@@ -1,0 +1,20 @@
+{
+  "name": "ai-development-team-os",
+  "version": "0.1.0",
+  "description": "AI Development Team OS — スマホだけでAI開発チームを運営するシステム",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "pnpm --parallel --filter './apps/*' dev",
+    "build": "pnpm --filter './packages/*' build && pnpm --filter './apps/*' build",
+    "test": "pnpm --parallel --filter './apps/*' test",
+    "typecheck": "pnpm --parallel --filter './apps/*' typecheck"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  }
+}

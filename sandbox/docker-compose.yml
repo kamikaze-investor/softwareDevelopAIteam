@@ -1,0 +1,30 @@
+# ⚠️ CONTROL REPOSITORY — AI編集禁止
+#
+# Sandbox実行設定
+# Target Repositoryのみマウントする
+
+version: '3.8'
+
+services:
+  sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Target Repositoryのみマウント（Control Repositoryはマウントしない）
+      - ${TARGET_REPO_PATH}:/workspace/project
+    environment:
+      # 必要最小限のみ注入（.envは渡さない）
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+      - GIT_USER_NAME=${GIT_USER_NAME}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL}
+    # ネットワーク制限
+    networks:
+      - sandbox-net
+    # リソース制限
+    mem_limit: 2g
+    cpus: '2.0'
+
+networks:
+  sandbox-net:
+    driver: bridge

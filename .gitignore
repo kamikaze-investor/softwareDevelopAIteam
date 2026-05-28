@@ -1,0 +1,38 @@
+node_modules/
+dist/
+build/
+.next/
+.expo/
+
+# 環境変数（絶対コミットしない）
+.env
+.env.local
+.env.production
+.env.*.local
+
+# 秘密情報
+*.pem
+*.key
+id_rsa
+id_ed25519
+service-account.json
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Test coverage
+coverage/
+
+# pnpm
+.pnpm-store/
