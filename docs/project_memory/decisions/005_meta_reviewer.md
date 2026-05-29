@@ -68,6 +68,32 @@ packages/shared/src/types/
   10. Project Reviewer AI（Phase 3）
 ```
 
+## 担当モデル選定
+
+**Meta Reviewer AI のモデル: Gemini（Google）**
+
+| AI役割 | 採用モデル | 理由 |
+|---|---|---|
+| Developer AI | Claude Code | 実装品質・コード生成能力が高い |
+| CTO AI | Claude | 設計・意思決定の推論力 |
+| **Meta Reviewer AI** | **Gemini** | **別プロバイダ → 独立した判断** |
+| Project Reviewer AI | Gemini | 同上（Phase 3） |
+| QA AI | Claude or Gemini | どちらでも可 |
+
+### なぜ別プロバイダか
+
+同じClaudeを開発者（Developer AI）とレビュアー（Meta Reviewer AI）の両方に使うと、
+**相関バイアス（Correlated Blind Spots）** が生じる。
+
+- 両者が同じ「考え方のクセ」を持つ
+- Claudeが見落とすパターンをClaudeがレビューしても検出できない
+- 特にセキュリティ系の判断で「AIが自分の判断を正当化してしまう」リスク
+
+Geminiを使うことで：
+- 別の訓練データ・アーキテクチャ → 異なる盲点
+- Developer AIが見落とした問題を独立して検出できる
+- 「檻を自分で弱める」を構造的に防ぐ
+
 ---
 
 *Created by: CTO AI — 外部AIレビューフィードバック対応*

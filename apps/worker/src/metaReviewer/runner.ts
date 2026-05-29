@@ -9,7 +9,7 @@
  * フロー:
  * 1. gitDiffを取得
  * 2. changedFilesを分類（どのエリアの変更か）
- * 3. Meta Reviewer AI（Claude）にプロンプト + diff を渡す
+ * 3. Meta Reviewer AI（Gemini）にプロンプト + diff を渡す
  * 4. MetaReviewResultを受け取る
  * 5. blocked → Jobを停止・CEOへ通知
  *    changes_requested → 修正Jobを作成
@@ -87,14 +87,15 @@ export function buildMetaReviewRequest(
   taskId: string,
   taskTitle: string,
   changedFiles: string[],
-  workingDir: string
+  workingDir: string,
+  gitDiff?: string,  // GitHub Actions等から正確なdiffを渡す場合に使用
 ): MetaReviewRequest {
   return {
     taskId,
     taskTitle,
     targetArea: classifyTargetArea(changedFiles),
     changedFiles,
-    gitDiff: getGitDiff(workingDir),
+    gitDiff: gitDiff ?? getGitDiff(workingDir),
     relatedSpecs: inferRelatedSpecs(changedFiles),
   }
 }

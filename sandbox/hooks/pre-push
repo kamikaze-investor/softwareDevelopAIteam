@@ -1,0 +1,50 @@
+#!/bin/sh
+# pre-push フック — Meta Review を自動実行する
+#
+# インストール方法:
+#   cp sandbox/hooks/pre-push .git/hooks/pre-push
+#   chmod +x .git/hooks/pre-push
+#
+# または setup-hooks.sh を実行する
+
+set -e
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "🔍 Meta Review を実行します（Gemini）"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# GEMINI_API_KEY の確認
+if [ -z "$GEMINI_API_KEY" ]; then
+  # .env から読み込みを試みる
+  if [ -f .env ]; then
+    export $(grep -v '^#' .env | grep GEMINI_API_KEY | xargs)
+  fi
+fi
+
+if [ -z "$GEMINI_API_KEY" ]; then
+  echo "❌ GEMINI_API_KEY が設定されていません"
+  echo "   .env ファイルに GEMINI_API_KEY を設定してください"
+  exit 1
+fi
+
+# Meta Review 実行
+pnpm --filter @ai-team/worker tsx src/metaReviewer/autoReview.ts
+
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 1 ]; then
+  echo ""
+  echo "🚫 Meta Review が BLOCKED を返しました。"
+  echo "   push を中止します。CEO承認後にマージしてください。"
+  exit 1
+fi
+
+if [ $EXIT_CODE -eq 2 ]; then
+  echo ""
+  echo "❌ Meta Review の実行に失敗しました。"
+  echo "   安全のため push を中止します。"
+  exit 1
+fi
+
+echo "✅ Meta Review 通過。push を続行します。"
+exit 0

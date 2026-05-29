@@ -33,6 +33,7 @@
 | task-017 | Jobログ分離保存 (stdout/stderrファイル) | [ ] | task-009 | Developer AI |
 | task-018 | Backend Storage SQLite完全実装 | [ ] | task-002 | Developer AI |
 | task-019 | Dashboard: Pending Approval UI | [ ] | task-012 | Developer AI |
+| task-020 | Meta Review 自動実行（GitHub Actions + pre-push） | [x] | — | Developer AI |
 
 ---
 
@@ -50,8 +51,9 @@
 | ✅ | Job.agentRole / guardResult追加（監査ログ） |
 | ✅ | ReviewResult / QAResult型追加 |
 | ✅ | SQLite + Repository Pattern（Race Condition対策） |
-| ✅ | Decision-003〜004記録済み |
+| ✅ | Decision-003〜005記録済み（Meta Reviewer / Gemini担当） |
+| ✅ | Meta Review 自動化（GitHub Actions + pre-push hook） |
 
 ---
 
-*Updated: 2026-05-28*
+*Updated: 2026-05-30*

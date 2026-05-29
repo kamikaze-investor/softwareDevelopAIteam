@@ -184,13 +184,47 @@ Developerが Project Memoryを読まなくても実装できること
 
 **Rule**: Project Memory直接参照禁止 — Context Packのみ参照
 
-**Candidate Models**
-- Claude Code
-- Codex
+**Model**: Claude Code（メイン）/ Codex（サブ）
 
 ---
 
-# 7. Reviewer AI
+# 7. Meta Reviewer AI（憲法裁判所）
+
+**Mission**: AI Development Team OS 自身を監査する。
+
+**Model**: **Gemini（Google）**
+— Developer AI（Claude）と別プロバイダにすることで相関バイアスを排除する。
+
+## Responsibilities
+
+**Cage Integrity Check**（最優先）
+- permissionGuard / fileChangeGuard の弱体化を検出
+- Docker Sandbox制限の解除を検出
+- CLAUDE.md の権限境界変更を検出
+
+**Security Regression Check**
+- AgentPolicy 権限の拡張を検出
+- 禁止コマンドのAllowlist追加を検出
+- 秘密情報アクセス経路の追加を検出
+
+**Architecture Check**
+- MVPスコープ外機能の混入を検出
+- 仕様思想との不整合を検出
+
+**Input**
+- Git Diff（control repository）
+- Changed Files リスト
+- 関連仕様書
+
+**Output**: MetaReviewResult（approved / changes_requested / blocked）
+
+**Trigger**: Developer AIのPRマージ前に必ず実行
+
+**Rule**: `blocked` が返った場合、CEO承認なしにマージ不可
+
+---
+
+# 8. Reviewer AI（Project Reviewer）
 
 **Mission**: 品質監査。
 
@@ -217,13 +251,11 @@ Developerが Project Memoryを読まなくても実装できること
 
 **Output**: Review Report
 
-**Candidate Models**
-- Gemini
-- Claude
+**Model**: Gemini（メイン）/ Claude（サブ）
 
 ---
 
-# 8. QA AI
+# 9. QA AI
 
 **Mission**: 品質保証。
 
@@ -250,7 +282,7 @@ Developerが Project Memoryを読まなくても実装できること
 
 ---
 
-# 9. Summary Engine
+# 10. Summary Engine
 
 **Mission**: 人間が30秒で現在地を理解できる状態を作る。
 
@@ -281,7 +313,7 @@ Developerが Project Memoryを読まなくても実装できること
 
 ---
 
-# 10. Project Summary Format
+# 11. Project Summary Format
 
 **表示項目**
 
@@ -309,7 +341,7 @@ QA Report
 
 ---
 
-# 11. Inter-Agent Workflow
+# 12. Inter-Agent Workflow
 
 ## Standard Flow
 
@@ -318,13 +350,15 @@ CTO AI
 ↓
 Context Manager
 ↓
-Developer
+Developer AI（Claude）
 ↓
-Reviewer
+Meta Reviewer AI（Gemini）← PRマージ前・必須
+↓ approved のみ通過
+Reviewer AI（Gemini）
 ↓
-QA
+QA AI
 ↓
-Repository
+Repository（merge）
 ↓
 Summary Engine
 ```
@@ -345,7 +379,7 @@ Summary Engine
 
 ---
 
-# 12. Authority Principle
+# 13. Authority Principle
 
 ## AI Freedom Zone
 
@@ -376,7 +410,7 @@ AIは以下を自由に実行できる
 
 ---
 
-# 13. Organization Success Criteria
+# 14. Organization Success Criteria
 
 AI組織の成功条件
 

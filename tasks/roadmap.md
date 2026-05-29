@@ -25,7 +25,7 @@
 - [x] Meta Reviewer AI システムプロンプト (docs/meta_reviewer/prompt.md)
 - [x] Meta Reviewer チェックリスト (docs/meta_reviewer/checklist.md)
 - [x] Meta Review Runner (apps/worker/src/metaReviewer/runner.ts)
-- [ ] Meta Review の自動実行フック（PR前に必ず実行）
+- [x] Meta Review の自動実行フック（PR前に必ず実行）← GitHub Actions (.github/workflows/meta-review.yml)
 
 ### 1-C: セキュリティ基盤 ✅
 - [x] Permission Guard (SafeCommand / CommandKind 方式)
