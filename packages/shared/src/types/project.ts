@@ -37,10 +37,16 @@ export interface Decision {
   description: string
 }
 
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected'
+
 export interface Approval {
   id: string
   title: string
   reason: string
   type: 'goal_change' | 'philosophy_change' | 'external_service' | 'billing' | 'deployment' | 'security'
+  // レビュー指摘(2026-05-28): CEOの承認・却下状態を追跡するため追加
+  status: ApprovalStatus
+  reviewedAt?: string
+  reviewNote?: string
   createdAt: string
 }
