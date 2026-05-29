@@ -34,6 +34,16 @@
 - [x] commandResolver (kind→argv変換 / サニタイズ)
 - [x] Docker: Control(read-only) / Target(read-write) 物理分離
 
+### 1-F: AI CLI Adapter基盤 ✅
+- [x] AiCliProvider / AiCliRequest / AiCliResult 型定義 (packages/shared)
+- [x] BaseCliAdapter（セキュリティ強制: workingDir検証・Secret Scan・shell:false）
+- [x] ClaudeCodeAdapter（Developer AI）
+- [x] GeminiCliAdapter（Reviewer AI）
+- [x] CodexAdapter（将来用プレースホルダー）
+- [ ] CLI実行ログ保存 (task-021)
+- [ ] CLI出力パーサー + JSONリトライ機構 (task-022)
+- [ ] CLI timeout / retry / cancel設計 (task-023)
+
 ### 1-D: バックエンド実装（次）
 - [ ] SQLite Storage 完全実装 (task-018)
 - [ ] Backend API 骨格 → Project / Task / Job CRUD (task-006〜008)

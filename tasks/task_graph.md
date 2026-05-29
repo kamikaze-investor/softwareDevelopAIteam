@@ -34,6 +34,10 @@
 | task-018 | Backend Storage SQLite完全実装 | [ ] | task-002 | Developer AI |
 | task-019 | Dashboard: Pending Approval UI | [ ] | task-012 | Developer AI |
 | task-020 | Meta Review 自動実行（GitHub Actions + pre-push） | [x] | — | Developer AI |
+| task-021 | AI CLI Adapter基盤（型定義 + BaseCliAdapter + 各Provider） | [x] | task-003 | Developer AI |
+| task-022 | CLI実行ログ保存（stdout/stderr/changedFiles永続化） | [ ] | task-021 task-017 | Developer AI |
+| task-023 | CLI出力パーサー + JSONリトライ機構（失敗→blocked） | [ ] | task-021 | Developer AI |
+| task-024 | CLI timeout / cancel 設計（暴走防止） | [ ] | task-021 | Developer AI |
 
 ---
 
@@ -53,7 +57,9 @@
 | ✅ | SQLite + Repository Pattern（Race Condition対策） |
 | ✅ | Decision-003〜005記録済み（Meta Reviewer / Gemini担当） |
 | ✅ | Meta Review 自動化（GitHub Actions + pre-push hook） |
+| ✅ | AI CLI Adapter設計（Decision-006: CLIをWorkerがラップ） |
+| ✅ | BaseCliAdapter: workingDir検証・SecretScan・shell:false・timeout |
 
 ---
 
-*Updated: 2026-05-30*
+*Updated: 2026-05-30 (AI CLI Adapter追加)*
