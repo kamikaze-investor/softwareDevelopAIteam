@@ -1,7 +1,11 @@
 # ⚠️ CONTROL REPOSITORY — AI編集禁止
 #
-# Sandbox実行設定
-# Target Repositoryのみマウントする
+# Control/Target Repository物理分離
+#
+# レビュー指摘(2026-05-28):
+# - Control Repository は read-only でマウント
+# - Target Repository のみ read-write
+# - AIは /workspace/target 配下しか変更できない
 
 version: '3.8'
 
@@ -11,20 +15,41 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      # Target Repositoryのみマウント（Control Repositoryはマウントしない）
-      - ${TARGET_REPO_PATH}:/workspace/project
+      # Control Repository: read-only（AIが自分の檻を改造できない）
+      - ${CONTROL_REPO_PATH}:/workspace/control:ro
+
+      # Target Repository: read-write（AIが開発する対象）
+      - ${TARGET_REPO_PATH}:/workspace/target
+
     environment:
       # 必要最小限のみ注入（.envは渡さない）
       - CLAUDE_API_KEY=${CLAUDE_API_KEY}
       - GIT_USER_NAME=${GIT_USER_NAME}
       - GIT_USER_EMAIL=${GIT_USER_EMAIL}
-    # ネットワーク制限
+      # TARGET_ROOTをコンテナ内に明示
+      - TARGET_ROOT=/workspace/target
+
+    working_dir: /workspace/target
+
     networks:
       - sandbox-net
+
     # リソース制限
     mem_limit: 2g
     cpus: '2.0'
 
+    # セキュリティ強化
+    read_only: false         # /workspace/targetのみ書き込み可（volumeで制御）
+    cap_drop:
+      - ALL                  # 全capabilityを剥奪
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   sandbox-net:
     driver: bridge
+    # 将来的にネットワーク制限を追加する場所

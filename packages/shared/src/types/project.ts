@@ -37,13 +37,27 @@ export interface Decision {
   description: string
 }
 
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected'
+/**
+ * 承認タイプ
+ * dependency_add追加: npm install/pnpm addはYellow Zone
+ * レビュー指摘(2026-05-28): 外部依存追加はセキュリティ・ライセンス・サプライチェーンリスク
+ */
+export type ApprovalType =
+  | 'goal_change'
+  | 'philosophy_change'
+  | 'external_service'
+  | 'billing'
+  | 'deployment'
+  | 'security'
+  | 'dependency_add'  // npm/pnpm add <package> はCEO承認必須
+
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'expired'
 
 export interface Approval {
   id: string
   title: string
   reason: string
-  type: 'goal_change' | 'philosophy_change' | 'external_service' | 'billing' | 'deployment' | 'security'
+  type: ApprovalType
   // レビュー指摘(2026-05-28): CEOの承認・却下状態を追跡するため追加
   status: ApprovalStatus
   reviewedAt?: string
