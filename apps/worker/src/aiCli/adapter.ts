@@ -85,6 +85,20 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     }
 
     // ── CLI 実行 ───────────────────────────────────────────
+    //
+    // ⚠️ 設計上の注意（Meta Review 指摘: medium）:
+    //   この実行経路は CommandKind / permissionGuard を通らない。
+    //   AI CLI はファイル編集・git操作を自律的に行うため、
+    //   CommandKind の細粒度制御とは別レイヤーで動作する。
+    //
+    //   代わりに以下の多層防御を適用する:
+    //     1. workingDir = /workspace/target 限定（このクラスで強制）
+    //     2. Docker read-only mount（Control Repo を物理的に保護）
+    //     3. File Change Guard（実行後の差分を検査）
+    //     4. Meta Reviewer AI（コミット前に差分を審査）
+    //
+    //   CommandKind Guard との統合は task-009（Worker Job実行エンジン）で設計する。
+    //
     const argv = this.buildArgv(request)
     const timeout = request.timeoutMs ?? 300_000  // 5分
 
@@ -123,30 +137,6 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       durationMs: Date.now() - startTime,
       summary,
     }
-  }
-}
-
-// ────────────────────────────────────────────────────────────
-// ファクトリー
-// ────────────────────────────────────────────────────────────
-
-export function createAiCliAdapter(config: AiCliAdapterConfig): IAiCliAdapter {
-  switch (config.provider) {
-    case 'claude_code':
-      // import は動的に避ける（circular dependency防止）
-      const { ClaudeCodeAdapter } = require('./claudeCodeAdapter.js')
-      return new ClaudeCodeAdapter(config)
-
-    case 'gemini':
-      const { GeminiCliAdapter } = require('./geminiCliAdapter.js')
-      return new GeminiCliAdapter(config)
-
-    case 'codex':
-      const { CodexAdapter } = require('./codexAdapter.js')
-      return new CodexAdapter(config)
-
-    default:
-      throw new Error(`未対応のAI CLIプロバイダー: ${config.provider satisfies never}`)
   }
 }
 

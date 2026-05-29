@@ -4,7 +4,7 @@ name: Meta Review (Gemini)
 # blocked → CI失敗 → マージ不可（Branch Protection で Required に設定すること）
 on:
   pull_request:
-    branches: [main]
+    branches: [master, main]   # master（現在）と main（将来の改名）の両方に対応
 
 permissions:
   pull-requests: write   # PRへのコメント投稿
