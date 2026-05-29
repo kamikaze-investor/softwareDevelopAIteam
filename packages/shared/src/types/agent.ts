@@ -6,7 +6,8 @@ export type AgentRole =
   | 'cto_ai'
   | 'context_manager'
   | 'developer_ai'
-  | 'reviewer_ai'
+  | 'meta_reviewer'   // AI Development Team OS 自身を監査するAI
+  | 'reviewer_ai'     // target-project/ のコードをレビューするAI
   | 'qa_ai'
 
 /**
@@ -24,6 +25,15 @@ export interface AgentPolicy {
 }
 
 export const AGENT_POLICIES: Record<AgentRole, AgentPolicy> = {
+  meta_reviewer: {
+    role: 'meta_reviewer',
+    canExecuteCommands: false,  // 実行不可 / 読み取り専用
+    canModifyFiles: false,
+    canCommit: false,
+    canReadMemory: true,        // 仕様・ルールを参照する
+    canWriteMemory: false,
+    requiresApprovalFor: [],
+  },
   cto_ai: {
     role: 'cto_ai',
     canExecuteCommands: false,
