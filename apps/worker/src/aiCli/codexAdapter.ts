@@ -25,11 +25,18 @@ export class CodexAdapter extends BaseCliAdapter {
   }
 
   protected buildArgv(request: AiCliRequest): string[] {
-    // TODO: Codex CLI の正式フラグが確定したら実装する
-    // 現状は approval_mode=suggest で変更提案のみ
+    // Codex CLI フラグ:
+    //   --approval-mode full-auto  : ファイル編集もコマンド実行も全自動（implement向け）
+    //   --approval-mode auto-edit  : ファイル編集のみ自動（コマンド実行は不可・より安全）
+    //   --approval-mode suggest    : 提案のみ・実際には変更しない（review向け）
+    //
+    // Worker からの自動実行は auto-edit を使う（コマンド実行を Codex に委ねない）
+    // コマンド実行は引き続き Worker の CommandKind/SafeCommand で制御する
+
+    const approvalMode = request.mode === 'implement' ? 'auto-edit' : 'suggest'
+
     return [
-      '--approval-mode', 'suggest',
-      '--quiet',
+      '--approval-mode', approvalMode,
       request.prompt,
     ]
   }
