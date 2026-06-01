@@ -27,8 +27,17 @@ AI CLI Adapter（共通インターフェース）
 
 ---
 
-## 役割の明確化
+## 確定した役割分担
 
+| AI役割 | プロバイダー | 使用形式 | 使う状況 |
+|---|---|---|---|
+| **Developer AI（メイン）** | Claude Code | CLI | 新機能・複雑実装・CLAUDE.mdの自律遵守が必要 |
+| **Developer AI（サブ）** | Codex | CLI（auto-edit） | 既存コード局所編集・フォールバック |
+| **Meta Reviewer AI** | Gemini | **API**（geminiClient.ts） | セキュリティ審査（再現性・温度制御が必要） |
+| **Project Reviewer AI** | Gemini | CLI | コード品質レビュー（Phase 3） |
+| **CTO AI / Context Manager** | Claude | API（将来） | 設計・推論・ContextPack生成 |
+
+**コンポーネント役割**:
 | コンポーネント | 役割 |
 |---|---|
 | **AI CLI** | 意思決定・実装案・レビュー案を出すエンジン（頭脳） |
@@ -37,6 +46,7 @@ AI CLI Adapter（共通インターフェース）
 | **Meta Reviewer AI** | OSの憲法裁判所（Gemini API経由 — autoReview.ts） |
 
 > AI CLIは強力だが、最終権限は持たせない。
+> 詳細なリスクと対策: `docs/project_memory/rules/001_codex_integration_risks.md`
 
 ---
 

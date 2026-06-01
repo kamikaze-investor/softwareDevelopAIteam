@@ -16,7 +16,20 @@
 // Provider
 // ────────────────────────────────────────────────────────────
 
-/** 対応AI CLIプロバイダー */
+/**
+ * 対応AI CLIプロバイダー
+ *
+ * 使い分けの原則:
+ *   claude_code — 新機能・ゼロからの実装・複雑な設計判断が必要なとき
+ *                 CLAUDE.md を自動読込する唯一のCLI
+ *   codex       — 既存コードへの局所編集・パターン踏襲・claude_code 障害時フォールバック
+ *                 CLAUDE.md を自動読込しない → Context Pack に必ず要点を含めること
+ *   gemini      — Project Reviewer AI（コード品質レビュー）
+ *                 Meta Reviewer は CLI ではなく API (geminiClient.ts) を使うこと
+ *
+ * 重要: 1タスク = 1プロバイダー原則
+ *   同一タスク内で claude_code と codex を混在させない。
+ */
 export type AiCliProvider =
   | 'claude_code'  // Claude Code CLI (claude コマンド)
   | 'codex'        // OpenAI Codex CLI (codex コマンド)

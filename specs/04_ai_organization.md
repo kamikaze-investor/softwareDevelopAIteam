@@ -184,7 +184,18 @@ Developerが Project Memoryを読まなくても実装できること
 
 **Rule**: Project Memory直接参照禁止 — Context Packのみ参照
 
-**Model**: Claude Code（メイン）/ Codex（サブ）
+## モデル選定（Developer AI）
+
+| プロバイダー | 役割 | 使う状況 |
+|---|---|---|
+| **Claude Code CLI** | メイン実装者 | 新機能・ゼロからの実装・複雑な設計判断が必要なとき |
+| **Codex CLI** | 局所編集・フォールバック | 既存コードへの小変更・パターン踏襲・Claude Code障害時 |
+
+**原則**:
+- 1タスク = 1プロバイダー（同一タスク内で両CLIを混在させない）
+- Claude Code が設計・実装した部分は Codex で上書きしない
+- Codex に渡すタスクは「ファイル編集のみ」に限定（コマンド実行はWorkerが制御）
+- Context Pack に CLAUDE.md の要点を**必ず含める**（Codexは自動読込しないため）
 
 ---
 
@@ -350,9 +361,9 @@ CTO AI
 ↓
 Context Manager
 ↓
-Developer AI（Claude）
-↓
-Meta Reviewer AI（Gemini）← PRマージ前・必須
+Developer AI（Claude Code または Codex）
+↓  ← 1タスク1プロバイダー原則
+Meta Reviewer AI（Gemini API）← PRマージ前・必須
 ↓ approved のみ通過
 Reviewer AI（Gemini）
 ↓

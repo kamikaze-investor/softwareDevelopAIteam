@@ -4,6 +4,17 @@
  * ⚠️ CONTROL REPOSITORY — AI編集禁止
  *
  * claude コマンド（Claude Code CLI）のラッパー。
+ * Developer AI のメインプロバイダー。
+ *
+ * 使う状況:
+ *   - 新機能のゼロからの実装
+ *   - 複雑な設計判断が必要なタスク
+ *   - CLAUDE.md のルールを自律的に守る必要があるとき（自動読込する）
+ *
+ * 使わない状況（Codex を使う）:
+ *   - 既存コードへの局所的な修正
+ *   - パターンが明確で機械的な変更
+ *   - Claude Code API が制限/障害時のフォールバック
  *
  * 実行形式:
  *   claude -p "<prompt>" --output-format json

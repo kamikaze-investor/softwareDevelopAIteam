@@ -4,12 +4,22 @@
  * ⚠️ CONTROL REPOSITORY — AI編集禁止
  *
  * codex コマンドのラッパー。
+ * Developer AI のサブプロバイダー（局所編集・フォールバック用）。
+ *
+ * 使う状況:
+ *   - 既存コードへの局所的な修正（関数1つ・バグ修正・リネーム等）
+ *   - パターンが明確で機械的な変更
+ *   - Claude Code が障害/レート制限のときのフォールバック
+ *
+ * 重要な制約:
+ *   - CLAUDE.md を自動読込しない
+ *     → Context Pack に CLAUDE.md の禁止事項・コーディングルールを必ず含めること
+ *   - --approval-mode auto-edit を使用
+ *     → ファイル編集のみ実行（コマンド実行はWorkerが制御）
+ *   - 1タスク1プロバイダー原則: Claude Code と同一タスクで混在させない
  *
  * ⚠️ Codex CLIの正式フラグはバージョンによって変わる。
  *    確認コマンド: codex --help
- *
- * 現状: プレースホルダー実装
- * 実際に使用する場合は buildArgv() を実装すること。
  */
 
 import type { AiCliRequest, AiCliAdapterConfig } from '@ai-team/shared'
