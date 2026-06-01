@@ -87,6 +87,83 @@ export interface AiCliRequest {
 
   /** ドライラン（実際に実行しない） */
   dryRun?: boolean
+
+  // ────────────────────────────────────────────────────────
+  // Rule-001 対策フィールド
+  // ────────────────────────────────────────────────────────
+
+  /**
+   * H-1対策: Codex向けCLAUDE.md注入の制御
+   * デフォルト: provider === 'codex' のとき自動的に true
+   * false にすると注入をスキップする（テスト時等）
+   */
+  injectClaudeMd?: boolean
+
+  /**
+   * H-2対策: このリクエスト実行前にContextPackの再生成が必要か
+   * 前のJobがコミットを作成した場合、Workerはこれをtrueにセットする
+   * true のとき Worker は Context Manager AI に再生成を依頼してから実行する
+   */
+  requiresFreshContextPack?: boolean
+
+  /**
+   * H-2対策: ContextPackが生成された時刻（ISO 8601）
+   * Worker がstalenessを判定するために使う
+   * 前Jobのコミット時刻よりも古ければ再生成が必要
+   */
+  contextPackGeneratedAt?: string
+
+  /**
+   * M-2対策: フォールバックポリシー
+   * 指定した条件を満たしたとき、別プロバイダーで再実行する
+   */
+  fallbackPolicy?: FallbackPolicy
+
+  /**
+   * M-4対策: CLI実行後にlintを実行するか
+   * デフォルト: provider === 'codex' のとき true（スタイル不一致を自動修正）
+   *            provider === 'claude_code' のとき false（Claude自身が整形する）
+   */
+  postLint?: boolean
+}
+
+// ────────────────────────────────────────────────────────────
+// M-2対策: フォールバックポリシー
+// ────────────────────────────────────────────────────────────
+
+/**
+ * CLI実行失敗時のフォールバックルール（Rule-001 M-2）
+ *
+ * 重要: 品質問題（Meta Review: blocked/changes_requested）ではフォールバックしない。
+ * APIエラー・タイムアウト等の技術的失敗のみフォールバック可。
+ */
+export interface FallbackPolicy {
+  /** フォールバック先のプロバイダー */
+  fallbackProvider: AiCliProvider
+
+  /**
+   * フォールバックを発動する条件
+   *   'api_error'  — APIエラー（5xx・接続失敗）のみ（推奨）
+   *   'timeout'    — タイムアウト時のみ
+   *   'any_error'  — 任意のエラー（品質問題には使わないこと）
+   */
+  condition: 'api_error' | 'timeout' | 'any_error'
+}
+
+/**
+ * フォールバック条件に一致するかを判定するヘルパー
+ */
+export function shouldFallback(
+  policy: FallbackPolicy,
+  exitCode: number,
+  isTimeout: boolean,
+  isApiError: boolean,
+): boolean {
+  switch (policy.condition) {
+    case 'api_error': return isApiError
+    case 'timeout':   return isTimeout
+    case 'any_error': return exitCode !== 0
+  }
 }
 
 // ────────────────────────────────────────────────────────────

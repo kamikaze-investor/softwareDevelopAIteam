@@ -39,7 +39,10 @@ Context Manager AI の生成ルール:
   - Escalation Rules（CEOへの通知条件）
 ```
 
-**実装タスク**: Context Manager AI 実装時（Phase 2）に対応
+**実装状況**: ✅ `BaseCliAdapter.run()` で自動注入済み（`injectClaudeMdEssentials()`）
+- provider=codex のとき CLAUDE.md を読み込みプロンプト先頭に注入する
+- CLAUDE.md が見つからない場合はフォールバック定数（最重要ルール）を使用
+- `injectClaudeMd: false` で明示的にスキップ可能（テスト用）
 
 ---
 
@@ -61,7 +64,10 @@ Worker のジョブ実行ルール:
   次のJobのContextPackは必ず再生成する（キャッシュ禁止）
 ```
 
-**実装タスク**: task-009（Worker Job実行エンジン）で実装
+**実装状況**:
+- ✅ `AiCliRequest.requiresFreshContextPack?: boolean` を型に追加済み
+- ✅ `AiCliRequest.contextPackGeneratedAt?: string` を型に追加済み
+- ⏳ Worker が前Jobのコミット時刻と比較して自動セットする処理は task-009 で実装
 
 ---
 
@@ -110,6 +116,11 @@ Claude Codeが失敗したとき、いつCodexに切り替えるか？
 | 品質問題（Meta Review: blocked） | CEO承認まで停止。切り替え不可 |
 | タスク定義の問題（実装不可） | タスクを分割してCTOAIに差し戻す |
 
+**実装状況**:
+- ✅ `AiCliRequest.fallbackPolicy?: FallbackPolicy` を型に追加済み
+- ✅ `shouldFallback()` ヘルパー関数を `@ai-team/shared` に追加済み
+- ⏳ Worker が `shouldFallback()` を呼び出して自動切り替えする処理は task-009 で実装
+
 ---
 
 #### M-3: Rollback設計の複雑化
@@ -148,6 +159,11 @@ Prettier + ESLint を Guard の一部として位置づける
   ContextPackに .eslintrc / .prettierrc の内容を含める
   CLIの実行後、Workerが自動でlint/formatを実行する（SafeCommandのlintを使う）
 ```
+
+**実装状況**: ✅ `BaseCliAdapter.run()` で provider=codex のとき `pnpm lint --fix` を自動実行済み
+- 失敗しても non-fatal（警告のみ）
+- 変更ファイルがある場合のみ実行
+- `postLint: false` で明示的にスキップ可能
 
 ---
 

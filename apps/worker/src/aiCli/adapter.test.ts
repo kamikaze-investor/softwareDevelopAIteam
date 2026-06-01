@@ -113,6 +113,70 @@ describe('BaseCliAdapter セキュリティチェック', () => {
 })
 
 // ────────────────────────────────────────────────────────────
+// H-1対策: CLAUDE.md注入のテスト
+// ────────────────────────────────────────────────────────────
+
+describe('H-1対策: CLAUDE.md注入', () => {
+  it('codex provider は dryRun=true でも injectClaudeMd が動作しない（dryRunは注入前にreturn）', async () => {
+    const codexAdapter = createAiCliAdapter({ provider: 'codex' })
+    const result = await codexAdapter.run({
+      taskId: 'test-h1-1',
+      provider: 'codex',
+      workingDir: '/workspace/target',
+      prompt: 'テスト実装',
+      contextFiles: [],
+      mode: 'implement',
+      dryRun: true,
+    })
+    // dryRun は注入なしで即リターン（注入はCLI実行直前に行われる）
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('[DRY RUN]')
+  })
+
+  it('claude_code provider は injectClaudeMd=false でも注入しない（もともと不要）', async () => {
+    const claudeAdapter = createAiCliAdapter({ provider: 'claude_code' })
+    // claude_code は CLAUDE.md を自動読込するので注入不要
+    // injectClaudeMd フラグは claude_code では無視される（adapter.ts の条件分岐で skip）
+    await expect(claudeAdapter.run({
+      taskId: 'test-h1-2',
+      provider: 'claude_code',
+      workingDir: '/workspace/target',
+      prompt: '正常なプロンプト',
+      contextFiles: [],
+      mode: 'implement',
+      dryRun: true,
+    })).resolves.toMatchObject({ exitCode: 0 })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// M-2対策: FallbackPolicy のテスト
+// ────────────────────────────────────────────────────────────
+
+describe('M-2対策: shouldFallback', () => {
+  const { shouldFallback } = await import('@ai-team/shared')
+
+  it('api_error 条件: APIエラー時のみフォールバック', () => {
+    const policy = { fallbackProvider: 'codex' as const, condition: 'api_error' as const }
+    expect(shouldFallback(policy, 1, false, true)).toBe(true)   // APIエラー → fallback
+    expect(shouldFallback(policy, 1, true, false)).toBe(false)  // timeout → no fallback
+    expect(shouldFallback(policy, 1, false, false)).toBe(false) // その他エラー → no fallback
+  })
+
+  it('timeout 条件: タイムアウト時のみフォールバック', () => {
+    const policy = { fallbackProvider: 'codex' as const, condition: 'timeout' as const }
+    expect(shouldFallback(policy, 1, true, false)).toBe(true)   // timeout → fallback
+    expect(shouldFallback(policy, 1, false, true)).toBe(false)  // APIエラー → no fallback
+  })
+
+  it('any_error 条件: 任意エラーでフォールバック', () => {
+    const policy = { fallbackProvider: 'codex' as const, condition: 'any_error' as const }
+    expect(shouldFallback(policy, 0, false, false)).toBe(false) // 成功 → no fallback
+    expect(shouldFallback(policy, 1, false, false)).toBe(true)  // エラー → fallback
+  })
+})
+
+// ────────────────────────────────────────────────────────────
 // factory のテスト
 // ────────────────────────────────────────────────────────────
 

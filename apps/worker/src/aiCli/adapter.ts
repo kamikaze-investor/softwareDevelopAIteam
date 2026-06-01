@@ -12,9 +12,13 @@
  *     4. timeout 強制（暴走防止）
  *     5. Secret Scan（プロンプトに秘密情報が混入していないか確認）
  *     6. changedFiles の自動検出（git diff）
+ *     7. H-1対策: provider=codex のとき CLAUDE.md 要点をプロンプトに自動注入
+ *     8. M-4対策: provider=codex のとき CLI実行後に lint を自動実行
  */
 
 import { execFileSync } from 'node:child_process'
+import { readFileSync, existsSync } from 'node:fs'
+import path from 'node:path'
 import type {
   AiCliRequest,
   AiCliResult,
@@ -22,7 +26,14 @@ import type {
   AiCliProvider,
 } from '@ai-team/shared'
 import { isPromptSafe } from '@ai-team/shared'
-import { isInsideTargetRoot } from '../utils/pathUtils.js'
+import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
+
+// CLAUDE.md のパス（コンテナ内 = /workspace/control、ローカル開発 = プロジェクトルート）
+const CLAUDE_MD_PATHS = [
+  '/workspace/control/CLAUDE.md',
+  path.resolve(process.cwd(), '../../CLAUDE.md'),  // monorepo ルートからの相対
+  path.resolve(process.cwd(), 'CLAUDE.md'),
+]
 
 // ────────────────────────────────────────────────────────────
 // インターフェース
@@ -72,6 +83,14 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       )
     }
 
+    // ── H-1対策: Codex向けCLAUDE.md注入 ──────────────────
+    // Codex は CLAUDE.md を自動読込しないため、プロンプト先頭に必ず注入する。
+    // injectClaudeMd が明示的に false の場合のみスキップ（テスト用）。
+    const shouldInject = request.provider === 'codex' && request.injectClaudeMd !== false
+    const finalPrompt = shouldInject
+      ? injectClaudeMdEssentials(request.prompt)
+      : request.prompt
+
     if (request.dryRun) {
       return {
         taskId: request.taskId,
@@ -99,7 +118,8 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     //
     //   CommandKind Guard との統合は task-009（Worker Job実行エンジン）で設計する。
     //
-    const argv = this.buildArgv(request)
+    // finalPrompt = H-1注入済みプロンプト（Codexの場合のみCLAUDE.md先頭付与）
+    const argv = this.buildArgv({ ...request, prompt: finalPrompt })
     const timeout = request.timeoutMs ?? 300_000  // 5分
 
     let stdout = ''
@@ -124,6 +144,14 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     // ── 変更ファイル検出（実行後の git diff） ──────────────
     const changedFiles = getChangedFiles(request.workingDir)
 
+    // ── M-4対策: Codex実行後のlint自動実行 ────────────────
+    // Codex はスタイルが不一致になりやすいため、デフォルトでlintを実行する。
+    // postLint が明示的に false の場合のみスキップ。
+    const shouldPostLint = request.provider === 'codex' && request.postLint !== false
+    if (shouldPostLint && changedFiles.length > 0) {
+      runPostLint(request.workingDir)
+    }
+
     // ── サマリー抽出（JSON出力があれば） ───────────────────
     const summary = extractSummary(stdout)
 
@@ -143,6 +171,96 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
 // ────────────────────────────────────────────────────────────
 // ヘルパー
 // ────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────
+// H-1対策: CLAUDE.md注入
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Codex向けにCLAUDE.mdの要点をプロンプト先頭に注入する（Rule-001 H-1）
+ *
+ * Codex CLI は CLAUDE.md を自動読込しないため、
+ * システムの制約（禁止事項・コーディングルール）をプロンプトに含めることで
+ * Codexが知らずにルール違反するリスクを排除する。
+ */
+function injectClaudeMdEssentials(originalPrompt: string): string {
+  // CLAUDE.md を探して読み込む
+  let claudeMdContent: string | undefined
+  for (const claudeMdPath of CLAUDE_MD_PATHS) {
+    if (existsSync(claudeMdPath)) {
+      try {
+        claudeMdContent = readFileSync(claudeMdPath, 'utf-8')
+        break
+      } catch {
+        // 次のパスを試す
+      }
+    }
+  }
+
+  if (!claudeMdContent) {
+    // CLAUDE.md が見つからない場合はハードコードした最重要ルールで代替
+    // これ自体がシステムの異常なので stderr に記録
+    console.error('[AiCliAdapter] WARNING: CLAUDE.md が見つかりません。フォールバックルールを使用します。')
+    claudeMdContent = CLAUDE_MD_FALLBACK_ESSENTIALS
+  }
+
+  return [
+    '## ⚠️ システム制約（最優先・必読）',
+    '',
+    '以下はAI Development Team OSの憲法です。この制約はタスクの内容よりも優先されます。',
+    '',
+    claudeMdContent,
+    '',
+    '---',
+    '',
+    '## タスク',
+    '',
+    originalPrompt,
+  ].join('\n')
+}
+
+/**
+ * CLAUDE.md が見つからない場合のフォールバック（最重要事項のみ）
+ * 実際の CLAUDE.md と同期を保つこと
+ */
+const CLAUDE_MD_FALLBACK_ESSENTIALS = `
+絶対禁止:
+  - ai-team-backend/ / apps/ / packages/ / specs/ / docs/ / sandbox/ の変更（Control Repository）
+  - target-project/ 以外のファイルの編集
+  - .env / secret files の読み書き
+  - sudo / rm -rf / curl | sh などの危険コマンド
+
+Repository Boundary:
+  - 編集可能: /workspace/target 配下のみ
+  - 編集不可: /workspace/control 配下（このOSのコード）
+
+コミットルール:
+  - コミットメッセージ: [task-xxx] 変更内容の要約
+  - テストなしで完了とみなさない
+`.trim()
+
+// ────────────────────────────────────────────────────────────
+// M-4対策: lint後処理
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Codex実行後のlint自動実行（Rule-001 M-4）
+ * スタイル不一致を自動修正する。失敗しても実行は継続する（non-fatal）。
+ */
+function runPostLint(workingDir: string): void {
+  try {
+    execFileSync('pnpm', ['lint', '--fix'], {
+      cwd: workingDir,
+      shell: false,
+      encoding: 'utf-8',
+      timeout: 60_000,  // 1分
+    })
+  } catch {
+    // lint失敗は警告のみ（ブロックしない）
+    // lint結果はFile Change Guard + Meta Reviewer AIが後から確認する
+    console.warn('[AiCliAdapter] post-lint failed (non-fatal). File Change Guard will check the diff.')
+  }
+}
 
 /**
  * プロバイダーごとに必要な環境変数だけを渡す
