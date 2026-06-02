@@ -8,12 +8,15 @@
 
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
+import { getStorage } from './storage'
 
 const app = Fastify({ logger: true })
 
 app.register(cors, {
   origin: true,
 })
+
+getStorage()
 
 // Health check
 app.get('/health', async () => {

@@ -22,7 +22,12 @@ export const CREATE_TABLES = `
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     assignee TEXT NOT NULL DEFAULT 'cto_ai',
+    provider TEXT,
     dependencies TEXT NOT NULL DEFAULT '[]',
+    allowed_paths TEXT NOT NULL DEFAULT '[]',
+    forbidden_paths TEXT NOT NULL DEFAULT '[]',
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    expected_outputs TEXT NOT NULL DEFAULT '[]',
     branch_name TEXT,
     commit_hash TEXT,
     created_at TEXT NOT NULL,
@@ -34,17 +39,20 @@ export const CREATE_TABLES = `
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
+    agent_role TEXT NOT NULL DEFAULT 'developer_ai',
     status TEXT NOT NULL DEFAULT 'queued',
-    command TEXT NOT NULL,
-    working_dir TEXT NOT NULL,
+    safe_command TEXT NOT NULL,
+    dry_run INTEGER NOT NULL DEFAULT 0,
     started_at TEXT,
     completed_at TEXT,
     exit_code INTEGER,
     stdout TEXT,
     stderr TEXT,
-    changed_files TEXT DEFAULT '[]',
+    changed_files TEXT NOT NULL DEFAULT '[]',
     commit_hash TEXT,
     rollback_info TEXT,
+    guard_result TEXT,
+    approval_id TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
@@ -62,3 +70,20 @@ export const CREATE_TABLES = `
     FOREIGN KEY (project_id) REFERENCES projects(id)
   );
 `
+
+/**
+ * Existing databases need explicit ALTER TABLE statements because
+ * CREATE TABLE IF NOT EXISTS does not change already-created tables.
+ */
+export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; definition: string }> = [
+  { table: 'tasks', column: 'provider', definition: 'TEXT' },
+  { table: 'tasks', column: 'allowed_paths', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { table: 'tasks', column: 'forbidden_paths', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { table: 'tasks', column: 'acceptance_criteria', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { table: 'tasks', column: 'expected_outputs', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { table: 'jobs', column: 'agent_role', definition: "TEXT NOT NULL DEFAULT 'developer_ai'" },
+  { table: 'jobs', column: 'safe_command', definition: 'TEXT' },
+  { table: 'jobs', column: 'dry_run', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'jobs', column: 'guard_result', definition: 'TEXT' },
+  { table: 'jobs', column: 'approval_id', definition: 'TEXT' },
+]
