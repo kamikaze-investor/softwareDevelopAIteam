@@ -40,13 +40,16 @@
 - [x] ClaudeCodeAdapter（Developer AI）
 - [x] GeminiCliAdapter（Reviewer AI）
 - [x] CodexAdapter（将来用プレースホルダー）
-- [ ] CLI実行ログ保存 (task-021)
-- [ ] CLI出力パーサー + JSONリトライ機構 (task-022)
-- [ ] CLI timeout / retry / cancel設計 (task-023)
+- [x] AGENTS.md・session-log・コミットプレフィックス対応 (task-021)
+- [ ] CLI実行ログ保存 (task-022)
+- [ ] CLI出力パーサー + JSONリトライ機構 (task-023)
+- [ ] CLI timeout / retry / cancel設計 (task-024)
 
-### 1-D: バックエンド実装（次）
-- [ ] SQLite Storage 完全実装 (task-018)
-- [ ] Backend API 骨格 → Project / Task / Job CRUD (task-006〜008)
+### 1-D: バックエンド実装
+- [x] SQLite Storage 完全実装 (task-018) ← Codex実装済・masterマージ待ち
+- [ ] Backend: Project CRUD API (task-006)
+- [ ] Backend: Task CRUD API (task-007)
+- [ ] Backend: Job Queue API (task-008)
 - [ ] 簡易認証 API token (task-014)
 - [ ] Worker Job実行エンジン (task-009)
 - [ ] Job状態遷移 + 復旧ロジック (task-016)

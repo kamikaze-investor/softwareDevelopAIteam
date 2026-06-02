@@ -31,7 +31,7 @@
 | task-015 | ReviewResult / QAResult型 + API | [ ] | task-007 | Developer AI |
 | task-016 | Job状態遷移ルール + 復旧ロジック | [ ] | task-008 task-009 | Developer AI |
 | task-017 | Jobログ分離保存 (stdout/stderrファイル) | [ ] | task-009 | Developer AI |
-| task-018 | Backend Storage SQLite完全実装 | [ ] | task-002 | Developer AI |
+| task-018 | Backend Storage SQLite完全実装 | [x] | task-002 | Codex |
 | task-019 | Dashboard: Pending Approval UI | [ ] | task-012 | Developer AI |
 | task-020 | Meta Review 自動実行（GitHub Actions + pre-push） | [x] | — | Developer AI |
 | task-021 | AI CLI Adapter基盤（型定義 + BaseCliAdapter + 各Provider） | [x] | task-003 | Developer AI |

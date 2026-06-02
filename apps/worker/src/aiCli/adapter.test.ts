@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { isPromptSafe } from '@ai-team/shared'
+import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { createAiCliAdapter } from './factory.js'
 
 // ────────────────────────────────────────────────────────────
@@ -154,8 +154,6 @@ describe('H-1対策: CLAUDE.md注入', () => {
 // ────────────────────────────────────────────────────────────
 
 describe('M-2対策: shouldFallback', () => {
-  const { shouldFallback } = await import('@ai-team/shared')
-
   it('api_error 条件: APIエラー時のみフォールバック', () => {
     const policy = { fallbackProvider: 'codex' as const, condition: 'api_error' as const }
     expect(shouldFallback(policy, 1, false, true)).toBe(true)   // APIエラー → fallback
