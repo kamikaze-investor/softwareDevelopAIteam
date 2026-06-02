@@ -9,6 +9,8 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import { getStorage } from './storage'
+import { projectRoutes } from './routes/projects'
+import { approvalRoutes } from './routes/approvals'
 
 const app = Fastify({ logger: true })
 
@@ -24,7 +26,8 @@ app.get('/health', async () => {
 })
 
 // Routes (Phase 1で追加予定)
-// app.register(projectRoutes, { prefix: '/api/projects' })
+app.register(projectRoutes, { prefix: '/api/projects' })
+app.register(approvalRoutes, { prefix: '/api' })
 // app.register(taskRoutes, { prefix: '/api/tasks' })
 // app.register(jobRoutes, { prefix: '/api/jobs' })
 // app.register(dashboardRoutes, { prefix: '/api/dashboard' })
