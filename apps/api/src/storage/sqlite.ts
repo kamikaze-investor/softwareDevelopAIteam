@@ -1,8 +1,16 @@
+/**
+ * SQLite Storage 実装
+ *
+ * Race Condition対応済み（better-sqlite3は同期APIでトランザクション管理が容易）
+ * Phase 2でPostgreSQLに移行する際はこのファイルをPostgres実装に差し替える
+ * → IStorage インターフェースを実装した別クラスに切り替えるだけでよい
+ */
+
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage } from './interface'
-import type { Project, Task, Approval, Job } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, SafeCommand } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -266,7 +274,11 @@ function deserializeJob(row: any): Job {
     projectId: row.project_id,
     agentRole: row.agent_role,
     status: row.status,
-    safeCommand: JSON.parse(row.safe_command),
+    // マイグレーション後の既存行は safe_command が NULL の可能性がある
+    // Phase 1 では新規rowのみだが、防御的にフォールバックを設ける
+    safeCommand: row.safe_command
+      ? (JSON.parse(row.safe_command) as SafeCommand)
+      : ({ kind: 'git_status', workingDir: '/workspace/target' } satisfies SafeCommand),
     dryRun: row.dry_run === 1 ? true : undefined,
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
