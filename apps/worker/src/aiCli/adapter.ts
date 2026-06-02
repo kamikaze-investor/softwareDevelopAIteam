@@ -28,11 +28,17 @@ import type {
 import { isPromptSafe } from '@ai-team/shared'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 
-// CLAUDE.md のパス（コンテナ内 = /workspace/control、ローカル開発 = プロジェクトルート）
+// CLAUDE.md / AGENTS.md のパス（コンテナ内 = /workspace/control、ローカル開発 = プロジェクトルート）
 const CLAUDE_MD_PATHS = [
   '/workspace/control/CLAUDE.md',
-  path.resolve(process.cwd(), '../../CLAUDE.md'),  // monorepo ルートからの相対
+  path.resolve(process.cwd(), '../../CLAUDE.md'),
   path.resolve(process.cwd(), 'CLAUDE.md'),
+]
+
+const AGENTS_MD_PATHS = [
+  '/workspace/control/AGENTS.md',
+  path.resolve(process.cwd(), '../../AGENTS.md'),
+  path.resolve(process.cwd(), 'AGENTS.md'),
 ]
 
 // ────────────────────────────────────────────────────────────
@@ -198,10 +204,16 @@ function injectClaudeMdEssentials(originalPrompt: string): string {
   }
 
   if (!claudeMdContent) {
-    // CLAUDE.md が見つからない場合はハードコードした最重要ルールで代替
-    // これ自体がシステムの異常なので stderr に記録
     console.error('[AiCliAdapter] WARNING: CLAUDE.md が見つかりません。フォールバックルールを使用します。')
     claudeMdContent = CLAUDE_MD_FALLBACK_ESSENTIALS
+  }
+
+  // AGENTS.md も読み込む（共同運用ルール + TypeScript品質ルール）
+  let agentsMdContent: string | undefined
+  for (const p of AGENTS_MD_PATHS) {
+    if (existsSync(p)) {
+      try { agentsMdContent = readFileSync(p, 'utf-8'); break } catch { /* 次を試す */ }
+    }
   }
 
   return [
@@ -210,6 +222,14 @@ function injectClaudeMdEssentials(originalPrompt: string): string {
     '以下はAI Development Team OSの憲法です。この制約はタスクの内容よりも優先されます。',
     '',
     claudeMdContent,
+    '',
+    ...(agentsMdContent ? [
+      '---',
+      '',
+      '## 共同運用ルール（AGENTS.md）',
+      '',
+      agentsMdContent,
+    ] : []),
     '',
     '---',
     '',

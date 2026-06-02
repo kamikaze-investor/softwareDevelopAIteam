@@ -32,6 +32,13 @@ export interface SafeCommandParams {
   branchName?: string       // git_branch_create, git_checkout
   revertCommit?: string     // git_revert: 対象コミットハッシュ
   testPattern?: string      // test: 特定テストのみ実行
+
+  /**
+   * git_commit のプレフィックス（JPstock方式: git log が誰が何をしたかのタイムラインになる）
+   *   '[claude_code task-xxx]' または '[codex task-xxx]'
+   * Workerが自動でセットする（AI入力ではないためサニタイズ不要）
+   */
+  agentPrefix?: string
 }
 
 export interface SafeCommand {

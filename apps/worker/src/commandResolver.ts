@@ -54,10 +54,14 @@ const RESOLVERS: Record<CommandKind, Resolver> = {
   },
 
   git_commit: (params) => {
+    // agentPrefix は Worker が制御するため sanitize 不要
+    // commitMessage は AI 入力のため必ず sanitize する
     const message = sanitizeCommitMessage(params?.commitMessage ?? 'ai: auto commit')
+    const prefix  = params?.agentPrefix ? `${params.agentPrefix} ` : ''
+    const full    = `${prefix}${message}`
     return {
-      argv: ['git', 'commit', '-m', message],
-      description: `git commit -m "${message}"`,
+      argv: ['git', 'commit', '-m', full],
+      description: `git commit -m "${full}"`,
     }
   },
 
