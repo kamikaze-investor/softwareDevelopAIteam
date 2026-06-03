@@ -1,0 +1,57 @@
+name: CI
+
+# PRごとにtypecheck + test を自動実行する
+# このチェックが通らないとマージ不可（Branch Protectionで設定すること）
+on:
+  pull_request:
+    branches: [master, main]
+
+env:
+  # pnpm 11 の依存チェックによる失敗を回避
+  PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'false'
+
+jobs:
+  ci:
+    name: Typecheck & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------------
+      # 1. チェックアウト
+      # -------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------
+      # 2. Node.js + pnpm
+      # -------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # -------------------------------------------------------
+      # 3. Worker テストが /workspace/target を必要とするため作成
+      #    isInsideTargetRoot() は realpathSync を使うため
+      #    ディレクトリが存在しないと false を返しテストが失敗する
+      # -------------------------------------------------------
+      - name: Create workspace dirs for worker tests
+        run: sudo mkdir -p /workspace/target /workspace/control
+
+      # -------------------------------------------------------
+      # 4. 全パッケージ typecheck
+      # -------------------------------------------------------
+      - name: Typecheck (all packages)
+        run: pnpm -r typecheck
+
+      # -------------------------------------------------------
+      # 5. 全パッケージ test
+      # -------------------------------------------------------
+      - name: Test (all packages)
+        run: pnpm -r test
