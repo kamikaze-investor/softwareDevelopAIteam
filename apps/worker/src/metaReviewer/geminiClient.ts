@@ -11,8 +11,8 @@
 import { GoogleGenerativeAI } from '@google/generative-ai'
 
 // レビュー用モデル設定
-// gemini-2.5-pro: セキュリティ判断に最高品質を使う
-const GEMINI_MODEL = 'gemini-2.5-pro'
+// gemini-2.5-flash: CI の無料枠でも動かしやすい安定版をデフォルトにする
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
 
 /**
  * Gemini にレビューを依頼し、生のテキスト応答を返す
@@ -26,8 +26,9 @@ export async function callGeminiForReview(prompt: string): Promise<string> {
   }
 
   const genAI = new GoogleGenerativeAI(apiKey)
+  const modelName = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL
   const model = genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
+    model: modelName,
     generationConfig: {
       // 低温度 = 決定論的な判断（セキュリティレビューに適切）
       temperature: 0.1,
