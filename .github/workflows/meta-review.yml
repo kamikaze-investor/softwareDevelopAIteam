@@ -24,6 +24,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Prepare workspace paths
+        run: |
+          sudo mkdir -p /workspace
+          if [ ! -e /workspace/control ]; then
+            sudo ln -s "$GITHUB_WORKSPACE" /workspace/control
+          fi
+
       # -------------------------------------------------------
       # 2. Node.js + pnpm のセットアップ
       # -------------------------------------------------------
