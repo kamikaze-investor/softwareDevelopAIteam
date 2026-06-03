@@ -22,6 +22,23 @@ corepack pnpm -r typecheck   # 全パッケージ一括
 
 ---
 
+## gh CLI の認証設定
+
+`gh pr checks` や `gh pr view` を使うには `gh` の認証が必要。
+
+```powershell
+# 方法1: 環境変数で渡す（.envのGITHUB_TOKENをそのまま使う）
+$env:GH_TOKEN = $env:GITHUB_TOKEN
+gh pr checks 1   # 動作確認
+
+# 方法2: 一度だけログイン（ブラウザ経由）
+gh auth login
+```
+
+Codex がループ内で `gh` を使う場合は `GH_TOKEN` を環境変数にセットしておく。
+
+---
+
 ## タスク着手前のチェックリスト
 
 1. `tasks/active/task-xxx.md` が存在することを確認する
