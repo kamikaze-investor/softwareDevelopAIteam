@@ -57,6 +57,7 @@ jobs:
           HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
           PR_TITLE:  ${{ github.event.pull_request.title }}
           TASK_ID:   "pr-${{ github.event.pull_request.number }}"
+          META_REVIEW_RESULT_PATH: ${{ github.workspace }}/meta-review-result.json
 
       # -------------------------------------------------------
       # 4. 結果をPRにコメント投稿（always = blocked時も投稿）

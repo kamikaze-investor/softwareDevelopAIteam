@@ -16,6 +16,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } from './runner.js'
 import { callGeminiForReview } from './geminiClient.js'
 
@@ -26,6 +27,8 @@ async function main(): Promise<void> {
   const prTitle = process.env.PR_TITLE ?? 'Manual Meta Review'
   const taskId  = process.env.TASK_ID ?? `pr-${Date.now()}`
   const workingDir = process.cwd()
+  const resultFilePath = process.env.META_REVIEW_RESULT_PATH
+    ?? resolve(workingDir, 'meta-review-result.json')
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('🔍 Meta Review 開始（Gemini）')
@@ -76,7 +79,7 @@ async function main(): Promise<void> {
       findings: [],
       requiresCeoApproval: false,
       createdAt: new Date().toISOString(),
-    })
+    }, resultFilePath)
     process.exit(0)
   }
 
@@ -116,14 +119,14 @@ async function main(): Promise<void> {
       requiresCeoApproval: true,
       createdAt: new Date().toISOString(),
     }
-    writeResultFile(errorResult)
+    writeResultFile(errorResult, resultFilePath)
     printResult(errorResult)
     process.exit(1)
   }
 
   // --- 結果をパース ---
   const result = parseMetaReviewResult(rawResponse, taskId)
-  writeResultFile(result)
+  writeResultFile(result, resultFilePath)
   printResult(result)
 
   // --- 終了コード ---
@@ -160,8 +163,8 @@ type MetaReviewResultLike = {
   createdAt: string
 }
 
-function writeResultFile(result: MetaReviewResultLike): void {
-  writeFileSync('meta-review-result.json', JSON.stringify(result, null, 2))
+function writeResultFile(result: MetaReviewResultLike, resultFilePath: string): void {
+  writeFileSync(resultFilePath, JSON.stringify(result, null, 2))
 }
 
 function printResult(result: MetaReviewResultLike): void {
