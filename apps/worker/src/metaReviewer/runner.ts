@@ -37,6 +37,48 @@ const META_REVIEWER_CHECKLIST_PATH = path.join(
   CONTROL_ROOT,
   'docs/meta_reviewer/checklist.md'
 )
+const CHECKLISTS_DIR = path.join(CONTROL_ROOT, 'docs/meta_reviewer/checklists')
+
+/**
+ * 変更ファイルに対応するファイル別チェックリストを全て返す
+ * 複数のエリアにまたがる変更（例: api + worker）には複数のチェックリストを返す
+ */
+function getFileChecklists(changedFiles: string[]): string[] {
+  const results: string[] = []
+
+  const add = (filename: string) => {
+    try {
+      const content = readFileSync(path.join(CHECKLISTS_DIR, filename), 'utf-8')
+      results.push(content)
+    } catch {
+      // チェックリストファイルが存在しない場合はスキップ
+    }
+  }
+
+  if (changedFiles.some(f => f.includes('guards/'))) {
+    add('guards.md')
+  }
+  if (changedFiles.some(f => f.startsWith('sandbox/'))) {
+    add('sandbox.md')
+  }
+  if (changedFiles.some(f => f.startsWith('apps/api/src/routes/') || f === 'apps/api/src/index.ts')) {
+    add('api_routes.md')
+  }
+  if (changedFiles.some(f => f.startsWith('apps/api/src/storage/'))) {
+    add('storage.md')
+  }
+  if (changedFiles.some(f => f.startsWith('apps/worker/src/') && !f.includes('guards/'))) {
+    add('worker.md')
+  }
+  if (changedFiles.some(f => f.startsWith('packages/shared/src/types/'))) {
+    add('shared_types.md')
+  }
+  if (changedFiles.some(f => f.startsWith('.github/workflows/') || f === '.github/CODEOWNERS')) {
+    add('workflows.md')
+  }
+
+  return results
+}
 
 /**
  * changedFilesからTargetAreaを分類する
@@ -108,15 +150,31 @@ export function buildMetaReviewRequest(
  */
 export function buildMetaReviewPrompt(request: MetaReviewRequest): string {
   const systemPrompt = readFileSync(META_REVIEWER_PROMPT_PATH, 'utf-8')
-  const checklist = readFileSync(META_REVIEWER_CHECKLIST_PATH, 'utf-8')
+  const generalChecklist = readFileSync(META_REVIEWER_CHECKLIST_PATH, 'utf-8')
+  const fileChecklists = getFileChecklists(request.changedFiles)
+
+  const fileChecklistSection = fileChecklists.length > 0
+    ? [
+        '## ファイル別チェックリスト（フェーズ1で使用）',
+        '',
+        '以下は変更されたファイルに対応する専用チェックリストである。',
+        'フェーズ1では各項目を1つずつ確認すること。',
+        '',
+        ...fileChecklists.flatMap(c => [c, '']),
+      ].join('\n')
+    : '## ファイル別チェックリスト\n\n（このPRに対応する専用チェックリストなし。汎用チェックリストと判定基準で評価すること）'
 
   return `${systemPrompt}
 
 ---
 
-## チェックリスト（参考）
+## 汎用チェックリスト（フェーズ1・フェーズ2で参照）
 
-${checklist}
+${generalChecklist}
+
+---
+
+${fileChecklistSection}
 
 ---
 
