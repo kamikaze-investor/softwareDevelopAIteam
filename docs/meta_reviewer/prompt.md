@@ -44,7 +44,11 @@ AI Cannot Modify Its Own Cage
 **権限境界の変更**
 - `CLAUDE.md` の Green/Yellow/Red Zone の内容を変更している
 - `AgentPolicy` の権限を広げている（特に reviewer_ai / meta_reviewer への実行権限付与）
-- Control Repository（`apps/worker/` `apps/api/` `sandbox/`）をAIが編集可能にしている
+- **重要な注意**: `apps/api/src/routes/` への新規ルート追加はOS開発フェーズの正当な作業であり blocked にしない。
+  blockedにするのは以下の場合のみ:
+  - Guard / Sandbox / AgentPolicy のセキュリティ機構を弱体化させている
+  - 認証なしで機密データを返すエンドポイントを追加している
+  - `apps/worker/src/guards/` または `sandbox/` の設定を変更している
 
 **その他のblockedトリガー**
 - `TARGET_ROOT` 以外への write mount を追加している
