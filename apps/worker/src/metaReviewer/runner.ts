@@ -20,8 +20,11 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import type {
+  MetaFindingCategory,
+  MetaRiskLevel,
   MetaReviewRequest,
   MetaReviewResult,
+  MetaReviewStatus,
   MetaReviewTargetArea,
 } from '@ai-team/shared'
 
@@ -146,49 +149,191 @@ export function parseMetaReviewResult(
   rawResponse: string,
   taskId: string
 ): MetaReviewResult {
-  try {
-    // JSONブロックを抽出
-    const jsonMatch = rawResponse.match(/```json\n([\s\S]+?)\n```/) ||
-                      rawResponse.match(/\{[\s\S]+\}/)
-    const jsonStr = jsonMatch ? (jsonMatch[1] ?? jsonMatch[0]) : rawResponse
-    const parsed = JSON.parse(jsonStr)
+  for (const jsonStr of extractJsonCandidates(rawResponse)) {
+    try {
+      const parsed: unknown = JSON.parse(jsonStr)
+      if (!isRecord(parsed)) {
+        throw new Error('Parsed value is not an object')
+      }
+      return buildMetaReviewResult(parsed, taskId)
+    } catch {
+      // 別候補を試す。全候補が失敗した場合だけ blocked に倒す。
+    }
+  }
 
-    // 必須フィールドの検証
-    if (!['approved', 'changes_requested', 'blocked'].includes(parsed.status)) {
-      throw new Error('Invalid status')
-    }
-
-    return {
-      id: `meta-review-${taskId}-${Date.now()}`,
-      taskId,
-      status: parsed.status,
-      riskLevel: parsed.riskLevel ?? 'high',
-      summary: parsed.summary ?? 'Parse error - treated as high risk',
-      findings: parsed.findings ?? [],
-      requiresCeoApproval: parsed.requiresCeoApproval ?? false,
-      createdAt: new Date().toISOString(),
-    }
-  } catch {
-    // パース失敗は最も安全な方向（blocked）に倒す
-    return {
-      id: `meta-review-${taskId}-${Date.now()}`,
-      taskId,
-      status: 'blocked',
-      riskLevel: 'critical',
-      summary: 'Meta Review AIの応答をパースできませんでした。安全のためblockedとします。',
-      findings: [{
-        severity: 'critical',
-        category: 'security_regression',
-        message: 'Meta Review AIの応答が不正なフォーマットです',
-        suggestion: 'Meta Reviewer AIの応答を確認してください',
-      }],
-      requiresCeoApproval: true,
-      createdAt: new Date().toISOString(),
-    }
+  // パース失敗は最も安全な方向（blocked）に倒す
+  return {
+    id: `meta-review-${taskId}-${Date.now()}`,
+    taskId,
+    status: 'blocked',
+    riskLevel: 'critical',
+    summary: 'Meta Review AIの応答をパースできませんでした。安全のためblockedとします。',
+    findings: [{
+      severity: 'critical',
+      category: 'security_regression',
+      message: 'Meta Review AIの応答が不正なフォーマットです',
+      suggestion: 'Meta Reviewer AIの応答を確認してください',
+    }],
+    requiresCeoApproval: true,
+    createdAt: new Date().toISOString(),
   }
 }
 
 // --- ヘルパー ---
+
+const META_REVIEW_STATUSES: readonly MetaReviewStatus[] = [
+  'approved',
+  'changes_requested',
+  'blocked',
+]
+
+const META_RISK_LEVELS: readonly MetaRiskLevel[] = [
+  'low',
+  'medium',
+  'high',
+  'critical',
+]
+
+const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
+  'cage_violation',
+  'authority_change',
+  'repository_boundary',
+  'security_regression',
+  'architecture_drift',
+  'scope_creep',
+  'mvp_mismatch',
+  'spec_violation',
+]
+
+function extractJsonCandidates(rawResponse: string): string[] {
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  const addCandidate = (candidate: string): void => {
+    const trimmed = candidate.trim()
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed)
+      candidates.push(trimmed)
+    }
+  }
+
+  for (const match of rawResponse.matchAll(/```(?:json)?[ \t]*\r?\n([\s\S]*?)```/gi)) {
+    addCandidate(match[1])
+  }
+
+  addCandidate(rawResponse)
+
+  for (const candidate of findBalancedJsonObjects(rawResponse)) {
+    addCandidate(candidate)
+  }
+
+  return candidates
+}
+
+function findBalancedJsonObjects(text: string): string[] {
+  const objects: string[] = []
+  let start = -1
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]
+
+    if (start === -1) {
+      if (char === '{') {
+        start = index
+        depth = 1
+        inString = false
+        escaped = false
+      }
+      continue
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+    } else if (char === '{') {
+      depth += 1
+    } else if (char === '}') {
+      depth -= 1
+      if (depth === 0) {
+        objects.push(text.slice(start, index + 1))
+        start = -1
+      }
+    }
+  }
+
+  return objects
+}
+
+function buildMetaReviewResult(
+  parsed: Record<string, unknown>,
+  taskId: string
+): MetaReviewResult {
+  if (!isMetaReviewStatus(parsed.status)) {
+    throw new Error('Invalid status')
+  }
+
+  const riskLevel = isMetaRiskLevel(parsed.riskLevel) ? parsed.riskLevel : 'high'
+
+  return {
+    id: `meta-review-${taskId}-${Date.now()}`,
+    taskId,
+    status: parsed.status,
+    riskLevel,
+    summary: typeof parsed.summary === 'string'
+      ? parsed.summary
+      : 'Parse warning - summary was missing',
+    findings: normalizeFindings(parsed.findings, riskLevel),
+    requiresCeoApproval: typeof parsed.requiresCeoApproval === 'boolean'
+      ? parsed.requiresCeoApproval
+      : false,
+    createdAt: new Date().toISOString(),
+  }
+}
+
+function normalizeFindings(value: unknown, fallbackSeverity: MetaRiskLevel): MetaReviewResult['findings'] {
+  if (!Array.isArray(value)) return []
+
+  return value
+    .filter(isRecord)
+    .map((finding) => ({
+      severity: isMetaRiskLevel(finding.severity) ? finding.severity : fallbackSeverity,
+      category: isMetaFindingCategory(finding.category)
+        ? finding.category
+        : 'security_regression',
+      message: typeof finding.message === 'string' ? finding.message : 'No message',
+      file: typeof finding.file === 'string' ? finding.file : undefined,
+      line: typeof finding.line === 'number' ? finding.line : undefined,
+      suggestion: typeof finding.suggestion === 'string' ? finding.suggestion : undefined,
+    }))
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function isMetaReviewStatus(value: unknown): value is MetaReviewStatus {
+  return typeof value === 'string' && META_REVIEW_STATUSES.includes(value as MetaReviewStatus)
+}
+
+function isMetaRiskLevel(value: unknown): value is MetaRiskLevel {
+  return typeof value === 'string' && META_RISK_LEVELS.includes(value as MetaRiskLevel)
+}
+
+function isMetaFindingCategory(value: unknown): value is MetaFindingCategory {
+  return typeof value === 'string' && META_FINDING_CATEGORIES.includes(value as MetaFindingCategory)
+}
 
 function inferRelatedSpecs(changedFiles: string[]): string[] {
   const specs: string[] = []

@@ -30,6 +30,7 @@ export async function callGeminiForReview(prompt: string): Promise<string> {
   const model = genAI.getGenerativeModel({
     model: modelName,
     generationConfig: {
+      responseMimeType: 'application/json',
       // 低温度 = 決定論的な判断（セキュリティレビューに適切）
       temperature: 0.1,
       maxOutputTokens: 4096,
