@@ -121,10 +121,7 @@ async function main(): Promise<void> {
     }
     writeResultFile(errorResult, resultFilePath)
     printResult(errorResult)
-    // API障害時も exit 0 にする（CI を落とさない）
-    // 理由: Gemini API 障害で CI が通らなくなるのを防ぐ
-    // blocked コメントがPRに投稿されるので CEO が気づける
-    process.exit(0)
+    process.exit(1)
   }
 
   // --- 結果をパース ---
@@ -134,18 +131,15 @@ async function main(): Promise<void> {
 
   // --- 終了コード ---
   //
-  // blocked でも exit 0 にする設計について:
-  //   Meta Review は「情報提供・警告」の役割。マージの最終判断は人間（CEO）が行う。
-  //   blocked の強制停止は GitHub の Required Reviewers（CODEOWNERS）が担う。
-  //   CEO が PR を承認しなければマージできない構造が本当の安全装置。
-  //
-  //   AIがこのコードを変更しても、CODEOWNERS + Branch Protection は
-  //   リポジトリのコードではなく GitHub 側で管理されているため偽造不可能。
+  // blocked = exit 1（CI 失敗）の設計について:
+  //   Meta Review が genuine なセキュリティ違反を検出した場合、CI を失敗させる。
+  //   ただし autoReview.ts 自体が CODEOWNERS の対象ではないため AI が改ざん可能。
+  //   本当の防護壁は CODEOWNERS によるセキュリティファイルへの人間承認必須。
+  //   詳細: .github/CODEOWNERS を参照。
   //
   if (result.status === 'blocked') {
-    console.error('\n🚫 BLOCKED: CEOによるPR承認が必要です。マージ前に内容を確認してください。')
-    // exit 0 = CI チェックとしては通過。マージには別途 CEO の GitHub PR 承認が必要。
-    process.exit(0)
+    console.error('\n🚫 BLOCKED: このPRはCEO承認なしにマージできません')
+    process.exit(1)
   }
 
   if (result.status === 'changes_requested') {
