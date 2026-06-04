@@ -1,0 +1,7 @@
+# CODEOWNERS — AI Development Team OS
+#
+# すべてのファイル変更にオーナーのレビューを必須にする。
+# これにより AI が PR を自己承認できなくなる。
+# GitHub の Required Reviewers と組み合わせて使用する。
+
+* @kamikaze-investor

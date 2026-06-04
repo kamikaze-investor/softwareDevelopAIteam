@@ -50,8 +50,9 @@
 - [ ] Repository Boundary（ai-team-backend / target-project）が維持されている
 - [ ] 絶対禁止リストから項目が削除されていない
 
-**注意**: `apps/api/src/routes/` への新規ルート追加はOS開発フェーズの正当作業。
-`blocked` にしない。Guard / Sandbox / AgentPolicy の変更のみを問題視する。
+**注意**: routes/ 追加の blocked 判定は「機密情報を返すか」「Guardを迂回するか」で判断する。
+通常のCRUD追加は changes_requested / approved で評価する。
+「Control Repository への変更」という理由だけで blocked にしない。
 
 ### packages/shared/types/agent.ts
 - [ ] `reviewer_ai.canExecuteCommands` が false のまま
