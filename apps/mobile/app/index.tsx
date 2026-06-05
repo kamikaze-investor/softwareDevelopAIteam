@@ -5,7 +5,7 @@
  */
 
 import { useCallback, useEffect, useState } from 'react'
-import type { Project, Task, Job } from '@ai-team/shared'
+import type { Approval, Job, Project, Task } from '@ai-team/shared'
 import { router } from 'expo-router'
 import {
   ActivityIndicator,
@@ -62,6 +62,18 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
   return (await response.json()) as Job[]
 }
 
+async function fetchApprovals(projectId: string): Promise<Approval[]> {
+  const response = await fetch(
+    `${API_BASE}/api/projects/${projectId}/approvals`,
+  )
+
+  if (!response.ok) {
+    return []
+  }
+
+  return (await response.json()) as Approval[]
+}
+
 async function fetchRecentJobs(taskIds: string[]): Promise<Job[]> {
   const selectedTaskIds = taskIds.slice(0, MAX_TASKS_FOR_RECENT_JOBS)
   const jobGroups = await Promise.all(selectedTaskIds.map(fetchJobs))
@@ -69,6 +81,15 @@ async function fetchRecentJobs(taskIds: string[]): Promise<Job[]> {
   return jobGroups
     .flatMap((jobs) => jobs.slice(0, MAX_JOBS_PER_TASK))
     .slice(0, MAX_RECENT_JOBS)
+}
+
+async function fetchPendingApprovalCount(projectIds: string[]): Promise<number> {
+  const approvalGroups = await Promise.all(projectIds.map(fetchApprovals))
+
+  return approvalGroups.reduce(
+    (count, approvals): number => count + approvals.length,
+    0,
+  )
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -171,6 +192,7 @@ function ProjectCard({ project }: { project: Project }) {
 
 export default function Dashboard() {
   const [projects, setProjects] = useState<Project[]>([])
+  const [pendingApprovalCount, setPendingApprovalCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -179,13 +201,18 @@ export default function Dashboard() {
     try {
       setError(null)
       const data = await fetchProjects()
+      const approvalCount = await fetchPendingApprovalCount(
+        data.map((project) => project.id),
+      )
       setProjects(data)
+      setPendingApprovalCount(approvalCount)
     } catch (loadError) {
       const message =
         loadError instanceof Error
           ? loadError.message
           : 'Failed to connect to API'
       setError(message)
+      setPendingApprovalCount(0)
     } finally {
       setLoading(false)
       setRefreshing(false)
@@ -246,6 +273,19 @@ export default function Dashboard() {
 
       <TouchableOpacity
         accessibilityRole="button"
+        onPress={() => router.push('/approvals')}
+        style={styles.approvalButton}
+      >
+        <Text style={styles.approvalText}>承認待ち一覧</Text>
+        <View style={styles.approvalBadge}>
+          <Text style={styles.approvalBadgeText}>
+            {pendingApprovalCount}件
+          </Text>
+        </View>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        accessibilityRole="button"
         onPress={load}
         style={styles.refreshButton}
       >
@@ -256,6 +296,36 @@ export default function Dashboard() {
 }
 
 const styles = StyleSheet.create({
+  approvalBadge: {
+    backgroundColor: '#f59e0b22',
+    borderColor: '#f59e0b44',
+    borderRadius: 999,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  approvalBadgeText: {
+    color: '#f59e0b',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  approvalButton: {
+    alignItems: 'center',
+    backgroundColor: '#1a1a1a',
+    borderColor: '#f59e0b44',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+    marginTop: 8,
+    padding: 14,
+  },
+  approvalText: {
+    color: '#f59e0b',
+    fontSize: 15,
+    fontWeight: '600',
+  },
   badge: {
     borderRadius: 6,
     paddingHorizontal: 8,
