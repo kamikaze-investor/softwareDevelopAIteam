@@ -27,6 +27,7 @@ import type {
 } from '@ai-team/shared'
 import { isPromptSafe } from '@ai-team/shared'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
+import { saveJobLogs } from '../jobLogger.js'
 
 // CLAUDE.md / AGENTS.md のパス（コンテナ内 = /workspace/control、ローカル開発 = プロジェクトルート）
 const CLAUDE_MD_PATHS = [
@@ -161,12 +162,28 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     // ── サマリー抽出（JSON出力があれば） ───────────────────
     const summary = extractSummary(stdout)
 
+    // ── ログ永続化（task-022） ──────────────────────────────
+    // stdout/stderr をファイルに保存し、パスを結果に含める
+    let stdoutPath: string | undefined
+    let stderrPath: string | undefined
+    if (request.taskId) {
+      try {
+        const logPaths = saveJobLogs(`cli-${request.taskId}`, stdout, stderr)
+        stdoutPath = logPaths.stdoutPath
+        stderrPath = logPaths.stderrPath
+      } catch {
+        // ログ保存失敗は非致命的（実行結果には影響しない）
+      }
+    }
+
     return {
       taskId: request.taskId,
       provider: request.provider,
       exitCode,
       stdout,
       stderr,
+      stdoutPath,
+      stderrPath,
       changedFiles,
       durationMs: Date.now() - startTime,
       summary,
