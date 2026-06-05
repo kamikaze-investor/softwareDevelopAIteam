@@ -25,7 +25,7 @@ import type {
   AiCliAdapterConfig,
   AiCliProvider,
 } from '@ai-team/shared'
-import { isPromptSafe } from '@ai-team/shared'
+import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 import { saveJobLogs } from '../jobLogger.js'
 
@@ -61,6 +61,7 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     this.config = {
       cliPath: this.defaultCliName(),
       maxRetries: 2,
+      defaultTimeoutMs: 300_000,
       ...config,
     }
   }
@@ -127,11 +128,14 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     //
     // finalPrompt = H-1注入済みプロンプト（Codexの場合のみCLAUDE.md先頭付与）
     const argv = this.buildArgv({ ...request, prompt: finalPrompt })
-    const timeout = request.timeoutMs ?? 300_000  // 5分
+    // task-024: request > config > デフォルト(5分) の優先順位でタイムアウト決定
+    const timeout = request.timeoutMs ?? this.config.defaultTimeoutMs
 
     let stdout = ''
     let stderr = ''
     let exitCode = 0
+    let isTimeoutError = false
+    let isApiError = false
 
     try {
       stdout = execFileSync(this.config.cliPath, argv, {
@@ -146,6 +150,25 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       exitCode = typeof err.status === 'number' ? err.status : 1
       stdout   = typeof err.stdout === 'string' ? err.stdout : ''
       stderr   = typeof err.stderr === 'string' ? err.stderr : String(err)
+      // task-024: タイムアウト・APIエラーを分類
+      isTimeoutError = err.signal === 'SIGTERM' || (err.code === 'ETIMEDOUT') || stderr.includes('ETIMEDOUT')
+      isApiError = exitCode >= 500 || stderr.includes('API Error') || stderr.includes('5xx')
+    }
+
+    // task-024: フォールバックポリシーが設定されていて条件を満たす場合は再実行
+    if (
+      request.fallbackPolicy &&
+      shouldFallback(request.fallbackPolicy, exitCode, isTimeoutError, isApiError) &&
+      request.fallbackPolicy.fallbackProvider !== request.provider
+    ) {
+      const fallbackRequest: AiCliRequest = {
+        ...request,
+        provider: request.fallbackPolicy.fallbackProvider,
+        fallbackPolicy: undefined,  // 無限ループ防止
+      }
+      const { createAiCliAdapter } = await import('./factory.js')
+      const fallbackAdapter = createAiCliAdapter({ provider: request.fallbackPolicy.fallbackProvider })
+      return fallbackAdapter.run(fallbackRequest)
     }
 
     // ── 変更ファイル検出（実行後の git diff） ──────────────

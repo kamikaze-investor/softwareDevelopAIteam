@@ -246,6 +246,13 @@ export interface AiCliAdapterConfig {
    * 全リトライ失敗時は blocked 扱い
    */
   maxRetries?: number
+
+  /**
+   * task-024: デフォルトタイムアウト（ms）
+   * request.timeoutMs が指定されている場合はそちらが優先
+   * デフォルト: 300_000（5分）
+   */
+  defaultTimeoutMs?: number
 }
 
 // ────────────────────────────────────────────────────────────
