@@ -162,8 +162,47 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     // ── サマリー抽出（JSON出力があれば） ───────────────────
     const summary = extractSummary(stdout)
 
+    // ── task-023: JSON出力パーサー + リトライ ───────────────
+    let parsedOutput: Record<string, unknown> | undefined
+    let blocked = false
+    let retryCount = 0
+    if (request.expectJson) {
+      const maxRetries = this.config.maxRetries
+      let parseTarget = stdout
+      parsedOutput = tryParseJson(parseTarget)
+
+      while (parsedOutput === undefined && retryCount < maxRetries) {
+        retryCount++
+        // リトライ: "JSONで出力し直してください" を付け加えて再実行
+        const retryArgv = this.buildArgv({
+          ...request,
+          prompt: `${finalPrompt}\n\n## 再試行指示（リトライ ${retryCount}/${maxRetries}）\n前回の出力がJSONとして解析できませんでした。必ず有効なJSON形式のみを出力してください。`,
+        })
+        let retryStdout = ''
+        try {
+          retryStdout = execFileSync(this.config.cliPath, retryArgv, {
+            cwd: request.workingDir,
+            shell: false,
+            timeout,
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: buildSafeEnv(request.provider),
+          })
+        } catch (err: any) {
+          retryStdout = typeof err.stdout === 'string' ? err.stdout : ''
+        }
+        parsedOutput = tryParseJson(retryStdout)
+        if (parsedOutput !== undefined) {
+          stdout = retryStdout  // パース成功したリトライ出力で上書き
+        }
+      }
+
+      if (parsedOutput === undefined) {
+        blocked = true
+      }
+    }
+
     // ── ログ永続化（task-022） ──────────────────────────────
-    // stdout/stderr をファイルに保存し、パスを結果に含める
     let stdoutPath: string | undefined
     let stderrPath: string | undefined
     if (request.taskId) {
@@ -187,6 +226,8 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       changedFiles,
       durationMs: Date.now() - startTime,
       summary,
+      parsedOutput,
+      ...(request.expectJson ? { blocked, retryCount } : {}),
     }
   }
 }
@@ -345,6 +386,24 @@ function getChangedFiles(workingDir: string): string[] {
  * stdout から summary を抽出する
  * CLIがJSON形式で出力している場合に対応
  */
+/**
+ * task-023: JSON文字列のパースを試みる
+ * stdout内のコードブロックまたは生のJSONオブジェクトを探す
+ */
+function tryParseJson(stdout: string): Record<string, unknown> | undefined {
+  // ```json ... ``` ブロックを優先
+  const jsonBlockMatch = stdout.match(/```json\n([\s\S]+?)\n```/)
+  if (jsonBlockMatch) {
+    try { return JSON.parse(jsonBlockMatch[1]) } catch { /* fall through */ }
+  }
+  // 生JSONオブジェクト（最初の { ... } を探す）
+  const rawMatch = stdout.match(/\{[\s\S]+\}/)
+  if (rawMatch) {
+    try { return JSON.parse(rawMatch[0]) } catch { /* fall through */ }
+  }
+  return undefined
+}
+
 function extractSummary(stdout: string): string | undefined {
   try {
     const jsonMatch = stdout.match(/```json\n([\s\S]+?)\n```/) ||

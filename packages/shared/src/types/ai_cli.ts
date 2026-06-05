@@ -125,6 +125,12 @@ export interface AiCliRequest {
    *            provider === 'claude_code' のとき false（Claude自身が整形する）
    */
   postLint?: boolean
+
+  /**
+   * task-023: JSON出力を期待するか
+   * true のとき、stdout のパースに失敗したらリトライし、最終的に失敗したら blocked を返す
+   */
+  expectJson?: boolean
 }
 
 // ────────────────────────────────────────────────────────────
@@ -209,6 +215,18 @@ export interface AiCliResult {
 
   /** 保存された stderr ファイルのパス（task-022） */
   stderrPath?: string
+
+  /**
+   * task-023: JSONパース成功時の出力オブジェクト
+   * expectJson=true のとき、パースに成功した場合にセットされる
+   */
+  parsedOutput?: Record<string, unknown>
+
+  /**
+   * task-023: JSONパース失敗で blocked になったか
+   * expectJson=true かつ全リトライ失敗時に true
+   */
+  blocked?: boolean
 }
 
 // ────────────────────────────────────────────────────────────
