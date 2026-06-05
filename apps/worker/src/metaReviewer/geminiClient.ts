@@ -30,12 +30,13 @@ export async function callGeminiForReview(prompt: string): Promise<string> {
   const model = genAI.getGenerativeModel({
     model: modelName,
     generationConfig: {
-      // responseMimeType: 'application/json' は使わない。
-      // JSON mode では Gemini がスキーマを無視した構造で返すことがあり
-      // parseMetaReviewResult() のパースが失敗する原因になる。
+      // responseMimeType を指定しない（JSON mode はトークン不足時に途中切断される）
       // Gemini には「JSON で返せ」とプロンプトで指示し、runner.ts 側でパースする。
       temperature: 0.1,
-      maxOutputTokens: 4096,
+      // maxOutputTokens を増やした理由:
+      //   4096 では PR の diff が大きいとき JSON が途中で切れてパース失敗する。
+      //   gemini-2.5-flash の上限は 8192 tokens。
+      maxOutputTokens: 8192,
     },
   })
 
