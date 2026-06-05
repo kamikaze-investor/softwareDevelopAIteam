@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { Project, Task, Job } from '@ai-team/shared'
+import { router } from 'expo-router'
 import {
   ActivityIndicator,
   RefreshControl,
@@ -237,6 +238,14 @@ export default function Dashboard() {
 
       <TouchableOpacity
         accessibilityRole="button"
+        onPress={() => router.push('/create')}
+        style={styles.createButton}
+      >
+        <Text style={styles.createText}>＋ 新規プロジェクト</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        accessibilityRole="button"
         onPress={load}
         style={styles.refreshButton}
       >
@@ -289,6 +298,19 @@ const styles = StyleSheet.create({
   content: {
     padding: 16,
     paddingBottom: 40,
+  },
+  createButton: {
+    alignItems: 'center',
+    backgroundColor: '#3b82f6',
+    borderRadius: 12,
+    marginBottom: 12,
+    marginTop: 8,
+    padding: 14,
+  },
+  createText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
   },
   empty: {
     color: '#737373',
