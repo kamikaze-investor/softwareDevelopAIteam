@@ -20,19 +20,19 @@
 | task-004 | Docker Sandbox 設定 | [x] | task-003 | Developer AI |
 | task-005 | Mobile App 骨格 (Expo) | [x] | task-001 | Developer AI |
 | task-006 | Backend: Project CRUD API | [x] | task-002 | Codex |
-| task-007 | Backend: Task CRUD API | [ ] | task-002 | Codex |
-| task-008 | Backend: Job Queue API | [ ] | task-002 task-003 | Developer AI |
-| task-009 | Worker: Job実行エンジン | [ ] | task-003 task-004 | Developer AI |
+| task-007 | Backend: Task CRUD API | [x] | task-002 | Codex |
+| task-008 | Backend: Job Queue API | [x] | task-002 task-003 | Developer AI |
+| task-009 | Worker: Job実行エンジン | [x] | task-003 task-004 | Developer AI |
 | task-010 | Worker: CommandResolver実装 | [x] | task-003 | Developer AI |
 | task-011 | Worker: File Change Guard完成 | [x] | task-009 | Developer AI |
-| task-012 | Mobile: Dashboard画面 | [ ] | task-005 task-006 | Developer AI |
-| task-013 | Mobile: Project作成画面 | [ ] | task-005 task-006 | Developer AI |
-| task-014 | 簡易認証追加 (API token) | [ ] | task-002 | Developer AI |
+| task-012 | Mobile: Dashboard画面 | [x] | task-005 task-006 | Developer AI |
+| task-013 | Mobile: Project作成画面 | [x] | task-005 task-006 | Developer AI |
+| task-014 | 簡易認証追加 (API token) | [x] | task-002 | Developer AI |
 | task-015 | ReviewResult / QAResult型 + API | [ ] | task-007 | Developer AI |
-| task-016 | Job状態遷移ルール + 復旧ロジック | [ ] | task-008 task-009 | Developer AI |
-| task-017 | Jobログ分離保存 (stdout/stderrファイル) | [ ] | task-009 | Developer AI |
+| task-016 | Job状態遷移ルール + 復旧ロジック | [x] | task-008 task-009 | Developer AI |
+| task-017 | Jobログ分離保存 (stdout/stderrファイル) | [x] | task-009 | Developer AI |
 | task-018 | Backend Storage SQLite完全実装 | [x] | task-002 | Codex |
-| task-019 | Dashboard: Pending Approval UI | [ ] | task-012 | Developer AI |
+| task-019 | Dashboard: Pending Approval UI | [x] | task-012 | Developer AI |
 | task-020 | Meta Review 自動実行（GitHub Actions + pre-push） | [x] | — | Developer AI |
 | task-021 | AI CLI Adapter基盤（型定義 + BaseCliAdapter + 各Provider） | [x] | task-003 | Developer AI |
 | task-022 | CLI実行ログ保存（stdout/stderr/changedFiles永続化） | [ ] | task-021 task-017 | Developer AI |
@@ -62,4 +62,4 @@
 
 ---
 
-*Updated: 2026-06-05 (task-006 完了・PR #1 マージ)*
+*Updated: 2026-06-06 (task-007〜009, 012〜014, 016〜017, 019 完了確認)*
