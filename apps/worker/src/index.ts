@@ -31,6 +31,8 @@ type JobUpdate = Partial<Pick<
   | 'exitCode'
   | 'stdout'
   | 'stderr'
+  | 'stdoutPath'
+  | 'stderrPath'
   | 'changedFiles'
   | 'guardResult'
 >>
@@ -101,6 +103,8 @@ async function pollJobs(): Promise<never> {
           exitCode: result.exitCode,
           stdout: result.stdout,
           stderr: result.stderr,
+          stdoutPath: result.stdoutPath,
+          stderrPath: result.stderrPath,
           changedFiles: result.changedFiles,
           completedAt: result.completedAt,
           guardResult: result.guardResult,

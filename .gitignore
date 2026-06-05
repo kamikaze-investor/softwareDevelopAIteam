@@ -30,6 +30,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+data/logs/
 
 # Test coverage
 coverage/

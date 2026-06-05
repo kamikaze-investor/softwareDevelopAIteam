@@ -213,4 +213,30 @@ describe('Job API', () => {
       expect(parseBody<Job>(res.body).exitCode).toBe(0)
     })
   })
+
+  it('PATCH /api/jobs/:id updates log previews and paths', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          stdout: 'preview stdout',
+          stderr: 'preview stderr',
+          stdoutPath: '/workspace/target/data/logs/job-1/stdout.txt',
+          stderrPath: '/workspace/target/data/logs/job-1/stderr.txt',
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<Job>(res.body)
+      expect(body.stdout).toBe('preview stdout')
+      expect(body.stderr).toBe('preview stderr')
+      expect(body.stdoutPath).toBe('/workspace/target/data/logs/job-1/stdout.txt')
+      expect(body.stderrPath).toBe('/workspace/target/data/logs/job-1/stderr.txt')
+    })
+  })
 })

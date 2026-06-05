@@ -48,6 +48,8 @@ export const CREATE_TABLES = `
     exit_code INTEGER,
     stdout TEXT,
     stderr TEXT,
+    stdout_path TEXT,
+    stderr_path TEXT,
     changed_files TEXT NOT NULL DEFAULT '[]',
     commit_hash TEXT,
     rollback_info TEXT,
@@ -86,4 +88,6 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'jobs', column: 'dry_run', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'jobs', column: 'guard_result', definition: 'TEXT' },
   { table: 'jobs', column: 'approval_id', definition: 'TEXT' },
+  { table: 'jobs', column: 'stdout_path', definition: 'TEXT' },
+  { table: 'jobs', column: 'stderr_path', definition: 'TEXT' },
 ]

@@ -174,7 +174,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         UPDATE jobs SET
           status=?, started_at=?, completed_at=?, exit_code=?,
-          stdout=?, stderr=?, changed_files=?, commit_hash=?,
+          stdout=?, stderr=?, stdout_path=?, stderr_path=?, changed_files=?, commit_hash=?,
           rollback_info=?, guard_result=?, approval_id=?
         WHERE id=?
       `).run(
@@ -184,6 +184,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         updated.exitCode ?? null,
         updated.stdout ?? null,
         updated.stderr ?? null,
+        updated.stdoutPath ?? null,
+        updated.stderrPath ?? null,
         JSON.stringify(updated.changedFiles ?? []),
         updated.commitHash ?? null,
         updated.rollbackInfo ? JSON.stringify(updated.rollbackInfo) : null,
@@ -285,6 +287,8 @@ function deserializeJob(row: any): Job {
     exitCode: row.exit_code ?? undefined,
     stdout: row.stdout ?? undefined,
     stderr: row.stderr ?? undefined,
+    stdoutPath: row.stdout_path ?? undefined,
+    stderrPath: row.stderr_path ?? undefined,
     changedFiles: JSON.parse(row.changed_files ?? '[]'),
     commitHash: row.commit_hash ?? undefined,
     rollbackInfo: row.rollback_info ? JSON.parse(row.rollback_info) : undefined,

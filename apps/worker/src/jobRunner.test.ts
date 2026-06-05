@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { permissionGuard } from './guards/permissionGuard.js'
+import { saveJobLogs } from './jobLogger.js'
 import { runJob } from './jobRunner.js'
 
 vi.mock('node:child_process', () => ({
@@ -22,10 +23,20 @@ vi.mock('./guards/fileChangeGuard.js', () => ({
   fileChangeGuard: vi.fn(),
 }))
 
+vi.mock('./jobLogger.js', () => ({
+  saveJobLogs: vi.fn((jobId: string, stdout: string, stderr: string) => ({
+    stdoutPath: `/logs/${jobId}/stdout.txt`,
+    stderrPath: `/logs/${jobId}/stderr.txt`,
+    stdoutPreview: stdout.slice(0, 1000),
+    stderrPreview: stderr.slice(0, 1000),
+  })),
+}))
+
 const execFileSyncMock = vi.mocked(execFileSync)
 const resolveCommandMock = vi.mocked(resolveCommand)
 const permissionGuardMock = vi.mocked(permissionGuard)
 const fileChangeGuardMock = vi.mocked(fileChangeGuard)
+const saveJobLogsMock = vi.mocked(saveJobLogs)
 
 function createJob(overrides: Partial<Job> = {}): Job {
   return {
@@ -99,7 +110,10 @@ describe('runJob', () => {
     expect(result.status).toBe('success')
     expect(result.exitCode).toBe(0)
     expect(result.stdout).toBe('M src/index.ts\n')
+    expect(result.stdoutPath).toBe('/logs/job-1/stdout.txt')
+    expect(result.stderrPath).toBe('/logs/job-1/stderr.txt')
     expect(result.changedFiles).toEqual(['src/index.ts'])
+    expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'M src/index.ts\n', '')
   })
 
   it('returns failed when the command exits with a non-zero status', async () => {
@@ -123,6 +137,7 @@ describe('runJob', () => {
     expect(result.stdout).toBe('partial output')
     expect(result.stderr).toBe('fatal error')
     expect(result.changedFiles).toEqual([])
+    expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'partial output', 'fatal error')
   })
 
   it('returns failed when File Change Guard rejects changed files', async () => {

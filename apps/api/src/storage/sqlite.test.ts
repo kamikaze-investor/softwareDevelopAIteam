@@ -191,6 +191,10 @@ describe('SQLiteStorage', () => {
       storage.jobs.update(job.id, {
         status: 'success',
         exitCode: 0,
+        stdout: 'preview stdout',
+        stderr: 'preview stderr',
+        stdoutPath: '/workspace/target/data/logs/job-1/stdout.txt',
+        stderrPath: '/workspace/target/data/logs/job-1/stderr.txt',
         changedFiles: ['apps/api/src/storage/sqlite.ts'],
         guardResult: {
           permissionAllowed: true,
@@ -203,6 +207,10 @@ describe('SQLiteStorage', () => {
 
       expect(found?.status).toBe('success')
       expect(found?.exitCode).toBe(0)
+      expect(found?.stdout).toBe('preview stdout')
+      expect(found?.stderr).toBe('preview stderr')
+      expect(found?.stdoutPath).toBe('/workspace/target/data/logs/job-1/stdout.txt')
+      expect(found?.stderrPath).toBe('/workspace/target/data/logs/job-1/stderr.txt')
       expect(found?.changedFiles).toEqual(['apps/api/src/storage/sqlite.ts'])
       expect(found?.guardResult?.permissionAllowed).toBe(true)
       expect(found?.approvalId).toBe('approval-1')
