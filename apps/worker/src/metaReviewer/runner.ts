@@ -220,6 +220,13 @@ export function parseMetaReviewResult(
   }
 
   // パース失敗は最も安全な方向（blocked）に倒す
+  // デバッグ用: 実際の応答内容を出力する（次回の修正に役立てる）
+  console.error('=== Meta Review パース失敗 ===')
+  console.error('応答の先頭200文字:', rawResponse.slice(0, 200))
+  console.error('応答の末尾200文字:', rawResponse.slice(-200))
+  console.error('応答の全文字数:', rawResponse.length)
+  console.error('==============================')
+
   return {
     id: `meta-review-${taskId}-${Date.now()}`,
     taskId,
@@ -230,7 +237,7 @@ export function parseMetaReviewResult(
       severity: 'critical',
       category: 'security_regression',
       message: 'Meta Review AIの応答が不正なフォーマットです',
-      suggestion: 'Meta Reviewer AIの応答を確認してください',
+      suggestion: 'GitHub Actions のログで「=== Meta Review パース失敗 ===」を検索して応答内容を確認してください',
     }],
     requiresCeoApproval: true,
     createdAt: new Date().toISOString(),

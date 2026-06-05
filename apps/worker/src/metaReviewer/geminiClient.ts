@@ -30,8 +30,10 @@ export async function callGeminiForReview(prompt: string): Promise<string> {
   const model = genAI.getGenerativeModel({
     model: modelName,
     generationConfig: {
-      responseMimeType: 'application/json',
-      // 低温度 = 決定論的な判断（セキュリティレビューに適切）
+      // responseMimeType: 'application/json' は使わない。
+      // JSON mode では Gemini がスキーマを無視した構造で返すことがあり
+      // parseMetaReviewResult() のパースが失敗する原因になる。
+      // Gemini には「JSON で返せ」とプロンプトで指示し、runner.ts 側でパースする。
       temperature: 0.1,
       maxOutputTokens: 4096,
     },
