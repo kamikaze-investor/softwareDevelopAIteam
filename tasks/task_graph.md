@@ -19,8 +19,8 @@
 | task-003 | Worker 骨格 | [x] | task-001 | Developer AI |
 | task-004 | Docker Sandbox 設定 | [x] | task-003 | Developer AI |
 | task-005 | Mobile App 骨格 (Expo) | [x] | task-001 | Developer AI |
-| task-006 | Backend: Project CRUD API | [ ] | task-002 | Developer AI |
-| task-007 | Backend: Task CRUD API | [ ] | task-002 | Developer AI |
+| task-006 | Backend: Project CRUD API | [x] | task-002 | Codex |
+| task-007 | Backend: Task CRUD API | [ ] | task-002 | Codex |
 | task-008 | Backend: Job Queue API | [ ] | task-002 task-003 | Developer AI |
 | task-009 | Worker: Job実行エンジン | [ ] | task-003 task-004 | Developer AI |
 | task-010 | Worker: CommandResolver実装 | [x] | task-003 | Developer AI |
@@ -62,4 +62,4 @@
 
 ---
 
-*Updated: 2026-05-30 (AI CLI Adapter追加)*
+*Updated: 2026-06-05 (task-006 完了・PR #1 マージ)*
