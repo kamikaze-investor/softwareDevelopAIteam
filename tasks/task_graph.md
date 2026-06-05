@@ -28,16 +28,16 @@
 | task-012 | Mobile: Dashboard画面 | [x] | task-005 task-006 | Developer AI |
 | task-013 | Mobile: Project作成画面 | [x] | task-005 task-006 | Developer AI |
 | task-014 | 簡易認証追加 (API token) | [x] | task-002 | Developer AI |
-| task-015 | ReviewResult / QAResult型 + API | [ ] | task-007 | Developer AI |
+| task-015 | ReviewResult / QAResult型 + API | [x] | task-007 | Developer AI |
 | task-016 | Job状態遷移ルール + 復旧ロジック | [x] | task-008 task-009 | Developer AI |
 | task-017 | Jobログ分離保存 (stdout/stderrファイル) | [x] | task-009 | Developer AI |
 | task-018 | Backend Storage SQLite完全実装 | [x] | task-002 | Codex |
 | task-019 | Dashboard: Pending Approval UI | [x] | task-012 | Developer AI |
 | task-020 | Meta Review 自動実行（GitHub Actions + pre-push） | [x] | — | Developer AI |
 | task-021 | AI CLI Adapter基盤（型定義 + BaseCliAdapter + 各Provider） | [x] | task-003 | Developer AI |
-| task-022 | CLI実行ログ保存（stdout/stderr/changedFiles永続化） | [ ] | task-021 task-017 | Developer AI |
-| task-023 | CLI出力パーサー + JSONリトライ機構（失敗→blocked） | [ ] | task-021 | Developer AI |
-| task-024 | CLI timeout / cancel 設計（暴走防止） | [ ] | task-021 | Developer AI |
+| task-022 | CLI実行ログ保存（stdout/stderr/changedFiles永続化） | [x] | task-021 task-017 | Developer AI |
+| task-023 | CLI出力パーサー + JSONリトライ機構（失敗→blocked） | [x] | task-021 | Developer AI |
+| task-024 | CLI timeout / cancel 設計（暴走防止） | [x] | task-021 | Developer AI |
 
 ---
 
@@ -62,4 +62,4 @@
 
 ---
 
-*Updated: 2026-06-06 (task-007〜009, 012〜014, 016〜017, 019 完了確認)*
+*Updated: 2026-06-06 (task-015, 022〜024 完了・Phase 1 全タスク完了)*
