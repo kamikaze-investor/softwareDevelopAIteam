@@ -13,11 +13,17 @@ import { projectRoutes } from './routes/projects'
 import { approvalRoutes } from './routes/approvals'
 import { taskRoutes } from './routes/tasks'
 import { jobRoutes } from './routes/jobs'
+import { apiTokenAuth } from './auth/apiToken'
 
 const app = Fastify({ logger: true })
 
 app.register(cors, {
   origin: true,
+})
+
+app.addHook('preHandler', async (req, reply): Promise<void> => {
+  if (req.url === '/health') return
+  await apiTokenAuth(req, reply)
 })
 
 getStorage()
