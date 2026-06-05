@@ -57,6 +57,8 @@ const UpdateJobBody = z.object({
   exitCode: z.number().int().optional(),
   stdout: z.string().optional(),
   stderr: z.string().optional(),
+  stdoutPath: z.string().optional(),
+  stderrPath: z.string().optional(),
   changedFiles: z.array(z.string()).optional(),
   commitHash: z.string().optional(),
   rollbackInfo: z.object({

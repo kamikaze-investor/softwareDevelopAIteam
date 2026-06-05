@@ -11,10 +11,10 @@ import { execFileSync } from 'node:child_process'
 import type { Job, JobGuardResult } from '@ai-team/shared'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
+import { saveJobLogs } from './jobLogger.js'
 import { permissionGuard } from './guards/permissionGuard.js'
 
 const JOB_TIMEOUT_MS = 120_000
-const MAX_OUTPUT_LENGTH = 10_000
 
 interface ExecFileFailure {
   status?: number
@@ -27,6 +27,8 @@ export interface JobRunResult {
   exitCode?: number
   stdout?: string
   stderr?: string
+  stdoutPath?: string
+  stderrPath?: string
   changedFiles?: string[]
   guardResult: JobGuardResult
   startedAt: string
@@ -83,12 +85,15 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   const fileGuard = fileChangeGuard(changedFiles)
   guardResult.fileChangeAllowed = fileGuard.allowed
   guardResult.fileViolations = fileGuard.violations
+  const logPaths = saveJobLogs(job.id, stdout, stderr)
 
   return {
     status: exitCode === 0 && fileGuard.allowed ? 'success' : 'failed',
     exitCode,
-    stdout: stdout.slice(0, MAX_OUTPUT_LENGTH),
-    stderr: stderr.slice(0, MAX_OUTPUT_LENGTH),
+    stdout: logPaths.stdoutPreview,
+    stderr: logPaths.stderrPreview,
+    stdoutPath: logPaths.stdoutPath,
+    stderrPath: logPaths.stderrPath,
     changedFiles,
     guardResult,
     startedAt,

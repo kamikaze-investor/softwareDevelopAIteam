@@ -40,6 +40,8 @@ export interface Job {
   exitCode?: number
   stdout?: string
   stderr?: string
+  stdoutPath?: string
+  stderrPath?: string
   changedFiles?: string[]
   commitHash?: string
   rollbackInfo?: RollbackInfo
