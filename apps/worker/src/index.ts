@@ -13,6 +13,7 @@
  */
 
 import type { Job, Project, Task } from '@ai-team/shared'
+import { assertTransition, recoverStaleJobs } from './jobStateManager.js'
 import { runJob } from './jobRunner.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
@@ -85,15 +86,18 @@ async function pollJobs(): Promise<never> {
       if (job) {
         console.log(`[Worker] Job ${job.id} (${job.safeCommand.kind}) を実行します`)
 
+        assertTransition(job.status, 'running')
         await updateJob(job.id, {
           status: 'running',
           startedAt: new Date().toISOString(),
         })
 
         const result = await runJob(job)
+        const resultStatus = resolveResultStatus(result)
 
+        assertTransition('running', resultStatus)
         await updateJob(job.id, {
-          status: result.status,
+          status: resultStatus,
           exitCode: result.exitCode,
           stdout: result.stdout,
           stderr: result.stderr,
@@ -102,7 +106,7 @@ async function pollJobs(): Promise<never> {
           guardResult: result.guardResult,
         })
 
-        console.log(`[Worker] Job ${job.id}: ${result.status}`)
+        console.log(`[Worker] Job ${job.id}: ${resultStatus}`)
       }
     } catch (err: unknown) {
       console.error(`[Worker] ポーリングエラー: ${formatUnknownError(err)}`)
@@ -131,4 +135,31 @@ function formatUnknownError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-pollJobs()
+function resolveResultStatus(result: Awaited<ReturnType<typeof runJob>>): Job['status'] {
+  if (!result.guardResult.permissionAllowed || !result.guardResult.fileChangeAllowed) {
+    return 'blocked'
+  }
+
+  return result.status
+}
+
+async function recoverJobsAtStartup(): Promise<void> {
+  try {
+    const recovered = await recoverStaleJobs(API_BASE, authHeaders())
+    if (recovered > 0) {
+      console.log(`[Worker] ${recovered} 件の stale Job を復旧しました`)
+    }
+  } catch (err: unknown) {
+    console.error(`[Worker] 起動時復旧エラー: ${formatUnknownError(err)}。通常ポーリングを継続します`)
+  }
+}
+
+async function start(): Promise<void> {
+  await recoverJobsAtStartup()
+  await pollJobs()
+}
+
+start().catch((err: unknown) => {
+  console.error(`[Worker] 起動エラー: ${formatUnknownError(err)}`)
+  process.exitCode = 1
+})
