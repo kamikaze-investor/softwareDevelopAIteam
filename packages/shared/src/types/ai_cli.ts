@@ -203,6 +203,12 @@ export interface AiCliResult {
 
   /** JSONパース失敗などで再試行した回数 */
   retryCount?: number
+
+  /** 保存された stdout ファイルのパス（task-022） */
+  stdoutPath?: string
+
+  /** 保存された stderr ファイルのパス（task-022） */
+  stderrPath?: string
 }
 
 // ────────────────────────────────────────────────────────────
