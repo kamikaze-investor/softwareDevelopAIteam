@@ -24,6 +24,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Prepare workspace paths
+        run: |
+          sudo mkdir -p /workspace
+          if [ ! -e /workspace/control ]; then
+            sudo ln -s "$GITHUB_WORKSPACE" /workspace/control
+          fi
+
       # -------------------------------------------------------
       # 2. Node.js + pnpm のセットアップ
       # -------------------------------------------------------
@@ -43,13 +50,15 @@ jobs:
       # -------------------------------------------------------
       - name: Run Meta Review
         id: meta-review
-        run: pnpm --filter @ai-team/worker tsx src/metaReviewer/autoReview.ts
+        run: pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           BASE_SHA:  ${{ github.event.pull_request.base.sha }}
           HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
           PR_TITLE:  ${{ github.event.pull_request.title }}
           TASK_ID:   "pr-${{ github.event.pull_request.number }}"
+          META_REVIEW_RESULT_PATH: ${{ github.workspace }}/meta-review-result.json
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
 
       # -------------------------------------------------------
       # 4. 結果をPRにコメント投稿（always = blocked時も投稿）

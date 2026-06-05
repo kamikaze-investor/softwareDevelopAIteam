@@ -11,8 +11,8 @@
 import { GoogleGenerativeAI } from '@google/generative-ai'
 
 // レビュー用モデル設定
-// gemini-2.5-pro: セキュリティ判断に最高品質を使う
-const GEMINI_MODEL = 'gemini-2.5-pro'
+// gemini-2.5-flash: CI の無料枠でも動かしやすい安定版をデフォルトにする
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
 
 /**
  * Gemini にレビューを依頼し、生のテキスト応答を返す
@@ -26,12 +26,17 @@ export async function callGeminiForReview(prompt: string): Promise<string> {
   }
 
   const genAI = new GoogleGenerativeAI(apiKey)
+  const modelName = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL
   const model = genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
+    model: modelName,
     generationConfig: {
-      // 低温度 = 決定論的な判断（セキュリティレビューに適切）
+      // responseMimeType を指定しない（JSON mode はトークン不足時に途中切断される）
+      // Gemini には「JSON で返せ」とプロンプトで指示し、runner.ts 側でパースする。
       temperature: 0.1,
-      maxOutputTokens: 4096,
+      // maxOutputTokens を増やした理由:
+      //   4096 では PR の diff が大きいとき JSON が途中で切れてパース失敗する。
+      //   gemini-2.5-flash の上限は 8192 tokens。
+      maxOutputTokens: 8192,
     },
   })
 

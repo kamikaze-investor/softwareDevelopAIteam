@@ -1,0 +1,24 @@
+# CODEOWNERS — AI Development Team OS
+#
+# セキュリティ上重要なファイルのみオーナー承認を必須化。
+# 通常の実装ファイル（routes, tests 等）は対象外 → AI が自律的にマージできる。
+#
+# 守るもの:
+#   - ワークフロー改ざん（AI が審査を回避するコードを仕込む）
+#   - Guard / Sandbox 弱体化
+#   - CLAUDE.md 憲法変更
+#   - Meta Reviewer プロンプト改ざん
+#   - AgentPolicy 権限拡大
+
+# ワークフロー（Meta Reviewer の審査を回避するコードの追加を防ぐ）
+.github/workflows/ @kamikaze-investor
+.github/CODEOWNERS @kamikaze-investor
+
+# セキュリティ機構
+apps/worker/src/guards/ @kamikaze-investor
+sandbox/ @kamikaze-investor
+
+# 憲法・権限定義
+CLAUDE.md @kamikaze-investor
+docs/meta_reviewer/ @kamikaze-investor
+packages/shared/src/types/agent.ts @kamikaze-investor

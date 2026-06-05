@@ -16,6 +16,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } from './runner.js'
 import { callGeminiForReview } from './geminiClient.js'
 
@@ -26,6 +27,8 @@ async function main(): Promise<void> {
   const prTitle = process.env.PR_TITLE ?? 'Manual Meta Review'
   const taskId  = process.env.TASK_ID ?? `pr-${Date.now()}`
   const workingDir = process.cwd()
+  const resultFilePath = process.env.META_REVIEW_RESULT_PATH
+    ?? resolve(workingDir, 'meta-review-result.json')
 
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
   console.log('🔍 Meta Review 開始（Gemini）')
@@ -76,7 +79,7 @@ async function main(): Promise<void> {
       findings: [],
       requiresCeoApproval: false,
       createdAt: new Date().toISOString(),
-    })
+    }, resultFilePath)
     process.exit(0)
   }
 
@@ -116,17 +119,24 @@ async function main(): Promise<void> {
       requiresCeoApproval: true,
       createdAt: new Date().toISOString(),
     }
-    writeResultFile(errorResult)
+    writeResultFile(errorResult, resultFilePath)
     printResult(errorResult)
     process.exit(1)
   }
 
   // --- 結果をパース ---
   const result = parseMetaReviewResult(rawResponse, taskId)
-  writeResultFile(result)
+  writeResultFile(result, resultFilePath)
   printResult(result)
 
   // --- 終了コード ---
+  //
+  // blocked = exit 1（CI 失敗）の設計について:
+  //   Meta Review が genuine なセキュリティ違反を検出した場合、CI を失敗させる。
+  //   ただし autoReview.ts 自体が CODEOWNERS の対象ではないため AI が改ざん可能。
+  //   本当の防護壁は CODEOWNERS によるセキュリティファイルへの人間承認必須。
+  //   詳細: .github/CODEOWNERS を参照。
+  //
   if (result.status === 'blocked') {
     console.error('\n🚫 BLOCKED: このPRはCEO承認なしにマージできません')
     process.exit(1)
@@ -134,7 +144,6 @@ async function main(): Promise<void> {
 
   if (result.status === 'changes_requested') {
     console.warn('\n⚠️  CHANGES REQUESTED: 修正後に再レビューが必要です')
-    // changes_requested は警告のみ（マージはブロックしない）
     process.exit(0)
   }
 
@@ -160,8 +169,8 @@ type MetaReviewResultLike = {
   createdAt: string
 }
 
-function writeResultFile(result: MetaReviewResultLike): void {
-  writeFileSync('meta-review-result.json', JSON.stringify(result, null, 2))
+function writeResultFile(result: MetaReviewResultLike, resultFilePath: string): void {
+  writeFileSync(resultFilePath, JSON.stringify(result, null, 2))
 }
 
 function printResult(result: MetaReviewResultLike): void {
