@@ -71,6 +71,30 @@ export const CREATE_TABLES = `
     created_at TEXT NOT NULL,
     FOREIGN KEY (project_id) REFERENCES projects(id)
   );
+
+  CREATE TABLE IF NOT EXISTS review_results (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    findings TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS qa_results (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    details TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+  );
 `
 
 /**

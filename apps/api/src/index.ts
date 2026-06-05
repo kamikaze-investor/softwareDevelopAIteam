@@ -13,6 +13,7 @@ import { projectRoutes } from './routes/projects'
 import { approvalRoutes } from './routes/approvals'
 import { taskRoutes } from './routes/tasks'
 import { jobRoutes } from './routes/jobs'
+import { reviewRoutes, qaRoutes } from './routes/reviews'
 import { apiTokenAuth } from './auth/apiToken'
 
 const app = Fastify({ logger: true })
@@ -38,6 +39,8 @@ app.register(projectRoutes, { prefix: '/api/projects' })
 app.register(approvalRoutes, { prefix: '/api' })
 app.register(taskRoutes, { prefix: '/api/tasks' })
 app.register(jobRoutes, { prefix: '/api/jobs' })
+app.register(reviewRoutes, { prefix: '/api/reviews' })
+app.register(qaRoutes, { prefix: '/api/qa' })
 // app.register(dashboardRoutes, { prefix: '/api/dashboard' })
 
 const PORT = Number(process.env.PORT) || 3000
