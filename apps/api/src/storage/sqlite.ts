@@ -9,8 +9,8 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -233,7 +233,63 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals }
+  const reviewResults: IReviewResultStorage = {
+    findByTaskId(taskId) {
+      const rows = db.prepare('SELECT * FROM review_results WHERE task_id = ? ORDER BY created_at DESC').all(taskId) as any[]
+      return rows.map(deserializeReviewResult)
+    },
+    findById(id) {
+      const row = db.prepare('SELECT * FROM review_results WHERE id = ?').get(id) as any
+      return row ? deserializeReviewResult(row) : undefined
+    },
+    create(data) {
+      const result: ReviewResult = { ...data, id: randomUUID(), createdAt: now() }
+      db.prepare(`
+        INSERT INTO review_results (id, task_id, job_id, reviewer, status, summary, findings, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        result.id,
+        result.taskId,
+        result.jobId,
+        result.reviewer,
+        result.status,
+        result.summary,
+        JSON.stringify(result.findings),
+        result.createdAt,
+      )
+      return result
+    },
+  }
+
+  const qaResults: IQAResultStorage = {
+    findByTaskId(taskId) {
+      const rows = db.prepare('SELECT * FROM qa_results WHERE task_id = ? ORDER BY created_at DESC').all(taskId) as any[]
+      return rows.map(deserializeQAResult)
+    },
+    findById(id) {
+      const row = db.prepare('SELECT * FROM qa_results WHERE id = ?').get(id) as any
+      return row ? deserializeQAResult(row) : undefined
+    },
+    create(data) {
+      const result: QAResult = { ...data, id: randomUUID(), createdAt: now() }
+      db.prepare(`
+        INSERT INTO qa_results (id, task_id, job_id, type, status, summary, details, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        result.id,
+        result.taskId,
+        result.jobId,
+        result.type,
+        result.status,
+        result.summary,
+        result.details ?? null,
+        result.createdAt,
+      )
+      return result
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults }
 }
 
 function deserializeProject(row: any): Project {
@@ -294,6 +350,32 @@ function deserializeJob(row: any): Job {
     rollbackInfo: row.rollback_info ? JSON.parse(row.rollback_info) : undefined,
     guardResult: row.guard_result ? JSON.parse(row.guard_result) : undefined,
     approvalId: row.approval_id ?? undefined,
+    createdAt: row.created_at,
+  }
+}
+
+function deserializeReviewResult(row: any): ReviewResult {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    jobId: row.job_id,
+    reviewer: row.reviewer,
+    status: row.status,
+    summary: row.summary,
+    findings: JSON.parse(row.findings ?? '[]'),
+    createdAt: row.created_at,
+  }
+}
+
+function deserializeQAResult(row: any): QAResult {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    jobId: row.job_id,
+    type: row.type,
+    status: row.status,
+    summary: row.summary,
+    details: row.details ?? undefined,
     createdAt: row.created_at,
   }
 }

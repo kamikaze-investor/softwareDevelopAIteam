@@ -7,8 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval } from '@ai-team/shared'
-import type { Job } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult } from '@ai-team/shared'
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -38,9 +37,23 @@ export interface IApprovalStorage {
   update(id: string, data: Partial<Approval>): Approval | undefined
 }
 
+export interface IReviewResultStorage {
+  findByTaskId(taskId: string): ReviewResult[]
+  findById(id: string): ReviewResult | undefined
+  create(data: Omit<ReviewResult, 'id' | 'createdAt'>): ReviewResult
+}
+
+export interface IQAResultStorage {
+  findByTaskId(taskId: string): QAResult[]
+  findById(id: string): QAResult | undefined
+  create(data: Omit<QAResult, 'id' | 'createdAt'>): QAResult
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
   jobs: IJobStorage
   approvals: IApprovalStorage
+  reviewResults: IReviewResultStorage
+  qaResults: IQAResultStorage
 }
