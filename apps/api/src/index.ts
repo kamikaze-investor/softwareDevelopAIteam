@@ -12,6 +12,7 @@ import { getStorage } from './storage'
 import { projectRoutes } from './routes/projects'
 import { approvalRoutes } from './routes/approvals'
 import { taskRoutes } from './routes/tasks'
+import { jobRoutes } from './routes/jobs'
 
 const app = Fastify({ logger: true })
 
@@ -30,7 +31,7 @@ app.get('/health', async () => {
 app.register(projectRoutes, { prefix: '/api/projects' })
 app.register(approvalRoutes, { prefix: '/api' })
 app.register(taskRoutes, { prefix: '/api/tasks' })
-// app.register(jobRoutes, { prefix: '/api/jobs' })
+app.register(jobRoutes, { prefix: '/api/jobs' })
 // app.register(dashboardRoutes, { prefix: '/api/dashboard' })
 
 const PORT = Number(process.env.PORT) || 3000
