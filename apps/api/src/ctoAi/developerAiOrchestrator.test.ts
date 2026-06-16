@@ -77,6 +77,18 @@ describe('runDeveloperAi (mockRun)', () => {
     expect(result.durationMs).toBe(0)
   })
 
+  // [codex-review P1] mockRun=false は明確なエラーを返す（壊れた動的importを防ぐ）
+  it('mockRun=false は NotImplemented エラーをスローする', async () => {
+    await expect(runDeveloperAi({
+      provider: 'claude',
+      instruction: 'テスト',
+      targetProjectRoot: tmpDir(),
+      taskId: 'task-001',
+      timeoutMs: 10_000,
+      mockRun: false,
+    })).rejects.toThrow('Job Queue')
+  })
+
   it('mockRun=true のとき provider 名が結果に含まれる', async () => {
     const result = await runDeveloperAi({
       provider: 'gemini',

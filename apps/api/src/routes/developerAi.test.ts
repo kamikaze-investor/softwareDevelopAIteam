@@ -102,4 +102,41 @@ describe('Developer AI API', () => {
     const body = JSON.parse(res.body)
     expect(Array.isArray(body.changedFiles)).toBe(true)
   })
+
+  // [codex-review P2] 手動承認ゲートのテスト
+  it('POST /api/developer-ai/run — mockRun=false & approved=false は 403', async () => {
+    const app = buildApp()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/developer-ai/run',
+      body: {
+        instruction: '実装してください',
+        targetProjectRoot: tmpDir,
+        taskId: 'task-001',
+        mockRun: false,
+        approved: false,
+      },
+    })
+    expect(res.statusCode).toBe(403)
+    const body = JSON.parse(res.body)
+    expect(body.error).toContain('承認が必要')
+  })
+
+  // [codex-review P1] パス境界検証のテスト
+  it('POST /api/developer-ai/run — ".." を含むパスは 400', async () => {
+    const app = buildApp()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/developer-ai/run',
+      body: {
+        instruction: '実装してください',
+        targetProjectRoot: 'C:/Users/honka/../softwareDevelopAIteam',
+        taskId: 'task-001',
+        mockRun: true,
+      },
+    })
+    expect(res.statusCode).toBe(400)
+    const body = JSON.parse(res.body)
+    expect(body.error).toContain('パス検証エラー')
+  })
 })
