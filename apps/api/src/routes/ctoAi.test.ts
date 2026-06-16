@@ -117,3 +117,94 @@ describe('CTO AI API', () => {
     expect(res.statusCode).toBe(400)
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// task-102: generate-roadmap エンドポイント
+// ────────────────────────────────────────────────────────────
+
+const MOCK_ROADMAP = JSON.stringify({
+  phases: [
+    {
+      number: 1,
+      name: '基盤構築',
+      goal: '型定義とDB',
+      tasks: ['task-001'],
+    },
+  ],
+  tasks: [
+    {
+      id: 'task-001',
+      title: '共有型定義',
+      description: 'shared パッケージに型を追加',
+      phase: 1,
+      assignee: 'developer_ai',
+      dependencies: [],
+      acceptanceCriteria: ['型エラーがない'],
+      allowedPaths: ['packages/shared/src/'],
+      estimatedComplexity: 'small',
+    },
+  ],
+  totalTasks: 1,
+  estimatedWeeks: 1,
+})
+
+const MOCK_ANALYSIS_OBJ = JSON.parse(MOCK_ANALYSIS)
+
+describe('CTO AI — generate-roadmap API', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    resetStorage()
+    tmpDir = path.join(os.tmpdir(), `roadmap-api-test-${Date.now()}`)
+    mkdirSync(tmpDir, { recursive: true })
+  })
+
+  it('POST /api/cto/generate-roadmap — mockResponse でロードマップを生成できる', async () => {
+    const app = buildApp()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      body: {
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.status).toBe('roadmap_generated')
+    expect(body.totalTasks).toBe(1)
+    expect(body.writtenFiles).toHaveLength(2)
+    // ファイルが実際に生成されているか
+    const { existsSync } = await import('node:fs')
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(true)
+    expect(existsSync(path.join(tmpDir, 'tasks', 'task_graph.md'))).toBe(true)
+  })
+
+  it('POST /api/cto/generate-roadmap — analysis がない場合 400', async () => {
+    const app = buildApp()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      body: {
+        targetProjectRoot: tmpDir,
+        mockResponse: MOCK_ROADMAP,
+        // analysis なし
+      },
+    })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('POST /api/cto/generate-roadmap — targetProjectRoot がない場合 400', async () => {
+    const app = buildApp()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      body: {
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+    expect(res.statusCode).toBe(400)
+  })
+})
