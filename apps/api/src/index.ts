@@ -16,6 +16,7 @@ import { jobRoutes } from './routes/jobs'
 import { reviewRoutes, qaRoutes } from './routes/reviews'
 import { ctoAiRoutes } from './routes/ctoAi'
 import { contextPackRoutes } from './routes/contextPack'
+import { developerAiRoutes } from './routes/developerAi'
 import { apiTokenAuth } from './auth/apiToken'
 
 const app = Fastify({ logger: true })
@@ -45,6 +46,7 @@ app.register(reviewRoutes, { prefix: '/api/reviews' })
 app.register(qaRoutes, { prefix: '/api/qa' })
 app.register(ctoAiRoutes, { prefix: '/api/cto' })
 app.register(contextPackRoutes, { prefix: '/api/context-pack' })
+app.register(developerAiRoutes, { prefix: '/api/developer-ai' })
 // app.register(dashboardRoutes, { prefix: '/api/dashboard' })
 
 const PORT = Number(process.env.PORT) || 3000
