@@ -9,6 +9,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { updateDashboard } from '../ctoAi/summaryEngine.js'
+import { validateTargetRoot } from '../utils/pathGuard.js'
 
 const UpdateBody = z.object({
   /** Developer AI の実行結果 */
@@ -38,6 +39,12 @@ export async function summaryEngineRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const { result, targetProjectRoot } = parsed.data
+
+    // [codex-review P1] パス境界検証
+    const pathCheck = validateTargetRoot(targetProjectRoot)
+    if (!pathCheck.ok) {
+      return reply.status(400).send({ error: 'パス検証エラー', detail: pathCheck.reason })
+    }
 
     try {
       const summary = updateDashboard(result as any, targetProjectRoot)

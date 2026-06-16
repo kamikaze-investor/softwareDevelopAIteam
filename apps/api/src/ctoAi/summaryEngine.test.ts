@@ -61,7 +61,7 @@ describe('updateDashboard', () => {
     expect(result2.entriesInDashboard).toBe(2)
   })
 
-  it('task_graph.md が存在すれば [x] に更新する', () => {
+  it('status=success のとき task_graph.md を [x] に更新する', () => {
     const tasksDir = path.join(tmpDir, 'tasks')
     mkdirSync(tasksDir, { recursive: true })
     writeFileSync(
@@ -69,7 +69,8 @@ describe('updateDashboard', () => {
       '| task-001 | 共有型定義 | [ ] | — | developer_ai |\n',
     )
 
-    const result = updateDashboard(MOCK_RESULT, tmpDir)
+    // [codex-review P2修正] mock ではなく success を使う
+    const result = updateDashboard({ ...MOCK_RESULT, status: 'success' }, tmpDir)
     expect(result.taskStatusUpdated).toBe(true)
 
     const content = readFileSync(path.join(tasksDir, 'task_graph.md'), 'utf-8')
@@ -93,6 +94,20 @@ describe('updateDashboard', () => {
     updateDashboard({ ...MOCK_RESULT, status: 'failed' }, tmpDir)
     const content = readFileSync(path.join(tasksDir, 'task_graph.md'), 'utf-8')
     expect(content).toContain('[!]')
+  })
+
+  // [codex-review P2] mock は task_graph を更新しないこと
+  it('status=mock のとき task_graph.md は変更しない', () => {
+    const tasksDir = path.join(tmpDir, 'tasks')
+    mkdirSync(tasksDir, { recursive: true })
+    const original = '| task-001 | 共有型定義 | [ ] | — | developer_ai |\n'
+    writeFileSync(path.join(tasksDir, 'task_graph.md'), original)
+
+    const result = updateDashboard(MOCK_RESULT, tmpDir)  // status='mock'
+    expect(result.taskStatusUpdated).toBe(false)
+
+    const content = readFileSync(path.join(tasksDir, 'task_graph.md'), 'utf-8')
+    expect(content).toBe(original)  // 変更なし
   })
 
   it('stdout が dashboard.md に含まれる（省略あり）', () => {

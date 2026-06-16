@@ -195,11 +195,16 @@ export function updateDashboard(
   const existingContent = readExistingEntries(dashboardPath)
   const entriesInDashboard = writeDashboard(dashboardPath, entry, existingContent)
 
-  // 成功・mock の場合は task_graph.md のステータスを [x] に
-  const isSuccess = result.status === 'success' || result.status === 'mock'
-  const taskStatusUpdated = isSuccess
-    ? updateTaskGraph(taskGraphPath, result.taskId, '[x]')
-    : updateTaskGraph(taskGraphPath, result.taskId, '[!]')
+  // [codex-review P2修正]
+  // mock / dry-run は実際の変更を伴わないため task_graph を完了扱いにしない。
+  // success のみ [x]、failed/blocked は [!]、mock は task_graph を更新しない。
+  let taskStatusUpdated = false
+  if (result.status === 'success') {
+    taskStatusUpdated = updateTaskGraph(taskGraphPath, result.taskId, '[x]')
+  } else if (result.status === 'failed' || result.status === 'blocked') {
+    taskStatusUpdated = updateTaskGraph(taskGraphPath, result.taskId, '[!]')
+  }
+  // mock: task_graph 更新なし（進捗への影響を与えない）
 
   return {
     dashboardPath,

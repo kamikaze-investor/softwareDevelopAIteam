@@ -101,45 +101,20 @@ export async function runDeveloperAi(
     return mockExecution(req)
   }
 
-  // Worker の AI CLI Adapter を動的インポートして実行
-  // （Worker と API は別パッケージだが、モノレポなので直接インポート可能）
-  // 実際の Docker 環境では Worker が別プロセスで動くため、
-  // 本番では Job Queue 経由で呼ぶ（task-104はローカル統合テスト用のブリッジ）
-  const { createAiCliAdapter } = await import(
-    '../../worker/src/aiCli/factory.js'
-  ).catch(() => {
-    // パス解決失敗時はフォールバック用エラーを投げる
-    throw new Error(
-      '[DeveloperAI] Worker モジュールへのパスが解決できません。' +
-      'Docker 環境では Job Queue 経由で実行してください。'
-    )
-  })
-
-  const adapter = createAiCliAdapter({ provider: req.provider })
-  const prompt = buildPrompt(req)
-  const startMs = Date.now()
-
-  const result = await adapter.run({
-    prompt,
-    workingDir: req.targetProjectRoot,
-    provider: req.provider,
-    timeoutMs: req.timeoutMs,
-    expectJson: false,
-  })
-
-  const completedAt = new Date().toISOString()
-  const durationMs = Date.now() - startMs
-
-  return {
-    status: result.exitCode === 0 ? 'success' : 'failed',
-    taskId: req.taskId,
-    provider: req.provider,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    changedFiles: result.changedFiles,
-    exitCode: result.exitCode,
-    executedAt,
-    completedAt,
-    durationMs,
-  }
+  // [codex-review P1修正]
+  // 本番実行は Job Queue 経由で Worker プロセスに委譲する設計。
+  // API から Worker モジュールを直接 import するとパスが壊れる
+  // （`apps/api/src/ctoAi/` から相対パスでは Worker に到達できない）ため、
+  // mockRun=false の直接実行は意図的に実装しない。
+  //
+  // 実行フロー（本番）:
+  //   POST /api/developer-ai/run { mockRun: false }
+  //   → Job をキューに積む（POST /api/jobs）
+  //   → Worker が Job をピックアップして AI CLI Adapter を呼ぶ
+  //   → 結果を POST /api/summary/update で Dashboard に反映
+  throw new Error(
+    '[DeveloperAI] mockRun=false の直接実行は未実装です。\n' +
+    'Job Queue 経由（POST /api/jobs → Worker）で実行してください。\n' +
+    'テスト・開発時は mockRun: true を使用してください。'
+  )
 }

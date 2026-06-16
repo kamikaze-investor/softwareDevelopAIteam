@@ -12,6 +12,7 @@ import { analyzeSpec } from '../ctoAi/specAnalyzer.js'
 import { writeProjectMemory } from '../ctoAi/projectMemoryWriter.js'
 import { generateRoadmap } from '../ctoAi/roadmapGenerator.js'
 import { writeRoadmap } from '../ctoAi/roadmapWriter.js'
+import { validateTargetRoot } from '../utils/pathGuard.js'
 
 const AnalyzeBody = z.object({
   /** 仕様書テキスト（Markdown） */
@@ -56,6 +57,12 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
 
     const { specText, targetProjectRoot, mockResponse } = parsed.data
 
+    // [codex-review P1] パス境界検証
+    const pathCheck = validateTargetRoot(targetProjectRoot)
+    if (!pathCheck.ok) {
+      return reply.status(400).send({ error: 'パス検証エラー', detail: pathCheck.reason })
+    }
+
     try {
       // 1. 仕様書解析（ANTHROPIC_API_KEY は環境変数から）
       const analysis = await analyzeSpec(specText, { mockResponse })
@@ -98,6 +105,12 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const { analysis, targetProjectRoot, mockResponse } = parsed.data
+
+    // [codex-review P1] パス境界検証
+    const pathCheck = validateTargetRoot(targetProjectRoot)
+    if (!pathCheck.ok) {
+      return reply.status(400).send({ error: 'パス検証エラー', detail: pathCheck.reason })
+    }
 
     try {
       // 1. ロードマップ生成（Claude API or mock）
