@@ -329,3 +329,21 @@ BLOCKED [claude_code → codex task-xxx] 何が必要か (YYYY-MM-DD)
 - **コマンド実行できない**（`--approval-mode auto-edit`）→ Worker が別途コマンドを実行
 - **1タスク = 1プロバイダー**：Claude Code と同一タスクで混在させない
 - Context Pack が古い場合（前 Job のコミット後）は実行前に再生成される
+
+### Codex 呼び出し運用ルール（詳細: `docs/project_memory/rules/002_codex_operation_rules.md`）
+
+| # | ルール | 要点 |
+|---|---|---|
+| 001 | CLI パス解決 — CODEX_CLI_PATH 最優先 | 環境変数 > codex.cmd > codex |
+| 002 | Windows では codex.cmd を優先 | npm global の .cmd を PATH 走査で探す |
+| 003 | WindowsApps 配下の codex は拒否 | Access Denied 回避。npm install -g @openai/codex を案内 |
+| 004 | 事前疎通確認（codex --version） | ok=false なら実行しない |
+| 005 | workdir は許可済みルート配下のみ | validateTargetRoot() で強制 |
+| 006 | targetProjectRoot/allowedPaths は正規化・範囲検証 | validateAllowedPaths() で強制 |
+| 007 | 機密ファイル（.env/*.pem/*.key/id_rsa 等）は読み取り・変更禁止 | allowedPaths から除外 |
+| 008 | デフォルト実行モードは review-only（-s read-only） | ファイル変更はデフォルト無効 |
+| 009 | 実ファイル変更は mode=implement + approved=true + mockRun=false の三点揃いのみ | 1つでも欠けたら 403 |
+| 010 | git push / PR approve / merge / branch protection / workflows / CODEOWNERS は自動実行禁止 | SafeCommand allowlist で除外 |
+| 011 | mock 実行を完了扱いにしない | status='mock' では task_graph を [x] にしない |
+| 012 | 呼び出しごとにログ保存（taskId/cliPath/workdir/promptPath/changedFiles/exitCode/stdout/stderr） | `docs/codex_invocation_log/` に保存 |
+| 013 | guards/workflows/CODEOWNERS/security 関連ファイルの変更は Red Zone — 人間承認必須 | FileChangeGuard で検出 → blocked |
