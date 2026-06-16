@@ -17,7 +17,7 @@ import path from 'node:path'
 
 // Control Repository の絶対パス（環境変数で上書き可能）
 const CONTROL_ROOT = path.resolve(
-  process.env.CONTROL_ROOT ?? path.join(import.meta.dirname ?? __dirname, '../../../../'),
+  process.env.CONTROL_ROOT ?? path.join(__dirname, '../../../../'),
 )
 
 // 絶対に許可しないパスの prefix リスト
