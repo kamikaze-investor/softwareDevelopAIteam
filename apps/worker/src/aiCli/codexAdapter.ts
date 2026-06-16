@@ -18,19 +18,36 @@
  *     → ファイル編集のみ実行（コマンド実行はWorkerが制御）
  *   - 1タスク1プロバイダー原則: Claude Code と同一タスクで混在させない
  *
+ * Windows での注意:
+ *   Windows Store 版 Codex (WindowsApps) は直接実行できないため、
+ *   npm グローバルインストール版 (codex.cmd) を使用する。
+ *   → resolveCodexPath() が自動判定。CODEX_CLI_PATH 環境変数で上書き可能。
+ *
  * ⚠️ Codex CLIの正式フラグはバージョンによって変わる。
- *    確認コマンド: codex --help
+ *    確認コマンド: codex --version
  */
 
 import type { AiCliRequest, AiCliAdapterConfig } from '@ai-team/shared'
 import { BaseCliAdapter } from './adapter.js'
+import { resolveCodexPath } from './codexPathResolver.js'
 
 export class CodexAdapter extends BaseCliAdapter {
   constructor(config: AiCliAdapterConfig) {
-    super({ ...config, provider: 'codex' })
+    // cliPath が明示指定されていない場合は resolveCodexPath() で自動解決
+    const resolvedCli = config.cliPath ?? (() => {
+      try {
+        return resolveCodexPath().resolved
+      } catch {
+        // 解決失敗時は 'codex' を仮設定し、実行時に詳細エラーが出る
+        return 'codex'
+      }
+    })()
+
+    super({ ...config, provider: 'codex', cliPath: resolvedCli })
   }
 
   protected defaultCliName(): string {
+    // resolveCodexPath() は constructor で解決済みなのでここは到達しない
     return 'codex'
   }
 
