@@ -76,7 +76,7 @@
 | task-102 | CTO AI: Project Memory → Roadmap + Task一覧生成 | [x] | task-101 | Developer AI |
 | task-103 | Context Manager AI: Task → Context Pack生成 | [x] | task-102 | Developer AI |
 | task-104 | Worker: AI CLI を target-project で実行するエンドツーエンド接続 | [x] | task-103 | Developer AI |
-| task-105 | Summary Engine: 実行結果 → Dashboard自動更新 | [ ] | task-104 | Developer AI |
+| task-105 | Summary Engine: 実行結果 → Dashboard自動更新 | [x] | task-104 | Developer AI |
 
 ---
 
