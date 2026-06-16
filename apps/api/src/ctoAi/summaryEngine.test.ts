@@ -1,0 +1,103 @@
+import { describe, it, expect, beforeEach } from 'vitest'
+import { updateDashboard } from './summaryEngine.js'
+import type { DeveloperAiResult } from './developerAiOrchestrator.js'
+import os from 'node:os'
+import path from 'node:path'
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+
+function makeTmp(): string {
+  const dir = path.join(os.tmpdir(), `summary-test-${Date.now()}`)
+  mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+const MOCK_RESULT: DeveloperAiResult = {
+  status: 'mock',
+  taskId: 'task-001',
+  provider: 'claude',
+  stdout: '[MOCK] claude が task-001 を処理しました。\n実装完了。',
+  changedFiles: ['src/types.ts', 'src/index.ts'],
+  exitCode: 0,
+  executedAt: '2026-06-16T10:00:00.000Z',
+  completedAt: '2026-06-16T10:00:05.000Z',
+  durationMs: 5000,
+}
+
+describe('updateDashboard', () => {
+  let tmpDir: string
+
+  beforeEach(() => {
+    tmpDir = makeTmp()
+  })
+
+  it('docs/dashboard.md を生成する', () => {
+    updateDashboard(MOCK_RESULT, tmpDir)
+    expect(existsSync(path.join(tmpDir, 'docs', 'dashboard.md'))).toBe(true)
+  })
+
+  it('dashboard.md にタスクIDと実行ステータスが含まれる', () => {
+    updateDashboard(MOCK_RESULT, tmpDir)
+    const content = readFileSync(path.join(tmpDir, 'docs', 'dashboard.md'), 'utf-8')
+    expect(content).toContain('task-001')
+    expect(content).toContain('mock')
+    expect(content).toContain('claude')
+  })
+
+  it('dashboard.md に changedFiles が含まれる', () => {
+    updateDashboard(MOCK_RESULT, tmpDir)
+    const content = readFileSync(path.join(tmpDir, 'docs', 'dashboard.md'), 'utf-8')
+    expect(content).toContain('src/types.ts')
+    expect(content).toContain('src/index.ts')
+  })
+
+  it('entriesInDashboard が 1 を返す', () => {
+    const result = updateDashboard(MOCK_RESULT, tmpDir)
+    expect(result.entriesInDashboard).toBe(1)
+  })
+
+  it('2回実行すると entriesInDashboard が 2 になる', () => {
+    updateDashboard(MOCK_RESULT, tmpDir)
+    const result2 = updateDashboard({ ...MOCK_RESULT, taskId: 'task-002' }, tmpDir)
+    expect(result2.entriesInDashboard).toBe(2)
+  })
+
+  it('task_graph.md が存在すれば [x] に更新する', () => {
+    const tasksDir = path.join(tmpDir, 'tasks')
+    mkdirSync(tasksDir, { recursive: true })
+    writeFileSync(
+      path.join(tasksDir, 'task_graph.md'),
+      '| task-001 | 共有型定義 | [ ] | — | developer_ai |\n',
+    )
+
+    const result = updateDashboard(MOCK_RESULT, tmpDir)
+    expect(result.taskStatusUpdated).toBe(true)
+
+    const content = readFileSync(path.join(tasksDir, 'task_graph.md'), 'utf-8')
+    expect(content).toContain('[x]')
+    expect(content).not.toContain('[ ]')
+  })
+
+  it('task_graph.md がなくても taskStatusUpdated は false でエラーにならない', () => {
+    const result = updateDashboard(MOCK_RESULT, tmpDir)
+    expect(result.taskStatusUpdated).toBe(false)
+  })
+
+  it('status=failed のとき task_graph.md を [!] に更新する', () => {
+    const tasksDir = path.join(tmpDir, 'tasks')
+    mkdirSync(tasksDir, { recursive: true })
+    writeFileSync(
+      path.join(tasksDir, 'task_graph.md'),
+      '| task-001 | 共有型定義 | [ ] | — | developer_ai |\n',
+    )
+
+    updateDashboard({ ...MOCK_RESULT, status: 'failed' }, tmpDir)
+    const content = readFileSync(path.join(tasksDir, 'task_graph.md'), 'utf-8')
+    expect(content).toContain('[!]')
+  })
+
+  it('stdout が dashboard.md に含まれる（省略あり）', () => {
+    updateDashboard(MOCK_RESULT, tmpDir)
+    const content = readFileSync(path.join(tmpDir, 'docs', 'dashboard.md'), 'utf-8')
+    expect(content).toContain('[MOCK]')
+  })
+})
