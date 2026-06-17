@@ -20,6 +20,7 @@ import { normalizeAndValidateChangedFile } from '../utils/pathUtils'
 
 // target-project/配下でも常時禁止のファイルパターン
 const ALWAYS_FORBIDDEN_PATTERNS = [
+  // 秘密情報
   /^\.env$/,
   /^\.env\./,
   /\.pem$/,
@@ -28,6 +29,13 @@ const ALWAYS_FORBIDDEN_PATTERNS = [
   /^id_ed25519/,
   /service-account\.json$/,
   /\.secrets/,
+  // Control Repository — Guard・Worker・共有型は target 側に存在しないが念のため保護
+  /guards\/safetyAuditor/,
+  /guards\/alignmentChecker/,
+  /guards\/gateProcessor/,
+  /guards\/permissionGuard/,
+  /guards\/fileChangeGuard/,
+  /types\/safety_guard/,
 ]
 
 export interface FileGuardResult {
