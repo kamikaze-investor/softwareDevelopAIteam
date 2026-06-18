@@ -28,6 +28,7 @@ import { randomUUID } from 'node:crypto'
 const REPO_ROOT = path.resolve(fileURLToPath(import.meta.url), '../../../../')
 const args = process.argv.slice(2)
 const useUI = args.includes('--ui')
+const forceUI = args.includes('--force-ui')  // テスト用：ALLOW時もダイアログ表示
 const ref = args.find((a) => !a.startsWith('--')) ?? 'HEAD'
 
 // ────────────────────────────────────────────────────────────
@@ -249,50 +250,30 @@ function buildPsScript(inputFilePath: string): string {
     'Add-Sec "📊 リスクレベル" ($data.riskLabel + "' + NL + NL + '🟢 低  → 通常の変更（コメント・テスト等）' + NL + '🟡 中  → 影響範囲の広い変更（設定ファイル等）' + NL + '🟠 高  → 重要ファイルへの変更（要確認）' + NL + '🔴 重大 → セキュリティ・ガード系ファイルへの変更") 255 240 240',
     'Add-Sec "🛡️ 安全に運用できる仕組みは？" $data.safetyText 235 255 240',
     '',
-    '# ── 技術詳細（折りたたみ） ──',
-    '$techToggle = New-Object System.Windows.Forms.Button',
-    '$techToggle.Text = "▶ 技術的な詳細を見る（エンジニア向け）"',
-    '$techToggle.Location = New-Object System.Drawing.Point(10, $script:sy)',
-    '$techToggle.Size = New-Object System.Drawing.Size(760, 30)',
-    '$techToggle.TextAlign = "MiddleLeft"',
-    '$techToggle.FlatStyle = "Flat"',
-    '$techToggle.BackColor = [System.Drawing.Color]::FromArgb(220, 220, 230)',
-    '$techToggle.ForeColor = [System.Drawing.Color]::FromArgb(40, 40, 100)',
-    '$techToggle.Font = New-Object System.Drawing.Font("Meiryo UI", 9, [System.Drawing.FontStyle]::Bold)',
-    '$script:sy += 38',
-    '$scroll.Controls.Add($techToggle)',
-    '',
-    '# 行数から高さを先に計算（非表示時に PreferredHeight が 0 になる問題を回避）',
-    '$techLineCount = ($data.techDetails -split "`n").Count',
-    '$techPanelH = [Math]::Max($techLineCount * 17 + 28, 80)',
-    '$techPanel = New-Object System.Windows.Forms.Panel',
-    '$techPanel.Location = New-Object System.Drawing.Point(10, $script:sy)',
-    '$techPanel.Size = New-Object System.Drawing.Size(760, $techPanelH)',
-    '$techPanel.BackColor = [System.Drawing.Color]::FromArgb(235, 235, 245)',
-    '$techPanel.Visible = $false',
-    '$techPanel.AutoScroll = $true',
-    '',
-    '$techLbl = New-Object System.Windows.Forms.Label',
-    '$techLbl.Text = $data.techDetails',
-    '$techLbl.Font = New-Object System.Drawing.Font("Consolas", 8.5)',
-    '$techLbl.ForeColor = [System.Drawing.Color]::FromArgb(40, 40, 40)',
-    '$techLbl.Location = New-Object System.Drawing.Point(10, 10)',
-    '$techLbl.MaximumSize = New-Object System.Drawing.Size(730, 0)',
-    '$techLbl.AutoSize = $true',
-    '$techPanel.Controls.Add($techLbl)',
-    '$scroll.Controls.Add($techPanel)',
-    '',
-    '$techToggle.Add_Click({',
-    '  if ($techPanel.Visible) {',
-    '    $techPanel.Visible = $false',
-    '    $techToggle.Text = "▶ 技術的な詳細を見る（エンジニア向け）"',
-    '  } else {',
-    '    $techPanel.Visible = $true',
-    '    $techToggle.Text = "▼ 技術的な詳細を隠す"',
-    '  }',
-    '})',
-    '',
-    '$script:sy += 8',
+    '# ── 技術詳細（タイトル＋TextBox、スクロール可） ──',
+    '$techPnl = New-Object System.Windows.Forms.Panel',
+    '$techPnl.Location = New-Object System.Drawing.Point(10, $script:sy)',
+    '$techPnl.Size = New-Object System.Drawing.Size(760, 210)',
+    '$techPnl.BackColor = [System.Drawing.Color]::FromArgb(235, 235, 248)',
+    '$techTtl = New-Object System.Windows.Forms.Label',
+    '$techTtl.Text = "🔧 技術的な詳細（エンジニア向け）"',
+    '$techTtl.Font = New-Object System.Drawing.Font("Meiryo UI", 9.5, [System.Drawing.FontStyle]::Bold)',
+    '$techTtl.ForeColor = [System.Drawing.Color]::FromArgb(30,30,30)',
+    '$techTtl.Location = New-Object System.Drawing.Point(12, 8)',
+    '$techTtl.AutoSize = $true',
+    '$techPnl.Controls.Add($techTtl)',
+    '$techBox = New-Object System.Windows.Forms.TextBox',
+    '$techBox.Text = $data.techDetails',
+    '$techBox.Location = New-Object System.Drawing.Point(12, 34)',
+    '$techBox.Size = New-Object System.Drawing.Size(736, 160)',
+    '$techBox.Multiline = $true',
+    '$techBox.ReadOnly = $true',
+    '$techBox.ScrollBars = "Vertical"',
+    '$techBox.Font = New-Object System.Drawing.Font("Courier New", 8)',
+    '$techBox.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 255)',
+    '$techPnl.Controls.Add($techBox)',
+    '$scroll.Controls.Add($techPnl)',
+    '$script:sy += 218',
     '',
     '# ── 指示記入欄 ──',
     '$instrPnl = New-Object System.Windows.Forms.Panel',
@@ -586,18 +567,20 @@ async function main(): Promise<number> {
   // 6. 結果表示 & 承認フロー
   console.log('\n' + '─'.repeat(50))
 
-  if (gateResult.gateDecision === 'ALLOW') {
+  if (gateResult.gateDecision === 'ALLOW' && !forceUI) {
     console.log('✅ ALLOW — コミット可能')
     return 0
   }
 
   if (gateResult.gateDecision === 'DEEP_REVIEW') {
     console.log('🟡 DEEP_REVIEW — 人間のレビューが必要です')
-  } else {
+  } else if (gateResult.gateDecision === 'BLOCK_CEO_REQUIRED') {
     console.log('🔴 BLOCK_CEO_REQUIRED — CEO承認が必要です')
+  } else {
+    console.log('✅ ALLOW（--force-ui でダイアログ表示）')
   }
 
-  if (useUI) {
+  if (useUI || forceUI) {
     console.log('\n📋 承認理由を生成中（Gemini）...')
     const whyText = await generateWhyExplanation(
       rawDiff,
