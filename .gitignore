@@ -37,3 +37,10 @@ coverage/
 
 # pnpm
 .pnpm-store/
+
+# SQLite 一時ファイル
+*.db-shm
+*.db-wal
+
+# Safety Audit 承認ログ（監査証跡はローカルのみ）
+data/approvals/
