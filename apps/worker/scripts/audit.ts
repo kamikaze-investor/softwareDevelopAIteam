@@ -17,6 +17,25 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { writeFileSync, readFileSync, mkdirSync, unlinkSync, existsSync } from 'node:fs'
+
+// .env を手動ロード（dotenv 非依存）— tsx 直接実行時に process.env が未設定になる問題を回避
+{
+  const envPath = path.resolve(fileURLToPath(import.meta.url), '../../../../.env')
+  if (existsSync(envPath)) {
+    for (const line of readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
+      const m = line.match(/^([^#=\s][^=]*)=(.*)$/)
+      if (!m) continue
+      const key = m[1].trim()
+      if (key in process.env) continue
+      // 前後のクォート（シングル・ダブル）を除去
+      let val = m[2].trim()
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1)
+      }
+      process.env[key] = val
+    }
+  }
+}
 import { runSafetyAudit } from '../src/guards/safetyAuditor.js'
 import { runAlignmentCheck } from '../src/guards/alignmentChecker.js'
 import { processGate, type GateResult } from '../src/guards/gateProcessor.js'
