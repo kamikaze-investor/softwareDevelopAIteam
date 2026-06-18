@@ -20,6 +20,7 @@ import { developerAiRoutes } from './routes/developerAi'
 import { summaryEngineRoutes } from './routes/summaryEngine'
 import { permissionGrantRoutes } from './routes/permissionGrants'
 import { watchdogEventRoutes } from './routes/watchdogEvents'
+import { dashboardRoutes } from './routes/dashboard'
 import { apiTokenAuth } from './auth/apiToken'
 
 const app = Fastify({ logger: true })
@@ -53,7 +54,7 @@ app.register(developerAiRoutes, { prefix: '/api/developer-ai' })
 app.register(summaryEngineRoutes, { prefix: '/api/summary' })
 app.register(permissionGrantRoutes, { prefix: '/api' })
 app.register(watchdogEventRoutes, { prefix: '/api' })
-// app.register(dashboardRoutes, { prefix: '/api/dashboard' })
+app.register(dashboardRoutes, { prefix: '/api' })
 
 const PORT = Number(process.env.PORT) || 3000
 

@@ -8,6 +8,7 @@
 import type { Job, Project, Task } from '@ai-team/shared'
 import { checkStall } from './stallDetector.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
+import { sendAlert } from '../notifier/notifier.js'
 
 const WATCHDOG_INTERVAL_MS = Number(process.env.WATCHDOG_INTERVAL_MS ?? 30_000)
 
@@ -120,10 +121,24 @@ async function analyzeAndReport(
   }, apiBaseUrl, headers)
 
   if (isStuck) {
+    const minutes = Math.round(stallDurationMs / 60_000 * 10) / 10
     console.warn(
       `[Watchdog] ⚠️ スタル確認: Job ${job.id} (${job.safeCommand.kind})\n` +
       `  分析: ${aiAnalysis}`
     )
+    void sendAlert({
+      severity: 'critical',
+      title: `Job スタル検出: ${job.safeCommand.kind}`,
+      body: [
+        `Job ID: ${job.id}`,
+        `コマンド: ${job.safeCommand.kind}`,
+        `作業ディレクトリ: ${job.safeCommand.workingDir}`,
+        `経過時間: ${minutes} 分`,
+        `AI分析: ${aiAnalysis}`,
+      ].join('\n'),
+      sourceType: 'watchdog_event',
+      sourceId: event.id,
+    })
   } else {
     console.log(
       `[Watchdog] 誤検知: Job ${job.id} は低速なだけ\n` +
