@@ -201,5 +201,36 @@ describe('callGeminiWithFallback', () => {
       const result = await callGeminiWithFallback('prompt', { preferCli: true })
       expect(result).toBe('API result')
     })
+
+    it('CLI が exit 0 でも stdout が空の場合は API にフォールバックする', async () => {
+      // agy の実際の挙動: --print に対して exit 0 + 空 stdout を返す
+      mockSpawnSync.mockReturnValue(
+        { status: 0, stdout: '', stderr: '', pid: 1, output: [], signal: null } as unknown as ReturnType<typeof spawnSync>
+      )
+      mockCallApi.mockResolvedValue('API result from fallback')
+
+      const result = await callGeminiWithFallback('test prompt', {
+        preferCli: true,
+        featureName: 'alignment_check',
+      })
+
+      expect(result).toBe('API result from fallback')
+      expect(mockCallApi).toHaveBeenCalledOnce()
+    })
+
+    it('CLI が exit 0 でも stdout が空白のみの場合も API にフォールバックする', async () => {
+      mockSpawnSync.mockReturnValue(
+        { status: 0, stdout: '   \n  ', stderr: '', pid: 1, output: [], signal: null } as unknown as ReturnType<typeof spawnSync>
+      )
+      mockCallApi.mockResolvedValue('API result')
+
+      const result = await callGeminiWithFallback('test prompt', {
+        preferCli: true,
+        featureName: 'test',
+      })
+
+      expect(result).toBe('API result')
+      expect(mockCallApi).toHaveBeenCalledOnce()
+    })
   })
 })

@@ -46,7 +46,7 @@ function callCli(prompt: string, cliModel: string): string | null {
   const stdout = result.stdout ?? ''
   const stderr = result.stderr ?? ''
 
-  if (result.status !== 0 || isQuotaError(stdout) || isQuotaError(stderr)) {
+  if (result.status !== 0 || !stdout.trim() || isQuotaError(stdout) || isQuotaError(stderr)) {
     return null
   }
 

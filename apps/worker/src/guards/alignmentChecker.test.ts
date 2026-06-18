@@ -115,6 +115,16 @@ describe('runAlignmentCheck', () => {
     expect(report.issues[0].severity).toBe('warning')
   })
 
+  it('Gemini が空文字を返した場合も aligned=false の fallback report を返す', async () => {
+    mockCallGemini.mockResolvedValue('')
+
+    const report = await runAlignmentCheck(SAFE_DIFF, 'empty-response', 'C:/repo')
+
+    expect(report.aligned).toBe(false)
+    expect(report.issues[0].severity).toBe('warning')
+    expect(report.issues[0].category).toBe('other')
+  })
+
   it('includes the ref in the report', async () => {
     mockCallGemini.mockResolvedValue(JSON.stringify({
       aligned: true, summary: 'OK', issues: [],
