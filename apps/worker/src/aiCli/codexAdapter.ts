@@ -14,8 +14,8 @@
  * 重要な制約:
  *   - CLAUDE.md を自動読込しない
  *     → Context Pack に CLAUDE.md の禁止事項・コーディングルールを必ず含めること
- *   - --approval-mode auto-edit を使用
- *     → ファイル編集のみ実行（コマンド実行はWorkerが制御）
+ *   - `exec --sandbox workspace-write` を使用（v0.140.0以降）
+ *     → ワークスペース内ファイル編集のみ（コマンド実行はWorkerが制御）
  *   - 1タスク1プロバイダー原則: Claude Code と同一タスクで混在させない
  *
  * Windows での注意:
@@ -23,8 +23,7 @@
  *   npm グローバルインストール版 (codex.cmd) を使用する。
  *   → resolveCodexPath() が自動判定。CODEX_CLI_PATH 環境変数で上書き可能。
  *
- * ⚠️ Codex CLIの正式フラグはバージョンによって変わる。
- *    確認コマンド: codex --version
+ * ⚠️ Codex CLIのフラグ仕様は v0.140.0 時点。変更時は `codex exec --help` で確認。
  */
 
 import type { AiCliRequest, AiCliAdapterConfig } from '@ai-team/shared'
@@ -52,18 +51,21 @@ export class CodexAdapter extends BaseCliAdapter {
   }
 
   protected buildArgv(request: AiCliRequest): string[] {
-    // Codex CLI フラグ:
-    //   --approval-mode full-auto  : ファイル編集もコマンド実行も全自動（implement向け）
-    //   --approval-mode auto-edit  : ファイル編集のみ自動（コマンド実行は不可・より安全）
-    //   --approval-mode suggest    : 提案のみ・実際には変更しない（review向け）
+    // codex-cli v0.140.0 以降: 非対話実行は `exec` サブコマンドを使用。
     //
-    // Worker からの自動実行は auto-edit を使う（コマンド実行を Codex に委ねない）
-    // コマンド実行は引き続き Worker の CommandKind/SafeCommand で制御する
+    // --sandbox オプション（-s）:
+    //   read-only        : ファイル読み取りのみ（review向け）
+    //   workspace-write  : ワークスペース内のファイル書き込みを許可（implement向け）
+    //   danger-full-access: 制限なし（使用禁止）
+    //
+    // Worker からの自動実行は workspace-write を上限とする。
+    // コマンド実行は引き続き Worker の CommandKind/SafeCommand で制御する。
 
-    const approvalMode = request.mode === 'implement' ? 'auto-edit' : 'suggest'
+    const sandboxMode = request.mode === 'implement' ? 'workspace-write' : 'read-only'
 
     return [
-      '--approval-mode', approvalMode,
+      'exec',
+      '--sandbox', sandboxMode,
       request.prompt,
     ]
   }
