@@ -175,6 +175,32 @@ describe('M-2対策: shouldFallback', () => {
 })
 
 // ────────────────────────────────────────────────────────────
+// CodexAdapter: stdin prompt テスト
+// ────────────────────────────────────────────────────────────
+
+import { CodexAdapter } from './codexAdapter.js'
+import type { AiCliRequest } from '@ai-team/shared'
+
+describe('CodexAdapter — stdin prompt', () => {
+  it('buildArgv は末尾に - を置く（プロンプトは stdin 経由）', () => {
+    class TestCodexAdapter extends CodexAdapter {
+      testArgv(r: AiCliRequest) { return this.buildArgv(r) }
+    }
+    const adapter = new TestCodexAdapter({ provider: 'codex' })
+    const argv = adapter.testArgv({
+      provider: 'codex',
+      taskId: 't1',
+      workingDir: '/workspace/target/app',
+      prompt: 'hello world',
+      contextFiles: [],
+      mode: 'implement',
+    })
+    expect(argv[argv.length - 1]).toBe('-')
+    expect(argv.join(' ')).not.toContain('hello world')
+  })
+})
+
+// ────────────────────────────────────────────────────────────
 // factory のテスト
 // ────────────────────────────────────────────────────────────
 

@@ -50,6 +50,9 @@ export class CodexAdapter extends BaseCliAdapter {
     return 'codex'
   }
 
+  /** codex exec はパイプされた stdin を読む。prompt は argv ではなく stdin で渡す。 */
+  protected useStdinPrompt(): boolean { return true }
+
   protected buildArgv(request: AiCliRequest): string[] {
     // codex-cli v0.140.0 以降: 非対話実行は `exec` サブコマンドを使用。
     //
@@ -60,6 +63,9 @@ export class CodexAdapter extends BaseCliAdapter {
     //
     // Worker からの自動実行は workspace-write を上限とする。
     // コマンド実行は引き続き Worker の CommandKind/SafeCommand で制御する。
+    //
+    // prompt は argv 末尾ではなく stdin 経由で渡す（'-' = stdin 読み込みを指示）。
+    // BaseCliAdapter が input: finalPrompt を execFileSync に渡す。
 
     const sandboxMode = request.mode === 'implement' ? 'workspace-write' : 'read-only'
 
@@ -68,7 +74,7 @@ export class CodexAdapter extends BaseCliAdapter {
       '--sandbox', sandboxMode,
       '-C', request.workingDir,   // ワークスペースルートを明示（execFileSync の cwd と一致）
       '--ephemeral',               // Workerの自動実行ではセッションファイルを残さない
-      request.prompt,
+      '-',                         // stdin からプロンプトを読む（useStdinPrompt() = true）
     ]
   }
 }

@@ -72,6 +72,25 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
   /** サブクラスがプロンプト+モードをargvに変換する */
   protected abstract buildArgv(request: AiCliRequest): string[]
 
+  /**
+   * prompt を argv ではなく stdin で渡す場合は true を返す。
+   * true の場合: buildArgv は末尾に '-' を置き、BaseCliAdapter が input: finalPrompt を渡す。
+   * false の場合（デフォルト）: buildArgv が prompt を argv 末尾に含める従来動作。
+   */
+  protected useStdinPrompt(): boolean { return false }
+
+  /**
+   * Windows で .cmd ファイルを shell:false で実行するために cmd.exe /c でラップする。
+   * 他プラットフォームは { exe: cliPath, prefixArgs: [] } をそのまま返す。
+   */
+  private resolveExe(): { exe: string; prefixArgs: string[] } {
+    const p = this.config.cliPath
+    if (process.platform === 'win32' && p.toLowerCase().endsWith('.cmd')) {
+      return { exe: 'cmd.exe', prefixArgs: ['/c', p] }
+    }
+    return { exe: p, prefixArgs: [] }
+  }
+
   async run(request: AiCliRequest): Promise<AiCliResult> {
     const startTime = Date.now()
 
@@ -130,6 +149,8 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     const argv = this.buildArgv({ ...request, prompt: finalPrompt })
     // task-024: request > config > デフォルト(5分) の優先順位でタイムアウト決定
     const timeout = request.timeoutMs ?? this.config.defaultTimeoutMs
+    const { exe, prefixArgs } = this.resolveExe()
+    const stdinInput = this.useStdinPrompt() ? finalPrompt : undefined
 
     let stdout = ''
     let stderr = ''
@@ -138,13 +159,14 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     let isApiError = false
 
     try {
-      stdout = execFileSync(this.config.cliPath, argv, {
+      stdout = execFileSync(exe, [...prefixArgs, ...argv], {
         cwd: request.workingDir,
         shell: false,           // ⚠️ シェルを経由しない（インジェクション防止）
         timeout,
         encoding: 'utf-8',
         stdio: ['pipe', 'pipe', 'pipe'],
         env: buildSafeEnv(request.provider),
+        ...(stdinInput !== undefined ? { input: stdinInput } : {}),
       })
     } catch (err: any) {
       exitCode = typeof err.status === 'number' ? err.status : 1
@@ -197,19 +219,19 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       while (parsedOutput === undefined && retryCount < maxRetries) {
         retryCount++
         // リトライ: "JSONで出力し直してください" を付け加えて再実行
-        const retryArgv = this.buildArgv({
-          ...request,
-          prompt: `${finalPrompt}\n\n## 再試行指示（リトライ ${retryCount}/${maxRetries}）\n前回の出力がJSONとして解析できませんでした。必ず有効なJSON形式のみを出力してください。`,
-        })
+        const retryPromptText = `${finalPrompt}\n\n## 再試行指示（リトライ ${retryCount}/${maxRetries}）\n前回の出力がJSONとして解析できませんでした。必ず有効なJSON形式のみを出力してください。`
+        const retryArgv = this.buildArgv({ ...request, prompt: retryPromptText })
+        const retryInput = this.useStdinPrompt() ? retryPromptText : undefined
         let retryStdout = ''
         try {
-          retryStdout = execFileSync(this.config.cliPath, retryArgv, {
+          retryStdout = execFileSync(exe, [...prefixArgs, ...retryArgv], {
             cwd: request.workingDir,
             shell: false,
             timeout,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             env: buildSafeEnv(request.provider),
+            ...(retryInput !== undefined ? { input: retryInput } : {}),
           })
         } catch (err: any) {
           retryStdout = typeof err.stdout === 'string' ? err.stdout : ''
