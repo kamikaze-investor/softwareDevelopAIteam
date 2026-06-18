@@ -36,6 +36,9 @@ const ALWAYS_FORBIDDEN_PATTERNS = [
   /guards\/permissionGuard/,
   /guards\/fileChangeGuard/,
   /types\/safety_guard/,
+  /metaReviewer\/geminiClient/,  // Alignment Checker が依存するGeminiクライアント
+  /src\/utils\/pathUtils/,        // Guard が依存するパスユーティリティ
+  /jobRunner/,                    // Job実行エンジン本体
 ]
 
 export interface FileGuardResult {

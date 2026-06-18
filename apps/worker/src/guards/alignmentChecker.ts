@@ -35,8 +35,13 @@ async function loadDesignDocs(repoRoot: string): Promise<string> {
     try {
       const text = await readFile(join(repoRoot, relPath), 'utf-8')
       sections.push(`### ${relPath}\n\n${text}`)
-    } catch {
-      // ドキュメントが存在しない場合はスキップ
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== 'ENOENT') {
+        // ファイルが存在しない以外のエラー（権限不足等）は警告ログを出す
+        // 設計ドキュメントが読めないと Gemini の判断精度が下がるため可視化する
+        console.warn(`[AlignmentChecker] Failed to load design doc: ${relPath}`, err)
+      }
     }
   }
   return sections.join('\n\n---\n\n')
