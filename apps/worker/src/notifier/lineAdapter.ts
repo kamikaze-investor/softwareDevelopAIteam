@@ -8,6 +8,7 @@
 import type { AlertPayload } from './notifier.js'
 
 const LINE_API = 'https://api.line.me/v2/bot/message/push'
+const FETCH_TIMEOUT_MS = 8_000
 
 const SEVERITY_EMOJI: Record<string, string> = {
   info: 'ℹ️',
@@ -26,6 +27,8 @@ export async function sendLine(payload: AlertPayload): Promise<{ success: boolea
   const text = `${emoji} ${payload.title}\n\n${payload.body}`
 
   try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     const res = await fetch(LINE_API, {
       method: 'POST',
       headers: {
@@ -36,7 +39,9 @@ export async function sendLine(payload: AlertPayload): Promise<{ success: boolea
         to: userId,
         messages: [{ type: 'text', text }],
       }),
+      signal: controller.signal,
     })
+    clearTimeout(timer)
 
     if (!res.ok) {
       const errBody = await res.text()

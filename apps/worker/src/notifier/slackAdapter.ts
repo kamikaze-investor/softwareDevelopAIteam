@@ -6,6 +6,8 @@
 
 import type { AlertPayload } from './notifier.js'
 
+const FETCH_TIMEOUT_MS = 8_000
+
 const SEVERITY_EMOJI: Record<string, string> = {
   info: ':information_source:',
   warning: ':warning:',
@@ -22,11 +24,15 @@ export async function sendSlack(payload: AlertPayload): Promise<{ success: boole
   const text = `${emoji} *${payload.title}*\n${payload.body}`
 
   try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS)
     const res = await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
+      signal: controller.signal,
     })
+    clearTimeout(timer)
 
     if (!res.ok) {
       const errBody = await res.text()
