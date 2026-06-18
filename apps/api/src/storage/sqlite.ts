@@ -9,8 +9,8 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -340,7 +340,70 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants }
+  const watchdogEvents: IWatchdogEventStorage = {
+    findAll() {
+      const rows = db.prepare('SELECT * FROM watchdog_events ORDER BY created_at DESC').all() as any[]
+      return rows.map(deserializeWatchdogEvent)
+    },
+    findByJobId(jobId) {
+      const rows = db.prepare('SELECT * FROM watchdog_events WHERE job_id = ? ORDER BY created_at DESC').all(jobId) as any[]
+      return rows.map(deserializeWatchdogEvent)
+    },
+    findById(id) {
+      const row = db.prepare('SELECT * FROM watchdog_events WHERE id = ?').get(id) as any
+      return row ? deserializeWatchdogEvent(row) : undefined
+    },
+    create(data) {
+      const event: WatchdogEvent = {
+        ...data,
+        id: randomUUID(),
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO watchdog_events
+          (id, job_id, task_id, command_kind, working_dir, started_at, detected_at,
+           stall_duration_ms, status, ai_analysis, is_stuck, resolved_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        event.id,
+        event.jobId,
+        event.taskId,
+        event.commandKind,
+        event.workingDir,
+        event.startedAt,
+        event.detectedAt,
+        event.stallDurationMs,
+        event.status,
+        event.aiAnalysis ?? null,
+        event.isStuck === undefined ? null : (event.isStuck ? 1 : 0),
+        event.resolvedAt ?? null,
+        event.createdAt,
+      )
+      return event
+    },
+    update(id, data) {
+      const existing = watchdogEvents.findById(id)
+      if (!existing) return undefined
+      const updated: WatchdogEvent = {
+        ...existing,
+        ...data,
+      }
+      db.prepare(`
+        UPDATE watchdog_events
+        SET status=?, ai_analysis=?, is_stuck=?, resolved_at=?
+        WHERE id=?
+      `).run(
+        updated.status,
+        updated.aiAnalysis ?? null,
+        updated.isStuck === undefined ? null : (updated.isStuck ? 1 : 0),
+        updated.resolvedAt ?? null,
+        id,
+      )
+      return updated
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents }
 }
 
 function deserializeProject(row: any): Project {
@@ -442,6 +505,24 @@ function deserializePermissionGrant(row: any): PermissionGrant {
     expiresAt: row.expires_at ?? undefined,
     reason: row.reason ?? undefined,
     used: row.used === 1,
+    createdAt: row.created_at,
+  }
+}
+
+function deserializeWatchdogEvent(row: any): WatchdogEvent {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    taskId: row.task_id,
+    commandKind: row.command_kind,
+    workingDir: row.working_dir,
+    startedAt: row.started_at,
+    detectedAt: row.detected_at,
+    stallDurationMs: row.stall_duration_ms,
+    status: row.status,
+    aiAnalysis: row.ai_analysis ?? undefined,
+    isStuck: row.is_stuck === null ? undefined : row.is_stuck === 1,
+    resolvedAt: row.resolved_at ?? undefined,
     createdAt: row.created_at,
   }
 }

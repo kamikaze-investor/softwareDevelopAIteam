@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent } from '@ai-team/shared'
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -57,6 +57,14 @@ export interface IPermissionGrantStorage {
   delete(id: string): boolean
 }
 
+export interface IWatchdogEventStorage {
+  findAll(): WatchdogEvent[]
+  findByJobId(jobId: string): WatchdogEvent[]
+  findById(id: string): WatchdogEvent | undefined
+  create(event: Omit<WatchdogEvent, 'id' | 'createdAt'>): WatchdogEvent
+  update(id: string, data: Partial<Pick<WatchdogEvent, 'status' | 'aiAnalysis' | 'isStuck' | 'resolvedAt'>>): WatchdogEvent | undefined
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -65,4 +73,5 @@ export interface IStorage {
   reviewResults: IReviewResultStorage
   qaResults: IQAResultStorage
   permissionGrants: IPermissionGrantStorage
+  watchdogEvents: IWatchdogEventStorage
 }

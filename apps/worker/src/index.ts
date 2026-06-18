@@ -15,6 +15,7 @@
 import type { Job, Project, Task } from '@ai-team/shared'
 import { assertTransition, recoverStaleJobs } from './jobStateManager.js'
 import { runJob } from './jobRunner.js'
+import { startWatchdog } from './watchdog/watchdog.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
@@ -160,6 +161,8 @@ async function recoverJobsAtStartup(): Promise<void> {
 
 async function start(): Promise<void> {
   await recoverJobsAtStartup()
+  // ウォッチドッグを pollJobs と並行して起動
+  void startWatchdog(API_BASE, authHeaders())
   await pollJobs()
 }
 

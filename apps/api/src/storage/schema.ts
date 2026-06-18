@@ -108,6 +108,22 @@ export const CREATE_TABLES = `
     used INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS watchdog_events (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    command_kind TEXT NOT NULL,
+    working_dir TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    stall_duration_ms INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'detected',
+    ai_analysis TEXT,
+    is_stuck INTEGER,
+    resolved_at TEXT,
+    created_at TEXT NOT NULL
+  );
 `
 
 /**
