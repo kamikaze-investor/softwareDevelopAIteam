@@ -95,6 +95,19 @@ export const CREATE_TABLES = `
     created_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
+
+  CREATE TABLE IF NOT EXISTS permission_grants (
+    id TEXT PRIMARY KEY,
+    task_id TEXT,
+    job_id TEXT,
+    allowed_command_kinds TEXT NOT NULL DEFAULT '[]',
+    agent_role TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    expires_at TEXT,
+    reason TEXT,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
 `
 
 /**

@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant } from '@ai-team/shared'
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -49,6 +49,14 @@ export interface IQAResultStorage {
   create(data: Omit<QAResult, 'id' | 'createdAt'>): QAResult
 }
 
+export interface IPermissionGrantStorage {
+  findActiveByTaskId(taskId: string): PermissionGrant[]
+  findById(id: string): PermissionGrant | undefined
+  create(grant: Omit<PermissionGrant, 'id' | 'createdAt'>): PermissionGrant
+  markUsed(id: string): PermissionGrant | undefined
+  delete(id: string): boolean
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -56,4 +64,5 @@ export interface IStorage {
   approvals: IApprovalStorage
   reviewResults: IReviewResultStorage
   qaResults: IQAResultStorage
+  permissionGrants: IPermissionGrantStorage
 }

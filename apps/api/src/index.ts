@@ -18,6 +18,7 @@ import { ctoAiRoutes } from './routes/ctoAi'
 import { contextPackRoutes } from './routes/contextPack'
 import { developerAiRoutes } from './routes/developerAi'
 import { summaryEngineRoutes } from './routes/summaryEngine'
+import { permissionGrantRoutes } from './routes/permissionGrants'
 import { apiTokenAuth } from './auth/apiToken'
 
 const app = Fastify({ logger: true })
@@ -49,6 +50,7 @@ app.register(ctoAiRoutes, { prefix: '/api/cto' })
 app.register(contextPackRoutes, { prefix: '/api/context-pack' })
 app.register(developerAiRoutes, { prefix: '/api/developer-ai' })
 app.register(summaryEngineRoutes, { prefix: '/api/summary' })
+app.register(permissionGrantRoutes, { prefix: '/api' })
 // app.register(dashboardRoutes, { prefix: '/api/dashboard' })
 
 const PORT = Number(process.env.PORT) || 3000

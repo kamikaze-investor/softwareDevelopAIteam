@@ -9,8 +9,8 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -289,7 +289,58 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults }
+  const permissionGrants: IPermissionGrantStorage = {
+    findActiveByTaskId(taskId) {
+      const nowIso = new Date().toISOString()
+      const rows = db.prepare(`
+        SELECT * FROM permission_grants
+        WHERE task_id = ? AND scope = 'task' AND used = 0
+          AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY created_at DESC
+      `).all(taskId, nowIso) as any[]
+      return rows.map(deserializePermissionGrant)
+    },
+    findById(id) {
+      const row = db.prepare('SELECT * FROM permission_grants WHERE id = ?').get(id) as any
+      return row ? deserializePermissionGrant(row) : undefined
+    },
+    create(data) {
+      const grant: PermissionGrant = {
+        ...data,
+        id: randomUUID(),
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO permission_grants
+          (id, task_id, job_id, allowed_command_kinds, agent_role, scope, expires_at, reason, used, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        grant.id,
+        grant.taskId ?? null,
+        grant.jobId ?? null,
+        JSON.stringify(grant.allowedCommandKinds ?? []),
+        grant.agentRole,
+        grant.scope,
+        grant.expiresAt ?? null,
+        grant.reason ?? null,
+        grant.used ? 1 : 0,
+        grant.createdAt,
+      )
+      return grant
+    },
+    markUsed(id) {
+      const existing = permissionGrants.findById(id)
+      if (!existing) return undefined
+      db.prepare('UPDATE permission_grants SET used = 1 WHERE id = ?').run(id)
+      return { ...existing, used: true }
+    },
+    delete(id) {
+      const result = db.prepare('DELETE FROM permission_grants WHERE id = ?').run(id)
+      return result.changes > 0
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants }
 }
 
 function deserializeProject(row: any): Project {
@@ -376,6 +427,21 @@ function deserializeQAResult(row: any): QAResult {
     status: row.status,
     summary: row.summary,
     details: row.details ?? undefined,
+    createdAt: row.created_at,
+  }
+}
+
+function deserializePermissionGrant(row: any): PermissionGrant {
+  return {
+    id: row.id,
+    taskId: row.task_id ?? undefined,
+    jobId: row.job_id ?? undefined,
+    allowedCommandKinds: JSON.parse(row.allowed_command_kinds ?? '[]'),
+    agentRole: row.agent_role,
+    scope: row.scope,
+    expiresAt: row.expires_at ?? undefined,
+    reason: row.reason ?? undefined,
+    used: row.used === 1,
     createdAt: row.created_at,
   }
 }

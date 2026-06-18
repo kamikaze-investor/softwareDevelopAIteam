@@ -3,7 +3,6 @@ import type { Job } from '@ai-team/shared'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
-import { permissionGuard } from './guards/permissionGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { runJob } from './jobRunner.js'
 
@@ -17,6 +16,7 @@ vi.mock('./commandResolver.js', () => ({
 
 vi.mock('./guards/permissionGuard.js', () => ({
   permissionGuard: vi.fn(),
+  permissionGuardWithGrants: vi.fn(),
 }))
 
 vi.mock('./guards/fileChangeGuard.js', () => ({
@@ -34,9 +34,12 @@ vi.mock('./jobLogger.js', () => ({
 
 const execFileSyncMock = vi.mocked(execFileSync)
 const resolveCommandMock = vi.mocked(resolveCommand)
-const permissionGuardMock = vi.mocked(permissionGuard)
 const fileChangeGuardMock = vi.mocked(fileChangeGuard)
 const saveJobLogsMock = vi.mocked(saveJobLogs)
+
+// Import the mocked guard to configure it
+import { permissionGuardWithGrants } from './guards/permissionGuard.js'
+const permissionGuardWithGrantsMock = vi.mocked(permissionGuardWithGrants)
 
 function createJob(overrides: Partial<Job> = {}): Job {
   return {
@@ -56,7 +59,7 @@ function createJob(overrides: Partial<Job> = {}): Job {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  permissionGuardMock.mockReturnValue({ allowed: true })
+  permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
   resolveCommandMock.mockReturnValue({
     argv: ['git', 'status', '--short'],
     description: 'git status',
@@ -70,7 +73,7 @@ beforeEach(() => {
 
 describe('runJob', () => {
   it('returns blocked when Permission Guard rejects the job', async () => {
-    permissionGuardMock.mockReturnValue({
+    permissionGuardWithGrantsMock.mockResolvedValue({
       allowed: false,
       reason: 'workingDir is outside TARGET_ROOT',
     })
@@ -86,6 +89,28 @@ describe('runJob', () => {
     })
     expect(resolveCommandMock).not.toHaveBeenCalled()
     expect(execFileSyncMock).not.toHaveBeenCalled()
+  })
+
+  it('returns blocked with permissionBlockEvent when grant is expired', async () => {
+    const blockEvent = {
+      type: 'grant_expired' as const,
+      jobId: 'job-1',
+      taskId: 'task-1',
+      agentRole: 'developer_ai',
+      commandKind: 'git_status',
+      message: 'Grant expired',
+      occurredAt: new Date().toISOString(),
+    }
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      reason: 'Grant expired',
+      blockEvent,
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.permissionBlockEvent).toEqual(blockEvent)
   })
 
   it('executes the resolved command with shell disabled and records changed files', async () => {
@@ -155,5 +180,53 @@ describe('runJob', () => {
     expect(result.status).toBe('failed')
     expect(result.guardResult.fileChangeAllowed).toBe(false)
     expect(result.guardResult.fileViolations).toEqual(['../secret.txt'])
+  })
+
+  it('git_commit job uses timeout=undefined (atomic)', async () => {
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+    // git rev-parse HEAD (before), git commit, git rev-parse HEAD (after), git diff
+    execFileSyncMock
+      .mockReturnValueOnce('abc123\n')  // beforeCommitHash
+      .mockReturnValueOnce('')           // git commit stdout
+      .mockReturnValueOnce('def456\n')  // afterCommitHash
+      .mockReturnValueOnce('')           // git diff --name-only
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
+    })
+
+    await runJob(job)
+
+    // The commit command call should have timeout: undefined
+    const commitCall = execFileSyncMock.mock.calls.find(
+      (call) => Array.isArray(call[1]) && (call[1] as string[]).includes('commit')
+    )
+    expect(commitCall).toBeDefined()
+    expect((commitCall![2] as { timeout?: number }).timeout).toBeUndefined()
+  })
+
+  it('git_commit job generates RollbackInfo', async () => {
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+    execFileSyncMock
+      .mockReturnValueOnce('abc123\n')  // beforeCommitHash
+      .mockReturnValueOnce('')           // git commit stdout
+      .mockReturnValueOnce('def456\n')  // afterCommitHash
+      .mockReturnValueOnce('')           // git diff --name-only
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
+    })
+
+    const result = await runJob(job)
+
+    expect(result.rollbackInfo).toBeDefined()
+    expect(result.rollbackInfo?.previousCommitHash).toBe('abc123')
+    expect(result.rollbackInfo?.rollbackArgv).toContain('revert')
   })
 })

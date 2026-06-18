@@ -8,13 +8,14 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import type { Job, JobGuardResult } from '@ai-team/shared'
+import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo } from '@ai-team/shared'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
-import { permissionGuard } from './guards/permissionGuard.js'
+import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
 
 const JOB_TIMEOUT_MS = 120_000
+const API_BASE_URL = process.env.API_BASE_URL ?? 'http://localhost:3000'
 
 interface ExecFileFailure {
   status?: number
@@ -33,16 +34,24 @@ export interface JobRunResult {
   guardResult: JobGuardResult
   startedAt: string
   completedAt: string
+  permissionBlockEvent?: PermissionBlockEvent
+  rollbackInfo?: RollbackInfo
 }
 
 /**
  * Job を実行して結果を返す
- * - Permission Guard → commandResolver → execFileSync → File Change Guard
+ * - Permission Guard (with grants) → commandResolver → execFileSync → File Change Guard
  */
 export async function runJob(job: Job): Promise<JobRunResult> {
   const startedAt = new Date().toISOString()
 
-  const guardCheck = permissionGuard(job.safeCommand, job.agentRole)
+  const guardCheck = await permissionGuardWithGrants(
+    job.safeCommand,
+    job.agentRole,
+    job.taskId,
+    job.id,
+    API_BASE_URL,
+  )
   const guardResult: JobGuardResult = {
     permissionAllowed: guardCheck.allowed,
     permissionReason: guardCheck.reason,
@@ -56,21 +65,30 @@ export async function runJob(job: Job): Promise<JobRunResult> {
       guardResult,
       startedAt,
       completedAt: new Date().toISOString(),
+      permissionBlockEvent: guardCheck.blockEvent,
     }
   }
 
   const resolved = resolveCommand(job.safeCommand)
+  const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)
 
   let exitCode = 0
   let stdout = ''
   let stderr = ''
+  let beforeCommitHash: string | undefined
+  let afterCommitHash: string | undefined
 
   if (!job.dryRun) {
+    // アトミックジョブの場合は実行前コミットハッシュを記録
+    if (isAtomic) {
+      beforeCommitHash = getCommitHash(job.safeCommand.workingDir)
+    }
+
     try {
       stdout = execFileSync(resolved.argv[0], resolved.argv.slice(1), {
         cwd: job.safeCommand.workingDir,
         shell: false,
-        timeout: JOB_TIMEOUT_MS,
+        timeout: isAtomic ? undefined : JOB_TIMEOUT_MS,
         encoding: 'utf-8',
       })
     } catch (err: unknown) {
@@ -79,6 +97,11 @@ export async function runJob(job: Job): Promise<JobRunResult> {
       stdout = outputToString(failure.stdout)
       stderr = outputToString(failure.stderr) || formatUnknownError(err)
     }
+
+    // アトミックジョブの場合は実行後コミットハッシュを記録
+    if (isAtomic) {
+      afterCommitHash = getCommitHash(job.safeCommand.workingDir)
+    }
   }
 
   const changedFiles = getChangedFiles(job.safeCommand.workingDir)
@@ -86,6 +109,16 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   guardResult.fileChangeAllowed = fileGuard.allowed
   guardResult.fileViolations = fileGuard.violations
   const logPaths = saveJobLogs(job.id, stdout, stderr)
+
+  // アトミックジョブの RollbackInfo を自動生成
+  let rollbackInfo: RollbackInfo | undefined
+  if (isAtomic && beforeCommitHash && exitCode === 0) {
+    rollbackInfo = {
+      previousCommitHash: beforeCommitHash,
+      changedFiles,
+      rollbackArgv: ['git', 'revert', '--no-edit', afterCommitHash ?? 'HEAD'],
+    }
+  }
 
   return {
     status: exitCode === 0 && fileGuard.allowed ? 'success' : 'failed',
@@ -98,6 +131,19 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     guardResult,
     startedAt,
     completedAt: new Date().toISOString(),
+    rollbackInfo,
+  }
+}
+
+function getCommitHash(workingDir: string): string | undefined {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: workingDir,
+      encoding: 'utf-8',
+      shell: false,
+    }).trim()
+  } catch {
+    return undefined
   }
 }
 
@@ -130,3 +176,6 @@ function outputToString(output: string | Buffer | undefined): string {
 function formatUnknownError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
+
+// 後方互換のため permissionGuard を再エクスポート
+export { permissionGuard }
