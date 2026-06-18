@@ -17,7 +17,7 @@
 
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { callGeminiForReview } from '../metaReviewer/geminiClient.js'
+import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
 import type { AlignmentIssue, AlignmentReport } from '@ai-team/shared'
 
 // プロジェクトルートからの相対パス（Control Repo の設計ドキュメント）
@@ -133,7 +133,12 @@ export async function runAlignmentCheck(
 ): Promise<AlignmentReport> {
   const designDocs = await loadDesignDocs(repoRoot)
   const prompt = buildAlignmentPrompt(designDocs, rawDiff)
-  const responseText = await callGeminiForReview(prompt)
+  const responseText = await callGeminiWithFallback(prompt, {
+    preferCli: true,
+    cliModel: 'gemini-3.1-flash-lite',
+    apiModel: 'gemini-3.1-flash-lite',
+    featureName: 'alignment_check',
+  })
   const { aligned, issues, summary } = parseAlignmentResponse(responseText)
 
   return {

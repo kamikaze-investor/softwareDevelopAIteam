@@ -17,7 +17,7 @@ const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash'
 /**
  * Gemini にレビューを依頼し、生のテキスト応答を返す
  */
-export async function callGeminiForReview(prompt: string): Promise<string> {
+export async function callGeminiForReview(prompt: string, modelOverride?: string): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY
   if (!apiKey) {
     throw new Error(
@@ -26,7 +26,7 @@ export async function callGeminiForReview(prompt: string): Promise<string> {
   }
 
   const genAI = new GoogleGenerativeAI(apiKey)
-  const modelName = process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL
+  const modelName = modelOverride?.trim() || process.env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL
   const model = genAI.getGenerativeModel({
     model: modelName,
     generationConfig: {

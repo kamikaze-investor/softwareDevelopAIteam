@@ -9,9 +9,9 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { runAlignmentCheck } from './alignmentChecker.js'
 
-// geminiClient をモック
-vi.mock('../metaReviewer/geminiClient.js', () => ({
-  callGeminiForReview: vi.fn(),
+// geminiRouter をモック
+vi.mock('../metaReviewer/geminiRouter.js', () => ({
+  callGeminiWithFallback: vi.fn(),
 }))
 
 // node:fs/promises をモック（設計ドキュメント読み込み）
@@ -19,8 +19,8 @@ vi.mock('node:fs/promises', () => ({
   readFile: vi.fn().mockResolvedValue('# Design Doc\nTest content'),
 }))
 
-import { callGeminiForReview } from '../metaReviewer/geminiClient.js'
-const mockCallGemini = vi.mocked(callGeminiForReview)
+import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
+const mockCallGemini = vi.mocked(callGeminiWithFallback)
 
 const SAFE_DIFF = `diff --git a/src/utils/format.ts b/src/utils/format.ts
 --- a/src/utils/format.ts

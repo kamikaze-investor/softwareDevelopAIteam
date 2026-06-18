@@ -40,7 +40,7 @@ import { runSafetyAudit } from '../src/guards/safetyAuditor.js'
 import { runAlignmentCheck } from '../src/guards/alignmentChecker.js'
 import { processGate, type GateResult } from '../src/guards/gateProcessor.js'
 import { appendExecutionLog } from '../src/executionLogStore.js'
-import { callGeminiForReview } from '../src/metaReviewer/geminiClient.js'
+import { callGeminiWithFallback } from '../src/metaReviewer/geminiRouter.js'
 import type { AuditReport, AlignmentReport } from '@ai-team/shared'
 import { randomUUID } from 'node:crypto'
 
@@ -147,7 +147,12 @@ async function generateWhyExplanation(
   ].join('\n')
 
   try {
-    const result = await callGeminiForReview(prompt)
+    const result = await callGeminiWithFallback(prompt, {
+      preferCli: false,
+      cliModel: 'gemini-3.5-flash',
+      apiModel: 'gemini-3.5-flash',
+      featureName: 'audit_explanation',
+    })
     return result.trim()
   } catch {
     // Gemini 失敗時のフォールバック：技術情報ベースの最低限の説明

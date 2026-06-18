@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process'
 import { writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } from './runner.js'
-import { callGeminiForReview } from './geminiClient.js'
+import { callGeminiWithFallback } from './geminiRouter.js'
 
 async function main(): Promise<void> {
   // --- 環境変数の読み取り ---
@@ -100,7 +100,12 @@ async function main(): Promise<void> {
   console.log('\n🤖 Gemini にレビューを依頼中...')
   let rawResponse: string
   try {
-    rawResponse = await callGeminiForReview(prompt)
+    rawResponse = await callGeminiWithFallback(prompt, {
+      preferCli: true,
+      cliModel: 'gemini-3.5-flash',
+      apiModel: 'gemini-3.5-flash',
+      featureName: 'meta_review',
+    })
   } catch (err) {
     console.error('❌ Gemini API 呼び出しに失敗しました:', err)
     // API障害は安全のため blocked 扱い
