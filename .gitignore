@@ -38,7 +38,8 @@ coverage/
 # pnpm
 .pnpm-store/
 
-# SQLite 一時ファイル
+# SQLite データベース本体・一時ファイル
+apps/api/data/*.db
 *.db-shm
 *.db-wal
 
