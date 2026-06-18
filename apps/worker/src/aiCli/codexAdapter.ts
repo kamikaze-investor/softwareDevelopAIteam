@@ -66,6 +66,8 @@ export class CodexAdapter extends BaseCliAdapter {
     return [
       'exec',
       '--sandbox', sandboxMode,
+      '-C', request.workingDir,   // ワークスペースルートを明示（execFileSync の cwd と一致）
+      '--ephemeral',               // Workerの自動実行ではセッションファイルを残さない
       request.prompt,
     ]
   }
