@@ -149,8 +149,8 @@ async function generateWhyExplanation(
   try {
     const result = await callGeminiWithFallback(prompt, {
       preferCli: false,
-      cliModel: 'gemini-3.5-flash',
-      apiModel: 'gemini-3.5-flash',
+      cliModel: 'gemini-3.1-flash-lite',
+      apiModel: 'gemini-3.1-flash-lite',
       featureName: 'audit_explanation',
     })
     return result.trim()
