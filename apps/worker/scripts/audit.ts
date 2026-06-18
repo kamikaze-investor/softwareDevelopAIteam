@@ -21,6 +21,7 @@ import { runSafetyAudit } from '../src/guards/safetyAuditor.js'
 import { runAlignmentCheck } from '../src/guards/alignmentChecker.js'
 import { processGate, type GateResult } from '../src/guards/gateProcessor.js'
 import { appendExecutionLog } from '../src/executionLogStore.js'
+import { callGeminiForReview } from '../src/metaReviewer/geminiClient.js'
 import type { AuditReport, AlignmentReport } from '@ai-team/shared'
 import { randomUUID } from 'node:crypto'
 
@@ -63,23 +64,94 @@ function describeRisk(riskLevel: string): string {
   }
 }
 
-function describeReason(reason: string | undefined, dangerousHits: AuditReport['dangerousHits']): string {
-  const parts: string[] = []
-  if (dangerousHits.length > 0) {
-    parts.push('【AIが検出した具体的な懸念点】')
-    for (const hit of dangerousHits) {
-      if (hit.type === 'file') parts.push(`・ファイル「${hit.value}」は変更に注意が必要なカテゴリです`)
-      if (hit.type === 'keyword') parts.push(`・コード内に注意キーワード「${hit.value}」が含まれています`)
+/**
+ * Gemini に「なぜ承認が必要か」を非エンジニア向けの平文で説明させる。
+ * 技術的ヒット情報は内部コンテキストとして渡し、出力は目的中心にする。
+ */
+async function generateWhyExplanation(
+  rawDiff: string,
+  changedFiles: string[],
+  dangerousHits: AuditReport['dangerousHits'],
+  gateDecision: string,
+): Promise<string> {
+  const hitSummary = dangerousHits.length > 0
+    ? dangerousHits.map((h) => `- [${h.type}] ${h.value} (${h.location})`).join('\n')
+    : '（技術的ヒットなし）'
+
+  const diffPreview = rawDiff.split('\n').slice(0, 80).join('\n')
+
+  const prompt = [
+    '# 承認理由の説明文を生成してください',
+    '',
+    'あなたは AI 開発チームのセキュリティゲートです。',
+    '以下の変更に対して、非エンジニアの経営者（CEO）が「承認するかどうか」を判断できるよう、',
+    '平文で説明する文章を書いてください。',
+    '',
+    '## 変更されたファイル',
+    changedFiles.join('\n'),
+    '',
+    '## セキュリティシステムが検出した懸念点（技術情報・内部参照用）',
+    hitSummary,
+    '',
+    '## 変更の概要（git diff の先頭部分）',
+    '```diff',
+    diffPreview,
+    '```',
+    '',
+    '## 出力フォーマット（必ずこの構造で日本語で書くこと）',
+    '',
+    '【今のままだと何ができないのか】',
+    '（この変更をしない場合、何が実現できないか。現在の制約を具体的に説明する。不明な場合は「不明」と書く）',
+    '',
+    '【この変更で何が可能になるのか】',
+    '（承認した場合に追加・改善される機能や仕組みを、目的・用途で説明する）',
+    '',
+    '【今やる必要がある理由】',
+    '（なぜ今このタイミングで必要か。緊急性・依存関係・開発フローへの影響など。不明な場合は「不明」と書く）',
+    '',
+    '【AIが懸念していること】',
+    '（セキュリティシステムが検出した懸念を、技術用語を使わず説明する。',
+    ' リスクを小さく見せないこと。不確実な部分は「不明」と書く。',
+    ' この判断はAIによる検出であり、人間の承認の代わりにはならない）',
+    '',
+    '## 制約（必ず守ること）',
+    '- 技術名（TypeScript, Node.js, PowerShell, API など）だけで説明しない',
+    '- 「必要だから必要」の循環説明禁止',
+    '- リスクを過小評価・隠蔽しない',
+    '- AIの判断を人間承認として扱わない（「AIが安全と判断した」等の表現禁止）',
+    '- 不確実な情報には「不明」と明記する',
+    '- 各セクションは2〜4文程度',
+  ].join('\n')
+
+  try {
+    const result = await callGeminiForReview(prompt)
+    return result.trim()
+  } catch {
+    // Gemini 失敗時のフォールバック：技術情報ベースの最低限の説明
+    const fallback: string[] = [
+      '【今のままだと何ができないのか】',
+      'Gemini による自動説明の生成に失敗しました。以下の技術情報を参考にしてください。',
+      '',
+      '【この変更で何が可能になるのか】',
+      '（自動生成失敗 — 不明）',
+      '',
+      '【今やる必要がある理由】',
+      '（自動生成失敗 — 不明）',
+      '',
+      '【AIが懸念していること】',
+    ]
+    if (dangerousHits.length > 0) {
+      for (const h of dangerousHits) {
+        if (h.type === 'file') fallback.push(`・重要ファイル「${h.value}」が変更対象に含まれています`)
+        if (h.type === 'keyword') fallback.push(`・注意が必要なコード「${h.value}」が変更内に検出されました`)
+      }
+    } else {
+      fallback.push('・技術的な自動検出項目はありませんでした')
     }
+    fallback.push('')
+    fallback.push(`Gate判定: ${gateDecision}`)
+    return fallback.join('\n')
   }
-  if (reason?.includes('Alignment')) {
-    parts.push('\n【設計方針との整合性チェック（AI Geminiによる判断）】')
-    const alignParts = reason.split('|').filter((p) => p.includes('Alignment'))
-    for (const p of alignParts) {
-      parts.push(p.replace('[Alignment CRITICAL]', '🔴').replace('[Alignment WARNING]', '🟡').trim())
-    }
-  }
-  return parts.length > 0 ? parts.join('\n') : '詳細な理由は取得できませんでした。'
 }
 
 function describeSafetyMechanisms(): string {
@@ -226,9 +298,8 @@ function buildPsScript(inputFilePath: string): string {
 function showApprovalDialog(
   gateResult: GateResult,
   auditReport: AuditReport,
-  alignmentReport?: AlignmentReport,
+  whyText: string,
 ): ApprovalDecision {
-  void alignmentReport
   const tmpDir = path.join(REPO_ROOT, 'data', '.tmp_approval')
   mkdirSync(tmpDir, { recursive: true })
   const inputFile = path.join(tmpDir, 'input.json')
@@ -238,7 +309,7 @@ function showApprovalDialog(
     riskLabel: describeRisk(gateResult.finalRiskLevel),
     gateDecision: gateResult.gateDecision,
     filesText: describeFiles(auditReport.changedFiles),
-    reasonText: describeReason(gateResult.reason, auditReport.dangerousHits),
+    reasonText: whyText,
     safetyText: describeSafetyMechanisms(),
     ref,
     changedCount: auditReport.changedFiles.length,
@@ -416,8 +487,15 @@ async function main(): Promise<number> {
   }
 
   if (useUI) {
+    console.log('\n📋 承認理由を生成中（Gemini）...')
+    const whyText = await generateWhyExplanation(
+      rawDiff,
+      auditReport.changedFiles,
+      auditReport.dangerousHits,
+      gateResult.gateDecision,
+    )
     console.log('\n📋 承認ダイアログを表示します...')
-    const decision = showApprovalDialog(gateResult, auditReport, alignmentReport)
+    const decision = showApprovalDialog(gateResult, auditReport, whyText)
     recordApproval(ref, gateResult, decision)
 
     if (decision === 'approve_all' || decision === 'approve_once') {
