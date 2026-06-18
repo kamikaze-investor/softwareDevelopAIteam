@@ -28,7 +28,7 @@ import type {
   MetaReviewTargetArea,
 } from '@ai-team/shared'
 
-const CONTROL_ROOT = '/workspace/control'
+const CONTROL_ROOT = process.env.CONTROL_ROOT ?? '/workspace/control'
 const META_REVIEWER_PROMPT_PATH = path.join(
   CONTROL_ROOT,
   'docs/meta_reviewer/prompt.md'
