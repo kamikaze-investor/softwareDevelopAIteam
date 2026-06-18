@@ -106,8 +106,11 @@ async function generateWhyExplanation(
     '【この変更で何が可能になるのか】',
     '（承認した場合に追加・改善される機能や仕組みを、目的・用途で説明する）',
     '',
-    '【今やる必要がある理由】',
-    '（なぜ今このタイミングで必要か。緊急性・依存関係・開発フローへの影響など。不明な場合は「不明」と書く）',
+    '【承認しない場合はどうなるか】',
+    '（拒否した場合の影響を具体的に説明する。開発が止まるか、代替手段があるか、コストはどう変わるか。',
+    ' 例：「開発は止まりませんが、この機能は完成できません」',
+    ' 例：「別の方法がありますが、開発時間が増えます」',
+    ' 不明な場合は「不明」と書く）',
     '',
     '【AIが懸念していること】',
     '（セキュリティシステムが検出した懸念を、技術用語を使わず説明する。',
@@ -168,130 +171,210 @@ function describeSafetyMechanisms(): string {
 // CEO 承認ダイアログ（PowerShell WinForms カスタムフォーム）
 // ────────────────────────────────────────────────────────────
 
-type ApprovalDecision = 'approve_all' | 'approve_once' | 'reject'
+type ApprovalDecision =
+  | 'approve_all'
+  | 'approve_once'
+  | 'reject'
+  | { kind: 'instructions'; text: string }
 
 function buildPsScript(inputFilePath: string): string {
   // PowerShell スクリプトを行配列で構築（テンプレートリテラル回避）
-  // TS template literal 内では backtick と ${} が特殊文字なので string 配列で組み立てる
   const NL = '\n'
-  const BT = '`' // PowerShell のエスケープ文字（バッククォート）
   const iPath = inputFilePath.replace(/\\/g, '\\\\')
   const lines: string[] = [
     'Add-Type -AssemblyName System.Windows.Forms',
     'Add-Type -AssemblyName System.Drawing',
     '',
     '$data = Get-Content -Raw -Encoding UTF8 -Path \'' + iPath + '\' | ConvertFrom-Json',
+    '$script:outFile = $data.outputFile',
     '',
+    '# ── フォーム ──',
     '$form = New-Object System.Windows.Forms.Form',
     '$form.Text = "Safety Gate — CEO 承認リクエスト"',
-    '$form.Size = New-Object System.Drawing.Size(780, 720)',
+    '$form.Size = New-Object System.Drawing.Size(800, 900)',
     '$form.StartPosition = "CenterScreen"',
-    '$form.FormBorderStyle = "FixedDialog"',
-    '$form.MaximizeBox = $false',
+    '$form.FormBorderStyle = "Sizable"',
+    '$form.MinimumSize = New-Object System.Drawing.Size(700, 700)',
     '$form.BackColor = [System.Drawing.Color]::FromArgb(245, 245, 248)',
     '$form.Font = New-Object System.Drawing.Font("Meiryo UI", 9)',
     '',
-    '# header',
+    '# ── ヘッダー ──',
     '$hdr = New-Object System.Windows.Forms.Panel',
     '$hdr.Dock = "Top"',
     '$hdr.Height = 70',
-    '$hdrColor = if ($data.isBlock) { [System.Drawing.Color]::FromArgb(220,53,69) } else { [System.Drawing.Color]::FromArgb(255,153,0) }',
-    '$hdr.BackColor = $hdrColor',
+    '$hdr.BackColor = if ($data.isBlock) { [System.Drawing.Color]::FromArgb(220,53,69) } else { [System.Drawing.Color]::FromArgb(255,153,0) }',
     '$hdrLbl = New-Object System.Windows.Forms.Label',
-    '$hdrLbl.Text = if ($data.isBlock) { "🔴  BLOCK — CEO承認が必要です" } else { "🟡  DEEP REVIEW — 人間のレビューが必要です" }',
+    '$hdrLbl.Text = if ($data.isBlock) { "  BLOCK — CEO承認が必要です" } else { "  DEEP REVIEW — 人間のレビューが必要です" }',
     '$hdrLbl.Font = New-Object System.Drawing.Font("Meiryo UI", 13, [System.Drawing.FontStyle]::Bold)',
     '$hdrLbl.ForeColor = [System.Drawing.Color]::White',
-    '$hdrLbl.AutoSize = $false',
-    '$hdrLbl.Dock = "Fill"',
-    '$hdrLbl.TextAlign = "MiddleCenter"',
+    '$hdrLbl.AutoSize = $false; $hdrLbl.Dock = "Fill"; $hdrLbl.TextAlign = "MiddleCenter"',
     '$hdr.Controls.Add($hdrLbl)',
     '$form.Controls.Add($hdr)',
     '',
-    '# scroll panel',
+    '# ── スクロールエリア ──',
     '$scroll = New-Object System.Windows.Forms.Panel',
     '$scroll.Location = New-Object System.Drawing.Point(0, 70)',
-    '$scroll.Size = New-Object System.Drawing.Size(780, 540)',
+    '$scroll.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right',
+    '$scroll.Size = New-Object System.Drawing.Size(800, 620)',
     '$scroll.AutoScroll = $true',
+    '$script:sy = 10',
     '',
-    '$sy = 10',
-    '',
+    '# ── セクション追加ヘルパー ──',
     'function Add-Sec($ttl, $body, $r, $g, $b) {',
     '  $pnl = New-Object System.Windows.Forms.Panel',
     '  $pnl.Location = New-Object System.Drawing.Point(10, $script:sy)',
-    '  $pnl.Size = New-Object System.Drawing.Size(740, 10)',
+    '  $pnl.Size = New-Object System.Drawing.Size(760, 10)',
     '  $pnl.BackColor = [System.Drawing.Color]::FromArgb($r,$g,$b)',
     '  $tl = New-Object System.Windows.Forms.Label',
     '  $tl.Text = $ttl',
     '  $tl.Font = New-Object System.Drawing.Font("Meiryo UI", 9.5, [System.Drawing.FontStyle]::Bold)',
     '  $tl.ForeColor = [System.Drawing.Color]::FromArgb(30,30,30)',
-    '  $tl.Location = New-Object System.Drawing.Point(12, 8)',
-    '  $tl.AutoSize = $true',
+    '  $tl.Location = New-Object System.Drawing.Point(12, 8); $tl.AutoSize = $true',
     '  $pnl.Controls.Add($tl)',
     '  $bl = New-Object System.Windows.Forms.Label',
     '  $bl.Text = $body',
     '  $bl.Font = New-Object System.Drawing.Font("Meiryo UI", 9)',
     '  $bl.ForeColor = [System.Drawing.Color]::FromArgb(50,50,50)',
     '  $bl.Location = New-Object System.Drawing.Point(12, 30)',
-    '  $bl.MaximumSize = New-Object System.Drawing.Size(715, 0)',
-    '  $bl.AutoSize = $true',
+    '  $bl.MaximumSize = New-Object System.Drawing.Size(735, 0); $bl.AutoSize = $true',
     '  $pnl.Controls.Add($bl)',
     '  $pnl.Height = $tl.Height + $bl.PreferredHeight + 48',
     '  $script:scroll.Controls.Add($pnl)',
     '  $script:sy += $pnl.Height + 8',
     '}',
     '',
-    'Add-Sec "❓ 何を承認するのか？" ("AIアシスタント（Claude Code）が、このリポジトリに " + $data.changedCount + " 個のファイルを変更しようとしています。' + NL + NL + '変更対象ファイル:' + NL + '" + $data.filesText) 235 245 255',
+    '# ── 通常セクション ──',
+    'Add-Sec "❓ 何を承認するのか？" ("AIアシスタントが、このリポジトリに " + $data.changedCount + " 個のファイルを変更しようとしています。' + NL + NL + '変更対象ファイル:' + NL + '" + $data.filesText) 235 245 255',
     'Add-Sec "⚠️ なぜ承認が必要なのか？" $data.reasonText 255 248 230',
-    'Add-Sec "📊 リスクレベル" ($data.riskLabel + "' + NL + NL + '🟢 低  → 通常の変更（コメント、テスト等）' + NL + '🟡 中  → 影響範囲の広い変更（設定ファイル等）' + NL + '🟠 高  → 重要ファイルへの変更（要確認）' + NL + '🔴 重大 → セキュリティ・ガード系ファイルへの変更") 255 240 240',
+    'Add-Sec "📊 リスクレベル" ($data.riskLabel + "' + NL + NL + '🟢 低  → 通常の変更（コメント・テスト等）' + NL + '🟡 中  → 影響範囲の広い変更（設定ファイル等）' + NL + '🟠 高  → 重要ファイルへの変更（要確認）' + NL + '🔴 重大 → セキュリティ・ガード系ファイルへの変更") 255 240 240',
     'Add-Sec "🛡️ 安全に運用できる仕組みは？" $data.safetyText 235 255 240',
     '',
-    '$scroll.AutoScrollMinSize = New-Object System.Drawing.Size(740, ($sy + 20))',
+    '# ── 技術詳細（折りたたみ） ──',
+    '$techToggle = New-Object System.Windows.Forms.Button',
+    '$techToggle.Text = "▶ 技術的な詳細を見る（エンジニア向け）"',
+    '$techToggle.Location = New-Object System.Drawing.Point(10, $script:sy)',
+    '$techToggle.Size = New-Object System.Drawing.Size(760, 30)',
+    '$techToggle.TextAlign = "MiddleLeft"',
+    '$techToggle.FlatStyle = "Flat"',
+    '$techToggle.BackColor = [System.Drawing.Color]::FromArgb(220, 220, 230)',
+    '$techToggle.ForeColor = [System.Drawing.Color]::FromArgb(40, 40, 100)',
+    '$techToggle.Font = New-Object System.Drawing.Font("Meiryo UI", 9, [System.Drawing.FontStyle]::Bold)',
+    '$script:sy += 38',
+    '$scroll.Controls.Add($techToggle)',
+    '',
+    '$techPanel = New-Object System.Windows.Forms.Panel',
+    '$techPanel.Location = New-Object System.Drawing.Point(10, $script:sy)',
+    '$techPanel.Size = New-Object System.Drawing.Size(760, 0)',
+    '$techPanel.BackColor = [System.Drawing.Color]::FromArgb(235, 235, 245)',
+    '$techPanel.Visible = $false',
+    '',
+    '$techLbl = New-Object System.Windows.Forms.Label',
+    '$techLbl.Text = $data.techDetails',
+    '$techLbl.Font = New-Object System.Drawing.Font("Consolas", 8.5)',
+    '$techLbl.ForeColor = [System.Drawing.Color]::FromArgb(40, 40, 40)',
+    '$techLbl.Location = New-Object System.Drawing.Point(10, 10)',
+    '$techLbl.MaximumSize = New-Object System.Drawing.Size(735, 0)',
+    '$techLbl.AutoSize = $true',
+    '$techPanel.Controls.Add($techLbl)',
+    '$scroll.Controls.Add($techPanel)',
+    '',
+    '$techToggle.Add_Click({',
+    '  if ($techPanel.Visible) {',
+    '    $techPanel.Visible = $false',
+    '    $techPanel.Height = 0',
+    '    $techToggle.Text = "▶ 技術的な詳細を見る（エンジニア向け）"',
+    '  } else {',
+    '    $techPanel.Height = $techLbl.PreferredHeight + 24',
+    '    $techPanel.Visible = $true',
+    '    $techToggle.Text = "▼ 技術的な詳細を隠す"',
+    '  }',
+    '})',
+    '',
+    '$script:sy += 8',
+    '',
+    '# ── 指示記入欄 ──',
+    '$instrPnl = New-Object System.Windows.Forms.Panel',
+    '$instrPnl.Location = New-Object System.Drawing.Point(10, $script:sy)',
+    '$instrPnl.Size = New-Object System.Drawing.Size(760, 110)',
+    '$instrPnl.BackColor = [System.Drawing.Color]::FromArgb(255, 253, 235)',
+    '$instrLbl = New-Object System.Windows.Forms.Label',
+    '$instrLbl.Text = "📝 承認せずに指示を出す（例：「原因調査だけして」「依存関係の修正は後回しにして」）"',
+    '$instrLbl.Font = New-Object System.Drawing.Font("Meiryo UI", 9, [System.Drawing.FontStyle]::Bold)',
+    '$instrLbl.ForeColor = [System.Drawing.Color]::FromArgb(100, 70, 0)',
+    '$instrLbl.Location = New-Object System.Drawing.Point(10, 8)',
+    '$instrLbl.AutoSize = $true',
+    '$instrPnl.Controls.Add($instrLbl)',
+    '$instrBox = New-Object System.Windows.Forms.TextBox',
+    '$instrBox.Location = New-Object System.Drawing.Point(10, 30)',
+    '$instrBox.Size = New-Object System.Drawing.Size(570, 60)',
+    '$instrBox.Multiline = $true',
+    '$instrBox.ScrollBars = "Vertical"',
+    '$instrBox.Font = New-Object System.Drawing.Font("Meiryo UI", 9)',
+    '$instrPnl.Controls.Add($instrBox)',
+    '$instrBtn = New-Object System.Windows.Forms.Button',
+    '$instrBtn.Text = "この指示で止める"',
+    '$instrBtn.Location = New-Object System.Drawing.Point(590, 30)',
+    '$instrBtn.Size = New-Object System.Drawing.Size(160, 60)',
+    '$instrBtn.BackColor = [System.Drawing.Color]::FromArgb(180, 140, 0)',
+    '$instrBtn.ForeColor = [System.Drawing.Color]::White',
+    '$instrBtn.Font = New-Object System.Drawing.Font("Meiryo UI", 9, [System.Drawing.FontStyle]::Bold)',
+    '$instrBtn.FlatStyle = "Flat"',
+    '$instrBtn.Add_Click({',
+    '  $txt = $instrBox.Text.Trim()',
+    '  if ($txt.Length -gt 0) {',
+    '    ("instructions:" + $txt) | Out-File -FilePath $script:outFile -Encoding utf8',
+    '    $form.Close()',
+    '  } else {',
+    '    [System.Windows.Forms.MessageBox]::Show("指示内容を入力してください。", "入力エラー") | Out-Null',
+    '  }',
+    '})',
+    '$instrPnl.Controls.Add($instrBtn)',
+    '$scroll.Controls.Add($instrPnl)',
+    '$script:sy += 118',
+    '',
+    '$scroll.AutoScrollMinSize = New-Object System.Drawing.Size(760, ($script:sy + 20))',
     '$form.Controls.Add($scroll)',
     '',
-    '# button panel',
+    '# ── ボタンパネル ──',
     '$bp = New-Object System.Windows.Forms.Panel',
     '$bp.Dock = "Bottom"',
-    '$bp.Height = 80',
-    '$bp.BackColor = [System.Drawing.Color]::FromArgb(225,225,230)',
-    '',
-    '$outFile = $data.outputFile',
+    '$bp.Height = 76',
+    '$bp.BackColor = [System.Drawing.Color]::FromArgb(225, 225, 230)',
     '',
     '$b1 = New-Object System.Windows.Forms.Button',
     '$b1.Text = "✅ 承認する（以降も有効）"',
     '$b1.Size = New-Object System.Drawing.Size(210, 46)',
-    '$b1.Location = New-Object System.Drawing.Point(30, 17)',
+    '$b1.Location = New-Object System.Drawing.Point(30, 15)',
     '$b1.BackColor = [System.Drawing.Color]::FromArgb(40,167,69)',
     '$b1.ForeColor = [System.Drawing.Color]::White',
     '$b1.Font = New-Object System.Drawing.Font("Meiryo UI", 9.5, [System.Drawing.FontStyle]::Bold)',
     '$b1.FlatStyle = "Flat"',
-    '$b1.Add_Click({ "approve_all" | Out-File -FilePath $outFile -Encoding utf8; $form.Close() })',
+    '$b1.Add_Click({ "approve_all" | Out-File -FilePath $script:outFile -Encoding utf8; $form.Close() })',
     '',
     '$b2 = New-Object System.Windows.Forms.Button',
     '$b2.Text = "🔁 今回のみ承認"',
     '$b2.Size = New-Object System.Drawing.Size(210, 46)',
-    '$b2.Location = New-Object System.Drawing.Point(260, 17)',
+    '$b2.Location = New-Object System.Drawing.Point(260, 15)',
     '$b2.BackColor = [System.Drawing.Color]::FromArgb(0,123,255)',
     '$b2.ForeColor = [System.Drawing.Color]::White',
     '$b2.Font = New-Object System.Drawing.Font("Meiryo UI", 9.5, [System.Drawing.FontStyle]::Bold)',
     '$b2.FlatStyle = "Flat"',
-    '$b2.Add_Click({ "approve_once" | Out-File -FilePath $outFile -Encoding utf8; $form.Close() })',
+    '$b2.Add_Click({ "approve_once" | Out-File -FilePath $script:outFile -Encoding utf8; $form.Close() })',
     '',
     '$b3 = New-Object System.Windows.Forms.Button',
     '$b3.Text = "🚫 拒否する"',
     '$b3.Size = New-Object System.Drawing.Size(210, 46)',
-    '$b3.Location = New-Object System.Drawing.Point(490, 17)',
+    '$b3.Location = New-Object System.Drawing.Point(490, 15)',
     '$b3.BackColor = [System.Drawing.Color]::FromArgb(108,117,125)',
     '$b3.ForeColor = [System.Drawing.Color]::White',
     '$b3.Font = New-Object System.Drawing.Font("Meiryo UI", 9.5, [System.Drawing.FontStyle]::Bold)',
     '$b3.FlatStyle = "Flat"',
-    '$b3.Add_Click({ "reject" | Out-File -FilePath $outFile -Encoding utf8; $form.Close() })',
+    '$b3.Add_Click({ "reject" | Out-File -FilePath $script:outFile -Encoding utf8; $form.Close() })',
     '',
     '$bp.Controls.AddRange(@($b1, $b2, $b3))',
     '$form.Controls.Add($bp)',
     '$form.ShowDialog() | Out-Null',
   ]
-  // 未使用変数の参照を回避するためのダミー参照
-  void BT
   return lines.join(NL)
 }
 
@@ -305,16 +388,34 @@ function showApprovalDialog(
   const inputFile = path.join(tmpDir, 'input.json')
   const outputFile = path.join(tmpDir, 'output.json')
 
+  // 技術詳細（折りたたみセクション用）
+  const techLines: string[] = []
+  if (auditReport.dangerousHits.length > 0) {
+    techLines.push('[Policy Guard 検出]')
+    for (const h of auditReport.dangerousHits) {
+      techLines.push(`  ${h.type === 'file' ? 'FILE ' : 'KEYWORD '} ${h.value}  (${h.location})`)
+    }
+  }
+  techLines.push(``)
+  techLines.push(`[変更ファイル diff サマリー]`)
+  for (const d of auditReport.diffSummary) {
+    techLines.push(`  ${d.file}  +${d.added} -${d.removed}`)
+  }
+  techLines.push(``)
+  techLines.push(`[Gate 判定]  ${gateResult.finalRiskLevel} → ${gateResult.gateDecision}`)
+  if (gateResult.reason) techLines.push(`[理由]  ${gateResult.reason}`)
+
   const input = {
     riskLabel: describeRisk(gateResult.finalRiskLevel),
     gateDecision: gateResult.gateDecision,
     filesText: describeFiles(auditReport.changedFiles),
     reasonText: whyText,
+    techDetails: techLines.join('\n'),
     safetyText: describeSafetyMechanisms(),
     ref,
     changedCount: auditReport.changedFiles.length,
     isBlock: gateResult.gateDecision === 'BLOCK_CEO_REQUIRED',
-    outputFile,  // JSON.stringify が \\ を自動エスケープするので二重エスケープ不要
+    outputFile,
   }
   // PowerShell 5.1 は BOM なし UTF-8 を Shift-JIS として読むため BOM を付与
   const jsonBom = Buffer.from([0xEF, 0xBB, 0xBF])
@@ -340,6 +441,8 @@ function showApprovalDialog(
       const raw = readFileSync(outputFile, 'utf-8').trim()
       if (raw === 'approve_all' || raw === 'approve_once' || raw === 'reject') {
         decision = raw
+      } else if (raw.startsWith('instructions:')) {
+        decision = { kind: 'instructions', text: raw.slice('instructions:'.length).trim() }
       }
     }
   } catch { /* 読み取り失敗 = 拒否扱い */ }
@@ -361,23 +464,29 @@ function recordApproval(ref: string, gateResult: GateResult, decision: ApprovalD
   try {
     const approvalDir = path.join(REPO_ROOT, 'data', 'approvals')
     mkdirSync(approvalDir, { recursive: true })
+    const isInstructions = typeof decision === 'object' && decision.kind === 'instructions'
+    const decisionStr = isInstructions ? 'instructions' : decision as string
     const record = {
       id: randomUUID(),
       ref,
       decidedAt: new Date().toISOString(),
-      decision,
+      decision: decisionStr,
+      instructions: isInstructions ? (decision as { kind: string; text: string }).text : undefined,
       approvedBy: 'CEO_UI_CLICK',
       gateDecision: gateResult.gateDecision,
       finalRiskLevel: gateResult.finalRiskLevel,
       reason: gateResult.reason,
-      scope: decision === 'approve_once' ? 'once' : decision === 'approve_all' ? 'permanent' : 'none',
+      scope: decisionStr === 'approve_once' ? 'once' : decisionStr === 'approve_all' ? 'permanent' : 'none',
     }
     writeFileSync(
       path.join(approvalDir, 'approval_log.jsonl'),
       JSON.stringify(record) + '\n',
       { flag: 'a', encoding: 'utf-8' },
     )
-    const label = decision === 'approve_all' ? '✅ 承認（全般）' : decision === 'approve_once' ? '🔁 承認（今回のみ）' : '🚫 拒否'
+    const label = decisionStr === 'approve_all' ? '✅ 承認（全般）'
+      : decisionStr === 'approve_once' ? '🔁 承認（今回のみ）'
+      : decisionStr === 'instructions' ? '📝 指示あり（コミット中止）'
+      : '🚫 拒否'
     console.log(`${label} — 記録を保存しました。`)
   } catch {
     // ログ保存失敗はノイズにしない
@@ -502,6 +611,10 @@ async function main(): Promise<number> {
       const label = decision === 'approve_once' ? '今回のみ承認' : '全般承認'
       console.log(`✅ CEO承認済み（${label}）— コミット続行します`)
       return 0
+    } else if (typeof decision === 'object' && decision.kind === 'instructions') {
+      console.log(`📝 指示を受け取りました — コミット中止します`)
+      console.log(`   指示内容: ${decision.text}`)
+      return 2
     } else {
       console.log('🚫 CEO拒否 — コミット中止します')
       return 2
