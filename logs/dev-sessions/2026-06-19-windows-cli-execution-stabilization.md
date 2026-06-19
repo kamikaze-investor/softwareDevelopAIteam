@@ -155,6 +155,87 @@ execFileSync(exe, [...prefixArgs, 'lint', '--fix'], { shell: false, ... })
 
 ---
 
+## 4-補足. `caaffb0`（feat: dev-log 基盤追加）の Meta Review ステータス
+
+**Meta Review: 未実行（手動評価による代替）**
+
+コミット `caaffb0` の Meta Review は `autoReview.ts` 経由での実行を試みたが、以下の理由で失敗した。
+
+**原因:**
+- `autoReview.ts` は `.env` を読み込まない（`alignmentCheck.ts` と異なる設計）
+- `runner.ts` の `CONTROL_ROOT` がデフォルト値 `/workspace/control` にフォールバック
+- `C:\workspace\control\docs\meta_reviewer\prompt.md` が存在しないため ENOENT で終了
+
+**正しいパス:** `C:\Users\honka\softwareDevelopAIteam\docs\meta_reviewer\prompt.md` は存在する。環境変数 `CONTROL_ROOT` を渡せば解決する。
+
+**手動評価結果:**
+- 変更内容: 型定義（`dev_log.ts`）・ADR・開発ログ・`.gitignore` のみ
+- Control Layer（adapter / guard / permission / sandbox）への変更: **なし**
+- DB schema・env・secrets 変更: **なし**
+- 判定: **ALIGNED**（手動）
+
+**対応:**
+CEO承認のもと `autoReview.ts` に `.env` ロード + 動的 import を追加（コミット後述）。
+
+---
+
+## 8. Meta Review 実行パス修正（autoReview.ts .env ロード追加）
+
+**日付:** 2026-06-19  
+**コミット:** 後述  
+**対象:** `apps/worker/src/metaReviewer/autoReview.ts`
+
+### 原因
+
+`autoReview.ts` に `.env` ロードコードが存在しなかったため、
+`runner.ts` の module-level 定数 `CONTROL_ROOT` がデフォルト値 `/workspace/control` に
+フォールバックし、`C:\workspace\control\docs\meta_reviewer\prompt.md` で ENOENT が発生した。
+
+`.env` には正しく `CONTROL_ROOT=C:\Users\honka\softwareDevelopAIteam` が設定されていた。
+
+### 追加した実装
+
+**`.env` ロードブロック（module-level）:**
+
+```typescript
+{
+  const envPath = resolve(__dirname, '../../../../.env')
+  if (existsSync(envPath)) { /* ... key=val パース */ }
+}
+```
+
+**動的 import（main() 冒頭）:**
+
+```typescript
+const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } =
+  await import('./runner.js')
+const { callGeminiWithFallback } = await import('./geminiRouter.js')
+```
+
+ESM では静的 import はモジュール本体より先に評価されるため、`.env` ブロックを
+静的 import の前に書いても `runner.ts` の module-level 評価に間に合わない。
+そのため `runner.ts` / `geminiRouter.ts` を `main()` 内で動的 import することで、
+`.env` ロード後に評価させる設計とした。
+
+### 検証結果
+
+| 項目 | 結果 |
+|------|------|
+| typecheck | ✅ パス |
+| test (148件) | ✅ 全パス |
+| `autoReview.ts` 実行時の CONTROL_ROOT | ✅ `.env` から正しく解決 |
+| `runner.ts` が `docs/meta_reviewer/prompt.md` を参照 | ✅ ENOENT なし |
+| Gemini 呼び出しまで到達 | ✅ quota exhausted エラー（経路は正常） |
+| `alignmentCheck.ts` 経由の Meta Review | ✅ ALIGNED（caaffb0 を正式確認） |
+
+### caaffb0 Meta Review 最終ステータス
+
+**Gemini ALIGNED（alignmentCheck.ts 経由で正式確認済み）**
+
+> 開発ログシステムの導入は、AIの判断の系譜を可視化し、Context重視および透明性を高める設計思想に合致しています。Git管理対象の選別もリスク管理として適切です。
+
+---
+
 ## 5. 現環境での制限
 
 **この Windows 開発環境では `pnpm` がグローバルインストールされていない。**
@@ -195,3 +276,56 @@ npm install -g pnpm   # または winget install pnpm.pnpm
 本番（Docker Linux）では `pnpm` はバイナリとして存在するため、
 `resolveWindowsExe` の Windows 分岐は通らず従来通り動作する。
 ただし Docker 環境での実際の lint 実行は未確認。
+
+---
+
+## 7. pnpm v11.8.0 インストール後の再 E2E 確認結果
+
+**確認日:** 2026-06-19  
+**pnpm バージョン:** 11.8.0（グローバルインストール済み）
+
+### 確認結果サマリー
+
+| 確認項目 | 結果 |
+|----------|------|
+| ENOENT / EINVAL エラー | ✅ 解消 |
+| `resolvePnpmPath()` が `pnpm.cmd` を解決 | ✅ PATH から解決 |
+| `pnpm lint --fix` が実行経路に乗った | ✅ 確認 |
+| シナリオ3（lint success）: postLint warning なし | ✅ 確認 |
+| Codex 実行・changedFiles 検出・ログ保存 | ✅ 継続して正常 |
+| FileChangeGuard | ✅ 継続して正常 |
+
+### 副作用として確認された事象
+
+`pnpm lint --fix` が Target Repository 内で実行されると、以下が生成される場合がある:
+
+- `node_modules/` — Target Repository に `package.json` がある場合、pnpm が依存をインストールする可能性
+- `pnpm-lock.yaml` — Target Repository に lockfile が存在しない場合、新規生成される可能性
+
+これらは FileChangeGuard の changedFiles 検出に含まれるため、
+**意図しないファイル変更として誤検知される可能性がある**。
+
+### 今後の検討事項（postLint ルール設計）
+
+以下は現在未実装。設計メモとして残す（実装時は CEO 承認・Meta Review 必要）:
+
+1. **node_modules/ を変更対象から常に除外**
+   - FileChangeGuard / changedFiles 集計から `node_modules/` を除外するフィルタを追加
+
+2. **pnpm-lock.yaml の新規生成を警告対象とする**
+   - Target Repository に既存 lockfile が存在する場合のみ更新を許可
+   - 新規生成時は warning を出して CEO 確認を促す
+
+3. **package.json が存在しない場合の postLint は non-fatal**
+   - 現在も non-fatal だが、エラーコードで区別できるとより明確になる
+
+4. **lint スクリプトが存在しない場合も non-fatal**
+   - `pnpm lint` が `ERR_PNPM_NO_SCRIPT` を返す場合のエラーコード識別を追加
+
+5. **lint スクリプトがあるのに失敗した場合は warning としてログに残す**
+   - 現在は全 postLint 失敗を同一の warning にまとめている
+   - 「スクリプト未定義」と「スクリプト実行失敗」を区別して出力する
+
+6. **postLint 結果をログファイルに保存する**
+   - lint stdout/stderr を `logs/implementation/` 以下に保存
+   - ImplementationLog の `postLintStatus` フィールドと紐付ける（Dev Log Phase 5 で実装予定）

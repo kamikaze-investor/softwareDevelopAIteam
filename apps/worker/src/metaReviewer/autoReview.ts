@@ -15,12 +15,40 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { writeFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } from './runner.js'
-import { callGeminiWithFallback } from './geminiRouter.js'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+
+// .env ロード（runner.ts の動的 import より前に CONTROL_ROOT を設定する）
+//
+// runner.ts は module-level で CONTROL_ROOT を確定する。ESM では静的 import は
+// モジュール本体より先に評価されるため、静的 import のままでは .env ロードが間に
+// 合わない。そのため runner.ts / geminiRouter.ts は main() 内で動的 import する。
+//
+// __dirname = apps/worker/src/metaReviewer/
+// ../../../../.env = リポジトリルートの .env
+{
+  const envPath = resolve(__dirname, '../../../../.env')
+  if (existsSync(envPath)) {
+    for (const line of readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
+      const m = line.match(/^([^#=\s][^=]*)=(.*)$/)
+      if (!m) continue
+      const key = m[1].trim()
+      if (key in process.env) continue   // 既存の環境変数を上書きしない
+      let val = m[2].trim()
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1)
+      }
+      process.env[key] = val
+    }
+  }
+}
 
 async function main(): Promise<void> {
+  // .env ロード後に runner.ts / geminiRouter.ts を評価させるため動的 import する
+  const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } =
+    await import('./runner.js')
+  const { callGeminiWithFallback } = await import('./geminiRouter.js')
+
   // --- 環境変数の読み取り ---
   const baseSha = process.env.BASE_SHA       // GitHub Actions: PR の base SHA
   const headSha = process.env.HEAD_SHA       // GitHub Actions: PR の head SHA
