@@ -29,6 +29,36 @@ import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 import { saveJobLogs } from '../jobLogger.js'
 
+// ────────────────────────────────────────────────────────────
+// Windows .cmd / .bat ラップユーティリティ
+// ────────────────────────────────────────────────────────────
+
+/**
+ * Windows で .cmd / .bat ファイルを shell:false で実行するために
+ * cmd.exe /c 経由にラップする。他プラットフォームはそのまま返す。
+ *
+ * AI CLI 実行（BaseCliAdapter）と postLint（pnpm）の両方で使用する。
+ */
+function resolveWindowsExe(cliPath: string): { exe: string; prefixArgs: string[] } {
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(cliPath)) {
+    return { exe: 'cmd.exe', prefixArgs: ['/c', cliPath] }
+  }
+  return { exe: cliPath, prefixArgs: [] }
+}
+
+/**
+ * Windows 環境で PATH から pnpm.cmd を探す。
+ * 見つかれば絶対パスを返す。見つからなければ 'pnpm' を返す（ENOENT は呼び出し元で non-fatal 処理）。
+ */
+function resolvePnpmPath(): string {
+  if (process.platform !== 'win32') return 'pnpm'
+  for (const dir of (process.env.PATH ?? '').split(';')) {
+    const candidate = path.join(dir.trim(), 'pnpm.cmd')
+    if (existsSync(candidate)) return candidate
+  }
+  return 'pnpm'  // 見つからなければ 'pnpm' のまま（catch で non-fatal）
+}
+
 // CLAUDE.md / AGENTS.md のパス（コンテナ内 = /workspace/control、ローカル開発 = プロジェクトルート）
 const CLAUDE_MD_PATHS = [
   '/workspace/control/CLAUDE.md',
@@ -80,15 +110,11 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
   protected useStdinPrompt(): boolean { return false }
 
   /**
-   * Windows で .cmd ファイルを shell:false で実行するために cmd.exe /c でラップする。
-   * 他プラットフォームは { exe: cliPath, prefixArgs: [] } をそのまま返す。
+   * Windows で .cmd / .bat ファイルを shell:false で実行するために cmd.exe /c でラップする。
+   * module-level の resolveWindowsExe() に委譲する。
    */
   private resolveExe(): { exe: string; prefixArgs: string[] } {
-    const p = this.config.cliPath
-    if (process.platform === 'win32' && p.toLowerCase().endsWith('.cmd')) {
-      return { exe: 'cmd.exe', prefixArgs: ['/c', p] }
-    }
-    return { exe: p, prefixArgs: [] }
+    return resolveWindowsExe(this.config.cliPath)
   }
 
   async run(request: AiCliRequest): Promise<AiCliResult> {
@@ -372,16 +398,19 @@ Repository Boundary:
  */
 function runPostLint(workingDir: string): void {
   try {
-    execFileSync('pnpm', ['lint', '--fix'], {
+    const pnpmPath = resolvePnpmPath()
+    const { exe, prefixArgs } = resolveWindowsExe(pnpmPath)
+    execFileSync(exe, [...prefixArgs, 'lint', '--fix'], {
       cwd: workingDir,
       shell: false,
       encoding: 'utf-8',
       timeout: 60_000,  // 1分
     })
-  } catch {
+  } catch (err) {
     // lint失敗は警告のみ（ブロックしない）
     // lint結果はFile Change Guard + Meta Reviewer AIが後から確認する
-    console.warn('[AiCliAdapter] post-lint failed (non-fatal). File Change Guard will check the diff.')
+    const code = (err as NodeJS.ErrnoException).code ?? 'unknown'
+    console.warn(`[AiCliAdapter] post-lint failed (non-fatal, code=${code}). File Change Guard will check the diff.`)
   }
 }
 
