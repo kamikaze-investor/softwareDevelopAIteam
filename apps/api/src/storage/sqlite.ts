@@ -9,8 +9,8 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -403,7 +403,67 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents }
+  const approvalRequests: IApprovalRequestStorage = {
+    findByTaskId(taskId) {
+      const rows = db.prepare(
+        'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC'
+      ).all(taskId) as any[]
+      return rows.map(deserializeApprovalRequest)
+    },
+    findById(id) {
+      const row = db.prepare('SELECT * FROM approval_requests WHERE id = ?').get(id) as any
+      return row ? deserializeApprovalRequest(row) : undefined
+    },
+    findActiveByTaskId(taskId) {
+      const row = db.prepare(`
+        SELECT * FROM approval_requests
+        WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+        ORDER BY created_at DESC LIMIT 1
+      `).get(taskId) as any
+      return row ? deserializeApprovalRequest(row) : undefined
+    },
+    create(data) {
+      const req: ApprovalRequest = {
+        ...data,
+        id: `approval-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randomUUID().slice(0, 8)}`,
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO approval_requests
+          (id, task_id, target_branch, target_commit, target_diff_hash, risk_level,
+           requested_action, status, expires_at, invalid_if, reason, created_at, reviewed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        req.id,
+        req.taskId,
+        req.targetBranch,
+        req.targetCommit,
+        req.targetDiffHash,
+        req.riskLevel,
+        req.requestedAction,
+        req.status,
+        req.expiresAt,
+        JSON.stringify(req.invalidIf),
+        req.reason ?? null,
+        req.createdAt,
+        req.reviewedAt ?? null,
+      )
+      return req
+    },
+    updateStatus(id, status, reason) {
+      const existing = approvalRequests.findById(id)
+      if (!existing) return undefined
+      const reviewedAt = now()
+      db.prepare(`
+        UPDATE approval_requests
+        SET status = ?, reason = ?, reviewed_at = ?
+        WHERE id = ?
+      `).run(status, reason ?? existing.reason ?? null, reviewedAt, id)
+      return { ...existing, status, reason: reason ?? existing.reason, reviewedAt }
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests }
 }
 
 function deserializeProject(row: any): Project {
@@ -537,6 +597,24 @@ function deserializeApproval(row: any): Approval {
     reviewedAt: row.reviewed_at ?? undefined,
     reviewNote: row.review_note ?? undefined,
     createdAt: row.created_at,
+  }
+}
+
+function deserializeApprovalRequest(row: any): ApprovalRequest {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    targetBranch: row.target_branch,
+    targetCommit: row.target_commit,
+    targetDiffHash: row.target_diff_hash,
+    riskLevel: row.risk_level as ApprovalRequest['riskLevel'],
+    requestedAction: row.requested_action,
+    status: row.status as ApprovalGateStatus,
+    expiresAt: row.expires_at,
+    invalidIf: JSON.parse(row.invalid_if ?? '[]') as string[],
+    reason: row.reason ?? undefined,
+    createdAt: row.created_at,
+    reviewedAt: row.reviewed_at ?? undefined,
   }
 }
 

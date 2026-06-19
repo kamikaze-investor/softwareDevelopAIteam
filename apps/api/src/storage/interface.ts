@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus } from '@ai-team/shared'
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -57,6 +57,15 @@ export interface IPermissionGrantStorage {
   delete(id: string): boolean
 }
 
+export interface IApprovalRequestStorage {
+  findByTaskId(taskId: string): ApprovalRequest[]
+  findById(id: string): ApprovalRequest | undefined
+  /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す */
+  findActiveByTaskId(taskId: string): ApprovalRequest | undefined
+  create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
+  updateStatus(id: string, status: ApprovalGateStatus, reason?: string): ApprovalRequest | undefined
+}
+
 export interface IWatchdogEventStorage {
   findAll(): WatchdogEvent[]
   findByJobId(jobId: string): WatchdogEvent[]
@@ -74,4 +83,5 @@ export interface IStorage {
   qaResults: IQAResultStorage
   permissionGrants: IPermissionGrantStorage
   watchdogEvents: IWatchdogEventStorage
+  approvalRequests: IApprovalRequestStorage
 }

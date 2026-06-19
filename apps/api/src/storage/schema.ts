@@ -109,6 +109,22 @@ export const CREATE_TABLES = `
     created_at TEXT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    target_commit TEXT NOT NULL,
+    target_diff_hash TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    requested_action TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'WAITING_FOR_USER',
+    expires_at TEXT NOT NULL,
+    invalid_if TEXT NOT NULL DEFAULT '[]',
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT
+  );
+
   CREATE TABLE IF NOT EXISTS watchdog_events (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
