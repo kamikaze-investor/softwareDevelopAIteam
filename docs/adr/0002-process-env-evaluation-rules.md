@@ -32,6 +32,10 @@ const CONTROL_ROOT = process.env.CONTROL_ROOT ?? '/workspace/control'
 | `apps/worker/src/metaReviewer/autoReview.ts` | **プロセス内ロード** | `__dirname` ベースの `.env` ブロック（2026-06-19 追加） |
 | `apps/worker/scripts/alignmentCheck.ts` | **プロセス内ロード** | `import.meta.url` ベースの `.env` ブロック（既存） |
 
+worker/api 系は `.env` をプロセス内でロードしない外部注入前提のため、
+ESM の静的 import 評価順によって `.env` ロードが間に合わない、という種類の問題は発生しない。
+ただし、外部環境変数注入が失敗した場合はデフォルト値が使われる。
+
 Docker 本番環境は `sandbox/docker-compose.yml` で `environment:` に個別キーを明示注入しており、`.env` ファイルをコンテナに渡さない設計。
 CI (`meta-review.yml`) も `env:` ブロックで Secrets から個別注入。
 
