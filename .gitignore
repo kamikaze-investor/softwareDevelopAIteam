@@ -29,8 +29,19 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
 data/logs/
+
+# 開発ログ: Git管理しないもの（長文・個人情報・APIキーリスク）
+logs/conversations/
+logs/implementation/
+logs/codex/
+logs/gemini-review/
+logs/commands/
+
+# 開発ログ: Git管理するもの（!で除外解除）
+# logs/dev-sessions/   → Git管理（重要セッションのみ）
+# logs/consultations/  → Git管理（承認済みのみ）
+# docs/review-packets/ → Git管理（承認記録）
 
 # Test coverage
 coverage/
