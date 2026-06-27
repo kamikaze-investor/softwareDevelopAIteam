@@ -807,3 +807,21 @@ describe('POST /api/gate/check', () => {
     })
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// PATCH /api/approval-requests/:id/status — EXPIRED は受け付けない
+// ────────────────────────────────────────────────────────────
+
+describe('PATCH /api/approval-requests/:id/status — EXPIRED は受け付けない', () => {
+  it('status=EXPIRED は Zod バリデーションで 400 になる', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app)
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${req.id}/status`,
+        payload: { status: 'EXPIRED' },
+      })
+      expect(res.statusCode).toBe(400)
+    })
+  })
+})

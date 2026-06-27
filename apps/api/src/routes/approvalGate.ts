@@ -163,8 +163,11 @@ const CreateApprovalRequestBody = z.object({
 })
 
 const UpdateStatusBody = z.object({
-  // CONSUMED はシステム内部遷移専用（/consume エンドポイント経由のみ）— ここには追加しない
-  status: z.enum(['APPROVED', 'REJECTED', 'EXPIRED', 'SUPERSEDED', 'STALE']),
+  // EXPIRED: 内部遷移専用 (/consume が expiresAt 超過時に自動設定)。PATCH /status では設定不可
+  // CONSUMED: 内部遷移専用 (/consume エンドポイント経由のみ)
+  // TODO(P3): SUPERSEDED / STALE も将来的に system/internal 遷移へ寄せることを検討する
+  //           現在は人間が明示的に使う可能性があるため残置
+  status: z.enum(['APPROVED', 'REJECTED', 'SUPERSEDED', 'STALE']),
   reason: z.string().optional(),
 })
 
@@ -179,6 +182,10 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
   // POST /api/gate/check
   // ⚠️ trusted internal caller 専用。
   //    diffText 省略時は changedFiles / targetDiffHash / targetCommit / targetBranch を申告値として信頼する。
+  // P2-followup: expired APPROVED cleanup in /gate/check or storage layer
+  //   /gate/check が decideGateOutcome で EXPIRED を検知した場合、DB の status は更新されない。
+  //   findActiveByTaskId が次回も同じ APPROVED+expired を返し続ける可能性がある。
+  //   対処は別タスクで設計・実装する。
   app.post('/gate/check', async (req, reply) => {
     const parsed = GateCheckBody.safeParse(req.body)
     if (!parsed.success) {
