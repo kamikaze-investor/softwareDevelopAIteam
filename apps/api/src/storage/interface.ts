@@ -60,7 +60,7 @@ export interface IPermissionGrantStorage {
 export interface IApprovalRequestStorage {
   findByTaskId(taskId: string): ApprovalRequest[]
   findById(id: string): ApprovalRequest | undefined
-  /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す */
+  /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す（CONSUMED は除外） */
   findActiveByTaskId(taskId: string): ApprovalRequest | undefined
   create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */

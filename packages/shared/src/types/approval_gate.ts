@@ -15,11 +15,12 @@ import type { RiskLevel } from './safety_guard'
 
 export type ApprovalGateStatus =
   | 'WAITING_FOR_USER'  // 承認待ち（人間が応答していない）
-  | 'APPROVED'          // 承認済み（commit/diff 照合済み）
+  | 'APPROVED'          // 承認済み（使用可能）
   | 'REJECTED'          // 拒否済み
   | 'EXPIRED'           // expires_at を超過
-  | 'SUPERSEDED'        // 同 task_id で新しい ApprovalRequest が作成された
+  | 'SUPERSEDED'        // 同 task_id で新しい ApprovalRequest が作成された（置き換え）
   | 'STALE'             // 承認後に commit/diff が変化した（無効化）
+  | 'CONSUMED'          // 承認が実際に使用された（/consume 後 — 再利用不可）
 
 
 // ────────────────────────────────────────────────────────────
@@ -102,8 +103,8 @@ export type GateOutcome =
       riskLevel: RiskLevel
       /**
        * HIGH/CRITICAL 承認由来の ALLOW の場合のみ設定される。
-       * 呼び出し元はこの ID を使って承認リクエストを SUPERSEDED に更新すること
-       * （一回限りの承認を強制するため）。
+       * 呼び出し元はこの ID を使って POST /approval-requests/:id/consume を呼び出して
+       * APPROVED → CONSUMED に遷移させること（一回限りの承認を強制するため）。
        * LOW/MEDIUM 由来の ALLOW は undefined。
        */
       consumedRequestId?: string

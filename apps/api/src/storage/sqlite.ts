@@ -415,6 +415,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return row ? deserializeApprovalRequest(row) : undefined
     },
     findActiveByTaskId(taskId) {
+      // CONSUMED は除外: 消費済み承認を再利用しないよう IN ('WAITING_FOR_USER', 'APPROVED') のみ対象
       const row = db.prepare(`
         SELECT * FROM approval_requests
         WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')

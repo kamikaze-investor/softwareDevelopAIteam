@@ -30,8 +30,14 @@ const CreateApprovalRequestBody = z.object({
 })
 
 const UpdateStatusBody = z.object({
+  // CONSUMED はシステム内部遷移専用（/consume エンドポイント経由のみ）— ここには追加しない
   status: z.enum(['APPROVED', 'REJECTED', 'EXPIRED', 'SUPERSEDED', 'STALE']),
   reason: z.string().optional(),
+})
+
+const ConsumeApprovalRequestBody = z.object({
+  currentCommit: z.string(),
+  currentDiffHash: z.string(),
 })
 
 export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
@@ -102,20 +108,44 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(updated)
   })
 
-  // POST /api/approval-requests/:id/consume — APPROVED を SUPERSEDED に遷移（一回限りの承認を強制）
-  // Codex P2: PATCH /status は WAITING_FOR_USER しか受けないため、consume 専用エンドポイントが必要
+  // POST /api/approval-requests/:id/consume — APPROVED → CONSUMED に遷移（一回限りの承認を強制）
+  // 検証順: 404 → 409(非APPROVED) → 409(期限切れ) → 409(commit/diff不一致) → 200(CONSUMED)
   app.post<{ Params: { id: string } }>('/approval-requests/:id/consume', async (req, reply) => {
+    // 1. リクエストが存在しない → 404
     const request = storage.approvalRequests.findById(req.params.id)
     if (!request) {
       return reply.status(404).send({ error: 'Approval request not found' })
     }
+
+    // 2. APPROVED 以外は consume 不可 → 409（状態遷移なし）
+    //    CONSUMED を再 consume しようとした場合もここで 409 になる（二重consume防止）
     if (request.status !== 'APPROVED') {
       return reply.status(409).send({
         error: `Cannot consume: current status is '${request.status}' (must be APPROVED)`,
       })
     }
-    // preserveReviewMeta=true: CEO の承認メモ(reason)と reviewedAt を上書きしない
-    const updated = storage.approvalRequests.updateStatus(req.params.id, 'SUPERSEDED', undefined, true)
+
+    // body をパース
+    const bodyResult = ConsumeApprovalRequestBody.safeParse(req.body)
+    if (!bodyResult.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: bodyResult.error.format() })
+    }
+    const { currentCommit, currentDiffHash } = bodyResult.data
+
+    // 3. expiresAt 超過 → EXPIRED に遷移して 409
+    if (new Date(request.expiresAt) <= new Date()) {
+      storage.approvalRequests.updateStatus(req.params.id, 'EXPIRED', undefined, true)
+      return reply.status(409).send({ error: 'Approval request has expired' })
+    }
+
+    // 4. commit または diffHash が不一致 → STALE に遷移して 409
+    if (request.targetCommit !== currentCommit || request.targetDiffHash !== currentDiffHash) {
+      storage.approvalRequests.updateStatus(req.params.id, 'STALE', undefined, true)
+      return reply.status(409).send({ error: 'Approval request is stale: commit or diff has changed' })
+    }
+
+    // 5. すべてパス → APPROVED → CONSUMED に遷移（preserveReviewMeta=true で CEO メモ保持）
+    const updated = storage.approvalRequests.updateStatus(req.params.id, 'CONSUMED', undefined, true)
     return reply.send(updated)
   })
 
