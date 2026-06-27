@@ -162,6 +162,21 @@ describe('runRiskReview', () => {
     expect(result.riskLevel).toBe('CRITICAL')
   })
 
+  // Codex P3: 混在変更で triggeredRules が全ルール分揃うことを確認
+  it('mixed CRITICAL+HIGH: all triggered rules collected (no early return)', () => {
+    const result = runRiskReview(['db/migration/0001_init.ts', 'billing/stripe.ts'])
+    expect(result.riskLevel).toBe('CRITICAL')
+    expect(result.triggeredRules).toContain('DB migration / schema')
+    expect(result.triggeredRules).toContain('payment / billing')
+  })
+
+  it('docs/AGENTS.md + migration → CRITICAL with both rules', () => {
+    const result = runRiskReview(['docs/AGENTS.md', 'db/migration/0001_init.ts'])
+    expect(result.riskLevel).toBe('CRITICAL')
+    expect(result.triggeredRules).toContain('AI instruction file')
+    expect(result.triggeredRules).toContain('DB migration / schema')
+  })
+
   it('empty list → LOW (no files = no risk)', () => {
     const result = runRiskReview([])
     expect(result.riskLevel).toBe('LOW')

@@ -63,27 +63,23 @@ const ALWAYS_CRITICAL_RULES: RiskRule[] = RISK_RULES.filter(r => r.level === 'CR
  * changedFiles からリスクレベルを算出する（純粋関数）
  */
 export function runRiskReview(changedFiles: string[]): RiskReviewResult {
-  // CRITICAL ルールは safe-only 早期リターンより先に評価する
-  // （例: docs/AGENTS.md や logs/CLAUDE.md が LOW にならないように）
-  for (const file of changedFiles) {
-    for (const rule of ALWAYS_CRITICAL_RULES) {
-      if (rule.pattern.test(file)) {
-        return {
-          riskLevel: 'CRITICAL',
-          triggeredRules: [rule.label],
-          requiresIndependentReview: true,
-        }
-      }
+  // CRITICAL ルールを先に評価して safe-only 早期リターンを防ぐ（bypass ガード）
+  // Codex P3: ここでは早期リターンせず「CRITICAL ファイルが含まれるか」だけ判定する
+  const hasCriticalFile = changedFiles.some(f =>
+    ALWAYS_CRITICAL_RULES.some(r => r.pattern.test(f))
+  )
+
+  // CRITICAL ファイルがなければ safe-only 早期リターンを許可
+  if (!hasCriticalFile) {
+    const allSafe = changedFiles.length > 0 &&
+      changedFiles.every(f => SAFE_ONLY_PATTERNS.some(p => p.test(f)))
+    if (allSafe) {
+      return { riskLevel: 'LOW', triggeredRules: [], requiresIndependentReview: false }
     }
   }
 
-  // docs / logs のみ → LOW（CRITICAL 先行チェック通過後）
-  const allSafe = changedFiles.length > 0 &&
-    changedFiles.every(f => SAFE_ONLY_PATTERNS.some(p => p.test(f)))
-  if (allSafe) {
-    return { riskLevel: 'LOW', triggeredRules: [], requiresIndependentReview: false }
-  }
-
+  // 全 RISK_RULES をスキャンして maxLevel と triggeredRules を収集
+  // Codex P3: 早期リターンをやめることで混在ケースのルール情報が全て揃う
   let maxLevel: RiskLevel = 'LOW'
   const triggered: string[] = []
 
