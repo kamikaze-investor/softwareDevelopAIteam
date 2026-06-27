@@ -1,7 +1,136 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
-import type { ApprovalGateStatus, RiskLevel } from '@ai-team/shared'
+import type { ApprovalGateStatus, RiskLevel, ApprovalRequest, GateOutcome, RiskReviewResult } from '@ai-team/shared'
+import {
+  runRiskReview,
+  computeDiffHash,
+  decideGateOutcome,
+  buildApprovalRequest,
+  type ApprovalGateInput,
+} from '@ai-team/shared'
+
+// ────────────────────────────────────────────────────────────
+// POST /api/gate/check — ローカル型定義
+// ────────────────────────────────────────────────────────────
+
+type SideEffectEvent =
+  | { type: 'CREATED_APPROVAL_REQUEST';    requestId: string }
+  | { type: 'SUPERSEDED_APPROVAL_REQUEST'; requestId: string }
+  | { type: 'MARKED_STALE';               requestId: string }
+
+type ContinuationPolicy =
+  | 'continue'
+  | 'continue_safe_work_only'
+  | 'block_until_approved'
+
+type NextActionKind =
+  | 'proceed'
+  | 'call_consume'
+  | 'wait_for_approval'
+  | 're_check'
+
+interface NextAction {
+  action: NextActionKind
+  consumedRequestId?: string
+  requestId?: string
+  message: string
+}
+
+interface GateCheckResponse {
+  outcome:            GateOutcome
+  riskReview:         RiskReviewResult
+  sideEffects:        SideEffectEvent[]
+  continuationPolicy: ContinuationPolicy
+  nextAction:         NextAction
+  approvalRequest?:   ApprovalRequest
+}
+
+// Zod スキーマ
+const GateCheckBody = z.object({
+  taskId:          z.string().min(1),
+  requestedAction: z.string().min(1),
+  targetBranch:    z.string().min(1),
+  targetCommit:    z.string().min(1),
+  targetDiffHash:  z.string().min(1),
+  changedFiles:    z.array(z.string()),
+  diffText:        z.string().optional(),
+  // TODO: 外部公開APIとして使う場合は diffText を必須化し、
+  //       サーバー側でハッシュ照合すること（現在は trusted internal caller 専用）
+  // TODO(Step D): diffText content rules — diff ハンク内のパターンスキャン（シークレット検出等）
+  //               changedFiles ベースの Risk Review を補完する形で将来追加予定
+})
+
+// ────────────────────────────────────────────────────────────
+// ヘルパー関数
+// ────────────────────────────────────────────────────────────
+
+function computeContinuationPolicy(
+  riskLevel: RiskLevel,
+  decision: GateOutcome['decision'],
+): ContinuationPolicy {
+  if (decision === 'ALLOW') return 'continue'
+
+  switch (riskLevel) {
+    case 'CRITICAL':
+      return 'block_until_approved'
+    case 'HIGH':
+      return 'continue_safe_work_only'
+    case 'LOW':
+    case 'MEDIUM':
+      // LOW/MEDIUM で ALLOW 以外は内部不整合（decideGateOutcome の設計上発生しえない）
+      console.warn(
+        `[gate/check] Unexpected: riskLevel=${riskLevel} with decision=${decision}. ` +
+        `decideGateOutcome should always return ALLOW for LOW/MEDIUM. Defaulting to continue.`
+      )
+      return 'continue'
+  }
+}
+
+function computeNextAction(
+  outcome: GateOutcome,
+  riskLevel: RiskLevel,
+  newRequestId?: string,
+): NextAction {
+  switch (outcome.decision) {
+    case 'ALLOW':
+      if (outcome.consumedRequestId) {
+        return {
+          action: 'call_consume',
+          consumedRequestId: outcome.consumedRequestId,
+          message: `承認済みです。POST /api/approval-requests/${outcome.consumedRequestId}/consume を呼び出して承認を使い切ってください。`,
+        }
+      }
+      return {
+        action: 'proceed',
+        message: 'リスクレベルが低いため承認不要。処理を続けてください。',
+      }
+
+    case 'PENDING_APPROVAL':
+      return {
+        action: 'wait_for_approval',
+        requestId: outcome.requestId,
+        message: riskLevel === 'CRITICAL'
+          ? '【CRITICAL】危険な変更を含むため、承認まですべての作業を停止してください。承認者に通知してください。'
+          : '承認待ち中です。安全な作業は継続可能ですが、この変更の適用は承認後に行ってください。',
+      }
+
+    case 'BLOCKED':
+      return {
+        action: 'wait_for_approval',
+        requestId: newRequestId,
+        message: riskLevel === 'CRITICAL'
+          ? '【CRITICAL】承認リクエストを作成しました。危険な変更を含むため、承認まですべての作業を停止してください。'
+          : '承認リクエストを作成しました。HIGH リスク変更のため人間承認が必要です。安全な作業は継続可能です。',
+      }
+
+    case 'STALE':
+      return {
+        action: 're_check',
+        message: '承認が無効化されました（commit/diff が変化）。再度 /api/gate/check を呼び出して新しい承認フローを開始してください。',
+      }
+  }
+}
 
 const RiskLevelSchema = z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
 
@@ -42,6 +171,83 @@ const ConsumeApprovalRequestBody = z.object({
 
 export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
+
+  // POST /api/gate/check
+  // ⚠️ trusted internal caller 専用。
+  //    diffText 省略時は changedFiles / targetDiffHash / targetCommit / targetBranch を申告値として信頼する。
+  app.post('/gate/check', async (req, reply) => {
+    const parsed = GateCheckBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    }
+
+    const {
+      taskId, requestedAction, targetBranch, targetCommit,
+      targetDiffHash, changedFiles, diffText,
+    } = parsed.data
+
+    // diffText が提供された場合のみハッシュ照合
+    if (diffText !== undefined) {
+      const computed = computeDiffHash(diffText)
+      if (computed !== targetDiffHash) {
+        return reply.status(400).send({
+          error: 'targetDiffHash does not match computed hash of diffText',
+        })
+      }
+    }
+
+    const sideEffects: SideEffectEvent[] = []
+
+    // Risk Review
+    const riskReview = runRiskReview(changedFiles)
+
+    // アクティブな承認リクエストを取得
+    let existingReq = storage.approvalRequests.findActiveByTaskId(taskId)
+
+    // WAITING_FOR_USER + ref 変化 → SUPERSEDE（decideGateOutcome に渡す前に処理）
+    if (existingReq?.status === 'WAITING_FOR_USER') {
+      if (existingReq.targetCommit !== targetCommit || existingReq.targetDiffHash !== targetDiffHash) {
+        storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
+        sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
+        existingReq = undefined
+      }
+    }
+
+    // Gate 判定（純粋関数）
+    const outcome = decideGateOutcome(riskReview, existingReq, targetCommit, targetDiffHash)
+
+    // storage 副作用
+    let approvalRequest: ApprovalRequest | undefined = existingReq
+    let newRequestId: string | undefined
+
+    if (outcome.decision === 'STALE') {
+      storage.approvalRequests.updateStatus(existingReq!.id, 'STALE', undefined, true)
+      sideEffects.push({ type: 'MARKED_STALE', requestId: existingReq!.id })
+      approvalRequest = storage.approvalRequests.findById(existingReq!.id)
+    } else if (outcome.decision === 'BLOCKED') {
+      const input: ApprovalGateInput = {
+        taskId, requestedAction, targetBranch, targetCommit, targetDiffHash, changedFiles,
+      }
+      approvalRequest = storage.approvalRequests.create(
+        buildApprovalRequest(input, riskReview.riskLevel)
+      )
+      sideEffects.push({ type: 'CREATED_APPROVAL_REQUEST', requestId: approvalRequest.id })
+      newRequestId = approvalRequest.id
+    }
+
+    const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision)
+    const nextAction = computeNextAction(outcome, riskReview.riskLevel, newRequestId)
+
+    const response: GateCheckResponse = {
+      outcome,
+      riskReview,
+      sideEffects,
+      continuationPolicy,
+      nextAction,
+      ...(approvalRequest ? { approvalRequest } : {}),
+    }
+    return reply.send(response)
+  })
 
   // POST /api/approval-requests — 承認リクエスト作成
   app.post('/approval-requests', async (req, reply) => {

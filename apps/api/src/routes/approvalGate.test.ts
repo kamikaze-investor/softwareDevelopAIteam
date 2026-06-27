@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { createHash } from 'crypto'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { ApprovalRequest } from '@ai-team/shared'
 
@@ -368,6 +369,424 @@ describe('findActiveByTaskId CONSUMED 除外', () => {
       expect(res.statusCode).toBe(200)
       const active = parseBody<ApprovalRequest | null>(res.body)
       expect(active?.status).toBe('APPROVED')
+    })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// POST /api/gate/check
+// ────────────────────────────────────────────────────────────
+
+type SideEffectType =
+  | 'CREATED_APPROVAL_REQUEST'
+  | 'SUPERSEDED_APPROVAL_REQUEST'
+  | 'MARKED_STALE'
+
+interface SideEffect {
+  type: SideEffectType
+  requestId: string
+}
+
+interface GateCheckResponse {
+  outcome: {
+    decision: string
+    riskLevel?: string
+    consumedRequestId?: string
+    requestId?: string
+    reason?: string
+  }
+  riskReview: {
+    riskLevel: string
+    triggeredRules: string[]
+    requiresIndependentReview: boolean
+  }
+  sideEffects: SideEffect[]
+  continuationPolicy: string
+  nextAction: {
+    action: string
+    consumedRequestId?: string
+    requestId?: string
+    message: string
+  }
+  approvalRequest?: ApprovalRequest
+}
+
+const BASE_GATE_PAYLOAD = {
+  taskId: 'gate-task-001',
+  requestedAction: 'merge feature branch',
+  targetBranch: 'feat/test',
+  targetCommit: 'commit-abc123',
+  targetDiffHash: 'hash-deadbeef',
+  changedFiles: ['apps/api/src/storage/migration.ts'],
+}
+
+async function gateCheck(
+  app: FastifyInstance,
+  payload: Record<string, unknown>,
+): Promise<{ statusCode: number; body: GateCheckResponse }> {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/gate/check',
+    payload,
+  })
+  return { statusCode: res.statusCode, body: parseBody<GateCheckResponse>(res.body) }
+}
+
+describe('POST /api/gate/check', () => {
+  // 1. LOW リスクファイル → 200, sideEffects=[], continuationPolicy='continue', nextAction.action='proceed'
+  it('LOW リスクファイル → continue, proceed, sideEffects=[]', async () => {
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        changedFiles: ['docs/README.md'],
+      })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('LOW')
+      expect(body.sideEffects).toEqual([])
+      expect(body.continuationPolicy).toBe('continue')
+      expect(body.nextAction.action).toBe('proceed')
+    })
+  })
+
+  // 2. HIGH リスクファイル + active なし → CREATED_APPROVAL_REQUEST, continue_safe_work_only, wait_for_approval
+  it('HIGH リスクファイル + active なし → CREATED, continue_safe_work_only, wait_for_approval', async () => {
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, BASE_GATE_PAYLOAD)
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.sideEffects).toHaveLength(1)
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+      expect(body.continuationPolicy).toBe('continue_safe_work_only')
+      expect(body.nextAction.action).toBe('wait_for_approval')
+      expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
+    })
+  })
+
+  // 3. CRITICAL リスクファイル + active なし → CREATED, block_until_approved, wait_for_approval
+  it('CRITICAL リスクファイル + active なし → CREATED, block_until_approved, wait_for_approval', async () => {
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-003',
+        changedFiles: ['AGENTS.md'],
+      })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('CRITICAL')
+      expect(body.sideEffects).toHaveLength(1)
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+      expect(body.continuationPolicy).toBe('block_until_approved')
+      expect(body.nextAction.action).toBe('wait_for_approval')
+    })
+  })
+
+  // 4. HIGH + WAITING_FOR_USER（same ref）→ sideEffects=[], wait_for_approval
+  it('HIGH + WAITING_FOR_USER (same ref) → sideEffects=[], wait_for_approval', async () => {
+    await withApp(async (app) => {
+      // 最初の呼び出しでリクエスト作成
+      await gateCheck(app, BASE_GATE_PAYLOAD)
+      // 同じ ref で再呼び出し
+      const { statusCode, body } = await gateCheck(app, BASE_GATE_PAYLOAD)
+      expect(statusCode).toBe(200)
+      expect(body.sideEffects).toEqual([])
+      expect(body.nextAction.action).toBe('wait_for_approval')
+      expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
+    })
+  })
+
+  // 5. HIGH + WAITING_FOR_USER（diff ref — commit が変化）→ SUPERSEDED + CREATED
+  it('HIGH + WAITING_FOR_USER (diff ref) → SUPERSEDED + CREATED', async () => {
+    await withApp(async (app) => {
+      // 最初の呼び出しで WAITING_FOR_USER 作成
+      const first = await gateCheck(app, BASE_GATE_PAYLOAD)
+      const oldId = first.body.approvalRequest?.id
+      expect(oldId).toBeTruthy()
+
+      // commit が変わった状態で再呼び出し
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        targetCommit: 'commit-new-xyz',
+        targetDiffHash: 'hash-new-deadbeef',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.sideEffects).toHaveLength(2)
+      expect(body.sideEffects[0].type).toBe('SUPERSEDED_APPROVAL_REQUEST')
+      expect(body.sideEffects[0].requestId).toBe(oldId)
+      expect(body.sideEffects[1].type).toBe('CREATED_APPROVAL_REQUEST')
+
+      // 旧リクエストが SUPERSEDED になっていること
+      const getRes = await app.inject({ method: 'GET', url: `/api/approval-requests/${oldId}` })
+      const stored = parseBody<ApprovalRequest>(getRes.body)
+      expect(stored.status).toBe('SUPERSEDED')
+
+      // 新リクエストが WAITING_FOR_USER
+      expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
+    })
+  })
+
+  // 6. HIGH + APPROVED (same ref) → sideEffects=[], continue, call_consume
+  it('HIGH + APPROVED (same ref) → sideEffects=[], continue, call_consume', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app, {
+        taskId: 'gate-task-006',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+      await patchStatus(app, req.id, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-006',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.sideEffects).toEqual([])
+      expect(body.continuationPolicy).toBe('continue')
+      expect(body.nextAction.action).toBe('call_consume')
+      expect(body.nextAction.consumedRequestId).toBe(req.id)
+      // DB の APPROVED は変化していない（/consume はまだ呼ばれていない）
+      const getRes = await app.inject({ method: 'GET', url: `/api/approval-requests/${req.id}` })
+      const stored = parseBody<ApprovalRequest>(getRes.body)
+      expect(stored.status).toBe('APPROVED')
+    })
+  })
+
+  // 7. HIGH + APPROVED (diff ref) → MARKED_STALE, continue_safe_work_only, re_check
+  it('HIGH + APPROVED (diff ref) → MARKED_STALE, re_check', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app, {
+        taskId: 'gate-task-007',
+        targetCommit: 'commit-old',
+        targetDiffHash: 'hash-old',
+      })
+      await patchStatus(app, req.id, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-007',
+        targetCommit: 'commit-new',
+        targetDiffHash: 'hash-new',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.sideEffects).toHaveLength(1)
+      expect(body.sideEffects[0].type).toBe('MARKED_STALE')
+      expect(body.continuationPolicy).toBe('continue_safe_work_only')
+      expect(body.nextAction.action).toBe('re_check')
+      // DB が STALE になっていること
+      const getRes = await app.inject({ method: 'GET', url: `/api/approval-requests/${req.id}` })
+      const stored = parseBody<ApprovalRequest>(getRes.body)
+      expect(stored.status).toBe('STALE')
+    })
+  })
+
+  // 8. CONSUMED は active 扱いされない → 新規 CREATED
+  it('CONSUMED は active 扱いされない → 新規 CREATED_APPROVAL_REQUEST', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app, {
+        taskId: 'gate-task-008',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+      await patchStatus(app, req.id, 'APPROVED')
+      await consumeRequest(app, req.id, {
+        currentCommit: 'commit-abc123',
+        currentDiffHash: 'hash-deadbeef',
+      })
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-008',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.sideEffects).toHaveLength(1)
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+    })
+  })
+
+  // 9. REJECTED は active 扱いされない → 新規 CREATED
+  it('REJECTED は active 扱いされない → 新規 CREATED_APPROVAL_REQUEST', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app, { taskId: 'gate-task-009' })
+      await patchStatus(app, req.id, 'REJECTED')
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-009',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.sideEffects).toHaveLength(1)
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+    })
+  })
+
+  // 10. diffText 提供 + 正しいハッシュ → 200
+  it('diffText 提供 + 正しい SHA-256 ハッシュ → 200', async () => {
+    await withApp(async (app) => {
+      const diffText = 'diff --git a/foo.ts b/foo.ts\n+const x = 1'
+      const hash = createHash('sha256').update(diffText, 'utf-8').digest('hex')
+      const { statusCode } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-010',
+        changedFiles: ['docs/README.md'],
+        targetDiffHash: hash,
+        diffText,
+      })
+      expect(statusCode).toBe(200)
+    })
+  })
+
+  // 11. diffText 提供 + 誤ったハッシュ → 400
+  it('diffText 提供 + 誤ったハッシュ → 400', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/gate/check',
+        payload: {
+          ...BASE_GATE_PAYLOAD,
+          taskId: 'gate-task-011',
+          changedFiles: ['docs/README.md'],
+          targetDiffHash: 'wrong-hash',
+          diffText: 'some diff content',
+        },
+      })
+      expect(res.statusCode).toBe(400)
+      const body = parseBody<{ error: string }>(res.body)
+      expect(body.error).toMatch(/targetDiffHash does not match/i)
+    })
+  })
+
+  // 12. HIGH + BLOCKED → nextAction.message に「安全な作業は継続可能」
+  it('HIGH + BLOCKED → message に「安全な作業は継続可能」', async () => {
+    await withApp(async (app) => {
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-012',
+      })
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.nextAction.message).toContain('安全な作業は継続可能')
+    })
+  })
+
+  // 13. CRITICAL + BLOCKED → nextAction.message に「すべての作業を停止」
+  it('CRITICAL + BLOCKED → message に「すべての作業を停止」', async () => {
+    await withApp(async (app) => {
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-013',
+        changedFiles: ['AGENTS.md'],
+      })
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.riskReview.riskLevel).toBe('CRITICAL')
+      expect(body.nextAction.message).toContain('すべての作業を停止')
+    })
+  })
+
+  // 14. HIGH + PENDING_APPROVAL → message に「安全な作業は継続可能」
+  it('HIGH + PENDING_APPROVAL (same ref) → message に「安全な作業は継続可能」', async () => {
+    await withApp(async (app) => {
+      await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-014' })
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-014' })
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.nextAction.message).toContain('安全な作業は継続可能')
+    })
+  })
+
+  // 15. CRITICAL + PENDING_APPROVAL → message に「すべての作業を停止」
+  it('CRITICAL + PENDING_APPROVAL (same ref) → message に「すべての作業を停止」', async () => {
+    await withApp(async (app) => {
+      await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-015', changedFiles: ['AGENTS.md'] })
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-015', changedFiles: ['AGENTS.md'] })
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.nextAction.message).toContain('すべての作業を停止')
+    })
+  })
+
+  // 16. HIGH + PENDING_APPROVAL → continuationPolicy='continue_safe_work_only'
+  it('HIGH + PENDING_APPROVAL → continuationPolicy=continue_safe_work_only', async () => {
+    await withApp(async (app) => {
+      await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-016' })
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-016' })
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.continuationPolicy).toBe('continue_safe_work_only')
+    })
+  })
+
+  // 17. CRITICAL + BLOCKED → continuationPolicy='block_until_approved'
+  it('CRITICAL + BLOCKED → continuationPolicy=block_until_approved', async () => {
+    await withApp(async (app) => {
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-017',
+        changedFiles: ['AGENTS.md'],
+      })
+      expect(body.continuationPolicy).toBe('block_until_approved')
+    })
+  })
+
+  // 18. LOW + ALLOW → continuationPolicy='continue'
+  it('LOW + ALLOW → continuationPolicy=continue', async () => {
+    await withApp(async (app) => {
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-018',
+        changedFiles: ['docs/README.md'],
+      })
+      expect(body.continuationPolicy).toBe('continue')
+    })
+  })
+
+  // 19. PENDING_APPROVAL 時の sideEffects が []
+  it('PENDING_APPROVAL 時の sideEffects が []', async () => {
+    await withApp(async (app) => {
+      await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-019' })
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: 'gate-task-019' })
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.sideEffects).toEqual([])
+    })
+  })
+
+  // 20. ALLOW（LOW）時の sideEffects が []
+  it('ALLOW (LOW) 時の sideEffects が []', async () => {
+    await withApp(async (app) => {
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-020',
+        changedFiles: ['docs/README.md'],
+      })
+      expect(body.outcome.decision).toBe('ALLOW')
+      expect(body.sideEffects).toEqual([])
+    })
+  })
+
+  // 21. ALLOW + consumedRequestId の後に /consume を呼ぶと CONSUMED になること
+  it('ALLOW + consumedRequestId の後に /consume を呼ぶと CONSUMED になること', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app, {
+        taskId: 'gate-task-021',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+      await patchStatus(app, req.id, 'APPROVED')
+
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-task-021',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+      expect(body.outcome.decision).toBe('ALLOW')
+      expect(body.nextAction.action).toBe('call_consume')
+      const consumedId = body.nextAction.consumedRequestId
+      expect(consumedId).toBeTruthy()
+
+      // /consume を呼ぶ
+      const { statusCode, body: consumed } = await consumeRequest(app, consumedId!, {
+        currentCommit: 'commit-abc123',
+        currentDiffHash: 'hash-deadbeef',
+      })
+      expect(statusCode).toBe(200)
+      expect((consumed as ApprovalRequest).status).toBe('CONSUMED')
     })
   })
 })
