@@ -1,14 +1,18 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
+import { createHash } from 'node:crypto'
 import { getStorage } from '../storage'
 import type { ApprovalGateStatus, RiskLevel, ApprovalRequest, GateOutcome, RiskReviewResult } from '@ai-team/shared'
 import {
   runRiskReview,
-  computeDiffHash,
   decideGateOutcome,
   buildApprovalRequest,
   type ApprovalGateInput,
 } from '@ai-team/shared'
+
+function computeDiffHash(diffText: string): string {
+  return createHash('sha256').update(diffText, 'utf-8').digest('hex')
+}
 
 // ────────────────────────────────────────────────────────────
 // POST /api/gate/check — ローカル型定義

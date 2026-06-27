@@ -14,8 +14,12 @@
 
 export {
   runRiskReview,
-  computeDiffHash,
   resolveEffectiveStatus,
   decideGateOutcome,
   buildApprovalRequest,
 } from '@ai-team/shared'
+
+import { createHash } from 'node:crypto'
+export function computeDiffHash(diffText: string): string {
+  return createHash('sha256').update(diffText, 'utf-8').digest('hex')
+}

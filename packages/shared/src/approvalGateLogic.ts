@@ -5,7 +5,6 @@
  * API と worker の両方からインポートできるように packages/shared に配置する。
  */
 
-import { createHash } from 'crypto'
 import type {
   ApprovalGateInput,
   ApprovalRequest,
@@ -94,17 +93,6 @@ export function runRiskReview(changedFiles: string[]): RiskReviewResult {
 
   const requiresIndependentReview = maxLevel === 'HIGH' || maxLevel === 'CRITICAL'
   return { riskLevel: maxLevel, triggeredRules: triggered, requiresIndependentReview }
-}
-
-// ────────────────────────────────────────────────────────────
-// diff hash（commit/diff 照合用）
-// ────────────────────────────────────────────────────────────
-
-/**
- * git diff 文字列の SHA-256 ハッシュを返す（純粋関数）
- */
-export function computeDiffHash(diffText: string): string {
-  return createHash('sha256').update(diffText, 'utf-8').digest('hex')
 }
 
 // ────────────────────────────────────────────────────────────

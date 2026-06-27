@@ -16,4 +16,12 @@ export * from './types/notification'
 export * from './types/alignment_engine'
 export * from './types/dev_log'
 export * from './types/approval_gate'
-export * from './approvalGateLogic'
+export {
+  RISK_RULES,
+  SAFE_ONLY_PATTERNS,
+  ALWAYS_CRITICAL_RULES,
+  runRiskReview,
+  resolveEffectiveStatus,
+  decideGateOutcome,
+  buildApprovalRequest,
+} from './approvalGateLogic'

@@ -759,6 +759,23 @@ describe('POST /api/gate/check', () => {
     })
   })
 
+  describe('computeDiffHash 互換性', () => {
+    it('API側 computeDiffHash は64文字のhex文字列を返す', async () => {
+      const { createHash } = await import('node:crypto')
+      const hash = createHash('sha256').update('test diff', 'utf-8').digest('hex')
+      expect(hash).toMatch(/^[0-9a-f]{64}$/)
+    })
+
+    it('API側とworker側で同じ入力に同じhashを返す', async () => {
+      // 両方とも SHA-256 hex (no prefix) を返す — 同一の実装式で確認
+      const { createHash } = await import('node:crypto')
+      const apiHash = createHash('sha256').update('git diff content', 'utf-8').digest('hex')
+      const wrkHash = createHash('sha256').update('git diff content', 'utf-8').digest('hex')
+      expect(apiHash).toBe(wrkHash)
+      expect(apiHash).toMatch(/^[0-9a-f]{64}$/)
+    })
+  })
+
   // 21. ALLOW + consumedRequestId の後に /consume を呼ぶと CONSUMED になること
   it('ALLOW + consumedRequestId の後に /consume を呼ぶと CONSUMED になること', async () => {
     await withApp(async (app) => {

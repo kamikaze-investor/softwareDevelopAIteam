@@ -6,6 +6,5 @@
       "@ai-team/shared": ["../../packages/shared/src/index.ts"]
     }
   },
-  "include": ["app", "components"],
-  "exclude": ["../../packages/shared/src/approvalGateLogic.ts"]
+  "include": ["app", "components"]
 }
