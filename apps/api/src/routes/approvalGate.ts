@@ -102,6 +102,22 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(updated)
   })
 
+  // POST /api/approval-requests/:id/consume — APPROVED を SUPERSEDED に遷移（一回限りの承認を強制）
+  // Codex P2: PATCH /status は WAITING_FOR_USER しか受けないため、consume 専用エンドポイントが必要
+  app.post<{ Params: { id: string } }>('/approval-requests/:id/consume', async (req, reply) => {
+    const request = storage.approvalRequests.findById(req.params.id)
+    if (!request) {
+      return reply.status(404).send({ error: 'Approval request not found' })
+    }
+    if (request.status !== 'APPROVED') {
+      return reply.status(409).send({
+        error: `Cannot consume: current status is '${request.status}' (must be APPROVED)`,
+      })
+    }
+    const updated = storage.approvalRequests.updateStatus(req.params.id, 'SUPERSEDED', 'consumed after ALLOW')
+    return reply.send(updated)
+  })
+
   // GET /api/approval-requests/:id/active?taskId=xxx — アクティブな承認リクエストを取得
   app.get<{ Querystring: { taskId?: string } }>('/approval-requests/active', async (req, reply) => {
     const { taskId } = req.query
