@@ -257,4 +257,84 @@ describe('SQLiteStorage', () => {
       expect(storage.approvals.findPendingByProjectId(projectId)).toHaveLength(0)
     })
   })
+
+  describe('approvalRequests', () => {
+    const BASE = {
+      taskId: 'task-001',
+      targetBranch: 'feat/x',
+      targetCommit: 'abc123',
+      targetDiffHash: 'deadbeef',
+      riskLevel: 'HIGH' as const,
+      requestedAction: 'merge',
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      invalidIf: [],
+    }
+
+    it('expiresAt 超過 → updateStatus で EXPIRED に遷移し、reason/reviewedAt が保持される', () => {
+      // APPROVED + reason + reviewedAt を持つリクエストを作成
+      const req = storage.approvalRequests.create({ ...BASE, status: 'WAITING_FOR_USER' })
+      // CEO が承認（reason/reviewedAt をセット）
+      storage.approvalRequests.updateStatus(req.id, 'APPROVED', 'CEO承認メモ')
+
+      const approved = storage.approvalRequests.findById(req.id)
+      expect(approved?.status).toBe('APPROVED')
+      expect(approved?.reason).toBe('CEO承認メモ')
+      expect(approved?.reviewedAt).toBeTruthy()
+      const savedReviewedAt = approved?.reviewedAt
+
+      // expiresAt を過去に書き換えて「超過」状態を再現
+      const pastExpiry = new Date(Date.now() - 1000).toISOString()
+      storage.approvalRequests.updateStatus(req.id, 'APPROVED', undefined, true) // no-op で保持確認後…
+      // DB を直接更新して expiresAt を過去に設定
+      // createSQLiteStorage は内部で better-sqlite3 を使うが、
+      // テストから db 参照はないため storage.approvalRequests.create で別リクエストを作り
+      // updateStatus(EXPIRED, preserveReviewMeta=true) で遷移を検証する
+      const req2 = storage.approvalRequests.create({
+        ...BASE,
+        expiresAt: pastExpiry,
+        status: 'WAITING_FOR_USER',
+      })
+      storage.approvalRequests.updateStatus(req2.id, 'APPROVED', 'CEOメモ2')
+      const approved2 = storage.approvalRequests.findById(req2.id)
+      const savedAt2 = approved2?.reviewedAt
+
+      // consume 相当: expiresAt 超過を検知して EXPIRED に遷移（preserveReviewMeta=true）
+      const expired = storage.approvalRequests.updateStatus(req2.id, 'EXPIRED', undefined, true)
+
+      expect(expired?.status).toBe('EXPIRED')
+      // reason / reviewedAt が保持されていること
+      expect(expired?.reason).toBe('CEOメモ2')
+      expect(expired?.reviewedAt).toBe(savedAt2)
+    })
+
+    it('expiresAt 超過リクエストは findActiveByTaskId に出ない（EXPIRED は active 外）', () => {
+      const pastExpiry = new Date(Date.now() - 1000).toISOString()
+      const req = storage.approvalRequests.create({
+        ...BASE,
+        expiresAt: pastExpiry,
+        status: 'WAITING_FOR_USER',
+      })
+      storage.approvalRequests.updateStatus(req.id, 'APPROVED', undefined)
+      storage.approvalRequests.updateStatus(req.id, 'EXPIRED', undefined, true)
+
+      const active = storage.approvalRequests.findActiveByTaskId('task-001')
+      expect(active).toBeUndefined()
+    })
+
+    it('APPROVED → EXPIRED 遷移で reviewedAt が NULL の場合も NULL のまま保持される', () => {
+      // reviewedAt=NULL を再現するため: WAITING_FOR_USER で作成し、
+      // updateStatus で preserveReviewMeta=true のまま APPROVED に遷移
+      // （APPROVED 遷移で reason/reviewedAt を設定した後、NULL に戻す手段はないが、
+      //  preserveReviewMeta=true の APPROVED→EXPIRED パスを検証する）
+      const req = storage.approvalRequests.create({ ...BASE, status: 'WAITING_FOR_USER' })
+      // preserveReviewMeta=true で APPROVED: reviewedAt は existing.reviewedAt (null) のまま
+      const approved = storage.approvalRequests.updateStatus(req.id, 'APPROVED', undefined, true)
+      expect(approved?.reviewedAt).toBeUndefined()
+
+      const expired = storage.approvalRequests.updateStatus(req.id, 'EXPIRED', undefined, true)
+      expect(expired?.status).toBe('EXPIRED')
+      // NULL のまま保持
+      expect(expired?.reviewedAt).toBeUndefined()
+    })
+  })
 })
