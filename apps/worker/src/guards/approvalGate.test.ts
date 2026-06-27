@@ -266,10 +266,14 @@ describe('decideGateOutcome', () => {
     if (outcome.decision === 'PENDING_APPROVAL') expect(outcome.requestId).toBe(req.id)
   })
 
-  it('HIGH with APPROVED (same commit/diff) → ALLOW', () => {
+  it('HIGH with APPROVED (same commit/diff) → ALLOW with consumedRequestId', () => {
     const req = makeApprovalRequest({ riskLevel: 'HIGH', status: 'APPROVED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
     const outcome = decideGateOutcome(highReview, req, COMMIT, DIFF_HASH)
     expect(outcome.decision).toBe('ALLOW')
+    if (outcome.decision === 'ALLOW') {
+      // Codex P2: 一回限りの承認。呼び出し元が consumedRequestId で SUPERSEDED にする
+      expect(outcome.consumedRequestId).toBe(req.id)
+    }
   })
 
   it('HIGH with APPROVED but commit changed → STALE', () => {
@@ -285,10 +289,18 @@ describe('decideGateOutcome', () => {
     expect(outcome.decision).toBe('BLOCKED')
   })
 
-  it('CRITICAL with APPROVED (same commit/diff) → ALLOW', () => {
+  it('CRITICAL with APPROVED (same commit/diff) → ALLOW with consumedRequestId', () => {
     const req = makeApprovalRequest({ riskLevel: 'CRITICAL', status: 'APPROVED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
     const outcome = decideGateOutcome(criticalReview, req, COMMIT, DIFF_HASH)
     expect(outcome.decision).toBe('ALLOW')
+    if (outcome.decision === 'ALLOW') expect(outcome.consumedRequestId).toBe(req.id)
+  })
+
+  it('LOW with APPROVED request → ALLOW without consumedRequestId', () => {
+    // LOW は承認不要。consumedRequestId はない
+    const outcome = decideGateOutcome(lowReview, undefined, COMMIT, DIFF_HASH)
+    expect(outcome.decision).toBe('ALLOW')
+    if (outcome.decision === 'ALLOW') expect(outcome.consumedRequestId).toBeUndefined()
   })
 
   it('BLOCKED message contains triggered rules', () => {

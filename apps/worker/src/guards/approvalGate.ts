@@ -164,7 +164,9 @@ export function decideGateOutcome(
     const effective = resolveEffectiveStatus(existingReq, currentCommit, currentDiffHash)
 
     if (effective === 'APPROVED') {
-      return { decision: 'ALLOW', riskLevel }
+      // consumedRequestId を返すことで呼び出し元が承認を SUPERSEDED にできる
+      // （一回限りの承認を保証するため、呼び出し元が必ず updateStatus を呼ぶ）
+      return { decision: 'ALLOW', riskLevel, consumedRequestId: existingReq.id }
     }
     if (effective === 'STALE') {
       return {

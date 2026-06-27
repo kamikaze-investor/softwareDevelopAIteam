@@ -1,9 +1,21 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
-import type { ApprovalGateStatus } from '@ai-team/shared'
+import type { ApprovalGateStatus, RiskLevel } from '@ai-team/shared'
 
 const RiskLevelSchema = z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
+
+// Codex P2: expiresAt はサーバー側で riskLevel から計算する（呼び出し元に任せない）
+const EXPIRY_MINUTES: Record<RiskLevel, number> = {
+  LOW: 30,
+  MEDIUM: 30,
+  HIGH: 30,
+  CRITICAL: 60,
+}
+
+function computeExpiresAt(riskLevel: RiskLevel): string {
+  return new Date(Date.now() + EXPIRY_MINUTES[riskLevel] * 60 * 1000).toISOString()
+}
 
 const CreateApprovalRequestBody = z.object({
   taskId: z.string(),
@@ -12,7 +24,7 @@ const CreateApprovalRequestBody = z.object({
   targetDiffHash: z.string(),
   riskLevel: RiskLevelSchema,
   requestedAction: z.string(),
-  expiresAt: z.string(),
+  // expiresAt は受け付けない（サーバーが計算する）
   invalidIf: z.array(z.string()).default([]),
   reason: z.string().optional(),
 })
@@ -41,6 +53,7 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     const req_ = storage.approvalRequests.create({
       ...result.data,
       status: 'WAITING_FOR_USER',
+      expiresAt: computeExpiresAt(result.data.riskLevel),  // Codex P2: サーバー計算
     })
     return reply.status(201).send(req_)
   })

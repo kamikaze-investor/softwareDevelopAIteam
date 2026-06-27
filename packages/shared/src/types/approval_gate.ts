@@ -97,7 +97,17 @@ export interface IndependentReviewResult {
 // ────────────────────────────────────────────────────────────
 
 export type GateOutcome =
-  | { decision: 'ALLOW'; riskLevel: RiskLevel }
+  | {
+      decision: 'ALLOW'
+      riskLevel: RiskLevel
+      /**
+       * HIGH/CRITICAL 承認由来の ALLOW の場合のみ設定される。
+       * 呼び出し元はこの ID を使って承認リクエストを SUPERSEDED に更新すること
+       * （一回限りの承認を強制するため）。
+       * LOW/MEDIUM 由来の ALLOW は undefined。
+       */
+      consumedRequestId?: string
+    }
   | { decision: 'PENDING_APPROVAL'; requestId: string; riskLevel: RiskLevel }
   | { decision: 'BLOCKED'; reason: string; riskLevel: RiskLevel }
   | { decision: 'STALE'; requestId: string; reason: string }
