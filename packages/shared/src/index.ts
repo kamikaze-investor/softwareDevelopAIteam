@@ -16,6 +16,7 @@ export * from './types/notification'
 export * from './types/alignment_engine'
 export * from './types/dev_log'
 export * from './types/approval_gate'
+export * from './types/knowledge_graph'
 export {
   RISK_RULES,
   SAFE_ONLY_PATTERNS,

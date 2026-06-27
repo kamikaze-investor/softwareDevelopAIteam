@@ -8,6 +8,7 @@
  */
 
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus } from '@ai-team/shared'
+import type { KGNode, KGEdge, KGNodeType, KGEdgeType } from '@ai-team/shared'
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -75,6 +76,25 @@ export interface IWatchdogEventStorage {
   update(id: string, data: Partial<Pick<WatchdogEvent, 'status' | 'aiAnalysis' | 'isStuck' | 'resolvedAt'>>): WatchdogEvent | undefined
 }
 
+export interface IKnowledgeGraphStorage {
+  // Node CRUD
+  findNodeById(id: string): KGNode | undefined
+  findNodesByType(type: KGNodeType): KGNode[]
+  findNodesByPhase(phase: string): KGNode[]
+  findNodesByTag(tag: string): KGNode[]
+  createNode(data: Omit<KGNode, 'id' | 'createdAt' | 'updatedAt'>): KGNode
+  updateNode(id: string, data: Partial<Omit<KGNode, 'id' | 'createdAt'>>): KGNode | undefined
+  deleteNode(id: string): boolean
+
+  // Edge CRUD
+  findEdgeById(id: string): KGEdge | undefined
+  findEdgesByFromNode(fromNodeId: string): KGEdge[]
+  findEdgesByToNode(toNodeId: string): KGEdge[]
+  findEdgesByType(edgeType: KGEdgeType): KGEdge[]
+  createEdge(data: Omit<KGEdge, 'id' | 'createdAt'>): KGEdge
+  deleteEdge(id: string): boolean
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -85,4 +105,5 @@ export interface IStorage {
   permissionGrants: IPermissionGrantStorage
   watchdogEvents: IWatchdogEventStorage
   approvalRequests: IApprovalRequestStorage
+  knowledgeGraph: IKnowledgeGraphStorage
 }

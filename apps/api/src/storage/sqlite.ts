@@ -9,8 +9,8 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -467,7 +467,173 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests }
+  // ────────────────────────────────────────────────────────────
+  // KnowledgeGraph Storage
+  // ────────────────────────────────────────────────────────────
+
+  function generateKGNodeId(): string {
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+    const rows = db.prepare(
+      "SELECT id FROM knowledge_graph_nodes WHERE id LIKE ? ORDER BY id DESC LIMIT 1"
+    ).all(`kg-${date}-%`) as Array<{ id: string }>
+    if (rows.length === 0) {
+      return `kg-${date}-001`
+    }
+    const last = rows[0].id
+    const seq = parseInt(last.split('-')[2] ?? '0', 10)
+    return `kg-${date}-${String(seq + 1).padStart(3, '0')}`
+  }
+
+  function generateKGEdgeId(): string {
+    const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+    const rows = db.prepare(
+      "SELECT id FROM knowledge_graph_edges WHERE id LIKE ? ORDER BY id DESC LIMIT 1"
+    ).all(`kge-${date}-%`) as Array<{ id: string }>
+    if (rows.length === 0) {
+      return `kge-${date}-001`
+    }
+    const last = rows[0].id
+    const parts = last.split('-')
+    const seq = parseInt(parts[2] ?? '0', 10)
+    return `kge-${date}-${String(seq + 1).padStart(3, '0')}`
+  }
+
+  const knowledgeGraph: IKnowledgeGraphStorage = {
+    findNodeById(id) {
+      const row = db.prepare('SELECT * FROM knowledge_graph_nodes WHERE id = ?').get(id) as any
+      return row ? deserializeKGNode(row) : undefined
+    },
+    findNodesByType(type: KGNodeType) {
+      const rows = db.prepare('SELECT * FROM knowledge_graph_nodes WHERE type = ? ORDER BY created_at DESC').all(type) as any[]
+      return rows.map(deserializeKGNode)
+    },
+    findNodesByPhase(phase: string) {
+      const rows = db.prepare('SELECT * FROM knowledge_graph_nodes WHERE phase = ? ORDER BY created_at DESC').all(phase) as any[]
+      return rows.map(deserializeKGNode)
+    },
+    findNodesByTag(tag: string) {
+      // JSON contains search: simple LIKE approach
+      const rows = db.prepare(
+        "SELECT * FROM knowledge_graph_nodes WHERE tags LIKE ? ORDER BY created_at DESC"
+      ).all(`%${tag}%`) as any[]
+      return rows.map(deserializeKGNode).filter((n) => n.tags.includes(tag))
+    },
+    createNode(data) {
+      const node: KGNode = {
+        ...data,
+        id: generateKGNodeId(),
+        createdAt: now(),
+        updatedAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO knowledge_graph_nodes
+          (id, type, title, tags, phase, status, risk, priority, summary,
+           related_docs, related_files, depends_on, blocks,
+           related_features, related_incidents, related_decisions, history_refs,
+           created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        node.id,
+        node.type,
+        node.title,
+        JSON.stringify(node.tags),
+        node.phase ?? null,
+        node.status,
+        node.risk,
+        node.priority,
+        node.summary ?? null,
+        JSON.stringify(node.relatedDocs),
+        JSON.stringify(node.relatedFiles),
+        JSON.stringify(node.dependsOn),
+        JSON.stringify(node.blocks),
+        JSON.stringify(node.relatedFeatures),
+        JSON.stringify(node.relatedIncidents),
+        JSON.stringify(node.relatedDecisions),
+        JSON.stringify(node.historyRefs),
+        node.createdAt,
+        node.updatedAt,
+      )
+      return node
+    },
+    updateNode(id, data) {
+      const existing = knowledgeGraph.findNodeById(id)
+      if (!existing) return undefined
+      const updated: KGNode = { ...existing, ...data, updatedAt: now() }
+      db.prepare(`
+        UPDATE knowledge_graph_nodes SET
+          type=?, title=?, tags=?, phase=?, status=?, risk=?, priority=?, summary=?,
+          related_docs=?, related_files=?, depends_on=?, blocks=?,
+          related_features=?, related_incidents=?, related_decisions=?, history_refs=?,
+          updated_at=?
+        WHERE id=?
+      `).run(
+        updated.type,
+        updated.title,
+        JSON.stringify(updated.tags),
+        updated.phase ?? null,
+        updated.status,
+        updated.risk,
+        updated.priority,
+        updated.summary ?? null,
+        JSON.stringify(updated.relatedDocs),
+        JSON.stringify(updated.relatedFiles),
+        JSON.stringify(updated.dependsOn),
+        JSON.stringify(updated.blocks),
+        JSON.stringify(updated.relatedFeatures),
+        JSON.stringify(updated.relatedIncidents),
+        JSON.stringify(updated.relatedDecisions),
+        JSON.stringify(updated.historyRefs),
+        updated.updatedAt,
+        id,
+      )
+      return updated
+    },
+    deleteNode(id) {
+      const result = db.prepare('DELETE FROM knowledge_graph_nodes WHERE id = ?').run(id)
+      return result.changes > 0
+    },
+    findEdgeById(id) {
+      const row = db.prepare('SELECT * FROM knowledge_graph_edges WHERE id = ?').get(id) as any
+      return row ? deserializeKGEdge(row) : undefined
+    },
+    findEdgesByFromNode(fromNodeId: string) {
+      const rows = db.prepare('SELECT * FROM knowledge_graph_edges WHERE from_node_id = ? ORDER BY created_at DESC').all(fromNodeId) as any[]
+      return rows.map(deserializeKGEdge)
+    },
+    findEdgesByToNode(toNodeId: string) {
+      const rows = db.prepare('SELECT * FROM knowledge_graph_edges WHERE to_node_id = ? ORDER BY created_at DESC').all(toNodeId) as any[]
+      return rows.map(deserializeKGEdge)
+    },
+    findEdgesByType(edgeType: KGEdgeType) {
+      const rows = db.prepare('SELECT * FROM knowledge_graph_edges WHERE edge_type = ? ORDER BY created_at DESC').all(edgeType) as any[]
+      return rows.map(deserializeKGEdge)
+    },
+    createEdge(data) {
+      const edge: KGEdge = {
+        ...data,
+        id: generateKGEdgeId(),
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO knowledge_graph_edges (id, from_node_id, to_node_id, edge_type, label, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        edge.id,
+        edge.fromNodeId,
+        edge.toNodeId,
+        edge.edgeType,
+        edge.label ?? null,
+        edge.createdAt,
+      )
+      return edge
+    },
+    deleteEdge(id) {
+      const result = db.prepare('DELETE FROM knowledge_graph_edges WHERE id = ?').run(id)
+      return result.changes > 0
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph }
 }
 
 function deserializeProject(row: any): Project {
@@ -619,6 +785,41 @@ function deserializeApprovalRequest(row: any): ApprovalRequest {
     reason: row.reason ?? undefined,
     createdAt: row.created_at,
     reviewedAt: row.reviewed_at ?? undefined,
+  }
+}
+
+function deserializeKGNode(row: any): KGNode {
+  return {
+    id: row.id,
+    type: row.type as KGNodeType,
+    title: row.title,
+    tags: JSON.parse(row.tags ?? '[]'),
+    phase: row.phase ?? undefined,
+    status: row.status,
+    risk: row.risk,
+    priority: row.priority,
+    summary: row.summary ?? undefined,
+    relatedDocs: JSON.parse(row.related_docs ?? '[]'),
+    relatedFiles: JSON.parse(row.related_files ?? '[]'),
+    dependsOn: JSON.parse(row.depends_on ?? '[]'),
+    blocks: JSON.parse(row.blocks ?? '[]'),
+    relatedFeatures: JSON.parse(row.related_features ?? '[]'),
+    relatedIncidents: JSON.parse(row.related_incidents ?? '[]'),
+    relatedDecisions: JSON.parse(row.related_decisions ?? '[]'),
+    historyRefs: JSON.parse(row.history_refs ?? '[]'),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function deserializeKGEdge(row: any): KGEdge {
+  return {
+    id: row.id,
+    fromNodeId: row.from_node_id,
+    toNodeId: row.to_node_id,
+    edgeType: row.edge_type as KGEdgeType,
+    label: row.label ?? undefined,
+    createdAt: row.created_at,
   }
 }
 

@@ -140,6 +140,39 @@ export const CREATE_TABLES = `
     resolved_at TEXT,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS knowledge_graph_nodes (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    tags TEXT NOT NULL DEFAULT '[]',
+    phase TEXT,
+    status TEXT NOT NULL DEFAULT 'inbox',
+    risk TEXT NOT NULL DEFAULT 'LOW',
+    priority TEXT NOT NULL DEFAULT 'medium',
+    summary TEXT,
+    related_docs TEXT NOT NULL DEFAULT '[]',
+    related_files TEXT NOT NULL DEFAULT '[]',
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    blocks TEXT NOT NULL DEFAULT '[]',
+    related_features TEXT NOT NULL DEFAULT '[]',
+    related_incidents TEXT NOT NULL DEFAULT '[]',
+    related_decisions TEXT NOT NULL DEFAULT '[]',
+    history_refs TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS knowledge_graph_edges (
+    id TEXT PRIMARY KEY,
+    from_node_id TEXT NOT NULL,
+    to_node_id TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    label TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (from_node_id) REFERENCES knowledge_graph_nodes(id),
+    FOREIGN KEY (to_node_id) REFERENCES knowledge_graph_nodes(id)
+  );
 `
 
 /**
