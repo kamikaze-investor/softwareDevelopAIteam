@@ -59,6 +59,19 @@ describe('runRiskReview', () => {
     expect(result.triggeredRules).toContain('AI instruction file')
   })
 
+  // Codex P1 review: safe-only パス配下の AGENTS.md / CLAUDE.md も CRITICAL
+  it('docs/AGENTS.md → CRITICAL (safe-only path does not bypass CRITICAL rules)', () => {
+    const result = runRiskReview(['docs/AGENTS.md'])
+    expect(result.riskLevel).toBe('CRITICAL')
+    expect(result.triggeredRules).toContain('AI instruction file')
+  })
+
+  it('logs/CLAUDE.md → CRITICAL (safe-only path does not bypass CRITICAL rules)', () => {
+    const result = runRiskReview(['logs/CLAUDE.md'])
+    expect(result.riskLevel).toBe('CRITICAL')
+    expect(result.triggeredRules).toContain('AI instruction file')
+  })
+
   // Codex P1: docker-compose.yml / sandbox 配下も HIGH
   it('docker-compose.yml → HIGH', () => {
     const result = runRiskReview(['docker-compose.yml'])

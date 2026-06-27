@@ -55,11 +55,29 @@ const SAFE_ONLY_PATTERNS: RegExp[] = [
   /^\.gitignore$/,
 ]
 
+// CRITICAL ルール（safe-only 早期リターンより先に評価する）
+// Codex P1 review: docs/AGENTS.md など safe-only パス配下でも CRITICAL にするために先行チェック
+const ALWAYS_CRITICAL_RULES: RiskRule[] = RISK_RULES.filter(r => r.level === 'CRITICAL')
+
 /**
  * changedFiles からリスクレベルを算出する（純粋関数）
  */
 export function runRiskReview(changedFiles: string[]): RiskReviewResult {
-  // docs / logs のみ → LOW
+  // CRITICAL ルールは safe-only 早期リターンより先に評価する
+  // （例: docs/AGENTS.md や logs/CLAUDE.md が LOW にならないように）
+  for (const file of changedFiles) {
+    for (const rule of ALWAYS_CRITICAL_RULES) {
+      if (rule.pattern.test(file)) {
+        return {
+          riskLevel: 'CRITICAL',
+          triggeredRules: [rule.label],
+          requiresIndependentReview: true,
+        }
+      }
+    }
+  }
+
+  // docs / logs のみ → LOW（CRITICAL 先行チェック通過後）
   const allSafe = changedFiles.length > 0 &&
     changedFiles.every(f => SAFE_ONLY_PATTERNS.some(p => p.test(f)))
   if (allSafe) {
