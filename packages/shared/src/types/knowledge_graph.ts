@@ -84,3 +84,35 @@ export interface TimelineMap {
   inbox: KGNode[]
   generatedAt: string
 }
+
+// ────────────────────────────────────────────────────────────
+// Context Engine 型
+// ────────────────────────────────────────────────────────────
+
+/** KG Context Pack の1エントリ */
+export interface KGContextEntry {
+  nodeId: string
+  title: string
+  type: KGNodeType
+  /** 優先度スコア（高いほど重要） */
+  priority: number
+  /** なぜこのノードが選ばれたか */
+  reason: string
+  /** 関連ファイルパス */
+  relatedFiles: string[]
+  /** 関連ドキュメントパス */
+  relatedDocs: string[]
+  summary?: string
+}
+
+/** Context Engine (KG索引ベース) が生成する Context Pack */
+export interface KGContextPack {
+  taskId: string
+  /** Risk level に基づく実行レベル (1-4) */
+  executionLevel: 1 | 2 | 3 | 4
+  /** 優先順位付き・重複排除済みコンテキスト */
+  entries: KGContextEntry[]
+  /** このパックに含まれなかったノード数（上限超過） */
+  truncatedCount: number
+  generatedAt: string
+}

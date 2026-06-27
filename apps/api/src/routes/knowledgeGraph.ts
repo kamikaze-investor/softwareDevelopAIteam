@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
+import type { KGContextEntry, KGContextPack } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // Zod スキーマ
@@ -277,5 +278,127 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     const outgoingEdges = kg.findEdgesByFromNode(id)
     const incomingEdges = kg.findEdgesByToNode(id)
     return reply.send({ node, outgoingEdges, incomingEdges })
+  })
+
+  // ── Context Engine ─────────────────────────────────────────
+
+  const KGContextPackBodySchema = z.object({
+    taskId: z.string().min(1),
+    changedFiles: z.array(z.string()),
+    riskLevel: z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']).default('LOW'),
+    maxEntries: z.number().int().min(1).max(50).default(20),
+  })
+
+  // POST /api/kg/context-pack — Context Pack 生成
+  app.post('/api/kg/context-pack', async (request, reply) => {
+    const parseResult = KGContextPackBodySchema.safeParse(request.body)
+    if (!parseResult.success) {
+      return reply.status(400).send({ error: 'Validation error', details: parseResult.error.issues })
+    }
+
+    const { taskId, changedFiles, riskLevel, maxEntries } = parseResult.data
+
+    // 1. riskLevel から executionLevel を決定
+    const executionLevel: 1 | 2 | 3 | 4 =
+      riskLevel === 'LOW' ? 1
+      : riskLevel === 'MEDIUM' ? 2
+      : riskLevel === 'HIGH' ? 3
+      : 4
+
+    const kg = getStorage().knowledgeGraph
+    const allTypes = ['feature', 'phase', 'task', 'decision', 'incident', 'file', 'doc'] as const
+
+    // 2. Knowledge Graph から関連ノードを収集（executionLevel に応じて）
+    let candidateNodes = (() => {
+      if (executionLevel === 1) {
+        return kg.findNodesByType('feature').filter((n) => n.status === 'active')
+      }
+      if (executionLevel === 2) {
+        return [
+          ...kg.findNodesByType('feature').filter((n) => n.status === 'active'),
+          ...kg.findNodesByType('decision').filter((n) => n.status === 'active'),
+        ]
+      }
+      if (executionLevel === 3) {
+        const fileNodes = kg.findNodesByType('file').filter((n) =>
+          n.relatedFiles.some((f) => changedFiles.includes(f)),
+        )
+        return [
+          ...kg.findNodesByType('feature').filter((n) => n.status === 'active'),
+          ...kg.findNodesByType('decision').filter((n) => n.status === 'active'),
+          ...kg.findNodesByType('incident').filter((n) => n.status === 'active'),
+          ...fileNodes,
+        ]
+      }
+      // Level 4: 全タイプ・全 status
+      return allTypes.flatMap((t) => kg.findNodesByType(t))
+    })()
+
+    // 3. スコアリング
+    const changedFilesSet = new Set(changedFiles)
+    const scored = candidateNodes.map((node) => {
+      let score = 0
+      const reasons: string[] = []
+
+      if (node.relatedFiles.some((f) => changedFilesSet.has(f))) {
+        score += 10
+        reasons.push('changedFiles に relatedFiles が一致')
+      }
+      if (node.type === 'feature' && node.status === 'active') {
+        score += 5
+        reasons.push('active feature')
+      }
+      if (node.risk === 'HIGH') {
+        score += 3
+        reasons.push('risk=HIGH')
+      }
+      if (node.risk === 'CRITICAL') {
+        score += 5
+        reasons.push('risk=CRITICAL')
+      }
+      if (node.type === 'decision') {
+        score += 2
+        reasons.push('type=decision')
+      }
+
+      return { node, score, reason: reasons.join(', ') || node.type }
+    })
+
+    // 4. 重複排除（同一 nodeId）
+    const seen = new Set<string>()
+    const deduped = scored.filter(({ node }) => {
+      if (seen.has(node.id)) return false
+      seen.add(node.id)
+      return true
+    })
+
+    // 5. priority 降順でソート
+    deduped.sort((a, b) => b.score - a.score)
+
+    // 6. maxEntries で切り詰め
+    const truncatedCount = Math.max(0, deduped.length - maxEntries)
+    const limited = deduped.slice(0, maxEntries)
+
+    // 7. KGContextPack を生成
+    const entries: KGContextEntry[] = limited.map(({ node, score, reason }) => ({
+      nodeId: node.id,
+      title: node.title,
+      type: node.type,
+      priority: score,
+      reason,
+      relatedFiles: node.relatedFiles,
+      relatedDocs: node.relatedDocs,
+      summary: node.summary,
+    }))
+
+    const pack: KGContextPack = {
+      taskId,
+      executionLevel,
+      entries,
+      truncatedCount,
+      generatedAt: new Date().toISOString(),
+    }
+
+    return reply.send(pack)
   })
 }

@@ -320,7 +320,7 @@ describe('Knowledge Graph Edges', () => {
 // Timeline Map テスト
 // ────────────────────────────────────────────────────────────
 
-import type { TimelineMap } from '@ai-team/shared'
+import type { TimelineMap, KGContextPack } from '@ai-team/shared'
 
 describe('GET /api/kg/timeline', () => {
   // 1. Phase ノードが1つ、feature ノードが2つ → phases[0].features が2つ返る
@@ -440,6 +440,118 @@ describe('GET /api/kg/nodes/:id/detail', () => {
     await withApp(async (app) => {
       const res = await app.inject({ method: 'GET', url: '/api/kg/nodes/nonexistent-id/detail' })
       expect(res.statusCode).toBe(404)
+    })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Context Pack テスト
+// ────────────────────────────────────────────────────────────
+
+describe('POST /api/kg/context-pack', () => {
+  // 1. LOW riskLevel → executionLevel=1, type=feature のみ返る
+  it('LOW riskLevel → executionLevel=1, type=feature のみ返る', async () => {
+    await withApp(async (app) => {
+      await createNode(app, { type: 'feature', title: 'Feature A', status: 'active' })
+      await createNode(app, { type: 'decision', title: 'Decision A', status: 'active' })
+      await createNode(app, { type: 'incident', title: 'Incident A', status: 'active' })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/context-pack',
+        payload: { taskId: 'task-001', changedFiles: [], riskLevel: 'LOW' },
+      })
+      expect(res.statusCode).toBe(200)
+      const pack = parseBody<KGContextPack>(res.body)
+      expect(pack.taskId).toBe('task-001')
+      expect(pack.executionLevel).toBe(1)
+      expect(pack.entries.every((e) => e.type === 'feature')).toBe(true)
+    })
+  })
+
+  // 2. changedFiles に relatedFiles が一致するノードが priority 高くなる
+  it('changedFiles に relatedFiles が一致するノードが priority 高くなる', async () => {
+    await withApp(async (app) => {
+      await createNode(app, { type: 'feature', title: 'Feature Match', status: 'active', relatedFiles: ['src/foo.ts'] })
+      await createNode(app, { type: 'feature', title: 'Feature NoMatch', status: 'active', relatedFiles: [] })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/context-pack',
+        payload: { taskId: 'task-002', changedFiles: ['src/foo.ts'], riskLevel: 'LOW' },
+      })
+      expect(res.statusCode).toBe(200)
+      const pack = parseBody<KGContextPack>(res.body)
+      const matchEntry = pack.entries.find((e) => e.title === 'Feature Match')
+      const noMatchEntry = pack.entries.find((e) => e.title === 'Feature NoMatch')
+      expect(matchEntry).toBeDefined()
+      expect(noMatchEntry).toBeDefined()
+      expect(matchEntry!.priority).toBeGreaterThan(noMatchEntry!.priority)
+    })
+  })
+
+  // 3. HIGH riskLevel → executionLevel=3, incident ノードも含まれる
+  it('HIGH riskLevel → executionLevel=3, incident ノードも含まれる', async () => {
+    await withApp(async (app) => {
+      await createNode(app, { type: 'feature', title: 'Feature A', status: 'active' })
+      await createNode(app, { type: 'incident', title: 'Incident A', status: 'active' })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/context-pack',
+        payload: { taskId: 'task-003', changedFiles: [], riskLevel: 'HIGH' },
+      })
+      expect(res.statusCode).toBe(200)
+      const pack = parseBody<KGContextPack>(res.body)
+      expect(pack.executionLevel).toBe(3)
+      expect(pack.entries.some((e) => e.type === 'incident')).toBe(true)
+    })
+  })
+
+  // 4. maxEntries=2 で truncatedCount が正しい
+  it('maxEntries=2 で truncatedCount が正しい', async () => {
+    await withApp(async (app) => {
+      await createNode(app, { type: 'feature', title: 'Feature A', status: 'active' })
+      await createNode(app, { type: 'feature', title: 'Feature B', status: 'active' })
+      await createNode(app, { type: 'feature', title: 'Feature C', status: 'active' })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/context-pack',
+        payload: { taskId: 'task-004', changedFiles: [], riskLevel: 'LOW', maxEntries: 2 },
+      })
+      expect(res.statusCode).toBe(200)
+      const pack = parseBody<KGContextPack>(res.body)
+      expect(pack.entries).toHaveLength(2)
+      expect(pack.truncatedCount).toBe(1)
+    })
+  })
+
+  // 5. ノードが0件でも空の entries=[] が返る
+  it('ノードが0件でも空の entries=[] が返る', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/context-pack',
+        payload: { taskId: 'task-005', changedFiles: [], riskLevel: 'LOW' },
+      })
+      expect(res.statusCode).toBe(200)
+      const pack = parseBody<KGContextPack>(res.body)
+      expect(pack.entries).toEqual([])
+      expect(pack.truncatedCount).toBe(0)
+      expect(pack.generatedAt).toBeTruthy()
+    })
+  })
+
+  // 6. taskId が空文字列 → 400
+  it('taskId が空文字列 → 400', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/context-pack',
+        payload: { taskId: '', changedFiles: [], riskLevel: 'LOW' },
+      })
+      expect(res.statusCode).toBe(400)
     })
   })
 })
