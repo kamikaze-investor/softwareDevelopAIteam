@@ -185,4 +185,97 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     }
     return reply.status(204).send()
   })
+
+  // ── Timeline Map ───────────────────────────────────────────
+
+  // GET /api/kg/timeline — CEO向け集約ビュー
+  app.get('/api/kg/timeline', async (_request, reply) => {
+    const kg = getStorage().knowledgeGraph
+    const allTypes = ['feature', 'phase', 'task', 'decision', 'incident', 'file', 'doc'] as const
+    const allNodes = allTypes.flatMap((t) => kg.findNodesByType(t))
+    const allEdgeTypes = ['depends_on', 'blocks', 'related_to', 'belongs_to', 'impacts'] as const
+    const allEdges = allEdgeTypes.flatMap((t) => kg.findEdgesByType(t))
+
+    // Phase ノード抽出 & 並び替え（high→medium→low, createdAt 昇順）
+    const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 }
+    const phaseNodes = allNodes
+      .filter((n) => n.type === 'phase')
+      .sort((a, b) => {
+        const pd = priorityOrder[a.priority] - priorityOrder[b.priority]
+        if (pd !== 0) return pd
+        return a.createdAt.localeCompare(b.createdAt)
+      })
+
+    // Phase ID セット（存在するフェーズのみ）
+    const phaseIdSet = new Set(phaseNodes.map((p) => p.id))
+
+    // 各フェーズに所属するノード（phase フィールドが phaseNode.id に一致）
+    const phases = phaseNodes.map((phaseNode) => {
+      const phaseMembers = allNodes.filter(
+        (n) => n.type !== 'phase' && n.phase === phaseNode.id,
+      )
+      const featureNodes = phaseMembers.filter((n) => n.type === 'feature')
+      const nonFeatureMembers = phaseMembers.filter((n) => n.type !== 'feature')
+
+      // belongs_to エッジで feature に紐づく子ノード
+      const belongsToEdges = allEdges.filter((e) => e.edgeType === 'belongs_to')
+
+      const features = featureNodes.map((featureNode) => {
+        const childIds = new Set(
+          belongsToEdges
+            .filter((e) => e.toNodeId === featureNode.id)
+            .map((e) => e.fromNodeId),
+        )
+        const children = allNodes.filter((n) => childIds.has(n.id))
+        const edges = allEdges.filter(
+          (e) =>
+            e.fromNodeId === featureNode.id &&
+            (e.edgeType === 'depends_on' || e.edgeType === 'blocks'),
+        )
+        return { node: featureNode, children, edges }
+      })
+
+      // stats: phase に所属する全ノード（feature + nonFeature + feature の children）
+      // ただし children は phase フィールドを持たないケースがあるため featureMembers のみでカウント
+      const allPhaseNodes = phaseMembers
+      const total = allPhaseNodes.length
+      const active = allPhaseNodes.filter((n) => n.status === 'active').length
+      const archived = allPhaseNodes.filter((n) => n.status === 'archived').length
+      const inbox = allPhaseNodes.filter((n) => n.status === 'inbox').length
+      const highRiskCount = allPhaseNodes.filter((n) => n.risk === 'HIGH').length
+      const criticalRiskCount = allPhaseNodes.filter((n) => n.risk === 'CRITICAL').length
+
+      return {
+        phaseNode,
+        features,
+        stats: { total, active, archived, inbox, highRiskCount, criticalRiskCount },
+      }
+    })
+
+    // inbox: phase フィールドが未定義 or 対応する phase ノードが存在しない非 phase ノード
+    const inboxNodes = allNodes.filter(
+      (n) => n.type !== 'phase' && (n.phase === undefined || !phaseIdSet.has(n.phase)),
+    )
+
+    return reply.send({
+      phases,
+      inbox: inboxNodes,
+      generatedAt: new Date().toISOString(),
+    })
+  })
+
+  // ── Node Detail ────────────────────────────────────────────
+
+  // GET /api/kg/nodes/:id/detail — ノード詳細 + 関連エッジ
+  app.get('/api/kg/nodes/:id/detail', async (request, reply) => {
+    const { id } = request.params as { id: string }
+    const kg = getStorage().knowledgeGraph
+    const node = kg.findNodeById(id)
+    if (!node) {
+      return reply.status(404).send({ error: `Node not found: ${id}` })
+    }
+    const outgoingEdges = kg.findEdgesByFromNode(id)
+    const incomingEdges = kg.findEdgesByToNode(id)
+    return reply.send({ node, outgoingEdges, incomingEdges })
+  })
 }

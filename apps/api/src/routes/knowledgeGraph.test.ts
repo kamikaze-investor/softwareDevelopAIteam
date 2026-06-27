@@ -315,3 +315,131 @@ describe('Knowledge Graph Edges', () => {
     })
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// Timeline Map テスト
+// ────────────────────────────────────────────────────────────
+
+import type { TimelineMap } from '@ai-team/shared'
+
+describe('GET /api/kg/timeline', () => {
+  // 1. Phase ノードが1つ、feature ノードが2つ → phases[0].features が2つ返る
+  it('Phase 1つ + feature 2つ → phases[0].features が2つ返る', async () => {
+    await withApp(async (app) => {
+      const phase = await createNode(app, { type: 'phase', title: 'Phase 1', status: 'active' })
+      await createNode(app, { type: 'feature', title: 'Feature A', phase: phase.id, status: 'active' })
+      await createNode(app, { type: 'feature', title: 'Feature B', phase: phase.id, status: 'active' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      expect(res.statusCode).toBe(200)
+      const timeline = parseBody<TimelineMap>(res.body)
+      expect(timeline.phases).toHaveLength(1)
+      expect(timeline.phases[0].features).toHaveLength(2)
+    })
+  })
+
+  // 2. inbox: phase 未所属のノードが inbox に入る
+  it('phase 未所属のノードが inbox に入る', async () => {
+    await withApp(async (app) => {
+      const phase = await createNode(app, { type: 'phase', title: 'Phase 1', status: 'active' })
+      await createNode(app, { type: 'feature', title: 'In Phase', phase: phase.id, status: 'active' })
+      await createNode(app, { type: 'feature', title: 'No Phase', status: 'inbox' }) // phase 未指定
+
+      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      expect(res.statusCode).toBe(200)
+      const timeline = parseBody<TimelineMap>(res.body)
+      expect(timeline.inbox.some((n) => n.title === 'No Phase')).toBe(true)
+      expect(timeline.inbox.every((n) => n.type !== 'phase')).toBe(true)
+    })
+  })
+
+  // 3. stats: active/archived カウントが正しい
+  it('stats: active/archived カウントが正しい', async () => {
+    await withApp(async (app) => {
+      const phase = await createNode(app, { type: 'phase', title: 'Phase S', status: 'active' })
+      await createNode(app, { type: 'feature', title: 'F1', phase: phase.id, status: 'active' })
+      await createNode(app, { type: 'feature', title: 'F2', phase: phase.id, status: 'archived' })
+      await createNode(app, { type: 'task', title: 'T1', phase: phase.id, status: 'active' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      const timeline = parseBody<TimelineMap>(res.body)
+      const stats = timeline.phases[0].stats
+      expect(stats.total).toBe(3)
+      expect(stats.active).toBe(2)
+      expect(stats.archived).toBe(1)
+    })
+  })
+
+  // 4. stats: highRiskCount が正しい
+  it('stats: highRiskCount が正しい', async () => {
+    await withApp(async (app) => {
+      const phase = await createNode(app, { type: 'phase', title: 'Phase R', status: 'active' })
+      await createNode(app, { type: 'feature', title: 'F-high', phase: phase.id, status: 'active', risk: 'HIGH' })
+      await createNode(app, { type: 'feature', title: 'F-critical', phase: phase.id, status: 'active', risk: 'CRITICAL' })
+      await createNode(app, { type: 'task', title: 'T-low', phase: phase.id, status: 'active', risk: 'LOW' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      const timeline = parseBody<TimelineMap>(res.body)
+      const stats = timeline.phases[0].stats
+      expect(stats.highRiskCount).toBe(1)
+      expect(stats.criticalRiskCount).toBe(1)
+    })
+  })
+
+  // 5. ノードが0件でも空の timeline が返る
+  it('ノードが0件でも空の timeline が返る（phases=[], inbox=[]）', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      expect(res.statusCode).toBe(200)
+      const timeline = parseBody<TimelineMap>(res.body)
+      expect(timeline.phases).toEqual([])
+      expect(timeline.inbox).toEqual([])
+      expect(timeline.generatedAt).toBeTruthy()
+    })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Node Detail テスト
+// ────────────────────────────────────────────────────────────
+
+describe('GET /api/kg/nodes/:id/detail', () => {
+  // 6. outgoingEdges / incomingEdges が正しく返る
+  it('outgoingEdges / incomingEdges が正しく返る', async () => {
+    await withApp(async (app) => {
+      const nodeA = await createNode(app, { title: 'Node A' })
+      const nodeB = await createNode(app, { title: 'Node B' })
+      const nodeC = await createNode(app, { title: 'Node C' })
+
+      // A → B (depends_on)
+      await app.inject({
+        method: 'POST',
+        url: '/api/kg/edges',
+        payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'depends_on' },
+      })
+      // C → A (blocks)
+      await app.inject({
+        method: 'POST',
+        url: '/api/kg/edges',
+        payload: { fromNodeId: nodeC.id, toNodeId: nodeA.id, edgeType: 'blocks' },
+      })
+
+      const res = await app.inject({ method: 'GET', url: `/api/kg/nodes/${nodeA.id}/detail` })
+      expect(res.statusCode).toBe(200)
+      const detail = parseBody<{ node: KGNode; outgoingEdges: KGEdge[]; incomingEdges: KGEdge[] }>(res.body)
+      expect(detail.node.id).toBe(nodeA.id)
+      expect(detail.outgoingEdges).toHaveLength(1)
+      expect(detail.outgoingEdges[0].toNodeId).toBe(nodeB.id)
+      expect(detail.incomingEdges).toHaveLength(1)
+      expect(detail.incomingEdges[0].fromNodeId).toBe(nodeC.id)
+    })
+  })
+
+  // 7. 存在しない ID → 404
+  it('存在しない ID → 404', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({ method: 'GET', url: '/api/kg/nodes/nonexistent-id/detail' })
+      expect(res.statusCode).toBe(404)
+    })
+  })
+})

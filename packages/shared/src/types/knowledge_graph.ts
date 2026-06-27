@@ -50,3 +50,37 @@ export interface KGEdge {
   label?: string
   createdAt: string
 }
+
+// ────────────────────────────────────────────────────────────
+// CEO向け Project Timeline Map 型
+// ────────────────────────────────────────────────────────────
+
+export interface TimelineFeature {
+  node: KGNode
+  /** この Feature に belongs_to エッジで紐づく子ノード */
+  children: KGNode[]
+  /** この Feature から出ている depends_on / blocks エッジ */
+  edges: KGEdge[]
+}
+
+export interface TimelinePhase {
+  phaseNode: KGNode
+  features: TimelineFeature[]
+  /** このフェーズ内の集計 */
+  stats: {
+    total: number
+    active: number
+    archived: number
+    inbox: number
+    highRiskCount: number
+    criticalRiskCount: number
+  }
+}
+
+export interface TimelineMap {
+  /** Phase ノード順（priority: high→medium→low, createdAt 昇順）に並ぶ */
+  phases: TimelinePhase[]
+  /** Phase に未所属のノード（status='inbox' または phase=undefined） */
+  inbox: KGNode[]
+  generatedAt: string
+}
