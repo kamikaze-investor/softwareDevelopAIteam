@@ -320,7 +320,7 @@ describe('Knowledge Graph Edges', () => {
 // Timeline Map テスト
 // ────────────────────────────────────────────────────────────
 
-import type { TimelineMap, KGContextPack } from '@ai-team/shared'
+import type { TimelineMap, KGContextPack, ImpactAnalysisResult } from '@ai-team/shared'
 
 describe('GET /api/kg/timeline', () => {
   // 1. Phase ノードが1つ、feature ノードが2つ → phases[0].features が2つ返る
@@ -550,6 +550,137 @@ describe('POST /api/kg/context-pack', () => {
         method: 'POST',
         url: '/api/kg/context-pack',
         payload: { taskId: '', changedFiles: [], riskLevel: 'LOW' },
+      })
+      expect(res.statusCode).toBe(400)
+    })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Impact Analyzer テスト
+// ────────────────────────────────────────────────────────────
+
+describe('POST /api/kg/impact', () => {
+  // 1. changedFiles が relatedFiles に一致するノードが impactedFeatures に含まれる
+  it('changedFiles が relatedFiles に一致するノードが impactedFeatures に含まれる', async () => {
+    await withApp(async (app) => {
+      const nodeA = await createNode(app, { title: 'Feature Match', relatedFiles: ['src/foo.ts'] })
+      await createNode(app, { title: 'Feature NoMatch', relatedFiles: ['src/bar.ts'] })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/impact',
+        payload: { changedFiles: ['src/foo.ts'] },
+      })
+      expect(res.statusCode).toBe(200)
+      const result = parseBody<ImpactAnalysisResult>(res.body)
+      expect(result.impactedFeatures.some((n) => n.id === nodeA.id)).toBe(true)
+      expect(result.impactedFeatures.every((n) => n.title !== 'Feature NoMatch')).toBe(true)
+    })
+  })
+
+  // 2. CRITICAL ノードが含まれると riskLevel='CRITICAL'
+  it('CRITICAL ノードが含まれると riskLevel="CRITICAL"', async () => {
+    await withApp(async (app) => {
+      await createNode(app, { title: 'Critical Feature', risk: 'CRITICAL', relatedFiles: ['src/critical.ts'] })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/impact',
+        payload: { changedFiles: ['src/critical.ts'] },
+      })
+      expect(res.statusCode).toBe(200)
+      const result = parseBody<ImpactAnalysisResult>(res.body)
+      expect(result.riskLevel).toBe('CRITICAL')
+      expect(result.riskReasons.some((r) => r.includes('CRITICAL'))).toBe(true)
+    })
+  })
+
+  // 3. HIGH ノードのみなら riskLevel='HIGH'
+  it('HIGH ノードのみなら riskLevel="HIGH"', async () => {
+    await withApp(async (app) => {
+      await createNode(app, { title: 'High Feature', risk: 'HIGH', relatedFiles: ['src/high.ts'] })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/impact',
+        payload: { changedFiles: ['src/high.ts'] },
+      })
+      expect(res.statusCode).toBe(200)
+      const result = parseBody<ImpactAnalysisResult>(res.body)
+      expect(result.riskLevel).toBe('HIGH')
+      expect(result.riskReasons.some((r) => r.includes('HIGH'))).toBe(true)
+    })
+  })
+
+  // 4. 一致するノードが0件でも 200 + riskLevel='LOW' + impactedFeatures=[]
+  it('一致するノードが0件でも 200 + riskLevel="LOW" + impactedFeatures=[]', async () => {
+    await withApp(async (app) => {
+      await createNode(app, { title: 'Unrelated', relatedFiles: ['src/other.ts'] })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/impact',
+        payload: { changedFiles: ['src/nomatch.ts'] },
+      })
+      expect(res.statusCode).toBe(200)
+      const result = parseBody<ImpactAnalysisResult>(res.body)
+      expect(result.riskLevel).toBe('LOW')
+      expect(result.impactedFeatures).toEqual([])
+    })
+  })
+
+  // 5. targetFeatureId を指定すると impacts エッジ先のノードも含まれる
+  it('targetFeatureId を指定すると impacts エッジ先のノードも含まれる', async () => {
+    await withApp(async (app) => {
+      const nodeA = await createNode(app, { title: 'Target Feature', relatedFiles: ['src/target.ts'] })
+      const nodeB = await createNode(app, { title: 'Impacted Feature', relatedFiles: [] })
+
+      // A → B (impacts)
+      await app.inject({
+        method: 'POST',
+        url: '/api/kg/edges',
+        payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'impacts' },
+      })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/impact',
+        payload: { changedFiles: ['src/target.ts'], targetFeatureId: nodeA.id },
+      })
+      expect(res.statusCode).toBe(200)
+      const result = parseBody<ImpactAnalysisResult>(res.body)
+      expect(result.impactedFeatures.some((n) => n.id === nodeB.id)).toBe(true)
+    })
+  })
+
+  // 6. impactedTests が .test. を含むファイルのみ返す
+  it('impactedTests が .test. を含むファイルのみ返す', async () => {
+    await withApp(async (app) => {
+      await createNode(app, {
+        title: 'Feature With Tests',
+        relatedFiles: ['src/foo.ts', 'src/foo.test.ts', 'src/bar.spec.ts'],
+      })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/impact',
+        payload: { changedFiles: ['src/foo.ts'] },
+      })
+      expect(res.statusCode).toBe(200)
+      const result = parseBody<ImpactAnalysisResult>(res.body)
+      expect(result.impactedTests).toContain('src/foo.test.ts')
+      expect(result.impactedTests.every((f) => f.includes('.test.'))).toBe(true)
+    })
+  })
+
+  // 7. changedFiles が空配列 → 400
+  it('changedFiles が空配列 → 400', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/kg/impact',
+        payload: { changedFiles: [] },
       })
       expect(res.statusCode).toBe(400)
     })

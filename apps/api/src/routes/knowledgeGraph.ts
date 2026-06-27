@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
-import type { KGContextEntry, KGContextPack } from '@ai-team/shared'
+import type { KGContextEntry, KGContextPack, ImpactAnalysisResult } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // Zod スキーマ
@@ -400,5 +400,107 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     }
 
     return reply.send(pack)
+  })
+
+  // ── Impact Analyzer ────────────────────────────────────────
+
+  const ImpactAnalysisBody = z.object({
+    changedFiles: z.array(z.string()).min(1),
+    targetFeatureId: z.string().optional(),
+    taskId: z.string().optional(),
+  })
+
+  // POST /api/kg/impact — Impact Analysis
+  app.post('/api/kg/impact', async (request, reply) => {
+    const parseResult = ImpactAnalysisBody.safeParse(request.body)
+    if (!parseResult.success) {
+      return reply.status(400).send({ error: 'Validation error', details: parseResult.error.issues })
+    }
+
+    const { changedFiles, targetFeatureId } = parseResult.data
+    const kg = getStorage().knowledgeGraph
+
+    // 1. changedFiles に relatedFiles がマッチする KGNode を全ノードから検索
+    const allTypes = ['feature', 'phase', 'task', 'decision', 'incident', 'file', 'doc'] as const
+    const allNodes = allTypes.flatMap((t) => kg.findNodesByType(t))
+
+    const matchedNodes = allNodes.filter((node) =>
+      node.relatedFiles.some((rf) =>
+        changedFiles.some((cf) => cf === rf || cf.includes(rf) || rf.includes(cf)),
+      ),
+    )
+
+    const impactedSet = new Map(matchedNodes.map((n) => [n.id, n]))
+
+    // 2. targetFeatureId が指定されている場合: 1ホップ edge 探索
+    if (targetFeatureId) {
+      const targetNode = kg.findNodeById(targetFeatureId)
+      if (targetNode) {
+        impactedSet.set(targetNode.id, targetNode)
+        const outgoingEdges = kg.findEdgesByFromNode(targetFeatureId)
+        for (const edge of outgoingEdges) {
+          if (edge.edgeType === 'impacts' || edge.edgeType === 'depends_on' || edge.edgeType === 'blocks') {
+            const reachable = kg.findNodeById(edge.toNodeId)
+            if (reachable) {
+              impactedSet.set(reachable.id, reachable)
+            }
+          }
+        }
+      }
+    }
+
+    const impactedFeatures = Array.from(impactedSet.values())
+
+    // 3. riskLevel 算出
+    let riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' = 'LOW'
+    if (impactedFeatures.some((n) => n.risk === 'CRITICAL')) {
+      riskLevel = 'CRITICAL'
+    } else if (impactedFeatures.some((n) => n.risk === 'HIGH')) {
+      riskLevel = 'HIGH'
+    } else if (impactedFeatures.some((n) => n.risk === 'MEDIUM')) {
+      riskLevel = 'MEDIUM'
+    }
+
+    // 4. riskReasons 構築
+    const riskReasons: string[] = []
+    for (const node of impactedFeatures) {
+      if (node.risk === 'CRITICAL') {
+        riskReasons.push(`Feature '${node.title}' is CRITICAL risk`)
+      } else if (node.risk === 'HIGH') {
+        riskReasons.push(`Feature '${node.title}' is HIGH risk`)
+      }
+    }
+
+    // 5. impactedDocs: relatedDocs を集約・重複排除
+    const docsSet = new Set<string>()
+    for (const node of impactedFeatures) {
+      for (const doc of node.relatedDocs) {
+        docsSet.add(doc)
+      }
+    }
+    const impactedDocs = Array.from(docsSet)
+
+    // 6. impactedTests: relatedFiles のうち .test. を含むもの
+    const testsSet = new Set<string>()
+    for (const node of impactedFeatures) {
+      for (const f of node.relatedFiles) {
+        if (f.includes('.test.')) {
+          testsSet.add(f)
+        }
+      }
+    }
+    const impactedTests = Array.from(testsSet)
+
+    const result: ImpactAnalysisResult = {
+      impactedFeatures,
+      impactedDocs,
+      impactedTests,
+      riskLevel,
+      riskReasons,
+      requiredReviewers: [],
+      analyzedAt: new Date().toISOString(),
+    }
+
+    return reply.send(result)
   })
 }

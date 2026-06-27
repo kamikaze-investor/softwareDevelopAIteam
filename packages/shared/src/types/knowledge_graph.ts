@@ -105,6 +105,35 @@ export interface KGContextEntry {
   summary?: string
 }
 
+// ────────────────────────────────────────────────────────────
+// Impact Analyzer 型
+// ────────────────────────────────────────────────────────────
+
+/** Impact Analyzer の入力 */
+export interface ImpactAnalysisInput {
+  changedFiles: string[]
+  /** 変更を起こしている Feature の KGNode ID（任意） */
+  targetFeatureId?: string
+  taskId?: string
+}
+
+/** Impact Analyzer の出力 */
+export interface ImpactAnalysisResult {
+  /** 影響を受ける Feature ノード */
+  impactedFeatures: KGNode[]
+  /** 影響を受けるドキュメント */
+  impactedDocs: string[]
+  /** 影響を受けるテストファイル（relatedFiles に .test. を含むもの） */
+  impactedTests: string[]
+  /** 算出された riskLevel（最大リスクを採用） */
+  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  /** riskLevel の根拠 */
+  riskReasons: string[]
+  /** レビューが推奨される担当者・役割（将来拡張用、現在は空配列） */
+  requiredReviewers: string[]
+  analyzedAt: string
+}
+
 /** Context Engine (KG索引ベース) が生成する Context Pack */
 export interface KGContextPack {
   taskId: string
