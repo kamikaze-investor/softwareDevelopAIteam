@@ -114,7 +114,8 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
         error: `Cannot consume: current status is '${request.status}' (must be APPROVED)`,
       })
     }
-    const updated = storage.approvalRequests.updateStatus(req.params.id, 'SUPERSEDED', 'consumed after ALLOW')
+    // preserveReviewMeta=true: CEO の承認メモ(reason)と reviewedAt を上書きしない
+    const updated = storage.approvalRequests.updateStatus(req.params.id, 'SUPERSEDED', undefined, true)
     return reply.send(updated)
   })
 

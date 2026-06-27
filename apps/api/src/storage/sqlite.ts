@@ -450,16 +450,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       )
       return req
     },
-    updateStatus(id, status, reason) {
+    updateStatus(id, status, reason, preserveReviewMeta = false) {
       const existing = approvalRequests.findById(id)
       if (!existing) return undefined
-      const reviewedAt = now()
+      // preserveReviewMeta=true（consume 時）: CEO が記録した reason/reviewedAt を上書きしない
+      const newReason = preserveReviewMeta ? (existing.reason ?? null) : (reason ?? existing.reason ?? null)
+      const newReviewedAt = preserveReviewMeta ? (existing.reviewedAt ?? now()) : now()
       db.prepare(`
         UPDATE approval_requests
         SET status = ?, reason = ?, reviewed_at = ?
         WHERE id = ?
-      `).run(status, reason ?? existing.reason ?? null, reviewedAt, id)
-      return { ...existing, status, reason: reason ?? existing.reason, reviewedAt }
+      `).run(status, newReason, newReviewedAt, id)
+      return { ...existing, status, reason: newReason ?? undefined, reviewedAt: newReviewedAt }
     },
   }
 

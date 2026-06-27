@@ -63,7 +63,8 @@ export interface IApprovalRequestStorage {
   /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す */
   findActiveByTaskId(taskId: string): ApprovalRequest | undefined
   create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
-  updateStatus(id: string, status: ApprovalGateStatus, reason?: string): ApprovalRequest | undefined
+  /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
+  updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
 }
 
 export interface IWatchdogEventStorage {
