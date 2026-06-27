@@ -454,14 +454,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const existing = approvalRequests.findById(id)
       if (!existing) return undefined
       // preserveReviewMeta=true（consume 時）: CEO が記録した reason/reviewedAt を上書きしない
+      // Codex: reviewedAt が NULL の行に consume 時刻を書かないよう undefined のまま保持
       const newReason = preserveReviewMeta ? (existing.reason ?? null) : (reason ?? existing.reason ?? null)
-      const newReviewedAt = preserveReviewMeta ? (existing.reviewedAt ?? now()) : now()
+      const newReviewedAt = preserveReviewMeta ? (existing.reviewedAt ?? null) : now()
       db.prepare(`
         UPDATE approval_requests
         SET status = ?, reason = ?, reviewed_at = ?
         WHERE id = ?
       `).run(status, newReason, newReviewedAt, id)
-      return { ...existing, status, reason: newReason ?? undefined, reviewedAt: newReviewedAt }
+      return { ...existing, status, reason: newReason ?? undefined, reviewedAt: newReviewedAt ?? undefined }
     },
   }
 
