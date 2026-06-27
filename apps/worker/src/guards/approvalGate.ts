@@ -33,18 +33,23 @@ interface RiskRule {
 }
 
 const RISK_RULES: RiskRule[] = [
-  { label: 'DB migration / schema',  pattern: /migration|schema\.ts/i,                  level: 'HIGH' },
-  { label: 'auth / permission guard', pattern: /auth|permission|guard/i,                 level: 'HIGH' },
-  { label: 'payment / billing',       pattern: /payment|billing|stripe/i,                level: 'CRITICAL' },
-  { label: 'secrets / env / token',   pattern: /secret|\.env|token|api.?key/i,           level: 'HIGH' },
-  { label: 'destructive operation',   pattern: /delete|drop|truncate|destroy/i,          level: 'HIGH' },
-  { label: 'docker / sandbox config', pattern: /sandbox\/docker|Dockerfile/i,            level: 'HIGH' },
-  { label: 'CI/CD workflow change',   pattern: /\.github\/workflows/i,                   level: 'HIGH' },
-  { label: 'alignment / gate change', pattern: /alignmentCheck|approvalGate|gateProcessor/i, level: 'HIGH' },
+  { label: 'DB migration / schema',      pattern: /migration|schema\.ts/i,                    level: 'HIGH' },
+  { label: 'auth / permission guard',    pattern: /auth|permission|guard/i,                   level: 'HIGH' },
+  { label: 'payment / billing',          pattern: /payment|billing|stripe/i,                  level: 'CRITICAL' },
+  { label: 'secrets / env / token',      pattern: /secret|\.env|token|api.?key/i,             level: 'HIGH' },
+  { label: 'destructive operation',      pattern: /delete|drop|truncate|destroy/i,            level: 'HIGH' },
+  // Codex P1: docker-compose.yml / sandbox/config.yml も対象に拡張
+  { label: 'docker / sandbox config',    pattern: /sandbox\/docker|Dockerfile|docker-compose|sandbox\//i, level: 'HIGH' },
+  { label: 'CI/CD workflow change',      pattern: /\.github\//i,                              level: 'HIGH' },
+  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor/i, level: 'HIGH' },
+  // Codex P1: AI 指示ファイル（AGENTS.md / CLAUDE.md）は CRITICAL
+  { label: 'AI instruction file',        pattern: /AGENTS\.md$|CLAUDE\.md$/i,                 level: 'CRITICAL' },
 ]
 
+// SAFE_ONLY_PATTERNS: 全ファイルが "安全のみ" と判断されたとき LOW に落とすホワイトリスト
+// 注意: RISK_RULES より先に評価されるため、ここに入れると RISK_RULES を完全にスキップする
+// → .md ファイルは無条件 LOW にせず、RISK_RULES に先に通す
 const SAFE_ONLY_PATTERNS: RegExp[] = [
-  /\.md$/i,
   /^docs\//,
   /^logs\//,
   /^\.gitignore$/,

@@ -40,10 +40,43 @@ const OTHER_DIFF_HASH = 'cafebabe'
 
 describe('runRiskReview', () => {
   it('docs-only → LOW, requiresIndependentReview=false', () => {
-    const result = runRiskReview(['docs/architecture.md', 'README.md'])
+    const result = runRiskReview(['docs/architecture.md'])
     expect(result.riskLevel).toBe('LOW')
     expect(result.requiresIndependentReview).toBe(false)
     expect(result.triggeredRules).toHaveLength(0)
+  })
+
+  // Codex P1: .md でも AI 指示ファイルは CRITICAL
+  it('AGENTS.md → CRITICAL (AI instruction file)', () => {
+    const result = runRiskReview(['AGENTS.md'])
+    expect(result.riskLevel).toBe('CRITICAL')
+    expect(result.triggeredRules).toContain('AI instruction file')
+  })
+
+  it('CLAUDE.md → CRITICAL (AI instruction file)', () => {
+    const result = runRiskReview(['CLAUDE.md'])
+    expect(result.riskLevel).toBe('CRITICAL')
+    expect(result.triggeredRules).toContain('AI instruction file')
+  })
+
+  // Codex P1: docker-compose.yml / sandbox 配下も HIGH
+  it('docker-compose.yml → HIGH', () => {
+    const result = runRiskReview(['docker-compose.yml'])
+    expect(result.riskLevel).toBe('HIGH')
+    expect(result.triggeredRules).toContain('docker / sandbox config')
+  })
+
+  it('sandbox/config.yml → HIGH', () => {
+    const result = runRiskReview(['sandbox/config.yml'])
+    expect(result.riskLevel).toBe('HIGH')
+    expect(result.triggeredRules).toContain('docker / sandbox config')
+  })
+
+  // Codex P1: .github/CODEOWNERS など workflows 以外の .github/ も HIGH
+  it('.github/CODEOWNERS → HIGH (CI/CD workflow change)', () => {
+    const result = runRiskReview(['.github/CODEOWNERS'])
+    expect(result.riskLevel).toBe('HIGH')
+    expect(result.triggeredRules).toContain('CI/CD workflow change')
   })
 
   it('logs-only → LOW', () => {
