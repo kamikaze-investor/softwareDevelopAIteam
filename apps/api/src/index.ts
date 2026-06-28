@@ -22,6 +22,7 @@ import { permissionGrantRoutes } from './routes/permissionGrants'
 import { watchdogEventRoutes } from './routes/watchdogEvents'
 import { dashboardRoutes } from './routes/dashboard'
 import { approvalGateRoutes } from './routes/approvalGate'
+import { knowledgeGraphRoutes } from './routes/knowledgeGraph'
 import { apiTokenAuth } from './auth/apiToken'
 
 const app = Fastify({ logger: true })
@@ -57,6 +58,7 @@ app.register(permissionGrantRoutes, { prefix: '/api' })
 app.register(watchdogEventRoutes, { prefix: '/api' })
 app.register(dashboardRoutes, { prefix: '/api' })
 app.register(approvalGateRoutes, { prefix: '/api' })
+app.register(knowledgeGraphRoutes, { prefix: '/api' })
 
 const PORT = Number(process.env.PORT) || 3000
 
