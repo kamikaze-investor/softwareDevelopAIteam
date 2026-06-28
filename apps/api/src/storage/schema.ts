@@ -199,6 +199,31 @@ export const CREATE_TABLES = `
     task_id TEXT,
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS pattern_records (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    keywords TEXT NOT NULL DEFAULT '[]',
+    description TEXT NOT NULL,
+    steps TEXT NOT NULL DEFAULT '[]',
+    feature_type TEXT NOT NULL DEFAULT '',
+    trigger TEXT NOT NULL DEFAULT 'manual',
+    related_node_ids TEXT NOT NULL DEFAULT '[]',
+    usage_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS feature_dna (
+    node_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL DEFAULT '',
+    source_task_id TEXT,
+    related_task_ids TEXT NOT NULL DEFAULT '[]',
+    ai_notes TEXT NOT NULL DEFAULT '[]',
+    history TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `
 
 /**

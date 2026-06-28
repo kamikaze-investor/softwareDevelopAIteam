@@ -4,6 +4,8 @@ import type { KGNode, KGEdge } from '@ai-team/shared'
 
 let decisionId: string
 let incidentId: string
+let patternId: string
+let dnaNodeId: string
 
 async function buildApp(): Promise<FastifyInstance> {
   process.env.DB_PATH = ':memory:'
@@ -852,5 +854,172 @@ describe('POST /api/kg/risk-lookup', () => {
       payload: { keywords: ['auth'], riskLevel: 'LOW' },
     })
     expect(res.statusCode).toBe(400)
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Pattern Library テスト
+// ────────────────────────────────────────────────────────────
+
+describe('Pattern Library', () => {
+  let app: FastifyInstance
+
+  beforeAll(async () => {
+    app = await buildApp()
+  })
+
+  afterAll(async () => {
+    await app.close()
+  })
+
+  it('POST /api/kg/patterns — 登録して201、id が pat- で始まる', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/patterns',
+      payload: {
+        title: 'Permission Grant 作成パターン',
+        keywords: ['permission', 'grant', 'approval'],
+        description: 'Permission Grant を作る時の標準手順',
+        steps: ['Approval Record を作成', 'Permission Guard を追加', 'Expiration Handling を追加', 'Audit Log を追加'],
+        featureType: 'Permission Grant',
+        trigger: 'high_risk',
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.id).toMatch(/^pat-\d{8}-/)
+    expect(body.usageCount).toBe(0)
+    patternId = body.id
+  })
+
+  it('GET /api/kg/patterns?featureType=Permission Grant — featureType フィルタ', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/kg/patterns?featureType=Permission%20Grant' })
+    expect(res.statusCode).toBe(200)
+    const list = JSON.parse(res.body)
+    expect(list.some((p: any) => p.id === patternId)).toBe(true)
+  })
+
+  it('POST /api/kg/patterns/:id/use — usage_count が増える', async () => {
+    const res = await app.inject({ method: 'POST', url: `/api/kg/patterns/${patternId}/use` })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).usageCount).toBe(1)
+  })
+
+  it('PATCH /api/kg/patterns/:id — title 更新', async () => {
+    const res = await app.inject({
+      method: 'PATCH', url: `/api/kg/patterns/${patternId}`,
+      payload: { title: 'Permission Grant 作成パターン v2' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).title).toBe('Permission Grant 作成パターン v2')
+  })
+
+  it('DELETE /api/kg/patterns/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/api/kg/patterns/${patternId}` })
+    expect(res.statusCode).toBe(204)
+  })
+})
+
+describe('POST /api/kg/pattern-lookup', () => {
+  let app: FastifyInstance
+  let pid: string
+
+  beforeAll(async () => {
+    app = await buildApp()
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/patterns',
+      payload: { title: 'Storage CRUD パターン', keywords: ['storage', 'crud', 'sqlite'], description: 'Storage CRUD 実装手順', steps: ['interface 定義', 'schema 追加', 'sqlite 実装', 'テスト'], featureType: 'Storage', trigger: 'same_feature_type' },
+    })
+    pid = JSON.parse(res.body).id
+  })
+
+  afterAll(async () => {
+    await app.inject({ method: 'DELETE', url: `/api/kg/patterns/${pid}` })
+    await app.close()
+  })
+
+  it('keywords でパターンが返る', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/pattern-lookup',
+      payload: { keywords: ['storage', 'crud'] },
+    })
+    expect(res.statusCode).toBe(200)
+    const body = JSON.parse(res.body)
+    expect(body.patterns.some((p: any) => p.id === pid)).toBe(true)
+    expect(body.matchedKeywords.length).toBeGreaterThan(0)
+  })
+
+  it('featureType でパターンが返る', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/pattern-lookup',
+      payload: { featureType: 'Storage' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).patterns.some((p: any) => p.id === pid)).toBe(true)
+  })
+
+  it('マッチなしでも 200 + 空配列', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/pattern-lookup',
+      payload: { keywords: ['xxxxunmatched'] },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).patterns).toEqual([])
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Feature DNA テスト
+// ────────────────────────────────────────────────────────────
+
+describe('Feature DNA', () => {
+  let app: FastifyInstance
+
+  beforeAll(async () => {
+    app = await buildApp()
+    dnaNodeId = 'kg-test-dna-001'
+  })
+
+  afterAll(async () => {
+    await app.close()
+  })
+
+  it('POST /api/kg/feature-dna — 201', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/feature-dna',
+      payload: { nodeId: dnaNodeId, reason: 'Approval Gate の一回限り消費を保証するため', relatedTaskIds: ['task-001'] },
+    })
+    expect(res.statusCode).toBe(201)
+    expect(JSON.parse(res.body).nodeId).toBe(dnaNodeId)
+  })
+
+  it('POST /api/kg/feature-dna (同nodeId) — 409', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/feature-dna',
+      payload: { nodeId: dnaNodeId, reason: 'duplicate' },
+    })
+    expect(res.statusCode).toBe(409)
+  })
+
+  it('POST /api/kg/feature-dna/:nodeId/history — 履歴追記', async () => {
+    const res = await app.inject({
+      method: 'POST', url: `/api/kg/feature-dna/${dnaNodeId}/history`,
+      payload: { note: 'CONSUMED 状態を追加' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).history.length).toBe(1)
+  })
+
+  it('PATCH /api/kg/feature-dna/:nodeId — reason 更新', async () => {
+    const res = await app.inject({
+      method: 'PATCH', url: `/api/kg/feature-dna/${dnaNodeId}`,
+      payload: { reason: '更新後の理由' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).reason).toBe('更新後の理由')
+  })
+
+  it('DELETE /api/kg/feature-dna/:nodeId — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/api/kg/feature-dna/${dnaNodeId}` })
+    expect(res.statusCode).toBe(204)
   })
 })

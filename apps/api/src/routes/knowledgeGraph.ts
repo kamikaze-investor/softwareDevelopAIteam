@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
-import type { KGContextEntry, KGContextPack, ImpactAnalysisResult, DecisionRecord, IncidentRecord, RiskLookupResult, DecisionStatus, IncidentSeverity } from '@ai-team/shared'
+import type { KGContextEntry, KGContextPack, ImpactAnalysisResult, DecisionRecord, IncidentRecord, RiskLookupResult, DecisionStatus, IncidentSeverity, PatternRecord, FeatureDNA, PatternLookupResult, PatternTrigger } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // Zod スキーマ
@@ -73,6 +73,54 @@ const CreateIncidentSchema = z.object({
   severity: IncidentSeveritySchema.default('medium'),
   relatedNodeIds: z.array(z.string()).default([]),
   taskId: z.string().optional(),
+})
+
+const PatternTriggerSchema = z.enum(['same_feature_type', 'high_risk', 'manual'])
+
+const CreatePatternSchema = z.object({
+  title: z.string().min(1),
+  keywords: z.array(z.string()).default([]),
+  description: z.string().min(1),
+  steps: z.array(z.string()).min(1),
+  featureType: z.string().min(1),
+  trigger: PatternTriggerSchema.default('manual'),
+  relatedNodeIds: z.array(z.string()).default([]),
+  usageCount: z.number().int().min(0).default(0),
+})
+
+const UpdatePatternSchema = z.object({
+  title: z.string().min(1).optional(),
+  keywords: z.array(z.string()).optional(),
+  description: z.string().min(1).optional(),
+  steps: z.array(z.string()).min(1).optional(),
+  featureType: z.string().optional(),
+  trigger: PatternTriggerSchema.optional(),
+  relatedNodeIds: z.array(z.string()).optional(),
+})
+
+const PatternLookupBodySchema = z.object({
+  keywords: z.array(z.string()).optional().default([]),
+  featureType: z.string().optional(),
+})
+
+const CreateFeatureDNASchema = z.object({
+  nodeId: z.string().min(1),
+  reason: z.string().min(1),
+  sourceTaskId: z.string().optional(),
+  relatedTaskIds: z.array(z.string()).default([]),
+  aiNotes: z.array(z.string()).default([]),
+  history: z.array(z.object({ at: z.string(), note: z.string() })).default([]),
+})
+
+const UpdateFeatureDNASchema = z.object({
+  reason: z.string().optional(),
+  sourceTaskId: z.string().optional(),
+  relatedTaskIds: z.array(z.string()).optional(),
+  aiNotes: z.array(z.string()).optional(),
+})
+
+const AppendHistorySchema = z.object({
+  note: z.string().min(1),
 })
 
 const RiskLookupBodySchema = z.object({
@@ -643,5 +691,125 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
       matchedKeywords: Array.from(matchedSet),
     }
     return reply.send(result)
+  })
+
+  // ─── Pattern Library ─────────────────────────────────────
+
+  // POST /api/kg/patterns
+  app.post('/api/kg/patterns', async (req, reply) => {
+    const parsed = CreatePatternSchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const record = getStorage().patternLibrary.create(parsed.data)
+    return reply.status(201).send(record)
+  })
+
+  // GET /api/kg/patterns?featureType=xxx
+  app.get<{ Querystring: { featureType?: string } }>('/api/kg/patterns', async (req, reply) => {
+    const { featureType } = req.query
+    if (featureType) return reply.send(getStorage().patternLibrary.findByFeatureType(featureType))
+    return reply.send(getStorage().patternLibrary.findAll())
+  })
+
+  // GET /api/kg/patterns/:id
+  app.get<{ Params: { id: string } }>('/api/kg/patterns/:id', async (req, reply) => {
+    const record = getStorage().patternLibrary.findById(req.params.id)
+    if (!record) return reply.status(404).send({ error: 'Pattern not found' })
+    return reply.send(record)
+  })
+
+  // PATCH /api/kg/patterns/:id
+  app.patch<{ Params: { id: string } }>('/api/kg/patterns/:id', async (req, reply) => {
+    const parsed = UpdatePatternSchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const updated = getStorage().patternLibrary.update(req.params.id, parsed.data)
+    if (!updated) return reply.status(404).send({ error: 'Pattern not found' })
+    return reply.send(updated)
+  })
+
+  // POST /api/kg/patterns/:id/use — usage_count +1
+  app.post<{ Params: { id: string } }>('/api/kg/patterns/:id/use', async (req, reply) => {
+    const updated = getStorage().patternLibrary.incrementUsage(req.params.id)
+    if (!updated) return reply.status(404).send({ error: 'Pattern not found' })
+    return reply.send(updated)
+  })
+
+  // DELETE /api/kg/patterns/:id
+  app.delete<{ Params: { id: string } }>('/api/kg/patterns/:id', async (req, reply) => {
+    if (!getStorage().patternLibrary.delete(req.params.id)) return reply.status(404).send({ error: 'Pattern not found' })
+    return reply.status(204).send()
+  })
+
+  // POST /api/kg/pattern-lookup — キーワード or featureType でパターン検索
+  app.post('/api/kg/pattern-lookup', async (req, reply) => {
+    const parsed = PatternLookupBodySchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const { keywords, featureType } = parsed.data
+    const pl = getStorage().patternLibrary
+
+    let patterns: PatternRecord[] = []
+    const matchedKeywordsSet = new Set<string>()
+
+    if (featureType) {
+      patterns = pl.findByFeatureType(featureType)
+    }
+    if (keywords.length > 0) {
+      const byKw = pl.findByKeywords(keywords)
+      for (const p of byKw) {
+        if (!patterns.find(existing => existing.id === p.id)) patterns.push(p)
+        for (const kw of keywords) {
+          if (p.keywords.some(k => k.toLowerCase().includes(kw.toLowerCase()))) matchedKeywordsSet.add(kw)
+        }
+      }
+    }
+
+    const result: PatternLookupResult = {
+      patterns,
+      matchedKeywords: Array.from(matchedKeywordsSet),
+    }
+    return reply.send(result)
+  })
+
+  // ─── Feature DNA ──────────────────────────────────────────
+
+  // POST /api/kg/feature-dna
+  app.post('/api/kg/feature-dna', async (req, reply) => {
+    const parsed = CreateFeatureDNASchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const dna = getStorage().featureDNA
+    const existing = dna.findByNodeId(parsed.data.nodeId)
+    if (existing) return reply.status(409).send({ error: 'FeatureDNA for this nodeId already exists' })
+    const record = dna.create(parsed.data)
+    return reply.status(201).send(record)
+  })
+
+  // GET /api/kg/feature-dna/:nodeId
+  app.get<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId', async (req, reply) => {
+    const record = getStorage().featureDNA.findByNodeId(req.params.nodeId)
+    if (!record) return reply.status(404).send({ error: 'FeatureDNA not found' })
+    return reply.send(record)
+  })
+
+  // PATCH /api/kg/feature-dna/:nodeId
+  app.patch<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId', async (req, reply) => {
+    const parsed = UpdateFeatureDNASchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const updated = getStorage().featureDNA.update(req.params.nodeId, parsed.data)
+    if (!updated) return reply.status(404).send({ error: 'FeatureDNA not found' })
+    return reply.send(updated)
+  })
+
+  // POST /api/kg/feature-dna/:nodeId/history — 履歴追記
+  app.post<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId/history', async (req, reply) => {
+    const parsed = AppendHistorySchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const updated = getStorage().featureDNA.appendHistory(req.params.nodeId, parsed.data.note)
+    if (!updated) return reply.status(404).send({ error: 'FeatureDNA not found' })
+    return reply.send(updated)
+  })
+
+  // DELETE /api/kg/feature-dna/:nodeId
+  app.delete<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId', async (req, reply) => {
+    if (!getStorage().featureDNA.delete(req.params.nodeId)) return reply.status(404).send({ error: 'FeatureDNA not found' })
+    return reply.status(204).send()
   })
 }

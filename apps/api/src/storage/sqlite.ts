@@ -9,8 +9,8 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -24,6 +24,12 @@ function makeIncidentId(): string {
   const d = new Date()
   const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
   return `inc-${ymd}-${randomUUID().slice(0,3)}`
+}
+
+function makePatternId(): string {
+  const d = new Date()
+  const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
+  return `pat-${ymd}-${randomUUID().slice(0,3)}`
 }
 
 export function createSQLiteStorage(dbPath: string): IStorage {
@@ -769,7 +775,115 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph, decisionCache, incidentDB }
+  const patternLibrary: IPatternLibraryStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM pattern_records WHERE id = ?').get(id) as any
+      return row ? deserializePatternRecord(row) : undefined
+    },
+    findByKeywords(keywords) {
+      const all = db.prepare('SELECT * FROM pattern_records').all() as any[]
+      return all
+        .map(deserializePatternRecord)
+        .filter(rec =>
+          keywords.some(kw =>
+            rec.keywords.some(rk => rk.toLowerCase().includes(kw.toLowerCase()))
+          )
+        )
+    },
+    findByFeatureType(featureType) {
+      const rows = db.prepare('SELECT * FROM pattern_records WHERE feature_type = ? ORDER BY usage_count DESC').all(featureType) as any[]
+      return rows.map(deserializePatternRecord)
+    },
+    findAll() {
+      const rows = db.prepare('SELECT * FROM pattern_records ORDER BY usage_count DESC, created_at DESC').all() as any[]
+      return rows.map(deserializePatternRecord)
+    },
+    create(data) {
+      const record: PatternRecord = { ...data, id: makePatternId(), createdAt: now(), updatedAt: now() }
+      db.prepare(`
+        INSERT INTO pattern_records
+          (id, title, keywords, description, steps, feature_type, trigger, related_node_ids, usage_count, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id, record.title, JSON.stringify(record.keywords), record.description,
+        JSON.stringify(record.steps), record.featureType, record.trigger,
+        JSON.stringify(record.relatedNodeIds), record.usageCount, record.createdAt, record.updatedAt,
+      )
+      return record
+    },
+    update(id, data) {
+      const existing = this.findById(id)
+      if (!existing) return undefined
+      const updated = { ...existing, ...data, updatedAt: now() }
+      db.prepare(`
+        UPDATE pattern_records
+        SET title=?, keywords=?, description=?, steps=?, feature_type=?, trigger=?, related_node_ids=?, usage_count=?, updated_at=?
+        WHERE id=?
+      `).run(
+        updated.title, JSON.stringify(updated.keywords), updated.description,
+        JSON.stringify(updated.steps), updated.featureType, updated.trigger,
+        JSON.stringify(updated.relatedNodeIds), updated.usageCount, updated.updatedAt, id,
+      )
+      return updated
+    },
+    incrementUsage(id) {
+      db.prepare('UPDATE pattern_records SET usage_count = usage_count + 1, updated_at = ? WHERE id = ?').run(now(), id)
+      return this.findById(id)
+    },
+    delete(id) {
+      return db.prepare('DELETE FROM pattern_records WHERE id = ?').run(id).changes > 0
+    },
+  }
+
+  const featureDNA: IFeatureDNAStorage = {
+    findByNodeId(nodeId) {
+      const row = db.prepare('SELECT * FROM feature_dna WHERE node_id = ?').get(nodeId) as any
+      return row ? deserializeFeatureDNA(row) : undefined
+    },
+    findAll() {
+      const rows = db.prepare('SELECT * FROM feature_dna ORDER BY created_at DESC').all() as any[]
+      return rows.map(deserializeFeatureDNA)
+    },
+    create(data) {
+      const record: FeatureDNA = { ...data, createdAt: now(), updatedAt: now() }
+      db.prepare(`
+        INSERT INTO feature_dna
+          (node_id, reason, source_task_id, related_task_ids, ai_notes, history, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.nodeId, record.reason, record.sourceTaskId ?? null,
+        JSON.stringify(record.relatedTaskIds), JSON.stringify(record.aiNotes),
+        JSON.stringify(record.history), record.createdAt, record.updatedAt,
+      )
+      return record
+    },
+    update(nodeId, data) {
+      const existing = this.findByNodeId(nodeId)
+      if (!existing) return undefined
+      const updated = { ...existing, ...data, updatedAt: now() }
+      db.prepare(`
+        UPDATE feature_dna
+        SET reason=?, source_task_id=?, related_task_ids=?, ai_notes=?, history=?, updated_at=?
+        WHERE node_id=?
+      `).run(
+        updated.reason, updated.sourceTaskId ?? null,
+        JSON.stringify(updated.relatedTaskIds), JSON.stringify(updated.aiNotes),
+        JSON.stringify(updated.history), updated.updatedAt, nodeId,
+      )
+      return updated
+    },
+    appendHistory(nodeId, note) {
+      const existing = this.findByNodeId(nodeId)
+      if (!existing) return undefined
+      const history = [...existing.history, { at: now(), note }]
+      return this.update(nodeId, { history })
+    },
+    delete(nodeId) {
+      return db.prepare('DELETE FROM feature_dna WHERE node_id = ?').run(nodeId).changes > 0
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA }
 }
 
 function deserializeProject(row: any): Project {
@@ -986,6 +1100,35 @@ function deserializeKGEdge(row: any): KGEdge {
     edgeType: row.edge_type as KGEdgeType,
     label: row.label ?? undefined,
     createdAt: row.created_at,
+  }
+}
+
+function deserializePatternRecord(row: any): PatternRecord {
+  return {
+    id: row.id,
+    title: row.title,
+    keywords: JSON.parse(row.keywords ?? '[]'),
+    description: row.description,
+    steps: JSON.parse(row.steps ?? '[]'),
+    featureType: row.feature_type,
+    trigger: row.trigger as PatternTrigger,
+    relatedNodeIds: JSON.parse(row.related_node_ids ?? '[]'),
+    usageCount: row.usage_count,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function deserializeFeatureDNA(row: any): FeatureDNA {
+  return {
+    nodeId: row.node_id,
+    reason: row.reason,
+    sourceTaskId: row.source_task_id ?? undefined,
+    relatedTaskIds: JSON.parse(row.related_task_ids ?? '[]'),
+    aiNotes: JSON.parse(row.ai_notes ?? '[]'),
+    history: JSON.parse(row.history ?? '[]'),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   }
 }
 

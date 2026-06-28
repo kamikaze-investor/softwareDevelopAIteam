@@ -8,7 +8,7 @@
  */
 
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus } from '@ai-team/shared'
-import type { KGNode, KGEdge, KGNodeType, KGEdgeType } from '@ai-team/shared'
+import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger } from '@ai-team/shared'
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -95,6 +95,44 @@ export interface IKnowledgeGraphStorage {
   deleteEdge(id: string): boolean
 }
 
+export interface IDecisionCacheStorage {
+  findById(id: string): DecisionRecord | undefined
+  findByKeywords(keywords: string[]): DecisionRecord[]
+  findAll(): DecisionRecord[]
+  create(data: Omit<DecisionRecord, 'id' | 'createdAt' | 'updatedAt'>): DecisionRecord
+  update(id: string, data: Partial<Omit<DecisionRecord, 'id' | 'createdAt'>>): DecisionRecord | undefined
+  delete(id: string): boolean
+}
+
+export interface IIncidentDBStorage {
+  findById(id: string): IncidentRecord | undefined
+  findByKeywords(keywords: string[]): IncidentRecord[]
+  findBySeverity(severity: IncidentSeverity): IncidentRecord[]
+  findAll(): IncidentRecord[]
+  create(data: Omit<IncidentRecord, 'id' | 'createdAt'>): IncidentRecord
+  delete(id: string): boolean
+}
+
+export interface IPatternLibraryStorage {
+  findById(id: string): PatternRecord | undefined
+  findByKeywords(keywords: string[]): PatternRecord[]
+  findByFeatureType(featureType: string): PatternRecord[]
+  findAll(): PatternRecord[]
+  create(data: Omit<PatternRecord, 'id' | 'createdAt' | 'updatedAt'>): PatternRecord
+  update(id: string, data: Partial<Omit<PatternRecord, 'id' | 'createdAt'>>): PatternRecord | undefined
+  incrementUsage(id: string): PatternRecord | undefined
+  delete(id: string): boolean
+}
+
+export interface IFeatureDNAStorage {
+  findByNodeId(nodeId: string): FeatureDNA | undefined
+  findAll(): FeatureDNA[]
+  create(data: Omit<FeatureDNA, 'createdAt' | 'updatedAt'>): FeatureDNA
+  update(nodeId: string, data: Partial<Omit<FeatureDNA, 'nodeId' | 'createdAt'>>): FeatureDNA | undefined
+  appendHistory(nodeId: string, note: string): FeatureDNA | undefined
+  delete(nodeId: string): boolean
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -106,4 +144,8 @@ export interface IStorage {
   watchdogEvents: IWatchdogEventStorage
   approvalRequests: IApprovalRequestStorage
   knowledgeGraph: IKnowledgeGraphStorage
+  decisionCache: IDecisionCacheStorage
+  incidentDB: IIncidentDBStorage
+  patternLibrary: IPatternLibraryStorage
+  featureDNA: IFeatureDNAStorage
 }
