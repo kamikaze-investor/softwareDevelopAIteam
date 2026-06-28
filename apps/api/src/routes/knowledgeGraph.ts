@@ -85,7 +85,6 @@ const CreatePatternSchema = z.object({
   featureType: z.string().min(1),
   trigger: PatternTriggerSchema.default('manual'),
   relatedNodeIds: z.array(z.string()).default([]),
-  usageCount: z.number().int().min(0).default(0),
 })
 
 const UpdatePatternSchema = z.object({
@@ -146,8 +145,8 @@ const CreateReflectionSchema = z.object({
 export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> {
   // ── Node CRUD ──────────────────────────────────────────────
 
-  // POST /api/kg/nodes — Node 作成
-  app.post('/api/kg/nodes', async (request, reply) => {
+  // POST /kg/nodes — Node 作成
+  app.post('/kg/nodes', async (request, reply) => {
     const parseResult = CreateNodeSchema.safeParse(request.body)
     if (!parseResult.success) {
       return reply.status(400).send({ error: 'Validation error', details: parseResult.error.issues })
@@ -157,8 +156,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.status(201).send(node)
   })
 
-  // GET /api/kg/nodes?type=&phase=&tag= — Node 一覧
-  app.get('/api/kg/nodes', async (request, reply) => {
+  // GET /kg/nodes?type=&phase=&tag= — Node 一覧
+  app.get('/kg/nodes', async (request, reply) => {
     const query = request.query as Record<string, string>
     const storage = getStorage()
     const kg = storage.knowledgeGraph
@@ -183,8 +182,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(all)
   })
 
-  // GET /api/kg/nodes/:id — 単体取得
-  app.get('/api/kg/nodes/:id', async (request, reply) => {
+  // GET /kg/nodes/:id — 単体取得
+  app.get('/kg/nodes/:id', async (request, reply) => {
     const { id } = request.params as { id: string }
     const node = getStorage().knowledgeGraph.findNodeById(id)
     if (!node) {
@@ -193,8 +192,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(node)
   })
 
-  // PATCH /api/kg/nodes/:id — Node 更新
-  app.patch('/api/kg/nodes/:id', async (request, reply) => {
+  // PATCH /kg/nodes/:id — Node 更新
+  app.patch('/kg/nodes/:id', async (request, reply) => {
     const { id } = request.params as { id: string }
     const parseResult = UpdateNodeSchema.safeParse(request.body)
     if (!parseResult.success) {
@@ -207,8 +206,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(node)
   })
 
-  // DELETE /api/kg/nodes/:id — Node 削除
-  app.delete('/api/kg/nodes/:id', async (request, reply) => {
+  // DELETE /kg/nodes/:id — Node 削除
+  app.delete('/kg/nodes/:id', async (request, reply) => {
     const { id } = request.params as { id: string }
     const deleted = getStorage().knowledgeGraph.deleteNode(id)
     if (!deleted) {
@@ -219,8 +218,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ── Edge CRUD ──────────────────────────────────────────────
 
-  // POST /api/kg/edges — Edge 作成
-  app.post('/api/kg/edges', async (request, reply) => {
+  // POST /kg/edges — Edge 作成
+  app.post('/kg/edges', async (request, reply) => {
     const parseResult = CreateEdgeSchema.safeParse(request.body)
     if (!parseResult.success) {
       return reply.status(400).send({ error: 'Validation error', details: parseResult.error.issues })
@@ -240,8 +239,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.status(201).send(edge)
   })
 
-  // GET /api/kg/edges?fromNodeId=&toNodeId=&type= — Edge 一覧
-  app.get('/api/kg/edges', async (request, reply) => {
+  // GET /kg/edges?fromNodeId=&toNodeId=&type= — Edge 一覧
+  app.get('/kg/edges', async (request, reply) => {
     const query = request.query as Record<string, string>
     const kg = getStorage().knowledgeGraph
 
@@ -265,8 +264,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(all)
   })
 
-  // GET /api/kg/edges/:id — 単体取得
-  app.get('/api/kg/edges/:id', async (request, reply) => {
+  // GET /kg/edges/:id — 単体取得
+  app.get('/kg/edges/:id', async (request, reply) => {
     const { id } = request.params as { id: string }
     const edge = getStorage().knowledgeGraph.findEdgeById(id)
     if (!edge) {
@@ -275,8 +274,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(edge)
   })
 
-  // DELETE /api/kg/edges/:id — Edge 削除
-  app.delete('/api/kg/edges/:id', async (request, reply) => {
+  // DELETE /kg/edges/:id — Edge 削除
+  app.delete('/kg/edges/:id', async (request, reply) => {
     const { id } = request.params as { id: string }
     const deleted = getStorage().knowledgeGraph.deleteEdge(id)
     if (!deleted) {
@@ -287,8 +286,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ── Timeline Map ───────────────────────────────────────────
 
-  // GET /api/kg/timeline — CEO向け集約ビュー
-  app.get('/api/kg/timeline', async (_request, reply) => {
+  // GET /kg/timeline — CEO向け集約ビュー
+  app.get('/kg/timeline', async (_request, reply) => {
     const kg = getStorage().knowledgeGraph
     const allTypes = ['feature', 'phase', 'task', 'decision', 'incident', 'file', 'doc'] as const
     const allNodes = allTypes.flatMap((t) => kg.findNodesByType(t))
@@ -365,8 +364,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ── Node Detail ────────────────────────────────────────────
 
-  // GET /api/kg/nodes/:id/detail — ノード詳細 + 関連エッジ
-  app.get('/api/kg/nodes/:id/detail', async (request, reply) => {
+  // GET /kg/nodes/:id/detail — ノード詳細 + 関連エッジ
+  app.get('/kg/nodes/:id/detail', async (request, reply) => {
     const { id } = request.params as { id: string }
     const kg = getStorage().knowledgeGraph
     const node = kg.findNodeById(id)
@@ -387,8 +386,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     maxEntries: z.number().int().min(1).max(50).default(20),
   })
 
-  // POST /api/kg/context-pack — Context Pack 生成
-  app.post('/api/kg/context-pack', async (request, reply) => {
+  // POST /kg/context-pack — Context Pack 生成
+  app.post('/kg/context-pack', async (request, reply) => {
     const parseResult = KGContextPackBodySchema.safeParse(request.body)
     if (!parseResult.success) {
       return reply.status(400).send({ error: 'Validation error', details: parseResult.error.issues })
@@ -508,8 +507,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     taskId: z.string().optional(),
   })
 
-  // POST /api/kg/impact — Impact Analysis
-  app.post('/api/kg/impact', async (request, reply) => {
+  // POST /kg/impact — Impact Analysis
+  app.post('/kg/impact', async (request, reply) => {
     const parseResult = ImpactAnalysisBody.safeParse(request.body)
     if (!parseResult.success) {
       return reply.status(400).send({ error: 'Validation error', details: parseResult.error.issues })
@@ -522,10 +521,12 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     const allTypes = ['feature', 'phase', 'task', 'decision', 'incident', 'file', 'doc'] as const
     const allNodes = allTypes.flatMap((t) => kg.findNodesByType(t))
 
+    // パス区切り文字を '/' に正規化して完全一致
+    const normalizeFilePath = (p: string) => p.replace(/\\/g, '/')
+    const changedFilesNormalized = new Set(changedFiles.map(normalizeFilePath))
+
     const matchedNodes = allNodes.filter((node) =>
-      node.relatedFiles.some((rf) =>
-        changedFiles.some((cf) => cf === rf || cf.includes(rf) || rf.includes(cf)),
-      ),
+      node.relatedFiles.some((rf) => changedFilesNormalized.has(normalizeFilePath(rf))),
     )
 
     const impactedSet = new Map(matchedNodes.map((n) => [n.id, n]))
@@ -604,8 +605,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ─── Decision Cache ─────────────────────────────────────────
 
-  // POST /api/kg/decisions
-  app.post('/api/kg/decisions', async (req, reply) => {
+  // POST /kg/decisions
+  app.post('/kg/decisions', async (req, reply) => {
     const parsed = CreateDecisionSchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const storage = getStorage()
@@ -613,20 +614,20 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.status(201).send(record)
   })
 
-  // GET /api/kg/decisions
-  app.get('/api/kg/decisions', async (_req, reply) => {
+  // GET /kg/decisions
+  app.get('/kg/decisions', async (_req, reply) => {
     return reply.send(getStorage().decisionCache.findAll())
   })
 
-  // GET /api/kg/decisions/:id
-  app.get<{ Params: { id: string } }>('/api/kg/decisions/:id', async (req, reply) => {
+  // GET /kg/decisions/:id
+  app.get<{ Params: { id: string } }>('/kg/decisions/:id', async (req, reply) => {
     const record = getStorage().decisionCache.findById(req.params.id)
     if (!record) return reply.status(404).send({ error: 'Decision record not found' })
     return reply.send(record)
   })
 
-  // PATCH /api/kg/decisions/:id
-  app.patch<{ Params: { id: string } }>('/api/kg/decisions/:id', async (req, reply) => {
+  // PATCH /kg/decisions/:id
+  app.patch<{ Params: { id: string } }>('/kg/decisions/:id', async (req, reply) => {
     const parsed = UpdateDecisionSchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const updated = getStorage().decisionCache.update(req.params.id, parsed.data)
@@ -634,8 +635,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(updated)
   })
 
-  // DELETE /api/kg/decisions/:id
-  app.delete<{ Params: { id: string } }>('/api/kg/decisions/:id', async (req, reply) => {
+  // DELETE /kg/decisions/:id
+  app.delete<{ Params: { id: string } }>('/kg/decisions/:id', async (req, reply) => {
     const deleted = getStorage().decisionCache.delete(req.params.id)
     if (!deleted) return reply.status(404).send({ error: 'Decision record not found' })
     return reply.status(204).send()
@@ -643,16 +644,16 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ─── Incident DB ─────────────────────────────────────────────
 
-  // POST /api/kg/incidents
-  app.post('/api/kg/incidents', async (req, reply) => {
+  // POST /kg/incidents
+  app.post('/kg/incidents', async (req, reply) => {
     const parsed = CreateIncidentSchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const record = getStorage().incidentDB.create(parsed.data)
     return reply.status(201).send(record)
   })
 
-  // GET /api/kg/incidents?severity=xxx
-  app.get<{ Querystring: { severity?: string } }>('/api/kg/incidents', async (req, reply) => {
+  // GET /kg/incidents?severity=xxx
+  app.get<{ Querystring: { severity?: string } }>('/kg/incidents', async (req, reply) => {
     const { severity } = req.query
     if (severity) {
       const parsed = IncidentSeveritySchema.safeParse(severity)
@@ -662,15 +663,15 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(getStorage().incidentDB.findAll())
   })
 
-  // GET /api/kg/incidents/:id
-  app.get<{ Params: { id: string } }>('/api/kg/incidents/:id', async (req, reply) => {
+  // GET /kg/incidents/:id
+  app.get<{ Params: { id: string } }>('/kg/incidents/:id', async (req, reply) => {
     const record = getStorage().incidentDB.findById(req.params.id)
     if (!record) return reply.status(404).send({ error: 'Incident record not found' })
     return reply.send(record)
   })
 
-  // DELETE /api/kg/incidents/:id
-  app.delete<{ Params: { id: string } }>('/api/kg/incidents/:id', async (req, reply) => {
+  // DELETE /kg/incidents/:id
+  app.delete<{ Params: { id: string } }>('/kg/incidents/:id', async (req, reply) => {
     const deleted = getStorage().incidentDB.delete(req.params.id)
     if (!deleted) return reply.status(404).send({ error: 'Incident record not found' })
     return reply.status(204).send()
@@ -678,8 +679,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ─── Risk Lookup (HIGH/CRITICAL のみ) ────────────────────
 
-  // POST /api/kg/risk-lookup
-  app.post('/api/kg/risk-lookup', async (req, reply) => {
+  // POST /kg/risk-lookup
+  app.post('/kg/risk-lookup', async (req, reply) => {
     const parsed = RiskLookupBodySchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const { keywords } = parsed.data
@@ -706,30 +707,30 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ─── Pattern Library ─────────────────────────────────────
 
-  // POST /api/kg/patterns
-  app.post('/api/kg/patterns', async (req, reply) => {
+  // POST /kg/patterns
+  app.post('/kg/patterns', async (req, reply) => {
     const parsed = CreatePatternSchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
-    const record = getStorage().patternLibrary.create(parsed.data)
+    const record = getStorage().patternLibrary.create({ ...parsed.data, usageCount: 0 })
     return reply.status(201).send(record)
   })
 
-  // GET /api/kg/patterns?featureType=xxx
-  app.get<{ Querystring: { featureType?: string } }>('/api/kg/patterns', async (req, reply) => {
+  // GET /kg/patterns?featureType=xxx
+  app.get<{ Querystring: { featureType?: string } }>('/kg/patterns', async (req, reply) => {
     const { featureType } = req.query
     if (featureType) return reply.send(getStorage().patternLibrary.findByFeatureType(featureType))
     return reply.send(getStorage().patternLibrary.findAll())
   })
 
-  // GET /api/kg/patterns/:id
-  app.get<{ Params: { id: string } }>('/api/kg/patterns/:id', async (req, reply) => {
+  // GET /kg/patterns/:id
+  app.get<{ Params: { id: string } }>('/kg/patterns/:id', async (req, reply) => {
     const record = getStorage().patternLibrary.findById(req.params.id)
     if (!record) return reply.status(404).send({ error: 'Pattern not found' })
     return reply.send(record)
   })
 
-  // PATCH /api/kg/patterns/:id
-  app.patch<{ Params: { id: string } }>('/api/kg/patterns/:id', async (req, reply) => {
+  // PATCH /kg/patterns/:id
+  app.patch<{ Params: { id: string } }>('/kg/patterns/:id', async (req, reply) => {
     const parsed = UpdatePatternSchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const updated = getStorage().patternLibrary.update(req.params.id, parsed.data)
@@ -737,21 +738,21 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(updated)
   })
 
-  // POST /api/kg/patterns/:id/use — usage_count +1
-  app.post<{ Params: { id: string } }>('/api/kg/patterns/:id/use', async (req, reply) => {
+  // POST /kg/patterns/:id/use — usage_count +1
+  app.post<{ Params: { id: string } }>('/kg/patterns/:id/use', async (req, reply) => {
     const updated = getStorage().patternLibrary.incrementUsage(req.params.id)
     if (!updated) return reply.status(404).send({ error: 'Pattern not found' })
     return reply.send(updated)
   })
 
-  // DELETE /api/kg/patterns/:id
-  app.delete<{ Params: { id: string } }>('/api/kg/patterns/:id', async (req, reply) => {
+  // DELETE /kg/patterns/:id
+  app.delete<{ Params: { id: string } }>('/kg/patterns/:id', async (req, reply) => {
     if (!getStorage().patternLibrary.delete(req.params.id)) return reply.status(404).send({ error: 'Pattern not found' })
     return reply.status(204).send()
   })
 
-  // POST /api/kg/pattern-lookup — キーワード or featureType でパターン検索
-  app.post('/api/kg/pattern-lookup', async (req, reply) => {
+  // POST /kg/pattern-lookup — キーワード or featureType でパターン検索
+  app.post('/kg/pattern-lookup', async (req, reply) => {
     const parsed = PatternLookupBodySchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const { keywords, featureType } = parsed.data
@@ -782,8 +783,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // ─── Feature DNA ──────────────────────────────────────────
 
-  // POST /api/kg/feature-dna
-  app.post('/api/kg/feature-dna', async (req, reply) => {
+  // POST /kg/feature-dna
+  app.post('/kg/feature-dna', async (req, reply) => {
     const parsed = CreateFeatureDNASchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const dna = getStorage().featureDNA
@@ -793,15 +794,15 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.status(201).send(record)
   })
 
-  // GET /api/kg/feature-dna/:nodeId
-  app.get<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId', async (req, reply) => {
+  // GET /kg/feature-dna/:nodeId
+  app.get<{ Params: { nodeId: string } }>('/kg/feature-dna/:nodeId', async (req, reply) => {
     const record = getStorage().featureDNA.findByNodeId(req.params.nodeId)
     if (!record) return reply.status(404).send({ error: 'FeatureDNA not found' })
     return reply.send(record)
   })
 
-  // PATCH /api/kg/feature-dna/:nodeId
-  app.patch<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId', async (req, reply) => {
+  // PATCH /kg/feature-dna/:nodeId
+  app.patch<{ Params: { nodeId: string } }>('/kg/feature-dna/:nodeId', async (req, reply) => {
     const parsed = UpdateFeatureDNASchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const updated = getStorage().featureDNA.update(req.params.nodeId, parsed.data)
@@ -809,8 +810,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(updated)
   })
 
-  // POST /api/kg/feature-dna/:nodeId/history — 履歴追記
-  app.post<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId/history', async (req, reply) => {
+  // POST /kg/feature-dna/:nodeId/history — 履歴追記
+  app.post<{ Params: { nodeId: string } }>('/kg/feature-dna/:nodeId/history', async (req, reply) => {
     const parsed = AppendHistorySchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const updated = getStorage().featureDNA.appendHistory(req.params.nodeId, parsed.data.note)
@@ -818,24 +819,24 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(updated)
   })
 
-  // DELETE /api/kg/feature-dna/:nodeId
-  app.delete<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId', async (req, reply) => {
+  // DELETE /kg/feature-dna/:nodeId
+  app.delete<{ Params: { nodeId: string } }>('/kg/feature-dna/:nodeId', async (req, reply) => {
     if (!getStorage().featureDNA.delete(req.params.nodeId)) return reply.status(404).send({ error: 'FeatureDNA not found' })
     return reply.status(204).send()
   })
 
   // ─── Self Reflection ──────────────────────────────────────
 
-  // POST /api/kg/reflections
-  app.post('/api/kg/reflections', async (req, reply) => {
+  // POST /kg/reflections
+  app.post('/kg/reflections', async (req, reply) => {
     const parsed = CreateReflectionSchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     const record = getStorage().selfReflection.create(parsed.data)
     return reply.status(201).send(record)
   })
 
-  // GET /api/kg/reflections?trigger=xxx&taskId=yyy
-  app.get<{ Querystring: { trigger?: string; taskId?: string } }>('/api/kg/reflections', async (req, reply) => {
+  // GET /kg/reflections?trigger=xxx&taskId=yyy
+  app.get<{ Querystring: { trigger?: string; taskId?: string } }>('/kg/reflections', async (req, reply) => {
     const { trigger, taskId } = req.query
     if (taskId) return reply.send(getStorage().selfReflection.findByTaskId(taskId))
     if (trigger) {
@@ -846,23 +847,23 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     return reply.send(getStorage().selfReflection.findAll())
   })
 
-  // GET /api/kg/reflections/:id
-  app.get<{ Params: { id: string } }>('/api/kg/reflections/:id', async (req, reply) => {
+  // GET /kg/reflections/:id
+  app.get<{ Params: { id: string } }>('/kg/reflections/:id', async (req, reply) => {
     const record = getStorage().selfReflection.findById(req.params.id)
     if (!record) return reply.status(404).send({ error: 'Reflection not found' })
     return reply.send(record)
   })
 
-  // DELETE /api/kg/reflections/:id
-  app.delete<{ Params: { id: string } }>('/api/kg/reflections/:id', async (req, reply) => {
+  // DELETE /kg/reflections/:id
+  app.delete<{ Params: { id: string } }>('/kg/reflections/:id', async (req, reply) => {
     if (!getStorage().selfReflection.delete(req.params.id)) return reply.status(404).send({ error: 'Reflection not found' })
     return reply.status(204).send()
   })
 
   // ─── Project Health Score（リアルタイム算出、保存なし）────
 
-  // GET /api/kg/health-score
-  app.get('/api/kg/health-score', async (_req, reply) => {
+  // GET /kg/health-score
+  app.get('/kg/health-score', async (_req, reply) => {
     const storage = getStorage()
     const nodes = storage.knowledgeGraph.findNodesByType('feature')
       .concat(storage.knowledgeGraph.findNodesByType('phase'))
@@ -896,7 +897,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
       memoryHealth,
       openRisks: highRiskActive,
       blockedTasks: inboxCount,
-      approvalWaiting: 0,
+      approvalWaiting: null,
+      approvalWaitingAvailable: false,
       calculatedAt: new Date().toISOString(),
     }
     return reply.send(score)

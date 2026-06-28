@@ -283,8 +283,10 @@ export interface ProjectHealthScore {
   openRisks: number
   /** status=inbox のノード数（未分類） */
   blockedTasks: number
-  /** WAITING_FOR_USER 状態の ApprovalRequest 数 */
-  approvalWaiting: number
+  /** 承認待ち件数。取得不能な場合は null */
+  approvalWaiting: number | null
+  /** approvalWaiting が実際に取得されたか（false の場合は null が入る） */
+  approvalWaitingAvailable: boolean
   calculatedAt: string
 }
 

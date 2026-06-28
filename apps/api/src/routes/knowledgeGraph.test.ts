@@ -1,4 +1,4 @@
-import Fastify, { type FastifyInstance } from 'fastify'
+﻿import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeAll, afterAll, beforeEach, describe, expect, it } from 'vitest'
 import type { KGNode, KGEdge } from '@ai-team/shared'
 
@@ -56,7 +56,7 @@ const BASE_NODE_PAYLOAD = {
 async function createNode(app: FastifyInstance, overrides: Record<string, unknown> = {}): Promise<KGNode> {
   const res = await app.inject({
     method: 'POST',
-    url: '/api/kg/nodes',
+    url: '/kg/nodes',
     payload: { ...BASE_NODE_PAYLOAD, ...overrides },
   })
   expect(res.statusCode).toBe(201)
@@ -68,8 +68,8 @@ async function createNode(app: FastifyInstance, overrides: Record<string, unknow
 // ────────────────────────────────────────────────────────────
 
 describe('Knowledge Graph Nodes', () => {
-  // 1. POST /api/kg/nodes — feature ノード作成 → 201 + id が kg- で始まる
-  it('POST /api/kg/nodes — feature ノード作成 → 201 + id が kg- で始まる', async () => {
+  // 1. POST /kg/nodes — feature ノード作成 → 201 + id が kg- で始まる
+  it('POST /kg/nodes — feature ノード作成 → 201 + id が kg- で始まる', async () => {
     await withApp(async (app) => {
       const node = await createNode(app)
       expect(node.id).toMatch(/^kg-/)
@@ -78,8 +78,8 @@ describe('Knowledge Graph Nodes', () => {
     })
   })
 
-  // 2. POST /api/kg/nodes — phase 未指定 → status='inbox'
-  it('POST /api/kg/nodes — phase 未指定 → status="inbox"', async () => {
+  // 2. POST /kg/nodes — phase 未指定 → status='inbox'
+  it('POST /kg/nodes — phase 未指定 → status="inbox"', async () => {
     await withApp(async (app) => {
       const node = await createNode(app)
       expect(node.phase).toBeUndefined()
@@ -87,13 +87,13 @@ describe('Knowledge Graph Nodes', () => {
     })
   })
 
-  // 3. GET /api/kg/nodes?type=feature — type フィルタで絞り込める
-  it('GET /api/kg/nodes?type=feature — type フィルタで絞り込める', async () => {
+  // 3. GET /kg/nodes?type=feature — type フィルタで絞り込める
+  it('GET /kg/nodes?type=feature — type フィルタで絞り込める', async () => {
     await withApp(async (app) => {
       await createNode(app, { type: 'feature', title: 'Feature A' })
       await createNode(app, { type: 'phase', title: 'Phase 1' })
 
-      const res = await app.inject({ method: 'GET', url: '/api/kg/nodes?type=feature' })
+      const res = await app.inject({ method: 'GET', url: '/kg/nodes?type=feature' })
       expect(res.statusCode).toBe(200)
       const nodes = parseBody<KGNode[]>(res.body)
       expect(nodes.every((n) => n.type === 'feature')).toBe(true)
@@ -101,13 +101,13 @@ describe('Knowledge Graph Nodes', () => {
     })
   })
 
-  // 4. GET /api/kg/nodes?phase=phase-1 — phase フィルタで絞り込める
-  it('GET /api/kg/nodes?phase=phase-1 — phase フィルタで絞り込める', async () => {
+  // 4. GET /kg/nodes?phase=phase-1 — phase フィルタで絞り込める
+  it('GET /kg/nodes?phase=phase-1 — phase フィルタで絞り込める', async () => {
     await withApp(async (app) => {
       await createNode(app, { phase: 'phase-1', title: 'In Phase 1' })
       await createNode(app, { phase: 'phase-2', title: 'In Phase 2' })
 
-      const res = await app.inject({ method: 'GET', url: '/api/kg/nodes?phase=phase-1' })
+      const res = await app.inject({ method: 'GET', url: '/kg/nodes?phase=phase-1' })
       expect(res.statusCode).toBe(200)
       const nodes = parseBody<KGNode[]>(res.body)
       expect(nodes.every((n) => n.phase === 'phase-1')).toBe(true)
@@ -115,11 +115,11 @@ describe('Knowledge Graph Nodes', () => {
     })
   })
 
-  // 5. GET /api/kg/nodes/:id — 単体取得
-  it('GET /api/kg/nodes/:id — 単体取得', async () => {
+  // 5. GET /kg/nodes/:id — 単体取得
+  it('GET /kg/nodes/:id — 単体取得', async () => {
     await withApp(async (app) => {
       const created = await createNode(app)
-      const res = await app.inject({ method: 'GET', url: `/api/kg/nodes/${created.id}` })
+      const res = await app.inject({ method: 'GET', url: `/kg/nodes/${created.id}` })
       expect(res.statusCode).toBe(200)
       const node = parseBody<KGNode>(res.body)
       expect(node.id).toBe(created.id)
@@ -127,16 +127,16 @@ describe('Knowledge Graph Nodes', () => {
     })
   })
 
-  // 6. GET /api/kg/nodes/:id — 存在しない ID → 404
-  it('GET /api/kg/nodes/:id — 存在しない ID → 404', async () => {
+  // 6. GET /kg/nodes/:id — 存在しない ID → 404
+  it('GET /kg/nodes/:id — 存在しない ID → 404', async () => {
     await withApp(async (app) => {
-      const res = await app.inject({ method: 'GET', url: '/api/kg/nodes/nonexistent-id' })
+      const res = await app.inject({ method: 'GET', url: '/kg/nodes/nonexistent-id' })
       expect(res.statusCode).toBe(404)
     })
   })
 
-  // 7. PATCH /api/kg/nodes/:id — title 更新 → updatedAt が変わる
-  it('PATCH /api/kg/nodes/:id — title 更新 → updatedAt が変わる', async () => {
+  // 7. PATCH /kg/nodes/:id — title 更新 → updatedAt が変わる
+  it('PATCH /kg/nodes/:id — title 更新 → updatedAt が変わる', async () => {
     await withApp(async (app) => {
       const created = await createNode(app)
       // 時間差を確保
@@ -144,7 +144,7 @@ describe('Knowledge Graph Nodes', () => {
 
       const res = await app.inject({
         method: 'PATCH',
-        url: `/api/kg/nodes/${created.id}`,
+        url: `/kg/nodes/${created.id}`,
         payload: { title: '更新後タイトル' },
       })
       expect(res.statusCode).toBe(200)
@@ -154,15 +154,15 @@ describe('Knowledge Graph Nodes', () => {
     })
   })
 
-  // 8. DELETE /api/kg/nodes/:id → 204
-  it('DELETE /api/kg/nodes/:id → 204', async () => {
+  // 8. DELETE /kg/nodes/:id → 204
+  it('DELETE /kg/nodes/:id → 204', async () => {
     await withApp(async (app) => {
       const created = await createNode(app)
-      const res = await app.inject({ method: 'DELETE', url: `/api/kg/nodes/${created.id}` })
+      const res = await app.inject({ method: 'DELETE', url: `/kg/nodes/${created.id}` })
       expect(res.statusCode).toBe(204)
 
       // 削除後は 404
-      const getRes = await app.inject({ method: 'GET', url: `/api/kg/nodes/${created.id}` })
+      const getRes = await app.inject({ method: 'GET', url: `/kg/nodes/${created.id}` })
       expect(getRes.statusCode).toBe(404)
     })
   })
@@ -182,7 +182,7 @@ describe('Knowledge Graph Nodes', () => {
         historyRefs: ['ref-1'],
       }
       const created = await createNode(app, payload)
-      const res = await app.inject({ method: 'GET', url: `/api/kg/nodes/${created.id}` })
+      const res = await app.inject({ method: 'GET', url: `/kg/nodes/${created.id}` })
       const node = parseBody<KGNode>(res.body)
       expect(node.tags).toEqual(['alpha', 'beta', 'gamma'])
       expect(node.relatedFiles).toEqual(['src/a.ts', 'src/b.ts'])
@@ -201,15 +201,15 @@ describe('Knowledge Graph Nodes', () => {
 // ────────────────────────────────────────────────────────────
 
 describe('Knowledge Graph Edges', () => {
-  // 10. POST /api/kg/edges — depends_on エッジ作成 → 201 + id が kge- で始まる
-  it('POST /api/kg/edges — depends_on エッジ作成 → 201 + id が kge- で始まる', async () => {
+  // 10. POST /kg/edges — depends_on エッジ作成 → 201 + id が kge- で始まる
+  it('POST /kg/edges — depends_on エッジ作成 → 201 + id が kge- で始まる', async () => {
     await withApp(async (app) => {
       const nodeA = await createNode(app, { title: 'Node A' })
       const nodeB = await createNode(app, { title: 'Node B' })
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'depends_on' },
       })
       expect(res.statusCode).toBe(201)
@@ -221,8 +221,8 @@ describe('Knowledge Graph Edges', () => {
     })
   })
 
-  // 11. GET /api/kg/edges?fromNodeId=xxx — fromNodeId フィルタ
-  it('GET /api/kg/edges?fromNodeId=xxx — fromNodeId フィルタ', async () => {
+  // 11. GET /kg/edges?fromNodeId=xxx — fromNodeId フィルタ
+  it('GET /kg/edges?fromNodeId=xxx — fromNodeId フィルタ', async () => {
     await withApp(async (app) => {
       const nodeA = await createNode(app, { title: 'Node A' })
       const nodeB = await createNode(app, { title: 'Node B' })
@@ -230,16 +230,16 @@ describe('Knowledge Graph Edges', () => {
 
       await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'depends_on' },
       })
       await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeC.id, toNodeId: nodeB.id, edgeType: 'blocks' },
       })
 
-      const res = await app.inject({ method: 'GET', url: `/api/kg/edges?fromNodeId=${nodeA.id}` })
+      const res = await app.inject({ method: 'GET', url: `/kg/edges?fromNodeId=${nodeA.id}` })
       expect(res.statusCode).toBe(200)
       const edges = parseBody<KGEdge[]>(res.body)
       expect(edges.every((e) => e.fromNodeId === nodeA.id)).toBe(true)
@@ -247,8 +247,8 @@ describe('Knowledge Graph Edges', () => {
     })
   })
 
-  // 12. GET /api/kg/edges?type=depends_on — type フィルタ
-  it('GET /api/kg/edges?type=depends_on — type フィルタ', async () => {
+  // 12. GET /kg/edges?type=depends_on — type フィルタ
+  it('GET /kg/edges?type=depends_on — type フィルタ', async () => {
     await withApp(async (app) => {
       const nodeA = await createNode(app, { title: 'Node A' })
       const nodeB = await createNode(app, { title: 'Node B' })
@@ -256,16 +256,16 @@ describe('Knowledge Graph Edges', () => {
 
       await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'depends_on' },
       })
       await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: nodeC.id, edgeType: 'blocks' },
       })
 
-      const res = await app.inject({ method: 'GET', url: '/api/kg/edges?type=depends_on' })
+      const res = await app.inject({ method: 'GET', url: '/kg/edges?type=depends_on' })
       expect(res.statusCode).toBe(200)
       const edges = parseBody<KGEdge[]>(res.body)
       expect(edges.every((e) => e.edgeType === 'depends_on')).toBe(true)
@@ -273,23 +273,23 @@ describe('Knowledge Graph Edges', () => {
     })
   })
 
-  // 13. DELETE /api/kg/edges/:id → 204
-  it('DELETE /api/kg/edges/:id → 204', async () => {
+  // 13. DELETE /kg/edges/:id → 204
+  it('DELETE /kg/edges/:id → 204', async () => {
     await withApp(async (app) => {
       const nodeA = await createNode(app, { title: 'Node A' })
       const nodeB = await createNode(app, { title: 'Node B' })
 
       const createRes = await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'related_to' },
       })
       const edge = parseBody<KGEdge>(createRes.body)
 
-      const deleteRes = await app.inject({ method: 'DELETE', url: `/api/kg/edges/${edge.id}` })
+      const deleteRes = await app.inject({ method: 'DELETE', url: `/kg/edges/${edge.id}` })
       expect(deleteRes.statusCode).toBe(204)
 
-      const getRes = await app.inject({ method: 'GET', url: `/api/kg/edges/${edge.id}` })
+      const getRes = await app.inject({ method: 'GET', url: `/kg/edges/${edge.id}` })
       expect(getRes.statusCode).toBe(404)
     })
   })
@@ -301,7 +301,7 @@ describe('Knowledge Graph Edges', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: 'nonexistent-node', toNodeId: nodeB.id, edgeType: 'depends_on' },
       })
       expect(res.statusCode).toBe(400)
@@ -314,7 +314,7 @@ describe('Knowledge Graph Edges', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: 'nonexistent-node', edgeType: 'depends_on' },
       })
       expect(res.statusCode).toBe(400)
@@ -328,7 +328,7 @@ describe('Knowledge Graph Edges', () => {
 
 import type { TimelineMap, KGContextPack, ImpactAnalysisResult } from '@ai-team/shared'
 
-describe('GET /api/kg/timeline', () => {
+describe('GET /kg/timeline', () => {
   // 1. Phase ノードが1つ、feature ノードが2つ → phases[0].features が2つ返る
   it('Phase 1つ + feature 2つ → phases[0].features が2つ返る', async () => {
     await withApp(async (app) => {
@@ -336,7 +336,7 @@ describe('GET /api/kg/timeline', () => {
       await createNode(app, { type: 'feature', title: 'Feature A', phase: phase.id, status: 'active' })
       await createNode(app, { type: 'feature', title: 'Feature B', phase: phase.id, status: 'active' })
 
-      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      const res = await app.inject({ method: 'GET', url: '/kg/timeline' })
       expect(res.statusCode).toBe(200)
       const timeline = parseBody<TimelineMap>(res.body)
       expect(timeline.phases).toHaveLength(1)
@@ -351,7 +351,7 @@ describe('GET /api/kg/timeline', () => {
       await createNode(app, { type: 'feature', title: 'In Phase', phase: phase.id, status: 'active' })
       await createNode(app, { type: 'feature', title: 'No Phase', status: 'inbox' }) // phase 未指定
 
-      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      const res = await app.inject({ method: 'GET', url: '/kg/timeline' })
       expect(res.statusCode).toBe(200)
       const timeline = parseBody<TimelineMap>(res.body)
       expect(timeline.inbox.some((n) => n.title === 'No Phase')).toBe(true)
@@ -367,7 +367,7 @@ describe('GET /api/kg/timeline', () => {
       await createNode(app, { type: 'feature', title: 'F2', phase: phase.id, status: 'archived' })
       await createNode(app, { type: 'task', title: 'T1', phase: phase.id, status: 'active' })
 
-      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      const res = await app.inject({ method: 'GET', url: '/kg/timeline' })
       const timeline = parseBody<TimelineMap>(res.body)
       const stats = timeline.phases[0].stats
       expect(stats.total).toBe(3)
@@ -384,7 +384,7 @@ describe('GET /api/kg/timeline', () => {
       await createNode(app, { type: 'feature', title: 'F-critical', phase: phase.id, status: 'active', risk: 'CRITICAL' })
       await createNode(app, { type: 'task', title: 'T-low', phase: phase.id, status: 'active', risk: 'LOW' })
 
-      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      const res = await app.inject({ method: 'GET', url: '/kg/timeline' })
       const timeline = parseBody<TimelineMap>(res.body)
       const stats = timeline.phases[0].stats
       expect(stats.highRiskCount).toBe(1)
@@ -395,7 +395,7 @@ describe('GET /api/kg/timeline', () => {
   // 5. ノードが0件でも空の timeline が返る
   it('ノードが0件でも空の timeline が返る（phases=[], inbox=[]）', async () => {
     await withApp(async (app) => {
-      const res = await app.inject({ method: 'GET', url: '/api/kg/timeline' })
+      const res = await app.inject({ method: 'GET', url: '/kg/timeline' })
       expect(res.statusCode).toBe(200)
       const timeline = parseBody<TimelineMap>(res.body)
       expect(timeline.phases).toEqual([])
@@ -409,7 +409,7 @@ describe('GET /api/kg/timeline', () => {
 // Node Detail テスト
 // ────────────────────────────────────────────────────────────
 
-describe('GET /api/kg/nodes/:id/detail', () => {
+describe('GET /kg/nodes/:id/detail', () => {
   // 6. outgoingEdges / incomingEdges が正しく返る
   it('outgoingEdges / incomingEdges が正しく返る', async () => {
     await withApp(async (app) => {
@@ -420,17 +420,17 @@ describe('GET /api/kg/nodes/:id/detail', () => {
       // A → B (depends_on)
       await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'depends_on' },
       })
       // C → A (blocks)
       await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeC.id, toNodeId: nodeA.id, edgeType: 'blocks' },
       })
 
-      const res = await app.inject({ method: 'GET', url: `/api/kg/nodes/${nodeA.id}/detail` })
+      const res = await app.inject({ method: 'GET', url: `/kg/nodes/${nodeA.id}/detail` })
       expect(res.statusCode).toBe(200)
       const detail = parseBody<{ node: KGNode; outgoingEdges: KGEdge[]; incomingEdges: KGEdge[] }>(res.body)
       expect(detail.node.id).toBe(nodeA.id)
@@ -444,7 +444,7 @@ describe('GET /api/kg/nodes/:id/detail', () => {
   // 7. 存在しない ID → 404
   it('存在しない ID → 404', async () => {
     await withApp(async (app) => {
-      const res = await app.inject({ method: 'GET', url: '/api/kg/nodes/nonexistent-id/detail' })
+      const res = await app.inject({ method: 'GET', url: '/kg/nodes/nonexistent-id/detail' })
       expect(res.statusCode).toBe(404)
     })
   })
@@ -454,7 +454,7 @@ describe('GET /api/kg/nodes/:id/detail', () => {
 // Context Pack テスト
 // ────────────────────────────────────────────────────────────
 
-describe('POST /api/kg/context-pack', () => {
+describe('POST /kg/context-pack', () => {
   // 1. LOW riskLevel → executionLevel=1, type=feature のみ返る
   it('LOW riskLevel → executionLevel=1, type=feature のみ返る', async () => {
     await withApp(async (app) => {
@@ -464,7 +464,7 @@ describe('POST /api/kg/context-pack', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/context-pack',
+        url: '/kg/context-pack',
         payload: { taskId: 'task-001', changedFiles: [], riskLevel: 'LOW' },
       })
       expect(res.statusCode).toBe(200)
@@ -483,7 +483,7 @@ describe('POST /api/kg/context-pack', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/context-pack',
+        url: '/kg/context-pack',
         payload: { taskId: 'task-002', changedFiles: ['src/foo.ts'], riskLevel: 'LOW' },
       })
       expect(res.statusCode).toBe(200)
@@ -504,7 +504,7 @@ describe('POST /api/kg/context-pack', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/context-pack',
+        url: '/kg/context-pack',
         payload: { taskId: 'task-003', changedFiles: [], riskLevel: 'HIGH' },
       })
       expect(res.statusCode).toBe(200)
@@ -523,7 +523,7 @@ describe('POST /api/kg/context-pack', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/context-pack',
+        url: '/kg/context-pack',
         payload: { taskId: 'task-004', changedFiles: [], riskLevel: 'LOW', maxEntries: 2 },
       })
       expect(res.statusCode).toBe(200)
@@ -538,7 +538,7 @@ describe('POST /api/kg/context-pack', () => {
     await withApp(async (app) => {
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/context-pack',
+        url: '/kg/context-pack',
         payload: { taskId: 'task-005', changedFiles: [], riskLevel: 'LOW' },
       })
       expect(res.statusCode).toBe(200)
@@ -554,7 +554,7 @@ describe('POST /api/kg/context-pack', () => {
     await withApp(async (app) => {
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/context-pack',
+        url: '/kg/context-pack',
         payload: { taskId: '', changedFiles: [], riskLevel: 'LOW' },
       })
       expect(res.statusCode).toBe(400)
@@ -566,7 +566,7 @@ describe('POST /api/kg/context-pack', () => {
 // Impact Analyzer テスト
 // ────────────────────────────────────────────────────────────
 
-describe('POST /api/kg/impact', () => {
+describe('POST /kg/impact', () => {
   // 1. changedFiles が relatedFiles に一致するノードが impactedFeatures に含まれる
   it('changedFiles が relatedFiles に一致するノードが impactedFeatures に含まれる', async () => {
     await withApp(async (app) => {
@@ -575,7 +575,7 @@ describe('POST /api/kg/impact', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/impact',
+        url: '/kg/impact',
         payload: { changedFiles: ['src/foo.ts'] },
       })
       expect(res.statusCode).toBe(200)
@@ -592,7 +592,7 @@ describe('POST /api/kg/impact', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/impact',
+        url: '/kg/impact',
         payload: { changedFiles: ['src/critical.ts'] },
       })
       expect(res.statusCode).toBe(200)
@@ -609,7 +609,7 @@ describe('POST /api/kg/impact', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/impact',
+        url: '/kg/impact',
         payload: { changedFiles: ['src/high.ts'] },
       })
       expect(res.statusCode).toBe(200)
@@ -626,7 +626,7 @@ describe('POST /api/kg/impact', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/impact',
+        url: '/kg/impact',
         payload: { changedFiles: ['src/nomatch.ts'] },
       })
       expect(res.statusCode).toBe(200)
@@ -645,13 +645,13 @@ describe('POST /api/kg/impact', () => {
       // A → B (impacts)
       await app.inject({
         method: 'POST',
-        url: '/api/kg/edges',
+        url: '/kg/edges',
         payload: { fromNodeId: nodeA.id, toNodeId: nodeB.id, edgeType: 'impacts' },
       })
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/impact',
+        url: '/kg/impact',
         payload: { changedFiles: ['src/target.ts'], targetFeatureId: nodeA.id },
       })
       expect(res.statusCode).toBe(200)
@@ -670,7 +670,7 @@ describe('POST /api/kg/impact', () => {
 
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/impact',
+        url: '/kg/impact',
         payload: { changedFiles: ['src/foo.ts'] },
       })
       expect(res.statusCode).toBe(200)
@@ -685,10 +685,56 @@ describe('POST /api/kg/impact', () => {
     await withApp(async (app) => {
       const res = await app.inject({
         method: 'POST',
-        url: '/api/kg/impact',
+        url: '/kg/impact',
         payload: { changedFiles: [] },
       })
       expect(res.statusCode).toBe(400)
+    })
+  })
+
+  // 8. 部分一致ではなく完全一致でファイルをマッチする
+  it('POST /kg/impact — 部分一致ではなく完全一致でファイルをマッチする', async () => {
+    await withApp(async (app) => {
+      // セットアップ: relatedFiles が "src/auth.ts.bak" のノードを作成
+      const nodeRes = await app.inject({
+        method: 'POST', url: '/kg/nodes',
+        payload: { type: 'feature', title: '部分一致テスト用ノード', relatedFiles: ['src/auth.ts.bak'] },
+      })
+      const nodeId = JSON.parse(nodeRes.body).id
+
+      const res = await app.inject({
+        method: 'POST', url: '/kg/impact',
+        payload: { changedFiles: ['src/auth.ts'] },
+      })
+      expect(res.statusCode).toBe(200)
+      const body = JSON.parse(res.body)
+      // "src/auth.ts" と "src/auth.ts.bak" は別ファイル
+      expect(body.impactedFeatures.every((n: any) => n.id !== nodeId)).toBe(true)
+
+      // クリーンアップ
+      await app.inject({ method: 'DELETE', url: `/kg/nodes/${nodeId}` })
+    })
+  })
+
+  // 9. 完全一致ならマッチする
+  it('POST /kg/impact — 完全一致ならマッチする', async () => {
+    await withApp(async (app) => {
+      const nodeRes = await app.inject({
+        method: 'POST', url: '/kg/nodes',
+        payload: { type: 'feature', title: '完全一致テスト用ノード', relatedFiles: ['src/auth.ts'] },
+      })
+      const nodeId = JSON.parse(nodeRes.body).id
+
+      const res = await app.inject({
+        method: 'POST', url: '/kg/impact',
+        payload: { changedFiles: ['src/auth.ts'] },
+      })
+      expect(res.statusCode).toBe(200)
+      const body = JSON.parse(res.body)
+      expect(body.impactedFeatures.some((n: any) => n.id === nodeId)).toBe(true)
+
+      // クリーンアップ
+      await app.inject({ method: 'DELETE', url: `/kg/nodes/${nodeId}` })
     })
   })
 })
@@ -708,10 +754,10 @@ describe('Decision Cache', () => {
     await app.close()
   })
 
-  it('POST /api/kg/decisions — 登録して201、id が dc- で始まる', async () => {
+  it('POST /kg/decisions — 登録して201、id が dc- で始まる', async () => {
     const res = await app.inject({
       method: 'POST',
-      url: '/api/kg/decisions',
+      url: '/kg/decisions',
       payload: {
         title: 'CONTROL_ROOT は環境変数優先',
         keywords: ['CONTROL_ROOT', 'env', 'runner'],
@@ -725,24 +771,24 @@ describe('Decision Cache', () => {
     decisionId = body.id
   })
 
-  it('GET /api/kg/decisions/:id — 単体取得', async () => {
-    const res = await app.inject({ method: 'GET', url: `/api/kg/decisions/${decisionId}` })
+  it('GET /kg/decisions/:id — 単体取得', async () => {
+    const res = await app.inject({ method: 'GET', url: `/kg/decisions/${decisionId}` })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).title).toBe('CONTROL_ROOT は環境変数優先')
   })
 
-  it('PATCH /api/kg/decisions/:id — status を superseded に更新', async () => {
+  it('PATCH /kg/decisions/:id — status を superseded に更新', async () => {
     const res = await app.inject({
       method: 'PATCH',
-      url: `/api/kg/decisions/${decisionId}`,
+      url: `/kg/decisions/${decisionId}`,
       payload: { status: 'superseded' },
     })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).status).toBe('superseded')
   })
 
-  it('DELETE /api/kg/decisions/:id — 204', async () => {
-    const res = await app.inject({ method: 'DELETE', url: `/api/kg/decisions/${decisionId}` })
+  it('DELETE /kg/decisions/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/kg/decisions/${decisionId}` })
     expect(res.statusCode).toBe(204)
   })
 })
@@ -762,10 +808,10 @@ describe('Incident DB', () => {
     await app.close()
   })
 
-  it('POST /api/kg/incidents — 登録して201、id が inc- で始まる', async () => {
+  it('POST /kg/incidents — 登録して201、id が inc- で始まる', async () => {
     const res = await app.inject({
       method: 'POST',
-      url: '/api/kg/incidents',
+      url: '/kg/incidents',
       payload: {
         title: 'AV-001 Control Layer 迂回',
         keywords: ['control', 'bypass', 'runner', '直接呼び出す'],
@@ -781,16 +827,16 @@ describe('Incident DB', () => {
     incidentId = body.id
   })
 
-  it('GET /api/kg/incidents?severity=critical — severity フィルタ', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/kg/incidents?severity=critical' })
+  it('GET /kg/incidents?severity=critical — severity フィルタ', async () => {
+    const res = await app.inject({ method: 'GET', url: '/kg/incidents?severity=critical' })
     expect(res.statusCode).toBe(200)
     const list = JSON.parse(res.body)
     expect(list.length).toBeGreaterThan(0)
     expect(list.every((i: any) => i.severity === 'critical')).toBe(true)
   })
 
-  it('DELETE /api/kg/incidents/:id — 204', async () => {
-    const res = await app.inject({ method: 'DELETE', url: `/api/kg/incidents/${incidentId}` })
+  it('DELETE /kg/incidents/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/kg/incidents/${incidentId}` })
     expect(res.statusCode).toBe(204)
   })
 })
@@ -799,7 +845,7 @@ describe('Incident DB', () => {
 // Risk Lookup テスト
 // ────────────────────────────────────────────────────────────
 
-describe('POST /api/kg/risk-lookup', () => {
+describe('POST /kg/risk-lookup', () => {
   let app: FastifyInstance
   let dcId: string
   let incId: string
@@ -808,27 +854,27 @@ describe('POST /api/kg/risk-lookup', () => {
     app = await buildApp()
 
     const dc = await app.inject({
-      method: 'POST', url: '/api/kg/decisions',
+      method: 'POST', url: '/kg/decisions',
       payload: { title: 'Auth token 保存先', keywords: ['auth', 'token', 'storage'], decision: 'トークンは DB に保存しない', rationale: 'セキュリティ要件' },
     })
     dcId = JSON.parse(dc.body).id
 
     const inc = await app.inject({
-      method: 'POST', url: '/api/kg/incidents',
+      method: 'POST', url: '/kg/incidents',
       payload: { title: 'Token 漏洩事例', keywords: ['auth', 'token', 'leak'], description: 'トークンがログに出力された', rootCause: 'debug ログが本番で有効だった', prevention: 'debug ログは本番無効', severity: 'high' },
     })
     incId = JSON.parse(inc.body).id
   })
 
   afterAll(async () => {
-    await app.inject({ method: 'DELETE', url: `/api/kg/decisions/${dcId}` })
-    await app.inject({ method: 'DELETE', url: `/api/kg/incidents/${incId}` })
+    await app.inject({ method: 'DELETE', url: `/kg/decisions/${dcId}` })
+    await app.inject({ method: 'DELETE', url: `/kg/incidents/${incId}` })
     await app.close()
   })
 
   it('keywords にマッチする Decision と Incident が返る', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/risk-lookup',
+      method: 'POST', url: '/kg/risk-lookup',
       payload: { keywords: ['auth', 'token'], riskLevel: 'HIGH' },
     })
     expect(res.statusCode).toBe(200)
@@ -840,7 +886,7 @@ describe('POST /api/kg/risk-lookup', () => {
 
   it('マッチなしでも 200 + 空配列', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/risk-lookup',
+      method: 'POST', url: '/kg/risk-lookup',
       payload: { keywords: ['xxxxunmatched'], riskLevel: 'CRITICAL' },
     })
     expect(res.statusCode).toBe(200)
@@ -851,7 +897,7 @@ describe('POST /api/kg/risk-lookup', () => {
 
   it('riskLevel=LOW → 400', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/risk-lookup',
+      method: 'POST', url: '/kg/risk-lookup',
       payload: { keywords: ['auth'], riskLevel: 'LOW' },
     })
     expect(res.statusCode).toBe(400)
@@ -873,9 +919,9 @@ describe('Pattern Library', () => {
     await app.close()
   })
 
-  it('POST /api/kg/patterns — 登録して201、id が pat- で始まる', async () => {
+  it('POST /kg/patterns — 登録して201、id が pat- で始まる', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/patterns',
+      method: 'POST', url: '/kg/patterns',
       payload: {
         title: 'Permission Grant 作成パターン',
         keywords: ['permission', 'grant', 'approval'],
@@ -892,55 +938,73 @@ describe('Pattern Library', () => {
     patternId = body.id
   })
 
-  it('GET /api/kg/patterns?featureType=Permission Grant — featureType フィルタ', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/kg/patterns?featureType=Permission%20Grant' })
+  it('GET /kg/patterns?featureType=Permission Grant — featureType フィルタ', async () => {
+    const res = await app.inject({ method: 'GET', url: '/kg/patterns?featureType=Permission%20Grant' })
     expect(res.statusCode).toBe(200)
     const list = JSON.parse(res.body)
     expect(list.some((p: any) => p.id === patternId)).toBe(true)
   })
 
-  it('POST /api/kg/patterns/:id/use — usage_count が増える', async () => {
-    const res = await app.inject({ method: 'POST', url: `/api/kg/patterns/${patternId}/use` })
+  it('POST /kg/patterns/:id/use — usage_count が増える', async () => {
+    const res = await app.inject({ method: 'POST', url: `/kg/patterns/${patternId}/use` })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).usageCount).toBe(1)
   })
 
-  it('PATCH /api/kg/patterns/:id — title 更新', async () => {
+  it('PATCH /kg/patterns/:id — title 更新', async () => {
     const res = await app.inject({
-      method: 'PATCH', url: `/api/kg/patterns/${patternId}`,
+      method: 'PATCH', url: `/kg/patterns/${patternId}`,
       payload: { title: 'Permission Grant 作成パターン v2' },
     })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).title).toBe('Permission Grant 作成パターン v2')
   })
 
-  it('DELETE /api/kg/patterns/:id — 204', async () => {
-    const res = await app.inject({ method: 'DELETE', url: `/api/kg/patterns/${patternId}` })
+  it('DELETE /kg/patterns/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/kg/patterns/${patternId}` })
     expect(res.statusCode).toBe(204)
+  })
+
+  it('POST /kg/patterns — usageCount をクライアントが指定しても 0 に固定される', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/kg/patterns',
+      payload: {
+        title: 'usageCount 指定テスト',
+        description: 'usageCount 上書きテスト用',
+        steps: ['step1'],
+        featureType: 'Test',
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    expect(JSON.parse(res.body).usageCount).toBe(0)
+    // クリーンアップ
+    const id = JSON.parse(res.body).id
+    await app.inject({ method: 'DELETE', url: `/kg/patterns/${id}` })
   })
 })
 
-describe('POST /api/kg/pattern-lookup', () => {
+describe('POST /kg/pattern-lookup', () => {
   let app: FastifyInstance
   let pid: string
 
   beforeAll(async () => {
     app = await buildApp()
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/patterns',
+      method: 'POST', url: '/kg/patterns',
       payload: { title: 'Storage CRUD パターン', keywords: ['storage', 'crud', 'sqlite'], description: 'Storage CRUD 実装手順', steps: ['interface 定義', 'schema 追加', 'sqlite 実装', 'テスト'], featureType: 'Storage', trigger: 'same_feature_type' },
     })
     pid = JSON.parse(res.body).id
   })
 
   afterAll(async () => {
-    await app.inject({ method: 'DELETE', url: `/api/kg/patterns/${pid}` })
+    await app.inject({ method: 'DELETE', url: `/kg/patterns/${pid}` })
     await app.close()
   })
 
   it('keywords でパターンが返る', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/pattern-lookup',
+      method: 'POST', url: '/kg/pattern-lookup',
       payload: { keywords: ['storage', 'crud'] },
     })
     expect(res.statusCode).toBe(200)
@@ -951,7 +1015,7 @@ describe('POST /api/kg/pattern-lookup', () => {
 
   it('featureType でパターンが返る', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/pattern-lookup',
+      method: 'POST', url: '/kg/pattern-lookup',
       payload: { featureType: 'Storage' },
     })
     expect(res.statusCode).toBe(200)
@@ -960,7 +1024,7 @@ describe('POST /api/kg/pattern-lookup', () => {
 
   it('マッチなしでも 200 + 空配列', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/pattern-lookup',
+      method: 'POST', url: '/kg/pattern-lookup',
       payload: { keywords: ['xxxxunmatched'] },
     })
     expect(res.statusCode).toBe(200)
@@ -984,43 +1048,43 @@ describe('Feature DNA', () => {
     await app.close()
   })
 
-  it('POST /api/kg/feature-dna — 201', async () => {
+  it('POST /kg/feature-dna — 201', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/feature-dna',
+      method: 'POST', url: '/kg/feature-dna',
       payload: { nodeId: dnaNodeId, reason: 'Approval Gate の一回限り消費を保証するため', relatedTaskIds: ['task-001'] },
     })
     expect(res.statusCode).toBe(201)
     expect(JSON.parse(res.body).nodeId).toBe(dnaNodeId)
   })
 
-  it('POST /api/kg/feature-dna (同nodeId) — 409', async () => {
+  it('POST /kg/feature-dna (同nodeId) — 409', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/feature-dna',
+      method: 'POST', url: '/kg/feature-dna',
       payload: { nodeId: dnaNodeId, reason: 'duplicate' },
     })
     expect(res.statusCode).toBe(409)
   })
 
-  it('POST /api/kg/feature-dna/:nodeId/history — 履歴追記', async () => {
+  it('POST /kg/feature-dna/:nodeId/history — 履歴追記', async () => {
     const res = await app.inject({
-      method: 'POST', url: `/api/kg/feature-dna/${dnaNodeId}/history`,
+      method: 'POST', url: `/kg/feature-dna/${dnaNodeId}/history`,
       payload: { note: 'CONSUMED 状態を追加' },
     })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).history.length).toBe(1)
   })
 
-  it('PATCH /api/kg/feature-dna/:nodeId — reason 更新', async () => {
+  it('PATCH /kg/feature-dna/:nodeId — reason 更新', async () => {
     const res = await app.inject({
-      method: 'PATCH', url: `/api/kg/feature-dna/${dnaNodeId}`,
+      method: 'PATCH', url: `/kg/feature-dna/${dnaNodeId}`,
       payload: { reason: '更新後の理由' },
     })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).reason).toBe('更新後の理由')
   })
 
-  it('DELETE /api/kg/feature-dna/:nodeId — 204', async () => {
-    const res = await app.inject({ method: 'DELETE', url: `/api/kg/feature-dna/${dnaNodeId}` })
+  it('DELETE /kg/feature-dna/:nodeId — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/kg/feature-dna/${dnaNodeId}` })
     expect(res.statusCode).toBe(204)
   })
 })
@@ -1036,9 +1100,9 @@ describe('Self Reflection', () => {
     await app.close()
   })
 
-  it('POST /api/kg/reflections — 201、id が ref- で始まる', async () => {
+  it('POST /kg/reflections — 201、id が ref- で始まる', async () => {
     const res = await app.inject({
-      method: 'POST', url: '/api/kg/reflections',
+      method: 'POST', url: '/kg/reflections',
       payload: {
         trigger: 'failure',
         summary: 'Codex が index.ts を直接編集しようとした',
@@ -1053,26 +1117,26 @@ describe('Self Reflection', () => {
     reflectionId = body.id
   })
 
-  it('GET /api/kg/reflections?trigger=failure — trigger フィルタ', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/kg/reflections?trigger=failure' })
+  it('GET /kg/reflections?trigger=failure — trigger フィルタ', async () => {
+    const res = await app.inject({ method: 'GET', url: '/kg/reflections?trigger=failure' })
     expect(res.statusCode).toBe(200)
     const list = JSON.parse(res.body)
     expect(list.some((r: any) => r.id === reflectionId)).toBe(true)
   })
 
-  it('GET /api/kg/reflections/:id — 単体取得', async () => {
-    const res = await app.inject({ method: 'GET', url: `/api/kg/reflections/${reflectionId}` })
+  it('GET /kg/reflections/:id — 単体取得', async () => {
+    const res = await app.inject({ method: 'GET', url: `/kg/reflections/${reflectionId}` })
     expect(res.statusCode).toBe(200)
     expect(JSON.parse(res.body).trigger).toBe('failure')
   })
 
-  it('DELETE /api/kg/reflections/:id — 204', async () => {
-    const res = await app.inject({ method: 'DELETE', url: `/api/kg/reflections/${reflectionId}` })
+  it('DELETE /kg/reflections/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/kg/reflections/${reflectionId}` })
     expect(res.statusCode).toBe(204)
   })
 })
 
-describe('GET /api/kg/health-score', () => {
+describe('GET /kg/health-score', () => {
   let app: FastifyInstance
 
   beforeAll(async () => {
@@ -1084,7 +1148,7 @@ describe('GET /api/kg/health-score', () => {
   })
 
   it('200 でスコアオブジェクトが返る', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/kg/health-score' })
+    const res = await app.inject({ method: 'GET', url: '/kg/health-score' })
     expect(res.statusCode).toBe(200)
     const body = JSON.parse(res.body)
     expect(typeof body.progress).toBe('number')
@@ -1093,12 +1157,13 @@ describe('GET /api/kg/health-score', () => {
     expect(typeof body.memoryHealth).toBe('number')
     expect(typeof body.openRisks).toBe('number')
     expect(typeof body.blockedTasks).toBe('number')
-    expect(typeof body.approvalWaiting).toBe('number')
+    expect(body.approvalWaiting).toBeNull()
+    expect(body.approvalWaitingAvailable).toBe(false)
     expect(body.calculatedAt).toBeTruthy()
   })
 
   it('progress は 0-100 の範囲', async () => {
-    const res = await app.inject({ method: 'GET', url: '/api/kg/health-score' })
+    const res = await app.inject({ method: 'GET', url: '/kg/health-score' })
     const body = JSON.parse(res.body)
     expect(body.progress).toBeGreaterThanOrEqual(0)
     expect(body.progress).toBeLessThanOrEqual(100)
