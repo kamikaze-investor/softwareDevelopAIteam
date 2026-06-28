@@ -19,7 +19,7 @@
 | SP-4 | Impact Analyzer — changedFiles から影響Feature抽出 | ✅ done (`75e6519`) |
 | SP-5 | Decision Cache / Incident DB — HIGH risk変更時のみ参照 | ✅ done (`e70aa14`) |
 | SP-6 | Pattern Library / Feature DNA — 成功手順の再利用 | ✅ done (`4722330`) |
-| SP-7 | Health Score / Self Reflection — 定期・完了時に実行 | ✅ done (TBD) |
+| SP-7 | Health Score / Self Reflection — 定期・完了時に実行 | ✅ done (`b006b89`) |
 
 ---
 
