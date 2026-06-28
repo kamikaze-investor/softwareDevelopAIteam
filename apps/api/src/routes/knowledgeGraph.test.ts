@@ -6,6 +6,7 @@ let decisionId: string
 let incidentId: string
 let patternId: string
 let dnaNodeId: string
+let reflectionId: string
 
 async function buildApp(): Promise<FastifyInstance> {
   process.env.DB_PATH = ':memory:'
@@ -1021,5 +1022,85 @@ describe('Feature DNA', () => {
   it('DELETE /api/kg/feature-dna/:nodeId — 204', async () => {
     const res = await app.inject({ method: 'DELETE', url: `/api/kg/feature-dna/${dnaNodeId}` })
     expect(res.statusCode).toBe(204)
+  })
+})
+
+describe('Self Reflection', () => {
+  let app: FastifyInstance
+
+  beforeAll(async () => {
+    app = await buildApp()
+  })
+
+  afterAll(async () => {
+    await app.close()
+  })
+
+  it('POST /api/kg/reflections — 201、id が ref- で始まる', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/reflections',
+      payload: {
+        trigger: 'failure',
+        summary: 'Codex が index.ts を直接編集しようとした',
+        rootCause: 'AI編集禁止ファイルの認識不足',
+        improvement: '実装前に禁止ファイルリストを確認する',
+        relatedNodeIds: [],
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.id).toMatch(/^ref-\d{8}-/)
+    reflectionId = body.id
+  })
+
+  it('GET /api/kg/reflections?trigger=failure — trigger フィルタ', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/kg/reflections?trigger=failure' })
+    expect(res.statusCode).toBe(200)
+    const list = JSON.parse(res.body)
+    expect(list.some((r: any) => r.id === reflectionId)).toBe(true)
+  })
+
+  it('GET /api/kg/reflections/:id — 単体取得', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/kg/reflections/${reflectionId}` })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).trigger).toBe('failure')
+  })
+
+  it('DELETE /api/kg/reflections/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/api/kg/reflections/${reflectionId}` })
+    expect(res.statusCode).toBe(204)
+  })
+})
+
+describe('GET /api/kg/health-score', () => {
+  let app: FastifyInstance
+
+  beforeAll(async () => {
+    app = await buildApp()
+  })
+
+  afterAll(async () => {
+    await app.close()
+  })
+
+  it('200 でスコアオブジェクトが返る', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/kg/health-score' })
+    expect(res.statusCode).toBe(200)
+    const body = JSON.parse(res.body)
+    expect(typeof body.progress).toBe('number')
+    expect(typeof body.safety).toBe('number')
+    expect(typeof body.contextQuality).toBe('number')
+    expect(typeof body.memoryHealth).toBe('number')
+    expect(typeof body.openRisks).toBe('number')
+    expect(typeof body.blockedTasks).toBe('number')
+    expect(typeof body.approvalWaiting).toBe('number')
+    expect(body.calculatedAt).toBeTruthy()
+  })
+
+  it('progress は 0-100 の範囲', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/kg/health-score' })
+    const body = JSON.parse(res.body)
+    expect(body.progress).toBeGreaterThanOrEqual(0)
+    expect(body.progress).toBeLessThanOrEqual(100)
   })
 })

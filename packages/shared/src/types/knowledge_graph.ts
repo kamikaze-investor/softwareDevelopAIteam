@@ -266,3 +266,46 @@ export interface PatternLookupResult {
   patterns: PatternRecord[]
   matchedKeywords: string[]
 }
+
+// ── Project Health Score ──
+
+/** CEO 向けプロジェクト健全性スコア（リアルタイム算出、保存しない） */
+export interface ProjectHealthScore {
+  /** 全ノード中 active の割合 0-100 */
+  progress: number
+  /** CRITICAL/HIGH ノードのうち STALE/EXPIRED ApprovalRequest がないか */
+  safety: number
+  /** KGNode の summary 充足率 0-100 */
+  contextQuality: number
+  /** archived / inbox バランス（inbox が多いと低下） 0-100 */
+  memoryHealth: number
+  /** HIGH/CRITICAL リスクで status=active のノード数 */
+  openRisks: number
+  /** status=inbox のノード数（未分類） */
+  blockedTasks: number
+  /** WAITING_FOR_USER 状態の ApprovalRequest 数 */
+  approvalWaiting: number
+  calculatedAt: string
+}
+
+// ── Self Reflection ──
+
+export type ReflectionTrigger = 'task_complete' | 'failure' | 'post_review'
+
+/** AI の失敗・改善点の記録 */
+export interface SelfReflectionEntry {
+  /** ref-YYYYMMDD-NNN 形式 */
+  id: string
+  trigger: ReflectionTrigger
+  /** 何が起きたか / 何を完了したか */
+  summary: string
+  /** 失敗の場合: 根本原因 */
+  rootCause?: string
+  /** 次回どう改善するか */
+  improvement: string
+  /** 関連タスク ID */
+  taskId?: string
+  /** 関連 KGNode ID */
+  relatedNodeIds: string[]
+  createdAt: string
+}

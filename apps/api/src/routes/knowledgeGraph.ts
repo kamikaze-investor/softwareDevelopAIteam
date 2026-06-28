@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
-import type { KGContextEntry, KGContextPack, ImpactAnalysisResult, DecisionRecord, IncidentRecord, RiskLookupResult, DecisionStatus, IncidentSeverity, PatternRecord, FeatureDNA, PatternLookupResult, PatternTrigger } from '@ai-team/shared'
+import type { KGContextEntry, KGContextPack, ImpactAnalysisResult, DecisionRecord, IncidentRecord, RiskLookupResult, DecisionStatus, IncidentSeverity, PatternRecord, FeatureDNA, PatternLookupResult, PatternTrigger, ProjectHealthScore, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // Zod スキーマ
@@ -126,6 +126,17 @@ const AppendHistorySchema = z.object({
 const RiskLookupBodySchema = z.object({
   keywords: z.array(z.string()).min(1),
   riskLevel: z.enum(['HIGH', 'CRITICAL']),
+})
+
+const ReflectionTriggerSchema = z.enum(['task_complete', 'failure', 'post_review'])
+
+const CreateReflectionSchema = z.object({
+  trigger: ReflectionTriggerSchema,
+  summary: z.string().min(1),
+  rootCause: z.string().optional(),
+  improvement: z.string().min(1),
+  taskId: z.string().optional(),
+  relatedNodeIds: z.array(z.string()).default([]),
 })
 
 // ────────────────────────────────────────────────────────────
@@ -811,5 +822,83 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
   app.delete<{ Params: { nodeId: string } }>('/api/kg/feature-dna/:nodeId', async (req, reply) => {
     if (!getStorage().featureDNA.delete(req.params.nodeId)) return reply.status(404).send({ error: 'FeatureDNA not found' })
     return reply.status(204).send()
+  })
+
+  // ─── Self Reflection ──────────────────────────────────────
+
+  // POST /api/kg/reflections
+  app.post('/api/kg/reflections', async (req, reply) => {
+    const parsed = CreateReflectionSchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const record = getStorage().selfReflection.create(parsed.data)
+    return reply.status(201).send(record)
+  })
+
+  // GET /api/kg/reflections?trigger=xxx&taskId=yyy
+  app.get<{ Querystring: { trigger?: string; taskId?: string } }>('/api/kg/reflections', async (req, reply) => {
+    const { trigger, taskId } = req.query
+    if (taskId) return reply.send(getStorage().selfReflection.findByTaskId(taskId))
+    if (trigger) {
+      const parsed = ReflectionTriggerSchema.safeParse(trigger)
+      if (!parsed.success) return reply.status(400).send({ error: 'Invalid trigger value' })
+      return reply.send(getStorage().selfReflection.findByTrigger(parsed.data))
+    }
+    return reply.send(getStorage().selfReflection.findAll())
+  })
+
+  // GET /api/kg/reflections/:id
+  app.get<{ Params: { id: string } }>('/api/kg/reflections/:id', async (req, reply) => {
+    const record = getStorage().selfReflection.findById(req.params.id)
+    if (!record) return reply.status(404).send({ error: 'Reflection not found' })
+    return reply.send(record)
+  })
+
+  // DELETE /api/kg/reflections/:id
+  app.delete<{ Params: { id: string } }>('/api/kg/reflections/:id', async (req, reply) => {
+    if (!getStorage().selfReflection.delete(req.params.id)) return reply.status(404).send({ error: 'Reflection not found' })
+    return reply.status(204).send()
+  })
+
+  // ─── Project Health Score（リアルタイム算出、保存なし）────
+
+  // GET /api/kg/health-score
+  app.get('/api/kg/health-score', async (_req, reply) => {
+    const storage = getStorage()
+    const nodes = storage.knowledgeGraph.findNodesByType('feature')
+      .concat(storage.knowledgeGraph.findNodesByType('phase'))
+      .concat(storage.knowledgeGraph.findNodesByType('task'))
+      .concat(storage.knowledgeGraph.findNodesByType('decision'))
+      .concat(storage.knowledgeGraph.findNodesByType('incident'))
+      .concat(storage.knowledgeGraph.findNodesByType('file'))
+      .concat(storage.knowledgeGraph.findNodesByType('doc'))
+
+    const totalNodes = nodes.length
+
+    // progress: active ノード率
+    const activeCount = nodes.filter(n => n.status === 'active').length
+    const progress = totalNodes === 0 ? 100 : Math.round((activeCount / totalNodes) * 100)
+
+    const inboxCount = nodes.filter(n => n.status === 'inbox').length
+    const highRiskActive = nodes.filter(n => (n.risk === 'HIGH' || n.risk === 'CRITICAL') && n.status === 'active').length
+    const safety = Math.max(0, 100 - highRiskActive * 10)
+
+    // contextQuality: summary を持つノード率
+    const withSummary = nodes.filter(n => n.summary && n.summary.length > 0).length
+    const contextQuality = totalNodes === 0 ? 100 : Math.round((withSummary / totalNodes) * 100)
+
+    // memoryHealth: inbox が少ないほど良い
+    const memoryHealth = totalNodes === 0 ? 100 : Math.max(0, 100 - Math.round((inboxCount / totalNodes) * 100))
+
+    const score: ProjectHealthScore = {
+      progress,
+      safety,
+      contextQuality,
+      memoryHealth,
+      openRisks: highRiskActive,
+      blockedTasks: inboxCount,
+      approvalWaiting: 0,
+      calculatedAt: new Date().toISOString(),
+    }
+    return reply.send(score)
   })
 }

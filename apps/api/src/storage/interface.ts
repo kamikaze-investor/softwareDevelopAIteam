@@ -8,7 +8,7 @@
  */
 
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus } from '@ai-team/shared'
-import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger } from '@ai-team/shared'
+import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -133,6 +133,15 @@ export interface IFeatureDNAStorage {
   delete(nodeId: string): boolean
 }
 
+export interface ISelfReflectionStorage {
+  findById(id: string): SelfReflectionEntry | undefined
+  findByTaskId(taskId: string): SelfReflectionEntry[]
+  findByTrigger(trigger: ReflectionTrigger): SelfReflectionEntry[]
+  findAll(): SelfReflectionEntry[]
+  create(data: Omit<SelfReflectionEntry, 'id' | 'createdAt'>): SelfReflectionEntry
+  delete(id: string): boolean
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -148,4 +157,5 @@ export interface IStorage {
   incidentDB: IIncidentDBStorage
   patternLibrary: IPatternLibraryStorage
   featureDNA: IFeatureDNAStorage
+  selfReflection: ISelfReflectionStorage
 }

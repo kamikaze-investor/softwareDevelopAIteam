@@ -224,6 +224,17 @@ export const CREATE_TABLES = `
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS self_reflections (
+    id TEXT PRIMARY KEY,
+    trigger TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    root_cause TEXT,
+    improvement TEXT NOT NULL DEFAULT '',
+    task_id TEXT,
+    related_node_ids TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+  );
 `
 
 /**

@@ -9,8 +9,8 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -30,6 +30,12 @@ function makePatternId(): string {
   const d = new Date()
   const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
   return `pat-${ymd}-${randomUUID().slice(0,3)}`
+}
+
+function makeReflectionId(): string {
+  const d = new Date()
+  const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
+  return `ref-${ymd}-${randomUUID().slice(0,3)}`
 }
 
 export function createSQLiteStorage(dbPath: string): IStorage {
@@ -883,7 +889,42 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA }
+  const selfReflection: ISelfReflectionStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM self_reflections WHERE id = ?').get(id) as any
+      return row ? deserializeSelfReflection(row) : undefined
+    },
+    findByTaskId(taskId) {
+      const rows = db.prepare('SELECT * FROM self_reflections WHERE task_id = ? ORDER BY created_at DESC').all(taskId) as any[]
+      return rows.map(deserializeSelfReflection)
+    },
+    findByTrigger(trigger) {
+      const rows = db.prepare('SELECT * FROM self_reflections WHERE trigger = ? ORDER BY created_at DESC').all(trigger) as any[]
+      return rows.map(deserializeSelfReflection)
+    },
+    findAll() {
+      const rows = db.prepare('SELECT * FROM self_reflections ORDER BY created_at DESC').all() as any[]
+      return rows.map(deserializeSelfReflection)
+    },
+    create(data) {
+      const record: SelfReflectionEntry = { ...data, id: makeReflectionId(), createdAt: now() }
+      db.prepare(`
+        INSERT INTO self_reflections
+          (id, trigger, summary, root_cause, improvement, task_id, related_node_ids, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id, record.trigger, record.summary,
+        record.rootCause ?? null, record.improvement,
+        record.taskId ?? null, JSON.stringify(record.relatedNodeIds), record.createdAt,
+      )
+      return record
+    },
+    delete(id) {
+      return db.prepare('DELETE FROM self_reflections WHERE id = ?').run(id).changes > 0
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
 }
 
 function deserializeProject(row: any): Project {
@@ -1129,6 +1170,19 @@ function deserializeFeatureDNA(row: any): FeatureDNA {
     history: JSON.parse(row.history ?? '[]'),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  }
+}
+
+function deserializeSelfReflection(row: any): SelfReflectionEntry {
+  return {
+    id: row.id,
+    trigger: row.trigger as ReflectionTrigger,
+    summary: row.summary,
+    rootCause: row.root_cause ?? undefined,
+    improvement: row.improvement,
+    taskId: row.task_id ?? undefined,
+    relatedNodeIds: JSON.parse(row.related_node_ids ?? '[]'),
+    createdAt: row.created_at,
   }
 }
 
