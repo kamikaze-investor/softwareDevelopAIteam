@@ -9,10 +9,22 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage } from './interface'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
+
+function makeDecisionId(): string {
+  const d = new Date()
+  const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
+  return `dc-${ymd}-${randomUUID().slice(0,3)}`
+}
+
+function makeIncidentId(): string {
+  const d = new Date()
+  const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
+  return `inc-${ymd}-${randomUUID().slice(0,3)}`
+}
 
 export function createSQLiteStorage(dbPath: string): IStorage {
   const db = new Database(dbPath)
@@ -633,7 +645,131 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph }
+  const decisionCache: IDecisionCacheStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM decision_records WHERE id = ?').get(id) as any
+      return row ? deserializeDecisionRecord(row) : undefined
+    },
+    findByKeywords(keywords) {
+      const all = db.prepare('SELECT * FROM decision_records').all() as any[]
+      return all
+        .map(deserializeDecisionRecord)
+        .filter(rec =>
+          keywords.some(kw =>
+            rec.keywords.some(rk => rk.toLowerCase().includes(kw.toLowerCase()))
+          )
+        )
+    },
+    findAll() {
+      const rows = db.prepare('SELECT * FROM decision_records ORDER BY created_at DESC').all() as any[]
+      return rows.map(deserializeDecisionRecord)
+    },
+    create(data) {
+      const record: DecisionRecord = {
+        ...data,
+        id: makeDecisionId(),
+        createdAt: now(),
+        updatedAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO decision_records
+          (id, title, keywords, decision, rationale, status, context, related_node_ids, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id,
+        record.title,
+        JSON.stringify(record.keywords),
+        record.decision,
+        record.rationale,
+        record.status,
+        JSON.stringify(record.context),
+        JSON.stringify(record.relatedNodeIds),
+        record.createdAt,
+        record.updatedAt,
+      )
+      return record
+    },
+    update(id, data) {
+      const existing = decisionCache.findById(id)
+      if (!existing) return undefined
+      const updated = { ...existing, ...data, updatedAt: now() }
+      db.prepare(`
+        UPDATE decision_records
+        SET title=?, keywords=?, decision=?, rationale=?, status=?, context=?, related_node_ids=?, updated_at=?
+        WHERE id=?
+      `).run(
+        updated.title,
+        JSON.stringify(updated.keywords),
+        updated.decision,
+        updated.rationale,
+        updated.status,
+        JSON.stringify(updated.context),
+        JSON.stringify(updated.relatedNodeIds),
+        updated.updatedAt,
+        id,
+      )
+      return updated
+    },
+    delete(id) {
+      const result = db.prepare('DELETE FROM decision_records WHERE id = ?').run(id)
+      return result.changes > 0
+    },
+  }
+
+  const incidentDB: IIncidentDBStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM incident_records WHERE id = ?').get(id) as any
+      return row ? deserializeIncidentRecord(row) : undefined
+    },
+    findByKeywords(keywords) {
+      const all = db.prepare('SELECT * FROM incident_records').all() as any[]
+      return all
+        .map(deserializeIncidentRecord)
+        .filter(rec =>
+          keywords.some(kw =>
+            rec.keywords.some(rk => rk.toLowerCase().includes(kw.toLowerCase()))
+          )
+        )
+    },
+    findBySeverity(severity) {
+      const rows = db.prepare('SELECT * FROM incident_records WHERE severity = ? ORDER BY created_at DESC').all(severity) as any[]
+      return rows.map(deserializeIncidentRecord)
+    },
+    findAll() {
+      const rows = db.prepare('SELECT * FROM incident_records ORDER BY created_at DESC').all() as any[]
+      return rows.map(deserializeIncidentRecord)
+    },
+    create(data) {
+      const record: IncidentRecord = {
+        ...data,
+        id: makeIncidentId(),
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO incident_records
+          (id, title, keywords, description, root_cause, prevention, severity, related_node_ids, task_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id,
+        record.title,
+        JSON.stringify(record.keywords),
+        record.description,
+        record.rootCause,
+        record.prevention,
+        record.severity,
+        JSON.stringify(record.relatedNodeIds),
+        record.taskId ?? null,
+        record.createdAt,
+      )
+      return record
+    },
+    delete(id) {
+      const result = db.prepare('DELETE FROM incident_records WHERE id = ?').run(id)
+      return result.changes > 0
+    },
+  }
+
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph, decisionCache, incidentDB }
 }
 
 function deserializeProject(row: any): Project {
@@ -809,6 +945,36 @@ function deserializeKGNode(row: any): KGNode {
     historyRefs: JSON.parse(row.history_refs ?? '[]'),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  }
+}
+
+function deserializeDecisionRecord(row: any): DecisionRecord {
+  return {
+    id: row.id,
+    title: row.title,
+    keywords: JSON.parse(row.keywords ?? '[]'),
+    decision: row.decision,
+    rationale: row.rationale,
+    status: row.status as DecisionStatus,
+    context: JSON.parse(row.context ?? '[]'),
+    relatedNodeIds: JSON.parse(row.related_node_ids ?? '[]'),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function deserializeIncidentRecord(row: any): IncidentRecord {
+  return {
+    id: row.id,
+    title: row.title,
+    keywords: JSON.parse(row.keywords ?? '[]'),
+    description: row.description,
+    rootCause: row.root_cause,
+    prevention: row.prevention,
+    severity: row.severity as IncidentSeverity,
+    relatedNodeIds: JSON.parse(row.related_node_ids ?? '[]'),
+    taskId: row.task_id ?? undefined,
+    createdAt: row.created_at,
   }
 }
 

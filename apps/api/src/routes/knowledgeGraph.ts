@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
-import type { KGContextEntry, KGContextPack, ImpactAnalysisResult } from '@ai-team/shared'
+import type { KGContextEntry, KGContextPack, ImpactAnalysisResult, DecisionRecord, IncidentRecord, RiskLookupResult, DecisionStatus, IncidentSeverity } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // Zod スキーマ
@@ -39,6 +39,45 @@ const CreateEdgeSchema = z.object({
   toNodeId: z.string().min(1),
   edgeType: KGEdgeTypeSchema,
   label: z.string().optional(),
+})
+
+const DecisionStatusSchema = z.enum(['active', 'superseded', 'under_review'])
+const IncidentSeveritySchema = z.enum(['low', 'medium', 'high', 'critical'])
+
+const CreateDecisionSchema = z.object({
+  title: z.string().min(1),
+  keywords: z.array(z.string()).default([]),
+  decision: z.string().min(1),
+  rationale: z.string().min(1),
+  status: DecisionStatusSchema.default('active'),
+  context: z.array(z.string()).default([]),
+  relatedNodeIds: z.array(z.string()).default([]),
+})
+
+const UpdateDecisionSchema = z.object({
+  title: z.string().min(1).optional(),
+  keywords: z.array(z.string()).optional(),
+  decision: z.string().min(1).optional(),
+  rationale: z.string().min(1).optional(),
+  status: DecisionStatusSchema.optional(),
+  context: z.array(z.string()).optional(),
+  relatedNodeIds: z.array(z.string()).optional(),
+})
+
+const CreateIncidentSchema = z.object({
+  title: z.string().min(1),
+  keywords: z.array(z.string()).default([]),
+  description: z.string().min(1),
+  rootCause: z.string().min(1),
+  prevention: z.string().min(1),
+  severity: IncidentSeveritySchema.default('medium'),
+  relatedNodeIds: z.array(z.string()).default([]),
+  taskId: z.string().optional(),
+})
+
+const RiskLookupBodySchema = z.object({
+  keywords: z.array(z.string()).min(1),
+  riskLevel: z.enum(['HIGH', 'CRITICAL']),
 })
 
 // ────────────────────────────────────────────────────────────
@@ -501,6 +540,108 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
       analyzedAt: new Date().toISOString(),
     }
 
+    return reply.send(result)
+  })
+
+  // ─── Decision Cache ─────────────────────────────────────────
+
+  // POST /api/kg/decisions
+  app.post('/api/kg/decisions', async (req, reply) => {
+    const parsed = CreateDecisionSchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const storage = getStorage()
+    const record = storage.decisionCache.create(parsed.data)
+    return reply.status(201).send(record)
+  })
+
+  // GET /api/kg/decisions
+  app.get('/api/kg/decisions', async (_req, reply) => {
+    return reply.send(getStorage().decisionCache.findAll())
+  })
+
+  // GET /api/kg/decisions/:id
+  app.get<{ Params: { id: string } }>('/api/kg/decisions/:id', async (req, reply) => {
+    const record = getStorage().decisionCache.findById(req.params.id)
+    if (!record) return reply.status(404).send({ error: 'Decision record not found' })
+    return reply.send(record)
+  })
+
+  // PATCH /api/kg/decisions/:id
+  app.patch<{ Params: { id: string } }>('/api/kg/decisions/:id', async (req, reply) => {
+    const parsed = UpdateDecisionSchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const updated = getStorage().decisionCache.update(req.params.id, parsed.data)
+    if (!updated) return reply.status(404).send({ error: 'Decision record not found' })
+    return reply.send(updated)
+  })
+
+  // DELETE /api/kg/decisions/:id
+  app.delete<{ Params: { id: string } }>('/api/kg/decisions/:id', async (req, reply) => {
+    const deleted = getStorage().decisionCache.delete(req.params.id)
+    if (!deleted) return reply.status(404).send({ error: 'Decision record not found' })
+    return reply.status(204).send()
+  })
+
+  // ─── Incident DB ─────────────────────────────────────────────
+
+  // POST /api/kg/incidents
+  app.post('/api/kg/incidents', async (req, reply) => {
+    const parsed = CreateIncidentSchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const record = getStorage().incidentDB.create(parsed.data)
+    return reply.status(201).send(record)
+  })
+
+  // GET /api/kg/incidents?severity=xxx
+  app.get<{ Querystring: { severity?: string } }>('/api/kg/incidents', async (req, reply) => {
+    const { severity } = req.query
+    if (severity) {
+      const parsed = IncidentSeveritySchema.safeParse(severity)
+      if (!parsed.success) return reply.status(400).send({ error: 'Invalid severity value' })
+      return reply.send(getStorage().incidentDB.findBySeverity(parsed.data))
+    }
+    return reply.send(getStorage().incidentDB.findAll())
+  })
+
+  // GET /api/kg/incidents/:id
+  app.get<{ Params: { id: string } }>('/api/kg/incidents/:id', async (req, reply) => {
+    const record = getStorage().incidentDB.findById(req.params.id)
+    if (!record) return reply.status(404).send({ error: 'Incident record not found' })
+    return reply.send(record)
+  })
+
+  // DELETE /api/kg/incidents/:id
+  app.delete<{ Params: { id: string } }>('/api/kg/incidents/:id', async (req, reply) => {
+    const deleted = getStorage().incidentDB.delete(req.params.id)
+    if (!deleted) return reply.status(404).send({ error: 'Incident record not found' })
+    return reply.status(204).send()
+  })
+
+  // ─── Risk Lookup (HIGH/CRITICAL のみ) ────────────────────
+
+  // POST /api/kg/risk-lookup
+  app.post('/api/kg/risk-lookup', async (req, reply) => {
+    const parsed = RiskLookupBodySchema.safeParse(req.body)
+    if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    const { keywords } = parsed.data
+    const storage = getStorage()
+
+    const decisions = storage.decisionCache.findByKeywords(keywords)
+    const incidents = storage.incidentDB.findByKeywords(keywords)
+
+    const matchedSet = new Set<string>()
+    for (const kw of keywords) {
+      const lcKw = kw.toLowerCase()
+      const hitDecision = decisions.some(d => d.keywords.some(k => k.toLowerCase().includes(lcKw)))
+      const hitIncident = incidents.some(i => i.keywords.some(k => k.toLowerCase().includes(lcKw)))
+      if (hitDecision || hitIncident) matchedSet.add(kw)
+    }
+
+    const result: RiskLookupResult = {
+      decisions,
+      incidents,
+      matchedKeywords: Array.from(matchedSet),
+    }
     return reply.send(result)
   })
 }

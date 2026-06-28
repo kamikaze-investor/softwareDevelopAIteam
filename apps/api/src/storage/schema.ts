@@ -173,6 +173,32 @@ export const CREATE_TABLES = `
     FOREIGN KEY (from_node_id) REFERENCES knowledge_graph_nodes(id),
     FOREIGN KEY (to_node_id) REFERENCES knowledge_graph_nodes(id)
   );
+
+  CREATE TABLE IF NOT EXISTS decision_records (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    keywords TEXT NOT NULL DEFAULT '[]',
+    decision TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    context TEXT NOT NULL DEFAULT '[]',
+    related_node_ids TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS incident_records (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    keywords TEXT NOT NULL DEFAULT '[]',
+    description TEXT NOT NULL,
+    root_cause TEXT NOT NULL,
+    prevention TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'medium',
+    related_node_ids TEXT NOT NULL DEFAULT '[]',
+    task_id TEXT,
+    created_at TEXT NOT NULL
+  );
 `
 
 /**

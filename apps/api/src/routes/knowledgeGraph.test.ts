@@ -1,6 +1,9 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeAll, afterAll, beforeEach, describe, expect, it } from 'vitest'
 import type { KGNode, KGEdge } from '@ai-team/shared'
+
+let decisionId: string
+let incidentId: string
 
 async function buildApp(): Promise<FastifyInstance> {
   process.env.DB_PATH = ':memory:'
@@ -684,5 +687,170 @@ describe('POST /api/kg/impact', () => {
       })
       expect(res.statusCode).toBe(400)
     })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Decision Cache テスト
+// ────────────────────────────────────────────────────────────
+
+describe('Decision Cache', () => {
+  let app: FastifyInstance
+
+  beforeAll(async () => {
+    app = await buildApp()
+  })
+
+  afterAll(async () => {
+    await app.close()
+  })
+
+  it('POST /api/kg/decisions — 登録して201、id が dc- で始まる', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/kg/decisions',
+      payload: {
+        title: 'CONTROL_ROOT は環境変数優先',
+        keywords: ['CONTROL_ROOT', 'env', 'runner'],
+        decision: '環境変数 CONTROL_ROOT が未指定の場合は /workspace/control を使う',
+        rationale: 'コンテナ外から制御ルートを差し替え可能にするため',
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.id).toMatch(/^dc-\d{8}-/)
+    decisionId = body.id
+  })
+
+  it('GET /api/kg/decisions/:id — 単体取得', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/kg/decisions/${decisionId}` })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).title).toBe('CONTROL_ROOT は環境変数優先')
+  })
+
+  it('PATCH /api/kg/decisions/:id — status を superseded に更新', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/kg/decisions/${decisionId}`,
+      payload: { status: 'superseded' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(JSON.parse(res.body).status).toBe('superseded')
+  })
+
+  it('DELETE /api/kg/decisions/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/api/kg/decisions/${decisionId}` })
+    expect(res.statusCode).toBe(204)
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Incident DB テスト
+// ────────────────────────────────────────────────────────────
+
+describe('Incident DB', () => {
+  let app: FastifyInstance
+
+  beforeAll(async () => {
+    app = await buildApp()
+  })
+
+  afterAll(async () => {
+    await app.close()
+  })
+
+  it('POST /api/kg/incidents — 登録して201、id が inc- で始まる', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/kg/incidents',
+      payload: {
+        title: 'AV-001 Control Layer 迂回',
+        keywords: ['control', 'bypass', 'runner', '直接呼び出す'],
+        description: 'AI が approval gate をスキップして直接 runner を呼び出した',
+        rootCause: 'gateProcessor のチェックが不完全だった',
+        prevention: 'すべての runner 呼び出しは gate を経由すること',
+        severity: 'critical',
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.id).toMatch(/^inc-\d{8}-/)
+    incidentId = body.id
+  })
+
+  it('GET /api/kg/incidents?severity=critical — severity フィルタ', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/kg/incidents?severity=critical' })
+    expect(res.statusCode).toBe(200)
+    const list = JSON.parse(res.body)
+    expect(list.length).toBeGreaterThan(0)
+    expect(list.every((i: any) => i.severity === 'critical')).toBe(true)
+  })
+
+  it('DELETE /api/kg/incidents/:id — 204', async () => {
+    const res = await app.inject({ method: 'DELETE', url: `/api/kg/incidents/${incidentId}` })
+    expect(res.statusCode).toBe(204)
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Risk Lookup テスト
+// ────────────────────────────────────────────────────────────
+
+describe('POST /api/kg/risk-lookup', () => {
+  let app: FastifyInstance
+  let dcId: string
+  let incId: string
+
+  beforeAll(async () => {
+    app = await buildApp()
+
+    const dc = await app.inject({
+      method: 'POST', url: '/api/kg/decisions',
+      payload: { title: 'Auth token 保存先', keywords: ['auth', 'token', 'storage'], decision: 'トークンは DB に保存しない', rationale: 'セキュリティ要件' },
+    })
+    dcId = JSON.parse(dc.body).id
+
+    const inc = await app.inject({
+      method: 'POST', url: '/api/kg/incidents',
+      payload: { title: 'Token 漏洩事例', keywords: ['auth', 'token', 'leak'], description: 'トークンがログに出力された', rootCause: 'debug ログが本番で有効だった', prevention: 'debug ログは本番無効', severity: 'high' },
+    })
+    incId = JSON.parse(inc.body).id
+  })
+
+  afterAll(async () => {
+    await app.inject({ method: 'DELETE', url: `/api/kg/decisions/${dcId}` })
+    await app.inject({ method: 'DELETE', url: `/api/kg/incidents/${incId}` })
+    await app.close()
+  })
+
+  it('keywords にマッチする Decision と Incident が返る', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/risk-lookup',
+      payload: { keywords: ['auth', 'token'], riskLevel: 'HIGH' },
+    })
+    expect(res.statusCode).toBe(200)
+    const body = JSON.parse(res.body)
+    expect(body.decisions.some((d: any) => d.id === dcId)).toBe(true)
+    expect(body.incidents.some((i: any) => i.id === incId)).toBe(true)
+    expect(body.matchedKeywords.length).toBeGreaterThan(0)
+  })
+
+  it('マッチなしでも 200 + 空配列', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/risk-lookup',
+      payload: { keywords: ['xxxxunmatched'], riskLevel: 'CRITICAL' },
+    })
+    expect(res.statusCode).toBe(200)
+    const body = JSON.parse(res.body)
+    expect(body.decisions).toEqual([])
+    expect(body.incidents).toEqual([])
+  })
+
+  it('riskLevel=LOW → 400', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/api/kg/risk-lookup',
+      payload: { keywords: ['auth'], riskLevel: 'LOW' },
+    })
+    expect(res.statusCode).toBe(400)
   })
 })
