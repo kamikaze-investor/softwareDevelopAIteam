@@ -34,6 +34,19 @@
 - [x] commandResolver (kind→argv変換 / サニタイズ)
 - [x] Docker: Control(read-only) / Target(read-write) 物理分離
 
+### 1-G: Approval Gate（承認ゲート）✅
+- [x] 承認ゲート型定義・純粋関数群 (packages/shared/src/approvalGateLogic.ts)
+- [x] approval_requests テーブル + SQLite CRUD
+- [x] POST /api/gate/check — changedFiles ベースリスク判定・GateOutcome
+- [x] POST /api/approval-requests — 承認リクエスト作成・SUPERSEDED 自動化
+- [x] PATCH /api/approval-requests/:id/status — APPROVED / REJECTED のみ受付
+- [x] POST /api/approval-requests/:id/consume — APPROVED → CONSUMED（一回限り保証）
+- [x] SUPERSEDED / STALE / EXPIRED / CONSUMED は内部専用（外部 PATCH 不可）
+- [x] P2-followup: 期限切れ APPROVED の自動 EXPIRED 化 (8a86845)
+- [x] Step A: health-score approvalWaiting を WAITING_FOR_USER 実件数で計測 (31d9941)
+- [x] Step 3D: jobRunner CEO 通知統合（block 時・consume 失敗時・re_check 時） (7345214)
+- [x] Step D: diffText シークレットスキャン（追加行のみ・CRITICAL 昇格・マスク処理） (4169d44)
+
 ### 1-F: AI CLI Adapter基盤 ✅
 - [x] AiCliProvider / AiCliRequest / AiCliResult 型定義 (packages/shared)
 - [x] BaseCliAdapter（セキュリティ強制: workingDir検証・Secret Scan・shell:false）
@@ -46,7 +59,7 @@
 - [ ] CLI timeout / retry / cancel設計 (task-024)
 
 ### 1-D: バックエンド実装
-- [x] SQLite Storage 完全実装 (task-018) ← Codex実装済・masterマージ待ち
+- [x] SQLite Storage 完全実装 (task-018)
 - [ ] Backend: Project CRUD API (task-006)
 - [ ] Backend: Task CRUD API (task-007)
 - [ ] Backend: Job Queue API (task-008)
@@ -60,6 +73,17 @@
 - [ ] Project作成画面 (task-013)
 - [ ] Pending Approval UI (task-019)
 - [ ] ReviewResult / QAResult API + 型 (task-015)
+
+### Phase B: Task Watchdog ✅
+- [x] 停滞検出（CommandKind 別閾値） — stallDetector.ts
+- [x] Watchdog ループ — watchdog.ts
+- [x] WatchdogEvent API — routes/watchdogEvents.ts
+
+### Phase C: 通知 + ダッシュボード ✅
+- [x] 通知ルーター（LINE / Slack） — notifier.ts
+- [x] LINE アダプター — lineAdapter.ts
+- [x] Slack アダプター — slackAdapter.ts
+- [x] ダッシュボード集計 API — routes/dashboard.ts
 
 ---
 
@@ -89,4 +113,4 @@
 
 ---
 
-*Updated: 2026-05-28*
+*Updated: 2026-06-30*
