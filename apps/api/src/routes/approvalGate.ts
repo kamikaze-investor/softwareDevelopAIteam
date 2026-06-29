@@ -182,10 +182,6 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
   // POST /api/gate/check
   // ⚠️ trusted internal caller 専用。
   //    diffText 省略時は changedFiles / targetDiffHash / targetCommit / targetBranch を申告値として信頼する。
-  // P2-followup: expired APPROVED cleanup in /gate/check or storage layer
-  //   /gate/check が decideGateOutcome で EXPIRED を検知した場合、DB の status は更新されない。
-  //   findActiveByTaskId が次回も同じ APPROVED+expired を返し続ける可能性がある。
-  //   対処は別タスクで設計・実装する。
   app.post('/gate/check', async (req, reply) => {
     const parsed = GateCheckBody.safeParse(req.body)
     if (!parsed.success) {
@@ -214,6 +210,15 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
 
     // アクティブな承認リクエストを取得
     let existingReq = storage.approvalRequests.findActiveByTaskId(taskId)
+
+    // P2-followup: expired APPROVED cleanup
+    // findActiveByTaskId は expiresAt を見ないため期限切れ APPROVED が返ることがある。
+    // DB を EXPIRED に更新して次回以降も正しく扱えるようにする。
+    if (existingReq?.status === 'APPROVED' && new Date(existingReq.expiresAt) < new Date()) {
+      console.warn(`[gate/check] expired APPROVED detected: id=${existingReq.id}. Updating to EXPIRED.`)
+      storage.approvalRequests.updateStatus(existingReq.id, 'EXPIRED', undefined, true)
+      existingReq = undefined
+    }
 
     // WAITING_FOR_USER + ref 変化 → SUPERSEDE（decideGateOutcome に渡す前に処理）
     if (existingReq?.status === 'WAITING_FOR_USER') {

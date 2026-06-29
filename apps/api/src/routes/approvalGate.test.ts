@@ -809,6 +809,127 @@ describe('POST /api/gate/check', () => {
 })
 
 // ────────────────────────────────────────────────────────────
+// P2-followup: expired APPROVED cleanup
+// ────────────────────────────────────────────────────────────
+
+describe('POST /api/gate/check — expired APPROVED cleanup (P2-followup)', () => {
+  // P2-16: expired APPROVED → DB status = EXPIRED, outcome = BLOCKED, nextAction = wait_for_approval
+  it('expired APPROVED → DB が EXPIRED に更新され、outcome=BLOCKED + 新規リクエスト作成', async () => {
+    await withApp(async (app) => {
+      // buildApp() 後に dynamic import することで :memory: DB singleton を取得
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      // 期限切れの APPROVED を直接 storage に作成
+      const expiredReq = storage.approvalRequests.create({
+        taskId: 'gate-p2-016',
+        targetBranch: 'feat/test',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+        riskLevel: 'HIGH',
+        requestedAction: 'merge feature branch',
+        status: 'APPROVED',
+        expiresAt: new Date(Date.now() - 5000).toISOString(), // 5秒前に期限切れ
+        invalidIf: [],
+      })
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-p2-016',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+
+      expect(statusCode).toBe(200)
+
+      // 期限切れ APPROVED は BLOCKED として扱う（ALLOW+call_consume にしない）
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.nextAction.action).toBe('wait_for_approval')
+      expect(body.nextAction.action).not.toBe('call_consume')
+
+      // 新規リクエストが作成されていること
+      expect(body.sideEffects).toHaveLength(1)
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+
+      // 旧リクエストの DB status が EXPIRED に更新されていること
+      const getRes = await app.inject({
+        method: 'GET',
+        url: `/api/approval-requests/${expiredReq.id}`,
+      })
+      const stored = parseBody<ApprovalRequest>(getRes.body)
+      expect(stored.status).toBe('EXPIRED')
+    })
+  })
+
+  // P2-17: 期限内の APPROVED は cleanup されない（regression）
+  it('期限内の APPROVED は EXPIRED にならず ALLOW + call_consume になる', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app, {
+        taskId: 'gate-p2-017',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+      await patchStatus(app, req.id, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-p2-017',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
+
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('ALLOW')
+      expect(body.nextAction.action).toBe('call_consume')
+
+      // DB の APPROVED は変化していない
+      const getRes = await app.inject({
+        method: 'GET',
+        url: `/api/approval-requests/${req.id}`,
+      })
+      const stored = parseBody<ApprovalRequest>(getRes.body)
+      expect(stored.status).toBe('APPROVED')
+    })
+  })
+
+  // P2-18: expired APPROVED cleanup 後、EXPIRED は active に出ない（2回目は PENDING_APPROVAL）
+  it('expired APPROVED cleanup 後、EXPIRED は active に出ない（2回目は PENDING_APPROVAL）', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.approvalRequests.create({
+        taskId: 'gate-p2-018',
+        targetBranch: 'feat/test',
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+        riskLevel: 'HIGH',
+        requestedAction: 'merge feature branch',
+        status: 'APPROVED',
+        expiresAt: new Date(Date.now() - 5000).toISOString(),
+        invalidIf: [],
+      })
+
+      // 1回目: 期限切れ APPROVED を検知 → EXPIRED に更新 → BLOCKED + 新規 WAITING_FOR_USER 作成
+      const first = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-p2-018',
+      })
+      expect(first.body.outcome.decision).toBe('BLOCKED')
+      expect(first.body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+
+      // 2回目: EXPIRED は findActiveByTaskId に出ない。
+      //         1回目で作られた WAITING_FOR_USER が active なので PENDING_APPROVAL になる。
+      const second = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-p2-018',
+      })
+      expect(second.body.outcome.decision).toBe('PENDING_APPROVAL')
+      // 新規リクエスト作成は起きない（sideEffects=[]）
+      expect(second.body.sideEffects).toEqual([])
+    })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
 // PATCH /api/approval-requests/:id/status — EXPIRED は受け付けない
 // ────────────────────────────────────────────────────────────
 
