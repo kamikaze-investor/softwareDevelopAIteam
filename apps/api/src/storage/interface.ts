@@ -63,6 +63,8 @@ export interface IApprovalRequestStorage {
   findById(id: string): ApprovalRequest | undefined
   /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す（CONSUMED は除外） */
   findActiveByTaskId(taskId: string): ApprovalRequest | undefined
+  /** status = WAITING_FOR_USER の全件を返す（health-score 用） */
+  findWaiting(): ApprovalRequest[]
   create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined

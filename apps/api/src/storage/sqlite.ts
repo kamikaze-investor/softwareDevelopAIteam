@@ -447,6 +447,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).get(taskId) as any
       return row ? deserializeApprovalRequest(row) : undefined
     },
+    findWaiting() {
+      const rows = db.prepare(
+        `SELECT * FROM approval_requests WHERE status = 'WAITING_FOR_USER' ORDER BY created_at DESC`
+      ).all() as any[]
+      return rows.map(deserializeApprovalRequest)
+    },
     create(data) {
       const req: ApprovalRequest = {
         ...data,

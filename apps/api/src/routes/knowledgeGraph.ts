@@ -897,6 +897,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
     // memoryHealth: inbox が少ないほど良い
     const memoryHealth = totalNodes === 0 ? 100 : Math.max(0, 100 - Math.round((inboxCount / totalNodes) * 100))
 
+    const approvalWaiting = storage.approvalRequests.findWaiting().length
+
     const score: ProjectHealthScore = {
       progress,
       safety,
@@ -904,8 +906,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
       memoryHealth,
       openRisks: highRiskActive,
       blockedTasks: inboxCount,
-      approvalWaiting: null,
-      approvalWaitingAvailable: false,
+      approvalWaiting,
+      approvalWaitingAvailable: true,
       calculatedAt: new Date().toISOString(),
     }
     return reply.send(score)

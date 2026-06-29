@@ -1265,8 +1265,9 @@ describe('GET /kg/health-score', () => {
     expect(typeof body.memoryHealth).toBe('number')
     expect(typeof body.openRisks).toBe('number')
     expect(typeof body.blockedTasks).toBe('number')
-    expect(body.approvalWaiting).toBeNull()
-    expect(body.approvalWaitingAvailable).toBe(false)
+    expect(typeof body.approvalWaiting).toBe('number')
+    expect(body.approvalWaiting).toBeGreaterThanOrEqual(0)
+    expect(body.approvalWaitingAvailable).toBe(true)
     expect(body.calculatedAt).toBeTruthy()
   })
 
@@ -1275,5 +1276,51 @@ describe('GET /kg/health-score', () => {
     const body = JSON.parse(res.body)
     expect(body.progress).toBeGreaterThanOrEqual(0)
     expect(body.progress).toBeLessThanOrEqual(100)
+  })
+
+  it('approvalWaiting は WAITING_FOR_USER の実測件数を返す', async () => {
+    // WAITING_FOR_USER を 2 件追加
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    storage.approvalRequests.create({
+      taskId: 'kg-health-w1',
+      status: 'WAITING_FOR_USER',
+      targetBranch: 'main',
+      targetCommit: 'abc',
+      targetDiffHash: 'hash1',
+      riskLevel: 'HIGH',
+      requestedAction: 'git_commit',
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      invalidIf: [],
+    })
+    storage.approvalRequests.create({
+      taskId: 'kg-health-w2',
+      status: 'WAITING_FOR_USER',
+      targetBranch: 'main',
+      targetCommit: 'def',
+      targetDiffHash: 'hash2',
+      riskLevel: 'CRITICAL',
+      requestedAction: 'git_push',
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      invalidIf: [],
+    })
+    // APPROVED は含まれないことを確認するため追加
+    storage.approvalRequests.create({
+      taskId: 'kg-health-w3',
+      status: 'APPROVED',
+      targetBranch: 'main',
+      targetCommit: 'ghi',
+      targetDiffHash: 'hash3',
+      riskLevel: 'HIGH',
+      requestedAction: 'git_commit',
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      invalidIf: [],
+    })
+
+    const res = await app.inject({ method: 'GET', url: '/kg/health-score' })
+    const body = JSON.parse(res.body)
+    // WAITING_FOR_USER が 2 件、APPROVED は含まれない
+    expect(body.approvalWaiting).toBeGreaterThanOrEqual(2)
+    expect(body.approvalWaitingAvailable).toBe(true)
   })
 })
