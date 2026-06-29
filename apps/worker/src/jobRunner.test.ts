@@ -50,6 +50,10 @@ vi.mock('./guards/gatePolicy.js', () => ({
   SAFE_WORK_ALLOWED_COMMAND_KINDS: ['git_status', 'git_diff', 'git_log', 'typecheck', 'test', 'lint'],
 }))
 
+vi.mock('./notifier/notifier.js', () => ({
+  sendAlert: vi.fn().mockResolvedValue([]),
+}))
+
 // ────────────────────────────────────────────────────────────
 // Mock references
 // ────────────────────────────────────────────────────────────
@@ -64,6 +68,9 @@ const resolvePolicyMock = vi.mocked(resolvePolicy)
 
 import { permissionGuardWithGrants } from './guards/permissionGuard.js'
 const permissionGuardWithGrantsMock = vi.mocked(permissionGuardWithGrants)
+
+import { sendAlert } from './notifier/notifier.js'
+const sendAlertMock = vi.mocked(sendAlert)
 
 // ────────────────────────────────────────────────────────────
 // Helpers
@@ -99,6 +106,9 @@ function createJob(overrides: Partial<Job> = {}): Job {
 
 beforeEach(() => {
   vi.clearAllMocks()
+
+  // Notifier: always resolve silently by default
+  sendAlertMock.mockResolvedValue([])
 
   // Gate mocks: default to ALLOW / continue
   callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
@@ -729,5 +739,258 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     const consumeParams = callConsumeMock.mock.calls[0][1] as { currentCommit: string; currentDiffHash: string }
     expect(consumeParams.currentCommit).toBe(gateCheckParams.targetCommit)
     expect(consumeParams.currentDiffHash).toBe(gateCheckParams.targetDiffHash)
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Notifier / CEO 通知テスト (Step 3D)
+// ────────────────────────────────────────────────────────────
+
+describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
+  // approvalRequest fixture (最小フィールド)
+  function makeApprovalRequest(id: string) {
+    return {
+      id,
+      status: 'WAITING_FOR_USER' as const,
+      taskId: 'task-1',
+      targetBranch: 'feat/test',
+      targetCommit: 'abc123',
+      targetDiffHash: 'deadbeef',
+      riskLevel: 'HIGH' as const,
+      requestedAction: 'merge',
+      expiresAt: '2026-12-31T00:00:00.000Z',
+      createdAt: new Date().toISOString(),
+      invalidIf: [],
+    }
+  }
+
+  function makeBlockedResponse(approvalRequestId: string) {
+    return {
+      ...ALLOW_PROCEED_RESPONSE,
+      approvalRequest: makeApprovalRequest(approvalRequestId),
+      nextAction: {
+        action: 'wait_for_approval' as const,
+        requestId: approvalRequestId,
+        message: '承認待ち',
+      },
+    }
+  }
+
+  // 1. block_until_approved → sendAlert が severity='critical' で呼ばれる
+  it('block_until_approved → sendAlert が severity=critical で呼ばれる', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-001'))
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL risk',
+      apiAvailable: true,
+    })
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).toHaveBeenCalledOnce()
+    expect(sendAlertMock).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical' }),
+    )
+  })
+
+  // 2. block_until_approved の title に safeCommand.kind が含まれる
+  it('block_until_approved の title に safeCommand.kind が含まれる', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-002'))
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL',
+      apiAvailable: true,
+    })
+
+    const job = createJob({ safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } } })
+    await runJob(job)
+
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.title).toContain('git_commit')
+  })
+
+  // 3. block_until_approved の body に taskId / job.id / approvalRequestId が含まれる
+  it('block_until_approved の body に taskId / job.id / approvalRequestId が含まれる', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-003'))
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL',
+      apiAvailable: true,
+    })
+
+    const job = createJob({ taskId: 'task-notif-3d', id: 'job-notif-3d' })
+    await runJob(job)
+
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.body).toContain('task-notif-3d')
+    expect(payload.body).toContain('job-notif-3d')
+    expect(payload.body).toContain('req-3d-003')
+  })
+
+  // 4. 同一 approvalRequestId の block_until_approved は 2 回目通知されない（dedup）
+  it('同一 approvalRequestId の block_until_approved は 2 回目通知されない', async () => {
+    const DEDUP_ID = 'req-3d-dedup-001'
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse(DEDUP_ID))
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL',
+      apiAvailable: true,
+    })
+
+    // 1 回目
+    await runJob(createJob())
+    expect(sendAlertMock).toHaveBeenCalledOnce()
+
+    sendAlertMock.mockClear()
+
+    // 2 回目 (同一 approvalRequestId)
+    await runJob(createJob())
+    expect(sendAlertMock).not.toHaveBeenCalled()
+  })
+
+  // 5. re_check → sendAlert が severity='warning' で呼ばれる
+  it('re_check → sendAlert が severity=warning で呼ばれる', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-005'))
+    resolvePolicyMock.mockReturnValue({
+      policy: 're_check',
+      reason: 'Approval is stale',
+      apiAvailable: true,
+    })
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).toHaveBeenCalledOnce()
+    expect(sendAlertMock).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'warning' }),
+    )
+  })
+
+  // 6. consume failed → sendAlert が severity='critical' で呼ばれる
+  it('consume failed → sendAlert が severity=critical で呼ばれる', async () => {
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-3d-006', message: 'consume' },
+    })
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockRejectedValue(new Error('HTTP 409 stale'))
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).toHaveBeenCalledOnce()
+    expect(sendAlertMock).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical', sourceType: 'gate_consume_failed' }),
+    )
+  })
+
+  // 7. consumedRequestId missing → sendAlert が severity='critical' で呼ばれる
+  it('consumedRequestId missing → sendAlert が severity=critical で呼ばれる', async () => {
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, message: 'missing id' },
+    })
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).toHaveBeenCalledOnce()
+    expect(sendAlertMock).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical', sourceType: 'gate_consume_missing_id' }),
+    )
+  })
+
+  // 8. continue → sendAlert は呼ばれない
+  it('continue → sendAlert は呼ばれない', async () => {
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).not.toHaveBeenCalled()
+  })
+
+  // 9. continue_safe_work_only + safe command → sendAlert は呼ばれない
+  it('continue_safe_work_only + safe command (test) → sendAlert は呼ばれない', async () => {
+    resolvePolicyMock.mockReturnValue({
+      policy: 'continue_safe_work_only',
+      reason: 'HIGH risk',
+      apiAvailable: true,
+    })
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'test'], description: 'test' })
+
+    const job = createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } })
+    await runJob(job)
+
+    expect(sendAlertMock).not.toHaveBeenCalled()
+  })
+
+  // 10. continue_safe_work_only + unsafe command blocked → sendAlert は呼ばれない（console.warn のみ）
+  it('continue_safe_work_only + unsafe command blocked → sendAlert は呼ばれない', async () => {
+    resolvePolicyMock.mockReturnValue({
+      policy: 'continue_safe_work_only',
+      reason: 'HIGH risk',
+      apiAvailable: true,
+    })
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+    })
+    await runJob(job)
+
+    expect(sendAlertMock).not.toHaveBeenCalled()
+  })
+
+  // 11. alreadyConsumed → sendAlert は呼ばれない
+  it('alreadyConsumed → sendAlert は呼ばれない', async () => {
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-3d-011', message: 'consume' },
+    })
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockResolvedValue({ ok: true, alreadyConsumed: true })
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).not.toHaveBeenCalled()
+  })
+
+  // 12. permission guard blocked → sendAlert は呼ばれない
+  it('permission guard blocked → sendAlert は呼ばれない', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      reason: 'outside TARGET_ROOT',
+    })
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).not.toHaveBeenCalled()
+  })
+
+  // 13. callGateCheck failed → sendAlert は呼ばれない
+  it('callGateCheck failed → sendAlert は呼ばれない', async () => {
+    callGateCheckMock.mockRejectedValue(new Error('ECONNREFUSED'))
+    resolvePolicyMock.mockReturnValue({
+      policy: 'continue_safe_work_only',
+      reason: 'Gate API unavailable',
+      apiAvailable: false,
+    })
+
+    await runJob(createJob())
+
+    expect(sendAlertMock).not.toHaveBeenCalled()
+  })
+
+  // 14. sendAlert が同期 throw しても blocked return は維持される
+  it('sendAlert が同期 throw しても blocked return は維持される', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-014'))
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL',
+      apiAvailable: true,
+    })
+    sendAlertMock.mockImplementation(() => { throw new Error('sync notification error') })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('block_until_approved')
   })
 })

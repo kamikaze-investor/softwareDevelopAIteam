@@ -20,8 +20,12 @@ import { resolvePolicy, SAFE_WORK_ALLOWED_COMMAND_KINDS } from './guards/gatePol
 import type { EffectivePolicy } from './guards/gatePolicy.js'
 import { toGateDecision } from './guards/safetyAuditor.js'
 import type { GateResult } from './guards/gateProcessor.js'
+import { sendAlert } from './notifier/notifier.js'
 
 const JOB_TIMEOUT_MS = 120_000
+
+/** 重複 CEO 通知防止: 同一 approvalRequestId には一度だけ通知する */
+const notifiedApprovalRequests = new Set<string>()
 const API_BASE_URL = process.env.API_BASE_URL ?? 'http://localhost:3000'
 
 interface ExecFileFailure {
@@ -107,6 +111,67 @@ export async function runJob(job: Job): Promise<JobRunResult> {
 
   if (gateResult.policy === 'block_until_approved' || gateResult.policy === 're_check') {
     console.warn(`[gate] ${gateResult.policy}: taskId=${job.taskId} reason="${gateResult.reason}"`)
+
+    const approvalRequestId =
+      checkResponse?.approvalRequest?.id ??
+      checkResponse?.nextAction?.requestId ??
+      checkResponse?.nextAction?.consumedRequestId
+    const expiresAt = checkResponse?.approvalRequest?.expiresAt
+
+    // dedup: 同一 approvalRequestId への重複通知を抑制
+    const dedupKey = approvalRequestId
+    if (!dedupKey || !notifiedApprovalRequests.has(dedupKey)) {
+      if (dedupKey) notifiedApprovalRequests.add(dedupKey)
+
+      if (gateResult.policy === 'block_until_approved') {
+        notifyGateEvent({
+          severity: 'critical',
+          title: `🚨 承認待ち — ${job.safeCommand.kind} が停止`,
+          body: [
+            '[ACTION REQUIRED] 人間による承認が必要です。',
+            '',
+            `コマンド: ${job.safeCommand.kind}`,
+            `タスク: ${job.taskId}`,
+            `Job: ${job.id}`,
+            `理由: ${gateResult.reason}`,
+            `承認リクエスト: ${approvalRequestId ?? '不明'}`,
+            `承認期限: ${expiresAt ?? '不明'}`,
+            `変更ファイル: ${formatChangedFiles(preChangedFiles)}`,
+            `コミット: ${targetCommit}`,
+            `DiffHash: ${targetDiffHash}`,
+            `検出時刻: ${new Date().toISOString()}`,
+            '',
+            '次のアクション:',
+            '承認が必要な場合は approval request を確認してください。',
+          ].join('\n'),
+          sourceType: 'gate_blocked',
+          sourceId: approvalRequestId ?? job.id,
+        })
+      } else {
+        notifyGateEvent({
+          severity: 'warning',
+          title: `⚠️ 承認無効 — 再確認が必要 (${job.safeCommand.kind})`,
+          body: [
+            '承認が無効化されたか、再確認が必要です。',
+            '',
+            `コマンド: ${job.safeCommand.kind}`,
+            `タスク: ${job.taskId}`,
+            `Job: ${job.id}`,
+            `理由: ${gateResult.reason}`,
+            `対象リクエスト: ${approvalRequestId ?? '不明'}`,
+            `コミット: ${targetCommit}`,
+            `DiffHash: ${targetDiffHash}`,
+            `検出時刻: ${new Date().toISOString()}`,
+            '',
+            '次のアクション:',
+            'もう一度 Gate check を行い、新しい承認フローを開始してください。',
+          ].join('\n'),
+          sourceType: 'gate_stale',
+          sourceId: approvalRequestId ?? job.id,
+        })
+      }
+    }
+
     return {
       status: 'blocked',
       guardResult: {
@@ -147,6 +212,23 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     const consumeRequestId = checkResponse.nextAction.consumedRequestId
     if (!consumeRequestId) {
       console.error('[gate] consume requested but consumedRequestId is missing')
+      notifyGateEvent({
+        severity: 'critical',
+        title: `🚨 承認 consume ID 欠落 — ${job.safeCommand.kind}`,
+        body: [
+          'Gate API が call_consume を要求しましたが、consumedRequestId がありません。',
+          '',
+          `コマンド: ${job.safeCommand.kind}`,
+          `タスク: ${job.taskId}`,
+          `Job: ${job.id}`,
+          '理由: API response inconsistency',
+          `コミット: ${targetCommit}`,
+          `DiffHash: ${targetDiffHash}`,
+          `検出時刻: ${new Date().toISOString()}`,
+        ].join('\n'),
+        sourceType: 'gate_consume_missing_id',
+        sourceId: job.id,
+      })
       return {
         status: 'blocked',
         guardResult: {
@@ -176,6 +258,24 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       console.error(`[gate] consume failed: ${message}`)
+      notifyGateEvent({
+        severity: 'critical',
+        title: `🚨 承認 consume 失敗 — ${job.safeCommand.kind}`,
+        body: [
+          '承認の使用に失敗しました。システム調査が必要です。',
+          '',
+          `コマンド: ${job.safeCommand.kind}`,
+          `タスク: ${job.taskId}`,
+          `Job: ${job.id}`,
+          `エラー: ${message}`,
+          `リクエストID: ${consumeRequestId ?? '不明'}`,
+          `コミット: ${targetCommit}`,
+          `DiffHash: ${targetDiffHash}`,
+          `検出時刻: ${new Date().toISOString()}`,
+        ].join('\n'),
+        sourceType: 'gate_consume_failed',
+        sourceId: consumeRequestId ?? job.id,
+      })
       return {
         status: 'blocked',
         guardResult: {
@@ -333,6 +433,28 @@ function outputToString(output: string | Buffer | undefined): string {
 
 function formatUnknownError(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+// ── Gate 通知ヘルパー ──
+
+/**
+ * sendAlert を void で呼び出す best-effort ラッパー。
+ * 同期 throw を握りつぶし、Gate 判定に影響させない。
+ * 非同期失敗は sendAlert 側が console.error に記録する。
+ */
+function notifyGateEvent(payload: Parameters<typeof sendAlert>[0]): void {
+  try {
+    void sendAlert(payload)
+  } catch (err) {
+    console.error(`[gate] failed to dispatch notification: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+/** 変更ファイル一覧を最大3件に丸めて文字列化する */
+function formatChangedFiles(files: string[]): string {
+  if (files.length === 0) return 'なし'
+  const head = files.slice(0, 3).join(', ')
+  return files.length > 3 ? `${head} …他${files.length - 3}件` : head
 }
 
 // 後方互換のため permissionGuard を再エクスポート
