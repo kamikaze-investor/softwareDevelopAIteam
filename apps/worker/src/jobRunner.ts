@@ -15,7 +15,7 @@ import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
-import { callGateCheck } from './guards/gateClient.js'
+import { callGateCheck, callConsume } from './guards/gateClient.js'
 import { resolvePolicy } from './guards/gatePolicy.js'
 import type { EffectivePolicy } from './guards/gatePolicy.js'
 import { toGateDecision } from './guards/safetyAuditor.js'
@@ -142,9 +142,54 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     }
   }
 
-  // consume は Step 3B で接続予定
+  // ── consume (Step 3B) ──
   if (checkResponse?.nextAction?.action === 'call_consume') {
-    console.warn('[gate] nextAction=call_consume received, but consume integration is deferred')
+    const consumeRequestId = checkResponse.nextAction.consumedRequestId
+    if (!consumeRequestId) {
+      console.error('[gate] consume requested but consumedRequestId is missing')
+      return {
+        status: 'blocked',
+        guardResult: {
+          permissionAllowed: true,
+          permissionReason: undefined,
+          fileChangeAllowed: true,
+          fileViolations: [],
+        },
+        gatePolicy: 'block_until_approved',
+        gateBlockReason: 'consume requested but consumedRequestId is missing',
+        startedAt,
+        completedAt: new Date().toISOString(),
+      }
+    }
+
+    console.log(`[gate] consuming approval request: requestId=${consumeRequestId}`)
+    try {
+      const consumeResult = await callConsume(consumeRequestId, {
+        currentCommit: targetCommit,
+        currentDiffHash: targetDiffHash,
+      })
+      if (consumeResult.alreadyConsumed) {
+        console.warn(`[gate] approval already consumed: requestId=${consumeRequestId}`)
+      } else {
+        console.log(`[gate] approval consumed: requestId=${consumeRequestId}`)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error(`[gate] consume failed: ${message}`)
+      return {
+        status: 'blocked',
+        guardResult: {
+          permissionAllowed: true,
+          permissionReason: undefined,
+          fileChangeAllowed: true,
+          fileViolations: [],
+        },
+        gatePolicy: 'block_until_approved',
+        gateBlockReason: `consume failed: ${message}`,
+        startedAt,
+        completedAt: new Date().toISOString(),
+      }
+    }
   }
   // ── Gate check end ──
 

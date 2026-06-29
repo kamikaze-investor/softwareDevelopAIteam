@@ -434,11 +434,8 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     expect(result.status).toBe('success') // continue_safe_work_only + git_status → allowed
   })
 
-  it('nextAction: call_consume → callConsume is NOT called (deferred)', async () => {
-    callGateCheckMock.mockResolvedValue({
-      ...ALLOW_PROCEED_RESPONSE,
-      nextAction: { action: 'call_consume', consumedRequestId: 'req-001', message: 'consume it' },
-    })
+  it('nextAction: proceed → callConsume is NOT called', async () => {
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
     const result = await runJob(createJob())
@@ -489,5 +486,137 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     expect(callGateCheckMock).toHaveBeenCalledWith(
       expect.not.objectContaining({ diffText: expect.anything() })
     )
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// callConsume 接続テスト (Step 3B)
+// ────────────────────────────────────────────────────────────
+
+describe('runJob — callConsume integration (Step 3B)', () => {
+  const CONSUME_RESPONSE = {
+    ...ALLOW_PROCEED_RESPONSE,
+    outcome: { decision: 'ALLOW' as const, riskLevel: 'LOW', consumedRequestId: 'req-001' },
+    nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-001', message: 'consume it' },
+  }
+
+  it('nextAction: call_consume + consumedRequestId → callConsume is called', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+
+    await runJob(createJob())
+
+    expect(callConsumeMock).toHaveBeenCalledWith(
+      'req-001',
+      expect.objectContaining({ currentCommit: expect.any(String), currentDiffHash: expect.any(String) }),
+    )
+  })
+
+  it('consume success → existing flow continues (status: success)', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockResolvedValue({ ok: true })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('success')
+    expect(result.gatePolicy).toBeUndefined()
+  })
+
+  it('alreadyConsumed: true → existing flow continues (status: success)', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockResolvedValue({ ok: true, alreadyConsumed: true })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('success')
+    expect(callConsumeMock).toHaveBeenCalled()
+  })
+
+  it('consume throws → status: blocked with gateBlockReason', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockRejectedValue(new Error('HTTP 409 — Approval request is stale'))
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('block_until_approved')
+    expect(result.gateBlockReason).toContain('consume failed')
+    expect(result.gateBlockReason).toContain('409')
+  })
+
+  it('consume fails → resolveCommand is NOT called', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockRejectedValue(new Error('network error'))
+
+    await runJob(createJob())
+
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('nextAction: call_consume without consumedRequestId → blocked', async () => {
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, message: 'missing id' },
+    })
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gateBlockReason).toContain('consumedRequestId is missing')
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+
+  it('policy: block_until_approved → callConsume is NOT called', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'block_until_approved', reason: 'CRITICAL', apiAvailable: true })
+
+    await runJob(createJob())
+
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+
+  it('policy: re_check → callConsume is NOT called', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: 'stale', apiAvailable: true })
+
+    await runJob(createJob())
+
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+
+  it('nextAction: proceed → callConsume is NOT called', async () => {
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+
+    await runJob(createJob())
+
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+
+  it('permission guard blocked → callConsume is NOT called', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: false, reason: 'outside TARGET_ROOT' })
+
+    await runJob(createJob())
+
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+
+  it('consume uses same targetCommit and targetDiffHash as gate check', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+
+    await runJob(createJob())
+
+    // consume に渡す currentCommit / currentDiffHash は gate check 時と同一値
+    const gateCheckParams = callGateCheckMock.mock.calls[0][0]
+    // callConsume(requestId, { currentCommit, currentDiffHash }) → calls[0] = [requestId, params]
+    const consumeParams = callConsumeMock.mock.calls[0][1] as { currentCommit: string; currentDiffHash: string }
+    expect(consumeParams.currentCommit).toBe(gateCheckParams.targetCommit)
+    expect(consumeParams.currentDiffHash).toBe(gateCheckParams.targetDiffHash)
   })
 })
