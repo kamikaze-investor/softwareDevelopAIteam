@@ -613,6 +613,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return updated
     },
     deleteNode(id) {
+      // 接続する edge を先に削除（orphan 防止）
+      db.prepare('DELETE FROM knowledge_graph_edges WHERE from_node_id = ? OR to_node_id = ?').run(id, id)
       const result = db.prepare('DELETE FROM knowledge_graph_nodes WHERE id = ?').run(id)
       return result.changes > 0
     },

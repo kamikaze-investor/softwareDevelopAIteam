@@ -1041,10 +1041,16 @@ describe('Feature DNA', () => {
 
   beforeAll(async () => {
     app = await buildApp()
-    dnaNodeId = 'kg-test-dna-001'
+    // Fix 2 対応: 実在する KGNode を先に作成
+    const nodeRes = await app.inject({
+      method: 'POST', url: '/kg/nodes',
+      payload: { type: 'feature', title: 'Feature DNA テスト用ノード' },
+    })
+    dnaNodeId = JSON.parse(nodeRes.body).id
   })
 
   afterAll(async () => {
+    await app.inject({ method: 'DELETE', url: `/kg/nodes/${dnaNodeId}` })
     await app.close()
   })
 
@@ -1086,6 +1092,108 @@ describe('Feature DNA', () => {
   it('DELETE /kg/feature-dna/:nodeId — 204', async () => {
     const res = await app.inject({ method: 'DELETE', url: `/kg/feature-dna/${dnaNodeId}` })
     expect(res.statusCode).toBe(204)
+  })
+
+  it('POST /kg/feature-dna — 存在しない nodeId では 400 になる', async () => {
+    const res = await app.inject({
+      method: 'POST', url: '/kg/feature-dna',
+      payload: { nodeId: 'kg-99999999-nonexistent', reason: '存在しないノード' },
+    })
+    expect(res.statusCode).toBe(400)
+    expect(JSON.parse(res.body).error).toMatch(/KGNode not found/)
+  })
+
+  it('POST /kg/feature-dna — 実在する KGNode なら成功する', async () => {
+    // まず KGNode を作成
+    const nodeRes = await app.inject({
+      method: 'POST', url: '/kg/nodes',
+      payload: { type: 'feature', title: 'FeatureDNA 存在チェックテスト用ノード' },
+    })
+    const validNodeId = JSON.parse(nodeRes.body).id
+
+    // DNA を作成
+    const res = await app.inject({
+      method: 'POST', url: '/kg/feature-dna',
+      payload: { nodeId: validNodeId, reason: '実在ノードへのDNA登録テスト' },
+    })
+    expect(res.statusCode).toBe(201)
+    expect(JSON.parse(res.body).nodeId).toBe(validNodeId)
+
+    // クリーンアップ
+    await app.inject({ method: 'DELETE', url: `/kg/feature-dna/${validNodeId}` })
+    await app.inject({ method: 'DELETE', url: `/kg/nodes/${validNodeId}` })
+  })
+})
+
+describe('Node削除時の orphan edge 対策', () => {
+  it('Node削除時に接続 edge も削除される', async () => {
+    await withApp(async (app) => {
+      // Node A, Node B を作成
+      const resA = await app.inject({
+        method: 'POST', url: '/kg/nodes',
+        payload: { type: 'feature', title: 'Node A (orphan test)' },
+      })
+      const resB = await app.inject({
+        method: 'POST', url: '/kg/nodes',
+        payload: { type: 'feature', title: 'Node B (orphan test)' },
+      })
+      const nodeAId = JSON.parse(resA.body).id
+      const nodeBId = JSON.parse(resB.body).id
+
+      // A → B の edge を作成
+      const edgeRes = await app.inject({
+        method: 'POST', url: '/kg/edges',
+        payload: { fromNodeId: nodeAId, toNodeId: nodeBId, edgeType: 'depends_on' },
+      })
+      const edgeId = JSON.parse(edgeRes.body).id
+
+      // Node A を削除
+      await app.inject({ method: 'DELETE', url: `/kg/nodes/${nodeAId}` })
+
+      // A に関連する edge が削除されていること
+      const edgeCheck = await app.inject({ method: 'GET', url: `/kg/edges/${edgeId}` })
+      expect(edgeCheck.statusCode).toBe(404)
+
+      // Node B は残っていること
+      const nodeBCheck = await app.inject({ method: 'GET', url: `/kg/nodes/${nodeBId}` })
+      expect(nodeBCheck.statusCode).toBe(200)
+
+      // クリーンアップ
+      await app.inject({ method: 'DELETE', url: `/kg/nodes/${nodeBId}` })
+    })
+  })
+
+  it('Node B 削除時も、A→B edge が削除される', async () => {
+    await withApp(async (app) => {
+      // Node A, Node B を作成
+      const resA = await app.inject({
+        method: 'POST', url: '/kg/nodes',
+        payload: { type: 'feature', title: 'Node A (to-node orphan test)' },
+      })
+      const resB = await app.inject({
+        method: 'POST', url: '/kg/nodes',
+        payload: { type: 'feature', title: 'Node B (to-node orphan test)' },
+      })
+      const nodeAId = JSON.parse(resA.body).id
+      const nodeBId = JSON.parse(resB.body).id
+
+      // A → B の edge を作成
+      const edgeRes = await app.inject({
+        method: 'POST', url: '/kg/edges',
+        payload: { fromNodeId: nodeAId, toNodeId: nodeBId, edgeType: 'blocks' },
+      })
+      const edgeId = JSON.parse(edgeRes.body).id
+
+      // Node B を削除（to_node_id 側）
+      await app.inject({ method: 'DELETE', url: `/kg/nodes/${nodeBId}` })
+
+      // edge が削除されていること
+      const edgeCheck = await app.inject({ method: 'GET', url: `/kg/edges/${edgeId}` })
+      expect(edgeCheck.statusCode).toBe(404)
+
+      // クリーンアップ
+      await app.inject({ method: 'DELETE', url: `/kg/nodes/${nodeAId}` })
+    })
   })
 })
 

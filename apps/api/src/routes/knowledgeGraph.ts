@@ -787,10 +787,17 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
   app.post('/kg/feature-dna', async (req, reply) => {
     const parsed = CreateFeatureDNASchema.safeParse(req.body)
     if (!parsed.success) return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
-    const dna = getStorage().featureDNA
-    const existing = dna.findByNodeId(parsed.data.nodeId)
+    const storage = getStorage()
+
+    // nodeId の KGNode 存在チェック（新規追加）
+    const node = storage.knowledgeGraph.findNodeById(parsed.data.nodeId)
+    if (!node) {
+      return reply.status(400).send({ error: `KGNode not found for nodeId: ${parsed.data.nodeId}` })
+    }
+
+    const existing = storage.featureDNA.findByNodeId(parsed.data.nodeId)
     if (existing) return reply.status(409).send({ error: 'FeatureDNA for this nodeId already exists' })
-    const record = dna.create(parsed.data)
+    const record = storage.featureDNA.create(parsed.data)
     return reply.status(201).send(record)
   })
 
