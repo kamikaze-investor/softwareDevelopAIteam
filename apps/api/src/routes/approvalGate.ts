@@ -61,8 +61,7 @@ const GateCheckBody = z.object({
   diffText:        z.string().optional(),
   // TODO: 外部公開APIとして使う場合は diffText を必須化し、
   //       サーバー側でハッシュ照合すること（現在は trusted internal caller 専用）
-  // TODO(Step D): diffText content rules — diff ハンク内のパターンスキャン（シークレット検出等）
-  //               changedFiles ベースの Risk Review を補完する形で将来追加予定
+  // Step D 実装済み: diffText 内容スキャン（シークレット検出）→ routes/approvalGate.ts の scanDiffForSecrets()
 })
 
 // ────────────────────────────────────────────────────────────
@@ -136,6 +135,68 @@ function computeNextAction(
   }
 }
 
+// ────────────────────────────────────────────────────────────
+// Step D: diff内容スキャン（シークレット検出）
+// ────────────────────────────────────────────────────────────
+
+interface DiffScanHit {
+  /** 検出されたシークレットの種類（値そのものは含まない） */
+  label: string
+  /** マスクされた行（値部分は *** に置換） */
+  maskedLine: string
+}
+
+interface DiffScanResult {
+  hits: DiffScanHit[]
+}
+
+/** 追加行（+始まり）のみを対象とする検出ルール */
+const DIFF_SECRET_RULES: Array<{
+  label: string
+  /** 行全体にマッチ。キャプチャグループ1が値部分（マスク対象） */
+  pattern: RegExp
+}> = [
+  { label: 'API_KEY',        pattern: /\bAPI_KEY\s*[:=]\s*(\S+)/i },
+  { label: 'SECRET_KEY',     pattern: /\bSECRET(?:_KEY)?\s*[:=]\s*(\S+)/i },
+  { label: 'PASSWORD',       pattern: /\bPASSWORD\s*[:=]\s*(\S+)/i },
+  { label: 'ACCESS_TOKEN',   pattern: /\bACCESS_TOKEN\s*[:=]\s*(\S+)/i },
+  { label: 'AUTH_TOKEN',     pattern: /\bAUTH_TOKEN\s*[:=]\s*(\S+)/i },
+  { label: 'PRIVATE_KEY',    pattern: /\bPRIVATE_KEY\s*[:=]\s*(\S+)/i },
+  { label: 'ACCESS_KEY_ID',  pattern: /\bACCESS_KEY(?:_ID)?\s*[:=]\s*(\S+)/i },
+  { label: 'WEBHOOK_URL',    pattern: /\bWEBHOOK_URL\s*[:=]\s*(\S+)/i },
+  { label: 'DATABASE_URL',   pattern: /\bDATABASE_URL\s*[:=]\s*(\S+)/i },
+  { label: 'PEM private key', pattern: /(-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/ },
+  // .env 追加行に値付きの代入がある場合（KEY=VALUE 形式、値が16文字以上のランダム文字列）
+  { label: 'env assignment (long value)', pattern: /^[A-Z][A-Z0-9_]{3,}=([A-Za-z0-9+/=_\-]{16,})$/ },
+]
+
+/**
+ * diffText の追加行（+で始まる行）をスキャンしてシークレット疑いを検出する。
+ * 値そのものはレスポンスに含めず、マスク済み行のみ返す。
+ */
+function scanDiffForSecrets(diffText: string): DiffScanResult {
+  const hits: DiffScanHit[] = []
+  const addedLines = diffText
+    .split('\n')
+    .filter(line => line.startsWith('+') && !line.startsWith('+++'))
+    .map(line => line.slice(1)) // '+' を除いた実際の内容
+
+  for (const line of addedLines) {
+    for (const rule of DIFF_SECRET_RULES) {
+      const m = rule.pattern.exec(line)
+      if (!m) continue
+      // キャプチャグループ1があれば値部分をマスク、なければ行全体をマスク
+      const maskedLine = m[1]
+        ? line.replace(m[1], '***')
+        : line.replace(m[0], m[0].replace(/=.*/, '=***'))
+      hits.push({ label: rule.label, maskedLine })
+      break // 同一行で複数ルールがヒットしても1件にする
+    }
+  }
+
+  return { hits }
+}
+
 const RiskLevelSchema = z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
 
 // Codex P2: expiresAt はサーバー側で riskLevel から計算する（呼び出し元に任せない）
@@ -206,8 +267,29 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
 
     const sideEffects: SideEffectEvent[] = []
 
-    // Risk Review
-    const riskReview = runRiskReview(changedFiles)
+    // Risk Review（changedFiles ベース）
+    let riskReview = runRiskReview(changedFiles)
+
+    // Step D: diffText 内容スキャン（シークレット検出）
+    // diffText が提供された場合のみ実行。ハッシュ照合は上記で完了済み。
+    if (diffText !== undefined) {
+      const scanResult = scanDiffForSecrets(diffText)
+      if (scanResult.hits.length > 0) {
+        const LEVEL_ORDER: Record<RiskLevel, number> = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 }
+        const labels = scanResult.hits.map(h => `diff:secret(${h.label})`)
+        riskReview = {
+          ...riskReview,
+          riskLevel: LEVEL_ORDER[riskReview.riskLevel] >= LEVEL_ORDER['CRITICAL']
+            ? riskReview.riskLevel
+            : 'CRITICAL',
+          triggeredRules: [...riskReview.triggeredRules, ...labels],
+          requiresIndependentReview: true,
+        }
+        console.warn(
+          `[gate/check][Step D] シークレット疑いを検出: taskId=${taskId}, hits=[${labels.join(', ')}]`
+        )
+      }
+    }
 
     // アクティブな承認リクエストを取得
     let existingReq = storage.approvalRequests.findActiveByTaskId(taskId)

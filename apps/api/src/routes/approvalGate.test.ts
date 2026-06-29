@@ -983,3 +983,119 @@ describe('PATCH /api/approval-requests/:id/status — EXPIRED は受け付けな
     })
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// Step D: diffText シークレットスキャン
+// ────────────────────────────────────────────────────────────
+
+describe('Step D: diffText シークレットスキャン', () => {
+  function makeDiffWithSecret(line: string): string {
+    return `diff --git a/.env b/.env\n--- a/.env\n+++ b/.env\n@@ -0,0 +1 @@\n+${line}`
+  }
+
+  function makeDiffHash(text: string): string {
+    return createHash('sha256').update(text, 'utf-8').digest('hex')
+  }
+
+  it('API_KEY を含む追加行 → riskLevel が CRITICAL に昇格', async () => {
+    await withApp(async (app) => {
+      const diffText = makeDiffWithSecret('API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+      const hash = makeDiffHash(diffText)
+      const { body, statusCode } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'stepd-001',
+        changedFiles: ['docs/README.md'], // changedFiles だけなら LOW
+        targetDiffHash: hash,
+        diffText,
+      })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('CRITICAL')
+      expect(body.riskReview.triggeredRules.some((r: string) => r.includes('API_KEY'))).toBe(true)
+      // レスポンスにシークレット値そのものが含まれないことを確認
+      const bodyStr = JSON.stringify(body)
+      expect(bodyStr).not.toContain('sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx')
+    })
+  })
+
+  it('PRIVATE_KEY を含む追加行 → riskLevel が CRITICAL に昇格', async () => {
+    await withApp(async (app) => {
+      const diffText = makeDiffWithSecret('-----BEGIN RSA PRIVATE KEY-----')
+      const hash = makeDiffHash(diffText)
+      const { body, statusCode } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'stepd-002',
+        changedFiles: ['docs/README.md'],
+        targetDiffHash: hash,
+        diffText,
+      })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('CRITICAL')
+      expect(body.riskReview.triggeredRules.some((r: string) => r.includes('PEM private key'))).toBe(true)
+    })
+  })
+
+  it('通常のコード変更 diff → 既存 riskLevel を変えない', async () => {
+    await withApp(async (app) => {
+      const diffText = [
+        'diff --git a/src/util.ts b/src/util.ts',
+        '--- a/src/util.ts',
+        '+++ b/src/util.ts',
+        '@@ -1,3 +1,4 @@',
+        ' export function add(a: number, b: number) {',
+        '+  // sum two numbers',
+        '   return a + b',
+        ' }',
+      ].join('\n')
+      const hash = makeDiffHash(diffText)
+      const { body, statusCode } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'stepd-003',
+        changedFiles: ['docs/README.md'], // LOW
+        targetDiffHash: hash,
+        diffText,
+      })
+      expect(statusCode).toBe(200)
+      // changedFiles が docs/README.md なので LOW のまま
+      expect(body.riskReview.riskLevel).toBe('LOW')
+    })
+  })
+
+  it('diffText なし → シークレットスキャンを実行せず既存挙動を維持', async () => {
+    await withApp(async (app) => {
+      const { body, statusCode } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'stepd-004',
+        changedFiles: ['docs/README.md'],
+        // diffText を渡さない
+      })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('LOW')
+      // diff スキャン由来のラベルが入っていないこと
+      expect(body.riskReview.triggeredRules.some((r: string) => r.startsWith('diff:secret'))).toBe(false)
+    })
+  })
+
+  it('削除行（-）のみの diff にシークレットがあっても昇格しない', async () => {
+    await withApp(async (app) => {
+      // 削除行（-始まり）にシークレットがある → スキャン対象は+行のみなので検出しない
+      const diffText = [
+        'diff --git a/.env b/.env',
+        '--- a/.env',
+        '+++ b/.env',
+        '@@ -1 +0,0 @@',
+        '-API_KEY=sk-oldkeyvalue',
+      ].join('\n')
+      const hash = makeDiffHash(diffText)
+      const { body, statusCode } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'stepd-005',
+        changedFiles: ['docs/README.md'],
+        targetDiffHash: hash,
+        diffText,
+      })
+      expect(statusCode).toBe(200)
+      // 削除行は対象外 → LOW のまま
+      expect(body.riskReview.riskLevel).toBe('LOW')
+    })
+  })
+})
