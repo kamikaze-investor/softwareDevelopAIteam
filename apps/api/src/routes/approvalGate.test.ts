@@ -233,7 +233,7 @@ describe('POST /api/approval-requests/:id/consume', () => {
   })
 
   // テスト 8: REJECTED / STALE / SUPERSEDED は consume不可 → 409
-  // （EXPIRED は PATCH /status では設定できないため REJECTED/STALE/SUPERSEDED でカバー）
+  // STALE / SUPERSEDED は internal 遷移専用のため、内部フロー経由でセットアップ
   it('REJECTED は consume不可 → 409', async () => {
     await withApp(async (app) => {
       const req = await createApprovalRequest(app)
@@ -248,31 +248,68 @@ describe('POST /api/approval-requests/:id/consume', () => {
     })
   })
 
-  it('STALE は consume不可 → 409', async () => {
+  it('STALE は consume不可 → 409 (APPROVED → /consume に commit 不一致で STALE 化)', async () => {
     await withApp(async (app) => {
+      // APPROVED にしてから /consume に別 commit を送って STALE にする
       const req = await createApprovalRequest(app)
-      await patchStatus(app, req.id, 'STALE')
+      await patchStatus(app, req.id, 'APPROVED')
+      // commit 不一致 → STALE に遷移して 409
+      const staleResult = await consumeRequest(app, req.id, {
+        currentCommit: 'different-commit',
+        currentDiffHash: 'deadbeef',
+      })
+      expect(staleResult.statusCode).toBe(409)
 
+      // STALE になったので再度 consume → 409（must be APPROVED）
       const { statusCode } = await consumeRequest(app, req.id, {
         currentCommit: 'abc123',
         currentDiffHash: 'deadbeef',
       })
-
       expect(statusCode).toBe(409)
     })
   })
 
-  it('SUPERSEDED は consume不可 → 409', async () => {
+  it('SUPERSEDED は consume不可 → 409 (同 taskId で新規リクエスト作成により SUPERSEDED 化)', async () => {
     await withApp(async (app) => {
-      const req = await createApprovalRequest(app)
-      await patchStatus(app, req.id, 'SUPERSEDED')
+      // 同 taskId で新規リクエストを作成すると旧リクエストが SUPERSEDED になる
+      const req = await createApprovalRequest(app, { taskId: 'task-supersede-test' })
+      // 同 taskId で別リクエストを POST → req が SUPERSEDED になる
+      await app.inject({
+        method: 'POST',
+        url: '/api/approval-requests',
+        payload: { ...BASE_REQUEST_PAYLOAD, taskId: 'task-supersede-test', targetCommit: 'new-commit' },
+      })
 
+      // SUPERSEDED になったので consume → 409
       const { statusCode } = await consumeRequest(app, req.id, {
         currentCommit: 'abc123',
         currentDiffHash: 'deadbeef',
       })
-
       expect(statusCode).toBe(409)
+    })
+  })
+
+  it('PATCH /status に STALE を送ると 400（internal 遷移専用）', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app)
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${req.id}/status`,
+        payload: { status: 'STALE' },
+      })
+      expect(res.statusCode).toBe(400)
+    })
+  })
+
+  it('PATCH /status に SUPERSEDED を送ると 400（internal 遷移専用）', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app)
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${req.id}/status`,
+        payload: { status: 'SUPERSEDED' },
+      })
+      expect(res.statusCode).toBe(400)
     })
   })
 

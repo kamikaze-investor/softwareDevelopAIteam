@@ -163,11 +163,12 @@ const CreateApprovalRequestBody = z.object({
 })
 
 const UpdateStatusBody = z.object({
-  // EXPIRED: 内部遷移専用 (/consume が expiresAt 超過時に自動設定)。PATCH /status では設定不可
-  // CONSUMED: 内部遷移専用 (/consume エンドポイント経由のみ)
-  // TODO(P3): SUPERSEDED / STALE も将来的に system/internal 遷移へ寄せることを検討する
-  //           現在は人間が明示的に使う可能性があるため残置
-  status: z.enum(['APPROVED', 'REJECTED', 'SUPERSEDED', 'STALE']),
+  // EXPIRED / CONSUMED / SUPERSEDED / STALE: 内部遷移専用。PATCH /status では設定不可
+  // - EXPIRED: /consume が expiresAt 超過時に自動設定
+  // - CONSUMED: /consume エンドポイント経由のみ
+  // - SUPERSEDED: /gate/check または POST /approval-requests が自動設定
+  // - STALE: /gate/check または /consume が自動設定（commit/diff 不一致時）
+  status: z.enum(['APPROVED', 'REJECTED']),
   reason: z.string().optional(),
 })
 
