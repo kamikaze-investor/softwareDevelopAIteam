@@ -16,7 +16,7 @@ import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
 import { callGateCheck, callConsume } from './guards/gateClient.js'
-import { resolvePolicy } from './guards/gatePolicy.js'
+import { resolvePolicy, SAFE_WORK_ALLOWED_COMMAND_KINDS } from './guards/gatePolicy.js'
 import type { EffectivePolicy } from './guards/gatePolicy.js'
 import { toGateDecision } from './guards/safetyAuditor.js'
 import type { GateResult } from './guards/gateProcessor.js'
@@ -124,7 +124,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
 
   if (gateResult.policy === 'continue_safe_work_only') {
     const kind = job.safeCommand.kind
-    if (kind === 'git_commit' || kind === 'git_revert') {
+    if (!(SAFE_WORK_ALLOWED_COMMAND_KINDS as readonly string[]).includes(kind)) {
       console.warn(`[gate] safe_work_only: ${kind} is not permitted. taskId=${job.taskId}`)
       return {
         status: 'blocked',

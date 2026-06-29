@@ -413,6 +413,29 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     expect(result.gatePolicy).toBeUndefined()
   })
 
+  it('continue policy → safe work check is not applied (all kinds allowed)', async () => {
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'commit', '-m', 'x'], description: 'git commit' })
+    // git_commit under 'continue' policy should NOT be blocked
+    execFileSyncMock
+      .mockReturnValueOnce('')          // pre getChangedFiles
+      .mockReturnValueOnce('')          // pre getPreGateDiffText
+      .mockReturnValueOnce('main\n')    // getTargetBranch
+      .mockReturnValueOnce('')          // getCommitHash (targetCommit)
+      .mockReturnValueOnce('abc\n')     // beforeCommitHash
+      .mockReturnValueOnce('')          // git commit
+      .mockReturnValueOnce('def\n')     // afterCommitHash
+      .mockReturnValueOnce('')          // post getChangedFiles
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('success')
+    expect(result.gatePolicy).toBeUndefined()
+  })
+
   it('callGateCheck throws → resolvePolicy called with apiError, not re-thrown', async () => {
     const networkErr = new Error('ECONNREFUSED')
     callGateCheckMock.mockRejectedValue(networkErr)
@@ -486,6 +509,94 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     expect(callGateCheckMock).toHaveBeenCalledWith(
       expect.not.objectContaining({ diffText: expect.anything() })
     )
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// safe_work_only 完全 CommandKind 制御 (Step 3C)
+// ────────────────────────────────────────────────────────────
+
+describe('runJob — safe_work_only CommandKind control (Step 3C)', () => {
+  const SAFE_WORK_POLICY = {
+    policy: 'continue_safe_work_only' as const,
+    reason: 'HIGH risk',
+    apiAvailable: true,
+  }
+
+  // 許可される CommandKind (table-driven)
+  const ALLOWED_KINDS: Array<{ kind: string; argv: string[] }> = [
+    { kind: 'git_status',  argv: ['git', 'status'] },
+    { kind: 'git_diff',    argv: ['git', 'diff'] },
+    { kind: 'git_log',     argv: ['git', 'log'] },
+    { kind: 'typecheck',   argv: ['pnpm', 'typecheck'] },
+    { kind: 'test',        argv: ['pnpm', 'test'] },
+    { kind: 'lint',        argv: ['pnpm', 'lint'] },
+  ]
+
+  for (const { kind, argv } of ALLOWED_KINDS) {
+    it(`continue_safe_work_only + ${kind} → existing flow continues`, async () => {
+      resolvePolicyMock.mockReturnValue(SAFE_WORK_POLICY)
+      resolveCommandMock.mockReturnValue({ argv, description: kind })
+
+      const job = createJob()
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(job.safeCommand as any).kind = kind
+      const result = await runJob(job)
+
+      expect(result.status).toBe('success')
+      expect(resolveCommandMock).toHaveBeenCalled()
+      expect(result.gatePolicy).toBeUndefined()
+    })
+  }
+
+  // 禁止される CommandKind (table-driven)
+  const BLOCKED_KINDS = [
+    'git_commit',
+    'git_revert',
+    'build',
+    'git_branch_create',
+    'git_checkout',
+  ] as const
+
+  for (const kind of BLOCKED_KINDS) {
+    it(`continue_safe_work_only + ${kind} → blocked`, async () => {
+      resolvePolicyMock.mockReturnValue(SAFE_WORK_POLICY)
+
+      const result = await runJob(createJob({ safeCommand: { kind, workingDir: '/workspace/target' } }))
+
+      expect(result.status).toBe('blocked')
+      expect(result.gatePolicy).toBe('continue_safe_work_only')
+      expect(result.gateBlockReason).toContain(kind)
+      expect(resolveCommandMock).not.toHaveBeenCalled()
+    })
+  }
+
+  it('safe work violation → callConsume is NOT called', async () => {
+    resolvePolicyMock.mockReturnValue(SAFE_WORK_POLICY)
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-x', message: 'consume' },
+    })
+
+    await runJob(createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+    }))
+
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+
+  it('safe work allowed + nextAction: call_consume → callConsume IS called', async () => {
+    resolvePolicyMock.mockReturnValue(SAFE_WORK_POLICY)
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-y', message: 'consume' },
+    })
+    callConsumeMock.mockResolvedValue({ ok: true })
+
+    const result = await runJob(createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }))
+
+    expect(callConsumeMock).toHaveBeenCalledWith('req-y', expect.anything())
+    expect(result.status).toBe('success')
   })
 })
 
