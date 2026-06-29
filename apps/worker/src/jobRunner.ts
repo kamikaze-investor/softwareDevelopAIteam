@@ -8,11 +8,18 @@
  */
 
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo } from '@ai-team/shared'
+import { runRiskReview } from '@ai-team/shared'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
+import { callGateCheck } from './guards/gateClient.js'
+import { resolvePolicy } from './guards/gatePolicy.js'
+import type { EffectivePolicy } from './guards/gatePolicy.js'
+import { toGateDecision } from './guards/safetyAuditor.js'
+import type { GateResult } from './guards/gateProcessor.js'
 
 const JOB_TIMEOUT_MS = 120_000
 const API_BASE_URL = process.env.API_BASE_URL ?? 'http://localhost:3000'
@@ -36,11 +43,13 @@ export interface JobRunResult {
   completedAt: string
   permissionBlockEvent?: PermissionBlockEvent
   rollbackInfo?: RollbackInfo
+  gatePolicy?: EffectivePolicy
+  gateBlockReason?: string
 }
 
 /**
  * Job を実行して結果を返す
- * - Permission Guard (with grants) → commandResolver → execFileSync → File Change Guard
+ * - Permission Guard (with grants) → Gate Check → commandResolver → execFileSync → File Change Guard
  */
 export async function runJob(job: Job): Promise<JobRunResult> {
   const startedAt = new Date().toISOString()
@@ -68,6 +77,76 @@ export async function runJob(job: Job): Promise<JobRunResult> {
       permissionBlockEvent: guardCheck.blockEvent,
     }
   }
+
+  // ── Approval Gate check (Step 3A) ──
+  const workingDir = job.safeCommand.workingDir
+  const preChangedFiles = getChangedFiles(workingDir)
+  const preDiffText = getPreGateDiffText(workingDir)
+  const targetDiffHash = createHash('sha256').update(preDiffText, 'utf-8').digest('hex')
+  const targetCommit = getCommitHash(workingDir) ?? ''
+  const targetBranch = getTargetBranch(workingDir)
+  const localGateResult = buildLocalGateResult(preChangedFiles)
+
+  let checkResponse
+  let apiError: unknown
+  try {
+    checkResponse = await callGateCheck({
+      taskId: job.taskId,
+      requestedAction: job.safeCommand.kind,
+      targetBranch,
+      targetCommit,
+      targetDiffHash,
+      changedFiles: preChangedFiles,
+    })
+  } catch (err) {
+    apiError = err
+    console.error(`[gate] callGateCheck failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  const gateResult = resolvePolicy(localGateResult, checkResponse, apiError)
+
+  if (gateResult.policy === 'block_until_approved' || gateResult.policy === 're_check') {
+    console.warn(`[gate] ${gateResult.policy}: taskId=${job.taskId} reason="${gateResult.reason}"`)
+    return {
+      status: 'blocked',
+      guardResult: {
+        permissionAllowed: true,
+        permissionReason: undefined,
+        fileChangeAllowed: true,
+        fileViolations: [],
+      },
+      gatePolicy: gateResult.policy,
+      gateBlockReason: gateResult.reason,
+      startedAt,
+      completedAt: new Date().toISOString(),
+    }
+  }
+
+  if (gateResult.policy === 'continue_safe_work_only') {
+    const kind = job.safeCommand.kind
+    if (kind === 'git_commit' || kind === 'git_revert') {
+      console.warn(`[gate] safe_work_only: ${kind} is not permitted. taskId=${job.taskId}`)
+      return {
+        status: 'blocked',
+        guardResult: {
+          permissionAllowed: true,
+          permissionReason: undefined,
+          fileChangeAllowed: true,
+          fileViolations: [],
+        },
+        gatePolicy: gateResult.policy,
+        gateBlockReason: `safe_work_only: ${kind} not permitted`,
+        startedAt,
+        completedAt: new Date().toISOString(),
+      }
+    }
+  }
+
+  // consume は Step 3B で接続予定
+  if (checkResponse?.nextAction?.action === 'call_consume') {
+    console.warn('[gate] nextAction=call_consume received, but consume integration is deferred')
+  }
+  // ── Gate check end ──
 
   const resolved = resolveCommand(job.safeCommand)
   const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)
@@ -157,6 +236,40 @@ function getChangedFiles(workingDir: string): string[] {
     return result.trim().split('\n').filter(Boolean)
   } catch {
     return []
+  }
+}
+
+function getPreGateDiffText(workingDir: string): string {
+  try {
+    return execFileSync('git', ['diff', 'HEAD'], {
+      cwd: workingDir,
+      encoding: 'utf-8',
+      shell: false,
+    })
+  } catch {
+    return ''
+  }
+}
+
+function getTargetBranch(workingDir: string): string {
+  try {
+    return execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      cwd: workingDir,
+      encoding: 'utf-8',
+      shell: false,
+    }).trim()
+  } catch {
+    return 'unknown'
+  }
+}
+
+function buildLocalGateResult(changedFiles: string[]): GateResult {
+  const riskReview = runRiskReview(changedFiles)
+  return {
+    finalRiskLevel: riskReview.riskLevel,
+    gateDecision: toGateDecision(riskReview.riskLevel),
+    auditRiskLevel: riskReview.riskLevel,
+    alignmentRiskLevel: 'LOW',
   }
 }
 
