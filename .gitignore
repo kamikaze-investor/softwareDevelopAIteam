@@ -56,3 +56,7 @@ apps/api/data/*.db
 
 # Safety Audit 承認ログ（監査証跡はローカルのみ）
 data/approvals/
+
+# Meta Review ランタイム生成物（実行のたびに上書きされる）
+meta-review-result.json
+data/quota-exhausted.json
