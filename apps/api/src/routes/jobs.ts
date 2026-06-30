@@ -42,13 +42,28 @@ const SafeCommandSchema: z.ZodType<SafeCommand> = z.object({
   workingDir: z.string().min(1),
 })
 
+const AiCliProviderSchema = z.enum(['claude_code', 'codex', 'gemini'])
+const AiCliModeSchema = z.enum(['implement', 'review', 'qa', 'summarize'])
+
 const CreateJobBody = z.object({
   taskId: z.string().min(1),
   projectId: z.string().min(1),
   agentRole: AgentRoleSchema,
   safeCommand: SafeCommandSchema,
   dryRun: z.boolean().optional(),
-})
+  aiCliProvider: AiCliProviderSchema.optional(),
+  aiCliPrompt: z.string().max(50_000).optional(),
+  aiCliMode: AiCliModeSchema.optional(),
+}).refine(
+  (d) => {
+    const hasProvider = d.aiCliProvider !== undefined
+    const hasPrompt = d.aiCliPrompt !== undefined
+    const hasMode = d.aiCliMode !== undefined
+    const count = [hasProvider, hasPrompt, hasMode].filter(Boolean).length
+    return count === 0 || count === 3
+  },
+  { message: 'aiCliProvider / aiCliPrompt / aiCliMode はすべて指定するか、すべて省略してください' },
+)
 
 const UpdateJobBody = z.object({
   status: JobStatusSchema.optional(),

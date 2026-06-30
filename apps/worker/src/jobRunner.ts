@@ -4,13 +4,15 @@
  * ⚠️ CONTROL REPOSITORY — AI編集禁止
  *
  * 1Job = 1SafeCommand を安全に実行して結果を返す。
- * AI CLI の呼び出しは task-022 以降で実装する。
+ * aiCliProvider / aiCliPrompt / aiCliMode が揃っている場合は
+ * SafeCommand 実行前に AI CLI を先行実行する（task-022）。
  */
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo } from '@ai-team/shared'
 import { runRiskReview } from '@ai-team/shared'
+import { createAiCliAdapter } from './aiCli/factory.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -53,7 +55,8 @@ export interface JobRunResult {
 
 /**
  * Job を実行して結果を返す
- * - Permission Guard (with grants) → Gate Check → commandResolver → execFileSync → File Change Guard
+ * - Permission Guard (with grants) → Gate Check → [AI CLI] → commandResolver → execFileSync → File Change Guard
+ * - aiCliProvider / aiCliPrompt / aiCliMode が揃っている場合のみ AI CLI を先行実行（task-022）
  */
 export async function runJob(job: Job): Promise<JobRunResult> {
   const startedAt = new Date().toISOString()
@@ -292,6 +295,59 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     }
   }
   // ── Gate check end ──
+
+  // ── AI CLI 実行ブロック（task-022） ─────────────────────────────────────────
+  // aiCliProvider / aiCliPrompt / aiCliMode が3つ揃った場合のみ先行実行する。
+  // 成功時は後続の SafeCommand（git_commit 等）を引き続き実行する。
+  // 失敗（throw / blocked / exitCode !== 0）時は status: failed で早期リターン。
+  if (job.aiCliProvider && job.aiCliPrompt && job.aiCliMode) {
+    const adapter = createAiCliAdapter({ provider: job.aiCliProvider })
+    let cliResult
+    try {
+      cliResult = await adapter.run({
+        taskId: job.taskId,
+        provider: job.aiCliProvider,
+        workingDir: job.safeCommand.workingDir,
+        prompt: job.aiCliPrompt,
+        contextFiles: [],  // task-023 で Context Manager 連携後に拡張
+        mode: job.aiCliMode,
+        dryRun: job.dryRun,
+      })
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err)
+      console.error(`[jobRunner] AI CLI 実行エラー (${job.aiCliProvider}): ${message}`)
+      return {
+        status: 'failed',
+        exitCode: 1,
+        stdout: '',
+        stderr: message,
+        changedFiles: [],
+        guardResult,
+        startedAt,
+        completedAt: new Date().toISOString(),
+      }
+    }
+
+    const cliFailed = cliResult.blocked === true || (cliResult.exitCode !== 0 && !job.dryRun)
+    if (cliFailed) {
+      console.error(`[jobRunner] AI CLI 失敗 (${job.aiCliProvider}): exitCode=${cliResult.exitCode} blocked=${cliResult.blocked}`)
+      return {
+        status: 'failed',
+        exitCode: cliResult.exitCode,
+        stdout: cliResult.stdout,
+        stderr: cliResult.stderr,
+        stdoutPath: cliResult.stdoutPath,
+        stderrPath: cliResult.stderrPath,
+        changedFiles: cliResult.changedFiles,
+        guardResult,
+        startedAt,
+        completedAt: new Date().toISOString(),
+      }
+    }
+
+    console.log(`[jobRunner] AI CLI 成功 (${job.aiCliProvider}): changedFiles=${cliResult.changedFiles.length}件 → SafeCommand に続行`)
+  }
+  // ── AI CLI 実行ブロック終端 ───────────────────────────────────────────────
 
   const resolved = resolveCommand(job.safeCommand)
   const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)

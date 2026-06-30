@@ -994,3 +994,148 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     expect(result.gatePolicy).toBe('block_until_approved')
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// task-022: AI CLI → jobRunner 接続テスト
+// ────────────────────────────────────────────────────────────
+
+vi.mock('./aiCli/factory.js', () => ({
+  createAiCliAdapter: vi.fn(),
+}))
+
+import { createAiCliAdapter } from './aiCli/factory.js'
+const createAiCliAdapterMock = vi.mocked(createAiCliAdapter)
+
+function makeCliResult(overrides: Partial<{
+  exitCode: number
+  stdout: string
+  stderr: string
+  changedFiles: string[]
+  blocked: boolean
+  stdoutPath: string
+  stderrPath: string
+}> = {}) {
+  return {
+    taskId: 'task-1',
+    provider: 'claude_code' as const,
+    exitCode: 0,
+    stdout: 'AI CLIの実行結果',
+    stderr: '',
+    changedFiles: ['src/feature.ts'],
+    durationMs: 1000,
+    blocked: false,
+    ...overrides,
+  }
+}
+
+describe('task-022: AI CLI 実行ブロック', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('aiCliProvider なし → AI CLI をスキップして SafeCommand を実行する', async () => {
+    // AI CLI フィールドが未指定の通常 Job
+    const job = createJob()
+    const result = await runJob(job)
+
+    expect(createAiCliAdapterMock).not.toHaveBeenCalled()
+    expect(result.status).toBe('success')
+  })
+
+  it('aiCliProvider あり・CLI 成功 → SafeCommand も実行される', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult()) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/feature.ts にログ出力を追加してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(createAiCliAdapterMock).toHaveBeenCalledWith({ provider: 'claude_code' })
+    expect(mockAdapter.run).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-1',
+      provider: 'claude_code',
+      workingDir: '/workspace/target',
+      prompt: 'src/feature.ts にログ出力を追加してください',
+      contextFiles: [],
+      mode: 'implement',
+    }))
+    // SafeCommand も実行された
+    expect(execFileSyncMock).toHaveBeenCalled()
+    expect(result.status).toBe('success')
+  })
+
+  it('AI CLI が exitCode !== 0 → status: failed で早期リターン（SafeCommand は実行されない）', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toBe('compile error')
+    // SafeCommand (resolveCommand) は実行されない
+    // ※ execFileSyncMock は Gate フェーズの git ヘルパーでも呼ばれるためチェック対象外
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('AI CLI が blocked: true → status: failed で早期リターン', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 0, blocked: true })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'JSON をパースして返してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('AI CLI が throw → status: failed で早期リターン（エラーメッセージが stderr に入る）', async () => {
+    const mockAdapter = { run: vi.fn().mockRejectedValue(new Error('workingDir が TARGET_ROOT 外')) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: '実装してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('TARGET_ROOT')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('dryRun: true → AI CLI にも dryRun: true が伝搬する', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult()) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      dryRun: true,
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'テスト実行だけ',
+      aiCliMode: 'review',
+    })
+    await runJob(job)
+
+    expect(mockAdapter.run).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }))
+  })
+})

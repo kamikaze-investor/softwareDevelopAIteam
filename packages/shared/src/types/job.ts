@@ -2,6 +2,7 @@
 
 import type { AgentRole } from './agent'
 import type { SafeCommand } from './command'
+import type { AiCliProvider, AiCliMode } from './ai_cli'
 
 export type JobStatus = 'queued' | 'running' | 'success' | 'failed' | 'blocked'
 
@@ -51,6 +52,15 @@ export interface Job {
 
   /** このJobに関連するApproval ID */
   approvalId?: string
+
+  /**
+   * AI CLI 実行パラメータ（task-022）
+   * 指定された場合、SafeCommand 実行前に AI CLI を先行実行する。
+   * 3フィールドすべて揃った場合のみ AI CLI が起動する（部分指定は無視）。
+   */
+  aiCliProvider?: AiCliProvider
+  aiCliPrompt?: string
+  aiCliMode?: AiCliMode
 
   createdAt: string
 }
