@@ -54,9 +54,17 @@
 - [x] GeminiCliAdapter（Reviewer AI）
 - [x] CodexAdapter（将来用プレースホルダー）
 - [x] AGENTS.md・session-log・コミットプレフィックス対応 (task-021)
-- [ ] CLI実行ログ保存 (task-022)
 - [ ] CLI出力パーサー + JSONリトライ機構 (task-023)
 - [ ] CLI timeout / retry / cancel設計 (task-024)
+
+### task-022: AI CLI → jobRunner 接続 ✅
+- [x] Job型に aiCliProvider / aiCliPrompt / aiCliMode 追加 (388358d)
+- [x] jobs.ts CreateJobBody 拡張・バリデーション強制（3フィールド全指定 or 全省略）(388358d)
+- [x] jobRunner.ts に AI CLI 先行実行ブロック追加（SafeCommand 実行前）(388358d)
+- [x] AI CLI 失敗時（blocked / exitCode !== 0 / throw）→ Job failed 早期リターン (388358d)
+- [x] aiCliProvider なし既存 Job への影響ゼロを保証 (388358d)
+- [x] テスト 5 ケース追加（285/285 pass）(388358d)
+- [ ] contextFiles 拡張（Context Manager 連携）← 別 task
 
 ### 1-D: バックエンド実装
 - [x] SQLite Storage 完全実装 (task-018)
@@ -113,4 +121,4 @@
 
 ---
 
-*Updated: 2026-06-30*
+*Updated: 2026-07-01*

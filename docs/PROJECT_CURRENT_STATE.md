@@ -1,7 +1,7 @@
 # Project Current State Map
 
 **作成日**: 2026-06-19
-**最終更新**: 2026-06-30
+**最終更新**: 2026-07-01
 **作成者**: Claude Code (CTO)
 **目的**: リポジトリの現状を一枚で把握するためのスナップショット
 
@@ -127,6 +127,22 @@ softwareDevelopAIteam/            ← Control Repository（AI編集禁止）
 | Codex パス解決（Windows 対応） | `apps/worker/src/aiCli/codexPathResolver.ts` |
 | AI CLI ファクトリ | `apps/worker/src/aiCli/factory.ts` |
 
+### task-022: AI CLI → jobRunner 接続 ✅
+
+| 機能 | ファイル | コミット |
+|---|---|---|
+| Job 型に `aiCliProvider` / `aiCliPrompt` / `aiCliMode` 追加 | `packages/shared/src/types/job.ts` | 388358d |
+| `CreateJobBody` に AI CLI フィールド追加・バリデーション強制 | `apps/api/src/routes/jobs.ts` | 388358d |
+| jobRunner に AI CLI 先行実行ブロック追加 | `apps/worker/src/jobRunner.ts` | 388358d |
+| AI CLI 実行分岐テスト（5ケース） | `apps/worker/src/jobRunner.test.ts` | 388358d |
+
+**実装仕様:**
+- `aiCliProvider` / `aiCliPrompt` / `aiCliMode` が揃っている場合のみ AI CLI を先行実行
+- 成功時: 既存 SafeCommand（`git_commit` 等）フローを継続
+- 失敗時（`blocked: true` / `exitCode !== 0` / `adapter.run()` throw）: `status: failed` で早期リターン
+- 3フィールドが揃わない既存 Job への影響ゼロ
+- `contextFiles` は初期実装では `[]` 固定（Context Manager 連携は別 task）
+
 ### Phase 1-D 一部: ジョブ管理基盤 ✅
 
 | 機能 | ファイル |
@@ -231,7 +247,7 @@ softwareDevelopAIteam/            ← Control Repository（AI編集禁止）
 | エージェント | ツール | 役割 | 状態 |
 |---|---|---|---|
 | **Claude Code** | claude-code CLI | CTO / メイン Developer AI。新機能・設計判断・アーキテクチャ変更 | ✅ 稼働中 |
-| **Codex** | codex CLI | サブ Developer AI。局所修正・パターン的実装 | ⚠️ CLI フラグ不整合（後述） |
+| **Codex** | codex CLI | サブ Developer AI。局所修正・パターン的実装 | ✅ CLI フラグ解決済み（v0.140.0 対応） |
 | **Gemini** | Gemini API + CLI | Meta Reviewer / Alignment Checker。全 PR の安全監査 | ✅ API 経由で稼働 |
 
 ### AI エージェント間の呼び出し構造
@@ -241,47 +257,33 @@ CEO（スマホ）
   └─ apps/api  ─→  apps/worker
                       ├─ JobRunner
                       │    ├─ PermissionGuard ──→ [block]
-                      │    ├─ commandResolver
                       │    ├─ ApprovalGate ──→ [block / notify CEO]
-                      │    ├─ AI CLI Adapter ──→ Claude Code / Codex / Gemini CLI  ※未接続
-                      │    ├─ FileChangeGuard ──→ [block]
-                      │    └─ SafetyAuditor ──→ GateProcessor
+                      │    ├─ AI CLI Adapter ──→ Claude Code / Codex / Gemini CLI  ✅ 接続済み (task-022)
+                      │    ├─ commandResolver
+                      │    ├─ execFileSync (SafeCommand)
+                      │    └─ FileChangeGuard ──→ [block]
                       ├─ Watchdog ──→ Notifier ──→ LINE / Slack
                       └─ MetaReviewer ──→ GeminiRouter ──→ Gemini API / CLI
 ```
 
-※ AI CLI Adapter の jobRunner への接続は task-022 以降で実装予定。現在は未接続。
+AI CLI Adapter は task-022 (388358d) で jobRunner に接続済み。
+`aiCliProvider` / `aiCliPrompt` / `aiCliMode` が Job に指定された場合、SafeCommand 実行前に先行実行される。
 
 ---
 
 ## 5. Codex CLI 統合状況
 
-### 現状（問題あり）
+### 現状（解決済み）
 
 | 項目 | 状態 |
 |---|---|
 | Codex CLI インストール | ✅ npm グローバル（`codex.cmd` 解決済み） |
 | `codexPathResolver.ts` | ✅ Windows 対応・WindowsApps 回避 |
-| `codexAdapter.ts` の CLI フラグ | ❌ **`--approval-mode`** を使用中（codex-cli v0.140.0 で廃止） |
-| 正しいフラグ | `--ask-for-approval never / on-request` |
-| Claude Code からの自律呼び出し | ❌ Claude Code auto mode が `--ask-for-approval never` をブロック |
+| `codexAdapter.ts` の CLI フラグ | ✅ **`exec --sandbox workspace-write/read-only`**（v0.140.0 対応済み）(bf00bae) |
+| jobRunner との接続 | ✅ task-022 (388358d) で接続済み |
 
-### 問題の詳細
-
-`codexAdapter.ts`（AI 編集禁止・Control Layer）の `buildArgv()` が:
-```typescript
-return ['--approval-mode', approvalMode, request.prompt]
-// → codex-cli v0.140.0 では "unexpected argument '--approval-mode'" エラー
-```
-
-**修正が必要だが Control Layer 変更のため CEO 承認待ち。**
-
-### Codex 呼び出し代替手段
-
-現時点で CEO が直接ターミナルから実行する場合:
-```bash
-cat prompt.txt | codex --ask-for-approval never exec -
-```
+`--approval-mode` フラグは bf00bae（2026-06-19）で `exec --sandbox` に修正済み。
+jobRunner への接続は 388358d（2026-07-01）で完了。
 
 ---
 
@@ -319,7 +321,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 ## 7. テストカバレッジ
 
-### 実行結果（2026-06-30）: **全 560 件パス** ✅
+### 実行結果（2026-07-01）: **全 566 件パス** ✅
 
 **API（apps/api）: 281 件・22 ファイル**
 
@@ -333,7 +335,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 | `src/ctoAi/*.test.ts` | CTO AI 各機能 |
 | `src/auth/apiToken.test.ts` | API 認証 |
 
-**Worker（apps/worker）: 279 件・18 ファイル**
+**Worker（apps/worker）: 285 件・18 ファイル**
 
 | テストファイル | テスト数 | 内容 |
 |---|---|---|
@@ -345,7 +347,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 | `src/guards/alignmentChecker.test.ts` | 7 | Gemini 連携・JSON パース |
 | `src/guards/safetyAuditor.test.ts` | 15 | diff 解析・危険キーワード |
 | `src/guards/permissionGuard.test.ts` | 13 | 静的ポリシー + Grant 検証 |
-| `src/jobRunner.test.ts` | — | ジョブ実行・ブロック・CEO 通知（Step 3D） |
+| `src/jobRunner.test.ts` | — | ジョブ実行・ブロック・CEO 通知（Step 3D）・AI CLI 分岐（task-022, +5件） |
 | `src/aiCli/adapter.test.ts` | 14 | セキュリティチェック・フォールバック |
 | `src/aiCli/codexPathResolver.test.ts` | 12 | パス解決・Windows 対応 |
 
@@ -358,42 +360,28 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 ## 8. リスク領域
 
-### 🔴 HIGH RISK
-
-| # | リスク | 詳細 |
-|---|---|---|
-| R-001 | **Codex CLI フラグ不整合** | `codexAdapter.ts` の `--approval-mode` は v0.140.0 で廃止。Codex を使う全ジョブが実行時エラーになる。Control Layer 変更のため CEO 承認必要。 |
-
 ### 🟡 MEDIUM RISK
 
 | # | リスク | 詳細 |
 |---|---|---|
-| R-004 | **AI CLI と jobRunner の未接続** | AI CLI Adapter 基盤は実装済みだが、jobRunner への接続が未実装（task-022 以降）。現在 AI が自律実行できない。 |
-| R-005 | **Claude Code auto mode からの Codex 呼び出し不可** | `--ask-for-approval never` フラグが Claude Code auto mode にブロックされる。Codex の自律実行は CEO が直接ターミナルから行う必要がある。 |
+| R-005 | **Context Manager 未接続** | AI CLI の `contextFiles` は初期実装で `[]` 固定。Context Manager AI による ContextPack 生成・連携は未実装（別 task）。 |
 | R-006 | **ローカル Meta Review 自動実行停止中** | `postTestHook.ps1` が `exit 0` のみ。GitHub Actions 経由は有効だが、ローカル開発時の自動チェックが機能していない。 |
 
 ### 🟢 LOW RISK（把握済み・管理下）
 
 | # | リスク | 詳細 |
 |---|---|---|
-| R-007 | **未コミット変更の要確認** | `ALIGNMENT_VIOLATIONS.md` / `alignment_engine.ts` 等の未コミット変更が以前指摘されていたが、現在のコミット状況は要確認。`git status` で確認推奨。 |
-| R-008 | **roadmap.md の日付・内容が古い** | Approval Gate・Watchdog・ダッシュボード等が反映されていない（2026-06-30 に別途更新）。 |
+| R-007 | **未追跡スクリプトの扱い** | `apps/worker/scripts/alignmentCheck.ts` / `postTestHook.ps1` が未追跡。意図的な未追跡（AV-001 対象）のため現状維持。 |
 
 ---
 
 ## 9. 次タスク（優先順）
 
-### P0: 即座に対応すべき
-
-| タスク | 理由 | 担当 |
-|---|---|---|
-| **Codex CLI フラグ修正（CEO 承認待ち）** | R-001 解消。`codexAdapter.ts` の `--approval-mode` → `--ask-for-approval`。Control Layer 変更のため CEO 承認が必要 | CEO 承認後 Claude Code |
-
 ### P1: 早期対応が望ましい
 
 | タスク | 理由 | 担当 |
 |---|---|---|
-| **AI CLI と jobRunner 接続（task-022）** | これが完成して初めて AI が実際に開発を行うシステムになる。Codex CLI フラグ修正後に着手推奨 | Claude Code |
+| **Context Manager 連携（contextFiles 拡張）** | AI CLI の `contextFiles` が現在 `[]` 固定。Context Manager AI が ContextPack を生成して渡すことで AI の実装精度が向上する | Claude Code |
 | **postTestHook.ps1 正式設計** | ローカル開発時の Meta Review 自動実行を正式経路で再設計。現状は `exit 0` のみで機能停止中 | Claude Code |
 
 ### P2: 中期対応
@@ -402,7 +390,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 |---|---|---|
 | **Mobile Dashboard 実装（task-012〜013）** | Expo 画面が骨格のみ。スマホからの状況確認に直結 | Codex or Claude Code |
 | **apps/api テスト補完** | 一部ルートの未テスト領域を埋める | Codex |
-| **CLI 実行ログ保存（task-022）** | Codex 呼び出しログ保存機能 | Codex |
+| **CLI 出力パーサー + JSON リトライ（task-023）** | AI CLI が JSON 出力を期待する場合のリトライ機構 | Codex |
 
 ---
 
