@@ -151,3 +151,41 @@ better_sqlite3.node
 - AIはテスト失敗時に、コード変更由来・環境由来・依存関係由来を切り分けるべき
 - 状態変更コマンドはCEO承認を得てから実行する
 - package.json / pnpm-lock.yaml / workspace設定の変更は、AI Approval Level上でも注意対象にする
+
+---
+
+## AI Approval Level v2 のスコープ前提（Step6-B0）
+
+**背景:**
+Step6（jobRunner.tsへのAI Approval Level v2接続）の実装過程で、`determineApprovalLevel()`
+（`packages/shared/src/approvalLevelClassifier.ts`）の分類パターンが、実際にjobRunner経由で
+評価される対象と前提のズレを起こしていることが判明した。
+
+**重要な事実:**
+
+- AI Approval Level v2の現在の分類パターン（Mechanical Gate・Level0/1/2）は、
+  **control repo（このAIチームOS自身のリポジトリ）のディレクトリ構造を前提**に設計されている
+  （例: `apps/worker/src/jobRunner.ts`、`apps/worker/src/guards/`、
+  `apps/worker/src/metaReviewer/`、`postTestHook.ps1` 等の実在パスに直接一致するパターン）
+- 一方、`jobRunner.ts`経由で実行されるJobの`workingDir`は、
+  `permissionGuardWithGrants()`（`apps/worker/src/guards/permissionGuard.ts`）と
+  `isInsideTargetRoot()`（`apps/worker/src/utils/pathUtils.ts`）により、
+  **常に`TARGET_ROOT`（`/workspace/target`）配下に制限**されている
+- つまり、**jobRunner経由のJobは基本的にtarget_project（AIチームOSが開発する対象アプリ）向け**であり、
+  control repo自身を対象にすることは、現行の安全設計上構造的にあり得ない
+  （Docker構成上もcontrol repoはread-onlyマウント、target-projectのみread-writeマウント）
+
+**Step6-A2で`JobRunResult`に載せている`approvalLevelResult`の扱い:**
+
+- `approvalLevelResult`は、control repo基準の分類器をtarget_project向けJobに便宜的に
+  適用した、**観察目的の参考ラベル**である
+- `approvalLevelResult.reviewPolicy`や`approvalLevelResult.level`を、
+  **そのままtarget_projectの自動停止根拠として使ってはならない**
+  （target_project側の通常ファイル変更が、control repo基準のパターンに一致せず
+  `UNMATCHED_FALLBACK`によりLevel3/ceo_requiredに誤判定される可能性があるため）
+
+**今後の方針:**
+
+- Step6-B（`ceo_required`/`Level3`によるjobRunnerの自動停止）は延期する
+- target_project向けの軽量preflight判定（control repo固有パスに依存しない、
+  diffパターン中心の危険判定）を別タスクとして設計してから、自動停止機能を追加する

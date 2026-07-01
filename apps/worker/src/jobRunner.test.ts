@@ -1251,3 +1251,63 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
     expect(result.approvalLevelResult?.reviewPolicy).toBe('mechanical_only')
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// Step6-B0: Approval Scope（jobRunner経由のJobは常にtarget_project）
+//
+// このdescribeブロックは新しい機能を検証するものではなく、
+// 既存の安全保証（permissionGuardWithGrants → isInsideTargetRoot）が
+// 引き続き機能していることを可視化するための回帰テストである。
+//
+// jobRunner.ts で evaluateJobApprovalLevel() に渡される
+// changedFiles / diffText は、この保証により常に target_project
+// （AIチームOSが開発する対象アプリ）側の差分であり、
+// AIチームOS自身（control repo）の差分ではない。
+// ────────────────────────────────────────────────────────────
+describe('Step6-B0: Approval Scope（jobRunner経由のJobはtarget_project前提）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('TARGET_ROOT外のworkingDirを持つJobは、permissionGuardでblockedされる（jobRunnerがtarget_project以外を評価することはない）', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      reason: 'workingDir is outside TARGET_ROOT',
+    })
+
+    const job = createJob({
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/control' },
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('blocked')
+    expect(result.guardResult.permissionReason).toBe('workingDir is outside TARGET_ROOT')
+    // permissionGuardの時点でblockedのため、Approval Level v2判定にも到達しない
+    expect(result.approvalLevelResult).toBeUndefined()
+  })
+
+  it('TARGET_ROOT配下のworkingDirを持つ通常Jobは、既存フロー通り継続する（target_project前提の回帰確認）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'src/index.ts\n'
+      return ''
+    })
+
+    const job = createJob({
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    })
+    const result = await runJob(job)
+
+    // permissionGuardを通過し、既存フロー（resolveCommand実行）まで到達する
+    expect(result.status).toBe('success')
+    expect(resolveCommandMock).toHaveBeenCalled()
+    // approvalLevelResultは計算されるが、これはtarget_project向けの観察用参考ラベルに過ぎない
+    expect(result.approvalLevelResult).toBeDefined()
+  })
+})

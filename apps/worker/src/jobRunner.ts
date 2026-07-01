@@ -307,6 +307,26 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   // 既存Approval Gate通過後・AI CLI実行前に判定する。
   // preChangedFiles / preDiffText は Approval Gate（Step3A）で取得済みのものをそのまま再利用する。
   // 観察モード: ここではまだ判定結果でJobをblockingしない（ceo_requiredでも停止しない）。
+  //
+  // ── スコープに関する重要な前提（Step6-B0） ─────────────────────────────
+  // この時点の workingDir は、直前の permissionGuardWithGrants() 通過後であり、
+  // isInsideTargetRoot() により TARGET_ROOT（'/workspace/target'）配下であることが
+  // 既に保証されている。つまり、ここで評価している changedFiles / diffText は
+  // 常に target_project（AIチームOSが開発する対象アプリ）側の差分であり、
+  // AIチームOS自身（control repo）の差分ではない。
+  //
+  // 一方、determineApprovalLevel()（packages/shared/src/approvalLevelClassifier.ts）の
+  // Mechanical Gate・Level0/1/2分類パターンは、control repo（このリポジトリ自身）の
+  // ディレクトリ構造（apps/worker/src/jobRunner.ts・guards/・metaReviewer/等）を
+  // 前提に設計されている。target_project側のファイル（例: src/index.ts・app/page.tsx等）は
+  // これらのパターンにほぼ一致せず、UNMATCHED_FALLBACKによりLevel3/ceo_requiredに
+  // 分類されてしまう可能性がある。
+  //
+  // そのため、以下の approvalLevelResult は「control repo基準の分類器を
+  // target_project向けJobに便宜的に適用した、観察目的の参考ラベル」であり、
+  // reviewPolicy / level をそのまま target_project の自動停止根拠として
+  // 使ってはならない。Step6-B（自動停止）は、target_project向けの
+  // 軽量preflight判定を別途設計するまで延期する。
   const approvalLevelResult = evaluateJobApprovalLevel({
     jobId: job.id,
     taskId: job.taskId,
