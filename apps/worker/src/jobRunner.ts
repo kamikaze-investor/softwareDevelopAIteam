@@ -10,9 +10,10 @@
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo } from '@ai-team/shared'
+import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo, ApprovalLevelResult } from '@ai-team/shared'
 import { runRiskReview } from '@ai-team/shared'
 import { createAiCliAdapter } from './aiCli/factory.js'
+import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -51,6 +52,12 @@ export interface JobRunResult {
   rollbackInfo?: RollbackInfo
   gatePolicy?: EffectivePolicy
   gateBlockReason?: string
+  /**
+   * Approval Level v2 判定結果（Step6-A2）。
+   * 既存Approval Gate通過後・AI CLI実行前に計算される。
+   * 観察モード: まだこの結果でJobをblockingしない。
+   */
+  approvalLevelResult?: ApprovalLevelResult
 }
 
 /**
@@ -296,6 +303,18 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   }
   // ── Gate check end ──
 
+  // ── Approval Level v2 判定（Step6-A2） ──────────────────────────────────────
+  // 既存Approval Gate通過後・AI CLI実行前に判定する。
+  // preChangedFiles / preDiffText は Approval Gate（Step3A）で取得済みのものをそのまま再利用する。
+  // 観察モード: ここではまだ判定結果でJobをblockingしない（ceo_requiredでも停止しない）。
+  const approvalLevelResult = evaluateJobApprovalLevel({
+    jobId: job.id,
+    taskId: job.taskId,
+    changedFiles: preChangedFiles,
+    diffText: preDiffText,
+  })
+  // ── Approval Level v2 判定終端 ───────────────────────────────────────────
+
   // ── AI CLI 実行ブロック（task-022） ─────────────────────────────────────────
   // aiCliProvider / aiCliPrompt / aiCliMode が3つ揃った場合のみ先行実行する。
   // 成功時は後続の SafeCommand（git_commit 等）を引き続き実行する。
@@ -325,6 +344,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
         guardResult,
         startedAt,
         completedAt: new Date().toISOString(),
+        approvalLevelResult,
       }
     }
 
@@ -342,6 +362,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
         guardResult,
         startedAt,
         completedAt: new Date().toISOString(),
+        approvalLevelResult,
       }
     }
 
@@ -412,6 +433,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     startedAt,
     completedAt: new Date().toISOString(),
     rollbackInfo,
+    approvalLevelResult,
   }
 }
 

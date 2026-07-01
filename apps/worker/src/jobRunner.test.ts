@@ -1139,3 +1139,115 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(mockAdapter.run).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }))
   })
 })
+
+describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('docsのみの変更 → approvalLevelResultがmechanical_onlyになる', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
+      if (Array.isArray(args) && args[0] === 'diff' && args[1] === 'HEAD') return '+# タイトル\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('success')
+    expect(result.approvalLevelResult).toBeDefined()
+    expect(result.approvalLevelResult?.reviewPolicy).toBe('mechanical_only')
+    expect(result.approvalLevelResult?.level).toBe(0)
+  })
+
+  it('jobRunner.ts自体を変更するJob → approvalLevelResultがfull_pre_post_reviewになる（level:2）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'apps/worker/src/jobRunner.ts\n'
+      if (Array.isArray(args) && args[0] === 'diff' && args[1] === 'HEAD') return '+const x = 1\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('success')
+    expect(result.approvalLevelResult?.reviewPolicy).toBe('full_pre_post_review')
+    expect(result.approvalLevelResult?.level).toBe(2)
+  })
+
+  it('postTestHook.ps1を変更するJob（Mechanical Gate hit）→ reviewPolicyはceo_requiredだが、Jobはまだブロックされない', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'apps/worker/scripts/postTestHook.ps1\n'
+      if (Array.isArray(args) && args[0] === 'diff' && args[1] === 'HEAD') return '+Write-Host "test"\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    // 観察モード: ceo_requiredでもまだ既存フロー通りに進み、statusはblockedにならない
+    expect(result.status).toBe('success')
+    expect(result.approvalLevelResult?.reviewPolicy).toBe('ceo_required')
+    expect(result.approvalLevelResult?.level).toBe(3)
+    expect(resolveCommandMock).toHaveBeenCalled()
+  })
+
+  it('permissionGuardでblockedの場合、approvalLevelResultはundefinedのまま（判定に到達しない）', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      reason: 'denied',
+      blockEvent: {
+        type: 'grant_expired' as const,
+        jobId: 'job-1',
+        taskId: 'task-1',
+        agentRole: 'developer_ai',
+        commandKind: 'git_status',
+        message: 'denied',
+        occurredAt: new Date().toISOString(),
+      },
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.approvalLevelResult).toBeUndefined()
+  })
+
+  it('既存Approval Gateがblock_until_approvedの場合、approvalLevelResultはundefinedのまま（判定に到達しない）', async () => {
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL risk — CEO approval required',
+      apiAvailable: true,
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.approvalLevelResult).toBeUndefined()
+  })
+
+  it('AI CLI失敗時のJobRunResultにもapprovalLevelResultが含まれる', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
+      return ''
+    })
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(result.approvalLevelResult).toBeDefined()
+    expect(result.approvalLevelResult?.reviewPolicy).toBe('mechanical_only')
+  })
+})
