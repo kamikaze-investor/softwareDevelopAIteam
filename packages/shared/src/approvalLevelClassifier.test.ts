@@ -258,6 +258,174 @@ describe('approvalLevelClassifier fallback cases', () => {
   })
 })
 
+describe('reviewPolicy', () => {
+  it('Level0（docs更新のみ）→ reviewPolicy: mechanical_only', () => {
+    const result = determine(['docs/guide.md'], '+updated docs')
+
+    expect(result.reviewPolicy).toBe('mechanical_only')
+    expect(result.classifierResult.reviewPolicy).toBe('mechanical_only')
+  })
+
+  it('Level0（.gitignoreのみ）→ reviewPolicy: mechanical_only', () => {
+    const result = determine(['.gitignore'], '+tmp/')
+
+    expect(result.reviewPolicy).toBe('mechanical_only')
+    expect(result.classifierResult.reviewPolicy).toBe('mechanical_only')
+  })
+
+  it('Level0（新規テストファイルのみ）→ reviewPolicy: mechanical_only', () => {
+    const diffText = [
+      'diff --git a/apps/api/src/example.test.ts b/apps/api/src/example.test.ts',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/apps/api/src/example.test.ts',
+      '@@',
+      "+it('works', () => {})",
+    ].join('\n')
+    const result = determine(['apps/api/src/example.test.ts'], diffText)
+
+    expect(result.reviewPolicy).toBe('mechanical_only')
+    expect(result.classifierResult.reviewPolicy).toBe('mechanical_only')
+  })
+
+  it('Level1（type-definitionのみ・削除なし・1ファイル）→ reviewPolicy: mechanical_only', () => {
+    const result = determine(
+      ['packages/shared/src/types/example.ts'],
+      '+export interface Example { name: string }',
+    )
+
+    expect(result.reviewPolicy).toBe('mechanical_only')
+    expect(result.classifierResult.reviewPolicy).toBe('mechanical_only')
+  })
+
+  it('Level1（type-definitionのみ・削除なし・3ファイル）→ reviewPolicy: mechanical_only', () => {
+    const result = determine(
+      [
+        'packages/shared/src/types/exampleA.ts',
+        'packages/shared/src/types/exampleB.ts',
+        'packages/shared/src/types/exampleC.ts',
+      ],
+      '+export interface Example { name: string }',
+    )
+
+    expect(result.reviewPolicy).toBe('mechanical_only')
+    expect(result.classifierResult.reviewPolicy).toBe('mechanical_only')
+  })
+
+  it('Level1（type-definitionのみだが4ファイル以上）→ reviewPolicy: light_ai_post_review', () => {
+    const result = determine(
+      [
+        'packages/shared/src/types/exampleA.ts',
+        'packages/shared/src/types/exampleB.ts',
+        'packages/shared/src/types/exampleC.ts',
+        'packages/shared/src/types/exampleD.ts',
+      ],
+      '+export interface Example { name: string }',
+    )
+
+    expect(result.reviewPolicy).toBe('light_ai_post_review')
+    expect(result.classifierResult.reviewPolicy).toBe('light_ai_post_review')
+  })
+
+  it('Level1（zod-schema拡張を含む）→ reviewPolicy: light_ai_post_review', () => {
+    const result = determine(
+      ['apps/api/src/routes/projects.ts'],
+      ['+const ProjectSchema = z.object({', '+  name: z.string(),', '+})'].join('\n'),
+    )
+
+    expect(result.reviewPolicy).toBe('light_ai_post_review')
+    expect(result.classifierResult.reviewPolicy).toBe('light_ai_post_review')
+  })
+
+  it('Level1（non-breaking-extensionを含む）→ reviewPolicy: light_ai_post_review', () => {
+    const result = determine(
+      ['packages/shared/src/utils/example.ts'],
+      '+export function helper(): string { return "ok" }',
+    )
+
+    expect(result.reviewPolicy).toBe('light_ai_post_review')
+    expect(result.classifierResult.reviewPolicy).toBe('light_ai_post_review')
+  })
+
+  it('Level2（jobRunner.ts変更）→ reviewPolicy: full_pre_post_review', () => {
+    const result = determine(['apps/worker/src/jobRunner.ts'], '+const retryLimit = 1')
+
+    expect(result.reviewPolicy).toBe('full_pre_post_review')
+    expect(result.classifierResult.reviewPolicy).toBe('full_pre_post_review')
+  })
+
+  it('Level2（aiCliPathTouched）→ reviewPolicy: full_pre_post_review', () => {
+    const result = determine(['apps/worker/src/aiCli/factory.ts'], '+export const provider = "codex"')
+
+    expect(result.reviewPolicy).toBe('full_pre_post_review')
+    expect(result.classifierResult.reviewPolicy).toBe('full_pre_post_review')
+  })
+
+  it('Level2（CLAUDE.md/AGENTS.md軽微変更）→ reviewPolicy: full_pre_post_review', () => {
+    const result = determine(['AGENTS.md'], ['-old text', '+new text'].join('\n'))
+
+    expect(result.reviewPolicy).toBe('full_pre_post_review')
+    expect(result.classifierResult.reviewPolicy).toBe('full_pre_post_review')
+  })
+
+  it('Level2（required→optional、安全非関係）→ reviewPolicy: full_pre_post_review', () => {
+    const result = determine(
+      ['apps/api/src/routes/projects.ts'],
+      '+const ProjectSchema = z.object({ nickname: z.string().optional() })',
+    )
+
+    expect(result.reviewPolicy).toBe('full_pre_post_review')
+    expect(result.classifierResult.reviewPolicy).toBe('full_pre_post_review')
+  })
+
+  it('Level3（Mechanical Gate: postTestHook.ps1）→ reviewPolicy: ceo_required', () => {
+    const result = determine(['apps/worker/scripts/postTestHook.ps1'], '+Write-Host ok')
+
+    expect(result.reviewPolicy).toBe('ceo_required')
+    expect(result.classifierResult.reviewPolicy).toBe('ceo_required')
+  })
+
+  it('Level3（判定不能・空入力）→ reviewPolicy: ceo_required', () => {
+    const result = determine([])
+
+    expect(result.reviewPolicy).toBe('ceo_required')
+    expect(result.classifierResult.reviewPolicy).toBe('ceo_required')
+  })
+
+  it('Level3（required→optional、安全関係あり）→ reviewPolicy: ceo_required', () => {
+    const result = determine(
+      ['packages/shared/src/types/permission_grant.ts'],
+      '+const PermissionSchema = z.object({ token: z.string().optional() })',
+    )
+
+    expect(result.reviewPolicy).toBe('ceo_required')
+    expect(result.classifierResult.reviewPolicy).toBe('ceo_required')
+  })
+
+  it('Level3（大量ファイル変更）→ reviewPolicy: ceo_required', () => {
+    const changedFiles = Array.from({ length: 31 }, (_, index) => `docs/file-${index}.md`)
+    const result = determine(changedFiles, '+docs update')
+
+    expect(result.reviewPolicy).toBe('ceo_required')
+    expect(result.classifierResult.reviewPolicy).toBe('ceo_required')
+  })
+
+  it('determineApprovalLevel()の戻り値でApprovalLevelResult.reviewPolicyが' +
+     'classifierResult.reviewPolicyと一致する（task-023相当の入力で確認）', () => {
+    const result = determine(
+      [
+        'packages/shared/src/types/job.ts',
+        'apps/api/src/routes/jobs.ts',
+        'apps/worker/src/jobRunner.ts',
+      ],
+      '+const approvalLevel = 2',
+    )
+
+    expect(result.reviewPolicy).toBe(result.classifierResult.reviewPolicy)
+    expect(result.reviewPolicy).toBe('full_pre_post_review')
+  })
+})
+
 describe('shouldEscalateToAiReview', () => {
   it('confidence 0.9かつneedsEscalation=falseならfalse', () => {
     const result = shouldEscalateToAiReview({
@@ -265,6 +433,7 @@ describe('shouldEscalateToAiReview', () => {
       confidence: 0.9,
       reasons: [],
       needsEscalation: false,
+      reviewPolicy: 'mechanical_only',
     })
 
     expect(result).toBe(false)
@@ -276,6 +445,7 @@ describe('shouldEscalateToAiReview', () => {
       confidence: 0.7,
       reasons: [],
       needsEscalation: false,
+      reviewPolicy: 'light_ai_post_review',
     })
 
     expect(result).toBe(true)
@@ -287,6 +457,7 @@ describe('shouldEscalateToAiReview', () => {
       confidence: 0.9,
       reasons: [],
       needsEscalation: true,
+      reviewPolicy: 'full_pre_post_review',
     })
 
     expect(result).toBe(true)

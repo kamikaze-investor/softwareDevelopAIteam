@@ -6,6 +6,7 @@ import type {
   MechanicalGateHit,
   MechanicalGatePattern,
   MechanicalGateResult,
+  ReviewPolicy,
 } from './types/approvalLevel'
 
 export const MECHANICAL_GATE_PATTERNS: MechanicalGatePattern[] = [
@@ -223,6 +224,7 @@ function buildClassifierResult(
   confidence: number,
   reasons: ClassifierReason[],
   needsEscalation: boolean,
+  reviewPolicy: ReviewPolicy,
   escalationReason?: string,
 ): ClassifierResult {
   return {
@@ -230,6 +232,7 @@ function buildClassifierResult(
     confidence,
     reasons,
     needsEscalation,
+    reviewPolicy,
     ...(escalationReason ? { escalationReason } : {}),
   }
 }
@@ -385,6 +388,34 @@ function hasMeaningfulDeletion(diffText: string): boolean {
   return /^-(?!---).*\S/m.test(diffText)
 }
 
+/**
+ * Level1確定時に、mechanical_only（機械チェックのみで十分）か
+ * light_ai_post_review（軽量AIによるpost-reviewが必要）かを判定する。
+ *
+ * mechanical_only の条件（すべて満たす場合のみ）:
+ *   - level1Kinds が 'type-definition' のみで構成される
+ *     （'zod-schema' / 'non-breaking-extension' を一切含まない）
+ *   - diffText に削除行が一切ない（hasMeaningfulDeletion()がfalse）
+ *   - changedFiles.length <= 3
+ *
+ * 上記を1つでも満たさない場合は light_ai_post_review とする（安全側に倒す）。
+ */
+function classifyLevel1ReviewPolicy(
+  changedFiles: string[],
+  diffText: string,
+  level1Kinds: Set<string>,
+): ReviewPolicy {
+  const isTypeDefinitionOnly = level1Kinds.size === 1 && level1Kinds.has('type-definition')
+  const hasNoDeletion = !hasMeaningfulDeletion(diffText)
+  const isWithinFileLimit = changedFiles.length <= 3
+
+  if (isTypeDefinitionOnly && hasNoDeletion && isWithinFileLimit) {
+    return 'mechanical_only'
+  }
+
+  return 'light_ai_post_review'
+}
+
 function isRouteZodSchemaExtension(file: string, diffText: string): boolean {
   return /\/routes\/.*\.ts$/.test(file) &&
     /^\+.*\bz\.(object|string|number|boolean|array|enum|nativeEnum|literal|union|record)/m.test(diffText) &&
@@ -515,6 +546,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
       0.3,
       [{ rule: 'FAIL_CLOSED_NO_INPUT', detail: '変更情報が空のため判定不能' }],
       true,
+      'ceo_required',
       '入力情報が空',
     )
   }
@@ -528,6 +560,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
         detail: `変更ファイル数 ${changedFiles.length} が上限30を超過`,
       }],
       true,
+      'ceo_required',
       '大量変更のため要人間確認',
     )
   }
@@ -541,6 +574,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
         0.7,
         safetyReasons,
         true,
+        'ceo_required',
         'CLAUDE.md/AGENTS.mdの安全関連記述変更',
       )
     }
@@ -554,6 +588,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
         detail: 'CLAUDE.md/AGENTS.mdの変更のためLevel2',
       }],
       false,
+      'full_pre_post_review',
     )
   }
 
@@ -567,6 +602,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
           detail: 'required→optional化と安全条件緩和の疑いを検出',
         }],
         true,
+        'ceo_required',
         'optional化+安全条件緩和の疑い',
       )
     }
@@ -579,6 +615,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
         detail: 'required→optional化のためLevel2で意図確認',
       }],
       true,
+      'full_pre_post_review',
       'required→optional化のためAIレビューで意図確認',
     )
   }
@@ -590,6 +627,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
       calculateLevel2Confidence(input, level2Reasons),
       level2Reasons,
       false,
+      'full_pre_post_review',
     )
   }
 
@@ -614,6 +652,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
           detail: '型定義、Zodスキーマ、または非破壊的拡張に限定された変更',
         }],
         false,
+        classifyLevel1ReviewPolicy(changedFiles, diffText, level1Kinds),
       )
     }
   }
@@ -629,6 +668,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
         detail: 'docs/README/.gitignore/新規テスト/logsのみの変更',
       }],
       false,
+      'mechanical_only',
     )
   }
 
@@ -637,6 +677,7 @@ export function classifyApprovalLevel(input: ClassifierInput): ClassifierResult 
     0.4,
     [{ rule: 'UNMATCHED_FALLBACK', detail: '既知のルールに一致しないため安全側でLevel3' }],
     true,
+    'ceo_required',
     '未知パターンのため人間確認が必要',
   )
 }
@@ -668,6 +709,7 @@ export function determineApprovalLevel(
         detail: hit.reason,
       })),
       needsEscalation: false,
+      reviewPolicy: 'ceo_required',
     }
 
     return {
@@ -680,6 +722,7 @@ export function determineApprovalLevel(
       finalReason: `Mechanical Gate: ${mechanicalGate.hits.map(hit => hit.label).join(', ')}`,
       decidedAt: new Date().toISOString(),
       requiresChatGptReview: true,
+      reviewPolicy: classifierResult.reviewPolicy,
     }
   }
 
@@ -706,5 +749,6 @@ export function determineApprovalLevel(
     finalReason: classifierResult.reasons.map(reason => reason.detail).join('; '),
     decidedAt: new Date().toISOString(),
     requiresChatGptReview,
+    reviewPolicy: classifierResult.reviewPolicy,
   }
 }

@@ -67,6 +67,8 @@ export interface ClassifierResult {
   needsEscalation: boolean
   /** 昇格が必要な場合の理由。 */
   escalationReason?: string
+  /** このケースに適用するレビュー方針 */
+  reviewPolicy: ReviewPolicy
 }
 
 export interface ApprovalLevelResult {
@@ -92,4 +94,19 @@ export interface ApprovalLevelResult {
    * 将来のCost-aware Review RouterでChatGPTレビューへ昇格するための判定フラグ。
    */
   requiresChatGptReview: boolean
+  /** このタスクに適用するレビュー方針。classifierResult.reviewPolicyと同じ値になる。 */
+  reviewPolicy: ReviewPolicy
 }
+
+/**
+ * レビュー方針。Levelに応じて必要なレビュー・成果物の重さを決める。
+ *   mechanical_only        : AIレビュー不要。機械チェックのみ。
+ *   light_ai_post_review    : 実装後レビューのみ必要。実装前レビューは不要。
+ *   full_pre_post_review    : 実装前後レビューの両方が必要。
+ *   ceo_required            : 自動停止。CEOの事前承認が必要。
+ */
+export type ReviewPolicy =
+  | 'mechanical_only'
+  | 'light_ai_post_review'
+  | 'full_pre_post_review'
+  | 'ceo_required'
