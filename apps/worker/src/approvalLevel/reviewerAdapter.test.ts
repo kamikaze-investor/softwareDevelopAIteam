@@ -41,10 +41,12 @@ function makeApprovalLevelResult(overrides: Partial<ApprovalLevelResult> = {}): 
       confidence: 0.9,
       reasons: [],
       needsEscalation: false,
+      reviewPolicy: 'full_pre_post_review',
     },
     finalReason: 'test fixture',
     decidedAt: '2026-07-01T00:00:00.000Z',
     requiresChatGptReview: false,
+    reviewPolicy: 'full_pre_post_review',
     ...overrides,
   }
 }

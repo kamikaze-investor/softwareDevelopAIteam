@@ -418,6 +418,17 @@ export function checkPurposeDiffAlignment(
 export function runSafetyVerification(
   input: SafetyVerificationInput,
 ): SafetyVerificationResult {
+  const reviewPolicy = input.approvalLevelResult.reviewPolicy
+  const purposeDiffAlignmentCheck: SafetyCheckResult =
+    reviewPolicy === 'mechanical_only'
+      ? {
+          id: 'PURPOSE_DIFF_ALIGNMENT',
+          passed: true,
+          blocking: true,
+          detail: 'reviewPolicy mechanical_only のため Post-Review alignment check は不要',
+        }
+      : checkPurposeDiffAlignment(input.postReviewAlignmentVerdict)
+
   const checks: SafetyCheckResult[] = [
     checkUnexpectedFiles(input.changedFiles, input.allowedPaths),
     checkMechanicalGateFiles(input.approvalLevelResult, input.changedFiles, input.diffText),
@@ -430,7 +441,7 @@ export function runSafetyVerification(
     checkTypecheckResult(input.typecheckResult),
     checkRelatedTestResult(input.relatedTestResult),
     checkFullTestResult(input.fullTestResult),
-    checkPurposeDiffAlignment(input.postReviewAlignmentVerdict),
+    purposeDiffAlignmentCheck,
   ]
 
   const blockingFailures = checks

@@ -27,10 +27,12 @@ export interface PreReviewResult {
 }
 
 /**
- * runPreReview() は Level 1 のタスクに対しては呼び出さない設計とする
- * （Level 1 は postReview のみで十分という方針のため）。
- * この関数自体はLevelを判定しない。呼び出し元（Step6のjobRunner接続時）が
- * ApprovalLevelResult.level >= 2 の場合のみこの関数を呼ぶこと。
+ * runPreReview() は reviewPolicy === 'full_pre_post_review'（Level2相当）の
+ * タスクに対してのみ呼び出す設計とする。
+ * mechanical_only / light_ai_post_review では呼ばない。
+ * この関数自体はreviewPolicyを判定しない。呼び出し元（Step6のjobRunner接続時）が
+ * ApprovalLevelResult.reviewPolicy === 'full_pre_post_review' の場合のみ
+ * この関数を呼ぶこと。
  */
 export async function runPreReview(input: PreReviewInput): Promise<PreReviewResult> {
   void input.approvalLevelResult

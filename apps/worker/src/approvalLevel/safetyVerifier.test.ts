@@ -1,6 +1,6 @@
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { ApprovalLevelResult } from '@ai-team/shared'
+import type { ApprovalLevelResult, ReviewPolicy } from '@ai-team/shared'
 import {
   checkApprovalGateWeakening,
   checkFullTestResult,
@@ -36,7 +36,10 @@ const FAILED_COMMAND: CommandExecutionResult = {
   durationMs: 10,
 }
 
-function makeApprovalLevelResult(mechanicalGateTriggered = false): ApprovalLevelResult {
+function makeApprovalLevelResult(
+  mechanicalGateTriggered = false,
+  reviewPolicy: ReviewPolicy = 'full_pre_post_review',
+): ApprovalLevelResult {
   const level = mechanicalGateTriggered ? 3 : 2
 
   return {
@@ -60,10 +63,12 @@ function makeApprovalLevelResult(mechanicalGateTriggered = false): ApprovalLevel
       confidence: 0.9,
       reasons: [],
       needsEscalation: false,
+      reviewPolicy,
     },
     finalReason: 'test fixture',
     decidedAt: '2026-07-01T00:00:00.000Z',
     requiresChatGptReview: false,
+    reviewPolicy,
   }
 }
 
@@ -435,5 +440,66 @@ describe('runSafetyVerification', () => {
 
     expect(result.overallPassed).toBe(true)
     expect(result.blockingFailures).toEqual([])
+  })
+})
+
+describe('reviewPolicy による PURPOSE_DIFF_ALIGNMENT の分岐', () => {
+  it('reviewPolicy: mechanical_only + postReviewAlignmentVerdict未指定 → PURPOSE_DIFF_ALIGNMENT passed:true', () => {
+    const result = runSafetyVerification(makePassingVerificationInput({
+      approvalLevelResult: makeApprovalLevelResult(false, 'mechanical_only'),
+      postReviewAlignmentVerdict: undefined,
+    }))
+    const purposeCheck = result.checks.find(check => check.id === 'PURPOSE_DIFF_ALIGNMENT')
+
+    expect(result.overallPassed).toBe(true)
+    expect(purposeCheck).toMatchObject({
+      passed: true,
+      blocking: true,
+    })
+    expect(result.blockingFailures).not.toContain('PURPOSE_DIFF_ALIGNMENT')
+  })
+
+  it('reviewPolicy: light_ai_post_review + postReviewAlignmentVerdict未指定 → PURPOSE_DIFF_ALIGNMENT passed:false', () => {
+    const result = runSafetyVerification(makePassingVerificationInput({
+      approvalLevelResult: makeApprovalLevelResult(false, 'light_ai_post_review'),
+      postReviewAlignmentVerdict: undefined,
+    }))
+    const purposeCheck = result.checks.find(check => check.id === 'PURPOSE_DIFF_ALIGNMENT')
+
+    expect(result.overallPassed).toBe(false)
+    expect(purposeCheck).toMatchObject({
+      passed: false,
+      blocking: true,
+    })
+    expect(result.blockingFailures).toContain('PURPOSE_DIFF_ALIGNMENT')
+  })
+
+  it('reviewPolicy: full_pre_post_review + postReviewAlignmentVerdict:aligned → PURPOSE_DIFF_ALIGNMENT passed:true', () => {
+    const result = runSafetyVerification(makePassingVerificationInput({
+      approvalLevelResult: makeApprovalLevelResult(false, 'full_pre_post_review'),
+      postReviewAlignmentVerdict: 'aligned',
+    }))
+    const purposeCheck = result.checks.find(check => check.id === 'PURPOSE_DIFF_ALIGNMENT')
+
+    expect(result.overallPassed).toBe(true)
+    expect(purposeCheck).toMatchObject({
+      passed: true,
+      blocking: true,
+    })
+    expect(result.blockingFailures).not.toContain('PURPOSE_DIFF_ALIGNMENT')
+  })
+
+  it('reviewPolicy: mechanical_only でも他の11項目は通常通り評価される', () => {
+    const result = runSafetyVerification(makePassingVerificationInput({
+      allowedPaths: ['apps/worker/scripts'],
+      changedFiles: ['apps/worker/scripts/postTestHook.ps1'],
+      approvalLevelResult: makeApprovalLevelResult(true, 'mechanical_only'),
+      postReviewAlignmentVerdict: undefined,
+    }))
+
+    expect(result.overallPassed).toBe(false)
+    expect(result.blockingFailures).toContain('POST_TEST_HOOK')
+    expect(result.blockingFailures).not.toContain('PURPOSE_DIFF_ALIGNMENT')
+    expect(result.blockingFailures).not.toContain('MECHANICAL_GATE_FILES')
   })
 })
