@@ -119,6 +119,53 @@
 - [ ] Health Metrics
 - [ ] Notification System
 
+### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
+
+**背景:**
+VPS Doctor Lite の実reboot検証により、SSH再接続・hostname一致・uptime reset・Docker Up復帰・
+failed service増加なし・reboot-required解消は確認できた。ただし最終ユーザー目線ではこれだけでは不十分。
+本当に重要なのは「再起動前に稼働していた自作アプリが、再起動後も実際に稼働しているか」を確認できること。
+Docker Up / systemd active / URL 200 だけでは、アプリ内部の主要処理が動いているか分からない。
+
+**目的:**
+- 自作アプリが再起動後も稼働しているか、VPS Doctor Liteから高確度で確認できるようにする
+- 単なるHTTP 200ではなく、アプリ内部の状態・最終実行時刻・最終成功時刻を返す
+- bot / worker / 定期処理 / 自動投稿 / 監視アプリなど、自動稼働アプリの復旧確認を標準化する
+- 今後の自作アプリすべてに共通で実装できる運用標準にする
+
+**標準仕様（今後AIチームOSで作る自作アプリに必須化）:**
+- `/health` または `/api/health` エンドポイント（Next.js / APIアプリの場合は `/api/health` を優先）
+- アプリ識別情報・起動時刻・最終heartbeat時刻・最終成功時刻・最終エラー時刻・現在ステータス
+- VPS Doctor Liteが判定しやすいJSON形式
+
+**最低限のレスポンス形式:**
+```json
+{
+  "ok": true,
+  "appName": "example-app",
+  "appType": "web-worker",
+  "version": "0.1.0",
+  "environment": "production",
+  "startedAt": "2026-07-02T16:00:00+09:00",
+  "lastHeartbeatAt": "2026-07-02T16:58:00+09:00",
+  "lastSuccessAt": "2026-07-02T16:57:30+09:00",
+  "lastErrorAt": null,
+  "status": "running",
+  "message": "running"
+}
+```
+
+**ステータス:** 未着手（AI Approval Level v2 Step6完了後、別タスクとして着手予定）
+
+- [ ] app manifest のファイル形式決定
+- [ ] app manifest の保存場所決定
+- [ ] heartbeat送信先決定
+- [ ] success/error event送信先決定
+- [ ] `/health` エンドポイントのレスポンス形式確定
+- [ ] systemd と Docker Compose のどちらを標準にするか決定
+- [ ] logs の標準ディレクトリ決定
+- [ ] 既存VPS Doctor / VPS Keeper 系アプリとの接続方法設計
+
 ---
 
-*Updated: 2026-07-01*
+*Updated: 2026-07-02*
