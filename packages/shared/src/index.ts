@@ -18,6 +18,7 @@ export * from './types/dev_log'
 export * from './types/approval_gate'
 export * from './types/knowledge_graph'
 export * from './types/actor'
+export * from './types/approvalLevel'
 export {
   RISK_RULES,
   SAFE_ONLY_PATTERNS,
@@ -27,3 +28,10 @@ export {
   decideGateOutcome,
   buildApprovalRequest,
 } from './approvalGateLogic'
+export {
+  MECHANICAL_GATE_PATTERNS,
+  runMechanicalGate,
+  classifyApprovalLevel,
+  shouldEscalateToAiReview,
+  determineApprovalLevel,
+} from './approvalLevelClassifier'
