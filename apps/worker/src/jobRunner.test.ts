@@ -1423,3 +1423,91 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
     expect(result.status).not.toBe('blocked')
   })
 })
+
+describe('Risk Scan Console Warning（観察モード）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('.env を含む変更 → console.warnが呼ばれ、Target Project Risk Scan summaryを含む', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+
+    await runJob(createJob())
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
+
+    warnSpy.mockRestore()
+  })
+
+  it('通常の変更（src/index.ts）→ console.warnが呼ばれない（hasRisk:falseのため）', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'src/index.ts\n'
+      return ''
+    })
+
+    await runJob(createJob())
+
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
+
+    warnSpy.mockRestore()
+  })
+
+  it('AI CLI失敗時 → console.warnが呼ばれない（scanポイントに到達しないため）', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    await runJob(job)
+
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
+
+    warnSpy.mockRestore()
+  })
+
+  it('既存Approval Gateがblock_until_approvedの場合 → console.warnが呼ばれない', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL risk — CEO approval required',
+      apiAvailable: true,
+    })
+
+    await runJob(createJob())
+
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
+
+    warnSpy.mockRestore()
+  })
+
+  it('console.warnが呼ばれても、statusはblockedにならない', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
+    expect(result.status).not.toBe('blocked')
+
+    warnSpy.mockRestore()
+  })
+})

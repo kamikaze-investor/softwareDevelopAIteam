@@ -14,7 +14,7 @@ import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo, ApprovalL
 import { runRiskReview } from '@ai-team/shared'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
-import { scanTargetProjectRisk } from './approvalLevel/targetProjectRiskScan.js'
+import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
 import type { TargetProjectRiskScanResult } from './approvalLevel/targetProjectRiskScan.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
@@ -411,6 +411,12 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     changedFiles: postChangedFiles,
     diffText: postDiffText,
   })
+  // Risk Scan Console Warning（観察モード）: summary がある場合のみログに出す。
+  // 停止・通知・API/UI転送は一切行わない。
+  const riskScanSummary = formatRiskScanSummary(targetProjectRiskScanResult)
+  if (riskScanSummary) {
+    console.warn(riskScanSummary)
+  }
   // ── Target Project Risk Scan 終端 ───────────────────────────────────────────
 
   const resolved = resolveCommand(job.safeCommand)
