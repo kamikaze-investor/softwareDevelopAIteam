@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   checkEnvFileChanged,
   checkMechanicalGateDiffPatterns,
+  formatRiskScanSummary,
   scanTargetProjectRisk,
 } from './targetProjectRiskScan.js'
 import type {
@@ -245,6 +246,59 @@ describe('scanTargetProjectRisk', () => {
       const severities = result.issues.map(i => i.severity)
       expect(severities).toEqual(expect.arrayContaining(['medium', 'high']))
       expect(result.highestSeverity).toBe('high')
+    })
+  })
+
+  describe('formatRiskScanSummary（Risk Scan Summary Formatter v1）', () => {
+    it('hasRisk:false の場合、undefinedを返す', () => {
+      const result = scan(['src/index.ts'], '+const x = 1')
+
+      expect(formatRiskScanSummary(result)).toBeUndefined()
+    })
+
+    it('hasRisk:true + high の場合、high を含むサマリーを返す', () => {
+      const result = scan([], "+  ANTHROPIC_API_KEY = 'sk-test123'")
+
+      const summary = formatRiskScanSummary(result)
+      expect(summary).toBeDefined()
+      expect(summary).toContain('high')
+    })
+
+    it('hasRisk:true + medium の場合、medium を含むサマリーを返す', () => {
+      const result = scan(['.env'], '')
+
+      const summary = formatRiskScanSummary(result)
+      expect(summary).toBeDefined()
+      expect(summary).toContain('medium')
+    })
+
+    it('hasRisk:true + low の場合、low を含むサマリーを返す', () => {
+      const result = scan([], '+  it.skip("test", () => {})')
+
+      const summary = formatRiskScanSummary(result)
+      expect(summary).toBeDefined()
+      expect(summary).toContain('low')
+    })
+
+    it('複数issueの場合、各issue labelがサマリーに含まれる', () => {
+      const result = scan(['.env'], '+  it.skip("test", () => {})')
+
+      const summary = formatRiskScanSummary(result)
+      expect(summary).toBeDefined()
+      for (const issue of result.issues) {
+        expect(summary).toContain(issue.label)
+      }
+    })
+
+    it('issuesが空なのに hasRisk:true のような異常ケースでも例外を投げない', () => {
+      const abnormalResult: TargetProjectRiskScanResult = {
+        hasRisk: true,
+        issues: [],
+        scannedAt: new Date().toISOString(),
+      }
+
+      expect(() => formatRiskScanSummary(abnormalResult)).not.toThrow()
+      expect(formatRiskScanSummary(abnormalResult)).toBeUndefined()
     })
   })
 })

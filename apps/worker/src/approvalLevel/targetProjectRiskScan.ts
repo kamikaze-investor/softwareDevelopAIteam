@@ -291,3 +291,18 @@ function computeHighestSeverity(issues: RiskScanIssue[]): RiskScanSeverity | und
     issues[0].severity,
   )
 }
+
+/**
+ * TargetProjectRiskScanResult を人間が読める一行サマリーに整形する。
+ *
+ * これはwarning表示・通知・自動停止への接続ではない。
+ * risk scan結果を読みやすい文字列に整形するだけのヘルパー関数である。
+ */
+export function formatRiskScanSummary(result: TargetProjectRiskScanResult): string | undefined {
+  if (!result.hasRisk || result.issues.length === 0) return undefined
+
+  const severity = result.highestSeverity ?? computeHighestSeverity(result.issues)
+  const issueLabels = result.issues.map(issue => issue.label).join(', ')
+
+  return `[Target Project Risk Scan] ${severity} risk detected: ${issueLabels}`
+}
