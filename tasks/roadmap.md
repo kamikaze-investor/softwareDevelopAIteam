@@ -155,16 +155,21 @@ Docker Up / systemd active / URL 200 だけでは、アプリ内部の主要処�
 }
 ```
 
-**ステータス:** 未着手（AI Approval Level v2 Step6完了後、別タスクとして着手予定）
+**仕様書:** [docs/vps_app_runtime_standard.md](../docs/vps_app_runtime_standard.md)（Step V1/V2完了。標準エンドポイント・レスポンスJSON・フィールド定義・status/ok/HTTPステータスの関係・Next.js/Node worker実装案・VPS Doctor Lite連携イメージを記載）
 
+**ステータス:** 仕様策定完了（Step V1/V2）。target-project側への実装・VPS Doctor Lite側の実装は別タスクとして着手予定
+
+- [x] `/api/health` エンドポイントのレスポンス形式確定（仕様書参照）
+- [x] status（running/degraded/error/stopped）と ok / HTTPステータスの関係確定（仕様書参照）
 - [ ] app manifest のファイル形式決定
 - [ ] app manifest の保存場所決定
 - [ ] heartbeat送信先決定
 - [ ] success/error event送信先決定
-- [ ] `/health` エンドポイントのレスポンス形式確定
 - [ ] systemd と Docker Compose のどちらを標準にするか決定
 - [ ] logs の標準ディレクトリ決定
 - [ ] 既存VPS Doctor / VPS Keeper 系アプリとの接続方法設計
+- [ ] target-project側への実際の実装（別タスク・別プロジェクト）
+- [ ] VPS Doctor Lite側の実装（別タスク・別プロジェクト）
 
 ---
 
