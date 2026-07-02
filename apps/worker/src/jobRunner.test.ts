@@ -298,6 +298,8 @@ describe('runJob', () => {
       .mockReturnValueOnce('')           // getPreGateDiffText
       .mockReturnValueOnce('main\n')     // getTargetBranch
       .mockReturnValueOnce('')           // getCommitHash targetCommit
+      .mockReturnValueOnce('')           // getChangedFiles (Target Project Risk Scan)
+      .mockReturnValueOnce('')           // getPreGateDiffText (Target Project Risk Scan)
       .mockReturnValueOnce('abc123\n')   // beforeCommitHash
       .mockReturnValueOnce('')           // git commit stdout
       .mockReturnValueOnce('def456\n')   // afterCommitHash
@@ -1309,5 +1311,115 @@ describe('Step6-B0: Approval Scope（jobRunner経由のJobはtarget_project前�
     expect(resolveCommandMock).toHaveBeenCalled()
     // approvalLevelResultは計算されるが、これはtarget_project向けの観察用参考ラベルに過ぎない
     expect(result.approvalLevelResult).toBeDefined()
+  })
+})
+
+describe('Target Project Risk Scan 接続（観察モード）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('通常の変更（docs/README.md）→ targetProjectRiskScanResult.hasRisk:false', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('success')
+    expect(result.targetProjectRiskScanResult).toBeDefined()
+    expect(result.targetProjectRiskScanResult?.hasRisk).toBe(false)
+  })
+
+  it('.env を含む変更 → targetProjectRiskScanResult.hasRisk:true、ただしstatusはsuccessのまま（停止しない）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('success')
+    expect(result.targetProjectRiskScanResult?.hasRisk).toBe(true)
+    expect(result.targetProjectRiskScanResult?.issues.some(issue => issue.id === 'ENV_FILE_CHANGED')).toBe(true)
+  })
+
+  it('AI CLI経由で.envを変更するJob → AI CLI実行後のchangedFilesを対象にscanされる', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: ['.env'] })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: '設定を追加してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('success')
+    expect(result.targetProjectRiskScanResult?.hasRisk).toBe(true)
+  })
+
+  it('AI CLI失敗時、targetProjectRiskScanResultはundefinedのまま（scanポイントに到達しない）', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(result.targetProjectRiskScanResult).toBeUndefined()
+  })
+
+  it('permissionGuardでblockedの場合、targetProjectRiskScanResultはundefinedのまま', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      reason: 'denied',
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.targetProjectRiskScanResult).toBeUndefined()
+  })
+
+  it('既存Approval Gateがblock_until_approvedの場合、targetProjectRiskScanResultはundefinedのまま', async () => {
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL risk — CEO approval required',
+      apiAvailable: true,
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.targetProjectRiskScanResult).toBeUndefined()
+  })
+
+  it('hasRisk:trueでもJobのstatusはblockedにならない（観察モードであることの確認）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'Dockerfile\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.targetProjectRiskScanResult?.hasRisk).toBe(true)
+    expect(result.status).not.toBe('blocked')
   })
 })

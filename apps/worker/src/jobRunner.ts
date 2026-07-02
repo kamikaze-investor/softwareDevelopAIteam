@@ -14,6 +14,8 @@ import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo, ApprovalL
 import { runRiskReview } from '@ai-team/shared'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
+import { scanTargetProjectRisk } from './approvalLevel/targetProjectRiskScan.js'
+import type { TargetProjectRiskScanResult } from './approvalLevel/targetProjectRiskScan.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -58,6 +60,14 @@ export interface JobRunResult {
    * 観察モード: まだこの結果でJobをblockingしない。
    */
   approvalLevelResult?: ApprovalLevelResult
+  /**
+   * Target Project Risk Scan v1 の結果（観察モード）。
+   * AI CLI実行ブロックの終端（成功時）・SafeCommand実行前に計算される。
+   * hasRisk:true であっても、Jobをblockingする根拠にはまだ使わない。
+   * AI CLI失敗時やそれ以前の早期return（Approval Gate blocked等）では
+   * 計算されず、undefinedのまま。
+   */
+  targetProjectRiskScanResult?: TargetProjectRiskScanResult
 }
 
 /**
@@ -390,6 +400,19 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   }
   // ── AI CLI 実行ブロック終端 ───────────────────────────────────────────────
 
+  // ── Target Project Risk Scan（観察モード） ─────────────────────────────────
+  // AI CLI実行後（AI CLIを使わないJobの場合はこの時点の作業ツリー状態）を対象に
+  // スキャンする。AI CLI実行前は差分が空のことが多く検出に使えないため、
+  // ここで再取得した changedFiles / diffText を使う。
+  // 観察モード: hasRisk:true でもJobをblockingしない。
+  const postChangedFiles = getChangedFiles(job.safeCommand.workingDir)
+  const postDiffText = getPreGateDiffText(job.safeCommand.workingDir)
+  const targetProjectRiskScanResult = scanTargetProjectRisk({
+    changedFiles: postChangedFiles,
+    diffText: postDiffText,
+  })
+  // ── Target Project Risk Scan 終端 ───────────────────────────────────────────
+
   const resolved = resolveCommand(job.safeCommand)
   const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)
 
@@ -454,6 +477,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     completedAt: new Date().toISOString(),
     rollbackInfo,
     approvalLevelResult,
+    targetProjectRiskScanResult,
   }
 }
 
