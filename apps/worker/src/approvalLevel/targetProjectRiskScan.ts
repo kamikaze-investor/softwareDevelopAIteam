@@ -29,11 +29,20 @@ export type RiskScanIssueId =
   | 'REMOTE_CODE_EXECUTION_ADDED'
   | 'AUTH_CHECK_WEAKENED'
 
+/**
+ * リスクの重さの分類（Risk Scan Handling v1）。
+ * 注意: この段階ではまだ運用ルールの実行を意味しない。
+ * 「highなら停止」「mediumなら通知」「commit不可」「CEO承認必須」等は
+ * 一切実装していない。将来の通知/停止/commitGate判断のための土台のみ。
+ */
+export type RiskScanSeverity = 'high' | 'medium' | 'low'
+
 export interface RiskScanIssue {
   id: RiskScanIssueId
   label: string
   detail: string
   evidence: string[]
+  severity: RiskScanSeverity
 }
 
 export interface TargetProjectRiskScanResult {
@@ -44,6 +53,11 @@ export interface TargetProjectRiskScanResult {
    */
   hasRisk: boolean
   issues: RiskScanIssue[]
+  /**
+   * issuesの中で最も重いseverity。issuesが空の場合はundefined。
+   * こちらも同様に、まだ運用ルールの実行は意味しない。
+   */
+  highestSeverity?: RiskScanSeverity
   scannedAt: string
 }
 
@@ -54,6 +68,31 @@ const NPMRC_PATTERN = /(^|\/)\.npmrc$/
 const INFRA_AS_CODE_PATTERN = /\.tf$|^terraform\//i
 const REMOTE_CODE_EXECUTION_PATTERN = /^\+.*(curl|wget).*\|\s*(sh|bash)/im
 const AUTH_CHECK_WEAKENED_PATTERN = /^-.*(isAdmin|isAuthenticated|requireAuth|checkPermission)/m
+
+const ISSUE_SEVERITY: Record<RiskScanIssueId, RiskScanSeverity> = {
+  HARDCODED_SECRET_ADDED: 'high',
+  DESTRUCTIVE_COMMAND_ADDED: 'high',
+  REMOTE_CODE_EXECUTION_ADDED: 'high',
+  ENV_FILE_CHANGED: 'medium',
+  CI_WORKFLOW_CHANGED: 'medium',
+  DEPLOY_CONFIG_CHANGED: 'medium',
+  PROD_DEPLOY_CONFIG_CHANGED: 'medium',
+  PAYMENT_CODE_ADDED: 'medium',
+  AUTH_CHECK_WEAKENED: 'medium',
+  GUARD_BYPASS_ADDED: 'medium',
+  NPMRC_CHANGED: 'medium',
+  INFRA_AS_CODE_CHANGED: 'medium',
+  TEST_SKIP_ADDED: 'low',
+  GIT_HOOK_SKIP_ADDED: 'low',
+  FORCE_PUSH_ADDED: 'low',
+  EMPTY_CATCH_ADDED: 'low',
+}
+
+const SEVERITY_ORDER: Record<RiskScanSeverity, number> = {
+  high: 3,
+  medium: 2,
+  low: 1,
+}
 
 const MECHANICAL_GATE_DIFF_ISSUE_IDS: Partial<Record<string, RiskScanIssueId>> = {
   'MG-D01': 'TEST_SKIP_ADDED',
@@ -96,6 +135,7 @@ function buildFileIssue(
     label,
     detail,
     evidence: matched,
+    severity: ISSUE_SEVERITY[id],
   }
 }
 
@@ -122,6 +162,7 @@ function buildDiffIssue(
     label,
     detail,
     evidence: [matched],
+    severity: ISSUE_SEVERITY[id],
   }
 }
 
@@ -189,6 +230,7 @@ export function checkMechanicalGateDiffPatterns(diffText: string): RiskScanIssue
         label: pattern.label,
         detail: pattern.reason,
         evidence: [matched],
+        severity: ISSUE_SEVERITY[issueId],
       }
     })
     .filter((issue): issue is RiskScanIssue => issue !== undefined)
@@ -236,6 +278,16 @@ export function scanTargetProjectRisk(
   return {
     hasRisk: issues.length > 0,
     issues,
+    highestSeverity: computeHighestSeverity(issues),
     scannedAt: new Date().toISOString(),
   }
+}
+
+function computeHighestSeverity(issues: RiskScanIssue[]): RiskScanSeverity | undefined {
+  if (issues.length === 0) return undefined
+
+  return issues.reduce<RiskScanSeverity>(
+    (highest, issue) => (SEVERITY_ORDER[issue.severity] > SEVERITY_ORDER[highest] ? issue.severity : highest),
+    issues[0].severity,
+  )
 }

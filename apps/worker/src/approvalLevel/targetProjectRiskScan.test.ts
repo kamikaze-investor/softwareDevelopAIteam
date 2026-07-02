@@ -181,4 +181,70 @@ describe('scanTargetProjectRisk', () => {
       expect(checkMechanicalGateDiffPatterns('+const value = 1')).toEqual([])
     })
   })
+
+  describe('severity / highestSeverity（Risk Scan Handling v1）', () => {
+    it('HARDCODED_SECRET_ADDED は severity:high', () => {
+      const result = scan([], "+  ANTHROPIC_API_KEY = 'sk-test123'")
+      const issue = result.issues.find(i => i.id === 'HARDCODED_SECRET_ADDED')
+
+      expect(issue?.severity).toBe('high')
+    })
+
+    it('ENV_FILE_CHANGED は severity:medium', () => {
+      const result = scan(['.env'], '')
+      const issue = result.issues.find(i => i.id === 'ENV_FILE_CHANGED')
+
+      expect(issue?.severity).toBe('medium')
+    })
+
+    it('NPMRC_CHANGED は severity:medium', () => {
+      const result = scan(['.npmrc'], '')
+      const issue = result.issues.find(i => i.id === 'NPMRC_CHANGED')
+
+      expect(issue?.severity).toBe('medium')
+    })
+
+    it('INFRA_AS_CODE_CHANGED は severity:medium', () => {
+      const result = scan(['terraform/main.tf'], '')
+      const issue = result.issues.find(i => i.id === 'INFRA_AS_CODE_CHANGED')
+
+      expect(issue?.severity).toBe('medium')
+    })
+
+    it('TEST_SKIP_ADDED は severity:low', () => {
+      const result = scan([], '+  it.skip("test", () => {})')
+      const issue = result.issues.find(i => i.id === 'TEST_SKIP_ADDED')
+
+      expect(issue?.severity).toBe('low')
+    })
+
+    it('hasRisk:false の場合、highestSeverityは未設定', () => {
+      const result = scan(['src/index.ts'], '+const x = 1')
+
+      expect(result.hasRisk).toBe(false)
+      expect(result.highestSeverity).toBeUndefined()
+    })
+
+    it('低severityのissueのみの場合、highestSeverityはlow', () => {
+      const result = scan([], '+  it.skip("test", () => {})')
+
+      expect(result.highestSeverity).toBe('low')
+    })
+
+    it('複数issueが同時に検出される場合、highestSeverityが最も重いseverityになる（low + medium → medium）', () => {
+      const result = scan(['.npmrc'], '+  it.skip("test", () => {})')
+
+      const severities = result.issues.map(i => i.severity)
+      expect(severities).toEqual(expect.arrayContaining(['low', 'medium']))
+      expect(result.highestSeverity).toBe('medium')
+    })
+
+    it('複数issueが同時に検出される場合、highestSeverityが最も重いseverityになる（medium + high → high）', () => {
+      const result = scan(['.env'], "+  ANTHROPIC_API_KEY = 'sk-test123'")
+
+      const severities = result.issues.map(i => i.severity)
+      expect(severities).toEqual(expect.arrayContaining(['medium', 'high']))
+      expect(result.highestSeverity).toBe('high')
+    })
+  })
 })
