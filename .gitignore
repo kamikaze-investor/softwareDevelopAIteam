@@ -60,3 +60,10 @@ data/approvals/
 # Meta Review ランタイム生成物（実行のたびに上書きされる）
 meta-review-result.json
 data/quota-exhausted.json
+
+# Worker ランタイム生成物（実行ログ・stdout/stderrダンプ）
+apps/worker/data/
+
+# SQLite DB本体・一時承認ディレクトリ（data/README.md等の追跡ファイルは対象外）
+data/*.db
+data/.tmp_approval/
