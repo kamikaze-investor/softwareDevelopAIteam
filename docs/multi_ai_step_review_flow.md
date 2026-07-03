@@ -1,0 +1,380 @@
+# Multi-AI Step Review Flow 仕様書 v1
+
+**作成日**: 2026-07-02
+**目的**: AIチームOSにおいて、Claude Sonnetによる実装を安全かつ低コストに進めるためのMulti-AIレビュー運用フローを標準化する。
+
+---
+
+## 1. 目的
+
+危険な変更を早期に検出しつつ、ChatGPTレビューのAPIコストを抑え、Claude Sonnetの実装速度を活かす。Gemini Flashで軽量レビューと重要度判定を行い、コミット直前に必要な情報だけをChatGPTへ渡す。高リスク作業はCEO承認必須、中リスク作業は事後報告で進める。ユーザーを毎回の伝令役から外す方向に進める。
+
+## 2. 基本思想
+
+役割分離:
+
+| 役割 | 責務 | 最終承認権限 |
+|---|---|---|
+| **Claude Sonnet** | 実装担当。Step単位で実装・テスト・報告・修正案を出す | なし（自分の変更を最終承認しない） |
+| **Mechanical Safety Checks** | 機械的な危険検出（diff・禁止ファイル・AV-001・typecheck・test・Risk Scan・secret漏洩等） | 判断ではなくfactsを出力 |
+| **Gemini Flash** | 各Step後の軽量レビュー。重要度をlow/medium/highで判定 | なし（一次判定のみ） |
+| **ChatGPT** | コミット直前の判断整理・次工程設計。全Stepの要約パケットを読み、コミット可否・CEO承認要否・次Stepを判断 | 高リスクはCEO承認を要求 |
+| **CEO** | 高リスク・方針変更・外部公開・認証・DB・自動停止・予算・リポジトリ外操作を最終承認 | 最終承認者 |
+
+重要な原則:
+- 実装者であるClaude Sonnetは、自分の変更を最終承認しない
+- Gemini Flashは安価な一次判定であり、最終判断者ではない
+- ChatGPTは最終判断レビュー担当だが、高リスク案件ではCEO承認を要求する
+- 機械チェックでNGが出た場合、AIレビューがOKでも自動進行しない
+
+## 2-1. レイヤー構造: Safety Gate/Risk Control と Review Orchestration/Decision Routing
+
+本仕様書を正しく位置づけるため、AIチームOSには性質の異なる2つの層が存在することを明確にする。
+
+| 層 | 目的 | 構成要素（既存実装） | 停止権限 |
+|---|---|---|---|
+| **Safety Gate / Risk Control**<br>（危険変更を検出・停止する安全チェック層） | 機械的・決定的に危険な変更を検出し、必要なら実行を止める | Mechanical Safety Checks（`safetyVerifier.ts`）、Mechanical Gate（`approvalLevelClassifier.ts`）、Risk Scan（`targetProjectRiskScan.ts`）、commitGate（`commitGate.ts`）、AV-001検出、secret scan、test/typecheck | あり（factsに基づき機械的にblock） |
+| **Review Orchestration / Decision Routing**<br>（実装報告を読み、重要度・次工程・ChatGPTレビュー要否・CEO承認要否を整理する判断レビュー層） | Safety Gate層が出したfactsと実装報告を読み、重要度判定・次工程設計・エスカレーション要否・CEO承認要否を「整理」する | Gemini Flash Stepレビュー（新規概念）、Final Review Packet（新規概念）、ChatGPT最終判断レビュー（新規概念）、次Stepプロンプト生成（新規概念） | なし（提案・整理のみ。最終停止権限はSafety Gate層とCEOに残る） |
+
+**本仕様書（Multi-AI Step Review Flow v1）が主に対象とするのは Review Orchestration / Decision Routing 層である。** Safety Gate / Risk Control層はレビューの「材料（facts）」を提供する既存コンポーネントであり、本仕様書によって変更・拡張されるものではない。
+
+**既存の`preReviewer.ts` / `postReviewer.ts`について:** これらはGemini経由のレビューアダプターだが、`blocked: true`を返すことで実行をブロックする権限を持つ、Safety Gate / Risk Control寄りの既存コンポーネントである。本仕様書が新たに定義する「Gemini Flash Stepレビュー」（停止権限を持たず、重要度・ルーティングを提案するのみ）とは役割が異なるため、**同一視しない**。両者は名称が似ているが別物として扱う。
+
+## 3. 全体フロー
+
+```
+1. Claude SonnetがStep単位で実装する
+2. Mechanical Safety Checksを実行する
+3. Gemini Flashが軽量レビュー・重要度判定を行う
+4. SonnetがGeminiの指摘を受けて修正する
+5. 次Stepへ進む
+6. 全Step完了後、SonnetがFinal Review Packetを作成する
+7. Gemini FlashがFinal Review Packetの抜け漏れを確認する
+8. ChatGPTがFinal Review Packetをレビューする
+9. 必要ならCEO承認
+10. コミット
+```
+
+## 4. Step単位の実装フロー
+
+1 Stepの理想範囲: 変更対象ファイルが少ない・目的が明確・テスト可能・失敗時に戻しやすい・AV-001や認証・DB・workerなど危険領域に触る場合は事前承認済み。
+
+```
+Step N:
+Claude Sonnetが実装
+↓
+typecheck / test / diff / Risk Scan / secret scan 等を実行
+↓
+Claudeが実装報告を出す
+↓
+Gemini Flashが軽量レビュー
+↓
+Gemini判定が low なら次Step候補
+Gemini判定が medium なら必要修正・事後報告候補
+Gemini判定が high ならChatGPTまたはCEOへエスカレーション候補
+↓
+Sonnetが必要修正
+↓
+次Stepへ
+```
+
+## 5. Mechanical Safety Checks
+
+機械的に事実を検出する層。判断ではなくfactsとして扱う。
+
+対象:
+```
+- git diff --name-only
+- git status --short
+- 禁止ファイルチェック
+- AV-001対象ファイル検出
+- typecheck結果
+- test結果
+- Risk Scan結果
+- secret漏洩チェック
+- package.json / lockfile変更検出
+- DBスキーマ変更検出
+- worker / jobRunner / commitGate / safetyVerification変更検出
+- リポジトリ外操作検出
+```
+
+出力例:
+```
+changedFiles:
+- apps/api/src/index.ts
+- apps/api/src/routes/health.ts
+
+av001Touched: true
+tests: PASS
+riskScan: medium
+secretLeakDetected: false
+```
+
+**重要:** Mechanical Safety ChecksでNGが出た場合、Gemini FlashやChatGPTがOKと言っても自動進行しない。
+
+## 6. Gemini Flash 軽量レビュー
+
+**役割定義（Review Orchestration / Decision Routing層）:** Gemini Flash Stepレビューは、Safety Gate層ではない。危険変更の最終判断者でも停止権限を持つ機構でもなく、**Stepごとの軽量な判断レビュー・重要度判定**を行うのが役割である。危険検出そのものはMechanical Safety Checks（Safety Gate層）が担い、Gemini Flashはその結果と実装報告を読んで「重要度」と「次に何をすべきか」を整理する。
+
+**既存の`preReviewer.ts`/`postReviewer.ts`との違い:** 既存実装はblocked:trueで実行を止める権限を持つSafety Gate寄りのコンポーネントであるのに対し、本仕様書のGemini Flash Stepレビューは停止権限を持たない一次判定・提案のみのコンポーネントである（詳細は2-1章）。
+
+目的: Claude実装報告の妥当性確認・機械チェック結果の読み取り・重要度の一次判定・修正が必要な点の指摘・ChatGPTへ上げるべきか判定・CEO承認が必要そうか判定。
+
+出力形式:
+```json
+{
+  "importance": "low | medium | high",
+  "routing": "proceed_candidate | fix_required | escalate_to_chatgpt | require_ceo | stop",
+  "summary": "短い要約",
+  "concerns": ["懸念点"],
+  "requiredFixes": ["必要修正"],
+  "escalationReason": "ChatGPT/CEOへ上げる理由。不要ならnull",
+  "confidence": "low | medium | high"
+}
+```
+
+**できる:** 重要度判定・修正提案・ChatGPTへのエスカレーション提案・CEO承認が必要そうな点の指摘
+**できない:** コミット承認・CEO承認の代替・high riskの解除・Mechanical Safety ChecksのNG上書き・Claudeへ自動で次実装を指示する
+
+## 7. Sonnetの役割と制約
+
+**できること:** Step単位の実装・テスト追加・typecheck/test実行・差分報告・Gemini指摘への修正・次Step案の提案・Final Review Packetの作成
+
+**できないこと:** 自分の変更を最終承認する・high riskを自己判断で解除する・CEO承認が必要な変更を承認済み扱いにする・GeminiやChatGPTレビューを省略する判断を単独で行う・AV-001/認証/DB/外部公開/自動停止などを承認なしで変更する
+
+Sonnetは「提案」はできるが、「承認」はできない。
+
+## 8. ChatGPT 最終判断レビュー
+
+**役割定義（Review Orchestration / Decision Routing層）:** ChatGPT最終判断レビューは「コードレビュー」ではない。役割は**コミット前の判断整理・次工程設計・CEO承認要否判定**である。コードの正しさそのものはSafety Gate層（typecheck/test/Mechanical Safety Checks）とGemini Flash Stepレビューが既に確認済みという前提のもと、ChatGPTはFinal Review Packet（低コスト圧縮資料）を読んで「このまま進めてよいか」「CEO承認が必要か」「次に何をすべきか」を判断する、意思決定支援の役割に限定される。
+
+原則としてコミット直前にまとめてレビューする。目的: 全Stepが完了扱いでよいか判断・コミットしてよいか判断・CEO承認が必要か判断・Geminiがmedium/highにした懸念が解消されたか確認・機械チェック結果に問題がないか確認・次にやるべき作業を整理・Claudeへの次プロンプトを必要に応じて作成。
+
+生ログ全文ではなくFinal Review Packetを基本とする（APIコスト抑制・判断対象の明確化・重要な懸念の埋没防止・レビュー品質の安定化）。
+
+## 9. Final Review Packet
+
+**役割定義（Review Orchestration / Decision Routing層）:** Final Review Packetは、ChatGPTに全ログ・全diffを渡さずに、低コストかつ的確に最終判断させるための**圧縮レビュー資料**である。ChatGPTへの入力量（=APIコスト）を抑えつつ、判断に必要な情報（重要な懸念・未解決事項・変更範囲）を欠落させないことが目的。
+
+全Step完了後、SonnetはChatGPTに渡すためのFinal Review Packetを作成する。Sonnetが自分に都合よく要約するリスクがあるため、Gemini Flashが抜け漏れ確認を行う。
+
+標準形式:
+
+```md
+# Final Review Packet
+
+## 1. Task Goal
+## 2. Scope（やったこと/やっていないこと）
+## 3. Step Summary（Step / 実装内容 / 変更ファイル / Gemini判定 / 対応状況）
+## 4. Changed Files
+## 5. Mechanical Safety Results
+## 6. Gemini Escalation Items（medium/highのみ）
+## 7. How Escalation Items Were Resolved
+## 8. Remaining Concerns
+## 9. Commit Candidate
+## 10. CEO Approval Candidate
+## 11. Proposed Commit Message
+## 12. Next Task Candidate
+```
+
+## 10. ChatGPTへ生ログを渡す条件
+
+通常はFinal Review Packetのみ。以下の場合は該当ログ抜粋を添付:
+```
+- GeminiとSonnetの判断が食い違った
+- Geminiがhigh判定を出した
+- AV-001に触った
+- 認証・外部公開endpointに触った
+- DBスキーマに触った
+- worker/jobRunner/commitGate/safetyVerificationに触った
+- テスト失敗から復旧した
+- Claudeが禁止事項に触れかけた
+- 仕様解釈が曖昧だった
+- CEO承認が必要な可能性がある
+```
+
+危険度が高い場合: Final Review Packet + 関連ログ抜粋 + CEO承認
+
+## 11. リスク分類
+
+| Risk | 例 | 扱い |
+|---|---|---|
+| **Low** | ドキュメント更新・テスト追加・小さな型修正・UI文言修正・既存仕様内の軽微な修正・禁止ファイルなし・AV-001なし・test/typecheck PASS・Risk Scan low or none | Gemini Flashレビューのみで次Step候補。コミット直前にChatGPTまとめレビュー。CEO承認不要 |
+| **Medium** | 複数ファイル変更・軽微なAPI追加・既存ロジック変更・テスト修正を伴う変更・Risk Scan medium・影響範囲が限定的だが判断が必要 | Gemini Flashでmedium判定。必要ならSonnet修正。コミット前にChatGPTレビュー。CEOへ事後報告でも可 |
+| **High** | AV-001変更・認証変更・DBスキーマ変更・外部公開endpoint・worker/jobRunner変更・commitGate変更・safetyVerification変更・自動停止条件・CEO通知条件・package.json/lockfile変更・secretや.envに関係する変更・リポジトリ外操作 | Geminiがlowと言ってもChatGPTへエスカレーション。原則CEO承認必須。コミット直前だけでなく実装前レビューも必要 |
+
+## 12. エスカレーションルール
+
+Gemini Flashの判定に関係なくChatGPTへエスカレーション:
+```
+- Mechanical Safety Checksで重要領域に触れた
+- AV-001対象ファイルが変更された
+- 認証・外部公開・DB・worker・commitGate・safetyVerificationが変更された
+- テスト失敗が発生した
+- Risk Scan high
+- secret scanが警告を出した
+- Geminiがmedium/high判定を出した
+- SonnetとGeminiの判断が食い違った
+```
+
+CEO承認必須:
+```
+- high risk変更
+- 方針変更
+- 外部公開endpoint
+- 認証変更
+- DBスキーマ変更
+- 自動停止条件
+- CEO通知条件
+- 予算・課金・外部API追加
+- リポジトリ外操作
+```
+
+## 13. コスト最適化方針
+
+```
+各Step:      Gemini Flashで軽量レビュー
+コミット直前: ChatGPTでFinal Review Packetをレビュー
+高リスク:    必要に応じて実装前からChatGPT/Opusレビュー
+```
+
+## 14. 推奨運用
+
+```
+Claude Sonnet: Step実装
+Mechanical Safety Checks: Stepごとに実行
+Gemini Flash: Stepごとに軽量レビュー
+Sonnet: Gemini指摘を修正
+Final: SonnetがFinal Review Packet作成
+Gemini Flash: Packetの抜け漏れ確認
+ChatGPT: コミット前レビュー
+CEO: 必要な場合のみ承認
+Commit: 承認後に実行
+```
+
+## 15. 実装初期段階の制約
+
+```
+- Gemini Flashは提案のみ
+- ChatGPTは判断整理のみ
+- Claude Sonnetは実装と修正のみ
+- 自動コミットはしない
+- high riskは必ずCEO承認
+- medium riskは事後報告候補
+- low riskでも機械チェックNGなら止める
+```
+
+## 16. 将来拡張
+
+```
+- Gemini Flashレビューの自動API化
+- ChatGPTレビューのAPI化
+- Final Review Packet自動生成
+- GeminiによるPacket整合性チェック
+- low riskの自動継続
+- medium riskの事後報告自動化
+- high riskのCEO承認UI
+- スマホUIでの承認フロー
+- モデルルーティング
+- APIコスト上限管理
+- レビュー履歴DB
+- 過去判断の検索
+```
+
+## 17. 重要な禁止事項
+
+```
+- Claude Sonnetが自分の実装を最終承認すること
+- Gemini Flashがhigh riskを解除すること
+- ChatGPT判断レビューがMechanical Safety ChecksのNGを上書きすること
+- CEO承認必須領域をAIだけで通すこと
+- Final Review PacketからGeminiのmedium/high懸念を省略すること
+- 機械チェック結果を要約だけにして原情報を失うこと
+- コミット直前レビューなしでコミットすること
+```
+
+## 18. 最終まとめ
+
+```
+Sonnetが細かくStep実装
+↓
+Stepごとに機械チェック
+↓
+StepごとにGemini Flashが軽量レビュー・重要度判定
+↓
+Sonnetが修正して次Stepへ
+↓
+全Step完了後にFinal Review Packet作成
+↓
+GeminiがPacket抜け漏れ確認
+↓
+ChatGPTがコミット前レビュー
+↓
+必要ならCEO承認
+↓
+コミット
+```
+
+---
+
+## 19. 既存実装との関係（AIチームOSへの組み込み時の前提）
+
+このMulti-AI Step Review Flowは、AIチームOSに既に部分実装されている既存コンポーネントを土台としつつ、**Review Orchestration / Decision Routing層を新規に整備するもの**である。2-1章で定義した層分離に沿って、既存実装との関係を2つの表に分けて整理する。
+
+### 19-1. Safety Gate / Risk Control層（既存の安全チェック機構。本仕様書の対象外）
+
+危険変更を検出・停止する機構であり、本仕様書によって変更・拡張されるものではない。本仕様書はこれらが出力するfactsを「読む側」である。
+
+| 仕様書上の位置づけ | 対応する既存実装 | 状態 |
+|---|---|---|
+| Mechanical Safety Checks | `apps/worker/src/approvalLevel/safetyVerifier.ts`（12項目チェック）、`packages/shared/src/approvalLevelClassifier.ts`（Mechanical Gate） | 実装済み（Step1-2, Step3。コミット b159d73, 3b3d1fb） |
+| Risk Scan | `apps/worker/src/approvalLevel/targetProjectRiskScan.ts`（severity付きリスク検出） | 実装済み・観察モードでjobRunner接続済み（コミット d16a709〜afab85c）。現在ログ観察期間中 |
+| commitGate（成果物確認） | `apps/worker/src/approvalLevel/commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続（Step5完了、コミット 351840f） |
+| 既存Gemini Reviewer（実行ブロック権限あり） | `apps/worker/src/approvalLevel/preReviewer.ts` / `postReviewer.ts` / `reviewerAdapter.ts` | 実装済み・未接続（Step4完了、コミット a7d3f81）。**2-1章の通り、本仕様書のGemini Flash Stepレビューとは別物として扱う** |
+| control repo vs target_project スコープ分離 | Step6-B0（コミット334732a）でjobRunner経由のJobは常にtarget_project前提であることを確認済み | 実装済み（前提の明文化のみ、コード変更なし） |
+
+### 19-2. Review Orchestration / Decision Routing層（本仕様書が中心的に扱う対象）
+
+実装報告とSafety Gate層のfactsを読み、重要度・次工程・エスカレーション要否・CEO承認要否を整理する判断レビュー層。ほとんどが新規概念であり、既存実装との単純な1:1対応はない。
+
+| 仕様書の概念 | 役割 | 対応する既存実装 | 状態 |
+|---|---|---|---|
+| Gemini Flash Stepレビュー | Stepごとの軽量判断レビュー・重要度判定（停止権限なし） | 既存の`preReviewer.ts`/`postReviewer.ts`とは別物（2-1章参照）。新規に整理・実装が必要 | 未実装（新規概念） |
+| Final Review Packet | ChatGPTに全ログを渡さず低コストに最終判断させるための圧縮レビュー資料 | 既存の`ApprovalLevelResult` / `PreReviewResult` / `PostReviewResult` / `SafetyVerificationResult` / `TargetProjectRiskScanResult`を集約する生成関数が必要 | 未実装（新規概念） |
+| ChatGPT最終判断レビュー | コミット前の判断整理・次工程設計・CEO承認要否判定（コードレビューではない） | `reviewerAdapter.ts`内の`shouldEscalateToChatGpt()`（プレースホルダー、常にfalse） | 未実装（将来のCost-aware Review Router用の拡張ポイントのみ存在） |
+| 次Stepプロンプト生成 | ChatGPTの判断整理結果をもとに、Claude Sonnetへの次Stepプロンプトを生成する | — | 未実装（新規概念） |
+| リスク分類（Low/Medium/High） | Review Orchestration層内での重要度判定の共通基準 | `packages/shared/src/types/approvalLevel.ts`の`ReviewPolicy`（mechanical_only/light_ai_post_review/full_pre_post_review/ceo_required）は名称・粒度が異なるため直接転用しない | 概念のみ。`targetProjectRiskScanResult.highestSeverity`（high/medium/low、コミット1040090）ベースで再設計するのが自然 |
+
+**重要な整理:** 既存の`ReviewPolicy`はcontrol repo基準の分類器（`determineApprovalLevel()`）の出力であり、Step6-B0の結論により「jobRunner経由のJobは基本的にtarget_project」であることが判明している。一方、本仕様書のLow/Medium/High分類は「変更内容の性質」に基づく分類であり、`targetProjectRiskScanResult.highestSeverity`の方が親和性が高い。**したがって、本仕様書のリスク分類は`ReviewPolicy`ではなく`targetProjectRiskScanResult.highestSeverity`をベースに再設計するのが自然。**
+
+## 20. Review Transport Mode（レビュー伝送モード）
+
+外部AI（Gemini Flash / ChatGPT）へレビュー用ペイロードをどう届けるかを定義する。2モード構成（当初のmanual/assisted/apiの3モード案から、manualとassistedを統合し2モードに簡素化した最終仕様）。
+
+| モード | 内容 |
+|---|---|
+| **handoff** | 人間がClaude / Gemini / ChatGPT間の受け渡しを行う。ChatGPT判断レビューは手動で利用する。AIチームOSは必要に応じてFinal Review Packet、貼り付け用プロンプト、次Stepプロンプトを生成する。APIコストを最小化できるため、初期推奨モードとする。 |
+| **api** | AIチームOSがGemini / ChatGPT APIへ自動送信する。低リスク・中リスクの効率化に使う。高リスクはCEO承認必須。 |
+
+**初期推奨:** `handoff`
+**将来拡張:** `api`
+
+## 21. Quota Policy（クォータポリシー）
+
+無料枠のAPI利用上限に達した場合の挙動を定義する。
+
+```
+quotaPolicy:
+- wait
+- handoff_fallback
+- paid_api_fallback
+```
+
+| ポリシー | 内容 |
+|---|---|
+| **wait** | 無料枠が回復するまで待つ。 |
+| **handoff_fallback** | 無料枠が切れたら、人間の手渡し運用（Review Transport Mode: handoff）に切り替える。 |
+| **paid_api_fallback** | 有料APIで続行する。明示承認時のみ。 |
+
+**無料枠切れ時の初期推奨:** `handoff_fallback` または `wait`
+**paid_api_fallbackは原則OFF**。高リスクレビューや緊急時のみ明示承認でON。

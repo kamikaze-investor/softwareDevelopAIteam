@@ -95,6 +95,55 @@
 
 ---
 
+## Review Orchestration / Decision Routing（判断レビュー層・仕様策定済み・段階実装予定）
+
+**位置づけ:** Approval Gate（1-G）・AI Approval Level v2・Target Project Risk Scan v1などの
+**Safety Gate / Risk Control層**（危険変更を検出・停止する安全チェック層）とは別の、独立した層。
+本セクションが扱うのは、実装報告を読み、重要度・次工程・ChatGPTレビュー要否・CEO承認要否を
+整理する**判断レビュー層**である。Safety Gate層のコンポーネント自体はこのセクションの対象外。
+
+**仕様書:** [docs/multi_ai_step_review_flow.md](../docs/multi_ai_step_review_flow.md)
+
+**目的:** Claude Sonnetの実装報告とSafety Gate層のfactsを読み、Gemini Flashが軽量な
+Step単位の判断レビュー・重要度判定を行い、コミット前にFinal Review Packet（圧縮レビュー資料）を
+ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理する、という判断レビューフローを標準化する。
+
+**Safety Gate / Risk Control層（既存・本セクションの対象外）:**
+
+| 役割 | 対応する既存実装 | 状態 |
+|---|---|---|
+| Mechanical Safety Checks | `safetyVerifier.ts`（12項目チェック）・`approvalLevelClassifier.ts`（Mechanical Gate） | 実装済み (b159d73, 3b3d1fb) |
+| Risk Scan | `targetProjectRiskScan.ts`（severity付き） | 実装済み・観察モードで接続済み (d16a709〜afab85c)。ログ観察期間中 |
+| commitGate | `commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続 (351840f) |
+| 既存Gemini Reviewer（実行ブロック権限あり） | `preReviewer.ts` / `postReviewer.ts` / `reviewerAdapter.ts` | 実装済み・未接続 (a7d3f81)。**本セクションのGemini Flash Stepレビューとは別物** |
+
+**Review Orchestration / Decision Routing層（新規概念が中心）:**
+
+| 概念 | 役割 | 対応する既存実装 | 状態 |
+|---|---|---|---|
+| Gemini Flash Stepレビュー | Stepごとの軽量判断レビュー・重要度判定（停止権限なし） | 既存preReviewer/postReviewerとは別物として新規整理 | 未実装（新規概念） |
+| Final Review Packet | ChatGPTに全ログを渡さず低コストに最終判断させる圧縮レビュー資料 | `ApprovalLevelResult`等の既存結果型を集約する生成関数が必要 | 未実装（新規概念） |
+| ChatGPT最終判断レビュー | コミット前の判断整理・次工程設計・CEO承認要否判定（コードレビューではない） | `shouldEscalateToChatGpt()`（プレースホルダー） | 未実装（拡張ポイントのみ） |
+| Review Transport Mode | 外部AIへの送信方法（handoff/api、初期推奨: handoff） | — | 仕様策定済み（仕様書20章） |
+| Quota Policy | 無料枠切れ時の挙動（wait/handoff_fallback/paid_api_fallback） | — | 仕様策定済み（仕様書21章）。初期推奨: handoff_fallbackまたはwait、paid_api_fallbackは原則OFF |
+| Low/Medium/High分類 | Review Orchestration層内の共通重要度基準 | `targetProjectRiskScanResult.highestSeverity`ベースで再設計予定 | 概念近似。再設計が必要（詳細は仕様書19-2章） |
+
+**段階実装案（このセクションの下位ステップとして今後着手）:**
+- [ ] Step R1: リスク分類を`targetProjectRiskScanResult.highestSeverity`ベースで再設計
+- [ ] Step R2: Final Review Packet の型・生成関数を新規設計（既存の`ApprovalLevelResult` /
+      `PreReviewResult` / `PostReviewResult` / `SafetyVerificationResult` /
+      `TargetProjectRiskScanResult`を集約）
+- [ ] Step R3: Gemini Flash Stepレビュー（新規・停止権限なし）の設計・実装、Review Transport Mode（初期: handoff）選択
+- [ ] Step R4: commitGateのjobRunner接続（Safety Gate層・既存Step5は実装済みだが未接続）
+- [ ] Step R5: ChatGPT最終判断レビューの実装（Review Transport Mode/Quota Policyに従う）
+- [ ] Step R6: CEO承認UI・事後報告フローの設計
+
+**ステータス:** 仕様策定完了（層分離・Review Transport Mode・Quota Policyを含む）。
+Approval Gate（1-G）・AI Approval Level v2・Target Project Risk Scan v1をSafety Gate層として
+土台にしつつ、独立したReview Orchestration / Decision Routing層として段階的に実装していく。
+
+---
+
 ## Phase 2: MVP実装
 
 目的: Project Creation Flow を動かす
