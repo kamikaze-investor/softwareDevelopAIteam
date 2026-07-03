@@ -23,6 +23,7 @@ import { watchdogEventRoutes } from './routes/watchdogEvents'
 import { dashboardRoutes } from './routes/dashboard'
 import { approvalGateRoutes } from './routes/approvalGate'
 import { knowledgeGraphRoutes } from './routes/knowledgeGraph'
+import { healthRoutes } from './routes/health'
 import { apiTokenAuth } from './auth/apiToken'
 
 const app = Fastify({ logger: true })
@@ -31,8 +32,13 @@ app.register(cors, {
   origin: true,
 })
 
+function isHealthCheckUrl(url: string): boolean {
+  const pathname = url.split('?')[0]
+  return pathname === '/health' || pathname === '/api/health'
+}
+
 app.addHook('preHandler', async (req, reply): Promise<void> => {
-  if (req.url === '/health') return
+  if (isHealthCheckUrl(req.url)) return
   await apiTokenAuth(req, reply)
 })
 
@@ -59,6 +65,7 @@ app.register(watchdogEventRoutes, { prefix: '/api' })
 app.register(dashboardRoutes, { prefix: '/api' })
 app.register(approvalGateRoutes, { prefix: '/api' })
 app.register(knowledgeGraphRoutes, { prefix: '/api' })
+app.register(healthRoutes, { prefix: '/api' })
 
 const PORT = Number(process.env.PORT) || 3000
 
