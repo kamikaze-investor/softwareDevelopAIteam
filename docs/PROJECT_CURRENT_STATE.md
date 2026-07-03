@@ -1,7 +1,7 @@
 # Project Current State Map
 
 **作成日**: 2026-06-19
-**最終更新**: 2026-07-01
+**最終更新**: 2026-07-02
 **作成者**: Claude Code (CTO)
 **目的**: リポジトリの現状を一枚で把握するためのスナップショット
 
@@ -142,6 +142,30 @@ softwareDevelopAIteam/            ← Control Repository（AI編集禁止）
 - 失敗時（`blocked: true` / `exitCode !== 0` / `adapter.run()` throw）: `status: failed` で早期リターン
 - 3フィールドが揃わない既存 Job への影響ゼロ
 - `contextFiles` は初期実装では `[]` 固定（Context Manager 連携は別 task）
+
+### 代表Health Endpoint（VPS App Runtime Standard v1準拠）✅
+
+| 機能 | ファイル | コミット |
+|---|---|---|
+| Health Endpoint ルートロジック（in-memory runtime state） | `apps/api/src/routes/health.ts` | 9a425f2 |
+| Health Endpoint テスト | `apps/api/src/routes/health.test.ts` | 9a425f2 |
+| `/api/health` 登録・認証除外ロジック拡張 | `apps/api/src/index.ts` | 9a425f2 |
+| 認証除外・health統合テスト | `apps/api/src/index.test.ts` | 9a425f2 |
+
+**実装仕様:**
+- 代表Health Endpointとして `/api/health` を追加（VPS App Runtime Standard v1準拠、仕様書: `docs/vps_app_runtime_standard.md`）
+- 既存 `/health` は旧simple livenessとして維持（後方互換）
+- `/health` と `/api/health` は認証除外（`isHealthCheckUrl()` ヘルパーでクエリ文字列付きURL `/health?x=1` `/api/health?x=1` にも対応）
+- レスポンスは秘密情報を返さない（`process.env.npm_package_version` / `NODE_ENV` のみ参照）
+- `status` は `'running'` 固定、`lastSuccessAt` / `lastErrorAt` は `null` 固定（worker success/error連携は未実装・別task）
+- VPS Doctor Lite側の読み取り実装は未着手（別プロジェクト）
+
+**未着手の関連タスク:**
+- VPS Doctor Lite側から `/api/health` を読む実装（別プロジェクト）
+- worker success/error連携（`lastSuccessAt`/`lastErrorAt`の実データ反映）
+- app manifest
+- IPアクセス制限・認証機構の追加検討
+- target-project向けリスクスキャン（Target Project Risk Scan v1、コミット d16a709〜afab85c）の観察期間継続、target-project用preflight判定の別途設計
 
 ### Phase 1-D 一部: ジョブ管理基盤 ✅
 
@@ -321,7 +345,11 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 ## 7. テストカバレッジ
 
-### 実行結果（2026-07-01）: **全 566 件パス** ✅
+### 実行結果（2026-07-02）: **全 798 件パス** ✅
+
+（2026-07-01時点の566件から、AI Approval Level v2（Step1〜6-B0）・Target Project Risk Scan v1・代表Health Endpoint追加により798件に増加。内訳の詳細は下記は2026-07-01時点のスナップショットのまま）
+
+### 実行結果（2026-07-01時点スナップショット）: 全 566 件パス
 
 **API（apps/api）: 281 件・22 ファイル**
 
@@ -371,7 +399,8 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 | # | リスク | 詳細 |
 |---|---|---|
-| R-007 | **未追跡スクリプトの扱い** | `apps/worker/scripts/alignmentCheck.ts` / `postTestHook.ps1` が未追跡。意図的な未追跡（AV-001 対象）のため現状維持。 |
+| R-007 | **未追跡スクリプトの扱い** | `apps/worker/scripts/alignmentCheck.ts` / `postTestHook.ps1` が未追跡。意図的な未追跡（AV-001 対象）のため現状維持。代表Health Endpoint追加コミット（9a425f2）でもこの2ファイルおよび `apps/worker/data/` は含めていない。既存の意図的未追跡として引き続き現状維持。 |
+| R-008 | **代表Health Endpointの`/api/health`無認証公開** | `/api/health`・`/health`は認証除外。レスポンスに秘密情報を含まないことをテストで担保済み（`health.test.ts`）だが、外部公開範囲を広げた判断であることを継続的に把握しておく。IPアクセス制限は未実装（roadmap未決定事項）。 |
 
 ---
 
@@ -391,6 +420,10 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 | **Mobile Dashboard 実装（task-012〜013）** | Expo 画面が骨格のみ。スマホからの状況確認に直結 | Codex or Claude Code |
 | **apps/api テスト補完** | 一部ルートの未テスト領域を埋める | Codex |
 | **CLI 出力パーサー + JSON リトライ（task-023）** | AI CLI が JSON 出力を期待する場合のリトライ機構 | Codex |
+| **VPS Doctor Lite側から `/api/health` を読む** | 代表Health Endpoint追加（9a425f2）を実際に外部監視に接続する | 別プロジェクト |
+| **worker success/error連携** | `/api/health` の `lastSuccessAt`/`lastErrorAt` を実データで反映 | Claude Code |
+| **app manifest** | VPS App Runtime Standard v1の未決定事項 | 別途設計 |
+| **target-project用リスクスキャン preflight判定** | Target Project Risk Scan v1（観察モード、コミットd16a709〜afab85c）の次段階設計 | Claude Code |
 
 ---
 
