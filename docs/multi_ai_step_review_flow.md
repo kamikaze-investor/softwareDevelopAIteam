@@ -15,17 +15,34 @@
 
 | 役割 | 責務 | 最終承認権限 |
 |---|---|---|
-| **Claude Sonnet** | 実装担当。Step単位で実装・テスト・報告・修正案を出す | なし（自分の変更を最終承認しない） |
+| **Codex** | 通常実装担当。既存実装に沿った小さな変更・軽微修正・テスト修正・型エラー修正・ドキュメント更新。目的外の改善や新機能追加は行わない。DB/認証/権限/外部サービス/課金/本番/package変更/破壊的変更/設計判断が必要な変更を見つけたら無理に進めずClaudeまたはレビューへ上げる | なし |
+| **Claude Sonnet** | 設計・進行計画・危険箇所担当。Step単位の実装・テスト・報告・修正案に加え、Codexで処理できる通常実装か自身が扱うべき危険箇所かの分類、Codexへの作業指示作成も担う | なし（自分の変更を最終承認しない） |
 | **Mechanical Safety Checks** | 機械的な危険検出（diff・禁止ファイル・AV-001・typecheck・test・Risk Scan・secret漏洩等） | 判断ではなくfactsを出力 |
-| **Gemini Flash** | 各Step後の軽量レビュー。重要度をlow/medium/highで判定 | なし（一次判定のみ） |
-| **ChatGPT** | コミット直前の判断整理・次工程設計。全Stepの要約パケットを読み、コミット可否・CEO承認要否・次Stepを判断 | 高リスクはCEO承認を要求 |
-| **CEO** | 高リスク・方針変更・外部公開・認証・DB・自動停止・予算・リポジトリ外操作を最終承認 | 最終承認者 |
+| **Gemini（低コストなレビュー・監査レイヤー）** | 単一の「判断担当」ではなく、用途に応じて複数の監査機能を担う低コストレイヤー: Risk Review・Alignment Review・Meta Review・preReview・postReview・Report Translation（詳細は2-2章） | なし（安く早く危険なズレを検出するのみ。warning/uncertain/blockedはClaude/ChatGPT/人間へエスカレーション） |
+| **ChatGPT** | 重要判断・コミット前判断・人間向け整理担当。コミット直前の判断整理・次工程設計。全Stepの要約パケットを読み、コミット可否・CEO承認要否・次Stepを判断 | 高リスクはCEO承認を要求 |
+| **Human / CEO** | Goal/Design Philosophy変更・外部サービス・課金・本番影響・認証権限・破壊的変更・AIレビュー同士の判断が割れた場合の最終判断 | 最終承認者 |
 
 重要な原則:
+- Codexは通常実装のみを担当し、危険箇所・設計判断は自己判断で進めずClaudeへ上げる
 - 実装者であるClaude Sonnetは、自分の変更を最終承認しない
-- Gemini Flashは安価な一次判定であり、最終判断者ではない
+- Geminiは安価な監査レイヤーであり、最終判断者ではない（「判断レビュー担当」ではなく「低コストなレビュー・監査レイヤー」として扱う）
 - ChatGPTは最終判断レビュー担当だが、高リスク案件ではCEO承認を要求する
 - 機械チェックでNGが出た場合、AIレビューがOKでも自動進行しない
+
+## 2-2. Gemini（低コストなレビュー・監査レイヤー）と既存実装の対応
+
+Geminiは以下の用途で使われるが、いずれも「安く早く危険なズレを検出する」という同一の役割の応用であり、別々の新規レビュー機構ではない。既存実装との対応は以下の通り（新規追加ではなく既存コンポーネントの呼称整理）。
+
+| 用途 | 対応する既存実装 | 層 |
+|---|---|---|
+| Meta Review | `docs/meta_reviewer/prompt.md` + `apps/worker/src/metaReviewer/runner.ts`（憲法裁判所。Cage弱体化・権限境界変更を検出） | Safety Gate / Risk Control |
+| Risk Review | `apps/worker/src/approvalLevel/targetProjectRiskScan.ts`（severity付きリスク検出） | Safety Gate / Risk Control |
+| Alignment Review | `apps/worker/scripts/alignmentCheck.ts`（設計思想との整合性確認。未コミット・CEO判断待ち） | Safety Gate / Risk Control |
+| preReview / postReview | `apps/worker/src/approvalLevel/preReviewer.ts` / `postReviewer.ts`（blocked:trueを返す権限を持つ既存Gemini Reviewer） | Safety Gate / Risk Control |
+| Gemini Flash Stepレビュー | 6章参照（停止権限なしの重要度判定） | Review Orchestration / Decision Routing |
+| Report Translation | 未実装（新規・低リスク）。技術ログ・変更内容・テスト結果・安全チェックリストを非エンジニア向けに翻訳する用途に限定し、コミット可否等の最終判断には使わない | Review Orchestration / Decision Routing |
+
+**重要:** Meta Review・Risk Review・Alignment Reviewは全てSafety Gate / Risk Control層に属し、本仕様書が新設する層ではない。本仕様書が新設するのはGemini Flash StepレビューとReport Translationのみであり、いずれも停止権限を持たない。
 
 ## 2-1. レイヤー構造: Safety Gate/Risk Control と Review Orchestration/Decision Routing
 
@@ -202,6 +219,39 @@ Sonnetは「提案」はできるが、「承認」はできない。
 | **Low** | ドキュメント更新・テスト追加・小さな型修正・UI文言修正・既存仕様内の軽微な修正・禁止ファイルなし・AV-001なし・test/typecheck PASS・Risk Scan low or none | Gemini Flashレビューのみで次Step候補。コミット直前にChatGPTまとめレビュー。CEO承認不要 |
 | **Medium** | 複数ファイル変更・軽微なAPI追加・既存ロジック変更・テスト修正を伴う変更・Risk Scan medium・影響範囲が限定的だが判断が必要 | Gemini Flashでmedium判定。必要ならSonnet修正。コミット前にChatGPTレビュー。CEOへ事後報告でも可 |
 | **High** | AV-001変更・認証変更・DBスキーマ変更・外部公開endpoint・worker/jobRunner変更・commitGate変更・safetyVerification変更・自動停止条件・CEO通知条件・package.json/lockfile変更・secretや.envに関係する変更・リポジトリ外操作 | Geminiがlowと言ってもChatGPTへエスカレーション。原則CEO承認必須。コミット直前だけでなく実装前レビューも必要 |
+
+## 10-1. 人間向け報告フォーマット（Report Translation）
+
+人間への報告は、非エンジニアが判断できる形にGemini Flash（Report Translation）で翻訳してよい。ただし、Gemini Flashは翻訳係であり最終判断者ではない。コミット可否・設計判断・Goal/Design Philosophyに関わる判断・DB/認証/権限/外部サービス/本番影響の判断・warning/uncertain/blockedが出たケースは、Gemini Flash単独で完結させず、ChatGPTまたはHuman/CEOの判断に委ねる。
+
+報告フォーマット（技術用語を並べず、以下を説明する）:
+```
+1. 今回やったこと
+2. なぜ必要だったか
+3. どこまで変えたか
+4. 変えていない重要部分
+5. 安全面
+6. 検証結果
+7. Geminiレビュー結果
+8. ChatGPTレビューが必要か
+9. 人間判断が必要か
+10. コミットしてよいか
+```
+
+報告の最後には必ず結論を書く（例: 「このままコミットして問題ありません」「修正後に再レビューが必要です」「人間判断が必要です」「危険なため停止すべきです」）。
+
+## 11-1. Review Level（実行主体ルーティング）
+
+11章のリスク分類（Low/Medium/High）に、実行主体（Codex/Claude）と関与するAIレビューの組み合わせを対応付けたものが以下のReview Levelである。**11章の分類を置き換える新しい機構ではなく、実行主体をどう振り分けるかの運用ルール**として位置づける。
+
+| Level | 対応するリスク分類 | 実行主体 | 関与するレビュー | 人間確認 |
+|---|---|---|---|---|
+| **Level 0**（軽微） | Lowのうちtypo/コメント/README軽微修正など | Codex実装のみ | Gemini不要（Mechanical Safety Checksのみ） | 不要 |
+| **Level 1**（通常実装） | Low | Codex実装 | Gemini postReview（既存`postReviewer.ts`）+ 必要ならGemini Flashで人間向け報告（Report Translation） | 原則不要 |
+| **Level 2**（中リスク） | Medium | Claudeが計画、CodexまたはClaudeが実装 | Gemini preReview/postReview（既存`preReviewer.ts`/`postReviewer.ts`）。warning/uncertainならChatGPTレビュー | 原則不要 |
+| **Level 3**（高リスク） | High | Claudeが設計 | Gemini Risk Review（`targetProjectRiskScan.ts`）+ Alignment Review（`alignmentCheck.ts`）+ ChatGPT判断レビュー | Human/CEO確認必須（承認後に実装） |
+
+**Codex/Claudeの振り分け基準:** Codexは既存実装に沿った小さな変更・軽微修正・テスト修正・型エラー修正・ドキュメント更新を担当する（Level 0-1が基本、Level 2でも定型的な修正はCodexが担当してよい）。DB・認証・権限・外部サービス・課金・本番環境・package変更・破壊的変更・設計判断が必要な変更（Level 2の一部〜Level 3）はClaudeが担当し、Codexは自己判断で進めずClaudeへ上げる。
 
 ## 12. エスカレーションルール
 

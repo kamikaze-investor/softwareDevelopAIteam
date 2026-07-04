@@ -142,6 +142,13 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 Approval Gate（1-G）・AI Approval Level v2・Target Project Risk Scan v1をSafety Gate層として
 土台にしつつ、独立したReview Orchestration / Decision Routing層として段階的に実装していく。
 
+**役割分担・Review Level（Codex/Claude/Gemini/ChatGPT/Human）:** 仕様書2章・2-2章・11-1章に
+Codex（通常実装）/Claude（設計・危険箇所）/Gemini（低コストなレビュー・監査レイヤー: Risk Review・
+Alignment Review・Meta Review・preReview・postReview・Report Translation）/ChatGPT（重要判断・
+コミット前判断）/Human・CEO（最終判断）の役割分担とReview Level 0-3（実行主体ルーティング）を
+追記済み。既存のMeta Reviewer・Risk Scan・Alignment Check・preReviewer/postReviewerを流用し、
+新規レビュー機構は追加していない。
+
 ---
 
 ## Phase 2: MVP実装
