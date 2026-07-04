@@ -232,11 +232,17 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 
 ## 11. リスク分類
 
-| Risk | 例 | 扱い |
+**このリスク分類は「危険度」を表す軸であり、実行主体やレビュー経路を決める軸（11-1章のReview Level）とは別物である。11章＝何がどれだけ危ないか、11-1章＝それをどう振り分けて実行するか、という役割分担で読むこと。**
+
+**2つの適用範囲（重複ではなく対象範囲の違い）:**
+- **target_project（jobRunner経由のJob）向けの判定**: `apps/worker/src/approvalLevel/targetProjectRiskScan.ts`が実際に検出する`RiskScanSeverity`（`'high' | 'medium' | 'low'`）が、この章のHigh/Medium/Lowにそのまま対応する。ここで新しい判定基準を作らない。AV-001・jobRunner/commitGate/safetyVerification自体の変更は、Step6-B0の結論（jobRunner経由のJobは常にtarget_project scope）によりtarget_projectのdiffには含まれ得ないため、target_project向けの判定には含まれない。
+- **control repo（Claude Codeが直接このリポジトリを編集するセッション。今回のようなdocs/CLAUDE.md/AGENTS.md編集や、AV-001対象ファイルの編集を含む）向けの判定**: コード化された分類器は存在せず、本章の例示（AV-001変更・認証変更・DBスキーマ変更・自動停止条件・CEO通知条件・package.json/lockfile変更等）がそのままHighの目安になる。ここは「docsか実装か」ではなく影響範囲で判断する原則（[[feedback_meta_review_warnings]]相当の運用ルール）に従う。
+
+| Risk | 例（target_project: Risk Scanの検出／control repo: 影響範囲による例示） | 扱い |
 |---|---|---|
 | **Low** | ドキュメント更新・テスト追加・小さな型修正・UI文言修正・既存仕様内の軽微な修正・禁止ファイルなし・AV-001なし・test/typecheck PASS・Risk Scan low or none | Gemini Flashレビューのみで次Step候補。コミット直前にChatGPTまとめレビュー。CEO承認不要 |
-| **Medium** | 複数ファイル変更・軽微なAPI追加・既存ロジック変更・テスト修正を伴う変更・Risk Scan medium・影響範囲が限定的だが判断が必要 | Gemini Flashでmedium判定。必要ならSonnet修正。コミット前にChatGPTレビュー。CEOへ事後報告でも可 |
-| **High** | AV-001変更・認証変更・DBスキーマ変更・外部公開endpoint・worker/jobRunner変更・commitGate変更・safetyVerification変更・自動停止条件・CEO通知条件・package.json/lockfile変更・secretや.envに関係する変更・リポジトリ外操作 | Geminiがlowと言ってもChatGPTへエスカレーション。原則CEO承認必須。コミット直前だけでなく実装前レビューも必要 |
+| **Medium** | 複数ファイル変更・軽微なAPI追加・既存ロジック変更・テスト修正を伴う変更・Risk Scan medium・影響範囲が限定的だが判断が必要（AI役割分担・レビュー方針に関わるdocs変更もここに含む） | Gemini Flashでmedium判定。必要ならSonnet修正。コミット前にChatGPTレビュー。CEOへ事後報告でも可 |
+| **High** | AV-001変更・認証変更・DBスキーマ変更・外部公開endpoint・worker/jobRunner変更・commitGate変更・safetyVerification変更・自動停止条件・CEO通知条件・package.json/lockfile変更・secretや.envに関係する変更・リポジトリ外操作・Goal/Design Philosophyに関わるdocs変更 | Geminiがlowと言ってもChatGPTへエスカレーション。原則CEO承認必須。コミット直前だけでなく実装前レビューも必要 |
 
 ## 10-1. 人間向け報告フォーマット（Report Translation）
 
@@ -247,6 +253,8 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 ## 11-1. Review Level（実行主体ルーティング）
 
 11章のリスク分類（Low/Medium/High）に、実行主体（Codex/Claude）と関与するAIレビューの組み合わせを対応付けたものが以下のReview Levelである。**11章の分類を置き換える新しい機構ではなく、実行主体をどう振り分けるかの運用ルール**として位置づける。
+
+**`ApprovalLevel`（`packages/shared`）との違い（数値が同じ0〜3のため混同注意）:** `ApprovalLevel`は`determineApprovalLevel()`が出力するcontrol repo基準のMechanical Gate分類器の値であり、Step6-B0の結論により「jobRunner経由のJobは常にtarget_project scopeであり、control repo基準のパターンはほぼ一致しない」ことが判明している。本章のReview Levelは、11章のリスク分類（target_projectはRisk Scan severity、control repoは影響範囲による例示）から導く独立した実行ルーティングであり、`ApprovalLevel`の値をそのまま使うものではない。
 
 | Level | 対応するリスク分類 | 実行主体 | 関与するレビュー | 人間確認 |
 |---|---|---|---|---|

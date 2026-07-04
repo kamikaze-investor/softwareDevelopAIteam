@@ -126,10 +126,12 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 | ChatGPT最終判断レビュー | コミット前の判断整理・次工程設計・CEO承認要否判定（コードレビューではない） | `shouldEscalateToChatGpt()`（プレースホルダー） | 未実装（拡張ポイントのみ） |
 | Review Transport Mode | 外部AIへの送信方法（handoff/api、初期推奨: handoff） | — | 仕様策定済み（仕様書20章） |
 | Quota Policy | 無料枠切れ時の挙動（wait/handoff_fallback/paid_api_fallback） | — | 仕様策定済み（仕様書21章）。初期推奨: handoff_fallbackまたはwait、paid_api_fallbackは原則OFF |
-| Low/Medium/High分類 | Review Orchestration層内の共通重要度基準 | `targetProjectRiskScanResult.highestSeverity`ベースで再設計予定 | 概念近似。再設計が必要（詳細は仕様書19-2章） |
+| Low/Medium/High分類 | Review Orchestration層内の共通重要度基準。target_project向けは`targetProjectRiskScanResult.highestSeverity`にそのまま対応、control repo向けは影響範囲による例示（仕様書11章） | `targetProjectRiskScanResult.highestSeverity`（既存実装）をtarget_project向けの正とする対応関係を明記済み | 設計完了（仕様書11章・11-1章。`ApprovalLevel`とは別軸であることも明記） |
 
 **段階実装案（このセクションの下位ステップとして今後着手）:**
-- [ ] Step R1: リスク分類を`targetProjectRiskScanResult.highestSeverity`ベースで再設計
+- [x] Step R1: リスク分類（Low/Medium/High）と Review Level（0〜3・実行主体ルーティング）の
+      重複解消・関係整理（仕様書11章・11-1章。target_projectは`targetProjectRiskScanResult.highestSeverity`
+      にそのまま対応、control repoは影響範囲による例示、`ApprovalLevel`とは別軸であることも明記）
 - [x] Step R2（設計のみ）: Final Review Packetの役割・15項目フォーマット・結論先出し方針を設計（仕様書9章・10-1章）
 - [ ] Step R2（実装）: 上記フォーマットの型・生成関数を実装（既存の`ApprovalLevelResult` /
       `PreReviewResult` / `PostReviewResult` / `SafetyVerificationResult` /
