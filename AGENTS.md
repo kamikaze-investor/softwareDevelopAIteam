@@ -58,6 +58,25 @@ Worker が `agentPrefix` を自動でセットするため、AI 側が手動で�
 
 **1タスク = 1プロバイダー原則: 同一タスク内で両方を混在させない。**
 
+### 3-1. レビュー・判断を含めた全体の役割分担
+
+上表はClaude Code/Codexの実装担当振り分けだが、実際の開発フローにはレビュー・判断を行う他のAIも関わる。
+
+| 役割 | 責務 | 最終判断権限 |
+|---|---|---|
+| **Codex** | 通常実装（上表参照）。危険箇所・設計判断が必要な変更を見つけたらClaude Codeへ上げる | なし |
+| **Claude Code** | 設計・進行計画・危険箇所実装（上表参照） | なし（自分の変更を最終承認しない） |
+| **Gemini** | 低コストなレビュー・監査レイヤー（Risk Review・Alignment Review・Meta Review・preReview・postReview・Report Translation）。単一の「判断担当」ではない | なし（warning/uncertain/blockedはClaude Code/ChatGPT/Humanへエスカレーション） |
+| **ChatGPT** | 重要判断・コミット前判断・人間向け整理（Gemini判断が不確実な場合・高リスク変更・コミット可否判断が必要な場合に使う） | 高リスクはCEO承認を要求 |
+| **Human / CEO** | Goal/Design Philosophy・外部サービス・課金・本番環境・認証権限・破壊的変更の最終判断 | 最終承認者 |
+
+**Review Level 0〜3:** 変更内容はLevel 0（軽微・Codexのみ）/ Level 1（通常実装・Codex+Gemini postReview）/
+Level 2（中リスク・Claude計画+Gemini pre/postReview、必要ならChatGPT）/ Level 3（高リスク・Claude設計+
+Gemini Risk/Alignment Review+ChatGPT判断レビュー+Human/CEO確認）に分類する。
+**Levelは「docsかコードか」ではなく影響範囲で判断する** — AI役割分担・レビュー方針・運用ルールに関わる
+ドキュメント変更はコード変更を伴わなくてもLevel 1〜2相当として扱う。
+詳細は [docs/multi_ai_step_review_flow.md](docs/multi_ai_step_review_flow.md) を参照。
+
 ---
 
 ## 4. 自律修正ループ（暫定 — task-009実装まで）

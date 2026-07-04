@@ -25,6 +25,13 @@ AGENTS.md には Claude Code・Codex 共同運用ルールと TypeScript 品質�
 
 人間（CEO）は Goal変更・方向修正のみ行う。コードを書かない。
 
+**現在の運用（Phase 1）における実際の担当:** Codex（通常実装）/ Claude（設計・進行計画・危険箇所実装）/
+Gemini（低コストなレビュー・監査レイヤー: Risk Review・Alignment Review・Meta Review・preReview・
+postReview・Report Translation。最終判断者ではない）/ ChatGPT（重要判断・コミット前判断・人間向け整理）/
+Human・CEO（Goal・Design Philosophy・外部サービス・課金・本番・認証権限・破壊的変更の最終判断）。
+変更内容はReview Level 0〜3に分類し、Levelに応じたレビュー・確認・エスカレーションを行う。
+詳細は `AGENTS.md` 3章・`docs/multi_ai_step_review_flow.md` を参照。
+
 ---
 
 ## 3. Design Philosophy（絶対遵守）
