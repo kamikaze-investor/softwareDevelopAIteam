@@ -122,7 +122,7 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 | 概念 | 役割 | 対応する既存実装 | 状態 |
 |---|---|---|---|
 | Gemini Flash Stepレビュー | Stepごとの軽量判断レビュー・重要度判定（停止権限なし） | 既存preReviewer/postReviewerとは別物として新規整理 | 未実装（新規概念） |
-| Final Review Packet | ChatGPTに全ログを渡さず低コストに最終判断させる圧縮レビュー資料 | `ApprovalLevelResult`等の既存結果型を集約する生成関数が必要 | 未実装（新規概念） |
+| Final Review Packet | 既存レビュー結果・安全確認・報告を集約する受け皿（新しい判断者ではない）。結論先出し・非エンジニア可読・Report Translationとの相性を重視した15項目形式 | フォーマット設計完了（仕様書9章）。`ApprovalLevelResult`等の既存結果型を集約する生成関数は未実装 | 設計完了・実装未着手 |
 | ChatGPT最終判断レビュー | コミット前の判断整理・次工程設計・CEO承認要否判定（コードレビューではない） | `shouldEscalateToChatGpt()`（プレースホルダー） | 未実装（拡張ポイントのみ） |
 | Review Transport Mode | 外部AIへの送信方法（handoff/api、初期推奨: handoff） | — | 仕様策定済み（仕様書20章） |
 | Quota Policy | 無料枠切れ時の挙動（wait/handoff_fallback/paid_api_fallback） | — | 仕様策定済み（仕様書21章）。初期推奨: handoff_fallbackまたはwait、paid_api_fallbackは原則OFF |
@@ -130,7 +130,8 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 
 **段階実装案（このセクションの下位ステップとして今後着手）:**
 - [ ] Step R1: リスク分類を`targetProjectRiskScanResult.highestSeverity`ベースで再設計
-- [ ] Step R2: Final Review Packet の型・生成関数を新規設計（既存の`ApprovalLevelResult` /
+- [x] Step R2（設計のみ）: Final Review Packetの役割・15項目フォーマット・結論先出し方針を設計（仕様書9章・10-1章）
+- [ ] Step R2（実装）: 上記フォーマットの型・生成関数を実装（既存の`ApprovalLevelResult` /
       `PreReviewResult` / `PostReviewResult` / `SafetyVerificationResult` /
       `TargetProjectRiskScanResult`を集約）
 - [ ] Step R3: Gemini Flash Stepレビュー（新規・停止権限なし）の設計・実装、Review Transport Mode（初期: handoff）選択

@@ -171,28 +171,46 @@ Sonnetは「提案」はできるが、「承認」はできない。
 
 ## 9. Final Review Packet
 
-**役割定義（Review Orchestration / Decision Routing層）:** Final Review Packetは、ChatGPTに全ログ・全diffを渡さずに、低コストかつ的確に最終判断させるための**圧縮レビュー資料**である。ChatGPTへの入力量（=APIコスト）を抑えつつ、判断に必要な情報（重要な懸念・未解決事項・変更範囲）を欠落させないことが目的。
+**役割定義（Review Orchestration / Decision Routing層）:** Final Review Packetは、**既存のレビュー結果・安全確認・報告を1つにまとめる「受け皿」**であり、新しい判断者ではない。ChatGPTに全ログ・全diffを渡さずに低コストかつ的確に最終判断させるための圧縮資料であると同時に、Gemini Flash（Report Translation）で非エンジニア向けに翻訳する際の元データにもなる、共通フォーマットである。
 
-全Step完了後、SonnetはChatGPTに渡すためのFinal Review Packetを作成する。Sonnetが自分に都合よく要約するリスクがあるため、Gemini Flashが抜け漏れ確認を行う。
+Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・commitGate等）とGemini Flash Stepレビューが既に出した結果を**集約するだけ**であり、Packet自体が新たにリスク判定やコミット可否を発明することはない。全Step完了後、SonnetがPacketを作成し、Sonnetが自分に都合よく要約するリスクがあるため、Gemini Flashが抜け漏れ確認を行う。
+
+**設計方針:**
+- 結論を先頭に出し、技術ログをそのまま貼らない（非エンジニアが読んで判断できる形式）
+- Review Level（0〜3）は11-1章の実行ルーティングをそのまま転記する。Packet内で新たにLow/Medium/High判定をやり直さない（11章のリスク分類との重複を避ける）
+- Level 3相当の場合は「Human / CEO確認が必要」であることを結論部分に明記する
+- Geminiレビュー結果は用途別（Risk Review / Alignment Review / Meta Review / preReview・postReview）に分けて記載し、未実施の場合は理由を書く（実施していないことを隠さない）
 
 標準形式:
 
 ```md
 # Final Review Packet
 
-## 1. Task Goal
-## 2. Scope（やったこと/やっていないこと）
-## 3. Step Summary（Step / 実装内容 / 変更ファイル / Gemini判定 / 対応状況）
-## 4. Changed Files
-## 5. Mechanical Safety Results
-## 6. Gemini Escalation Items（medium/highのみ）
-## 7. How Escalation Items Were Resolved
-## 8. Remaining Concerns
-## 9. Commit Candidate
-## 10. CEO Approval Candidate
-## 11. Proposed Commit Message
-## 12. Next Task Candidate
+## 結論（必ず先頭に記載）
+- コミットしてよいか: OK / 修正後再レビュー / 判断保留 / 停止すべき
+- ChatGPTレビューが必要か: 要 / 不要（理由）
+- Human / CEO判断が必要か: 要 / 不要（理由。Level 3相当なら必ず「要」）
+
+## 1. 今回やったこと
+## 2. なぜ必要だったか
+## 3. どこまで変えたか
+## 4. 変えていない重要部分
+## 5. Review Level（0〜3。11-1章のルーティングをそのまま転記）
+## 6. 安全面チェック
+  - DB変更 / 認証・権限変更 / セキュリティ変更 / 外部サービス追加 / 課金影響 /
+    本番環境影響 / package.json・lockfile変更 / 破壊的変更（各項目: 有無と概要）
+## 7. 検証結果（test / typecheck / build / lint。未実行の場合は理由）
+## 8. Geminiレビュー結果（Risk Review / Alignment Review / Meta Review / preReview・postReview。未実施の場合は理由）
+## 9. ChatGPTレビューが必要か（結論の詳細・根拠）
+## 10. Human / CEO判断が必要か（結論の詳細・根拠）
+## 11. コミットしてよいか（結論の詳細・根拠）
+## 12. 対象ファイル
+## 13. コミットメッセージ案
+## 14. 未追跡ファイル・対象外ファイルの扱い
+## 15. 次にやるべき最小アクション
 ```
+
+**旧形式（Task Goal/Scope/Step Summary/Changed Files/Mechanical Safety Results/Gemini Escalation Items/...）との関係:** 上記15項目は旧形式の情報を包含しつつ、結論先出し・非エンジニア可読性・Review Levelとの整合を追加したもの。旧形式を別途維持する必要はない。
 
 ## 10. ChatGPTへ生ログを渡す条件
 
@@ -222,23 +240,9 @@ Sonnetは「提案」はできるが、「承認」はできない。
 
 ## 10-1. 人間向け報告フォーマット（Report Translation）
 
-人間への報告は、非エンジニアが判断できる形にGemini Flash（Report Translation）で翻訳してよい。ただし、Gemini Flashは翻訳係であり最終判断者ではない。コミット可否・設計判断・Goal/Design Philosophyに関わる判断・DB/認証/権限/外部サービス/本番影響の判断・warning/uncertain/blockedが出たケースは、Gemini Flash単独で完結させず、ChatGPTまたはHuman/CEOの判断に委ねる。
+人間への報告は、**Final Review Packet（9章）をGemini Flash（Report Translation）で非エンジニア向けに翻訳したもの**とする。人間向け報告専用の別テンプレートは作らない（9章のPacketと重複する新しい項目一覧を持たない）。ただし、Gemini Flashは翻訳係であり最終判断者ではない。コミット可否・設計判断・Goal/Design Philosophyに関わる判断・DB/認証/権限/外部サービス/本番影響の判断・warning/uncertain/blockedが出たケースは、Gemini Flash単独で完結させず、ChatGPTまたはHuman/CEOの判断に委ねる。
 
-報告フォーマット（技術用語を並べず、以下を説明する）:
-```
-1. 今回やったこと
-2. なぜ必要だったか
-3. どこまで変えたか
-4. 変えていない重要部分
-5. 安全面
-6. 検証結果
-7. Geminiレビュー結果
-8. ChatGPTレビューが必要か
-9. 人間判断が必要か
-10. コミットしてよいか
-```
-
-報告の最後には必ず結論を書く（例: 「このままコミットして問題ありません」「修正後に再レビューが必要です」「人間判断が必要です」「危険なため停止すべきです」）。
+翻訳時は、Packetの「結論」ブロックを冒頭にそのまま出し、技術用語を並べずに1〜15項目を平易な文章に置き換える。報告の最後には必ず結論を書く（例: 「このままコミットして問題ありません」「修正後に再レビューが必要です」「人間判断が必要です」「危険なため停止すべきです」）。
 
 ## 11-1. Review Level（実行主体ルーティング）
 
