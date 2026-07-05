@@ -169,11 +169,46 @@ Step R2までで型・生成関数を用意したFinal Review Packetに続き、
 
 **渡す情報量（11-1章「プロンプト前提量最適化」に従う）:** 今回のStepのdiff要約・目的（purposeSummary相当）・直前のMechanical Safety Checks結果の要約のみを渡す。過去Stepの全文・経緯・関係ない背景は渡さない。既存`ReviewerRequest`（`planText`/`diffText`/`purposeSummary`/`targetFiles`）の構造を参考にしつつ、Gemini Flash Stepレビュー専用の軽量な入力型として別に定義する（`blocked`概念を持たない）。
 
-**Final Review Packetへの格納（既知のギャップ）:** 現在の`FinalReviewPacket`の`GeminiReviewKind`（`risk_review`/`alignment_review`/`meta_review`/`pre_review`/`post_review`）には、Gemini Flash Stepレビュー専用の種別がない。`pre_review`/`post_review`は既存Gemini Reviewer（blocked概念あり）用のkindであり、Stepレビュー（停止権限なし）と混同すると2-1章・6章の役割分離が崩れる。実装時（Step R3実装フェーズ）に`GeminiReviewKind`へ`step_review`を追加する必要がある。**今回はこのギャップを記録するのみで、型は変更しない。**
+**Final Review Packetへの格納:** `FinalReviewPacket`の`GeminiReviewKind`に`step_review`を追加済み（Step R3実装、コミット641243b）。`pre_review`/`post_review`（既存Gemini Reviewer、blocked概念あり）とは区別されている。
 
 **エスカレーション導線:** 出力の`routing`が`escalate_to_chatgpt`または`require_ceo`の場合、Claude Codeは次Stepへ進まず、`escalationReason`を添えてChatGPT（Review Transport Mode: handoff）またはHuman/CEOへ報告する。`routing: stop`の場合は即座に作業を止めてCEOへ報告する（Mechanical Safety ChecksのNGと同様、Gemini側の判断だけで自動停止権限を持つわけではないが、Claude Codeが自身の判断で進行を止める運用とする）。
 
-**今回時点の結論:** 上記はすべて設計・既存基盤の再利用方針であり、コード変更は不要。実装（Step R3実装フェーズ）では、(1) 軽量な入力/出力型の新規定義、(2) `geminiRouter.ts`呼び出しのラッパー関数作成、(3) `GeminiReviewKind`への`step_review`追加、(4) jobRunnerへの接続（Level 2のStep単位フロー内）が対象になる。いずれも新しいレビュー機構ではなく、既存基盤への薄い接続レイヤーとして実装する。
+**Step R3の状態:** 上記(1)〜(4)は実装済み（コミット641243b・f5e4427）。stepReviewResultは`targetProjectRiskScanResult.highestSeverity`がmedium/highの場合のみ呼ばれ、非停止・soft-fail観察モードでjobRunnerに接続されている（medium/high時はGemini API呼び出し分の遅延が発生する）。
+
+### 6-2. commitGate接続設計（Step R4。設計のみ・未実装）
+
+Step R3に続き、既存`commitGate.ts`（reviewPolicy別必須成果物チェック）をjobRunnerのどこに・どの範囲で接続するかを設計する。今回はコード変更を行わない。
+
+**現状（調査結果）:** `commitGate.ts`の`evaluateCommitGate()`/`getRequiredArtifacts()`/`checkArtifactPresence()`は、自身のテストファイル以外どこからも呼ばれていない（`jobRunner.ts`に`commitGate`関連のimport・呼び出しは存在しない）。
+
+**重要な発見（接続を急ぐべきでない理由）:** `getRequiredArtifacts(reviewPolicy)`は、reviewPolicyに応じて`SAFETY_VERIFICATION_RESULT`（全policy共通で必須）・`POST_REVIEW_RESULT`（light_ai_post_review以上）・`PRE_REVIEW_RESULT`（full_pre_post_review以上）を要求する。一方、現在の`jobRunner.ts`は`approvalLevelResult`のみを計算しており、`safetyVerifier.ts`（Safety Gate層の12項目チェック）・`preReviewer.ts`・`postReviewer.ts`はいずれも未接続で、これらの結果はjobRunner内に一切存在しない。**つまり今この時点でcommitGateをjobRunnerへ接続すると、ほぼ全てのJobでrequired artifactが「存在しない」と判定され、`allowed`がほぼ常に`false`になる。** これは意図しない大規模な自動停止化を招くため、safetyVerifier/preReviewer/postReviewerが実接続されるまでは、commitGateの判定結果を実際のcommit可否には使わず、観察モードに限定すべきである。
+
+**接続すべき箇所（観察モードとして、将来実装する場合）:** Gemini Flash Stepレビューブロックの直後・`isAtomic`（git_commit/git_revert）分岐の直前。理由: 既存のRisk Scan/Step Reviewと同じ「Step実行後・commit実行前」という配置パターンを踏襲でき、かつcommitGateの本来の役割（コミット直前の成果物確認）に最も近い位置のため。
+
+**既存レイヤーとの責務の重複確認（重複なし）:** Safety Gate（Mechanical Safety Checks）＝diff内容そのものの危険検出。Risk Scan＝target_project向け危険シグナル検出。Gemini Flash Stepレビュー＝重要度の一次判定（停止権限なし）。commitGate＝「reviewPolicyに応じた必須成果物が揃っているか」を確認するゲート（成果物の中身を判定するのではなく、存在確認のみ）。4つはそれぞれ別の問いに答えており、重複しない。
+
+**R4でやるべき範囲（今回はここまでを設計として提案。実装は次回以降）:**
+```
+1. jobRunnerが現在持つ情報（approvalLevelResult・stepReviewResult）だけでCommitGateInputを
+   組み立てる薄い変換関数を用意する（safetyVerificationResult/preReviewResult/postReviewResult
+   はundefinedのまま渡すことになる）
+2. isAtomic分岐の直前でevaluateCommitGate()を呼び、結果をログ出力・JobRunResultに
+   commitGateResult フィールドとして保持するだけの観察モードとする
+3. allowed:false であってもgit_commitの実行は一切止めない（Gemini Step Reviewと同じ非停止方針）
+```
+
+**R5以降に残すべき範囲:**
+```
+- safetyVerifier.ts / preReviewer.ts / postReviewer.ts の実接続
+  （これらがない限りcommitGateの必須成果物チェックは実質機能しない）
+- Final Review Packetのconclusion/コミット可否欄へのcommitGateResultの反映
+- commitGateResult.allowed に基づく実際のcommit blocking化（自動停止条件の追加。CEO承認が必要）
+- ChatGPT最終判断レビューへFinal Review Packet経由でcommitGate結果を渡す導線
+```
+
+**Jobを止めるべき条件は今あるか:** ない。上記の通りsafetyVerifier/preReviewer/postReviewerが未接続のため、commitGateの判定はまだ「意味のある可否判定」として機能しない。観察モードに留めるべき。
+
+**AV-001対象ファイルと理由（今回は編集しない）:** `jobRunner.ts`（Job実行フローの中核。Control Repository保護対象）、`commitGate.ts`（コミット可否判定ロジック。安全境界に直結するため保護対象）。いずれも実装に進む場合は、編集前に具体的な変更計画を提示し、明確な承認を得てから着手する。
 
 ## 7. Sonnetの役割と制約
 

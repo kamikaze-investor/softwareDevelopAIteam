@@ -114,7 +114,7 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 |---|---|---|
 | Mechanical Safety Checks | `safetyVerifier.ts`（12項目チェック）・`approvalLevelClassifier.ts`（Mechanical Gate） | 実装済み (b159d73, 3b3d1fb) |
 | Risk Scan | `targetProjectRiskScan.ts`（severity付き） | 実装済み・観察モードで接続済み (d16a709〜afab85c)。ログ観察期間中 |
-| commitGate | `commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続 (351840f) |
+| commitGate | `commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続 (351840f)。接続設計完了（仕様書6-2章）。safetyVerifier/preReviewer/postReviewerが未接続のため、接続時は観察モードに限定する必要あり |
 | 既存Gemini Reviewer（実行ブロック権限あり） | `preReviewer.ts` / `postReviewer.ts` / `reviewerAdapter.ts` | 実装済み・未接続 (a7d3f81)。**本セクションのGemini Flash Stepレビューとは別物** |
 
 **Review Orchestration / Decision Routing層（新規概念が中心）:**
@@ -141,7 +141,12 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
       格納ギャップ（`GeminiReviewKind`に`step_review`追加が必要）を整理（仕様書6-1章）
 - [ ] Step R3（実装）: 軽量な入力/出力型の新規定義、`geminiRouter.ts`呼び出しラッパー関数、
       `GeminiReviewKind`への`step_review`追加、jobRunnerへの接続
-- [ ] Step R4: commitGateのjobRunner接続（Safety Gate層・既存Step5は実装済みだが未接続）
+- [x] Step R4（設計のみ）: commitGateの接続設計 — safetyVerifier/preReviewer/postReviewerが
+      未接続のため今この時点で接続すると`allowed`がほぼ常にfalseになる、という重要な発見を記録。
+      接続する場合はGemini Step Reviewブロック直後・isAtomic分岐直前、観察モード限定と結論
+      （仕様書6-2章）。`jobRunner.ts`/`commitGate.ts`はAV-001対象のため今回は未編集
+- [ ] Step R4（実装）: safetyVerifier/preReviewer/postReviewerの実接続が前提。それまでは
+      commitGateのjobRunner接続を実装しない（意図しない自動停止化を避けるため）
 - [ ] Step R5: ChatGPT最終判断レビューの実装（Review Transport Mode/Quota Policyに従う）
 - [ ] Step R6: CEO承認UI・事後報告フローの設計
 
