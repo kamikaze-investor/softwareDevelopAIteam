@@ -20,6 +20,7 @@ import { runStepReview, createNotRunStepReviewResult } from './approvalLevel/ste
 import type { StepReviewResult } from './approvalLevel/stepReview.js'
 import { runPostReview } from './approvalLevel/postReviewer.js'
 import type { PostReviewResult } from './approvalLevel/postReviewer.js'
+import { appendObservationLog } from './approvalLevel/observationLog.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -494,6 +495,17 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     }
   }
   // ── postReviewer接続終端 ─────────────────────────────────────────────────
+
+  // Review Observation Log（最小永続化。書き込み失敗はobservationLog.ts内部で吸収されJobを止めない）
+  appendObservationLog({
+    jobId: job.id,
+    taskId: job.taskId,
+    provider: job.aiCliProvider,
+    changedFilesCount: postChangedFiles.length,
+    targetProjectRiskScanResult,
+    stepReviewResult,
+    postReviewResult,
+  })
 
   const resolved = resolveCommand(job.safeCommand)
   const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)

@@ -97,6 +97,10 @@ vi.mock('./approvalLevel/postReviewer.js', () => ({
   }),
 }))
 
+vi.mock('./approvalLevel/observationLog.js', () => ({
+  appendObservationLog: vi.fn(),
+}))
+
 // ────────────────────────────────────────────────────────────
 // Mock references
 // ────────────────────────────────────────────────────────────
@@ -120,6 +124,9 @@ const runStepReviewMock = vi.mocked(runStepReview)
 
 import { runPostReview } from './approvalLevel/postReviewer.js'
 const runPostReviewMock = vi.mocked(runPostReview)
+
+import { appendObservationLog } from './approvalLevel/observationLog.js'
+const appendObservationLogMock = vi.mocked(appendObservationLog)
 
 // ────────────────────────────────────────────────────────────
 // Helpers
@@ -1791,5 +1798,47 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
     expect(result.status).toBe('blocked')
     expect(result.postReviewResult).toBeUndefined()
     expect(runPostReviewMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('Review Observation Log 接続（観察結果の最小永続化）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('観察対象（Risk Scan/Step Review/postReview）計算後にappendObservationLogが1回呼ばれる', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(appendObservationLogMock).toHaveBeenCalledTimes(1)
+    expect(appendObservationLogMock).toHaveBeenCalledWith(
+      expect.objectContaining({ jobId: 'job-1', taskId: 'task-1' }),
+    )
+    expect(result.status).toBe('success')
+  })
+
+  it('AI CLI失敗時（scanポイントに到達しない）は、appendObservationLogは呼ばれない', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    await runJob(job)
+
+    expect(appendObservationLogMock).not.toHaveBeenCalled()
   })
 })
