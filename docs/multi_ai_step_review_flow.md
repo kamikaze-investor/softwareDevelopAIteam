@@ -230,6 +230,8 @@ Step R3に続き、既存`commitGate.ts`（reviewPolicy別必須成果物チェ�
 
 **AV-001対象ファイルと理由（今回は編集しない）:** `jobRunner.ts`（Job実行フローの中核。Control Repository保護対象）、`commitGate.ts`（コミット可否判定ロジック。安全境界に直結するため保護対象）。いずれも実装に進む場合は、編集前に具体的な変更計画を提示し、明確な承認を得てから着手する。
 
+**更新（R4-A/B完了後・preReviewer調査後）:** safetyVerifier（R4-B、コミット929efe8）・postReviewer（R4-A、コミット5de0f15）は接続済みになったが、commitGate接続（R4-C）は依然として保留とした。理由は「safetyVerifier/postReviewerが未接続だから」ではなく、**`commitGate`が依存する`reviewPolicy`（`approvalLevelResult.reviewPolicy`）自体がcontrol repo基準の分類器であり、target_project向けJobには信頼できない**（Step6-B0で既知）ことが本質的なボトルネックだと判明したため。preReviewerを接続しても、この`reviewPolicy`不信頼問題は解決しない（詳細は6-3章の追記を参照）。
+
 ### 6-3. safetyVerifier / preReviewer / postReviewer 接続順序の設計（Step R4前提整理。設計のみ・未実装）
 
 commitGateが要求する3つの成果物（`safetyVerificationResult`/`preReviewResult`/`postReviewResult`）について、どれから接続すべきかを整理する。今回もコード変更は行わない。対象ファイル（`safetyVerifier.ts`/`preReviewer.ts`/`postReviewer.ts`）はAV-001ではないが、`jobRunner.ts`（AV-001）への接続作業を伴うため、実装時は同様に事前承認が必要。
@@ -279,6 +281,8 @@ preReviewerの接続設計:
 **失敗時にJobを止めない設計にできるか（全ステップ共通）:** できる。Gemini Step Reviewと同じ非停止・soft-fail方針を踏襲する。postReviewer/safetyVerifierの呼び出し自体が失敗した場合（例外・パース失敗）も、既存の`buildFailureResult()`（reviewerAdapter.ts）や、safetyVerifierの各checkのfail-closed設計により、「失敗＝blocking扱いの結果オブジェクトを返す」だけで、jobRunner側で例外を投げることはない。ただしこれは「結果としてblocking:trueが多く出る」ことを意味し、commitGate接続前（R4-A/B段階）ではこの結果を観察するだけに留め、実際のcommit可否には使わない。
 
 **既存Risk Scan/Gemini Step Reviewとの重複確認:** postReviewerは「実装目的とdiffの整合性」をAIが判断する点でRisk Scan（パターンマッチ検出）ともStep Review（重要度の一次判定）とも異なる。safetyVerifierは機械的な12項目チェックであり、Gemini呼び出しを含まない点でGemini系（Step Review/postReviewer）とは別レイヤー。重複なし。
+
+**preReviewer調査結果（2026-07-06。接続は見送り）:** R4-A/B完了後、R4-C再開条件の1つである「preReviewer接続」を別途調査した。結論は**接続しない**。理由: (1) このコードベースには独立した「実装計画」成果物が存在せず、`planText`の実質は`job.aiCliPrompt`になるため、**postReviewerと判断材料がほぼ重複する**（postReviewは同じ元データに対しdiff生成後にレビューする）。(2) preReviewer本来のタイミングはAI CLI実行前だが、その時点では`changedFiles`/`diffText`/Risk Scan severityが存在せず、既存のRisk Scan/Step Review/postReview/safetyVerifierが使う「severity: medium/high」という呼び出しゲート条件が使えない。(3) 観察モード（非停止）では、preReviewer本来の価値である「実装前に止める」が活きない。破棄ではなく、MVP後の設計再検討対象として扱う（`tasks/roadmap.md`参照）。
 
 **できること:** Step単位の実装・テスト追加・typecheck/test実行・差分報告・Gemini指摘への修正・次Step案の提案・Final Review Packetの作成
 

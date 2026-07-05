@@ -425,7 +425,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 | **worker success/error連携** | `/api/health` の `lastSuccessAt`/`lastErrorAt` を実データで反映 | Claude Code |
 | **app manifest** | VPS App Runtime Standard v1の未決定事項 | 別途設計 |
 | **target-project用リスクスキャン preflight判定** | Target Project Risk Scan v1（観察モード、コミットd16a709〜afab85c）の次段階設計 | Claude Code |
-| **commitGate観察モード接続（Step R4-C）** | **保留中。** Step R4-A（postReviewer, 5de0f15）・R4-B（safetyVerifier, 929efe8）は完了し、`review_observation.jsonl`にRisk Scan/Gemini Step Review/postReview/safetyVerificationの観察結果が蓄積される状態になった。R4-CはpreReviewer未接続のため`allowed:false`の大半が構造的な理由（PRE_REVIEW_RESULT不足）になり観察データの価値が低く、MVP前は見送り。再開条件: preReviewer接続後、またはcommitGateの必須成果物設計見直し後 | Claude Code |
+| **commitGate観察モード接続（Step R4-C）** | **保留中。** Step R4-A（postReviewer, 5de0f15）・R4-B（safetyVerifier, 929efe8）は完了し、`review_observation.jsonl`にRisk Scan/Gemini Step Review/postReview/safetyVerificationの観察結果が蓄積される状態になった。preReviewer接続を調査した結果、本質的なボトルネックは「preReviewer未接続」ではなく`commitGate`が依存する`reviewPolicy`がcontrol repo基準でtarget_project向けJobには信頼できないこと（Step6-B0で既知）と判明。preReviewer接続自体は責務重複・入力不足・観察モードでの価値低下により見送り。再開条件: MVP後、またはtarget_project向けreviewPolicy/commitGate必須成果物設計を見直した後 | Claude Code |
 
 ---
 
