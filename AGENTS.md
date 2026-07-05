@@ -77,6 +77,8 @@ Gemini Risk/Alignment Review+ChatGPT判断レビュー+Human/CEO確認）に分�
 ドキュメント変更はコード変更を伴わなくてもLevel 1〜2相当として扱う。
 詳細は [docs/multi_ai_step_review_flow.md](docs/multi_ai_step_review_flow.md) を参照。
 
+**Codexへの作業指示はLevelに応じて前提量を最適化する**（Level 0-1は軽量、Level 2以上は前提不足/過多を内部チェック、Level 3は安全境界を削らない）。詳細は同ドキュメント11-1章「プロンプト前提量最適化」を参照。
+
 ---
 
 ## 4. 自律修正ループ（暫定 — task-009実装まで）

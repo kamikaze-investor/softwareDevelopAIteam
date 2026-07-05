@@ -142,6 +142,11 @@ AI Cannot Modify Its Own Cage
 - ドキュメントとコードの乖離
 - 設計思想（CLAUDE.md）との不整合
 
+**プロンプト前提診断（⚪ ADVISORY専用。blocked/changes_requestedの判定には使わない）**
+- 前提不足の兆候: 安全境界（AV-001・DB・認証・破壊的変更等）に関する考慮が抜け落ちているように見える
+- 前提過多の兆候: タスク目的と無関係な変更・説明が混入している（プロンプトの背景情報が過剰だった可能性）
+- 検出した場合は `findings` に `severity: "low"` で記録するに留め、判定結果には影響させない
+
 フェーズ2で発見した問題も `findings` に含め、
 severity と category を適切に設定すること。
 
