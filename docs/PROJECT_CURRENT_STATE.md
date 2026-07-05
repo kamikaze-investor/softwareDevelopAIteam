@@ -401,6 +401,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 |---|---|---|
 | R-007 | **未追跡スクリプトの扱い** | `apps/worker/scripts/alignmentCheck.ts` / `postTestHook.ps1` が未追跡。意図的な未追跡（AV-001 対象）のため現状維持。代表Health Endpoint追加コミット（9a425f2）でもこの2ファイルおよび `apps/worker/data/` は含めていない。既存の意図的未追跡として引き続き現状維持。 |
 | R-008 | **代表Health Endpointの`/api/health`無認証公開** | `/api/health`・`/health`は認証除外。レスポンスに秘密情報を含まないことをテストで担保済み（`health.test.ts`）だが、外部公開範囲を広げた判断であることを継続的に把握しておく。IPアクセス制限は未実装（roadmap未決定事項）。 |
+| R-009 | **safetyVerification観察結果の`overallPassed:false`は危険検出とは限らない** | Step R4-B（コミット929efe8）で`safetyVerifier`を観察モード接続。`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`の3項目は実行結果を渡していないため常にfail-closedになり、`overallPassed:false`の主要因になり得る。`review_observation.jsonl`の`blockingFailures`を見れば、本当の危険シグナルか未接続項目由来かを区別できる。 |
 
 ---
 
@@ -424,6 +425,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 | **worker success/error連携** | `/api/health` の `lastSuccessAt`/`lastErrorAt` を実データで反映 | Claude Code |
 | **app manifest** | VPS App Runtime Standard v1の未決定事項 | 別途設計 |
 | **target-project用リスクスキャン preflight判定** | Target Project Risk Scan v1（観察モード、コミットd16a709〜afab85c）の次段階設計 | Claude Code |
+| **commitGate観察モード接続（Step R4-C）** | **保留中。** Step R4-A（postReviewer, 5de0f15）・R4-B（safetyVerifier, 929efe8）は完了し、`review_observation.jsonl`にRisk Scan/Gemini Step Review/postReview/safetyVerificationの観察結果が蓄積される状態になった。R4-CはpreReviewer未接続のため`allowed:false`の大半が構造的な理由（PRE_REVIEW_RESULT不足）になり観察データの価値が低く、MVP前は見送り。再開条件: preReviewer接続後、またはcommitGateの必須成果物設計見直し後 | Claude Code |
 
 ---
 

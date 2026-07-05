@@ -114,7 +114,7 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 |---|---|---|
 | Mechanical Safety Checks | `safetyVerifier.ts`（12項目チェック）・`approvalLevelClassifier.ts`（Mechanical Gate） | 実装済み (b159d73, 3b3d1fb) |
 | Risk Scan | `targetProjectRiskScan.ts`（severity付き） | 実装済み・観察モードで接続済み (d16a709〜afab85c)。観察結果は`review_observation.jsonl`へ永続化済み (cc9c95f)。ログ観察期間中 |
-| commitGate | `commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続 (351840f)。接続設計完了（仕様書6-2章）。safetyVerifier/preReviewer/postReviewerが未接続のため、接続時は観察モードに限定する必要あり |
+| commitGate | `commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続 (351840f)。接続設計完了（仕様書6-2章）。**接続は保留**（preReviewer未接続のため`allowed:false`の大半が構造的な理由になり観察データの価値が低い。再開条件はStep R4-C参照） |
 | 既存Gemini Reviewer（実行ブロック権限あり） | `preReviewer.ts` / `postReviewer.ts` / `reviewerAdapter.ts` | 実装済み・未接続 (a7d3f81)。**本セクションのGemini Flash Stepレビューとは別物** |
 
 **Review Orchestration / Decision Routing層（新規概念が中心）:**
@@ -156,10 +156,17 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
       `data/logs/review_observation.jsonl`へappend-only記録（`observationLog.ts`。コミットcc9c95f）。
       2-3章「効果検証可能性の原則」の是正実装 — 観察モードの結果が永続化されず後から評価できない
       問題を解消
-- [ ] Step R4-B（実装）: safetyVerifierの観察モード接続（R4-Aの後。typecheck/test実行結果は
-      未指定のままfail-closedで観察。overallPassed:falseでもJobを止めない）
-- [ ] Step R4-C（実装）: commitGateの観察モード接続（仕様書6-2章の設計に基づく。
-      R4-A/Bの結果を入力として使えるようになった段階で接続。allowed:falseでもcommitを止めない）
+- [x] Step R4-B（実装）: safetyVerifierの観察モード接続（R4-Aの後。typecheck/test実行結果は
+      未指定のままfail-closedで観察。overallPassed:falseでもJobを止めない。コミット929efe8）。
+      `review_observation.jsonl`に`safetyVerification.overallPassed`/`blockingFailures`/
+      `supportedChecksCount`/`totalChecksCount`を追加記録。**注意**: `overallPassed:false`は
+      TYPECHECK/RELATED_TESTS/FULL_TESTS未接続によるfail-closedを含む（危険検出とは限らない）。
+      `blockingFailures`を見れば、本当の危険シグナルか未接続項目由来かを後から区別できる
+- [ ] Step R4-C（実装・**保留**）: commitGateの観察モード接続（仕様書6-2章の設計に基づく）。
+      **保留理由**: preReviewerが未接続のため、今接続すると`allowed:false`の大半が実際の危険検出
+      ではなく`PRE_REVIEW_RESULT`不足という構造的な理由になり、観察データとしての価値（効果検証
+      可能性の原則）が低い。MVP前の開発速度を優先し、いったん見送る（破棄ではない）。
+      **再開条件**: preReviewer接続後、またはcommitGateの必須成果物設計を見直した後
 - [ ] preReviewer接続設計（別トラック）: 実装前タイミングへの接続方法、target_project Jobの
       reviewPolicy=full_pre_post_review判定方法（Step6-B0の制約を踏まえた再設計）を解決してから着手
 - [ ] Step R5: ChatGPT最終判断レビューの実装（Review Transport Mode/Quota Policyに従う）
