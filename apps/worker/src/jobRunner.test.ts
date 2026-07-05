@@ -77,6 +77,26 @@ vi.mock('./approvalLevel/stepReview.js', () => ({
   })),
 }))
 
+vi.mock('./approvalLevel/postReviewer.js', () => ({
+  runPostReview: vi.fn().mockResolvedValue({
+    jobId: 'job-1',
+    taskId: 'task-1',
+    reviewerResult: {
+      provider: 'gemini',
+      phase: 'post',
+      verdict: 'approved',
+      summary: '(test default)',
+      issues: [],
+      confidence: 0.9,
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      rawResponse: '',
+    },
+    alignmentVerdict: 'aligned',
+    blocked: false,
+    decidedAt: '2026-01-01T00:00:00.000Z',
+  }),
+}))
+
 // ────────────────────────────────────────────────────────────
 // Mock references
 // ────────────────────────────────────────────────────────────
@@ -97,6 +117,9 @@ const sendAlertMock = vi.mocked(sendAlert)
 
 import { runStepReview } from './approvalLevel/stepReview.js'
 const runStepReviewMock = vi.mocked(runStepReview)
+
+import { runPostReview } from './approvalLevel/postReviewer.js'
+const runPostReviewMock = vi.mocked(runPostReview)
 
 // ────────────────────────────────────────────────────────────
 // Helpers
@@ -1638,5 +1661,135 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
     expect(result.status).toBe('blocked')
     expect(result.stepReviewResult).toBeUndefined()
     expect(runStepReviewMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('postReviewer接続（Step R4-A・観察モード）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('Risk Scan severity: medium + aiCliProviderあり → runPostReviewが呼ばれ、結果がJobRunResultに含まれる', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: ['.env'] })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+    runPostReviewMock.mockResolvedValue({
+      jobId: 'job-1',
+      taskId: 'task-1',
+      reviewerResult: {
+        provider: 'gemini',
+        phase: 'post',
+        verdict: 'approved',
+        summary: '整合している',
+        issues: [],
+        confidence: 0.9,
+        generatedAt: '2026-01-01T00:00:00.000Z',
+        rawResponse: '',
+      },
+      alignmentVerdict: 'aligned',
+      blocked: false,
+      decidedAt: '2026-01-01T00:00:00.000Z',
+    })
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: '.envに設定を追加してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(runPostReviewMock).toHaveBeenCalledTimes(1)
+    expect(result.postReviewResult?.alignmentVerdict).toBe('aligned')
+    expect(result.status).toBe('success')
+  })
+
+  it('Risk Scan severity: low/none → runPostReviewは呼ばれず、postReviewResultはundefined', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(runPostReviewMock).not.toHaveBeenCalled()
+    expect(result.postReviewResult).toBeUndefined()
+  })
+
+  it('severity: medium だが job.aiCliProvider がない → runPostReviewは呼ばれず、postReviewResultはundefined', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(runPostReviewMock).not.toHaveBeenCalled()
+    expect(result.postReviewResult).toBeUndefined()
+  })
+
+  it('runPostReviewが例外を投げても（実装AIとレビューAIが同一等）catchされ、Jobはsuccess継続', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: ['.env'] })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+    runPostReviewMock.mockRejectedValue(
+      new Error('[reviewerAdapter] 実装AI(gemini)とレビューAI(gemini)が同一です。分離ルールに違反しています。'),
+    )
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: '.envに設定を追加してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('success')
+    expect(result.postReviewResult).toBeUndefined()
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('postReviewer呼び出し失敗'))
+
+    warnSpy.mockRestore()
+  })
+
+  it('AI CLI失敗時、postReviewResultはundefinedのまま（scanポイントに到達しない）', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(result.postReviewResult).toBeUndefined()
+    expect(runPostReviewMock).not.toHaveBeenCalled()
+  })
+
+  it('既存Approval Gateがblock_until_approvedの場合、postReviewResultはundefinedのまま', async () => {
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL risk — CEO approval required',
+      apiAvailable: true,
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.postReviewResult).toBeUndefined()
+    expect(runPostReviewMock).not.toHaveBeenCalled()
   })
 })

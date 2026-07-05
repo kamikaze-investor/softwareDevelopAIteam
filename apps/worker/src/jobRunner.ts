@@ -18,6 +18,8 @@ import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/ta
 import type { TargetProjectRiskScanResult } from './approvalLevel/targetProjectRiskScan.js'
 import { runStepReview, createNotRunStepReviewResult } from './approvalLevel/stepReview.js'
 import type { StepReviewResult } from './approvalLevel/stepReview.js'
+import { runPostReview } from './approvalLevel/postReviewer.js'
+import type { PostReviewResult } from './approvalLevel/postReviewer.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -78,6 +80,15 @@ export interface JobRunResult {
    * Gemini呼び出しに失敗しても（quota枯渇等）status:'failed'として保持し、Jobは止めない。
    */
   stepReviewResult?: StepReviewResult
+  /**
+   * postReviewer結果（Step R4-A・観察モード）。
+   * targetProjectRiskScanResult.highestSeverity が medium/high、かつ job.aiCliProvider が
+   * 定まっている場合のみ呼び出す（既存Gemini Step Reviewと同じ呼び出し条件を流用。
+   * 新しい分類器は作らない）。停止権限を持たず、この結果でJobをblockingしない。
+   * reviewWithSeparation()が例外を投げるケース（実装AIとレビューAIが同一等）を含め、
+   * postReview呼び出しに失敗した場合はundefinedのまま（Jobは継続）。
+   */
+  postReviewResult?: PostReviewResult
 }
 
 /**
@@ -455,6 +466,35 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   }
   // ── Gemini Flash Stepレビュー終端 ───────────────────────────────────────────
 
+  // ── postReviewer接続（Step R4-A・観察モード・非停止） ─────────────────────────
+  // 既存Gemini Step Reviewと同じ呼び出し条件（Risk Scan severity: medium/high）に加え、
+  // job.aiCliProvider が定まっている場合のみ呼ぶ（implementerProviderが必須のため）。
+  // reviewWithSeparation()は「実装AIとレビューAIが同一」の場合にErrorをthrowする
+  // 防御コードを持つため、必ずtry/catchで包む。catch時はJobを止めず、
+  // diff本文等は出さずエラー種別の要約のみをログに残す。
+  const isRiskSeverityMediumOrHigh =
+    targetProjectRiskScanResult.highestSeverity === 'medium' ||
+    targetProjectRiskScanResult.highestSeverity === 'high'
+  let postReviewResult: PostReviewResult | undefined
+  if (isRiskSeverityMediumOrHigh && job.aiCliProvider) {
+    try {
+      postReviewResult = await runPostReview({
+        jobId: job.id,
+        taskId: job.taskId,
+        implementerProvider: job.aiCliProvider,
+        approvalLevelResult,
+        diffText: postDiffText,
+        changedFiles: postChangedFiles,
+        purposeSummary: job.aiCliPrompt ?? `Task ${job.taskId}（${job.safeCommand.kind}）`,
+      })
+      console.log(`[jobRunner] postReviewer: verdict=${postReviewResult.reviewerResult.verdict} alignmentVerdict=${postReviewResult.alignmentVerdict}`)
+    } catch (err) {
+      const errorKind = err instanceof Error ? err.constructor.name : typeof err
+      console.warn(`[jobRunner] postReviewer呼び出し失敗（Jobは継続）: jobId=${job.id} taskId=${job.taskId} errorKind=${errorKind}`)
+    }
+  }
+  // ── postReviewer接続終端 ─────────────────────────────────────────────────
+
   const resolved = resolveCommand(job.safeCommand)
   const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)
 
@@ -521,6 +561,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     approvalLevelResult,
     targetProjectRiskScanResult,
     stepReviewResult,
+    postReviewResult,
   }
 }
 
