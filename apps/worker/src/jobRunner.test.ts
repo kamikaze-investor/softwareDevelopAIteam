@@ -54,6 +54,29 @@ vi.mock('./notifier/notifier.js', () => ({
   sendAlert: vi.fn().mockResolvedValue([]),
 }))
 
+vi.mock('./approvalLevel/stepReview.js', () => ({
+  runStepReview: vi.fn().mockResolvedValue({
+    status: 'failed',
+    summary: '(test default: runStepReview not mocked for this case)',
+    concerns: [],
+    requiredFixes: [],
+    escalationReason: null,
+    confidence: 0,
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    rawResponse: '',
+  }),
+  createNotRunStepReviewResult: vi.fn((reason: string) => ({
+    status: 'not_run',
+    summary: reason,
+    concerns: [],
+    requiredFixes: [],
+    escalationReason: null,
+    confidence: 0,
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    rawResponse: '',
+  })),
+}))
+
 // ────────────────────────────────────────────────────────────
 // Mock references
 // ────────────────────────────────────────────────────────────
@@ -71,6 +94,9 @@ const permissionGuardWithGrantsMock = vi.mocked(permissionGuardWithGrants)
 
 import { sendAlert } from './notifier/notifier.js'
 const sendAlertMock = vi.mocked(sendAlert)
+
+import { runStepReview } from './approvalLevel/stepReview.js'
+const runStepReviewMock = vi.mocked(runStepReview)
 
 // ────────────────────────────────────────────────────────────
 // Helpers
@@ -1509,5 +1535,108 @@ describe('Risk Scan Console Warning（観察モード）', () => {
     expect(result.status).not.toBe('blocked')
 
     warnSpy.mockRestore()
+  })
+})
+
+describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('リスクなしの変更（Risk Scan severity: none）→ runStepReviewは呼ばれず、stepReviewResult.status:not_run', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(runStepReviewMock).not.toHaveBeenCalled()
+    expect(result.stepReviewResult?.status).toBe('not_run')
+  })
+
+  it('Risk Scan severity: medium（.env変更）→ runStepReviewが呼ばれ、結果がJobRunResultに含まれる', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+    runStepReviewMock.mockResolvedValue({
+      status: 'done',
+      importance: 'medium',
+      routing: 'proceed_candidate',
+      summary: '軽微な懸念のみ',
+      concerns: [],
+      requiredFixes: [],
+      escalationReason: null,
+      confidence: 0.8,
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      rawResponse: '',
+    })
+
+    const result = await runJob(createJob())
+
+    expect(runStepReviewMock).toHaveBeenCalledTimes(1)
+    expect(result.stepReviewResult?.status).toBe('done')
+    expect(result.stepReviewResult?.importance).toBe('medium')
+    expect(result.status).toBe('success')
+  })
+
+  it('Gemini呼び出しが失敗（quota枯渇等）してもJobのstatusはsuccessのまま（Jobを止めない）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+    runStepReviewMock.mockResolvedValue({
+      status: 'failed',
+      summary: 'Stepレビュー呼び出しに失敗しました: quota exhausted',
+      concerns: [],
+      requiredFixes: [],
+      escalationReason: null,
+      confidence: 0,
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      rawResponse: '',
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('success')
+    expect(result.stepReviewResult?.status).toBe('failed')
+  })
+
+  it('AI CLI失敗時、stepReviewResultはundefinedのまま（scanポイントに到達しない）', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(result.stepReviewResult).toBeUndefined()
+    expect(runStepReviewMock).not.toHaveBeenCalled()
+  })
+
+  it('既存Approval Gateがblock_until_approvedの場合、stepReviewResultはundefinedのまま', async () => {
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL risk — CEO approval required',
+      apiAvailable: true,
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.stepReviewResult).toBeUndefined()
+    expect(runStepReviewMock).not.toHaveBeenCalled()
   })
 })

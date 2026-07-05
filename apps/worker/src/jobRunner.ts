@@ -16,6 +16,8 @@ import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
 import type { TargetProjectRiskScanResult } from './approvalLevel/targetProjectRiskScan.js'
+import { runStepReview, createNotRunStepReviewResult } from './approvalLevel/stepReview.js'
+import type { StepReviewResult } from './approvalLevel/stepReview.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -68,6 +70,14 @@ export interface JobRunResult {
    * 計算されず、undefinedのまま。
    */
   targetProjectRiskScanResult?: TargetProjectRiskScanResult
+  /**
+   * Gemini Flash Stepレビュー結果（Step R3・観察モード）。
+   * targetProjectRiskScanResult.highestSeverity が medium/high の場合のみ呼び出す
+   * （target_project向けReview Level 2以上に相当する既存情報として使える唯一のシグナル。
+   * 新しい分類器は作らない）。停止権限を持たず、この結果でJobをblockingしない。
+   * Gemini呼び出しに失敗しても（quota枯渇等）status:'failed'として保持し、Jobは止めない。
+   */
+  stepReviewResult?: StepReviewResult
 }
 
 /**
@@ -419,6 +429,32 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   }
   // ── Target Project Risk Scan 終端 ───────────────────────────────────────────
 
+  // ── Gemini Flash Stepレビュー（Step R3・観察モード・非ブロッキング） ─────────
+  // targetProjectRiskScanResult.highestSeverity が medium/high の場合のみ呼ぶ。
+  // 11章の対応関係により、これがtarget_project向けReview Level 2以上に相当する
+  // 既存情報として使える唯一のシグナルであり、新しい分類器はここで作らない。
+  // 停止権限を持たず、この結果でJobをblockingしない。Gemini呼び出しに失敗しても
+  // （quota枯渇・ネットワークエラー等）stepReview.ts側でstatus:'failed'として
+  // 返るため、ここでは例外を捕捉する必要はない（Jobを止めない）。
+  const stepReviewResult =
+    targetProjectRiskScanResult.highestSeverity === 'medium' ||
+    targetProjectRiskScanResult.highestSeverity === 'high'
+      ? await runStepReview({
+          jobId: job.id,
+          taskId: job.taskId,
+          stepSummary: riskScanSummary ?? `Risk Scanでseverity:${targetProjectRiskScanResult.highestSeverity}を検出`,
+          purposeSummary: job.aiCliPrompt ?? `Task ${job.taskId}（${job.safeCommand.kind}）`,
+          mechanicalSafetyResultSummary: riskScanSummary ?? 'Risk Scan: 重大な指摘なし',
+          targetFiles: postChangedFiles,
+        })
+      : createNotRunStepReviewResult('Risk Scan severityがlow/noneのため未実行（Level 1相当）')
+  if (stepReviewResult.status === 'done') {
+    console.log(`[jobRunner] Gemini Flash Stepレビュー: importance=${stepReviewResult.importance} routing=${stepReviewResult.routing}`)
+  } else if (stepReviewResult.status === 'failed') {
+    console.warn(`[jobRunner] Gemini Flash Stepレビュー呼び出し失敗（Jobは継続）: ${stepReviewResult.summary}`)
+  }
+  // ── Gemini Flash Stepレビュー終端 ───────────────────────────────────────────
+
   const resolved = resolveCommand(job.safeCommand)
   const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)
 
@@ -484,6 +520,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     rollbackInfo,
     approvalLevelResult,
     targetProjectRiskScanResult,
+    stepReviewResult,
   }
 }
 
