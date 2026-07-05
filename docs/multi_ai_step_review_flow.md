@@ -210,7 +210,55 @@ Step R3に続き、既存`commitGate.ts`（reviewPolicy別必須成果物チェ�
 
 **AV-001対象ファイルと理由（今回は編集しない）:** `jobRunner.ts`（Job実行フローの中核。Control Repository保護対象）、`commitGate.ts`（コミット可否判定ロジック。安全境界に直結するため保護対象）。いずれも実装に進む場合は、編集前に具体的な変更計画を提示し、明確な承認を得てから着手する。
 
-## 7. Sonnetの役割と制約
+### 6-3. safetyVerifier / preReviewer / postReviewer 接続順序の設計（Step R4前提整理。設計のみ・未実装）
+
+commitGateが要求する3つの成果物（`safetyVerificationResult`/`preReviewResult`/`postReviewResult`）について、どれから接続すべきかを整理する。今回もコード変更は行わない。対象ファイル（`safetyVerifier.ts`/`preReviewer.ts`/`postReviewer.ts`）はAV-001ではないが、`jobRunner.ts`（AV-001）への接続作業を伴うため、実装時は同様に事前承認が必要。
+
+**それぞれが要求する入力（調査結果）:**
+
+| 成果物 | 必要な入力 | jobRunnerに既にあるか |
+|---|---|---|
+| `postReviewResult` | `diffText`・`changedFiles`・`purposeSummary`・`implementerProvider` | ある（Risk Scan/Step Reviewと同じpost-diffデータ。`purposeSummary`はStep Reviewと同様`job.aiCliPrompt`等で代用可） |
+| `safetyVerificationResult`（12項目中8項目） | `changedFiles`・`diffText`・`approvalLevelResult`・`repoRoot` | ある |
+| `safetyVerificationResult`（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`） | 実際のtypecheck/test実行結果（`CommandExecutionResult`） | **ない。**jobRunnerは1Job=1SafeCommandのため、同一Job実行内でtypecheck/testを別途実行する仕組みが存在しない。未接続の場合、`buildCommandResultCheck()`の実装により`passed:false, blocking:true, detail:"〜が未実行"`と**fail-closedで返る**（バグではなく、この関数の意図した既存挙動） |
+| `safetyVerificationResult`（`PURPOSE_DIFF_ALIGNMENT`） | `postReviewResult.alignmentVerdict` | **ない（postReviewerが先に接続されて初めて得られる）**。未接続の場合`checkPurposeDiffAlignment()`が`passed:false, blocking:true, detail:"Post-Review未実施または判定不能"`とfail-closedで返る（同様に意図した既存挙動） |
+| `preReviewResult` | `planText`（実装前の変更計画テキスト）・`purposeSummary`・`targetFiles`・`implementerProvider` | **ない。**jobRunnerは実装（AI CLI実行）前に「計画テキスト」を保持する仕組みを持たない。加えてpreReviewはpolicy=`full_pre_post_review`（Level2相当）のみ対象という前提があるが、Step6-B0の結論により`approvalLevelResult`（control repo基準）はtarget_project向けJobのreviewPolicy判定として信頼できないため、「このJobがfull_pre_post_review対象か」を安全に判定する手段自体が別途必要 |
+
+**接続順序の結論: postReviewer → safetyVerifier（部分）→ commitGate（観察モード）。preReviewerは別トラックとして後回しにする。**
+
+理由:
+- postReviewerは既存のRisk Scan/Step Reviewと全く同じタイミング・同じ入力（post-diffデータ）で呼べるため、追加の設計課題がない。最も接続しやすい。
+- safetyVerifierは12項目中8項目が既存情報だけで評価可能。残る4項目（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`のcommand実行結果系3項目・`PURPOSE_DIFF_ALIGNMENT`1項目）は接続後もfail-closedのまま観察するに留め、無理に埋めようとしない（typecheck/test実行結果の受け渡しは1Job=1SafeCommandというjobRunnerの設計と衝突するため、安易に拡張しない）。
+- preReviewerは（a）実装前という異なるタイミングへの接続が必要、（b）対象policy判定自体が未解決、という2つの未解決設計課題があるため、無理に今回の順序に含めず、独立した設計課題として先送りする。
+
+**R4実装の分割案:**
+```
+R4-A: postReviewerの観察モード接続
+  - 既存Risk Scan/Step Reviewと同じ位置（Gemini Step Reviewブロックの直後）
+  - postReviewResultをJobRunResultに保持するだけ。blocked:trueでもJobは止めない
+  - 新規入力なし（postChangedFiles/postDiffTextを流用）
+
+R4-B: safetyVerifierの観察モード接続（部分評価であることを明記）
+  - R4-Aの後（PURPOSE_DIFF_ALIGNMENTにpostReviewResult.alignmentVerdictを渡すため）
+  - typecheckResult/relatedTestResult/fullTestResultは今回未指定（undefined）のまま渡す
+    → 3項目は意図的にfail-closedのまま観察する（実行結果を渡す仕組みは別途設計が必要）
+  - safetyVerificationResultをJobRunResultに保持するだけ。overallPassed:falseでもJobは止めない
+
+R4-C: commitGateの観察モード接続（6-2章の設計に基づく）
+  - R4-A/Bの結果を入力として渡せるようになった段階で接続
+  - allowed:falseであってもcommitは止めない（このR4全体を通して非停止方針を維持）
+
+（別トラック・今回のR4順序には含めない）
+preReviewerの接続設計:
+  - 実装前（AI CLI実行前）のタイミングへの接続方法
+  - target_project Jobにおいてreviewpolicy=full_pre_post_review対象かどうかの
+    安全な判定方法（Step6-B0の制約を踏まえた再設計）
+  の2点を解決してから、別Stepとして設計する
+```
+
+**失敗時にJobを止めない設計にできるか（全ステップ共通）:** できる。Gemini Step Reviewと同じ非停止・soft-fail方針を踏襲する。postReviewer/safetyVerifierの呼び出し自体が失敗した場合（例外・パース失敗）も、既存の`buildFailureResult()`（reviewerAdapter.ts）や、safetyVerifierの各checkのfail-closed設計により、「失敗＝blocking扱いの結果オブジェクトを返す」だけで、jobRunner側で例外を投げることはない。ただしこれは「結果としてblocking:trueが多く出る」ことを意味し、commitGate接続前（R4-A/B段階）ではこの結果を観察するだけに留め、実際のcommit可否には使わない。
+
+**既存Risk Scan/Gemini Step Reviewとの重複確認:** postReviewerは「実装目的とdiffの整合性」をAIが判断する点でRisk Scan（パターンマッチ検出）ともStep Review（重要度の一次判定）とも異なる。safetyVerifierは機械的な12項目チェックであり、Gemini呼び出しを含まない点でGemini系（Step Review/postReviewer）とは別レイヤー。重複なし。
 
 **できること:** Step単位の実装・テスト追加・typecheck/test実行・差分報告・Gemini指摘への修正・次Step案の提案・Final Review Packetの作成
 

@@ -145,8 +145,19 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
       未接続のため今この時点で接続すると`allowed`がほぼ常にfalseになる、という重要な発見を記録。
       接続する場合はGemini Step Reviewブロック直後・isAtomic分岐直前、観察モード限定と結論
       （仕様書6-2章）。`jobRunner.ts`/`commitGate.ts`はAV-001対象のため今回は未編集
-- [ ] Step R4（実装）: safetyVerifier/preReviewer/postReviewerの実接続が前提。それまでは
-      commitGateのjobRunner接続を実装しない（意図しない自動停止化を避けるため）
+- [x] Step R4前提整理（設計のみ）: safetyVerifier/preReviewer/postReviewerの接続順序を整理
+      （仕様書6-3章）。postReviewerは既存Risk Scan/Step Reviewと同じ入力で接続可能、
+      safetyVerifierは12項目中8項目が既存情報で評価可能（残り4項目はtypecheck/test実行結果3項目・
+      postReviewResultが必要な1項目でfail-closedのまま観察）、preReviewerは実装前タイミングへの接続と
+      target_project向けpolicy判定という2つの未解決課題があるため別トラックに切り出し
+- [ ] Step R4-A（実装）: postReviewerの観察モード接続（Gemini Step Reviewブロック直後、
+      既存post-diffデータを流用。blocked:trueでもJobを止めない）
+- [ ] Step R4-B（実装）: safetyVerifierの観察モード接続（R4-Aの後。typecheck/test実行結果は
+      未指定のままfail-closedで観察。overallPassed:falseでもJobを止めない）
+- [ ] Step R4-C（実装）: commitGateの観察モード接続（仕様書6-2章の設計に基づく。
+      R4-A/Bの結果を入力として使えるようになった段階で接続。allowed:falseでもcommitを止めない）
+- [ ] preReviewer接続設計（別トラック）: 実装前タイミングへの接続方法、target_project Jobの
+      reviewPolicy=full_pre_post_review判定方法（Step6-B0の制約を踏まえた再設計）を解決してから着手
 - [ ] Step R5: ChatGPT最終判断レビューの実装（Review Transport Mode/Quota Policyに従う）
 - [ ] Step R6: CEO承認UI・事後報告フローの設計
 
