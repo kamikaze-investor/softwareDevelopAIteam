@@ -65,6 +65,11 @@ export type GeminiReviewKind =
   | 'meta_review'
   | 'pre_review'
   | 'post_review'
+  /**
+   * Gemini Flash Stepレビュー（Step R3・stepReview.ts）。停止権限を持たない一次判定であり、
+   * 'pre_review'/'post_review'（既存preReviewer/postReviewer、blocked概念あり）とは別物。
+   */
+  | 'step_review'
 
 export interface GeminiReviewItem {
   kind: GeminiReviewKind
@@ -170,6 +175,7 @@ const GEMINI_REVIEW_LABEL: Record<GeminiReviewKind, string> = {
   meta_review: 'Meta Review',
   pre_review: 'preReview',
   post_review: 'postReview',
+  step_review: 'Gemini Flash Stepレビュー',
 }
 
 const REVIEW_ITEM_STATUS_LABEL: Record<ReviewItemStatus, string> = {
