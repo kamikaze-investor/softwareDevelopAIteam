@@ -121,7 +121,7 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 
 | 概念 | 役割 | 対応する既存実装 | 状態 |
 |---|---|---|---|
-| Gemini Flash Stepレビュー | Stepごとの軽量判断レビュー・重要度判定（停止権限なし） | 既存preReviewer/postReviewerとは別物として新規整理 | 未実装（新規概念） |
+| Gemini Flash Stepレビュー | Stepごとの軽量判断レビュー・重要度判定（停止権限なし） | 既存preReviewer/postReviewerとは別物として新規整理。`geminiRouter.ts`（既存基盤）を呼ぶだけの軽量ラッパーとして実装予定 | 接続設計完了（仕様書6-1章）・実装未着手 |
 | Final Review Packet | 既存レビュー結果・安全確認・報告を集約する受け皿（新しい判断者ではない）。結論先出し・非エンジニア可読・Report Translationとの相性を重視した15項目形式 | フォーマット設計完了（仕様書9章）。`ApprovalLevelResult`等の既存結果型を集約する生成関数は未実装 | 設計完了・実装未着手 |
 | ChatGPT最終判断レビュー | コミット前の判断整理・次工程設計・CEO承認要否判定（コードレビューではない） | `shouldEscalateToChatGpt()`（プレースホルダー） | 未実装（拡張ポイントのみ） |
 | Review Transport Mode | 外部AIへの送信方法（handoff/api、初期推奨: handoff） | — | 仕様策定済み（仕様書20章） |
@@ -133,10 +133,14 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
       重複解消・関係整理（仕様書11章・11-1章。target_projectは`targetProjectRiskScanResult.highestSeverity`
       にそのまま対応、control repoは影響範囲による例示、`ApprovalLevel`とは別軸であることも明記）
 - [x] Step R2（設計のみ）: Final Review Packetの役割・15項目フォーマット・結論先出し方針を設計（仕様書9章・10-1章）
-- [ ] Step R2（実装）: 上記フォーマットの型・生成関数を実装（既存の`ApprovalLevelResult` /
-      `PreReviewResult` / `PostReviewResult` / `SafetyVerificationResult` /
-      `TargetProjectRiskScanResult`を集約）
-- [ ] Step R3: Gemini Flash Stepレビュー（新規・停止権限なし）の設計・実装、Review Transport Mode（初期: handoff）選択
+- [x] Step R2（実装）: 上記フォーマットの型・生成関数を実装（`apps/worker/src/approvalLevel/finalReviewPacket.ts`。
+      コミット3600ae3。jobRunner/commitGateへの接続はまだ）
+- [x] Step R3（設計のみ）: Gemini Flash Stepレビューの接続設計 — 既存`geminiRouter.ts`基盤の再利用方針、
+      Transport Mode（Gemini Flashは初期から`api`、ChatGPTは引き続き`handoff`）、呼び出しタイミング
+      （Level 2のStep単位フロー）、渡す情報量（プロンプト前提量最適化に従う）、Final Review Packetへの
+      格納ギャップ（`GeminiReviewKind`に`step_review`追加が必要）を整理（仕様書6-1章）
+- [ ] Step R3（実装）: 軽量な入力/出力型の新規定義、`geminiRouter.ts`呼び出しラッパー関数、
+      `GeminiReviewKind`への`step_review`追加、jobRunnerへの接続
 - [ ] Step R4: commitGateのjobRunner接続（Safety Gate層・既存Step5は実装済みだが未接続）
 - [ ] Step R5: ChatGPT最終判断レビューの実装（Review Transport Mode/Quota Policyに従う）
 - [ ] Step R6: CEO承認UI・事後報告フローの設計

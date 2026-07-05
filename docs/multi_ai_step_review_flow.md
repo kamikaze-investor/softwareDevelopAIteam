@@ -153,6 +153,28 @@ secretLeakDetected: false
 **できる:** 重要度判定・修正提案・ChatGPTへのエスカレーション提案・CEO承認が必要そうな点の指摘
 **できない:** コミット承認・CEO承認の代替・high riskの解除・Mechanical Safety ChecksのNG上書き・Claudeへ自動で次実装を指示する
 
+### 6-1. 接続設計（Step R3。設計のみ・未実装）
+
+Step R2までで型・生成関数を用意したFinal Review Packetに続き、Gemini Flash Stepレビューを**いつ・どの情報量で・どの経路で**呼ぶかを設計する。今回はコード変更を行わない。
+
+**既存Gemini呼び出し基盤の再利用（新規実装しない）:** `apps/worker/src/metaReviewer/geminiRouter.ts`が既にCLI（agy）→API自動フォールバック・429/quotaエラー検出を実装済み（AV-001対象・AI編集禁止）。Gemini Flash Stepレビューを実装する際は、この既存基盤（`callGeminiForReview`相当）を呼び出すだけとし、新しいGemini API接続コードを作らない。`preReviewer.ts`/`postReviewer.ts`が使う`reviewerAdapter.ts`とも別モジュール（新しい軽量関数）として実装し、既存の`blocked`概念を持つ型は流用しない（2-1章・6章の役割分離を維持するため）。
+
+**Review Transport Mode（20章）との関係:** 20章は「初期推奨: handoff」としているが、これは主にAPI未接続のChatGPTを想定した推奨である。Gemini Flashは既に`geminiRouter.ts`経由でAPI運用されている実績があり、低コスト（Flashモデル・quota検出済み）のため、**Gemini Flash Stepレビューは初期から`api`モードでよい**。ChatGPTは引き続き`handoff`初期推奨のまま変更しない。AIごとにTransport Modeが異なってよいことを20章に補足する必要がある（次回のドキュメント更新候補。今回はここに設計メモとして記録するに留める）。
+
+**呼び出しタイミング（11-1章のReview Levelと連動）:**
+- Level 0: 呼ばない
+- Level 1: 呼ばない（既存`postReviewer.ts`のpostReviewのみ。Gemini Flashは人間向け報告のReport Translationにのみ関与）
+- Level 2: 4章のStep単位実装フローの通り、**Mechanical Safety Checks通過後・次Step着手前**に呼ぶ
+- Level 3: Gemini Risk Review・Alignment Reviewが優先されるため、Stepレビューは補助的に使う程度に留める
+
+**渡す情報量（11-1章「プロンプト前提量最適化」に従う）:** 今回のStepのdiff要約・目的（purposeSummary相当）・直前のMechanical Safety Checks結果の要約のみを渡す。過去Stepの全文・経緯・関係ない背景は渡さない。既存`ReviewerRequest`（`planText`/`diffText`/`purposeSummary`/`targetFiles`）の構造を参考にしつつ、Gemini Flash Stepレビュー専用の軽量な入力型として別に定義する（`blocked`概念を持たない）。
+
+**Final Review Packetへの格納（既知のギャップ）:** 現在の`FinalReviewPacket`の`GeminiReviewKind`（`risk_review`/`alignment_review`/`meta_review`/`pre_review`/`post_review`）には、Gemini Flash Stepレビュー専用の種別がない。`pre_review`/`post_review`は既存Gemini Reviewer（blocked概念あり）用のkindであり、Stepレビュー（停止権限なし）と混同すると2-1章・6章の役割分離が崩れる。実装時（Step R3実装フェーズ）に`GeminiReviewKind`へ`step_review`を追加する必要がある。**今回はこのギャップを記録するのみで、型は変更しない。**
+
+**エスカレーション導線:** 出力の`routing`が`escalate_to_chatgpt`または`require_ceo`の場合、Claude Codeは次Stepへ進まず、`escalationReason`を添えてChatGPT（Review Transport Mode: handoff）またはHuman/CEOへ報告する。`routing: stop`の場合は即座に作業を止めてCEOへ報告する（Mechanical Safety ChecksのNGと同様、Gemini側の判断だけで自動停止権限を持つわけではないが、Claude Codeが自身の判断で進行を止める運用とする）。
+
+**今回時点の結論:** 上記はすべて設計・既存基盤の再利用方針であり、コード変更は不要。実装（Step R3実装フェーズ）では、(1) 軽量な入力/出力型の新規定義、(2) `geminiRouter.ts`呼び出しのラッパー関数作成、(3) `GeminiReviewKind`への`step_review`追加、(4) jobRunnerへの接続（Level 2のStep単位フロー内）が対象になる。いずれも新しいレビュー機構ではなく、既存基盤への薄い接続レイヤーとして実装する。
+
 ## 7. Sonnetの役割と制約
 
 **できること:** Step単位の実装・テスト追加・typecheck/test実行・差分報告・Gemini指摘への修正・次Step案の提案・Final Review Packetの作成
