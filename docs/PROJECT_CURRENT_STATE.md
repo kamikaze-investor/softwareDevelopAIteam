@@ -264,6 +264,11 @@ softwareDevelopAIteam/            ← Control Repository（AI編集禁止）
 | Context Manager | `apps/api/src/ctoAi/contextManager.ts` |
 | Developer AI Orchestrator | `apps/api/src/ctoAi/developerAiOrchestrator.ts` |
 
+**注記（2026-07-06実態確認）:** 上記はいずれも実装済み・単体テストありだが、「仕様書入力→CTO AI→
+Context Pack→Developer AI→Job実行→Review→Dashboard更新」という一連の流れがE2Eで実際につながって
+動くことはまだ確認していない（Project/Task/Job CRUD API・API token認証・Mobile Dashboard・
+Pending Approval UIも同様）。次タスク「MVP E2E疎通確認」（`tasks/roadmap.md`参照）で検証する。
+
 ---
 
 ## 4. AI エージェント役割定義
@@ -411,6 +416,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 | タスク | 理由 | 担当 |
 |---|---|---|
+| **MVP E2E疎通確認（最優先）** | Project/Task/Job CRUD API・CTO AI・Context Pack・Developer AI・Summary Engine・Mobile Dashboardは個別に実装済み・テストありだが、一連の流れが実際につながって動くかは未検証。roadmap整合性是正（2026-07-06）を踏まえた、MVP完成の実質的なゴール判定タスク | Claude Code |
 | **Context Manager 連携（contextFiles 拡張）** | AI CLI の `contextFiles` が現在 `[]` 固定。Context Manager AI が ContextPack を生成して渡すことで AI の実装精度が向上する | Claude Code |
 | **postTestHook.ps1 正式設計** | ローカル開発時の Meta Review 自動実行を正式経路で再設計。現状は `exit 0` のみで機能停止中 | Claude Code |
 

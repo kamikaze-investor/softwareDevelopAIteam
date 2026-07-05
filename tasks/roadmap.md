@@ -67,20 +67,27 @@
 - [ ] contextFiles 拡張（Context Manager 連携）← 別 task
 
 ### 1-D: バックエンド実装
+
+**注記（2026-07-06実態確認）:** 以下は「該当ファイル・ルート登録・単体テストの存在」を実装済みの根拠とする。
+E2Eでの動作確認・実運用確認はまだ行っていない（次タスク「MVP E2E疎通確認」で検証予定）。
+
 - [x] SQLite Storage 完全実装 (task-018)
-- [ ] Backend: Project CRUD API (task-006)
-- [ ] Backend: Task CRUD API (task-007)
-- [ ] Backend: Job Queue API (task-008)
-- [ ] 簡易認証 API token (task-014)
-- [ ] Worker Job実行エンジン (task-009)
-- [ ] Job状態遷移 + 復旧ロジック (task-016)
-- [ ] Jobログ分離保存 (task-017)
+- [x] Backend: Project CRUD API (task-006) — 実装済み・テストあり（`apps/api/src/routes/projects.ts` + `projects.test.ts`）／E2E未検証
+- [x] Backend: Task CRUD API (task-007) — 実装済み・テストあり（`tasks.ts` + `tasks.test.ts`）／E2E未検証
+- [x] Backend: Job Queue API (task-008) — 実装済み・テストあり（`jobs.ts` + `jobs.test.ts`）／E2E未検証
+- [x] 簡易認証 API token (task-014) — 実装済み・テストあり（`auth/apiToken.ts` + `apiToken.test.ts`）／E2E未検証
+- [x] Worker Job実行エンジン (task-009) — 実装済み・テストあり（`jobRunner.ts`。本セッションでR3/R4まで拡張継続中）／実運用（実際のtarget-projectでの継続稼働）未確認
+- [x] Job状態遷移 + 復旧ロジック (task-016) — 実装済み・テストあり（`JobStatus`型 + `rollbackInfo`自動生成ロジック）／E2E未検証
+- [x] Jobログ分離保存 (task-017) — 実装済み・テストあり（`jobLogger.ts` + `jobLogger.test.ts`）／E2E未検証
 
 ### 1-E: ダッシュボード
-- [ ] Mobile Dashboard基本画面 (task-012)
-- [ ] Project作成画面 (task-013)
-- [ ] Pending Approval UI (task-019)
-- [ ] ReviewResult / QAResult API + 型 (task-015)
+
+**注記:** 同上（実装済み・テストありの根拠は「ファイル存在＋テスト存在」まで。E2E未検証）。
+
+- [x] Mobile Dashboard基本画面 (task-012) — 実装済み（`apps/mobile/app/index.tsx`, 476行）／実機・実運用未確認
+- [x] Project作成画面 (task-013) — 実装済み（`apps/mobile/app/create.tsx`, 199行）／実機・実運用未確認
+- [x] Pending Approval UI (task-019) — 実装済み（`apps/mobile/app/approvals.tsx`, 328行）／実機・実運用未確認
+- [x] ReviewResult / QAResult API + 型 (task-015) — 実装済み・テストあり（`routes/reviews.ts` + `reviews.test.ts`）／E2E未検証
 
 ### Phase B: Task Watchdog ✅
 - [x] 停滞検出（CommandKind 別閾値） — stallDetector.ts
@@ -196,12 +203,28 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 
 目的: Project Creation Flow を動かす
 
-- [ ] 仕様書入力 → Project Memory生成
-- [ ] CTO AI: Roadmap・Task自動生成
-- [ ] Context Manager AI: Context Pack生成
-- [ ] Developer AI: 実装Job実行（Sandbox経由）
-- [ ] Meta Reviewer AIの自動実行（全PR前に）
-- [ ] Summary Engine: Dashboard自動更新
+**注記（2026-07-06実態確認）:** 個別コンポーネントは実装済み・APIとして登録済みだが、
+「仕様書入力からDashboard更新までの一連の流れが実際につながって動くか」（Project Creation Flow
+全体のE2E疎通）はまだ検証していない。次タスク「MVP E2E疎通確認」で確認する。
+
+- [x] 仕様書入力 → Project Memory生成 — 実装済み（`routes/ctoAi.ts` POST `/api/cto/analyze`、
+      `specAnalyzer.ts`/`projectMemoryWriter.ts`）／E2E未検証
+- [x] CTO AI: Roadmap・Task自動生成 — 実装済み（`roadmapGenerator.ts`/`roadmapWriter.ts`、
+      POST `/api/cto/generate-roadmap`）／E2E未検証
+- [x] Context Manager AI: Context Pack生成 — 実装済み（`routes/contextPack.ts`）／E2E未検証
+- [x] Developer AI: 実装Job実行（Sandbox経由） — 実装済み（`routes/developerAi.ts`。
+      Sandbox実行自体はjobRunner/Docker分離に委譲）／E2E未検証
+- [ ] Meta Reviewer AIの自動実行（全PR前に） — 1-Bで基盤は実装済み（GitHub Actions
+      `meta-review.yml`）だが、ローカル開発時の自動実行は`postTestHook.ps1`が`exit 0`のみで
+      停止中（R-006既知課題）。**実運用未確認のまま**
+- [x] Summary Engine: Dashboard自動更新 — 実装済み（`routes/summaryEngine.ts`）／E2E未検証
+
+### 次タスク: MVP E2E疎通確認（未着手）
+
+- [ ] 仕様書入力→CTO AI→Context Pack→Developer AI→Job実行→Review→Dashboard更新の一連の
+      流れが実際につながって動くかを確認する（Project/Task/Job CRUD API・API token認証・
+      Mobile Dashboard・Pending Approval UIを含む）。個別コンポーネントは実装済みだが、
+      これらが組み合わさって動くかは未検証。MVP完成の実質的なゴール判定となるタスク
 
 ---
 
