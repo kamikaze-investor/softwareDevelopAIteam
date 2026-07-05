@@ -163,7 +163,7 @@ Step R2までで型・生成関数を用意したFinal Review Packetに続き、
 
 **呼び出しタイミング（11-1章のReview Levelと連動）:**
 - Level 0: 呼ばない
-- Level 1: 呼ばない（既存`postReviewer.ts`のpostReviewのみ。Gemini Flashは人間向け報告のReport Translationにのみ関与）
+- Level 1: 呼ばない（原則Gemini不要。11-1章の「Level 1 → Level 2への繰り上げ条件」に該当する場合のみLevel 2として扱いStepレビューを呼ぶ。Gemini Flashは人間向け報告のReport Translationにのみ関与）
 - Level 2: 4章のStep単位実装フローの通り、**Mechanical Safety Checks通過後・次Step着手前**に呼ぶ
 - Level 3: Gemini Risk Review・Alignment Reviewが優先されるため、Stepレビューは補助的に使う程度に留める
 
@@ -331,9 +331,19 @@ ClaudeがCodexへ作業指示を書く前に、内部で以下を自問する（
 | Level | 対応するリスク分類 | 実行主体 | 関与するレビュー | 人間確認 |
 |---|---|---|---|---|
 | **Level 0**（軽微） | Lowのうちtypo/コメント/README軽微修正など | Codex実装のみ | Gemini不要（Mechanical Safety Checksのみ） | 不要 |
-| **Level 1**（通常実装） | Low | Codex実装 | Gemini postReview（既存`postReviewer.ts`）+ 必要ならGemini Flashで人間向け報告（Report Translation） | 原則不要 |
-| **Level 2**（中リスク） | Medium | Claudeが計画、CodexまたはClaudeが実装 | Gemini preReview/postReview（既存`preReviewer.ts`/`postReviewer.ts`）。warning/uncertainならChatGPTレビュー | 原則不要 |
+| **Level 1**（通常実装） | Low | Codex実装 | **原則Gemini不要**（既存のtest/typecheck等の検証で担保）。人間向け報告が必要な場合のみGemini Flashで報告（Report Translation） | 原則不要 |
+| **Level 2**（中リスク） | Medium | Claudeが計画、CodexまたはClaudeが実装 | Gemini preReview/postReview（既存`preReviewer.ts`/`postReviewer.ts`）+ Gemini Flash Stepレビュー（6-1章）。warning/uncertainならChatGPTレビュー | 原則不要 |
 | **Level 3**（高リスク） | High | Claudeが設計 | Gemini Risk Review（`targetProjectRiskScan.ts`）+ Alignment Review（`alignmentCheck.ts`）+ ChatGPT判断レビュー | Human/CEO確認必須（承認後に実装） |
+
+**Level 1 → Level 2への繰り上げ条件（いずれか該当する場合、Level 1のままにせずLevel 2として扱う）:**
+```
+- 差分の拡大（当初想定より変更範囲が広がった）
+- 実装内容に不確実性がある（判断に迷う点がある）
+- 複数ファイルにまたがる変更
+- レビュー運用・AI役割分担に関わるdocs変更（本ドキュメント・AGENTS.md・CLAUDE.md等）
+- 安全境界に近い変更（DB/認証/権限/外部サービス/課金/本番/破壊的変更に近い・隣接する変更）
+```
+上記に該当しない通常のLevel 1（typo修正に次ぐ程度の小さな変更・軽微なUI改善・テスト追加等）は、Gemini postReviewを都度実行する必要はなく、既存の検証（test/typecheck）で担保してよい。
 
 **Codex/Claudeの振り分け基準:** Codexは既存実装に沿った小さな変更・軽微修正・テスト修正・型エラー修正・ドキュメント更新を担当する（Level 0-1が基本、Level 2でも定型的な修正はCodexが担当してよい）。DB・認証・権限・外部サービス・課金・本番環境・package変更・破壊的変更・設計判断が必要な変更（Level 2の一部〜Level 3）はClaudeが担当し、Codexは自己判断で進めずClaudeへ上げる。
 
