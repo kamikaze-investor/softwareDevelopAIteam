@@ -113,7 +113,7 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 | 役割 | 対応する既存実装 | 状態 |
 |---|---|---|
 | Mechanical Safety Checks | `safetyVerifier.ts`（12項目チェック）・`approvalLevelClassifier.ts`（Mechanical Gate） | 実装済み (b159d73, 3b3d1fb) |
-| Risk Scan | `targetProjectRiskScan.ts`（severity付き） | 実装済み・観察モードで接続済み (d16a709〜afab85c)。ログ観察期間中 |
+| Risk Scan | `targetProjectRiskScan.ts`（severity付き） | 実装済み・観察モードで接続済み (d16a709〜afab85c)。観察結果は`review_observation.jsonl`へ永続化済み (cc9c95f)。ログ観察期間中 |
 | commitGate | `commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続 (351840f)。接続設計完了（仕様書6-2章）。safetyVerifier/preReviewer/postReviewerが未接続のため、接続時は観察モードに限定する必要あり |
 | 既存Gemini Reviewer（実行ブロック権限あり） | `preReviewer.ts` / `postReviewer.ts` / `reviewerAdapter.ts` | 実装済み・未接続 (a7d3f81)。**本セクションのGemini Flash Stepレビューとは別物** |
 
@@ -150,8 +150,12 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
       safetyVerifierは12項目中8項目が既存情報で評価可能（残り4項目はtypecheck/test実行結果3項目・
       postReviewResultが必要な1項目でfail-closedのまま観察）、preReviewerは実装前タイミングへの接続と
       target_project向けpolicy判定という2つの未解決課題があるため別トラックに切り出し
-- [ ] Step R4-A（実装）: postReviewerの観察モード接続（Gemini Step Reviewブロック直後、
-      既存post-diffデータを流用。blocked:trueでもJobを止めない）
+- [x] Step R4-A（実装）: postReviewerの観察モード接続（Gemini Step Reviewブロック直後、
+      既存post-diffデータを流用。blocked:trueでもJobを止めない。コミット5de0f15）
+- [x] Review Observation Log（最小永続化）: Risk Scan/Gemini Step Review/postReviewの観察結果を
+      `data/logs/review_observation.jsonl`へappend-only記録（`observationLog.ts`。コミットcc9c95f）。
+      2-3章「効果検証可能性の原則」の是正実装 — 観察モードの結果が永続化されず後から評価できない
+      問題を解消
 - [ ] Step R4-B（実装）: safetyVerifierの観察モード接続（R4-Aの後。typecheck/test実行結果は
       未指定のままfail-closedで観察。overallPassed:falseでもJobを止めない）
 - [ ] Step R4-C（実装）: commitGateの観察モード接続（仕様書6-2章の設計に基づく。
@@ -197,6 +201,10 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 - [ ] Drift Detection
 - [ ] Health Metrics
 - [ ] Notification System
+- [ ] 効果検証可能性の原則の本格検討（MVP後の改善課題）: 改善・監視・レビュー・自動判定・最適化・
+      安全化など、何かを良くする目的で仕組みを追加する場合は、後から客観データで効果を判断できる
+      状態にする。ただしMVP段階では過剰な設計負荷を避け、まずは`review_observation.jsonl`による
+      観察データ蓄積を優先する（詳細は`docs/multi_ai_step_review_flow.md` 2-3章）
 
 ### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
 
