@@ -20,6 +20,8 @@ import { runStepReview, createNotRunStepReviewResult } from './approvalLevel/ste
 import type { StepReviewResult } from './approvalLevel/stepReview.js'
 import { runPostReview } from './approvalLevel/postReviewer.js'
 import type { PostReviewResult } from './approvalLevel/postReviewer.js'
+import { runSafetyVerification } from './approvalLevel/safetyVerifier.js'
+import type { SafetyVerificationResult } from './approvalLevel/safetyVerifier.js'
 import { appendObservationLog } from './approvalLevel/observationLog.js'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
@@ -90,6 +92,15 @@ export interface JobRunResult {
    * postReview呼び出しに失敗した場合はundefinedのまま（Jobは継続）。
    */
   postReviewResult?: PostReviewResult
+  /**
+   * safetyVerifier結果（Step R4-B・観察モード）。
+   * targetProjectRiskScanResult.highestSeverity が medium/high の場合のみ呼び出す
+   * （postReviewer/Gemini Step Reviewと同じ既存シグナルを流用。新しい分類器は作らない）。
+   * 12項目中、TYPECHECK/RELATED_TESTS/FULL_TESTSの3項目は実行結果を渡していないため
+   * 常にfail-closed（overallPassed:falseの主要因になり得る。危険検出とは限らない）。
+   * 呼び出し自体に失敗しても（想定外入力・実装バグ等）Jobは止めず、undefinedのまま。
+   */
+  safetyVerificationResult?: SafetyVerificationResult
 }
 
 /**
@@ -496,6 +507,33 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   }
   // ── postReviewer接続終端 ─────────────────────────────────────────────────
 
+  // ── safetyVerifier接続（Step R4-B・観察モード・非停止） ─────────────────────────
+  // 既存Risk Scan/Step Review/postReviewと同じ呼び出し条件（severity: medium/high）を流用。
+  // 新しい分類器は作らない。runSafetyVerification()は本来例外を投げない純粋関数だが、
+  // 観察モードでの接続であることを明確にするため、想定外入力・実装バグを含めてtry/catchで包む。
+  // catch時はJobを止めずconsole.warnのみに留める。
+  // 12項目中TYPECHECK/RELATED_TESTS/FULL_TESTSの3項目は実行結果を渡していないためfail-closed。
+  // これは危険検出ではなく未接続項目によるものであり、blockingFailuresで区別できるようにする。
+  let safetyVerificationResult: SafetyVerificationResult | undefined
+  if (isRiskSeverityMediumOrHigh) {
+    try {
+      safetyVerificationResult = runSafetyVerification({
+        jobId: job.id,
+        taskId: job.taskId,
+        changedFiles: postChangedFiles,
+        diffText: postDiffText,
+        approvalLevelResult,
+        repoRoot: job.safeCommand.workingDir,
+        postReviewAlignmentVerdict: postReviewResult?.alignmentVerdict,
+      })
+      console.log(`[jobRunner] safetyVerifier: overallPassed=${safetyVerificationResult.overallPassed} blockingFailures=${safetyVerificationResult.blockingFailures.join(',')}`)
+    } catch (err) {
+      const errorKind = err instanceof Error ? err.constructor.name : typeof err
+      console.warn(`[jobRunner] safetyVerifier呼び出し失敗（Jobは継続）: jobId=${job.id} taskId=${job.taskId} errorKind=${errorKind}`)
+    }
+  }
+  // ── safetyVerifier接続終端 ───────────────────────────────────────────────
+
   // Review Observation Log（最小永続化。書き込み失敗はobservationLog.ts内部で吸収されJobを止めない）
   appendObservationLog({
     jobId: job.id,
@@ -505,6 +543,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     targetProjectRiskScanResult,
     stepReviewResult,
     postReviewResult,
+    safetyVerificationResult,
   })
 
   const resolved = resolveCommand(job.safeCommand)
@@ -574,6 +613,7 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     targetProjectRiskScanResult,
     stepReviewResult,
     postReviewResult,
+    safetyVerificationResult,
   }
 }
 

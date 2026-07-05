@@ -1842,3 +1842,85 @@ describe('Review Observation Log 接続（観察結果の最小永続化）', ()
     expect(appendObservationLogMock).not.toHaveBeenCalled()
   })
 })
+
+describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    execFileSyncMock.mockReturnValue('')
+  })
+
+  it('Risk Scan severity: medium → safetyVerificationResultが計算され、JobRunResultに含まれる', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.safetyVerificationResult).toBeDefined()
+    expect(result.safetyVerificationResult?.checks).toHaveLength(12)
+    expect(result.status).toBe('success')
+  })
+
+  it('overallPassed:falseであってもJobのstatusはsuccessのまま（観察モードであることの確認）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    // typecheck/test実行結果を渡していないため、TYPECHECK/RELATED_TESTS/FULL_TESTSがfail-closedになり
+    // overallPassedはfalseになる想定（危険検出ではなく未接続項目による）。それでもJobは止めない。
+    expect(result.safetyVerificationResult?.overallPassed).toBe(false)
+    expect(result.safetyVerificationResult?.blockingFailures).toEqual(
+      expect.arrayContaining(['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS']),
+    )
+    expect(result.status).toBe('success')
+  })
+
+  it('Risk Scan severity: low/none → safetyVerificationResultは呼ばれずundefinedのまま', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
+      return ''
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.safetyVerificationResult).toBeUndefined()
+  })
+
+  it('AI CLI失敗時、safetyVerificationResultはundefinedのまま（scanポイントに到達しない）', async () => {
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const job = createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job)
+
+    expect(result.status).toBe('failed')
+    expect(result.safetyVerificationResult).toBeUndefined()
+  })
+
+  it('既存Approval Gateがblock_until_approvedの場合、safetyVerificationResultはundefinedのまま', async () => {
+    resolvePolicyMock.mockReturnValue({
+      policy: 'block_until_approved',
+      reason: 'CRITICAL risk — CEO approval required',
+      apiAvailable: true,
+    })
+
+    const result = await runJob(createJob())
+
+    expect(result.status).toBe('blocked')
+    expect(result.safetyVerificationResult).toBeUndefined()
+  })
+})

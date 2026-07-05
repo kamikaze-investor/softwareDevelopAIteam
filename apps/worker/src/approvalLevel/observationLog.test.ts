@@ -56,6 +56,27 @@ describe('buildObservationLogEntry', () => {
           blocked: false,
           decidedAt: '2026-01-01T00:00:00.000Z',
         },
+        safetyVerificationResult: {
+          jobId: 'job-1',
+          taskId: 'task-1',
+          overallPassed: false,
+          checks: [
+            { id: 'UNEXPECTED_FILES', passed: true, blocking: true, detail: 'x' },
+            { id: 'MECHANICAL_GATE_FILES', passed: true, blocking: true, detail: 'x' },
+            { id: 'POST_TEST_HOOK', passed: true, blocking: true, detail: 'x' },
+            { id: 'META_REVIEW_CODE', passed: true, blocking: true, detail: 'x' },
+            { id: 'APPROVAL_GATE_WEAKENING', passed: true, blocking: true, detail: 'x' },
+            { id: 'PERMISSION_GUARD_WEAKENING', passed: true, blocking: true, detail: 'x' },
+            { id: 'SECRET_SCAN_WEAKENING', passed: true, blocking: true, detail: 'x' },
+            { id: 'OUTSIDE_REPO_FILES', passed: true, blocking: true, detail: 'x' },
+            { id: 'TYPECHECK', passed: false, blocking: true, detail: 'typecheckが未実行' },
+            { id: 'RELATED_TESTS', passed: false, blocking: true, detail: '関連テストが未実行' },
+            { id: 'FULL_TESTS', passed: false, blocking: true, detail: '全テストが未実行' },
+            { id: 'PURPOSE_DIFF_ALIGNMENT', passed: true, blocking: true, detail: 'Post-Review verdict: aligned' },
+          ],
+          blockingFailures: ['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS'],
+          verifiedAt: '2026-01-01T00:00:00.000Z',
+        },
       }),
     )
 
@@ -68,6 +89,10 @@ describe('buildObservationLogEntry', () => {
     expect(entry.postReview.verdict).toBe('approved')
     expect(entry.postReview.confidence).toBe(0.9)
     expect(entry.postReview.alignmentVerdict).toBe('aligned')
+    expect(entry.safetyVerification.overallPassed).toBe(false)
+    expect(entry.safetyVerification.blockingFailures).toEqual(['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS'])
+    expect(entry.safetyVerification.totalChecksCount).toBe(12)
+    expect(entry.safetyVerification.supportedChecksCount).toBe(9)
   })
 
   it('結果が未計算（undefined）の場合、対応するフィールドはnullになる', () => {
@@ -77,6 +102,10 @@ describe('buildObservationLogEntry', () => {
     expect(entry.riskScan.issueLabels).toEqual([])
     expect(entry.stepReview.status).toBeNull()
     expect(entry.postReview.verdict).toBeNull()
+    expect(entry.safetyVerification.overallPassed).toBeNull()
+    expect(entry.safetyVerification.blockingFailures).toEqual([])
+    expect(entry.safetyVerification.supportedChecksCount).toBeNull()
+    expect(entry.safetyVerification.totalChecksCount).toBeNull()
   })
 
   it('rawResponse（Gemini生応答）は一切含まれない', () => {
