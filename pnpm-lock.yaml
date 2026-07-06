@@ -50,6 +50,9 @@ importers:
       '@ai-team/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@babel/runtime':
+        specifier: 7.29.7
+        version: 7.29.7
       expo:
         specifier: ~51.0.0
         version: 51.0.39(@babel/core@7.29.7)(@babel/preset-env@7.29.7(@babel/core@7.29.7))(react-native@0.74.0(@babel/core@7.29.7)(@babel/preset-env@7.29.7(@babel/core@7.29.7))(@types/react@18.2.79)(react@18.2.0))(react@18.2.0)
@@ -63,9 +66,6 @@ importers:
         specifier: 0.74.0
         version: 0.74.0(@babel/core@7.29.7)(@babel/preset-env@7.29.7(@babel/core@7.29.7))(@types/react@18.2.79)(react@18.2.0)
     devDependencies:
-      '@types/node':
-        specifier: ^20.19.41
-        version: 20.19.41
       '@types/react':
         specifier: ~18.2.0
         version: 18.2.79
