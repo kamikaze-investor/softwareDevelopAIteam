@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "AI Dev Team",
+    "slug": "ai-dev-team-mobile",
+    "version": "0.1.0",
+    "scheme": "ai-dev-team",
+    "android": {
+      "package": "com.nakagawa.aidevteam"
+    },
+    "ios": {
+      "bundleIdentifier": "com.nakagawa.aidevteam"
+    }
+  }
+}
