@@ -219,12 +219,14 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
       停止中（R-006既知課題）。**実運用未確認のまま**
 - [x] Summary Engine: Dashboard自動更新 — 実装済み（`routes/summaryEngine.ts`）／E2E未検証
 
-### 次タスク: MVP E2E疎通確認（未着手）
+### 次タスク: MVP E2E疎通確認（E2E-1〜E2E-4 実施済み）
 
-- [ ] 仕様書入力→CTO AI→Context Pack→Developer AI→Job実行→Review→Dashboard更新の一連の
+- [x] 仕様書入力→CTO AI→Context Pack→Developer AI→Job実行→Review→Dashboard更新の一連の
       流れが実際につながって動くかを確認する（Project/Task/Job CRUD API・API token認証・
-      Mobile Dashboard・Pending Approval UIを含む）。個別コンポーネントは実装済みだが、
-      これらが組み合わさって動くかは未検証。MVP完成の実質的なゴール判定となるタスク
+      Mobile Dashboard・Pending Approval UIを含む）。E2E-1（API/DB疎通）・E2E-2（Worker Job実行）・
+      E2E-3（AI routes mock疎通）・E2E-4（Android実機Expo Go起動・API疎通・Project一覧表示・
+      主要ボタン操作）まで確認済み（コミット be0a5b5〜9b3121c）。Project作成画面・Pending Approval UIの
+      個別操作確認、Worker/API/Mobile同時起動での通し確認は未実施
 
 ---
 
@@ -242,6 +244,17 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
       安全化など、何かを良くする目的で仕組みを追加する場合は、後から客観データで効果を判断できる
       状態にする。ただしMVP段階では過剰な設計負荷を避け、まずは`review_observation.jsonl`による
       観察データ蓄積を優先する（詳細は`docs/multi_ai_step_review_flow.md` 2-3章）
+- [ ] Mobile: Dashboard/approvals間の画面遷移遅延の原因調査（E2E-4で発見。主要操作は
+      ブロックしていないためMVP後のUX改善候補として保留）
+- [ ] Mobile: Dashboardの`ScrollView`＋大量ProjectCard＋N+1 fetch（Project毎にTask/Job取得）の
+      改善検討（`FlatList`化、表示中カードのみfetch、集約API利用等）。Project数が多い場合
+      （`Projects (559)`等）の描画・fetch負荷増大に備える
+- [ ] API: 承認待ち一覧専用エンドポイントの必要性確認（現状mobile側で全Project/Task/Jobを
+      巡回して承認待ちを探している可能性があり、専用APIが必要になるかもしれない）
+- [ ] Mobile: Project詳細画面の新規実装（`ProjectCard`タップ時の遷移。タップ無反応はバグではなく
+      未実装のため。`onPress`追加・詳細画面作成は別タスクとして着手）
+- [ ] 開発DBのテストデータ整理（`Projects (559)`等、蓄積されたテストデータの扱い方針決定。
+      表示件数・UXへの影響はあるが、誤って必要データを消さないよう方針を決めてから対応する）
 
 ### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
 
