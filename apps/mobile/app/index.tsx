@@ -237,61 +237,65 @@ export default function Dashboard() {
   }
 
   return (
-    <ScrollView
-      contentContainerStyle={styles.content}
-      refreshControl={
-        <RefreshControl refreshing={refreshing} onRefresh={refresh} />
-      }
-      style={styles.container}
-    >
-      <Text style={styles.title}>AI Development Team OS</Text>
-      <Text style={styles.subtitle}>CEO Dashboard</Text>
-
-      <Text style={styles.projectCount}>Projects ({projects.length})</Text>
-
-      {error !== null && (
-        <View style={styles.errorBox}>
-          <Text style={styles.errorText}>{error}</Text>
-        </View>
-      )}
-
-      {projects.length === 0 && error === null && (
-        <Text style={styles.empty}>No projects yet</Text>
-      )}
-
-      {projects.map((project) => (
-        <ProjectCard key={project.id} project={project} />
-      ))}
-
-      <TouchableOpacity
-        accessibilityRole="button"
-        onPress={() => router.push('/create')}
-        style={styles.createButton}
+    <View style={styles.container}>
+      <ScrollView
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={refresh} />
+        }
+        style={styles.scrollArea}
       >
-        <Text style={styles.createText}>＋ 新規プロジェクト</Text>
-      </TouchableOpacity>
+        <Text style={styles.title}>AI Development Team OS</Text>
+        <Text style={styles.subtitle}>CEO Dashboard</Text>
 
-      <TouchableOpacity
-        accessibilityRole="button"
-        onPress={() => router.push('/approvals')}
-        style={styles.approvalButton}
-      >
-        <Text style={styles.approvalText}>承認待ち一覧</Text>
-        <View style={styles.approvalBadge}>
-          <Text style={styles.approvalBadgeText}>
-            {pendingApprovalCount}件
-          </Text>
-        </View>
-      </TouchableOpacity>
+        <Text style={styles.projectCount}>Projects ({projects.length})</Text>
 
-      <TouchableOpacity
-        accessibilityRole="button"
-        onPress={load}
-        style={styles.refreshButton}
-      >
-        <Text style={styles.refreshText}>Refresh</Text>
-      </TouchableOpacity>
-    </ScrollView>
+        {error !== null && (
+          <View style={styles.errorBox}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
+
+        {projects.length === 0 && error === null && (
+          <Text style={styles.empty}>No projects yet</Text>
+        )}
+
+        {projects.map((project) => (
+          <ProjectCard key={project.id} project={project} />
+        ))}
+      </ScrollView>
+
+      <View style={styles.footer}>
+        <TouchableOpacity
+          accessibilityRole="button"
+          onPress={() => router.push('/create')}
+          style={styles.createButton}
+        >
+          <Text style={styles.createText}>＋ 新規プロジェクト</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          accessibilityRole="button"
+          onPress={() => router.push('/approvals')}
+          style={styles.approvalButton}
+        >
+          <Text style={styles.approvalText}>承認待ち一覧</Text>
+          <View style={styles.approvalBadge}>
+            <Text style={styles.approvalBadgeText}>
+              {pendingApprovalCount}件
+            </Text>
+          </View>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          accessibilityRole="button"
+          onPress={load}
+          style={styles.refreshButton}
+        >
+          <Text style={styles.refreshText}>Refresh</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
   )
 }
 
@@ -367,7 +371,20 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: 16,
-    paddingBottom: 40,
+    // 固定フッター（新規プロジェクト/承認待ち一覧/Refreshボタン）と重ならないよう、
+    // 一覧末尾に十分な余白を確保する。
+    paddingBottom: 240,
+  },
+  footer: {
+    backgroundColor: '#0a0a0a',
+    borderTopColor: '#2a2a2a',
+    borderTopWidth: 1,
+    paddingBottom: 24,
+    paddingHorizontal: 16,
+    paddingTop: 8,
+  },
+  scrollArea: {
+    flex: 1,
   },
   createButton: {
     alignItems: 'center',
