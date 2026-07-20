@@ -27,6 +27,42 @@ CEO（人間）
 - Docker によって物理的に分離（Control → `:ro` マウント、Target → `rw` マウント）
 - Permission Guard / File Change Guard / Approval Gate / Meta Review の多層防御
 
+### 運用形態（要約）: VPS常駐稼働 + スマホ操作
+
+**正本**: `specs/11_runtime_environment.md`「3b. 運用形態（正本）: VPS常駐稼働 + スマホ操作」
+
+AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間）はスマホから Web UI（未実装・将来候補）または Mobile app（`apps/mobile`, 実装済み）経由で操作する。ローカルPC起動は開発・検証用の一時形態であり、本番運用形態ではない。詳細な接続関係・後続タスクは正本を参照。
+
+### Implemented MVP Baseline（現在すでに動いているMVP機能・正本）
+
+**位置づけ**: 本節は、現在すでに実装・動作しているMVP機能のベースラインである。
+
+`specs/00_constitution.md` / `specs/13_future_system_architecture.md` / `specs/20_token_efficient_intelligence_policy.md`
+に記載する将来思想・将来アーキテクチャは、本節に列挙する既存機能を **自動的に上書き・削除・弱体化しない**。
+これらを削除・置換する場合は、明示的なCEO承認を必要とする。
+
+| 機能 | 実装箇所 | 状態 |
+|---|---|---|
+| Project / Task / Job 基本管理 | `apps/api/src/routes/{projects,tasks,jobs}.ts` | 実装済み・テストあり |
+| API（Fastify） | `apps/api/src` | 実装済み・テストあり |
+| Worker / Job Runner | `apps/worker/src/jobRunner.ts`, `jobStateManager.ts`, `executionLogStore.ts` | 実装済み・テストあり |
+| Approval Gate | `apps/api/src/routes/approvalGate.ts`, `apps/worker/src/guards/approvalGate.ts` | 実装済み・テストあり |
+| Risk Control | `apps/worker/src/guards/{safetyAuditor,gatePolicy,gateProcessor}.ts` | 実装済み・テストあり |
+| Policy Enforcement | `apps/worker/src/guards/permissionGuard.ts`, `gateClient.ts` | 実装済み・テストあり |
+| Notification | `apps/worker/src/notifier/{notifier,lineAdapter,slackAdapter}.ts` | 実装済み・テストあり |
+| health-score | `apps/api/src/routes/knowledgeGraph.ts`（`GET /kg/health-score`）、`packages/shared/src/types/project.ts`の`healthScore` | 実装済み・テストあり |
+| Watchdog | `apps/worker/src/watchdog/{watchdog,stallDetector}.ts` | 実装済み・テストあり |
+| stale / expired approval cleanup | `apps/api/src/routes/{approvalGate,approvals}.ts`, `apps/worker/src/guards/{gateClient,gatePolicy}.ts`, `apps/worker/src/jobStateManager.ts` | 実装済み・テストあり |
+| Mobile app | `apps/mobile/app/{index,create,approvals}.tsx` | 実装済み |
+| Android実機Expo Go起動・API疎通・Project一覧表示 | 同上（コミット `be0a5b5`〜`9b3121c`） | 実機確認済み・E2E-4 |
+| 下部フッター固定表示 | `apps/mobile/app/index.tsx`（`6b8eff3`） | 実機確認済み |
+| Expo app config | `apps/mobile/app.json`（`9b3121c`） | 実機確認済み |
+| 既存テスト群 | `apps/**/*.test.ts`（52ファイル） | 全パス確認済み |
+
+**将来構想との関係**: 添付仕様（`specs/00_constitution.md`ほか）が定義するTeam Extension / Service Extension / Health Engine /
+Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記いずれの機能も置き換えるものではない。
+現行のCore/Team概念との対応関係は `specs/13_future_system_architecture.md` の現状マッピングを参照。
+
 ---
 
 ## 2. ディレクトリ構成

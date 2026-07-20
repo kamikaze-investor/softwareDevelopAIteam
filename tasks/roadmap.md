@@ -256,6 +256,42 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 - [ ] 開発DBのテストデータ整理（`Projects (559)`等、蓄積されたテストデータの扱い方針決定。
       表示件数・UXへの影響はあるが、誤って必要データを消さないよう方針を決めてから対応する）
 
+### VPS常駐運用化（本番運用形態への移行）
+
+**前提（正本）:** `docs/PROJECT_CURRENT_STATE.md`「運用形態（正本）: VPS常駐稼働 + スマホ操作」
+および `specs/11_runtime_environment.md` 3章に記載の通り、API/Workerは最終的にVPS上で常駐稼働し、
+ローカルPC起動は開発・検証用の一時形態である。以下は本番運用形態へ移行するための後続実装タスク（未着手）。
+
+- [ ] API / Worker の Docker化（本番常駐用コンテナ定義。既存`sandbox/`はAI実行サンドボックス用であり別物）
+- [ ] HTTPS化（証明書・リバースプロキシ）
+- [ ] 認証強化の要否確認（現状API Token方式。スマホからの外部アクセスを前提にした強化要否を検討）
+- [ ] ヘルスチェック（`docs/vps_app_runtime_standard.md`準拠の`/api/health`。API側実装済み・Worker側未確認）
+- [ ] ログ保存（VPS上での永続化・ローテーション方針）
+- [ ] 再起動耐性（プロセスマネージャ導入・クラッシュ時自動再起動・OS再起動後の自動起動）
+
+### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
+
+**前提（正本）:** `specs/00_constitution.md`（最上位思想）、`specs/13_future_system_architecture.md`
+（将来のCore/Service Extension/Team Extension構造・現状マッピング）、
+`specs/20_token_efficient_intelligence_policy.md`（AI利用量抑制方針）。
+
+**重要:** 以下はいずれもMVP完成後の将来構想であり、今すぐ実装するものではない。MVP開発中に先回りして
+実装しない。現行のAPI / Worker / Approval Gate / Risk Control / Watchdog / Mobile app等は
+`docs/PROJECT_CURRENT_STATE.md`「Implemented MVP Baseline」に明示された維持対象であり、
+本セクションの将来構想によって削除・置換されることはない。
+
+- [ ] Extension Registry正式化・Service Extension Interface定義（Telemetry/Notification/Knowledge等の抽象化）
+- [ ] Development TeamのTeam Extension化（現状はClaude Code/Codex/Geminiが`apps/worker`に直接組み込まれた
+      単一構成。将来的にTeam概念として抽象化するかは要検討）
+- [ ] Team Health（Team単位の状態可視化。現状のProject単位health-scoreとは別軸）
+- [ ] Self Diagnosis Framework（観測のみ・変更なし。Token-Efficient Intelligence Policy準拠必須）
+- [ ] Improvement Planner（改善提案作成のみ・本番反映なし）
+- [ ] Problem-Driven Research（外部調査。具体的課題がある場合のみ開始）
+- [ ] Experiment（Replay/Shadow/Canary。本番反映前の段階的検証）
+- [ ] Personal Evolution / Profile Evolution / Core Evolution（CEO承認付き昇格フロー）
+- [ ] `docs/AI_TEAM_OS_DESIGN.md`「第3弾」（AI Reliability/KPI/Conflict Management/Learning Control/Rollback/
+      AI Runtime State）との重複整理（要整理・将来統合検討。今回は削除・置換しない）
+
 ### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
 
 **背景:**
