@@ -51,6 +51,61 @@ Mounted Target Repo
 
 ---
 
+# 3b. 運用形態（正本）: VPS常駐稼働 + スマホ操作
+
+本章が、AI Development Team OSの基本運用前提に関する **正本（canonical spec）** である。
+現状把握用の要約は `docs/PROJECT_CURRENT_STATE.md` に置き、本章を参照する。
+
+## 本番運用形態
+
+AI Development Team OSは最終的に **VPS上で常駐稼働** する。
+
+```text
+Backend API（apps/api） ・ Worker（apps/worker）
+  → VPS上でプロセスとして常駐起動し続ける
+  → CEOはローカルPCを起動・待機させる必要がない
+```
+
+CEO（人間）はスマホから以下のいずれか経由で操作する。
+
+```text
+Web UI（未実装・将来候補）
+または
+Mobile App（apps/mobile, 実装済み）
+```
+
+## ローカルPC起動の位置づけ
+
+ローカルPCでの起動（`pnpm --filter ... dev` 等によるローカル起動・E2E確認を含む）は
+**開発・検証用の一時形態** であり、正式な本番運用形態ではない。
+
+## 接続関係
+
+```text
+スマホ（CEO）
+  └─ Web UI（未実装・将来候補） または Mobile App（apps/mobile, 実装済み）
+        └─ HTTPS
+              └─ Backend API（apps/api, Fastify）※ VPS上で常駐
+                    └─ Job登録
+                          └─ Worker（apps/worker）※ VPS上で常駐
+                                └─ Docker Sandbox（本ドキュメント準拠）
+```
+
+## VPS運用に向けた後続タスク（未着手・実装は`tasks/roadmap.md`側で管理）
+
+VPS上での常駐稼働に必要な以下の項目は、本章では仕様として明示するに留め、実装タスクとしては
+`tasks/roadmap.md` Phase 3「VPS常駐運用化」に記載する。
+
+- Docker化（API / Workerの本番用コンテナ定義。本ドキュメントが定義するDocker Sandboxは
+  AI実行サンドボックス用であり、API/Worker自体の常駐コンテナ化とは別）
+- HTTPS化（証明書・リバースプロキシ）
+- 認証（現状はAPI Token方式のみ。スマホからの外部アクセスを前提にした認証強化の要否は別途検討）
+- ヘルスチェック（`docs/vps_app_runtime_standard.md`の`/api/health`標準に準拠）
+- ログ保存（VPS上での永続化・ローテーション方針）
+- 再起動耐性（プロセスマネージャ導入・クラッシュ時自動再起動・OS再起動後の自動起動）
+
+---
+
 # 4. Server Components
 
 ## Backend API
