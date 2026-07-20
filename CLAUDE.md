@@ -32,6 +32,11 @@ Human・CEO（Goal・Design Philosophy・外部サービス・課金・本番・
 変更内容はReview Level 0〜3に分類し、Levelに応じたレビュー・確認・エスカレーションを行う。
 詳細は `AGENTS.md` 3章・`docs/multi_ai_step_review_flow.md` を参照。
 
+**報告・説明の責務分離:** Claudeの作業報告は、非エンジニア向け説明ではなく、後続のChatGPT/Gemini/Claude自身が
+レビュー・判断に使える正確な作業報告（変更範囲・実行内容・検証結果・未解決点・リスク・コミット対象外ファイル）とする。
+CEOへの非エンジニア向け説明・翻訳はChatGPT（人間向け整理）またはGemini（Report Translation）が担当する。
+詳細は `docs/multi_ai_step_review_flow.md` 10-1章を参照。
+
 ---
 
 ## 3. Design Philosophy（絶対遵守）

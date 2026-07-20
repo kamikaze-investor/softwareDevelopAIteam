@@ -375,7 +375,9 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 
 ## 10-1. 人間向け報告フォーマット（Report Translation）
 
-人間への報告は、**Final Review Packet（9章）をGemini Flash（Report Translation）で非エンジニア向けに翻訳したもの**とする。人間向け報告専用の別テンプレートは作らない（9章のPacketと重複する新しい項目一覧を持たない）。ただし、Gemini Flashは翻訳係であり最終判断者ではない。コミット可否・設計判断・Goal/Design Philosophyに関わる判断・DB/認証/権限/外部サービス/本番影響の判断・warning/uncertain/blockedが出たケースは、Gemini Flash単独で完結させず、ChatGPTまたはHuman/CEOの判断に委ねる。
+**報告・説明の責務分離（前提）:** Claude自身が書く報告（本章の「通常報告5項目」・9章のFinal Review Packetいずれも含む）は、**非エンジニア向け説明ではなく、後続のChatGPT/Gemini/Claude自身がレビュー・判断に使える正確な作業報告**として書く。変更ファイル・変更内容・検証結果・未解決点・リスク・コミット対象外ファイルを明記し、1つの報告で「人間向け説明」と「AIレビュー向け技術報告」を無理に兼ねない。CEOが直接読む場合でも、Claudeは平易さより正確さ・レビューしやすさを優先する。Claudeへの作業指示（Claudeに何をさせるか）も同様に、技術的に正確・短め・レビューしやすい形式とする。
+
+人間への非エンジニア向け説明・翻訳は、**Final Review Packet（9章）またはClaudeの報告を、ChatGPT（人間向け整理。重要判断・コミット前判断時）またはGemini Flash（Report Translation。軽量な翻訳が必要な場合）が非エンジニア向けに翻訳したもの**とする。人間向け報告専用の別テンプレートは作らない（9章のPacketと重複する新しい項目一覧を持たない）。ただし、ChatGPT・Gemini Flashは翻訳・整理係であり最終判断者ではない。コミット可否・設計判断・Goal/Design Philosophyに関わる判断・DB/認証/権限/外部サービス/本番影響の判断・warning/uncertain/blockedが出たケースは、翻訳側で完結させず、ChatGPTまたはHuman/CEOの判断に委ねる。
 
 **2段階構成（通常時は軽量・必要時だけ詳細）:** 毎回15項目すべてを長く書くと、正常系でもCEOが読む負担・トークン消費が大きい。そのため報告は「通常報告（5項目）」を基本とし、下記の詳細化条件に該当する場合のみFinal Review Packet（9章）に沿って詳細化する。
 
