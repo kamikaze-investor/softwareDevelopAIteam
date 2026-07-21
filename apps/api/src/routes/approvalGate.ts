@@ -379,6 +379,12 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(requests)
   })
 
+  // GET /api/approval-requests/waiting
+  app.get('/approval-requests/waiting', async (_req, reply) => {
+    const requests = storage.approvalRequests.findWaiting()
+    return reply.send(requests)
+  })
+
   // GET /api/approval-requests/:id — 単体取得
   app.get<{ Params: { id: string } }>('/approval-requests/:id', async (req, reply) => {
     const request = storage.approvalRequests.findById(req.params.id)

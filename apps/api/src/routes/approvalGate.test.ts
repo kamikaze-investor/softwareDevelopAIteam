@@ -410,6 +410,58 @@ describe('findActiveByTaskId CONSUMED 除外', () => {
   })
 })
 
+describe('GET /api/approval-requests/waiting', () => {
+  it('returns only WAITING_FOR_USER requests', async () => {
+    await withApp(async (app) => {
+      const waiting = await createApprovalRequest(app, { taskId: 'waiting-task' })
+
+      const approved = await createApprovalRequest(app, { taskId: 'approved-task' })
+      await patchStatus(app, approved.id, 'APPROVED')
+
+      const rejected = await createApprovalRequest(app, { taskId: 'rejected-task' })
+      await patchStatus(app, rejected.id, 'REJECTED')
+
+      const consumed = await createApprovalRequest(app, { taskId: 'consumed-task' })
+      await patchStatus(app, consumed.id, 'APPROVED')
+      const consumedResult = await consumeRequest(app, consumed.id, {
+        currentCommit: consumed.targetCommit,
+        currentDiffHash: consumed.targetDiffHash,
+      })
+      expect(consumedResult.statusCode).toBe(200)
+
+      const { getStorage } = await import('../storage/index.js')
+      const expired = getStorage().approvalRequests.create({
+        taskId: 'expired-task',
+        targetBranch: 'feat/test',
+        targetCommit: 'abc123',
+        targetDiffHash: 'deadbeef',
+        riskLevel: 'HIGH',
+        requestedAction: 'merge feature branch',
+        status: 'EXPIRED',
+        expiresAt: new Date(Date.now() - 5000).toISOString(),
+        invalidIf: [],
+      })
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/approval-requests/waiting',
+      })
+
+      expect(res.statusCode).toBe(200)
+      const requests = parseBody<ApprovalRequest[]>(res.body)
+      const requestIds = new Set(requests.map(request => request.id))
+
+      expect(requestIds.has(waiting.id)).toBe(true)
+      expect(requests.find(request => request.id === waiting.id)?.status).toBe('WAITING_FOR_USER')
+      expect(requestIds.has(approved.id)).toBe(false)
+      expect(requestIds.has(rejected.id)).toBe(false)
+      expect(requestIds.has(consumed.id)).toBe(false)
+      expect(requestIds.has(expired.id)).toBe(false)
+      expect(requests.every(request => request.status === 'WAITING_FOR_USER')).toBe(true)
+    })
+  })
+})
+
 // ────────────────────────────────────────────────────────────
 // POST /api/gate/check
 // ────────────────────────────────────────────────────────────
