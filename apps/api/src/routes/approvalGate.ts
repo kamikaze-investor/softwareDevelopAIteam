@@ -7,11 +7,38 @@ import {
   runRiskReview,
   decideGateOutcome,
   buildApprovalRequest,
+  RISK_RULES,
   type ApprovalGateInput,
 } from '@ai-team/shared'
 
 function computeDiffHash(diffText: string): string {
   return createHash('sha256').update(diffText, 'utf-8').digest('hex')
+}
+
+const SECRET_SUSPECTED_IN_DIFF_LABEL = 'secret suspected in diff'
+const OTHER_RISK_FACTOR_DETECTED_LABEL = 'other risk factor detected'
+const SAFE_RISK_RULE_LABELS = new Set(RISK_RULES.map(rule => rule.label))
+const DIFF_SECRET_LABEL_PATTERN = /^diff:secret\([^)]*\)$/
+
+function sanitizeTriggeredRulesForApprovalRequest(triggeredRules: string[]): string[] {
+  const safeLabels: string[] = []
+
+  for (const label of triggeredRules) {
+    let safeLabel: string
+    if (SAFE_RISK_RULE_LABELS.has(label)) {
+      safeLabel = label
+    } else if (DIFF_SECRET_LABEL_PATTERN.test(label)) {
+      safeLabel = SECRET_SUSPECTED_IN_DIFF_LABEL
+    } else {
+      safeLabel = OTHER_RISK_FACTOR_DETECTED_LABEL
+    }
+
+    if (!safeLabels.includes(safeLabel)) {
+      safeLabels.push(safeLabel)
+    }
+  }
+
+  return safeLabels
 }
 
 // ────────────────────────────────────────────────────────────
@@ -327,8 +354,9 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       const input: ApprovalGateInput = {
         taskId, requestedAction, targetBranch, targetCommit, targetDiffHash, changedFiles,
       }
+      const safeTriggeredRules = sanitizeTriggeredRulesForApprovalRequest(riskReview.triggeredRules)
       approvalRequest = storage.approvalRequests.create(
-        buildApprovalRequest(input, riskReview.riskLevel)
+        buildApprovalRequest(input, riskReview.riskLevel, safeTriggeredRules)
       )
       sideEffects.push({ type: 'CREATED_APPROVAL_REQUEST', requestId: approvalRequest.id })
       newRequestId = approvalRequest.id

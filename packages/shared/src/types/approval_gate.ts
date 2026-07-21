@@ -41,6 +41,10 @@ export interface ApprovalRequest {
   riskLevel: RiskLevel
   /** 何をしようとしているか（人間が読む説明） */
   requestedAction: string
+  /** 変更対象ファイルパス一覧（ファイル内容・diff本文は含まない） */
+  changedFiles?: string[]
+  /** なぜ危険と判定されたか（CEOが読める安全なラベルのみ。secret種別等の生の値は含まない） */
+  triggeredRules?: string[]
   status: ApprovalGateStatus
   /**
    * 承認有効期限（ISO 8601）

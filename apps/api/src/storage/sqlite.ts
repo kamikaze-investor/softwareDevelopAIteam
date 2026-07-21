@@ -14,6 +14,18 @@ import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult,
 
 const now = () => new Date().toISOString()
 
+function parseStringArray(value: unknown): string[] {
+  if (typeof value !== 'string') return []
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : []
+  } catch {
+    return []
+  }
+}
+
 function makeDecisionId(): string {
   const d = new Date()
   const ymd = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
@@ -456,14 +468,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     create(data) {
       const req: ApprovalRequest = {
         ...data,
+        changedFiles: data.changedFiles ?? [],
+        triggeredRules: data.triggeredRules ?? [],
         id: `approval-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randomUUID().slice(0, 8)}`,
         createdAt: now(),
       }
       db.prepare(`
         INSERT INTO approval_requests
           (id, task_id, target_branch, target_commit, target_diff_hash, risk_level,
-           requested_action, status, expires_at, invalid_if, reason, created_at, reviewed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           requested_action, status, expires_at, invalid_if, changed_files, triggered_rules,
+           reason, created_at, reviewed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         req.id,
         req.taskId,
@@ -475,6 +490,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         req.status,
         req.expiresAt,
         JSON.stringify(req.invalidIf),
+        JSON.stringify(req.changedFiles ?? []),
+        JSON.stringify(req.triggeredRules ?? []),
         req.reason ?? null,
         req.createdAt,
         req.reviewedAt ?? null,
@@ -1078,6 +1095,8 @@ function deserializeApprovalRequest(row: any): ApprovalRequest {
     targetDiffHash: row.target_diff_hash,
     riskLevel: row.risk_level as ApprovalRequest['riskLevel'],
     requestedAction: row.requested_action,
+    changedFiles: parseStringArray(row.changed_files),
+    triggeredRules: parseStringArray(row.triggered_rules),
     status: row.status as ApprovalGateStatus,
     expiresAt: row.expires_at,
     invalidIf: JSON.parse(row.invalid_if ?? '[]') as string[],

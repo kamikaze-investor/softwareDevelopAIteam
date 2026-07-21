@@ -453,6 +453,8 @@ describe('GET /api/approval-requests/waiting', () => {
 
       expect(requestIds.has(waiting.id)).toBe(true)
       expect(requests.find(request => request.id === waiting.id)?.status).toBe('WAITING_FOR_USER')
+      expect(requests.find(request => request.id === waiting.id)?.changedFiles).toEqual([])
+      expect(requests.find(request => request.id === waiting.id)?.triggeredRules).toEqual([])
       expect(requestIds.has(approved.id)).toBe(false)
       expect(requestIds.has(rejected.id)).toBe(false)
       expect(requestIds.has(consumed.id)).toBe(false)
@@ -548,6 +550,16 @@ describe('POST /api/gate/check', () => {
       expect(body.continuationPolicy).toBe('continue_safe_work_only')
       expect(body.nextAction.action).toBe('wait_for_approval')
       expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
+      expect(body.approvalRequest?.changedFiles).toEqual(BASE_GATE_PAYLOAD.changedFiles)
+      expect(body.approvalRequest?.triggeredRules).toContain('DB migration / schema')
+
+      const getRes = await app.inject({
+        method: 'GET',
+        url: `/api/approval-requests/${body.approvalRequest?.id}`,
+      })
+      const stored = parseBody<ApprovalRequest>(getRes.body)
+      expect(stored.changedFiles).toEqual(BASE_GATE_PAYLOAD.changedFiles)
+      expect(stored.triggeredRules).toEqual(['DB migration / schema'])
     })
   })
 
@@ -1063,6 +1075,21 @@ describe('Step D: diffText シークレットスキャン', () => {
       expect(statusCode).toBe(200)
       expect(body.riskReview.riskLevel).toBe('CRITICAL')
       expect(body.riskReview.triggeredRules.some((r: string) => r.includes('API_KEY'))).toBe(true)
+      expect(body.approvalRequest?.triggeredRules).toEqual(['secret suspected in diff'])
+      const approvalRequestStr = JSON.stringify(body.approvalRequest)
+      expect(approvalRequestStr).not.toContain('API_KEY')
+      expect(approvalRequestStr).not.toContain('SECRET_KEY')
+      expect(approvalRequestStr).not.toContain('PASSWORD')
+      const getRes = await app.inject({
+        method: 'GET',
+        url: `/api/approval-requests/${body.approvalRequest?.id}`,
+      })
+      const stored = parseBody<ApprovalRequest>(getRes.body)
+      expect(stored.triggeredRules).toEqual(['secret suspected in diff'])
+      const storedStr = JSON.stringify(stored)
+      expect(storedStr).not.toContain('API_KEY')
+      expect(storedStr).not.toContain('SECRET_KEY')
+      expect(storedStr).not.toContain('PASSWORD')
       // レスポンスにシークレット値そのものが含まれないことを確認
       const bodyStr = JSON.stringify(body)
       expect(bodyStr).not.toContain('sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxx')

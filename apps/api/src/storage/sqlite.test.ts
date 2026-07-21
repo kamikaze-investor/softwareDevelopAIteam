@@ -270,6 +270,32 @@ describe('SQLiteStorage', () => {
       invalidIf: [],
     }
 
+    it('serializes and deserializes changedFiles and triggeredRules', () => {
+      const req = storage.approvalRequests.create({
+        ...BASE,
+        status: 'WAITING_FOR_USER',
+        changedFiles: ['apps/api/src/storage/schema.ts'],
+        triggeredRules: ['DB migration / schema'],
+      })
+
+      const found = storage.approvalRequests.findById(req.id)
+
+      expect(req.changedFiles).toEqual(['apps/api/src/storage/schema.ts'])
+      expect(req.triggeredRules).toEqual(['DB migration / schema'])
+      expect(found?.changedFiles).toEqual(['apps/api/src/storage/schema.ts'])
+      expect(found?.triggeredRules).toEqual(['DB migration / schema'])
+    })
+
+    it('defaults changedFiles and triggeredRules to empty arrays when omitted', () => {
+      const req = storage.approvalRequests.create({ ...BASE, status: 'WAITING_FOR_USER' })
+      const found = storage.approvalRequests.findById(req.id)
+
+      expect(req.changedFiles).toEqual([])
+      expect(req.triggeredRules).toEqual([])
+      expect(found?.changedFiles).toEqual([])
+      expect(found?.triggeredRules).toEqual([])
+    })
+
     it('expiresAt 超過 → updateStatus で EXPIRED に遷移し、reason/reviewedAt が保持される', () => {
       // APPROVED + reason + reviewedAt を持つリクエストを作成
       const req = storage.approvalRequests.create({ ...BASE, status: 'WAITING_FOR_USER' })

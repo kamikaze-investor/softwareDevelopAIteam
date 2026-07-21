@@ -201,9 +201,12 @@ export function decideGateOutcome(
 export function buildApprovalRequest(
   input: ApprovalGateInput,
   riskLevel: RiskLevel,
-  now: Date = new Date(),
+  triggeredRulesOrNow: string[] | Date = [],
+  now?: Date,
 ): Omit<ApprovalRequest, 'id' | 'createdAt'> {
-  const exp = computeExpiresAt(riskLevel, now)
+  const triggeredRules = Array.isArray(triggeredRulesOrNow) ? triggeredRulesOrNow : []
+  const requestTime = triggeredRulesOrNow instanceof Date ? triggeredRulesOrNow : (now ?? new Date())
+  const exp = computeExpiresAt(riskLevel, requestTime)
   return {
     taskId: input.taskId,
     targetBranch: input.targetBranch,
@@ -211,6 +214,8 @@ export function buildApprovalRequest(
     targetDiffHash: input.targetDiffHash,
     riskLevel,
     requestedAction: input.requestedAction,
+    changedFiles: [...input.changedFiles],
+    triggeredRules: [...triggeredRules],
     status: 'WAITING_FOR_USER',
     expiresAt: exp,
     invalidIf: [

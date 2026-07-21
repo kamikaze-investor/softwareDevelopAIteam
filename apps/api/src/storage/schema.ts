@@ -120,6 +120,8 @@ export const CREATE_TABLES = `
     status TEXT NOT NULL DEFAULT 'WAITING_FOR_USER',
     expires_at TEXT NOT NULL,
     invalid_if TEXT NOT NULL DEFAULT '[]',
+    changed_files TEXT NOT NULL DEFAULT '[]',
+    triggered_rules TEXT NOT NULL DEFAULT '[]',
     reason TEXT,
     created_at TEXT NOT NULL,
     reviewed_at TEXT
@@ -254,4 +256,6 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'jobs', column: 'approval_id', definition: 'TEXT' },
   { table: 'jobs', column: 'stdout_path', definition: 'TEXT' },
   { table: 'jobs', column: 'stderr_path', definition: 'TEXT' },
+  { table: 'approval_requests', column: 'changed_files', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { table: 'approval_requests', column: 'triggered_rules', definition: "TEXT NOT NULL DEFAULT '[]'" },
 ]
