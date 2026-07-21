@@ -63,6 +63,31 @@ AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間�
 Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記いずれの機能も置き換えるものではない。
 現行のCore/Team概念との対応関係は `specs/13_future_system_architecture.md` の現状マッピングを参照。
 
+### スマホ操作MVPの現在地（2026-07-21整理）
+
+**スマホ操作MVPの定義:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→AI作業の進捗を見る→
+危険操作は承認で止まる→Approval Gateの承認/却下を行う→完了結果・失敗理由を見る→必要に応じて再実行や
+追加指示を出す」という一連の開発サイクルを完結できる状態。VPS常駐稼働前提（`specs/11_runtime_environment.md`）
+と矛盾しないことも条件とする。
+
+**注記:** 以下の「未実装の重要項目」は、Implemented MVP Baseline（上記）に列挙した既存機能が
+存在しない・弱いという意味ではない。既存機能はそのまま維持対象であり、以下は**スマホ操作MVP到達のために
+新たに必要な残タスク**として扱う。詳細な実装タスクは `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
+
+**既に確認済みのMobile app機能:**
+- Android実機Expo Go起動・API疎通・Project一覧表示（Implemented MVP Baseline参照）
+- Project作成（`create.tsx`: 名前・Goal・Design Philosophy入力）
+- Project単位承認の一覧・承認/却下（`approvals.tsx`。`apps/api/src/routes/approvals.ts`経由）
+- 下部フッター固定表示・Expo app config
+
+**未実装の重要項目（スマホ操作MVP到達に必要な残タスク）:**
+- Task/Job一覧・詳細UI（status・進捗・失敗理由を確認する手段が現状ない）
+- Task作成UI（開発指示。現状Project作成のみでTask追加導線がない）
+- Task/Job単位Approval GateのMobile連携（`apps/api/src/routes/approvalGate.ts`の`/approval-requests`系。
+  Project単位承認とは別物であり、現状Mobileから未接続）
+- Job結果・失敗理由表示
+- 再実行・追加指示UI
+
 ---
 
 ## 2. ディレクトリ構成

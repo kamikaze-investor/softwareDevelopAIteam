@@ -228,6 +228,36 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
       主要ボタン操作）まで確認済み（コミット be0a5b5〜9b3121c）。Project作成画面・Pending Approval UIの
       個別操作確認、Worker/API/Mobile同時起動での通し確認は未実施
 
+### スマホ操作MVP残タスク（2026-07-21整理）
+
+**目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
+止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
+スマホ操作MVPの定義・現状・不足機能の詳細な整理は `docs/PROJECT_CURRENT_STATE.md`「スマホ操作MVPの現在地」を参照。
+
+**MVP必須（このセクションの5項目）:**
+
+1. [ ] 2種類の承認の役割整理とMobile導線設計 — Project単位承認（`apps/api/src/routes/approvals.ts`、
+   Mobile `approvals.tsx`で使用中）とTask/Job単位Approval Gate（`apps/api/src/routes/approvalGate.ts`、
+   `/approval-requests`系。Mobileから未接続）は役割が異なる可能性があるため、統一を前提とせず、
+   まず両者の役割・使い分けを調査したうえでMobile導線設計に反映する（統合するか併存させるかは調査後に判断）
+2. [ ] Task/Job一覧・詳細画面（Mobile） — 現状Projectをタップしても遷移せず、Task/Jobのstatus
+   （queued/running/success/failed/blocked）・進捗・失敗理由をスマホから確認する手段がない
+3. [ ] Task/Job単位Approval GateのMobile UI連携 — `/approval-requests`系がMobile UIから見えず、
+   LINE/Slack通知が届いても対応する承認画面がないため通知→承認が現状つながらない
+4. [ ] 開発指示（Task作成）画面（Mobile） — 現状`create.tsx`はProject作成のみで、Project内に
+   Taskを追加する導線がスマホ側にない
+5. [ ] 再実行・追加指示UI（Mobile） — Job失敗後にスマホから再実行・追加指示を出す手段がない
+   （4の実装後に着手）
+
+**MVP後または別タスク扱い（既存バックログ通り。変更なし）:** Dashboard/approvals間の画面遷移遅延調査、
+Dashboardの`ScrollView`/N+1 fetch改善、Project詳細画面（`ProjectCard`タップ遷移）、開発DBテストデータ
+（`Projects (559)`等）整理 — いずれも本セクション追加より前から「Phase 3: 品質・安定化」に記載済みの項目
+であり、優先度・扱いは変更しない。
+
+**後続Phase扱い（既存バックログ通り。変更なし）:** VPS常駐運用化（Docker化・HTTPS化・認証強化・
+ヘルスチェック・ログ保存・再起動耐性）、将来アーキテクチャ移行（Health/Diagnosis/Research/Experiment/
+Evolution等）— いずれも本セクション追加より前から記載済みの後続Phase項目であり、優先度・扱いは変更しない。
+
 ---
 
 ## Phase 3: 品質・安定化
