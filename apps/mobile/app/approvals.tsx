@@ -9,8 +9,8 @@ import type {
   ApprovalGateStatus,
   ApprovalRequest,
   ApprovalType,
-  Project,
   RiskLevel,
+  Task,
 } from '@ai-team/shared'
 import { router } from 'expo-router'
 import {
@@ -66,45 +66,15 @@ const RISK_TEXT_STYLE: Record<RiskLevel, { color: string }> = {
   MEDIUM: { color: '#f59e0b' },
 }
 
-async function fetchProjects(): Promise<Project[]> {
-  const response = await fetch(`${API_BASE}/api/projects`)
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch projects: ${response.status}`)
-  }
-
-  return (await response.json()) as Project[]
-}
-
-async function fetchProjectApprovals(
-  project: Project,
-): Promise<ApprovalWithProject[]> {
-  const response = await fetch(`${API_BASE}/api/projects/${project.id}/approvals`)
-
-  if (!response.ok) {
-    return []
-  }
-
-  const approvals = (await response.json()) as Approval[]
-
-  return approvals.map(
-    (approval): ApprovalWithProject => ({
-      ...approval,
-      projectName: project.name,
-    }),
-  )
-}
-
+/** 全Project横断でpending状態の方針承認だけを1回のfetchで取得する（Project数分fetchしない） */
 async function fetchPendingApprovals(): Promise<ApprovalWithProject[]> {
-  const projects = await fetchProjects()
-  const approvalGroups = await Promise.all(projects.map(fetchProjectApprovals))
+  const response = await fetch(`${API_BASE}/api/approvals/pending`)
 
-  return approvalGroups
-    .flatMap((approvals): ApprovalWithProject[] => approvals)
-    .sort(
-      (left, right): number =>
-        Date.parse(right.createdAt) - Date.parse(left.createdAt),
-    )
+  if (!response.ok) {
+    throw new Error(`Failed to fetch pending approvals: ${response.status}`)
+  }
+
+  return (await response.json()) as ApprovalWithProject[]
 }
 
 async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
@@ -117,6 +87,19 @@ async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
   return (await response.json()) as ApprovalRequest[]
 }
 
+/** タップして詳細を開いた時だけ呼ぶ。404/失敗時はnullを返し、UI側で目的説明を省略する */
+async function fetchTaskInfo(taskId: string): Promise<Task | null> {
+  try {
+    const response = await fetch(`${API_BASE}/api/tasks/${taskId}`)
+    if (!response.ok) {
+      return null
+    }
+    return (await response.json()) as Task
+  } catch {
+    return null
+  }
+}
+
 function formatDateTime(value: string): string {
   const date = new Date(value)
 
@@ -127,36 +110,140 @@ function formatDateTime(value: string): string {
   return date.toLocaleString()
 }
 
+function formatRiskLevel(riskLevel: string): string {
+  switch (riskLevel) {
+    case 'CRITICAL':
+      return '危険度: 最重要'
+    case 'HIGH':
+      return '危険度: 高'
+    case 'MEDIUM':
+      return '危険度: 中'
+    case 'LOW':
+      return '危険度: 低'
+    default:
+      return `危険度: ${riskLevel}`
+  }
+}
+
+function formatApprovalGateStatus(status: string): string {
+  switch (status) {
+    case 'WAITING_FOR_USER':
+      return 'ステータス: CEOの承認待ち'
+    case 'APPROVED':
+      return 'ステータス: 承認済み'
+    case 'REJECTED':
+      return 'ステータス: 却下済み'
+    case 'CONSUMED':
+      return 'ステータス: 反映済み'
+    case 'EXPIRED':
+      return 'ステータス: 期限切れ'
+    default:
+      return `ステータス: ${status}`
+  }
+}
+
+/** 代表的なrequestedActionをCEO向けの平易な説明に変換する。未知の文言はfallbackする */
+const REQUESTED_ACTION_LABEL: Record<string, string> = {
+  'merge feature branch': '作業中の変更を本体に取り込もうとしています',
+}
+
+function formatRequestedActionSummary(requestedAction: string): string {
+  return (
+    REQUESTED_ACTION_LABEL[requestedAction] ??
+    '技術的な操作内容のため、詳細確認が必要です'
+  )
+}
+
+const UNKNOWN_REQUESTED_ACTION_NOTE =
+  '内容が分からない場合は承認せず、ChatGPT/Claudeに説明を依頼してください。'
+
+function formatJudgmentGuide(riskLevel: string): string {
+  switch (riskLevel) {
+    case 'CRITICAL':
+      return '最重要リスクです。内容に確信がない場合は承認しないでください。'
+    case 'HIGH':
+      return '高リスク操作です。問題ないと分かる場合だけ承認してください。'
+    default:
+      return 'この操作を進めてよいか分からない場合は、承認せずに詳細確認してください。'
+  }
+}
+
+/** ApprovalRequest.triggeredRules（保存値）→ CEO向け日本語説明 */
+const TRIGGERED_RULE_LABEL: Record<string, string> = {
+  'AI instruction file': 'AIの行動ルールを定めるファイルの変更です',
+  'CI/CD workflow change': '自動テスト・自動デプロイの仕組みに関わります',
+  'DB migration / schema': 'データベース構造の変更に関わります',
+  'alignment / gate change': '安全チェックの仕組み自体に関わります',
+  'auth / permission guard': '認証・権限まわりの変更に関わります',
+  'destructive operation': 'データを削除・破棄する可能性があります',
+  'docker / sandbox config': '実行環境の設定に関わります',
+  'other risk factor detected': 'その他のリスク要因が検出されました',
+  'payment / billing': '課金・支払いに関わる変更です',
+  'secret suspected in diff': '秘密情報が含まれている可能性がある変更です',
+  'secrets / env / token': '秘密情報（APIキー等）の扱いに関わります',
+}
+
+const UNKNOWN_TRIGGERED_RULE_LABEL = '未分類のリスク要因が検出されました'
+
+function formatTriggeredRule(rule: string): string {
+  return TRIGGERED_RULE_LABEL[rule] ?? UNKNOWN_TRIGGERED_RULE_LABEL
+}
+
+function formatChangedFilesDetail(changedFiles: string[]): string {
+  if (changedFiles.length === 0) return ''
+  const head = changedFiles.slice(0, 8)
+  const rest = changedFiles.length - head.length
+  return rest > 0 ? `${head.join('\n')}\n他${rest}件` : head.join('\n')
+}
+
+const NO_DETAIL_INFO_WARNING =
+  'この古い承認リクエストには、変更ファイルや危険理由の詳細情報が保存されていません。内容が分からない場合は承認しないでください。'
+
 export default function ApprovalsScreen(): ReactElement {
   const [approvals, setApprovals] = useState<ApprovalWithProject[]>([])
   const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>([])
+  const [expandedApprovalRequestId, setExpandedApprovalRequestId] = useState<
+    string | null
+  >(null)
+  const [taskInfoByTaskId, setTaskInfoByTaskId] = useState<
+    Record<string, Task | null>
+  >({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
 
-  const load = useCallback(async (): Promise<void> => {
+  const loadApprovalRequests = useCallback(async (): Promise<void> => {
     try {
-      const [pendingApprovals, waitingApprovalRequests] = await Promise.all([
-        fetchPendingApprovals(),
-        fetchWaitingApprovalRequests(),
-      ])
-      setApprovals(pendingApprovals)
+      const waitingApprovalRequests = await fetchWaitingApprovalRequests()
       setApprovalRequests(waitingApprovalRequests)
     } catch {
-      Alert.alert('エラー', 'データの取得に失敗しました')
-    } finally {
-      setLoading(false)
-      setRefreshing(false)
+      Alert.alert('エラー', '危険操作承認の取得に失敗しました')
     }
   }, [])
 
+  /** 方針承認（Project単位承認）を1回のfetchで取得する。Project数分のfetchは発生しない */
+  const loadPolicyApprovals = useCallback(async (): Promise<void> => {
+    try {
+      const pendingApprovals = await fetchPendingApprovals()
+      setApprovals(pendingApprovals)
+    } catch {
+      Alert.alert('エラー', '方針承認の取得に失敗しました')
+    }
+  }, [])
+
+  const loadAll = useCallback(async (): Promise<void> => {
+    await Promise.all([loadApprovalRequests(), loadPolicyApprovals()])
+    setLoading(false)
+    setRefreshing(false)
+  }, [loadApprovalRequests, loadPolicyApprovals])
+
   useEffect(() => {
-    void load()
-  }, [load])
+    void loadAll()
+  }, [loadAll])
 
   const refresh = useCallback((): void => {
     setRefreshing(true)
-    void load()
-  }, [load])
+    void loadAll()
+  }, [loadAll])
 
   async function handleDecision(
     approvalId: string,
@@ -174,7 +261,7 @@ export default function ApprovalsScreen(): ReactElement {
         throw new Error(`Failed to update approval: ${response.status}`)
       }
 
-      await load()
+      await loadPolicyApprovals()
     } catch {
       Alert.alert('エラー', '操作に失敗しました')
     }
@@ -198,7 +285,7 @@ export default function ApprovalsScreen(): ReactElement {
         throw new Error(`Failed to update approval request: ${response.status}`)
       }
 
-      await load()
+      await loadApprovalRequests()
 
       if (status === 'APPROVED') {
         Alert.alert(
@@ -236,6 +323,18 @@ export default function ApprovalsScreen(): ReactElement {
         text: '却下',
       },
     ])
+  }
+
+  function toggleApprovalRequestDetail(item: ApprovalRequest): void {
+    setExpandedApprovalRequestId((current) => {
+      const willExpand = current !== item.id
+      if (willExpand && !(item.taskId in taskInfoByTaskId)) {
+        void fetchTaskInfo(item.taskId).then((task) => {
+          setTaskInfoByTaskId((prev) => ({ ...prev, [item.taskId]: task }))
+        })
+      }
+      return willExpand ? item.id : null
+    })
   }
 
   function confirmApproveApprovalRequest(item: ApprovalRequest): void {
@@ -293,59 +392,160 @@ export default function ApprovalsScreen(): ReactElement {
         <Text style={styles.title}>承認待ち</Text>
       </View>
 
+      <View style={styles.introBox}>
+        <Text style={styles.introText}>
+          この画面では、AI開発チームが作業を進めるためにCEO判断が必要な項目を確認できます。
+        </Text>
+        <Text style={styles.introItemText}>
+          判断に迷う場合は承認しないでください。承認するまで、対象の処理は実行されません。
+        </Text>
+        <Text style={styles.introItemText}>
+          ⚠️ 危険操作の承認: AIが高リスクな変更を行おうとして停止している項目です。
+        </Text>
+        <Text style={styles.introItemText}>
+          📋 方針承認: 課金・外部サービス追加・Goal変更など、Project全体に関わる経営判断です。
+        </Text>
+      </View>
+
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>⚠️ 危険操作の承認</Text>
+        <Text style={styles.sectionDescription}>
+          AIが作業中に危険度の高い変更を行おうとして停止している項目です。内容を確認し、問題なければ承認してください。
+          危険操作については、承認するまでWorkerはその操作を進めません。
+        </Text>
 
         {approvalRequests.length === 0 && (
           <Text style={styles.sectionEmpty}>承認待ちの危険操作はありません</Text>
         )}
 
-        {approvalRequests.map((item) => (
-          <View key={item.id} style={styles.card}>
-            <View style={styles.cardTop}>
-              <View style={[styles.riskBadge, RISK_BADGE_STYLE[item.riskLevel]]}>
-                <Text style={[styles.riskText, RISK_TEXT_STYLE[item.riskLevel]]}>
-                  {item.riskLevel}
-                </Text>
+        {approvalRequests.map((item) => {
+          const isExpanded = expandedApprovalRequestId === item.id
+          const isKnownAction = item.requestedAction in REQUESTED_ACTION_LABEL
+          const changedFiles = item.changedFiles ?? []
+          const triggeredRules = item.triggeredRules ?? []
+          const hasDetailInfo = changedFiles.length > 0 || triggeredRules.length > 0
+          const riskSummary = triggeredRules.slice(0, 2).map(formatTriggeredRule)
+          const taskInfo = taskInfoByTaskId[item.taskId]
+
+          return (
+            <TouchableOpacity
+              key={item.id}
+              activeOpacity={0.8}
+              onPress={() => toggleApprovalRequestDetail(item)}
+              style={styles.card}
+            >
+              <View style={styles.cardTop}>
+                <View style={[styles.riskBadge, RISK_BADGE_STYLE[item.riskLevel]]}>
+                  <Text style={[styles.riskText, RISK_TEXT_STYLE[item.riskLevel]]}>
+                    {formatRiskLevel(item.riskLevel)}
+                  </Text>
+                </View>
               </View>
-              <Text style={styles.projectName} numberOfLines={1}>
-                {item.status}
+
+              <Text style={styles.itemTitle}>
+                AIがしようとしていること: {formatRequestedActionSummary(item.requestedAction)}
               </Text>
-            </View>
 
-            <Text style={styles.itemTitle}>{item.requestedAction}</Text>
+              {riskSummary.map((label) => (
+                <Text key={label} style={styles.metaText}>
+                  ・{label}
+                </Text>
+              ))}
 
-            <View style={styles.metaGroup}>
-              <Text style={styles.metaText}>Task: {item.taskId}</Text>
-              <Text style={styles.metaText}>Status: {item.status}</Text>
-              <Text style={styles.metaText}>
-                Expires: {formatDateTime(item.expiresAt)}
+              <Text style={styles.judgmentGuideText}>
+                {formatJudgmentGuide(item.riskLevel)}
               </Text>
-            </View>
 
-            <View style={styles.actions}>
-              <TouchableOpacity
-                onPress={() => confirmApproveApprovalRequest(item)}
-                style={styles.approveButton}
-              >
-                <Text style={styles.approveButtonText}>承認</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => confirmRejectApprovalRequest(item)}
-                style={styles.rejectButton}
-              >
-                <Text style={styles.rejectButtonText}>却下</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        ))}
+              {!isExpanded && (
+                <Text style={styles.expandHintText}>タップして詳細を確認</Text>
+              )}
+
+              {isExpanded && (
+                <View style={styles.detailArea}>
+                  {!hasDetailInfo && (
+                    <Text style={styles.warningText}>{NO_DETAIL_INFO_WARNING}</Text>
+                  )}
+
+                  {triggeredRules.length > 0 && (
+                    <>
+                      <Text style={styles.detailLabel}>なぜ危険と判定されたか</Text>
+                      {triggeredRules.map((rule, index) => (
+                        <Text key={`${rule}-${index}`} style={styles.metaText}>
+                          ・{formatTriggeredRule(rule)}
+                        </Text>
+                      ))}
+                    </>
+                  )}
+
+                  {changedFiles.length > 0 && (
+                    <>
+                      <Text style={styles.detailLabel}>変更されるファイル</Text>
+                      <Text style={styles.metaText}>
+                        {formatChangedFilesDetail(changedFiles)}
+                      </Text>
+                    </>
+                  )}
+
+                  {taskInfo && (
+                    <>
+                      <Text style={styles.detailLabel}>この変更の目的</Text>
+                      <Text style={styles.metaText}>元タスク: {taskInfo.title}</Text>
+                      {taskInfo.description.length > 0 && (
+                        <Text style={styles.metaText}>{taskInfo.description}</Text>
+                      )}
+                    </>
+                  )}
+
+                  <Text style={styles.detailLabel}>技術的な操作名</Text>
+                  <Text style={styles.metaText}>{item.requestedAction}</Text>
+                  {!isKnownAction && (
+                    <Text style={styles.metaHelpText}>
+                      {UNKNOWN_REQUESTED_ACTION_NOTE}
+                    </Text>
+                  )}
+
+                  <Text style={styles.metaText}>
+                    {formatApprovalGateStatus(item.status)}
+                  </Text>
+                  <Text style={styles.metaText}>
+                    承認期限: {formatDateTime(item.expiresAt)}
+                  </Text>
+                  <Text style={styles.metaText}>管理用ID: {item.taskId}</Text>
+                  <Text style={styles.metaHelpText}>
+                    開発チームがこの承認を特定するための番号です。
+                  </Text>
+
+                  <Text style={styles.expandHintText}>タップして詳細を閉じる</Text>
+
+                  <View style={styles.actions}>
+                    <TouchableOpacity
+                      onPress={() => confirmApproveApprovalRequest(item)}
+                      style={styles.approveButton}
+                    >
+                      <Text style={styles.approveButtonText}>承認</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => confirmRejectApprovalRequest(item)}
+                      style={styles.rejectButton}
+                    >
+                      <Text style={styles.rejectButtonText}>却下</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )}
+            </TouchableOpacity>
+          )
+        })}
       </View>
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>📋 方針承認</Text>
+        <Text style={styles.sectionTitle}>📋 方針承認（Project全体の経営判断）</Text>
+        <Text style={styles.sectionDescription}>
+          課金・外部サービス追加・Goal変更・設計思想変更など、Project全体に関わるCEO判断です。
+        </Text>
 
         {approvals.length === 0 && (
-          <Text style={styles.sectionEmpty}>承認待ちの事項はありません</Text>
+          <Text style={styles.sectionEmpty}>現在、方針承認はありません</Text>
         )}
 
         {approvals.map((item) => (
@@ -437,17 +637,56 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 16,
   },
+  detailArea: {
+    borderColor: '#2a2a2a',
+    borderTopWidth: 1,
+    gap: 6,
+    marginTop: 10,
+    paddingTop: 10,
+  },
+  detailLabel: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+    marginTop: 8,
+  },
   empty: {
     color: '#737373',
     fontSize: 16,
     marginTop: 60,
     textAlign: 'center',
   },
+  expandHintText: {
+    color: '#60a5fa',
+    fontSize: 12,
+    fontWeight: '600',
+    marginTop: 4,
+  },
   header: {
     alignItems: 'center',
     flexDirection: 'row',
     marginBottom: 20,
     marginTop: 52,
+  },
+  introBox: {
+    backgroundColor: '#141414',
+    borderColor: '#2a2a2a',
+    borderRadius: 10,
+    borderWidth: 1,
+    gap: 8,
+    marginBottom: 20,
+    padding: 14,
+  },
+  introItemText: {
+    color: '#a3a3a3',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  introText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    lineHeight: 20,
   },
   itemReason: {
     color: '#a3a3a3',
@@ -461,9 +700,18 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginBottom: 6,
   },
-  metaGroup: {
-    gap: 4,
+  judgmentGuideText: {
+    color: '#fbbf24',
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
     marginBottom: 14,
+    marginTop: 4,
+  },
+  metaHelpText: {
+    color: '#737373',
+    fontSize: 12,
+    lineHeight: 17,
   },
   metaText: {
     color: '#a3a3a3',
@@ -502,6 +750,12 @@ const styles = StyleSheet.create({
   section: {
     marginBottom: 20,
   },
+  sectionDescription: {
+    color: '#a3a3a3',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 12,
+  },
   sectionEmpty: {
     color: '#737373',
     fontSize: 14,
@@ -528,5 +782,12 @@ const styles = StyleSheet.create({
     color: '#f59e0b',
     fontSize: 11,
     fontWeight: '600',
+  },
+  warningText: {
+    color: '#ef4444',
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 19,
+    marginBottom: 6,
   },
 })
