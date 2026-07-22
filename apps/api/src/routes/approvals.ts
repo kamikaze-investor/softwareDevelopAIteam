@@ -1,6 +1,9 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
+import type { Approval } from '@ai-team/shared'
+
+type ApprovalWithProjectId = Approval & { projectId: string }
 
 const ApprovalTypeSchema = z.enum([
   'goal_change',
@@ -25,6 +28,20 @@ const UpdateApprovalBody = z.object({
 
 export async function approvalRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
+
+  app.get('/approvals/pending', async (_req, reply) => {
+    const pendingApprovals = storage.approvals.findAllPending() as ApprovalWithProjectId[]
+    const projectNamesById = new Map(
+      storage.projects.findAll().map((project) => [project.id, project.name]),
+    )
+
+    return reply.send(
+      pendingApprovals.map((approval) => ({
+        ...approval,
+        projectName: projectNamesById.get(approval.projectId) ?? approval.projectId,
+      })),
+    )
+  })
 
   app.get<{ Params: { projectId: string } }>('/projects/:projectId/approvals', async (req, reply) => {
     const project = storage.projects.findById(req.params.projectId)

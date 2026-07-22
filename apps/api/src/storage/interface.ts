@@ -32,6 +32,8 @@ export interface IJobStorage {
 }
 
 export interface IApprovalStorage {
+  /** 全Project横断でpending状態の承認のみを1クエリで取得する（N+1回避用） */
+  findAllPending(): Approval[]
   findPendingByProjectId(projectId: string): Approval[]
   findById(id: string): Approval | undefined
   create(approval: Omit<Approval, 'id' | 'createdAt'>): Approval

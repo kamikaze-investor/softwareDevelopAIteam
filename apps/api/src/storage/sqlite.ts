@@ -234,6 +234,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   const approvals: IApprovalStorage = {
+    findAllPending() {
+      const rows = db.prepare("SELECT * FROM approvals WHERE status = 'pending' ORDER BY created_at DESC").all() as any[]
+      return rows.map(deserializeApprovalWithProjectId)
+    },
     findPendingByProjectId(projectId) {
       const rows = db.prepare("SELECT * FROM approvals WHERE project_id = ? AND status = 'pending' ORDER BY created_at DESC").all(projectId) as any[]
       return rows.map(deserializeApproval)
@@ -1084,6 +1088,14 @@ function deserializeApproval(row: any): Approval {
     reviewNote: row.review_note ?? undefined,
     createdAt: row.created_at,
   }
+}
+
+function deserializeApprovalWithProjectId(row: any): Approval {
+  const approval: Approval & { projectId: string } = {
+    ...deserializeApproval(row),
+    projectId: row.project_id,
+  }
+  return approval
 }
 
 function deserializeApprovalRequest(row: any): ApprovalRequest {
