@@ -588,6 +588,7 @@ describe('POST /api/gate/check', () => {
       // 同じ ref で再呼び出し
       const { statusCode, body } = await gateCheck(app, BASE_GATE_PAYLOAD)
       expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
       expect(body.sideEffects).toEqual([])
       expect(body.nextAction.action).toBe('wait_for_approval')
       expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
@@ -641,6 +642,7 @@ describe('POST /api/gate/check', () => {
         targetDiffHash: 'hash-deadbeef',
       })
       expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('ALLOW')
       expect(body.sideEffects).toEqual([])
       expect(body.continuationPolicy).toBe('continue')
       expect(body.nextAction.action).toBe('call_consume')
@@ -704,19 +706,67 @@ describe('POST /api/gate/check', () => {
     })
   })
 
-  // 9. REJECTED は active 扱いされない → 新規 CREATED
-  it('REJECTED は active 扱いされない → 新規 CREATED_APPROVAL_REQUEST', async () => {
+  // 9. REJECTED + same commit/diff → 新規作成せず REJECTED
+  it('REJECTED + same commit/diff → 新規 ApprovalRequest を作らず REJECTED を返す', async () => {
     await withApp(async (app) => {
-      const req = await createApprovalRequest(app, { taskId: 'gate-task-009' })
+      const taskId = 'gate-task-009'
+      const req = await createApprovalRequest(app, {
+        taskId,
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
+      })
       await patchStatus(app, req.id, 'REJECTED')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const before = storage.approvalRequests.findByTaskId(taskId)
 
       const { statusCode, body } = await gateCheck(app, {
         ...BASE_GATE_PAYLOAD,
-        taskId: 'gate-task-009',
+        taskId,
+        targetCommit: 'commit-abc123',
+        targetDiffHash: 'hash-deadbeef',
       })
       expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('REJECTED')
+      expect(body.outcome.decision).not.toBe('ALLOW')
+      expect(body.outcome.requestId).toBe(req.id)
+      expect(body.sideEffects).toEqual([])
+      expect(body.nextAction.action).toBe('wait_for_approval')
+      expect(body.nextAction.requestId).toBe(req.id)
+      expect(body.approvalRequest?.id).toBe(req.id)
+      expect(body.approvalRequest?.status).toBe('REJECTED')
+      expect(storage.approvalRequests.findByTaskId(taskId)).toHaveLength(before.length)
+    })
+  })
+
+  // 9b. REJECTED + different commit/diff → 別変更なので新規 CREATED
+  it('REJECTED + different commit/diff → 新規 ApprovalRequest を作成する', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-task-009b'
+      const req = await createApprovalRequest(app, {
+        taskId,
+        targetCommit: 'commit-old',
+        targetDiffHash: 'hash-old',
+      })
+      await patchStatus(app, req.id, 'REJECTED')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const before = storage.approvalRequests.findByTaskId(taskId)
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId,
+        targetCommit: 'commit-new',
+        targetDiffHash: 'hash-new',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.outcome.decision).not.toBe('ALLOW')
       expect(body.sideEffects).toHaveLength(1)
       expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+      expect(body.approvalRequest?.id).not.toBe(req.id)
+      expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
+      expect(storage.approvalRequests.findByTaskId(taskId)).toHaveLength(before.length + 1)
     })
   })
 

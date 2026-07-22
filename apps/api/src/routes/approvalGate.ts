@@ -77,6 +77,17 @@ interface GateCheckResponse {
   approvalRequest?:   ApprovalRequest
 }
 
+function findRelevantRejectedRequest(
+  requests: ApprovalRequest[],
+  currentCommit: string,
+  currentDiffHash: string,
+): ApprovalRequest | undefined {
+  const rejectedRequests = requests.filter(request => request.status === 'REJECTED')
+  return rejectedRequests.find(request =>
+    request.targetCommit === currentCommit && request.targetDiffHash === currentDiffHash
+  ) ?? rejectedRequests[0]
+}
+
 // Zod スキーマ
 const GateCheckBody = z.object({
   taskId:          z.string().min(1),
@@ -143,6 +154,13 @@ function computeNextAction(
         message: riskLevel === 'CRITICAL'
           ? '【CRITICAL】危険な変更を含むため、承認まですべての作業を停止してください。承認者に通知してください。'
           : '承認待ち中です。安全な作業は継続可能ですが、この変更の適用は承認後に行ってください。',
+      }
+
+    case 'REJECTED':
+      return {
+        action: 'wait_for_approval',
+        requestId: outcome.requestId,
+        message: 'この危険操作は却下済みです。同一内容では再承認依頼を作成しません。作業を続けるにはCEOの追加指示が必要です。',
       }
 
     case 'BLOCKED':
@@ -339,6 +357,14 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
+    if (!existingReq) {
+      existingReq = findRelevantRejectedRequest(
+        storage.approvalRequests.findByTaskId(taskId),
+        targetCommit,
+        targetDiffHash,
+      )
+    }
+
     // Gate 判定（純粋関数）
     const outcome = decideGateOutcome(riskReview, existingReq, targetCommit, targetDiffHash)
 
@@ -350,6 +376,8 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       storage.approvalRequests.updateStatus(existingReq!.id, 'STALE', undefined, true)
       sideEffects.push({ type: 'MARKED_STALE', requestId: existingReq!.id })
       approvalRequest = storage.approvalRequests.findById(existingReq!.id)
+    } else if (outcome.decision === 'REJECTED') {
+      approvalRequest = existingReq
     } else if (outcome.decision === 'BLOCKED') {
       const input: ApprovalGateInput = {
         taskId, requestedAction, targetBranch, targetCommit, targetDiffHash, changedFiles,

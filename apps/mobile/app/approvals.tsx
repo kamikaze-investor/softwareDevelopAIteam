@@ -293,7 +293,7 @@ export default function ApprovalsScreen(): ReactElement {
           '承認済み。Worker反映待ちになる場合があります。',
         )
       } else {
-        Alert.alert('却下済み', '危険操作の承認リクエストを却下しました')
+        Alert.alert('却下済み', 'この危険操作は却下されました。作業を続けるには追加指示が必要です。')
       }
     } catch {
       Alert.alert('エラー', '操作に失敗しました')

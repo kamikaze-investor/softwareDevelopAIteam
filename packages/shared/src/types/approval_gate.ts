@@ -114,6 +114,7 @@ export type GateOutcome =
       consumedRequestId?: string
     }
   | { decision: 'PENDING_APPROVAL'; requestId: string; riskLevel: RiskLevel }
+  | { decision: 'REJECTED'; requestId: string; riskLevel: RiskLevel; reason: string }
   | { decision: 'BLOCKED'; reason: string; riskLevel: RiskLevel }
   | { decision: 'STALE'; requestId: string; reason: string }
 

@@ -237,9 +237,14 @@ describe('resolveEffectiveStatus', () => {
     expect(resolveEffectiveStatus(req, COMMIT, DIFF_HASH)).toBe('EXPIRED')
   })
 
-  it('REJECTED → returns REJECTED', () => {
-    const req = makeApprovalRequest({ status: 'REJECTED' })
+  it('REJECTED + same commit/diff → returns REJECTED', () => {
+    const req = makeApprovalRequest({ status: 'REJECTED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
     expect(resolveEffectiveStatus(req, COMMIT, DIFF_HASH)).toBe('REJECTED')
+  })
+
+  it('REJECTED + different commit/diff → SUPERSEDED', () => {
+    const req = makeApprovalRequest({ status: 'REJECTED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
+    expect(resolveEffectiveStatus(req, OTHER_COMMIT, OTHER_DIFF_HASH)).toBe('SUPERSEDED')
   })
 
   it('SUPERSEDED → returns SUPERSEDED', () => {
@@ -311,9 +316,16 @@ describe('decideGateOutcome', () => {
     if (outcome.decision === 'STALE') expect(outcome.requestId).toBe(req.id)
   })
 
-  it('HIGH with REJECTED request → BLOCKED (new request needed)', () => {
-    const req = makeApprovalRequest({ riskLevel: 'HIGH', status: 'REJECTED' })
+  it('HIGH with REJECTED request (same commit/diff) → REJECTED', () => {
+    const req = makeApprovalRequest({ riskLevel: 'HIGH', status: 'REJECTED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
     const outcome = decideGateOutcome(highReview, req, COMMIT, DIFF_HASH)
+    expect(outcome.decision).toBe('REJECTED')
+    if (outcome.decision === 'REJECTED') expect(outcome.requestId).toBe(req.id)
+  })
+
+  it('HIGH with REJECTED request (different commit/diff) → BLOCKED', () => {
+    const req = makeApprovalRequest({ riskLevel: 'HIGH', status: 'REJECTED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
+    const outcome = decideGateOutcome(highReview, req, OTHER_COMMIT, OTHER_DIFF_HASH)
     expect(outcome.decision).toBe('BLOCKED')
   })
 

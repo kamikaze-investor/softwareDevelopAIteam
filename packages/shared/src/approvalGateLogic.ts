@@ -119,6 +119,12 @@ export function resolveEffectiveStatus(
   currentCommit: string,
   currentDiffHash: string,
 ): ApprovalGateStatus {
+  if (req.status === 'REJECTED') {
+    if (req.targetCommit !== currentCommit || req.targetDiffHash !== currentDiffHash) {
+      return 'SUPERSEDED'
+    }
+    return 'REJECTED'
+  }
   if (new Date(req.expiresAt) < new Date()) {
     return 'EXPIRED'
   }
@@ -174,7 +180,15 @@ export function decideGateOutcome(
     if (effective === 'WAITING_FOR_USER') {
       return { decision: 'PENDING_APPROVAL', requestId: existingReq.id, riskLevel }
     }
-    // REJECTED / EXPIRED / SUPERSEDED → 新規リクエスト作成が必要
+    if (effective === 'REJECTED') {
+      return {
+        decision: 'REJECTED',
+        requestId: existingReq.id,
+        riskLevel,
+        reason: 'この変更はCEOにより却下されています。同一内容のため再承認依頼は作成されません。内容を変更するか、CEOの追加指示を待ってください。',
+      }
+    }
+    // EXPIRED / SUPERSEDED → 新規リクエスト作成が必要
   }
 
   // 承認リクエストなし or 無効状態 → BLOCKED（新規リクエスト作成を促す）
