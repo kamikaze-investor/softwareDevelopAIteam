@@ -171,6 +171,21 @@ Telemetryは継続する。
 
 ---
 
+# 12b. Rubric生成・Knowledge Consult・Investigate・Distill・Loop Metricsへの適用
+
+外部のAgent Loop的な設計思想（`specs/13_future_system_architecture.md` 5b章参照）を導入する際も、
+本ドキュメントの既存原則をそのまま適用する（新しい例外は設けない）:
+
+- Rubric生成はPlannerが必要時（Project/Task作成時）にのみ行う。定期的な無条件生成はしない（11章）
+- Knowledge Consultは関連するRuleだけを検索・抽出する。全文を渡さない（6章）
+- InvestigateはAI Invocation Gate（5章）の条件（Critical Issue・異常継続・既知ルールで原因不明等）に
+  従って発動する。Retry複数回の継続もこの発動条件の一種として扱う
+- Distillは全ログを毎回AI処理しない。Caching and Deduplication（8章）に従い、同一Issueへの重複処理を避ける
+- Loop Metrics（Retry回数・Rubric達成率等）は原則Telemetry/SQL/通常コードで集計する（Deterministic
+  Evaluation、9章と同じ扱い）。AIを使うのは非構造判断・原因分析が必要な場合に限定する
+
+---
+
 # 13. MVP段階での適用（本プロジェクト固有の注記）
 
 現段階（MVP開発中）では、本ドキュメントが対象とするDiagnosis / Research / Experiment / Evolution機能自体が

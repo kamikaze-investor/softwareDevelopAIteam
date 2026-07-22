@@ -106,6 +106,40 @@ AI Team OSは、会話を続けることではなく仕事を完了すること�
 
 ConversationはWorkflowを開始・補助するInterfaceであり、状態管理の本体ではない。
 
+## 3.10 Goal Driven
+
+AI Team OSの全Workflowは、会話の継続ではなく「Goal達成」を目的にする。
+
+CEOが入力するのは、細かい技術指示ではなく「何を達成したいか」（Goal）である。Goalの技術的な作業分解は
+AI Team / Plannerが担当する。Goalが曖昧な場合、Plannerは必要最小限の確認をCEOに行う。
+
+（外部のAgent Loop的な設計思想における「Goal」概念を吸収したもの。新規コンポーネントは追加しない）
+
+## 3.11 Rubric Driven
+
+AIが「どうなれば完成か」を明確に理解できるよう、成果物の評価基準（Rubric）に基づいて作業を評価する。
+
+CEOが技術的なRubricを細かく書く前提にはしない。CEOは目的・方針・優先順位・妥協しない点を伝え、
+Planner（`specs/13_future_system_architecture.md`参照）がProject/Task/Workflowに応じたRubricを生成する。
+RubricはTeamごとに観点が異なり、全Team共通の固定Rubricにはしない。
+
+（Rubricは独立仕様書・独立Teamにはしない。Planner / Project / Task / Workflowへ吸収する）
+
+## 3.12 Evidence over Opinion
+
+Review・Feedbackは、AIの感想や主観ではなく、事実・検証結果・根拠（Evidence）に基づいて判断する。
+
+Evidenceにはtest結果・typecheck結果・bundle結果・実機確認・ログ・Telemetry・差分等を含む。Evidenceのない
+主張はReview結果として扱わない。
+
+## 3.13 Risk-based Review
+
+すべての変更を同じ重さでレビューせず、リスクレベルに応じて確認深度を変える。リスクが高いほどEvidence要求を
+強くする。High RiskはApproval Gate対象とする。
+
+（既存の`docs/multi_ai_step_review_flow.md`「11. リスク分類」「11-1. Review Level」と同じ考え方であり、
+新しい分類軸を追加するものではない）
+
 ---
 
 # 4. 実装方針（MVP優先の原則）

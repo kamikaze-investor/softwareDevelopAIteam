@@ -335,6 +335,29 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 - [ ] `docs/AI_TEAM_OS_DESIGN.md`「第3弾」（AI Reliability/KPI/Conflict Management/Learning Control/Rollback/
       AI Runtime State）との重複整理（要整理・将来統合検討。今回は削除・置換しない）
 
+### 外部Agent Loop設計思想の吸収（Rubric / Workflow Lifecycle / Knowledge Consult / Investigate / Distill / Loop Metrics。2026-07-21反映・MVP後）
+
+**前提（正本）:** `specs/00_constitution.md` 3.10〜3.13（Goal Driven / Rubric Driven / Evidence over Opinion /
+Risk-based Review）、`specs/13_future_system_architecture.md` 5b章（Planner責務・Workflow Lifecycle・
+Knowledge Consult・Investigate・Distill・Loop Metrics）、`specs/20_token_efficient_intelligence_policy.md`
+12b章。今回は仕様反映のみで実装は行っていない。新規`Rubric.md`/`Loop.md`/`Memory.md`は作らない方針。
+
+**MVP後の実装候補（未着手）:**
+- [ ] Knowledge Consult（Execution前に関連Ruleだけを検索・添付する仕組み）
+- [ ] Retry複数回後のInvestigate（Self Diagnosisの一部として。原因・Evidence・再発防止案を出すのみ）
+- [ ] DistillによるRule化（Evolutionの一部として。Knowledge登録・CEO承認対象）
+- [ ] Loop Metrics（Retry回数・Feedback回数・Rubric達成率・Rule利用率・Knowledge命中率。Team Healthの一部として）
+- [ ] Rubric達成率のHealth反映
+- [ ] RubricをProject/Task/Workflow/Review/Approval/Healthで共通利用する正式実装
+
+**スマホ操作MVP中に検討してよい最小実装（実装は今回行わない）:**
+Task作成画面・開発指示UI（本セクション上部「スマホ操作MVP残タスク」4番目）を実装する際、以下を
+最小実装として検討してよい:
+- CEOがGoal/優先順位/制約を入力する
+- PlannerがProject/Task Rubricを自動生成する
+- Development Team向け最小Rubric例: typecheck成功・test成功・Android bundle成功・危険変更はApproval Gateで
+  停止・CEOがスマホで確認できる
+
 ### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
 
 **背景:**
