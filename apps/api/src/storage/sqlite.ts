@@ -10,7 +10,8 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage } from './interface'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
+import { computeTaskDisplayStatus } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -23,6 +24,92 @@ function parseStringArray(value: unknown): string[] {
       : []
   } catch {
     return []
+  }
+}
+
+const DEFAULT_SUMMARY_LIMIT = 50
+const MAX_SUMMARY_LIMIT = 100
+
+function normalizeSummaryLimit(limit?: number): number {
+  if (limit === undefined || !Number.isFinite(limit) || limit < 1) return DEFAULT_SUMMARY_LIMIT
+  return Math.min(Math.trunc(limit), MAX_SUMMARY_LIMIT)
+}
+
+function buildInPlaceholders(values: string[]): string {
+  return values.map(() => '?').join(', ')
+}
+
+function latestByTaskId<T extends { taskId: string }>(items: T[]): Map<string, T> {
+  const latest = new Map<string, T>()
+  for (const item of items) {
+    if (!latest.has(item.taskId)) {
+      latest.set(item.taskId, item)
+    }
+  }
+  return latest
+}
+
+function groupByTaskId<T extends { taskId: string }>(items: T[]): Map<string, T[]> {
+  const grouped = new Map<string, T[]>()
+  for (const item of items) {
+    const group = grouped.get(item.taskId) ?? []
+    group.push(item)
+    grouped.set(item.taskId, group)
+  }
+  return grouped
+}
+
+function newestIso(values: Array<string | undefined>): string {
+  const validValues = values.filter((value): value is string => value !== undefined)
+  return validValues.reduce((newest, value) => (
+    Date.parse(value) > Date.parse(newest) ? value : newest
+  ))
+}
+
+function buildTaskSummary(
+  task: Task,
+  projectName: string,
+  latestJob: Job | undefined,
+  approvalRequests: ApprovalRequest[],
+): TaskSummary {
+  const latestApproval = approvalRequests[0]
+  // Approval correlation is intentionally taskId-only for this lightweight view.
+  // It does not identify which Job maps to which ApprovalRequest; Job.approvalId wiring is a later task.
+  const latestApprovalStatus = latestApproval?.status
+
+  return {
+    taskId: task.id,
+    projectId: task.projectId,
+    projectName,
+    title: task.title,
+    description: task.description,
+    taskStatus: task.status,
+    latestJob: latestJob ? {
+      jobId: latestJob.id,
+      status: latestJob.status,
+      startedAt: latestJob.startedAt,
+      completedAt: latestJob.completedAt,
+    } : undefined,
+    approvalSummary: {
+      hasWaitingApproval: approvalRequests.some(request => request.status === 'WAITING_FOR_USER'),
+      hasRejectedApproval: approvalRequests.some(request => request.status === 'REJECTED'),
+      latestApprovalRequestId: latestApproval?.id,
+      latestApprovalStatus,
+      latestApprovalRiskLevel: latestApproval?.riskLevel,
+    },
+    displayStatus: computeTaskDisplayStatus({
+      taskStatus: task.status,
+      latestJobStatus: latestJob?.status,
+      latestJobCreatedAt: latestJob?.createdAt,
+      latestApprovalStatus,
+      latestApprovalCreatedAt: latestApproval?.createdAt,
+    }),
+    updatedAt: newestIso([
+      task.updatedAt,
+      latestJob?.completedAt,
+      latestJob?.startedAt,
+      latestApproval?.createdAt,
+    ]),
   }
 }
 
@@ -112,6 +199,66 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     findById(id) {
       const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as any
       return row ? deserializeTask(row) : undefined
+    },
+    findSummaries(options) {
+      const conditions: string[] = []
+      const params: Array<string | number> = []
+
+      if (options?.projectId) {
+        conditions.push('t.project_id = ?')
+        params.push(options.projectId)
+      }
+      if (options?.status) {
+        conditions.push('t.status = ?')
+        params.push(options.status)
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      // 「最近作成されたTask」ではなく「最近活動があったTask」を上位に出すため、
+      // Task本体・最新Job・最新ApprovalRequestの各活動時刻の最大値でORDER BYしてからLIMITする。
+      // 相関サブクエリ2本＋本体1クエリの単一SQL文であり、Task件数分のクエリ発行や
+      // 全Task IDを巨大なIN句へ詰める実装にはしていない。
+      const taskRows = db.prepare(`
+        SELECT t.*,
+          MAX(
+            t.updated_at,
+            COALESCE((SELECT MAX(created_at) FROM jobs j WHERE j.task_id = t.id), ''),
+            COALESCE((SELECT MAX(created_at) FROM approval_requests a WHERE a.task_id = t.id), '')
+          ) AS last_activity_at
+        FROM tasks t
+        ${whereClause}
+        ORDER BY last_activity_at DESC, t.id ASC
+        LIMIT ?
+      `).all(...params, normalizeSummaryLimit(options?.limit)) as any[]
+      const taskList = taskRows.map(deserializeTask)
+      if (taskList.length === 0) return []
+
+      const taskIds = taskList.map(task => task.id)
+      const placeholders = buildInPlaceholders(taskIds)
+      const jobRows = db.prepare(`
+        SELECT * FROM jobs
+        WHERE task_id IN (${placeholders})
+        ORDER BY task_id ASC, created_at DESC
+      `).all(...taskIds) as any[]
+      const latestJobs = latestByTaskId(jobRows.map(deserializeJob))
+
+      const projectNameById = new Map(
+        projects.findAll().map(project => [project.id, project.name] as const),
+      )
+
+      const approvalRows = db.prepare(`
+        SELECT * FROM approval_requests
+        WHERE task_id IN (${placeholders})
+        ORDER BY task_id ASC, created_at DESC
+      `).all(...taskIds) as any[]
+      const approvalsByTaskId = groupByTaskId(approvalRows.map(deserializeApprovalRequest))
+
+      return taskList.map(task => buildTaskSummary(
+        task,
+        projectNameById.get(task.projectId) ?? '',
+        latestJobs.get(task.id),
+        approvalsByTaskId.get(task.id) ?? [],
+      ))
     },
     create(data) {
       const task: Task = {

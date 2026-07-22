@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 
 export interface IProjectStorage {
@@ -20,6 +20,7 @@ export interface IProjectStorage {
 export interface ITaskStorage {
   findByProjectId(projectId: string): Task[]
   findById(id: string): Task | undefined
+  findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   create(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt'>): Task
   update(id: string, data: Partial<Task>): Task | undefined
 }

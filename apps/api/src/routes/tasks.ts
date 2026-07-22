@@ -48,8 +48,30 @@ const ListQuerySchema = z.object({
   projectId: z.string().min(1),
 })
 
+// limit はここで厳密なnumber検証をせず、storage層のnormalizeSummaryLimit()に正規化を委ねる
+// （0/負数/NaN/非数値文字列/100超過はいずれもそこで安全な値へfallback・clampされる）
+const SummaryQuerySchema = z.object({
+  projectId: z.string().min(1).optional(),
+  status: TaskStatusSchema.optional(),
+  limit: z.string().optional(),
+})
+
 export async function taskRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
+
+  app.get('/summary', async (req, reply) => {
+    const query = SummaryQuerySchema.safeParse(req.query)
+    if (!query.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: query.error.format() })
+    }
+
+    return reply.send(storage.tasks.findSummaries({
+      projectId: query.data.projectId,
+      status: query.data.status,
+      // 不正値（NaN/0/負数/100超過）は normalizeSummaryLimit() 側で安全な値へfallback・clampされる
+      limit: query.data.limit !== undefined ? Number(query.data.limit) : undefined,
+    }))
+  })
 
   app.get('/', async (req, reply) => {
     const query = ListQuerySchema.safeParse(req.query)

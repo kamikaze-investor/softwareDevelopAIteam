@@ -1,12 +1,13 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Project, Task } from '@ai-team/shared'
+import type { ApprovalRequest, Job, Project, Task, TaskSummary } from '@ai-team/shared'
 
 async function buildApp(): Promise<FastifyInstance> {
-  const [{ projectRoutes }, { taskRoutes }, { resetStorage }] = await Promise.all([
+  const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { resetStorage }] = await Promise.all([
     import('./projects.js'),
     import('./tasks.js'),
+    import('./jobs.js'),
     import('../storage/index.js'),
   ])
 
@@ -16,6 +17,7 @@ async function buildApp(): Promise<FastifyInstance> {
   app.register(cors, { origin: true })
   app.register(projectRoutes, { prefix: '/api/projects' })
   app.register(taskRoutes, { prefix: '/api/tasks' })
+  app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app
 }
@@ -67,6 +69,67 @@ async function createTask(
 
   expect(res.statusCode).toBe(201)
   return parseBody<Task>(res.body)
+}
+
+async function createJob(
+  app: FastifyInstance,
+  task: Task,
+  body: Partial<Job> = {},
+): Promise<Job> {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/jobs',
+    payload: {
+      taskId: task.id,
+      projectId: task.projectId,
+      agentRole: 'developer_ai',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      ...body,
+    },
+  })
+
+  expect(res.statusCode).toBe(201)
+  return parseBody<Job>(res.body)
+}
+
+async function updateJob(
+  app: FastifyInstance,
+  jobId: string,
+  body: Partial<Job>,
+): Promise<Job> {
+  const res = await app.inject({
+    method: 'PATCH',
+    url: `/api/jobs/${jobId}`,
+    payload: body,
+  })
+
+  expect(res.statusCode).toBe(200)
+  return parseBody<Job>(res.body)
+}
+
+async function createApprovalRequest(
+  taskId: string,
+  body: Partial<Omit<ApprovalRequest, 'id' | 'createdAt' | 'taskId'>> = {},
+): Promise<ApprovalRequest> {
+  const { getStorage } = await import('../storage/index.js')
+
+  return getStorage().approvalRequests.create({
+    taskId,
+    targetBranch: 'ai/task-test',
+    targetCommit: 'abc123',
+    targetDiffHash: 'deadbeef',
+    riskLevel: 'HIGH',
+    requestedAction: 'Review changes',
+    status: 'WAITING_FOR_USER',
+    expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    invalidIf: [],
+    ...body,
+  })
+}
+
+/** createdAt比較テスト用に、ミリ秒レベルで確実に順序を分けるための待機 */
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 beforeEach(() => {
@@ -129,6 +192,264 @@ describe('Task API', () => {
       const body = parseBody<Task[]>(res.body)
       expect(body).toHaveLength(2)
       expect(body.map((task) => task.title)).toEqual(['T1', 'T2'])
+    })
+  })
+
+  it('GET /api/tasks/summary returns task summaries across projects', async () => {
+    await withApp(async (app) => {
+      const alpha = await createProject(app, { name: 'Alpha' })
+      const beta = await createProject(app, { name: 'Beta' })
+      const alphaTask = await createTask(app, alpha.id, { title: 'Alpha task' })
+      const betaTask = await createTask(app, beta.id, { title: 'Beta task' })
+      const alphaJob = await createJob(app, alphaTask)
+      await updateJob(app, alphaJob.id, {
+        status: 'running',
+        startedAt: '2026-07-22T10:00:00.000Z',
+      })
+      await createJob(app, betaTask)
+      await createApprovalRequest(alphaTask.id, { status: 'WAITING_FOR_USER' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body).toHaveLength(2)
+      const summaryByTaskId = new Map(body.map((summary) => [summary.taskId, summary]))
+      const alphaSummary = summaryByTaskId.get(alphaTask.id)
+      const betaSummary = summaryByTaskId.get(betaTask.id)
+
+      expect(alphaSummary?.projectName).toBe('Alpha')
+      expect(betaSummary?.projectName).toBe('Beta')
+      expect(alphaSummary?.latestJob?.status).toBe('running')
+      expect(alphaSummary?.approvalSummary.hasWaitingApproval).toBe(true)
+      expect(alphaSummary?.displayStatus).toBe('waiting_approval')
+    })
+  })
+
+  it('GET /api/tasks/summary maps rejected approvals to rejected_waiting_instruction', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { title: 'Rejected task' })
+      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'CRITICAL' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body[0].approvalSummary.hasRejectedApproval).toBe(true)
+      expect(body[0].approvalSummary.latestApprovalStatus).toBe('REJECTED')
+      expect(body[0].approvalSummary.latestApprovalRiskLevel).toBe('CRITICAL')
+      expect(body[0].displayStatus).toBe('rejected_waiting_instruction')
+    })
+  })
+
+  it('GET /api/tasks/summary treats REJECTED as stale once a newer Job succeeds', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { title: 'Retried task' })
+
+      const blockedJob = await createJob(app, task)
+      await updateJob(app, blockedJob.id, { status: 'blocked' })
+      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'HIGH' })
+      await wait(5)
+      const newerJob = await createJob(app, task)
+      await updateJob(app, newerJob.id, { status: 'success' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body[0].latestJob?.status).toBe('success')
+      expect(body[0].displayStatus).toBe('completed')
+    })
+  })
+
+  it('GET /api/tasks/summary treats REJECTED as stale once a newer Job is running', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { title: 'Retrying task' })
+
+      const blockedJob = await createJob(app, task)
+      await updateJob(app, blockedJob.id, { status: 'blocked' })
+      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'HIGH' })
+      await wait(5)
+      const newerJob = await createJob(app, task)
+      await updateJob(app, newerJob.id, { status: 'running' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body[0].displayStatus).toBe('running')
+    })
+  })
+
+  it('GET /api/tasks/summary keeps rejected_waiting_instruction when the blocked Job predates the rejection and nothing newer exists', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { title: 'Still rejected task' })
+
+      const blockedJob = await createJob(app, task)
+      await updateJob(app, blockedJob.id, { status: 'blocked' })
+      await wait(5)
+      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'CRITICAL' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body[0].displayStatus).toBe('rejected_waiting_instruction')
+    })
+  })
+
+  it('GET /api/tasks/summary does not show waiting_approval once a newer Job has succeeded', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { title: 'Approved and moved on task' })
+
+      await createApprovalRequest(task.id, { status: 'WAITING_FOR_USER' })
+      await wait(5)
+      const newerJob = await createJob(app, task)
+      await updateJob(app, newerJob.id, { status: 'success' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body[0].displayStatus).not.toBe('waiting_approval')
+      expect(body[0].displayStatus).toBe('completed')
+    })
+  })
+
+  it('GET /api/tasks/summary applies limit', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      await createTask(app, project.id, { title: 'T1' })
+      await createTask(app, project.id, { title: 'T2' })
+      await createTask(app, project.id, { title: 'T3' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary?limit=2' })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<TaskSummary[]>(res.body)).toHaveLength(2)
+    })
+  })
+
+  it('GET /api/tasks/summary clamps limit to 100 even when a larger value is requested', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      for (let i = 0; i < 105; i++) {
+        await createTask(app, project.id, { title: `T${i}` })
+      }
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary?limit=200' })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<TaskSummary[]>(res.body)).toHaveLength(100)
+    })
+  })
+
+  it('GET /api/tasks/summary falls back to the default limit for invalid limit values', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      await createTask(app, project.id, { title: 'Only task' })
+
+      const zero = await app.inject({ method: 'GET', url: '/api/tasks/summary?limit=0' })
+      const negative = await app.inject({ method: 'GET', url: '/api/tasks/summary?limit=-5' })
+      const notANumber = await app.inject({ method: 'GET', url: '/api/tasks/summary?limit=abc' })
+
+      expect(zero.statusCode).toBe(200)
+      expect(negative.statusCode).toBe(200)
+      expect(notANumber.statusCode).toBe(200)
+      expect(parseBody<TaskSummary[]>(zero.body)).toHaveLength(1)
+      expect(parseBody<TaskSummary[]>(negative.body)).toHaveLength(1)
+      expect(parseBody<TaskSummary[]>(notANumber.body)).toHaveLength(1)
+    })
+  })
+
+  it('GET /api/tasks/summary orders by recent activity, not creation time', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+
+      // A is created first (older) but gets a Job much later (recent activity)
+      const taskA = await createTask(app, project.id, { title: 'Old task with recent activity' })
+      await wait(5)
+      // B is created after A but never gets any Job/ApprovalRequest
+      const taskB = await createTask(app, project.id, { title: 'New task with no activity' })
+      await wait(5)
+      const jobForA = await createJob(app, taskA)
+      await updateJob(app, jobForA.id, { status: 'success' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body.map((summary) => summary.taskId)).toEqual([taskA.id, taskB.id])
+    })
+  })
+
+  it('GET /api/tasks/summary with limit=1 still returns the most recently active task', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+
+      const taskA = await createTask(app, project.id, { title: 'Old task with recent activity' })
+      await wait(5)
+      await createTask(app, project.id, { title: 'New task with no activity' })
+      await wait(5)
+      const jobForA = await createJob(app, taskA)
+      await updateJob(app, jobForA.id, { status: 'success' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary?limit=1' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body).toHaveLength(1)
+      expect(body[0].taskId).toBe(taskA.id)
+    })
+  })
+
+  it('GET /api/tasks/summary returns a stable order when activity timestamps tie', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      await createTask(app, project.id, { title: 'T1' })
+      await createTask(app, project.id, { title: 'T2' })
+
+      const first = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+      const second = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      const firstIds = parseBody<TaskSummary[]>(first.body).map((summary) => summary.taskId)
+      const secondIds = parseBody<TaskSummary[]>(second.body).map((summary) => summary.taskId)
+      expect(firstIds).toEqual(secondIds)
+    })
+  })
+
+  it('GET /api/tasks/summary status filters by the Task\'s own status, not displayStatus', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const pendingTask = await createTask(app, project.id, { title: 'Pending', status: 'pending' })
+      await createTask(app, project.id, { title: 'Done', status: 'done' })
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary?status=pending' })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<TaskSummary[]>(res.body)
+      expect(body).toHaveLength(1)
+      expect(body[0].taskId).toBe(pendingTask.id)
+      expect(body[0].taskStatus).toBe('pending')
+    })
+  })
+
+  it('GET /api/tasks/summary returns an empty array when no tasks match', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/tasks/summary?projectId=${project.id}`,
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<TaskSummary[]>(res.body)).toEqual([])
     })
   })
 
@@ -211,6 +532,21 @@ describe('Task API', () => {
 
       expect(res.statusCode).toBe(404)
       expect(parseBody<{ error: string }>(res.body).error).toBe('Project not found')
+    })
+  })
+
+  it('GET /api/jobs?taskId continues to list task jobs', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const job = await createJob(app, task)
+
+      const res = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<Job[]>(res.body)
+      expect(body).toHaveLength(1)
+      expect(body[0].id).toBe(job.id)
     })
   })
 })
