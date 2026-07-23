@@ -84,7 +84,7 @@ AI Team OS
 | Service Extension: Health | `apps/api/src/routes/knowledgeGraph.ts`（health-score）, `apps/worker/src/watchdog/*` | 部分的に実装済み（Team単位のHealthではなくProject/KnowledgeGraph単位） |
 | Service Extension: Telemetry | `apps/worker/src/executionLogStore.ts`, `apps/worker/src/approvalLevel/observationLog.ts` | 部分的に実装済み（最低限のログ記録のみ） |
 | Service Extension: Knowledge | `apps/api/src/routes/knowledgeGraph.ts` | 実装済み（MVP Baseline） |
-| Service Extension: Model Routing | `apps/worker/src/aiCli/*`（Claude/Codex/Geminiアダプター） | 部分的に実装済み（固定ルーティング。動的Model Routingは将来構想） |
+| Service Extension: Model Routing | `apps/worker/src/aiCli/*`（Claude/Codex/Geminiアダプター） | 部分的に実装済み（固定ルーティング＝Static Model Routing。詳細は5b-7章。動的Model Routingは将来構想・低優先度） |
 | Service Extension: Diagnosis / Research / Improvement Planner / Experiment / Evolution | 未実装 | 将来構想（MVP後） |
 | Team Extension: Development Team | Claude Code（CTO / Developer AI） + Codex（Developer AI サブ） + Gemini（Meta Reviewer） | 実装済みだが「Team」として抽象化されておらず、`apps/worker`に直接組み込まれた単一構成 |
 | Team Extension: Marketing / Finance / Legal / Sales Team | 未実装 | 将来構想 |
@@ -183,6 +183,100 @@ Context Minimization原則に従う。
 Workflow Loopの健全性を測る指標（候補: Retry回数・Feedback回数・Rubric達成率・Rule利用率・
 Knowledge命中率・Retry後成功率）。Team単位を中心とし、異なるTeamを単純比較しない。Metricsは
 状態把握のために使い、それ自体が改善提案や自動変更の根拠にはしない。
+
+## 5b-7. モデル選択・モデル評価・将来の動的Model Routing（将来構想）
+
+**位置づけ**: 「3. 現状マッピング」表の`Service Extension: Model Routing`行に対応する詳細仕様。
+本章はいずれもMVP後の将来構想（一部は既存実装の運用方針整理）であり、特定ベンダー・特定モデル名
+（Claude/GPT/Gemini等の個別モデル名）には依存しない。モデルは能力・コスト・用途で抽象化して扱う
+（`specs/00_constitution.md` 3.7 Vendor Independenceの原則に従う）。Plannerは自身の内部知識で
+モデル情報を記憶するのではなく、将来的にはModel Registry（5b-7-3）を参照する構造にする。
+
+### 5b-7-1. Static Model Routing（現在・MVP開発中の運用方針）
+
+複雑な自動最適化を実装せず、単純で予測可能な固定ルールでモデルを選択する段階。
+
+**現状との対応（新規実装ではなく既存実装の運用方針整理）**: 「1タスク＝1プロバイダー」原則
+（`packages/shared/src/types/task.ts`の`Task.provider`フィールド、Rule-001: Codex統合リスクM-1）と
+`apps/worker/src/aiCli/*`（Claude Code/Codex/Gemini各アダプター＋`factory.ts`）が、タスク種別ごとに
+固定のモデル（プロバイダー）を割り当てる、Static Model Routingに相当する仕組みとして既に実装済み。
+
+**将来の拡張候補（未実装）**:
+- リスクまたは重要度に応じたモデルクラスの選択（現状は`Task.provider`固定割当のみで、リスク連動はない）
+- 推論工数を低・標準・高など少数段階で設定する仕組み
+- 失敗時に上位モデルまたは高い工数へ自動昇格する仕組み（現状は自動昇格ロジックなし）
+- CEOが設定した予算上限の遵守・無料枠優先・無料枠枯渇時の待機/CEO承認後の有料切り替え
+  （既存の`docs/multi_ai_step_review_flow.md` 20〜21章「Quota Policy」「Review Transport Mode」は
+  Gemini Review呼び出し限定の同種方針。本項はDeveloper AI実行全体への拡張として整理し、
+  既存Quota Policyと矛盾しないよう後日統合する）
+- 使用モデル・推論工数・成功/失敗・Retry回数・トークン量の最低限のログ記録
+  （現状`apps/worker/src/executionLogStore.ts`・`apps/worker/src/approvalLevel/observationLog.ts`が
+  近い機能を持つが、モデル選択判断用の記録としては未整理）
+
+### 5b-7-2. Model Usage Telemetry（MVP完成後・Phase 1）
+
+AI Team OS自身の実運用結果を収集する。収集項目: タスク種別・使用モデル・推論工数・入出力トークン・
+推定/実コスト・実行時間・成功/失敗・Retry回数・Rubric達成状況・Reviewで発見された重大問題・
+**最終的な完了までにかかった総コスト**（最初の生成コストだけでなく、修正・再試行を含む完了コストを
+評価できるようにする）。既存のTelemetry Service Extension（`apps/worker/src/executionLogStore.ts`等）へ
+統合する形で位置づけ、独立した新規コンポーネントにはしない。
+
+### 5b-7-3. Model Registry Lite（MVP完成後・Phase 2）
+
+Plannerが、利用可能なモデルの能力・制約・コスト・状態を参照できるようにする。保持項目候補:
+provider・model identifier・状態（active/deprecated/unavailable等）・入出力コスト・コンテキスト上限・
+対応機能・推論工数設定の有無・推奨用途・既知の制約・最終確認日時・情報源・AI Team OS内での実運用実績。
+
+**公式情報（ベンダー公表スペック）と内部実績（Model Usage Telemetryの集計結果）は分離して保存する。**
+Plannerはモデル情報を内部知識だけで判断せず、Model Registryを参照する構造にする。Model Registry自体の
+自動インターネット更新は行わない（後述「今回実装しないもの」参照）。
+
+### 5b-7-4. Selective Model Evaluation（MVP完成後・Phase 2またはPhase 3）
+
+モデル選択が微妙で、かつ今後も繰り返し発生する価値の高いタスクだけを限定的に比較する。全タスクで
+複数モデルを並列実行する設計にはしない。比較の実行機構は、既存のExperiment Service Extension
+（`specs/13_future_system_architecture.md` 4.1・「3. 現状マッピング」表）の一部として位置づける。
+
+**比較を開始する条件の例**: 新しいモデルを導入するとき／過去実績が少ないタスク種別／既定モデルが
+繰り返し失敗したとき／安価なモデルと高性能モデルのどちらが適切か判断しにくいとき／モデル選択ルールを
+変更する前／今後何度も発生するタスクで比較コストを回収できる可能性があるとき。
+
+**比較方法（コストが低い順）**: 1. 方針・計画だけを比較する → 2. 難しい部分だけを部分比較する →
+3. 必要性が高い場合のみ完全なShadow実験を行う。比較実験によるトークン消費が、得られる改善効果を
+上回らないようにする（`specs/20_token_efficient_intelligence_policy.md`の原則に従う）。
+
+### 5b-7-5. Dynamic Model Routing（将来・低優先度）
+
+十分な実運用データ（Model Usage Telemetry）が蓄積された後に、タスク分類・要求品質・リスク・重要度・
+予算・レイテンシ・過去の成功率・完了までの総コスト・モデルの利用可能状態・失敗時のエスカレーションから
+モデルと推論工数を自動選択する。**複雑性が高く、固定ルール（5b-7-1）で実際に問題が発生した場合のみ
+実装を検討する低優先度機能とする。自動最適化を導入すること自体を目的にしない。**
+
+### 5b-7-6. 優先順位
+
+1. MVPの完成
+2. 単純な固定ルールによる安定運用（5b-7-1 Static Model Routing）
+3. 実行ログの収集（5b-7-2 Model Usage Telemetry）
+4. 実際に問題が出た部分だけモデル選択を改善
+5. 必要性が確認された場合のみ限定比較（5b-7-4 Selective Model Evaluation）
+6. 十分なデータと費用対効果がある場合のみ動的ルーティング（5b-7-5 Dynamic Model Routing）
+
+### 5b-7-7. 今回実装しないもの（明記）
+
+全モデルの常時比較／タスクごとの複数モデル完全実行／自動ベンチマーク基盤／複雑な選択確信度計算／
+機械学習によるモデルルーティング／モデル選択ルールの自動変更／本番成果物へのShadow結果の自動反映／
+CEO承認なしの予算上限超過／Model Registryの自動インターネット更新／プロダクションコードの変更。
+
+### 5b-7-8. 既存仕様との統合方針（重複回避）
+
+| 領域 | 統合先 |
+|---|---|
+| モデルの基本情報管理 | Model Registry Lite（本章5b-7-3）。既存のProvider管理実装（`apps/worker/src/aiCli/*`）とは別レイヤーとして整理し、置き換えない |
+| 実行結果の収集 | Model Usage Telemetry（5b-7-2）＝既存Telemetry Service Extensionへ統合。Team Health（5b-6）とは別軸（Team単位の健全性 vs モデル単位の実績）だが、将来Team Healthの内訳分析としても参照しうる |
+| 比較実験 | Experiment Service Extension（「3. 現状マッピング」表）の一部として実施。独立した`Shadow Experiment`仕様は新設しない |
+| モデル選択ルールの改善提案 | Self Diagnosis（5b-4）・Evolution（5b-5）の対象領域の一つとして扱う。独立仕様は新設しない |
+| 高額モデル利用の許可 | 既存のBudget Control（`specs/13_future_system_architecture.md`「3. 現状マッピング」表の`Core: Resource / Cost Gate`。未実装・将来構想）＋既存Approval Gateに従う。新しい承認経路は作らない |
+| PlannerによるモデルGate選択 | Planner責務（5b-1）の一部として整理。Team ArchitectureまたはWorkflow Lifecycle（5b-2）に接続する |
 
 ---
 

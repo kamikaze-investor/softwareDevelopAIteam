@@ -358,6 +358,58 @@ Task作成画面・開発指示UI（本セクション上部「スマホ操作MV
 - Development Team向け最小Rubric例: typecheck成功・test成功・Android bundle成功・危険変更はApproval Gateで
   停止・CEOがスマホで確認できる
 
+### モデル選択・モデル評価・将来の動的Model Routing（2026-07-23反映・段階実装予定）
+
+**前提（正本）:** `specs/13_future_system_architecture.md` 5b-7章（Static Model Routing・Model Usage
+Telemetry・Model Registry Lite・Selective Model Evaluation・Dynamic Model Routing）、`specs/00_constitution.md`
+3.7 Vendor Independence、`specs/20_token_efficient_intelligence_policy.md`（Model Selection・比較実験の
+トークン効率原則）。特定ベンダー・特定モデル名には依存せず、モデルは能力・コスト・用途で抽象化して扱う。
+今回は仕様反映のみで実装は行っていない。
+
+**現在・MVP開発中（新規実装ではなく既存の運用方針整理）:** 「1タスク＝1プロバイダー」原則
+（`packages/shared/src/types/task.ts`の`Task.provider`）と`apps/worker/src/aiCli/*`が、Static Model
+Routing（タスク種別ごとの固定モデル割当）に相当する仕組みとして既に実装済み。以下は同項目の将来拡張候補
+（MVP後）:
+- [ ] リスク/重要度に応じたモデルクラスの自動選択（現状は固定割当のみ）
+- [ ] 推論工数の少数段階設定（低・標準・高等）
+- [ ] 失敗時の上位モデル/高工数への自動昇格
+- [ ] CEO予算上限の遵守・無料枠優先・無料枠枯渇時の待機/CEO承認後の有料切り替え
+      （既存の`docs/multi_ai_step_review_flow.md` 20〜21章「Quota Policy」はGemini Review限定。
+      Developer AI実行全体への拡張として整理し、後日既存Quota Policyと統合する）
+- [ ] モデル選択判断用の実行ログ整理（使用モデル・推論工数・成功/失敗・Retry回数・トークン量）
+
+**MVP完成後・Phase 1:**
+- [ ] Model Usage Telemetry — タスク種別・使用モデル・推論工数・入出力トークン・推定/実コスト・実行時間・
+      成功/失敗・Retry回数・Rubric達成状況・Reviewで発見された重大問題・**修正/再試行を含む完了までの
+      総コスト**を記録する。既存Telemetry（`executionLogStore.ts`等）へ統合し、独立コンポーネントにしない
+
+**MVP完成後・Phase 2:**
+- [ ] Model Registry Lite — Plannerが参照する、モデルの能力・制約・コスト・状態のレジストリ
+      （provider・model identifier・状態・コスト・コンテキスト上限・対応機能・推奨用途・既知の制約・
+      最終確認日時・情報源・実運用実績）。**公式情報と内部実績（Model Usage Telemetry集計）は分離保存**。
+      Model Registryの自動インターネット更新は行わない
+
+**MVP完成後・Phase 2またはPhase 3:**
+- [ ] Selective Model Evaluation — モデル選択が微妙で繰り返し発生する価値の高いタスクのみ限定比較
+      （方針比較→部分比較→完全Shadow実験の順にコストが低い方法から選ぶ）。全タスク並列実行はしない。
+      比較実験のトークン消費が改善効果を上回らないようにする。実行機構はExperiment Service Extension
+      （`specs/13_future_system_architecture.md`）の一部として位置づけ、独立仕様は新設しない
+
+**将来・低優先度:**
+- [ ] Dynamic Model Routing — 十分な実運用データ蓄積後、タスク分類・要求品質・リスク・重要度・予算・
+      レイテンシ・過去の成功率・完了総コスト・モデル利用可能状態・失敗時エスカレーションから自動選択する。
+      **固定ルールで実際に問題が発生した場合のみ実装を検討する低優先度機能。自動最適化の導入自体を
+      目的にしない**
+
+**優先順位:** 1. MVPの完成 → 2. 単純な固定ルールによる安定運用 → 3. 実行ログの収集 →
+4. 実際に問題が出た部分だけモデル選択を改善 → 5. 必要性が確認された場合のみ限定比較 →
+6. 十分なデータと費用対効果がある場合のみ動的ルーティング
+
+**今回実装しないもの（明記）:** 全モデルの常時比較／タスクごとの複数モデル完全実行／自動ベンチマーク
+基盤／複雑な選択確信度計算／機械学習によるモデルルーティング／モデル選択ルールの自動変更／本番成果物への
+Shadow結果の自動反映／CEO承認なしの予算上限超過／Model Registryの自動インターネット更新／
+プロダクションコードの変更。
+
 ### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
 
 **背景:**
