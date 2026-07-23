@@ -165,7 +165,12 @@ function TaskCard({ task }: { task: TaskSummary }): ReactElement {
   const latestJobStatus = task.latestJob?.status
 
   return (
-    <View style={styles.card}>
+    <TouchableOpacity
+      activeOpacity={0.85}
+      accessibilityRole="button"
+      onPress={() => router.push(`/tasks/${task.taskId}`)}
+      style={styles.card}
+    >
       <View style={styles.cardTop}>
         <Text style={styles.projectName} numberOfLines={1}>
           {task.projectName}
@@ -208,7 +213,7 @@ function TaskCard({ task }: { task: TaskSummary }): ReactElement {
         <Text style={styles.metaLabel}>最終更新</Text>
         <Text style={styles.metaText}>{formatDateTime(task.updatedAt)}</Text>
       </View>
-    </View>
+    </TouchableOpacity>
   )
 }
 
