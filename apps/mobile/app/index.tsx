@@ -289,6 +289,14 @@ export default function Dashboard() {
 
         <TouchableOpacity
           accessibilityRole="button"
+          onPress={() => router.push('/tasks')}
+          style={styles.taskButton}
+        >
+          <Text style={styles.taskText}>作業状況を見る</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          accessibilityRole="button"
           onPress={load}
           style={styles.refreshButton}
         >
@@ -459,6 +467,20 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     marginBottom: 12,
     marginTop: 20,
+  },
+  taskButton: {
+    alignItems: 'center',
+    backgroundColor: '#1a1a1a',
+    borderColor: '#3b82f644',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 8,
+    padding: 14,
+  },
+  taskText: {
+    color: '#60a5fa',
+    fontSize: 15,
+    fontWeight: '600',
   },
   refreshButton: {
     alignItems: 'center',
