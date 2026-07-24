@@ -171,6 +171,44 @@ describe('Job API', () => {
     })
   })
 
+  it('persists aiCliProvider/aiCliPrompt/aiCliMode across a DB round-trip', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task, {
+        aiCliProvider: 'codex',
+        aiCliPrompt: 'Implement the requested change carefully.',
+        aiCliMode: 'implement',
+      })
+
+      // POSTのレスポンスは作成直後のin-memoryオブジェクトを返すだけの可能性があるため、
+      // 別リクエストでDBから再取得し、永続化が実際に効いていることを確認する
+      const res = await app.inject({ method: 'GET', url: `/api/jobs/${created.id}` })
+
+      expect(res.statusCode).toBe(200)
+      const fetched = parseBody<Job>(res.body)
+      expect(fetched.aiCliProvider).toBe('codex')
+      expect(fetched.aiCliPrompt).toBe('Implement the requested change carefully.')
+      expect(fetched.aiCliMode).toBe('implement')
+    })
+  })
+
+  it('leaves aiCliProvider/aiCliPrompt/aiCliMode undefined when omitted (backward compatibility)', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const res = await app.inject({ method: 'GET', url: `/api/jobs/${created.id}` })
+
+      expect(res.statusCode).toBe(200)
+      const fetched = parseBody<Job>(res.body)
+      expect(fetched.aiCliProvider).toBeUndefined()
+      expect(fetched.aiCliPrompt).toBeUndefined()
+      expect(fetched.aiCliMode).toBeUndefined()
+    })
+  })
+
   it('GET /api/jobs/:id returns 404 for a missing job', async () => {
     await withApp(async (app) => {
       const res = await app.inject({ method: 'GET', url: '/api/jobs/not-exist' })

@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
-import type { Project, Task, Approval, Job, SafeCommand, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 
 const now = () => new Date().toISOString()
 
@@ -336,8 +336,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const job: Job = { ...data, id: randomUUID(), createdAt: now() }
       db.prepare(`
         INSERT INTO jobs
-          (id, task_id, project_id, agent_role, status, safe_command, dry_run, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (id, task_id, project_id, agent_role, status, safe_command,
+           ai_cli_provider, ai_cli_prompt, ai_cli_mode, dry_run, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         job.id,
         job.taskId,
@@ -345,6 +346,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         job.agentRole,
         job.status,
         JSON.stringify(job.safeCommand),
+        job.aiCliProvider ?? null,
+        job.aiCliPrompt ?? null,
+        job.aiCliMode ?? null,
         job.dryRun ? 1 : 0,
         job.createdAt,
       )
@@ -1143,11 +1147,9 @@ function deserializeJob(row: any): Job {
     projectId: row.project_id,
     agentRole: row.agent_role,
     status: row.status,
-    // マイグレーション後の既存行は safe_command が NULL の可能性がある
-    // Phase 1 では新規rowのみだが、防御的にフォールバックを設ける
     safeCommand: row.safe_command
-      ? (JSON.parse(row.safe_command) as SafeCommand)
-      : ({ kind: 'git_status', workingDir: '/workspace/target' } satisfies SafeCommand),
+      ? JSON.parse(row.safe_command)
+      : { kind: 'git_status', workingDir: '/workspace/target' },
     dryRun: row.dry_run === 1 ? true : undefined,
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
@@ -1161,6 +1163,9 @@ function deserializeJob(row: any): Job {
     rollbackInfo: row.rollback_info ? JSON.parse(row.rollback_info) : undefined,
     guardResult: row.guard_result ? JSON.parse(row.guard_result) : undefined,
     approvalId: row.approval_id ?? undefined,
+    aiCliProvider: row.ai_cli_provider ?? undefined,
+    aiCliPrompt: row.ai_cli_prompt ?? undefined,
+    aiCliMode: row.ai_cli_mode ?? undefined,
     createdAt: row.created_at,
   }
 }
