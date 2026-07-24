@@ -10,6 +10,10 @@
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 
+export type ResumeBlockedTaskResult =
+  | { ok: true; job: Job }
+  | { ok: false; reason: string }
+
 export interface IProjectStorage {
   findAll(): Project[]
   findById(id: string): Project | undefined
@@ -30,6 +34,10 @@ export interface IJobStorage {
   findById(id: string): Job | undefined
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
   update(id: string, data: Partial<Job>): Job | undefined
+  resumeBlockedTask(input: {
+    taskId: string
+    instructionPrompt: string
+  }): ResumeBlockedTaskResult
 }
 
 export interface IApprovalStorage {

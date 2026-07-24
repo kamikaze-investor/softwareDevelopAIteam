@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
+import type { Task } from '@ai-team/shared'
 import { getStorage } from '../storage'
 
 const TaskStatusSchema = z.enum(['pending', 'in_progress', 'review', 'done', 'blocked'])
@@ -47,6 +48,21 @@ const UpdateTaskBody = z.object({
 const ListQuerySchema = z.object({
   projectId: z.string().min(1),
 })
+
+const ResumeTaskBody = z.object({
+  instruction: z.string().trim().min(1).max(2000),
+}).strict()
+
+function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string {
+  return `[Task] ${task.title}
+${task.description}
+
+[CEOからの追加指示]
+${instruction}
+
+[重要な注意]
+却下された操作を変更せず繰り返さないこと。CEOの追加指示を反映した、異なる内容の変更を作成してください。`
+}
 
 // limit はここで厳密なnumber検証をせず、storage層のnormalizeSummaryLimit()に正規化を委ねる
 // （0/負数/NaN/非数値文字列/100超過はいずれもそこで安全な値へfallback・clampされる）
@@ -108,6 +124,29 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
 
     const task = storage.tasks.create(result.data)
     return reply.status(201).send(task)
+  })
+
+  app.post<{ Params: { id: string } }>('/:id/resume', async (req, reply) => {
+    const result = ResumeTaskBody.safeParse(req.body)
+    if (!result.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
+    }
+
+    const task = storage.tasks.findById(req.params.id)
+    if (!task) {
+      return reply.status(404).send({ error: 'Task not found' })
+    }
+
+    const resumed = storage.jobs.resumeBlockedTask({
+      taskId: task.id,
+      instructionPrompt: buildResumeAiCliPrompt(task, result.data.instruction),
+    })
+
+    if (!resumed.ok) {
+      return reply.status(400).send({ error: resumed.reason })
+    }
+
+    return reply.status(201).send(resumed.job)
   })
 
   app.patch<{ Params: { id: string } }>('/:id', async (req, reply) => {

@@ -107,6 +107,21 @@ async function updateJob(
   return parseBody<Job>(res.body)
 }
 
+async function createBlockedAiCliJob(
+  app: FastifyInstance,
+  task: Task,
+  body: Partial<Job> = {},
+): Promise<Job> {
+  const job = await createJob(app, task, {
+    aiCliProvider: 'codex',
+    aiCliPrompt: 'Initial implementation prompt',
+    aiCliMode: 'implement',
+    ...body,
+  })
+
+  return updateJob(app, job.id, { status: 'blocked' })
+}
+
 async function createApprovalRequest(
   taskId: string,
   body: Partial<Omit<ApprovalRequest, 'id' | 'createdAt' | 'taskId'>> = {},
@@ -471,6 +486,209 @@ describe('Task API', () => {
 
       expect(res.statusCode).toBe(404)
       expect(parseBody<{ error: string }>(res.body).error).toBe('Task not found')
+    })
+  })
+
+  describe('POST /api/tasks/:id/resume', () => {
+    it('creates a queued job from the latest blocked job and keeps the blocked job unchanged', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id, {
+          title: 'Fix blocked deployment',
+          description: 'Update only the allowed API files.',
+        })
+        const blockedJob = await createBlockedAiCliJob(app, task, {
+          agentRole: 'developer_ai',
+          safeCommand: {
+            kind: 'typecheck',
+            params: { testPattern: 'apps/api' },
+            workingDir: '/workspace/target',
+          },
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'Original rejected prompt',
+          aiCliMode: 'implement',
+        })
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'Use the existing storage interface and add tests.' },
+        })
+
+        expect(res.statusCode).toBe(201)
+        const resumedJob = parseBody<Job>(res.body)
+        expect(resumedJob.id).not.toBe(blockedJob.id)
+        expect(resumedJob.status).toBe('queued')
+        expect(resumedJob.taskId).toBe(task.id)
+        expect(resumedJob.projectId).toBe(project.id)
+        expect(resumedJob.agentRole).toBe(blockedJob.agentRole)
+        expect(resumedJob.safeCommand).toEqual(blockedJob.safeCommand)
+        expect(resumedJob.aiCliProvider).toBe('codex')
+        expect(resumedJob.aiCliMode).toBe('implement')
+        expect(resumedJob.aiCliPrompt).toContain('[Task] Fix blocked deployment')
+        expect(resumedJob.aiCliPrompt).toContain('Update only the allowed API files.')
+        expect(resumedJob.aiCliPrompt).toContain('Use the existing storage interface and add tests.')
+        expect(resumedJob.aiCliPrompt).toContain('却下された操作を変更せず繰り返さないこと')
+
+        const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+        expect(jobsRes.statusCode).toBe(200)
+        const jobs = parseBody<Job[]>(jobsRes.body)
+        expect(jobs).toHaveLength(2)
+        const original = jobs.find((job) => job.id === blockedJob.id)
+        const created = jobs.find((job) => job.id === resumedJob.id)
+        expect(original?.status).toBe('blocked')
+        expect(original?.aiCliPrompt).toBe('Original rejected prompt')
+        expect(created?.status).toBe('queued')
+      })
+    })
+
+    it('rejects resume while the latest approval request is waiting for the user', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        await createBlockedAiCliJob(app, task)
+        await createApprovalRequest(task.id, { status: 'WAITING_FOR_USER' })
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'Try a smaller change.' },
+        })
+
+        expect(res.statusCode).toBe(400)
+        expect(parseBody<{ error: string }>(res.body).error).toContain('waiting for user')
+
+        const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+        expect(parseBody<Job[]>(jobsRes.body)).toHaveLength(1)
+      })
+    })
+
+    it.each(['queued', 'running'] satisfies Job['status'][])(
+      'rejects resume when a %s job already exists',
+      async (activeStatus) => {
+        await withApp(async (app) => {
+          const project = await createProject(app)
+          const task = await createTask(app, project.id)
+          await createBlockedAiCliJob(app, task)
+          await wait(5)
+          const activeJob = await createJob(app, task, {
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'Already retrying',
+            aiCliMode: 'implement',
+          })
+          if (activeStatus === 'running') {
+            await updateJob(app, activeJob.id, { status: 'running' })
+          }
+
+          const res = await app.inject({
+            method: 'POST',
+            url: `/api/tasks/${task.id}/resume`,
+            payload: { instruction: 'Retry with constraints.' },
+          })
+
+          expect(res.statusCode).toBe(400)
+
+          const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+          expect(parseBody<Job[]>(jobsRes.body)).toHaveLength(2)
+        })
+      },
+    )
+
+    it.each(['queued', 'running', 'success', 'failed'] satisfies Job['status'][])(
+      'rejects resume when the latest job is %s',
+      async (status) => {
+        await withApp(async (app) => {
+          const project = await createProject(app)
+          const task = await createTask(app, project.id)
+          const job = await createJob(app, task, {
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'Latest job prompt',
+            aiCliMode: 'implement',
+          })
+          if (status !== 'queued') {
+            await updateJob(app, job.id, { status })
+          }
+
+          const res = await app.inject({
+            method: 'POST',
+            url: `/api/tasks/${task.id}/resume`,
+            payload: { instruction: 'Resume with updated direction.' },
+          })
+
+          expect(res.statusCode).toBe(400)
+        })
+      },
+    )
+
+    it('returns 404 for a missing task', async () => {
+      await withApp(async (app) => {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/api/tasks/not-exist/resume',
+          payload: { instruction: 'Retry with a narrower change.' },
+        })
+
+        expect(res.statusCode).toBe(404)
+        expect(parseBody<{ error: string }>(res.body).error).toBe('Task not found')
+      })
+    })
+
+    it.each(['', '   '])('rejects blank instruction input', async (instruction) => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction },
+        })
+
+        expect(res.statusCode).toBe(400)
+      })
+    })
+
+    it('rejects instruction input longer than 2000 characters', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'a'.repeat(2001) },
+        })
+
+        expect(res.statusCode).toBe(400)
+      })
+    })
+
+    it('creates only one job when resume is submitted twice', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        await createBlockedAiCliJob(app, task)
+
+        const first = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'Retry with the approved file list.' },
+        })
+        const second = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'Retry with the approved file list.' },
+        })
+
+        expect(first.statusCode).toBe(201)
+        expect(second.statusCode).toBe(400)
+
+        const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+        const jobs = parseBody<Job[]>(jobsRes.body)
+        expect(jobs).toHaveLength(2)
+        expect(jobs.filter((job) => job.status === 'queued')).toHaveLength(1)
+        expect(jobs.filter((job) => job.status === 'blocked')).toHaveLength(1)
+      })
     })
   })
 

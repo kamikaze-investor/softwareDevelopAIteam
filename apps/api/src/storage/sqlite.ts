@@ -9,7 +9,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 
@@ -381,6 +381,56 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         id,
       )
       return updated
+    },
+    resumeBlockedTask(input) {
+      const resumeTransaction = db.transaction((taskId: string, instructionPrompt: string): ResumeBlockedTaskResult => {
+        const jobRows = db.prepare(
+          'SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC'
+        ).all(taskId) as any[]
+        const taskJobs = jobRows.map(deserializeJob)
+        const latestJob = taskJobs[0]
+
+        if (!latestJob) {
+          return { ok: false, reason: 'No jobs exist for this task' }
+        }
+
+        if (latestJob.status !== 'blocked') {
+          return { ok: false, reason: `Latest job status is ${latestJob.status}, not blocked` }
+        }
+
+        if (taskJobs.some((job) => job.status === 'queued' || job.status === 'running')) {
+          return { ok: false, reason: 'A queued or running job already exists for this task' }
+        }
+
+        const latestApprovalRow = db.prepare(
+          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1'
+        ).get(taskId) as any
+        const latestApproval = latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined
+
+        if (latestApproval?.status === 'WAITING_FOR_USER') {
+          return { ok: false, reason: 'The latest approval request is waiting for user review' }
+        }
+
+        if (!latestJob.aiCliProvider || !latestJob.aiCliMode) {
+          return { ok: false, reason: 'Latest blocked job is missing AI CLI provider or mode' }
+        }
+
+        const job = jobs.create({
+          taskId,
+          projectId: latestJob.projectId,
+          agentRole: latestJob.agentRole,
+          status: 'queued',
+          safeCommand: latestJob.safeCommand,
+          dryRun: latestJob.dryRun,
+          aiCliProvider: latestJob.aiCliProvider,
+          aiCliPrompt: instructionPrompt,
+          aiCliMode: latestJob.aiCliMode,
+        })
+
+        return { ok: true, job }
+      })
+
+      return resumeTransaction(input.taskId, input.instructionPrompt)
     },
   }
 
