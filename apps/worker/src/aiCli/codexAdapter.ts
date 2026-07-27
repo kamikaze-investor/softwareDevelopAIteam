@@ -23,7 +23,7 @@
  *   npm グローバルインストール版 (codex.cmd) を使用する。
  *   → resolveCodexPath() が自動判定。CODEX_CLI_PATH 環境変数で上書き可能。
  *
- * ⚠️ Codex CLIのフラグ仕様は v0.140.0 時点。変更時は `codex exec --help` で確認。
+ * ⚠️ Codex CLIのフラグ仕様は v0.145.0 時点（実測確認済み）。変更時は `codex exec --help` で確認。
  */
 
 import type { AiCliRequest, AiCliAdapterConfig } from '@ai-team/shared'
@@ -69,9 +69,15 @@ export class CodexAdapter extends BaseCliAdapter {
 
     const sandboxMode = request.mode === 'implement' ? 'workspace-write' : 'read-only'
 
+    // model は任意。指定された場合のみ --model を渡す。
+    // 未指定時は従来どおり Codex CLI のデフォルトモデルに委ねる
+    // （実装用Jobの挙動を変えないため、ここで既定値を補わない）。
+    const modelArgs = request.model ? ['--model', request.model] : []
+
     return [
       'exec',
       '--sandbox', sandboxMode,
+      ...modelArgs,
       '-C', request.workingDir,   // ワークスペースルートを明示（execFileSync の cwd と一致）
       '--ephemeral',               // Workerの自動実行ではセッションファイルを残さない
       '-',                         // stdin からプロンプトを読む（useStdinPrompt() = true）

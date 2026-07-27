@@ -198,6 +198,44 @@ describe('CodexAdapter — stdin prompt', () => {
     expect(argv[argv.length - 1]).toBe('-')
     expect(argv.join(' ')).not.toContain('hello world')
   })
+
+  it('model 指定時は --model とモデルIDを隣接して argv に含め、末尾は - のままにする', () => {
+    class TestCodexAdapter extends CodexAdapter {
+      testArgv(r: AiCliRequest): string[] { return this.buildArgv(r) }
+    }
+    const adapter = new TestCodexAdapter({ provider: 'codex' })
+    const argv = adapter.testArgv({
+      provider: 'codex',
+      taskId: 't1',
+      workingDir: '/workspace/target/app',
+      prompt: 'hello world',
+      contextFiles: [],
+      mode: 'review',
+      model: 'gpt-5.6-sol',
+    })
+    const modelFlagIndex = argv.indexOf('--model')
+
+    expect(modelFlagIndex).toBeGreaterThanOrEqual(0)
+    expect(argv[modelFlagIndex + 1]).toBe('gpt-5.6-sol')
+    expect(argv[argv.length - 1]).toBe('-')
+  })
+
+  it('model 未指定時は --model を argv に含めない', () => {
+    class TestCodexAdapter extends CodexAdapter {
+      testArgv(r: AiCliRequest): string[] { return this.buildArgv(r) }
+    }
+    const adapter = new TestCodexAdapter({ provider: 'codex' })
+    const argv = adapter.testArgv({
+      provider: 'codex',
+      taskId: 't1',
+      workingDir: '/workspace/target/app',
+      prompt: 'hello world',
+      contextFiles: [],
+      mode: 'implement',
+    })
+
+    expect(argv).not.toContain('--model')
+  })
 })
 
 // ────────────────────────────────────────────────────────────

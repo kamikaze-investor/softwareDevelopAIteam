@@ -216,6 +216,14 @@ export class GeminiReviewerAdapter implements IReviewerAdapter {
   }
 }
 
+/**
+ * Codex Reviewer が使用するモデル。
+ * Reviewer専用であり、実装用のCodex実行には適用しない。
+ * 利用不能な場合は CLI が非0で終了し、既存の exitCode 判定で blocking に倒れる
+ * （別モデルへの自動fallbackは行わない）。
+ */
+const CODEX_REVIEWER_MODEL = 'gpt-5.6-sol'
+
 export class CodexReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {
     const prompt = buildReviewPrompt(req)
@@ -230,6 +238,7 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
         contextFiles: [],
         mode: 'review',
         expectJson: true,
+        model: CODEX_REVIEWER_MODEL,
       })
 
       if (result.blocked) {

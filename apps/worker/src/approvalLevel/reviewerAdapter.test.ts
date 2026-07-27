@@ -317,6 +317,19 @@ describe('CodexReviewerAdapter.review', () => {
     }))
   })
 
+  it('adapter.run に Codex Reviewer 専用モデルを渡す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult())
+
+    await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'gpt-5.6-sol',
+    }))
+  })
+
   it.each<ReviewVerdict>(['approved', 'changes_requested', 'blocking'])(
     'stdout の正常JSONを %s に変換する',
     async verdict => {
