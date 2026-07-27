@@ -20,6 +20,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native'
@@ -31,6 +32,26 @@ declare const process: {
 }
 
 const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000'
+
+const RESUME_INSTRUCTION_MAX_LENGTH = 2000
+const RESUME_HELP_TEXT =
+  '元の停止した作業は履歴として残し、追加指示を含む新しい作業を開始します。危険な変更が含まれる場合は再び承認待ちになります。'
+const RESUME_ERROR_MESSAGE_FALLBACK =
+  '追加指示の送信に失敗しました。時間をおいて再度お試しください。'
+const RESUME_ERROR_MESSAGE_BY_REASON: Record<string, string> = {
+  'already exists for this task':
+    '既に実行中または待機中の作業があるため、追加指示を送れませんでした。',
+  'missing AI CLI':
+    'AI実行設定が不足しているため、再開できませんでした。',
+  'No jobs exist':
+    '対象の作業履歴が見つからないため、再開できませんでした。',
+  'not blocked':
+    '現在は停止状態ではないため、追加指示を送れませんでした。',
+  instruction: '入力内容を確認してください。',
+  validation: '入力内容を確認してください。',
+  'waiting for user review':
+    '承認待ちの操作があるため、追加指示を送れませんでした。',
+}
 
 const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
   blocked: '停止中',
@@ -262,6 +283,76 @@ function sortApprovalRequestsByNewestFirst(
   )
 }
 
+function canShowResumeUI(
+  jobs: Job[],
+  approvalRequests: ApprovalRequest[],
+): boolean {
+  // POST /api/tasks/:id/resume は最新Jobがblockedでない限り拒否するため、
+  // UIの表示条件もAPIと同じく「最新Job」を基準にする（queued/running Jobの有無や
+  // Task.status、古いREJECTEDだけでは判定しない）。
+  const latestJob = sortJobsByNewestFirst(jobs)[0]
+
+  if (latestJob?.status !== 'blocked') {
+    return false
+  }
+
+  const latestApprovalRequest =
+    sortApprovalRequestsByNewestFirst(approvalRequests)[0]
+
+  if (latestApprovalRequest?.status === 'WAITING_FOR_USER') {
+    return false
+  }
+
+  return true
+}
+
+async function readResumeApiError(response: Response): Promise<string | null> {
+  try {
+    const body = (await response.json()) as { error?: unknown }
+    return typeof body.error === 'string' ? body.error : null
+  } catch {
+    return null
+  }
+}
+
+function formatResumeErrorMessage(errorMessage: string | null): string {
+  if (errorMessage === null || errorMessage.length === 0) {
+    return RESUME_ERROR_MESSAGE_FALLBACK
+  }
+
+  const normalizedErrorMessage = errorMessage.toLowerCase()
+  const matchingMessage = Object.entries(RESUME_ERROR_MESSAGE_BY_REASON).find(
+    ([reason]) => normalizedErrorMessage.includes(reason.toLowerCase()),
+  )
+
+  return matchingMessage?.[1] ?? RESUME_ERROR_MESSAGE_FALLBACK
+}
+
+async function postResumeInstruction(
+  taskId: string,
+  instruction: string,
+): Promise<{ message: string; ok: false } | { ok: true }> {
+  try {
+    const response = await fetch(
+      `${API_BASE}/api/tasks/${encodeURIComponent(taskId)}/resume`,
+      {
+        body: JSON.stringify({ instruction }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    )
+
+    if (response.status === 201) {
+      return { ok: true }
+    }
+
+    const errorMessage = await readResumeApiError(response)
+    return { message: formatResumeErrorMessage(errorMessage), ok: false }
+  } catch {
+    return { message: RESUME_ERROR_MESSAGE_FALLBACK, ok: false }
+  }
+}
+
 function TaskInfoSection({ task }: { task: Task }): ReactElement {
   return (
     <View style={styles.section}>
@@ -281,6 +372,88 @@ function TaskInfoSection({ task }: { task: Task }): ReactElement {
         >
           {formatTaskStatus(task.status)}
         </Text>
+      </View>
+    </View>
+  )
+}
+
+interface ResumeInstructionSectionProps {
+  approvalRequests: ApprovalRequest[]
+  instruction: string
+  isEditorOpen: boolean
+  isSubmitting: boolean
+  jobs: Job[]
+  onChangeInstruction: (instruction: string) => void
+  onOpen: () => void
+  onSubmit: () => void
+}
+
+function ResumeInstructionSection({
+  approvalRequests,
+  instruction,
+  isEditorOpen,
+  isSubmitting,
+  jobs,
+  onChangeInstruction,
+  onOpen,
+  onSubmit,
+}: ResumeInstructionSectionProps): ReactElement | null {
+  if (!canShowResumeUI(jobs, approvalRequests)) {
+    return null
+  }
+
+  const trimmedInstruction = instruction.trim()
+  const isSubmitDisabled =
+    trimmedInstruction.length === 0 || isSubmitting
+
+  if (!isEditorOpen) {
+    return (
+      <View style={styles.section}>
+        <TouchableOpacity
+          onPress={onOpen}
+          style={styles.resumeOpenButton}
+        >
+          <Text style={styles.resumeOpenButtonText}>追加指示を出す</Text>
+        </TouchableOpacity>
+      </View>
+    )
+  }
+
+  return (
+    <View style={styles.section}>
+      <View style={styles.resumeBox}>
+        <Text style={styles.resumeHelpText}>{RESUME_HELP_TEXT}</Text>
+        <TextInput
+          editable={!isSubmitting}
+          maxLength={RESUME_INSTRUCTION_MAX_LENGTH}
+          multiline
+          onChangeText={onChangeInstruction}
+          placeholder="追加指示を入力"
+          placeholderTextColor="#737373"
+          style={styles.resumeInput}
+          textAlignVertical="top"
+          value={instruction}
+        />
+        <View style={styles.resumeFooter}>
+          <Text style={styles.resumeCounter}>
+            {instruction.length}/{RESUME_INSTRUCTION_MAX_LENGTH}
+          </Text>
+          <TouchableOpacity
+            disabled={isSubmitDisabled}
+            onPress={onSubmit}
+            style={[
+              styles.resumeSubmitButton,
+              isSubmitDisabled && styles.resumeSubmitButtonDisabled,
+            ]}
+          >
+            {isSubmitting && (
+              <ActivityIndicator color="#fff" size="small" />
+            )}
+            <Text style={styles.resumeSubmitButtonText}>
+              追加指示して再開
+            </Text>
+          </TouchableOpacity>
+        </View>
       </View>
     </View>
   )
@@ -429,6 +602,10 @@ export default function TaskDetailScreen(): ReactElement {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [notFound, setNotFound] = useState(false)
+  const [resumeInstruction, setResumeInstruction] = useState('')
+  const [isResumeEditorOpen, setIsResumeEditorOpen] = useState(false)
+  const [isSubmittingResumeInstruction, setIsSubmittingResumeInstruction] =
+    useState(false)
 
   const loadTaskDetail = useCallback(async (): Promise<void> => {
     if (taskId === null || taskId.length === 0) {
@@ -486,6 +663,65 @@ export default function TaskDetailScreen(): ReactElement {
     void loadTaskDetail()
   }, [loadTaskDetail])
 
+  const submitResumeInstruction = useCallback(
+    async (trimmedInstruction: string): Promise<void> => {
+      if (taskId === null || taskId.length === 0) {
+        Alert.alert(
+          '送信失敗',
+          'Task IDが指定されていないため、追加指示を送れませんでした。',
+        )
+        return
+      }
+
+      try {
+        setIsSubmittingResumeInstruction(true)
+        const result = await postResumeInstruction(taskId, trimmedInstruction)
+
+        if (!result.ok) {
+          Alert.alert('送信失敗', result.message)
+          return
+        }
+
+        setResumeInstruction('')
+        setIsResumeEditorOpen(false)
+        Alert.alert(
+          '追加指示して再開',
+          '追加指示を受け付け、新しい作業を開始しました',
+        )
+        await loadTaskDetail()
+      } finally {
+        setIsSubmittingResumeInstruction(false)
+      }
+    },
+    [loadTaskDetail, taskId],
+  )
+
+  const handleSubmitResumeInstruction = useCallback((): void => {
+    const trimmedInstruction = resumeInstruction.trim()
+
+    if (trimmedInstruction.length === 0 || isSubmittingResumeInstruction) {
+      return
+    }
+
+    Alert.alert(
+      '追加指示して再開',
+      '追加指示を送信して新しい作業を開始しますか？',
+      [
+        { style: 'cancel', text: 'キャンセル' },
+        {
+          onPress: () => {
+            void submitResumeInstruction(trimmedInstruction)
+          },
+          text: '送信',
+        },
+      ],
+    )
+  }, [
+    isSubmittingResumeInstruction,
+    resumeInstruction,
+    submitResumeInstruction,
+  ])
+
   if (loading) {
     return (
       <View style={styles.center}>
@@ -518,6 +754,16 @@ export default function TaskDetailScreen(): ReactElement {
       {data !== null && (
         <>
           <TaskInfoSection task={data.task} />
+          <ResumeInstructionSection
+            approvalRequests={data.approvalRequests}
+            instruction={resumeInstruction}
+            isEditorOpen={isResumeEditorOpen}
+            isSubmitting={isSubmittingResumeInstruction}
+            jobs={data.jobs}
+            onChangeInstruction={setResumeInstruction}
+            onOpen={() => setIsResumeEditorOpen(true)}
+            onSubmit={handleSubmitResumeInstruction}
+          />
           <JobHistorySection jobs={data.jobs} />
           <ApprovalHistorySection
             approvalRequests={data.approvalRequests}
@@ -624,6 +870,74 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     marginBottom: 4,
+  },
+  resumeBox: {
+    backgroundColor: '#141414',
+    borderColor: '#2a2a2a',
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 14,
+  },
+  resumeCounter: {
+    color: '#737373',
+    flex: 1,
+    fontSize: 12,
+  },
+  resumeFooter: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 12,
+    justifyContent: 'space-between',
+    marginTop: 10,
+  },
+  resumeHelpText: {
+    color: '#d4d4d4',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 10,
+  },
+  resumeInput: {
+    backgroundColor: '#0f0f0f',
+    borderColor: '#333',
+    borderRadius: 8,
+    borderWidth: 1,
+    color: '#fff',
+    fontSize: 14,
+    lineHeight: 20,
+    minHeight: 120,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  resumeOpenButton: {
+    alignItems: 'center',
+    backgroundColor: '#1d4ed8',
+    borderRadius: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  resumeOpenButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  resumeSubmitButton: {
+    alignItems: 'center',
+    backgroundColor: '#2563eb',
+    borderRadius: 8,
+    flexDirection: 'row',
+    gap: 8,
+    minHeight: 44,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  resumeSubmitButtonDisabled: {
+    backgroundColor: '#262626',
+    opacity: 0.7,
+  },
+  resumeSubmitButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
   },
   riskBadge: {
     alignSelf: 'flex-start',
