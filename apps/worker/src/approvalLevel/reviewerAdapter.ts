@@ -1,7 +1,9 @@
 import type { ApprovalLevelResult } from '@ai-team/shared'
+import { createAiCliAdapter } from '../aiCli/factory.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
+import { TARGET_ROOT } from '../utils/pathUtils.js'
 
-export type ReviewerProvider = 'gemini' | 'claude' | 'chatgpt'
+export type ReviewerProvider = 'gemini' | 'claude' | 'chatgpt' | 'codex'
 export type ImplementerProvider = 'claude_code' | 'codex' | 'gemini'
 export type ReviewPhase = 'pre' | 'post'
 export type ReviewVerdict = 'approved' | 'changes_requested' | 'blocking'
@@ -214,10 +216,63 @@ export class GeminiReviewerAdapter implements IReviewerAdapter {
   }
 }
 
+export class CodexReviewerAdapter implements IReviewerAdapter {
+  async review(req: ReviewerRequest): Promise<ReviewerResult> {
+    const prompt = buildReviewPrompt(req)
+    const adapter = createAiCliAdapter({ provider: 'codex' })
+
+    try {
+      const result = await adapter.run({
+        taskId: req.taskId,
+        provider: 'codex',
+        workingDir: TARGET_ROOT,
+        prompt,
+        contextFiles: [],
+        mode: 'review',
+        expectJson: true,
+      })
+
+      if (result.blocked) {
+        return buildFailureResult(result.stdout || result.stderr || '', 'codex', req.phase)
+      }
+
+      if (result.exitCode !== 0) {
+        return {
+          provider: 'codex',
+          phase: req.phase,
+          verdict: 'blocking',
+          summary: `レビューAI呼び出しに失敗しました: exitCode=${result.exitCode}`,
+          issues: [],
+          confidence: 0,
+          generatedAt: new Date().toISOString(),
+          rawResponse: result.stdout || result.stderr || '',
+        }
+      }
+
+      return parseReviewerResponse(result.stdout, 'codex', req.phase)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+
+      return {
+        provider: 'codex',
+        phase: req.phase,
+        verdict: 'blocking',
+        summary: `レビューAI呼び出しに失敗しました: ${message}`,
+        issues: [],
+        confidence: 0,
+        generatedAt: new Date().toISOString(),
+        rawResponse: '',
+      }
+    }
+  }
+}
+
 export function createReviewerAdapter(provider: ReviewerProvider): IReviewerAdapter {
   switch (provider) {
     case 'gemini':
       return new GeminiReviewerAdapter()
+    case 'codex':
+      return new CodexReviewerAdapter()
     case 'claude':
       throw new Error('ClaudeReviewerAdapter は未実装です（将来拡張ポイント）')
     case 'chatgpt':

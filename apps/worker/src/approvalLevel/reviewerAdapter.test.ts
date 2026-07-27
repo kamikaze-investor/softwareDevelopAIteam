@@ -1,13 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ApprovalLevelResult } from '@ai-team/shared'
+import type { AiCliResult, ApprovalLevelResult } from '@ai-team/shared'
 
 vi.mock('../metaReviewer/geminiRouter.js', () => ({
   callGeminiWithFallback: vi.fn(),
 }))
 
+vi.mock('../aiCli/factory.js', () => ({
+  createAiCliAdapter: vi.fn(),
+}))
+
+import { createAiCliAdapter } from '../aiCli/factory.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
+import { TARGET_ROOT } from '../utils/pathUtils.js'
 import {
   buildReviewPrompt,
+  CodexReviewerAdapter,
   createReviewerAdapter,
   GeminiReviewerAdapter,
   parseReviewerResponse,
@@ -23,6 +30,7 @@ import type {
 } from './reviewerAdapter.js'
 
 const mockCallGeminiWithFallback = vi.mocked(callGeminiWithFallback)
+const mockCreateAiCliAdapter = vi.mocked(createAiCliAdapter)
 
 function makeApprovalLevelResult(overrides: Partial<ApprovalLevelResult> = {}): ApprovalLevelResult {
   const level = overrides.level ?? 2
@@ -88,6 +96,25 @@ function makeReviewerResult(overrides: Partial<ReviewerResult> = {}): ReviewerRe
     rawResponse: reviewerJson('approved'),
     ...overrides,
   }
+}
+
+function makeAiCliResult(overrides: Partial<AiCliResult> = {}): AiCliResult {
+  return {
+    taskId: 'task-1',
+    provider: 'codex',
+    exitCode: 0,
+    stdout: reviewerJson('approved'),
+    stderr: '',
+    changedFiles: [],
+    durationMs: 10,
+    ...overrides,
+  }
+}
+
+function mockCodexAdapterRun(): ReturnType<typeof vi.fn> {
+  const run = vi.fn()
+  mockCreateAiCliAdapter.mockReturnValue({ run } as ReturnType<typeof createAiCliAdapter>)
+  return run
 }
 
 beforeEach(() => {
@@ -269,9 +296,126 @@ describe('GeminiReviewerAdapter.review', () => {
   })
 })
 
+describe('CodexReviewerAdapter.review', () => {
+  it('createAiCliAdapter 経由で mode:review と expectJson:true を渡す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult())
+
+    await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+      phase: 'post',
+    }))
+
+    expect(mockCreateAiCliAdapter).toHaveBeenCalledWith({ provider: 'codex' })
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'task-1',
+      provider: 'codex',
+      workingDir: TARGET_ROOT,
+      contextFiles: [],
+      mode: 'review',
+      expectJson: true,
+    }))
+  })
+
+  it.each<ReviewVerdict>(['approved', 'changes_requested', 'blocking'])(
+    'stdout の正常JSONを %s に変換する',
+    async verdict => {
+      const run = mockCodexAdapterRun()
+      run.mockResolvedValue(makeAiCliResult({ stdout: reviewerJson(verdict) }))
+
+      const result = await new CodexReviewerAdapter().review(makeRequest({
+        reviewerProvider: 'codex',
+      }))
+
+      expect(result.provider).toBe('codex')
+      expect(result.verdict).toBe(verdict)
+    },
+  )
+
+  it('adapter.run が blocked:true を返すと blocking に倒す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({
+      stdout: reviewerJson('approved'),
+      blocked: true,
+    }))
+
+    const result = await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(result.provider).toBe('codex')
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+  })
+
+  it('adapter.run が exitCode 0以外を返すと blocking に倒す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({
+      exitCode: 2,
+      stdout: reviewerJson('approved'),
+      stderr: 'cli failed',
+    }))
+
+    const result = await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(result.provider).toBe('codex')
+    expect(result.verdict).toBe('blocking')
+    expect(result.summary).toContain('exitCode=2')
+    expect(result.confidence).toBe(0)
+  })
+
+  it('stdout が不正JSONなら fail closed で blocking に倒す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({ stdout: 'not json' }))
+
+    const result = await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(result.provider).toBe('codex')
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+  })
+
+  it('adapter.run が例外をthrowすると blocking に倒す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockRejectedValue(new Error('spawn failed'))
+
+    const result = await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(result.provider).toBe('codex')
+    expect(result.verdict).toBe('blocking')
+    expect(result.summary).toContain('spawn failed')
+    expect(result.confidence).toBe(0)
+    expect(result.rawResponse).toBe('')
+  })
+
+  it('adapter.run の workingDir は TARGET_ROOT である', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult())
+
+    await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      workingDir: TARGET_ROOT,
+    }))
+    expect(TARGET_ROOT).toBe('/workspace/target')
+  })
+})
+
 describe('createReviewerAdapter', () => {
   it('gemini は GeminiReviewerAdapter のインスタンスを返す', () => {
     expect(createReviewerAdapter('gemini')).toBeInstanceOf(GeminiReviewerAdapter)
+  })
+
+  it('codex は CodexReviewerAdapter のインスタンスを返す', () => {
+    expect(createReviewerAdapter('codex')).toBeInstanceOf(CodexReviewerAdapter)
   })
 
   it('claude は未実装エラーをthrowする', () => {
