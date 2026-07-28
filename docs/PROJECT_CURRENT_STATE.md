@@ -54,6 +54,7 @@ AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間�
 | Watchdog | `apps/worker/src/watchdog/{watchdog,stallDetector}.ts` | 実装済み・テストあり |
 | stale / expired approval cleanup | `apps/api/src/routes/{approvalGate,approvals}.ts`, `apps/worker/src/guards/{gateClient,gatePolicy}.ts`, `apps/worker/src/jobStateManager.ts` | 実装済み・テストあり |
 | Mobile app | `apps/mobile/app/{index,create,approvals}.tsx` | 実装済み |
+| Project作成画面（`create.tsx`） | 名前・Goal・Design Philosophy入力 | 実装済み |
 | Android実機Expo Go起動・API疎通・Project一覧表示 | 同上（コミット `be0a5b5`〜`9b3121c`） | 実機確認済み・E2E-4 |
 | 下部フッター固定表示 | `apps/mobile/app/index.tsx`（`6b8eff3`） | 実機確認済み |
 | Expo app config | `apps/mobile/app.json`（`9b3121c`） | 実機確認済み |
@@ -74,21 +75,18 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 存在しない・弱いという意味ではない。既存機能はそのまま維持対象であり、以下は**スマホ操作MVP到達のために
 新たに必要な残タスク**として扱う。詳細な実装タスクは `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 
-**既に確認済みのMobile app機能:**
-- Android実機Expo Go起動・API疎通・Project一覧表示（Implemented MVP Baseline参照）
-- Project作成（`create.tsx`: 名前・Goal・Design Philosophy入力）
-- Project単位承認の一覧・承認/却下（`approvals.tsx`。`apps/api/src/routes/approvals.ts`経由）
-- Task/Job単位Approval Gateの一覧・承認/却下（`approvals.tsx`。`/api/approval-requests/waiting`経由）
-- Task/Job一覧・詳細UI（`tasks.tsx`, `tasks/[id].tsx`。status・Job履歴・承認履歴・失敗理由を表示）
-- 再実行・追加指示UI（Task詳細画面。`POST /api/tasks/:id/resume`経由）
-- 下部フッター固定表示・Expo app config
+<!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:START -->
+**完了項目:**
+- Task/Job一覧・詳細画面（Mobile）
+- Task/Job単位Approval GateのMobile UI連携
+- 再実行・追加指示UI（Mobile）
 
-**未実装の重要項目（スマホ操作MVP到達に必要な残タスク）:**
-- Task作成UI（開発指示。現状Project作成のみでTask追加導線がない。**現在の主要実装残タスク**）
+**未完了・保留項目:**
+- 2種類の承認の役割整理とMobile導線設計（state: deferred）
+- 開発指示（Task作成）画面（Mobile）（state: planned）
 
-**文書整理のみ残っている項目（実装は完了・非ブロッキング）:**
-- Project単位承認とTask/Job単位Approval Gateは、統合せず併存させる形でMobile実装済み。
-  両者の役割・使い分けの文書化のみ未完了
+詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
+<!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
 
 ---
 

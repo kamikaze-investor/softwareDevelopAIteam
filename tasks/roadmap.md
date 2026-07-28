@@ -253,20 +253,25 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 
 **MVP必須（このセクションの5項目）:**
 
+<!-- roadmap:id=mobile-approval-role-docs state=deferred -->
 1. [ ] 2種類の承認の役割整理とMobile導線設計 — **Mobile導線は実装完了・文書整理のみ未完**。
    Project単位承認（`/api/approvals/pending`）とTask/Job単位Approval Gate
    （`/api/approval-requests/waiting`）は、統合せず併存させる形で`approvals.tsx`に実装済み
    （一覧取得・承認/却下操作とも動作）。**未完了なのは両者の役割・使い分けの文書化のみ**で、
    これはMVP必須ではなく非ブロッキング（スマホ操作サイクルは現状の併存実装で完結するため、
    項目4の後またはMVP後に実施してよい）
+<!-- roadmap:id=mobile-task-job-detail-ui state=done -->
 2. [x] Task/Job一覧・詳細画面（Mobile） — 完了。Task一覧（`tasks.tsx`）・Task詳細（`tasks/[id].tsx`、
    Task情報・Job履歴・承認履歴を表示）を実装（コミット`0b91eac`, `a76a790`）
+<!-- roadmap:id=mobile-approval-gate-ui state=done -->
 3. [x] Task/Job単位Approval GateのMobile UI連携 — 完了。`approvals.tsx`が`/api/approval-requests/waiting`
    から取得し、`/api/approval-requests/:id/status`で承認/却下操作まで実装済み
+<!-- roadmap:id=mobile-task-create state=planned -->
 4. [ ] 開発指示（Task作成）画面（Mobile） — **スマホ操作MVPの現在の主要残タスク**。現状`create.tsx`は
    Project作成のみで、Project内にTaskを追加する導線がスマホ側にない。Task作成後、誰が・どの経路で
    初回Jobを起動するか（CTO AI/Developer AI Orchestratorの既存ルートで代替できないか等）を
    既存経路の調査から始め、調査後に実装方針を決める
+<!-- roadmap:id=mobile-task-resume-ui state=done -->
 5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
    （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
 
@@ -285,6 +290,13 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 
 目的: 継続的に開発できる状態にする
 
+- [ ] Roadmap Progress Automation（`tasks/roadmap.md`の進捗状態管理と`docs/PROJECT_CURRENT_STATE.md`
+      「スマホ操作MVPの現在地」の要約同期を、LLMではなく決定論的なコードで行う運用基盤。
+      実装は`apps/worker/scripts/roadmap/`。`pnpm roadmap:update|sync|check`で操作）
+  - [x] 第1段階: update / sync / check CLIとCurrent State生成ブロック（roadmap項目への
+        `<!-- roadmap:id=... state=... -->`メタデータ付与はまず「スマホ操作MVP残タスク」の
+        5項目のみに段階導入。全項目への一括展開はしていない）
+  - [ ] 第2段階: 既存の開発完了・検証フローへの最小接続
 - [ ] Project Reviewer AI（target-project/のコードレビュー）
 - [ ] QA AI（テスト自動実行・品質判定）
 - [ ] Memory Governance

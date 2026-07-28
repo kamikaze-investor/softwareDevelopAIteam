@@ -11,7 +11,10 @@
     "dev": "pnpm --parallel --filter './apps/*' dev",
     "build": "pnpm --filter './packages/*' build && pnpm --filter './apps/*' build",
     "test": "pnpm --parallel --filter './apps/*' test",
-    "typecheck": "pnpm --parallel --filter './apps/*' typecheck"
+    "typecheck": "pnpm --parallel --filter './apps/*' typecheck",
+    "roadmap:update": "pnpm --filter @ai-team/worker exec tsx scripts/roadmap/cli.ts update",
+    "roadmap:sync": "pnpm --filter @ai-team/worker exec tsx scripts/roadmap/cli.ts sync",
+    "roadmap:check": "pnpm --filter @ai-team/worker exec tsx scripts/roadmap/cli.ts check"
   },
   "engines": {
     "node": ">=20.0.0",
