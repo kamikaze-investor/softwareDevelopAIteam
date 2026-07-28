@@ -313,10 +313,21 @@ try { ... } catch (e) {
 ### Q12. ドキュメントを同時に更新する
 
 - 新機能追加・型定義変更時は同じコミット内で以下を更新する:
-  - `tasks/task_graph.md`（タスクの状態）
+  - `tasks/task_graph.md`（target-project側のタスク状態・依存関係。CTO AI / `roadmapWriter.ts`が
+    生成・更新する対象）
   - `docs/project_memory/` （設計判断があれば）
   - `docs/session-log.md`（ハンドオフエントリ）
-- `AGENTS.md` 自体の変更は **Worker が行う**（AI が直接変更しない）
+- Control Repository自身の開発タスクについて:
+  - タスク開始時に、既存`tasks/roadmap.md`項目への影響・新しい追跡対象の発生・影響なしの
+    いずれかを確認する
+  - 進捗状態が変化した場合や記載漏れを発見した場合は`tasks/roadmap.md`を更新する
+    （`tasks/task_graph.md`とは別ファイル・別スコープであり、同じ状態を両方へ重複記録しない）
+  - 状態変更には可能な限り`pnpm roadmap:update` / `pnpm roadmap:sync`を使う
+  - 完了報告前に`pnpm verify`を実行する
+  - 完了報告には対象ロードマップ項目と最終stateを記載する
+  - 進捗に影響しない小規模修正では`tasks/roadmap.md`の更新は不要
+- `AGENTS.md` 自体の変更は、CEOが具体的diffを明示承認した場合に限り実施する。AIによる
+  無承認変更は禁止する。Goal・Design Philosophy・権限・安全方針に影響する変更は必ずCEO承認を得る
 
 ---
 

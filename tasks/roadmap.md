@@ -290,13 +290,24 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 
 目的: 継続的に開発できる状態にする
 
-- [ ] Roadmap Progress Automation（`tasks/roadmap.md`の進捗状態管理と`docs/PROJECT_CURRENT_STATE.md`
+- [x] Roadmap Progress Automation（`tasks/roadmap.md`の進捗状態管理と`docs/PROJECT_CURRENT_STATE.md`
       「スマホ操作MVPの現在地」の要約同期を、LLMではなく決定論的なコードで行う運用基盤。
       実装は`apps/worker/scripts/roadmap/`。`pnpm roadmap:update|sync|check`で操作）
   - [x] 第1段階: update / sync / check CLIとCurrent State生成ブロック（roadmap項目への
         `<!-- roadmap:id=... state=... -->`メタデータ付与はまず「スマホ操作MVP残タスク」の
         5項目のみに段階導入。全項目への一括展開はしていない）
-  - [ ] 第2段階: 既存の開発完了・検証フローへの最小接続
+  - [x] 第2段階: 既存の開発完了・検証フローへの最小接続（A+B構成、完了）
+        - [x] B: `pnpm verify`（`pnpm -r typecheck && pnpm -r test && pnpm roadmap:check`）を
+              package.jsonへ追加。既存の`typecheck`/`test`/`roadmap:*`スクリプトは無変更
+        - [x] A: AGENTS.md Q12へルール追記（開発タスク開始時のroadmap影響確認・
+              進捗変化時のroadmap更新・`pnpm roadmap:update/sync`の使用・完了報告前の
+              `pnpm verify`実行・完了報告への対象ロードマップ項目/最終state記載）。
+              CEOの具体的diff明示承認を得てClaudeが直接適用（Worker経由の自動適用経路が
+              存在しないことを確認済みのため）。あわせて`tasks/task_graph.md`
+              （target-project向け）と`tasks/roadmap.md`（Control Repository自身）の
+              責務をQ12内で明記し、二重記録を避ける設計にした
+        - **`roadmap:check`だけでは「更新自体を忘れたこと」は検出できない**ため、
+          A（タスク開始・完了報告フロー側の確認）と組み合わせて運用する
 - [ ] Project Reviewer AI（target-project/のコードレビュー）
 - [ ] QA AI（テスト自動実行・品質判定）
 - [ ] Memory Governance
