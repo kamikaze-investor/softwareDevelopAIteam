@@ -236,18 +236,20 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 
 **MVP必須（このセクションの5項目）:**
 
-1. [ ] 2種類の承認の役割整理とMobile導線設計 — Project単位承認（`apps/api/src/routes/approvals.ts`、
-   Mobile `approvals.tsx`で使用中）とTask/Job単位Approval Gate（`apps/api/src/routes/approvalGate.ts`、
-   `/approval-requests`系。Mobileから未接続）は役割が異なる可能性があるため、統一を前提とせず、
-   まず両者の役割・使い分けを調査したうえでMobile導線設計に反映する（統合するか併存させるかは調査後に判断）
-2. [ ] Task/Job一覧・詳細画面（Mobile） — 現状Projectをタップしても遷移せず、Task/Jobのstatus
-   （queued/running/success/failed/blocked）・進捗・失敗理由をスマホから確認する手段がない
-3. [ ] Task/Job単位Approval GateのMobile UI連携 — `/approval-requests`系がMobile UIから見えず、
-   LINE/Slack通知が届いても対応する承認画面がないため通知→承認が現状つながらない
-4. [ ] 開発指示（Task作成）画面（Mobile） — 現状`create.tsx`はProject作成のみで、Project内に
-   Taskを追加する導線がスマホ側にない
-5. [ ] 再実行・追加指示UI（Mobile） — Job失敗後にスマホから再実行・追加指示を出す手段がない
-   （4の実装後に着手）
+1. [x] 2種類の承認の役割整理とMobile導線設計 — Project単位承認（`/api/approvals/pending`、
+   Mobile `approvals.tsx`で使用中）とTask/Job単位Approval Gate（`/api/approval-requests/waiting`、
+   同じく`approvals.tsx`から取得・操作）は、統合せず併存させる形でMobile実装済み。
+   **残るのは文書上の責務整理のみ**（両者の役割・使い分けを明文化する作業。実装上のブロッカーではない）
+2. [x] Task/Job一覧・詳細画面（Mobile） — 完了。Task一覧（`tasks.tsx`）・Task詳細（`tasks/[id].tsx`、
+   Task情報・Job履歴・承認履歴を表示）を実装（コミット`0b91eac`, `a76a790`）
+3. [x] Task/Job単位Approval GateのMobile UI連携 — 完了。`approvals.tsx`が`/api/approval-requests/waiting`
+   から取得し、`/api/approval-requests/:id/status`で承認/却下操作まで実装済み
+4. [ ] 開発指示（Task作成）画面（Mobile） — **スマホ操作MVPの現在の主要残タスク**。現状`create.tsx`は
+   Project作成のみで、Project内にTaskを追加する導線がスマホ側にない。Task作成後、誰が・どの経路で
+   初回Jobを起動するか（CTO AI/Developer AI Orchestratorの既存ルートで代替できないか等）を
+   既存経路の調査から始め、調査後に実装方針を決める
+5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
+   （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
 
 **MVP後または別タスク扱い（既存バックログ通り。変更なし）:** Dashboard/approvals間の画面遷移遅延調査、
 Dashboardの`ScrollView`/N+1 fetch改善、Project詳細画面（`ProjectCard`タップ遷移）、開発DBテストデータ
