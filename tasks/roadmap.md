@@ -64,6 +64,11 @@
 - [x] AI CLI 失敗時（blocked / exitCode !== 0 / throw）→ Job failed 早期リターン (388358d)
 - [x] aiCliProvider なし既存 Job への影響ゼロを保証 (388358d)
 - [x] テスト 5 ケース追加（285/285 pass）(388358d)
+- [x] **仕様と実装の差異を修正**: `aiCliProvider`/`aiCliPrompt`/`aiCliMode`はJob型・APIバリデーションには
+      存在していたが、`jobs.create()`のINSERT文に含まれておらず**DBへ実際には永続化されていなかった**
+      （task-022導入時からの潜在バグ。AI CLI事前実行機能を使う全Jobが対象）。resume API実装時の調査で発覚し、
+      専用カラム追加（`ai_cli_provider`/`ai_cli_prompt`/`ai_cli_mode`、既存`MIGRATION_STATEMENTS`パターン）で
+      修正（コミット`92fe91b`）
 - [ ] contextFiles 拡張（Context Manager 連携）← 別 task
 
 ### 1-D: バックエンド実装
@@ -151,7 +156,7 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
 - [x] Step R4（設計のみ）: commitGateの接続設計 — safetyVerifier/preReviewer/postReviewerが
       未接続のため今この時点で接続すると`allowed`がほぼ常にfalseになる、という重要な発見を記録。
       接続する場合はGemini Step Reviewブロック直後・isAtomic分岐直前、観察モード限定と結論
-      （仕様書6-2章）。`jobRunner.ts`/`commitGate.ts`はAV-001対象のため今回は未編集
+      （仕様書6-2章）。`jobRunner.ts`/`commitGate.ts`はCONTROL REPOSITORY保護対象のため今回は未編集
 - [x] Step R4前提整理（設計のみ）: safetyVerifier/preReviewer/postReviewerの接続順序を整理
       （仕様書6-3章）。postReviewerは既存Risk Scan/Step Reviewと同じ入力で接続可能、
       safetyVerifierは12項目中8項目が既存情報で評価可能（残り4項目はtypecheck/test実行結果3項目・
@@ -184,6 +189,18 @@ ChatGPTが読んでコミット可否・次工程・CEO承認要否を整理す�
       が存在せず既存の呼び出しゲート条件が使えない、(3) 観察モードでは「実装前に止める」という
       preReviewer本来の価値が活きない、ことが判明。破棄ではなく、MVP後の設計再検討対象として扱う
 - [ ] Step R5: ChatGPT最終判断レビューの実装（Review Transport Mode/Quota Policyに従う）
+- [x] Step R5-A（実装）: read-only Codex Reviewer Adapterの追加 — 既存`reviewerAdapter.ts`の
+      `createReviewerAdapter()`拡張ポイント（従来`claude`/`chatgpt`は未実装エラーのみ）に`codex`を追加。
+      既存の`createAiCliAdapter`/`buildReviewPrompt`/`parseReviewerResponse`を再利用し、新しい
+      プロンプト生成・JSONパーサーは作っていない（`mode:'review'`によりCodex CLIは
+      `--sandbox read-only`で起動。CLI失敗・blocked・不正JSON・例外はすべて`blocking`へfail-closed。
+      コミット`fe56b8e`）。Reviewerが使うモデルは`gpt-5.6-sol`を明示指定（`AiCliRequest.model`は任意項目で、
+      実装用Codex実行には適用しない。コミット`c3ff36a`）。
+      **本番Jobフロー（`jobRunner.ts`）への接続は未実施**（現状どこからも呼ばれていない）。
+      Step R5がChatGPTによる最終判断レビューの実装であるのに対し、本項目はその判断レビュー枠を
+      別ベンダーのReviewerで担えるようにするAdapter追加であり、Step R5を置き換えるものではない。
+      **スマホ操作MVP必須ではないため、Phase 2の項目4（Task作成フロー）を優先し、接続は保留**
+      （破棄ではない。再開条件: スマホ操作MVP完了後）
 - [ ] Step R6: CEO承認UI・事後報告フローの設計
 
 **ステータス:** 仕様策定完了（層分離・Review Transport Mode・Quota Policyを含む）。
@@ -236,10 +253,12 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 
 **MVP必須（このセクションの5項目）:**
 
-1. [x] 2種類の承認の役割整理とMobile導線設計 — Project単位承認（`/api/approvals/pending`、
-   Mobile `approvals.tsx`で使用中）とTask/Job単位Approval Gate（`/api/approval-requests/waiting`、
-   同じく`approvals.tsx`から取得・操作）は、統合せず併存させる形でMobile実装済み。
-   **残るのは文書上の責務整理のみ**（両者の役割・使い分けを明文化する作業。実装上のブロッカーではない）
+1. [ ] 2種類の承認の役割整理とMobile導線設計 — **Mobile導線は実装完了・文書整理のみ未完**。
+   Project単位承認（`/api/approvals/pending`）とTask/Job単位Approval Gate
+   （`/api/approval-requests/waiting`）は、統合せず併存させる形で`approvals.tsx`に実装済み
+   （一覧取得・承認/却下操作とも動作）。**未完了なのは両者の役割・使い分けの文書化のみ**で、
+   これはMVP必須ではなく非ブロッキング（スマホ操作サイクルは現状の併存実装で完結するため、
+   項目4の後またはMVP後に実施してよい）
 2. [x] Task/Job一覧・詳細画面（Mobile） — 完了。Task一覧（`tasks.tsx`）・Task詳細（`tasks/[id].tsx`、
    Task情報・Job履歴・承認履歴を表示）を実装（コミット`0b91eac`, `a76a790`）
 3. [x] Task/Job単位Approval GateのMobile UI連携 — 完了。`approvals.tsx`が`/api/approval-requests/waiting`

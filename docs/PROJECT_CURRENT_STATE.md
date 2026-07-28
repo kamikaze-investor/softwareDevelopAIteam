@@ -78,15 +78,17 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - Android実機Expo Go起動・API疎通・Project一覧表示（Implemented MVP Baseline参照）
 - Project作成（`create.tsx`: 名前・Goal・Design Philosophy入力）
 - Project単位承認の一覧・承認/却下（`approvals.tsx`。`apps/api/src/routes/approvals.ts`経由）
+- Task/Job単位Approval Gateの一覧・承認/却下（`approvals.tsx`。`/api/approval-requests/waiting`経由）
+- Task/Job一覧・詳細UI（`tasks.tsx`, `tasks/[id].tsx`。status・Job履歴・承認履歴・失敗理由を表示）
+- 再実行・追加指示UI（Task詳細画面。`POST /api/tasks/:id/resume`経由）
 - 下部フッター固定表示・Expo app config
 
 **未実装の重要項目（スマホ操作MVP到達に必要な残タスク）:**
-- Task/Job一覧・詳細UI（status・進捗・失敗理由を確認する手段が現状ない）
-- Task作成UI（開発指示。現状Project作成のみでTask追加導線がない）
-- Task/Job単位Approval GateのMobile連携（`apps/api/src/routes/approvalGate.ts`の`/approval-requests`系。
-  Project単位承認とは別物であり、現状Mobileから未接続）
-- Job結果・失敗理由表示
-- 再実行・追加指示UI
+- Task作成UI（開発指示。現状Project作成のみでTask追加導線がない。**現在の主要実装残タスク**）
+
+**文書整理のみ残っている項目（実装は完了・非ブロッキング）:**
+- Project単位承認とTask/Job単位Approval Gateは、統合せず併存させる形でMobile実装済み。
+  両者の役割・使い分けの文書化のみ未完了
 
 ---
 
@@ -149,9 +151,9 @@ softwareDevelopAIteam/            ← Control Repository（AI編集禁止）
 
 | 機能 | ファイル |
 |---|---|
-| 共有型定義（14種） | `packages/shared/src/types/` |
+| 共有型定義（19種） | `packages/shared/src/types/` |
 | モノレポ骨格 | `pnpm-workspace.yaml` |
-| 仕様書 | `specs/01〜11` |
+| 仕様書 | `specs/00〜11, 13, 20` |
 
 ### Phase 1-B: Meta Reviewer AI ✅
 
@@ -411,7 +413,11 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 ## 7. テストカバレッジ
 
-### 実行結果（2026-07-02）: **全 798 件パス** ✅
+### 実行結果（2026-07-28）: **api 336 件・worker 511 件（合計847件）パス** ✅
+
+（shared/mobileはtestスクリプトなし・typecheckのみ実施。typecheckはshared/api/worker/mobile全て通過。内訳の詳細は下記は2026-07-02時点のスナップショットのまま）
+
+### 実行結果（2026-07-02）: 全 798 件パス ✅
 
 （2026-07-01時点の566件から、AI Approval Level v2（Step1〜6-B0）・Target Project Risk Scan v1・代表Health Endpoint追加により798件に増加。内訳の詳細は下記は2026-07-01時点のスナップショットのまま）
 
@@ -465,7 +471,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 | # | リスク | 詳細 |
 |---|---|---|
-| R-007 | **未追跡スクリプトの扱い** | `apps/worker/scripts/alignmentCheck.ts` / `postTestHook.ps1` が未追跡。意図的な未追跡（AV-001 対象）のため現状維持。代表Health Endpoint追加コミット（9a425f2）でもこの2ファイルおよび `apps/worker/data/` は含めていない。既存の意図的未追跡として引き続き現状維持。 |
+| R-007 | **未追跡スクリプトの扱い** | `apps/worker/scripts/alignmentCheck.ts` / `postTestHook.ps1` が未追跡。意図的な未追跡（CONTROL REPOSITORY保護対象）のため現状維持。代表Health Endpoint追加コミット（9a425f2）でもこの2ファイルおよび `apps/worker/data/` は含めていない。既存の意図的未追跡として引き続き現状維持。 |
 | R-008 | **代表Health Endpointの`/api/health`無認証公開** | `/api/health`・`/health`は認証除外。レスポンスに秘密情報を含まないことをテストで担保済み（`health.test.ts`）だが、外部公開範囲を広げた判断であることを継続的に把握しておく。IPアクセス制限は未実装（roadmap未決定事項）。 |
 | R-009 | **safetyVerification観察結果の`overallPassed:false`は危険検出とは限らない** | Step R4-B（コミット929efe8）で`safetyVerifier`を観察モード接続。`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`の3項目は実行結果を渡していないため常にfail-closedになり、`overallPassed:false`の主要因になり得る。`review_observation.jsonl`の`blockingFailures`を見れば、本当の危険シグナルか未接続項目由来かを区別できる。 |
 
@@ -477,7 +483,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 | タスク | 理由 | 担当 |
 |---|---|---|
-| **MVP E2E疎通確認（最優先）** | Project/Task/Job CRUD API・CTO AI・Context Pack・Developer AI・Summary Engine・Mobile Dashboardは個別に実装済み・テストありだが、一連の流れが実際につながって動くかは未検証。roadmap整合性是正（2026-07-06）を踏まえた、MVP完成の実質的なゴール判定タスク | Claude Code |
+| **スマホからの開発指示（Task作成）フローの調査・設計・実装** | スマホ操作MVPの現在の主要実装残タスク。Task/Job一覧・詳細UI・Approval Gate連携・再実行/追加指示UIは完了済みで、Project内にTaskを追加する導線のみ未実装。Task作成後の初回Job起動方法を既存経路（CTO AI/Developer AI Orchestrator等）から調査したうえで実装方針を決める | Claude Code |
 | **Context Manager 連携（contextFiles 拡張）** | AI CLI の `contextFiles` が現在 `[]` 固定。Context Manager AI が ContextPack を生成して渡すことで AI の実装精度が向上する | Claude Code |
 | **postTestHook.ps1 正式設計** | ローカル開発時の Meta Review 自動実行を正式経路で再設計。現状は `exit 0` のみで機能停止中 | Claude Code |
 
@@ -485,7 +491,6 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 | タスク | 理由 | 担当 |
 |---|---|---|
-| **Mobile Dashboard 実装（task-012〜013）** | Expo 画面が骨格のみ。スマホからの状況確認に直結 | Codex or Claude Code |
 | **apps/api テスト補完** | 一部ルートの未テスト領域を埋める | Codex |
 | **CLI 出力パーサー + JSON リトライ（task-023）** | AI CLI が JSON 出力を期待する場合のリトライ機構 | Codex |
 | **VPS Doctor Lite側から `/api/health` を読む** | 代表Health Endpoint追加（9a425f2）を実際に外部監視に接続する | 別プロジェクト |
@@ -493,6 +498,7 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 | **app manifest** | VPS App Runtime Standard v1の未決定事項 | 別途設計 |
 | **target-project用リスクスキャン preflight判定** | Target Project Risk Scan v1（観察モード、コミットd16a709〜afab85c）の次段階設計 | Claude Code |
 | **commitGate観察モード接続（Step R4-C）** | **保留中。** Step R4-A（postReviewer, 5de0f15）・R4-B（safetyVerifier, 929efe8）は完了し、`review_observation.jsonl`にRisk Scan/Gemini Step Review/postReview/safetyVerificationの観察結果が蓄積される状態になった。preReviewer接続を調査した結果、本質的なボトルネックは「preReviewer未接続」ではなく`commitGate`が依存する`reviewPolicy`がcontrol repo基準でtarget_project向けJobには信頼できないこと（Step6-B0で既知）と判明。preReviewer接続自体は責務重複・入力不足・観察モードでの価値低下により見送り。再開条件: MVP後、またはtarget_project向けreviewPolicy/commitGate必須成果物設計を見直した後 | Claude Code |
+| **Codex Reviewer本番接続** | read-only Codex Reviewer Adapter（`fe56b8e`）・モデル明示指定（`c3ff36a`）は実装済みだが、`jobRunner.ts`への接続は未実施。スマホ操作MVP必須ではないため保留中 | Claude Code |
 
 ---
 
