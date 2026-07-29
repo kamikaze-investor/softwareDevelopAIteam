@@ -9,10 +9,22 @@
 
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
+import type { RoadmapSyncTaskInput } from './roadmapTaskValidation'
+
+export type { RoadmapSyncTaskInput } from './roadmapTaskValidation'
 
 export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
   | { ok: false; reason: string }
+
+export interface RoadmapSyncResult {
+  ok: boolean
+  createdTaskIds: string[]
+  updatedTaskIds: string[]
+  reactivatedTaskIds: string[]
+  deactivatedTaskIds: string[]
+  failureReason?: string
+}
 
 export interface IProjectStorage {
   findAll(): Project[]
@@ -34,6 +46,12 @@ export interface ITaskStorage {
    */
   create(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & { roadmapActive?: boolean }): Task
   update(id: string, data: Partial<Task>): Task | undefined
+  /**
+   * 検証済みロードマップTask一覧を、単一トランザクションでDBへ同期する。
+   * 呼び出し前に validateRoadmapTasks() で自己整合性検証が済んでいる前提。
+   * 失敗時はDBを一切変更しない。
+   */
+  syncRoadmapTasks(input: { projectId: string; tasks: RoadmapSyncTaskInput[] }): RoadmapSyncResult
 }
 
 export interface IJobStorage {

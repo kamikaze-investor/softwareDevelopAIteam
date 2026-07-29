@@ -9,9 +9,10 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { RoadmapSyncTaskInput } from './roadmapTaskValidation'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -48,6 +49,16 @@ function parseStringArray(value: unknown): string[] {
   } catch {
     return []
   }
+}
+
+const ACTIVE_JOB_STATUSES = new Set<JobStatus>(['queued', 'running', 'blocked'])
+
+function sameStringArray(left: string[] | undefined, right: string[] | undefined): boolean {
+  const leftValues = left ?? []
+  const rightValues = right ?? []
+  if (leftValues.length !== rightValues.length) return false
+
+  return leftValues.every((value, index) => value === rightValues[index])
 }
 
 const DEFAULT_SUMMARY_LIMIT = 50
@@ -373,6 +384,166 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         id,
       )
       return updated
+    },
+    syncRoadmapTasks(input) {
+      const emptyFailureResult = (failureReason: string): RoadmapSyncResult => ({
+        ok: false,
+        createdTaskIds: [],
+        updatedTaskIds: [],
+        reactivatedTaskIds: [],
+        deactivatedTaskIds: [],
+        failureReason,
+      })
+
+      const syncTransaction = db.transaction((
+        projectId: string,
+        roadmapTasks: RoadmapSyncTaskInput[],
+      ): RoadmapSyncResult => {
+        const createdTaskIds: string[] = []
+        const updatedTaskIdSet = new Set<string>()
+        const reactivatedTaskIds: string[] = []
+        const deactivatedTaskIds: string[] = []
+        const inputByKey = new Map(
+          roadmapTasks.map((roadmapTask) => [roadmapTask.roadmapTaskKey, roadmapTask] as const),
+        )
+        const inputKeys = new Set(inputByKey.keys())
+
+        const existingRows = db.prepare(
+          'SELECT * FROM tasks WHERE project_id = ? AND roadmap_task_key IS NOT NULL',
+        ).all(projectId) as any[]
+        const existingRoadmapTasks = existingRows.map(deserializeTask)
+        const disappearedTasks = existingRoadmapTasks.filter((task) => (
+          task.roadmapTaskKey !== undefined && !inputKeys.has(task.roadmapTaskKey)
+        ))
+
+        for (const task of disappearedTasks) {
+          const activeJob = (db.prepare('SELECT * FROM jobs WHERE task_id = ?').all(task.id) as any[])
+            .find((jobRow) => ACTIVE_JOB_STATUSES.has(jobRow.status as JobStatus))
+
+          if (activeJob) {
+            return emptyFailureResult(
+              `Cannot deactivate roadmap task ${task.roadmapTaskKey} because job ${activeJob.id} is ${activeJob.status}`,
+            )
+          }
+        }
+
+        const roadmapTaskKeyToTaskId = new Map<string, string>()
+        const dependencyUpdateKeys = new Set<string>()
+
+        for (const roadmapTask of roadmapTasks) {
+          const existingRow = db.prepare(
+            'SELECT * FROM tasks WHERE project_id = ? AND roadmap_task_key = ?',
+          ).get(projectId, roadmapTask.roadmapTaskKey) as any
+          const existingTask = existingRow ? deserializeTask(existingRow) : undefined
+
+          if (!existingTask) {
+            const created = tasks.create({
+              projectId,
+              title: roadmapTask.title,
+              description: roadmapTask.description,
+              status: 'pending',
+              assignee: roadmapTask.assignee,
+              dependencies: [],
+              allowedPaths: roadmapTask.allowedPaths,
+              acceptanceCriteria: roadmapTask.acceptanceCriteria,
+              roadmapTaskKey: roadmapTask.roadmapTaskKey,
+              phase: roadmapTask.phase,
+              roadmapActive: true,
+            })
+            createdTaskIds.push(created.id)
+            roadmapTaskKeyToTaskId.set(roadmapTask.roadmapTaskKey, created.id)
+            dependencyUpdateKeys.add(roadmapTask.roadmapTaskKey)
+            continue
+          }
+
+          roadmapTaskKeyToTaskId.set(roadmapTask.roadmapTaskKey, existingTask.id)
+
+          const jobRows = db.prepare('SELECT * FROM jobs WHERE task_id = ?').all(existingTask.id) as any[]
+          const isUnstarted = jobRows.length === 0 && existingTask.status === 'pending'
+
+          if (isUnstarted) {
+            dependencyUpdateKeys.add(roadmapTask.roadmapTaskKey)
+
+            const specChanged =
+              existingTask.title !== roadmapTask.title ||
+              existingTask.description !== roadmapTask.description ||
+              existingTask.phase !== roadmapTask.phase ||
+              existingTask.assignee !== roadmapTask.assignee ||
+              !sameStringArray(existingTask.allowedPaths, roadmapTask.allowedPaths) ||
+              !sameStringArray(existingTask.acceptanceCriteria, roadmapTask.acceptanceCriteria) ||
+              existingTask.roadmapActive !== true
+
+            if (specChanged) {
+              tasks.update(existingTask.id, {
+                title: roadmapTask.title,
+                description: roadmapTask.description,
+                phase: roadmapTask.phase,
+                assignee: roadmapTask.assignee,
+                allowedPaths: roadmapTask.allowedPaths,
+                acceptanceCriteria: roadmapTask.acceptanceCriteria,
+                roadmapActive: true,
+              })
+              updatedTaskIdSet.add(existingTask.id)
+            }
+            continue
+          }
+
+          if (!existingTask.roadmapActive) {
+            tasks.update(existingTask.id, { roadmapActive: true })
+            reactivatedTaskIds.push(existingTask.id)
+          }
+        }
+
+        for (const task of disappearedTasks) {
+          if (task.roadmapActive) {
+            tasks.update(task.id, { roadmapActive: false })
+            deactivatedTaskIds.push(task.id)
+          }
+        }
+
+        for (const roadmapTaskKey of dependencyUpdateKeys) {
+          const roadmapTask = inputByKey.get(roadmapTaskKey)
+          const taskId = roadmapTaskKeyToTaskId.get(roadmapTaskKey)
+
+          if (!roadmapTask || !taskId) {
+            throw new Error(`Cannot resolve roadmap task ${roadmapTaskKey}`)
+          }
+
+          const dependencyTaskIds = roadmapTask.dependencies.map((dependencyKey) => {
+            const dependencyTaskId = roadmapTaskKeyToTaskId.get(dependencyKey)
+            if (!dependencyTaskId) {
+              throw new Error(`Cannot resolve dependency ${dependencyKey} for ${roadmapTaskKey}`)
+            }
+            return dependencyTaskId
+          })
+          const currentTask = tasks.findById(taskId)
+          if (!currentTask) {
+            throw new Error(`Cannot find task ${taskId} while resolving dependencies`)
+          }
+
+          if (!sameStringArray(currentTask.dependencies, dependencyTaskIds)) {
+            tasks.update(taskId, { dependencies: dependencyTaskIds })
+            if (!createdTaskIds.includes(taskId)) {
+              updatedTaskIdSet.add(taskId)
+            }
+          }
+        }
+
+        return {
+          ok: true,
+          createdTaskIds,
+          updatedTaskIds: [...updatedTaskIdSet],
+          reactivatedTaskIds,
+          deactivatedTaskIds,
+        }
+      })
+
+      try {
+        return syncTransaction(input.projectId, input.tasks)
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err)
+        return emptyFailureResult(message)
+      }
     },
   }
 
