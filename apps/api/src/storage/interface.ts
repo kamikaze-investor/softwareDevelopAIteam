@@ -17,6 +17,8 @@ export type ResumeBlockedTaskResult =
 export interface IProjectStorage {
   findAll(): Project[]
   findById(id: string): Project | undefined
+  /** status='running' のProjectを返す（MVPでは最大1件。存在しなければundefined） */
+  findRunning(): Project | undefined
   create(project: Omit<Project, 'id' | 'createdAt' | 'updatedAt'>): Project
   update(id: string, data: Partial<Project>): Project | undefined
 }

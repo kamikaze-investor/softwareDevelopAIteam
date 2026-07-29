@@ -1,13 +1,14 @@
-import { describe, it, expect, beforeEach } from 'vitest'
-import Fastify from 'fastify'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+import Fastify, { type FastifyInstance } from 'fastify'
 import cors from '@fastify/cors'
-import { ctoAiRoutes } from './ctoAi.js'
-import { resetStorage } from '../storage/index.js'
 import os from 'node:os'
 import path from 'node:path'
 import { mkdirSync, existsSync } from 'node:fs'
+import type { Project } from '@ai-team/shared'
 
 process.env.DB_PATH = ':memory:'
+
+const VALID_SPEC_TEXT = 'This test specification is intentionally longer than fifty characters so validation can pass.'
 
 const MOCK_ANALYSIS = JSON.stringify({
   goal: 'テスト用プロジェクトの目的',
@@ -25,28 +26,50 @@ const MOCK_ANALYSIS = JSON.stringify({
   readinessReason: 'テスト用スコア',
 })
 
-function buildApp() {
+async function buildApp(): Promise<FastifyInstance> {
+  const [{ ctoAiRoutes }, { resetStorage }] = await Promise.all([
+    import('./ctoAi.js'),
+    import('../storage/index.js'),
+  ])
+
+  resetStorage()
+
   const app = Fastify()
   app.register(cors, { origin: true })
   app.register(ctoAiRoutes, { prefix: '/api/cto' })
+  await app.ready()
   return app
+}
+
+async function createProject(status: Project['status'] = 'running'): Promise<Project> {
+  const { getStorage } = await import('../storage/index.js')
+  return getStorage().projects.create({
+    name: `${status} project`,
+    goal: 'Goal',
+    designPhilosophy: [],
+    status,
+  })
 }
 
 describe('CTO AI API', () => {
   let tmpDir: string
 
   beforeEach(() => {
-    resetStorage()
+    vi.resetModules()
+    process.env.DB_PATH = ':memory:'
     tmpDir = path.join(os.tmpdir(), `cto-test-${Date.now()}`)
     mkdirSync(tmpDir, { recursive: true })
+    process.env.TARGET_ROOT = tmpDir
   })
 
   it('POST /api/cto/analyze — mockResponse で Project Memory を生成できる', async () => {
-    const app = buildApp()
+    const app = await buildApp()
+    const project = await createProject()
     const res = await app.inject({
       method: 'POST',
       url: '/api/cto/analyze',
-      body: {
+      payload: {
+        projectId: project.id,
         specText: 'テスト仕様書です。これは50文字以上のテキストが必要なのでここに追加テキストを入れます。十分な長さにするために更に文字を追加します。',
         targetProjectRoot: tmpDir,
         mockResponse: MOCK_ANALYSIS,
@@ -63,11 +86,13 @@ describe('CTO AI API', () => {
   })
 
   it('POST /api/cto/analyze — specText が短すぎると 400', async () => {
-    const app = buildApp()
+    const app = await buildApp()
+    const project = await createProject()
     const res = await app.inject({
       method: 'POST',
       url: '/api/cto/analyze',
-      body: {
+      payload: {
+        projectId: project.id,
         specText: '短い',
         targetProjectRoot: tmpDir,
         mockResponse: MOCK_ANALYSIS,
@@ -87,11 +112,13 @@ describe('CTO AI API', () => {
         suggestion: '決定が必要',
       }],
     })
-    const app = buildApp()
+    const app = await buildApp()
+    const project = await createProject()
     const res = await app.inject({
       method: 'POST',
       url: '/api/cto/analyze',
-      body: {
+      payload: {
+        projectId: project.id,
         specText: 'テスト仕様書です。これは50文字以上のテキストが必要なのでここに追加テキストを入れます。十分な長さにするために更に文字を追加します。',
         targetProjectRoot: tmpDir,
         mockResponse: lowScoreMock,
@@ -104,16 +131,91 @@ describe('CTO AI API', () => {
   })
 
   it('POST /api/cto/analyze — targetProjectRoot がない場合 400', async () => {
-    const app = buildApp()
+    const app = await buildApp()
+    const project = await createProject()
     const res = await app.inject({
       method: 'POST',
       url: '/api/cto/analyze',
-      body: {
+      payload: {
+        projectId: project.id,
         specText: 'テスト仕様書です。これは50文字以上のテキストが必要なのでここに追加テキストを入れます。十分な長さにするために更に文字を追加します。',
         mockResponse: MOCK_ANALYSIS,
         // targetProjectRoot なし
       },
     })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('POST /api/cto/analyze returns 400 when projectId is missing', async () => {
+    const app = await buildApp()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/analyze',
+      payload: {
+        specText: VALID_SPEC_TEXT,
+        targetProjectRoot: tmpDir,
+        mockResponse: MOCK_ANALYSIS,
+      },
+    })
+
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('POST /api/cto/analyze returns 404 when projectId does not exist', async () => {
+    const app = await buildApp()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/analyze',
+      payload: {
+        projectId: 'missing-project',
+        specText: VALID_SPEC_TEXT,
+        targetProjectRoot: tmpDir,
+        mockResponse: MOCK_ANALYSIS,
+      },
+    })
+
+    expect(res.statusCode).toBe(404)
+    expect(JSON.parse(res.body).error).toBe('Project not found')
+  })
+
+  it('POST /api/cto/analyze returns 409 when project is not running', async () => {
+    const app = await buildApp()
+    const project = await createProject('draft')
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/analyze',
+      payload: {
+        projectId: project.id,
+        specText: VALID_SPEC_TEXT,
+        targetProjectRoot: tmpDir,
+        mockResponse: MOCK_ANALYSIS,
+      },
+    })
+
+    expect(res.statusCode).toBe(409)
+    expect(JSON.parse(res.body)).toMatchObject({
+      error: 'Project is not running',
+      detail: 'status=draft',
+    })
+  })
+
+  it('POST /api/cto/analyze returns 400 when targetProjectRoot differs from configured TARGET_ROOT', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const otherRoot = path.join(os.tmpdir(), `cto-other-${Date.now()}`)
+    mkdirSync(otherRoot, { recursive: true })
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/analyze',
+      payload: {
+        projectId: project.id,
+        specText: VALID_SPEC_TEXT,
+        targetProjectRoot: otherRoot,
+        mockResponse: MOCK_ANALYSIS,
+      },
+    })
+
     expect(res.statusCode).toBe(400)
   })
 })
@@ -154,17 +256,21 @@ describe('CTO AI — generate-roadmap API', () => {
   let tmpDir: string
 
   beforeEach(() => {
-    resetStorage()
+    vi.resetModules()
+    process.env.DB_PATH = ':memory:'
     tmpDir = path.join(os.tmpdir(), `roadmap-api-test-${Date.now()}`)
     mkdirSync(tmpDir, { recursive: true })
+    process.env.TARGET_ROOT = tmpDir
   })
 
   it('POST /api/cto/generate-roadmap — mockResponse でロードマップを生成できる', async () => {
-    const app = buildApp()
+    const app = await buildApp()
+    const project = await createProject()
     const res = await app.inject({
       method: 'POST',
       url: '/api/cto/generate-roadmap',
-      body: {
+      payload: {
+        projectId: project.id,
         targetProjectRoot: tmpDir,
         analysis: MOCK_ANALYSIS_OBJ,
         mockResponse: MOCK_ROADMAP,
@@ -182,11 +288,13 @@ describe('CTO AI — generate-roadmap API', () => {
   })
 
   it('POST /api/cto/generate-roadmap — analysis がない場合 400', async () => {
-    const app = buildApp()
+    const app = await buildApp()
+    const project = await createProject()
     const res = await app.inject({
       method: 'POST',
       url: '/api/cto/generate-roadmap',
-      body: {
+      payload: {
+        projectId: project.id,
         targetProjectRoot: tmpDir,
         mockResponse: MOCK_ROADMAP,
         // analysis なし
@@ -196,11 +304,13 @@ describe('CTO AI — generate-roadmap API', () => {
   })
 
   it('POST /api/cto/generate-roadmap — targetProjectRoot がない場合 400', async () => {
-    const app = buildApp()
+    const app = await buildApp()
+    const project = await createProject()
     const res = await app.inject({
       method: 'POST',
       url: '/api/cto/generate-roadmap',
-      body: {
+      payload: {
+        projectId: project.id,
         analysis: MOCK_ANALYSIS_OBJ,
         mockResponse: MOCK_ROADMAP,
       },

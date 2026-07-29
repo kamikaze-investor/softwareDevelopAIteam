@@ -43,6 +43,8 @@ async function fetchQueuedJob(): Promise<Job | null> {
   if (!projects) return null
 
   for (const project of projects) {
+    if (project.status !== 'running') continue
+
     const tasks = await fetchJson<Task[]>(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)
     if (!tasks) continue
 

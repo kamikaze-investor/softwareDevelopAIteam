@@ -13,7 +13,30 @@ import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalSto
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 
+export class SingleRunningProjectError extends Error {
+  constructor() {
+    super('Another project is already running')
+    this.name = 'SingleRunningProjectError'
+  }
+}
+
 const now = () => new Date().toISOString()
+
+function isSingleRunningProjectConstraintError(err: unknown): boolean {
+  const sqliteError = err as { code?: unknown; message?: unknown }
+  if (sqliteError.code !== 'SQLITE_CONSTRAINT_UNIQUE') return false
+
+  const message = typeof sqliteError.message === 'string' ? sqliteError.message : ''
+  return message.includes('ux_projects_single_running') || message.includes('projects.status')
+}
+
+function throwSingleRunningProjectError(err: unknown): never {
+  if (isSingleRunningProjectConstraintError(err)) {
+    throw new SingleRunningProjectError()
+  }
+
+  throw err
+}
 
 function parseStringArray(value: unknown): string[] {
   if (typeof value !== 'string') return []
@@ -153,6 +176,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const row = db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as any
       return row ? deserializeProject(row) : undefined
     },
+    findRunning() {
+      const row = db.prepare("SELECT * FROM projects WHERE status = 'running' LIMIT 1").get() as any
+      return row ? deserializeProject(row) : undefined
+    },
     create(data) {
       const project: Project = {
         ...data,
@@ -160,34 +187,42 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         createdAt: now(),
         updatedAt: now(),
       }
-      db.prepare(`
-        INSERT INTO projects (id, name, goal, design_philosophy, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        project.id,
-        project.name,
-        project.goal,
-        JSON.stringify(project.designPhilosophy),
-        project.status,
-        project.createdAt,
-        project.updatedAt,
-      )
+      try {
+        db.prepare(`
+          INSERT INTO projects (id, name, goal, design_philosophy, status, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          project.id,
+          project.name,
+          project.goal,
+          JSON.stringify(project.designPhilosophy),
+          project.status,
+          project.createdAt,
+          project.updatedAt,
+        )
+      } catch (err: unknown) {
+        throwSingleRunningProjectError(err)
+      }
       return project
     },
     update(id, data) {
       const existing = projects.findById(id)
       if (!existing) return undefined
       const updated = { ...existing, ...data, updatedAt: now() }
-      db.prepare(`
-        UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=? WHERE id=?
-      `).run(
-        updated.name,
-        updated.goal,
-        JSON.stringify(updated.designPhilosophy),
-        updated.status,
-        updated.updatedAt,
-        id,
-      )
+      try {
+        db.prepare(`
+          UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=? WHERE id=?
+        `).run(
+          updated.name,
+          updated.goal,
+          JSON.stringify(updated.designPhilosophy),
+          updated.status,
+          updated.updatedAt,
+          id,
+        )
+      } catch (err: unknown) {
+        throwSingleRunningProjectError(err)
+      }
       return updated
     },
   }

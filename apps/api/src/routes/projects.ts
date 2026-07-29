@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
+import { SingleRunningProjectError } from '../storage/sqlite'
 
 const ProjectStatusSchema = z.enum(['draft', 'running', 'paused', 'archived'])
 
@@ -20,6 +21,7 @@ const UpdateProjectBody = z.object({
 
 export async function projectRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
+  const singleRunningProjectResponse = { error: 'Another project is already running' }
 
   app.get('/', async (_req, reply) => {
     return reply.send(storage.projects.findAll())
@@ -39,8 +41,19 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
-    const project = storage.projects.create(result.data)
-    return reply.status(201).send(project)
+    if (result.data.status === 'running' && storage.projects.findRunning()) {
+      return reply.status(409).send(singleRunningProjectResponse)
+    }
+
+    try {
+      const project = storage.projects.create(result.data)
+      return reply.status(201).send(project)
+    } catch (err: unknown) {
+      if (err instanceof SingleRunningProjectError) {
+        return reply.status(409).send(singleRunningProjectResponse)
+      }
+      throw err
+    }
   })
 
   app.patch<{ Params: { id: string } }>('/:id', async (req, reply) => {
@@ -49,10 +62,26 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
-    const updated = storage.projects.update(req.params.id, result.data)
-    if (!updated) {
+    const existing = storage.projects.findById(req.params.id)
+    if (!existing) {
       return reply.status(404).send({ error: 'Project not found' })
     }
-    return reply.send(updated)
+
+    if (result.data.status === 'running') {
+      const running = storage.projects.findRunning()
+      if (running && running.id !== req.params.id) {
+        return reply.status(409).send(singleRunningProjectResponse)
+      }
+    }
+
+    try {
+      const updated = storage.projects.update(req.params.id, result.data)
+      return reply.send(updated)
+    } catch (err: unknown) {
+      if (err instanceof SingleRunningProjectError) {
+        return reply.status(409).send(singleRunningProjectResponse)
+      }
+      throw err
+    }
   })
 }

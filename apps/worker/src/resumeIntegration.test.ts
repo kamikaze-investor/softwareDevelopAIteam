@@ -247,6 +247,7 @@ describe('resume API to worker integration', () => {
         status: 'blocked',
         assignee: 'developer_ai',
         dependencies: [],
+        roadmapActive: false,
       })
       const blockedJob = storage.jobs.create({
         taskId: task.id,

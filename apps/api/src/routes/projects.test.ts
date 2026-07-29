@@ -135,6 +135,76 @@ describe('Project API', () => {
     })
   })
 
+  it('POST /api/projects returns 409 when another project is already running', async () => {
+    await withApp(async (app) => {
+      await createProject(app, { name: 'Running', status: 'running' })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/projects',
+        payload: {
+          name: 'Second running',
+          goal: 'Goal',
+          designPhilosophy: [],
+          status: 'running',
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toBe('Another project is already running')
+    })
+  })
+
+  it('PATCH /api/projects/:id returns 409 when another project is already running', async () => {
+    await withApp(async (app) => {
+      await createProject(app, { name: 'Running', status: 'running' })
+      const other = await createProject(app, { name: 'Other', status: 'draft' })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${other.id}`,
+        payload: { status: 'running' },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toBe('Another project is already running')
+    })
+  })
+
+  it('PATCH /api/projects/:id allows a running project to remain running', async () => {
+    await withApp(async (app) => {
+      const running = await createProject(app, { name: 'Running', status: 'running' })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${running.id}`,
+        payload: { name: 'Still running', status: 'running' },
+      })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<Project>(res.body)
+      expect(body.id).toBe(running.id)
+      expect(body.name).toBe('Still running')
+      expect(body.status).toBe('running')
+    })
+  })
+
+  it('POST /api/projects allows multiple non-running projects for each status', async () => {
+    await withApp(async (app) => {
+      const statuses = ['draft', 'paused', 'archived'] as const
+
+      for (const status of statuses) {
+        await createProject(app, { name: `${status}-1`, status })
+        await createProject(app, { name: `${status}-2`, status })
+      }
+
+      const res = await app.inject({ method: 'GET', url: '/api/projects' })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<Project[]>(res.body)).toHaveLength(statuses.length * 2)
+    })
+  })
+
   it('POST /api/projects returns 400 for invalid input', async () => {
     await withApp(async (app) => {
       const res = await app.inject({

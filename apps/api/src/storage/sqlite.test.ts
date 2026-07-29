@@ -3,7 +3,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
-import { createSQLiteStorage } from './sqlite'
+import { createSQLiteStorage, SingleRunningProjectError } from './sqlite'
 import type { IStorage } from './interface'
 import type { Task } from '@ai-team/shared'
 
@@ -55,6 +55,47 @@ describe('SQLiteStorage', () => {
 
     it('returns undefined when updating a missing project', () => {
       expect(storage.projects.update('not-exist', { name: 'x' })).toBeUndefined()
+    })
+
+    it('rejects a second running project with SingleRunningProjectError', () => {
+      storage.projects.create({
+        name: 'Running',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'running',
+      })
+
+      expect(() => {
+        storage.projects.create({
+          name: 'Second running',
+          goal: 'g',
+          designPhilosophy: [],
+          status: 'running',
+        })
+      }).toThrow(SingleRunningProjectError)
+    })
+
+    it('findRunning returns the running project or undefined', () => {
+      expect(storage.projects.findRunning()).toBeUndefined()
+
+      storage.projects.create({
+        name: 'Draft',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const running = storage.projects.create({
+        name: 'Running',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'running',
+      })
+
+      expect(storage.projects.findRunning()?.id).toBe(running.id)
+
+      storage.projects.update(running.id, { status: 'paused' })
+
+      expect(storage.projects.findRunning()).toBeUndefined()
     })
   })
 

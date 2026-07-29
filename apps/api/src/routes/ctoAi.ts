@@ -7,14 +7,19 @@
  */
 
 import type { FastifyInstance } from 'fastify'
+import path from 'node:path'
 import { z } from 'zod'
 import { analyzeSpec } from '../ctoAi/specAnalyzer.js'
 import { writeProjectMemory } from '../ctoAi/projectMemoryWriter.js'
 import { generateRoadmap } from '../ctoAi/roadmapGenerator.js'
 import { writeRoadmap } from '../ctoAi/roadmapWriter.js'
+import { getStorage } from '../storage'
 import { validateTargetRoot } from '../utils/pathGuard.js'
 
+const CONFIGURED_TARGET_ROOT = process.env.TARGET_ROOT ?? '/workspace/target'
+
 const AnalyzeBody = z.object({
+  projectId: z.string().min(1),
   /** 仕様書テキスト（Markdown） */
   specText: z.string().min(50, '仕様書が短すぎます（最低50文字）'),
   /** target-project のルートパス（絶対パス） */
@@ -24,6 +29,7 @@ const AnalyzeBody = z.object({
 })
 
 const GenerateRoadmapBody = z.object({
+  projectId: z.string().min(1),
   /** Project Memory が書かれた target-project のルートパス */
   targetProjectRoot: z.string().min(1),
   /** specAnalyzer の出力（analyze エンドポイントの analysis フィールド）を渡す */
@@ -47,6 +53,7 @@ const GenerateRoadmapBody = z.object({
 })
 
 export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
+  const storage = getStorage()
 
   // POST /api/cto/analyze
   app.post('/analyze', async (req, reply) => {
@@ -55,12 +62,26 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     }
 
-    const { specText, targetProjectRoot, mockResponse } = parsed.data
+    const { projectId, specText, targetProjectRoot, mockResponse } = parsed.data
+
+    const project = storage.projects.findById(projectId)
+    if (!project) return reply.status(404).send({ error: 'Project not found' })
+
+    if (project.status !== 'running') {
+      return reply.status(409).send({ error: 'Project is not running', detail: `status=${project.status}` })
+    }
 
     // [codex-review P1] パス境界検証
     const pathCheck = validateTargetRoot(targetProjectRoot)
     if (!pathCheck.ok) {
       return reply.status(400).send({ error: 'パス検証エラー', detail: pathCheck.reason })
+    }
+
+    if (path.resolve(targetProjectRoot) !== path.resolve(CONFIGURED_TARGET_ROOT)) {
+      return reply.status(400).send({
+        error: 'targetProjectRoot が設定値と一致しません',
+        detail: `configured=${CONFIGURED_TARGET_ROOT}`,
+      })
     }
 
     try {
@@ -104,12 +125,26 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
     }
 
-    const { analysis, targetProjectRoot, mockResponse } = parsed.data
+    const { projectId, analysis, targetProjectRoot, mockResponse } = parsed.data
+
+    const project = storage.projects.findById(projectId)
+    if (!project) return reply.status(404).send({ error: 'Project not found' })
+
+    if (project.status !== 'running') {
+      return reply.status(409).send({ error: 'Project is not running', detail: `status=${project.status}` })
+    }
 
     // [codex-review P1] パス境界検証
     const pathCheck = validateTargetRoot(targetProjectRoot)
     if (!pathCheck.ok) {
       return reply.status(400).send({ error: 'パス検証エラー', detail: pathCheck.reason })
+    }
+
+    if (path.resolve(targetProjectRoot) !== path.resolve(CONFIGURED_TARGET_ROOT)) {
+      return reply.status(400).send({
+        error: 'targetProjectRoot が設定値と一致しません',
+        detail: `configured=${CONFIGURED_TARGET_ROOT}`,
+      })
     }
 
     try {
