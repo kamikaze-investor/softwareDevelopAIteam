@@ -261,21 +261,81 @@ Goal変更・重大仕様変更・高リスク操作など経営判断が必要�
 TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在しない
 （Workerは`updateJob()`でJobのみ更新し、Task status更新も次Job生成も行わない）。
 
-- [ ] **前提: データモデルの不整合解消**（Codexレビューで判明。これを解かずに接続すると壊れる）
-      - `generateRoadmap()`は`task-001`形式のidと`phase`を持つTaskを生成するが、
-        `storage.tasks.create()`は`id: randomUUID()`を強制し、`Task`型に`phase`が無い
-        （`roadmapGenerator.ts:22-25` / `sqlite.ts:263-269` / `packages/shared/src/types/task.ts`）
-      - `contextPack`は`task-001`形式と`phase`を必須要求する（`routes/contextPack.ts:14-18`）ため、
-        UUIDのままではContext Pack生成が通らない
-      - `POST /api/cto/generate-roadmap`は`projectId`を受け取らず、`Project`型に
-        `targetProjectRoot`が無い（`routes/ctoAi.ts:26-30` / `types/project.ts`）ため、
-        生成物とProjectレコードを紐付けられない
-      **完了条件**: Task識別子・`phase`・Project↔target-project紐付けの持ち方が決まり、
-      Context Packとの互換が保たれること
-- [ ] ロードマップ→Taskレコード自動生成: `generateRoadmap()`の出力から`storage.tasks.create()`で
+<!-- roadmap:id=project-auto-data-model state=in_progress -->
+1. [ ] **Step 0: データモデル整合（設計レビュー中。実装はCEO承認待ち）**
+      設計方針（2026-07-29。Codex `gpt-5.6-sol` read-onlyレビューの指摘を反映済み。CEO採否待ち）:
+      - **Task識別子**: `Task.id`はUUIDのまま維持し、nullableな`roadmapTaskKey`列を追加する。
+        `Job.taskId`・`approval_requests`・`review_results`・`qa_results`・Mobileの`/tasks/[id]`が
+        すべてUUID依存のため、外部指定IDへの変更は広範囲の破壊とbackfillを伴う。対応表は作らない。
+        一意性は`(project_id, roadmap_task_key)`で担保する（SQLiteはNULL同士を重複と扱わないため、
+        手動Task＝NULLは何件でも共存できる）。**`roadmapTaskKey`は`POST /api/tasks`では受け付けず、
+        内部のロードマップ保存処理でのみ設定する**（手動Taskによるキー占有を防ぐため）
+      - **phase**: nullableな`phase INTEGER`列をtasksへ追加する。Phase完了検知をDBクエリで完結させる。
+        Markdown再解析は脆く、`targetProjectRoot`を別途要するため採らない。
+        **`phase=NULL`を「ロードマップから外れた」印として兼用しない**（手動Taskも`phase=NULL`で
+        意味が二重になり、元のphaseも失われるため）。代わりに
+        **`roadmap_active INTEGER NOT NULL DEFAULT 0`**（DEFAULTは0）を追加し、phaseは元の値を
+        保持したまま`roadmap_active=0`で非アクティブ化する。
+        **手動Taskと既存Taskは0**、ロードマップ同期で作成・再登場したTaskだけ明示的に1にする。
+        `roadmapTaskKey`がNULLのTaskはPhase判定へ含めない。
+        （「現行ロードマップへの所属」と「仕様フィールドを更新してよいか」は別軸として扱う）
+      - **estimatedComplexity**: **DB列として保存しない。** `buildContextPack()`本文生成に影響せず
+        （`contextManager.ts`では型定義に現れるのみ）、必要なのは`routes/contextPack.ts:23`の
+        リクエスト必須要件を満たすことだけ。DB TaskからContext Packを作る際は`'medium'`固定を渡す。
+        ロードマップ生成時のMarkdown出力は従来どおり`GeneratedTask`の値を使う（現状維持）
+      - **Project↔workspace**: 新規列を追加しない。`Project.targetProjectRoot`は持たない。
+        `POST /api/cto/generate-roadmap`のbodyに`projectId`を追加するのみ。workspaceはデプロイ設定
+        （`/workspace/target`）として扱う。MVP制約として**`status='running'`のProjectを同時1件に制限**し、
+        `POST /api/projects`（`status`を任意指定可能。`routes/projects.ts:11`）と
+        `PATCH /api/projects/:id`の**両方**で検証する。Workerの`fetchQueuedJob()`にも
+        `project.status === 'running'`フィルタを追加する
+      - **再生成時のTask更新方針**: 判定基準はTask.statusではなく**Jobの実在と状態**を主とする
+        （自動フローからTask.statusを同期する呼び出しが無く、実質`pending`のままのため。
+        ただしAPI自体は`status`を受け付ける: `routes/tasks.ts:23,36`）。
+        `queued`/`running`/`blocked`のJobが**1件でも**あれば進行中とみなす（最新Jobだけで
+        判定しない。`POST /api/jobs`に重複active Job防止が無く併存し得るため）。
+        更新可否: (a)Jobが1件も無く**かつ**`Task.status==='pending'` → 全フィールド更新可、
+        (b)進行中 → 更新しない、(c)全Jobがterminal（success/failed）→ 仕様フィールドは更新しない、
+        (d)Jobなしだが`status!=='pending'` → 異常状態としてスキップ・ログ。
+        **ロードマップから消えたTaskがactive Job（queued/running/blocked）を持つ場合は、
+        そのTaskだけ残す部分同期を行わず、ロードマップ同期全体をfail-closedで失敗させる。
+        DBを一切変更せず、競合内容を報告する。**
+        最新Job判定には`ORDER BY created_at DESC, rowid DESC`のtie-breakが必要
+        （`created_at`のみでは同一ミリ秒で順序不定。`sqlite.ts:322`）。
+        **これらの同期処理はStep 1の実装範囲であり、Step 0では作らない**
+      - **dependencies**: 1トランザクション内の2パス（全件挿入→`roadmapTaskKey`→UUID変換）で解決する。
+        変換前に重複キー・自己参照・循環・存在しない依存先を全件検証し、1件でも不正ならロールバックする。
+        解決スコープは同一Project内に限定する
+      - **追加するDB列（tasks・最終3列）**: `roadmap_task_key TEXT NULL`／
+        `phase INTEGER NULL`／`roadmap_active INTEGER NOT NULL DEFAULT 0`。
+        制約として`UNIQUE(project_id, roadmap_task_key)`と`CHECK (roadmap_active IN (0,1))`を付ける。
+        公開APIの`POST /api/tasks`・`PATCH /api/tasks/:id`ではこの3フィールドを受け付けない
+      - **migration**: `MIGRATION_STATEMENTS`（`ALTER TABLE ADD COLUMN`専用）で3列を追加。
+        **UNIQUE INDEXはこの仕組みでは追加できず、`CREATE_TABLES`へ書いても既存DBでは失敗する**
+        （`db.exec(CREATE_TABLES)`が`runMigrations()`より先に走るため。`sqlite.ts:143-144`）。
+        `runMigrations()`の**後**に`CREATE UNIQUE INDEX IF NOT EXISTS`を実行する処理を別途追加する
+      - **役割定義（正本の置き方）**: DBをProject計画全体の正本とは定義しない。
+        (a)CTO AIが生成した構造化ロードマップ＝**計画内容の入力**、
+        (b)target-projectの`tasks/task_graph.md`＝**計画のMarkdown表現**、
+        (c)DB Task＝**実行状態を持つ投影**。
+        Step 1では同じ検証済みロードマップからDB TaskとMarkdownの両方を生成し、
+        **片方だけ成功した場合は成功扱いにしない**。SQLiteトランザクションはMarkdown書き込みを
+        ロールバックできない（`roadmapWriter.ts:93`が2ファイルを直接上書き）ため、
+        **再実行で安全に修復できる冪等設計**とする
+      - **既知の積み残し（Step 0の範囲外・Step 1/2で解く）**: summaryEngineは`| task-001 |`形式で
+        Markdownを照合するためUUIDでは一致しない（`summaryEngine.ts:148`）。初回Jobの`workingDir`調達。
+        `validateTargetRoot()`は任意の絶対パスを許し固定workspaceを強制していない
+        （`pathGuard.ts:47`）。`generate-roadmap`/`analyze`は他Project実行中でも同じworkspaceへ
+        書けるためWorkerフィルタだけでは競合を防げない。Project activation（runningへ遷移させる）
+        担当がMobileにもコードにも無い。running→paused時のdrain semantics。
+        複数Worker時のatomic claim
+      **完了条件**: 上記の持ち方（識別子・phase・roadmap_active・estimatedComplexity・workspace制約・
+      dependencies解決・再生成ポリシー）がCEOに採択され、既存Task/Job/resume/Mobileルートを
+      壊さないことが確認されていること。実装着手はCEO承認後
+2. [ ] ロードマップ→Taskレコード自動生成: `generateRoadmap()`の出力から`storage.tasks.create()`で
       DB上のTaskを作る接続。現状この接続がないため、生成されたロードマップは開発に使われない。
       **完了条件**: Project作成後にロードマップ生成を実行するとDB上にTaskが並ぶこと
-- [ ] Task→Job自動生成と連続実行: 初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
+3. [ ] Task→Job自動生成と連続実行: 初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
       （手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。無いのは「自動生成」と「自動継続」）。
       **既知の穴（Codexレビュー）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
       `projectId`とTaskのProjectの一致検証も無い（`routes/jobs.ts:122-137`）。Workerは
@@ -283,11 +343,11 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       （`worker/src/index.ts`）。
       **完了条件**: 1つのProjectで複数Taskが順に自動実行され、二重生成・途中失敗時に
       安全側で停止すること（既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）
-- [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
+4. [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
       **既知の穴**: `ProjectStatus`に`completed`が無い（`draft/running/paused/archived`のみ。
       `types/project.ts:3`）ため、計算値にするか状態として持つかの決定が必要。
       **完了条件**: 完了/未完了がAPIで取得でき、Mobileから確認できること
-- [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
+5. [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
       **通知後も開発は継続し、通常チェックポイントでは停止しない**。既存の`notifier`
       （LINE/Slack）・`summaryEngine.ts`・Approval Gateの再利用を前提とし、新しい停止Gateは作らない。
       **完了条件**: Phase完了時にCEOへ通知が届き、開発が止まらないこと。CEOが修正指示を返す経路は
@@ -314,7 +374,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 <!-- roadmap:id=mobile-approval-gate-ui state=done -->
 3. [x] Task/Job単位Approval GateのMobile UI連携 — 完了。`approvals.tsx`が`/api/approval-requests/waiting`
    から取得し、`/api/approval-requests/:id/status`で承認/却下操作まで実装済み
-<!-- roadmap:id=mobile-task-create state=in_progress -->
+<!-- roadmap:id=mobile-task-create state=planned -->
 4. [ ] 追加開発指示（追加Task作成）画面（Mobile） — **スマホ操作MVPの現在の主要残タスク**。
    通常のTaskはProject作成後にAIが自動生成する想定（下記「Project自動開発フロー」参照）であり、
    この画面はCEOが**既存Projectへ後から要望を追加する入口**（追加機能・改善・不具合・調査・
@@ -323,6 +383,16 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 <!-- roadmap:id=mobile-task-resume-ui state=done -->
 5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
    （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
+
+**セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
+
+- [ ] MobileがAPI tokenの`Authorization`ヘッダーを送っていない — `apps/mobile/app/`の全fetchに
+      `Authorization`ヘッダーが無く、API側で`API_TOKEN`を設定すると`apiToken.ts`のpreHandlerが
+      全リクエストを401で弾く。**現在動作しているのはAPI token未設定時のみ**。
+      VPS常駐（外部公開）へ進む前に必須。403行目「認証強化の要否確認」は方式の強化検討であり、
+      この「そもそもヘッダーを送っていない」問題とは別。
+      **完了条件**: `API_TOKEN`を設定した状態でMobileの主要操作（Project一覧・作成・承認・
+      Task詳細・resume）が通ること
 
 **MVP後または別タスク扱い（既存バックログ通り。変更なし）:** Dashboard/approvals間の画面遷移遅延調査、
 Dashboardの`ScrollView`/N+1 fetch改善、Project詳細画面（`ProjectCard`タップ遷移）、開発DBテストデータ

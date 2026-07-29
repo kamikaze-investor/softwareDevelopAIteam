@@ -82,8 +82,9 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - 再実行・追加指示UI（Mobile）
 
 **未完了・保留項目:**
+- **Step 0: データモデル整合（設計レビュー中。実装はCEO承認待ち）**（state: in_progress）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
-- 追加開発指示（追加Task作成）画面（Mobile）（state: in_progress）
+- 追加開発指示（追加Task作成）画面（Mobile）（state: planned）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
