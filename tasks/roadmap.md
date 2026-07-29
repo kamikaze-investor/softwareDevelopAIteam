@@ -261,9 +261,14 @@ Goal変更・重大仕様変更・高リスク操作など経営判断が必要�
 TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在しない
 （Workerは`updateJob()`でJobのみ更新し、Task status更新も次Job生成も行わない）。
 
-<!-- roadmap:id=project-auto-data-model state=in_progress -->
-1. [ ] **Step 0: データモデル整合（設計レビュー中。実装はCEO承認待ち）**
-      設計方針（2026-07-29。Codex `gpt-5.6-sol` read-onlyレビューの指摘を反映済み。CEO採否待ち）:
+<!-- roadmap:id=project-auto-data-model state=done -->
+1. [x] **Step 0: データモデル整合（完了）** — Task識別子・phase・
+      `roadmap_active`・固定workspace制約をCEO承認済み設計どおり実装済み
+      （コミット`2a1daa2` feat(api): add roadmap task metadata、
+      `beb6612` fix(orchestration): enforce single active workspace）。
+      Step 1（bulk upsert・dependencies UUID変換・ロードマップからのTask生成・
+      Context Pack接続）は未着手。
+      設計方針（2026-07-29確定。Codex `gpt-5.6-sol` read-onlyレビュー反映済み）:
       - **Task識別子**: `Task.id`はUUIDのまま維持し、nullableな`roadmapTaskKey`列を追加する。
         `Job.taskId`・`approval_requests`・`review_results`・`qa_results`・Mobileの`/tasks/[id]`が
         すべてUUID依存のため、外部指定IDへの変更は広範囲の破壊とbackfillを伴う。対応表は作らない。
