@@ -226,11 +226,16 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 
 - [x] 仕様書入力 → Project Memory生成 — 実装済み（`routes/ctoAi.ts` POST `/api/cto/analyze`、
       `specAnalyzer.ts`/`projectMemoryWriter.ts`）／E2E未検証
-- [x] CTO AI: Roadmap・Task自動生成 — 実装済み（`roadmapGenerator.ts`/`roadmapWriter.ts`、
-      POST `/api/cto/generate-roadmap`）／E2E未検証
+- [x] CTO AI: Roadmap生成 — 実装済み（`roadmapGenerator.ts`/`roadmapWriter.ts`、
+      POST `/api/cto/generate-roadmap`）／E2E未検証。**注意: 生成物はtarget-project側の
+      Markdown（`docs/roadmap.md`・`tasks/task_graph.md`）のみで、DB上のTaskレコードは
+      作られない**（`storage.tasks.create()`を呼ぶのは`POST /api/tasks`のみ）。
+      「Task自動生成」は未実装（下記「Project自動開発フロー」参照）
 - [x] Context Manager AI: Context Pack生成 — 実装済み（`routes/contextPack.ts`）／E2E未検証
-- [x] Developer AI: 実装Job実行（Sandbox経由） — 実装済み（`routes/developerAi.ts`。
-      Sandbox実行自体はjobRunner/Docker分離に委譲）／E2E未検証
+- [x] Developer AI: 実装Job実行（Sandbox経由） — ルートは実装済み（`routes/developerAi.ts`）／E2E未検証。
+      **注意: `runDeveloperAi()`は`mockRun:true`のみ動作し、`mockRun:false`（本番実行）は
+      意図的に未実装でthrowする**（`developerAiOrchestrator.ts`。本番はJob Queue経由=
+      `POST /api/jobs`→Workerに委譲する設計）
 - [ ] Meta Reviewer AIの自動実行（全PR前に） — 1-Bで基盤は実装済み（GitHub Actions
       `meta-review.yml`）だが、ローカル開発時の自動実行は`postTestHook.ps1`が`exit 0`のみで
       停止中（R-006既知課題）。**実運用未確認のまま**
@@ -244,6 +249,49 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
       E2E-3（AI routes mock疎通）・E2E-4（Android実機Expo Go起動・API疎通・Project一覧表示・
       主要ボタン操作）まで確認済み（コミット be0a5b5〜9b3121c）。Project作成画面・Pending Approval UIの
       個別操作確認、Worker/API/Mobile同時起動での通し確認は未実施
+
+### Project自動開発フロー（2026-07-29調査）
+
+**目的:** Project作成後、AIがロードマップとTaskを作り、原則として完成まで自動で進む状態にする。
+CEOが通常Taskを一件ずつ手作業で登録する設計にはしない。通常のチェックポイントでは開発を止めず、
+Goal変更・重大仕様変更・高リスク操作など経営判断が必要な場合だけ既存Approval Gateで停止する。
+
+**現状（実コード調査結果）:** 個別部品は存在するが、**Project作成→完成までの自動連鎖は未接続**。
+`POST /api/cto/generate-roadmap`はtarget-project側Markdownを書くだけでDB上のTaskを作らず、
+TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在しない
+（Workerは`updateJob()`でJobのみ更新し、Task status更新も次Job生成も行わない）。
+
+- [ ] **前提: データモデルの不整合解消**（Codexレビューで判明。これを解かずに接続すると壊れる）
+      - `generateRoadmap()`は`task-001`形式のidと`phase`を持つTaskを生成するが、
+        `storage.tasks.create()`は`id: randomUUID()`を強制し、`Task`型に`phase`が無い
+        （`roadmapGenerator.ts:22-25` / `sqlite.ts:263-269` / `packages/shared/src/types/task.ts`）
+      - `contextPack`は`task-001`形式と`phase`を必須要求する（`routes/contextPack.ts:14-18`）ため、
+        UUIDのままではContext Pack生成が通らない
+      - `POST /api/cto/generate-roadmap`は`projectId`を受け取らず、`Project`型に
+        `targetProjectRoot`が無い（`routes/ctoAi.ts:26-30` / `types/project.ts`）ため、
+        生成物とProjectレコードを紐付けられない
+      **完了条件**: Task識別子・`phase`・Project↔target-project紐付けの持ち方が決まり、
+      Context Packとの互換が保たれること
+- [ ] ロードマップ→Taskレコード自動生成: `generateRoadmap()`の出力から`storage.tasks.create()`で
+      DB上のTaskを作る接続。現状この接続がないため、生成されたロードマップは開発に使われない。
+      **完了条件**: Project作成後にロードマップ生成を実行するとDB上にTaskが並ぶこと
+- [ ] Task→Job自動生成と連続実行: 初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
+      （手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。無いのは「自動生成」と「自動継続」）。
+      **既知の穴（Codexレビュー）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
+      `projectId`とTaskのProjectの一致検証も無い（`routes/jobs.ts:122-137`）。Workerは
+      queued Job取得と`running`更新が別リクエストのため多重起動時に競合し得る
+      （`worker/src/index.ts`）。
+      **完了条件**: 1つのProjectで複数Taskが順に自動実行され、二重生成・途中失敗時に
+      安全側で停止すること（既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）
+- [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
+      **既知の穴**: `ProjectStatus`に`completed`が無い（`draft/running/paused/archived`のみ。
+      `types/project.ts:3`）ため、計算値にするか状態として持つかの決定が必要。
+      **完了条件**: 完了/未完了がAPIで取得でき、Mobileから確認できること
+- [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
+      **通知後も開発は継続し、通常チェックポイントでは停止しない**。既存の`notifier`
+      （LINE/Slack）・`summaryEngine.ts`・Approval Gateの再利用を前提とし、新しい停止Gateは作らない。
+      **完了条件**: Phase完了時にCEOへ通知が届き、開発が止まらないこと。CEOが修正指示を返す経路は
+      「追加開発指示（追加Task作成）」を使う
 
 ### スマホ操作MVP残タスク（2026-07-21整理）
 
@@ -266,11 +314,12 @@ Alignment Review・Meta Review・preReview・postReview・Report Translation）/
 <!-- roadmap:id=mobile-approval-gate-ui state=done -->
 3. [x] Task/Job単位Approval GateのMobile UI連携 — 完了。`approvals.tsx`が`/api/approval-requests/waiting`
    から取得し、`/api/approval-requests/:id/status`で承認/却下操作まで実装済み
-<!-- roadmap:id=mobile-task-create state=planned -->
-4. [ ] 開発指示（Task作成）画面（Mobile） — **スマホ操作MVPの現在の主要残タスク**。現状`create.tsx`は
-   Project作成のみで、Project内にTaskを追加する導線がスマホ側にない。Task作成後、誰が・どの経路で
-   初回Jobを起動するか（CTO AI/Developer AI Orchestratorの既存ルートで代替できないか等）を
-   既存経路の調査から始め、調査後に実装方針を決める
+<!-- roadmap:id=mobile-task-create state=in_progress -->
+4. [ ] 追加開発指示（追加Task作成）画面（Mobile） — **スマホ操作MVPの現在の主要残タスク**。
+   通常のTaskはProject作成後にAIが自動生成する想定（下記「Project自動開発フロー」参照）であり、
+   この画面はCEOが**既存Projectへ後から要望を追加する入口**（追加機能・改善・不具合・調査・
+   完成後アップデート）と位置づける。CEOが通常Taskを一件ずつ手作業で登録する設計にはしない。
+   現状`create.tsx`はProject作成のみで、Project内にTaskを追加する導線がスマホ側にない
 <!-- roadmap:id=mobile-task-resume-ui state=done -->
 5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
    （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
