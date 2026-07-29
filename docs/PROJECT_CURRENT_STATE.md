@@ -78,6 +78,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:START -->
 **完了項目:**
 - **Step 0: データモデル整合（完了）**
+- **ロードマップ→Taskレコード自動生成（完了）**
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
 - 再実行・追加指示UI（Mobile）

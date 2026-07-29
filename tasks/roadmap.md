@@ -337,9 +337,14 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **完了条件**: 上記の持ち方（識別子・phase・roadmap_active・estimatedComplexity・workspace制約・
       dependencies解決・再生成ポリシー）がCEOに採択され、既存Task/Job/resume/Mobileルートを
       壊さないことが確認されていること。実装着手はCEO承認後
-2. [ ] ロードマップ→Taskレコード自動生成: `generateRoadmap()`の出力から`storage.tasks.create()`で
-      DB上のTaskを作る接続。現状この接続がないため、生成されたロードマップは開発に使われない。
-      **完了条件**: Project作成後にロードマップ生成を実行するとDB上にTaskが並ぶこと
+<!-- roadmap:id=project-auto-roadmap-sync state=done -->
+2. [x] **ロードマップ→Taskレコード自動生成（完了）** — `POST /api/cto/generate-roadmap`が
+      生成→事前検証（422）→`storage.tasks.syncRoadmapTasks()`によるDB同期（409）→
+      Markdown出力の順で動作し、同じ生成結果からDBとMarkdownの両方を作る
+      （コミット`0a80437` feat(api): sync roadmap tasks transactionally、
+      `e58040c` feat(cto): persist generated roadmap tasks）。
+      Task→初回Job生成・自動連続実行・Project完了判定・CEO Alignment Checkpoint・
+      Context PackのJob実行時接続は未着手（Step 2）
 3. [ ] Task→Job自動生成と連続実行: 初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
       （手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。無いのは「自動生成」と「自動継続」）。
       **既知の穴（Codexレビュー）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
