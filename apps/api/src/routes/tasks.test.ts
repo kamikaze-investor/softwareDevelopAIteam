@@ -195,6 +195,31 @@ describe('Task API', () => {
     })
   })
 
+  it('POST /api/tasks ignores roadmap fields from the public body', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Public task',
+          assignee: 'developer_ai',
+          roadmapTaskKey: 'task-001',
+          phase: 1,
+          roadmapActive: true,
+        },
+      })
+
+      expect(res.statusCode).toBe(201)
+      const body = parseBody<Task>(res.body)
+      expect(body.roadmapTaskKey).toBeUndefined()
+      expect(body.phase).toBeUndefined()
+      expect(body.roadmapActive).toBe(false)
+    })
+  })
+
   it('GET /api/tasks lists project tasks', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -723,6 +748,34 @@ describe('Task API', () => {
       const body = parseBody<Task>(res.body)
       expect(body.provider).toBe('codex')
       expect(body.allowedPaths).toEqual(['apps/api/src/'])
+    })
+  })
+
+  it('PATCH /api/tasks/:id does not accept roadmap fields from the public body', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const created = await createTask(app, project.id)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/tasks/${created.id}`,
+        payload: {
+          title: 'Should not update',
+          roadmapTaskKey: 'task-001',
+          phase: 1,
+          roadmapActive: true,
+        },
+      })
+
+      expect(res.statusCode).toBe(400)
+
+      const found = await app.inject({ method: 'GET', url: `/api/tasks/${created.id}` })
+      expect(found.statusCode).toBe(200)
+      const body = parseBody<Task>(found.body)
+      expect(body.title).toBe(created.title)
+      expect(body.roadmapTaskKey).toBeUndefined()
+      expect(body.phase).toBeUndefined()
+      expect(body.roadmapActive).toBe(false)
     })
   })
 

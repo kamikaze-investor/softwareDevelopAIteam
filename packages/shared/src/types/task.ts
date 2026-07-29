@@ -50,6 +50,21 @@ export interface Task {
    */
   expectedOutputs?: string[]
 
+  /**
+   * ロードマップ上の論理ID（例: task-001）。
+   * ロードマップ同期で作成されたTaskのみ設定される。手動作成Taskはundefined。
+   */
+  roadmapTaskKey?: string
+
+  /** ロードマップ上のPhase番号。手動作成Taskはundefined */
+  phase?: number
+
+  /**
+   * 現行ロードマップに属しているか。
+   * 手動作成Task・既存Taskはfalse。ロードマップ同期で作成/再登場したTaskのみtrue。
+   */
+  roadmapActive: boolean
+
   createdAt: string
   updatedAt: string
 }

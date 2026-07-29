@@ -1,8 +1,16 @@
 import { beforeEach, describe, expect, it } from 'vitest'
+import Database from 'better-sqlite3'
+import { randomUUID } from 'node:crypto'
+import os from 'node:os'
+import path from 'node:path'
 import { createSQLiteStorage } from './sqlite'
 import type { IStorage } from './interface'
+import type { Task } from '@ai-team/shared'
 
 type ApprovalCreateInput = Parameters<IStorage['approvals']['create']>[0] & { projectId: string }
+type TaskCreateInput = Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & {
+  roadmapActive?: boolean
+}
 
 describe('SQLiteStorage', () => {
   let storage: IStorage
@@ -61,6 +69,18 @@ describe('SQLiteStorage', () => {
         status: 'draft',
       }).id
     })
+
+    function createTask(overrides: Partial<TaskCreateInput> = {}) {
+      return storage.tasks.create({
+        projectId,
+        title: 'T',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+        ...overrides,
+      })
+    }
 
     it('creates and finds tasks by project id', () => {
       storage.tasks.create({
@@ -121,6 +141,129 @@ describe('SQLiteStorage', () => {
 
       expect(found?.provider).toBe('claude_code')
       expect(found?.allowedPaths).toEqual(['target-project/'])
+    })
+
+    it('creates roadmap columns in a new database and persists roadmap fields', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-roadmap-task-${randomUUID()}.db`)
+      const fileStorage = createSQLiteStorage(dbPath)
+      const db = new Database(dbPath, { readonly: true })
+
+      try {
+        const columns = new Map(
+          (db.pragma('table_info(tasks)') as Array<{
+            name: string
+            type: string
+            notnull: number
+            dflt_value: string | null
+          }>).map((column) => [column.name, column]),
+        )
+
+        expect(columns.get('roadmap_task_key')?.type).toBe('TEXT')
+        expect(columns.get('phase')?.type).toBe('INTEGER')
+        expect(columns.get('roadmap_active')?.type).toBe('INTEGER')
+        expect(columns.get('roadmap_active')?.notnull).toBe(1)
+        expect(columns.get('roadmap_active')?.dflt_value).toBe('0')
+      } finally {
+        db.close()
+      }
+
+      const project = fileStorage.projects.create({
+        name: 'Roadmap Project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const task = fileStorage.tasks.create({
+        projectId: project.id,
+        title: 'Roadmap task',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+        roadmapTaskKey: 'task-001',
+        phase: 1,
+        roadmapActive: true,
+      })
+
+      const found = fileStorage.tasks.findById(task.id)
+
+      expect(found?.roadmapTaskKey).toBe('task-001')
+      expect(found?.phase).toBe(1)
+      expect(found?.roadmapActive).toBe(true)
+    })
+
+    it('defaults roadmapActive to false when it is omitted', () => {
+      const task = createTask({ title: 'Manual task' })
+      const found = storage.tasks.findById(task.id)
+
+      expect(task.roadmapActive).toBe(false)
+      expect(found?.roadmapActive).toBe(false)
+    })
+
+    it('rejects duplicate roadmapTaskKey values in the same project', () => {
+      createTask({ roadmapTaskKey: 'task-001', phase: 1, roadmapActive: true })
+
+      expect(() => {
+        createTask({ title: 'Duplicate roadmap task', roadmapTaskKey: 'task-001', phase: 2, roadmapActive: true })
+      }).toThrow()
+    })
+
+    it('allows the same roadmapTaskKey in different projects', () => {
+      const otherProjectId = storage.projects.create({
+        name: 'Other',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      }).id
+
+      const first = createTask({ roadmapTaskKey: 'task-001', phase: 1, roadmapActive: true })
+      const second = storage.tasks.create({
+        projectId: otherProjectId,
+        title: 'Same roadmap key',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+        roadmapTaskKey: 'task-001',
+        phase: 1,
+        roadmapActive: true,
+      })
+
+      expect(first.roadmapTaskKey).toBe(second.roadmapTaskKey)
+      expect(first.projectId).not.toBe(second.projectId)
+    })
+
+    it('allows multiple NULL roadmapTaskKey tasks in the same project', () => {
+      createTask({ title: 'Manual task 1' })
+      createTask({ title: 'Manual task 2' })
+
+      const tasks = storage.tasks.findByProjectId(projectId)
+
+      expect(tasks).toHaveLength(2)
+      expect(tasks.map((task) => task.roadmapTaskKey)).toEqual([undefined, undefined])
+    })
+
+    it('updates phase and roadmapActive fields', () => {
+      const task = createTask({ roadmapTaskKey: 'task-001', phase: 1, roadmapActive: false })
+
+      storage.tasks.update(task.id, { phase: 2, roadmapActive: true })
+
+      const found = storage.tasks.findById(task.id)
+      expect(found?.phase).toBe(2)
+      expect(found?.roadmapActive).toBe(true)
+    })
+
+    it('keeps roadmapActive when updating other fields without specifying it', () => {
+      const task = createTask({ roadmapTaskKey: 'task-001', phase: 1, roadmapActive: true })
+
+      // roadmapActive を渡さない部分更新で、既存の true が暗黙に false へ落ちないこと
+      storage.tasks.update(task.id, { title: 'updated title' })
+
+      const found = storage.tasks.findById(task.id)
+      expect(found?.title).toBe('updated title')
+      expect(found?.roadmapActive).toBe(true)
+      expect(found?.phase).toBe(1)
+      expect(found?.roadmapTaskKey).toBe('task-001')
     })
   })
 

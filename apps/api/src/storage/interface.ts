@@ -25,7 +25,12 @@ export interface ITaskStorage {
   findByProjectId(projectId: string): Task[]
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
-  create(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt'>): Task
+  /**
+   * roadmapActive は省略可能で、省略時は false（＝現行ロードマップに属さない手動Task）として保存する。
+   * roadmapTaskKey / phase / roadmapActive は内部のロードマップ同期処理のみが指定し、
+   * 公開API（POST /api/tasks）からは設定できない。
+   */
+  create(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & { roadmapActive?: boolean }): Task
   update(id: string, data: Partial<Task>): Task | undefined
 }
 

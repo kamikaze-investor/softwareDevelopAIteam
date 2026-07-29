@@ -28,6 +28,9 @@ export const CREATE_TABLES = `
     forbidden_paths TEXT NOT NULL DEFAULT '[]',
     acceptance_criteria TEXT NOT NULL DEFAULT '[]',
     expected_outputs TEXT NOT NULL DEFAULT '[]',
+    roadmap_task_key TEXT,
+    phase INTEGER,
+    roadmap_active INTEGER NOT NULL DEFAULT 0 CHECK (roadmap_active IN (0,1)),
     branch_name TEXT,
     commit_hash TEXT,
     created_at TEXT NOT NULL,
@@ -252,6 +255,9 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'tasks', column: 'forbidden_paths', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'tasks', column: 'acceptance_criteria', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'tasks', column: 'expected_outputs', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { table: 'tasks', column: 'roadmap_task_key', definition: 'TEXT' },
+  { table: 'tasks', column: 'phase', definition: 'INTEGER' },
+  { table: 'tasks', column: 'roadmap_active', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'jobs', column: 'agent_role', definition: "TEXT NOT NULL DEFAULT 'developer_ai'" },
   { table: 'jobs', column: 'safe_command', definition: 'TEXT' },
   { table: 'jobs', column: 'dry_run', definition: 'INTEGER NOT NULL DEFAULT 0' },
@@ -264,4 +270,12 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'jobs', column: 'ai_cli_mode', definition: 'TEXT' },
   { table: 'approval_requests', column: 'changed_files', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'approval_requests', column: 'triggered_rules', definition: "TEXT NOT NULL DEFAULT '[]'" },
+]
+
+/**
+ * runMigrations() の後に実行するインデックス定義。
+ * CREATE_TABLES に書くと、既存DBではまだ列が存在せず失敗するため分離している。
+ */
+export const INDEX_STATEMENTS: string[] = [
+  'CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_project_roadmap_task_key ON tasks(project_id, roadmap_task_key)',
 ]

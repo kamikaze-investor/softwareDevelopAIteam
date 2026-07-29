@@ -8,7 +8,7 @@
 
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
-import { CREATE_TABLES, MIGRATION_STATEMENTS } from './schema'
+import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
@@ -142,6 +142,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   db.pragma('journal_mode = WAL')
   db.exec(CREATE_TABLES)
   runMigrations(db)
+  runIndexMigrations(db)
 
   const projects: IProjectStorage = {
     findAll() {
@@ -263,6 +264,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     create(data) {
       const task: Task = {
         ...data,
+        // 未指定は false（手動Task）。DBへは常に0/1のみを書き込む。
+        roadmapActive: data.roadmapActive === true,
         id: randomUUID(),
         createdAt: now(),
         updatedAt: now(),
@@ -271,8 +274,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         INSERT INTO tasks
           (id, project_id, title, description, status, assignee, provider, dependencies,
            allowed_paths, forbidden_paths, acceptance_criteria, expected_outputs,
-           branch_name, commit_hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           roadmap_task_key, phase, roadmap_active, branch_name, commit_hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         task.id,
         task.projectId,
@@ -286,6 +289,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         JSON.stringify(task.forbiddenPaths ?? []),
         JSON.stringify(task.acceptanceCriteria ?? []),
         JSON.stringify(task.expectedOutputs ?? []),
+        task.roadmapTaskKey ?? null,
+        task.phase ?? null,
+        task.roadmapActive ? 1 : 0,
         task.branchName ?? null,
         task.commitHash ?? null,
         task.createdAt,
@@ -296,12 +302,21 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     update(id, data) {
       const existing = tasks.findById(id)
       if (!existing) return undefined
-      const updated = { ...existing, ...data, updatedAt: now() }
+      const updated: Task = {
+        ...existing,
+        ...data,
+        // 未指定時は既存値を保持する（=== true で潰すと部分更新で暗黙にfalse化する）。
+        // 指定時のみ厳密に真偽へ正規化し、DBへは常に0/1のみを書き込む。
+        roadmapActive: data.roadmapActive === undefined
+          ? existing.roadmapActive === true
+          : data.roadmapActive === true,
+        updatedAt: now(),
+      }
       db.prepare(`
         UPDATE tasks SET
           title=?, description=?, status=?, assignee=?, provider=?, dependencies=?,
           allowed_paths=?, forbidden_paths=?, acceptance_criteria=?, expected_outputs=?,
-          branch_name=?, commit_hash=?, updated_at=?
+          roadmap_task_key=?, phase=?, roadmap_active=?, branch_name=?, commit_hash=?, updated_at=?
         WHERE id=?
       `).run(
         updated.title,
@@ -314,6 +329,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         JSON.stringify(updated.forbiddenPaths ?? []),
         JSON.stringify(updated.acceptanceCriteria ?? []),
         JSON.stringify(updated.expectedOutputs ?? []),
+        updated.roadmapTaskKey ?? null,
+        updated.phase ?? null,
+        updated.roadmapActive ? 1 : 0,
         updated.branchName ?? null,
         updated.commitHash ?? null,
         updated.updatedAt,
@@ -1183,6 +1201,9 @@ function deserializeTask(row: any): Task {
     forbiddenPaths: JSON.parse(row.forbidden_paths ?? '[]'),
     acceptanceCriteria: JSON.parse(row.acceptance_criteria ?? '[]'),
     expectedOutputs: JSON.parse(row.expected_outputs ?? '[]'),
+    roadmapTaskKey: row.roadmap_task_key ?? undefined,
+    phase: row.phase ?? undefined,
+    roadmapActive: row.roadmap_active === 1,
     branchName: row.branch_name ?? undefined,
     commitHash: row.commit_hash ?? undefined,
     createdAt: row.created_at,
@@ -1433,5 +1454,11 @@ function runMigrations(db: Database.Database): void {
     if (!columns.includes(column)) {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
     }
+  }
+}
+
+function runIndexMigrations(db: Database.Database): void {
+  for (const statement of INDEX_STATEMENTS) {
+    db.exec(statement)
   }
 }
