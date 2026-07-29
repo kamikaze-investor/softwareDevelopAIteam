@@ -16,6 +16,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
+import type { Task } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // 型定義
@@ -60,6 +61,37 @@ export interface ContextPack {
   projectMemory: ProjectMemorySummary
   /** Developer AI へのインストラクション（プロンプト用） */
   instruction: string
+}
+
+/**
+ * DB Task を Context Pack 入力（TaskSummary）へ変換する。
+ * DB列を追加しない前提のため estimatedComplexity は 'medium' 固定を使う。
+ * dependencies は roadmapTaskKey 表示のため、UUID→roadmapTaskKey の解決が必要。
+ * 解決できない依存（他Projectや削除済み等）は無視する（配列から除外）。
+ */
+export function taskToContextPackSummary(
+  task: Task,
+  allProjectTasks: Task[],
+): TaskSummary {
+  const roadmapTaskKeyById = new Map(
+    allProjectTasks
+      .filter((projectTask) => projectTask.roadmapTaskKey !== undefined)
+      .map((projectTask) => [projectTask.id, projectTask.roadmapTaskKey as string] as const),
+  )
+
+  return {
+    id: task.roadmapTaskKey ?? task.id,
+    title: task.title,
+    description: task.description,
+    phase: task.phase ?? 0,
+    assignee: task.assignee,
+    dependencies: task.dependencies
+      .map((dependencyId) => roadmapTaskKeyById.get(dependencyId))
+      .filter((roadmapTaskKey): roadmapTaskKey is string => roadmapTaskKey !== undefined),
+    acceptanceCriteria: task.acceptanceCriteria ?? [],
+    allowedPaths: task.allowedPaths ?? [],
+    estimatedComplexity: 'medium',
+  }
 }
 
 // ────────────────────────────────────────────────────────────

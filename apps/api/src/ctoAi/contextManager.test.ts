@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest'
-import { buildContextPack } from './contextManager.js'
+import { buildContextPack, taskToContextPackSummary } from './contextManager.js'
 import type { TaskSummary } from './contextManager.js'
 import os from 'node:os'
 import path from 'node:path'
 import { mkdirSync, writeFileSync } from 'node:fs'
+import type { Task } from '@ai-team/shared'
 
 function makeTmp(): string {
   const dir = path.join(os.tmpdir(), `ctx-test-${Date.now()}`)
@@ -21,6 +22,26 @@ const SAMPLE_TASK: TaskSummary = {
   acceptanceCriteria: ['型エラーがない', 'テストが通る'],
   allowedPaths: ['packages/shared/src/'],
   estimatedComplexity: 'small',
+}
+
+function dbTask(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'uuid-task-001',
+    projectId: 'project-001',
+    title: 'DB task',
+    description: 'DB description',
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+    allowedPaths: ['apps/api/src/'],
+    acceptanceCriteria: ['done'],
+    roadmapTaskKey: 'task-001',
+    phase: 1,
+    roadmapActive: true,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  }
 }
 
 describe('buildContextPack', () => {
@@ -96,5 +117,38 @@ describe('buildContextPack', () => {
     const task = { ...SAMPLE_TASK, dependencies: ['task-000'] }
     const pack = buildContextPack(task, tmpDir)
     expect(pack.instruction).toContain('task-000')
+  })
+
+  it('converts a DB Task to a Context Pack TaskSummary with medium complexity', () => {
+    const summary = taskToContextPackSummary(dbTask(), [dbTask()])
+
+    expect(summary).toMatchObject({
+      id: 'task-001',
+      title: 'DB task',
+      description: 'DB description',
+      phase: 1,
+      assignee: 'developer_ai',
+      dependencies: [],
+      acceptanceCriteria: ['done'],
+      allowedPaths: ['apps/api/src/'],
+      estimatedComplexity: 'medium',
+    })
+  })
+
+  it('converts dependency UUIDs to roadmapTaskKey values and ignores unresolved IDs', () => {
+    const dependency = dbTask({
+      id: 'uuid-task-001',
+      roadmapTaskKey: 'task-001',
+    })
+    const task = dbTask({
+      id: 'uuid-task-002',
+      roadmapTaskKey: 'task-002',
+      dependencies: ['uuid-task-001', 'missing-task'],
+    })
+
+    const summary = taskToContextPackSummary(task, [dependency, task])
+
+    expect(summary.id).toBe('task-002')
+    expect(summary.dependencies).toEqual(['task-001'])
   })
 })

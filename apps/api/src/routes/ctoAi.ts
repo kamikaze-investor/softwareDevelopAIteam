@@ -14,6 +14,7 @@ import { writeProjectMemory } from '../ctoAi/projectMemoryWriter.js'
 import { generateRoadmap } from '../ctoAi/roadmapGenerator.js'
 import { writeRoadmap } from '../ctoAi/roadmapWriter.js'
 import { getStorage } from '../storage'
+import { validateRoadmapTasks, type RoadmapSyncTaskInput } from '../storage/roadmapTaskValidation'
 import { validateTargetRoot } from '../utils/pathGuard.js'
 
 const CONFIGURED_TARGET_ROOT = process.env.TARGET_ROOT ?? '/workspace/target'
@@ -151,6 +152,33 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
       // 1. ロードマップ生成（Claude API or mock）
       const roadmap = await generateRoadmap(analysis as any, { mockResponse })
 
+      const roadmapTasks: RoadmapSyncTaskInput[] = roadmap.tasks.map((task) => ({
+        roadmapTaskKey: task.id,
+        title: task.title,
+        description: task.description,
+        phase: task.phase,
+        assignee: task.assignee,
+        dependencies: task.dependencies,
+        acceptanceCriteria: task.acceptanceCriteria,
+        allowedPaths: task.allowedPaths,
+      }))
+
+      const validationIssues = validateRoadmapTasks(roadmapTasks)
+      if (validationIssues.length > 0) {
+        return reply.status(422).send({
+          error: 'ロードマップの検証に失敗しました',
+          issues: validationIssues,
+        })
+      }
+
+      const syncResult = storage.tasks.syncRoadmapTasks({ projectId, tasks: roadmapTasks })
+      if (!syncResult.ok) {
+        return reply.status(409).send({
+          error: 'ロードマップの同期に失敗しました',
+          detail: syncResult.failureReason,
+        })
+      }
+
       // 2. target-project に書き出し
       const writeResult = writeRoadmap(roadmap, targetProjectRoot)
 
@@ -159,6 +187,12 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
         totalTasks: roadmap.totalTasks,
         estimatedWeeks: roadmap.estimatedWeeks,
         phaseCount: roadmap.phases.length,
+        syncSummary: {
+          created: syncResult.createdTaskIds.length,
+          updated: syncResult.updatedTaskIds.length,
+          reactivated: syncResult.reactivatedTaskIds.length,
+          deactivated: syncResult.deactivatedTaskIds.length,
+        },
         writtenFiles: writeResult.writtenFiles,
         targetDir: writeResult.targetDir,
         roadmap,

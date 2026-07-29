@@ -27,8 +27,9 @@ const MOCK_ANALYSIS = JSON.stringify({
 })
 
 async function buildApp(): Promise<FastifyInstance> {
-  const [{ ctoAiRoutes }, { resetStorage }] = await Promise.all([
+  const [{ ctoAiRoutes }, { taskRoutes }, { resetStorage }] = await Promise.all([
     import('./ctoAi.js'),
+    import('./tasks.js'),
     import('../storage/index.js'),
   ])
 
@@ -37,6 +38,7 @@ async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify()
   app.register(cors, { origin: true })
   app.register(ctoAiRoutes, { prefix: '/api/cto' })
+  app.register(taskRoutes, { prefix: '/api/tasks' })
   await app.ready()
   return app
 }
@@ -250,6 +252,44 @@ const MOCK_ROADMAP = JSON.stringify({
   estimatedWeeks: 1,
 })
 
+type MockRoadmapTask = {
+  id: string
+  title?: string
+  description?: string
+  phase?: number
+  assignee?: 'developer_ai'
+  dependencies?: string[]
+  acceptanceCriteria?: string[]
+  allowedPaths?: string[]
+  estimatedComplexity?: 'small' | 'medium' | 'large'
+}
+
+function mockRoadmapResponse(tasks: MockRoadmapTask[]): string {
+  return JSON.stringify({
+    phases: [
+      {
+        number: 1,
+        name: 'Phase 1',
+        goal: 'Goal',
+        tasks: tasks.map((task) => task.id),
+      },
+    ],
+    tasks: tasks.map((task) => ({
+      title: `Title ${task.id}`,
+      description: `Description ${task.id}`,
+      phase: 1,
+      assignee: 'developer_ai',
+      dependencies: [],
+      acceptanceCriteria: [],
+      allowedPaths: [],
+      estimatedComplexity: 'small',
+      ...task,
+    })),
+    totalTasks: tasks.length,
+    estimatedWeeks: 1,
+  })
+}
+
 const MOCK_ANALYSIS_OBJ = JSON.parse(MOCK_ANALYSIS)
 
 describe('CTO AI — generate-roadmap API', () => {
@@ -280,7 +320,26 @@ describe('CTO AI — generate-roadmap API', () => {
     const body = JSON.parse(res.body)
     expect(body.status).toBe('roadmap_generated')
     expect(body.totalTasks).toBe(1)
+    expect(body.syncSummary).toMatchObject({
+      created: 1,
+      updated: 0,
+      reactivated: 0,
+      deactivated: 0,
+    })
     expect(body.writtenFiles).toHaveLength(2)
+    const tasksRes = await app.inject({
+      method: 'GET',
+      url: `/api/tasks?projectId=${project.id}`,
+    })
+    expect(tasksRes.statusCode).toBe(200)
+    const tasks = JSON.parse(tasksRes.body)
+    expect(tasks).toHaveLength(1)
+    expect(tasks[0]).toMatchObject({
+      projectId: project.id,
+      roadmapTaskKey: 'task-001',
+      roadmapActive: true,
+      phase: 1,
+    })
     // ファイルが実際に生成されているか
     const { existsSync } = await import('node:fs')
     expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(true)
@@ -316,5 +375,116 @@ describe('CTO AI — generate-roadmap API', () => {
       },
     })
     expect(res.statusCode).toBe(400)
+  })
+
+  it('POST /api/cto/generate-roadmap returns 409 and does not write Markdown when DB sync fails', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const removedTask = storage.tasks.create({
+      projectId: project.id,
+      title: 'Existing task',
+      description: '',
+      status: 'pending',
+      assignee: 'developer_ai',
+      dependencies: [],
+      roadmapTaskKey: 'task-001',
+      phase: 1,
+      roadmapActive: true,
+    })
+    storage.jobs.create({
+      taskId: removedTask.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    })
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: mockRoadmapResponse([{ id: 'task-002' }]),
+      },
+    })
+
+    expect(res.statusCode).toBe(409)
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+    expect(existsSync(path.join(tmpDir, 'tasks', 'task_graph.md'))).toBe(false)
+    expect(storage.tasks.findByProjectId(project.id)).toHaveLength(1)
+    expect(storage.tasks.findById(removedTask.id)?.roadmapActive).toBe(true)
+  })
+
+  it('POST /api/cto/generate-roadmap returns 422 and creates no tasks for invalid generated roadmap', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: mockRoadmapResponse([
+          { id: 'task-001', title: 'First duplicate' },
+          { id: 'task-001', title: 'Second duplicate' },
+        ]),
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(422)
+    expect(JSON.parse(res.body).issues).toContainEqual(expect.objectContaining({
+      code: 'duplicate_roadmap_task_key',
+    }))
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+  })
+
+  it('POST /api/cto/generate-roadmap keeps the existing 409 for non-running projects', async () => {
+    const app = await buildApp()
+    const project = await createProject('draft')
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(409)
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+  })
+
+  it('POST /api/cto/generate-roadmap keeps the existing 400 for an unconfigured target root', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const otherRoot = path.join(os.tmpdir(), `roadmap-api-other-${Date.now()}`)
+    mkdirSync(otherRoot, { recursive: true })
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: otherRoot,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(400)
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
   })
 })
