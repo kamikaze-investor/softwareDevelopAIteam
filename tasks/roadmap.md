@@ -69,7 +69,8 @@
       （task-022導入時からの潜在バグ。AI CLI事前実行機能を使う全Jobが対象）。resume API実装時の調査で発覚し、
       専用カラム追加（`ai_cli_provider`/`ai_cli_prompt`/`ai_cli_mode`、既存`MIGRATION_STATEMENTS`パターン）で
       修正（コミット`92fe91b`）
-- [ ] contextFiles 拡張（Context Manager 連携）← 別 task
+- [ ] contextFiles 拡張（Context Manager 連携）← 「Project自動開発フロー」将来項目
+      `project-auto-context-pack-wiring` で追跡する
 
 ### 1-D: バックエンド実装
 
@@ -261,6 +262,23 @@ Goal変更・重大仕様変更・高リスク操作など経営判断が必要�
 TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在しない
 （Workerは`updateJob()`でJobのみ更新し、Task status更新も次Job生成も行わない）。
 
+**実装順（2026-07-30確定。Step 2設計調査で判明した安全要件を反映）:**
+
+自動連続実行を有効化する前に、**AI実行プロセスから本体DBを隔離し、Worker結果をAPI障害時にも
+失わず、本体DBを書き込めるのはAPIだけにし、DB事故から復旧できる**状態を先に作る。
+
+1. `project-auto-worker-trust-boundary` — Worker安全境界・結果引き渡し設計
+2. `project-auto-worker-outbox` — Worker永続Outbox・結果受信基盤
+3. `project-auto-db-safety` — 本体DB安全・復旧基盤
+4. `project-auto-task-job-chain` — Task→Job自動生成と連続実行
+5. `project-auto-recovery-e2e` — 障害復旧E2E・自律実行有効化
+6. 将来: `project-auto-worker-core-split` — Worker安全コアの物理分離
+7. 将来: `project-auto-context-pack-wiring` — Context Pack実接続
+8. 将来: `project-auto-multi-worker` — 複数Worker対応
+
+**2と3は1の完了後に並行実装できる。4は2と3の両方が完了するまで開始しない。**
+5の完了をもって自律連続実行を有効化する。
+
 <!-- roadmap:id=project-auto-data-model state=done -->
 1. [x] **Step 0: データモデル整合（完了）** — Task識別子・phase・
       `roadmap_active`・固定workspace制約をCEO承認済み設計どおり実装済み
@@ -355,23 +373,127 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       DB Task同期とMarkdown保存の両方が成功するまでJobを作らない／Markdown保存失敗時はJobを作らない／
       再実行時、履歴のあるTaskの仕様変更は本Stepの実装どおり409で拒否する／
       未着手Taskは冪等に再同期できる
-3. [ ] Task→Job自動生成と連続実行: 初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
+<!-- roadmap:id=project-auto-worker-trust-boundary state=in_progress -->
+3. [ ] **Worker安全境界・結果引き渡し設計** — 自動連続実行を実装する前に、信頼境界を確定する
+      設計項目（実装を伴わない）。**基本方針**: AI CLI実行プロセスには本体DBファイル・DB認証情報・
+      管理APIトークンを渡さない／Workerにも本体DBファイルをマウントせず任意のDB操作を許可しない／
+      **本体DBを書き込めるのはAPIだけ**とする／Task状態更新と次Job生成はAPI側の冪等な進行管理で行う／
+      MVPではWorkerは1インスタンスに限定する。
+      **確定すること**: Worker安全コアに残す責務（実行・Permission Guard・File Change Guard・
+      Approval Gate・Risk Scan・fail-closed）と、外側へ分離する進行管理責務（Task選定・
+      次Job生成・Context Pack構築）の線引き／AI実行プロセス・本体API・本体DB・Worker Outboxの
+      権限境界／結果イベントとACKの契約／CONTROL REPOSITORY保護対象の再分割方針。
+      **現状の実測根拠（2026-07-30 Step 2調査）**: Workerは`updateJob()`で
+      `PATCH /api/jobs/:id`へ直接結果を書くだけで永続キューを持たず、**API停止中にJobが完了すると
+      結果が失われる**（`apps/worker/src/index.ts:63-76,100-114`）。`recoverStaleJobs()`は起動時に
+      **全Projectのrunning Jobを無条件でfailedへ落とす**ため、Workerを2つ起動すると互いの実行中Jobを
+      破壊する（`apps/worker/src/jobStateManager.ts:31-66`）。`apps/worker/src/index.ts`・
+      `jobRunner.ts`・`guards/permissionGuard.ts`は**CONTROL REPOSITORY（AI編集禁止）**であり、
+      Worker側へ継続処理を足す案は採れない。
+      **Context Pack接続と複数Worker対応はこの項目に含めず、別項目（将来項目）へ分離する。**
+      **Worker OutboxとCONTROL REPOSITORY保護対象の関係**: Worker Outboxは、AI実行結果の確定直後に
+      保存する必要がある。実装時にCONTROL REPOSITORY保護対象（`index.ts`/`jobRunner.ts`/
+      `permissionGuard.ts`等）への接続が必要な場合は、対象ファイル・変更箇所・許可する入出力を
+      **事前に確定**し、CEOが承認した限定差分だけを変更する（Worker全体の保護解除は行わない）。
+      外側の進行管理からApproval Gate・Risk Scan・permissionGuard・fail-closed処理を
+      迂回できないこと。**この接続口の設計承認を、`project-auto-worker-outbox`実装開始の
+      完了条件に含める**（Worker安全コアの物理分離＝将来項目`project-auto-worker-core-split`とは別。
+      今回必要なのはOutbox用の最小接続口であり、Worker全体の物理的な再分割は将来項目のまま）。
+      **完了条件**: 信頼境界とデータフローが文書化されている／Workerが持つ権限と持たない権限が明確／
+      本体DBへの直接アクセス禁止が明記されている／Outboxと結果受信APIの責務が確定している／
+      Task→Job自動生成が依存するインターフェースが確定している／
+      Outbox用の最小接続口（対象ファイル・変更箇所・許可する入出力）がCEOに承認されている
+<!-- roadmap:id=project-auto-worker-outbox state=planned -->
+4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
+      **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
+      保護対象変更が必要な場合は、実装前にCEOが具体的な差分を承認すること。
+      保護対象ルールを包括的に緩和しないこと。
+      **Worker側**: 実行結果を専用の永続Outboxへ保存する（本体DBとは分離し、未送信結果だけを保持）／
+      `completionEventId`等で結果を一意識別する／APIからACKを受け取るまでOutboxの結果を削除しない／
+      通信失敗・429・5xx・タイムアウト時はバックオフして再送する／Worker再起動後も未送信結果を再送する／
+      **未送信結果が残っている間は新しいJobを取得しない**。
+      **API側**: 狭い内部Job結果受信口だけを提供する／同じ結果が再送されても一度だけ反映する（冪等）／
+      許可されたJob状態遷移だけを実行する（既存`ALLOWED_TRANSITIONS`に従う）／
+      任意のTask・Project・DB操作は受け付けない。
+      **完了条件**: API停止中にWorkerが完了しても結果が失われない／Worker再起動後に未送信結果を
+      再送できる／同じ結果を複数回送ってもDB反映は一度だけ／APIがACKするまで次Jobへ進まない／
+      Workerから本体DBへ直接アクセスできない
+<!-- roadmap:id=project-auto-db-safety state=planned -->
+5. [ ] **本体DB安全・復旧基盤** — 依存: `project-auto-worker-trust-boundary`。
+      `project-auto-worker-outbox`とは**並行実装可能**。
+      本体DBを書き込める主体をAPIへ限定する／任意SQLを受け付けない／重要状態変更の監査ログ／
+      定期バックアップ／世代管理／復元手順／**実際の復元テスト**／重要データの物理削除を
+      通常フローから分離する／migration・一括削除の管理権限を分離する。
+      **完了条件**: バックアップが自動作成される／世代管理が機能する／復元テストが成功している／
+      重要な状態変更を追跡できる／AI・Workerが本体DBを直接削除できない
+<!-- roadmap:id=project-auto-task-job-chain state=blocked -->
+6. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
+      `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。
+      ただし**設計調査は継続中**（2026-07-30時点でCodex `gpt-5.6-sol` read-only独立レビュー実施済み）。
+      初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
       （手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。無いのは「自動生成」と「自動継続」）。
-      **既知の穴（Codexレビュー）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
-      `projectId`とTaskのProjectの一致検証も無い（`routes/jobs.ts:122-137`）。Workerは
-      queued Job取得と`running`更新が別リクエストのため多重起動時に競合し得る
-      （`worker/src/index.ts`）。
+      **設計方針**: DB Task同期とMarkdown保存の**両方**が成功するまで初回Jobを作らない／
+      Worker結果がAPIへ確定反映されるまで次Jobを作らない／API側の**薄いapplication service**が
+      Task状態更新と次Job生成を担当する（新しい常駐Orchestratorは作らない）／
+      Task単位でqueued/running Jobの重複を**DB制約**（partial unique index）で防止する／
+      paused・blocked・failed・Approval待ちでは継続しない／MVPでは単一Workerのみ／
+      **Context Pack完全接続は含めない**。
+      **既知の穴（実コード検証済み）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
+      `projectId`とTaskのProjectの一致検証も無い（`routes/jobs.ts:122-137`）。
+      `Task.status`を自動更新するコードが存在せず事実上`pending`のまま。
+      `approval_requests`に`project_id`列が無く`findWaiting()`が全Project横断で返るため、
+      停止条件では`tasks`とJOINしてProject限定する必要がある。
+      API側`TARGET_ROOT`は環境変数で可変だがWorker側は`/workspace/target`ハードコードのため、
+      不一致時は全Jobがblockedになる（Job生成時にfail-closedで検出する）。
+      `canExecuteCommands: false`のassignee（`cto_ai`/`context_manager`/`reviewer_ai`）が
+      最小候補になると同じTaskを選び続けて永久停止するため、ロードマップ検証側で拒否する。
       **完了条件**: 1つのProjectで複数Taskが順に自動実行され、二重生成・途中失敗時に
       安全側で停止すること（既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）
-4. [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
+<!-- roadmap:id=project-auto-recovery-e2e state=planned -->
+7. [ ] **障害復旧E2E・自律実行有効化** — 依存: `project-auto-task-job-chain`。
+      **確認シナリオ**: API停止中にWorkerが完了／API復旧後に結果再送／ACK消失による重複送信／
+      Worker再起動／API再起動／Outbox書き込み後のクラッシュ／DB反映後・ACK前の通信切断／
+      paused Project／blocked・failed・Approval待ち／同一Taskへの同時Job生成／
+      バックアップからの復元。
+      **完了条件**: 結果消失がない／二重反映がない／二重Job生成がない／復旧後に正しい位置から
+      再開できる／異常時はfail-closedで停止する。
+      **この項目の完了をもって自律連続実行を有効化する。**
+<!-- roadmap:id=project-auto-completion-detection state=planned -->
+8. [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
       **既知の穴**: `ProjectStatus`に`completed`が無い（`draft/running/paused/archived`のみ。
       `types/project.ts:3`）ため、計算値にするか状態として持つかの決定が必要。
       **完了条件**: 完了/未完了がAPIで取得でき、Mobileから確認できること
-5. [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
+<!-- roadmap:id=project-auto-ceo-alignment state=planned -->
+9. [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
       **通知後も開発は継続し、通常チェックポイントでは停止しない**。既存の`notifier`
       （LINE/Slack）・`summaryEngine.ts`・Approval Gateの再利用を前提とし、新しい停止Gateは作らない。
       **完了条件**: Phase完了時にCEOへ通知が届き、開発が止まらないこと。CEOが修正指示を返す経路は
       「追加開発指示（追加Task作成）」を使う
+
+**将来項目（Step 2系の完了後に個別判断。今回は着手しない）**
+
+<!-- roadmap:id=project-auto-worker-core-split state=deferred -->
+1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
+      実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
+      進行管理は保護対象外へ外部化する。**外側から安全機能を迂回できないインターフェース**を作ることが
+      前提条件。`project-auto-worker-trust-boundary`で決めた再分割方針を実際に適用する項目。
+      現在は`apps/worker/src/index.ts`・`jobRunner.ts`・`guards/permissionGuard.ts`が
+      まとめて編集禁止のため、進行管理の変更が安全コアの変更と不可分になっている
+<!-- roadmap:id=project-auto-context-pack-wiring state=deferred -->
+2. [ ] **Context Pack実接続** — `buildContextPack()`が集めた`relevantFiles`は現在AI CLIへ届いていない。
+      `jobRunner.ts:394`が`contextFiles: []`をハードコードしているため
+      （コメント: 「task-023 で Context Manager 連携後に拡張」）、AIへ渡るのは`aiCliPrompt`のみ。
+      **保護対象（CONTROL REPOSITORY）の変更を伴うため独立項目として扱う**。
+      Step 2の自動Job生成では接続せず、プロンプトはTaskフィールドから決定論的に構築する。
+      接続時は秘密情報検査とサイズ上限を必須とする（`gatherRelevantFiles()`は絶対パスの
+      `allowedPaths`を検証せず読むため、`validateAllowedPaths()`相当の事前検証が要る）。
+      1-F「contextFiles 拡張（Context Manager 連携）」はこの項目で追跡する
+<!-- roadmap:id=project-auto-multi-worker state=deferred -->
+3. [ ] **複数Worker対応** — atomic Job claim／Worker ownership・lease／stale recoveryのWorker識別／
+      単一Worker制約を解除する条件の確定。現在は`recoverStaleJobs()`が起動時に全Projectの
+      running Jobを無条件failedにするため、Workerの2重起動は互いの実行中Jobを破壊する
+      （`jobStateManager.ts:31-66`）。またWorkerのqueued Job取得と`running`更新が別リクエストのため
+      atomicにclaimできない。MVPは単一Worker前提を維持する
 
 ### スマホ操作MVP残タスク（2026-07-21整理）
 

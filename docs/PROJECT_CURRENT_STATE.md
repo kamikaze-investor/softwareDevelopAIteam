@@ -84,6 +84,16 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - 再実行・追加指示UI（Mobile）
 
 **未完了・保留項目:**
+- **Worker安全境界・結果引き渡し設計**（state: in_progress）
+- **Worker永続Outbox・結果受信基盤**（state: planned）
+- **本体DB安全・復旧基盤**（state: planned）
+- **Task→Job自動生成と連続実行**（state: blocked）
+- **障害復旧E2E・自律実行有効化**（state: planned）
+- Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。（state: planned）
+- CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
+- **Worker安全コアの物理分離**（state: deferred）
+- **Context Pack実接続**（state: deferred）
+- **複数Worker対応**（state: deferred）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 - 追加開発指示（追加Task作成）画面（Mobile）（state: planned）
 
