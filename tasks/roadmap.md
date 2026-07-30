@@ -403,6 +403,66 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       本体DBへの直接アクセス禁止が明記されている／Outboxと結果受信APIの責務が確定している／
       Task→Job自動生成が依存するインターフェースが確定している／
       Outbox用の最小接続口（対象ファイル・変更箇所・許可する入出力）がCEOに承認されている
+
+      **CEO確定方針（2026-07-31。上位仕様`specs/03_system_architecture.md`へも反映）**:
+      AI CLIとWorkerは本体DBを直接操作しない／本体DBを書き込めるのはAPIのみ／
+      Worker結果は本体DBとは別の永続SQLite Outboxへ保存する／結果送信はat-least-onceとし、
+      API側はevent IDとpayload hashで冪等処理する／APIが本体DBへの反映をcommitした場合だけ
+      ACKを返す／**OutboxはTelemetryではなくCoreのJob / State Controlに属する**（DB権限・
+      状態遷移・transactionはCore、バックアップ・復元はSafe Mode / Recovery、監査記録はAudit、
+      長期分析記録はTelemetryとし、この4責務を混在させない）／AI実行プロセスには本体DB・
+      管理認証情報・Core内部状態を渡さない。
+
+      **信頼境界の対象はAI CLI本体だけでなく「target-project内で実行される全コマンド」**
+      （実コード確認済み: `test`/`build`/`lint`のSafeCommand実行（`jobRunner.ts:565`）と
+      AI実行後の自動lint（`adapter.ts:403`）はいずれも`env`未指定でWorkerプロセスの全環境
+      （`API_TOKEN`含む）を継承する。AIが書き換えたtarget側`package.json`スクリプト経由で
+      漏出しうる。AI CLI本体は`buildSafeEnv()`により既に`DB_PATH`/`API_TOKEN`を渡していない）。
+
+      **状態不明attemptの復旧方針（replay-safe隔離実行）**: AI実行完了後からOutbox保存前に
+      Workerが停止し結果を確定できない場合、**MVPでは既存成果を救出しない**。
+      - 隔離方式は**git worktree**（新しい実行エンティティは作らない。1 Job行＝1 attempt＝
+        1 worktree＋1専用ブランチとし、既存の`resumeBlockedTask()`が「新Job行を作る」形で
+        retryを表現している既存パターンをそのまま踏襲する）
+      - 作成場所は`/workspace/target/.worktrees/<jobId>/`（既存の`isInsideTargetRoot()`が
+        `/workspace/target`のサブディレクトリを許可する実装のため、**この判定関数自体は無変更**
+        で通る。`normalizeAndValidateChangedFile()`が相対パスで比較するため`fileChangeGuard`も
+        無変更で機能する）
+      - 基準commitはJobへ新設する`base_commit_hash`列（nullable）に記録する。新設する
+        `retry_of_job_id`列（nullable、jobsへの自己参照）で「このJobは既にretryか」を判定する
+      - 専用ブランチは基準commitから作成し、Job（attempt）ごとに固有名にする
+        （同じブランチを複数attemptで共有すると、破棄したはずの前attemptのcommitを
+        次attemptが引き継いでしまいreplay-safeにならないため）
+      - 破棄は`git worktree remove --force <path>` + 専用ブランチの削除。他Jobのworktree・
+        メインツリーのHEAD・他Taskには影響しない（パス・ブランチ名がJobごとに一意のため）
+      - 状態不明の判定条件: Worker起動時、DB上`running`のJobについてOutboxに送信済み/未送信の
+        該当eventが**存在しない**場合（Outboxに未送信eventがあるだけなら「状態不明」ではなく
+        通常のOutbox再送で処理する）
+      - 自動再実行は`retry_of_job_id`が`NULL`のJobに対してのみ1回行う。retry対象Job自身が
+        既に`retry_of_job_id`を持つ（＝それ自体がretryである）場合は再実行せずfail-closedで
+        停止する（`failed`のまま。新しいApproval Gate等は作らずCEOへ技術的な承認を要求しない。
+        既存のTask/Job失敗可視化と同じ経路で表面化させる）
+      - replay-safeの担保: 既存`CommandKindSchema`（git系／typecheck／test／build／lint）には
+        deploy・publish・課金・通知送信等の外部作用コマンドがそもそも存在しない。破棄した
+        worktreeはどこにもmergeされないため副作用は伝播しない。ただし前段で確認済みの
+        「targetスクリプトがWorker全環境を継承する」残存リスク（秘密情報の外部送信）は
+        本項目の破棄・再実行設計だけでは閉じられず、`project-auto-worker-outbox`側の
+        env allowlist化で対処する（再実行によってこのリスクが増幅されることはない）
+      - **保護対象への最小接続口の再評価**: worktreeの作成・破棄・`base_commit_hash`決定は
+        `job.safeCommand.workingDir`を書き換えてから`runJob()`を呼ぶ形にすることで、
+        **`jobRunner.ts`は無変更のまま**成立する。protected diffは`index.ts`（起動順序・
+        claim・Outbox・worktree準備呼び出し）に集約される
+      - Worker再起動時の順序: ①Outbox整合性確認（破損・容量確認含む） → ②未送信event再送 →
+        ③状態不明attemptの検出・worktree破棄・1回までの自動retry → ④通常pollJobsループ開始。
+        現行の`recoverStaleJobs()`（起動時に全Projectのrunning Jobを無条件failed化）はこの
+        ③相当を代替する新しいロジックに置き換える（無条件failed化は廃止）
+      - 古いattemptのログは既存`jobLogger.ts`（`apps/worker/data/logs/<jobId>/`）がJob単位で
+        永続化する仕組みをそのまま使う（worktree破棄とは独立した保存先のため影響しない。
+        ただしクラッシュが早すぎてログ書き込み自体に未到達だった場合はログも残らない＝
+        「救出しない」方針と整合）
+
+      **`project-auto-worker-trust-boundary`は保護対象への具体的コード差分承認が
+      完了条件として残るため、doneにはせずin_progressを維持する。**
 <!-- roadmap:id=project-auto-worker-outbox state=planned -->
 4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
       **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
@@ -418,6 +478,18 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **完了条件**: API停止中にWorkerが完了しても結果が失われない／Worker再起動後に未送信結果を
       再送できる／同じ結果を複数回送ってもDB反映は一度だけ／APIがACKするまで次Jobへ進まない／
       Workerから本体DBへ直接アクセスできない
+
+      **attemptとOutbox eventの対応（2026-07-31確定）**: 1 Job行＝1 attemptであり、
+      Outbox eventは`jobId`＋Worker生成の`event_id`で該当attemptに紐づく。attemptの
+      再実行（`base_commit_hash`を引き継ぐ新Job行の作成）は状態不明時のみ1回、
+      `project-auto-worker-trust-boundary`側のgit worktree破棄・再実行設計に従う。
+      **Outbox保存前のクラッシュで確定できなかった結果は救出しない**
+      （at-least-once保証はterminal結果がOutboxへ永続化された後にのみ成立する契約とする。
+      それ以前の実行は「unknown」として扱い、自動的に成功/失敗を推測しない）。
+      **未送信eventが残っている間は新しいJobを取得しない**ことと、
+      **stale recovery（状態不明判定・worktree破棄・自動retry）はOutbox整合性確認より後に
+      実行しない**（起動順序: Outbox整合性確認→未送信event再送→状態不明attempt処理→
+      通常pollJobs）ことを、この項目の実装がそのまま満たす設計とする。
 <!-- roadmap:id=project-auto-db-safety state=planned -->
 5. [ ] **本体DB安全・復旧基盤** — 依存: `project-auto-worker-trust-boundary`。
       `project-auto-worker-outbox`とは**並行実装可能**。
@@ -458,6 +530,12 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **完了条件**: 結果消失がない／二重反映がない／二重Job生成がない／復旧後に正しい位置から
       再開できる／異常時はfail-closedで停止する。
       **この項目の完了をもって自律連続実行を有効化する。**
+
+      **確認シナリオへ追加（2026-07-31）**: 状態不明attemptの検出（Outboxに該当eventが
+      存在しないrunning Job）／該当worktree・専用ブランチの破棄／同一`base_commit_hash`からの
+      新attempt自動生成（1回まで）／2回目の状態不明でfail-closed停止し、CEO承認を要求せず
+      既存のJob/Task失敗可視化経路にそのまま乗ること／replay-safeでないJob（既存
+      `CommandKindSchema`に無い外部作用を伴うJob）は本メカニズムの対象にしないこと。
 <!-- roadmap:id=project-auto-completion-detection state=planned -->
 8. [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
       **既知の穴**: `ProjectStatus`に`completed`が無い（`draft/running/paused/archived`のみ。

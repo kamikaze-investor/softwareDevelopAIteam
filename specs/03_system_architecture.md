@@ -141,6 +141,19 @@ CEOとの唯一の接点。
 - 依存関係管理
 - Progress管理
 
+## Worker Execution Core
+
+**役割**
+AI実行結果を安全にAPIへ引き渡す（2026-07-31確定）。
+
+**責任**
+- AI実行プロセスへ本体DB・管理認証情報・Core内部状態を渡さない
+- AI結果はWorker安全コアが検証・永続化し、Coreの限定インターフェースからのみ本体状態へ反映する
+- 結果配送はat-least-once。受信側（API＝Core）はevent IDとpayload hashで冪等処理する
+- 本体DBを書き込めるのはAPI（Core）のみ
+- 状態不明のAI実行（結果を確定できないまま停止した実行）は隔離環境を破棄して1回だけ
+  自動再実行し、CEOへ技術的な承認を要求しない。2回目も状態不明ならfail-closedで停止する
+
 ## Repository Layer
 
 **役割**
@@ -319,6 +332,15 @@ Project Memory は放置すると劣化する。そのため週次で以下を�
 - Small Change
 - Small Commit
 - Frequent Rollback Point
+
+**責務分離（2026-07-31確定）**: DB安全・Recovery・Audit・Telemetryの責務を混在させない。
+- **Core**: DB権限・状態遷移・transaction・Job / State Control（Worker Outboxを含む）
+- **Safe Mode / Recovery**: バックアップ・復元
+- **Audit**: 監査記録
+- **Telemetry**: 長期分析記録
+
+AI実行結果が不明な場合、既存成果を救出せず隔離環境を破棄して1回だけ自動的にやり直す。
+2回目も不明な場合は、人に判断を求めず安全に停止する。
 
 ---
 
