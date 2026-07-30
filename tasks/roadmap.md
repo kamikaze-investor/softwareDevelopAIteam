@@ -343,8 +343,18 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       Markdown出力の順で動作し、同じ生成結果からDBとMarkdownの両方を作る
       （コミット`0a80437` feat(api): sync roadmap tasks transactionally、
       `e58040c` feat(cto): persist generated roadmap tasks）。
+      **独立二重レビュー（Sonnet・Codex）で発見された安全性問題を修正済み**
+      （コミット`32facd2` fix(api): reject conflicting roadmap task revisions）:
+      Job履歴のある・status!=='pending'の「仕様変更不可」Taskは、書き込み前のプリフライトで
+      DB仕様と入力仕様（title/description/phase/assignee/allowedPaths/acceptanceCriteria/
+      dependencies）を比較し、1件でも不一致があれば同期全体をfail-closedで拒否する
+      （409、DB・Markdownとも無変更）。空`tasks`配列は422で拒否し既存Taskの一括非アクティブ化を防ぐ。
       Task→初回Job生成・自動連続実行・Project完了判定・CEO Alignment Checkpoint・
-      Context PackのJob実行時接続は未着手（Step 2）
+      Context PackのJob実行時接続は未着手（Step 2）。
+      **Step 2の完了条件に含めるべき事項**（本Stepのレビューで判明・未解決のまま残す設計上の制約）:
+      DB Task同期とMarkdown保存の両方が成功するまでJobを作らない／Markdown保存失敗時はJobを作らない／
+      再実行時、履歴のあるTaskの仕様変更は本Stepの実装どおり409で拒否する／
+      未着手Taskは冪等に再同期できる
 3. [ ] Task→Job自動生成と連続実行: 初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
       （手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。無いのは「自動生成」と「自動継続」）。
       **既知の穴（Codexレビュー）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
