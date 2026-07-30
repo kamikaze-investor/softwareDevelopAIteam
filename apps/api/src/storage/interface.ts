@@ -9,9 +9,9 @@
 
 import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
-import type { RoadmapSyncTaskInput } from './roadmapTaskValidation'
+import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
 
-export type { RoadmapSyncTaskInput } from './roadmapTaskValidation'
+export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
 
 export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
@@ -24,6 +24,7 @@ export interface RoadmapSyncResult {
   reactivatedTaskIds: string[]
   deactivatedTaskIds: string[]
   failureReason?: string
+  conflicts?: RoadmapTaskSpecConflict[]
 }
 
 export interface IProjectStorage {

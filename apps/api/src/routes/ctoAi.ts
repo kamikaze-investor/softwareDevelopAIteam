@@ -176,6 +176,7 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(409).send({
           error: 'ロードマップの同期に失敗しました',
           detail: syncResult.failureReason,
+          conflicts: syncResult.conflicts,
         })
       }
 

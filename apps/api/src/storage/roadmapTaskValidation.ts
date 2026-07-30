@@ -11,11 +11,17 @@ export interface RoadmapSyncTaskInput {
   allowedPaths: string[]
 }
 
+export interface RoadmapTaskSpecConflict {
+  roadmapTaskKey: string
+  field: 'title' | 'description' | 'phase' | 'assignee' | 'allowedPaths' | 'acceptanceCriteria' | 'dependencies'
+}
+
 export type RoadmapValidationIssueCode =
   | 'duplicate_roadmap_task_key'
   | 'unknown_dependency'
   | 'self_dependency'
   | 'circular_dependency'
+  | 'empty_roadmap'
 
 export interface RoadmapValidationIssue {
   code: RoadmapValidationIssueCode
@@ -145,6 +151,10 @@ export function validateRoadmapTasks(tasks: RoadmapSyncTaskInput[]): RoadmapVali
   const roadmapTaskKeys = new Set(tasks.map((task) => task.roadmapTaskKey))
 
   return [
+    ...(tasks.length === 0 ? [{
+      code: 'empty_roadmap' as const,
+      message: 'Roadmap must include at least one task',
+    }] : []),
     ...buildDuplicateIssues(tasks),
     ...buildDependencyIssues(tasks, roadmapTaskKeys),
     ...buildCircularDependencyIssues(tasks, roadmapTaskKeys),

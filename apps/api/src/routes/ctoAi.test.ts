@@ -419,6 +419,54 @@ describe('CTO AI — generate-roadmap API', () => {
     expect(storage.tasks.findById(removedTask.id)?.roadmapActive).toBe(true)
   })
 
+  it('POST /api/cto/generate-roadmap returns 409 with conflicts for started task spec changes', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const existingTask = storage.tasks.create({
+      projectId: project.id,
+      title: 'Title task-001',
+      description: 'Description task-001',
+      status: 'pending',
+      assignee: 'developer_ai',
+      dependencies: [],
+      acceptanceCriteria: [],
+      allowedPaths: [],
+      roadmapTaskKey: 'task-001',
+      phase: 1,
+      roadmapActive: true,
+    })
+    storage.jobs.create({
+      taskId: existingTask.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    })
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: mockRoadmapResponse([{ id: 'task-001', title: 'Changed title' }]),
+      },
+    })
+
+    const body = JSON.parse(res.body)
+    expect(res.statusCode).toBe(409)
+    expect(body.conflicts).toContainEqual({
+      roadmapTaskKey: 'task-001',
+      field: 'title',
+    })
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+    expect(existsSync(path.join(tmpDir, 'tasks', 'task_graph.md'))).toBe(false)
+    expect(storage.tasks.findById(existingTask.id)?.title).toBe('Title task-001')
+  })
+
   it('POST /api/cto/generate-roadmap returns 422 and creates no tasks for invalid generated roadmap', async () => {
     const app = await buildApp()
     const project = await createProject()
@@ -440,6 +488,29 @@ describe('CTO AI — generate-roadmap API', () => {
     expect(res.statusCode).toBe(422)
     expect(JSON.parse(res.body).issues).toContainEqual(expect.objectContaining({
       code: 'duplicate_roadmap_task_key',
+    }))
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+  })
+
+  it('POST /api/cto/generate-roadmap returns 422 and creates no tasks for an empty generated roadmap', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: mockRoadmapResponse([]),
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(422)
+    expect(JSON.parse(res.body).issues).toContainEqual(expect.objectContaining({
+      code: 'empty_roadmap',
     }))
     expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
     expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)

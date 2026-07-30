@@ -18,6 +18,14 @@ function task(
 }
 
 describe('validateRoadmapTasks', () => {
+  it('detects an empty roadmap', () => {
+    expect(validateRoadmapTasks([])).toEqual([
+      expect.objectContaining({
+        code: 'empty_roadmap',
+      }),
+    ])
+  })
+
   it('returns no issues for valid input', () => {
     expect(validateRoadmapTasks([
       task('task-001'),

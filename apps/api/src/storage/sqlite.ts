@@ -12,12 +12,23 @@ import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
-import type { RoadmapSyncTaskInput } from './roadmapTaskValidation'
+import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
     super('Another project is already running')
     this.name = 'SingleRunningProjectError'
+  }
+}
+
+export class RoadmapTaskConflictError extends Error {
+  constructor(public readonly conflicts: RoadmapTaskSpecConflict[]) {
+    super(
+      `Roadmap task spec conflicts detected for started/completed tasks: ${
+        conflicts.map((conflict) => `${conflict.roadmapTaskKey}.${conflict.field}`).join(', ')
+      }`,
+    )
+    this.name = 'RoadmapTaskConflictError'
   }
 }
 
@@ -59,6 +70,80 @@ function sameStringArray(left: string[] | undefined, right: string[] | undefined
   if (leftValues.length !== rightValues.length) return false
 
   return leftValues.every((value, index) => value === rightValues[index])
+}
+
+function sameStringArrayAsSet(left: string[] | undefined, right: string[] | undefined): boolean {
+  const leftValues = [...(left ?? [])].sort()
+  const rightValues = [...(right ?? [])].sort()
+  if (leftValues.length !== rightValues.length) return false
+
+  return leftValues.every((value, index) => value === rightValues[index])
+}
+
+function resolveDependencyKeysForConflictCheck(
+  dependencyTaskIds: string[] | undefined,
+  projectTaskIdToRoadmapTaskKey: Map<string, string>,
+  inputKeys: Set<string>,
+): string[] | undefined {
+  const dependencyKeys: string[] = []
+
+  for (const dependencyTaskId of dependencyTaskIds ?? []) {
+    const dependencyKey = projectTaskIdToRoadmapTaskKey.get(dependencyTaskId)
+    if (!dependencyKey || !inputKeys.has(dependencyKey)) {
+      return undefined
+    }
+    dependencyKeys.push(dependencyKey)
+  }
+
+  return dependencyKeys
+}
+
+function collectRoadmapTaskSpecConflicts(
+  existingRoadmapTasks: Task[],
+  inputByKey: Map<string, RoadmapSyncTaskInput>,
+  inputKeys: Set<string>,
+  projectTaskIdToRoadmapTaskKey: Map<string, string>,
+  jobsByTaskId: Map<string, Job[]>,
+): RoadmapTaskSpecConflict[] {
+  const conflicts: RoadmapTaskSpecConflict[] = []
+
+  function addConflict(roadmapTaskKey: string, field: RoadmapTaskSpecConflict['field']): void {
+    conflicts.push({ roadmapTaskKey, field })
+  }
+
+  for (const existingTask of existingRoadmapTasks) {
+    const roadmapTaskKey = existingTask.roadmapTaskKey
+    if (!roadmapTaskKey) continue
+
+    const roadmapTask = inputByKey.get(roadmapTaskKey)
+    if (!roadmapTask) continue
+
+    const hasJobHistory = (jobsByTaskId.get(existingTask.id) ?? []).length > 0
+    const specLocked = hasJobHistory || existingTask.status !== 'pending'
+    if (!specLocked) continue
+
+    if (existingTask.title !== roadmapTask.title) addConflict(roadmapTaskKey, 'title')
+    if (existingTask.description !== roadmapTask.description) addConflict(roadmapTaskKey, 'description')
+    if (existingTask.phase !== roadmapTask.phase) addConflict(roadmapTaskKey, 'phase')
+    if (existingTask.assignee !== roadmapTask.assignee) addConflict(roadmapTaskKey, 'assignee')
+    if (!sameStringArrayAsSet(existingTask.allowedPaths, roadmapTask.allowedPaths)) {
+      addConflict(roadmapTaskKey, 'allowedPaths')
+    }
+    if (!sameStringArrayAsSet(existingTask.acceptanceCriteria, roadmapTask.acceptanceCriteria)) {
+      addConflict(roadmapTaskKey, 'acceptanceCriteria')
+    }
+
+    const dependencyKeys = resolveDependencyKeysForConflictCheck(
+      existingTask.dependencies,
+      projectTaskIdToRoadmapTaskKey,
+      inputKeys,
+    )
+    if (!dependencyKeys || !sameStringArrayAsSet(dependencyKeys, roadmapTask.dependencies)) {
+      addConflict(roadmapTaskKey, 'dependencies')
+    }
+  }
+
+  return conflicts
 }
 
 const DEFAULT_SUMMARY_LIMIT = 50
@@ -386,13 +471,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return updated
     },
     syncRoadmapTasks(input) {
-      const emptyFailureResult = (failureReason: string): RoadmapSyncResult => ({
+      const emptyFailureResult = (
+        failureReason: string,
+        conflicts?: RoadmapTaskSpecConflict[],
+      ): RoadmapSyncResult => ({
         ok: false,
         createdTaskIds: [],
         updatedTaskIds: [],
         reactivatedTaskIds: [],
         deactivatedTaskIds: [],
         failureReason,
+        conflicts,
       })
 
       const syncTransaction = db.transaction((
@@ -408,23 +497,41 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         )
         const inputKeys = new Set(inputByKey.keys())
 
-        const existingRows = db.prepare(
-          'SELECT * FROM tasks WHERE project_id = ? AND roadmap_task_key IS NOT NULL',
-        ).all(projectId) as any[]
-        const existingRoadmapTasks = existingRows.map(deserializeTask)
+        const projectTaskRows = db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(projectId) as any[]
+        const projectTasks = projectTaskRows.map(deserializeTask)
+        const existingRoadmapTasks = projectTasks.filter((task) => task.roadmapTaskKey !== undefined)
+        const projectJobs = (db.prepare('SELECT * FROM jobs WHERE project_id = ?').all(projectId) as any[])
+          .map(deserializeJob)
+        const jobsByTaskId = groupByTaskId(projectJobs)
+        const projectTaskIdToRoadmapTaskKey = new Map(
+          projectTasks
+            .filter((task) => task.roadmapTaskKey !== undefined)
+            .map((task) => [task.id, task.roadmapTaskKey as string] as const),
+        )
         const disappearedTasks = existingRoadmapTasks.filter((task) => (
           task.roadmapTaskKey !== undefined && !inputKeys.has(task.roadmapTaskKey)
         ))
 
         for (const task of disappearedTasks) {
-          const activeJob = (db.prepare('SELECT * FROM jobs WHERE task_id = ?').all(task.id) as any[])
-            .find((jobRow) => ACTIVE_JOB_STATUSES.has(jobRow.status as JobStatus))
+          const activeJob = (jobsByTaskId.get(task.id) ?? [])
+            .find((job) => ACTIVE_JOB_STATUSES.has(job.status))
 
           if (activeJob) {
-            return emptyFailureResult(
+            throw new Error(
               `Cannot deactivate roadmap task ${task.roadmapTaskKey} because job ${activeJob.id} is ${activeJob.status}`,
             )
           }
+        }
+
+        const conflicts = collectRoadmapTaskSpecConflicts(
+          existingRoadmapTasks,
+          inputByKey,
+          inputKeys,
+          projectTaskIdToRoadmapTaskKey,
+          jobsByTaskId,
+        )
+        if (conflicts.length > 0) {
+          throw new RoadmapTaskConflictError(conflicts)
         }
 
         const roadmapTaskKeyToTaskId = new Map<string, string>()
@@ -458,8 +565,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
           roadmapTaskKeyToTaskId.set(roadmapTask.roadmapTaskKey, existingTask.id)
 
-          const jobRows = db.prepare('SELECT * FROM jobs WHERE task_id = ?').all(existingTask.id) as any[]
-          const isUnstarted = jobRows.length === 0 && existingTask.status === 'pending'
+          const taskJobs = jobsByTaskId.get(existingTask.id) ?? []
+          const isUnstarted = taskJobs.length === 0 && existingTask.status === 'pending'
 
           if (isUnstarted) {
             dependencyUpdateKeys.add(roadmapTask.roadmapTaskKey)
@@ -541,6 +648,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       try {
         return syncTransaction(input.projectId, input.tasks)
       } catch (err: unknown) {
+        if (err instanceof RoadmapTaskConflictError) {
+          return emptyFailureResult(err.message, err.conflicts)
+        }
+
         const message = err instanceof Error ? err.message : String(err)
         return emptyFailureResult(message)
       }

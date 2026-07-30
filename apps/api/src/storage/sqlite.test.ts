@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { createSQLiteStorage, SingleRunningProjectError } from './sqlite'
-import type { IStorage, RoadmapSyncTaskInput } from './interface'
+import { validateRoadmapTasks } from './roadmapTaskValidation'
+import type { IStorage, RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './interface'
 import type { JobStatus, Task } from '@ai-team/shared'
 
 type ApprovalCreateInput = Parameters<IStorage['approvals']['create']>[0] & { projectId: string }
@@ -148,6 +149,34 @@ describe('SQLiteStorage', () => {
         status,
         safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
       })
+    }
+
+    function createRoadmapTaskRecord(
+      input: RoadmapSyncTaskInput,
+      overrides: Partial<TaskCreateInput> = {},
+    ): Task {
+      return createTask({
+        title: input.title,
+        description: input.description,
+        status: 'pending',
+        assignee: input.assignee,
+        dependencies: [],
+        allowedPaths: input.allowedPaths,
+        acceptanceCriteria: input.acceptanceCriteria,
+        roadmapTaskKey: input.roadmapTaskKey,
+        phase: input.phase,
+        roadmapActive: true,
+        ...overrides,
+      })
+    }
+
+    function expectConflict(
+      result: ReturnType<IStorage['tasks']['syncRoadmapTasks']>,
+      roadmapTaskKey: string,
+      field: RoadmapTaskSpecConflict['field'],
+    ): void {
+      expect(result.ok).toBe(false)
+      expect(result.conflicts).toContainEqual({ roadmapTaskKey, field })
     }
 
     it('creates and finds tasks by project id', () => {
@@ -462,78 +491,255 @@ describe('SQLiteStorage', () => {
       expect(storage.jobs.findByTaskId(removed.id)).toEqual(beforeJobs)
     })
 
-    it('syncRoadmapTasks updates specification fields for unstarted tasks only', () => {
+    it('syncRoadmapTasks updates specification fields and dependencies for unstarted tasks only', () => {
+      const oldDependency = createTask({
+        roadmapTaskKey: 'task-old',
+        title: 'Old dependency',
+        phase: 1,
+        roadmapActive: true,
+      })
+      const newDependencyInput = roadmapTask('task-new')
+      const newDependency = createRoadmapTaskRecord(newDependencyInput)
       const existing = createTask({
         roadmapTaskKey: 'task-001',
         title: 'Old title',
         description: 'Old description',
         phase: 1,
         roadmapActive: true,
+        dependencies: [oldDependency.id],
         allowedPaths: ['old/path'],
         acceptanceCriteria: ['old criteria'],
       })
 
       const result = storage.tasks.syncRoadmapTasks({
         projectId,
-        tasks: [roadmapTask('task-001', {
-          title: 'New title',
-          description: 'New description',
-          phase: 2,
-          allowedPaths: ['new/path'],
-          acceptanceCriteria: ['new criteria'],
-        })],
+        tasks: [
+          newDependencyInput,
+          roadmapTask('task-001', {
+            title: 'New title',
+            description: 'New description',
+            phase: 2,
+            dependencies: ['task-new'],
+            allowedPaths: ['new/path'],
+            acceptanceCriteria: ['new criteria'],
+          }),
+        ],
       })
 
       const updated = storage.tasks.findById(existing.id)
+      expect(result.ok).toBe(true)
       expect(result.updatedTaskIds).toEqual([existing.id])
       expect(updated?.title).toBe('New title')
       expect(updated?.description).toBe('New description')
       expect(updated?.phase).toBe(2)
+      expect(updated?.dependencies).toEqual([newDependency.id])
       expect(updated?.allowedPaths).toEqual(['new/path'])
       expect(updated?.acceptanceCriteria).toEqual(['new criteria'])
     })
 
-    it('syncRoadmapTasks does not update specification fields for active-job tasks', () => {
-      const existing = createTask({
-        roadmapTaskKey: 'task-001',
-        title: 'Old title',
-        phase: 1,
-        roadmapActive: false,
-      })
-      createJob(existing.id, 'running')
+    it.each([
+      {
+        field: 'title' as const,
+        changedInput: (input: RoadmapSyncTaskInput): RoadmapSyncTaskInput => ({
+          ...input,
+          title: 'Changed title',
+        }),
+      },
+      {
+        field: 'description' as const,
+        changedInput: (input: RoadmapSyncTaskInput): RoadmapSyncTaskInput => ({
+          ...input,
+          description: 'Changed description',
+        }),
+      },
+      {
+        field: 'phase' as const,
+        changedInput: (input: RoadmapSyncTaskInput): RoadmapSyncTaskInput => ({
+          ...input,
+          phase: 2,
+        }),
+      },
+      {
+        field: 'assignee' as const,
+        changedInput: (input: RoadmapSyncTaskInput): RoadmapSyncTaskInput => ({
+          ...input,
+          assignee: 'reviewer_ai',
+        }),
+      },
+      {
+        field: 'allowedPaths' as const,
+        changedInput: (input: RoadmapSyncTaskInput): RoadmapSyncTaskInput => ({
+          ...input,
+          allowedPaths: ['changed/path'],
+        }),
+      },
+      {
+        field: 'acceptanceCriteria' as const,
+        changedInput: (input: RoadmapSyncTaskInput): RoadmapSyncTaskInput => ({
+          ...input,
+          acceptanceCriteria: ['Changed criteria'],
+        }),
+      },
+    ])('syncRoadmapTasks rejects $field changes for tasks with job history', ({ field, changedInput }) => {
+      const input = roadmapTask('task-001')
+      const existing = createRoadmapTaskRecord(input)
+      createJob(existing.id, 'success')
+      const beforeTasks = storage.tasks.findByProjectId(projectId)
 
       const result = storage.tasks.syncRoadmapTasks({
         projectId,
-        tasks: [roadmapTask('task-001', { title: 'New title', phase: 2 })],
+        tasks: [changedInput(input)],
       })
 
-      const found = storage.tasks.findById(existing.id)
-      expect(result.reactivatedTaskIds).toEqual([existing.id])
-      expect(found?.title).toBe('Old title')
-      expect(found?.phase).toBe(1)
-      expect(found?.roadmapActive).toBe(true)
+      expectConflict(result, 'task-001', field)
+      expect(storage.tasks.findByProjectId(projectId)).toEqual(beforeTasks)
     })
 
-    it('syncRoadmapTasks does not update specification fields for terminal-job tasks', () => {
-      const existing = createTask({
-        roadmapTaskKey: 'task-001',
-        title: 'Old title',
-        phase: 1,
-        roadmapActive: true,
+    it('syncRoadmapTasks rejects spec changes for non-pending tasks without job history', () => {
+      const input = roadmapTask('task-001')
+      createRoadmapTaskRecord(input, { status: 'in_progress' })
+      const beforeTasks = storage.tasks.findByProjectId(projectId)
+
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId,
+        tasks: [roadmapTask('task-001', { title: 'Changed title' })],
       })
+
+      expectConflict(result, 'task-001', 'title')
+      expect(storage.tasks.findByProjectId(projectId)).toEqual(beforeTasks)
+    })
+
+    it('syncRoadmapTasks rejects dependency changes for tasks with job history', () => {
+      const dependencyInput = roadmapTask('task-000')
+      const dependency = createRoadmapTaskRecord(dependencyInput)
+      const input = roadmapTask('task-001', { dependencies: ['task-000'] })
+      const existing = createRoadmapTaskRecord(input, { dependencies: [dependency.id] })
+      createJob(existing.id, 'success')
+      const beforeTasks = storage.tasks.findByProjectId(projectId)
+
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId,
+        tasks: [
+          dependencyInput,
+          roadmapTask('task-001', { dependencies: [] }),
+        ],
+      })
+
+      expectConflict(result, 'task-001', 'dependencies')
+      expect(storage.tasks.findByProjectId(projectId)).toEqual(beforeTasks)
+    })
+
+    it('syncRoadmapTasks ignores order-only differences for locked task array fields', () => {
+      const firstDependencyInput = roadmapTask('task-001')
+      const secondDependencyInput = roadmapTask('task-002')
+      const firstDependency = createRoadmapTaskRecord(firstDependencyInput)
+      const secondDependency = createRoadmapTaskRecord(secondDependencyInput)
+      const lockedInput = roadmapTask('task-003', {
+        allowedPaths: ['apps/api/src/a.ts', 'apps/api/src/b.ts'],
+        acceptanceCriteria: ['First criterion', 'Second criterion'],
+        dependencies: ['task-001', 'task-002'],
+      })
+      const locked = createRoadmapTaskRecord(lockedInput, {
+        allowedPaths: ['apps/api/src/b.ts', 'apps/api/src/a.ts'],
+        acceptanceCriteria: ['Second criterion', 'First criterion'],
+        dependencies: [secondDependency.id, firstDependency.id],
+      })
+      createJob(locked.id, 'success')
+      const beforeTasks = storage.tasks.findByProjectId(projectId)
+
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId,
+        tasks: [
+          firstDependencyInput,
+          secondDependencyInput,
+          lockedInput,
+        ],
+      })
+
+      expect(result.ok).toBe(true)
+      expect(result.createdTaskIds).toEqual([])
+      expect(result.updatedTaskIds).toEqual([])
+      expect(result.reactivatedTaskIds).toEqual([])
+      expect(result.deactivatedTaskIds).toEqual([])
+      expect(storage.tasks.findByProjectId(projectId)).toEqual(beforeTasks)
+    })
+
+    it('syncRoadmapTasks rejects locked dependencies that cannot resolve to project roadmapTaskKey values', () => {
+      const manualDependency = createTask({
+        title: 'Manual dependency',
+        roadmapActive: false,
+      })
+      const input = roadmapTask('task-001')
+      const existing = createRoadmapTaskRecord(input, { dependencies: [manualDependency.id] })
+      createJob(existing.id, 'success')
+      const beforeTasks = storage.tasks.findByProjectId(projectId)
+
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId,
+        tasks: [input],
+      })
+
+      expectConflict(result, 'task-001', 'dependencies')
+      expect(storage.tasks.findByProjectId(projectId)).toEqual(beforeTasks)
+    })
+
+    it('syncRoadmapTasks leaves every task unchanged when a locked task conflicts', () => {
+      const lockedInput = roadmapTask('task-001')
+      const locked = createRoadmapTaskRecord(lockedInput)
+      createJob(locked.id, 'success')
+      const retainedInput = roadmapTask('task-002')
+      createRoadmapTaskRecord(retainedInput, { title: 'Retained old title' })
+      const beforeTasks = storage.tasks.findByProjectId(projectId)
+
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId,
+        tasks: [
+          roadmapTask('task-001', { title: 'Changed title' }),
+          roadmapTask('task-002', { title: 'Retained new title' }),
+          roadmapTask('task-003'),
+        ],
+      })
+
+      expectConflict(result, 'task-001', 'title')
+      expect(storage.tasks.findByProjectId(projectId)).toEqual(beforeTasks)
+    })
+
+    it('syncRoadmapTasks syncs locked tasks when specifications match exactly', () => {
+      const input = roadmapTask('task-001')
+      const existing = createRoadmapTaskRecord(input)
+      createJob(existing.id, 'success')
+      const before = storage.tasks.findById(existing.id)
+
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId,
+        tasks: [input],
+      })
+
+      expect(result.ok).toBe(true)
+      expect(result.conflicts).toBeUndefined()
+      expect(result.createdTaskIds).toEqual([])
+      expect(result.updatedTaskIds).toEqual([])
+      expect(result.reactivatedTaskIds).toEqual([])
+      expect(storage.tasks.findById(existing.id)).toEqual(before)
+    })
+
+    it('syncRoadmapTasks reactivates inactive locked tasks when specifications match exactly', () => {
+      const input = roadmapTask('task-001')
+      const existing = createRoadmapTaskRecord(input, { roadmapActive: false })
       createJob(existing.id, 'success')
 
       const result = storage.tasks.syncRoadmapTasks({
         projectId,
-        tasks: [roadmapTask('task-001', { title: 'New title', phase: 2 })],
+        tasks: [input],
       })
 
-      const found = storage.tasks.findById(existing.id)
-      expect(result.updatedTaskIds).toEqual([])
-      expect(result.reactivatedTaskIds).toEqual([])
-      expect(found?.title).toBe('Old title')
-      expect(found?.phase).toBe(1)
-      expect(found?.roadmapActive).toBe(true)
+      expect(result.ok).toBe(true)
+      expect(result.reactivatedTaskIds).toEqual([existing.id])
+      expect(storage.tasks.findById(existing.id)).toMatchObject({
+        title: input.title,
+        phase: input.phase,
+        roadmapActive: true,
+      })
     })
 
     it('syncRoadmapTasks deactivates disappeared tasks without changing phase', () => {
@@ -584,41 +790,37 @@ describe('SQLiteStorage', () => {
       expect(storage.tasks.findById(retained.id)?.title).toBe('Old title')
     })
 
-    it('syncRoadmapTasks reactivates inactive started tasks without changing specifications', () => {
-      const running = createTask({
-        roadmapTaskKey: 'task-001',
-        title: 'Running old title',
-        phase: 1,
-        roadmapActive: false,
-      })
-      createJob(running.id, 'running')
-      const completed = createTask({
-        roadmapTaskKey: 'task-002',
-        title: 'Completed old title',
-        phase: 2,
-        roadmapActive: false,
-      })
-      createJob(completed.id, 'success')
+    it('syncRoadmapTasks preserves dependencies when a locked task disappears without an active job', () => {
+      const dependencyInput = roadmapTask('task-001')
+      const dependency = createRoadmapTaskRecord(dependencyInput)
+      const removedInput = roadmapTask('task-002', { dependencies: ['task-001'] })
+      const removed = createRoadmapTaskRecord(removedInput, { dependencies: [dependency.id] })
+      createJob(removed.id, 'success')
 
       const result = storage.tasks.syncRoadmapTasks({
         projectId,
-        tasks: [
-          roadmapTask('task-001', { title: 'Running new title', phase: 5 }),
-          roadmapTask('task-002', { title: 'Completed new title', phase: 6 }),
-        ],
+        tasks: [dependencyInput],
       })
 
-      expect(result.reactivatedTaskIds).toEqual([running.id, completed.id])
-      expect(storage.tasks.findById(running.id)).toMatchObject({
-        title: 'Running old title',
+      const found = storage.tasks.findById(removed.id)
+      expect(result.ok).toBe(true)
+      expect(result.deactivatedTaskIds).toEqual([removed.id])
+      expect(found?.roadmapActive).toBe(false)
+      expect(found?.dependencies).toEqual([dependency.id])
+    })
+
+    it('validateRoadmapTasks rejects an empty roadmap before sync changes existing tasks', () => {
+      createTask({
+        roadmapTaskKey: 'task-001',
         phase: 1,
         roadmapActive: true,
       })
-      expect(storage.tasks.findById(completed.id)).toMatchObject({
-        title: 'Completed old title',
-        phase: 2,
-        roadmapActive: true,
-      })
+      const beforeTasks = storage.tasks.findByProjectId(projectId)
+
+      const issues = validateRoadmapTasks([])
+
+      expect(issues).toContainEqual(expect.objectContaining({ code: 'empty_roadmap' }))
+      expect(storage.tasks.findByProjectId(projectId)).toEqual(beforeTasks)
     })
   })
 
