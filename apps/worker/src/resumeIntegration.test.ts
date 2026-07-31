@@ -32,6 +32,37 @@ vi.mock('./guards/permissionGuard.js', () => ({
 
 vi.mock('./guards/fileChangeGuard.js', () => ({
   fileChangeGuard: vi.fn(),
+  ALWAYS_FORBIDDEN_PATTERNS: [/^.env$/, /.pem$/],
+}))
+
+vi.mock('./guards/changeManifest.js', () => ({
+  ChangeDetectionError: class ChangeDetectionError extends Error {
+    constructor(msg: string) {
+      super(msg)
+      this.name = 'ChangeDetectionError'
+    }
+  },
+  buildWorktreeManifest: vi.fn(() => ({ changes: [], paths: [] })),
+  buildCommitRangeManifest: vi.fn(() => ({ changes: [], paths: [] })),
+  captureReflogBaseline: vi.fn(() => ({ headHashes: [] })),
+  assertNoHistoryRewrite: vi.fn(),
+  getWorktreeDiffText: vi.fn(() => ''),
+  getCommitRangeDiffText: vi.fn(() => ''),
+  scanSensitiveFiles: vi.fn(() => new Map()),
+  diffSensitiveBaseline: vi.fn(() => []),
+  mergeManifests: vi.fn((...manifests: any[]) => {
+    const changes = manifests.flatMap((m) => m.changes)
+    const paths: string[] = []
+    for (const c of changes) {
+      if (!paths.includes(c.path)) paths.push(c.path)
+      if (c.oldPath && !paths.includes(c.oldPath)) paths.push(c.oldPath)
+    }
+    return { changes, paths }
+  }),
+  manifestFromChanges: vi.fn((changes: any[]) => ({
+    changes,
+    paths: changes.map((c) => c.path),
+  })),
 }))
 
 vi.mock('./jobLogger.js', () => ({
@@ -217,7 +248,13 @@ function resetWorkerMocks(): void {
   permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
   resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
   fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-  execFileSyncMock.mockReturnValue('')
+  // rev-parse HEAD は安全判定に使われ fail-closed 対象のため有効なハッシュを返す
+  execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+    if (Array.isArray(args) && args[0] === 'rev-parse' && !args.includes('--abbrev-ref')) {
+      return 'basecommit0000000000000000000000000000000'
+    }
+    return ''
+  })
 }
 
 describe('resume API to worker integration', () => {
@@ -288,7 +325,13 @@ describe('resume API to worker integration', () => {
       const mockAdapter: IAiCliAdapter = { run: adapterRunMock }
       createAiCliAdapterMock.mockReturnValue(mockAdapter)
 
-      const runResult = await runJob(resumedJob)
+      const runtimePolicy = Object.freeze({
+        taskId: task.id,
+        projectId: project.id,
+        allowedPaths: Object.freeze([] as string[]),
+        forbiddenPaths: Object.freeze([] as string[]),
+      })
+      const runResult = await runJob(resumedJob, runtimePolicy)
 
       expect(runResult.status).toBe('success')
       expect(callGateCheckMock).toHaveBeenCalledWith(expect.objectContaining({

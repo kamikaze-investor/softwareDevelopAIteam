@@ -24,7 +24,22 @@ import { runSafetyVerification } from './approvalLevel/safetyVerifier.js'
 import type { SafetyVerificationResult } from './approvalLevel/safetyVerifier.js'
 import { appendObservationLog } from './approvalLevel/observationLog.js'
 import { resolveCommand } from './commandResolver.js'
-import { fileChangeGuard } from './guards/fileChangeGuard.js'
+import { ALWAYS_FORBIDDEN_PATTERNS, fileChangeGuard } from './guards/fileChangeGuard.js'
+import type { RuntimeTaskPolicy } from './guards/fileChangeGuard.js'
+import {
+  ChangeDetectionError,
+  assertNoHistoryRewrite,
+  buildCommitRangeManifest,
+  buildWorktreeManifest,
+  captureReflogBaseline,
+  diffSensitiveBaseline,
+  getCommitRangeDiffText,
+  getWorktreeDiffText,
+  manifestFromChanges,
+  mergeManifests,
+  scanSensitiveFiles,
+} from './guards/changeManifest.js'
+import type { ChangeManifest, ReflogBaseline, SensitiveBaseline } from './guards/changeManifest.js'
 import { saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
 import { callGateCheck, callConsume } from './guards/gateClient.js'
@@ -101,15 +116,46 @@ export interface JobRunResult {
    * 呼び出し自体に失敗しても（想定外入力・実装バグ等）Jobは止めず、undefinedのまま。
    */
   safetyVerificationResult?: SafetyVerificationResult
+  /**
+   * 最終成果として検査した変更 manifest（監査用）。
+   * commit が作られた場合は commit tree 由来、作られなかった場合は working tree 由来。
+   */
+  finalChangeManifest?: ChangeManifest
+  /**
+   * 変更検出・ポリシー構築などの**技術的失敗**であることを示す。
+   *
+   * Guard 違反（fileChangeAllowed:false）と区別するために持つ。
+   * index.ts の resolveResultStatus() はこのフラグが立っている場合、
+   * blocked（＝承認・手動 resume 待ち）へ変換せず failed のまま永続化する。
+   */
+  detectionFailure?: boolean
 }
 
 /**
  * Job を実行して結果を返す
- * - Permission Guard (with grants) → Gate Check → [AI CLI] → commandResolver → execFileSync → File Change Guard
+ * - Permission Guard (with grants) → Gate Check → [AI CLI] → Stage A 検査
+ *   → commandResolver → execFileSync → Stage B / Stage C 最終検査
  * - aiCliProvider / aiCliPrompt / aiCliMode が揃っている場合のみ AI CLI を先行実行（task-022）
+ *
+ * @param policy 実行時 Task ポリシー（required）。呼び出し元は runJob() を呼ぶ前に
+ *   Task を取得し buildRuntimeTaskPolicy() で構築する。取得・構築に失敗した場合は
+ *   runJob() を呼ばず Job を failed にすること（AI を実行してはならない）。
  */
-export async function runJob(job: Job): Promise<JobRunResult> {
+export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRunResult> {
   const startedAt = new Date().toISOString()
+
+  if (policy.taskId !== job.taskId) {
+    return failClosed(
+      startedAt,
+      `Runtime task policy mismatch: policy.taskId=${policy.taskId} job.taskId=${job.taskId}`,
+    )
+  }
+  if (policy.projectId !== job.projectId) {
+    return failClosed(
+      startedAt,
+      `Task と Job の Project が一致しません: task.projectId=${policy.projectId} job.projectId=${job.projectId}`,
+    )
+  }
 
   const guardCheck = await permissionGuardWithGrants(
     job.safeCommand,
@@ -137,10 +183,36 @@ export async function runJob(job: Job): Promise<JobRunResult> {
 
   // ── Approval Gate check (Step 3A) ──
   const workingDir = job.safeCommand.workingDir
-  const preChangedFiles = getChangedFiles(workingDir)
-  const preDiffText = getPreGateDiffText(workingDir)
+
+  // Job 開始時の機密ファイルベースライン（.gitignore 対象を含む）。
+  // 既存の ignored .env 等は「存在するだけ」では違反にせず、以降の新規作成・
+  // 内容変更・symlink 化だけを検出するために使う。
+  let sensitiveBaseline: SensitiveBaseline
+  let preManifest: ChangeManifest
+  let preDiffText: string
+  // Job 開始時点の HEAD。AI CLI や非 atomic な SafeCommand（target 側の
+  // test/build/lint スクリプト）が自分で commit / checkout して working tree を
+  // clean にした場合でも、この HEAD を基準に commit tree を検査するために使う。
+  // isAtomic のときだけ取得していると、それらの HEAD 変更を完全に見落とす。
+  let startCommitHash: string
+  // Job 開始時の HEAD reflog スナップショット。`git reset --hard` 等で一度作った
+  // commit を履歴から外し、その後に別内容の commit を作ると、base..after の
+  // 祖先関係だけを見る検査ではその commit が完全に見えなくなる
+  // （2026-07-31 Codex 最終レビューで発見・実測確認済み）。
+  let reflogBaseline: ReflogBaseline
+  try {
+    sensitiveBaseline = scanSensitiveFiles(workingDir, ALWAYS_FORBIDDEN_PATTERNS)
+    preManifest = buildWorktreeManifest(workingDir)
+    preDiffText = getWorktreeDiffText(workingDir, preManifest)
+    // Gate 用の targetCommit と同じ取得を1回で済ませる（追加の git 呼び出しを増やさない）
+    startCommitHash = requireCommitHash(workingDir)
+    reflogBaseline = captureReflogBaseline(workingDir)
+  } catch (err: unknown) {
+    return failClosed(startedAt, formatChangeDetectionError(err))
+  }
+  const preChangedFiles = preManifest.paths
   const targetDiffHash = createHash('sha256').update(preDiffText, 'utf-8').digest('hex')
-  const targetCommit = getCommitHash(workingDir) ?? ''
+  const targetCommit = startCommitHash
   const targetBranch = getTargetBranch(workingDir)
   const localGateResult = buildLocalGateResult(preChangedFiles)
 
@@ -398,35 +470,42 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
       console.error(`[jobRunner] AI CLI 実行エラー (${job.aiCliProvider}): ${message}`)
-      return {
-        status: 'failed',
+      // AI が失敗しても、失敗するまでに書いた変更は残っている。
+      // 検査せずに返すと次 Job がそれを新しいベースラインとして信頼してしまうため、
+      // 成功・失敗に関わらず終了後検査を必ず実行する。
+      return inspectAfterAiFailure({
+        workingDir: job.safeCommand.workingDir,
+        startCommitHash,
+        reflogBaseline,
+        sensitiveBaseline,
+        policy,
+        guardResult,
+        startedAt,
+        approvalLevelResult,
         exitCode: 1,
         stdout: '',
         stderr: message,
-        changedFiles: [],
-        guardResult,
-        startedAt,
-        completedAt: new Date().toISOString(),
-        approvalLevelResult,
-      }
+      })
     }
 
     const cliFailed = cliResult.blocked === true || (cliResult.exitCode !== 0 && !job.dryRun)
     if (cliFailed) {
       console.error(`[jobRunner] AI CLI 失敗 (${job.aiCliProvider}): exitCode=${cliResult.exitCode} blocked=${cliResult.blocked}`)
-      return {
-        status: 'failed',
+      return inspectAfterAiFailure({
+        workingDir: job.safeCommand.workingDir,
+        startCommitHash,
+        reflogBaseline,
+        sensitiveBaseline,
+        policy,
+        guardResult,
+        startedAt,
+        approvalLevelResult,
         exitCode: cliResult.exitCode,
         stdout: cliResult.stdout,
         stderr: cliResult.stderr,
         stdoutPath: cliResult.stdoutPath,
         stderrPath: cliResult.stderrPath,
-        changedFiles: cliResult.changedFiles,
-        guardResult,
-        startedAt,
-        completedAt: new Date().toISOString(),
-        approvalLevelResult,
-      }
+      })
     }
 
     console.log(`[jobRunner] AI CLI 成功 (${job.aiCliProvider}): changedFiles=${cliResult.changedFiles.length}件 → SafeCommand に続行`)
@@ -438,8 +517,34 @@ export async function runJob(job: Job): Promise<JobRunResult> {
   // スキャンする。AI CLI実行前は差分が空のことが多く検出に使えないため、
   // ここで再取得した changedFiles / diffText を使う。
   // 観察モード: hasRisk:true でもJobをblockingしない。
-  const postChangedFiles = getChangedFiles(job.safeCommand.workingDir)
-  const postDiffText = getPreGateDiffText(job.safeCommand.workingDir)
+  // ── Stage A: AI 作業後の途中検査 ───────────────────────────────────────────
+  // AI CLI が作った変更をこの時点で検査する。ここは途中検査であり、
+  // 最終判定は SafeCommand 実行後の Stage B / Stage C で行う。
+  //
+  // working tree だけでなく、Job 開始 HEAD からの commit 差分も検査対象にする。
+  // AI CLI（Codex 等）が自分で commit / checkout して working tree を clean にすると、
+  // working tree だけを見る検査ではこの時点の変更を素通りしてしまう
+  // （2026-07-31 Codex 最終レビューで発見。buildFinalInspection() と同じロジックを使う）。
+  let stageAManifest: ChangeManifest
+  let postDiffText: string
+  try {
+    const stageAInspection = buildFinalInspection(
+      job.safeCommand.workingDir,
+      startCommitHash,
+      reflogBaseline,
+      sensitiveBaseline,
+    )
+    stageAManifest = stageAInspection.manifest
+    postDiffText = stageAInspection.diffText
+  } catch (err: unknown) {
+    return failClosed(startedAt, formatChangeDetectionError(err), guardResult)
+  }
+  const postChangedFiles = stageAManifest.paths
+
+  // Guard 違反で return する場合でも、内容ベースの Risk Scan 結果を
+  // 監査対象から欠落させないよう、判定より前に実行しておく
+  // （2026-07-31 Codex 最終レビューで発見: Stage A blocked 経路のみ Risk Scan が
+  //   スキップされ、AI失敗経路の修正と非対称になっていた）。
   const targetProjectRiskScanResult = scanTargetProjectRisk({
     changedFiles: postChangedFiles,
     diffText: postDiffText,
@@ -451,6 +556,30 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     console.warn(riskScanSummary)
   }
   // ── Target Project Risk Scan 終端 ───────────────────────────────────────────
+
+  const stageAGuard = fileChangeGuard(stageAManifest, policy, job.safeCommand.workingDir)
+  if (!stageAGuard.allowed) {
+    guardResult.fileChangeAllowed = false
+    guardResult.fileViolations = stageAGuard.violations
+    console.error(
+      `[jobRunner] Stage A file guard blocked: ${JSON.stringify(stageAGuard.reasons)}`,
+    )
+    // 既存契約に合わせ status は 'failed' を返す。
+    // index.ts の resolveResultStatus() が guardResult.fileChangeAllowed=false を見て
+    // 最終的に 'blocked' へ変換する（File Change Guard 由来の停止の既存表現）。
+    return {
+      status: 'failed',
+      exitCode: 1,
+      stdout: '',
+      stderr: `File Change Guard blocked (stage A): ${stageAGuard.violations.join(', ')}`,
+      changedFiles: stageAManifest.paths,
+      guardResult,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      targetProjectRiskScanResult,
+      finalChangeManifest: stageAManifest,
+    }
+  }
 
   // ── Gemini Flash Stepレビュー（Step R3・観察モード・非ブロッキング） ─────────
   // targetProjectRiskScanResult.highestSeverity が medium/high の場合のみ呼ぶ。
@@ -581,10 +710,48 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     }
   }
 
-  const changedFiles = getChangedFiles(job.safeCommand.workingDir)
-  const fileGuard = fileChangeGuard(changedFiles)
+  // ── Stage B / Stage C: 最終成果の全面再検査 ────────────────────────────────
+  // commit が作られていない場合  : SafeCommand 実行後の working tree manifest が最終成果
+  // commit が作られた場合        : base commit → after commit の commit tree manifest が最終成果
+  //   （git_commit 実行後は working tree 差分が空になるため、working tree だけを見ると
+  //     コミット済みの変更を検出できない）
+  // 最終成果は path/kind/mode の照合で済ませず、File Change Guard・
+  // ALWAYS_FORBIDDEN_PATTERNS・secret/diff 検査・Risk 検査へ改めて通す。
+  let finalManifest: ChangeManifest
+  let finalDiffText: string
+  try {
+    const inspection = buildFinalInspection(
+      job.safeCommand.workingDir,
+      startCommitHash,
+      reflogBaseline,
+      sensitiveBaseline,
+    )
+    finalManifest = inspection.manifest
+    finalDiffText = inspection.diffText
+  } catch (err: unknown) {
+    return failClosed(startedAt, formatChangeDetectionError(err), guardResult)
+  }
+
+  const changedFiles = finalManifest.paths
+  const fileGuard = fileChangeGuard(finalManifest, policy, job.safeCommand.workingDir)
   guardResult.fileChangeAllowed = fileGuard.allowed
   guardResult.fileViolations = fileGuard.violations
+  if (!fileGuard.allowed) {
+    console.error(`[jobRunner] Final file guard blocked: ${JSON.stringify(fileGuard.reasons)}`)
+  }
+
+  // 最終成果に対する secret / diff 検査と Risk 検査
+  const finalRiskScan = scanTargetProjectRisk({
+    changedFiles,
+    diffText: finalDiffText,
+  })
+  const finalRiskSummary = formatRiskScanSummary(finalRiskScan)
+  if (finalRiskSummary) {
+    console.warn(`[final] ${finalRiskSummary}`)
+  }
+  const finalRiskReview = runRiskReview(changedFiles)
+  logFinalRiskReview(finalRiskReview.riskLevel, changedFiles)
+
   const logPaths = saveJobLogs(job.id, stdout, stderr)
 
   // アトミックジョブの RollbackInfo を自動生成
@@ -610,11 +777,198 @@ export async function runJob(job: Job): Promise<JobRunResult> {
     completedAt: new Date().toISOString(),
     rollbackInfo,
     approvalLevelResult,
-    targetProjectRiskScanResult,
+    targetProjectRiskScanResult: finalRiskScan.hasRisk
+      ? finalRiskScan
+      : targetProjectRiskScanResult,
     stepReviewResult,
     postReviewResult,
     safetyVerificationResult,
+    finalChangeManifest: finalManifest,
   }
+}
+
+/** 最終 Risk Review の結果はログのみに使う（観察モードの既存方針を変えない） */
+function logFinalRiskReview(level: string, files: string[]): void {
+  if (level === 'HIGH' || level === 'CRITICAL') {
+    console.warn(`[final] risk review ${level}: ${files.join(', ')}`)
+  }
+}
+
+/**
+ * 検出不能・分類不能をJobの失敗として返す。
+ *
+ * status は 'blocked' ではなく 'failed' を使う。'blocked' は
+ * resumeBlockedTask()（最新Jobがblockedのときに新Jobを作る承認・手動resume経路）の
+ * 入口であり、技術障害へ流用すると人手の再開待ちと区別できなくなるため。
+ * 'failed' は resumeBlockedTask() の対象外なので自動resumeされず fail-closed になる。
+ */
+function failClosed(
+  startedAt: string,
+  message: string,
+  guardResult?: JobGuardResult,
+): JobRunResult {
+  console.error(`[jobRunner] fail-closed: ${message}`)
+  return {
+    status: 'failed',
+    exitCode: 1,
+    stdout: '',
+    stderr: message,
+    changedFiles: [],
+    // 技術的失敗では fileChangeAllowed を false にしない。
+    // false にすると index.ts の resolveResultStatus() が blocked へ変換し、
+    // 承認・手動 resume 待ち（Guard 違反の表現）と区別できなくなるため。
+    guardResult: guardResult ?? {
+      permissionAllowed: true,
+      fileChangeAllowed: true,
+      fileViolations: [],
+    },
+    startedAt,
+    completedAt: new Date().toISOString(),
+    detectionFailure: true,
+  }
+}
+
+function formatChangeDetectionError(err: unknown): string {
+  if (err instanceof ChangeDetectionError) {
+    return `変更ファイル検出に失敗したため fail-closed で停止します: ${err.message}`
+  }
+  return `変更ファイル検出で予期しないエラーが発生しました: ${
+    err instanceof Error ? err.message : String(err)
+  }`
+}
+
+/**
+ * git が報告しない `.gitignore` 対象の機密ファイル変化を manifest へ合流させる。
+ * Job 開始時ベースラインと比較し、新規作成・内容変更・symlink 化・削除を検出する。
+ */
+function withSensitiveChanges(
+  manifest: ChangeManifest,
+  baseline: SensitiveBaseline,
+  workingDir: string,
+): ChangeManifest {
+  const current = scanSensitiveFiles(workingDir, ALWAYS_FORBIDDEN_PATTERNS)
+  const sensitiveChanges = diffSensitiveBaseline(baseline, current)
+  if (sensitiveChanges.length === 0) return manifest
+  return mergeManifests(manifest, manifestFromChanges(sensitiveChanges))
+}
+
+interface AiFailureInspectionInput {
+  workingDir: string
+  startCommitHash: string
+  reflogBaseline: ReflogBaseline
+  sensitiveBaseline: SensitiveBaseline
+  policy: RuntimeTaskPolicy
+  guardResult: JobGuardResult
+  startedAt: string
+  approvalLevelResult?: ApprovalLevelResult
+  exitCode?: number
+  stdout?: string
+  stderr?: string
+  stdoutPath?: string
+  stderrPath?: string
+}
+
+/**
+ * AI CLI が失敗した場合でも、残っている変更を必ず検査してから結果を返す。
+ * Job 自体は failed のままだが、禁止ファイルが残っていれば
+ * guardResult.fileChangeAllowed=false として記録する。
+ */
+function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
+  let manifest: ChangeManifest | undefined
+  let riskScan: ReturnType<typeof scanTargetProjectRisk> | undefined
+  try {
+    const inspection = buildFinalInspection(
+      input.workingDir,
+      input.startCommitHash,
+      input.reflogBaseline,
+      input.sensitiveBaseline,
+    )
+    manifest = inspection.manifest
+    const guard = fileChangeGuard(manifest, input.policy, input.workingDir)
+    input.guardResult.fileChangeAllowed = guard.allowed
+    input.guardResult.fileViolations = guard.violations
+    if (!guard.allowed) {
+      console.error(
+        `[jobRunner] AI CLI 失敗後にも Guard 違反が残っています: ${JSON.stringify(guard.reasons)}`,
+      )
+    }
+    // 成功経路と同様、失敗経路でも secret/diff の Risk Scan を残す。
+    // Guard がパス単位の違反を検出しなくても、内容ベースの検査結果を
+    // 監査対象から欠落させない（2026-07-31 Codex 最終レビューで発見）。
+    riskScan = scanTargetProjectRisk({ changedFiles: manifest.paths, diffText: inspection.diffText })
+    const summary = formatRiskScanSummary(riskScan)
+    if (summary) console.warn(`[final][ai-failure] ${summary}`)
+  } catch (err: unknown) {
+    return failClosed(input.startedAt, formatChangeDetectionError(err), input.guardResult)
+  }
+
+  return {
+    status: 'failed',
+    exitCode: input.exitCode,
+    stdout: input.stdout,
+    stderr: input.stderr,
+    stdoutPath: input.stdoutPath,
+    stderrPath: input.stderrPath,
+    changedFiles: manifest.paths,
+    guardResult: input.guardResult,
+    startedAt: input.startedAt,
+    completedAt: new Date().toISOString(),
+    approvalLevelResult: input.approvalLevelResult,
+    targetProjectRiskScanResult: riskScan,
+    finalChangeManifest: manifest,
+  }
+}
+
+/**
+ * 最終成果（working tree + Job 開始 HEAD からの commit tree + 機密ファイル差分）を組み立てる。
+ *
+ * base は Job 開始時の HEAD を使う。AI CLI 自身や非 atomic な SafeCommand が
+ * commit / checkout して working tree を clean にしても、HEAD が動いていれば
+ * その差分を必ず検査対象に含めるため。
+ */
+function buildFinalInspection(
+  workingDir: string,
+  startCommitHash: string,
+  reflogBaseline: ReflogBaseline,
+  baseline: SensitiveBaseline,
+): { manifest: ChangeManifest; diffText: string } {
+  // currentHead が startCommitHash と一致していても、reset で一度別のcommitへ
+  // 移動してから元のhashへ戻された可能性は排除できないため、HEAD一致による
+  // 早期returnより前に必ず reflog を検証する（fail-closed）。
+  assertNoHistoryRewrite(workingDir, reflogBaseline)
+
+  const worktreeManifest = withSensitiveChanges(
+    buildWorktreeManifest(workingDir),
+    baseline,
+    workingDir,
+  )
+  const currentHead = requireCommitHash(workingDir)
+  const worktreeDiff = getWorktreeDiffText(workingDir, worktreeManifest)
+
+  if (currentHead === startCommitHash) {
+    return { manifest: worktreeManifest, diffText: worktreeDiff }
+  }
+
+  // tree-to-tree の単純比較ではなく、commit を1つずつ検査する。
+  // 途中コミットで追加・削除された変更が最終treeで相殺されて消える経路
+  // （2026-07-31 Codex 最終レビューで発見・実測確認済み）を塞ぐため。
+  const commitManifest = buildCommitRangeManifest(workingDir, startCommitHash, currentHead)
+  return {
+    manifest: mergeManifests(commitManifest, worktreeManifest),
+    diffText: getCommitRangeDiffText(workingDir, startCommitHash, currentHead) + worktreeDiff,
+  }
+}
+
+/**
+ * 安全判定に使う HEAD 取得。失敗を undefined で握りつぶすと
+ * commit tree 検査自体がスキップされてしまうため fail-closed にする。
+ */
+function requireCommitHash(workingDir: string): string {
+  const hash = getCommitHash(workingDir)
+  if (hash === undefined || hash === '') {
+    throw new ChangeDetectionError(`Failed to resolve HEAD commit in "${workingDir}"`)
+  }
+  return hash
 }
 
 function getCommitHash(workingDir: string): string | undefined {
@@ -629,30 +983,10 @@ function getCommitHash(workingDir: string): string | undefined {
   }
 }
 
-function getChangedFiles(workingDir: string): string[] {
-  try {
-    const result = execFileSync('git', ['diff', '--name-only', 'HEAD'], {
-      cwd: workingDir,
-      encoding: 'utf-8',
-      shell: false,
-    })
-    return result.trim().split('\n').filter(Boolean)
-  } catch {
-    return []
-  }
-}
-
-function getPreGateDiffText(workingDir: string): string {
-  try {
-    return execFileSync('git', ['diff', 'HEAD'], {
-      cwd: workingDir,
-      encoding: 'utf-8',
-      shell: false,
-    })
-  } catch {
-    return ''
-  }
-}
+// getChangedFiles() / getPreGateDiffText() は削除した。
+// `git diff --name-only HEAD` は untracked を検出せず、git_commit 実行後は差分が空になり、
+// さらに失敗時に [] / '' を返して fail-open になっていたため、
+// guards/changeManifest.ts の buildWorktreeManifest() / getWorktreeDiffText() へ置き換えた。
 
 function getTargetBranch(workingDir: string): string {
   try {

@@ -27,6 +27,7 @@ import type {
 } from '@ai-team/shared'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
+import { buildWorktreeManifest } from '../guards/changeManifest.js'
 import { saveJobLogs } from '../jobLogger.js'
 
 // ────────────────────────────────────────────────────────────
@@ -440,20 +441,14 @@ function buildSafeEnv(provider: AiCliProvider): NodeJS.ProcessEnv {
 }
 
 /**
- * 実行後の変更ファイルを git diff で検出する
- * （未コミット変更 = CLIが書いたファイル）
+ * 実行後の変更ファイルを検出する。
+ *
+ * `git diff --name-only HEAD` は untracked を検出せず、失敗時に [] を返して
+ * fail-open になっていたため、buildWorktreeManifest() へ置き換えた。
+ * 検出できない場合は例外を投げ、呼び出し元（jobRunner）が fail-closed で扱う。
  */
 function getChangedFiles(workingDir: string): string[] {
-  try {
-    const result = execFileSync(
-      'git',
-      ['diff', '--name-only', 'HEAD'],
-      { cwd: workingDir, encoding: 'utf-8', shell: false }
-    )
-    return result.trim().split('\n').filter(Boolean)
-  } catch {
-    return []
-  }
+  return buildWorktreeManifest(workingDir).paths
 }
 
 /**

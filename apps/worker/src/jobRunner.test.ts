@@ -5,11 +5,19 @@ import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { runJob } from './jobRunner.js'
+import {
+  buildCommitRangeManifest,
+  buildWorktreeManifest,
+  diffSensitiveBaseline,
+  scanSensitiveFiles,
+} from './guards/changeManifest.js'
 import { callGateCheck, callConsume } from './guards/gateClient.js'
 import { resolvePolicy } from './guards/gatePolicy.js'
 
+const { hoistedExecFileSync } = vi.hoisted(() => ({ hoistedExecFileSync: vi.fn() }))
+
 vi.mock('node:child_process', () => ({
-  execFileSync: vi.fn(),
+  execFileSync: hoistedExecFileSync,
 }))
 
 vi.mock('./commandResolver.js', () => ({
@@ -23,6 +31,66 @@ vi.mock('./guards/permissionGuard.js', () => ({
 
 vi.mock('./guards/fileChangeGuard.js', () => ({
   fileChangeGuard: vi.fn(),
+  ALWAYS_FORBIDDEN_PATTERNS: [/^.env$/, /.pem$/],
+}))
+
+vi.mock('./guards/changeManifest.js', () => ({
+  ChangeDetectionError: class ChangeDetectionError extends Error {
+    constructor(msg: string) {
+      super(msg)
+      this.name = 'ChangeDetectionError'
+    }
+  },
+  captureReflogBaseline: vi.fn(() => ({ headHashes: [] })),
+  assertNoHistoryRewrite: vi.fn(),
+  // jobRunner のオーケストレーションを検証するためのスタブ。
+  // 既存テストが execFileSync 経由で変更ファイルを注入する方式をそのまま活かすため、
+  // ここでは同じ git 呼び出しから manifest を組み立てる。
+  // 実際の porcelain=v2 / diff --raw 解析は changeManifest.test.ts が実 git で検証する。
+  buildWorktreeManifest: vi.fn((workingDir: string) => {
+    const out = hoistedExecFileSync('git', ['diff', '--name-only', 'HEAD'], {
+      cwd: workingDir,
+      encoding: 'utf-8',
+      shell: false,
+    })
+    const paths = String(out ?? '').trim().split(/\r?\n/).filter(Boolean)
+    return {
+      changes: paths.map((path: string) => ({
+        path,
+        kind: 'modified',
+        afterType: 'regular',
+      })),
+      paths,
+    }
+  }),
+  buildCommitRangeManifest: vi.fn(() => ({ changes: [], paths: [] })),
+  // 既存テストの execFileSync 呼び出し順序（mockReturnValueOnce チェーン）を保つため、
+  // 旧 getPreGateDiffText と同じ git 呼び出しを行う。
+  getWorktreeDiffText: vi.fn((workingDir: string) => {
+    return String(
+      hoistedExecFileSync('git', ['diff', 'HEAD'], {
+        cwd: workingDir,
+        encoding: 'utf-8',
+        shell: false,
+      }) ?? '',
+    )
+  }),
+  getCommitRangeDiffText: vi.fn(() => ''),
+  scanSensitiveFiles: vi.fn(() => new Map()),
+  diffSensitiveBaseline: vi.fn(() => []),
+  mergeManifests: vi.fn((...manifests: any[]) => {
+    const changes = manifests.flatMap((m) => m.changes)
+    const paths: string[] = []
+    for (const c of changes) {
+      if (!paths.includes(c.path)) paths.push(c.path)
+      if (c.oldPath && !paths.includes(c.oldPath)) paths.push(c.oldPath)
+    }
+    return { changes, paths }
+  }),
+  manifestFromChanges: vi.fn((changes: any[]) => ({
+    changes,
+    paths: changes.map((c) => c.path),
+  })),
 }))
 
 vi.mock('./jobLogger.js', () => ({
@@ -108,6 +176,18 @@ vi.mock('./approvalLevel/observationLog.js', () => ({
 const execFileSyncMock = vi.mocked(execFileSync)
 const resolveCommandMock = vi.mocked(resolveCommand)
 const fileChangeGuardMock = vi.mocked(fileChangeGuard)
+const buildWorktreeManifestMock = vi.mocked(buildWorktreeManifest)
+const buildCommitRangeManifestMock = vi.mocked(buildCommitRangeManifest)
+const scanSensitiveFilesMock = vi.mocked(scanSensitiveFiles)
+const diffSensitiveBaselineMock = vi.mocked(diffSensitiveBaseline)
+
+/** テスト内で ChangeDetectionError 相当を投げるためのスタブ */
+class ChangeDetectionErrorStub extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ChangeDetectionError'
+  }
+}
 const saveJobLogsMock = vi.mocked(saveJobLogs)
 const callGateCheckMock = vi.mocked(callGateCheck)
 const callConsumeMock = vi.mocked(callConsume)
@@ -156,6 +236,44 @@ function createJob(overrides: Partial<Job> = {}): Job {
   }
 }
 
+/** runJob() が要求する実行時Taskポリシー（createJob のデフォルトに一致させる） */
+/** execFileSync mock の既定応答。rev-parse HEAD は fail-closed 対象なので有効値を返す */
+const BASE_COMMIT = 'basecommit0000000000000000000000000000000'
+/**
+ * git_commit 実行を伴う Job 用の execFileSync mock。
+ * 呼び出し順ではなく引数で分岐するため、内部の git 呼び出し回数が変わっても壊れない。
+ */
+function mockGitCommitRun(before: string, after: string): void {
+  let committed = false
+  execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+    if (!Array.isArray(args)) return ''
+    if (args[0] === 'commit') {
+      committed = true
+      return ''
+    }
+    if (args.includes('--abbrev-ref')) return 'main' + String.fromCharCode(10)
+    if (args[0] === 'rev-parse') return committed ? after : before
+    return ''
+  })
+}
+
+function gitFallback(args: readonly string[] | undefined): string {
+  if (Array.isArray(args) && args[0] === 'rev-parse' && !args.includes('--abbrev-ref')) {
+    return BASE_COMMIT
+  }
+  return ''
+}
+
+function createPolicy(overrides: Record<string, unknown> = {}) {
+  return Object.freeze({
+    taskId: 'task-1',
+    projectId: 'project-1',
+    allowedPaths: Object.freeze([] as string[]),
+    forbiddenPaths: Object.freeze([] as string[]),
+    ...overrides,
+  }) as never
+}
+
 // ────────────────────────────────────────────────────────────
 // beforeEach: reset all mocks to safe defaults
 // ────────────────────────────────────────────────────────────
@@ -186,8 +304,14 @@ beforeEach(() => {
     reasons: {},
   })
 
-  // execFileSync: return '' for all git helper calls by default
-  execFileSyncMock.mockReturnValue('')
+  // execFileSync: git ヘルパー呼び出しの既定値
+  // rev-parse HEAD は安全判定に使われ fail-closed 対象のため、有効なハッシュを返す
+  execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+    if (Array.isArray(args) && args[0] === 'rev-parse' && !args.includes('--abbrev-ref')) {
+      return 'basecommit0000000000000000000000000000000'
+    }
+    return ''
+  })
 })
 
 // ────────────────────────────────────────────────────────────
@@ -201,7 +325,7 @@ describe('runJob', () => {
       reason: 'workingDir is outside TARGET_ROOT',
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.guardResult).toEqual({
@@ -232,7 +356,7 @@ describe('runJob', () => {
       blockEvent,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.permissionBlockEvent).toEqual(blockEvent)
@@ -244,10 +368,10 @@ describe('runJob', () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args[0] === 'status') return 'M src/index.ts\n'
       if (Array.isArray(args) && args.includes('--name-only')) return 'src/index.ts\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     // The main command must have been called with shell: false and timeout
     expect(execFileSyncMock).toHaveBeenCalledWith('git', ['status', '--short'], {
@@ -262,7 +386,12 @@ describe('runJob', () => {
       encoding: 'utf-8',
       shell: false,
     })
-    expect(fileChangeGuardMock).toHaveBeenCalledWith(['src/index.ts'])
+    // File Change Guard は string[] ではなく変更 manifest と実行時ポリシーを受け取る
+    expect(fileChangeGuardMock).toHaveBeenCalledWith(
+      expect.objectContaining({ paths: ['src/index.ts'] }),
+      expect.objectContaining({ taskId: 'task-1', projectId: 'project-1' }),
+      '/workspace/target',
+    )
     expect(result.status).toBe('success')
     expect(result.exitCode).toBe(0)
     expect(result.stdout).toBe('M src/index.ts\n')
@@ -284,10 +413,10 @@ describe('runJob', () => {
 
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args[0] === 'status') throw error
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.exitCode).toBe(2)
@@ -300,7 +429,7 @@ describe('runJob', () => {
   it('returns failed when File Change Guard rejects changed files', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '../secret.txt\n'
-      return ''
+      return gitFallback(args)
     })
     fileChangeGuardMock.mockReturnValue({
       allowed: false,
@@ -308,7 +437,7 @@ describe('runJob', () => {
       reasons: { '../secret.txt': 'Path traversal or outside target' },
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.guardResult.fileChangeAllowed).toBe(false)
@@ -320,22 +449,13 @@ describe('runJob', () => {
       argv: ['git', 'commit', '-m', 'test'],
       description: 'git commit',
     })
-    // pre-gate calls (4) + beforeCommitHash + git commit + afterCommitHash + getChangedFiles
-    execFileSyncMock
-      .mockReturnValueOnce('')           // getChangedFiles pre-gate (git diff --name-only HEAD)
-      .mockReturnValueOnce('')           // getPreGateDiffText (git diff HEAD)
-      .mockReturnValueOnce('main\n')     // getTargetBranch (git rev-parse --abbrev-ref HEAD)
-      .mockReturnValueOnce('')           // getCommitHash targetCommit (git rev-parse HEAD)
-      .mockReturnValueOnce('abc123\n')   // beforeCommitHash (git rev-parse HEAD)
-      .mockReturnValueOnce('')           // git commit stdout
-      .mockReturnValueOnce('def456\n')   // afterCommitHash (git rev-parse HEAD)
-      .mockReturnValueOnce('')           // getChangedFiles post-execution
+    mockGitCommitRun('abc123', 'def456')
 
     const job = createJob({
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
     })
 
-    await runJob(job)
+    await runJob(job, createPolicy())
 
     const commitCall = execFileSyncMock.mock.calls.find(
       (call) => Array.isArray(call[1]) && (call[1] as string[]).includes('commit')
@@ -349,23 +469,13 @@ describe('runJob', () => {
       argv: ['git', 'commit', '-m', 'test'],
       description: 'git commit',
     })
-    execFileSyncMock
-      .mockReturnValueOnce('')           // getChangedFiles pre-gate
-      .mockReturnValueOnce('')           // getPreGateDiffText
-      .mockReturnValueOnce('main\n')     // getTargetBranch
-      .mockReturnValueOnce('')           // getCommitHash targetCommit
-      .mockReturnValueOnce('')           // getChangedFiles (Target Project Risk Scan)
-      .mockReturnValueOnce('')           // getPreGateDiffText (Target Project Risk Scan)
-      .mockReturnValueOnce('abc123\n')   // beforeCommitHash
-      .mockReturnValueOnce('')           // git commit stdout
-      .mockReturnValueOnce('def456\n')   // afterCommitHash
-      .mockReturnValueOnce('')           // getChangedFiles post-execution
+    mockGitCommitRun('abc123', 'def456')
 
     const job = createJob({
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
     })
 
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.rollbackInfo).toBeDefined()
     expect(result.rollbackInfo?.previousCommitHash).toBe('abc123')
@@ -381,7 +491,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
   it('policy: continue → existing flow executes normally', async () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(resolveCommandMock).toHaveBeenCalled()
@@ -395,7 +505,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.gatePolicy).toBe('block_until_approved')
@@ -413,7 +523,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.gatePolicy).toBe('re_check')
@@ -435,7 +545,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     const job = createJob({
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.gatePolicy).toBe('continue_safe_work_only')
@@ -453,7 +563,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     const job = createJob({
       safeCommand: { kind: 'git_revert', workingDir: '/workspace/target' },
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.gatePolicy).toBe('continue_safe_work_only')
@@ -474,7 +584,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     const job = createJob({
       safeCommand: { kind: 'test', workingDir: '/workspace/target' },
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('success')
     expect(resolveCommandMock).toHaveBeenCalled()
@@ -485,20 +595,12 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'commit', '-m', 'x'], description: 'git commit' })
     // git_commit under 'continue' policy should NOT be blocked
-    execFileSyncMock
-      .mockReturnValueOnce('')          // pre getChangedFiles
-      .mockReturnValueOnce('')          // pre getPreGateDiffText
-      .mockReturnValueOnce('main\n')    // getTargetBranch
-      .mockReturnValueOnce('')          // getCommitHash (targetCommit)
-      .mockReturnValueOnce('abc\n')     // beforeCommitHash
-      .mockReturnValueOnce('')          // git commit
-      .mockReturnValueOnce('def\n')     // afterCommitHash
-      .mockReturnValueOnce('')          // post getChangedFiles
+    mockGitCommitRun('abc', 'def')
 
     const job = createJob({
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.gatePolicy).toBeUndefined()
@@ -513,7 +615,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
       apiAvailable: false,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     // resolvePolicy must have been called with apiError
     expect(resolvePolicyMock).toHaveBeenCalledWith(
@@ -529,7 +631,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(callConsumeMock).not.toHaveBeenCalled()
     expect(result.status).toBe('success')
@@ -541,7 +643,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
       reason: 'outside TARGET_ROOT',
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(callGateCheckMock).not.toHaveBeenCalled()
     expect(resolvePolicyMock).not.toHaveBeenCalled()
@@ -554,7 +656,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.guardResult.permissionAllowed).toBe(true)
@@ -565,7 +667,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
   it('callGateCheck is called with correct params including taskId and requestedAction', async () => {
     const job = createJob({ taskId: 'task-xyz' })
 
-    await runJob(job)
+    await runJob(job, createPolicy({ taskId: 'task-xyz' }))
 
     expect(callGateCheckMock).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -609,7 +711,7 @@ describe('runJob — safe_work_only CommandKind control (Step 3C)', () => {
       const job = createJob()
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       ;(job.safeCommand as any).kind = kind
-      const result = await runJob(job)
+      const result = await runJob(job, createPolicy())
 
       expect(result.status).toBe('success')
       expect(resolveCommandMock).toHaveBeenCalled()
@@ -630,7 +732,7 @@ describe('runJob — safe_work_only CommandKind control (Step 3C)', () => {
     it(`continue_safe_work_only + ${kind} → blocked`, async () => {
       resolvePolicyMock.mockReturnValue(SAFE_WORK_POLICY)
 
-      const result = await runJob(createJob({ safeCommand: { kind, workingDir: '/workspace/target' } }))
+      const result = await runJob(createJob({ safeCommand: { kind, workingDir: '/workspace/target' } }), createPolicy())
 
       expect(result.status).toBe('blocked')
       expect(result.gatePolicy).toBe('continue_safe_work_only')
@@ -648,7 +750,7 @@ describe('runJob — safe_work_only CommandKind control (Step 3C)', () => {
 
     await runJob(createJob({
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
-    }))
+    }), createPolicy())
 
     expect(callConsumeMock).not.toHaveBeenCalled()
   })
@@ -661,7 +763,7 @@ describe('runJob — safe_work_only CommandKind control (Step 3C)', () => {
     })
     callConsumeMock.mockResolvedValue({ ok: true })
 
-    const result = await runJob(createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }))
+    const result = await runJob(createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }), createPolicy())
 
     expect(callConsumeMock).toHaveBeenCalledWith('req-y', expect.anything())
     expect(result.status).toBe('success')
@@ -683,7 +785,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(callConsumeMock).toHaveBeenCalledWith(
       'req-001',
@@ -696,7 +798,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
     callConsumeMock.mockResolvedValue({ ok: true })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.gatePolicy).toBeUndefined()
@@ -707,7 +809,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
     callConsumeMock.mockResolvedValue({ ok: true, alreadyConsumed: true })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(callConsumeMock).toHaveBeenCalled()
@@ -718,7 +820,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
     callConsumeMock.mockRejectedValue(new Error('HTTP 409 — Approval request is stale'))
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.gatePolicy).toBe('block_until_approved')
@@ -731,7 +833,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
     callConsumeMock.mockRejectedValue(new Error('network error'))
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(resolveCommandMock).not.toHaveBeenCalled()
   })
@@ -743,7 +845,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     })
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.gateBlockReason).toContain('consumedRequestId is missing')
@@ -754,7 +856,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 'block_until_approved', reason: 'CRITICAL', apiAvailable: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(callConsumeMock).not.toHaveBeenCalled()
   })
@@ -763,7 +865,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: 'stale', apiAvailable: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(callConsumeMock).not.toHaveBeenCalled()
   })
@@ -772,7 +874,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(callConsumeMock).not.toHaveBeenCalled()
   })
@@ -780,7 +882,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
   it('permission guard blocked → callConsume is NOT called', async () => {
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: false, reason: 'outside TARGET_ROOT' })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(callConsumeMock).not.toHaveBeenCalled()
   })
@@ -789,7 +891,7 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     // consume に渡す currentCommit / currentDiffHash は gate check 時と同一値
     const gateCheckParams = callGateCheckMock.mock.calls[0][0]
@@ -843,7 +945,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
       apiAvailable: true,
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).toHaveBeenCalledOnce()
     expect(sendAlertMock).toHaveBeenCalledWith(
@@ -861,7 +963,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     })
 
     const job = createJob({ safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } } })
-    await runJob(job)
+    await runJob(job, createPolicy())
 
     const payload = sendAlertMock.mock.calls[0][0]
     expect(payload.title).toContain('git_commit')
@@ -877,7 +979,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     })
 
     const job = createJob({ taskId: 'task-notif-3d', id: 'job-notif-3d' })
-    await runJob(job)
+    await runJob(job, createPolicy({ taskId: 'task-notif-3d' }))
 
     const payload = sendAlertMock.mock.calls[0][0]
     expect(payload.body).toContain('task-notif-3d')
@@ -896,13 +998,13 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     })
 
     // 1 回目
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
     expect(sendAlertMock).toHaveBeenCalledOnce()
 
     sendAlertMock.mockClear()
 
     // 2 回目 (同一 approvalRequestId)
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
     expect(sendAlertMock).not.toHaveBeenCalled()
   })
 
@@ -915,7 +1017,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
       apiAvailable: true,
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).toHaveBeenCalledOnce()
     expect(sendAlertMock).toHaveBeenCalledWith(
@@ -932,7 +1034,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
     callConsumeMock.mockRejectedValue(new Error('HTTP 409 stale'))
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).toHaveBeenCalledOnce()
     expect(sendAlertMock).toHaveBeenCalledWith(
@@ -948,7 +1050,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     })
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).toHaveBeenCalledOnce()
     expect(sendAlertMock).toHaveBeenCalledWith(
@@ -960,7 +1062,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
   it('continue → sendAlert は呼ばれない', async () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).not.toHaveBeenCalled()
   })
@@ -975,7 +1077,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'test'], description: 'test' })
 
     const job = createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } })
-    await runJob(job)
+    await runJob(job, createPolicy())
 
     expect(sendAlertMock).not.toHaveBeenCalled()
   })
@@ -991,7 +1093,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     const job = createJob({
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
     })
-    await runJob(job)
+    await runJob(job, createPolicy())
 
     expect(sendAlertMock).not.toHaveBeenCalled()
   })
@@ -1005,7 +1107,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
     callConsumeMock.mockResolvedValue({ ok: true, alreadyConsumed: true })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).not.toHaveBeenCalled()
   })
@@ -1017,7 +1119,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
       reason: 'outside TARGET_ROOT',
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).not.toHaveBeenCalled()
   })
@@ -1031,7 +1133,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
       apiAvailable: false,
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(sendAlertMock).not.toHaveBeenCalled()
   })
@@ -1046,7 +1148,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     })
     sendAlertMock.mockImplementation(() => { throw new Error('sync notification error') })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.gatePolicy).toBe('block_until_approved')
@@ -1095,13 +1197,13 @@ describe('task-022: AI CLI 実行ブロック', () => {
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('aiCliProvider なし → AI CLI をスキップして SafeCommand を実行する', async () => {
     // AI CLI フィールドが未指定の通常 Job
     const job = createJob()
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(createAiCliAdapterMock).not.toHaveBeenCalled()
     expect(result.status).toBe('success')
@@ -1116,7 +1218,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliPrompt: 'src/feature.ts にログ出力を追加してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(createAiCliAdapterMock).toHaveBeenCalledWith({ provider: 'claude_code' })
     expect(mockAdapter.run).toHaveBeenCalledWith(expect.objectContaining({
@@ -1141,7 +1243,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.exitCode).toBe(1)
@@ -1160,7 +1262,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliPrompt: 'JSON をパースして返してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
     expect(resolveCommandMock).not.toHaveBeenCalled()
@@ -1175,7 +1277,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliPrompt: '実装してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.stderr).toContain('TARGET_ROOT')
@@ -1192,7 +1294,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliPrompt: 'テスト実行だけ',
       aiCliMode: 'review',
     })
-    await runJob(job)
+    await runJob(job, createPolicy())
 
     expect(mockAdapter.run).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }))
   })
@@ -1207,17 +1309,17 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('docsのみの変更 → approvalLevelResultがmechanical_onlyになる', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === 'HEAD') return '+# タイトル\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.approvalLevelResult).toBeDefined()
@@ -1229,10 +1331,10 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'apps/worker/src/jobRunner.ts\n'
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === 'HEAD') return '+const x = 1\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.approvalLevelResult?.reviewPolicy).toBe('full_pre_post_review')
@@ -1243,10 +1345,10 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'apps/worker/scripts/postTestHook.ps1\n'
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === 'HEAD') return '+Write-Host "test"\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     // 観察モード: ceo_requiredでもまだ既存フロー通りに進み、statusはblockedにならない
     expect(result.status).toBe('success')
@@ -1270,7 +1372,7 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
       },
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.approvalLevelResult).toBeUndefined()
@@ -1283,7 +1385,7 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.approvalLevelResult).toBeUndefined()
@@ -1294,7 +1396,7 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
-      return ''
+      return gitFallback(args)
     })
 
     const job = createJob({
@@ -1302,7 +1404,7 @@ describe('Step6-A2: Approval Level v2 判定接続（観察モード）', () => 
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.approvalLevelResult).toBeDefined()
@@ -1331,7 +1433,7 @@ describe('Step6-B0: Approval Scope（jobRunner経由のJobはtarget_project前�
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('TARGET_ROOT外のworkingDirを持つJobは、permissionGuardでblockedされる（jobRunnerがtarget_project以外を評価することはない）', async () => {
@@ -1343,7 +1445,7 @@ describe('Step6-B0: Approval Scope（jobRunner経由のJobはtarget_project前�
     const job = createJob({
       safeCommand: { kind: 'git_status', workingDir: '/workspace/control' },
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.guardResult.permissionReason).toBe('workingDir is outside TARGET_ROOT')
@@ -1354,13 +1456,13 @@ describe('Step6-B0: Approval Scope（jobRunner経由のJobはtarget_project前�
   it('TARGET_ROOT配下のworkingDirを持つ通常Jobは、既存フロー通り継続する（target_project前提の回帰確認）', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'src/index.ts\n'
-      return ''
+      return gitFallback(args)
     })
 
     const job = createJob({
       safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     // permissionGuardを通過し、既存フロー（resolveCommand実行）まで到達する
     expect(result.status).toBe('success')
@@ -1379,16 +1481,16 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('通常の変更（docs/README.md）→ targetProjectRiskScanResult.hasRisk:false', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.targetProjectRiskScanResult).toBeDefined()
@@ -1398,10 +1500,10 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
   it('.env を含む変更 → targetProjectRiskScanResult.hasRisk:true、ただしstatusはsuccessのまま（停止しない）', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.targetProjectRiskScanResult?.hasRisk).toBe(true)
@@ -1413,7 +1515,7 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
 
     const job = createJob({
@@ -1421,13 +1523,13 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
       aiCliPrompt: '設定を追加してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.targetProjectRiskScanResult?.hasRisk).toBe(true)
   })
 
-  it('AI CLI失敗時、targetProjectRiskScanResultはundefinedのまま（scanポイントに到達しない）', async () => {
+  it('AI CLI失敗時も、残った変更に対する Risk Scan は実行される（内容検査を欠落させない）', async () => {
     const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
 
@@ -1436,10 +1538,12 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
-    expect(result.targetProjectRiskScanResult).toBeUndefined()
+    // 2026-07-31 修正: AI 失敗経路でも Guard に加えて Risk Scan を実行し、
+    // 内容ベースの検査結果を JobRunResult へ残す
+    expect(result.targetProjectRiskScanResult).toBeDefined()
   })
 
   it('permissionGuardでblockedの場合、targetProjectRiskScanResultはundefinedのまま', async () => {
@@ -1448,7 +1552,7 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
       reason: 'denied',
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.targetProjectRiskScanResult).toBeUndefined()
@@ -1461,7 +1565,7 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.targetProjectRiskScanResult).toBeUndefined()
@@ -1470,10 +1574,10 @@ describe('Target Project Risk Scan 接続（観察モード）', () => {
   it('hasRisk:trueでもJobのstatusはblockedにならない（観察モードであることの確認）', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'Dockerfile\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.targetProjectRiskScanResult?.hasRisk).toBe(true)
     expect(result.status).not.toBe('blocked')
@@ -1489,17 +1593,17 @@ describe('Risk Scan Console Warning（観察モード）', () => {
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('.env を含む変更 → console.warnが呼ばれ、Target Project Risk Scan summaryを含む', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
 
@@ -1510,10 +1614,10 @@ describe('Risk Scan Console Warning（観察モード）', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'src/index.ts\n'
-      return ''
+      return gitFallback(args)
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
 
@@ -1530,7 +1634,7 @@ describe('Risk Scan Console Warning（観察モード）', () => {
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    await runJob(job)
+    await runJob(job, createPolicy())
 
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
 
@@ -1545,7 +1649,7 @@ describe('Risk Scan Console Warning（観察モード）', () => {
       apiAvailable: true,
     })
 
-    await runJob(createJob())
+    await runJob(createJob(), createPolicy())
 
     expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
 
@@ -1556,10 +1660,10 @@ describe('Risk Scan Console Warning（観察モード）', () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('[Target Project Risk Scan]'))
     expect(result.status).not.toBe('blocked')
@@ -1577,16 +1681,16 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('リスクなしの変更（Risk Scan severity: none）→ runStepReviewは呼ばれず、stepReviewResult.status:not_run', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(runStepReviewMock).not.toHaveBeenCalled()
     expect(result.stepReviewResult?.status).toBe('not_run')
@@ -1595,7 +1699,7 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
   it('Risk Scan severity: medium（.env変更）→ runStepReviewが呼ばれ、結果がJobRunResultに含まれる', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
     runStepReviewMock.mockResolvedValue({
       status: 'done',
@@ -1610,7 +1714,7 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
       rawResponse: '',
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(runStepReviewMock).toHaveBeenCalledTimes(1)
     expect(result.stepReviewResult?.status).toBe('done')
@@ -1621,7 +1725,7 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
   it('Gemini呼び出しが失敗（quota枯渇等）してもJobのstatusはsuccessのまま（Jobを止めない）', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
     runStepReviewMock.mockResolvedValue({
       status: 'failed',
@@ -1634,7 +1738,7 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
       rawResponse: '',
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.stepReviewResult?.status).toBe('failed')
@@ -1649,7 +1753,7 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.stepReviewResult).toBeUndefined()
@@ -1663,7 +1767,7 @@ describe('Gemini Flash Stepレビュー接続（Step R3・観察モード）', (
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.stepReviewResult).toBeUndefined()
@@ -1680,13 +1784,13 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('Risk Scan severity: medium + aiCliProviderあり → runPostReviewが呼ばれ、結果がJobRunResultに含まれる', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
     const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: ['.env'] })) }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
@@ -1713,7 +1817,7 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
       aiCliPrompt: '.envに設定を追加してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(runPostReviewMock).toHaveBeenCalledTimes(1)
     expect(result.postReviewResult?.alignmentVerdict).toBe('aligned')
@@ -1723,10 +1827,10 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
   it('Risk Scan severity: low/none → runPostReviewは呼ばれず、postReviewResultはundefined', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(runPostReviewMock).not.toHaveBeenCalled()
     expect(result.postReviewResult).toBeUndefined()
@@ -1735,10 +1839,10 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
   it('severity: medium だが job.aiCliProvider がない → runPostReviewは呼ばれず、postReviewResultはundefined', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(runPostReviewMock).not.toHaveBeenCalled()
     expect(result.postReviewResult).toBeUndefined()
@@ -1747,7 +1851,7 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
   it('runPostReviewが例外を投げても（実装AIとレビューAIが同一等）catchされ、Jobはsuccess継続', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
     const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: ['.env'] })) }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
@@ -1761,7 +1865,7 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
       aiCliPrompt: '.envに設定を追加してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('success')
     expect(result.postReviewResult).toBeUndefined()
@@ -1779,7 +1883,7 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.postReviewResult).toBeUndefined()
@@ -1793,7 +1897,7 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.postReviewResult).toBeUndefined()
@@ -1810,16 +1914,16 @@ describe('Review Observation Log 接続（観察結果の最小永続化）', ()
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('観察対象（Risk Scan/Step Review/postReview）計算後にappendObservationLogが1回呼ばれる', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(appendObservationLogMock).toHaveBeenCalledTimes(1)
     expect(appendObservationLogMock).toHaveBeenCalledWith(
@@ -1837,7 +1941,7 @@ describe('Review Observation Log 接続（観察結果の最小永続化）', ()
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    await runJob(job)
+    await runJob(job, createPolicy())
 
     expect(appendObservationLogMock).not.toHaveBeenCalled()
   })
@@ -1852,16 +1956,16 @@ describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
     permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
-    execFileSyncMock.mockReturnValue('')
+    execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
   })
 
   it('Risk Scan severity: medium → safetyVerificationResultが計算され、JobRunResultに含まれる', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.safetyVerificationResult).toBeDefined()
     expect(result.safetyVerificationResult?.checks).toHaveLength(12)
@@ -1871,10 +1975,10 @@ describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
   it('overallPassed:falseであってもJobのstatusはsuccessのまま（観察モードであることの確認）', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     // typecheck/test実行結果を渡していないため、TYPECHECK/RELATED_TESTS/FULL_TESTSがfail-closedになり
     // overallPassedはfalseになる想定（危険検出ではなく未接続項目による）。それでもJobは止めない。
@@ -1888,10 +1992,10 @@ describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
   it('Risk Scan severity: low/none → safetyVerificationResultは呼ばれずundefinedのまま', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
-      return ''
+      return gitFallback(args)
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.safetyVerificationResult).toBeUndefined()
   })
@@ -1905,7 +2009,7 @@ describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
       aiCliPrompt: 'バグを修正してください',
       aiCliMode: 'implement',
     })
-    const result = await runJob(job)
+    const result = await runJob(job, createPolicy())
 
     expect(result.status).toBe('failed')
     expect(result.safetyVerificationResult).toBeUndefined()
@@ -1918,9 +2022,178 @@ describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
       apiAvailable: true,
     })
 
-    const result = await runJob(createJob())
+    const result = await runJob(createJob(), createPolicy())
 
     expect(result.status).toBe('blocked')
     expect(result.safetyVerificationResult).toBeUndefined()
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// 変更ファイル検出契約（2026-07-31 critical 修正）
+// ────────────────────────────────────────────────────────────
+
+describe('変更ファイル検出契約', () => {
+  it('Task と Job の Project が一致しない場合、AI 実行前に failed で停止する', async () => {
+    const job = createJob({ projectId: 'project-other' })
+
+    const result = await runJob(job, createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toMatch(/Project が一致しません/)
+    // AI 実行にも Gate にも到達しない
+    expect(callGateCheckMock).not.toHaveBeenCalled()
+    expect(execFileSyncMock).not.toHaveBeenCalled()
+  })
+
+  it('Task ポリシーの taskId が Job と一致しない場合も AI 実行前に停止する', async () => {
+    const result = await runJob(createJob(), createPolicy({ taskId: 'task-mismatch' }))
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toMatch(/task policy mismatch/i)
+    expect(callGateCheckMock).not.toHaveBeenCalled()
+  })
+
+  it('変更検出に失敗した場合は blocked ではなく failed で fail-closed になる', async () => {
+    buildWorktreeManifestMock.mockImplementationOnce(() => {
+      throw new ChangeDetectionErrorStub('git status parse failed')
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toMatch(/変更ファイル検出/)
+    // 技術的失敗は detectionFailure で表す。
+    // fileChangeAllowed を false にすると index.ts が blocked（承認・手動resume待ち）へ
+    // 変換してしまい、Guard 違反と区別できなくなるため false にしない。
+    expect(result.detectionFailure).toBe(true)
+    expect(result.guardResult.fileChangeAllowed).toBe(true)
+  })
+
+  it('File Change Guard へは string[] ではなく manifest と実行時ポリシーを渡す', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'src/a.ts\n'
+      return gitFallback(args)
+    })
+
+    await runJob(createJob(), createPolicy({ allowedPaths: ['src'] }))
+
+    expect(fileChangeGuardMock).toHaveBeenCalledWith(
+      expect.objectContaining({ paths: expect.arrayContaining(['src/a.ts']) }),
+      expect.objectContaining({ allowedPaths: ['src'] }),
+      '/workspace/target',
+    )
+  })
+
+  it('SafeCommand が実行中に作った新規ファイルも最終検査の対象になる（Stage B）', async () => {
+    // SafeCommand 実行前は空、実行後に新規ファイルが現れるケース
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({ changes: [], paths: [] })   // pre-gate
+      .mockReturnValueOnce({ changes: [], paths: [] })   // Stage A（AI作業後）
+      .mockReturnValueOnce({                              // Stage B（SafeCommand実行後）
+        changes: [{ path: 'build/generated.env', kind: 'added', afterType: 'regular' }],
+        paths: ['build/generated.env'],
+      })
+
+    await runJob(createJob(), createPolicy())
+
+    const lastCall = fileChangeGuardMock.mock.calls[fileChangeGuardMock.mock.calls.length - 1]
+    expect(lastCall[0]).toEqual(
+      expect.objectContaining({ paths: ['build/generated.env'] }),
+    )
+  })
+
+  it('commit 後に working tree 差分が空でも commit tree の変更を最終検査する（Stage C）', async () => {
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+    // beforeCommitHash / afterCommitHash が変わる = commit が作られた
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--abbrev-ref')) return 'main\n'
+      if (Array.isArray(args) && args[0] === 'rev-parse') {
+        return execFileSyncMock.mock.calls.filter(
+          (c) => Array.isArray(c[1]) && c[1][0] === 'rev-parse' && !c[1].includes('--abbrev-ref'),
+        ).length <= 2
+          ? 'before111\n'
+          : 'after222\n'
+      }
+      return gitFallback(args)
+    })
+    // working tree はクリーン（commit 済みなので差分が消えている）
+    buildWorktreeManifestMock.mockReturnValue({ changes: [], paths: [] })
+    // commit tree には禁止ファイルが含まれる
+    buildCommitRangeManifestMock.mockReturnValue({
+      changes: [{ path: '.env', kind: 'added', afterType: 'regular' }],
+      paths: ['.env'],
+    })
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
+    })
+    await runJob(job, createPolicy())
+
+    expect(buildCommitRangeManifestMock).toHaveBeenCalled()
+    const lastCall = fileChangeGuardMock.mock.calls[fileChangeGuardMock.mock.calls.length - 1]
+    expect(lastCall[0].paths).toContain('.env')
+  })
+
+  it('Stage A 後に SafeCommand が同じ path の内容を変更して commit しても最終 commit diff で検出する', async () => {
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--abbrev-ref')) return 'main\n'
+      if (Array.isArray(args) && args[0] === 'rev-parse') {
+        return execFileSyncMock.mock.calls.filter(
+          (c) => Array.isArray(c[1]) && c[1][0] === 'rev-parse' && !c[1].includes('--abbrev-ref'),
+        ).length <= 2
+          ? 'before111\n'
+          : 'after222\n'
+      }
+      return gitFallback(args)
+    })
+    // Stage A では安全な内容だった同じ path が、commit tree では別 blob になっている
+    buildWorktreeManifestMock.mockReturnValue({
+      changes: [{ path: 'src/app.ts', kind: 'modified', afterType: 'regular' }],
+      paths: ['src/app.ts'],
+    })
+    buildCommitRangeManifestMock.mockReturnValue({
+      changes: [
+        {
+          path: 'src/app.ts',
+          kind: 'modified',
+          afterType: 'regular',
+          beforeHash: 'aaaaaaa',
+          afterHash: 'bbbbbbb',
+        },
+      ],
+      paths: ['src/app.ts'],
+    })
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
+    })
+    const result = await runJob(job, createPolicy())
+
+    // 最終検査は commit tree 由来の manifest（blob hash 付き）を使う
+    const lastCall = fileChangeGuardMock.mock.calls[fileChangeGuardMock.mock.calls.length - 1]
+    const committedChange = lastCall[0].changes.find((c: { path: string }) => c.path === 'src/app.ts')
+    expect(committedChange?.afterHash).toBe('bbbbbbb')
+    expect(result.finalChangeManifest?.paths).toContain('src/app.ts')
+  })
+
+  it('ignored な機密ファイルの変化を manifest へ合流させる', async () => {
+    scanSensitiveFilesMock
+      .mockReturnValueOnce(new Map())  // Job 開始時ベースライン: .env は存在しない
+    diffSensitiveBaselineMock.mockReturnValue([
+      { path: '.env', kind: 'added', afterType: 'regular' },
+    ])
+
+    await runJob(createJob(), createPolicy())
+
+    const lastCall = fileChangeGuardMock.mock.calls[fileChangeGuardMock.mock.calls.length - 1]
+    expect(lastCall[0].paths).toContain('.env')
   })
 })

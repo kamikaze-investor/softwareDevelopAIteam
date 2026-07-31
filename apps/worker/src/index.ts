@@ -15,6 +15,7 @@
 import type { Job, Project, Task } from '@ai-team/shared'
 import { assertTransition, recoverStaleJobs } from './jobStateManager.js'
 import { runJob } from './jobRunner.js'
+import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { startWatchdog } from './watchdog/watchdog.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
@@ -38,7 +39,13 @@ type JobUpdate = Partial<Pick<
   | 'guardResult'
 >>
 
-async function fetchQueuedJob(): Promise<Job | null> {
+/** queued Job と、その Job が属する Task を一緒に返す（Task は実行時ポリシー構築に必須） */
+interface QueuedWork {
+  job: Job
+  task: Task
+}
+
+async function fetchQueuedJob(): Promise<QueuedWork | null> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return null
 
@@ -53,7 +60,7 @@ async function fetchQueuedJob(): Promise<Job | null> {
       if (!jobs) continue
 
       const queued = jobs.find((job) => job.status === 'queued')
-      if (queued) return queued
+      if (queued) return { job: queued, task }
     }
   }
 
@@ -87,9 +94,36 @@ async function fetchJson<T>(path: string): Promise<T | null> {
 async function pollJobs(): Promise<never> {
   while (true) {
     try {
-      const job = await fetchQueuedJob()
-      if (job) {
+      const work = await fetchQueuedJob()
+      if (work) {
+        const { job, task } = work
         console.log(`[Worker] Job ${job.id} (${job.safeCommand.kind}) を実行します`)
+
+        // 実行時 Task ポリシーは AI 実行より前に構築する。
+        // Task 取得失敗・Project 不一致・構築失敗のいずれでも runJob() を呼ばず failed にする
+        // （allowedPaths / forbiddenPaths を適用できないまま AI を動かさない）。
+        let policy
+        try {
+          if (task.projectId !== job.projectId) {
+            throw new Error(
+              `Task と Job の Project が一致しません: task.projectId=${task.projectId} job.projectId=${job.projectId}`,
+            )
+          }
+          policy = buildRuntimeTaskPolicy(task)
+        } catch (err: unknown) {
+          const message = `実行時Taskポリシーを構築できないため実行しません: ${formatUnknownError(err)}`
+          console.error(`[Worker] ${message}`)
+          assertTransition(job.status, 'running')
+          await updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() })
+          assertTransition('running', 'failed')
+          await updateJob(job.id, {
+            status: 'failed',
+            stderr: message,
+            completedAt: new Date().toISOString(),
+          })
+          await sleep(POLL_INTERVAL_MS)
+          continue
+        }
 
         assertTransition(job.status, 'running')
         await updateJob(job.id, {
@@ -97,7 +131,7 @@ async function pollJobs(): Promise<never> {
           startedAt: new Date().toISOString(),
         })
 
-        const result = await runJob(job)
+        const result = await runJob(job, policy)
         const resultStatus = resolveResultStatus(result)
 
         assertTransition('running', resultStatus)
@@ -143,6 +177,12 @@ function formatUnknownError(err: unknown): string {
 }
 
 function resolveResultStatus(result: Awaited<ReturnType<typeof runJob>>): Job['status'] {
+  // 変更検出・ポリシー構築の技術的失敗は blocked（承認・手動resume待ち）へ変換しない。
+  // blocked は resumeBlockedTask() の入口であり、人手の再開待ちを意味するため。
+  if (result.detectionFailure) {
+    return 'failed'
+  }
+
   if (!result.guardResult.permissionAllowed || !result.guardResult.fileChangeAllowed) {
     return 'blocked'
   }
