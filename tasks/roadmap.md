@@ -461,6 +461,86 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         ただしクラッシュが早すぎてログ書き込み自体に未到達だった場合はログも残らない＝
         「救出しない」方針と整合）
 
+      **変更ファイル検出契約（2026-07-31確定。Codex `gpt-5.6-sol`独立レビューで発見された
+      既存critical欠陥への対処。上記「保護対象への最小接続口の再評価」の記述を修正する）**:
+      `getChangedFiles()`が使う`git diff --name-only HEAD`は**untrackedファイルを検出せず**、
+      さらに**SafeCommand=`git_commit`の場合は実行後に差分が空になる**ため、正常にコミットされた
+      変更ほどGuardを素通りする（実測確認済み: `.env`をcommitさせても
+      `fileChangeGuard([])`→`fileChangeAllowed:true`となる）。この関数はApproval Gate
+      （`jobRunner.ts:156`）・`runRiskReview()`（同:669）・Target Project Risk Scan（同:441）・
+      File Change Guard（同:584）の**4機構すべてに供給されている**ため、影響は全安全機構に及ぶ。
+      加えて`fileChangeGuard()`は`task`引数を受け取る設計なのに`jobRunner.ts:584`が渡しておらず、
+      **allowedPaths/forbiddenPathsが実行時に一切適用されていない**。
+      よって次を必須要件とする:
+      - **commit前**に`git status --porcelain=v2 -z --untracked-files=all`相当から
+        変更manifestを作る（`git diff --name-only HEAD`だけを変更判定に使わない）
+      - 新規・変更・削除・renameを検出する。renameは**旧パスと新パスの両方**を検査する
+      - 新規または変更されたsymlinkはMVPでは拒否する
+      - TaskのallowedPaths/forbiddenPathsを必ず適用する（Job作成時のimmutable snapshotとして束縛）
+      - `.env`・秘密鍵等の常時禁止パターンを**新規ファイルにも**適用する
+      - **Git/status解析失敗時は空配列を返さずfail-closed**にする
+        （現状`adapter.ts:453`・`jobRunner.ts:640`はcatchで`[]`を返しfail-openになっている）
+      - Approval Gate・Risk Review・Risk Scan・File Change Guardが**同じ検査済みmanifest**を使う
+      - **commit後にbase treeとcommit treeを比較**し、検査済みmanifestと一致しなければ失敗する
+      - **`jobRunner.ts`は無変更では成立しない**（上記「最小接続口の再評価」で
+        「`jobRunner.ts`は無変更のまま成立する」としていた見積もりは、この欠陥の発見により誤りと確定）
+      - **OS隔離（Job単位mount namespace）が完成するまで、状態不明Jobの自動retryは有効化しない**
+        （replay-safeは`CommandKind`にdeployが無いことでは保証されない。`test`/`build`/`lint`は
+        target管理の`pnpm`スクリプトを実行し、webhook・publish・課金APIを自由に呼べるため。
+        既存`sandbox/docker-compose.yml`はcanonical target全体をRW mountし、networkも
+        遮断していない上、現行Jobはコンテナを経由せずホスト上で直接`execFileSync`している）
+      - **Critical設計および保護対象（CONTROL REPOSITORY / AV-001）の変更は、
+        Codex `gpt-5.6-sol`によるread-only独立レビューを必須とする**
+        （Claude自身によるレビュー省略は不可。`docs/multi_ai_step_review_flow.md`の
+        「AV-001対象ファイルは編集前に具体的な変更計画を提示し明確な承認を得てから着手する」
+        という既存Risk Control工程に統合し、新しいレビュー工程は作らない）
+      - **reflog検証（`assertNoHistoryRewrite`）は、通常のresetや履歴変更を検出する
+        追加防御として位置づける。OS隔離前のため、敵対的プロセスによる`.git`管理領域
+        （`.git/logs/HEAD`等）の直接改ざんを防げる安全境界ではない**
+        （2026-07-31 Codex 4回目レビューで指摘。「reflog行を削除してbaselineだけ残す改ざん」は
+        Worker実行プロセスが`.git`ディレクトリへの書き込み権限を持つ限り原理的に検出できない。
+        完全なGit・filesystem境界は将来項目`project-auto-worker-core-split`（Worker安全コアの
+        物理分離）のOS隔離で解決する）
+      - **reflog検証の実装方針確定（2026-07-31、Codex closureレビュー2回・実測に基づく最終確定。
+        上記の位置づけを補強する）**: 当初、reflogエントリ数と`git rev-list --count`による
+        実commit数を突き合わせる`countCommitsBetween()`を追加したが、(a)
+        `git reflog delete`でエントリを完全削除された場合は削除されたcommitが最終HEADの
+        祖先チェーンから到達不能になり、到達可能性ベースの`rev-list`では原理的に検出しようが
+        なく検出力が無いまま複雑さだけが残ること、(b) `git merge --ff-only`のように1回の
+        reflog更新で複数commitが一気に前進する正当な操作を誤って拒否する回帰があること
+        （いずれも実測確認済み）から、CEO判断により**`countCommitsBetween()`は完全撤去**した。
+        維持するのはbaseline空判定・current reflog空判定・baseline suffix一致判定・
+        隣接hash遷移のfast-forward判定（`git merge-base --is-ancestor`）のみであり、
+        これらは通常のreset・checkout・巻き戻し・unrelated履歴移動を検出する実効性のある
+        追加防御として機能する。**HEAD reflogとbranch reflogの物理的独立性を実測で確認**した
+        （`git reflog delete --updateref HEAD@{1}`は`.git/logs/HEAD`のみを操作し、
+        `.git/logs/refs/heads/<branch>`には影響しない）ため、branch上で実行している限りは
+        branch reflogという第二の防御線が働き、HEAD reflog単独の完全削除では回避できない。
+        ただし**detached HEAD状態（branchRefが存在しない場合）はこの第二防御が働かず、
+        reflogの完全削除を防げない**（テストで既知の限界として明示済み）。
+        いずれにせよreflog検証は「敵対的プロセスによる`.git`管理領域の直接改ざん」に対する
+        安全境界ではなく、Worker/AIプロセスが`.git`への同一書き込み権限を持つ限り
+        reflogという痕跡ベースの検証手法そのものの限界であり、根本解決は将来項目
+        `project-auto-worker-core-split`のJob単位OS隔離とGit管理領域の分離でのみ可能。
+        **OS隔離が完成するまで、状態不明Jobの自動retryおよび完全自律運転（人間承認なしの
+        連続Job実行）は有効化しない。**
+      - **既知の残存課題（MVP-Bへ送る。今回は対応しない）**: `buildCommitRangeManifest()`/
+        `getCommitRangeDiffText()`はJob内のcommit数・diff累積サイズに上限が無く、
+        個々の`git`呼び出しには`GIT_TIMEOUT_MS`（10秒）の上限があるものの、1 Jobで極端に
+        多数のcommitが作られた場合は長時間停止やメモリ消費が起こりうる
+        （2026-07-31 Codex 4回目レビューで指摘）。監督付きMVP（CEO承認済みTask範囲内で
+        AIが動作する前提）では通常発生しない異常系であり、対応には新しい上限値の設計判断
+        （commit数上限・累積バイト数上限の具体値決定）を要するため、変更検出契約の
+        バグ修正の範囲を超えると判断し今回は見送る
+      - **機密ファイル走査（`scanSensitiveFiles`）の実測（2026-07-31、対象Repository実測）**:
+        リポジトリルート全体（`node_modules`含む）走査で総entry数85,544件・
+        `SCAN_MAX_ENTRIES`(200,000件)の42.8%使用・所要0.79秒。機密パターン一致判定込みの
+        走査（`hashSensitiveEntry`含む）で2.08秒・メモリ増分4.5MB。Job1回あたり
+        （開始時ベースライン＋Stage A＋Stage B/C）で3回相当の走査が発生するため
+        合計6秒程度。現状のRepository規模では実用上問題ないが、依存が大きいtarget-project
+        では`SCAN_MAX_ENTRIES`到達に近づく可能性があり、キャッシュ化・差分走査等の
+        性能改善は将来項目として扱う（新設計のため今回は実装しない）
+
       **`project-auto-worker-trust-boundary`は保護対象への具体的コード差分承認が
       完了条件として残るため、doneにはせずin_progressを維持する。**
 <!-- roadmap:id=project-auto-worker-outbox state=planned -->
@@ -519,6 +599,13 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       不一致時は全Jobがblockedになる（Job生成時にfail-closedで検出する）。
       `canExecuteCommands: false`のassignee（`cto_ai`/`context_manager`/`reviewer_ai`）が
       最小候補になると同じTaskを選び続けて永久停止するため、ロードマップ検証側で拒否する。
+      **Task取得不能時のJob確定（2026-07-31 Codex指摘。変更検出修正では対処せず本Stepへ送る）**:
+      Workerの`fetchQueuedJob()`は`/api/tasks`が失敗すると`if (!tasks) continue`で
+      次のProjectへ進むため、**queued Jobをfailedへ確定できずポーリングに残り続ける**
+      （`apps/worker/src/index.ts`）。AIは実行されないため安全側だが、
+      「Task取得失敗はAI実行前にfailedで停止する」という状態契約を満たさない。
+      正しく直すにはqueued Jobを先に取得して`taskId`からTaskを引くポーリング契約へ変える必要があり、
+      API側の変更を伴うため本Step（薄いapplication serviceによる進行管理）の設計に含めて解決する。
       **完了条件**: 1つのProjectで複数Taskが順に自動実行され、二重生成・途中失敗時に
       安全側で停止すること（既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）
 <!-- roadmap:id=project-auto-recovery-e2e state=planned -->
