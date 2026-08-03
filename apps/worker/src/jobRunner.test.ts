@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import type { Job } from '@ai-team/shared'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -379,6 +379,7 @@ describe('runJob', () => {
       shell: false,
       timeout: 120_000,
       encoding: 'utf-8',
+      env: expect.any(Object),
     })
     // git diff --name-only HEAD (getChangedFiles post-execution) must have been called
     expect(execFileSyncMock).toHaveBeenCalledWith('git', ['diff', '--name-only', 'HEAD'], {
@@ -399,6 +400,86 @@ describe('runJob', () => {
     expect(result.stderrPath).toBe('/logs/job-1/stderr.txt')
     expect(result.changedFiles).toEqual(['src/index.ts'])
     expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'M src/index.ts\n', '')
+  })
+
+  describe('SafeCommand 実行の env allowlist（secrets boundary）', () => {
+    const SECRET_ENV_BACKUP: Record<string, string | undefined> = {}
+
+    beforeEach(() => {
+      SECRET_ENV_BACKUP.API_TOKEN = process.env.API_TOKEN
+      SECRET_ENV_BACKUP.DB_PATH = process.env.DB_PATH
+      SECRET_ENV_BACKUP.OPENAI_API_KEY = process.env.OPENAI_API_KEY
+      SECRET_ENV_BACKUP.CLAUDE_API_KEY = process.env.CLAUDE_API_KEY
+      SECRET_ENV_BACKUP.GEMINI_API_KEY = process.env.GEMINI_API_KEY
+      SECRET_ENV_BACKUP.FUTURE_OUTBOX_SECRET = process.env.FUTURE_OUTBOX_SECRET
+
+      process.env.API_TOKEN = 'secret-api-token'
+      process.env.DB_PATH = '/secret/db.sqlite'
+      process.env.OPENAI_API_KEY = 'sk-secret-openai'
+      process.env.CLAUDE_API_KEY = 'sk-secret-claude'
+      process.env.GEMINI_API_KEY = 'secret-gemini'
+      process.env.FUTURE_OUTBOX_SECRET = 'secret-outbox-value'
+    })
+
+    afterEach(() => {
+      for (const [key, value] of Object.entries(SECRET_ENV_BACKUP)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    })
+
+    function mainCommandEnv(): NodeJS.ProcessEnv {
+      const call = execFileSyncMock.mock.calls.find(
+        (c) => Array.isArray(c[1]) && c[1].join(' ') === 'run test',
+      ) ?? execFileSyncMock.mock.calls.find(
+        (c) => Array.isArray(c[1]) && c[1].join(' ') === 'run build',
+      ) ?? execFileSyncMock.mock.calls.find(
+        (c) => Array.isArray(c[1]) && c[1].join(' ') === 'run lint',
+      )
+      if (!call) throw new Error('main command execFileSync call not found')
+      return (call[2] as { env: NodeJS.ProcessEnv }).env
+    }
+
+    it('test コマンドから API_TOKEN が見えない', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+
+      await runJob(createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }), createPolicy())
+
+      const env = mainCommandEnv()
+      expect(env.API_TOKEN).toBeUndefined()
+      expect(env.PATH).toBe(process.env.PATH)
+    })
+
+    it('build コマンドから DB_PATH が見えない', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'build'], description: 'pnpm build' })
+
+      await runJob(createJob({ safeCommand: { kind: 'build', workingDir: '/workspace/target' } }), createPolicy())
+
+      const env = mainCommandEnv()
+      expect(env.DB_PATH).toBeUndefined()
+      expect(env.PATH).toBe(process.env.PATH)
+    })
+
+    it('lint コマンドから全 provider API key が見えない', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'lint'], description: 'pnpm lint' })
+
+      await runJob(createJob({ safeCommand: { kind: 'lint', workingDir: '/workspace/target' } }), createPolicy())
+
+      const env = mainCommandEnv()
+      expect(env.OPENAI_API_KEY).toBeUndefined()
+      expect(env.CLAUDE_API_KEY).toBeUndefined()
+      expect(env.GEMINI_API_KEY).toBeUndefined()
+      expect(env.PATH).toBe(process.env.PATH)
+    })
+
+    it('未知の環境変数（将来の Outbox 秘密情報等）が自動継承されない', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+
+      await runJob(createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }), createPolicy())
+
+      const env = mainCommandEnv()
+      expect(env.FUTURE_OUTBOX_SECRET).toBeUndefined()
+    })
   })
 
   it('returns failed when the command exits with a non-zero status', async () => {

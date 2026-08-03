@@ -63,6 +63,7 @@ export const ALWAYS_FORBIDDEN_PATTERNS = [
   // 完全パス一致であれば誤検出のリスクなく安全側に倒せる。
   /^apps\/worker\/src\/aiCli\/adapter\.ts$/i,  // AI CLI Adapter（環境変数allowlistの実装元）
   /^apps\/worker\/src\/index\.ts$/i,            // Worker エントリポイント（claim・起動順序）
+  /^apps\/worker\/src\/utils\/safeEnv\.ts$/i,   // target側コマンド env allowlist（秘密情報の唯一の関所。2026-08-01 追加）
 ]
 
 export interface FileGuardResult {

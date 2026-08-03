@@ -53,6 +53,8 @@ const DANGEROUS_FILE_PATTERNS: Array<{ pattern: RegExp; reason: string; risk: Ri
   { pattern: /sandbox\//, reason: 'sandbox config', risk: 'HIGH' },
   { pattern: /auth/, reason: 'authentication related', risk: 'HIGH' },
   { pattern: /\.(pem|key|crt)$/, reason: 'certificate/key file', risk: 'CRITICAL' },
+  // target側コマンド env allowlist（秘密情報の唯一の関所。2026-08-01 追加）
+  { pattern: /^apps\/worker\/src\/utils\/safeEnv\.ts$/, reason: 'target command env allowlist (secrets boundary)', risk: 'CRITICAL' },
 ]
 
 // ────────────────────────────────────────────────────────────

@@ -24,6 +24,7 @@ import { runSafetyVerification } from './approvalLevel/safetyVerifier.js'
 import type { SafetyVerificationResult } from './approvalLevel/safetyVerifier.js'
 import { appendObservationLog } from './approvalLevel/observationLog.js'
 import { resolveCommand } from './commandResolver.js'
+import { buildTargetCommandEnv } from './utils/safeEnv.js'
 import { ALWAYS_FORBIDDEN_PATTERNS, fileChangeGuard } from './guards/fileChangeGuard.js'
 import type { RuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import {
@@ -696,6 +697,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
         shell: false,
         timeout: isAtomic ? undefined : JOB_TIMEOUT_MS,
         encoding: 'utf-8',
+        env: buildTargetCommandEnv(),
       })
     } catch (err: unknown) {
       const failure = toExecFileFailure(err)

@@ -27,6 +27,7 @@ import type {
 } from '@ai-team/shared'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
+import { buildTargetCommandEnv } from '../utils/safeEnv.js'
 import { buildWorktreeManifest } from '../guards/changeManifest.js'
 import { saveJobLogs } from '../jobLogger.js'
 
@@ -406,6 +407,7 @@ function runPostLint(workingDir: string): void {
       shell: false,
       encoding: 'utf-8',
       timeout: 60_000,  // 1分
+      env: buildTargetCommandEnv(),
     })
   } catch (err) {
     // lint失敗は警告のみ（ブロックしない）
