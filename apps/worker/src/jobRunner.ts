@@ -43,7 +43,8 @@ import {
 import type { ChangeManifest, ReflogBaseline, SensitiveBaseline } from './guards/changeManifest.js'
 import { saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
-import { callGateCheck, callConsume } from './guards/gateClient.js'
+import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
+import type { GateCheckResponse } from './guards/gateClient.js'
 import { resolvePolicy, SAFE_WORK_ALLOWED_COMMAND_KINDS } from './guards/gatePolicy.js'
 import type { EffectivePolicy } from './guards/gatePolicy.js'
 import { toGateDecision } from './guards/safetyAuditor.js'
@@ -130,6 +131,16 @@ export interface JobRunResult {
    * blocked（＝承認・手動 resume 待ち）へ変換せず failed のまま永続化する。
    */
   detectionFailure?: boolean
+  /**
+   * Permission API / Gate API の**技術障害**であることを示す
+   * （疎通不可・認証失敗・タイムアウト・不正レスポンス）。
+   *
+   * `detectionFailure`（変更検出の失敗）とは意味が異なるため流用しない。
+   * 権限の拒否や承認待ちとも区別する: 技術障害を blocked にすると
+   * resumeBlockedTask() の自動再開対象になり、API が壊れたまま再実行され続ける。
+   * index.ts の resolveResultStatus() はこのフラグで failed を維持する。
+   */
+  technicalFailure?: boolean
 }
 
 /**
@@ -173,6 +184,15 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   }
 
   if (!guardCheck.allowed) {
+    // 権限 API の技術障害（疎通不可・認証失敗・タイムアウト・不正レスポンス、
+    // および once グラントの使用済み記録失敗）は「権限が拒否された」ではない。
+    // blocked に流すと resumeBlockedTask() の自動再開対象になってしまうため failed で止める。
+    if (guardCheck.technicalFailure) {
+      return failTechnical(
+        startedAt,
+        `Permission check could not be completed: ${guardCheck.reason ?? 'unknown error'}`,
+      )
+    }
     return {
       status: 'blocked',
       guardResult,
@@ -217,8 +237,10 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   const targetBranch = getTargetBranch(workingDir)
   const localGateResult = buildLocalGateResult(preChangedFiles)
 
-  let checkResponse
-  let apiError: unknown
+  // Gate API の技術障害（通信・認証・タイムアウト・不正レスポンス）は
+  // safe work 継続や「CEO 承認待ち」へ変換しない。承認フローと技術障害を
+  // 混同すると、API が壊れている事実が承認待ち通知に隠れてしまうため。
+  let checkResponse: GateCheckResponse
   try {
     checkResponse = await callGateCheck({
       taskId: job.taskId,
@@ -229,11 +251,13 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
       changedFiles: preChangedFiles,
     })
   } catch (err) {
-    apiError = err
-    console.error(`[gate] callGateCheck failed: ${err instanceof Error ? err.message : String(err)}`)
+    return failTechnical(
+      startedAt,
+      `Gate check could not be completed: ${formatUnknownError(err)}`,
+    )
   }
 
-  const gateResult = resolvePolicy(localGateResult, checkResponse, apiError)
+  const gateResult = resolvePolicy(localGateResult, checkResponse)
 
   if (gateResult.policy === 'block_until_approved' || gateResult.policy === 're_check') {
     console.warn(`[gate] ${gateResult.policy}: taskId=${job.taskId} reason="${gateResult.reason}"`)
@@ -383,6 +407,10 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      // GateClientError 以外の想定外エラーも技術障害として扱う（安全側）。
+      // 404（request 不存在）・409（stale / 期限切れ / 非APPROVED）だけが
+      // API 契約上意味を持つ業務上の block。
+      const isTechnical = !(err instanceof GateClientError) || err.technicalFailure
       console.error(`[gate] consume failed: ${message}`)
       notifyGateEvent({
         severity: 'critical',
@@ -402,6 +430,16 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
         sourceType: 'gate_consume_failed',
         sourceId: consumeRequestId ?? job.id,
       })
+
+      // 消費できたかどうかを確認できない技術障害では、消費済みとみなして継続しない。
+      // かつ承認待ちの blocked にもしない（自動再開の対象にしない）。
+      if (isTechnical) {
+        return failTechnical(
+          startedAt,
+          `Approval consume could not be completed: ${message}`,
+        )
+      }
+
       return {
         status: 'blocked',
         guardResult: {
@@ -827,6 +865,36 @@ function failClosed(
     startedAt,
     completedAt: new Date().toISOString(),
     detectionFailure: true,
+  }
+}
+
+/**
+ * Permission API / Gate API の技術障害で Job を停止する。
+ *
+ * failClosed() と同じく status='failed'（resumeBlockedTask() の対象外）だが、
+ * 意味が異なるため `detectionFailure` は流用せず `technicalFailure` を立てる。
+ *
+ * guardResult は permissionAllowed/fileChangeAllowed とも true のままにする。
+ * false にすると index.ts の resolveResultStatus() が blocked へ変換し、
+ * 「権限が拒否された」「承認待ち」と区別できなくなるため
+ * （ここで起きたのは判定の失敗であって、拒否ではない）。
+ */
+function failTechnical(startedAt: string, message: string): JobRunResult {
+  console.error(`[jobRunner] technical-failure: ${message}`)
+  return {
+    status: 'failed',
+    exitCode: 1,
+    stdout: '',
+    stderr: message,
+    changedFiles: [],
+    guardResult: {
+      permissionAllowed: true,
+      fileChangeAllowed: true,
+      fileViolations: [],
+    },
+    startedAt,
+    completedAt: new Date().toISOString(),
+    technicalFailure: true,
   }
 }
 

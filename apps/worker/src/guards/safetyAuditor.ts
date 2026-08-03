@@ -37,6 +37,12 @@ const DANGEROUS_FILE_PATTERNS: Array<{ pattern: RegExp; reason: string; risk: Ri
   { pattern: /goal\.md$/, reason: 'project goal definition', risk: 'CRITICAL' },
   { pattern: /CLAUDE\.md$/, reason: 'AI instruction file', risk: 'CRITICAL' },
   { pattern: /AGENTS\.md$/, reason: 'AI agent rules file', risk: 'CRITICAL' },
+  // 権限・承認の安全中核（2026-08-01 追加）。
+  // ⚠️ 下の広い `/guards\//`（HIGH）より**前**に置くこと。
+  //    このリストは最初に一致したパターンで break するため、後ろに置くと
+  //    `/guards\//` が先に当たって CRITICAL に昇格しない。
+  { pattern: /^apps\/worker\/src\/guards\/gateClient\.ts$/, reason: 'approval gate API client (auth + fail-closed boundary)', risk: 'CRITICAL' },
+  { pattern: /^apps\/worker\/src\/guards\/gatePolicy\.ts$/, reason: 'gate policy resolution (approval decision boundary)', risk: 'CRITICAL' },
   // HIGH
   { pattern: /guards\//, reason: 'guard implementation (control repo)', risk: 'HIGH' },
   { pattern: /permissionGuard/, reason: 'permission guard', risk: 'HIGH' },
@@ -55,6 +61,8 @@ const DANGEROUS_FILE_PATTERNS: Array<{ pattern: RegExp; reason: string; risk: Ri
   { pattern: /\.(pem|key|crt)$/, reason: 'certificate/key file', risk: 'CRITICAL' },
   // target側コマンド env allowlist（秘密情報の唯一の関所。2026-08-01 追加）
   { pattern: /^apps\/worker\/src\/utils\/safeEnv\.ts$/, reason: 'target command env allowlist (secrets boundary)', risk: 'CRITICAL' },
+  // Worker→API 認証ヘッダーの単一生成点（2026-08-01 追加）
+  { pattern: /^apps\/worker\/src\/utils\/apiAuth\.ts$/, reason: 'worker→API auth header builder (authn boundary)', risk: 'CRITICAL' },
 ]
 
 // ────────────────────────────────────────────────────────────

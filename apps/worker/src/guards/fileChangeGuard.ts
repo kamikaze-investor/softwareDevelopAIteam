@@ -64,6 +64,9 @@ export const ALWAYS_FORBIDDEN_PATTERNS = [
   /^apps\/worker\/src\/aiCli\/adapter\.ts$/i,  // AI CLI Adapter（環境変数allowlistの実装元）
   /^apps\/worker\/src\/index\.ts$/i,            // Worker エントリポイント（claim・起動順序）
   /^apps\/worker\/src\/utils\/safeEnv\.ts$/i,   // target側コマンド env allowlist（秘密情報の唯一の関所。2026-08-01 追加）
+  /^apps\/worker\/src\/utils\/apiAuth\.ts$/i,   // Worker→API 認証ヘッダーの単一生成点（2026-08-01 追加）
+  /^apps\/worker\/src\/guards\/gateClient\.ts$/i, // Approval Gate API クライアント（技術障害/業務拒否の分離。2026-08-01 追加）
+  /^apps\/worker\/src\/guards\/gatePolicy\.ts$/i, // Gate レスポンス→実行ポリシー統合（2026-08-01 追加）
 ]
 
 export interface FileGuardResult {

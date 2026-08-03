@@ -11,7 +11,7 @@ import {
   diffSensitiveBaseline,
   scanSensitiveFiles,
 } from './guards/changeManifest.js'
-import { callGateCheck, callConsume } from './guards/gateClient.js'
+import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
 import { resolvePolicy } from './guards/gatePolicy.js'
 
 const { hoistedExecFileSync } = vi.hoisted(() => ({ hoistedExecFileSync: vi.fn() }))
@@ -105,10 +105,13 @@ vi.mock('./jobLogger.js', () => ({
 vi.mock('./guards/gateClient.js', () => ({
   callGateCheck: vi.fn(),
   callConsume: vi.fn(),
+  // 実装と同じく technicalFailure を持たせる（既定 true = 未知の失敗は安全側）
   GateClientError: class GateClientError extends Error {
-    constructor(msg: string) {
+    readonly technicalFailure: boolean
+    constructor(msg: string, options?: { technicalFailure?: boolean }) {
       super(msg)
       this.name = 'GateClientError'
+      this.technicalFailure = options?.technicalFailure ?? true
     }
   },
 }))
@@ -361,6 +364,54 @@ describe('runJob', () => {
     expect(result.status).toBe('blocked')
     expect(result.permissionBlockEvent).toEqual(blockEvent)
     expect(callGateCheckMock).not.toHaveBeenCalled()
+  })
+
+  // 2026-08-01: 権限 API の技術障害は「権限が拒否された」ではないため、
+  // 承認・手動 resume 待ちの blocked ではなく failed で止める。
+  it('permissionGuard の technicalFailure → blocked ではなく failed', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      technicalFailure: true,
+      reason: 'permission-grants: HTTP 401',
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.technicalFailure).toBe(true)
+    expect(result.stderr).toContain('Permission check could not be completed')
+    expect(result.stderr).toContain('HTTP 401')
+    // 技術障害では Gate も SafeCommand も動かさない
+    expect(callGateCheckMock).not.toHaveBeenCalled()
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('permissionGuard の technicalFailure では guardResult を permission 拒否として扱わない', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      technicalFailure: true,
+      reason: 'permission-grants: request failed — ECONNREFUSED',
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    // permissionAllowed=false にすると index.ts の resolveResultStatus() が
+    // blocked へ変換してしまうため、技術障害では true のままにする
+    expect(result.guardResult.permissionAllowed).toBe(true)
+    expect(result.guardResult.fileChangeAllowed).toBe(true)
+  })
+
+  it('once グラントの使用済み記録失敗（technicalFailure）でも Job を続行しない', async () => {
+    permissionGuardWithGrantsMock.mockResolvedValue({
+      allowed: false,
+      technicalFailure: true,
+      reason: 'permission-grants/use: HTTP 500',
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
   it('executes the resolved command with shell disabled and records changed files', async () => {
@@ -687,25 +738,33 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
     expect(result.gatePolicy).toBeUndefined()
   })
 
-  it('callGateCheck throws → resolvePolicy called with apiError, not re-thrown', async () => {
-    const networkErr = new Error('ECONNREFUSED')
-    callGateCheckMock.mockRejectedValue(networkErr)
-    resolvePolicyMock.mockReturnValue({
-      policy: 'continue_safe_work_only',
-      reason: 'Gate API unavailable: ECONNREFUSED',
-      apiAvailable: false,
-    })
+  // 2026-08-01: Gate API の技術障害を safe work 継続や承認待ちへ縮退させない。
+  // 以前は resolvePolicy(localResult, undefined, apiError) へ渡して
+  // continue_safe_work_only へ落としていたため、認証失敗や API 停止でも
+  // Job が進んでいた（かつ技術障害が「CEO承認待ち」として通知されていた）。
+  it('callGateCheck throws → resolvePolicy を呼ばず technical failure で failed にする', async () => {
+    callGateCheckMock.mockRejectedValue(new Error('ECONNREFUSED'))
 
     const result = await runJob(createJob(), createPolicy())
 
-    // resolvePolicy must have been called with apiError
-    expect(resolvePolicyMock).toHaveBeenCalledWith(
-      expect.anything(),  // localGateResult
-      undefined,          // checkResponse undefined (callGateCheck threw)
-      networkErr,         // apiError
-    )
-    // Job should not throw — policy handles it
-    expect(result.status).toBe('success') // continue_safe_work_only + git_status → allowed
+    expect(resolvePolicyMock).not.toHaveBeenCalled()
+    expect(result.status).toBe('failed')
+    expect(result.technicalFailure).toBe(true)
+    expect(result.stderr).toContain('Gate check could not be completed')
+    // safe work すら継続しない
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+    // 承認待ちの blocked に変換しない（自動 resume の対象にしない）
+    expect(result.gatePolicy).toBeUndefined()
+  })
+
+  it('callGateCheck が 401 で失敗しても CEO 承認待ちとして通知しない', async () => {
+    callGateCheckMock.mockRejectedValue(new Error('gate/check: HTTP 401'))
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.technicalFailure).toBe(true)
+    expect(sendAlertMock).not.toHaveBeenCalled()
   })
 
   it('nextAction: proceed → callConsume is NOT called', async () => {
@@ -896,10 +955,16 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     expect(callConsumeMock).toHaveBeenCalled()
   })
 
-  it('consume throws → status: blocked with gateBlockReason', async () => {
+  // 2026-08-01: consume 失敗を「業務上の block」と「技術障害」で分ける。
+  // 404 / 409 は API 契約上意味を持つ承認フローの結果なので blocked のまま。
+  it('consume が業務上の 409（stale）→ 既存どおり blocked', async () => {
     callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
     resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
-    callConsumeMock.mockRejectedValue(new Error('HTTP 409 — Approval request is stale'))
+    callConsumeMock.mockRejectedValue(
+      new GateClientError('consume(req-abc): HTTP 409 — Approval request is stale', {
+        technicalFailure: false,
+      }),
+    )
 
     const result = await runJob(createJob(), createPolicy())
 
@@ -907,6 +972,49 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     expect(result.gatePolicy).toBe('block_until_approved')
     expect(result.gateBlockReason).toContain('consume failed')
     expect(result.gateBlockReason).toContain('409')
+    expect(result.technicalFailure).toBeUndefined()
+  })
+
+  it('consume が業務上の 404（request 不存在）→ 既存どおり blocked', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockRejectedValue(
+      new GateClientError('consume(req-abc): HTTP 404 — approval request not found', {
+        technicalFailure: false,
+      }),
+    )
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.technicalFailure).toBeUndefined()
+  })
+
+  it('consume が技術障害（401）→ blocked ではなく failed（消費済み扱いにしない）', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockRejectedValue(
+      new GateClientError('consume(req-abc): HTTP 401', { technicalFailure: true }),
+    )
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.technicalFailure).toBe(true)
+    expect(result.stderr).toContain('Approval consume could not be completed')
+    // 消費できたか不明なまま SafeCommand を実行しない
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('consume が GateClientError 以外の想定外エラー → 安全側で failed', async () => {
+    callGateCheckMock.mockResolvedValue(CONSUME_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    callConsumeMock.mockRejectedValue(new TypeError('unexpected'))
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.technicalFailure).toBe(true)
   })
 
   it('consume fails → resolveCommand is NOT called', async () => {

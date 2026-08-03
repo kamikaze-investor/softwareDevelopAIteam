@@ -36,39 +36,41 @@ function makeCheckResponse(overrides: Partial<GateCheckResponse> = {}): GateChec
 }
 
 // ────────────────────────────────────────────────────────────
-// API 通信失敗時 (fail closed)
+// API 通信失敗は「ポリシーへ縮退させない」（2026-08-01 変更）
+//
+// 以前は apiError を受け取り continue_safe_work_only / block_until_approved へ
+// 縮退させていたが、認証失敗や API 停止でも safe work を継続してしまい、
+// さらに技術障害を「CEO承認待ち」として通知していた。
+// 現在、Gate API の技術障害は jobRunner が Job を failed にして止めるため、
+// この関数は有効なレスポンスがある場合しか呼ばれない。
 // ────────────────────────────────────────────────────────────
 
-describe('resolvePolicy — API 通信失敗時', () => {
-  it('apiFailed + localRisk LOW → continue_safe_work_only', () => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), undefined, new Error('ECONNREFUSED'))
-    expect(result.policy).toBe('continue_safe_work_only')
-    expect(result.apiAvailable).toBe(false)
+describe('resolvePolicy — 有効なレスポンス必須', () => {
+  it('checkResponse が無い場合はポリシーを返さず例外にする（JS からの誤用を安全側へ倒す）', () => {
+    // 型の上では到達しないため、実行時ガードの確認として cast して呼ぶ
+    const callWithoutResponse = () =>
+      (resolvePolicy as unknown as (l: GateResult, c?: GateCheckResponse) => ResolvePolicyResult)(
+        makeGateResult({ finalRiskLevel: 'LOW' }),
+        undefined,
+      )
+
+    expect(callWithoutResponse).toThrow(/checkResponse is required/)
   })
 
-  it('apiFailed + localRisk MEDIUM → continue_safe_work_only', () => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'MEDIUM', gateDecision: 'ALLOW' }), undefined, new Error('timeout'))
-    expect(result.policy).toBe('continue_safe_work_only')
-    expect(result.apiAvailable).toBe(false)
+  it('CRITICAL ローカルリスクでも、レスポンス無しを block_until_approved へ縮退させない', () => {
+    const callWithoutResponse = () =>
+      (resolvePolicy as unknown as (l: GateResult, c?: GateCheckResponse) => ResolvePolicyResult)(
+        makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
+        undefined,
+      )
+
+    // 承認待ちではなく例外（＝呼び出し元が技術障害として failed にする）
+    expect(callWithoutResponse).toThrow(/technical failures/)
   })
 
-  it('apiFailed + localRisk HIGH → continue_safe_work_only', () => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH', gateDecision: 'DEEP_REVIEW' }), undefined, new Error('timeout'))
-    expect(result.policy).toBe('continue_safe_work_only')
-    expect(result.apiAvailable).toBe(false)
-  })
-
-  it('apiFailed + localRisk CRITICAL → block_until_approved', () => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }), undefined, new Error('timeout'))
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.apiAvailable).toBe(false)
-  })
-
-  it('checkResponse が undefined でも apiError なしなら fail closed', () => {
-    // checkResponse=undefined, apiError=undefined → API 未接続扱い
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }))
-    expect(result.policy).toBe('continue_safe_work_only')
-    expect(result.apiAvailable).toBe(false)
+  it('有効なレスポンスがあるときは apiAvailable=true になる', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), makeCheckResponse())
+    expect(result.apiAvailable).toBe(true)
   })
 })
 

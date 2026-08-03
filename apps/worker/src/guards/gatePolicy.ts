@@ -1,13 +1,23 @@
 /**
  * Gate Policy
  *
+ * ⚠️ CONTROL REPOSITORY — AI編集禁止
+ *
  * ローカルの processGate() 結果と /api/gate/check のレスポンスを統合し、
  * 最終的な実行ポリシーを決定する純粋関数。
  *
  * 基本方針:
  *   - ローカルリスクが高い場合は API の判断より安全側へ escalate する
- *   - Gate API が落ちている場合も fail closed（安全側）で処理する
- *   - LOW/MEDIUM でも Gate API 不通時は safe work only に落とす
+ *   - **有効な Gate レスポンスがあるときだけ呼ぶ**
+ *
+ * 【技術障害の扱い（2026-08-01 変更）】
+ * 以前はここで `apiError` を受け取り、API 不通を `continue_safe_work_only`
+ * （CRITICAL のみ `block_until_approved`）へ縮退させていた。しかしこれは
+ *   - 認証失敗・API 停止でも safe work を継続してしまう
+ *   - 技術障害を「CEO 承認待ち」として通知してしまう
+ * という問題があった。現在、Gate API の技術障害は呼び出し元（jobRunner）が
+ * Job を failed で停止させ、この関数へは到達しない。
+ * よってこの関数は **成功した Gate レスポンスの解釈だけ**を責務とする。
  */
 
 import type { GateResult } from './gateProcessor.js'
@@ -27,7 +37,11 @@ export type EffectivePolicy =
 export interface ResolvePolicyResult {
   policy: EffectivePolicy
   reason: string
-  /** Gate API に接続できたか。false の場合はローカルリスクのみで判断している */
+  /**
+   * Gate API の有効なレスポンスに基づく判断か。
+   * この関数は成功レスポンスがある場合しか呼ばれないため常に true になる
+   * （API 不通時にローカルリスクだけで縮退判断する経路は 2026-08-01 に撤去した）。
+   */
   apiAvailable: boolean
 }
 
@@ -56,25 +70,21 @@ export const SAFE_WORK_ALLOWED_COMMAND_KINDS: readonly CommandKind[] = [
  * ローカル GateResult と API GateCheckResponse を統合し最終ポリシーを返す。
  *
  * @param localResult  processGate() の結果（必須）
- * @param checkResponse  /api/gate/check のレスポンス（API 通信成功時）
- * @param apiError  API 通信失敗時のエラー（checkResponse が undefined の場合）
+ * @param checkResponse  /api/gate/check の**成功**レスポンス（必須）。
+ *   API 通信失敗・認証失敗・不正レスポンスの場合は呼び出さず、
+ *   呼び出し元が技術障害として Job を failed にすること。
  */
 export function resolvePolicy(
   localResult: GateResult,
-  checkResponse?: GateCheckResponse,
-  apiError?: unknown,
+  checkResponse: GateCheckResponse,
 ): ResolvePolicyResult {
-  // ── API 通信失敗時: fail closed ──
-  if (apiError !== undefined || checkResponse === undefined) {
-    const reason = apiError instanceof Error
-      ? `Gate API unavailable: ${apiError.message}`
-      : 'Gate API unavailable'
-
-    if (localResult.finalRiskLevel === 'CRITICAL') {
-      return { policy: 'block_until_approved', reason, apiAvailable: false }
-    }
-    // LOW / MEDIUM / HIGH: safe work only に落とす（完全 continue にしない）
-    return { policy: 'continue_safe_work_only', reason, apiAvailable: false }
+  // 有効なレスポンスなしでポリシーを決めない。
+  // 型の上では到達しないが、JS からの誤用でも安全側（例外）へ倒す。
+  if (checkResponse === undefined || checkResponse === null) {
+    throw new Error(
+      'resolvePolicy: checkResponse is required. ' +
+      'Gate API failures must be handled as technical failures by the caller, not degraded into a policy.',
+    )
   }
 
   // ── STALE / re_check ──

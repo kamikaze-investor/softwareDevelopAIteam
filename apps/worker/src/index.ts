@@ -16,11 +16,11 @@ import type { Job, Project, Task } from '@ai-team/shared'
 import { assertTransition, recoverStaleJobs } from './jobStateManager.js'
 import { runJob } from './jobRunner.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
+import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
-const API_TOKEN = process.env.API_TOKEN
 
 console.log('Worker starting...')
 console.log(`API: ${API_BASE}, poll interval: ${POLL_INTERVAL_MS}ms`)
@@ -71,7 +71,7 @@ async function updateJob(jobId: string, data: JobUpdate): Promise<void> {
   const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}`, {
     method: 'PATCH',
     headers: {
-      ...authHeaders(),
+      ...buildApiAuthHeaders(),
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(data),
@@ -84,7 +84,7 @@ async function updateJob(jobId: string, data: JobUpdate): Promise<void> {
 
 async function fetchJson<T>(path: string): Promise<T | null> {
   const res = await fetch(`${API_BASE}${path}`, {
-    headers: authHeaders(),
+    headers: buildApiAuthHeaders(),
   })
 
   if (!res.ok) return null
@@ -157,10 +157,6 @@ async function pollJobs(): Promise<never> {
   }
 }
 
-function authHeaders(): Record<string, string> {
-  return API_TOKEN ? { authorization: `Bearer ${API_TOKEN}` } : {}
-}
-
 function readPollInterval(): number {
   const parsed = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 5000
@@ -177,9 +173,11 @@ function formatUnknownError(err: unknown): string {
 }
 
 function resolveResultStatus(result: Awaited<ReturnType<typeof runJob>>): Job['status'] {
-  // 変更検出・ポリシー構築の技術的失敗は blocked（承認・手動resume待ち）へ変換しない。
+  // 技術的失敗は blocked（承認・手動resume待ち）へ変換しない。
   // blocked は resumeBlockedTask() の入口であり、人手の再開待ちを意味するため。
-  if (result.detectionFailure) {
+  // - detectionFailure: 変更検出・ポリシー構築の失敗
+  // - technicalFailure: Permission API / Gate API の疎通不可・認証失敗・不正レスポンス
+  if (result.detectionFailure || result.technicalFailure) {
     return 'failed'
   }
 
@@ -192,7 +190,7 @@ function resolveResultStatus(result: Awaited<ReturnType<typeof runJob>>): Job['s
 
 async function recoverJobsAtStartup(): Promise<void> {
   try {
-    const recovered = await recoverStaleJobs(API_BASE, authHeaders())
+    const recovered = await recoverStaleJobs(API_BASE, buildApiAuthHeaders())
     if (recovered > 0) {
       console.log(`[Worker] ${recovered} 件の stale Job を復旧しました`)
     }
@@ -204,7 +202,7 @@ async function recoverJobsAtStartup(): Promise<void> {
 async function start(): Promise<void> {
   await recoverJobsAtStartup()
   // ウォッチドッグを pollJobs と並行して起動
-  void startWatchdog(API_BASE, authHeaders())
+  void startWatchdog(API_BASE, buildApiAuthHeaders())
   await pollJobs()
 }
 
