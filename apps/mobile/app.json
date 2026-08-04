@@ -9,6 +9,9 @@
     },
     "ios": {
       "bundleIdentifier": "com.nakagawa.aidevteam"
-    }
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
   }
 }

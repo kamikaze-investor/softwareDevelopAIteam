@@ -17,13 +17,7 @@ import {
   View,
 } from 'react-native'
 
-declare const process: {
-  env: {
-    EXPO_PUBLIC_API_URL?: string
-  }
-}
-
-const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000'
+import { apiFetch } from '../lib/api'
 
 const TASK_STATUS_BADGE_FALLBACK = {
   backgroundColor: '#73737322',
@@ -71,7 +65,7 @@ const JOB_STATUS_TEXT_STYLE: Record<JobStatus, { color: string }> = {
 }
 
 async function fetchTaskSummaries(): Promise<TaskSummary[]> {
-  const response = await fetch(`${API_BASE}/api/tasks/summary`)
+  const response = await apiFetch('/api/tasks/summary')
 
   if (!response.ok) {
     throw new Error(`Failed to fetch task summaries: ${response.status}`)

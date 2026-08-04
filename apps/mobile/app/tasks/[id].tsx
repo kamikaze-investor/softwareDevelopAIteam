@@ -25,13 +25,7 @@ import {
   View,
 } from 'react-native'
 
-declare const process: {
-  env: {
-    EXPO_PUBLIC_API_URL?: string
-  }
-}
-
-const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000'
+import { apiFetch } from '../../lib/api'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
 const RESUME_HELP_TEXT =
@@ -162,8 +156,8 @@ interface TaskDetailData {
 }
 
 async function fetchTask(taskId: string): Promise<Task | null> {
-  const response = await fetch(
-    `${API_BASE}/api/tasks/${encodeURIComponent(taskId)}`,
+  const response = await apiFetch(
+    `/api/tasks/${encodeURIComponent(taskId)}`,
   )
 
   if (response.status === 404) {
@@ -178,8 +172,8 @@ async function fetchTask(taskId: string): Promise<Task | null> {
 }
 
 async function fetchJobs(taskId: string): Promise<Job[]> {
-  const response = await fetch(
-    `${API_BASE}/api/jobs?taskId=${encodeURIComponent(taskId)}`,
+  const response = await apiFetch(
+    `/api/jobs?taskId=${encodeURIComponent(taskId)}`,
   )
 
   if (!response.ok) {
@@ -192,8 +186,8 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
 async function fetchApprovalRequests(
   taskId: string,
 ): Promise<ApprovalRequest[]> {
-  const response = await fetch(
-    `${API_BASE}/api/approval-requests?taskId=${encodeURIComponent(taskId)}`,
+  const response = await apiFetch(
+    `/api/approval-requests?taskId=${encodeURIComponent(taskId)}`,
   )
 
   if (!response.ok) {
@@ -283,6 +277,93 @@ function sortApprovalRequestsByNewestFirst(
   )
 }
 
+// ────────────────────────────────────────────────────────────
+// Job作成（実装 / 独立レビュー / 反映）
+//
+// workingDir はMobileから送信しない。API側（POST /api/jobs）が
+// MVP-Aの正規workingDir（/workspace/target固定）をサーバー側で設定する。
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 独立レビューAIへ渡す固定プロンプト。
+ * 対象は現在の未コミット差分のみ・コード変更禁止・出力は3000文字以内の
+ * 固定フォーマットとする（MVP-Aポリシー）。
+ */
+const REVIEW_PROMPT = `あなたは独立したコードレビューAIです。
+
+対象: 現在のworking treeにある未コミットの差分だけを確認してください。それ以外のファイルは見ないでください。
+禁止: コードを変更しないでください。レビューのみを行ってください。
+
+出力は次の形式で、3000文字以内にまとめてください:
+【結論】(approve / changes_requested / reject のいずれか一つ)
+【重大な問題】(無ければ「なし」)
+【推奨対応】`
+
+function isImplementJob(job: Job): boolean {
+  return job.aiCliMode === 'implement'
+}
+
+function isReviewJob(job: Job): boolean {
+  return job.aiCliMode === 'review'
+}
+
+function isJobBusy(jobs: Job[]): boolean {
+  const latestJob = sortJobsByNewestFirst(jobs)[0]
+  return latestJob?.status === 'queued' || latestJob?.status === 'running'
+}
+
+/** 実装Jobが少なくとも1件成功しているか（独立レビューJobを起票できるか） */
+function canRunReview(jobs: Job[]): boolean {
+  const latestImplement = sortJobsByNewestFirst(jobs).find(isImplementJob)
+  return latestImplement?.status === 'success'
+}
+
+/**
+ * 「変更を反映」を有効にする条件:
+ *   最新の実装/レビュー関連Jobの中で最も新しいものが成功したレビューJobであり、
+ *   かつそれより前に成功した実装Jobが存在すること
+ *   （＝最新実装Jobがsuccess → その後の最新Review Jobがsuccess →
+ *     Review後に新しい実装Jobが存在しない、と同値）。
+ */
+function canReflectChanges(jobs: Job[]): boolean {
+  const relevant = sortJobsByNewestFirst(jobs).filter(
+    (job) => isImplementJob(job) || isReviewJob(job),
+  )
+  const [newest] = relevant
+  if (newest === undefined || !isReviewJob(newest) || newest.status !== 'success') {
+    return false
+  }
+  const priorImplement = relevant.slice(1).find(isImplementJob)
+  return priorImplement?.status === 'success'
+}
+
+interface CreateJobResult {
+  ok: boolean
+  message?: string
+}
+
+async function createTaskJob(
+  taskId: string,
+  projectId: string,
+  body: Record<string, unknown>,
+): Promise<CreateJobResult> {
+  try {
+    const response = await apiFetch('/api/jobs', {
+      body: JSON.stringify({ projectId, taskId, ...body }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    })
+
+    if (response.status === 201) {
+      return { ok: true }
+    }
+
+    return { ok: false, message: `作成に失敗しました（HTTP ${response.status}）` }
+  } catch {
+    return { ok: false, message: 'APIに接続できませんでした' }
+  }
+}
+
 function canShowResumeUI(
   jobs: Job[],
   approvalRequests: ApprovalRequest[],
@@ -333,8 +414,8 @@ async function postResumeInstruction(
   instruction: string,
 ): Promise<{ message: string; ok: false } | { ok: true }> {
   try {
-    const response = await fetch(
-      `${API_BASE}/api/tasks/${encodeURIComponent(taskId)}/resume`,
+    const response = await apiFetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/resume`,
       {
         body: JSON.stringify({ instruction }),
         headers: { 'Content-Type': 'application/json' },
@@ -459,6 +540,127 @@ function ResumeInstructionSection({
   )
 }
 
+type JobActionKind = 'implement' | 'review' | 'reflect'
+
+function latestAiCliProvider(jobs: Job[]): Job['aiCliProvider'] {
+  return sortJobsByNewestFirst(jobs).find(isImplementJob)?.aiCliProvider
+}
+
+function JobActionsSection({
+  jobs,
+  onCreated,
+  task,
+}: {
+  jobs: Job[]
+  onCreated: () => void
+  task: Task
+}): ReactElement {
+  const [runningAction, setRunningAction] = useState<JobActionKind | null>(null)
+
+  const busy = isJobBusy(jobs)
+  const reviewEnabled = !busy && canRunReview(jobs)
+  const reflectEnabled = !busy && canReflectChanges(jobs)
+
+  const runAction = useCallback(
+    async (kind: JobActionKind, body: Record<string, unknown>): Promise<void> => {
+      setRunningAction(kind)
+      try {
+        const result = await createTaskJob(task.id, task.projectId, body)
+        if (!result.ok) {
+          Alert.alert('作成失敗', result.message ?? '作業を開始できませんでした')
+          return
+        }
+        onCreated()
+      } finally {
+        setRunningAction(null)
+      }
+    },
+    [task.id, task.projectId, onCreated],
+  )
+
+  const handleImplement = useCallback((): void => {
+    void runAction('implement', {
+      agentRole: 'developer_ai',
+      aiCliMode: 'implement',
+      aiCliPrompt: task.description,
+      aiCliProvider: 'claude_code',
+      safeCommand: { kind: 'test' },
+    })
+  }, [runAction, task.description])
+
+  const handleReview = useCallback((): void => {
+    void runAction('review', {
+      agentRole: 'qa_ai',
+      aiCliMode: 'review',
+      aiCliPrompt: REVIEW_PROMPT,
+      aiCliProvider: latestAiCliProvider(jobs) ?? 'claude_code',
+      safeCommand: { kind: 'git_status' },
+    })
+  }, [runAction, jobs])
+
+  const handleReflect = useCallback((): void => {
+    Alert.alert('変更を反映', 'レビュー済みの変更を反映しますか？CEO承認が必要な場合は承認待ちになります。', [
+      { style: 'cancel', text: 'キャンセル' },
+      {
+        onPress: () => {
+          void runAction('reflect', {
+            agentRole: 'developer_ai',
+            safeCommand: {
+              kind: 'git_commit',
+              params: { commitMessage: task.title },
+            },
+          })
+        },
+        text: '反映する',
+      },
+    ])
+  }, [runAction, task.title])
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>作業</Text>
+
+      <TouchableOpacity
+        disabled={busy}
+        onPress={handleImplement}
+        style={[styles.actionButton, styles.actionButtonImplement, busy && styles.actionButtonDisabled]}
+      >
+        {runningAction === 'implement' && <ActivityIndicator color="#fff" size="small" />}
+        <Text style={styles.actionButtonText}>実装を開始</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        disabled={!reviewEnabled}
+        onPress={handleReview}
+        style={[
+          styles.actionButton,
+          styles.actionButtonReview,
+          !reviewEnabled && styles.actionButtonDisabled,
+        ]}
+      >
+        {runningAction === 'review' && <ActivityIndicator color="#fff" size="small" />}
+        <Text style={styles.actionButtonText}>独立レビューを実行</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        disabled={!reflectEnabled}
+        onPress={handleReflect}
+        style={[
+          styles.actionButton,
+          styles.actionButtonReflect,
+          !reflectEnabled && styles.actionButtonDisabled,
+        ]}
+      >
+        {runningAction === 'reflect' && <ActivityIndicator color="#fff" size="small" />}
+        <Text style={styles.actionButtonText}>変更を反映</Text>
+      </TouchableOpacity>
+      {!reflectEnabled && !busy && (
+        <Text style={styles.actionHelpText}>独立レビュー完了後に反映できます</Text>
+      )}
+    </View>
+  )
+}
+
 function JobHistorySection({ jobs }: { jobs: Job[] }): ReactElement {
   const sortedJobs = useMemo(() => sortJobsByNewestFirst(jobs), [jobs])
 
@@ -494,6 +696,28 @@ function JobHistorySection({ jobs }: { jobs: Job[] }): ReactElement {
           </Text>
           {job.exitCode !== undefined && (
             <Text style={styles.metaText}>exitCode: {job.exitCode}</Text>
+          )}
+          {job.changedFiles !== undefined && job.changedFiles.length > 0 && (
+            <>
+              <Text style={styles.detailLabel}>変更ファイル</Text>
+              <Text style={styles.fileListText}>
+                {formatChangedFilesDetail(job.changedFiles)}
+              </Text>
+            </>
+          )}
+          {job.stdout !== undefined && job.stdout.length > 0 && (
+            <>
+              <Text style={styles.detailLabel}>出力</Text>
+              <Text style={styles.outputText}>{job.stdout}</Text>
+            </>
+          )}
+          {job.stderr !== undefined && job.stderr.length > 0 && (
+            <>
+              <Text style={styles.detailLabel}>エラー出力</Text>
+              <Text style={[styles.outputText, styles.outputTextError]}>
+                {job.stderr}
+              </Text>
+            </>
           )}
         </View>
       ))}
@@ -754,6 +978,11 @@ export default function TaskDetailScreen(): ReactElement {
       {data !== null && (
         <>
           <TaskInfoSection task={data.task} />
+          <JobActionsSection
+            jobs={data.jobs}
+            onCreated={() => void loadTaskDetail()}
+            task={data.task}
+          />
           <ResumeInstructionSection
             approvalRequests={data.approvalRequests}
             instruction={resumeInstruction}
@@ -784,6 +1013,39 @@ const styles = StyleSheet.create({
   backText: {
     color: '#3b82f6',
     fontSize: 15,
+  },
+  actionButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    flexDirection: 'row',
+    gap: 8,
+    justifyContent: 'center',
+    marginBottom: 10,
+    padding: 12,
+  },
+  actionButtonImplement: {
+    backgroundColor: '#2563eb',
+  },
+  actionButtonReview: {
+    backgroundColor: '#7c3aed',
+  },
+  actionButtonReflect: {
+    backgroundColor: '#16a34a',
+  },
+  actionButtonDisabled: {
+    backgroundColor: '#262626',
+    opacity: 0.6,
+  },
+  actionButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  actionHelpText: {
+    color: '#737373',
+    fontSize: 12,
+    marginTop: -4,
+    textAlign: 'center',
   },
   bodyText: {
     color: '#d4d4d4',
@@ -870,6 +1132,22 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     marginBottom: 4,
+  },
+  outputText: {
+    backgroundColor: '#0f0f0f',
+    borderColor: '#2a2a2a',
+    borderRadius: 6,
+    borderWidth: 1,
+    color: '#d4d4d4',
+    fontFamily: 'monospace',
+    fontSize: 12,
+    lineHeight: 17,
+    marginBottom: 4,
+    padding: 10,
+  },
+  outputTextError: {
+    borderColor: '#ef444444',
+    color: '#fca5a5',
   },
   resumeBox: {
     backgroundColor: '#141414',

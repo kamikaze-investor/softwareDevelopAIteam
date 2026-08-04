@@ -16,21 +16,17 @@ import { router } from 'expo-router'
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native'
 
-declare const process: {
-  env: {
-    EXPO_PUBLIC_API_URL?: string
-  }
-}
-
-const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000'
+import { apiFetch } from '../lib/api'
 
 type ApprovalWithProject = Approval & { projectName: string }
 type DecisionStatus = 'approved' | 'rejected'
@@ -38,6 +34,10 @@ type ApprovalGateDecisionStatus = Extract<
   ApprovalGateStatus,
   'APPROVED' | 'REJECTED'
 >
+
+type RejectTarget =
+  | { type: 'policy'; item: ApprovalWithProject }
+  | { type: 'gate'; item: ApprovalRequest }
 
 const TYPE_LABEL: Record<ApprovalType, string> = {
   billing: '課金',
@@ -68,7 +68,7 @@ const RISK_TEXT_STYLE: Record<RiskLevel, { color: string }> = {
 
 /** 全Project横断でpending状態の方針承認だけを1回のfetchで取得する（Project数分fetchしない） */
 async function fetchPendingApprovals(): Promise<ApprovalWithProject[]> {
-  const response = await fetch(`${API_BASE}/api/approvals/pending`)
+  const response = await apiFetch('/api/approvals/pending')
 
   if (!response.ok) {
     throw new Error(`Failed to fetch pending approvals: ${response.status}`)
@@ -78,7 +78,7 @@ async function fetchPendingApprovals(): Promise<ApprovalWithProject[]> {
 }
 
 async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
-  const response = await fetch(`${API_BASE}/api/approval-requests/waiting`)
+  const response = await apiFetch('/api/approval-requests/waiting')
 
   if (!response.ok) {
     throw new Error(`Failed to fetch approval requests: ${response.status}`)
@@ -90,7 +90,7 @@ async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
 /** タップして詳細を開いた時だけ呼ぶ。404/失敗時はnullを返し、UI側で目的説明を省略する */
 async function fetchTaskInfo(taskId: string): Promise<Task | null> {
   try {
-    const response = await fetch(`${API_BASE}/api/tasks/${taskId}`)
+    const response = await apiFetch(`/api/tasks/${taskId}`)
     if (!response.ok) {
       return null
     }
@@ -199,6 +199,62 @@ function formatChangedFilesDetail(changedFiles: string[]): string {
 const NO_DETAIL_INFO_WARNING =
   'この古い承認リクエストには、変更ファイルや危険理由の詳細情報が保存されていません。内容が分からない場合は承認しないでください。'
 
+function RejectReasonModal({
+  onCancel,
+  onConfirm,
+  visible,
+}: {
+  onCancel: () => void
+  onConfirm: (reason: string) => void
+  visible: boolean
+}): ReactElement {
+  const [reason, setReason] = useState('')
+
+  useEffect(() => {
+    if (visible) {
+      setReason('')
+    }
+  }, [visible])
+
+  const trimmedReason = reason.trim()
+  const canConfirm = trimmedReason.length > 0
+
+  return (
+    <Modal animationType="fade" onRequestClose={onCancel} transparent visible={visible}>
+      <View style={styles.modalOverlay}>
+        <View style={styles.modalBox}>
+          <Text style={styles.modalTitle}>却下理由</Text>
+          <TextInput
+            maxLength={500}
+            multiline
+            onChangeText={setReason}
+            placeholder="却下理由を入力してください"
+            placeholderTextColor="#555"
+            style={styles.modalInput}
+            textAlignVertical="top"
+            value={reason}
+          />
+          <View style={styles.modalActions}>
+            <TouchableOpacity onPress={onCancel} style={styles.modalCancelButton}>
+              <Text style={styles.modalCancelButtonText}>キャンセル</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              disabled={!canConfirm}
+              onPress={() => onConfirm(trimmedReason)}
+              style={[
+                styles.modalConfirmButton,
+                !canConfirm && styles.modalConfirmButtonDisabled,
+              ]}
+            >
+              <Text style={styles.modalConfirmButtonText}>却下する</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
 export default function ApprovalsScreen(): ReactElement {
   const [approvals, setApprovals] = useState<ApprovalWithProject[]>([])
   const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>([])
@@ -210,6 +266,7 @@ export default function ApprovalsScreen(): ReactElement {
   >({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [rejectTarget, setRejectTarget] = useState<RejectTarget | null>(null)
 
   const loadApprovalRequests = useCallback(async (): Promise<void> => {
     try {
@@ -251,7 +308,7 @@ export default function ApprovalsScreen(): ReactElement {
     note?: string,
   ): Promise<void> {
     try {
-      const response = await fetch(`${API_BASE}/api/approvals/${approvalId}`, {
+      const response = await apiFetch(`/api/approvals/${approvalId}`, {
         body: JSON.stringify({ reviewNote: note, status }),
         headers: { 'Content-Type': 'application/json' },
         method: 'PATCH',
@@ -270,12 +327,13 @@ export default function ApprovalsScreen(): ReactElement {
   async function handleApprovalGateDecision(
     requestId: string,
     status: ApprovalGateDecisionStatus,
+    reason?: string,
   ): Promise<void> {
     try {
-      const response = await fetch(
-        `${API_BASE}/api/approval-requests/${requestId}/status`,
+      const response = await apiFetch(
+        `/api/approval-requests/${requestId}/status`,
         {
-          body: JSON.stringify({ status }),
+          body: JSON.stringify({ reason, status }),
           headers: { 'Content-Type': 'application/json' },
           method: 'PATCH',
         },
@@ -313,16 +371,7 @@ export default function ApprovalsScreen(): ReactElement {
   }
 
   function confirmReject(item: ApprovalWithProject): void {
-    Alert.alert('却下', `「${item.title}」を却下しますか？`, [
-      { style: 'cancel', text: 'キャンセル' },
-      {
-        onPress: () => {
-          void handleDecision(item.id, 'rejected')
-        },
-        style: 'destructive',
-        text: '却下',
-      },
-    ])
+    setRejectTarget({ item, type: 'policy' })
   }
 
   function toggleApprovalRequestDetail(item: ApprovalRequest): void {
@@ -354,20 +403,21 @@ export default function ApprovalsScreen(): ReactElement {
   }
 
   function confirmRejectApprovalRequest(item: ApprovalRequest): void {
-    Alert.alert(
-      '危険操作の却下',
-      `Task ${item.taskId} の「${item.requestedAction}」を却下しますか？`,
-      [
-        { style: 'cancel', text: 'キャンセル' },
-        {
-          onPress: () => {
-            void handleApprovalGateDecision(item.id, 'REJECTED')
-          },
-          style: 'destructive',
-          text: '却下',
-        },
-      ],
-    )
+    setRejectTarget({ item, type: 'gate' })
+  }
+
+  function handleConfirmReject(reason: string): void {
+    const target = rejectTarget
+    if (target === null) {
+      return
+    }
+    setRejectTarget(null)
+
+    if (target.type === 'policy') {
+      void handleDecision(target.item.id, 'rejected', reason)
+    } else {
+      void handleApprovalGateDecision(target.item.id, 'REJECTED', reason)
+    }
   }
 
   if (loading) {
@@ -379,6 +429,7 @@ export default function ApprovalsScreen(): ReactElement {
   }
 
   return (
+    <>
     <ScrollView
       refreshControl={
         <RefreshControl refreshing={refreshing} onRefresh={refresh} />
@@ -582,6 +633,12 @@ export default function ApprovalsScreen(): ReactElement {
 
       <View style={styles.bottomSpacer} />
     </ScrollView>
+    <RejectReasonModal
+      onCancel={() => setRejectTarget(null)}
+      onConfirm={handleConfirmReject}
+      visible={rejectTarget !== null}
+    />
+    </>
   )
 }
 
@@ -589,6 +646,71 @@ const styles = StyleSheet.create({
   actions: {
     flexDirection: 'row',
     gap: 10,
+  },
+  modalOverlay: {
+    alignItems: 'center',
+    backgroundColor: '#000000aa',
+    flex: 1,
+    justifyContent: 'center',
+    padding: 24,
+  },
+  modalBox: {
+    backgroundColor: '#141414',
+    borderColor: '#2a2a2a',
+    borderRadius: 12,
+    borderWidth: 1,
+    padding: 16,
+    width: '100%',
+  },
+  modalTitle: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 10,
+  },
+  modalInput: {
+    backgroundColor: '#0f0f0f',
+    borderColor: '#333',
+    borderRadius: 8,
+    borderWidth: 1,
+    color: '#fff',
+    fontSize: 14,
+    minHeight: 90,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'flex-end',
+    marginTop: 14,
+  },
+  modalCancelButton: {
+    alignItems: 'center',
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  modalCancelButtonText: {
+    color: '#a3a3a3',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modalConfirmButton: {
+    alignItems: 'center',
+    backgroundColor: '#ef4444',
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  modalConfirmButtonDisabled: {
+    backgroundColor: '#262626',
+    opacity: 0.6,
+  },
+  modalConfirmButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
   },
   approveButton: {
     alignItems: 'center',

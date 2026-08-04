@@ -83,7 +83,7 @@ async function createJob(
       taskId: task.id,
       projectId: task.projectId,
       agentRole: 'developer_ai',
-      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      safeCommand: { kind: 'git_status' },
       ...body,
     },
   })
@@ -128,7 +128,7 @@ describe('Job API', () => {
           taskId: task.id,
           projectId: project.id,
           agentRole: 'developer_ai',
-          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+          safeCommand: { kind: 'git_status' },
           dryRun: true,
         },
       })
@@ -139,7 +139,29 @@ describe('Job API', () => {
       expect(body.taskId).toBe(task.id)
       expect(body.status).toBe('queued')
       expect(body.safeCommand.kind).toBe('git_status')
+      // workingDir はクライアントから受け取らず、サーバー側の正規workingDirが設定される
+      expect(body.safeCommand.workingDir).toBe('/workspace/target')
       expect(body.dryRun).toBe(true)
+    })
+  })
+
+  it('POST /api/jobs rejects a client-supplied workingDir with 400', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: project.id,
+          agentRole: 'developer_ai',
+          safeCommand: { kind: 'git_status', workingDir: '/some/other/path' },
+        },
+      })
+
+      expect(res.statusCode).toBe(400)
     })
   })
 

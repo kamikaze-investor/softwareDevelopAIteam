@@ -1,7 +1,8 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import type { Job, SafeCommand } from '@ai-team/shared'
+import type { Job } from '@ai-team/shared'
 import { getStorage } from '../storage'
+import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 
 const AgentRoleSchema = z.enum([
   'cto_ai',
@@ -36,11 +37,17 @@ const SafeCommandParamsSchema = z.object({
   agentPrefix: z.string().optional(),
 }).strict()
 
-const SafeCommandSchema: z.ZodType<SafeCommand> = z.object({
+/**
+ * クライアント入力用の SafeCommand schema。
+ *
+ * `workingDir` はクライアントから受け取らない（MVP-Aでは単一Repository固定のため
+ * サーバー側で `TARGET_WORKING_DIR` を設定する）。`.strict()` により、
+ * クライアントが `workingDir` を含めて送信した場合は不明なキーとして 400 で拒否する。
+ */
+const SafeCommandInputSchema = z.object({
   kind: CommandKindSchema,
   params: SafeCommandParamsSchema.optional(),
-  workingDir: z.string().min(1),
-})
+}).strict()
 
 const AiCliProviderSchema = z.enum(['claude_code', 'codex', 'gemini'])
 const AiCliModeSchema = z.enum(['implement', 'review', 'qa', 'summarize'])
@@ -49,7 +56,7 @@ const CreateJobBody = z.object({
   taskId: z.string().min(1),
   projectId: z.string().min(1),
   agentRole: AgentRoleSchema,
-  safeCommand: SafeCommandSchema,
+  safeCommand: SafeCommandInputSchema,
   dryRun: z.boolean().optional(),
   aiCliProvider: AiCliProviderSchema.optional(),
   aiCliPrompt: z.string().max(50_000).optional(),
@@ -132,6 +139,8 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
 
     const jobInput: Omit<Job, 'id' | 'createdAt'> = {
       ...result.data,
+      // workingDir はクライアントから受け取らない。MVP-Aの正規workingDirをここで設定する。
+      safeCommand: { ...result.data.safeCommand, workingDir: TARGET_WORKING_DIR },
       status: 'queued',
     }
     const job = storage.jobs.create(jobInput)

@@ -4,32 +4,37 @@
  * 30 Second Rule: show the project's current state within 30 seconds.
  */
 
+import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
-import type { Approval, Job, Project, Task } from '@ai-team/shared'
+import type { Approval, Job, Project, ProjectStatus, Task } from '@ai-team/shared'
 import { router } from 'expo-router'
 import {
   ActivityIndicator,
+  Alert,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native'
+import { apiFetch, clearApiToken, getApiToken, setApiToken } from '../lib/api'
 
-declare const process: {
-  env: {
-    EXPO_PUBLIC_API_URL?: string
-  }
-}
-
-const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000'
 const MAX_TASKS_FOR_RECENT_JOBS = 3
 const MAX_JOBS_PER_TASK = 2
 const MAX_RECENT_JOBS = 5
 
+/**
+ * API上でrunningへの遷移が許可されているProject status。
+ * `archived`からの再開はMVP-Aの対象操作ではないため、`draft`/`paused`のみを許可する
+ * （APIの`PATCH /api/projects/:id`自体はfrom-statusを制限しないが、UI側で意味のある
+ * 遷移だけに絞る）。
+ */
+const STARTABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['draft', 'paused']
+
 async function fetchProjects(): Promise<Project[]> {
-  const response = await fetch(`${API_BASE}/api/projects`)
+  const response = await apiFetch('/api/projects')
 
   if (!response.ok) {
     throw new Error(`Failed to fetch projects: ${response.status}`)
@@ -39,8 +44,8 @@ async function fetchProjects(): Promise<Project[]> {
 }
 
 async function fetchTasks(projectId: string): Promise<Task[]> {
-  const response = await fetch(
-    `${API_BASE}/api/tasks?projectId=${encodeURIComponent(projectId)}`,
+  const response = await apiFetch(
+    `/api/tasks?projectId=${encodeURIComponent(projectId)}`,
   )
 
   if (!response.ok) {
@@ -51,8 +56,8 @@ async function fetchTasks(projectId: string): Promise<Task[]> {
 }
 
 async function fetchJobs(taskId: string): Promise<Job[]> {
-  const response = await fetch(
-    `${API_BASE}/api/jobs?taskId=${encodeURIComponent(taskId)}`,
+  const response = await apiFetch(
+    `/api/jobs?taskId=${encodeURIComponent(taskId)}`,
   )
 
   if (!response.ok) {
@@ -63,8 +68,8 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
 }
 
 async function fetchApprovals(projectId: string): Promise<Approval[]> {
-  const response = await fetch(
-    `${API_BASE}/api/projects/${projectId}/approvals`,
+  const response = await apiFetch(
+    `/api/projects/${projectId}/approvals`,
   )
 
   if (!response.ok) {
@@ -72,6 +77,30 @@ async function fetchApprovals(projectId: string): Promise<Approval[]> {
   }
 
   return (await response.json()) as Approval[]
+}
+
+/** 409時は本体APIの固定エラー文だけを返す（token・内部情報は含めない） */
+async function startProject(projectId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  try {
+    const response = await apiFetch(`/api/projects/${projectId}`, {
+      body: JSON.stringify({ status: 'running' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'PATCH',
+    })
+
+    if (response.ok) {
+      return { ok: true }
+    }
+
+    if (response.status === 409) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string }
+      return { ok: false, message: body.error ?? 'このProjectを開始できませんでした' }
+    }
+
+    return { ok: false, message: `開始に失敗しました（HTTP ${response.status}）` }
+  } catch {
+    return { ok: false, message: 'APIに接続できませんでした' }
+  }
 }
 
 async function fetchRecentJobs(taskIds: string[]): Promise<Job[]> {
@@ -111,9 +140,16 @@ function getStatusColor(status: string): string {
   return STATUS_COLOR[status] ?? '#737373'
 }
 
-function ProjectCard({ project }: { project: Project }) {
+function ProjectCard({
+  project,
+  onStarted,
+}: {
+  project: Project
+  onStarted: () => void
+}) {
   const [tasks, setTasks] = useState<Task[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
+  const [starting, setStarting] = useState(false)
 
   useEffect(() => {
     let isMounted = true
@@ -144,6 +180,21 @@ function ProjectCard({ project }: { project: Project }) {
 
   const doneTasks = tasks.filter((task) => task.status === 'done').length
   const statusColor = getStatusColor(project.status)
+  const canStart = STARTABLE_PROJECT_STATUSES.includes(project.status)
+
+  const handleStart = useCallback(async (): Promise<void> => {
+    setStarting(true)
+    try {
+      const result = await startProject(project.id)
+      if (!result.ok) {
+        Alert.alert('開始できません', result.message)
+        return
+      }
+      onStarted()
+    } finally {
+      setStarting(false)
+    }
+  }, [project.id, onStarted])
 
   return (
     <View style={styles.card}>
@@ -163,6 +214,32 @@ function ProjectCard({ project }: { project: Project }) {
       <Text style={styles.progressText}>
         Tasks: {doneTasks}/{tasks.length} done
       </Text>
+
+      <View style={styles.cardActions}>
+        {canStart && (
+          <TouchableOpacity
+            accessibilityRole="button"
+            disabled={starting}
+            onPress={() => void handleStart()}
+            style={[styles.startButton, starting && styles.startButtonDisabled]}
+          >
+            {starting && <ActivityIndicator color="#fff" size="small" />}
+            <Text style={styles.startButtonText}>▶ このProjectを開始</Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity
+          accessibilityRole="button"
+          onPress={() =>
+            router.push({
+              params: { projectId: project.id },
+              pathname: '/tasks/create',
+            })
+          }
+          style={styles.addTaskButton}
+        >
+          <Text style={styles.addTaskButtonText}>＋ Taskを追加</Text>
+        </TouchableOpacity>
+      </View>
 
       {jobs.length > 0 && (
         <View style={styles.jobsSection}>
@@ -184,6 +261,105 @@ function ProjectCard({ project }: { project: Project }) {
               </View>
             )
           })}
+        </View>
+      )}
+    </View>
+  )
+}
+
+function ApiTokenSettings(): ReactElement {
+  const [isOpen, setIsOpen] = useState(false)
+  const [hasToken, setHasToken] = useState<boolean | null>(null)
+  const [input, setInput] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const refreshStatus = useCallback(async (): Promise<void> => {
+    const token = await getApiToken()
+    setHasToken(token !== null && token.length > 0)
+  }, [])
+
+  useEffect(() => {
+    void refreshStatus()
+  }, [refreshStatus])
+
+  const handleSave = useCallback(async (): Promise<void> => {
+    const trimmed = input.trim()
+    if (trimmed.length === 0) {
+      Alert.alert('入力エラー', 'APIトークンを入力してください')
+      return
+    }
+    setSaving(true)
+    try {
+      await setApiToken(trimmed)
+      setInput('')
+      setIsOpen(false)
+      await refreshStatus()
+      Alert.alert('保存しました', 'APIトークンを保存しました')
+    } finally {
+      setSaving(false)
+    }
+  }, [input, refreshStatus])
+
+  const handleDelete = useCallback((): void => {
+    Alert.alert('APIトークンを削除', '削除すると認証が必要なAPIに接続できなくなります。よろしいですか？', [
+      { style: 'cancel', text: 'キャンセル' },
+      {
+        onPress: () => {
+          void (async () => {
+            await clearApiToken()
+            await refreshStatus()
+          })()
+        },
+        style: 'destructive',
+        text: '削除',
+      },
+    ])
+  }, [refreshStatus])
+
+  return (
+    <View style={styles.tokenSection}>
+      <TouchableOpacity
+        accessibilityRole="button"
+        onPress={() => setIsOpen((prev) => !prev)}
+        style={styles.tokenToggle}
+      >
+        <Text style={styles.tokenToggleText}>
+          ⚙ 接続設定（APIトークン: {hasToken === null ? '確認中' : hasToken ? '設定済み' : '未設定'}）
+        </Text>
+      </TouchableOpacity>
+
+      {isOpen && (
+        <View style={styles.tokenBox}>
+          <TextInput
+            autoCapitalize="none"
+            autoCorrect={false}
+            editable={!saving}
+            onChangeText={setInput}
+            placeholder="新しいAPIトークンを入力"
+            placeholderTextColor="#555"
+            secureTextEntry
+            style={styles.tokenInput}
+            value={input}
+          />
+          <View style={styles.tokenActions}>
+            <TouchableOpacity
+              accessibilityRole="button"
+              disabled={saving}
+              onPress={() => void handleSave()}
+              style={styles.tokenSaveButton}
+            >
+              <Text style={styles.tokenSaveButtonText}>保存</Text>
+            </TouchableOpacity>
+            {hasToken === true && (
+              <TouchableOpacity
+                accessibilityRole="button"
+                onPress={handleDelete}
+                style={styles.tokenDeleteButton}
+              >
+                <Text style={styles.tokenDeleteButtonText}>削除</Text>
+              </TouchableOpacity>
+            )}
+          </View>
         </View>
       )}
     </View>
@@ -248,6 +424,8 @@ export default function Dashboard() {
         <Text style={styles.title}>AI Development Team OS</Text>
         <Text style={styles.subtitle}>CEO Dashboard</Text>
 
+        <ApiTokenSettings />
+
         <Text style={styles.projectCount}>Projects ({projects.length})</Text>
 
         {error !== null && (
@@ -261,7 +439,7 @@ export default function Dashboard() {
         )}
 
         {projects.map((project) => (
-          <ProjectCard key={project.id} project={project} />
+          <ProjectCard key={project.id} onStarted={load} project={project} />
         ))}
       </ScrollView>
 
@@ -366,6 +544,44 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     marginRight: 8,
+  },
+  cardActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  startButton: {
+    alignItems: 'center',
+    backgroundColor: '#22c55e',
+    borderRadius: 8,
+    flexDirection: 'row',
+    flexShrink: 0,
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  startButtonDisabled: {
+    opacity: 0.6,
+  },
+  startButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  addTaskButton: {
+    alignItems: 'center',
+    backgroundColor: '#1a1a1a',
+    borderColor: '#3b82f644',
+    borderRadius: 8,
+    borderWidth: 1,
+    flexShrink: 0,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  addTaskButtonText: {
+    color: '#60a5fa',
+    fontSize: 13,
+    fontWeight: '700',
   },
   center: {
     alignItems: 'center',
@@ -511,5 +727,62 @@ const styles = StyleSheet.create({
     fontSize: 22,
     fontWeight: '700',
     marginTop: 52,
+  },
+  tokenSection: {
+    marginTop: 14,
+  },
+  tokenToggle: {
+    paddingVertical: 6,
+  },
+  tokenToggleText: {
+    color: '#737373',
+    fontSize: 12,
+  },
+  tokenBox: {
+    backgroundColor: '#141414',
+    borderColor: '#2a2a2a',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 6,
+    padding: 12,
+  },
+  tokenInput: {
+    backgroundColor: '#0f0f0f',
+    borderColor: '#333',
+    borderRadius: 6,
+    borderWidth: 1,
+    color: '#fff',
+    fontSize: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  tokenActions: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  tokenSaveButton: {
+    alignItems: 'center',
+    backgroundColor: '#3b82f6',
+    borderRadius: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  tokenSaveButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  tokenDeleteButton: {
+    alignItems: 'center',
+    backgroundColor: '#2a1515',
+    borderRadius: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  tokenDeleteButtonText: {
+    color: '#ef4444',
+    fontSize: 13,
+    fontWeight: '700',
   },
 })

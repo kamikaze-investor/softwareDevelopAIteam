@@ -13,6 +13,7 @@ import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalSto
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
+import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -755,7 +756,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           projectId: latestJob.projectId,
           agentRole: latestJob.agentRole,
           status: 'queued',
-          safeCommand: latestJob.safeCommand,
+          // workingDir は元Jobの値をそのまま引き継がず、常に正規workingDirへ上書きする
+          // （MVP-Aは単一Repository固定。POST /api/jobsでのJob作成と同じ定義を再利用する）
+          safeCommand: { ...latestJob.safeCommand, workingDir: TARGET_WORKING_DIR },
           dryRun: latestJob.dryRun,
           aiCliProvider: latestJob.aiCliProvider,
           aiCliPrompt: instructionPrompt,
@@ -1537,7 +1540,7 @@ function deserializeJob(row: any): Job {
     status: row.status,
     safeCommand: row.safe_command
       ? JSON.parse(row.safe_command)
-      : { kind: 'git_status', workingDir: '/workspace/target' },
+      : { kind: 'git_status', workingDir: TARGET_WORKING_DIR },
     dryRun: row.dry_run === 1 ? true : undefined,
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,

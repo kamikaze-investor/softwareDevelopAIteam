@@ -1,7 +1,15 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ApprovalRequest, Job, Project, Task, TaskSummary } from '@ai-team/shared'
+import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskSummary } from '@ai-team/shared'
+
+/**
+ * POST /api/jobs のリクエストボディ用の型。
+ * `workingDir` はクライアントから送らない（サーバー側で正規workingDirを設定するため）。
+ */
+type CreateJobRequestBody = Partial<Omit<Job, 'safeCommand'>> & {
+  safeCommand?: { kind: SafeCommand['kind']; params?: SafeCommand['params'] }
+}
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { resetStorage }] = await Promise.all([
@@ -74,7 +82,7 @@ async function createTask(
 async function createJob(
   app: FastifyInstance,
   task: Task,
-  body: Partial<Job> = {},
+  body: CreateJobRequestBody = {},
 ): Promise<Job> {
   const res = await app.inject({
     method: 'POST',
@@ -83,7 +91,7 @@ async function createJob(
       taskId: task.id,
       projectId: task.projectId,
       agentRole: 'developer_ai',
-      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      safeCommand: { kind: 'git_status' },
       ...body,
     },
   })
@@ -110,7 +118,7 @@ async function updateJob(
 async function createBlockedAiCliJob(
   app: FastifyInstance,
   task: Task,
-  body: Partial<Job> = {},
+  body: CreateJobRequestBody = {},
 ): Promise<Job> {
   const job = await createJob(app, task, {
     aiCliProvider: 'codex',
@@ -527,7 +535,6 @@ describe('Task API', () => {
           safeCommand: {
             kind: 'typecheck',
             params: { testPattern: 'apps/api' },
-            workingDir: '/workspace/target',
           },
           aiCliProvider: 'codex',
           aiCliPrompt: 'Original rejected prompt',
@@ -564,6 +571,42 @@ describe('Task API', () => {
         expect(original?.status).toBe('blocked')
         expect(original?.aiCliPrompt).toBe('Original rejected prompt')
         expect(created?.status).toBe('queued')
+      })
+    })
+
+    it('normalizes workingDir to the canonical TARGET_WORKING_DIR even if the blocked job stored a different value', async () => {
+      await withApp(async (app) => {
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+
+        // POST /api/jobs は常に正規workingDirを強制するため、異なるworkingDirを持つ
+        // Jobを作るにはルートを経由せずstorage層へ直接書き込む（過去データ・移行データを模倣）。
+        const legacyJob = storage.jobs.create({
+          taskId: task.id,
+          projectId: project.id,
+          agentRole: 'developer_ai',
+          status: 'blocked',
+          safeCommand: { kind: 'typecheck', workingDir: '/some/legacy/path' },
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'legacy prompt',
+          aiCliMode: 'implement',
+        })
+        expect(legacyJob.safeCommand.workingDir).toBe('/some/legacy/path')
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'Continue with the correct workingDir.' },
+        })
+
+        expect(res.statusCode).toBe(201)
+        const resumedJob = parseBody<Job>(res.body)
+        expect(resumedJob.safeCommand.workingDir).toBe('/workspace/target')
+        // kind等workingDir以外のフィールドは元Jobから引き継がれる
+        expect(resumedJob.safeCommand.kind).toBe('typecheck')
       })
     })
 

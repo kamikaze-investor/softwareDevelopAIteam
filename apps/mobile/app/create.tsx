@@ -17,13 +17,7 @@ import {
   View,
 } from 'react-native'
 
-declare const process: {
-  env: {
-    EXPO_PUBLIC_API_URL?: string
-  }
-}
-
-const API_BASE = process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:3000'
+import { apiFetch } from '../lib/api'
 
 export default function CreateProject(): ReactElement {
   const [name, setName] = useState('')
@@ -45,7 +39,7 @@ export default function CreateProject(): ReactElement {
         .map((line: string): string => line.trim())
         .filter((line: string): boolean => line.length > 0)
 
-      const response = await fetch(`${API_BASE}/api/projects`, {
+      const response = await apiFetch('/api/projects', {
         body: JSON.stringify({
           designPhilosophy,
           goal: goal.trim(),
