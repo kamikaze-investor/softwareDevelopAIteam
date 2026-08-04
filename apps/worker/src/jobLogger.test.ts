@@ -30,13 +30,23 @@ describe('saveJobLogs', () => {
     expect(readFileSync(result.stderrPath, 'utf-8')).toBe('hello stderr')
   })
 
-  it('returns the first 1000 characters as previews', () => {
-    const longOutput = 'x'.repeat(2000)
-    const result = saveJobLogs('test-job-2', longOutput, '')
+  it('returns exactly 4000 characters without a truncation notice', () => {
+    const output = 'x'.repeat(4000)
+    const result = saveJobLogs('test-job-2', output, '')
 
-    expect(result.stdoutPreview).toHaveLength(1000)
-    expect(result.stdoutPreview).toBe('x'.repeat(1000))
+    expect(result.stdoutPreview).toHaveLength(4000)
+    expect(result.stdoutPreview).toBe(output)
     expect(result.stderrPreview).toBe('')
+  })
+
+  it('appends the fixed notice only when a preview exceeds 4000 characters', () => {
+    const output = 'x'.repeat(4001)
+    const result = saveJobLogs('test-job-4', output, output)
+
+    expect(result.stdoutPreview).toBe(`${'x'.repeat(4000)}\n[表示上限を超えたため一部省略されています]`)
+    expect(result.stderrPreview).toContain('[表示上限を超えたため一部省略されています]')
+    expect(readFileSync(result.stdoutPath, 'utf-8')).toBe(output)
+    expect(readFileSync(result.stderrPath, 'utf-8')).toBe(output)
   })
 
   it('truncates log files larger than the max log size', () => {

@@ -53,6 +53,16 @@ export interface ChangeManifest {
   paths: string[]
 }
 
+/** git_commit の承認済み最終状態、または実際にstageされた最終状態を1pathぶん表す */
+export interface ApprovedFileState {
+  /** true の場合そのpathは最終的に存在しない（削除／rename元）。true のとき他フィールドは無い */
+  absent: boolean
+  /** regular file の場合のみ。git hash-object / git diff-index が返す blob ID（SHA-1） */
+  blobId?: string
+  type?: EntryType
+  mode?: string
+}
+
 /** 検出・分類に失敗したことを示す。呼び出し元は必ず fail-closed で扱う */
 export class ChangeDetectionError extends Error {
   constructor(message: string) {
@@ -195,6 +205,91 @@ export function lstatEntryType(workingDir: string, relativePath: string): EntryT
   throw new ChangeDetectionError(
     `Unclassifiable file type for "${relativePath}" (socket / device / fifo 等は許可しない)`,
   )
+}
+
+/** Approval Gateへ送るmanifestの最終状態を、staging前のGit blob IDで凍結する。 */
+export function buildApprovedStateMap(
+  workingDir: string,
+  manifest: ChangeManifest,
+): Map<string, ApprovedFileState> {
+  assertWorktreeRoot(workingDir)
+  const result = new Map<string, ApprovedFileState>()
+
+  for (const change of manifest.changes) {
+    if (change.kind === 'deleted') {
+      result.set(change.path, { absent: true })
+      continue
+    }
+    if (change.kind === 'renamed') {
+      if (change.oldPath === undefined) {
+        throw new ChangeDetectionError(`Renamed change is missing oldPath: "${change.path}"`)
+      }
+      result.set(change.oldPath, { absent: true })
+      result.set(change.path, buildApprovedEntryState(workingDir, change))
+      continue
+    }
+    result.set(change.path, buildApprovedEntryState(workingDir, change))
+  }
+
+  return result
+}
+
+function buildApprovedEntryState(workingDir: string, change: FileChange): ApprovedFileState {
+  if (change.afterType === undefined) {
+    throw new ChangeDetectionError(
+      `Change for "${change.path}" has no afterType (kind=${change.kind}); cannot record approved state (fail-closed)`,
+    )
+  }
+  if (change.afterType !== 'regular') {
+    throw new ChangeDetectionError(
+      `Approved change for "${change.path}" has non-regular afterType "${change.afterType}"; ` +
+        `not supported for git_commit content verification (fail-closed)`,
+    )
+  }
+
+  const blobId = runGit(workingDir, ['hash-object', '--', change.path]).trim()
+  const mode = change.afterMode ?? computeFilesystemGitMode(workingDir, change.path)
+
+  return { absent: false, blobId, type: change.afterType, mode }
+}
+
+/** untrackedファイルはporcelain=v2にmodeが無いため、実行bitからgit modeを推定する。 */
+function computeFilesystemGitMode(workingDir: string, relativePath: string): string {
+  const absolute = resolveInsideWorktree(workingDir, relativePath)
+  let stat
+  try {
+    stat = lstatSync(absolute)
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    throw new ChangeDetectionError(`lstat failed while computing mode for "${relativePath}": ${message}`)
+  }
+  if (!stat.isFile()) {
+    throw new ChangeDetectionError(`"${relativePath}" is not a regular file when computing git mode (fail-closed)`)
+  }
+  return (stat.mode & 0o111) !== 0 ? '100755' : '100644'
+}
+
+/** git_commit staging前にindexが空であることを保証する。 */
+export function assertIndexClean(workingDir: string): void {
+  assertWorktreeRoot(workingDir)
+  try {
+    runGit(workingDir, ['diff', '--cached', '--quiet', '--exit-code'])
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    throw new ChangeDetectionError(
+      `Git index already has staged changes before git_commit staging (fail-closed). ` +
+        `Do not run 'git reset' to work around this — investigate what staged them. Detail: ${message}`,
+    )
+  }
+}
+
+/** Approval Gateで承認された明示パスだけをstageする。 */
+export function stageApprovedPaths(workingDir: string, paths: readonly string[]): void {
+  assertWorktreeRoot(workingDir)
+  if (paths.length === 0) {
+    throw new ChangeDetectionError('stageApprovedPaths called with an empty path list (fail-closed)')
+  }
+  runGit(workingDir, ['add', '--', ...paths])
 }
 
 // ────────────────────────────────────────────────────────────
@@ -418,6 +513,128 @@ export function buildCommitTreeManifest(workingDir: string, base: string, after:
   }
 
   return toManifest(changes)
+}
+
+/** stage後のindexを、HEADとの差分に現れる最終状態として取得する。 */
+export function buildIndexStateMap(workingDir: string): Map<string, ApprovedFileState> {
+  assertWorktreeRoot(workingDir)
+  const raw = runGit(workingDir, ['diff-index', '--cached', '-M', '-z', '--raw', '--abbrev=40', 'HEAD'])
+  const segments = splitNulSegments(raw)
+  const result = new Map<string, ApprovedFileState>()
+
+  for (let i = 0; i < segments.length; i += 1) {
+    const record = segments[i]
+    if (record === '') continue
+    if (!record.startsWith(':')) {
+      throw new ChangeDetectionError(`Unknown git diff-index --raw record: "${record}"`)
+    }
+
+    const { fields, rest: status } = splitFields(record.slice(1), 4)
+    const [, dstMode, , dstHash] = fields
+
+    const firstPath = segments[i + 1]
+    if (firstPath === undefined) {
+      throw new ChangeDetectionError(`git diff-index --raw record missing path: "${record}"`)
+    }
+    i += 1
+
+    const statusCode = status[0]
+
+    if (statusCode === 'R') {
+      const newPath = segments[i + 1]
+      if (newPath === undefined) {
+        throw new ChangeDetectionError(`Rename record missing destination path: "${record}"`)
+      }
+      i += 1
+      result.set(firstPath, { absent: true })
+      result.set(newPath, {
+        absent: false,
+        blobId: dstHash,
+        type: entryTypeFromMode(dstMode),
+        mode: dstMode === MODE_ABSENT ? undefined : dstMode,
+      })
+      continue
+    }
+    if (statusCode === 'C') {
+      throw new ChangeDetectionError(`Copy detection is not supported (record "${status}")`)
+    }
+    if (statusCode === 'U') {
+      throw new ChangeDetectionError(`Unmerged entry in index is not supported: "${firstPath}"`)
+    }
+    if (statusCode === 'D') {
+      result.set(firstPath, { absent: true })
+      continue
+    }
+    if (statusCode !== 'A' && statusCode !== 'M' && statusCode !== 'T') {
+      throw new ChangeDetectionError(`Unknown git diff-index --raw status "${status}" for "${firstPath}"`)
+    }
+
+    result.set(firstPath, {
+      absent: false,
+      blobId: dstHash,
+      type: entryTypeFromMode(dstMode),
+      mode: dstMode === MODE_ABSENT ? undefined : dstMode,
+    })
+  }
+
+  return result
+}
+
+/** 承認時に凍結した状態とstage後のindexを完全一致で照合する。 */
+export function assertIndexMatchesApproved(
+  approved: Map<string, ApprovedFileState>,
+  actual: Map<string, ApprovedFileState>,
+): void {
+  const approvedKeys = new Set(approved.keys())
+  const actualKeys = new Set(actual.keys())
+
+  const missing = [...approvedKeys].filter((key) => !actualKeys.has(key))
+  const extra = [...actualKeys].filter((key) => !approvedKeys.has(key))
+  if (missing.length > 0 || extra.length > 0) {
+    throw new ChangeDetectionError(
+      `Staged index does not match approved path set (fail-closed). ` +
+        `missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}`,
+    )
+  }
+
+  for (const [approvedPath, approvedState] of approved) {
+    const actualState = actual.get(approvedPath)
+    if (actualState === undefined) continue
+    if (approvedState.absent !== actualState.absent) {
+      throw new ChangeDetectionError(
+        `Approved/staged presence mismatch for "${approvedPath}": approved.absent=${approvedState.absent} actual.absent=${actualState.absent} (fail-closed)`,
+      )
+    }
+    if (approvedState.absent) continue
+    if (
+      approvedState.blobId !== actualState.blobId ||
+      approvedState.type !== actualState.type ||
+      approvedState.mode !== actualState.mode
+    ) {
+      throw new ChangeDetectionError(
+        `Approved/staged content mismatch for "${approvedPath}" (fail-closed): ` +
+          `approved=${JSON.stringify(approvedState)} actual=${JSON.stringify(actualState)}`,
+      )
+    }
+  }
+}
+
+/** 承認パスのstage後に、index外のtracked/untracked変更が残っていないことを確認する。 */
+export function assertNoResidualChanges(workingDir: string): void {
+  assertWorktreeRoot(workingDir)
+  try {
+    runGit(workingDir, ['diff', '--quiet', '--exit-code'])
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    throw new ChangeDetectionError(
+      `Unstaged tracked changes remain after staging approved paths (fail-closed): ${message}`,
+    )
+  }
+  const raw = runGit(workingDir, ['status', '--porcelain=v2', '-z', '--untracked-files=all'])
+  const segments = splitNulSegments(raw)
+  if (segments.some((segment) => segment.startsWith('?'))) {
+    throw new ChangeDetectionError('Untracked files remain after staging approved paths (fail-closed)')
+  }
 }
 
 /**

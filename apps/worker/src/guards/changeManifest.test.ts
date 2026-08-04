@@ -5,18 +5,25 @@
  * porcelain=v2 / diff --raw の実際の解析はここで一時リポジトリを作って検証する。
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   ChangeDetectionError,
+  assertIndexClean,
+  assertIndexMatchesApproved,
+  assertNoResidualChanges,
+  buildApprovedStateMap,
   buildCommitTreeManifest,
+  buildIndexStateMap,
   buildWorktreeManifest,
   diffSensitiveBaseline,
   entryTypeFromMode,
   lstatEntryType,
   scanSensitiveFiles,
+  stageApprovedPaths,
+  type ApprovedFileState,
 } from './changeManifest.js'
 
 const SENSITIVE_PATTERNS = [/^\.env$/, /^\.env\./, /\.pem$/, /\.key$/, /^id_rsa/]
@@ -60,6 +67,151 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(repo, { recursive: true, force: true })
+})
+
+describe('git_commit approved/index state verification', () => {
+  it('buildApprovedStateMap records added, modified, deleted, renamed, CRLF, spaced, and leading-hyphen paths', () => {
+    git('config', 'core.autocrlf', 'true')
+    write('src/keep.ts', 'export const keep = 2\n')
+    unlinkSync(path.join(repo, 'src/remove.ts'))
+    git('mv', 'src/rename-me.ts', 'src/renamed.ts')
+    write('src/new.ts', 'export const added = 1\n')
+    write('src/crlf.txt', 'first\r\nsecond\r\n')
+    write('src/with space.txt', 'space\n')
+    write('-leading.txt', 'hyphen\n')
+
+    const manifest = buildWorktreeManifest(repo)
+    const approved = buildApprovedStateMap(repo, manifest)
+
+    expect(approved.get('src/remove.ts')).toEqual({ absent: true })
+    expect(approved.get('src/rename-me.ts')).toEqual({ absent: true })
+    for (const filePath of [
+      'src/keep.ts',
+      'src/renamed.ts',
+      'src/new.ts',
+      'src/crlf.txt',
+      'src/with space.txt',
+      '-leading.txt',
+    ]) {
+      expect(approved.get(filePath)).toEqual({
+        absent: false,
+        blobId: git('hash-object', '--', filePath).trim(),
+        type: 'regular',
+        mode: '100644',
+      })
+    }
+  })
+
+  it('assertIndexClean accepts a clean index and rejects an already-staged index', () => {
+    expect(() => assertIndexClean(repo)).not.toThrow()
+
+    write('src/staged.ts', 'staged\n')
+    git('add', '--', 'src/staged.ts')
+
+    expect(() => assertIndexClean(repo)).toThrow(ChangeDetectionError)
+  })
+
+  it('stageApprovedPaths stages only explicit paths and preserves unrelated changes as unstaged', () => {
+    write('src/approved.ts', 'approved\n')
+    write('src/unapproved.ts', 'unapproved\n')
+    write('src/keep.ts', 'export const keep = 2\n')
+
+    stageApprovedPaths(repo, ['src/approved.ts'])
+
+    expect(git('diff', '--cached', '--name-only').trim()).toBe('src/approved.ts')
+    expect(git('diff', '--name-only').trim()).toBe('src/keep.ts')
+    expect(git('status', '--short')).toContain('?? src/unapproved.ts')
+  })
+
+  it('stageApprovedPaths stages a filesystem rename when old and new paths are explicit', () => {
+    renameSync(path.join(repo, 'src/rename-me.ts'), path.join(repo, 'src/renamed.ts'))
+
+    stageApprovedPaths(repo, ['src/rename-me.ts', 'src/renamed.ts'])
+
+    expect(git('diff', '--cached', '--name-status', '-M').trim()).toMatch(/^R\d+\s+src\/rename-me\.ts\s+src\/renamed\.ts$/)
+  })
+
+  it('stageApprovedPaths rejects an empty path list', () => {
+    expect(() => stageApprovedPaths(repo, [])).toThrow(ChangeDetectionError)
+  })
+
+  it('buildIndexStateMap reports added, modified, deleted, and renamed final states', () => {
+    write('src/keep.ts', 'export const keep = 2\n')
+    unlinkSync(path.join(repo, 'src/remove.ts'))
+    renameSync(path.join(repo, 'src/rename-me.ts'), path.join(repo, 'src/renamed.ts'))
+    write('src/new.ts', 'export const added = 1\n')
+    stageApprovedPaths(repo, [
+      'src/keep.ts',
+      'src/remove.ts',
+      'src/rename-me.ts',
+      'src/renamed.ts',
+      'src/new.ts',
+    ])
+
+    const actual = buildIndexStateMap(repo)
+
+    expect(actual.get('src/remove.ts')).toEqual({ absent: true })
+    expect(actual.get('src/rename-me.ts')).toEqual({ absent: true })
+    for (const filePath of ['src/keep.ts', 'src/renamed.ts', 'src/new.ts']) {
+      expect(actual.get(filePath)).toEqual({
+        absent: false,
+        blobId: git('rev-parse', `:${filePath}`).trim(),
+        type: 'regular',
+        mode: '100644',
+      })
+    }
+  })
+
+  it('assertIndexMatchesApproved accepts an exact match', () => {
+    const approved = new Map<string, ApprovedFileState>([
+      ['src/file.ts', { absent: false, blobId: 'abc', type: 'regular', mode: '100644' }],
+      ['src/deleted.ts', { absent: true }],
+    ])
+    const actual = new Map<string, ApprovedFileState>(approved)
+
+    expect(() => assertIndexMatchesApproved(approved, actual)).not.toThrow()
+  })
+
+  it.each([
+    ['path set', new Map<string, ApprovedFileState>([['src/extra.ts', { absent: true }]])],
+    ['blobId', new Map<string, ApprovedFileState>([['src/file.ts', { absent: false, blobId: 'def', type: 'regular', mode: '100644' }]])],
+    ['mode', new Map<string, ApprovedFileState>([['src/file.ts', { absent: false, blobId: 'abc', type: 'regular', mode: '100755' }]])],
+    ['type', new Map<string, ApprovedFileState>([['src/file.ts', { absent: false, blobId: 'abc', type: 'symlink', mode: '100644' }]])],
+  ])('assertIndexMatchesApproved rejects a %s mismatch', (_label, actual) => {
+    const approved = new Map<string, ApprovedFileState>([
+      ['src/file.ts', { absent: false, blobId: 'abc', type: 'regular', mode: '100644' }],
+    ])
+
+    expect(() => assertIndexMatchesApproved(approved, actual)).toThrow(ChangeDetectionError)
+  })
+
+  it('assertNoResidualChanges accepts a fully staged worktree', () => {
+    write('src/keep.ts', 'export const keep = 2\n')
+    write('src/new.ts', 'new\n')
+    stageApprovedPaths(repo, ['src/keep.ts', 'src/new.ts'])
+
+    expect(() => assertNoResidualChanges(repo)).not.toThrow()
+  })
+
+  it('assertNoResidualChanges rejects unstaged tracked changes and untracked files', () => {
+    write('src/keep.ts', 'export const keep = 2\n')
+    expect(() => assertNoResidualChanges(repo)).toThrow(ChangeDetectionError)
+
+    stageApprovedPaths(repo, ['src/keep.ts'])
+    write('src/untracked.ts', 'untracked\n')
+    expect(() => assertNoResidualChanges(repo)).toThrow(ChangeDetectionError)
+  })
+
+  it('uses the same filtered Git blob ID before and after staging a CRLF file with core.autocrlf=true', () => {
+    git('config', 'core.autocrlf', 'true')
+    write('src/crlf.txt', 'first\r\nsecond\r\n')
+    const beforeStage = git('hash-object', '--', 'src/crlf.txt').trim()
+
+    stageApprovedPaths(repo, ['src/crlf.txt'])
+    const afterStage = git('rev-parse', ':src/crlf.txt').trim()
+
+    expect(beforeStage).toBe(afterStage)
+  })
 })
 
 describe('buildWorktreeManifest', () => {

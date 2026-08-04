@@ -29,8 +29,13 @@ import { ALWAYS_FORBIDDEN_PATTERNS, fileChangeGuard } from './guards/fileChangeG
 import type { RuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import {
   ChangeDetectionError,
+  assertIndexClean,
+  assertIndexMatchesApproved,
+  assertNoResidualChanges,
   assertNoHistoryRewrite,
+  buildApprovedStateMap,
   buildCommitRangeManifest,
+  buildIndexStateMap,
   buildWorktreeManifest,
   captureReflogBaseline,
   diffSensitiveBaseline,
@@ -39,8 +44,9 @@ import {
   manifestFromChanges,
   mergeManifests,
   scanSensitiveFiles,
+  stageApprovedPaths,
 } from './guards/changeManifest.js'
-import type { ChangeManifest, ReflogBaseline, SensitiveBaseline } from './guards/changeManifest.js'
+import type { ApprovedFileState, ChangeManifest, ReflogBaseline, SensitiveBaseline } from './guards/changeManifest.js'
 import { saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
 import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
@@ -202,8 +208,17 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     }
   }
 
-  // ── Approval Gate check (Step 3A) ──
   const workingDir = job.safeCommand.workingDir
+
+  if (job.safeCommand.kind === 'git_commit') {
+    try {
+      assertIndexClean(workingDir)
+    } catch (err: unknown) {
+      return failClosed(startedAt, formatChangeDetectionError(err), guardResult)
+    }
+  }
+
+  // ── Approval Gate check (Step 3A) ──
 
   // Job 開始時の機密ファイルベースライン（.gitignore 対象を含む）。
   // 既存の ignored .env 等は「存在するだけ」では違反にせず、以降の新規作成・
@@ -221,6 +236,9 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   // 祖先関係だけを見る検査ではその commit が完全に見えなくなる
   // （2026-07-31 Codex 最終レビューで発見・実測確認済み）。
   let reflogBaseline: ReflogBaseline
+  // git_commit Jobでは、Approval Gate checkより前に承認予定の最終状態をGit blob IDで凍結する。
+  // staging直前ではなくここで保持し、Gate通過中に生じたworktreeの競合変更を検出する。
+  let approvedFileState: Map<string, ApprovedFileState> | undefined
   try {
     sensitiveBaseline = scanSensitiveFiles(workingDir, ALWAYS_FORBIDDEN_PATTERNS)
     preManifest = buildWorktreeManifest(workingDir)
@@ -228,6 +246,9 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     // Gate 用の targetCommit と同じ取得を1回で済ませる（追加の git 呼び出しを増やさない）
     startCommitHash = requireCommitHash(workingDir)
     reflogBaseline = captureReflogBaseline(workingDir)
+    if (job.safeCommand.kind === 'git_commit') {
+      approvedFileState = buildApprovedStateMap(workingDir, preManifest)
+    }
   } catch (err: unknown) {
     return failClosed(startedAt, formatChangeDetectionError(err))
   }
@@ -493,6 +514,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   // aiCliProvider / aiCliPrompt / aiCliMode が3つ揃った場合のみ先行実行する。
   // 成功時は後続の SafeCommand（git_commit 等）を引き続き実行する。
   // 失敗（throw / blocked / exitCode !== 0）時は status: failed で早期リターン。
+  let aiCliStdoutSection: string | undefined
   if (job.aiCliProvider && job.aiCliPrompt && job.aiCliMode) {
     const adapter = createAiCliAdapter({ provider: job.aiCliProvider })
     let cliResult
@@ -547,6 +569,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
       })
     }
 
+    aiCliStdoutSection = `=== AI CLI (${job.aiCliProvider}/${job.aiCliMode}) ===\n${cliResult.stdout}`
     console.log(`[jobRunner] AI CLI 成功 (${job.aiCliProvider}): changedFiles=${cliResult.changedFiles.length}件 → SafeCommand に続行`)
   }
   // ── AI CLI 実行ブロック終端 ───────────────────────────────────────────────
@@ -714,6 +737,41 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     safetyVerificationResult,
   })
 
+  if (job.safeCommand.kind === 'git_commit' && !job.dryRun) {
+    try {
+      if (approvedFileState === undefined) {
+        throw new ChangeDetectionError('approvedFileState was not captured for a git_commit Job (fail-closed)')
+      }
+      if (preManifest.paths.length === 0) {
+        throw new ChangeDetectionError('git_commit Job has no approved changed paths to stage (fail-closed)')
+      }
+
+      assertIndexClean(job.safeCommand.workingDir)
+
+      const headBeforeStage = getCommitHash(job.safeCommand.workingDir)
+      if (headBeforeStage !== startCommitHash) {
+        throw new ChangeDetectionError(
+          `HEAD changed since job start (expected ${startCommitHash}, now ${headBeforeStage}); refusing to stage (fail-closed)`,
+        )
+      }
+
+      stageApprovedPaths(job.safeCommand.workingDir, preManifest.paths)
+
+      const indexState = buildIndexStateMap(job.safeCommand.workingDir)
+      assertIndexMatchesApproved(approvedFileState, indexState)
+      assertNoResidualChanges(job.safeCommand.workingDir)
+
+      const headBeforeCommit = getCommitHash(job.safeCommand.workingDir)
+      if (headBeforeCommit !== startCommitHash) {
+        throw new ChangeDetectionError(
+          `HEAD changed immediately before commit (expected ${startCommitHash}, now ${headBeforeCommit}); refusing to commit (fail-closed)`,
+        )
+      }
+    } catch (err: unknown) {
+      return failClosed(startedAt, formatChangeDetectionError(err), guardResult)
+    }
+  }
+
   const resolved = resolveCommand(job.safeCommand)
   const isAtomic = ['git_commit', 'git_revert'].includes(job.safeCommand.kind)
 
@@ -792,7 +850,10 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   const finalRiskReview = runRiskReview(changedFiles)
   logFinalRiskReview(finalRiskReview.riskLevel, changedFiles)
 
-  const logPaths = saveJobLogs(job.id, stdout, stderr)
+  const combinedStdout = aiCliStdoutSection
+    ? `${aiCliStdoutSection}\n=== SafeCommand (${job.safeCommand.kind}) ===\n${stdout}`
+    : stdout
+  const logPaths = saveJobLogs(job.id, combinedStdout, stderr)
 
   // アトミックジョブの RollbackInfo を自動生成
   let rollbackInfo: RollbackInfo | undefined

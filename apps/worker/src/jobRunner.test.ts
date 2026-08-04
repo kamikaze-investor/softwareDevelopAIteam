@@ -6,10 +6,16 @@ import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { runJob } from './jobRunner.js'
 import {
+  assertIndexClean,
+  assertIndexMatchesApproved,
+  assertNoResidualChanges,
+  buildApprovedStateMap,
   buildCommitRangeManifest,
+  buildIndexStateMap,
   buildWorktreeManifest,
   diffSensitiveBaseline,
   scanSensitiveFiles,
+  stageApprovedPaths,
 } from './guards/changeManifest.js'
 import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
 import { resolvePolicy } from './guards/gatePolicy.js'
@@ -43,6 +49,9 @@ vi.mock('./guards/changeManifest.js', () => ({
   },
   captureReflogBaseline: vi.fn(() => ({ headHashes: [] })),
   assertNoHistoryRewrite: vi.fn(),
+  assertIndexClean: vi.fn(),
+  assertIndexMatchesApproved: vi.fn(),
+  assertNoResidualChanges: vi.fn(),
   // jobRunner のオーケストレーションを検証するためのスタブ。
   // 既存テストが execFileSync 経由で変更ファイルを注入する方式をそのまま活かすため、
   // ここでは同じ git 呼び出しから manifest を組み立てる。
@@ -64,6 +73,22 @@ vi.mock('./guards/changeManifest.js', () => ({
     }
   }),
   buildCommitRangeManifest: vi.fn(() => ({ changes: [], paths: [] })),
+  buildApprovedStateMap: vi.fn((_workingDir: string, manifest: { changes: Array<{ path: string; oldPath?: string; kind: string }> }) => {
+    const states = new Map<string, { absent: boolean; blobId?: string; type?: string; mode?: string }>()
+    for (const change of manifest.changes) {
+      if (change.kind === 'deleted') {
+        states.set(change.path, { absent: true })
+      } else if (change.kind === 'renamed') {
+        if (change.oldPath) states.set(change.oldPath, { absent: true })
+        states.set(change.path, { absent: false, blobId: 'approved-blob', type: 'regular', mode: '100644' })
+      } else {
+        states.set(change.path, { absent: false, blobId: 'approved-blob', type: 'regular', mode: '100644' })
+      }
+    }
+    return states
+  }),
+  buildIndexStateMap: vi.fn(() => new Map()),
+  stageApprovedPaths: vi.fn(),
   // 既存テストの execFileSync 呼び出し順序（mockReturnValueOnce チェーン）を保つため、
   // 旧 getPreGateDiffText と同じ git 呼び出しを行う。
   getWorktreeDiffText: vi.fn((workingDir: string) => {
@@ -97,8 +122,8 @@ vi.mock('./jobLogger.js', () => ({
   saveJobLogs: vi.fn((jobId: string, stdout: string, stderr: string) => ({
     stdoutPath: `/logs/${jobId}/stdout.txt`,
     stderrPath: `/logs/${jobId}/stderr.txt`,
-    stdoutPreview: stdout.slice(0, 1000),
-    stderrPreview: stderr.slice(0, 1000),
+    stdoutPreview: stdout.slice(0, 4000),
+    stderrPreview: stderr.slice(0, 4000),
   })),
 }))
 
@@ -181,6 +206,12 @@ const resolveCommandMock = vi.mocked(resolveCommand)
 const fileChangeGuardMock = vi.mocked(fileChangeGuard)
 const buildWorktreeManifestMock = vi.mocked(buildWorktreeManifest)
 const buildCommitRangeManifestMock = vi.mocked(buildCommitRangeManifest)
+const buildApprovedStateMapMock = vi.mocked(buildApprovedStateMap)
+const assertIndexCleanMock = vi.mocked(assertIndexClean)
+const stageApprovedPathsMock = vi.mocked(stageApprovedPaths)
+const buildIndexStateMapMock = vi.mocked(buildIndexStateMap)
+const assertIndexMatchesApprovedMock = vi.mocked(assertIndexMatchesApproved)
+const assertNoResidualChangesMock = vi.mocked(assertNoResidualChanges)
 const scanSensitiveFilesMock = vi.mocked(scanSensitiveFiles)
 const diffSensitiveBaselineMock = vi.mocked(diffSensitiveBaseline)
 
@@ -254,6 +285,7 @@ function mockGitCommitRun(before: string, after: string): void {
       committed = true
       return ''
     }
+    if (args.includes('--name-only')) return committed ? '' : 'src/approved.ts\n'
     if (args.includes('--abbrev-ref')) return 'main' + String.fromCharCode(10)
     if (args[0] === 'rev-parse') return committed ? after : before
     return ''
@@ -283,6 +315,45 @@ function createPolicy(overrides: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+
+  buildWorktreeManifestMock.mockImplementation((workingDir: string) => {
+    const out = hoistedExecFileSync('git', ['diff', '--name-only', 'HEAD'], {
+      cwd: workingDir,
+      encoding: 'utf-8',
+      shell: false,
+    })
+    const paths = String(out ?? '').trim().split(/\r?\n/).filter(Boolean)
+    return {
+      changes: paths.map((changedPath: string) => ({
+        path: changedPath,
+        kind: 'modified' as const,
+        afterType: 'regular' as const,
+      })),
+      paths,
+    }
+  })
+  buildApprovedStateMapMock.mockImplementation((_workingDir, manifest) => {
+    const states = new Map()
+    for (const change of manifest.changes) {
+      if (change.kind === 'deleted') {
+        states.set(change.path, { absent: true })
+      } else {
+        if (change.oldPath) states.set(change.oldPath, { absent: true })
+        states.set(change.path, {
+          absent: false,
+          blobId: 'approved-blob',
+          type: 'regular',
+          mode: '100644',
+        })
+      }
+    }
+    return states
+  })
+  buildIndexStateMapMock.mockReturnValue(new Map())
+  assertIndexCleanMock.mockImplementation(() => {})
+  stageApprovedPathsMock.mockImplementation(() => {})
+  assertIndexMatchesApprovedMock.mockImplementation(() => {})
+  assertNoResidualChangesMock.mockImplementation(() => {})
 
   // Notifier: always resolve silently by default
   sendAlertMock.mockResolvedValue([])
@@ -612,6 +683,208 @@ describe('runJob', () => {
     expect(result.rollbackInfo).toBeDefined()
     expect(result.rollbackInfo?.previousCommitHash).toBe('abc123')
     expect(result.rollbackInfo?.rollbackArgv).toContain('revert')
+  })
+})
+
+describe('Phase 2: git_commit staging verification', () => {
+  const approvedManifest = {
+    changes: [{ path: 'src/approved.ts', kind: 'modified' as const, afterType: 'regular' as const, afterMode: '100644' }],
+    paths: ['src/approved.ts'],
+  }
+  const approvedState = new Map([
+    ['src/approved.ts', { absent: false, blobId: 'approved-blob', type: 'regular' as const, mode: '100644' }],
+  ])
+
+  beforeEach(() => {
+    buildWorktreeManifestMock.mockReturnValue(approvedManifest)
+    buildApprovedStateMapMock.mockReturnValue(new Map(approvedState))
+    buildIndexStateMapMock.mockReturnValue(new Map(approvedState))
+    assertIndexCleanMock.mockImplementation(() => {})
+    stageApprovedPathsMock.mockImplementation(() => {})
+    assertIndexMatchesApprovedMock.mockImplementation(() => {})
+    assertNoResidualChangesMock.mockImplementation(() => {})
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+  })
+
+  function gitCommitJob(): Job {
+    return createJob({
+      safeCommand: {
+        kind: 'git_commit',
+        workingDir: '/workspace/target',
+        params: { commitMessage: 'test' },
+      },
+    })
+  }
+
+  it('stages the approved paths, verifies the index, and creates the commit', async () => {
+    mockGitCommitRun(BASE_COMMIT, 'aftercommit000000000000000000000000000000')
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('success')
+    expect(buildApprovedStateMapMock.mock.invocationCallOrder[0]).toBeLessThan(
+      callGateCheckMock.mock.invocationCallOrder[0],
+    )
+    expect(stageApprovedPathsMock).toHaveBeenCalledWith('/workspace/target', ['src/approved.ts'])
+    expect(assertIndexMatchesApprovedMock).toHaveBeenCalledWith(
+      expect.any(Map),
+      expect.any(Map),
+    )
+    expect(execFileSyncMock.mock.calls.some((call) => Array.isArray(call[1]) && call[1][0] === 'commit')).toBe(true)
+  })
+
+  it('fails before staging when the index is already dirty and never runs git reset', async () => {
+    mockGitCommitRun(BASE_COMMIT, 'unused')
+    assertIndexCleanMock.mockImplementationOnce(() => {
+      throw new ChangeDetectionErrorStub('index already staged')
+    })
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.detectionFailure).toBe(true)
+    expect(callGateCheckMock).not.toHaveBeenCalled()
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    expect(stageApprovedPathsMock).not.toHaveBeenCalled()
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+    expect(execFileSyncMock.mock.calls.some((call) => Array.isArray(call[1]) && call[1][0] === 'commit')).toBe(false)
+    expect(execFileSyncMock.mock.calls.some((call) => Array.isArray(call[1]) && call[1][0] === 'reset')).toBe(false)
+  })
+
+  it('fails at job start before building the pre-manifest or calling the approval APIs when the index is dirty', async () => {
+    assertIndexCleanMock.mockImplementationOnce(() => {
+      throw new ChangeDetectionErrorStub('index dirty at job start')
+    })
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(assertIndexCleanMock).toHaveBeenCalledTimes(1)
+    expect(buildWorktreeManifestMock).not.toHaveBeenCalled()
+    expect(callGateCheckMock).not.toHaveBeenCalled()
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    expect(stageApprovedPathsMock).not.toHaveBeenCalled()
+    expect(execFileSyncMock.mock.calls.some((call) => Array.isArray(call[1]) && call[1][0] === 'commit')).toBe(false)
+  })
+
+  it('fails after consume when the second index check detects a race before staging', async () => {
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-index-race', message: 'consume' },
+    })
+    callConsumeMock.mockResolvedValueOnce({ ok: true })
+    assertIndexCleanMock
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new ChangeDetectionErrorStub('index dirtied after consume')
+      })
+    mockGitCommitRun(BASE_COMMIT, 'unused')
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(assertIndexCleanMock).toHaveBeenCalledTimes(2)
+    expect(callGateCheckMock).toHaveBeenCalledOnce()
+    expect(callConsumeMock).toHaveBeenCalledOnce()
+    expect(stageApprovedPathsMock).not.toHaveBeenCalled()
+    expect(execFileSyncMock.mock.calls.some((call) => Array.isArray(call[1]) && call[1][0] === 'commit')).toBe(false)
+  })
+
+  it('fails before staging when HEAD changes after consume succeeds', async () => {
+    let consumed = false
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-head-before-stage', message: 'consume' },
+    })
+    callConsumeMock.mockImplementationOnce(async () => {
+      consumed = true
+      return { ok: true }
+    })
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--abbrev-ref')) return 'main\n'
+      if (Array.isArray(args) && args[0] === 'rev-parse') {
+        return consumed ? 'changed-before-stage\n' : `${BASE_COMMIT}\n`
+      }
+      return ''
+    })
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(callConsumeMock).toHaveBeenCalled()
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('HEAD changed since job start')
+    expect(stageApprovedPathsMock).not.toHaveBeenCalled()
+  })
+
+  it('fails without committing when HEAD changes after staging', async () => {
+    let staged = false
+    stageApprovedPathsMock.mockImplementationOnce(() => {
+      staged = true
+    })
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--abbrev-ref')) return 'main\n'
+      if (Array.isArray(args) && args[0] === 'rev-parse') {
+        return staged ? 'changed-before-commit\n' : `${BASE_COMMIT}\n`
+      }
+      return ''
+    })
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('HEAD changed immediately before commit')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('fails after consume when an unapproved path appears in the staged index', async () => {
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-extra-index', message: 'consume' },
+    })
+    callConsumeMock.mockResolvedValueOnce({ ok: true })
+    buildIndexStateMapMock.mockReturnValueOnce(new Map([
+      ...approvedState,
+      ['src/unapproved.ts', { absent: false, blobId: 'extra-blob', type: 'regular' as const, mode: '100644' }],
+    ]))
+    assertIndexMatchesApprovedMock.mockImplementationOnce((_approved, actual) => {
+      if (actual.has('src/unapproved.ts')) throw new ChangeDetectionErrorStub('extra staged path')
+    })
+    mockGitCommitRun(BASE_COMMIT, 'unused')
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(callConsumeMock).toHaveBeenCalled()
+    expect(result.status).toBe('failed')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('fails without committing when residual unstaged or untracked changes remain', async () => {
+    mockGitCommitRun(BASE_COMMIT, 'unused')
+    assertNoResidualChangesMock.mockImplementationOnce(() => {
+      throw new ChangeDetectionErrorStub('residual worktree changes')
+    })
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('residual worktree changes')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it.each(['blobId', 'type', 'mode'])('fails without committing on an approved/staged %s mismatch', async (field) => {
+    mockGitCommitRun(BASE_COMMIT, 'unused')
+    assertIndexMatchesApprovedMock.mockImplementationOnce(() => {
+      throw new ChangeDetectionErrorStub(`${field} mismatch`)
+    })
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain(`${field} mismatch`)
+    expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 })
 
@@ -1391,16 +1664,26 @@ describe('task-022: AI CLI 実行ブロック', () => {
 
   it('aiCliProvider なし → AI CLI をスキップして SafeCommand を実行する', async () => {
     // AI CLI フィールドが未指定の通常 Job
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'status') return 'safe output\n'
+      return gitFallback(args)
+    })
     const job = createJob()
     const result = await runJob(job, createPolicy())
 
     expect(createAiCliAdapterMock).not.toHaveBeenCalled()
     expect(result.status).toBe('success')
+    expect(result.stdout).toBe('safe output\n')
+    expect(result.stdout).not.toContain('=== SafeCommand')
   })
 
   it('aiCliProvider あり・CLI 成功 → SafeCommand も実行される', async () => {
     const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult()) }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'status') return 'safe output\n'
+      return gitFallback(args)
+    })
 
     const job = createJob({
       aiCliProvider: 'claude_code',
@@ -1421,6 +1704,8 @@ describe('task-022: AI CLI 実行ブロック', () => {
     // SafeCommand も実行された
     expect(execFileSyncMock).toHaveBeenCalled()
     expect(result.status).toBe('success')
+    expect(result.stdout).toContain('=== AI CLI (claude_code/implement) ===\nAI CLIの実行結果')
+    expect(result.stdout).toContain('=== SafeCommand (git_status) ===\nsafe output\n')
   })
 
   it('AI CLI が exitCode !== 0 → status: failed で早期リターン（SafeCommand は実行されない）', async () => {
@@ -2298,19 +2583,14 @@ describe('変更ファイル検出契約', () => {
       description: 'git commit',
     })
     // beforeCommitHash / afterCommitHash が変わる = commit が作られた
-    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
-      if (Array.isArray(args) && args.includes('--abbrev-ref')) return 'main\n'
-      if (Array.isArray(args) && args[0] === 'rev-parse') {
-        return execFileSyncMock.mock.calls.filter(
-          (c) => Array.isArray(c[1]) && c[1][0] === 'rev-parse' && !c[1].includes('--abbrev-ref'),
-        ).length <= 2
-          ? 'before111\n'
-          : 'after222\n'
-      }
-      return gitFallback(args)
-    })
-    // working tree はクリーン（commit 済みなので差分が消えている）
-    buildWorktreeManifestMock.mockReturnValue({ changes: [], paths: [] })
+    mockGitCommitRun('before111', 'after222')
+    // Approval Gate時点では承認対象があり、その後はcommit済みなのでworking treeはクリーン。
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({
+        changes: [{ path: 'src/approved.ts', kind: 'modified', afterType: 'regular', afterMode: '100644' }],
+        paths: ['src/approved.ts'],
+      })
+      .mockReturnValue({ changes: [], paths: [] })
     // commit tree には禁止ファイルが含まれる
     buildCommitRangeManifestMock.mockReturnValue({
       changes: [{ path: '.env', kind: 'added', afterType: 'regular' }],
@@ -2332,22 +2612,14 @@ describe('変更ファイル検出契約', () => {
       argv: ['git', 'commit', '-m', 'test'],
       description: 'git commit',
     })
-    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
-      if (Array.isArray(args) && args.includes('--abbrev-ref')) return 'main\n'
-      if (Array.isArray(args) && args[0] === 'rev-parse') {
-        return execFileSyncMock.mock.calls.filter(
-          (c) => Array.isArray(c[1]) && c[1][0] === 'rev-parse' && !c[1].includes('--abbrev-ref'),
-        ).length <= 2
-          ? 'before111\n'
-          : 'after222\n'
-      }
-      return gitFallback(args)
-    })
+    mockGitCommitRun('before111', 'after222')
     // Stage A では安全な内容だった同じ path が、commit tree では別 blob になっている
-    buildWorktreeManifestMock.mockReturnValue({
-      changes: [{ path: 'src/app.ts', kind: 'modified', afterType: 'regular' }],
-      paths: ['src/app.ts'],
-    })
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({
+        changes: [{ path: 'src/app.ts', kind: 'modified', afterType: 'regular', afterMode: '100644' }],
+        paths: ['src/app.ts'],
+      })
+      .mockReturnValue({ changes: [], paths: [] })
     buildCommitRangeManifestMock.mockReturnValue({
       changes: [
         {

@@ -1,7 +1,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
-const PREVIEW_LENGTH = 1000
+const PREVIEW_LENGTH = 4000
+const PREVIEW_TRUNCATION_NOTICE = '\n[表示上限を超えたため一部省略されています]'
 const MAX_LOG_SIZE = 1_000_000
 
 export interface JobLogPaths {
@@ -24,8 +25,8 @@ export function saveJobLogs(jobId: string, stdout: string, stderr: string): JobL
   return {
     stdoutPath,
     stderrPath,
-    stdoutPreview: stdout.slice(0, PREVIEW_LENGTH),
-    stderrPreview: stderr.slice(0, PREVIEW_LENGTH),
+    stdoutPreview: buildPreview(stdout),
+    stderrPreview: buildPreview(stderr),
   }
 }
 
@@ -44,6 +45,11 @@ function resolveJobLogDir(jobId: string): string {
 function isPathInside(targetPath: string, rootDir: string): boolean {
   const relative = path.relative(rootDir, targetPath)
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
+function buildPreview(output: string): string {
+  if (output.length <= PREVIEW_LENGTH) return output
+  return output.slice(0, PREVIEW_LENGTH) + PREVIEW_TRUNCATION_NOTICE
 }
 
 function truncateLog(output: string): string {
