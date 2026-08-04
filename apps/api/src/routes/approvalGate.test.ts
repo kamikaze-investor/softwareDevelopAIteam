@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import { createHash } from 'crypto'
 import { beforeEach, describe, expect, it } from 'vitest'
-import type { ApprovalRequest } from '@ai-team/shared'
+import type { ApprovalRequest, RiskReviewResult } from '@ai-team/shared'
+import { decideGateOutcome } from '@ai-team/shared'
 
 async function buildApp(): Promise<FastifyInstance> {
   process.env.DB_PATH = ':memory:'
@@ -960,6 +961,245 @@ describe('POST /api/gate/check', () => {
 })
 
 // ────────────────────────────────────────────────────────────
+// MVP-A: git_commit は実際のriskLevelに関わらず常にCEO承認が必要
+// （2026-08-03。riskLevelは書き換えず、policy起因であることをtriggeredRules/
+//   continuationPolicy/nextAction文言で表現する）
+// ────────────────────────────────────────────────────────────
+
+describe('POST /api/gate/check — git_commit requiresApprovalByPolicy', () => {
+  const GIT_COMMIT_PAYLOAD = {
+    ...BASE_GATE_PAYLOAD,
+    requestedAction: 'git_commit',
+    changedFiles: ['docs/README.md'], // 実riskLevel=LOW（RISK_RULES非該当・SAFE_ONLY_PATTERNS該当）
+  }
+
+  it('LOW risk の git_commit 初回 → BLOCKED、riskLevelはLOWのまま、block_until_approved', async () => {
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId: 'gate-commit-001',
+      })
+      expect(statusCode).toBe(200)
+      // 実riskLevelは変更されない
+      expect(body.riskReview.riskLevel).toBe('LOW')
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.outcome.riskLevel).toBe('LOW')
+      expect(body.continuationPolicy).toBe('block_until_approved')
+      expect(body.sideEffects).toHaveLength(1)
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+
+      // 保存された ApprovalRequest にも実riskLevel（LOW）がそのまま保存される
+      expect(body.approvalRequest?.riskLevel).toBe('LOW')
+      // policyラベルが triggeredRules に含まれる（重複なし、1件のみ）
+      const rules = body.approvalRequest?.triggeredRules ?? []
+      expect(rules.filter((r) => r === 'git_commit requires CEO approval (policy)')).toHaveLength(1)
+
+      // CEO向け文言は「HIGH/CRITICALリスクだから」ではなくpolicy理由として表示される
+      expect(body.nextAction.message).not.toMatch(/HIGH|CRITICAL/)
+      expect(body.nextAction.message).toContain('ポリシー')
+    })
+  })
+
+  it('MEDIUM 相当のファイル変更でも git_commit は BLOCKED になる（実運用ではMEDIUMがrunRiskReviewから出ないため、LOWと同じ経路を再確認）', async () => {
+    // 注記: 現行 RISK_RULES は HIGH/CRITICAL のみを定義しており、
+    // runRiskReview() は changedFiles だけからは MEDIUM を返さない
+    // （実測確認済み）。MEDIUM の decideGateOutcome() 挙動は本ファイル末尾の
+    // unit テスト（decideGateOutcome — requiresApprovalByPolicy）で直接検証する。
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId: 'gate-commit-001b',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('BLOCKED')
+    })
+  })
+
+  it('APPROVED（同一commit/diffHash・同一requestedAction）→ ALLOW + consumedRequestId、riskLevelはLOWのまま', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-commit-002'
+      const first = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      const requestId = first.body.approvalRequest?.id
+      expect(requestId).toBeTruthy()
+      await patchStatus(app, requestId!, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('ALLOW')
+      expect(body.outcome.riskLevel).toBe('LOW')
+      expect(body.continuationPolicy).toBe('continue')
+      expect(body.nextAction.action).toBe('call_consume')
+      expect(body.nextAction.consumedRequestId).toBe(requestId)
+
+      // consume まで実行できる（既存フローの再利用確認）
+      const consumed = await consumeRequest(app, requestId!, {
+        currentCommit: GIT_COMMIT_PAYLOAD.targetCommit,
+        currentDiffHash: GIT_COMMIT_PAYLOAD.targetDiffHash,
+      })
+      expect(consumed.statusCode).toBe(200)
+      expect((consumed.body as ApprovalRequest).status).toBe('CONSUMED')
+    })
+  })
+
+  it('REJECTED（同一commit/diffHash）→ 新規作成せず REJECTED のまま進行しない', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-commit-003'
+      const first = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      const requestId = first.body.approvalRequest?.id
+      await patchStatus(app, requestId!, 'REJECTED')
+
+      const { statusCode, body } = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('REJECTED')
+      expect(body.outcome.decision).not.toBe('ALLOW')
+      expect(body.sideEffects).toEqual([])
+    })
+  })
+
+  it('EXPIRED（期限切れAPPROVED）→ ALLOWにならず新規BLOCKED', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.approvalRequests.create({
+        taskId: 'gate-commit-004',
+        targetBranch: GIT_COMMIT_PAYLOAD.targetBranch,
+        targetCommit: GIT_COMMIT_PAYLOAD.targetCommit,
+        targetDiffHash: GIT_COMMIT_PAYLOAD.targetDiffHash,
+        riskLevel: 'LOW',
+        requestedAction: 'git_commit',
+        status: 'APPROVED',
+        expiresAt: new Date(Date.now() - 5000).toISOString(),
+        invalidIf: [],
+      })
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId: 'gate-commit-004',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.outcome.decision).not.toBe('ALLOW')
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+    })
+  })
+
+  it('commit不一致（APPROVED済み）→ STALEになり再利用しない', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-commit-005'
+      const first = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId,
+        targetCommit: 'commit-old',
+        targetDiffHash: 'hash-shared',
+      })
+      const requestId = first.body.approvalRequest?.id
+      await patchStatus(app, requestId!, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId,
+        targetCommit: 'commit-new', // commitだけ変化
+        targetDiffHash: 'hash-shared',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('STALE')
+      expect(body.outcome.decision).not.toBe('ALLOW')
+    })
+  })
+
+  it('diffHash不一致（APPROVED済み）→ STALEになり再利用しない', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-commit-006'
+      const first = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId,
+        targetCommit: 'commit-shared',
+        targetDiffHash: 'hash-old',
+      })
+      const requestId = first.body.approvalRequest?.id
+      await patchStatus(app, requestId!, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId,
+        targetCommit: 'commit-shared',
+        targetDiffHash: 'hash-new', // diffHashだけ変化
+      })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('STALE')
+      expect(body.outcome.decision).not.toBe('ALLOW')
+    })
+  })
+
+  it('requestedAction不一致（別アクションのAPPROVED、同一commit/diffHash）→ 再利用せず新規BLOCKED', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-commit-007'
+      // 'test' アクションに対する承認を作成・APPROVEDにする（commit/diffHashはgit_commit側と同一）
+      const unrelated = await createApprovalRequest(app, {
+        taskId,
+        requestedAction: 'test',
+        targetCommit: GIT_COMMIT_PAYLOAD.targetCommit,
+        targetDiffHash: GIT_COMMIT_PAYLOAD.targetDiffHash,
+      })
+      await patchStatus(app, unrelated.id, 'APPROVED')
+
+      // 同一 commit/diffHash で git_commit を確認 → 無関係な承認を消費してはならない
+      const { statusCode, body } = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.outcome.decision).not.toBe('ALLOW')
+      expect(body.nextAction.action).not.toBe('call_consume')
+      // 新しい git_commit 専用の承認リクエストが作成される（unrelated とは別ID）
+      expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
+      expect(body.approvalRequest?.id).not.toBe(unrelated.id)
+      expect(body.approvalRequest?.requestedAction).toBe('git_commit')
+    })
+  })
+
+  it('git_commit以外（例: test）のLOWリスクは従来どおり自動継続する（回帰）', async () => {
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId: 'gate-commit-008',
+        requestedAction: 'test',
+        changedFiles: ['docs/README.md'],
+      })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('ALLOW')
+      expect(body.continuationPolicy).toBe('continue')
+      expect(body.nextAction.action).toBe('proceed')
+    })
+  })
+
+  it('PENDING_APPROVAL（2回目呼び出し）の文言もHIGH/CRITICALリスクではなくpolicy理由として表示される', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-commit-009'
+      await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      const { statusCode, body } = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.nextAction.message).not.toMatch(/HIGH|CRITICAL/)
+      expect(body.nextAction.message).toContain('ポリシー')
+    })
+  })
+
+  it('HIGH/CRITICALリスクのgit_commitは既存どおり（policyラベルは付くがriskLevel由来の文言・continuationPolicyは変わらない）', async () => {
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, {
+        ...GIT_COMMIT_PAYLOAD,
+        taskId: 'gate-commit-010',
+        changedFiles: ['AGENTS.md'], // CRITICAL
+      })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('CRITICAL')
+      expect(body.outcome.riskLevel).toBe('CRITICAL')
+      expect(body.continuationPolicy).toBe('block_until_approved')
+      expect(body.approvalRequest?.triggeredRules).toContain('git_commit requires CEO approval (policy)')
+    })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
 // P2-followup: expired APPROVED cleanup
 // ────────────────────────────────────────────────────────────
 
@@ -1226,5 +1466,93 @@ describe('Step D: diffText シークレットスキャン', () => {
       // 削除行は対象外 → LOW のまま
       expect(body.riskReview.riskLevel).toBe('LOW')
     })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// decideGateOutcome — requiresApprovalByPolicy (unit)
+//
+// runRiskReview() は現行 RISK_RULES（HIGH/CRITICAL のみ定義）の都合上、
+// changedFiles だけからは MEDIUM を返さない（実測確認済み）。
+// MEDIUM の挙動はここで RiskReviewResult を直接構築して検証する。
+// ────────────────────────────────────────────────────────────
+
+describe('decideGateOutcome — requiresApprovalByPolicy (unit)', () => {
+  function makeRiskReview(riskLevel: RiskReviewResult['riskLevel']): RiskReviewResult {
+    return { riskLevel, triggeredRules: [], requiresIndependentReview: false }
+  }
+
+  it('LOW + requiresApprovalByPolicy=true + existingReqなし → BLOCKED、riskLevelはLOWのまま', () => {
+    const outcome = decideGateOutcome(
+      makeRiskReview('LOW'),
+      undefined,
+      'commit-1',
+      'diff-1',
+      { requiresApprovalByPolicy: true },
+    )
+    expect(outcome.decision).toBe('BLOCKED')
+    if (outcome.decision !== 'BLOCKED') throw new Error('unreachable')
+    expect(outcome.riskLevel).toBe('LOW')
+  })
+
+  it('MEDIUM + requiresApprovalByPolicy=true + existingReqなし → BLOCKED、riskLevelはMEDIUMのまま', () => {
+    const outcome = decideGateOutcome(
+      makeRiskReview('MEDIUM'),
+      undefined,
+      'commit-1',
+      'diff-1',
+      { requiresApprovalByPolicy: true },
+    )
+    expect(outcome.decision).toBe('BLOCKED')
+    if (outcome.decision !== 'BLOCKED') throw new Error('unreachable')
+    expect(outcome.riskLevel).toBe('MEDIUM')
+  })
+
+  it('LOW + requiresApprovalByPolicy=false（既定）→ 従来どおり自動ALLOW（回帰）', () => {
+    const outcome = decideGateOutcome(makeRiskReview('LOW'), undefined, 'commit-1', 'diff-1')
+    expect(outcome.decision).toBe('ALLOW')
+    if (outcome.decision !== 'ALLOW') throw new Error('unreachable')
+    expect(outcome.riskLevel).toBe('LOW')
+  })
+
+  it('MEDIUM + requiresApprovalByPolicy=false（既定）→ 従来どおり自動ALLOW（回帰）', () => {
+    const outcome = decideGateOutcome(makeRiskReview('MEDIUM'), undefined, 'commit-1', 'diff-1')
+    expect(outcome.decision).toBe('ALLOW')
+    if (outcome.decision !== 'ALLOW') throw new Error('unreachable')
+    expect(outcome.riskLevel).toBe('MEDIUM')
+  })
+
+  it('MEDIUM + requiresApprovalByPolicy=true + APPROVED一致 → ALLOW + consumedRequestId（riskLevelはMEDIUMのまま）', () => {
+    const existingReq: ApprovalRequest = {
+      id: 'req-1',
+      taskId: 'task-1',
+      targetBranch: 'feat/x',
+      targetCommit: 'commit-1',
+      targetDiffHash: 'diff-1',
+      riskLevel: 'MEDIUM',
+      requestedAction: 'git_commit',
+      status: 'APPROVED',
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      invalidIf: [],
+      createdAt: new Date().toISOString(),
+    }
+    const outcome = decideGateOutcome(
+      makeRiskReview('MEDIUM'),
+      existingReq,
+      'commit-1',
+      'diff-1',
+      { requiresApprovalByPolicy: true },
+    )
+    expect(outcome.decision).toBe('ALLOW')
+    if (outcome.decision !== 'ALLOW') throw new Error('unreachable')
+    expect(outcome.riskLevel).toBe('MEDIUM')
+    expect(outcome.consumedRequestId).toBe('req-1')
+  })
+
+  it('HIGH + requiresApprovalByPolicy未指定 → 既存挙動と同一（4引数呼び出しの回帰）', () => {
+    const outcome = decideGateOutcome(makeRiskReview('HIGH'), undefined, 'commit-1', 'diff-1')
+    expect(outcome.decision).toBe('BLOCKED')
+    if (outcome.decision !== 'BLOCKED') throw new Error('unreachable')
+    expect(outcome.riskLevel).toBe('HIGH')
   })
 })

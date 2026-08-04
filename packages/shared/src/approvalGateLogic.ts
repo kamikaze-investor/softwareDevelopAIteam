@@ -140,6 +140,15 @@ export function resolveEffectiveStatus(
 // Gate Decision（純粋関数）
 // ────────────────────────────────────────────────────────────
 
+export interface GateDecisionOptions {
+  /**
+   * riskLevel が LOW/MEDIUM でも承認を必須にする（例: git_commit は常に承認必須という
+   * MVP-A ポリシー）。riskLevel 自体は書き換えない。既存の呼び出し元（4引数）を
+   * 壊さないよう省略可能とし、既定値は false（従来どおり LOW/MEDIUM は自動継続）。
+   */
+  requiresApprovalByPolicy?: boolean
+}
+
 /**
  * Risk Review 結果と既存の ApprovalRequest（あれば）から GateOutcome を決定する。
  *
@@ -147,21 +156,26 @@ export function resolveEffectiveStatus(
  * @param existingReq  storage から取得したアクティブな ApprovalRequest（なければ undefined）
  * @param currentCommit  現在の git HEAD commit hash
  * @param currentDiffHash  現在の diff hash
+ * @param options      省略可能。`requiresApprovalByPolicy` で LOW/MEDIUM の自動 ALLOW を無効化する
  */
 export function decideGateOutcome(
   riskReview: RiskReviewResult,
   existingReq: ApprovalRequest | undefined,
   currentCommit: string,
   currentDiffHash: string,
+  options: GateDecisionOptions = {},
 ): GateOutcome {
   const { riskLevel } = riskReview
+  const { requiresApprovalByPolicy = false } = options
 
-  // LOW / MEDIUM は自動継続（承認不要）
-  if (riskLevel === 'LOW' || riskLevel === 'MEDIUM') {
+  // LOW / MEDIUM は自動継続（承認不要）。ただし policy 上の承認必須指定がある場合は
+  // 自動継続をスキップし、以降の existingReq 照合・BLOCKED 生成へ進む（riskLevel は変更しない）。
+  if (!requiresApprovalByPolicy && (riskLevel === 'LOW' || riskLevel === 'MEDIUM')) {
     return { decision: 'ALLOW', riskLevel }
   }
 
-  // HIGH / CRITICAL: 既存リクエストを照合
+  // HIGH / CRITICAL 相当（または policy により承認必須化された LOW/MEDIUM）:
+  // 既存リクエストを照合する。この分岐は riskLevel を一切参照しないため無変更で流用できる。
   if (existingReq) {
     const effective = resolveEffectiveStatus(existingReq, currentCommit, currentDiffHash)
 
@@ -192,11 +206,16 @@ export function decideGateOutcome(
   }
 
   // 承認リクエストなし or 無効状態 → BLOCKED（新規リクエスト作成を促す）
+  // policy起因（riskLevelはLOW/MEDIUMのまま）の場合は、実際のriskLevelを偽らない固定文言にする。
+  const reason = requiresApprovalByPolicy && (riskLevel === 'LOW' || riskLevel === 'MEDIUM')
+    ? 'git_commit はポリシー上CEO承認が必要です。承認リクエストを作成してください。'
+    : riskLevel === 'CRITICAL'
+      ? `CRITICAL リスク: 人間承認が必要です。承認リクエストを作成してください。[${riskReview.triggeredRules.join(', ')}]`
+      : `HIGH リスク: 人間承認が必要です。承認リクエストを作成してください。[${riskReview.triggeredRules.join(', ')}]`
+
   return {
     decision: 'BLOCKED',
-    reason: riskLevel === 'CRITICAL'
-      ? `CRITICAL リスク: 人間承認が必要です。承認リクエストを作成してください。[${riskReview.triggeredRules.join(', ')}]`
-      : `HIGH リスク: 人間承認が必要です。承認リクエストを作成してください。[${riskReview.triggeredRules.join(', ')}]`,
+    reason,
     riskLevel,
   }
 }

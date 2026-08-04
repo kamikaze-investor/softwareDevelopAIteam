@@ -17,6 +17,8 @@ function computeDiffHash(diffText: string): string {
 
 const SECRET_SUSPECTED_IN_DIFF_LABEL = 'secret suspected in diff'
 const OTHER_RISK_FACTOR_DETECTED_LABEL = 'other risk factor detected'
+/** MVP-A: git_commit は実際のriskLevelに関わらず常に承認必須というポリシー起因の理由ラベル */
+const GIT_COMMIT_POLICY_LABEL = 'git_commit requires CEO approval (policy)'
 const SAFE_RISK_RULE_LABELS = new Set(RISK_RULES.map(rule => rule.label))
 const DIFF_SECRET_LABEL_PATTERN = /^diff:secret\([^)]*\)$/
 
@@ -109,8 +111,14 @@ const GateCheckBody = z.object({
 function computeContinuationPolicy(
   riskLevel: RiskLevel,
   decision: GateOutcome['decision'],
+  requiresApprovalByPolicy: boolean,
 ): ContinuationPolicy {
   if (decision === 'ALLOW') return 'continue'
+
+  // policy起因（git_commit等）で承認必須化された場合は、実際のriskLevelに関わらず
+  // 完全停止で承認待ちにする（continue_safe_work_onlyのような「実リスクの緩和ラベル」を
+  // policy起因の停止へ流用しない）。
+  if (requiresApprovalByPolicy) return 'block_until_approved'
 
   switch (riskLevel) {
     case 'CRITICAL':
@@ -119,7 +127,8 @@ function computeContinuationPolicy(
       return 'continue_safe_work_only'
     case 'LOW':
     case 'MEDIUM':
-      // LOW/MEDIUM で ALLOW 以外は内部不整合（decideGateOutcome の設計上発生しえない）
+      // LOW/MEDIUM で ALLOW 以外は内部不整合（decideGateOutcome の設計上、
+      // requiresApprovalByPolicy=false の場合は発生しえない）
       console.warn(
         `[gate/check] Unexpected: riskLevel=${riskLevel} with decision=${decision}. ` +
         `decideGateOutcome should always return ALLOW for LOW/MEDIUM. Defaulting to continue.`
@@ -131,6 +140,7 @@ function computeContinuationPolicy(
 function computeNextAction(
   outcome: GateOutcome,
   riskLevel: RiskLevel,
+  requiresApprovalByPolicy: boolean,
   newRequestId?: string,
 ): NextAction {
   switch (outcome.decision) {
@@ -151,9 +161,11 @@ function computeNextAction(
       return {
         action: 'wait_for_approval',
         requestId: outcome.requestId,
-        message: riskLevel === 'CRITICAL'
-          ? '【CRITICAL】危険な変更を含むため、承認まですべての作業を停止してください。承認者に通知してください。'
-          : '承認待ち中です。安全な作業は継続可能ですが、この変更の適用は承認後に行ってください。',
+        message: requiresApprovalByPolicy
+          ? 'この操作はポリシー上CEO承認が必要です。承認後に反映してください。'
+          : riskLevel === 'CRITICAL'
+            ? '【CRITICAL】危険な変更を含むため、承認まですべての作業を停止してください。承認者に通知してください。'
+            : '承認待ち中です。安全な作業は継続可能ですが、この変更の適用は承認後に行ってください。',
       }
 
     case 'REJECTED':
@@ -167,9 +179,11 @@ function computeNextAction(
       return {
         action: 'wait_for_approval',
         requestId: newRequestId,
-        message: riskLevel === 'CRITICAL'
-          ? '【CRITICAL】承認リクエストを作成しました。危険な変更を含むため、承認まですべての作業を停止してください。'
-          : '承認リクエストを作成しました。HIGH リスク変更のため人間承認が必要です。安全な作業は継続可能です。',
+        message: requiresApprovalByPolicy
+          ? 'この操作はポリシー上CEO承認が必要です。承認リクエストを作成しました。'
+          : riskLevel === 'CRITICAL'
+            ? '【CRITICAL】承認リクエストを作成しました。危険な変更を含むため、承認まですべての作業を停止してください。'
+            : '承認リクエストを作成しました。HIGH リスク変更のため人間承認が必要です。安全な作業は継続可能です。',
       }
 
     case 'STALE':
@@ -312,6 +326,10 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
 
     const sideEffects: SideEffectEvent[] = []
 
+    // MVP-A: git_commit は実際のriskLevelに関わらず常にCEO承認を必須にする。
+    // riskLevel自体は書き換えない（decideGateOutcome/継続方針/表示文言だけで扱う）。
+    const requiresApprovalByPolicy = requestedAction === 'git_commit'
+
     // Risk Review（changedFiles ベース）
     let riskReview = runRiskReview(changedFiles)
 
@@ -365,8 +383,20 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       )
     }
 
+    // policy起因（git_commit）で承認必須にした場合、commit/diffHashが偶然一致しても
+    // 無関係なrequestedAction向けに発行された既存Approval Requestを再利用しない
+    // （例: 'test' への承認が偶然同じcommit/diffHashの'git_commit'を通過させない）。
+    // 既存のHIGH/CRITICALパス（requiresApprovalByPolicy=false）はrequestedActionを
+    // 見ない従来どおりの挙動を維持する（対象外）。
+    const existingReqForOutcome =
+      requiresApprovalByPolicy && existingReq && existingReq.requestedAction !== requestedAction
+        ? undefined
+        : existingReq
+
     // Gate 判定（純粋関数）
-    const outcome = decideGateOutcome(riskReview, existingReq, targetCommit, targetDiffHash)
+    const outcome = decideGateOutcome(riskReview, existingReqForOutcome, targetCommit, targetDiffHash, {
+      requiresApprovalByPolicy,
+    })
 
     // storage 副作用
     let approvalRequest: ApprovalRequest | undefined = existingReq
@@ -383,15 +413,21 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
         taskId, requestedAction, targetBranch, targetCommit, targetDiffHash, changedFiles,
       }
       const safeTriggeredRules = sanitizeTriggeredRulesForApprovalRequest(riskReview.triggeredRules)
+      // policy起因（git_commit）でBLOCKEDになった場合、実riskLevelは変更せず
+      // triggeredRulesへ固定ラベルを追加して理由を残す（重複追加はしない）
+      const triggeredRulesWithPolicy = requiresApprovalByPolicy && !safeTriggeredRules.includes(GIT_COMMIT_POLICY_LABEL)
+        ? [...safeTriggeredRules, GIT_COMMIT_POLICY_LABEL]
+        : safeTriggeredRules
       approvalRequest = storage.approvalRequests.create(
-        buildApprovalRequest(input, riskReview.riskLevel, safeTriggeredRules)
+        // riskReview.riskLevel は runRiskReview（+Step D）が算出した実際の値をそのまま保存する
+        buildApprovalRequest(input, riskReview.riskLevel, triggeredRulesWithPolicy)
       )
       sideEffects.push({ type: 'CREATED_APPROVAL_REQUEST', requestId: approvalRequest.id })
       newRequestId = approvalRequest.id
     }
 
-    const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision)
-    const nextAction = computeNextAction(outcome, riskReview.riskLevel, newRequestId)
+    const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)
+    const nextAction = computeNextAction(outcome, riskReview.riskLevel, requiresApprovalByPolicy, newRequestId)
 
     const response: GateCheckResponse = {
       outcome,

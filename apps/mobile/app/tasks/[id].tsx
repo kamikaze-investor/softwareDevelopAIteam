@@ -140,6 +140,7 @@ const TRIGGERED_RULE_LABEL: Record<string, string> = {
   'auth / permission guard': '認証・権限まわりの変更に関わります',
   'destructive operation': 'データ削除・破壊的操作の可能性があります',
   'docker / sandbox config': '実行環境・サンドボックス設定に関わります',
+  'git_commit requires CEO approval (policy)': '変更の反映にはCEO承認が必要です',
   'other risk factor detected': 'その他のリスク要因が検出されました',
   'payment / billing': '課金・支払いに関わる変更です',
   'secret suspected in diff': '秘密情報が含まれている可能性があります',
