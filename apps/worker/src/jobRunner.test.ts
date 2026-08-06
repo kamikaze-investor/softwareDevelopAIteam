@@ -1641,7 +1641,7 @@ function makeCliResult(overrides: Partial<{
     taskId: 'task-1',
     provider: 'claude_code' as const,
     exitCode: 0,
-    stdout: 'AI CLIの実行結果',
+    stdout: '{"is_error":false}',
     stderr: '',
     changedFiles: ['src/feature.ts'],
     durationMs: 1000,
@@ -1704,8 +1704,175 @@ describe('task-022: AI CLI 実行ブロック', () => {
     // SafeCommand も実行された
     expect(execFileSyncMock).toHaveBeenCalled()
     expect(result.status).toBe('success')
-    expect(result.stdout).toContain('=== AI CLI (claude_code/implement) ===\nAI CLIの実行結果')
+    expect(result.stdout).toContain('=== AI CLI (claude_code/implement) ===\n{"is_error":false}')
     expect(result.stdout).toContain('=== SafeCommand (git_status) ===\nsafe output\n')
+  })
+
+  it('Claude implement で変更0件かつpermission_denialsあり → failedになりSafeCommandを実行しない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({
+          is_error: false,
+          permission_denials: [{
+            tool_name: 'Edit',
+            tool_input: { file_path: 'src/x.ts', old_string: 'secret-before', new_string: 'secret-after' },
+          }],
+        }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('Claude Code tool permission denied (tools: Edit)')
+    expect(result.stderr).not.toContain('secret-before')
+    expect(result.stderr).not.toContain('secret-after')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('Claude implement で変更0件かつpermission_denialsなし → no file changesでfailedになる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: '{"is_error":false}',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('implementation produced no file changes')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('Claude implement で変更ありかつpermission_denialsあり → 通常どおりSafeCommandへ進む', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: ['src/x.ts'],
+        stdout: JSON.stringify({
+          is_error: false,
+          permission_denials: [{ tool_name: 'Edit', tool_input: { file_path: 'src/y.ts' } }],
+        }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('success')
+    expect(resolveCommandMock).toHaveBeenCalled()
+  })
+
+  it('Claude implement のstdoutが不正なJSON → failedになる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({ stdout: 'not-json' })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('could not be parsed as JSON')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('Claude implement がis_error:trueを返す → 変更があってもfailedになる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: ['src/x.ts'],
+        stdout: '{"is_error":true}',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('Claude Code CLI reported an error result')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('implement でもdryRunなら変更0件チェックの対象外になる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: 'dry-run output is not JSON',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      dryRun: true,
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'dry run',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('success')
+    expect(resolveCommandMock).toHaveBeenCalled()
+  })
+
+  it('Claude Code以外のimplementで変更0件 → JSON解析せずno file changesでfailedになる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: 'Codex plain text output',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('implementation produced no file changes')
+    expect(result.stderr).not.toContain('could not be parsed as JSON')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('reviewで変更0件 → 今回のチェック対象外で従来どおり成功する', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: 'review output is not JSON',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: '変更をレビューしてください',
+      aiCliMode: 'review',
+    }), createPolicy())
+
+    expect(result.status).toBe('success')
+    expect(resolveCommandMock).toHaveBeenCalled()
   })
 
   it('AI CLI が exitCode !== 0 → status: failed で早期リターン（SafeCommand は実行されない）', async () => {

@@ -233,7 +233,7 @@ function makeCliResult(taskId: string, provider: AiCliProvider): AiCliResult {
     exitCode: 0,
     stdout: 'ai cli completed',
     stderr: '',
-    changedFiles: [],
+    changedFiles: ['src/example.ts'],
     durationMs: 1,
     blocked: false,
   }

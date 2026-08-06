@@ -24,7 +24,7 @@
  *    確認コマンド: claude --version / claude --help
  */
 
-import type { AiCliRequest, AiCliAdapterConfig } from '@ai-team/shared'
+import type { AiCliMode, AiCliRequest, AiCliAdapterConfig } from '@ai-team/shared'
 import { BaseCliAdapter } from './adapter.js'
 
 // モードごとのシステムプロンプト接頭辞
@@ -40,6 +40,29 @@ const MODE_PREFIXES: Record<AiCliRequest['mode'], string> = {
     'あなたはSummary Engineです。以下のプロジェクト状態を30秒で読めるサマリーにしてください。\n\n',
 }
 
+const MODE_CLI_FLAGS: Record<AiCliMode, string[]> = {
+  implement: [
+    '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Glob,Grep,Edit,Write',
+    '--allowedTools', 'Read,Glob,Grep,Edit,Write',
+  ],
+  review: [
+    '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Glob,Grep',
+    '--allowedTools', 'Read,Glob,Grep',
+  ],
+  qa: [
+    '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Glob,Grep',
+    '--allowedTools', 'Read,Glob,Grep',
+  ],
+  summarize: [
+    '--permission-mode', 'dontAsk',
+    '--tools', 'Read,Glob,Grep',
+    '--allowedTools', 'Read,Glob,Grep',
+  ],
+}
+
 export class ClaudeCodeAdapter extends BaseCliAdapter {
   constructor(config: AiCliAdapterConfig) {
     super({ ...config, provider: 'claude_code' })
@@ -50,6 +73,13 @@ export class ClaudeCodeAdapter extends BaseCliAdapter {
   }
 
   protected buildArgv(request: AiCliRequest): string[] {
+    const modeFlags = MODE_CLI_FLAGS[request.mode]
+    if (modeFlags === undefined) {
+      throw new Error(
+        `[ClaudeCodeAdapter] Unknown aiCliMode "${request.mode}" — refusing to run without explicit tool permissions (fail-closed)`,
+      )
+    }
+
     const fullPrompt = MODE_PREFIXES[request.mode] + request.prompt
 
     // Claude Code CLI の非対話モード
@@ -58,6 +88,7 @@ export class ClaudeCodeAdapter extends BaseCliAdapter {
     return [
       '--print', fullPrompt,
       '--output-format', 'json',
+      ...modeFlags,
     ]
   }
 }

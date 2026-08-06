@@ -461,7 +461,7 @@ function getChangedFiles(workingDir: string): string[] {
  * task-023: JSON文字列のパースを試みる
  * stdout内のコードブロックまたは生のJSONオブジェクトを探す
  */
-function tryParseJson(stdout: string): Record<string, unknown> | undefined {
+export function tryParseJson(stdout: string): Record<string, unknown> | undefined {
   // ```json ... ``` ブロックを優先
   const jsonBlockMatch = stdout.match(/```json\n([\s\S]+?)\n```/)
   if (jsonBlockMatch) {

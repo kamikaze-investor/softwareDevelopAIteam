@@ -10,8 +10,17 @@
 
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import type { Job, JobGuardResult, PermissionBlockEvent, RollbackInfo, ApprovalLevelResult } from '@ai-team/shared'
+import type {
+  AiCliProvider,
+  AiCliResult,
+  Job,
+  JobGuardResult,
+  PermissionBlockEvent,
+  RollbackInfo,
+  ApprovalLevelResult,
+} from '@ai-team/shared'
 import { runRiskReview } from '@ai-team/shared'
+import { tryParseJson } from './aiCli/adapter.js'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
@@ -569,6 +578,30 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
       })
     }
 
+    if (job.aiCliMode === 'implement' && !job.dryRun) {
+      const implementFailureReason = classifyClaudeImplementFailure(job.aiCliProvider, cliResult)
+      if (implementFailureReason !== undefined) {
+        console.error(`[jobRunner] implement Job が変更を生成しませんでした: ${implementFailureReason}`)
+        return inspectAfterAiFailure({
+          workingDir: job.safeCommand.workingDir,
+          startCommitHash,
+          reflogBaseline,
+          sensitiveBaseline,
+          policy,
+          guardResult,
+          startedAt,
+          approvalLevelResult,
+          exitCode: cliResult.exitCode,
+          stdout: cliResult.stdout,
+          stderr: cliResult.stderr
+            ? `${cliResult.stderr}\n[jobRunner] ${implementFailureReason}`
+            : `[jobRunner] ${implementFailureReason}`,
+          stdoutPath: cliResult.stdoutPath,
+          stderrPath: cliResult.stderrPath,
+        })
+      }
+    }
+
     aiCliStdoutSection = `=== AI CLI (${job.aiCliProvider}/${job.aiCliMode}) ===\n${cliResult.stdout}`
     console.log(`[jobRunner] AI CLI 成功 (${job.aiCliProvider}): changedFiles=${cliResult.changedFiles.length}件 → SafeCommand に続行`)
   }
@@ -981,6 +1014,58 @@ function withSensitiveChanges(
   const sensitiveChanges = diffSensitiveBaseline(baseline, current)
   if (sensitiveChanges.length === 0) return manifest
   return mergeManifests(manifest, manifestFromChanges(sensitiveChanges))
+}
+
+/**
+ * implement モードでAI CLIが成功終了したが、実際にはファイル変更が0件だった場合の
+ * 失敗理由を判定する。undefined を返せば通常どおり後続処理へ進む。
+ */
+function classifyClaudeImplementFailure(
+  provider: AiCliProvider,
+  cliResult: AiCliResult,
+): string | undefined {
+  if (provider !== 'claude_code') {
+    // Claude Code CLI以外は JSON 形式が異なるため permission_denials 等を解析しない。
+    // 変更0件のときだけ technical failure にする。
+    return cliResult.changedFiles.length === 0 ? 'implementation produced no file changes' : undefined
+  }
+
+  const parsed = tryParseJson(cliResult.stdout)
+  if (parsed === undefined) {
+    return 'Claude Code CLI output could not be parsed as JSON'
+  }
+  if (parsed.is_error === true) {
+    return 'Claude Code CLI reported an error result'
+  }
+
+  if (cliResult.changedFiles.length > 0) {
+    // 変更が実際に存在する場合、permission_denials があっても失敗にしない
+    // （拒否情報は aiCliStdoutSection 経由で既存ログにそのまま残る）。
+    return undefined
+  }
+
+  const deniedTools = extractDeniedToolNames(parsed)
+  if (deniedTools.length > 0) {
+    return `Claude Code tool permission denied (tools: ${deniedTools.join(', ')})`
+  }
+  return 'implementation produced no file changes'
+}
+
+/**
+ * Claude Code CLI JSON の permission_denials から tool_name だけを安全に取り出す。
+ * tool_input・ファイル内容・token等は一切ログへ含めない。
+ */
+function extractDeniedToolNames(parsed: Record<string, unknown>): string[] {
+  const denials = parsed.permission_denials
+  if (!Array.isArray(denials)) return []
+  const names: string[] = []
+  for (const denial of denials) {
+    if (denial !== null && typeof denial === 'object' && 'tool_name' in denial) {
+      const toolName = (denial as { tool_name: unknown }).tool_name
+      if (typeof toolName === 'string') names.push(toolName)
+    }
+  }
+  return names
 }
 
 interface AiFailureInspectionInput {
