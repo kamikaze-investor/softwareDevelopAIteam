@@ -122,8 +122,12 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Project not found' })
     }
 
-    const task = storage.tasks.create(result.data)
-    return reply.status(201).send(task)
+    const created = storage.tasks.createWithInitialImplementJob(result.data)
+    if (!created.ok) {
+      req.log.error({ reason: created.reason }, 'Failed to create Task workflow')
+      return reply.status(500).send({ error: 'Failed to create Task workflow' })
+    }
+    return reply.status(201).send(created.task)
   })
 
   app.post<{ Params: { id: string } }>('/:id/resume', async (req, reply) => {

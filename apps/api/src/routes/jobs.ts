@@ -61,7 +61,7 @@ const CreateJobBody = z.object({
   aiCliProvider: AiCliProviderSchema.optional(),
   aiCliPrompt: z.string().max(50_000).optional(),
   aiCliMode: AiCliModeSchema.optional(),
-}).refine(
+}).strict().refine(
   (d) => {
     const hasProvider = d.aiCliProvider !== undefined
     const hasPrompt = d.aiCliPrompt !== undefined
@@ -150,6 +150,45 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const result = UpdateJobBody.safeParse(req.body)
     if (!result.success) {
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
+    }
+
+    const existing = storage.jobs.findById(req.params.id)
+    if (!existing) {
+      return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    const isInitialImplementWorkflowJob =
+      existing.workflowStepKey === `task:${existing.taskId}:initial-implement` &&
+      existing.aiCliMode === 'implement'
+    const shouldCreateReview =
+      isInitialImplementWorkflowJob &&
+      existing.safeCommand.kind === 'test' &&
+      result.data.status === 'success' &&
+      result.data.exitCode === 0 &&
+      (result.data.changedFiles?.length ?? 0) > 0 &&
+      result.data.guardResult?.permissionAllowed === true &&
+      result.data.guardResult.fileChangeAllowed === true
+
+    if (shouldCreateReview) {
+      const transition = storage.jobs.updateAndCreateNextWorkflowJob({
+        jobId: existing.id,
+        update: result.data,
+        nextJob: {
+          taskId: existing.taskId,
+          projectId: existing.projectId,
+          workflowStepKey: `implement:${existing.id}:review`,
+          agentRole: 'qa_ai',
+          status: 'queued',
+          safeCommand: { kind: 'git_status', workingDir: TARGET_WORKING_DIR },
+          aiCliProvider: existing.aiCliProvider ?? 'claude_code',
+          aiCliMode: 'review',
+        },
+      })
+      if (!transition.ok) {
+        req.log.error({ code: transition.code, reason: transition.reason }, 'Failed to advance Job workflow')
+        return reply.status(500).send({ error: 'Failed to advance Job workflow' })
+      }
+      return reply.send(transition.job)
     }
 
     const updated = storage.jobs.update(req.params.id, result.data)

@@ -52,23 +52,20 @@ async function createProject(app: FastifyInstance, body: Partial<Project> = {}):
 }
 
 async function createTask(
-  app: FastifyInstance,
+  _app: FastifyInstance,
   projectId: string,
   body: Partial<Task> = {},
 ): Promise<Task> {
-  const res = await app.inject({
-    method: 'POST',
-    url: '/api/tasks',
-    payload: {
-      projectId,
-      title: 'Task',
-      assignee: 'developer_ai',
-      ...body,
-    },
+  const { getStorage } = await import('../storage/index.js')
+  return getStorage().tasks.create({
+    projectId,
+    title: 'Task',
+    description: '',
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+    ...body,
   })
-
-  expect(res.statusCode).toBe(201)
-  return parseBody<Task>(res.body)
 }
 
 async function createJob(
@@ -315,6 +312,157 @@ describe('Job API', () => {
       expect(body.stderr).toBe('preview stderr')
       expect(body.stdoutPath).toBe('/workspace/target/data/logs/job-1/stdout.txt')
       expect(body.stderrPath).toBe('/workspace/target/data/logs/job-1/stderr.txt')
+    })
+  })
+
+  it('PATCH /api/jobs/:id creates one review Job after a successful changed implementation', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const taskResponse = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Automatic implementation',
+          assignee: 'developer_ai',
+        },
+      })
+      const task = parseBody<Task>(taskResponse.body)
+      const initialJobsResponse = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${task.id}`,
+      })
+      const implement = parseBody<Job[]>(initialJobsResponse.body)[0]
+      const successfulResult = {
+        status: 'success' as const,
+        exitCode: 0,
+        changedFiles: ['src/feature.ts'],
+        guardResult: {
+          permissionAllowed: true,
+          fileChangeAllowed: true,
+        },
+      }
+
+      const first = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${implement.id}`,
+        payload: successfulResult,
+      })
+      const resend = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${implement.id}`,
+        payload: successfulResult,
+      })
+
+      expect(first.statusCode).toBe(200)
+      expect(resend.statusCode).toBe(200)
+      const jobsResponse = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${task.id}`,
+      })
+      const jobs = parseBody<Job[]>(jobsResponse.body)
+      expect(jobs).toHaveLength(2)
+      const reviewJob = jobs.find((job) => job.aiCliMode === 'review')
+      expect(reviewJob).toMatchObject({
+        workflowStepKey: `implement:${implement.id}:review`,
+        agentRole: 'qa_ai',
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'review',
+        status: 'queued',
+      })
+      expect(reviewJob?.aiCliPrompt).toBeUndefined()
+    })
+  })
+
+  it.each([
+    ['implement failed', { status: 'failed', exitCode: 1, changedFiles: ['src/a.ts'], guardResult: { permissionAllowed: true, fileChangeAllowed: true } }],
+    ['changedFiles is empty', { status: 'success', exitCode: 0, changedFiles: [], guardResult: { permissionAllowed: true, fileChangeAllowed: true } }],
+    ['SafeCommand failed', { status: 'failed', exitCode: 1, changedFiles: ['src/a.ts'], guardResult: { permissionAllowed: true, fileChangeAllowed: true } }],
+    ['permission guard failed', { status: 'blocked', exitCode: 1, changedFiles: ['src/a.ts'], guardResult: { permissionAllowed: false, fileChangeAllowed: true } }],
+    ['file guard failed', { status: 'blocked', exitCode: 1, changedFiles: ['src/a.ts'], guardResult: { permissionAllowed: true, fileChangeAllowed: false } }],
+  ])('does not create a review Job when %s', async (_label, resultPayload) => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const taskResponse = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Stopped implementation',
+          assignee: 'developer_ai',
+        },
+      })
+      const task = parseBody<Task>(taskResponse.body)
+      const initialJobsResponse = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${task.id}`,
+      })
+      const implement = parseBody<Job[]>(initialJobsResponse.body)[0]
+
+      const updateResponse = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${implement.id}`,
+        payload: resultPayload,
+      })
+
+      expect(updateResponse.statusCode).toBe(200)
+      const jobsResponse = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${task.id}`,
+      })
+      expect(parseBody<Job[]>(jobsResponse.body)).toHaveLength(1)
+    })
+  })
+
+  it('does not advance a manual implement Job and rejects client workflowStepKey input', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const rejectedCreate = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: project.id,
+          workflowStepKey: 'client-controlled-key',
+          agentRole: 'developer_ai',
+          safeCommand: { kind: 'test' },
+        },
+      })
+      expect(rejectedCreate.statusCode).toBe(400)
+
+      const manualResponse = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: project.id,
+          agentRole: 'developer_ai',
+          aiCliProvider: 'claude_code',
+          aiCliPrompt: 'Manual recovery',
+          aiCliMode: 'implement',
+          safeCommand: { kind: 'test' },
+        },
+      })
+      expect(manualResponse.statusCode).toBe(201)
+      const manual = parseBody<Job>(manualResponse.body)
+      const updateResponse = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${manual.id}`,
+        payload: {
+          status: 'success',
+          exitCode: 0,
+          changedFiles: ['src/manual.ts'],
+          guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+        },
+      })
+
+      expect(updateResponse.statusCode).toBe(200)
+      const jobsResponse = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${task.id}`,
+      })
+      expect(parseBody<Job[]>(jobsResponse.body)).toHaveLength(1)
     })
   })
 })

@@ -60,23 +60,20 @@ async function createProject(app: FastifyInstance, body: Partial<Project> = {}):
 }
 
 async function createTask(
-  app: FastifyInstance,
+  _app: FastifyInstance,
   projectId: string,
   body: Partial<Task> = {},
 ): Promise<Task> {
-  const res = await app.inject({
-    method: 'POST',
-    url: '/api/tasks',
-    payload: {
-      projectId,
-      title: 'Task',
-      assignee: 'developer_ai',
-      ...body,
-    },
+  const { getStorage } = await import('../storage/index.js')
+  return getStorage().tasks.create({
+    projectId,
+    title: 'Task',
+    description: '',
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+    ...body,
   })
-
-  expect(res.statusCode).toBe(201)
-  return parseBody<Task>(res.body)
 }
 
 async function createJob(
@@ -200,6 +197,48 @@ describe('Task API', () => {
       expect(body.description).toBe('')
       expect(body.status).toBe('pending')
       expect(body.dependencies).toEqual([])
+
+      const jobsRes = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${body.id}`,
+      })
+      expect(jobsRes.statusCode).toBe(200)
+      const jobs = parseBody<Job[]>(jobsRes.body)
+      expect(jobs).toHaveLength(1)
+      expect(jobs[0]).toMatchObject({
+        workflowStepKey: `task:${body.id}:initial-implement`,
+        agentRole: 'developer_ai',
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'implement',
+        status: 'queued',
+      })
+      expect(jobs[0].safeCommand.kind).toBe('test')
+    })
+  })
+
+  it('POST /api/tasks leaves no Task when initial Job creation fails', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      vi.spyOn(storage.tasks, 'createWithInitialImplementJob').mockReturnValue({
+        ok: false,
+        code: 'STORAGE_ERROR',
+        reason: 'injected failure',
+      })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Atomic failure',
+          assignee: 'developer_ai',
+        },
+      })
+
+      expect(res.statusCode).toBe(500)
+      expect(storage.tasks.findByProjectId(project.id)).toEqual([])
     })
   })
 
