@@ -94,7 +94,6 @@ const UpdateJobBody = z.object({
     fileChangeAllowed: z.boolean(),
     fileViolations: z.array(z.string()).optional(),
   }).optional(),
-  approvalId: z.string().optional(),
 }).strict()
 
 const ListQuerySchema = z.object({

@@ -279,4 +279,5 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
 export const INDEX_STATEMENTS: string[] = [
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_project_roadmap_task_key ON tasks(project_id, roadmap_task_key)',
   "CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_single_running ON projects(status) WHERE status = 'running'",
+  'CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_approval_id ON jobs(approval_id) WHERE approval_id IS NOT NULL',
 ]

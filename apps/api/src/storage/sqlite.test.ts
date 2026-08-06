@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { createSQLiteStorage, SingleRunningProjectError } from './sqlite'
+import { CREATE_TABLES } from './schema'
 import { validateRoadmapTasks } from './roadmapTaskValidation'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './interface'
 import type { JobStatus, Task } from '@ai-team/shared'
@@ -915,6 +916,53 @@ describe('SQLiteStorage', () => {
       expect(found?.guardResult?.permissionAllowed).toBe(true)
       expect(found?.approvalId).toBe('approval-1')
     })
+
+    it('enforces one Job per non-NULL approval_id with the unique index', () => {
+      const first = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const second = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+
+      storage.jobs.update(first.id, { approvalId: 'approval-unique' })
+      expect(() => {
+        storage.jobs.update(second.id, { approvalId: 'approval-unique' })
+      }).toThrow()
+      expect(storage.jobs.findById(second.id)?.approvalId).toBeUndefined()
+    })
+
+    it('fails startup when the unique approval_id index migration finds legacy duplicates', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-duplicate-approval-${randomUUID()}.db`)
+      const legacyDb = new Database(dbPath)
+      const timestamp = new Date().toISOString()
+      legacyDb.exec(CREATE_TABLES)
+      legacyDb.prepare(`
+        INSERT INTO projects (id, name, goal, created_at, updated_at)
+        VALUES ('project-1', 'P', 'g', ?, ?)
+      `).run(timestamp, timestamp)
+      legacyDb.prepare(`
+        INSERT INTO tasks (id, project_id, title, created_at, updated_at)
+        VALUES ('task-1', 'project-1', 'T', ?, ?)
+      `).run(timestamp, timestamp)
+      const insertJob = legacyDb.prepare(`
+        INSERT INTO jobs (id, task_id, project_id, status, safe_command, approval_id, created_at)
+        VALUES (?, 'task-1', 'project-1', 'blocked', ?, 'duplicate-approval', ?)
+      `)
+      insertJob.run('job-1', JSON.stringify({ kind: 'git_commit', workingDir: '/workspace/target' }), timestamp)
+      insertJob.run('job-2', JSON.stringify({ kind: 'git_commit', workingDir: '/workspace/target' }), timestamp)
+      legacyDb.close()
+
+      expect(() => createSQLiteStorage(dbPath)).toThrow()
+    })
   })
 
   describe('approvals', () => {
@@ -984,6 +1032,46 @@ describe('SQLiteStorage', () => {
       expect(req.triggeredRules).toEqual(['DB migration / schema'])
       expect(found?.changedFiles).toEqual(['apps/api/src/storage/schema.ts'])
       expect(found?.triggeredRules).toEqual(['DB migration / schema'])
+    })
+
+    it('createForJob failure leaves both Approval and Job unchanged atomically', () => {
+      const project = storage.projects.create({
+        name: 'Atomic approval project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const task = storage.tasks.create({
+        projectId: project.id,
+        title: 'Atomic approval task',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+      const job = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      })
+
+      const result = storage.approvalRequests.createForJob({
+        taskId: task.id,
+        targetBranch: 'main',
+        targetCommit: 'commit',
+        targetDiffHash: 'diff',
+        riskLevel: 'LOW',
+        requestedAction: 'git_commit',
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        invalidIf: [],
+      }, job.id)
+
+      expect(result.ok).toBe(false)
+      expect(storage.approvalRequests.findByTaskId(task.id)).toEqual([])
+      expect(storage.jobs.findById(job.id)?.approvalId).toBeUndefined()
     })
 
     it('defaults changedFiles and triggeredRules to empty arrays when omitted', () => {

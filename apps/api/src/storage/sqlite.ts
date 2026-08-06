@@ -9,7 +9,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
@@ -693,6 +693,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     update(id, data) {
       const existing = jobs.findById(id)
       if (!existing) return undefined
+
+      // Approval承認とWorkerのblocked結果保存が競合した場合、承認transactionがqueuedへ
+      // 戻したJobを古いblocked結果で巻き戻さない。実行結果も再注入せず、現在値を返す。
+      if (data.status === 'blocked' && existing.approvalId) {
+        const approvalRow = db.prepare(
+          'SELECT status FROM approval_requests WHERE id = ?'
+        ).get(existing.approvalId) as { status: ApprovalGateStatus } | undefined
+        if (approvalRow?.status === 'APPROVED' || approvalRow?.status === 'CONSUMED') {
+          return existing
+        }
+      }
+
       const updated = { ...existing, ...data }
       db.prepare(`
         UPDATE jobs SET
@@ -1040,6 +1052,272 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         req.reviewedAt ?? null,
       )
       return req
+    },
+    createForJob(data, jobId): CreateApprovalForJobResult {
+      const createTransaction = db.transaction((): CreateApprovalForJobResult => {
+        const jobRow = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as Record<string, unknown> | undefined
+        if (!jobRow) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+
+        const job = deserializeJob(jobRow)
+        if (
+          job.taskId !== data.taskId ||
+          job.safeCommand.kind !== 'git_commit' ||
+          data.requestedAction !== job.safeCommand.kind
+        ) {
+          return {
+            ok: false,
+            code: 'JOB_MISMATCH',
+            reason: 'Job task or requested action does not match the approval request',
+          }
+        }
+        if (job.approvalId !== undefined) {
+          return {
+            ok: false,
+            code: 'JOB_ALREADY_LINKED',
+            reason: 'Job is already linked to an approval request',
+          }
+        }
+
+        const approvalRequest = approvalRequests.create(data)
+        const linked = db.prepare(
+          'UPDATE jobs SET approval_id = ? WHERE id = ? AND approval_id IS NULL'
+        ).run(approvalRequest.id, jobId)
+        if (linked.changes !== 1) {
+          throw new Error('Failed to atomically link approval request to job')
+        }
+
+        return { ok: true, approvalRequest }
+      })
+
+      return createTransaction()
+    },
+    approveAndResumeJob(id, reason): ReviewApprovalAndResumeJobResult {
+      const approveTransaction = db.transaction((): ReviewApprovalAndResumeJobResult => {
+        const existing = approvalRequests.findById(id)
+        if (!existing) {
+          return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        }
+        if (existing.status !== 'WAITING_FOR_USER') {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: `Cannot approve: current status is '${existing.status}'`,
+            approvalRequest: existing,
+          }
+        }
+
+        const reviewedAt = now()
+        if (new Date(existing.expiresAt) <= new Date(reviewedAt)) {
+          const expired = db.prepare(`
+            UPDATE approval_requests
+            SET status = 'EXPIRED'
+            WHERE id = ? AND status = 'WAITING_FOR_USER'
+          `).run(id)
+          if (expired.changes !== 1) {
+            return {
+              ok: false,
+              code: 'STATUS_CONFLICT',
+              reason: 'Approval request status changed concurrently',
+            }
+          }
+          return {
+            ok: false,
+            code: 'EXPIRED',
+            reason: 'Approval request has expired',
+            approvalRequest: { ...existing, status: 'EXPIRED' },
+          }
+        }
+
+        const jobRows = db.prepare('SELECT * FROM jobs WHERE approval_id = ?').all(id) as Array<Record<string, unknown>>
+        if (jobRows.length === 0) {
+          return {
+            ok: false,
+            code: 'JOB_NOT_FOUND',
+            reason: 'No Job is linked to this approval request',
+          }
+        }
+        if (jobRows.length !== 1) {
+          return {
+            ok: false,
+            code: 'JOB_NOT_UNIQUE',
+            reason: 'Approval request is linked to multiple Jobs',
+          }
+        }
+
+        const job = deserializeJob(jobRows[0])
+        if (
+          job.taskId !== existing.taskId ||
+          job.safeCommand.kind !== 'git_commit' ||
+          existing.requestedAction !== job.safeCommand.kind ||
+          (job.status !== 'running' && job.status !== 'blocked')
+        ) {
+          return {
+            ok: false,
+            code: 'JOB_MISMATCH',
+            reason: 'Linked Job does not match the approval request or cannot be resumed',
+          }
+        }
+
+        const approvalUpdated = db.prepare(`
+          UPDATE approval_requests
+          SET status = 'APPROVED', reason = ?, reviewed_at = ?
+          WHERE id = ? AND status = 'WAITING_FOR_USER' AND expires_at > ?
+        `).run(reason ?? existing.reason ?? null, reviewedAt, id, reviewedAt)
+        if (approvalUpdated.changes !== 1) {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: 'Approval request status changed concurrently',
+          }
+        }
+
+        const jobUpdated = db.prepare(`
+          UPDATE jobs SET
+            status = 'queued', started_at = NULL, completed_at = NULL, exit_code = NULL,
+            stdout = NULL, stderr = NULL, stdout_path = NULL, stderr_path = NULL,
+            changed_files = '[]', commit_hash = NULL, rollback_info = NULL, guard_result = NULL
+          WHERE id = ? AND approval_id = ? AND status IN ('running', 'blocked')
+        `).run(job.id, id)
+        if (jobUpdated.changes !== 1) {
+          throw new Error('Failed to atomically resume the linked Job')
+        }
+
+        const approvalRequest = approvalRequests.findById(id)
+        const resumedJob = jobs.findById(job.id)
+        if (!approvalRequest || !resumedJob) {
+          throw new Error('Failed to read atomically resumed approval and Job')
+        }
+        return { ok: true, approvalRequest, job: resumedJob }
+      })
+
+      return approveTransaction()
+    },
+    consumeForJob(input): ConsumeApprovalForJobResult {
+      const consumeTransaction = db.transaction((): ConsumeApprovalForJobResult => {
+        const existing = approvalRequests.findById(input.id)
+        if (!existing) {
+          return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        }
+
+        const requestedJob = jobs.findById(input.jobId)
+        if (!requestedJob) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+
+        const linkedJobRows = db.prepare('SELECT * FROM jobs WHERE approval_id = ?').all(input.id) as Array<Record<string, unknown>>
+        if (linkedJobRows.length !== 1) {
+          return {
+            ok: false,
+            code: 'JOB_NOT_UNIQUE',
+            reason: linkedJobRows.length === 0
+              ? 'No Job is linked to this approval request'
+              : 'Approval request is linked to multiple Jobs',
+          }
+        }
+
+        const linkedJob = deserializeJob(linkedJobRows[0])
+        if (linkedJob.id !== input.jobId) {
+          return {
+            ok: false,
+            code: 'JOB_MISMATCH',
+            reason: 'Approval request is linked to a different Job',
+            approvalRequest: existing,
+            linkedJobId: linkedJob.id,
+          }
+        }
+        if (
+          requestedJob.approvalId !== existing.id ||
+          requestedJob.taskId !== existing.taskId ||
+          requestedJob.safeCommand.kind !== 'git_commit' ||
+          existing.requestedAction !== requestedJob.safeCommand.kind
+        ) {
+          return {
+            ok: false,
+            code: 'JOB_MISMATCH',
+            reason: 'Job task or requested action does not match the approval request',
+            approvalRequest: existing,
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        if (existing.targetCommit !== input.currentCommit || existing.targetDiffHash !== input.currentDiffHash) {
+          if (existing.status === 'APPROVED') {
+            db.prepare(`
+              UPDATE approval_requests SET status = 'STALE'
+              WHERE id = ? AND status = 'APPROVED'
+            `).run(input.id)
+          }
+          return {
+            ok: false,
+            code: 'STALE',
+            reason: 'Approval request is stale: commit or diff has changed',
+            approvalRequest: existing.status === 'APPROVED'
+              ? { ...existing, status: 'STALE' }
+              : existing,
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        if (existing.status === 'CONSUMED') {
+          return {
+            ok: true,
+            approvalRequest: existing,
+            jobId: linkedJob.id,
+            alreadyConsumed: true,
+          }
+        }
+        if (existing.status !== 'APPROVED') {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: `Cannot consume: current status is '${existing.status}' (must be APPROVED)`,
+            approvalRequest: existing,
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        if (new Date(existing.expiresAt) <= new Date()) {
+          db.prepare(`
+            UPDATE approval_requests SET status = 'EXPIRED'
+            WHERE id = ? AND status = 'APPROVED'
+          `).run(input.id)
+          return {
+            ok: false,
+            code: 'EXPIRED',
+            reason: 'Approval request has expired',
+            approvalRequest: { ...existing, status: 'EXPIRED' },
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        const consumed = db.prepare(`
+          UPDATE approval_requests SET status = 'CONSUMED'
+          WHERE id = ? AND status = 'APPROVED'
+        `).run(input.id)
+        if (consumed.changes !== 1) {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: 'Approval request status changed concurrently',
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        const approvalRequest = approvalRequests.findById(input.id)
+        if (!approvalRequest) {
+          throw new Error('Failed to read consumed approval request')
+        }
+        return {
+          ok: true,
+          approvalRequest,
+          jobId: linkedJob.id,
+          alreadyConsumed: false,
+        }
+      })
+
+      return consumeTransaction()
     },
     updateStatus(id, status, reason, preserveReviewMeta = false) {
       const existing = approvalRequests.findById(id)

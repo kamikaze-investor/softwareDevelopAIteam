@@ -92,6 +92,7 @@ function findRelevantRejectedRequest(
 
 // Zod スキーマ
 const GateCheckBody = z.object({
+  jobId:           z.string().min(1).optional(),
   taskId:          z.string().min(1),
   requestedAction: z.string().min(1),
   targetBranch:    z.string().min(1),
@@ -293,6 +294,7 @@ const UpdateStatusBody = z.object({
 })
 
 const ConsumeApprovalRequestBody = z.object({
+  jobId: z.string().min(1).optional(),
   currentCommit: z.string(),
   currentDiffHash: z.string(),
 })
@@ -310,7 +312,7 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const {
-      taskId, requestedAction, targetBranch, targetCommit,
+      jobId, taskId, requestedAction, targetBranch, targetCommit,
       targetDiffHash, changedFiles, diffText,
     } = parsed.data
 
@@ -329,6 +331,41 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     // MVP-A: git_commit は実際のriskLevelに関わらず常にCEO承認を必須にする。
     // riskLevel自体は書き換えない（decideGateOutcome/継続方針/表示文言だけで扱う）。
     const requiresApprovalByPolicy = requestedAction === 'git_commit'
+
+    // Phase A: git_commit Gateだけは実行中Jobを必須にし、任意クライアントが
+    // ApprovalとJobの関連を作れないようAPI側で実体と内容を検証する。
+    let linkedGitCommitApproval: ApprovalRequest | undefined
+    if (requiresApprovalByPolicy) {
+      if (!jobId) {
+        return reply.status(400).send({ error: 'jobId is required for git_commit gate checks' })
+      }
+      const job = storage.jobs.findById(jobId)
+      if (!job) {
+        return reply.status(404).send({ error: 'Job not found' })
+      }
+      if (
+        job.taskId !== taskId ||
+        job.safeCommand.kind !== 'git_commit' ||
+        requestedAction !== job.safeCommand.kind
+      ) {
+        return reply.status(409).send({
+          error: 'Job task or requested action does not match the gate check',
+        })
+      }
+      if (job.approvalId) {
+        const linkedApproval = storage.approvalRequests.findById(job.approvalId)
+        if (
+          !linkedApproval ||
+          linkedApproval.taskId !== taskId ||
+          linkedApproval.requestedAction !== requestedAction
+        ) {
+          return reply.status(409).send({
+            error: 'Job has an invalid approval association',
+          })
+        }
+        linkedGitCommitApproval = linkedApproval
+      }
+    }
 
     // Risk Review（changedFiles ベース）
     let riskReview = runRiskReview(changedFiles)
@@ -355,7 +392,11 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     }
 
     // アクティブな承認リクエストを取得
-    let existingReq = storage.approvalRequests.findActiveByTaskId(taskId)
+    // 同一Taskには複数の正当なJobが存在し得る。git_commitはTask単位の最新Approvalではなく、
+    // jobs.approval_idでこのJobに結び付いたApprovalだけを再利用する。
+    let existingReq = requiresApprovalByPolicy
+      ? linkedGitCommitApproval
+      : storage.approvalRequests.findActiveByTaskId(taskId)
 
     // P2-followup: expired APPROVED cleanup
     // findActiveByTaskId は expiresAt を見ないため期限切れ APPROVED が返ることがある。
@@ -375,7 +416,7 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    if (!existingReq) {
+    if (!existingReq && !requiresApprovalByPolicy) {
       existingReq = findRelevantRejectedRequest(
         storage.approvalRequests.findByTaskId(taskId),
         targetCommit,
@@ -418,10 +459,18 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       const triggeredRulesWithPolicy = requiresApprovalByPolicy && !safeTriggeredRules.includes(GIT_COMMIT_POLICY_LABEL)
         ? [...safeTriggeredRules, GIT_COMMIT_POLICY_LABEL]
         : safeTriggeredRules
-      approvalRequest = storage.approvalRequests.create(
-        // riskReview.riskLevel は runRiskReview（+Step D）が算出した実際の値をそのまま保存する
-        buildApprovalRequest(input, riskReview.riskLevel, triggeredRulesWithPolicy)
-      )
+      const approvalData = buildApprovalRequest(input, riskReview.riskLevel, triggeredRulesWithPolicy)
+      if (requiresApprovalByPolicy) {
+        const created = storage.approvalRequests.createForJob(approvalData, jobId!)
+        if (!created.ok) {
+          return reply.status(created.code === 'JOB_NOT_FOUND' ? 404 : 409).send({
+            error: created.reason,
+          })
+        }
+        approvalRequest = created.approvalRequest
+      } else {
+        approvalRequest = storage.approvalRequests.create(approvalData)
+      }
       sideEffects.push({ type: 'CREATED_APPROVAL_REQUEST', requestId: approvalRequest.id })
       newRequestId = approvalRequest.id
     }
@@ -445,6 +494,12 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
     const result = CreateApprovalRequestBody.safeParse(req.body)
     if (!result.success) {
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
+    }
+
+    if (result.data.requestedAction === 'git_commit') {
+      return reply.status(400).send({
+        error: 'git_commit approval requests must be created by /api/gate/check',
+      })
     }
 
     // 同 taskId の既存アクティブリクエストを SUPERSEDED にする
@@ -503,6 +558,17 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
+    if (result.data.status === 'APPROVED' && request.requestedAction === 'git_commit') {
+      const approved = storage.approvalRequests.approveAndResumeJob(req.params.id, result.data.reason)
+      if (!approved.ok) {
+        return reply.status(approved.code === 'NOT_FOUND' ? 404 : 409).send({
+          error: approved.reason,
+          ...(approved.approvalRequest ? { status: approved.approvalRequest.status } : {}),
+        })
+      }
+      return reply.send(approved.approvalRequest)
+    }
+
     const updated = storage.approvalRequests.updateStatus(
       req.params.id,
       result.data.status as ApprovalGateStatus,
@@ -512,42 +578,68 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
   })
 
   // POST /api/approval-requests/:id/consume — APPROVED → CONSUMED に遷移（一回限りの承認を強制）
-  // 検証順: 404 → 409(非APPROVED) → 409(期限切れ) → 409(commit/diff不一致) → 200(CONSUMED)
+  // git_commitはJob関連・task/action・commit/diffをtransaction内で検証する。
   app.post<{ Params: { id: string } }>('/approval-requests/:id/consume', async (req, reply) => {
-    // 1. リクエストが存在しない → 404
     const request = storage.approvalRequests.findById(req.params.id)
     if (!request) {
       return reply.status(404).send({ error: 'Approval request not found' })
     }
 
-    // 2. APPROVED 以外は consume 不可 → 409（状態遷移なし）
-    //    CONSUMED を再 consume しようとした場合もここで 409 になる（二重consume防止）
+    const bodyResult = ConsumeApprovalRequestBody.safeParse(req.body)
+    if (!bodyResult.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: bodyResult.error.format() })
+    }
+    const { jobId, currentCommit, currentDiffHash } = bodyResult.data
+
+    if (request.requestedAction === 'git_commit') {
+      if (!jobId) {
+        return reply.status(400).send({ error: 'jobId is required to consume a git_commit approval' })
+      }
+
+      const consumed = storage.approvalRequests.consumeForJob({
+        id: req.params.id,
+        jobId,
+        currentCommit,
+        currentDiffHash,
+      })
+      if (!consumed.ok) {
+        const consumedByDifferentJob =
+          consumed.code === 'JOB_MISMATCH' &&
+          consumed.approvalRequest?.status === 'CONSUMED' &&
+          consumed.linkedJobId !== undefined &&
+          consumed.linkedJobId !== jobId
+        return reply.status(consumed.code === 'NOT_FOUND' || consumed.code === 'JOB_NOT_FOUND' ? 404 : 409).send({
+          error: consumed.reason,
+          consumed: consumedByDifferentJob,
+          ...(consumed.linkedJobId ? { jobId: consumed.linkedJobId } : {}),
+        })
+      }
+
+      return reply.send({
+        ...consumed.approvalRequest,
+        consumed: true,
+        jobId: consumed.jobId,
+        alreadyConsumed: consumed.alreadyConsumed,
+      })
+    }
+
+    // 非git_commit経路は既存契約を維持する。
     if (request.status !== 'APPROVED') {
       return reply.status(409).send({
         error: `Cannot consume: current status is '${request.status}' (must be APPROVED)`,
       })
     }
 
-    // body をパース
-    const bodyResult = ConsumeApprovalRequestBody.safeParse(req.body)
-    if (!bodyResult.success) {
-      return reply.status(400).send({ error: 'Validation failed', details: bodyResult.error.format() })
-    }
-    const { currentCommit, currentDiffHash } = bodyResult.data
-
-    // 3. expiresAt 超過 → EXPIRED に遷移して 409
     if (new Date(request.expiresAt) <= new Date()) {
       storage.approvalRequests.updateStatus(req.params.id, 'EXPIRED', undefined, true)
       return reply.status(409).send({ error: 'Approval request has expired' })
     }
 
-    // 4. commit または diffHash が不一致 → STALE に遷移して 409
     if (request.targetCommit !== currentCommit || request.targetDiffHash !== currentDiffHash) {
       storage.approvalRequests.updateStatus(req.params.id, 'STALE', undefined, true)
       return reply.status(409).send({ error: 'Approval request is stale: commit or diff has changed' })
     }
 
-    // 5. すべてパス → APPROVED → CONSUMED に遷移（preserveReviewMeta=true で CEO メモ保持）
     const updated = storage.approvalRequests.updateStatus(req.params.id, 'CONSUMED', undefined, true)
     return reply.send(updated)
   })

@@ -86,6 +86,8 @@ export interface JobRunResult {
   stdoutPath?: string
   stderrPath?: string
   changedFiles?: string[]
+  /** git_commitが実際に作成したcommit。API最終保存とは独立した照合証跡。 */
+  commitHash?: string
   guardResult: JobGuardResult
   startedAt: string
   completedAt: string
@@ -273,6 +275,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   let checkResponse: GateCheckResponse
   try {
     checkResponse = await callGateCheck({
+      jobId: job.id,
       taskId: job.taskId,
       requestedAction: job.safeCommand.kind,
       targetBranch,
@@ -427,6 +430,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     console.log(`[gate] consuming approval request: requestId=${consumeRequestId}`)
     try {
       const consumeResult = await callConsume(consumeRequestId, {
+        jobId: job.id,
         currentCommit: targetCommit,
         currentDiffHash: targetDiffHash,
       })
@@ -813,6 +817,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   let stderr = ''
   let beforeCommitHash: string | undefined
   let afterCommitHash: string | undefined
+  let createdCommitHash: string | undefined
 
   if (!job.dryRun) {
     // アトミックジョブの場合は実行前コミットハッシュを記録
@@ -839,6 +844,28 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     if (isAtomic) {
       afterCommitHash = getCommitHash(job.safeCommand.workingDir)
     }
+
+    if (
+      job.safeCommand.kind === 'git_commit' &&
+      beforeCommitHash !== undefined &&
+      afterCommitHash !== undefined &&
+      afterCommitHash !== beforeCommitHash
+    ) {
+      createdCommitHash = afterCommitHash
+      const evidence = `[commit-evidence] commitHash=${createdCommitHash}`
+      try {
+        // commit作成直後、後続の最終検査より前にJob個別ログへ同期保存する。
+        saveJobLogs(job.id, `${evidence}\n${stdout}`, stderr)
+      } catch (err: unknown) {
+        return {
+          ...failTechnical(
+            startedAt,
+            `Commit ${createdCommitHash} was created, but its Job evidence log could not be saved: ${formatUnknownError(err)}`,
+          ),
+          commitHash: createdCommitHash,
+        }
+      }
+    }
   }
 
   // ── Stage B / Stage C: 最終成果の全面再検査 ────────────────────────────────
@@ -860,7 +887,10 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     finalManifest = inspection.manifest
     finalDiffText = inspection.diffText
   } catch (err: unknown) {
-    return failClosed(startedAt, formatChangeDetectionError(err), guardResult)
+    return {
+      ...failClosed(startedAt, formatChangeDetectionError(err), guardResult),
+      ...(createdCommitHash ? { commitHash: createdCommitHash } : {}),
+    }
   }
 
   const changedFiles = finalManifest.paths
@@ -883,10 +913,21 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   const finalRiskReview = runRiskReview(changedFiles)
   logFinalRiskReview(finalRiskReview.riskLevel, changedFiles)
 
-  const combinedStdout = aiCliStdoutSection
+  const commitEvidenceSection = createdCommitHash
+    ? `[commit-evidence] commitHash=${createdCommitHash}\n`
+    : ''
+  const combinedStdout = commitEvidenceSection + (aiCliStdoutSection
     ? `${aiCliStdoutSection}\n=== SafeCommand (${job.safeCommand.kind}) ===\n${stdout}`
-    : stdout
-  const logPaths = saveJobLogs(job.id, combinedStdout, stderr)
+    : stdout)
+  let logPaths: ReturnType<typeof saveJobLogs>
+  try {
+    logPaths = saveJobLogs(job.id, combinedStdout, stderr)
+  } catch (err: unknown) {
+    return {
+      ...failTechnical(startedAt, `Job result log could not be saved: ${formatUnknownError(err)}`),
+      ...(createdCommitHash ? { commitHash: createdCommitHash } : {}),
+    }
+  }
 
   // アトミックジョブの RollbackInfo を自動生成
   let rollbackInfo: RollbackInfo | undefined
@@ -906,6 +947,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     stdoutPath: logPaths.stdoutPath,
     stderrPath: logPaths.stderrPath,
     changedFiles,
+    commitHash: createdCommitHash,
     guardResult,
     startedAt,
     completedAt: new Date().toISOString(),

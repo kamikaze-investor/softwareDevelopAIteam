@@ -740,7 +740,7 @@ function ApprovalHistorySection({
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>このTaskに関する承認履歴</Text>
       <Text style={styles.sectionDescription}>
-        承認履歴はTask単位の関連情報です。特定Jobとの1対1対応は追跡していません。
+        変更反映の承認後は、承認済みのJobが自動的に反映待ちへ戻ります。
       </Text>
 
       {sortedApprovalRequests.length === 0 && (

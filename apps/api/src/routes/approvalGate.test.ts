@@ -1,14 +1,15 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import { createHash } from 'crypto'
 import { beforeEach, describe, expect, it } from 'vitest'
-import type { ApprovalRequest, RiskReviewResult } from '@ai-team/shared'
+import type { ApprovalRequest, Job, RiskReviewResult } from '@ai-team/shared'
 import { decideGateOutcome } from '@ai-team/shared'
 
 async function buildApp(): Promise<FastifyInstance> {
   process.env.DB_PATH = ':memory:'
 
-  const [{ approvalGateRoutes }, { resetStorage }] = await Promise.all([
+  const [{ approvalGateRoutes }, { jobRoutes }, { resetStorage }] = await Promise.all([
     import('./approvalGate.js'),
+    import('./jobs.js'),
     import('../storage/index.js'),
   ])
 
@@ -16,6 +17,7 @@ async function buildApp(): Promise<FastifyInstance> {
 
   const app = Fastify()
   app.register(approvalGateRoutes, { prefix: '/api' })
+  app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app
 }
@@ -66,12 +68,23 @@ async function patchStatus(app: FastifyInstance, id: string, status: string, rea
 async function consumeRequest(
   app: FastifyInstance,
   id: string,
-  payload: { currentCommit: string; currentDiffHash: string },
+  payload: { jobId?: string; currentCommit: string; currentDiffHash: string },
 ): Promise<{ statusCode: number; body: unknown }> {
+  let effectivePayload = payload
+  if (!payload.jobId) {
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const approvalRequest = storage.approvalRequests.findById(id)
+    if (approvalRequest?.requestedAction === 'git_commit') {
+      const linkedJob = storage.jobs.findByTaskId(approvalRequest.taskId)
+        .find((job) => job.approvalId === id)
+      if (linkedJob) effectivePayload = { ...payload, jobId: linkedJob.id }
+    }
+  }
   const res = await app.inject({
     method: 'POST',
     url: `/api/approval-requests/${id}/consume`,
-    payload,
+    payload: effectivePayload,
   })
   return { statusCode: res.statusCode, body: parseBody(res.body) }
 }
@@ -512,16 +525,104 @@ const BASE_GATE_PAYLOAD = {
   changedFiles: ['apps/api/src/storage/migration.ts'],
 }
 
+const gateTaskIds = new WeakMap<FastifyInstance, Map<string, string>>()
+
+async function ensureGateTask(app: FastifyInstance, logicalTaskId: string): Promise<string> {
+  let taskIds = gateTaskIds.get(app)
+  if (!taskIds) {
+    taskIds = new Map<string, string>()
+    gateTaskIds.set(app, taskIds)
+  }
+  const existingTaskId = taskIds.get(logicalTaskId)
+  if (existingTaskId) return existingTaskId
+
+  const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
+  const project = storage.projects.create({
+    name: `Gate project ${logicalTaskId}`,
+    goal: 'Approval Gate test',
+    designPhilosophy: [],
+    status: 'draft',
+  })
+  const task = storage.tasks.create({
+    projectId: project.id,
+    title: logicalTaskId,
+    description: 'Approval Gate test task',
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+  })
+  taskIds.set(logicalTaskId, task.id)
+  return task.id
+}
+
 async function gateCheck(
   app: FastifyInstance,
   payload: Record<string, unknown>,
 ): Promise<{ statusCode: number; body: GateCheckResponse }> {
+  let effectivePayload = payload
+  if (payload.requestedAction === 'git_commit' && typeof payload.jobId !== 'string') {
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const taskId = await ensureGateTask(app, String(payload.taskId))
+    let job = storage.jobs.findByTaskId(taskId)
+      .find((candidate) => candidate.safeCommand.kind === 'git_commit')
+    if (!job) {
+      job = storage.jobs.create({
+        taskId,
+        projectId: 'gate-project-001',
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: {
+          kind: 'git_commit',
+          workingDir: '/workspace/target',
+          params: { commitMessage: 'test commit' },
+        },
+      })
+    }
+    effectivePayload = { ...payload, taskId, jobId: job.id }
+  }
   const res = await app.inject({
     method: 'POST',
     url: '/api/gate/check',
-    payload,
+    payload: effectivePayload,
   })
   return { statusCode: res.statusCode, body: parseBody<GateCheckResponse>(res.body) }
+}
+
+async function startGitCommitApproval(
+  app: FastifyInstance,
+  logicalTaskId: string,
+): Promise<{ approvalRequest: ApprovalRequest; job: Job }> {
+  const { statusCode, body } = await gateCheck(app, {
+    ...BASE_GATE_PAYLOAD,
+    taskId: logicalTaskId,
+    requestedAction: 'git_commit',
+    changedFiles: ['docs/README.md'],
+  })
+  expect(statusCode).toBe(200)
+  expect(body.approvalRequest).toBeDefined()
+
+  const approvalRequest = body.approvalRequest!
+  const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
+  const job = storage.jobs.findByTaskId(approvalRequest.taskId)
+    .find((candidate) => candidate.approvalId === approvalRequest.id)
+  expect(job).toBeDefined()
+  return { approvalRequest, job: job! }
+}
+
+async function patchJob(
+  app: FastifyInstance,
+  jobId: string,
+  payload: Record<string, unknown>,
+): Promise<{ statusCode: number; job: Job }> {
+  const res = await app.inject({
+    method: 'PATCH',
+    url: `/api/jobs/${jobId}`,
+    payload,
+  })
+  return { statusCode: res.statusCode, job: parseBody<Job>(res.body) }
 }
 
 describe('POST /api/gate/check', () => {
@@ -1060,8 +1161,9 @@ describe('POST /api/gate/check — git_commit requiresApprovalByPolicy', () => {
     await withApp(async (app) => {
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
+      const taskId = await ensureGateTask(app, 'gate-commit-004')
       storage.approvalRequests.create({
-        taskId: 'gate-commit-004',
+        taskId,
         targetBranch: GIT_COMMIT_PAYLOAD.targetBranch,
         targetCommit: GIT_COMMIT_PAYLOAD.targetCommit,
         targetDiffHash: GIT_COMMIT_PAYLOAD.targetDiffHash,
@@ -1133,7 +1235,8 @@ describe('POST /api/gate/check — git_commit requiresApprovalByPolicy', () => {
 
   it('requestedAction不一致（別アクションのAPPROVED、同一commit/diffHash）→ 再利用せず新規BLOCKED', async () => {
     await withApp(async (app) => {
-      const taskId = 'gate-commit-007'
+      const logicalTaskId = 'gate-commit-007'
+      const taskId = await ensureGateTask(app, logicalTaskId)
       // 'test' アクションに対する承認を作成・APPROVEDにする（commit/diffHashはgit_commit側と同一）
       const unrelated = await createApprovalRequest(app, {
         taskId,
@@ -1144,7 +1247,7 @@ describe('POST /api/gate/check — git_commit requiresApprovalByPolicy', () => {
       await patchStatus(app, unrelated.id, 'APPROVED')
 
       // 同一 commit/diffHash で git_commit を確認 → 無関係な承認を消費してはならない
-      const { statusCode, body } = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
+      const { statusCode, body } = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId: logicalTaskId })
       expect(statusCode).toBe(200)
       expect(body.outcome.decision).toBe('BLOCKED')
       expect(body.outcome.decision).not.toBe('ALLOW')
@@ -1195,6 +1298,243 @@ describe('POST /api/gate/check — git_commit requiresApprovalByPolicy', () => {
       expect(body.outcome.riskLevel).toBe('CRITICAL')
       expect(body.continuationPolicy).toBe('block_until_approved')
       expect(body.approvalRequest?.triggeredRules).toContain('git_commit requires CEO approval (policy)')
+    })
+  })
+})
+
+describe('Phase A — git_commit Approvalと同一Jobの自動再開', () => {
+  it('順序A: blocked保存後の承認で同じJobだけをqueuedへ戻し、一時実行状態を初期化する', async () => {
+    await withApp(async (app) => {
+      const { approvalRequest, job } = await startGitCommitApproval(app, 'phase-a-order-a')
+      const blocked = await patchJob(app, job.id, {
+        status: 'blocked',
+        startedAt: '2026-08-06T00:00:00.000Z',
+        completedAt: '2026-08-06T00:01:00.000Z',
+        exitCode: 1,
+        stdout: 'old stdout',
+        stderr: 'waiting approval',
+        changedFiles: ['docs/README.md'],
+      })
+      expect(blocked.job.status).toBe('blocked')
+
+      const approved = await patchStatus(app, approvalRequest.id, 'APPROVED', 'approved')
+      expect(approved.status).toBe('APPROVED')
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const stored = storage.jobs.findById(job.id)!
+      expect(stored.status).toBe('queued')
+      expect(stored.startedAt).toBeUndefined()
+      expect(stored.completedAt).toBeUndefined()
+      expect(stored.exitCode).toBeUndefined()
+      expect(stored.stdout).toBeUndefined()
+      expect(stored.stderr).toBeUndefined()
+      expect(stored.changedFiles).toEqual([])
+      expect(stored.id).toBe(job.id)
+      expect(stored.approvalId).toBe(approvalRequest.id)
+      expect(stored.safeCommand).toEqual(job.safeCommand)
+      expect(stored.createdAt).toBe(job.createdAt)
+      expect(storage.jobs.findByTaskId(job.taskId)).toHaveLength(1)
+    })
+  })
+
+  it('順序B: 承認が先でも後着したblocked結果でqueuedから巻き戻らない', async () => {
+    await withApp(async (app) => {
+      const { approvalRequest, job } = await startGitCommitApproval(app, 'phase-a-order-b')
+      await patchStatus(app, approvalRequest.id, 'APPROVED')
+
+      const lateBlocked = await patchJob(app, job.id, {
+        status: 'blocked',
+        completedAt: '2026-08-06T00:01:00.000Z',
+        stderr: 'late blocked result',
+      })
+      expect(lateBlocked.statusCode).toBe(200)
+      expect(lateBlocked.job.status).toBe('queued')
+      expect(lateBlocked.job.stderr).toBeUndefined()
+    })
+  })
+
+  it('二重承認は409で、新Job作成も再queueも行わない', async () => {
+    await withApp(async (app) => {
+      const { approvalRequest, job } = await startGitCommitApproval(app, 'phase-a-double-approve')
+      await patchStatus(app, approvalRequest.id, 'APPROVED')
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.jobs.update(job.id, { stdout: 'queue-once-marker' })
+
+      const second = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${approvalRequest.id}/status`,
+        payload: { status: 'APPROVED' },
+      })
+      expect(second.statusCode).toBe(409)
+      expect(storage.jobs.findByTaskId(job.taskId)).toHaveLength(1)
+      expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      expect(storage.jobs.findById(job.id)?.stdout).toBe('queue-once-marker')
+    })
+  })
+
+  it('同一Jobの再consumeだけ200の冪等成功、異なるJobは409で拒否する', async () => {
+    await withApp(async (app) => {
+      const { approvalRequest, job } = await startGitCommitApproval(app, 'phase-a-consume')
+      await patchStatus(app, approvalRequest.id, 'APPROVED')
+
+      const first = await consumeRequest(app, approvalRequest.id, {
+        jobId: job.id,
+        currentCommit: approvalRequest.targetCommit,
+        currentDiffHash: approvalRequest.targetDiffHash,
+      })
+      expect(first.statusCode).toBe(200)
+      expect((first.body as { alreadyConsumed: boolean }).alreadyConsumed).toBe(false)
+
+      const second = await consumeRequest(app, approvalRequest.id, {
+        jobId: job.id,
+        currentCommit: approvalRequest.targetCommit,
+        currentDiffHash: approvalRequest.targetDiffHash,
+      })
+      expect(second.statusCode).toBe(200)
+      expect((second.body as { alreadyConsumed: boolean }).alreadyConsumed).toBe(true)
+
+      const changedBaseline = await consumeRequest(app, approvalRequest.id, {
+        jobId: job.id,
+        currentCommit: 'changed-after-consume',
+        currentDiffHash: approvalRequest.targetDiffHash,
+      })
+      expect(changedBaseline.statusCode).toBe(409)
+      expect(changedBaseline.body).toMatchObject({ consumed: false, jobId: job.id })
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const otherJob = storage.jobs.create({
+        taskId: job.taskId,
+        projectId: job.projectId,
+        agentRole: job.agentRole,
+        status: 'running',
+        safeCommand: job.safeCommand,
+      })
+      const differentJob = await consumeRequest(app, approvalRequest.id, {
+        jobId: otherJob.id,
+        currentCommit: approvalRequest.targetCommit,
+        currentDiffHash: approvalRequest.targetDiffHash,
+      })
+      expect(differentJob.statusCode).toBe(409)
+      expect(differentJob.body).toMatchObject({ consumed: true, jobId: job.id })
+    })
+  })
+
+  it('git_commit GateはjobId・task・action不一致をfail-closedで拒否する', async () => {
+    await withApp(async (app) => {
+      const missingJobId = await app.inject({
+        method: 'POST',
+        url: '/api/gate/check',
+        payload: { ...BASE_GATE_PAYLOAD, requestedAction: 'git_commit' },
+      })
+      expect(missingJobId.statusCode).toBe(400)
+
+      const taskId = await ensureGateTask(app, 'phase-a-contract-task')
+      const otherTaskId = await ensureGateTask(app, 'phase-a-contract-other-task')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const commitJob = storage.jobs.create({
+        taskId,
+        projectId: storage.tasks.findById(taskId)!.projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const taskMismatch = await app.inject({
+        method: 'POST',
+        url: '/api/gate/check',
+        payload: {
+          ...BASE_GATE_PAYLOAD,
+          jobId: commitJob.id,
+          taskId: otherTaskId,
+          requestedAction: 'git_commit',
+        },
+      })
+      expect(taskMismatch.statusCode).toBe(409)
+
+      const actionJob = storage.jobs.create({
+        taskId,
+        projectId: storage.tasks.findById(taskId)!.projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      })
+      const actionMismatch = await app.inject({
+        method: 'POST',
+        url: '/api/gate/check',
+        payload: {
+          ...BASE_GATE_PAYLOAD,
+          jobId: actionJob.id,
+          taskId,
+          requestedAction: 'git_commit',
+        },
+      })
+      expect(actionMismatch.statusCode).toBe(409)
+    })
+  })
+
+  it.each([
+    ['commit', 'different-commit', BASE_GATE_PAYLOAD.targetDiffHash],
+    ['diff', BASE_GATE_PAYLOAD.targetCommit, 'different-diff'],
+  ])('%s不一致はconsumeを拒否し、ApprovalをSTALEへする', async (label, commit, diffHash) => {
+    await withApp(async (app) => {
+      const { approvalRequest, job } = await startGitCommitApproval(app, `phase-a-stale-${label}`)
+      await patchStatus(app, approvalRequest.id, 'APPROVED')
+
+      const stale = await consumeRequest(app, approvalRequest.id, {
+        jobId: job.id,
+        currentCommit: commit,
+        currentDiffHash: diffHash,
+      })
+      expect(stale.statusCode).toBe(409)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().approvalRequests.findById(approvalRequest.id)?.status).toBe('STALE')
+    })
+  })
+
+  it('REJECTEDと期限切れApprovalはJobをqueuedへ戻さない', async () => {
+    await withApp(async (app) => {
+      const rejectedFlow = await startGitCommitApproval(app, 'phase-a-rejected')
+      await patchStatus(app, rejectedFlow.approvalRequest.id, 'REJECTED')
+      const rejectedBlocked = await patchJob(app, rejectedFlow.job.id, { status: 'blocked' })
+      expect(rejectedBlocked.job.status).toBe('blocked')
+
+      const taskId = await ensureGateTask(app, 'phase-a-expired')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.findById(taskId)!
+      const expiredJob = storage.jobs.create({
+        taskId,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const linked = storage.approvalRequests.createForJob({
+        taskId,
+        targetBranch: 'main',
+        targetCommit: 'expired-commit',
+        targetDiffHash: 'expired-diff',
+        riskLevel: 'LOW',
+        requestedAction: 'git_commit',
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() - 1000).toISOString(),
+        invalidIf: [],
+      }, expiredJob.id)
+      expect(linked.ok).toBe(true)
+      if (!linked.ok) throw new Error(linked.reason)
+
+      const expiredApproval = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${linked.approvalRequest.id}/status`,
+        payload: { status: 'APPROVED' },
+      })
+      expect(expiredApproval.statusCode).toBe(409)
+      expect(storage.approvalRequests.findById(linked.approvalRequest.id)?.status).toBe('EXPIRED')
+      expect(storage.jobs.findById(expiredJob.id)?.status).toBe('running')
     })
   })
 })

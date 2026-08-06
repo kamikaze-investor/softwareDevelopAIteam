@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
+import { persistJobResult } from './index.js'
 import { runJob } from './jobRunner.js'
 import {
   assertIndexClean,
   assertIndexMatchesApproved,
+  assertNoHistoryRewrite,
   assertNoResidualChanges,
   buildApprovedStateMap,
   buildCommitRangeManifest,
@@ -211,6 +213,7 @@ const assertIndexCleanMock = vi.mocked(assertIndexClean)
 const stageApprovedPathsMock = vi.mocked(stageApprovedPaths)
 const buildIndexStateMapMock = vi.mocked(buildIndexStateMap)
 const assertIndexMatchesApprovedMock = vi.mocked(assertIndexMatchesApproved)
+const assertNoHistoryRewriteMock = vi.mocked(assertNoHistoryRewrite)
 const assertNoResidualChangesMock = vi.mocked(assertNoResidualChanges)
 const scanSensitiveFilesMock = vi.mocked(scanSensitiveFiles)
 const diffSensitiveBaselineMock = vi.mocked(diffSensitiveBaseline)
@@ -385,6 +388,39 @@ beforeEach(() => {
       return 'basecommit0000000000000000000000000000000'
     }
     return ''
+  })
+})
+
+describe('commit後のJob結果保存', () => {
+  it('完全結果のAPI保存失敗後は再commitせず、commitHash付きtechnical failureだけを保存する', async () => {
+    const writeJob = vi.fn<(id: string, data: Partial<Job>) => Promise<void>>()
+      .mockRejectedValueOnce(new Error('API unavailable'))
+      .mockResolvedValueOnce()
+    const result = {
+      status: 'success' as const,
+      commitHash: 'created-commit-hash',
+      guardResult: {
+        permissionAllowed: true,
+        fileChangeAllowed: true,
+        fileViolations: [],
+      },
+      startedAt: '2026-08-06T00:00:00.000Z',
+      completedAt: '2026-08-06T00:01:00.000Z',
+    }
+
+    await persistJobResult('job-1', result, 'success', writeJob)
+
+    expect(writeJob).toHaveBeenCalledTimes(2)
+    expect(writeJob.mock.calls[0]?.[1]).toMatchObject({
+      status: 'success',
+      commitHash: 'created-commit-hash',
+    })
+    expect(writeJob.mock.calls[1]?.[1]).toMatchObject({
+      status: 'failed',
+      commitHash: 'created-commit-hash',
+      stderr: expect.stringContaining('Manual reconciliation is required'),
+    })
+    expect(execFileSyncMock).not.toHaveBeenCalled()
   })
 })
 
@@ -734,6 +770,32 @@ describe('Phase 2: git_commit staging verification', () => {
       expect.any(Map),
     )
     expect(execFileSyncMock.mock.calls.some((call) => Array.isArray(call[1]) && call[1][0] === 'commit')).toBe(true)
+    expect(result.commitHash).toBe('aftercommit000000000000000000000000000000')
+    expect(saveJobLogsMock.mock.calls[0]?.[1]).toContain(
+      '[commit-evidence] commitHash=aftercommit000000000000000000000000000000',
+    )
+  })
+
+  it('records commitHash immediately and never creates a second commit when post-commit inspection fails', async () => {
+    const afterCommit = 'aftercommit-evidence000000000000000000000000'
+    mockGitCommitRun(BASE_COMMIT, afterCommit)
+    assertNoHistoryRewriteMock
+      .mockImplementationOnce(() => {})
+      .mockImplementationOnce(() => {
+        throw new ChangeDetectionErrorStub('post-commit inspection failed')
+      })
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.detectionFailure).toBe(true)
+    expect(result.commitHash).toBe(afterCommit)
+    expect(saveJobLogsMock).toHaveBeenCalledTimes(1)
+    expect(saveJobLogsMock.mock.calls[0]?.[1]).toContain(`[commit-evidence] commitHash=${afterCommit}`)
+    const commitCalls = execFileSyncMock.mock.calls.filter(
+      (call) => Array.isArray(call[1]) && call[1][0] === 'commit',
+    )
+    expect(commitCalls).toHaveLength(1)
   })
 
   it('fails before staging when the index is already dirty and never runs git reset', async () => {
@@ -1084,6 +1146,7 @@ describe('runJob — Approval Gate integration (Step 3A)', () => {
 
     expect(callGateCheckMock).toHaveBeenCalledWith(
       expect.objectContaining({
+        jobId: job.id,
         taskId: 'task-xyz',
         requestedAction: 'git_status',
       })
@@ -1202,7 +1265,11 @@ describe('runJob — callConsume integration (Step 3B)', () => {
 
     expect(callConsumeMock).toHaveBeenCalledWith(
       'req-001',
-      expect.objectContaining({ currentCommit: expect.any(String), currentDiffHash: expect.any(String) }),
+      expect.objectContaining({
+        jobId: 'job-1',
+        currentCommit: expect.any(String),
+        currentDiffHash: expect.any(String),
+      }),
     )
   })
 
@@ -1358,7 +1425,8 @@ describe('runJob — callConsume integration (Step 3B)', () => {
     // consume に渡す currentCommit / currentDiffHash は gate check 時と同一値
     const gateCheckParams = callGateCheckMock.mock.calls[0][0]
     // callConsume(requestId, { currentCommit, currentDiffHash }) → calls[0] = [requestId, params]
-    const consumeParams = callConsumeMock.mock.calls[0][1] as { currentCommit: string; currentDiffHash: string }
+    const consumeParams = callConsumeMock.mock.calls[0][1]
+    expect(consumeParams.jobId).toBe(gateCheckParams.jobId)
     expect(consumeParams.currentCommit).toBe(gateCheckParams.targetCommit)
     expect(consumeParams.currentDiffHash).toBe(gateCheckParams.targetDiffHash)
   })

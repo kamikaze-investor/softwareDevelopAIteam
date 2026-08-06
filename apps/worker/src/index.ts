@@ -36,6 +36,7 @@ type JobUpdate = Partial<Pick<
   | 'stdoutPath'
   | 'stderrPath'
   | 'changedFiles'
+  | 'commitHash'
   | 'guardResult'
 >>
 
@@ -79,6 +80,47 @@ async function updateJob(jobId: string, data: JobUpdate): Promise<void> {
 
   if (!res.ok) {
     throw new Error(`Failed to update job ${jobId}: ${res.status} ${res.statusText}`)
+  }
+}
+
+export async function persistJobResult(
+  jobId: string,
+  result: Awaited<ReturnType<typeof runJob>>,
+  resultStatus: Job['status'],
+  writeJob: (id: string, data: JobUpdate) => Promise<void> = updateJob,
+): Promise<void> {
+  const resultUpdate: JobUpdate = {
+    status: resultStatus,
+    exitCode: result.exitCode,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    stdoutPath: result.stdoutPath,
+    stderrPath: result.stderrPath,
+    changedFiles: result.changedFiles,
+    commitHash: result.commitHash,
+    completedAt: result.completedAt,
+    guardResult: result.guardResult,
+  }
+  try {
+    await writeJob(jobId, resultUpdate)
+  } catch (err: unknown) {
+    if (!result.commitHash) throw err
+
+    // commit自体は再実行しない。最終結果保存だけが失敗した場合は、commitHashを伴う
+    // technical failureとして最小更新を試み、手動照合が必要な状態をAPIへ残す。
+    const reconciliationMessage =
+      `Commit ${result.commitHash} was created, but the complete Job result could not be saved. ` +
+      'Manual reconciliation is required; do not retry git_commit automatically.'
+    await writeJob(jobId, {
+      status: 'failed',
+      exitCode: result.exitCode,
+      stderr: reconciliationMessage,
+      stdoutPath: result.stdoutPath,
+      stderrPath: result.stderrPath,
+      commitHash: result.commitHash,
+      completedAt: new Date().toISOString(),
+      guardResult: result.guardResult,
+    })
   }
 }
 
@@ -135,17 +177,7 @@ async function pollJobs(): Promise<never> {
         const resultStatus = resolveResultStatus(result)
 
         assertTransition('running', resultStatus)
-        await updateJob(job.id, {
-          status: resultStatus,
-          exitCode: result.exitCode,
-          stdout: result.stdout,
-          stderr: result.stderr,
-          stdoutPath: result.stdoutPath,
-          stderrPath: result.stderrPath,
-          changedFiles: result.changedFiles,
-          completedAt: result.completedAt,
-          guardResult: result.guardResult,
-        })
+        await persistJobResult(job.id, result, resultStatus)
 
         console.log(`[Worker] Job ${job.id}: ${resultStatus}`)
       }
@@ -206,7 +238,9 @@ async function start(): Promise<void> {
   await pollJobs()
 }
 
-start().catch((err: unknown) => {
-  console.error(`[Worker] 起動エラー: ${formatUnknownError(err)}`)
-  process.exitCode = 1
-})
+if (process.env.VITEST !== 'true') {
+  start().catch((err: unknown) => {
+    console.error(`[Worker] 起動エラー: ${formatUnknownError(err)}`)
+    process.exitCode = 1
+  })
+}

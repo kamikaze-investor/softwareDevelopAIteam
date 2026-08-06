@@ -52,6 +52,7 @@ export class GateClientError extends Error {
 // ────────────────────────────────────────────────────────────
 
 export interface GateCheckParams {
+  jobId: string
   taskId: string
   requestedAction: string
   targetBranch: string
@@ -63,6 +64,7 @@ export interface GateCheckParams {
 }
 
 export interface ConsumeParams {
+  jobId: string
   currentCommit: string
   currentDiffHash: string
 }
@@ -299,7 +301,7 @@ export async function callGateCheck(params: GateCheckParams): Promise<GateCheckR
  * 実 route 契約（`apps/api/src/routes/approvalGate.ts`）:
  *   404 → approval request 不存在        : **業務上の block**（technicalFailure=false）
  *   409 → 非APPROVED / 期限切れ / stale    : **業務上の block**（technicalFailure=false）
- *   409 + status='CONSUMED'               : 二重 consume。冪等成功として継続（既存動作）
+ *   409 + { consumed:true, jobId:<same> } : 同一Jobの二重consumeだけ冪等成功
  *   200 → 更新後の ApprovalRequest        : 成功（status='CONSUMED' まで確認する）
  *   上記以外（400 / 401 / 403 / 429 / 5xx / 通信障害 / 不正 JSON / schema 不一致）
  *                                         : **技術障害**（technicalFailure=true）
@@ -327,14 +329,12 @@ export async function callConsume(requestId: string, params: ConsumeParams): Pro
     }
 
     // ── API 契約上の意味を持つ status（業務上の block） ──
-    // 409 の JSON parse 失敗時の扱い（{} へフォールバック）は今回のclosure対象外。
-    // 既存どおり維持する。
     if (res.status === 409) {
-      const body = await res.json().catch(() => ({})) as { error?: string }
-      const errMsg = body.error ?? ''
+      const body = await res.json().catch(() => undefined)
+      const record = asRecord(body)
 
-      // 二重 consume: "Cannot consume: current status is 'CONSUMED'"
-      if (errMsg.includes("'CONSUMED'")) {
+      // 応答文字列ではなく、APIが返す構造化フィールドとJob IDの一致だけを信頼する。
+      if (record?.consumed === true && record.jobId === params.jobId) {
         console.warn(`[gateClient] consume(${requestId}): already consumed (ignoring)`)
         logActorAction('consume_approval', requestId, 'already_consumed')
         return { ok: true, alreadyConsumed: true }
@@ -342,7 +342,7 @@ export async function callConsume(requestId: string, params: ConsumeParams): Pro
 
       // それ以外の 409 (expired / stale / non-APPROVED)
       throw new GateClientError(
-        `consume(${requestId}): HTTP 409 — ${errMsg}`,
+        `consume(${requestId}): HTTP 409`,
         { technicalFailure: false },
       )
     }
@@ -373,8 +373,16 @@ export async function callConsume(requestId: string, params: ConsumeParams): Pro
       )
     }
 
+    const consumedRecord = asRecord(data)
+    const alreadyConsumed = consumedRecord?.alreadyConsumed === true
+    if (alreadyConsumed && consumedRecord.jobId !== params.jobId) {
+      throw new GateClientError(
+        `consume(${requestId}): invalid response (Job identity unconfirmed)`,
+      )
+    }
+
     logActorAction('consume_approval', requestId, 'consumed')
-    return { ok: true, data }
+    return { ok: true, data, ...(alreadyConsumed ? { alreadyConsumed: true } : {}) }
   } finally {
     // timeout は本文読み取り・schema 検証が終わるまで有効にする
     clearTimeout(timer)

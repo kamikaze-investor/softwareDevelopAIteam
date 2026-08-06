@@ -17,6 +17,36 @@ export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
   | { ok: false; reason: string }
 
+export type CreateApprovalForJobResult =
+  | { ok: true; approvalRequest: ApprovalRequest }
+  | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED'; reason: string }
+
+export type ReviewApprovalAndResumeJobResult =
+  | { ok: true; approvalRequest: ApprovalRequest; job: Job }
+  | {
+      ok: false
+      code: 'NOT_FOUND' | 'STATUS_CONFLICT' | 'EXPIRED' | 'JOB_NOT_FOUND' | 'JOB_NOT_UNIQUE' | 'JOB_MISMATCH'
+      reason: string
+      approvalRequest?: ApprovalRequest
+    }
+
+export type ConsumeApprovalForJobResult =
+  | { ok: true; approvalRequest: ApprovalRequest; jobId: string; alreadyConsumed: boolean }
+  | {
+      ok: false
+      code:
+        | 'NOT_FOUND'
+        | 'STATUS_CONFLICT'
+        | 'EXPIRED'
+        | 'STALE'
+        | 'JOB_NOT_FOUND'
+        | 'JOB_NOT_UNIQUE'
+        | 'JOB_MISMATCH'
+      reason: string
+      approvalRequest?: ApprovalRequest
+      linkedJobId?: string
+    }
+
 export interface RoadmapSyncResult {
   ok: boolean
   createdTaskIds: string[]
@@ -103,6 +133,20 @@ export interface IApprovalRequestStorage {
   /** status = WAITING_FOR_USER の全件を返す（health-score 用） */
   findWaiting(): ApprovalRequest[]
   create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
+  /** git_commit Approval の作成と jobs.approval_id 設定を単一transactionで行う。 */
+  createForJob(
+    data: Omit<ApprovalRequest, 'id' | 'createdAt'>,
+    jobId: string,
+  ): CreateApprovalForJobResult
+  /** WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。 */
+  approveAndResumeJob(id: string, reason?: string): ReviewApprovalAndResumeJobResult
+  /** Job/Task/Action/baselineを検証して git_commit Approval を一度だけconsumeする。 */
+  consumeForJob(input: {
+    id: string
+    jobId: string
+    currentCommit: string
+    currentDiffHash: string
+  }): ConsumeApprovalForJobResult
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
 }

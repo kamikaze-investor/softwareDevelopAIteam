@@ -274,6 +274,24 @@ describe('Job API', () => {
     })
   })
 
+  it('PATCH /api/jobs/:id rejects client-supplied approvalId', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: { approvalId: 'client-controlled-approval' },
+      })
+
+      expect(res.statusCode).toBe(400)
+      const fetched = await app.inject({ method: 'GET', url: `/api/jobs/${created.id}` })
+      expect(parseBody<Job>(fetched.body).approvalId).toBeUndefined()
+    })
+  })
+
   it('PATCH /api/jobs/:id updates log previews and paths', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

@@ -40,6 +40,7 @@ function makeGateCheckParams(overrides: Partial<GateCheckParams> = {}): GateChec
     targetDiffHash: 'deadbeef',
     changedFiles: ['src/feature.ts'],
     ...overrides,
+    jobId: overrides.jobId ?? 'job-001',
   }
 }
 
@@ -48,6 +49,7 @@ function makeConsumeParams(overrides: Partial<ConsumeParams> = {}): ConsumeParam
     currentCommit: 'abc123',
     currentDiffHash: 'deadbeef',
     ...overrides,
+    jobId: overrides.jobId ?? 'job-001',
   }
 }
 
@@ -309,17 +311,45 @@ describe('callConsume', () => {
     expect(result.alreadyConsumed).toBeUndefined()
   })
 
-  it("409 + status='CONSUMED' → alreadyConsumed=true を返す（STOP しない）", async () => {
+  it('409 + structured consumed response for the same Job → alreadyConsumed=true', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 409,
-      json: async () => ({ error: "Cannot consume: current status is 'CONSUMED' (must be APPROVED)" }),
+      json: async () => ({ consumed: true, jobId: 'job-001' }),
       text: async () => '',
     } as Response)
 
     const result = await callConsume('req-001', makeConsumeParams())
     expect(result.ok).toBe(true)
     expect(result.alreadyConsumed).toBe(true)
+  })
+
+  it('200 + alreadyConsumedは構造化された同一jobIdだけ受け入れる', async () => {
+    mockFetch.mockResolvedValueOnce(makeJsonResponse({
+      id: 'req-001',
+      status: 'CONSUMED',
+      consumed: true,
+      jobId: 'job-001',
+      alreadyConsumed: true,
+    }))
+
+    const result = await callConsume('req-001', makeConsumeParams())
+    expect(result.ok).toBe(true)
+    expect(result.alreadyConsumed).toBe(true)
+  })
+
+  it('200 + alreadyConsumedでも異なるjobIdなら拒否する', async () => {
+    mockFetch.mockResolvedValueOnce(makeJsonResponse({
+      id: 'req-001',
+      status: 'CONSUMED',
+      consumed: true,
+      jobId: 'job-other',
+      alreadyConsumed: true,
+    }))
+
+    const err = await callConsume('req-001', makeConsumeParams()).catch(e => e)
+    expect(err).toBeInstanceOf(GateClientError)
+    expect(err.technicalFailure).toBe(true)
   })
 
   it('409 expired → GateClientError (HTTP 409 メッセージ)', async () => {
@@ -411,16 +441,40 @@ describe('callConsume', () => {
     expect(err.technicalFailure).toBe(false)
   })
 
-  it("409 + 'CONSUMED' の冪等成功は既存どおり継続する（technical failure にしない）", async () => {
+  it('409 + same jobIdの構造化CONSUMEDだけ冪等成功として継続する', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 409,
-      json: async () => ({ error: "Cannot consume: current status is 'CONSUMED' (must be APPROVED)" }),
+      json: async () => ({ consumed: true, jobId: 'job-001' }),
     } as Response)
 
     const result = await callConsume('req-001', makeConsumeParams())
     expect(result.ok).toBe(true)
     expect(result.alreadyConsumed).toBe(true)
+  })
+
+  it('409 + consumed=trueでも異なるjobIdなら拒否する', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ consumed: true, jobId: 'job-other' }),
+    } as Response)
+
+    const err = await callConsume('req-001', makeConsumeParams()).catch(e => e)
+    expect(err).toBeInstanceOf(GateClientError)
+    expect(err.technicalFailure).toBe(false)
+  })
+
+  it("409のerror文字列に'CONSUMED'があっても冪等成功にしない", async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: async () => ({ error: "Cannot consume: current status is 'CONSUMED'" }),
+    } as Response)
+
+    const err = await callConsume('req-001', makeConsumeParams()).catch(e => e)
+    expect(err).toBeInstanceOf(GateClientError)
+    expect(err.technicalFailure).toBe(false)
   })
 
   // ── 技術障害（消費できたか確認できない） ───────────────────────
