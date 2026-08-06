@@ -42,6 +42,7 @@ export const CREATE_TABLES = `
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
+    workflow_step_key TEXT,
     agent_role TEXT NOT NULL DEFAULT 'developer_ai',
     status TEXT NOT NULL DEFAULT 'queued',
     safe_command TEXT NOT NULL,
@@ -259,6 +260,7 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'tasks', column: 'phase', definition: 'INTEGER' },
   { table: 'tasks', column: 'roadmap_active', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'jobs', column: 'agent_role', definition: "TEXT NOT NULL DEFAULT 'developer_ai'" },
+  { table: 'jobs', column: 'workflow_step_key', definition: 'TEXT' },
   { table: 'jobs', column: 'safe_command', definition: 'TEXT' },
   { table: 'jobs', column: 'dry_run', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'jobs', column: 'guard_result', definition: 'TEXT' },
@@ -280,4 +282,6 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_project_roadmap_task_key ON tasks(project_id, roadmap_task_key)',
   "CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_single_running ON projects(status) WHERE status = 'running'",
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_approval_id ON jobs(approval_id) WHERE approval_id IS NOT NULL',
+  'CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_workflow_step_key ON jobs(workflow_step_key) WHERE workflow_step_key IS NOT NULL',
+  'CREATE UNIQUE INDEX IF NOT EXISTS ux_review_results_job_id ON review_results(job_id)',
 ]

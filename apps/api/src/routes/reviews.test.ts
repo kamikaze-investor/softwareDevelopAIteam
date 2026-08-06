@@ -57,7 +57,7 @@ describe('ReviewResult API', () => {
       method: 'POST', url: '/api/reviews',
       body: {
         taskId: task.id,
-        jobId: 'job-001',
+        jobId: `job-${task.id}`,
         reviewer: 'reviewer_ai',
         status: 'approved',
         summary: 'LGTM',
@@ -79,7 +79,7 @@ describe('ReviewResult API', () => {
       method: 'POST', url: '/api/reviews',
       body: {
         taskId: task.id,
-        jobId: 'job-001',
+        jobId: `job-${task.id}`,
         reviewer: 'meta_reviewer',
         status: 'changes_requested',
         summary: '修正が必要',
@@ -98,7 +98,7 @@ describe('ReviewResult API', () => {
     const task = await createTask(app, project.id)
     await app.inject({
       method: 'POST', url: '/api/reviews',
-      body: { taskId: task.id, jobId: 'job-001', reviewer: 'reviewer_ai', status: 'approved', summary: 'OK' },
+      body: { taskId: task.id, jobId: `job-${task.id}`, reviewer: 'reviewer_ai', status: 'approved', summary: 'OK' },
     })
     const res = await app.inject({ method: 'GET', url: `/api/reviews?taskId=${task.id}` })
     expect(res.statusCode).toBe(200)
@@ -111,7 +111,7 @@ describe('ReviewResult API', () => {
     const task = await createTask(app, project.id)
     const created = JSON.parse((await app.inject({
       method: 'POST', url: '/api/reviews',
-      body: { taskId: task.id, jobId: 'job-001', reviewer: 'reviewer_ai', status: 'approved', summary: 'OK' },
+      body: { taskId: task.id, jobId: `job-${task.id}`, reviewer: 'reviewer_ai', status: 'approved', summary: 'OK' },
     })).body)
     const res = await app.inject({ method: 'GET', url: `/api/reviews/${created.id}` })
     expect(res.statusCode).toBe(200)
@@ -130,7 +130,7 @@ describe('ReviewResult API', () => {
     const task = await createTask(app, project.id)
     const res = await app.inject({
       method: 'POST', url: '/api/reviews',
-      body: { taskId: task.id, jobId: 'job-001', status: 'approved' },
+      body: { taskId: task.id, jobId: `job-${task.id}`, status: 'approved' },
     })
     expect(res.statusCode).toBe(400)
   })

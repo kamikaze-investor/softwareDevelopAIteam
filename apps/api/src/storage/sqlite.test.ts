@@ -364,6 +364,63 @@ describe('SQLiteStorage', () => {
       expect(found?.roadmapTaskKey).toBe('task-001')
     })
 
+    it('creates a Task and one initial implement Job atomically', () => {
+      const result = storage.tasks.createWithInitialImplementJob({
+        projectId,
+        title: 'Automatic task',
+        description: 'Implement the requirement',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(storage.tasks.findById(result.task.id)).toMatchObject(result.task)
+      expect(storage.jobs.findByTaskId(result.task.id)[0]).toMatchObject(result.job)
+      expect(result.job).toMatchObject({
+        workflowStepKey: `task:${result.task.id}:initial-implement`,
+        agentRole: 'developer_ai',
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'implement',
+        aiCliPrompt: 'Implement the requirement',
+        status: 'queued',
+      })
+      expect(result.job.safeCommand.kind).toBe('test')
+    })
+
+    it('rolls back Task creation when the initial implement Job insert fails', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-initial-job-rollback-${randomUUID()}.db`)
+      const fileStorage = createSQLiteStorage(dbPath)
+      const project = fileStorage.projects.create({
+        name: 'Atomic project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const triggerDb = new Database(dbPath)
+      triggerDb.exec(`
+        CREATE TRIGGER reject_initial_job
+        BEFORE INSERT ON jobs
+        BEGIN
+          SELECT RAISE(ABORT, 'initial job rejected');
+        END;
+      `)
+      triggerDb.close()
+
+      const result = fileStorage.tasks.createWithInitialImplementJob({
+        projectId: project.id,
+        title: 'Must roll back',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+
+      expect(result).toMatchObject({ ok: false, code: 'STORAGE_ERROR' })
+      expect(fileStorage.tasks.findByProjectId(project.id)).toEqual([])
+    })
+
     it('syncRoadmapTasks creates tasks from a new roadmap', () => {
       const result = storage.tasks.syncRoadmapTasks({
         projectId,
@@ -917,6 +974,124 @@ describe('SQLiteStorage', () => {
       expect(found?.approvalId).toBe('approval-1')
     })
 
+    it('allows multiple manual Jobs because workflow_step_key is NULL', () => {
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+
+      expect(storage.jobs.findByTaskId(taskId)).toHaveLength(2)
+      expect(storage.jobs.findByTaskId(taskId).every((job) => job.workflowStepKey === undefined)).toBe(true)
+    })
+
+    it('rejects duplicate non-NULL workflow step keys', () => {
+      const workflowStepKey = `task:${taskId}:initial-implement`
+      const input = {
+        taskId,
+        projectId,
+        workflowStepKey,
+        agentRole: 'developer_ai' as const,
+        status: 'queued' as const,
+        safeCommand: { kind: 'test' as const, workingDir: '/workspace/target' },
+      }
+
+      storage.jobs.create(input)
+
+      expect(() => storage.jobs.create(input)).toThrow()
+    })
+
+    it('creates a new workflow Job once and returns it on result resend', () => {
+      const implement = storage.jobs.create({
+        taskId,
+        projectId,
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      })
+      const nextJob = {
+        taskId,
+        projectId,
+        workflowStepKey: `implement:${implement.id}:review`,
+        agentRole: 'reviewer_ai' as const,
+        status: 'queued' as const,
+        safeCommand: { kind: 'git_status' as const, workingDir: '/workspace/target' },
+      }
+
+      const first = storage.jobs.updateAndCreateNextWorkflowJob({
+        jobId: implement.id,
+        update: { status: 'success' },
+        nextJob,
+      })
+      const second = storage.jobs.updateAndCreateNextWorkflowJob({
+        jobId: implement.id,
+        update: { status: 'success' },
+        nextJob,
+      })
+
+      expect(first.ok && first.nextJobCreated).toBe(true)
+      expect(second.ok && second.nextJobCreated).toBe(false)
+      expect(storage.jobs.findByTaskId(taskId)).toHaveLength(2)
+    })
+
+    it('does not advance a manual Job', () => {
+      const manual = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      })
+
+      const result = storage.jobs.updateAndCreateNextWorkflowJob({
+        jobId: manual.id,
+        update: { status: 'success' },
+        nextJob: {
+          taskId,
+          projectId,
+          workflowStepKey: `implement:${manual.id}:review`,
+          agentRole: 'reviewer_ai',
+          status: 'queued',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        },
+      })
+
+      expect(result).toMatchObject({ ok: false, code: 'NOT_WORKFLOW_JOB' })
+      expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+    })
+
+    it('creates workflow schema on a new DB and migrates a legacy jobs table', () => {
+      const newDbPath = path.join(os.tmpdir(), `ai-team-workflow-new-${randomUUID()}.db`)
+      createSQLiteStorage(newDbPath)
+      const newDb = new Database(newDbPath, { readonly: true })
+      expect((newDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'workflow_step_key',
+      )).toBe(true)
+      newDb.close()
+
+      const legacyDbPath = path.join(os.tmpdir(), `ai-team-workflow-legacy-${randomUUID()}.db`)
+      const legacyDb = new Database(legacyDbPath)
+      legacyDb.exec(CREATE_TABLES.replace('    workflow_step_key TEXT,\n', ''))
+      legacyDb.close()
+
+      expect(() => createSQLiteStorage(legacyDbPath)).not.toThrow()
+      const migratedDb = new Database(legacyDbPath, { readonly: true })
+      expect((migratedDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'workflow_step_key',
+      )).toBe(true)
+      migratedDb.close()
+    })
+
     it('enforces one Job per non-NULL approval_id with the unique index', () => {
       const first = storage.jobs.create({
         taskId,
@@ -1003,6 +1178,45 @@ describe('SQLiteStorage', () => {
       storage.approvals.update(approval.id, { status: 'approved' })
 
       expect(storage.approvals.findPendingByProjectId(projectId)).toHaveLength(0)
+    })
+  })
+
+  describe('reviewResults', () => {
+    it('enforces one ReviewResult per review Job', () => {
+      const project = storage.projects.create({
+        name: 'Review project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const task = storage.tasks.create({
+        projectId: project.id,
+        title: 'Review task',
+        description: '',
+        status: 'review',
+        assignee: 'reviewer_ai',
+        dependencies: [],
+      })
+      const job = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'reviewer_ai',
+        status: 'success',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+      const review = {
+        taskId: task.id,
+        jobId: job.id,
+        reviewer: 'reviewer_ai' as const,
+        status: 'approved' as const,
+        summary: 'Approved',
+        findings: [],
+      }
+
+      storage.reviewResults.create(review)
+
+      expect(() => storage.reviewResults.create(review)).toThrow()
+      expect(storage.reviewResults.findByTaskId(task.id)).toHaveLength(1)
     })
   })
 

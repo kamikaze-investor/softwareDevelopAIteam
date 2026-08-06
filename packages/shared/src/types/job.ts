@@ -22,6 +22,9 @@ export interface Job {
   taskId: string
   projectId: string
 
+  /** APIが自動workflow内の1回限りのstepへ付与する冪等キー。手動Jobは未設定。 */
+  workflowStepKey?: string
+
   /** 実行AIエージェント（監査ログ用） */
   agentRole: AgentRole
 

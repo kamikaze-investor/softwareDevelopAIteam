@@ -17,6 +17,18 @@ export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
   | { ok: false; reason: string }
 
+export type CreateTaskWithInitialImplementJobResult =
+  | { ok: true; task: Task; job: Job }
+  | { ok: false; code: 'STORAGE_ERROR'; reason: string }
+
+export type AdvanceWorkflowJobResult =
+  | { ok: true; job: Job; nextJob: Job; nextJobCreated: boolean }
+  | {
+      ok: false
+      code: 'JOB_NOT_FOUND' | 'NOT_WORKFLOW_JOB' | 'WORKFLOW_CONFLICT' | 'STORAGE_ERROR'
+      reason: string
+    }
+
 export type CreateApprovalForJobResult =
   | { ok: true; approvalRequest: ApprovalRequest }
   | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED'; reason: string }
@@ -76,6 +88,10 @@ export interface ITaskStorage {
    * 公開API（POST /api/tasks）からは設定できない。
    */
   create(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & { roadmapActive?: boolean }): Task
+  /** 手動Taskと、そのTask専用のinitial implement Jobを単一transactionで作成する。 */
+  createWithInitialImplementJob(
+    task: Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & { roadmapActive?: boolean },
+  ): CreateTaskWithInitialImplementJobResult
   update(id: string, data: Partial<Task>): Task | undefined
   /**
    * 検証済みロードマップTask一覧を、単一トランザクションでDBへ同期する。
@@ -90,6 +106,12 @@ export interface IJobStorage {
   findById(id: string): Job | undefined
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
   update(id: string, data: Partial<Job>): Job | undefined
+  /** workflow Jobの結果保存と次step Jobの作成を単一transactionで冪等に行う。 */
+  updateAndCreateNextWorkflowJob(input: {
+    jobId: string
+    update: Partial<Job>
+    nextJob: Omit<Job, 'id' | 'createdAt' | 'workflowStepKey'> & { workflowStepKey: string }
+  }): AdvanceWorkflowJobResult
   resumeBlockedTask(input: {
     taskId: string
     instructionPrompt: string

@@ -9,7 +9,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
@@ -431,6 +431,33 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       )
       return task
     },
+    createWithInitialImplementJob(data) {
+      const createTransaction = db.transaction((): CreateTaskWithInitialImplementJobResult => {
+        const task = tasks.create(data)
+        const job = jobs.create({
+          taskId: task.id,
+          projectId: task.projectId,
+          workflowStepKey: `task:${task.id}:initial-implement`,
+          agentRole: 'developer_ai',
+          status: 'queued',
+          safeCommand: { kind: 'test', workingDir: TARGET_WORKING_DIR },
+          aiCliProvider: 'claude_code',
+          aiCliPrompt: task.description,
+          aiCliMode: 'implement',
+        })
+        return { ok: true, task, job }
+      })
+
+      try {
+        return createTransaction()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
     update(id, data) {
       const existing = tasks.findById(id)
       if (!existing) return undefined
@@ -672,13 +699,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const job: Job = { ...data, id: randomUUID(), createdAt: now() }
       db.prepare(`
         INSERT INTO jobs
-          (id, task_id, project_id, agent_role, status, safe_command,
+          (id, task_id, project_id, workflow_step_key, agent_role, status, safe_command,
            ai_cli_provider, ai_cli_prompt, ai_cli_mode, dry_run, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         job.id,
         job.taskId,
         job.projectId,
+        job.workflowStepKey ?? null,
         job.agentRole,
         job.status,
         JSON.stringify(job.safeCommand),
@@ -729,6 +757,49 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         id,
       )
       return updated
+    },
+    updateAndCreateNextWorkflowJob(input) {
+      const transition = db.transaction((): AdvanceWorkflowJobResult => {
+        const source = jobs.findById(input.jobId)
+        if (!source) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
+        }
+        if (!source.workflowStepKey) {
+          return { ok: false, code: 'NOT_WORKFLOW_JOB', reason: 'Manual Job cannot advance the automatic workflow' }
+        }
+
+        const existingRow = db.prepare(
+          'SELECT * FROM jobs WHERE workflow_step_key = ?',
+        ).get(input.nextJob.workflowStepKey) as any
+        const existingNext = existingRow ? deserializeJob(existingRow) : undefined
+        if (
+          existingNext &&
+          (existingNext.taskId !== input.nextJob.taskId || existingNext.projectId !== input.nextJob.projectId)
+        ) {
+          return { ok: false, code: 'WORKFLOW_CONFLICT', reason: 'Workflow step key belongs to another Task or Project' }
+        }
+
+        const updated = jobs.update(input.jobId, input.update)
+        if (!updated) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
+        }
+        if (existingNext) {
+          return { ok: true, job: updated, nextJob: existingNext, nextJobCreated: false }
+        }
+
+        const nextJob = jobs.create(input.nextJob)
+        return { ok: true, job: updated, nextJob, nextJobCreated: true }
+      })
+
+      try {
+        return transition()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
     },
     resumeBlockedTask(input) {
       const resumeTransaction = db.transaction((taskId: string, instructionPrompt: string): ResumeBlockedTaskResult => {
@@ -1814,6 +1885,7 @@ function deserializeJob(row: any): Job {
     id: row.id,
     taskId: row.task_id,
     projectId: row.project_id,
+    workflowStepKey: row.workflow_step_key ?? undefined,
     agentRole: row.agent_role,
     status: row.status,
     safeCommand: row.safe_command
