@@ -6,7 +6,14 @@
 
 import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
-import type { Approval, Job, Project, ProjectStatus, Task } from '@ai-team/shared'
+import type {
+  Approval,
+  ApprovalRequest,
+  Job,
+  Project,
+  ProjectStatus,
+  Task,
+} from '@ai-team/shared'
 import { router } from 'expo-router'
 import {
   ActivityIndicator,
@@ -67,16 +74,24 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
   return (await response.json()) as Job[]
 }
 
-async function fetchApprovals(projectId: string): Promise<Approval[]> {
-  const response = await apiFetch(
-    `/api/projects/${projectId}/approvals`,
-  )
+async function fetchPendingApprovals(): Promise<Approval[]> {
+  const response = await apiFetch('/api/approvals/pending')
 
   if (!response.ok) {
-    return []
+    throw new Error(`Failed to fetch pending approvals: ${response.status}`)
   }
 
   return (await response.json()) as Approval[]
+}
+
+async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
+  const response = await apiFetch('/api/approval-requests/waiting')
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch approval requests: ${response.status}`)
+  }
+
+  return (await response.json()) as ApprovalRequest[]
 }
 
 /** 409時は本体APIの固定エラー文だけを返す（token・内部情報は含めない） */
@@ -112,13 +127,13 @@ async function fetchRecentJobs(taskIds: string[]): Promise<Job[]> {
     .slice(0, MAX_RECENT_JOBS)
 }
 
-async function fetchPendingApprovalCount(projectIds: string[]): Promise<number> {
-  const approvalGroups = await Promise.all(projectIds.map(fetchApprovals))
+async function fetchPendingApprovalCount(): Promise<number> {
+  const [approvals, approvalRequests] = await Promise.all([
+    fetchPendingApprovals(),
+    fetchWaitingApprovalRequests(),
+  ])
 
-  return approvalGroups.reduce(
-    (count, approvals): number => count + approvals.length,
-    0,
-  )
+  return approvals.length + approvalRequests.length
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -368,7 +383,7 @@ function ApiTokenSettings(): ReactElement {
 
 export default function Dashboard() {
   const [projects, setProjects] = useState<Project[]>([])
-  const [pendingApprovalCount, setPendingApprovalCount] = useState(0)
+  const [pendingApprovalCount, setPendingApprovalCount] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -376,19 +391,27 @@ export default function Dashboard() {
   const load = useCallback(async (): Promise<void> => {
     try {
       setError(null)
-      const data = await fetchProjects()
-      const approvalCount = await fetchPendingApprovalCount(
-        data.map((project) => project.id),
+      const [projectsResult, approvalCountResult] = await Promise.allSettled([
+        fetchProjects(),
+        fetchPendingApprovalCount(),
+      ])
+
+      if (projectsResult.status === 'fulfilled') {
+        setProjects(projectsResult.value)
+      } else {
+        const loadError = projectsResult.reason as unknown
+        const message =
+          loadError instanceof Error
+            ? loadError.message
+            : 'Failed to connect to API'
+        setError(message)
+      }
+
+      setPendingApprovalCount(
+        approvalCountResult.status === 'fulfilled'
+          ? approvalCountResult.value
+          : null,
       )
-      setProjects(data)
-      setPendingApprovalCount(approvalCount)
-    } catch (loadError) {
-      const message =
-        loadError instanceof Error
-          ? loadError.message
-          : 'Failed to connect to API'
-      setError(message)
-      setPendingApprovalCount(0)
     } finally {
       setLoading(false)
       setRefreshing(false)
@@ -460,7 +483,7 @@ export default function Dashboard() {
           <Text style={styles.approvalText}>承認待ち一覧</Text>
           <View style={styles.approvalBadge}>
             <Text style={styles.approvalBadgeText}>
-              {pendingApprovalCount}件
+              {pendingApprovalCount === null ? '—' : `${pendingApprovalCount}件`}
             </Text>
           </View>
         </TouchableOpacity>
