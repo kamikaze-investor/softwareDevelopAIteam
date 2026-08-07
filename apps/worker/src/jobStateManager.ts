@@ -6,6 +6,33 @@
  */
 
 import type { Job, JobStatus, Project, Task } from '@ai-team/shared'
+import { buildApiAuthHeaders } from './utils/apiAuth.js'
+
+const RECONCILE_TIMEOUT_MS = 5_000
+
+export interface ReconcileRunningFailure {
+  stderr: string
+  completedAt: string
+}
+
+export type ReconcileRunningJobResult =
+  | {
+      outcome: 'reconciled'
+      updated: boolean
+      currentStatus: JobStatus
+    }
+  | {
+      outcome: 'unrecoverable'
+      updated: false
+      currentStatus?: JobStatus
+    }
+
+export interface ReconcileRunningJobOptions {
+  apiBaseUrl?: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  fetchImpl?: typeof fetch
+}
 
 const ALLOWED_TRANSITIONS: Record<JobStatus, JobStatus[]> = {
   queued: ['running'],
@@ -25,6 +52,68 @@ export function assertTransition(from: JobStatus, to: JobStatus): void {
       `不正な状態遷移: ${from} -> ${to}。` +
         `許可: ${ALLOWED_TRANSITIONS[from]?.join(', ') || 'なし'}`
     )
+  }
+}
+
+export async function reconcileRunningJob(
+  jobId: string,
+  failure: ReconcileRunningFailure,
+  options: ReconcileRunningJobOptions = {},
+): Promise<ReconcileRunningJobResult> {
+  const apiBaseUrl = options.apiBaseUrl ?? process.env.API_BASE_URL ?? 'http://localhost:3000'
+  const headers = options.headers ?? buildApiAuthHeaders()
+  const fetchImpl = options.fetchImpl ?? fetch
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? RECONCILE_TIMEOUT_MS)
+
+  try {
+    const response = await fetchImpl(
+      `${apiBaseUrl}/api/jobs/${encodeURIComponent(jobId)}/fail-if-running`,
+      {
+        method: 'PATCH',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(failure),
+        signal: controller.signal,
+      },
+    )
+
+    if (!response.ok) {
+      return { outcome: 'unrecoverable', updated: false }
+    }
+
+    const body = await response.json() as unknown
+    if (!isFailIfRunningResponse(body)) {
+      return { outcome: 'unrecoverable', updated: false }
+    }
+
+    if (body.updated) {
+      return {
+        outcome: 'reconciled',
+        updated: true,
+        currentStatus: body.currentStatus,
+      }
+    }
+
+    if (body.currentStatus !== 'running') {
+      return {
+        outcome: 'reconciled',
+        updated: false,
+        currentStatus: body.currentStatus,
+      }
+    }
+
+    return {
+      outcome: 'unrecoverable',
+      updated: false,
+      currentStatus: body.currentStatus,
+    }
+  } catch {
+    return { outcome: 'unrecoverable', updated: false }
+  } finally {
+    clearTimeout(timeout)
   }
 }
 
@@ -55,9 +144,18 @@ export async function recoverStaleJobs(
       for (const job of jobs) {
         if (job.status === 'running') {
           assertTransition(job.status, 'failed')
-          await updateStaleJob(apiBaseUrl, headers, job.id)
-          recovered += 1
-          console.log(`[Recovery] Job ${job.id} を running -> failed にリセット`)
+          const reconciliation = await reconcileRunningJob(
+            job.id,
+            {
+              stderr: '[Worker] 前回の Worker が異常終了したため failed にリセットしました',
+              completedAt: new Date().toISOString(),
+            },
+            { apiBaseUrl, headers },
+          )
+          if (reconciliation.outcome === 'reconciled' && reconciliation.updated) {
+            recovered += 1
+            console.log(`[Recovery] Job ${job.id} を running -> failed にリセット`)
+          }
         }
       }
     }
@@ -76,25 +174,18 @@ async function fetchJson<T>(
   return await res.json() as T
 }
 
-async function updateStaleJob(
-  apiBaseUrl: string,
-  headers: Record<string, string>,
-  jobId: string
-): Promise<void> {
-  const res = await fetch(`${apiBaseUrl}/api/jobs/${encodeURIComponent(jobId)}`, {
-    method: 'PATCH',
-    headers: {
-      ...headers,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      status: 'failed',
-      stderr: '[Worker] 前回の Worker が異常終了したため failed にリセットしました',
-      completedAt: new Date().toISOString(),
-    }),
-  })
+function isFailIfRunningResponse(
+  value: unknown,
+): value is { updated: boolean; currentStatus: JobStatus } {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as { updated?: unknown; currentStatus?: unknown }
+  return typeof candidate.updated === 'boolean' && isJobStatus(candidate.currentStatus)
+}
 
-  if (!res.ok) {
-    throw new Error(`Failed to recover stale job ${jobId}: ${res.status} ${res.statusText}`)
-  }
+function isJobStatus(value: unknown): value is JobStatus {
+  return value === 'queued' ||
+    value === 'running' ||
+    value === 'success' ||
+    value === 'failed' ||
+    value === 'blocked'
 }

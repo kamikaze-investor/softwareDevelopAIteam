@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { assertTransition, isTransitionAllowed, recoverStaleJobs } from './jobStateManager.js'
+import {
+  assertTransition,
+  isTransitionAllowed,
+  reconcileRunningJob,
+  recoverStaleJobs,
+} from './jobStateManager.js'
 
 const fetchMock = vi.fn<typeof fetch>()
 
@@ -58,16 +63,108 @@ describe('assertTransition', () => {
   })
 })
 
+describe('reconcileRunningJob', () => {
+  it('updated=true は reconciled として返す', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      updated: true,
+      currentStatus: 'failed',
+      job: { id: 'job-1', status: 'failed' },
+    }))
+
+    const result = await reconcileRunningJob(
+      'job-1',
+      { stderr: 'technical failure', completedAt: '2026-08-08T00:00:00.000Z' },
+      { apiBaseUrl: 'http://api.test', headers: { authorization: 'Bearer token' } },
+    )
+
+    expect(result).toEqual({ outcome: 'reconciled', updated: true, currentStatus: 'failed' })
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://api.test/api/jobs/job-1/fail-if-running',
+      expect.objectContaining({
+        method: 'PATCH',
+        headers: {
+          authorization: 'Bearer token',
+          'Content-Type': 'application/json',
+        },
+      }),
+    )
+  })
+
+  it.each(['success', 'failed', 'blocked', 'queued'] as const)(
+    'updated=false, currentStatus=%s は reconciled として返す',
+    async (currentStatus) => {
+      fetchMock.mockResolvedValueOnce(jsonResponse({ updated: false, currentStatus, job: {} }))
+
+      const result = await reconcileRunningJob(
+        'job-1',
+        { stderr: 'technical failure', completedAt: '2026-08-08T00:00:00.000Z' },
+        { apiBaseUrl: 'http://api.test' },
+      )
+
+      expect(result).toEqual({ outcome: 'reconciled', updated: false, currentStatus })
+    },
+  )
+
+  it('updated=false, currentStatus=running は unrecoverable として返す', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      updated: false,
+      currentStatus: 'running',
+      job: { id: 'job-1', status: 'running' },
+    }))
+
+    const result = await reconcileRunningJob(
+      'job-1',
+      { stderr: 'technical failure', completedAt: '2026-08-08T00:00:00.000Z' },
+      { apiBaseUrl: 'http://api.test' },
+    )
+
+    expect(result).toEqual({ outcome: 'unrecoverable', updated: false, currentStatus: 'running' })
+  })
+
+  it('404 は unrecoverable として返す', async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 404 }))
+
+    const result = await reconcileRunningJob(
+      'missing-job',
+      { stderr: 'technical failure', completedAt: '2026-08-08T00:00:00.000Z' },
+      { apiBaseUrl: 'http://api.test' },
+    )
+
+    expect(result).toEqual({ outcome: 'unrecoverable', updated: false })
+  })
+
+  it('通信失敗は unrecoverable として返す', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'))
+
+    const result = await reconcileRunningJob(
+      'job-1',
+      { stderr: 'technical failure', completedAt: '2026-08-08T00:00:00.000Z' },
+      { apiBaseUrl: 'http://api.test' },
+    )
+
+    expect(result).toEqual({ outcome: 'unrecoverable', updated: false })
+  })
+})
+
 describe('recoverStaleJobs', () => {
-  it('running の Job を failed に更新して件数を返す', async () => {
+  it('reconciliationで実際にrunningからfailedへ遷移したJobだけを回収件数へ加算する', async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
       .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
       .mockResolvedValueOnce(jsonResponse([
         { id: 'job-running', status: 'running' },
-        { id: 'job-success', status: 'success' },
+        { id: 'job-raced', status: 'running' },
       ]))
-      .mockResolvedValueOnce(jsonResponse({ id: 'job-running', status: 'failed' }))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'failed',
+        job: { id: 'job-running', status: 'failed' },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: false,
+        currentStatus: 'success',
+        job: { id: 'job-raced', status: 'success' },
+      }))
 
     const recovered = await recoverStaleJobs('http://api.test', {
       authorization: 'Bearer token',
@@ -89,6 +186,9 @@ describe('recoverStaleJobs', () => {
     )
 
     const updateOptions = fetchMock.mock.calls[3]?.[1]
+    expect(fetchMock.mock.calls[3]?.[0]).toBe(
+      'http://api.test/api/jobs/job-running/fail-if-running',
+    )
     expect(updateOptions).toMatchObject({
       method: 'PATCH',
       headers: {
@@ -97,8 +197,8 @@ describe('recoverStaleJobs', () => {
       },
     })
     expect(JSON.parse(String(updateOptions?.body))).toMatchObject({
-      status: 'failed',
       stderr: '[Worker] 前回の Worker が異常終了したため failed にリセットしました',
+      completedAt: expect.any(String),
     })
   })
 })

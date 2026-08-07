@@ -111,6 +111,11 @@ const UpdateJobBody = z.object({
   reviewResult: StructuredReviewResultSchema.optional(),
 }).strict()
 
+const FailIfRunningJobBody = z.object({
+  stderr: z.string(),
+  completedAt: z.string(),
+}).strict()
+
 const ListQuerySchema = z.object({
   taskId: z.string().min(1),
 })
@@ -159,6 +164,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     }
     const job = storage.jobs.create(jobInput)
     return reply.status(201).send(job)
+  })
+
+  app.patch<{ Params: { id: string } }>('/:id/fail-if-running', async (req, reply) => {
+    const result = FailIfRunningJobBody.safeParse(req.body)
+    if (!result.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
+    }
+
+    const transition = storage.jobs.failIfRunning(req.params.id, result.data)
+    if (!transition.ok) {
+      return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    return reply.send({
+      updated: transition.updated,
+      currentStatus: transition.currentStatus,
+      job: transition.job,
+    })
   })
 
   app.patch<{ Params: { id: string } }>('/:id', async (req, reply) => {

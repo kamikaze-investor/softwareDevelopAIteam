@@ -974,6 +974,71 @@ describe('SQLiteStorage', () => {
       expect(found?.approvalId).toBe('approval-1')
     })
 
+    it('failIfRunning transitions only a running Job and persists failure details', () => {
+      const job = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+      const failure = {
+        stderr: 'Failed to persist the terminal result',
+        completedAt: '2026-08-08T01:02:03.000Z',
+      }
+
+      const result = storage.jobs.failIfRunning(job.id, failure)
+
+      expect(result).toMatchObject({
+        ok: true,
+        updated: true,
+        currentStatus: 'failed',
+        job: {
+          id: job.id,
+          status: 'failed',
+          stderr: failure.stderr,
+          completedAt: failure.completedAt,
+        },
+      })
+      expect(storage.jobs.findById(job.id)).toMatchObject({
+        status: 'failed',
+        stderr: failure.stderr,
+        completedAt: failure.completedAt,
+      })
+    })
+
+    it.each(['success', 'failed', 'blocked', 'queued'] as const)(
+      'failIfRunning leaves a %s Job unchanged',
+      (status) => {
+        const job = storage.jobs.create({
+          taskId,
+          projectId,
+          agentRole: 'developer_ai',
+          status,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        })
+
+        const result = storage.jobs.failIfRunning(job.id, {
+          stderr: 'must not be saved',
+          completedAt: '2026-08-08T01:02:03.000Z',
+        })
+
+        expect(result).toMatchObject({ ok: true, updated: false, currentStatus: status })
+        expect(storage.jobs.findById(job.id)).toMatchObject({
+          status,
+          stderr: undefined,
+          completedAt: undefined,
+        })
+      },
+    )
+
+    it('failIfRunning returns JOB_NOT_FOUND for a missing Job', () => {
+      expect(storage.jobs.failIfRunning('missing-job', {
+        stderr: 'technical failure',
+        completedAt: '2026-08-08T01:02:03.000Z',
+      })).toEqual({ ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' })
+    })
+
     it('allows multiple manual Jobs because workflow_step_key is NULL', () => {
       storage.jobs.create({
         taskId,

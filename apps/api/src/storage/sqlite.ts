@@ -9,7 +9,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, PersistReviewWorkflowResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
@@ -757,6 +757,29 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         id,
       )
       return updated
+    },
+    failIfRunning(jobId, failure) {
+      const transition = db.transaction((): FailIfRunningJobResult => {
+        const updateResult = db.prepare(`
+          UPDATE jobs
+          SET status = 'failed', stderr = ?, completed_at = ?
+          WHERE id = ? AND status = 'running'
+        `).run(failure.stderr, failure.completedAt, jobId)
+
+        const job = jobs.findById(jobId)
+        if (!job) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+
+        return {
+          ok: true,
+          updated: updateResult.changes === 1,
+          currentStatus: job.status,
+          job,
+        }
+      })
+
+      return transition()
     },
     updateAndCreateNextWorkflowJob(input) {
       const transition = db.transaction((): AdvanceWorkflowJobResult => {

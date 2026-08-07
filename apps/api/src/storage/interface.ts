@@ -29,6 +29,10 @@ export type AdvanceWorkflowJobResult =
       reason: string
     }
 
+export type FailIfRunningJobResult =
+  | { ok: true; updated: boolean; currentStatus: Job['status']; job: Job }
+  | { ok: false; code: 'JOB_NOT_FOUND'; reason: string }
+
 export type PersistReviewWorkflowResult =
   | {
       ok: true
@@ -126,6 +130,10 @@ export interface IJobStorage {
   findById(id: string): Job | undefined
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
   update(id: string, data: Partial<Job>): Job | undefined
+  failIfRunning(
+    jobId: string,
+    failure: { stderr: string; completedAt: string },
+  ): FailIfRunningJobResult
   /** workflow Jobの結果保存と次step Jobの作成を単一transactionで冪等に行う。 */
   updateAndCreateNextWorkflowJob(input: {
     jobId: string

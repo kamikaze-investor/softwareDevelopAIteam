@@ -13,7 +13,15 @@
  */
 
 import type { Job, Project, ReviewResult, Task } from '@ai-team/shared'
-import { assertTransition, recoverStaleJobs } from './jobStateManager.js'
+import {
+  assertTransition,
+  reconcileRunningJob,
+  recoverStaleJobs,
+} from './jobStateManager.js'
+import type {
+  ReconcileRunningFailure,
+  ReconcileRunningJobResult,
+} from './jobStateManager.js'
 import { runJob } from './jobRunner.js'
 import type { StructuredReviewContext } from './jobRunner.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
@@ -23,11 +31,15 @@ import { sendAlert } from './notifier/notifier.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
+const PATCH_TIMEOUT_MS = 5_000
+const PATCH_BACKOFF_MS = [500, 1_000] as const
+const TECHNICAL_PERSISTENCE_FAILURE =
+  'Job status persistence failed after bounded retries due to a technical communication failure.'
 
 console.log('Worker starting...')
 console.log(`API: ${API_BASE}, poll interval: ${POLL_INTERVAL_MS}ms`)
 
-type JobUpdate = Partial<Pick<
+export type JobUpdate = Partial<Pick<
   Job,
   | 'status'
   | 'startedAt'
@@ -45,7 +57,7 @@ type JobUpdate = Partial<Pick<
 }
 
 /** queued Job と、その Job が属する Task を一緒に返す（Task は実行時ポリシー構築に必須） */
-interface QueuedWork {
+export interface QueuedWork {
   job: Job
   task: Task
   jobs: Job[]
@@ -73,26 +85,77 @@ async function fetchQueuedJob(): Promise<QueuedWork | null> {
   return null
 }
 
-async function updateJob(jobId: string, data: JobUpdate): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}`, {
-    method: 'PATCH',
-    headers: {
-      ...buildApiAuthHeaders(),
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(data),
-  })
+export interface PatchJobWithRetryOptions {
+  apiBaseUrl?: string
+  headers?: Record<string, string>
+  timeoutMs?: number
+  backoffMs?: readonly [number, number]
+  fetchImpl?: typeof fetch
+  sleepImpl?: (ms: number) => Promise<void>
+}
 
-  if (!res.ok) {
-    throw new Error(`Failed to update job ${jobId}: ${res.status} ${res.statusText}`)
+export async function patchJobWithRetry(
+  jobId: string,
+  payload: JobUpdate,
+  options: PatchJobWithRetryOptions = {},
+): Promise<boolean> {
+  const apiBaseUrl = options.apiBaseUrl ?? API_BASE
+  const headers = options.headers ?? buildApiAuthHeaders()
+  const fetchImpl = options.fetchImpl ?? fetch
+  const sleepImpl = options.sleepImpl ?? sleep
+  const backoffMs = options.backoffMs ?? PATCH_BACKOFF_MS
+  const requestBody = JSON.stringify(payload)
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? PATCH_TIMEOUT_MS)
+    try {
+      const response = await fetchImpl(
+        `${apiBaseUrl}/api/jobs/${encodeURIComponent(jobId)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...headers,
+            'Content-Type': 'application/json',
+          },
+          body: requestBody,
+          signal: controller.signal,
+        },
+      )
+      if (response.ok) return true
+    } catch {
+      // A network error and an AbortController timeout are both retryable here.
+    } finally {
+      clearTimeout(timeout)
+    }
+
+    if (attempt < 2) {
+      await sleepImpl(backoffMs[attempt])
+    }
   }
+
+  return false
+}
+
+type PatchJob = (jobId: string, payload: JobUpdate) => Promise<boolean>
+type ReconcileJob = (
+  jobId: string,
+  failure: ReconcileRunningFailure,
+) => Promise<ReconcileRunningJobResult>
+type Alert = (payload: Parameters<typeof sendAlert>[0]) => Promise<unknown>
+
+export interface JobPersistenceDependencies {
+  patchJob?: PatchJob
+  reconcileJob?: ReconcileJob
+  alert?: Alert
+  now?: () => string
 }
 
 export async function persistJobResult(
   jobId: string,
   result: Awaited<ReturnType<typeof runJob>>,
   resultStatus: Job['status'],
-  writeJob: (id: string, data: JobUpdate) => Promise<void> = updateJob,
+  dependencies: JobPersistenceDependencies = {},
 ): Promise<void> {
   const resultUpdate: JobUpdate = {
     status: resultStatus,
@@ -107,11 +170,11 @@ export async function persistJobResult(
     guardResult: result.guardResult,
     reviewResult: result.reviewResult,
   }
-  try {
-    await writeJob(jobId, resultUpdate)
+  const persisted = await persistTerminalUpdate(jobId, resultUpdate, dependencies)
+  if (persisted) {
     if (result.reviewResult && result.reviewResult.status !== 'approved') {
       try {
-        await sendAlert({
+        await (dependencies.alert ?? sendAlert)({
           severity: result.reviewResult.status === 'rejected' ? 'critical' : 'warning',
           title: `Structured review: ${result.reviewResult.status}`,
           body: `${result.reviewResult.summary}\nJob: ${jobId}\n自動修正は行わず停止しました。`,
@@ -122,24 +185,53 @@ export async function persistJobResult(
         console.error(`[Worker] structured review通知エラー: ${formatUnknownError(err)}`)
       }
     }
-  } catch (err: unknown) {
-    if (!result.commitHash) throw err
+  }
+}
 
-    // commit自体は再実行しない。最終結果保存だけが失敗した場合は、commitHashを伴う
-    // technical failureとして最小更新を試み、手動照合が必要な状態をAPIへ残す。
-    const reconciliationMessage =
-      `Commit ${result.commitHash} was created, but the complete Job result could not be saved. ` +
-      'Manual reconciliation is required; do not retry git_commit automatically.'
-    await writeJob(jobId, {
-      status: 'failed',
-      exitCode: result.exitCode,
-      stderr: reconciliationMessage,
-      stdoutPath: result.stdoutPath,
-      stderrPath: result.stderrPath,
-      commitHash: result.commitHash,
-      completedAt: new Date().toISOString(),
-      guardResult: result.guardResult,
+async function persistTerminalUpdate(
+  jobId: string,
+  payload: JobUpdate,
+  dependencies: JobPersistenceDependencies,
+): Promise<boolean> {
+  const persisted = await (dependencies.patchJob ?? patchJobWithRetry)(jobId, payload)
+  if (persisted) return true
+
+  await reconcileAfterPatchFailure(
+    jobId,
+    {
+      stderr: TECHNICAL_PERSISTENCE_FAILURE,
+      completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    },
+    dependencies,
+  )
+  return false
+}
+
+async function reconcileAfterPatchFailure(
+  jobId: string,
+  failure: ReconcileRunningFailure,
+  dependencies: JobPersistenceDependencies,
+): Promise<void> {
+  const reconciliation = await (dependencies.reconcileJob ?? reconcileRunningJob)(jobId, failure)
+  if (reconciliation.outcome === 'reconciled') {
+    console.log(
+      `[Worker] Job ${jobId} のstatus保存失敗をreconciliationで収束しました ` +
+      `(currentStatus=${reconciliation.currentStatus})`,
+    )
+    return
+  }
+
+  try {
+    await (dependencies.alert ?? sendAlert)({
+      severity: 'critical',
+      title: 'Job status persistence technical failure（技術的障害）',
+      body: `Job ${jobId} could not be reconciled after a technical failure（技術的障害）. ` +
+        'Manual investigation is required.',
+      sourceType: 'job_persistence',
+      sourceId: jobId,
     })
+  } catch (err: unknown) {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
   }
 }
 
@@ -152,53 +244,87 @@ async function fetchJson<T>(path: string): Promise<T | null> {
   return await res.json() as T
 }
 
+export interface ProcessQueuedWorkDependencies extends JobPersistenceDependencies {
+  executeJob?: typeof runJob
+  buildPolicy?: typeof buildRuntimeTaskPolicy
+}
+
+export async function processQueuedWork(
+  work: QueuedWork,
+  dependencies: ProcessQueuedWorkDependencies = {},
+): Promise<Job['status'] | null> {
+  const { job, task, jobs } = work
+  let policy: ReturnType<typeof buildRuntimeTaskPolicy>
+  try {
+    if (task.projectId !== job.projectId) {
+      throw new Error(
+        `Task と Job の Project が一致しません: task.projectId=${task.projectId} job.projectId=${job.projectId}`,
+      )
+    }
+    policy = (dependencies.buildPolicy ?? buildRuntimeTaskPolicy)(task)
+  } catch (err: unknown) {
+    const message = `実行時Taskポリシーを構築できないため実行しません: ${formatUnknownError(err)}`
+    console.error(`[Worker] ${message}`)
+    const runningConfirmed = await confirmRunningTransition(job, dependencies)
+    if (!runningConfirmed) return null
+
+    assertTransition('running', 'failed')
+    const failedPayload: JobUpdate = {
+      status: 'failed',
+      stderr: message,
+      completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    }
+    await persistTerminalUpdate(job.id, failedPayload, dependencies)
+    return 'failed'
+  }
+
+  const runningConfirmed = await confirmRunningTransition(job, dependencies)
+  if (!runningConfirmed) return null
+
+  const result = await (dependencies.executeJob ?? runJob)(
+    job,
+    policy,
+    buildStructuredReviewContext(job, task, jobs),
+  )
+  const resultStatus = resolveResultStatus(result)
+
+  assertTransition('running', resultStatus)
+  await persistJobResult(job.id, result, resultStatus, dependencies)
+  return resultStatus
+}
+
+async function confirmRunningTransition(
+  job: Job,
+  dependencies: JobPersistenceDependencies,
+): Promise<boolean> {
+  assertTransition(job.status, 'running')
+  const runningPayload: JobUpdate = {
+    status: 'running',
+    startedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+  }
+  const confirmed = await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload)
+  if (confirmed) return true
+
+  await reconcileAfterPatchFailure(
+    job.id,
+    {
+      stderr: 'Failed to confirm running transition',
+      completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    },
+    dependencies,
+  )
+  return false
+}
+
 async function pollJobs(): Promise<never> {
   while (true) {
     try {
       const work = await fetchQueuedJob()
       if (work) {
-        const { job, task, jobs } = work
+        const { job } = work
         console.log(`[Worker] Job ${job.id} (${job.safeCommand.kind}) を実行します`)
-
-        // 実行時 Task ポリシーは AI 実行より前に構築する。
-        // Task 取得失敗・Project 不一致・構築失敗のいずれでも runJob() を呼ばず failed にする
-        // （allowedPaths / forbiddenPaths を適用できないまま AI を動かさない）。
-        let policy
-        try {
-          if (task.projectId !== job.projectId) {
-            throw new Error(
-              `Task と Job の Project が一致しません: task.projectId=${task.projectId} job.projectId=${job.projectId}`,
-            )
-          }
-          policy = buildRuntimeTaskPolicy(task)
-        } catch (err: unknown) {
-          const message = `実行時Taskポリシーを構築できないため実行しません: ${formatUnknownError(err)}`
-          console.error(`[Worker] ${message}`)
-          assertTransition(job.status, 'running')
-          await updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() })
-          assertTransition('running', 'failed')
-          await updateJob(job.id, {
-            status: 'failed',
-            stderr: message,
-            completedAt: new Date().toISOString(),
-          })
-          await sleep(POLL_INTERVAL_MS)
-          continue
-        }
-
-        assertTransition(job.status, 'running')
-        await updateJob(job.id, {
-          status: 'running',
-          startedAt: new Date().toISOString(),
-        })
-
-        const result = await runJob(job, policy, buildStructuredReviewContext(job, task, jobs))
-        const resultStatus = resolveResultStatus(result)
-
-        assertTransition('running', resultStatus)
-        await persistJobResult(job.id, result, resultStatus)
-
-        console.log(`[Worker] Job ${job.id}: ${resultStatus}`)
+        const resultStatus = await processQueuedWork(work)
+        if (resultStatus) console.log(`[Worker] Job ${job.id}: ${resultStatus}`)
       }
     } catch (err: unknown) {
       console.error(`[Worker] ポーリングエラー: ${formatUnknownError(err)}`)

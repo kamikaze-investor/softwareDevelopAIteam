@@ -430,10 +430,13 @@ beforeEach(() => {
 })
 
 describe('commit後のJob結果保存', () => {
-  it('完全結果のAPI保存失敗後は再commitせず、commitHash付きtechnical failureだけを保存する', async () => {
-    const writeJob = vi.fn<(id: string, data: Partial<Job>) => Promise<void>>()
-      .mockRejectedValueOnce(new Error('API unavailable'))
-      .mockResolvedValueOnce()
+  it('完全結果のAPI保存失敗後は再commitせず、running限定reconciliationへ収束する', async () => {
+    const patchJob = vi.fn().mockResolvedValue(false)
+    const reconcileJob = vi.fn().mockResolvedValue({
+      outcome: 'reconciled',
+      updated: true,
+      currentStatus: 'failed',
+    })
     const result = {
       status: 'success' as const,
       commitHash: 'created-commit-hash',
@@ -446,23 +449,22 @@ describe('commit後のJob結果保存', () => {
       completedAt: '2026-08-06T00:01:00.000Z',
     }
 
-    await persistJobResult('job-1', result, 'success', writeJob)
+    await persistJobResult('job-1', result, 'success', { patchJob, reconcileJob })
 
-    expect(writeJob).toHaveBeenCalledTimes(2)
-    expect(writeJob.mock.calls[0]?.[1]).toMatchObject({
+    expect(patchJob).toHaveBeenCalledTimes(1)
+    expect(patchJob.mock.calls[0]?.[1]).toMatchObject({
       status: 'success',
       commitHash: 'created-commit-hash',
     })
-    expect(writeJob.mock.calls[1]?.[1]).toMatchObject({
-      status: 'failed',
-      commitHash: 'created-commit-hash',
-      stderr: expect.stringContaining('Manual reconciliation is required'),
-    })
+    expect(reconcileJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
+      stderr: expect.stringContaining('technical communication failure'),
+      completedAt: expect.any(String),
+    }))
     expect(execFileSyncMock).not.toHaveBeenCalled()
   })
 
   it('structured reviewをAPIへ保存し、非approved時はCEO通知して停止する', async () => {
-    const writeJob = vi.fn().mockResolvedValue(undefined)
+    const patchJob = vi.fn().mockResolvedValue(true)
     const result = {
       status: 'failed' as const,
       exitCode: 0,
@@ -480,9 +482,9 @@ describe('commit後のJob結果保存', () => {
       completedAt: '2026-08-06T00:01:00.000Z',
     }
 
-    await persistJobResult('review-job-1', result, 'failed', writeJob)
+    await persistJobResult('review-job-1', result, 'failed', { patchJob })
 
-    expect(writeJob).toHaveBeenCalledWith('review-job-1', expect.objectContaining({
+    expect(patchJob).toHaveBeenCalledWith('review-job-1', expect.objectContaining({
       status: 'failed',
       reviewResult: result.reviewResult,
     }))

@@ -371,6 +371,91 @@ describe('Job API', () => {
     })
   })
 
+  it('PATCH /api/jobs/:id/fail-if-running changes running to failed', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: { status: 'running' },
+      })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}/fail-if-running`,
+        payload: {
+          stderr: 'technical failure',
+          completedAt: '2026-08-08T01:02:03.000Z',
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<{
+        updated: boolean
+        currentStatus: Job['status']
+        job: Job
+      }>(res.body)).toMatchObject({
+        updated: true,
+        currentStatus: 'failed',
+        job: {
+          id: created.id,
+          status: 'failed',
+          stderr: 'technical failure',
+          completedAt: '2026-08-08T01:02:03.000Z',
+        },
+      })
+    })
+  })
+
+  it.each(['success', 'failed', 'blocked', 'queued'] as const)(
+    'PATCH /api/jobs/:id/fail-if-running leaves %s unchanged',
+    async (status) => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const created = await createJob(app, task)
+        if (status !== 'queued') {
+          await app.inject({
+            method: 'PATCH',
+            url: `/api/jobs/${created.id}`,
+            payload: { status },
+          })
+        }
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${created.id}/fail-if-running`,
+          payload: {
+            stderr: 'must not be saved',
+            completedAt: '2026-08-08T01:02:03.000Z',
+          },
+        })
+
+        expect(res.statusCode).toBe(200)
+        expect(parseBody<{ updated: boolean; currentStatus: Job['status']; job: Job }>(res.body))
+          .toMatchObject({ updated: false, currentStatus: status, job: { status } })
+      })
+    },
+  )
+
+  it('PATCH /api/jobs/:id/fail-if-running returns 404 for a missing Job', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/jobs/missing-job/fail-if-running',
+        payload: {
+          stderr: 'technical failure',
+          completedAt: '2026-08-08T01:02:03.000Z',
+        },
+      })
+
+      expect(res.statusCode).toBe(404)
+      expect(parseBody<{ error: string }>(res.body).error).toBe('Job not found')
+    })
+  })
+
   it('PATCH /api/jobs/:id updates exitCode', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
