@@ -18,8 +18,11 @@ import type {
   PermissionBlockEvent,
   RollbackInfo,
   ApprovalLevelResult,
+  ReviewResult,
+  Task,
 } from '@ai-team/shared'
 import { runRiskReview } from '@ai-team/shared'
+import { z } from 'zod'
 import { tryParseJson } from './aiCli/adapter.js'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
@@ -76,6 +79,109 @@ interface ExecFileFailure {
   status?: number
   stdout?: string | Buffer
   stderr?: string | Buffer
+}
+
+export type StructuredReviewVerdict = Pick<ReviewResult, 'status' | 'summary' | 'findings'>
+
+export interface StructuredReviewContext {
+  task: Task
+  implementJob: Job
+}
+
+const StructuredReviewVerdictSchema = z.object({
+  status: z.enum(['approved', 'changes_requested', 'rejected']),
+  summary: z.string(),
+  findings: z.array(z.object({
+    severity: z.enum(['low', 'medium', 'high', 'critical']),
+    file: z.string().optional(),
+    line: z.number().optional(),
+    message: z.string().min(1),
+    rule: z.string().optional(),
+  }).strict()),
+}).strict()
+
+function parseJsonDocument(text: string): Record<string, unknown> | undefined {
+  const trimmed = text.trim()
+  const fenced = trimmed.match(/^```json\s*\n([\s\S]+)\n```$/)
+  const jsonText = fenced?.[1] ?? trimmed
+  try {
+    const parsed: unknown = JSON.parse(jsonText)
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Claude Code JSON envelopeのresult、または直接のJSON objectをstrictに検証する。 */
+export function parseStructuredReviewOutput(stdout: string): StructuredReviewVerdict | undefined {
+  const outer = parseJsonDocument(stdout)
+  if (!outer) return undefined
+
+  const candidate = typeof outer.result === 'string'
+    ? parseJsonDocument(outer.result)
+    : outer
+  const parsed = StructuredReviewVerdictSchema.safeParse(candidate)
+  return parsed.success ? parsed.data : undefined
+}
+
+export function buildStructuredReviewPrompt(input: {
+  context: StructuredReviewContext
+  baselineHead: string
+  changedFiles: string[]
+  diffText: string
+}): string {
+  const { task, implementJob } = input.context
+  return `以下に渡された実装結果だけを独立レビューしてください。Git/Bashその他のツールを実行せず、追加のファイル探索も行わないでください。
+
+出力は次のJSON objectだけにしてください。フィールド追加やenum値の変更は禁止です。
+{
+  "status": "approved | changes_requested | rejected",
+  "summary": "string",
+  "findings": [
+    { "severity": "low | medium | high | critical", "file": "optional string", "line": 1, "message": "string", "rule": "optional string" }
+  ]
+}
+
+[Task要求]
+${JSON.stringify({
+    title: task.title,
+    description: task.description,
+    acceptanceCriteria: task.acceptanceCriteria ?? [],
+    expectedOutputs: task.expectedOutputs ?? [],
+    allowedPaths: task.allowedPaths ?? [],
+    forbiddenPaths: task.forbiddenPaths ?? [],
+  }, null, 2)}
+
+[baseline HEAD]
+${input.baselineHead}
+
+[changedFiles]
+${JSON.stringify(input.changedFiles, null, 2)}
+
+[diffText]
+${input.diffText}
+
+[SafeCommand結果]
+${JSON.stringify({
+    kind: implementJob.safeCommand.kind,
+    status: implementJob.status,
+    exitCode: implementJob.exitCode,
+    stdout: implementJob.stdout,
+    stderr: implementJob.stderr,
+    guardResult: implementJob.guardResult,
+  }, null, 2)}
+
+[implement Job結果]
+${JSON.stringify({
+    id: implementJob.id,
+    status: implementJob.status,
+    changedFiles: implementJob.changedFiles ?? [],
+    completedAt: implementJob.completedAt,
+    aiCliProvider: implementJob.aiCliProvider,
+    aiCliMode: implementJob.aiCliMode,
+  }, null, 2)}`
 }
 
 export interface JobRunResult {
@@ -158,6 +264,8 @@ export interface JobRunResult {
    * index.ts の resolveResultStatus() はこのフラグで failed を維持する。
    */
   technicalFailure?: boolean
+  /** APIがReviewResultのID・関連ID・reviewer・createdAtを付与して永続化する。 */
+  reviewResult?: StructuredReviewVerdict
 }
 
 /**
@@ -170,7 +278,11 @@ export interface JobRunResult {
  *   Task を取得し buildRuntimeTaskPolicy() で構築する。取得・構築に失敗した場合は
  *   runJob() を呼ばず Job を failed にすること（AI を実行してはならない）。
  */
-export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRunResult> {
+export async function runJob(
+  job: Job,
+  policy: RuntimeTaskPolicy,
+  structuredReviewContext?: StructuredReviewContext,
+): Promise<JobRunResult> {
   const startedAt = new Date().toISOString()
 
   if (policy.taskId !== job.taskId) {
@@ -527,8 +639,22 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   // aiCliProvider / aiCliPrompt / aiCliMode が3つ揃った場合のみ先行実行する。
   // 成功時は後続の SafeCommand（git_commit 等）を引き続き実行する。
   // 失敗（throw / blocked / exitCode !== 0）時は status: failed で早期リターン。
+  let effectiveAiCliPrompt = job.aiCliPrompt
+  if (job.aiCliMode === 'review') {
+    if (!structuredReviewContext) {
+      return failClosed(startedAt, 'Structured review context is missing (fail-closed)', guardResult)
+    }
+    effectiveAiCliPrompt = buildStructuredReviewPrompt({
+      context: structuredReviewContext,
+      baselineHead: startCommitHash,
+      changedFiles: preManifest.paths,
+      diffText: preDiffText,
+    })
+  }
+
   let aiCliStdoutSection: string | undefined
-  if (job.aiCliProvider && job.aiCliPrompt && job.aiCliMode) {
+  let structuredReviewResult: StructuredReviewVerdict | undefined
+  if (job.aiCliProvider && effectiveAiCliPrompt && job.aiCliMode) {
     const adapter = createAiCliAdapter({ provider: job.aiCliProvider })
     let cliResult
     try {
@@ -536,10 +662,11 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
         taskId: job.taskId,
         provider: job.aiCliProvider,
         workingDir: job.safeCommand.workingDir,
-        prompt: job.aiCliPrompt,
+        prompt: effectiveAiCliPrompt,
         contextFiles: [],  // task-023 で Context Manager 連携後に拡張
         mode: job.aiCliMode,
         dryRun: job.dryRun,
+        expectJson: job.aiCliMode === 'review',
       })
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
@@ -600,6 +727,27 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
           stderr: cliResult.stderr
             ? `${cliResult.stderr}\n[jobRunner] ${implementFailureReason}`
             : `[jobRunner] ${implementFailureReason}`,
+          stdoutPath: cliResult.stdoutPath,
+          stderrPath: cliResult.stderrPath,
+        })
+      }
+    }
+
+    if (job.aiCliMode === 'review') {
+      structuredReviewResult = parseStructuredReviewOutput(cliResult.stdout)
+      if (!structuredReviewResult) {
+        return inspectAfterAiFailure({
+          workingDir: job.safeCommand.workingDir,
+          startCommitHash,
+          reflogBaseline,
+          sensitiveBaseline,
+          policy,
+          guardResult,
+          startedAt,
+          approvalLevelResult,
+          exitCode: 1,
+          stdout: cliResult.stdout,
+          stderr: 'Structured review output failed strict schema validation (fail-closed)',
           stdoutPath: cliResult.stdoutPath,
           stderrPath: cliResult.stderrPath,
         })
@@ -866,6 +1014,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
         }
       }
     }
+
   }
 
   // ── Stage B / Stage C: 最終成果の全面再検査 ────────────────────────────────
@@ -940,7 +1089,12 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
   }
 
   return {
-    status: exitCode === 0 && fileGuard.allowed ? 'success' : 'failed',
+    status:
+      exitCode === 0 &&
+      fileGuard.allowed &&
+      (structuredReviewResult === undefined || structuredReviewResult.status === 'approved')
+        ? 'success'
+        : 'failed',
     exitCode,
     stdout: logPaths.stdoutPreview,
     stderr: logPaths.stderrPreview,
@@ -960,6 +1114,7 @@ export async function runJob(job: Job, policy: RuntimeTaskPolicy): Promise<JobRu
     postReviewResult,
     safetyVerificationResult,
     finalChangeManifest: finalManifest,
+    reviewResult: structuredReviewResult,
   }
 }
 

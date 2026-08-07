@@ -12,12 +12,14 @@
  * - 結果を API で更新
  */
 
-import type { Job, Project, Task } from '@ai-team/shared'
+import type { Job, Project, ReviewResult, Task } from '@ai-team/shared'
 import { assertTransition, recoverStaleJobs } from './jobStateManager.js'
 import { runJob } from './jobRunner.js'
+import type { StructuredReviewContext } from './jobRunner.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
+import { sendAlert } from './notifier/notifier.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
@@ -38,12 +40,15 @@ type JobUpdate = Partial<Pick<
   | 'changedFiles'
   | 'commitHash'
   | 'guardResult'
->>
+>> & {
+  reviewResult?: Pick<ReviewResult, 'status' | 'summary' | 'findings'>
+}
 
 /** queued Job と、その Job が属する Task を一緒に返す（Task は実行時ポリシー構築に必須） */
 interface QueuedWork {
   job: Job
   task: Task
+  jobs: Job[]
 }
 
 async function fetchQueuedJob(): Promise<QueuedWork | null> {
@@ -61,7 +66,7 @@ async function fetchQueuedJob(): Promise<QueuedWork | null> {
       if (!jobs) continue
 
       const queued = jobs.find((job) => job.status === 'queued')
-      if (queued) return { job: queued, task }
+      if (queued) return { job: queued, task, jobs }
     }
   }
 
@@ -100,9 +105,23 @@ export async function persistJobResult(
     commitHash: result.commitHash,
     completedAt: result.completedAt,
     guardResult: result.guardResult,
+    reviewResult: result.reviewResult,
   }
   try {
     await writeJob(jobId, resultUpdate)
+    if (result.reviewResult && result.reviewResult.status !== 'approved') {
+      try {
+        await sendAlert({
+          severity: result.reviewResult.status === 'rejected' ? 'critical' : 'warning',
+          title: `Structured review: ${result.reviewResult.status}`,
+          body: `${result.reviewResult.summary}\nJob: ${jobId}\n自動修正は行わず停止しました。`,
+          sourceType: 'structured_review',
+          sourceId: jobId,
+        })
+      } catch (err: unknown) {
+        console.error(`[Worker] structured review通知エラー: ${formatUnknownError(err)}`)
+      }
+    }
   } catch (err: unknown) {
     if (!result.commitHash) throw err
 
@@ -138,7 +157,7 @@ async function pollJobs(): Promise<never> {
     try {
       const work = await fetchQueuedJob()
       if (work) {
-        const { job, task } = work
+        const { job, task, jobs } = work
         console.log(`[Worker] Job ${job.id} (${job.safeCommand.kind}) を実行します`)
 
         // 実行時 Task ポリシーは AI 実行より前に構築する。
@@ -173,7 +192,7 @@ async function pollJobs(): Promise<never> {
           startedAt: new Date().toISOString(),
         })
 
-        const result = await runJob(job, policy)
+        const result = await runJob(job, policy, buildStructuredReviewContext(job, task, jobs))
         const resultStatus = resolveResultStatus(result)
 
         assertTransition('running', resultStatus)
@@ -243,4 +262,20 @@ if (process.env.VITEST !== 'true') {
     console.error(`[Worker] 起動エラー: ${formatUnknownError(err)}`)
     process.exitCode = 1
   })
+}
+
+function buildStructuredReviewContext(
+  job: Job,
+  task: Task,
+  jobs: Job[],
+): StructuredReviewContext | undefined {
+  if (job.aiCliMode !== 'review') return undefined
+
+  const match = job.workflowStepKey
+    ? /^implement:(.+):review$/.exec(job.workflowStepKey)
+    : null
+  const implementJob = match
+    ? jobs.find((candidate) => candidate.id === match[1])
+    : jobs.find((candidate) => candidate.aiCliMode === 'implement' && candidate.status === 'success')
+  return implementJob ? { task, implementJob } : undefined
 }

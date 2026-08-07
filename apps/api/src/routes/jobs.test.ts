@@ -89,6 +89,47 @@ async function createJob(
   return parseBody<Job>(res.body)
 }
 
+async function createAutomaticReviewJob(
+  app: FastifyInstance,
+): Promise<{ implement: Job; project: Project; review: Job; task: Task }> {
+  const project = await createProject(app)
+  const taskResponse = await app.inject({
+    method: 'POST',
+    url: '/api/tasks',
+    payload: {
+      projectId: project.id,
+      title: 'Structured review task',
+      description: 'Implement the approved requirement.',
+      assignee: 'developer_ai',
+    },
+  })
+  expect(taskResponse.statusCode).toBe(201)
+  const task = parseBody<Task>(taskResponse.body)
+  const initialJobs = parseBody<Job[]>((await app.inject({
+    method: 'GET',
+    url: `/api/jobs?taskId=${task.id}`,
+  })).body)
+  const implement = initialJobs[0]
+  const implementResult = await app.inject({
+    method: 'PATCH',
+    url: `/api/jobs/${implement.id}`,
+    payload: {
+      status: 'success',
+      exitCode: 0,
+      changedFiles: ['src/feature.ts'],
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+    },
+  })
+  expect(implementResult.statusCode).toBe(200)
+  const jobs = parseBody<Job[]>((await app.inject({
+    method: 'GET',
+    url: `/api/jobs?taskId=${task.id}`,
+  })).body)
+  const review = jobs.find((job) => job.aiCliMode === 'review')
+  if (!review) throw new Error('Automatic review Job was not created')
+  return { implement, project, review, task }
+}
+
 beforeEach(() => {
   vi.resetModules()
   process.env.DB_PATH = ':memory:'
@@ -225,6 +266,82 @@ describe('Job API', () => {
       expect(fetched.aiCliProvider).toBeUndefined()
       expect(fetched.aiCliPrompt).toBeUndefined()
       expect(fetched.aiCliMode).toBeUndefined()
+    })
+  })
+
+  it('POST /api/jobs accepts a manual review Job without a client prompt', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+
+      const created = await createJob(app, task, {
+        agentRole: 'qa_ai',
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'review',
+      })
+
+      expect(created.aiCliProvider).toBe('claude_code')
+      expect(created.aiCliMode).toBe('review')
+      expect(created.aiCliPrompt).toBeUndefined()
+    })
+  })
+
+  it('POST /api/jobs rejects a client prompt for a review Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: project.id,
+          agentRole: 'qa_ai',
+          aiCliProvider: 'claude_code',
+          aiCliMode: 'review',
+          aiCliPrompt: 'Client-controlled review instructions',
+          safeCommand: { kind: 'git_status' },
+        },
+      })
+
+      expect(res.statusCode).toBe(400)
+    })
+  })
+
+  it('persists a manual structured review without auto-creating a commit Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const review = await createJob(app, task, {
+        agentRole: 'qa_ai',
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'review',
+      })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${review.id}`,
+        payload: {
+          status: 'success',
+          exitCode: 0,
+          reviewResult: {
+            status: 'approved',
+            summary: 'Manual recovery review passed.',
+            findings: [],
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<Job>(res.body).status).toBe('success')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      expect(storage.reviewResults.findByTaskId(task.id)).toEqual([
+        expect.objectContaining({ jobId: review.id, status: 'approved' }),
+      ])
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(1)
+      expect(storage.approvalRequests.findByTaskId(task.id)).toEqual([])
     })
   })
 
@@ -463,6 +580,106 @@ describe('Job API', () => {
         url: `/api/jobs?taskId=${task.id}`,
       })
       expect(parseBody<Job[]>(jobsResponse.body)).toHaveLength(1)
+    })
+  })
+
+  it('persists an approved structured review and creates one git_commit Job idempotently', async () => {
+    await withApp(async (app) => {
+      const { review, task } = await createAutomaticReviewJob(app)
+      const verdict = {
+        status: 'approved' as const,
+        summary: 'All requirements are satisfied.',
+        findings: [],
+      }
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const response = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${review.id}`,
+          payload: {
+            status: 'success',
+            exitCode: 0,
+            changedFiles: ['src/feature.ts'],
+            guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+            reviewResult: verdict,
+          },
+        })
+        expect(response.statusCode).toBe(200)
+        expect(parseBody<Job>(response.body).status).toBe('success')
+      }
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const reviewResults = storage.reviewResults.findByTaskId(task.id)
+      expect(reviewResults).toHaveLength(1)
+      expect(reviewResults[0]).toMatchObject({
+        taskId: task.id,
+        jobId: review.id,
+        reviewer: 'qa_ai',
+        ...verdict,
+      })
+      const jobs = storage.jobs.findByTaskId(task.id)
+      const commitJobs = jobs.filter((job) => job.safeCommand.kind === 'git_commit')
+      expect(commitJobs).toHaveLength(1)
+      expect(commitJobs[0]).toMatchObject({
+        workflowStepKey: `review:${review.id}:git-commit`,
+        status: 'queued',
+      })
+      expect(storage.approvalRequests.findByTaskId(task.id)).toEqual([])
+    })
+  })
+
+  it.each(['changes_requested', 'rejected'] as const)(
+    'persists %s as a failed review Job without creating commit or Approval',
+    async (status) => {
+      await withApp(async (app) => {
+        const { review, task } = await createAutomaticReviewJob(app)
+        const response = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${review.id}`,
+          payload: {
+            status: 'success',
+            exitCode: 0,
+            changedFiles: ['src/feature.ts'],
+            guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+            reviewResult: {
+              status,
+              summary: 'CEO action is required.',
+              findings: [{ severity: 'high', message: 'Blocking issue' }],
+            },
+          },
+        })
+
+        expect(response.statusCode).toBe(200)
+        expect(parseBody<Job>(response.body).status).toBe('failed')
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        expect(storage.reviewResults.findByTaskId(task.id)).toHaveLength(1)
+        expect(storage.jobs.findByTaskId(task.id).filter(
+          (job) => job.safeCommand.kind === 'git_commit',
+        )).toEqual([])
+        expect(storage.approvalRequests.findByTaskId(task.id)).toEqual([])
+      })
+    },
+  )
+
+  it.each([
+    ['unknown status', { status: 'approve', summary: 'bad', findings: [] }],
+    ['unknown severity', { status: 'approved', summary: 'bad', findings: [{ severity: 'major', message: 'bad' }] }],
+    ['missing required field', { status: 'approved', findings: [] }],
+    ['extra field', { status: 'approved', summary: 'bad', findings: [], verdict: 'approved' }],
+  ])('rejects structured review with %s and saves no ReviewResult', async (_label, reviewResult) => {
+    await withApp(async (app) => {
+      const { review, task } = await createAutomaticReviewJob(app)
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${review.id}`,
+        payload: { status: 'success', reviewResult },
+      })
+
+      expect(response.statusCode).toBe(400)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().reviewResults.findByTaskId(task.id)).toEqual([])
     })
   })
 })

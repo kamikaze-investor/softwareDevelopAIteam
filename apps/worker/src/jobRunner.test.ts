@@ -1,11 +1,15 @@
 import { execFileSync } from 'node:child_process'
-import type { Job } from '@ai-team/shared'
+import type { Job, Task } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { persistJobResult } from './index.js'
-import { runJob } from './jobRunner.js'
+import {
+  buildStructuredReviewPrompt,
+  parseStructuredReviewOutput,
+  runJob,
+} from './jobRunner.js'
 import {
   assertIndexClean,
   assertIndexMatchesApproved,
@@ -312,6 +316,40 @@ function createPolicy(overrides: Record<string, unknown> = {}) {
   }) as never
 }
 
+function createStructuredReviewContext() {
+  const task: Task = {
+    id: 'task-1',
+    projectId: 'project-1',
+    title: 'Implement feature A',
+    description: 'Add feature A without changing public APIs.',
+    status: 'review',
+    assignee: 'developer_ai',
+    dependencies: [],
+    allowedPaths: ['src/'],
+    forbiddenPaths: ['.env'],
+    acceptanceCriteria: ['tests pass'],
+    expectedOutputs: ['src/feature.ts'],
+    roadmapActive: false,
+    createdAt: '2026-08-06T00:00:00.000Z',
+    updatedAt: '2026-08-06T00:00:00.000Z',
+  }
+  const implementJob = createJob({
+    id: 'implement-job-1',
+    workflowStepKey: 'task:task-1:initial-implement',
+    aiCliProvider: 'claude_code',
+    aiCliMode: 'implement',
+    status: 'success',
+    exitCode: 0,
+    stdout: 'implementation complete',
+    stderr: '',
+    changedFiles: ['src/feature.ts'],
+    completedAt: '2026-08-06T00:05:00.000Z',
+    guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+  })
+  return { task, implementJob }
+}
+
 // ────────────────────────────────────────────────────────────
 // beforeEach: reset all mocks to safe defaults
 // ────────────────────────────────────────────────────────────
@@ -421,6 +459,38 @@ describe('commit後のJob結果保存', () => {
       stderr: expect.stringContaining('Manual reconciliation is required'),
     })
     expect(execFileSyncMock).not.toHaveBeenCalled()
+  })
+
+  it('structured reviewをAPIへ保存し、非approved時はCEO通知して停止する', async () => {
+    const writeJob = vi.fn().mockResolvedValue(undefined)
+    const result = {
+      status: 'failed' as const,
+      exitCode: 0,
+      reviewResult: {
+        status: 'changes_requested' as const,
+        summary: 'A blocking fix is required.',
+        findings: [{ severity: 'high' as const, message: 'Fix this issue.' }],
+      },
+      guardResult: {
+        permissionAllowed: true,
+        fileChangeAllowed: true,
+        fileViolations: [],
+      },
+      startedAt: '2026-08-06T00:00:00.000Z',
+      completedAt: '2026-08-06T00:01:00.000Z',
+    }
+
+    await persistJobResult('review-job-1', result, 'failed', writeJob)
+
+    expect(writeJob).toHaveBeenCalledWith('review-job-1', expect.objectContaining({
+      status: 'failed',
+      reviewResult: result.reviewResult,
+    }))
+    expect(sendAlertMock).toHaveBeenCalledWith(expect.objectContaining({
+      severity: 'warning',
+      sourceType: 'structured_review',
+      sourceId: 'review-job-1',
+    }))
   })
 })
 
@@ -1718,6 +1788,57 @@ function makeCliResult(overrides: Partial<{
   }
 }
 
+describe('structured review contract', () => {
+  const approved = {
+    status: 'approved',
+    summary: 'No blocking findings.',
+    findings: [{ severity: 'low', file: 'src/feature.ts', line: 4, message: 'Minor note', rule: 'style' }],
+  }
+
+  it('extracts the strict verdict from a Claude Code JSON envelope', () => {
+    const stdout = JSON.stringify({
+      type: 'result',
+      subtype: 'success',
+      result: JSON.stringify(approved),
+    })
+
+    expect(parseStructuredReviewOutput(stdout)).toEqual(approved)
+  })
+
+  it.each([
+    ['unknown status', { ...approved, status: 'approve' }],
+    ['unknown severity', { ...approved, findings: [{ severity: 'major', message: 'bad' }] }],
+    ['missing summary', { status: 'approved', findings: [] }],
+    ['extra top-level field', { ...approved, verdict: 'approved' }],
+    ['extra finding field', { ...approved, findings: [{ severity: 'low', message: 'note', extra: true }] }],
+  ])('rejects %s', (_label, value) => {
+    expect(parseStructuredReviewOutput(JSON.stringify(value))).toBeUndefined()
+  })
+
+  it('rejects non-JSON even when it contains a JSON substring', () => {
+    expect(parseStructuredReviewOutput(`review result: ${JSON.stringify(approved)}`)).toBeUndefined()
+  })
+
+  it('builds a prompt containing every supplied review input without requesting Git execution', () => {
+    const prompt = buildStructuredReviewPrompt({
+      context: createStructuredReviewContext(),
+      baselineHead: BASE_COMMIT,
+      changedFiles: ['src/feature.ts'],
+      diffText: 'diff --git a/src/feature.ts b/src/feature.ts',
+    })
+
+    expect(prompt).toContain('Implement feature A')
+    expect(prompt).toContain('Add feature A without changing public APIs.')
+    expect(prompt).toContain('tests pass')
+    expect(prompt).toContain(BASE_COMMIT)
+    expect(prompt).toContain('src/feature.ts')
+    expect(prompt).toContain('diff --git a/src/feature.ts b/src/feature.ts')
+    expect(prompt).toContain('implementation complete')
+    expect(prompt).toContain('"kind": "test"')
+    expect(prompt).toContain('Git/Bashその他のツールを実行せず')
+  })
+})
+
 describe('task-022: AI CLI 実行ブロック', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -1924,11 +2045,12 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
-  it('reviewで変更0件 → 今回のチェック対象外で従来どおり成功する', async () => {
+  it('reviewで変更0件でもstructured verdictがapprovedなら成功する', async () => {
+    const verdict = { status: 'approved', summary: 'Approved', findings: [] }
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
         changedFiles: [],
-        stdout: 'review output is not JSON',
+        stdout: JSON.stringify({ type: 'result', result: JSON.stringify(verdict) }),
       })),
     }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
@@ -1937,10 +2059,55 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliProvider: 'claude_code',
       aiCliPrompt: '変更をレビューしてください',
       aiCliMode: 'review',
-    }), createPolicy())
+    }), createPolicy(), createStructuredReviewContext())
 
     expect(result.status).toBe('success')
+    expect(result.reviewResult).toEqual(verdict)
     expect(resolveCommandMock).toHaveBeenCalled()
+    expect(mockAdapter.run).toHaveBeenCalledWith(expect.objectContaining({
+      expectJson: true,
+      prompt: expect.stringContaining('[baseline HEAD]'),
+    }))
+  })
+
+  it.each(['changes_requested', 'rejected'] as const)(
+    'review verdict %s is persisted in the result and fails the Job',
+    async (status) => {
+      const verdict = { status, summary: 'Stop for CEO review', findings: [] }
+      const mockAdapter = {
+        run: vi.fn().mockResolvedValue(makeCliResult({ stdout: JSON.stringify(verdict) })),
+      }
+      createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+      const result = await runJob(createJob({
+        workflowStepKey: 'implement:implement-job-1:review',
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'review',
+      }), createPolicy(), createStructuredReviewContext())
+
+      expect(result.status).toBe('failed')
+      expect(result.reviewResult).toEqual(verdict)
+    },
+  )
+
+  it('invalid structured review output fails closed without a ReviewResult', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        stdout: JSON.stringify({ status: 'approved', summary: 'Missing findings' }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      workflowStepKey: 'implement:implement-job-1:review',
+      aiCliProvider: 'claude_code',
+      aiCliMode: 'review',
+    }), createPolicy(), createStructuredReviewContext())
+
+    expect(result.status).toBe('failed')
+    expect(result.reviewResult).toBeUndefined()
+    expect(result.stderr).toContain('strict schema validation')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
   it('AI CLI が exitCode !== 0 → status: failed で早期リターン（SafeCommand は実行されない）', async () => {
@@ -1994,7 +2161,11 @@ describe('task-022: AI CLI 実行ブロック', () => {
   })
 
   it('dryRun: true → AI CLI にも dryRun: true が伝搬する', async () => {
-    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult()) }
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        stdout: JSON.stringify({ status: 'approved', summary: 'dry run', findings: [] }),
+      })),
+    }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
 
     const job = createJob({
@@ -2003,7 +2174,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliPrompt: 'テスト実行だけ',
       aiCliMode: 'review',
     })
-    await runJob(job, createPolicy())
+    await runJob(job, createPolicy(), createStructuredReviewContext())
 
     expect(mockAdapter.run).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }))
   })

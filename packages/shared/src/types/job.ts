@@ -59,7 +59,8 @@ export interface Job {
   /**
    * AI CLI 実行パラメータ（task-022）
    * 指定された場合、SafeCommand 実行前に AI CLI を先行実行する。
-   * 3フィールドすべて揃った場合のみ AI CLI が起動する（部分指定は無視）。
+   * review JobのpromptはWorkerが構築するため、クライアント/APIはproviderとmodeだけを保持する。
+   * その他のmodeでは3フィールドすべてを指定する。
    */
   aiCliProvider?: AiCliProvider
   aiCliPrompt?: string

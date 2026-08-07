@@ -9,7 +9,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, PersistReviewWorkflowResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
@@ -793,6 +793,77 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
       try {
         return transition()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+    persistReviewWorkflowResult(input) {
+      const persistTransaction = db.transaction((): PersistReviewWorkflowResult => {
+        const source = jobs.findById(input.jobId)
+        if (!source) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Review Job not found' }
+        }
+        if (source.aiCliMode !== 'review') {
+          return { ok: false, code: 'NOT_WORKFLOW_JOB', reason: 'Only review Jobs can persist structured reviews' }
+        }
+
+        const existingReviewRow = db.prepare(
+          'SELECT * FROM review_results WHERE job_id = ?',
+        ).get(source.id) as any
+        const existingReview = existingReviewRow
+          ? deserializeReviewResult(existingReviewRow)
+          : undefined
+        if (
+          existingReview &&
+          (existingReview.status !== input.reviewResult.status ||
+            existingReview.summary !== input.reviewResult.summary ||
+            JSON.stringify(existingReview.findings) !== JSON.stringify(input.reviewResult.findings))
+        ) {
+          return { ok: false, code: 'REVIEW_CONFLICT', reason: 'Review result resend does not match the saved result' }
+        }
+
+        let existingNext: Job | undefined
+        if (input.nextJob) {
+          const existingNextRow = db.prepare(
+            'SELECT * FROM jobs WHERE workflow_step_key = ?',
+          ).get(input.nextJob.workflowStepKey) as any
+          existingNext = existingNextRow ? deserializeJob(existingNextRow) : undefined
+          if (
+            existingNext &&
+            (existingNext.taskId !== input.nextJob.taskId || existingNext.projectId !== input.nextJob.projectId)
+          ) {
+            return { ok: false, code: 'WORKFLOW_CONFLICT', reason: 'Workflow step key belongs to another Task or Project' }
+          }
+        }
+
+        const updated = jobs.update(source.id, input.update)
+        if (!updated) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Review Job not found' }
+        }
+        const reviewResult = existingReview ?? reviewResults.create({
+          taskId: source.taskId,
+          jobId: source.id,
+          reviewer: source.agentRole,
+          ...input.reviewResult,
+        })
+        const nextJob = existingNext ?? (input.nextJob ? jobs.create(input.nextJob) : undefined)
+
+        return {
+          ok: true,
+          job: updated,
+          reviewResult,
+          reviewResultCreated: existingReview === undefined,
+          nextJob,
+          nextJobCreated: input.nextJob !== undefined && existingNext === undefined,
+        }
+      })
+
+      try {
+        return persistTransaction()
       } catch (err: unknown) {
         return {
           ok: false,

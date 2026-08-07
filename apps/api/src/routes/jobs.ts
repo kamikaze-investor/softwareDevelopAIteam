@@ -51,6 +51,19 @@ const SafeCommandInputSchema = z.object({
 
 const AiCliProviderSchema = z.enum(['claude_code', 'codex', 'gemini'])
 const AiCliModeSchema = z.enum(['implement', 'review', 'qa', 'summarize'])
+const ReviewStatusSchema = z.enum(['approved', 'changes_requested', 'rejected'])
+const FindingSeveritySchema = z.enum(['low', 'medium', 'high', 'critical'])
+const StructuredReviewResultSchema = z.object({
+  status: ReviewStatusSchema,
+  summary: z.string(),
+  findings: z.array(z.object({
+    severity: FindingSeveritySchema,
+    file: z.string().optional(),
+    line: z.number().optional(),
+    message: z.string().min(1),
+    rule: z.string().optional(),
+  }).strict()),
+}).strict()
 
 const CreateJobBody = z.object({
   taskId: z.string().min(1),
@@ -66,10 +79,11 @@ const CreateJobBody = z.object({
     const hasProvider = d.aiCliProvider !== undefined
     const hasPrompt = d.aiCliPrompt !== undefined
     const hasMode = d.aiCliMode !== undefined
-    const count = [hasProvider, hasPrompt, hasMode].filter(Boolean).length
-    return count === 0 || count === 3
+    if (!hasProvider && !hasPrompt && !hasMode) return true
+    if (d.aiCliMode === 'review') return hasProvider && !hasPrompt
+    return hasProvider && hasPrompt && hasMode
   },
-  { message: 'aiCliProvider / aiCliPrompt / aiCliMode はすべて指定するか、すべて省略してください' },
+  { message: 'review JobはaiCliPromptを受け取らず、その他のAI CLI Jobはprovider/prompt/modeをすべて指定してください' },
 )
 
 const UpdateJobBody = z.object({
@@ -94,6 +108,7 @@ const UpdateJobBody = z.object({
     fileChangeAllowed: z.boolean(),
     fileViolations: z.array(z.string()).optional(),
   }).optional(),
+  reviewResult: StructuredReviewResultSchema.optional(),
 }).strict()
 
 const ListQuerySchema = z.object({
@@ -157,22 +172,76 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Job not found' })
     }
 
+    const { reviewResult, ...jobUpdate } = result.data
+    const isReviewJob = existing.aiCliMode === 'review'
+    const isAutomaticReviewJob =
+      existing.workflowStepKey?.startsWith('implement:') === true &&
+      existing.workflowStepKey.endsWith(':review') &&
+      isReviewJob
+
+    if (reviewResult) {
+      if (!isReviewJob) {
+        return reply.status(400).send({ error: 'Structured review results are only accepted for review Jobs' })
+      }
+
+      const approved = reviewResult.status === 'approved' && jobUpdate.status === 'success'
+      const normalizedUpdate: Partial<Job> = {
+        ...jobUpdate,
+        status: approved ? 'success' : 'failed',
+      }
+      const task = storage.tasks.findById(existing.taskId)
+      if (!task) {
+        return reply.status(500).send({ error: 'Review Job Task not found' })
+      }
+      const persisted = storage.jobs.persistReviewWorkflowResult({
+        jobId: existing.id,
+        update: normalizedUpdate,
+        reviewResult,
+        nextJob: approved && isAutomaticReviewJob ? {
+          taskId: existing.taskId,
+          projectId: existing.projectId,
+          workflowStepKey: `review:${existing.id}:git-commit`,
+          agentRole: 'developer_ai',
+          status: 'queued',
+          safeCommand: {
+            kind: 'git_commit',
+            params: { commitMessage: task.title },
+            workingDir: TARGET_WORKING_DIR,
+          },
+        } : undefined,
+      })
+      if (!persisted.ok) {
+        req.log.error({ code: persisted.code, reason: persisted.reason }, 'Failed to persist structured review')
+        return reply.status(500).send({ error: 'Failed to persist structured review' })
+      }
+      return reply.send(persisted.job)
+    }
+
+    if (isReviewJob && jobUpdate.status === 'success') {
+      const failed = storage.jobs.update(existing.id, {
+        ...jobUpdate,
+        status: 'failed',
+        stderr: jobUpdate.stderr ?? 'Structured review result is missing (fail-closed)',
+      })
+      return reply.send(failed)
+    }
+
     const isInitialImplementWorkflowJob =
       existing.workflowStepKey === `task:${existing.taskId}:initial-implement` &&
       existing.aiCliMode === 'implement'
     const shouldCreateReview =
       isInitialImplementWorkflowJob &&
       existing.safeCommand.kind === 'test' &&
-      result.data.status === 'success' &&
-      result.data.exitCode === 0 &&
-      (result.data.changedFiles?.length ?? 0) > 0 &&
-      result.data.guardResult?.permissionAllowed === true &&
-      result.data.guardResult.fileChangeAllowed === true
+      jobUpdate.status === 'success' &&
+      jobUpdate.exitCode === 0 &&
+      (jobUpdate.changedFiles?.length ?? 0) > 0 &&
+      jobUpdate.guardResult?.permissionAllowed === true &&
+      jobUpdate.guardResult.fileChangeAllowed === true
 
     if (shouldCreateReview) {
       const transition = storage.jobs.updateAndCreateNextWorkflowJob({
         jobId: existing.id,
-        update: result.data,
+        update: jobUpdate,
         nextJob: {
           taskId: existing.taskId,
           projectId: existing.projectId,
@@ -191,7 +260,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(transition.job)
     }
 
-    const updated = storage.jobs.update(req.params.id, result.data)
+    const updated = storage.jobs.update(req.params.id, jobUpdate)
     if (!updated) {
       return reply.status(404).send({ error: 'Job not found' })
     }

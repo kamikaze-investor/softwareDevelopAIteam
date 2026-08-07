@@ -29,6 +29,26 @@ export type AdvanceWorkflowJobResult =
       reason: string
     }
 
+export type PersistReviewWorkflowResult =
+  | {
+      ok: true
+      job: Job
+      reviewResult: ReviewResult
+      reviewResultCreated: boolean
+      nextJob?: Job
+      nextJobCreated: boolean
+    }
+  | {
+      ok: false
+      code:
+        | 'JOB_NOT_FOUND'
+        | 'NOT_WORKFLOW_JOB'
+        | 'REVIEW_CONFLICT'
+        | 'WORKFLOW_CONFLICT'
+        | 'STORAGE_ERROR'
+      reason: string
+    }
+
 export type CreateApprovalForJobResult =
   | { ok: true; approvalRequest: ApprovalRequest }
   | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED'; reason: string }
@@ -112,6 +132,13 @@ export interface IJobStorage {
     update: Partial<Job>
     nextJob: Omit<Job, 'id' | 'createdAt' | 'workflowStepKey'> & { workflowStepKey: string }
   }): AdvanceWorkflowJobResult
+  /** structured review保存・review Job更新・任意のworkflow次Job作成を原子的に行う。 */
+  persistReviewWorkflowResult(input: {
+    jobId: string
+    update: Partial<Job>
+    reviewResult: Pick<ReviewResult, 'status' | 'summary' | 'findings'>
+    nextJob?: Omit<Job, 'id' | 'createdAt' | 'workflowStepKey'> & { workflowStepKey: string }
+  }): PersistReviewWorkflowResult
   resumeBlockedTask(input: {
     taskId: string
     instructionPrompt: string
