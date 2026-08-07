@@ -89,6 +89,7 @@ export interface TaskSummary {
   latestJob?: {
     jobId: string
     status: JobStatus
+    approvalId?: string
     startedAt?: string
     completedAt?: string
   }
@@ -106,45 +107,17 @@ export interface TaskSummary {
 export interface TaskDisplayStatusInput {
   taskStatus: TaskStatus
   latestJobStatus?: JobStatus
-  /** 最新Jobの作成時刻（Job.createdAt）。ApprovalRequestとの新旧比較に使う */
-  latestJobCreatedAt?: string
-  latestApprovalStatus?: ApprovalGateStatus
-  /** 最新ApprovalRequestの作成時刻（ApprovalRequest.createdAt） */
-  latestApprovalCreatedAt?: string
-}
-
-function parseTimeSafe(iso?: string): number | undefined {
-  if (!iso) return undefined
-  const time = Date.parse(iso)
-  return Number.isNaN(time) ? undefined : time
-}
-
-/**
- * ApprovalRequestの状態（WAITING_FOR_USER/REJECTED）を「現在のJob停止状態」として扱ってよいかを判定する。
- *
- * Job.approvalIdが未接続のため、taskId一致による簡易な時系列比較に留まる:
- * 最新ApprovalRequestより後に作成されたJobが存在する場合、その承認情報は既に古い試行に対するもの
- * （＝却下/承認待ちの後に新しいJobが動いている）とみなし、現在状態としては扱わない。
- * 時刻が安全に比較できない場合（createdAt欠落・パース失敗）は、誤ってREJECTED/WAITING_FOR_USERを
- * 現在状態と断定せず、Jobベースの判定（blocked等の曖昧だが安全な状態）へフォールバックする。
- */
-function isApprovalCurrent(input: TaskDisplayStatusInput): boolean {
-  if (input.latestApprovalStatus === undefined) return false
-
-  const approvalTime = parseTimeSafe(input.latestApprovalCreatedAt)
-  if (approvalTime === undefined) return false
-
-  const jobTime = parseTimeSafe(input.latestJobCreatedAt)
-  if (jobTime === undefined) return true
-
-  return jobTime <= approvalTime
+  /** Approval referenced by the latest Job's approvalId, if that link resolves. */
+  linkedApprovalStatus?: ApprovalGateStatus
 }
 
 export function computeTaskDisplayStatus(input: TaskDisplayStatusInput): TaskDisplayStatus {
-  const approvalCurrent = isApprovalCurrent(input)
-
-  if (approvalCurrent && input.latestApprovalStatus === 'WAITING_FOR_USER') return 'waiting_approval'
-  if (approvalCurrent && input.latestApprovalStatus === 'REJECTED') return 'rejected_waiting_instruction'
+  if (input.latestJobStatus === 'blocked' && input.linkedApprovalStatus === 'WAITING_FOR_USER') {
+    return 'waiting_approval'
+  }
+  if (input.latestJobStatus === 'blocked' && input.linkedApprovalStatus === 'REJECTED') {
+    return 'rejected_waiting_instruction'
+  }
   if (input.latestJobStatus === 'blocked') return 'blocked'
   if (input.latestJobStatus === 'failed') return 'failed'
   if (input.latestJobStatus === 'running') return 'running'

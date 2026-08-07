@@ -193,8 +193,9 @@ function buildTaskSummary(
   approvalRequests: ApprovalRequest[],
 ): TaskSummary {
   const latestApproval = approvalRequests[0]
-  // Approval correlation is intentionally taskId-only for this lightweight view.
-  // It does not identify which Job maps to which ApprovalRequest; Job.approvalId wiring is a later task.
+  const linkedApproval = latestJob?.approvalId
+    ? approvalRequests.find(request => request.id === latestJob.approvalId)
+    : undefined
   const latestApprovalStatus = latestApproval?.status
 
   return {
@@ -207,6 +208,7 @@ function buildTaskSummary(
     latestJob: latestJob ? {
       jobId: latestJob.id,
       status: latestJob.status,
+      approvalId: latestJob.approvalId,
       startedAt: latestJob.startedAt,
       completedAt: latestJob.completedAt,
     } : undefined,
@@ -220,9 +222,7 @@ function buildTaskSummary(
     displayStatus: computeTaskDisplayStatus({
       taskStatus: task.status,
       latestJobStatus: latestJob?.status,
-      latestJobCreatedAt: latestJob?.createdAt,
-      latestApprovalStatus,
-      latestApprovalCreatedAt: latestApproval?.createdAt,
+      linkedApprovalStatus: linkedApproval?.status,
     }),
     updatedAt: newestIso([
       task.updatedAt,

@@ -285,21 +285,6 @@ function sortApprovalRequestsByNewestFirst(
 // MVP-Aの正規workingDir（/workspace/target固定）をサーバー側で設定する。
 // ────────────────────────────────────────────────────────────
 
-/**
- * 独立レビューAIへ渡す固定プロンプト。
- * 対象は現在の未コミット差分のみ・コード変更禁止・出力は3000文字以内の
- * 固定フォーマットとする（MVP-Aポリシー）。
- */
-const REVIEW_PROMPT = `あなたは独立したコードレビューAIです。
-
-対象: 現在のworking treeにある未コミットの差分だけを確認してください。それ以外のファイルは見ないでください。
-禁止: コードを変更しないでください。レビューのみを行ってください。
-
-出力は次の形式で、3000文字以内にまとめてください:
-【結論】(approve / changes_requested / reject のいずれか一つ)
-【重大な問題】(無ければ「なし」)
-【推奨対応】`
-
 function isImplementJob(job: Job): boolean {
   return job.aiCliMode === 'implement'
 }
@@ -309,12 +294,42 @@ function isReviewJob(job: Job): boolean {
 }
 
 function isJobBusy(jobs: Job[]): boolean {
+  return jobs.some((job) => job.status === 'queued' || job.status === 'running')
+}
+
+function isAutomaticCommitJob(job: Job): boolean {
+  return job.workflowStepKey?.startsWith('review:') === true &&
+    job.workflowStepKey.endsWith(':git-commit')
+}
+
+function findLinkedApproval(
+  job: Job | undefined,
+  approvalRequests: ApprovalRequest[],
+): ApprovalRequest | undefined {
+  if (!job?.approvalId) return undefined
+  return approvalRequests.find(request => request.id === job.approvalId)
+}
+
+function hasWaitingLinkedApproval(
+  jobs: Job[],
+  approvalRequests: ApprovalRequest[],
+): boolean {
   const latestJob = sortJobsByNewestFirst(jobs)[0]
-  return latestJob?.status === 'queued' || latestJob?.status === 'running'
+  return findLinkedApproval(latestJob, approvalRequests)?.status === 'WAITING_FOR_USER'
+}
+
+function manualWorkflowIsLocked(
+  jobs: Job[],
+  approvalRequests: ApprovalRequest[],
+): boolean {
+  return isJobBusy(jobs) ||
+    jobs.some(isAutomaticCommitJob) ||
+    hasWaitingLinkedApproval(jobs, approvalRequests)
 }
 
 /** 実装Jobが少なくとも1件成功しているか（独立レビューJobを起票できるか） */
-function canRunReview(jobs: Job[]): boolean {
+function canRunReview(jobs: Job[], approvalRequests: ApprovalRequest[]): boolean {
+  if (manualWorkflowIsLocked(jobs, approvalRequests)) return false
   const latestImplement = sortJobsByNewestFirst(jobs).find(isImplementJob)
   return latestImplement?.status === 'success'
 }
@@ -326,7 +341,8 @@ function canRunReview(jobs: Job[]): boolean {
  *   （＝最新実装Jobがsuccess → その後の最新Review Jobがsuccess →
  *     Review後に新しい実装Jobが存在しない、と同値）。
  */
-function canReflectChanges(jobs: Job[]): boolean {
+function canReflectChanges(jobs: Job[], approvalRequests: ApprovalRequest[]): boolean {
+  if (manualWorkflowIsLocked(jobs, approvalRequests)) return false
   const relevant = sortJobsByNewestFirst(jobs).filter(
     (job) => isImplementJob(job) || isReviewJob(job),
   )
@@ -378,10 +394,7 @@ function canShowResumeUI(
     return false
   }
 
-  const latestApprovalRequest =
-    sortApprovalRequestsByNewestFirst(approvalRequests)[0]
-
-  if (latestApprovalRequest?.status === 'WAITING_FOR_USER') {
+  if (findLinkedApproval(latestJob, approvalRequests)?.status === 'WAITING_FOR_USER') {
     return false
   }
 
@@ -548,19 +561,21 @@ function latestAiCliProvider(jobs: Job[]): Job['aiCliProvider'] {
 }
 
 function JobActionsSection({
+  approvalRequests,
   jobs,
   onCreated,
   task,
 }: {
+  approvalRequests: ApprovalRequest[]
   jobs: Job[]
   onCreated: () => void
   task: Task
 }): ReactElement {
   const [runningAction, setRunningAction] = useState<JobActionKind | null>(null)
 
-  const busy = isJobBusy(jobs)
-  const reviewEnabled = !busy && canRunReview(jobs)
-  const reflectEnabled = !busy && canReflectChanges(jobs)
+  const actionsLocked = runningAction !== null || manualWorkflowIsLocked(jobs, approvalRequests)
+  const reviewEnabled = runningAction === null && canRunReview(jobs, approvalRequests)
+  const reflectEnabled = runningAction === null && canReflectChanges(jobs, approvalRequests)
 
   const runAction = useCallback(
     async (kind: JobActionKind, body: Record<string, unknown>): Promise<void> => {
@@ -593,7 +608,6 @@ function JobActionsSection({
     void runAction('review', {
       agentRole: 'qa_ai',
       aiCliMode: 'review',
-      aiCliPrompt: REVIEW_PROMPT,
       aiCliProvider: latestAiCliProvider(jobs) ?? 'claude_code',
       safeCommand: { kind: 'git_status' },
     })
@@ -622,9 +636,13 @@ function JobActionsSection({
       <Text style={styles.sectionTitle}>作業</Text>
 
       <TouchableOpacity
-        disabled={busy}
+        disabled={actionsLocked}
         onPress={handleImplement}
-        style={[styles.actionButton, styles.actionButtonImplement, busy && styles.actionButtonDisabled]}
+        style={[
+          styles.actionButton,
+          styles.actionButtonImplement,
+          actionsLocked && styles.actionButtonDisabled,
+        ]}
       >
         {runningAction === 'implement' && <ActivityIndicator color="#fff" size="small" />}
         <Text style={styles.actionButtonText}>実装を開始</Text>
@@ -655,7 +673,7 @@ function JobActionsSection({
         {runningAction === 'reflect' && <ActivityIndicator color="#fff" size="small" />}
         <Text style={styles.actionButtonText}>変更を反映</Text>
       </TouchableOpacity>
-      {!reflectEnabled && !busy && (
+      {!reflectEnabled && !actionsLocked && (
         <Text style={styles.actionHelpText}>独立レビュー完了後に反映できます</Text>
       )}
     </View>
@@ -980,6 +998,7 @@ export default function TaskDetailScreen(): ReactElement {
         <>
           <TaskInfoSection task={data.task} />
           <JobActionsSection
+            approvalRequests={data.approvalRequests}
             jobs={data.jobs}
             onCreated={() => void loadTaskDetail()}
             task={data.task}

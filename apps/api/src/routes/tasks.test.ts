@@ -130,10 +130,12 @@ async function createBlockedAiCliJob(
 async function createApprovalRequest(
   taskId: string,
   body: Partial<Omit<ApprovalRequest, 'id' | 'createdAt' | 'taskId'>> = {},
+  linkedJobId?: string,
 ): Promise<ApprovalRequest> {
   const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
 
-  return getStorage().approvalRequests.create({
+  const approvalRequest = storage.approvalRequests.create({
     taskId,
     targetBranch: 'ai/task-test',
     targetCommit: 'abc123',
@@ -145,6 +147,12 @@ async function createApprovalRequest(
     invalidIf: [],
     ...body,
   })
+
+  if (linkedJobId) {
+    storage.jobs.update(linkedJobId, { approvalId: approvalRequest.id })
+  }
+
+  return approvalRequest
 }
 
 /** createdAt比較テスト用に、ミリ秒レベルで確実に順序を分けるための待機 */
@@ -309,7 +317,7 @@ describe('Task API', () => {
       expect(betaSummary?.projectName).toBe('Beta')
       expect(alphaSummary?.latestJob?.status).toBe('running')
       expect(alphaSummary?.approvalSummary.hasWaitingApproval).toBe(true)
-      expect(alphaSummary?.displayStatus).toBe('waiting_approval')
+      expect(alphaSummary?.displayStatus).toBe('running')
     })
   })
 
@@ -317,7 +325,13 @@ describe('Task API', () => {
     await withApp(async (app) => {
       const project = await createProject(app)
       const task = await createTask(app, project.id, { title: 'Rejected task' })
-      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'CRITICAL' })
+      const blockedJob = await createJob(app, task)
+      await updateJob(app, blockedJob.id, { status: 'blocked' })
+      await createApprovalRequest(
+        task.id,
+        { status: 'REJECTED', riskLevel: 'CRITICAL' },
+        blockedJob.id,
+      )
 
       const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
 
@@ -330,6 +344,52 @@ describe('Task API', () => {
     })
   })
 
+  it('GET /api/tasks/summary shows waiting_approval only for the Approval linked to the latest blocked Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { title: 'Waiting task' })
+      const blockedJob = await createJob(app, task)
+      await updateJob(app, blockedJob.id, { status: 'blocked' })
+      const approval = await createApprovalRequest(
+        task.id,
+        { status: 'WAITING_FOR_USER' },
+        blockedJob.id,
+      )
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const [summary] = parseBody<TaskSummary[]>(res.body)
+      expect(summary.latestJob?.approvalId).toBe(approval.id)
+      expect(summary.displayStatus).toBe('waiting_approval')
+    })
+  })
+
+  it('GET /api/tasks/summary keeps a technical Job failure visible despite its linked waiting Approval', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { title: 'Technical failure task' })
+      const failedJob = await createJob(app, task)
+      await updateJob(app, failedJob.id, {
+        status: 'failed',
+        stderr: 'Worker API connection failed',
+      })
+      const approval = await createApprovalRequest(
+        task.id,
+        { status: 'WAITING_FOR_USER' },
+        failedJob.id,
+      )
+
+      const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
+
+      expect(res.statusCode).toBe(200)
+      const [summary] = parseBody<TaskSummary[]>(res.body)
+      expect(summary.approvalSummary.hasWaitingApproval).toBe(true)
+      expect(summary.latestJob?.approvalId).toBe(approval.id)
+      expect(summary.displayStatus).toBe('failed')
+    })
+  })
+
   it('GET /api/tasks/summary treats REJECTED as stale once a newer Job succeeds', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -337,7 +397,11 @@ describe('Task API', () => {
 
       const blockedJob = await createJob(app, task)
       await updateJob(app, blockedJob.id, { status: 'blocked' })
-      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'HIGH' })
+      await createApprovalRequest(
+        task.id,
+        { status: 'REJECTED', riskLevel: 'HIGH' },
+        blockedJob.id,
+      )
       await wait(5)
       const newerJob = await createJob(app, task)
       await updateJob(app, newerJob.id, { status: 'success' })
@@ -358,7 +422,11 @@ describe('Task API', () => {
 
       const blockedJob = await createJob(app, task)
       await updateJob(app, blockedJob.id, { status: 'blocked' })
-      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'HIGH' })
+      await createApprovalRequest(
+        task.id,
+        { status: 'REJECTED', riskLevel: 'HIGH' },
+        blockedJob.id,
+      )
       await wait(5)
       const newerJob = await createJob(app, task)
       await updateJob(app, newerJob.id, { status: 'running' })
@@ -379,7 +447,11 @@ describe('Task API', () => {
       const blockedJob = await createJob(app, task)
       await updateJob(app, blockedJob.id, { status: 'blocked' })
       await wait(5)
-      await createApprovalRequest(task.id, { status: 'REJECTED', riskLevel: 'CRITICAL' })
+      await createApprovalRequest(
+        task.id,
+        { status: 'REJECTED', riskLevel: 'CRITICAL' },
+        blockedJob.id,
+      )
 
       const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
 
@@ -394,7 +466,13 @@ describe('Task API', () => {
       const project = await createProject(app)
       const task = await createTask(app, project.id, { title: 'Approved and moved on task' })
 
-      await createApprovalRequest(task.id, { status: 'WAITING_FOR_USER' })
+      const blockedJob = await createJob(app, task)
+      await updateJob(app, blockedJob.id, { status: 'blocked' })
+      await createApprovalRequest(
+        task.id,
+        { status: 'WAITING_FOR_USER' },
+        blockedJob.id,
+      )
       await wait(5)
       const newerJob = await createJob(app, task)
       await updateJob(app, newerJob.id, { status: 'success' })
