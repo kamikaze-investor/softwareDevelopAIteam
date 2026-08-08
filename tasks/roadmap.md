@@ -803,6 +803,25 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 `docs/PROJECT_CURRENT_STATE.md`「Implemented MVP Baseline」に明示された維持対象であり、
 本セクションの将来構想によって削除・置換されることはない。
 
+**上位アーキテクチャの移行方向（正本）:** 本OSは最終的に次の構造へ移行する方向とする。
+
+```text
+現在: AI Development Team OS（単一構成）
+  ↓
+将来: AI Organization OS Core（汎用部分）
+      + Development Team Extension（Development固有部分）
+```
+
+- **汎用部分（Core行き）**: Task Engine / Worker Registry / Worker Routing / Worker Adapter Framework /
+  Approval Gate / Policy / Cost / Knowledge / Learning / Observability
+- **Development固有（Team Extension行き）**: Git操作 / Repository理解 / branch / commit / diff /
+  lint / typecheck / test / build / deploy / code review
+
+**この移行はMVP完成後に着手する。** MVP中は「境界を作る」ことのみを目的とし、汎用機能の実装は行わない。
+判断に迷った場合は`specs/13_future_system_architecture.md`と`specs/00_constitution.md` 3.7
+（Vendor Independence）を正本とする。Worker抽象化の包含関係（Worker Registry ⊃ Model Registry 等）は
+`specs/13_future_system_architecture.md` 5b-7-9を参照。
+
 - [ ] Extension Registry正式化・Service Extension Interface定義（Telemetry/Notification/Knowledge等の抽象化）
 - [ ] Development TeamのTeam Extension化（現状はClaude Code/Codex/Geminiが`apps/worker`に直接組み込まれた
       単一構成。将来的にTeam概念として抽象化するかは要検討）
@@ -814,6 +833,38 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 - [ ] Personal Evolution / Profile Evolution / Core Evolution（CEO承認付き昇格フロー）
 - [ ] `docs/AI_TEAM_OS_DESIGN.md`「第3弾」（AI Reliability/KPI/Conflict Management/Learning Control/Rollback/
       AI Runtime State）との重複整理（要整理・将来統合検討。今回は削除・置換しない）
+
+### Architecture Debt: Organization Core切り出しの阻害要因（2026-08-09調査で確定・MVP中は修正しない）
+
+将来 Development OS を「Development Team Extension」へ、汎用部分を「AI Organization OS Core」へ移行する
+際、以下が前提条件となる。**MVP完成を優先し、現時点では大規模リファクタリングを行わない。**
+
+- [ ] Debt-1: Core型の`CommandKind`がDevelopment/Git専用
+      `packages/shared/src/types/command.ts`の11種すべてがGit/devツールチェーン
+      （`git_commit` / `typecheck` / `test` / `build` / `lint`等）。Core層がDevelopment語彙を直接保持している
+- [ ] Debt-2: `Job` schemaにDevelopment固有情報が混在
+      `changedFiles` / `commitHash` / `rollbackInfo`がCore Job型・`jobs`テーブルに存在。
+      汎用Task/Resultへ寄せる場合、これらはExtension metadata側へ退避が必要
+- [ ] Debt-3: Approval Gate / DB schemaがGitロジックへ密結合
+      `approval_requests`の`target_branch` / `target_commit` / `target_diff_hash`列、
+      `apps/api/src/routes/approvalGate.ts`の`requestedAction === 'git_commit'`分岐とdiff scan。
+      Approval GateはRisk / Action Type / Policyのみを扱う形へ抽象化が必要
+
+**Architecture Rule（MVP中も適用。絶対禁止ではなく判断基準）:** 上記3点はMVP中にリファクタリングしない。
+基本原則は「**新規実装で同種の密結合を不用意に増やさない**」ことであり、これをArchitecture判断基準に含める。
+具体的には、(a) Core型・Core DB schemaへDevelopment固有概念を新たに必須項目として追加しない、
+(b) Approval GateへGit固有ロジックを新規追加しない、(c) Worker出力をProvider固有形式のまま新規の判断
+ロジックへ流さない、を原則とする。
+
+**例外を認める条件:** 次のいずれも満たす場合は例外として密結合の追加を認めてよい。目的はMVP完成を優先
+しながら将来の切り出しを不用意に阻害しないことであり、現在のDevelopment OSを今すぐ汎用Organization OS
+へ作り替えることではない。
+
+- MVP完成に不可欠である
+- 現時点で無理に汎用化すると実装複雑性が大きく増える
+- 将来Extensionへ切り出せることが明確である
+
+例外を適用した場合は、本セクションへ**新しいDebt項目として追記**し、無断で密結合を積み増さない。
 
 ### 外部Agent Loop設計思想の吸収（Rubric / Workflow Lifecycle / Knowledge Consult / Investigate / Distill / Loop Metrics。2026-07-21反映・MVP後）
 
@@ -829,6 +880,34 @@ Knowledge Consult・Investigate・Distill・Loop Metrics）、`specs/20_token_ef
 - [ ] Loop Metrics（Retry回数・Feedback回数・Rubric達成率・Rule利用率・Knowledge命中率。Team Healthの一部として）
 - [ ] Rubric達成率のHealth反映
 - [ ] RubricをProject/Task/Workflow/Review/Approval/Healthで共通利用する正式実装
+
+**組織学習の不足分（2026-08-09のsemantic gap analysisで判明。既存項目へ統合済み・新規Phaseは追加しない）:**
+
+既存の`Investigate` / `Distill` / `Loop Metrics`は、それぞれ「失敗の原因深掘り」「Rule化」「内部Loop状態
+把握」を責務としており、以下は**射程外**であることを確認した。既存機能を肥大化させず、下記として整理する。
+詳細定義は`specs/13_future_system_architecture.md` 5b-5-1 / 5b-6-1 / 5b-6-2 / 5b-8 / 5b-9 / 5b-10。
+
+- [ ] Self Diagnosis Frameworkの責務定義に基づく実装（Current State / Objective / Goal Gap /
+      Trajectory Gap / Degradation / Opportunity / Bottleneck / Riskを観測し改善対象候補を検出する。
+      **悪化検知だけに限定しない**。既存Investigateをこの検出機能へ肥大化させない。仕様: 5b-8）
+- [ ] Improvement Plannerの責務定義に基づく実装（Expected Outcome Impact / Strategic Importance /
+      Probability of Success / Urgency / Implementation Cost / Time to Learn / Riskで優先順位付け。
+      下位KPI改善が上位KPIを犠牲にしないことを条件とする。原因分析は既存Investigateを再利用。仕様: 5b-9）
+- [ ] Knowledge Lifecycle State（External Claim / Observation / Hypothesis / Evidence /
+      Validated Knowledge / Operationalized Knowledge / Revalidation）と属性
+      （`applicable_conditions` / `confidence` / `causal_confidence` / Internal・External区別）。
+      現行5b-3のKnowledge種別（内容カテゴリ）と直交する軸として追加する。仕様: 5b-5-1
+- [ ] Knowledge Conflict（外部主張と自社実績の不一致をエラーとせず`CONFLICT`として記録し、
+      原因候補を保持する。Conflict自体を価値ある知識として扱う。仕様: 5b-5-1）
+- [ ] 指標体系の分離（Execution/Loop Metrics ／ Business Outcome ／ Objective Progress を別軸として扱う。
+      **Loop Metricsへ事業指標を統合しない**。仕様: 5b-6-1）
+- [ ] 評価概念の分離（Worker/Execution Quality ／ Strategy/Playbook Performance ／ Business Outcome を
+      混同しない。仕様: 5b-6-2）
+- [ ] Problem-driven Learningの順序原則の実装
+      （Objective/Gap/Opportunity → 原因・仮説 → Internal Knowledge → 不足時のみExternal Knowledge →
+      Experiment → Outcome → Knowledge更新。外部ノウハウを改善活動の起点にしない。仕様: 5b-10）
+- [ ] Quality Stabilizer（Worker間の品質ばらつきを吸収し最終成果物品質を一定範囲へ収束させる層。
+      必要なレベルまでしかescalationしない。仕様: 5b-7-9）
 
 **スマホ操作MVP中に検討してよい最小実装（実装は今回行わない）:**
 Task作成画面・開発指示UI（本セクション上部「スマホ操作MVP残タスク」4番目）を実装する際、以下を
@@ -880,6 +959,28 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
       レイテンシ・過去の成功率・完了総コスト・モデル利用可能状態・失敗時エスカレーションから自動選択する。
       **固定ルールで実際に問題が発生した場合のみ実装を検討する低優先度機能。自動最適化の導入自体を
       目的にしない**
+
+**将来のWorker抽象化との包含関係（2026-08-09追記。移行方向の明示のみ。現行機能の削除・改名は不要）:**
+
+本セクションの各機能はいずれも**LLM（モデル）だけを対象としたsubset**である。将来のAI Organization OS
+Coreでは実行主体をモデルに限定せずWorkerとして抽象化する。最終正本はWorker系の名称とする。
+
+```text
+Worker Registry                 ← 最終正本
+  └ Model Registry (Lite)           LLMのみを対象とするsubset
+
+Worker Routing / Execution Plan ← 最終正本
+  └ Model Routing (Static/Dynamic)  単一モデル選択のみのsubset
+
+Worker Adapter Framework        ← 最終正本
+  └ AI CLI Adapter                  現行実装（`apps/worker/src/aiCli/*`）。CLI型LLMのみのsubset
+```
+
+将来Workerには、LLMに加えAgent（Lovable / OpenHands等）・Tool（Apify Actor / n8n等）・Script（Python /
+shell）・Deterministic（validator / test runner / linter）等を含める。Routingの最適化単位も単一Workerに
+限らずWorker Compositionまで拡張しうる。最適化目標は「最も安いWorker」ではなく
+「**要求品質を満たす実行計画の総コスト最小化**」（＝本セクション既出の「修正/再試行を含む完了までの
+総コスト」と同一概念）。詳細: `specs/13_future_system_architecture.md` 5b-7-9。
 
 **優先順位:** 1. MVPの完成 → 2. 単純な固定ルールによる安定運用 → 3. 実行ログの収集 →
 4. 実際に問題が出た部分だけモデル選択を改善 → 5. 必要性が確認された場合のみ限定比較 →

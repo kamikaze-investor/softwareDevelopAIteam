@@ -172,17 +172,85 @@ Context Minimization原則に従う。
 （例: 3回）続いた場合、または既知ルールで原因が分からない場合にのみ発動する。Investigateはコード変更を
 直接行わず、原因・Evidence・再発防止案を出すのみで、結果はKnowledgeへ送る。
 
+**責務境界（重要）:** Investigateの責務は「起きた事象の**原因を深掘りする**」ことに限定する。
+Goal Gap・Trajectory Gap・Opportunity・Bottleneckといった「**そもそも何を改善対象にするか**」の検出は
+Investigateの責務ではなく、Self Diagnosis Framework（5b-8）が担う。優先順位付けはImprovement Planner
+（5b-9）が担う。Investigateをこれらの検出機能へ肥大化させない。改善候補について原因分析が必要になった
+場合に、Investigateを**再利用する**関係とする（呼び出し順序は5b-10を参照）。
+
 ## 5b-5. Distill（Evolutionへ吸収）
 
 ログ・失敗・Review結果・Investigate結果から、再利用可能なRuleやKnown Pitfallを作る処理。
 `Observation → Investigate → Verify → Distill → Knowledge登録`の流れを取る。Rule化にはEvidenceが必要で、
 自動でCoreやWorkflowを変更することはなく、必要に応じてCEO承認対象とする。
 
+### 5b-5-1. Knowledge Lifecycle（将来設計。現行5b-3のKnowledge種別を置き換えない）
+
+5b-3のKnowledge種別（Project / Workflow / Skill / Rule / Architecture Decision / Known Pitfall /
+Past Decision / Review Finding）は**内容カテゴリ**であり、知識の確からしさを表す状態ではない。将来的には
+これと直交する軸として、以下の**Lifecycle State**を持たせる。
+
+```text
+External Claim          外部由来の未検証の主張（そのままValidated扱いにしない）
+  ↓
+Observation             実際に起きた観測（この段階では一般化しない）
+  ↓
+Hypothesis              原因・因果についての仮説（事実として扱わない）
+  ↓
+Evidence                仮説を支持/否定する検証結果
+  ↓
+Validated Knowledge     再現性が確認された知識
+  ↓
+Operationalized         Rule / Routing / Playbook等へ実際に反映された状態
+  ↓
+Revalidation            陳腐化を検知して再検証・失効させる
+```
+
+**Knowledgeへ持たせる属性（将来）:** `applicable_conditions`（どの条件下で成立するか）、`confidence`、
+`causal_confidence`（相関と因果を区別する）、`source_type`（Internal / External）、`evidence`、
+`last_validated_at`、`revalidation_condition`。
+
+条件のない断定的な保存（例:「AはBに向いている」）は避け、成立条件つきで保存する。
+
+**Internal / External の優先:** 自社実績（Internal）を外部由来（External Claim）より優先できる設計とする。
+
+**Knowledge Conflict:** 外部主張と自社実績が一致しない場合、これをエラーや例外として捨てず
+`CONFLICT`として記録し、原因候補（対象顧客・市場・価格帯・KPI定義・時期・サンプル不足・
+適用条件の不足・外部主張自体の誤り等）を保持する。Conflictの記録自体を価値ある知識として扱う。
+
 ## 5b-6. Loop Metrics（Team Healthへ吸収）
 
 Workflow Loopの健全性を測る指標（候補: Retry回数・Feedback回数・Rubric達成率・Rule利用率・
 Knowledge命中率・Retry後成功率）。Team単位を中心とし、異なるTeamを単純比較しない。Metricsは
 状態把握のために使い、それ自体が改善提案や自動変更の根拠にはしない。
+
+### 5b-6-1. 指標体系の分離（将来設計。Loop Metricsへ事業指標を混ぜない）
+
+Loop Metricsの責務は**内部Loopの状態把握**に限定し、事業成果指標をここへ統合しない。将来的には
+以下の3系統を**別軸**として扱う。
+
+| 系統 | 内容 | 主な用途 |
+|---|---|---|
+| **Execution / Loop Metrics**（現行5b-6） | Retry・Feedback・Rubric達成率・Knowledge命中率・Worker execution実績 | 内部Loopの健全性把握 |
+| **Business Outcome** | Revenue・Profit・CV・Retention・Customer outcome等 | 事業成果の把握 |
+| **Objective Progress** | `target_value` / `current_value` / `target_date` / `trajectory` / `expected_achievement_date` / `goal_gap` | 目標到達見込みの把握（5b-8が参照） |
+
+### 5b-6-2. 評価概念の分離（混同禁止）
+
+以下3つは**別々に評価**し、混同しない。
+
+1. **Worker / Execution Quality** — Workerが指示された仕事を正しく実行したか
+   （Correctness / Completeness / Format / Policy遵守 / Acceptance Criteria充足）
+2. **Strategy / Playbook Performance** — その手順・戦略自体が有効だったか
+3. **Business Outcome** — 上位Objectiveへ寄与したか
+
+例: SNS投稿が売上につながらなかったとしても、Writer Workerの品質が低いとは限らない（Strategyの問題で
+ありうる）。逆にWorkerが完全に指示通り動作しても、Strategy自体が誤っていれば成果は出ない。
+
+**注記:** `specs/00_constitution.md` 3.12 Evidence over Opinion が現在列挙するEvidence
+（test結果・typecheck結果・bundle結果・実機確認・ログ・Telemetry・差分）は、上記1（Execution Quality）
+に相当する。2・3の評価軸は現行憲法の射程外であり、将来必要になった時点で憲法レベルへの昇格を別途検討する
+（本ドキュメント追加時点では憲法を変更しない）。
 
 ## 5b-7. モデル選択・モデル評価・将来の動的Model Routing（将来構想）
 
@@ -277,6 +345,131 @@ CEO承認なしの予算上限超過／Model Registryの自動インターネッ
 | モデル選択ルールの改善提案 | Self Diagnosis（5b-4）・Evolution（5b-5）の対象領域の一つとして扱う。独立仕様は新設しない |
 | 高額モデル利用の許可 | 既存のBudget Control（`specs/13_future_system_architecture.md`「3. 現状マッピング」表の`Core: Resource / Cost Gate`。未実装・将来構想）＋既存Approval Gateに従う。新しい承認経路は作らない |
 | PlannerによるモデルGate選択 | Planner責務（5b-1）の一部として整理。Team ArchitectureまたはWorkflow Lifecycle（5b-2）に接続する |
+
+### 5b-7-9. 将来のWorker抽象化との包含関係（移行方向）
+
+本章5b-7の各機能は、いずれも**LLM（モデル）だけを対象としたsubset**である。将来のAI Organization OS
+Coreでは、実行主体をモデルに限定せず**Worker**として抽象化する。最終正本はWorker系の名称とし、
+Model前提の密結合を将来へ持ち越さない。
+
+```text
+Worker Registry                      ← 最終正本
+  └ Model Registry (Lite)                現行の将来構想。LLMのみを対象とするsubset（5b-7-3）
+
+Worker Routing / Execution Plan      ← 最終正本
+  └ Model Routing (Static / Dynamic)     現行。単一モデル選択のみのsubset（5b-7-1 / 5b-7-5）
+
+Worker Adapter Framework             ← 最終正本
+  └ AI CLI Adapter                       現行実装。CLI型LLMのみのsubset（`apps/worker/src/aiCli/*`）
+```
+
+**現行のModel系機能を削除・改名する必要はない。** 上記は「現在の実装は将来の汎用Worker Architectureの
+subsetである」という移行関係を明示するものであり、既存実装・既存将来構想を置き換えるものではない。
+
+**Workerに含める対象（LLMに限定しない）:**
+
+| 分類 | 例 |
+|---|---|
+| AI Worker | Claude / Codex / Gemini / その他LLM |
+| Agent Worker | Lovable / OpenHands / Replit Agent 等 |
+| Tool Worker | Apify Actor / n8n / Make 等のWorkflow・SaaS |
+| Script Worker | Python / shell 等のスクリプト |
+| Deterministic Worker | validator / test runner / linter / parser / calculator |
+
+将来的にはHumanもWorker Typeとして表現しうる。
+
+**Execution Plan:** Routingの最適化単位は単一Workerに限らない。Worker Composition
+（例: 安価Worker → Deterministic Validator → 低confidenceの場合のみ上位Worker）まで拡張しうる。
+最適化の目標は「最も安いWorker」ではなく「**要求品質を満たす実行計画の総コスト最小化**」とする
+（既存roadmapの「修正/再試行を含む完了までの総コスト」と同一概念）。
+
+**Quality Stabilizer（将来）:** Worker間の品質ばらつきを後段へ露出させず、最終成果物の品質を一定範囲へ
+収束させる層。Deterministic Check → 安価Review → 上位Worker → Human承認の順で、**必要なレベルまでしか
+上げない**。全Taskに同一構成を強制しない。
+
+---
+
+## 5b-8. Self Diagnosis Framework（将来構想。改善対象の検出）
+
+「3. 現状マッピング」表の`Service Extension: Diagnosis`に対応する詳細。現在は名称のみで実質未定義で
+あったため、本節で責務を定義する。**MVP後の将来構想であり現時点では未実装。**
+
+**責務:** 以下を観測し、「**改善対象候補（Improvement Opportunity）**」を検出する。
+
+| 観点 | 内容 |
+|---|---|
+| Current State | 現在値の把握 |
+| Objective | 上位目標（target_value / target_date） |
+| Goal Gap | 現在値と目標値の差 |
+| Trajectory Gap | 改善はしているが、その速度では期限までに目標へ到達できない状態 |
+| Degradation | 既存指標の悪化 |
+| Opportunity | 現在問題がなくても改善余地が大きい箇所 |
+| Bottleneck | 全体成果を制限している制約 |
+| Risk | 将来的な悪化・事故の兆候 |
+
+**重要:** 検出対象を「悪化（Degradation）」だけに限定しない。「改善しているが目標到達速度が足りない」
+「問題は無いが最もレバレッジが大きい」も検出対象とする。
+
+Self Diagnosisは**検出のみ**を行い、優先順位付け（5b-9）・原因分析（5b-4 Investigate）・実行
+（Experiment）は行わない。
+
+## 5b-9. Improvement Planner（将来構想。改善候補の優先順位付け）
+
+「3. 現状マッピング」表の`Service Extension: Improvement Planner`に対応する詳細。現在は名称のみで
+実質未定義であったため、本節で責務を定義する。**MVP後の将来構想であり現時点では未実装。**
+
+**責務:** Self Diagnosis（5b-8）が検出した改善候補について、以下の観点で優先順位を決める。
+
+- Expected Outcome Impact（期待される成果インパクト）
+- Strategic Importance（戦略的重要度）
+- Probability of Success（成功確率）
+- Urgency（緊急度）
+- Implementation Cost（実装コスト）
+- Time to Learn（学習に要する時間）
+- Risk（リスク）
+
+厳密な計算式として固定しない。**下位KPIの改善が上位KPIを犠牲にしないこと**を優先条件とする
+（局所最適の禁止）。例: AI実行コストを削減しても、品質低下・開発速度低下・売上減を招くなら採用しない。
+
+原因分析が必要な候補については、既存のInvestigate（5b-4）を**再利用**する。Improvement Planner自身は
+原因分析機能を持たない。
+
+## 5b-10. Problem-driven Learning（改善の起点順序）
+
+改善活動の起点は、外部ノウハウの発見ではなく**Objective / Gap / Opportunity**とする。外部知識は改善の
+**材料**であり、改善活動の起点にしない。既存roadmapの「Problem-Driven Research（具体的課題がある場合の
+み開始）」を、順序原則として明文化したもの。
+
+```text
+Objective / Gap / Opportunity        ← 起点（5b-8で検出、5b-9で優先順位付け）
+  ↓
+原因分析・仮説                        ← 必要な場合のみInvestigate（5b-4）を再利用
+  ↓
+Internal Knowledge を先に検索         ← 自社実績を優先
+  ↓
+不足する場合のみ External Knowledge   ← Research。取得経路のCompliance方針に従う
+  ↓
+Experiment                            ← Experiment Service Extension。Risk階層とApproval Gateに従う
+  ↓
+Outcome 評価                          ← Execution Quality / Strategy / Business Outcome を分離評価（5b-6-2）
+  ↓
+Knowledge 更新                        ← Distill（5b-5）。Lifecycle State（5b-5-1）に従う
+```
+
+**禁止対象の明確化:** 禁止するのは「**外部で新しいノウハウを発見したことだけを理由に、改善施策や本番
+Experimentを開始する**」ことであり、External Knowledgeの収集・探索そのものを禁止する意味ではない。
+
+- External Knowledgeの収集・Knowledge DBへの蓄積は継続してよい
+- External Claim（5b-5-1）として、将来利用できる状態で保持してよい
+- ただし改善施策の**優先順位付け**は原則としてObjective / Gap / Opportunity（5b-8, 5b-9）から決定する
+- 「面白そうな外部ノウハウを見つけたので試す」という**起点のみ**で改善Experimentを開始しない
+- Objective-drivenな改善を行う際に、必要なKnowledgeとして参照する（5b-10図の位置づけ）ことを基本とする
+
+改善活動には必ずObjective / Gap / Opportunity / Riskとの関連を要求する。低コストの探索的分析
+（＝収集・保持段階）は許可しうるが、Experiment着手の優先順位は低くする。
+
+**安全性:** 本ループはいかなる理由があっても既存のApproval Gate / Policy Engine / Constitutionを
+迂回しない。High Riskの実験はCEO承認を必須とする。改善予算・同時実験数・停止条件・Rollbackを設ける。
 
 ---
 
