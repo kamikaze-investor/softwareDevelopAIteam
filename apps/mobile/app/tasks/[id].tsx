@@ -3,7 +3,7 @@
  */
 
 import type { ReactElement } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import type {
   ApprovalGateStatus,
   ApprovalRequest,
@@ -26,6 +26,7 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../../lib/api'
+import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
 const RESUME_HELP_TEXT =
@@ -902,9 +903,15 @@ export default function TaskDetailScreen(): ReactElement {
     }
   }, [taskId])
 
-  useEffect(() => {
-    void loadTaskDetail()
-  }, [loadTaskDetail])
+  const pollingEnabled =
+    data === null ||
+    isJobBusy(data.jobs) ||
+    sortJobsByNewestFirst(data.jobs)[0]?.status === 'blocked'
+
+  usePolling(loadTaskDetail, {
+    intervalMs: POLLING_INTERVAL_MS,
+    enabled: pollingEnabled,
+  })
 
   const submitResumeInstruction = useCallback(
     async (trimmedInstruction: string): Promise<void> => {

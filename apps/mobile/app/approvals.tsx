@@ -27,6 +27,7 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../lib/api'
+import { POLLING_INTERVAL_MS, usePolling } from '../lib/usePolling'
 
 type ApprovalWithProject = Approval & { projectName: string }
 type DecisionStatus = 'approved' | 'rejected'
@@ -293,9 +294,7 @@ export default function ApprovalsScreen(): ReactElement {
     setRefreshing(false)
   }, [loadApprovalRequests, loadPolicyApprovals])
 
-  useEffect(() => {
-    void loadAll()
-  }, [loadAll])
+  usePolling(loadAll, { intervalMs: POLLING_INTERVAL_MS, enabled: true })
 
   const refresh = useCallback((): void => {
     setRefreshing(true)

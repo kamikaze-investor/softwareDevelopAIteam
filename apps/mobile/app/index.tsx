@@ -27,6 +27,7 @@ import {
   View,
 } from 'react-native'
 import { apiFetch, clearApiToken, getApiToken, setApiToken } from '../lib/api'
+import { POLLING_INTERVAL_MS, usePolling } from '../lib/usePolling'
 
 const MAX_TASKS_FOR_RECENT_JOBS = 3
 const MAX_JOBS_PER_TASK = 2
@@ -418,9 +419,7 @@ export default function Dashboard() {
     }
   }, [])
 
-  useEffect(() => {
-    void load()
-  }, [load])
+  usePolling(load, { intervalMs: POLLING_INTERVAL_MS, enabled: true })
 
   const refresh = useCallback((): void => {
     setRefreshing(true)
