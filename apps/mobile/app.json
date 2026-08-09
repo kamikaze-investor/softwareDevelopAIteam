@@ -12,6 +12,12 @@
     },
     "plugins": [
       "expo-secure-store"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "fb8e336f-f871-4174-93d1-7fcbc97c829a"
+      }
+    },
+    "owner": "kamikaze.investor"
   }
 }
