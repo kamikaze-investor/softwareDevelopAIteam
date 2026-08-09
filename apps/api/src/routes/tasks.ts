@@ -121,6 +121,9 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
     if (!project) {
       return reply.status(404).send({ error: 'Project not found' })
     }
+    if (project.status === 'archived') {
+      return reply.status(409).send({ error: 'Project is archived' })
+    }
 
     const created = storage.tasks.createWithInitialImplementJob(result.data)
     if (!created.ok) {

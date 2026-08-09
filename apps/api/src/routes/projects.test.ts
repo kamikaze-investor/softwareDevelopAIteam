@@ -1,7 +1,7 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Approval, ApprovalType, Project } from '@ai-team/shared'
+import type { Approval, ApprovalType, JobStatus, Project } from '@ai-team/shared'
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { approvalRoutes }, { resetStorage }] = await Promise.all([
@@ -47,6 +47,26 @@ async function createProject(app: FastifyInstance, body: Partial<Project> = {}):
 
   expect(res.statusCode).toBe(201)
   return parseBody<Project>(res.body)
+}
+
+async function createProjectJob(projectId: string, status: JobStatus): Promise<void> {
+  const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
+  const task = storage.tasks.create({
+    projectId,
+    title: 'Task',
+    description: '',
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+  })
+  storage.jobs.create({
+    taskId: task.id,
+    projectId,
+    agentRole: 'developer_ai',
+    status,
+    safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+  })
 }
 
 async function createApproval(
@@ -132,6 +152,90 @@ describe('Project API', () => {
 
       expect(res.statusCode).toBe(200)
       expect(parseBody<Project>(res.body).name).toBe('New')
+    })
+  })
+
+  it('PATCH /api/projects/:id rejects archived to running', async () => {
+    await withApp(async (app) => {
+      const archived = await createProject(app, { status: 'archived' })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${archived.id}`,
+        payload: { status: 'running' },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toBe(
+        'Cannot resume an archived project directly to running',
+      )
+    })
+  })
+
+  it('PATCH /api/projects/:id allows archived to paused', async () => {
+    await withApp(async (app) => {
+      const archived = await createProject(app, { status: 'archived' })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${archived.id}`,
+        payload: { status: 'paused' },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<Project>(res.body).status).toBe('paused')
+    })
+  })
+
+  it('PATCH /api/projects/:id archives a draft project with no Jobs', async () => {
+    await withApp(async (app) => {
+      const draft = await createProject(app, { status: 'draft' })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${draft.id}`,
+        payload: { status: 'archived' },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<Project>(res.body).status).toBe('archived')
+    })
+  })
+
+  it.each(['queued', 'blocked'] as const)(
+    'PATCH /api/projects/:id archives a project with only a %s Job',
+    async (jobStatus) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'paused' })
+        await createProjectJob(project.id, jobStatus)
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/projects/${project.id}`,
+          payload: { status: 'archived' },
+        })
+
+        expect(res.statusCode).toBe(200)
+        expect(parseBody<Project>(res.body).status).toBe('archived')
+      })
+    },
+  )
+
+  it('PATCH /api/projects/:id rejects archive while a Job is running', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      await createProjectJob(project.id, 'running')
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${project.id}`,
+        payload: { status: 'archived' },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toBe(
+        'Cannot archive project while a Job is running',
+      )
     })
   })
 

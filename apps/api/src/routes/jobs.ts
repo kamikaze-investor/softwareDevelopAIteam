@@ -156,6 +156,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Task not found' })
     }
 
+    const project = storage.projects.findById(task.projectId)
+    if (!project) {
+      return reply.status(404).send({ error: 'Project not found' })
+    }
+    if (project.status === 'archived') {
+      return reply.status(409).send({ error: 'Project is archived' })
+    }
+
     const jobInput: Omit<Job, 'id' | 'createdAt'> = {
       ...result.data,
       // workingDir はクライアントから受け取らない。MVP-Aの正規workingDirをここで設定する。

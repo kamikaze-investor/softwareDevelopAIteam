@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { getStorage } from '../storage'
-import { SingleRunningProjectError } from '../storage/sqlite'
+import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
 
 const ProjectStatusSchema = z.enum(['draft', 'running', 'paused', 'archived'])
 
@@ -67,6 +67,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Project not found' })
     }
 
+    if (existing.status === 'archived' && result.data.status === 'running') {
+      return reply.status(409).send({ error: 'Cannot resume an archived project directly to running' })
+    }
+
     if (result.data.status === 'running') {
       const running = storage.projects.findRunning()
       if (running && running.id !== req.params.id) {
@@ -80,6 +84,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     } catch (err: unknown) {
       if (err instanceof SingleRunningProjectError) {
         return reply.status(409).send(singleRunningProjectResponse)
+      }
+      if (err instanceof ArchiveBlockedByRunningJobError) {
+        return reply.status(409).send({ error: 'Cannot archive project while a Job is running' })
       }
       throw err
     }

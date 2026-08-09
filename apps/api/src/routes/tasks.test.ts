@@ -224,6 +224,47 @@ describe('Task API', () => {
     })
   })
 
+  it.each(['draft', 'paused', 'running'] as const)(
+    'POST /api/tasks creates a task for a %s project',
+    async (projectStatus) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: projectStatus })
+
+        const res = await app.inject({
+          method: 'POST',
+          url: '/api/tasks',
+          payload: {
+            projectId: project.id,
+            title: `${projectStatus} task`,
+            assignee: 'developer_ai',
+          },
+        })
+
+        expect(res.statusCode).toBe(201)
+        expect(parseBody<Task>(res.body).projectId).toBe(project.id)
+      })
+    },
+  )
+
+  it('POST /api/tasks returns 409 for an archived project', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'archived' })
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Archived task',
+          assignee: 'developer_ai',
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toBe('Project is archived')
+    })
+  })
+
   it('POST /api/tasks leaves no Task when initial Job creation fails', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

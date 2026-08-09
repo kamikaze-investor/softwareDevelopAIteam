@@ -22,6 +22,13 @@ export class SingleRunningProjectError extends Error {
   }
 }
 
+export class ArchiveBlockedByRunningJobError extends Error {
+  constructor() {
+    super('Cannot archive project while a Job is running')
+    this.name = 'ArchiveBlockedByRunningJobError'
+  }
+}
+
 export class RoadmapTaskConflictError extends Error {
   constructor(public readonly conflicts: RoadmapTaskSpecConflict[]) {
     super(
@@ -305,6 +312,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     update(id, data) {
       const existing = projects.findById(id)
       if (!existing) return undefined
+
+      if (data.status === 'archived') {
+        const runningJob = db.prepare(
+          `SELECT id FROM jobs WHERE project_id = ? AND status = 'running' LIMIT 1`
+        ).get(id)
+        if (runningJob) {
+          throw new ArchiveBlockedByRunningJobError()
+        }
+      }
+
       const updated = { ...existing, ...data, updatedAt: now() }
       try {
         db.prepare(`

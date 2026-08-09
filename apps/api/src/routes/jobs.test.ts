@@ -183,6 +183,59 @@ describe('Job API', () => {
     })
   })
 
+  it('POST /api/jobs returns 404 for a missing task', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: 'not-exist',
+          projectId: project.id,
+          agentRole: 'developer_ai',
+          safeCommand: { kind: 'git_status' },
+        },
+      })
+
+      expect(res.statusCode).toBe(404)
+      expect(parseBody<{ error: string }>(res.body).error).toBe('Task not found')
+    })
+  })
+
+  it('POST /api/jobs returns 409 for a task in an archived project', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'archived' })
+      const task = await createTask(app, project.id)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: project.id,
+          agentRole: 'developer_ai',
+          safeCommand: { kind: 'git_status' },
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toBe('Project is archived')
+    })
+  })
+
+  it('POST /api/jobs creates a queued job for a task in a paused project', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'paused' })
+      const task = await createTask(app, project.id)
+
+      const job = await createJob(app, task)
+
+      expect(job.projectId).toBe(project.id)
+      expect(job.status).toBe('queued')
+    })
+  })
+
   it('POST /api/jobs rejects a client-supplied workingDir with 400', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

@@ -40,6 +40,9 @@ const MAX_RECENT_JOBS = 5
  * 遷移だけに絞る）。
  */
 const STARTABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['draft', 'paused']
+const PAUSABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['running']
+const ARCHIVABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['draft', 'paused']
+const RESTORABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['archived']
 
 async function fetchProjects(): Promise<Project[]> {
   const response = await apiFetch('/api/projects')
@@ -119,6 +122,75 @@ async function startProject(projectId: string): Promise<{ ok: true } | { ok: fal
   }
 }
 
+async function pauseProject(projectId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  try {
+    const response = await apiFetch(`/api/projects/${projectId}`, {
+      body: JSON.stringify({ status: 'paused' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'PATCH',
+    })
+
+    if (response.ok) {
+      return { ok: true }
+    }
+
+    if (response.status === 409) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string }
+      return { ok: false, message: body.error ?? 'このProjectを一時停止できませんでした' }
+    }
+
+    return { ok: false, message: `一時停止に失敗しました（HTTP ${response.status}）` }
+  } catch {
+    return { ok: false, message: 'APIに接続できませんでした' }
+  }
+}
+
+async function archiveProject(projectId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  try {
+    const response = await apiFetch(`/api/projects/${projectId}`, {
+      body: JSON.stringify({ status: 'archived' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'PATCH',
+    })
+
+    if (response.ok) {
+      return { ok: true }
+    }
+
+    if (response.status === 409) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string }
+      return { ok: false, message: body.error ?? 'このProjectを終了できませんでした' }
+    }
+
+    return { ok: false, message: `終了に失敗しました（HTTP ${response.status}）` }
+  } catch {
+    return { ok: false, message: 'APIに接続できませんでした' }
+  }
+}
+
+async function restoreProject(projectId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+  try {
+    const response = await apiFetch(`/api/projects/${projectId}`, {
+      body: JSON.stringify({ status: 'paused' }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'PATCH',
+    })
+
+    if (response.ok) {
+      return { ok: true }
+    }
+
+    if (response.status === 409) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string }
+      return { ok: false, message: body.error ?? 'このProjectを復元できませんでした' }
+    }
+
+    return { ok: false, message: `復元に失敗しました（HTTP ${response.status}）` }
+  } catch {
+    return { ok: false, message: 'APIに接続できませんでした' }
+  }
+}
+
 async function fetchRecentJobs(taskIds: string[]): Promise<Job[]> {
   const selectedTaskIds = taskIds.slice(0, MAX_TASKS_FOR_RECENT_JOBS)
   const jobGroups = await Promise.all(selectedTaskIds.map(fetchJobs))
@@ -166,6 +238,9 @@ function ProjectCard({
   const [tasks, setTasks] = useState<Task[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [starting, setStarting] = useState(false)
+  const [pausing, setPausing] = useState(false)
+  const [archiving, setArchiving] = useState(false)
+  const [restoring, setRestoring] = useState(false)
 
   useEffect(() => {
     let isMounted = true
@@ -197,6 +272,9 @@ function ProjectCard({
   const doneTasks = tasks.filter((task) => task.status === 'done').length
   const statusColor = getStatusColor(project.status)
   const canStart = STARTABLE_PROJECT_STATUSES.includes(project.status)
+  const canPause = PAUSABLE_PROJECT_STATUSES.includes(project.status)
+  const canArchive = ARCHIVABLE_PROJECT_STATUSES.includes(project.status)
+  const canRestore = RESTORABLE_PROJECT_STATUSES.includes(project.status)
 
   const handleStart = useCallback(async (): Promise<void> => {
     setStarting(true)
@@ -209,6 +287,48 @@ function ProjectCard({
       onStarted()
     } finally {
       setStarting(false)
+    }
+  }, [project.id, onStarted])
+
+  const handlePause = useCallback(async (): Promise<void> => {
+    setPausing(true)
+    try {
+      const result = await pauseProject(project.id)
+      if (!result.ok) {
+        Alert.alert('一時停止できません', result.message)
+        return
+      }
+      onStarted()
+    } finally {
+      setPausing(false)
+    }
+  }, [project.id, onStarted])
+
+  const handleArchive = useCallback(async (): Promise<void> => {
+    setArchiving(true)
+    try {
+      const result = await archiveProject(project.id)
+      if (!result.ok) {
+        Alert.alert('終了できません', result.message)
+        return
+      }
+      onStarted()
+    } finally {
+      setArchiving(false)
+    }
+  }, [project.id, onStarted])
+
+  const handleRestore = useCallback(async (): Promise<void> => {
+    setRestoring(true)
+    try {
+      const result = await restoreProject(project.id)
+      if (!result.ok) {
+        Alert.alert('復元できません', result.message)
+        return
+      }
+      onStarted()
+    } finally {
+      setRestoring(false)
     }
   }, [project.id, onStarted])
 
@@ -241,6 +361,39 @@ function ProjectCard({
           >
             {starting && <ActivityIndicator color="#fff" size="small" />}
             <Text style={styles.startButtonText}>▶ このProjectを開始</Text>
+          </TouchableOpacity>
+        )}
+        {canPause && (
+          <TouchableOpacity
+            accessibilityRole="button"
+            disabled={pausing}
+            onPress={() => void handlePause()}
+            style={[styles.startButton, styles.pauseButton, pausing && styles.startButtonDisabled]}
+          >
+            {pausing && <ActivityIndicator color="#fff" size="small" />}
+            <Text style={styles.startButtonText}>⏸ 一時停止</Text>
+          </TouchableOpacity>
+        )}
+        {canArchive && (
+          <TouchableOpacity
+            accessibilityRole="button"
+            disabled={archiving}
+            onPress={() => void handleArchive()}
+            style={[styles.startButton, styles.archiveButton, archiving && styles.startButtonDisabled]}
+          >
+            {archiving && <ActivityIndicator color="#fff" size="small" />}
+            <Text style={styles.startButtonText}>■ 終了</Text>
+          </TouchableOpacity>
+        )}
+        {canRestore && (
+          <TouchableOpacity
+            accessibilityRole="button"
+            disabled={restoring}
+            onPress={() => void handleRestore()}
+            style={[styles.startButton, styles.restoreButton, restoring && styles.startButtonDisabled]}
+          >
+            {restoring && <ActivityIndicator color="#fff" size="small" />}
+            <Text style={styles.startButtonText}>↩ 復元</Text>
           </TouchableOpacity>
         )}
         <TouchableOpacity
@@ -569,6 +722,7 @@ const styles = StyleSheet.create({
   },
   cardActions: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: 8,
     marginTop: 10,
   },
@@ -589,6 +743,15 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 13,
     fontWeight: '700',
+  },
+  pauseButton: {
+    backgroundColor: '#f59e0b',
+  },
+  archiveButton: {
+    backgroundColor: '#525252',
+  },
+  restoreButton: {
+    backgroundColor: '#3b82f6',
   },
   addTaskButton: {
     alignItems: 'center',
