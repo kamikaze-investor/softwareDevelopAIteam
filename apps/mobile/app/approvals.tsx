@@ -6,7 +6,10 @@ import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type {
   Approval,
+  ApprovalExplanationResponse,
   ApprovalGateStatus,
+  ApprovalQuestionResponse,
+  ApprovalQuestionTurn,
   ApprovalRequest,
   ApprovalType,
   RiskLevel,
@@ -39,6 +42,11 @@ type ApprovalGateDecisionStatus = Extract<
 type RejectTarget =
   | { type: 'policy'; item: ApprovalWithProject }
   | { type: 'gate'; item: ApprovalRequest }
+
+interface ExplanationLoadState {
+  loading: boolean
+  result?: ApprovalExplanationResponse
+}
 
 const TYPE_LABEL: Record<ApprovalType, string> = {
   billing: '課金',
@@ -86,6 +94,51 @@ async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
   }
 
   return (await response.json()) as ApprovalRequest[]
+}
+
+async function fetchApprovalExplanation(
+  requestId: string,
+): Promise<ApprovalExplanationResponse> {
+  try {
+    const response = await apiFetch(
+      `/api/approval-requests/${requestId}/explanation`,
+      { method: 'POST' },
+    )
+    if (!response.ok) {
+      throw new Error(`Failed to fetch approval explanation: ${response.status}`)
+    }
+    return (await response.json()) as ApprovalExplanationResponse
+  } catch {
+    return {
+      ok: false,
+      error: 'AIによる説明を生成できませんでした',
+      diffStatus: 'unavailable',
+    }
+  }
+}
+
+async function askApprovalQuestion(
+  requestId: string,
+  question: string,
+  history: ApprovalQuestionTurn[],
+): Promise<ApprovalQuestionResponse> {
+  try {
+    const response = await apiFetch(`/api/approval-requests/${requestId}/ask`, {
+      body: JSON.stringify({ history: history.slice(-20), question }),
+      headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+    })
+    if (!response.ok) {
+      throw new Error(`Failed to ask approval question: ${response.status}`)
+    }
+    return (await response.json()) as ApprovalQuestionResponse
+  } catch {
+    return {
+      ok: false,
+      error: 'AIから回答を取得できませんでした',
+      diffStatus: 'unavailable',
+    }
+  }
 }
 
 /** タップして詳細を開いた時だけ呼ぶ。404/失敗時はnullを返し、UI側で目的説明を省略する */
@@ -197,6 +250,11 @@ function formatChangedFilesDetail(changedFiles: string[]): string {
   return rest > 0 ? `${head.join('\n')}\n他${rest}件` : head.join('\n')
 }
 
+function formatFindingLocation(file?: string, line?: number): string {
+  if (!file) return ''
+  return line === undefined ? file : `${file}:${line}`
+}
+
 const NO_DETAIL_INFO_WARNING =
   'この古い承認リクエストには、変更ファイルや危険理由の詳細情報が保存されていません。内容が分からない場合は承認しないでください。'
 
@@ -256,6 +314,96 @@ function RejectReasonModal({
   )
 }
 
+function ApprovalQuestionModal({
+  error,
+  loading,
+  onCancel,
+  onChangeQuestion,
+  onSubmit,
+  question,
+  turns,
+  visible,
+}: {
+  error: string | null
+  loading: boolean
+  onCancel: () => void
+  onChangeQuestion: (value: string) => void
+  onSubmit: () => void
+  question: string
+  turns: ApprovalQuestionTurn[]
+  visible: boolean
+}): ReactElement {
+  const trimmedQuestion = question.trim()
+  const canSubmit = trimmedQuestion.length > 0 && !loading
+
+  return (
+    <Modal animationType="fade" onRequestClose={onCancel} transparent visible={visible}>
+      <View style={styles.modalOverlay}>
+        <View style={[styles.modalBox, styles.questionModalBox]}>
+          <Text style={styles.modalTitle}>AIに質問する</Text>
+          <Text style={styles.questionHelpText}>
+            この画面を閉じるまでのやり取りだけを使って回答します。
+          </Text>
+
+          {turns.length > 0 && (
+            <ScrollView style={styles.questionHistory}>
+              {turns.map((turn, index) => (
+                <View
+                  key={`${turn.role}-${index}`}
+                  style={[
+                    styles.questionTurn,
+                    turn.role === 'user'
+                      ? styles.questionTurnUser
+                      : styles.questionTurnAssistant,
+                  ]}
+                >
+                  <Text style={styles.questionTurnLabel}>
+                    {turn.role === 'user' ? 'CEO' : 'AI'}
+                  </Text>
+                  <Text style={styles.questionTurnText}>{turn.content}</Text>
+                </View>
+              ))}
+            </ScrollView>
+          )}
+
+          {error !== null && <Text style={styles.warningText}>{error}</Text>}
+
+          <TextInput
+            editable={!loading}
+            maxLength={2_000}
+            multiline
+            onChangeText={onChangeQuestion}
+            placeholder="例: 失敗した場合、元に戻せますか？"
+            placeholderTextColor="#555"
+            style={styles.modalInput}
+            textAlignVertical="top"
+            value={question}
+          />
+          <View style={styles.modalActions}>
+            <TouchableOpacity onPress={onCancel} style={styles.modalCancelButton}>
+              <Text style={styles.modalCancelButtonText}>閉じる</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              disabled={!canSubmit}
+              onPress={onSubmit}
+              style={[
+                styles.questionSubmitButton,
+                !canSubmit && styles.modalConfirmButtonDisabled,
+              ]}
+            >
+              {loading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.questionSubmitButtonText}>質問する</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
 export default function ApprovalsScreen(): ReactElement {
   const [approvals, setApprovals] = useState<ApprovalWithProject[]>([])
   const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>([])
@@ -264,6 +412,19 @@ export default function ApprovalsScreen(): ReactElement {
   >(null)
   const [taskInfoByTaskId, setTaskInfoByTaskId] = useState<
     Record<string, Task | null>
+  >({})
+  const [explanationByRequestId, setExplanationByRequestId] = useState<
+    Record<string, ExplanationLoadState>
+  >({})
+  const [expandedTechnicalRequestId, setExpandedTechnicalRequestId] = useState<
+    string | null
+  >(null)
+  const [questionTarget, setQuestionTarget] = useState<ApprovalRequest | null>(null)
+  const [questionText, setQuestionText] = useState('')
+  const [questionLoading, setQuestionLoading] = useState(false)
+  const [questionError, setQuestionError] = useState<string | null>(null)
+  const [questionHistoryByRequestId, setQuestionHistoryByRequestId] = useState<
+    Record<string, ApprovalQuestionTurn[]>
   >({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -357,6 +518,58 @@ export default function ApprovalsScreen(): ReactElement {
     }
   }
 
+  async function loadApprovalExplanation(requestId: string): Promise<void> {
+    setExplanationByRequestId((current) => ({
+      ...current,
+      [requestId]: { loading: true, result: current[requestId]?.result },
+    }))
+    const result = await fetchApprovalExplanation(requestId)
+    setExplanationByRequestId((current) => ({
+      ...current,
+      [requestId]: { loading: false, result },
+    }))
+  }
+
+  function openQuestionModal(item: ApprovalRequest): void {
+    setQuestionTarget(item)
+    setQuestionText('')
+    setQuestionError(null)
+  }
+
+  function closeQuestionModal(): void {
+    if (questionLoading) return
+    setQuestionTarget(null)
+    setQuestionText('')
+    setQuestionError(null)
+  }
+
+  async function submitApprovalQuestion(): Promise<void> {
+    const target = questionTarget
+    const question = questionText.trim()
+    if (target === null || question.length === 0 || questionLoading) return
+
+    const history = questionHistoryByRequestId[target.id] ?? []
+    setQuestionLoading(true)
+    setQuestionError(null)
+    const result = await askApprovalQuestion(target.id, question, history)
+    setQuestionLoading(false)
+
+    if (!result.ok) {
+      setQuestionError('AIから回答を取得できませんでした')
+      return
+    }
+
+    setQuestionHistoryByRequestId((current) => ({
+      ...current,
+      [target.id]: [
+        ...(current[target.id] ?? []),
+        { role: 'user', content: question },
+        { role: 'assistant', content: result.answer },
+      ],
+    }))
+    setQuestionText('')
+  }
+
   function confirmApprove(item: ApprovalWithProject): void {
     Alert.alert('承認', `「${item.title}」を承認しますか？`, [
       { style: 'cancel', text: 'キャンセル' },
@@ -374,15 +587,17 @@ export default function ApprovalsScreen(): ReactElement {
   }
 
   function toggleApprovalRequestDetail(item: ApprovalRequest): void {
-    setExpandedApprovalRequestId((current) => {
-      const willExpand = current !== item.id
-      if (willExpand && !(item.taskId in taskInfoByTaskId)) {
-        void fetchTaskInfo(item.taskId).then((task) => {
-          setTaskInfoByTaskId((prev) => ({ ...prev, [item.taskId]: task }))
-        })
-      }
-      return willExpand ? item.id : null
-    })
+    const willExpand = expandedApprovalRequestId !== item.id
+    setExpandedApprovalRequestId(willExpand ? item.id : null)
+
+    if (willExpand && !(item.taskId in taskInfoByTaskId)) {
+      void fetchTaskInfo(item.taskId).then((task) => {
+        setTaskInfoByTaskId((prev) => ({ ...prev, [item.taskId]: task }))
+      })
+    }
+    if (willExpand && explanationByRequestId[item.id] === undefined) {
+      void loadApprovalExplanation(item.id)
+    }
   }
 
   function confirmApproveApprovalRequest(item: ApprovalRequest): void {
@@ -476,6 +691,12 @@ export default function ApprovalsScreen(): ReactElement {
           const hasDetailInfo = changedFiles.length > 0 || triggeredRules.length > 0
           const riskSummary = triggeredRules.slice(0, 2).map(formatTriggeredRule)
           const taskInfo = taskInfoByTaskId[item.taskId]
+          const explanationState = explanationByRequestId[item.id]
+          const explanationResult = explanationState?.result
+          const explanation = explanationResult?.ok === true
+            ? explanationResult.explanation
+            : null
+          const isTechnicalExpanded = expandedTechnicalRequestId === item.id
 
           return (
             <TouchableOpacity
@@ -512,58 +733,188 @@ export default function ApprovalsScreen(): ReactElement {
 
               {isExpanded && (
                 <View style={styles.detailArea}>
-                  {!hasDetailInfo && (
-                    <Text style={styles.warningText}>{NO_DETAIL_INFO_WARNING}</Text>
-                  )}
+                  <View style={styles.explanationArea}>
+                    <Text style={styles.explanationTitle}>承認内容の分かりやすい説明</Text>
 
-                  {triggeredRules.length > 0 && (
-                    <>
-                      <Text style={styles.detailLabel}>なぜ危険と判定されたか</Text>
-                      {triggeredRules.map((rule, index) => (
-                        <Text key={`${rule}-${index}`} style={styles.metaText}>
-                          ・{formatTriggeredRule(rule)}
+                    {explanationState?.loading === true && (
+                      <View style={styles.explanationLoadingRow}>
+                        <ActivityIndicator color="#60a5fa" size="small" />
+                        <Text style={styles.metaText}>AIが説明を生成しています...</Text>
+                      </View>
+                    )}
+
+                    {explanationState?.loading !== true && explanationResult?.ok === false && (
+                      <>
+                        <Text style={styles.warningText}>
+                          AIによる説明を生成できませんでした
                         </Text>
-                      ))}
-                    </>
-                  )}
+                        <TouchableOpacity
+                          onPress={(event) => {
+                            event.stopPropagation()
+                            void loadApprovalExplanation(item.id)
+                          }}
+                          style={styles.retryButton}
+                        >
+                          <Text style={styles.retryButtonText}>説明を再取得</Text>
+                        </TouchableOpacity>
+                      </>
+                    )}
 
-                  {changedFiles.length > 0 && (
-                    <>
-                      <Text style={styles.detailLabel}>変更されるファイル</Text>
-                      <Text style={styles.metaText}>
-                        {formatChangedFilesDetail(changedFiles)}
-                      </Text>
-                    </>
-                  )}
+                    {explanation !== null && (
+                      <>
+                        <Text style={styles.explanationLabel}>何をする承認か</Text>
+                        <Text style={styles.explanationText}>{explanation.whatWasDone}</Text>
+                        <Text style={styles.explanationLabel}>なぜ必要か</Text>
+                        <Text style={styles.explanationText}>{explanation.whyNeeded}</Text>
+                        <Text style={styles.explanationLabel}>Productionへの影響</Text>
+                        <Text style={styles.explanationText}>{explanation.productionImpact}</Text>
+                        <Text style={styles.explanationLabel}>リスク</Text>
+                        <Text style={styles.explanationText}>{explanation.riskSummary}</Text>
+                        <Text style={styles.explanationLabel}>失敗した場合どうなるか</Text>
+                        <Text style={styles.explanationText}>{explanation.failureImpact}</Text>
+                        <Text style={styles.explanationLabel}>test・QA結果</Text>
+                        <Text style={styles.explanationText}>{explanation.verificationSummary}</Text>
+                        <Text style={styles.explanationLabel}>review結果</Text>
+                        <Text style={styles.explanationText}>{explanation.reviewSummary}</Text>
+                        <Text style={styles.explanationLabel}>変更範囲</Text>
+                        <Text style={styles.explanationText}>{explanation.scope}</Text>
+                        <Text style={styles.explanationLabel}>変えていない重要部分</Text>
+                        <Text style={styles.explanationText}>{explanation.notChanged}</Text>
+                      </>
+                    )}
+                  </View>
 
-                  {taskInfo && (
-                    <>
-                      <Text style={styles.detailLabel}>この変更の目的</Text>
-                      <Text style={styles.metaText}>元タスク: {taskInfo.title}</Text>
-                      {taskInfo.description.length > 0 && (
-                        <Text style={styles.metaText}>{taskInfo.description}</Text>
-                      )}
-                    </>
-                  )}
+                  <TouchableOpacity
+                    onPress={(event) => {
+                      event.stopPropagation()
+                      openQuestionModal(item)
+                    }}
+                    style={styles.askButton}
+                  >
+                    <Text style={styles.askButtonText}>AIに質問する</Text>
+                  </TouchableOpacity>
 
-                  <Text style={styles.detailLabel}>技術的な操作名</Text>
-                  <Text style={styles.metaText}>{item.requestedAction}</Text>
-                  {!isKnownAction && (
-                    <Text style={styles.metaHelpText}>
-                      {UNKNOWN_REQUESTED_ACTION_NOTE}
+                  <TouchableOpacity
+                    onPress={(event) => {
+                      event.stopPropagation()
+                      setExpandedTechnicalRequestId((current) =>
+                        current === item.id ? null : item.id,
+                      )
+                    }}
+                    style={styles.technicalToggle}
+                  >
+                    <Text style={styles.technicalToggleText}>
+                      {isTechnicalExpanded ? '技術詳細を閉じる' : '技術詳細を表示'}
                     </Text>
-                  )}
+                  </TouchableOpacity>
 
-                  <Text style={styles.metaText}>
-                    {formatApprovalGateStatus(item.status)}
-                  </Text>
-                  <Text style={styles.metaText}>
-                    承認期限: {formatDateTime(item.expiresAt)}
-                  </Text>
-                  <Text style={styles.metaText}>管理用ID: {item.taskId}</Text>
-                  <Text style={styles.metaHelpText}>
-                    開発チームがこの承認を特定するための番号です。
-                  </Text>
+                  {isTechnicalExpanded && (
+                    <View style={styles.technicalArea}>
+                      {!hasDetailInfo && explanation === null && (
+                        <Text style={styles.warningText}>{NO_DETAIL_INFO_WARNING}</Text>
+                      )}
+
+                      {triggeredRules.length > 0 && (
+                        <>
+                          <Text style={styles.detailLabel}>既存Gateが検出した危険理由</Text>
+                          {triggeredRules.map((rule, index) => (
+                            <Text key={`${rule}-${index}`} style={styles.metaText}>
+                              ・{formatTriggeredRule(rule)}
+                            </Text>
+                          ))}
+                        </>
+                      )}
+
+                      {(explanation?.targetFiles.length ?? changedFiles.length) > 0 && (
+                        <>
+                          <Text style={styles.detailLabel}>対象ファイル</Text>
+                          <Text selectable style={styles.codeText}>
+                            {formatChangedFilesDetail(explanation?.targetFiles ?? changedFiles)}
+                          </Text>
+                        </>
+                      )}
+
+                      {explanationResult?.ok === true && explanationResult.diffStatus === 'exact' && (
+                        <>
+                          <Text style={styles.detailLabel}>Approval対象のexact diff</Text>
+                          <ScrollView horizontal style={styles.diffScrollArea}>
+                            <Text selectable style={styles.diffText}>
+                              {explanationResult.exactDiff ?? ''}
+                            </Text>
+                          </ScrollView>
+                        </>
+                      )}
+
+                      {explanationResult?.diffStatus === 'stale' && (
+                        <Text style={styles.warningText}>
+                          Approval作成後にHEADまたはdiffが変わったため、diffは表示しません。
+                        </Text>
+                      )}
+
+                      {explanationResult?.diffStatus === 'unavailable' && (
+                        <Text style={styles.metaHelpText}>
+                          現在、Approval対象diffを安全に取得できません。
+                        </Text>
+                      )}
+
+                      {explanation !== null && explanation.reviewFindings.length > 0 && (
+                        <>
+                          <Text style={styles.detailLabel}>review findings詳細</Text>
+                          {explanation.reviewFindings.map((finding, index) => (
+                            <View key={`${finding.message}-${index}`} style={styles.findingItem}>
+                              <Text style={styles.findingSeverity}>{finding.severity.toUpperCase()}</Text>
+                              {formatFindingLocation(finding.file, finding.line).length > 0 && (
+                                <Text selectable style={styles.codeText}>
+                                  {formatFindingLocation(finding.file, finding.line)}
+                                </Text>
+                              )}
+                              <Text style={styles.metaText}>{finding.message}</Text>
+                            </View>
+                          ))}
+                        </>
+                      )}
+
+                      {explanation !== null && explanation.verificationResults.length > 0 && (
+                        <>
+                          <Text style={styles.detailLabel}>verification詳細</Text>
+                          {explanation.verificationResults.map((verification, index) => (
+                            <View key={`${verification.kind}-${index}`} style={styles.verificationItem}>
+                              <Text style={styles.metaText}>
+                                {verification.kind}: {verification.status}
+                              </Text>
+                              <Text style={styles.metaHelpText}>{verification.detail}</Text>
+                            </View>
+                          ))}
+                        </>
+                      )}
+
+                      {taskInfo && (
+                        <>
+                          <Text style={styles.detailLabel}>元タスク</Text>
+                          <Text style={styles.metaText}>{taskInfo.title}</Text>
+                          {taskInfo.description.length > 0 && (
+                            <Text style={styles.metaText}>{taskInfo.description}</Text>
+                          )}
+                        </>
+                      )}
+
+                      <Text style={styles.detailLabel}>技術的な操作名</Text>
+                      <Text selectable style={styles.codeText}>{item.requestedAction}</Text>
+                      {!isKnownAction && (
+                        <Text style={styles.metaHelpText}>
+                          {UNKNOWN_REQUESTED_ACTION_NOTE}
+                        </Text>
+                      )}
+
+                      <Text style={styles.metaText}>
+                        {formatApprovalGateStatus(item.status)}
+                      </Text>
+                      <Text style={styles.metaText}>
+                        承認期限: {formatDateTime(item.expiresAt)}
+                      </Text>
+                      <Text style={styles.metaText}>管理用ID: {item.taskId}</Text>
+                    </View>
+                  )}
 
                   <Text style={styles.expandHintText}>タップして詳細を閉じる</Text>
 
@@ -637,6 +988,18 @@ export default function ApprovalsScreen(): ReactElement {
       onConfirm={handleConfirmReject}
       visible={rejectTarget !== null}
     />
+    <ApprovalQuestionModal
+      error={questionError}
+      loading={questionLoading}
+      onCancel={closeQuestionModal}
+      onChangeQuestion={setQuestionText}
+      onSubmit={() => {
+        void submitApprovalQuestion()
+      }}
+      question={questionText}
+      turns={questionTarget === null ? [] : (questionHistoryByRequestId[questionTarget.id] ?? [])}
+      visible={questionTarget !== null}
+    />
     </>
   )
 }
@@ -645,6 +1008,20 @@ const styles = StyleSheet.create({
   actions: {
     flexDirection: 'row',
     gap: 10,
+  },
+  askButton: {
+    alignItems: 'center',
+    backgroundColor: '#3b82f622',
+    borderColor: '#3b82f666',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 8,
+    padding: 11,
+  },
+  askButtonText: {
+    color: '#60a5fa',
+    fontSize: 14,
+    fontWeight: '700',
   },
   modalOverlay: {
     alignItems: 'center',
@@ -758,6 +1135,12 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 16,
   },
+  codeText: {
+    color: '#d4d4d4',
+    fontFamily: 'monospace',
+    fontSize: 12,
+    lineHeight: 18,
+  },
   detailArea: {
     borderColor: '#2a2a2a',
     borderTopWidth: 1,
@@ -771,6 +1154,20 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginTop: 8,
   },
+  diffScrollArea: {
+    backgroundColor: '#0a0a0a',
+    borderColor: '#2a2a2a',
+    borderRadius: 6,
+    borderWidth: 1,
+    maxHeight: 320,
+    padding: 10,
+  },
+  diffText: {
+    color: '#d4d4d4',
+    fontFamily: 'monospace',
+    fontSize: 11,
+    lineHeight: 16,
+  },
   empty: {
     color: '#737373',
     fontSize: 16,
@@ -782,6 +1179,47 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '600',
     marginTop: 4,
+  },
+  explanationArea: {
+    backgroundColor: '#141414',
+    borderColor: '#2a2a2a',
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 12,
+  },
+  explanationLabel: {
+    color: '#93c5fd',
+    fontSize: 12,
+    fontWeight: '700',
+    marginTop: 9,
+  },
+  explanationLoadingRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    paddingVertical: 10,
+  },
+  explanationText: {
+    color: '#e5e5e5',
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 2,
+  },
+  explanationTitle: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  findingItem: {
+    backgroundColor: '#141414',
+    borderRadius: 6,
+    gap: 3,
+    padding: 8,
+  },
+  findingSeverity: {
+    color: '#fbbf24',
+    fontSize: 11,
+    fontWeight: '800',
   },
   header: {
     alignItems: 'center',
@@ -844,6 +1282,54 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 12,
   },
+  questionHelpText: {
+    color: '#a3a3a3',
+    fontSize: 12,
+    lineHeight: 17,
+    marginBottom: 10,
+  },
+  questionHistory: {
+    marginBottom: 12,
+    maxHeight: 300,
+  },
+  questionModalBox: {
+    maxHeight: '85%',
+  },
+  questionSubmitButton: {
+    alignItems: 'center',
+    backgroundColor: '#2563eb',
+    borderRadius: 8,
+    minWidth: 92,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  questionSubmitButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  questionTurn: {
+    borderRadius: 8,
+    marginBottom: 8,
+    padding: 10,
+  },
+  questionTurnAssistant: {
+    backgroundColor: '#172554',
+  },
+  questionTurnLabel: {
+    color: '#93c5fd',
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 3,
+  },
+  questionTurnText: {
+    color: '#e5e5e5',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  questionTurnUser: {
+    backgroundColor: '#262626',
+  },
   rejectButton: {
     alignItems: 'center',
     backgroundColor: '#ef444422',
@@ -868,6 +1354,18 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '700',
   },
+  retryButton: {
+    alignItems: 'center',
+    borderColor: '#ef444466',
+    borderRadius: 7,
+    borderWidth: 1,
+    padding: 9,
+  },
+  retryButtonText: {
+    color: '#fca5a5',
+    fontSize: 13,
+    fontWeight: '700',
+  },
   section: {
     marginBottom: 20,
   },
@@ -888,6 +1386,23 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     marginBottom: 10,
   },
+  technicalArea: {
+    backgroundColor: '#101010',
+    borderColor: '#2a2a2a',
+    borderRadius: 8,
+    borderWidth: 1,
+    gap: 6,
+    padding: 12,
+  },
+  technicalToggle: {
+    alignItems: 'center',
+    padding: 9,
+  },
+  technicalToggleText: {
+    color: '#a3a3a3',
+    fontSize: 13,
+    fontWeight: '600',
+  },
   title: {
     color: '#fff',
     fontSize: 22,
@@ -903,6 +1418,12 @@ const styles = StyleSheet.create({
     color: '#f59e0b',
     fontSize: 11,
     fontWeight: '600',
+  },
+  verificationItem: {
+    backgroundColor: '#141414',
+    borderRadius: 6,
+    gap: 3,
+    padding: 8,
   },
   warningText: {
     color: '#ef4444',

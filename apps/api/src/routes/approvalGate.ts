@@ -2,7 +2,15 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { createHash } from 'node:crypto'
 import { getStorage } from '../storage'
-import type { ApprovalGateStatus, RiskLevel, ApprovalRequest, GateOutcome, RiskReviewResult } from '@ai-team/shared'
+import type {
+  ApprovalExplanationDiffStatus,
+  ApprovalGateStatus,
+  ApprovalRequest,
+  ApprovalQuestionTurn,
+  GateOutcome,
+  RiskLevel,
+  RiskReviewResult,
+} from '@ai-team/shared'
 import {
   runRiskReview,
   decideGateOutcome,
@@ -10,6 +18,14 @@ import {
   RISK_RULES,
   type ApprovalGateInput,
 } from '@ai-team/shared'
+import {
+  answerApprovalQuestion,
+  generateApprovalExplanation,
+  type ApprovalAiContext,
+  type ApprovalAiOptions,
+} from '../approvalExplain/approvalAi'
+import { readExactApprovalDiff } from '../approvalExplain/diffReader'
+import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 
 function computeDiffHash(diffText: string): string {
   return createHash('sha256').update(diffText, 'utf-8').digest('hex')
@@ -299,8 +315,68 @@ const ConsumeApprovalRequestBody = z.object({
   currentDiffHash: z.string(),
 })
 
-export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
+const ApprovalQuestionBody = z.object({
+  question: z.string().trim().min(1).max(2_000),
+  history: z.array(z.object({
+    role: z.enum(['user', 'assistant']),
+    content: z.string().min(1).max(4_000),
+  })).max(20).default([]),
+})
+
+export interface ApprovalGateRouteOptions {
+  targetWorkingDir?: string
+  explanationAiOptions?: ApprovalAiOptions
+  questionAiOptions?: ApprovalAiOptions
+}
+
+interface ResolvedApprovalAiContext {
+  context: ApprovalAiContext
+  diffStatus: ApprovalExplanationDiffStatus
+  exactDiff?: string
+}
+
+export async function approvalGateRoutes(
+  app: FastifyInstance,
+  options: ApprovalGateRouteOptions = {},
+): Promise<void> {
   const storage = getStorage()
+  const targetWorkingDir = options.targetWorkingDir ?? TARGET_WORKING_DIR
+
+  function resolveApprovalAiContext(request: ApprovalRequest): ResolvedApprovalAiContext | null {
+    const task = storage.tasks.findById(request.taskId)
+    if (!task) return null
+
+    let diffStatus: ApprovalExplanationDiffStatus = 'unavailable'
+    let exactDiff: string | undefined
+    try {
+      const diffResult = readExactApprovalDiff(
+        targetWorkingDir,
+        request.targetCommit,
+        request.targetDiffHash,
+      )
+      if (diffResult.stale) {
+        diffStatus = 'stale'
+      } else {
+        diffStatus = 'exact'
+        exactDiff = diffResult.diffText
+      }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      app.log.warn({ approvalRequestId: request.id, error: message }, 'Approval diff could not be read')
+    }
+
+    return {
+      context: {
+        task,
+        approvalRequest: request,
+        reviewResults: storage.reviewResults.findByTaskId(request.taskId),
+        qaResults: storage.qaResults.findByTaskId(request.taskId),
+        ...(exactDiff !== undefined ? { exactDiff } : {}),
+      },
+      diffStatus,
+      ...(exactDiff !== undefined ? { exactDiff } : {}),
+    }
+  }
 
   // POST /api/gate/check
   // ⚠️ trusted internal caller 専用。
@@ -539,6 +615,92 @@ export async function approvalGateRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Approval request not found' })
     }
     return reply.send(request)
+  })
+
+  // POST /api/approval-requests/:id/explanation — read-onlyなCEO向け説明生成
+  app.post<{ Params: { id: string } }>('/approval-requests/:id/explanation', async (req, reply) => {
+    const request = storage.approvalRequests.findById(req.params.id)
+    if (!request) {
+      return reply.status(404).send({ error: 'Approval request not found' })
+    }
+
+    const resolved = resolveApprovalAiContext(request)
+    if (!resolved) {
+      return reply.send({
+        ok: false,
+        error: 'AIによる説明を生成できませんでした',
+        diffStatus: 'unavailable' satisfies ApprovalExplanationDiffStatus,
+      })
+    }
+
+    const generated = await generateApprovalExplanation(
+      resolved.context,
+      options.explanationAiOptions,
+    )
+    if (!generated.ok) {
+      req.log.warn(
+        { approvalRequestId: request.id, error: generated.error },
+        'Approval explanation generation failed',
+      )
+      return reply.send({
+        ok: false,
+        error: 'AIによる説明を生成できませんでした',
+        diffStatus: resolved.diffStatus,
+      })
+    }
+
+    return reply.send({
+      ok: true,
+      explanation: generated.explanation,
+      diffStatus: resolved.diffStatus,
+      ...(resolved.diffStatus === 'exact' ? { exactDiff: resolved.exactDiff } : {}),
+    })
+  })
+
+  // POST /api/approval-requests/:id/ask — 会話履歴を保存しない単発AI質問
+  app.post<{ Params: { id: string } }>('/approval-requests/:id/ask', async (req, reply) => {
+    const bodyResult = ApprovalQuestionBody.safeParse(req.body)
+    if (!bodyResult.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: bodyResult.error.format() })
+    }
+
+    const request = storage.approvalRequests.findById(req.params.id)
+    if (!request) {
+      return reply.status(404).send({ error: 'Approval request not found' })
+    }
+
+    const resolved = resolveApprovalAiContext(request)
+    if (!resolved) {
+      return reply.send({
+        ok: false,
+        error: 'AIから回答を取得できませんでした',
+        diffStatus: 'unavailable' satisfies ApprovalExplanationDiffStatus,
+      })
+    }
+
+    const generated = await answerApprovalQuestion(
+      resolved.context,
+      bodyResult.data.question,
+      bodyResult.data.history as ApprovalQuestionTurn[],
+      options.questionAiOptions,
+    )
+    if (!generated.ok) {
+      req.log.warn(
+        { approvalRequestId: request.id, error: generated.error },
+        'Approval question generation failed',
+      )
+      return reply.send({
+        ok: false,
+        error: 'AIから回答を取得できませんでした',
+        diffStatus: resolved.diffStatus,
+      })
+    }
+
+    return reply.send({
+      ok: true,
+      answer: generated.answer,
+      diffStatus: resolved.diffStatus,
+    })
   })
 
   // PATCH /api/approval-requests/:id/status — 状態更新（人間が承認/拒否する口）
