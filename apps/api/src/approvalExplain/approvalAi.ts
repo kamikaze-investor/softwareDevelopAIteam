@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import { z } from 'zod'
 import type {
   ApprovalExplanationViewModel,
@@ -9,9 +9,7 @@ import type {
   Task,
 } from '@ai-team/shared'
 
-const DEFAULT_MODEL = 'claude-3-5-haiku-latest'
-const AI_TIMEOUT_MS = 30_000
-const AI_MAX_RETRIES = 1
+const DEFAULT_MODEL = 'gemini-2.5-flash'
 
 const ApprovalExplanationTextSchema = z.object({
   whatWasDone: z.string().min(1),
@@ -139,12 +137,8 @@ function buildViewModel(
   }
 }
 
-function createAnthropicClient(apiKey: string): Anthropic {
-  return new Anthropic({
-    apiKey,
-    maxRetries: AI_MAX_RETRIES,
-    timeout: AI_TIMEOUT_MS,
-  })
+function createGeminiClient(apiKey: string): GoogleGenerativeAI {
+  return new GoogleGenerativeAI(apiKey)
 }
 
 async function requestText(
@@ -157,24 +151,22 @@ async function requestText(
     return options.mockResponse
   }
 
-  const apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY
+  const apiKey = options.apiKey ?? process.env.GEMINI_API_KEY
   if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY is not configured')
+    throw new Error('GEMINI_API_KEY is not configured')
   }
 
-  const client = createAnthropicClient(apiKey)
-  const message = await client.messages.create({
-    max_tokens: maxTokens,
-    messages: [{ role: 'user', content: userContent }],
+  const client = createGeminiClient(apiKey)
+  const model = client.getGenerativeModel({
     model: options.model ?? DEFAULT_MODEL,
-    system,
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: maxTokens,
+    },
   })
+  const result = await model.generateContent(`${system}\n\n${userContent}`)
 
-  return message.content
-    .filter((block) => block.type === 'text')
-    .map((block) => (block as { type: 'text'; text: string }).text)
-    .join('')
-    .trim()
+  return result.response.text().trim()
 }
 
 /** Provider・timeout・quota・parseを含む全失敗を値として返し、呼び出し元を壊さない。 */

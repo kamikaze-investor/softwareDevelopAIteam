@@ -74,7 +74,7 @@ const validExplanationJson = JSON.stringify({
 })
 
 describe('generateApprovalExplanation', () => {
-  it('builds a factual view model from a mock Anthropic response', async () => {
+  it('builds a factual view model from a mock Gemini response', async () => {
     const result = await generateApprovalExplanation(createContext('+exact'), {
       mockResponse: `\`\`\`json\n${validExplanationJson}\n\`\`\``,
     })
@@ -116,12 +116,12 @@ describe('answerApprovalQuestion', () => {
   })
 
   it('returns a failure result when no API key is configured', async () => {
-    const previous = process.env.ANTHROPIC_API_KEY
-    delete process.env.ANTHROPIC_API_KEY
+    const previous = process.env.GEMINI_API_KEY
+    delete process.env.GEMINI_API_KEY
     try {
       await expect(answerApprovalQuestion(createContext(), '質問', [])).resolves.toMatchObject({ ok: false })
     } finally {
-      if (previous !== undefined) process.env.ANTHROPIC_API_KEY = previous
+      if (previous !== undefined) process.env.GEMINI_API_KEY = previous
     }
   })
 })
