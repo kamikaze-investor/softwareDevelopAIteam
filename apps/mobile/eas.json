@@ -2,6 +2,7 @@
   "build": {
     "preview": {
       "distribution": "internal",
+      "pnpm": "10.34.1",
       "env": {
         "EXPO_PUBLIC_API_URL": "https://api.aiteamos.uk"
       }
