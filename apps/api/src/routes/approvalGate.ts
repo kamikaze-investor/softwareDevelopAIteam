@@ -16,6 +16,7 @@ import {
   decideGateOutcome,
   buildApprovalRequest,
   RISK_RULES,
+  APPROVAL_REQUEST_TTL_MINUTES,
   type ApprovalGateInput,
 } from '@ai-team/shared'
 import {
@@ -275,16 +276,10 @@ function scanDiffForSecrets(diffText: string): DiffScanResult {
 
 const RiskLevelSchema = z.enum(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'])
 
-// Codex P2: expiresAt はサーバー側で riskLevel から計算する（呼び出し元に任せない）
-const EXPIRY_MINUTES: Record<RiskLevel, number> = {
-  LOW: 30,
-  MEDIUM: 30,
-  HIGH: 30,
-  CRITICAL: 60,
-}
-
-function computeExpiresAt(riskLevel: RiskLevel): string {
-  return new Date(Date.now() + EXPIRY_MINUTES[riskLevel] * 60 * 1000).toISOString()
+// Codex P2: expiresAt はサーバー側で計算する（呼び出し元に任せない）。
+// TTL値は packages/shared/src/approvalGateLogic.ts の APPROVAL_REQUEST_TTL_MINUTES を正本とする。
+function computeExpiresAt(): string {
+  return new Date(Date.now() + APPROVAL_REQUEST_TTL_MINUTES * 60 * 1000).toISOString()
 }
 
 const CreateApprovalRequestBody = z.object({
@@ -587,7 +582,7 @@ export async function approvalGateRoutes(
     const req_ = storage.approvalRequests.create({
       ...result.data,
       status: 'WAITING_FOR_USER',
-      expiresAt: computeExpiresAt(result.data.riskLevel),  // Codex P2: サーバー計算
+      expiresAt: computeExpiresAt(),  // Codex P2: サーバー計算
     })
     return reply.status(201).send(req_)
   })

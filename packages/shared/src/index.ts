@@ -24,6 +24,7 @@ export {
   RISK_RULES,
   SAFE_ONLY_PATTERNS,
   ALWAYS_CRITICAL_RULES,
+  APPROVAL_REQUEST_TTL_MINUTES,
   runRiskReview,
   resolveEffectiveStatus,
   decideGateOutcome,

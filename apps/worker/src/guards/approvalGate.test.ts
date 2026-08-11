@@ -376,19 +376,15 @@ describe('buildApprovalRequest', () => {
     expect(req.invalidIf.length).toBeGreaterThan(0)
   })
 
-  it('HIGH expires in ~30 minutes', () => {
-    const req = buildApprovalRequest(input, 'HIGH')
-    const diffMs = new Date(req.expiresAt).getTime() - Date.now()
-    expect(diffMs).toBeGreaterThan(29 * 60 * 1000)
-    expect(diffMs).toBeLessThan(31 * 60 * 1000)
-  })
-
-  it('CRITICAL expires in ~60 minutes', () => {
-    const req = buildApprovalRequest(input, 'CRITICAL')
-    const diffMs = new Date(req.expiresAt).getTime() - Date.now()
-    expect(diffMs).toBeGreaterThan(59 * 60 * 1000)
-    expect(diffMs).toBeLessThan(61 * 60 * 1000)
-  })
+  it.each(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const)(
+    '%s expires in ~24 hours (no risk-based branching)',
+    (riskLevel) => {
+      const req = buildApprovalRequest(input, riskLevel)
+      const diffMs = new Date(req.expiresAt).getTime() - Date.now()
+      expect(diffMs).toBeGreaterThan(23 * 60 * 60 * 1000)
+      expect(diffMs).toBeLessThan(25 * 60 * 60 * 1000)
+    },
+  )
 
   it('invalidIf includes the expiry time', () => {
     const req = buildApprovalRequest(input, 'HIGH')

@@ -99,9 +99,11 @@ export function runRiskReview(changedFiles: string[]): RiskReviewResult {
 // 承認の有効期限を算出（純粋関数）
 // ────────────────────────────────────────────────────────────
 
-function computeExpiresAt(riskLevel: RiskLevel, now: Date): string {
-  const minutes = riskLevel === 'CRITICAL' ? 60 : 30
-  return new Date(now.getTime() + minutes * 60 * 1000).toISOString()
+/** 全RiskLevel共通のApprovalRequest有効期限（分）。Risk別の分岐は持たない。 */
+export const APPROVAL_REQUEST_TTL_MINUTES = 24 * 60
+
+function computeExpiresAt(now: Date): string {
+  return new Date(now.getTime() + APPROVAL_REQUEST_TTL_MINUTES * 60 * 1000).toISOString()
 }
 
 // ────────────────────────────────────────────────────────────
@@ -239,7 +241,7 @@ export function buildApprovalRequest(
 ): Omit<ApprovalRequest, 'id' | 'createdAt'> {
   const triggeredRules = Array.isArray(triggeredRulesOrNow) ? triggeredRulesOrNow : []
   const requestTime = triggeredRulesOrNow instanceof Date ? triggeredRulesOrNow : (now ?? new Date())
-  const exp = computeExpiresAt(riskLevel, requestTime)
+  const exp = computeExpiresAt(requestTime)
   return {
     taskId: input.taskId,
     targetBranch: input.targetBranch,
