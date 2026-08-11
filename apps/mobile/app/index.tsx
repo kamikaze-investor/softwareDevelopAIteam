@@ -333,7 +333,16 @@ function ProjectCard({
   }, [project.id, onStarted])
 
   return (
-    <View style={styles.card}>
+    <TouchableOpacity
+      accessibilityRole="button"
+      onPress={() =>
+        router.push({
+          params: { id: project.id },
+          pathname: '/projects/[id]',
+        })
+      }
+      style={styles.card}
+    >
       <View style={styles.cardHeader}>
         <Text style={styles.cardTitle} numberOfLines={1}>
           {project.name}
@@ -356,7 +365,10 @@ function ProjectCard({
           <TouchableOpacity
             accessibilityRole="button"
             disabled={starting}
-            onPress={() => void handleStart()}
+            onPress={(event) => {
+              event.stopPropagation()
+              void handleStart()
+            }}
             style={[styles.startButton, starting && styles.startButtonDisabled]}
           >
             {starting && <ActivityIndicator color="#fff" size="small" />}
@@ -367,7 +379,10 @@ function ProjectCard({
           <TouchableOpacity
             accessibilityRole="button"
             disabled={pausing}
-            onPress={() => void handlePause()}
+            onPress={(event) => {
+              event.stopPropagation()
+              void handlePause()
+            }}
             style={[styles.startButton, styles.pauseButton, pausing && styles.startButtonDisabled]}
           >
             {pausing && <ActivityIndicator color="#fff" size="small" />}
@@ -378,7 +393,10 @@ function ProjectCard({
           <TouchableOpacity
             accessibilityRole="button"
             disabled={archiving}
-            onPress={() => void handleArchive()}
+            onPress={(event) => {
+              event.stopPropagation()
+              void handleArchive()
+            }}
             style={[styles.startButton, styles.archiveButton, archiving && styles.startButtonDisabled]}
           >
             {archiving && <ActivityIndicator color="#fff" size="small" />}
@@ -389,7 +407,10 @@ function ProjectCard({
           <TouchableOpacity
             accessibilityRole="button"
             disabled={restoring}
-            onPress={() => void handleRestore()}
+            onPress={(event) => {
+              event.stopPropagation()
+              void handleRestore()
+            }}
             style={[styles.startButton, styles.restoreButton, restoring && styles.startButtonDisabled]}
           >
             {restoring && <ActivityIndicator color="#fff" size="small" />}
@@ -398,12 +419,13 @@ function ProjectCard({
         )}
         <TouchableOpacity
           accessibilityRole="button"
-          onPress={() =>
+          onPress={(event) => {
+            event.stopPropagation()
             router.push({
               params: { projectId: project.id },
               pathname: '/tasks/create',
             })
-          }
+          }}
           style={styles.addTaskButton}
         >
           <Text style={styles.addTaskButtonText}>＋ Taskを追加</Text>
@@ -432,7 +454,7 @@ function ProjectCard({
           })}
         </View>
       )}
-    </View>
+    </TouchableOpacity>
   )
 }
 
