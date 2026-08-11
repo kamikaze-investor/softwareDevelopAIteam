@@ -8,8 +8,8 @@ import { z } from 'zod'
 import {
   parseJsonObject,
   requestText,
-  type GeminiRequestOptions,
-} from '../aiExplain/geminiClient'
+  type CheapAiRequestOptions,
+} from '../aiExplain/cheapAiClient'
 
 const MAX_OUTPUT_CONTEXT_LENGTH = 8_000
 const MAX_RECENT_JOBS = 5
@@ -38,7 +38,7 @@ export interface TaskFailureAiContext {
   recentJobs: Job[]
 }
 
-export type TaskFailureAiOptions = GeminiRequestOptions
+export type TaskFailureAiOptions = CheapAiRequestOptions
 
 export type TaskFailureExplanationGenerationResult =
   | { ok: true; explanation: TaskFailureExplanationViewModel }
@@ -156,7 +156,7 @@ function buildViewModel(
   }
 }
 
-/** Geminiを含む全失敗を値として返し、Task取得や再開処理へ伝播させない。 */
+/** AI providerを含む全失敗を値として返し、Task取得や再開処理へ伝播させない。 */
 export async function generateTaskFailureExplanation(
   context: TaskFailureAiContext,
   options: TaskFailureAiOptions = {},

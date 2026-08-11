@@ -69,6 +69,9 @@ function createFailureJob(
     agentRole: 'developer_ai',
     status: 'running',
     safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliPrompt: 'Original failed prompt',
+    aiCliMode: 'implement',
   })
   const updated = storage.jobs.update(created.id, {
     status,
@@ -169,7 +172,7 @@ describe('Task failure explanation routes', () => {
     })
     try {
       const task = createTask(storage, 'blocked')
-      createFailureJob(storage, task, 'blocked')
+      const blockedJob = createFailureJob(storage, task, 'blocked')
       const before = storage.tasks.findById(task.id)
       const explanationResponse = await app.inject({
         method: 'POST',
@@ -188,6 +191,20 @@ describe('Task failure explanation routes', () => {
       })
       expect(taskResponse.statusCode).toBe(200)
       expect(taskResponse.json<Task>()).toEqual(before)
+
+      const resumeResponse = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/resume`,
+        payload: { instruction: 'Retry after reviewing the failure.' },
+      })
+      expect(resumeResponse.statusCode).toBe(201)
+      expect(resumeResponse.json<Job>()).toMatchObject({
+        taskId: task.id,
+        status: 'queued',
+        aiCliProvider: 'codex',
+        aiCliMode: 'implement',
+      })
+      expect(storage.jobs.findById(blockedJob.id)?.status).toBe('blocked')
     } finally {
       await app.close()
     }

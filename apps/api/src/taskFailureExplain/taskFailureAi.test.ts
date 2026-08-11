@@ -71,7 +71,7 @@ const validAnalysisJson = JSON.stringify({
 })
 
 describe('generateTaskFailureExplanation', () => {
-  it('keeps code-built facts separate from mock Gemini analysis', async () => {
+  it('keeps code-built facts separate from mock OpenCode Go analysis', async () => {
     const result = await generateTaskFailureExplanation(createContext(), {
       mockResponse: `\`\`\`json\n${validAnalysisJson}\n\`\`\``,
     })

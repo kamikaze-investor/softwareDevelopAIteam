@@ -10,8 +10,8 @@ import type {
 import {
   parseJsonObject,
   requestText,
-  type GeminiRequestOptions,
-} from '../aiExplain/geminiClient'
+  type CheapAiRequestOptions,
+} from '../aiExplain/cheapAiClient'
 
 const ApprovalExplanationTextSchema = z.object({
   whatWasDone: z.string().min(1),
@@ -37,7 +37,7 @@ export interface ApprovalAiContext {
   exactDiff?: string
 }
 
-export type ApprovalAiOptions = GeminiRequestOptions
+export type ApprovalAiOptions = CheapAiRequestOptions
 
 export type ApprovalExplanationGenerationResult =
   | { ok: true; explanation: ApprovalExplanationViewModel }
