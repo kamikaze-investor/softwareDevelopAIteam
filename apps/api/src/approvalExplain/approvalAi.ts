@@ -1,4 +1,3 @@
-import { GoogleGenerativeAI } from '@google/generative-ai'
 import { z } from 'zod'
 import type {
   ApprovalExplanationViewModel,
@@ -8,8 +7,11 @@ import type {
   ReviewResult,
   Task,
 } from '@ai-team/shared'
-
-const DEFAULT_MODEL = 'gemini-2.5-flash'
+import {
+  parseJsonObject,
+  requestText,
+  type GeminiRequestOptions,
+} from '../aiExplain/geminiClient'
 
 const ApprovalExplanationTextSchema = z.object({
   whatWasDone: z.string().min(1),
@@ -35,11 +37,7 @@ export interface ApprovalAiContext {
   exactDiff?: string
 }
 
-export interface ApprovalAiOptions {
-  apiKey?: string
-  model?: string
-  mockResponse?: string
-}
+export type ApprovalAiOptions = GeminiRequestOptions
 
 export type ApprovalExplanationGenerationResult =
   | { ok: true; explanation: ApprovalExplanationViewModel }
@@ -112,14 +110,6 @@ export function formatApprovalAiContext(context: ApprovalAiContext): string {
   )
 }
 
-function parseJsonObject(raw: string): unknown {
-  const jsonMatch = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!jsonMatch) {
-    throw new Error('AI response did not contain a JSON object')
-  }
-  return JSON.parse(jsonMatch[1] ?? jsonMatch[0])
-}
-
 function buildViewModel(
   generated: ApprovalExplanationText,
   context: ApprovalAiContext,
@@ -135,38 +125,6 @@ function buildViewModel(
     reviewFindings: context.reviewResults.flatMap((review) => review.findings),
     targetFiles: [...(context.approvalRequest.changedFiles ?? [])],
   }
-}
-
-function createGeminiClient(apiKey: string): GoogleGenerativeAI {
-  return new GoogleGenerativeAI(apiKey)
-}
-
-async function requestText(
-  system: string,
-  userContent: string,
-  options: ApprovalAiOptions,
-  maxTokens: number,
-): Promise<string> {
-  if (options.mockResponse !== undefined) {
-    return options.mockResponse
-  }
-
-  const apiKey = options.apiKey ?? process.env.GEMINI_API_KEY
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY is not configured')
-  }
-
-  const client = createGeminiClient(apiKey)
-  const model = client.getGenerativeModel({
-    model: options.model ?? DEFAULT_MODEL,
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens: maxTokens,
-    },
-  })
-  const result = await model.generateContent(`${system}\n\n${userContent}`)
-
-  return result.response.text().trim()
 }
 
 /** Provider・timeout・quota・parseを含む全失敗を値として返し、呼び出し元を壊さない。 */

@@ -3,7 +3,7 @@
  */
 
 import type { ReactElement } from 'react'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
   ApprovalGateStatus,
   ApprovalRequest,
@@ -11,12 +11,18 @@ import type {
   JobStatus,
   RiskLevel,
   Task,
+  TaskFailureClassification,
+  TaskFailureExplanationResponse,
+  TaskFailureFacts,
+  TaskFailureQuestionResponse,
+  TaskFailureQuestionTurn,
   TaskStatus,
 } from '@ai-team/shared'
 import { router, useLocalSearchParams } from 'expo-router'
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   ScrollView,
   StyleSheet,
   Text,
@@ -151,6 +157,18 @@ const TRIGGERED_RULE_LABEL: Record<string, string> = {
 const UNKNOWN_TRIGGERED_RULE_LABEL =
   '未分類のリスク要因が検出されました'
 
+const TASK_FAILURE_CLASSIFICATION_LABEL: Record<
+  TaskFailureClassification,
+  string
+> = {
+  approval_or_policy: 'Approval・方針に関する可能性',
+  code: 'コード問題の可能性',
+  configuration: '設定問題の可能性',
+  environment: '環境問題の可能性',
+  permission_or_safety: '権限・安全停止に関する可能性',
+  unknown: '分類できません',
+}
+
 interface TaskDetailData {
   task: Task
   jobs: Job[]
@@ -197,6 +215,46 @@ async function fetchApprovalRequests(
   }
 
   return (await response.json()) as ApprovalRequest[]
+}
+
+async function fetchTaskFailureExplanation(
+  taskId: string,
+): Promise<TaskFailureExplanationResponse> {
+  try {
+    const response = await apiFetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/failure-explanation`,
+      { method: 'POST' },
+    )
+    if (!response.ok) {
+      throw new Error(`Failed to fetch Task failure explanation: ${response.status}`)
+    }
+    return (await response.json()) as TaskFailureExplanationResponse
+  } catch {
+    return { ok: false, error: 'AIによる分析を生成できませんでした' }
+  }
+}
+
+async function askTaskFailureQuestion(
+  taskId: string,
+  question: string,
+  history: TaskFailureQuestionTurn[],
+): Promise<TaskFailureQuestionResponse> {
+  try {
+    const response = await apiFetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/failure-ask`,
+      {
+        body: JSON.stringify({ history: history.slice(-20), question }),
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+      },
+    )
+    if (!response.ok) {
+      throw new Error(`Failed to ask Task failure question: ${response.status}`)
+    }
+    return (await response.json()) as TaskFailureQuestionResponse
+  } catch {
+    return { ok: false, error: 'AIから回答を取得できませんでした' }
+  }
 }
 
 function normalizeTaskId(
@@ -470,6 +528,329 @@ function TaskInfoSection({ task }: { task: Task }): ReactElement {
         </Text>
       </View>
     </View>
+  )
+}
+
+function formatGuardResult(facts: TaskFailureFacts): string {
+  const guardResult = facts.guardResult
+  if (guardResult === null) return '記録なし'
+
+  const lines = [
+    `権限チェック: ${guardResult.permissionAllowed ? '通過' : '停止'}`,
+    `ファイル変更チェック: ${guardResult.fileChangeAllowed ? '通過' : '停止'}`,
+  ]
+  if (guardResult.permissionReason !== undefined) {
+    lines.push(`権限チェック理由: ${guardResult.permissionReason}`)
+  }
+  if (
+    guardResult.fileViolations !== undefined &&
+    guardResult.fileViolations.length > 0
+  ) {
+    lines.push(`対象外ファイル:\n${formatChangedFilesDetail(guardResult.fileViolations)}`)
+  }
+  return lines.join('\n')
+}
+
+function TaskFailureFactsView({ facts }: { facts: TaskFailureFacts }): ReactElement {
+  return (
+    <View style={styles.failureFactsBox}>
+      <Text style={styles.failureFactsTitle}>事実情報（何が起きたか）</Text>
+      <Text style={styles.bodyText}>{facts.whatHappened}</Text>
+
+      <Text style={styles.detailLabel}>Task / Job状態</Text>
+      <Text style={styles.metaText}>
+        {formatTaskStatus(facts.taskStatus)} / {formatJobStatus(facts.jobStatus)}
+      </Text>
+
+      <Text style={styles.detailLabel}>実行種別</Text>
+      <Text style={styles.metaText}>{facts.safeCommandKind}</Text>
+
+      <Text style={styles.detailLabel}>exitCode</Text>
+      <Text style={styles.metaText}>
+        {facts.exitCode === null ? '記録なし' : facts.exitCode}
+      </Text>
+
+      <Text style={styles.detailLabel}>変更ファイル</Text>
+      <Text style={styles.fileListText}>
+        {facts.changedFiles.length === 0
+          ? 'なし'
+          : formatChangedFilesDetail(facts.changedFiles)}
+      </Text>
+
+      <Text style={styles.detailLabel}>安全チェック結果</Text>
+      <Text style={styles.metaText}>{formatGuardResult(facts)}</Text>
+
+      {facts.stderrExcerpt !== null && (
+        <>
+          <Text style={styles.detailLabel}>エラー出力（記録された事実）</Text>
+          <Text style={[styles.outputText, styles.outputTextError]}>
+            {facts.stderrExcerpt}
+          </Text>
+        </>
+      )}
+
+      {facts.stdoutExcerpt !== null && (
+        <>
+          <Text style={styles.detailLabel}>標準出力（記録された事実）</Text>
+          <Text style={styles.outputText}>{facts.stdoutExcerpt}</Text>
+        </>
+      )}
+    </View>
+  )
+}
+
+function TaskFailureQuestionModal({
+  error,
+  loading,
+  onCancel,
+  onChangeQuestion,
+  onSubmit,
+  question,
+  turns,
+  visible,
+}: {
+  error: string | null
+  loading: boolean
+  onCancel: () => void
+  onChangeQuestion: (value: string) => void
+  onSubmit: () => void
+  question: string
+  turns: TaskFailureQuestionTurn[]
+  visible: boolean
+}): ReactElement {
+  const canSubmit = question.trim().length > 0 && !loading
+
+  return (
+    <Modal animationType="fade" onRequestClose={onCancel} transparent visible={visible}>
+      <View style={styles.modalOverlay}>
+        <View style={styles.questionModalBox}>
+          <Text style={styles.modalTitle}>AIに質問する</Text>
+          <Text style={styles.questionHelpText}>
+            この画面を閉じるまでの履歴だけを送信します。AIの回答には推測が含まれる場合があります。
+          </Text>
+
+          {turns.length > 0 && (
+            <ScrollView style={styles.questionHistory}>
+              {turns.map((turn, index) => (
+                <View
+                  key={`${turn.role}-${index}`}
+                  style={[
+                    styles.questionTurn,
+                    turn.role === 'user'
+                      ? styles.questionTurnUser
+                      : styles.questionTurnAssistant,
+                  ]}
+                >
+                  <Text style={styles.questionTurnLabel}>
+                    {turn.role === 'user' ? 'CEO' : 'AI（AIによる分析を含む）'}
+                  </Text>
+                  <Text style={styles.questionTurnText}>{turn.content}</Text>
+                </View>
+              ))}
+            </ScrollView>
+          )}
+
+          {error !== null && <Text style={styles.failureAiErrorText}>{error}</Text>}
+
+          <TextInput
+            editable={!loading}
+            maxLength={2_000}
+            multiline
+            onChangeText={onChangeQuestion}
+            placeholder="例: これはコード問題ですか？"
+            placeholderTextColor="#555"
+            style={styles.questionInput}
+            textAlignVertical="top"
+            value={question}
+          />
+
+          <View style={styles.modalActions}>
+            <TouchableOpacity onPress={onCancel} style={styles.modalCancelButton}>
+              <Text style={styles.modalCancelButtonText}>閉じる</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              disabled={!canSubmit}
+              onPress={onSubmit}
+              style={[
+                styles.questionSubmitButton,
+                !canSubmit && styles.questionSubmitButtonDisabled,
+              ]}
+            >
+              {loading ? (
+                <ActivityIndicator color="#fff" size="small" />
+              ) : (
+                <Text style={styles.questionSubmitButtonText}>質問する</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  )
+}
+
+function TaskFailureExplanationSection({
+  jobs,
+  task,
+}: {
+  jobs: Job[]
+  task: Task
+}): ReactElement | null {
+  const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
+  const shouldShow = latestJob?.status === 'failed' || task.status === 'blocked'
+  const explanationKey = shouldShow
+    ? `${task.id}:${task.status}:${latestJob?.id ?? 'no-job'}`
+    : null
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState<TaskFailureExplanationResponse | null>(null)
+  const [questionOpen, setQuestionOpen] = useState(false)
+  const [question, setQuestion] = useState('')
+  const [questionLoading, setQuestionLoading] = useState(false)
+  const [questionError, setQuestionError] = useState<string | null>(null)
+  const [turns, setTurns] = useState<TaskFailureQuestionTurn[]>([])
+
+  useEffect(() => {
+    if (explanationKey === null) {
+      setResult(null)
+      setLoading(false)
+      return
+    }
+
+    let active = true
+    setLoading(true)
+    setResult(null)
+    setQuestionOpen(false)
+    setQuestion('')
+    setQuestionError(null)
+    setTurns([])
+    void fetchTaskFailureExplanation(task.id).then((nextResult) => {
+      if (!active) return
+      setResult(nextResult)
+      setLoading(false)
+    })
+
+    return () => {
+      active = false
+    }
+  }, [explanationKey, task.id])
+
+  if (!shouldShow) return null
+
+  function closeQuestionModal(): void {
+    if (questionLoading) return
+    setQuestionOpen(false)
+    setQuestion('')
+    setQuestionError(null)
+  }
+
+  async function submitQuestion(): Promise<void> {
+    const trimmedQuestion = question.trim()
+    if (trimmedQuestion.length === 0 || questionLoading) return
+
+    setQuestionLoading(true)
+    setQuestionError(null)
+    const answer = await askTaskFailureQuestion(task.id, trimmedQuestion, turns)
+    setQuestionLoading(false)
+    if (!answer.ok) {
+      setQuestionError('AIから回答を取得できませんでした')
+      return
+    }
+
+    setTurns((current) => [
+      ...current,
+      { role: 'user', content: trimmedQuestion },
+      { role: 'assistant', content: answer.answer },
+    ])
+    setQuestion('')
+  }
+
+  const title = task.status === 'blocked'
+    ? '停止中／要対応の説明'
+    : '実行失敗の説明'
+
+  return (
+    <>
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>{title}</Text>
+        {task.status === 'blocked' && (
+          <Text style={styles.failureStatusDescription}>
+            Approval待ち・安全停止等を含むため、停止中であることだけで失敗とは断定しません。
+          </Text>
+        )}
+
+        {loading && (
+          <View style={styles.failureAiLoading}>
+            <ActivityIndicator color="#60a5fa" size="small" />
+            <Text style={styles.metaText}>事実情報とAI分析を読み込んでいます</Text>
+          </View>
+        )}
+
+        {result !== null && !result.ok && (
+          <View style={styles.failureAiErrorBox}>
+            <Text style={styles.failureAiErrorText}>
+              AIによる分析を取得できませんでした。Task情報・Job履歴・再開機能は引き続き利用できます。
+            </Text>
+          </View>
+        )}
+
+        {result?.ok === true && (
+          <>
+            <TaskFailureFactsView facts={result.explanation.facts} />
+            <View style={styles.aiAnalysisBox}>
+              <Text style={styles.aiAnalysisTitle}>AIによる分析（推測を含みます）</Text>
+              <Text style={styles.aiAnalysisDisclaimer}>
+                以下は記録された事実を基にしたAIの分析であり、確定した原因ではありません。
+              </Text>
+
+              <Text style={styles.detailLabel}>分類</Text>
+              <Text style={styles.bodyText}>
+                {TASK_FAILURE_CLASSIFICATION_LABEL[
+                  result.explanation.aiAnalysis.classification
+                ]}
+              </Text>
+
+              <Text style={styles.detailLabel}>推定原因</Text>
+              <Text style={styles.bodyText}>
+                {result.explanation.aiAnalysis.likelyCause}
+              </Text>
+
+              <Text style={styles.detailLabel}>影響</Text>
+              <Text style={styles.bodyText}>
+                {result.explanation.aiAnalysis.impact}
+              </Text>
+
+              <Text style={styles.detailLabel}>推奨する次の対応</Text>
+              <Text style={styles.bodyText}>
+                {result.explanation.aiAnalysis.recommendedNextAction}
+              </Text>
+            </View>
+          </>
+        )}
+
+        {!loading && (
+          <TouchableOpacity
+            onPress={() => {
+              setQuestionError(null)
+              setQuestionOpen(true)
+            }}
+            style={styles.failureQuestionButton}
+          >
+            <Text style={styles.failureQuestionButtonText}>AIに質問する</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      <TaskFailureQuestionModal
+        error={questionError}
+        loading={questionLoading}
+        onCancel={closeQuestionModal}
+        onChangeQuestion={setQuestion}
+        onSubmit={() => void submitQuestion()}
+        question={question}
+        turns={turns}
+        visible={questionOpen}
+      />
+    </>
   )
 }
 
@@ -1004,6 +1385,10 @@ export default function TaskDetailScreen(): ReactElement {
       {data !== null && (
         <>
           <TaskInfoSection task={data.task} />
+          <TaskFailureExplanationSection
+            jobs={data.jobs}
+            task={data.task}
+          />
           <JobActionsSection
             approvalRequests={data.approvalRequests}
             jobs={data.jobs}
@@ -1074,6 +1459,26 @@ const styles = StyleSheet.create({
     marginTop: -4,
     textAlign: 'center',
   },
+  aiAnalysisBox: {
+    backgroundColor: '#111827',
+    borderColor: '#3b82f655',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 12,
+    padding: 14,
+  },
+  aiAnalysisDisclaimer: {
+    color: '#93c5fd',
+    fontSize: 12,
+    lineHeight: 18,
+    marginBottom: 4,
+  },
+  aiAnalysisTitle: {
+    color: '#60a5fa',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
   bodyText: {
     color: '#d4d4d4',
     fontSize: 14,
@@ -1135,6 +1540,58 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     marginBottom: 4,
   },
+  failureAiErrorBox: {
+    backgroundColor: '#2a1515',
+    borderColor: '#ef444444',
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 12,
+  },
+  failureAiErrorText: {
+    color: '#fca5a5',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  failureAiLoading: {
+    alignItems: 'center',
+    backgroundColor: '#141414',
+    borderRadius: 8,
+    flexDirection: 'row',
+    gap: 10,
+    padding: 14,
+  },
+  failureFactsBox: {
+    backgroundColor: '#141414',
+    borderColor: '#404040',
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 14,
+  },
+  failureFactsTitle: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+    marginBottom: 8,
+  },
+  failureQuestionButton: {
+    alignItems: 'center',
+    backgroundColor: '#2563eb',
+    borderRadius: 8,
+    marginTop: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+  },
+  failureQuestionButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  failureStatusDescription: {
+    color: '#fbbf24',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 10,
+  },
   header: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -1160,6 +1617,36 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     marginBottom: 4,
   },
+  modalActions: {
+    flexDirection: 'row',
+    gap: 10,
+    justifyContent: 'flex-end',
+  },
+  modalCancelButton: {
+    alignItems: 'center',
+    backgroundColor: '#262626',
+    borderRadius: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  modalCancelButtonText: {
+    color: '#d4d4d4',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modalOverlay: {
+    alignItems: 'center',
+    backgroundColor: '#000000aa',
+    flex: 1,
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 6,
+  },
   outputText: {
     backgroundColor: '#0f0f0f',
     borderColor: '#2a2a2a',
@@ -1175,6 +1662,77 @@ const styles = StyleSheet.create({
   outputTextError: {
     borderColor: '#ef444444',
     color: '#fca5a5',
+  },
+  questionHelpText: {
+    color: '#a3a3a3',
+    fontSize: 12,
+    lineHeight: 17,
+    marginBottom: 10,
+  },
+  questionHistory: {
+    marginBottom: 12,
+    maxHeight: 300,
+  },
+  questionInput: {
+    backgroundColor: '#0f0f0f',
+    borderColor: '#333',
+    borderRadius: 8,
+    borderWidth: 1,
+    color: '#fff',
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 12,
+    minHeight: 110,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  questionModalBox: {
+    backgroundColor: '#171717',
+    borderColor: '#333',
+    borderRadius: 12,
+    borderWidth: 1,
+    maxHeight: '85%',
+    padding: 18,
+    width: '100%',
+  },
+  questionSubmitButton: {
+    alignItems: 'center',
+    backgroundColor: '#2563eb',
+    borderRadius: 8,
+    minWidth: 92,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  questionSubmitButtonDisabled: {
+    backgroundColor: '#262626',
+    opacity: 0.7,
+  },
+  questionSubmitButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  questionTurn: {
+    borderRadius: 8,
+    marginBottom: 8,
+    padding: 10,
+  },
+  questionTurnAssistant: {
+    backgroundColor: '#172554',
+  },
+  questionTurnLabel: {
+    color: '#93c5fd',
+    fontSize: 11,
+    fontWeight: '700',
+    marginBottom: 3,
+  },
+  questionTurnText: {
+    color: '#e5e5e5',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  questionTurnUser: {
+    backgroundColor: '#262626',
   },
   resumeBox: {
     backgroundColor: '#141414',

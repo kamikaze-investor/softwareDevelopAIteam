@@ -1,7 +1,14 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import type { Task } from '@ai-team/shared'
+import type { Job, Task, TaskFailureQuestionTurn } from '@ai-team/shared'
 import { getStorage } from '../storage'
+import {
+  answerTaskFailureQuestion,
+  generateTaskFailureExplanation,
+  type TaskFailureAiContext,
+  type TaskFailureAiOptions,
+  type TaskFailureJob,
+} from '../taskFailureExplain/taskFailureAi'
 
 const TaskStatusSchema = z.enum(['pending', 'in_progress', 'review', 'done', 'blocked'])
 
@@ -53,6 +60,23 @@ const ResumeTaskBody = z.object({
   instruction: z.string().trim().min(1).max(2000),
 }).strict()
 
+const TaskFailureQuestionBody = z.object({
+  question: z.string().trim().min(1).max(2_000),
+  history: z.array(z.object({
+    role: z.enum(['user', 'assistant']),
+    content: z.string().min(1).max(4_000),
+  })).max(20).default([]),
+})
+
+export interface TaskRouteOptions {
+  failureExplanationAiOptions?: TaskFailureAiOptions
+  failureQuestionAiOptions?: TaskFailureAiOptions
+}
+
+function isTaskFailureJob(job: Job): job is TaskFailureJob {
+  return job.status === 'failed' || job.status === 'blocked'
+}
+
 function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string {
   return `[Task] ${task.title}
 ${task.description}
@@ -72,8 +96,23 @@ const SummaryQuerySchema = z.object({
   limit: z.string().optional(),
 })
 
-export async function taskRoutes(app: FastifyInstance): Promise<void> {
+export async function taskRoutes(
+  app: FastifyInstance,
+  options: TaskRouteOptions = {},
+): Promise<void> {
   const storage = getStorage()
+
+  function resolveTaskFailureAiContext(task: Task): TaskFailureAiContext | null {
+    const jobs = storage.jobs.findByTaskId(task.id)
+    const latestJob = jobs[0]
+    const shouldExplain = latestJob?.status === 'failed' || task.status === 'blocked'
+    if (!shouldExplain) return null
+
+    const targetJob = jobs.find(isTaskFailureJob)
+    if (!targetJob) return null
+
+    return { task, latestJob: targetJob, recentJobs: jobs }
+  }
 
   app.get('/summary', async (req, reply) => {
     const query = SummaryQuerySchema.safeParse(req.query)
@@ -109,6 +148,80 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Task not found' })
     }
     return reply.send(task)
+  })
+
+  app.post<{ Params: { id: string } }>('/:id/failure-explanation', async (req, reply) => {
+    const task = storage.tasks.findById(req.params.id)
+    if (!task) {
+      return reply.status(404).send({ error: 'Task not found' })
+    }
+
+    const context = resolveTaskFailureAiContext(task)
+    if (!context) {
+      return reply.send({
+        ok: false,
+        error: '説明対象の失敗・停止Jobが見つかりませんでした',
+      })
+    }
+
+    const generated = await generateTaskFailureExplanation(
+      context,
+      options.failureExplanationAiOptions,
+    )
+    if (!generated.ok) {
+      req.log.warn(
+        { taskId: task.id, error: generated.error },
+        'Task failure explanation generation failed',
+      )
+      return reply.send({
+        ok: false,
+        error: 'AIによる分析を生成できませんでした',
+      })
+    }
+
+    return reply.send(generated)
+  })
+
+  app.post<{ Params: { id: string } }>('/:id/failure-ask', async (req, reply) => {
+    const bodyResult = TaskFailureQuestionBody.safeParse(req.body)
+    if (!bodyResult.success) {
+      return reply.status(400).send({
+        error: 'Validation failed',
+        details: bodyResult.error.format(),
+      })
+    }
+
+    const task = storage.tasks.findById(req.params.id)
+    if (!task) {
+      return reply.status(404).send({ error: 'Task not found' })
+    }
+
+    const context = resolveTaskFailureAiContext(task)
+    if (!context) {
+      return reply.send({
+        ok: false,
+        error: '質問対象の失敗・停止Jobが見つかりませんでした',
+      })
+    }
+
+    const generated = await answerTaskFailureQuestion(
+      context,
+      bodyResult.data.question,
+      bodyResult.data.history as TaskFailureQuestionTurn[],
+      options.failureQuestionAiOptions,
+    )
+    if (!generated.ok) {
+      req.log.warn(
+        { taskId: task.id, error: generated.error },
+        'Task failure question generation failed',
+      )
+      return reply.send({
+        ok: false,
+        error: 'AIから回答を取得できませんでした',
+      })
+    }
+
+    return reply.send(generated)
   })
 
   app.post('/', async (req, reply) => {
