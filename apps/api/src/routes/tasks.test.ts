@@ -224,6 +224,47 @@ describe('Task API', () => {
     })
   })
 
+  it('POST /api/tasks accepts a 50,000-character description', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const description = 'a'.repeat(50_000)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Long description task',
+          description,
+          assignee: 'developer_ai',
+        },
+      })
+
+      expect(res.statusCode).toBe(201)
+      expect(parseBody<Task>(res.body).description).toHaveLength(50_000)
+    })
+  })
+
+  it('POST /api/tasks rejects a 50,001-character description', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const description = 'a'.repeat(50_001)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Too long description task',
+          description,
+          assignee: 'developer_ai',
+        },
+      })
+
+      expect(res.statusCode).toBe(400)
+    })
+  })
+
   it.each(['draft', 'paused', 'running'] as const)(
     'POST /api/tasks creates a task for a %s project',
     async (projectStatus) => {

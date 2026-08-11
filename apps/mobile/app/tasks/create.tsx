@@ -95,7 +95,7 @@ export default function CreateTask(): ReactElement {
 
       <Text style={styles.label}>開発指示（自然文）*</Text>
       <TextInput
-        maxLength={4000}
+        maxLength={50000}
         multiline
         numberOfLines={8}
         onChangeText={setDescription}

@@ -19,7 +19,7 @@ const AiCliProviderSchema = z.enum(['claude_code', 'codex', 'gemini'])
 const CreateTaskBody = z.object({
   projectId: z.string().min(1),
   title: z.string().min(1).max(200),
-  description: z.string().default(''),
+  description: z.string().max(50_000).default(''),
   status: TaskStatusSchema.default('pending'),
   assignee: AgentRoleSchema,
   provider: AiCliProviderSchema.optional(),
