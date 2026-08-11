@@ -7,8 +7,6 @@
 import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type {
-  Approval,
-  ApprovalRequest,
   Job,
   Project,
   ProjectStatus,
@@ -27,6 +25,12 @@ import {
   View,
 } from 'react-native'
 import { apiFetch, clearApiToken, getApiToken, setApiToken } from '../lib/api'
+import {
+  fetchPendingApprovals,
+  fetchWaitingApprovalRequests,
+  setCachedApprovalRequests,
+  setCachedApprovals,
+} from '../lib/approvalsCache'
 import { POLLING_INTERVAL_MS, usePolling } from '../lib/usePolling'
 
 const MAX_TASKS_FOR_RECENT_JOBS = 3
@@ -76,26 +80,6 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
   }
 
   return (await response.json()) as Job[]
-}
-
-async function fetchPendingApprovals(): Promise<Approval[]> {
-  const response = await apiFetch('/api/approvals/pending')
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch pending approvals: ${response.status}`)
-  }
-
-  return (await response.json()) as Approval[]
-}
-
-async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
-  const response = await apiFetch('/api/approval-requests/waiting')
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch approval requests: ${response.status}`)
-  }
-
-  return (await response.json()) as ApprovalRequest[]
 }
 
 /** 409時は本体APIの固定エラー文だけを返す（token・内部情報は含めない） */
@@ -205,6 +189,9 @@ async function fetchPendingApprovalCount(): Promise<number> {
     fetchPendingApprovals(),
     fetchWaitingApprovalRequests(),
   ])
+
+  setCachedApprovals(approvals)
+  setCachedApprovalRequests(approvalRequests)
 
   return approvals.length + approvalRequests.length
 }

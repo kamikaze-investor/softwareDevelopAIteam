@@ -5,7 +5,6 @@
 import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type {
-  Approval,
   ApprovalExplanationResponse,
   ApprovalGateStatus,
   ApprovalQuestionResponse,
@@ -30,9 +29,16 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../lib/api'
+import {
+  fetchPendingApprovals,
+  fetchWaitingApprovalRequests,
+  getApprovalsCache,
+  setCachedApprovalRequests,
+  setCachedApprovals,
+} from '../lib/approvalsCache'
+import type { ApprovalWithProject } from '../lib/approvalsCache'
 import { POLLING_INTERVAL_MS, usePolling } from '../lib/usePolling'
 
-type ApprovalWithProject = Approval & { projectName: string }
 type DecisionStatus = 'approved' | 'rejected'
 type ApprovalGateDecisionStatus = Extract<
   ApprovalGateStatus,
@@ -73,27 +79,6 @@ const RISK_TEXT_STYLE: Record<RiskLevel, { color: string }> = {
   HIGH: { color: '#fb923c' },
   LOW: { color: '#22c55e' },
   MEDIUM: { color: '#f59e0b' },
-}
-
-/** 全Project横断でpending状態の方針承認だけを1回のfetchで取得する（Project数分fetchしない） */
-async function fetchPendingApprovals(): Promise<ApprovalWithProject[]> {
-  const response = await apiFetch('/api/approvals/pending')
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch pending approvals: ${response.status}`)
-  }
-
-  return (await response.json()) as ApprovalWithProject[]
-}
-
-async function fetchWaitingApprovalRequests(): Promise<ApprovalRequest[]> {
-  const response = await apiFetch('/api/approval-requests/waiting')
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch approval requests: ${response.status}`)
-  }
-
-  return (await response.json()) as ApprovalRequest[]
 }
 
 async function fetchApprovalExplanation(
@@ -405,8 +390,13 @@ function ApprovalQuestionModal({
 }
 
 export default function ApprovalsScreen(): ReactElement {
-  const [approvals, setApprovals] = useState<ApprovalWithProject[]>([])
-  const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>([])
+  const [initialCache] = useState(() => getApprovalsCache())
+  const [approvals, setApprovals] = useState<ApprovalWithProject[]>(
+    initialCache.approvals ?? [],
+  )
+  const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>(
+    initialCache.approvalRequests ?? [],
+  )
   const [expandedApprovalRequestId, setExpandedApprovalRequestId] = useState<
     string | null
   >(null)
@@ -426,7 +416,9 @@ export default function ApprovalsScreen(): ReactElement {
   const [questionHistoryByRequestId, setQuestionHistoryByRequestId] = useState<
     Record<string, ApprovalQuestionTurn[]>
   >({})
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(
+    initialCache.approvals === null && initialCache.approvalRequests === null,
+  )
   const [refreshing, setRefreshing] = useState(false)
   const [rejectTarget, setRejectTarget] = useState<RejectTarget | null>(null)
 
@@ -434,6 +426,7 @@ export default function ApprovalsScreen(): ReactElement {
     try {
       const waitingApprovalRequests = await fetchWaitingApprovalRequests()
       setApprovalRequests(waitingApprovalRequests)
+      setCachedApprovalRequests(waitingApprovalRequests)
     } catch {
       Alert.alert('エラー', '危険操作承認の取得に失敗しました')
     }
@@ -444,6 +437,7 @@ export default function ApprovalsScreen(): ReactElement {
     try {
       const pendingApprovals = await fetchPendingApprovals()
       setApprovals(pendingApprovals)
+      setCachedApprovals(pendingApprovals)
     } catch {
       Alert.alert('エラー', '方針承認の取得に失敗しました')
     }
