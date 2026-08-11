@@ -476,6 +476,63 @@ describe('GET /api/approval-requests/waiting', () => {
       expect(requests.every(request => request.status === 'WAITING_FOR_USER')).toBe(true)
     })
   })
+
+  it('returns a WAITING_FOR_USER request with a future expiresAt', async () => {
+    await withApp(async (app) => {
+      const waiting = await createApprovalRequest(app, { taskId: 'future-expiry-task' })
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/approval-requests/waiting',
+      })
+
+      expect(res.statusCode).toBe(200)
+      const requests = parseBody<ApprovalRequest[]>(res.body)
+      expect(requests.some(request => request.id === waiting.id)).toBe(true)
+    })
+  })
+
+  it('excludes a WAITING_FOR_USER request whose expiresAt has passed', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const expiredWaiting = getStorage().approvalRequests.create({
+        taskId: 'past-expiry-task',
+        targetBranch: 'feat/test',
+        targetCommit: 'abc123',
+        targetDiffHash: 'deadbeef',
+        riskLevel: 'HIGH',
+        requestedAction: 'merge feature branch',
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() - 5000).toISOString(),
+        invalidIf: [],
+      })
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/approval-requests/waiting',
+      })
+
+      expect(res.statusCode).toBe(200)
+      const requests = parseBody<ApprovalRequest[]>(res.body)
+      expect(requests.some(request => request.id === expiredWaiting.id)).toBe(false)
+    })
+  })
+
+  it('excludes a non-WAITING_FOR_USER request even with a future expiresAt', async () => {
+    await withApp(async (app) => {
+      const approved = await createApprovalRequest(app, { taskId: 'non-waiting-task' })
+      await patchStatus(app, approved.id, 'APPROVED')
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/api/approval-requests/waiting',
+      })
+
+      expect(res.statusCode).toBe(200)
+      const requests = parseBody<ApprovalRequest[]>(res.body)
+      expect(requests.some(request => request.id === approved.id)).toBe(false)
+    })
+  })
 })
 
 // ────────────────────────────────────────────────────────────

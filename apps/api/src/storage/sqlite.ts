@@ -1197,9 +1197,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return row ? deserializeApprovalRequest(row) : undefined
     },
     findWaiting() {
-      const rows = db.prepare(
-        `SELECT * FROM approval_requests WHERE status = 'WAITING_FOR_USER' ORDER BY created_at DESC`
-      ).all() as any[]
+      const rows = db.prepare(`
+        SELECT * FROM approval_requests
+        WHERE status = 'WAITING_FOR_USER' AND expires_at > ?
+        ORDER BY created_at DESC
+      `).all(now()) as any[]
       return rows.map(deserializeApprovalRequest)
     },
     create(data) {
