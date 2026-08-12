@@ -25,6 +25,9 @@ importers:
       fastify:
         specifier: ^4.28.0
         version: 4.29.1
+      opencode-ai:
+        specifier: 1.18.16
+        version: 1.18.16
       zod:
         specifier: ^3.23.0
         version: 3.25.76
@@ -3831,6 +3834,75 @@ packages:
   open@8.4.2:
     resolution: {integrity: sha512-7x81NCL719oNbsq/3mh+hVrAWmFuEYUqrq/Iw3kUzH8ReypT9QQ0BLoJS7/G9k6N81XjW4qHWtjWwe/9eLy1EQ==}
     engines: {node: '>=12'}
+
+  opencode-ai@1.18.16:
+    resolution: {integrity: sha512-l4nUfoucuw8u5WYU9my9Yz7lYpBI649i/ppgL0BGTjp/HC3p2jN50i331YpcGbKfGTEv9VG6mxU1+QZyaR5hxA==}
+    cpu: [arm64, x64]
+    os: [darwin, linux, win32]
+    hasBin: true
+
+  opencode-darwin-arm64@1.18.16:
+    resolution: {integrity: sha512-/eEAcBOMOAv2c35s+1smy8+8VxGHOAbH8bIgcYdJJ8rJNMRMtSrdhsHFKsa/27oYbv1k/WHHU8XYddLvCoCXVw==}
+    cpu: [arm64]
+    os: [darwin]
+
+  opencode-darwin-x64-baseline@1.18.16:
+    resolution: {integrity: sha512-IxX00YOhWQ38f54ZR+g9bJTtRK7cUCKM7VzGaHbOgk8sfqAxNUJEhz1+BY/V0eODE76jh8lKM5Bjm/vqBno92Q==}
+    cpu: [x64]
+    os: [darwin]
+
+  opencode-darwin-x64@1.18.16:
+    resolution: {integrity: sha512-mABJJ0+OX9ACWmfX49QNUDsU2PowqaInKQ4vzkAjSCX1V7fP1sD9AJGISn3eVrJNTZsB1oUbyeYjQeDMnzZK2g==}
+    cpu: [x64]
+    os: [darwin]
+
+  opencode-linux-arm64-musl@1.18.16:
+    resolution: {integrity: sha512-jWzJLJBjlDq8OHI9MAh+DNh6Prtl5P8ppWOoEACmYkh/ntKVfD4DWm2xRhCZ6Qada7v0OX6Dty/1b3fDRFhHgg==}
+    cpu: [arm64]
+    os: [linux]
+    libc: [musl]
+
+  opencode-linux-arm64@1.18.16:
+    resolution: {integrity: sha512-0s32hDy72CBsT6sK7xsDUNKrACmylz5TIADHcYf8BXm7cHA/ry6fVNZ6r/RDtdQxRv6Hr47bynx+NJ8rm9SZAA==}
+    cpu: [arm64]
+    os: [linux]
+
+  opencode-linux-x64-baseline-musl@1.18.16:
+    resolution: {integrity: sha512-tPJ+omujiwwr88bkz9eLqleD9sznTt9OGLq02uSbtSVw8XqSVR3EZVqByFa6wtbHGypKpkHww3i/JTaTYJRz8g==}
+    cpu: [x64]
+    os: [linux]
+    libc: [musl]
+
+  opencode-linux-x64-baseline@1.18.16:
+    resolution: {integrity: sha512-Lvm4XLm918etLz85Yh8CCTcCalLUjx3TA8KVq3S4+EfTNBJ3QOmUyLjGQPhuC2kw+5NvkQVV/mnVdCawxnJ6ng==}
+    cpu: [x64]
+    os: [linux]
+
+  opencode-linux-x64-musl@1.18.16:
+    resolution: {integrity: sha512-ULqBV/MsG/0k/5+wkJbZvV9xzDy6Hl3DFD7YJwbHzhZ03CrivJozK7GnuAz6Zp+j466obPEaKdwr+nVdTbGiYA==}
+    cpu: [x64]
+    os: [linux]
+    libc: [musl]
+
+  opencode-linux-x64@1.18.16:
+    resolution: {integrity: sha512-eArnlUAhE3bqhaMXsypn14x49GsafuPS9oI6eH+rWZ2vrUCrKfKk/F7WOe/sFgp09gQU8yzFbGsZjDpWBFSCBg==}
+    cpu: [x64]
+    os: [linux]
+
+  opencode-windows-arm64@1.18.16:
+    resolution: {integrity: sha512-FZrB40RBm5gvv3Uv+WOSRlEHQsqcJ04t7B3yp/L6SFYU6T2UZQqvLwDF/TPT1C0//a8uAbfqUV1h26sTmsi4ow==}
+    cpu: [arm64]
+    os: [win32]
+
+  opencode-windows-x64-baseline@1.18.16:
+    resolution: {integrity: sha512-5ZnpdRq4KICElnb/OQ1PtufgmcxAYLILEJiu9rKJjAxTYjFEWMkpA6SRiU4LRbYzQn8LaHObDgxzt7bquA0OTw==}
+    cpu: [x64]
+    os: [win32]
+
+  opencode-windows-x64@1.18.16:
+    resolution: {integrity: sha512-edxKete10oR4fqRzh1usD1b8uCsxpPqt4Vm0nHHX2kuPe9toQVM2vA02U37gm7j3s/eBO7Lcjw15hKU1A56Lsw==}
+    cpu: [x64]
+    os: [win32]
 
   ora@3.4.0:
     resolution: {integrity: sha512-eNwHudNbO1folBP3JsZ19v9azXWtQZjICdr3Q0TDPIaeBQ3mXLrh54wM+er0+hSp+dWKf+Z8KM58CYzEyIYxYg==}
@@ -9597,6 +9669,57 @@ snapshots:
       define-lazy-prop: 2.0.0
       is-docker: 2.2.1
       is-wsl: 2.2.0
+
+  opencode-ai@1.18.16:
+    optionalDependencies:
+      opencode-darwin-arm64: 1.18.16
+      opencode-darwin-x64: 1.18.16
+      opencode-darwin-x64-baseline: 1.18.16
+      opencode-linux-arm64: 1.18.16
+      opencode-linux-arm64-musl: 1.18.16
+      opencode-linux-x64: 1.18.16
+      opencode-linux-x64-baseline: 1.18.16
+      opencode-linux-x64-baseline-musl: 1.18.16
+      opencode-linux-x64-musl: 1.18.16
+      opencode-windows-arm64: 1.18.16
+      opencode-windows-x64: 1.18.16
+      opencode-windows-x64-baseline: 1.18.16
+
+  opencode-darwin-arm64@1.18.16:
+    optional: true
+
+  opencode-darwin-x64-baseline@1.18.16:
+    optional: true
+
+  opencode-darwin-x64@1.18.16:
+    optional: true
+
+  opencode-linux-arm64-musl@1.18.16:
+    optional: true
+
+  opencode-linux-arm64@1.18.16:
+    optional: true
+
+  opencode-linux-x64-baseline-musl@1.18.16:
+    optional: true
+
+  opencode-linux-x64-baseline@1.18.16:
+    optional: true
+
+  opencode-linux-x64-musl@1.18.16:
+    optional: true
+
+  opencode-linux-x64@1.18.16:
+    optional: true
+
+  opencode-windows-arm64@1.18.16:
+    optional: true
+
+  opencode-windows-x64-baseline@1.18.16:
+    optional: true
+
+  opencode-windows-x64@1.18.16:
+    optional: true
 
   ora@3.4.0:
     dependencies:
