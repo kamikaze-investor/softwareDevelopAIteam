@@ -181,8 +181,18 @@ Investigateの責務ではなく、Self Diagnosis Framework（5b-8）が担う�
 ## 5b-5. Distill（Evolutionへ吸収）
 
 ログ・失敗・Review結果・Investigate結果から、再利用可能なRuleやKnown Pitfallを作る処理。
-`Observation → Investigate → Verify → Distill → Knowledge登録`の流れを取る。Rule化にはEvidenceが必要で、
-自動でCoreやWorkflowを変更することはなく、必要に応じてCEO承認対象とする。
+`Observation → Investigate → Verify → Distill → Knowledge登録`の流れを取る。Rule化にはEvidenceが必要である。
+
+**CEO承認必須方針（2026-08-12 CEO確定。既存の「必要に応じてCEO承認対象とする」という表現を明確化する）**:
+Lesson / Observation / Hypothesis / Diagnosis / Improvement Proposalの自動生成・蓄積・分析まではAIが
+自律的に行ってよい。しかし、それを正式にOperationalize（実際の反映）して、Rule / Prompt / Workflow /
+Roadmap / Constitution / Goal / Design Philosophy / Security Policy / Approval Policy /
+Model・Data Policy / Risk Policy / AIの自動実行可能範囲 / 全Project・全Teamへ影響するdefaultを
+変更する場合は、変更の大小・Evidence量にかかわらず**毎回例外なくCEO Proposalとして提示し、
+CEOの明示承認を得てから変更する**。AI自身が「今回は軽微だから承認不要」と判断して自己変更することは
+禁止する。この承認経路は既存のProposal Lifecycle（`docs/AI_TEAM_OS_DESIGN.md` 第2弾5章）・
+Human Approval Zone（`specs/04_ai_organization.md` 13章）をそのまま再利用し、新しいApproval Gateは
+作らない。
 
 ### 5b-5-1. Knowledge Lifecycle（将来設計。現行5b-3のKnowledge種別を置き換えない）
 
