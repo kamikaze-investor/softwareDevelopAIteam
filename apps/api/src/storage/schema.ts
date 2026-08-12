@@ -244,6 +244,14 @@ export const CREATE_TABLES = `
     related_node_ids TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS outbox_applied_events (
+    event_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    FOREIGN KEY (job_id) REFERENCES jobs(id)
+  );
 `
 
 /**

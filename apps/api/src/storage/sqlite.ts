@@ -9,7 +9,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
@@ -41,6 +41,60 @@ export class RoadmapTaskConflictError extends Error {
 }
 
 const now = () => new Date().toISOString()
+
+interface AppliedOutboxEventRow {
+  event_id: string
+  job_id: string
+  payload_hash: string
+  applied_at: string
+}
+
+type OutboxDedupCheck =
+  | { status: 'new' }
+  | { status: 'deduplicated' }
+  | { status: 'conflict'; reason: string }
+
+function checkOutboxEvent(
+  db: Database.Database,
+  jobId: string,
+  outboxEvent: OutboxEventInput | undefined,
+): OutboxDedupCheck {
+  if (!outboxEvent) return { status: 'new' }
+
+  const applied = db.prepare(
+    'SELECT * FROM outbox_applied_events WHERE event_id = ?',
+  ).get(outboxEvent.eventId) as AppliedOutboxEventRow | undefined
+
+  if (!applied) return { status: 'new' }
+  if (applied.job_id !== jobId) {
+    return { status: 'conflict', reason: 'Outbox event belongs to another Job' }
+  }
+  if (applied.payload_hash !== outboxEvent.payloadHash) {
+    return { status: 'conflict', reason: 'Outbox event payload hash mismatch' }
+  }
+
+  return { status: 'deduplicated' }
+}
+
+function recordOutboxEvent(
+  db: Database.Database,
+  jobId: string,
+  outboxEvent: OutboxEventInput | undefined,
+): void {
+  if (!outboxEvent) return
+
+  db.prepare(`
+    INSERT INTO outbox_applied_events (event_id, job_id, payload_hash, applied_at)
+    VALUES (?, ?, ?, ?)
+  `).run(outboxEvent.eventId, jobId, outboxEvent.payloadHash, now())
+}
+
+function findJobByWorkflowStepKey(db: Database.Database, workflowStepKey: string): Job | undefined {
+  const row = db.prepare(
+    'SELECT * FROM jobs WHERE workflow_step_key = ?',
+  ).get(workflowStepKey) as any
+  return row ? deserializeJob(row) : undefined
+}
 
 function isSingleRunningProjectConstraintError(err: unknown): boolean {
   const sqliteError = err as { code?: unknown; message?: unknown }
@@ -775,6 +829,38 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       )
       return updated
     },
+    updateWithOutboxEvent(id, data, outboxEvent) {
+      const updateTransaction = db.transaction((): UpdateWithOutboxEventResult => {
+        const dedup = checkOutboxEvent(db, id, outboxEvent)
+        if (dedup.status === 'conflict') {
+          return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        }
+        if (dedup.status === 'deduplicated') {
+          const job = jobs.findById(id)
+          if (!job) {
+            return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+          }
+          return { ok: true, job, deduplicated: true }
+        }
+
+        const updated = jobs.update(id, data)
+        if (!updated) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+        recordOutboxEvent(db, id, outboxEvent)
+        return { ok: true, job: updated, deduplicated: false }
+      })
+
+      try {
+        return updateTransaction()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
     failIfRunning(jobId, failure) {
       const transition = db.transaction((): FailIfRunningJobResult => {
         const updateResult = db.prepare(`
@@ -800,6 +886,22 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     updateAndCreateNextWorkflowJob(input) {
       const transition = db.transaction((): AdvanceWorkflowJobResult => {
+        const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
+        if (dedup.status === 'conflict') {
+          return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        }
+        if (dedup.status === 'deduplicated') {
+          const job = jobs.findById(input.jobId)
+          if (!job) {
+            return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
+          }
+          const nextJob = findJobByWorkflowStepKey(db, input.nextJob.workflowStepKey)
+          if (!nextJob) {
+            return { ok: false, code: 'STORAGE_ERROR', reason: 'Applied Outbox event is missing its next workflow Job' }
+          }
+          return { ok: true, job, nextJob, nextJobCreated: false, deduplicated: true }
+        }
+
         const source = jobs.findById(input.jobId)
         if (!source) {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
@@ -824,11 +926,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
         }
         if (existingNext) {
-          return { ok: true, job: updated, nextJob: existingNext, nextJobCreated: false }
+          recordOutboxEvent(db, input.jobId, input.outboxEvent)
+          return { ok: true, job: updated, nextJob: existingNext, nextJobCreated: false, deduplicated: false }
         }
 
         const nextJob = jobs.create(input.nextJob)
-        return { ok: true, job: updated, nextJob, nextJobCreated: true }
+        recordOutboxEvent(db, input.jobId, input.outboxEvent)
+        return { ok: true, job: updated, nextJob, nextJobCreated: true, deduplicated: false }
       })
 
       try {
@@ -843,6 +947,41 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     persistReviewWorkflowResult(input) {
       const persistTransaction = db.transaction((): PersistReviewWorkflowResult => {
+        const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
+        if (dedup.status === 'conflict') {
+          return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        }
+        if (dedup.status === 'deduplicated') {
+          const job = jobs.findById(input.jobId)
+          if (!job) {
+            return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Review Job not found' }
+          }
+          const existingReviewRow = db.prepare(
+            'SELECT * FROM review_results WHERE job_id = ?',
+          ).get(input.jobId) as any
+          const reviewResult = existingReviewRow
+            ? deserializeReviewResult(existingReviewRow)
+            : undefined
+          if (!reviewResult) {
+            return { ok: false, code: 'STORAGE_ERROR', reason: 'Applied Outbox event is missing its ReviewResult' }
+          }
+          const nextJob = input.nextJob
+            ? findJobByWorkflowStepKey(db, input.nextJob.workflowStepKey)
+            : undefined
+          if (input.nextJob && !nextJob) {
+            return { ok: false, code: 'STORAGE_ERROR', reason: 'Applied Outbox event is missing its next workflow Job' }
+          }
+          return {
+            ok: true,
+            job,
+            reviewResult,
+            reviewResultCreated: false,
+            nextJob,
+            nextJobCreated: false,
+            deduplicated: true,
+          }
+        }
+
         const source = jobs.findById(input.jobId)
         if (!source) {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Review Job not found' }
@@ -892,6 +1031,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         })
         const nextJob = existingNext ?? (input.nextJob ? jobs.create(input.nextJob) : undefined)
 
+        recordOutboxEvent(db, source.id, input.outboxEvent)
         return {
           ok: true,
           job: updated,
@@ -899,6 +1039,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           reviewResultCreated: existingReview === undefined,
           nextJob,
           nextJobCreated: input.nextJob !== undefined && existingNext === undefined,
+          deduplicated: false,
         }
       })
 

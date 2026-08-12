@@ -1,20 +1,10 @@
+import { describe, expect, it } from 'vitest'
 import {
   classifyApprovalLevel,
   determineApprovalLevel,
   shouldEscalateToAiReview,
 } from './approvalLevelClassifier'
 import type { ClassifierInput, ClassifierResult } from './types/approvalLevel'
-
-interface Expectation {
-  toBe(expected: unknown): void
-  toEqual(expected: unknown): void
-  toContain(expected: unknown): void
-  toBeGreaterThanOrEqual(expected: number): void
-}
-
-declare const describe: (name: string, fn: () => void) => void
-declare const it: (name: string, fn: () => void) => void
-declare const expect: (actual: unknown) => Expectation
 
 const DEFAULT_FLAGS = {
   jobRunnerTouched: false,

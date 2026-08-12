@@ -1,10 +1,38 @@
 import type { Job, Task } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { JobRunResult } from './jobRunner.js'
+
+const outboxMocks = vi.hoisted(() => ({
+  recordPending: vi.fn(),
+  deletePending: vi.fn(),
+  resendPending: vi.fn(),
+  hasPending: vi.fn(),
+}))
+
+const jobStateMocks = vi.hoisted(() => ({
+  recoverStaleJobs: vi.fn(),
+}))
+
+const watchdogMocks = vi.hoisted(() => ({
+  startWatchdog: vi.fn(),
+}))
+
+vi.mock('./outbox/outboxStore.js', () => outboxMocks)
+vi.mock('./watchdog/watchdog.js', () => watchdogMocks)
+vi.mock('./jobStateManager.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./jobStateManager.js')>()
+  return {
+    ...actual,
+    recoverStaleJobs: jobStateMocks.recoverStaleJobs,
+  }
+})
+
 import {
   patchJobWithRetry,
+  pollJobs,
   persistJobResult,
   processQueuedWork,
+  start,
 } from './index.js'
 
 const NOW = '2026-08-08T01:02:03.000Z'
@@ -50,12 +78,27 @@ const runResult: JobRunResult = {
 
 beforeEach(() => {
   fetchMock.mockReset()
+  outboxMocks.recordPending.mockReset()
+  outboxMocks.deletePending.mockReset()
+  outboxMocks.resendPending.mockReset()
+  outboxMocks.hasPending.mockReset()
+  jobStateMocks.recoverStaleJobs.mockReset()
+  watchdogMocks.startWatchdog.mockReset()
+  outboxMocks.recordPending.mockReturnValue({
+    eventId: 'event-1',
+    payloadHash: 'payload-hash-1',
+  })
+  outboxMocks.resendPending.mockResolvedValue(undefined)
+  outboxMocks.hasPending.mockReturnValue(false)
+  jobStateMocks.recoverStaleJobs.mockResolvedValue(0)
   vi.spyOn(console, 'log').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
 })
 
 afterEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
 
@@ -73,6 +116,7 @@ describe('terminal result persistence', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(outboxMocks.deletePending).toHaveBeenCalledWith('job-1')
     expect(reconcileJob).not.toHaveBeenCalled()
   })
 
@@ -92,25 +136,27 @@ describe('terminal result persistence', () => {
       status: 'success',
       completedAt: runResult.completedAt,
       stdout: runResult.stdout,
+      eventId: 'event-1',
+      payloadHash: 'payload-hash-1',
     })
   })
 
   it('3回失敗後にreconcileできればCRITICAL通知しない', async () => {
     fetchMock.mockResolvedValue(new Response(null, { status: 503 }))
     const alert = vi.fn().mockResolvedValue([])
+    const reconcileJob = vi.fn()
 
     await persistJobResult('job-1', runResult, 'success', {
       patchJob: retryingPatchJob(),
-      reconcileJob: vi.fn().mockResolvedValue({
-        outcome: 'reconciled',
-        updated: false,
-        currentStatus: 'success',
-      }),
+      reconcileJob,
       alert,
       now: () => NOW,
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(outboxMocks.recordPending).toHaveBeenCalledTimes(1)
+    expect(outboxMocks.deletePending).not.toHaveBeenCalled()
+    expect(reconcileJob).not.toHaveBeenCalled()
     expect(alert).not.toHaveBeenCalled()
   })
 
@@ -122,24 +168,56 @@ describe('terminal result persistence', () => {
       stdout: 'private stdout token-secret-123',
       stderr: 'private stderr token-secret-123',
     }
+    const reconcileJob = vi.fn()
 
     await persistJobResult('job-sensitive', sensitiveResult, 'success', {
       patchJob: retryingPatchJob(),
-      reconcileJob: vi.fn().mockResolvedValue({
-        outcome: 'unrecoverable',
-        updated: false,
-      }),
+      reconcileJob,
       alert,
       now: () => NOW,
     })
 
-    expect(alert).toHaveBeenCalledTimes(1)
-    const notification = JSON.stringify(alert.mock.calls[0]?.[0])
-    expect(notification).toContain('job-sensitive')
-    expect(notification).toContain('technical failure')
-    expect(notification).not.toContain('private stdout')
-    expect(notification).not.toContain('private stderr')
-    expect(notification).not.toContain('token-secret-123')
+    expect(outboxMocks.deletePending).not.toHaveBeenCalled()
+    expect(reconcileJob).not.toHaveBeenCalled()
+    expect(alert).not.toHaveBeenCalled()
+  })
+})
+
+describe('outbox gating', () => {
+  it('pollJobs skips queued Job fetch while pending Outbox events exist', async () => {
+    vi.useFakeTimers()
+    outboxMocks.hasPending.mockReturnValue(true)
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(outboxMocks.hasPending).toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('start waits for pending Outbox events before startup recovery', async () => {
+    vi.useFakeTimers()
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    outboxMocks.hasPending
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(false)
+      .mockReturnValue(false)
+
+    void start()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
+    expect(jobStateMocks.recoverStaleJobs).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    await Promise.resolve()
+
+    expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
   })
 })
 

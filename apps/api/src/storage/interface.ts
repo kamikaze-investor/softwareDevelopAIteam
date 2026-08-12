@@ -22,10 +22,23 @@ export type CreateTaskWithInitialImplementJobResult =
   | { ok: false; code: 'STORAGE_ERROR'; reason: string }
 
 export type AdvanceWorkflowJobResult =
-  | { ok: true; job: Job; nextJob: Job; nextJobCreated: boolean }
+  | { ok: true; job: Job; nextJob: Job; nextJobCreated: boolean; deduplicated?: boolean }
   | {
       ok: false
-      code: 'JOB_NOT_FOUND' | 'NOT_WORKFLOW_JOB' | 'WORKFLOW_CONFLICT' | 'STORAGE_ERROR'
+      code: 'JOB_NOT_FOUND' | 'NOT_WORKFLOW_JOB' | 'WORKFLOW_CONFLICT' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
+      reason: string
+    }
+
+export interface OutboxEventInput {
+  eventId: string
+  payloadHash: string
+}
+
+export type UpdateWithOutboxEventResult =
+  | { ok: true; job: Job; deduplicated: boolean }
+  | {
+      ok: false
+      code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
       reason: string
     }
 
@@ -41,6 +54,7 @@ export type PersistReviewWorkflowResult =
       reviewResultCreated: boolean
       nextJob?: Job
       nextJobCreated: boolean
+      deduplicated?: boolean
     }
   | {
       ok: false
@@ -49,6 +63,7 @@ export type PersistReviewWorkflowResult =
         | 'NOT_WORKFLOW_JOB'
         | 'REVIEW_CONFLICT'
         | 'WORKFLOW_CONFLICT'
+        | 'OUTBOX_HASH_MISMATCH'
         | 'STORAGE_ERROR'
       reason: string
     }
@@ -130,6 +145,11 @@ export interface IJobStorage {
   findById(id: string): Job | undefined
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
   update(id: string, data: Partial<Job>): Job | undefined
+  updateWithOutboxEvent(
+    id: string,
+    data: Partial<Job>,
+    outboxEvent?: OutboxEventInput,
+  ): UpdateWithOutboxEventResult
   failIfRunning(
     jobId: string,
     failure: { stderr: string; completedAt: string },
@@ -139,6 +159,7 @@ export interface IJobStorage {
     jobId: string
     update: Partial<Job>
     nextJob: Omit<Job, 'id' | 'createdAt' | 'workflowStepKey'> & { workflowStepKey: string }
+    outboxEvent?: OutboxEventInput
   }): AdvanceWorkflowJobResult
   /** structured review保存・review Job更新・任意のworkflow次Job作成を原子的に行う。 */
   persistReviewWorkflowResult(input: {
@@ -146,6 +167,7 @@ export interface IJobStorage {
     update: Partial<Job>
     reviewResult: Pick<ReviewResult, 'status' | 'summary' | 'findings'>
     nextJob?: Omit<Job, 'id' | 'createdAt' | 'workflowStepKey'> & { workflowStepKey: string }
+    outboxEvent?: OutboxEventInput
   }): PersistReviewWorkflowResult
   resumeBlockedTask(input: {
     taskId: string

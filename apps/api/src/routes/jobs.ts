@@ -1,8 +1,10 @@
 import type { FastifyInstance } from 'fastify'
+import { createHash } from 'node:crypto'
 import { z } from 'zod'
-import type { Job } from '@ai-team/shared'
+import { canonicalizeJobUpdate, type Job } from '@ai-team/shared'
 import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
+import type { OutboxEventInput } from '../storage/interface'
 
 const AgentRoleSchema = z.enum([
   'cto_ai',
@@ -87,6 +89,8 @@ const CreateJobBody = z.object({
 )
 
 const UpdateJobBody = z.object({
+  eventId: z.string().min(1).optional(),
+  payloadHash: z.string().min(1).optional(),
   status: JobStatusSchema.optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
@@ -119,6 +123,53 @@ const FailIfRunningJobBody = z.object({
 const ListQuerySchema = z.object({
   taskId: z.string().min(1),
 })
+
+function calculatePayloadHash(payload: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(canonicalizeJobUpdate(payload))
+    .digest('hex')
+}
+
+function buildOutboxEvent(
+  eventId: string | undefined,
+  requestPayloadHash: string | undefined,
+  payload: Record<string, unknown>,
+): { ok: true; outboxEvent?: OutboxEventInput } | { ok: false; statusCode: 400 | 409; error: string } {
+  const hasEventId = eventId !== undefined
+  const hasPayloadHash = requestPayloadHash !== undefined
+  if (hasEventId !== hasPayloadHash) {
+    return {
+      ok: false,
+      statusCode: 400,
+      error: 'eventId and payloadHash must either both be specified or both be omitted',
+    }
+  }
+  if (!eventId || !requestPayloadHash) {
+    return { ok: true }
+  }
+
+  const computedPayloadHash = calculatePayloadHash(payload)
+  if (computedPayloadHash !== requestPayloadHash) {
+    return {
+      ok: false,
+      statusCode: 409,
+      error: 'Outbox payload hash mismatch',
+    }
+  }
+
+  return { ok: true, outboxEvent: { eventId, payloadHash: computedPayloadHash } }
+}
+
+function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, deduplicated: boolean): Job | (Job & { outbox: { eventId: string; deduplicated: boolean } }) {
+  if (!outboxEvent) return job
+  return {
+    ...job,
+    outbox: {
+      eventId: outboxEvent.eventId,
+      deduplicated,
+    },
+  }
+}
 
 export async function jobRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
@@ -198,12 +249,21 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
+    const { eventId, payloadHash, reviewResult, ...jobUpdate } = result.data
+    const outboxPayload = reviewResult === undefined
+      ? jobUpdate
+      : { ...jobUpdate, reviewResult }
+    const outboxCheck = buildOutboxEvent(eventId, payloadHash, outboxPayload)
+    if (!outboxCheck.ok) {
+      return reply.status(outboxCheck.statusCode).send({ error: outboxCheck.error })
+    }
+    const { outboxEvent } = outboxCheck
+
     const existing = storage.jobs.findById(req.params.id)
     if (!existing) {
       return reply.status(404).send({ error: 'Job not found' })
     }
 
-    const { reviewResult, ...jobUpdate } = result.data
     const isReviewJob = existing.aiCliMode === 'review'
     const isAutomaticReviewJob =
       existing.workflowStepKey?.startsWith('implement:') === true &&
@@ -240,20 +300,36 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
             workingDir: TARGET_WORKING_DIR,
           },
         } : undefined,
+        outboxEvent,
       })
       if (!persisted.ok) {
+        if (persisted.code === 'OUTBOX_HASH_MISMATCH') {
+          return reply.status(409).send({ error: persisted.reason })
+        }
         req.log.error({ code: persisted.code, reason: persisted.reason }, 'Failed to persist structured review')
         return reply.status(500).send({ error: 'Failed to persist structured review' })
       }
-      return reply.send(persisted.job)
+      return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated === true))
     }
 
     if (isReviewJob && jobUpdate.status === 'success') {
-      const failed = storage.jobs.update(existing.id, {
+      const failedUpdate: Partial<Job> = {
         ...jobUpdate,
         status: 'failed',
         stderr: jobUpdate.stderr ?? 'Structured review result is missing (fail-closed)',
-      })
+      }
+      if (outboxEvent) {
+        const failed = storage.jobs.updateWithOutboxEvent(existing.id, failedUpdate, outboxEvent)
+        if (!failed.ok) {
+          if (failed.code === 'OUTBOX_HASH_MISMATCH') {
+            return reply.status(409).send({ error: failed.reason })
+          }
+          return reply.status(failed.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: failed.reason })
+        }
+        return reply.send(outboxResponse(failed.job, outboxEvent, failed.deduplicated))
+      }
+
+      const failed = storage.jobs.update(existing.id, failedUpdate)
       return reply.send(failed)
     }
 
@@ -283,12 +359,27 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           aiCliProvider: existing.aiCliProvider ?? 'claude_code',
           aiCliMode: 'review',
         },
+        outboxEvent,
       })
       if (!transition.ok) {
+        if (transition.code === 'OUTBOX_HASH_MISMATCH') {
+          return reply.status(409).send({ error: transition.reason })
+        }
         req.log.error({ code: transition.code, reason: transition.reason }, 'Failed to advance Job workflow')
         return reply.status(500).send({ error: 'Failed to advance Job workflow' })
       }
-      return reply.send(transition.job)
+      return reply.send(outboxResponse(transition.job, outboxEvent, transition.deduplicated === true))
+    }
+
+    if (outboxEvent) {
+      const updated = storage.jobs.updateWithOutboxEvent(req.params.id, jobUpdate, outboxEvent)
+      if (!updated.ok) {
+        if (updated.code === 'OUTBOX_HASH_MISMATCH') {
+          return reply.status(409).send({ error: updated.reason })
+        }
+        return reply.status(updated.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: updated.reason })
+      }
+      return reply.send(outboxResponse(updated.job, outboxEvent, updated.deduplicated))
     }
 
     const updated = storage.jobs.update(req.params.id, jobUpdate)

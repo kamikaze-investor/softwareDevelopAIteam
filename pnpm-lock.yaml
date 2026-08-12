@@ -105,10 +105,16 @@ importers:
       '@google/generative-ai':
         specifier: ^0.21.0
         version: 0.21.0
+      better-sqlite3:
+        specifier: ^9.4.0
+        version: 9.6.0
       zod:
         specifier: ^3.23.0
         version: 3.25.76
     devDependencies:
+      '@types/better-sqlite3':
+        specifier: ^7.6.0
+        version: 7.6.13
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.41
@@ -127,6 +133,9 @@ importers:
       typescript:
         specifier: ^5.4.0
         version: 5.9.3
+      vitest:
+        specifier: ^2.0.0
+        version: 2.1.9(@types/node@20.19.41)(terser@5.48.0)
 
 packages:
 

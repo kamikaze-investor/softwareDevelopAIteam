@@ -1,6 +1,16 @@
 import { execFileSync } from 'node:child_process'
 import type { Job, Task } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const outboxMocks = vi.hoisted(() => ({
+  recordPending: vi.fn(),
+  deletePending: vi.fn(),
+  resendPending: vi.fn(),
+  hasPending: vi.fn(),
+}))
+
+vi.mock('./outbox/outboxStore.js', () => outboxMocks)
+
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
@@ -356,6 +366,10 @@ function createStructuredReviewContext() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  outboxMocks.recordPending.mockReturnValue({
+    eventId: 'event-1',
+    payloadHash: 'payload-hash-1',
+  })
 
   buildWorktreeManifestMock.mockImplementation((workingDir: string) => {
     const out = hoistedExecFileSync('git', ['diff', '--name-only', 'HEAD'], {
@@ -430,7 +444,7 @@ beforeEach(() => {
 })
 
 describe('commit後のJob結果保存', () => {
-  it('完全結果のAPI保存失敗後は再commitせず、running限定reconciliationへ収束する', async () => {
+  it('完全結果のAPI保存失敗後もOutboxへ結果を残し、reconciliationは行わない', async () => {
     const patchJob = vi.fn().mockResolvedValue(false)
     const reconcileJob = vi.fn().mockResolvedValue({
       outcome: 'reconciled',
@@ -456,9 +470,10 @@ describe('commit後のJob結果保存', () => {
       status: 'success',
       commitHash: 'created-commit-hash',
     })
-    expect(reconcileJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
-      stderr: expect.stringContaining('technical communication failure'),
-      completedAt: expect.any(String),
+    expect(reconcileJob).not.toHaveBeenCalled()
+    expect(outboxMocks.recordPending).toHaveBeenCalledWith('job-1', expect.objectContaining({
+      status: 'success',
+      commitHash: 'created-commit-hash',
     }))
     expect(execFileSyncMock).not.toHaveBeenCalled()
   })

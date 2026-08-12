@@ -1,7 +1,8 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
+import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Job, Project, Task } from '@ai-team/shared'
+import { canonicalizeJobUpdate, type Job, type Project, type Task } from '@ai-team/shared'
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { resetStorage }] = await Promise.all([
@@ -33,6 +34,22 @@ async function withApp(run: (app: FastifyInstance) => Promise<void>): Promise<vo
 
 function parseBody<T>(body: string): T {
   return JSON.parse(body) as T
+}
+
+type OutboxJobResponse = Job & { outbox?: { eventId: string; deduplicated: boolean } }
+
+function calculatePayloadHash(payload: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(canonicalizeJobUpdate(payload))
+    .digest('hex')
+}
+
+function withOutbox<T extends Record<string, unknown>>(payload: T, eventId: string): T & { eventId: string; payloadHash: string } {
+  return {
+    ...payload,
+    eventId,
+    payloadHash: calculatePayloadHash(payload),
+  }
 }
 
 async function createProject(app: FastifyInstance, body: Partial<Project> = {}): Promise<Project> {
@@ -420,7 +437,99 @@ describe('Job API', () => {
       })
 
       expect(res.statusCode).toBe(200)
-      expect(parseBody<Job>(res.body).status).toBe('running')
+      const body = parseBody<OutboxJobResponse>(res.body)
+      expect(body.status).toBe('running')
+      expect(body.outbox).toBeUndefined()
+    })
+  })
+
+  it('PATCH /api/jobs/:id accepts an Outbox event and returns Outbox metadata', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      const payload = { status: 'running' as const, startedAt: '2026-08-08T01:02:03.000Z' }
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: withOutbox(payload, 'event-simple-update'),
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(res.body)).toMatchObject({
+        id: created.id,
+        status: 'running',
+        startedAt: '2026-08-08T01:02:03.000Z',
+        outbox: { eventId: 'event-simple-update', deduplicated: false },
+      })
+    })
+  })
+
+  it.each([
+    ['eventId only', { eventId: 'event-missing-hash', status: 'running' }],
+    ['payloadHash only', { payloadHash: 'abc123', status: 'running' }],
+  ])('PATCH /api/jobs/:id rejects Outbox metadata with %s', async (_label, payload) => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload,
+      })
+
+      expect(res.statusCode).toBe(400)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('eventId and payloadHash')
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects a request payload hash mismatch', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          status: 'running',
+          eventId: 'event-bad-request-hash',
+          payloadHash: 'not-the-api-computed-hash',
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('hash mismatch')
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects the same eventId with a different valid payload', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const firstPayload = { status: 'running' as const }
+      const secondPayload = { status: 'failed' as const, stderr: 'different result' }
+      const first = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: withOutbox(firstPayload, 'event-conflict'),
+      })
+      const second = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: withOutbox(secondPayload, 'event-conflict'),
+      })
+
+      expect(first.statusCode).toBe(200)
+      expect(second.statusCode).toBe(409)
+      const fetched = await app.inject({ method: 'GET', url: `/api/jobs/${created.id}` })
+      expect(parseBody<Job>(fetched.body)).toMatchObject({ status: 'running' })
     })
   })
 
@@ -629,6 +738,64 @@ describe('Job API', () => {
     })
   })
 
+  it('deduplicates an Outbox resend that creates the automatic review Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const taskResponse = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Outbox implementation',
+          assignee: 'developer_ai',
+        },
+      })
+      const task = parseBody<Task>(taskResponse.body)
+      const initialJobsResponse = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${task.id}`,
+      })
+      const implement = parseBody<Job[]>(initialJobsResponse.body)[0]
+      const successfulResult = {
+        status: 'success' as const,
+        exitCode: 0,
+        changedFiles: ['src/feature.ts'],
+        guardResult: {
+          permissionAllowed: true,
+          fileChangeAllowed: true,
+        },
+      }
+
+      const first = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${implement.id}`,
+        payload: withOutbox(successfulResult, 'event-review-once'),
+      })
+      const resend = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${implement.id}`,
+        payload: withOutbox(successfulResult, 'event-review-once'),
+      })
+
+      expect(first.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(first.body).outbox).toEqual({
+        eventId: 'event-review-once',
+        deduplicated: false,
+      })
+      expect(resend.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(resend.body).outbox).toEqual({
+        eventId: 'event-review-once',
+        deduplicated: true,
+      })
+      const jobsResponse = await app.inject({
+        method: 'GET',
+        url: `/api/jobs?taskId=${task.id}`,
+      })
+      const jobs = parseBody<Job[]>(jobsResponse.body)
+      expect(jobs.filter((job) => job.aiCliMode === 'review')).toHaveLength(1)
+    })
+  })
+
   it.each([
     ['implement failed', { status: 'failed', exitCode: 1, changedFiles: ['src/a.ts'], guardResult: { permissionAllowed: true, fileChangeAllowed: true } }],
     ['changedFiles is empty', { status: 'success', exitCode: 0, changedFiles: [], guardResult: { permissionAllowed: true, fileChangeAllowed: true } }],
@@ -764,6 +931,53 @@ describe('Job API', () => {
         status: 'queued',
       })
       expect(storage.approvalRequests.findByTaskId(task.id)).toEqual([])
+    })
+  })
+
+  it('deduplicates an Outbox resend that creates the git_commit Job after review approval', async () => {
+    await withApp(async (app) => {
+      const { review, task } = await createAutomaticReviewJob(app)
+      const verdict = {
+        status: 'approved' as const,
+        summary: 'All requirements are satisfied.',
+        findings: [],
+      }
+      const payload = {
+        status: 'success' as const,
+        exitCode: 0,
+        changedFiles: ['src/feature.ts'],
+        guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+        reviewResult: verdict,
+      }
+
+      const first = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${review.id}`,
+        payload: withOutbox(payload, 'event-commit-once'),
+      })
+      const resend = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${review.id}`,
+        payload: withOutbox(payload, 'event-commit-once'),
+      })
+
+      expect(first.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(first.body).outbox).toEqual({
+        eventId: 'event-commit-once',
+        deduplicated: false,
+      })
+      expect(resend.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(resend.body).outbox).toEqual({
+        eventId: 'event-commit-once',
+        deduplicated: true,
+      })
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      expect(storage.reviewResults.findByTaskId(task.id)).toHaveLength(1)
+      expect(storage.jobs.findByTaskId(task.id).filter(
+        (job) => job.safeCommand.kind === 'git_commit',
+      )).toHaveLength(1)
     })
   })
 

@@ -28,6 +28,7 @@ import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
 import { sendAlert } from './notifier/notifier.js'
+import * as outboxStore from './outbox/outboxStore.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
@@ -193,16 +194,21 @@ async function persistTerminalUpdate(
   payload: JobUpdate,
   dependencies: JobPersistenceDependencies,
 ): Promise<boolean> {
-  const persisted = await (dependencies.patchJob ?? patchJobWithRetry)(jobId, payload)
-  if (persisted) return true
+  const outboxEvent = outboxStore.recordPending(jobId, payload)
+  const deliveryPayload = {
+    ...payload,
+    eventId: outboxEvent.eventId,
+    payloadHash: outboxEvent.payloadHash,
+  }
+  const persisted = await (dependencies.patchJob ?? patchJobWithRetry)(jobId, deliveryPayload)
+  if (persisted) {
+    outboxStore.deletePending(jobId)
+    return true
+  }
 
-  await reconcileAfterPatchFailure(
-    jobId,
-    {
-      stderr: TECHNICAL_PERSISTENCE_FAILURE,
-      completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
-    },
-    dependencies,
+  console.warn(
+    `[Worker] Job ${jobId} terminal update PATCH failed after retries, but the result is persisted in the local Outbox. ` +
+    'It will be resent before startup recovery on the next Worker start.',
   )
   return false
 }
@@ -316,15 +322,19 @@ async function confirmRunningTransition(
   return false
 }
 
-async function pollJobs(): Promise<never> {
+export async function pollJobs(): Promise<never> {
   while (true) {
     try {
-      const work = await fetchQueuedJob()
-      if (work) {
-        const { job } = work
-        console.log(`[Worker] Job ${job.id} (${job.safeCommand.kind}) を実行します`)
-        const resultStatus = await processQueuedWork(work)
-        if (resultStatus) console.log(`[Worker] Job ${job.id}: ${resultStatus}`)
+      if (outboxStore.hasPending()) {
+        console.warn('[Worker] Pending Outbox events remain; skipping queued Job fetch for this poll cycle.')
+      } else {
+        const work = await fetchQueuedJob()
+        if (work) {
+          const { job } = work
+          console.log(`[Worker] Job ${job.id} (${job.safeCommand.kind}) を実行します`)
+          const resultStatus = await processQueuedWork(work)
+          if (resultStatus) console.log(`[Worker] Job ${job.id}: ${resultStatus}`)
+        }
       }
     } catch (err: unknown) {
       console.error(`[Worker] ポーリングエラー: ${formatUnknownError(err)}`)
@@ -376,7 +386,32 @@ async function recoverJobsAtStartup(): Promise<void> {
   }
 }
 
-async function start(): Promise<void> {
+export async function start(): Promise<void> {
+  let pendingResendFailures = 0
+  let pendingAlertSent = false
+
+  while (outboxStore.hasPending()) {
+    await outboxStore.resendPending((jobId, payload) => patchJobWithRetry(jobId, payload))
+    if (outboxStore.hasPending()) {
+      pendingResendFailures += 1
+      if (pendingResendFailures >= 3 && !pendingAlertSent) {
+        pendingAlertSent = true
+        try {
+          await sendAlert({
+            severity: 'critical',
+            title: 'Worker Outbox resend is blocked',
+            body: 'Pending Worker Outbox events could not be delivered after repeated retry cycles. Startup recovery is intentionally blocked until delivery succeeds.',
+            sourceType: 'job_persistence',
+            sourceId: 'worker_outbox',
+          })
+        } catch (err: unknown) {
+          console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
+        }
+      }
+      await sleep(PATCH_BACKOFF_MS[PATCH_BACKOFF_MS.length - 1])
+    }
+  }
+
   await recoverJobsAtStartup()
   // ウォッチドッグを pollJobs と並行して起動
   void startWatchdog(API_BASE, buildApiAuthHeaders())
