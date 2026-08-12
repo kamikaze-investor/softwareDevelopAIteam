@@ -79,12 +79,12 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 **完了項目:**
 - **Step 0: データモデル整合（完了）**
 - **ロードマップ→Taskレコード自動生成（完了）**
+- **Worker安全境界・結果引き渡し設計**
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
 - 再実行・追加指示UI（Mobile）
 
 **未完了・保留項目:**
-- **Worker安全境界・結果引き渡し設計**（state: in_progress）
 - **Worker永続Outbox・結果受信基盤**（state: planned）
 - **本体DB安全・復旧基盤**（state: planned）
 - **Task→Job自動生成と連続実行**（state: blocked）

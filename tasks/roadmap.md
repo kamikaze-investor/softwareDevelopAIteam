@@ -373,8 +373,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       DB Task同期とMarkdown保存の両方が成功するまでJobを作らない／Markdown保存失敗時はJobを作らない／
       再実行時、履歴のあるTaskの仕様変更は本Stepの実装どおり409で拒否する／
       未着手Taskは冪等に再同期できる
-<!-- roadmap:id=project-auto-worker-trust-boundary state=in_progress -->
-3. [ ] **Worker安全境界・結果引き渡し設計** — 自動連続実行を実装する前に、信頼境界を確定する
+<!-- roadmap:id=project-auto-worker-trust-boundary state=done -->
+3. [x] **Worker安全境界・結果引き渡し設計** — 自動連続実行を実装する前に、信頼境界を確定する
       設計項目（実装を伴わない）。**基本方針**: AI CLI実行プロセスには本体DBファイル・DB認証情報・
       管理APIトークンを渡さない／Workerにも本体DBファイルをマウントせず任意のDB操作を許可しない／
       **本体DBを書き込めるのはAPIだけ**とする／Task状態更新と次Job生成はAPI側の冪等な進行管理で行う／
@@ -444,10 +444,12 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         既存のTask/Job失敗可視化と同じ経路で表面化させる）
       - replay-safeの担保: 既存`CommandKindSchema`（git系／typecheck／test／build／lint）には
         deploy・publish・課金・通知送信等の外部作用コマンドがそもそも存在しない。破棄した
-        worktreeはどこにもmergeされないため副作用は伝播しない。ただし前段で確認済みの
-        「targetスクリプトがWorker全環境を継承する」残存リスク（秘密情報の外部送信）は
-        本項目の破棄・再実行設計だけでは閉じられず、`project-auto-worker-outbox`側の
-        env allowlist化で対処する（再実行によってこのリスクが増幅されることはない）
+        worktreeはどこにもmergeされないため副作用は伝播しない。「targetスクリプトが
+        Worker全環境を継承する」残存リスク（秘密情報の外部送信）は、`project-auto-worker-outbox`
+        側ではなく本項目（`project-auto-worker-trust-boundary`）側で
+        `apps/worker/src/utils/safeEnv.ts`の`buildTargetCommandEnv()`（allowlist方式）として
+        **既に対処済み**（`jobRunner.ts`のSafeCommand実行・`adapter.ts`のpostLintの両方に
+        配線済み、2026-08-01。再実行によってこのリスクが増幅されることはない）
       - **保護対象への最小接続口の再評価**: worktreeの作成・破棄・`base_commit_hash`決定は
         `job.safeCommand.workingDir`を書き換えてから`runJob()`を呼ぶ形にすることで、
         **`jobRunner.ts`は無変更のまま**成立する。protected diffは`index.ts`（起動順序・
@@ -541,8 +543,78 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         では`SCAN_MAX_ENTRIES`到達に近づく可能性があり、キャッシュ化・差分走査等の
         性能改善は将来項目として扱う（新設計のため今回は実装しない）
 
-      **`project-auto-worker-trust-boundary`は保護対象への具体的コード差分承認が
-      完了条件として残るため、doneにはせずin_progressを維持する。**
+      **Task→Job→Worker pickupインターフェース確定（2026-08-12、現HEAD実装から確認。
+      Acceptance Criteria「Task→Job自動生成が依存するインターフェースが確定している」に対応）**:
+      - **TaskからJob生成に必要な入力**: `POST /api/jobs`（`apps/api/src/routes/jobs.ts`）が
+        受け取るのは`taskId`・`projectId`・`agentRole`・`safeCommand`（`workingDir`除く）・
+        任意で`dryRun`/`aiCliProvider`/`aiCliPrompt`/`aiCliMode`のみ（`.strict()`スキーマにより
+        不明フィールドは400で拒否）。`workingDir`はクライアントから受け取らずAPI側で
+        `TARGET_WORKING_DIR`（`apps/api/src/config/targetWorkingDir.ts`）を強制設定する。
+        存在しない`taskId`/`projectId`、archived Projectは拒否する。
+      - **Jobへ固定される実行時情報**: 生成時に`status:'queued'`で確定し、`id`/`createdAt`は
+        ストレージ側が付与する。`safeCommand.workingDir`はサーバー側固定値のみで、
+        クライアント/AIから上書き不可。
+      - **WorkerがJobを取得する境界**: Worker（`apps/worker/src/index.ts`の`fetchQueuedJob()`）は
+        `GET /api/projects`→`GET /api/tasks?projectId=`→`GET /api/jobs?taskId=`をポーリングし、
+        `status==='queued'`の先頭Jobを取得する。対応するTaskから`buildRuntimeTaskPolicy(task)`
+        （`guards/fileChangeGuard.ts`）を**Job実行開始時点**に構築・freezeする。これは
+        「Job作成時にAPI/DBへ保存されたimmutable snapshot」ではなく、Workerが実行を開始する
+        瞬間にTaskを読み直して構築する実行時ポリシーである（`fileChangeGuard.ts`のコメントに
+        明記済み。上記「変更ファイル検出契約」の記述を精緻化するもので、要件自体は変わらない）。
+      - **WorkerがTask/Project DBを直接操作せず既存API/interfaceを通す責務**: Workerは
+        DBファイルを直接開かない。Job結果の書き戻しは常に`PATCH /api/jobs/:id`
+        （`patchJobWithRetry()`、`apps/worker/src/index.ts`）を通す。Task/Project読み取りも
+        常に`GET /api/tasks`・`GET /api/projects`のfetch経由であり、DBファイルパス・DB認証情報は
+        Workerプロセスへ一切渡さない（`utils/apiAuth.ts`の`buildApiAuthHeaders()`が
+        認証ヘッダーの唯一の生成点）。
+      - **将来Outboxが入っても崩さない責務境界**: Outbox導入後も、Job結果の確定的な永続化先が
+        「即時PATCH」から「Outbox→再送」に変わるだけで、(a) WorkerがDBファイルへ直接
+        アクセスしない、(b) Task/Project/Jobの読み書きは常にAPIの定義済みinterfaceを通す、
+        (c) `buildRuntimeTaskPolicy()`によるallowedPaths/forbiddenPaths適用はJob実行開始時点で
+        行う、という3点の責務境界は変更しない。Outbox自体は「WorkerからAPIへの結果引き渡し経路の
+        信頼性強化」であり、Task→Job生成・Worker pickupのインターフェース自体を変更するものではない。
+
+      **Outbox最小接続口 — CEO承認済み（2026-08-12。Acceptance Criteria
+      「Outbox用の最小接続口がCEOに承認されている」に対応。まだOutbox自体は未実装。
+      `project-auto-worker-outbox`着手時の設計拘束として扱う）**:
+      新しいSecurity Gate/Workflow層は作らず、既存のJob結果PATCH経路上に永続キューを
+      1枚差し込む方式のみを承認する。
+      - **対象ファイル**: Worker側ローカル永続キュー（新規、非保護ファイル）＋
+        `apps/worker/src/index.ts`（既存呼び出し箇所の差し替えのみ。保護対象＝AV-001）＋
+        既存`PATCH /api/jobs/:id`への冪等キー追加（既存ファイル拡張、新規route/Gate追加ではない）。
+      - **Worker→API payloadは既存`JobUpdate`を正本とする**: Outbox用に新しい結果payload
+        schemaを広げない。現在`PATCH /api/jobs/:id`へ送っているJobUpdate（`status`/
+        `startedAt`/`completedAt`/`exitCode`/`stdout`/`stderr`/`stdoutPath`/`stderrPath`/
+        `changedFiles`/`commitHash`/`guardResult`/`reviewResult`）をそのままOutbox配送対象の
+        正本とする。Outbox追加分として許可する新規metadataは、冪等性確保に必要な
+        `eventId`・`payloadHash`の最小2項目のみとし、`taskId`等の重複追加は行わない。
+      - **stdout/stderr等のsecret取扱い（2026-08-12現HEAD確認）**: 現HEADには
+        stdout/stderrに対する中央redaction/sanitization処理は**存在しない**
+        （`jobRunner.ts`・`jobLogger.ts`を確認。存在するのはコマンド引数構築時の
+        `commandResolver.ts`の`sanitizeBranchName`/`sanitizeCommitMessage`等であり、
+        これはinjection対策でありsecret redactionではない）。今回この事実を報告するに
+        留め、新しいredaction実装は追加しない。よって**#6の承認条件を
+        「Outboxは既存経路より機密情報露出範囲を拡大しない」までとして確定する**。
+        具体的に以下を明記する:
+        - Outbox導入により新たにraw secretを永続化しない
+        - `API_TOKEN`/provider key等をOutbox payloadへ追加しない
+        - env全体を保存しない
+        - command argumentやcredentialを結果metadataとして追加しない
+        - stdout/stderrは既存JobUpdate経路で現在許可されている内容のみを対象とし、
+          将来中央redactionが必要と判断された場合も、既存Trust Boundaryの
+          sanitization方針を迂回せず、別途CEO承認のもと本項目または関連項目で扱う
+      - **Control/API→Workerへ許可する入力**: `{received, eventId, deduplicated}`の
+        ACKのみ。Job/Task本体は既存`GET /api/jobs`・`GET /api/tasks`から取得済みのため
+        Outbox応答に重複させない。
+      - **明確に禁止**: 本体DBへの直接接続情報／不要なsecret／Provider credential／
+        Cloudflare・GitHub等のcredential／任意SQL／任意のControl Repository
+        filesystem write／Trust Boundaryを迂回する別経路。
+      - **今回混ぜない**: worktree/状態不明Jobの自動retry/OS隔離。roadmap確定方針
+        （L487, 525-526）によりOS隔離完成まで有効化しない。
+
+      **`project-auto-worker-trust-boundary`は、Task→Job→Workerインターフェースの文書化と
+      Outbox最小接続口のCEO承認（いずれも2026-08-12）により全Acceptance Criteriaが
+      満たされたため、doneとする。**
 <!-- roadmap:id=project-auto-worker-outbox state=planned -->
 4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
       **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
