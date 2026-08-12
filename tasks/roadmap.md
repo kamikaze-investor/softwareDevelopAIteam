@@ -934,7 +934,15 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
 - [ ] 失敗時の上位モデル/高工数への自動昇格
 - [ ] CEO予算上限の遵守・無料枠優先・無料枠枯渇時の待機/CEO承認後の有料切り替え
       （既存の`docs/multi_ai_step_review_flow.md` 20〜21章「Quota Policy」はGemini Review限定。
-      Developer AI実行全体への拡張として整理し、後日既存Quota Policyと統合する）
+      Developer AI実行全体への拡張として整理し、後日既存Quota Policyと統合する。
+      **2026-08-12追記（2026-08-12再検討で更新）**: このCost and Model PolicyへData Sensitivity Policy
+      も統合する（下記Model Registry Lite拡張を参照）。判断基準は**モデルの物理hosting locationの特定**
+      ではなく、**Task/Dataの機密度（Data Sensitivity）× ProviderのData Policy（training・retention・
+      明示的な地域制限）の適合可否**とする。Policy不適合の候補（機密度に対して不適合なProvider、または
+      CEOが禁止したregionへの明示opt-inが必要と判明しているmodel）は、budget上余裕があっても自動
+      Routing対象から除外する。Policy不適合モデルの自動Routing禁止は新しい独立Gateを作らず、既存の
+      Routing選択ロジック（現状はTask.provider固定割当、将来はモデルクラス自動選択）が候補モデルを
+      絞り込む際の必須フィルタとして組み込む）
 - [ ] モデル選択判断用の実行ログ整理（使用モデル・推論工数・成功/失敗・Retry回数・トークン量）
 
 **MVP完成後・Phase 1:**
@@ -947,6 +955,83 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
       （provider・model identifier・状態・コスト・コンテキスト上限・対応機能・推奨用途・既知の制約・
       最終確認日時・情報源・実運用実績）。**公式情報と内部実績（Model Usage Telemetry集計）は分離保存**。
       Model Registryの自動インターネット更新は行わない
+
+      **2026-08-12追記（2026-08-12再検討で全面更新）: Data Sensitivity × Provider Data Policyを
+      本レジストリのfieldとして統合する**（独立した「中国モデル監視機能」・新しいSecurity Gateは作らず、
+      既存Model Registry Lite・Static/Dynamic Model Routing・Cost and Model Policyの拡張で実現する。
+      背景: OpenCode Go `deepseek-v4-flash`が、同一model IDのまま最新版で中国ホスト限定・明示的opt-in
+      必須に変更されたことが判明した。ただし多くのProviderは個々のmodelの正確な物理hosting locationを
+      常時公開しておらず、hosting location特定を利用可否の必須条件にすると利用可能モデルを過剰に除外
+      する。**目的はモデルの物理所在地監視ではなく、データ機密度に応じて信頼できるProvider/modelだけを
+      Routingすること**であり、判断基準はhosting locationそのものではなくData Sensitivity × Provider
+      Data Policyの適合可否とする）。
+
+      **Provider-level Policy優先（Acceptance Criteria）**: Data Policyは原則Provider／契約単位で
+      管理し、model固有条件（例: 特定modelだけの地域制限）だけをmodel側へ持たせる。同一Provider配下の
+      多数のmodelでPolicyが共通する場合、modelごとに重複保存・重複確認しない設計とする。
+      - [ ] Provider（または契約）単位で以下を管理できる:
+            - `trainingPolicy`: `no_training` / `opt_out_available` / `may_train` / `unknown`
+            - `retentionPolicy`: `zero_retention` / `limited_retention` / `provider_default` / `unknown`
+            - `providerTrustTier`: 高機密用途で許可されたProviderかを表現できればよい（enum詳細は
+              実装時に決定）
+            - `lastVerifiedAt`（最終確認日時）
+            - `verificationSource`（情報源。**providerのmodels endpointだけを唯一の情報源にしない**。
+              models endpointがこれらの情報を返さない場合があることを2026-08-12のOpenCode Go調査で
+              確認済み）
+      - [ ] model単位では、Provider-level Policyを継承した上で、model固有の例外だけを追加で持てる:
+            - `explicitRegionRestriction`: `none` / `prohibited_region` / `requires_explicit_opt_in` /
+              `unknown`（`unknown`は「情報が単に無い」状態。「禁止regionでの処理が明示されている」
+              状態とは区別する。後者の実例が今回のOpenCode Go `deepseek-v4-flash`）
+            - model固有Policy（`explicitRegionRestriction`等）が存在する場合だけ、そのPolicy自身に
+              `lastVerifiedAt`／`verificationSource`相当のverification metadataを持たせられる
+              （Provider-level Policyのverification metadataとは別物として、model-level側にも
+              必要な場合だけ保持する。全modelへ無意味に複製しない）。目的は、同一model IDのまま
+              region条件が後から変わった場合に、model固有Policy側で個別にstale判定・再確認できる
+              ようにすること
+      - [ ] `hostingRegion`・`hostingStatus`（判明していれば記録できる補助情報）は、利用可否を決める
+            必須条件ではなく**optional metadata**として扱う。hosting locationが単に不明であることを
+            理由に自動利用禁止にはしない
+      - [ ] Provider-level PolicyとModel-level例外の差分（同一model IDのままPolicyが変更された場合を
+            含む）は、`lastVerifiedAt`超過によるstale判定、または再確認時の差分検出のいずれかで検出
+            できる。新しい常時監視プロセスは作らない
+      - [ ] Policy情報の更新は、毎request時の外部問い合わせではなく、**キャッシュされたmetadata +
+            適切なrefresh interval**（利用前のstale確認、または定期バッチのいずれか）で行う
+
+      **Routing/Policy連動（Acceptance Criteria）**:
+      - [ ] CEOが設定したData Sensitivity別Policyと、Model Routingの候補選択が連動し、機密度に対して
+            不適合なProvider/modelは自動Routing候補から除外される
+      - [ ] `explicitRegionRestriction: prohibited_region`または`requires_explicit_opt_in`かつCEO
+            Policyで禁止されているmodelは自動Routing対象外とする。CEOが明示的にPolicyを変更した場合
+            のみ利用可能とする
+      - [ ] Task.provider固定割当・Cheap AI（`cheap_explainer`等の固定role）を含む、**固定model
+            指定の経路にも同じData Sensitivity Policyを適用する**（Dynamic Routing実装前でも、固定
+            割当先のモデルがPolicy不適合にならないことを個別に確認する運用でよい。ただし毎requestごと
+            にLLMや外部APIへPolicy確認を行う設計にはせず、キャッシュされたRegistry metadataを利用し、
+            staleな場合のみ再確認する。新しいGateは作らない）
+      - [ ] 該当Data Sensitivityで利用可能なmodelが0件の場合、機密レベルを自動的に下げない。
+            対象Taskだけを安全側で停止し、他Taskは継続可能とする（Project全体は停止しない）。
+            既存のTask statusで表現できる場合は新しいstatusを追加しない
+      - [ ] Secret（APIキー・パスワード・秘密鍵・access token・credential等）そのものの外部LLMへの
+            非送信は、機密レベルに関係なく既存Worker Trust Boundary側の責務とする。Model Routing側へ
+            重複したSecret Gateを新設しない
+
+      **初期Data Sensitivity別Model Policy（Acceptance Criteria）**:
+      - [ ] **低機密・通常機密**: OpenCode Go等を含め、既存のCost/Quality/Quota Policyに従って
+            Routing可能。ただし明示的な禁止region条件（`explicitRegionRestriction`）や、明確に不適合
+            と判明しているProvider Data Policyが判明している場合は除外する
+      - [ ] **高機密**: 「API入力・出力をmodel trainingへ利用しないことが明示されている」
+            「retention policyが明示されている」「Providerの契約・データ取扱条件を確認できる」を
+            少なくとも確認できるProviderを優先する。初期運用ではOpenAI API / Anthropic APIを優先候補
+            とする
+      - [ ] **最高機密**: 当面はOpenAI API・Anthropic APIのみを許可Providerとする。前提: commercial
+            API契約を使用する／model trainingへ使用しないことがProviderから明示されている／標準の
+            限定的retention（abuse monitoring等）は許容する。将来的にLocal LLM/Self-hosted modelを
+            最高機密用fallback候補として追加検討する余地を残すが、**Local LLMは今回実装しない**
+
+      **CEO向け表示（Acceptance Criteria、既存Model Registry Lite表示への追加として。新規画面は必須で
+      はない）**:
+      - [ ] 「利用可能」「Data Policy不適合のため利用禁止」「確認が必要」の3状態でモデル一覧を確認
+            できる
 
 **MVP完成後・Phase 2またはPhase 3:**
 - [ ] Selective Model Evaluation — モデル選択が微妙で繰り返し発生する価値の高いタスクのみ限定比較
