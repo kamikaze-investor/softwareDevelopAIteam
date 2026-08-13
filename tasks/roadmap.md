@@ -373,8 +373,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       DB Task同期とMarkdown保存の両方が成功するまでJobを作らない／Markdown保存失敗時はJobを作らない／
       再実行時、履歴のあるTaskの仕様変更は本Stepの実装どおり409で拒否する／
       未着手Taskは冪等に再同期できる
-<!-- roadmap:id=project-auto-worker-trust-boundary state=done -->
-3. [x] **Worker安全境界・結果引き渡し設計** — 自動連続実行を実装する前に、信頼境界を確定する
+<!-- roadmap:id=project-auto-worker-trust-boundary state=in_progress -->
+3. [ ] **Worker安全境界・結果引き渡し設計** — 自動連続実行を実装する前に、信頼境界を確定する
       設計項目（実装を伴わない）。**基本方針**: AI CLI実行プロセスには本体DBファイル・DB認証情報・
       管理APIトークンを渡さない／Workerにも本体DBファイルをマウントせず任意のDB操作を許可しない／
       **本体DBを書き込めるのはAPIだけ**とする／Task状態更新と次Job生成はAPI側の冪等な進行管理で行う／
@@ -613,9 +613,136 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       - **今回混ぜない**: worktree/状態不明Jobの自動retry/OS隔離。roadmap確定方針
         （L487, 525-526）によりOS隔離完成まで有効化しない。
 
-      **`project-auto-worker-trust-boundary`は、Task→Job→Workerインターフェースの文書化と
-      Outbox最小接続口のCEO承認（いずれも2026-08-12）により全Acceptance Criteriaが
-      満たされたため、doneとする。**
+      **状態（2026-08-14更新）**: Task→Job→Workerインターフェースの文書化とOutbox最小接続口の
+      CEO承認（いずれも2026-08-12）は完了済み。**ただし新たに以下3点の未完了が確認されたため、
+      本項目は`done`から`in_progress`へ差し戻す**（Outbox関連の完了自体は取り消さない）:
+      (1) AI/CEO GitHub credential未分離、(2) trusted ALLOW evidence不足（Gap A）、
+      (3) GitHub Actions用read-only API credential不足（Gap B）。詳細は以下。
+
+      **GitHub外部強制境界の設計（2026-08-14追記。上記610-611行の「Cloudflare・GitHub等の
+      credential」禁止方針を、Task→Job Full Automation解放条件として具体化するもの。read-only
+      調査に基づく設計確定であり実装はまだ行っていない）**:
+      - **現状のTruth**: AI（Claude Code/Worker）とCEO本人は現在**同一のGitHub admin
+        credential**（CEO個人のgh CLI OAuth token）を使用しており、AI/人間間のGitHub権限境界は
+        存在しない。`master`用Ruleset（既存、force push禁止・branch削除禁止・PR必須・
+        required status checks）は作成済みだが**`enforcement: disabled`**で現在無効
+      - **Approval Check構造（2026-08-14修正。Commit statuses:write方式は第一候補から撤回）**:
+        AI/Worker → branch push → PR → **GitHub Actionsが自動実行** → AIteamOS APIへ
+        read-only問い合わせ → PR HEADのcommit/diffがAIteamOS Approval Gate上で有効に
+        承認済みかを**機械的に判定** → GitHub Actions job success/failure → GitHub Ruleset
+        required check → merge可否、を第一候補とする。**AI判断はGitHub Actions側で行わない**。
+        既存Approval Gateの確定済み状態を機械的に確認するだけの構造とし、Commit Status APIへの
+        書き込み（＝新しいstatus publisher責務）は追加しない。GitHub Actions方式が既存Gate
+        schemaで合理的に成立しないと判明した場合のみ、Commit statuses:write＋trusted
+        publisher方式をfallback候補として再評価する
+      - **判定ロジック（deterministic、新enumは作らない。既存`ApprovalGateStatus`をそのまま使う）**:
+        `packages/shared/src/types/approval_gate.ts`の既存`ApprovalRequest`／
+        `ApprovalGateStatus`（`WAITING_FOR_USER`/`APPROVED`/`REJECTED`/`EXPIRED`/`SUPERSEDED`/
+        `STALE`/`CONSUMED`）をそのまま使う。`APPROVED`・`CONSUMED`（かつcommit/diffHash一致）→
+        PASS。`WAITING_FOR_USER`・`REJECTED`・`EXPIRED`・`SUPERSEDED`・`STALE`・
+        該当レコードなし→FAIL側で扱う。**判定は`taskId`のみでは行わず、target commit SHA
+        （PR HEAD）／target diff hashの一致を必須とする**（caller供給のmutable metadataだけを
+        信頼してPASSしない。該当レコードなしの扱いは下記「確定したGap A」「Gate evaluation
+        bindingの要件」参照）
+      - **Approval bindingの現状確認（read-only調査。2026-08-14実施）**: 既存`ApprovalRequest`
+        （`apps/api/src/routes/approvalGate.ts`）は`taskId`・`targetBranch`・
+        `targetCommit`（`git rev-parse HEAD`）・`targetDiffHash`（diffのSHA-256）へ既に
+        紐づいている。**「CEO承認後にAIが変更内容を変えても古いApprovalを再利用できない」構造は
+        既に実装済みで確認できた**: `targetCommit`/`targetDiffHash`が承認時と一致しない場合、
+        `/gate/check`・`/consume`が自動的に`STALE`へ遷移させる（同ファイル106・483・795行、
+        `updateStatus(..., 'STALE', ...)`）。さらに`diffText`から計算したhashと申告された
+        `targetDiffHash`の不一致も別途拒否される（393行）。**新しいApproval schema・新Systemは
+        不要**、既存の`targetCommit`/`targetDiffHash`をPR HEAD SHAとの一致判定にそのまま
+        再利用できる
+      - **required statusのsource固定（Acceptance Criteria候補）**: Approval Check用の
+        required statusは、同名statusを誰でも発行できる状態にしない。GitHub Rulesetの
+        required_status_checksは発行元App（app_id）を指定して固定できるため、この
+        Actions workflow由来のみを要求する設定を完了条件に含める
+      - **Workflow自体の保護**: Approval Check用GitHub Actions workflow（`.github/workflows/`
+        配下）を通常Workerが書き換えて常時PASSにできてはならない。通常Worker用GitHub Appへ
+        **`Workflows: write`を付与しない**方針を維持する。既存CODEOWNERS（`.github/workflows/`を
+        `@kamikaze-investor`指定済み）・fileChangeGuard等のprotected-file guardと責務が重複するが、
+        タイミング（実行前 vs マージ前）が異なるため両方Keepとし、**新しい専用Guardは追加しない**
+      - **通常Worker用GitHub App 最小権限（第一候補、原則1個）**: Metadata:read・
+        Contents:read/write・Pull requests:read/writeの**3権限のみ**。`Commit statuses:write`・
+        `Checks:write`・`Workflows:write`・`Administration`・`Secrets`・`Actions:write`は
+        いずれも付与しない（Worker自身がApproval結果を書き込む構造にしない）
+      - **Task→Job Full Automation（`project-auto-task-job-chain`）解放前の必須条件**:
+        (1) AIとCEOのGitHub credentialを分離する（AI/Worker用の最小権限GitHub App、原則1個。
+        上記3権限のみ）
+        (2) AI用credentialにはRuleset変更・保護設定変更・Administration権限を与えない
+        (3) master直接push・force push・branch deletionをGitHub側で外部強制拒否する
+        (4) required status checks（Typecheck & Test・Meta Reviewer AI・AIteamOS Approval
+        Check）をGitHub側で外部強制する
+        (5) Approval CheckをWorkerが偽装できない構成にする（Workflows:write不付与＋
+        required statusのsource固定）
+        (6) 通常作業（Low/Medium Risk）はAI自身がbranch作成→commit→push→PR作成→checks→mergeまで
+        completeでき、CEOの通常作業（GitHub上での追加承認クリック等）を増やさない設計とする
+      - **CEO本人のadmin credentialは、AI/Worker実行環境から除去する**。Recovery時は
+        新しいRecovery用GitHub Appを別途作らず、**CEO本人のGitHub accountをhuman-onlyで直接
+        使用する**（Worker実行環境がRecovery/Administration credentialを保持しない設計）
+      - **CODEOWNERS / classic branch protection / Approval Gateの関係（Current Truth）**:
+        CEOの人間承認正本はAIteamOS Approval Gateとする。GitHubは、Approval Gate結果を
+        GitHub Actions機械checkのrequired statusとして外部強制する役割に限定する。CODEOWNERSは
+        protected-path情報の文書化として維持する。GitHub側のcode-owner human review requirementは、
+        AIteamOS Approval Gateとの二重承認にならないよう、**Ruleset側だけでなくclassic branch
+        protection側（`require_code_owner_reviews`）との整合も実装時に整理する**（Ruleset・
+        classic protectionは重ねて適用されるため、片方だけ調整しても不十分になりうる）。
+        **今回はbranch protection設定自体は変更しない**
+      - **GitHub側の最終保証**: master直接push禁止・force push禁止・branch deletion禁止・
+        PR必須・CI（Typecheck & Test）必須・MetaReview必須・**AIteamOS Approval Check必須**・
+        通常AI credentialによるRuleset変更不可・通常AI credentialによるApproval Check
+        workflow改変不可
+      - **AIteamOS側の責務（GitHub Actionsは意味判断を再実装しない）**: Risk分類・
+        Approval必要性判断・CEO Approval・Strategic Alignment・MetaReview意味判断・
+        protected-file実行前判断・DB/Production Safety・Secret Boundary
+      - **GitHubが最終強制できるのは処理手続き（PR経由・checks green・force push/delete不可・
+        AI credentialでの保護設定変更不可・Approval Check機械判定の強制）のみであり、
+        Approval Gateが持つ意味的判断（このdiffに本当に承認が必要か）を代替しない**。
+        `required_approving_review_count=0`のまま運用する場合、Approval Gateの承認結果を
+        正しくActions機械checkへ反映する経路がなければ、Approval Gate側のバグをGitHub側は救えない
+      - **確定したGap A — Low/Medium ALLOW evidence不足（2026-08-14 read-only調査で確定）**:
+        High/Critical等で`ApprovalRequest`が作られる場合は、`targetCommit`/`targetDiffHash`/
+        `status`がAPI/DB側に存在し、変更後は`STALE`になるため、GitHub Actionsから信頼できる
+        機械検証が可能。**一方、Gateが自動ALLOWする変更については、「このcommit/diffに対して
+        Gate評価が実行され、結果がALLOWだった」ことをAPI/DB側で独立して証明できるtrusted
+        persistent recordが現在存在しない**。`Job.guardResult`（`permissionGuard`/
+        `fileChangeGuard`の結果でありApproval Gate結果ではない。かつWorker自己申告値でAPI側の
+        独立再検証がない）は、GitHub外部境界のtrusted evidenceとして**使用しない**
+      - **Gate evaluation bindingの要件（将来の最小解決方針。今回は永続化方式を決め打ちしない）**:
+        Task→Job Full Automation解放前に、GitHub ActionsがPR HEADについて
+        `Gate evaluation exists for this exact change AND (outcome = ALLOW OR valid
+        ApprovalRequest = APPROVED)`を機械的に確認できる状態を必須とする。判定対象は最低限
+        task/job・target branch・target commit SHA・target diff hash・Gate outcomeへ
+        bindingされ、変更後に古いGate結果を再利用できないこと。**永続化方式は実装時に
+        以下の順で評価する（新しいGate DB/Systemを即追加しない）**: 第一候補＝既存Approval
+        Gate永続化構造の自然な拡張／第二候補＝DB Safety B等で導入される既存audit永続化が
+        trusted Gate evidenceとして自然に再利用可能ならそこへ統合／それでも責務が不自然な
+        場合のみ最小のGate evaluation永続化を追加する
+      - **確定したGap B — GitHub Actions API credential不足（2026-08-14 read-only調査で確定）**:
+        現在の`API_TOKEN`はscope分離が存在せず、health check以外の全`/api/*`に対しread/write
+        可能な強いcredentialであることを確認した。**現在の`API_TOKEN`をGitHub Actions Secretへ
+        渡すことは禁止候補とする**。GitHub Approval Checkには、Gate/Approvalのmerge
+        eligibility確認だけが可能な最小read-only認証境界が必要。**認証方式は今回確定しない**。
+        実装時に(1)既存認証方式の最小拡張、(2)Approval Check専用read-only credential、
+        (3)GitHub Actions OIDC等のsecret-less認証、を実装量・Safety・保守性・既存設計との整合で
+        比較し最小で自然な方法を選ぶ（新しい汎用RBAC systemは作らない）
+      - **Workflow Safety（Current Truth）**: Approval Check workflowは原則PR code
+        checkout不要・package install不要・PR script実行不要・PR codeへcredentialを渡さない
+        構造とする（`pull_request`イベントmetadataとAPIへのread-only問い合わせのみで成立する
+        設計）
+      - **将来のPrivate repository化について**: 将来的に本Repositoryをprivateへ変更する予定が
+        ある。private化後もGitHub Actions・Ruleset・required checks・PR外部強制境界は維持する
+        前提とする。必要プランは現時点の調査では**個人Repository + GitHub Proを第一候補**とし、
+        Team限定機能が本当に必要と判明しない限りTeamへは上げない方針候補とする（料金/プラン
+        情報は変わりうるため、実際のprivate化時に再確認するものとし、現時点では確定しない）
+      - **今回のスコープ外**: Secret exposure対策（別項目、上記「VPS常駐運用化」参照）
+      - **現在の人間監督下MVP開発（Meta Review MVP Hardening・DB Safety等）は、この
+        GitHub外部境界が未実装でも継続可能。今回の調査・設計により現在作業を停止しない**
+      - **「Task→Job Full Automation解放前必須」を正本とする**（「MVP後」という表現は
+        Task→Job Full Automationの位置づけと紛らわしいため使用しない）。実装
+        （Ruleset有効化・GitHub App作成・credential分離・Approval status連携）は現時点では
+        未着手
 <!-- roadmap:id=project-auto-worker-outbox state=planned -->
 4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
       **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
@@ -665,6 +792,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 <!-- roadmap:id=project-auto-task-job-chain state=blocked -->
 6. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
       `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。
+      **加えて、GitHub外部強制境界（`project-auto-worker-trust-boundary`参照）が完成するまで、
+      自律的なgit push/mergeを解放しない**（詳細は同項目参照。本項目へ内容を複製しない）。
       ただし**設計調査は継続中**（2026-07-30時点でCodex `gpt-5.6-sol` read-only独立レビュー実施済み）。
       初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
       （手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。無いのは「自動生成」と「自動継続」）。
