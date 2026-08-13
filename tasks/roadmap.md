@@ -450,10 +450,12 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         `apps/worker/src/utils/safeEnv.ts`の`buildTargetCommandEnv()`（allowlist方式）として
         **既に対処済み**（`jobRunner.ts`のSafeCommand実行・`adapter.ts`のpostLintの両方に
         配線済み、2026-08-01。再実行によってこのリスクが増幅されることはない）
-      - **保護対象への最小接続口の再評価**: worktreeの作成・破棄・`base_commit_hash`決定は
-        `job.safeCommand.workingDir`を書き換えてから`runJob()`を呼ぶ形にすることで、
-        **`jobRunner.ts`は無変更のまま**成立する。protected diffは`index.ts`（起動順序・
-        claim・Outbox・worktree準備呼び出し）に集約される
+      - **保護対象への最小接続口（確定版。当初「`jobRunner.ts`は無変更のまま成立する」と
+        見積もったが、下記「変更ファイル検出契約」の欠陥発見によりこの見積もりは誤りと判明した
+        ため訂正）**: worktreeの作成・破棄・`base_commit_hash`決定に伴うprotected diffは
+        `index.ts`（起動順序・claim・Outbox・worktree準備呼び出し）だけでなく、`jobRunner.ts`
+        （変更ファイル検出契約の適用箇所）にも及ぶ。具体的な対象箇所は下記「変更ファイル検出契約」
+        を正とする
       - Worker再起動時の順序: ①Outbox整合性確認（破損・容量確認含む） → ②未送信event再送 →
         ③状態不明attemptの検出・worktree破棄・1回までの自動retry → ④通常pollJobsループ開始。
         現行の`recoverStaleJobs()`（起動時に全Projectのrunning Jobを無条件failed化）はこの
@@ -464,7 +466,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         「救出しない」方針と整合）
 
       **変更ファイル検出契約（2026-07-31確定。Codex `gpt-5.6-sol`独立レビューで発見された
-      既存critical欠陥への対処。上記「保護対象への最小接続口の再評価」の記述を修正する）**:
+      既存critical欠陥への対処）**:
       `getChangedFiles()`が使う`git diff --name-only HEAD`は**untrackedファイルを検出せず**、
       さらに**SafeCommand=`git_commit`の場合は実行後に差分が空になる**ため、正常にコミットされた
       変更ほどGuardを素通りする（実測確認済み: `.env`をcommitさせても
@@ -484,8 +486,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         （現状`adapter.ts:453`・`jobRunner.ts:640`はcatchで`[]`を返しfail-openになっている）
       - Approval Gate・Risk Review・Risk Scan・File Change Guardが**同じ検査済みmanifest**を使う
       - **commit後にbase treeとcommit treeを比較**し、検査済みmanifestと一致しなければ失敗する
-      - **`jobRunner.ts`は無変更では成立しない**（上記「最小接続口の再評価」で
-        「`jobRunner.ts`は無変更のまま成立する」としていた見積もりは、この欠陥の発見により誤りと確定）
+      - **`jobRunner.ts`への変更が必要**（上記「保護対象への最小接続口」参照）
       - **OS隔離（Job単位mount namespace）が完成するまで、状態不明Jobの自動retryは有効化しない**
         （replay-safeは`CommandKind`にdeployが無いことでは保証されない。`test`/`build`/`lint`は
         target管理の`pnpm`スクリプトを実行し、webhook・publish・課金APIを自由に呼べるため。
@@ -843,6 +844,16 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       - **改善案の自動実装は禁止**。`Incident → Cluster → 反復検知 → 原因調査 → 改善案 →
         AI内部レビュー → CEO Proposal → CEO承認 → 通常のAI Team OS Task → 既存開発Workflow`
         という既存経路のみを使う。改善機能専用の別実装ルートは作らない
+
+      **Document Rotとの関係（2026-08-13、Document Architecture Audit実施により追記。新規
+      roadmap項目は追加せず本項目へ統合）**: 既存ログ・既存Review・既存Diagnosis等によって
+      **既に検出された**Document Rot / Doc↔Code Drift（Append-only Rot・Internal
+      Contradiction・Duplicate Truth・Dangling Reference・Orphan Document・Structural
+      Degradation等）は、Incident Candidate / Problem Clusterとして本項目のend-to-end
+      （反復原因分析→改善提案）に接続できる。**本項目がDocument Rotを能動的に検出する責務は
+      持たない**。repository全体の定期Document scan・Orphan Document専用crawler・Document
+      Integrity専用Agent・専用Gate・専用Workflow・常時LLM巡回はいずれも本項目の範囲外であり
+      新設しない。
 
       **MVP完成までに行うこと**: roadmap登録（本項目）のみ。既存ログ（Job実行履歴・Review結果・
       Approval Gate記録・Watchdog・failure/retry/blocked記録等）を、後から分析可能な状態で

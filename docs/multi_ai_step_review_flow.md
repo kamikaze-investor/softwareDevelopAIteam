@@ -181,13 +181,13 @@ Step R2までで型・生成関数を用意したFinal Review Packetに続き、
 
 **Review Transport Mode（20章）との関係:** 20章は「初期推奨: handoff」としているが、これは主にAPI未接続のChatGPTを想定した推奨である。Gemini Flashは既に`geminiRouter.ts`経由でAPI運用されている実績があり、低コスト（Flashモデル・quota検出済み）のため、**Gemini Flash Stepレビューは初期から`api`モードでよい**。ChatGPTは引き続き`handoff`初期推奨のまま変更しない。AIごとにTransport Modeが異なってよいことを20章に補足する必要がある（次回のドキュメント更新候補。今回はここに設計メモとして記録するに留める）。
 
-**呼び出しタイミング（11-1章のReview Levelと連動）:**
+**呼び出しタイミング（12章のReview Levelと連動）:**
 - Level 0: 呼ばない
-- Level 1: 呼ばない（原則Gemini不要。11-1章の「Level 1 → Level 2への繰り上げ条件」に該当する場合のみLevel 2として扱いStepレビューを呼ぶ。Gemini Flashは人間向け報告のReport Translationにのみ関与）
+- Level 1: 呼ばない（原則Gemini不要。12章の「Level 1 → Level 2への繰り上げ条件」に該当する場合のみLevel 2として扱いStepレビューを呼ぶ。Gemini Flashは人間向け報告のReport Translationにのみ関与）
 - Level 2: 4章のStep単位実装フローの通り、**Mechanical Safety Checks通過後・次Step着手前**に呼ぶ
 - Level 3: Gemini Risk Review・Alignment Reviewが優先されるため、Stepレビューは補助的に使う程度に留める
 
-**渡す情報量（11-1章「プロンプト前提量最適化」に従う）:** 今回のStepのdiff要約・目的（purposeSummary相当）・直前のMechanical Safety Checks結果の要約のみを渡す。過去Stepの全文・経緯・関係ない背景は渡さない。既存`ReviewerRequest`（`planText`/`diffText`/`purposeSummary`/`targetFiles`）の構造を参考にしつつ、Gemini Flash Stepレビュー専用の軽量な入力型として別に定義する（`blocked`概念を持たない）。
+**渡す情報量（12章「プロンプト前提量最適化」に従う）:** 今回のStepのdiff要約・目的（purposeSummary相当）・直前のMechanical Safety Checks結果の要約のみを渡す。過去Stepの全文・経緯・関係ない背景は渡さない。既存`ReviewerRequest`（`planText`/`diffText`/`purposeSummary`/`targetFiles`）の構造を参考にしつつ、Gemini Flash Stepレビュー専用の軽量な入力型として別に定義する（`blocked`概念を持たない）。
 
 **Final Review Packetへの格納:** `FinalReviewPacket`の`GeminiReviewKind`に`step_review`を追加済み（Step R3実装、コミット641243b）。`pre_review`/`post_review`（既存Gemini Reviewer、blocked概念あり）とは区別されている。
 
@@ -290,7 +290,7 @@ preReviewerの接続設計:
 
 Sonnetは「提案」はできるが、「承認」はできない。
 
-## 8. ChatGPT 最終判断レビュー
+## 7. ChatGPT 最終判断レビュー
 
 **役割定義（Review Orchestration / Decision Routing層）:** ChatGPT最終判断レビューは「コードレビュー」ではない。役割は**コミット前の判断整理・次工程設計・CEO承認要否判定**である。コードの正しさそのものはSafety Gate層（typecheck/test/Mechanical Safety Checks）とGemini Flash Stepレビューが既に確認済みという前提のもと、ChatGPTはFinal Review Packet（低コスト圧縮資料）を読んで「このまま進めてよいか」「CEO承認が必要か」「次に何をすべきか」を判断する、意思決定支援の役割に限定される。
 
@@ -298,7 +298,7 @@ Sonnetは「提案」はできるが、「承認」はできない。
 
 生ログ全文ではなくFinal Review Packetを基本とする（APIコスト抑制・判断対象の明確化・重要な懸念の埋没防止・レビュー品質の安定化）。
 
-## 9. Final Review Packet
+## 8. Final Review Packet
 
 **役割定義（Review Orchestration / Decision Routing層）:** Final Review Packetは、**既存のレビュー結果・安全確認・報告を1つにまとめる「受け皿」**であり、新しい判断者ではない。ChatGPTに全ログ・全diffを渡さずに低コストかつ的確に最終判断させるための圧縮資料であると同時に、Gemini Flash（Report Translation）で非エンジニア向けに翻訳する際の元データにもなる、共通フォーマットである。
 
@@ -306,7 +306,7 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 
 **設計方針:**
 - 結論を先頭に出し、技術ログをそのまま貼らない（非エンジニアが読んで判断できる形式）
-- Review Level（0〜3）は11-1章の実行ルーティングをそのまま転記する。Packet内で新たにLow/Medium/High判定をやり直さない（11章のリスク分類との重複を避ける）
+- Review Level（0〜3）は12章の実行ルーティングをそのまま転記する。Packet内で新たにLow/Medium/High判定をやり直さない（10章のリスク分類との重複を避ける）
 - Level 3相当の場合は「Human / CEO確認が必要」であることを結論部分に明記する
 - Geminiレビュー結果は用途別（Risk Review / Alignment Review / Meta Review / preReview・postReview）に分けて記載し、未実施の場合は理由を書く（実施していないことを隠さない）
 
@@ -324,7 +324,7 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 ## 2. なぜ必要だったか
 ## 3. どこまで変えたか
 ## 4. 変えていない重要部分
-## 5. Review Level（0〜3。11-1章のルーティングをそのまま転記）
+## 5. Review Level（0〜3。12章のルーティングをそのまま転記）
 ## 6. 安全面チェック
   - DB変更 / 認証・権限変更 / セキュリティ変更 / 外部サービス追加 / 課金影響 /
     本番環境影響 / package.json・lockfile変更 / 破壊的変更（各項目: 有無と概要）
@@ -341,7 +341,7 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 
 **旧形式（Task Goal/Scope/Step Summary/Changed Files/Mechanical Safety Results/Gemini Escalation Items/...）との関係:** 上記15項目は旧形式の情報を包含しつつ、結論先出し・非エンジニア可読性・Review Levelとの整合を追加したもの。旧形式を別途維持する必要はない。
 
-## 10. ChatGPTへ生ログを渡す条件
+## 9. ChatGPTへ生ログを渡す条件
 
 通常はFinal Review Packetのみ。以下の場合は該当ログ抜粋を添付:
 ```
@@ -359,9 +359,9 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 
 危険度が高い場合: Final Review Packet + 関連ログ抜粋 + CEO承認
 
-## 11. リスク分類
+## 10. リスク分類
 
-**このリスク分類は「危険度」を表す軸であり、実行主体やレビュー経路を決める軸（11-1章のReview Level）とは別物である。11章＝何がどれだけ危ないか、11-1章＝それをどう振り分けて実行するか、という役割分担で読むこと。**
+**このリスク分類は「危険度」を表す軸であり、実行主体やレビュー経路を決める軸（12章のReview Level）とは別物である。10章＝何がどれだけ危ないか、12章＝それをどう振り分けて実行するか、という役割分担で読むこと。**
 
 **2つの適用範囲（重複ではなく対象範囲の違い）:**
 - **target_project（jobRunner経由のJob）向けの判定**: `apps/worker/src/approvalLevel/targetProjectRiskScan.ts`が実際に検出する`RiskScanSeverity`（`'high' | 'medium' | 'low'`）が、この章のHigh/Medium/Lowにそのまま対応する。ここで新しい判定基準を作らない。AV-001・jobRunner/commitGate/safetyVerification自体の変更は、Step6-B0の結論（jobRunner経由のJobは常にtarget_project scope）によりtarget_projectのdiffには含まれ得ないため、target_project向けの判定には含まれない。
@@ -373,13 +373,13 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 | **Medium** | 複数ファイル変更・軽微なAPI追加・既存ロジック変更・テスト修正を伴う変更・Risk Scan medium・影響範囲が限定的だが判断が必要（AI役割分担・レビュー方針に関わるdocs変更もここに含む） | Gemini Flashでmedium判定。必要ならSonnet修正。コミット前にChatGPTレビュー。CEOへ事後報告でも可 |
 | **High** | AV-001変更・認証変更・DBスキーマ変更・外部公開endpoint・worker/jobRunner変更・commitGate変更・safetyVerification変更・自動停止条件・CEO通知条件・package.json/lockfile変更・secretや.envに関係する変更・リポジトリ外操作・Goal/Design Philosophyに関わるdocs変更 | Geminiがlowと言ってもChatGPTへエスカレーション。原則CEO承認必須。コミット直前だけでなく実装前レビューも必要 |
 
-## 10-1. 人間向け報告フォーマット（Report Translation）
+## 11. 人間向け報告フォーマット（Report Translation）
 
-**報告・説明の責務分離（前提）:** Claude自身が書く報告（本章の「通常報告5項目」・9章のFinal Review Packetいずれも含む）は、**非エンジニア向け説明ではなく、後続のChatGPT/Gemini/Claude自身がレビュー・判断に使える正確な作業報告**として書く。変更ファイル・変更内容・検証結果・未解決点・リスク・コミット対象外ファイルを明記し、1つの報告で「人間向け説明」と「AIレビュー向け技術報告」を無理に兼ねない。CEOが直接読む場合でも、Claudeは平易さより正確さ・レビューしやすさを優先する。Claudeへの作業指示（Claudeに何をさせるか）も同様に、技術的に正確・短め・レビューしやすい形式とする。
+**報告・説明の責務分離（前提）:** Claude自身が書く報告（本章の「通常報告5項目」・8章のFinal Review Packetいずれも含む）は、**非エンジニア向け説明ではなく、後続のChatGPT/Gemini/Claude自身がレビュー・判断に使える正確な作業報告**として書く。変更ファイル・変更内容・検証結果・未解決点・リスク・コミット対象外ファイルを明記し、1つの報告で「人間向け説明」と「AIレビュー向け技術報告」を無理に兼ねない。CEOが直接読む場合でも、Claudeは平易さより正確さ・レビューしやすさを優先する。Claudeへの作業指示（Claudeに何をさせるか）も同様に、技術的に正確・短め・レビューしやすい形式とする。
 
-人間への非エンジニア向け説明・翻訳は、**Final Review Packet（9章）またはClaudeの報告を、ChatGPT（人間向け整理。重要判断・コミット前判断時）またはGemini Flash（Report Translation。軽量な翻訳が必要な場合）が非エンジニア向けに翻訳したもの**とする。人間向け報告専用の別テンプレートは作らない（9章のPacketと重複する新しい項目一覧を持たない）。ただし、ChatGPT・Gemini Flashは翻訳・整理係であり最終判断者ではない。コミット可否・設計判断・Goal/Design Philosophyに関わる判断・DB/認証/権限/外部サービス/本番影響の判断・warning/uncertain/blockedが出たケースは、翻訳側で完結させず、ChatGPTまたはHuman/CEOの判断に委ねる。
+人間への非エンジニア向け説明・翻訳は、**Final Review Packet（8章）またはClaudeの報告を、ChatGPT（人間向け整理。重要判断・コミット前判断時）またはGemini Flash（Report Translation。軽量な翻訳が必要な場合）が非エンジニア向けに翻訳したもの**とする。人間向け報告専用の別テンプレートは作らない（8章のPacketと重複する新しい項目一覧を持たない）。ただし、ChatGPT・Gemini Flashは翻訳・整理係であり最終判断者ではない。コミット可否・設計判断・Goal/Design Philosophyに関わる判断・DB/認証/権限/外部サービス/本番影響の判断・warning/uncertain/blockedが出たケースは、翻訳側で完結させず、ChatGPTまたはHuman/CEOの判断に委ねる。
 
-**2段階構成（通常時は軽量・必要時だけ詳細）:** 毎回15項目すべてを長く書くと、正常系でもCEOが読む負担・トークン消費が大きい。そのため報告は「通常報告（5項目）」を基本とし、下記の詳細化条件に該当する場合のみFinal Review Packet（9章）に沿って詳細化する。
+**2段階構成（通常時は軽量・必要時だけ詳細）:** 毎回15項目すべてを長く書くと、正常系でもCEOが読む負担・トークン消費が大きい。そのため報告は「通常報告（5項目）」を基本とし、下記の詳細化条件に該当する場合のみFinal Review Packet（8章）に沿って詳細化する。
 
 **通常報告（5項目・基本形）:**
 ```
@@ -391,7 +391,7 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 5. 次の最小アクション（何もしなくてよい / コミットする / 次のStepに進む / 人間判断が必要、など具体的に）
 ```
 
-**詳細化する条件（いずれか該当する場合、9章のFinal Review Packet形式に寄せて詳細化する）:**
+**詳細化する条件（いずれか該当する場合、8章のFinal Review Packet形式に寄せて詳細化する）:**
 ```
 - コード変更あり
 - コミット前判断
@@ -408,13 +408,13 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 
 **Review Notes（判断レビューAI向け補足。CEO向け本文とは分ける）:** ChatGPT/Gemini/Claudeのレビュー判断に役立つが、CEO判断には不要な情報がある場合のみ、本文の末尾に短い`Review Notes`として付記する。CEO判断や方針判断に役立たない技術ログ・長い経緯・重複説明はここにも書かない（Review Notesは「レビューAI向けの短い補足」であり、省略した技術詳細の避難場所ではない）。
 
-**Final Review Packetとの関係（廃止しない）:** Final Review Packet（9章）は詳細報告時の形式として維持する。通常報告（5項目）は「Packetの結論ブロックを含む軽量版」、詳細報告は「Packet全体（1〜15項目）」という位置づけであり、新しい別機構ではない。Report Translationも、通常時は5項目に圧縮するが、リスクや判断が必要な情報（詳細化条件に該当する部分）は削らない。
+**Final Review Packetとの関係（廃止しない）:** Final Review Packet（8章）は詳細報告時の形式として維持する。通常報告（5項目）は「Packetの結論ブロックを含む軽量版」、詳細報告は「Packet全体（1〜15項目）」という位置づけであり、新しい別機構ではない。Report Translationも、通常時は5項目に圧縮するが、リスクや判断が必要な情報（詳細化条件に該当する部分）は削らない。
 
-## 11-1. Review Level（実行主体ルーティング）
+## 12. Review Level（実行主体ルーティング）
 
-11章のリスク分類（Low/Medium/High）に、実行主体（Codex/Claude）と関与するAIレビューの組み合わせを対応付けたものが以下のReview Levelである。**11章の分類を置き換える新しい機構ではなく、実行主体をどう振り分けるかの運用ルール**として位置づける。
+10章のリスク分類（Low/Medium/High）に、実行主体（Codex/Claude）と関与するAIレビューの組み合わせを対応付けたものが以下のReview Levelである。**10章の分類を置き換える新しい機構ではなく、実行主体をどう振り分けるかの運用ルール**として位置づける。
 
-**`ApprovalLevel`（`packages/shared`）との違い（数値が同じ0〜3のため混同注意）:** `ApprovalLevel`は`determineApprovalLevel()`が出力するcontrol repo基準のMechanical Gate分類器の値であり、Step6-B0の結論により「jobRunner経由のJobは常にtarget_project scopeであり、control repo基準のパターンはほぼ一致しない」ことが判明している。本章のReview Levelは、11章のリスク分類（target_projectはRisk Scan severity、control repoは影響範囲による例示）から導く独立した実行ルーティングであり、`ApprovalLevel`の値をそのまま使うものではない。
+**`ApprovalLevel`（`packages/shared`）との違い（数値が同じ0〜3のため混同注意）:** `ApprovalLevel`は`determineApprovalLevel()`が出力するcontrol repo基準のMechanical Gate分類器の値であり、Step6-B0の結論により「jobRunner経由のJobは常にtarget_project scopeであり、control repo基準のパターンはほぼ一致しない」ことが判明している。本章のReview Levelは、10章のリスク分類（target_projectはRisk Scan severity、control repoは影響範囲による例示）から導く独立した実行ルーティングであり、`ApprovalLevel`の値をそのまま使うものではない。
 
 ### プロンプト前提量最適化（Codexへの作業指示作成時）
 
@@ -456,7 +456,7 @@ ClaudeがCodexへ作業指示を書く前に、内部で以下を自問する（
 
 **Codex/Claudeの振り分け基準:** Codexは既存実装に沿った小さな変更・軽微修正・テスト修正・型エラー修正・ドキュメント更新を担当する（Level 0-1が基本、Level 2でも定型的な修正はCodexが担当してよい）。DB・認証・権限・外部サービス・課金・本番環境・package変更・破壊的変更・設計判断が必要な変更（Level 2の一部〜Level 3）はClaudeが担当し、Codexは自己判断で進めずClaudeへ上げる。
 
-## 12. エスカレーションルール
+## 13. エスカレーションルール
 
 Gemini Flashの判定に関係なくChatGPTへエスカレーション:
 ```
@@ -483,7 +483,7 @@ CEO承認必須:
 - リポジトリ外操作
 ```
 
-## 13. コスト最適化方針
+## 14. コスト最適化方針
 
 ```
 各Step:      Gemini Flashで軽量レビュー
@@ -491,7 +491,7 @@ CEO承認必須:
 高リスク:    必要に応じて実装前からChatGPT/Opusレビュー
 ```
 
-## 14. 推奨運用
+## 15. 推奨運用
 
 ```
 Claude Sonnet: Step実装
@@ -505,7 +505,7 @@ CEO: 必要な場合のみ承認
 Commit: 承認後に実行
 ```
 
-## 15. 実装初期段階の制約
+## 16. 実装初期段階の制約
 
 ```
 - Gemini Flashは提案のみ
@@ -517,7 +517,7 @@ Commit: 承認後に実行
 - low riskでも機械チェックNGなら止める
 ```
 
-## 16. 将来拡張
+## 17. 将来拡張
 
 ```
 - Gemini Flashレビューの自動API化
@@ -534,7 +534,7 @@ Commit: 承認後に実行
 - 過去判断の検索
 ```
 
-## 17. 重要な禁止事項
+## 18. 重要な禁止事項
 
 ```
 - Claude Sonnetが自分の実装を最終承認すること
@@ -546,7 +546,7 @@ Commit: 承認後に実行
 - コミット直前レビューなしでコミットすること
 ```
 
-## 18. 最終まとめ
+## 19. 最終まとめ
 
 ```
 Sonnetが細かくStep実装
@@ -570,7 +570,7 @@ ChatGPTがコミット前レビュー
 
 ---
 
-## 19. 既存実装との関係（AIチームOSへの組み込み時の前提）
+## 20. 既存実装との関係（AIチームOSへの組み込み時の前提）
 
 このMulti-AI Step Review Flowは、AIチームOSに既に部分実装されている既存コンポーネントを土台としつつ、**Review Orchestration / Decision Routing層を新規に整備するもの**である。2-1章で定義した層分離に沿って、既存実装との関係を2つの表に分けて整理する。
 
@@ -600,7 +600,7 @@ ChatGPTがコミット前レビュー
 
 **重要な整理:** 既存の`ReviewPolicy`はcontrol repo基準の分類器（`determineApprovalLevel()`）の出力であり、Step6-B0の結論により「jobRunner経由のJobは基本的にtarget_project」であることが判明している。一方、本仕様書のLow/Medium/High分類は「変更内容の性質」に基づく分類であり、`targetProjectRiskScanResult.highestSeverity`の方が親和性が高い。**したがって、本仕様書のリスク分類は`ReviewPolicy`ではなく`targetProjectRiskScanResult.highestSeverity`をベースに再設計するのが自然。**
 
-## 20. Review Transport Mode（レビュー伝送モード）
+## 21. Review Transport Mode（レビュー伝送モード）
 
 外部AI（Gemini Flash / ChatGPT）へレビュー用ペイロードをどう届けるかを定義する。2モード構成（当初のmanual/assisted/apiの3モード案から、manualとassistedを統合し2モードに簡素化した最終仕様）。
 
@@ -612,7 +612,7 @@ ChatGPTがコミット前レビュー
 **初期推奨:** `handoff`
 **将来拡張:** `api`
 
-## 21. Quota Policy（クォータポリシー）
+## 22. Quota Policy（クォータポリシー）
 
 無料枠のAPI利用上限に達した場合の挙動を定義する。
 

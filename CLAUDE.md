@@ -103,7 +103,8 @@ AIはこのリポジトリ（ai-team-backend）のコアロジックを改変し
 ### Context Packルール
 - Developer AIはProject Memoryを直接読まない
 - Context Pack経由でのみ情報を参照する
-- Context Packは `docs/context/` に生成する
+- Context Packは `POST /api/context-pack`（`apps/api/src/routes/contextPack.ts`）のレスポンスとして
+  返される（ファイルとして `docs/context/` へ保存する実装ではない）
 
 ---
 

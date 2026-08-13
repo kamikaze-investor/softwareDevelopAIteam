@@ -377,5 +377,5 @@ BLOCKED [claude_code → codex task-xxx] 何が必要か (YYYY-MM-DD)
 | 009 | 実ファイル変更は mode=implement + approved=true + mockRun=false の三点揃いのみ | 1つでも欠けたら 403 |
 | 010 | git push / PR approve / merge / branch protection / workflows / CODEOWNERS は自動実行禁止 | SafeCommand allowlist で除外 |
 | 011 | mock 実行を完了扱いにしない | status='mock' では task_graph を [x] にしない |
-| 012 | 呼び出しごとにログ保存（taskId/cliPath/workdir/promptPath/changedFiles/exitCode/stdout/stderr） | `docs/codex_invocation_log/` に保存 |
+| 012 | 呼び出しごとにログ保存（taskId/cliPath/workdir/promptPath/changedFiles/exitCode/stdout/stderr） | 未実装（`docs/codex_invocation_log/` への保存は設計のみで実装コードなし） |
 | 013 | guards/workflows/CODEOWNERS/security 関連ファイルの変更は Red Zone — 人間承認必須 | FileChangeGuard で検出 → blocked |

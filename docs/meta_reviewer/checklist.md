@@ -83,7 +83,8 @@
 
 ### Context First
 - [ ] Developer AIがProject Memoryを直接読む実装になっていない
-- [ ] Context Packが `docs/context/` に保存される設計が維持されている
+- [ ] Context Packが `POST /api/context-pack` のレスポンスとして返される設計が維持されている
+      （ファイル保存ではなくAPIレスポンスが正）
 
 ### Rollback重視
 - [ ] `RollbackInfo.rollbackArgv` がshell文字列でなくargvになっている

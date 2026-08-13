@@ -219,7 +219,9 @@ interface CodexInvocationLog {
 }
 ```
 
-保存先: `docs/codex_invocation_log/YYYY-MM-DD_<taskId>.json`  
+保存先（未実装。設計のみで、これを実装するコードは現時点で存在しない）:
+`docs/codex_invocation_log/YYYY-MM-DD_<taskId>.json`
+
 保存タイミング: Codex プロセス終了後（成功・失敗問わず）
 
 ---

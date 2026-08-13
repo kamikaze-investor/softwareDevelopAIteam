@@ -425,43 +425,14 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 ## 7. テストカバレッジ
 
-### 実行結果（2026-07-28）: **api 336 件・worker 511 件（合計847件）パス** ✅
+### 現在値（2026-08-13、`pnpm --filter @ai-team/{api,worker,shared} test` を実行して確認）
 
-（shared/mobileはtestスクリプトなし・typecheckのみ実施。typecheckはshared/api/worker/mobile全て通過。内訳の詳細は下記は2026-07-02時点のスナップショットのまま）
+**リポジトリ全体（test スクリプトを持つ全パッケージ）: 1473 件パス** ✅
+- api: 540 件・35 ファイル
+- worker: 886 件・45 ファイル
+- shared: 47 件・2 ファイル
 
-### 実行結果（2026-07-02）: 全 798 件パス ✅
-
-（2026-07-01時点の566件から、AI Approval Level v2（Step1〜6-B0）・Target Project Risk Scan v1・代表Health Endpoint追加により798件に増加。内訳の詳細は下記は2026-07-01時点のスナップショットのまま）
-
-### 実行結果（2026-07-01時点スナップショット）: 全 566 件パス
-
-**API（apps/api）: 281 件・22 ファイル**
-
-主なテストファイル（抜粋）:
-
-| テストファイル | 内容 |
-|---|---|
-| `src/routes/approvalGate.test.ts` | Approval Gate フロー全体（281件中の主要部分） |
-| `src/routes/knowledgeGraph.test.ts` | KG・health-score |
-| `src/storage/sqlite.test.ts` | SQLite CRUD |
-| `src/ctoAi/*.test.ts` | CTO AI 各機能 |
-| `src/auth/apiToken.test.ts` | API 認証 |
-
-**Worker（apps/worker）: 285 件・18 ファイル**
-
-| テストファイル | テスト数 | 内容 |
-|---|---|---|
-| `src/metaReviewer/runner.test.ts` | 3 | Meta Review JSON パース |
-| `src/metaReviewer/geminiRouter.test.ts` | 9 | API/CLI フォールバック |
-| `src/watchdog/stallDetector.test.ts` | 6 | 停滞検出・CommandKind 別閾値 |
-| `src/jobStateManager.test.ts` | 11 | ジョブ状態遷移ルール |
-| `src/guards/gateProcessor.test.ts` | 11 | audit + alignment 統合判定 |
-| `src/guards/alignmentChecker.test.ts` | 7 | Gemini 連携・JSON パース |
-| `src/guards/safetyAuditor.test.ts` | 15 | diff 解析・危険キーワード |
-| `src/guards/permissionGuard.test.ts` | 13 | 静的ポリシー + Grant 検証 |
-| `src/jobRunner.test.ts` | — | ジョブ実行・ブロック・CEO 通知（Step 3D）・AI CLI 分岐（task-022, +5件） |
-| `src/aiCli/adapter.test.ts` | 14 | セキュリティチェック・フォールバック |
-| `src/aiCli/codexPathResolver.test.ts` | 12 | パス解決・Windows 対応 |
+（`apps/mobile` は test スクリプトを持たず typecheck のみのため、この件数に含めない。過去の実行結果スナップショット（847件・798件・566件など。いずれもapi+workerのみの集計だった）は現在値と乖離するため削除し、テスト件数の推移が必要な場合は各コミットのCI実行履歴を参照する）
 
 **テストがないファイル（未カバー領域）:**
 - `apps/mobile/` 全体（UI）
