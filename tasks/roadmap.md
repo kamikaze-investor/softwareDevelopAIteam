@@ -778,6 +778,93 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       running Jobを無条件failedにするため、Workerの2重起動は互いの実行中Jobを破壊する
       （`jobStateManager.ts:31-66`）。またWorkerのqueued Job取得と`running`更新が別リクエストのため
       atomicにclaimできない。MVPは単一Worker前提を維持する
+<!-- roadmap:id=project-auto-incident-pattern-improvement state=planned -->
+4. [ ] **ヒヤリハット・反復非効率検知 — Incident Pattern Improvement Loop**（2026-08-13仕様反映。
+      `AIteamOS ヒヤリハット・反復非効率検知機能 仕様設計`に基づく）— 新しい独立Incident Management
+      System / Quality Management System / Lesson Systemを作るものではない。既存の
+      `Telemetry → Team Health → Self Diagnosis → Improvement Planner → CEO Proposal →
+      Experiment / Evolution`（本ファイル944-1030行、`specs/13_future_system_architecture.md`
+      5b章）を再利用し、「AI Team OS内部で反復するヒヤリハット・非効率・無駄行動を自動検出し、
+      原因分析と改善提案まで行う」という具体的end-to-endユースケースを完成させるための統合
+      milestone。新しい実装基盤を意味する項目ではない。**MVP完成までは実装しない**（roadmap登録の
+      み）。DB Safety / Meta Review Hardening / Worker Outbox / Task→Job automationの実装順序を
+      この項目のために変更しない。
+
+      **責務分担（既存Service Extensionへの分散統合方針）**:
+      - **Telemetry**: Incident Candidate（`incident_id`/`timestamp`/`project_id`/`task_id`/
+        `job_id`/`actor_type`・`actor_id`/`department`/`workflow`/`process_stage`/
+        `incident_category`/`trigger`/`action_taken`/`result`/`estimated_impact`/
+        `reversibility`/`blast_radius`/`evidence_strength`/`wasted_time`/`wasted_ai_cost`/
+        `retry_count`）に必要な最低限の事実を記録可能にする。既存ログ（Job実行履歴・Review結果・
+        Approval Gate・Watchdog・failure/retry/blocked記録）を最大限再利用し、不足分だけ最小
+        event記録を追加する。Secret・Prompt全文は無条件保存しない
+      - **Team Health**: actor（Claude Code/Codex/ChatGPT/Reviewer AI/Worker/Scheduler/Planner/
+        特定Workflow/特定Department/System Rule/Human/CEO/External Service/Unknown）・
+        department・workflow別のIncident反復傾向を可視化する。実行量補正指標
+        （Incident/100 Jobs等）を併用し、**件数だけで部署・actorを悪いと判定しない**
+      - **Self Diagnosis**: 意味的に類似したIncidentをProblem Clusterへ集約する（完全一致では
+        ない）。Repeat Level（0:単発／1:類似確認／2:反復可能性高／3:構造的問題／
+        4:改善後も再発）を判定し、Level 3以上を改善候補とする。重大Incident
+        （データ消失・セキュリティ事故・本番破壊・復旧困難・高額コスト・CEO承認領域の無断変更）は
+        **反復を待たず即時分析対象とする**。Direct/Root/System/Actor/Environment Causeへ分解し、
+        **外部障害（VPS/API障害・rate limit等）をAIの失敗として誤分類しない**、
+        **Context供給不足等のSystem CauseをActor責任と誤認しない**
+      - **Improvement Planner**: 反復Problem Clusterから改善候補を生成する。優先順位は
+        既存機能の改善→既存Rule変更→既存Prompt改善→既存Workflow改善→既存レビュー改善→
+        **新規機能追加は最後の手段**。CEOへ出す前に内部セルフレビュー（本当に必要か／偶発事象
+        でないか／既に対策済みでないか／既存機能で対応できないか／重複にならないか／改善コストが
+        利益を上回らないか／別の非効率を生まないか／安全性を過剰に高め速度を落とさないかを自問）を
+        通過したものだけ候補とする。**過剰安全策・過剰レビュー自体もIncident候補として扱う**
+      - **CEO Proposal**: 個別Incidentの一覧ではなく改善提案単位で提出する。**通常は週1〜2件**
+        （CEOレビューが新たなボトルネックにならないようにする）。ただしCritical
+        （データ消失リスク・セキュリティ重大問題・復旧困難・大規模障害・大きな金銭損失・
+        改善後の重大事故再発・AI Team OS自身の制御不能につながる問題）は**件数制限なしで即時
+        提出可能**。CEO Actionは`Approve` / `Reject` / `Deep Dive` / `Modify` / `Defer`とし、
+        既存Approval Gate/CEO Proposal経路をそのまま使う。新しい承認経路は作らない
+      - **Experiment / Evolution**: 改善実装後の再発率を追跡する
+        （`improvement_id`/`implemented_at`/`expected_effect`を紐付け、`Resolved`/`Improved`/
+        `No Effect`/`Worse`/`Insufficient Evidence`で判定）。**改善後も再発した場合はRepeat
+        Level 4へ引き上げる**。根本方針（Goal/Design Philosophy/Constitution等）の変更が
+        必要な場合は既存のCEO Approval経路をそのまま使う
+
+      **重要な設計条件（Acceptance Criteriaとして必ず維持）**:
+      - 単発偶発Incidentでは原則Improvement Proposalを作らない（記録のみ）
+      - 重大Incidentは反復を待たず即時分析対象とする
+      - 同一actor / department / workflowでの反復を、全体件数比較より重視する
+      - 部署間の単純件数ランキングを改善対象選定の主判定にしない
+      - 外部障害をAIの失敗として扱わない
+      - Context不足等のSystem CauseをActor責任と誤認しない
+      - 改善案は新規機能追加より既存機能改善を優先する
+      - 過剰安全策・過剰レビュー自体もIncident候補として扱う
+      - この機能自身が大量token・大量LLMレビューを消費しない（全Jobへの追加LLMレビュー・
+        全Taskの常時LLM再分析は行わない。既存ログ・既存レビュー結果の再利用を基本とする）
+      - CEOへの通常Improvement Proposalは週1〜2件、Criticalのみ件数制限なし
+      - 改善実装後の再発を追跡する
+      - **改善案の自動実装は禁止**。`Incident → Cluster → 反復検知 → 原因調査 → 改善案 →
+        AI内部レビュー → CEO Proposal → CEO承認 → 通常のAI Team OS Task → 既存開発Workflow`
+        という既存経路のみを使う。改善機能専用の別実装ルートは作らない
+
+      **MVP完成までに行うこと**: roadmap登録（本項目）のみ。既存ログ（Job実行履歴・Review結果・
+      Approval Gate記録・Watchdog・failure/retry/blocked記録等）を、後から分析可能な状態で
+      失わずに保存し続けていることの確認のみ行い、新規実装は行わない
+
+      **MVP完成後・初期実装（最小構成）**: 既存ログからのIncident Candidate抽出／類似Incident
+      clustering／Repeat検知／重大Incidentの即時昇格／上位1〜2件だけの原因分析／Improvement
+      Proposal生成／CEOへ週1〜2件提出。これ以上の巨大な品質管理システムを最初から構築しない
+
+      **後段階（必要性が実証されてから追加。最初から実装しない）**: 高度なActorランキング、
+      Incident専用の大規模DB、Incident専用Agent群、Incident専用Workflow engine、Incident専用
+      Approval Gate、全Jobへの追加LLMレビュー、常時LLM分析、自動改善実装、Review/Prompt自己進化、
+      高度な効果測定Dashboard
+
+      **成功指標（実装時の参考。件数発見量では測定しない）**: 同一Problem Clusterの再発率低下／
+      無駄なJob・retry減少／手戻り減少／AI作業時間削減／CEOへの不要な確認減少／重大Incident再発率
+      低下／改善による新たな複雑性を増やしていないこと
+
+      **完了条件**: Incident Candidate抽出→Problem Cluster集約→Repeat Level判定→上位候補の原因
+      分析→Improvement Proposal生成→CEO週次提出、のend-to-endが最小構成で機能すること。既存
+      Telemetry/Team Health/Self Diagnosis/Improvement Planner/CEO Proposal/Experiment/
+      Evolutionの責務定義（本ファイル944-1030行）と重複する独立実装を作っていないこと
 
 ### スマホ操作MVP残タスク（2026-07-21整理）
 
@@ -944,7 +1031,9 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 - [ ] Extension Registry正式化・Service Extension Interface定義（Telemetry/Notification/Knowledge等の抽象化）
 - [ ] Development TeamのTeam Extension化（現状はClaude Code/Codex/Geminiが`apps/worker`に直接組み込まれた
       単一構成。将来的にTeam概念として抽象化するかは要検討）
-- [ ] Team Health（Team単位の状態可視化。現状のProject単位health-scoreとは別軸）
+- [ ] Team Health（Team単位の状態可視化。現状のProject単位health-scoreとは別軸。actor・
+      department・workflow別のIncident反復傾向可視化を含む。件数だけで悪い部署と判定しない。
+      詳細: `project-auto-incident-pattern-improvement`）
 - [ ] Self Diagnosis Framework（観測のみ・変更なし。Token-Efficient Intelligence Policy準拠必須）
 - [ ] Improvement Planner（改善提案作成のみ・本番反映なし）
 - [ ] Problem-Driven Research（外部調査。具体的課題がある場合のみ開始）
@@ -1008,10 +1097,16 @@ Knowledge Consult・Investigate・Distill・Loop Metrics）、`specs/20_token_ef
 
 - [ ] Self Diagnosis Frameworkの責務定義に基づく実装（Current State / Objective / Goal Gap /
       Trajectory Gap / Degradation / Opportunity / Bottleneck / Riskを観測し改善対象候補を検出する。
-      **悪化検知だけに限定しない**。既存Investigateをこの検出機能へ肥大化させない。仕様: 5b-8）
+      **悪化検知だけに限定しない**。既存Investigateをこの検出機能へ肥大化させない。仕様: 5b-8。
+      反復するヒヤリハット・非効率行動のProblem Cluster化・Repeat Level判定・原因分析
+      （Root/System/Actor/Environment Cause分離、外部障害の誤分類禁止）を含む。
+      詳細: `project-auto-incident-pattern-improvement`）
 - [ ] Improvement Plannerの責務定義に基づく実装（Expected Outcome Impact / Strategic Importance /
       Probability of Success / Urgency / Implementation Cost / Time to Learn / Riskで優先順位付け。
-      下位KPI改善が上位KPIを犠牲にしないことを条件とする。原因分析は既存Investigateを再利用。仕様: 5b-9）
+      下位KPI改善が上位KPIを犠牲にしないことを条件とする。原因分析は既存Investigateを再利用。仕様: 5b-9。
+      反復Problem Clusterからの改善候補生成（既存機能改善を最優先、新規機能追加は最後）・
+      週1〜2件のCEO Proposal提出（Critical時のみ件数制限なし）を含む。
+      詳細: `project-auto-incident-pattern-improvement`）
 - [ ] Knowledge Lifecycle State（External Claim / Observation / Hypothesis / Evidence /
       Validated Knowledge / Operationalized Knowledge / Revalidation）と属性
       （`applicable_conditions` / `confidence` / `causal_confidence` / Internal・External区別）。

@@ -95,6 +95,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
 - **複数Worker対応**（state: deferred）
+- **ヒヤリハット・反復非効率検知（state: planned）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 - 追加開発指示（追加Task作成）画面（Mobile）（state: planned）
 
