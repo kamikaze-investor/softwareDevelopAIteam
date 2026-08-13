@@ -1019,6 +1019,43 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 - [ ] ヘルスチェック（`docs/vps_app_runtime_standard.md`準拠の`/api/health`。API側実装済み・Worker側未確認）
 - [ ] ログ保存（VPS上での永続化・ローテーション方針）
 - [ ] 再起動耐性（プロセスマネージャ導入・クラッシュ時自動再起動・OS再起動後の自動起動）
+- [ ] **正式Production起動方式の確定**（2026-08-14、Incident `inc-20260814-1d8`確認により追記）。
+      **現在のTruth**: Productionは正式常駐方式として`tsx watch`（dev-mode）は使用しない
+      （git pull時の意図しないauto-reloadを避けるため）。現状は暫定対応として、API/Workerとも
+      watch無しの`tsx src/index.ts`直接実行で常駐している。**`build`（`tsc`）の成功は
+      `Production runnable`の判定に使わない**: `apps/api`/`apps/worker`自体はbuildできても、
+      workspace依存先`@ai-team/shared`が`package.json`の`main`/`types`を`./src/index.ts`のまま
+      ビルド出力を持たないため、plain `node dist/index.js`は現状**成立しない**
+      （`ERR_MODULE_NOT_FOUND`で起動不能）。正式Production起動方式は、API/Worker単体だけでなく
+      workspace依存関係を含めた実起動確認をもって確定する（`packages/shared`側のbuild追加を
+      含め、正式Production packaging時にこのgapを解消する）。旧processを停止する前に、
+      新しい起動方式は可能な限りsafe/isolatedな環境で先に実起動確認しておく。
+      crash時自動復旧・OS再起動後自動起動・process supervisionは上記「再起動耐性」の
+      既存未解決事項のまま維持する
+- [ ] **Secret output exposureの構造的再発防止**（2026-08-14、Security Critical寄り重大Incident由来。
+      `project-auto-incident-pattern-improvement`の「重大Incidentは反復を待たず即時分析対象とする」
+      方針に従い、反復発生を待たずMVP後早期の改善候補へ即時昇格）。
+      **発生した事象**: Secret存在確認作業中に値を含むgrepコマンドを使用し、`OPENCODE_GO_API_KEY`の
+      実値がツール出力へ露出した。「Secret値を出力禁止」という既存Prompt/Rule上の注意が存在した
+      にもかかわらず発生したため、**注意喚起の追記だけでは不十分というEvidence**として扱う。
+      **原因候補（優先度順に検討。今回は原因分解のみで対策実装はしない）**:
+      1. 既存command/helper/toolの安全化（値を返さないSecret存在確認手段の標準化）
+      2. 既存Secret handling ruleの実行方法改善（ルールの記述ではなく実行経路側の改善）
+      3. output redaction等の既存Safety mechanism改善（stdout/stderr中央redactionの要否は
+         `project-auto-worker-trust-boundary`で既出（未実装・見送り済み）だが、対象はJob実行時の
+         AI CLI出力であり、今回のような人間/AIの手動ops作業時のtool出力は別スコープ）
+      4. Secret確認用の安全な標準手順の整備
+      5. 上記で不十分な場合のみ新機構検討（新しいSecurity Gate/Reviewerを今回の1件だけを理由に
+         即追加しない）
+      **Acceptance Criteria候補（MVP後早期に対策実装する際の完了条件）**:
+      - Secretの存在確認で値が出力されない
+      - env確認で値が出力されない
+      - process env確認で値が出力されない
+      - 誤って一般的なcommandを使用した場合のblast radiusを可能な限り小さくする
+      - Secretを必要とする正常運用を過剰に阻害しない
+      - AI作業全体へ過剰なreview/token負荷を追加しない
+      - 実際のSecretを使わないE2Eで再発防止を確認する
+      **今回は対策実装しない**。新規roadmap itemも追加せず、本項目（VPS常駐運用化）へ統合する
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
