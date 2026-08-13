@@ -643,7 +643,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **stale recovery（状態不明判定・worktree破棄・自動retry）はOutbox整合性確認より後に
       実行しない**（起動順序: Outbox整合性確認→未送信event再送→状態不明attempt処理→
       通常pollJobs）ことを、この項目の実装がそのまま満たす設計とする。
-<!-- roadmap:id=project-auto-db-safety state=planned -->
+<!-- roadmap:id=project-auto-db-safety state=in_progress -->
 5. [ ] **本体DB安全・復旧基盤** — 依存: `project-auto-worker-trust-boundary`。
       `project-auto-worker-outbox`とは**並行実装可能**。
       本体DBを書き込める主体をAPIへ限定する／任意SQLを受け付けない／重要状態変更の監査ログ／
@@ -651,6 +651,17 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       通常フローから分離する／migration・一括削除の管理権限を分離する。
       **完了条件**: バックアップが自動作成される／世代管理が機能する／復元テストが成功している／
       重要な状態変更を追跡できる／AI・Workerが本体DBを直接削除できない
+
+      **DB Safety A: production運用確認完了（2026-08-13確定）**: production fail-closed
+      （`NODE_ENV=production`時の`DB_PATH`未設定・`:memory:`・ファイル不在での起動拒否）・
+      WAL-safe backup（Online Backup API・`PRAGMA journal_mode=DELETE`によるWAL/SHM分離）・
+      `PRAGMA integrity_check`+コアテーブル検証・世代ローテーション・isolated restore test・
+      systemd user timer（6時間毎）・`loginctl enable-linger`まで実装・実測済み。**2026-08-13
+      18:00 JST・2026-08-14 00:00 JSTの2回連続で、手動トリガーなしの完全無人自然発火→
+      バックアップ作成→systemd journalでの成功ログ確認まで実測済み**（`journalctl --user -u
+      ai-team-db-backup.service`で確認）。
+      **DB Safety B（残課題。本項目を`in_progress`のまま維持する理由）**: 重要状態変更の監査ログ・
+      migration/一括削除の管理権限分離は未着手。これらが完了するまで本項目は`done`にしない
 <!-- roadmap:id=project-auto-task-job-chain state=blocked -->
 6. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
       `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。

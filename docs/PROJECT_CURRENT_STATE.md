@@ -86,7 +86,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 
 **未完了・保留項目:**
 - **Worker永続Outbox・結果受信基盤**（state: planned）
-- **本体DB安全・復旧基盤**（state: planned）
+- **本体DB安全・復旧基盤**（state: in_progress）
 - **Task→Job自動生成と連続実行**（state: blocked）
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。（state: planned）
