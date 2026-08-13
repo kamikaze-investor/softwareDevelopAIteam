@@ -706,6 +706,53 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       （LINE/Slack）・`summaryEngine.ts`・Approval Gateの再利用を前提とし、新しい停止Gateは作らない。
       **完了条件**: Phase完了時にCEOへ通知が届き、開発が止まらないこと。CEOが修正指示を返す経路は
       「追加開発指示（追加Task作成）」を使う
+<!-- roadmap:id=project-auto-meta-review-hardening state=in_progress -->
+10. [ ] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
+      foundation実装完了）— 既存Meta Reviewer（`docs/meta_reviewer/`prompt/checklist、
+      `apps/worker/src/metaReviewer/runner.ts`・`geminiRouter.ts`、AV-001保護）の改善。新しい
+      Review基盤・新Agent種類・新Workflow engineは作らない。目的: 局所的には合理的な設計・実装が
+      Goal / Design Philosophy / Constitution / CEO Decision / Roadmap目的と矛盾したまま実装
+      されることを、実装前に検出して止める。
+
+      **完了済みAcceptance Criteria（foundation実装、AV-001対象ファイルは無変更）**:
+      - deterministic Review Load分類（`reviewLoadClassifier.ts`。Risk Levelとは独立、
+        diff行数に非依存の固定ルール）
+      - Risk Levelとの分離（コード上参照なし。独立モジュールとして実装・確認済み）
+      - Focus selection（`focusSelector.ts`。既存7 checklistへのmapping、新checklist追加なし）
+      - Strategic Alignment Review（Goal→Design Philosophy→Constitution→関連Decision→
+        関連Roadmap item→Task→設計、の優先順位でcontext構築。Repository全文投入なし）
+      - System-level Integration Review（Focused Review結果の矛盾・全体最適破壊を確認。
+        diff本文の再レビューはしない）
+      - ALIGNED / CONFLICT / UNCERTAIN判定（`strategicReview.ts`の`resolveFinalDecision()`）
+      - REVIEW_UNAVAILABLE fail-closed（Gemini失敗・パース失敗・context欠如・checklist欠如の
+        いずれでも`ALIGNED`にならないことをコード・テスト双方で確認済み）
+      - design-review CLI（`apps/worker/scripts/designReview.ts`、
+        `pnpm --filter @ai-team/worker design-review`で起動可能。実装前の設計テキストに対して
+        動作する独立ツール。2026-08-13、実LLMによるE2Eで意図通りCONFLICT検出を確認済み）
+      - 既存7 checklist再利用（新規checklistなし）
+      - tests（`apps/worker`: 45 files / 886 tests、既存test regressionなし）
+
+      **未完了Acceptance Criteria（3件。この3件が揃うまでdoneにしない）**:
+      1. **Strategic Alignment Reviewの実装前自動発火**: 現状`design-review` CLIは手動起動のみで、
+         Task/Job作成フローへの自動接続がない。`project-auto-task-job-chain`
+         （Task→Job自動生成）が未着手のため、自動接続に必要な「Job作成前フック」相当の
+         最小interfaceが現行リポジトリに存在しない。Task→Job full automationは、この項目の
+         残Acceptance Criteriaが揃う前に有効化しない（依存関係として明記。ただし
+         Task→Job full automation自体は本項目の範囲外であり今回実装しない）
+      2. **Critical Independent Reviewの実実行接続**: `independentReviewRequired`フラグは
+         CRITICAL時に立つが、実際に別プロバイダへ独立レビューを発注する接続コードは無い
+         （現状は既存の運用上のCodex独立レビュー手続き前提）。新しいReviewer Agent・
+         Provider Router・Workflow engineは作らず、既存のIndependent Review経路（Codex CLI
+         独立レビュー等）へ自然に接続できるpre-implementation interfaceがTask→Job側で
+         用意された時点で接続する。**Critical Independent Review execution wiring = pending**
+      3. **Production相当E2E**: 実productionワークフロー（Task作成→design-review→
+         実装→Job実行）を通した一連のE2Eはまだ実施していない。2026-08-13時点で確認したのは
+         design-review CLI単体の実LLM E2E（1シナリオ）のみ
+
+      **完了条件**: 上記未完了3件が満たされ、Review Load分類・Strategic Alignment・
+      Integration Review・fail-closedが実運用（PR自動レビューまたはTask/Job自動生成フロー）で
+      実証されること。既存の統合Meta Review（LOW時）・既存Implementation Meta Review
+      （`autoReview.ts`）の挙動を壊さないこと
 
 **将来項目（Step 2系の完了後に個別判断。今回は着手しない）**
 

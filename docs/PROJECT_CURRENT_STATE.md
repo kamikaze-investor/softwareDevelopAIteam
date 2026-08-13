@@ -91,6 +91,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
+- **Meta Review MVP Hardening（state: in_progress）
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
 - **複数Worker対応**（state: deferred）

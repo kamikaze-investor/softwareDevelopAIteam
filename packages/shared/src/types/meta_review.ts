@@ -93,3 +93,54 @@ export const META_REVIEW_BLOCKED_TRIGGERS = [
   'TARGET_ROOT 以外への write mount 追加',
   'Control Repository の編集権限を AI に付与',
 ] as const
+
+/** Review Load: cognitive load required for review. Independent from Risk Level. */
+export type ReviewLoad = 'low' | 'medium' | 'high' | 'critical'
+
+/** Candidate focus areas for Focused Review. */
+export type MetaReviewFocus =
+  | 'strategic_alignment'
+  | 'safety_recovery'
+  | 'architecture_responsibility'
+  | 'data_state_integrity'
+  | 'auth_permission'
+  | 'operations'
+  | 'product_ceo_experience'
+  | 'scope_simplicity'
+
+/** Final decision for Strategic Alignment / Integration Review. */
+export type StrategicDecision = 'ALIGNED' | 'CONFLICT' | 'UNCERTAIN'
+
+export interface ReviewLoadClassification {
+  reviewLoad: ReviewLoad
+  reasons: string[]
+}
+
+export interface FocusedReviewResult {
+  focus: MetaReviewFocus
+  decision: StrategicDecision
+  summary: string
+  findings: MetaReviewFinding[]
+}
+
+export interface IntegrationReviewResult {
+  decision: StrategicDecision
+  summary: string
+  conflictingFocuses?: MetaReviewFocus[]
+  unresolvedAssumptions?: string[]
+}
+
+/** REVIEW_UNAVAILABLE means a required review could not complete and must not be treated as ALIGNED. */
+export interface StrategicMetaReviewResult {
+  taskId: string
+  reviewLoad: ReviewLoad
+  reviewLoadReasons: string[]
+  selectedFocuses: MetaReviewFocus[]
+  strategicAlignmentResult?: FocusedReviewResult
+  focusedReviewResults: FocusedReviewResult[]
+  integrationReviewResult?: IntegrationReviewResult
+  finalDecision: StrategicDecision | 'REVIEW_UNAVAILABLE'
+  independentReviewRequired: boolean
+  requiresCeoApproval: boolean
+  createdAt: string
+}
