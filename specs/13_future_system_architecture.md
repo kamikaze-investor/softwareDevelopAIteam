@@ -481,6 +481,12 @@ Experimentを開始する**」ことであり、External Knowledgeの収集・�
 **安全性:** 本ループはいかなる理由があっても既存のApproval Gate / Policy Engine / Constitutionを
 迂回しない。High Riskの実験はCEO承認を必須とする。改善予算・同時実験数・停止条件・Rollbackを設ける。
 
+**関連Lesson Candidate:** 「遭遇した問題を放置して本線を継続してよいか」の障害トリアージ的判断
+（credible worst caseに基づくRED/YELLOW/GREENの仮ラベル）は、`docs/project_memory/decisions/
+007_opencode_go_investigation_lesson_candidate.md`（Risk-weighted Progress）に具体例として記録
+されている。本章の設計内容を変更するものではなく、将来のInvestigate/Self Diagnosisの実装検討時に
+参照するEvidenceの一つとして位置づける。
+
 ---
 
 # 6. 既存ドキュメントとの関係（要整理・将来統合検討）
