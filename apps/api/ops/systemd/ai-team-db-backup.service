@@ -1,0 +1,10 @@
+[Unit]
+Description=AI Team production SQLite backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/absolute/path/to/ai-development-team-os/apps/api
+Environment=NODE_ENV=production
+Environment=DB_PATH=/absolute/path/to/production/ai-team.db
+Environment=DB_BACKUP_DIR=/absolute/path/to/backup-directory
+ExecStart=/usr/bin/env pnpm exec tsx scripts/dbBackup.ts

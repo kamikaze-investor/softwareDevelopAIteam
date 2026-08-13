@@ -1,0 +1,10 @@
+[Unit]
+Description=Run AI Team production SQLite backup every six hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+Persistent=true
+Unit=ai-team-db-backup.service
+
+[Install]
+WantedBy=timers.target
