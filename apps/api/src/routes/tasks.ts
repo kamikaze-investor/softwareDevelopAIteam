@@ -77,7 +77,7 @@ function isTaskFailureJob(job: Job): job is TaskFailureJob {
   return job.status === 'failed' || job.status === 'blocked'
 }
 
-function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string {
+export function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string {
   return `[Task] ${task.title}
 ${task.description}
 
@@ -263,6 +263,12 @@ export async function taskRoutes(
     })
 
     if (!resumed.ok) {
+      if (resumed.code === 'DESIGN_REVIEW_PRECONDITION_FAILED') {
+        return reply.status(409).send({
+          error: 'Implement Job requires an aligned pre-implementation Design Review',
+          reason: resumed.reason,
+        })
+      }
       return reply.status(400).send({ error: resumed.reason })
     }
 

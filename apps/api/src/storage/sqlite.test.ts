@@ -8,6 +8,7 @@ import { CREATE_TABLES } from './schema'
 import { validateRoadmapTasks } from './roadmapTaskValidation'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './interface'
 import type { JobStatus, Task } from '@ai-team/shared'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 
 type ApprovalCreateInput = Parameters<IStorage['approvals']['create']>[0] & { projectId: string }
 type TaskCreateInput = Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & {
@@ -1428,6 +1429,100 @@ describe('SQLiteStorage', () => {
       expect(expired?.status).toBe('EXPIRED')
       // NULL のまま保持
       expect(expired?.reviewedAt).toBeUndefined()
+    })
+  })
+
+  describe('designReviewEvidence', () => {
+    it('creates the table in a new database', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-design-review-evidence-${randomUUID()}.db`)
+      createSQLiteStorage(dbPath)
+      const db = new Database(dbPath, { readonly: true })
+
+      try {
+        const columns = new Set(
+          (db.pragma('table_info(design_review_evidence)') as Array<{ name: string }>)
+            .map((column) => column.name),
+        )
+
+        expect(columns.has('task_id')).toBe(true)
+        expect(columns.has('design_text_hash')).toBe(true)
+        expect(columns.has('independent_review_verdict')).toBe(true)
+      } finally {
+        db.close()
+      }
+    })
+
+    it('creates and finds Design Review evidence by Task', () => {
+      const project = storage.projects.create({
+        name: 'Design evidence project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const task = storage.tasks.create({
+        projectId: project.id,
+        title: 'Design evidence task',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+      const designText = 'Design: use the existing storage repository pattern.'
+
+      const created = storage.designReviewEvidence.create({
+        taskId: task.id,
+        designTextHash: computeDesignTextHash(designText),
+        reviewLoad: 'critical',
+        decision: 'ALIGNED',
+        independentReviewRequired: true,
+        independentReviewVerdict: 'approved',
+      })
+
+      expect(storage.designReviewEvidence.findById(created.id)).toMatchObject({
+        taskId: task.id,
+        designTextHash: computeDesignTextHash(designText),
+        reviewLoad: 'critical',
+        decision: 'ALIGNED',
+        independentReviewRequired: true,
+        independentReviewVerdict: 'approved',
+      })
+      expect(storage.designReviewEvidence.findByTaskId(task.id)).toHaveLength(1)
+      expect(storage.designReviewEvidence.findLatestByTaskId(task.id)?.id).toBe(created.id)
+    })
+
+    it('returns the latest Design Review evidence for a Task', async () => {
+      const project = storage.projects.create({
+        name: 'Latest design evidence project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const task = storage.tasks.create({
+        projectId: project.id,
+        title: 'Latest design evidence task',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+
+      storage.designReviewEvidence.create({
+        taskId: task.id,
+        designTextHash: computeDesignTextHash('Design: first version.'),
+        reviewLoad: 'medium',
+        decision: 'CONFLICT',
+        independentReviewRequired: false,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const latest = storage.designReviewEvidence.create({
+        taskId: task.id,
+        designTextHash: computeDesignTextHash('Design: second version.'),
+        reviewLoad: 'medium',
+        decision: 'ALIGNED',
+        independentReviewRequired: false,
+      })
+
+      expect(storage.designReviewEvidence.findLatestByTaskId(task.id)?.id).toBe(latest.id)
     })
   })
 })

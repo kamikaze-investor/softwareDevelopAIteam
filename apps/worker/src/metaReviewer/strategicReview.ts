@@ -3,6 +3,7 @@ import { basename, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type {
   FocusedReviewResult,
+  IndependentReviewOutcome,
   IntegrationReviewResult,
   MetaFindingCategory,
   MetaReviewFinding,
@@ -21,6 +22,15 @@ import {
   parseMetaReviewResult,
 } from './runner.js'
 import { callGeminiWithFallback } from './geminiRouter.js'
+import { createReviewerAdapter } from '../approvalLevel/reviewerAdapter.js'
+
+/**
+ * Reviewer used for the CRITICAL-only Independent Review.
+ * Deliberately different from the Gemini-based primary Focused/Integration review
+ * (different provider, different model — see reviewerAdapter.ts's CODEX_REVIEWER_MODEL),
+ * so it is a genuinely independent second opinion, not a re-run of the same call.
+ */
+const INDEPENDENT_REVIEWER_PROVIDER = 'codex'
 
 export interface StrategicReviewInput {
   taskId: string
@@ -141,9 +151,15 @@ export async function runStrategicMetaReview(
     reviewUnavailable = integrationOutcome.unavailable
   }
 
-  const finalDecision = reviewUnavailable
+  let finalDecision: StrategicDecision | 'REVIEW_UNAVAILABLE' = reviewUnavailable
     ? 'REVIEW_UNAVAILABLE'
     : resolveFinalDecision(focusedReviewResults, integrationReviewResult)
+
+  let independentReviewResult: IndependentReviewOutcome | undefined
+  if (classification.reviewLoad === 'critical' && finalDecision !== 'REVIEW_UNAVAILABLE') {
+    independentReviewResult = await runIndependentReview(input)
+    finalDecision = applyIndependentReviewOverride(finalDecision, independentReviewResult)
+  }
 
   return buildStrategicResult({
     taskId: input.taskId,
@@ -151,8 +167,68 @@ export async function runStrategicMetaReview(
     selectedFocuses,
     focusedReviewResults,
     integrationReviewResult,
+    independentReviewResult,
     finalDecision,
   })
+}
+
+/**
+ * CRITICAL-only Independent Review. Uses a provider/model genuinely separate from the
+ * primary Gemini-based Focused/Integration review, called fresh against the same
+ * design/diff material (never fed the primary review's prompt or output).
+ */
+export async function runIndependentReview(
+  input: StrategicReviewInput,
+): Promise<IndependentReviewOutcome> {
+  const adapter = createReviewerAdapter(INDEPENDENT_REVIEWER_PROVIDER)
+  const materialKind = input.materialKind ?? 'diff'
+
+  try {
+    const result = await adapter.review({
+      jobId: input.taskId,
+      taskId: input.taskId,
+      implementerProvider: 'claude_code',
+      reviewerProvider: INDEPENDENT_REVIEWER_PROVIDER,
+      phase: materialKind === 'design' ? 'pre' : 'post',
+      planText: materialKind === 'design' ? input.gitDiff : undefined,
+      diffText: materialKind === 'design' ? undefined : input.gitDiff,
+      purposeSummary: input.taskTitle,
+      targetFiles: input.changedFiles,
+    })
+
+    return {
+      provider: result.provider,
+      verdict: result.verdict === 'blocking' ? 'blocking' : result.verdict,
+      summary: result.summary,
+      unavailable: result.confidence === 0 && result.verdict === 'blocking' && result.issues.length === 0,
+    }
+  } catch (err) {
+    return {
+      provider: INDEPENDENT_REVIEWER_PROVIDER,
+      verdict: 'blocking',
+      summary: `Independent review failed: ${formatError(err)}`,
+      unavailable: true,
+    }
+  }
+}
+
+export function applyIndependentReviewOverride(
+  baseDecision: StrategicDecision | 'REVIEW_UNAVAILABLE',
+  outcome: IndependentReviewOutcome,
+): StrategicDecision | 'REVIEW_UNAVAILABLE' {
+  if (outcome.unavailable) {
+    return 'REVIEW_UNAVAILABLE'
+  }
+
+  if (outcome.verdict === 'blocking') {
+    return 'CONFLICT'
+  }
+
+  if (outcome.verdict === 'changes_requested' && baseDecision === 'ALIGNED') {
+    return 'UNCERTAIN'
+  }
+
+  return baseDecision
 }
 
 export function mapMetaReviewStatusToStrategicDecision(status: 'approved' | 'changes_requested' | 'blocked'): StrategicDecision {
@@ -690,6 +766,7 @@ function buildStrategicResult(input: {
   selectedFocuses: MetaReviewFocus[]
   focusedReviewResults: FocusedReviewResult[]
   integrationReviewResult?: IntegrationReviewResult
+  independentReviewResult?: IndependentReviewOutcome
   finalDecision: StrategicDecision | 'REVIEW_UNAVAILABLE'
   requiresCeoApprovalOverride?: boolean
 }): StrategicMetaReviewResult {
@@ -708,6 +785,7 @@ function buildStrategicResult(input: {
     strategicAlignmentResult,
     focusedReviewResults: input.focusedReviewResults,
     integrationReviewResult: input.integrationReviewResult,
+    independentReviewResult: input.independentReviewResult,
     finalDecision: input.finalDecision,
     independentReviewRequired,
     requiresCeoApproval,

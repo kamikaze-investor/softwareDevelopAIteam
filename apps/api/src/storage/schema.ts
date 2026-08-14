@@ -134,6 +134,18 @@ export const CREATE_TABLES = `
     reviewed_at TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS design_review_evidence (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    design_text_hash TEXT NOT NULL,
+    review_load TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    independent_review_required INTEGER NOT NULL DEFAULT 0,
+    independent_review_verdict TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+  );
+
   CREATE TABLE IF NOT EXISTS watchdog_events (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
@@ -292,4 +304,5 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_approval_id ON jobs(approval_id) WHERE approval_id IS NOT NULL',
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_workflow_step_key ON jobs(workflow_step_key) WHERE workflow_step_key IS NOT NULL',
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_review_results_job_id ON review_results(job_id)',
+  'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at ON design_review_evidence(task_id, created_at DESC)',
 ]

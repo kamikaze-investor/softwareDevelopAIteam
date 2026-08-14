@@ -7,7 +7,8 @@ import type {
 import Fastify, { type FastifyInstance } from 'fastify'
 import { describe, expect, it } from 'vitest'
 import type { IStorage } from '../storage/interface'
-import type { TaskRouteOptions } from '../routes/tasks'
+import { buildResumeAiCliPrompt, type TaskRouteOptions } from '../routes/tasks'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 
 const validAnalysisJson = JSON.stringify({
   aiAnalysis: {
@@ -192,10 +193,18 @@ describe('Task failure explanation routes', () => {
       expect(taskResponse.statusCode).toBe(200)
       expect(taskResponse.json<Task>()).toEqual(before)
 
+      const instruction = 'Retry after reviewing the failure.'
+      storage.designReviewEvidence.create({
+        taskId: task.id,
+        designTextHash: computeDesignTextHash(buildResumeAiCliPrompt(task, instruction)),
+        reviewLoad: 'medium',
+        decision: 'ALIGNED',
+        independentReviewRequired: false,
+      })
       const resumeResponse = await app.inject({
         method: 'POST',
         url: `/api/tasks/${task.id}/resume`,
-        payload: { instruction: 'Retry after reviewing the failure.' },
+        payload: { instruction },
       })
       expect(resumeResponse.statusCode).toBe(201)
       expect(resumeResponse.json<Job>()).toMatchObject({

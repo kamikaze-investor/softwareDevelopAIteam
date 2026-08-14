@@ -9,11 +9,12 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
-import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
+import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -1086,6 +1087,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, reason: 'Latest blocked job is missing AI CLI provider or mode' }
         }
 
+        const designReviewCheck = checkImplementJobDesignReviewEvidence({
+          taskId,
+          aiCliMode: latestJob.aiCliMode,
+          aiCliPrompt: instructionPrompt,
+        }, designReviewEvidence)
+        if (!designReviewCheck.ok) {
+          return {
+            ok: false,
+            code: 'DESIGN_REVIEW_PRECONDITION_FAILED',
+            reason: designReviewCheck.reason,
+          }
+        }
+
         const job = jobs.create({
           taskId,
           projectId: latestJob.projectId,
@@ -1664,6 +1678,48 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   // KnowledgeGraph Storage
   // ────────────────────────────────────────────────────────────
 
+  const designReviewEvidence: IDesignReviewEvidenceStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM design_review_evidence WHERE id = ?').get(id) as any
+      return row ? deserializeDesignReviewEvidence(row) : undefined
+    },
+    findByTaskId(taskId) {
+      const rows = db.prepare(
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(taskId) as any[]
+      return rows.map(deserializeDesignReviewEvidence)
+    },
+    findLatestByTaskId(taskId) {
+      const row = db.prepare(
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+      ).get(taskId) as any
+      return row ? deserializeDesignReviewEvidence(row) : undefined
+    },
+    create(data) {
+      const evidence: DesignReviewEvidence = {
+        ...data,
+        id: randomUUID(),
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO design_review_evidence
+          (id, task_id, design_text_hash, review_load, decision,
+           independent_review_required, independent_review_verdict, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        evidence.id,
+        evidence.taskId,
+        evidence.designTextHash,
+        evidence.reviewLoad,
+        evidence.decision,
+        evidence.independentReviewRequired ? 1 : 0,
+        evidence.independentReviewVerdict ?? null,
+        evidence.createdAt,
+      )
+      return evidence
+    },
+  }
+
   function generateKGNodeId(): string {
     const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
     const rows = db.prepare(
@@ -2095,7 +2151,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
 }
 
 function deserializeProject(row: any): Project {
@@ -2262,6 +2318,19 @@ function deserializeApprovalRequest(row: any): ApprovalRequest {
     reason: row.reason ?? undefined,
     createdAt: row.created_at,
     reviewedAt: row.reviewed_at ?? undefined,
+  }
+}
+
+function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    designTextHash: row.design_text_hash,
+    reviewLoad: row.review_load as DesignReviewEvidence['reviewLoad'],
+    decision: row.decision as DesignReviewEvidence['decision'],
+    independentReviewRequired: row.independent_review_required === 1,
+    independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
+    createdAt: row.created_at,
   }
 }
 

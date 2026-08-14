@@ -2,13 +2,14 @@ import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { canonicalizeJobUpdate, type Job, type Project, type Task } from '@ai-team/shared'
+import { canonicalizeJobUpdate, type DesignReviewEvidence, type Job, type Project, type Task } from '@ai-team/shared'
 
 async function buildApp(): Promise<FastifyInstance> {
-  const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { resetStorage }] = await Promise.all([
+  const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { designReviewEvidenceRoutes }, { resetStorage }] = await Promise.all([
     import('./projects.js'),
     import('./tasks.js'),
     import('./jobs.js'),
+    import('./designReviewEvidence.js'),
     import('../storage/index.js'),
   ])
 
@@ -19,6 +20,7 @@ async function buildApp(): Promise<FastifyInstance> {
   app.register(projectRoutes, { prefix: '/api/projects' })
   app.register(taskRoutes, { prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
+  app.register(designReviewEvidenceRoutes, { prefix: '/api' })
   await app.ready()
   return app
 }
@@ -37,6 +39,11 @@ function parseBody<T>(body: string): T {
 }
 
 type OutboxJobResponse = Job & { outbox?: { eventId: string; deduplicated: boolean } }
+
+type DesignReviewEvidenceOverrides = Partial<Pick<
+  DesignReviewEvidence,
+  'reviewLoad' | 'decision' | 'independentReviewRequired' | 'independentReviewVerdict'
+>>
 
 function calculatePayloadHash(payload: Record<string, unknown>): string {
   return createHash('sha256')
@@ -83,6 +90,29 @@ async function createTask(
     dependencies: [],
     ...body,
   })
+}
+
+async function createDesignReviewEvidence(
+  app: FastifyInstance,
+  task: Task,
+  designText: string,
+  overrides: DesignReviewEvidenceOverrides = {},
+): Promise<DesignReviewEvidence> {
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/design-review-evidence',
+    payload: {
+      taskId: task.id,
+      designText,
+      reviewLoad: 'medium',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+      ...overrides,
+    },
+  })
+
+  expect(res.statusCode).toBe(201)
+  return parseBody<DesignReviewEvidence>(res.body)
 }
 
 async function createJob(
@@ -305,9 +335,11 @@ describe('Job API', () => {
     await withApp(async (app) => {
       const project = await createProject(app)
       const task = await createTask(app, project.id)
+      const prompt = 'Implement the requested change carefully.'
+      await createDesignReviewEvidence(app, task, prompt)
       const created = await createJob(app, task, {
         aiCliProvider: 'codex',
-        aiCliPrompt: 'Implement the requested change carefully.',
+        aiCliPrompt: prompt,
         aiCliMode: 'implement',
       })
 
@@ -376,6 +408,187 @@ describe('Job API', () => {
       })
 
       expect(res.statusCode).toBe(400)
+    })
+  })
+
+  describe('POST /api/jobs Design Review evidence gate', () => {
+    async function postImplementJob(
+      app: FastifyInstance,
+      task: Task,
+      prompt: string,
+    ) {
+      return await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: task.projectId,
+          agentRole: 'developer_ai',
+          aiCliProvider: 'codex',
+          aiCliPrompt: prompt,
+          aiCliMode: 'implement',
+          safeCommand: { kind: 'test' },
+        },
+      })
+    }
+
+    it('allows implement Job creation with matching ALIGNED evidence', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const prompt = 'Design: implement the approved storage interface change.'
+        await createDesignReviewEvidence(app, task, prompt)
+
+        const res = await postImplementJob(app, task, prompt)
+
+        expect(res.statusCode).toBe(201)
+        expect(parseBody<Job>(res.body)).toMatchObject({
+          taskId: task.id,
+          aiCliMode: 'implement',
+          aiCliPrompt: prompt,
+        })
+      })
+    })
+
+    it('rejects implement Job creation when no evidence exists', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const otherTask = await createTask(app, project.id)
+        const prompt = 'Design: no review was persisted for this task.'
+        await createDesignReviewEvidence(app, otherTask, prompt)
+
+        const res = await postImplementJob(app, task, prompt)
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('MISSING_DESIGN_REVIEW_EVIDENCE')
+      })
+    })
+
+    it.each(['CONFLICT', 'UNCERTAIN'] as const)(
+      'rejects implement Job creation when latest evidence decision is %s',
+      async (decision) => {
+        await withApp(async (app) => {
+          const project = await createProject(app)
+          const task = await createTask(app, project.id)
+          const prompt = `Design: ${decision.toLowerCase()} result must fail closed.`
+          await createDesignReviewEvidence(app, task, prompt, { decision })
+
+          const res = await postImplementJob(app, task, prompt)
+
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('DESIGN_REVIEW_NOT_ALIGNED')
+        })
+      },
+    )
+
+    it('rejects implement Job creation when latest evidence is REVIEW_UNAVAILABLE', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const prompt = 'Design: reviewer unavailable must not pass.'
+        await createDesignReviewEvidence(app, task, prompt, { decision: 'REVIEW_UNAVAILABLE' })
+
+        const res = await postImplementJob(app, task, prompt)
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('DESIGN_REVIEW_NOT_ALIGNED')
+      })
+    })
+
+    it('rejects stale ALIGNED evidence created for different design text', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        await createDesignReviewEvidence(app, task, 'Design: original reviewed plan.')
+
+        const res = await postImplementJob(app, task, 'Design: changed plan after review.')
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('DESIGN_REVIEW_HASH_MISMATCH')
+      })
+    })
+
+    it('allows critical implement Job creation only when the independent verdict approved', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const prompt = 'Design: critical meta-review change approved independently.'
+        await createDesignReviewEvidence(app, task, prompt, {
+          reviewLoad: 'critical',
+          decision: 'ALIGNED',
+          independentReviewRequired: true,
+          independentReviewVerdict: 'approved',
+        })
+
+        const res = await postImplementJob(app, task, prompt)
+
+        expect(res.statusCode).toBe(201)
+      })
+    })
+
+    it('rejects critical ALIGNED evidence when the independent verdict did not approve', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const prompt = 'Design: critical change without independent approval.'
+        await createDesignReviewEvidence(app, task, prompt, {
+          reviewLoad: 'critical',
+          decision: 'ALIGNED',
+          independentReviewRequired: true,
+          independentReviewVerdict: 'changes_requested',
+        })
+
+        const res = await postImplementJob(app, task, prompt)
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('CRITICAL_INDEPENDENT_REVIEW_NOT_APPROVED')
+      })
+    })
+
+    it('allows non-implement Job creation without evidence', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+
+        const reviewJob = await createJob(app, task, {
+          agentRole: 'qa_ai',
+          aiCliProvider: 'claude_code',
+          aiCliMode: 'review',
+        })
+        const commandJob = await createJob(app, task)
+
+        expect(reviewJob.aiCliMode).toBe('review')
+        expect(commandJob.aiCliMode).toBeUndefined()
+      })
+    })
+
+    it('rejects the resume path when no matching Design Review evidence exists', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.jobs.create({
+          taskId: task.id,
+          projectId: task.projectId,
+          agentRole: 'developer_ai',
+          status: 'blocked',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'Original blocked prompt',
+          aiCliMode: 'implement',
+        })
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'Resume with a new plan.' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ error: string }>(res.body).error).toContain('Design Review')
+      })
     })
   })
 
@@ -853,6 +1066,7 @@ describe('Job API', () => {
       })
       expect(rejectedCreate.statusCode).toBe(400)
 
+      await createDesignReviewEvidence(app, task, 'Manual recovery')
       const manualResponse = await app.inject({
         method: 'POST',
         url: '/api/jobs',

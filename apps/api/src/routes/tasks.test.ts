@@ -2,6 +2,8 @@ import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskSummary } from '@ai-team/shared'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildResumeAiCliPrompt } from './tasks'
 
 /**
  * POST /api/jobs のリクエストボディ用の型。
@@ -81,6 +83,10 @@ async function createJob(
   task: Task,
   body: CreateJobRequestBody = {},
 ): Promise<Job> {
+  if (body.aiCliMode === 'implement' && typeof body.aiCliPrompt === 'string') {
+    await createAlignedDesignReviewEvidence(task.id, body.aiCliPrompt)
+  }
+
   const res = await app.inject({
     method: 'POST',
     url: '/api/jobs',
@@ -95,6 +101,17 @@ async function createJob(
 
   expect(res.statusCode).toBe(201)
   return parseBody<Job>(res.body)
+}
+
+async function createAlignedDesignReviewEvidence(taskId: string, designText: string): Promise<void> {
+  const { getStorage } = await import('../storage/index.js')
+  getStorage().designReviewEvidence.create({
+    taskId,
+    designTextHash: computeDesignTextHash(designText),
+    reviewLoad: 'medium',
+    decision: 'ALIGNED',
+    independentReviewRequired: false,
+  })
 }
 
 async function updateJob(
@@ -739,11 +756,13 @@ describe('Task API', () => {
           aiCliPrompt: 'Original rejected prompt',
           aiCliMode: 'implement',
         })
+        const instruction = 'Use the existing storage interface and add tests.'
+        await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
 
         const res = await app.inject({
           method: 'POST',
           url: `/api/tasks/${task.id}/resume`,
-          payload: { instruction: 'Use the existing storage interface and add tests.' },
+          payload: { instruction },
         })
 
         expect(res.statusCode).toBe(201)
@@ -794,11 +813,13 @@ describe('Task API', () => {
           aiCliMode: 'implement',
         })
         expect(legacyJob.safeCommand.workingDir).toBe('/some/legacy/path')
+        const instruction = 'Continue with the correct workingDir.'
+        await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
 
         const res = await app.inject({
           method: 'POST',
           url: `/api/tasks/${task.id}/resume`,
-          payload: { instruction: 'Continue with the correct workingDir.' },
+          payload: { instruction },
         })
 
         expect(res.statusCode).toBe(201)
@@ -935,16 +956,18 @@ describe('Task API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         await createBlockedAiCliJob(app, task)
+        const instruction = 'Retry with the approved file list.'
+        await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
 
         const first = await app.inject({
           method: 'POST',
           url: `/api/tasks/${task.id}/resume`,
-          payload: { instruction: 'Retry with the approved file list.' },
+          payload: { instruction },
         })
         const second = await app.inject({
           method: 'POST',
           url: `/api/tasks/${task.id}/resume`,
-          payload: { instruction: 'Retry with the approved file list.' },
+          payload: { instruction },
         })
 
         expect(first.statusCode).toBe(201)

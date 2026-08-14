@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import type { StrategicMetaReviewResult } from '@ai-team/shared'
+import { buildApiAuthHeaders } from '../src/utils/apiAuth.js'
 
 export interface DesignReviewCliInput {
   taskId: string
@@ -9,6 +10,25 @@ export interface DesignReviewCliInput {
   changedFiles: string[]
   designText: string
   workingDir: string
+}
+
+interface EvidencePersistenceResponse {
+  ok: boolean
+  status: number
+}
+
+type EvidenceFetch = (
+  url: string,
+  init: {
+    method: 'POST'
+    headers: Record<string, string>
+    body: string
+  },
+) => Promise<EvidencePersistenceResponse>
+
+export interface PersistDesignReviewEvidenceOptions {
+  apiBaseUrl?: string
+  fetchImpl?: EvidenceFetch
 }
 
 interface ParsedDesignReviewArgs {
@@ -129,12 +149,75 @@ export function exitCodeForStrategicResult(result: StrategicMetaReviewResult): n
   }
 }
 
+/**
+ * Pre-implementation Design Review gate.
+ *
+ * This is the connectable precondition hook for "may implementation start on this
+ * design": run the existing Strategic Meta Review against a design (not yet a diff)
+ * and report whether the caller may proceed to create an implement-mode Job.
+ *
+ * Fail-closed: only `ALIGNED` returns `allowed: true`. `CONFLICT` (AI-side design
+ * rework, not CEO escalation per requiresCeoApproval semantics), `UNCERTAIN`, and
+ * `REVIEW_UNAVAILABLE` all return `allowed: false`.
+ *
+ * This function does not create a Job itself and does not call any Task→Job
+ * automation — the caller decides what to do with the result (e.g. proceed to call
+ * the existing `POST /api/jobs`, or stop and revise the design).
+ */
+export async function checkPreImplementationDesignReview(
+  input: DesignReviewCliInput,
+): Promise<{ allowed: boolean; result: StrategicMetaReviewResult }> {
+  const { runStrategicMetaReview } = await import('../src/metaReviewer/strategicReview.js')
+  const result = await runStrategicMetaReview(buildStrategicReviewInputFromDesign(input))
+  return { allowed: result.finalDecision === 'ALIGNED', result }
+}
+
+export async function persistDesignReviewEvidence(
+  input: DesignReviewCliInput,
+  result: StrategicMetaReviewResult,
+  options: PersistDesignReviewEvidenceOptions = {},
+): Promise<boolean> {
+  const apiBaseUrl = (options.apiBaseUrl ?? process.env.API_BASE_URL ?? 'http://localhost:3000').replace(/\/$/, '')
+  const fetchImpl = options.fetchImpl ?? fetch
+
+  try {
+    const response = await fetchImpl(`${apiBaseUrl}/api/design-review-evidence`, {
+      method: 'POST',
+      headers: {
+        ...buildApiAuthHeaders(),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        taskId: input.taskId,
+        // Must be the exact text later submitted as the implement Job's aiCliPrompt.
+        designText: input.designText,
+        reviewLoad: result.reviewLoad,
+        decision: result.finalDecision,
+        independentReviewRequired: result.independentReviewRequired,
+        independentReviewVerdict: result.independentReviewResult?.verdict,
+      }),
+    })
+
+    if (!response.ok) {
+      process.stderr.write(`[design-review] Failed to persist Design Review evidence: HTTP ${response.status}\n`)
+      return false
+    }
+
+    return true
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`[design-review] Failed to persist Design Review evidence: ${message}\n`)
+    return false
+  }
+}
+
 async function main(): Promise<void> {
   loadEnvFile()
   const stdinText = process.stdin.isTTY ? undefined : await readStdin()
   const input = await resolveDesignReviewInput(process.argv.slice(2), process.env, stdinText)
   const { runStrategicMetaReview } = await import('../src/metaReviewer/strategicReview.js')
   const result = await runStrategicMetaReview(buildStrategicReviewInputFromDesign(input))
+  await persistDesignReviewEvidence(input, result)
 
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
   process.exit(exitCodeForStrategicResult(result))

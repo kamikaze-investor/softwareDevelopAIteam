@@ -130,6 +130,20 @@ export interface IntegrationReviewResult {
   unresolvedAssumptions?: string[]
 }
 
+/**
+ * Result of the CRITICAL-only Independent Review call.
+ * Executed via a provider genuinely separate from the primary Gemini-based
+ * Focused/Integration review (currently Codex, reviewer-only model) — never a
+ * copy of the primary review's prompt or result.
+ */
+export interface IndependentReviewOutcome {
+  provider: string
+  verdict: 'approved' | 'changes_requested' | 'blocking'
+  summary: string
+  /** true when the independent reviewer itself could not be reached/parsed (fail-closed). */
+  unavailable: boolean
+}
+
 /** REVIEW_UNAVAILABLE means a required review could not complete and must not be treated as ALIGNED. */
 export interface StrategicMetaReviewResult {
   taskId: string
@@ -139,8 +153,24 @@ export interface StrategicMetaReviewResult {
   strategicAlignmentResult?: FocusedReviewResult
   focusedReviewResults: FocusedReviewResult[]
   integrationReviewResult?: IntegrationReviewResult
+  /** Only populated when reviewLoad === 'critical'. Set together with independentReviewRequired. */
+  independentReviewResult?: IndependentReviewOutcome
   finalDecision: StrategicDecision | 'REVIEW_UNAVAILABLE'
   independentReviewRequired: boolean
   requiresCeoApproval: boolean
+  createdAt: string
+}
+
+export type DesignReviewDecision = StrategicDecision | 'REVIEW_UNAVAILABLE'
+export type DesignReviewIndependentVerdict = IndependentReviewOutcome['verdict']
+
+export interface DesignReviewEvidence {
+  id: string
+  taskId: string
+  designTextHash: string
+  reviewLoad: ReviewLoad
+  decision: DesignReviewDecision
+  independentReviewRequired: boolean
+  independentReviewVerdict?: DesignReviewIndependentVerdict
   createdAt: string
 }

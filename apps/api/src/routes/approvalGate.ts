@@ -27,6 +27,7 @@ import {
 } from '../approvalExplain/approvalAi'
 import { readExactApprovalDiff } from '../approvalExplain/diffReader'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
+import { designReviewEvidenceRoutes } from './designReviewEvidence'
 
 function computeDiffHash(diffText: string): string {
   return createHash('sha256').update(diffText, 'utf-8').digest('hex')
@@ -336,6 +337,7 @@ export async function approvalGateRoutes(
 ): Promise<void> {
   const storage = getStorage()
   const targetWorkingDir = options.targetWorkingDir ?? TARGET_WORKING_DIR
+  app.register(designReviewEvidenceRoutes)
 
   function resolveApprovalAiContext(request: ApprovalRequest): ResolvedApprovalAiContext | null {
     const task = storage.tasks.findById(request.taskId)

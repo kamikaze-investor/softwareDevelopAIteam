@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
 
@@ -15,7 +15,7 @@ export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTas
 
 export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
-  | { ok: false; reason: string }
+  | { ok: false; code?: 'DESIGN_REVIEW_PRECONDITION_FAILED'; reason: string }
 
 export type CreateTaskWithInitialImplementJobResult =
   | { ok: true; task: Task; job: Job }
@@ -230,6 +230,13 @@ export interface IApprovalRequestStorage {
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
 }
 
+export interface IDesignReviewEvidenceStorage {
+  findById(id: string): DesignReviewEvidence | undefined
+  findByTaskId(taskId: string): DesignReviewEvidence[]
+  findLatestByTaskId(taskId: string): DesignReviewEvidence | undefined
+  create(data: Omit<DesignReviewEvidence, 'id' | 'createdAt'>): DesignReviewEvidence
+}
+
 export interface IWatchdogEventStorage {
   findAll(): WatchdogEvent[]
   findByJobId(jobId: string): WatchdogEvent[]
@@ -314,6 +321,7 @@ export interface IStorage {
   permissionGrants: IPermissionGrantStorage
   watchdogEvents: IWatchdogEventStorage
   approvalRequests: IApprovalRequestStorage
+  designReviewEvidence: IDesignReviewEvidenceStorage
   knowledgeGraph: IKnowledgeGraphStorage
   decisionCache: IDecisionCacheStorage
   incidentDB: IIncidentDBStorage

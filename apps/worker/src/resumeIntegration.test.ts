@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
-import type { AiCliProvider, AiCliResult, Job, Project, Task } from '@ai-team/shared'
+import type { AiCliProvider, AiCliResult, DesignReviewEvidence, Job, Project, Task } from '@ai-team/shared'
 import { describe, expect, it, vi } from 'vitest'
 import type { IAiCliAdapter } from './aiCli/adapter.js'
 import { createAiCliAdapter } from './aiCli/factory.js'
@@ -191,6 +191,9 @@ interface TestStorage {
     create(job: Omit<Job, 'id' | 'createdAt'>): Job
     findById(id: string): Job | undefined
   }
+  designReviewEvidence: {
+    create(evidence: Omit<DesignReviewEvidence, 'id' | 'createdAt'>): DesignReviewEvidence
+  }
 }
 
 interface StorageModule {
@@ -200,13 +203,26 @@ interface StorageModule {
 
 interface TaskRoutesModule {
   taskRoutes: unknown
+  buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string
+}
+
+interface DesignReviewEvidencePolicyModule {
+  computeDesignTextHash(designText: string): string
+}
+
+interface ResumeRouteApp {
+  app: TestHttpApp
+  storage: TestStorage
+  resetStorage: () => void
+  buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string
+  computeDesignTextHash(designText: string): string
 }
 
 function parseBody<T>(body: string): T {
   return JSON.parse(body) as T
 }
 
-async function buildResumeRouteApp(): Promise<{ app: TestHttpApp; storage: TestStorage; resetStorage: () => void }> {
+async function buildResumeRouteApp(): Promise<ResumeRouteApp> {
   process.env.DB_PATH = ':memory:'
 
   const requireFromApi = createRequire(path.resolve(__dirname, '../../api/package.json'))
@@ -214,8 +230,10 @@ async function buildResumeRouteApp(): Promise<{ app: TestHttpApp; storage: TestS
 
   const storageModulePath = '../../api/src/storage/index.ts'
   const taskRoutesModulePath = '../../api/src/routes/tasks.ts'
+  const evidencePolicyModulePath = '../../api/src/designReviewEvidencePolicy.ts'
   const storageModule = await import(storageModulePath) as unknown as StorageModule
   const taskRoutesModule = await import(taskRoutesModulePath) as unknown as TaskRoutesModule
+  const evidencePolicyModule = await import(evidencePolicyModulePath) as unknown as DesignReviewEvidencePolicyModule
 
   storageModule.resetStorage()
   const storage = storageModule.getStorage()
@@ -223,7 +241,13 @@ async function buildResumeRouteApp(): Promise<{ app: TestHttpApp; storage: TestS
   app.register(taskRoutesModule.taskRoutes, { prefix: '/api/tasks' })
   await app.ready()
 
-  return { app, storage, resetStorage: storageModule.resetStorage }
+  return {
+    app,
+    storage,
+    resetStorage: storageModule.resetStorage,
+    buildResumeAiCliPrompt: taskRoutesModule.buildResumeAiCliPrompt,
+    computeDesignTextHash: evidencePolicyModule.computeDesignTextHash,
+  }
 }
 
 function makeCliResult(taskId: string, provider: AiCliProvider): AiCliResult {
@@ -269,7 +293,7 @@ describe('resume API to worker integration', () => {
       const built = await buildResumeRouteApp()
       app = built.app
       resetStorage = built.resetStorage
-      const { storage } = built
+      const { buildResumeAiCliPrompt, computeDesignTextHash, storage } = built
 
       const project = storage.projects.create({
         name: 'Resume integration',
@@ -298,6 +322,13 @@ describe('resume API to worker integration', () => {
       })
 
       const instruction = 'Use the existing storage interface and add tests.'
+      storage.designReviewEvidence.create({
+        taskId: task.id,
+        designTextHash: computeDesignTextHash(buildResumeAiCliPrompt(task, instruction)),
+        reviewLoad: 'medium',
+        decision: 'ALIGNED',
+        independentReviewRequired: false,
+      })
       const response = await app.inject({
         method: 'POST',
         url: `/api/tasks/${task.id}/resume`,

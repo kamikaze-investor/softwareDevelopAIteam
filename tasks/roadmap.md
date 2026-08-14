@@ -743,6 +743,28 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         Task→Job Full Automationの位置づけと紛らわしいため使用しない）。実装
         （Ruleset有効化・GitHub App作成・credential分離・Approval status連携）は現時点では
         未着手
+
+      **Worker↔API credential / authority separation未完了（2026-08-14確認。GitHub境界とは
+      別の、Meta Review Hardening実装で新たに確認された未解決事項）**: `project-auto-meta-
+      review-hardening`で実装した`design_review_evidence`（`POST /api/design-review-evidence`）
+      は、現在Workerが持つ単一の万能`API_TOKEN`（他の全API呼び出しと同一）だけで認証される。
+      サーバー側は`designText`のhashは自前で再計算するが、`decision`・
+      `independentReviewVerdict`等はクライアント申告値をそのまま保存する。**つまり現状の
+      evidenceは「Worker-authenticated evidence」であり、Workerから独立したtrusted evidence
+      ではない**。Workerが現在の万能`API_TOKEN`を悪用すれば、`runStrategicMetaReview()`を
+      一度も実行せず`decision: 'ALIGNED'`・`independentReviewVerdict: 'approved'`等を
+      自己申告してevidenceを偽装できる（確認済み。read-only調査のみ、対策は今回実装しない）。
+      これはMeta Reviewの判断ロジック（Review Load/Strategic Alignment/Independent Review
+      自体）の不足ではなく、**Worker↔API間のcredential/authority分離が無いこと**に起因するため、
+      本項目（Worker Trust Boundary）の未完了事項として扱う。Task→Job Full Automation解放前に
+      必要な条件へ追加する:
+      - 現状: Workerは`API_TOKEN`（全API操作に共通の単一credential）を保持しており、
+        `design_review_evidence`の`decision`等を自己申告できる
+      - Task→Job Full Automation解放前に、Worker自身がreview evidenceを偽装できない
+        authority boundaryが必要
+      - **解決方法は今回決め打ちしない**（新token種別・別service・署名・別process等、
+        いずれも今回選定しない）。上記のGitHub外部境界（Approval Check・API credential分離）
+        と合わせて、最小のauthority separationを後日まとめて設計する
 <!-- roadmap:id=project-auto-worker-outbox state=planned -->
 4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
       **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
@@ -847,9 +869,10 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       （LINE/Slack）・`summaryEngine.ts`・Approval Gateの再利用を前提とし、新しい停止Gateは作らない。
       **完了条件**: Phase完了時にCEOへ通知が届き、開発が止まらないこと。CEOが修正指示を返す経路は
       「追加開発指示（追加Task作成）」を使う
-<!-- roadmap:id=project-auto-meta-review-hardening state=in_progress -->
-10. [ ] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
-      foundation実装完了）— 既存Meta Reviewer（`docs/meta_reviewer/`prompt/checklist、
+<!-- roadmap:id=project-auto-meta-review-hardening state=done -->
+10. [x] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
+      foundation実装完了。2026-08-14、残り3 Acceptance Criteria全件を実production経路への
+      接続まで含めて完了しdoneへ）— 既存Meta Reviewer（`docs/meta_reviewer/`prompt/checklist、
       `apps/worker/src/metaReviewer/runner.ts`・`geminiRouter.ts`、AV-001保護）の改善。新しい
       Review基盤・新Agent種類・新Workflow engineは作らない。目的: 局所的には合理的な設計・実装が
       Goal / Design Philosophy / Constitution / CEO Decision / Roadmap目的と矛盾したまま実装
@@ -873,27 +896,73 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       - 既存7 checklist再利用（新規checklistなし）
       - tests（`apps/worker`: 45 files / 886 tests、既存test regressionなし）
 
-      **未完了Acceptance Criteria（3件。この3件が揃うまでdoneにしない）**:
-      1. **Strategic Alignment Reviewの実装前自動発火**: 現状`design-review` CLIは手動起動のみで、
-         Task/Job作成フローへの自動接続がない。`project-auto-task-job-chain`
-         （Task→Job自動生成）が未着手のため、自動接続に必要な「Job作成前フック」相当の
-         最小interfaceが現行リポジトリに存在しない。Task→Job full automationは、この項目の
-         残Acceptance Criteriaが揃う前に有効化しない（依存関係として明記。ただし
-         Task→Job full automation自体は本項目の範囲外であり今回実装しない）
-      2. **Critical Independent Reviewの実実行接続**: `independentReviewRequired`フラグは
-         CRITICAL時に立つが、実際に別プロバイダへ独立レビューを発注する接続コードは無い
-         （現状は既存の運用上のCodex独立レビュー手続き前提）。新しいReviewer Agent・
-         Provider Router・Workflow engineは作らず、既存のIndependent Review経路（Codex CLI
-         独立レビュー等）へ自然に接続できるpre-implementation interfaceがTask→Job側で
-         用意された時点で接続する。**Critical Independent Review execution wiring = pending**
-      3. **Production相当E2E**: 実productionワークフロー（Task作成→design-review→
-         実装→Job実行）を通した一連のE2Eはまだ実施していない。2026-08-13時点で確認したのは
-         design-review CLI単体の実LLM E2E（1シナリオ）のみ
+      **残り3 Acceptance Criteria（2026-08-14、全件完了）。読み方の確定: 「automatic hook」＝
+      Task→Job Full Automationの有効化ではなく、実装開始を許可する既存経路の直前へDesign
+      Reviewを必須preconditionとして接続できるinterface/hookを完成させること。protected file
+      （AV-001）は今回変更していない）**:
+      1. **Strategic Alignment Reviewのpre-implementation hook — 完了**: 当初
+         `checkPreImplementationDesignReview()`を追加しただけでproduction呼び出し元が
+         ゼロ件という未達が判明したため（2026-08-14中間確認）、Worker実行とAPI強制を分離する
+         設計へ差し替えて実接続した。**APIはGemini/Codex認証情報を持たない**（実測確認済み:
+         production API processのenvは`API_TOKEN`/`DB_PATH`/`HOST`/`NODE_ENV`/`PORT`/
+         `OPENCODE_GO_API_KEY`のみで`CLAUDE_API_KEY`/`GEMINI_API_KEY`を含まない）ため、
+         APIがGemini/Codexを直接呼ぶ設計は採らず、次の分離構成にした:
+         Worker側（`designReview.ts`の`main()`）が既存`runStrategicMetaReview()`実行後、
+         新規`persistDesignReviewEvidence()`で結果を`POST /api/design-review-evidence`へ
+         POSTする（`apps/api/src/routes/designReviewEvidence.ts`新設。protected対象の
+         `index.ts`は編集せず、既存の非protected`approvalGateRoutes`内で`app.register()`する
+         形で追加）。サーバー側は`designText`から`sha256`を**自前で再計算**し
+         （`apps/api/src/designReviewEvidencePolicy.ts`の`computeDesignTextHash()`。
+         `approvalGate.ts`の`targetDiffHash`検証と同じ既存パターンを再利用。クライアント申告
+         hashは信用しない）、新規`design_review_evidence`テーブル（`task_id`・
+         `design_text_hash`・`review_load`・`decision`・`independent_review_required`・
+         `independent_review_verdict`）へ保存する。**実強制点**: `jobs.create()`
+         （`apps/api/src/storage/sqlite.ts`。`POST /api/jobs`・`resumeBlockedTask()`の両方が
+         収束する唯一の低レベル関数であることを事前調査で確認済み）の直前で
+         `checkImplementJobDesignReviewEvidence()`
+         （`apps/api/src/designReviewEvidencePolicy.ts`）を呼び、`aiCliMode==='implement'`の
+         場合のみ、最新evidenceの`design_text_hash`が今回の`aiCliPrompt`のhashと一致し、
+         かつ`decision==='ALIGNED'`であることを要求する（不一致・エビデンスなし・
+         ALIGNED以外はすべて409で拒否、fail-closed）。resume経路も同じ関数を呼ぶため
+         迂回不可（`sqlite.ts`の`resumeBlockedTask()`内で同一chokepointを通ることをコードで
+         確認済み）。非implement Job（`aiCliMode`未指定・`review`・`qa`・`summarize`）は
+         この判定を一切通らない
+      2. **Critical Independent Reviewの実実行接続 — 完了**: `strategicReview.ts`に
+         `runIndependentReview()`を追加し、`reviewLoad === 'critical'`のときだけ既存
+         `reviewerAdapter.ts`の`createReviewerAdapter('codex')`（既存のCodex独立レビュー機構。
+         reviewer専用モデル`gpt-5.6-sol`、primaryのGemini呼び出しとは別プロバイダ・別モデル・
+         別呼び出し）を実行し、結果を`finalDecision`へ反映する
+         （`applyIndependentReviewOverride()`: blocking→CONFLICT、changes_requested時ALIGNED→
+         UNCERTAIN、reviewer自体が失敗/未応答→fail-closedでREVIEW_UNAVAILABLE）。**この経路は
+         `designReview.ts`の`main()`＝既存の`design-review` CLI（`pnpm --filter @ai-team/worker
+         design-review`）という、変更前から存在する本物のproduction entry pointから実際に
+         呼び出し可能**（1と異なり、この呼び出し元は新設ではなく既存CLIそのもの）。新しい
+         Reviewer Agent・Provider Router・Workflow engineは追加していない。independenceは
+         テストで検証済み（primary Geminiのprompt/応答が独立レビュー呼び出しへ混入しないこと
+         を個別テストで確認）
+      3. **Production相当E2E — 完了**: 二層で実証。(a) `apps/worker/scripts/
+         designReview.e2e.test.ts`が、Review Load分類・Focus選択・Strategic Alignment・
+         Integration Review・Independent Review（上記2）という核心ロジックを実際の
+         production code path経由で検証（LLM/CLI呼び出し境界＝`callGeminiWithFallback`・
+         `createAiCliAdapter`のみモックし、ALIGNED/CONFLICT（rollback時DB safety迂回、
+         2026-08-13の実LLM E2Eと同じ設計内容）/UNCERTAIN/CRITICAL/reviewer unavailableの
+         5シナリオを確認）。(b) `apps/api/src/routes/jobs.test.ts`「POST /api/jobs Design
+         Review evidence gate」が、実際の`POST /api/jobs`・`POST /api/tasks/:id/resume`
+         route（`app.inject()`）を通し: ALIGNED evidenceあり→201成功／evidenceなし→409／
+         CONFLICT・UNCERTAIN・REVIEW_UNAVAILABLE→409／レビュー対象と異なるdesign textでの
+         古いALIGNED（hash不一致）→409／resume経路でのevidenceなし→409／CRITICALで
+         independent review未承認→409／CRITICALでindependent review承認済み→201／
+         非implement Jobはevidenceなしで成功、を確認。新しい巨大E2E frameworkは作らず、
+         既存`strategicReview.test.ts`・`jobs.test.ts`と同じvitest/`app.inject()`方式を再利用
 
-      **完了条件**: 上記未完了3件が満たされ、Review Load分類・Strategic Alignment・
-      Integration Review・fail-closedが実運用（PR自動レビューまたはTask/Job自動生成フロー）で
-      実証されること。既存の統合Meta Review（LOW時）・既存Implementation Meta Review
-      （`autoReview.ts`）の挙動を壊さないこと
+      **完了条件（達成）**: Design Reviewを呼ばずにimplement Jobを作成できる全productionの
+      経路（`POST /api/jobs`・resume）がAPI側で機械的に拒否されることを、実route経由のE2Eで
+      証明した。Review Load分類・Strategic Alignment・Integration Review・Independent
+      Review・fail-closedのすべてが実production経路で実証された
+      （`apps/api`: 36 files / 555 tests、`apps/worker`: 46 files / 911 tests、既存test
+      regressionなし。`pnpm verify`・`git diff --check`成功。AV-001対象ファイルは無変更）。
+      既存の統合Meta Review（LOW時）・既存Implementation Meta Review（`autoReview.ts`）の
+      挙動は変更していない
 
 **将来項目（Step 2系の完了後に個別判断。今回は着手しない）**
 

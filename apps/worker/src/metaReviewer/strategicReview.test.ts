@@ -7,6 +7,10 @@ vi.mock('./geminiRouter.js', () => ({
   callGeminiWithFallback: vi.fn(),
 }))
 
+vi.mock('../aiCli/factory.js', () => ({
+  createAiCliAdapter: vi.fn(),
+}))
+
 vi.mock('./runner.js', () => ({
   buildMetaReviewRequest: vi.fn(() => ({
     taskId: 'task-test',
@@ -29,19 +33,40 @@ vi.mock('./runner.js', () => ({
   })),
 }))
 
+import { createAiCliAdapter } from '../aiCli/factory.js'
 import { callGeminiWithFallback } from './geminiRouter.js'
 import {
   buildMetaReviewPrompt,
   parseMetaReviewResult,
 } from './runner.js'
 import {
+  applyIndependentReviewOverride,
+  runIndependentReview,
   runStrategicMetaReview,
 } from './strategicReview.js'
 
 const mockCallGeminiWithFallback = vi.mocked(callGeminiWithFallback)
 const mockBuildMetaReviewPrompt = vi.mocked(buildMetaReviewPrompt)
 const mockParseMetaReviewResult = vi.mocked(parseMetaReviewResult)
+const mockCreateAiCliAdapter = vi.mocked(createAiCliAdapter)
 const repoRoot = resolve(__dirname, '../../../..')
+
+/** Codex reviewer JSON response wrapped the way CodexReviewerAdapter expects (stdout, exitCode 0). */
+function mockCodexReviewerRun(
+  verdict: 'approved' | 'changes_requested' | 'blocking',
+  summary = 'codex independent review',
+): void {
+  const stdout = JSON.stringify({ verdict, summary, issues: [], confidence: 0.9 })
+  mockCreateAiCliAdapter.mockReturnValue({
+    run: vi.fn().mockResolvedValue({ blocked: false, exitCode: 0, stdout, stderr: '' }),
+  } as unknown as ReturnType<typeof createAiCliAdapter>)
+}
+
+function mockCodexReviewerFailure(): void {
+  mockCreateAiCliAdapter.mockReturnValue({
+    run: vi.fn().mockResolvedValue({ blocked: false, exitCode: 1, stdout: '', stderr: 'codex unavailable' }),
+  } as unknown as ReturnType<typeof createAiCliAdapter>)
+}
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -56,6 +81,7 @@ beforeEach(() => {
     requiresCeoApproval: false,
     createdAt: '2026-08-13T00:00:00.000Z',
   })
+  mockCodexReviewerRun('approved')
 })
 
 describe('runStrategicMetaReview', () => {
@@ -119,6 +145,194 @@ describe('runStrategicMetaReview', () => {
     expect(result.reviewLoad).toBe('critical')
     expect(result.selectedFocuses).toContain('strategic_alignment')
     expect(result.independentReviewRequired).toBe(true)
+  })
+
+  it('actually executes an Independent Review for CRITICAL, not just the flag', async () => {
+    mockCallGeminiWithFallback
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockCodexReviewerRun('approved', 'independent codex review approved')
+
+    const result = await runStrategicMetaReview({
+      taskId: 'task-critical-independent',
+      taskTitle: 'Meta reviewer hardening',
+      changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
+      gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
+      workingDir: repoRoot,
+    })
+
+    expect(mockCreateAiCliAdapter).toHaveBeenCalledTimes(1)
+    expect(result.independentReviewResult).toBeDefined()
+    expect(result.independentReviewResult?.provider).toBe('codex')
+    expect(result.independentReviewResult?.verdict).toBe('approved')
+    expect(result.finalDecision).toBe('ALIGNED')
+  })
+
+  it('does not call the Independent Reviewer for non-CRITICAL review load', async () => {
+    await runStrategicMetaReview(highStorageInput())
+
+    expect(mockCreateAiCliAdapter).not.toHaveBeenCalled()
+  })
+
+  it('does not feed the Independent Reviewer the primary Gemini prompt or response', async () => {
+    mockCallGeminiWithFallback
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    const run = vi.fn().mockResolvedValue({
+      blocked: false,
+      exitCode: 0,
+      stdout: JSON.stringify({ verdict: 'approved', summary: 'ok', issues: [], confidence: 0.9 }),
+      stderr: '',
+    })
+    mockCreateAiCliAdapter.mockReturnValue({ run } as unknown as ReturnType<typeof createAiCliAdapter>)
+
+    await runStrategicMetaReview({
+      taskId: 'task-critical-independence',
+      taskTitle: 'Meta reviewer hardening',
+      changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
+      gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
+      workingDir: repoRoot,
+    })
+
+    const reviewCall = run.mock.calls[0][0] as { prompt: string }
+    expect(reviewCall.prompt).not.toContain('strategic aligned')
+    expect(reviewCall.prompt).not.toContain('architecture aligned')
+    expect(reviewCall.prompt).not.toContain('integration aligned')
+  })
+
+  it('overrides CRITICAL ALIGNED to CONFLICT when the Independent Review blocks', async () => {
+    mockCallGeminiWithFallback
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockCodexReviewerRun('blocking', 'independent reviewer found a critical safety gap')
+
+    const result = await runStrategicMetaReview({
+      taskId: 'task-critical-blocked',
+      taskTitle: 'Meta reviewer hardening',
+      changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
+      gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
+      workingDir: repoRoot,
+    })
+
+    expect(result.finalDecision).toBe('CONFLICT')
+    expect(result.independentReviewResult?.verdict).toBe('blocking')
+    expect(result.requiresCeoApproval).toBe(true)
+  })
+
+  it('fails closed to REVIEW_UNAVAILABLE when the Independent Reviewer itself is unavailable', async () => {
+    mockCallGeminiWithFallback
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
+      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockCodexReviewerFailure()
+
+    const result = await runStrategicMetaReview({
+      taskId: 'task-critical-reviewer-unavailable',
+      taskTitle: 'Meta reviewer hardening',
+      changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
+      gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
+      workingDir: repoRoot,
+    })
+
+    expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+    expect(result.requiresCeoApproval).toBe(true)
+  })
+
+  it('does not run the Independent Reviewer when the primary review is already unavailable', async () => {
+    mockCallGeminiWithFallback.mockRejectedValueOnce(new Error('gemini timeout'))
+
+    const result = await runStrategicMetaReview({
+      taskId: 'task-critical-primary-unavailable',
+      taskTitle: 'Meta reviewer hardening',
+      changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
+      gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
+      workingDir: repoRoot,
+    })
+
+    expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+    expect(mockCreateAiCliAdapter).not.toHaveBeenCalled()
+  })
+
+  describe('applyIndependentReviewOverride', () => {
+    it('keeps the base decision when the independent reviewer approves', () => {
+      expect(applyIndependentReviewOverride('ALIGNED', {
+        provider: 'codex',
+        verdict: 'approved',
+        summary: 'ok',
+        unavailable: false,
+      })).toBe('ALIGNED')
+    })
+
+    it('forces CONFLICT when the independent reviewer blocks', () => {
+      expect(applyIndependentReviewOverride('ALIGNED', {
+        provider: 'codex',
+        verdict: 'blocking',
+        summary: 'blocked',
+        unavailable: false,
+      })).toBe('CONFLICT')
+    })
+
+    it('downgrades ALIGNED to UNCERTAIN when the independent reviewer requests changes', () => {
+      expect(applyIndependentReviewOverride('ALIGNED', {
+        provider: 'codex',
+        verdict: 'changes_requested',
+        summary: 'needs changes',
+        unavailable: false,
+      })).toBe('UNCERTAIN')
+    })
+
+    it('does not downgrade an existing CONFLICT further on changes_requested', () => {
+      expect(applyIndependentReviewOverride('CONFLICT', {
+        provider: 'codex',
+        verdict: 'changes_requested',
+        summary: 'needs changes',
+        unavailable: false,
+      })).toBe('CONFLICT')
+    })
+
+    it('fails closed to REVIEW_UNAVAILABLE when the independent reviewer is unavailable regardless of base decision', () => {
+      expect(applyIndependentReviewOverride('ALIGNED', {
+        provider: 'codex',
+        verdict: 'blocking',
+        summary: 'unavailable',
+        unavailable: true,
+      })).toBe('REVIEW_UNAVAILABLE')
+    })
+  })
+
+  describe('runIndependentReview', () => {
+    it('reports unavailable:true when the Codex CLI exits non-zero', async () => {
+      mockCodexReviewerFailure()
+
+      const outcome = await runIndependentReview({
+        taskId: 'task-x',
+        taskTitle: 'title',
+        changedFiles: ['apps/worker/src/example.ts'],
+        gitDiff: 'diff',
+        workingDir: repoRoot,
+      })
+
+      expect(outcome.unavailable).toBe(true)
+    })
+
+    it('reports unavailable:false with the parsed verdict on success', async () => {
+      mockCodexReviewerRun('changes_requested', 'please address X')
+
+      const outcome = await runIndependentReview({
+        taskId: 'task-x',
+        taskTitle: 'title',
+        changedFiles: ['apps/worker/src/example.ts'],
+        gitDiff: 'diff',
+        workingDir: repoRoot,
+      })
+
+      expect(outcome.unavailable).toBe(false)
+      expect(outcome.verdict).toBe('changes_requested')
+      expect(outcome.summary).toBe('please address X')
+    })
   })
 
   it('requires CEO approval for CRITICAL CONFLICT', async () => {

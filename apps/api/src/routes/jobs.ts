@@ -5,6 +5,7 @@ import { canonicalizeJobUpdate, type Job } from '@ai-team/shared'
 import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import type { OutboxEventInput } from '../storage/interface'
+import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 
 const AgentRoleSchema = z.enum([
   'cto_ai',
@@ -213,6 +214,15 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     }
     if (project.status === 'archived') {
       return reply.status(409).send({ error: 'Project is archived' })
+    }
+
+    const designReviewCheck = checkImplementJobDesignReviewEvidence(result.data, storage.designReviewEvidence)
+    if (!designReviewCheck.ok) {
+      return reply.status(409).send({
+        error: 'Implement Job requires an aligned pre-implementation Design Review',
+        code: designReviewCheck.code,
+        reason: designReviewCheck.reason,
+      })
     }
 
     const jobInput: Omit<Job, 'id' | 'createdAt'> = {
