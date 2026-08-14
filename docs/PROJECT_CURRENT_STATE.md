@@ -82,11 +82,12 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Meta Review MVP Hardening
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
+- 追加開発指示（追加Task作成）画面（Mobile）
 - 再実行・追加指示UI（Mobile）
 
 **未完了・保留項目:**
 - **Worker安全境界・結果引き渡し設計**（state: in_progress）
-- **Worker永続Outbox・結果受信基盤**（state: planned）
+- **Worker永続Outbox・結果受信基盤**（state: in_progress）
 - **本体DB安全・復旧基盤**（state: in_progress）
 - **Task→Job自動生成と連続実行**（state: blocked）
 - **障害復旧E2E・自律実行有効化**（state: planned）
@@ -97,7 +98,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **複数Worker対応**（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
-- 追加開発指示（追加Task作成）画面（Mobile）（state: planned）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->

@@ -765,11 +765,21 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       - **解決方法は今回決め打ちしない**（新token種別・別service・署名・別process等、
         いずれも今回選定しない）。上記のGitHub外部境界（Approval Check・API credential分離）
         と合わせて、最小のauthority separationを後日まとめて設計する
-<!-- roadmap:id=project-auto-worker-outbox state=planned -->
+<!-- roadmap:id=project-auto-worker-outbox state=in_progress -->
 4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
       **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
       保護対象変更が必要な場合は、実装前にCEOが具体的な差分を承認すること。
       保護対象ルールを包括的に緩和しないこと。
+
+      **実装済み（2026-08-14確認。commit`b1c2d9e`）**: Worker-local outbox
+      （`apps/worker/src/outbox/outboxStore.ts`。`recordPending`/`deletePending`/
+      `hasPending`/`resendPending`）／API側 idempotent apply（`outbox_applied_events`
+      テーブル、`payloadHash`をサーバー側で再計算しWorker申告値を信用しない）／
+      pending中は新しいJobを取得しない（`apps/worker/src/index.ts`のpollJobsガード）／
+      startup時のpending resend（起動時drain）。いずれも`apps/worker/src/index.ts`
+      （実Worker起動経路）に実際に配線されていることをコードで確認済み。
+      **残課題**: natural production terminal-result E2Eのみ（実VPS環境でのAPI停止・
+      再起動を伴う実測確認）。この残課題が満たされるまでchecklistは未完了のまま維持する
       **Worker側**: 実行結果を専用の永続Outboxへ保存する（本体DBとは分離し、未送信結果だけを保持）／
       `completionEventId`等で結果を一意識別する／APIからACKを受け取るまでOutboxの結果を削除しない／
       通信失敗・429・5xx・タイムアウト時はバックオフして再送する／Worker再起動後も未送信結果を再送する／
@@ -1107,12 +1117,17 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 <!-- roadmap:id=mobile-approval-gate-ui state=done -->
 3. [x] Task/Job単位Approval GateのMobile UI連携 — 完了。`approvals.tsx`が`/api/approval-requests/waiting`
    から取得し、`/api/approval-requests/:id/status`で承認/却下操作まで実装済み
-<!-- roadmap:id=mobile-task-create state=planned -->
-4. [ ] 追加開発指示（追加Task作成）画面（Mobile） — **スマホ操作MVPの現在の主要残タスク**。
+<!-- roadmap:id=mobile-task-create state=done -->
+4. [x] 追加開発指示（追加Task作成）画面（Mobile） — 完了（2026-08-14確認）。
    通常のTaskはProject作成後にAIが自動生成する想定（下記「Project自動開発フロー」参照）であり、
    この画面はCEOが**既存Projectへ後から要望を追加する入口**（追加機能・改善・不具合・調査・
    完成後アップデート）と位置づける。CEOが通常Taskを一件ずつ手作業で登録する設計にはしない。
-   現状`create.tsx`はProject作成のみで、Project内にTaskを追加する導線がスマホ側にない
+   **現状**: `apps/mobile/app/tasks/create.tsx`が通常Task作成画面として実装済み（タイトル・
+   自然文の開発指示を入力し、既存`POST /api/tasks`をそのまま呼ぶ。特別なTask種別や別APIは
+   使わない）。`apps/mobile/app/index.tsx`のProjectカードに「＋ Taskを追加」導線があり、
+   `projectId`を渡して本画面へ遷移する。作成成功後はTask詳細画面（`/tasks/:id`）へ自動遷移する。
+   導線はProject一覧のカードにあり、Project詳細画面（`projects/[id].tsx`）自体には同等の
+   ボタンはまだない（機能到達は可能なため未完了条件としては扱わない）
 <!-- roadmap:id=mobile-task-resume-ui state=done -->
 5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
    （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
