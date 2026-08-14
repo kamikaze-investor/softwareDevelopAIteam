@@ -8,6 +8,7 @@ import type {
   Job,
   JobStatus,
   Project,
+  ProjectRoadmapPhase,
   ProjectStatus,
   Task,
   TaskStatus,
@@ -59,6 +60,7 @@ const STATUS_COLOR: Record<TaskStatus | JobStatus, string> = {
 
 interface ProjectDetailData {
   jobsByTaskId: Record<string, Job[]>
+  phases: ProjectRoadmapPhase[]
   project: Project
   tasks: Task[]
 }
@@ -82,6 +84,19 @@ async function fetchProject(projectId: string): Promise<Project | null> {
   }
 
   return (await response.json()) as Project
+}
+
+async function fetchRoadmapPhases(projectId: string): Promise<ProjectRoadmapPhase[]> {
+  const response = await apiFetch(
+    `/api/projects/${encodeURIComponent(projectId)}/roadmap`,
+  )
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch roadmap: ${response.status}`)
+  }
+
+  const body = (await response.json()) as { phases: ProjectRoadmapPhase[] }
+  return body.phases
 }
 
 async function fetchTasks(projectId: string): Promise<Task[]> {
@@ -131,6 +146,19 @@ function normalizeProjectId(
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to connect to API'
+}
+
+function selectActivePhasesWithTasks(
+  phases: ProjectRoadmapPhase[],
+  tasks: Task[],
+): Array<{ phase: ProjectRoadmapPhase; tasks: Task[] }> {
+  return phases
+    .filter((phase) => phase.roadmapActive)
+    .sort((left, right) => left.phaseNumber - right.phaseNumber)
+    .map((phase) => ({
+      phase,
+      tasks: tasks.filter((task) => task.roadmapActive && task.phase === phase.phaseNumber),
+    }))
 }
 
 function countTasksByStatus(tasks: Task[]): Record<TaskStatus, number> {
@@ -235,6 +263,76 @@ function ProjectStatusSection({ project }: { project: Project }): ReactElement {
           status={project.status}
         />
       </View>
+    </View>
+  )
+}
+
+function GoalSection({ project }: { project: Project }): ReactElement {
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Goal</Text>
+      <View style={styles.infoCard}>
+        <Text style={styles.bodyText}>{project.goal}</Text>
+      </View>
+    </View>
+  )
+}
+
+function DesignPhilosophySection({
+  designPhilosophy,
+}: {
+  designPhilosophy: string[]
+}): ReactElement | null {
+  if (designPhilosophy.length === 0) {
+    return null
+  }
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Design Philosophy</Text>
+      <View style={styles.infoCard}>
+        {designPhilosophy.map((item, index) => (
+          <Text key={index} style={styles.bulletText}>
+            {'• '}{item}
+          </Text>
+        ))}
+      </View>
+    </View>
+  )
+}
+
+function RoadmapSection({
+  phases,
+  tasks,
+}: {
+  phases: ProjectRoadmapPhase[]
+  tasks: Task[]
+}): ReactElement | null {
+  const activePhases = selectActivePhasesWithTasks(phases, tasks)
+
+  if (activePhases.length === 0) {
+    return null
+  }
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Roadmap</Text>
+      {activePhases.map(({ phase, tasks: phaseTasks }) => {
+        const phaseTaskStatusCounts = countTasksByStatus(phaseTasks)
+        const doneCount = phaseTaskStatusCounts.done
+
+        return (
+          <View key={phase.phaseNumber} style={styles.itemCard}>
+            <Text style={styles.itemTitle}>
+              Phase {phase.phaseNumber}: {phase.name}
+            </Text>
+            <Text style={styles.phaseGoal}>{phase.goal}</Text>
+            <Text style={styles.taskProgressSummary}>
+              完了Task: {doneCount} / {phaseTasks.length}
+            </Text>
+          </View>
+        )
+      })}
     </View>
   )
 }
@@ -416,8 +514,11 @@ export default function ProjectDetailScreen(): ReactElement {
       }
 
       const tasks = await fetchTasks(projectId)
-      const jobsByTaskId = await fetchJobsByTaskId(tasks)
-      setData({ jobsByTaskId, project, tasks })
+      const [jobsByTaskId, phases] = await Promise.all([
+        fetchJobsByTaskId(tasks),
+        fetchRoadmapPhases(projectId),
+      ])
+      setData({ jobsByTaskId, phases, project, tasks })
     } catch (loadError) {
       setError(getErrorMessage(loadError))
       Alert.alert('エラー', 'Project詳細の取得に失敗しました')
@@ -463,6 +564,9 @@ export default function ProjectDetailScreen(): ReactElement {
       {data !== null && (
         <>
           <ProjectStatusSection project={data.project} />
+          <GoalSection project={data.project} />
+          <DesignPhilosophySection designPhilosophy={data.project.designPhilosophy} />
+          <RoadmapSection phases={data.phases} tasks={data.tasks} />
           <TaskProgressSection tasks={data.tasks} />
           <RunningTaskJobsSection
             jobsByTaskId={data.jobsByTaskId}
@@ -492,6 +596,21 @@ const styles = StyleSheet.create({
   backText: {
     color: '#3b82f6',
     fontSize: 15,
+  },
+  bodyText: {
+    color: '#d4d4d4',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  bulletText: {
+    color: '#d4d4d4',
+    fontSize: 14,
+    lineHeight: 22,
+  },
+  phaseGoal: {
+    color: '#a3a3a3',
+    fontSize: 13,
+    marginTop: 4,
   },
   bottomSpacer: {
     height: 48,

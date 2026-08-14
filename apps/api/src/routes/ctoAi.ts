@@ -14,7 +14,7 @@ import { writeProjectMemory } from '../ctoAi/projectMemoryWriter.js'
 import { generateRoadmap } from '../ctoAi/roadmapGenerator.js'
 import { writeRoadmap } from '../ctoAi/roadmapWriter.js'
 import { getStorage } from '../storage'
-import { validateRoadmapTasks, type RoadmapSyncTaskInput } from '../storage/roadmapTaskValidation'
+import { validateRoadmapTasks, validateRoadmapPhases, type RoadmapSyncTaskInput, type RoadmapSyncPhaseInput } from '../storage/roadmapTaskValidation'
 import { validateTargetRoot } from '../utils/pathGuard.js'
 
 const CONFIGURED_TARGET_ROOT = process.env.TARGET_ROOT ?? '/workspace/target'
@@ -162,8 +162,16 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
         acceptanceCriteria: task.acceptanceCriteria,
         allowedPaths: task.allowedPaths,
       }))
+      const roadmapPhases: RoadmapSyncPhaseInput[] = roadmap.phases.map((phase) => ({
+        phaseNumber: phase.number,
+        name: phase.name,
+        goal: phase.goal,
+      }))
 
-      const validationIssues = validateRoadmapTasks(roadmapTasks)
+      const validationIssues = [
+        ...validateRoadmapTasks(roadmapTasks),
+        ...validateRoadmapPhases(roadmapPhases, roadmapTasks),
+      ]
       if (validationIssues.length > 0) {
         return reply.status(422).send({
           error: 'ロードマップの検証に失敗しました',
@@ -171,16 +179,17 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
         })
       }
 
-      const syncResult = storage.tasks.syncRoadmapTasks({ projectId, tasks: roadmapTasks })
+      const syncResult = storage.tasks.syncRoadmapTasks({ projectId, tasks: roadmapTasks, phases: roadmapPhases })
       if (!syncResult.ok) {
         return reply.status(409).send({
           error: 'ロードマップの同期に失敗しました',
           detail: syncResult.failureReason,
           conflicts: syncResult.conflicts,
+          phaseConflicts: syncResult.phaseConflicts,
         })
       }
 
-      // 2. target-project に書き出し
+      // 2. target-project に書き出し（人間向けsnapshot。正本はDB）
       const writeResult = writeRoadmap(roadmap, targetProjectRoot)
 
       return reply.status(201).send({
@@ -193,6 +202,10 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
           updated: syncResult.updatedTaskIds.length,
           reactivated: syncResult.reactivatedTaskIds.length,
           deactivated: syncResult.deactivatedTaskIds.length,
+          phasesCreated: syncResult.createdPhaseNumbers.length,
+          phasesUpdated: syncResult.updatedPhaseNumbers.length,
+          phasesReactivated: syncResult.reactivatedPhaseNumbers.length,
+          phasesDeactivated: syncResult.deactivatedPhaseNumbers.length,
         },
         writtenFiles: writeResult.writtenFiles,
         targetDir: writeResult.targetDir,

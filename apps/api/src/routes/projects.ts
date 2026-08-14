@@ -35,6 +35,19 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(project)
   })
 
+  // GET /api/projects/:id/roadmap — 現行Roadmap（roadmapActive=trueのPhaseのみ）
+  // 消えたPhaseの履歴はDBにroadmapActive=falseで残るが、「現在のRoadmap」を返す本エンドポイントでは除外する
+  app.get<{ Params: { id: string } }>('/:id/roadmap', async (req, reply) => {
+    const project = storage.projects.findById(req.params.id)
+    if (!project) {
+      return reply.status(404).send({ error: 'Project not found' })
+    }
+    const activePhases = storage.projectRoadmapPhases
+      .findByProjectId(req.params.id)
+      .filter((phase) => phase.roadmapActive)
+    return reply.send({ phases: activePhases })
+  })
+
   app.post('/', async (req, reply) => {
     const result = CreateProjectBody.safeParse(req.body)
     if (!result.success) {

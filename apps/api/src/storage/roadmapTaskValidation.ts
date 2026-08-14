@@ -16,16 +16,30 @@ export interface RoadmapTaskSpecConflict {
   field: 'title' | 'description' | 'phase' | 'assignee' | 'allowedPaths' | 'acceptanceCriteria' | 'dependencies'
 }
 
+export interface RoadmapSyncPhaseInput {
+  phaseNumber: number
+  name: string
+  goal: string
+}
+
+export interface RoadmapPhaseSpecConflict {
+  phaseNumber: number
+  field: 'name' | 'goal'
+}
+
 export type RoadmapValidationIssueCode =
   | 'duplicate_roadmap_task_key'
   | 'unknown_dependency'
   | 'self_dependency'
   | 'circular_dependency'
   | 'empty_roadmap'
+  | 'duplicate_phase_number'
+  | 'unknown_phase'
 
 export interface RoadmapValidationIssue {
   code: RoadmapValidationIssueCode
   roadmapTaskKey?: string
+  phaseNumber?: number
   message: string
 }
 
@@ -158,5 +172,50 @@ export function validateRoadmapTasks(tasks: RoadmapSyncTaskInput[]): RoadmapVali
     ...buildDuplicateIssues(tasks),
     ...buildDependencyIssues(tasks, roadmapTaskKeys),
     ...buildCircularDependencyIssues(tasks, roadmapTaskKeys),
+  ]
+}
+
+function buildDuplicatePhaseIssues(phases: RoadmapSyncPhaseInput[]): RoadmapValidationIssue[] {
+  const counts = new Map<number, number>()
+  for (const phase of phases) {
+    counts.set(phase.phaseNumber, (counts.get(phase.phaseNumber) ?? 0) + 1)
+  }
+
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([phaseNumber]) => ({
+      code: 'duplicate_phase_number' as const,
+      phaseNumber,
+      message: `Duplicate phaseNumber: ${phaseNumber}`,
+    }))
+}
+
+function buildUnknownPhaseIssues(
+  tasks: RoadmapSyncTaskInput[],
+  phaseNumbers: Set<number>,
+): RoadmapValidationIssue[] {
+  return tasks
+    .filter((task) => !phaseNumbers.has(task.phase))
+    .map((task) => ({
+      code: 'unknown_phase' as const,
+      roadmapTaskKey: task.roadmapTaskKey,
+      phaseNumber: task.phase,
+      message: `Task ${task.roadmapTaskKey} references unknown phase ${task.phase}`,
+    }))
+}
+
+/**
+ * DB書き込み前に、Roadmap Phase自身の自己整合性を検証する（DBは見ない）。
+ * Task側の`phase`が実在するPhaseを参照しているかもここで検証する。
+ */
+export function validateRoadmapPhases(
+  phases: RoadmapSyncPhaseInput[],
+  tasks: RoadmapSyncTaskInput[],
+): RoadmapValidationIssue[] {
+  const phaseNumbers = new Set(phases.map((phase) => phase.phaseNumber))
+
+  return [
+    ...buildDuplicatePhaseIssues(phases),
+    ...buildUnknownPhaseIssues(tasks, phaseNumbers),
   ]
 }

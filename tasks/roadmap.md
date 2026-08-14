@@ -829,28 +829,58 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       role基盤を追加せず現状で要件を満たすと判断（最小変更原則）。state-mutatingな全routes/
       storage操作の網羅確認済み（Task/Project等の通常CRUDはaudit対象外、review/QA結果は
       append-only履歴で追跡可能なため対象外）
-<!-- roadmap:id=project-auto-project-roadmap-visibility state=planned -->
-6. [ ] **Project別Roadmap可視化**（2026-08-14、Project Detail調査により新規登録。既存項目
+<!-- roadmap:id=project-auto-project-roadmap-visibility state=in_progress -->
+6. [ ] **Project別Roadmap可視化** — 2026-08-14実装完了、Mobile実機/シミュレータでのruntime smoke
+      未確認のため`in_progress`のまま維持（doneにはしない）。既存項目
       （`project-auto-completion-detection`＝Project完了判定のみ、`project-auto-ceo-alignment`＝
-      Phase完了通知のみ、`project-auto-context-pack-wiring`＝AI CLIへのcontext供給のみ）は
-      いずれも責務が異なり、自然に統合できないため独立項目とする）。**CEO方針（2026-08-14
-      確定）: `project-auto-db-safety`のDB Safety B完了後に着手する次の主要項目**
-      （技術的dependencyではなく、CEOが決めた実装順序）。
+      Phase完了通知のみ、`project-auto-context-pack-wiring`＝AI CLIへのcontext供給のみ）とは責務が
+      異なるため独立項目のまま扱う。
 
-      **現状のCurrent Truth（未実装であることの確認）**:
-      - Project別RoadmapのUIは未実装（Mobile Project Detail画面にRoadmap関連の表示は無い）
-      - ProjectとRoadmapの紐付け自体が未実装（`tasks/roadmap.md`はAIteamOS自己開発専用であり、
-        一般Project向けのRoadmap概念とは別物）
-      - Project別Roadmapのデータ/APIそのものが未設計・未実装（`Project`型に`goal`/
-        `designPhilosophy`フィールドはあるが、Roadmap相当のフィールド・テーブル・APIは無い）
+      **現状のCurrent Truth**:
+      - implementation complete（下記実装範囲を参照）
+      - tests/typecheck complete（`pnpm verify`全通過、API 579 tests・Worker 911 tests）
+      - **Mobile runtime smokeのみ未確認**（実機/シミュレータでの目視確認を行っていない。
+        typecheckのみで動作未検証）。確認後にdoneへ更新する
 
-      **Goal（今回はこの範囲のみ登録。巨大仕様にしない）**:
-      - Goal / Design Philosophy / Roadmap / Task進捗をProject単位で確認できること
-      - Project Roadmapの正本を持てること（データ保存先を確定する）
-      - Mobile Project Detailから閲覧できること
+      **正本設計**: Project別Roadmapのstructured source of truthはDB（新設`project_roadmap_phases`
+      テーブル）とした。既存`POST /api/cto/generate-roadmap`のTask同期（`syncRoadmapTasks()`、
+      db.transaction内でcreate/update/reactivate/deactivateとconflict検出を行う既存機構）が
+      Phase同期より先にDB確定させる設計だったため、Task粒度は元々DBが実質的な正本であったことを
+      確認した上で、不足していたPhase粒度（`name`/`goal`）だけを同一機構・同一transactionへ
+      最小追加した。`docs/roadmap.md`はどこからも再読込されない書き込み専用のドキュメントである
+      ことをコード調査で確認し、target-project内の人間向け生成snapshotという現状の役割のまま維持
+      （parser新設・逆同期は行わない）。AIteamOS自身の`tasks/roadmap.md`（CEOのgit diffレビューに
+      組み込まれたDocument SoT）とは統治モデルが異なるため、同じ方式を適用しないと判断した
 
-      **今回は設計・実装しない**: 上記Goal達成のための具体的なデータモデル・API・UI設計は
-      今回のroadmap登録では確定しない。新しいGate/Workflow/Agentは前提としない
+      **Phase再同期の整合性**: `(projectId, phaseNumber)`をMVPのPhase識別に用いる。Job履歴がある、
+      またはstatusが`pending`でないTaskを持つPhaseは「着手済み」とみなし、そのPhaseの`name`/`goal`
+      変更を既存`RoadmapTaskConflictError`と同じ枠組みでconflict化して409で拒否する（Task側の
+      spec freeze思想とPhase側を統一）。着手済みTaskを含まないPhaseは自由に更新できる。消失した
+      Phaseは削除ではなく`roadmapActive=false`（Task同様、活動中Jobを持つ場合は拒否）。Phase/Task
+      同期は同一DB transaction内で行い、一方の書き込みが失敗すれば両方ロールバックされる。Milestone
+      entity・Phase UUID・generic versioning systemは追加していない
+
+      **最小schema**: `project_roadmap_phases(project_id, phase_number, name, goal, roadmap_active,
+      created_at, updated_at)`。PRIMARY KEY (project_id, phase_number)。既存`tasks`テーブルの
+      `phase`/`roadmapTaskKey`/`roadmapActive`/`dependencies`/`acceptanceCriteria`はスキーマ変更
+      なしでそのまま再利用した
+
+      **実装範囲**: (1) Phase metadata storage（`schema.ts`/`interface.ts`/`sqlite.ts`）
+      (2) `generate-roadmap`実行時のPhase+Task同期（`ctoAi.ts`、`roadmapTaskValidation.ts`へ
+      `validateRoadmapPhases()`追加） (3) `GET /api/projects/:id/roadmap`読み取りAPI新設
+      (4) Mobile Project Detail: Goal・Design Philosophy・Phase名/goal・Phase別Task進捗（
+      `roadmapActive`なPhase/Taskのみ表示）を追加。次Taskを決定するplanning algorithmは追加して
+      いない（既存data・既存API・既存job/approval状態の再利用のみ）
+
+      **DB Safety**: additive migrationのみ（新規テーブル追加、既存テーブルへのALTERなし）。
+      Roadmap生成/再生成はTask/Project通常CRUDと同様の性質（削除ではなくsoft
+      deactivate、authorization/approval判断を伴わない）と判断し、`audit_log`（DB Safety B）の
+      対象には追加しなかった（audit system自体の拡張は行わない）
+
+      **完了条件**: Phase metadataがDB正本として取得可能／PhaseとTaskが再同期時にも矛盾しない
+      （テストで検証）／`docs/roadmap.md`はsnapshotとして維持／Mobile Project DetailでGoal /
+      Design Philosophy / Roadmap進捗を確認可能／既存Task Roadmap同期を壊さない（既存test全件
+      regressionなし）／新規Milestone/versioning/generic planning systemなし、をすべて満たした
 <!-- roadmap:id=project-auto-task-job-chain state=blocked -->
 7. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
       `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。

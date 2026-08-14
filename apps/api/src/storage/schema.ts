@@ -38,6 +38,18 @@ export const CREATE_TABLES = `
     FOREIGN KEY (project_id) REFERENCES projects(id)
   );
 
+  CREATE TABLE IF NOT EXISTS project_roadmap_phases (
+    project_id TEXT NOT NULL,
+    phase_number INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    roadmap_active INTEGER NOT NULL DEFAULT 1 CHECK (roadmap_active IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project_id, phase_number),
+    FOREIGN KEY (project_id) REFERENCES projects(id)
+  );
+
   CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,

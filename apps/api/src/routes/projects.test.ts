@@ -140,6 +140,73 @@ describe('Project API', () => {
     })
   })
 
+  it('GET /api/projects/:id/roadmap returns synced phases ordered by phaseNumber', async () => {
+    await withApp(async (app) => {
+      const created = await createProject(app, { name: 'P', goal: 'g' })
+
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().tasks.syncRoadmapTasks({
+        projectId: created.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 1, name: 'First', goal: 'G1' }],
+      })
+
+      const res = await app.inject({ method: 'GET', url: `/api/projects/${created.id}/roadmap` })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<{ phases: Array<{ phaseNumber: number; name: string }> }>(res.body)
+      expect(body.phases).toEqual([
+        expect.objectContaining({ phaseNumber: 1, name: 'First', roadmapActive: true }),
+      ])
+    })
+  })
+
+  it('GET /api/projects/:id/roadmap excludes deactivated phases while DB history is preserved', async () => {
+    await withApp(async (app) => {
+      const created = await createProject(app, { name: 'P', goal: 'g' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: created.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 1, name: 'Old phase', goal: 'Old goal' }],
+      })
+      // 再生成でphase 1が消え、phase 2だけが現行Roadmapになる
+      storage.tasks.syncRoadmapTasks({
+        projectId: created.id,
+        tasks: [
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 2, name: 'New phase', goal: 'New goal' }],
+      })
+
+      const res = await app.inject({ method: 'GET', url: `/api/projects/${created.id}/roadmap` })
+      const body = parseBody<{ phases: Array<{ phaseNumber: number; roadmapActive: boolean }> }>(res.body)
+
+      // APIは現行Roadmap（active）のみ返す
+      expect(body.phases).toHaveLength(1)
+      expect(body.phases[0]).toMatchObject({ phaseNumber: 2, roadmapActive: true })
+
+      // DBには履歴としてinactiveなphase 1が残っている（削除されていない）
+      const allPhases = storage.projectRoadmapPhases.findByProjectId(created.id)
+      expect(allPhases).toHaveLength(2)
+      expect(allPhases.find((p) => p.phaseNumber === 1)?.roadmapActive).toBe(false)
+    })
+  })
+
+  it('GET /api/projects/:id/roadmap returns 404 for a missing project', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({ method: 'GET', url: '/api/projects/not-exist/roadmap' })
+
+      expect(res.statusCode).toBe(404)
+    })
+  })
+
   it('PATCH /api/projects/:id updates a project', async () => {
     await withApp(async (app) => {
       const created = await createProject(app, { name: 'Old' })

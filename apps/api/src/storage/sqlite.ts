@@ -9,10 +9,10 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
-import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
-import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
+import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 
@@ -31,11 +31,23 @@ export class ArchiveBlockedByRunningJobError extends Error {
 }
 
 export class RoadmapTaskConflictError extends Error {
-  constructor(public readonly conflicts: RoadmapTaskSpecConflict[]) {
+  constructor(
+    public readonly conflicts: RoadmapTaskSpecConflict[],
+    public readonly phaseConflicts: RoadmapPhaseSpecConflict[] = [],
+  ) {
     super(
-      `Roadmap task spec conflicts detected for started/completed tasks: ${
-        conflicts.map((conflict) => `${conflict.roadmapTaskKey}.${conflict.field}`).join(', ')
-      }`,
+      [
+        conflicts.length > 0
+          ? `Roadmap task spec conflicts detected for started/completed tasks: ${
+              conflicts.map((conflict) => `${conflict.roadmapTaskKey}.${conflict.field}`).join(', ')
+            }`
+          : undefined,
+        phaseConflicts.length > 0
+          ? `Roadmap phase spec conflicts detected for phases with started tasks: ${
+              phaseConflicts.map((conflict) => `phase${conflict.phaseNumber}.${conflict.field}`).join(', ')
+            }`
+          : undefined,
+      ].filter(Boolean).join('; '),
     )
     this.name = 'RoadmapTaskConflictError'
   }
@@ -203,6 +215,54 @@ function collectRoadmapTaskSpecConflicts(
     )
     if (!dependencyKeys || !sameStringArrayAsSet(dependencyKeys, roadmapTask.dependencies)) {
       addConflict(roadmapTaskKey, 'dependencies')
+    }
+  }
+
+  return conflicts
+}
+
+/** Task.status='pending' かつ Job履歴が一切無いTaskのみ「未着手」とみなす（collectRoadmapTaskSpecConflictsのspecLockedと同一定義） */
+function isTaskStarted(task: Task, jobsByTaskId: Map<string, Job[]>): boolean {
+  const hasJobHistory = (jobsByTaskId.get(task.id) ?? []).length > 0
+  return hasJobHistory || task.status !== 'pending'
+}
+
+function groupTasksByPhase(tasks: Task[]): Map<number, Task[]> {
+  const grouped = new Map<number, Task[]>()
+  for (const task of tasks) {
+    if (task.phase === undefined) continue
+    const group = grouped.get(task.phase) ?? []
+    group.push(task)
+    grouped.set(task.phase, group)
+  }
+  return grouped
+}
+
+/**
+ * 既に着手されたTaskを持つPhaseのname/goalが変更される場合をconflictとして検出する。
+ * 「Phase番号の意味が再割り当てされ、着手済みTaskが誤ったPhase metadataへ紐づく」事故を防ぐ。
+ */
+function collectRoadmapPhaseSpecConflicts(
+  existingPhases: ProjectRoadmapPhase[],
+  inputByNumber: Map<number, RoadmapSyncPhaseInput>,
+  tasksByPhase: Map<number, Task[]>,
+  jobsByTaskId: Map<string, Job[]>,
+): RoadmapPhaseSpecConflict[] {
+  const conflicts: RoadmapPhaseSpecConflict[] = []
+
+  for (const existingPhase of existingPhases) {
+    const inputPhase = inputByNumber.get(existingPhase.phaseNumber)
+    if (!inputPhase) continue // 消失したPhaseは別途disappearedPhasesとして扱う
+
+    const phaseTasks = tasksByPhase.get(existingPhase.phaseNumber) ?? []
+    const hasStartedTask = phaseTasks.some((task) => isTaskStarted(task, jobsByTaskId))
+    if (!hasStartedTask) continue
+
+    if (existingPhase.name !== inputPhase.name) {
+      conflicts.push({ phaseNumber: existingPhase.phaseNumber, field: 'name' })
+    }
+    if (existingPhase.goal !== inputPhase.goal) {
+      conflicts.push({ phaseNumber: existingPhase.phaseNumber, field: 'goal' })
     }
   }
 
@@ -574,28 +634,43 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const emptyFailureResult = (
         failureReason: string,
         conflicts?: RoadmapTaskSpecConflict[],
+        phaseConflicts?: RoadmapPhaseSpecConflict[],
       ): RoadmapSyncResult => ({
         ok: false,
         createdTaskIds: [],
         updatedTaskIds: [],
         reactivatedTaskIds: [],
         deactivatedTaskIds: [],
+        createdPhaseNumbers: [],
+        updatedPhaseNumbers: [],
+        reactivatedPhaseNumbers: [],
+        deactivatedPhaseNumbers: [],
         failureReason,
         conflicts,
+        phaseConflicts,
       })
 
       const syncTransaction = db.transaction((
         projectId: string,
         roadmapTasks: RoadmapSyncTaskInput[],
+        roadmapPhases: RoadmapSyncPhaseInput[],
       ): RoadmapSyncResult => {
         const createdTaskIds: string[] = []
         const updatedTaskIdSet = new Set<string>()
         const reactivatedTaskIds: string[] = []
         const deactivatedTaskIds: string[] = []
+        const createdPhaseNumbers: number[] = []
+        const updatedPhaseNumbers: number[] = []
+        const reactivatedPhaseNumbers: number[] = []
+        const deactivatedPhaseNumbers: number[] = []
         const inputByKey = new Map(
           roadmapTasks.map((roadmapTask) => [roadmapTask.roadmapTaskKey, roadmapTask] as const),
         )
         const inputKeys = new Set(inputByKey.keys())
+        const inputPhaseByNumber = new Map(
+          roadmapPhases.map((phase) => [phase.phaseNumber, phase] as const),
+        )
+        const inputPhaseNumbers = new Set(inputPhaseByNumber.keys())
 
         const projectTaskRows = db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(projectId) as any[]
         const projectTasks = projectTaskRows.map(deserializeTask)
@@ -611,6 +686,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         const disappearedTasks = existingRoadmapTasks.filter((task) => (
           task.roadmapTaskKey !== undefined && !inputKeys.has(task.roadmapTaskKey)
         ))
+        const tasksByPhase = groupTasksByPhase(projectTasks)
+
+        const existingPhaseRows = db.prepare(
+          'SELECT * FROM project_roadmap_phases WHERE project_id = ?',
+        ).all(projectId) as any[]
+        const existingPhases = existingPhaseRows.map(deserializeProjectRoadmapPhase)
+        const disappearedPhases = existingPhases.filter((phase) => (
+          phase.roadmapActive && !inputPhaseNumbers.has(phase.phaseNumber)
+        ))
 
         for (const task of disappearedTasks) {
           const activeJob = (jobsByTaskId.get(task.id) ?? [])
@@ -623,6 +707,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
         }
 
+        for (const phase of disappearedPhases) {
+          const phaseTasks = tasksByPhase.get(phase.phaseNumber) ?? []
+          const activeJobTask = phaseTasks.find((task) => (
+            (jobsByTaskId.get(task.id) ?? []).some((job) => ACTIVE_JOB_STATUSES.has(job.status))
+          ))
+
+          if (activeJobTask) {
+            throw new Error(
+              `Cannot deactivate roadmap phase ${phase.phaseNumber} because task ${activeJobTask.id} has an active job`,
+            )
+          }
+        }
+
         const conflicts = collectRoadmapTaskSpecConflicts(
           existingRoadmapTasks,
           inputByKey,
@@ -630,8 +727,49 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           projectTaskIdToRoadmapTaskKey,
           jobsByTaskId,
         )
-        if (conflicts.length > 0) {
-          throw new RoadmapTaskConflictError(conflicts)
+        const phaseConflicts = collectRoadmapPhaseSpecConflicts(
+          existingPhases,
+          inputPhaseByNumber,
+          tasksByPhase,
+          jobsByTaskId,
+        )
+        if (conflicts.length > 0 || phaseConflicts.length > 0) {
+          throw new RoadmapTaskConflictError(conflicts, phaseConflicts)
+        }
+
+        for (const inputPhase of roadmapPhases) {
+          const existingPhase = existingPhases.find((phase) => phase.phaseNumber === inputPhase.phaseNumber)
+
+          if (!existingPhase) {
+            db.prepare(`
+              INSERT INTO project_roadmap_phases
+                (project_id, phase_number, name, goal, roadmap_active, created_at, updated_at)
+              VALUES (?, ?, ?, ?, 1, ?, ?)
+            `).run(projectId, inputPhase.phaseNumber, inputPhase.name, inputPhase.goal, now(), now())
+            createdPhaseNumbers.push(inputPhase.phaseNumber)
+            continue
+          }
+
+          const specChanged = existingPhase.name !== inputPhase.name || existingPhase.goal !== inputPhase.goal
+          const reactivating = !existingPhase.roadmapActive
+
+          if (specChanged || reactivating) {
+            db.prepare(`
+              UPDATE project_roadmap_phases SET name=?, goal=?, roadmap_active=1, updated_at=?
+              WHERE project_id=? AND phase_number=?
+            `).run(inputPhase.name, inputPhase.goal, now(), projectId, inputPhase.phaseNumber)
+
+            if (specChanged) updatedPhaseNumbers.push(inputPhase.phaseNumber)
+            if (reactivating) reactivatedPhaseNumbers.push(inputPhase.phaseNumber)
+          }
+        }
+
+        for (const phase of disappearedPhases) {
+          db.prepare(`
+            UPDATE project_roadmap_phases SET roadmap_active=0, updated_at=?
+            WHERE project_id=? AND phase_number=?
+          `).run(now(), projectId, phase.phaseNumber)
+          deactivatedPhaseNumbers.push(phase.phaseNumber)
         }
 
         const roadmapTaskKeyToTaskId = new Map<string, string>()
@@ -742,19 +880,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           updatedTaskIds: [...updatedTaskIdSet],
           reactivatedTaskIds,
           deactivatedTaskIds,
+          createdPhaseNumbers,
+          updatedPhaseNumbers,
+          reactivatedPhaseNumbers,
+          deactivatedPhaseNumbers,
         }
       })
 
       try {
-        return syncTransaction(input.projectId, input.tasks)
+        return syncTransaction(input.projectId, input.tasks, input.phases ?? [])
       } catch (err: unknown) {
         if (err instanceof RoadmapTaskConflictError) {
-          return emptyFailureResult(err.message, err.conflicts)
+          return emptyFailureResult(err.message, err.conflicts, err.phaseConflicts)
         }
 
         const message = err instanceof Error ? err.message : String(err)
         return emptyFailureResult(message)
       }
+    },
+  }
+
+  const projectRoadmapPhases: IProjectRoadmapPhaseStorage = {
+    findByProjectId(projectId) {
+      const rows = db.prepare(
+        'SELECT * FROM project_roadmap_phases WHERE project_id = ? ORDER BY phase_number ASC',
+      ).all(projectId) as any[]
+      return rows.map(deserializeProjectRoadmapPhase)
     },
   }
 
@@ -2287,7 +2438,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, auditLog, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, auditLog, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
 }
 
 function deserializeProject(row: any): Project {
@@ -2321,6 +2472,18 @@ function deserializeTask(row: any): Task {
     roadmapActive: row.roadmap_active === 1,
     branchName: row.branch_name ?? undefined,
     commitHash: row.commit_hash ?? undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function deserializeProjectRoadmapPhase(row: any): ProjectRoadmapPhase {
+  return {
+    projectId: row.project_id,
+    phaseNumber: row.phase_number,
+    name: row.name,
+    goal: row.goal,
+    roadmapActive: row.roadmap_active === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }

@@ -1,19 +1,28 @@
 import { describe, expect, it } from 'vitest'
-import { validateRoadmapTasks, type RoadmapSyncTaskInput } from './roadmapTaskValidation'
+import { validateRoadmapTasks, validateRoadmapPhases, type RoadmapSyncTaskInput, type RoadmapSyncPhaseInput } from './roadmapTaskValidation'
 
 function task(
   roadmapTaskKey: string,
   dependencies: string[] = [],
+  phase = 1,
 ): RoadmapSyncTaskInput {
   return {
     roadmapTaskKey,
     title: `Task ${roadmapTaskKey}`,
     description: '',
-    phase: 1,
+    phase,
     assignee: 'developer_ai',
     dependencies,
     acceptanceCriteria: [],
     allowedPaths: [],
+  }
+}
+
+function phase(phaseNumber: number): RoadmapSyncPhaseInput {
+  return {
+    phaseNumber,
+    name: `Phase ${phaseNumber}`,
+    goal: `Goal ${phaseNumber}`,
   }
 }
 
@@ -89,6 +98,40 @@ describe('validateRoadmapTasks', () => {
 
     expect(issues).toContainEqual(expect.objectContaining({
       code: 'circular_dependency',
+    }))
+  })
+})
+
+describe('validateRoadmapPhases', () => {
+  it('returns no issues for valid input', () => {
+    expect(validateRoadmapPhases(
+      [phase(1), phase(2)],
+      [task('task-001', [], 1), task('task-002', [], 2)],
+    )).toEqual([])
+  })
+
+  it('detects duplicate phase numbers', () => {
+    const issues = validateRoadmapPhases(
+      [phase(1), phase(1)],
+      [task('task-001', [], 1)],
+    )
+
+    expect(issues).toContainEqual(expect.objectContaining({
+      code: 'duplicate_phase_number',
+      phaseNumber: 1,
+    }))
+  })
+
+  it('detects a task referencing an unknown phase', () => {
+    const issues = validateRoadmapPhases(
+      [phase(1)],
+      [task('task-001', [], 2)],
+    )
+
+    expect(issues).toContainEqual(expect.objectContaining({
+      code: 'unknown_phase',
+      roadmapTaskKey: 'task-001',
+      phaseNumber: 2,
     }))
   })
 })

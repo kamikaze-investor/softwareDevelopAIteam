@@ -1596,4 +1596,186 @@ describe('SQLiteStorage', () => {
       expect(entries[1].operation).toBe('approve')
     })
   })
+
+  describe('projectRoadmapPhases', () => {
+    it('creates the table in a new database', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-project-roadmap-phases-${randomUUID()}.db`)
+      createSQLiteStorage(dbPath)
+      const db = new Database(dbPath, { readonly: true })
+
+      try {
+        const columns = new Set(
+          (db.pragma('table_info(project_roadmap_phases)') as Array<{ name: string }>)
+            .map((column) => column.name),
+        )
+
+        expect(columns.has('project_id')).toBe(true)
+        expect(columns.has('phase_number')).toBe(true)
+        expect(columns.has('name')).toBe(true)
+        expect(columns.has('goal')).toBe(true)
+        expect(columns.has('roadmap_active')).toBe(true)
+      } finally {
+        db.close()
+      }
+    })
+
+    it('syncs phases alongside tasks and returns them ordered by phaseNumber', () => {
+      const project = storage.projects.create({
+        name: 'Roadmap phase project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [
+          { phaseNumber: 2, name: 'Second', goal: 'G2' },
+          { phaseNumber: 1, name: 'First', goal: 'G1' },
+        ],
+      })
+
+      const phases = storage.projectRoadmapPhases.findByProjectId(project.id)
+      expect(phases.map((p) => p.phaseNumber)).toEqual([1, 2])
+      expect(phases[0]).toMatchObject({ projectId: project.id, name: 'First', goal: 'G1', roadmapActive: true })
+      expect(phases[1]).toMatchObject({ projectId: project.id, name: 'Second', goal: 'G2', roadmapActive: true })
+    })
+
+    it('rolls back both task and phase changes when a phase conflict is detected', () => {
+      const project = storage.projects.create({
+        name: 'Roadmap phase conflict project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 1, name: 'Original', goal: 'Original goal' }],
+      })
+      const startedTask = storage.tasks.findByProjectId(project.id)[0]
+      storage.jobs.create({
+        taskId: startedTask.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'success',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+
+      // phase 1 のrepurpose（conflict）と、無関係な新規phase 2・新規taskを同一呼び出しに含める。
+      // 同一transactionであれば、phase 1のconflictでロールバックされ、phase 2・task-002も作成されないはず。
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [
+          { phaseNumber: 1, name: 'Repurposed', goal: 'Repurposed goal' },
+          { phaseNumber: 2, name: 'Unrelated new phase', goal: 'Unrelated goal' },
+        ],
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.phaseConflicts).toContainEqual({ phaseNumber: 1, field: 'name' })
+      expect(result.phaseConflicts).toContainEqual({ phaseNumber: 1, field: 'goal' })
+      expect(storage.projectRoadmapPhases.findByProjectId(project.id)[0].name).toBe('Original')
+      // 同一transactionであることの確認: 無関係な新規phase 2・task-002も作成されていない
+      expect(storage.projectRoadmapPhases.findByProjectId(project.id)).toHaveLength(1)
+      expect(storage.tasks.findByProjectId(project.id)).toHaveLength(1)
+    })
+
+    it('rolls back an unrelated new phase when a Task-level conflict is detected in the same call (same-transaction proof)', () => {
+      const project = storage.projects.create({
+        name: 'Roadmap task conflict blocks phase project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'Original title', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 1, name: 'Phase 1', goal: 'G1' }],
+      })
+      const startedTask = storage.tasks.findByProjectId(project.id)[0]
+      storage.jobs.create({
+        taskId: startedTask.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'success',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+
+      // task-001（着手済み）のtitle変更（task-level conflict）と、無関係な新規phase 2を同一呼び出しに含める。
+      const result = storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'Changed title', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [
+          { phaseNumber: 1, name: 'Phase 1', goal: 'G1' },
+          { phaseNumber: 2, name: 'Unrelated new phase', goal: 'Unrelated goal' },
+        ],
+      })
+
+      expect(result.ok).toBe(false)
+      expect(result.conflicts).toContainEqual({ roadmapTaskKey: 'task-001', field: 'title' })
+      // task-levelのconflictにもかかわらず、無関係な新規phase 2が作成されていないこと（同一transaction証明）
+      expect(storage.projectRoadmapPhases.findByProjectId(project.id)).toHaveLength(1)
+      expect(storage.tasks.findById(startedTask.id)?.title).toBe('Original title')
+    })
+
+    it('deactivates a phase that disappears from regeneration and reactivates it if it reappears', () => {
+      const project = storage.projects.create({
+        name: 'Roadmap phase lifecycle project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 1, name: 'First', goal: 'G1' }],
+      })
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 2, name: 'Second', goal: 'G2' }],
+      })
+
+      const afterDeactivate = storage.projectRoadmapPhases.findByProjectId(project.id)
+      expect(afterDeactivate.find((p) => p.phaseNumber === 1)?.roadmapActive).toBe(false)
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: project.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [
+          { phaseNumber: 1, name: 'First', goal: 'G1' },
+          { phaseNumber: 2, name: 'Second', goal: 'G2' },
+        ],
+      })
+
+      const afterReactivate = storage.projectRoadmapPhases.findByProjectId(project.id)
+      expect(afterReactivate.find((p) => p.phaseNumber === 1)?.roadmapActive).toBe(true)
+    })
+  })
 })

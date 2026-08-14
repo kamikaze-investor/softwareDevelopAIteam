@@ -7,11 +7,11 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
-import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
+import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
-export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
+export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
 export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
@@ -104,8 +104,18 @@ export interface RoadmapSyncResult {
   updatedTaskIds: string[]
   reactivatedTaskIds: string[]
   deactivatedTaskIds: string[]
+  createdPhaseNumbers: number[]
+  updatedPhaseNumbers: number[]
+  reactivatedPhaseNumbers: number[]
+  deactivatedPhaseNumbers: number[]
   failureReason?: string
   conflicts?: RoadmapTaskSpecConflict[]
+  phaseConflicts?: RoadmapPhaseSpecConflict[]
+}
+
+export interface IProjectRoadmapPhaseStorage {
+  /** roadmapActive=false（過去に消えたPhase）も含めて、phaseNumber昇順で全件返す */
+  findByProjectId(projectId: string): ProjectRoadmapPhase[]
 }
 
 export interface IProjectStorage {
@@ -133,11 +143,16 @@ export interface ITaskStorage {
   ): CreateTaskWithInitialImplementJobResult
   update(id: string, data: Partial<Task>): Task | undefined
   /**
-   * 検証済みロードマップTask一覧を、単一トランザクションでDBへ同期する。
-   * 呼び出し前に validateRoadmapTasks() で自己整合性検証が済んでいる前提。
+   * 検証済みロードマップTask一覧（と、あればPhase一覧）を、単一トランザクションでDBへ同期する。
+   * 呼び出し前に validateRoadmapTasks() / validateRoadmapPhases() で自己整合性検証が済んでいる前提。
    * 失敗時はDBを一切変更しない。
+   * phasesを省略した場合はTask同期のみ行い、Phase同期は行わない（既存呼び出し元の後方互換用）。
    */
-  syncRoadmapTasks(input: { projectId: string; tasks: RoadmapSyncTaskInput[] }): RoadmapSyncResult
+  syncRoadmapTasks(input: {
+    projectId: string
+    tasks: RoadmapSyncTaskInput[]
+    phases?: RoadmapSyncPhaseInput[]
+  }): RoadmapSyncResult
 }
 
 export interface IJobStorage {
@@ -331,6 +346,7 @@ export interface IStorage {
   approvalRequests: IApprovalRequestStorage
   designReviewEvidence: IDesignReviewEvidenceStorage
   auditLog: IAuditLogStorage
+  projectRoadmapPhases: IProjectRoadmapPhaseStorage
   knowledgeGraph: IKnowledgeGraphStorage
   decisionCache: IDecisionCacheStorage
   incidentDB: IIncidentDBStorage

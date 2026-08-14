@@ -467,6 +467,166 @@ describe('CTO AI — generate-roadmap API', () => {
     expect(storage.tasks.findById(existingTask.id)?.title).toBe('Title task-001')
   })
 
+  it('POST /api/cto/generate-roadmap — Phase metadataもDBへ同期される', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.syncSummary).toMatchObject({
+      phasesCreated: 1,
+      phasesUpdated: 0,
+      phasesReactivated: 0,
+      phasesDeactivated: 0,
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    const phases = getStorage().projectRoadmapPhases.findByProjectId(project.id)
+    expect(phases).toEqual([
+      expect.objectContaining({
+        projectId: project.id,
+        phaseNumber: 1,
+        name: '基盤構築',
+        goal: '型定義とDB',
+        roadmapActive: true,
+      }),
+    ])
+  })
+
+  it('POST /api/cto/generate-roadmap — 未着手Taskのみのphaseはname/goal変更が反映される', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: mockRoadmapResponse([{ id: 'task-001' }]).replace('Phase 1', 'Renamed Phase'),
+      },
+    })
+    expect(res.statusCode).toBe(201)
+
+    const { getStorage } = await import('../storage/index.js')
+    const phases = getStorage().projectRoadmapPhases.findByProjectId(project.id)
+    expect(phases).toHaveLength(1)
+    expect(phases[0].name).toBe('Renamed Phase')
+  })
+
+  it('POST /api/cto/generate-roadmap returns 409 with phaseConflicts when a phase with a started task is repurposed', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+
+    // 1回目: task-001 が phase 1 に紐づき、Jobが完了して「着手済み」になる
+    await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+    const startedTask = storage.tasks.findByProjectId(project.id)[0]
+    storage.jobs.create({
+      taskId: startedTask.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    })
+
+    // 2回目: 同じ phase 1 だが task-001 は変更なし・phase 1 の name/goal だけ別の意味へ変更しようとする
+    const repurposedRoadmap = JSON.stringify({
+      ...JSON.parse(MOCK_ROADMAP),
+      phases: [{ number: 1, name: '全く別のPhase', goal: '別の目的', tasks: ['task-001'] }],
+    })
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: repurposedRoadmap,
+      },
+    })
+
+    const body = JSON.parse(res.body)
+    expect(res.statusCode).toBe(409)
+    expect(body.phaseConflicts).toContainEqual({ phaseNumber: 1, field: 'name' })
+    expect(body.phaseConflicts).toContainEqual({ phaseNumber: 1, field: 'goal' })
+    const phases = storage.projectRoadmapPhases.findByProjectId(project.id)
+    expect(phases[0].name).toBe('基盤構築') // ロールバックされ元のままであること
+  })
+
+  it('POST /api/cto/generate-roadmap — 再生成でPhaseが消えるとroadmapActive=falseになる', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: MOCK_ROADMAP,
+      },
+    })
+
+    const secondRoadmap = JSON.stringify({
+      phases: [{ number: 2, name: '別フェーズ', goal: '別の目的', tasks: ['task-002'] }],
+      tasks: [{
+        id: 'task-002', title: 'T2', description: 'D2', phase: 2, assignee: 'developer_ai',
+        dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small',
+      }],
+      totalTasks: 1,
+      estimatedWeeks: 1,
+    })
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: secondRoadmap,
+      },
+    })
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.syncSummary.phasesDeactivated).toBe(1)
+
+    const { getStorage } = await import('../storage/index.js')
+    const phases = getStorage().projectRoadmapPhases.findByProjectId(project.id)
+    const phase1 = phases.find((p: { phaseNumber: number }) => p.phaseNumber === 1)
+    expect(phase1?.roadmapActive).toBe(false)
+  })
+
   it('POST /api/cto/generate-roadmap returns 422 and creates no tasks for invalid generated roadmap', async () => {
     const app = await buildApp()
     const project = await createProject()
