@@ -821,8 +821,30 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       ai-team-db-backup.service`で確認）。
       **DB Safety B（残課題。本項目を`in_progress`のまま維持する理由）**: 重要状態変更の監査ログ・
       migration/一括削除の管理権限分離は未着手。これらが完了するまで本項目は`done`にしない
+<!-- roadmap:id=project-auto-project-roadmap-visibility state=planned -->
+6. [ ] **Project別Roadmap可視化**（2026-08-14、Project Detail調査により新規登録。既存項目
+      （`project-auto-completion-detection`＝Project完了判定のみ、`project-auto-ceo-alignment`＝
+      Phase完了通知のみ、`project-auto-context-pack-wiring`＝AI CLIへのcontext供給のみ）は
+      いずれも責務が異なり、自然に統合できないため独立項目とする）。**CEO方針（2026-08-14
+      確定）: `project-auto-db-safety`のDB Safety B完了後に着手する次の主要項目**
+      （技術的dependencyではなく、CEOが決めた実装順序）。
+
+      **現状のCurrent Truth（未実装であることの確認）**:
+      - Project別RoadmapのUIは未実装（Mobile Project Detail画面にRoadmap関連の表示は無い）
+      - ProjectとRoadmapの紐付け自体が未実装（`tasks/roadmap.md`はAIteamOS自己開発専用であり、
+        一般Project向けのRoadmap概念とは別物）
+      - Project別Roadmapのデータ/APIそのものが未設計・未実装（`Project`型に`goal`/
+        `designPhilosophy`フィールドはあるが、Roadmap相当のフィールド・テーブル・APIは無い）
+
+      **Goal（今回はこの範囲のみ登録。巨大仕様にしない）**:
+      - Goal / Design Philosophy / Roadmap / Task進捗をProject単位で確認できること
+      - Project Roadmapの正本を持てること（データ保存先を確定する）
+      - Mobile Project Detailから閲覧できること
+
+      **今回は設計・実装しない**: 上記Goal達成のための具体的なデータモデル・API・UI設計は
+      今回のroadmap登録では確定しない。新しいGate/Workflow/Agentは前提としない
 <!-- roadmap:id=project-auto-task-job-chain state=blocked -->
-6. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
+7. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
       `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。
       **加えて、GitHub外部強制境界（`project-auto-worker-trust-boundary`参照）が完成するまで、
       自律的なgit push/mergeを解放しない**（詳細は同項目参照。本項目へ内容を複製しない）。
@@ -854,7 +876,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **完了条件**: 1つのProjectで複数Taskが順に自動実行され、二重生成・途中失敗時に
       安全側で停止すること（既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）
 <!-- roadmap:id=project-auto-recovery-e2e state=planned -->
-7. [ ] **障害復旧E2E・自律実行有効化** — 依存: `project-auto-task-job-chain`。
+8. [ ] **障害復旧E2E・自律実行有効化** — 依存: `project-auto-task-job-chain`。
       **確認シナリオ**: API停止中にWorkerが完了／API復旧後に結果再送／ACK消失による重複送信／
       Worker再起動／API再起動／Outbox書き込み後のクラッシュ／DB反映後・ACK前の通信切断／
       paused Project／blocked・failed・Approval待ち／同一Taskへの同時Job生成／
@@ -869,18 +891,18 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       既存のJob/Task失敗可視化経路にそのまま乗ること／replay-safeでないJob（既存
       `CommandKindSchema`に無い外部作用を伴うJob）は本メカニズムの対象にしないこと。
 <!-- roadmap:id=project-auto-completion-detection state=planned -->
-8. [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
+9. [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
       **既知の穴**: `ProjectStatus`に`completed`が無い（`draft/running/paused/archived`のみ。
       `types/project.ts:3`）ため、計算値にするか状態として持つかの決定が必要。
       **完了条件**: 完了/未完了がAPIで取得でき、Mobileから確認できること
 <!-- roadmap:id=project-auto-ceo-alignment state=planned -->
-9. [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
+10. [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
       **通知後も開発は継続し、通常チェックポイントでは停止しない**。既存の`notifier`
       （LINE/Slack）・`summaryEngine.ts`・Approval Gateの再利用を前提とし、新しい停止Gateは作らない。
       **完了条件**: Phase完了時にCEOへ通知が届き、開発が止まらないこと。CEOが修正指示を返す経路は
       「追加開発指示（追加Task作成）」を使う
 <!-- roadmap:id=project-auto-meta-review-hardening state=done -->
-10. [x] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
+11. [x] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
       foundation実装完了。2026-08-14、残り3 Acceptance Criteria全件を実production経路への
       接続まで含めて完了しdoneへ）— 既存Meta Reviewer（`docs/meta_reviewer/`prompt/checklist、
       `apps/worker/src/metaReviewer/runner.ts`・`geminiRouter.ts`、AV-001保護）の改善。新しい
@@ -1096,8 +1118,6 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       Telemetry/Team Health/Self Diagnosis/Improvement Planner/CEO Proposal/Experiment/
       Evolutionの責務定義（本ファイル944-1030行）と重複する独立実装を作っていないこと
 
-### スマホ操作MVP残タスク（2026-07-21整理）
-
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
 スマホ操作MVPの定義・現状・不足機能の詳細な整理は `docs/PROJECT_CURRENT_STATE.md`「スマホ操作MVPの現在地」を参照。
@@ -1202,8 +1222,13 @@ Evolution等）— いずれも本セクション追加より前から記載済�
       （`Projects (559)`等）の描画・fetch負荷増大に備える
 - [ ] API: 承認待ち一覧専用エンドポイントの必要性確認（現状mobile側で全Project/Task/Jobを
       巡回して承認待ちを探している可能性があり、専用APIが必要になるかもしれない）
-- [ ] Mobile: Project詳細画面の新規実装（`ProjectCard`タップ時の遷移。タップ無反応はバグではなく
-      未実装のため。`onPress`追加・詳細画面作成は別タスクとして着手）
+- [x] Mobile: Project詳細画面（2026-08-14確認。実装済み、`apps/mobile/app/projects/[id].tsx`。
+      commit`1f71d32`）。**現状（Current Truth）**: Project詳細画面あり／`ProjectCard`タップで
+      遷移可能（`index.tsx`の`onPress`→`/projects/[id]`）／name・status表示済み／Recent Jobs
+      表示済み／Task進捗（status別件数）集計あり。**未実装**: Goal未表示（`Project.goal`は
+      型に存在するが画面未参照）／Design Philosophy未表示（`Project.designPhilosophy`も同様）
+      ／個別Task一覧なし（集計のみ）／次Task明示なし／Approval待ちの独立表示なし（「要対応Task」
+      内に間接的に含まれるのみ）
 - [ ] 開発DBのテストデータ整理（`Projects (559)`等、蓄積されたテストデータの扱い方針決定。
       表示件数・UXへの影響はあるが、誤って必要データを消さないよう方針を決めてから対応する）
 - [ ] 【採用未定・アイデア段階】Local Mobile Test Runner / ADB実機確認自動化（2026-07-21調査）:
