@@ -829,18 +829,21 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       role基盤を追加せず現状で要件を満たすと判断（最小変更原則）。state-mutatingな全routes/
       storage操作の網羅確認済み（Task/Project等の通常CRUDはaudit対象外、review/QA結果は
       append-only履歴で追跡可能なため対象外）
-<!-- roadmap:id=project-auto-project-roadmap-visibility state=in_progress -->
-6. [ ] **Project別Roadmap可視化** — 2026-08-14実装完了、Mobile実機/シミュレータでのruntime smoke
-      未確認のため`in_progress`のまま維持（doneにはしない）。既存項目
+<!-- roadmap:id=project-auto-project-roadmap-visibility state=done -->
+6. [x] **Project別Roadmap可視化** — 2026-08-14実装完了、Mobile実機（Expo Go）でのruntime smokeも
+      CEO確認済みのためdone。既存項目
       （`project-auto-completion-detection`＝Project完了判定のみ、`project-auto-ceo-alignment`＝
       Phase完了通知のみ、`project-auto-context-pack-wiring`＝AI CLIへのcontext供給のみ）とは責務が
-      異なるため独立項目のまま扱う。
+      異なるため独立項目のまま完了とした。
 
-      **現状のCurrent Truth**:
+      **Current Truth**:
       - implementation complete（下記実装範囲を参照）
       - tests/typecheck complete（`pnpm verify`全通過、API 579 tests・Worker 911 tests）
-      - **Mobile runtime smokeのみ未確認**（実機/シミュレータでの目視確認を行っていない。
-        typecheckのみで動作未検証）。確認後にdoneへ更新する
+      - **Mobile runtime smoke complete**（2026-08-14、Expo Go経由の実機確認でCEOが確認済み。
+        Goal・Design Philosophy・Roadmap全体進捗バー・進捗%・完了Task数/全Task数・
+        Current Phase/全Phase数・Phase 1 completed/Phase 2 current/Phase 3 upcomingの位置関係・
+        各Phaseのgoal・Phase別Task進捗・inactive旧Phase非表示・既存Project Detail表示、いずれも
+        正常表示を確認）
 
       **正本設計**: Project別Roadmapのstructured source of truthはDB（新設`project_roadmap_phases`
       テーブル）とした。既存`POST /api/cto/generate-roadmap`のTask同期（`syncRoadmapTasks()`、
@@ -869,18 +872,25 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       (2) `generate-roadmap`実行時のPhase+Task同期（`ctoAi.ts`、`roadmapTaskValidation.ts`へ
       `validateRoadmapPhases()`追加） (3) `GET /api/projects/:id/roadmap`読み取りAPI新設
       (4) Mobile Project Detail: Goal・Design Philosophy・Phase名/goal・Phase別Task進捗（
-      `roadmapActive`なPhase/Taskのみ表示）を追加。次Taskを決定するplanning algorithmは追加して
-      いない（既存data・既存API・既存job/approval状態の再利用のみ）
+      `roadmapActive`なPhase/Taskのみ表示）、Roadmap全体進捗バー（completed active roadmap
+      tasks / total active roadmap tasksの単純比率。Task weighting等は追加しない）、現在位置表示
+      （active PhaseをphaseNumber順に並べ、全Task完了→completed、未完了Taskを含む最も早いPhase→
+      current、それ以降→upcomingという既存dataのみの分類。新しいplanning algorithm・AI判断は
+      追加していない）を追加。次Taskを決定するplanning algorithmは追加していない（既存data・既存
+      API・既存job/approval状態の再利用のみ）
 
       **DB Safety**: additive migrationのみ（新規テーブル追加、既存テーブルへのALTERなし）。
       Roadmap生成/再生成はTask/Project通常CRUDと同様の性質（削除ではなくsoft
       deactivate、authorization/approval判断を伴わない）と判断し、`audit_log`（DB Safety B）の
       対象には追加しなかった（audit system自体の拡張は行わない）
 
-      **完了条件**: Phase metadataがDB正本として取得可能／PhaseとTaskが再同期時にも矛盾しない
-      （テストで検証）／`docs/roadmap.md`はsnapshotとして維持／Mobile Project DetailでGoal /
-      Design Philosophy / Roadmap進捗を確認可能／既存Task Roadmap同期を壊さない（既存test全件
-      regressionなし）／新規Milestone/versioning/generic planning systemなし、をすべて満たした
+      **完了条件（すべて満たした）**: Phase metadataがDB正本として取得可能／PhaseとTaskが再同期時
+      にも矛盾しない（テストで検証）／`docs/roadmap.md`はsnapshotとして維持／Mobile Project Detail
+      でGoal・Design Philosophy・Roadmap全体進捗バー・進捗%・完了Task数/全Task数・Current Phase/
+      全Phase数・Phase位置関係（completed/current/upcoming）・各Phaseのgoal・Phase別Task進捗を
+      確認可能（2026-08-14 Expo Go実機smokeでCEO確認済み）／inactive旧Phase/Taskが現在Roadmap表示
+      へ混ざらないこと（実機確認済み）／既存Task Roadmap同期を壊さない（既存test全件regression
+      なし）／新規Milestone/versioning/generic planning systemなし
 <!-- roadmap:id=project-auto-task-job-chain state=blocked -->
 7. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
       `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。

@@ -161,6 +161,62 @@ function selectActivePhasesWithTasks(
     }))
 }
 
+type PhaseRoadmapStatus = 'completed' | 'current' | 'upcoming'
+
+interface ClassifiedPhase {
+  phase: ProjectRoadmapPhase
+  tasks: Task[]
+  phaseStatus: PhaseRoadmapStatus
+}
+
+const PHASE_STATUS_ICON: Record<PhaseRoadmapStatus, string> = {
+  completed: '✅',
+  current: '🟡',
+  upcoming: '⬜',
+}
+
+/**
+ * 全Task完了のPhaseはcompleted、未完了Taskを含む最も早いPhaseがcurrent、それ以降はupcoming。
+ * 既存data（Phase順序・Task status）だけで決まる分類で、新しいplanning algorithmは導入しない。
+ */
+function classifyPhases(
+  activePhases: Array<{ phase: ProjectRoadmapPhase; tasks: Task[] }>,
+): ClassifiedPhase[] {
+  let currentAssigned = false
+
+  return activePhases.map(({ phase, tasks }) => {
+    const allDone = tasks.every((task) => task.status === 'done')
+    let phaseStatus: PhaseRoadmapStatus
+
+    if (allDone) {
+      phaseStatus = 'completed'
+    } else if (!currentAssigned) {
+      phaseStatus = 'current'
+      currentAssigned = true
+    } else {
+      phaseStatus = 'upcoming'
+    }
+
+    return { phase, tasks, phaseStatus }
+  })
+}
+
+interface RoadmapProgress {
+  completed: number
+  total: number
+  percent: number
+}
+
+/** completed active roadmap tasks / total active roadmap tasks。Task weighting等は行わない。 */
+function computeRoadmapProgress(tasks: Task[]): RoadmapProgress {
+  const activeRoadmapTasks = tasks.filter((task) => task.roadmapActive)
+  const completed = activeRoadmapTasks.filter((task) => task.status === 'done').length
+  const total = activeRoadmapTasks.length
+  const percent = total === 0 ? 0 : Math.round((completed / total) * 100)
+
+  return { completed, total, percent }
+}
+
 function countTasksByStatus(tasks: Task[]): Record<TaskStatus, number> {
   const taskStatusCounts: Record<TaskStatus, number> = {
     blocked: 0,
@@ -301,6 +357,39 @@ function DesignPhilosophySection({
   )
 }
 
+function RoadmapProgressBar({ progress }: { progress: RoadmapProgress }): ReactElement {
+  return (
+    <View style={styles.infoCard}>
+      <View style={styles.progressBarTrack}>
+        <View style={[styles.progressBarFill, { width: `${progress.percent}%` }]} />
+      </View>
+      <Text style={styles.progressPercentText}>{progress.percent}%</Text>
+      <Text style={styles.taskProgressSummary}>
+        {progress.completed} / {progress.total} Tasks completed
+      </Text>
+    </View>
+  )
+}
+
+function RoadmapCurrentPositionSummary({
+  classifiedPhases,
+}: {
+  classifiedPhases: ClassifiedPhase[]
+}): ReactElement {
+  const currentIndex = classifiedPhases.findIndex(({ phaseStatus }) => phaseStatus === 'current')
+  const currentPhase = currentIndex === -1 ? null : classifiedPhases[currentIndex]
+
+  return (
+    <View style={styles.infoCard}>
+      <Text style={styles.taskProgressSummary}>
+        {currentPhase
+          ? `Current: Phase ${currentPhase.phase.phaseNumber} / ${classifiedPhases.length}`
+          : `全Phase完了 / ${classifiedPhases.length}`}
+      </Text>
+    </View>
+  )
+}
+
 function RoadmapSection({
   phases,
   tasks,
@@ -314,17 +403,26 @@ function RoadmapSection({
     return null
   }
 
+  const classifiedPhases = classifyPhases(activePhases)
+  const activeRoadmapTasks = tasks.filter((task) => task.roadmapActive)
+  const progress = computeRoadmapProgress(activeRoadmapTasks)
+
   return (
     <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Roadmap Progress</Text>
+      <RoadmapProgressBar progress={progress} />
+
       <Text style={styles.sectionTitle}>Roadmap</Text>
-      {activePhases.map(({ phase, tasks: phaseTasks }) => {
+      <RoadmapCurrentPositionSummary classifiedPhases={classifiedPhases} />
+      {classifiedPhases.map(({ phase, tasks: phaseTasks, phaseStatus }) => {
         const phaseTaskStatusCounts = countTasksByStatus(phaseTasks)
         const doneCount = phaseTaskStatusCounts.done
 
         return (
           <View key={phase.phaseNumber} style={styles.itemCard}>
             <Text style={styles.itemTitle}>
-              Phase {phase.phaseNumber}: {phase.name}
+              {PHASE_STATUS_ICON[phaseStatus]} Phase {phase.phaseNumber}: {phase.name}
+              {phaseStatus === 'current' ? ' ← Current' : ''}
             </Text>
             <Text style={styles.phaseGoal}>{phase.goal}</Text>
             <Text style={styles.taskProgressSummary}>
@@ -611,6 +709,24 @@ const styles = StyleSheet.create({
     color: '#a3a3a3',
     fontSize: 13,
     marginTop: 4,
+  },
+  progressBarTrack: {
+    backgroundColor: '#2a2a2a',
+    borderRadius: 6,
+    height: 12,
+    overflow: 'hidden',
+    width: '100%',
+  },
+  progressBarFill: {
+    backgroundColor: '#3b82f6',
+    borderRadius: 6,
+    height: '100%',
+  },
+  progressPercentText: {
+    color: '#f5f5f5',
+    fontSize: 20,
+    fontWeight: '700',
+    marginTop: 10,
   },
   bottomSpacer: {
     height: 48,
