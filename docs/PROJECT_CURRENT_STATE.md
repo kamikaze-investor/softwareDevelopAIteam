@@ -97,6 +97,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
 - **複数Worker対応**（state: deferred）
+- **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 

@@ -407,17 +407,27 @@ stdout / stderr / changed files / commit hash
 
 **MVPで実装するもの**
 ```text
-Backend API / Worker / Docker Sandbox
+Backend API / Worker
 Target Repo mount / Command Allowlist
 File Change Guard / Job Logs
 Git branch/commit / Dashboard update
 ```
+
+**Docker Sandbox / OS隔離（Current Truth、2026-08-14修正）**: 本章は当初Docker Sandboxを
+MVP実装対象として記載していたが、現状と矛盾するため訂正する。実際は`jobRunner.ts`が
+`execFileSync`でhost上に直接コマンドを実行しており、Sandbox（コンテナ隔離）・OS隔離
+（Job単位mount namespace等）はMVPでは未実装。既存`sandbox/docker-compose.yml`はcanonical
+targetをRW mountし現行Jobはこれを経由しない。この事実は`tasks/roadmap.md`の
+`project-auto-worker-trust-boundary`（現状分析）・`project-auto-worker-core-split`
+（将来のOS隔離実装先、deferred）で追跡済み。将来対応であり、本仕様書の今回の修正でも
+実装は行わない。
 
 **MVPで実装しないもの**
 ```text
 高度なネットワーク制御 / 複数ユーザー
 チーム権限管理 / 本番デプロイ
 課金 / 外部公開自動化
+Docker Sandbox / OS隔離（上記参照。project-auto-worker-core-splitへ移管）
 ```
 
 ---

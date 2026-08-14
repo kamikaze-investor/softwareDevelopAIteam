@@ -1020,8 +1020,17 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       running Jobを無条件failedにするため、Workerの2重起動は互いの実行中Jobを破壊する
       （`jobStateManager.ts:31-66`）。またWorkerのqueued Job取得と`running`更新が別リクエストのため
       atomicにclaimできない。MVPは単一Worker前提を維持する
+<!-- roadmap:id=project-auto-resource-allocation state=deferred -->
+4. [ ] **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に
+      完全未登録であることを確認済み。単一Worker前提のMVPでは配分問題自体が発生しないため
+      `project-auto-multi-worker`の後続として位置づける。**現在のMVP順序には割り込ませない**）。
+      概念のみ登録（仕様詳細・実装は今回追加しない）:
+      - Project別のAI resource allocation
+      - 固定処理量
+      - 過去utilization / idle capacityの把握
+      - 配分時の進捗予測
 <!-- roadmap:id=project-auto-incident-pattern-improvement state=planned -->
-4. [ ] **ヒヤリハット・反復非効率検知 — Incident Pattern Improvement Loop**（2026-08-13仕様反映。
+5. [ ] **ヒヤリハット・反復非効率検知 — Incident Pattern Improvement Loop**（2026-08-13仕様反映。
       `AIteamOS ヒヤリハット・反復非効率検知機能 仕様設計`に基づく）— 新しい独立Incident Management
       System / Quality Management System / Lesson Systemを作るものではない。既存の
       `Telemetry → Team Health → Self Diagnosis → Improvement Planner → CEO Proposal →
