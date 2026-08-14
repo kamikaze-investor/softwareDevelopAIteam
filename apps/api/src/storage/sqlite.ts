@@ -9,9 +9,9 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
-import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
@@ -1151,13 +1151,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return approval
     },
     update(id, data) {
-      const existing = approvals.findById(id)
-      if (!existing) return undefined
-      const updated = { ...existing, ...data }
-      db.prepare(`
-        UPDATE approvals SET status=?, reviewed_at=?, review_note=? WHERE id=?
-      `).run(updated.status, updated.reviewedAt ?? null, updated.reviewNote ?? null, id)
-      return updated
+      const updateTransaction = db.transaction((): Approval | undefined => {
+        const existing = approvals.findById(id)
+        if (!existing) return undefined
+        const updated = { ...existing, ...data }
+        db.prepare(`
+          UPDATE approvals SET status=?, reviewed_at=?, review_note=? WHERE id=?
+        `).run(updated.status, updated.reviewedAt ?? null, updated.reviewNote ?? null, id)
+        if (data.status && data.status !== existing.status) {
+          auditLog.record({
+            actor: 'api',
+            operation: data.status === 'approved' ? 'approve' : data.status === 'rejected' ? 'reject' : 'expire',
+            entityType: 'approval',
+            entityId: id,
+            result: 'success',
+          })
+        }
+        return updated
+      })
+      return updateTransaction()
     },
   }
 
@@ -1263,8 +1275,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return { ...existing, used: true }
     },
     delete(id) {
-      const result = db.prepare('DELETE FROM permission_grants WHERE id = ?').run(id)
-      return result.changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        const result = db.prepare('DELETE FROM permission_grants WHERE id = ?').run(id)
+        const deleted = result.changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'permission_grant', entityId: id,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
   }
 
@@ -1434,17 +1454,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     approveAndResumeJob(id, reason): ReviewApprovalAndResumeJobResult {
       const approveTransaction = db.transaction((): ReviewApprovalAndResumeJobResult => {
+        const record = (result: ReviewApprovalAndResumeJobResult): ReviewApprovalAndResumeJobResult => {
+          auditLog.record({
+            actor: 'api', operation: 'approve', entityType: 'approval_request', entityId: id,
+            result: result.ok ? 'success' : 'failure',
+          })
+          return result
+        }
+
         const existing = approvalRequests.findById(id)
         if (!existing) {
-          return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+          return record({ ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' })
         }
         if (existing.status !== 'WAITING_FOR_USER') {
-          return {
+          return record({
             ok: false,
             code: 'STATUS_CONFLICT',
             reason: `Cannot approve: current status is '${existing.status}'`,
             approvalRequest: existing,
-          }
+          })
         }
 
         const reviewedAt = now()
@@ -1455,34 +1483,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             WHERE id = ? AND status = 'WAITING_FOR_USER'
           `).run(id)
           if (expired.changes !== 1) {
-            return {
+            return record({
               ok: false,
               code: 'STATUS_CONFLICT',
               reason: 'Approval request status changed concurrently',
-            }
+            })
           }
-          return {
+          return record({
             ok: false,
             code: 'EXPIRED',
             reason: 'Approval request has expired',
             approvalRequest: { ...existing, status: 'EXPIRED' },
-          }
+          })
         }
 
         const jobRows = db.prepare('SELECT * FROM jobs WHERE approval_id = ?').all(id) as Array<Record<string, unknown>>
         if (jobRows.length === 0) {
-          return {
+          return record({
             ok: false,
             code: 'JOB_NOT_FOUND',
             reason: 'No Job is linked to this approval request',
-          }
+          })
         }
         if (jobRows.length !== 1) {
-          return {
+          return record({
             ok: false,
             code: 'JOB_NOT_UNIQUE',
             reason: 'Approval request is linked to multiple Jobs',
-          }
+          })
         }
 
         const job = deserializeJob(jobRows[0])
@@ -1492,11 +1520,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           existing.requestedAction !== job.safeCommand.kind ||
           (job.status !== 'running' && job.status !== 'blocked')
         ) {
-          return {
+          return record({
             ok: false,
             code: 'JOB_MISMATCH',
             reason: 'Linked Job does not match the approval request or cannot be resumed',
-          }
+          })
         }
 
         const approvalUpdated = db.prepare(`
@@ -1505,11 +1533,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           WHERE id = ? AND status = 'WAITING_FOR_USER' AND expires_at > ?
         `).run(reason ?? existing.reason ?? null, reviewedAt, id, reviewedAt)
         if (approvalUpdated.changes !== 1) {
-          return {
+          return record({
             ok: false,
             code: 'STATUS_CONFLICT',
             reason: 'Approval request status changed concurrently',
-          }
+          })
         }
 
         const jobUpdated = db.prepare(`
@@ -1528,7 +1556,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         if (!approvalRequest || !resumedJob) {
           throw new Error('Failed to read atomically resumed approval and Job')
         }
-        return { ok: true, approvalRequest, job: resumedJob }
+        return record({ ok: true, approvalRequest, job: resumedJob })
       })
 
       return approveTransaction()
@@ -1672,6 +1700,22 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).run(status, newReason, newReviewedAt, id)
       return { ...existing, status, reason: newReason ?? undefined, reviewedAt: newReviewedAt ?? undefined }
     },
+    recordDecision(id, status, reason) {
+      const decisionTransaction = db.transaction((): ApprovalRequest | undefined => {
+        const updated = approvalRequests.updateStatus(id, status, reason)
+        if (updated) {
+          auditLog.record({
+            actor: 'api',
+            operation: status === 'APPROVED' ? 'approve' : 'reject',
+            entityType: 'approval_request',
+            entityId: id,
+            result: 'success',
+          })
+        }
+        return updated
+      })
+      return decisionTransaction()
+    },
   }
 
   // ────────────────────────────────────────────────────────────
@@ -1717,6 +1761,42 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         evidence.createdAt,
       )
       return evidence
+    },
+  }
+
+  const auditLog: IAuditLogStorage = {
+    findByEntity(entityType, entityId) {
+      const rows = db.prepare(
+        'SELECT * FROM audit_log WHERE entity_type = ? AND entity_id = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(entityType, entityId) as any[]
+      return rows.map(deserializeAuditLogEntry)
+    },
+    findAll() {
+      const rows = db.prepare(
+        'SELECT * FROM audit_log ORDER BY created_at DESC, rowid DESC'
+      ).all() as any[]
+      return rows.map(deserializeAuditLogEntry)
+    },
+    record(data) {
+      const entry: AuditLogEntry = {
+        ...data,
+        id: randomUUID(),
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        entry.id,
+        entry.actor,
+        entry.operation,
+        entry.entityType,
+        entry.entityId,
+        entry.result,
+        entry.detail ?? null,
+        entry.createdAt,
+      )
+      return entry
     },
   }
 
@@ -1838,10 +1918,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return updated
     },
     deleteNode(id) {
-      // 接続する edge を先に削除（orphan 防止）
-      db.prepare('DELETE FROM knowledge_graph_edges WHERE from_node_id = ? OR to_node_id = ?').run(id, id)
-      const result = db.prepare('DELETE FROM knowledge_graph_nodes WHERE id = ?').run(id)
-      return result.changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        // 接続する edge を先に削除（orphan 防止）
+        db.prepare('DELETE FROM knowledge_graph_edges WHERE from_node_id = ? OR to_node_id = ?').run(id, id)
+        const result = db.prepare('DELETE FROM knowledge_graph_nodes WHERE id = ?').run(id)
+        const deleted = result.changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'kg_node', entityId: id,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
     findEdgeById(id) {
       const row = db.prepare('SELECT * FROM knowledge_graph_edges WHERE id = ?').get(id) as any
@@ -1879,8 +1967,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return edge
     },
     deleteEdge(id) {
-      const result = db.prepare('DELETE FROM knowledge_graph_edges WHERE id = ?').run(id)
-      return result.changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        const result = db.prepare('DELETE FROM knowledge_graph_edges WHERE id = ?').run(id)
+        const deleted = result.changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'kg_edge', entityId: id,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
   }
 
@@ -1950,8 +2046,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return updated
     },
     delete(id) {
-      const result = db.prepare('DELETE FROM decision_records WHERE id = ?').run(id)
-      return result.changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        const result = db.prepare('DELETE FROM decision_records WHERE id = ?').run(id)
+        const deleted = result.changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'decision_record', entityId: id,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
   }
 
@@ -2003,8 +2107,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return record
     },
     delete(id) {
-      const result = db.prepare('DELETE FROM incident_records WHERE id = ?').run(id)
-      return result.changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        const result = db.prepare('DELETE FROM incident_records WHERE id = ?').run(id)
+        const deleted = result.changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'incident_record', entityId: id,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
   }
 
@@ -2064,7 +2176,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return this.findById(id)
     },
     delete(id) {
-      return db.prepare('DELETE FROM pattern_records WHERE id = ?').run(id).changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        const deleted = db.prepare('DELETE FROM pattern_records WHERE id = ?').run(id).changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'pattern_record', entityId: id,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
   }
 
@@ -2112,7 +2232,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return this.update(nodeId, { history })
     },
     delete(nodeId) {
-      return db.prepare('DELETE FROM feature_dna WHERE node_id = ?').run(nodeId).changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        const deleted = db.prepare('DELETE FROM feature_dna WHERE node_id = ?').run(nodeId).changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'feature_dna', entityId: nodeId,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
   }
 
@@ -2147,11 +2275,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return record
     },
     delete(id) {
-      return db.prepare('DELETE FROM self_reflections WHERE id = ?').run(id).changes > 0
+      const deleteTransaction = db.transaction((): boolean => {
+        const deleted = db.prepare('DELETE FROM self_reflections WHERE id = ?').run(id).changes > 0
+        auditLog.record({
+          actor: 'api', operation: 'delete', entityType: 'self_reflection', entityId: id,
+          result: deleted ? 'success' : 'failure',
+        })
+        return deleted
+      })
+      return deleteTransaction()
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, auditLog, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
 }
 
 function deserializeProject(row: any): Project {
@@ -2330,6 +2466,19 @@ function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
     decision: row.decision as DesignReviewEvidence['decision'],
     independentReviewRequired: row.independent_review_required === 1,
     independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
+    createdAt: row.created_at,
+  }
+}
+
+function deserializeAuditLogEntry(row: any): AuditLogEntry {
+  return {
+    id: row.id,
+    actor: row.actor as AuditLogEntry['actor'],
+    operation: row.operation,
+    entityType: row.entity_type,
+    entityId: row.entity_id,
+    result: row.result,
+    detail: row.detail ?? undefined,
     createdAt: row.created_at,
   }
 }

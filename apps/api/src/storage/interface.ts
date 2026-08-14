@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './roadmapTaskValidation'
 
@@ -228,6 +228,8 @@ export interface IApprovalRequestStorage {
   }): ConsumeApprovalForJobResult
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
+  /** 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用） */
+  recordDecision(id: string, status: 'APPROVED' | 'REJECTED', reason?: string): ApprovalRequest | undefined
 }
 
 export interface IDesignReviewEvidenceStorage {
@@ -235,6 +237,12 @@ export interface IDesignReviewEvidenceStorage {
   findByTaskId(taskId: string): DesignReviewEvidence[]
   findLatestByTaskId(taskId: string): DesignReviewEvidence | undefined
   create(data: Omit<DesignReviewEvidence, 'id' | 'createdAt'>): DesignReviewEvidence
+}
+
+export interface IAuditLogStorage {
+  findByEntity(entityType: string, entityId: string): AuditLogEntry[]
+  findAll(): AuditLogEntry[]
+  record(data: Omit<AuditLogEntry, 'id' | 'createdAt'>): AuditLogEntry
 }
 
 export interface IWatchdogEventStorage {
@@ -322,6 +330,7 @@ export interface IStorage {
   watchdogEvents: IWatchdogEventStorage
   approvalRequests: IApprovalRequestStorage
   designReviewEvidence: IDesignReviewEvidenceStorage
+  auditLog: IAuditLogStorage
   knowledgeGraph: IKnowledgeGraphStorage
   decisionCache: IDecisionCacheStorage
   incidentDB: IIncidentDBStorage

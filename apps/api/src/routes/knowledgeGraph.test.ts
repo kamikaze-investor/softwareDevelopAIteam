@@ -167,6 +167,24 @@ describe('Knowledge Graph Nodes', () => {
     })
   })
 
+  it('DELETE /kg/nodes/:id で audit_log に delete が記録される', async () => {
+    await withApp(async (app) => {
+      const created = await createNode(app)
+      await app.inject({ method: 'DELETE', url: `/kg/nodes/${created.id}` })
+
+      const { getStorage } = await import('../storage/index.js')
+      const entries = getStorage().auditLog.findByEntity('kg_node', created.id)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({
+        actor: 'api',
+        operation: 'delete',
+        entityType: 'kg_node',
+        entityId: created.id,
+        result: 'success',
+      })
+    })
+  })
+
   // 9. tags / relatedFiles などの配列フィールドが正しくシリアライズ/デシリアライズされる
   it('配列フィールドが正しくシリアライズ/デシリアライズされる', async () => {
     await withApp(async (app) => {

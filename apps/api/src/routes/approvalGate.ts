@@ -4,7 +4,6 @@ import { createHash } from 'node:crypto'
 import { getStorage } from '../storage'
 import type {
   ApprovalExplanationDiffStatus,
-  ApprovalGateStatus,
   ApprovalRequest,
   ApprovalQuestionTurn,
   GateOutcome,
@@ -728,9 +727,9 @@ export async function approvalGateRoutes(
       return reply.send(approved.approvalRequest)
     }
 
-    const updated = storage.approvalRequests.updateStatus(
+    const updated = storage.approvalRequests.recordDecision(
       req.params.id,
-      result.data.status as ApprovalGateStatus,
+      result.data.status as 'APPROVED' | 'REJECTED',
       result.data.reason,
     )
     return reply.send(updated)

@@ -170,4 +170,38 @@ describe('Approval API', () => {
       expect(parseBody<ApprovalWithProject[]>(pending.body)).toEqual([])
     })
   })
+
+  it('PATCH /api/approvals/:id で承認すると audit_log に approve が記録される（billing/security等の重要決定）', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const approval = await createApproval(app, project.id, { type: 'security' })
+
+      await updateApprovalStatus(app, approval.id, 'approved')
+
+      const { getStorage } = await import('../storage/index.js')
+      const entries = getStorage().auditLog.findByEntity('approval', approval.id)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({
+        actor: 'api',
+        operation: 'approve',
+        entityType: 'approval',
+        entityId: approval.id,
+        result: 'success',
+      })
+    })
+  })
+
+  it('PATCH /api/approvals/:id で却下すると audit_log に reject が記録される', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const approval = await createApproval(app, project.id, { type: 'billing' })
+
+      await updateApprovalStatus(app, approval.id, 'rejected')
+
+      const { getStorage } = await import('../storage/index.js')
+      const entries = getStorage().auditLog.findByEntity('approval', approval.id)
+      expect(entries).toHaveLength(1)
+      expect(entries[0].operation).toBe('reject')
+    })
+  })
 })

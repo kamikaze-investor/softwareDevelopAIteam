@@ -173,6 +173,37 @@ describe('DELETE /api/permission-grants/:id', () => {
       expect(res.statusCode).toBe(404)
     })
   })
+
+  it('records an audit log entry on delete', async () => {
+    await withApp(async (app) => {
+      const createRes = await app.inject({
+        method: 'POST',
+        url: '/api/permission-grants',
+        payload: {
+          taskId: 'task-5',
+          agentRole: 'developer_ai',
+          scope: 'task',
+        },
+      })
+      const grant = parseBody<PermissionGrant>(createRes.body)
+
+      await app.inject({
+        method: 'DELETE',
+        url: `/api/permission-grants/${grant.id}`,
+      })
+
+      const { getStorage } = await import('../storage/index.js')
+      const entries = getStorage().auditLog.findByEntity('permission_grant', grant.id)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({
+        actor: 'api',
+        operation: 'delete',
+        entityType: 'permission_grant',
+        entityId: grant.id,
+        result: 'success',
+      })
+    })
+  })
 })
 
 describe('PATCH /api/permission-grants/:id/use', () => {

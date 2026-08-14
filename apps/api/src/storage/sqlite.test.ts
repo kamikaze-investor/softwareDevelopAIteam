@@ -1525,4 +1525,75 @@ describe('SQLiteStorage', () => {
       expect(storage.designReviewEvidence.findLatestByTaskId(task.id)?.id).toBe(latest.id)
     })
   })
+
+  describe('auditLog', () => {
+    it('creates the table in a new database', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-audit-log-${randomUUID()}.db`)
+      createSQLiteStorage(dbPath)
+      const db = new Database(dbPath, { readonly: true })
+
+      try {
+        const columns = new Set(
+          (db.pragma('table_info(audit_log)') as Array<{ name: string }>)
+            .map((column) => column.name),
+        )
+
+        expect(columns.has('actor')).toBe(true)
+        expect(columns.has('operation')).toBe(true)
+        expect(columns.has('entity_type')).toBe(true)
+        expect(columns.has('entity_id')).toBe(true)
+        expect(columns.has('result')).toBe(true)
+      } finally {
+        db.close()
+      }
+    })
+
+    it('records an entry and finds it by entity', () => {
+      const recorded = storage.auditLog.record({
+        actor: 'api',
+        operation: 'delete',
+        entityType: 'permission_grant',
+        entityId: 'grant-1',
+        result: 'success',
+      })
+
+      expect(recorded.id).toBeTruthy()
+      expect(recorded.createdAt).toBeTruthy()
+
+      const byEntity = storage.auditLog.findByEntity('permission_grant', 'grant-1')
+      expect(byEntity).toHaveLength(1)
+      expect(byEntity[0]).toMatchObject({
+        actor: 'api',
+        operation: 'delete',
+        entityType: 'permission_grant',
+        entityId: 'grant-1',
+        result: 'success',
+      })
+
+      expect(storage.auditLog.findAll().length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('returns entries for an entity newest first', async () => {
+      storage.auditLog.record({
+        actor: 'api',
+        operation: 'approve',
+        entityType: 'approval_request',
+        entityId: 'req-1',
+        result: 'success',
+      })
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      storage.auditLog.record({
+        actor: 'api',
+        operation: 'reject',
+        entityType: 'approval_request',
+        entityId: 'req-1',
+        result: 'success',
+      })
+
+      const entries = storage.auditLog.findByEntity('approval_request', 'req-1')
+      expect(entries).toHaveLength(2)
+      expect(entries[0].operation).toBe('reject')
+      expect(entries[1].operation).toBe('approve')
+    })
+  })
 })

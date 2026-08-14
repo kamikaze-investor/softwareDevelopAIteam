@@ -264,6 +264,17 @@ export const CREATE_TABLES = `
     applied_at TEXT NOT NULL,
     FOREIGN KEY (job_id) REFERENCES jobs(id)
   );
+
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    result TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+  );
 `
 
 /**
@@ -305,4 +316,5 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_workflow_step_key ON jobs(workflow_step_key) WHERE workflow_step_key IS NOT NULL',
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_review_results_job_id ON review_results(job_id)',
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at ON design_review_evidence(task_id, created_at DESC)',
+  'CREATE INDEX IF NOT EXISTS ix_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC)',
 ]

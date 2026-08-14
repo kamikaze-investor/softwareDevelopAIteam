@@ -327,6 +327,42 @@ describe('POST /api/approval-requests/:id/consume', () => {
     })
   })
 
+  it('PATCH /status で REJECTED にすると audit_log に reject が記録される', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app)
+      await patchStatus(app, req.id, 'REJECTED', 'CEOが却下した')
+
+      const { getStorage } = await import('../storage/index.js')
+      const entries = getStorage().auditLog.findByEntity('approval_request', req.id)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({
+        actor: 'api',
+        operation: 'reject',
+        entityType: 'approval_request',
+        entityId: req.id,
+        result: 'success',
+      })
+    })
+  })
+
+  it('PATCH /status で git_commit 以外を APPROVED にすると audit_log に approve が記録される', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app)
+      await patchStatus(app, req.id, 'APPROVED', 'CEOが承認した')
+
+      const { getStorage } = await import('../storage/index.js')
+      const entries = getStorage().auditLog.findByEntity('approval_request', req.id)
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({
+        actor: 'api',
+        operation: 'approve',
+        entityType: 'approval_request',
+        entityId: req.id,
+        result: 'success',
+      })
+    })
+  })
+
   // テスト 9: consume後、reason / reviewedAt が保持される
   it('consume後、reason と reviewedAt が保持される', async () => {
     await withApp(async (app) => {

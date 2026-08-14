@@ -802,8 +802,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **stale recovery（状態不明判定・worktree破棄・自動retry）はOutbox整合性確認より後に
       実行しない**（起動順序: Outbox整合性確認→未送信event再送→状態不明attempt処理→
       通常pollJobs）ことを、この項目の実装がそのまま満たす設計とする。
-<!-- roadmap:id=project-auto-db-safety state=in_progress -->
-5. [ ] **本体DB安全・復旧基盤** — 依存: `project-auto-worker-trust-boundary`。
+<!-- roadmap:id=project-auto-db-safety state=done -->
+5. [x] **本体DB安全・復旧基盤** — 依存: `project-auto-worker-trust-boundary`。
       `project-auto-worker-outbox`とは**並行実装可能**。
       本体DBを書き込める主体をAPIへ限定する／任意SQLを受け付けない／重要状態変更の監査ログ／
       定期バックアップ／世代管理／復元手順／**実際の復元テスト**／重要データの物理削除を
@@ -819,8 +819,16 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       18:00 JST・2026-08-14 00:00 JSTの2回連続で、手動トリガーなしの完全無人自然発火→
       バックアップ作成→systemd journalでの成功ログ確認まで実測済み**（`journalctl --user -u
       ai-team-db-backup.service`で確認）。
-      **DB Safety B（残課題。本項目を`in_progress`のまま維持する理由）**: 重要状態変更の監査ログ・
-      migration/一括削除の管理権限分離は未着手。これらが完了するまで本項目は`done`にしない
+      **DB Safety B: 完了（2026-08-14）**: 重要状態変更の監査ログを`audit_log`テーブル
+      （actor/operation/entityType/entityId/result/createdAt）として新設し、既存の破壊的操作
+      （KG系7種のdelete・permission_grants delete・approval-requests/approvalsの人間による
+      承認・却下決定）へ計測を追加。監査記録は対象の状態変更と同一DBトランザクション内で
+      書き込まれ、部分失敗（変更されたがauditが残らない状態）を防ぐ。migration/一括削除の
+      管理権限分離は、対象となるランタイムAPIが存在しない（migrationは起動時の加算専用
+      自動実行のみ、bulk delete/raw SQL経路は無く全delete文が単一entity指定）ため、新規admin/
+      role基盤を追加せず現状で要件を満たすと判断（最小変更原則）。state-mutatingな全routes/
+      storage操作の網羅確認済み（Task/Project等の通常CRUDはaudit対象外、review/QA結果は
+      append-only履歴で追跡可能なため対象外）
 <!-- roadmap:id=project-auto-project-roadmap-visibility state=planned -->
 6. [ ] **Project別Roadmap可視化**（2026-08-14、Project Detail調査により新規登録。既存項目
       （`project-auto-completion-detection`＝Project完了判定のみ、`project-auto-ceo-alignment`＝

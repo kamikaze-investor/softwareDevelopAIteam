@@ -21,6 +21,7 @@ export * from './types/task_failure_explanation'
 export * from './types/knowledge_graph'
 export * from './types/actor'
 export * from './types/approvalLevel'
+export * from './types/audit_log'
 export * from './outbox/canonicalize'
 export {
   RISK_RULES,

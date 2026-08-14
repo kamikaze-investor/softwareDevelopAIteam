@@ -209,7 +209,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
   // DELETE /kg/nodes/:id — Node 削除
   app.delete('/kg/nodes/:id', async (request, reply) => {
     const { id } = request.params as { id: string }
-    const deleted = getStorage().knowledgeGraph.deleteNode(id)
+    const storage = getStorage()
+    const deleted = storage.knowledgeGraph.deleteNode(id)
     if (!deleted) {
       return reply.status(404).send({ error: `Node not found: ${id}` })
     }
@@ -277,7 +278,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
   // DELETE /kg/edges/:id — Edge 削除
   app.delete('/kg/edges/:id', async (request, reply) => {
     const { id } = request.params as { id: string }
-    const deleted = getStorage().knowledgeGraph.deleteEdge(id)
+    const storage = getStorage()
+    const deleted = storage.knowledgeGraph.deleteEdge(id)
     if (!deleted) {
       return reply.status(404).send({ error: `Edge not found: ${id}` })
     }
@@ -637,7 +639,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // DELETE /kg/decisions/:id
   app.delete<{ Params: { id: string } }>('/kg/decisions/:id', async (req, reply) => {
-    const deleted = getStorage().decisionCache.delete(req.params.id)
+    const storage = getStorage()
+    const deleted = storage.decisionCache.delete(req.params.id)
     if (!deleted) return reply.status(404).send({ error: 'Decision record not found' })
     return reply.status(204).send()
   })
@@ -672,7 +675,8 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // DELETE /kg/incidents/:id
   app.delete<{ Params: { id: string } }>('/kg/incidents/:id', async (req, reply) => {
-    const deleted = getStorage().incidentDB.delete(req.params.id)
+    const storage = getStorage()
+    const deleted = storage.incidentDB.delete(req.params.id)
     if (!deleted) return reply.status(404).send({ error: 'Incident record not found' })
     return reply.status(204).send()
   })
@@ -747,7 +751,9 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // DELETE /kg/patterns/:id
   app.delete<{ Params: { id: string } }>('/kg/patterns/:id', async (req, reply) => {
-    if (!getStorage().patternLibrary.delete(req.params.id)) return reply.status(404).send({ error: 'Pattern not found' })
+    const storage = getStorage()
+    const deleted = storage.patternLibrary.delete(req.params.id)
+    if (!deleted) return reply.status(404).send({ error: 'Pattern not found' })
     return reply.status(204).send()
   })
 
@@ -828,7 +834,9 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // DELETE /kg/feature-dna/:nodeId
   app.delete<{ Params: { nodeId: string } }>('/kg/feature-dna/:nodeId', async (req, reply) => {
-    if (!getStorage().featureDNA.delete(req.params.nodeId)) return reply.status(404).send({ error: 'FeatureDNA not found' })
+    const storage = getStorage()
+    const deleted = storage.featureDNA.delete(req.params.nodeId)
+    if (!deleted) return reply.status(404).send({ error: 'FeatureDNA not found' })
     return reply.status(204).send()
   })
 
@@ -863,7 +871,9 @@ export async function knowledgeGraphRoutes(app: FastifyInstance): Promise<void> 
 
   // DELETE /kg/reflections/:id
   app.delete<{ Params: { id: string } }>('/kg/reflections/:id', async (req, reply) => {
-    if (!getStorage().selfReflection.delete(req.params.id)) return reply.status(404).send({ error: 'Reflection not found' })
+    const storage = getStorage()
+    const deleted = storage.selfReflection.delete(req.params.id)
+    if (!deleted) return reply.status(404).send({ error: 'Reflection not found' })
     return reply.status(204).send()
   })
 
