@@ -100,6 +100,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
+- **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->

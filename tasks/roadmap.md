@@ -1604,6 +1604,106 @@ shell）・Deterministic（validator / test runner / linter）等を含める。
 Shadow結果の自動反映／CEO承認なしの予算上限超過／Model Registryの自動インターネット更新／
 プロダクションコードの変更。
 
+<!-- roadmap:id=project-auto-gemini-worker-eligibility state=planned -->
+1. [ ] **Gemini 3.7 Flash Free Tier Worker適合性調査** — 2026-08-14、CEO指示により新規登録。本節の
+      Static/Dynamic Model Routing・Data Sensitivity Policy・Model Registry Lite・Quota Policyの
+      枠組みを、具体的な1 Providerへ最初に適用する調査。新しい独立Provider評価の仕組みは作らない。
+
+**位置づけ**: 「無料だから仕事を振る」のではなく、「そのTask・Contextに適しており、安全性と品質を満たす
+場合、その中でFree Tierを優先活用する」。「Geminiを追加する」ことを先に決めず、既存Worker/Router/
+Context/Security構造との適合性を調査し、安全かつ合理的な配置が確認できた場合のみ実装する。
+
+```text
+MVP完成 → 初期安定化 → Gemini Worker適合性調査 →
+  適合性あり → 最小実装
+  適合性なし/構造不足 → 保留または必要な前提機能へ統合
+```
+
+MVP完成を遅らせない。MVP直後のCritical bug/Safety issue/運用安定化より優先しない。Gemini追加のためだけに
+Router等の大規模新機能を先行実装しない。
+
+**既存Geminiとの違い（重複ではないことの確認）**: 既存のGemini利用（`geminiRouter.ts`/`geminiClient.ts`
+経由のRisk Review・Step Review・Independent Review、Reviewer/Meta Reviewer層）とは別物。本項目が扱うのは
+Taskを実行するWorker Providerとしての Gemini 3.7 Flash Free Tierであり、既存Gemini Reviewerの変更・
+置換は含まない。
+
+**Phase 1（コード変更なし。調査のみ）**:
+- [ ] 現在のWorker/Provider構造の調査 — Claude/Codex/OpenCode/cheap AI client等の既存Providerが
+      どこで定義されるか、Task固定指定か・Job生成時決定か・Worker起動時決定か、retry/resume時の
+      引き継ぎ方を確認する。上記「1タスク＝1プロバイダー」（`Task.provider`）原則がどこまで実装済みか
+      を含む
+- [ ] Routerの実装状況調査 — Fixed Provider Selection／Rule-based Routing／Dynamic Routing（Task
+      内容・難易度・Risk・Cost・quota・Worker availability・過去成績・Data Sensitivityを考慮）の
+      どこまで実装済みかを区別して確認する。**Routerが未実装だからという理由だけでGemini導入のために
+      大規模Routerを新規実装しない**
+- [ ] Gemini Freeへ渡るContextの調査（最重要） — 現在Worker Contextへ自動的に含まれるもの（Task本文/
+      Project Goal/Design Philosophy/Architecture/Current State/Roadmap/Decisions/source code/
+      git diff/logs/filesystem情報/environment情報/credentials等）を確認する。Task自体が非機密でも
+      自動Context Packによってprivate codeや内部設計が混入しないかを重点確認する。
+      `project-auto-context-pack-wiring`（現状`contextFiles`未接続。`jobRunner.ts`が
+      `contextFiles: []`をハードコード）の状態を前提として踏まえる
+- [ ] Gemini Free利用禁止情報の定義 — API keys/passwords/tokens/private keys/`.env`/Personal
+      Data/Customer Data/Private Repository source/unpublished architecture/confidential
+      business informationを送信禁止候補として評価する。原則: 明確にNon-sensitive→候補／
+      Sensitive→禁止／判定不能→禁止（**Default Deny**）。上記Data Sensitivity Policy（低機密・
+      通常機密／高機密／最高機密の3tier）と整合させる（Gemini Free候補はこの3tierのうち最も低い
+      区分に位置づく想定だが、実装前提として断定しない）
+- [ ] 既存Security分類の再利用確認 — 現在のRisk分類・protected files・permissions・security
+      classification・Task metadata、および上記Model Registry Lite（`trainingPolicy`/
+      `retentionPolicy`/`providerTrustTier`）で再利用できるものがないか先に確認する。既存分類で
+      合理的に実現可能なら新規分類は追加しない
+- [ ] Geminiへ向いているTaskの実測ベース分類 — 実際のAIteamOSのTask/Context構造を確認した上で、
+      Allowed/Conditional/Denied/Unknownへ分類する（想定候補: 公開情報整理・分類・タグ付け・
+      非機密ログ分析・Incident分類・Document Rot候補検出・重複候補検出・公開OSS調査・軽量一次
+      レビュー等。あくまで例であり実構造確認後に判断する）
+- [ ] 「配置ミス」評価 — 性能だけでなく品質不足による手戻り・誤判断・retry増加・Incident/Near Miss・
+      Context不足・private data送信リスク・高性能Modelへ戻す必要性・結果的な総コストを評価する。
+      単純なtoken単価だけでProviderを選ばない
+
+**Phase 2（Phase 1で適合性ありと判断された場合のみ着手）**:
+- [ ] Experimental/Free/Non-sensitive/Limited scopeのWorkerとして開始する。最初からClaudeの代替・
+      Codexの代替・主力Coding Worker・全TaskのDefault Providerにはしない
+- [ ] 最小導入案を優先する。既存Provider abstractionへの自然な追加（既存Provider定義+Gemini、既存
+      Worker launcher+Gemini adapter、既存metadata+eligibility判定、既存Routing+非機密条件）程度を
+      優先する。Routerが十分でない場合はOption A（対象Taskだけ明示的にGemini指定）／Option B（非常に
+      小さいRule-based Routing）／Option C（本格Dynamic Router）を比較し、A/Bで十分ならCを実装しない
+- [ ] Quota/Fallback確認 — Rate Limit・quota exhaustion・Provider unavailable・timeout・retryを
+      確認する。Gemini Freeが使えない場合に自動で有料Providerへ切り替えることで予期しないコストが
+      発生しないかを確認する。既存Cost/Budget Approval機構（上記「CEO予算上限の遵守・無料枠優先」）を
+      再利用する
+- [ ] 実運用評価 — 新しいAnalytics Systemを安易に作らず、既存の記録（上記Model Usage Telemetry、
+      Task成功率・Review一発通過率・retry率・failure率・duration・token/cost・Incident/Near Miss・
+      手戻り・1 successful taskあたりコスト）でGemini/Claude/Codex等を比較できるか確認する
+
+**2027-01-01前後の再評価（条件として必須）**: Gemini 3.7 FlashはPaid Tier価格変更が2027-01-01から
+予定されているため、2026年末〜2027年1月にProvider継続評価を行う。評価内容: Free Tier継続有無・Free
+quota/Rate Limit・最新利用条件・Paid価格・実運用成功率・Incident率・1成功Taskあたりコスト・Claude/
+Codex/他Providerとの比較。継続/役割縮小/Paid利用/Freeのみ利用/他Providerへ置換/廃止を再判断する。
+
+**重複確認・既存項目との関係**:
+- 本項目は本節（Static/Dynamic Model Routing・Data Sensitivity Policy・Model Registry Lite・Quota
+  Policy）の枠組みを、Gemini 3.7 Flashという具体的Providerへ最初に適用する調査であり、独立の評価
+  システムを新設するものではない
+- `project-auto-resource-allocation`（deferred、AI Resource Allocation/Capacity管理、概念登録のみ）
+  とは責務が重なる可能性があるが、あちらはProject別配分・稼働量管理が中心。Phase 2実装時、Resource
+  Allocation機構が先に実装されていればFree quota/Worker capacity/Provider performance/Costの
+  Routing責務はそちらへ統合し、本項目で重複実装しない
+- `project-auto-context-pack-wiring`（deferred、Context Pack未接続の事実）とは調査前提として関連
+  するが責務は別（あちらはContext接続そのものの実装、本項目はContext内容のsensitivity調査）
+- 既存Gemini Reviewer（`geminiRouter.ts`等）とは別物（上記参照）
+- `project-auto-multi-worker`（deferred、複数Worker**プロセス**対応）ともスコープが異なる（本項目は
+  単一Worker内でのProvider選択の話であり、複数Worker並行実行の前提条件ではない）
+
+**今回の作業範囲（禁止事項）**: 今回はRoadmap登録のみ。Gemini API実装・API key取得/登録・Provider
+追加・Router実装・Context Filter実装・DB migration・Worker変更・外部API接続テストは行わない。
+
+**完了条件（Definition of Done）**: 単に「Gemini APIを呼べるようになった」では完了扱いにしない。
+少なくとも次を満たすこと: (1) Worker/Router現状調査済み (2) Context流入経路確認済み (3) Free利用
+禁止情報を定義済み（Default Deny） (4) Gemini適用Task範囲決定済み（Allowed/Conditional/Denied/
+Unknown分類） (5) Default Denyが成立 (6) 最小Provider統合完了 (7) quota/fallback動作確認 (8) 実績
+計測可能 (9) 既存Providerへの回帰可能。**ただし調査の結果Gemini追加が不適切と判断された場合は
+「追加しない」という判断でも本項目は正常終了（done）とする**。
+
 ### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
 
 **背景:**
