@@ -744,27 +744,95 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         （Ruleset有効化・GitHub App作成・credential分離・Approval status連携）は現時点では
         未着手
 
-      **Worker↔API credential / authority separation未完了（2026-08-14確認。GitHub境界とは
-      別の、Meta Review Hardening実装で新たに確認された未解決事項）**: `project-auto-meta-
-      review-hardening`で実装した`design_review_evidence`（`POST /api/design-review-evidence`）
-      は、現在Workerが持つ単一の万能`API_TOKEN`（他の全API呼び出しと同一）だけで認証される。
-      サーバー側は`designText`のhashは自前で再計算するが、`decision`・
-      `independentReviewVerdict`等はクライアント申告値をそのまま保存する。**つまり現状の
-      evidenceは「Worker-authenticated evidence」であり、Workerから独立したtrusted evidence
-      ではない**。Workerが現在の万能`API_TOKEN`を悪用すれば、`runStrategicMetaReview()`を
-      一度も実行せず`decision: 'ALIGNED'`・`independentReviewVerdict: 'approved'`等を
-      自己申告してevidenceを偽装できる（確認済み。read-only調査のみ、対策は今回実装しない）。
-      これはMeta Reviewの判断ロジック（Review Load/Strategic Alignment/Independent Review
-      自体）の不足ではなく、**Worker↔API間のcredential/authority分離が無いこと**に起因するため、
-      本項目（Worker Trust Boundary）の未完了事項として扱う。Task→Job Full Automation解放前に
-      必要な条件へ追加する:
-      - 現状: Workerは`API_TOKEN`（全API操作に共通の単一credential）を保持しており、
-        `design_review_evidence`の`decision`等を自己申告できる
-      - Task→Job Full Automation解放前に、Worker自身がreview evidenceを偽装できない
-        authority boundaryが必要
-      - **解決方法は今回決め打ちしない**（新token種別・別service・署名・別process等、
-        いずれも今回選定しない）。上記のGitHub外部境界（Approval Check・API credential分離）
-        と合わせて、最小のauthority separationを後日まとめて設計する
+      **Worker↔API credential / authority separation — 設計確定・ローカル実装完了
+      （2026-08-15。Production移行は未実施）**: `project-auto-meta-review-hardening`で実装した
+      `design_review_evidence`（`POST /api/design-review-evidence`）を含め、Workerが現在
+      単一の万能`API_TOKEN`（他の全API呼び出しと同一）で全API操作可能だった問題を確認した
+      （2026-08-14確認。Workerが`decision: 'ALIGNED'`等を自己申告してevidence偽装可能・CEO
+      Approval決定を偽造可能・Task/Project自由変更可能・permission grant自己発行可能等、
+      read-only調査で確認済み）。
+
+      **確定設計・実装済み**: generic RBAC/Permission DBは作らず、既存`apiTokenAuth`
+      （`apps/api/src/auth/apiToken.ts`、AV-001保護対象外）を最小拡張する2-credential方式。
+      - **ADMIN credential**: 全API操作可能。API側は`ADMIN_TOKEN_SHA256`（平文ではなくSHA-256
+        ハッシュ）のみ保持し、timing-safe比較。平文はVPS上のWorkerと同一OS userから読める場所
+        （`.env`・process env）へ置かない
+      - **WORKER credential**: `WORKER_TOKEN_SHA256`と一致した場合のみ、method +
+        `req.routeOptions.url`（Fastifyのroute登録pattern）のallowlist（`apps/api/src/auth/
+        workerAllowlist.ts`、11経路。実使用経路のread-only調査結果のみで構成）を通過。
+        allowlist外はDefault Deny（403）
+      - **auth mode定義（2026-08-15、testで固定。both-or-neither invariant）**: modeは
+        `ADMIN_TOKEN_SHA256`/`WORKER_TOKEN_SHA256`の設定状態だけで決まる（空文字は未設定扱い）。
+        - **両方とも未設定** → legacy mode（既存`API_TOKEN`単一credential方式）
+        - **両方とも設定** → split credential mode（ADMIN全許可／WORKERはallowlistのみ）
+        - **片方だけ設定** → invalid configurationとして**全requestを503で拒否**（fail closed。
+          片側credentialだけ有効な中途半端な状態でProductionを動かさない）
+        - **両方設定されているが値が同一** → invalid configurationとして**全requestを503で
+          拒否**（2026-08-15追加。同一hashだとADMIN判定が先に評価されWORKER tokenでも
+          ADMINとして通過してしまい、authority separationそのものが無効化されるため）
+        **split credential modeでは旧`API_TOKEN`は（envに値が残っていても）認証に使えない**。
+        legacyとsplitの共存・段階的移行は成立しないため、cutoverは短い計画停止を伴う
+      - **Reviewer専用credentialは作らない**: `apps/worker/scripts/designReview.ts`は
+        Worker runtimeから一切呼ばれない手動CLIであることを確認済みのため、ADMIN credentialで
+        実行すれば足り、WORKER credentialからは`design-review-evidence`をDefault Denyにした
+      - 新規table・新規storage interface・新規サービス・新OS user・署名システムはいずれも
+        追加していない
+      - tests: WORKER allowlist 11経路通過／CEO Approval決定・Task/Project mutation・
+        permission grant発行削除・design-review-evidence・Job自己生成・KG delete等の
+        Default Deny／ADMIN全許可／unknown token・token無し401／既存`apiTokenAuth`
+        testsの回帰なし、を確認済み
+      **Production未実施（別途安全手順レビュー後に実施）**: 上記auth mode定義により、
+      **code deployとcredential cutoverは必ず分離する**。またlegacy/splitは共存できないため、
+      **cutoverは短い計画停止（API再起動を挟む）を前提とする**。「新ADMIN tokenをAPIより先に
+      検証する」ことは原理的に不可能（APIがhashを知る前は必ず401になる）ため、そのような
+      手順を置かない。
+      - **Phase 1: code deployのみ**（`ADMIN_TOKEN_SHA256`/`WORKER_TOKEN_SHA256`は設定しない）
+        → 両方未設定のためlegacy `API_TOKEN`方式のまま動作し続ける。**挙動変化なし**。
+        現在Production稼働commitはmaster HEADと異なるため、このdeploy自体も別途安全な
+        deploy手順を確定してから行う
+      - **Phase 2: credential cutover**（Phase 1とは別タイミング。計画停止として実施）:
+        1. 新ADMIN token・新WORKER tokenを生成する
+        2. ADMIN平文をCEO Mobile / operator実行環境側へ安全に準備する（**VPSへは置かない**）
+        3. VPSには両tokenの**ハッシュのみ**を準備する（`ADMIN_TOKEN_SHA256`・
+           `WORKER_TOKEN_SHA256`。ADMIN平文はVPS上のWorkerと同一OS userから読める場所に
+           置かない）
+        4. cutover直前に **running Job = 0 / pending outbox = 0** を確認する
+           （実行中のJobがある状態でcredentialを切り替えない）
+        5. Workerをgraceful停止（`SIGTERM`。process tree全体の終了を確認）
+        6. APIへ`ADMIN_TOKEN_SHA256`と`WORKER_TOKEN_SHA256`を**同時に、かつ異なる値で**
+           設定する（片方だけ設定、または両方に同じhash値を設定した状態はいずれも
+           invalid configurationとして503で全停止する。特に同一値の設定はauthority
+           separationそのものを無効化する重大な設定ミスのため、投入前に2値が異なることを
+           確認する）
+        7. API再起動（**この時点で旧`API_TOKEN`は失効する**）
+        8. **cutover成功判定は`/health`だけで行わない**（後述の既知gap参照）。以下を
+           個別に確認する:
+           - 新ADMIN tokenで認証付きAPI（例: `GET /api/projects`）が200で成功する
+           - Workerを新WORKER tokenで起動し、allowlist route（Job poll等）が成功する
+           - Worker credentialで禁止route（CEO approval decision・Task/Project
+             mutation・design-review-evidence等）が**403**になる
+        9. Job poll / gate/check / permission-grant / watchdog等の正常動作を確認する
+        10. cutover成功確認後、VPSの`.env`から旧`API_TOKEN`の行を削除する
+        起動方式は現行の暫定運用（watch無し`tsx src/index.ts`）に合わせる。正式な
+        process supervision導入時は上記「正式Production起動方式の確定」側の手順に統合する
+      **旧API_TOKENの扱い（2026-08-15確認）**: 旧`API_TOKEN`は現状ADMIN相当（全API操作可能）の
+      credentialである。上記cutoverの手順7が完了した時点で旧`API_TOKEN`は技術的に認証へ使えなく
+      なるため、**「念のため残す」判断はしない**。VPSの`.env`から旧`API_TOKEN`の行を削除する
+      **design-review CLIの運用（2026-08-15確認。運用記述のみ、新serviceは作らない）**:
+      split credential cutover後、`apps/worker/scripts/designReview.ts`はWORKER credential
+      では`POST /api/design-review-evidence`が403になる。**VPS上のWorker実行環境ではなく、
+      trusted control/operator環境からADMIN credentialで実行する**。ADMIN token平文をVPS上の
+      `ai-team` user（Worker runtimeと同一OS user）から読めるenv/file/processへ渡す運用は
+      禁止とする
+      **`/health`の既知gap（2026-08-15確認。今回はhealth実装を広げない）**: partial/invalid
+      auth configuration（503を返す状態）でも、`/health`・`/api/health`は認証チェック自体を
+      バイパスするため200を返し続ける。**cutover成功判定を`/health`だけに依存しないこと**
+      （上記手順8参照）。正式なhealth/config validation改善は、「VPS常駐運用化」節の
+      ヘルスチェック・正式Production起動方式の確定と合わせて将来統合できるか再評価する
+      （cutover完了確認後）ことを標準手順に含める
+      **Design Review trust blocker**: 将来design-reviewをWorker自動実行へ組み込む場合の
+      trusted evidence問題は未解決のまま`project-auto-task-job-chain`側へblockerとして
+      明記した（本項目へ内容を複製しない）
 <!-- roadmap:id=project-auto-worker-outbox state=in_progress -->
 4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
       **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
@@ -921,6 +989,18 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       「Task取得失敗はAI実行前にfailedで停止する」という状態契約を満たさない。
       正しく直すにはqueued Jobを先に取得して`taskId`からTaskを引くポーリング契約へ変える必要があり、
       API側の変更を伴うため本Step（薄いapplication serviceによる進行管理）の設計に含めて解決する。
+      **Design Review evidence trust blocker（2026-08-15確認。本項目着手前に解決が必須）**:
+      `apps/worker/scripts/designReview.ts`（`POST /api/design-review-evidence`でverdictを
+      登録するCLI）は現在**Worker runtimeから一切呼ばれていない**（手動CLI実行のみ）。
+      Worker↔API authority separation（`project-auto-worker-trust-boundary`参照）で、WORKER
+      credentialからは`design-review-evidence`書き込みをDefault Denyにした。**この項目
+      （Task→Job自動連続実行）でdesign-reviewをWorker自動実行へ組み込む場合、Worker（または
+      それに準ずる自動実行主体）がevidence登録の権限を必要とすることになり、上記deny設計と
+      衝突する**。Worker自動実行がverdictを自己申告できる限り、実際にreviewが実行されたことの
+      非否認性は成立しない（API側はGemini/Codex認証情報を持たない既存確定方針のため、API側での
+      独立検証も採れない）。**本項目のスコープにDesign Review自動実行を含める場合は、着手前に
+      この trust問題を解決すること**（新しいReviewer service・新OS user・署名システムを安易に
+      追加しない前提で、着手時に改めて設計する）
       **完了条件**: 1つのProjectで複数Taskが順に自動実行され、二重生成・途中失敗時に
       安全側で停止すること（既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）
 <!-- roadmap:id=project-auto-recovery-e2e state=planned -->
@@ -1327,6 +1407,25 @@ Evolution等）— いずれも本セクション追加より前から記載済�
       新しい起動方式は可能な限りsafe/isolatedな環境で先に実起動確認しておく。
       crash時自動復旧・OS再起動後自動起動・process supervisionは上記「再起動耐性」の
       既存未解決事項のまま維持する
+- [ ] **Single-worker enforcement / duplicate startup prevention**（2026-08-15確認。
+      `project-auto-multi-worker`＝複数Workerを安全に並列稼働させる将来機能とは別責務。
+      本項目はMVPの「Workerは1インスタンスに限定する」前提が現状**強制されていない**ことへの
+      対策）。
+      **発生した事象**: Production上でWorkerプロセスが手動起動により**2本同時稼働**していた
+      （2026-08-15確認。起動時刻・稼働commit・接続先APIとも同一で、いずれも残留processではなく
+      実稼働中だった）。単一起動を強制するpidfile/lockfile/flock等のガードが存在しないため発生した。
+      **実測した危険性（発生時点では実害なし。running Job 0件・pending outbox 0件のため顕在化せず）**:
+      - atomic claimが未実装（`fetchQueuedJob()`はGETのみ、`running`化は別リクエスト）のため、
+        両Workerが同一queued Jobを同時取得し**同一Jobの二重実行**が起こり得た
+      - `recoverStaleJobs()`が起動時に全`running` Jobを無条件failedにするため、一方の再起動が
+        **他方の実行中Jobを破壊**し得た
+      - 両Workerが同一`outbox.db`（`job_id`がPRIMARY KEY）へ書き込むため、**衝突**し得た
+      **対応**: 2026-08-15、余剰Workerプロセスツリーへ`SIGTERM`を送り正常終了させ、single Workerへ
+      正常化した。Production DB・backup・APIへの変更なし
+      **恒久対策として必要なもの**: single-worker enforcement / duplicate startup preventionが
+      必要（今回は対策実装しない）。**正式process supervision導入（上記「再起動耐性」
+      「正式Production起動方式の確定」）時に、1ユニット=1インスタンスの強制として自然に統合する
+      ことを第一候補とする**。新規roadmap itemは追加せず、本項目へ統合する
 - [ ] **Secret output exposureの構造的再発防止**（2026-08-14、Security Critical寄り重大Incident由来。
       `project-auto-incident-pattern-improvement`の「重大Incidentは反復を待たず即時分析対象とする」
       方針に従い、反復発生を待たずMVP後早期の改善候補へ即時昇格）。

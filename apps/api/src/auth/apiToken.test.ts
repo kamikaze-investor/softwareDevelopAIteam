@@ -94,4 +94,17 @@ describe('API Token Auth', () => {
       expect(parseBody<{ error: string }>(res.body)).toEqual({ error: 'Invalid token' })
     })
   })
+
+  it('falls back to legacy API_TOKEN when ADMIN_TOKEN_SHA256/WORKER_TOKEN_SHA256 are unset', async () => {
+    delete process.env.ADMIN_TOKEN_SHA256
+    delete process.env.WORKER_TOKEN_SHA256
+    await withApp('legacy-token', async (app) => {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/protected',
+        headers: { authorization: 'Bearer legacy-token' },
+      })
+      expect(res.statusCode).toBe(200)
+    })
+  })
 })
