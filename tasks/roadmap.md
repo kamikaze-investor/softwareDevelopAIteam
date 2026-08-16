@@ -619,6 +619,15 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       (1) AI/CEO GitHub credential未分離、(2) trusted ALLOW evidence不足（Gap A）、
       (3) GitHub Actions用read-only API credential不足（Gap B）。詳細は以下。
 
+      **観測事実の追記（2026-08-16）**: Design Review Gate hardening（`aef0722`）のpush時、
+      GitHubから`Bypassed rule violations for refs/heads/master: Changes must be made
+      through a pull request. / Required status check "Typecheck & Test" is expected.`
+      という通知を実際に受け取った。これは上記(3)(4)の未完了（master用Rulesetが
+      `enforcement: disabled`のまま、AI/CEO GitHub credential未分離のため通常push権限で
+      required check・PR必須を強制できる状態）を実運用で裏づける観測事実であり、
+      新しい問題ではなく既存の未解決事項の再確認。新規roadmap item・追加Gateは作らない。
+      引き続き`project-auto-task-job-chain`のFull Automation解放前の必須条件として維持する。
+
       **GitHub外部強制境界の設計（2026-08-14追記。上記610-611行の「Cloudflare・GitHub等の
       credential」禁止方針を、Task→Job Full Automation解放条件として具体化するもの。read-only
       調査に基づく設計確定であり実装はまだ行っていない）**:
@@ -792,32 +801,58 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         deploy手順を確定してから行う
       - **Phase 2: credential cutover**（Phase 1とは別タイミング。計画停止として実施）:
         1. 新ADMIN token・新WORKER tokenを生成する
-        2. ADMIN平文をCEO Mobile / operator実行環境側へ安全に準備する（**VPSへは置かない**）
-        3. VPSには両tokenの**ハッシュのみ**を準備する（`ADMIN_TOKEN_SHA256`・
-           `WORKER_TOKEN_SHA256`。ADMIN平文はVPS上のWorkerと同一OS userから読める場所に
-           置かない）
+        2. ADMIN平文をCEO Mobile / **trusted control/operator端末**（VPSではなく、CEOが
+           管理する手元の実行環境）側へ安全に準備する（**VPSへは置かない**）
+        3. **VPSへ置くもの／置かないものを分ける（2026-08-17訂正。旧記述「VPSには両tokenの
+           ハッシュのみ」は実装と矛盾していたため修正）**:
+           - **ADMIN raw tokenはVPSへ一切置かない**（CEO Mobileのsecure store、および
+             **trusted control/operator端末**のprocess envにのみ保持する。ここでいう
+             「operator process env」は**VPS上のshell/env/fileではなく、VPS外にある
+             CEO管理の手元端末**を指す。VPS上の`ai-team` user（Worker runtimeと同一OS user）
+             から読める場所へADMIN平文を置く運用は禁止）
+           - `ADMIN_TOKEN_SHA256`はVPS/APIへ設定する（hashのみ）
+           - `WORKER_TOKEN_SHA256`はVPS/APIへ設定する（hashのみ）
+           - **WORKER raw tokenはVPS上でWorker用credentialとして保持する**。Workerには
+             `WORKER_TOKEN`等の専用env名が存在せず`apps/worker/src/utils/apiAuth.ts`が
+             既存env名`API_TOKEN`から読むため、VPSの`API_TOKEN`へWORKER raw tokenを置く
+             （env名のrenameは行わない）
         4. cutover直前に **running Job = 0 / pending outbox = 0** を確認する
            （実行中のJobがある状態でcredentialを切り替えない）
         5. Workerをgraceful停止（`SIGTERM`。process tree全体の終了を確認）
-        6. APIへ`ADMIN_TOKEN_SHA256`と`WORKER_TOKEN_SHA256`を**同時に、かつ異なる値で**
+        6. **Worker起動より前に**、VPSの`.env`の`API_TOKEN`の値を**新WORKER raw tokenへ
+           置換する**（2026-08-17訂正。旧手順では置換が最後（旧手順10）にあり、その前段で
+           Workerを起動する記述と矛盾していた＝旧tokenを送って401になる順序だった）。
+           `API_TOKEN`というenv名自体は削除しない。この置換により旧`API_TOKEN`値は
+           VPS上から除去される
+        7. APIへ`ADMIN_TOKEN_SHA256`と`WORKER_TOKEN_SHA256`を**同時に、かつ異なる値で**
            設定する（片方だけ設定、または両方に同じhash値を設定した状態はいずれも
            invalid configurationとして503で全停止する。特に同一値の設定はauthority
            separationそのものを無効化する重大な設定ミスのため、投入前に2値が異なることを
            確認する）
-        7. API再起動（**この時点で旧`API_TOKEN`は失効する**）
-        8. **cutover成功判定は`/health`だけで行わない**（後述の既知gap参照）。以下を
-           個別に確認する:
+        8. API再起動でsplit modeへ切り替える（**この時点で旧`API_TOKEN`値は失効する**）
+        9. **cutover成功判定は`/health`だけで行わない**（後述の既知gap参照）。以下を
+           この順で個別に確認する:
            - 新ADMIN tokenで認証付きAPI（例: `GET /api/projects`）が200で成功する
-           - Workerを新WORKER tokenで起動し、allowlist route（Job poll等）が成功する
+           - Workerを起動する（手順6で`API_TOKEN`が新WORKER raw tokenへ置換済みであるため、
+             Workerは新WORKER credentialで認証する。既に起動中のWorkerは古いprocess envを
+             保持するので、必ず停止→再起動で反映させる）
+           - Workerのallowlist route（Job poll等）が成功する
            - Worker credentialで禁止route（CEO approval decision・Task/Project
              mutation・design-review-evidence等）が**403**になる
-        9. Job poll / gate/check / permission-grant / watchdog等の正常動作を確認する
-        10. cutover成功確認後、VPSの`.env`から旧`API_TOKEN`の行を削除する
+           - Job pollingが継続して動作している
+        10. Job poll / gate/check / permission-grant / watchdog等の正常動作を確認する
+        11. **CEO Mobileへ新ADMIN tokenを保存し直す**（Mobileは`expo-secure-store`へ実行時に
+           保存する方式のため**再ビルド・再配布は不要**。接続設定画面から保存し直すだけでよい。
+           Mobileの通常操作（Project/Task詳細・承認判断・作成/resume）はWORKER allowlist外の
+           ためADMIN credentialが必須であり、この手順を省くとMobileが全面的に403になる）
         起動方式は現行の暫定運用（watch無し`tsx src/index.ts`）に合わせる。正式な
         process supervision導入時は上記「正式Production起動方式の確定」側の手順に統合する
-      **旧API_TOKENの扱い（2026-08-15確認）**: 旧`API_TOKEN`は現状ADMIN相当（全API操作可能）の
-      credentialである。上記cutoverの手順7が完了した時点で旧`API_TOKEN`は技術的に認証へ使えなく
-      なるため、**「念のため残す」判断はしない**。VPSの`.env`から旧`API_TOKEN`の行を削除する
+      **旧API_TOKENの扱い（2026-08-15確認。2026-08-17訂正）**: 旧`API_TOKEN`は現状ADMIN相当
+      （全API操作可能）のcredentialである。旧`API_TOKEN`**値**は上記cutoverの手順6でVPSの
+      `.env`から除去され、手順8のAPI split mode再起動をもって技術的にも認証へ使えなくなるため、
+      **「念のため残す」判断はしない**。**ただし`API_TOKEN`というenv名自体は、Workerが自分の
+      WORKER credentialを読むためのenv名として引き続き使用する**（手順3・6参照。Worker側に
+      専用env名が無いため、env名の削除・renameはcutoverの範囲に含めない）
       **design-review CLIの運用（2026-08-15確認。運用記述のみ、新serviceは作らない）**:
       split credential cutover後、`apps/worker/scripts/designReview.ts`はWORKER credential
       では`POST /api/design-review-evidence`が403になる。**VPS上のWorker実行環境ではなく、
@@ -1307,13 +1342,16 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
-- [ ] MobileがAPI tokenの`Authorization`ヘッダーを送っていない — `apps/mobile/app/`の全fetchに
-      `Authorization`ヘッダーが無く、API側で`API_TOKEN`を設定すると`apiToken.ts`のpreHandlerが
-      全リクエストを401で弾く。**現在動作しているのはAPI token未設定時のみ**。
-      VPS常駐（外部公開）へ進む前に必須。403行目「認証強化の要否確認」は方式の強化検討であり、
-      この「そもそもヘッダーを送っていない」問題とは別。
-      **完了条件**: `API_TOKEN`を設定した状態でMobileの主要操作（Project一覧・作成・承認・
-      Task詳細・resume）が通ること
+- [x] MobileがAPI tokenの`Authorization`ヘッダーを送っていない — **解消済み（2026-08-17
+      Current Truth修正。当初2026-07-29の指摘時点では未実装だった）**。現在は
+      `apps/mobile/lib/api.ts`の共通`apiFetch()`が保存済みtokenを読んで
+      `Authorization: Bearer <token>`を付与し、Mobileの全API呼び出しがこれを経由する。
+      tokenは`EXPO_PUBLIC_*`（バンドルへ埋め込まれる）ではなく`expo-secure-store`
+      （iOS Keychain / Android Keystore、キー`api_token`）へ実行時に保存し、Dashboardの
+      接続設定画面から保存・変更・削除できる。このため**token変更時もMobileの再ビルド・
+      再配布は不要**。403行目「認証強化の要否確認」は方式の強化検討であり本項目とは別。
+      **完了条件（達成）**: `API_TOKEN`を設定した状態でMobileの主要操作（Project一覧・作成・
+      承認・Task詳細・resume）が通ること
 
 **UX残タスク（2026-08-06 実機E2E中に発見。MVP必須5項目とは別枠）:**
 
