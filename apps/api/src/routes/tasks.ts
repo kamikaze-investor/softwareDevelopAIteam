@@ -238,12 +238,8 @@ export async function taskRoutes(
       return reply.status(409).send({ error: 'Project is archived' })
     }
 
-    const created = storage.tasks.createWithInitialImplementJob(result.data)
-    if (!created.ok) {
-      req.log.error({ reason: created.reason }, 'Failed to create Task workflow')
-      return reply.status(500).send({ error: 'Failed to create Task workflow' })
-    }
-    return reply.status(201).send(created.task)
+    const task = storage.tasks.create(result.data)
+    return reply.status(201).send(task)
   })
 
   app.post<{ Params: { id: string } }>('/:id/resume', async (req, reply) => {

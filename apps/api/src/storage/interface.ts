@@ -17,10 +17,6 @@ export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
   | { ok: false; code?: 'DESIGN_REVIEW_PRECONDITION_FAILED'; reason: string }
 
-export type CreateTaskWithInitialImplementJobResult =
-  | { ok: true; task: Task; job: Job }
-  | { ok: false; code: 'STORAGE_ERROR'; reason: string }
-
 export type AdvanceWorkflowJobResult =
   | { ok: true; job: Job; nextJob: Job; nextJobCreated: boolean; deduplicated?: boolean }
   | {
@@ -76,7 +72,14 @@ export type ReviewApprovalAndResumeJobResult =
   | { ok: true; approvalRequest: ApprovalRequest; job: Job }
   | {
       ok: false
-      code: 'NOT_FOUND' | 'STATUS_CONFLICT' | 'EXPIRED' | 'JOB_NOT_FOUND' | 'JOB_NOT_UNIQUE' | 'JOB_MISMATCH'
+      code:
+        | 'NOT_FOUND'
+        | 'STATUS_CONFLICT'
+        | 'EXPIRED'
+        | 'JOB_NOT_FOUND'
+        | 'JOB_NOT_UNIQUE'
+        | 'JOB_MISMATCH'
+        | 'DESIGN_REVIEW_PRECONDITION_FAILED'
       reason: string
       approvalRequest?: ApprovalRequest
     }
@@ -137,10 +140,6 @@ export interface ITaskStorage {
    * 公開API（POST /api/tasks）からは設定できない。
    */
   create(task: Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & { roadmapActive?: boolean }): Task
-  /** 手動Taskと、そのTask専用のinitial implement Jobを単一transactionで作成する。 */
-  createWithInitialImplementJob(
-    task: Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapActive'> & { roadmapActive?: boolean },
-  ): CreateTaskWithInitialImplementJobResult
   update(id: string, data: Partial<Task>): Task | undefined
   /**
    * 検証済みロードマップTask一覧（と、あればPhase一覧）を、単一トランザクションでDBへ同期する。

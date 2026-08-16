@@ -274,6 +274,21 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Job not found' })
     }
 
+    const isImplementRequeue =
+      existing.aiCliMode === 'implement' &&
+      existing.status !== 'queued' &&
+      jobUpdate.status === 'queued'
+    if (isImplementRequeue) {
+      const designReviewCheck = checkImplementJobDesignReviewEvidence(existing, storage.designReviewEvidence)
+      if (!designReviewCheck.ok) {
+        return reply.status(409).send({
+          error: 'Implement Job requires an aligned pre-implementation Design Review',
+          code: designReviewCheck.code,
+          reason: designReviewCheck.reason,
+        })
+      }
+    }
+
     const isReviewJob = existing.aiCliMode === 'review'
     const isAutomaticReviewJob =
       existing.workflowStepKey?.startsWith('implement:') === true &&

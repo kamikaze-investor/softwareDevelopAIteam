@@ -1086,7 +1086,15 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
          ALIGNED以外はすべて409で拒否、fail-closed）。resume経路も同じ関数を呼ぶため
          迂回不可（`sqlite.ts`の`resumeBlockedTask()`内で同一chokepointを通ることをコードで
          確認済み）。非implement Job（`aiCliMode`未指定・`review`・`qa`・`summarize`）は
-         この判定を一切通らない
+         この判定を一切通らない。**2026-08-16 Option A実装完了**: `POST /api/tasks`はTaskのみを
+         作成してJobを作らない契約へ変更し、initial implement Job作成は既存`POST /api/jobs`へ
+         完全に合流させた。Gateを通らずTaskとimplement Jobを同時作成できた
+         `createWithInitialImplementJob()`はstorage interface・実装・結果型ごと削除し、将来の
+         bypass経路として残していない。**2026-08-16 requeue hardening**: `PATCH /api/jobs/:id`で
+         既存implement Jobを非queued状態から`queued`へ戻す際も、保存済みJobの`aiCliPrompt`に
+         対して同じDesign Review Gateを再検証する。あわせて、公開Job作成APIが許容する
+         implement + `git_commit` Jobをapproval承認SQLが再queueする経路にも同じ再検証を適用し、
+         非implement Jobのstatus更新・git_commit承認にはGateを広げない
       2. **Critical Independent Reviewの実実行接続 — 完了**: `strategicReview.ts`に
          `runIndependentReview()`を追加し、`reviewLoad === 'critical'`のときだけ既存
          `reviewerAdapter.ts`の`createReviewerAdapter('codex')`（既存のCodex独立レビュー機構。
@@ -1113,13 +1121,21 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
          古いALIGNED（hash不一致）→409／resume経路でのevidenceなし→409／CRITICALで
          independent review未承認→409／CRITICALでindependent review承認済み→201／
          非implement Jobはevidenceなしで成功、を確認。新しい巨大E2E frameworkは作らず、
-         既存`strategicReview.test.ts`・`jobs.test.ts`と同じvitest/`app.inject()`方式を再利用
+         既存`strategicReview.test.ts`・`jobs.test.ts`と同じvitest/`app.inject()`方式を再利用。
+         加えて`tasks.test.ts`で、`POST /api/tasks`→201かつJob 0件、evidenceなしの後続
+         `POST /api/jobs`→409、matching ALIGNED evidence保存後の同prompt→201を実routeで確認した。
+         requeueについても`jobs.test.ts`でevidenceなし・CONFLICT・UNCERTAIN・
+         REVIEW_UNAVAILABLE・stale・CRITICAL独立承認なしの409とALIGNEDの200を、
+         `approvalGate.test.ts`でimplement + `git_commit`承認時の拒否・成功を実routeで確認した
 
-      **完了条件（達成）**: Design Reviewを呼ばずにimplement Jobを作成できる全productionの
-      経路（`POST /api/jobs`・resume）がAPI側で機械的に拒否されることを、実route経由のE2Eで
-      証明した。Review Load分類・Strategic Alignment・Integration Review・Independent
+      **完了条件（達成）**: `POST /api/tasks`はTaskのみを作成し、implement Job作成は既存
+      `POST /api/jobs`へ合流する。Design Reviewを呼ばずにimplement Jobを作成できる全productionの
+      経路（`POST /api/jobs`・resume・PATCH requeue・approval requeue）はAPI側で機械的に拒否され、
+      旧Task＋initial implement Job同時作成APIも削除済みであることを実route経由のE2Eとcall site確認で
+      証明した。
+      Review Load分類・Strategic Alignment・Integration Review・Independent
       Review・fail-closedのすべてが実production経路で実証された
-      （`apps/api`: 36 files / 555 tests、`apps/worker`: 46 files / 911 tests、既存test
+      （`apps/api`: 39 files / 633 tests、`apps/worker`: 46 files / 911 tests、既存test
       regressionなし。`pnpm verify`・`git diff --check`成功。AV-001対象ファイルは無変更）。
       既存の統合Meta Review（LOW時）・既存Implementation Meta Review（`autoReview.ts`）の
       挙動は変更していない

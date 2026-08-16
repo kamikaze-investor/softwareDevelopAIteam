@@ -201,7 +201,7 @@ describe('Task API', () => {
     })
   })
 
-  it('POST /api/tasks creates a task', async () => {
+  it('POST /api/tasks creates only a Task and leaves its Job list empty', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
 
@@ -222,22 +222,94 @@ describe('Task API', () => {
       expect(body.description).toBe('')
       expect(body.status).toBe('pending')
       expect(body.dependencies).toEqual([])
+      expect(body).not.toHaveProperty('job')
 
       const jobsRes = await app.inject({
         method: 'GET',
         url: `/api/jobs?taskId=${body.id}`,
       })
       expect(jobsRes.statusCode).toBe(200)
-      const jobs = parseBody<Job[]>(jobsRes.body)
-      expect(jobs).toHaveLength(1)
-      expect(jobs[0]).toMatchObject({
-        workflowStepKey: `task:${body.id}:initial-implement`,
-        agentRole: 'developer_ai',
-        aiCliProvider: 'claude_code',
+      expect(parseBody<Job[]>(jobsRes.body)).toEqual([])
+    })
+  })
+
+  it('POST /api/jobs rejects the new Task implement Job without Design Review evidence', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const prompt = 'Implement the reviewed Task design.'
+      const taskRes = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Evidence-gated Task',
+          description: prompt,
+          assignee: 'developer_ai',
+        },
+      })
+      expect(taskRes.statusCode).toBe(201)
+      const task = parseBody<Task>(taskRes.body)
+
+      const jobRes = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: task.projectId,
+          agentRole: 'developer_ai',
+          aiCliProvider: 'codex',
+          aiCliPrompt: prompt,
+          aiCliMode: 'implement',
+          safeCommand: { kind: 'test' },
+        },
+      })
+
+      expect(jobRes.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(jobRes.body).code).toBe(
+        'MISSING_DESIGN_REVIEW_EVIDENCE',
+      )
+    })
+  })
+
+  it('POST /api/jobs creates the new Task implement Job with matching ALIGNED evidence', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const prompt = 'Implement the reviewed Task design.'
+      const taskRes = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: {
+          projectId: project.id,
+          title: 'Aligned Task',
+          description: prompt,
+          assignee: 'developer_ai',
+        },
+      })
+      expect(taskRes.statusCode).toBe(201)
+      const task = parseBody<Task>(taskRes.body)
+      await createAlignedDesignReviewEvidence(task.id, prompt)
+
+      const jobRes = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: {
+          taskId: task.id,
+          projectId: task.projectId,
+          agentRole: 'developer_ai',
+          aiCliProvider: 'codex',
+          aiCliPrompt: prompt,
+          aiCliMode: 'implement',
+          safeCommand: { kind: 'test' },
+        },
+      })
+
+      expect(jobRes.statusCode).toBe(201)
+      expect(parseBody<Job>(jobRes.body)).toMatchObject({
+        taskId: task.id,
         aiCliMode: 'implement',
+        aiCliPrompt: prompt,
         status: 'queued',
       })
-      expect(jobs[0].safeCommand.kind).toBe('test')
     })
   })
 
@@ -320,32 +392,6 @@ describe('Task API', () => {
 
       expect(res.statusCode).toBe(409)
       expect(parseBody<{ error: string }>(res.body).error).toBe('Project is archived')
-    })
-  })
-
-  it('POST /api/tasks leaves no Task when initial Job creation fails', async () => {
-    await withApp(async (app) => {
-      const project = await createProject(app)
-      const { getStorage } = await import('../storage/index.js')
-      const storage = getStorage()
-      vi.spyOn(storage.tasks, 'createWithInitialImplementJob').mockReturnValue({
-        ok: false,
-        code: 'STORAGE_ERROR',
-        reason: 'injected failure',
-      })
-
-      const res = await app.inject({
-        method: 'POST',
-        url: '/api/tasks',
-        payload: {
-          projectId: project.id,
-          title: 'Atomic failure',
-          assignee: 'developer_ai',
-        },
-      })
-
-      expect(res.statusCode).toBe(500)
-      expect(storage.tasks.findByProjectId(project.id)).toEqual([])
     })
   })
 

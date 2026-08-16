@@ -36,6 +36,7 @@ const TASK_STATUS_BADGE_STYLE: Record<
   completed: { backgroundColor: '#22c55e22', borderColor: '#22c55e55' },
   failed: { backgroundColor: '#ef444422', borderColor: '#ef444466' },
   in_progress: { backgroundColor: '#3b82f622', borderColor: '#3b82f655' },
+  pending: { backgroundColor: '#73737322', borderColor: '#73737355' },
   queued: { backgroundColor: '#73737322', borderColor: '#73737355' },
   rejected_waiting_instruction: {
     backgroundColor: '#ef444422',
@@ -50,6 +51,7 @@ const TASK_STATUS_TEXT_STYLE: Record<TaskDisplayStatus, { color: string }> = {
   completed: { color: '#22c55e' },
   failed: { color: '#ef4444' },
   in_progress: { color: '#60a5fa' },
+  pending: { color: '#a3a3a3' },
   queued: { color: '#a3a3a3' },
   rejected_waiting_instruction: { color: '#ef4444' },
   running: { color: '#60a5fa' },
@@ -102,6 +104,8 @@ function formatDisplayStatus(displayStatus: string): string {
       return '完了'
     case 'in_progress':
       return '進行中'
+    case 'pending':
+      return '未着手'
     default:
       return `ステータス: ${displayStatus}`
   }

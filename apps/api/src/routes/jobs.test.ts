@@ -136,6 +136,44 @@ async function createJob(
   return parseBody<Job>(res.body)
 }
 
+async function createTestWorkflowImplementJob(
+  app: FastifyInstance,
+  task: Task,
+  prompt = 'Implement the approved requirement.',
+): Promise<Job> {
+  await createDesignReviewEvidence(app, task, prompt)
+  const { getStorage } = await import('../storage/index.js')
+  return getStorage().jobs.create({
+    taskId: task.id,
+    projectId: task.projectId,
+    workflowStepKey: `task:${task.id}:initial-implement`,
+    agentRole: 'developer_ai',
+    status: 'queued',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'claude_code',
+    aiCliPrompt: prompt,
+    aiCliMode: 'implement',
+  })
+}
+
+async function createStoredImplementJob(
+  task: Task,
+  prompt: string,
+  status: Job['status'] = 'failed',
+): Promise<Job> {
+  const { getStorage } = await import('../storage/index.js')
+  return getStorage().jobs.create({
+    taskId: task.id,
+    projectId: task.projectId,
+    agentRole: 'developer_ai',
+    status,
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliPrompt: prompt,
+    aiCliMode: 'implement',
+  })
+}
+
 async function createAutomaticReviewJob(
   app: FastifyInstance,
 ): Promise<{ implement: Job; project: Project; review: Job; task: Task }> {
@@ -152,11 +190,7 @@ async function createAutomaticReviewJob(
   })
   expect(taskResponse.statusCode).toBe(201)
   const task = parseBody<Task>(taskResponse.body)
-  const initialJobs = parseBody<Job[]>((await app.inject({
-    method: 'GET',
-    url: `/api/jobs?taskId=${task.id}`,
-  })).body)
-  const implement = initialJobs[0]
+  const implement = await createTestWorkflowImplementJob(app, task)
   const implementResult = await app.inject({
     method: 'PATCH',
     url: `/api/jobs/${implement.id}`,
@@ -656,6 +690,159 @@ describe('Job API', () => {
     })
   })
 
+  describe('PATCH /api/jobs/:id implement requeue Design Review evidence gate', () => {
+    it('rejects requeue when no evidence exists', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const job = await createStoredImplementJob(task, 'Design: evidence is missing.')
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}`,
+          payload: { status: 'queued' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('MISSING_DESIGN_REVIEW_EVIDENCE')
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().jobs.findById(job.id)?.status).toBe('failed')
+      })
+    })
+
+    it.each(['CONFLICT', 'UNCERTAIN', 'REVIEW_UNAVAILABLE'] as const)(
+      'rejects requeue when latest evidence decision is %s',
+      async (decision) => {
+        await withApp(async (app) => {
+          const project = await createProject(app)
+          const task = await createTask(app, project.id)
+          const prompt = `Design: ${decision.toLowerCase()} requeue must fail closed.`
+          await createDesignReviewEvidence(app, task, prompt, { decision })
+          const job = await createStoredImplementJob(task, prompt)
+
+          const res = await app.inject({
+            method: 'PATCH',
+            url: `/api/jobs/${job.id}`,
+            payload: { status: 'queued' },
+          })
+
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('DESIGN_REVIEW_NOT_ALIGNED')
+        })
+      },
+    )
+
+    it('rejects requeue when the latest ALIGNED evidence is stale', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        await createDesignReviewEvidence(app, task, 'Design: original reviewed implementation.')
+        const job = await createStoredImplementJob(task, 'Design: changed implementation after review.')
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}`,
+          payload: { status: 'queued' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('DESIGN_REVIEW_HASH_MISMATCH')
+      })
+    })
+
+    it('rejects requeue when critical ALIGNED evidence lacks independent approval', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const prompt = 'Design: critical requeue needs independent approval.'
+        await createDesignReviewEvidence(app, task, prompt, {
+          reviewLoad: 'critical',
+          decision: 'ALIGNED',
+          independentReviewRequired: true,
+        })
+        const job = await createStoredImplementJob(task, prompt)
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}`,
+          payload: { status: 'queued' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('CRITICAL_INDEPENDENT_REVIEW_NOT_APPROVED')
+      })
+    })
+
+    it.each([
+      ['blocked', false],
+      ['failed', true],
+    ] as const)('allows an ALIGNED implement Job to requeue from %s', async (status, useOutbox) => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const prompt = `Design: approved ${status} Job requeue.`
+        await createDesignReviewEvidence(app, task, prompt)
+        const job = await createStoredImplementJob(task, prompt, status)
+        const payload = { status: 'queued' as const }
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}`,
+          payload: useOutbox ? withOutbox(payload, `requeue-${status}`) : payload,
+        })
+
+        expect(res.statusCode).toBe(200)
+        expect(parseBody<OutboxJobResponse>(res.body)).toMatchObject({
+          id: job.id,
+          status: 'queued',
+          ...(useOutbox ? { outbox: { eventId: `requeue-${status}`, deduplicated: false } } : {}),
+        })
+      })
+    })
+
+    it('does not apply the Gate when an implement Job is already queued', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const job = await createStoredImplementJob(task, 'Design: no transition occurs.', 'queued')
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}`,
+          payload: { status: 'queued', startedAt: '2026-08-16T00:00:00.000Z' },
+        })
+
+        expect(res.statusCode).toBe(200)
+        expect(parseBody<Job>(res.body)).toMatchObject({
+          status: 'queued',
+          startedAt: '2026-08-16T00:00:00.000Z',
+        })
+      })
+    })
+
+    it('allows a non-implement Job to requeue without evidence', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const job = await createJob(app, task)
+        await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}`,
+          payload: { status: 'failed' },
+        })
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}`,
+          payload: { status: 'queued' },
+        })
+
+        expect(res.statusCode).toBe(200)
+        expect(parseBody<Job>(res.body).status).toBe('queued')
+      })
+    })
+  })
+
   it('PATCH /api/jobs/:id accepts an Outbox event and returns Outbox metadata', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -905,11 +1092,7 @@ describe('Job API', () => {
         },
       })
       const task = parseBody<Task>(taskResponse.body)
-      const initialJobsResponse = await app.inject({
-        method: 'GET',
-        url: `/api/jobs?taskId=${task.id}`,
-      })
-      const implement = parseBody<Job[]>(initialJobsResponse.body)[0]
+      const implement = await createTestWorkflowImplementJob(app, task)
       const successfulResult = {
         status: 'success' as const,
         exitCode: 0,
@@ -964,11 +1147,7 @@ describe('Job API', () => {
         },
       })
       const task = parseBody<Task>(taskResponse.body)
-      const initialJobsResponse = await app.inject({
-        method: 'GET',
-        url: `/api/jobs?taskId=${task.id}`,
-      })
-      const implement = parseBody<Job[]>(initialJobsResponse.body)[0]
+      const implement = await createTestWorkflowImplementJob(app, task)
       const successfulResult = {
         status: 'success' as const,
         exitCode: 0,
@@ -1028,11 +1207,7 @@ describe('Job API', () => {
         },
       })
       const task = parseBody<Task>(taskResponse.body)
-      const initialJobsResponse = await app.inject({
-        method: 'GET',
-        url: `/api/jobs?taskId=${task.id}`,
-      })
-      const implement = parseBody<Job[]>(initialJobsResponse.body)[0]
+      const implement = await createTestWorkflowImplementJob(app, task)
 
       const updateResponse = await app.inject({
         method: 'PATCH',

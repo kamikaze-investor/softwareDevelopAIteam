@@ -9,7 +9,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, CreateTaskWithInitialImplementJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -562,33 +562,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         task.updatedAt,
       )
       return task
-    },
-    createWithInitialImplementJob(data) {
-      const createTransaction = db.transaction((): CreateTaskWithInitialImplementJobResult => {
-        const task = tasks.create(data)
-        const job = jobs.create({
-          taskId: task.id,
-          projectId: task.projectId,
-          workflowStepKey: `task:${task.id}:initial-implement`,
-          agentRole: 'developer_ai',
-          status: 'queued',
-          safeCommand: { kind: 'test', workingDir: TARGET_WORKING_DIR },
-          aiCliProvider: 'claude_code',
-          aiCliPrompt: task.description,
-          aiCliMode: 'implement',
-        })
-        return { ok: true, task, job }
-      })
-
-      try {
-        return createTransaction()
-      } catch (err: unknown) {
-        return {
-          ok: false,
-          code: 'STORAGE_ERROR',
-          reason: err instanceof Error ? err.message : String(err),
-        }
-      }
     },
     update(id, data) {
       const existing = tasks.findById(id)
@@ -1676,6 +1649,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             code: 'JOB_MISMATCH',
             reason: 'Linked Job does not match the approval request or cannot be resumed',
           })
+        }
+
+        if (job.aiCliMode === 'implement') {
+          const designReviewCheck = checkImplementJobDesignReviewEvidence(job, designReviewEvidence)
+          if (!designReviewCheck.ok) {
+            return record({
+              ok: false,
+              code: 'DESIGN_REVIEW_PRECONDITION_FAILED',
+              reason: designReviewCheck.reason,
+            })
+          }
         }
 
         const approvalUpdated = db.prepare(`

@@ -365,63 +365,6 @@ describe('SQLiteStorage', () => {
       expect(found?.roadmapTaskKey).toBe('task-001')
     })
 
-    it('creates a Task and one initial implement Job atomically', () => {
-      const result = storage.tasks.createWithInitialImplementJob({
-        projectId,
-        title: 'Automatic task',
-        description: 'Implement the requirement',
-        status: 'pending',
-        assignee: 'developer_ai',
-        dependencies: [],
-      })
-
-      expect(result.ok).toBe(true)
-      if (!result.ok) return
-      expect(storage.tasks.findById(result.task.id)).toMatchObject(result.task)
-      expect(storage.jobs.findByTaskId(result.task.id)[0]).toMatchObject(result.job)
-      expect(result.job).toMatchObject({
-        workflowStepKey: `task:${result.task.id}:initial-implement`,
-        agentRole: 'developer_ai',
-        aiCliProvider: 'claude_code',
-        aiCliMode: 'implement',
-        aiCliPrompt: 'Implement the requirement',
-        status: 'queued',
-      })
-      expect(result.job.safeCommand.kind).toBe('test')
-    })
-
-    it('rolls back Task creation when the initial implement Job insert fails', () => {
-      const dbPath = path.join(os.tmpdir(), `ai-team-initial-job-rollback-${randomUUID()}.db`)
-      const fileStorage = createSQLiteStorage(dbPath)
-      const project = fileStorage.projects.create({
-        name: 'Atomic project',
-        goal: 'g',
-        designPhilosophy: [],
-        status: 'draft',
-      })
-      const triggerDb = new Database(dbPath)
-      triggerDb.exec(`
-        CREATE TRIGGER reject_initial_job
-        BEFORE INSERT ON jobs
-        BEGIN
-          SELECT RAISE(ABORT, 'initial job rejected');
-        END;
-      `)
-      triggerDb.close()
-
-      const result = fileStorage.tasks.createWithInitialImplementJob({
-        projectId: project.id,
-        title: 'Must roll back',
-        description: '',
-        status: 'pending',
-        assignee: 'developer_ai',
-        dependencies: [],
-      })
-
-      expect(result).toMatchObject({ ok: false, code: 'STORAGE_ERROR' })
-      expect(fileStorage.tasks.findByProjectId(project.id)).toEqual([])
-    })
-
     it('syncRoadmapTasks creates tasks from a new roadmap', () => {
       const result = storage.tasks.syncRoadmapTasks({
         projectId,

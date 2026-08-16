@@ -1431,6 +1431,86 @@ describe('Phase A — git_commit Approvalと同一Jobの自動再開', () => {
     })
   })
 
+  it('implement git_commit Jobは承認時にDesign Review evidenceを再検証する', async () => {
+    await withApp(async (app) => {
+      const taskId = await ensureGateTask(app, 'phase-a-implement-requeue-gate')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.findById(taskId)!
+      const job = storage.jobs.create({
+        taskId,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        aiCliProvider: 'codex',
+        aiCliPrompt: 'Design: approval resume must revalidate this prompt.',
+        aiCliMode: 'implement',
+      })
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId,
+        jobId: job.id,
+        requestedAction: 'git_commit',
+        changedFiles: ['docs/README.md'],
+      })
+      const approvalRequest = body.approvalRequest!
+      await patchJob(app, job.id, { status: 'blocked' })
+
+      const approved = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${approvalRequest.id}/status`,
+        payload: { status: 'APPROVED' },
+      })
+
+      expect(approved.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(approved.body).error).toContain('Design Review evidence')
+      expect(storage.jobs.findById(job.id)?.status).toBe('blocked')
+      expect(storage.approvalRequests.findById(approvalRequest.id)?.status).toBe('WAITING_FOR_USER')
+    })
+  })
+
+  it('implement git_commit Jobはmatching ALIGNED evidenceがあれば承認時にrequeueできる', async () => {
+    await withApp(async (app) => {
+      const taskId = await ensureGateTask(app, 'phase-a-implement-requeue-aligned')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.findById(taskId)!
+      const prompt = 'Design: approved implement git_commit resume.'
+      storage.designReviewEvidence.create({
+        taskId,
+        designTextHash: createHash('sha256').update(prompt, 'utf-8').digest('hex'),
+        reviewLoad: 'medium',
+        decision: 'ALIGNED',
+        independentReviewRequired: false,
+      })
+      const job = storage.jobs.create({
+        taskId,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        aiCliProvider: 'codex',
+        aiCliPrompt: prompt,
+        aiCliMode: 'implement',
+      })
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD,
+        taskId,
+        jobId: job.id,
+        requestedAction: 'git_commit',
+        changedFiles: ['docs/README.md'],
+      })
+      const approvalRequest = body.approvalRequest!
+      await patchJob(app, job.id, { status: 'blocked' })
+
+      const approved = await patchStatus(app, approvalRequest.id, 'APPROVED')
+
+      expect(approved.status).toBe('APPROVED')
+      expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+    })
+  })
+
   it('順序B: 承認が先でも後着したblocked結果でqueuedから巻き戻らない', async () => {
     await withApp(async (app) => {
       const { approvalRequest, job } = await startGitCommitApproval(app, 'phase-a-order-b')

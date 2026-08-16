@@ -77,6 +77,7 @@ export type TaskDisplayStatus =
   | 'running'
   | 'queued'
   | 'completed'
+  | 'pending'
   | 'in_progress'
 
 export interface TaskSummary {
@@ -123,5 +124,6 @@ export function computeTaskDisplayStatus(input: TaskDisplayStatusInput): TaskDis
   if (input.latestJobStatus === 'running') return 'running'
   if (input.latestJobStatus === 'queued') return 'queued'
   if (input.taskStatus === 'done' || input.latestJobStatus === 'success') return 'completed'
+  if (input.latestJobStatus === undefined && input.taskStatus === 'pending') return 'pending'
   return 'in_progress'
 }
