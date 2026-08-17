@@ -8,6 +8,7 @@
 
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
+import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
@@ -54,6 +55,26 @@ export class RoadmapTaskConflictError extends Error {
 }
 
 const now = () => new Date().toISOString()
+
+const PersistedTaskFailureExplanationV1Schema = z.object({
+  schemaVersion: z.literal(1),
+  inputVersion: z.literal(1),
+  contentHash: z.string(),
+  generatedAt: z.string(),
+  aiAnalysis: z.object({
+    classification: z.enum([
+      'code',
+      'environment',
+      'configuration',
+      'permission_or_safety',
+      'approval_or_policy',
+      'unknown',
+    ]),
+    likelyCause: z.string(),
+    impact: z.string(),
+    recommendedNextAction: z.string(),
+  }),
+})
 
 interface AppliedOutboxEventRow {
   event_id: string
@@ -884,12 +905,33 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
   const jobs: IJobStorage = {
     findByTaskId(taskId) {
-      const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC').all(taskId) as any[]
+      const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
       return rows.map(deserializeJob)
     },
     findById(id) {
       const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as any
       return row ? deserializeJob(row) : undefined
+    },
+    findFailureExplanation(jobId) {
+      const row = db.prepare(
+        'SELECT failure_explanation_json FROM jobs WHERE id = ?',
+      ).get(jobId) as { failure_explanation_json: string | null } | undefined
+      if (!row?.failure_explanation_json) return undefined
+
+      try {
+        const savedValue: unknown = JSON.parse(row.failure_explanation_json)
+        const parsed = PersistedTaskFailureExplanationV1Schema.safeParse(savedValue)
+        return parsed.success
+          ? parsed.data
+          : undefined
+      } catch {
+        return undefined
+      }
+    },
+    saveFailureExplanation(jobId, envelope) {
+      db.prepare(
+        'UPDATE jobs SET failure_explanation_json = ? WHERE id = ?',
+      ).run(JSON.stringify(envelope), jobId)
     },
     create(data) {
       const job: Job = { ...data, id: randomUUID(), createdAt: now() }

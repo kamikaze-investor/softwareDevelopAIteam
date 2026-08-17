@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1 } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -157,6 +157,8 @@ export interface ITaskStorage {
 export interface IJobStorage {
   findByTaskId(taskId: string): Job[]
   findById(id: string): Job | undefined
+  findFailureExplanation(jobId: string): PersistedTaskFailureExplanationV1 | undefined
+  saveFailureExplanation(jobId: string, envelope: PersistedTaskFailureExplanationV1): void
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
   update(id: string, data: Partial<Job>): Job | undefined
   updateWithOutboxEvent(

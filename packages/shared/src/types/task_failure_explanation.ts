@@ -30,6 +30,14 @@ export interface TaskFailureAiAnalysis {
   recommendedNextAction: string
 }
 
+export interface PersistedTaskFailureExplanationV1 {
+  schemaVersion: 1
+  inputVersion: 1
+  contentHash: string
+  generatedAt: string
+  aiAnalysis: TaskFailureAiAnalysis
+}
+
 /**
  * Task/Jobからコードで構築する事実と、Geminiによる推測を分離した表示専用データ。
  */

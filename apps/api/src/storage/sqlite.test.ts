@@ -7,7 +7,7 @@ import { createSQLiteStorage, SingleRunningProjectError } from './sqlite'
 import { CREATE_TABLES } from './schema'
 import { validateRoadmapTasks } from './roadmapTaskValidation'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './interface'
-import type { JobStatus, Task } from '@ai-team/shared'
+import type { JobStatus, PersistedTaskFailureExplanationV1, Task } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 
 type ApprovalCreateInput = Parameters<IStorage['approvals']['create']>[0] & { projectId: string }
@@ -881,6 +881,73 @@ describe('SQLiteStorage', () => {
       expect(found?.safeCommand.params?.commitMessage).toBe('test commit')
     })
 
+    it('saves and finds a failure explanation envelope without exposing it on Job', () => {
+      const job = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      })
+      const envelope: PersistedTaskFailureExplanationV1 = {
+        schemaVersion: 1,
+        inputVersion: 1,
+        contentHash: 'content-hash',
+        generatedAt: '2026-08-17T00:00:00.000Z',
+        aiAnalysis: {
+          classification: 'code',
+          likelyCause: 'Type mismatch',
+          impact: 'Tests failed',
+          recommendedNextAction: 'Fix the type',
+        },
+      }
+
+      expect(storage.jobs.findFailureExplanation(job.id)).toBeUndefined()
+      storage.jobs.saveFailureExplanation(job.id, envelope)
+
+      expect(storage.jobs.findFailureExplanation(job.id)).toEqual(envelope)
+      expect(storage.jobs.findById(job.id)).toMatchObject(job)
+      expect(storage.jobs.findById(job.id)).not.toHaveProperty('failureExplanationJson')
+      expect(storage.jobs.findById(job.id)).not.toHaveProperty('failure_explanation_json')
+    })
+
+    it.each([
+      ['malformed JSON', '{not-json'],
+      ['a schema mismatch', JSON.stringify({ schemaVersion: 2, inputVersion: 1 })],
+    ])('treats %s in a saved failure explanation as a cache miss', (_label, savedJson) => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-failure-explanation-invalid-${randomUUID()}.db`)
+      const fileStorage = createSQLiteStorage(dbPath)
+      const project = fileStorage.projects.create({
+        name: 'Failure explanation storage',
+        goal: 'Validate persisted JSON',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const task = fileStorage.tasks.create({
+        projectId: project.id,
+        title: 'Failure explanation task',
+        description: '',
+        status: 'blocked',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+      const job = fileStorage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      })
+      const db = new Database(dbPath)
+      db.prepare(
+        'UPDATE jobs SET failure_explanation_json = ? WHERE id = ?',
+      ).run(savedJson, job.id)
+      db.close()
+
+      expect(() => fileStorage.jobs.findFailureExplanation(job.id)).not.toThrow()
+      expect(fileStorage.jobs.findFailureExplanation(job.id)).toBeUndefined()
+    })
+
     it('updates job result fields', () => {
       const job = storage.jobs.create({
         taskId,
@@ -1097,6 +1164,29 @@ describe('SQLiteStorage', () => {
       const migratedDb = new Database(legacyDbPath, { readonly: true })
       expect((migratedDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
         (column) => column.name === 'workflow_step_key',
+      )).toBe(true)
+      migratedDb.close()
+    })
+
+    it('creates and idempotently migrates the failure explanation column', () => {
+      const newDbPath = path.join(os.tmpdir(), `ai-team-failure-explanation-new-${randomUUID()}.db`)
+      createSQLiteStorage(newDbPath)
+      const newDb = new Database(newDbPath, { readonly: true })
+      expect((newDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'failure_explanation_json',
+      )).toBe(true)
+      newDb.close()
+
+      const legacyDbPath = path.join(os.tmpdir(), `ai-team-failure-explanation-legacy-${randomUUID()}.db`)
+      const legacyDb = new Database(legacyDbPath)
+      legacyDb.exec(CREATE_TABLES.replace('    failure_explanation_json TEXT,\n', ''))
+      legacyDb.close()
+
+      expect(() => createSQLiteStorage(legacyDbPath)).not.toThrow()
+      expect(() => createSQLiteStorage(legacyDbPath)).not.toThrow()
+      const migratedDb = new Database(legacyDbPath, { readonly: true })
+      expect((migratedDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'failure_explanation_json',
       )).toBe(true)
       migratedDb.close()
     })

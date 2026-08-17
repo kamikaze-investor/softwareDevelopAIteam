@@ -1,6 +1,7 @@
 import type {
   Job,
   Task,
+  TaskFailureAiAnalysis,
   TaskFailureExplanationViewModel,
   TaskFailureQuestionTurn,
 } from '@ai-team/shared'
@@ -127,12 +128,13 @@ function describeWhatHappened(context: TaskFailureAiContext): string {
   return '対象Jobは実行失敗として記録されています。'
 }
 
-function buildViewModel(
-  aiAnalysis: z.infer<typeof TaskFailureAiAnalysisSchema>['aiAnalysis'],
+export function buildTaskFailureExplanationViewModel(
+  aiAnalysis: TaskFailureAiAnalysis,
   context: TaskFailureAiContext,
+  generatedAt: string,
 ): TaskFailureExplanationViewModel {
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     facts: {
       whatHappened: describeWhatHappened(context),
       taskStatus: context.task.status,
@@ -171,7 +173,11 @@ export async function generateTaskFailureExplanation(
     const generated = TaskFailureAiAnalysisSchema.parse(parseJsonObject(raw))
     return {
       ok: true,
-      explanation: buildViewModel(generated.aiAnalysis, context),
+      explanation: buildTaskFailureExplanationViewModel(
+        generated.aiAnalysis,
+        context,
+        new Date().toISOString(),
+      ),
     }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)

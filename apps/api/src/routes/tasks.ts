@@ -1,14 +1,72 @@
+import { createHash } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
-import type { Job, Task, TaskFailureQuestionTurn } from '@ai-team/shared'
+import {
+  canonicalizeJobUpdate,
+  type Job,
+  type PersistedTaskFailureExplanationV1,
+  type Task,
+  type TaskFailureQuestionTurn,
+} from '@ai-team/shared'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
+  buildTaskFailureExplanationViewModel,
   generateTaskFailureExplanation,
   type TaskFailureAiContext,
   type TaskFailureAiOptions,
   type TaskFailureJob,
 } from '../taskFailureExplain/taskFailureAi'
+
+export const TASK_FAILURE_EXPLANATION_INPUT_VERSION = 1 as const
+
+type FailureExplanationPersistenceResult =
+  | { ok: true; envelope: PersistedTaskFailureExplanationV1 }
+  | { ok: false; error: string }
+  | { retryWithCurrentFailure: true }
+
+const inFlight = new Map<string, Promise<FailureExplanationPersistenceResult>>()
+
+function runFailureExplanationSingleFlight(
+  key: string,
+  operation: () => Promise<FailureExplanationPersistenceResult>,
+): Promise<FailureExplanationPersistenceResult> {
+  const existing = inFlight.get(key)
+  if (existing) return existing
+
+  const promise = Promise.resolve()
+    .then(operation)
+    .finally(() => {
+      if (inFlight.get(key) === promise) {
+        inFlight.delete(key)
+      }
+    })
+  inFlight.set(key, promise)
+  return promise
+}
+
+export function computeFailureContentHash(context: TaskFailureAiContext): string {
+  const canonicalInput = canonicalizeJobUpdate({
+    inputVersion: TASK_FAILURE_EXPLANATION_INPUT_VERSION,
+    task: {
+      title: context.task.title,
+      description: context.task.description,
+    },
+    job: {
+      id: context.latestJob.id,
+      status: context.latestJob.status,
+      safeCommandKind: context.latestJob.safeCommand.kind,
+      startedAt: context.latestJob.startedAt ?? null,
+      completedAt: context.latestJob.completedAt ?? null,
+      exitCode: context.latestJob.exitCode ?? null,
+      stdout: context.latestJob.stdout ?? null,
+      stderr: context.latestJob.stderr ?? null,
+      changedFiles: context.latestJob.changedFiles ?? [],
+      guardResult: context.latestJob.guardResult ?? null,
+    },
+  })
+  return createHash('sha256').update(canonicalInput, 'utf8').digest('hex')
+}
 
 const TaskStatusSchema = z.enum(['pending', 'in_progress', 'review', 'done', 'blocked'])
 
@@ -156,30 +214,104 @@ export async function taskRoutes(
       return reply.status(404).send({ error: 'Task not found' })
     }
 
-    const context = resolveTaskFailureAiContext(task)
-    if (!context) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const currentTask = attempt === 0 ? task : storage.tasks.findById(task.id)
+      const context = currentTask
+        ? resolveTaskFailureAiContext(currentTask)
+        : null
+      if (!context) {
+        return reply.send({
+          ok: false,
+          error: '説明対象の失敗・停止Jobが見つかりませんでした',
+        })
+      }
+
+      const contentHash = computeFailureContentHash(context)
+      const key = `${context.latestJob.id}:${contentHash}`
+      const stored = storage.jobs.findFailureExplanation(context.latestJob.id)
+      if (
+        stored?.schemaVersion === 1 &&
+        stored.inputVersion === TASK_FAILURE_EXPLANATION_INPUT_VERSION &&
+        stored.contentHash === contentHash
+      ) {
+        return reply.send({
+          ok: true,
+          explanation: buildTaskFailureExplanationViewModel(
+            stored.aiAnalysis,
+            context,
+            stored.generatedAt,
+          ),
+        })
+      }
+
+      const persisted = await runFailureExplanationSingleFlight(key, async () => {
+        const generated = await generateTaskFailureExplanation(
+          context,
+          options.failureExplanationAiOptions,
+        )
+        if (!generated.ok) return generated
+
+        const currentTaskAfterGeneration = storage.tasks.findById(task.id)
+        const currentContext = currentTaskAfterGeneration
+          ? resolveTaskFailureAiContext(currentTaskAfterGeneration)
+          : null
+        if (
+          !currentContext ||
+          currentContext.latestJob.id !== context.latestJob.id ||
+          computeFailureContentHash(currentContext) !== contentHash
+        ) {
+          return { retryWithCurrentFailure: true }
+        }
+
+        const envelope: PersistedTaskFailureExplanationV1 = {
+          schemaVersion: 1,
+          inputVersion: TASK_FAILURE_EXPLANATION_INPUT_VERSION,
+          contentHash,
+          generatedAt: generated.explanation.generatedAt,
+          aiAnalysis: generated.explanation.aiAnalysis,
+        }
+        storage.jobs.saveFailureExplanation(context.latestJob.id, envelope)
+        return { ok: true, envelope }
+      })
+
+      if ('retryWithCurrentFailure' in persisted) continue
+      if (!persisted.ok) {
+        req.log.warn(
+          { taskId: task.id, error: persisted.error },
+          'Task failure explanation generation failed',
+        )
+        return reply.send({
+          ok: false,
+          error: 'AIによる分析を生成できませんでした',
+        })
+      }
+
+      const latestTask = storage.tasks.findById(task.id)
+      const latestContext = latestTask
+        ? resolveTaskFailureAiContext(latestTask)
+        : null
+      if (
+        !latestContext ||
+        latestContext.latestJob.id !== context.latestJob.id ||
+        computeFailureContentHash(latestContext) !== contentHash
+      ) {
+        continue
+      }
+
       return reply.send({
-        ok: false,
-        error: '説明対象の失敗・停止Jobが見つかりませんでした',
+        ok: true,
+        explanation: buildTaskFailureExplanationViewModel(
+          persisted.envelope.aiAnalysis,
+          latestContext,
+          persisted.envelope.generatedAt,
+        ),
       })
     }
 
-    const generated = await generateTaskFailureExplanation(
-      context,
-      options.failureExplanationAiOptions,
-    )
-    if (!generated.ok) {
-      req.log.warn(
-        { taskId: task.id, error: generated.error },
-        'Task failure explanation generation failed',
-      )
-      return reply.send({
-        ok: false,
-        error: 'AIによる分析を生成できませんでした',
-      })
-    }
-
-    return reply.send(generated)
+    return reply.send({
+      ok: false,
+      error: 'AIによる分析を生成できませんでした',
+    })
   })
 
   app.post<{ Params: { id: string } }>('/:id/failure-ask', async (req, reply) => {

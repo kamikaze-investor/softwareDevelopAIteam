@@ -73,6 +73,7 @@ export const CREATE_TABLES = `
     commit_hash TEXT,
     rollback_info TEXT,
     guard_result TEXT,
+    failure_explanation_json TEXT,
     approval_id TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
@@ -307,6 +308,7 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'jobs', column: 'safe_command', definition: 'TEXT' },
   { table: 'jobs', column: 'dry_run', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'jobs', column: 'guard_result', definition: 'TEXT' },
+  { table: 'jobs', column: 'failure_explanation_json', definition: 'TEXT' },
   { table: 'jobs', column: 'approval_id', definition: 'TEXT' },
   { table: 'jobs', column: 'stdout_path', definition: 'TEXT' },
   { table: 'jobs', column: 'stderr_path', definition: 'TEXT' },
