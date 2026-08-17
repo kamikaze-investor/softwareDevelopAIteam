@@ -881,18 +881,24 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       pending中は新しいJobを取得しない（`apps/worker/src/index.ts`のpollJobsガード）／
       startup時のpending resend（起動時drain）。いずれも`apps/worker/src/index.ts`
       （実Worker起動経路）に実際に配線されていることをコードで確認済み。
-      **残課題**: natural production terminal-result E2Eのみ（実VPS環境でのAPI停止・
-      再起動を伴う実測確認）。この残課題が満たされるまでchecklistは未完了のまま維持する
+      **残課題**: natural production terminal-result E2E（実VPS環境でのAPI停止・再起動を伴う
+      実測確認）に加え、後述する稼働中再送とAPI側FSM強制が未完了。これらが満たされるまで
+      checklistは未完了のまま維持する
       **Worker側**: 実行結果を専用の永続Outboxへ保存する（本体DBとは分離し、未送信結果だけを保持）／
       `completionEventId`等で結果を一意識別する／APIからACKを受け取るまでOutboxの結果を削除しない／
-      通信失敗・429・5xx・タイムアウト時はバックオフして再送する／Worker再起動後も未送信結果を再送する／
-      **未送信結果が残っている間は新しいJobを取得しない**。
+      terminal PATCHは通信失敗・429・5xx・タイムアウト時に最大3回retryし、失敗後はOutboxへ残す／
+      Worker再起動時はstartup drainで未送信結果を再送する／**未送信結果が残っている間は新しいJobを
+      取得しない**。**未完了**: 稼働中pollはpending検出時にJob取得をskipするだけで
+      `resendPending()`を呼ばず、初回3回のbounded retry後はrestartまで再送されない
+      （`apps/worker/src/index.ts:98,325,389`）。稼働中もbounded backoffで再送する配線が必要。
       **API側**: 狭い内部Job結果受信口だけを提供する／同じ結果が再送されても一度だけ反映する（冪等）／
-      許可されたJob状態遷移だけを実行する（既存`ALLOWED_TRANSITIONS`に従う）／
-      任意のTask・Project・DB操作は受け付けない。
-      **完了条件**: API停止中にWorkerが完了しても結果が失われない／Worker再起動後に未送信結果を
-      再送できる／同じ結果を複数回送ってもDB反映は一度だけ／APIがACKするまで次Jobへ進まない／
-      Workerから本体DBへ直接アクセスできない
+      任意のTask・Project・DB操作は受け付けない。**未完了**: `ALLOWED_TRANSITIONS`はWorker側の
+      `apps/worker/src/jobStateManager.ts:37`にのみ存在し、APIの一般PATCHはZodによるstatus値検証と
+      implement requeue時のDesign Review確認だけで、from→toのFSMを強制していない
+      （`apps/api/src/routes/jobs.ts`）。API側でも許可されたJob状態遷移だけを実行する必要がある。
+      **完了条件**: API停止中にWorkerが完了しても結果が失われない／Worker稼働中および再起動後に
+      未送信結果を再送できる／同じ結果を複数回送ってもDB反映は一度だけ／APIがfrom→toのFSMを
+      強制する／APIがACKするまで次Jobへ進まない／Workerから本体DBへ直接アクセスできない
 
       **attemptとOutbox eventの対応（2026-07-31確定）**: 1 Job行＝1 attemptであり、
       Outbox eventは`jobId`＋Worker生成の`event_id`で該当attemptに紐づく。attemptの
@@ -1000,14 +1006,52 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **加えて、GitHub外部強制境界（`project-auto-worker-trust-boundary`参照）が完成するまで、
       自律的なgit push/mergeを解放しない**（詳細は同項目参照。本項目へ内容を複製しない）。
       ただし**設計調査は継続中**（2026-07-30時点でCodex `gpt-5.6-sol` read-only独立レビュー実施済み）。
-      初回Jobの自動生成と、Job完了後に次Taskへ自動で進む仕組み
-      （手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。無いのは「自動生成」と「自動継続」）。
+      **接続済み範囲と不足範囲**: workflowへ入った後の成功系
+      `implement success → review Job自動生成 → approved → git_commit Job自動生成`は接続済み
+      （`apps/api/src/routes/jobs.ts:361,303`）。一方、公開APIから`workflowStepKey`を設定できず、
+      initial workflow Jobを作るproduction serviceも無いため、新規Taskからこのchainへ入る入口が無い。
+      手動の`POST /api/jobs`とblocked Jobの`resume`は既に存在する。不足しているのは初回Jobの
+      自動生成、次Taskへの自動継続、および主にfailure recovery側であり、chain全体が未接続なのではない。
       **設計方針**: DB Task同期とMarkdown保存の**両方**が成功するまで初回Jobを作らない／
       Worker結果がAPIへ確定反映されるまで次Jobを作らない／API側の**薄いapplication service**が
       Task状態更新と次Job生成を担当する（新しい常駐Orchestratorは作らない）／
       Task単位でqueued/running Jobの重複を**DB制約**（partial unique index）で防止する／
-      paused・blocked・failed・Approval待ちでは継続しない／MVPでは単一Workerのみ／
+      `blocked`（Approval・Permission・Safety）、`rejected`、CEO操作が必要な場合、Worker起動時に
+      attemptの状態が不明な場合、およびpaused Projectでは継続しない。**`failed`は一律停止条件にせず、
+      failureの種類と安全な再試行条件に従ってStage 1/2へ振り分ける**／MVPでは単一Workerのみ／
       **Context Pack完全接続は含めない**。
+
+      **Stage 1 — 限定technical/transient retry（Core Auto-Recovery完成ではない）**:
+      次の条件を**すべて**満たす場合だけ、同一内容のJobを限定的に再実行する。
+      - `aiCliPrompt`が完全一致し、provider・mode・SafeCommand等の実行条件も同一
+      - rate limit・provider timeout・network transient等、機械的に再試行可能と判定できるfailure
+      - 前attemptによるworktreeおよびHEADの変更がない
+      - Taskの最新Design Review evidenceのhashが引き続き一致する
+      - bounded retry、failure fingerprint、duplicate active Job防止、必要なTask状態同期を備える
+      **Stage 1の対象外（自動修正しない）**: test/build/lint failure、implementation error、
+      changed filesがあるattempt、review `changes_requested`、failure contextをpromptへ追加する必要が
+      あるfailure。Stage 1は同一入力の限定的な再実行機能にすぎず、失敗内容を踏まえて実装を直す
+      自動修正機能でも、Core Auto-RecoveryやFull Automationの完成でもない。
+
+      **Stage 2 — Trusted Design Review経路完成後のauto-recovery**:
+      test/build/implementation failureを踏まえた再実装、review `changes_requested`からの自動修正、
+      changed promptに対するtrusted Design Review、異なる修正アプローチの試行を扱う。同じ失敗を
+      無限反復せず、failure fingerprintとboundedな試行履歴に基づき、AIが合理的な解決手段を
+      使い切った場合、一時的resource/external wait、またはCEO操作・承認・判断が必要な場合に
+      Humanへescalateする。Safety Gate / Design Reviewは迂回・弱体化しない。
+
+      **Stage分割の技術的根拠（2026-08-17 read-only確認）**:
+      Design Review Gateは`computeDesignTextHash(input.aiCliPrompt)`で`aiCliPrompt`全体をhash化し、
+      Taskの**最新**evidenceのhashと厳密比較する（`apps/api/src/designReviewEvidencePolicy.ts:46,55`）。
+      Job型には`failureContext`/`failedTests`/`reviewFindings`等の専用フィールドが無く、failure contextを
+      渡すには`aiCliPrompt`へ含めるしかないため、1文字でも加えるとhashが変わる。`contextFiles`は型に
+      あるが、`jobRunner`は常に空配列を渡しており利用可能な経路ではない
+      （`apps/worker/src/jobRunner.ts:665`）。hash対象外の経路でfailure contextを渡す設計はGateの
+      実質的な迂回となり、stderr・test出力・review findingsにはprompt injectionも混入し得る。
+      また全Jobは共有の`/workspace/target`で実行され、失敗後もresetされないため、前attemptの
+      未commit変更が次Jobから見える（`apps/worker/src/jobRunner.ts:671`）。worktree隔離はroadmap上の
+      計画だけで未実装。このためStage 1は「prompt完全一致かつworktree/HEAD変更なし」に限定し、
+      failure contextや変更済みworktreeを扱う再実装はtrusted経路完成後のStage 2へ分離する。
       **既知の穴（実コード検証済み）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
       `projectId`とTaskのProjectの一致検証も無い（`routes/jobs.ts:122-137`）。
       `Task.status`を自動更新するコードが存在せず事実上`pending`のまま。
@@ -1024,20 +1068,22 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       「Task取得失敗はAI実行前にfailedで停止する」という状態契約を満たさない。
       正しく直すにはqueued Jobを先に取得して`taskId`からTaskを引くポーリング契約へ変える必要があり、
       API側の変更を伴うため本Step（薄いapplication serviceによる進行管理）の設計に含めて解決する。
-      **Design Review evidence trust blocker（2026-08-15確認。本項目着手前に解決が必須）**:
-      `apps/worker/scripts/designReview.ts`（`POST /api/design-review-evidence`でverdictを
-      登録するCLI）は現在**Worker runtimeから一切呼ばれていない**（手動CLI実行のみ）。
-      Worker↔API authority separation（`project-auto-worker-trust-boundary`参照）で、WORKER
-      credentialからは`design-review-evidence`書き込みをDefault Denyにした。**この項目
-      （Task→Job自動連続実行）でdesign-reviewをWorker自動実行へ組み込む場合、Worker（または
-      それに準ずる自動実行主体）がevidence登録の権限を必要とすることになり、上記deny設計と
-      衝突する**。Worker自動実行がverdictを自己申告できる限り、実際にreviewが実行されたことの
-      非否認性は成立しない（API側はGemini/Codex認証情報を持たない既存確定方針のため、API側での
-      独立検証も採れない）。**本項目のスコープにDesign Review自動実行を含める場合は、着手前に
-      この trust問題を解決すること**（新しいReviewer service・新OS user・署名システムを安易に
-      追加しない前提で、着手時に改めて設計する）
-      **完了条件**: 1つのProjectで複数Taskが順に自動実行され、二重生成・途中失敗時に
-      安全側で停止すること（既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）
+      **Trusted Design Review evidence trust blocker（Stage 2着手前に解決必須）**:
+      evidence authorityはAPI / Control Plane側に置き、Workerへevidence登録権限を与えず、既存の
+      WORKER credential allowlistを拡大しない。Reviewer AIはreview実行者でありauthorityではない。
+      Worker結果PATCH内でLLMを同期実行しない（結果PATCHのtimeoutは5秒）。既存Strategic Review、
+      `design_review_evidence`、storage transaction、Job資産を最大限再利用する。
+      `design_review_runs` 1テーブル案は**有力な最小案**だが最終実装としては未確定。Stage 2実装前に
+      Production構成をread-only確認し、API runtimeのreview用credential、deploy artifact、runner配置を
+      確認してから最終決定する。`apps/worker/scripts/designReview.ts`は自らevidenceをPOSTし、保存失敗を
+      exit codeへ反映しないうえ、Worker build対象は`src`のみで`scripts/`はproduction `dist`に含まれない。
+      したがって同script全体ではなくreview実行部分の`runStrategicMetaReview()`のみ再利用候補とする。
+      hash対象外のfailure context経路やWorkerの自己申告でtrust blockerを回避しない。
+      **完了条件**: 新規Taskからworkflowへ入る入口があり、1つのProjectで複数Taskが順に自動実行され、
+      二重生成を防止し、Stage 1の限定retryとStage 2のtrusted auto-recoveryを区別して実行できること。
+      通常failureは安全な範囲で自動回復し、指定した停止・Human escalation条件ではfail-closedになること
+      （既存`resumeBlockedTask()`の原子的チェック＋作成パターンを流用）。Stage 1だけでは本項目を
+      完了扱いにせず、Full Automation完成とも扱わない
 <!-- roadmap:id=project-auto-recovery-e2e state=planned -->
 8. [ ] **障害復旧E2E・自律実行有効化** — 依存: `project-auto-task-job-chain`。
       **確認シナリオ**: API停止中にWorkerが完了／API復旧後に結果再送／ACK消失による重複送信／
