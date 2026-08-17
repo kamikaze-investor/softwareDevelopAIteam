@@ -5,6 +5,7 @@
  * スタル検出時は Gemini に分析を依頼し、結果を WatchdogEvent として API に記録する。
  */
 
+import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { Job, Project, Task } from '@ai-team/shared'
 import { checkStall } from './stallDetector.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
@@ -149,8 +150,13 @@ async function analyzeAndReport(
 
 function buildStallAnalysisPrompt(job: Job, stallDurationMs: number): string {
   const minutes = Math.round(stallDurationMs / 60_000 * 10) / 10
+  const constitutionPrinciples = loadConstitutionPrinciples()
+  const constitutionPrinciplesWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
+  if (constitutionPrinciplesWarning) console.warn(constitutionPrinciplesWarning)
+  const constitutionPrinciplesPrompt = `${buildConstitutionPrinciplesPrompt(constitutionPrinciples)}\n`
   return `あなたは開発システムの監視 AI です。
 AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。
+${constitutionPrinciplesPrompt}
 以下の Job が応答なしで実行中です。本当にスタック（無限ループ・デッドロック・I/O待ちなど）しているか、それとも単に時間がかかっているだけか分析してください。
 
 Job 情報:

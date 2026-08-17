@@ -10,6 +10,7 @@
  * - jobRunner/commitGateへの接続、ChatGPT自動呼び出し、自動停止条件の追加は本モジュールの範囲外。
  */
 
+import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
 
 export type StepReviewImportance = 'low' | 'medium' | 'high'
@@ -105,11 +106,15 @@ function normalizeStringArray(value: unknown): string[] {
  */
 export function buildStepReviewPrompt(input: StepReviewInput): string {
   const targetFileList = input.targetFiles.map(file => `- ${file}`).join('\n')
+  const constitutionPrinciples = loadConstitutionPrinciples()
+  const constitutionPrinciplesWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
+  if (constitutionPrinciplesWarning) console.warn(constitutionPrinciplesWarning)
 
   return [
     'これはAI開発チームにおけるStep単位の軽量判断レビューです。',
     'あなたは最終判断者ではありません。重要度判定と次に何をすべきかの提案のみを行ってください。',
     'AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。',
+    buildConstitutionPrinciplesPrompt(constitutionPrinciples),
     '',
     'タスクの目的:',
     input.purposeSummary,

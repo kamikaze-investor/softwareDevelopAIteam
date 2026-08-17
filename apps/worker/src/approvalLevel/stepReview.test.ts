@@ -51,6 +51,14 @@ describe('buildStepReviewPrompt', () => {
 
     expect(prompt).toContain('最終判断者ではありません')
   })
+
+  it('Constitution 3.14〜3.15 の原則本文が含まれる', () => {
+    const prompt = buildStepReviewPrompt(makeInput())
+
+    expect(prompt).toContain('## 3.14 Minimum Sufficient Validation')
+    expect(prompt).toContain('必要最小限の独立した反証レビュー')
+    expect(prompt).toContain('CEO確認は、原則として次の場合に限る')
+  })
 })
 
 describe('parseStepReviewResponse', () => {

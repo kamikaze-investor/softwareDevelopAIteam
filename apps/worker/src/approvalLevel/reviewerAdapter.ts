@@ -1,3 +1,4 @@
+import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { ApprovalLevelResult } from '@ai-team/shared'
 import { createAiCliAdapter } from '../aiCli/factory.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
@@ -121,6 +122,9 @@ export function selectReviewerProvider(implementer: ImplementerProvider): Review
 
 export function buildReviewPrompt(req: ReviewerRequest): string {
   const targetFileList = req.targetFiles.map(file => `- ${file}`).join('\n')
+  const constitutionPrinciples = loadConstitutionPrinciples()
+  const constitutionPrinciplesWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
+  if (constitutionPrinciplesWarning) console.warn(constitutionPrinciplesWarning)
 
   const phaseSpecificContent = req.phase === 'pre'
     ? [
@@ -140,6 +144,7 @@ export function buildReviewPrompt(req: ReviewerRequest): string {
     phaseSpecificContent,
     '',
     'AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。',
+    buildConstitutionPrinciplesPrompt(constitutionPrinciples),
     '',
     '実装目的・タスク説明:',
     req.purposeSummary,

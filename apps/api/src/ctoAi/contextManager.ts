@@ -16,6 +16,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { Task } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
@@ -231,10 +232,14 @@ function readProjectMemory(targetProjectRoot: string): ProjectMemorySummary {
 // ────────────────────────────────────────────────────────────
 
 function buildInstruction(task: TaskSummary, projectMemory: ProjectMemorySummary): string {
+  const constitutionPrinciples = loadConstitutionPrinciples()
+  const constitutionWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
+  if (constitutionWarning) console.warn(constitutionWarning)
   const lines: string[] = [
     `# Developer AI — Task: ${task.id}`,
     '',
     'AI Team OS共通行動原則は `specs/00_constitution.md` 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。',
+    buildConstitutionPrinciplesPrompt(constitutionPrinciples),
     '',
     `## あなたの使命`,
     `**${task.title}** を実装してください。`,

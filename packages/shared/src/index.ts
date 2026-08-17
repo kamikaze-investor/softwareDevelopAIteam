@@ -24,6 +24,10 @@ export * from './types/approvalLevel'
 export * from './types/audit_log'
 export * from './types/project_roadmap'
 export * from './outbox/canonicalize'
+// `constitutionPrinciples` は node:fs / node:path に依存するため、ここからは再exportしない。
+// Mobile（React Native）は `@ai-team/shared` をこのbarrel経由で読み込むため、
+// barrelへ載せるとNode専用APIがRNバンドルへ混入する。
+// Node runtime（API / Worker）からは `@ai-team/shared/src/constitutionPrinciples.js` を直接importすること。
 export {
   RISK_RULES,
   SAFE_ONLY_PATTERNS,

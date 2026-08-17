@@ -10,6 +10,7 @@
  */
 
 import Anthropic from '@anthropic-ai/sdk'
+import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import { z } from 'zod'
 
 // ────────────────────────────────────────────────────────────
@@ -59,10 +60,15 @@ export type Gap = z.infer<typeof GapSchema>
 // プロンプト
 // ────────────────────────────────────────────────────────────
 
+const constitutionPrinciples = loadConstitutionPrinciples()
+const constitutionPrinciplesWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
+if (constitutionPrinciplesWarning) console.warn(constitutionPrinciplesWarning)
+const constitutionPrinciplesPrompt = `${buildConstitutionPrinciplesPrompt(constitutionPrinciples)}\n`
+
 const SYSTEM_PROMPT = `あなたはAI開発チームのCTO AIです。
 ユーザーから仕様書（Markdown）を受け取り、開発チームが開発を開始できる形に構造化します。
 AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先します。
-
+${constitutionPrinciplesPrompt}
 以下のJSON形式のみで回答してください。説明文・マークダウンコードブロック・前置き・後書きは一切不要です。
 
 {

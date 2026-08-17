@@ -171,6 +171,14 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toContain('"verdict": "approved" | "changes_requested" | "blocking"')
   })
 
+  it('Constitution 3.14〜3.15 の原則本文が含まれる', () => {
+    const prompt = buildReviewPrompt(makeRequest())
+
+    expect(prompt).toContain('## 3.14 Minimum Sufficient Validation')
+    expect(prompt).toContain('必要最小限の独立した反証レビュー')
+    expect(prompt).toContain('CEO確認は、原則として次の場合に限る')
+  })
+
   it('purposeSummary と targetFiles が含まれる', () => {
     const prompt = buildReviewPrompt(makeRequest({
       purposeSummary: 'Level 1以上で別AIレビューを実行する',

@@ -26,6 +26,7 @@ import type {
   AiCliProvider,
 } from '@ai-team/shared'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
+import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 import { buildTargetCommandEnv } from '../utils/safeEnv.js'
 import { buildWorktreeManifest } from '../guards/changeManifest.js'
@@ -142,9 +143,15 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     // Codex は CLAUDE.md を自動読込しないため、プロンプト先頭に必ず注入する。
     // injectClaudeMd が明示的に false の場合のみスキップ（テスト用）。
     const shouldInject = request.provider === 'codex' && request.injectClaudeMd !== false
-    const finalPrompt = shouldInject
+    const promptWithClaudeMd = shouldInject
       ? injectClaudeMdEssentials(request.prompt)
       : request.prompt
+
+    // Constitution 3.14〜3.15（AI Team OS共通行動原則）のPolicy overlay。
+    // Control Repository由来の固定Policyのみをprovider非依存で1回だけ前置する。
+    // request.prompt（= 保存済み job.aiCliPrompt、Design Review hashの対象）は変更しない。
+    // 任意のcontextを注入する汎用機構へは拡張しないこと。
+    const finalPrompt = prependConstitutionPrinciples(promptWithClaudeMd)
 
     if (request.dryRun) {
       return {
@@ -317,6 +324,29 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
 // ────────────────────────────────────────────────────────────
 // H-1対策: CLAUDE.md注入
 // ────────────────────────────────────────────────────────────
+
+/**
+ * Constitution 3.14〜3.15（AI Team OS共通行動原則）をプロンプト先頭へ1回だけ前置する。
+ *
+ * Implementation Agentの入力は `job.aiCliPrompt` であり、Context Packは未配線のため、
+ * ここで前置しない限り共通行動原則がAgentへ届かない。
+ * 対象はControl Repository由来の固定Policyのみで、Task/user入力やfailure context等の
+ * 動的情報は扱わない（汎用のcontext注入機構へ拡張しないこと）。
+ * 取得できなかった場合も黙って省略せず、未取得である旨をpromptへ明示する。
+ */
+function prependConstitutionPrinciples(prompt: string): string {
+  const principles = loadConstitutionPrinciples()
+  const warning = formatConstitutionPrinciplesWarning(principles)
+  if (warning) console.warn(`[AiCliAdapter] ${warning}`)
+
+  return [
+    '## AI Team OS 共通行動原則（Constitution 3.14〜3.15）',
+    '',
+    buildConstitutionPrinciplesPrompt(principles),
+    '',
+    prompt,
+  ].join('\n')
+}
 
 /**
  * Codex向けにCLAUDE.mdの要点をプロンプト先頭に注入する（Rule-001 H-1）

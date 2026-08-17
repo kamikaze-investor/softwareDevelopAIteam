@@ -72,6 +72,14 @@ describe('buildContextPack', () => {
     expect(pack.instruction).toContain('packages/shared/src/')
   })
 
+  it('Constitution 3.14〜3.15 の原則本文がインストラクションに含まれる', () => {
+    const pack = buildContextPack(SAMPLE_TASK, tmpDir)
+
+    expect(pack.instruction).toContain('## 3.14 Minimum Sufficient Validation')
+    expect(pack.instruction).toContain('必要最小限の独立した反証レビュー')
+    expect(pack.instruction).toContain('CEO確認は、原則として次の場合に限る')
+  })
+
   it('存在しないパスは isNew: true で返す', () => {
     const pack = buildContextPack(SAMPLE_TASK, tmpDir)
     const newFile = pack.relevantFiles.find(f => f.isNew)
