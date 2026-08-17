@@ -139,6 +139,8 @@ export function buildReviewPrompt(req: ReviewerRequest): string {
   return [
     phaseSpecificContent,
     '',
+    'AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。',
+    '',
     '実装目的・タスク説明:',
     req.purposeSummary,
     '',

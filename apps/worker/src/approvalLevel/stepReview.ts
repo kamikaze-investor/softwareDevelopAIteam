@@ -109,6 +109,7 @@ export function buildStepReviewPrompt(input: StepReviewInput): string {
   return [
     'これはAI開発チームにおけるStep単位の軽量判断レビューです。',
     'あなたは最終判断者ではありません。重要度判定と次に何をすべきかの提案のみを行ってください。',
+    'AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。',
     '',
     'タスクの目的:',
     input.purposeSummary,

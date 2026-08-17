@@ -51,6 +51,7 @@ export type Roadmap = z.infer<typeof RoadmapSchema>
 
 const SYSTEM_PROMPT = `あなたはAI開発チームのCTO AIです。
 Project Memoryを受け取り、具体的な開発ロードマップとタスク一覧をJSON形式で出力します。
+AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先します。
 
 以下のルールを守ってください:
 - タスクは小さく分割する（1タスク = 最大2日の作業量）
