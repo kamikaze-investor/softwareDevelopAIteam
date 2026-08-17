@@ -208,6 +208,9 @@ export interface AiCliResult {
   /** 実行時間（ms） */
   durationMs: number
 
+  /** Stage 1で機械的に再試行可能なprovider障害の分類 */
+  providerFailureKind?: 'provider_timeout'
+
   /**
    * CLIが出力したサマリー（あれば）
    * JSON出力の summary フィールドから抽出

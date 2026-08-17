@@ -103,6 +103,29 @@ afterEach(() => {
 })
 
 describe('terminal result persistence', () => {
+  it('provider failure metadataをterminal PATCHとOutboxへ同じ内容で渡す', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const timeoutResult: JobRunResult = {
+      ...runResult,
+      status: 'failed',
+      exitCode: 1,
+      providerFailureKind: 'provider_timeout',
+      workspaceState: 'unchanged',
+    }
+
+    await persistJobResult('job-timeout', timeoutResult, 'failed', { patchJob })
+
+    const failureMetadata = {
+      kind: 'provider_timeout',
+      workspaceState: 'unchanged',
+    }
+    expect(patchJob).toHaveBeenCalledWith('job-timeout', expect.objectContaining({ failureMetadata }))
+    expect(outboxMocks.recordPending).toHaveBeenCalledWith(
+      'job-timeout',
+      expect.objectContaining({ failureMetadata }),
+    )
+  })
+
   it('1〜2回目の失敗後に3回目が成功すればterminal resultを成功として扱う', async () => {
     fetchMock
       .mockRejectedValueOnce(new TypeError('fetch failed'))

@@ -113,6 +113,10 @@ const UpdateJobBody = z.object({
     fileChangeAllowed: z.boolean(),
     fileViolations: z.array(z.string()).optional(),
   }).optional(),
+  failureMetadata: z.object({
+    kind: z.string().optional(),
+    workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+  }).strict().optional(),
   reviewResult: StructuredReviewResultSchema.optional(),
 }).strict()
 
@@ -274,6 +278,11 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Job not found' })
     }
 
+    const isReviewJob = existing.aiCliMode === 'review'
+    if (reviewResult && !isReviewJob) {
+      return reply.status(400).send({ error: 'Structured review results are only accepted for review Jobs' })
+    }
+
     const isImplementRequeue =
       existing.aiCliMode === 'implement' &&
       existing.status !== 'queued' &&
@@ -289,17 +298,35 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    const isReviewJob = existing.aiCliMode === 'review'
+    const isProviderTimeoutFailure =
+      jobUpdate.status === 'failed' &&
+      jobUpdate.failureMetadata?.kind === 'provider_timeout' &&
+      jobUpdate.failureMetadata.workspaceState === 'unchanged' &&
+      existing.aiCliMode === 'implement' &&
+      existing.workflowStepKey?.startsWith('retry:') !== true
+    const isProviderTimeoutRetryCandidate =
+      existing.status === 'running' &&
+      isProviderTimeoutFailure
+    if (isProviderTimeoutRetryCandidate) {
+      const persisted = storage.jobs.persistProviderTimeoutFailure({
+        jobId: existing.id,
+        update: jobUpdate,
+        outboxEvent,
+      })
+      if (!persisted.ok) {
+        if (persisted.code === 'OUTBOX_HASH_MISMATCH') {
+          return reply.status(409).send({ error: persisted.reason })
+        }
+        return reply.status(persisted.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: persisted.reason })
+      }
+      return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
+    }
     const isAutomaticReviewJob =
       existing.workflowStepKey?.startsWith('implement:') === true &&
       existing.workflowStepKey.endsWith(':review') &&
       isReviewJob
 
     if (reviewResult) {
-      if (!isReviewJob) {
-        return reply.status(400).send({ error: 'Structured review results are only accepted for review Jobs' })
-      }
-
       const approved = reviewResult.status === 'approved' && jobUpdate.status === 'success'
       const normalizedUpdate: Partial<Job> = {
         ...jobUpdate,

@@ -1191,6 +1191,110 @@ describe('SQLiteStorage', () => {
       migratedDb.close()
     })
 
+    it('creates and migrates failure_metadata and preserves it through serialization', () => {
+      const created = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        failureMetadata: {
+          kind: 'provider_timeout',
+          workspaceState: 'unchanged',
+        },
+      })
+      expect(storage.jobs.findById(created.id)?.failureMetadata).toEqual({
+        kind: 'provider_timeout',
+        workspaceState: 'unchanged',
+      })
+
+      storage.jobs.update(created.id, {
+        status: 'failed',
+        failureMetadata: { workspaceState: 'changed' },
+      })
+      expect(storage.jobs.findById(created.id)?.failureMetadata).toEqual({
+        workspaceState: 'changed',
+      })
+
+      const newDbPath = path.join(os.tmpdir(), `ai-team-failure-metadata-new-${randomUUID()}.db`)
+      createSQLiteStorage(newDbPath)
+      const newDb = new Database(newDbPath, { readonly: true })
+      expect((newDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'failure_metadata',
+      )).toBe(true)
+      newDb.close()
+
+      const legacyDbPath = path.join(os.tmpdir(), `ai-team-failure-metadata-legacy-${randomUUID()}.db`)
+      const legacyDb = new Database(legacyDbPath)
+      legacyDb.exec(CREATE_TABLES.replace('    failure_metadata TEXT,\n', ''))
+      legacyDb.close()
+
+      expect(() => createSQLiteStorage(legacyDbPath)).not.toThrow()
+      expect(() => createSQLiteStorage(legacyDbPath)).not.toThrow()
+      const migratedDb = new Database(legacyDbPath, { readonly: true })
+      expect((migratedDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'failure_metadata',
+      )).toBe(true)
+      migratedDb.close()
+    })
+
+    it.each(['blocked', 'queued', 'success'] as const)(
+      'persistProviderTimeoutFailure leaves a %s source Job and its Outbox event unapplied',
+      (status) => {
+        const source = storage.jobs.create({
+          taskId,
+          projectId,
+          agentRole: 'developer_ai',
+          status,
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          aiCliProvider: 'codex',
+          aiCliPrompt: `Preserve ${status}`,
+          aiCliMode: 'implement',
+        })
+        const sourceBefore = storage.jobs.findById(source.id)
+        const update = {
+          status: 'failed' as const,
+          failureMetadata: {
+            kind: 'provider_timeout',
+            workspaceState: 'unchanged' as const,
+          },
+        }
+        const outboxEvent = {
+          eventId: `provider-timeout-${status}`,
+          payloadHash: `provider-timeout-${status}-hash`,
+        }
+
+        const result = storage.jobs.persistProviderTimeoutFailure({
+          jobId: source.id,
+          update,
+          outboxEvent,
+        })
+
+        expect(result).toMatchObject({
+          ok: true,
+          job: source,
+          retryJobCreated: false,
+          deduplicated: false,
+        })
+        expect(storage.jobs.findById(source.id)).toEqual(sourceBefore)
+        expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+
+        const applied = storage.jobs.updateWithOutboxEvent(source.id, update, outboxEvent)
+        const resend = storage.jobs.updateWithOutboxEvent(source.id, update, outboxEvent)
+        expect(applied).toMatchObject({
+          ok: true,
+          job: { id: source.id, status: 'failed' },
+          deduplicated: false,
+        })
+        expect(resend).toMatchObject({
+          ok: true,
+          job: { id: source.id, status: 'failed' },
+          deduplicated: true,
+        })
+        expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+      },
+    )
+
     it('enforces one Job per non-NULL approval_id with the unique index', () => {
       const first = storage.jobs.create({
         taskId,

@@ -174,6 +174,40 @@ async function createStoredImplementJob(
   })
 }
 
+function providerTimeoutFailure(
+  workspaceState: 'unchanged' | 'changed' | 'unknown' = 'unchanged',
+): Record<string, unknown> {
+  return {
+    status: 'failed',
+    exitCode: 1,
+    stderr: 'provider command timed out',
+    changedFiles: [],
+    guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+    failureMetadata: {
+      kind: 'provider_timeout',
+      workspaceState,
+    },
+  }
+}
+
+async function createApprovalRequestWithStatus(
+  task: Task,
+  status: 'WAITING_FOR_USER' | 'REJECTED',
+): Promise<void> {
+  const { getStorage } = await import('../storage/index.js')
+  getStorage().approvalRequests.create({
+    taskId: task.id,
+    targetBranch: 'main',
+    targetCommit: 'commit-hash',
+    targetDiffHash: 'diff-hash',
+    riskLevel: 'HIGH',
+    requestedAction: 'test',
+    status,
+    expiresAt: '2099-01-01T00:00:00.000Z',
+    invalidIf: [],
+  })
+}
+
 async function createAutomaticReviewJob(
   app: FastifyInstance,
 ): Promise<{ implement: Job; project: Project; review: Job; task: Task }> {
@@ -1221,6 +1255,409 @@ describe('Job API', () => {
         url: `/api/jobs?taskId=${task.id}`,
       })
       expect(parseBody<Job[]>(jobsResponse.body)).toHaveLength(1)
+    })
+  })
+
+  it('creates one new retry Job, preserves the failed source Job, and deduplicates the same result PATCH', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const prompt = 'Implement the reviewed timeout retry case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const { getStorage } = await import('../storage/index.js')
+      const source = getStorage().jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        workflowStepKey: `task:${task.id}:initial-implement`,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: true,
+        aiCliProvider: 'codex',
+        aiCliPrompt: prompt,
+        aiCliMode: 'implement',
+      })
+      const payload = providerTimeoutFailure()
+      const outboxPayload = withOutbox(payload, 'provider-timeout-event')
+
+      const first = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: outboxPayload,
+      })
+      const second = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: outboxPayload,
+      })
+
+      expect(first.statusCode).toBe(200)
+      expect(second.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(second.body).outbox?.deduplicated).toBe(true)
+
+      const jobs = getStorage().jobs.findByTaskId(task.id)
+      expect(jobs).toHaveLength(2)
+      expect(jobs.find((job) => job.id === source.id)).toMatchObject({
+        status: 'failed',
+        failureMetadata: {
+          kind: 'provider_timeout',
+          workspaceState: 'unchanged',
+        },
+      })
+      expect(jobs.find((job) => job.id !== source.id)).toMatchObject({
+        taskId: source.taskId,
+        projectId: source.projectId,
+        workflowStepKey: `retry:${source.id}:1`,
+        agentRole: source.agentRole,
+        status: 'queued',
+        safeCommand: source.safeCommand,
+        dryRun: true,
+        aiCliProvider: source.aiCliProvider,
+        aiCliPrompt: source.aiCliPrompt,
+        aiCliMode: source.aiCliMode,
+      })
+    })
+  })
+
+  it.each(['blocked', 'queued', 'success'] as const)(
+    'applies an Outbox provider_timeout result to a %s source Job without retrying and deduplicates its resend',
+    async (status) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        const task = await createTask(app, project.id)
+        const prompt = `Apply the timeout result to the ${status} source Job.`
+        await createDesignReviewEvidence(app, task, prompt)
+        const source = await createStoredImplementJob(task, prompt, status)
+        const { getStorage } = await import('../storage/index.js')
+        const payload = withOutbox(providerTimeoutFailure(), `provider-timeout-${status}`)
+
+        const first = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${source.id}`,
+          payload,
+        })
+        const resend = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${source.id}`,
+          payload,
+        })
+
+        expect(first.statusCode).toBe(200)
+        expect(resend.statusCode).toBe(200)
+        expect(parseBody<OutboxJobResponse>(first.body).outbox).toEqual({
+          eventId: `provider-timeout-${status}`,
+          deduplicated: false,
+        })
+        expect(parseBody<OutboxJobResponse>(resend.body).outbox).toEqual({
+          eventId: `provider-timeout-${status}`,
+          deduplicated: true,
+        })
+        const jobs = getStorage().jobs.findByTaskId(task.id)
+        expect(jobs).toHaveLength(1)
+        expect(jobs[0]).toMatchObject({
+          id: source.id,
+          status: 'failed',
+          exitCode: 1,
+          stderr: 'provider command timed out',
+          failureMetadata: {
+            kind: 'provider_timeout',
+            workspaceState: 'unchanged',
+          },
+        })
+        expect(jobs.some((job) => job.workflowStepKey?.startsWith('retry:') === true)).toBe(false)
+      })
+    },
+  )
+
+  it.each([
+    ['changes_requested without Outbox', 'changes_requested' as const, false],
+    ['rejected without Outbox', 'rejected' as const, false],
+    ['changes_requested with Outbox', 'changes_requested' as const, true],
+    ['rejected with Outbox', 'rejected' as const, true],
+  ])('rejects %s on an eligible implement timeout without applying the update', async (_label, status, useOutbox) => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const prompt = 'Reject structured review data on an implement timeout.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'running')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const sourceBefore = storage.jobs.findById(source.id)
+      const reviewPayload = {
+        ...providerTimeoutFailure(),
+        reviewResult: {
+          status,
+          summary: 'blocking',
+          findings: [],
+        },
+      }
+      const eventId = `implement-timeout-review-${status}`
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: useOutbox ? withOutbox(reviewPayload, eventId) : reviewPayload,
+      })
+
+      expect(response.statusCode).toBe(400)
+      expect(parseBody<{ error: string }>(response.body)).toEqual({
+        error: 'Structured review results are only accepted for review Jobs',
+      })
+      expect(storage.jobs.findById(source.id)).toEqual(sourceBefore)
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(1)
+      expect(storage.reviewResults.findByTaskId(task.id)).toEqual([])
+
+      if (useOutbox) {
+        const probePayload = { status: 'running' as const }
+        const probe = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${source.id}`,
+          payload: withOutbox(probePayload, eventId),
+        })
+        expect(probe.statusCode).toBe(200)
+        expect(parseBody<OutboxJobResponse>(probe.body).outbox).toEqual({
+          eventId,
+          deduplicated: false,
+        })
+        expect(storage.jobs.findByTaskId(task.id)).toHaveLength(1)
+        expect(storage.jobs.findById(source.id)?.status).toBe('running')
+      }
+    })
+  })
+
+  it('does not create a third Job when the retry Job also fails with provider_timeout', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const prompt = 'Implement the reviewed bounded retry case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'running')
+
+      await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: providerTimeoutFailure(),
+      })
+      const { getStorage } = await import('../storage/index.js')
+      const retry = getStorage().jobs.findByTaskId(task.id).find(
+        (job) => job.workflowStepKey === `retry:${source.id}:1`,
+      )
+      expect(retry).toBeDefined()
+
+      const retryFailure = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry?.id}`,
+        payload: providerTimeoutFailure(),
+      })
+
+      expect(retryFailure.statusCode).toBe(200)
+      expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(2)
+      expect(getStorage().jobs.findById(retry?.id ?? '')?.status).toBe('failed')
+    })
+  })
+
+  it.each(['changed', 'unknown'] as const)(
+    'does not retry when workspaceState is %s',
+    async (workspaceState) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        const task = await createTask(app, project.id)
+        const prompt = `Implement workspace ${workspaceState}.`
+        await createDesignReviewEvidence(app, task, prompt)
+        const source = await createStoredImplementJob(task, prompt, 'running')
+
+        const response = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${source.id}`,
+          payload: providerTimeoutFailure(workspaceState),
+        })
+
+        expect(response.statusCode).toBe(200)
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(1)
+      })
+    },
+  )
+
+  it('does not retry when stderr only contains ETIMEDOUT without failureMetadata.kind', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const prompt = 'Implement stderr-only classification case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'running')
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: {
+          status: 'failed',
+          stderr: 'ETIMEDOUT from nested command output',
+          failureMetadata: { workspaceState: 'unchanged' },
+        },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(1)
+    })
+  })
+
+  it('does not retry a review-mode Job even with provider_timeout metadata', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const { getStorage } = await import('../storage/index.js')
+      const review = getStorage().jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        workflowStepKey: 'implement:source:review',
+        agentRole: 'qa_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'review',
+      })
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${review.id}`,
+        payload: providerTimeoutFailure(),
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(1)
+      expect(getStorage().jobs.findById(review.id)?.status).toBe('failed')
+    })
+  })
+
+  it.each([
+    ['hash mismatch', 'different reviewed text', 'ALIGNED' as const],
+    ['non-ALIGNED evidence', 'Implement the reviewed evidence case.', 'CONFLICT' as const],
+  ])('does not retry when Design Review evidence has %s', async (_label, reviewedText, decision) => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const prompt = 'Implement the reviewed evidence case.'
+      await createDesignReviewEvidence(app, task, reviewedText, { decision })
+      const source = await createStoredImplementJob(task, prompt, 'running')
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: providerTimeoutFailure(),
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(1)
+      expect(getStorage().jobs.findById(source.id)?.status).toBe('failed')
+    })
+  })
+
+  it.each(['WAITING_FOR_USER', 'REJECTED'] as const)(
+    'does not retry while the latest Approval is %s',
+    async (approvalStatus) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        const task = await createTask(app, project.id)
+        const prompt = `Implement approval state ${approvalStatus}.`
+        await createDesignReviewEvidence(app, task, prompt)
+        await createApprovalRequestWithStatus(task, approvalStatus)
+        const source = await createStoredImplementJob(task, prompt, 'running')
+
+        const response = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${source.id}`,
+          payload: providerTimeoutFailure(),
+        })
+
+        expect(response.statusCode).toBe(200)
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(1)
+      })
+    },
+  )
+
+  it('does not retry while a newer blocked Job represents a Permission or Safety wait', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const prompt = 'Implement blocked state case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'running')
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      })
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: providerTimeoutFailure(),
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(2)
+      expect(getStorage().jobs.findByTaskId(task.id).some(
+        (job) => job.workflowStepKey?.startsWith('retry:') === true,
+      )).toBe(false)
+    })
+  })
+
+  it('does not retry when another queued or running Job already exists for the Task', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const prompt = 'Implement active Job conflict case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'running')
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: providerTimeoutFailure(),
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(2)
+      expect(getStorage().jobs.findById(source.id)?.status).toBe('failed')
+    })
+  })
+
+  it.each([
+    ['paused Project', { projectStatus: 'paused' as const, taskStatus: 'pending' as const }],
+    ['blocked Task', { projectStatus: 'running' as const, taskStatus: 'blocked' as const }],
+  ])('does not retry for a %s', async (_label, state) => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: state.projectStatus })
+      const task = await createTask(app, project.id, { status: state.taskStatus })
+      const prompt = 'Implement stopped project or task case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'running')
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: providerTimeoutFailure(),
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id)).toHaveLength(1)
     })
   })
 

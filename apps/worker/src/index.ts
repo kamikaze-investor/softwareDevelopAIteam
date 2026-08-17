@@ -53,6 +53,7 @@ export type JobUpdate = Partial<Pick<
   | 'changedFiles'
   | 'commitHash'
   | 'guardResult'
+  | 'failureMetadata'
 >> & {
   reviewResult?: Pick<ReviewResult, 'status' | 'summary' | 'findings'>
 }
@@ -169,6 +170,12 @@ export async function persistJobResult(
     commitHash: result.commitHash,
     completedAt: result.completedAt,
     guardResult: result.guardResult,
+    failureMetadata: result.providerFailureKind || result.workspaceState
+      ? {
+          kind: result.providerFailureKind,
+          workspaceState: result.workspaceState,
+        }
+      : undefined,
     reviewResult: result.reviewResult,
   }
   const persisted = await persistTerminalUpdate(jobId, resultUpdate, dependencies)

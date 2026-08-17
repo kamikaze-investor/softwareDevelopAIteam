@@ -10,7 +10,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -938,8 +938,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO jobs
           (id, task_id, project_id, workflow_step_key, agent_role, status, safe_command,
-           ai_cli_provider, ai_cli_prompt, ai_cli_mode, dry_run, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ai_cli_provider, ai_cli_prompt, ai_cli_mode, dry_run, failure_metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         job.id,
         job.taskId,
@@ -952,6 +952,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         job.aiCliPrompt ?? null,
         job.aiCliMode ?? null,
         job.dryRun ? 1 : 0,
+        job.failureMetadata ? JSON.stringify(job.failureMetadata) : null,
         job.createdAt,
       )
       return job
@@ -976,7 +977,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         UPDATE jobs SET
           status=?, started_at=?, completed_at=?, exit_code=?,
           stdout=?, stderr=?, stdout_path=?, stderr_path=?, changed_files=?, commit_hash=?,
-          rollback_info=?, guard_result=?, approval_id=?
+          rollback_info=?, guard_result=?, failure_metadata=?, approval_id=?
         WHERE id=?
       `).run(
         updated.status,
@@ -991,6 +992,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         updated.commitHash ?? null,
         updated.rollbackInfo ? JSON.stringify(updated.rollbackInfo) : null,
         updated.guardResult ? JSON.stringify(updated.guardResult) : null,
+        updated.failureMetadata ? JSON.stringify(updated.failureMetadata) : null,
         updated.approvalId ?? null,
         id,
       )
@@ -1020,6 +1022,161 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
       try {
         return updateTransaction()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+    persistProviderTimeoutFailure(input) {
+      const persistTransaction = db.transaction((): PersistProviderTimeoutFailureResult => {
+        const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
+        if (dedup.status === 'conflict') {
+          return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        }
+        if (dedup.status === 'deduplicated') {
+          const job = jobs.findById(input.jobId)
+          if (!job) {
+            return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
+          }
+          const retryJob = findJobByWorkflowStepKey(db, `retry:${job.id}:1`)
+          return {
+            ok: true,
+            job,
+            retryJob,
+            retryJobCreated: false,
+            deduplicated: true,
+          }
+        }
+
+        const source = jobs.findById(input.jobId)
+        if (!source) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
+        }
+
+        if (source.status !== 'running') {
+          return {
+            ok: true,
+            job: source,
+            retryJobCreated: false,
+            deduplicated: false,
+          }
+        }
+
+        const updated = jobs.update(source.id, input.update)
+        if (!updated) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
+        }
+
+        const finishWithoutRetry = (): PersistProviderTimeoutFailureResult => {
+          recordOutboxEvent(db, source.id, input.outboxEvent)
+          return {
+            ok: true,
+            job: updated,
+            retryJobCreated: false,
+            deduplicated: false,
+          }
+        }
+
+        if (
+          updated.status !== 'failed' ||
+          updated.failureMetadata?.kind !== 'provider_timeout' ||
+          updated.failureMetadata.workspaceState !== 'unchanged' ||
+          updated.aiCliMode !== 'implement' ||
+          updated.workflowStepKey?.startsWith('retry:') === true
+        ) {
+          return finishWithoutRetry()
+        }
+
+        const retryWorkflowStepKey = `retry:${source.id}:1`
+        const existingRetry = findJobByWorkflowStepKey(db, retryWorkflowStepKey)
+        if (existingRetry) {
+          recordOutboxEvent(db, source.id, input.outboxEvent)
+          return {
+            ok: true,
+            job: updated,
+            retryJob: existingRetry,
+            retryJobCreated: false,
+            deduplicated: false,
+          }
+        }
+
+        const activeJob = db.prepare(`
+          SELECT id FROM jobs
+          WHERE task_id = ? AND status IN ('queued', 'running')
+          LIMIT 1
+        `).get(source.taskId) as { id: string } | undefined
+        if (activeJob) {
+          return finishWithoutRetry()
+        }
+
+        const task = tasks.findById(source.taskId)
+        const project = projects.findById(source.projectId)
+        if (
+          !task ||
+          task.projectId !== source.projectId ||
+          task.status === 'blocked' ||
+          task.status === 'done' ||
+          !project ||
+          project.status !== 'running'
+        ) {
+          return finishWithoutRetry()
+        }
+
+        const latestApprovalRow = db.prepare(`
+          SELECT status FROM approval_requests
+          WHERE task_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `).get(source.taskId) as { status: ApprovalGateStatus } | undefined
+        if (
+          latestApprovalRow?.status === 'WAITING_FOR_USER' ||
+          latestApprovalRow?.status === 'REJECTED'
+        ) {
+          return finishWithoutRetry()
+        }
+
+        const latestJobRow = db.prepare(`
+          SELECT id, status FROM jobs
+          WHERE task_id = ?
+          ORDER BY created_at DESC, rowid DESC
+          LIMIT 1
+        `).get(source.taskId) as { id: string; status: JobStatus } | undefined
+        if (latestJobRow?.id !== source.id && latestJobRow?.status === 'blocked') {
+          return finishWithoutRetry()
+        }
+
+        const designReviewCheck = checkImplementJobDesignReviewEvidence(updated, designReviewEvidence)
+        if (!designReviewCheck.ok) {
+          return finishWithoutRetry()
+        }
+
+        const retryJob = jobs.create({
+          taskId: source.taskId,
+          projectId: source.projectId,
+          workflowStepKey: retryWorkflowStepKey,
+          agentRole: source.agentRole,
+          status: 'queued',
+          safeCommand: source.safeCommand,
+          dryRun: source.dryRun,
+          aiCliProvider: source.aiCliProvider,
+          aiCliPrompt: source.aiCliPrompt,
+          aiCliMode: source.aiCliMode,
+        })
+        recordOutboxEvent(db, source.id, input.outboxEvent)
+        return {
+          ok: true,
+          job: updated,
+          retryJob,
+          retryJobCreated: true,
+          deduplicated: false,
+        }
+      })
+
+      try {
+        return persistTransaction()
       } catch (err: unknown) {
         return {
           ok: false,
@@ -2538,6 +2695,7 @@ function deserializeJob(row: any): Job {
     commitHash: row.commit_hash ?? undefined,
     rollbackInfo: row.rollback_info ? JSON.parse(row.rollback_info) : undefined,
     guardResult: row.guard_result ? JSON.parse(row.guard_result) : undefined,
+    failureMetadata: row.failure_metadata ? JSON.parse(row.failure_metadata) : undefined,
     approvalId: row.approval_id ?? undefined,
     aiCliProvider: row.ai_cli_provider ?? undefined,
     aiCliPrompt: row.ai_cli_prompt ?? undefined,

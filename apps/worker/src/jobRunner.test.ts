@@ -1791,6 +1791,7 @@ function makeCliResult(overrides: Partial<{
   blocked: boolean
   stdoutPath: string
   stderrPath: string
+  providerFailureKind: 'provider_timeout'
 }> = {}) {
   return {
     taskId: 'task-1',
@@ -2144,6 +2145,133 @@ describe('task-022: AI CLI 実行ブロック', () => {
     // SafeCommand (resolveCommand) は実行されない
     // ※ execFileSyncMock は Gate フェーズの git ヘルパーでも呼ばれるためチェック対象外
     expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('provider timeoutかつ最終検査でHEAD・manifest・sensitive baselineが不変ならunchangedを伝播する', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        providerFailureKind: 'provider_timeout',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'Implement the approved change.',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.providerFailureKind).toBe('provider_timeout')
+    expect(result.workspaceState).toBe('unchanged')
+  })
+
+  it.each([
+    ['tracked', { path: 'src/tracked.ts', kind: 'modified' as const, afterType: 'regular' as const }],
+    ['staged', { path: 'src/staged.ts', kind: 'modified' as const, afterType: 'regular' as const }],
+    ['untracked', { path: 'src/untracked.ts', kind: 'added' as const, afterType: 'regular' as const }],
+  ])('provider timeout後に%s変更があればworkspaceState=changedを伝播する', async (_label, change) => {
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({ changes: [], paths: [] })
+      .mockReturnValueOnce({ changes: [change], paths: [change.path] })
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [change.path],
+        providerFailureKind: 'provider_timeout',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'Implement the approved change.',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.providerFailureKind).toBe('provider_timeout')
+    expect(result.workspaceState).toBe('changed')
+  })
+
+  it('provider timeout後にpath差分のない空commitでHEADだけ変化してもworkspaceState=changedになる', async () => {
+    let headReadCount = 0
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'rev-parse' && !args.includes('--abbrev-ref')) {
+        headReadCount += 1
+        return headReadCount === 1 ? BASE_COMMIT : 'emptycommit000000000000000000000000000000'
+      }
+      return ''
+    })
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        providerFailureKind: 'provider_timeout',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'Implement the approved change.',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.changedFiles).toEqual([])
+    expect(result.workspaceState).toBe('changed')
+  })
+
+  it('provider timeout後にsensitive baseline差分だけがあってもworkspaceState=changedになる', async () => {
+    diffSensitiveBaselineMock.mockReturnValueOnce([{
+      path: '.env',
+      kind: 'modified',
+      beforeType: 'regular',
+      afterType: 'regular',
+    }])
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        providerFailureKind: 'provider_timeout',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'Implement the approved change.',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.changedFiles).toContain('.env')
+    expect(result.workspaceState).toBe('changed')
+  })
+
+  it('provider timeout後のfinal inspection失敗はworkspaceState=unknownになる', async () => {
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({ changes: [], paths: [] })
+      .mockImplementationOnce(() => {
+        throw new ChangeDetectionErrorStub('inspection failed')
+      })
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        providerFailureKind: 'provider_timeout',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'codex',
+      aiCliPrompt: 'Implement the approved change.',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.detectionFailure).toBe(true)
+    expect(result.providerFailureKind).toBe('provider_timeout')
+    expect(result.workspaceState).toBe('unknown')
   })
 
   it('AI CLI が blocked: true → status: failed で早期リターン', async () => {

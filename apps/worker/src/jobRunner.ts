@@ -197,6 +197,8 @@ export interface JobRunResult {
   guardResult: JobGuardResult
   startedAt: string
   completedAt: string
+  providerFailureKind?: AiCliResult['providerFailureKind']
+  workspaceState?: 'unchanged' | 'changed' | 'unknown'
   permissionBlockEvent?: PermissionBlockEvent
   rollbackInfo?: RollbackInfo
   gatePolicy?: EffectivePolicy
@@ -706,6 +708,7 @@ export async function runJob(
         stderr: cliResult.stderr,
         stdoutPath: cliResult.stdoutPath,
         stderrPath: cliResult.stderrPath,
+        providerFailureKind: cliResult.providerFailureKind,
       })
     }
 
@@ -729,6 +732,7 @@ export async function runJob(
             : `[jobRunner] ${implementFailureReason}`,
           stdoutPath: cliResult.stdoutPath,
           stderrPath: cliResult.stderrPath,
+          providerFailureKind: cliResult.providerFailureKind,
         })
       }
     }
@@ -750,6 +754,7 @@ export async function runJob(
           stderr: 'Structured review output failed strict schema validation (fail-closed)',
           stdoutPath: cliResult.stdoutPath,
           stderrPath: cliResult.stderrPath,
+          providerFailureKind: cliResult.providerFailureKind,
         })
       }
     }
@@ -1279,6 +1284,7 @@ interface AiFailureInspectionInput {
   stderr?: string
   stdoutPath?: string
   stderrPath?: string
+  providerFailureKind?: AiCliResult['providerFailureKind']
 }
 
 /**
@@ -1289,6 +1295,7 @@ interface AiFailureInspectionInput {
 function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
   let manifest: ChangeManifest | undefined
   let riskScan: ReturnType<typeof scanTargetProjectRisk> | undefined
+  let workspaceState: JobRunResult['workspaceState']
   try {
     const inspection = buildFinalInspection(
       input.workingDir,
@@ -1297,6 +1304,7 @@ function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
       input.sensitiveBaseline,
     )
     manifest = inspection.manifest
+    workspaceState = inspection.workspaceState
     const guard = fileChangeGuard(manifest, input.policy, input.workingDir)
     input.guardResult.fileChangeAllowed = guard.allowed
     input.guardResult.fileViolations = guard.violations
@@ -1312,7 +1320,11 @@ function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
     const summary = formatRiskScanSummary(riskScan)
     if (summary) console.warn(`[final][ai-failure] ${summary}`)
   } catch (err: unknown) {
-    return failClosed(input.startedAt, formatChangeDetectionError(err), input.guardResult)
+    return {
+      ...failClosed(input.startedAt, formatChangeDetectionError(err), input.guardResult),
+      ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
+      workspaceState: 'unknown',
+    }
   }
 
   return {
@@ -1329,6 +1341,8 @@ function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
     approvalLevelResult: input.approvalLevelResult,
     targetProjectRiskScanResult: riskScan,
     finalChangeManifest: manifest,
+    ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
+    workspaceState,
   }
 }
 
@@ -1344,7 +1358,7 @@ function buildFinalInspection(
   startCommitHash: string,
   reflogBaseline: ReflogBaseline,
   baseline: SensitiveBaseline,
-): { manifest: ChangeManifest; diffText: string } {
+): { manifest: ChangeManifest; diffText: string; workspaceState: 'unchanged' | 'changed' } {
   // currentHead が startCommitHash と一致していても、reset で一度別のcommitへ
   // 移動してから元のhashへ戻された可能性は排除できないため、HEAD一致による
   // 早期returnより前に必ず reflog を検証する（fail-closed）。
@@ -1359,7 +1373,11 @@ function buildFinalInspection(
   const worktreeDiff = getWorktreeDiffText(workingDir, worktreeManifest)
 
   if (currentHead === startCommitHash) {
-    return { manifest: worktreeManifest, diffText: worktreeDiff }
+    return {
+      manifest: worktreeManifest,
+      diffText: worktreeDiff,
+      workspaceState: worktreeManifest.paths.length === 0 ? 'unchanged' : 'changed',
+    }
   }
 
   // tree-to-tree の単純比較ではなく、commit を1つずつ検査する。
@@ -1369,6 +1387,7 @@ function buildFinalInspection(
   return {
     manifest: mergeManifests(commitManifest, worktreeManifest),
     diffText: getCommitRangeDiffText(workingDir, startCommitHash, currentHead) + worktreeDiff,
+    workspaceState: 'changed',
   }
 }
 

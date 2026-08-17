@@ -17,6 +17,11 @@ export interface JobGuardResult {
   fileViolations?: string[]
 }
 
+export interface JobFailureMetadata {
+  kind?: string
+  workspaceState?: 'unchanged' | 'changed' | 'unknown'
+}
+
 export interface Job {
   id: string
   taskId: string
@@ -49,6 +54,7 @@ export interface Job {
   changedFiles?: string[]
   commitHash?: string
   rollbackInfo?: RollbackInfo
+  failureMetadata?: JobFailureMetadata
 
   /** ガード検証結果（監査ログ） */
   guardResult?: JobGuardResult

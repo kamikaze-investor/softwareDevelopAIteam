@@ -185,6 +185,7 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     let exitCode = 0
     let isTimeoutError = false
     let isApiError = false
+    let providerFailureKind: AiCliResult['providerFailureKind']
 
     try {
       stdout = execFileSync(exe, [...prefixArgs, ...argv], {
@@ -200,6 +201,9 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       exitCode = typeof err.status === 'number' ? err.status : 1
       stdout   = typeof err.stdout === 'string' ? err.stdout : ''
       stderr   = typeof err.stderr === 'string' ? err.stderr : String(err)
+      const isStructuredTimeout =
+        err.code === 'ETIMEDOUT' && err.status === null && err.signal === 'SIGTERM'
+      if (isStructuredTimeout) providerFailureKind = 'provider_timeout'
       // task-024: タイムアウト・APIエラーを分類
       isTimeoutError = err.signal === 'SIGTERM' || (err.code === 'ETIMEDOUT') || stderr.includes('ETIMEDOUT')
       isApiError = exitCode >= 500 || stderr.includes('API Error') || stderr.includes('5xx')
@@ -298,6 +302,7 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       stderrPath,
       changedFiles,
       durationMs: Date.now() - startTime,
+      ...(providerFailureKind ? { providerFailureKind } : {}),
       summary,
       parsedOutput,
       ...(request.expectJson ? { blocked, retryCount } : {}),

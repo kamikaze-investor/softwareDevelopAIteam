@@ -1015,7 +1015,9 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **設計方針**: DB Task同期とMarkdown保存の**両方**が成功するまで初回Jobを作らない／
       Worker結果がAPIへ確定反映されるまで次Jobを作らない／API側の**薄いapplication service**が
       Task状態更新と次Job生成を担当する（新しい常駐Orchestratorは作らない）／
-      Task単位でqueued/running Jobの重複を**DB制約**（partial unique index）で防止する／
+      Task単位のqueued/running Job重複は、`workflow_step_key`のunique制約＋transaction内active Job
+      チェック＋deterministic keyで防止する。`workflow_step_key IS NULL`のmanual Jobは同一Taskに複数active可
+      という既存契約があるため、Task全体へのglobal partial unique indexは採用しない／
       `blocked`（Approval・Permission・Safety）、`rejected`、CEO操作が必要な場合、Worker起動時に
       attemptの状態が不明な場合、およびpaused Projectでは継続しない。**`failed`は一律停止条件にせず、
       failureの種類と安全な再試行条件に従ってStage 1/2へ振り分ける**／MVPでは単一Workerのみ／

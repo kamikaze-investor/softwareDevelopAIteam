@@ -38,6 +38,20 @@ export type UpdateWithOutboxEventResult =
       reason: string
     }
 
+export type PersistProviderTimeoutFailureResult =
+  | {
+      ok: true
+      job: Job
+      retryJob?: Job
+      retryJobCreated: boolean
+      deduplicated: boolean
+    }
+  | {
+      ok: false
+      code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
+      reason: string
+    }
+
 export type FailIfRunningJobResult =
   | { ok: true; updated: boolean; currentStatus: Job['status']; job: Job }
   | { ok: false; code: 'JOB_NOT_FOUND'; reason: string }
@@ -166,6 +180,12 @@ export interface IJobStorage {
     data: Partial<Job>,
     outboxEvent?: OutboxEventInput,
   ): UpdateWithOutboxEventResult
+  /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
+  persistProviderTimeoutFailure(input: {
+    jobId: string
+    update: Partial<Job>
+    outboxEvent?: OutboxEventInput
+  }): PersistProviderTimeoutFailureResult
   failIfRunning(
     jobId: string,
     failure: { stderr: string; completedAt: string },
