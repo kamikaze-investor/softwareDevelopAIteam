@@ -6,6 +6,10 @@ import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import type { DesignReviewRun, OutboxEventInput } from '../storage/interface'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import {
+  canApplyJobResultStatus,
+  describeApplicableJobStatuses,
+} from '../jobResultApplicationPolicy'
 import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from '../designReview/repairFlow'
 
 const AgentRoleSchema = z.enum([
@@ -295,6 +299,29 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const existing = storage.jobs.findById(req.params.id)
     if (!existing) {
       return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    // Result State Application Policy。
+    // 正当な再送・遅延resultはHTTP 200で受理し続ける（at-least-onceを壊さない）。
+    // DB stateを変更してよいかだけをここで判定し、stale / 不正な遷移はstatusを適用しない。
+    // Worker側のexecution FSMとは責務が異なるため同一化しない。
+    // 同一statusの再送（from === to）はDB stateを変えないが、statusを削ると下流の
+    // 判定（review approved等）まで変わってしまうため、そのまま通す。
+    if (
+      jobUpdate.status !== undefined &&
+      jobUpdate.status !== existing.status &&
+      !canApplyJobResultStatus(existing.status, jobUpdate.status)
+    ) {
+      req.log.warn(
+        {
+          jobId: existing.id,
+          from: existing.status,
+          to: jobUpdate.status,
+          applicable: describeApplicableJobStatuses(existing.status),
+        },
+        'job result accepted but status not applied (stale or non-applicable transition)',
+      )
+      delete jobUpdate.status
     }
 
     const isReviewJob = existing.aiCliMode === 'review'

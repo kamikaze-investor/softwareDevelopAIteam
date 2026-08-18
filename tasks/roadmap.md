@@ -894,10 +894,15 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       `resendPending()`を呼ばず、初回3回のbounded retry後はrestartまで再送されない
       （`apps/worker/src/index.ts:98,325,389`）。稼働中もbounded backoffで再送する配線が必要。
       **API側**: 狭い内部Job結果受信口だけを提供する／同じ結果が再送されても一度だけ反映する（冪等）／
-      任意のTask・Project・DB操作は受け付けない。**未完了**: `ALLOWED_TRANSITIONS`はWorker側の
-      `apps/worker/src/jobStateManager.ts:37`にのみ存在し、APIの一般PATCHはZodによるstatus値検証と
-      implement requeue時のDesign Review確認だけで、from→toのFSMを強制していない
-      （`apps/api/src/routes/jobs.ts`）。API側でも許可されたJob状態遷移だけを実行する必要がある。
+      任意のTask・Project・DB操作は受け付けない。**完了（2026-08-19）**: API側は`Result State Application Policy`
+      （`apps/api/src/jobResultApplicationPolicy.ts`）で、届いた結果をDB stateへ適用してよいかを
+      判定する。Worker側の`ALLOWED_TRANSITIONS`（`apps/worker/src/jobStateManager.ts:37`）は
+      **execution FSM**であり責務が異なるため同一化しない。
+      HTTP層で拒否（409）するとat-least-once配送の正当な遅延・重複resultを失うため、
+      **受理は200のまま、適用可否だけを厳格化する**（stale/非適用な遷移はstatusを適用せず記録する）。
+      許可集合は既存テストで固定されている契約をSource of Truthとし、
+      `queued`からのterminal直行・terminalへ遅れて届くterminal結果の記録・requeueを許可し、
+      **terminalから`running`への復帰のみ禁止**する。
       **完了条件**: API停止中にWorkerが完了しても結果が失われない／Worker稼働中および再起動後に
       未送信結果を再送できる／同じ結果を複数回送ってもDB反映は一度だけ／APIがfrom→toのFSMを
       強制する／APIがACKするまで次Jobへ進まない／Workerから本体DBへ直接アクセスできない
