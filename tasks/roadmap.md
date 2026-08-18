@@ -717,7 +717,15 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         Gate評価が実行され、結果がALLOWだった」ことをAPI/DB側で独立して証明できるtrusted
         persistent recordが現在存在しない**。`Job.guardResult`（`permissionGuard`/
         `fileChangeGuard`の結果でありApproval Gate結果ではない。かつWorker自己申告値でAPI側の
-        独立再検証がない）は、GitHub外部境界のtrusted evidenceとして**使用しない**
+        独立再検証がない）は、GitHub外部境界のtrusted evidenceとして**使用しない**。
+        **2026-08-19: evidence永続化のみ実装済み**（`gate_evaluations`テーブル、記録は
+        `apps/api/src/routes/approvalGate.ts`のGate評価時）。taskId/jobId・targetBranch・
+        targetCommit・targetDiffHash・decision・riskLevel・triggeredRules・policyVersionを
+        記録し、**自動ALLOW（LOW/MEDIUM）も残す**。Workerの自己申告はevidenceにしない。
+        `ApprovalRequest`は流用していない（status群と`expiresAt`/`requestedAction`が
+        人間承認専用semanticsであり、自動ALLOWを混ぜると承認待ち一覧・期限・consumeの意味が
+        壊れるため）。Gateの権限（Authority）は増やしていない。
+        **未完了**: これをGitHub Actionsから機械検証する経路はGap B（read-only credential）待ち
       - **Gate evaluation bindingの要件（将来の最小解決方針。今回は永続化方式を決め打ちしない）**:
         Task→Job Full Automation解放前に、GitHub ActionsがPR HEADについて
         `Gate evaluation exists for this exact change AND (outcome = ALLOW OR valid

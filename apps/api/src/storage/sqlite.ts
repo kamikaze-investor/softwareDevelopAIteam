@@ -10,7 +10,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -2107,6 +2107,35 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  const gateEvaluations: IGateEvaluationStorage = {
+    create(data) {
+      const evidence: GateEvaluationEvidence = { ...data, id: randomUUID(), createdAt: now() }
+      db.prepare(`
+        INSERT INTO gate_evaluations
+          (id, task_id, job_id, target_branch, target_commit, target_diff_hash,
+           decision, risk_level, triggered_rules, policy_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        evidence.id, evidence.taskId, evidence.jobId ?? null, evidence.targetBranch,
+        evidence.targetCommit, evidence.targetDiffHash, evidence.decision, evidence.riskLevel,
+        JSON.stringify(evidence.triggeredRules), evidence.policyVersion, evidence.createdAt,
+      )
+      return evidence
+    },
+    findByTaskId(taskId) {
+      const rows = db.prepare(
+        'SELECT * FROM gate_evaluations WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(taskId) as any[]
+      return rows.map(deserializeGateEvaluation)
+    },
+    findByTarget(targetCommit, targetDiffHash) {
+      const rows = db.prepare(
+        'SELECT * FROM gate_evaluations WHERE target_commit = ? AND target_diff_hash = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(targetCommit, targetDiffHash) as any[]
+      return rows.map(deserializeGateEvaluation)
+    },
+  }
+
   const designReviewRuns: IDesignReviewRunStorage = {
     findById(id) {
       const row = db.prepare('SELECT * FROM design_review_runs WHERE id = ?').get(id) as any
@@ -2796,7 +2825,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, auditLog, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, gateEvaluations, auditLog, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
 }
 
 function deserializeProject(row: any): Project {
@@ -2988,6 +3017,22 @@ function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
     decision: row.decision as DesignReviewEvidence['decision'],
     independentReviewRequired: row.independent_review_required === 1,
     independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
+    createdAt: row.created_at,
+  }
+}
+
+function deserializeGateEvaluation(row: any): GateEvaluationEvidence {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    jobId: row.job_id ?? undefined,
+    targetBranch: row.target_branch,
+    targetCommit: row.target_commit,
+    targetDiffHash: row.target_diff_hash,
+    decision: row.decision,
+    riskLevel: row.risk_level,
+    triggeredRules: JSON.parse(row.triggered_rules ?? '[]') as string[],
+    policyVersion: row.policy_version,
     createdAt: row.created_at,
   }
 }

@@ -358,6 +358,42 @@ export interface IDesignReviewRunStorage {
   recoverStaleRunningAtStartup(maxAttempts: number, startedBefore: string): DesignReviewRun[]
 }
 
+/**
+ * Gate評価のdurable evidence。
+ *
+ * 目的は「このcommit/diffに対してGate評価が実行され、結果がこうだった」ことを
+ * API/DB側で独立に証明できるようにすることだけである。Gateの権限（Authority）は増やさない。
+ *
+ * ApprovalRequestは流用しない。あちらのstatus（WAITING_FOR_USER / APPROVED / REJECTED /
+ * EXPIRED / SUPERSEDED / STALE / CONSUMED）とexpiresAt・requestedActionは
+ * **人間承認専用のsemantics**であり、自動ALLOWを混ぜると承認待ち一覧・期限・consumeの
+ * 意味が壊れるため。既存の`design_review_evidence`と同じ「決定のevidence」パターンに倣う。
+ *
+ * Workerの自己申告（`Job.guardResult`）はevidenceにしない。ここへ記録するのは
+ * API側がGate評価を実行したその場の結果だけである。
+ */
+export interface GateEvaluationEvidence {
+  id: string
+  taskId: string
+  jobId?: string
+  targetBranch: string
+  targetCommit: string
+  targetDiffHash: string
+  decision: string
+  riskLevel: string
+  triggeredRules: string[]
+  /** どのGate policyで判断したかを後から一意に特定するための版。 */
+  policyVersion: string
+  createdAt: string
+}
+
+export interface IGateEvaluationStorage {
+  create(data: Omit<GateEvaluationEvidence, 'id' | 'createdAt'>): GateEvaluationEvidence
+  findByTaskId(taskId: string): GateEvaluationEvidence[]
+  /** 対象commit/diffに対して実際に記録されたGate評価を引く（機械検証用）。 */
+  findByTarget(targetCommit: string, targetDiffHash: string): GateEvaluationEvidence[]
+}
+
 export interface IAuditLogStorage {
   findByEntity(entityType: string, entityId: string): AuditLogEntry[]
   findAll(): AuditLogEntry[]
@@ -450,6 +486,7 @@ export interface IStorage {
   approvalRequests: IApprovalRequestStorage
   designReviewEvidence: IDesignReviewEvidenceStorage
   designReviewRuns: IDesignReviewRunStorage
+  gateEvaluations: IGateEvaluationStorage
   auditLog: IAuditLogStorage
   projectRoadmapPhases: IProjectRoadmapPhaseStorage
   knowledgeGraph: IKnowledgeGraphStorage

@@ -28,6 +28,12 @@ import { readExactApprovalDiff } from '../approvalExplain/diffReader'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
 
+/**
+ * Gate policyの版。RISK_RULESや判定ロジックを変えたら上げる。
+ * evidenceから「どのpolicyで判断したか」を後から一意に特定するために持つ。
+ */
+const GATE_POLICY_VERSION = 'gate-policy-v1'
+
 function computeDiffHash(diffText: string): string {
   return createHash('sha256').update(diffText, 'utf-8').digest('hex')
 }
@@ -546,6 +552,26 @@ export async function approvalGateRoutes(
       sideEffects.push({ type: 'CREATED_APPROVAL_REQUEST', requestId: approvalRequest.id })
       newRequestId = approvalRequest.id
     }
+
+    // Gate評価のdurable evidenceを残す。
+    //
+    // 目的は「このcommit/diffに対してGate評価が実行され、結果がこうだった」ことを
+    // API/DB側で独立に証明できるようにすることだけで、Gateの権限は増やさない。
+    // 特にLOW/MEDIUMの自動ALLOWはこれまで一切永続化されておらず、
+    // Workerの自己申告（Job.guardResult）しか残らなかった。自己申告はevidenceにしない。
+    //
+    // ここで記録するのはAPI側が今まさに実行した評価の結果だけである。
+    storage.gateEvaluations.create({
+      taskId,
+      jobId,
+      targetBranch,
+      targetCommit,
+      targetDiffHash,
+      decision: outcome.decision,
+      riskLevel: riskReview.riskLevel,
+      triggeredRules: sanitizeTriggeredRulesForApprovalRequest(riskReview.triggeredRules),
+      policyVersion: GATE_POLICY_VERSION,
+    })
 
     const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)
     const nextAction = computeNextAction(outcome, riskReview.riskLevel, requiresApprovalByPolicy, newRequestId)

@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [master, main]
 
+# GITHUB_TOKENの権限を必要最小限へ明示する。
+# このworkflowはcheckout・依存導入・typecheck・testのみで、
+# repositoryへの書き込み・PRコメント・API呼び出しを行わないため contents: read だけでよい。
+permissions:
+  contents: read
+
 env:
   # pnpm 11 の依存チェックによる失敗を回避
   PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN: 'false'

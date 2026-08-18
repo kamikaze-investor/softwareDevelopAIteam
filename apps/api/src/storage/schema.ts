@@ -160,6 +160,20 @@ export const CREATE_TABLES = `
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
 
+  CREATE TABLE IF NOT EXISTS gate_evaluations (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    job_id TEXT,
+    target_branch TEXT NOT NULL,
+    target_commit TEXT NOT NULL,
+    target_diff_hash TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    triggered_rules TEXT NOT NULL DEFAULT '[]',
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS design_review_runs (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -354,5 +368,7 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at ON design_review_evidence(task_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC)',
   "CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_task_active ON design_review_runs(task_id) WHERE status IN ('queued','running')",
+  'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_task_created_at ON gate_evaluations(task_id, created_at DESC)',
+  'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_target ON gate_evaluations(target_commit, target_diff_hash)',
   'CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at ON design_review_runs(status, started_at)',
 ]
