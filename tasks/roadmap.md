@@ -1510,7 +1510,16 @@ Evolution等）— いずれも本セクション追加より前から記載済�
       含め、正式Production packaging時にこのgapを解消する）。旧processを停止する前に、
       新しい起動方式は可能な限りsafe/isolatedな環境で先に実起動確認しておく。
       crash時自動復旧・OS再起動後自動起動・process supervisionは上記「再起動耐性」の
-      既存未解決事項のまま維持する
+      既存未解決事項のまま維持する。
+      **API起動時のenvは`env -i`＋明示allowlistで与える（2026-08-18確定。同種事故が再発したため）**:
+      `set -a; . .env`（.env全体のsource）でAPIを起動することを**禁止**する。これを行うと
+      APIが本来持たない`CLAUDE_API_KEY`/`GEMINI_API_KEY`/`OPENAI_API_KEY`/`GITHUB_TOKEN`まで
+      process envへ載り、Secret boundaryが黙って広がる。
+      APIのallowlistは`PATH`/`HOME`/`NODE_ENV`/`HOST`/`PORT`/`DB_PATH`/`API_TOKEN`/
+      `ADMIN_TOKEN_SHA256`/`WORKER_TOKEN_SHA256`/`OPENCODE_GO_API_KEY`のみ。
+      Workerは必要credentialが異なる（`API_TOKEN`とprovider key・git設定・`TARGET_REPO_PATH`等）ため、
+      **APIとWorkerのallowlistを共用・混同しない**。値は環境変数として渡し、argvへ載せない
+      （`ps`露出防止）
 - [ ] **Single-worker enforcement / duplicate startup prevention**（2026-08-15確認。
       `project-auto-multi-worker`＝複数Workerを安全に並列稼働させる将来機能とは別責務。
       本項目はMVPの「Workerは1インスタンスに限定する」前提が現状**強制されていない**ことへの

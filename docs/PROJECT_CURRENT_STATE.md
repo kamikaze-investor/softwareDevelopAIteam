@@ -35,12 +35,29 @@ AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間�
 
 ### Production Baseline（現在Productionで稼働しているcommit）
 
-**Production baseline SHA**: `9e410621543e972e32c5504012a829e7517b7b31`（2026-08-18 deploy）
+**Production baseline SHA**: `2520d0dc192082d99d06de258b84ebf986b2bbd5`（2026-08-18 deploy）
 
-`aef0722` から6 commitをverified SHA固定（`--ff-only`）で反映した。deploy直前に既存
-`ai-team-db-backup`でDB backupを取得し、**rollbackは不要だった**。
+`9e41062` から7 commitをverified SHA固定（`--ff-only`）で反映した。`4473fa7`で
+`apps/api`へ`@ai-team/worker` workspace依存が増えたため、**`pnpm install --frozen-lockfile`が
+必須**だった（install前は`require.resolve('@ai-team/worker')`が`MODULE_NOT_FOUND`）。
+deploy直前にcanonical DBのbackupを取得し、**rollbackは不要だった**。
 
 このdeployでProductionへ初めて反映された主な変更:
+
+- **Trusted Design Review executor（Stage 2基盤）**: APIが`design_review_runs`を所有し、
+  review専用one-shot runnerを起動する。runnerはevidenceをPOSTせずraw resultを返すだけで、
+  decisionの確定・evidence登録はAPIが再計算して行う。runnerのenvは明示allowlistのみで、
+  `API_TOKEN`・evidence登録token・不要provider keyは渡らない
+- **Stage 2 failure-aware repair flow**: Job失敗とreview `changes_requested`を起点に、
+  失敗事実からcanonicalなrepair promptを構築し、Design ReviewがALIGNEDのときだけ
+  同一promptでimplement Jobを作る。失敗事実はuntrusted dataとして区切り、指示として
+  解釈させない。terminal Job stateとqueued runは同一transactionで確定し、kick前にcrashしても
+  startup recoveryが再kickする
+- **Bounded autonomous repair**: `MAX_REPAIR_ATTEMPTS=3`をhard boundとし、同一failure再発は
+  即escalateせず別アプローチを要求して継続する。bound到達時は既存の`blocked` →
+  `POST /api/tasks/:id/resume`へ渡す（新status・新Human workflowは追加していない）
+
+このdeployより前（`9e41062`）で反映済みの主な変更:
 
 - **failure explanation persistence**: 失敗説明を失敗イベント単位で`jobs.failure_explanation_json`へ
   永続化し、同じ失敗でLLMを再実行しない
@@ -50,14 +67,29 @@ AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間�
   Watchdog / Implementation Agent（全provider）の実LLM入力へ届く。取得失敗はsilentにせず
   警告とprompt表記で識別する
 
-**Production acceptance: PASS**（migration additive適用・`integrity_check: ok`・件数不変・
-auth split維持（未認証401 / WORKER allowlist 200 / ADMIN専用403）・secret露出なし・
-Cloudflare `/health` 200・pending Outbox 0・API/Worker各1系統でwatch process無し・
-SSH切断後もdetached生存・Constitution読込警告0件）。
+**Production acceptance: PASS**（`design_review_runs` migration additive適用・
+`integrity_check: ok`・件数不変（projects 3 / tasks 14 / jobs 36）・
+`pnpm install --frozen-lockfile`後に`@ai-team/worker` resolution成功・
+auth split維持・secret露出なし・外部 `https://api.aiteamos.uk/health` 200・
+pending Outbox 0・API/Worker各1系統でwatch process無し・startup recoveryエラー0件・
+`design_review_runs` 0行・`repair:*` Job 0件・`retry:*` Job 0件）。
 
-**未確認として残るもの**: Stage 1のpositive production observation（実際にretry Jobが作られる
-経路の実地確認）は、**自然なprovider_timeout発生時**に行う。人工的なtimeoutはProductionで
-発生させない。現時点では「provider_timeout未発生下でretry Jobが誤生成されない」ことのみ確認済み。
+rollback互換も事前検証済み: baseline `9e41062`のコードがmigration後DBを正常に読み、
+新tableを無視し、件数も変わらない。
+
+**deploy時に発生し是正した事故**: 再起動時に`set -a; . .env`を使ったため、APIが本来持たない
+`CLAUDE_API_KEY`/`GEMINI_API_KEY`/`OPENAI_API_KEY`/`GITHUB_TOKEN`をprocess envへ載せていた。
+`env -i`＋明示allowlistで再起動し、APIのenvをdeploy前と同一集合へ戻した。
+正規の起動手順は`tasks/roadmap.md`「正式Production起動方式の確定」へ反映済み。
+
+**未確認として残るもの**:
+
+- **Stage 2のpositive production observation**（実際にrepair Jobが作られる経路の実地確認）は、
+  **次の自然なeligible failure発生時**に行う。人工的なimplementation failureはProductionで
+  発生させない。現時点では「failure未発生下でrepair Job・design_review_runが誤生成されない」
+  ことのみ確認済み
+- **Stage 1のpositive production observation**（実際にretry Jobが作られる経路の実地確認）は、
+  **自然なprovider_timeout発生時**に行う。人工的なtimeoutはProductionで発生させない
 
 ### Implemented MVP Baseline（現在すでに動いているMVP機能・正本）
 
