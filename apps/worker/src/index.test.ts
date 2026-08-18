@@ -206,6 +206,9 @@ describe('terminal result persistence', () => {
   })
 })
 
+/** 既存POLL_INTERVAL_MSの既定値（テスト内で時間を進めるため）。 */
+const POLL_INTERVAL_FOR_TEST = 5_000
+
 describe('outbox gating', () => {
   it('pollJobs skips queued Job fetch while pending Outbox events exist', async () => {
     vi.useFakeTimers()
@@ -218,6 +221,99 @@ describe('outbox gating', () => {
 
     expect(outboxMocks.hasPending).toHaveBeenCalled()
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('pendingがある間はresendPendingを呼び、新しいJob fetchはしない', async () => {
+    vi.useFakeTimers()
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockResolvedValue(undefined)
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(outboxMocks.resendPending).toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('resend成功でpendingが消えると、次のpollから通常のJob fetchへ戻る', async () => {
+    vi.useFakeTimers()
+    outboxMocks.hasPending.mockReturnValueOnce(true).mockReturnValue(false)
+    outboxMocks.resendPending.mockResolvedValue(undefined)
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
+    await Promise.resolve()
+
+    expect(fetchMock).toHaveBeenCalled()
+  })
+
+  it('resend失敗でもWorkerは落ちず、同一poll内でtight retryせず次pollで再試行する', async () => {
+    vi.useFakeTimers()
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockRejectedValue(new Error('network down'))
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // 1 pollにつき1 resend batchであり、同一poll内で繰り返さない
+    expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
+    await Promise.resolve()
+
+    // 次pollで再試行される（pendingは保持されたまま）
+    expect(outboxMocks.resendPending.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('pendingが無いときはresendPendingを呼ばない（既存挙動のまま）', async () => {
+    vi.useFakeTimers()
+    outboxMocks.hasPending.mockReturnValue(false)
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(outboxMocks.resendPending).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalled()
+  })
+
+  it('resendに時間がかかっても同一poll cycleが直列化され並列再送しない', async () => {
+    vi.useFakeTimers()
+    outboxMocks.hasPending.mockReturnValue(true)
+    let resolveResend: (() => void) | undefined
+    outboxMocks.resendPending.mockImplementation(
+      () => new Promise<void>((resolve) => { resolveResend = resolve }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
+
+    // resendが未完了のまま時間が進んでも、pollはawaitで直列化されており次のbatchを開始しない
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+    await Promise.resolve()
+
+    expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
+
+    resolveResend?.()
   })
 
   it('start waits for pending Outbox events before startup recovery', async () => {

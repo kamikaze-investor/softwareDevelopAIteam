@@ -334,6 +334,14 @@ export async function pollJobs(): Promise<never> {
     try {
       if (outboxStore.hasPending()) {
         console.warn('[Worker] Pending Outbox events remain; skipping queued Job fetch for this poll cycle.')
+        // 稼働中も未送信結果を再送する。新しいscheduler/watchdog/retry frameworkは追加せず、
+        // 既存のpoll cycleに相乗りする。
+        // 1 pollにつき1 resend batch。失敗時はpendingを保持し、tight loopせず次pollで再試行する。
+        try {
+          await outboxStore.resendPending((jobId, payload) => patchJobWithRetry(jobId, payload))
+        } catch (err: unknown) {
+          console.error(`[Worker] Outbox再送エラー: ${formatUnknownError(err)}。次のpollで再試行します`)
+        }
       } else {
         const work = await fetchQueuedJob()
         if (work) {

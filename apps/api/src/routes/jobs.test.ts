@@ -1354,9 +1354,12 @@ describe('Job API', () => {
         })
         const jobs = getStorage().jobs.findByTaskId(task.id)
         expect(jobs).toHaveLength(1)
+        // 遅延resultは受理されるが、確定済みterminal stateは上書きしない。
+        // queuedのsourceはまだ確定していないため適用される。
+        const expectedStatus = status === 'queued' ? 'failed' : status
         expect(jobs[0]).toMatchObject({
           id: source.id,
-          status: 'failed',
+          status: expectedStatus,
           exitCode: 1,
           stderr: 'provider command timed out',
           failureMetadata: {

@@ -24,24 +24,27 @@ import type { JobStatus } from '@ai-team/shared'
 /**
  * 結果適用として state を変更してよい遷移。
  *
- * 既存テストで正当と確認されている契約をSource of Truthにしている:
- *   - `queued` からの terminal 直行は正当（running観測前の完了報告、API停止中完了のOutbox再送）
- *   - `blocked` / `success` の Job へ遅れて届いた terminal 結果も**適用する**
- *     （`jobs.test.ts` の provider_timeout 再送テストがこの契約を固定している。
- *      抑止されるのは retry Job の生成であって、結果の記録ではない）
- *   - `failed` / `blocked` / `running` / `success` から `queued` への戻しはAPI起点のrequeue
+ * 方針: **確定済みのterminal stateを、遅れて届いた結果で上書きしない。**
+ * これはこのコードベース自身の既存の意図と一致する:
+ *   - `failIfRunning` は `WHERE id = ? AND status = 'running'` で terminal を保護する
+ *   - `persistProviderTimeoutFailure` は `source.status !== 'running'` のとき no-op を返す
+ * 一般PATCH経路だけが terminal を上書きできる状態だったため、ここで揃える。
  *
- * 唯一禁止しているのは **terminal から `running` への復帰**である。
- * `running` はWorkerがqueuedなJobをclaimしたときにだけ成立する状態で、
- * 終端に達したJobが結果配送によって実行中へ戻ることは無い。
- * これ以上を禁止すると上記の既存契約（at-least-once受理）を壊すため広げない。
+ * 受理そのものは止めない。HTTPは200のままで、DBへ status を適用しないだけである
+ * （at-least-once配送の正当な遅延・重複resultを失わない）。
+ *
+ *   - `queued` からは running / terminal のどちらへも進める
+ *     （running観測前の完了報告、API停止中に完了した結果のOutbox再送）
+ *   - `running` からは terminal へ進める
+ *   - terminal からは **requeue（→ `queued`）のみ**。API起点の明示的な再実行であり、
+ *     遅延resultによる上書きではない
  */
 const APPLICABLE_TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
   queued: ['running', 'success', 'failed', 'blocked'],
   running: ['success', 'failed', 'blocked', 'queued'],
-  success: ['failed', 'blocked', 'queued'],
-  failed: ['success', 'blocked', 'queued'],
-  blocked: ['success', 'failed', 'queued'],
+  success: ['queued'],
+  failed: ['queued'],
+  blocked: ['queued'],
 }
 
 export const TERMINAL_JOB_STATUSES: readonly JobStatus[] = ['success', 'failed', 'blocked']

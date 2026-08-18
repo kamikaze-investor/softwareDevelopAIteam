@@ -28,9 +28,11 @@ describe('canApplyJobResultStatus（allowed setは既存契約がSource of Truth
     expect(canApplyJobResultStatus('running', 'blocked')).toBe(true)
   })
 
-  it('terminalへ遅れて届いたterminal結果も記録できる（既存契約）', () => {
-    expect(canApplyJobResultStatus('blocked', 'failed')).toBe(true)
-    expect(canApplyJobResultStatus('success', 'failed')).toBe(true)
+  it('確定済みterminalは遅延resultで上書きされない', () => {
+    expect(canApplyJobResultStatus('success', 'failed')).toBe(false)
+    expect(canApplyJobResultStatus('failed', 'success')).toBe(false)
+    expect(canApplyJobResultStatus('blocked', 'failed')).toBe(false)
+    expect(canApplyJobResultStatus('blocked', 'success')).toBe(false)
   })
 
   it('requeue（→queued）は許可する', () => {
@@ -162,5 +164,89 @@ describe('HTTP受理とstate適用の分離', () => {
     }
 
     expect(storage.jobs.findByTaskId(task.id)).toHaveLength(1)
+  })
+})
+
+describe('stale terminal resultが新しい確定stateを上書きしない', () => {
+  function seedJob(status: 'success' | 'failed' | 'blocked') {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'P', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: '', status: 'in_progress',
+      assignee: 'developer_ai', dependencies: [],
+    })
+    const job = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai',
+      status: 'running', safeCommand: { kind: 'noop' },
+    } as never)
+    storage.jobs.update(job.id, { status, stderr: 'confirmed' } as never)
+    return { storage, jobId: job.id }
+  }
+
+  /** PATCH経路と同じ判定でstatusを適用する（適用不可ならstatusを落とす）。 */
+  function applyLateResult(
+    storage: IStorage,
+    jobId: string,
+    update: Record<string, unknown>,
+  ): Job {
+    const existing = storage.jobs.findById(jobId)!
+    const next = { ...update }
+    const to = next.status as Job['status'] | undefined
+    if (to !== undefined && to !== existing.status && !canApplyJobResultStatus(existing.status, to)) {
+      delete next.status
+    }
+    return storage.jobs.update(jobId, next as never)!
+  }
+
+  it('success後に遅延failedが届いてもsuccessのまま', () => {
+    const { storage, jobId } = seedJob('success')
+    const after = applyLateResult(storage, jobId, { status: 'failed', stderr: 'late failure' })
+
+    expect(after.status).toBe('success')
+    // statusは守るが、他のフィールド（監査情報）は受理して記録できる
+    expect(after.stderr).toBe('late failure')
+  })
+
+  it('failed後に遅延successが届いてもfailedのまま', () => {
+    const { storage, jobId } = seedJob('failed')
+    const after = applyLateResult(storage, jobId, { status: 'success', exitCode: 0 })
+
+    expect(after.status).toBe('failed')
+  })
+
+  it('blocked後に遅延terminalが届いてもblockedのまま', () => {
+    for (const late of ['success', 'failed'] as const) {
+      const { storage, jobId } = seedJob('blocked')
+      const after = applyLateResult(storage, jobId, { status: late })
+      expect(after.status).toBe('blocked')
+    }
+  })
+
+  it('requeueはterminalからでも適用される（API起点の明示的な再実行）', () => {
+    for (const terminal of ['success', 'failed', 'blocked'] as const) {
+      const { storage, jobId } = seedJob(terminal)
+      const after = applyLateResult(storage, jobId, { status: 'queued' })
+      expect(after.status).toBe('queued')
+    }
+  })
+
+  it('queuedはまだ確定していないためterminal resultを適用する', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'P', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: '', status: 'in_progress',
+      assignee: 'developer_ai', dependencies: [],
+    })
+    const job = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai',
+      status: 'queued', safeCommand: { kind: 'noop' },
+    } as never)
+
+    const after = applyLateResult(storage, job.id, { status: 'failed' })
+    expect(after.status).toBe('failed')
   })
 })
