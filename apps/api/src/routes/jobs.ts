@@ -1,11 +1,12 @@
 import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
-import { canonicalizeJobUpdate, type Job } from '@ai-team/shared'
+import { canonicalizeJobUpdate, type Job, type ReviewResult } from '@ai-team/shared'
 import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
-import type { OutboxEventInput } from '../storage/interface'
+import type { DesignReviewRun, OutboxEventInput } from '../storage/interface'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from '../designReview/repairFlow'
 
 const AgentRoleSchema = z.enum([
   'cto_ai',
@@ -176,6 +177,24 @@ function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, ded
   }
 }
 
+
+/**
+ * durableにqueuedとなったDesign Review runのexecutorをkickする。
+ *
+ * **fire-and-forgetにしてよいのはここだけ。** run自体は既にterminal Job updateと
+ * 同一transactionで永続化されているため、この起動が落ちてもstartup recoveryが再kickする。
+ * Design ReviewはLLM実行を伴い最大120秒かかるので、PATCH応答をブロックしてはならない
+ * （Worker側PATCH timeoutは5秒）。
+ */
+function kickQueuedDesignReview(
+  storage: ReturnType<typeof getStorage>,
+  log: { error: (obj: unknown, msg: string) => void },
+  run: DesignReviewRun,
+  stepKey: string,
+): void {
+  void executeQueuedRepair(storage, run, stepKey)
+    .catch((err) => log.error({ err, runId: run.id }, 'stage 2 repair execution failed'))
+}
 export async function jobRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
 
@@ -361,6 +380,32 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         req.log.error({ code: persisted.code, reason: persisted.reason }, 'Failed to persist structured review')
         return reply.status(500).send({ error: 'Failed to persist structured review' })
       }
+      // review が changes_requested の場合、Stage 2 を起動する。
+      // 対象は review 対象の implement Job であって review Job 自身ではない。
+      // review結果の永続化は既に完了しているため、ここでのqueue失敗はStage 2を失うだけで
+      // review結果は失われない。失敗はlogに残し、PATCH応答は妨げない。
+      if (!approved && !persisted.deduplicated) {
+        const implementJobId = existing.workflowStepKey?.match(/^implement:(.+):review$/)?.[1]
+        const implementJob = implementJobId ? storage.jobs.findById(implementJobId) : undefined
+        if (implementJob) {
+          try {
+            const reviewPreparation = prepareRepairFlow(storage, {
+              failedJob: implementJob,
+              review: persisted.reviewResult,
+              qaResults: storage.qaResults.findByTaskId(existing.taskId),
+            })
+            if (reviewPreparation.action === 'escalate') {
+              escalateTaskToHuman(storage, existing.taskId)
+            } else if (reviewPreparation.action === 'queue') {
+              const run = storage.designReviewRuns.create(reviewPreparation.run)
+              kickQueuedDesignReview(storage, req.log, run, reviewPreparation.stepKey)
+            }
+          } catch (err) {
+            req.log.error({ err, jobId: existing.id }, 'failed to start stage 2 from review')
+          }
+        }
+      }
+
       return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated === true))
     }
 
@@ -423,21 +468,40 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(outboxResponse(transition.job, outboxEvent, transition.deduplicated === true))
     }
 
-    if (outboxEvent) {
-      const updated = storage.jobs.updateWithOutboxEvent(req.params.id, jobUpdate, outboxEvent)
-      if (!updated.ok) {
-        if (updated.code === 'OUTBOX_HASH_MISMATCH') {
-          return reply.status(409).send({ error: updated.reason })
-        }
-        return reply.status(updated.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: updated.reason })
-      }
-      return reply.send(outboxResponse(updated.job, outboxEvent, updated.deduplicated))
+    // 通常の実装失敗（Stage 1のprovider timeout retry候補は上で return 済み）。
+    // 判定とcanonical prompt構築はここで同期実行する（LLMは実行しない）。
+    const shouldPrepareRepair =
+      jobUpdate.status === 'failed' &&
+      existing.status !== 'failed' &&
+      existing.aiCliMode === 'implement'
+    const preparation = shouldPrepareRepair
+      ? prepareRepairFlow(storage, { failedJob: { ...existing, ...jobUpdate } as Job })
+      : undefined
+
+    if (preparation?.action === 'escalate') {
+      escalateTaskToHuman(storage, existing.taskId)
     }
 
-    const updated = storage.jobs.update(req.params.id, jobUpdate)
-    if (!updated) {
-      return reply.status(404).send({ error: 'Job not found' })
+    // outboxEventの有無にかかわらず同じatomic経路を使う。
+    // 経路を分けると非outbox側にlost-trigger window（Jobはfailed / runは無い）が残る。
+    const updated = storage.jobs.updateWithOutboxEvent(
+      req.params.id,
+      jobUpdate,
+      outboxEvent,
+      preparation?.action === 'queue' ? preparation.run : undefined,
+    )
+    if (!updated.ok) {
+      if (updated.code === 'OUTBOX_HASH_MISMATCH') {
+        return reply.status(409).send({ error: updated.reason })
+      }
+      return reply.status(updated.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: updated.reason })
     }
-    return reply.send(updated)
+    if (updated.queuedDesignReviewRun && preparation?.action === 'queue') {
+      kickQueuedDesignReview(storage, req.log, updated.queuedDesignReviewRun, preparation.stepKey)
+    }
+    if (outboxEvent) {
+      return reply.send(outboxResponse(updated.job, outboxEvent, updated.deduplicated))
+    }
+    return reply.send(updated.job)
   })
 }

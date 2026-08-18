@@ -31,7 +31,7 @@ export interface OutboxEventInput {
 }
 
 export type UpdateWithOutboxEventResult =
-  | { ok: true; job: Job; deduplicated: boolean }
+  | { ok: true; job: Job; deduplicated: boolean; queuedDesignReviewRun?: DesignReviewRun }
   | {
       ok: false
       code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
@@ -175,10 +175,17 @@ export interface IJobStorage {
   saveFailureExplanation(jobId: string, envelope: PersistedTaskFailureExplanationV1): void
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
   update(id: string, data: Partial<Job>): Job | undefined
+  /**
+   * Job更新（+Outbox冪等化）を行う。
+   * `queueDesignReview` を渡すと、terminal Job state と queued な design_review_run を
+   * **同一transaction**で確定させる。分離するとcrash時に
+   * 「Jobはfailed / runは無い / duplicate PATCHも再起動しない」というlost-trigger windowができる。
+   */
   updateWithOutboxEvent(
     id: string,
     data: Partial<Job>,
     outboxEvent?: OutboxEventInput,
+    queueDesignReview?: QueuedDesignReviewRunInput,
   ): UpdateWithOutboxEventResult
   /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
   persistProviderTimeoutFailure(input: {
@@ -305,6 +312,15 @@ export interface DesignReviewRun {
 export interface ClaimDesignReviewRunResult {
   run?: DesignReviewRun
   claimToken?: string
+}
+
+/** terminal Job update と同一transactionでqueue するDesign Review run の内容。 */
+export interface QueuedDesignReviewRunInput {
+  taskId: string
+  taskTitle: string
+  designText: string
+  designTextHash: string
+  changedFiles: string[]
 }
 
 export interface IDesignReviewRunStorage {

@@ -16,6 +16,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import path from 'node:path'
 import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
 import { selectFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 // 判定ロジックは @ai-team/shared の pure 実装を使う。
@@ -401,12 +402,29 @@ export async function createAndExecuteDesignReview(
 }
 
 /**
+ * 既定のrunner起動設定。index.ts側を最小変更に保つため、既定値の構築はここに置く。
+ * secretは一切含めない（envはbuildRunnerEnvが明示構築する）。
+ */
+export function buildDefaultCoordinatorDeps(): CoordinatorDeps {
+  const repoRoot = process.env.DESIGN_REVIEW_REPO_ROOT ?? path.resolve(process.cwd(), '../..')
+  return {
+    runnerCommand: process.env.DESIGN_REVIEW_RUNNER_COMMAND ?? 'npx',
+    runnerArgs: [
+      ...(process.env.DESIGN_REVIEW_RUNNER_COMMAND ? [] : ['tsx']),
+      path.join(repoRoot, 'apps', 'worker', 'scripts', 'designReviewRunner.ts'),
+    ],
+    homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? repoRoot,
+    workingDir: repoRoot,
+  }
+}
+
+/**
  * API process crash後の起動時回収。runningのまま残ったrunをqueuedへ戻し、そのまま再kickする。
  * 新しいscheduler/cronは導入せず、起動時の一度だけ実行する。
  */
 export async function recoverAndRekickAtStartup(
   storage: IStorage,
-  deps: CoordinatorDeps,
+  deps: CoordinatorDeps = buildDefaultCoordinatorDeps(),
   processStartedAt: string = new Date().toISOString(),
 ): Promise<ExecuteDesignReviewResult[]> {
   // processStartedAt より後に開始したrunは現プロセスのものとして除外されるため、

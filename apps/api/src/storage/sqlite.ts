@@ -998,7 +998,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       )
       return updated
     },
-    updateWithOutboxEvent(id, data, outboxEvent) {
+    updateWithOutboxEvent(id, data, outboxEvent, queueDesignReview) {
       const updateTransaction = db.transaction((): UpdateWithOutboxEventResult => {
         const dedup = checkOutboxEvent(db, id, outboxEvent)
         if (dedup.status === 'conflict') {
@@ -1017,7 +1017,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
         }
         recordOutboxEvent(db, id, outboxEvent)
-        return { ok: true, job: updated, deduplicated: false }
+
+        // Stage 2 の起動条件が満たされている場合、terminal Job state と
+        // queued な design_review_run を**同一transaction**で確定させる。
+        // これを分けると「Jobはfailed / runは無い」というlost-trigger windowができる。
+        let queuedDesignReviewRun: DesignReviewRun | undefined
+        if (queueDesignReview) {
+          queuedDesignReviewRun = designReviewRuns.create(queueDesignReview)
+        }
+
+        return { ok: true, job: updated, deduplicated: false, queuedDesignReviewRun }
       })
 
       try {

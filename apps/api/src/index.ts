@@ -25,6 +25,7 @@ import { approvalGateRoutes } from './routes/approvalGate'
 import { knowledgeGraphRoutes } from './routes/knowledgeGraph'
 import { healthRoutes } from './routes/health'
 import { apiTokenAuth } from './auth/apiToken'
+import { recoverAndRekickAtStartup } from './designReview/designReviewCoordinator'
 
 const app = Fastify({ logger: true })
 
@@ -74,4 +75,9 @@ app.listen({ port: PORT, host: process.env.HOST ?? '0.0.0.0' }, (err) => {
     app.log.error(err)
     process.exit(1)
   }
+
+  // API起動時に1回だけ、前プロセスが残したstale runningのDesign Reviewを回収し再kickする。
+  // scheduler/cron/watchdogは追加しない。recoveryが失敗してもAPI起動は継続させる。
+  void recoverAndRekickAtStartup(getStorage())
+    .catch((recoveryError) => app.log.error({ err: recoveryError }, 'design review startup recovery failed'))
 })
