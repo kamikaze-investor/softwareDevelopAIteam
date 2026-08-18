@@ -14,6 +14,10 @@ import type {
   StrategicDecision,
   StrategicMetaReviewResult,
 } from '@ai-team/shared'
+// 判定ロジックはAPI（Control Plane）側でも再計算する必要があるため @ai-team/shared を正本とし、
+// ここでは再exportして既存の呼び出し元との互換を保つ。定義を二重化しないこと。
+import { applyIndependentReviewOverride, resolveFinalDecision } from '@ai-team/shared'
+export { applyIndependentReviewOverride, resolveFinalDecision }
 import { classifyReviewLoad } from '../approvalLevel/reviewLoadClassifier.js'
 import { selectFocuses } from '../approvalLevel/focusSelector.js'
 import {
@@ -212,51 +216,12 @@ export async function runIndependentReview(
   }
 }
 
-export function applyIndependentReviewOverride(
-  baseDecision: StrategicDecision | 'REVIEW_UNAVAILABLE',
-  outcome: IndependentReviewOutcome,
-): StrategicDecision | 'REVIEW_UNAVAILABLE' {
-  if (outcome.unavailable) {
-    return 'REVIEW_UNAVAILABLE'
-  }
-
-  if (outcome.verdict === 'blocking') {
-    return 'CONFLICT'
-  }
-
-  if (outcome.verdict === 'changes_requested' && baseDecision === 'ALIGNED') {
-    return 'UNCERTAIN'
-  }
-
-  return baseDecision
-}
-
 export function mapMetaReviewStatusToStrategicDecision(status: 'approved' | 'changes_requested' | 'blocked'): StrategicDecision {
   if (status === 'approved') {
     return 'ALIGNED'
   }
 
   return 'CONFLICT'
-}
-
-export function resolveFinalDecision(
-  focusedReviewResults: readonly FocusedReviewResult[],
-  integrationReviewResult?: IntegrationReviewResult,
-): StrategicDecision {
-  const decisions = [
-    ...focusedReviewResults.map((result) => result.decision),
-    ...(integrationReviewResult ? [integrationReviewResult.decision] : []),
-  ]
-
-  if (decisions.includes('CONFLICT')) {
-    return 'CONFLICT'
-  }
-
-  if (decisions.length === 0 || decisions.includes('UNCERTAIN')) {
-    return 'UNCERTAIN'
-  }
-
-  return 'ALIGNED'
 }
 
 export function parseFocusedReviewResponse(

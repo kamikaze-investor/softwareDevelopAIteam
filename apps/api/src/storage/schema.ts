@@ -160,6 +160,24 @@ export const CREATE_TABLES = `
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
 
+  CREATE TABLE IF NOT EXISTS design_review_runs (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    design_text TEXT NOT NULL,
+    design_text_hash TEXT NOT NULL,
+    task_title TEXT NOT NULL DEFAULT '',
+    changed_files TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'queued',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    claim_token TEXT,
+    result_json TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+  );
+
   CREATE TABLE IF NOT EXISTS watchdog_events (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
@@ -304,6 +322,8 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'tasks', column: 'roadmap_task_key', definition: 'TEXT' },
   { table: 'tasks', column: 'phase', definition: 'INTEGER' },
   { table: 'tasks', column: 'roadmap_active', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'design_review_runs', column: 'task_title', definition: "TEXT NOT NULL DEFAULT ''" },
+  { table: 'design_review_runs', column: 'changed_files', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'jobs', column: 'agent_role', definition: "TEXT NOT NULL DEFAULT 'developer_ai'" },
   { table: 'jobs', column: 'workflow_step_key', definition: 'TEXT' },
   { table: 'jobs', column: 'safe_command', definition: 'TEXT' },
@@ -333,4 +353,6 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_review_results_job_id ON review_results(job_id)',
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at ON design_review_evidence(task_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC)',
+  "CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_task_active ON design_review_runs(task_id) WHERE status IN ('queued','running')",
+  'CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at ON design_review_runs(status, started_at)',
 ]

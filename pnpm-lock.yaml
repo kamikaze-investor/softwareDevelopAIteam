@@ -13,6 +13,9 @@ importers:
       '@ai-team/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@ai-team/worker':
+        specifier: workspace:*
+        version: link:../worker
       '@anthropic-ai/sdk':
         specifier: ^0.104.1
         version: 0.104.1(zod@3.25.76)

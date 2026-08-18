@@ -45,3 +45,4 @@ export {
   shouldEscalateToAiReview,
   determineApprovalLevel,
 } from './approvalLevelClassifier'
+export { resolveFinalDecision, applyIndependentReviewOverride } from './strategicDecision'

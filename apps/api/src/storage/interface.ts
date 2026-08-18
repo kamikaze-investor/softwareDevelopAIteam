@@ -275,6 +275,73 @@ export interface IDesignReviewEvidenceStorage {
   create(data: Omit<DesignReviewEvidence, 'id' | 'createdAt'>): DesignReviewEvidence
 }
 
+/**
+ * Design Review の実行単位。API（Control Plane）が所有し、review専用runnerは
+ * 実行するだけでこの表を書かない。
+ *
+ * stale completion fencing: claim時に `claim_token` を新規発行し、completeは
+ * `claim_token` 一致 + `status='running'` を条件にする。requeueはtokenをNULLに
+ * するため、requeue後に遅れて完了した旧attemptのUPDATEは必ず0行になり破棄される。
+ */
+export interface DesignReviewRun {
+  id: string
+  taskId: string
+  designText: string
+  designTextHash: string
+  /** startup recovery後の再kickをrunだけで完結させるため、レビュー入力を自己完結で保持する。 */
+  taskTitle: string
+  changedFiles: string[]
+  status: 'queued' | 'running' | 'succeeded' | 'failed'
+  attemptCount: number
+  claimToken?: string
+  resultJson?: string
+  error?: string
+  createdAt: string
+  startedAt?: string
+  completedAt?: string
+}
+
+/** claim結果。claimできなかった場合は run=undefined。 */
+export interface ClaimDesignReviewRunResult {
+  run?: DesignReviewRun
+  claimToken?: string
+}
+
+export interface IDesignReviewRunStorage {
+  findById(id: string): DesignReviewRun | undefined
+  findActiveByTaskId(taskId: string): DesignReviewRun | undefined
+  /** 同一Taskにqueued/running中のrunがある場合は作成せず既存を返す（partial unique index準拠）。 */
+  create(input: Omit<DesignReviewRun, 'id' | 'status' | 'attemptCount' | 'claimToken' | 'resultJson' | 'error' | 'createdAt' | 'startedAt' | 'completedAt'>): DesignReviewRun
+  /** startup recovery後に再kick対象となるqueued run一覧。 */
+  findQueued(): DesignReviewRun[]
+  /** queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。 */
+  claim(id: string, maxAttempts: number): ClaimDesignReviewRunResult
+  /** claim_token一致時のみ終端へ遷移する。不一致（stale）ならfalseを返し、呼び出し側は結果を破棄する。 */
+  complete(id: string, claimToken: string, status: 'succeeded' | 'failed', resultJson?: string, error?: string): boolean
+  /**
+   * fencingに成功した場合のみ、run終端とevidence登録を単一transactionで行う。
+   * claim_token不一致（stale attempt）のときはevidenceを登録せずfalseを返す。
+   */
+  completeWithEvidence(
+    id: string,
+    claimToken: string,
+    resultJson: string,
+    evidence: Omit<DesignReviewEvidence, 'id' | 'createdAt'>,
+  ): DesignReviewEvidence | undefined
+  /** claim_token一致時のみqueuedへ戻し、tokenを無効化する。 */
+  requeue(id: string, claimToken: string, error: string): boolean
+  /**
+   * API process crash後の起動時回収専用。runningのまま残った行をqueuedへ戻す。
+   * attempt_countがmaxAttempts以上の行はrequeueせずfailedで終端させる。
+   * 通常のread経路からは呼ばない（GET/readは状態を変更しない）。
+   *
+   * `startedBefore` より後に開始したrunは対象外にする。現プロセスが起動した時刻を渡すことで、
+   * 「今動いているrun」を巻き込まないことを保証し、誤って稼働中に呼ばれても実行中attemptを
+   * 壊さない。回収対象は必ず前プロセスの残骸だけになる。
+   */
+  recoverStaleRunningAtStartup(maxAttempts: number, startedBefore: string): DesignReviewRun[]
+}
+
 export interface IAuditLogStorage {
   findByEntity(entityType: string, entityId: string): AuditLogEntry[]
   findAll(): AuditLogEntry[]
@@ -366,6 +433,7 @@ export interface IStorage {
   watchdogEvents: IWatchdogEventStorage
   approvalRequests: IApprovalRequestStorage
   designReviewEvidence: IDesignReviewEvidenceStorage
+  designReviewRuns: IDesignReviewRunStorage
   auditLog: IAuditLogStorage
   projectRoadmapPhases: IProjectRoadmapPhaseStorage
   knowledgeGraph: IKnowledgeGraphStorage

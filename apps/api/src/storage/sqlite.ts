@@ -10,7 +10,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -2098,6 +2098,172 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  const designReviewRuns: IDesignReviewRunStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM design_review_runs WHERE id = ?').get(id) as any
+      return row ? deserializeDesignReviewRun(row) : undefined
+    },
+    findActiveByTaskId(taskId) {
+      const row = db.prepare(
+        "SELECT * FROM design_review_runs WHERE task_id = ? AND status IN ('queued','running') LIMIT 1"
+      ).get(taskId) as any
+      return row ? deserializeDesignReviewRun(row) : undefined
+    },
+    findQueued() {
+      const rows = db.prepare(
+        "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
+      ).all() as any[]
+      return rows.map(deserializeDesignReviewRun)
+    },
+    create({ taskId, designText, designTextHash, taskTitle, changedFiles }) {
+      const createTransaction = db.transaction((): DesignReviewRun => {
+        // partial unique index (task_id) WHERE status IN ('queued','running') と同じ条件で
+        // 事前に確認し、二重起票ではなく既存runを返す。
+        const existing = db.prepare(
+          "SELECT * FROM design_review_runs WHERE task_id = ? AND status IN ('queued','running') LIMIT 1"
+        ).get(taskId) as any
+        if (existing) {
+          return deserializeDesignReviewRun(existing)
+        }
+
+        const run: DesignReviewRun = {
+          id: randomUUID(),
+          taskId,
+          designText,
+          designTextHash,
+          taskTitle,
+          changedFiles,
+          status: 'queued',
+          attemptCount: 0,
+          createdAt: now(),
+        }
+        try {
+          db.prepare(`
+            INSERT INTO design_review_runs
+              (id, task_id, design_text, design_text_hash, task_title, changed_files, status,
+               attempt_count, claim_token, result_json, error, created_at, started_at, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL)
+          `).run(
+            run.id, run.taskId, run.designText, run.designTextHash, run.taskTitle,
+            JSON.stringify(run.changedFiles), run.status, run.attemptCount, run.createdAt,
+          )
+        } catch (err) {
+          // partial unique index (ux_design_review_runs_task_active) 違反は「別経路が先に
+          // active runを作った」ことを意味するので、例外にせず既存runを返す。
+          const existingAfterConflict = db.prepare(
+            "SELECT * FROM design_review_runs WHERE task_id = ? AND status IN ('queued','running') LIMIT 1"
+          ).get(taskId) as any
+          if (!existingAfterConflict) {
+            throw err
+          }
+          return deserializeDesignReviewRun(existingAfterConflict)
+        }
+        return run
+      })
+      return createTransaction()
+    },
+    claim(id, maxAttempts) {
+      const claimTransaction = db.transaction((): ClaimDesignReviewRunResult => {
+        const current = db.prepare('SELECT * FROM design_review_runs WHERE id = ?').get(id) as any
+        if (!current || current.status !== 'queued') {
+          return {}
+        }
+
+        // bounded attempt: 超過分はclaimせずfailedで終端させ、再実行しない。
+        if (current.attempt_count >= maxAttempts) {
+          db.prepare(`
+            UPDATE design_review_runs
+            SET status = 'failed', claim_token = NULL, error = ?, completed_at = ?
+            WHERE id = ? AND status = 'queued'
+          `).run(`max attempts (${maxAttempts}) exceeded`, now(), id)
+          return {}
+        }
+
+        const claimToken = randomUUID()
+        const result = db.prepare(`
+          UPDATE design_review_runs
+          SET status = 'running', attempt_count = attempt_count + 1, claim_token = ?, started_at = ?
+          WHERE id = ? AND status = 'queued'
+        `).run(claimToken, now(), id)
+
+        if (result.changes !== 1) {
+          return {}
+        }
+
+        const claimed = db.prepare('SELECT * FROM design_review_runs WHERE id = ?').get(id) as any
+        return { run: deserializeDesignReviewRun(claimed), claimToken }
+      })
+      return claimTransaction()
+    },
+    complete(id, claimToken, status, resultJson, error) {
+      const result = db.prepare(`
+        UPDATE design_review_runs
+        SET status = ?, result_json = ?, error = ?, completed_at = ?, claim_token = NULL
+        WHERE id = ? AND claim_token = ? AND status = 'running'
+      `).run(status, resultJson ?? null, error ?? null, now(), id, claimToken)
+      return result.changes === 1
+    },
+    completeWithEvidence(id, claimToken, resultJson, evidenceData) {
+      const completeTransaction = db.transaction((): DesignReviewEvidence | undefined => {
+        const fenced = db.prepare(`
+          UPDATE design_review_runs
+          SET status = 'succeeded', result_json = ?, error = NULL, completed_at = ?, claim_token = NULL
+          WHERE id = ? AND claim_token = ? AND status = 'running'
+        `).run(resultJson, now(), id, claimToken)
+
+        // stale attempt: 既にrequeue/別attemptで進行しているため、evidenceを登録してはならない。
+        if (fenced.changes !== 1) {
+          return undefined
+        }
+
+        return designReviewEvidence.create(evidenceData)
+      })
+      return completeTransaction()
+    },
+    requeue(id, claimToken, error) {
+      const result = db.prepare(`
+        UPDATE design_review_runs
+        SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL
+        WHERE id = ? AND claim_token = ? AND status = 'running'
+      `).run(error, id, claimToken)
+      return result.changes === 1
+    },
+    recoverStaleRunningAtStartup(maxAttempts, startedBefore) {
+      const recoverTransaction = db.transaction((): DesignReviewRun[] => {
+        // startedBefore（＝現プロセス起動時刻）より後に開始したrunは現プロセスが実行中の
+        // ものなので回収対象にしない。稼働中に誤って呼ばれても実行中attemptを壊さない。
+        const rows = db.prepare(
+          "SELECT * FROM design_review_runs WHERE status = 'running' AND (started_at IS NULL OR started_at < ?)"
+        ).all(startedBefore) as any[]
+        const recovered: DesignReviewRun[] = []
+
+        for (const row of rows) {
+          if (row.attempt_count >= maxAttempts) {
+            db.prepare(`
+              UPDATE design_review_runs
+              SET status = 'failed', claim_token = NULL, error = ?, completed_at = ?
+              WHERE id = ? AND status = 'running'
+            `).run(`max attempts (${maxAttempts}) exceeded after API restart`, now(), row.id)
+            continue
+          }
+
+          // claim_tokenをNULLにするため、旧processの遅延completeはこの後必ず0行になる。
+          db.prepare(`
+            UPDATE design_review_runs
+            SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL
+            WHERE id = ? AND status = 'running'
+          `).run('recovered from stale running at API startup', row.id)
+
+          const requeued = db.prepare('SELECT * FROM design_review_runs WHERE id = ?').get(row.id) as any
+          recovered.push(deserializeDesignReviewRun(requeued))
+        }
+
+        return recovered
+      })
+      return recoverTransaction()
+    },
+  }
+
   const auditLog: IAuditLogStorage = {
     findByEntity(entityType, entityId) {
       const rows = db.prepare(
@@ -2621,7 +2787,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, auditLog, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, auditLog, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
 }
 
 function deserializeProject(row: any): Project {
@@ -2814,6 +2980,25 @@ function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
     independentReviewRequired: row.independent_review_required === 1,
     independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
     createdAt: row.created_at,
+  }
+}
+
+function deserializeDesignReviewRun(row: any): DesignReviewRun {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    designText: row.design_text,
+    designTextHash: row.design_text_hash,
+    taskTitle: row.task_title ?? '',
+    changedFiles: JSON.parse(row.changed_files ?? '[]') as string[],
+    status: row.status as DesignReviewRun['status'],
+    attemptCount: row.attempt_count,
+    claimToken: row.claim_token ?? undefined,
+    resultJson: row.result_json ?? undefined,
+    error: row.error ?? undefined,
+    createdAt: row.created_at,
+    startedAt: row.started_at ?? undefined,
+    completedAt: row.completed_at ?? undefined,
   }
 }
 
