@@ -39,6 +39,7 @@ describe('gate evaluation evidence', () => {
       riskLevel: 'LOW',
       triggeredRules: [],
       policyVersion: 'gate-policy-v1',
+      bindingVerification: 'authoritative',
     })
 
     expect(evidence.id).toBeTruthy()
@@ -54,6 +55,7 @@ describe('gate evaluation evidence', () => {
       decision: 'ALLOW',
       riskLevel: 'LOW',
       policyVersion: 'gate-policy-v1',
+      bindingVerification: 'authoritative',
     })
   })
 
@@ -68,6 +70,7 @@ describe('gate evaluation evidence', () => {
         riskLevel,
         triggeredRules: [],
         policyVersion: 'gate-policy-v1',
+        bindingVerification: 'authoritative',
       })
     }
 
@@ -86,6 +89,7 @@ describe('gate evaluation evidence', () => {
       riskLevel: 'LOW',
       triggeredRules: [],
       policyVersion: 'gate-policy-v1',
+      bindingVerification: 'authoritative',
     })
 
     expect(storage.gateEvaluations.findByTarget('target-commit', 'target-diff')).toHaveLength(1)
@@ -105,6 +109,7 @@ describe('gate evaluation evidence', () => {
         riskLevel: 'HIGH',
         triggeredRules: ['rule-a'],
         policyVersion: 'gate-policy-v1',
+        bindingVerification: 'authoritative',
       })
     }
 
@@ -122,6 +127,7 @@ describe('gate evaluation evidence', () => {
       riskLevel: 'CRITICAL',
       triggeredRules: ['secret_suspect', 'control_repo_change'],
       policyVersion: 'gate-policy-v1',
+      bindingVerification: 'authoritative',
     })
 
     expect(storage.gateEvaluations.findByTaskId(taskId)[0].triggeredRules)
@@ -138,9 +144,64 @@ describe('gate evaluation evidence', () => {
       riskLevel: 'LOW',
       triggeredRules: [],
       policyVersion: 'gate-policy-v1',
+      bindingVerification: 'authoritative',
     })
 
     // 自動ALLOWのevidenceを作っても、人間承認待ちは1件も生まれない
     expect(storage.approvalRequests.findByTaskId(taskId)).toHaveLength(0)
+  })
+})
+
+describe('binding verification（自己申告値をtrusted bindingにしない）', () => {
+  let storage: IStorage
+  let taskId: string
+
+  beforeEach(() => {
+    storage = createSQLiteStorage(':memory:')
+    taskId = seed(storage)
+  })
+
+  function create(bindingVerification: 'authoritative' | 'diff_text_hash' | 'unverified') {
+    return storage.gateEvaluations.create({
+      taskId,
+      targetBranch: 'b',
+      targetCommit: `c-${bindingVerification}`,
+      targetDiffHash: `d-${bindingVerification}`,
+      decision: 'ALLOW',
+      riskLevel: 'LOW',
+      triggeredRules: [],
+      policyVersion: 'gate-policy-v1',
+      bindingVerification,
+    })
+  }
+
+  it('検証水準が3値で往復し、後から区別できる', () => {
+    for (const level of ['authoritative', 'diff_text_hash', 'unverified'] as const) {
+      expect(create(level).bindingVerification).toBe(level)
+    }
+
+    const stored = storage.gateEvaluations.findByTaskId(taskId)
+    expect(stored.map((e) => e.bindingVerification).sort())
+      .toEqual(['authoritative', 'diff_text_hash', 'unverified'])
+  })
+
+  it('既定は unverified で、黙ってtrusted扱いにならない', () => {
+    // 既存行（binding_verification未設定）はunverifiedとして読める
+    const evidence = create('unverified')
+    const stored = storage.gateEvaluations.findByTarget(evidence.targetCommit, evidence.targetDiffHash)[0]
+    expect(stored.bindingVerification).toBe('unverified')
+  })
+
+  it('外部境界はunverifiedを除外してtrusted evidenceだけ選別できる', () => {
+    create('authoritative')
+    create('diff_text_hash')
+    create('unverified')
+
+    const trusted = storage.gateEvaluations
+      .findByTaskId(taskId)
+      .filter((e) => e.bindingVerification === 'authoritative')
+
+    expect(trusted).toHaveLength(1)
+    expect(trusted[0].bindingVerification).toBe('authoritative')
   })
 })

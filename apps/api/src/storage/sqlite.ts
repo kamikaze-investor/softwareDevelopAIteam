@@ -2113,12 +2113,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO gate_evaluations
           (id, task_id, job_id, target_branch, target_commit, target_diff_hash,
-           decision, risk_level, triggered_rules, policy_version, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           decision, risk_level, triggered_rules, policy_version, binding_verification, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evidence.id, evidence.taskId, evidence.jobId ?? null, evidence.targetBranch,
         evidence.targetCommit, evidence.targetDiffHash, evidence.decision, evidence.riskLevel,
-        JSON.stringify(evidence.triggeredRules), evidence.policyVersion, evidence.createdAt,
+        JSON.stringify(evidence.triggeredRules), evidence.policyVersion,
+        evidence.bindingVerification, evidence.createdAt,
       )
       return evidence
     },
@@ -3033,6 +3034,7 @@ function deserializeGateEvaluation(row: any): GateEvaluationEvidence {
     riskLevel: row.risk_level,
     triggeredRules: JSON.parse(row.triggered_rules ?? '[]') as string[],
     policyVersion: row.policy_version,
+    bindingVerification: (row.binding_verification ?? 'unverified') as GateEvaluationEvidence['bindingVerification'],
     createdAt: row.created_at,
   }
 }

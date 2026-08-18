@@ -25,6 +25,7 @@ import {
   type ApprovalAiOptions,
 } from '../approvalExplain/approvalAi'
 import { readExactApprovalDiff } from '../approvalExplain/diffReader'
+import type { GateEvaluationEvidence } from '../storage/interface'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
 
@@ -553,6 +554,26 @@ export async function approvalGateRoutes(
       newRequestId = approvalRequest.id
     }
 
+    // targetCommit / targetDiffHash がどこまで検証済みかを判定する。
+    //
+    // callerの申告値をそのままtrusted bindingとして保存してはならない。
+    // 既存の readExactApprovalDiff は実worktreeのHEADとdiff hashの**両方**へ照合するので、
+    // 新しい検証機構を作らずこれを再利用する。照合できない場合は `unverified` として記録し、
+    // trustされているかのように見せない。
+    let bindingVerification: GateEvaluationEvidence['bindingVerification'] =
+      diffText !== undefined ? 'diff_text_hash' : 'unverified'
+    try {
+      const authoritative = readExactApprovalDiff(TARGET_WORKING_DIR, targetCommit, targetDiffHash)
+      if (!authoritative.stale) {
+        bindingVerification = 'authoritative'
+      }
+    } catch (error: unknown) {
+      app.log.warn(
+        { taskId, error: error instanceof Error ? error.message : String(error) },
+        'gate evidence binding could not be verified against the worktree',
+      )
+    }
+
     // Gate評価のdurable evidenceを残す。
     //
     // 目的は「このcommit/diffに対してGate評価が実行され、結果がこうだった」ことを
@@ -571,6 +592,7 @@ export async function approvalGateRoutes(
       riskLevel: riskReview.riskLevel,
       triggeredRules: sanitizeTriggeredRulesForApprovalRequest(riskReview.triggeredRules),
       policyVersion: GATE_POLICY_VERSION,
+      bindingVerification,
     })
 
     const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)

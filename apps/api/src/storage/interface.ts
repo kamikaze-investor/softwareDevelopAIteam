@@ -384,6 +384,18 @@ export interface GateEvaluationEvidence {
   triggeredRules: string[]
   /** どのGate policyで判断したかを後から一意に特定するための版。 */
   policyVersion: string
+  /**
+   * targetCommit / targetDiffHash がどこまで検証済みかを表す。
+   *
+   * - `authoritative`: 実worktreeのHEADとdiff hashへ照合済み（caller申告値ではない）
+   * - `diff_text_hash`: callerが渡したdiff本文からAPIがhashを算出して一致を確認した
+   *   （diff内容とhashは結び付くが、commitはcaller申告のまま）
+   * - `unverified`: caller申告値のまま。**trusted bindingとして扱ってはならない**
+   *
+   * 外部境界（GitHub Actions等）がevidenceを機械検証する際は、
+   * 少なくとも `unverified` を信頼してはならない。
+   */
+  bindingVerification: 'authoritative' | 'diff_text_hash' | 'unverified'
   createdAt: string
 }
 

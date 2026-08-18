@@ -725,6 +725,12 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         `ApprovalRequest`は流用していない（status群と`expiresAt`/`requestedAction`が
         人間承認専用semanticsであり、自動ALLOWを混ぜると承認待ち一覧・期限・consumeの意味が
         壊れるため）。Gateの権限（Authority）は増やしていない。
+        **binding検証**: `targetCommit`/`targetDiffHash`はcaller申告値を無検証で保存しない。
+        既存の`readExactApprovalDiff`（実worktreeのHEADとdiff hashの両方へ照合）を再利用し、
+        検証水準を`binding_verification`として記録する: `authoritative`（実worktreeへ照合済み）/
+        `diff_text_hash`（callerのdiff本文からAPIがhashを算出して一致確認。commitは申告のまま）/
+        `unverified`（申告値のまま）。既定は`unverified`で黙ってtrusted扱いにしない。
+        外部境界は`unverified`をtrusted bindingとして扱ってはならない。
         **未完了**: これをGitHub Actionsから機械検証する経路はGap B（read-only credential）待ち
       - **Gate evaluation bindingの要件（将来の最小解決方針。今回は永続化方式を決め打ちしない）**:
         Task→Job Full Automation解放前に、GitHub ActionsがPR HEADについて

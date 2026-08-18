@@ -171,6 +171,7 @@ export const CREATE_TABLES = `
     risk_level TEXT NOT NULL,
     triggered_rules TEXT NOT NULL DEFAULT '[]',
     policy_version TEXT NOT NULL,
+    binding_verification TEXT NOT NULL DEFAULT 'unverified',
     created_at TEXT NOT NULL
   );
 
@@ -336,6 +337,7 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'tasks', column: 'roadmap_task_key', definition: 'TEXT' },
   { table: 'tasks', column: 'phase', definition: 'INTEGER' },
   { table: 'tasks', column: 'roadmap_active', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { table: 'gate_evaluations', column: 'binding_verification', definition: "TEXT NOT NULL DEFAULT 'unverified'" },
   { table: 'design_review_runs', column: 'task_title', definition: "TEXT NOT NULL DEFAULT ''" },
   { table: 'design_review_runs', column: 'changed_files', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'jobs', column: 'agent_role', definition: "TEXT NOT NULL DEFAULT 'developer_ai'" },
