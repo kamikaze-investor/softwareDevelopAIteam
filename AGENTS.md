@@ -70,6 +70,44 @@ Worker が `agentPrefix` を自動でセットするため、AI 側が手動で�
 | **ChatGPT** | 重要判断・コミット前判断・人間向け整理（Gemini判断が不確実な場合・高リスク変更・コミット可否判断が必要な場合に使う） | 高リスクはCEO承認を要求 |
 | **Human / CEO** | Goal/Design Philosophy・外部サービス・課金・本番環境・認証権限・破壊的変更の最終判断 | 最終承認者 |
 
+### 3-2. Router導入前の暫定Role Policy（2026-08-18〜。Router実装まで）
+
+Provider Routerは未実装のため、下記はPLが手動で委任する暫定運用とする。上表3・3-1の
+Review責務（Gemini / ChatGPT / Human）と既存Multi-stage Reviewは**変更しない**。
+
+- **Claude Opus = PL**。判断・委任・統合を担当し、**原則として自分で作業するAgentではない**。
+  問題設定／Risk・難易度判定／調査項目の分解／Evidence統合／設計・方針決定／Task分解／
+  Agent・Model選択／Review結果統合／Safety Boundary判定／CEO承認要否／最終進行判断を持つ。
+  repo全体のgrep・大量コード読解・Evidence収集・単純な仮説検証・通常実装・通常test・
+  通常コードReviewは**抱え込まない**。結論を左右するload-bearing claimのみ最小限spot checkする
+  （上表3-1の「危険箇所実装」はPLが自ら実装する意味ではなく、実装先の選定と設計責任を指す）。
+- **OpenCode Go = 暫定Research / Implementer / Challenger Pool**。
+  `AiCliProvider`に含まれずJob Providerではないため、**PLがCLIから直接委任する**
+  （`./node_modules/.bin/opencode run "<prompt>" -m <model> --dir <path>`）。
+  repo横断探索・関連コード特定・docs/tests/実装の照合・Evidence収集・原因候補探索・
+  影響範囲調査・仮説検証・counterexample探索を優先的に委任する。
+  通常の明確な実装も委任してよく、Taskの性質に応じて軽量／coding標準／強モデルを選ぶ
+  （選択理由は1行でよい。毎回全モデルを比較しない）。
+  **1回失敗しただけでPLが実装を引き取らず、別モデルへ再委任する。**
+- **Design Challenger（暫定）**: 明示的なAdversarial / Falsification Design Reviewは
+  **AIteamOSに未実装**のため、非自明な設計ではOpenCodeを別Agentとして使い、前提の誤り・
+  counterexample・隠れた副作用・failure mode・local optimum・抜け道・より単純な代替案を
+  意図的に探させる。これは既存のIntegration / Strategic Alignment Reviewの**代替ではなく追加工程**。
+  独立性を保つため、設計者の詳細な推論過程ではなく**問題・制約・Evidence・提案設計**を渡す。
+- **Codex Sol = Senior Implementer / Independent Reviewer**。希少な上級実装能力として、
+  原因不明の難bug・複雑な状態遷移・concurrency/race・DB integrity・recovery・
+  複数module横断・非自明なarchitecture変更・high-value/high-risk実装に使う。
+  **単純実装には消費しない。** CRITICAL ReviewのIndependent Reviewerは既存仕様どおりCodex Sol。
+- **Codex Sol利用不能時**: Codex不在を理由に通常開発を止めない。通常/HARD Taskは
+  PLがOpenCode Goの強モデルへ**手動fallback**し（`fallbackPolicy`は型と処理はあるが
+  **production呼び出し元が存在せず未配線**）、実装→deterministic test→既存Multi-stage Review→
+  必要なら別OpenCodeモデルによる追加Independent / Adversarial Review→PL統合判断とする。
+  **CRITICAL Taskでは、OpenCodeによる手動Reviewを既存Codex Independent ReviewがPASSしたものとして
+  扱ってはならない**（調査・Evidence・設計・反証・patch・test・Gemini側Reviewまでは進めてよい）。
+  既存Gateを迂回・偽装しない。
+- **調査原則**: 実行結果だけで仮説を証明・棄却できる場合は過剰なコード探索より実行を優先する。
+  実行しても複数原因が残る場合のみOpenCodeへコード探索を委任する。
+
 **Review Level 0〜3:** 変更内容はLevel 0（軽微・Codexのみ）/ Level 1（通常実装・Codex+Gemini postReview）/
 Level 2（中リスク・Claude計画+Gemini pre/postReview、必要ならChatGPT）/ Level 3（高リスク・Claude設計+
 Gemini Risk/Alignment Review+ChatGPT判断レビュー+Human/CEO確認）に分類する。
