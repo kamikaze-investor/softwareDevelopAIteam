@@ -797,8 +797,10 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       手順を置かない。
       - **Phase 1: code deployのみ**（`ADMIN_TOKEN_SHA256`/`WORKER_TOKEN_SHA256`は設定しない）
         → 両方未設定のためlegacy `API_TOKEN`方式のまま動作し続ける。**挙動変化なし**。
-        現在Production稼働commitはmaster HEADと異なるため、このdeploy自体も別途安全な
-        deploy手順を確定してから行う
+        **2026-08-16 実施済み**（Production `239f8da9` → `aef0722`）
+      - **Phase 1・2とも完了（2026-08-16）**。以降のProduction baselineは
+        `docs/PROJECT_CURRENT_STATE.md`「Production Baseline」を正本とする
+        （現在: `9e41062`。2026-08-18 deploy、acceptance PASS、rollback不要）
       - **Phase 2: credential cutover**（Phase 1とは別タイミング。計画停止として実施）:
         1. 新ADMIN token・新WORKER tokenを生成する
         2. ADMIN平文をCEO Mobile / **trusted control/operator端末**（VPSではなく、CEOが

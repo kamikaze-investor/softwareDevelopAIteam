@@ -33,6 +33,32 @@ CEO（人間）
 
 AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間）はスマホから Web UI（未実装・将来候補）または Mobile app（`apps/mobile`, 実装済み）経由で操作する。ローカルPC起動は開発・検証用の一時形態であり、本番運用形態ではない。詳細な接続関係・後続タスクは正本を参照。
 
+### Production Baseline（現在Productionで稼働しているcommit）
+
+**Production baseline SHA**: `9e410621543e972e32c5504012a829e7517b7b31`（2026-08-18 deploy）
+
+`aef0722` から6 commitをverified SHA固定（`--ff-only`）で反映した。deploy直前に既存
+`ai-team-db-backup`でDB backupを取得し、**rollbackは不要だった**。
+
+このdeployでProductionへ初めて反映された主な変更:
+
+- **failure explanation persistence**: 失敗説明を失敗イベント単位で`jobs.failure_explanation_json`へ
+  永続化し、同じ失敗でLLMを再実行しない
+- **Stage 1 provider timeout retry**: 構造化provider timeout かつ workspace無変更の場合だけ
+  implement Jobを1回だけ自動再試行する（限定的な再実行であり、失敗内容を踏まえた自動修正ではない）
+- **Constitution §3.14〜3.15のRuntime伝播**: 共通行動原則の**本文**がCTO AI / Reviewer・QA /
+  Watchdog / Implementation Agent（全provider）の実LLM入力へ届く。取得失敗はsilentにせず
+  警告とprompt表記で識別する
+
+**Production acceptance: PASS**（migration additive適用・`integrity_check: ok`・件数不変・
+auth split維持（未認証401 / WORKER allowlist 200 / ADMIN専用403）・secret露出なし・
+Cloudflare `/health` 200・pending Outbox 0・API/Worker各1系統でwatch process無し・
+SSH切断後もdetached生存・Constitution読込警告0件）。
+
+**未確認として残るもの**: Stage 1のpositive production observation（実際にretry Jobが作られる
+経路の実地確認）は、**自然なprovider_timeout発生時**に行う。人工的なtimeoutはProductionで
+発生させない。現時点では「provider_timeout未発生下でretry Jobが誤生成されない」ことのみ確認済み。
+
 ### Implemented MVP Baseline（現在すでに動いているMVP機能・正本）
 
 **位置づけ**: 本節は、現在すでに実装・動作しているMVP機能のベースラインである。
