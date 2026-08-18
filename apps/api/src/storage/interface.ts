@@ -387,7 +387,11 @@ export interface GateEvaluationEvidence {
   /**
    * targetCommit / targetDiffHash がどこまで検証済みかを表す。
    *
-   * - `authoritative`: 実worktreeのHEADとdiff hashへ照合済み（caller申告値ではない）
+   * - `authoritative`: 実worktreeのHEADとdiff hashへ照合済み（caller申告値ではない）。
+   *   **保証範囲は targetCommit + targetDiffHash のみで、targetBranch は含まない**
+   *   （`readExactApprovalDiff`は`rev-parse HEAD`と`git diff HEAD`だけを見る）。
+   *   trust判断はcommit+diffで一意に成立し、branchは監査metadataとして保持するだけ。
+   *   外部境界がevidenceを照合するときも commit+diff を対象にする
    * - `diff_text_hash`: callerが渡したdiff本文からAPIがhashを算出して一致を確認した
    *   （diff内容とhashは結び付くが、commitはcaller申告のまま）
    * - `unverified`: caller申告値のまま。**trusted bindingとして扱ってはならない**

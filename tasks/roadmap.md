@@ -731,6 +731,10 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         `diff_text_hash`（callerのdiff本文からAPIがhashを算出して一致確認。commitは申告のまま）/
         `unverified`（申告値のまま）。既定は`unverified`で黙ってtrusted扱いにしない。
         外部境界は`unverified`をtrusted bindingとして扱ってはならない。
+        **`authoritative`の保証範囲は`targetCommit`+`targetDiffHash`のみで`targetBranch`は含まない**
+        （2026-08-19実測: `readExactApprovalDiff`は`rev-parse HEAD`と`git diff HEAD`だけを照合し、
+        stale判定もcommit+diffのみ。branchはtrust判断に使われておらず監査metadataである）。
+        外部境界の照合対象もcommit+diffとする。
         **未完了**: これをGitHub Actionsから機械検証する経路はGap B（read-only credential）待ち
       - **Gate evaluation bindingの要件（将来の最小解決方針。今回は永続化方式を決め打ちしない）**:
         Task→Job Full Automation解放前に、GitHub ActionsがPR HEADについて
