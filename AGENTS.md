@@ -81,14 +81,14 @@ Review責務（Gemini / ChatGPT / Human）と既存Multi-stage Reviewは**変更
 Production / Secret等の**Authority・Safety Boundaryを一切変更しない**。
 全Agentは既存Safety Ruleおよび`specs/00_constitution.md` §3.14〜3.15に従う。
 
-- **PL Role**（現在の着任Model: **Claude Opus**）。判断・委任・統合を担当し、
+- **PL Role**（暫定着任Model: **Claude Opus**）。判断・委任・統合を担当し、
   **原則として自分で作業するAgentではない**。
   問題設定／Risk・難易度判定／調査項目の分解／Evidence統合／設計・方針決定／Task分解／
   Agent・Model選択／Review結果統合／Safety Boundary判定／CEO承認要否／最終進行判断を持つ。
   repo全体のgrep・大量コード読解・Evidence収集・単純な仮説検証・通常実装・通常test・
   通常コードReviewは**抱え込まない**。結論を左右するload-bearing claimのみ最小限spot checkする
   （上表3-1の「危険箇所実装」はPLが自ら実装する意味ではなく、実装先の選定と設計責任を指す）。
-- **Research / Implementer / Challenger Pool Role**（現在の着任Model: **OpenCode Go**）。
+- **Research / Implementer / Challenger Pool Role**（暫定着任Model: **OpenCode Go**）。
   `AiCliProvider`に含まれずJob Providerではないため、**PLがCLIから直接委任する**
   （`./node_modules/.bin/opencode run "<prompt>" -m <model> --dir <path>`）。
   repo横断探索・関連コード特定・docs/tests/実装の照合・Evidence収集・原因候補探索・
@@ -97,15 +97,29 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   （選択理由は1行でよい。毎回全モデルを比較しない）。
   **1回失敗しただけでPLが実装を引き取らず、別モデルへ再委任する。**
 - **Design Challenger（暫定）**: 明示的なAdversarial / Falsification Design Reviewは
-  **AIteamOSに未実装**のため、非自明な設計ではOpenCodeを別Agentとして使い、前提の誤り・
-  counterexample・隠れた副作用・failure mode・local optimum・抜け道・より単純な代替案を
-  意図的に探させる。これは既存のIntegration / Strategic Alignment Reviewの**代替ではなく追加工程**。
-  独立性を保つため、設計者の詳細な推論過程ではなく**問題・制約・Evidence・提案設計**を渡す。
-- **Senior Implementer / Independent Reviewer Role**（現在の着任Model: **Codex Sol**）。
+  **AIteamOSに未実装**（git全履歴でも実装された証跡なし）。そのためOpenCodeを別Agentとして使い、
+  前提の誤り・counterexample・隠れた副作用・failure mode・local optimum・抜け道・
+  より単純な代替案を意図的に探させる。既存のIntegration / Strategic Alignment Reviewの
+  **代替ではなく追加工程**。
+  **「非自明なら毎回」実行しない。** 反証の期待価値が高い次の場合に限定する:
+  Safety Boundary／Authority・Permission／State Transition／DB・State Integrity／
+  concurrency・race／Recovery・Rollback／重大な前提／高い設計不確実性／
+  failure modeが複数あり局所最適化の危険が高い場合。
+  **既存Multi-stage Reviewと同じ論点を理由なく重複確認しない。**
+  独立性を保つため、PLの詳細な推論過程は渡さず**問題・制約・Evidence・提案設計**だけを渡す。
+- **Senior Implementer / Independent Reviewer Role**（暫定着任Model: **Codex Sol**）。
   希少な上級実装能力として、
   原因不明の難bug・複雑な状態遷移・concurrency/race・DB integrity・recovery・
   複数module横断・非自明なarchitecture変更・high-value/high-risk実装に使う。
-  **単純実装には消費しない。** CRITICAL ReviewのIndependent Reviewerは既存仕様どおりCodex Sol。
+  **単純実装には優先消費しない。** CRITICAL ReviewのIndependent Reviewerは既存仕様どおりCodex Sol。
+  加えて**General Fallback**として、他Agent/Modelがusage limit・provider障害・一時的利用不能・
+  その他resource制約になった場合、PL判断でResearch／Implementation／Design Challenger／
+  QA・Investigation／必要なら一時的PL代行の代替要員に使ってよい。
+  **他Agentが利用不能でも、Codex Solで安全かつ合理的に継続できるならresource復旧待ちだけを
+  理由に通常開発を停止しない。**
+- **Role独立性**: Codex Solが同一Taskで設計・実装その他の当事者Roleを担当した場合、
+  独立性を要求されるCRITICAL Independent Reviewを**同一実行コンテキストで自己レビューしない**。
+  別Reviewを正式なIndependent Review PASSとして偽装せず、既存Gateが要求する独立Review要件を維持する。
 - **Codex Sol利用不能時**: Codex不在を理由に通常開発を止めない。通常/HARD Taskは
   PLがOpenCode Goの強モデルへ**手動fallback**し（`fallbackPolicy`は型と処理はあるが
   **production呼び出し元が存在せず未配線**）、実装→deterministic test→既存Multi-stage Review→
@@ -115,6 +129,12 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   既存Gateを迂回・偽装しない。
 - **調査原則**: 実行結果だけで仮説を証明・棄却できる場合は過剰なコード探索より実行を優先する。
   実行しても複数原因が残る場合のみOpenCodeへコード探索を委任する。
+- **Router完成まで自動fallbackは成立しない**: `fallbackPolicy`は型と`adapter.ts`側の処理が
+  存在するがproductionに設定する呼び出し元が無く未配線であり、**これを配線しただけでは
+  Codex → OpenCodeへ自動切替できない**。OpenCodeはそもそも`AiCliProvider`ではないため、
+  最低限**OpenCodeのJob Provider化・`fallbackPolicy`の実配線・Routing判断**の3つが必要になる。
+  Router完成までは**PLが手動でRole / Modelを切り替える**。
+  Router実装・OpenCodeのJob Provider化・`fallbackPolicy`実配線・自動Routingは今回行わない。
 
 **Review Level 0〜3:** 変更内容はLevel 0（軽微・Codexのみ）/ Level 1（通常実装・Codex+Gemini postReview）/
 Level 2（中リスク・Claude計画+Gemini pre/postReview、必要ならChatGPT）/ Level 3（高リスク・Claude設計+

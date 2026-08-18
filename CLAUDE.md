@@ -34,7 +34,7 @@ Human・CEO（Goal・Design Philosophy・外部サービス・課金・本番・
 変更内容はReview Level 0〜3に分類し、Levelに応じたレビュー・確認・エスカレーションを行う。
 詳細は `AGENTS.md` 3章・`docs/multi_ai_step_review_flow.md` を参照。
 
-**Router導入前の暫定運用（2026-08-18〜）**: Claude は **PL Roleの現在の着任Model**として
+**Router導入前の暫定運用（2026-08-18〜）**: Claude は **PL Roleの暫定着任Model**として
 判断・委任・統合を担当し、原則として自分で作業するAgentではない（Role→Model割当は暫定で、
 Roleを特定Modelへ恒久固定しない）。上記「危険箇所実装」は自ら実装する意味ではなく、
 実装先の選定と設計責任を指す。調査・通常実装はOpenCode Goへ、難問・高リスク実装と
