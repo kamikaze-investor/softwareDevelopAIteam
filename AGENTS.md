@@ -75,13 +75,20 @@ Worker が `agentPrefix` を自動でセットするため、AI 側が手動で�
 Provider Routerは未実装のため、下記はPLが手動で委任する暫定運用とする。上表3・3-1の
 Review責務（Gemini / ChatGPT / Human）と既存Multi-stage Reviewは**変更しない**。
 
-- **Claude Opus = PL**。判断・委任・統合を担当し、**原則として自分で作業するAgentではない**。
+**適用原則**: 本節は**Router導入前の暫定的なRole→Model割当**であり、**Roleそのものを特定Modelへ
+恒久固定するものではない**。Modelの着任は変更され得る。
+本節は**作業分担のみを変更し**、既存のPermission / Approval Gate / AV-001 / Control Repository /
+Production / Secret等の**Authority・Safety Boundaryを一切変更しない**。
+全Agentは既存Safety Ruleおよび`specs/00_constitution.md` §3.14〜3.15に従う。
+
+- **PL Role**（現在の着任Model: **Claude Opus**）。判断・委任・統合を担当し、
+  **原則として自分で作業するAgentではない**。
   問題設定／Risk・難易度判定／調査項目の分解／Evidence統合／設計・方針決定／Task分解／
   Agent・Model選択／Review結果統合／Safety Boundary判定／CEO承認要否／最終進行判断を持つ。
   repo全体のgrep・大量コード読解・Evidence収集・単純な仮説検証・通常実装・通常test・
   通常コードReviewは**抱え込まない**。結論を左右するload-bearing claimのみ最小限spot checkする
   （上表3-1の「危険箇所実装」はPLが自ら実装する意味ではなく、実装先の選定と設計責任を指す）。
-- **OpenCode Go = 暫定Research / Implementer / Challenger Pool**。
+- **Research / Implementer / Challenger Pool Role**（現在の着任Model: **OpenCode Go**）。
   `AiCliProvider`に含まれずJob Providerではないため、**PLがCLIから直接委任する**
   （`./node_modules/.bin/opencode run "<prompt>" -m <model> --dir <path>`）。
   repo横断探索・関連コード特定・docs/tests/実装の照合・Evidence収集・原因候補探索・
@@ -94,7 +101,8 @@ Review責務（Gemini / ChatGPT / Human）と既存Multi-stage Reviewは**変更
   counterexample・隠れた副作用・failure mode・local optimum・抜け道・より単純な代替案を
   意図的に探させる。これは既存のIntegration / Strategic Alignment Reviewの**代替ではなく追加工程**。
   独立性を保つため、設計者の詳細な推論過程ではなく**問題・制約・Evidence・提案設計**を渡す。
-- **Codex Sol = Senior Implementer / Independent Reviewer**。希少な上級実装能力として、
+- **Senior Implementer / Independent Reviewer Role**（現在の着任Model: **Codex Sol**）。
+  希少な上級実装能力として、
   原因不明の難bug・複雑な状態遷移・concurrency/race・DB integrity・recovery・
   複数module横断・非自明なarchitecture変更・high-value/high-risk実装に使う。
   **単純実装には消費しない。** CRITICAL ReviewのIndependent Reviewerは既存仕様どおりCodex Sol。
