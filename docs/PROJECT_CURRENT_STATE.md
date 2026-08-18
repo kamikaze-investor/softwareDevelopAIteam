@@ -35,6 +35,40 @@ AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間�
 
 ### Production Baseline（現在Productionで稼働しているcommit）
 
+**Production baseline SHA**: `dff52cffffc7cb9045e940b30bfa10e740906466`（2026-08-19 deploy）
+
+`2520d0d` から3 commitをverified SHA固定（`--ff-only`）で反映した。
+`package.json`/`pnpm-lock.yaml`の変更が無いことを実値で確認したため`pnpm install`は行わず、
+deploy後に`@ai-team/worker`・`@ai-team/shared`のresolution成功を確認した。
+deploy直前にcanonical DBのbackupを取得し、**rollbackは不要だった**。追加migrationは無い。
+
+このdeployでProductionへ初めて反映された主な変更:
+
+- **API Result State Application Policy**（`apps/api/src/jobResultApplicationPolicy.ts`）:
+  正当な遅延・重複resultはHTTP 200で受理したまま、DB stateへ適用してよいかだけを判定する。
+  **確定済みterminal stateは遅延resultで上書きしない**（terminalからはrequeue→queuedのみ許可）。
+  Worker側のexecution FSMとは責務が異なるため同一化していない
+- **Worker running Outbox resend**（`apps/worker/src/index.ts`）: 稼働中のpoll cycleでも
+  未送信Outboxを再送する。1 pollにつき1 resend batchで、失敗時はpendingを保持し、
+  tight loopせず次pollで再試行する。「未送信結果が残っている間は新しいJobを取得しない」
+  既存契約は維持している
+
+**Production acceptance: PASS**（active Job 0 / Outbox 0で停止・deploy、`integrity_check: ok`、
+件数不変、install不要を実値確認、APIは`env -i`＋明示allowlistで起動しenvはbaselineと一致、
+WorkerはWorker用credentialのみ、各1系統・ppid=1・watchless、auth split維持、
+`ps`へのsecret露出0、外部`https://api.aiteamos.uk/health` 200、
+API側Outbox 0・Worker pending outbox 0、`design_review_runs` 0・`repair:*` 0・`retry:*` 0、
+startup recoveryエラー0）。
+
+**未確認として残るもの（この deploy 分）**: `project-auto-worker-outbox`のNatural Outbox E2E
+（API停止中にWorkerが自然にterminalへ到達し、pendingがdurableに残り、API再起動後の
+running resendで1回だけ適用されること）は、**次の自然なeligible Jobがrunningになった時の
+positive observation待ち**。人工Job・人工failureはProductionで作らない。
+
+---
+
+### 前回のProduction Baseline（2026-08-18 deploy・履歴）
+
 **Production baseline SHA**: `2520d0dc192082d99d06de258b84ebf986b2bbd5`（2026-08-18 deploy）
 
 `9e41062` から7 commitをverified SHA固定（`--ff-only`）で反映した。`4473fa7`で
