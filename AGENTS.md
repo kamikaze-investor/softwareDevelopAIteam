@@ -135,6 +135,24 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   最低限**OpenCodeのJob Provider化・`fallbackPolicy`の実配線・Routing判断**の3つが必要になる。
   Router完成までは**PLが手動でRole / Modelを切り替える**。
   Router実装・OpenCodeのJob Provider化・`fallbackPolicy`実配線・自動Routingは今回行わない。
+- **OpenCode Recovery Policy（暫定。2026-08-18〜）**: OpenCodeは依頼しても実作業を開始しないまま
+  無応答になることがある。2026-08-18の実測ではprompt長1000/2000/4046文字を単一行・複数行の
+  両方で試して6通りすべて成功しており、**prompt長とfailureの因果は確認できていない**。
+  よって**通常時はprompt長を理由に事前短縮・分割しない**。まず必要なpromptをそのまま渡す。
+  - **Progress Check**: 依頼後、原則2分後に実作業の開始を確認する。**PID存在をprogressと
+    判定しない**。内部progress marker（`stream` / `loop` / `process` / `llm runtime selected`）
+    またはoutputの実増加で判定する。progress markerは`~/.local/share/opencode/log/opencode.log`
+    で確認できる。upstream error等が明示された場合は2分を待たずfailureとしてよい。
+  - **Retry**: 2分経過しても開始を確認できない場合、現attemptを安全に停止し、**同じpromptで**
+    再実行する。**無限retryは禁止**。
+  - **3回連続failure**: 同一作業で3回連続して正常開始できない場合、同じ方法を繰り返さず
+    Recovery Strategyを変更する。優先順は (1) promptを整理・短縮 (2) Taskを合理的な単位へ分割
+    (3) 別OpenCodeモデルへ切替 (4) Codex Solが利用可能かつTask価値に見合う場合はGeneral Fallback
+    としてCodexへ委任。**単純な文字数削減より、目的・制約・Safety情報を維持したTask分割を優先する**。
+  - 正常に実作業が開始された場合はconsecutive failure countを**リセット**する。
+  - 本Policyは暫定運用ルールであり、**新Retry System / watchdog / Routerは実装しない**。
+    将来Routerでは `OpenCode dispatch → progress check → bounded retry → degradation →
+    model fallback` として自動化対象にする。
 
 **Review Level 0〜3:** 変更内容はLevel 0（軽微・Codexのみ）/ Level 1（通常実装・Codex+Gemini postReview）/
 Level 2（中リスク・Claude計画+Gemini pre/postReview、必要ならChatGPT）/ Level 3（高リスク・Claude設計+
