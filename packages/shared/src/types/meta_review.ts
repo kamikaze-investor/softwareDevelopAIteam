@@ -172,7 +172,5 @@ export interface DesignReviewEvidence {
   decision: DesignReviewDecision
   independentReviewRequired: boolean
   independentReviewVerdict?: DesignReviewIndependentVerdict
-  criticalFactsSnapshot?: string
-  criticalFactsHash?: string
   createdAt: string
 }

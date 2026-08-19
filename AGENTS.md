@@ -104,12 +104,15 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   **責務は Correctness / Simplicity / Naturalness の3観点**。
   発火トリガーは2種:
   - **Initial Design Challenge**: 重要設計の初回確定時
-  - **Material Redesign Challenge**: 前回PASS後に Review-Critical Design Facts が変化した場合（**mandatory**）
-  Review-Critical Design Facts の5カテゴリ（Authority/Permission/Trust Boundary、Durable State/DB Schema/State Transition、Gate/Approval/Safety/Recovery、重要API/Interface/External Contract、主要Invariant/採用方式）。
+  - **Material Redesign Challenge**: PLが design text を更新した場合（**mandatory**）。
+    PLは material redesign を行う場合、design text を更新する。
+    design text が更新されれば、既存の designTextHash により古いPASSは機械的に無効になる
+    （designTextHash は prompt テキストから SHA-256 で算出されるため、
+    テキスト変更 → hash 変更 → Job Gate で mismatch 検出、という**機械保証**）。
+    ただし「design text の変更が material かどうか」の判断自体は行動規範に委ねる
+    （semantic change を100%機械検出できるものではない）。
   comment / wording / formatting / rename / test追加のみ / 実装詳細のみ では発火しない。
-  **PLは mandatory Challenge を skip できない**（判定は deterministic な hash 比較で、PL の裁量が入る分岐が無い）。
   PL は deterministic trigger 外でも追加 Challenge を発火できる。
-  Meta Reviewer は「現在の facts と最新 Challenge PASS 時の facts が一致するか」だけを最終確認し、詳細な Design Quality review はしない。
   Strategic Alignment / Focused / Integration / Independent Review の既存責務は変更しない。
   **「非自明なら毎回」実行しない。** 反証の期待価値が高い次の場合に限定する:
   Safety Boundary／Authority・Permission／State Transition／DB・State Integrity／
@@ -117,6 +120,7 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   failure modeが複数あり局所最適化の危険が高い場合。
   **既存Multi-stage Reviewと同じ論点を理由なく重複確認しない。**
   独立性を保つため、PLの詳細な推論過程は渡さず**問題・制約・Evidence・提案設計**だけを渡す。
+  Constitution §3.16 に従う。
 - **Senior Implementer / Independent Reviewer Role**（暫定着任Model: **Codex Sol**）。
   希少な上級実装能力として、
   原因不明の難bug・複雑な状態遷移・concurrency/race・DB integrity・recovery・

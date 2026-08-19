@@ -26,9 +26,6 @@ import {
   applyIndependentReviewOverride,
   resolveFinalDecision,
   type DesignReviewEvidence,
-  type CriticalDesignFact,
-  canonicalizeCriticalDesignFacts,
-  computeCriticalDesignFactsHash,
 } from '@ai-team/shared'
 import type { IStorage, DesignReviewRun } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -306,7 +303,6 @@ export async function executeDesignReviewRun(
   storage: IStorage,
   run: DesignReviewRun,
   deps: CoordinatorDeps,
-  criticalFacts?: readonly CriticalDesignFact[],
 ): Promise<ExecuteDesignReviewResult> {
   const changedFiles = run.changedFiles
   const taskTitle = run.taskTitle
@@ -364,13 +360,6 @@ export async function executeDesignReviewRun(
     return { status: 'not_aligned', decision: outcome.decision, error: outcome.rejectedReason }
   }
 
-  let criticalFactsSnapshot: string | undefined
-  let criticalFactsHash: string | undefined
-  if (criticalFacts !== undefined) {
-    criticalFactsSnapshot = canonicalizeCriticalDesignFacts(criticalFacts)
-    criticalFactsHash = computeCriticalDesignFactsHash(criticalFacts)
-  }
-
   const evidence = storage.designReviewRuns.completeWithEvidence(run.id, claimToken, execution.stdout, {
     taskId: run.taskId,
     designTextHash: run.designTextHash,
@@ -378,8 +367,6 @@ export async function executeDesignReviewRun(
     decision: 'ALIGNED',
     independentReviewRequired: outcome.independentReviewRequired,
     independentReviewVerdict: outcome.independentReviewVerdict as DesignReviewEvidence['independentReviewVerdict'],
-    criticalFactsSnapshot,
-    criticalFactsHash,
   })
 
   if (!evidence) {
@@ -400,7 +387,6 @@ export async function createAndExecuteDesignReview(
     taskTitle: string
     designText: string
     changedFiles: string[]
-    criticalFacts?: CriticalDesignFact[]
   },
   deps: CoordinatorDeps,
 ): Promise<ExecuteDesignReviewResult> {
@@ -412,7 +398,7 @@ export async function createAndExecuteDesignReview(
     ...input,
     designTextHash: computeDesignTextHash(input.designText),
   })
-  return executeDesignReviewRun(storage, run, deps, input.criticalFacts)
+  return executeDesignReviewRun(storage, run, deps)
 }
 
 /**

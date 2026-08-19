@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { DesignReviewEvidence } from '@ai-team/shared'
 import type { IDesignReviewEvidenceStorage } from './storage/interface'
-import { computeCriticalDesignFactsHash } from './designReview/criticalDesignFactsHash'
 
 export type ImplementDesignReviewPreconditionFailureCode =
   | 'MISSING_AI_CLI_PROMPT'
@@ -9,8 +8,6 @@ export type ImplementDesignReviewPreconditionFailureCode =
   | 'DESIGN_REVIEW_HASH_MISMATCH'
   | 'DESIGN_REVIEW_NOT_ALIGNED'
   | 'CRITICAL_INDEPENDENT_REVIEW_NOT_APPROVED'
-  | 'CRITICAL_FACTS_NOT_REVIEWED'
-  | 'CRITICAL_FACTS_CHANGED'
 
 export type ImplementDesignReviewPreconditionResult =
   | { ok: true; evidence?: DesignReviewEvidence }
@@ -24,14 +21,11 @@ export interface ImplementDesignReviewPreconditionInput {
   taskId: string
   aiCliMode?: string
   aiCliPrompt?: string
-  currentCriticalFactsHash?: string
 }
 
 export function computeDesignTextHash(designText: string): string {
   return createHash('sha256').update(designText, 'utf-8').digest('hex')
 }
-
-export { computeCriticalDesignFactsHash }
 
 export function checkImplementJobDesignReviewEvidence(
   input: ImplementDesignReviewPreconditionInput,
@@ -79,23 +73,6 @@ export function checkImplementJobDesignReviewEvidence(
       ok: false,
       code: 'CRITICAL_INDEPENDENT_REVIEW_NOT_APPROVED',
       reason: 'Critical Design Review evidence is missing an approved independent review verdict',
-    }
-  }
-
-  if (input.currentCriticalFactsHash !== undefined) {
-    if (evidence.criticalFactsHash === undefined) {
-      return {
-        ok: false,
-        code: 'CRITICAL_FACTS_NOT_REVIEWED',
-        reason: 'Design Review evidence is missing critical facts hash',
-      }
-    }
-    if (evidence.criticalFactsHash !== input.currentCriticalFactsHash) {
-      return {
-        ok: false,
-        code: 'CRITICAL_FACTS_CHANGED',
-        reason: 'Critical Design Facts have changed since Design Review',
-      }
     }
   }
 

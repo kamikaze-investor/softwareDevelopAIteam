@@ -156,8 +156,6 @@ export const CREATE_TABLES = `
     decision TEXT NOT NULL,
     independent_review_required INTEGER NOT NULL DEFAULT 0,
     independent_review_verdict TEXT,
-    critical_facts_snapshot TEXT,
-    critical_facts_hash TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
@@ -361,8 +359,6 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'jobs', column: 'ai_cli_mode', definition: 'TEXT' },
   { table: 'approval_requests', column: 'changed_files', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'approval_requests', column: 'triggered_rules', definition: "TEXT NOT NULL DEFAULT '[]'" },
-  { table: 'design_review_evidence', column: 'critical_facts_snapshot', definition: 'TEXT' },
-  { table: 'design_review_evidence', column: 'critical_facts_hash', definition: 'TEXT' },
 ]
 
 /**
