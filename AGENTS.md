@@ -79,7 +79,7 @@ Review責務（Gemini / ChatGPT / Human）と既存Multi-stage Reviewは**変更
 恒久固定するものではない**。Modelの着任は変更され得る。
 本節は**作業分担のみを変更し**、既存のPermission / Approval Gate / AV-001 / Control Repository /
 Production / Secret等の**Authority・Safety Boundaryを一切変更しない**。
-全Agentは既存Safety Ruleおよび`specs/00_constitution.md` §3.14〜3.15に従う。
+全Agentは既存Safety Ruleおよび`specs/00_constitution.md` §3.14〜3.16に従う。
 
 - **PL Role**（暫定着任Model: **Claude Opus**）。判断・委任・統合を担当し、
   **原則として自分で作業するAgentではない**。
@@ -99,7 +99,7 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
 - **Design Challenger（暫定）**: 明示的なAdversarial / Falsification Design Reviewは
   **AIteamOSに未実装**（git全履歴でも実装された証跡なし）。そのためOpenCodeを別Agentとして使い、
   前提の誤り・counterexample・隠れた副作用・failure mode・local optimum・抜け道・
-  より単純な代替案を意図的に探させる。既存のIntegration / Strategic Alignment Reviewの
+  より単純な代替案を意図的に探させる。**複雑な解決策を評価する前に、複雑な状態そのものを消せないかを確認する。** 既存のIntegration / Strategic Alignment Reviewの
   **代替ではなく追加工程**。
   **「非自明なら毎回」実行しない。** 反証の期待価値が高い次の場合に限定する:
   Safety Boundary／Authority・Permission／State Transition／DB・State Integrity／
