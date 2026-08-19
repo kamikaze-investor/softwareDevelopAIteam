@@ -46,10 +46,25 @@ async function capturePrompt(provider: 'claude_code' | 'codex'): Promise<string>
   }
 
   expect(execFileSyncMock).toHaveBeenCalled()
-  const call = execFileSyncMock.mock.calls[0] as [string, string[], { input?: string }]
-  const argvText = (call[1] ?? []).join('\n')
-  const stdinText = call[2]?.input ?? ''
-  return `${argvText}\n${stdinText}`
+
+  // calls[0] を決め打ちしない。codexPathResolver が実行前に `which codex` /
+  // `codex --version` で execFileSync を呼ぶため、OSによって先頭callが変わる
+  // （Linux CIでは解決用callがcalls[0]になり、プロンプトを含まない）。
+  // 実装ではなくテストの前提がplatform依存だったので、
+  // 「実際にプロンプトを載せたcall」を全callから探す形にする。
+  const calls = execFileSyncMock.mock.calls as Array<[string, string[], { input?: string }]>
+  const texts = calls.map((call) => {
+    const argvText = (call[1] ?? []).join('\n')
+    const stdinText = call[2]?.input ?? ''
+    return `${argvText}\n${stdinText}`
+  })
+
+  const promptCall = texts.find((text) => text.includes(ORIGINAL_PROMPT))
+  if (promptCall !== undefined) return promptCall
+
+  // Constitution本文を取得できなかったケースの検証では ORIGINAL_PROMPT を含む call が
+  // 無いこともあるため、最後のcall（＝実際のCLI実行）へfallbackする。
+  return texts[texts.length - 1] ?? ''
 }
 
 describe('Constitution overlay は Implementation Agent の全providerへ届く', () => {
