@@ -11,9 +11,16 @@ name: Gate Evidence Check
 #   `pull_request_target` の一般的な危険は「PR codeをcheckoutして実行すること」だが、
 #   このworkflowはPR head/merge commitのcheckout・download・script実行を**一切行わない**
 #   （PR metadataの取得とAPIへのread-only問い合わせだけで成立する）。
+#
+# **現在このRepositoryのPRでは自動実行しない（2026-08-20）**:
+#   `gate_evaluations.resulting_commit` が証明するのは Target Repository（`/workspace/target`）の
+#   commitであり、このControl Repository（softwareDevelopAIteam）のPR commitとは**別RepositoryのSHA**である。
+#   照合対象が異なるため、このRepositoryのPRへ適用しても常にFAILする。未完成だからではなく
+#   **適用対象外**という判断であり、Control Repo用のgate evidenceは新設しない。
+#   Target RepositoryにGitHub remote / push / PR経路ができた時点でそちら側へ適用し、
+#   実PRでPASSを確認してからrequired化する。それまでは手動実行のみとする。
 on:
-  pull_request_target:
-    branches: [master, main]
+  workflow_dispatch:
 
 # GITHUB_TOKENの権限を必要最小限へ明示する。
 # このworkflowはPR metadataの取得とAPIへのread-only問い合わせだけを行い、

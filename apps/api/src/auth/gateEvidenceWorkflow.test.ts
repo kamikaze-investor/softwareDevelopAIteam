@@ -25,9 +25,13 @@ const workflow = YAML.parse(workflowText) as {
 const steps = workflow.jobs['gate-evidence'].steps
 
 describe('gate evidence workflow: secret trust boundary', () => {
-  it('workflow定義をbase branchへ固定する（pull_request_targetのみ）', () => {
-    expect(Object.keys(workflow.on)).toEqual(['pull_request_target'])
+  it('このRepositoryのPRでは自動実行しない（適用対象外のため手動のみ）', () => {
+    // gate_evaluations.resulting_commit は Target Repository の commit を証明するもので、
+    // このControl Repository の PR commit とは別RepositoryのSHA。照合対象が異なるため
+    // ここへ自動適用すると常にFAILする。Target Repo側へ適用するまで手動実行のみとする。
+    expect(Object.keys(workflow.on)).toEqual(['workflow_dispatch'])
     expect(workflow.on).not.toHaveProperty('pull_request')
+    expect(workflow.on).not.toHaveProperty('pull_request_target')
   })
 
   it('PR head / merge commit をcheckoutしない', () => {
