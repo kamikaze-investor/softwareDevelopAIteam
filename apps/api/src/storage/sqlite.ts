@@ -2091,8 +2091,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO design_review_evidence
           (id, task_id, design_text_hash, review_load, decision,
-           independent_review_required, independent_review_verdict, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           independent_review_required, independent_review_verdict, critical_facts_snapshot, critical_facts_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evidence.id,
         evidence.taskId,
@@ -2101,6 +2101,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         evidence.decision,
         evidence.independentReviewRequired ? 1 : 0,
         evidence.independentReviewVerdict ?? null,
+        evidence.criticalFactsSnapshot ?? null,
+        evidence.criticalFactsHash ?? null,
         evidence.createdAt,
       )
       return evidence
@@ -3055,6 +3057,8 @@ function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
     decision: row.decision as DesignReviewEvidence['decision'],
     independentReviewRequired: row.independent_review_required === 1,
     independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
+    criticalFactsSnapshot: row.critical_facts_snapshot ?? undefined,
+    criticalFactsHash: row.critical_facts_hash ?? undefined,
     createdAt: row.created_at,
   }
 }

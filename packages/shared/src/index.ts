@@ -24,6 +24,7 @@ export * from './types/approvalLevel'
 export * from './types/audit_log'
 export * from './types/project_roadmap'
 export * from './outbox/canonicalize'
+export * from './criticalDesignFacts'
 // `constitutionPrinciples` は node:fs / node:path に依存するため、ここからは再exportしない。
 // Mobile（React Native）は `@ai-team/shared` をこのbarrel経由で読み込むため、
 // barrelへ載せるとNode専用APIがRNバンドルへ混入する。

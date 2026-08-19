@@ -101,6 +101,16 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   前提の誤り・counterexample・隠れた副作用・failure mode・local optimum・抜け道・
   より単純な代替案を意図的に探させる。**複雑な解決策を評価する前に、複雑な状態そのものを消せないかを確認する。** 既存のIntegration / Strategic Alignment Reviewの
   **代替ではなく追加工程**。
+  **責務は Correctness / Simplicity / Naturalness の3観点**。
+  発火トリガーは2種:
+  - **Initial Design Challenge**: 重要設計の初回確定時
+  - **Material Redesign Challenge**: 前回PASS後に Review-Critical Design Facts が変化した場合（**mandatory**）
+  Review-Critical Design Facts の5カテゴリ（Authority/Permission/Trust Boundary、Durable State/DB Schema/State Transition、Gate/Approval/Safety/Recovery、重要API/Interface/External Contract、主要Invariant/採用方式）。
+  comment / wording / formatting / rename / test追加のみ / 実装詳細のみ では発火しない。
+  **PLは mandatory Challenge を skip できない**（判定は deterministic な hash 比較で、PL の裁量が入る分岐が無い）。
+  PL は deterministic trigger 外でも追加 Challenge を発火できる。
+  Meta Reviewer は「現在の facts と最新 Challenge PASS 時の facts が一致するか」だけを最終確認し、詳細な Design Quality review はしない。
+  Strategic Alignment / Focused / Integration / Independent Review の既存責務は変更しない。
   **「非自明なら毎回」実行しない。** 反証の期待価値が高い次の場合に限定する:
   Safety Boundary／Authority・Permission／State Transition／DB・State Integrity／
   concurrency・race／Recovery・Rollback／重大な前提／高い設計不確実性／
