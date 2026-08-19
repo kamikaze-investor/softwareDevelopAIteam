@@ -2113,13 +2113,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO gate_evaluations
           (id, task_id, job_id, target_branch, target_commit, target_diff_hash,
-           decision, risk_level, triggered_rules, policy_version, binding_verification, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           decision, risk_level, triggered_rules, policy_version, binding_verification,
+           approved_content_hash, resulting_commit, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evidence.id, evidence.taskId, evidence.jobId ?? null, evidence.targetBranch,
         evidence.targetCommit, evidence.targetDiffHash, evidence.decision, evidence.riskLevel,
         JSON.stringify(evidence.triggeredRules), evidence.policyVersion,
-        evidence.bindingVerification, evidence.createdAt,
+        evidence.bindingVerification, evidence.approvedContentHash ?? null,
+        evidence.resultingCommit ?? null, evidence.createdAt,
       )
       return evidence
     },
@@ -2128,6 +2130,41 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         'SELECT * FROM gate_evaluations WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
       ).all(taskId) as any[]
       return rows.map(deserializeGateEvaluation)
+    },
+    findByJobId(jobId) {
+      const rows = db.prepare(
+        'SELECT * FROM gate_evaluations WHERE job_id = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(jobId) as any[]
+      return rows.map(deserializeGateEvaluation)
+    },
+    findByResultingCommit(resultingCommit) {
+      const rows = db.prepare(
+        'SELECT * FROM gate_evaluations WHERE resulting_commit = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(resultingCommit) as any[]
+      return rows.map(deserializeGateEvaluation)
+    },
+    bindResultingCommit({ evidenceId, jobId, resultingCommit }) {
+      // CAS: resulting_commit IS NULL のときだけ書く。
+      // at-least-once PATCHで何度呼ばれてもbindingは1回だけ成立し、
+      // 既にbind済みのevidenceを別commitへ付け替えない。
+      // 併せてbind可能な条件（ALLOW / authoritative / hash有り / jobId一致）もSQLで強制する。
+      // 一意制約違反（同一commitへ別evidenceが既にbind済み）は例外になるため、
+      // bind失敗として扱う。曖昧なbindを黙って成立させない。
+      try {
+      const result = db.prepare(`
+        UPDATE gate_evaluations
+        SET resulting_commit = ?
+        WHERE id = ?
+          AND job_id = ?
+          AND resulting_commit IS NULL
+          AND decision = 'ALLOW'
+          AND binding_verification = 'authoritative'
+          AND approved_content_hash IS NOT NULL
+      `).run(resultingCommit, evidenceId, jobId)
+      return result.changes === 1
+      } catch {
+        return false
+      }
     },
     findByTarget(targetCommit, targetDiffHash) {
       const rows = db.prepare(
@@ -3035,6 +3072,8 @@ function deserializeGateEvaluation(row: any): GateEvaluationEvidence {
     triggeredRules: JSON.parse(row.triggered_rules ?? '[]') as string[],
     policyVersion: row.policy_version,
     bindingVerification: (row.binding_verification ?? 'unverified') as GateEvaluationEvidence['bindingVerification'],
+    approvedContentHash: row.approved_content_hash ?? undefined,
+    resultingCommit: row.resulting_commit ?? undefined,
     createdAt: row.created_at,
   }
 }

@@ -400,6 +400,21 @@ export interface GateEvaluationEvidence {
    * 少なくとも `unverified` を信頼してはならない。
    */
   bindingVerification: 'authoritative' | 'diff_text_hash' | 'unverified'
+  /**
+   * ALLOWした変更集合のcanonical change manifest hash。
+   * API側がauthoritative repositoryから算出したときだけ入る。
+   */
+  approvedContentHash?: string
+  /**
+   * このALLOWを根拠に実際に作られたcommit。
+   *
+   * API/Control Plane自身がauthoritative repositoryで
+   * (1) commitの実在 (2) parent === targetCommit (3) canonical manifest hash一致
+   * を全て検証できた場合だけ非NULLになる。WorkerのcommitHashはtrust sourceにしない。
+   *
+   * 一度非NULLになったら別commitへbindし直さない（binding updateはCASで1回だけ）。
+   */
+  resultingCommit?: string
   createdAt: string
 }
 
@@ -408,6 +423,23 @@ export interface IGateEvaluationStorage {
   findByTaskId(taskId: string): GateEvaluationEvidence[]
   /** 対象commit/diffに対して実際に記録されたGate評価を引く（機械検証用）。 */
   findByTarget(targetCommit: string, targetDiffHash: string): GateEvaluationEvidence[]
+  /** そのJob自身のGate評価を引く（「最新ALLOW」のような曖昧な選択をしないため）。 */
+  findByJobId(jobId: string): GateEvaluationEvidence[]
+  /** PR HEADから照合するための引き当て（ACTIONS_READONLY検証用）。 */
+  findByResultingCommit(resultingCommit: string): GateEvaluationEvidence[]
+  /**
+   * authoritative verification成功時にresulting_commitをbindする。
+   *
+   * `resulting_commit IS NULL`をCAS条件にするため、at-least-once PATCHでも
+   * bindingは1回だけ成立する。bind可能なのは
+   * decision=ALLOW / binding_verification=authoritative / approved_content_hash有り /
+   * jobId一致 のevidenceのみ。
+   */
+  bindResultingCommit(input: {
+    evidenceId: string
+    jobId: string
+    resultingCommit: string
+  }): boolean
 }
 
 export interface IAuditLogStorage {

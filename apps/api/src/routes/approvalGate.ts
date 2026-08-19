@@ -25,6 +25,8 @@ import {
   type ApprovalAiOptions,
 } from '../approvalExplain/approvalAi'
 import { readExactApprovalDiff } from '../approvalExplain/diffReader'
+import { computeChangeManifestHash } from '../approvalExplain/changeManifestIdentity'
+import { buildWorktreeChangeManifest } from '../approvalExplain/changeManifestReader'
 import type { GateEvaluationEvidence } from '../storage/interface'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
@@ -574,6 +576,22 @@ export async function approvalGateRoutes(
       )
     }
 
+    // approved_content_hash: ALLOWした変更集合のcanonical manifest hash。
+    // commit後に「Bが本当にこの変更集合から作られたか」を独立検証するために使う。
+    // binding_verificationがauthoritativeでないevidenceには付けない
+    // （申告値ベースのevidenceをcommit後にauthoritativeへ昇格させないため）。
+    let approvedContentHash: string | undefined
+    if (bindingVerification === 'authoritative') {
+      try {
+        approvedContentHash = computeChangeManifestHash(buildWorktreeChangeManifest(TARGET_WORKING_DIR))
+      } catch (error: unknown) {
+        app.log.warn(
+          { taskId, error: error instanceof Error ? error.message : String(error) },
+          'approved content manifest could not be computed',
+        )
+      }
+    }
+
     // Gate評価のdurable evidenceを残す。
     //
     // 目的は「このcommit/diffに対してGate評価が実行され、結果がこうだった」ことを
@@ -593,6 +611,7 @@ export async function approvalGateRoutes(
       triggeredRules: sanitizeTriggeredRulesForApprovalRequest(riskReview.triggeredRules),
       policyVersion: GATE_POLICY_VERSION,
       bindingVerification,
+      approvedContentHash,
     })
 
     const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)

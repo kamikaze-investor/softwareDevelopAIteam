@@ -11,6 +11,7 @@ import {
   describeApplicableJobStatuses,
 } from '../jobResultApplicationPolicy'
 import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from '../designReview/repairFlow'
+import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
 
 const AgentRoleSchema = z.enum([
   'cto_ai',
@@ -493,6 +494,41 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(500).send({ error: 'Failed to advance Job workflow' })
       }
       return reply.send(outboxResponse(transition.job, outboxEvent, transition.deduplicated === true))
+    }
+
+    // git_commit Jobが成功したら、そのJobのGate ALLOW evidenceへresulting commitをbindする。
+    //
+    // 原則: 1 Gate ALLOW = 1 git_commit Job = 1 resulting_commit。
+    // WorkerのcommitHashは渡さない（trust sourceにしない）。API自身がauthoritative repositoryで
+    // HEAD取得・parent一致・canonical manifest hash一致を独立検証し、
+    // すべて成立した場合だけbindする（CASにより1回だけ）。
+    // 失敗してもJob結果の保存は妨げない（bindしないだけ）。
+    const isCommitJobSuccess =
+      existing.safeCommand.kind === 'git_commit' &&
+      jobUpdate.status === 'success' &&
+      existing.status !== 'success'
+    if (isCommitJobSuccess) {
+      try {
+        const bindOutcome = bindResultingCommitForJob(
+          storage,
+          {
+            jobId: existing.id,
+            workingDir: existing.safeCommand.workingDir ?? TARGET_WORKING_DIR,
+          },
+          req.log,
+        )
+        if (!bindOutcome.bound) {
+          req.log.warn(
+            { jobId: existing.id, reason: bindOutcome.reason },
+            'resulting commit was not bound to gate evidence',
+          )
+        }
+      } catch (error: unknown) {
+        req.log.error(
+          { jobId: existing.id, err: error },
+          'resulting commit binding raised an unexpected error',
+        )
+      }
     }
 
     // 通常の実装失敗（Stage 1のprovider timeout retry候補は上で return 済み）。

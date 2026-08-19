@@ -172,6 +172,8 @@ export const CREATE_TABLES = `
     triggered_rules TEXT NOT NULL DEFAULT '[]',
     policy_version TEXT NOT NULL,
     binding_verification TEXT NOT NULL DEFAULT 'unverified',
+    approved_content_hash TEXT,
+    resulting_commit TEXT,
     created_at TEXT NOT NULL
   );
 
@@ -338,6 +340,8 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'tasks', column: 'phase', definition: 'INTEGER' },
   { table: 'tasks', column: 'roadmap_active', definition: 'INTEGER NOT NULL DEFAULT 0' },
   { table: 'gate_evaluations', column: 'binding_verification', definition: "TEXT NOT NULL DEFAULT 'unverified'" },
+  { table: 'gate_evaluations', column: 'approved_content_hash', definition: 'TEXT' },
+  { table: 'gate_evaluations', column: 'resulting_commit', definition: 'TEXT' },
   { table: 'design_review_runs', column: 'task_title', definition: "TEXT NOT NULL DEFAULT ''" },
   { table: 'design_review_runs', column: 'changed_files', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'jobs', column: 'agent_role', definition: "TEXT NOT NULL DEFAULT 'developer_ai'" },
@@ -372,5 +376,8 @@ export const INDEX_STATEMENTS: string[] = [
   "CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_task_active ON design_review_runs(task_id) WHERE status IN ('queued','running')",
   'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_task_created_at ON gate_evaluations(task_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_target ON gate_evaluations(target_commit, target_diff_hash)',
+  // 1 ALLOW = 1 git_commit = 1 resulting_commit。
+  // 同一commitへ複数のtrusted evidenceが曖昧にbindされないよう一意にする（NULLは対象外）。
+  'CREATE UNIQUE INDEX IF NOT EXISTS ux_gate_evaluations_resulting_commit ON gate_evaluations(resulting_commit) WHERE resulting_commit IS NOT NULL',
   'CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at ON design_review_runs(status, started_at)',
 ]
