@@ -30,6 +30,7 @@ import { buildWorktreeChangeManifest } from '../approvalExplain/changeManifestRe
 import type { GateEvaluationEvidence } from '../storage/interface'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
+import { gateEvaluationRoutes } from './gateEvaluations'
 
 /**
  * Gate policyの版。RISK_RULESや判定ロジックを変えたら上げる。
@@ -346,6 +347,8 @@ export async function approvalGateRoutes(
   const storage = getStorage()
   const targetWorkingDir = options.targetWorkingDir ?? TARGET_WORKING_DIR
   app.register(designReviewEvidenceRoutes)
+  // AV-001保護のindex.tsを触らずに済むよう、既存の同prefix(/api)配下へ相乗りする。
+  app.register(gateEvaluationRoutes)
 
   function resolveApprovalAiContext(request: ApprovalRequest): ResolvedApprovalAiContext | null {
     const task = storage.tasks.findById(request.taskId)

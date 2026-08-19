@@ -1,6 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { isWorkerRouteAllowed } from './workerAllowlist'
+import { isActionsReadonlyRouteAllowed } from './actionsReadonlyAllowlist'
 
 const BEARER_PREFIX = 'Bearer '
 
@@ -31,6 +32,12 @@ function timingSafeStringEqual(a: string, b: string): boolean {
  * - **片方だけ設定** → invalid configuration。設定ミスとして全requestを503で拒否する
  *   （fail closed。片側credentialだけ有効な中途半端な状態でProductionを動かさない）
  *
+ * split credential modeでは、任意で第3のcredential class `ACTIONS_READONLY`を
+ * （`ACTIONS_READONLY_TOKEN_SHA256`）追加できる。GitHub Actionsがtrusted resulting_commitを
+ * 機械検証するためだけのread-only credentialで、`./actionsReadonlyAllowlist`のGET routeのみ
+ * 許可しそれ以外はDefault Deny（403）。未設定ならこのcredential classは存在しない扱いで、
+ * ADMIN/WORKERの挙動は一切変わらない。ADMIN/WORKERへのfallbackも行わない。
+ *
  * split credential modeでは旧`API_TOKEN`は（値がenvに残っていても）認証に使えない。
  * legacyとsplitの共存・段階的移行は成立しないため、Production cutoverは計画停止を伴う。
  */
@@ -42,6 +49,7 @@ export async function apiTokenAuth(
   // どのtokenとも一致しないcredentialが有効扱いになるのを防ぐ）。
   const adminTokenHash = process.env.ADMIN_TOKEN_SHA256 || undefined
   const workerTokenHash = process.env.WORKER_TOKEN_SHA256 || undefined
+  const actionsTokenHash = process.env.ACTIONS_READONLY_TOKEN_SHA256 || undefined
 
   if (adminTokenHash === undefined && workerTokenHash === undefined) {
     await legacySingleTokenAuth(req, reply)
@@ -67,6 +75,19 @@ export async function apiTokenAuth(
     return
   }
 
+  // ACTIONS_READONLYが設定されている場合、ADMIN/WORKERのいずれとも異なる値でなければ
+  // authority separationが無効化される。設定ミスとしてfail closedで拒否する。
+  if (
+    actionsTokenHash !== undefined &&
+    (timingSafeStringEqual(actionsTokenHash, adminTokenHash) ||
+      timingSafeStringEqual(actionsTokenHash, workerTokenHash))
+  ) {
+    reply.status(503).send({
+      error: 'Server auth configuration is invalid: ACTIONS_READONLY_TOKEN_SHA256 must differ from ADMIN_TOKEN_SHA256 and WORKER_TOKEN_SHA256',
+    })
+    return
+  }
+
   const authHeader = req.headers.authorization
   if (!authHeader || !authHeader.startsWith(BEARER_PREFIX)) {
     reply.status(401).send({ error: 'Authorization header required' })
@@ -84,6 +105,15 @@ export async function apiTokenAuth(
       return
     }
     reply.status(403).send({ error: 'Forbidden: route not allowed for WORKER credential' })
+    return
+  }
+
+  // ACTIONS_READONLY: GETのexact verification routeのみ。ADMIN/WORKERへはfallbackしない。
+  if (actionsTokenHash !== undefined && timingSafeStringEqual(tokenHash, actionsTokenHash)) {
+    if (isActionsReadonlyRouteAllowed(req.routeOptions.method, req.routeOptions.url)) {
+      return
+    }
+    reply.status(403).send({ error: 'Forbidden: route not allowed for ACTIONS_READONLY credential' })
     return
   }
 

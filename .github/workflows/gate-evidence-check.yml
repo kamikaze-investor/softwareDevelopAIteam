@@ -1,0 +1,78 @@
+name: Gate Evidence Check
+
+# PRで追加される各commitが trusted resulting_commit かをAPIへ問い合わせて確認する。
+# 1つでも未trusted・API/auth error・曖昧ならFAIL CLOSEDにする。
+
+on:
+  pull_request:
+    branches: [master, main]
+
+# GITHUB_TOKENの権限を必要最小限へ明示する。
+# このworkflowはPR metadataの取得とAPIへのread-only問い合わせだけを行い、
+# repositoryへの書き込み・PRコメント投稿を行わない。
+permissions:
+  contents: read
+
+jobs:
+  gate-evidence:
+    name: Trusted Gate Evidence
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------------
+      # PR codeはcheckoutしない。依存導入もPR script実行も行わず、
+      # ACTIONS_READONLY secretをPR codeへ渡さない。
+      # commit列挙はGitHub標準のREST APIだけで行う（新systemを作らない）。
+      # -------------------------------------------------------
+      - name: Verify every commit added by this PR
+        env:
+          # exact verification専用のread-only credential。write権限は持たない。
+          AI_TEAM_ACTIONS_READONLY_TOKEN: ${{ secrets.AI_TEAM_ACTIONS_READONLY_TOKEN }}
+          AI_TEAM_API_BASE: ${{ vars.AI_TEAM_API_BASE }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${AI_TEAM_ACTIONS_READONLY_TOKEN:-}" ] || [ -z "${AI_TEAM_API_BASE:-}" ]; then
+            echo "FAIL: ACTIONS_READONLY credential or API base is not configured (fail closed)"
+            exit 1
+          fi
+
+          # PRで追加されるcommitだけを列挙する。
+          # base branchに以前から存在するcommitは含まれない（GitHubのPR commits APIの定義）。
+          commits=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/commits" --jq '.[].sha')
+
+          if [ -z "$commits" ]; then
+            echo "FAIL: no commits found for this PR (fail closed)"
+            exit 1
+          fi
+
+          failed=0
+          for sha in $commits; do
+            status=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${AI_TEAM_ACTIONS_READONLY_TOKEN}" \
+              "${AI_TEAM_API_BASE}/api/gate-evaluations/verify-commit?resultingCommit=${sha}" || echo "000")
+
+            if [ "$status" != "200" ]; then
+              echo "FAIL ${sha}: verification request failed (HTTP ${status})"
+              failed=1
+              continue
+            fi
+
+            trusted=$(jq -r '.trusted // false' /tmp/resp.json)
+            if [ "$trusted" = "true" ]; then
+              echo "OK   ${sha}: trusted resulting_commit"
+            else
+              echo "FAIL ${sha}: not a trusted resulting_commit"
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Gate Evidence Check failed: every commit in this PR must be a trusted resulting_commit"
+            exit 1
+          fi
+
+          echo "All commits in this PR are trusted resulting_commits"
