@@ -65,6 +65,15 @@ startup recoveryエラー0）。
 running resendで1回だけ適用されること）は、**次の自然なeligible Jobがrunningになった時の
 positive observation待ち**。人工Job・人工failureはProductionで作らない。
 
+**2026-08-20 実測により「実運用観測待ち」として一旦クローズ**: 実装（Worker稼働中resend・
+API側Result State Application Policy）はdeploy済みでdeterministic test検証も完了しており、
+残るのはproduction上のpositive observationのみ。ただしProductionは
+running/queued Job 0件・最新Job作成が2026-08-11で、9日間Jobが発生していない。
+Task→Job自動生成（`project-auto-task-job-chain`）がblockedのため、Jobは
+`POST /api/jobs`かTask resumeからしか作られず、**実運用でTaskが投入されない限り
+観測機会は発生しない**。CEOが次にProductionで実タスクを流すタイミングで、
+API停止ウィンドウ手順を実行して観測する。
+
 ---
 
 ### 前回のProduction Baseline（2026-08-18 deploy・履歴）
