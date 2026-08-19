@@ -735,6 +735,17 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         （2026-08-19実測: `readExactApprovalDiff`は`rev-parse HEAD`と`git diff HEAD`だけを照合し、
         stale判定もcommit+diffのみ。branchはtrust判断に使われておらず監査metadataである）。
         外部境界の照合対象もcommit+diffとする。
+        **Gate Evidence CheckのControl Repositoryへの適用は見送り（2026-08-20確定）**:
+        `gate_evaluations.resulting_commit`が証明するのはTarget Repository（`/workspace/target`）の
+        commitであり、Control Repository（`softwareDevelopAIteam`）のPR commitとは**別RepositoryのSHA**である。
+        実測: Control HEAD=`d020c61` / Target HEAD=`8aecfc4` / Target remoteは**0件でGitHub上に存在しない**。
+        照合対象が異なるためControl RepoのPRへ適用すると常にFAILする。**未完成だからではなく適用対象外**
+        という判断であり、**Control Repo commit用のgate evidenceは新設しない**。
+        `.github/workflows/gate-evidence-check.yml`は削除せず、triggerを`workflow_dispatch`のみに変更して
+        自動実行しない状態で保持する（新機構は作らない）。
+        **将来の導入条件**: Target RepositoryにGitHub remote / push / PR経路ができた時点で、
+        Gate Evidence CheckをTarget Repo側へ適用し、**実PRでPASSを確認してからrequired化**する。
+        それまでControl RepoのRuleset required checksは`Typecheck & Test`と`Meta Review`の2つとする。
         **未完了**: これをGitHub Actionsから機械検証する経路はGap B（read-only credential）待ち
       - **Gate evaluation bindingの要件（将来の最小解決方針。今回は永続化方式を決め打ちしない）**:
         Task→Job Full Automation解放前に、GitHub ActionsがPR HEADについて
