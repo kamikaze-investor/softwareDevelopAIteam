@@ -126,7 +126,7 @@ function writeDashboard(
   let entriesSection: string
   if (existingContent) {
     // 既存の ## 実行履歴 の下に追記
-    const afterHeader = existingContent.replace(/^## 実行履歴\n+/, '')
+    const afterHeader = existingContent.replace(/^## 実行履歴\r?\n+/, '')
     entriesSection = `## 実行履歴\n\n${newEntryMd}\n${afterHeader}`
   } else {
     entriesSection = `## 実行履歴\n\n${newEntryMd}`
