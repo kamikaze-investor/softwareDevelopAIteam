@@ -3,11 +3,14 @@ import { updateDashboard } from './summaryEngine.js'
 import type { DeveloperAiResult } from './developerAiOrchestrator.js'
 import os from 'node:os'
 import path from 'node:path'
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 
 function makeTmp(): string {
-  const dir = path.join(os.tmpdir(), `summary-test-${Date.now()}`)
-  mkdirSync(dir, { recursive: true })
+  // `Date.now()` だけだと、実行が速い環境（CI）で複数のテストが同一ミリ秒になり
+  // 同じディレクトリを共有してしまう。前のテストが書いた dashboard.md が残るため
+  // entriesInDashboard が期待値より多くなる（CIで expected 3 to be 2 として観測）。
+  // 実装ではなくテストのfixtureがCI環境依存だったので、一意なディレクトリを使う。
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'summary-test-'))
   return dir
 }
 

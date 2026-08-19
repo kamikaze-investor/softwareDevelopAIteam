@@ -627,6 +627,26 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       required check・PR必須を強制できる状態）を実運用で裏づける観測事実であり、
       新しい問題ではなく既存の未解決事項の再確認。新規roadmap item・追加Gateは作らない。
       引き続き`project-auto-task-job-chain`のFull Automation解放前の必須条件として維持する。
+      **3点の解決状況（2026-08-20実測。上記(1)(2)(3)はすべて解決済み）**:
+      - **(1) AI/CEO GitHub credential分離 = 完了**。GitHub Appは**作らなかった**。同一principalのまま
+        AI側credentialをrestricted Fine-grained PAT（Administration無し）へ統一し、`gh auth setup-git`で
+        git pushも同一credentialへ集約、旧classic OAuthとGit Credential Managerの旧entryは削除。
+        実測: Ruleset create/update/delete = **HTTP 403 Resource not accessible**（実在Rulesetに触れない
+        safe probeで確認）。master Rulesetは**enforcement=active / bypass_actors=[] /
+        required checks = `Typecheck & Test`・`Meta Reviewer AI (Gemini)`**。
+        AI credentialからのmaster direct pushは**GH013「Changes must be made through a pull request」で
+        実際に拒否**され、`origin/master`は不変であることを非破壊probeで確認済み。
+        Ruleset Active化はCEOがWeb UIから人間操作で実施（AIからは行わない）。
+      - **(2) Gap A（trusted ALLOW evidence）= 完了**。`gate_evaluations`テーブルへGate評価を永続化し、
+        `approved_content_hash`（Canonical Change Manifest）と`resulting_commit`のauthoritative bindingを
+        実装済み。詳細は下記Gap A節を参照。
+      - **(3) Gap B（Actions用read-only credential）= 完了**。第3 credential class `ACTIONS_READONLY`
+        （`ACTIONS_READONLY_TOKEN_SHA256`）と`GET /api/gate-evaluations/verify-commit`を実装しProductionへdeploy済み。
+        GitHub Secret `AI_TEAM_ACTIONS_READONLY_TOKEN` と Repository Variable `AI_TEAM_API_BASE` も設定済み。
+        ただしGate Evidence Check自体は**Control Repositoryには適用対象外**のためrequiredにしない（下記参照）。
+
+      **本項目の残作業**: 上記3点が解決したため、GitHub外部強制境界は成立している。
+      Gate Evidence CheckのTarget Repo側への適用のみ保留（Target RepoのGitHub remote/push/PR対応待ち）。
 
       **GitHub外部強制境界の設計（2026-08-14追記。上記610-611行の「Cloudflare・GitHub等の
       credential」禁止方針を、Task→Job Full Automation解放条件として具体化するもの。read-only
