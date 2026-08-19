@@ -2,9 +2,17 @@ name: Gate Evidence Check
 
 # PRで追加される各commitが trusted resulting_commit かをAPIへ問い合わせて確認する。
 # 1つでも未trusted・API/auth error・曖昧ならFAIL CLOSEDにする。
-
+#
+# `pull_request_target` を使う理由:
+#   `pull_request` では同一repository内のPRでも**workflow定義がPR head側から読まれる**ため、
+#   PRがこのファイル自体を書き換えてACTIONS_READONLY secretを持ち出せてしまう。
+#   `pull_request_target` はworkflow定義をbase branch側に固定するのでその経路が塞がる。
+#
+#   `pull_request_target` の一般的な危険は「PR codeをcheckoutして実行すること」だが、
+#   このworkflowはPR head/merge commitのcheckout・download・script実行を**一切行わない**
+#   （PR metadataの取得とAPIへのread-only問い合わせだけで成立する）。
 on:
-  pull_request:
+  pull_request_target:
     branches: [master, main]
 
 # GITHUB_TOKENの権限を必要最小限へ明示する。
@@ -20,8 +28,8 @@ jobs:
 
     steps:
       # -------------------------------------------------------
-      # PR codeはcheckoutしない。依存導入もPR script実行も行わず、
-      # ACTIONS_READONLY secretをPR codeへ渡さない。
+      # PR head / merge commit のcheckout・download・script実行はしない。
+      # 依存導入も行わず、ACTIONS_READONLY secretをPR codeへ渡さない。
       # commit列挙はGitHub標準のREST APIだけで行う（新systemを作らない）。
       # -------------------------------------------------------
       - name: Verify every commit added by this PR
