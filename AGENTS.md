@@ -167,6 +167,11 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   - 本Policyは暫定運用ルールであり、**新Retry System / watchdog / Routerは実装しない**。
     将来Routerでは `OpenCode dispatch → progress check → bounded retry → degradation →
     model fallback` として自動化対象にする。
+  - **Delegation Wrapper（`scripts/delegate.sh`）**: PLがAIへ委任する際は本wrapperを使い、
+    委任開始と120秒後のreminderを1操作で完了する。reminderは時間経過を知らせるだけであり、
+    進捗判定・retry判断はPLが個別に行う。これは**運用保証であり機械強制ではない**
+    （wrapperを経由せず生のCLIを直接叩けばreminderは付かない）。
+    全AI delegationへの共通化は今後の課題として扱う。
 
 **Review Level 0〜3:** 変更内容はLevel 0（軽微・Codexのみ）/ Level 1（通常実装・Codex+Gemini postReview）/
 Level 2（中リスク・Claude計画+Gemini pre/postReview、必要ならChatGPT）/ Level 3（高リスク・Claude設計+
