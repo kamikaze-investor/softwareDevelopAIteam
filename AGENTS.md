@@ -65,7 +65,16 @@ Worker が `agentPrefix` を自動でセットするため、AI 側が手動で�
 | 役割 | 責務 | 最終判断権限 |
 |---|---|---|
 | **Codex** | 通常実装（上表参照）。危険箇所・設計判断が必要な変更を見つけたらClaude Codeへ上げる | なし |
-| **Claude Code** | 設計・進行計画・危険箇所実装（上表参照） | なし（自分の変更を最終承認しない） |
+| **Claude Code** | 設計・進行計画・危険箇所実装（上表参照） | なし（自分の変更を最終承認しない）※ |
+
+※ **「自己承認」の範囲**: ここで禁止しているのは、AIが自分の変更の可否を自分の判断だけで決めることである。
+GitHub Rulesetによりrequired checks（`Typecheck & Test` と、独立レビューである
+`Meta Reviewer AI (Gemini)`）が**外部強制**されている状態で、両方PASSした後にmergeを実行することは、
+判断ではなく**承認済み変更の機械的適用**であり自己承認に含まない。
+したがって次をすべて満たす通常変更は、AI側でmergeまで進めてよい:
+required checks PASS ／ 独立レビュー PASS ／ 新しいCEO判断事項なし ／ Goal・Design Philosophy変更なし。
+required checksを迂回するadmin merge、Rulesetの無効化・bypass・force pushは引き続き**禁止**。
+既存ルールで判断できない設計・方針・Authority判断が必要な場合だけCEOへエスカレーションする。
 | **Gemini** | 低コストなレビュー・監査レイヤー（Risk Review・Alignment Review・Meta Review・preReview・postReview・Report Translation）。単一の「判断担当」ではない | なし（warning/uncertain/blockedはClaude Code/ChatGPT/Humanへエスカレーション） |
 | **ChatGPT** | 重要判断・コミット前判断・人間向け整理（Gemini判断が不確実な場合・高リスク変更・コミット可否判断が必要な場合に使う） | 高リスクはCEO承認を要求 |
 | **Human / CEO** | Goal/Design Philosophy・外部サービス・課金・本番環境・認証権限・破壊的変更の最終判断 | 最終承認者 |
