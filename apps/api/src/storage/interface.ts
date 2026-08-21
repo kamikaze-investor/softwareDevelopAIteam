@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1 } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -38,6 +38,13 @@ export type UpdateWithOutboxEventResult =
       reason: string
     }
 
+export type PersistCommitSuccessWithContinuationResult =
+  | { ok: true; job: Job; continuation: TaskContinuation; deduplicated: boolean }
+  | {
+      ok: false
+      code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
+      reason: string
+    }
 export type PersistProviderTimeoutFailureResult =
   | {
       ok: true
@@ -188,6 +195,11 @@ export interface IJobStorage {
     queueDesignReview?: QueuedDesignReviewRunInput,
   ): UpdateWithOutboxEventResult
   /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
+  persistCommitSuccessWithContinuation(input: {
+    jobId: string
+    update: Partial<Job>
+    outboxEvent?: OutboxEventInput
+  }): PersistCommitSuccessWithContinuationResult
   persistProviderTimeoutFailure(input: {
     jobId: string
     update: Partial<Job>
@@ -522,6 +534,14 @@ export interface ISelfReflectionStorage {
   delete(id: string): boolean
 }
 
+export interface ITaskContinuationStorage {
+  findById(id: string): TaskContinuation | undefined
+  findBySourceJobId(sourceJobId: string): TaskContinuation | undefined
+  findByCompletedTaskId(completedTaskId: string): TaskContinuation | undefined
+  create(data: Omit<TaskContinuation, 'id' | 'createdAt' | 'completedAt'>): TaskContinuation
+  update(id: string, data: Partial<Pick<TaskContinuation, 'status' | 'error' | 'completedAt'>>): TaskContinuation | undefined
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -536,6 +556,7 @@ export interface IStorage {
   designReviewRuns: IDesignReviewRunStorage
   gateEvaluations: IGateEvaluationStorage
   auditLog: IAuditLogStorage
+  taskContinuations: ITaskContinuationStorage
   projectRoadmapPhases: IProjectRoadmapPhaseStorage
   knowledgeGraph: IKnowledgeGraphStorage
   decisionCache: IDecisionCacheStorage

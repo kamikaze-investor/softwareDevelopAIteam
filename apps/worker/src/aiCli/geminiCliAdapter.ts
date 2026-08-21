@@ -1,17 +1,7 @@
 /**
- * Gemini / Antigravity CLI Adapter
+ * Gemini CLI Adapter
  *
  * ⚠️ CONTROL REPOSITORY — AI編集禁止
- *
- * agy コマンド（Antigravity CLI）のラッパー。
- * Gemini CLI の後継ツール（Google I/O 2026 で発表）。
- *
- * 移行経緯:
- *   Gemini CLI（gemini コマンド）→ 2026-06-18 に停止
- *   Antigravity CLI（agy コマンド）→ 後継。Skills/Hooks は引き継ぎ可能。
- *
- * ⚠️ 非対話モードのフラグは `agy --help` で要確認。
- *    buildArgv() のフラグが旧 Gemini CLI のままになっている場合は修正すること。
  *
  * 用途:
  *   - Reviewer AI（Project Reviewer）
@@ -39,20 +29,14 @@ export class GeminiCliAdapter extends BaseCliAdapter {
   }
 
   protected defaultCliName(): string {
-    // Gemini CLI（gemini）→ Antigravity CLI（agy）に変更
-    // 2026-06-18 以降は gemini コマンドが使えなくなる
-    return 'agy'
+    return 'gemini'
   }
 
   protected buildArgv(request: AiCliRequest): string[] {
     const fullPrompt = MODE_PREFIXES[request.mode] + request.prompt
 
-    // TODO: Antigravity CLI（agy）の非対話モードのフラグを確認すること
-    //   確認コマンド: agy --help
-    //   旧 Gemini CLI は --prompt フラグを使っていたが、agy では変わっている可能性がある
-    //   公式ドキュメント: https://www.ai-souken.com/article/what-is-antigravity-cli
     return [
-      '--prompt', fullPrompt,
+      '-p', fullPrompt,
     ]
   }
 }

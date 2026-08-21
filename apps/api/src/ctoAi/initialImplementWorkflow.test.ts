@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow'
 import type { IStorage } from '../storage/interface'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 
 function alignedDeps() {
   return {
@@ -60,5 +61,21 @@ describe('initial implement workflow', () => {
     const result = await createInitialImplementWorkflow(storage, taskId, alignedDeps())
     expect(result).toMatchObject({ status: 'skipped', reason: 'project is unavailable' })
     expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
+  })
+  it('reuses matching ALIGNED evidence after a pre-Job crash without executing a new review', async () => {
+    const task = storage.tasks.findById(taskId)!
+    storage.designReviewEvidence.create({
+      taskId,
+      designTextHash: computeDesignTextHash(task.description),
+      reviewLoad: 'medium',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+    })
+
+    const result = await createInitialImplementWorkflow(storage, taskId, {
+      ...alignedDeps(),
+      execute: async () => { throw new Error('existing evidence must avoid a new Design Review') },
+    })
+    expect(result).toMatchObject({ status: 'created' })
   })
 })

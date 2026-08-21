@@ -314,6 +314,24 @@ export const CREATE_TABLES = `
     FOREIGN KEY (job_id) REFERENCES jobs(id)
   );
 
+  CREATE TABLE IF NOT EXISTS task_continuations (
+    id TEXT PRIMARY KEY,
+    source_job_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    completed_task_id TEXT NOT NULL,
+    next_task_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+    error TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (source_job_id) REFERENCES jobs(id),
+    FOREIGN KEY (completed_task_id) REFERENCES tasks(id),
+    FOREIGN KEY (next_task_id) REFERENCES tasks(id),
+    UNIQUE (source_job_id),
+    UNIQUE (completed_task_id)
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -380,4 +398,6 @@ export const INDEX_STATEMENTS: string[] = [
   // 同一commitへ複数のtrusted evidenceが曖昧にbindされないよう一意にする（NULLは対象外）。
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_gate_evaluations_resulting_commit ON gate_evaluations(resulting_commit) WHERE resulting_commit IS NOT NULL',
   'CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at ON design_review_runs(status, started_at)',
+  'CREATE INDEX IF NOT EXISTS ix_task_continuations_project ON task_continuations(project_id)',
+  'CREATE INDEX IF NOT EXISTS ix_task_continuations_completed ON task_continuations(completed_task_id)',
 ]
