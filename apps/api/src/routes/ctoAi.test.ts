@@ -419,6 +419,34 @@ describe('CTO AI — generate-roadmap API', () => {
     expect(storage.tasks.findById(removedTask.id)?.roadmapActive).toBe(true)
   })
 
+  it('does not start an initial workflow when Markdown saving fails after DB Task sync', async () => {
+    vi.doMock('../ctoAi/roadmapWriter.js', () => ({
+      writeRoadmap: () => { throw new Error('simulated Markdown write failure') },
+    }))
+    try {
+      const app = await buildApp()
+      const project = await createProject()
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/cto/generate-roadmap',
+        payload: {
+          projectId: project.id,
+          targetProjectRoot: tmpDir,
+          analysis: MOCK_ANALYSIS_OBJ,
+          mockResponse: MOCK_ROADMAP,
+        },
+      })
+
+      expect(res.statusCode).toBe(500)
+      const { getStorage } = await import('../storage/index.js')
+      const tasks = getStorage().tasks.findByProjectId(project.id)
+      expect(tasks).toHaveLength(1)
+      expect(getStorage().jobs.findByTaskId(tasks[0].id)).toHaveLength(0)
+    } finally {
+      vi.doUnmock('../ctoAi/roadmapWriter.js')
+    }
+  })
+
   it('POST /api/cto/generate-roadmap returns 409 with conflicts for started task spec changes', async () => {
     const app = await buildApp()
     const project = await createProject()
