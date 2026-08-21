@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# MVP: Load GEMINI_API_KEY from the repository-local .env when it is not
+# already supplied by the parent process. Do not print the secret value.
+if [ -z "${GEMINI_API_KEY:-}" ] && [ -f "$REPO_ROOT/.env" ]; then
+  GEMINI_API_KEY="$(
+    sed -n 's/^GEMINI_API_KEY=//p' "$REPO_ROOT/.env" | head -n 1
+  )"
+  GEMINI_API_KEY="${GEMINI_API_KEY%\"}"
+  GEMINI_API_KEY="${GEMINI_API_KEY#\"}"
+  GEMINI_API_KEY="${GEMINI_API_KEY%\'}"
+  GEMINI_API_KEY="${GEMINI_API_KEY#\'}"
+  export GEMINI_API_KEY
+fi
+
 if [ $# -lt 4 ]; then
   echo "Usage: $0 <run_dir> <model> <log> <prompt>" >&2
   exit 1
@@ -10,14 +26,25 @@ RUN_DIR="$1"
 MODEL="$2"
 LOG="$3"
 PROMPT="$4"
+OPENCODE_BIN="${DELEGATION_OPENCODE_BIN:-./node_modules/.bin/opencode}"
 
-sleep 120
+WATCHDOG_DELAY_SECONDS="${DELEGATION_WATCHDOG_DELAY_SECONDS:-120}"
+sleep "$WATCHDOG_DELAY_SECONDS"
 
 PID=$(cat "$RUN_DIR/pid")
 ATTEMPT=$(cat "$RUN_DIR/attempt")
 
 ALIVE="dead"
 kill -0 "$PID" 2>/dev/null && ALIVE="alive" || true
+
+PID_IS_OPENCODE="not_applicable"
+if [ "$ALIVE" = "alive" ]; then
+  PID_COMMAND=$(ps -p "$PID" -o args= 2>/dev/null || echo "")
+  case "$PID_COMMAND" in
+    *opencode*run*) PID_IS_OPENCODE="yes" ;;
+    *) PID_IS_OPENCODE="no" ;;
+  esac
+fi
 
 SIZE=$(wc -c < "$LOG" 2>/dev/null || echo 0)
 
@@ -31,15 +58,20 @@ fi
 
 TAIL=$(tail -c 2000 "$LOG" 2>/dev/null | head -n 30 || echo "")
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GEMINI_API_KEY=$(grep -m1 '^GEMINI_API_KEY=' "$REPO_ROOT/.env" | cut -d= -f2- | tr -d '\\"')
-
-JUDGE_PROMPT="model=$MODEL attempt=$ATTEMPT alive=$ALIVE size=$SIZE idle=${IDLE}s
+JUDGE_PROMPT="model=$MODEL attempt=$ATTEMPT alive=$ALIVE pid_is_opencode=$PID_IS_OPENCODE size=$SIZE idle=${IDLE}s
 tail:
 $TAIL
 
 Reply with exactly one word: RUNNING, STALLED_RETRYABLE, FAILED_NON_RETRYABLE, COMPLETED, or UNCERTAIN.
-Use FAILED_NON_RETRYABLE for auth failure, quota exceeded, or permission denied since retrying the same prompt will not help."
+Use FAILED_NON_RETRYABLE for auth failure, quota exceeded, or permission denied since retrying the same prompt will not help.
+Even when the process is dead, use COMPLETED if the log clearly contains a successful completion or final result.
+Use UNCERTAIN when completion is plausible but not clear.
+Use STALLED_RETRYABLE only when there is no completion evidence and the supplied state gives a concrete reason that retrying the same prompt is likely to help."
+
+if [ -z "${GEMINI_API_KEY:-}" ]; then
+  echo "ESCALATE:uncertain" > "$RUN_DIR/verdict"
+  exit 0
+fi
 
 # Build Gemini request JSON with Node.js to avoid a jq dependency.
 BODY=$(JUDGE_PROMPT="$JUDGE_PROMPT" node -e '
@@ -99,15 +131,29 @@ case "$VERDICT" in
       exit 0
     fi
 
-    kill "$PID" 2>/dev/null || true
-    sleep 1
+    if [ "$ALIVE" = "alive" ]; then
+      # Re-check immediately before kill to reduce the chance of signalling a reused PID.
+      CURRENT_COMMAND=$(ps -p "$PID" -o args= 2>/dev/null || echo "")
+      case "$CURRENT_COMMAND" in
+        *opencode*run*) kill "$PID" 2>/dev/null || true ;;
+        *)
+          echo "ESCALATE:uncertain" > "$RUN_DIR/verdict"
+          exit 0
+          ;;
+      esac
+      sleep 1
+    fi
 
-    nohup ./node_modules/.bin/opencode run "$PROMPT" -m "$MODEL" --dir "$(pwd)" > "$LOG" 2>&1 &
+    NEXT_ATTEMPT=$(( ATTEMPT + 1 ))
+    BASE_LOG=$(cat "$RUN_DIR/base_log" 2>/dev/null || echo "$LOG")
+    NEXT_LOG="${BASE_LOG}.attempt-${NEXT_ATTEMPT}"
+    nohup "$OPENCODE_BIN" run "$PROMPT" -m "$MODEL" --dir "$(pwd)" > "$NEXT_LOG" 2>&1 &
     NEW_PID=$!
     echo "$NEW_PID" > "$RUN_DIR/pid"
-    echo "$(( ATTEMPT + 1 ))" > "$RUN_DIR/attempt"
+    echo "$NEXT_ATTEMPT" > "$RUN_DIR/attempt"
+    echo "$NEXT_LOG" > "$RUN_DIR/current_log"
 
-    nohup bash scripts/delegate-watchdog.sh "$RUN_DIR" "$MODEL" "$LOG" "$PROMPT" >> "$RUN_DIR/watchdog.log" 2>&1 &
+    nohup bash "$SCRIPT_DIR/delegate-watchdog.sh" "$RUN_DIR" "$MODEL" "$NEXT_LOG" "$PROMPT" >> "$RUN_DIR/watchdog.log" 2>&1 &
     exit 0
     ;;
 esac
