@@ -16,6 +16,7 @@ import { writeRoadmap } from '../ctoAi/roadmapWriter.js'
 import { getStorage } from '../storage'
 import { validateRoadmapTasks, validateRoadmapPhases, type RoadmapSyncTaskInput, type RoadmapSyncPhaseInput } from '../storage/roadmapTaskValidation'
 import { validateTargetRoot } from '../utils/pathGuard.js'
+import { createInitialImplementWorkflow } from '../ctoAi/initialImplementWorkflow.js'
 
 const CONFIGURED_TARGET_ROOT = process.env.TARGET_ROOT ?? '/workspace/target'
 
@@ -192,6 +193,12 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
       // 2. target-project に書き出し（人間向けsnapshot。正本はDB）
       const writeResult = writeRoadmap(roadmap, targetProjectRoot)
 
+      // DB同期とMarkdown保存が両方成功した後だけ、初回workflowへ投入する。
+      // 公開Job APIを経由せず、workflowStepKeyは内部producerだけが所有する。
+      const initialWorkflow = await Promise.all(
+        syncResult.createdTaskIds.map((taskId) => createInitialImplementWorkflow(storage, taskId)),
+      )
+
       return reply.status(201).send({
         status: 'roadmap_generated',
         totalTasks: roadmap.totalTasks,
@@ -207,6 +214,7 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
           phasesReactivated: syncResult.reactivatedPhaseNumbers.length,
           phasesDeactivated: syncResult.deactivatedPhaseNumbers.length,
         },
+        initialWorkflow,
         writtenFiles: writeResult.writtenFiles,
         targetDir: writeResult.targetDir,
         roadmap,

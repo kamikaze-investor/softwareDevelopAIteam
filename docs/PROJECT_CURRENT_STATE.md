@@ -180,6 +180,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 **完了項目:**
 - **Step 0: データモデル整合（完了）**
 - **ロードマップ→Taskレコード自動生成（完了）**
+- **Worker安全境界・結果引き渡し設計**
+- **Worker永続Outbox・結果受信基盤**
 - **本体DB安全・復旧基盤**
 - **Project別Roadmap可視化**
 - **Meta Review MVP Hardening
@@ -189,9 +191,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - 再実行・追加指示UI（Mobile）
 
 **未完了・保留項目:**
-- **Worker安全境界・結果引き渡し設計**（state: in_progress）
-- **Worker永続Outbox・結果受信基盤**（state: in_progress）
-- **Task→Job自動生成と連続実行**（state: blocked）
+- **Task→Job自動生成と連続実行**（state: in_progress）
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
@@ -568,11 +568,15 @@ pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
 
 ### P1: 早期対応が望ましい
 
-| タスク | 理由 | 担当 |
-|---|---|---|
-| **スマホからの開発指示（Task作成）フローの調査・設計・実装** | スマホ操作MVPの現在の主要実装残タスク。Task/Job一覧・詳細UI・Approval Gate連携・再実行/追加指示UIは完了済みで、Project内にTaskを追加する導線のみ未実装。Task作成後の初回Job起動方法を既存経路（CTO AI/Developer AI Orchestrator等）から調査したうえで実装方針を決める | Claude Code |
-| **Context Manager 連携（contextFiles 拡張）** | AI CLI の `contextFiles` が現在 `[]` 固定。Context Manager AI が ContextPack を生成して渡すことで AI の実装精度が向上する | Claude Code |
-| **postTestHook.ps1 正式設計** | ローカル開発時の Meta Review 自動実行を正式経路で再設計。現状は `exit 0` のみで機能停止中 | Claude Code |
+現在、スマホ操作MVPの必須5項目はすべて完了しており、新規のP1実装はない。
+
+追加開発指示（追加Task作成）画面は、`apps/mobile/app/tasks/create.tsx` と
+`apps/mobile/app/index.tsx` の既存導線で実装済みである。`POST /api/tasks` はTaskのみを作成し、
+Task作成直後にMobileからimplementation Jobを直接作成する経路は追加しない。implementation Jobは
+既存のpre-implementation Design Review evidence Gateを満たす必要があり、このGateを迂回する変更は
+スマホ操作MVPの範囲外である。
+
+実際の未完了・保留項目と状態は、`tasks/roadmap.md` のroadmap metadataを正本とする。
 
 ### P2: 中期対応
 

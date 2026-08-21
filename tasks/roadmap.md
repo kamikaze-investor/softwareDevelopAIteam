@@ -373,8 +373,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       DB Task同期とMarkdown保存の両方が成功するまでJobを作らない／Markdown保存失敗時はJobを作らない／
       再実行時、履歴のあるTaskの仕様変更は本Stepの実装どおり409で拒否する／
       未着手Taskは冪等に再同期できる
-<!-- roadmap:id=project-auto-worker-trust-boundary state=in_progress -->
-3. [ ] **Worker安全境界・結果引き渡し設計** — 自動連続実行を実装する前に、信頼境界を確定する
+<!-- roadmap:id=project-auto-worker-trust-boundary state=done -->
+3. [x] **Worker安全境界・結果引き渡し設計** — 自動連続実行を実装する前に、信頼境界を確定する
       設計項目（実装を伴わない）。**基本方針**: AI CLI実行プロセスには本体DBファイル・DB認証情報・
       管理APIトークンを渡さない／Workerにも本体DBファイルをマウントせず任意のDB操作を許可しない／
       **本体DBを書き込めるのはAPIだけ**とする／Task状態更新と次Job生成はAPI側の冪等な進行管理で行う／
@@ -919,8 +919,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **Design Review trust blocker**: 将来design-reviewをWorker自動実行へ組み込む場合の
       trusted evidence問題は未解決のまま`project-auto-task-job-chain`側へblockerとして
       明記した（本項目へ内容を複製しない）
-<!-- roadmap:id=project-auto-worker-outbox state=in_progress -->
-4. [ ] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
+<!-- roadmap:id=project-auto-worker-outbox state=done -->
+4. [x] **Worker永続Outbox・結果受信基盤** — 依存: `project-auto-worker-trust-boundary`。
       **着手条件**: Worker安全境界設計で、Outboxへ結果を書き込む接続口が承認済みであること。
       保護対象変更が必要な場合は、実装前にCEOが具体的な差分を承認すること。
       保護対象ルールを包括的に緩和しないこと。
@@ -1060,7 +1060,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       確認可能（2026-08-14 Expo Go実機smokeでCEO確認済み）／inactive旧Phase/Taskが現在Roadmap表示
       へ混ざらないこと（実機確認済み）／既存Task Roadmap同期を壊さない（既存test全件regression
       なし）／新規Milestone/versioning/generic planning systemなし
-<!-- roadmap:id=project-auto-task-job-chain state=blocked -->
+<!-- roadmap:id=project-auto-task-job-chain state=in_progress -->
 7. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
       `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。
       **加えて、GitHub外部強制境界（`project-auto-worker-trust-boundary`参照）が完成するまで、
@@ -1653,6 +1653,24 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 `specs/13_future_system_architecture.md` 5b-7-9を参照。
 
 - [ ] Extension Registry正式化・Service Extension Interface定義（Telemetry/Notification/Knowledge等の抽象化）
+- [ ] Technology Sourcing / OSS Reuse Team MVP（Shared Expert Team / on-demand）
+      `specs/14_technology_sourcing_oss_reuse_team.md`を正本とする。Extension Registry正式化と
+      Team Extension境界を前提に、Capability Request/Registry lookup、Lightweight Scout、Static Filter、
+      Security Preflight、Disposable Trial、Reuse Gate、OSS Registry、Capability Registry、Adapter、
+      Contract Test、Exit Strategyを最小構成で実装する。**Learning / Evolution Coreの完成は前提にしない。**
+      `Experience` / `Prediction` / `Actual`は後続Coreへ接続可能な形式で保存するが、独自Learning Engineは
+      実装しない。Production導入・Secret利用・課金・Security最終承認は既存Gateを迂回しない。
+- [ ] Company共通 Learning / Evolution Core（Development / OSSの共通化）
+      `specs/13_future_system_architecture.md` 5cを正本とする。既存のSelf Diagnosis、Improvement Planner、
+      Investigate、Experiment、Evolutionの責務を維持したまま、共通Experience、Prediction vs Actual、
+      Lesson Candidate、Evidence/Confidence、Policy Proposal、Namespace、Versioning、Rollback、
+      `development` / `oss_sourcing` Learning Profileを統合する。Operationalizeは既存Proposal Lifecycleと
+      CEO明示承認を毎回必要とし、低リスクを含めPolicyの自動適用は行わない。
+- [ ] Team別 Learning Profile展開
+      Learning / Evolution Core完成後にEvaluation、Security、Marketing等へProfileを追加する。Team固有の
+      Metrics、Evidence threshold、Critical condition、Feedback timing、Policy targetをProfileとして定義し、
+      独自Learning Engineを増やさない。Team LessonのCompany Lesson昇格はCross-domain validationを要し、
+      自動全社適用をしない。
 - [ ] Development TeamのTeam Extension化（現状はClaude Code/Codex/Geminiが`apps/worker`に直接組み込まれた
       単一構成。将来的にTeam概念として抽象化するかは要検討）
 - [ ] Team Health（Team単位の状態可視化。現状のProject単位health-scoreとは別軸。actor・
