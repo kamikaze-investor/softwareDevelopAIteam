@@ -12,6 +12,7 @@ import {
 } from '../jobResultApplicationPolicy'
 import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from '../designReview/repairFlow'
 import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
+import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
 
 const AgentRoleSchema = z.enum([
   'cto_ai',
@@ -494,6 +495,45 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(500).send({ error: 'Failed to advance Job workflow' })
       }
       return reply.send(outboxResponse(transition.job, outboxEvent, transition.deduplicated === true))
+    }
+
+    // git_commit success is the sole Task-chain handoff trigger. The storage transaction
+    // persists the result, current Task completion, and continuation before any async Review.
+    const isCommitContinuationResult =
+      existing.safeCommand.kind === 'git_commit' &&
+      jobUpdate.status === 'success'
+    if (isCommitContinuationResult) {
+      const persisted = storage.jobs.persistCommitSuccessWithContinuation({
+        jobId: existing.id,
+        update: jobUpdate,
+        outboxEvent,
+      })
+      if (!persisted.ok) {
+        if (persisted.code === 'OUTBOX_HASH_MISMATCH') {
+          return reply.status(409).send({ error: persisted.reason })
+        }
+        return reply.status(persisted.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: persisted.reason })
+      }
+
+      if (!persisted.deduplicated && existing.status !== 'success') {
+        try {
+          bindResultingCommitForJob(
+            storage,
+            { jobId: existing.id, workingDir: existing.safeCommand.workingDir ?? TARGET_WORKING_DIR },
+            req.log,
+          )
+        } catch (error: unknown) {
+          req.log.error({ jobId: existing.id, err: error }, 'resulting commit binding raised an unexpected error')
+        }
+      }
+
+      if (persisted.continuation.status === 'pending') {
+        void ensureTaskContinuation(storage, persisted.continuation.id)
+          .catch((error) => req.log.error({ err: error, continuationId: persisted.continuation.id }, 'task continuation failed'))
+        // Do not block this PATCH on a Design Review. Non-2xx keeps the Worker Outbox event durable.
+        return reply.status(503).send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
+      }
+      return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
     }
 
     // git_commit Jobが成功したら、そのJobのGate ALLOW evidenceへresulting commitをbindする。

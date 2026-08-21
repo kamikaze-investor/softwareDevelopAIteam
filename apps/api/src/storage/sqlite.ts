@@ -13,6 +13,8 @@ import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
+import type { TaskContinuation } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
@@ -55,6 +57,22 @@ export class RoadmapTaskConflictError extends Error {
 }
 
 const now = () => new Date().toISOString()
+
+function selectNextContinuableTask(tasks: Task[]): Task | undefined {
+  const byId = new Map(tasks.map((task) => [task.id, task]))
+  return tasks
+    .filter((task) => (
+      task.roadmapActive &&
+      task.status === 'pending' &&
+      task.assignee === 'developer_ai' &&
+      task.dependencies.every((dependencyId) => byId.get(dependencyId)?.status === 'done')
+    ))
+    .sort((left, right) => (
+      (left.phase ?? Number.MAX_SAFE_INTEGER) - (right.phase ?? Number.MAX_SAFE_INTEGER) ||
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.id.localeCompare(right.id)
+    ))[0]
+}
 
 const PersistedTaskFailureExplanationV1Schema = z.object({
   schemaVersion: z.literal(1),
@@ -242,9 +260,9 @@ function collectRoadmapTaskSpecConflicts(
   return conflicts
 }
 
-/** Task.status='pending' かつ Job履歴が一切無いTaskのみ「未着手」とみなす（collectRoadmapTaskSpecConflictsのspecLockedと同一定義） */
+/** pending Taskのqueued Jobは未実行であり、Phase metadataをlockしない。 */
 function isTaskStarted(task: Task, jobsByTaskId: Map<string, Job[]>): boolean {
-  const hasJobHistory = (jobsByTaskId.get(task.id) ?? []).length > 0
+  const hasJobHistory = (jobsByTaskId.get(task.id) ?? []).some((job) => job.status !== 'queued')
   return hasJobHistory || task.status !== 'pending'
 }
 
@@ -1039,6 +1057,68 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
       }
     },
+    persistCommitSuccessWithContinuation(input) {
+      const persistTransaction = db.transaction((): PersistCommitSuccessWithContinuationResult => {
+        const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
+        if (dedup.status === 'conflict') {
+          return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        }
+
+        const source = jobs.findById(input.jobId)
+        if (!source) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+
+        if (dedup.status === 'deduplicated') {
+          const continuation = taskContinuations.findBySourceJobId(input.jobId)
+          if (!continuation) {
+            return { ok: false, code: 'STORAGE_ERROR', reason: 'Applied commit result is missing its continuation' }
+          }
+          return { ok: true, job: source, continuation, deduplicated: true }
+        }
+
+        const sourceTask = tasks.findById(source.taskId)
+        if (!sourceTask) {
+          return { ok: false, code: 'STORAGE_ERROR', reason: 'Source Task not found' }
+        }
+
+        const updated = jobs.update(input.jobId, input.update)
+        if (!updated) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+        recordOutboxEvent(db, input.jobId, input.outboxEvent)
+
+        if (sourceTask.status !== 'done') {
+          tasks.update(sourceTask.id, { status: 'done' })
+        }
+
+        const project = projects.findById(sourceTask.projectId)
+        const nextTask = project?.status === 'archived'
+          ? undefined
+          : selectNextContinuableTask(tasks.findByProjectId(sourceTask.projectId))
+        const continuation = taskContinuations.findByCompletedTaskId(sourceTask.id)
+          ?? taskContinuations.create({
+            sourceJobId: source.id,
+            projectId: sourceTask.projectId,
+            completedTaskId: sourceTask.id,
+            nextTaskId: nextTask?.id,
+            status: nextTask ? 'pending' : 'completed',
+          })
+
+        return { ok: true, job: updated, continuation, deduplicated: false }
+      })
+
+      try {
+        return persistTransaction()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+
     persistProviderTimeoutFailure(input) {
       const persistTransaction = db.transaction((): PersistProviderTimeoutFailureResult => {
         const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
@@ -2340,6 +2420,57 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  const taskContinuations: ITaskContinuationStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM task_continuations WHERE id = ?').get(id) as any
+      return row ? deserializeTaskContinuation(row) : undefined
+    },
+    findBySourceJobId(sourceJobId) {
+      const row = db.prepare(
+        'SELECT * FROM task_continuations WHERE source_job_id = ?'
+      ).get(sourceJobId) as any
+      return row ? deserializeTaskContinuation(row) : undefined
+    },
+    findByCompletedTaskId(completedTaskId) {
+      const row = db.prepare(
+        'SELECT * FROM task_continuations WHERE completed_task_id = ?'
+      ).get(completedTaskId) as any
+      return row ? deserializeTaskContinuation(row) : undefined
+    },
+    create(data) {
+      const continuation: TaskContinuation = {
+        ...data,
+        id: randomUUID(),
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO task_continuations
+          (id, source_job_id, project_id, completed_task_id, next_task_id, status, error, created_at, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        continuation.id,
+        continuation.sourceJobId,
+        continuation.projectId,
+        continuation.completedTaskId,
+        continuation.nextTaskId ?? null,
+        continuation.status,
+        continuation.error ?? null,
+        continuation.createdAt,
+        continuation.completedAt ?? null,
+      )
+      return continuation
+    },
+    update(id, data) {
+      const existing = taskContinuations.findById(id)
+      if (!existing) return undefined
+      const updated: TaskContinuation = { ...existing, ...data }
+      db.prepare(
+        'UPDATE task_continuations SET status = ?, error = ?, completed_at = ? WHERE id = ?'
+      ).run(updated.status, updated.error ?? null, updated.completedAt ?? null, id)
+      return updated
+    },
+  }
+
   const auditLog: IAuditLogStorage = {
     findByEntity(entityType, entityId) {
       const rows = db.prepare(
@@ -2863,7 +2994,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, gateEvaluations, auditLog, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, gateEvaluations, auditLog, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
 }
 
 function deserializeProject(row: any): Project {
@@ -3093,6 +3224,20 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
     error: row.error ?? undefined,
     createdAt: row.created_at,
     startedAt: row.started_at ?? undefined,
+    completedAt: row.completed_at ?? undefined,
+  }
+}
+
+function deserializeTaskContinuation(row: any): TaskContinuation {
+  return {
+    id: row.id,
+    sourceJobId: row.source_job_id,
+    projectId: row.project_id,
+    completedTaskId: row.completed_task_id,
+    nextTaskId: row.next_task_id ?? undefined,
+    status: row.status as TaskContinuation['status'],
+    error: row.error ?? undefined,
+    createdAt: row.created_at,
     completedAt: row.completed_at ?? undefined,
   }
 }

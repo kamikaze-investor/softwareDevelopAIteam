@@ -471,7 +471,11 @@ function buildSafeEnv(provider: AiCliProvider): NodeJS.ProcessEnv {
     case 'claude_code':
       return { ...base, ANTHROPIC_API_KEY: process.env.CLAUDE_API_KEY }
     case 'gemini':
-      return { ...base, GEMINI_API_KEY: process.env.GEMINI_API_KEY }
+      return {
+        ...base,
+        GEMINI_API_KEY: process.env.GEMINI_API_KEY,
+        GEMINI_CLI_TRUST_WORKSPACE: 'true',
+      }
     case 'codex':
       return { ...base, OPENAI_API_KEY: process.env.OPENAI_API_KEY }
   }

@@ -10,7 +10,7 @@ import type { IStorage } from '../storage/interface'
 
 export type InitialImplementWorkflowResult =
   | { taskId: string; status: 'created'; job: Job }
-  | { taskId: string; status: 'skipped'; reason: string }
+  | { taskId: string; status: 'skipped'; reason: string; retryable?: boolean }
 
 function initialWorkflowStepKey(taskId: string): string {
   return `task:${taskId}:initial-implement`
@@ -41,18 +41,8 @@ export async function createInitialImplementWorkflow(
     return { taskId, status: 'skipped', reason: 'initial workflow job already exists' }
   }
 
-  const review = await createAndExecuteDesignReview(storage, {
-    taskId: task.id,
-    taskTitle: task.title,
-    designText: task.description,
-    changedFiles: [],
-  }, deps)
-  if (review.status !== 'evidence_registered') {
-    return { taskId, status: 'skipped', reason: `design review did not align (${review.status})` }
-  }
-
-  // coordinatorが保存したevidenceはtask.descriptionのhashに対して作られている。
-  // 既存Job Gateを明示的に再利用し、想定外のcoordinator結果ではfail-closedにする。
+  // Job Gateは常に実行する。すでに同一Task・同一prompt hashのALIGNED evidenceがあれば、
+  // crash/replay時にReviewを再実行せずそのevidenceを再利用する。
   const jobInput: Omit<Job, 'id' | 'createdAt'> = {
     taskId: task.id,
     projectId: task.projectId,
@@ -64,7 +54,24 @@ export async function createInitialImplementWorkflow(
     aiCliPrompt: task.description,
     aiCliMode: 'implement',
   }
-  const gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
+  let gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
+  if (!gate.ok) {
+    const review = await createAndExecuteDesignReview(storage, {
+      taskId: task.id,
+      taskTitle: task.title,
+      designText: task.description,
+      changedFiles: [],
+    }, deps)
+    if (review.status !== 'evidence_registered') {
+      return {
+        taskId,
+        status: 'skipped',
+        reason: `design review did not align (${review.status})`,
+        retryable: review.status === 'requeued' || review.status === 'not_claimable' || review.status === 'stale',
+      }
+    }
+    gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
+  }
   if (!gate.ok) return { taskId, status: 'skipped', reason: gate.reason }
 
   try {
