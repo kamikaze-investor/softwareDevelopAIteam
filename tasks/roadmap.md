@@ -1060,8 +1060,22 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       確認可能（2026-08-14 Expo Go実機smokeでCEO確認済み）／inactive旧Phase/Taskが現在Roadmap表示
       へ混ざらないこと（実機確認済み）／既存Task Roadmap同期を壊さない（既存test全件regression
       なし）／新規Milestone/versioning/generic planning systemなし
-<!-- roadmap:id=project-auto-task-job-chain state=in_progress -->
-7. [ ] **Task→Job自動生成と連続実行** — 依存: `project-auto-worker-outbox` と
+<!-- roadmap:id=project-auto-task-job-chain state=done -->
+7. [x] **Task→Job自動生成と連続実行** — 完了（PR #15 / #16、master `d4d4fa8`）。
+      (a) はroadmap Task同期・Markdown保存・既存Design Review Gate通過後に
+      `task:<taskId>:initial-implement` を生成する。 (b) は`git_commit` successを
+      Task `done` と`task_continuations`のpending handoffへ同一transactionで永続化し、
+      replay-safeに次Taskのinitial workflowを起動する。crash-window deterministic testsは5/5 PASS。
+      新規Queue / Scheduler / Gateは追加していない。
+
+      **runtime follow-up（MVP blockerではない）**: 実Worker runtimeが提供された時点で、
+      live「1 Task完了 → 次Task開始」E2Eを1回だけ確認する。Gemini adapterについても同時に、
+      PLの手動trust指定なしでrepository内ファイルをread-only取得できることを1回だけ確認する。
+      これらの確認のためだけにcontainer・compose・runtimeを新設しない。
+
+      **以下は実装前の設計調査履歴**: 実装済み範囲と矛盾する着手不可・不足範囲の記述は、
+      上記の完了状態に置き換えられている。
+      依存: `project-auto-worker-outbox` と
       `project-auto-db-safety` の**両方**。安全基盤が未完成のため実装項目としては着手不可。
       **加えて、GitHub外部強制境界（`project-auto-worker-trust-boundary`参照）が完成するまで、
       自律的なgit push/mergeを解放しない**（詳細は同項目参照。本項目へ内容を複製しない）。

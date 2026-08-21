@@ -1,7 +1,7 @@
 # Project Current State Map
 
 **作成日**: 2026-06-19
-**最終更新**: 2026-07-02
+**最終更新**: 2026-08-22
 **作成者**: Claude Code (CTO)
 **目的**: リポジトリの現状を一枚で把握するためのスナップショット
 
@@ -69,10 +69,11 @@ positive observation待ち**。人工Job・人工failureはProductionで作ら�
 API側Result State Application Policy）はdeploy済みでdeterministic test検証も完了しており、
 残るのはproduction上のpositive observationのみ。ただしProductionは
 running/queued Job 0件・最新Job作成が2026-08-11で、9日間Jobが発生していない。
-Task→Job自動生成（`project-auto-task-job-chain`）がblockedのため、Jobは
-`POST /api/jobs`かTask resumeからしか作られず、**実運用でTaskが投入されない限り
-観測機会は発生しない**。CEOが次にProductionで実タスクを流すタイミングで、
-API停止ウィンドウ手順を実行して観測する。
+Task→Job自動生成と連続実行（`project-auto-task-job-chain`）はPR #15 / #16でmaster
+`d4d4fa8`へ実装・merge済みである。`task_continuations`によるTask間durable continuationと、
+crash-window deterministic tests 5/5 PASSを確認済み。実Worker runtimeが提供された時点で、
+live「1 Task完了 → 次Task開始」E2Eを1回だけ確認する。この確認のためだけにcontainer・compose・runtimeは
+新設しない。これは現時点のMVP blockerではない。
 
 ---
 
@@ -153,6 +154,8 @@ rollback互換も事前検証済み: baseline `9e41062`のコードがmigration�
 | Notification | `apps/worker/src/notifier/{notifier,lineAdapter,slackAdapter}.ts` | 実装済み・テストあり |
 | health-score | `apps/api/src/routes/knowledgeGraph.ts`（`GET /kg/health-score`）、`packages/shared/src/types/project.ts`の`healthScore` | 実装済み・テストあり |
 | Watchdog | `apps/worker/src/watchdog/{watchdog,stallDetector}.ts` | 実装済み・テストあり |
+| Task→Job自動生成と連続実行 | `apps/api/src/ctoAi/{initialImplementWorkflow,taskContinuation}.ts` | 実装済み・PR #15 / #16 merge・crash-window tests 5/5 PASS |
+| Gemini CLI adapter | `apps/worker/src/aiCli/geminiCliAdapter.ts`, `adapter.ts` | 最小実装完了（API/CLI疎通・adapter単体test・Worker typecheck確認済み） |
 | stale / expired approval cleanup | `apps/api/src/routes/{approvalGate,approvals}.ts`, `apps/worker/src/guards/{gateClient,gatePolicy}.ts`, `apps/worker/src/jobStateManager.ts` | 実装済み・テストあり |
 | Mobile app | `apps/mobile/app/{index,create,approvals}.tsx` | 実装済み |
 | Project作成画面（`create.tsx`） | 名前・Goal・Design Philosophy入力 | 実装済み |
@@ -160,6 +163,11 @@ rollback互換も事前検証済み: baseline `9e41062`のコードがmigration�
 | 下部フッター固定表示 | `apps/mobile/app/index.tsx`（`6b8eff3`） | 実機確認済み |
 | Expo app config | `apps/mobile/app.json`（`9b3121c`） | 実機確認済み |
 | 既存テスト群 | `apps/**/*.test.ts`（52ファイル） | 全パス確認済み |
+
+**Runtime E2E follow-up（MVP blockerではない）**: 実Worker runtimeが実際に提供された時点で、
+Gemini adapterがPLの手動trust指定なしにrepository内ファイルをread-only取得できること、および
+live「1 Task完了 → 次Task開始」を各1回だけ確認する。これらの確認のためだけにcontainer・compose・runtimeは
+新設しない。
 
 **将来構想との関係**: 添付仕様（`specs/00_constitution.md`ほか）が定義するTeam Extension / Service Extension / Health Engine /
 Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記いずれの機能も置き換えるものではない。
@@ -184,6 +192,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Worker永続Outbox・結果受信基盤**
 - **本体DB安全・復旧基盤**
 - **Project別Roadmap可視化**
+- **Task→Job自動生成と連続実行**
 - **Meta Review MVP Hardening
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
@@ -191,7 +200,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - 再実行・追加指示UI（Mobile）
 
 **未完了・保留項目:**
-- **Task→Job自動生成と連続実行**（state: in_progress）
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
