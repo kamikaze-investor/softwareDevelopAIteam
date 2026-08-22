@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify'
+import type { ProjectRoadmapCompletion, Task } from '@ai-team/shared'
 import { z } from 'zod'
 import { getStorage } from '../storage'
 import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
@@ -18,6 +19,17 @@ const UpdateProjectBody = z.object({
   designPhilosophy: z.array(z.string()).optional(),
   status: ProjectStatusSchema.optional(),
 }).strict()
+
+function getRoadmapCompletion(tasks: Task[]): ProjectRoadmapCompletion {
+  const activeTasks = tasks.filter((task) => task.roadmapActive)
+  const completedTaskCount = activeTasks.filter((task) => task.status === 'done').length
+
+  return {
+    completedTaskCount,
+    isComplete: activeTasks.length > 0 && completedTaskCount === activeTasks.length,
+    totalTaskCount: activeTasks.length,
+  }
+}
 
 export async function projectRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
@@ -45,7 +57,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const activePhases = storage.projectRoadmapPhases
       .findByProjectId(req.params.id)
       .filter((phase) => phase.roadmapActive)
-    return reply.send({ phases: activePhases })
+    const completion = getRoadmapCompletion(storage.tasks.findByProjectId(req.params.id))
+    return reply.send({ phases: activePhases, completion })
   })
 
   app.post('/', async (req, reply) => {

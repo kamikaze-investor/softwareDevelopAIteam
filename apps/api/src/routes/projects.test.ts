@@ -1,7 +1,7 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Approval, ApprovalType, JobStatus, Project } from '@ai-team/shared'
+import type { Approval, ApprovalType, JobStatus, Project, ProjectRoadmapCompletion } from '@ai-team/shared'
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { approvalRoutes }, { resetStorage }] = await Promise.all([
@@ -156,10 +156,61 @@ describe('Project API', () => {
       const res = await app.inject({ method: 'GET', url: `/api/projects/${created.id}/roadmap` })
 
       expect(res.statusCode).toBe(200)
-      const body = parseBody<{ phases: Array<{ phaseNumber: number; name: string }> }>(res.body)
+      const body = parseBody<{ completion: ProjectRoadmapCompletion; phases: Array<{ phaseNumber: number; name: string }> }>(res.body)
       expect(body.phases).toEqual([
         expect.objectContaining({ phaseNumber: 1, name: 'First', roadmapActive: true }),
       ])
+      expect(body.completion).toEqual({ completedTaskCount: 0, isComplete: false, totalTaskCount: 1 })
+    })
+  })
+
+  it('GET /api/projects/:id/roadmap derives completion from active roadmap tasks only', async () => {
+    await withApp(async (app) => {
+      const completed = await createProject(app, { name: 'Completed', goal: 'g' })
+      const incomplete = await createProject(app, { name: 'Incomplete', goal: 'g' })
+      const noRoadmap = await createProject(app, { name: 'No roadmap', goal: 'g' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: completed.id,
+        tasks: [{ roadmapTaskKey: 'task-001', title: 'Done', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] }],
+        phases: [{ phaseNumber: 1, name: 'Complete', goal: 'g' }],
+      })
+      const completedTask = storage.tasks.findByProjectId(completed.id)[0]
+      storage.tasks.update(completedTask.id, { status: 'done' })
+      storage.tasks.create({
+        projectId: completed.id,
+        title: 'Manual pending task',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+
+      storage.tasks.syncRoadmapTasks({
+        projectId: incomplete.id,
+        tasks: [
+          { roadmapTaskKey: 'task-001', title: 'Done', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'Pending', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+        ],
+        phases: [{ phaseNumber: 1, name: 'Incomplete', goal: 'g' }],
+      })
+      const incompleteTasks = storage.tasks.findByProjectId(incomplete.id)
+      storage.tasks.update(incompleteTasks[0].id, { status: 'done' })
+
+      const [completedRes, incompleteRes, noRoadmapRes] = await Promise.all([
+        app.inject({ method: 'GET', url: `/api/projects/${completed.id}/roadmap` }),
+        app.inject({ method: 'GET', url: `/api/projects/${incomplete.id}/roadmap` }),
+        app.inject({ method: 'GET', url: `/api/projects/${noRoadmap.id}/roadmap` }),
+      ])
+
+      expect(parseBody<{ completion: ProjectRoadmapCompletion }>(completedRes.body).completion)
+        .toEqual({ completedTaskCount: 1, isComplete: true, totalTaskCount: 1 })
+      expect(parseBody<{ completion: ProjectRoadmapCompletion }>(incompleteRes.body).completion)
+        .toEqual({ completedTaskCount: 1, isComplete: false, totalTaskCount: 2 })
+      expect(parseBody<{ completion: ProjectRoadmapCompletion }>(noRoadmapRes.body).completion)
+        .toEqual({ completedTaskCount: 0, isComplete: false, totalTaskCount: 0 })
     })
   })
 

@@ -12,6 +12,16 @@ export interface Project {
   updatedAt: string
 }
 
+/**
+ * 現行ロードマップTaskから導出するProject完了状況。
+ * ProjectStatusを増やさず、roadmapActiveなTaskだけを対象にする。
+ */
+export interface ProjectRoadmapCompletion {
+  completedTaskCount: number
+  isComplete: boolean
+  totalTaskCount: number
+}
+
 export interface ProjectSummary {
   project: Pick<Project, 'id' | 'name' | 'goal' | 'designPhilosophy' | 'status'>
   progress: number          // 0-100
