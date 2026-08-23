@@ -112,7 +112,7 @@ ${constitutionPrinciplesPrompt}
 export interface SpecAnalyzerOptions {
   /** Anthropic APIキー（省略時は環境変数 ANTHROPIC_API_KEY を使用） */
   apiKey?: string
-  /** 使用モデル（省略時は claude-3-5-haiku-latest） */
+  /** 使用モデル（省略時は claude-haiku-4-5-20251001） */
   model?: string
   /** テスト用モック（指定するとAPIを呼ばない） */
   mockResponse?: string
@@ -122,7 +122,7 @@ export async function analyzeSpec(
   specText: string,
   options: SpecAnalyzerOptions = {},
 ): Promise<SpecAnalysis> {
-  const { mockResponse, model = 'claude-3-5-haiku-latest' } = options
+  const { mockResponse, model = 'claude-haiku-4-5-20251001' } = options
 
   // ── モック（テスト用） ─────────────────────────────────
   if (mockResponse !== undefined) {

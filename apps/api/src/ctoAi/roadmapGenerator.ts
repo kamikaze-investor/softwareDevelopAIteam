@@ -110,7 +110,7 @@ export async function generateRoadmap(
   analysis: SpecAnalysis,
   options: RoadmapGeneratorOptions = {},
 ): Promise<Roadmap> {
-  const { mockResponse, model = 'claude-3-5-haiku-latest' } = options
+  const { mockResponse, model = 'claude-haiku-4-5-20251001' } = options
 
   if (mockResponse !== undefined) {
     return parseRoadmapJson(mockResponse)
