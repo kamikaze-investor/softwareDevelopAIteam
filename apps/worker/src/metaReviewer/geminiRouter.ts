@@ -39,7 +39,7 @@ function isQuotaError(text: string): boolean {
 function callCli(prompt: string, cliModel: string): string | null {
   const result = spawnSync(
     AGY_PATH,
-    ['--model', cliModel, '--print', prompt],
+    ['--add-dir', ROUTER_ROOT, '--model', cliModel, '--print', prompt],
     { encoding: 'utf-8', timeout: 120_000 },
   )
 

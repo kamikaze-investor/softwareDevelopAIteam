@@ -28,6 +28,7 @@ vi.mock('node:fs', () => ({
 import { spawnSync } from 'node:child_process'
 import { callGeminiForReview } from './geminiClient.js'
 import { writeFileSync } from 'node:fs'
+import path from 'node:path'
 import { callGeminiWithFallback } from './geminiRouter.js'
 
 const mockSpawnSync = vi.mocked(spawnSync)
@@ -231,6 +232,26 @@ describe('callGeminiWithFallback', () => {
 
       expect(result).toBe('API result')
       expect(mockCallApi).toHaveBeenCalledOnce()
+    })
+
+    it('CLI 呼び出し時に --add-dir <ROUTER_ROOT> が --model の前に渡される', async () => {
+      mockSpawnSync.mockReturnValue(cliSuccess('ok'))
+
+      await callGeminiWithFallback('test prompt', {
+        preferCli: true,
+        cliModel: 'gemini-2.5-flash',
+      })
+
+      expect(mockSpawnSync).toHaveBeenCalledOnce()
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      expect(args).toEqual([
+        '--add-dir',
+        path.resolve(__dirname, '../../../../'),
+        '--model',
+        'gemini-2.5-flash',
+        '--print',
+        'test prompt',
+      ])
     })
   })
 })
