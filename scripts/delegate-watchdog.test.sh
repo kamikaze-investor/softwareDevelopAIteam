@@ -178,7 +178,7 @@ fi
 # 6. 50 recovery retries cap -> ESCALATE:recovery_exhausted
 new_case 1 0 'initial crash'
 MOCK_MODE=exit_without_marker \
-DELEGATION_MAX_RECOVERY_RETRIES=50 \
+DELEGATION_MAX_RECOVERY_RETRIES=99 \
 DELEGATION_INACTIVITY_TIMEOUT_SECONDS=1 \
 DELEGATION_POLL_INTERVAL_SECONDS=0.001 \
 run_watchdog
