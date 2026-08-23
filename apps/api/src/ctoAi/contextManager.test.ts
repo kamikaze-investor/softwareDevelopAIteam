@@ -3,13 +3,11 @@ import { buildContextPack, taskToContextPackSummary } from './contextManager.js'
 import type { TaskSummary } from './contextManager.js'
 import os from 'node:os'
 import path from 'node:path'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import type { Task } from '@ai-team/shared'
 
 function makeTmp(): string {
-  const dir = path.join(os.tmpdir(), `ctx-test-${Date.now()}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return mkdtempSync(path.join(os.tmpdir(), 'ctx-test-'))
 }
 
 const SAMPLE_TASK: TaskSummary = {
