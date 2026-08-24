@@ -24,6 +24,8 @@ MODE="${MOCK_MODE:-default}"
 case "$MODE" in
   done)
     printf 'Performing work...\nAI_TEAM_OS_STATUS:DONE\n'
+    # Keep the process alive briefly so the polling watchdog can observe the marker.
+    sleep 0.05
     ;;
   blocked)
     printf 'Encountered blocker...\nAI_TEAM_OS_STATUS:BLOCKED\n'
@@ -83,6 +85,14 @@ start_watchdog() {
     MOCK_MODE="${MOCK_MODE:-default}" \
     bash "$WATCHDOG" "$RUN_DIR" test-model "$LOG" test-prompt &
   WATCHDOG_PID=$!
+  for _ in $(seq 1 100); do
+    if [ -f "$RUN_DIR/last_activity" ]; then
+      return 0
+    fi
+    sleep 0.01
+  done
+  echo "watchdog did not reach trap-ready state" >&2
+  return 1
 }
 
 assert_verdict() {
@@ -331,7 +341,6 @@ LIVE_PID=$!
 echo "$LIVE_PID" >> "$TEST_ROOT/live_pids"
 printf '%s\n' "$LIVE_PID" > "$RUN_DIR/pid"
 MOCK_MODE=hanging start_watchdog
-sleep 0.1
 kill -TERM "$WATCHDOG_PID"
 wait "$WATCHDOG_PID" 2>/dev/null || true
 assert_verdict "ESCALATE:watchdog_interrupted"
