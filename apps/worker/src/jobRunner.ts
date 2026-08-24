@@ -32,6 +32,7 @@ import { runStepReview, createNotRunStepReviewResult } from './approvalLevel/ste
 import type { StepReviewResult } from './approvalLevel/stepReview.js'
 import { runPostReview } from './approvalLevel/postReviewer.js'
 import type { PostReviewResult } from './approvalLevel/postReviewer.js'
+import { evaluateCommitGate } from './approvalLevel/commitGate.js'
 import { runSafetyVerification } from './approvalLevel/safetyVerifier.js'
 import type { SafetyVerificationResult } from './approvalLevel/safetyVerifier.js'
 import { appendObservationLog } from './approvalLevel/observationLog.js'
@@ -930,6 +931,46 @@ export async function runJob(
     }
   }
   // ── safetyVerifier接続終端 ───────────────────────────────────────────────
+
+  // ── Shadow Commit Gate（Phase 1・観察モード・非停止） ─────────────────────────
+  // 実装済み・単体テスト済み・未接続だった evaluateCommitGate() を、実際の
+  // git_commit 承認判断には一切影響しない観察専用経路で接続する。
+  // - git_commit Job のみで実行し、test/lint/build 等では何も出さない
+  // - 判定結果はconsole.logのみ。停止・通知・永続化は行わない（Job結果にも載せない）
+  // - approvalLevelResult は control repo 基準の分類器を target_project Job に便宜的に
+  //   適用した参考ラベル（上記 Step6-A2 の既知の限界）のため、多くの場合
+  //   ceo_required と観測される。これは Phase 1 では期待通りの観測結果であり、回避しない
+  // - preReviewResult は現状どこでも計算されていないため常にundefined。
+  //   full_pre_post_review 時は成果物欠落として fail-closed 表示になる（commitGateの正しい挙動）
+  if (job.safeCommand.kind === 'git_commit') {
+    try {
+      const shadowCommitGateResult = evaluateCommitGate({
+        jobId: job.id,
+        taskId: job.taskId,
+        approvalLevelResult,
+        preReviewResult: undefined,
+        postReviewResult,
+        safetyVerificationResult,
+      })
+      console.log(
+        `[jobRunner] Shadow Commit Gate (observation only, does not affect real approval): ` +
+        `jobId=${job.id} taskId=${job.taskId} allowed=${shadowCommitGateResult.allowed} ` +
+        `reviewPolicy=${shadowCommitGateResult.reviewPolicy} ` +
+        `blockingReasons=[${shadowCommitGateResult.blockingReasons.join(' | ')}]`,
+      )
+      // 同一Jobに対する実際の Gate 判定を併記し、ログ上で shadow vs real を比較できるようにする
+      console.log(
+        `[jobRunner] Shadow Commit Gate real-gate comparison (same Job): ` +
+        `decision=${checkResponse.outcome.decision} riskLevel=${checkResponse.riskReview.riskLevel} ` +
+        `triggeredRules=[${checkResponse.riskReview.triggeredRules.join(', ')}] ` +
+        `continuationPolicy=${checkResponse.continuationPolicy} nextAction=${checkResponse.nextAction.action}`,
+      )
+    } catch (err) {
+      const errorKind = err instanceof Error ? err.constructor.name : typeof err
+      console.warn(`[jobRunner] Shadow Commit Gate評価に失敗したためスキップ（Jobは継続）: jobId=${job.id} taskId=${job.taskId} errorKind=${errorKind}`)
+    }
+  }
+  // ── Shadow Commit Gate終端 ───────────────────────────────────────────────
 
   // Review Observation Log（最小永続化。書き込み失敗はobservationLog.ts内部で吸収されJobを止めない）
   appendObservationLog({

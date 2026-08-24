@@ -209,6 +209,10 @@ vi.mock('./approvalLevel/postReviewer.js', () => ({
   }),
 }))
 
+vi.mock('./approvalLevel/commitGate.js', () => ({
+  evaluateCommitGate: vi.fn(),
+}))
+
 vi.mock('./approvalLevel/observationLog.js', () => ({
   appendObservationLog: vi.fn(),
 }))
@@ -255,6 +259,25 @@ const runStepReviewMock = vi.mocked(runStepReview)
 
 import { runPostReview } from './approvalLevel/postReviewer.js'
 const runPostReviewMock = vi.mocked(runPostReview)
+
+import { evaluateCommitGate } from './approvalLevel/commitGate.js'
+import type { CommitGateResult } from './approvalLevel/commitGate.js'
+const evaluateCommitGateMock = vi.mocked(evaluateCommitGate)
+
+function makeShadowGateResult(
+  overrides: Partial<CommitGateResult> = {},
+): CommitGateResult {
+  return {
+    jobId: 'job-1',
+    taskId: 'task-1',
+    allowed: true,
+    reviewPolicy: 'mechanical_only',
+    artifactChecks: [],
+    blockingReasons: [],
+    decidedAt: '2026-01-01T00:00:00.000Z',
+    ...overrides,
+  }
+}
 
 import { appendObservationLog } from './approvalLevel/observationLog.js'
 const appendObservationLogMock = vi.mocked(appendObservationLog)
@@ -416,6 +439,10 @@ beforeEach(() => {
   // Gate mocks: default to ALLOW / continue
   callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
   resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+
+  // Shadow Commit Gate（Phase 1・観察モード）: デフォルトは allowed:true の結果を返すだけ。
+  // jobRunner 側でログ出力に使われるのみで、Job結果には影響しない。
+  evaluateCommitGateMock.mockReturnValue(makeShadowGateResult())
 
   // Permission guard: allowed by default
   permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
@@ -3207,5 +3234,149 @@ describe('変更ファイル検出契約', () => {
 
     const lastCall = fileChangeGuardMock.mock.calls[fileChangeGuardMock.mock.calls.length - 1]
     expect(lastCall[0].paths).toContain('.env')
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Shadow Commit Gate（Phase 1・観察モード）の配線検証
+// - git_commit Job のみで evaluateCommitGate() が呼ばれること
+// - allowed:false を返しても実際の Job 結果に影響しないこと
+// - shadow gate 内部エラーでも Job が壊れないこと（try/catch）
+// ────────────────────────────────────────────────────────────
+describe('Shadow Commit Gate (Phase 1 observation wiring)', () => {
+  // ファイル内の先行テストが diffSensitiveBaseline / scanSensitiveFiles に設定した
+  // 実装は clearAllMocks では消えないため、この describe 内では benign な既定値へ固定する
+  // （'.env' が manifest に合流すると Risk Scan severity が medium になり、
+  //   本テストの目的と無関係に safetyVerifier が実行されてしまう）。
+  beforeEach(() => {
+    scanSensitiveFilesMock.mockReturnValue(new Map())
+    diffSensitiveBaselineMock.mockReturnValue([])
+  })
+
+  function gitCommitShadowJob(): Job {
+    return createJob({
+      safeCommand: {
+        kind: 'git_commit',
+        workingDir: '/workspace/target',
+        params: { commitMessage: 'test' },
+      },
+    })
+  }
+
+  function setupSuccessfulGitCommit(): void {
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+    mockGitCommitRun(BASE_COMMIT, 'aftercommit000000000000000000000000000000')
+  }
+
+  it('git_commit Job で SafeCommand 実行前に1回だけ呼ばれ、3つの観察成果物を渡す', async () => {
+    setupSuccessfulGitCommit()
+
+    const result = await runJob(gitCommitShadowJob(), createPolicy())
+
+    expect(result.status).toBe('success')
+    expect(evaluateCommitGateMock).toHaveBeenCalledTimes(1)
+    expect(evaluateCommitGateMock).toHaveBeenCalledWith({
+      jobId: 'job-1',
+      taskId: 'task-1',
+      approvalLevelResult: expect.objectContaining({
+        jobId: 'job-1',
+        taskId: 'task-1',
+        // target_project向けファイルは分類器の既知パターンに一致せず
+        // UNMATCHED_FALLBACK → Level3/ceo_required になる（Phase 1では期待通りの観測値）
+        level: 3,
+        reviewPolicy: 'ceo_required',
+      }),
+      preReviewResult: undefined,
+      postReviewResult: undefined,
+      safetyVerificationResult: undefined,
+    })
+    // 配線位置の証明: shadow gate は SafeCommand（resolveCommand→execFileSync）より前に走る
+    expect(evaluateCommitGateMock.mock.invocationCallOrder[0]).toBeLessThan(
+      resolveCommandMock.mock.invocationCallOrder[0],
+    )
+  })
+
+  it('非git_commit Job（test等）では呼ばれない', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'src/a.ts\n'
+      return gitFallback(args)
+    })
+
+    const job = createJob({
+      safeCommand: { kind: 'test' as never, workingDir: '/workspace/target' },
+    })
+    await runJob(job, createPolicy())
+
+    expect(evaluateCommitGateMock).not.toHaveBeenCalled()
+  })
+
+  it('allowed:false を返しても Job の status / commitHash は変わらない', async () => {
+    setupSuccessfulGitCommit()
+    evaluateCommitGateMock.mockReturnValue(makeShadowGateResult({
+      allowed: false,
+      reviewPolicy: 'ceo_required',
+      blockingReasons: [
+        'reviewPolicy が ceo_required のため、CEOの事前承認なしに自動commitできません',
+      ],
+    }))
+
+    const result = await runJob(gitCommitShadowJob(), createPolicy())
+
+    expect(evaluateCommitGateMock).toHaveBeenCalledOnce()
+    expect(result.status).toBe('success')
+    expect(result.commitHash).toBe('aftercommit000000000000000000000000000000')
+  })
+
+  it('shadow gate 内部で例外が起きても Job は成功し、警告ログのみ残る', async () => {
+    setupSuccessfulGitCommit()
+    evaluateCommitGateMock.mockImplementation(() => {
+      throw new Error('shadow gate internal error')
+    })
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      const result = await runJob(gitCommitShadowJob(), createPolicy())
+
+      expect(result.status).toBe('success')
+      expect(result.commitHash).toBe('aftercommit000000000000000000000000000000')
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Shadow Commit Gate'))
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('jobId=job-1'))
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('観察ログには Shadow Commit Gate の主要フィールドと実Gate比較が出力される', async () => {
+    setupSuccessfulGitCommit()
+    evaluateCommitGateMock.mockReturnValue(makeShadowGateResult({
+      allowed: false,
+      reviewPolicy: 'ceo_required',
+      blockingReasons: ['reviewPolicy が ceo_required'],
+    }))
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+
+    try {
+      await runJob(gitCommitShadowJob(), createPolicy())
+
+      const shadowLog = logSpy.mock.calls
+        .map(call => String(call[0]))
+        .find(message => message.includes('Shadow Commit Gate (observation only'))
+      expect(shadowLog).toBeDefined()
+      expect(shadowLog).toContain('allowed=false')
+      expect(shadowLog).toContain('reviewPolicy=ceo_required')
+
+      const comparisonLog = logSpy.mock.calls
+        .map(call => String(call[0]))
+        .find(message => message.includes('real-gate comparison'))
+      expect(comparisonLog).toBeDefined()
+      // 実Gateの判定（ALLOW_PROCEED_RESPONSE相当）が併記されていること
+      expect(comparisonLog).toContain('decision=ALLOW')
+      expect(comparisonLog).toContain('riskLevel=LOW')
+    } finally {
+      logSpy.mockRestore()
+    }
   })
 })
