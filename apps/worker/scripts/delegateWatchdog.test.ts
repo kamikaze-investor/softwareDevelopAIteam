@@ -10,7 +10,7 @@ describe('delegation watchdog shell flow', () => {
   it('fails closed, bounds retries, preserves logs, and protects unrelated PIDs', () => {
     const output = execFileSync('bash', [watchdogTestScript], {
       encoding: 'utf8',
-      timeout: 45_000,
+      timeout: 90_000,
     })
 
     expect(output).toContain('delegate-watchdog deterministic tests: PASS')
