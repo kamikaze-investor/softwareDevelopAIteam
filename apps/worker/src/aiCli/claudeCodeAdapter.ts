@@ -31,7 +31,10 @@ import { BaseCliAdapter } from './adapter.js'
 const MODE_PREFIXES: Record<AiCliRequest['mode'], string> = {
   implement:
     'あなたはDeveloper AIです。以下のタスクを実装してください。' +
-    '/workspace/target 配下のファイルのみ編集可能です。\n\n',
+    '/workspace/target 配下のファイルのみ編集可能です。\n' +
+    'Taskの許可範囲（allowedPaths）外のファイルは作成・編集しないでください。' +
+    'ROADMAP.md等のプロジェクト全体のドキュメントや、Taskと無関係なファイルを自行判断で変更することも禁止します。' +
+    '許可範囲外に必要な対応があると判断した場合は、変更せずに結果報告でその不足を伝えてください。\n\n',
   review:
     'あなたはReviewer AIです。以下のdiffをレビューし、問題があればJSON形式で報告してください。\n\n',
   qa:
