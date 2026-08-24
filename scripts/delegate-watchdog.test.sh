@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WATCHDOG="$REPO_ROOT/scripts/delegate-watchdog.sh"
+DELEGATE="$REPO_ROOT/scripts/delegate.sh"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/delegate-watchdog-test.XXXXXX")
 MOCK_BIN="$TEST_ROOT/bin"
 mkdir -p "$MOCK_BIN"
@@ -71,6 +72,19 @@ run_watchdog() {
     bash "$WATCHDOG" "$RUN_DIR" test-model "$LOG" test-prompt
 }
 
+start_watchdog() {
+  env \
+    PATH="$MOCK_BIN:$PATH" \
+    DELEGATION_OPENCODE_BIN="$MOCK_BIN/opencode" \
+    DELEGATION_INACTIVITY_TIMEOUT_SECONDS="${DELEGATION_INACTIVITY_TIMEOUT_SECONDS:-10}" \
+    DELEGATION_LONG_TOOL_TIMEOUT_SECONDS="${DELEGATION_LONG_TOOL_TIMEOUT_SECONDS:-600}" \
+    DELEGATION_MAX_RECOVERY_RETRIES="${DELEGATION_MAX_RECOVERY_RETRIES:-50}" \
+    DELEGATION_POLL_INTERVAL_SECONDS="${DELEGATION_POLL_INTERVAL_SECONDS:-0.01}" \
+    MOCK_MODE="${MOCK_MODE:-default}" \
+    bash "$WATCHDOG" "$RUN_DIR" test-model "$LOG" test-prompt &
+  WATCHDOG_PID=$!
+}
+
 assert_verdict() {
   local expected="$1"
   local actual
@@ -107,6 +121,10 @@ run_watchdog
 assert_verdict "COMPLETED"
 assert_recovery_count 0
 assert_final_result "COMPLETED"
+if grep -Fq "watchdog_interrupted" "$RUN_DIR/telemetry.json"; then
+  echo "normal terminal verdict was overwritten during EXIT handling" >&2
+  exit 1
+fi
 
 # 2. BLOCKED marker produces ESCALATE:blocked without retry
 new_case 1 0 $'Blocked on external dependency\nAI_TEAM_OS_STATUS:BLOCKED\n'
@@ -279,4 +297,78 @@ if ! grep -q "AI_TEAM_OS_STATUS:DONE" "$LOG.attempt-2"; then
   exit 1
 fi
 
+# 9. An unexpected nonzero shell exit is terminalized instead of stranding delegate.sh.
+new_case 1 0 'working'
+MOCK_MODE=hanging nohup "$MOCK_BIN/opencode" run prompt -m model > "$LOG" 2>&1 &
+LIVE_PID=$!
+echo "$LIVE_PID" >> "$TEST_ROOT/live_pids"
+printf '%s\n' "$LIVE_PID" > "$RUN_DIR/pid"
+
+set +e
+MOCK_MODE=hanging DELEGATION_POLL_INTERVAL_SECONDS=not-a-duration run_watchdog
+WATCHDOG_STATUS=$?
+set -e
+if [ "$WATCHDOG_STATUS" -eq 0 ]; then
+  echo "expected invalid poll interval to terminate watchdog nonzero" >&2
+  exit 1
+fi
+assert_verdict "ESCALATE:watchdog_interrupted"
+assert_final_result "ESCALATE:watchdog_interrupted"
+if ! grep -q '"kind": "exit"' "$RUN_DIR/telemetry.json"; then
+  echo "unexpected exit telemetry missing termination kind" >&2
+  exit 1
+fi
+if ! grep -q '"exit_code":' "$RUN_DIR/telemetry.json"; then
+  echo "unexpected exit telemetry missing exit code" >&2
+  exit 1
+fi
+kill "$LIVE_PID" 2>/dev/null || true
+
+# 10. TERM terminalizes once; its subsequent EXIT trap must not overwrite signal telemetry.
+new_case 1 0 'working'
+MOCK_MODE=hanging nohup "$MOCK_BIN/opencode" run prompt -m model > "$LOG" 2>&1 &
+LIVE_PID=$!
+echo "$LIVE_PID" >> "$TEST_ROOT/live_pids"
+printf '%s\n' "$LIVE_PID" > "$RUN_DIR/pid"
+MOCK_MODE=hanging start_watchdog
+sleep 0.1
+kill -TERM "$WATCHDOG_PID"
+wait "$WATCHDOG_PID" 2>/dev/null || true
+assert_verdict "ESCALATE:watchdog_interrupted"
+assert_final_result "ESCALATE:watchdog_interrupted"
+if ! grep -q '"kind": "signal"' "$RUN_DIR/telemetry.json" || ! grep -q '"signal": "TERM"' "$RUN_DIR/telemetry.json"; then
+  echo "TERM telemetry was missing or overwritten by EXIT finalization" >&2
+  exit 1
+fi
+kill "$LIVE_PID" 2>/dev/null || true
+
+# 11. Parent wrapper returns the interruption verdict instead of waiting indefinitely.
+WRAPPER_LOG="$CASE_DIR/delegate.log"
+set +e
+timeout 5 env \
+  PATH="$MOCK_BIN:$PATH" \
+  DELEGATION_OPENCODE_BIN="$MOCK_BIN/opencode" \
+  DELEGATION_POLL_INTERVAL_SECONDS=not-a-duration \
+  MOCK_MODE=hanging \
+  bash "$DELEGATE" test-model "$WRAPPER_LOG" test-prompt > "$CASE_DIR/delegate.out" 2>&1
+DELEGATE_STATUS=$?
+set -e
+if [ "$DELEGATE_STATUS" -ne 0 ]; then
+  echo "delegate.sh did not return after watchdog interruption (status $DELEGATE_STATUS)" >&2
+  exit 1
+fi
+if ! grep -Fxq 'ESCALATE:watchdog_interrupted' "$CASE_DIR/delegate.out"; then
+  echo "delegate.sh did not surface watchdog_interrupted" >&2
+  exit 1
+fi
+WRAPPER_RUN_DIR=$(find "$CASE_DIR" -maxdepth 1 -type d -name '.delegate-*' -print -quit)
+if [ -z "$WRAPPER_RUN_DIR" ]; then
+  echo "delegate.sh did not create a run directory" >&2
+  exit 1
+fi
+WRAPPER_PID=$(cat "$WRAPPER_RUN_DIR/pid")
+if kill -0 "$WRAPPER_PID" 2>/dev/null; then
+  echo "watchdog interruption left the OpenCode process running" >&2
+  exit 1
+fi
 echo 'delegate-watchdog deterministic tests: PASS'
