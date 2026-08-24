@@ -8,6 +8,7 @@
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { tmpdir } from 'node:os'
 
 // node:child_process をモック
 vi.mock('node:child_process', () => ({
@@ -28,7 +29,6 @@ vi.mock('node:fs', () => ({
 import { spawnSync } from 'node:child_process'
 import { callGeminiForReview } from './geminiClient.js'
 import { writeFileSync } from 'node:fs'
-import path from 'node:path'
 import { callGeminiWithFallback } from './geminiRouter.js'
 
 const mockSpawnSync = vi.mocked(spawnSync)
@@ -160,6 +160,117 @@ describe('callGeminiWithFallback', () => {
     })
   })
 
+  describe('Antigravity CLI 経由の Claude Sonnet フォールバック（2026-08-24 追加）', () => {
+    it('Gemini API・CLI 双方が quota 起因で失敗 → Antigravity/Claude で成功する', async () => {
+      mockSpawnSync.mockImplementation((_cmd, args) => {
+        const model = (args as string[])[1]
+        if (model === 'claude-sonnet-4-6') return cliSuccess('Claude fallback response')
+        return cli429()
+      })
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+      const result = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        cliModel: 'gemini-3.5-flash',
+        featureName: 'strategic-meta-review-scope_simplicity',
+      })
+
+      expect(result).toBe('Claude fallback response')
+      expect(mockWriteFileSync).not.toHaveBeenCalled()
+      // spawnSync は Gemini-CLI（quota失敗）と Claude-CLI（成功）の2回のみ
+      expect(mockSpawnSync).toHaveBeenCalledTimes(2)
+    })
+
+    it('Gemini・Antigravity/Claude すべて quota 起因で失敗 → 従来どおり例外 + quota-exhausted.json', async () => {
+      mockSpawnSync.mockReturnValue(cli429())
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+      await expect(
+        callGeminiWithFallback('test prompt', {
+          preferCli: false,
+          featureName: 'strategic-meta-review-scope_simplicity',
+        })
+      ).rejects.toThrow('quota exhausted')
+
+      expect(mockWriteFileSync).toHaveBeenCalledOnce()
+      // spawnSync は Gemini-CLI と Claude-CLI の2回（API呼び出しは callGeminiForReview 経由で別モック）
+      expect(mockSpawnSync).toHaveBeenCalledTimes(2)
+    })
+
+    it('quota 以外の失敗（CLI・API とも）では Antigravity/Claude を試さない', async () => {
+      mockSpawnSync.mockReturnValue(cliError())
+      mockCallApi.mockRejectedValue(new Error('unexpected 500 internal error'))
+
+      await expect(
+        callGeminiWithFallback('test prompt', {
+          preferCli: false,
+          featureName: 'test',
+        })
+      ).rejects.toThrow('quota exhausted')
+
+      // Gemini-CLI の1回のみ（Claude フォールバックを試みていない）
+      expect(mockSpawnSync).toHaveBeenCalledTimes(1)
+    })
+
+    it('API が quota 起因失敗・CLI が非quota失敗の混在では Antigravity/Claude を試さない', async () => {
+      mockSpawnSync.mockReturnValue(cliError())
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+      await expect(
+        callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
+      ).rejects.toThrow('quota exhausted')
+
+      expect(mockSpawnSync).toHaveBeenCalledTimes(1)
+    })
+
+    it('agy サブプロセスへ渡す env に秘密情報を含めない（PATH/HOME/LANG/TERM のみ）', async () => {
+      const originalEnv = { ...process.env }
+      process.env.CLAUDE_API_KEY = 'should-not-leak'
+      process.env.GEMINI_API_KEY = 'should-not-leak'
+      process.env.API_TOKEN = 'should-not-leak'
+      process.env.DB_PATH = '/should/not/leak'
+
+      try {
+        mockSpawnSync.mockReturnValue(cli429())
+        mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+        await expect(
+          callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
+        ).rejects.toThrow('quota exhausted')
+
+        for (const call of mockSpawnSync.mock.calls) {
+          const env = call[2]?.env as NodeJS.ProcessEnv | undefined
+          expect(env).toBeDefined()
+          const keys = Object.keys(env as object).sort()
+          expect(keys).toEqual(keys.filter((k) => ['PATH', 'HOME', 'LANG', 'TERM'].includes(k)))
+          expect(env?.CLAUDE_API_KEY).toBeUndefined()
+          expect(env?.GEMINI_API_KEY).toBeUndefined()
+          expect(env?.API_TOKEN).toBeUndefined()
+          expect(env?.DB_PATH).toBeUndefined()
+        }
+      } finally {
+        process.env = originalEnv
+      }
+    })
+
+    it('agy へ --add-dir を渡さず、cwd をリポジトリ外の一時ディレクトリに固定する', async () => {
+      mockSpawnSync.mockReturnValue(cli429())
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+      await expect(
+        callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
+      ).rejects.toThrow('quota exhausted')
+
+      expect(mockSpawnSync.mock.calls.length).toBeGreaterThan(0)
+      for (const call of mockSpawnSync.mock.calls) {
+        const args = call[1] as string[]
+        expect(args).not.toContain('--add-dir')
+        const options = call[2] as { cwd?: string }
+        expect(options.cwd).toBe(tmpdir())
+      }
+    })
+  })
+
   describe('CLI 呼び出しの詳細', () => {
     it('preferCli: true のとき CLI が先に呼ばれる', async () => {
       const callOrder: string[] = []
@@ -232,26 +343,6 @@ describe('callGeminiWithFallback', () => {
 
       expect(result).toBe('API result')
       expect(mockCallApi).toHaveBeenCalledOnce()
-    })
-
-    it('CLI 呼び出し時に --add-dir <ROUTER_ROOT> が --model の前に渡される', async () => {
-      mockSpawnSync.mockReturnValue(cliSuccess('ok'))
-
-      await callGeminiWithFallback('test prompt', {
-        preferCli: true,
-        cliModel: 'gemini-2.5-flash',
-      })
-
-      expect(mockSpawnSync).toHaveBeenCalledOnce()
-      const args = mockSpawnSync.mock.calls[0][1] as string[]
-      expect(args).toEqual([
-        '--add-dir',
-        path.resolve(__dirname, '../../../../'),
-        '--model',
-        'gemini-2.5-flash',
-        '--print',
-        'test prompt',
-      ])
     })
   })
 })
