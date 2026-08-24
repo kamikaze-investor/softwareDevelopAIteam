@@ -293,7 +293,9 @@ async function runLowLoadLegacyReview(
     const prompt = buildMetaReviewPrompt(request)
     const rawResponse = await callGeminiWithFallback(prompt, {
       preferCli: true,
-      cliModel: 'gemini-3.5-flash',
+      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
+      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
+      cliModel: 'gemini-3.5-flash-medium',
       apiModel: 'gemini-3.5-flash',
       featureName: 'meta_review',
     })
@@ -340,7 +342,9 @@ async function runFocusedReview(
   try {
     const rawResponse = await callGeminiWithFallback(promptContext.prompt, {
       preferCli: true,
-      cliModel: 'gemini-3.5-flash',
+      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
+      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
+      cliModel: 'gemini-3.5-flash-medium',
       apiModel: 'gemini-3.5-flash',
       featureName: `strategic-meta-review-${focus}`,
     })
@@ -366,7 +370,9 @@ async function runIntegrationReview(
   try {
     const rawResponse = await callGeminiWithFallback(prompt, {
       preferCli: true,
-      cliModel: 'gemini-3.5-flash',
+      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
+      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
+      cliModel: 'gemini-3.5-flash-medium',
       apiModel: 'gemini-3.5-flash',
       featureName: 'strategic-meta-review-integration',
     })
