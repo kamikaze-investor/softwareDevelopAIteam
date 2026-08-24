@@ -141,6 +141,9 @@ check_marker() {
 write_telemetry() {
   local final_verdict="$1"
   local last_retry_reason="${2:-}"
+  local watchdog_termination_kind="${3:-terminal_verdict}"
+  local watchdog_exit_code="${4:-0}"
+  local watchdog_signal="${5:-}"
   if [ -z "$last_retry_reason" ] && [ -f "$RUN_DIR/retry_reason" ]; then
     last_retry_reason=$(cat "$RUN_DIR/retry_reason")
   fi
@@ -150,6 +153,20 @@ write_telemetry() {
 
   local recovery_count
   recovery_count=$(cat "$RUN_DIR/recovery_attempt_count" 2>/dev/null || echo 0)
+
+  local attempt
+  attempt=$(cat "$RUN_DIR/attempt" 2>/dev/null || echo 1)
+
+  local exit_code_json="null"
+  case "$watchdog_exit_code" in
+    *[!0-9]*|"") ;;
+    *) exit_code_json="$watchdog_exit_code" ;;
+  esac
+
+  local signal_json="null"
+  if [ -n "$watchdog_signal" ]; then
+    signal_json="\"$watchdog_signal\""
+  fi
 
   echo "$final_verdict" > "$RUN_DIR/final_result"
   echo "$recovery_count" > "$RUN_DIR/recovery_attempt_count"
@@ -169,12 +186,18 @@ write_telemetry() {
   cat > "$RUN_DIR/telemetry.json" <<EOF
 {
   "provider": "opencode",
+  "attempt_number": $attempt,
   "recovery_attempt_count": $recovery_count,
   "retry_reason": "$last_retry_reason",
   "final_result": "$final_verdict",
   "started_at": $START_TIME,
   "completed_at": $end_time,
   "elapsed_seconds": $elapsed,
+  "watchdog_termination": {
+    "kind": "$watchdog_termination_kind",
+    "exit_code": $exit_code_json,
+    "signal": $signal_json
+  },
   "retry_events": $events_json
 }
 EOF
@@ -196,6 +219,52 @@ record_retry_event() {
 {"attempt_number":$attempt,"recovery_attempt_count":$recovery_count,"retry_reason":"$reason","timestamp":$now}
 EOF
 }
+
+# A detached watchdog can be terminated independently of its parent wrapper.
+# Ensure that a non-terminal exit always releases delegate.sh from its verdict wait.
+FINALIZATION_IN_PROGRESS=0
+
+finalize_interrupted_watchdog() {
+  local termination_kind="$1"
+  local exit_code="$2"
+  local signal_name="${3:-}"
+
+  if [ "$FINALIZATION_IN_PROGRESS" -eq 1 ] || [ -e "$RUN_DIR/verdict" ]; then
+    return 0
+  fi
+  FINALIZATION_IN_PROGRESS=1
+
+  local watched_pid
+  watched_pid=$(cat "$RUN_DIR/pid" 2>/dev/null || echo "")
+  safe_kill_process "$watched_pid"
+
+  printf "watchdog interrupted kind=%s exit_code=%s signal=%s\n" \
+    "$termination_kind" "$exit_code" "${signal_name:-none}" >&2
+
+  if ! write_telemetry "ESCALATE:watchdog_interrupted" "watchdog_interrupted" \
+    "$termination_kind" "$exit_code" "$signal_name"; then
+    # Even if telemetry persistence itself fails, prefer releasing the parent
+    # wrapper over leaving it in an unbounded wait.
+    printf "%s\n" "ESCALATE:watchdog_interrupted" > "$RUN_DIR/verdict" 2>/dev/null || true
+  fi
+}
+
+on_watchdog_exit() {
+  local exit_code=$?
+  finalize_interrupted_watchdog "exit" "$exit_code"
+}
+
+on_watchdog_signal() {
+  local signal_name="$1"
+  local exit_code="$2"
+  finalize_interrupted_watchdog "signal" "$exit_code" "$signal_name"
+  exit "$exit_code"
+}
+
+trap on_watchdog_exit EXIT
+trap "on_watchdog_signal TERM 143" TERM
+trap "on_watchdog_signal INT 130" INT
+trap "on_watchdog_signal HUP 129" HUP
 
 [ -f "$RUN_DIR/base_log" ] || echo "$LOG" > "$RUN_DIR/base_log"
 [ -f "$RUN_DIR/current_log" ] || echo "$LOG" > "$RUN_DIR/current_log"
