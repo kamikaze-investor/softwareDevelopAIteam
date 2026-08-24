@@ -679,6 +679,7 @@ export async function runJob(
       return inspectAfterAiFailure({
         workingDir: job.safeCommand.workingDir,
         startCommitHash,
+        preChangedPaths: preManifest.paths,
         reflogBaseline,
         sensitiveBaseline,
         policy,
@@ -697,6 +698,7 @@ export async function runJob(
       return inspectAfterAiFailure({
         workingDir: job.safeCommand.workingDir,
         startCommitHash,
+        preChangedPaths: preManifest.paths,
         reflogBaseline,
         sensitiveBaseline,
         policy,
@@ -719,6 +721,7 @@ export async function runJob(
         return inspectAfterAiFailure({
           workingDir: job.safeCommand.workingDir,
           startCommitHash,
+          preChangedPaths: preManifest.paths,
           reflogBaseline,
           sensitiveBaseline,
           policy,
@@ -743,6 +746,7 @@ export async function runJob(
         return inspectAfterAiFailure({
           workingDir: job.safeCommand.workingDir,
           startCommitHash,
+          preChangedPaths: preManifest.paths,
           reflogBaseline,
           sensitiveBaseline,
           policy,
@@ -816,6 +820,15 @@ export async function runJob(
     console.error(
       `[jobRunner] Stage A file guard blocked: ${JSON.stringify(stageAGuard.reasons)}`,
     )
+    // Guard 違反で停止するなら、この Job が作った変更を作業ツリーへ残さない。
+    // 残置すると次の Job の File Change Guard（HEAD との差分）が前 Job の変更で
+    // 汚染され、自分では触れていないファイルまで拒否される（2026-08-24 実測）。
+    const workspaceCleanupNote = revertBlockedJobChanges(
+      job.safeCommand.workingDir,
+      startCommitHash,
+      stageAManifest,
+      preManifest.paths,
+    )
     // 既存契約に合わせ status は 'failed' を返す。
     // index.ts の resolveResultStatus() が guardResult.fileChangeAllowed=false を見て
     // 最終的に 'blocked' へ変換する（File Change Guard 由来の停止の既存表現）。
@@ -823,7 +836,10 @@ export async function runJob(
       status: 'failed',
       exitCode: 1,
       stdout: '',
-      stderr: `File Change Guard blocked (stage A): ${stageAGuard.violations.join(', ')}`,
+      stderr: withCleanupNote(
+        `File Change Guard blocked (stage A): ${stageAGuard.violations.join(', ')}`,
+        workspaceCleanupNote,
+      ),
       changedFiles: stageAManifest.paths,
       guardResult,
       startedAt,
@@ -1053,6 +1069,17 @@ export async function runJob(
   guardResult.fileViolations = fileGuard.violations
   if (!fileGuard.allowed) {
     console.error(`[jobRunner] Final file guard blocked: ${JSON.stringify(fileGuard.reasons)}`)
+    // Stage A と同じ理由で、最終検査でも Guard 違反なら後始末を行う。
+    // SafeCommand が commit を作った場合は HEAD が動いているためヘルパー側で
+    // スキップされ、その旨が戻り値で報告される。
+    const workspaceCleanupNote = revertBlockedJobChanges(
+      job.safeCommand.workingDir,
+      startCommitHash,
+      finalManifest,
+      preManifest.paths,
+    )
+    // saveJobLogs より前に連結するため、警告は永続化される Job ログにも残る。
+    stderr = withCleanupNote(stderr, workspaceCleanupNote)
   }
 
   // 最終成果に対する secret / diff 検査と Risk 検査
@@ -1123,7 +1150,119 @@ export async function runJob(
   }
 }
 
-/** 最終 Risk Review の結果はログのみに使う（観察モードの既存方針を変えない） */
+/**
+ * Guard 違反（fileChangeAllowed=false）で Job を停止するとき、この Job 自身が
+ * 作った変更を作業ツリーから取り消す。
+ *
+ * 【背景（2026-08-24 実測）】blocked Job が AI CLI の変更を作業ツリーに残したまま
+ * 返るため、次の Job の File Change Guard（HEAD との差分）が前 Job の残置変更で
+ * 汚染され、自分では触れていないファイルまで拒否されていた。
+ *
+ * 方針:
+ * - 対象は manifest に現れた path **のみ**。blanket な `git reset --hard` /
+ *   `git clean` は行わない（Job が責任を持つのは自分の change manifest のみ）。
+ * - Job 開始時（startCommitHash 取得時点）から既に変更のあった path
+ *   （preExistingPaths）はこの Job の成果ではないため**一切触らない**
+ *   （開始前に存在した無関係な dirty 状態を保存する）。
+ * - modified / deleted は `git checkout <startCommitHash> -- <path>` で
+ *   index と作業ツリーを開始コミットの内容へ復元する。added は index から外した上で
+ *   path を限定して削除する（untracked なら reset は no-op）。renamed は
+ *   旧パスを復元し新パスを削除する。
+ * - HEAD が startCommitHash から動いている場合（AI や SafeCommand が commit を
+ *   作った場合）は作業ツリーを安全に baseline へ戻せないため、取り消しを行わず
+ *   その旨を報告する（履歴を書き換えるような復元は行わない）。
+ *
+ * 戻り値: 完全成功なら undefined。スキップ・失敗があった場合は人間可読な警告文。
+ * 呼び出し元は戻り値を結果の stderr へ残すこと。**サイレントな失敗は許容しない**
+ * （黙って失敗すると「blocked 後の残置」問題を再導入する）。
+ */
+export function revertBlockedJobChanges(
+  workingDir: string,
+  startCommitHash: string,
+  manifest: ChangeManifest,
+  preExistingPaths: readonly string[],
+): string | undefined {
+  if (manifest.changes.length === 0) return undefined
+
+  const currentHead = getCommitHash(workingDir)
+  if (currentHead === undefined || currentHead !== startCommitHash) {
+    const message =
+      `workspace cleanup skipped: HEAD changed during job ` +
+      `(expected ${startCommitHash}, now ${currentHead ?? 'unknown'}); ` +
+      `${manifest.paths.length} changed path(s) remain in the working tree`
+    console.error(`[jobRunner] ${message}`)
+    return message
+  }
+
+  const preExisting = new Set(preExistingPaths)
+  const failures: string[] = []
+
+  for (const change of manifest.changes) {
+    // rename は旧・新のどちらかが Job 開始時点で既に dirty でも、部分的な復元より
+    // 何もしない方を優先する（開始前の状態を壊さないことを優先する）。
+    if (
+      preExisting.has(change.path) ||
+      (change.oldPath !== undefined && preExisting.has(change.oldPath))
+    ) {
+      continue
+    }
+
+    // modified / deleted → 開始コミットの内容へ復元。
+    // added / renamed新パス → index から外してから path を限定して削除。
+    const restorePaths: readonly string[] =
+      change.kind === 'renamed'
+        ? change.oldPath !== undefined
+          ? [change.oldPath]
+          : []
+        : change.kind === 'added'
+          ? []
+          : [change.path]
+    const removePaths: readonly string[] =
+      change.kind === 'added' || change.kind === 'renamed' ? [change.path] : []
+
+    try {
+      for (const p of restorePaths) {
+        execFileSync('git', ['checkout', '-q', startCommitHash, '--', p], {
+          cwd: workingDir,
+          shell: false,
+          encoding: 'utf-8',
+        })
+      }
+      for (const p of removePaths) {
+        // staged 追加の可能性に備えて先に index から外す（untracked なら no-op）。
+        execFileSync('git', ['reset', '-q', 'HEAD', '--', p], {
+          cwd: workingDir,
+          shell: false,
+          encoding: 'utf-8',
+        })
+        // `-fdq` でも対象は `-- <path>` に限定される（repo 全体の clean は行わない）。
+        execFileSync('git', ['clean', '-fdq', '--', p], {
+          cwd: workingDir,
+          shell: false,
+          encoding: 'utf-8',
+        })
+      }
+    } catch (err: unknown) {
+      failures.push(`${change.path}: ${formatUnknownError(err)}`)
+    }
+  }
+
+  if (failures.length > 0) {
+    const message = `workspace cleanup failed for some paths: ${failures.join('; ')}`
+    console.error(`[jobRunner] ${message}`)
+    return message
+  }
+  return undefined
+}
+
+/** 後始末の結果（スキップ・部分失敗）を Job 結果のメッセージへ連結する */
+function withCleanupNote(base: string, note: string | undefined): string {
+  return note === undefined ? base : `${base}\n[jobRunner] ${note}`
+}
+
+/**
+ * 最終 Risk Review の結果はログのみに使う（観察モードの既存方針を変えない）
+ */
 function logFinalRiskReview(level: string, files: string[]): void {
   if (level === 'HIGH' || level === 'CRITICAL') {
     console.warn(`[final] risk review ${level}: ${files.join(', ')}`)
@@ -1273,6 +1412,8 @@ function extractDeniedToolNames(parsed: Record<string, unknown>): string[] {
 interface AiFailureInspectionInput {
   workingDir: string
   startCommitHash: string
+  /** Job 開始時点で既に変更のあった path（この Job の成果ではないため後始末対象外） */
+  preChangedPaths: readonly string[]
   reflogBaseline: ReflogBaseline
   sensitiveBaseline: SensitiveBaseline
   policy: RuntimeTaskPolicy
@@ -1291,11 +1432,14 @@ interface AiFailureInspectionInput {
  * AI CLI が失敗した場合でも、残っている変更を必ず検査してから結果を返す。
  * Job 自体は failed のままだが、禁止ファイルが残っていれば
  * guardResult.fileChangeAllowed=false として記録する。
+ * Guard 違反（＝blocked へ変換される結果）の場合は、次の Job を汚染しないよう
+ * この Job 自身の変更を作業ツリーから取り消してから返す。
  */
 function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
   let manifest: ChangeManifest | undefined
   let riskScan: ReturnType<typeof scanTargetProjectRisk> | undefined
   let workspaceState: JobRunResult['workspaceState']
+  let workspaceCleanupNote: string | undefined
   try {
     const inspection = buildFinalInspection(
       input.workingDir,
@@ -1311,6 +1455,14 @@ function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
     if (!guard.allowed) {
       console.error(
         `[jobRunner] AI CLI 失敗後にも Guard 違反が残っています: ${JSON.stringify(guard.reasons)}`,
+      )
+      // blocked へ変換される結果と同じ扱い。残置すると次の Job の File Change Guard
+      // （HEAD との差分）がこの失敗 Job の変更で汚染されるため取り消す。
+      workspaceCleanupNote = revertBlockedJobChanges(
+        input.workingDir,
+        input.startCommitHash,
+        manifest,
+        input.preChangedPaths,
       )
     }
     // 成功経路と同様、失敗経路でも secret/diff の Risk Scan を残す。
@@ -1331,7 +1483,10 @@ function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
     status: 'failed',
     exitCode: input.exitCode,
     stdout: input.stdout,
-    stderr: input.stderr,
+    stderr:
+      workspaceCleanupNote === undefined
+        ? input.stderr
+        : withCleanupNote(input.stderr ?? '', workspaceCleanupNote),
     stdoutPath: input.stdoutPath,
     stderrPath: input.stderrPath,
     changedFiles: manifest.paths,

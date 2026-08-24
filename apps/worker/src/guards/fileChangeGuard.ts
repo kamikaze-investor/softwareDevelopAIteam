@@ -227,9 +227,15 @@ export function fileChangeGuard(
 
       // 4. タスクのallowedPathsチェック（指定がある場合のみ）
       if (policy.allowedPaths.length > 0) {
-        const isAllowed = policy.allowedPaths.some(
-          (ap) => normalized === ap || normalized.startsWith(ap + '/')
-        )
+        const isAllowed = policy.allowedPaths.some((ap) => {
+          // allowedPaths は roadmapGenerator のプロンプト規約上「src/runner/」のように
+          // 末尾スラッシュ付きで生成される。正規化せずに ap + '/' と比較すると
+          // 「src/runner//」という二重スラッシュになり、配下の正当なファイルまで
+          // 誤拒否されていた（2026-08-24 実測: src/runner/workflow-runner.js が blocked）。
+          // 末尾スラッシュだけを剥がして判定する（許可範囲は広げない）。
+          const normalizedAp = ap.endsWith('/') ? ap.slice(0, -1) : ap
+          return normalized === normalizedAp || normalized.startsWith(normalizedAp + '/')
+        })
         if (!isAllowed) {
           reject(file, `Not in task.allowedPaths: "${normalized}"`)
           continue
