@@ -14,7 +14,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { writeFileSync, mkdirSync } from 'node:fs'
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { callGeminiForReview } from './geminiClient.js'
@@ -41,6 +41,15 @@ export interface GeminiRouterOptions {
   apiModel?: string
   /** 機能名（ログ・通知用） */
   featureName?: string
+  /**
+   * agy 呼び出し（Gemini-CLI・Antigravity/Claude フォールバック双方）に
+   * `--output-format json --json-schema` を付け、呼び出し元の既存パーサー
+   * （parseFocusedReviewResponse 等）が期待する形へ応答を強制する。
+   * 新しい review schema/parser 仕様は作らず、呼び出し元が既に持つ contract
+   * （decision/summary/findings 等）をそのまま JSON Schema として渡すことを想定する。
+   * 未指定時は従来どおり素の `--print` のみ（挙動変更なし）。
+   */
+  cliJsonSchema?: Record<string, unknown>
 }
 
 /** 429 / quota 超過かどうかを判定 */
@@ -69,27 +78,95 @@ interface CliOutcome {
   quota: boolean
 }
 
-/** agy CLI を呼び出す。成功時は ok:true。失敗時は quota 起因かどうかを付けて返す。 */
-function callCliDetailed(prompt: string, cliModel: string): CliOutcome {
-  const result = spawnSync(
-    AGY_PATH,
-    // --add-dir 等でリポジトリを追加公開しない。review input（prompt）だけを渡す。
-    // cwd もリポジトリ外の一時ディレクトリに固定し、agy が cwd 経由で暗黙にプロジェクトを
-    // 検出してファイルへアクセスすることを避ける（2026-08-24 CEO承認・実測確認済み:
-    // --add-dir なし・非リポジトリ cwd でも `--print` の単発応答は正常に動作する）。
-    ['--model', cliModel, '--print', prompt],
-    { encoding: 'utf-8', timeout: 120_000, env: buildAgyEnv(), cwd: tmpdir() },
+/**
+ * agy は非対話の `--print` でもエージェント的な文章（「ファイルを確認します」等）を返すことが
+ * あり、呼び出し元パーサーが期待する構造化 JSON と噛み合わないことがある
+ * （2026-08-24 実測確認）。`--json-schema` は agy 自身の既存機能で、呼び出し元の
+ * contract をそのまま強制でき、新しい review schema/parser を作らずに済む。
+ */
+function withToolFreeInstruction(prompt: string): string {
+  return (
+    'Use ONLY the input provided below. Do not use any filesystem, shell, or other tools, ' +
+    'and do not explore the working directory or repository — answer directly from the given ' +
+    'input alone.\n\n' + prompt
   )
+}
 
-  const stdout = result.stdout ?? ''
-  const stderr = result.stderr ?? ''
-  const quota = isQuotaError(stdout) || isQuotaError(stderr)
+/** agy CLI を呼び出す。成功時は ok:true。失敗時は quota 起因かどうかを付けて返す。 */
+function callCliDetailed(
+  prompt: string,
+  cliModel: string,
+  jsonSchema?: Record<string, unknown>,
+): CliOutcome {
+  let schemaDir: string | undefined
+  const argv = ['--model', cliModel]
+  let effectivePrompt = prompt
 
-  if (result.status !== 0 || !stdout.trim() || quota) {
-    return { ok: false, text: null, quota }
+  if (jsonSchema !== undefined) {
+    schemaDir = mkdtempSync(path.join(tmpdir(), 'agy-schema-'))
+    const schemaPath = path.join(schemaDir, 'schema.json')
+    writeFileSync(schemaPath, JSON.stringify(jsonSchema))
+    argv.push('--output-format', 'json', '--json-schema', schemaPath)
+    effectivePrompt = withToolFreeInstruction(prompt)
   }
+  argv.push('--print', effectivePrompt)
 
-  return { ok: true, text: stdout, quota: false }
+  try {
+    const result = spawnSync(
+      AGY_PATH,
+      // --add-dir 等でリポジトリを追加公開しない。review input（prompt）だけを渡す。
+      // cwd もリポジトリ外の一時ディレクトリに固定し、agy が cwd 経由で暗黙にプロジェクトを
+      // 検出してファイルへアクセスすることを避ける（2026-08-24 CEO承認・実測確認済み:
+      // --add-dir なし・非リポジトリ cwd でも `--print` の単発応答は正常に動作する）。
+      argv,
+      { encoding: 'utf-8', timeout: 120_000, env: buildAgyEnv(), cwd: tmpdir() },
+    )
+
+    const stdout = result.stdout ?? ''
+    const stderr = result.stderr ?? ''
+    const quota = isQuotaError(stdout) || isQuotaError(stderr)
+
+    if (result.status !== 0 || !stdout.trim() || quota) {
+      return { ok: false, text: null, quota }
+    }
+
+    if (jsonSchema !== undefined) {
+      const extracted = extractStructuredOutput(stdout)
+      if (extracted !== undefined) {
+        return { ok: true, text: extracted, quota: false }
+      }
+      // structured_output を取り出せなかった場合は生の stdout のまま返す。
+      // 呼び出し元パーサーは複数候補から JSON を探すため、そのまま渡しても壊れない
+      // （fail-open ではなく、既存の多段パースにそのまま委ねるだけ）。
+    }
+
+    return { ok: true, text: stdout, quota: false }
+  } finally {
+    if (schemaDir !== undefined) {
+      try {
+        rmSync(schemaDir, { recursive: true, force: true })
+      } catch {
+        // 一時ディレクトリの削除失敗はサイレントに無視
+      }
+    }
+  }
+}
+
+/**
+ * `--output-format json` の agy 応答（`{"structured_output": {...}, ...}`）から
+ * `structured_output` を取り出し、呼び出し元パーサーがそのまま読める JSON 文字列にする。
+ * 形が違えば undefined を返す（呼び出し元は生 stdout にフォールバックする）。
+ */
+function extractStructuredOutput(stdout: string): string | undefined {
+  try {
+    const parsed = JSON.parse(stdout) as { structured_output?: unknown }
+    if (parsed.structured_output !== undefined && parsed.structured_output !== null) {
+      return JSON.stringify(parsed.structured_output)
+    }
+  } catch {
+    // JSON として読めない場合は undefined を返す
+  }
+  return undefined
 }
 
 interface ApiOutcome {
@@ -157,6 +234,7 @@ export async function callGeminiWithFallback(
     cliModel = 'gemini-2.5-flash',
     apiModel,
     featureName = 'unknown',
+    cliJsonSchema,
   } = options ?? {}
 
   let cliOutcome: CliOutcome
@@ -164,7 +242,7 @@ export async function callGeminiWithFallback(
 
   if (preferCli) {
     // CLI → API
-    cliOutcome = callCliDetailed(prompt, cliModel)
+    cliOutcome = callCliDetailed(prompt, cliModel, cliJsonSchema)
     if (cliOutcome.ok) return cliOutcome.text as string
 
     apiOutcome = await callApiDetailed(prompt, apiModel)
@@ -174,13 +252,13 @@ export async function callGeminiWithFallback(
     apiOutcome = await callApiDetailed(prompt, apiModel)
     if (apiOutcome.ok) return apiOutcome.text as string
 
-    cliOutcome = callCliDetailed(prompt, cliModel)
+    cliOutcome = callCliDetailed(prompt, cliModel, cliJsonSchema)
     if (cliOutcome.ok) return cliOutcome.text as string
   }
 
   // Gemini（API・CLI 双方）が quota 起因で失敗した場合だけ Antigravity/Claude を試す。
   if (cliOutcome.quota && apiOutcome.quota) {
-    const claudeOutcome = callCliDetailed(prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL)
+    const claudeOutcome = callCliDetailed(prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, cliJsonSchema)
     if (claudeOutcome.ok) return claudeOutcome.text as string
   }
 

@@ -20,11 +20,18 @@ vi.mock('./geminiClient.js', () => ({
   callGeminiForReview: vi.fn(),
 }))
 
-// node:fs をモック（quota-exhausted.json の書き込み検証用）
-vi.mock('node:fs', () => ({
-  writeFileSync: vi.fn(),
-  mkdirSync: vi.fn(),
-}))
+// node:fs をモック（quota-exhausted.json の書き込み・--json-schema 用の一時ファイル検証用）。
+// mkdtempSync は実際に一時ディレクトリを作る（--json-schema テストで実ファイルパスを
+// spawnSync 呼び出しへ渡す必要があるため）。rmSync は実装をそのまま使い後始末する。
+vi.mock('node:fs', async () => {
+  const actual = await vi.importActual<typeof import('node:fs')>('node:fs')
+  return {
+    writeFileSync: vi.fn(),
+    mkdirSync: vi.fn(),
+    mkdtempSync: actual.mkdtempSync,
+    rmSync: actual.rmSync,
+  }
+})
 
 import { spawnSync } from 'node:child_process'
 import { callGeminiForReview } from './geminiClient.js'
@@ -268,6 +275,122 @@ describe('callGeminiWithFallback', () => {
         const options = call[2] as { cwd?: string }
         expect(options.cwd).toBe(tmpdir())
       }
+    })
+  })
+
+  describe('cliJsonSchema による構造化出力の強制（2026-08-24 追加）', () => {
+    it('cliJsonSchema 指定時、agy へ --output-format json --json-schema を渡す', async () => {
+      mockSpawnSync.mockReturnValue(
+        cliSuccess(JSON.stringify({ structured_output: { decision: 'ALIGNED', summary: 'ok' } }))
+      )
+
+      const result = await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'gemini-3.5-flash-medium',
+        featureName: 'test',
+        cliJsonSchema: { type: 'object', properties: { decision: { type: 'string' } } },
+      })
+
+      expect(result).toBe(JSON.stringify({ decision: 'ALIGNED', summary: 'ok' }))
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      expect(args).toContain('--output-format')
+      expect(args[args.indexOf('--output-format') + 1]).toBe('json')
+      expect(args).toContain('--json-schema')
+      // --json-schema の値は一時ファイルパス。中身が指定したスキーマと一致することを確認する。
+      const schemaPathArg = args[args.indexOf('--json-schema') + 1]
+      const writtenSchema = JSON.parse(
+        mockWriteFileSync.mock.calls.find((c) => c[0] === schemaPathArg)?.[1] as string
+      )
+      expect(writtenSchema).toEqual({ type: 'object', properties: { decision: { type: 'string' } } })
+    })
+
+    it('agy の structured_output を抽出し、呼び出し元パーサーがそのまま読める JSON 文字列として返す', async () => {
+      mockSpawnSync.mockReturnValue(
+        cliSuccess(
+          JSON.stringify({
+            conversation_id: 'abc',
+            response: '{"decision":"ALIGNED"}',
+            structured_output: { decision: 'ALIGNED', summary: 'looks fine', findings: [] },
+          })
+        )
+      )
+
+      const result = await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'test-model',
+        featureName: 'test',
+        cliJsonSchema: { type: 'object' },
+      })
+
+      expect(JSON.parse(result)).toEqual({ decision: 'ALIGNED', summary: 'looks fine', findings: [] })
+    })
+
+    it('structured_output を取り出せない場合は生 stdout をそのまま返す（fail-open ではなく既存パーサーへ委ねる）', async () => {
+      mockSpawnSync.mockReturnValue(cliSuccess('not valid json at all'))
+
+      const result = await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'test-model',
+        featureName: 'test',
+        cliJsonSchema: { type: 'object' },
+      })
+
+      expect(result).toBe('not valid json at all')
+    })
+
+    it('cliJsonSchema 未指定時は --output-format/--json-schema を渡さない（既存挙動を変えない）', async () => {
+      mockSpawnSync.mockReturnValue(cliSuccess('plain text response'))
+
+      const result = await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'test-model',
+        featureName: 'test',
+      })
+
+      expect(result).toBe('plain text response')
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      expect(args).not.toContain('--output-format')
+      expect(args).not.toContain('--json-schema')
+    })
+
+    it('cliJsonSchema 指定時、プロンプトへツール不使用の指示が前置される', async () => {
+      mockSpawnSync.mockReturnValue(
+        cliSuccess(JSON.stringify({ structured_output: { decision: 'ALIGNED' } }))
+      )
+
+      await callGeminiWithFallback('original review prompt text', {
+        preferCli: true,
+        cliModel: 'test-model',
+        featureName: 'test',
+        cliJsonSchema: { type: 'object' },
+      })
+
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      const promptArg = args[args.indexOf('--print') + 1]
+      expect(promptArg).toContain('Do not use any filesystem')
+      expect(promptArg).toContain('original review prompt text')
+    })
+
+    it('Antigravity/Claude フォールバック時も cliJsonSchema が引き継がれる', async () => {
+      mockSpawnSync.mockImplementation((_cmd, args) => {
+        const model = (args as string[])[1]
+        if (model === 'claude-sonnet-4-6') {
+          const usesSchema = (args as string[]).includes('--json-schema')
+          if (!usesSchema) throw new Error('expected --json-schema on Claude fallback call')
+          return cliSuccess(JSON.stringify({ structured_output: { decision: 'ALIGNED' } }))
+        }
+        return cli429()
+      })
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+      const result = await callGeminiWithFallback('prompt', {
+        preferCli: false,
+        cliModel: 'gemini-3.5-flash-medium',
+        featureName: 'test',
+        cliJsonSchema: { type: 'object' },
+      })
+
+      expect(JSON.parse(result)).toEqual({ decision: 'ALIGNED' })
     })
   })
 
