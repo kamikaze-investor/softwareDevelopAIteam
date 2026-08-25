@@ -102,6 +102,49 @@ const FOCUS_DESCRIPTIONS: Record<MetaReviewFocus, string> = {
   scope_simplicity: 'Check scope discipline, unnecessary abstraction, accidental platform creation, and MVP simplicity.',
 }
 
+// agy（Antigravity CLI経由のGemini/Claudeフォールバック）へ渡す --json-schema。
+// 既存パーサー（parseFocusedReviewResponse / parseIntegrationReviewResponse）が
+// 期待する contract をそのまま JSON Schema 化したもので、新しい review 形式は
+// 作らない（2026-08-24: agy がエージェント的な文章を返し既存パーサーで
+// パースできない事象への対処として追加。実測で agy --json-schema がそのまま
+// 既存 contract を強制でき、パーサー側の変更は不要だった）。
+const FINDING_SCHEMA = {
+  type: 'object',
+  properties: {
+    severity: { type: 'string', enum: [...META_RISK_LEVELS] },
+    category: { type: 'string', enum: [...META_FINDING_CATEGORIES] },
+    message: { type: 'string' },
+    file: { type: 'string' },
+    line: { type: 'number' },
+    suggestion: { type: 'string' },
+  },
+  required: ['message'],
+} as const
+
+const FOCUSED_REVIEW_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    decision: { type: 'string', enum: [...STRATEGIC_DECISIONS] },
+    summary: { type: 'string' },
+    findings: { type: 'array', items: FINDING_SCHEMA },
+  },
+  required: ['decision', 'summary'],
+} as const
+
+const INTEGRATION_REVIEW_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    decision: { type: 'string', enum: [...STRATEGIC_DECISIONS] },
+    summary: { type: 'string' },
+    conflictingFocuses: {
+      type: 'array',
+      items: { type: 'string', enum: Object.keys(FOCUS_DESCRIPTIONS) },
+    },
+    unresolvedAssumptions: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['decision', 'summary'],
+} as const
+
 const CHECKLIST_FILES_BY_FOCUS: Record<Exclude<MetaReviewFocus, 'strategic_alignment'>, string[]> = {
   safety_recovery: ['guards.md', 'sandbox.md'],
   architecture_responsibility: ['worker.md', 'api_routes.md', 'shared_types.md'],
@@ -293,7 +336,9 @@ async function runLowLoadLegacyReview(
     const prompt = buildMetaReviewPrompt(request)
     const rawResponse = await callGeminiWithFallback(prompt, {
       preferCli: true,
-      cliModel: 'gemini-3.5-flash',
+      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
+      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
+      cliModel: 'gemini-3.5-flash-medium',
       apiModel: 'gemini-3.5-flash',
       featureName: 'meta_review',
     })
@@ -340,9 +385,12 @@ async function runFocusedReview(
   try {
     const rawResponse = await callGeminiWithFallback(promptContext.prompt, {
       preferCli: true,
-      cliModel: 'gemini-3.5-flash',
+      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
+      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
+      cliModel: 'gemini-3.5-flash-medium',
       apiModel: 'gemini-3.5-flash',
       featureName: `strategic-meta-review-${focus}`,
+      cliJsonSchema: FOCUSED_REVIEW_JSON_SCHEMA,
     })
     return parseFocusedReviewResponse(rawResponse, focus)
   } catch (err) {
@@ -366,9 +414,12 @@ async function runIntegrationReview(
   try {
     const rawResponse = await callGeminiWithFallback(prompt, {
       preferCli: true,
-      cliModel: 'gemini-3.5-flash',
+      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
+      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
+      cliModel: 'gemini-3.5-flash-medium',
       apiModel: 'gemini-3.5-flash',
       featureName: 'strategic-meta-review-integration',
+      cliJsonSchema: INTEGRATION_REVIEW_JSON_SCHEMA,
     })
     return parseIntegrationReviewResponse(rawResponse)
   } catch (err) {

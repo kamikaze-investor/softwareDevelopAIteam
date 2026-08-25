@@ -61,4 +61,26 @@ describe('ClaudeCodeAdapter buildArgv', () => {
       '[ClaudeCodeAdapter] Unknown aiCliMode "unknown" — refusing to run without explicit tool permissions (fail-closed)',
     )
   })
+
+  it('implement プロンプトは allowedPaths 外への自行判断の編集を禁止し、報告での代替を求める', () => {
+    // 2026-08-24 実測: 許可範囲は docs/ と README.md だったが、Claude Code が
+    // 自行判断でリポジトリ直下の ROADMAP.md を編集した。プロンプト接頭辞で
+    // 範囲外編集の禁止と「変更せず報告」を明示する。
+    const argv = adapter.testArgv(createRequest('implement'))
+    const prompt = argv[argv.indexOf('--print') + 1]
+
+    expect(prompt).toContain('allowedPaths')
+    expect(prompt).toContain('自行判断で変更することも禁止します')
+    expect(prompt).toContain('結果報告でその不足を伝えてください')
+  })
+
+  it('scope 制約の追記は implement モードに限定され、他モードの接頭辞は変更しない', () => {
+    for (const mode of ['review', 'qa', 'summarize'] as const) {
+      const argv = adapter.testArgv(createRequest(mode))
+      const prompt = argv[argv.indexOf('--print') + 1]
+
+      expect(prompt).not.toContain('allowedPaths')
+      expect(prompt).not.toContain('自行判断で変更することも禁止します')
+    }
+  })
 })

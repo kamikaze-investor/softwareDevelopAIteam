@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from 'fastify'
 import cors from '@fastify/cors'
 import os from 'node:os'
 import path from 'node:path'
+import { execFileSync } from 'node:child_process'
 import { mkdirSync, existsSync } from 'node:fs'
 import type { Project } from '@ai-team/shared'
 
@@ -10,6 +11,13 @@ vi.mock('../ctoAi/initialImplementWorkflow.js', () => ({ createInitialImplementW
 
 
 process.env.DB_PATH = ':memory:'
+
+/** target-project は実運用では常にgit repoであるため、テストでも同じ前提を再現する */
+function initGitRepo(dir: string): void {
+  execFileSync('git', ['init', '--quiet'], { cwd: dir })
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir })
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir })
+}
 
 const VALID_SPEC_TEXT = 'This test specification is intentionally longer than fifty characters so validation can pass.'
 
@@ -64,6 +72,7 @@ describe('CTO AI API', () => {
     process.env.DB_PATH = ':memory:'
     tmpDir = path.join(os.tmpdir(), `cto-test-${Date.now()}`)
     mkdirSync(tmpDir, { recursive: true })
+    initGitRepo(tmpDir)
     process.env.TARGET_ROOT = tmpDir
   })
 
@@ -303,6 +312,7 @@ describe('CTO AI — generate-roadmap API', () => {
     process.env.DB_PATH = ':memory:'
     tmpDir = path.join(os.tmpdir(), `roadmap-api-test-${Date.now()}`)
     mkdirSync(tmpDir, { recursive: true })
+    initGitRepo(tmpDir)
     process.env.TARGET_ROOT = tmpDir
   })
 

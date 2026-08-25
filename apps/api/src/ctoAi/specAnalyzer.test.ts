@@ -1,4 +1,12 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
+
+const anthropicMocks = vi.hoisted(() => ({ create: vi.fn() }))
+
+vi.mock('@anthropic-ai/sdk', () => ({
+  default: class Anthropic {
+    messages = { create: anthropicMocks.create }
+  },
+}))
 import { parseAnalysisJson, analyzeSpec } from './specAnalyzer.js'
 
 const VALID_ANALYSIS_JSON = JSON.stringify({
@@ -59,6 +67,20 @@ describe('parseAnalysisJson', () => {
     const badScore = JSON.parse(VALID_ANALYSIS_JSON)
     badScore.readinessScore = 150
     expect(() => parseAnalysisJson(JSON.stringify(badScore))).toThrow()
+  })
+})
+
+describe('analyzeSpec (default model)', () => {
+  it('uses the current Anthropic Haiku model by default', async () => {
+    anthropicMocks.create.mockResolvedValueOnce({
+      content: [{ type: 'text', text: VALID_ANALYSIS_JSON }],
+    })
+
+    await analyzeSpec('テスト仕様書のテキスト（50文字以上にするためにここに追加テキストを入れます）', { apiKey: 'test-api-key' })
+
+    expect(anthropicMocks.create).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'claude-haiku-4-5-20251001',
+    }))
   })
 })
 

@@ -9,6 +9,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Roadmap, GeneratedTask } from './roadmapGenerator.js'
+import { commitGeneratedDocs } from './commitGeneratedDocs.js'
 
 export interface RoadmapWriteResult {
   writtenFiles: string[]
@@ -105,6 +106,15 @@ export function writeRoadmap(
 
   writeFileSync(roadmapPath, buildRoadmapMd(roadmap), 'utf-8')
   writeFileSync(taskGraphPath, buildTaskGraphMd(roadmap), 'utf-8')
+
+  // CTO AIが機械的に生成したドキュメントをその場でcommitする。
+  // uncommittedのまま残すと、直後にauto-startされる実装JobのFile Change Guardが
+  // これらを誤って「Taskによる変更」として検出し、allowedPaths外として誤blockする。
+  commitGeneratedDocs(
+    targetProjectRoot,
+    [roadmapPath, taskGraphPath],
+    'chore(cto-ai): update roadmap docs',
+  )
 
   return {
     writtenFiles: [roadmapPath, taskGraphPath],

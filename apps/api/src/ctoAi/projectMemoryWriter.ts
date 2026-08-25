@@ -16,6 +16,7 @@
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
 import type { SpecAnalysis } from './specAnalyzer.js'
+import { commitGeneratedDocs } from './commitGeneratedDocs.js'
 
 export interface ProjectMemoryWriteResult {
   targetDir: string
@@ -158,6 +159,11 @@ ${analysis.requiredExternalServices.map(s => `## ${s.name}
 `
   writeFile(path.join(memoryDir, 'external_services.md'), servicesContent)
   writtenFiles.push('docs/project_memory/external_services.md')
+
+  // CTO AIが機械的に生成したドキュメントをその場でcommitする。
+  // uncommittedのまま残すと、直後にauto-startされる実装JobのFile Change Guardが
+  // これらを誤って「Taskによる変更」として検出し、allowedPaths外として誤blockする。
+  commitGeneratedDocs(targetProjectRoot, writtenFiles, 'chore(cto-ai): update project memory docs')
 
   return {
     targetDir: memoryDir,

@@ -237,6 +237,54 @@ describe('fileChangeGuard — Task ポリシー', () => {
 
     expect(result.allowed).toBe(false)
   })
+
+  it('末尾スラッシュなしの allowedPaths は従来どおり配下の変更を許可する', () => {
+    const result = fileChangeGuard(
+      manifest(modified('src/runner/workflow-runner.js')),
+      policy({ allowedPaths: ['src/runner'] }),
+      WORKTREE,
+    )
+
+    expect(result.allowed).toBe(true)
+  })
+})
+
+describe('fileChangeGuard — allowedPaths の末尾スラッシュ正規化（2026-08-24 誤拒否修正）', () => {
+  // roadmapGenerator のプロンプト規約上、allowedPaths は「src/runner/」のように
+  // 末尾スラッシュ付きで生成される。正規化せずに ap + '/' と連結すると
+  // 「src/runner//」という二重スラッシュ一致になり、配下の正当なファイルまで
+  // 拒否されていた（task 73c75496 の実測による誤拒否）。
+  it('末尾スラッシュ付きの allowedPaths も配下の変更を許可する', () => {
+    const result = fileChangeGuard(
+      manifest(modified('src/runner/workflow-runner.js')),
+      policy({ allowedPaths: ['src/workflow/', 'src/runner/'] }),
+      WORKTREE,
+    )
+
+    expect(result.allowed).toBe(true)
+    expect(result.violations).toEqual([])
+  })
+
+  it('末尾スラッシュ付きでも範囲外のファイルは拒否する（過剰許可にしない）', () => {
+    const result = fileChangeGuard(
+      manifest(added('src/other/x.ts')),
+      policy({ allowedPaths: ['src/runner/'] }),
+      WORKTREE,
+    )
+
+    expect(result.allowed).toBe(false)
+    expect(result.reasons['src/other/x.ts']).toMatch(/allowedPaths/)
+  })
+
+  it('末尾スラッシュ付きエントリそのものと一致する path も許可する', () => {
+    const result = fileChangeGuard(
+      manifest(modified('src/runner')),
+      policy({ allowedPaths: ['src/runner/'] }),
+      WORKTREE,
+    )
+
+    expect(result.allowed).toBe(true)
+  })
 })
 
 describe('fileChangeGuard — パス境界', () => {

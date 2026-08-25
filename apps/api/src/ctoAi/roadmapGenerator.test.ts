@@ -1,4 +1,12 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
+
+const anthropicMocks = vi.hoisted(() => ({ create: vi.fn() }))
+
+vi.mock('@anthropic-ai/sdk', () => ({
+  default: class Anthropic {
+    messages = { create: anthropicMocks.create }
+  },
+}))
 import { parseRoadmapJson, generateRoadmap } from './roadmapGenerator.js'
 import type { SpecAnalysis } from './specAnalyzer.js'
 
@@ -105,6 +113,20 @@ describe('parseRoadmapJson', () => {
       tasks: [{ ...JSON.parse(MOCK_ROADMAP_JSON).tasks[0], id: 'TASK001' }],
     })
     expect(() => parseRoadmapJson(invalidId)).toThrow()
+  })
+})
+
+describe('generateRoadmap (default model)', () => {
+  it('uses the current Anthropic Haiku model by default', async () => {
+    anthropicMocks.create.mockResolvedValueOnce({
+      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
+    })
+
+    await generateRoadmap(MOCK_ANALYSIS, { apiKey: 'test-api-key' })
+
+    expect(anthropicMocks.create).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'claude-haiku-4-5-20251001',
+    }))
   })
 })
 
