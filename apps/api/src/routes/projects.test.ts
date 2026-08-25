@@ -1,7 +1,24 @@
+import { mkdirSync } from 'node:fs'
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Approval, ApprovalType, JobStatus, Project, ProjectRoadmapCompletion } from '@ai-team/shared'
+
+const roadmapMocks = vi.hoisted(() => ({ generateRoadmap: vi.fn() }))
+vi.mock('../ctoAi/roadmapGenerator.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../ctoAi/roadmapGenerator.js')>()),
+  generateRoadmap: roadmapMocks.generateRoadmap,
+}))
+vi.mock('../designReview/designReviewCoordinator', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../designReview/designReviewCoordinator')>()),
+  buildDefaultCoordinatorDeps: () => ({
+    runnerCommand: 'node', runnerArgs: [], homeDirectory: '/tmp', workingDir: '/tmp',
+    execute: async () => ({ ok: true, timedOut: false, stdout: JSON.stringify({
+      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+      integrationReviewResult: { decision: 'ALIGNED' },
+    }) }),
+  }),
+}))
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { approvalRoutes }, { resetStorage }] = await Promise.all([
@@ -92,6 +109,9 @@ async function createApproval(
 beforeEach(() => {
   vi.resetModules()
   process.env.DB_PATH = ':memory:'
+  process.env.TARGET_ROOT = '/tmp/project-route-test'
+  mkdirSync(process.env.TARGET_ROOT, { recursive: true })
+  roadmapMocks.generateRoadmap.mockResolvedValue({ phases: [{ number: 1, name: 'Foundation', goal: 'Start', tasks: ['task-001'] }], tasks: [{ id: 'task-001', title: 'Implement', description: 'Implement.', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small' }], totalTasks: 1, estimatedWeeks: 1 })
 })
 
 describe('Project API', () => {
@@ -403,7 +423,7 @@ describe('Project API', () => {
         payload: { name: 'Still running', status: 'running' },
       })
 
-      expect(res.statusCode).toBe(200)
+      expect(res.statusCode, res.body).toBe(200)
       const body = parseBody<Project>(res.body)
       expect(body.id).toBe(running.id)
       expect(body.name).toBe('Still running')
@@ -424,6 +444,19 @@ describe('Project API', () => {
 
       expect(res.statusCode).toBe(200)
       expect(parseBody<Project[]>(res.body)).toHaveLength(statuses.length * 2)
+    })
+  })
+
+  it('starts draft through roadmap task and initial job once', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const first = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+      expect(first.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage(); const tasks = storage.tasks.findByProjectId(project.id)
+      expect(tasks).toHaveLength(1); expect(storage.jobs.findByTaskId(tasks[0].id)).toHaveLength(1)
+      const second = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+      expect(second.statusCode).toBe(200); expect(storage.tasks.findByProjectId(project.id)).toHaveLength(1); expect(storage.jobs.findByTaskId(tasks[0].id)).toHaveLength(1)
     })
   })
 

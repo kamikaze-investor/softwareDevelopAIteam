@@ -6,6 +6,9 @@ import path from 'node:path'
 import { mkdirSync, existsSync } from 'node:fs'
 import type { Project } from '@ai-team/shared'
 
+vi.mock('../ctoAi/initialImplementWorkflow.js', () => ({ createInitialImplementWorkflow: async (_storage: unknown, taskId: string) => ({ taskId, status: 'skipped', reason: 'test' }) }))
+
+
 process.env.DB_PATH = ':memory:'
 
 const VALID_SPEC_TEXT = 'This test specification is intentionally longer than fifty characters so validation can pass.'

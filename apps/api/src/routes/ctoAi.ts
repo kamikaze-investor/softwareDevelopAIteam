@@ -11,12 +11,9 @@ import path from 'node:path'
 import { z } from 'zod'
 import { analyzeSpec } from '../ctoAi/specAnalyzer.js'
 import { writeProjectMemory } from '../ctoAi/projectMemoryWriter.js'
-import { generateRoadmap } from '../ctoAi/roadmapGenerator.js'
-import { writeRoadmap } from '../ctoAi/roadmapWriter.js'
+import { initializeApprovedProject, ProjectInitializationError } from '../ctoAi/projectInitialization.js'
 import { getStorage } from '../storage'
-import { validateRoadmapTasks, validateRoadmapPhases, type RoadmapSyncTaskInput, type RoadmapSyncPhaseInput } from '../storage/roadmapTaskValidation'
 import { validateTargetRoot } from '../utils/pathGuard.js'
-import { createInitialImplementWorkflow } from '../ctoAi/initialImplementWorkflow.js'
 
 const CONFIGURED_TARGET_ROOT = process.env.TARGET_ROOT ?? '/workspace/target'
 
@@ -110,6 +107,9 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
           : `Gap が ${mustResolveGaps.length} 件あります。解決後に再度実行してください。`,
       })
     } catch (err: any) {
+      if (err instanceof ProjectInitializationError) {
+        return reply.status(err.statusCode).send({ error: err.message, ...err.details })
+      }
       const isApiKeyError = err.message?.includes('ANTHROPIC_API_KEY')
       return reply.status(isApiKeyError ? 503 : 500).send({
         error: isApiKeyError
@@ -150,54 +150,11 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
     }
 
     try {
-      // 1. ロードマップ生成（Claude API or mock）
-      const roadmap = await generateRoadmap(analysis as any, { mockResponse })
-
-      const roadmapTasks: RoadmapSyncTaskInput[] = roadmap.tasks.map((task) => ({
-        roadmapTaskKey: task.id,
-        title: task.title,
-        description: task.description,
-        phase: task.phase,
-        assignee: task.assignee,
-        dependencies: task.dependencies,
-        acceptanceCriteria: task.acceptanceCriteria,
-        allowedPaths: task.allowedPaths,
-      }))
-      const roadmapPhases: RoadmapSyncPhaseInput[] = roadmap.phases.map((phase) => ({
-        phaseNumber: phase.number,
-        name: phase.name,
-        goal: phase.goal,
-      }))
-
-      const validationIssues = [
-        ...validateRoadmapTasks(roadmapTasks),
-        ...validateRoadmapPhases(roadmapPhases, roadmapTasks),
-      ]
-      if (validationIssues.length > 0) {
-        return reply.status(422).send({
-          error: 'ロードマップの検証に失敗しました',
-          issues: validationIssues,
-        })
-      }
-
-      const syncResult = storage.tasks.syncRoadmapTasks({ projectId, tasks: roadmapTasks, phases: roadmapPhases })
-      if (!syncResult.ok) {
-        return reply.status(409).send({
-          error: 'ロードマップの同期に失敗しました',
-          detail: syncResult.failureReason,
-          conflicts: syncResult.conflicts,
-          phaseConflicts: syncResult.phaseConflicts,
-        })
-      }
-
-      // 2. target-project に書き出し（人間向けsnapshot。正本はDB）
-      const writeResult = writeRoadmap(roadmap, targetProjectRoot)
-
-      // DB同期とMarkdown保存が両方成功した後だけ、初回workflowへ投入する。
-      // 公開Job APIを経由せず、workflowStepKeyは内部producerだけが所有する。
-      const initialWorkflow = await Promise.all(
-        syncResult.createdTaskIds.map((taskId) => createInitialImplementWorkflow(storage, taskId)),
-      )
+      const result = await initializeApprovedProject(storage, project, targetProjectRoot, {
+        analysis,
+        mockResponse,
+      })
+      const { roadmap, syncResult, initialWorkflow } = result
 
       return reply.status(201).send({
         status: 'roadmap_generated',
@@ -215,12 +172,15 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
           phasesDeactivated: syncResult.deactivatedPhaseNumbers.length,
         },
         initialWorkflow,
-        writtenFiles: writeResult.writtenFiles,
-        targetDir: writeResult.targetDir,
+        writtenFiles: result.writtenFiles,
+        targetDir: result.targetDir,
         roadmap,
         message: `ロードマップを生成しました（${roadmap.totalTasks} タスク / ${roadmap.phases.length} フェーズ）`,
       })
     } catch (err: any) {
+      if (err instanceof ProjectInitializationError) {
+        return reply.status(err.statusCode).send({ error: err.message, ...err.details })
+      }
       const isApiKeyError = err.message?.includes('ANTHROPIC_API_KEY')
       return reply.status(isApiKeyError ? 503 : 500).send({
         error: isApiKeyError
