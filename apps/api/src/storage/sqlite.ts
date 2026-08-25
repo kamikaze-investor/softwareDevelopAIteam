@@ -1495,6 +1495,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, reason: 'The latest approval request is waiting for user review' }
         }
 
+        // git_commit SafeCommand Job（AI CLIを介さない）の resume。
+        // STALE化した古いapprovalは再利用・再承認しない: 新Jobはworkflow_step_keyを
+        // 変えて作成するため approvalId を引き継がず、/gate/check が現在のdiffに対して
+        // 新しいapprovalを発行する（既存の git_commit Job生成と同じ形、既存のGate/Queueのまま）。
+        if (latestJob.safeCommand.kind === 'git_commit') {
+          const job = jobs.create({
+            taskId,
+            projectId: latestJob.projectId,
+            agentRole: latestJob.agentRole,
+            status: 'queued',
+            workflowStepKey: `resume:${latestJob.id}:1`,
+            safeCommand: { ...latestJob.safeCommand, workingDir: TARGET_WORKING_DIR },
+            dryRun: latestJob.dryRun,
+          })
+          return { ok: true, job }
+        }
+
         if (!latestJob.aiCliProvider || !latestJob.aiCliMode) {
           return { ok: false, reason: 'Latest blocked job is missing AI CLI provider or mode' }
         }
