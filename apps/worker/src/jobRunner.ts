@@ -33,6 +33,7 @@ import type { StepReviewResult } from './approvalLevel/stepReview.js'
 import { runPostReview } from './approvalLevel/postReviewer.js'
 import type { PostReviewResult } from './approvalLevel/postReviewer.js'
 import { evaluateCommitGate } from './approvalLevel/commitGate.js'
+import { deriveTargetProjectApprovalLevel } from './approvalLevel/targetProjectApprovalLevel.js'
 import { runSafetyVerification } from './approvalLevel/safetyVerifier.js'
 import type { SafetyVerificationResult } from './approvalLevel/safetyVerifier.js'
 import { appendObservationLog } from './approvalLevel/observationLog.js'
@@ -937,17 +938,24 @@ export async function runJob(
   // git_commit 承認判断には一切影響しない観察専用経路で接続する。
   // - git_commit Job のみで実行し、test/lint/build 等では何も出さない
   // - 判定結果はconsole.logのみ。停止・通知・永続化は行わない（Job結果にも載せない）
-  // - approvalLevelResult は control repo 基準の分類器を target_project Job に便宜的に
-  //   適用した参考ラベル（上記 Step6-A2 の既知の限界）のため、多くの場合
-  //   ceo_required と観測される。これは Phase 1 では期待通りの観測結果であり、回避しない
+  // - 既存の targetProjectRiskScanResult.highestSeverity を既存の4tier
+  //   ReviewPolicy（mechanical_only / light_ai_post_review / full_pre_post_review /
+  //   ceo_required）に1:1対応させた ApprovalLevelResult を使用する
+  //   （control repo基準の classifier は target_project ファイルに適用すると
+  //     常に UNMATCHED_FALLBACK → Level3/ceo_required になるため）。
   // - preReviewResult は現状どこでも計算されていないため常にundefined。
   //   full_pre_post_review 時は成果物欠落として fail-closed 表示になる（commitGateの正しい挙動）
   if (job.safeCommand.kind === 'git_commit') {
     try {
+      const shadowApprovalLevelResult = deriveTargetProjectApprovalLevel({
+        jobId: job.id,
+        taskId: job.taskId,
+        riskScanResult: targetProjectRiskScanResult,
+      })
       const shadowCommitGateResult = evaluateCommitGate({
         jobId: job.id,
         taskId: job.taskId,
-        approvalLevelResult,
+        approvalLevelResult: shadowApprovalLevelResult,
         preReviewResult: undefined,
         postReviewResult,
         safetyVerificationResult,

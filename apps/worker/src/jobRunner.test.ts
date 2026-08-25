@@ -3271,7 +3271,7 @@ describe('Shadow Commit Gate (Phase 1 observation wiring)', () => {
     mockGitCommitRun(BASE_COMMIT, 'aftercommit000000000000000000000000000000')
   }
 
-  it('git_commit Job で SafeCommand 実行前に1回だけ呼ばれ、3つの観察成果物を渡す', async () => {
+  it('git_commit Job で SafeCommand 実行前に1回だけ呼ばれ、target_project-calibrated の approvalLevelResult を渡す', async () => {
     setupSuccessfulGitCommit()
 
     const result = await runJob(gitCommitShadowJob(), createPolicy())
@@ -3281,13 +3281,13 @@ describe('Shadow Commit Gate (Phase 1 observation wiring)', () => {
     expect(evaluateCommitGateMock).toHaveBeenCalledWith({
       jobId: 'job-1',
       taskId: 'task-1',
+      // target_project Risk Scan結果（テスト環境ではデフォルトでリスクなし）
+      // を deriveTargetProjectApprovalLevel() でマッピングした結果が渡される
       approvalLevelResult: expect.objectContaining({
         jobId: 'job-1',
         taskId: 'task-1',
-        // target_project向けファイルは分類器の既知パターンに一致せず
-        // UNMATCHED_FALLBACK → Level3/ceo_required になる（Phase 1では期待通りの観測値）
-        level: 3,
-        reviewPolicy: 'ceo_required',
+        level: 0,
+        reviewPolicy: 'mechanical_only',
       }),
       preReviewResult: undefined,
       postReviewResult: undefined,
