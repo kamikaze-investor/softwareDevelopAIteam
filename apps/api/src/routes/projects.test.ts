@@ -19,6 +19,7 @@ vi.mock('../designReview/designReviewCoordinator', async (importOriginal) => ({
     }) }),
   }),
 }))
+vi.mock('../ctoAi/projectMemoryWriter.js', async (importOriginal) => ({ ...(await importOriginal()), writeProjectMemory: () => ({ writtenFiles: [], targetDir: process.env.TARGET_ROOT ?? '/tmp' }) }))
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { approvalRoutes }, { resetStorage }] = await Promise.all([
