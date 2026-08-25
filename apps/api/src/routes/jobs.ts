@@ -11,6 +11,7 @@ import {
   describeApplicableJobStatuses,
 } from '../jobResultApplicationPolicy'
 import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from '../designReview/repairFlow'
+import { REPAIR_STEP_PREFIX } from '../designReview/repairPolicy'
 import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
 import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
 
@@ -462,8 +463,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const isInitialImplementWorkflowJob =
       existing.workflowStepKey === `task:${existing.taskId}:initial-implement` &&
       existing.aiCliMode === 'implement'
+    // repair Job（workflowStepKey: `repair:<sourceJobId>:1`、既存 REPAIR_STEP_PREFIX を再利用）も
+    // implement Jobの一種であり、initial-implement Jobと同じ「成功したらreviewが必要」という
+    // 責務を持つ。repair success後にreviewが生成されず停止していたのを、既存のreview生成経路を
+    // そのまま再利用して解消する（新しいworkflow/Queue/state管理は追加しない）。
+    const isRepairImplementJob =
+      existing.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true &&
+      existing.aiCliMode === 'implement'
+    const requiresPostImplementReview = isInitialImplementWorkflowJob || isRepairImplementJob
     const shouldCreateReview =
-      isInitialImplementWorkflowJob &&
+      requiresPostImplementReview &&
       existing.safeCommand.kind === 'test' &&
       jobUpdate.status === 'success' &&
       jobUpdate.exitCode === 0 &&
