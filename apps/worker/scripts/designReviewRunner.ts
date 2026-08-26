@@ -24,12 +24,14 @@ import { resolve } from 'node:path'
  *
  * least privilege: レビュー実行経路（metaReviewer/approvalLevel）が実際に参照する
  * secret は GEMINI_API_KEY のみで、GEMINI_MODEL は非secretの設定値である。
+ * Copilot CLI フォールバック（metaReviewFallbackRouter.ts → copilotRouter.ts）が
+ * strategicReview.ts 経由で実際に機能するには GITHUB_TOKEN もプロセス env に必要。
  * API_TOKEN / ADMIN_TOKEN_SHA256 / WORKER_TOKEN_SHA256 / OPENCODE_GO_API_KEY /
- * GITHUB_TOKEN / CLAUDE_API_KEY / OPENAI_API_KEY 等は、このプロセスの process.env へ
+ * CLAUDE_API_KEY / OPENAI_API_KEY 等は、このプロセスの process.env へ
  * 一切載せない。reviewer child は本プロセスの env を継承するため、ここで載せないことが
  * そのまま child への非伝播になる。
  */
-const ENV_ALLOWLIST: readonly string[] = ['GEMINI_API_KEY', 'GEMINI_MODEL']
+const ENV_ALLOWLIST: readonly string[] = ['GEMINI_API_KEY', 'GEMINI_MODEL', 'GITHUB_TOKEN']
 
 export interface DesignReviewRunnerInput {
   taskId: string
