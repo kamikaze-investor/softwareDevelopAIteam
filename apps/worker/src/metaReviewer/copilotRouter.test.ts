@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { tmpdir } from 'node:os'
 
 vi.mock('node:child_process', () => ({
   spawnSync: vi.fn(),
@@ -58,6 +59,42 @@ describe('callCopilotForMetaReview', () => {
     expect(args).not.toContain('--allow-all')
     expect(args).not.toContain('--allow-all-tools')
     expect(args.some(a => a.startsWith('--allow-tool'))).toBe(false)
+  })
+
+  it('cwd をリポジトリ外の一時ディレクトリに固定する（2026-08-26 独立レビュー: --allow-toolなしでも cwd 配下は確認なしで読めることを実測確認したため）', () => {
+    mockSpawnSync.mockReturnValue(success('ok'))
+
+    callCopilotForMetaReview('prompt')
+
+    const options = mockSpawnSync.mock.calls[0][2] as { cwd?: string }
+    expect(options.cwd).toBe(tmpdir())
+  })
+
+  it('子プロセスへ渡す env に秘密情報を含めない（PATH/HOME/LANG/TERM/GITHUB_TOKEN のみ、2026-08-26 独立レビュー修正）', () => {
+    const originalEnv = { ...process.env }
+    process.env.GEMINI_API_KEY = 'should-not-leak'
+    process.env.CLAUDE_API_KEY = 'should-not-leak'
+    process.env.OPENAI_API_KEY = 'should-not-leak'
+    process.env.API_TOKEN = 'should-not-leak'
+    process.env.GITHUB_TOKEN = 'gh-token-should-be-allowed'
+
+    try {
+      mockSpawnSync.mockReturnValue(success('ok'))
+
+      callCopilotForMetaReview('prompt')
+
+      const options = mockSpawnSync.mock.calls[0][2] as { env?: NodeJS.ProcessEnv }
+      const env = options.env as NodeJS.ProcessEnv
+      const keys = Object.keys(env).sort()
+      expect(keys).toEqual(keys.filter((k) => ['PATH', 'HOME', 'LANG', 'TERM', 'GITHUB_TOKEN'].includes(k)))
+      expect(env.GITHUB_TOKEN).toBe('gh-token-should-be-allowed')
+      expect(env.GEMINI_API_KEY).toBeUndefined()
+      expect(env.CLAUDE_API_KEY).toBeUndefined()
+      expect(env.OPENAI_API_KEY).toBeUndefined()
+      expect(env.API_TOKEN).toBeUndefined()
+    } finally {
+      process.env = originalEnv
+    }
   })
 
   it('exit code != 0 のとき例外を投げる（quotaエラーを隠さない）', () => {

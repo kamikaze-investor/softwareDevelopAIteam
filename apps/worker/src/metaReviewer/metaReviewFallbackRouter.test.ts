@@ -56,6 +56,16 @@ describe('reviewWithProviderFallback', () => {
     expect(mockCopilot).not.toHaveBeenCalled()
   })
 
+  it('geminiRouter が実際に投げる「非quota」文言（2026-08-26修正後の形式）でも Copilot を試さない', async () => {
+    // geminiRouter.ts の handleBothExhausted() は quota 起因と確認できない場合、
+    // "Gemini quota exhausted" ではなく "Gemini failed, non-quota" を投げる
+    // （独立レビューで発覚した quota/非quota混同バグの修正）。
+    mockGemini.mockRejectedValue(new Error('[geminiRouter] Gemini failed, non-quota (feature: meta_review)'))
+
+    await expect(reviewWithProviderFallback('prompt')).rejects.toThrow('Gemini failed, non-quota')
+    expect(mockCopilot).not.toHaveBeenCalled()
+  })
+
   it('quota 枯渇後に Copilot 自体も失敗したらそのエラーがそのまま伝播する', async () => {
     mockGemini.mockRejectedValue(new Error('[geminiRouter] Gemini quota exhausted (feature: meta_review)'))
     mockCopilot.mockImplementation(() => {
