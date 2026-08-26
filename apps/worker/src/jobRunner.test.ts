@@ -2876,7 +2876,7 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
     expect(result.status).toBe('success')
   })
 
-  it('Risk Scan severity: low/none → runPostReviewは呼ばれず、postReviewResultはundefined', async () => {
+  it('Risk Scan severity: none（hasRisk:false）→ runPostReviewは呼ばれず、postReviewResultはundefined', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return 'docs/README.md\n'
       return gitFallback(args)
@@ -2886,6 +2886,44 @@ describe('postReviewer接続（Step R4-A・観察モード）', () => {
 
     expect(runPostReviewMock).not.toHaveBeenCalled()
     expect(result.postReviewResult).toBeUndefined()
+  })
+
+  it('Risk Scan severity: low（hasRisk:true）+ aiCliProviderあり → runPostReviewが呼ばれ、postReviewResultが得られる（Phase 1c: lowもtrigger対象）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'src/index.ts\n'
+      if (Array.isArray(args) && args.includes('diff')) return 'diff --git a/src/index.ts b/src/index.ts\n+it.skip("test", () => {})\n'
+      return gitFallback(args)
+    })
+    const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: ['src/index.ts'] })) }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+    runPostReviewMock.mockResolvedValue({
+      jobId: 'job-1',
+      taskId: 'task-1',
+      reviewerResult: {
+        provider: 'gemini',
+        phase: 'post',
+        verdict: 'approved',
+        summary: '低リスク変更で整合している',
+        issues: [],
+        confidence: 0.85,
+        generatedAt: '2026-01-01T00:00:00.000Z',
+        rawResponse: '',
+      },
+      alignmentVerdict: 'aligned',
+      blocked: false,
+      decidedAt: '2026-01-01T00:00:00.000Z',
+    })
+
+    const job = createJob({
+      aiCliProvider: 'gemini',
+      aiCliPrompt: 'テストスキップを修正してください',
+      aiCliMode: 'implement',
+    })
+    const result = await runJob(job, createPolicy())
+
+    expect(runPostReviewMock).toHaveBeenCalledTimes(1)
+    expect(result.postReviewResult?.alignmentVerdict).toBe('aligned')
+    expect(result.status).toBe('success')
   })
 
   it('severity: medium だが job.aiCliProvider がない → runPostReviewは呼ばれず、postReviewResultはundefined', async () => {

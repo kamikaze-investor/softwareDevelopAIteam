@@ -26,6 +26,9 @@
  *                 CLAUDE.md を自動読込しない → Context Pack に必ず要点を含めること
  *   gemini      — Project Reviewer AI（コード品質レビュー）
  *                 Meta Reviewer は CLI ではなく API (geminiClient.ts) を使うこと
+ *   copilot     — GitHub Copilot CLI。Meta Review の Gemini API/CLI 両方 quota 枯渇時の
+ *                 最終フォールバック（metaReviewer/copilotRouter.ts）。
+ *                 将来の Independent Review / implementation 用の共通アダプターとしても使う。
  *
  * 重要: 1タスク = 1プロバイダー原則
  *   同一タスク内で claude_code と codex を混在させない。
@@ -34,6 +37,7 @@ export type AiCliProvider =
   | 'claude_code'  // Claude Code CLI (claude コマンド)
   | 'codex'        // OpenAI Codex CLI (codex コマンド)
   | 'gemini'       // Gemini CLI (gemini コマンド)
+  | 'copilot'      // GitHub Copilot CLI (copilot コマンド)
 
 // ────────────────────────────────────────────────────────────
 // Mode
