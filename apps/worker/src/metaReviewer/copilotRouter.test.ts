@@ -93,7 +93,11 @@ describe('callCopilotForMetaReview', () => {
     process.env.CLAUDE_API_KEY = 'should-not-leak'
     process.env.OPENAI_API_KEY = 'should-not-leak'
     process.env.API_TOKEN = 'should-not-leak'
-    process.env.GITHUB_TOKEN = 'gh-token-should-be-allowed'
+    // production では designReviewCoordinator.ts の buildRunnerEnv() が
+    // COPILOT_GITHUB_TOKEN のみを子プロセスへ渡す（GITHUB_TOKEN 自体は渡ってこない）。
+    // copilot CLI 自体が要求する変数名は GITHUB_TOKEN のままなので、ここで詰め替える。
+    delete process.env.GITHUB_TOKEN
+    process.env.COPILOT_GITHUB_TOKEN = 'gh-token-should-be-allowed'
 
     try {
       mockSpawnSync.mockReturnValue(success('ok'))
@@ -105,10 +109,29 @@ describe('callCopilotForMetaReview', () => {
       const keys = Object.keys(env).sort()
       expect(keys).toEqual(keys.filter((k) => ['PATH', 'HOME', 'LANG', 'TERM', 'GITHUB_TOKEN'].includes(k)))
       expect(env.GITHUB_TOKEN).toBe('gh-token-should-be-allowed')
+      expect(env).not.toHaveProperty('COPILOT_GITHUB_TOKEN')
       expect(env.GEMINI_API_KEY).toBeUndefined()
       expect(env.CLAUDE_API_KEY).toBeUndefined()
       expect(env.OPENAI_API_KEY).toBeUndefined()
       expect(env.API_TOKEN).toBeUndefined()
+    } finally {
+      process.env = originalEnv
+    }
+  })
+
+  it('COPILOT_GITHUB_TOKEN が未設定なら GITHUB_TOKEN も渡さない（プレーンな GITHUB_TOKEN 単体では認証しない）', () => {
+    const originalEnv = { ...process.env }
+    delete process.env.COPILOT_GITHUB_TOKEN
+    process.env.GITHUB_TOKEN = 'plain-github-token-must-not-leak'
+
+    try {
+      mockSpawnSync.mockReturnValue(success('ok'))
+
+      callCopilotForMetaReview('prompt')
+
+      const options = mockSpawnSync.mock.calls[0][2] as { env?: NodeJS.ProcessEnv }
+      const env = options.env as NodeJS.ProcessEnv
+      expect(env).not.toHaveProperty('GITHUB_TOKEN')
     } finally {
       process.env = originalEnv
     }

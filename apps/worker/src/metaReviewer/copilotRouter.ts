@@ -46,7 +46,10 @@ function buildCopilotEnv(): NodeJS.ProcessEnv {
   if (process.env.HOME !== undefined) env.HOME = process.env.HOME
   if (process.env.LANG !== undefined) env.LANG = process.env.LANG
   if (process.env.TERM !== undefined) env.TERM = process.env.TERM
-  if (process.env.GITHUB_TOKEN !== undefined) env.GITHUB_TOKEN = process.env.GITHUB_TOKEN
+  // production ではこの子プロセス env に GITHUB_TOKEN 自体は渡ってこない
+  // （designReviewCoordinator.ts の buildRunnerEnv() が渡すのは COPILOT_GITHUB_TOKEN のみ）。
+  // copilot CLI 自体が要求する変数名は GITHUB_TOKEN のままなので、ここで詰め替える。
+  if (process.env.COPILOT_GITHUB_TOKEN !== undefined) env.GITHUB_TOKEN = process.env.COPILOT_GITHUB_TOKEN
   return env
 }
 
