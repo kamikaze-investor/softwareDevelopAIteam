@@ -33,6 +33,7 @@ import type { StepReviewResult } from './approvalLevel/stepReview.js'
 import { runPostReview } from './approvalLevel/postReviewer.js'
 import type { PostReviewResult } from './approvalLevel/postReviewer.js'
 import { evaluateCommitGate } from './approvalLevel/commitGate.js'
+import { deriveTargetProjectApprovalLevel } from './approvalLevel/targetProjectApprovalLevel.js'
 import { runSafetyVerification } from './approvalLevel/safetyVerifier.js'
 import type { SafetyVerificationResult } from './approvalLevel/safetyVerifier.js'
 import { appendObservationLog } from './approvalLevel/observationLog.js'
@@ -877,7 +878,11 @@ export async function runJob(
   // ── Gemini Flash Stepレビュー終端 ───────────────────────────────────────────
 
   // ── postReviewer接続（Step R4-A・観察モード・非停止） ─────────────────────────
-  // 既存Gemini Step Reviewと同じ呼び出し条件（Risk Scan severity: medium/high）に加え、
+  // Phase 1c: postReviewer は severity が 'low' 以上（hasRisk === true）ならすべて呼ぶ。
+  // 理由: light_ai_post_review tier は「軽量AIレビューを実行する」ことが本質であり、
+  //   postReviewer は independent-verified-provider による実在のレビューで機能が正常。
+  //   Phase 1b で下位tier（mechanical_only / light_ai_post_review）が実運用で発生する
+  //   ようになったため、trigger を拡張。
   // job.aiCliProvider が定まっている場合のみ呼ぶ（implementerProviderが必須のため）。
   // reviewWithSeparation()は「実装AIとレビューAIが同一」の場合にErrorをthrowする
   // 防御コードを持つため、必ずtry/catchで包む。catch時はJobを止めず、
@@ -885,8 +890,11 @@ export async function runJob(
   const isRiskSeverityMediumOrHigh =
     targetProjectRiskScanResult.highestSeverity === 'medium' ||
     targetProjectRiskScanResult.highestSeverity === 'high'
+  const hasAnyRisk = targetProjectRiskScanResult.hasRisk === true
   let postReviewResult: PostReviewResult | undefined
-  if (isRiskSeverityMediumOrHigh && job.aiCliProvider) {
+  // 'copilot' は ImplementerProvider（実装AI）には含まれない
+  // （現状 Meta Review フォールバック専用。Task実装には未割当のため除外する）。
+  if (hasAnyRisk && job.aiCliProvider && job.aiCliProvider !== 'copilot') {
     try {
       postReviewResult = await runPostReview({
         jobId: job.id,
@@ -906,10 +914,13 @@ export async function runJob(
   // ── postReviewer接続終端 ─────────────────────────────────────────────────
 
   // ── safetyVerifier接続（Step R4-B・観察モード・非停止） ─────────────────────────
-  // 既存Risk Scan/Step Review/postReviewと同じ呼び出し条件（severity: medium/high）を流用。
-  // 新しい分類器は作らない。runSafetyVerification()は本来例外を投げない純粋関数だが、
-  // 観察モードでの接続であることを明確にするため、想定外入力・実装バグを含めてtry/catchで包む。
-  // catch時はJobを止めずconsole.warnのみに留める。
+  // safetyVerifier は postReviewer と異なり medium/high のみで実行する（意図的）。
+  // 理由: (1) TYPECHECK/RELATED_TESTS/FULL_TESTS の3チェックが未接続のため fail-closed
+  //   であり、any severity で実行しても overallPassed は常に false（構造的問題）;
+  //   (2) target_project の下位tier 相当のリスクシグナルは既に targetProjectRiskScanResult
+  //   がカバーしているため、SAFETY_VERIFICATION_RESULT は commit gate から不要とされた
+  //   （commitGate.ts getRequiredArtifacts 注釈参照）。
+  //   観察モードとして medium/high でのみ計測・ログを蓄積する。
   // 12項目中TYPECHECK/RELATED_TESTS/FULL_TESTSの3項目は実行結果を渡していないためfail-closed。
   // これは危険検出ではなく未接続項目によるものであり、blockingFailuresで区別できるようにする。
   let safetyVerificationResult: SafetyVerificationResult | undefined
@@ -937,17 +948,24 @@ export async function runJob(
   // git_commit 承認判断には一切影響しない観察専用経路で接続する。
   // - git_commit Job のみで実行し、test/lint/build 等では何も出さない
   // - 判定結果はconsole.logのみ。停止・通知・永続化は行わない（Job結果にも載せない）
-  // - approvalLevelResult は control repo 基準の分類器を target_project Job に便宜的に
-  //   適用した参考ラベル（上記 Step6-A2 の既知の限界）のため、多くの場合
-  //   ceo_required と観測される。これは Phase 1 では期待通りの観測結果であり、回避しない
+  // - 既存の targetProjectRiskScanResult.highestSeverity を既存の4tier
+  //   ReviewPolicy（mechanical_only / light_ai_post_review / full_pre_post_review /
+  //   ceo_required）に1:1対応させた ApprovalLevelResult を使用する
+  //   （control repo基準の classifier は target_project ファイルに適用すると
+  //     常に UNMATCHED_FALLBACK → Level3/ceo_required になるため）。
   // - preReviewResult は現状どこでも計算されていないため常にundefined。
   //   full_pre_post_review 時は成果物欠落として fail-closed 表示になる（commitGateの正しい挙動）
   if (job.safeCommand.kind === 'git_commit') {
     try {
+      const shadowApprovalLevelResult = deriveTargetProjectApprovalLevel({
+        jobId: job.id,
+        taskId: job.taskId,
+        riskScanResult: targetProjectRiskScanResult,
+      })
       const shadowCommitGateResult = evaluateCommitGate({
         jobId: job.id,
         taskId: job.taskId,
-        approvalLevelResult,
+        approvalLevelResult: shadowApprovalLevelResult,
         preReviewResult: undefined,
         postReviewResult,
         safetyVerificationResult,

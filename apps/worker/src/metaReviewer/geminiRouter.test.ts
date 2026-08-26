@@ -204,7 +204,29 @@ describe('callGeminiWithFallback', () => {
       expect(mockSpawnSync).toHaveBeenCalledTimes(2)
     })
 
-    it('quota 以外の失敗（CLI・API とも）では Antigravity/Claude を試さない', async () => {
+    it('API・CLI は quota 起因で失敗しても、Antigravity/Claude 段が非quota理由で失敗した場合は非quotaエラーとして区別される（2026-08-26 独立レビュー round2 修正）', async () => {
+      // Gemini-CLI（1回目）は quota、Claude-CLI（2回目、model引数で判別）は非quotaエラー
+      mockSpawnSync.mockImplementation((_cmd, args) => {
+        const model = (args as string[])[1]
+        if (model === 'claude-sonnet-4-6') return cliError()
+        return cli429()
+      })
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+      await expect(
+        callGeminiWithFallback('test prompt', {
+          preferCli: false,
+          featureName: 'test',
+        })
+      ).rejects.toThrow('Gemini failed, non-quota')
+
+      // Gemini-CLI(quota) → Claude-CLI(非quota) の2回試みている
+      expect(mockSpawnSync).toHaveBeenCalledTimes(2)
+      // API・CLIはquotaだったが、Claude段が非quotaで失敗した以上、quota-exhausted.jsonには記録しない
+      expect(mockWriteFileSync).not.toHaveBeenCalled()
+    })
+
+    it('quota 以外の失敗（CLI・API とも）では Antigravity/Claude を試さず、非quotaエラーとして区別される（2026-08-26 独立レビュー修正）', async () => {
       mockSpawnSync.mockReturnValue(cliError())
       mockCallApi.mockRejectedValue(new Error('unexpected 500 internal error'))
 
@@ -213,21 +235,24 @@ describe('callGeminiWithFallback', () => {
           preferCli: false,
           featureName: 'test',
         })
-      ).rejects.toThrow('quota exhausted')
+      ).rejects.toThrow('Gemini failed, non-quota')
 
       // Gemini-CLI の1回のみ（Claude フォールバックを試みていない）
       expect(mockSpawnSync).toHaveBeenCalledTimes(1)
+      // 非quota失敗は quota-exhausted.json に記録しない（quota起因だったという誤情報を残さない）
+      expect(mockWriteFileSync).not.toHaveBeenCalled()
     })
 
-    it('API が quota 起因失敗・CLI が非quota失敗の混在では Antigravity/Claude を試さない', async () => {
+    it('API が quota 起因失敗・CLI が非quota失敗の混在では Antigravity/Claude を試さず、非quotaエラーとして区別される（2026-08-26 独立レビュー修正）', async () => {
       mockSpawnSync.mockReturnValue(cliError())
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
 
       await expect(
         callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
-      ).rejects.toThrow('quota exhausted')
+      ).rejects.toThrow('Gemini failed, non-quota')
 
       expect(mockSpawnSync).toHaveBeenCalledTimes(1)
+      expect(mockWriteFileSync).not.toHaveBeenCalled()
     })
 
     it('agy サブプロセスへ渡す env に秘密情報を含めない（PATH/HOME/LANG/TERM のみ）', async () => {

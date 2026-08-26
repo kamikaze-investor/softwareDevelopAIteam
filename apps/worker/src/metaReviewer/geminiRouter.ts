@@ -187,8 +187,26 @@ async function callApiDetailed(prompt: string, apiModel?: string): Promise<ApiOu
   }
 }
 
-/** 両方失敗時の記録 & エラー */
-function handleBothExhausted(featureName: string): never {
+/**
+ * 両方失敗時の記録 & エラー。
+ *
+ * isQuotaConfirmed: API・CLI 双方が quota 起因（429/quota文言）で失敗したと確認できた場合のみ true。
+ * これが false のとき（非quota失敗・quota/非quota混在）は、呼び出し元（metaReviewFallbackRouter.ts の
+ * Copilot fallback 判定等）が「quota exhausted」と「それ以外の失敗」を区別できるよう、
+ * 別のエラーメッセージを投げる（quota-exhausted.json への記録も行わない）。
+ * 2026-08-26 独立レビュー指摘: 修正前はこの区別がなく、非quota失敗（認証エラー・プログラムエラー等）も
+ * 一律「quota exhausted」として扱われ、quota以外の障害をフォールバックで隠しうる状態だった。
+ */
+function handleBothExhausted(featureName: string, isQuotaConfirmed: boolean): never {
+  if (!isQuotaConfirmed) {
+    console.warn(
+      `\n⚠️  [geminiRouter] Gemini API・CLI 双方が失敗しましたが、quota起因とは確認できません。\n` +
+      `   機能: ${featureName}\n` +
+      `   quota以外の障害（認証・プログラムエラー等）の可能性があるため、quota-exhausted.json には記録しません。`,
+    )
+    throw new Error(`[geminiRouter] Gemini failed, non-quota (feature: ${featureName})`)
+  }
+
   const exhaustedAt = new Date().toISOString()
   const record = {
     featureName,
@@ -257,10 +275,24 @@ export async function callGeminiWithFallback(
   }
 
   // Gemini（API・CLI 双方）が quota 起因で失敗した場合だけ Antigravity/Claude を試す。
-  if (cliOutcome.quota && apiOutcome.quota) {
+  const geminiBothQuota = cliOutcome.quota && apiOutcome.quota
+  // Antigravity/Claude を実際に試みた場合のみ意味を持つ。試みていなければ vacuously true
+  // （「Claude段のせいで isQuotaConfirmed が false になる」ことはない）。
+  let claudeStageQuotaOrNotAttempted = true
+  if (geminiBothQuota) {
     const claudeOutcome = callCliDetailed(prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, cliJsonSchema)
     if (claudeOutcome.ok) return claudeOutcome.text as string
+    // 2026-08-26 独立レビュー指摘: Claude段が非quota理由（認証エラー・プログラムエラー等）で
+    // 失敗した場合、それをquota起因と混同してCopilotへ静かにフォールバックしてはいけない。
+    // agy自体の設定不備等はCLI段（cliOutcome）でも同様に起こりうるが、CLI段が429/quota文言で
+    // 失敗しつつAntigravity/Claude段だけが別の理由で失敗する組み合わせも理論上あり得るため、
+    // Claude段を実際に試みた場合は、その quota 判定も isQuotaConfirmed に含める。
+    claudeStageQuotaOrNotAttempted = claudeOutcome.quota
   }
 
-  return handleBothExhausted(featureName)
+  // 最終的な isQuotaConfirmed:
+  //   Gemini API・CLI が両方 quota 起因で失敗、かつ（Antigravity/Claude を試みていないか、
+  //   試みてそれも quota 起因で失敗した）場合のみ true。
+  const isQuotaConfirmed = geminiBothQuota && claudeStageQuotaOrNotAttempted
+  return handleBothExhausted(featureName, isQuotaConfirmed)
 }

@@ -7,8 +7,9 @@ on:
     branches: [master, main]   # master（現在）と main（将来の改名）の両方に対応
 
 permissions:
-  pull-requests: write   # PRへのコメント投稿
+  pull-requests: write     # PRへのコメント投稿
   contents: read
+  copilot-requests: write  # Gemini API/CLI 両方 quota 枯渇時の Copilot CLI フォールバック用
 
 jobs:
   meta-review:
@@ -46,13 +47,25 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # -------------------------------------------------------
-      # 3. Meta Review 実行（Gemini に diff を渡す）
+      # 2.5. Copilot CLI のセットアップ（Gemini API/CLI 両方 quota 枯渇時のみ使用）
+      # -------------------------------------------------------
+      - name: Install Copilot CLI
+        # 独立レビュー指摘: これが失敗しても Gemini 経路の可用性を道連れにしない
+        # （Gemini が正常なら Copilot は一度も呼ばれないため、install失敗自体はnon-fatal。
+        # 実際に Copilot が必要になったのに未インストールなら、copilotRouter.ts の
+        # spawnSync が ENOENT 相当のエラーを投げ、blocked として正しく表面化する）。
+        continue-on-error: true
+        run: npm install -g @github/copilot
+
+      # -------------------------------------------------------
+      # 3. Meta Review 実行（Gemini → Gemini CLI → Copilot CLI の順にフォールバック）
       # -------------------------------------------------------
       - name: Run Meta Review
         id: meta-review
         run: pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}   # Copilot CLI フォールバック用（PAT不要、実測確認済み）
           BASE_SHA:  ${{ github.event.pull_request.base.sha }}
           HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
           PR_TITLE:  ${{ github.event.pull_request.title }}
@@ -108,6 +121,12 @@ jobs:
               ? '\n\n> 🔴 **CEO承認が必要です。** このPRはマージ不可です。'
               : ''
 
+            // providerUsed は autoReview.ts が additive に書き込む監査証跡（2026-08-26追加）。
+            // 未設定（古い結果ファイル・エラー時）は従来どおり Gemini 表記にフォールバックする。
+            const reviewedBy = result.providerUsed === 'copilot'
+              ? 'GitHub Copilot CLI (Microsoft mai-code-1.1-flash) — Gemini quota exhausted fallback'
+              : 'Gemini (Meta Reviewer AI)'
+
             const body = [
               `## ${emoji} Meta Review — ${result.status.toUpperCase()}`,
               '',
@@ -123,7 +142,7 @@ jobs:
               ceoNote,
               '',
               `---`,
-              `*Reviewed by Gemini (Meta Reviewer AI) — [ログを確認](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`,
+              `*Reviewed by ${reviewedBy} — [ログを確認](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`,
             ].join('\n')
 
             await github.rest.issues.createComment({

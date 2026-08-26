@@ -44,10 +44,10 @@ import { dirname, resolve } from 'node:path'
 }
 
 async function main(): Promise<void> {
-  // .env ロード後に runner.ts / geminiRouter.ts を評価させるため動的 import する
+  // .env ロード後に runner.ts / geminiRouter.ts / metaReviewFallbackRouter.ts を評価させるため動的 import する
   const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } =
     await import('./runner.js')
-  const { callGeminiWithFallback } = await import('./geminiRouter.js')
+  const { reviewWithProviderFallback } = await import('./metaReviewFallbackRouter.js')
 
   // --- 環境変数の読み取り ---
   const baseSha = process.env.BASE_SHA       // GitHub Actions: PR の base SHA
@@ -124,33 +124,40 @@ async function main(): Promise<void> {
   )
   const prompt = buildMetaReviewPrompt(request)
 
-  // --- Gemini にレビューを依頼 ---
+  // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
   console.log('\n🤖 Gemini にレビューを依頼中...')
   let rawResponse: string
+  let providerUsed: 'gemini' | 'copilot' = 'gemini'
   try {
-    rawResponse = await callGeminiWithFallback(prompt, {
+    const reviewResult = await reviewWithProviderFallback(prompt, {
       preferCli: true,
       cliModel: 'gemini-3.5-flash',
       apiModel: 'gemini-3.5-flash',
       featureName: 'meta_review',
     })
+    rawResponse = reviewResult.raw
+    providerUsed = reviewResult.providerUsed
+    if (providerUsed === 'copilot') {
+      console.log('   ℹ️  Gemini quota 枯渇のため Copilot CLI（Microsoft系モデル）で審査しました')
+    }
   } catch (err) {
-    console.error('❌ Gemini API 呼び出しに失敗しました:', err)
+    console.error('❌ Meta Review プロバイダー呼び出しに失敗しました:', err)
     // API障害は安全のため blocked 扱い
     const errorResult = {
       id: `meta-review-${taskId}-${Date.now()}`,
       taskId,
       status: 'blocked' as const,
       riskLevel: 'critical' as const,
-      summary: 'Gemini API 呼び出しに失敗しました。安全のため blocked とします。',
+      summary: 'Meta Review プロバイダー（Gemini / Copilot）呼び出しに失敗しました。安全のため blocked とします。',
       findings: [{
         severity: 'critical' as const,
         category: 'security_regression' as const,
-        message: `Gemini API エラー: ${err instanceof Error ? err.message : String(err)}`,
-        suggestion: 'GEMINI_API_KEY と API の状態を確認してください',
+        message: `Meta Review プロバイダーエラー: ${err instanceof Error ? err.message : String(err)}`,
+        suggestion: 'GEMINI_API_KEY / Gemini CLI / Copilot CLI（GITHUB_TOKEN認証）の状態を確認してください',
       }],
       requiresCeoApproval: true,
       createdAt: new Date().toISOString(),
+      // providerUsed は付与しない（どちらが最終的に応答したか確定していないため）
     }
     writeResultFile(errorResult, resultFilePath)
     printResult(errorResult)
@@ -158,8 +165,12 @@ async function main(): Promise<void> {
   }
 
   // --- 結果をパース ---
+  // parseMetaReviewResult() の戻り値型・契約は変更しない（既存パーサーはそのまま）。
+  // providerUsed は監査証跡用にファイル書き込み時のみ additive に付与する
+  // （2026-08-26 独立レビュー指摘: 実際に応答したプロバイダーが記録されず、
+  //   PRコメントが常に「Reviewed by Gemini」と表示されていた問題への対応）。
   const result = parseMetaReviewResult(rawResponse, taskId)
-  writeResultFile(result, resultFilePath)
+  writeResultFile({ ...result, providerUsed }, resultFilePath)
   printResult(result)
 
   // --- 終了コード ---
@@ -200,6 +211,8 @@ type MetaReviewResultLike = {
   }>
   requiresCeoApproval: boolean
   createdAt: string
+  /** 監査証跡用（additive・parseMetaReviewResult の契約には含まれない）。未設定 = 従来どおり */
+  providerUsed?: 'gemini' | 'copilot'
 }
 
 function writeResultFile(result: MetaReviewResultLike, resultFilePath: string): void {
