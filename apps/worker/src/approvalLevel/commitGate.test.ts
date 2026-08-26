@@ -153,27 +153,23 @@ function expectBlockingReasonContaining(result: { blockingReasons: string[] }, v
 }
 
 describe('getRequiredArtifacts', () => {
-  it('mechanical_only は approval-level-result と safety-verification-result を必須にする', () => {
+  it('mechanical_only は approval-level-result のみを必須にする（Phase 1c: safety-verification-result は不要）', () => {
     expect(getRequiredArtifacts('mechanical_only')).toEqual([
       'APPROVAL_LEVEL_RESULT',
-      'SAFETY_VERIFICATION_RESULT',
     ])
   })
 
-  it('light_ai_post_review は post-review-result と safety-verification-result を必須にする', () => {
+  it('light_ai_post_review は approval-level-result と post-review-result を必須にする（Phase 1c: safety-verification-result は不要）', () => {
     expect(getRequiredArtifacts('light_ai_post_review')).toEqual([
       'APPROVAL_LEVEL_RESULT',
       'POST_REVIEW_RESULT',
-      'SAFETY_VERIFICATION_RESULT',
     ])
   })
 
-  it('full_pre_post_review は4種すべてを必須にする', () => {
+  it('full_pre_post_review は approval-level-result と post-review-result のみを必須にする（Phase 1c: pre/safety は不要）', () => {
     expect(getRequiredArtifacts('full_pre_post_review')).toEqual([
       'APPROVAL_LEVEL_RESULT',
-      'PRE_REVIEW_RESULT',
       'POST_REVIEW_RESULT',
-      'SAFETY_VERIFICATION_RESULT',
     ])
   })
 
@@ -235,10 +231,8 @@ describe('checkArtifactPresence', () => {
 })
 
 describe('evaluateCommitGate', () => {
-  it('mechanical_only は approval-level-result と通過済み safety-verification-result のみで allowed:true', () => {
-    const result = evaluateCommitGate(makeInput('mechanical_only', {
-      safetyVerificationResult: makeSafetyVerificationResult(),
-    }))
+  it('mechanical_only は approval-level-result のみで allowed:true（Phase 1c: safety不要）', () => {
+    const result = evaluateCommitGate(makeInput('mechanical_only'))
 
     expect(result.allowed).toBe(true)
     expect(result.artifactChecks.find(check => check.id === 'PRE_REVIEW_RESULT')).toMatchObject({
@@ -249,19 +243,23 @@ describe('evaluateCommitGate', () => {
       required: false,
       present: true,
     })
+    expect(result.artifactChecks.find(check => check.id === 'SAFETY_VERIFICATION_RESULT')).toMatchObject({
+      required: false,
+      present: true,
+    })
   })
 
-  it('mechanical_only で safety-verification-result が欠落している場合は allowed:false', () => {
-    const result = evaluateCommitGate(makeInput('mechanical_only'))
+  it('mechanical_only で approvalLevelResult が存在し safetyVerificationResult渡しても allowed:true（両方不要）', () => {
+    const result = evaluateCommitGate(makeInput('mechanical_only', {
+      safetyVerificationResult: makeSafetyVerificationResult(),
+    }))
 
-    expect(result.allowed).toBe(false)
-    expectBlockingReasonContaining(result, 'SAFETY_VERIFICATION_RESULT')
+    expect(result.allowed).toBe(true)
   })
 
-  it('light_ai_post_review は post-review-result と通過済み safety-verification-result で allowed:true', () => {
+  it('light_ai_post_review は post-review-result のみで allowed:true（Phase 1c: safety不要）', () => {
     const result = evaluateCommitGate(makeInput('light_ai_post_review', {
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makeSafetyVerificationResult(),
     }))
 
     expect(result.allowed).toBe(true)
@@ -269,20 +267,36 @@ describe('evaluateCommitGate', () => {
       required: false,
       present: true,
     })
+    expect(result.artifactChecks.find(check => check.id === 'SAFETY_VERIFICATION_RESULT')).toMatchObject({
+      required: false,
+      present: true,
+    })
   })
 
   it('light_ai_post_review で post-review-result が欠落している場合は allowed:false', () => {
-    const result = evaluateCommitGate(makeInput('light_ai_post_review', {
-      safetyVerificationResult: makeSafetyVerificationResult(),
-    }))
+    const result = evaluateCommitGate(makeInput('light_ai_post_review', {}))
 
     expect(result.allowed).toBe(false)
     expectBlockingReasonContaining(result, 'POST_REVIEW_RESULT')
   })
 
-  it('full_pre_post_review は4成果物が揃いすべてpassなら allowed:true', () => {
+  it('full_pre_post_review は approval-level-result と post-review-result のみで allowed:true（Phase 1c: pre/safety不要）', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
-      preReviewResult: makePreReviewResult(),
+      postReviewResult: makePostReviewResult(),
+    }))
+
+    expect(result.allowed).toBe(true)
+  })
+
+  it('full_pre_post_review で post-review-result が欠落している場合は allowed:false', () => {
+    const result = evaluateCommitGate(makeInput('full_pre_post_review', {}))
+
+    expect(result.allowed).toBe(false)
+    expectBlockingReasonContaining(result, 'POST_REVIEW_RESULT')
+  })
+
+  it('full_pre_post_review で safetyVerificationResult渡しても allowed:true（artifact ではないが overallPassed:false は blocking）', () => {
+    const result = evaluateCommitGate(makeInput('full_pre_post_review', {
       postReviewResult: makePostReviewResult(),
       safetyVerificationResult: makeSafetyVerificationResult(),
     }))
@@ -290,19 +304,8 @@ describe('evaluateCommitGate', () => {
     expect(result.allowed).toBe(true)
   })
 
-  it('full_pre_post_review で pre-review-result が欠落している場合は allowed:false', () => {
+  it('full_pre_post_review で safetyVerificationResult.overallPassed:false なら blockingFailures を理由に含める（artifact以外のblocking判定）', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
-      postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makeSafetyVerificationResult(),
-    }))
-
-    expect(result.allowed).toBe(false)
-    expectBlockingReasonContaining(result, 'PRE_REVIEW_RESULT')
-  })
-
-  it('full_pre_post_review で safetyVerificationResult.overallPassed:false なら blockingFailures を理由に含める', () => {
-    const result = evaluateCommitGate(makeInput('full_pre_post_review', {
-      preReviewResult: makePreReviewResult(),
       postReviewResult: makePostReviewResult(),
       safetyVerificationResult: makeSafetyVerificationResult({
         overallPassed: false,
@@ -315,11 +318,10 @@ describe('evaluateCommitGate', () => {
     expectBlockingReasonContaining(result, 'FULL_TESTS')
   })
 
-  it('full_pre_post_review で preReviewResult.blocked:true なら allowed:false', () => {
+  it('full_pre_post_review で preReviewResult.blocked:true なら allowed:false（artifact未要求でも渡された場合のblocking判定）', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
       preReviewResult: makePreReviewResult({ blocked: true }),
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makeSafetyVerificationResult(),
     }))
 
     expect(result.allowed).toBe(false)
@@ -328,20 +330,16 @@ describe('evaluateCommitGate', () => {
 
   it('full_pre_post_review で postReviewResult.blocked:true なら allowed:false', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
-      preReviewResult: makePreReviewResult(),
       postReviewResult: makePostReviewResult({ blocked: true }),
-      safetyVerificationResult: makeSafetyVerificationResult(),
     }))
 
     expect(result.allowed).toBe(false)
     expectBlockingReasonContaining(result, 'Post-Review')
   })
 
-  it('ceo_required は4成果物が揃いすべてpassでも allowed:false', () => {
+  it('ceo_required は成果物が揃っていても allowed:false', () => {
     const result = evaluateCommitGate(makeInput('ceo_required', {
-      preReviewResult: makePreReviewResult(),
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makeSafetyVerificationResult(),
     }))
 
     expect(result.allowed).toBe(false)
@@ -351,9 +349,7 @@ describe('evaluateCommitGate', () => {
   it('level:3 が ceo_required 以外に誤設定されても level3 の二重防御だけで allowed:false', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
       approvalLevelResult: makeApprovalLevelResult('full_pre_post_review', { level: 3 }),
-      preReviewResult: makePreReviewResult(),
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makeSafetyVerificationResult(),
     }))
 
     expect(result.allowed).toBe(false)
@@ -363,7 +359,6 @@ describe('evaluateCommitGate', () => {
 
   it('成果物欠落と safety 未通過が同時発生した場合は両方の理由を列挙する', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
-      preReviewResult: makePreReviewResult(),
       safetyVerificationResult: makeSafetyVerificationResult({
         overallPassed: false,
         blockingFailures: ['TYPECHECK'],
@@ -376,7 +371,7 @@ describe('evaluateCommitGate', () => {
     expectBlockingReasonContaining(result, 'TYPECHECK')
   })
 
-  it('task-023相当の full_pre_post_review で4成果物がすべて有効なら allowed:true', () => {
+  it('task-023相当の full_pre_post_review で approval-level-result と post-review-result が有効なら allowed:true', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
       approvalLevelResult: makeApprovalLevelResult('full_pre_post_review', {
         jobId: 'job-task-023',
@@ -384,15 +379,7 @@ describe('evaluateCommitGate', () => {
       }),
       jobId: 'job-task-023',
       taskId: 'task-023',
-      preReviewResult: makePreReviewResult({
-        jobId: 'job-task-023',
-        taskId: 'task-023',
-      }),
       postReviewResult: makePostReviewResult({
-        jobId: 'job-task-023',
-        taskId: 'task-023',
-      }),
-      safetyVerificationResult: makeSafetyVerificationResult({
         jobId: 'job-task-023',
         taskId: 'task-023',
       }),
@@ -408,7 +395,6 @@ describe('evaluateCommitGate', () => {
   it('CommitGateResult.reviewPolicy は input.approvalLevelResult.reviewPolicy と一致する', () => {
     const input = makeInput('light_ai_post_review', {
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makeSafetyVerificationResult(),
     })
 
     const result = evaluateCommitGate(input)
@@ -424,9 +410,7 @@ describe('evaluateCommitGate', () => {
       'SAFETY_VERIFICATION_RESULT',
     ]
 
-    const result = evaluateCommitGate(makeInput('mechanical_only', {
-      safetyVerificationResult: makeSafetyVerificationResult(),
-    }))
+    const result = evaluateCommitGate(makeInput('mechanical_only'))
 
     expect(result.artifactChecks.map(check => check.id)).toEqual(expectedIds)
   })
