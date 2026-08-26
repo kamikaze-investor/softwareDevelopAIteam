@@ -127,6 +127,7 @@ async function main(): Promise<void> {
   // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
   console.log('\n🤖 Gemini にレビューを依頼中...')
   let rawResponse: string
+  let providerUsed: 'gemini' | 'copilot' = 'gemini'
   try {
     const reviewResult = await reviewWithProviderFallback(prompt, {
       preferCli: true,
@@ -135,7 +136,8 @@ async function main(): Promise<void> {
       featureName: 'meta_review',
     })
     rawResponse = reviewResult.raw
-    if (reviewResult.providerUsed === 'copilot') {
+    providerUsed = reviewResult.providerUsed
+    if (providerUsed === 'copilot') {
       console.log('   ℹ️  Gemini quota 枯渇のため Copilot CLI（Microsoft系モデル）で審査しました')
     }
   } catch (err) {
@@ -155,6 +157,7 @@ async function main(): Promise<void> {
       }],
       requiresCeoApproval: true,
       createdAt: new Date().toISOString(),
+      // providerUsed は付与しない（どちらが最終的に応答したか確定していないため）
     }
     writeResultFile(errorResult, resultFilePath)
     printResult(errorResult)
@@ -162,8 +165,12 @@ async function main(): Promise<void> {
   }
 
   // --- 結果をパース ---
+  // parseMetaReviewResult() の戻り値型・契約は変更しない（既存パーサーはそのまま）。
+  // providerUsed は監査証跡用にファイル書き込み時のみ additive に付与する
+  // （2026-08-26 独立レビュー指摘: 実際に応答したプロバイダーが記録されず、
+  //   PRコメントが常に「Reviewed by Gemini」と表示されていた問題への対応）。
   const result = parseMetaReviewResult(rawResponse, taskId)
-  writeResultFile(result, resultFilePath)
+  writeResultFile({ ...result, providerUsed }, resultFilePath)
   printResult(result)
 
   // --- 終了コード ---
@@ -204,6 +211,8 @@ type MetaReviewResultLike = {
   }>
   requiresCeoApproval: boolean
   createdAt: string
+  /** 監査証跡用（additive・parseMetaReviewResult の契約には含まれない）。未設定 = 従来どおり */
+  providerUsed?: 'gemini' | 'copilot'
 }
 
 function writeResultFile(result: MetaReviewResultLike, resultFilePath: string): void {

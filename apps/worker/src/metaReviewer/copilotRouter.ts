@@ -11,21 +11,28 @@
  * metaReviewFallbackRouter.ts から呼ばれる最終フォールバック。
  *
  * 認証: GITHUB_TOKEN のみ（PAT不要、実測確認済み 2026-08-26）。
- * 安全性:
+ * 安全性（2026-08-26 独立レビュー2ラウンドを経て確定。すべて実測確認済み）:
  *   - --yolo / --allow-all / --allow-all-tools は使わない。
+ *   - `--available-tools`（値なし）を渡し、ツールそのものをモデルから見えなくする。
+ *     --allow-tool を渡さないだけでは不十分（実測: --allow-tool なしでも非対話モードで
+ *     cwd 配下のファイル一覧・読み取りが確認なしで実行される）。`--available-tools`
+ *     （値なし = 空allowlist）を渡すと同じ条件で `NO_FILE_ACCESS` と応答することを
+ *     GitHub Actions上で実証済み。
+ *   - cwd はさらに、リポジトリ外の使い捨て一時ディレクトリ（mkdtempSync、呼び出しごとに
+ *     生成・実行後に削除）に固定する。bare な os.tmpdir() 直下は同一CI実行内の他ステップと
+ *     共有される場所であり、隔離としては不十分なため使わない
+ *     （geminiRouter.ts が --json-schema 用の一時ファイルに mkdtempSync を使うのと同じ考え方）。
  *   - env は allowlist（PATH/HOME/LANG/TERM + GITHUB_TOKEN）のみを子プロセスへ渡す。
  *     `adapter.ts` の buildSafeEnv() / geminiRouter.ts の buildAgyEnv() と同じ考え方。
- *     GEMINI_API_KEY 等の秘密情報は一切含めない
- *     （2026-08-26 独立レビューで発覚: 旧実装は ...process.env で全環境変数を渡していた）。
- *   - cwd はリポジトリ外の一時ディレクトリに固定する。Copilot CLI は --allow-tool を
- *     一切渡さなくても非対話モードで cwd 配下のファイル一覧・読み取りを確認なしで
- *     実行してしまうことを実測確認した（2026-08-26, GitHub Actions上でcanary fileを
- *     使い実証。geminiRouter.ts の callCliDetailed() が agy に対して行っている
- *     cwd: tmpdir() と同じ対策）。
+ *     GEMINI_API_KEY 等の秘密情報は一切含めない。
+ *   - 上記2点（ツール完全無効化 + cwd隔離）は独立した多層防御。どちらか一方が
+ *     将来変更されても、もう一方が repository への到達を防ぐ。
  */
 
 import { spawnSync } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
+import path from 'node:path'
 
 export const DEFAULT_COPILOT_META_REVIEW_MODEL = 'mai-code-1.1-flash'
 
@@ -66,31 +73,43 @@ export function callCopilotForMetaReview(
   const usage = options?.usage ?? 'meta_review'
   const timeout = options?.timeoutMs ?? 300_000
 
-  const result = spawnSync(
-    'copilot',
-    ['-p', prompt, '-s', '--no-color', '--model', model],
-    {
-      encoding: 'utf-8',
-      timeout,
-      env: buildCopilotEnv(),
-      // repository を自由探索させない（--allow-tool なしでも cwd 配下は確認なしで
-      // 読める実測結果があるため、cwd 自体をリポジトリ外へ隔離する）
-      cwd: tmpdir(),
-    },
-  )
+  // 呼び出しごとの使い捨て隔離ディレクトリ（bare tmpdir() は他ステップと共有されるため使わない）
+  const isolatedCwd = mkdtempSync(path.join(tmpdir(), 'copilot-meta-review-'))
 
-  const stdout = result.stdout ?? ''
-  const stderr = result.stderr ?? ''
+  try {
+    const result = spawnSync(
+      'copilot',
+      [
+        '-p', prompt, '-s', '--no-color', '--model', model,
+        '--available-tools',  // 値なし = 空allowlist。ツールをモデルから完全に見えなくする（実測確認済み）
+      ],
+      {
+        encoding: 'utf-8',
+        timeout,
+        env: buildCopilotEnv(),
+        cwd: isolatedCwd,
+      },
+    )
 
-  if (result.error) {
-    throw new Error(`[copilotRouter] Copilot CLI 実行エラー（usage=${usage}）: ${result.error.message}`)
-  }
-  if (result.status !== 0) {
-    throw new Error(`[copilotRouter] Copilot CLI が exit code ${result.status} で終了しました（usage=${usage}）: ${stderr || stdout || '(no output)'}`)
-  }
-  if (!stdout.trim()) {
-    throw new Error(`[copilotRouter] Copilot CLI の応答が空でした（usage=${usage}）`)
-  }
+    const stdout = result.stdout ?? ''
+    const stderr = result.stderr ?? ''
 
-  return stdout
+    if (result.error) {
+      throw new Error(`[copilotRouter] Copilot CLI 実行エラー（usage=${usage}）: ${result.error.message}`)
+    }
+    if (result.status !== 0) {
+      throw new Error(`[copilotRouter] Copilot CLI が exit code ${result.status} で終了しました（usage=${usage}）: ${stderr || stdout || '(no output)'}`)
+    }
+    if (!stdout.trim()) {
+      throw new Error(`[copilotRouter] Copilot CLI の応答が空でした（usage=${usage}）`)
+    }
+
+    return stdout
+  } finally {
+    try {
+      rmSync(isolatedCwd, { recursive: true, force: true })
+    } catch {
+      // 一時ディレクトリの削除失敗はサイレントに無視
+    }
+  }
 }

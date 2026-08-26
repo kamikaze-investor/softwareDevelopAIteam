@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 vi.mock('node:child_process', () => ({
@@ -61,13 +62,29 @@ describe('callCopilotForMetaReview', () => {
     expect(args.some(a => a.startsWith('--allow-tool'))).toBe(false)
   })
 
-  it('cwd をリポジトリ外の一時ディレクトリに固定する（2026-08-26 独立レビュー: --allow-toolなしでも cwd 配下は確認なしで読めることを実測確認したため）', () => {
+  it('--available-tools（値なし）を渡し、ツール自体を無効化する（2026-08-26 独立レビュー round2: --allow-tool なしだけでは非対話モードでファイルアクセスが確認なしで実行されることを実測確認したため、--available-tools 空allowlistで完全に無効化する）', () => {
+    mockSpawnSync.mockReturnValue(success('ok'))
+
+    callCopilotForMetaReview('prompt')
+
+    const args = mockSpawnSync.mock.calls[0][1] as string[]
+    expect(args).toContain('--available-tools')
+    // 値を伴わない（次の要素は別のフラグか末尾であるべき、モデル名等の値ではない）
+    const idx = args.indexOf('--available-tools')
+    expect(idx).toBe(args.length - 1)
+  })
+
+  it('cwd をリポジトリ外の使い捨て一時ディレクトリに固定し、実行後に削除する（2026-08-26 独立レビュー round2: bare tmpdir() は他ステップと共有されるため不十分と指摘され、呼び出しごとの一意ディレクトリへ変更）', () => {
     mockSpawnSync.mockReturnValue(success('ok'))
 
     callCopilotForMetaReview('prompt')
 
     const options = mockSpawnSync.mock.calls[0][2] as { cwd?: string }
-    expect(options.cwd).toBe(tmpdir())
+    expect(options.cwd).toBeDefined()
+    expect(options.cwd).not.toBe(tmpdir())
+    expect((options.cwd as string).startsWith(tmpdir())).toBe(true)
+    // 実行後にクリーンアップされている（残存しない）
+    expect(existsSync(options.cwd as string)).toBe(false)
   })
 
   it('子プロセスへ渡す env に秘密情報を含めない（PATH/HOME/LANG/TERM/GITHUB_TOKEN のみ、2026-08-26 独立レビュー修正）', () => {

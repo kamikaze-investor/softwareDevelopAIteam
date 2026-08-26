@@ -50,6 +50,11 @@ jobs:
       # 2.5. Copilot CLI のセットアップ（Gemini API/CLI 両方 quota 枯渇時のみ使用）
       # -------------------------------------------------------
       - name: Install Copilot CLI
+        # 独立レビュー指摘: これが失敗しても Gemini 経路の可用性を道連れにしない
+        # （Gemini が正常なら Copilot は一度も呼ばれないため、install失敗自体はnon-fatal。
+        # 実際に Copilot が必要になったのに未インストールなら、copilotRouter.ts の
+        # spawnSync が ENOENT 相当のエラーを投げ、blocked として正しく表面化する）。
+        continue-on-error: true
         run: npm install -g @github/copilot
 
       # -------------------------------------------------------
@@ -116,6 +121,12 @@ jobs:
               ? '\n\n> 🔴 **CEO承認が必要です。** このPRはマージ不可です。'
               : ''
 
+            // providerUsed は autoReview.ts が additive に書き込む監査証跡（2026-08-26追加）。
+            // 未設定（古い結果ファイル・エラー時）は従来どおり Gemini 表記にフォールバックする。
+            const reviewedBy = result.providerUsed === 'copilot'
+              ? 'GitHub Copilot CLI (Microsoft mai-code-1.1-flash) — Gemini quota exhausted fallback'
+              : 'Gemini (Meta Reviewer AI)'
+
             const body = [
               `## ${emoji} Meta Review — ${result.status.toUpperCase()}`,
               '',
@@ -131,7 +142,7 @@ jobs:
               ceoNote,
               '',
               `---`,
-              `*Reviewed by Gemini (Meta Reviewer AI) — [ログを確認](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`,
+              `*Reviewed by ${reviewedBy} — [ログを確認](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`,
             ].join('\n')
 
             await github.rest.issues.createComment({

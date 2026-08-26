@@ -22,7 +22,10 @@
  *
  * 安全性:
  *   --yolo / --allow-all / --allow-all-tools は使用しない。
- *   ツールを一切許可しない状態（テキスト回答のみ）で運用する。
+ *   `--available-tools`（値なし）でツール自体をモデルから見えなくする。--allow-tool を
+ *   渡さないだけでは不十分（実測確認済み 2026-08-26: --allow-tool なしでも非対話モードで
+ *   cwd 配下のファイル一覧・読み取りが確認なしで実行される。`--available-tools` で空の
+ *   allowlistを渡すと同条件で NO_FILE_ACCESS 応答になることを GitHub Actions 上で実証済み）。
  *   implement モードのツール権限設計は未着手のため、明示的に未対応としてエラーにする。
  */
 
@@ -68,8 +71,9 @@ export class CopilotCliAdapter extends BaseCliAdapter {
       '-s',                                          // 統計を出さず応答のみ出力
       '--no-color',
       '--model', request.model ?? DEFAULT_COPILOT_MODEL,
-      // 意図的にツールを一切許可しない（--allow-tool を渡さない）。
+      // ツールをモデルから完全に見えなくする（値なし = 空allowlist。実測確認済み）。
       // repository を自由探索させず、プロンプトに埋め込んだ情報のみで回答させる。
+      '--available-tools',
     ]
   }
 }

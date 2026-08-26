@@ -275,15 +275,24 @@ export async function callGeminiWithFallback(
   }
 
   // Gemini（API・CLI 双方）が quota 起因で失敗した場合だけ Antigravity/Claude を試す。
-  const isQuotaConfirmed = cliOutcome.quota && apiOutcome.quota
-  if (isQuotaConfirmed) {
+  const geminiBothQuota = cliOutcome.quota && apiOutcome.quota
+  // Antigravity/Claude を実際に試みた場合のみ意味を持つ。試みていなければ vacuously true
+  // （「Claude段のせいで isQuotaConfirmed が false になる」ことはない）。
+  let claudeStageQuotaOrNotAttempted = true
+  if (geminiBothQuota) {
     const claudeOutcome = callCliDetailed(prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, cliJsonSchema)
     if (claudeOutcome.ok) return claudeOutcome.text as string
+    // 2026-08-26 独立レビュー指摘: Claude段が非quota理由（認証エラー・プログラムエラー等）で
+    // 失敗した場合、それをquota起因と混同してCopilotへ静かにフォールバックしてはいけない。
+    // agy自体の設定不備等はCLI段（cliOutcome）でも同様に起こりうるが、CLI段が429/quota文言で
+    // 失敗しつつAntigravity/Claude段だけが別の理由で失敗する組み合わせも理論上あり得るため、
+    // Claude段を実際に試みた場合は、その quota 判定も isQuotaConfirmed に含める。
+    claudeStageQuotaOrNotAttempted = claudeOutcome.quota
   }
 
-  // isQuotaConfirmed は Antigravity/Claude 試行後もこの時点の値のまま渡す。
-  // 「Gemini API と Gemini CLI が両方 quota 起因で失敗した」という判定自体は
-  // Antigravity/Claude 側の成否とは独立している（Antigravity/Claude は Gemini 本体では
-  // なく、既存の追加フォールバック段。呼び出し元の quota 判定はあくまで Gemini API/CLI 基準）。
+  // 最終的な isQuotaConfirmed:
+  //   Gemini API・CLI が両方 quota 起因で失敗、かつ（Antigravity/Claude を試みていないか、
+  //   試みてそれも quota 起因で失敗した）場合のみ true。
+  const isQuotaConfirmed = geminiBothQuota && claudeStageQuotaOrNotAttempted
   return handleBothExhausted(featureName, isQuotaConfirmed)
 }
