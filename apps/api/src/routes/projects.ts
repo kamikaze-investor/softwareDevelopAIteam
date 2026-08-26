@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify'
+import type { ProjectRoadmapCompletion, Task } from '@ai-team/shared'
 import { z } from 'zod'
+import { initializeApprovedProject } from '../ctoAi/projectInitialization'
 import { getStorage } from '../storage'
 import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
 
@@ -18,6 +20,17 @@ const UpdateProjectBody = z.object({
   designPhilosophy: z.array(z.string()).optional(),
   status: ProjectStatusSchema.optional(),
 }).strict()
+
+function getRoadmapCompletion(tasks: Task[]): ProjectRoadmapCompletion {
+  const activeTasks = tasks.filter((task) => task.roadmapActive)
+  const completedTaskCount = activeTasks.filter((task) => task.status === 'done').length
+
+  return {
+    completedTaskCount,
+    isComplete: activeTasks.length > 0 && completedTaskCount === activeTasks.length,
+    totalTaskCount: activeTasks.length,
+  }
+}
 
 export async function projectRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
@@ -45,7 +58,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const activePhases = storage.projectRoadmapPhases
       .findByProjectId(req.params.id)
       .filter((phase) => phase.roadmapActive)
-    return reply.send({ phases: activePhases })
+    const completion = getRoadmapCompletion(storage.tasks.findByProjectId(req.params.id))
+    return reply.send({ phases: activePhases, completion })
   })
 
   app.post('/', async (req, reply) => {
@@ -93,6 +107,21 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
 
     try {
       const updated = storage.projects.update(req.params.id, result.data)
+      if (!updated) {
+        return reply.status(404).send({ error: 'Project not found' })
+      }
+
+      // `running` は既存UIの「開始」承認後状態。Roadmapが未作成の場合だけ、既存の
+      // Roadmap→Task→初回Implement Job処理を起動する。既に同期済みのProjectは再生成しない。
+      const hasActiveRoadmap = storage.tasks
+        .findByProjectId(updated.id)
+        .some((task) => task.roadmapActive)
+      if (updated.status === 'running' && !hasActiveRoadmap) {
+        await initializeApprovedProject(storage, updated, process.env.TARGET_ROOT ?? '/workspace/target', {
+          writeProjectMemory: true,
+        })
+      }
+
       return reply.send(updated)
     } catch (err: unknown) {
       if (err instanceof SingleRunningProjectError) {
