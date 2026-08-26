@@ -3,8 +3,8 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('./geminiRouter.js', () => ({
-  callGeminiWithFallback: vi.fn(),
+vi.mock('./metaReviewFallbackRouter.js', () => ({
+  reviewWithProviderFallback: vi.fn(),
 }))
 
 vi.mock('../aiCli/factory.js', () => ({
@@ -34,7 +34,7 @@ vi.mock('./runner.js', () => ({
 }))
 
 import { createAiCliAdapter } from '../aiCli/factory.js'
-import { callGeminiWithFallback } from './geminiRouter.js'
+import { reviewWithProviderFallback } from './metaReviewFallbackRouter.js'
 import {
   buildMetaReviewPrompt,
   parseMetaReviewResult,
@@ -45,7 +45,7 @@ import {
   runStrategicMetaReview,
 } from './strategicReview.js'
 
-const mockCallGeminiWithFallback = vi.mocked(callGeminiWithFallback)
+const mockReviewWithProviderFallback = vi.mocked(reviewWithProviderFallback)
 const mockBuildMetaReviewPrompt = vi.mocked(buildMetaReviewPrompt)
 const mockParseMetaReviewResult = vi.mocked(parseMetaReviewResult)
 const mockCreateAiCliAdapter = vi.mocked(createAiCliAdapter)
@@ -70,7 +70,7 @@ function mockCodexReviewerFailure(): void {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mockCallGeminiWithFallback.mockResolvedValue(jsonDecision('ALIGNED'))
+  mockReviewWithProviderFallback.mockResolvedValue({ raw: jsonDecision('ALIGNED'), providerUsed: 'gemini' })
   mockParseMetaReviewResult.mockReturnValue({
     id: 'meta-review-task-test',
     taskId: 'task-test',
@@ -98,8 +98,8 @@ describe('runStrategicMetaReview', () => {
     expect(result.selectedFocuses).toEqual([])
     expect(result.focusedReviewResults).toEqual([])
     expect(mockBuildMetaReviewPrompt).toHaveBeenCalledOnce()
-    expect(mockCallGeminiWithFallback).toHaveBeenCalledOnce()
-    expect(mockCallGeminiWithFallback.mock.calls[0][0]).toBe('legacy meta review prompt')
+    expect(mockReviewWithProviderFallback).toHaveBeenCalledOnce()
+    expect(mockReviewWithProviderFallback.mock.calls[0][0]).toBe('legacy meta review prompt')
   })
 
   it('does not require CEO approval for LOW legacy CONFLICT without an explicit approval flag', async () => {
@@ -129,10 +129,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('sets independentReviewRequired for CRITICAL review load', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
 
     const result = await runStrategicMetaReview({
       taskId: 'task-critical',
@@ -148,10 +148,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('actually executes an Independent Review for CRITICAL, not just the flag', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
     mockCodexReviewerRun('approved', 'independent codex review approved')
 
     const result = await runStrategicMetaReview({
@@ -176,10 +176,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('does not feed the Independent Reviewer the primary Gemini prompt or response', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
     const run = vi.fn().mockResolvedValue({
       blocked: false,
       exitCode: 0,
@@ -203,10 +203,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('overrides CRITICAL ALIGNED to CONFLICT when the Independent Review blocks', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
     mockCodexReviewerRun('blocking', 'independent reviewer found a critical safety gap')
 
     const result = await runStrategicMetaReview({
@@ -223,10 +223,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('fails closed to REVIEW_UNAVAILABLE when the Independent Reviewer itself is unavailable', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
     mockCodexReviewerFailure()
 
     const result = await runStrategicMetaReview({
@@ -242,7 +242,7 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('does not run the Independent Reviewer when the primary review is already unavailable', async () => {
-    mockCallGeminiWithFallback.mockRejectedValueOnce(new Error('gemini timeout'))
+    mockReviewWithProviderFallback.mockRejectedValueOnce(new Error('gemini timeout'))
 
     const result = await runStrategicMetaReview({
       taskId: 'task-critical-primary-unavailable',
@@ -336,10 +336,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('requires CEO approval for CRITICAL CONFLICT', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('CONFLICT', 'critical conflict'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'architecture aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('CONFLICT', 'critical conflict'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
 
     const result = await runStrategicMetaReview({
       taskId: 'task-critical-conflict',
@@ -356,10 +356,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('returns CONFLICT when Strategic Alignment Focus returns CONFLICT', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('CONFLICT', 'goal conflict'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'data aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('CONFLICT', 'goal conflict'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
 
     const result = await runStrategicMetaReview(highStorageInput())
 
@@ -371,10 +371,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('returns CONFLICT when Integration Review returns CONFLICT even if Focused Reviews are ALIGNED', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'data aligned'))
-      .mockResolvedValueOnce(jsonDecision('CONFLICT', 'combined result conflicts'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('CONFLICT', 'combined result conflicts'), providerUsed: 'gemini' })
 
     const result = await runStrategicMetaReview(highStorageInput())
 
@@ -384,10 +384,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('returns UNCERTAIN when there is UNCERTAIN and no CONFLICT', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('UNCERTAIN', 'strategic assumption unresolved'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'data aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('UNCERTAIN', 'strategic assumption unresolved'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
 
     const result = await runStrategicMetaReview(highStorageInput())
 
@@ -397,10 +397,10 @@ describe('runStrategicMetaReview', () => {
   })
 
   it('labels pre-implementation design material as text instead of diff', async () => {
-    mockCallGeminiWithFallback
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'strategic aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'data aligned'))
-      .mockResolvedValueOnce(jsonDecision('ALIGNED', 'integration aligned'))
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
 
     await runStrategicMetaReview({
       ...highStorageInput(),
@@ -408,7 +408,7 @@ describe('runStrategicMetaReview', () => {
       materialKind: 'design',
     })
 
-    const prompt = mockCallGeminiWithFallback.mock.calls[0][0]
+    const prompt = mockReviewWithProviderFallback.mock.calls[0][0]
     expect(prompt).toContain('## Proposed Design (pre-implementation, not yet a diff)')
     expect(prompt).toContain('```text\nDesign: reuse the current Meta Reviewer router')
     expect(prompt).not.toContain('## Git Diff or Design Text\n\n```diff\nDesign:')
@@ -430,14 +430,14 @@ describe('runStrategicMetaReview', () => {
       expect(result.selectedFocuses).toEqual(['product_ceo_experience'])
       expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
       expect(result.requiresCeoApproval).toBe(true)
-      expect(mockCallGeminiWithFallback).not.toHaveBeenCalled()
+      expect(mockReviewWithProviderFallback).not.toHaveBeenCalled()
     } finally {
       await rm(tempRoot, { recursive: true, force: true })
     }
   })
 
   it('never returns ALIGNED when Gemini throws during a required Focused Review', async () => {
-    mockCallGeminiWithFallback.mockRejectedValueOnce(new Error('timeout'))
+    mockReviewWithProviderFallback.mockRejectedValueOnce(new Error('timeout'))
 
     const result = await runStrategicMetaReview({
       taskId: 'task-medium',
@@ -452,6 +452,39 @@ describe('runStrategicMetaReview', () => {
     expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
     expect(result.requiresCeoApproval).toBe(true)
     expect(result.independentReviewRequired).toBe(false)
+  })
+
+  it('parses Copilot-provided raw output through the existing focused review parser', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'copilot strategic review'), providerUsed: 'copilot' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'copilot data review'), providerUsed: 'copilot' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'copilot integration review'), providerUsed: 'copilot' })
+
+    const result = await runStrategicMetaReview(highStorageInput())
+
+    expect(result.reviewLoad).toBe('high')
+    expect(result.focusedReviewResults.length).toBe(2)
+    expect(result.focusedReviewResults.every((f) => f.decision === 'ALIGNED')).toBe(true)
+    expect(result.integrationReviewResult?.decision).toBe('ALIGNED')
+    expect(result.finalDecision).toBe('ALIGNED')
+  })
+
+  it('fails closed on non-quota errors without falling back to Copilot', async () => {
+    mockReviewWithProviderFallback.mockRejectedValueOnce(
+      new Error('[geminiRouter] Gemini failed, non-quota (feature: strategic-meta-review-scope_simplicity)'),
+    )
+
+    const result = await runStrategicMetaReview({
+      taskId: 'task-medium-nonquota',
+      taskTitle: 'Mobile UI adjustment',
+      changedFiles: ['apps/mobile/app/index.tsx'],
+      gitDiff: 'diff --git a/apps/mobile/app/index.tsx b/apps/mobile/app/index.tsx',
+      workingDir: repoRoot,
+    })
+
+    expect(result.reviewLoad).toBe('medium')
+    expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+    expect(result.requiresCeoApproval).toBe(true)
   })
 })
 

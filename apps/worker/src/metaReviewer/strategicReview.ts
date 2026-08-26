@@ -25,7 +25,7 @@ import {
   buildMetaReviewRequest,
   parseMetaReviewResult,
 } from './runner.js'
-import { callGeminiWithFallback } from './geminiRouter.js'
+import { reviewWithProviderFallback } from './metaReviewFallbackRouter.js'
 import { createReviewerAdapter } from '../approvalLevel/reviewerAdapter.js'
 
 /**
@@ -334,7 +334,7 @@ async function runLowLoadLegacyReview(
       input.gitDiff,
     )
     const prompt = buildMetaReviewPrompt(request)
-    const rawResponse = await callGeminiWithFallback(prompt, {
+    const { raw: rawResponse } = await reviewWithProviderFallback(prompt, {
       preferCli: true,
       // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
       // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
@@ -383,7 +383,7 @@ async function runFocusedReview(
   }
 
   try {
-    const rawResponse = await callGeminiWithFallback(promptContext.prompt, {
+    const { raw: rawResponse } = await reviewWithProviderFallback(promptContext.prompt, {
       preferCli: true,
       // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
       // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
@@ -412,7 +412,7 @@ async function runIntegrationReview(
   const prompt = buildIntegrationReviewPrompt(input, focusedReviewResults)
 
   try {
-    const rawResponse = await callGeminiWithFallback(prompt, {
+    const { raw: rawResponse } = await reviewWithProviderFallback(prompt, {
       preferCli: true,
       // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
       // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
