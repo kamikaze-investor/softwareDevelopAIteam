@@ -59,6 +59,11 @@ const SafeCommandInputSchema = z.object({
   params: SafeCommandParamsSchema.optional(),
 }).strict()
 
+// 意図的に 'copilot' を含めない。@ai-team/shared の AiCliProvider 型には
+// 存在するが、Task/Job実装用のプロバイダーとしてはまだ未対応
+// （CopilotCliAdapter は implement モードを明示的に拒否する。現状の用途は
+// Meta Review の quota枯渇時フォールバックのみ、apps/worker/src/metaReviewer/copilotRouter.ts）。
+// 対応時はこのSchemaと同時に更新すること（2026-08-26 独立レビュー指摘: 型とAPI契約の不整合）。
 const AiCliProviderSchema = z.enum(['claude_code', 'codex', 'gemini'])
 const AiCliModeSchema = z.enum(['implement', 'review', 'qa', 'summarize'])
 const ReviewStatusSchema = z.enum(['approved', 'changes_requested', 'rejected'])
