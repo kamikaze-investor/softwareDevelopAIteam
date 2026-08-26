@@ -887,7 +887,9 @@ export async function runJob(
     targetProjectRiskScanResult.highestSeverity === 'medium' ||
     targetProjectRiskScanResult.highestSeverity === 'high'
   let postReviewResult: PostReviewResult | undefined
-  if (isRiskSeverityMediumOrHigh && job.aiCliProvider) {
+  // 'copilot' は ImplementerProvider（実装AI）には含まれない
+  // （現状 Meta Review フォールバック専用。Task実装には未割当のため除外する）。
+  if (isRiskSeverityMediumOrHigh && job.aiCliProvider && job.aiCliProvider !== 'copilot') {
     try {
       postReviewResult = await runPostReview({
         jobId: job.id,

@@ -478,6 +478,9 @@ function buildSafeEnv(provider: AiCliProvider): NodeJS.ProcessEnv {
       }
     case 'codex':
       return { ...base, OPENAI_API_KEY: process.env.OPENAI_API_KEY }
+    case 'copilot':
+      // GITHUB_TOKEN のみで認証可能（PAT不要、実測確認済み 2026-08-26）
+      return { ...base, GITHUB_TOKEN: process.env.GITHUB_TOKEN }
   }
 }
 

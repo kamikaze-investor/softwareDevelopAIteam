@@ -16,6 +16,7 @@ import type { IAiCliAdapter } from './adapter.js'
 import { ClaudeCodeAdapter } from './claudeCodeAdapter.js'
 import { GeminiCliAdapter } from './geminiCliAdapter.js'
 import { CodexAdapter } from './codexAdapter.js'
+import { CopilotCliAdapter } from './copilotAdapter.js'
 
 export function createAiCliAdapter(config: AiCliAdapterConfig): IAiCliAdapter {
   switch (config.provider) {
@@ -27,6 +28,9 @@ export function createAiCliAdapter(config: AiCliAdapterConfig): IAiCliAdapter {
 
     case 'codex':
       return new CodexAdapter(config)
+
+    case 'copilot':
+      return new CopilotCliAdapter(config)
 
     default:
       // TypeScript exhaustiveness check

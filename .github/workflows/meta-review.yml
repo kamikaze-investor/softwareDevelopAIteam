@@ -7,8 +7,9 @@ on:
     branches: [master, main]   # master（現在）と main（将来の改名）の両方に対応
 
 permissions:
-  pull-requests: write   # PRへのコメント投稿
+  pull-requests: write     # PRへのコメント投稿
   contents: read
+  copilot-requests: write  # Gemini API/CLI 両方 quota 枯渇時の Copilot CLI フォールバック用
 
 jobs:
   meta-review:
@@ -46,13 +47,20 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # -------------------------------------------------------
-      # 3. Meta Review 実行（Gemini に diff を渡す）
+      # 2.5. Copilot CLI のセットアップ（Gemini API/CLI 両方 quota 枯渇時のみ使用）
+      # -------------------------------------------------------
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+
+      # -------------------------------------------------------
+      # 3. Meta Review 実行（Gemini → Gemini CLI → Copilot CLI の順にフォールバック）
       # -------------------------------------------------------
       - name: Run Meta Review
         id: meta-review
         run: pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}   # Copilot CLI フォールバック用（PAT不要、実測確認済み）
           BASE_SHA:  ${{ github.event.pull_request.base.sha }}
           HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
           PR_TITLE:  ${{ github.event.pull_request.title }}

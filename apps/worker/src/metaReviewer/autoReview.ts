@@ -44,10 +44,10 @@ import { dirname, resolve } from 'node:path'
 }
 
 async function main(): Promise<void> {
-  // .env ロード後に runner.ts / geminiRouter.ts を評価させるため動的 import する
+  // .env ロード後に runner.ts / geminiRouter.ts / metaReviewFallbackRouter.ts を評価させるため動的 import する
   const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } =
     await import('./runner.js')
-  const { callGeminiWithFallback } = await import('./geminiRouter.js')
+  const { reviewWithProviderFallback } = await import('./metaReviewFallbackRouter.js')
 
   // --- 環境変数の読み取り ---
   const baseSha = process.env.BASE_SHA       // GitHub Actions: PR の base SHA
@@ -124,30 +124,34 @@ async function main(): Promise<void> {
   )
   const prompt = buildMetaReviewPrompt(request)
 
-  // --- Gemini にレビューを依頼 ---
+  // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
   console.log('\n🤖 Gemini にレビューを依頼中...')
   let rawResponse: string
   try {
-    rawResponse = await callGeminiWithFallback(prompt, {
+    const reviewResult = await reviewWithProviderFallback(prompt, {
       preferCli: true,
       cliModel: 'gemini-3.5-flash',
       apiModel: 'gemini-3.5-flash',
       featureName: 'meta_review',
     })
+    rawResponse = reviewResult.raw
+    if (reviewResult.providerUsed === 'copilot') {
+      console.log('   ℹ️  Gemini quota 枯渇のため Copilot CLI（Microsoft系モデル）で審査しました')
+    }
   } catch (err) {
-    console.error('❌ Gemini API 呼び出しに失敗しました:', err)
+    console.error('❌ Meta Review プロバイダー呼び出しに失敗しました:', err)
     // API障害は安全のため blocked 扱い
     const errorResult = {
       id: `meta-review-${taskId}-${Date.now()}`,
       taskId,
       status: 'blocked' as const,
       riskLevel: 'critical' as const,
-      summary: 'Gemini API 呼び出しに失敗しました。安全のため blocked とします。',
+      summary: 'Meta Review プロバイダー（Gemini / Copilot）呼び出しに失敗しました。安全のため blocked とします。',
       findings: [{
         severity: 'critical' as const,
         category: 'security_regression' as const,
-        message: `Gemini API エラー: ${err instanceof Error ? err.message : String(err)}`,
-        suggestion: 'GEMINI_API_KEY と API の状態を確認してください',
+        message: `Meta Review プロバイダーエラー: ${err instanceof Error ? err.message : String(err)}`,
+        suggestion: 'GEMINI_API_KEY / Gemini CLI / Copilot CLI（GITHUB_TOKEN認証）の状態を確認してください',
       }],
       requiresCeoApproval: true,
       createdAt: new Date().toISOString(),
