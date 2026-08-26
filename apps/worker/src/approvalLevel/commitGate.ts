@@ -58,20 +58,29 @@ export interface CommitGateResult {
  * reviewPolicyがceo_requiredである時点で自動commitを禁止する」という
  * 意味である。この判定は evaluateCommitGate() 内で別途、成果物チェックとは
  * 独立した無条件blockingとして扱う。
+ *
+ * 2026-08-26 Phase 1c 修正:
+ * - SAFETY_VERIFICATION_RESULT を下位tier（mechanical_only / light_ai_post_review）の
+ *   必須から外した。理由: (1) safetyVerifier は未接続の blocking チェック（TYPECHECK 等）
+ *   により structurally overallPassed:false になるため、下位tier でも always-fail となり
+ *   commit が到達不能; (2) 対象は target_project であり、下位tier の相当するリスクシグナルは
+ *   既に targetProjectRiskScanResult（deriveTargetProjectApprovalLevel の入力）がカバーしている。
+ * - full_pre_post_review からも SAFETY_VERIFICATION_RESULT を外した（同理由）。
+ * - full_pre_post_review から PRE_REVIEW_RESULT を外した。理由: preReviewer は
+ *   jobRunner.ts に未接続（「変更計画テキスト」のキャプチャメカニズム未実装）のため、
+ *   必須にしても常に欠落し commit 到達不能になる。将来 preReviewer 接続時に復活させる。
+ *   note: PRE_REVIEW_RESULT / SAFETY_VERIFICATION_RESULT の checkArtifactPresence と
+ *   evaluateCommitGate 内の blocked/overallPassed チェック自体は削除しない
+ *   （これらは成果物が渡された場合に有効な汎用チェックのため）。
  */
 export function getRequiredArtifacts(reviewPolicy: ReviewPolicy): RequiredArtifactId[] {
   switch (reviewPolicy) {
     case 'mechanical_only':
-      return ['APPROVAL_LEVEL_RESULT', 'SAFETY_VERIFICATION_RESULT']
+      return ['APPROVAL_LEVEL_RESULT']
     case 'light_ai_post_review':
-      return ['APPROVAL_LEVEL_RESULT', 'POST_REVIEW_RESULT', 'SAFETY_VERIFICATION_RESULT']
+      return ['APPROVAL_LEVEL_RESULT', 'POST_REVIEW_RESULT']
     case 'full_pre_post_review':
-      return [
-        'APPROVAL_LEVEL_RESULT',
-        'PRE_REVIEW_RESULT',
-        'POST_REVIEW_RESULT',
-        'SAFETY_VERIFICATION_RESULT',
-      ]
+      return ['APPROVAL_LEVEL_RESULT', 'POST_REVIEW_RESULT']
     case 'ceo_required':
       return []
   }

@@ -251,23 +251,21 @@ describe('deriveTargetProjectApprovalLevel → evaluateCommitGate 統合', () =>
     }
   }
 
-  it('no-risk → mechanical_only: approvalLevelResult + safetyVerificationResult のみで allowed:true（post-review不要）', () => {
+  it('no-risk → mechanical_only: approvalLevelResult のみで allowed:true（post-review/safety不要）', () => {
     const approvalLevelResult = deriveTargetProjectApprovalLevel({
       jobId: 'job-1',
       taskId: 'task-1',
       riskScanResult: makeRiskScanResult(),
     })
 
-    const gateResult = evaluateCommitGate(makeCommitGateInput('mechanical_only', approvalLevelResult, {
-      safetyVerificationResult: makePassingSafetyVerificationResult(),
-    }))
+    const gateResult = evaluateCommitGate(makeCommitGateInput('mechanical_only', approvalLevelResult))
 
     expect(gateResult.allowed).toBe(true)
     expect(gateResult.reviewPolicy).toBe('mechanical_only')
     expect(gateResult.blockingReasons).toEqual([])
   })
 
-  it('low → light_ai_post_review: post-review + safety で allowed:true', () => {
+  it('low → light_ai_post_review: approvalLevelResult + PASSING postReviewResult で allowed:true（safety不要）', () => {
     const approvalLevelResult = deriveTargetProjectApprovalLevel({
       jobId: 'job-1',
       taskId: 'task-1',
@@ -288,7 +286,6 @@ describe('deriveTargetProjectApprovalLevel → evaluateCommitGate 統合', () =>
 
     const gateResult = evaluateCommitGate(makeCommitGateInput('light_ai_post_review', approvalLevelResult, {
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makePassingSafetyVerificationResult(),
     }))
 
     expect(gateResult.allowed).toBe(true)
@@ -314,15 +311,40 @@ describe('deriveTargetProjectApprovalLevel → evaluateCommitGate 統合', () =>
       }),
     })
 
-    const gateResult = evaluateCommitGate(makeCommitGateInput('light_ai_post_review', approvalLevelResult, {
-      safetyVerificationResult: makePassingSafetyVerificationResult(),
-    }))
+    const gateResult = evaluateCommitGate(makeCommitGateInput('light_ai_post_review', approvalLevelResult))
 
     expect(gateResult.allowed).toBe(false)
     expect(gateResult.blockingReasons.some(r => r.includes('POST_REVIEW_RESULT'))).toBe(true)
   })
 
-  it('medium → full_pre_post_review: 全4成果物が必要。pre+post+safety で allowed:true', () => {
+  it('low → light_ai_post_review: postReviewResult.blocked:true なら allowed:false', () => {
+    const approvalLevelResult = deriveTargetProjectApprovalLevel({
+      jobId: 'job-1',
+      taskId: 'task-1',
+      riskScanResult: makeRiskScanResult({
+        hasRisk: true,
+        highestSeverity: 'low',
+        issues: [
+          {
+            id: 'TEST_SKIP_ADDED',
+            label: 'テストスキップ',
+            detail: 'テストスキップ',
+            evidence: [],
+            severity: 'low',
+          },
+        ],
+      }),
+    })
+
+    const gateResult = evaluateCommitGate(makeCommitGateInput('light_ai_post_review', approvalLevelResult, {
+      postReviewResult: makePostReviewResult({ blocked: true }),
+    }))
+
+    expect(gateResult.allowed).toBe(false)
+    expect(gateResult.blockingReasons.some(r => r.includes('Post-Review'))).toBe(true)
+  })
+
+  it('medium → full_pre_post_review: approvalLevelResult + PASSING postReviewResult で allowed:true（pre/safety不要）', () => {
     const approvalLevelResult = deriveTargetProjectApprovalLevel({
       jobId: 'job-1',
       taskId: 'task-1',
@@ -342,14 +364,63 @@ describe('deriveTargetProjectApprovalLevel → evaluateCommitGate 統合', () =>
     })
 
     const gateResult = evaluateCommitGate(makeCommitGateInput('full_pre_post_review', approvalLevelResult, {
-      preReviewResult: undefined,
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makePassingSafetyVerificationResult(),
     }))
 
-    // preReviewResult が undefined のため成果物欠落で blocked
+    expect(gateResult.allowed).toBe(true)
+    expect(gateResult.reviewPolicy).toBe('full_pre_post_review')
+  })
+
+  it('medium → full_pre_post_review: postReviewResult なしでは allowed:false', () => {
+    const approvalLevelResult = deriveTargetProjectApprovalLevel({
+      jobId: 'job-1',
+      taskId: 'task-1',
+      riskScanResult: makeRiskScanResult({
+        hasRisk: true,
+        highestSeverity: 'medium',
+        issues: [
+          {
+            id: 'ENV_FILE_CHANGED',
+            label: '.env変更',
+            detail: '.env変更',
+            evidence: ['.env'],
+            severity: 'medium',
+          },
+        ],
+      }),
+    })
+
+    const gateResult = evaluateCommitGate(makeCommitGateInput('full_pre_post_review', approvalLevelResult))
+
     expect(gateResult.allowed).toBe(false)
-    expect(gateResult.blockingReasons.some(r => r.includes('PRE_REVIEW_RESULT'))).toBe(true)
+    expect(gateResult.blockingReasons.some(r => r.includes('POST_REVIEW_RESULT'))).toBe(true)
+  })
+
+  it('medium → full_pre_post_review: postReviewResult.blocked:true なら allowed:false', () => {
+    const approvalLevelResult = deriveTargetProjectApprovalLevel({
+      jobId: 'job-1',
+      taskId: 'task-1',
+      riskScanResult: makeRiskScanResult({
+        hasRisk: true,
+        highestSeverity: 'medium',
+        issues: [
+          {
+            id: 'ENV_FILE_CHANGED',
+            label: '.env変更',
+            detail: '.env変更',
+            evidence: ['.env'],
+            severity: 'medium',
+          },
+        ],
+      }),
+    })
+
+    const gateResult = evaluateCommitGate(makeCommitGateInput('full_pre_post_review', approvalLevelResult, {
+      postReviewResult: makePostReviewResult({ blocked: true }),
+    }))
+
+    expect(gateResult.allowed).toBe(false)
+    expect(gateResult.blockingReasons.some(r => r.includes('Post-Review'))).toBe(true)
   })
 
   it('high → ceo_required: 何を渡しても always blocked', () => {
@@ -372,9 +443,7 @@ describe('deriveTargetProjectApprovalLevel → evaluateCommitGate 統合', () =>
     })
 
     const gateResult = evaluateCommitGate(makeCommitGateInput('ceo_required', approvalLevelResult, {
-      preReviewResult: undefined,
       postReviewResult: makePostReviewResult(),
-      safetyVerificationResult: makePassingSafetyVerificationResult(),
     }))
 
     expect(gateResult.allowed).toBe(false)
