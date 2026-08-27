@@ -24,7 +24,8 @@ const FULL_ENV = [
   'GEMINI_API_KEY=gemini-secret',
   'GEMINI_MODEL=gemini-2.0',
   'OPENAI_API_KEY=openai-secret',
-  'GITHUB_TOKEN=github-secret',
+  'GITHUB_TOKEN=git-operation-secret',
+  'COPILOT_GITHUB_TOKEN=copilot-secret',
   'API_TOKEN=api-secret',
   'OPENCODE_GO_API_KEY=opencode-secret',
   'ADMIN_TOKEN_SHA256=admin-hash',
@@ -36,9 +37,9 @@ describe('loadAllowlistedEnv', () => {
     const target: NodeJS.ProcessEnv = {}
     loadAllowlistedEnv(writeEnvFile(FULL_ENV), target)
 
-    expect(Object.keys(target).sort()).toEqual(['GEMINI_API_KEY', 'GEMINI_MODEL', 'GITHUB_TOKEN'])
+    expect(Object.keys(target).sort()).toEqual(['COPILOT_GITHUB_TOKEN', 'GEMINI_API_KEY', 'GEMINI_MODEL'])
     expect(target.GEMINI_API_KEY).toBe('gemini-secret')
-    expect(target.GITHUB_TOKEN).toBe('github-secret')
+    expect(target.COPILOT_GITHUB_TOKEN).toBe('copilot-secret')
   })
 
   it('evidence登録token・API_TOKEN・不要provider keyを載せない', () => {
@@ -52,17 +53,19 @@ describe('loadAllowlistedEnv', () => {
       'OPENCODE_GO_API_KEY',
       'CLAUDE_API_KEY',
       'OPENAI_API_KEY',
+      'GITHUB_TOKEN',
     ]) {
       expect(target).not.toHaveProperty(forbidden)
     }
     expect(Object.values(target)).not.toContain('api-secret')
   })
 
-  it('GITHUB_TOKENがCopilot CLIフォールバック用にallowlistに含まれる', () => {
+  it('COPILOT_GITHUB_TOKENだけがCopilot CLIフォールバック用にallowlistに含まれる', () => {
     const target: NodeJS.ProcessEnv = {}
-    loadAllowlistedEnv(writeEnvFile('GITHUB_TOKEN=ghp_test123\nCLAUDE_API_KEY=should-not-load'), target)
+    loadAllowlistedEnv(writeEnvFile('COPILOT_GITHUB_TOKEN=copilot-test\nGITHUB_TOKEN=git-token-must-not-load\nCLAUDE_API_KEY=should-not-load'), target)
 
-    expect(target.GITHUB_TOKEN).toBe('ghp_test123')
+    expect(target.COPILOT_GITHUB_TOKEN).toBe('copilot-test')
+    expect(target).not.toHaveProperty('GITHUB_TOKEN')
     expect(target).not.toHaveProperty('CLAUDE_API_KEY')
   })
 
