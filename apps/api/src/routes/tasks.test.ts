@@ -848,7 +848,7 @@ describe('Task API', () => {
         return {
           ok: true,
           stdout: JSON.stringify({
-            focusedReviewResults: [],
+            focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
             integrationReviewResult: { decision: 'ALIGNED' },
           }),
           timedOut: false,
