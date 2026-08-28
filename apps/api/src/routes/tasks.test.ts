@@ -3,7 +3,7 @@ import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskSummary } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
-import { buildResumeAiCliPrompt } from './tasks'
+import { buildResumeAiCliPrompt, type TaskRouteOptions } from './tasks'
 
 /**
  * POST /api/jobs のリクエストボディ用の型。
@@ -13,7 +13,7 @@ type CreateJobRequestBody = Partial<Omit<Job, 'safeCommand'>> & {
   safeCommand?: { kind: SafeCommand['kind']; params?: SafeCommand['params'] }
 }
 
-async function buildApp(): Promise<FastifyInstance> {
+async function buildApp(taskRouteOptions: TaskRouteOptions = {}): Promise<FastifyInstance> {
   const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { resetStorage }] = await Promise.all([
     import('./projects.js'),
     import('./tasks.js'),
@@ -26,14 +26,17 @@ async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify()
   app.register(cors, { origin: true })
   app.register(projectRoutes, { prefix: '/api/projects' })
-  app.register(taskRoutes, { prefix: '/api/tasks' })
+  app.register(taskRoutes, { prefix: '/api/tasks', ...taskRouteOptions })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app
 }
 
-async function withApp(run: (app: FastifyInstance) => Promise<void>): Promise<void> {
-  const app = await buildApp()
+async function withApp(
+  run: (app: FastifyInstance) => Promise<void>,
+  taskRouteOptions: TaskRouteOptions = {},
+): Promise<void> {
+  const app = await buildApp(taskRouteOptions)
   try {
     await run(app)
   } finally {
@@ -835,6 +838,53 @@ describe('Task API', () => {
         expect(original?.status).toBe('blocked')
         expect(original?.aiCliPrompt).toBe('Original rejected prompt')
         expect(created?.status).toBe('queued')
+      })
+    })
+
+    it('reviews the instruction-augmented prompt before creating a resumed Job when no matching evidence exists', async () => {
+      const execute = vi.fn(async (input: string) => {
+        const reviewInput = JSON.parse(input) as { designText: string }
+        expect(reviewInput.designText).toContain('Use docs only.')
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            focusedReviewResults: [],
+            integrationReviewResult: { decision: 'ALIGNED' },
+          }),
+          timedOut: false,
+        }
+      })
+
+      await withApp(async (app) => {
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        const project = await createProject(app)
+        const task = await createTask(app, project.id, {
+          title: 'Retry safely',
+          description: 'Update only documentation.',
+        })
+        await createBlockedAiCliJob(app, task, {
+          aiCliPrompt: 'Original blocked prompt',
+        })
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks//resume`,
+          payload: { instruction: 'Use docs only.' },
+        })
+
+        expect(res.statusCode).toBe(201)
+        expect(execute).toHaveBeenCalledTimes(1)
+        expect(storage.designReviewEvidence.findByTaskId(task.id)).toHaveLength(1)
+        expect(storage.jobs.findByTaskId(task.id)).toHaveLength(2)
+      }, {
+        resumeDesignReviewDeps: {
+          runnerCommand: 'mock',
+          runnerArgs: [],
+          homeDirectory: '/tmp',
+          workingDir: '/tmp',
+          execute,
+        },
       })
     })
 
