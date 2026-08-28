@@ -875,7 +875,7 @@ describe('Task API', () => {
 
         expect(res.statusCode).toBe(201)
         expect(execute).toHaveBeenCalledTimes(1)
-        expect(storage.designReviewEvidence.findByTaskId(task.id)).toHaveLength(1)
+        expect(storage.designReviewEvidence.findByTaskId(task.id)).toHaveLength(2)
         expect(storage.jobs.findByTaskId(task.id)).toHaveLength(2)
       }, {
         resumeDesignReviewDeps: {
