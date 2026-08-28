@@ -78,4 +78,38 @@ describe('initial implement workflow', () => {
     })
     expect(result).toMatchObject({ status: 'created' })
   })
+
+  it('does not create a Job when a declared dependency is not yet done', async () => {
+    const project = storage.tasks.findById(taskId)!.projectId
+    const dependencyId = storage.tasks.create({
+      projectId: project, title: 'Dependency', description: 'D', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    }).id
+    const dependentId = storage.tasks.create({
+      projectId: project, title: 'Dependent', description: 'Implement dependent.', status: 'pending',
+      assignee: 'developer_ai', dependencies: [dependencyId], roadmapActive: true,
+    }).id
+
+    const result = await createInitialImplementWorkflow(storage, dependentId, alignedDeps())
+
+    expect(result).toMatchObject({ status: 'skipped', reason: 'task dependencies are not yet done', retryable: true })
+    expect(storage.jobs.findByTaskId(dependentId)).toHaveLength(0)
+  })
+
+  it('creates the Job once every declared dependency reaches done', async () => {
+    const project = storage.tasks.findById(taskId)!.projectId
+    const dependencyId = storage.tasks.create({
+      projectId: project, title: 'Dependency', description: 'D', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    }).id
+    const dependentId = storage.tasks.create({
+      projectId: project, title: 'Dependent', description: 'Implement dependent.', status: 'pending',
+      assignee: 'developer_ai', dependencies: [dependencyId], roadmapActive: true,
+    }).id
+
+    const result = await createInitialImplementWorkflow(storage, dependentId, alignedDeps())
+
+    expect(result).toMatchObject({ status: 'created' })
+    expect(storage.jobs.findByTaskId(dependentId)).toHaveLength(1)
+  })
 })

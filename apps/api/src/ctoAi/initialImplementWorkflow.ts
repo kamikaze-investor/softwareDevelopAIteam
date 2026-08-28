@@ -35,6 +35,15 @@ export async function createInitialImplementWorkflow(
   if (!isInitialWorkflowTarget(task)) {
     return { taskId, status: 'skipped', reason: 'task is not an initial workflow target' }
   }
+  // selectNextContinuableTask() と同じdependency判定をproducer側にも適用する。
+  // これが無いと、依存未達のTaskにも初回Jobが即座に作られ、依存元Taskの完了前に
+  // 同じ共有workspaceへ書き込まれてしまう（既報Issueと同一の根本原因）。
+  const siblingsById = new Map(
+    storage.tasks.findByProjectId(task.projectId).map((sibling) => [sibling.id, sibling]),
+  )
+  if (!task.dependencies.every((dependencyId) => siblingsById.get(dependencyId)?.status === 'done')) {
+    return { taskId, status: 'skipped', reason: 'task dependencies are not yet done', retryable: true }
+  }
 
   const stepKey = initialWorkflowStepKey(task.id)
   if (storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey === stepKey)) {
