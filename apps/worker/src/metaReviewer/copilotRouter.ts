@@ -62,20 +62,39 @@ export interface CopilotFallbackOptions {
    */
   usage?: string
   timeoutMs?: number
+  /** テストでの差し替え用。既定はAtomics.waitによる同期sleep。 */
+  sleepImpl?: (ms: number) => void
 }
 
-/**
- * Copilot CLI を呼び出し、非対話モードでレビュー結果テキストを取得する。
- * 失敗時は例外を投げる（quota以外の失敗を握り潰さない。呼び出し元が判定する）。
- */
-export function callCopilotForMetaReview(
-  prompt: string,
-  options?: CopilotFallbackOptions,
-): string {
-  const model = options?.model ?? DEFAULT_COPILOT_META_REVIEW_MODEL
-  const usage = options?.usage ?? 'meta_review'
-  const timeout = options?.timeoutMs ?? 300_000
+/** attempt 1 失敗 → 10秒待機 → attempt 2 失敗 → 30秒待機 → attempt 3。判定ロジックは追加しない固定値。 */
+const RETRY_DELAYS_MS = [10_000, 30_000] as const
+const MAX_ATTEMPTS = RETRY_DELAYS_MS.length + 1
 
+/**
+ * 同期ブロッキングsleep。この関数はdesignReviewRunner.ts経由で使い捨ての
+ * 別プロセスとして実行されるため（APIやWorker本体のevent loopではない）、
+ * 数十秒ブロックしても他の処理に影響しない。
+ */
+function defaultSleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+interface CopilotAttemptFailure {
+  ok: false
+  errorMessage: string
+}
+interface CopilotAttemptSuccess {
+  ok: true
+  stdout: string
+}
+
+/** 1回分の呼び出し。既存の隔離cwd・env・argv・判定はそのまま。例外は投げず結果を返す。 */
+function attemptCopilotCall(
+  prompt: string,
+  model: string,
+  usage: string,
+  timeout: number,
+): CopilotAttemptFailure | CopilotAttemptSuccess {
   // 呼び出しごとの使い捨て隔離ディレクトリ（bare tmpdir() は他ステップと共有されるため使わない）
   const isolatedCwd = mkdtempSync(path.join(tmpdir(), 'copilot-meta-review-'))
 
@@ -98,16 +117,16 @@ export function callCopilotForMetaReview(
     const stderr = result.stderr ?? ''
 
     if (result.error) {
-      throw new Error(`[copilotRouter] Copilot CLI 実行エラー（usage=${usage}）: ${result.error.message}`)
+      return { ok: false, errorMessage: `[copilotRouter] Copilot CLI 実行エラー（usage=${usage}）: ${result.error.message}` }
     }
     if (result.status !== 0) {
-      throw new Error(`[copilotRouter] Copilot CLI が exit code ${result.status} で終了しました（usage=${usage}）: ${stderr || stdout || '(no output)'}`)
+      return { ok: false, errorMessage: `[copilotRouter] Copilot CLI が exit code ${result.status} で終了しました（usage=${usage}）: ${stderr || stdout || '(no output)'}` }
     }
     if (!stdout.trim()) {
-      throw new Error(`[copilotRouter] Copilot CLI の応答が空でした（usage=${usage}）`)
+      return { ok: false, errorMessage: `[copilotRouter] Copilot CLI の応答が空でした（usage=${usage}）` }
     }
 
-    return stdout
+    return { ok: true, stdout }
   } finally {
     try {
       rmSync(isolatedCwd, { recursive: true, force: true })
@@ -115,4 +134,35 @@ export function callCopilotForMetaReview(
       // 一時ディレクトリの削除失敗はサイレントに無視
     }
   }
+}
+
+/**
+ * Copilot CLI を呼び出し、非対話モードでレビュー結果テキストを取得する。
+ * 401 / 429 / 5xx / network error / 一時的なnon-zero exit はいずれもCLI呼び出しの
+ * 技術的失敗として同じ形（非0 exit・spawn失敗・空応答）でしか観測できないため、
+ * 個別の原因判定は行わず、最大3回まで固定間隔（10秒 → 30秒）でretryする。
+ * 3回とも失敗した場合は最後の失敗内容で例外を投げる（既存のfail-closedを維持）。
+ * 正常に取得できた応答（意味のあるblocking結果を含む）はretryしない。
+ */
+export function callCopilotForMetaReview(
+  prompt: string,
+  options?: CopilotFallbackOptions,
+): string {
+  const model = options?.model ?? DEFAULT_COPILOT_META_REVIEW_MODEL
+  const usage = options?.usage ?? 'meta_review'
+  const timeout = options?.timeoutMs ?? 300_000
+  const sleepImpl = options?.sleepImpl ?? defaultSleepSync
+
+  let lastErrorMessage = ''
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const outcome = attemptCopilotCall(prompt, model, usage, timeout)
+    if (outcome.ok) return outcome.stdout
+
+    lastErrorMessage = outcome.errorMessage
+    if (attempt < MAX_ATTEMPTS) {
+      sleepImpl(RETRY_DELAYS_MS[attempt - 1])
+    }
+  }
+
+  throw new Error(lastErrorMessage)
 }
