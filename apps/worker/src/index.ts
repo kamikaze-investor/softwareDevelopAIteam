@@ -65,10 +65,29 @@ export interface QueuedWork {
   jobs: Job[]
 }
 
-async function fetchQueuedJob(): Promise<QueuedWork | null> {
+/**
+ * すべての Job の safeCommand.workingDir は TARGET_WORKING_DIR（単一の共有ディレクトリ）に
+ * 固定されている（MVP-A: 単一Repository固定）。あるTaskのJobが running/blocked の間は
+ * そのTaskのworking treeに未commitの変更が残っている可能性があるため、
+ * 別Taskのqueued Jobをclaimしない。これにより、Task境界を越えた変更混入
+ * （Task Aの未commit変更をTask Bがcommitに巻き込む等）を防ぐ。
+ * 既存のWorkerプロセス単位のflockはJobを1つずつ順番に実行することは保証するが、
+ * 「どのTaskが現在workspaceを保有しているか」は関知しないため、この判定を追加する。
+ */
+function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
+  for (const { task, jobs } of perTask) {
+    if (jobs.some((job) => job.status === 'running' || job.status === 'blocked')) {
+      return task.id
+    }
+  }
+  return undefined
+}
+
+export async function fetchQueuedJob(): Promise<QueuedWork | null> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return null
 
+  const perTask: Array<{ task: Task; jobs: Job[] }> = []
   for (const project of projects) {
     if (project.status !== 'running') continue
 
@@ -78,10 +97,17 @@ async function fetchQueuedJob(): Promise<QueuedWork | null> {
     for (const task of tasks) {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
-
-      const queued = jobs.find((job) => job.status === 'queued')
-      if (queued) return { job: queued, task, jobs }
+      perTask.push({ task, jobs })
     }
+  }
+
+  const workspaceOwnerTaskId = findWorkspaceOwningTaskId(perTask)
+
+  for (const { task, jobs } of perTask) {
+    if (workspaceOwnerTaskId !== undefined && workspaceOwnerTaskId !== task.id) continue
+
+    const queued = jobs.find((job) => job.status === 'queued')
+    if (queued) return { job: queued, task, jobs }
   }
 
   return null
