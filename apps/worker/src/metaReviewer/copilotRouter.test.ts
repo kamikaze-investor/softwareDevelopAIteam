@@ -137,31 +137,89 @@ describe('callCopilotForMetaReview', () => {
     }
   })
 
-  it('exit code != 0 のとき例外を投げる（quotaエラーを隠さない）', () => {
+  it('exit code != 0 が3回続いたとき最後の失敗内容で例外を投げる（quotaエラーを隠さない）', () => {
     mockSpawnSync.mockReturnValue(failure(1, 'authentication error'))
 
-    expect(() => callCopilotForMetaReview('prompt')).toThrow(/authentication error/)
+    expect(() => callCopilotForMetaReview('prompt', { sleepImpl: () => {} })).toThrow(/authentication error/)
+    expect(mockSpawnSync).toHaveBeenCalledTimes(3)
   })
 
-  it('spawnSync 自体が失敗（result.error）したとき例外を投げる', () => {
+  it('spawnSync 自体が失敗（result.error）したとき3回retryしたうえで例外を投げる', () => {
     mockSpawnSync.mockReturnValue({
       status: null, stdout: '', stderr: '', pid: 1, output: [], signal: null,
       error: new Error('spawn copilot ENOENT'),
     } as unknown as ReturnType<typeof spawnSync>)
 
-    expect(() => callCopilotForMetaReview('prompt')).toThrow(/ENOENT/)
+    expect(() => callCopilotForMetaReview('prompt', { sleepImpl: () => {} })).toThrow(/ENOENT/)
+    expect(mockSpawnSync).toHaveBeenCalledTimes(3)
   })
 
-  it('stdout が空のとき例外を投げる', () => {
+  it('stdout が空の応答が3回続いたとき例外を投げる', () => {
     mockSpawnSync.mockReturnValue(success('   '))
 
-    expect(() => callCopilotForMetaReview('prompt')).toThrow(/応答が空/)
+    expect(() => callCopilotForMetaReview('prompt', { sleepImpl: () => {} })).toThrow(/応答が空/)
+    expect(mockSpawnSync).toHaveBeenCalledTimes(3)
   })
 
   it('usage オプションがエラーメッセージに含まれる', () => {
     mockSpawnSync.mockReturnValue(failure(1, 'boom'))
 
-    expect(() => callCopilotForMetaReview('prompt', { usage: 'independent_review' }))
+    expect(() => callCopilotForMetaReview('prompt', { usage: 'independent_review', sleepImpl: () => {} }))
       .toThrow(/independent_review/)
+  })
+})
+
+describe('callCopilotForMetaReview bounded retry (attempt 1 -> 10s -> attempt 2 -> 30s -> attempt 3 -> fail-closed)', () => {
+  it('1回目失敗・2回目成功なら2回で成功を返し、2回だけsleepせず1回だけsleepする', () => {
+    mockSpawnSync
+      .mockReturnValueOnce(failure(1, 'transient error'))
+      .mockReturnValueOnce(success('ok-on-attempt-2'))
+    const sleepImpl = vi.fn()
+
+    const result = callCopilotForMetaReview('prompt', { sleepImpl })
+
+    expect(result).toBe('ok-on-attempt-2')
+    expect(mockSpawnSync).toHaveBeenCalledTimes(2)
+    expect(sleepImpl).toHaveBeenCalledTimes(1)
+    expect(sleepImpl).toHaveBeenNthCalledWith(1, 10_000)
+  })
+
+  it('1・2回目失敗、3回目成功なら3回で成功を返し、10秒→30秒の順でsleepする', () => {
+    mockSpawnSync
+      .mockReturnValueOnce(failure(1, 'transient error 1'))
+      .mockReturnValueOnce(failure(1, 'transient error 2'))
+      .mockReturnValueOnce(success('ok-on-attempt-3'))
+    const sleepImpl = vi.fn()
+
+    const result = callCopilotForMetaReview('prompt', { sleepImpl })
+
+    expect(result).toBe('ok-on-attempt-3')
+    expect(mockSpawnSync).toHaveBeenCalledTimes(3)
+    expect(sleepImpl).toHaveBeenCalledTimes(2)
+    expect(sleepImpl).toHaveBeenNthCalledWith(1, 10_000)
+    expect(sleepImpl).toHaveBeenNthCalledWith(2, 30_000)
+  })
+
+  it('3回とも失敗したら既存のfail-closedどおり最後の失敗内容で例外を投げ、4回目は呼ばない', () => {
+    mockSpawnSync
+      .mockReturnValueOnce(failure(1, 'attempt 1 failed'))
+      .mockReturnValueOnce(failure(1, 'attempt 2 failed'))
+      .mockReturnValueOnce(failure(1, 'attempt 3 failed'))
+    const sleepImpl = vi.fn()
+
+    expect(() => callCopilotForMetaReview('prompt', { sleepImpl })).toThrow(/attempt 3 failed/)
+    expect(mockSpawnSync).toHaveBeenCalledTimes(3)
+    expect(sleepImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it('1回目で成功したら追加retryせず、sleepも呼ばない', () => {
+    mockSpawnSync.mockReturnValueOnce(success('ok-on-attempt-1'))
+    const sleepImpl = vi.fn()
+
+    const result = callCopilotForMetaReview('prompt', { sleepImpl })
+
+    expect(result).toBe('ok-on-attempt-1')
+    expect(mockSpawnSync).toHaveBeenCalledTimes(1)
+    expect(sleepImpl).not.toHaveBeenCalled()
   })
 })
