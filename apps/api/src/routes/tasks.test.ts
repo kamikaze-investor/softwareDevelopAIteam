@@ -869,7 +869,7 @@ describe('Task API', () => {
 
         const res = await app.inject({
           method: 'POST',
-          url: `/api/tasks//resume`,
+          url: `/api/tasks/${task.id}/resume`,
           payload: { instruction: 'Use docs only.' },
         })
 
