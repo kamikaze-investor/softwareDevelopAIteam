@@ -37,9 +37,8 @@ describe('loadAllowlistedEnv', () => {
     const target: NodeJS.ProcessEnv = {}
     loadAllowlistedEnv(writeEnvFile(FULL_ENV), target)
 
-    expect(Object.keys(target).sort()).toEqual(['COPILOT_GITHUB_TOKEN', 'GEMINI_API_KEY', 'GEMINI_MODEL'])
+    expect(Object.keys(target).sort()).toEqual(['GEMINI_API_KEY', 'GEMINI_MODEL'])
     expect(target.GEMINI_API_KEY).toBe('gemini-secret')
-    expect(target.COPILOT_GITHUB_TOKEN).toBe('copilot-secret')
   })
 
   it('evidence登録token・API_TOKEN・不要provider keyを載せない', () => {
@@ -54,17 +53,19 @@ describe('loadAllowlistedEnv', () => {
       'CLAUDE_API_KEY',
       'OPENAI_API_KEY',
       'GITHUB_TOKEN',
+      'COPILOT_GITHUB_TOKEN',
     ]) {
       expect(target).not.toHaveProperty(forbidden)
     }
     expect(Object.values(target)).not.toContain('api-secret')
+    expect(Object.values(target)).not.toContain('copilot-secret')
   })
 
-  it('COPILOT_GITHUB_TOKENだけがCopilot CLIフォールバック用にallowlistに含まれる', () => {
+  it('COPILOT_GITHUB_TOKENはCopilot CLIがOAuth credentialで認証するため読み込まない（2026-08-28: PAT配線撤去）', () => {
     const target: NodeJS.ProcessEnv = {}
     loadAllowlistedEnv(writeEnvFile('COPILOT_GITHUB_TOKEN=copilot-test\nGITHUB_TOKEN=git-token-must-not-load\nCLAUDE_API_KEY=should-not-load'), target)
 
-    expect(target.COPILOT_GITHUB_TOKEN).toBe('copilot-test')
+    expect(target).not.toHaveProperty('COPILOT_GITHUB_TOKEN')
     expect(target).not.toHaveProperty('GITHUB_TOKEN')
     expect(target).not.toHaveProperty('CLAUDE_API_KEY')
   })

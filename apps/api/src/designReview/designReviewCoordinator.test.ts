@@ -89,22 +89,20 @@ describe('1. secret least privilege', () => {
     expect(Object.values(env)).not.toContain('must-not-leak')
   })
 
-  it('envは明示allowlistのキーだけで構成される（COPILOT_GITHUB_TOKEN未設定時）', () => {
-    delete process.env.COPILOT_GITHUB_TOKEN
+  it('envは明示allowlistのキーだけで構成される', () => {
     const env = buildRunnerEnv('/tmp/home')
     expect(Object.keys(env).sort()).toEqual(['HOME', 'LANG', 'NODE_ENV', 'PATH', 'USERPROFILE'])
   })
 
-  it('COPILOT_GITHUB_TOKEN設定時のみ、そのキー1つだけが追加される（他のsecretは相変わらず渡らない）', () => {
+  it('COPILOT_GITHUB_TOKENが設定されていてもCopilot CLIはOAuth credentialで認証するため渡さない（2026-08-28: PAT配線撤去）', () => {
     process.env.COPILOT_GITHUB_TOKEN = 'must-not-leak-copilot-token'
     process.env.GEMINI_API_KEY = 'must-not-leak-either'
     try {
       const env = buildRunnerEnv('/tmp/home')
-      expect(Object.keys(env).sort()).toEqual(
-        ['COPILOT_GITHUB_TOKEN', 'HOME', 'LANG', 'NODE_ENV', 'PATH', 'USERPROFILE'],
-      )
-      expect(env.COPILOT_GITHUB_TOKEN).toBe('must-not-leak-copilot-token')
+      expect(Object.keys(env).sort()).toEqual(['HOME', 'LANG', 'NODE_ENV', 'PATH', 'USERPROFILE'])
+      expect(env).not.toHaveProperty('COPILOT_GITHUB_TOKEN')
       expect(env).not.toHaveProperty('GEMINI_API_KEY')
+      expect(Object.values(env)).not.toContain('must-not-leak-copilot-token')
     } finally {
       delete process.env.COPILOT_GITHUB_TOKEN
     }

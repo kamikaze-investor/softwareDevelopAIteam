@@ -10,7 +10,7 @@
  * Gemini API・CLI の両方が quota 枯渇したときのみ、
  * metaReviewFallbackRouter.ts から呼ばれる最終フォールバック。
  *
- * 認証: GITHUB_TOKEN のみ（PAT不要、実測確認済み 2026-08-26）。
+ * 認証: ai-team ユーザーの保存済みOAuth credential（実測確認済み 2026-08-28。PAT配線は撤去済み）。
  * 安全性（2026-08-26 独立レビュー2ラウンドを経て確定。すべて実測確認済み）:
  *   - --yolo / --allow-all / --allow-all-tools は使わない。
  *   - `--available-tools`（値なし）を渡し、ツールそのものをモデルから見えなくする。
@@ -46,10 +46,9 @@ function buildCopilotEnv(): NodeJS.ProcessEnv {
   if (process.env.HOME !== undefined) env.HOME = process.env.HOME
   if (process.env.LANG !== undefined) env.LANG = process.env.LANG
   if (process.env.TERM !== undefined) env.TERM = process.env.TERM
-  // production ではこの子プロセス env に GITHUB_TOKEN 自体は渡ってこない
-  // （designReviewCoordinator.ts の buildRunnerEnv() が渡すのは COPILOT_GITHUB_TOKEN のみ）。
-  // copilot CLI 自体が要求する変数名は GITHUB_TOKEN のままなので、ここで詰め替える。
-  if (process.env.COPILOT_GITHUB_TOKEN !== undefined) env.GITHUB_TOKEN = process.env.COPILOT_GITHUB_TOKEN
+  // 認証は ai-team ユーザーの保存済みOAuth credential（HOME配下）で行う
+  // （2026-08-28: PAT/token配線を撤去。COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN
+  //  のいずれもこの子プロセスへは渡さない）。
   return env
 }
 
