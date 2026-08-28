@@ -171,6 +171,30 @@ describe('fetchQueuedJob workspace exclusivity', () => {
     expect(result?.job.id).toBe('job-a-2')
   })
 
+  it("does not let Task B claim while Task A's approved git_commit Job sits queued again (approveAndResumeJob blocked->queued window)", async () => {
+    const taskA = task({ id: 'task-a' })
+    const taskB = task({ id: 'task-b' })
+    mockEndpoints({
+      projects: [project()],
+      tasksByProjectId: { 'project-1': [taskA, taskB] },
+      jobsByTaskId: {
+        'task-a': [
+          job({ id: 'job-a-1', taskId: 'task-a', status: 'success', workflowStepKey: 'task:task-a:initial-implement' }),
+          job({ id: 'job-a-2', taskId: 'task-a', status: 'success', workflowStepKey: 'implement:job-a-1:review' }),
+          // approveAndResumeJob() just flipped this back to 'queued' (from 'blocked') -
+          // it is not literally running/blocked right now, but it is Task A's own
+          // git_commit continuation, not a fresh unclaimed initial-implement Job.
+          job({ id: 'job-a-3', taskId: 'task-a', status: 'queued', workflowStepKey: 'review:job-a-2:git-commit' }),
+        ],
+        'task-b': [job({ id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'task:task-b:initial-implement' })],
+      },
+    })
+
+    const result = await fetchQueuedJob()
+
+    expect(result?.job.id).toBe('job-a-3')
+  })
+
   it('9. does not serialize across unrelated Projects when only one is running (paused Projects\' active Jobs are ignored)', async () => {
     const taskA = task({ id: 'task-a', projectId: 'project-paused' })
     const taskB = task({ id: 'task-b', projectId: 'project-1' })
