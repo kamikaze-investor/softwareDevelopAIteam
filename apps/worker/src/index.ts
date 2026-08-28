@@ -73,12 +73,28 @@ export interface QueuedWork {
  * （Task Aの未commit変更をTask Bがcommitに巻き込む等）を防ぐ。
  * 既存のWorkerプロセス単位のflockはJobを1つずつ順番に実行することは保証するが、
  * 「どのTaskが現在workspaceを保有しているか」は関知しないため、この判定を追加する。
+ *
+ * running/blocked だけでは不十分な既知のwindowがある: approveAndResumeJob()
+ * （CEOがgit_commit承認を出した直後）は、blockedだったgit_commit Jobを
+ * 直接 'queued' へ戻す（apps/api/src/storage/sqlite.ts）。この瞬間、そのTaskの
+ * Jobは running でも blocked でもなくなるが、まだcommitは実行されていない。
+ * そこで、workflowStepKeyが最初のinitial-implementそのものではないqueued Job
+ * （＝review/repair/git-commit/resumeなど、既に開始済みのchainの続き）も
+ * 所有中として扱う。初めてのinitial-implement Jobがqueuedなだけの状態
+ * （＝そのTaskはまだ何も実行していない）は対象外のままにする。
  */
+function isInitialImplementStepKey(taskId: string, workflowStepKey: string | undefined): boolean {
+  return workflowStepKey === `task:${taskId}:initial-implement`
+}
+
 function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
   for (const { task, jobs } of perTask) {
-    if (jobs.some((job) => job.status === 'running' || job.status === 'blocked')) {
-      return task.id
-    }
+    const owns = jobs.some((job) => (
+      job.status === 'running' ||
+      job.status === 'blocked' ||
+      (job.status === 'queued' && !isInitialImplementStepKey(task.id, job.workflowStepKey))
+    ))
+    if (owns) return task.id
   }
   return undefined
 }
