@@ -54,18 +54,16 @@ const INDEPENDENT_REVIEW_VERDICTS = ['approved', 'changes_requested', 'blocking'
  * 既存 aiExplain/cheapAiClient.ts の buildSubprocessEnv と同じ方針である。
  */
 export function buildRunnerEnv(homeDirectory: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
+  // Copilot CLI フォールバック（copilotRouter.ts）は ai-team ユーザーの保存済み
+  // OAuth credential（HOME配下）で認証する。PAT/token類は一切渡さない
+  // （2026-08-28: COPILOT_GITHUB_TOKEN配線をOAuthへ統一するため撤去）。
+  return {
     PATH: process.env.PATH ?? process.env.Path ?? '',
     HOME: homeDirectory,
     USERPROFILE: homeDirectory,
     LANG: process.env.LANG ?? 'C.UTF-8',
     NODE_ENV: process.env.NODE_ENV ?? 'production',
   }
-  // Copilot CLI フォールバック（copilotRouter.ts）専用。他のsecretは一切渡さない。
-  if (process.env.COPILOT_GITHUB_TOKEN !== undefined) {
-    env.COPILOT_GITHUB_TOKEN = process.env.COPILOT_GITHUB_TOKEN
-  }
-  return env
 }
 
 export interface RawStrategicResult {
