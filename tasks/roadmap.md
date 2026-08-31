@@ -1644,9 +1644,9 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **完了条件**: AI主導の構造化制約抽出（自動確定 vs Gap Analysis経由でCEOへ質問する境界線）、
       deterministic/semantic/個別Task Design Reviewの3経路分離、Task同期より前にRoadmap全体を
       確認する実行順序、の設計がCEOに採択されていること。実装着手はCEO承認後
-<!-- roadmap:id=project-pause-continuation-gap state=planned -->
-10. [ ] **Project Pause / Continuation-Control Gap**（2026-09-01登録。`phase 1c v2`の
-      regression evidence保持作業中に発見。調査・roadmap登録のみ。Phase 1cへは混ぜない）。
+<!-- roadmap:id=project-pause-continuation-gap state=done -->
+10. [x] **Project Pause / Continuation-Control Gap — 完了**（2026-09-01登録・同日実装完了。
+      `phase 1c v2`のregression evidence保持作業中に発見。Phase 1cへは混ぜていない）。
 
       **発覚した事実**: Projectを`paused`にしても、Task→Task自動継続（`ensureTaskContinuation()`
       が呼ぶ`createInitialImplementWorkflow()`）は止まらない。同関数
@@ -1675,12 +1675,31 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       自動継続が発生した場合は、迂回・強制変更をせず、その事実を本項目の追加evidenceとして
       記録する。
 
-      **今回の作業範囲（禁止事項）**: 今回はroadmap登録・調査のみ。
-      `initialImplementWorkflow.ts`・`ensureTaskContinuation()`の変更は行わない。
-      **Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜない。**
+      **実装内容（完了、PR #54 `fix/project-pause-blocks-task-continuation`、コミット
+      `f53b2ff`）**: `createInitialImplementWorkflow()`（初回Task Job生成・自動継続の両方が
+      通る唯一のchokepoint）の判定を、`project.status === 'archived'`のみ拒否 →
+      `project.status !== 'running'`なら拒否、へ変更（`apps/api/src/ctoAi/
+      initialImplementWorkflow.ts`）。ただし`paused`は`archived`と区別し、
+      `{ status: 'skipped', reason: 'project is not running', retryable: true }`を返す。
+      `ensureTaskContinuation()`は`retryable`な skip の場合、`task_continuation`を
+      `failed`にせず`pending`のまま残す（既存ロジック、変更なし）。**新しいGate/Queue/daemonは
+      追加していない**: `pending`のまま残った継続は、既存のWorker Outbox再送機構
+      （`routes/jobs.ts`の`git_commit`成功処理が、継続`pending`中は常にHTTP 503を返し
+      Workerの Outbox が同一イベントを再送する既存の仕組み）がそのまま「Project再開後に
+      自動的にretryする」役割を果たす。`archived`は従来どおり非retryableな終了状態のまま
+      （既存の"keeps the archived Project boundary"テストは無変更で成功）。
 
-      **完了条件**: `paused`が新規継続Jobの生成を正しく止める設計（チェック追加箇所・
-      既存`archived`専用停止運用からの移行方針）がCEOに採択されていること。実装着手はCEO承認後
+      **テスト**: `initialImplementWorkflow.test.ts`に「Projectがpaused中はJobを作らず
+      retryableなskipを返す」「pausedから復帰後は正常にJobを作る」の2件を追加（8/8成功）。
+      `apps/api`全体: 59ファイル/877テスト成功、`tsc --noEmit`成功。CI（Typecheck & Test・
+      Meta Reviewer AI）green、通常のreview/PR経路でmaster反映済み。
+
+      **今回の作業範囲**: `initialImplementWorkflow.ts`のみ変更。`ensureTaskContinuation()`・
+      `routes/jobs.ts`のOutbox/git_commit成功処理は無変更（既存の再送挙動をそのまま利用）。
+      **Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜていない。**
+
+      **完了条件（達成）**: `paused`が新規継続Jobの生成を正しく止め、`archived`は従来どおり
+      終了状態のまま維持されていることをテストで確認済み。新しいGate/Queue/daemonなし。
 
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。

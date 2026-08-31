@@ -194,6 +194,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Project別Roadmap可視化**
 - **Task→Job自動生成と連続実行**
 - **Meta Review MVP Hardening
+- **Project Pause / Continuation-Control Gap
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
 - 追加開発指示（追加Task作成）画面（Mobile）
@@ -212,7 +213,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が（state: planned）
 - **Roadmap Task / Control-Plane Workflow Separation**（2026-09-01登録。Phase 1c Minimal（state: planned）
 - **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行（state: planned）
-- **Project Pause / Continuation-Control Gap**（2026-09-01登録。`phase 1c v2`の（state: planned）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
 
