@@ -1644,6 +1644,43 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **完了条件**: AI主導の構造化制約抽出（自動確定 vs Gap Analysis経由でCEOへ質問する境界線）、
       deterministic/semantic/個別Task Design Reviewの3経路分離、Task同期より前にRoadmap全体を
       確認する実行順序、の設計がCEOに採択されていること。実装着手はCEO承認後
+<!-- roadmap:id=project-pause-continuation-gap state=planned -->
+10. [ ] **Project Pause / Continuation-Control Gap**（2026-09-01登録。`phase 1c v2`の
+      regression evidence保持作業中に発見。調査・roadmap登録のみ。Phase 1cへは混ぜない）。
+
+      **発覚した事実**: Projectを`paused`にしても、Task→Task自動継続（`ensureTaskContinuation()`
+      が呼ぶ`createInitialImplementWorkflow()`）は止まらない。同関数
+      （`apps/api/src/ctoAi/initialImplementWorkflow.ts:31-34`）が拒否するのは
+      `!project || project.status === 'archived'`の場合のみで、`paused`と`running`を
+      区別していない。つまりTaskがimplement→review→approve→`git_commit`まで完走しTask
+      `done`になると、**Projectがpause中でも次Taskの初回Jobが自動生成される**。
+      現行の唯一の停止手段は`archived`だが、archive操作は既存Guardにより「Job running中は
+      不可」（`apps/api/src/routes/projects.ts`の`ArchiveBlockedByRunningJobError`）のため、
+      稼働中のJobがある間はarchiveもできない。
+
+      **一般原則**: 新しいTask/Jobへの自動継続は`project.status === 'running'`の場合のみ
+      許可する。`paused`を実質的な「即時停止」の代用にしなくても済む設計（＝`paused`状態自体が
+      新規継続Jobの生成を正しく止める）を優先して検討する。`archived`を停止のためだけに
+      使う運用（元に戻せない操作を一時停止の代わりに使う）は避けるべき設計上の課題として扱う。
+
+      **既存項目との関係**: `roadmap-generation-constraint-compliance`（項目9）とは別の欠陥
+      （項目9はRoadmap生成・検証時点の話、本項目はTask完了後の自動継続時点の話）。
+      `project-auto-task-job-chain`（本ファイル該当箇所、state=done）が実装した既存の
+      継続機構自体の見直しであり、新しい継続機構を追加するものではない。
+
+      **証拠**: `phase 1c v2`（Project ID `4a55dd0f-6b2f-4ad6-8864-f699d586d9b4`）は
+      regression evidenceとして永久保存する。task-001の初回Jobが終端状態に達した後、
+      稼働中Jobが無い状態を確認できた時点で既存の正式なarchive APIのみを用いてarchiveする
+      （Project/Task/Job/Review履歴の削除・書換えは行わない）。archive前に後続Taskへの
+      自動継続が発生した場合は、迂回・強制変更をせず、その事実を本項目の追加evidenceとして
+      記録する。
+
+      **今回の作業範囲（禁止事項）**: 今回はroadmap登録・調査のみ。
+      `initialImplementWorkflow.ts`・`ensureTaskContinuation()`の変更は行わない。
+      **Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜない。**
+
+      **完了条件**: `paused`が新規継続Jobの生成を正しく止める設計（チェック追加箇所・
+      既存`archived`専用停止運用からの移行方針）がCEOに採択されていること。実装着手はCEO承認後
 
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
