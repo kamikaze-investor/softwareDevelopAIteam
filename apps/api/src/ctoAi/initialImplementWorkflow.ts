@@ -32,6 +32,14 @@ export async function createInitialImplementWorkflow(
   if (!project || project.status === 'archived') {
     return { taskId, status: 'skipped', reason: 'project is unavailable' }
   }
+  // paused (or any other non-running, non-archived status) is a temporary state: unlike
+  // archived, it should not permanently fail a pending task_continuation. Marking this
+  // retryable leaves the continuation 'pending' so the existing Worker Outbox resend
+  // (jobs.ts's 503-on-pending-continuation response) naturally retries it once the
+  // Project is running again, without a new Gate/Queue/daemon.
+  if (project.status !== 'running') {
+    return { taskId, status: 'skipped', reason: 'project is not running', retryable: true }
+  }
   if (!isInitialWorkflowTarget(task)) {
     return { taskId, status: 'skipped', reason: 'task is not an initial workflow target' }
   }
