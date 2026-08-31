@@ -372,6 +372,11 @@ async function confirmRunningTransition(
 }
 
 export async function pollJobs(): Promise<never> {
+  // pendingが連続して残ったpoll cycle数。起動直後もこの1ループに合流するため、
+  // startup専用の別ループは持たない（start()は本関数を即座に呼ぶだけ）。
+  let pendingOutboxStreak = 0
+  let pendingOutboxAlertSent = false
+
   while (true) {
     try {
       if (outboxStore.hasPending()) {
@@ -384,7 +389,20 @@ export async function pollJobs(): Promise<never> {
         } catch (err: unknown) {
           console.error(`[Worker] Outbox再送エラー: ${formatUnknownError(err)}。次のpollで再試行します`)
         }
+
+        if (outboxStore.hasPending()) {
+          pendingOutboxStreak += 1
+          if (pendingOutboxStreak >= 3 && !pendingOutboxAlertSent) {
+            pendingOutboxAlertSent = true
+            await notifyOutboxDeliveryBlocked()
+          }
+        } else {
+          pendingOutboxStreak = 0
+          pendingOutboxAlertSent = false
+        }
       } else {
+        pendingOutboxStreak = 0
+        pendingOutboxAlertSent = false
         const work = await fetchQueuedJob()
         if (work) {
           const { job } = work
@@ -398,6 +416,25 @@ export async function pollJobs(): Promise<never> {
     }
 
     await sleep(POLL_INTERVAL_MS)
+  }
+}
+
+/**
+ * pendingなOutboxイベントが複数pollにわたって配送できない場合の通知。
+ * Job intakeは止めない（新しいJob fetchをスキップするだけ）ため、これは
+ * 「配送できていない」ことをCEOへ知らせるためだけの通知である。
+ */
+async function notifyOutboxDeliveryBlocked(): Promise<void> {
+  try {
+    await sendAlert({
+      severity: 'critical',
+      title: 'Worker Outbox resend is blocked',
+      body: 'Pending Worker Outbox events could not be delivered after repeated retry cycles. New Job intake is paused until delivery succeeds; Worker startup and the watchdog are unaffected.',
+      sourceType: 'job_persistence',
+      sourceId: 'worker_outbox',
+    })
+  } catch (err: unknown) {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
   }
 }
 
@@ -444,31 +481,9 @@ async function recoverJobsAtStartup(): Promise<void> {
 }
 
 export async function start(): Promise<void> {
-  let pendingResendFailures = 0
-  let pendingAlertSent = false
-
-  while (outboxStore.hasPending()) {
-    await outboxStore.resendPending((jobId, payload) => patchJobWithRetry(jobId, payload))
-    if (outboxStore.hasPending()) {
-      pendingResendFailures += 1
-      if (pendingResendFailures >= 3 && !pendingAlertSent) {
-        pendingAlertSent = true
-        try {
-          await sendAlert({
-            severity: 'critical',
-            title: 'Worker Outbox resend is blocked',
-            body: 'Pending Worker Outbox events could not be delivered after repeated retry cycles. Startup recovery is intentionally blocked until delivery succeeds.',
-            sourceType: 'job_persistence',
-            sourceId: 'worker_outbox',
-          })
-        } catch (err: unknown) {
-          console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
-        }
-      }
-      await sleep(PATCH_BACKOFF_MS[PATCH_BACKOFF_MS.length - 1])
-    }
-  }
-
+  // pending Outboxがあっても待たない。pollJobs()自身がpoll cycleごとに
+  // pendingの再送とnew Job fetchのskipを行うため、起動直後からwatchdog/pollingを
+  // 開始してよい（起動専用の別blockingループは持たない）。
   await recoverJobsAtStartup()
   // ウォッチドッグを pollJobs と並行して起動
   void startWatchdog(API_BASE, buildApiAuthHeaders())

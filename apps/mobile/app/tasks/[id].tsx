@@ -32,6 +32,17 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../../lib/api'
+import {
+  canReflectChanges,
+  canRunReview,
+  canShowResumeUI,
+  isImplementJob,
+  isJobBusy,
+  isReviewJob,
+  manualWorkflowIsLocked,
+  parseDateTime,
+  sortJobsByNewestFirst,
+} from '../../lib/taskWorkflow'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
@@ -271,11 +282,6 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Failed to connect to API'
 }
 
-function parseDateTime(value: string): number {
-  const time = Date.parse(value)
-  return Number.isNaN(time) ? 0 : time
-}
-
 function formatDateTime(value?: string): string {
   if (value === undefined) {
     return '未記録'
@@ -321,14 +327,6 @@ function formatChangedFilesDetail(changedFiles: string[]): string {
   return rest > 0 ? `${joinedHead}\n他${rest}件` : joinedHead
 }
 
-function sortJobsByNewestFirst(jobs: Job[]): Job[] {
-  return [...jobs].sort((a, b) => {
-    const aTime = parseDateTime(a.startedAt ?? a.createdAt)
-    const bTime = parseDateTime(b.startedAt ?? b.createdAt)
-    return bTime - aTime
-  })
-}
-
 function sortApprovalRequestsByNewestFirst(
   approvalRequests: ApprovalRequest[],
 ): ApprovalRequest[] {
@@ -343,75 +341,6 @@ function sortApprovalRequestsByNewestFirst(
 // workingDir はMobileから送信しない。API側（POST /api/jobs）が
 // MVP-Aの正規workingDir（/workspace/target固定）をサーバー側で設定する。
 // ────────────────────────────────────────────────────────────
-
-function isImplementJob(job: Job): boolean {
-  return job.aiCliMode === 'implement'
-}
-
-function isReviewJob(job: Job): boolean {
-  return job.aiCliMode === 'review'
-}
-
-function isJobBusy(jobs: Job[]): boolean {
-  return jobs.some((job) => job.status === 'queued' || job.status === 'running')
-}
-
-function isAutomaticCommitJob(job: Job): boolean {
-  return job.workflowStepKey?.startsWith('review:') === true &&
-    job.workflowStepKey.endsWith(':git-commit')
-}
-
-function findLinkedApproval(
-  job: Job | undefined,
-  approvalRequests: ApprovalRequest[],
-): ApprovalRequest | undefined {
-  if (!job?.approvalId) return undefined
-  return approvalRequests.find(request => request.id === job.approvalId)
-}
-
-function hasWaitingLinkedApproval(
-  jobs: Job[],
-  approvalRequests: ApprovalRequest[],
-): boolean {
-  const latestJob = sortJobsByNewestFirst(jobs)[0]
-  return findLinkedApproval(latestJob, approvalRequests)?.status === 'WAITING_FOR_USER'
-}
-
-function manualWorkflowIsLocked(
-  jobs: Job[],
-  approvalRequests: ApprovalRequest[],
-): boolean {
-  return isJobBusy(jobs) ||
-    jobs.some(isAutomaticCommitJob) ||
-    hasWaitingLinkedApproval(jobs, approvalRequests)
-}
-
-/** 実装Jobが少なくとも1件成功しているか（独立レビューJobを起票できるか） */
-function canRunReview(jobs: Job[], approvalRequests: ApprovalRequest[]): boolean {
-  if (manualWorkflowIsLocked(jobs, approvalRequests)) return false
-  const latestImplement = sortJobsByNewestFirst(jobs).find(isImplementJob)
-  return latestImplement?.status === 'success'
-}
-
-/**
- * 「変更を反映」を有効にする条件:
- *   最新の実装/レビュー関連Jobの中で最も新しいものが成功したレビューJobであり、
- *   かつそれより前に成功した実装Jobが存在すること
- *   （＝最新実装Jobがsuccess → その後の最新Review Jobがsuccess →
- *     Review後に新しい実装Jobが存在しない、と同値）。
- */
-function canReflectChanges(jobs: Job[], approvalRequests: ApprovalRequest[]): boolean {
-  if (manualWorkflowIsLocked(jobs, approvalRequests)) return false
-  const relevant = sortJobsByNewestFirst(jobs).filter(
-    (job) => isImplementJob(job) || isReviewJob(job),
-  )
-  const [newest] = relevant
-  if (newest === undefined || !isReviewJob(newest) || newest.status !== 'success') {
-    return false
-  }
-  const priorImplement = relevant.slice(1).find(isImplementJob)
-  return priorImplement?.status === 'success'
-}
 
 interface CreateJobResult {
   ok: boolean
@@ -438,26 +367,6 @@ async function createTaskJob(
   } catch {
     return { ok: false, message: 'APIに接続できませんでした' }
   }
-}
-
-function canShowResumeUI(
-  jobs: Job[],
-  approvalRequests: ApprovalRequest[],
-): boolean {
-  // POST /api/tasks/:id/resume は最新Jobがblockedでない限り拒否するため、
-  // UIの表示条件もAPIと同じく「最新Job」を基準にする（queued/running Jobの有無や
-  // Task.status、古いREJECTEDだけでは判定しない）。
-  const latestJob = sortJobsByNewestFirst(jobs)[0]
-
-  if (latestJob?.status !== 'blocked') {
-    return false
-  }
-
-  if (findLinkedApproval(latestJob, approvalRequests)?.status === 'WAITING_FOR_USER') {
-    return false
-  }
-
-  return true
 }
 
 async function readResumeApiError(response: Response): Promise<string | null> {
@@ -863,6 +772,7 @@ interface ResumeInstructionSectionProps {
   onChangeInstruction: (instruction: string) => void
   onOpen: () => void
   onSubmit: () => void
+  task: Task
 }
 
 function ResumeInstructionSection({
@@ -874,8 +784,9 @@ function ResumeInstructionSection({
   onChangeInstruction,
   onOpen,
   onSubmit,
+  task,
 }: ResumeInstructionSectionProps): ReactElement | null {
-  if (!canShowResumeUI(jobs, approvalRequests)) {
+  if (!canShowResumeUI(task, jobs, approvalRequests)) {
     return null
   }
 
@@ -1404,6 +1315,7 @@ export default function TaskDetailScreen(): ReactElement {
             onChangeInstruction={setResumeInstruction}
             onOpen={() => setIsResumeEditorOpen(true)}
             onSubmit={handleSubmitResumeInstruction}
+            task={data.task}
           />
           <JobHistorySection jobs={data.jobs} />
           <ApprovalHistorySection

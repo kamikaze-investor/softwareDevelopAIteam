@@ -847,6 +847,9 @@ describe('Task API', () => {
         expect(reviewInput.designText).toContain('Use docs only.')
         return {
           ok: true,
+          // changedFiles:[] を渡すresume経路は reviewLoad='medium' に分類され、
+          // selectFocuses は ['scope_simplicity'] を要求する（focus setが一致しないと
+          // recomputeDecisionがUNCERTAINへreject するため、空配列は誤り）。
           stdout: JSON.stringify({
             focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
             integrationReviewResult: { decision: 'ALIGNED' },
@@ -875,6 +878,8 @@ describe('Task API', () => {
 
         expect(res.statusCode).toBe(201)
         expect(execute).toHaveBeenCalledTimes(1)
+        // createBlockedAiCliJob自体がcreateJobヘルパー経由で元prompt用の evidence を
+        // 1件作るため、resumeの再レビューで作られる1件と合わせて2件になる。
         expect(storage.designReviewEvidence.findByTaskId(task.id)).toHaveLength(2)
         expect(storage.jobs.findByTaskId(task.id)).toHaveLength(2)
       }, {
@@ -979,9 +984,10 @@ describe('Task API', () => {
     )
 
     it.each(['queued', 'running', 'success', 'failed'] satisfies Job['status'][])(
-      'rejects resume when the latest job is %s',
+      'rejects resume when the latest job is %s (Task itself is not blocked)',
       async (status) => {
         await withApp(async (app) => {
+          const { getStorage } = await import('../storage/index.js')
           const project = await createProject(app)
           const task = await createTask(app, project.id)
           const job = await createJob(app, task, {
@@ -990,7 +996,10 @@ describe('Task API', () => {
             aiCliMode: 'implement',
           })
           if (status !== 'queued') {
-            await updateJob(app, job.id, { status })
+            // 直接storageへ書く（PATCH /api/jobs/:id経由だと、statusが'failed'になる際に
+            // 本物のprepareRepairFlow/design review再実行が非同期で走ってしまい、
+            // このテストが検証したい「Task自体はblockedでない」という前提が崩れる）。
+            getStorage().jobs.update(job.id, { status })
           }
 
           const res = await app.inject({
@@ -1003,6 +1012,207 @@ describe('Task API', () => {
         })
       },
     )
+
+    // Design Review CONFLICT/NOT_ALIGNED escalation (`escalateTaskToHuman`) sets
+    // Task.status='blocked' but never touches the failing Job, which stays 'failed'.
+    // resumeBlockedTask must accept this combination too, not just a directly
+    // blocked Job, or an escalated Task can never be resumed from Mobile.
+    describe('resume after a Design Review escalation (Task blocked, latest Job failed)', () => {
+      it('accepts resume once aligned evidence already exists for the instruction', async () => {
+        await withApp(async (app) => {
+          const { getStorage } = await import('../storage/index.js')
+          const project = await createProject(app)
+          const task = await createTask(app, project.id, { status: 'blocked' })
+          const failedJob = await createJob(app, task, {
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'Original failing prompt',
+            aiCliMode: 'implement',
+          })
+          // 直接storageへ書く。PATCH /api/jobs/:id経由だと、実装Jobが'failed'になる際に
+          // 本物のprepareRepairFlow/design review再実行が非同期で走ってしまい、
+          // このテストが検証したい状態（escalate済みTask + failed Job）が不確定になる。
+          getStorage().jobs.update(failedJob.id, { status: 'failed' })
+
+          const instruction = 'Try the alternate approach the reviewer suggested.'
+          await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
+
+          const res = await app.inject({
+            method: 'POST',
+            url: `/api/tasks/${task.id}/resume`,
+            payload: { instruction },
+          })
+
+          expect(res.statusCode).toBe(201)
+          const resumedJob = parseBody<Job>(res.body)
+          expect(resumedJob.status).toBe('queued')
+          expect(resumedJob.aiCliPrompt).toContain(instruction)
+
+          const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+          const jobs = parseBody<Job[]>(jobsRes.body)
+          expect(jobs).toHaveLength(2)
+          expect(jobs.find((job) => job.id === failedJob.id)?.status).toBe('failed')
+        })
+      })
+
+      it('re-runs the Design Review for the instruction when no matching evidence exists yet, then resumes', async () => {
+        const execute = vi.fn(async (input: string) => {
+          const reviewInput = JSON.parse(input) as { designText: string }
+          expect(reviewInput.designText).toContain('Try a narrower fix this time.')
+          return {
+            ok: true,
+            // changedFiles:[] のresume経路は reviewLoad='medium' に分類され、
+            // selectFocuses は ['scope_simplicity'] を要求する。
+            stdout: JSON.stringify({
+              focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+              integrationReviewResult: { decision: 'ALIGNED' },
+            }),
+            timedOut: false,
+          }
+        })
+
+        await withApp(async (app) => {
+          const { getStorage } = await import('../storage/index.js')
+          const storage = getStorage()
+          const project = await createProject(app)
+          const task = await createTask(app, project.id, { status: 'blocked' })
+          const failedJob = await createJob(app, task, {
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'Original failing prompt',
+            aiCliMode: 'implement',
+          })
+          storage.jobs.update(failedJob.id, { status: 'failed' })
+
+          const res = await app.inject({
+            method: 'POST',
+            url: `/api/tasks/${task.id}/resume`,
+            payload: { instruction: 'Try a narrower fix this time.' },
+          })
+
+          expect(res.statusCode).toBe(201)
+          expect(execute).toHaveBeenCalledTimes(1)
+          // createJobヘルパーが元prompt用のevidenceを1件作るため、resumeの
+          // 再レビューで作られる1件と合わせて2件になる。
+          expect(storage.designReviewEvidence.findByTaskId(task.id)).toHaveLength(2)
+          expect(storage.jobs.findByTaskId(task.id)).toHaveLength(2)
+        }, {
+          resumeDesignReviewDeps: {
+            runnerCommand: 'mock',
+            runnerArgs: [],
+            homeDirectory: '/tmp',
+            workingDir: '/tmp',
+            execute,
+          },
+        })
+      })
+
+      it('still rejects resume when Task is blocked but the latest job succeeded', async () => {
+        await withApp(async (app) => {
+          const project = await createProject(app)
+          const task = await createTask(app, project.id, { status: 'blocked' })
+          const job = await createJob(app, task, {
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'Prompt',
+            aiCliMode: 'implement',
+          })
+          await updateJob(app, job.id, { status: 'success' })
+
+          const res = await app.inject({
+            method: 'POST',
+            url: `/api/tasks/${task.id}/resume`,
+            payload: { instruction: 'Continue anyway.' },
+          })
+
+          expect(res.statusCode).toBe(400)
+          expect(parseBody<{ error: string }>(res.body).error).toContain('not blocked')
+        })
+      })
+    })
+
+    describe('Recovery E2E: Design Review CONFLICT stop → Mobile resume → ALIGNED → continuation', () => {
+      it('stays blocked on a CONFLICT re-review, then resumes once an aligned instruction is given', async () => {
+        // decision別に判定を変えるための単一execute実装。designTextの内容だけで判定する。
+        const execute = vi.fn(async (input: string) => {
+          const reviewInput = JSON.parse(input) as { designText: string }
+          const decision = reviewInput.designText.includes('better approach') ? 'ALIGNED' : 'CONFLICT'
+          return {
+            ok: true,
+            stdout: JSON.stringify({
+              focusedReviewResults: [{ focus: 'scope_simplicity', decision }],
+              integrationReviewResult: { decision },
+            }),
+            timedOut: false,
+          }
+        })
+        const resumeDesignReviewDeps = {
+          runnerCommand: 'mock',
+          runnerArgs: [],
+          homeDirectory: '/tmp',
+          workingDir: '/tmp',
+          execute,
+        }
+
+        await withApp(async (app) => {
+          const { getStorage } = await import('../storage/index.js')
+          const { escalateTaskToHuman } = await import('../designReview/repairFlow.js')
+          const storage = getStorage()
+
+          // 1) Design Review CONFLICT/NOT_ALIGNED相当の停止を、実際のescalation関数で再現する
+          //    （repair flow内部のsubprocess実行そのものはrepairFlow自身のテストで別途検証済みのため、
+          //    ここでは「escalateTaskToHumanが呼ばれた後の状態」から検証する）。
+          const project = await createProject(app)
+          const task = await createTask(app, project.id)
+          const failedJob = await createJob(app, task, {
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'Original implementation attempt',
+            aiCliMode: 'implement',
+          })
+          storage.jobs.update(failedJob.id, { status: 'failed' })
+          escalateTaskToHuman(storage, task.id)
+
+          // 2) Taskが安全に停止していることを確認する（SSH/DB直接操作/CLI/GitHub操作は行っていない。
+          //    ここまで全てHTTP API経由）。
+          const blockedTask = storage.tasks.findById(task.id)
+          expect(blockedTask?.status).toBe('blocked')
+
+          // 3) Mobileの「追加指示して再開」相当のAPI呼び出し。まだ改善されていない指示 → CONFLICT。
+          const conflictRes = await app.inject({
+            method: 'POST',
+            url: `/api/tasks/${task.id}/resume`,
+            payload: { instruction: 'Just try again the same way.' },
+          })
+          expect(conflictRes.statusCode).toBe(409)
+          // fail-closed: CONFLICTのままJobは作られず、Taskはblockedのまま
+          expect(storage.tasks.findById(task.id)?.status).toBe('blocked')
+          expect(storage.jobs.findByTaskId(task.id)).toHaveLength(1)
+
+          // 4) CEOがMobileから改善した追加指示を与える → Design Reviewが再実行される → ALIGNED
+          const alignedInstruction = 'Use the better approach the reviewer suggested.'
+          const resumeRes = await app.inject({
+            method: 'POST',
+            url: `/api/tasks/${task.id}/resume`,
+            payload: { instruction: alignedInstruction },
+          })
+
+          // 5) ALIGNEDになったのでJobが生成される
+          expect(resumeRes.statusCode).toBe(201)
+          const resumedJob = parseBody<Job>(resumeRes.body)
+          expect(resumedJob.status).toBe('queued')
+          expect(resumedJob.aiCliPrompt).toContain(alignedInstruction)
+          expect(execute).toHaveBeenCalledTimes(2)
+
+          // 6) 新しいJobが成功すれば、通常のcontinuationに戻れる（手動介入なしで次の
+          //    アクション — 独立レビュー等 — がMobileから取れる状態）
+          await updateJob(app, resumedJob.id, {
+            status: 'success',
+            changedFiles: ['apps/api/src/example.ts'],
+          })
+          const finalJobs = parseBody<Job[]>(
+            (await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })).body,
+          )
+          expect(finalJobs.find((job) => job.id === resumedJob.id)?.status).toBe('success')
+        }, { resumeDesignReviewDeps })
+      })
+    })
 
     it('returns 404 for a missing task', async () => {
       await withApp(async (app) => {

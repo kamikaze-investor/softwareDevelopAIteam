@@ -1468,6 +1468,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     resumeBlockedTask(input) {
       const resumeTransaction = db.transaction((taskId: string, instructionPrompt: string): ResumeBlockedTaskResult => {
+        const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as any
+        if (!taskRow) {
+          return { ok: false, reason: 'Task not found' }
+        }
+
         const jobRows = db.prepare(
           'SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC'
         ).all(taskId) as any[]
@@ -1478,7 +1483,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, reason: 'No jobs exist for this task' }
         }
 
-        if (latestJob.status !== 'blocked') {
+        // 通常はJob自体がblockedの場合のみ再開対象（guard違反等）。
+        // それに加え、Design Review CONFLICT/NOT_ALIGNED等でrepair flowが
+        // Taskをblockedへescalateしたケース（`escalateTaskToHuman`）も受理する。
+        // このescalationはJobを更新せずTask.statusだけをblockedにするため、
+        // 最新Jobはfailedのまま残る。これを「blockedでない」として拒否すると、
+        // 正式にescalateされたTaskが既存のresume経路から一切復旧できなくなる。
+        const isJobDirectlyBlocked = latestJob.status === 'blocked'
+        const isEscalatedFailure = taskRow.status === 'blocked' && latestJob.status === 'failed'
+        if (!isJobDirectlyBlocked && !isEscalatedFailure) {
           return { ok: false, reason: `Latest job status is ${latestJob.status}, not blocked` }
         }
 
