@@ -1548,6 +1548,102 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
       **完了条件**: 防止方式（生成時制約／生成後検出／両方）の採択、Design Review側で検出する場合の
       チェックリスト・focus設計方針がCEOに採択されていること。実装着手はCEO承認後
+<!-- roadmap:id=roadmap-generation-constraint-compliance state=planned -->
+9. [ ] **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行
+      `phase 1c v2`（Project ID `4a55dd0f-6b2f-4ad6-8864-f699d586d9b4`）で、1回目とは独立に再現。
+      調査・roadmap登録のみ。Phase 1cのscopeへは混ぜない。今回専用の「タスク数が1でなければreject」
+      というハードコードはしない）。
+
+      **発覚した事実**: `phase 1c v2`のGoalは今回truncateされておらず（`goalLength: 292`、
+      項目6のTruncation Preventionとは無関係な独立事象）、Goal本文に「Roadmap Taskはこの1件のみ」と
+      明記されていたにもかかわらず、生成されたRoadmapは4 Taskだった。項目8で見つかった
+      control-plane処理の重複は今回発生しなかった（改善は確認できた）が、**明示的なRoadmap
+      cardinality制約自体は守られず、Design Reviewもこれを検出せずJob生成まで進んだ**。
+
+      **原因（コード確認済み）**:
+      - `apps/api/src/ctoAi/roadmapGenerator.ts`の`SYSTEM_PROMPT`（68行）が
+        「タスク数は合計10〜20件程度（MVPスコープに絞る）」を**全Project共通のハードコードされた
+        ガイドライン**として与えている。これがProject固有の構造的制約（Goal自由文中の指示）と
+        競合し、LLMは両方を部分的にしか汲み取れない（今回は10〜20件よりは大幅に少ない4件まで
+        譲歩したが、指定された1件には届かなかった）。
+      - `initializeApprovedProject()`（`apps/api/src/ctoAi/projectInitialization.ts`）は
+        `validateRoadmapTasks`/`validateRoadmapPhases`（`apps/api/src/storage/
+        roadmapTaskValidation.ts`）で生成後のRoadmapを検証しているが、確認した内容は
+        **重複キー・存在しない依存先・循環依存・不明phaseというグラフ構造の妥当性のみ**であり、
+        **Projectが宣言した意味的・構造的制約（タスク数上限・許可パスのみ・新規ファイル禁止・
+        dependency数上限・特定技術禁止等）との適合性を検証する機構は存在しない**。
+      - Design Review側は`docs/project_memory/goal.md`経由でProjectの完全なGoalテキストに
+        アクセスできる（`buildApprovedProjectAnalysis()`が`project.goal`をそのまま
+        `SpecAnalysis.goal`へ渡し、`writeProjectMemory()`がRoadmap生成・Task同期の直後に
+        goal.mdへ書き出す。今回のケースでは全文が正しく反映されていたことをコードで確認済み）。
+        **しかしDesign Reviewは常に1 Task単位でのみ呼ばれ**（`createInitialImplementWorkflow()`の
+        `designText: task.description`）、**Roadmap全体の形（Task一覧・総数）を一度も見る機会が
+        ない**。今回の4 Taskはいずれも単体で見ればGoalの精神と矛盾しないため、CONFLICTと
+        判定されなかったのは個々のTask単位では自然な結果であり、「部分的に壊れていた」のではなく
+        **Roadmap全体の構造的制約を検証する視点そのものが存在しない**。
+      - Meta Reviewerチェックリスト（`docs/meta_reviewer/checklist.md`・`checklists/*.md`）にも、
+        Project宣言済み制約を体系的に1件ずつ検証する仕組みはない。Strategic Alignment Reviewは
+        自由記述のALIGNED/CONFLICT/UNCERTAIN判定であり、制約ごとのchecklist形式ではない。
+
+      **目的（今回専用のハードコードにしない一般化）**: Project Definitionから機械判定可能な
+      制約を構造化して抽出し、Roadmap生成後に機械的に検証し、Design Review側でもRoadmap全体を
+      対象とした独立確認を行う、という一般機構を設計する。対象例: タスク数上限／read-only限定／
+      特定ファイルのみ変更／新規ファイル禁止／dependency数上限／特定技術禁止／architecture変更禁止等、
+      Project Definitionに書かれうる任意の構造的・機械判定可能な制約。
+
+      **設計方向性（2026-09-01 CEOフィードバック反映。調査・設計のみ、実装は行わない）**:
+      1. **構造化制約の取得はAI主導、CEO手入力UXにしない**: CEOが多数の技術フィールド
+         （maxTaskCount等）を手入力するUXは採用しない。**通常は自然言語のProject Definitionから
+         AIが構造化制約を抽出する**。機械的に確定できるもの（例: 「1件のみ」→
+         `maxTaskCount=1`、「docs/配下のみ」→`allowedPathPrefixes=["docs/"]`）は
+         **自動確定**し、CEOに聞かない。**曖昧な場合、またはGoal/Design Philosophyの根幹に
+         関わる重要項目の場合だけ**、既存`interactive-project-definition-readiness`項目の
+         Gap Analysis経由でCEOへ質問する（新しい質問経路を追加しない。既存Gap
+         ⇒CEO回答／Skip／AI仮決定の枠組みをそのまま使う）。
+      2. **責務分離（3経路、混在させない）**:
+         - **deterministic constraint**（タスク数上限・許可パスのみ・新規ファイル禁止・
+           dependency数上限等、機械的に数えられるもの）→ 既存`validateRoadmapTasks`/
+           `validateRoadmapPhases`と同じ「生成後・DB同期前にfail-closedで拒否する」
+           validatorパターン（`validationIssues.length > 0` → 422）を拡張して強制する。
+           新しいGate/Queueは作らない。
+         - **semantic constraint**（特定技術禁止・architecture変更禁止等、意味的判断を要する
+           もの）→ **Roadmap全体を対象とした既存Design Reviewによる独立確認**で扱う。
+           既存`runIntegrationReview()`のパターン（複数の個別結果を統合してALIGNED/
+           CONFLICT/UNCERTAINを出す既存の仕組み）を参考に、新しいReview Agent種類は
+           追加しない。
+         - **個別Task Design Review**（現行の`createInitialImplementWorkflow()`が
+           `task.description`単位で呼ぶもの）→ **従来通り、別途維持する**。Roadmap全体の
+           確認に置き換えない・混在させない。
+      3. **実行順序: Roadmap全体の確認をTask同期・初回Implement Job生成より前に置く**。
+         現状`initializeApprovedProject()`は「生成→(グラフ構造)検証→Task同期→Project
+         Memory書き込み→Roadmap書き込み→Task毎のinitial implement workflow（Design Review
+         込み）」の順で進む。deterministic validatorとsemantic Design Reviewのいずれも、
+         **Task同期（`syncRoadmapTasks()`）より前**で完結させ、不正Roadmapからは
+         そもそもTask/Jobが1件も生成されない構造を優先する（今回のように、後から気づいて
+         Projectごと保持・破棄するのではなく、生成された時点でfail-closedにする）。
+
+      **既存項目との関係（重複実装にしないこと）**: `roadmap-task-control-plane-separation`
+      （項目8）は、本項目が一般化する制約体系の**具体例の1つ**（「Design Review/Approval/PR/CI/
+      Commit GateをTaskとして生成しない」という暗黙の制約）として位置づけ直せる。本項目の一般機構が
+      実装されれば項目8はその下のデフォルト制約の1つとして扱える可能性があるが、責務は本項目
+      （一般機構）と項目8（具体的な検出内容）で分離したまま残す。
+
+      **証拠**: `phase 1c v2`（Project ID `4a55dd0f-6b2f-4ad6-8864-f699d586d9b4`）は2件目の
+      regression evidenceとして保持し、resumeしない（4 Taskのまま後続Task/Jobへ進めない）。
+
+      **Phase 1c再開方針**: v3 Projectは今は作成しない。本項目・項目8等の前提条件（prerequisite
+      defects）の修正後、禁止事項を細かくprompt/Goalへ書き並べない自然なProject Definitionで
+      Phase 1cを再開する（今回のように「Design Review/Approval/PR/CI/Commit Gateをタスク化
+      しない」「Roadmap Taskはこの1件のみ」等を毎回Goal本文へ明記する運用を前提にしない）。
+
+      **今回の作業範囲（禁止事項）**: 今回はroadmap登録・調査のみ。`roadmapGenerator.ts`の
+      `SYSTEM_PROMPT`変更・`roadmapTaskValidation.ts`への新規バリデータ実装・Design Reviewへの
+      新しい呼び出しポイント追加は行わない。**Phase 1c（Phase 1c Minimal Production E2E）の
+      scopeへは混ぜない。**「タスク数が1でなければreject」という今回専用のハードコードは行わない。
+
+      **完了条件**: AI主導の構造化制約抽出（自動確定 vs Gap Analysis経由でCEOへ質問する境界線）、
+      deterministic/semantic/個別Task Design Reviewの3経路分離、Task同期より前にRoadmap全体を
+      確認する実行順序、の設計がCEOに採択されていること。実装着手はCEO承認後
 
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。

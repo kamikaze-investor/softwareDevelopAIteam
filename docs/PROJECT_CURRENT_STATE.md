@@ -211,6 +211,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Interactive Project Definition / Readiness**（2026-09-01登録。PL交代（Codex→Claude）時の（state: planned）
 - **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が（state: planned）
 - **Roadmap Task / Control-Plane Workflow Separation**（2026-09-01登録。Phase 1c Minimal（state: planned）
+- **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行（state: planned）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
 
