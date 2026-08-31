@@ -228,7 +228,12 @@ export interface IJobStorage {
     taskId: string
     instructionPrompt: string
   }): ResumeBlockedTaskResult
+  createInitialWorkflowJobForTask(taskId: string): CreateInitialWorkflowJobResult
 }
+
+export type CreateInitialWorkflowJobResult =
+  | { created: true; job: Job }
+  | { created: false; reason: string }
 
 export interface IApprovalStorage {
   /** 全Project横断でpending状態の承認のみを1クエリで取得する（N+1回避用） */

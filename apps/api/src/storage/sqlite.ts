@@ -10,7 +10,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, CreateInitialWorkflowJobResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
@@ -1560,6 +1560,80 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       return resumeTransaction(input.taskId, input.instructionPrompt)
+    },
+    createInitialWorkflowJobForTask(taskId) {
+      const tx = db.transaction((tid: string) => {
+        const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(tid) as any
+        if (!taskRow) {
+          return { created: false as const, reason: 'Task not found' }
+        }
+        if (taskRow.status === 'blocked' || taskRow.status === 'done') {
+          return { created: false as const, reason: `Task status is ${taskRow.status}` }
+        }
+
+        const projectRow = db.prepare('SELECT * FROM projects WHERE id = ?').get(taskRow.project_id) as any
+        if (!projectRow) {
+          return { created: false as const, reason: 'Project not found' }
+        }
+        if (projectRow.status !== 'running') {
+          return { created: false as const, reason: `Project status is ${projectRow.status}` }
+        }
+
+        const hasActiveJob = db.prepare(
+          "SELECT 1 FROM jobs WHERE task_id = ? AND status IN ('queued','running','blocked') LIMIT 1"
+        ).get(tid)
+        if (hasActiveJob) {
+          return { created: false as const, reason: 'An active job already exists for this task' }
+        }
+
+        const workflowStepKey = `task:${tid}:initial-implement`
+        const existingWorkflow = db.prepare(
+          'SELECT 1 FROM jobs WHERE workflow_step_key = ? LIMIT 1'
+        ).get(workflowStepKey)
+        if (existingWorkflow) {
+          return { created: false as const, reason: 'A job with this workflow_step_key already exists' }
+        }
+
+        const job: Job = {
+          id: randomUUID(),
+          taskId: tid,
+          projectId: taskRow.project_id,
+          workflowStepKey,
+          agentRole: taskRow.assignee,
+          status: 'queued',
+          safeCommand: { kind: 'git_status', workingDir: TARGET_WORKING_DIR },
+          aiCliProvider: taskRow.provider ?? 'claude_code',
+          createdAt: now(),
+        }
+
+        try {
+          db.prepare(`
+            INSERT INTO jobs
+              (id, task_id, project_id, workflow_step_key, agent_role, status, safe_command,
+               ai_cli_provider, ai_cli_prompt, ai_cli_mode, dry_run, failure_metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            job.id,
+            job.taskId,
+            job.projectId,
+            job.workflowStepKey,
+            job.agentRole,
+            job.status,
+            JSON.stringify(job.safeCommand),
+            job.aiCliProvider ?? null,
+            job.aiCliPrompt ?? null,
+            job.aiCliMode ?? null,
+            job.dryRun ? 1 : 0,
+            job.failureMetadata ? JSON.stringify(job.failureMetadata) : null,
+            job.createdAt,
+          )
+          return { created: true as const, job }
+        } catch (err) {
+          return { created: false as const, reason: 'Unique constraint violation' }
+        }
+      })
+
+      return tx(taskId)
     },
   }
 
