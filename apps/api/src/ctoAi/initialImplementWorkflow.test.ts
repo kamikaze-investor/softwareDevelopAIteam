@@ -62,6 +62,26 @@ describe('initial implement workflow', () => {
     expect(result).toMatchObject({ status: 'skipped', reason: 'project is unavailable' })
     expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
   })
+
+  it('does not create a Job while the Project is paused, and marks the skip retryable', async () => {
+    const task = storage.tasks.findById(taskId)!
+    storage.projects.update(task.projectId, { status: 'paused' })
+    const result = await createInitialImplementWorkflow(storage, taskId, alignedDeps())
+    expect(result).toMatchObject({ status: 'skipped', reason: 'project is not running', retryable: true })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
+  })
+
+  it('resumes creating the Job once a paused Project is running again', async () => {
+    const task = storage.tasks.findById(taskId)!
+    storage.projects.update(task.projectId, { status: 'paused' })
+    const paused = await createInitialImplementWorkflow(storage, taskId, alignedDeps())
+    expect(paused).toMatchObject({ status: 'skipped', retryable: true })
+
+    storage.projects.update(task.projectId, { status: 'running' })
+    const resumed = await createInitialImplementWorkflow(storage, taskId, alignedDeps())
+    expect(resumed).toMatchObject({ status: 'created' })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
   it('reuses matching ALIGNED evidence after a pre-Job crash without executing a new review', async () => {
     const task = storage.tasks.findById(taskId)!
     storage.designReviewEvidence.create({
