@@ -208,6 +208,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **複数Worker対応**（state: deferred）
 - **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
+- **Interactive Project Definition / Readiness**（2026-09-01登録。PL交代（Codex→Claude）時の（state: planned）
+- **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が（state: planned）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
 
