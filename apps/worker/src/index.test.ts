@@ -17,8 +17,13 @@ const watchdogMocks = vi.hoisted(() => ({
   startWatchdog: vi.fn(),
 }))
 
+const notifierMocks = vi.hoisted(() => ({
+  sendAlert: vi.fn(),
+}))
+
 vi.mock('./outbox/outboxStore.js', () => outboxMocks)
 vi.mock('./watchdog/watchdog.js', () => watchdogMocks)
+vi.mock('./notifier/notifier.js', () => notifierMocks)
 vi.mock('./jobStateManager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./jobStateManager.js')>()
   return {
@@ -84,6 +89,7 @@ beforeEach(() => {
   outboxMocks.hasPending.mockReset()
   jobStateMocks.recoverStaleJobs.mockReset()
   watchdogMocks.startWatchdog.mockReset()
+  notifierMocks.sendAlert.mockReset()
   outboxMocks.recordPending.mockReturnValue({
     eventId: 'event-1',
     payloadHash: 'payload-hash-1',
@@ -91,6 +97,7 @@ beforeEach(() => {
   outboxMocks.resendPending.mockResolvedValue(undefined)
   outboxMocks.hasPending.mockReturnValue(false)
   jobStateMocks.recoverStaleJobs.mockResolvedValue(0)
+  notifierMocks.sendAlert.mockResolvedValue([])
   vi.spyOn(console, 'log').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -316,27 +323,106 @@ describe('outbox gating', () => {
     resolveResend?.()
   })
 
-  it('start waits for pending Outbox events before startup recovery', async () => {
+  it('start does not wait for pending Outbox events before startup recovery/watchdog/polling', async () => {
     vi.useFakeTimers()
     fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)
-    outboxMocks.hasPending
-      .mockReturnValueOnce(true)
-      .mockReturnValueOnce(true)
-      .mockReturnValueOnce(false)
-      .mockReturnValue(false)
+    // pendingが解消しないケース（起動時に限らずずっと残る）でも、recovery/watchdog/
+    // pollingの開始そのものはblockされてはならない。
+    outboxMocks.hasPending.mockReturnValue(true)
 
     void start()
     await Promise.resolve()
     await Promise.resolve()
+    await Promise.resolve()
 
+    // startup sweepとwatchdogは、pending Outboxの解消を待たずに開始する
+    expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
+    expect(watchdogMocks.startWatchdog).toHaveBeenCalledTimes(1)
+
+    // pollJobs自体も開始しており、最初のcycleでpendingの再送を試みている
     expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
-    expect(jobStateMocks.recoverStaleJobs).not.toHaveBeenCalled()
+    // pendingが残っている間はqueued Job fetchだけがこのcycleでskipされる（既存仕様）
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
 
-    await vi.advanceTimersByTimeAsync(1_000)
+  it('startupでpending Outboxが残ったままでも、Worker全体とwatchdogは停止しない', async () => {
+    vi.useFakeTimers()
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    outboxMocks.hasPending.mockReturnValue(true)
+
+    void start()
+    await Promise.resolve()
+    await Promise.resolve()
     await Promise.resolve()
 
     expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
+    expect(watchdogMocks.startWatchdog).toHaveBeenCalledTimes(1)
+
+    // pending Outboxが解消しないまま複数poll cycleが進んでも、
+    // poll loop自体は生きていて次のcycleへ進み続ける（system全体のhaltではない）
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 4)
+    await Promise.resolve()
+
+    expect(outboxMocks.resendPending.mock.calls.length).toBeGreaterThanOrEqual(4)
+    expect(watchdogMocks.startWatchdog).toHaveBeenCalledTimes(1)
+  })
+
+  it('pendingが3poll cycle連続で解消しない場合にCRITICAL通知を1回送る', async () => {
+    vi.useFakeTimers()
+    outboxMocks.hasPending.mockReturnValue(true)
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical', title: 'Worker Outbox resend is blocked' }),
+    )
+
+    // 4回目以降も連続して残っていても、通知は1回のまま(alert済みフラグ)
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('pendingが解消した後に再び連続滞留すると、CRITICAL通知が再度送られる', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+
+    // 呼び出し回数（1cycleあたりhasPendingは1〜2回呼ばれうる）に依存しないよう、
+    // 状態フラグで表現する。
+    let pending = true
+    outboxMocks.hasPending.mockImplementation(() => pending)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+    await Promise.resolve()
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+
+    // 一度解消させる(streak/alert済みフラグがリセットされる)
+    pending = false
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
+    await Promise.resolve()
+
+    // 再び滞留させる
+    pending = true
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(2)
   })
 })
 
