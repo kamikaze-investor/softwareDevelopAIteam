@@ -1591,26 +1591,36 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       特定ファイルのみ変更／新規ファイル禁止／dependency数上限／特定技術禁止／architecture変更禁止等、
       Project Definitionに書かれうる任意の構造的・機械判定可能な制約。
 
-      **設計方向性（調査・設計のみ、実装は行わない）**:
-      1. **構造化制約の取得**: 既存`interactive-project-definition-readiness`項目（Gap Analysis /
-         Readiness Review）に、自由文Goalからの推測ではなく、CEOが明示的に選択・入力する構造化
-         フィールド（例: maxTaskCount, allowedPathPrefixes, forbidNewFiles, maxDependencyDepth,
-         forbiddenTechnologies, architectureChangeAllowed等）を追加する案を優先する。自由文からの
-         LLM抽出は誤検出・見落としのリスクがあるため、構造化入力を優先し自由文抽出は補助的位置づけに
-         留める。
-      2. **生成後の機械的検証**: 既存`validateRoadmapTasks`/`validateRoadmapPhases`と同じ
-         「生成後・DB同期前にfail-closedで拒否する」パターン（`validationIssues.length > 0` →
-         422）を拡張し、構造化制約に対する汎用バリデータを追加する。新しいGate/Queueは作らない。
-      3. **Design ReviewによるRoadmap全体の独立確認**: Roadmap生成直後・Task同期前に「Roadmap
-         全体（Task一覧・総数・依存関係）が宣言済み制約を満たしているか」を判定する新しい呼び出し
-         ポイントを、既存`runIntegrationReview()`のパターン（複数の個別結果を統合してALIGNED/
-         CONFLICT/UNCERTAINを出す既存の仕組み）を参考に検討する。新しいReview Agent種類は
-         追加しない。
-      4. **機械判定可能/不可能な制約の切り分け**: タスク数上限・許可パス・新規ファイル禁止・
-         dependency数上限のような機械的に数えられる制約は(2)で強制する。「特定技術禁止」
-         「architecture変更禁止」のような意味的判断を要する制約は、既存Design Reviewのfocus
-         （architecture_responsibility, scope_simplicity）へ制約テキストを明示的に渡すことで
-         対応し、新しいfocusは増やさない。
+      **設計方向性（2026-09-01 CEOフィードバック反映。調査・設計のみ、実装は行わない）**:
+      1. **構造化制約の取得はAI主導、CEO手入力UXにしない**: CEOが多数の技術フィールド
+         （maxTaskCount等）を手入力するUXは採用しない。**通常は自然言語のProject Definitionから
+         AIが構造化制約を抽出する**。機械的に確定できるもの（例: 「1件のみ」→
+         `maxTaskCount=1`、「docs/配下のみ」→`allowedPathPrefixes=["docs/"]`）は
+         **自動確定**し、CEOに聞かない。**曖昧な場合、またはGoal/Design Philosophyの根幹に
+         関わる重要項目の場合だけ**、既存`interactive-project-definition-readiness`項目の
+         Gap Analysis経由でCEOへ質問する（新しい質問経路を追加しない。既存Gap
+         ⇒CEO回答／Skip／AI仮決定の枠組みをそのまま使う）。
+      2. **責務分離（3経路、混在させない）**:
+         - **deterministic constraint**（タスク数上限・許可パスのみ・新規ファイル禁止・
+           dependency数上限等、機械的に数えられるもの）→ 既存`validateRoadmapTasks`/
+           `validateRoadmapPhases`と同じ「生成後・DB同期前にfail-closedで拒否する」
+           validatorパターン（`validationIssues.length > 0` → 422）を拡張して強制する。
+           新しいGate/Queueは作らない。
+         - **semantic constraint**（特定技術禁止・architecture変更禁止等、意味的判断を要する
+           もの）→ **Roadmap全体を対象とした既存Design Reviewによる独立確認**で扱う。
+           既存`runIntegrationReview()`のパターン（複数の個別結果を統合してALIGNED/
+           CONFLICT/UNCERTAINを出す既存の仕組み）を参考に、新しいReview Agent種類は
+           追加しない。
+         - **個別Task Design Review**（現行の`createInitialImplementWorkflow()`が
+           `task.description`単位で呼ぶもの）→ **従来通り、別途維持する**。Roadmap全体の
+           確認に置き換えない・混在させない。
+      3. **実行順序: Roadmap全体の確認をTask同期・初回Implement Job生成より前に置く**。
+         現状`initializeApprovedProject()`は「生成→(グラフ構造)検証→Task同期→Project
+         Memory書き込み→Roadmap書き込み→Task毎のinitial implement workflow（Design Review
+         込み）」の順で進む。deterministic validatorとsemantic Design Reviewのいずれも、
+         **Task同期（`syncRoadmapTasks()`）より前**で完結させ、不正Roadmapからは
+         そもそもTask/Jobが1件も生成されない構造を優先する（今回のように、後から気づいて
+         Projectごと保持・破棄するのではなく、生成された時点でfail-closedにする）。
 
       **既存項目との関係（重複実装にしないこと）**: `roadmap-task-control-plane-separation`
       （項目8）は、本項目が一般化する制約体系の**具体例の1つ**（「Design Review/Approval/PR/CI/
@@ -1621,13 +1631,19 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **証拠**: `phase 1c v2`（Project ID `4a55dd0f-6b2f-4ad6-8864-f699d586d9b4`）は2件目の
       regression evidenceとして保持し、resumeしない（4 Taskのまま後続Task/Jobへ進めない）。
 
+      **Phase 1c再開方針**: v3 Projectは今は作成しない。本項目・項目8等の前提条件（prerequisite
+      defects）の修正後、禁止事項を細かくprompt/Goalへ書き並べない自然なProject Definitionで
+      Phase 1cを再開する（今回のように「Design Review/Approval/PR/CI/Commit Gateをタスク化
+      しない」「Roadmap Taskはこの1件のみ」等を毎回Goal本文へ明記する運用を前提にしない）。
+
       **今回の作業範囲（禁止事項）**: 今回はroadmap登録・調査のみ。`roadmapGenerator.ts`の
       `SYSTEM_PROMPT`変更・`roadmapTaskValidation.ts`への新規バリデータ実装・Design Reviewへの
       新しい呼び出しポイント追加は行わない。**Phase 1c（Phase 1c Minimal Production E2E）の
       scopeへは混ぜない。**「タスク数が1でなければreject」という今回専用のハードコードは行わない。
 
-      **完了条件**: 構造化制約フィールドの範囲・機械的検証の実装方針・Roadmap全体を対象とする
-      Design Review呼び出しポイントの設計がCEOに採択されていること。実装着手はCEO承認後
+      **完了条件**: AI主導の構造化制約抽出（自動確定 vs Gap Analysis経由でCEOへ質問する境界線）、
+      deterministic/semantic/個別Task Design Reviewの3経路分離、Task同期より前にRoadmap全体を
+      確認する実行順序、の設計がCEOに採択されていること。実装着手はCEO承認後
 
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
