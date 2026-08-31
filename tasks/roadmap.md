@@ -1427,6 +1427,62 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       分析→Improvement Proposal生成→CEO週次提出、のend-to-endが最小構成で機能すること。既存
       Telemetry/Team Health/Self Diagnosis/Improvement Planner/CEO Proposal/Experiment/
       Evolutionの責務定義（本ファイル944-1030行）と重複する独立実装を作っていないこと
+<!-- roadmap:id=interactive-project-definition-readiness state=planned -->
+6. [ ] **Interactive Project Definition / Readiness**（2026-09-01登録。PL交代（Codex→Claude）時の
+      read-only監査で、Codexから「別責務としてRoadmapへ登録した」との報告があったが本リポジトリの
+      `tasks/roadmap.md`・`tasks/task_graph.md`・`docs/project_memory/`・全commit履歴のいずれにも
+      存在しないことを確認したため、正式に本項目として登録し直す）。
+
+      **背景**: authoritative spec `specs/09_project_creation_flow.md` に、Project作成→
+      Specification Analysis→Gap Analysis→不足情報をユーザーへ質問→Readiness Review→CEO Approval→
+      Initialization→Roadmap、という正式フローが定義済み。GapごとにCEO回答／Skip／AI仮決定を扱う
+      仕様も存在する。実装部品として`specAnalyzer`・`POST /api/cto/analyze`は既に実装済み。
+      **しかし通常のMobile Project作成導線（`draft→running`）はこれを呼んでいない**。
+      `projectInitialization.ts`が不足項目を空のまま扱い、Readinessを固定`100`にしてRoadmap生成へ
+      進んでいる。これは既存機能のregressionではなく、**正式仕様＋既存部品が通常Mobile導線へ
+      統合されていない**状態。
+
+      **目的**: Project作成→AI解析→Goal/Design Philosophy/Scope/Constraints/Success Criteria等の
+      不足検出→必要な場合だけCEOへ質問→Project Memory/authoritative definitionへ反映→Readiness→
+      Approval→Roadmap、という一連の流れを通常のMobile導線へ接続する。既存の
+      `specAnalyzer`/`POST /api/cto/analyze`・Project Memory・Approval・Roadmap同期を再利用し、
+      **新しいQueue / daemon / Gateは安易に追加しない**。
+
+      **今回の作業範囲（禁止事項）**: 今回はroadmap登録のみ。詳細設計・実装・API変更・Mobile UI変更は
+      行わない。
+
+      **完了条件**: 上記の統合方針（既存`specAnalyzer`をどう通常導線から呼ぶか、Gap質問のUI、
+      Readiness計算の固定`100`撤廃方針）がCEOに採択されていること。実装着手はCEO承認後
+<!-- roadmap:id=design-review-conflict-recovery state=planned -->
+7. [ ] **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が
+      本リポジトリに見つからなかったため正式登録し直す）。
+
+      **目的**: Design Review CONFLICTが発生した際、PL（AI）がCONFLICTの理由を分析し、
+      Goal / Design Philosophy / Approval Policyを変更せずに修正可能な場合はRoadmapを自動修正して
+      Design Reviewを再実行し、ALIGNEDを目指す。Goal / Design Philosophy / Approval Policyの変更が
+      必要な場合のみCEOへエスカレーションする。
+
+      **既存項目との関係（重複実装にしないこと）**: 既存の`resumeBlockedTask()`・Mobile resume UI
+      （PR #47 `codex/resume-design-review`・PR #48で拡張済み）は、**CEO/人間が新しいinstructionを
+      与えて再レビューさせる人間駆動の経路**。本項目は**PL（AI）がRoadmap側を自律的に修正して
+      再試行する経路**であり別責務。`project-auto-task-job-chain`のStage 2 auto-recovery
+      （本ファイル1112-1117行）とも、対象がtest/build/implementation failureではなく
+      **Design Review CONFLICTそのもの**である点で異なる。
+
+      **制約**: Safety Gate迂回禁止。CONFLICTのまま無理にJobを生成しない（Job直接生成による
+      Gate迂回は禁止）。Approval bypassは行わない。Design Review結果の書換えは行わない。
+
+      **既存CONFLICT Project（Phase 1c以前のE2E Project、Roadmap/active Tasks 12件・
+      initial Implement Job 0件・Design Review CONFLICT・Integration Review CONFLICT）は
+      Safety Gateがfail-closedした証拠として保持する方針であり、本項目の実装対象・テスト対象には
+      流用しない。**
+
+      **今回の作業範囲（禁止事項）**: 今回はroadmap登録のみ。詳細設計・実装は行わない。
+      **Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜない。**
+
+      **完了条件**: CONFLICT理由分析の方式・Roadmap自動修正の許容範囲（Goal/Design
+      Philosophy/Approval Policy不変の判定方法）・CEOエスカレーション条件がCEOに採択されていること。
+      実装着手はCEO承認後
 
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
