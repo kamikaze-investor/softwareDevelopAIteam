@@ -1448,11 +1448,32 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       `specAnalyzer`/`POST /api/cto/analyze`・Project Memory・Approval・Roadmap同期を再利用し、
       **新しいQueue / daemon / Gateは安易に追加しない**。
 
+      **Project Definition Truncation Prevention（2026-09-01追加。Phase 1c Minimal Production E2E
+      Project作成時の実測で発見。本項目の一部として扱う）**: `GET /api/projects/{id}`の`goal`が
+      ちょうど500文字で切れており、CEOが実際にMobileへ入力したProject Definition（Goal本文の後に
+      Constraints・Success Criteriaが続く想定だった）が欠落していた。原因を特定済み:
+      **Mobile側UI入力欄のsilent truncationであり、API/Storage/DBには文字数制限が存在しない**
+      （`apps/mobile/app/create.tsx:82` `<TextInput maxLength={500} ... />` — Goal欄のみに
+      React Native `TextInput`の`maxLength`が設定されており、上限到達後は警告・エラーなしに
+      入力・貼り付けが無音で切り捨てられる。対して`apps/api/src/routes/projects.ts`の
+      `CreateProjectBody`は`goal: z.string().min(1)`で上限なし、`apps/api/src/storage/schema.ts`の
+      `goal TEXT NOT NULL`もSQLite TEXTで無制限）。**したがって500文字はMobile UI由来の恣意的な
+      上限であり、API/schema/DB側の制約ではない**。名前欄`maxLength={100}`も同様の恣意的UI上限。
+      **重大な帰結**: このProjectのDesign Review ALIGNED判定は、CEOが意図した完全なGoalに対してではなく、
+      **truncateされた500文字のGoalに対する判定**であった可能性が高い。「CEOが意図した完全GoalとのALIGNED」
+      とは扱わない（該当Project `95509639-7cf2-47b8-af70-d2fdf28958b3`はresumeせず証拠として保持。
+      詳細は本ファイル該当コミットの経緯を参照）。
+      **完了条件に追加**: authoritative Project Definitionをsilent truncateしない／UI・API・Storage間で
+      情報を欠落させない／文字数上限が必要な場合は保存前に明示的に拒否・警告する（無音での切り捨てをしない）／
+      structured Project DefinitionをProject Memoryへ保持する／Roadmap生成・Design Reviewが
+      同一の完全なauthoritative definitionを参照すること。
+
       **今回の作業範囲（禁止事項）**: 今回はroadmap登録のみ。詳細設計・実装・API変更・Mobile UI変更は
-      行わない。
+      行わない。**Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜない。**
 
       **完了条件**: 上記の統合方針（既存`specAnalyzer`をどう通常導線から呼ぶか、Gap質問のUI、
-      Readiness計算の固定`100`撤廃方針）がCEOに採択されていること。実装着手はCEO承認後
+      Readiness計算の固定`100`撤廃方針、Truncation Prevention）がCEOに採択されていること。
+      実装着手はCEO承認後
 <!-- roadmap:id=design-review-conflict-recovery state=planned -->
 7. [ ] **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が
       本リポジトリに見つからなかったため正式登録し直す）。
@@ -1483,6 +1504,50 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **完了条件**: CONFLICT理由分析の方式・Roadmap自動修正の許容範囲（Goal/Design
       Philosophy/Approval Policy不変の判定方法）・CEOエスカレーション条件がCEOに採択されていること。
       実装着手はCEO承認後
+<!-- roadmap:id=roadmap-task-control-plane-separation state=planned -->
+8. [ ] **Roadmap Task / Control-Plane Workflow Separation**（2026-09-01登録。Phase 1c Minimal
+      Production E2E Projectの実行結果で発覚。調査・roadmap登録のみ行い、Phase 1cのscopeへは
+      混ぜない）。
+
+      **発覚した事実**: Phase 1c用に生成されたRoadmapは11 Taskで構成されていたが、うち5件
+      （「Design Review用ドキュメント準備」「Design Review提出・Approval取得」「Feature Branch作成・
+      変更コミット」「Pull Request作成・CI Gate確認」「Commit Gate通過・マージ完了」）は、
+      Projectの成果物ではなく**AIteamOS自身が既にTaskの外側で自動的に担当しているcontrol-plane処理**
+      （`checkImplementJobDesignReviewEvidence()`によるDesign Review Gate、Approval Gate、
+      `git_commit` SafeCommand、shadow Commit Gate等、既存の自動フロー）をなぞる内容だった。
+
+      **原因（コード確認済み）**: `apps/api/src/ctoAi/roadmapGenerator.ts`の`SYSTEM_PROMPT`
+      （59-97行）には、タスク粒度（「1タスク=最大2日」）・Phase構成・タスク数（10〜20件）の
+      指示はあるが、**「Design Review実行／Approval取得／Branch・commit workflow／PR・CI
+      orchestration／Commit Gate実行／Task completion machineryをRoadmap Taskとして生成しない」
+      という制約は一切存在しない**。既存Meta Reviewerチェックリスト（`docs/meta_reviewer/checklist.md`・
+      `checklists/*.md`）にも同種の検出項目はなく、Design Review Strategic Alignment側にも
+      「このTaskはAIteamOS自身のworkflow機構を再実装しようとしていないか」を判定する視点は
+      現状組み込まれていない。**部分的に壊れていたのではなく、この種のsemantic invariantが
+      最初から存在しない**ことを確認した。
+
+      **リスク**: Roadmap Taskとしてこの種の項目が生成されると、(a) Task本体に実装すべき差分が
+      実質存在しない（例:「Commit Gate通過・マージ完了」はコード変更を伴わない）、(b) その
+      Taskの`aiCliPrompt`自体がDesign Reviewの対象になるため、Design Review実行を指示する内容が
+      さらにDesign Reviewを通る、という概念的な循環が生じ得る、(c) 既存自動フローとの二重化により
+      不要なJob生成・混乱した失敗状態を招きうる。
+
+      **目的**: Roadmap Taskは常に「成果物を作るための作業」を表すという制約を、Roadmap生成・
+      （可能なら）Design Review側に持たせる。既存のDesign Review Gate・Approval Gate・
+      `git_commit`・shadow Commit Gateの自動フローはそのまま維持し、新しい実行機構は追加しない。
+
+      **評価事項（実装ではなく調査）**: `roadmapGenerator.ts`の`SYSTEM_PROMPT`へ制約を追加する案、
+      および生成後のバリデーション（タスクtitle/descriptionが既存control-plane処理と重複しないかの
+      機械的・LLMベースの検出）で防ぐ案の両方を比較する。Design Review Strategic Alignment
+      （`strategicReview.ts`）の既存7 checklist・focus selectionへ新しい観点を追加する場合の
+      責務境界（Roadmap生成時点で防ぐか、Design Review時点で検出するかの二段防御）を整理する。
+
+      **今回の作業範囲（禁止事項）**: 今回はroadmap登録のみ。`roadmapGenerator.ts`の`SYSTEM_PROMPT`
+      変更・Design Reviewチェックリスト変更・バリデーション実装は行わない。
+      **Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜない。**
+
+      **完了条件**: 防止方式（生成時制約／生成後検出／両方）の採択、Design Review側で検出する場合の
+      チェックリスト・focus設計方針がCEOに採択されていること。実装着手はCEO承認後
 
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
