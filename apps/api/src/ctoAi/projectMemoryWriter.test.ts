@@ -80,6 +80,8 @@ describe('writeProjectMemory', () => {
       structuredConstraints: MOCK_ANALYSIS.structuredConstraints,
       constraintsHash: computeProjectDefinitionHash(JSON.stringify(MOCK_ANALYSIS.structuredConstraints)),
     })
+    expect(result.definitionHash).toBe(metadata.definitionHash)
+    expect(result.constraintsHash).toBe(metadata.constraintsHash)
     expect(Date.parse(metadata.generatedAt)).not.toBeNaN()
   })
 

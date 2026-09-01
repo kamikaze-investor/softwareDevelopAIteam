@@ -1,10 +1,14 @@
 import type { Project } from '@ai-team/shared'
+import { buildDefaultCoordinatorDeps, createAndExecuteRoadmapReview } from '../designReview/designReviewCoordinator.js'
+import { checkRoadmapDesignReviewFreshness } from '../designReviewEvidencePolicy.js'
 import type { IStorage } from '../storage/interface.js'
 import { validateRoadmapConstraints, validateRoadmapPhases, validateRoadmapTasks, type RoadmapSyncPhaseInput, type RoadmapSyncTaskInput } from '../storage/roadmapTaskValidation.js'
 import { writeProjectMemory } from './projectMemoryWriter.js'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow.js'
 import { generateRoadmap, type RoadmapGeneratorOptions } from './roadmapGenerator.js'
-import { writeRoadmap } from './roadmapWriter.js'
+import { buildSpecTextFromProjectDefinition } from './projectDefinitionAnalysis.js'
+import { composeRoadmapReviewMaterial } from './roadmapReviewMaterial.js'
+import { buildRoadmapMd, writeRoadmap } from './roadmapWriter.js'
 import type { SpecAnalysis } from './specAnalyzer.js'
 
 export class ProjectInitializationError extends Error {
@@ -84,6 +88,48 @@ export async function initializeApprovedProject(
     throw new ProjectInitializationError('ロードマップの検証に失敗しました', 422, { issues: validationIssues })
   }
 
+  const projectMemory = options.writeProjectMemory
+    ? writeProjectMemory(analysis, targetProjectRoot, {
+        canonicalDefinitionText: options.canonicalDefinitionText,
+      })
+    : undefined
+
+  if (projectMemory) {
+    const canonicalDefinitionText = options.canonicalDefinitionText
+      ?? buildSpecTextFromProjectDefinition({
+        goal: analysis.goal,
+        designPhilosophy: analysis.designPhilosophy,
+      })
+    const reviewMaterial = composeRoadmapReviewMaterial({
+      canonicalDefinitionText,
+      definitionHash: projectMemory.definitionHash,
+      structuredConstraints: analysis.structuredConstraints,
+      constraintsHash: projectMemory.constraintsHash,
+      roadmapMarkdown: buildRoadmapMd(roadmap),
+    })
+    const deps = buildDefaultCoordinatorDeps()
+    let freshness = checkRoadmapDesignReviewFreshness(
+      project.id,
+      reviewMaterial,
+      storage.designReviewEvidence,
+    )
+    if (!freshness.ok) {
+      await createAndExecuteRoadmapReview(storage, { projectId: project.id, reviewMaterial }, deps)
+      freshness = checkRoadmapDesignReviewFreshness(
+        project.id,
+        reviewMaterial,
+        storage.designReviewEvidence,
+      )
+    }
+    if (!freshness.ok) {
+      throw new ProjectInitializationError(
+        'Whole-Roadmap Design Review did not align or could not complete',
+        422,
+        { code: freshness.code, reason: freshness.reason },
+      )
+    }
+  }
+
   const syncResult = storage.tasks.syncRoadmapTasks({
     projectId: project.id,
     tasks: roadmapTasks,
@@ -97,11 +143,6 @@ export async function initializeApprovedProject(
     })
   }
 
-  const projectMemory = options.writeProjectMemory
-    ? writeProjectMemory(analysis, targetProjectRoot, {
-        canonicalDefinitionText: options.canonicalDefinitionText,
-      })
-    : { writtenFiles: [] as string[] }
   const roadmapFiles = writeRoadmap(roadmap, targetProjectRoot)
   const initialWorkflow = await Promise.all(
     syncResult.createdTaskIds.map((taskId) => createInitialImplementWorkflow(storage, taskId)),
@@ -112,7 +153,7 @@ export async function initializeApprovedProject(
     initialWorkflow,
     roadmap,
     syncResult,
-    writtenFiles: [...projectMemory.writtenFiles, ...roadmapFiles.writtenFiles],
+    writtenFiles: [...(projectMemory?.writtenFiles ?? []), ...roadmapFiles.writtenFiles],
     targetDir: roadmapFiles.targetDir,
   }
 }
