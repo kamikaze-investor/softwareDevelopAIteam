@@ -12,7 +12,7 @@ import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
-import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
 import type { TaskContinuation } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -340,6 +340,24 @@ function groupByTaskId<T extends { taskId: string }>(items: T[]): Map<string, T[
   return grouped
 }
 
+function resolveDesignReviewSubject(data: {
+  reviewKind?: DesignReviewKind
+  subjectId?: string
+  taskId?: string
+}): { reviewKind: DesignReviewKind; subjectId: string; taskId?: string } {
+  const reviewKind = data.reviewKind ?? 'task'
+  const subjectId = data.subjectId ?? data.taskId
+  if (!subjectId) {
+    throw new Error('Design Review subjectId is required when taskId is not provided')
+  }
+
+  if (reviewKind === 'roadmap') {
+    return { reviewKind, subjectId }
+  }
+
+  return { reviewKind, subjectId, taskId: data.taskId ?? subjectId }
+}
+
 function newestIso(values: Array<string | undefined>): string {
   const validValues = values.filter((value): value is string => value !== undefined)
   return validValues.reduce((newest, value) => (
@@ -423,6 +441,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   db.pragma('journal_mode = WAL')
   db.exec(CREATE_TABLES)
   runMigrations(db)
+  runDesignReviewSubjectMigration(db)
   runIndexMigrations(db)
 
   const projects: IProjectStorage = {
@@ -2199,19 +2218,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return row ? deserializeDesignReviewEvidence(row) : undefined
     },
     create(data) {
+      const subject = resolveDesignReviewSubject(data)
       const evidence: DesignReviewEvidence = {
         ...data,
+        reviewKind: subject.reviewKind,
+        subjectId: subject.subjectId,
+        taskId: subject.taskId,
         id: randomUUID(),
         createdAt: now(),
       }
       db.prepare(`
         INSERT INTO design_review_evidence
-          (id, task_id, design_text_hash, review_load, decision,
+          (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
            independent_review_required, independent_review_verdict, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evidence.id,
-        evidence.taskId,
+        evidence.reviewKind,
+        evidence.subjectId,
+        evidence.taskId ?? null,
         evidence.designTextHash,
         evidence.reviewLoad,
         evidence.decision,
@@ -2307,20 +2332,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
-    create({ taskId, designText, designTextHash, taskTitle, changedFiles }) {
+    create(data) {
+      const subject = resolveDesignReviewSubject(data)
+      const { designText, designTextHash, taskTitle, changedFiles } = data
       const createTransaction = db.transaction((): DesignReviewRun => {
-        // partial unique index (task_id) WHERE status IN ('queued','running') と同じ条件で
+        // partial unique index (review_kind, subject_id) WHERE status IN ('queued','running') と同じ条件で
         // 事前に確認し、二重起票ではなく既存runを返す。
         const existing = db.prepare(
-          "SELECT * FROM design_review_runs WHERE task_id = ? AND status IN ('queued','running') LIMIT 1"
-        ).get(taskId) as any
+          "SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND status IN ('queued','running') LIMIT 1"
+        ).get(subject.reviewKind, subject.subjectId) as any
         if (existing) {
           return deserializeDesignReviewRun(existing)
         }
 
         const run: DesignReviewRun = {
           id: randomUUID(),
-          taskId,
+          reviewKind: subject.reviewKind,
+          subjectId: subject.subjectId,
+          taskId: subject.taskId,
           designText,
           designTextHash,
           taskTitle,
@@ -2332,19 +2361,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         try {
           db.prepare(`
             INSERT INTO design_review_runs
-              (id, task_id, design_text, design_text_hash, task_title, changed_files, status,
+              (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title, changed_files, status,
                attempt_count, claim_token, result_json, error, created_at, started_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL)
           `).run(
-            run.id, run.taskId, run.designText, run.designTextHash, run.taskTitle,
+            run.id, run.reviewKind, run.subjectId, run.taskId ?? null, run.designText, run.designTextHash, run.taskTitle,
             JSON.stringify(run.changedFiles), run.status, run.attemptCount, run.createdAt,
           )
         } catch (err) {
-          // partial unique index (ux_design_review_runs_task_active) 違反は「別経路が先に
+          // partial unique index (ux_design_review_runs_subject_active) 違反は「別経路が先に
           // active runを作った」ことを意味するので、例外にせず既存runを返す。
           const existingAfterConflict = db.prepare(
-            "SELECT * FROM design_review_runs WHERE task_id = ? AND status IN ('queued','running') LIMIT 1"
-          ).get(taskId) as any
+            "SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND status IN ('queued','running') LIMIT 1"
+          ).get(subject.reviewKind, subject.subjectId) as any
           if (!existingAfterConflict) {
             throw err
           }
@@ -3222,7 +3251,9 @@ function deserializeApprovalRequest(row: any): ApprovalRequest {
 function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
   return {
     id: row.id,
-    taskId: row.task_id,
+    reviewKind: row.review_kind as DesignReviewEvidence['reviewKind'],
+    subjectId: row.subject_id,
+    taskId: row.task_id ?? undefined,
     designTextHash: row.design_text_hash,
     reviewLoad: row.review_load as DesignReviewEvidence['reviewLoad'],
     decision: row.decision as DesignReviewEvidence['decision'],
@@ -3254,7 +3285,9 @@ function deserializeGateEvaluation(row: any): GateEvaluationEvidence {
 function deserializeDesignReviewRun(row: any): DesignReviewRun {
   return {
     id: row.id,
-    taskId: row.task_id,
+    reviewKind: row.review_kind as DesignReviewRun['reviewKind'],
+    subjectId: row.subject_id,
+    taskId: row.task_id ?? undefined,
     designText: row.design_text,
     designTextHash: row.design_text_hash,
     taskTitle: row.task_title ?? '',
@@ -3411,6 +3444,87 @@ function runMigrations(db: Database.Database): void {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
     }
   }
+}
+
+function runDesignReviewSubjectMigration(db: Database.Database): void {
+  const evidenceColumns = (db.pragma('table_info(design_review_evidence)') as Array<{ name: string }>)
+    .map((column) => column.name)
+  if (evidenceColumns.includes('review_kind')) {
+    return
+  }
+
+  const migrate = db.transaction((): void => {
+    db.exec(`
+      CREATE TABLE design_review_evidence_new (
+        id TEXT PRIMARY KEY,
+        review_kind TEXT NOT NULL DEFAULT 'task',
+        subject_id TEXT NOT NULL DEFAULT '',
+        task_id TEXT,
+        design_text_hash TEXT NOT NULL,
+        review_load TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        independent_review_required INTEGER NOT NULL DEFAULT 0,
+        independent_review_verdict TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id)
+      );
+
+      INSERT INTO design_review_evidence_new
+        (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
+         independent_review_required, independent_review_verdict, created_at)
+      SELECT
+        id, 'task', task_id, task_id, design_text_hash, review_load, decision,
+        independent_review_required, independent_review_verdict, created_at
+      FROM design_review_evidence;
+
+      DROP TABLE design_review_evidence;
+      ALTER TABLE design_review_evidence_new RENAME TO design_review_evidence;
+
+      CREATE TABLE design_review_runs_new (
+        id TEXT PRIMARY KEY,
+        review_kind TEXT NOT NULL DEFAULT 'task',
+        subject_id TEXT NOT NULL DEFAULT '',
+        task_id TEXT,
+        design_text TEXT NOT NULL,
+        design_text_hash TEXT NOT NULL,
+        task_title TEXT NOT NULL DEFAULT '',
+        changed_files TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        claim_token TEXT,
+        result_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        FOREIGN KEY (task_id) REFERENCES tasks(id)
+      );
+
+      INSERT INTO design_review_runs_new
+        (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title,
+         changed_files, status, attempt_count, claim_token, result_json, error, created_at,
+         started_at, completed_at)
+      SELECT
+        id, 'task', task_id, task_id, design_text, design_text_hash, task_title,
+        changed_files, status, attempt_count, claim_token, result_json, error, created_at,
+        started_at, completed_at
+      FROM design_review_runs;
+
+      DROP TABLE design_review_runs;
+      ALTER TABLE design_review_runs_new RENAME TO design_review_runs;
+
+      CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at
+        ON design_review_evidence(task_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS ix_design_review_evidence_subject_created_at
+        ON design_review_evidence(review_kind, subject_id, created_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_subject_active
+        ON design_review_runs(review_kind, subject_id) WHERE status IN ('queued','running');
+      CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at
+        ON design_review_runs(status, started_at);
+    `)
+  })
+
+  migrate()
 }
 
 function runIndexMigrations(db: Database.Database): void {

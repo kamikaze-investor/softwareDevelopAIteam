@@ -163,10 +163,14 @@ export interface StrategicMetaReviewResult {
 
 export type DesignReviewDecision = StrategicDecision | 'REVIEW_UNAVAILABLE'
 export type DesignReviewIndependentVerdict = IndependentReviewOutcome['verdict']
+export type DesignReviewKind = 'task' | 'roadmap'
 
 export interface DesignReviewEvidence {
   id: string
-  taskId: string
+  reviewKind: DesignReviewKind
+  subjectId: string
+  /** Populated only for reviewKind === 'task' (backward compat). undefined for 'roadmap'. */
+  taskId?: string
   designTextHash: string
   reviewLoad: ReviewLoad
   decision: DesignReviewDecision

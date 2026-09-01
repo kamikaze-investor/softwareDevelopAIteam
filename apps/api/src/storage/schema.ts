@@ -150,7 +150,9 @@ export const CREATE_TABLES = `
 
   CREATE TABLE IF NOT EXISTS design_review_evidence (
     id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
+    review_kind TEXT NOT NULL DEFAULT 'task',
+    subject_id TEXT NOT NULL DEFAULT '',
+    task_id TEXT,
     design_text_hash TEXT NOT NULL,
     review_load TEXT NOT NULL,
     decision TEXT NOT NULL,
@@ -179,7 +181,9 @@ export const CREATE_TABLES = `
 
   CREATE TABLE IF NOT EXISTS design_review_runs (
     id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
+    review_kind TEXT NOT NULL DEFAULT 'task',
+    subject_id TEXT NOT NULL DEFAULT '',
+    task_id TEXT,
     design_text TEXT NOT NULL,
     design_text_hash TEXT NOT NULL,
     task_title TEXT NOT NULL DEFAULT '',
@@ -390,8 +394,10 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_jobs_workflow_step_key ON jobs(workflow_step_key) WHERE workflow_step_key IS NOT NULL',
   'CREATE UNIQUE INDEX IF NOT EXISTS ux_review_results_job_id ON review_results(job_id)',
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at ON design_review_evidence(task_id, created_at DESC)',
+  'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_subject_created_at ON design_review_evidence(review_kind, subject_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC)',
-  "CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_task_active ON design_review_runs(task_id) WHERE status IN ('queued','running')",
+  'DROP INDEX IF EXISTS ux_design_review_runs_task_active',
+  "CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_subject_active ON design_review_runs(review_kind, subject_id) WHERE status IN ('queued','running')",
   'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_task_created_at ON gate_evaluations(task_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_target ON gate_evaluations(target_commit, target_diff_hash)',
   // 1 ALLOW = 1 git_commit = 1 resulting_commit。
