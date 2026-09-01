@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import type { ProjectRoadmapCompletion, Task } from '@ai-team/shared'
 import { z } from 'zod'
 import { initializeApprovedProject } from '../ctoAi/projectInitialization'
+import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
 import { getStorage } from '../storage'
 import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
 
@@ -120,6 +121,18 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         await initializeApprovedProject(storage, updated, process.env.TARGET_ROOT ?? '/workspace/target', {
           writeProjectMemory: true,
         })
+      } else if (updated.status === 'running' && hasActiveRoadmap) {
+        // Resuming an already-initialized Project: retry any Task continuation left
+        // 'pending' while paused (see initialImplementWorkflow.ts's retryable pause skip
+        // and jobs.ts's matching ack-without-503 branch). Reuses the existing
+        // task_continuations row and ensureTaskContinuation() -- no new Gate/Queue/daemon.
+        for (const continuation of storage.taskContinuations.findPendingByProjectId(updated.id)) {
+          void ensureTaskContinuation(storage, continuation.id)
+            .catch((error: unknown) => req.log.error(
+              { err: error, continuationId: continuation.id },
+              'task continuation retry on resume failed',
+            ))
+        }
       }
 
       return reply.send(updated)

@@ -538,6 +538,8 @@ export interface ITaskContinuationStorage {
   findById(id: string): TaskContinuation | undefined
   findBySourceJobId(sourceJobId: string): TaskContinuation | undefined
   findByCompletedTaskId(completedTaskId: string): TaskContinuation | undefined
+  /** pending状態のTaskContinuationのみを対象Projectで取得する（paused中に保留された継続をrunning復帰時に再試行するため）。 */
+  findPendingByProjectId(projectId: string): TaskContinuation[]
   create(data: Omit<TaskContinuation, 'id' | 'createdAt' | 'completedAt'>): TaskContinuation
   update(id: string, data: Partial<Pick<TaskContinuation, 'status' | 'error' | 'completedAt'>>): TaskContinuation | undefined
 }
