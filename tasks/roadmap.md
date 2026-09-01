@@ -1536,6 +1536,54 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       **完了条件（達成）**: 通常のProject作成体験を壊さずGap Analysisを接続、Truncation
       Preventionを実装、既存テスト（`apps/api`・`apps/mobile`）がregressionなく通過することを
       確認済み。
+
+      **残っていた4項目の追加実装（同PR #61ブランチへの追加commit、2026-09-01完了）**:
+      PL（Claude）による8条件（本節冒頭6条件＋統合設計確定文書の2条件）に対するread-only
+      gap分析で、上記実装内容が「structured constraints抽出」「authoritative definitionの
+      version/hash」「Roadmap生成が同一definitionを参照」「definition変更後の古いReview
+      evidence再利用防止」の4条件を満たしていないことを確認。既存機構の再利用のみで追加:
+      - **Structured constraints**: `specAnalyzer.ts`の`SpecAnalysisSchema`へ
+        `structuredConstraints`を追加。プロンプトは「明示的・曖昧でない記述だけを抽出し、
+        曖昧・重要な場合は推測せずmust_resolve Gapとして質問する」と明記（新しい質問経路は
+        追加していない）。
+      - **Version/hash**: `computeProjectDefinitionHash()`（sha256、
+        `designReviewEvidencePolicy.ts`の`computeDesignTextHash()`と同じ方式）と、
+        `docs/project_memory/project_definition.json`（definitionHash・structuredConstraints・
+        constraintsHash等）を`writeProjectMemory()`へ追加。**DB migrationは行っていない**
+        （既存のProject Memory書き出し＋`commitGeneratedDocs()`をそのまま再利用）。
+      - **Roadmap生成への伝播**: `roadmapGenerator.ts`のプロンプトへcanonical definition
+        text・definitionHash・structuredConstraintsを追加（resume等fresh analysisが無い
+        呼び出し元は従来通り、後方互換）。
+      - **Freshness guard**: `PATCH /api/projects/:id`が、Roadmapが既に存在するProjectへの
+        goal/designPhilosophy変更を`409`で拒否する（新しいGateではなく既存バリデーションの
+        拡張）。再生成そのものは項目9の範囲として実装しない。
+      - **Readiness閾値の統一**: `POST /api/cto/analyze`（readinessScore>=70）と
+        `PATCH /api/projects/:id`（must_resolve Gapのみ）で異なっていた採否判定を
+        `isProjectDefinitionReady()`へ共通化。
+
+      Codex CLI（別プロバイダ、OpenAI/GPT-5.5）による独立レビューを2回実施:
+      1回目（gap分析結果の実装に対するレビュー）で、readinessScore単体でblockする際に
+      具体的なGapが0件だとMobileのGap回答画面（質問カード＋回答欄前提のUI）が
+      行き止まりになるblocking issueを検出。`isProjectDefinitionReady()`が
+      readinessReasonから合成Gapを1件生成する形で修正し、新しいUIを追加せず既存の
+      Gap回答フローへ載せた。2回目のレビューでは残課題なしを確認。
+
+      Meta Reviewer AI（Gemini、CI）が`ProjectDefinitionGap`（Mobile）・
+      `StructuredConstraint`（API）がAPI/Mobile間・複数ctoAiモジュール間で共有されるべき
+      型でありながら個別宣言されていた点をCHANGES_REQUESTEDとして指摘。
+      `packages/shared/src/types/project.ts`へ`Gap`・`StructuredConstraint`を追加し、
+      `specAnalyzer.ts`のZod schemaを`z.ZodType<Gap>`等で型として強制、Mobile側は
+      shared型のaliasへ差し替えて対応（APPROVED再取得）。
+
+      **既知の残課題（今回のscope外、記録のみ）**: `POST /api/cto/generate-roadmap`
+      （手動呼び出し用の旧経路）は呼び出し元が渡す`analysis`をそのまま使うため、
+      Project行のauthoritative definitionと乖離しうる。通常のMobile導線
+      （本項目が対象）には影響しないため今回は対象外。
+
+      最終検証: `apps/api`（60ファイル/905テスト）・`apps/mobile`（10テスト）・
+      `packages/shared`（4ファイル/54テスト）全て成功、3パッケージとも`tsc --noEmit`成功。
+      Meta Reviewer AI・Typecheck & Test 両requiredチェックとも green（bypassなし）。
+      PR #61は通常のmerge手順でmaster統合済み（`b01b9c3`）。
 <!-- roadmap:id=design-review-conflict-recovery state=planned -->
 7. [ ] **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が
       本リポジトリに見つからなかったため正式登録し直す）。
