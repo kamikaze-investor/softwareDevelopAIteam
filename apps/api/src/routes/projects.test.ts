@@ -9,14 +9,18 @@ vi.mock('../ctoAi/roadmapGenerator.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../ctoAi/roadmapGenerator.js')>()),
   generateRoadmap: roadmapMocks.generateRoadmap,
 }))
+const ALIGNED_STDOUT = JSON.stringify({
+  focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+  integrationReviewResult: { decision: 'ALIGNED' },
+})
+const designReviewMocks = vi.hoisted(() => ({
+  execute: vi.fn(async () => ({ ok: true, timedOut: false, stdout: '' })),
+}))
 vi.mock('../designReview/designReviewCoordinator', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../designReview/designReviewCoordinator')>()),
   buildDefaultCoordinatorDeps: () => ({
     runnerCommand: 'node', runnerArgs: [], homeDirectory: '/tmp', workingDir: '/tmp',
-    execute: async () => ({ ok: true, timedOut: false, stdout: JSON.stringify({
-      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
-      integrationReviewResult: { decision: 'ALIGNED' },
-    }) }),
+    execute: designReviewMocks.execute,
   }),
 }))
 vi.mock('../ctoAi/projectMemoryWriter.js', async (importOriginal) => ({ ...(await importOriginal()), writeProjectMemory: () => ({ writtenFiles: [], targetDir: process.env.TARGET_ROOT ?? '/tmp' }) }))
@@ -114,6 +118,8 @@ beforeEach(() => {
   process.env.TARGET_ROOT = '/tmp/project-route-test'
   mkdirSync(process.env.TARGET_ROOT, { recursive: true })
   roadmapMocks.generateRoadmap.mockResolvedValue({ phases: [{ number: 1, name: 'Foundation', goal: 'Start', tasks: ['task-001'] }], tasks: [{ id: 'task-001', title: 'Implement', description: 'Implement.', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small' }], totalTasks: 1, estimatedWeeks: 1 })
+  designReviewMocks.execute.mockReset()
+  designReviewMocks.execute.mockResolvedValue({ ok: true, timedOut: false, stdout: ALIGNED_STDOUT })
 })
 
 describe('Project API', () => {
@@ -366,6 +372,98 @@ describe('Project API', () => {
       // ensureTaskContinuation() runs fire-and-forget (not awaited by the route) so the
       // next Task's Job creation happens asynchronously after the PATCH response.
       await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(1)
+      expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')
+    })
+  })
+
+  it('a resume attempt that cannot complete yet is retried by the next poll, not stranded forever', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const project = await createProject(app, { status: 'draft' })
+
+      const startRes = await app.inject({
+        method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' },
+      })
+      expect(startRes.statusCode).toBe(200)
+      const sourceTask = storage.tasks.findByProjectId(project.id)[0]
+
+      // nextTask depends on a still-pending blocker, so the FIRST retry attempt (fired by
+      // the resume PATCH itself) cannot create its Job yet -- createInitialImplementWorkflow()
+      // returns a `retryable: true` skip for "task dependencies are not yet done", which
+      // ensureTaskContinuation() leaves 'pending' rather than failing.
+      const blockerTask = storage.tasks.create({
+        projectId: project.id, title: 'Blocker', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 2,
+      })
+      const nextTask = storage.tasks.create({
+        projectId: project.id, title: 'Next', description: 'Implement next.', status: 'pending',
+        assignee: 'developer_ai', dependencies: [blockerTask.id], roadmapActive: true, phase: 3,
+      })
+      const sourceJob = storage.jobs.create({
+        taskId: sourceTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const continuation = storage.taskContinuations.create({
+        sourceJobId: sourceJob.id, projectId: project.id, completedTaskId: sourceTask.id,
+        nextTaskId: nextTask.id, status: 'pending',
+      })
+
+      await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' } })
+      const resumeRes = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+      expect(resumeRes.statusCode).toBe(200)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      // The resume-time attempt alone could not complete: it is not "try once and give up".
+      expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(0)
+      expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('pending')
+
+      // The blocker resolves later, independent of any further PATCH from the CEO.
+      storage.tasks.update(blockerTask.id, { status: 'done' })
+
+      // Mobile's existing poll of GET /api/projects/:id (usePolling) is what recovers it --
+      // not a second manual resume action.
+      const pollRes = await app.inject({ method: 'GET', url: `/api/projects/${project.id}` })
+      expect(pollRes.statusCode).toBe(200)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(1)
+      expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')
+    })
+  })
+
+  it('concurrent continuation retries never create more than one Job for the same continuation', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const { retryPendingContinuationsForProject } = await import('../ctoAi/taskContinuation.js')
+      const storage = getStorage()
+      const project = await createProject(app, { status: 'draft' })
+
+      await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+      const sourceTask = storage.tasks.findByProjectId(project.id)[0]
+
+      const nextTask = storage.tasks.create({
+        projectId: project.id, title: 'Next', description: 'Implement next.', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 2,
+      })
+      const sourceJob = storage.jobs.create({
+        taskId: sourceTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const continuation = storage.taskContinuations.create({
+        sourceJobId: sourceJob.id, projectId: project.id, completedTaskId: sourceTask.id,
+        nextTaskId: nextTask.id, status: 'pending',
+      })
+
+      // Simulates the resume-time sweep and a poll-triggered sweep (GET /:id or GET /)
+      // landing at nearly the same moment -- the exact race the Outbox 503 path already had
+      // to be safe against via the workflow_step_key unique index.
+      await Promise.all([
+        retryPendingContinuationsForProject(storage, project.id),
+        retryPendingContinuationsForProject(storage, project.id),
+      ])
 
       expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(1)
       expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')

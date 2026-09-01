@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import type { ProjectRoadmapCompletion, Task } from '@ai-team/shared'
 import { z } from 'zod'
 import { initializeApprovedProject } from '../ctoAi/projectInitialization'
-import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
+import { retryPendingContinuationsForProject } from '../ctoAi/taskContinuation'
 import { getStorage } from '../storage'
 import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
 
@@ -37,8 +37,23 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
   const singleRunningProjectResponse = { error: 'Another project is already running' }
 
+  // Retries any Task continuation still 'pending' for a running Project. Fire-and-forget:
+  // never blocks or fails the GET it rides on. This -- not this specific PATCH transition --
+  // is what guarantees a continuation left 'pending' by a failed resume-time attempt is not
+  // stranded forever: Mobile already polls both routes below continuously (usePolling), so
+  // each poll tick is another retry opportunity, matching the same "piggyback on an existing
+  // poll cycle instead of adding a new one" pattern the Worker's pollJobs() already uses for
+  // its own Outbox resend.
+  function retryRunningProjectContinuations(project: { id: string; status: string } | undefined): void {
+    if (project?.status !== 'running') return
+    void retryPendingContinuationsForProject(storage, project.id)
+      .catch((error: unknown) => app.log.error({ err: error, projectId: project.id }, 'continuation retry sweep failed'))
+  }
+
   app.get('/', async (_req, reply) => {
-    return reply.send(storage.projects.findAll())
+    const projects = storage.projects.findAll()
+    for (const project of projects) retryRunningProjectContinuations(project)
+    return reply.send(projects)
   })
 
   app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {
@@ -46,6 +61,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     if (!project) {
       return reply.status(404).send({ error: 'Project not found' })
     }
+    retryRunningProjectContinuations(project)
     return reply.send(project)
   })
 
@@ -124,15 +140,13 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       } else if (updated.status === 'running' && hasActiveRoadmap) {
         // Resuming an already-initialized Project: retry any Task continuation left
         // 'pending' while paused (see initialImplementWorkflow.ts's retryable pause skip
-        // and jobs.ts's matching ack-without-503 branch). Reuses the existing
-        // task_continuations row and ensureTaskContinuation() -- no new Gate/Queue/daemon.
-        for (const continuation of storage.taskContinuations.findPendingByProjectId(updated.id)) {
-          void ensureTaskContinuation(storage, continuation.id)
-            .catch((error: unknown) => req.log.error(
-              { err: error, continuationId: continuation.id },
-              'task continuation retry on resume failed',
-            ))
-        }
+        // and jobs.ts's matching ack-without-503 branch). This first attempt is a
+        // convenience, not the guarantee -- if it fails, retryRunningProjectContinuations()
+        // above (wired into GET / and GET /:id, which Mobile already polls) keeps retrying
+        // on every subsequent poll tick, so a transient failure here never stalls a
+        // continuation forever.
+        void retryPendingContinuationsForProject(storage, updated.id)
+          .catch((error: unknown) => req.log.error({ err: error, projectId: updated.id }, 'continuation retry sweep failed'))
       }
 
       return reply.send(updated)
