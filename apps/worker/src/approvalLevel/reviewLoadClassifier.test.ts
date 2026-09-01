@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   classifyReviewLoad,
+  ROADMAP_REVIEW_LOAD_CLASSIFICATION,
   type ReviewLoadClassifierInput,
 } from './reviewLoadClassifier.js'
 
@@ -50,5 +51,14 @@ describe('classifyReviewLoad', () => {
     } as unknown as ReviewLoadClassifierInput)
 
     expect(result.reviewLoad).toBe('low')
+  })
+})
+
+describe('ROADMAP_REVIEW_LOAD_CLASSIFICATION', () => {
+  it('always classifies whole-roadmap reviews as critical', () => {
+    expect(ROADMAP_REVIEW_LOAD_CLASSIFICATION).toEqual({
+      reviewLoad: 'critical',
+      reasons: ["reviewKind='roadmap': whole-roadmap review is always critical load by design"],
+    })
   })
 })

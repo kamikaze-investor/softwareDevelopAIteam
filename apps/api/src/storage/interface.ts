@@ -291,6 +291,7 @@ export interface IDesignReviewEvidenceStorage {
   findById(id: string): DesignReviewEvidence | undefined
   findByTaskId(taskId: string): DesignReviewEvidence[]
   findLatestByTaskId(taskId: string): DesignReviewEvidence | undefined
+  findLatestBySubjectId(reviewKind: DesignReviewKind, subjectId: string): DesignReviewEvidence | undefined
   create(data: DesignReviewEvidenceCreateInput): DesignReviewEvidence
 }
 

@@ -17,8 +17,8 @@
 
 import { spawn } from 'node:child_process'
 import path from 'node:path'
-import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
-import { selectFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
+import { classifyReviewLoad, ROADMAP_REVIEW_LOAD_CLASSIFICATION } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
+import { selectFocuses, selectRoadmapReviewFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 // 判定ロジックは @ai-team/shared の pure 実装を使う。
 // worker側 strategicReview.ts は geminiRouter（CLI spawn）や reviewerAdapter（codex CLI）を
 // 芋づるでimportするため、APIからimportするとWorkerのprovider/CLI機構がAPI runtimeへ入る。
@@ -26,6 +26,7 @@ import {
   applyIndependentReviewOverride,
   resolveFinalDecision,
   type DesignReviewEvidence,
+  type DesignReviewKind,
 } from '@ai-team/shared'
 import type { IStorage, DesignReviewRun } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -115,10 +116,18 @@ function isFocusResultArray(value: unknown): value is Array<{ focus: string; dec
  *   LLM/実行者の自己申告である。APIはその内容の真偽を検証できない。これは既存の
  *   手動design review運用と同一の残存リスクであり、本実装で悪化はしないが解消もしない。
  */
-export function recomputeDecision(raw: RawStrategicResult, changedFiles: string[]): RecomputeOutcome {
-  const classification = classifyReviewLoad({ changedFiles })
+export function recomputeDecision(
+  raw: RawStrategicResult,
+  reviewKind: DesignReviewKind,
+  changedFiles: string[],
+): RecomputeOutcome {
+  const classification = reviewKind === 'roadmap'
+    ? ROADMAP_REVIEW_LOAD_CLASSIFICATION
+    : classifyReviewLoad({ changedFiles })
   const reviewLoad = classification.reviewLoad
-  const expectedFocuses = selectFocuses(reviewLoad, changedFiles)
+  const expectedFocuses = reviewKind === 'roadmap'
+    ? selectRoadmapReviewFocuses()
+    : selectFocuses(reviewLoad, changedFiles)
   const independentReviewRequired = reviewLoad === 'critical'
 
   const reject = (rejectedReason: string): RecomputeOutcome => ({
@@ -317,15 +326,39 @@ export async function executeDesignReviewRun(
 
   const claimToken = claimed.claimToken
 
-  // review_kind の一般化（roadmap-generation-constraint-compliance / review subject
-  // 一般化フェーズ2）はまだこの関数を対応させていない。taskId は型上optionalになった
-  // （DesignReviewRun.taskId?: string）が、'task' 以外の run をここでrunnerへ渡すと
-  // taskId=undefined が silentに欠落した runnerInput を送ることになり、フェーズ2で
-  // この関数がroadmap kindも扱うよう拡張されるまで気づかれない不整合になる。
-  // フェーズ1時点ではroadmap kindのrunを作る呼び出し元は存在しないため到達しないはずだが、
-  // 到達した場合はfail-closedで即座に失敗させる（bounded retryでは解決しない不変条件違反
-  // のため、finalizeFailureのrequeueには乗せない）。
-  if (run.reviewKind !== 'task' || run.taskId === undefined) {
+  let runnerInput: string
+
+  if (run.reviewKind === 'task') {
+    if (run.taskId === undefined) {
+      // invariant violation: a task-kind row must always have taskId. Fail-closed exactly like the
+      // Phase 1 guard did, same fenced complete() call, same error message shape.
+      const fenced = storage.designReviewRuns.complete(
+        run.id, claimToken, 'failed', undefined,
+        `executeDesignReviewRun: reviewKind='task' requires a taskId but the run has none (invariant violation)`,
+      )
+      return fenced
+        ? { status: 'failed', error: 'task-kind design review run is missing taskId' }
+        : { status: 'stale' }
+    }
+    runnerInput = JSON.stringify({
+      reviewKind: 'task',
+      subjectId: run.taskId,
+      taskTitle,
+      designText: run.designText,
+      changedFiles,
+      workingDir: deps.workingDir,
+    })
+  } else if (run.reviewKind === 'roadmap') {
+    runnerInput = JSON.stringify({
+      reviewKind: 'roadmap',
+      subjectId: run.subjectId,
+      taskTitle,
+      designText: run.designText,
+      changedFiles: [],       // always genuinely empty for roadmap kind — never populate this
+      workingDir: deps.workingDir,
+    })
+  } else {
+    // exhaustive fail-closed default for any future reviewKind value this function doesn't support yet.
     const fenced = storage.designReviewRuns.complete(
       run.id, claimToken, 'failed', undefined,
       `executeDesignReviewRun does not yet support reviewKind=${run.reviewKind} (phase 2 must extend this before roadmap reviews reach here)`,
@@ -334,14 +367,6 @@ export async function executeDesignReviewRun(
       ? { status: 'failed', error: `unsupported reviewKind: ${run.reviewKind}` }
       : { status: 'stale' }
   }
-
-  const runnerInput = JSON.stringify({
-    taskId: run.taskId,
-    taskTitle,
-    designText: run.designText,
-    changedFiles,
-    workingDir: deps.workingDir,
-  })
 
   let execution: RunnerExecution
   try {
@@ -366,7 +391,7 @@ export async function executeDesignReviewRun(
     return finalizeFailure(storage, claimed.run, claimToken, 'runner returned unparsable output')
   }
 
-  const outcome = recomputeDecision(raw, changedFiles)
+  const outcome = recomputeDecision(raw, run.reviewKind, changedFiles)
 
   if (outcome.decision !== 'ALIGNED') {
     const fenced = storage.designReviewRuns.complete(
@@ -383,7 +408,9 @@ export async function executeDesignReviewRun(
   }
 
   const evidence = storage.designReviewRuns.completeWithEvidence(run.id, claimToken, execution.stdout, {
-    taskId: run.taskId,
+    reviewKind: run.reviewKind,
+    subjectId: run.subjectId,
+    taskId: run.reviewKind === 'task' ? run.taskId : undefined,
     designTextHash: run.designTextHash,
     reviewLoad: outcome.reviewLoad as DesignReviewEvidence['reviewLoad'],
     decision: 'ALIGNED',
@@ -419,6 +446,31 @@ export async function createAndExecuteDesignReview(
   const run = storage.designReviewRuns.create({
     ...input,
     designTextHash: computeDesignTextHash(input.designText),
+  })
+  return executeDesignReviewRun(storage, run, deps)
+}
+
+export interface CreateAndExecuteRoadmapReviewInput {
+  projectId: string
+  /** Composed canonical text — see composeRoadmapReviewMaterial() in the new
+   *  apps/api/src/ctoAi/roadmapReviewMaterial.ts (section 7). Callers build this, this function
+   *  just hashes and stores it — keeps this coordinator file subject-shape-agnostic. */
+  reviewMaterial: string
+  taskTitle?: string   // defaults to 'Whole-Roadmap Review'
+}
+
+export async function createAndExecuteRoadmapReview(
+  storage: IStorage,
+  input: CreateAndExecuteRoadmapReviewInput,
+  deps: CoordinatorDeps,
+): Promise<ExecuteDesignReviewResult> {
+  const run = storage.designReviewRuns.create({
+    reviewKind: 'roadmap',
+    subjectId: input.projectId,
+    taskTitle: input.taskTitle ?? 'Whole-Roadmap Review',
+    designText: input.reviewMaterial,
+    designTextHash: computeDesignTextHash(input.reviewMaterial),
+    changedFiles: [],
   })
   return executeDesignReviewRun(storage, run, deps)
 }

@@ -146,7 +146,11 @@ export interface IndependentReviewOutcome {
 
 /** REVIEW_UNAVAILABLE means a required review could not complete and must not be treated as ALIGNED. */
 export interface StrategicMetaReviewResult {
-  taskId: string
+  reviewKind: DesignReviewKind
+  /** task: taskId value. roadmap: projectId value. Never a synthetic taskId. */
+  subjectId: string
+  /** Populated only for reviewKind === 'task' (backward compat with existing consumers). */
+  taskId?: string
   reviewLoad: ReviewLoad
   reviewLoadReasons: string[]
   selectedFocuses: MetaReviewFocus[]

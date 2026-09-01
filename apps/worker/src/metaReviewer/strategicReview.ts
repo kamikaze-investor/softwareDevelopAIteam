@@ -2,6 +2,7 @@ import { readdir, readFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type {
+  DesignReviewKind,
   FocusedReviewResult,
   IndependentReviewOutcome,
   IntegrationReviewResult,
@@ -18,8 +19,8 @@ import type {
 // ここでは再exportして既存の呼び出し元との互換を保つ。定義を二重化しないこと。
 import { applyIndependentReviewOverride, resolveFinalDecision } from '@ai-team/shared'
 export { applyIndependentReviewOverride, resolveFinalDecision }
-import { classifyReviewLoad } from '../approvalLevel/reviewLoadClassifier.js'
-import { selectFocuses } from '../approvalLevel/focusSelector.js'
+import { classifyReviewLoad, ROADMAP_REVIEW_LOAD_CLASSIFICATION } from '../approvalLevel/reviewLoadClassifier.js'
+import { selectFocuses, selectRoadmapReviewFocuses } from '../approvalLevel/focusSelector.js'
 import {
   buildMetaReviewPrompt,
   buildMetaReviewRequest,
@@ -37,7 +38,9 @@ import { createReviewerAdapter } from '../approvalLevel/reviewerAdapter.js'
 const INDEPENDENT_REVIEWER_PROVIDER = 'codex'
 
 export interface StrategicReviewInput {
-  taskId: string
+  reviewKind?: DesignReviewKind
+  /** task: taskId value. roadmap: projectId value. Never a synthetic taskId. */
+  subjectId: string
   taskTitle: string
   changedFiles: string[]
   gitDiff: string
@@ -175,10 +178,18 @@ const STOPWORDS = new Set([
 export async function runStrategicMetaReview(
   input: StrategicReviewInput,
 ): Promise<StrategicMetaReviewResult> {
-  const classification = classifyReviewLoad({ changedFiles: input.changedFiles })
-  const selectedFocuses = selectFocuses(classification.reviewLoad, input.changedFiles)
+  const reviewKind = input.reviewKind ?? 'task'
+
+  const classification = reviewKind === 'roadmap'
+    ? ROADMAP_REVIEW_LOAD_CLASSIFICATION
+    : classifyReviewLoad({ changedFiles: input.changedFiles })
+
+  const selectedFocuses = reviewKind === 'roadmap'
+    ? selectRoadmapReviewFocuses()
+    : selectFocuses(classification.reviewLoad, input.changedFiles)
 
   if (classification.reviewLoad === 'low') {
+    // unreachable for roadmap kind (always critical) — fine, no branch needed here.
     return runLowLoadLegacyReview(input, classification)
   }
 
@@ -209,7 +220,8 @@ export async function runStrategicMetaReview(
   }
 
   return buildStrategicResult({
-    taskId: input.taskId,
+    reviewKind,
+    subjectId: input.subjectId,
     classification,
     selectedFocuses,
     focusedReviewResults,
@@ -232,8 +244,8 @@ export async function runIndependentReview(
 
   try {
     const result = await adapter.review({
-      jobId: input.taskId,
-      taskId: input.taskId,
+      jobId: input.subjectId,
+      taskId: input.subjectId,
       implementerProvider: 'claude_code',
       reviewerProvider: INDEPENDENT_REVIEWER_PROVIDER,
       phase: materialKind === 'design' ? 'pre' : 'post',
@@ -325,9 +337,11 @@ async function runLowLoadLegacyReview(
   input: StrategicReviewInput,
   classification: ReviewLoadClassification,
 ): Promise<StrategicMetaReviewResult> {
+  const reviewKind = input.reviewKind ?? 'task'
+
   try {
     const request = buildMetaReviewRequest(
-      input.taskId,
+      input.subjectId,
       input.taskTitle,
       input.changedFiles,
       input.workingDir,
@@ -342,7 +356,7 @@ async function runLowLoadLegacyReview(
       apiModel: 'gemini-3.5-flash',
       featureName: 'meta_review',
     })
-    const legacyResult = parseMetaReviewResult(rawResponse, input.taskId)
+    const legacyResult = parseMetaReviewResult(rawResponse, input.subjectId)
     const finalDecision = mapMetaReviewStatusToStrategicDecision(legacyResult.status)
 
     const independentReviewRequired = classification.reviewLoad === 'critical'
@@ -350,7 +364,8 @@ async function runLowLoadLegacyReview(
       || requiresCeoApprovalForDecision(finalDecision, independentReviewRequired)
 
     return buildStrategicResult({
-      taskId: input.taskId,
+      reviewKind,
+      subjectId: input.subjectId,
       classification,
       selectedFocuses: [],
       focusedReviewResults: [],
@@ -359,7 +374,8 @@ async function runLowLoadLegacyReview(
     })
   } catch (err) {
     return buildUnavailableStrategicResult(
-      input.taskId,
+      reviewKind,
+      input.subjectId,
       classification,
       [],
       [],
@@ -479,11 +495,7 @@ async function buildFocusedReviewPrompt(
       '',
       checklistContext.text,
       '',
-      `Task ID: ${input.taskId}`,
-      `Task title: ${input.taskTitle}`,
-      '',
-      'Changed files:',
-      formatBulletList(input.changedFiles),
+      buildReviewSubjectHeader(input),
       '',
       buildReviewMaterialSection(input.gitDiff, input.materialKind ?? 'diff'),
       '',
@@ -520,15 +532,7 @@ async function buildStrategicAlignmentContext(input: StrategicReviewInput): Prom
     ].join('\n'))
   }
 
-  sections.push([
-    '## Task',
-    '',
-    `Task ID: ${input.taskId}`,
-    `Task title: ${input.taskTitle}`,
-    '',
-    'Changed files:',
-    formatBulletList(input.changedFiles),
-  ].join('\n'))
+  sections.push(buildReviewSubjectHeader(input))
 
   return {
     text: sections.join('\n\n---\n\n'),
@@ -692,12 +696,7 @@ function buildIntegrationReviewPrompt(
     '',
     'Check for contradictions between Focused Reviews, local optimum combinations that break the whole system, final alignment with higher-level purpose, unresolved assumptions, unnecessary gates/workflows, and safety changes that damage autonomy or CEO effort.',
     '',
-    '## Task',
-    `Task ID: ${input.taskId}`,
-    `Task title: ${input.taskTitle}`,
-    '',
-    'Changed files:',
-    formatBulletList(input.changedFiles),
+    buildReviewSubjectHeader(input),
     '',
     '## Focused Review outcomes',
     ...focusedReviewResults.map(formatFocusedReviewSummary),
@@ -728,6 +727,27 @@ function formatFocusedReviewSummary(result: FocusedReviewResult): string {
     `Summary: ${result.summary}`,
     'Findings:',
     findingLines,
+  ].join('\n')
+}
+
+function buildReviewSubjectHeader(input: StrategicReviewInput): string {
+  if ((input.reviewKind ?? 'task') === 'roadmap') {
+    return [
+      '## Roadmap Under Review',
+      '',
+      `Project ID: ${input.subjectId}`,
+      'Review subject: whole-roadmap (all planned tasks for this project, reviewed together — not an individual task\'s diff)',
+    ].join('\n')
+  }
+
+  return [
+    '## Task',
+    '',
+    `Task ID: ${input.subjectId}`,
+    `Task title: ${input.taskTitle}`,
+    '',
+    'Changed files:',
+    formatBulletList(input.changedFiles),
   ].join('\n')
 }
 
@@ -777,7 +797,8 @@ function buildFocusedOutputContract(): string {
 }
 
 function buildStrategicResult(input: {
-  taskId: string
+  reviewKind: DesignReviewKind
+  subjectId: string
   classification: ReviewLoadClassification
   selectedFocuses: MetaReviewFocus[]
   focusedReviewResults: FocusedReviewResult[]
@@ -794,7 +815,9 @@ function buildStrategicResult(input: {
     ?? requiresCeoApprovalForDecision(input.finalDecision, independentReviewRequired)
 
   return {
-    taskId: input.taskId,
+    reviewKind: input.reviewKind,
+    subjectId: input.subjectId,
+    taskId: input.reviewKind === 'task' ? input.subjectId : undefined,
     reviewLoad: input.classification.reviewLoad,
     reviewLoadReasons: input.classification.reasons,
     selectedFocuses: input.selectedFocuses,
@@ -824,7 +847,8 @@ function requiresCeoApprovalForDecision(
 }
 
 function buildUnavailableStrategicResult(
-  taskId: string,
+  reviewKind: DesignReviewKind,
+  subjectId: string,
   classification: ReviewLoadClassification,
   selectedFocuses: MetaReviewFocus[],
   focusedReviewResults: FocusedReviewResult[],
@@ -836,7 +860,8 @@ function buildUnavailableStrategicResult(
     : [unavailableFocusedResult('strategic_alignment', reason, '')]
 
   return buildStrategicResult({
-    taskId,
+    reviewKind,
+    subjectId,
     classification,
     selectedFocuses,
     focusedReviewResults: nextFocusedReviewResults,
@@ -1033,7 +1058,7 @@ function extractMarkdownTitle(markdown: string): string | null {
 
 function buildKeywords(input: StrategicReviewInput): string[] {
   const source = [
-    input.taskId,
+    input.subjectId,
     input.taskTitle,
     ...input.changedFiles,
   ].join(' ')

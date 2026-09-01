@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { MetaReviewFocus } from '@ai-team/shared'
-import { selectFocuses } from './focusSelector.js'
+import { selectFocuses, selectRoadmapReviewFocuses } from './focusSelector.js'
 
 const VALID_FOCUSES: readonly MetaReviewFocus[] = [
   'strategic_alignment',
@@ -51,6 +51,23 @@ describe('selectFocuses', () => {
     expect(focuses).toContain('operations')
     expect(focuses).toContain('product_ceo_experience')
     expect(focuses).toContain('scope_simplicity')
+    expect(focuses.every((focus) => VALID_FOCUSES.includes(focus))).toBe(true)
+  })
+})
+
+describe('selectRoadmapReviewFocuses', () => {
+  it('returns exactly the fixed roadmap focus set', () => {
+    expect(selectRoadmapReviewFocuses()).toEqual([
+      'strategic_alignment',
+      'scope_simplicity',
+      'architecture_responsibility',
+    ])
+  })
+
+  it('never delegates to the changedFiles-driven selectFocuses paths', () => {
+    const focuses = selectRoadmapReviewFocuses()
+    expect(focuses).not.toContain('safety_recovery')
+    expect(focuses).not.toContain('data_state_integrity')
     expect(focuses.every((focus) => VALID_FOCUSES.includes(focus))).toBe(true)
   })
 })

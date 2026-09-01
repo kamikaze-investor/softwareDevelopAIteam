@@ -2217,6 +2217,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).get(taskId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
     },
+    findLatestBySubjectId(reviewKind, subjectId) {
+      const row = db.prepare(
+        'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+      ).get(reviewKind, subjectId) as any
+      return row ? deserializeDesignReviewEvidence(row) : undefined
+    },
     create(data) {
       const subject = resolveDesignReviewSubject(data)
       const evidence: DesignReviewEvidence = {

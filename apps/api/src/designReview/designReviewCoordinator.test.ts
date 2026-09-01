@@ -1,10 +1,11 @@
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, beforeEach, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
   buildRunnerEnv,
   createAndExecuteDesignReview,
+  createAndExecuteRoadmapReview,
   executeDesignReviewRun,
   recomputeDecision,
   recoverAndRekickAtStartup,
@@ -210,6 +211,7 @@ describe('3. decision authority', () => {
         integrationReviewResult: { decision: 'ALIGNED' },
         finalDecision: 'ALIGNED',
       },
+      'task',
       criticalFiles,
     )
 
@@ -230,6 +232,7 @@ describe('3. decision authority', () => {
         independentReviewResult: { verdict: 'blocking' },
         finalDecision: 'ALIGNED',
       },
+      'task',
       ['specs/00_constitution.md'],
     )
 
@@ -334,5 +337,121 @@ describe('4. bounded recovery', () => {
     const final = storage.designReviewRuns.findById(run.id)!
     expect(['failed', 'queued']).toContain(final.status)
     expect(final.status).not.toBe('running')
+  })
+})
+
+const ROADMAP_FOCUSES = ['strategic_alignment', 'scope_simplicity', 'architecture_responsibility']
+
+function roadmapAlignedRaw(): Record<string, unknown> {
+  return {
+    reviewKind: 'roadmap',
+    subjectId: 'project-roadmap-1',
+    reviewLoad: 'critical',
+    selectedFocuses: ROADMAP_FOCUSES,
+    focusedReviewResults: ROADMAP_FOCUSES.map((focus) => ({ focus, decision: 'ALIGNED' })),
+    integrationReviewResult: { decision: 'ALIGNED' },
+    independentReviewResult: { verdict: 'approved' },
+    finalDecision: 'ALIGNED',
+  }
+}
+
+describe('recomputeDecision with reviewKind=roadmap', () => {
+  it('roadmap固定のcritical負荷とfocus集合を採用する', () => {
+    const outcome = recomputeDecision(roadmapAlignedRaw(), 'roadmap', [])
+
+    expect(outcome.decision).toBe('ALIGNED')
+    expect(outcome.reviewLoad).toBe('critical')
+    expect(outcome.independentReviewRequired).toBe(true)
+    expect(outcome.rejectedReason).toBeUndefined()
+  })
+
+  it('roadmap focus集合と不一致なら採用しない（changedFiles起因のfocus推論を混ぜない）', () => {
+    const raw = roadmapAlignedRaw()
+    raw.focusedReviewResults = (raw.focusedReviewResults as Array<{ focus: string; decision: string }>).slice(0, 2)
+
+    const outcome = recomputeDecision(raw, 'roadmap', ['apps/worker/src/metaReviewer/strategicReview.ts'])
+
+    expect(outcome.decision).not.toBe('ALIGNED')
+    expect(outcome.rejectedReason).toContain('focus set mismatch')
+  })
+
+  it('criticalなのにindependent reviewが欠落していれば採用しない', () => {
+    const raw = roadmapAlignedRaw()
+    delete raw.independentReviewResult
+
+    const outcome = recomputeDecision(raw, 'roadmap', [])
+
+    expect(outcome.decision).not.toBe('ALIGNED')
+    expect(outcome.rejectedReason).toContain('independent review')
+  })
+})
+
+describe('createAndExecuteRoadmapReview', () => {
+  it('roadmap runを起票し、subjectId=projectIdのevidenceを登録する（taskIdは持たない）', async () => {
+    const storage = createStorage()
+    const projectId = 'project-roadmap-1'
+    const reviewMaterial = '# Roadmap Design Review Material'
+
+    const result = await createAndExecuteRoadmapReview(
+      storage,
+      { projectId, reviewMaterial },
+      deps(async () => ({ ok: true, stdout: JSON.stringify(roadmapAlignedRaw()), timedOut: false })),
+    )
+
+    expect(result.status).toBe('evidence_registered')
+    expect(result.decision).toBe('ALIGNED')
+    const evidence = result.evidence!
+    expect(evidence.reviewKind).toBe('roadmap')
+    expect(evidence.subjectId).toBe(projectId)
+    expect(evidence.taskId).toBeUndefined()
+
+    const stored = storage.designReviewEvidence.findLatestBySubjectId('roadmap', projectId)
+    expect(stored).toBeDefined()
+    expect(stored!.id).toBe(evidence.id)
+    expect(stored!.reviewKind).toBe('roadmap')
+    expect(stored!.subjectId).toBe(projectId)
+    expect(stored!.taskId).toBeUndefined()
+  })
+
+  it('runnerへ渡すinputはreviewKind=roadmap・subjectId=projectId・changedFiles=[] であり、taskIdを合成しない', async () => {
+    const storage = createStorage()
+    const projectId = 'project-roadmap-input'
+    const reviewMaterial = '# Roadmap Design Review Material'
+
+    const execute = vi.fn(async (_input: string) => ({ ok: true, stdout: JSON.stringify(roadmapAlignedRaw()), timedOut: false }))
+    await createAndExecuteRoadmapReview(
+      storage,
+      { projectId, reviewMaterial },
+      deps(execute),
+    )
+
+    expect(execute).toHaveBeenCalledTimes(1)
+    const runnerInput = JSON.parse(execute.mock.calls[0]?.[0] as string) as Record<string, unknown>
+    expect(runnerInput.reviewKind).toBe('roadmap')
+    expect(runnerInput.subjectId).toBe(projectId)
+    expect(runnerInput.taskId).toBeUndefined()
+    expect(runnerInput.changedFiles).toEqual([])
+  })
+})
+
+describe('roadmap review claim/fence dedup', () => {
+  it('同一projectIdに対して同時にcreateしてもactive runは1つだけになる（二重起票しない）', () => {
+    const storage = createStorage()
+    const projectId = 'project-roadmap-dedup'
+    const input = {
+      reviewKind: 'roadmap' as const,
+      subjectId: projectId,
+      taskTitle: 'Whole-Roadmap Review',
+      designText: '# Roadmap',
+      designTextHash: 'hash-r',
+      changedFiles: [],
+    }
+
+    const first = storage.designReviewRuns.create(input)
+    const second = storage.designReviewRuns.create(input)
+
+    expect(second.id).toBe(first.id)
+    const queued = storage.designReviewRuns.findQueued()
+    expect(queued.filter((run) => run.subjectId === projectId)).toHaveLength(1)
   })
 })
