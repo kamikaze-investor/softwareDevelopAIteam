@@ -2467,6 +2467,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).get(completedTaskId) as any
       return row ? deserializeTaskContinuation(row) : undefined
     },
+    findPendingByProjectId(projectId) {
+      const rows = db.prepare(
+        "SELECT * FROM task_continuations WHERE project_id = ? AND status = 'pending' ORDER BY created_at ASC"
+      ).all(projectId) as any[]
+      return rows.map(deserializeTaskContinuation)
+    },
     create(data) {
       const continuation: TaskContinuation = {
         ...data,

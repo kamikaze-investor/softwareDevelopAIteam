@@ -43,4 +43,31 @@ describe('git_commit durable continuation route', () => {
       await app.close()
     }
   })
+
+  it('ACKs immediately without invoking ensureTaskContinuation when the next Project is paused', async () => {
+    const [{ jobRoutes }, { getStorage, resetStorage }] = await Promise.all([import('./jobs.js'), import('../storage/index.js')])
+    resetStorage()
+    const storage = getStorage()
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const source = storage.tasks.create({ projectId: project.id, title: 'Source', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 1 })
+    storage.tasks.create({ projectId: project.id, title: 'Next', description: 'Implement next.', status: 'pending', assignee: 'developer_ai', dependencies: [source.id], roadmapActive: true, phase: 2 })
+    const commit = storage.jobs.create({ taskId: source.id, projectId: project.id, agentRole: 'developer_ai', status: 'running', safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' } })
+    // Pausing between commit-start and the Worker's success PATCH is the scenario this
+    // guards: the continuation must not hold the Worker's Outbox event pending while the
+    // Project can stay paused indefinitely.
+    storage.projects.update(project.id, { status: 'paused' })
+    const app = Fastify()
+    app.register(jobRoutes, { prefix: '/api/jobs' })
+    await app.ready()
+    try {
+      const payload = outboxPayload({ status: 'success', exitCode: 0 })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${commit.id}`, payload })
+      const continuation = storage.taskContinuations.findBySourceJobId(commit.id)!
+      expect(res.statusCode).toBe(200)
+      expect(ensureTaskContinuationMock).not.toHaveBeenCalled()
+      expect(continuation.status).toBe('pending')
+    } finally {
+      await app.close()
+    }
+  })
 })

@@ -542,6 +542,18 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (persisted.continuation.status === 'pending') {
+        const nextProject = storage.projects.findById(persisted.continuation.projectId)
+        if (nextProject?.status === 'paused') {
+          // A paused Project can stay paused indefinitely (CEO's call, not a transient
+          // failure). Returning 503 here -- as the running-Project path below does --
+          // would keep this event in the Worker's local Outbox, and pollJobs() skips ALL
+          // queued Job fetching (every Project) for as long as anything is Outbox-pending.
+          // Ack the Worker immediately instead; the continuation itself stays 'pending' in
+          // task_continuations and is retried by routes/projects.ts's running-transition
+          // handler once this Project resumes. No new Gate/Queue/daemon -- same
+          // ensureTaskContinuation() and task_continuations row, just a second call site.
+          return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
+        }
         void ensureTaskContinuation(storage, persisted.continuation.id)
           .catch((error) => req.log.error({ err: error, continuationId: persisted.continuation.id }, 'task continuation failed'))
         // Do not block this PATCH on a Design Review. Non-2xx keeps the Worker Outbox event durable.

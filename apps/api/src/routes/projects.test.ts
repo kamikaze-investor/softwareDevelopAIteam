@@ -327,6 +327,51 @@ describe('Project API', () => {
     })
   })
 
+  it('PATCH /api/projects/:id retries a pending Task continuation left over from a pause', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const project = await createProject(app, { status: 'draft' })
+
+      const startRes = await app.inject({
+        method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' },
+      })
+      expect(startRes.statusCode).toBe(200)
+      const sourceTask = storage.tasks.findByProjectId(project.id)[0]
+      expect(sourceTask).toBeDefined()
+
+      const nextTask = storage.tasks.create({
+        projectId: project.id, title: 'Next', description: 'Implement next.', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 2,
+      })
+      const sourceJob = storage.jobs.create({
+        taskId: sourceTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const continuation = storage.taskContinuations.create({
+        sourceJobId: sourceJob.id, projectId: project.id, completedTaskId: sourceTask.id,
+        nextTaskId: nextTask.id, status: 'pending',
+      })
+
+      const pauseRes = await app.inject({
+        method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' },
+      })
+      expect(pauseRes.statusCode).toBe(200)
+
+      const resumeRes = await app.inject({
+        method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' },
+      })
+      expect(resumeRes.statusCode).toBe(200)
+
+      // ensureTaskContinuation() runs fire-and-forget (not awaited by the route) so the
+      // next Task's Job creation happens asynchronously after the PATCH response.
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(1)
+      expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')
+    })
+  })
+
   it('PATCH /api/projects/:id archives a draft project with no Jobs', async () => {
     await withApp(async (app) => {
       const draft = await createProject(app, { status: 'draft' })
