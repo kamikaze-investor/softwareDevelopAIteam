@@ -1828,6 +1828,27 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       **完了条件**: AI主導の構造化制約抽出（自動確定 vs Gap Analysis経由でCEOへ質問する境界線）、
       deterministic/semantic/個別Task Design Reviewの3経路分離、Task同期より前にRoadmap全体を
       確認する実行順序、の設計がCEOに採択されていること。実装着手はCEO承認後
+
+      **進捗（2026-09-02、Phase 3完了）**: 設計採択済みの3経路分離のうち、deterministic
+      constraint（Phase 1c v2完了時点で既済）に続き、semantic constraint用のWhole-Roadmap
+      Design Reviewを実際の`initializeApprovedProject()`へpre-sync接続した（PR #70
+      `feat/roadmap-review-presync-connection`）。実行順序はRoadmap生成→deterministic
+      validation→Whole-Roadmap Design Review→ALIGNEDの場合のみ`syncRoadmapTasks()`→個別Task
+      Design Review→Implement、を厳密に強制。CONFLICT/UNCERTAIN/provider failure/stale・
+      不一致evidenceは既存`ProjectInitializationError`（422）経路でfail-closed、Task行は
+      1件も永続化されないことをtestで証明（イベントログでreview実行時点のTask数=0・評価保存後に
+      初めてTask数が増えることを確認）。Project Memory書き込みを`syncRoadmapTasks()`より前へ
+      移動（`options.writeProjectMemory`が真の場合のみ、既存の任意フラグは変更なし。
+      strategic_alignment focusがgoal.md/design_philosophy.mdを読める前提を満たすため）。
+      retry時はcheck→execute→re-checkパターン（`initialImplementWorkflow.ts`の既存Task-kind
+      gateと同型）でfresh ALIGNED evidenceを再利用し二重review・二重syncを防止。新Gate/Queue/
+      daemon/evidence store/hash方式は追加していない。apps/api 64ファイル/954テスト成功、
+      apps/worker・Control Repositoryは無変更のためAV-001対象外。
+
+      **残り**: 本項目の3経路分離自体はPhase 1〜3でコードとして完成したが、実運用での動作確認
+      （自然なGoalによるPhase 1c再検証）はまだ行っていない。Roadmap regeneration・Design
+      Review CONFLICT Recoveryは項目7として引き続き別管理・未着手（Phase 1c再検証でWhole-Roadmap
+      Reviewの実戦動作を確認してから着手する方針）。
 <!-- roadmap:id=project-pause-continuation-gap state=done -->
 10. [x] **Project Pause / Continuation-Control Gap — 完了**（2026-09-01登録・同日実装完了。
       `phase 1c v2`のregression evidence保持作業中に発見。Phase 1cへは混ぜていない）。
