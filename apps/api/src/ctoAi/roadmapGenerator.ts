@@ -12,19 +12,20 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
+import { ROADMAP_TASK_CATEGORIES, type RoadmapTaskCategory } from '@ai-team/shared'
 import { z } from 'zod'
 import type { SpecAnalysis } from './specAnalyzer.js'
 
 // ────────────────────────────────────────────────────────────
 // 出力型定義
+//
+// category の型そのものは packages/shared/src/types/project_roadmap.ts が正本
+// （roadmapTaskValidation.ts の検証と共有するため。Meta Reviewer指摘、2026-09-01）。
+// ここではLLM出力の実行時検証に使うZod schemaだけを持ち、`z.ZodType<RoadmapTaskCategory>`で
+// 共有型との一致をコンパイル時に強制する。
 // ────────────────────────────────────────────────────────────
 
-export const GeneratedTaskCategorySchema = z.enum([
-  'implementation',
-  'verification',
-  'control_plane_operation',
-  'other',
-])
+export const GeneratedTaskCategorySchema: z.ZodType<RoadmapTaskCategory> = z.enum(ROADMAP_TASK_CATEGORIES)
 
 export const GeneratedTaskSchema = z.object({
   id: z.string().regex(/^task-\d+$/, 'task-001 形式で指定'),

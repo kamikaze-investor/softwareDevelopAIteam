@@ -1,6 +1,8 @@
-import type { AgentRole, StructuredConstraint } from '@ai-team/shared'
+import type { AgentRole, RoadmapTaskCategory, StructuredConstraint } from '@ai-team/shared'
 
-export type RoadmapSyncTaskCategory = 'implementation' | 'verification' | 'control_plane_operation' | 'other'
+// category の型そのものは packages/shared/src/types/project_roadmap.ts が正本
+// （Roadmap生成のZod schemaとも共有するため。Meta Reviewer指摘、2026-09-01）。
+export type { RoadmapTaskCategory }
 
 export interface RoadmapSyncTaskInput {
   roadmapTaskKey: string
@@ -8,7 +10,7 @@ export interface RoadmapSyncTaskInput {
   description: string
   phase: number
   assignee: AgentRole
-  category: RoadmapSyncTaskCategory
+  category: RoadmapTaskCategory
   dependencies: string[]
   acceptanceCriteria: string[]
   allowedPaths: string[]

@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { validateRoadmapConstraints, validateRoadmapTasks, validateRoadmapPhases, type RoadmapSyncTaskInput, type RoadmapSyncPhaseInput, type RoadmapSyncTaskCategory } from './roadmapTaskValidation'
-import type { StructuredConstraint } from '@ai-team/shared'
+import { validateRoadmapConstraints, validateRoadmapTasks, validateRoadmapPhases, type RoadmapSyncTaskInput, type RoadmapSyncPhaseInput } from './roadmapTaskValidation'
+import type { RoadmapTaskCategory, StructuredConstraint } from '@ai-team/shared'
 
 function task(
   roadmapTaskKey: string,
   dependencies: string[] = [],
   phase = 1,
-  category: RoadmapSyncTaskCategory = 'implementation',
+  category: RoadmapTaskCategory = 'implementation',
 ): RoadmapSyncTaskInput {
   return {
     roadmapTaskKey,
