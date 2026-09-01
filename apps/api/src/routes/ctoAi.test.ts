@@ -287,6 +287,7 @@ const MOCK_ROADMAP = JSON.stringify({
       description: 'shared パッケージに型を追加',
       phase: 1,
       assignee: 'developer_ai',
+      category: 'implementation',
       dependencies: [],
       acceptanceCriteria: ['型エラーがない'],
       allowedPaths: ['packages/shared/src/'],
@@ -303,6 +304,7 @@ type MockRoadmapTask = {
   description?: string
   phase?: number
   assignee?: 'developer_ai'
+  category?: 'implementation' | 'verification' | 'control_plane_operation' | 'other'
   dependencies?: string[]
   acceptanceCriteria?: string[]
   allowedPaths?: string[]
@@ -324,6 +326,7 @@ function mockRoadmapResponse(tasks: MockRoadmapTask[]): string {
       description: `Description ${task.id}`,
       phase: 1,
       assignee: 'developer_ai',
+      category: 'implementation',
       dependencies: [],
       acceptanceCriteria: [],
       allowedPaths: [],
@@ -675,7 +678,7 @@ describe('CTO AI — generate-roadmap API', () => {
     const secondRoadmap = JSON.stringify({
       phases: [{ number: 2, name: '別フェーズ', goal: '別の目的', tasks: ['task-002'] }],
       tasks: [{
-        id: 'task-002', title: 'T2', description: 'D2', phase: 2, assignee: 'developer_ai',
+        id: 'task-002', title: 'T2', description: 'D2', phase: 2, assignee: 'developer_ai', category: 'implementation',
         dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small',
       }],
       totalTasks: 1,
@@ -748,6 +751,149 @@ describe('CTO AI — generate-roadmap API', () => {
     }))
     expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
     expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+  })
+
+  it('POST /api/cto/generate-roadmap returns 422 and creates no tasks when a structured constraint is violated', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const constrainedAnalysis = {
+      ...MOCK_ANALYSIS_OBJ,
+      structuredConstraints: [{
+        kind: 'max_task_count',
+        value: 1,
+        description: 'Only one task may be generated.',
+        sourceText: 'only 1 task',
+      }],
+    }
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: constrainedAnalysis,
+        // 2 tasks violates the max_task_count=1 constraint.
+        mockResponse: mockRoadmapResponse([
+          { id: 'task-001' },
+          { id: 'task-002' },
+        ]),
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(422)
+    expect(JSON.parse(res.body).issues).toContainEqual(expect.objectContaining({
+      code: 'task_count_exceeded',
+    }))
+    // No Task / Job may exist in storage before DB sync (fail-closed).
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(getStorage().jobs.findByTaskId('task-001')).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+    expect(existsSync(path.join(tmpDir, 'tasks', 'task_graph.md'))).toBe(false)
+  })
+
+  it('POST /api/cto/generate-roadmap returns 422 and creates no tasks when a structured constraint is violated', async () => {
+    const constrainedAnalysis = JSON.stringify({
+      ...JSON.parse(MOCK_ANALYSIS),
+      structuredConstraints: [
+        {
+          kind: 'max_task_count',
+          value: 1,
+          description: 'Only one task may be generated.',
+          sourceText: 'only 1 task',
+        },
+      ],
+    })
+    const app = await buildApp()
+    const project = await createProject()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: JSON.parse(constrainedAnalysis),
+        mockResponse: mockRoadmapResponse([
+          { id: 'task-001' },
+          { id: 'task-002' },
+        ]),
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(422)
+    expect(JSON.parse(res.body).issues).toContainEqual(expect.objectContaining({
+      code: 'task_count_exceeded',
+    }))
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(getStorage().jobs.findByTaskId('task-001')).toEqual([])
+    expect(getStorage().jobs.findByTaskId('task-002')).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+    expect(existsSync(path.join(tmpDir, 'tasks', 'task_graph.md'))).toBe(false)
+  })
+
+  it('POST /api/cto/generate-roadmap returns 422 when a control_plane_operation task is generated (unconditional)', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: MOCK_ANALYSIS_OBJ,
+        mockResponse: mockRoadmapResponse([
+          { id: 'task-001', category: 'control_plane_operation' },
+        ]),
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(422)
+    expect(JSON.parse(res.body).issues).toContainEqual(expect.objectContaining({
+      code: 'control_plane_operation_task',
+      roadmapTaskKey: 'task-001',
+    }))
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+  })
+
+  it('POST /api/cto/generate-roadmap returns 422 and creates no tasks when a structured constraint is violated', async () => {
+    const app = await buildApp()
+    const project = await createProject()
+    const constrainedAnalysis = {
+      ...MOCK_ANALYSIS_OBJ,
+      structuredConstraints: [{
+        kind: 'max_task_count',
+        value: 1,
+        description: 'Only one task may be generated.',
+        sourceText: 'only 1 task',
+      }],
+    }
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/generate-roadmap',
+      payload: {
+        projectId: project.id,
+        targetProjectRoot: tmpDir,
+        analysis: constrainedAnalysis,
+        // 2 tasks violates max_task_count=1
+        mockResponse: mockRoadmapResponse([
+          { id: 'task-001' },
+          { id: 'task-002' },
+        ]),
+      },
+    })
+
+    const { getStorage } = await import('../storage/index.js')
+    expect(res.statusCode).toBe(422)
+    expect(JSON.parse(res.body).issues).toContainEqual(expect.objectContaining({
+      code: 'task_count_exceeded',
+    }))
+    expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+    expect(getStorage().jobs.findByTaskId('nonexistent')).toEqual([])
+    expect(existsSync(path.join(tmpDir, 'docs', 'roadmap.md'))).toBe(false)
+    expect(existsSync(path.join(tmpDir, 'tasks', 'task_graph.md'))).toBe(false)
   })
 
   it('POST /api/cto/generate-roadmap keeps the existing 409 for non-running projects', async () => {

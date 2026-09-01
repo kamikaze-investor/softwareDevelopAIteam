@@ -132,7 +132,7 @@ beforeEach(() => {
   process.env.TARGET_ROOT = '/tmp/project-route-test'
   mkdirSync(process.env.TARGET_ROOT, { recursive: true })
   roadmapMocks.generateRoadmap.mockReset()
-  roadmapMocks.generateRoadmap.mockResolvedValue({ phases: [{ number: 1, name: 'Foundation', goal: 'Start', tasks: ['task-001'] }], tasks: [{ id: 'task-001', title: 'Implement', description: 'Implement.', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small' }], totalTasks: 1, estimatedWeeks: 1 })
+  roadmapMocks.generateRoadmap.mockResolvedValue({ phases: [{ number: 1, name: 'Foundation', goal: 'Start', tasks: ['task-001'] }], tasks: [{ id: 'task-001', title: 'Implement', description: 'Implement.', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small' }], totalTasks: 1, estimatedWeeks: 1 })
   designReviewMocks.execute.mockReset()
   designReviewMocks.execute.mockResolvedValue({ ok: true, timedOut: false, stdout: ALIGNED_STDOUT })
   specAnalyzerMocks.analyzeSpec.mockReset()
@@ -193,7 +193,7 @@ describe('Project API', () => {
       getStorage().tasks.syncRoadmapTasks({
         projectId: created.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 1, name: 'First', goal: 'G1' }],
       })
@@ -219,7 +219,7 @@ describe('Project API', () => {
 
       storage.tasks.syncRoadmapTasks({
         projectId: completed.id,
-        tasks: [{ roadmapTaskKey: 'task-001', title: 'Done', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] }],
+        tasks: [{ roadmapTaskKey: 'task-001', title: 'Done', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] }],
         phases: [{ phaseNumber: 1, name: 'Complete', goal: 'g' }],
       })
       const completedTask = storage.tasks.findByProjectId(completed.id)[0]
@@ -236,8 +236,8 @@ describe('Project API', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: incomplete.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'Done', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
-          { roadmapTaskKey: 'task-002', title: 'Pending', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'Done', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'Pending', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 1, name: 'Incomplete', goal: 'g' }],
       })
@@ -268,7 +268,7 @@ describe('Project API', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: created.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 1, name: 'Old phase', goal: 'Old goal' }],
       })
@@ -276,7 +276,7 @@ describe('Project API', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: created.id,
         tasks: [
-          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 2, name: 'New phase', goal: 'New goal' }],
       })

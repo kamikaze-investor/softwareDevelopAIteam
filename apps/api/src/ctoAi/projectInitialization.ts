@@ -1,6 +1,6 @@
 import type { Project } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface.js'
-import { validateRoadmapPhases, validateRoadmapTasks, type RoadmapSyncPhaseInput, type RoadmapSyncTaskInput } from '../storage/roadmapTaskValidation.js'
+import { validateRoadmapConstraints, validateRoadmapPhases, validateRoadmapTasks, type RoadmapSyncPhaseInput, type RoadmapSyncTaskInput } from '../storage/roadmapTaskValidation.js'
 import { writeProjectMemory } from './projectMemoryWriter.js'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow.js'
 import { generateRoadmap, type RoadmapGeneratorOptions } from './roadmapGenerator.js'
@@ -64,6 +64,7 @@ export async function initializeApprovedProject(
     description: task.description,
     phase: task.phase,
     assignee: task.assignee,
+    category: task.category,
     dependencies: task.dependencies,
     acceptanceCriteria: task.acceptanceCriteria,
     allowedPaths: task.allowedPaths,
@@ -73,9 +74,11 @@ export async function initializeApprovedProject(
     name: phase.name,
     goal: phase.goal,
   }))
+  const constraintValidation = validateRoadmapConstraints(roadmapTasks, analysis.structuredConstraints)
   const validationIssues = [
     ...validateRoadmapTasks(roadmapTasks),
     ...validateRoadmapPhases(roadmapPhases, roadmapTasks),
+    ...constraintValidation.issues,
   ]
   if (validationIssues.length > 0) {
     throw new ProjectInitializationError('ロードマップの検証に失敗しました', 422, { issues: validationIssues })
