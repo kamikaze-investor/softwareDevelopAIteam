@@ -45,7 +45,33 @@ describe('parseAnalysisJson', () => {
     expect(result.goal).toContain('個人の思考')
     expect(result.designPhilosophy).toHaveLength(3)
     expect(result.gaps).toHaveLength(1)
+    expect(result.structuredConstraints).toEqual([])
     expect(result.readinessScore).toBe(75)
+  })
+
+  it('explicitly extracted structuredConstraintsを解析できる', () => {
+    const payload = {
+      ...JSON.parse(VALID_ANALYSIS_JSON),
+      structuredConstraints: [
+        {
+          kind: 'allowed_path_prefixes',
+          value: ['docs/'],
+          description: 'Only docs may be changed.',
+          sourceText: 'only touch docs/',
+        },
+      ],
+    }
+
+    const result = parseAnalysisJson(JSON.stringify(payload))
+
+    expect(result.structuredConstraints).toEqual([
+      {
+        kind: 'allowed_path_prefixes',
+        value: ['docs/'],
+        description: 'Only docs may be changed.',
+        sourceText: 'only touch docs/',
+      },
+    ])
   })
 
   it('```json ブロックに包まれたJSONを解析できる', () => {
@@ -80,6 +106,7 @@ describe('analyzeSpec (default model)', () => {
 
     expect(anthropicMocks.create).toHaveBeenCalledWith(expect.objectContaining({
       model: 'claude-haiku-4-5-20251001',
+      system: expect.stringContaining('explicitly and unambiguously'),
     }))
   })
 })

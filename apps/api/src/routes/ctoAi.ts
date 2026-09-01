@@ -9,9 +9,10 @@
 import type { FastifyInstance } from 'fastify'
 import path from 'node:path'
 import { z } from 'zod'
-import { analyzeSpec } from '../ctoAi/specAnalyzer.js'
+import { analyzeSpec, StructuredConstraintSchema } from '../ctoAi/specAnalyzer.js'
 import { writeProjectMemory } from '../ctoAi/projectMemoryWriter.js'
 import { initializeApprovedProject, ProjectInitializationError } from '../ctoAi/projectInitialization.js'
+import { isProjectDefinitionReady } from '../ctoAi/projectDefinitionAnalysis.js'
 import { getStorage } from '../storage'
 import { validateTargetRoot } from '../utils/pathGuard.js'
 
@@ -43,6 +44,7 @@ const GenerateRoadmapBody = z.object({
     targetUsers: z.array(z.string()),
     techStack: z.array(z.string()),
     gaps: z.array(z.any()),
+    structuredConstraints: z.array(StructuredConstraintSchema).default([]),
     requiredExternalServices: z.array(z.any()),
     readinessScore: z.number(),
     readinessReason: z.string(),
@@ -91,20 +93,19 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
       const writeResult = writeProjectMemory(analysis, targetProjectRoot)
 
       // 3. Readiness チェック
-      const isReady = analysis.readinessScore >= 70
-      const mustResolveGaps = analysis.gaps.filter(g => g.severity === 'must_resolve')
+      const readiness = isProjectDefinitionReady(analysis)
 
       return reply.status(201).send({
-        status: isReady ? 'ready' : 'gaps_found',
+        status: readiness.ready ? 'ready' : 'gaps_found',
         readinessScore: analysis.readinessScore,
         readinessReason: analysis.readinessReason,
-        mustResolveGaps,
+        mustResolveGaps: readiness.importantGaps,
         writtenFiles: writeResult.writtenFiles,
         targetDir: writeResult.targetDir,
         analysis,
-        message: isReady
+        message: readiness.ready
           ? `準備完了（スコア: ${analysis.readinessScore}/100）。開発を開始できます。`
-          : `Gap が ${mustResolveGaps.length} 件あります。解決後に再度実行してください。`,
+          : `${readiness.reason}: ${analysis.readinessReason}`,
       })
     } catch (err: any) {
       if (err instanceof ProjectInitializationError) {

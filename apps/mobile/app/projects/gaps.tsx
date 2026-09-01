@@ -32,10 +32,15 @@ function parseGapsParam(raw: string | string[] | undefined): ProjectDefinitionGa
   }
 }
 
+function parseTextParam(raw: string | string[] | undefined): string {
+  return typeof raw === 'string' ? raw : ''
+}
+
 export default function ProjectDefinitionGaps(): ReactElement {
-  const params = useLocalSearchParams<{ id: string; gaps: string }>()
+  const params = useLocalSearchParams<{ id: string; gaps: string; readinessReason?: string }>()
   const projectId = params.id
   const [gaps, setGaps] = useState<ProjectDefinitionGap[]>(() => parseGapsParam(params.gaps))
+  const [readinessReason, setReadinessReason] = useState(() => parseTextParam(params.readinessReason))
   const [answers, setAnswers] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
 
@@ -63,10 +68,12 @@ export default function ProjectDefinitionGaps(): ReactElement {
         const body = (await response.json().catch(() => ({}))) as {
           error?: string
           gaps?: ProjectDefinitionGap[]
+          readinessReason?: string
         }
         if (body.error === 'Project Definition has unresolved gaps' && Array.isArray(body.gaps)) {
           // まだ重要なGapが残っている（回答が不十分だった等）。同じ画面で続けて聞く。
           setGaps(body.gaps)
+          setReadinessReason(body.readinessReason ?? '')
           setAnswers({})
           Alert.alert('まだ確認が必要です', 'いくつかの項目についてもう少し詳しく教えてください。')
           return
@@ -90,6 +97,12 @@ export default function ProjectDefinitionGaps(): ReactElement {
         Goal / Design Philosophyの内容から、開発を始める前に確認しておきたい点が見つかりました。
         分かる範囲で回答してください。空欄のまま送信すると、その項目はスキップされます。
       </Text>
+
+      {readinessReason.length > 0 && (
+        <View style={styles.readinessBox}>
+          <Text style={styles.readinessText}>{readinessReason}</Text>
+        </View>
+      )}
 
       {gaps.map((gap) => (
         <View key={gap.description} style={styles.gapCard}>
@@ -168,6 +181,15 @@ const styles = StyleSheet.create({
   },
   intro: { color: '#aaa', fontSize: 14, lineHeight: 20, marginBottom: 24 },
   multiline: { height: 80, textAlignVertical: 'top' },
+  readinessBox: {
+    backgroundColor: '#171717',
+    borderColor: '#3b82f655',
+    borderRadius: 8,
+    borderWidth: 1,
+    marginBottom: 14,
+    padding: 12,
+  },
+  readinessText: { color: '#d4d4d4', fontSize: 13, lineHeight: 18 },
   title: {
     color: '#fff',
     fontSize: 22,

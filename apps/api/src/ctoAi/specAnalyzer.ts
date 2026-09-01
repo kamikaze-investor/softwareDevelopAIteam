@@ -24,6 +24,20 @@ export const GapSchema = z.object({
   suggestion: z.string(),
 })
 
+export const StructuredConstraintSchema = z.object({
+  kind: z.enum([
+    'max_task_count',
+    'allowed_path_prefixes',
+    'forbidden_new_files',
+    'max_dependency_count',
+    'forbidden_technologies',
+    'other',
+  ]),
+  value: z.union([z.string(), z.number(), z.array(z.string()), z.boolean()]),
+  description: z.string(),
+  sourceText: z.string(),
+})
+
 export const SpecAnalysisSchema = z.object({
   /** プロジェクトの最終目的（1〜3文） */
   goal: z.string(),
@@ -41,6 +55,7 @@ export const SpecAnalysisSchema = z.object({
   techStack: z.array(z.string()),
   /** 不足情報（Gap Analysis） */
   gaps: z.array(GapSchema),
+  structuredConstraints: z.array(StructuredConstraintSchema).default([]),
   /** 外部サービス（APIキーや課金が必要なもの） */
   requiredExternalServices: z.array(z.object({
     name: z.string(),
@@ -55,6 +70,7 @@ export const SpecAnalysisSchema = z.object({
 
 export type SpecAnalysis = z.infer<typeof SpecAnalysisSchema>
 export type Gap = z.infer<typeof GapSchema>
+export type StructuredConstraint = z.infer<typeof StructuredConstraintSchema>
 
 // ────────────────────────────────────────────────────────────
 // プロンプト
@@ -69,6 +85,11 @@ const SYSTEM_PROMPT = `あなたはAI開発チームのCTO AIです。
 ユーザーから仕様書（Markdown）を受け取り、開発チームが開発を開始できる形に構造化します。
 AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先します。
 ${constitutionPrinciplesPrompt}
+Structured constraint extraction:
+- Only populate structuredConstraints for constraints explicitly and unambiguously stated in the spec text, such as "only 1 task", "only touch docs/", "no new files", or "don't add X as a dependency".
+- Do not infer structuredConstraints. Copy the exact source phrase into sourceText.
+- If a constraint-shaped statement is ambiguous or high-impact, do not guess. Emit a normal gaps entry with severity "must_resolve" and ask through the existing Gap flow.
+
 以下のJSON形式のみで回答してください。説明文・マークダウンコードブロック・前置き・後書きは一切不要です。
 
 {
@@ -87,6 +108,14 @@ ${constitutionPrinciplesPrompt}
       "description": "不足している情報",
       "severity": "must_resolve|should_resolve|optional",
       "suggestion": "解決案または仮決定案"
+    }
+  ],
+  "structuredConstraints": [
+    {
+      "kind": "max_task_count|allowed_path_prefixes|forbidden_new_files|max_dependency_count|forbidden_technologies|other",
+      "value": 1,
+      "description": "Only one task may be generated.",
+      "sourceText": "only 1 task"
     }
   ],
   "requiredExternalServices": [

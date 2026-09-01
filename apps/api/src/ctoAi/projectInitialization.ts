@@ -34,6 +34,7 @@ export function buildApprovedProjectAnalysis(project: Project): SpecAnalysis {
     targetUsers: [],
     techStack: [],
     gaps: [],
+    structuredConstraints: [],
     requiredExternalServices: [],
     readinessScore: 100,
     readinessReason: 'Project start has been approved by the existing Project status transition.',
@@ -94,7 +95,9 @@ export async function initializeApprovedProject(
   }
 
   const projectMemory = options.writeProjectMemory
-    ? writeProjectMemory(analysis, targetProjectRoot)
+    ? writeProjectMemory(analysis, targetProjectRoot, {
+        canonicalDefinitionText: options.canonicalDefinitionText,
+      })
     : { writtenFiles: [] as string[] }
   const roadmapFiles = writeRoadmap(roadmap, targetProjectRoot)
   const initialWorkflow = await Promise.all(

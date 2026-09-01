@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { analyzeProjectDefinition, buildSpecTextFromProjectDefinition } from './projectDefinitionAnalysis'
+import {
+  analyzeProjectDefinition,
+  buildSpecTextFromProjectDefinition,
+  computeProjectDefinitionHash,
+  isProjectDefinitionReady,
+} from './projectDefinitionAnalysis'
+import type { SpecAnalysis } from './specAnalyzer'
 
 describe('buildSpecTextFromProjectDefinition', () => {
   it('includes the goal', () => {
@@ -54,11 +60,86 @@ describe('analyzeProjectDefinition', () => {
     expect(importantGaps[0].severity).toBe('must_resolve')
   })
 
+  it('returns the canonical Project Definition text and hash used for analysis', async () => {
+    const result = await analyzeProjectDefinition(
+      {
+        goal: 'Ship the thing',
+        designPhilosophy: ['Small steps'],
+        gapAnswers: { 'Who is the user?': 'Internal operators' },
+      },
+      { mockResponse: mockResponse([]) },
+    )
+
+    expect(result.canonicalDefinitionText).toContain('# Goal')
+    expect(result.canonicalDefinitionText).toContain('Internal operators')
+    expect(result.definitionHash).toBe(computeProjectDefinitionHash(result.canonicalDefinitionText))
+  })
+
   it('returns an empty importantGaps array when there are no must_resolve gaps', async () => {
     const { importantGaps } = await analyzeProjectDefinition(
       { goal: 'G', designPhilosophy: [] },
       { mockResponse: mockResponse([{ severity: 'should_resolve' }, { severity: 'optional' }]) },
     )
     expect(importantGaps).toHaveLength(0)
+  })
+})
+
+describe('computeProjectDefinitionHash', () => {
+  it('uses deterministic sha256 hashing', () => {
+    expect(computeProjectDefinitionHash('abc')).toBe(
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+    )
+  })
+})
+
+describe('isProjectDefinitionReady', () => {
+  function analysis(overrides: Partial<SpecAnalysis> = {}): SpecAnalysis {
+    return {
+      goal: 'G',
+      designPhilosophy: [],
+      mvpScope: { description: 'G', includedFeatures: [], excludedFeatures: [] },
+      targetUsers: [],
+      techStack: [],
+      gaps: [],
+      structuredConstraints: [],
+      requiredExternalServices: [],
+      readinessScore: 80,
+      readinessReason: 'ready enough',
+      ...overrides,
+    }
+  }
+
+  it('blocks when a must_resolve gap exists even if readinessScore is high', () => {
+    const result = isProjectDefinitionReady(analysis({
+      gaps: [{ category: 'business', description: 'missing audience', severity: 'must_resolve', suggestion: 'ask' }],
+      readinessScore: 95,
+    }))
+
+    expect(result.ready).toBe(false)
+    expect(result.reason).toBe('Project Definition has unresolved gaps')
+    expect(result.importantGaps).toHaveLength(1)
+  })
+
+  it('blocks low readiness even without must_resolve gaps, synthesizing one answerable Gap', () => {
+    const result = isProjectDefinitionReady(analysis({
+      readinessScore: 60,
+      readinessReason: 'Scope is too vague.',
+    }))
+
+    expect(result.ready).toBe(false)
+    // The Mobile gaps screen only renders question cards with an input; a bare "not ready"
+    // message with an empty Gap list would be a dead end, so a concrete must_resolve Gap is
+    // synthesized from the readiness reason (independent-review fix, 2026-09-01).
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.importantGaps[0].severity).toBe('must_resolve')
+    expect(result.importantGaps[0].suggestion).toBe('Scope is too vague.')
+    expect(result.readinessReason).toBe('Scope is too vague.')
+  })
+
+  it('accepts analysis with no must_resolve gaps and readinessScore at the threshold', () => {
+    const result = isProjectDefinitionReady(analysis({ readinessScore: 70 }))
+
+    expect(result.ready).toBe(true)
+    expect(result.importantGaps).toEqual([])
   })
 })

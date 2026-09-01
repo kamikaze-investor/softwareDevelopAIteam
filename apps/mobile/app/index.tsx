@@ -97,7 +97,7 @@ export interface ProjectDefinitionGap {
  */
 async function startProject(
   projectId: string,
-): Promise<{ ok: true } | { ok: false; message: string; gaps?: ProjectDefinitionGap[] }> {
+): Promise<{ ok: true } | { ok: false; message: string; gaps?: ProjectDefinitionGap[]; readinessReason?: string }> {
   try {
     const response = await apiFetch(`/api/projects/${projectId}`, {
       body: JSON.stringify({ status: 'running' }),
@@ -110,9 +110,13 @@ async function startProject(
     }
 
     if (response.status === 409) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string; gaps?: ProjectDefinitionGap[] }
+      const body = (await response.json().catch(() => ({}))) as {
+        error?: string
+        gaps?: ProjectDefinitionGap[]
+        readinessReason?: string
+      }
       if (body.error === 'Project Definition has unresolved gaps' && Array.isArray(body.gaps)) {
-        return { ok: false, message: body.error, gaps: body.gaps }
+        return { ok: false, message: body.error, gaps: body.gaps, readinessReason: body.readinessReason }
       }
       return { ok: false, message: body.error ?? 'このProjectを開始できませんでした' }
     }
@@ -285,9 +289,9 @@ function ProjectCard({
     try {
       const result = await startProject(project.id)
       if (!result.ok) {
-        if (result.gaps && result.gaps.length > 0) {
+        if (result.gaps !== undefined) {
           router.push({
-            params: { gaps: JSON.stringify(result.gaps), id: project.id },
+            params: { gaps: JSON.stringify(result.gaps), id: project.id, readinessReason: result.readinessReason ?? '' },
             pathname: '/projects/gaps',
           })
           return

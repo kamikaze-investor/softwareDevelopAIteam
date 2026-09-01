@@ -21,6 +21,14 @@ const MOCK_ANALYSIS: SpecAnalysis = {
   targetUsers: ['開発者ブロガー'],
   techStack: ['Node.js', 'TypeScript', 'SQLite'],
   gaps: [],
+  structuredConstraints: [
+    {
+      kind: 'allowed_path_prefixes',
+      value: ['apps/api/src/'],
+      description: 'Only API source files may be changed.',
+      sourceText: 'only touch apps/api/src/',
+    },
+  ],
   requiredExternalServices: [{ name: 'DEV.to API', purpose: '記事投稿', hasCost: false }],
   readinessScore: 80,
   readinessReason: 'スコープが明確',
@@ -122,11 +130,20 @@ describe('generateRoadmap (default model)', () => {
       content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
     })
 
-    await generateRoadmap(MOCK_ANALYSIS, { apiKey: 'test-api-key' })
+    await generateRoadmap(MOCK_ANALYSIS, {
+      apiKey: 'test-api-key',
+      canonicalDefinitionText: '# Goal\n\nCanonical goal',
+      definitionHash: 'abc123',
+    })
 
     expect(anthropicMocks.create).toHaveBeenCalledWith(expect.objectContaining({
       model: 'claude-haiku-4-5-20251001',
     }))
+    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
+    expect(request?.messages[0]?.content).toContain('Project Definition Hash')
+    expect(request?.messages[0]?.content).toContain('abc123')
+    expect(request?.messages[0]?.content).toContain('Canonical goal')
+    expect(request?.messages[0]?.content).toContain('allowed_path_prefixes')
   })
 })
 

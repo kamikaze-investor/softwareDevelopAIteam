@@ -11,12 +11,14 @@
  *   mvp_scope.md          — MVPスコープ
  *   gap_analysis.md       — 不足情報一覧（要確認事項）
  *   external_services.md  — 外部サービス・課金情報
+ *   project_definition.json — authoritative Project Definition metadata
  */
 
-import { mkdirSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { SpecAnalysis } from './specAnalyzer.js'
 import { commitGeneratedDocs } from './commitGeneratedDocs.js'
+import { buildSpecTextFromProjectDefinition, computeProjectDefinitionHash } from './projectDefinitionAnalysis.js'
 
 export interface ProjectMemoryWriteResult {
   targetDir: string
@@ -24,6 +26,10 @@ export interface ProjectMemoryWriteResult {
   readinessScore: number
   readinessReason: string
   mustResolveGaps: number
+}
+
+export interface ProjectMemoryWriteOptions {
+  canonicalDefinitionText?: string
 }
 
 /**
@@ -35,11 +41,19 @@ export interface ProjectMemoryWriteResult {
 export function writeProjectMemory(
   analysis: SpecAnalysis,
   targetProjectRoot: string,
+  options: ProjectMemoryWriteOptions = {},
 ): ProjectMemoryWriteResult {
   const memoryDir = path.resolve(targetProjectRoot, 'docs', 'project_memory')
   mkdirSync(memoryDir, { recursive: true })
 
   const writtenFiles: string[] = []
+  const generatedAt = new Date().toISOString()
+  const canonicalDefinitionText = options.canonicalDefinitionText ?? buildSpecTextFromProjectDefinition({
+    goal: analysis.goal,
+    designPhilosophy: analysis.designPhilosophy,
+  })
+  const structuredConstraints = canonicalizeStructuredConstraints(analysis.structuredConstraints)
+  const constraintsHash = computeProjectDefinitionHash(JSON.stringify(structuredConstraints))
 
   // ── goal.md ──────────────────────────────────────────────
   const goalContent = `# Goal
@@ -160,6 +174,17 @@ ${analysis.requiredExternalServices.map(s => `## ${s.name}
   writeFile(path.join(memoryDir, 'external_services.md'), servicesContent)
   writtenFiles.push('docs/project_memory/external_services.md')
 
+  const projectDefinitionContent = JSON.stringify({
+    definitionHash: computeProjectDefinitionHash(canonicalDefinitionText),
+    generatedAt,
+    goal: analysis.goal,
+    designPhilosophy: analysis.designPhilosophy,
+    structuredConstraints,
+    constraintsHash,
+  }, null, 2) + '\n'
+  writeFile(path.join(memoryDir, 'project_definition.json'), projectDefinitionContent)
+  writtenFiles.push('docs/project_memory/project_definition.json')
+
   // CTO AIが機械的に生成したドキュメントをその場でcommitする。
   // uncommittedのまま残すと、直後にauto-startされる実装JobのFile Change Guardが
   // これらを誤って「Taskによる変更」として検出し、allowedPaths外として誤blockする。
@@ -180,4 +205,15 @@ ${analysis.requiredExternalServices.map(s => `## ${s.name}
 
 function writeFile(filePath: string, content: string): void {
   writeFileSync(filePath, content, 'utf-8')
+}
+
+function canonicalizeStructuredConstraints(
+  constraints: SpecAnalysis['structuredConstraints'],
+): SpecAnalysis['structuredConstraints'] {
+  return constraints.map((constraint) => ({
+    kind: constraint.kind,
+    value: Array.isArray(constraint.value) ? [...constraint.value] : constraint.value,
+    description: constraint.description,
+    sourceText: constraint.sourceText,
+  }))
 }
