@@ -179,25 +179,32 @@ describe('callGeminiWithFallback', () => {
       expect(mockCallApi).toHaveBeenCalledOnce()
     })
 
-    it('両方 429 → エラーがスローされる + quota-exhausted.json が書かれる', async () => {
+    it('両方 429 → エラーがスローされる + quota-exhausted がログに記録される（Control Repository 保護のため file write はしない）', async () => {
       mockSpawnSync.mockReturnValue(cli429())
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-      const error = await callGeminiWithFallback('test prompt', {
-        preferCli: true,
-        featureName: 'alignment_check',
-      }).catch((e: unknown) => e)
+      try {
+        const error = await callGeminiWithFallback('test prompt', {
+          preferCli: true,
+          featureName: 'alignment_check',
+        }).catch((e: unknown) => e)
 
-      expect(error).toBeInstanceOf(MetaReviewProviderError)
-      expect((error as MetaReviewProviderError).failureClass).toBe('quota')
-      expect((error as Error).message).toContain('quota exhausted')
+        expect(error).toBeInstanceOf(MetaReviewProviderError)
+        expect((error as MetaReviewProviderError).failureClass).toBe('quota')
+        expect((error as Error).message).toContain('quota exhausted')
 
-      expect(mockWriteFileSync).toHaveBeenCalledOnce()
-      const written = JSON.parse(mockWriteFileSync.mock.calls[0][1] as string)
-      expect(written.featureName).toBe('alignment_check')
-      expect(written.apiExhausted).toBe(true)
-      expect(written.cliExhausted).toBe(true)
-      expect(written.exhaustedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
+        // 独立レビュー指摘（Meta Reviewer AI）: /workspace/control は本番で読み取り専用マウントの
+        // ため、quota-exhausted は fs 書き込みではなく allowlist ログとして記録する。
+        expect(mockWriteFileSync).not.toHaveBeenCalled()
+        const logged = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n')
+        expect(logged).toContain('quota-exhausted: featureName=alignment_check')
+        expect(logged).toMatch(/exhaustedAt=\d{4}-\d{2}-\d{2}T/)
+        expect(logged).toContain('apiExhausted=true')
+        expect(logged).toContain('cliExhausted=true')
+      } finally {
+        warnSpy.mockRestore()
+      }
     })
   })
 
@@ -239,20 +246,25 @@ describe('callGeminiWithFallback', () => {
       expect(mockSpawnSync).not.toHaveBeenCalled()
     })
 
-    it('両方 429 → エラーがスローされる + quota-exhausted.json が書かれる', async () => {
+    it('両方 429 → エラーがスローされる + quota-exhausted がログに記録される（file write はしない）', async () => {
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
       mockSpawnSync.mockReturnValue(cli429())
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-      const error = await callGeminiWithFallback('test prompt', {
-        preferCli: false,
-        featureName: 'audit_explanation',
-      }).catch((e: unknown) => e)
+      try {
+        const error = await callGeminiWithFallback('test prompt', {
+          preferCli: false,
+          featureName: 'audit_explanation',
+        }).catch((e: unknown) => e)
 
-      expect(error).toBeInstanceOf(MetaReviewProviderError)
-      expect((error as MetaReviewProviderError).failureClass).toBe('quota')
-      expect(mockWriteFileSync).toHaveBeenCalledOnce()
-      const written = JSON.parse(mockWriteFileSync.mock.calls[0][1] as string)
-      expect(written.featureName).toBe('audit_explanation')
+        expect(error).toBeInstanceOf(MetaReviewProviderError)
+        expect((error as MetaReviewProviderError).failureClass).toBe('quota')
+        expect(mockWriteFileSync).not.toHaveBeenCalled()
+        const logged = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n')
+        expect(logged).toContain('quota-exhausted: featureName=audit_explanation')
+      } finally {
+        warnSpy.mockRestore()
+      }
     })
   })
 
@@ -408,19 +420,26 @@ describe('callGeminiWithFallback', () => {
       expect(mockSpawnSync).toHaveBeenCalledTimes(2)
     })
 
-    it('Gemini・Antigravity/Claude すべて quota 起因で失敗 → 従来どおり例外 + quota-exhausted.json', async () => {
+    it('Gemini・Antigravity/Claude すべて quota 起因で失敗 → 従来どおり例外 + quota-exhausted がログに記録される', async () => {
       mockSpawnSync.mockReturnValue(cli429())
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-      const error = await callGeminiWithFallback('test prompt', {
-        preferCli: false,
-        featureName: 'strategic-meta-review-scope_simplicity',
-      }).catch((e: unknown) => e)
+      try {
+        const error = await callGeminiWithFallback('test prompt', {
+          preferCli: false,
+          featureName: 'strategic-meta-review-scope_simplicity',
+        }).catch((e: unknown) => e)
 
-      expect((error as MetaReviewProviderError).failureClass).toBe('quota')
-      expect(mockWriteFileSync).toHaveBeenCalledOnce()
-      // spawnSync は Gemini-CLI と Claude-CLI の2回（API呼び出しは callGeminiForReview 経由で別モック）
-      expect(mockSpawnSync).toHaveBeenCalledTimes(2)
+        expect((error as MetaReviewProviderError).failureClass).toBe('quota')
+        expect(mockWriteFileSync).not.toHaveBeenCalled()
+        const logged = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n')
+        expect(logged).toContain('quota-exhausted: featureName=strategic-meta-review-scope_simplicity')
+        // spawnSync は Gemini-CLI と Claude-CLI の2回（API呼び出しは callGeminiForReview 経由で別モック）
+        expect(mockSpawnSync).toHaveBeenCalledTimes(2)
+      } finally {
+        warnSpy.mockRestore()
+      }
     })
 
     it('API・CLI は quota 起因で失敗しても、Antigravity/Claude 段が非quota理由で失敗した場合は quota-exhausted.json に記録しない（2026-08-26 独立レビュー round2 修正）', async () => {

@@ -25,7 +25,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { writeFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { callGeminiForReview } from './geminiClient.js'
@@ -38,10 +38,6 @@ const AGY_PATH = process.env.AGY_CLI_PATH ?? 'agy'
 // Gemini（API・CLI 双方）が quota 起因で失敗した場合だけ使う、Antigravity CLI 経由の
 // Claude フォールバックモデル。
 const ANTIGRAVITY_CLAUDE_FALLBACK_MODEL = 'claude-sonnet-4-6'
-
-// REPO_ROOT: geminiRouter.ts は apps/worker/src/metaReviewer/ にあるので 4段上がる
-// __dirname は CJS ビルド時にはファイルのディレクトリを指す
-const ROUTER_ROOT = path.resolve(__dirname, '../../../../')
 
 export interface GeminiRouterOptions {
   /** CLI を優先する場合 true（デフォルト false = API優先） */
@@ -430,11 +426,13 @@ function collectDiagnosticsForCombination(outcomes: Array<CliOutcome | ApiOutcom
 /**
  * 両方失敗時の記録 & エラー。
  *
- * failureClass が 'quota' のときだけ quota-exhausted.json に記録する（従来どおり）。
- * それ以外（transient / auth_or_config / unknown）は quota 起因という誤情報を残さないため
- * 記録しない。呼び出し元（metaReviewFallbackRouter.ts）は failureClass を見て、
- * quota・transient のときだけ Copilot フォールバックを試みる。auth_or_config・unknown は
- * リトライ・フォールバックせず fail-closed で終わる（安全側デフォルト）。
+ * failureClass が 'quota' のときだけ quota-exhausted の詳細（featureName/exhaustedAt/
+ * apiExhausted/cliExhausted）を console.warn に記録する（ファイルへは書かない。本番の
+ * ai-worker コンテナでは repo root が読み取り専用マウントのため）。それ以外
+ * （transient / auth_or_config / unknown）は quota 起因という誤情報を残さないため記録しない。
+ * 呼び出し元（metaReviewFallbackRouter.ts）は failureClass を見て、quota・transient のときだけ
+ * Copilot フォールバックを試みる。auth_or_config・unknown はリトライ・フォールバックせず
+ * fail-closed で終わる（安全側デフォルト）。
  */
 function handleBothExhausted(featureName: string, diagnostics: ProviderFailureDiagnostics[]): never {
   const failureClass = combineFailureClasses(diagnostics)
@@ -447,15 +445,17 @@ function handleBothExhausted(featureName: string, diagnostics: ProviderFailureDi
   }
 
   if (failureClass === 'quota') {
+    // 独立レビュー指摘（Meta Reviewer AI、2026-09-01）: 本番の ai-worker コンテナでは
+    // /workspace/control（= このファイルの ROUTER_ROOT 相当）が読み取り専用でマウントされており、
+    // ここへのファイル書き込みは「AIが自身の Control Repository（檻）を改変しようとする行為」
+    // として最重要原則違反になる。quota-exhausted.json は他コード・監視系のどこからも読まれて
+    // おらず、file write を無くしても実害はないため、同じ内容を allowlist ログとして
+    // console.warn に出す方式に切り替えた（fs 書き込みは行わない）。
     const exhaustedAt = new Date().toISOString()
-    const record = { featureName, exhaustedAt, apiExhausted: true, cliExhausted: true }
-    try {
-      const dataDir = path.join(ROUTER_ROOT, 'data')
-      mkdirSync(dataDir, { recursive: true })
-      writeFileSync(path.join(dataDir, 'quota-exhausted.json'), JSON.stringify(record, null, 2))
-    } catch {
-      // ファイル書き込み失敗はサイレントに無視
-    }
+    console.warn(
+      `[geminiRouter] quota-exhausted: featureName=${featureName} exhaustedAt=${exhaustedAt} ` +
+      `apiExhausted=true cliExhausted=true`,
+    )
     console.warn(
       `\n⛔ [geminiRouter] Gemini API・CLI 両方の quota が枯渇しています。\n` +
       `   機能: ${featureName}\n` +
@@ -478,8 +478,7 @@ function handleBothExhausted(featureName: string, diagnostics: ProviderFailureDi
 
   console.warn(
     `\n⚠️  [geminiRouter] Gemini API・CLI 双方が失敗しましたが、quota起因とは確認できません（分類: ${failureClass}）。\n` +
-    `   機能: ${featureName}\n` +
-    `   quota以外の障害（認証・設定・プログラムエラー等）の可能性があるため、quota-exhausted.json には記録しません。`,
+    `   機能: ${featureName}`,
   )
   throw new MetaReviewProviderError(
     `[geminiRouter] Gemini failed, ${failureClass} (feature: ${featureName})`, failureClass, diagnostics,
