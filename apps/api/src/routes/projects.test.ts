@@ -26,6 +26,20 @@ vi.mock('../designReview/designReviewCoordinator', async (importOriginal) => ({
 vi.mock('../ctoAi/projectMemoryWriter.js', async (importOriginal) => ({ ...(await importOriginal()), writeProjectMemory: () => ({ writtenFiles: [], targetDir: process.env.TARGET_ROOT ?? '/tmp' }) }))
 vi.mock('../ctoAi/roadmapWriter.js', () => ({ writeRoadmap: () => ({ writtenFiles: [], targetDir: process.env.TARGET_ROOT ?? '/tmp' }) }))
 
+function noGapsAnalysis(goal: string, designPhilosophy: string[]) {
+  return {
+    goal, designPhilosophy,
+    mvpScope: { description: goal, includedFeatures: [], excludedFeatures: [] },
+    targetUsers: [], techStack: [], gaps: [], structuredConstraints: [], requiredExternalServices: [],
+    readinessScore: 100, readinessReason: 'no gaps (test default)',
+  }
+}
+const specAnalyzerMocks = vi.hoisted(() => ({ analyzeSpec: vi.fn() }))
+vi.mock('../ctoAi/specAnalyzer.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../ctoAi/specAnalyzer.js')>()),
+  analyzeSpec: specAnalyzerMocks.analyzeSpec,
+}))
+
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { approvalRoutes }, { resetStorage }] = await Promise.all([
     import('./projects.js'),
@@ -117,9 +131,12 @@ beforeEach(() => {
   process.env.DB_PATH = ':memory:'
   process.env.TARGET_ROOT = '/tmp/project-route-test'
   mkdirSync(process.env.TARGET_ROOT, { recursive: true })
+  roadmapMocks.generateRoadmap.mockReset()
   roadmapMocks.generateRoadmap.mockResolvedValue({ phases: [{ number: 1, name: 'Foundation', goal: 'Start', tasks: ['task-001'] }], tasks: [{ id: 'task-001', title: 'Implement', description: 'Implement.', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small' }], totalTasks: 1, estimatedWeeks: 1 })
   designReviewMocks.execute.mockReset()
   designReviewMocks.execute.mockResolvedValue({ ok: true, timedOut: false, stdout: ALIGNED_STDOUT })
+  specAnalyzerMocks.analyzeSpec.mockReset()
+  specAnalyzerMocks.analyzeSpec.mockImplementation(async (specText: string) => noGapsAnalysis(specText, []))
 })
 
 describe('Project API', () => {
@@ -615,6 +632,187 @@ describe('Project API', () => {
 
       expect(res.statusCode).toBe(400)
     })
+  })
+
+  describe('Interactive Project Definition / Readiness (Gap Analysis gating)', () => {
+    it('an important (must_resolve) Gap blocks the running transition and is returned to the caller', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { goal: 'Vague goal' })
+        specAnalyzerMocks.analyzeSpec.mockResolvedValueOnce({
+          ...noGapsAnalysis('Vague goal', []),
+          gaps: [{ category: 'business', description: '対象ユーザーが不明', severity: 'must_resolve', suggestion: '対象ユーザーを教えてください' }],
+        })
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+
+        expect(res.statusCode).toBe(409)
+        const body = parseBody<{ error: string; gaps: Array<{ description: string }> }>(res.body)
+        expect(body.error).toBe('Project Definition has unresolved gaps')
+        expect(body.gaps).toHaveLength(1)
+        expect(body.gaps[0].description).toBe('対象ユーザーが不明')
+
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        expect(storage.projects.findById(project.id)?.status).toBe('draft')
+        expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+      })
+    })
+
+    it('a should_resolve/optional Gap does not block -- the normal fast path is unaffected', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { goal: 'Mostly clear goal' })
+        specAnalyzerMocks.analyzeSpec.mockResolvedValueOnce({
+          ...noGapsAnalysis('Mostly clear goal', []),
+          gaps: [{ category: 'technical', description: 'minor detail', severity: 'should_resolve', suggestion: 's' }],
+        })
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+
+        expect(res.statusCode).toBe(200)
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().tasks.findByProjectId(project.id)).toHaveLength(1)
+      })
+    })
+
+    it('low readiness blocks the running transition and synthesizes an answerable Gap when the model returned none (independent-review fix: the Mobile gaps screen has no input when gaps=[])', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { goal: 'Vague but gapless goal' })
+        specAnalyzerMocks.analyzeSpec.mockResolvedValueOnce({
+          ...noGapsAnalysis('Vague but gapless goal', []),
+          readinessScore: 55,
+          readinessReason: 'Scope is too vague to plan safely.',
+        })
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+
+        expect(res.statusCode).toBe(409)
+        const body = parseBody<{
+          gaps: Array<{ severity: string; description: string; suggestion: string }>
+          readinessReason: string; readinessScore: number; reason: string
+        }>(res.body)
+        // A concrete, answerable Gap is synthesized so the existing gaps screen (which only
+        // renders question cards with an input, not a bare message) always has something the
+        // CEO can respond to -- not an empty, non-actionable dead end.
+        expect(body.gaps).toHaveLength(1)
+        expect(body.gaps[0].severity).toBe('must_resolve')
+        expect(body.gaps[0].suggestion).toBe('Scope is too vague to plan safely.')
+        expect(body.readinessScore).toBe(55)
+        expect(body.readinessReason).toBe('Scope is too vague to plan safely.')
+        expect(body.reason).toContain('readiness score is below 70')
+
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        expect(storage.projects.findById(project.id)?.status).toBe('draft')
+        expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+      })
+    })
+
+    it('answering the Gap and resubmitting proceeds without a second manual Start', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { goal: 'Vague goal' })
+        specAnalyzerMocks.analyzeSpec.mockResolvedValueOnce({
+          ...noGapsAnalysis('Vague goal', []),
+          gaps: [{ category: 'business', description: '対象ユーザーが不明', severity: 'must_resolve', suggestion: 's' }],
+        })
+        const blocked = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+        expect(blocked.statusCode).toBe(409)
+
+        // Second analyzeSpec call (after the CEO answers) reports no more important gaps --
+        // the mock default (noGapsAnalysis) covers this without a second mockResolvedValueOnce.
+        const resolved = await app.inject({
+          method: 'PATCH',
+          url: `/api/projects/${project.id}`,
+          payload: { status: 'running', gapAnswers: { '対象ユーザーが不明': '中小企業の経理担当者' } },
+        })
+
+        expect(resolved.statusCode).toBe(200)
+        expect(specAnalyzerMocks.analyzeSpec.mock.calls[1][0]).toContain('中小企業の経理担当者')
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().tasks.findByProjectId(project.id)).toHaveLength(1)
+      })
+    })
+
+    it('threads canonical Project Definition metadata into Roadmap generation on first Start', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, {
+          goal: 'Plan from this goal',
+          designPhilosophy: ['Keep the first version small'],
+        })
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+
+        expect(res.statusCode).toBe(200)
+        const lastCall = roadmapMocks.generateRoadmap.mock.calls.at(-1)
+        expect(lastCall?.[1]).toEqual(expect.objectContaining({
+          canonicalDefinitionText: expect.stringContaining('Plan from this goal'),
+          definitionHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }))
+        expect(lastCall?.[1]?.canonicalDefinitionText).toContain('Keep the first version small')
+      })
+    })
+
+    it('field edits submitted alongside a blocked Start are still saved (normal creation experience preserved)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { goal: 'Vague goal' })
+        specAnalyzerMocks.analyzeSpec.mockResolvedValueOnce({
+          ...noGapsAnalysis('Vague goal', []),
+          gaps: [{ category: 'business', description: 'gap', severity: 'must_resolve', suggestion: 's' }],
+        })
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/projects/${project.id}`,
+          payload: { status: 'running', goal: 'Refined goal' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        const { getStorage } = await import('../storage/index.js')
+        const stored = getStorage().projects.findById(project.id)
+        expect(stored?.goal).toBe('Refined goal')
+        expect(stored?.status).toBe('draft')
+      })
+    })
+
+    it('resuming an already-initialized Project (hasActiveRoadmap) does not re-run Gap Analysis', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+        specAnalyzerMocks.analyzeSpec.mockClear()
+
+        await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' } })
+        const resumeRes = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+
+        expect(resumeRes.statusCode).toBe(200)
+        expect(specAnalyzerMocks.analyzeSpec).not.toHaveBeenCalled()
+      })
+    })
+
+    it.each([
+      ['goal', { goal: 'Changed goal' }],
+      ['designPhilosophy', { designPhilosophy: ['Changed philosophy'] }],
+    ] as const)(
+      'rejects %s edits once an active Roadmap exists',
+      async (_field, payload) => {
+        await withApp(async (app) => {
+          const project = await createProject(app, {
+            goal: 'Original goal',
+            designPhilosophy: ['Original philosophy'],
+          })
+          const startRes = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
+          expect(startRes.statusCode).toBe(200)
+          specAnalyzerMocks.analyzeSpec.mockClear()
+
+          const res = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload })
+
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ error: string }>(res.body).error).toBe('Project Definition cannot be edited after Roadmap generation')
+          const { getStorage } = await import('../storage/index.js')
+          const stored = getStorage().projects.findById(project.id)
+          expect(stored?.goal).toBe('Original goal')
+          expect(stored?.designPhilosophy).toEqual(['Original philosophy'])
+          expect(specAnalyzerMocks.analyzeSpec).not.toHaveBeenCalled()
+        })
+      },
+    )
   })
 })
 

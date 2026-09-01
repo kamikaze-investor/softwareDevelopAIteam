@@ -1447,8 +1447,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    purpose/categoryを構造化して機械判定可能なものはdeterministic validatorでも拒否し、
    semantic Reviewではcategoryと実際のTask内容の一致を独立確認する
 
-<!-- roadmap:id=interactive-project-definition-readiness state=in_progress -->
-6. [ ] **Interactive Project Definition / Readiness — 詳細設計・実装着手（2026-09-01）**。
+<!-- roadmap:id=interactive-project-definition-readiness state=done -->
+6. [x] **Interactive Project Definition / Readiness — 完了（2026-09-01）**。
       PL交代（Codex→Claude）時のread-only監査で、Codexから「別責務としてRoadmapへ登録した」との
       報告があったが本リポジトリの`tasks/roadmap.md`・`tasks/task_graph.md`・
       `docs/project_memory/`・全commit履歴のいずれにも存在しないことを確認したため、正式に
@@ -1497,14 +1497,45 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       機械判定できない項目だけをMobile上でCEOに質問する。**質問はGapがある時だけ発生し、
       通常は今までと同じ体験のまま完了する**。
 
-      **今回の作業範囲**: 詳細設計・実装に着手する（**Phase 1c（Phase 1c Minimal Production
-      E2E）のscopeへは混ぜない**）。Approval Policy・Architecture・DB migration・認証・
-      secretの変更は行わない。既存`specAnalyzer`/`POST /api/cto/analyze`・Project Memory・
-      Approval・Roadmap同期を再利用し、新しいQueue/daemon/Gateは追加しない。
+      **実装内容（完了、PR #61 `feat/interactive-project-definition`）**:
+      - **Truncation Prevention**: `apps/mobile/app/create.tsx`のGoal欄から`maxLength={500}`を
+        削除。API/DB側はもともと無制限のため、Mobile UI由来の恣意的な上限を撤廃しただけ
+        （名前欄`maxLength={100}`はAPI側の`z.string().max(100)`と一致する非silentな上限のため維持）。
+      - **Gap Analysis接続**: 新規`apps/api/src/ctoAi/projectDefinitionAnalysis.ts`
+        （`analyzeProjectDefinition()`）が、Project.goal/designPhilosophyから既存
+        `specAnalyzer.analyzeSpec()`（Claude Haiku、新しいLLM呼び出し経路は追加していない）を
+        呼び、既存`POST /api/cto/analyze`と同じ基準（`severity: 'must_resolve'`＝重要Gap）で
+        重要Gapだけを抽出する。`routes/projects.ts`の`PATCH /api/projects/:id`が、**Roadmap未生成
+        での初回running遷移の場合だけ**（resumeは対象外）これを呼び、重要Gapが残っていれば
+        `409 { error: 'Project Definition has unresolved gaps', project, gaps }`を返して
+        running化を止める（ただしgoal/designPhilosophy等の編集は保存する）。重要Gapが無ければ
+        （＝通常の大半のケース）今まで通り即座にRoadmap生成へ進む。解析結果（`SpecAnalysis`）は
+        `initializeApprovedProject()`の既存`options.analysis`にそのまま渡され、`gap_analysis.md`
+        等のProject Memoryへ実際の解析内容が反映されるようになった（従来の
+        `buildApprovedProjectAnalysis()`という空gaps・固定readinessScore100のpass-throughは、
+        Roadmap未生成の初回起動時だけ実解析へ置き換わった）。
+      - **Mobile UI**: 新規`apps/mobile/app/projects/gaps.tsx`。「開始」ボタンが409＋gapsを
+        受け取ると自動的にこの画面へ遷移し、Gapごとに自由記述で回答（空欄でスキップ）できる。
+        回答は`gapAnswers`として次のPATCHへ渡され、再解析で重要Gapが解消されていれば
+        そのままrunningへ進む（2回目の「開始」タップは不要）。まだ残っていれば同じ画面で
+        続けて聞く。
+      - **新しいQueue/daemon/Gateは追加していない**。既存`specAnalyzer`・
+        `initializeApprovedProject()`の`options.analysis`・既存Project作成/PATCH APIを
+        そのまま再利用。
 
-      **完了条件**: 通常のProject作成体験を壊さずにGap Analysisを接続できていること、
-      Truncation Preventionが実装されていること、既存テスト（`apps/api`・`apps/mobile`）が
-      regressionなく通過すること。
+      **テスト**: `apps/api`に`projectDefinitionAnalysis.test.ts`（7件）と、
+      `routes/projects.test.ts`へGap Analysis gatingのテスト5件（重要Gapでblockされ
+      running化されないこと／should_resolve・optionalはblockしないこと／回答して再送すると
+      2回目の手動操作なしに進むこと／blockされた際もフィールド編集は保存されること／
+      resume（hasActiveRoadmap）はGap Analysisを再実行しないこと）を追加。`apps/api`全体
+      60ファイル/893テスト成功、`apps/mobile`10テスト成功、両パッケージ`tsc --noEmit`成功。
+
+      **今回の作業範囲**: Approval Policy・Architecture・DB migration・認証・secretの変更は
+      行っていない。**Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜていない。**
+
+      **完了条件（達成）**: 通常のProject作成体験を壊さずGap Analysisを接続、Truncation
+      Preventionを実装、既存テスト（`apps/api`・`apps/mobile`）がregressionなく通過することを
+      確認済み。
 <!-- roadmap:id=design-review-conflict-recovery state=planned -->
 7. [ ] **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が
       本リポジトリに見つからなかったため正式登録し直す）。

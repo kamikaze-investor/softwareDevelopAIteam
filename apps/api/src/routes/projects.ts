@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import type { ProjectRoadmapCompletion, Task } from '@ai-team/shared'
 import { z } from 'zod'
+import { analyzeProjectDefinition } from '../ctoAi/projectDefinitionAnalysis'
 import { initializeApprovedProject } from '../ctoAi/projectInitialization'
 import { retryPendingContinuationsForProject } from '../ctoAi/taskContinuation'
 import { getStorage } from '../storage'
@@ -20,6 +21,13 @@ const UpdateProjectBody = z.object({
   goal: z.string().min(1).optional(),
   designPhilosophy: z.array(z.string()).optional(),
   status: ProjectStatusSchema.optional(),
+  /**
+   * 前回のPATCHが返した重要Gap（`gaps[].description`）への回答。key: description、
+   * value: 回答本文。次回のGap Analysisへ追加文脈として渡すだけで、Gap自体の照合には
+   * 使わない（LLMの言い回しが毎回同じとは限らないため、"回答を渡して再解析し、
+   * 重要Gapが残っていないか"を都度確認する設計にしている）。
+   */
+  gapAnswers: z.record(z.string(), z.string()).optional(),
 }).strict()
 
 function getRoadmapCompletion(tasks: Task[]): ProjectRoadmapCompletion {
@@ -31,6 +39,10 @@ function getRoadmapCompletion(tasks: Task[]): ProjectRoadmapCompletion {
     isComplete: activeTasks.length > 0 && completedTaskCount === activeTasks.length,
     totalTaskCount: activeTasks.length,
   }
+}
+
+function stringArraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 export async function projectRoutes(app: FastifyInstance): Promise<void> {
@@ -122,8 +134,66 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
+    const existingHasActiveRoadmap = storage.tasks
+      .findByProjectId(existing.id)
+      .some((task) => task.roadmapActive)
+    const projectDefinitionChanged =
+      (result.data.goal !== undefined && result.data.goal !== existing.goal)
+      || (result.data.designPhilosophy !== undefined
+        && !stringArraysEqual(result.data.designPhilosophy, existing.designPhilosophy))
+
+    if (existingHasActiveRoadmap && projectDefinitionChanged) {
+      return reply.status(409).send({
+        error: 'Project Definition cannot be edited after Roadmap generation',
+        detail: 'Project Definition cannot be edited once a Roadmap has been generated.',
+      })
+    }
+
+    const { gapAnswers, ...projectFields } = result.data
+
+    // Interactive Project Definition / Readiness: このPATCHが「初回のrunning遷移」（＝
+    // これからRoadmapを新規生成する）場合だけ、既存Gap Analysis（specAnalyzer）を通す。
+    // 通常のProject作成体験（名前・Goal・Design Philosophyを書いてすぐ開始）は変えず、
+    // 重要なGap（severity: 'must_resolve'）がある場合だけここで止めてCEOへ提示する。
+    // 曖昧でない・軽微なGapは自動確定してそのまま進む。resume（既にRoadmapがあるProjectを
+    // 再度runningにする）はこの対象外 -- 生成し直さないため確認の必要がない。
+    // The shared readiness helper also blocks readinessScore < 70 when there
+    // is no concrete must_resolve gap to ask about.
+    const isFreshStart = projectFields.status === 'running'
+      && !existingHasActiveRoadmap
+
+    let freshStartAnalysis: Awaited<ReturnType<typeof analyzeProjectDefinition>>['analysis'] | undefined
+    let freshStartCanonicalDefinitionText: string | undefined
+    let freshStartDefinitionHash: string | undefined
+    if (isFreshStart) {
+      const { analysis, canonicalDefinitionText, definitionHash, readiness } = await analyzeProjectDefinition({
+        goal: projectFields.goal ?? existing.goal,
+        designPhilosophy: projectFields.designPhilosophy ?? existing.designPhilosophy,
+        gapAnswers,
+      })
+
+      if (!readiness.ready) {
+        const { status: _status, ...nonStatusFields } = projectFields
+        const saved = Object.keys(nonStatusFields).length > 0
+          ? storage.projects.update(existing.id, nonStatusFields)
+          : existing
+        return reply.status(409).send({
+          error: 'Project Definition has unresolved gaps',
+          project: saved,
+          gaps: readiness.importantGaps,
+          readinessScore: readiness.readinessScore,
+          readinessReason: readiness.readinessReason,
+          reason: readiness.reason,
+        })
+      }
+
+      freshStartAnalysis = analysis
+      freshStartCanonicalDefinitionText = canonicalDefinitionText
+      freshStartDefinitionHash = definitionHash
+    }
+
     try {
-      const updated = storage.projects.update(req.params.id, result.data)
+      const updated = storage.projects.update(req.params.id, projectFields)
       if (!updated) {
         return reply.status(404).send({ error: 'Project not found' })
       }
@@ -136,6 +206,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (updated.status === 'running' && !hasActiveRoadmap) {
         await initializeApprovedProject(storage, updated, process.env.TARGET_ROOT ?? '/workspace/target', {
           writeProjectMemory: true,
+          analysis: freshStartAnalysis,
+          canonicalDefinitionText: freshStartCanonicalDefinitionText,
+          definitionHash: freshStartDefinitionHash,
         })
       } else if (updated.status === 'running' && hasActiveRoadmap) {
         // Resuming an already-initialized Project: retry any Task continuation left

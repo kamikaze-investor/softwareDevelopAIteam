@@ -7,6 +7,7 @@
 import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type {
+  Gap,
   Job,
   Project,
   ProjectStatus,
@@ -82,8 +83,22 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
   return (await response.json()) as Job[]
 }
 
-/** 409時は本体APIの固定エラー文だけを返す（token・内部情報は含めない） */
-async function startProject(projectId: string): Promise<{ ok: true } | { ok: false; message: string }> {
+/**
+ * `@ai-team/shared`の`Gap`のalias。API/Mobile間で共有すべき型をMobile側で個別宣言していた
+ * ものを、Meta Reviewer指摘（2026-09-01）に沿って共有型のimportへ差し替えた。呼び出し元の
+ * 変更を最小にするため、このモジュール内での名前は維持する。
+ */
+export type ProjectDefinitionGap = Gap
+
+/**
+ * 409時は本体APIの固定エラー文だけを返す（token・内部情報は含めない）。
+ * `Project Definition has unresolved gaps`（Interactive Project Definition / Readiness、
+ * roadmap item interactive-project-definition-readiness）の場合だけ、続けてCEOへ質問できる
+ * よう`gaps`を構造化して返す。それ以外の409（例: 他Project稼働中）は従来通りメッセージのみ。
+ */
+async function startProject(
+  projectId: string,
+): Promise<{ ok: true } | { ok: false; message: string; gaps?: ProjectDefinitionGap[]; readinessReason?: string }> {
   try {
     const response = await apiFetch(`/api/projects/${projectId}`, {
       body: JSON.stringify({ status: 'running' }),
@@ -96,7 +111,14 @@ async function startProject(projectId: string): Promise<{ ok: true } | { ok: fal
     }
 
     if (response.status === 409) {
-      const body = (await response.json().catch(() => ({}))) as { error?: string }
+      const body = (await response.json().catch(() => ({}))) as {
+        error?: string
+        gaps?: ProjectDefinitionGap[]
+        readinessReason?: string
+      }
+      if (body.error === 'Project Definition has unresolved gaps' && Array.isArray(body.gaps)) {
+        return { ok: false, message: body.error, gaps: body.gaps, readinessReason: body.readinessReason }
+      }
       return { ok: false, message: body.error ?? 'このProjectを開始できませんでした' }
     }
 
@@ -268,6 +290,13 @@ function ProjectCard({
     try {
       const result = await startProject(project.id)
       if (!result.ok) {
+        if (result.gaps !== undefined) {
+          router.push({
+            params: { gaps: JSON.stringify(result.gaps), id: project.id, readinessReason: result.readinessReason ?? '' },
+            pathname: '/projects/gaps',
+          })
+          return
+        }
         Alert.alert('開始できません', result.message)
         return
       }

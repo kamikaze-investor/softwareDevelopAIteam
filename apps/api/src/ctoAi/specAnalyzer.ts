@@ -11,17 +11,37 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
+import type { Gap, StructuredConstraint } from '@ai-team/shared'
 import { z } from 'zod'
 
 // ────────────────────────────────────────────────────────────
 // 出力型定義
+//
+// Gap / StructuredConstraint の型そのものは packages/shared/src/types/project.ts が正本
+// （API・Mobile UI・Roadmap生成プロンプトの複数箇所で共有するため。Meta Reviewer指摘、
+// 2026-09-01）。ここではLLM出力の実行時検証に使うZod schemaだけを持ち、
+// `z.ZodType<Gap>` 等で共有型との一致をコンパイル時に強制する。
 // ────────────────────────────────────────────────────────────
 
-export const GapSchema = z.object({
+export const GapSchema: z.ZodType<Gap> = z.object({
   category: z.enum(['business', 'technical', 'data', 'cost', 'legal', 'other']),
   description: z.string(),
   severity: z.enum(['must_resolve', 'should_resolve', 'optional']),
   suggestion: z.string(),
+})
+
+export const StructuredConstraintSchema: z.ZodType<StructuredConstraint> = z.object({
+  kind: z.enum([
+    'max_task_count',
+    'allowed_path_prefixes',
+    'forbidden_new_files',
+    'max_dependency_count',
+    'forbidden_technologies',
+    'other',
+  ]),
+  value: z.union([z.string(), z.number(), z.array(z.string()), z.boolean()]),
+  description: z.string(),
+  sourceText: z.string(),
 })
 
 export const SpecAnalysisSchema = z.object({
@@ -41,6 +61,7 @@ export const SpecAnalysisSchema = z.object({
   techStack: z.array(z.string()),
   /** 不足情報（Gap Analysis） */
   gaps: z.array(GapSchema),
+  structuredConstraints: z.array(StructuredConstraintSchema).default([]),
   /** 外部サービス（APIキーや課金が必要なもの） */
   requiredExternalServices: z.array(z.object({
     name: z.string(),
@@ -54,7 +75,10 @@ export const SpecAnalysisSchema = z.object({
 })
 
 export type SpecAnalysis = z.infer<typeof SpecAnalysisSchema>
-export type Gap = z.infer<typeof GapSchema>
+// Gap / StructuredConstraint は @ai-team/shared からの型のみを使う（このモジュール内での
+// 別名再宣言はしない）。既存の `import type { Gap } from './specAnalyzer.js'` 経由の
+// 呼び出し元がある場合に備え、後方互換のため再export だけしておく。
+export type { Gap, StructuredConstraint }
 
 // ────────────────────────────────────────────────────────────
 // プロンプト
@@ -69,6 +93,11 @@ const SYSTEM_PROMPT = `あなたはAI開発チームのCTO AIです。
 ユーザーから仕様書（Markdown）を受け取り、開発チームが開発を開始できる形に構造化します。
 AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先します。
 ${constitutionPrinciplesPrompt}
+Structured constraint extraction:
+- Only populate structuredConstraints for constraints explicitly and unambiguously stated in the spec text, such as "only 1 task", "only touch docs/", "no new files", or "don't add X as a dependency".
+- Do not infer structuredConstraints. Copy the exact source phrase into sourceText.
+- If a constraint-shaped statement is ambiguous or high-impact, do not guess. Emit a normal gaps entry with severity "must_resolve" and ask through the existing Gap flow.
+
 以下のJSON形式のみで回答してください。説明文・マークダウンコードブロック・前置き・後書きは一切不要です。
 
 {
@@ -87,6 +116,14 @@ ${constitutionPrinciplesPrompt}
       "description": "不足している情報",
       "severity": "must_resolve|should_resolve|optional",
       "suggestion": "解決案または仮決定案"
+    }
+  ],
+  "structuredConstraints": [
+    {
+      "kind": "max_task_count|allowed_path_prefixes|forbidden_new_files|max_dependency_count|forbidden_technologies|other",
+      "value": 1,
+      "description": "Only one task may be generated.",
+      "sourceText": "only 1 task"
     }
   ],
   "requiredExternalServices": [

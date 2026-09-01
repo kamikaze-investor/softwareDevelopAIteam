@@ -79,7 +79,6 @@ export default function CreateProject(): ReactElement {
 
       <Text style={styles.label}>Goal（目的）*</Text>
       <TextInput
-        maxLength={500}
         multiline
         numberOfLines={4}
         onChangeText={setGoal}

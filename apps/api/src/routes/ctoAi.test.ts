@@ -93,10 +93,11 @@ describe('CTO AI API', () => {
     const body = JSON.parse(res.body)
     expect(body.status).toBe('ready')
     expect(body.readinessScore).toBe(85)
-    expect(body.writtenFiles).toHaveLength(5)
+    expect(body.writtenFiles).toHaveLength(6)
     // ファイルが実際に作成されているか
     expect(existsSync(path.join(tmpDir, 'docs', 'project_memory', 'goal.md'))).toBe(true)
     expect(existsSync(path.join(tmpDir, 'docs', 'project_memory', 'gap_analysis.md'))).toBe(true)
+    expect(existsSync(path.join(tmpDir, 'docs', 'project_memory', 'project_definition.json'))).toBe(true)
   })
 
   it('POST /api/cto/analyze — specText が短すぎると 400', async () => {
@@ -142,6 +143,38 @@ describe('CTO AI API', () => {
     const body = JSON.parse(res.body)
     expect(body.status).toBe('gaps_found')
     expect(body.mustResolveGaps).toHaveLength(1)
+  })
+
+  it('POST /api/cto/analyze — readinessScore < 70 はmust_resolveなしでも gaps_found を返す', async () => {
+    const lowScoreMock = JSON.stringify({
+      ...JSON.parse(MOCK_ANALYSIS),
+      readinessScore: 50,
+      readinessReason: 'Scope is too vague.',
+      gaps: [],
+    })
+    const app = await buildApp()
+    const project = await createProject()
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/cto/analyze',
+      payload: {
+        projectId: project.id,
+        specText: VALID_SPEC_TEXT,
+        targetProjectRoot: tmpDir,
+        mockResponse: lowScoreMock,
+      },
+    })
+
+    expect(res.statusCode).toBe(201)
+    const body = JSON.parse(res.body)
+    expect(body.status).toBe('gaps_found')
+    // A synthetic must_resolve Gap is returned so a downstream consumer relying on a concrete
+    // Gap list to prompt for clarification (e.g. the Mobile gaps screen) always has one, even
+    // when the model didn't flag a specific gap itself (independent-review fix, 2026-09-01).
+    expect(body.mustResolveGaps).toHaveLength(1)
+    expect(body.mustResolveGaps[0].severity).toBe('must_resolve')
+    expect(body.readinessReason).toBe('Scope is too vague.')
+    expect(body.message).toContain('Scope is too vague.')
   })
 
   it('POST /api/cto/analyze — targetProjectRoot がない場合 400', async () => {

@@ -104,6 +104,8 @@ export interface RoadmapGeneratorOptions {
   apiKey?: string
   model?: string
   mockResponse?: string
+  canonicalDefinitionText?: string
+  definitionHash?: string
 }
 
 export async function generateRoadmap(
@@ -126,6 +128,8 @@ export async function generateRoadmap(
   const projectSummary = `
 # Project Summary
 
+${options.definitionHash ? `## Project Definition Hash\n${options.definitionHash}\n` : ''}
+${options.canonicalDefinitionText ? `## Canonical Project Definition\n${options.canonicalDefinitionText}\n` : ''}
 ## Goal
 ${analysis.goal}
 
@@ -143,6 +147,9 @@ ${analysis.mvpScope.excludedFeatures.map(f => `- ${f}`).join('\n')}
 
 ## Tech Stack
 ${analysis.techStack.map(t => `- ${t}`).join('\n')}
+
+## Structured Constraints
+${JSON.stringify(analysis.structuredConstraints, null, 2)}
 `.trim()
 
   const message = await client.messages.create({
