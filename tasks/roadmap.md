@@ -1427,11 +1427,32 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       分析→Improvement Proposal生成→CEO週次提出、のend-to-endが最小構成で機能すること。既存
       Telemetry/Team Health/Self Diagnosis/Improvement Planner/CEO Proposal/Experiment/
       Evolutionの責務定義（本ファイル944-1030行）と重複する独立実装を作っていないこと
-<!-- roadmap:id=interactive-project-definition-readiness state=planned -->
-6. [ ] **Interactive Project Definition / Readiness**（2026-09-01登録。PL交代（Codex→Claude）時の
-      read-only監査で、Codexから「別責務としてRoadmapへ登録した」との報告があったが本リポジトリの
-      `tasks/roadmap.md`・`tasks/task_graph.md`・`docs/project_memory/`・全commit履歴のいずれにも
-      存在しないことを確認したため、正式に本項目として登録し直す）。
+**統合設計確定（2026-09-01、CEO承認。項目6・7・8・9の関係を以下に固定する）**:
+Natural-language Project Definition → AI structured constraints → Readiness → Roadmap
+generation → deterministic constraint validation → whole-roadmap independent Design
+Review → Task sync → individual Task Design Review → Implement、の順序で統合する。
+項目6はstage 1-3、項目9はstage 4-6（項目8はstage 6が毎回自動判定する既定ルールの1つとして
+内包し、専用Gateを新設しない）、stage 7-9は既存のまま変更しない。**着手順序: 項目6 →
+項目9+8統合 → Phase 1c自然文Goalでの再検証 → 項目7**（項目7はDesign Reviewの判定自体が
+信頼できるようになってから着手する）。
+
+CEOレビューで以下3点を各項目の設計へ反映する（詳細は各項目内に記載）:
+1. 項目6: 「Mobile操作は無変更」ではなく、通常のProject作成体験は維持しつつ、重要なGapが
+   ある場合のみ既存Gap Analysisの質問・回答をMobileフローへ接続する
+2. 項目9: authoritative Project Definition / Structured Constraints / Roadmap /
+   Whole-Roadmap Review evidenceをversion/hashで結び、Review後に定義またはRoadmapが
+   変わった場合は古いReview evidenceを再利用できないようにする（新Gateではなく既存の
+   Review freshnessの延長として扱う）
+3. 項目8/9: Control-plane SeparationはWhole-Roadmap Reviewだけに依存せず、Task
+   purpose/categoryを構造化して機械判定可能なものはdeterministic validatorでも拒否し、
+   semantic Reviewではcategoryと実際のTask内容の一致を独立確認する
+
+<!-- roadmap:id=interactive-project-definition-readiness state=in_progress -->
+6. [ ] **Interactive Project Definition / Readiness — 詳細設計・実装着手（2026-09-01）**。
+      PL交代（Codex→Claude）時のread-only監査で、Codexから「別責務としてRoadmapへ登録した」との
+      報告があったが本リポジトリの`tasks/roadmap.md`・`tasks/task_graph.md`・
+      `docs/project_memory/`・全commit履歴のいずれにも存在しないことを確認したため、正式に
+      本項目として登録し直した。
 
       **背景**: authoritative spec `specs/09_project_creation_flow.md` に、Project作成→
       Specification Analysis→Gap Analysis→不足情報をユーザーへ質問→Readiness Review→CEO Approval→
@@ -1468,12 +1489,22 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       structured Project DefinitionをProject Memoryへ保持する／Roadmap生成・Design Reviewが
       同一の完全なauthoritative definitionを参照すること。
 
-      **今回の作業範囲（禁止事項）**: 今回はroadmap登録のみ。詳細設計・実装・API変更・Mobile UI変更は
-      行わない。**Phase 1c（Phase 1c Minimal Production E2E）のscopeへは混ぜない。**
+      **Mobile UX方針（2026-09-01、CEOフィードバック反映。「Mobile操作は無変更」ではない）**:
+      通常のProject作成体験（名前・Goal・Design Philosophyを入力してすぐ開始できる、という
+      現行のシンプルさ）はそのまま維持する。**重要なGapがある場合だけ**、既存Gap Analysis
+      （`specAnalyzer`）の質問・回答をMobileフローへ接続する。機械的に確定できる項目や
+      軽微なGapはCEOに聞かず自動確定し、Goal/Design Philosophyの根幹に関わる項目・曖昧で
+      機械判定できない項目だけをMobile上でCEOに質問する。**質問はGapがある時だけ発生し、
+      通常は今までと同じ体験のまま完了する**。
 
-      **完了条件**: 上記の統合方針（既存`specAnalyzer`をどう通常導線から呼ぶか、Gap質問のUI、
-      Readiness計算の固定`100`撤廃方針、Truncation Prevention）がCEOに採択されていること。
-      実装着手はCEO承認後
+      **今回の作業範囲**: 詳細設計・実装に着手する（**Phase 1c（Phase 1c Minimal Production
+      E2E）のscopeへは混ぜない**）。Approval Policy・Architecture・DB migration・認証・
+      secretの変更は行わない。既存`specAnalyzer`/`POST /api/cto/analyze`・Project Memory・
+      Approval・Roadmap同期を再利用し、新しいQueue/daemon/Gateは追加しない。
+
+      **完了条件**: 通常のProject作成体験を壊さずにGap Analysisを接続できていること、
+      Truncation Preventionが実装されていること、既存テスト（`apps/api`・`apps/mobile`）が
+      regressionなく通過すること。
 <!-- roadmap:id=design-review-conflict-recovery state=planned -->
 7. [ ] **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が
       本リポジトリに見つからなかったため正式登録し直す）。
@@ -1621,6 +1652,23 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
          **Task同期（`syncRoadmapTasks()`）より前**で完結させ、不正Roadmapからは
          そもそもTask/Jobが1件も生成されない構造を優先する（今回のように、後から気づいて
          Projectごと保持・破棄するのではなく、生成された時点でfail-closedにする）。
+      4. **Evidence freshness（2026-09-01 CEOフィードバック追加。新Gateにしない）**:
+         authoritative Project Definition・Structured Constraints・Roadmap・
+         Whole-Roadmap Review evidenceをversion/hashで結ぶ。Design Review後にProject
+         DefinitionまたはRoadmapが変わった場合、古いReview evidenceは再利用できないように
+         する。これは新しいGateではなく、既存の`checkImplementJobDesignReviewEvidence()`
+         （`design_text_hash`が現在の`aiCliPrompt`と一致しない限りevidenceを再利用させない、
+         既存Design Review Gateの核心ロジック）と同じ**freshness/hash一致の考え方を
+         Roadmapレベルへ拡張したもの**として位置づける。新しいevidence保存機構は増やさない。
+      5. **Control-plane Separation（項目8）の二重検証化（2026-09-01 CEOフィードバック追加）**:
+         項目8をWhole-Roadmap Review（semantic）だけに依存させない。Task purpose/category
+         （例:「実装」「検証」「control-plane操作」等）を構造化・機械判定可能な形でRoadmap
+         生成時に付与し、**deterministic validator側でも**「Design Review実行・Approval
+         取得・Branch/commit・PR/CI・Commit Gate実行に該当するcategoryのTaskを拒否」を
+         機械的に強制する（4と同じ既存validatorパターンの拡張）。semantic Design Review側は
+         **categoryと実際のTask内容（description等）が一致しているか**を独立確認する
+         （category詐称・categoryはdeterministic validatorを通ったが実態が異なる、を検出する
+         役割）。1つの判定に両方が依存しない二重検証にする。
 
       **既存項目との関係（重複実装にしないこと）**: `roadmap-task-control-plane-separation`
       （項目8）は、本項目が一般化する制約体系の**具体例の1つ**（「Design Review/Approval/PR/CI/
@@ -1700,6 +1748,24 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
       **完了条件（達成）**: `paused`が新規継続Jobの生成を正しく止め、`archived`は従来どおり
       終了状態のまま維持されていることをテストで確認済み。新しいGate/Queue/daemonなし。
+
+      **追記（2026-09-01、CEO指示によるOutbox retry-limit/dead-letter確認で発覚・修正済み、
+      PR #56 `fix/paused-continuation-outbox-starvation`、コミット`c833c44`）**: データ消失は
+      なかった（`apps/worker/src/outbox/outboxStore.ts`にretry上限・dead-letterはなく無期限保持）。
+      しかしより深刻な可用性の問題を発見した — `apps/worker/src/index.ts`の`pollJobs()`は
+      `outboxStore.hasPending()`が真の間、**全Project分のqueued Job取得を毎poll cycleスキップ**し、
+      3周期連続でCRITICALアラートを発報する。本項目の実装（pause中は`retryable: true`）は、
+      `routes/jobs.ts`の既存503応答（「Non-2xx keeps the Worker Outbox event durable」という
+      設計）と組み合わさると、**1つのProjectをpauseしている間、単一production Workerが他の
+      全Projectのjob取得を止めてしまう**という副作用を持っていた（元々この503設計は秒〜分単位の
+      一時的技術障害向けで、CEOが任意の長さpauseできる状態を想定していなかった）。
+      **修正**: `routes/jobs.ts`はcontinuation対象Projectが`paused`の場合だけWorkerへ即座に
+      2xxを返す（`ensureTaskContinuation()`は呼ばず`task_continuations`は`pending`のまま）。
+      `routes/projects.ts`のPATCH running遷移時に`taskContinuations.findPendingByProjectId()`
+      （新規クエリ）でpending中の継続を見つけ、既存の`ensureTaskContinuation()`で再試行する。
+      `archived`は既存通り503→数poll cycleで自己解決する挙動のまま無変更。
+      新しいGate/Queue/daemonなし、`apps/worker/src/index.ts`（CONTROL REPOSITORY保護対象）も
+      無変更。テスト2件追加、`apps/api`全体59ファイル/879テスト成功。
 
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
