@@ -17,7 +17,8 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { readFileSync, existsSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { readFileSync, existsSync, unlinkSync } from 'node:fs'
 import path from 'node:path'
 import type {
   AiCliRequest,
@@ -62,6 +63,39 @@ function resolvePnpmPath(): string {
   return 'pnpm'  // 見つからなければ 'pnpm' のまま（catch で non-fatal）
 }
 
+function buildCodexOutputLastMessagePath(request: AiCliRequest): string | undefined {
+  if (request.provider !== 'codex' || request.expectJson !== true) return undefined
+
+  const safeTaskId = request.taskId
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .slice(0, 64) || 'task'
+
+  return path.join(
+    request.workingDir,
+    `.codex-last-message-${safeTaskId}-${process.pid}-${Date.now()}-${randomUUID()}.json`,
+  )
+}
+
+function readCodexOutputLastMessage(filePath: string | undefined): Record<string, unknown> | undefined {
+  if (filePath === undefined || !existsSync(filePath)) return undefined
+
+  try {
+    return tryParseJson(readFileSync(filePath, 'utf-8'))
+  } catch {
+    return undefined
+  }
+}
+
+function cleanupCodexOutputLastMessage(filePath: string | undefined): void {
+  if (filePath === undefined) return
+
+  try {
+    if (existsSync(filePath)) unlinkSync(filePath)
+  } catch {
+    // cleanup failure is non-fatal; changed-file guards still inspect the worktree later.
+  }
+}
+
 // CLAUDE.md / AGENTS.md のパス（コンテナ内 = /workspace/control、ローカル開発 = プロジェクトルート）
 const CLAUDE_MD_PATHS = [
   '/workspace/control/CLAUDE.md',
@@ -81,6 +115,10 @@ const AGENTS_MD_PATHS = [
 
 export interface IAiCliAdapter {
   run(request: AiCliRequest): Promise<AiCliResult>
+}
+
+interface CodexLastMessageRequest extends AiCliRequest {
+  codexOutputLastMessagePath?: string
 }
 
 // ────────────────────────────────────────────────────────────
@@ -181,7 +219,11 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     //   CommandKind Guard との統合は task-009（Worker Job実行エンジン）で設計する。
     //
     // finalPrompt = H-1注入済みプロンプト（Codexの場合のみCLAUDE.md先頭付与）
-    const argv = this.buildArgv({ ...request, prompt: finalPrompt })
+    const codexOutputLastMessagePath = buildCodexOutputLastMessagePath(request)
+    const argvRequest: CodexLastMessageRequest = codexOutputLastMessagePath
+      ? { ...request, prompt: finalPrompt, codexOutputLastMessagePath }
+      : { ...request, prompt: finalPrompt }
+    const argv = this.buildArgv(argvRequest)
     // task-024: request > config > デフォルト(5分) の優先順位でタイムアウト決定
     const timeout = request.timeoutMs ?? this.config.defaultTimeoutMs
     const { exe, prefixArgs } = this.resolveExe()
@@ -193,6 +235,7 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     let isTimeoutError = false
     let isApiError = false
     let providerFailureKind: AiCliResult['providerFailureKind']
+    let parsedOutputFromLastMessage: Record<string, unknown> | undefined
 
     try {
       stdout = execFileSync(exe, [...prefixArgs, ...argv], {
@@ -214,6 +257,9 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       // task-024: タイムアウト・APIエラーを分類
       isTimeoutError = err.signal === 'SIGTERM' || (err.code === 'ETIMEDOUT') || stderr.includes('ETIMEDOUT')
       isApiError = exitCode >= 500 || stderr.includes('API Error') || stderr.includes('5xx')
+    } finally {
+      parsedOutputFromLastMessage = readCodexOutputLastMessage(codexOutputLastMessagePath)
+      cleanupCodexOutputLastMessage(codexOutputLastMessagePath)
     }
 
     // task-024: フォールバックポリシーが設定されていて条件を満たす場合は再実行
@@ -252,8 +298,7 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     let retryCount = 0
     if (request.expectJson) {
       const maxRetries = this.config.maxRetries
-      let parseTarget = stdout
-      parsedOutput = tryParseJson(parseTarget)
+      parsedOutput = parsedOutputFromLastMessage ?? tryParseJson(stdout)
 
       while (parsedOutput === undefined && retryCount < maxRetries) {
         retryCount++

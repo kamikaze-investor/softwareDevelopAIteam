@@ -10,9 +10,60 @@
  *   - isPromptSafe() のパターンマッチ
  */
 
-import { describe, it, expect } from 'vitest'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { createAiCliAdapter } from './factory.js'
+
+const {
+  execFileSyncMock,
+  buildWorktreeManifestMock,
+  saveJobLogsMock,
+} = vi.hoisted(() => ({
+  execFileSyncMock: vi.fn(),
+  buildWorktreeManifestMock: vi.fn(),
+  saveJobLogsMock: vi.fn(),
+}))
+
+vi.mock('node:child_process', () => ({
+  execFileSync: execFileSyncMock,
+}))
+
+vi.mock('../guards/changeManifest.js', () => ({
+  buildWorktreeManifest: buildWorktreeManifestMock,
+}))
+
+vi.mock('../jobLogger.js', () => ({
+  saveJobLogs: saveJobLogsMock,
+}))
+
+vi.mock('../utils/pathUtils.js', async () => {
+  const actual = await vi.importActual<typeof import('../utils/pathUtils.js')>('../utils/pathUtils.js')
+  return {
+    ...actual,
+    isInsideTargetRoot: (workingDir: string): boolean => {
+      const cwd = process.cwd()
+      return (
+        actual.isInsideTargetRoot(workingDir) ||
+        workingDir === cwd ||
+        workingDir.startsWith(`${cwd}\\`) ||
+        workingDir.startsWith(`${cwd}/`)
+      )
+    },
+  }
+})
+
+beforeEach(() => {
+  execFileSyncMock.mockReset()
+  buildWorktreeManifestMock.mockReset()
+  saveJobLogsMock.mockReset()
+  buildWorktreeManifestMock.mockReturnValue({ changes: [], paths: [] })
+  saveJobLogsMock.mockReturnValue({
+    stdoutPath: 'stdout.log',
+    stderrPath: 'stderr.log',
+  })
+})
 
 // ────────────────────────────────────────────────────────────
 // isPromptSafe() のテスト
@@ -235,6 +286,97 @@ describe('CodexAdapter — stdin prompt', () => {
     })
 
     expect(argv).not.toContain('--model')
+  })
+})
+
+describe('CodexAdapter --output-last-message structured output', () => {
+  let testDir: string | undefined
+
+  afterEach(() => {
+    if (testDir !== undefined) {
+      rmSync(testDir, { recursive: true, force: true })
+      testDir = undefined
+    }
+  })
+
+  function makeWorkingDir(): string {
+    testDir = mkdtempSync(path.join(process.cwd(), '.adapter-test-codex-'))
+    return testDir
+  }
+
+  function makeRequest(workingDir: string): AiCliRequest {
+    return {
+      taskId: 'test-codex-last-message',
+      provider: 'codex',
+      workingDir,
+      prompt: 'Return JSON only.',
+      contextFiles: [],
+      mode: 'review',
+      expectJson: true,
+      injectClaudeMd: false,
+      postLint: false,
+    }
+  }
+
+  it('uses last-message JSON and skips stdout retry when parsing succeeds', async () => {
+    const workingDir = makeWorkingDir()
+    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+
+    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
+      const args = argv ?? []
+      const outputFlagIndex = args.indexOf('--output-last-message')
+      expect(outputFlagIndex).toBeGreaterThanOrEqual(0)
+      const outputPath = args[outputFlagIndex + 1]
+      expect(outputPath).toBeTruthy()
+      if (outputPath === undefined) throw new Error('missing --output-last-message path')
+      writeFileSync(outputPath, '{"ok":true,"source":"last-message"}', 'utf-8')
+      return 'not json'
+    })
+
+    const result = await adapter.run(makeRequest(workingDir))
+
+    expect(result.parsedOutput).toEqual({ ok: true, source: 'last-message' })
+    expect(result.blocked).toBe(false)
+    expect(result.retryCount).toBe(0)
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1)
+    const initialArgv = execFileSyncMock.mock.calls[0]?.[1]
+    expect(initialArgv).toContain('--output-last-message')
+    const outputPath = initialArgv?.[initialArgv.indexOf('--output-last-message') + 1]
+    expect(outputPath).toBeTruthy()
+    if (outputPath === undefined) throw new Error('missing --output-last-message path')
+    expect(existsSync(outputPath)).toBe(false)
+    expect(buildWorktreeManifestMock).toHaveBeenCalledWith(workingDir)
+  })
+
+  it('falls back to stdout retry when last-message parsing fails', async () => {
+    const workingDir = makeWorkingDir()
+    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+    let firstOutputPath: string | undefined
+
+    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
+      const args = argv ?? []
+      const outputFlagIndex = args.indexOf('--output-last-message')
+      if (outputFlagIndex >= 0) {
+        const outputPath = args[outputFlagIndex + 1]
+        if (outputPath === undefined) throw new Error('missing --output-last-message path')
+        firstOutputPath = outputPath
+        writeFileSync(outputPath, 'not json', 'utf-8')
+        return 'still not json'
+      }
+      return '{"ok":true,"source":"stdout-retry"}'
+    })
+
+    const result = await adapter.run(makeRequest(workingDir))
+
+    expect(result.parsedOutput).toEqual({ ok: true, source: 'stdout-retry' })
+    expect(result.blocked).toBe(false)
+    expect(result.retryCount).toBe(1)
+    expect(execFileSyncMock).toHaveBeenCalledTimes(2)
+    expect(execFileSyncMock.mock.calls[0]?.[1]).toContain('--output-last-message')
+    expect(execFileSyncMock.mock.calls[1]?.[1]).not.toContain('--output-last-message')
+    expect(firstOutputPath).toBeTruthy()
+    if (firstOutputPath === undefined) throw new Error('missing --output-last-message path')
+    expect(existsSync(firstOutputPath)).toBe(false)
   })
 })
 
