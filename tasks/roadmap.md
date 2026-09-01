@@ -1497,7 +1497,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       機械判定できない項目だけをMobile上でCEOに質問する。**質問はGapがある時だけ発生し、
       通常は今までと同じ体験のまま完了する**。
 
-      **実装内容（完了、PR #60 `feat/interactive-project-definition`）**:
+      **実装内容（完了、PR #61 `feat/interactive-project-definition`）**:
       - **Truncation Prevention**: `apps/mobile/app/create.tsx`のGoal欄から`maxLength={500}`を
         削除。API/DB側はもともと無制限のため、Mobile UI由来の恣意的な上限を撤廃しただけ
         （名前欄`maxLength={100}`はAPI側の`z.string().max(100)`と一致する非silentな上限のため維持）。
