@@ -15,6 +15,302 @@ type TaskCreateInput = Omit<Task, 'id' | 'createdAt' | 'updatedAt' | 'roadmapAct
   roadmapActive?: boolean
 }
 
+type LegacyDesignReviewEvidenceRow = {
+  id: string
+  task_id: string
+  design_text_hash: string
+  review_load: string
+  decision: string
+  independent_review_required: number
+  independent_review_verdict: string | null
+  created_at: string
+}
+
+type LegacyDesignReviewRunRow = {
+  id: string
+  task_id: string
+  design_text: string
+  design_text_hash: string
+  task_title: string
+  changed_files: string
+  status: string
+  attempt_count: number
+  claim_token: string | null
+  result_json: string | null
+  error: string | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+}
+
+type DesignReviewSubjectRow = {
+  id: string
+  review_kind: string
+  subject_id: string
+  task_id: string | null
+}
+
+function readDatabase<T>(dbPath: string, read: (db: Database.Database) => T): T {
+  const db = new Database(dbPath, { readonly: true })
+  try {
+    return read(db)
+  } finally {
+    db.close()
+  }
+}
+
+function readLegacyEvidenceRows(db: Database.Database): LegacyDesignReviewEvidenceRow[] {
+  return db.prepare(`
+    SELECT id, task_id, design_text_hash, review_load, decision,
+           independent_review_required, independent_review_verdict, created_at
+    FROM design_review_evidence
+    ORDER BY id
+  `).all() as LegacyDesignReviewEvidenceRow[]
+}
+
+function readLegacyRunRows(db: Database.Database): LegacyDesignReviewRunRow[] {
+  return db.prepare(`
+    SELECT id, task_id, design_text, design_text_hash, task_title, changed_files,
+           status, attempt_count, claim_token, result_json, error, created_at,
+           started_at, completed_at
+    FROM design_review_runs
+    ORDER BY id
+  `).all() as LegacyDesignReviewRunRow[]
+}
+
+function readDesignReviewSubjectRows(db: Database.Database, table: 'design_review_evidence' | 'design_review_runs'): DesignReviewSubjectRow[] {
+  return db.prepare(`
+    SELECT id, review_kind, subject_id, task_id
+    FROM ${table}
+    ORDER BY id
+  `).all() as DesignReviewSubjectRow[]
+}
+
+function createLegacyDesignReviewDatabase(dbPath: string): {
+  evidenceRows: LegacyDesignReviewEvidenceRow[]
+  runRows: LegacyDesignReviewRunRow[]
+} {
+  const db = new Database(dbPath)
+  try {
+    db.exec(CREATE_TABLES)
+    db.exec(`
+      DROP TABLE design_review_evidence;
+      DROP TABLE design_review_runs;
+
+      CREATE TABLE design_review_evidence (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        design_text_hash TEXT NOT NULL,
+        review_load TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        independent_review_required INTEGER NOT NULL DEFAULT 0,
+        independent_review_verdict TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (task_id) REFERENCES tasks(id)
+      );
+
+      CREATE TABLE design_review_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        design_text TEXT NOT NULL,
+        design_text_hash TEXT NOT NULL,
+        task_title TEXT NOT NULL DEFAULT '',
+        changed_files TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        claim_token TEXT,
+        result_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        FOREIGN KEY (task_id) REFERENCES tasks(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at
+        ON design_review_evidence(task_id, created_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_task_active
+        ON design_review_runs(task_id) WHERE status IN ('queued','running');
+      CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at
+        ON design_review_runs(status, started_at);
+    `)
+
+    db.prepare(`
+      INSERT INTO projects (id, name, goal, design_philosophy, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'project-legacy',
+      'Legacy design review project',
+      'Generalize Design Review subjects',
+      '[]',
+      'running',
+      '2026-08-31T09:00:00.000Z',
+      '2026-08-31T09:00:00.000Z',
+    )
+
+    const insertTask = db.prepare(`
+      INSERT INTO tasks
+        (id, project_id, title, description, status, assignee, dependencies,
+         allowed_paths, forbidden_paths, acceptance_criteria, expected_outputs,
+         roadmap_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    for (const [id, title] of [
+      ['task-legacy-1', 'Legacy task review one'],
+      ['task-legacy-2', 'Legacy task review two'],
+      ['task-legacy-3', 'Legacy post-upgrade write target'],
+    ] as const) {
+      insertTask.run(
+        id,
+        'project-legacy',
+        title,
+        'Existing deployed task',
+        'pending',
+        'developer_ai',
+        '[]',
+        '[]',
+        '[]',
+        '[]',
+        '[]',
+        0,
+        '2026-08-31T09:00:00.000Z',
+        '2026-08-31T09:00:00.000Z',
+      )
+    }
+
+    const evidenceRows: LegacyDesignReviewEvidenceRow[] = [
+      {
+        id: 'evidence-legacy-1',
+        task_id: 'task-legacy-1',
+        design_text_hash: computeDesignTextHash('Design: first deployed review.'),
+        review_load: 'medium',
+        decision: 'CONFLICT',
+        independent_review_required: 0,
+        independent_review_verdict: null,
+        created_at: '2026-08-31T10:00:00.000Z',
+      },
+      {
+        id: 'evidence-legacy-2',
+        task_id: 'task-legacy-1',
+        design_text_hash: computeDesignTextHash('Design: second deployed review.'),
+        review_load: 'critical',
+        decision: 'ALIGNED',
+        independent_review_required: 1,
+        independent_review_verdict: 'approved',
+        created_at: '2026-08-31T10:05:00.000Z',
+      },
+      {
+        id: 'evidence-legacy-3',
+        task_id: 'task-legacy-2',
+        design_text_hash: computeDesignTextHash('Design: another task review.'),
+        review_load: 'high',
+        decision: 'REVIEW_UNAVAILABLE',
+        independent_review_required: 1,
+        independent_review_verdict: null,
+        created_at: '2026-08-31T10:10:00.000Z',
+      },
+    ]
+    const insertEvidence = db.prepare(`
+      INSERT INTO design_review_evidence
+        (id, task_id, design_text_hash, review_load, decision,
+         independent_review_required, independent_review_verdict, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    for (const row of evidenceRows) {
+      insertEvidence.run(
+        row.id,
+        row.task_id,
+        row.design_text_hash,
+        row.review_load,
+        row.decision,
+        row.independent_review_required,
+        row.independent_review_verdict,
+        row.created_at,
+      )
+    }
+
+    const runRows: LegacyDesignReviewRunRow[] = [
+      {
+        id: 'run-legacy-1',
+        task_id: 'task-legacy-1',
+        design_text: 'Design: queued deployed run.',
+        design_text_hash: computeDesignTextHash('Design: queued deployed run.'),
+        task_title: 'Legacy task review one',
+        changed_files: '["apps/api/src/storage/sqlite.ts"]',
+        status: 'queued',
+        attempt_count: 0,
+        claim_token: null,
+        result_json: null,
+        error: null,
+        created_at: '2026-08-31T11:00:00.000Z',
+        started_at: null,
+        completed_at: null,
+      },
+      {
+        id: 'run-legacy-2',
+        task_id: 'task-legacy-1',
+        design_text: 'Design: completed deployed run.',
+        design_text_hash: computeDesignTextHash('Design: completed deployed run.'),
+        task_title: 'Legacy task review one',
+        changed_files: '[]',
+        status: 'succeeded',
+        attempt_count: 1,
+        claim_token: null,
+        result_json: '{"finalDecision":"ALIGNED"}',
+        error: null,
+        created_at: '2026-08-31T11:05:00.000Z',
+        started_at: '2026-08-31T11:06:00.000Z',
+        completed_at: '2026-08-31T11:07:00.000Z',
+      },
+      {
+        id: 'run-legacy-3',
+        task_id: 'task-legacy-2',
+        design_text: 'Design: running deployed run.',
+        design_text_hash: computeDesignTextHash('Design: running deployed run.'),
+        task_title: 'Legacy task review two',
+        changed_files: '["packages/shared/src/types/meta_review.ts"]',
+        status: 'running',
+        attempt_count: 2,
+        claim_token: 'claim-legacy-3',
+        result_json: null,
+        error: 'previous transient failure',
+        created_at: '2026-08-31T11:10:00.000Z',
+        started_at: '2026-08-31T11:11:00.000Z',
+        completed_at: null,
+      },
+    ]
+    const insertRun = db.prepare(`
+      INSERT INTO design_review_runs
+        (id, task_id, design_text, design_text_hash, task_title, changed_files,
+         status, attempt_count, claim_token, result_json, error, created_at,
+         started_at, completed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    for (const row of runRows) {
+      insertRun.run(
+        row.id,
+        row.task_id,
+        row.design_text,
+        row.design_text_hash,
+        row.task_title,
+        row.changed_files,
+        row.status,
+        row.attempt_count,
+        row.claim_token,
+        row.result_json,
+        row.error,
+        row.created_at,
+        row.started_at,
+        row.completed_at,
+      )
+    }
+
+    return { evidenceRows: readLegacyEvidenceRows(db), runRows: readLegacyRunRows(db) }
+  } finally {
+    db.close()
+  }
+}
+
 describe('SQLiteStorage', () => {
   let storage: IStorage
 
@@ -1567,6 +1863,225 @@ describe('SQLiteStorage', () => {
       expect(expired?.status).toBe('EXPIRED')
       // NULL のまま保持
       expect(expired?.reviewedAt).toBeUndefined()
+    })
+  })
+
+  describe('designReviewSubjectMigration', () => {
+    it('preserves row counts and original columns when rebuilding legacy tables', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-design-review-subject-preserve-${randomUUID()}.db`)
+      const before = createLegacyDesignReviewDatabase(dbPath)
+
+      createSQLiteStorage(dbPath)
+
+      const after = readDatabase(dbPath, (db) => ({
+        evidenceRows: readLegacyEvidenceRows(db),
+        runRows: readLegacyRunRows(db),
+        evidenceSubjects: readDesignReviewSubjectRows(db, 'design_review_evidence'),
+        runSubjects: readDesignReviewSubjectRows(db, 'design_review_runs'),
+      }))
+
+      expect(after.evidenceRows).toHaveLength(before.evidenceRows.length)
+      expect(after.runRows).toHaveLength(before.runRows.length)
+      expect(after.evidenceRows).toEqual(before.evidenceRows)
+      expect(after.runRows).toEqual(before.runRows)
+      expect(after.evidenceSubjects).toEqual(before.evidenceRows.map((row) => ({
+        id: row.id,
+        review_kind: 'task',
+        subject_id: row.task_id,
+        task_id: row.task_id,
+      })))
+      expect(after.runSubjects).toEqual(before.runRows.map((row) => ({
+        id: row.id,
+        review_kind: 'task',
+        subject_id: row.task_id,
+        task_id: row.task_id,
+      })))
+    })
+
+    it('stores task defaults when existing callers supply only taskId', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-design-review-task-defaults-${randomUUID()}.db`)
+      const fileStorage = createSQLiteStorage(dbPath)
+      const project = fileStorage.projects.create({
+        name: 'Task default project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const task = fileStorage.tasks.create({
+        projectId: project.id,
+        title: 'Task default review',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+
+      const evidence = fileStorage.designReviewEvidence.create({
+        taskId: task.id,
+        designTextHash: computeDesignTextHash('Design: default evidence subject.'),
+        reviewLoad: 'medium',
+        decision: 'ALIGNED',
+        independentReviewRequired: false,
+      })
+      const run = fileStorage.designReviewRuns.create({
+        taskId: task.id,
+        taskTitle: task.title,
+        designText: 'Design: default run subject.',
+        designTextHash: computeDesignTextHash('Design: default run subject.'),
+        changedFiles: ['apps/api/src/storage/sqlite.ts'],
+      })
+
+      expect(evidence).toMatchObject({ reviewKind: 'task', subjectId: task.id, taskId: task.id })
+      expect(run).toMatchObject({ reviewKind: 'task', subjectId: task.id, taskId: task.id })
+      const raw = readDatabase(dbPath, (db) => ({
+        evidence: db.prepare(`
+          SELECT id, review_kind, subject_id, task_id
+          FROM design_review_evidence
+          WHERE id = ?
+        `).get(evidence.id) as DesignReviewSubjectRow | undefined,
+        run: db.prepare(`
+          SELECT id, review_kind, subject_id, task_id
+          FROM design_review_runs
+          WHERE id = ?
+        `).get(run.id) as DesignReviewSubjectRow | undefined,
+      }))
+
+      expect(raw.evidence).toEqual({
+        id: evidence.id,
+        review_kind: 'task',
+        subject_id: task.id,
+        task_id: task.id,
+      })
+      expect(raw.run).toEqual({
+        id: run.id,
+        review_kind: 'task',
+        subject_id: task.id,
+        task_id: task.id,
+      })
+    })
+
+    it('upgrades a deployed pre-migration database and reads/writes through storage afterward', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-design-review-subject-upgrade-${randomUUID()}.db`)
+      createLegacyDesignReviewDatabase(dbPath)
+
+      const upgraded = createSQLiteStorage(dbPath)
+
+      const latest = upgraded.designReviewEvidence.findLatestByTaskId('task-legacy-1')
+      expect(latest).toMatchObject({
+        id: 'evidence-legacy-2',
+        reviewKind: 'task',
+        subjectId: 'task-legacy-1',
+        taskId: 'task-legacy-1',
+        decision: 'ALIGNED',
+      })
+
+      const writtenEvidence = upgraded.designReviewEvidence.create({
+        taskId: 'task-legacy-3',
+        designTextHash: computeDesignTextHash('Design: post-upgrade evidence write.'),
+        reviewLoad: 'low',
+        decision: 'ALIGNED',
+        independentReviewRequired: false,
+      })
+      expect(upgraded.designReviewEvidence.findLatestByTaskId('task-legacy-3')).toMatchObject({
+        id: writtenEvidence.id,
+        reviewKind: 'task',
+        subjectId: 'task-legacy-3',
+        taskId: 'task-legacy-3',
+      })
+
+      const writtenRun = upgraded.designReviewRuns.create({
+        taskId: 'task-legacy-3',
+        taskTitle: 'Legacy post-upgrade write target',
+        designText: 'Design: post-upgrade run write.',
+        designTextHash: computeDesignTextHash('Design: post-upgrade run write.'),
+        changedFiles: [],
+      })
+      expect(upgraded.designReviewRuns.findActiveByTaskId('task-legacy-3')).toMatchObject({
+        id: writtenRun.id,
+        reviewKind: 'task',
+        subjectId: 'task-legacy-3',
+        taskId: 'task-legacy-3',
+      })
+    })
+
+    it('is idempotent on repeat startup after the rebuild has run once', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-design-review-subject-idempotent-${randomUUID()}.db`)
+      createLegacyDesignReviewDatabase(dbPath)
+      createSQLiteStorage(dbPath)
+
+      const beforeSecondStartup = readDatabase(dbPath, (db) => ({
+        evidenceColumns: (db.pragma('table_info(design_review_evidence)') as Array<{ name: string }>)
+          .map((column) => column.name),
+        evidenceRows: readLegacyEvidenceRows(db),
+        runRows: readLegacyRunRows(db),
+        evidenceSubjects: readDesignReviewSubjectRows(db, 'design_review_evidence'),
+        runSubjects: readDesignReviewSubjectRows(db, 'design_review_runs'),
+      }))
+      expect(beforeSecondStartup.evidenceColumns).toContain('review_kind')
+
+      expect(() => createSQLiteStorage(dbPath)).not.toThrow()
+
+      const afterSecondStartup = readDatabase(dbPath, (db) => ({
+        evidenceRows: readLegacyEvidenceRows(db),
+        runRows: readLegacyRunRows(db),
+        evidenceSubjects: readDesignReviewSubjectRows(db, 'design_review_evidence'),
+        runSubjects: readDesignReviewSubjectRows(db, 'design_review_runs'),
+      }))
+      expect(afterSecondStartup).toEqual({
+        evidenceRows: beforeSecondStartup.evidenceRows,
+        runRows: beforeSecondStartup.runRows,
+        evidenceSubjects: beforeSecondStartup.evidenceSubjects,
+        runSubjects: beforeSecondStartup.runSubjects,
+      })
+    })
+
+    it('passes integrity_check and preserves task_id foreign key declarations', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-design-review-subject-integrity-${randomUUID()}.db`)
+      createLegacyDesignReviewDatabase(dbPath)
+      createSQLiteStorage(dbPath)
+
+      const result = readDatabase(dbPath, (db) => ({
+        integrity: db.pragma('integrity_check') as Array<{ integrity_check: string }>,
+        runForeignKeys: db.pragma('foreign_key_list(design_review_runs)') as Array<{
+          table: string
+          from: string
+          to: string
+        }>,
+        evidenceForeignKeys: db.pragma('foreign_key_list(design_review_evidence)') as Array<{
+          table: string
+          from: string
+          to: string
+        }>,
+      }))
+
+      expect(result.integrity).toEqual([{ integrity_check: 'ok' }])
+      expect(result.runForeignKeys).toEqual(expect.arrayContaining([
+        expect.objectContaining({ table: 'tasks', from: 'task_id', to: 'id' }),
+      ]))
+      expect(result.evidenceForeignKeys).toEqual(expect.arrayContaining([
+        expect.objectContaining({ table: 'tasks', from: 'task_id', to: 'id' }),
+      ]))
+    })
+
+    it('replaces the task_id-only active-run index with the subject-based one (independent-review finding: a regression here would silently allow more than one active review per subject once task_id can be NULL)', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-design-review-subject-index-${randomUUID()}.db`)
+      createLegacyDesignReviewDatabase(dbPath)
+      createSQLiteStorage(dbPath)
+
+      const indexNames = readDatabase(dbPath, (db) => (
+        db.pragma("index_list('design_review_runs')") as Array<{ name: string; unique: number }>
+      ))
+
+      const oldIndex = indexNames.find((index) => index.name === 'ux_design_review_runs_task_active')
+      const newIndex = indexNames.find((index) => index.name === 'ux_design_review_runs_subject_active')
+
+      expect(oldIndex).toBeUndefined()
+      expect(newIndex).toMatchObject({ unique: 1 })
+
+      const indexedColumns = readDatabase(dbPath, (db) => (
+        db.pragma("index_info('ux_design_review_runs_subject_active')") as Array<{ name: string }>
+      )).map((column) => column.name)
+      expect(indexedColumns).toEqual(['review_kind', 'subject_id'])
     })
   })
 

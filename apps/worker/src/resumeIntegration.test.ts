@@ -323,6 +323,8 @@ describe('resume API to worker integration', () => {
 
       const instruction = 'Use the existing storage interface and add tests.'
       storage.designReviewEvidence.create({
+        reviewKind: 'task',
+        subjectId: task.id,
         taskId: task.id,
         designTextHash: computeDesignTextHash(buildResumeAiCliPrompt(task, instruction)),
         reviewLoad: 'medium',

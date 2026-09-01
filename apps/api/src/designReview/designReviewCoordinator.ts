@@ -316,6 +316,25 @@ export async function executeDesignReviewRun(
   }
 
   const claimToken = claimed.claimToken
+
+  // review_kind の一般化（roadmap-generation-constraint-compliance / review subject
+  // 一般化フェーズ2）はまだこの関数を対応させていない。taskId は型上optionalになった
+  // （DesignReviewRun.taskId?: string）が、'task' 以外の run をここでrunnerへ渡すと
+  // taskId=undefined が silentに欠落した runnerInput を送ることになり、フェーズ2で
+  // この関数がroadmap kindも扱うよう拡張されるまで気づかれない不整合になる。
+  // フェーズ1時点ではroadmap kindのrunを作る呼び出し元は存在しないため到達しないはずだが、
+  // 到達した場合はfail-closedで即座に失敗させる（bounded retryでは解決しない不変条件違反
+  // のため、finalizeFailureのrequeueには乗せない）。
+  if (run.reviewKind !== 'task' || run.taskId === undefined) {
+    const fenced = storage.designReviewRuns.complete(
+      run.id, claimToken, 'failed', undefined,
+      `executeDesignReviewRun does not yet support reviewKind=${run.reviewKind} (phase 2 must extend this before roadmap reviews reach here)`,
+    )
+    return fenced
+      ? { status: 'failed', error: `unsupported reviewKind: ${run.reviewKind}` }
+      : { status: 'stale' }
+  }
+
   const runnerInput = JSON.stringify({
     taskId: run.taskId,
     taskTitle,
