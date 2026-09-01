@@ -9,12 +9,27 @@ vi.mock('../ctoAi/roadmapGenerator.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../ctoAi/roadmapGenerator.js')>()),
   generateRoadmap: roadmapMocks.generateRoadmap,
 }))
-const ALIGNED_STDOUT = JSON.stringify({
+const TASK_ALIGNED_STDOUT = JSON.stringify({
   focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
   integrationReviewResult: { decision: 'ALIGNED' },
 })
+const ROADMAP_ALIGNED_STDOUT = JSON.stringify({
+  focusedReviewResults: [
+    { focus: 'strategic_alignment', decision: 'ALIGNED' },
+    { focus: 'scope_simplicity', decision: 'ALIGNED' },
+    { focus: 'architecture_responsibility', decision: 'ALIGNED' },
+  ],
+  integrationReviewResult: { decision: 'ALIGNED' },
+  independentReviewResult: { verdict: 'approved' },
+})
+
+function alignedStdoutForReviewInput(input: string): string {
+  const parsed = JSON.parse(input) as { reviewKind?: string }
+  return parsed.reviewKind === 'roadmap' ? ROADMAP_ALIGNED_STDOUT : TASK_ALIGNED_STDOUT
+}
+
 const designReviewMocks = vi.hoisted(() => ({
-  execute: vi.fn(async () => ({ ok: true, timedOut: false, stdout: '' })),
+  execute: vi.fn(async (_input: string) => ({ ok: true, timedOut: false, stdout: '' })),
 }))
 vi.mock('../designReview/designReviewCoordinator', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../designReview/designReviewCoordinator')>()),
@@ -23,8 +38,22 @@ vi.mock('../designReview/designReviewCoordinator', async (importOriginal) => ({
     execute: designReviewMocks.execute,
   }),
 }))
-vi.mock('../ctoAi/projectMemoryWriter.js', async (importOriginal) => ({ ...(await importOriginal()), writeProjectMemory: () => ({ writtenFiles: [], targetDir: process.env.TARGET_ROOT ?? '/tmp' }) }))
-vi.mock('../ctoAi/roadmapWriter.js', () => ({ writeRoadmap: () => ({ writtenFiles: [], targetDir: process.env.TARGET_ROOT ?? '/tmp' }) }))
+vi.mock('../ctoAi/projectMemoryWriter.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  writeProjectMemory: () => ({
+    writtenFiles: [],
+    targetDir: process.env.TARGET_ROOT ?? '/tmp',
+    readinessScore: 100,
+    readinessReason: 'test',
+    mustResolveGaps: 0,
+    definitionHash: 'test-definition-hash',
+    constraintsHash: 'test-constraints-hash',
+  }),
+}))
+vi.mock('../ctoAi/roadmapWriter.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../ctoAi/roadmapWriter.js')>()),
+  writeRoadmap: () => ({ writtenFiles: [], targetDir: process.env.TARGET_ROOT ?? '/tmp' }),
+}))
 
 function noGapsAnalysis(goal: string, designPhilosophy: string[]) {
   return {
@@ -134,7 +163,11 @@ beforeEach(() => {
   roadmapMocks.generateRoadmap.mockReset()
   roadmapMocks.generateRoadmap.mockResolvedValue({ phases: [{ number: 1, name: 'Foundation', goal: 'Start', tasks: ['task-001'] }], tasks: [{ id: 'task-001', title: 'Implement', description: 'Implement.', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [], estimatedComplexity: 'small' }], totalTasks: 1, estimatedWeeks: 1 })
   designReviewMocks.execute.mockReset()
-  designReviewMocks.execute.mockResolvedValue({ ok: true, timedOut: false, stdout: ALIGNED_STDOUT })
+  designReviewMocks.execute.mockImplementation(async (input: string) => ({
+    ok: true,
+    timedOut: false,
+    stdout: alignedStdoutForReviewInput(input),
+  }))
   specAnalyzerMocks.analyzeSpec.mockReset()
   specAnalyzerMocks.analyzeSpec.mockImplementation(async (specText: string) => noGapsAnalysis(specText, []))
 })

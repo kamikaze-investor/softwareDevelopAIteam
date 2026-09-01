@@ -26,6 +26,8 @@ export interface ProjectMemoryWriteResult {
   readinessScore: number
   readinessReason: string
   mustResolveGaps: number
+  definitionHash: string
+  constraintsHash: string
 }
 
 export interface ProjectMemoryWriteOptions {
@@ -52,6 +54,7 @@ export function writeProjectMemory(
     goal: analysis.goal,
     designPhilosophy: analysis.designPhilosophy,
   })
+  const definitionHash = computeProjectDefinitionHash(canonicalDefinitionText)
   const structuredConstraints = canonicalizeStructuredConstraints(analysis.structuredConstraints)
   const constraintsHash = computeProjectDefinitionHash(JSON.stringify(structuredConstraints))
 
@@ -175,7 +178,7 @@ ${analysis.requiredExternalServices.map(s => `## ${s.name}
   writtenFiles.push('docs/project_memory/external_services.md')
 
   const projectDefinitionContent = JSON.stringify({
-    definitionHash: computeProjectDefinitionHash(canonicalDefinitionText),
+    definitionHash,
     generatedAt,
     goal: analysis.goal,
     designPhilosophy: analysis.designPhilosophy,
@@ -196,6 +199,8 @@ ${analysis.requiredExternalServices.map(s => `## ${s.name}
     readinessScore: analysis.readinessScore,
     readinessReason: analysis.readinessReason,
     mustResolveGaps: mustResolveGaps.length,
+    definitionHash,
+    constraintsHash,
   }
 }
 

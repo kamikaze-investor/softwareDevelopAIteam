@@ -24,7 +24,7 @@ function complexityLabel(c: GeneratedTask['estimatedComplexity']): string {
   return { small: '🟢 S', medium: '🟡 M', large: '🔴 L' }[c]
 }
 
-function buildRoadmapMd(roadmap: Roadmap): string {
+export function buildRoadmapMd(roadmap: Roadmap): string {
   const lines: string[] = [
     '# Roadmap',
     '',
