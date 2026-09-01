@@ -87,7 +87,7 @@ beforeEach(() => {
 describe('runStrategicMetaReview', () => {
   it('keeps LOW review load on the legacy single-call Meta Review path', async () => {
     const result = await runStrategicMetaReview({
-      taskId: 'task-low',
+      subjectId: 'task-low',
       taskTitle: 'Only test updates',
       changedFiles: ['apps/worker/src/example.test.ts'],
       gitDiff: makeLargeDiff(300),
@@ -115,7 +115,7 @@ describe('runStrategicMetaReview', () => {
     })
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-low-conflict',
+      subjectId: 'task-low-conflict',
       taskTitle: 'Only test updates',
       changedFiles: ['apps/worker/src/example.test.ts'],
       gitDiff: makeLargeDiff(300),
@@ -135,7 +135,7 @@ describe('runStrategicMetaReview', () => {
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-critical',
+      subjectId: 'task-critical',
       taskTitle: 'Meta reviewer hardening',
       changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
       gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
@@ -155,7 +155,7 @@ describe('runStrategicMetaReview', () => {
     mockCodexReviewerRun('approved', 'independent codex review approved')
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-critical-independent',
+      subjectId: 'task-critical-independent',
       taskTitle: 'Meta reviewer hardening',
       changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
       gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
@@ -189,7 +189,7 @@ describe('runStrategicMetaReview', () => {
     mockCreateAiCliAdapter.mockReturnValue({ run } as unknown as ReturnType<typeof createAiCliAdapter>)
 
     await runStrategicMetaReview({
-      taskId: 'task-critical-independence',
+      subjectId: 'task-critical-independence',
       taskTitle: 'Meta reviewer hardening',
       changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
       gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
@@ -210,7 +210,7 @@ describe('runStrategicMetaReview', () => {
     mockCodexReviewerRun('blocking', 'independent reviewer found a critical safety gap')
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-critical-blocked',
+      subjectId: 'task-critical-blocked',
       taskTitle: 'Meta reviewer hardening',
       changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
       gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
@@ -230,7 +230,7 @@ describe('runStrategicMetaReview', () => {
     mockCodexReviewerFailure()
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-critical-reviewer-unavailable',
+      subjectId: 'task-critical-reviewer-unavailable',
       taskTitle: 'Meta reviewer hardening',
       changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
       gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
@@ -245,7 +245,7 @@ describe('runStrategicMetaReview', () => {
     mockReviewWithProviderFallback.mockRejectedValueOnce(new Error('gemini timeout'))
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-critical-primary-unavailable',
+      subjectId: 'task-critical-primary-unavailable',
       taskTitle: 'Meta reviewer hardening',
       changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
       gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
@@ -308,7 +308,7 @@ describe('runStrategicMetaReview', () => {
       mockCodexReviewerFailure()
 
       const outcome = await runIndependentReview({
-        taskId: 'task-x',
+        subjectId: 'task-x',
         taskTitle: 'title',
         changedFiles: ['apps/worker/src/example.ts'],
         gitDiff: 'diff',
@@ -322,7 +322,7 @@ describe('runStrategicMetaReview', () => {
       mockCodexReviewerRun('changes_requested', 'please address X')
 
       const outcome = await runIndependentReview({
-        taskId: 'task-x',
+        subjectId: 'task-x',
         taskTitle: 'title',
         changedFiles: ['apps/worker/src/example.ts'],
         gitDiff: 'diff',
@@ -342,7 +342,7 @@ describe('runStrategicMetaReview', () => {
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-critical-conflict',
+      subjectId: 'task-critical-conflict',
       taskTitle: 'Meta reviewer hardening',
       changedFiles: ['apps/worker/src/metaReviewer/strategicReview.ts'],
       gitDiff: 'diff --git a/apps/worker/src/metaReviewer/strategicReview.ts b/apps/worker/src/metaReviewer/strategicReview.ts',
@@ -419,7 +419,7 @@ describe('runStrategicMetaReview', () => {
 
     try {
       const result = await runStrategicMetaReview({
-        taskId: 'task-missing-checklist',
+        subjectId: 'task-missing-checklist',
         taskTitle: 'Mobile UI adjustment',
         changedFiles: ['apps/mobile/app/index.tsx'],
         gitDiff: 'diff --git a/apps/mobile/app/index.tsx b/apps/mobile/app/index.tsx',
@@ -440,7 +440,7 @@ describe('runStrategicMetaReview', () => {
     mockReviewWithProviderFallback.mockRejectedValueOnce(new Error('timeout'))
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-medium',
+      subjectId: 'task-medium',
       taskTitle: 'Mobile UI adjustment',
       changedFiles: ['apps/mobile/app/index.tsx'],
       gitDiff: 'diff --git a/apps/mobile/app/index.tsx b/apps/mobile/app/index.tsx',
@@ -475,7 +475,7 @@ describe('runStrategicMetaReview', () => {
     )
 
     const result = await runStrategicMetaReview({
-      taskId: 'task-medium-nonquota',
+      subjectId: 'task-medium-nonquota',
       taskTitle: 'Mobile UI adjustment',
       changedFiles: ['apps/mobile/app/index.tsx'],
       gitDiff: 'diff --git a/apps/mobile/app/index.tsx b/apps/mobile/app/index.tsx',
@@ -488,9 +488,39 @@ describe('runStrategicMetaReview', () => {
   })
 })
 
+describe('runStrategicMetaReview with reviewKind=roadmap', () => {
+  it('uses the fixed roadmap focuses and treats the whole roadmap as the review subject', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'scope aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+    mockCodexReviewerRun('approved', 'independent roadmap review approved')
+
+    const result = await runStrategicMetaReview({
+      reviewKind: 'roadmap',
+      subjectId: 'project-roadmap-1',
+      taskTitle: 'Whole-Roadmap Review',
+      changedFiles: [],
+      gitDiff: '# Roadmap Design Review Material detailing the planned roadmap',
+      workingDir: repoRoot,
+    })
+
+    expect(result.reviewKind).toBe('roadmap')
+    expect(result.subjectId).toBe('project-roadmap-1')
+    expect(result.reviewLoad).toBe('critical')
+    expect(result.selectedFocuses).toEqual([
+      'strategic_alignment',
+      'scope_simplicity',
+      'architecture_responsibility',
+    ])
+    expect(result.independentReviewResult?.verdict).toBe('approved')
+    expect(result.finalDecision).toBe('ALIGNED')
+  })
+})
+
 function highStorageInput(): Parameters<typeof runStrategicMetaReview>[0] {
   return {
-    taskId: 'task-high',
+    subjectId: 'task-high',
     taskTitle: 'Storage state hardening',
     changedFiles: ['apps/api/src/storage/schema.ts'],
     gitDiff: 'diff --git a/apps/api/src/storage/schema.ts b/apps/api/src/storage/schema.ts',

@@ -78,3 +78,40 @@ export function checkImplementJobDesignReviewEvidence(
 
   return { ok: true, evidence }
 }
+
+export type RoadmapDesignReviewFreshnessFailureCode =
+  | 'MISSING_ROADMAP_DESIGN_REVIEW_EVIDENCE'
+  | 'ROADMAP_DESIGN_REVIEW_HASH_MISMATCH'
+  | 'ROADMAP_DESIGN_REVIEW_NOT_ALIGNED'
+  | 'ROADMAP_DESIGN_REVIEW_INDEPENDENT_REVIEW_NOT_APPROVED'
+
+export type RoadmapDesignReviewFreshnessResult =
+  | { ok: true; evidence: DesignReviewEvidence }
+  | { ok: false; code: RoadmapDesignReviewFreshnessFailureCode; reason: string }
+
+/**
+ * Roadmap review is always critical-load by construction (ROADMAP_REVIEW_LOAD_CLASSIFICATION), so
+ * fresh ALIGNED evidence always requires an approved independent review verdict too — same rule
+ * checkImplementJobDesignReviewEvidence already applies conditionally for critical-load Task
+ * evidence, just unconditional here since roadmap is always critical.
+ */
+export function checkRoadmapDesignReviewFreshness(
+  projectId: string,
+  currentReviewMaterial: string,
+  evidenceStorage: IDesignReviewEvidenceStorage,
+): RoadmapDesignReviewFreshnessResult {
+  const evidence = evidenceStorage.findLatestBySubjectId('roadmap', projectId)
+  if (!evidence) {
+    return { ok: false, code: 'MISSING_ROADMAP_DESIGN_REVIEW_EVIDENCE', reason: 'No Roadmap Design Review evidence exists for this project' }
+  }
+  if (evidence.designTextHash !== computeDesignTextHash(currentReviewMaterial)) {
+    return { ok: false, code: 'ROADMAP_DESIGN_REVIEW_HASH_MISMATCH', reason: 'Latest Roadmap Design Review evidence was created for a different Project Definition, structured constraints, or Roadmap content' }
+  }
+  if (evidence.decision !== 'ALIGNED') {
+    return { ok: false, code: 'ROADMAP_DESIGN_REVIEW_NOT_ALIGNED', reason: `Latest Roadmap Design Review decision is ${evidence.decision}` }
+  }
+  if (evidence.independentReviewVerdict !== 'approved') {
+    return { ok: false, code: 'ROADMAP_DESIGN_REVIEW_INDEPENDENT_REVIEW_NOT_APPROVED', reason: 'Roadmap Design Review is always critical-load and requires an approved independent review verdict' }
+  }
+  return { ok: true, evidence }
+}

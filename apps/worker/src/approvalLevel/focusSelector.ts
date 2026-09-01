@@ -102,3 +102,14 @@ function sortFocusesByPriority(focuses: readonly MetaReviewFocus[]): MetaReviewF
     return (priority.get(left) ?? Number.MAX_SAFE_INTEGER) - (priority.get(right) ?? Number.MAX_SAFE_INTEGER)
   })
 }
+
+/**
+ * Whole-Roadmap review has no changedFiles to pattern-match against, so it does not go through
+ * mapFileToFocuses. It always reviews the same fixed set of concerns: does the roadmap still align
+ * with Goal/Philosophy/Constitution (strategic_alignment), does it stay in scope and avoid
+ * over-engineering across the whole plan (scope_simplicity), and does the task breakdown respect
+ * module/layer/responsibility boundaries (architecture_responsibility).
+ */
+export function selectRoadmapReviewFocuses(): MetaReviewFocus[] {
+  return ['strategic_alignment', 'scope_simplicity', 'architecture_responsibility']
+}

@@ -172,3 +172,15 @@ function isLowLoadMarkdown(file: string): boolean {
 function formatMatches(matches: readonly RuleMatch[]): string[] {
   return matches.map((match) => `${match.file}: ${match.rule}`)
 }
+
+/**
+ * Whole-Roadmap review is always the highest-stakes review category that exists in this pipeline —
+ * it can affect the entire task plan for the whole project — so it always uses the same load tier
+ * as changedFiles-classified 'critical' Task reviews: independent (2nd-provider) review required.
+ * This is a fixed constant, not a classifier, because reviewKind='roadmap' has no changedFiles to
+ * classify.
+ */
+export const ROADMAP_REVIEW_LOAD_CLASSIFICATION: ReviewLoadClassification = {
+  reviewLoad: 'critical',
+  reasons: ["reviewKind='roadmap': whole-roadmap review is always critical load by design"],
+}

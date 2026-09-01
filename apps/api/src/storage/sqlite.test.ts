@@ -2177,6 +2177,67 @@ describe('SQLiteStorage', () => {
 
       expect(storage.designReviewEvidence.findLatestByTaskId(task.id)?.id).toBe(latest.id)
     })
+
+    it('returns the latest Design Review evidence by reviewKind+subjectId without colliding across kinds', async () => {
+      const project = storage.projects.create({
+        name: 'Subject evidence project',
+        goal: 'g',
+        designPhilosophy: [],
+        status: 'draft',
+      })
+      const taskA = storage.tasks.create({
+        projectId: project.id,
+        title: 'Task A',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+      const taskB = storage.tasks.create({
+        projectId: project.id,
+        title: 'Task B',
+        description: '',
+        status: 'pending',
+        assignee: 'developer_ai',
+        dependencies: [],
+      })
+
+      // Same subject id used by both a task-kind and a roadmap-kind row: must stay independent.
+      storage.designReviewEvidence.create({
+        reviewKind: 'task',
+        taskId: taskA.id,
+        designTextHash: computeDesignTextHash('Design: task evidence.'),
+        reviewLoad: 'medium',
+        decision: 'CONFLICT',
+        independentReviewRequired: false,
+      })
+      storage.designReviewEvidence.create({
+        reviewKind: 'roadmap',
+        subjectId: project.id,
+        designTextHash: computeDesignTextHash('Design: roadmap v1.'),
+        reviewLoad: 'critical',
+        decision: 'CONFLICT',
+        independentReviewRequired: true,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const roadmapLatest = storage.designReviewEvidence.create({
+        reviewKind: 'roadmap',
+        subjectId: project.id,
+        designTextHash: computeDesignTextHash('Design: roadmap v2.'),
+        reviewLoad: 'critical',
+        decision: 'ALIGNED',
+        independentReviewRequired: true,
+        independentReviewVerdict: 'approved',
+      })
+
+      expect(storage.designReviewEvidence.findLatestBySubjectId('roadmap', project.id)?.id).toBe(roadmapLatest.id)
+      // task-kind lookup unaffected by roadmap rows sharing the same subject id.
+      expect(storage.designReviewEvidence.findLatestByTaskId(taskA.id)?.id).toBeDefined()
+    })
+
+    it('returns undefined when no evidence exists for the reviewKind+subjectId', () => {
+      expect(storage.designReviewEvidence.findLatestBySubjectId('roadmap', 'project-void')).toBeUndefined()
+    })
   })
 
   describe('auditLog', () => {
