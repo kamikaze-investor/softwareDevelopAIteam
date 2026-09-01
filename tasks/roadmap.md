@@ -1696,7 +1696,30 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       `task | roadmap`として正しく一般化する方向で調整中。Control Repository実装
       （`apps/worker/scripts/designReviewRunner.ts`・
       `apps/worker/src/metaReviewer/strategicReview.ts`）はAV-001の正式経路・独立provider
-      reviewを経てから着手する（現時点で未着手）。
+      reviewを経てから着手する。
+
+      **進捗（2026-09-02、Phase 2完了）**: review subject一般化のPhase 2
+      （`reviewKind`/`subjectId`をcoordinator→storage→runner→reviewer engineまで正式に
+      thread）を実装・独立レビュー・merge済み（PR #67
+      `feat/design-review-subject-generalization-phase2`）。`reviewKind='roadmap'`専用の
+      固定focus選択（`selectRoadmapReviewFocuses()`: strategic_alignment/scope_simplicity/
+      architecture_responsibility）と固定critical load分類
+      （`ROADMAP_REVIEW_LOAD_CLASSIFICATION`）を新設し、changedFilesベースの既存
+      `classifyReviewLoad`/`selectFocuses`とは完全に別経路にした（synthetic changedFilesは
+      使わない）。`createAndExecuteRoadmapReview()`をcoordinatorへ追加的entrypointとして新設
+      （既存`createAndExecuteDesignReview()`・Task Review呼び出し元は無変更）。Roadmap
+      freshnessは項目6のdefinitionHash/constraintsHash/生成Roadmapを`composeRoadmapReview
+      Material()`で1つの正本テキストへ合成し、既存`computeDesignTextHash()`をそのまま
+      再利用する形で実装（新しいhash方式は追加していない）。apps/api 63ファイル/949テスト・
+      apps/worker 1051/1054テスト（残り3件はCRLF/watchdogタイミングに起因する無関係な既存
+      environmental failureと確認済み）。独立レビュー（Codex、実装provider=OpenCodeとは別）で
+      1件の実修正を発見・修正済み: `runIndependentReview()`が`reviewKind='roadmap'`の
+      projectIdを`ReviewerRequest.taskId`（`AiCliRequest.taskId`まで転送される）へ渡していた
+      synthetic taskIdの取りこぼしを検出し、`ReviewerRequest`へ`reviewKind`/`subjectId`を
+      追加した上でtaskId欄はtask-kind限定・roadmap-kindでは`roadmap-review:<projectId>`という
+      明示ラベル付き値（disguiseではない）へ修正、再レビューでAPPROVE_WITH_NOTESを取得。
+      `projectInitialization.ts`からの実接続・Task同期順序変更・Roadmap regeneration/CONFLICT
+      recoveryはPhase 3として引き続き未着手（意図的にスコープ外）。
 
       **発覚した事実**: `phase 1c v2`のGoalは今回truncateされておらず（`goalLength: 292`、
       項目6のTruncation Preventionとは無関係な独立事象）、Goal本文に「Roadmap Taskはこの1件のみ」と
