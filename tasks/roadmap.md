@@ -1614,10 +1614,19 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       **完了条件**: CONFLICT理由分析の方式・Roadmap自動修正の許容範囲（Goal/Design
       Philosophy/Approval Policy不変の判定方法）・CEOエスカレーション条件がCEOに採択されていること。
       実装着手はCEO承認後
-<!-- roadmap:id=roadmap-task-control-plane-separation state=planned -->
-8. [ ] **Roadmap Task / Control-Plane Workflow Separation**（2026-09-01登録。Phase 1c Minimal
+<!-- roadmap:id=roadmap-task-control-plane-separation state=in_progress -->
+8. [~] **Roadmap Task / Control-Plane Workflow Separation**（2026-09-01登録。Phase 1c Minimal
       Production E2E Projectの実行結果で発覚。調査・roadmap登録のみ行い、Phase 1cのscopeへは
       混ぜない）。
+
+      **進捗（2026-09-01）**: deterministic側の防止・検出は項目9のdeterministic pathと統合実装し
+      完了（PR #64 `feat/roadmap-deterministic-constraint-validation`、詳細は項目9の進捗欄参照）。
+      本項目の設計で挙げたsemantic側の二重検証（categoryと実際のTask内容の一致確認、
+      Whole-Roadmap Design Review経由）はまだ未実装。既存Design Review pipelineへの
+      review subject一般化調査（read-only、Codex quota切れのためOpenCode CLIで代替実施）が
+      完了し、Control Repository実装（`apps/worker/scripts/designReviewRunner.ts`・
+      `apps/worker/src/metaReviewer/strategicReview.ts`）に着手可能な設計案が揃った段階。
+      AV-001の正式経路・独立provider reviewを経てから実装する（現時点で未着手）。
 
       **発覚した事実**: Phase 1c用に生成されたRoadmapは11 Taskで構成されていたが、うち5件
       （「Design Review用ドキュメント準備」「Design Review提出・Approval取得」「Feature Branch作成・
@@ -1658,11 +1667,36 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
       **完了条件**: 防止方式（生成時制約／生成後検出／両方）の採択、Design Review側で検出する場合の
       チェックリスト・focus設計方針がCEOに採択されていること。実装着手はCEO承認後
-<!-- roadmap:id=roadmap-generation-constraint-compliance state=planned -->
-9. [ ] **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行
+<!-- roadmap:id=roadmap-generation-constraint-compliance state=in_progress -->
+9. [~] **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行
       `phase 1c v2`（Project ID `4a55dd0f-6b2f-4ad6-8864-f699d586d9b4`）で、1回目とは独立に再現。
       調査・roadmap登録のみ。Phase 1cのscopeへは混ぜない。今回専用の「タスク数が1でなければreject」
       というハードコードはしない）。
+
+      **進捗（2026-09-01）**: 設計方向性3経路のうちdeterministic constraint（タスク数上限・
+      許可パスのみ・dependency数上限）とcategoryベースの機械的拒否（項目8）を統合実装し完了
+      （PR #64 `feat/roadmap-deterministic-constraint-validation`。`roadmapGenerator.ts`へ
+      `category`フィールドと構造化制約優先の指示を追加、`roadmapTaskValidation.ts`へ
+      `validateRoadmapConstraints()`を追加し`initializeApprovedProject()`の
+      `syncRoadmapTasks()`より前に組み込み済み。`forbidden_new_files`/`forbidden_technologies`は
+      意味的判断が必要なため意図的に機械検証せず、`checkedKinds`/`uncheckedKinds`で
+      検証範囲を監査可能にしている。DB migrationなし、新Gate/Queue/daemonなし。
+      apps/api 926テスト・packages/shared 54テスト成功、独立レビュー2回実施
+      〈実装内容の精査で1件の実修正（`allowed_path_prefixes`のpath境界チェック不備）を発見・
+      修正済み〉）。
+
+      残り: semantic constraint（禁止技術・architecture変更禁止等）を扱うWhole-Roadmap
+      Design Reviewは未実装。既存Design Review pipelineへの一般化可能性調査
+      （read-only、Codex quota切れのためOpenCode CLIで代替実施）が完了し、`taskId`は
+      DB上FK未強制の不透明な識別子でありclaim/fence/bounded retry/provider separationは
+      subject非依存であることを確認済み。ただしCEOの明示的指示により、`task_id`へ
+      `roadmap:<projectId>`のようなsynthetic値を入れてTaskを偽装する案はそのままでは
+      採用せず、`review_kind`カラムの追加的migration（新テーブルではなく既存の
+      idempotent `MIGRATION_STATEMENTS`パターンでの1カラム追加）でreview subjectを
+      `task | roadmap`として正しく一般化する方向で調整中。Control Repository実装
+      （`apps/worker/scripts/designReviewRunner.ts`・
+      `apps/worker/src/metaReviewer/strategicReview.ts`）はAV-001の正式経路・独立provider
+      reviewを経てから着手する（現時点で未着手）。
 
       **発覚した事実**: `phase 1c v2`のGoalは今回truncateされておらず（`goalLength: 292`、
       項目6のTruncation Preventionとは無関係な独立事象）、Goal本文に「Roadmap Taskはこの1件のみ」と
