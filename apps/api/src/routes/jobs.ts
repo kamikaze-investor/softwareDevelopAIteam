@@ -475,7 +475,15 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const isRepairImplementJob =
       existing.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true &&
       existing.aiCliMode === 'implement'
-    const requiresPostImplementReview = isInitialImplementWorkflowJob || isRepairImplementJob
+    // resumeBlockedTask()（POST /api/tasks/:id/resume）が作るAI-CLI Jobも同様。
+    // workflowStepKey: `resume:<元Job>:1`（storage/sqlite.ts のresumeBlockedTask参照。
+    // 文字列はそちらと一致させること）。これが無いと、Design Review escalationからMobileの
+    // 追加指示で正常に再開できたJobが成功しても、その先のreview→git_commit→Task done→
+    // continuationへ自動的に戻れず、CEOが独立レビューを毎回手動で起票する必要があった。
+    const isResumeImplementJob =
+      existing.workflowStepKey?.startsWith('resume:') === true &&
+      existing.aiCliMode === 'implement'
+    const requiresPostImplementReview = isInitialImplementWorkflowJob || isRepairImplementJob || isResumeImplementJob
     const shouldCreateReview =
       requiresPostImplementReview &&
       existing.safeCommand.kind === 'test' &&
