@@ -47,7 +47,7 @@ async function main(): Promise<void> {
   // .env ロード後に runner.ts / geminiRouter.ts / metaReviewFallbackRouter.ts を評価させるため動的 import する
   const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } =
     await import('./runner.js')
-  const { reviewWithProviderFallback } = await import('./metaReviewFallbackRouter.js')
+  const { reviewWithProviderFallback, MetaReviewProviderError, sanitizeMessage } = await import('./metaReviewFallbackRouter.js')
 
   // --- 環境変数の読み取り ---
   const baseSha = process.env.BASE_SHA       // GitHub Actions: PR の base SHA
@@ -125,23 +125,39 @@ async function main(): Promise<void> {
   const prompt = buildMetaReviewPrompt(request)
 
   // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
+  // GEMINI_MODEL は meta-review.yml が vars.GEMINI_MODEL（未設定時 gemini-2.5-flash）を渡す。
+  // 未設定（ローカル実行等）の場合のみ、このプロジェクトが実運用として使ってきた既定値にフォールバックする。
+  const geminiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash'
   console.log('\n🤖 Gemini にレビューを依頼中...')
   let rawResponse: string
   let providerUsed: 'gemini' | 'copilot' = 'gemini'
   try {
     const reviewResult = await reviewWithProviderFallback(prompt, {
       preferCli: true,
-      cliModel: 'gemini-3.5-flash',
-      apiModel: 'gemini-3.5-flash',
+      cliModel: geminiModel,
+      apiModel: geminiModel,
       featureName: 'meta_review',
+      // autoReview.ts は使い捨ての CI/pre-push プロセスとして実行されるため、transient
+      // （timeout/network/5xx）と判定された失敗を固定回数リトライしてよい。この opt-in が
+      // 既定 false なのは、同じ callGeminiWithFallback() を長時間稼働する Worker 本体
+      // （watchdog.ts 等）からも呼んでおり、そちらで同期リトライの待機が event loop を
+      // ブロックしないようにするため（独立レビュー指摘、2026-09-01）。
+      retryTransient: true,
     })
     rawResponse = reviewResult.raw
     providerUsed = reviewResult.providerUsed
     if (providerUsed === 'copilot') {
-      console.log('   ℹ️  Gemini quota 枯渇のため Copilot CLI（Microsoft系モデル）で審査しました')
+      console.log('   ℹ️  Gemini が失敗したため Copilot CLI（Microsoft系モデル）で審査しました')
     }
   } catch (err) {
     console.error('❌ Meta Review プロバイダー呼び出しに失敗しました:', err)
+    const failureClass = err instanceof MetaReviewProviderError ? err.failureClass : 'unknown'
+    // PRコメントに載る finding.message は、MetaReviewProviderError 以外（Copilot フォールバック
+    // 自体の失敗を含む。copilotRouter.ts は raw stderr/stdout をそのままエラーメッセージに含める）
+    // も含めて必ず sanitizeMessage() を通す。geminiRouter.ts 内の診断情報は個別に sanitize 済みだが、
+    // ここを通らないと err.message がそのまま公開 PR コメントに漏れる経路が残る
+    // （独立レビュー指摘、2026-09-01）。
+    const rawMessage = err instanceof Error ? err.message : String(err)
     // API障害は安全のため blocked 扱い
     const errorResult = {
       id: `meta-review-${taskId}-${Date.now()}`,
@@ -152,8 +168,8 @@ async function main(): Promise<void> {
       findings: [{
         severity: 'critical' as const,
         category: 'security_regression' as const,
-        message: `Meta Review プロバイダーエラー: ${err instanceof Error ? err.message : String(err)}`,
-        suggestion: 'GEMINI_API_KEY / Gemini CLI / Copilot CLI（GITHUB_TOKEN認証）の状態を確認してください',
+        message: `Meta Review プロバイダーエラー（分類: ${failureClass}）: ${sanitizeMessage(rawMessage)}`,
+        suggestion: 'GEMINI_API_KEY / Gemini CLI / Copilot CLI（GITHUB_TOKEN認証）の状態を確認してください。詳細な診断情報（provider/stage/httpStatus/exitCode等）はCI実行ログを参照してください。',
       }],
       requiresCeoApproval: true,
       createdAt: new Date().toISOString(),

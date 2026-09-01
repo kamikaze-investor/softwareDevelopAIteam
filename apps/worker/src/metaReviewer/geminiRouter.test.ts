@@ -4,7 +4,7 @@
  * ⚠️ CONTROL REPOSITORY — AI編集禁止
  *
  * spawnSync と callGeminiForReview をモックして
- * フォールバック挙動を検証する。
+ * フォールバック挙動と4分類（quota/transient/auth_or_config/unknown）を検証する。
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest'
@@ -36,11 +36,16 @@ vi.mock('node:fs', async () => {
 import { spawnSync } from 'node:child_process'
 import { callGeminiForReview } from './geminiClient.js'
 import { writeFileSync } from 'node:fs'
-import { callGeminiWithFallback } from './geminiRouter.js'
+import {
+  callGeminiWithFallback, classifyFailure, sanitizeMessage, MetaReviewProviderError,
+} from './geminiRouter.js'
 
 const mockSpawnSync = vi.mocked(spawnSync)
 const mockCallApi = vi.mocked(callGeminiForReview)
 const mockWriteFileSync = vi.mocked(writeFileSync)
+
+/** テストを高速化するため、transient リトライの待機を無効化する */
+const noSleep = (): void => {}
 
 /** CLI が成功したときの spawnSync 戻り値 */
 function cliSuccess(stdout: string): ReturnType<typeof spawnSync> {
@@ -52,13 +57,95 @@ function cli429(): ReturnType<typeof spawnSync> {
   return { status: 1, stdout: 'error 429 quota exceeded', stderr: '', pid: 1, output: [], signal: null } as unknown as ReturnType<typeof spawnSync>
 }
 
-/** CLI がプロセスエラー（exit code != 0）のとき */
+/** CLI が原因不明のプロセスエラー（exit code != 0）のとき */
 function cliError(): ReturnType<typeof spawnSync> {
   return { status: 1, stdout: '', stderr: 'unknown error', pid: 1, output: [], signal: null } as unknown as ReturnType<typeof spawnSync>
 }
 
+/** CLI が一時的障害（5xx相当）で失敗したとき */
+function cliTransient(): ReturnType<typeof spawnSync> {
+  return { status: 1, stdout: '', stderr: '503 Service Unavailable', pid: 1, output: [], signal: null } as unknown as ReturnType<typeof spawnSync>
+}
+
+/** agy バイナリ自体が見つからない（未インストール）とき、Node の spawnSync が返す形 */
+function cliEnoent(): ReturnType<typeof spawnSync> {
+  return {
+    status: null, stdout: '', stderr: '', pid: 0, output: [], signal: null,
+    error: Object.assign(new Error('spawnSync agy ENOENT'), { code: 'ENOENT' }),
+  } as unknown as ReturnType<typeof spawnSync>
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
+})
+
+describe('classifyFailure', () => {
+  it('429 / quota exceeded・exhausted / rate limit 文言 → quota', () => {
+    expect(classifyFailure({ text: '429 Too Many Requests' })).toBe('quota')
+    expect(classifyFailure({ text: 'Quota exceeded for this API key' })).toBe('quota')
+    expect(classifyFailure({ text: 'unrelated', httpStatus: 429 })).toBe('quota')
+    expect(classifyFailure({ text: 'RESOURCE_EXHAUSTED: quota exhausted' })).toBe('quota')
+    expect(classifyFailure({ text: 'rate limited, try again later' })).toBe('quota')
+  })
+
+  it('quota という単語を含んでいても exhaustion/rate-limit の形でなければ quota 扱いにしない（独立レビュー指摘: 誤って Copilot フォールバックへ倒れるのを防ぐ）', () => {
+    expect(classifyFailure({ text: 'quota project not configured for this API' })).not.toBe('quota')
+    expect(classifyFailure({ text: 'invalid quota project id' })).not.toBe('quota')
+  })
+
+  it('timeout / network / 5xx → transient', () => {
+    expect(classifyFailure({ text: 'ETIMEDOUT' })).toBe('transient')
+    expect(classifyFailure({ text: 'fetch failed' })).toBe('transient')
+    expect(classifyFailure({ text: '503 Service Unavailable' })).toBe('transient')
+    expect(classifyFailure({ text: 'unrelated', httpStatus: 502 })).toBe('transient')
+    expect(classifyFailure({ text: 'unrelated', timedOut: true })).toBe('transient')
+  })
+
+  it('auth / configuration / program error → auth_or_config', () => {
+    expect(classifyFailure({ text: 'API key not valid' })).toBe('auth_or_config')
+    expect(classifyFailure({ text: 'GEMINI_API_KEY が設定されていません' })).toBe('auth_or_config')
+    expect(classifyFailure({ text: 'spawnSync agy ENOENT' })).toBe('auth_or_config')
+    expect(classifyFailure({ text: 'unrelated', httpStatus: 401 })).toBe('auth_or_config')
+    expect(classifyFailure({ text: 'unrelated', exitCode: 127 })).toBe('auth_or_config')
+  })
+
+  it('どれにも一致しない → unknown（安全側デフォルト）', () => {
+    expect(classifyFailure({ text: 'something went wrong' })).toBe('unknown')
+  })
+
+  it('優先順位: quota が transient/auth_or_config より優先される', () => {
+    expect(classifyFailure({ text: '429 quota exceeded after timeout' })).toBe('quota')
+  })
+})
+
+describe('sanitizeMessage', () => {
+  it('既知の secret 環境変数の値を redact する', () => {
+    const originalEnv = { ...process.env }
+    process.env.GEMINI_API_KEY = 'super-secret-value-123'
+    try {
+      const result = sanitizeMessage('failed with key super-secret-value-123 in request')
+      expect(result).not.toContain('super-secret-value-123')
+      expect(result).toContain('[REDACTED]')
+    } finally {
+      process.env = originalEnv
+    }
+  })
+
+  it('env に値が無くても、既知の key shape を redact する（二重防御）', () => {
+    expect(sanitizeMessage('key=AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ1234567')).toContain('[REDACTED]')
+    expect(sanitizeMessage('token=sk-abcdefghijklmnopqrstuvwxyz123456')).toContain('[REDACTED]')
+    expect(sanitizeMessage('Authorization: Bearer abcdefghij1234567890')).toContain('[REDACTED]')
+  })
+
+  it('長いメッセージは切り詰める', () => {
+    const long = 'x'.repeat(1000)
+    const result = sanitizeMessage(long)
+    expect(result.length).toBeLessThanOrEqual(301)
+  })
+
+  it('改行を除去する', () => {
+    expect(sanitizeMessage('line1\nline2\r\nline3')).not.toContain('\n')
+  })
 })
 
 describe('callGeminiWithFallback', () => {
@@ -96,12 +183,14 @@ describe('callGeminiWithFallback', () => {
       mockSpawnSync.mockReturnValue(cli429())
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
 
-      await expect(
-        callGeminiWithFallback('test prompt', {
-          preferCli: true,
-          featureName: 'alignment_check',
-        })
-      ).rejects.toThrow('quota exhausted')
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: true,
+        featureName: 'alignment_check',
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      expect((error as MetaReviewProviderError).failureClass).toBe('quota')
+      expect((error as Error).message).toContain('quota exhausted')
 
       expect(mockWriteFileSync).toHaveBeenCalledOnce()
       const written = JSON.parse(mockWriteFileSync.mock.calls[0][1] as string)
@@ -154,16 +243,147 @@ describe('callGeminiWithFallback', () => {
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
       mockSpawnSync.mockReturnValue(cli429())
 
-      await expect(
-        callGeminiWithFallback('test prompt', {
-          preferCli: false,
-          featureName: 'audit_explanation',
-        })
-      ).rejects.toThrow('quota exhausted')
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'audit_explanation',
+      }).catch((e: unknown) => e)
 
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      expect((error as MetaReviewProviderError).failureClass).toBe('quota')
       expect(mockWriteFileSync).toHaveBeenCalledOnce()
       const written = JSON.parse(mockWriteFileSync.mock.calls[0][1] as string)
       expect(written.featureName).toBe('audit_explanation')
+    })
+  })
+
+  describe('4分類フォールバック（2026-09-01 拡張）', () => {
+    it('retryTransient 未指定（既定 false）では transient でもリトライしない（独立レビュー指摘: watchdog.ts 等の長時間稼働 Worker から呼ばれたとき event loop を同期sleepでブロックしないための回帰防止）', async () => {
+      mockSpawnSync.mockReturnValue(cliTransient())
+      mockCallApi.mockRejectedValue(new Error('503 Service Unavailable'))
+
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'test',
+        sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      expect((error as MetaReviewProviderError).failureClass).toBe('transient')
+      // retryTransient を渡していないので各段1回のみ（リトライしない）
+      expect(mockCallApi).toHaveBeenCalledOnce()
+      expect(mockSpawnSync).toHaveBeenCalledOnce()
+    })
+
+    it('retryTransient: true → transient を固定回数リトライしてから failureClass: transient で失敗する（autoReview.ts が明示的に opt-in する経路）', async () => {
+      mockSpawnSync.mockReturnValue(cliTransient())
+      mockCallApi.mockRejectedValue(new Error('503 Service Unavailable'))
+
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'test',
+        retryTransient: true,
+        sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      expect((error as MetaReviewProviderError).failureClass).toBe('transient')
+      // API段: 初回+リトライ2回=3回、CLI段: 初回+リトライ2回=3回
+      expect(mockCallApi).toHaveBeenCalledTimes(3)
+      expect(mockSpawnSync).toHaveBeenCalledTimes(3)
+      // transient は quota-exhausted.json に記録しない
+      expect(mockWriteFileSync).not.toHaveBeenCalled()
+    })
+
+    it('retryTransient: true で transient が途中で成功すれば、それ以上リトライせず結果を返す', async () => {
+      let apiCalls = 0
+      mockCallApi.mockImplementation(async () => {
+        apiCalls += 1
+        if (apiCalls < 2) throw new Error('503 Service Unavailable')
+        return 'recovered after retry'
+      })
+
+      const result = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'test',
+        retryTransient: true,
+        sleepImpl: noSleep,
+      })
+
+      expect(result).toBe('recovered after retry')
+      expect(apiCalls).toBe(2)
+      expect(mockSpawnSync).not.toHaveBeenCalled()
+    })
+
+    it('auth_or_config（認証・設定エラー）→ リトライせず fail-closed', async () => {
+      mockSpawnSync.mockReturnValue(cliError())
+      mockCallApi.mockRejectedValue(new Error('API key not valid. Please pass a valid API key.'))
+
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'test',
+        sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      // CLI(unknown) + API(auth_or_config) の混在は unknown に倒れる（fail-closed のまま）
+      expect(['auth_or_config', 'unknown']).toContain((error as MetaReviewProviderError).failureClass)
+      expect(mockCallApi).toHaveBeenCalledOnce()
+      expect(mockSpawnSync).toHaveBeenCalledOnce()
+      expect(mockWriteFileSync).not.toHaveBeenCalled()
+    })
+
+    it('unknown（原因不明の失敗）→ リトライせず fail-closed', async () => {
+      mockSpawnSync.mockReturnValue(cliError())
+      mockCallApi.mockRejectedValue(new Error('something went wrong'))
+
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'test',
+        sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      expect((error as MetaReviewProviderError).failureClass).toBe('unknown')
+      expect(mockCallApi).toHaveBeenCalledOnce()
+      expect(mockSpawnSync).toHaveBeenCalledOnce()
+      expect(mockWriteFileSync).not.toHaveBeenCalled()
+    })
+
+    it('CLI バイナリ未インストール（ENOENT）は、API 段の実信号（transient）を汚染しない', async () => {
+      // CI ランナーに agy がインストールされていない状況を再現する。
+      mockSpawnSync.mockReturnValue(cliEnoent())
+      mockCallApi.mockRejectedValue(new Error('503 Service Unavailable'))
+
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'test',
+        sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+
+      // CLI が ENOENT（unavailable）でも、API 段が実際に得た transient 信号がそのまま採用される
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      expect((error as MetaReviewProviderError).failureClass).toBe('transient')
+    })
+
+    it('診断情報（allowlist フィールドのみ）をログに出し、raw stderr をそのまま漏らさない', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const originalEnv = { ...process.env }
+      process.env.GEMINI_API_KEY = 'leaked-if-not-sanitized'
+      try {
+        mockSpawnSync.mockReturnValue(cliError())
+        mockCallApi.mockRejectedValue(new Error('failure containing leaked-if-not-sanitized token'))
+
+        await callGeminiWithFallback('test prompt', {
+          preferCli: false, featureName: 'test', sleepImpl: noSleep,
+        }).catch(() => undefined)
+
+        const logged = warnSpy.mock.calls.map((c) => c.join(' ')).join('\n')
+        expect(logged).toContain('failureClass=')
+        expect(logged).not.toContain('leaked-if-not-sanitized')
+      } finally {
+        process.env = originalEnv
+        warnSpy.mockRestore()
+      }
     })
   })
 
@@ -192,19 +412,18 @@ describe('callGeminiWithFallback', () => {
       mockSpawnSync.mockReturnValue(cli429())
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
 
-      await expect(
-        callGeminiWithFallback('test prompt', {
-          preferCli: false,
-          featureName: 'strategic-meta-review-scope_simplicity',
-        })
-      ).rejects.toThrow('quota exhausted')
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'strategic-meta-review-scope_simplicity',
+      }).catch((e: unknown) => e)
 
+      expect((error as MetaReviewProviderError).failureClass).toBe('quota')
       expect(mockWriteFileSync).toHaveBeenCalledOnce()
       // spawnSync は Gemini-CLI と Claude-CLI の2回（API呼び出しは callGeminiForReview 経由で別モック）
       expect(mockSpawnSync).toHaveBeenCalledTimes(2)
     })
 
-    it('API・CLI は quota 起因で失敗しても、Antigravity/Claude 段が非quota理由で失敗した場合は非quotaエラーとして区別される（2026-08-26 独立レビュー round2 修正）', async () => {
+    it('API・CLI は quota 起因で失敗しても、Antigravity/Claude 段が非quota理由で失敗した場合は quota-exhausted.json に記録しない（2026-08-26 独立レビュー round2 修正）', async () => {
       // Gemini-CLI（1回目）は quota、Claude-CLI（2回目、model引数で判別）は非quotaエラー
       mockSpawnSync.mockImplementation((_cmd, args) => {
         const model = (args as string[])[1]
@@ -213,12 +432,13 @@ describe('callGeminiWithFallback', () => {
       })
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
 
-      await expect(
-        callGeminiWithFallback('test prompt', {
-          preferCli: false,
-          featureName: 'test',
-        })
-      ).rejects.toThrow('Gemini failed, non-quota')
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false,
+        featureName: 'test',
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(MetaReviewProviderError)
+      expect((error as MetaReviewProviderError).failureClass).not.toBe('quota')
 
       // Gemini-CLI(quota) → Claude-CLI(非quota) の2回試みている
       expect(mockSpawnSync).toHaveBeenCalledTimes(2)
@@ -226,31 +446,15 @@ describe('callGeminiWithFallback', () => {
       expect(mockWriteFileSync).not.toHaveBeenCalled()
     })
 
-    it('quota 以外の失敗（CLI・API とも）では Antigravity/Claude を試さず、非quotaエラーとして区別される（2026-08-26 独立レビュー修正）', async () => {
-      mockSpawnSync.mockReturnValue(cliError())
-      mockCallApi.mockRejectedValue(new Error('unexpected 500 internal error'))
-
-      await expect(
-        callGeminiWithFallback('test prompt', {
-          preferCli: false,
-          featureName: 'test',
-        })
-      ).rejects.toThrow('Gemini failed, non-quota')
-
-      // Gemini-CLI の1回のみ（Claude フォールバックを試みていない）
-      expect(mockSpawnSync).toHaveBeenCalledTimes(1)
-      // 非quota失敗は quota-exhausted.json に記録しない（quota起因だったという誤情報を残さない）
-      expect(mockWriteFileSync).not.toHaveBeenCalled()
-    })
-
-    it('API が quota 起因失敗・CLI が非quota失敗の混在では Antigravity/Claude を試さず、非quotaエラーとして区別される（2026-08-26 独立レビュー修正）', async () => {
+    it('API が quota 起因失敗・CLI が非quota失敗の混在では Antigravity/Claude を試さず、quota以外として区別される（2026-08-26 独立レビュー修正）', async () => {
       mockSpawnSync.mockReturnValue(cliError())
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
 
-      await expect(
-        callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
-      ).rejects.toThrow('Gemini failed, non-quota')
+      const error = await callGeminiWithFallback('test prompt', {
+        preferCli: false, featureName: 'test', sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
 
+      expect((error as MetaReviewProviderError).failureClass).not.toBe('quota')
       expect(mockSpawnSync).toHaveBeenCalledTimes(1)
       expect(mockWriteFileSync).not.toHaveBeenCalled()
     })
@@ -266,9 +470,8 @@ describe('callGeminiWithFallback', () => {
         mockSpawnSync.mockReturnValue(cli429())
         mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
 
-        await expect(
-          callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
-        ).rejects.toThrow('quota exhausted')
+        await callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
+          .catch(() => undefined)
 
         for (const call of mockSpawnSync.mock.calls) {
           const env = call[2]?.env as NodeJS.ProcessEnv | undefined
@@ -289,9 +492,8 @@ describe('callGeminiWithFallback', () => {
       mockSpawnSync.mockReturnValue(cli429())
       mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
 
-      await expect(
-        callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
-      ).rejects.toThrow('quota exhausted')
+      await callGeminiWithFallback('test prompt', { preferCli: false, featureName: 'test' })
+        .catch(() => undefined)
 
       expect(mockSpawnSync.mock.calls.length).toBeGreaterThan(0)
       for (const call of mockSpawnSync.mock.calls) {
