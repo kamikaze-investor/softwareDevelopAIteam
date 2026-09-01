@@ -39,6 +39,7 @@ export async function runPreReview(input: PreReviewInput): Promise<PreReviewResu
 
   const reviewerResult = await reviewWithSeparation({
     jobId: input.jobId,
+    subjectId: input.taskId,
     taskId: input.taskId,
     implementerProvider: input.implementerProvider,
     phase: 'pre',

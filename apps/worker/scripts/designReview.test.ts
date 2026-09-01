@@ -40,7 +40,7 @@ describe('designReview CLI helpers', () => {
 
     const strategicInput = buildStrategicReviewInputFromDesign(input)
 
-    expect(strategicInput.taskId).toBe('task-design')
+    expect(strategicInput.subjectId).toBe('task-design')
     expect(strategicInput.taskTitle).toBe('Design review before implementation')
     expect(strategicInput.changedFiles).toEqual([
       'apps/worker/src/metaReviewer/strategicReview.ts',
@@ -186,6 +186,8 @@ function resultWithDecision(
   finalDecision: StrategicMetaReviewResult['finalDecision'],
 ): StrategicMetaReviewResult {
   return {
+    reviewKind: 'task',
+    subjectId: 'task-design',
     taskId: 'task-design',
     reviewLoad: 'medium',
     reviewLoadReasons: [],

@@ -18,6 +18,7 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import type { DesignReviewKind } from '@ai-team/shared'
 
 /**
  * .env から読み込んでよいキー。
@@ -35,7 +36,8 @@ import { resolve } from 'node:path'
 const ENV_ALLOWLIST: readonly string[] = ['GEMINI_API_KEY', 'GEMINI_MODEL']
 
 export interface DesignReviewRunnerInput {
-  taskId: string
+  reviewKind?: DesignReviewKind
+  subjectId: string
   taskTitle: string
   designText: string
   changedFiles: string[]
@@ -75,7 +77,7 @@ export function parseRunnerInput(raw: string): DesignReviewRunnerInput {
   const parsed = JSON.parse(raw) as Partial<DesignReviewRunnerInput>
 
   if (
-    typeof parsed.taskId !== 'string' ||
+    typeof parsed.subjectId !== 'string' ||
     typeof parsed.taskTitle !== 'string' ||
     typeof parsed.designText !== 'string' ||
     typeof parsed.workingDir !== 'string' ||
@@ -84,8 +86,14 @@ export function parseRunnerInput(raw: string): DesignReviewRunnerInput {
     throw new Error('invalid runner input')
   }
 
+  // 内部IPC契約（1プロセスの生存期間内だけのcontract）のため、未知の値を厳格に弾く。
+  if (parsed.reviewKind !== undefined && parsed.reviewKind !== 'task' && parsed.reviewKind !== 'roadmap') {
+    throw new Error(`invalid runner input: unknown reviewKind ${String(parsed.reviewKind)}`)
+  }
+
   return {
-    taskId: parsed.taskId,
+    reviewKind: parsed.reviewKind,
+    subjectId: parsed.subjectId,
     taskTitle: parsed.taskTitle,
     designText: parsed.designText,
     changedFiles: parsed.changedFiles as string[],
@@ -108,7 +116,8 @@ async function main(): Promise<void> {
   const { runStrategicMetaReview } = await import('../src/metaReviewer/strategicReview.js')
 
   const result = await runStrategicMetaReview({
-    taskId: input.taskId,
+    reviewKind: input.reviewKind ?? 'task',
+    subjectId: input.subjectId,
     taskTitle: input.taskTitle,
     changedFiles: input.changedFiles,
     gitDiff: input.designText,

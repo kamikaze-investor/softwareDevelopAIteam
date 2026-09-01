@@ -146,7 +146,11 @@ export interface IndependentReviewOutcome {
 
 /** REVIEW_UNAVAILABLE means a required review could not complete and must not be treated as ALIGNED. */
 export interface StrategicMetaReviewResult {
-  taskId: string
+  reviewKind: DesignReviewKind
+  /** task: taskId value. roadmap: projectId value. Never a synthetic taskId. */
+  subjectId: string
+  /** Populated only for reviewKind === 'task' (backward compat with existing consumers). */
+  taskId?: string
   reviewLoad: ReviewLoad
   reviewLoadReasons: string[]
   selectedFocuses: MetaReviewFocus[]
@@ -163,10 +167,14 @@ export interface StrategicMetaReviewResult {
 
 export type DesignReviewDecision = StrategicDecision | 'REVIEW_UNAVAILABLE'
 export type DesignReviewIndependentVerdict = IndependentReviewOutcome['verdict']
+export type DesignReviewKind = 'task' | 'roadmap'
 
 export interface DesignReviewEvidence {
   id: string
-  taskId: string
+  reviewKind: DesignReviewKind
+  subjectId: string
+  /** Populated only for reviewKind === 'task' (backward compat). undefined for 'roadmap'. */
+  taskId?: string
   designTextHash: string
   reviewLoad: ReviewLoad
   decision: DesignReviewDecision

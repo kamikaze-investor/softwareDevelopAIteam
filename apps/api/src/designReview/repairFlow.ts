@@ -324,12 +324,24 @@ export async function executeQueuedRepair(
   stepKey: string,
   deps: CoordinatorDeps = buildDefaultCoordinatorDeps(),
 ): Promise<RepairFlowOutcome> {
+  // Repairは「あるTaskの実装をやり直す」という概念そのものがTask固有であり、
+  // review_kind='roadmap'（Whole-Roadmap Review、まだ存在しない）はここへは来ない設計。
+  // taskId は型上optionalになった（DesignReviewRun.taskId?: string）ため、想定外に
+  // roadmap kindのrunがここへ渡された場合はnon-null assertionで握り潰さずfail-closedにする。
+  if (run.reviewKind !== 'task' || run.taskId === undefined) {
+    return {
+      status: 'escalated',
+      reason: `executeQueuedRepair only supports reviewKind=task, got ${run.reviewKind}`,
+    }
+  }
+  const taskId = run.taskId
+
   const sourceJobId = stepKey.slice(REPAIR_STEP_PREFIX.length).split(':')[0]
   const sourceJob = storage.jobs.findById(sourceJobId)
   // source Jobが引けないとprojectId / safeCommand / providerを復元できない。
   // 部分的に埋めた不完全なJobを作るより、人へ渡すほうが安全side。
   if (!sourceJob) {
-    escalateTaskToHuman(storage, run.taskId)
+    escalateTaskToHuman(storage, taskId)
     return { status: 'escalated', reason: 'source job for the repair chain is missing' }
   }
 
@@ -338,20 +350,20 @@ export async function executeQueuedRepair(
     return { status: 'already_started', stepKey }
   }
   if (outcome.status !== 'evidence_registered') {
-    escalateTaskToHuman(storage, run.taskId)
+    escalateTaskToHuman(storage, taskId)
     return {
       status: 'escalated',
       reason: `design review did not align (${outcome.status}${outcome.decision ? `: ${outcome.decision}` : ''})`,
     }
   }
 
-  if (storage.jobs.findByTaskId(run.taskId).some((job) => job.workflowStepKey === stepKey)) {
+  if (storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === stepKey)) {
     return { status: 'already_started', stepKey }
   }
 
   // review済みpromptをそのままaiCliPromptにする（追記・変更しない）。
   const repairJob = storage.jobs.create({
-    taskId: run.taskId,
+    taskId,
     projectId: sourceJob.projectId,
     agentRole: sourceJob.agentRole,
     status: 'queued',

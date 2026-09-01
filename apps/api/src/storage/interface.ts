@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -291,8 +291,13 @@ export interface IDesignReviewEvidenceStorage {
   findById(id: string): DesignReviewEvidence | undefined
   findByTaskId(taskId: string): DesignReviewEvidence[]
   findLatestByTaskId(taskId: string): DesignReviewEvidence | undefined
-  create(data: Omit<DesignReviewEvidence, 'id' | 'createdAt'>): DesignReviewEvidence
+  findLatestBySubjectId(reviewKind: DesignReviewKind, subjectId: string): DesignReviewEvidence | undefined
+  create(data: DesignReviewEvidenceCreateInput): DesignReviewEvidence
 }
+
+export type DesignReviewEvidenceCreateInput =
+  Omit<DesignReviewEvidence, 'id' | 'createdAt' | 'reviewKind' | 'subjectId'> &
+  Partial<Pick<DesignReviewEvidence, 'reviewKind' | 'subjectId'>>
 
 /**
  * Design Review の実行単位。API（Control Plane）が所有し、review専用runnerは
@@ -304,7 +309,9 @@ export interface IDesignReviewEvidenceStorage {
  */
 export interface DesignReviewRun {
   id: string
-  taskId: string
+  reviewKind: DesignReviewKind
+  subjectId: string
+  taskId?: string
   designText: string
   designTextHash: string
   /** startup recovery後の再kickをrunだけで完結させるため、レビュー入力を自己完結で保持する。 */
@@ -335,11 +342,15 @@ export interface QueuedDesignReviewRunInput {
   changedFiles: string[]
 }
 
+export type DesignReviewRunCreateInput =
+  Omit<DesignReviewRun, 'id' | 'reviewKind' | 'subjectId' | 'status' | 'attemptCount' | 'claimToken' | 'resultJson' | 'error' | 'createdAt' | 'startedAt' | 'completedAt'> &
+  Partial<Pick<DesignReviewRun, 'reviewKind' | 'subjectId'>>
+
 export interface IDesignReviewRunStorage {
   findById(id: string): DesignReviewRun | undefined
   findActiveByTaskId(taskId: string): DesignReviewRun | undefined
   /** 同一Taskにqueued/running中のrunがある場合は作成せず既存を返す（partial unique index準拠）。 */
-  create(input: Omit<DesignReviewRun, 'id' | 'status' | 'attemptCount' | 'claimToken' | 'resultJson' | 'error' | 'createdAt' | 'startedAt' | 'completedAt'>): DesignReviewRun
+  create(input: DesignReviewRunCreateInput): DesignReviewRun
   /** startup recovery後に再kick対象となるqueued run一覧。 */
   findQueued(): DesignReviewRun[]
   /** queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。 */
@@ -354,7 +365,7 @@ export interface IDesignReviewRunStorage {
     id: string,
     claimToken: string,
     resultJson: string,
-    evidence: Omit<DesignReviewEvidence, 'id' | 'createdAt'>,
+    evidence: DesignReviewEvidenceCreateInput,
   ): DesignReviewEvidence | undefined
   /** claim_token一致時のみqueuedへ戻し、tokenを無効化する。 */
   requeue(id: string, claimToken: string, error: string): boolean

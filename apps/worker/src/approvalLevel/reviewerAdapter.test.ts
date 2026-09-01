@@ -62,6 +62,7 @@ function makeApprovalLevelResult(overrides: Partial<ApprovalLevelResult> = {}): 
 function makeRequest(overrides: Partial<ReviewerRequest> = {}): ReviewerRequest {
   return {
     jobId: 'job-1',
+    subjectId: 'task-1',
     taskId: 'task-1',
     implementerProvider: 'codex',
     reviewerProvider: 'gemini',
@@ -322,6 +323,22 @@ describe('CodexReviewerAdapter.review', () => {
       contextFiles: [],
       mode: 'review',
       expectJson: true,
+    }))
+  })
+
+  it('reviewKind=roadmapではsubjectIdをtaskIdへ合成せず、ラベル付き値をadapter.runへ渡す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult())
+
+    await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+      reviewKind: 'roadmap',
+      subjectId: 'project-1',
+      taskId: undefined,
+    }))
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'roadmap-review:project-1',
     }))
   })
 

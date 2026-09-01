@@ -119,7 +119,7 @@ export async function resolveDesignReviewInput(
 }
 
 export function buildStrategicReviewInputFromDesign(input: DesignReviewCliInput): {
-  taskId: string
+  subjectId: string
   taskTitle: string
   changedFiles: string[]
   gitDiff: string
@@ -127,7 +127,7 @@ export function buildStrategicReviewInputFromDesign(input: DesignReviewCliInput)
   materialKind: 'design'
 } {
   return {
-    taskId: input.taskId,
+    subjectId: input.taskId,
     taskTitle: input.taskTitle,
     changedFiles: input.changedFiles,
     gitDiff: input.designText,

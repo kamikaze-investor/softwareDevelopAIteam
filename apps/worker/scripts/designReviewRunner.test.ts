@@ -87,15 +87,35 @@ describe('parseRunnerInput', () => {
   it('必須項目が揃っていればparseできる', () => {
     const input = parseRunnerInput(
       JSON.stringify({
-        taskId: 't1', taskTitle: 'title', designText: 'text',
+        subjectId: 't1', taskTitle: 'title', designText: 'text',
         changedFiles: ['a.ts'], workingDir: '/w',
       }),
     )
-    expect(input.taskId).toBe('t1')
+    expect(input.subjectId).toBe('t1')
     expect(input.changedFiles).toEqual(['a.ts'])
   })
 
   it('欠落があれば例外になる', () => {
-    expect(() => parseRunnerInput(JSON.stringify({ taskId: 't1' }))).toThrow('invalid runner input')
+    expect(() => parseRunnerInput(JSON.stringify({ subjectId: 't1' }))).toThrow('invalid runner input')
+  })
+
+  it('reviewKind roadmap を受け入れ、subjectId を保持する', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        reviewKind: 'roadmap', subjectId: 'project-1', taskTitle: 'title',
+        designText: 'text', changedFiles: [], workingDir: '/w',
+      }),
+    )
+    expect(input.reviewKind).toBe('roadmap')
+    expect(input.subjectId).toBe('project-1')
+  })
+
+  it('未知の reviewKind は拒否する', () => {
+    expect(() => parseRunnerInput(
+      JSON.stringify({
+        reviewKind: 'bogus', subjectId: 'project-1', taskTitle: 'title',
+        designText: 'text', changedFiles: [], workingDir: '/w',
+      }),
+    )).toThrow('invalid runner input')
   })
 })

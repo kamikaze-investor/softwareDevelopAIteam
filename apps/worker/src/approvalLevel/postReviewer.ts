@@ -44,6 +44,7 @@ export async function runPostReview(input: PostReviewInput): Promise<PostReviewR
 
   const reviewerResult = await reviewWithSeparation({
     jobId: input.jobId,
+    subjectId: input.taskId,
     taskId: input.taskId,
     implementerProvider: input.implementerProvider,
     phase: 'post',
