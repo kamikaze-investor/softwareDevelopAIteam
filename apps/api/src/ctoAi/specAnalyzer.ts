@@ -11,20 +11,26 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
+import type { Gap, StructuredConstraint } from '@ai-team/shared'
 import { z } from 'zod'
 
 // ────────────────────────────────────────────────────────────
 // 出力型定義
+//
+// Gap / StructuredConstraint の型そのものは packages/shared/src/types/project.ts が正本
+// （API・Mobile UI・Roadmap生成プロンプトの複数箇所で共有するため。Meta Reviewer指摘、
+// 2026-09-01）。ここではLLM出力の実行時検証に使うZod schemaだけを持ち、
+// `z.ZodType<Gap>` 等で共有型との一致をコンパイル時に強制する。
 // ────────────────────────────────────────────────────────────
 
-export const GapSchema = z.object({
+export const GapSchema: z.ZodType<Gap> = z.object({
   category: z.enum(['business', 'technical', 'data', 'cost', 'legal', 'other']),
   description: z.string(),
   severity: z.enum(['must_resolve', 'should_resolve', 'optional']),
   suggestion: z.string(),
 })
 
-export const StructuredConstraintSchema = z.object({
+export const StructuredConstraintSchema: z.ZodType<StructuredConstraint> = z.object({
   kind: z.enum([
     'max_task_count',
     'allowed_path_prefixes',
@@ -69,8 +75,10 @@ export const SpecAnalysisSchema = z.object({
 })
 
 export type SpecAnalysis = z.infer<typeof SpecAnalysisSchema>
-export type Gap = z.infer<typeof GapSchema>
-export type StructuredConstraint = z.infer<typeof StructuredConstraintSchema>
+// Gap / StructuredConstraint は @ai-team/shared からの型のみを使う（このモジュール内での
+// 別名再宣言はしない）。既存の `import type { Gap } from './specAnalyzer.js'` 経由の
+// 呼び出し元がある場合に備え、後方互換のため再export だけしておく。
+export type { Gap, StructuredConstraint }
 
 // ────────────────────────────────────────────────────────────
 // プロンプト

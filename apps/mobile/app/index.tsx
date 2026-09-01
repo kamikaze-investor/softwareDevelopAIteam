@@ -7,6 +7,7 @@
 import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type {
+  Gap,
   Job,
   Project,
   ProjectStatus,
@@ -82,12 +83,12 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
   return (await response.json()) as Job[]
 }
 
-export interface ProjectDefinitionGap {
-  category: string
-  description: string
-  severity: 'must_resolve' | 'should_resolve' | 'optional'
-  suggestion: string
-}
+/**
+ * `@ai-team/shared`の`Gap`のalias。API/Mobile間で共有すべき型をMobile側で個別宣言していた
+ * ものを、Meta Reviewer指摘（2026-09-01）に沿って共有型のimportへ差し替えた。呼び出し元の
+ * 変更を最小にするため、このモジュール内での名前は維持する。
+ */
+export type ProjectDefinitionGap = Gap
 
 /**
  * 409時は本体APIの固定エラー文だけを返す（token・内部情報は含めない）。
