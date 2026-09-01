@@ -52,29 +52,35 @@ PowerShellでは空、`USERPROFILE`/`APPDATA`等は一切渡さない）で`cmd.
 - `--output-last-message`変更そのものに起因する不具合・クラッシュ・安全機構の後退は、確認できた範囲では
   見つかっていない。
 
-## 4. 未確定・要再検証（使用量上限のため中断）
+## 4. D・E 再実行結果（quota解除後、直接呼び出し経路）
 
-- **D**: 不正モデル名時の失敗原因の切り分け（CLI拒否 vs 使用量上限）。stderrを記録した上で再実行が必要。
-- **E**: 「旧方式と比べて既存workflowに回帰がない」の直接確認が未実施。ユーザー指定の必須確認項目のうち
-  最も基本的なものであり、これが通るまでADOPT判定はできない。
-- 使用量上限のエラーメッセージによれば、`Sep 2nd, 2026 2:05 AM`（このマシンのタイムゾーンでの表示）以降に
-  再度実モデル呼び出しが可能になる見込み。
+再実行に使ったポーリングスクリプト（`.e2e-tmp/poll-remaining.sh`、未コミット）には
+**バグ**があった: quota解除判定を `stderr.includes('usage limit')` の有無で行っていたが、
+Codex呼び出しには毎回 CLAUDE.md/AGENTS.md 由来の Constitution テキストが H-1対策として
+プロンプト先頭へ注入されており、その本文中に「他Agent/Modelが**usage limit**・provider障害・
+一時的利用不能...」という一般論の記述が含まれていた。これが誤検出され、実際にはquotaが
+既に回復していたにもかかわらず、複数回「still rate-limited」と誤報告していた
+（＝実際の待機時間は本ドキュメントの当初想定より短かった可能性が高い）。
+
+バグ修正後ではなく、ログの実内容を直接確認して切り分けた結果、以下の**実応答**が得られた:
+
+- **D**: `exitCode=1`, `providerFailureKind=undefined`, `blocked=true`, `retryCount=1`。
+  stderrは `{"type":"error","status":400,"error":{"type":"invalid_request_error","message":
+  "The 'this-model-does-not-exist-xyz' model is not supported when using Codex with a ChatGPT
+  account."}}`。**使用量上限ではなく、不正なモデル名に対するCodex APIの正規のHTTP 400拒否**と
+  確定した。`isApiError`判定（`exitCode >= 500 || stderr.includes('API Error') || stderr.includes('5xx')`）
+  は400番台エラーを5xxとして誤分類しておらず、`providerFailureKind`が`undefined`のままなのは
+  **既存コードの正しい挙動**（今回のPoC変更とは無関係）。一時ファイルのcleanupも正常（leftoverなし）。
+- **E**: **PASS**。`exitCode=0`, `stdout="hello\n"`, `stderr=""`。`expectJson`未指定のため
+  `buildCodexOutputLastMessagePath()`は即座に`undefined`を返し`--output-last-message`は
+  argvに一切追加されない設計どおり、旧方式と完全に同一の経路で正常応答した。
+  **「旧方式と比べて既存workflowに回帰がない」を実モデル応答で確認した。**
 
 ## 5. 結論（このドキュメント時点）
 
-**PENDING_VERIFICATION（維持）。**
+**ADOPT_WITH_LIMITATIONS。**
 
-DとEの再実行（使用量上限解除後）が完了し、Eが旧方式と同等に成功することを確認できて初めて
-`ADOPT_WITH_LIMITATIONS`への格上げとPR化を検討する。現時点でADOPT_WITH_LIMITATIONSとしてPR化を
-進めることはしない。
-
-## 6. 再実行手順（quota解除後）
-
-未コミットのまま残してある検証ハーネスをそのまま使う:
-
-```
-apps/worker/scripts/e2eVerifyCaseEOnly.ts   — ケースEのみ、stderrも出力
-apps/worker/scripts/e2eVerifyCodexNativeRuntime.ts — A〜F一式
-```
-
-`C:\workspace\target\verify-repo` は再利用可能な状態でそのまま残している。
+必須確認項目（A: 正常系, B: fallback, C: timeout+cleanup, D: エラー分類, E: 回帰なし,
+F: File Guard検出）を全て実モデル応答/実測で確認した。対象はCodexプロバイダーの
+`expectJson`時の`--output-last-message`抽出のみに閉じており、rollbackはこのコミットの
+revertで完結する。session/resume・cancel/interrupt・streaming livenessには今回進まない。
