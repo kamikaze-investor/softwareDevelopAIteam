@@ -1,5 +1,5 @@
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
-import type { ApprovalLevelResult } from '@ai-team/shared'
+import type { ApprovalLevelResult, DesignReviewKind } from '@ai-team/shared'
 import { createAiCliAdapter } from '../aiCli/factory.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
 import { TARGET_ROOT } from '../utils/pathUtils.js'
@@ -16,7 +16,11 @@ export interface ReviewIssue {
 
 export interface ReviewerRequest {
   jobId: string
-  taskId: string
+  reviewKind?: DesignReviewKind
+  /** task: taskId value. roadmap: projectId value. Never a synthetic taskId. */
+  subjectId: string
+  /** Populated only for reviewKind === 'task' (backward compat with existing consumers). */
+  taskId?: string
   implementerProvider: ImplementerProvider
   reviewerProvider: ReviewerProvider
   phase: ReviewPhase
@@ -238,7 +242,13 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
 
     try {
       const result = await adapter.run({
-        taskId: req.taskId,
+        // AiCliRequest.taskId (packages/shared/src/types/ai_cli.ts) is a required string used only
+        // as a log-label here (a secret-scan warning message and a saved-log filename — never fed
+        // into the review prompt itself, see buildReviewPrompt() above). It is not a schema/FK
+        // column, so unlike design_review_runs.task_id there is no latent-incompatibility risk in
+        // giving it a clearly-labeled non-task value. For reviewKind='roadmap' there is no real
+        // taskId, so an honestly-prefixed label is used instead of disguising subjectId as one.
+        taskId: req.taskId ?? `roadmap-review:${req.subjectId}`,
         provider: 'codex',
         workingDir: TARGET_ROOT,
         prompt,

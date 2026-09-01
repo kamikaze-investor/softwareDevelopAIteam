@@ -243,9 +243,12 @@ export async function runIndependentReview(
   const materialKind = input.materialKind ?? 'diff'
 
   try {
+    const reviewKind = input.reviewKind ?? 'task'
     const result = await adapter.review({
       jobId: input.subjectId,
-      taskId: input.subjectId,
+      reviewKind,
+      subjectId: input.subjectId,
+      taskId: reviewKind === 'task' ? input.subjectId : undefined,
       implementerProvider: 'claude_code',
       reviewerProvider: INDEPENDENT_REVIEWER_PROVIDER,
       phase: materialKind === 'design' ? 'pre' : 'post',
