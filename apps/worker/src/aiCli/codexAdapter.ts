@@ -30,6 +30,10 @@ import type { AiCliRequest, AiCliAdapterConfig } from '@ai-team/shared'
 import { BaseCliAdapter } from './adapter.js'
 import { resolveCodexPath } from './codexPathResolver.js'
 
+interface CodexLastMessageRequest extends AiCliRequest {
+  codexOutputLastMessagePath?: string
+}
+
 export class CodexAdapter extends BaseCliAdapter {
   constructor(config: AiCliAdapterConfig) {
     // cliPath が明示指定されていない場合は resolveCodexPath() で自動解決
@@ -73,6 +77,11 @@ export class CodexAdapter extends BaseCliAdapter {
     // 未指定時は従来どおり Codex CLI のデフォルトモデルに委ねる
     // （実装用Jobの挙動を変えないため、ここで既定値を補わない）。
     const modelArgs = request.model ? ['--model', request.model] : []
+    const outputLastMessagePath =
+      (request as CodexLastMessageRequest).codexOutputLastMessagePath
+    const outputLastMessageArgs = outputLastMessagePath
+      ? ['--output-last-message', outputLastMessagePath]
+      : []
 
     return [
       'exec',
@@ -80,6 +89,7 @@ export class CodexAdapter extends BaseCliAdapter {
       ...modelArgs,
       '-C', request.workingDir,   // ワークスペースルートを明示（execFileSync の cwd と一致）
       '--ephemeral',               // Workerの自動実行ではセッションファイルを残さない
+      ...outputLastMessageArgs,
       '-',                         // stdin からプロンプトを読む（useStdinPrompt() = true）
     ]
   }
