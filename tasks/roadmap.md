@@ -1798,6 +1798,21 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       新しいGate/Queue/daemonなし、`apps/worker/src/index.ts`（CONTROL REPOSITORY保護対象）も
       無変更。テスト2件追加、`apps/api`全体59ファイル/879テスト成功。
 
+      **再追記（2026-09-01、CEOレビューで発覚・修正済み、PR #58
+      `fix/continuation-retry-durable-not-single-attempt`、コミット`d48ef3a`）**: 上記PR #56の
+      修正は、running遷移時に`ensureTaskContinuation()`を**1回だけ**試行する設計だった。
+      その1回が失敗・未完了（例: 依存Task未完了）で終わると、`routes/jobs.ts`のack-without-503化
+      によりWorker Outbox側の再送機会も既に失われているため、**再試行する契機が二度と来ない
+      （永久pending）**リスクがあった。**修正**: `taskContinuation.ts`に共有関数
+      `retryPendingContinuationsForProject()`を切り出し、`PATCH /api/projects/:id`のresume時
+      だけでなく、`GET /api/projects/:id`・`GET /api/projects`（いずれもMobileの`usePolling`が
+      既に継続的にpollしている既存endpoint）からも呼ぶよう変更。Workerの`pollJobs()`が自分の
+      poll cycleにOutbox再送を相乗りさせているのと同じパターンをMobile側の既存poll cycleへ
+      適用しただけで、新しいQueue/daemon/pollingは追加していない。テストで
+      (a) 依存Task未完了でresume単体では完了できないこと、その後**2回目の手動resumeなしに**
+      次のGET pollだけで自動回収されること、(b) resume時sweepとpoll時sweepが同時に競合しても
+      既存の`workflow_step_key`一意制約により重複Jobが生成されないこと、を確認済み。
+
 **目的:** CEOがスマホだけで「開発指示を出す→Project/Task/Jobを確認する→進捗を見る→危険操作は承認で
 止まる→承認/却下する→結果・失敗理由を見る→必要なら再指示する」という一連のサイクルを完結できる状態にする。
 スマホ操作MVPの定義・現状・不足機能の詳細な整理は `docs/PROJECT_CURRENT_STATE.md`「スマホ操作MVPの現在地」を参照。
