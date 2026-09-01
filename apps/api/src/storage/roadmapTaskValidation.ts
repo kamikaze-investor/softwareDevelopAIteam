@@ -1,4 +1,8 @@
-import type { AgentRole } from '@ai-team/shared'
+import type { AgentRole, RoadmapTaskCategory, StructuredConstraint } from '@ai-team/shared'
+
+// category の型そのものは packages/shared/src/types/project_roadmap.ts が正本
+// （Roadmap生成のZod schemaとも共有するため。Meta Reviewer指摘、2026-09-01）。
+export type { RoadmapTaskCategory }
 
 export interface RoadmapSyncTaskInput {
   roadmapTaskKey: string
@@ -6,6 +10,7 @@ export interface RoadmapSyncTaskInput {
   description: string
   phase: number
   assignee: AgentRole
+  category: RoadmapTaskCategory
   dependencies: string[]
   acceptanceCriteria: string[]
   allowedPaths: string[]
@@ -35,6 +40,10 @@ export type RoadmapValidationIssueCode =
   | 'empty_roadmap'
   | 'duplicate_phase_number'
   | 'unknown_phase'
+  | 'task_count_exceeded'
+  | 'disallowed_path'
+  | 'dependency_count_exceeded'
+  | 'control_plane_operation_task'
 
 export interface RoadmapValidationIssue {
   code: RoadmapValidationIssueCode
@@ -218,4 +227,156 @@ export function validateRoadmapPhases(
     ...buildDuplicatePhaseIssues(phases),
     ...buildUnknownPhaseIssues(tasks, phaseNumbers),
   ]
+}
+
+// ────────────────────────────────────────────────────────────
+// 構造化制約（Structured Constraints）の機械的検証
+//
+// ここではタスク一覧の構造化フィールドから機械的に数えられる制約だけを検証する
+// （max_task_count / allowed_path_prefixes / max_dependency_count / category拒否）。
+//
+// 承認済みギャップ（ACKNOWLEDGED-GAP-constraint-validation）:
+//   forbidden_new_files と forbidden_technologies は意味的判断が必要（このdiff計画が
+//   新規ファイルを生むか？/ この説明が禁止技術を暗示するか？）なため、機械的検証は
+//   行わない。これらは別途設計中のセマンティックReview経路の責務である。
+//   本関数はこれらのkindを検証対象とせず、返り値の`checkedKinds`で「何を検証したか」を
+//   明示する。`uncheckedKinds`に含まれるkindは検証していないという事実を監査可能にする。
+// ────────────────────────────────────────────────────────────
+
+export interface RoadmapConstraintValidationResult {
+  issues: RoadmapValidationIssue[]
+  checkedKinds: string[]
+  uncheckedKinds: string[]
+}
+
+const KINDS_NOT_MECHANICALLY_CHECKED = ['forbidden_new_files', 'forbidden_technologies'] as const
+
+function buildMaxTaskCountIssues(
+  tasks: RoadmapSyncTaskInput[],
+  constraint: StructuredConstraint,
+): RoadmapValidationIssue[] {
+  if (typeof constraint.value !== 'number') return []
+  if (tasks.length <= constraint.value) return []
+  return [{
+    code: 'task_count_exceeded' as const,
+    message: `Task count ${tasks.length} exceeds max_task_count constraint (${constraint.value})`,
+  }]
+}
+
+/**
+ * pathがprefixのpath-segment境界で始まっているかを判定する。
+ * 単純な`path.startsWith(prefix)`だと、prefix="apps/eng"がpath="apps/engine-evil/x.ts"にも
+ * マッチしてしまう（ディレクトリ境界を無視した文字列prefix一致）。allowed_path_prefixesは
+ * scope境界そのものを強制する制約のため、この取り違えは許容しない。
+ */
+function matchesPathPrefix(path: string, prefix: string): boolean {
+  if (path === prefix) return true
+  const boundedPrefix = prefix.endsWith('/') ? prefix : `${prefix}/`
+  return path.startsWith(boundedPrefix)
+}
+
+function buildDisallowedPathIssues(
+  tasks: RoadmapSyncTaskInput[],
+  constraint: StructuredConstraint,
+): RoadmapValidationIssue[] {
+  if (!Array.isArray(constraint.value)) return []
+  const prefixes = constraint.value
+  const issues: RoadmapValidationIssue[] = []
+  for (const task of tasks) {
+    for (const path of task.allowedPaths) {
+      if (!prefixes.some((prefix) => matchesPathPrefix(path, prefix))) {
+        issues.push({
+          code: 'disallowed_path' as const,
+          roadmapTaskKey: task.roadmapTaskKey,
+          message: `Task ${task.roadmapTaskKey} has disallowed path "${path}" (allowed prefixes: ${prefixes.join(', ')})`,
+        })
+      }
+    }
+  }
+  return issues
+}
+
+function buildDependencyCountIssues(
+  tasks: RoadmapSyncTaskInput[],
+  constraint: StructuredConstraint,
+): RoadmapValidationIssue[] {
+  if (typeof constraint.value !== 'number') return []
+  const issues: RoadmapValidationIssue[] = []
+  for (const task of tasks) {
+    if (task.dependencies.length > constraint.value) {
+      issues.push({
+        code: 'dependency_count_exceeded' as const,
+        roadmapTaskKey: task.roadmapTaskKey,
+        message: `Task ${task.roadmapTaskKey} has ${task.dependencies.length} dependencies (limit: ${constraint.value})`,
+      })
+    }
+  }
+  return issues
+}
+
+function buildControlPlaneOperationIssues(tasks: RoadmapSyncTaskInput[]): RoadmapValidationIssue[] {
+  const issues: RoadmapValidationIssue[] = []
+  for (const task of tasks) {
+    if (task.category === 'control_plane_operation') {
+      issues.push({
+        code: 'control_plane_operation_task' as const,
+        roadmapTaskKey: task.roadmapTaskKey,
+        message: `Task ${task.roadmapTaskKey} duplicates AIteamOS control-plane machinery (category: control_plane_operation) and must not exist as a Task`,
+      })
+    }
+  }
+  return issues
+}
+
+/**
+ * DB書き込み前に、生成されたRoadmapが Structured Constraints に機械的に適合するか検証する。
+ * 検証対象はタスク一覧の構造化フィールドのみ（DBは見ず、意味的判断はしない）。
+ *
+ * NOTE: セマンティックReview経路の責務である forbidden_new_files / forbidden_technologies の
+ * 機械的チェックは意図的に行わない（ACKNOWLEDGED-GAP-constraint-validation）。
+ * 本関数はcheckedKinds / uncheckedKinds で「何を検証したか」を明示し、検証漏れを隠さない。
+ */
+export function validateRoadmapConstraints(
+  tasks: RoadmapSyncTaskInput[],
+  constraints: StructuredConstraint[],
+): RoadmapConstraintValidationResult {
+  const issues: RoadmapValidationIssue[] = []
+  const checkedKinds = new Set<string>()
+  const uncheckedKinds = new Set<string>()
+
+  for (const constraint of constraints) {
+    switch (constraint.kind) {
+      case 'max_task_count':
+        issues.push(...buildMaxTaskCountIssues(tasks, constraint))
+        checkedKinds.add('max_task_count')
+        break
+      case 'allowed_path_prefixes':
+        issues.push(...buildDisallowedPathIssues(tasks, constraint))
+        checkedKinds.add('allowed_path_prefixes')
+        break
+      case 'max_dependency_count':
+        issues.push(...buildDependencyCountIssues(tasks, constraint))
+        checkedKinds.add('max_dependency_count')
+        break
+      case 'forbidden_new_files':
+      case 'forbidden_technologies':
+        uncheckedKinds.add(constraint.kind)
+        break
+      case 'other':
+        // 'other' is user-supplied free-form; nothing mechanical to check here.
+        checkedKinds.add('other')
+        break
+      default:
+        uncheckedKinds.add(String(constraint.kind))
+    }
+  }
+
+  // カテゴリ拒否は常に強制（structuredConstraints の有無に関わらず実行）
+  issues.push(...buildControlPlaneOperationIssues(tasks))
+
+  return {
+    issues,
+    checkedKinds: [...checkedKinds].sort(),
+    uncheckedKinds: [...uncheckedKinds].sort(),
+  }
 }

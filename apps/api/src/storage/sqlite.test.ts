@@ -136,6 +136,7 @@ describe('SQLiteStorage', () => {
         description: `Description ${roadmapTaskKey}`,
         phase: 1,
         assignee: 'developer_ai',
+        category: 'implementation',
         dependencies: [],
         acceptanceCriteria: [`Done ${roadmapTaskKey}`],
         allowedPaths: [`src/${roadmapTaskKey}`],
@@ -1767,8 +1768,8 @@ describe('SQLiteStorage', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
-          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 2, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [
           { phaseNumber: 2, name: 'Second', goal: 'G2' },
@@ -1793,7 +1794,7 @@ describe('SQLiteStorage', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 1, name: 'Original', goal: 'Original goal' }],
       })
@@ -1811,8 +1812,8 @@ describe('SQLiteStorage', () => {
       const result = storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
-          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [
           { phaseNumber: 1, name: 'Repurposed', goal: 'Repurposed goal' },
@@ -1840,7 +1841,7 @@ describe('SQLiteStorage', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'Original title', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'Original title', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 1, name: 'Phase 1', goal: 'G1' }],
       })
@@ -1857,7 +1858,7 @@ describe('SQLiteStorage', () => {
       const result = storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'Changed title', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'Changed title', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [
           { phaseNumber: 1, name: 'Phase 1', goal: 'G1' },
@@ -1883,7 +1884,7 @@ describe('SQLiteStorage', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 1, name: 'First', goal: 'G1' }],
       })
@@ -1891,7 +1892,7 @@ describe('SQLiteStorage', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [{ phaseNumber: 2, name: 'Second', goal: 'G2' }],
       })
@@ -1902,8 +1903,8 @@ describe('SQLiteStorage', () => {
       storage.tasks.syncRoadmapTasks({
         projectId: project.id,
         tasks: [
-          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
-          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-001', title: 'T1', description: '', phase: 1, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
+          { roadmapTaskKey: 'task-002', title: 'T2', description: '', phase: 2, assignee: 'developer_ai', category: 'implementation', dependencies: [], acceptanceCriteria: [], allowedPaths: [] },
         ],
         phases: [
           { phaseNumber: 1, name: 'First', goal: 'G1' },

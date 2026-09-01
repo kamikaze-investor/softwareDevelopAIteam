@@ -12,12 +12,20 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
+import { ROADMAP_TASK_CATEGORIES, type RoadmapTaskCategory } from '@ai-team/shared'
 import { z } from 'zod'
 import type { SpecAnalysis } from './specAnalyzer.js'
 
 // ────────────────────────────────────────────────────────────
 // 出力型定義
+//
+// category の型そのものは packages/shared/src/types/project_roadmap.ts が正本
+// （roadmapTaskValidation.ts の検証と共有するため。Meta Reviewer指摘、2026-09-01）。
+// ここではLLM出力の実行時検証に使うZod schemaだけを持ち、`z.ZodType<RoadmapTaskCategory>`で
+// 共有型との一致をコンパイル時に強制する。
 // ────────────────────────────────────────────────────────────
+
+export const GeneratedTaskCategorySchema: z.ZodType<RoadmapTaskCategory> = z.enum(ROADMAP_TASK_CATEGORIES)
 
 export const GeneratedTaskSchema = z.object({
   id: z.string().regex(/^task-\d+$/, 'task-001 形式で指定'),
@@ -25,6 +33,7 @@ export const GeneratedTaskSchema = z.object({
   description: z.string(),
   phase: z.number().int().min(1),
   assignee: z.enum(['cto_ai', 'context_manager', 'developer_ai', 'reviewer_ai', 'qa_ai']),
+  category: GeneratedTaskCategorySchema,
   dependencies: z.array(z.string()).default([]),
   acceptanceCriteria: z.array(z.string()).default([]),
   allowedPaths: z.array(z.string()).default([]),
@@ -65,8 +74,15 @@ ${constitutionPrinciplesPrompt}
 - Phase 1 は基盤構築（型定義・DB・API骨格）
 - Phase 2 はMVP機能（最小限の動くもの）
 - Phase 3 は品質・改善
-- タスク数は合計10〜20件程度（MVPスコープに絞る）
+- タスク数は合計10〜20件程度がデフォルトだが、Structured Constraints に max_task_count がある場合はその値を優先する
 - allowedPaths は実際に変更するディレクトリのみ（例: "apps/engine/src/"）
+- 各タスクには category を必ず設定する:
+  - "implementation": 実際にコード/ドキュメント/設定の変更を行いプロジェクトの成果物を生み出すタスク
+  - "verification": 既に実装された変更のテスト・QA・検証を行うタスク
+  - "control_plane_operation": AIteamOSの自動操作を複製するタスク（Design Review提出・Approval取得・ブランチ作成・コミット・PR作成・CI確認・Commit Gate実行など）— **このカテゴリのタスクは絶対に生成しないでください**。これらはTaskシステムの外で自動的に実行されるため、Taskとして生成しない
+  - "other": 上記以外（ sparingly 使用し、可能な限り他の3つを優先する）
+
+Structured Constraints が max_task_count を含む場合、タスク数はその制限を厳守してください。デフォルトの10〜20件ではなく、制約の値が上限です。
 
 以下のJSON形式のみで回答してください。コードブロック・前置き・後書きは不要です:
 
@@ -86,6 +102,7 @@ ${constitutionPrinciplesPrompt}
       "description": "何をするか（100文字以内）",
       "phase": 1,
       "assignee": "developer_ai",
+      "category": "implementation",
       "dependencies": [],
       "acceptanceCriteria": ["テストが通る", "型エラーがない"],
       "allowedPaths": ["apps/engine/src/"],

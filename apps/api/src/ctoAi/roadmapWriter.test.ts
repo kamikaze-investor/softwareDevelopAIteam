@@ -29,6 +29,7 @@ const MOCK_ROADMAP: Roadmap = {
       description: 'packages/shared に型を追加',
       phase: 1,
       assignee: 'developer_ai',
+      category: 'implementation',
       dependencies: [],
       acceptanceCriteria: ['型エラーがない'],
       allowedPaths: ['packages/shared/src/'],
