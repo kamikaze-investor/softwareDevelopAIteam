@@ -1554,6 +1554,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           aiCliProvider: latestJob.aiCliProvider,
           aiCliPrompt: instructionPrompt,
           aiCliMode: latestJob.aiCliMode,
+          // 上のgit_commit分岐と同じ `resume:<元Job>:1` 規約（既存のretry:/repair:と同じ
+          // 「anchorはsourceJobId、末尾は常に:1」パターン）。これが無いとupdateAndCreateNextWorkflowJob
+          // が「手動Jobなのでworkflowを進められない」としてreview自動生成を拒否し、成功しても
+          // review→git_commit→Task done→continuationへ自動的に戻れない
+          // （routes/jobs.ts の isResumeImplementJob がこの文字列を判定に使う。変更時は両方直すこと）。
+          workflowStepKey: `resume:${latestJob.id}:1`,
         })
 
         return { ok: true, job }
