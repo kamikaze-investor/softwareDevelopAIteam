@@ -370,6 +370,62 @@ describe('CodexReviewerAdapter.review', () => {
     },
   )
 
+  it('prefers parsedOutput when stdout contains Codex narration before unfenced JSON', async () => {
+    const run = mockCodexAdapterRun()
+    const rawStdout = [
+      'codex exec started',
+      'I inspected the requested files and found the final reviewer verdict.',
+      '{"verdict":"approved","summary":"parsed output succeeded","issues":[],"confidence":0.9}',
+    ].join('\n')
+
+    expect(parseReviewerResponse(rawStdout, 'codex', 'pre').verdict).toBe('blocking')
+
+    run.mockResolvedValue(makeAiCliResult({
+      stdout: rawStdout,
+      parsedOutput: {
+        verdict: 'approved',
+        summary: 'parsed output succeeded',
+        issues: [],
+        confidence: 0.9,
+      },
+    }))
+
+    const result = await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(result.provider).toBe('codex')
+    expect(result.verdict).toBe('approved')
+    expect(result.summary).toBe('parsed output succeeded')
+    expect(result.issues).toEqual([])
+    expect(result.confidence).toBe(0.9)
+    expect(result.rawResponse).toBe(rawStdout)
+  })
+
+  it('fails closed on a malformed parsedOutput without falling back to re-parsing stdout', async () => {
+    const run = mockCodexAdapterRun()
+    // stdout would itself parse successfully if the fallback path were reached -- this proves the
+    // malformed parsedOutput case fails closed on its own, rather than silently getting a second
+    // chance via the very stdout parsedOutput was specifically built to bypass.
+    const rawStdout = '{"verdict":"approved","summary":"should never be used","issues":[],"confidence":0.9}'
+
+    run.mockResolvedValue(makeAiCliResult({
+      stdout: rawStdout,
+      parsedOutput: {
+        summary: 'missing a valid verdict field',
+      },
+    }))
+
+    const result = await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+    }))
+
+    expect(result.provider).toBe('codex')
+    expect(result.verdict).toBe('blocking')
+    expect(result.summary).toBe('レビュー応答のパースに失敗しました')
+    expect(result.rawResponse).toBe(rawStdout)
+  })
+
   it('adapter.run が blocked:true を返すと blocking に倒す', async () => {
     const run = mockCodexAdapterRun()
     run.mockResolvedValue(makeAiCliResult({

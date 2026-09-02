@@ -56,9 +56,20 @@ function mockCodexReviewerRun(
   verdict: 'approved' | 'changes_requested' | 'blocking',
   summary = 'codex independent review',
 ): void {
-  const stdout = JSON.stringify({ verdict, summary, issues: [], confidence: 0.9 })
+  // Mirrors real codex exec output: narration/reasoning text on stdout ahead of the final
+  // answer, with the clean answer captured separately via --output-last-message as
+  // AiCliResult.parsedOutput (apps/worker/src/aiCli/adapter.ts). A prior bug had
+  // CodexReviewerAdapter re-parse the noisy stdout instead of using parsedOutput -- this shape
+  // (unparseable stdout, valid parsedOutput) proves both task-kind and roadmap-kind independent
+  // reviews (both share CodexReviewerAdapter) go through the fixed, parsedOutput-preferring path.
+  const parsedOutput = { verdict, summary, issues: [], confidence: 0.9 }
+  const stdout = [
+    'codex exec started',
+    'Inspecting the requested review material and forming a verdict.',
+    JSON.stringify(parsedOutput),
+  ].join('\n')
   mockCreateAiCliAdapter.mockReturnValue({
-    run: vi.fn().mockResolvedValue({ blocked: false, exitCode: 0, stdout, stderr: '' }),
+    run: vi.fn().mockResolvedValue({ blocked: false, exitCode: 0, stdout, stderr: '', parsedOutput }),
   } as unknown as ReturnType<typeof createAiCliAdapter>)
 }
 
