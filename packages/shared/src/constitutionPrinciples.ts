@@ -1,11 +1,35 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
+
+export const CONTROL_CONTEXT_DIR_CANDIDATES = [
+  '/workspace/control',
+  path.resolve(process.cwd(), '../..'),
+  path.resolve(process.cwd()),
+] as const
 
 const CONSTITUTION_PATHS = [
   '/workspace/control/specs/00_constitution.md',
   path.resolve(process.cwd(), '../../specs/00_constitution.md'),
   path.resolve(process.cwd(), 'specs/00_constitution.md'),
 ]
+
+function constitutionPathForControlContextDir(controlContextDir: string): string {
+  return controlContextDir === '/workspace/control'
+    ? '/workspace/control/specs/00_constitution.md'
+    : path.resolve(controlContextDir, 'specs/00_constitution.md')
+}
+
+export function resolveDefaultControlContextDir(
+  candidateDirs: readonly string[] = CONTROL_CONTEXT_DIR_CANDIDATES,
+): string {
+  for (const candidateDir of candidateDirs) {
+    if (existsSync(constitutionPathForControlContextDir(candidateDir))) {
+      return candidateDir
+    }
+  }
+
+  return candidateDirs[0] ?? process.cwd()
+}
 
 /**
  * Constitution 3.14〜3.15（AI Team OS共通行動原則）の読み込み結果。

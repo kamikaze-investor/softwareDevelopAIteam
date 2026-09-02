@@ -28,6 +28,7 @@ import {
   type DesignReviewEvidence,
   type DesignReviewKind,
 } from '@ai-team/shared'
+import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { IStorage, DesignReviewRun } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 
@@ -258,6 +259,8 @@ export interface CoordinatorDeps {
   runnerArgs: string[]
   homeDirectory: string
   workingDir: string
+  /** レビュー方針文書（Constitution / Meta Reviewer checklists）のルート。既定は resolveDefaultControlContextDir()。 */
+  controlContextDir?: string
   /** テストで差し替えるための実行フック。既定は restricted env での spawn。 */
   execute?: (input: string) => Promise<RunnerExecution>
   timeoutMs?: number
@@ -406,6 +409,7 @@ export async function executeDesignReviewRun(
       designText: run.designText,
       changedFiles,
       workingDir: deps.workingDir,
+      controlContextDir: deps.controlContextDir,
     })
   } else if (run.reviewKind === 'roadmap') {
     runnerInput = JSON.stringify({
@@ -415,6 +419,7 @@ export async function executeDesignReviewRun(
       designText: run.designText,
       changedFiles: [],       // always genuinely empty for roadmap kind — never populate this
       workingDir: deps.workingDir,
+      controlContextDir: deps.controlContextDir,
     })
   } else {
     // exhaustive fail-closed default for any future reviewKind value this function doesn't support yet.
@@ -548,6 +553,7 @@ export function buildDefaultCoordinatorDeps(): CoordinatorDeps {
     ],
     homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? repoRoot,
     workingDir: repoRoot,
+    controlContextDir: process.env.DESIGN_REVIEW_CONTROL_CONTEXT_DIR ?? resolveDefaultControlContextDir(),
   }
 }
 
