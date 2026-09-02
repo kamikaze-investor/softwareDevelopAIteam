@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 
 const anthropicMocks = vi.hoisted(() => ({ create: vi.fn() }))
 
@@ -7,7 +7,12 @@ vi.mock('@anthropic-ai/sdk', () => ({
     messages = { create: anthropicMocks.create }
   },
 }))
-import { parseAnalysisJson, analyzeSpec } from './specAnalyzer.js'
+import {
+  parseAnalysisJson,
+  analyzeSpec,
+  SPEC_ANALYSIS_MAX_ATTEMPTS,
+  SpecAnalysisParseError,
+} from './specAnalyzer.js'
 
 const VALID_ANALYSIS_JSON = JSON.stringify({
   goal: '個人の思考・経験をAIで複数媒体へ自動配信するシステムを作る。',
@@ -37,6 +42,13 @@ const VALID_ANALYSIS_JSON = JSON.stringify({
   ],
   readinessScore: 75,
   readinessReason: '主要機能が明確でMVP範囲が絞られている。対応媒体を決定すれば開発開始可能。',
+})
+
+const SPEC_TEXT = 'Spec text long enough for analysis. It describes one small API workflow and required output.'
+const MALFORMED_JSON_TEXT = '{"goal": "broken",}'
+
+beforeEach(() => {
+  anthropicMocks.create.mockReset()
 })
 
 describe('parseAnalysisJson', () => {
@@ -157,6 +169,70 @@ describe('analyzeSpec (default model)', () => {
       model: 'claude-haiku-4-5-20251001',
       system: expect.stringContaining('explicitly and unambiguously'),
     }))
+  })
+})
+
+describe('analyzeSpec (parse retry)', () => {
+  it('recovers from one malformed response', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const recoveredJson = JSON.stringify({
+      ...JSON.parse(VALID_ANALYSIS_JSON),
+      goal: 'Recovered analysis after retry',
+      readinessScore: 88,
+      readinessReason: 'Recovered from the second model response.',
+    })
+
+    anthropicMocks.create
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: MALFORMED_JSON_TEXT }],
+      })
+      .mockResolvedValueOnce({
+        content: [{ type: 'text', text: recoveredJson }],
+      })
+
+    try {
+      const result = await analyzeSpec(SPEC_TEXT, { apiKey: 'test-api-key' })
+
+      expect(result.goal).toBe('Recovered analysis after retry')
+      expect(result.readinessScore).toBe(88)
+      expect(anthropicMocks.create).toHaveBeenCalledTimes(2)
+      expect(warnSpy).toHaveBeenCalledWith(
+        `[CTO AI] Spec analysis response parse failed on attempt 1/${SPEC_ANALYSIS_MAX_ATTEMPTS}; retrying`,
+      )
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('bounds retries for repeated malformed responses', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+
+    for (let attempt = 0; attempt < SPEC_ANALYSIS_MAX_ATTEMPTS; attempt += 1) {
+      anthropicMocks.create.mockResolvedValueOnce({
+        content: [{ type: 'text', text: MALFORMED_JSON_TEXT }],
+      })
+    }
+
+    try {
+      await expect(
+        analyzeSpec(SPEC_TEXT, { apiKey: 'test-api-key' }),
+      ).rejects.toThrow(SpecAnalysisParseError)
+
+      expect(anthropicMocks.create).toHaveBeenCalledTimes(SPEC_ANALYSIS_MAX_ATTEMPTS)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('does not retry non-parse errors', async () => {
+    const sdkError = new Error('401 unauthorized')
+    anthropicMocks.create.mockRejectedValueOnce(sdkError)
+
+    await expect(
+      analyzeSpec(SPEC_TEXT, { apiKey: 'test-api-key' }),
+    ).rejects.toBe(sdkError)
+
+    expect(anthropicMocks.create).toHaveBeenCalledTimes(1)
   })
 })
 

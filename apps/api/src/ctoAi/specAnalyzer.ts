@@ -80,6 +80,15 @@ export type SpecAnalysis = z.infer<typeof SpecAnalysisSchema>
 // 呼び出し元がある場合に備え、後方互換のため再export だけしておく。
 export type { Gap, StructuredConstraint }
 
+export class SpecAnalysisParseError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'SpecAnalysisParseError'
+  }
+}
+
+export const SPEC_ANALYSIS_MAX_ATTEMPTS = 3
+
 // ────────────────────────────────────────────────────────────
 // プロンプト
 // ────────────────────────────────────────────────────────────
@@ -178,24 +187,42 @@ export async function analyzeSpec(
 
   const client = new Anthropic({ apiKey })
 
-  const message = await client.messages.create({
-    model,
-    max_tokens: 2048,
-    system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: `以下の仕様書を解析してください:\n\n${specText}`,
-      },
-    ],
-  })
+  for (let attempt = 1; attempt <= SPEC_ANALYSIS_MAX_ATTEMPTS; attempt += 1) {
+    const message = await client.messages.create({
+      model,
+      max_tokens: 2048,
+      system: SYSTEM_PROMPT,
+      messages: [
+        {
+          role: 'user',
+          content: `以下の仕様書を解析してください:\n\n${specText}`,
+        },
+      ],
+    })
 
-  const rawText = message.content
-    .filter(block => block.type === 'text')
-    .map(block => (block as { type: 'text'; text: string }).text)
-    .join('')
+    const rawText = message.content
+      .filter(block => block.type === 'text')
+      .map(block => (block as { type: 'text'; text: string }).text)
+      .join('')
 
-  return parseAnalysisJson(rawText)
+    try {
+      return parseAnalysisJson(rawText)
+    } catch (error: unknown) {
+      if (!(error instanceof SpecAnalysisParseError)) {
+        throw error
+      }
+
+      if (attempt >= SPEC_ANALYSIS_MAX_ATTEMPTS) {
+        throw error
+      }
+
+      console.warn(
+        `[CTO AI] Spec analysis response parse failed on attempt ${attempt}/${SPEC_ANALYSIS_MAX_ATTEMPTS}; retrying`,
+      )
+    }
+  }
+
+  throw new Error('[CTO AI] Spec analysis retry loop exited without a result')
 }
 
 // ────────────────────────────────────────────────────────────
@@ -208,15 +235,22 @@ export function parseAnalysisJson(raw: string): SpecAnalysis {
                     raw.match(/(\{[\s\S]+\})/)
 
   if (!jsonMatch) {
-    throw new Error(`[CTO AI] JSONが見つかりません。応答:\n${raw.slice(0, 300)}`)
+    throw new SpecAnalysisParseError(`[CTO AI] JSONが見つかりません。応答:\n${raw.slice(0, 300)}`)
   }
 
-  const parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0])
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0])
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new SpecAnalysisParseError(message, { cause: error })
+  }
+
   const filteredParsed = filterMalformedStructuredConstraints(parsed)
   const result = SpecAnalysisSchema.safeParse(filteredParsed)
 
   if (!result.success) {
-    throw new Error(
+    throw new SpecAnalysisParseError(
       `[CTO AI] JSON構造が不正です:\n${JSON.stringify(result.error.format(), null, 2)}`
     )
   }
