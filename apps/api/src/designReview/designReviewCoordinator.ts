@@ -99,6 +99,62 @@ function isFocusResultArray(value: unknown): value is Array<{ focus: string; dec
   )
 }
 
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key]
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+function findingMessages(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    if (typeof item !== 'object' || item === null) return []
+    const message = stringField(item as Record<string, unknown>, 'message')
+    return message ? [message] : []
+  })
+}
+
+function buildRoadmapRejectedReason(
+  raw: RawStrategicResult,
+  decision: RecomputedDecision,
+): string | undefined {
+  const reasons: string[] = []
+
+  if (Array.isArray(raw.focusedReviewResults)) {
+    for (const item of raw.focusedReviewResults) {
+      if (typeof item !== 'object' || item === null) continue
+      const record = item as Record<string, unknown>
+      const focusDecision = stringField(record, 'decision')
+      if (!focusDecision || focusDecision === 'ALIGNED') continue
+
+      const focus = stringField(record, 'focus') ?? 'focused_review'
+      const details = [
+        stringField(record, 'summary'),
+        ...findingMessages(record.findings),
+      ].filter((part): part is string => Boolean(part))
+      reasons.push(details.length > 0 ? `${focus}: ${details.join('; ')}` : `${focus}: ${focusDecision}`)
+    }
+  }
+
+  if (typeof raw.integrationReviewResult === 'object' && raw.integrationReviewResult !== null) {
+    const integration = raw.integrationReviewResult as Record<string, unknown>
+    const integrationDecision = stringField(integration, 'decision')
+    if (integrationDecision && integrationDecision !== 'ALIGNED') {
+      reasons.push(`integration: ${stringField(integration, 'summary') ?? integrationDecision}`)
+    }
+  }
+
+  if (typeof raw.independentReviewResult === 'object' && raw.independentReviewResult !== null) {
+    const independent = raw.independentReviewResult as Record<string, unknown>
+    const verdict = stringField(independent, 'verdict')
+    const unavailable = independent.unavailable === true
+    if (unavailable || (verdict && verdict !== 'approved')) {
+      reasons.push(`independent: ${stringField(independent, 'summary') ?? verdict ?? 'unavailable'}`)
+    }
+  }
+
+  return reasons.length > 0 ? `${decision}: ${reasons.join(' / ')}` : undefined
+}
+
 /**
  * runner の自己申告に依存せず、APIが決定論的に判定を再計算する。
  *
@@ -184,6 +240,9 @@ export function recomputeDecision(
     reviewLoad,
     independentReviewRequired,
     independentReviewVerdict: independent?.verdict,
+    rejectedReason: reviewKind === 'roadmap' && decision !== 'ALIGNED'
+      ? buildRoadmapRejectedReason(raw, decision)
+      : undefined,
   }
 }
 
