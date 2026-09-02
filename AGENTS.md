@@ -491,3 +491,20 @@ BLOCKED [claude_code → codex task-xxx] 何が必要か (YYYY-MM-DD)
 | 011 | mock 実行を完了扱いにしない | status='mock' では task_graph を [x] にしない |
 | 012 | 呼び出しごとにログ保存（taskId/cliPath/workdir/promptPath/changedFiles/exitCode/stdout/stderr） | 未実装（`docs/codex_invocation_log/` への保存は設計のみで実装コードなし） |
 | 013 | guards/workflows/CODEOWNERS/security 関連ファイルの変更は Red Zone — 人間承認必須 | FileChangeGuard で検出 → blocked |
+
+### Codex Usage Saving Policy（詳細: `docs/project_memory/rules/003_codex_usage_saving_policy.md`）
+
+Codexの利用枠は全セッション共有資源。同じ品質をより少ない利用量で達成する。
+
+| # | ルール | 要点 |
+|---|---|---|
+| 014 | 1 Finding = 1 bounded task | 複数Findingを1セッションへまとめない |
+| 015 | repository全体の再調査をさせない | Evidence/対象ファイル/Root Cause候補を渡し探索範囲を限定 |
+| 016 | 結論は独立検証、情報収集は繰り返させない | 検証対象の結論と根拠をprompt/Context Packに明示 |
+| 017 | 必要なファイルだけ読む | 無関係な履歴・PR・testを広範囲に読み込ませない |
+| 018 | 通常作業は軽量モデル優先 | 複雑なworkflow/concurrency/recovery等だけ上位モデルへ |
+| 019 | 最初から複雑なら軽量モデルで無駄に失敗させない | 難度が明らかなら最初から適切な階層を選ぶ |
+| 020 | 同一prompt・同一モデルへの無意味な連続retry禁止 | provider error/quota/authをモデル能力不足と誤認しない |
+| 021 | コード検索・広範囲Bug HuntingはOpenCode優先 | 明確な実装・test追加もOpenCode/Copilotで足りれば優先 |
+| 022 | Codexは独立検証・難problem Root Cause・重要diff reviewに集中 | 探索・実装の反復には使わない |
+| 023 | usage limit時も品質Gateは飛ばさない | Codex必須作業だけ保留、他は通常どおり進める |
