@@ -19,6 +19,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { DesignReviewKind } from '@ai-team/shared'
+import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
 
 /**
  * .env から読み込んでよいキー。
@@ -42,6 +43,7 @@ export interface DesignReviewRunnerInput {
   designText: string
   changedFiles: string[]
   workingDir: string
+  controlContextDir?: string
 }
 
 /** .env から ENV_ALLOWLIST のキーだけを process.env へ載せる。他のキーは読み捨てる。 */
@@ -91,6 +93,10 @@ export function parseRunnerInput(raw: string): DesignReviewRunnerInput {
     throw new Error(`invalid runner input: unknown reviewKind ${String(parsed.reviewKind)}`)
   }
 
+  if (parsed.controlContextDir !== undefined && typeof parsed.controlContextDir !== 'string') {
+    throw new Error('invalid runner input')
+  }
+
   return {
     reviewKind: parsed.reviewKind,
     subjectId: parsed.subjectId,
@@ -98,6 +104,7 @@ export function parseRunnerInput(raw: string): DesignReviewRunnerInput {
     designText: parsed.designText,
     changedFiles: parsed.changedFiles as string[],
     workingDir: parsed.workingDir,
+    controlContextDir: parsed.controlContextDir,
   }
 }
 
@@ -122,6 +129,7 @@ async function main(): Promise<void> {
     changedFiles: input.changedFiles,
     gitDiff: input.designText,
     workingDir: input.workingDir,
+    controlContextDir: input.controlContextDir ?? resolveDefaultControlContextDir(),
     materialKind: 'design',
   })
 

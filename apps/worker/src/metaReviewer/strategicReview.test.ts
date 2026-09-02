@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -427,14 +427,18 @@ describe('runStrategicMetaReview', () => {
 
   it('fails closed without calling Gemini when non-strategic checklist context is missing', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'strategic-review-empty-'))
+    const emptyControlRoot = await mkdtemp(join(tmpdir(), 'strategic-review-empty-control-'))
 
     try {
+      // workingDir（target）も controlContextDir（control）も空。checklistはcontrol rootから
+      // 読むため、control rootにchecklistが無ければ fail-closed になる。
       const result = await runStrategicMetaReview({
         subjectId: 'task-missing-checklist',
         taskTitle: 'Mobile UI adjustment',
         changedFiles: ['apps/mobile/app/index.tsx'],
         gitDiff: 'diff --git a/apps/mobile/app/index.tsx b/apps/mobile/app/index.tsx',
         workingDir: tempRoot,
+        controlContextDir: emptyControlRoot,
       })
 
       expect(result.reviewLoad).toBe('medium')
@@ -444,6 +448,7 @@ describe('runStrategicMetaReview', () => {
       expect(mockReviewWithProviderFallback).not.toHaveBeenCalled()
     } finally {
       await rm(tempRoot, { recursive: true, force: true })
+      await rm(emptyControlRoot, { recursive: true, force: true })
     }
   })
 
@@ -528,6 +533,199 @@ describe('runStrategicMetaReview with reviewKind=roadmap', () => {
     expect(result.finalDecision).toBe('ALIGNED')
   })
 })
+
+describe('two-root control context resolution (control-plane vs target-project)', () => {
+  it('positive: roadmap review succeeds with target docs in target root and control docs in control root', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: true,
+      controlHasChecklists: true,
+    })
+
+    try {
+      const result = await runStrategicMetaReview({
+        reviewKind: 'roadmap',
+        subjectId: 'project-two-root-1',
+        taskTitle: 'Whole-Roadmap Review',
+        changedFiles: [],
+        gitDiff: '# Roadmap Design Review Material detailing the planned roadmap',
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      // target root carries only target Project Memory; control root carries only control policy.
+      // No selected focus may come back as a missing-context review.
+      expect(result.selectedFocuses).toEqual([
+        'strategic_alignment',
+        'scope_simplicity',
+        'architecture_responsibility',
+      ])
+      expect(result.focusedReviewResults.every((f) => f.decision !== 'UNCERTAIN')).toBe(true)
+      expect(result.finalDecision).toBe('ALIGNED')
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('negative: fails closed when the control root lacks the Constitution', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: false,
+      controlHasChecklists: true,
+    })
+
+    try {
+      const result = await runStrategicMetaReview({
+        reviewKind: 'roadmap',
+        subjectId: 'project-two-root-constitution-missing',
+        taskTitle: 'Whole-Roadmap Review',
+        changedFiles: [],
+        gitDiff: '# Roadmap Design Review Material detailing the planned roadmap',
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+      expect(result.requiresCeoApproval).toBe(true)
+      const strategic = result.focusedReviewResults.find((f) => f.focus === 'strategic_alignment')
+      expect(strategic?.decision).toBe('UNCERTAIN')
+      expect(strategic?.summary).toContain('Required strategic context is missing')
+      expect(strategic?.summary).toContain('specs/00_constitution.md')
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('negative: fails closed when the control root lacks all checklist candidates', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: true,
+      controlHasChecklists: false,
+    })
+
+    try {
+      const result = await runStrategicMetaReview({
+        subjectId: 'task-two-root-checklist-missing',
+        taskTitle: 'Mobile UI adjustment',
+        changedFiles: ['apps/mobile/app/index.tsx'],
+        gitDiff: 'diff --git a/apps/mobile/app/index.tsx b/apps/mobile/app/index.tsx',
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      expect(result.reviewLoad).toBe('medium')
+      expect(result.selectedFocuses).toEqual(['product_ceo_experience'])
+      expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+      const focusResult = result.focusedReviewResults.find((f) => f.focus === 'product_ceo_experience')
+      expect(focusResult?.summary).toContain('Checklist context is missing')
+      expect(mockReviewWithProviderFallback).not.toHaveBeenCalled()
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('negative: output fails closed on missing target Project Memory even when the control root has its own docs', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: false,
+      controlHasConstitution: true,
+      controlHasChecklists: true,
+    })
+
+    try {
+      const result = await runStrategicMetaReview({
+        subjectId: 'task-two-root-target-memory-missing',
+        taskTitle: 'Storage state hardening',
+        changedFiles: ['apps/api/src/storage/schema.ts'],
+        gitDiff: 'diff --git a/apps/api/src/storage/schema.ts b/apps/api/src/storage/schema.ts',
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      expect(result.reviewLoad).toBe('high')
+      expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+      const strategic = result.focusedReviewResults.find((f) => f.focus === 'strategic_alignment')
+      expect(strategic?.decision).toBe('UNCERTAIN')
+      expect(strategic?.summary).toContain('Required strategic context is missing')
+      // The missing docs must be the target-owned ones, not the control root's own constitution.
+      expect(strategic?.summary).toContain('docs/project_memory/goal.md')
+      expect(strategic?.summary).toContain('docs/project_memory/design_philosophy.md')
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('reset-survival: review still succeeds after the target repo is reset/cleaned of all control files', async () => {
+    // Simulate the production symptom: a fresh target repo that has target Project Memory but
+    // was never seeded with / got cleaned of any specs/ or docs/meta_reviewer/ directory.
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: true,
+      controlHasChecklists: true,
+    })
+
+    try {
+      // Belt-and-braces: ensure the target root genuinely has no control-plane material.
+      const targetSpecs = join(targetRoot, 'specs')
+      const targetChecklists = join(targetRoot, 'docs', 'meta_reviewer')
+      await rm(targetSpecs, { recursive: true, force: true })
+      await rm(targetChecklists, { recursive: true, force: true })
+
+      const result = await runStrategicMetaReview({
+        reviewKind: 'roadmap',
+        subjectId: 'project-reset-survival',
+        taskTitle: 'Whole-Roadmap Review',
+        changedFiles: [],
+        gitDiff: '# Roadmap Design Review Material detailing the planned roadmap',
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      expect(result.finalDecision).toBe('ALIGNED')
+      expect(result.focusedReviewResults.every((f) => f.decision !== 'UNCERTAIN')).toBe(true)
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+async function createTwoRootSetup(options: {
+  targetHasProjectMemory: boolean
+  controlHasConstitution: boolean
+  controlHasChecklists: boolean
+}): Promise<{ targetRoot: string; controlRoot: string }> {
+  const targetRoot = await mkdtemp(join(tmpdir(), 'two-root-target-'))
+  const controlRoot = await mkdtemp(join(tmpdir(), 'two-root-control-'))
+
+  if (options.targetHasProjectMemory) {
+    await writeDeep(targetRoot, 'docs/project_memory/goal.md', '# Goal\n\nDeliver a working AI team OS MVP.')
+    await writeDeep(targetRoot, 'docs/project_memory/design_philosophy.md', '# Design Philosophy\n\nKeep it simple and safe.')
+  }
+
+  if (options.controlHasConstitution) {
+    await writeDeep(controlRoot, 'specs/00_constitution.md', '# Constitution\n\n## 3.14 AI Team OS\n\nSafety rules.')
+  }
+
+  if (options.controlHasChecklists) {
+    await writeDeep(controlRoot, 'docs/meta_reviewer/checklist.md', '# General Meta Reviewer checklist\n\nCheck safety.')
+    await writeDeep(controlRoot, 'docs/meta_reviewer/checklists/worker.md', '# Worker checklist\n\nCheck worker ownership.')
+    await writeDeep(controlRoot, 'docs/meta_reviewer/checklists/api_routes.md', '# API routes checklist\n\nCheck routes.')
+    await writeDeep(controlRoot, 'docs/meta_reviewer/checklists/shared_types.md', '# Shared types checklist\n\nCheck types.')
+    await writeDeep(controlRoot, 'docs/meta_reviewer/checklists/storage.md', '# Storage checklist\n\nCheck storage.')
+  }
+
+  return { targetRoot, controlRoot }
+}
+
+async function writeDeep(root: string, relPath: string, content: string): Promise<void> {
+  const fullPath = join(root, relPath)
+  await mkdir(join(root, relPath.split(/[\\/]/).slice(0, -1).join('/')), { recursive: true })
+  await writeFile(fullPath, content, 'utf-8')
+}
 
 function highStorageInput(): Parameters<typeof runStrategicMetaReview>[0] {
   return {

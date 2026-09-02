@@ -118,4 +118,37 @@ describe('parseRunnerInput', () => {
       }),
     )).toThrow('invalid runner input')
   })
+
+  it('workingDir（target）と controlContextDir（control）を別々のフィールドとして運ぶ', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        reviewKind: 'roadmap', subjectId: 'project-9', taskTitle: 'title',
+        designText: 'text', changedFiles: [], workingDir: '/target/root',
+        controlContextDir: '/control/root',
+      }),
+    )
+    expect(input.workingDir).toBe('/target/root')
+    expect(input.controlContextDir).toBe('/control/root')
+    expect(input.workingDir).not.toBe(input.controlContextDir)
+  })
+
+  it('controlContextDir が未指定でもキャリーできる（既定解決はrunner側）', () => {
+    const input = parseRunnerInput(
+      JSON.stringify({
+        reviewKind: 'roadmap', subjectId: 'project-10', taskTitle: 'title',
+        designText: 'text', changedFiles: [], workingDir: '/target/root',
+      }),
+    )
+    expect(input.workingDir).toBe('/target/root')
+    expect(input.controlContextDir).toBeUndefined()
+  })
+
+  it('controlContextDir が文字列でなければ拒否する', () => {
+    expect(() => parseRunnerInput(
+      JSON.stringify({
+        reviewKind: 'roadmap', subjectId: 'project-11', taskTitle: 'title',
+        designText: 'text', changedFiles: [], workingDir: '/w', controlContextDir: 42,
+      }),
+    )).toThrow('invalid runner input')
+  })
 })

@@ -15,6 +15,7 @@ import type {
   StrategicDecision,
   StrategicMetaReviewResult,
 } from '@ai-team/shared'
+import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
 // 判定ロジックはAPI（Control Plane）側でも再計算する必要があるため @ai-team/shared を正本とし、
 // ここでは再exportして既存の呼び出し元との互換を保つ。定義を二重化しないこと。
 import { applyIndependentReviewOverride, resolveFinalDecision } from '@ai-team/shared'
@@ -45,6 +46,7 @@ export interface StrategicReviewInput {
   changedFiles: string[]
   gitDiff: string
   workingDir: string
+  controlContextDir?: string
   materialKind?: 'diff' | 'design'
 }
 
@@ -88,9 +90,12 @@ const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
   'spec_violation',
 ]
 
-const REQUIRED_STRATEGIC_DOCS = [
+const REQUIRED_TARGET_STRATEGIC_DOCS = [
   'docs/project_memory/goal.md',
   'docs/project_memory/design_philosophy.md',
+]
+
+const REQUIRED_CONTROL_STRATEGIC_DOCS = [
   'specs/00_constitution.md',
 ]
 
@@ -481,7 +486,7 @@ async function buildFocusedReviewPrompt(
     }
   }
 
-  const checklistContext = await buildChecklistContext(input.workingDir, focus, input.changedFiles)
+  const checklistContext = await buildChecklistContext(resolveControlContextDir(input), focus, input.changedFiles)
   if (checklistContext.unavailableReason) {
     return {
       prompt: '',
@@ -511,8 +516,18 @@ async function buildStrategicAlignmentContext(input: StrategicReviewInput): Prom
   const sections: string[] = []
   const missingRequiredPaths: string[] = []
 
-  for (const relPath of REQUIRED_STRATEGIC_DOCS) {
+  for (const relPath of REQUIRED_TARGET_STRATEGIC_DOCS) {
     const content = await readOptionalFile(input.workingDir, relPath)
+    if (content === null) {
+      missingRequiredPaths.push(relPath)
+      continue
+    }
+    sections.push(`## ${relPath}\n\n${content}`)
+  }
+
+  const controlContextDir = resolveControlContextDir(input)
+  for (const relPath of REQUIRED_CONTROL_STRATEGIC_DOCS) {
+    const content = await readOptionalFile(controlContextDir, relPath)
     if (content === null) {
       missingRequiredPaths.push(relPath)
       continue
@@ -544,7 +559,7 @@ async function buildStrategicAlignmentContext(input: StrategicReviewInput): Prom
 }
 
 async function buildChecklistContext(
-  workingDir: string,
+  controlContextDir: string,
   focus: Exclude<MetaReviewFocus, 'strategic_alignment'>,
   changedFiles: readonly string[],
 ): Promise<{ text: string; unavailableReason?: string }> {
@@ -553,14 +568,14 @@ async function buildChecklistContext(
 
   for (const checklistFile of checklistFiles) {
     const relPath = `docs/meta_reviewer/checklists/${checklistFile}`
-    const content = await readOptionalFile(workingDir, relPath)
+    const content = await readOptionalFile(controlContextDir, relPath)
     if (content !== null) {
       sections.push(`## ${relPath}\n\n${content}`)
     }
   }
 
   if (sections.length === 0) {
-    const generalChecklist = await readOptionalFile(workingDir, 'docs/meta_reviewer/checklist.md')
+    const generalChecklist = await readOptionalFile(controlContextDir, 'docs/meta_reviewer/checklist.md')
     if (generalChecklist !== null) {
       sections.push(`## docs/meta_reviewer/checklist.md\n\n${generalChecklist}`)
     }
@@ -579,6 +594,10 @@ async function buildChecklistContext(
   }
 
   return { text: sections.join('\n\n---\n\n') }
+}
+
+function resolveControlContextDir(input: StrategicReviewInput): string {
+  return input.controlContextDir ?? resolveDefaultControlContextDir()
 }
 
 function selectChecklistFilesForFocus(

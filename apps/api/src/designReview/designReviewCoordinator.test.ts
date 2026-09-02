@@ -432,6 +432,42 @@ describe('createAndExecuteRoadmapReview', () => {
     expect(runnerInput.taskId).toBeUndefined()
     expect(runnerInput.changedFiles).toEqual([])
   })
+
+  it('runnerへ渡すinputはworkingDir（target）とcontrolContextDir（control）を別々のフィールドとして運ぶ', async () => {
+    const storage = createStorage()
+    const projectId = 'project-roadmap-two-root'
+
+    const execute = vi.fn(async (_input: string) => ({ ok: true, stdout: JSON.stringify(roadmapAlignedRaw()), timedOut: false }))
+    await createAndExecuteRoadmapReview(
+      storage,
+      { projectId, reviewMaterial: '# Roadmap Design Review Material' },
+      { ...deps(execute), workingDir: '/target/root', controlContextDir: '/control/root' },
+    )
+
+    expect(execute).toHaveBeenCalledTimes(1)
+    const runnerInput = JSON.parse(execute.mock.calls[0]?.[0] as string) as Record<string, unknown>
+    expect(runnerInput.workingDir).toBe('/target/root')
+    expect(runnerInput.controlContextDir).toBe('/control/root')
+    expect(runnerInput.workingDir).not.toBe(runnerInput.controlContextDir)
+  })
+
+  it('task系runner inputにもcontrolContextDirを通す', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+
+    const execute = vi.fn(async (_input: string) => ({ ok: true, stdout: alignedResult([]), timedOut: false }))
+    await createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText: 'text', changedFiles: LOW_LOAD_FILES },
+      { ...deps(execute), workingDir: '/target/root', controlContextDir: '/control/root' },
+    )
+
+    expect(execute).toHaveBeenCalledTimes(1)
+    const runnerInput = JSON.parse(execute.mock.calls[0]?.[0] as string) as Record<string, unknown>
+    expect(runnerInput.workingDir).toBe('/target/root')
+    expect(runnerInput.controlContextDir).toBe('/control/root')
+    expect(runnerInput.workingDir).not.toBe(runnerInput.controlContextDir)
+  })
 })
 
 describe('roadmap review claim/fence dedup', () => {
