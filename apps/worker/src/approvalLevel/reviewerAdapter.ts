@@ -111,6 +111,30 @@ function buildFailureResult(
   }
 }
 
+function buildReviewerResultFromParsedOutput(
+  parsed: Record<string, unknown>,
+  provider: ReviewerProvider,
+  phase: ReviewPhase,
+  raw: string,
+): ReviewerResult | undefined {
+  if (!isReviewVerdict(parsed.verdict)) {
+    return undefined
+  }
+
+  return {
+    provider,
+    phase,
+    verdict: parsed.verdict,
+    summary: typeof parsed.summary === 'string' ? parsed.summary : '(summary not provided)',
+    issues: normalizeIssues(parsed.issues),
+    confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
+      ? parsed.confidence
+      : 0.5,
+    generatedAt: new Date().toISOString(),
+    rawResponse: raw,
+  }
+}
+
 export function selectReviewerProvider(implementer: ImplementerProvider): ReviewerProvider {
   switch (implementer) {
     case 'claude_code':
@@ -179,22 +203,12 @@ export function parseReviewerResponse(
   try {
     const parsed = JSON.parse(jsonText) as ParsedReviewerResponse
 
-    if (!isRecord(parsed) || !isReviewVerdict(parsed.verdict)) {
+    if (!isRecord(parsed)) {
       return buildFailureResult(raw, provider, phase)
     }
 
-    return {
-      provider,
-      phase,
-      verdict: parsed.verdict,
-      summary: typeof parsed.summary === 'string' ? parsed.summary : '(summary not provided)',
-      issues: normalizeIssues(parsed.issues),
-      confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
-        ? parsed.confidence
-        : 0.5,
-      generatedAt: new Date().toISOString(),
-      rawResponse: raw,
-    }
+    return buildReviewerResultFromParsedOutput(parsed, provider, phase, raw)
+      ?? buildFailureResult(raw, provider, phase)
   } catch {
     return buildFailureResult(raw, provider, phase)
   }
@@ -273,6 +287,24 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
           generatedAt: new Date().toISOString(),
           rawResponse: result.stdout || result.stderr || '',
         }
+      }
+
+      // AiCliRequest.expectJson + provider='codex' makes adapter.ts capture Codex's final answer
+      // cleanly via --output-last-message (bypassing the narration/reasoning-trace noise codex exec
+      // normally streams to stdout). When that capture succeeded (parsedOutput is present), it is
+      // authoritative -- prefer it over re-parsing the noisy raw stdout, and fail closed directly if
+      // it doesn't validate as a proper reviewer response, rather than falling back to a re-parse of
+      // the very stdout parsedOutput was specifically built to bypass (that fallback would silently
+      // reintroduce the bug this fix closes: a well-formed-but-wrong parsedOutput should not get a
+      // second chance via a strictly noisier, less reliable source). Only fall back to the raw-stdout
+      // parser when parsedOutput was never captured at all (e.g. an older/incompatible path).
+      if (result.parsedOutput !== undefined) {
+        return buildReviewerResultFromParsedOutput(
+          result.parsedOutput,
+          'codex',
+          req.phase,
+          result.stdout,
+        ) ?? buildFailureResult(result.stdout, 'codex', req.phase)
       }
 
       return parseReviewerResponse(result.stdout, 'codex', req.phase)
