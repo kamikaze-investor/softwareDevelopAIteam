@@ -1845,10 +1845,46 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       daemon/evidence store/hash方式は追加していない。apps/api 64ファイル/954テスト成功、
       apps/worker・Control Repositoryは無変更のためAV-001対象外。
 
-      **残り**: 本項目の3経路分離自体はPhase 1〜3でコードとして完成したが、実運用での動作確認
-      （自然なGoalによるPhase 1c再検証）はまだ行っていない。Roadmap regeneration・Design
-      Review CONFLICT Recoveryは項目7として引き続き別管理・未着手（Phase 1c再検証でWhole-Roadmap
-      Reviewの実戦動作を確認してから着手する方針）。
+      **Phase 1c再検証 完了（2026-09-02）**: production（api.aiteamos.uk、VPS
+      `aiteamos-vps`/`ai-team-e2e`）を最新masterへ安全同期（read-only preflight→canonical DB
+      copyへのPR #66 migration事前検証→fresh backup→旧新process同時実行なしの
+      stop→pull→migrate→verify→start順序→provider canary、の全手順で実施。row count・
+      integrity_check・foreign_key_check・idempotencyすべてPASS、production HEADは
+      意図したmaster HEADと一致）。canary・Whole-Roadmap Review双方でGemini
+      APIが正常応答することを確認済み。
+
+      同期後、通常Mobileフロー（`POST /api/projects`→`PATCH /api/projects/:id
+      {status:'running'}`。`POST /api/cto/generate-roadmap`等のlower-level経路は不使用）で、
+      「1 Task」「control-plane Task禁止」等の正解を一切書かないGoal（`computeTaskDisplayStatus
+      のテスト不足を、小規模で低リスクな変更として改善してください。既存ArchitectureやPolicyは
+      変更しないでください。`）でPhase 1c再検証を実施。
+
+      **実行中に発見・修正した実バグ**: Gap回答を含む再解析でClaude Haikuが
+      `structuredConstraints[0].value=null`を出力し、`specAnalyzer.ts`の厳格な単一
+      `SpecAnalysisSchema.safeParse()`がこれを未処理の500として落としていた
+      （PR #72 `fix/spec-analyzer-null-structured-constraint-crash`。malformed AI
+      response＋error handling不足として分類、structuredConstraints単位のdefensive
+      filteringのみで修正、retry機構等は追加せず、production再同期・再検証済み）。
+
+      **確認できたこと（成功条件どおり）**: Gap Analysis/Readinessを複数ラウンド経由（都度
+      readinessScoreとgapsが非決定的に変化＝実際のLLM非決定性を確認）→readinessScore=92で
+      Roadmap生成へ進行→deterministic constraint validation通過→Whole-Roadmap Design
+      Reviewが実プロバイダー経路（Gemini focused review×3・integration review・critical-load
+      independent review=Codex）で実行→`scope_simplicity`focusが「9ケースのテスト追加を
+      5 Task・2 Phaseに過剰分割」という実在するスコープ違反を正しく検出→integration
+      reviewがCONFLICTと判定→independent review（Codex）はレスポンスparse失敗で
+      unavailable→最終決定REVIEW_UNAVAILABLE→`syncRoadmapTasks()`到達前に
+      `ProjectInitializationError(422)`でfail-closed→**Task行は1件も作成されず**（DB直接
+      確認済み）。1回目の試行では同一runがrunner 120秒timeoutでrequeueされ（bounded retry、
+      attempt_count 1→2）、2回目の再実行で完了した点も含め、既存claim/fence/bounded retry
+      機構が実際に機能することを確認できた。
+
+      **意図的に行わなかったこと**: 検出されたCONFLICT（過剰分割）は修正・迂回せず、対象
+      Projectはpausedのまま保持（旧`Phase 1c Minimal Production E2E`と同じ扱い）。Roadmap
+      generation自体の改善・Task分割数の調整は今回の検証範囲外。
+
+      Roadmap regeneration・Design Review CONFLICT Recoveryは項目7として引き続き別管理・
+      未着手。
 <!-- roadmap:id=project-pause-continuation-gap state=done -->
 10. [x] **Project Pause / Continuation-Control Gap — 完了**（2026-09-01登録・同日実装完了。
       `phase 1c v2`のregression evidence保持作業中に発見。Phase 1cへは混ぜていない）。
