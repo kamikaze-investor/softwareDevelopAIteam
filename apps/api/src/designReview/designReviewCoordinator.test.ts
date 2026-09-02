@@ -1,15 +1,21 @@
-import { describe, expect, it, beforeEach, vi } from 'vitest'
+import { describe, expect, it, beforeEach, vi, afterAll } from 'vitest'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
+  DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES,
   buildRunnerEnv,
   createAndExecuteDesignReview,
   createAndExecuteRoadmapReview,
   executeDesignReviewRun,
+  executeRunner,
   recomputeDecision,
   recoverAndRekickAtStartup,
 } from './designReviewCoordinator'
+import type { CoordinatorDeps } from './designReviewCoordinator'
 
 /**
  * Design Review executor の検証。
@@ -51,7 +57,7 @@ function baseInput(taskId: string) {
   }
 }
 
-function deps(execute: (input: string) => Promise<{ ok: boolean; stdout: string; error?: string; timedOut: boolean }>) {
+function deps(execute: (input: string) => Promise<{ ok: boolean; stdout: string; error?: string; timedOut: boolean; stderr?: string }>) {
   return {
     runnerCommand: 'node',
     runnerArgs: [],
@@ -197,6 +203,90 @@ describe('3. decision authority', () => {
     expect(result.status).toBe('not_aligned')
     expect(result.decision).toBe('CONFLICT')
     expect(storage.designReviewEvidence.findByTaskId(taskId)).toHaveLength(0)
+  })
+
+  it('runnerがok:trueでもstderr診断情報を保持し、decision非ALIGNED時にconsole.warnする', async () => {
+    const raw: Record<string, unknown> = {
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'CONFLICT' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      ],
+      integrationReviewResult: { decision: 'ALIGNED' },
+      independentReviewResult: { verdict: 'approved' },
+      finalDecision: 'ALIGNED',
+    }
+    const stderrDiag = '[geminiRouter] Gemini failed, unknown (feature: strategic-meta-review-scope_simplicity)'
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      const run = storage.designReviewRuns.create({
+        ...baseInput(taskId),
+        changedFiles: ['specs/00_constitution.md'],
+      })
+      const result = await executeDesignReviewRun(
+        storage, run, deps(async () => ({
+          ok: true,
+          stdout: JSON.stringify(raw),
+          timedOut: false,
+          stderr: stderrDiag,
+        })),
+      )
+
+      expect(result.status).toBe('not_aligned')
+      expect(result.decision).toBe('CONFLICT')
+      expect(warnSpy).toHaveBeenCalledOnce()
+      expect(warnSpy.mock.calls[0]?.[0]).toContain(stderrDiag)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('runnerがok:trueでstderrが空の場合はconsole.warnしない', async () => {
+    const raw: Record<string, unknown> = {
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'CONFLICT' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      ],
+      integrationReviewResult: { decision: 'ALIGNED' },
+      independentReviewResult: { verdict: 'approved' },
+      finalDecision: 'ALIGNED',
+    }
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      const run = storage.designReviewRuns.create({
+        ...baseInput(taskId),
+        changedFiles: ['specs/00_constitution.md'],
+      })
+      const result = await executeDesignReviewRun(
+        storage, run, deps(async () => ({
+          ok: true,
+          stdout: JSON.stringify(raw),
+          timedOut: false,
+        })),
+      )
+
+      expect(result.status).toBe('not_aligned')
+      expect(warnSpy).not.toHaveBeenCalled()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('runnerがok:falseの場合もstderrがerrorに含まれる（既存動作の確認）', async () => {
+    const run = storage.designReviewRuns.create(baseInput(taskId))
+    const result = await executeDesignReviewRun(
+      storage, run, deps(async () => ({
+        ok: false,
+        stdout: '',
+        error: 'runner exited with code 1: some stderr',
+        timedOut: false,
+        stderr: 'some stderr',
+      })),
+    )
+
+    expect(result.status).toMatch(/requeued|failed/)
+    expect(result.error).toContain('some stderr')
   })
 
   it('critical loadでindependent reviewが欠落していれば不採用', () => {
@@ -489,5 +579,108 @@ describe('roadmap review claim/fence dedup', () => {
     expect(second.id).toBe(first.id)
     const queued = storage.designReviewRuns.findQueued()
     expect(queued.filter((run) => run.subjectId === projectId)).toHaveLength(1)
+  })
+})
+
+describe('executeRunner stderr cap UTF-8 boundary', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'stderr-utf8-test-'))
+  const scriptPath = join(tmpDir, 'write-stderr-utf8.js')
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('stderr byte length never exceeds cap even when chunk slices mid-multibyte character', async () => {
+    const maxBytes = DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES
+    // Write enough ASCII to leave room for one multi-byte character to straddle the boundary.
+    // A 4-byte emoji (🎉) at the tail end ensures that if the handler byte-slices mid-character,
+    // the U+FFFD replacement (3 bytes) can overshoot.
+    const paddingLen = maxBytes - 4
+    const padding = 'x'.repeat(paddingLen)
+
+    writeFileSync(scriptPath, [
+      'const s = ' + JSON.stringify(padding) + ';',
+      'process.stderr.write(s);',
+      // Write a 4-byte UTF-8 emoji. The stream chunk boundary may or may not split
+      // this character; regardless, the handler must not let the total exceed the cap.
+      'process.stderr.write("\\u{1F389}");',
+      'process.exit(0);',
+    ].join('\n'))
+
+    const prevSystemRoot = process.env.SystemRoot
+    const prevWindir = process.env.windir
+    process.env.SystemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+    process.env.windir = process.env.windir ?? 'C:\\Windows'
+
+    try {
+      const runnerDeps: CoordinatorDeps = {
+        runnerCommand: process.execPath,
+        runnerArgs: [scriptPath],
+        homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? '/tmp/home',
+        workingDir: process.cwd(),
+      }
+
+      const result = await executeRunner(runnerDeps, '')
+
+      expect(result.ok).toBe(true)
+      expect(result.stderr).toBeDefined()
+      const stderrBytes = Buffer.byteLength(result.stderr!, 'utf-8')
+      expect(stderrBytes).toBeLessThanOrEqual(maxBytes)
+    } finally {
+      if (prevSystemRoot === undefined) delete process.env.SystemRoot
+      else process.env.SystemRoot = prevSystemRoot
+      if (prevWindir === undefined) delete process.env.windir
+      else process.env.windir = prevWindir
+    }
+  })
+})
+
+describe('executeRunner stderr cap enforcement', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'stderr-cap-test-'))
+  const scriptPath = join(tmpDir, 'write-stderr.js')
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('stderr byte length never exceeds DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES even with chunks that would overshoot', async () => {
+    // Write 12 MB to stderr in a single write. The child process outputs more than
+    // DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES (10 MB) to stderr. Under the old
+    // check-before-append logic, the full 12 MB would be appended because the check
+    // runs before the append (so the first append succeeds when stderr is empty, and
+    // subsequent appends continue until the check finally triggers). With the fix,
+    // the chunk is truncated to fit the remaining byte budget and no further chunks
+    // are appended.
+    writeFileSync(scriptPath, `process.stderr.write('x'.repeat(12 * 1024 * 1024)); process.exit(0);`)
+
+    // ExecuteRunner builds a restricted env via buildRunnerEnv. On Windows,
+    // SystemRoot/windir are required for child_process.spawn to find executables.
+    // We inject them into process.env before calling executeRunner so buildRunnerEnv
+    // inherits them, then clean up after.
+    const prevSystemRoot = process.env.SystemRoot
+    const prevWindir = process.env.windir
+    process.env.SystemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+    process.env.windir = process.env.windir ?? 'C:\\Windows'
+
+    try {
+      const runnerDeps: CoordinatorDeps = {
+        runnerCommand: process.execPath,
+        runnerArgs: [scriptPath],
+        homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? '/tmp/home',
+        workingDir: process.cwd(),
+      }
+
+      const result = await executeRunner(runnerDeps, '')
+
+      expect(result.ok).toBe(true)
+      expect(result.stderr).toBeDefined()
+      const stderrBytes = Buffer.byteLength(result.stderr!, 'utf-8')
+      expect(stderrBytes).toBeLessThanOrEqual(DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES)
+    } finally {
+      if (prevSystemRoot === undefined) delete process.env.SystemRoot
+      else process.env.SystemRoot = prevSystemRoot
+      if (prevWindir === undefined) delete process.env.windir
+      else process.env.windir = prevWindir
+    }
   })
 })
