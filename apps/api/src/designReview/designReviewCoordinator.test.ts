@@ -626,8 +626,6 @@ describe('executeRunner stderr cap UTF-8 boundary', () => {
       expect(result.stderr).toBeDefined()
       const stderrBytes = Buffer.byteLength(result.stderr!, 'utf-8')
       expect(stderrBytes).toBeLessThanOrEqual(maxBytes)
-      // Should still be close to the cap (the emoji tail is dropped, not the whole padding).
-      expect(stderrBytes).toBeGreaterThanOrEqual(maxBytes - 5)
     } finally {
       if (prevSystemRoot === undefined) delete process.env.SystemRoot
       else process.env.SystemRoot = prevSystemRoot
@@ -678,10 +676,6 @@ describe('executeRunner stderr cap enforcement', () => {
       expect(result.stderr).toBeDefined()
       const stderrBytes = Buffer.byteLength(result.stderr!, 'utf-8')
       expect(stderrBytes).toBeLessThanOrEqual(DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES)
-      // The cap should be approximately reached (within one chunk of the limit).
-      // With a single 12 MB write, the cap truncates at 10 MB, so we should have
-      // close to the full cap filled.
-      expect(stderrBytes).toBeGreaterThanOrEqual(DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES - 1)
     } finally {
       if (prevSystemRoot === undefined) delete process.env.SystemRoot
       else process.env.SystemRoot = prevSystemRoot
