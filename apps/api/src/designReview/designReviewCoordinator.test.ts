@@ -1,15 +1,21 @@
-import { describe, expect, it, beforeEach, vi } from 'vitest'
+import { describe, expect, it, beforeEach, vi, afterAll } from 'vitest'
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
+  DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES,
   buildRunnerEnv,
   createAndExecuteDesignReview,
   createAndExecuteRoadmapReview,
   executeDesignReviewRun,
+  executeRunner,
   recomputeDecision,
   recoverAndRekickAtStartup,
 } from './designReviewCoordinator'
+import type { CoordinatorDeps } from './designReviewCoordinator'
 
 /**
  * Design Review executor の検証。
@@ -573,5 +579,59 @@ describe('roadmap review claim/fence dedup', () => {
     expect(second.id).toBe(first.id)
     const queued = storage.designReviewRuns.findQueued()
     expect(queued.filter((run) => run.subjectId === projectId)).toHaveLength(1)
+  })
+})
+
+describe('executeRunner stderr cap enforcement', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'stderr-cap-test-'))
+  const scriptPath = join(tmpDir, 'write-stderr.js')
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('stderr byte length never exceeds DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES even with chunks that would overshoot', async () => {
+    // Write 12 MB to stderr in a single write. The child process outputs more than
+    // DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES (10 MB) to stderr. Under the old
+    // check-before-append logic, the full 12 MB would be appended because the check
+    // runs before the append (so the first append succeeds when stderr is empty, and
+    // subsequent appends continue until the check finally triggers). With the fix,
+    // the chunk is truncated to fit the remaining byte budget and no further chunks
+    // are appended.
+    writeFileSync(scriptPath, `process.stderr.write('x'.repeat(12 * 1024 * 1024)); process.exit(0);`)
+
+    // ExecuteRunner builds a restricted env via buildRunnerEnv. On Windows,
+    // SystemRoot/windir are required for child_process.spawn to find executables.
+    // We inject them into process.env before calling executeRunner so buildRunnerEnv
+    // inherits them, then clean up after.
+    const prevSystemRoot = process.env.SystemRoot
+    const prevWindir = process.env.windir
+    process.env.SystemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+    process.env.windir = process.env.windir ?? 'C:\\Windows'
+
+    try {
+      const runnerDeps: CoordinatorDeps = {
+        runnerCommand: process.execPath,
+        runnerArgs: [scriptPath],
+        homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? '/tmp/home',
+        workingDir: process.cwd(),
+      }
+
+      const result = await executeRunner(runnerDeps, '')
+
+      expect(result.ok).toBe(true)
+      expect(result.stderr).toBeDefined()
+      const stderrBytes = Buffer.byteLength(result.stderr!, 'utf-8')
+      expect(stderrBytes).toBeLessThanOrEqual(DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES)
+      // The cap should be approximately reached (within one chunk of the limit).
+      // With a single 12 MB write, the cap truncates at 10 MB, so we should have
+      // close to the full cap filled.
+      expect(stderrBytes).toBeGreaterThanOrEqual(DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES - 1)
+    } finally {
+      if (prevSystemRoot === undefined) delete process.env.SystemRoot
+      else process.env.SystemRoot = prevSystemRoot
+      if (prevWindir === undefined) delete process.env.windir
+      else process.env.windir = prevWindir
+    }
   })
 })

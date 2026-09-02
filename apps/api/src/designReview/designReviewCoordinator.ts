@@ -326,8 +326,17 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
     })
     child.stderr.on('data', (chunk: Buffer) => {
       if (overflowed) return
-      if (Buffer.byteLength(stderr, 'utf-8') <= DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES) {
-        stderr += chunk.toString('utf-8')
+      const currentBytes = Buffer.byteLength(stderr, 'utf-8')
+      if (currentBytes >= DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES) return
+      const remaining = DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES - currentBytes
+      const chunkStr = chunk.toString('utf-8')
+      const chunkBytes = Buffer.byteLength(chunkStr, 'utf-8')
+      if (chunkBytes <= remaining) {
+        stderr += chunkStr
+      } else {
+        // truncate the chunk to fit exactly within the cap
+        const truncated = chunk.subarray(0, remaining).toString('utf-8')
+        stderr += truncated
       }
     })
 
