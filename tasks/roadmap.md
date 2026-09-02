@@ -1585,8 +1585,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       Meta Reviewer AI・Typecheck & Test 両requiredチェックとも green（bypassなし）。
       PR #61は通常のmerge手順でmaster統合済み（`b01b9c3`）。
 <!-- roadmap:id=design-review-conflict-recovery state=planned -->
-7. [ ] **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が
-      本リポジトリに見つからなかったため正式登録し直す）。
+7. [x] **Design Review CONFLICT Recovery — 完了（2026-09-02）**（2026-09-01登録。上記と同じ経緯で、
+      Codexからの登録報告が本リポジトリに見つからなかったため正式登録し直す）。
 
       **目的**: Design Review CONFLICTが発生した際、PL（AI）がCONFLICTの理由を分析し、
       Goal / Design Philosophy / Approval Policyを変更せずに修正可能な場合はRoadmapを自動修正して
@@ -1614,7 +1614,31 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       **完了条件**: CONFLICT理由分析の方式・Roadmap自動修正の許容範囲（Goal/Design
       Philosophy/Approval Policy不変の判定方法）・CEOエスカレーション条件がCEOに採択されていること。
       実装着手はCEO承認後
-<!-- roadmap:id=roadmap-task-control-plane-separation state=in_progress -->
+
+      **実装完了（2026-09-02、PR #75 `feat/roadmap-conflict-recovery-item7`）**:
+      `initializeApprovedProject()`内でRoadmap生成→deterministic constraint validation→
+      Whole-Roadmap Design Reviewをbounded loop化（`ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS=3`）。
+      deterministic validation失敗またはWhole-Roadmap ReviewのCONFLICT判定の場合のみ、
+      その具体的な理由（`roadmapGenerator.ts`新設の`priorAttemptFeedback`オプション経由）を
+      次回生成promptへ渡してRoadmapのみを再生成——Project Definition/structured constraints/
+      Goal/Design Philosophy/Approval Policyは試行間で一切変更しない。UNCERTAIN・
+      REVIEW_UNAVAILABLE（provider unavailable相当）は初回で即fail-closed（再生成attemptを
+      消費しない——regenerateしても解決しない性質のため）。新設`executeRoadmapReviewToTerminal()`
+      が既存run-level bounded retry（claim/fence/requeue、Phase 1/2既存）を先にdecisiveな結果まで
+      drainしてから outer loopが判定するため、runner timeoutやclaim競合をCONFLICTと誤分類して
+      Roadmapを無駄に再生成することもない。古いreview evidenceの再利用は、Roadmap内容が変われば
+      `reviewMaterial`のhashも変わるという既存freshness機構だけで自然に防止（特別な仕組みを
+      追加していない）。Task syncはループがALIGNEDを得た場合のみ1回実行、却下された中間試行では
+      Task行を1件も作成しない。Phase 1c再検証で実際に観測した
+      scope_simplicity CONFLICT（9ケースのテスト追加を5 Task・2 Phaseに過剰分割）を
+      regression caseの実体として利用したが、このケース専用のタスク数ルールにはしていない
+      （Whole-Roadmap Reviewの意味的判断に委ねる設計を維持）。`designReviewCoordinator.ts`へ
+      roadmap-kind限定の`buildRoadmapRejectedReason()`を追加——決定的なCONFLICT判定は
+      従来`rejectedReason`が空のままだったため、これがないと再生成feedbackが
+      「reject されました」程度の中身のない文字列にしかならなかった。Task-kind reviewの挙動は
+      無変更（既存test suite全通過で確認）。apps/api 64ファイル/964テスト成功。apps/worker・
+      Control Repositoryは無変更のためAV-001対象外。production（api.aiteamos.uk）へ
+      deploy・health確認済み。
 8. [~] **Roadmap Task / Control-Plane Workflow Separation**（2026-09-01登録。Phase 1c Minimal
       Production E2E Projectの実行結果で発覚。調査・roadmap登録のみ行い、Phase 1cのscopeへは
       混ぜない）。
