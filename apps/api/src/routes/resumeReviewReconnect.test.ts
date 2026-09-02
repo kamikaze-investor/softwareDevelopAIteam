@@ -390,4 +390,39 @@ describe('resume success reconnects to the existing review-creation flow', () =>
       expect(nextJobs[0].status).toBe('queued')
     })
   })
+
+  it('6. a second resume (task blocked again after the first resumed Job) gets its own workflowStepKey and does not duplicate the review Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const blocked = await createBlockedImplementJob(app, task)
+      const firstResume = await resumeTask(app, task.id, 'First attempt: narrower approach.')
+      expect(firstResume.workflowStepKey).toBe(`resume:${blocked.id}:1`)
+
+      // 最初のresumed Jobも失敗し、再びblockedへ（既存のcreateBlockedImplementJobと同じ
+      // 直接blocked化パターン。resumeBlockedTask()はlatestJob.status==='blocked'を要求する）。
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().jobs.update(firstResume.id, { status: 'blocked' })
+
+      const secondResume = await resumeTask(app, task.id, 'Second attempt: even narrower approach.')
+      expect(secondResume.id).not.toBe(firstResume.id)
+      // anchorは直前のblocked Job(=firstResume)のid。retry:/repair:と同じ
+      // 「anchorはsourceJobId」規約により、1回目のresumeキーと衝突しない。
+      expect(secondResume.workflowStepKey).toBe(`resume:${firstResume.id}:1`)
+      expect(secondResume.workflowStepKey).not.toBe(firstResume.workflowStepKey)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${secondResume.id}`,
+        payload: successPatchPayload(),
+      })
+
+      expect(res.statusCode).toBe(200)
+      // 1回目のresumed Jobは一度も成功していないためreviewを作らず（testケース3と同じ挙動）、
+      // 2回目のresumed Jobの成功だけがreviewを作る: 合計でちょうど1件。
+      const reviews = await reviewJobsOf(task.id)
+      expect(reviews).toHaveLength(1)
+      expect(reviews[0].workflowStepKey).toBe(`implement:${secondResume.id}:review`)
+    })
+  })
 })
