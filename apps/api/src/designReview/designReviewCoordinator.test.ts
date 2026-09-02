@@ -582,6 +582,61 @@ describe('roadmap review claim/fence dedup', () => {
   })
 })
 
+describe('executeRunner stderr cap UTF-8 boundary', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'stderr-utf8-test-'))
+  const scriptPath = join(tmpDir, 'write-stderr-utf8.js')
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  it('stderr byte length never exceeds cap even when chunk slices mid-multibyte character', async () => {
+    const maxBytes = DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES
+    // Write enough ASCII to leave room for one multi-byte character to straddle the boundary.
+    // A 4-byte emoji (🎉) at the tail end ensures that if the handler byte-slices mid-character,
+    // the U+FFFD replacement (3 bytes) can overshoot.
+    const paddingLen = maxBytes - 4
+    const padding = 'x'.repeat(paddingLen)
+
+    writeFileSync(scriptPath, [
+      'const s = ' + JSON.stringify(padding) + ';',
+      'process.stderr.write(s);',
+      // Write a 4-byte UTF-8 emoji. The stream chunk boundary may or may not split
+      // this character; regardless, the handler must not let the total exceed the cap.
+      'process.stderr.write("\\u{1F389}");',
+      'process.exit(0);',
+    ].join('\n'))
+
+    const prevSystemRoot = process.env.SystemRoot
+    const prevWindir = process.env.windir
+    process.env.SystemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+    process.env.windir = process.env.windir ?? 'C:\\Windows'
+
+    try {
+      const runnerDeps: CoordinatorDeps = {
+        runnerCommand: process.execPath,
+        runnerArgs: [scriptPath],
+        homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? '/tmp/home',
+        workingDir: process.cwd(),
+      }
+
+      const result = await executeRunner(runnerDeps, '')
+
+      expect(result.ok).toBe(true)
+      expect(result.stderr).toBeDefined()
+      const stderrBytes = Buffer.byteLength(result.stderr!, 'utf-8')
+      expect(stderrBytes).toBeLessThanOrEqual(maxBytes)
+      // Should still be close to the cap (the emoji tail is dropped, not the whole padding).
+      expect(stderrBytes).toBeGreaterThanOrEqual(maxBytes - 5)
+    } finally {
+      if (prevSystemRoot === undefined) delete process.env.SystemRoot
+      else process.env.SystemRoot = prevSystemRoot
+      if (prevWindir === undefined) delete process.env.windir
+      else process.env.windir = prevWindir
+    }
+  })
+})
+
 describe('executeRunner stderr cap enforcement', () => {
   const tmpDir = mkdtempSync(join(tmpdir(), 'stderr-cap-test-'))
   const scriptPath = join(tmpDir, 'write-stderr.js')

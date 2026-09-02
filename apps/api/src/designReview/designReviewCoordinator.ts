@@ -334,9 +334,12 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
       if (chunkBytes <= remaining) {
         stderr += chunkStr
       } else {
-        // truncate the chunk to fit exactly within the cap
         const truncated = chunk.subarray(0, remaining).toString('utf-8')
-        stderr += truncated
+        if (Buffer.byteLength(stderr + truncated, 'utf-8') > DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES) {
+          // decoded fragment pushes total over cap (multi-byte boundary overshoot); drop it
+        } else {
+          stderr += truncated
+        }
       }
     })
 
