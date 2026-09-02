@@ -74,6 +74,48 @@ describe('parseAnalysisJson', () => {
     ])
   })
 
+  it('drops only malformed structuredConstraints entries and keeps the rest of the analysis intact', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const payload = {
+      ...JSON.parse(VALID_ANALYSIS_JSON),
+      goal: 'computeTaskDisplayStatus tests should be improved with a small, low-risk change.',
+      gaps: [],
+      structuredConstraints: [
+        {
+          kind: 'other',
+          value: null,
+          description: 'Do not change existing Architecture or Policy.',
+          sourceText: '既存ArchitectureやPolicyは変更しないでください',
+        },
+        {
+          kind: 'max_task_count',
+          value: 3,
+          description: 'At most three tasks may be generated.',
+          sourceText: '小規模で低リスクな変更',
+        },
+      ],
+    }
+
+    try {
+      const result = parseAnalysisJson(JSON.stringify(payload))
+
+      expect(result.goal).toBe(payload.goal)
+      expect(result.gaps).toEqual([])
+      expect(result.structuredConstraints).toEqual([
+        {
+          kind: 'max_task_count',
+          value: 3,
+          description: 'At most three tasks may be generated.',
+          sourceText: '小規模で低リスクな変更',
+        },
+      ])
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('kind=other'))
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('既存ArchitectureやPolicyは変更しないでください'))
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
   it('```json ブロックに包まれたJSONを解析できる', () => {
     const wrapped = '```json\n' + VALID_ANALYSIS_JSON + '\n```'
     const result = parseAnalysisJson(wrapped)
@@ -87,6 +129,13 @@ describe('parseAnalysisJson', () => {
   it('スキーマ不正なJSONはエラーをthrowする', () => {
     const invalid = JSON.stringify({ goal: 'OK' })  // 必須フィールド欠落
     expect(() => parseAnalysisJson(invalid)).toThrow('[CTO AI]')
+  })
+
+  it('still throws when a required top-level field is missing', () => {
+    const missingGoal = JSON.parse(VALID_ANALYSIS_JSON)
+    delete missingGoal.goal
+
+    expect(() => parseAnalysisJson(JSON.stringify(missingGoal))).toThrow('[CTO AI]')
   })
 
   it('readinessScore が 0〜100 の範囲外はエラー', () => {
