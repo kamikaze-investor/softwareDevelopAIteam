@@ -96,6 +96,7 @@ ${constitutionPrinciplesPrompt}
 Structured constraint extraction:
 - Only populate structuredConstraints for constraints explicitly and unambiguously stated in the spec text, such as "only 1 task", "only touch docs/", "no new files", or "don't add X as a dependency".
 - Do not infer structuredConstraints. Copy the exact source phrase into sourceText.
+- The value field must be a concrete string, number, string array, or boolean; never use null or omit value. If no concrete value is available, omit the structured constraint or emit a gaps entry instead.
 - If a constraint-shaped statement is ambiguous or high-impact, do not guess. Emit a normal gaps entry with severity "must_resolve" and ask through the existing Gap flow.
 
 以下のJSON形式のみで回答してください。説明文・マークダウンコードブロック・前置き・後書きは一切不要です。
@@ -211,7 +212,8 @@ export function parseAnalysisJson(raw: string): SpecAnalysis {
   }
 
   const parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0])
-  const result = SpecAnalysisSchema.safeParse(parsed)
+  const filteredParsed = filterMalformedStructuredConstraints(parsed)
+  const result = SpecAnalysisSchema.safeParse(filteredParsed)
 
   if (!result.success) {
     throw new Error(
@@ -220,4 +222,42 @@ export function parseAnalysisJson(raw: string): SpecAnalysis {
   }
 
   return result.data
+}
+
+function filterMalformedStructuredConstraints(parsed: unknown): unknown {
+  if (typeof parsed !== 'object' || parsed === null || !('structuredConstraints' in parsed)) {
+    return parsed
+  }
+
+  const record = parsed as Record<string, unknown>
+  if (!Array.isArray(record.structuredConstraints)) {
+    return parsed
+  }
+
+  const structuredConstraints = record.structuredConstraints.filter((entry) => {
+    const result = StructuredConstraintSchema.safeParse(entry)
+    if (!result.success) {
+      const context = describeMalformedStructuredConstraint(entry)
+      console.warn(
+        `[CTO AI] Dropping malformed structuredConstraints entry${context} (kept the rest of the analysis): ${JSON.stringify(entry)}`,
+      )
+    }
+    return result.success
+  })
+
+  return { ...record, structuredConstraints }
+}
+
+function describeMalformedStructuredConstraint(entry: unknown): string {
+  if (typeof entry !== 'object' || entry === null) {
+    return ''
+  }
+
+  const record = entry as Record<string, unknown>
+  const details = [
+    typeof record.kind === 'string' ? `kind=${record.kind}` : undefined,
+    typeof record.sourceText === 'string' ? `sourceText=${record.sourceText}` : undefined,
+  ].filter((detail): detail is string => detail !== undefined)
+
+  return details.length > 0 ? ` (${details.join(', ')})` : ''
 }
