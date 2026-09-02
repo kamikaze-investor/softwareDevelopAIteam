@@ -148,6 +148,22 @@ describe('generateRoadmap (default model)', () => {
     expect(request?.messages[0]?.content).toContain('Canonical goal')
     expect(request?.messages[0]?.content).toContain('allowed_path_prefixes')
   })
+
+  it('adds priorAttemptFeedback to the real API prompt when provided', async () => {
+    anthropicMocks.create.mockResolvedValueOnce({
+      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
+    })
+
+    await generateRoadmap(MOCK_ANALYSIS, {
+      apiKey: 'test-api-key',
+      priorAttemptFeedback: 'scope_simplicity rejected the previous roadmap as over-split.',
+    })
+
+    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
+    expect(request?.messages[0]?.content).toContain('Previous Attempt Was Rejected -- Fix This')
+    expect(request?.messages[0]?.content).toContain('scope_simplicity rejected the previous roadmap as over-split.')
+    expect(request?.messages[0]?.content).toContain('Generate a NEW roadmap')
+  })
 })
 
 describe('generateRoadmap (mockResponse)', () => {

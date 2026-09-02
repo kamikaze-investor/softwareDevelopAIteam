@@ -123,6 +123,13 @@ export interface RoadmapGeneratorOptions {
   mockResponse?: string
   canonicalDefinitionText?: string
   definitionHash?: string
+  /**
+   * Feedback from a previous rejected attempt (deterministic validation issues or a
+   * Whole-Roadmap Design Review CONFLICT reason). When present, tells the model what was wrong
+   * last time so it can avoid repeating it. Never used to inject new constraints or guess at
+   * Goal/Design Philosophy content -- purely "here's what failed, fix this."
+   */
+  priorAttemptFeedback?: string
 }
 
 export async function generateRoadmap(
@@ -167,6 +174,13 @@ ${analysis.techStack.map(t => `- ${t}`).join('\n')}
 
 ## Structured Constraints
 ${JSON.stringify(analysis.structuredConstraints, null, 2)}
+${options.priorAttemptFeedback ? `
+## Previous Attempt Was Rejected -- Fix This
+
+${options.priorAttemptFeedback}
+
+Generate a NEW roadmap that addresses this specific problem. Do not repeat the same structural mistake.
+` : ''}
 `.trim()
 
   const message = await client.messages.create({
