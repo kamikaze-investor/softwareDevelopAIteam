@@ -51,7 +51,7 @@ function baseInput(taskId: string) {
   }
 }
 
-function deps(execute: (input: string) => Promise<{ ok: boolean; stdout: string; error?: string; timedOut: boolean }>) {
+function deps(execute: (input: string) => Promise<{ ok: boolean; stdout: string; error?: string; timedOut: boolean; stderr?: string }>) {
   return {
     runnerCommand: 'node',
     runnerArgs: [],
@@ -197,6 +197,90 @@ describe('3. decision authority', () => {
     expect(result.status).toBe('not_aligned')
     expect(result.decision).toBe('CONFLICT')
     expect(storage.designReviewEvidence.findByTaskId(taskId)).toHaveLength(0)
+  })
+
+  it('runnerがok:trueでもstderr診断情報を保持し、decision非ALIGNED時にconsole.warnする', async () => {
+    const raw: Record<string, unknown> = {
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'CONFLICT' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      ],
+      integrationReviewResult: { decision: 'ALIGNED' },
+      independentReviewResult: { verdict: 'approved' },
+      finalDecision: 'ALIGNED',
+    }
+    const stderrDiag = '[geminiRouter] Gemini failed, unknown (feature: strategic-meta-review-scope_simplicity)'
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      const run = storage.designReviewRuns.create({
+        ...baseInput(taskId),
+        changedFiles: ['specs/00_constitution.md'],
+      })
+      const result = await executeDesignReviewRun(
+        storage, run, deps(async () => ({
+          ok: true,
+          stdout: JSON.stringify(raw),
+          timedOut: false,
+          stderr: stderrDiag,
+        })),
+      )
+
+      expect(result.status).toBe('not_aligned')
+      expect(result.decision).toBe('CONFLICT')
+      expect(warnSpy).toHaveBeenCalledOnce()
+      expect(warnSpy.mock.calls[0]?.[0]).toContain(stderrDiag)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('runnerがok:trueでstderrが空の場合はconsole.warnしない', async () => {
+    const raw: Record<string, unknown> = {
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'CONFLICT' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      ],
+      integrationReviewResult: { decision: 'ALIGNED' },
+      independentReviewResult: { verdict: 'approved' },
+      finalDecision: 'ALIGNED',
+    }
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    try {
+      const run = storage.designReviewRuns.create({
+        ...baseInput(taskId),
+        changedFiles: ['specs/00_constitution.md'],
+      })
+      const result = await executeDesignReviewRun(
+        storage, run, deps(async () => ({
+          ok: true,
+          stdout: JSON.stringify(raw),
+          timedOut: false,
+        })),
+      )
+
+      expect(result.status).toBe('not_aligned')
+      expect(warnSpy).not.toHaveBeenCalled()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('runnerがok:falseの場合もstderrがerrorに含まれる（既存動作の確認）', async () => {
+    const run = storage.designReviewRuns.create(baseInput(taskId))
+    const result = await executeDesignReviewRun(
+      storage, run, deps(async () => ({
+        ok: false,
+        stdout: '',
+        error: 'runner exited with code 1: some stderr',
+        timedOut: false,
+        stderr: 'some stderr',
+      })),
+    )
+
+    expect(result.status).toMatch(/requeued|failed/)
+    expect(result.error).toContain('some stderr')
   })
 
   it('critical loadでindependent reviewが欠落していれば不採用', () => {

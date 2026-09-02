@@ -252,6 +252,8 @@ export interface RunnerExecution {
   stdout: string
   error?: string
   timedOut: boolean
+  /** runner の stderr 診断情報。成功時も失敗時も同じ上限（DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES）で収集する。 */
+  stderr?: string
 }
 
 export interface CoordinatorDeps {
@@ -304,7 +306,7 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
 
     const timer = setTimeout(() => {
       timedOut = true
-      terminate({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true })
+      terminate({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true, stderr: undefined })
     }, timeoutMs)
 
     child.stdout.on('data', (chunk: Buffer) => {
@@ -318,6 +320,7 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
           stdout: '',
           error: `runner output exceeded ${DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES} bytes`,
           timedOut: false,
+          stderr: undefined,
         })
       }
     })
@@ -329,12 +332,12 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
     })
 
     child.on('error', (err) => {
-      settle({ ok: false, stdout, error: `spawn failed: ${err.message}`, timedOut })
+      settle({ ok: false, stdout, error: `spawn failed: ${err.message}`, timedOut, stderr: undefined })
     })
 
     child.on('close', (code) => {
       if (timedOut) {
-        settle({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true })
+        settle({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true, stderr: undefined })
         return
       }
       if (overflowed) {
@@ -343,14 +346,15 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
           stdout: '',
           error: `runner output exceeded ${DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES} bytes`,
           timedOut: false,
+          stderr: undefined,
         })
         return
       }
       if (code !== 0) {
-        settle({ ok: false, stdout, error: `runner exited with code ${code}: ${stderr.trim()}`, timedOut: false })
+        settle({ ok: false, stdout, error: `runner exited with code ${code}: ${stderr.trim()}`, timedOut: false, stderr: stderr.trim() || undefined })
         return
       }
-      settle({ ok: true, stdout, timedOut: false })
+      settle({ ok: true, stdout, timedOut: false, stderr: stderr.trim() || undefined })
     })
 
     // spawn失敗時などに stdin への書き込みが EPIPE を投げてプロセスを落とさないようにする。
@@ -458,6 +462,9 @@ export async function executeDesignReviewRun(
   const outcome = recomputeDecision(raw, run.reviewKind, changedFiles)
 
   if (outcome.decision !== 'ALIGNED') {
+    if (execution.stderr) {
+      console.warn(`[designReview] runner stderr (decision=${outcome.decision}): ${execution.stderr}`)
+    }
     const fenced = storage.designReviewRuns.complete(
       run.id,
       claimToken,
