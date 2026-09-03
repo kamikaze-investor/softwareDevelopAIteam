@@ -1,4 +1,10 @@
 import type { Job, Task } from '@ai-team/shared'
+import {
+  buildDesignContract,
+  loadEngineeringPrinciples,
+  selectPrincipleSlugs,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
+import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import {
   buildDefaultCoordinatorDeps,
@@ -16,9 +22,20 @@ function initialWorkflowStepKey(taskId: string): string {
   return `task:${taskId}:initial-implement`
 }
 
+export function buildInitialImplementAiCliPrompt(task: Pick<Task, 'description' | 'allowedPaths'>): string {
+  const designContract = buildDesignContract({
+    slugs: selectPrincipleSlugs({
+      predictedFocuses: (task.allowedPaths ?? []).flatMap(mapFileToFocuses),
+    }),
+    principles: loadEngineeringPrinciples(),
+  })
+
+  return `${task.description}\n\n${designContract}`
+}
+
 /**
  * DB Task同期とroadmap Markdown保存の成功後にだけ呼ぶ初回workflow producer。
- * promptは既存の手動implement経路と同じTask.descriptionをそのまま使用する。
+ * promptはTask.descriptionにDesign Contractを付与したcanonical文字列を使用する。
  */
 export async function createInitialImplementWorkflow(
   storage: IStorage,
@@ -60,6 +77,7 @@ export async function createInitialImplementWorkflow(
 
   // Job Gateは常に実行する。すでに同一Task・同一prompt hashのALIGNED evidenceがあれば、
   // crash/replay時にReviewを再実行せずそのevidenceを再利用する。
+  const aiCliPrompt = buildInitialImplementAiCliPrompt(task)
   const jobInput: Omit<Job, 'id' | 'createdAt'> = {
     taskId: task.id,
     projectId: task.projectId,
@@ -68,7 +86,7 @@ export async function createInitialImplementWorkflow(
     status: 'queued',
     safeCommand: { kind: 'test', workingDir: TARGET_WORKING_DIR },
     aiCliProvider: task.provider ?? 'claude_code',
-    aiCliPrompt: task.description,
+    aiCliPrompt,
     aiCliMode: 'implement',
   }
   let gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
@@ -76,7 +94,7 @@ export async function createInitialImplementWorkflow(
     const review = await createAndExecuteDesignReview(storage, {
       taskId: task.id,
       taskTitle: task.title,
-      designText: task.description,
+      designText: aiCliPrompt,
       changedFiles: [],
     }, deps)
     if (review.status !== 'evidence_registered') {

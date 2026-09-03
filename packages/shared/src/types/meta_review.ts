@@ -35,6 +35,9 @@ export type MetaFindingCategory =
   | 'scope_creep'           // 不要な機能追加・過剰実装
   | 'mvp_mismatch'          // MVPスコープとの不整合
   | 'spec_violation'        // CLAUDE.md / specs/への違反
+  | 'implementation_coupling'
+  | 'over_constraint'
+  | 'unverifiable_assumption'
 
 export type MetaReviewStatus = 'approved' | 'changes_requested' | 'blocked'
 export type MetaRiskLevel = 'low' | 'medium' | 'high' | 'critical'

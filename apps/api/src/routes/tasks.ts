@@ -8,6 +8,12 @@ import {
   type Task,
   type TaskFailureQuestionTurn,
 } from '@ai-team/shared'
+import {
+  buildDesignContract,
+  loadEngineeringPrinciples,
+  selectPrincipleSlugs,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
+import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
@@ -146,7 +152,14 @@ function isTaskFailureJob(job: Job): job is TaskFailureJob {
   return job.status === 'failed' || job.status === 'blocked'
 }
 
-export function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string {
+export function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description' | 'allowedPaths'>, instruction: string): string {
+  const designContract = buildDesignContract({
+    slugs: selectPrincipleSlugs({
+      predictedFocuses: (task.allowedPaths ?? []).flatMap(mapFileToFocuses),
+    }),
+    principles: loadEngineeringPrinciples(),
+  })
+
   return `[Task] ${task.title}
 ${task.description}
 
@@ -154,7 +167,9 @@ ${task.description}
 ${instruction}
 
 [重要な注意]
-却下された操作を変更せず繰り返さないこと。CEOの追加指示を反映した、異なる内容の変更を作成してください。`
+却下された操作を変更せず繰り返さないこと。CEOの追加指示を反映した、異なる内容の変更を作成してください。
+
+${designContract}`
 }
 
 // limit はここで厳密なnumber検証をせず、storage層のnormalizeSummaryLimit()に正規化を委ねる

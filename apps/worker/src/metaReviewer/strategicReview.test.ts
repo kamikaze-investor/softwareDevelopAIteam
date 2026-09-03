@@ -41,6 +41,7 @@ import {
 } from './runner.js'
 import {
   applyIndependentReviewOverride,
+  parseFocusedReviewResponse,
   runIndependentReview,
   runStrategicMetaReview,
 } from './strategicReview.js'
@@ -483,6 +484,21 @@ describe('runStrategicMetaReview', () => {
     expect(result.focusedReviewResults.every((f) => f.decision === 'ALIGNED')).toBe(true)
     expect(result.integrationReviewResult?.decision).toBe('ALIGNED')
     expect(result.finalDecision).toBe('ALIGNED')
+  })
+
+  it('accepts engineering principle categories in focused review findings', () => {
+    const outcome = parseFocusedReviewResponse(JSON.stringify({
+      decision: 'CONFLICT',
+      summary: 'Constraint issue',
+      findings: [{
+        severity: 'medium',
+        category: 'over_constraint',
+        message: 'The design adds a gate without a specific prevented failure.',
+      }],
+    }), 'scope_simplicity')
+
+    expect(outcome.unavailable).toBe(false)
+    expect(outcome.result.findings[0].category).toBe('over_constraint')
   })
 
   it('fails closed on non-quota errors without falling back to Copilot', async () => {

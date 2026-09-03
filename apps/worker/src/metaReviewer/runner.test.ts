@@ -51,6 +51,27 @@ describe('parseMetaReviewResult', () => {
     expect(result.findings[0].category).toBe('scope_creep')
   })
 
+  it('accepts engineering principle finding categories', () => {
+    const result = parseMetaReviewResult(
+      JSON.stringify({
+        status: 'changes_requested',
+        riskLevel: 'medium',
+        summary: 'Principle issue',
+        findings: [
+          {
+            severity: 'medium',
+            category: 'implementation_coupling',
+            message: 'Finding depends on process topology rather than observable behavior.',
+          },
+        ],
+        requiresCeoApproval: false,
+      }),
+      'task-test',
+    )
+
+    expect(result.findings[0].category).toBe('implementation_coupling')
+  })
+
   it('returns blocked when no valid Meta Review JSON exists', () => {
     const result = parseMetaReviewResult('not json', 'task-test')
 

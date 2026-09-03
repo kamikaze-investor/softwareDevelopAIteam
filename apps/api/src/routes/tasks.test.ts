@@ -2,6 +2,11 @@ import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskSummary } from '@ai-team/shared'
+import {
+  buildDesignContract,
+  loadEngineeringPrinciples,
+  selectPrincipleSlugs,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildResumeAiCliPrompt, type TaskRouteOptions } from './tasks'
 
@@ -87,7 +92,11 @@ async function createJob(
   body: CreateJobRequestBody = {},
 ): Promise<Job> {
   if (body.aiCliMode === 'implement' && typeof body.aiCliPrompt === 'string') {
-    await createAlignedDesignReviewEvidence(task.id, body.aiCliPrompt)
+    const routeWillAppendBaseContract = body.agentRole === undefined || body.agentRole === 'developer_ai'
+    await createAlignedDesignReviewEvidence(
+      task.id,
+      routeWillAppendBaseContract ? appendBaseDesignContract(body.aiCliPrompt) : body.aiCliPrompt,
+    )
   }
 
   const res = await app.inject({
@@ -115,6 +124,13 @@ async function createAlignedDesignReviewEvidence(taskId: string, designText: str
     decision: 'ALIGNED',
     independentReviewRequired: false,
   })
+}
+
+function appendBaseDesignContract(prompt: string): string {
+  return `${prompt}\n\n${buildDesignContract({
+    slugs: selectPrincipleSlugs(),
+    principles: loadEngineeringPrinciples(),
+  })}`
 }
 
 async function updateJob(
@@ -183,6 +199,22 @@ async function wait(ms: number): Promise<void> {
 beforeEach(() => {
   vi.resetModules()
   process.env.DB_PATH = ':memory:'
+})
+
+describe('buildResumeAiCliPrompt', () => {
+  it('appends a Design Contract using allowedPaths focus signals', () => {
+    const prompt = buildResumeAiCliPrompt({
+      title: 'Resume storage work',
+      description: 'Finish the storage update.',
+      allowedPaths: ['apps/api/src/storage/sqlite.ts'],
+    }, 'Use the reviewed storage API.')
+
+    expect(prompt).toContain('## Design Contract')
+    expect(prompt).toContain('Finish the storage update.')
+    expect(prompt).toContain('Use the reviewed storage API.')
+    expect(prompt).toContain('current implementation is evidence, not specification')
+    expect(prompt).toContain('Keep security and data boundaries strict')
+  })
 })
 
 describe('Task API', () => {
@@ -290,7 +322,8 @@ describe('Task API', () => {
       })
       expect(taskRes.statusCode).toBe(201)
       const task = parseBody<Task>(taskRes.body)
-      await createAlignedDesignReviewEvidence(task.id, prompt)
+      const finalPrompt = appendBaseDesignContract(prompt)
+      await createAlignedDesignReviewEvidence(task.id, finalPrompt)
 
       const jobRes = await app.inject({
         method: 'POST',
@@ -310,7 +343,7 @@ describe('Task API', () => {
       expect(parseBody<Job>(jobRes.body)).toMatchObject({
         taskId: task.id,
         aiCliMode: 'implement',
-        aiCliPrompt: prompt,
+        aiCliPrompt: finalPrompt,
         status: 'queued',
       })
     })
@@ -836,7 +869,8 @@ describe('Task API', () => {
         const original = jobs.find((job) => job.id === blockedJob.id)
         const created = jobs.find((job) => job.id === resumedJob.id)
         expect(original?.status).toBe('blocked')
-        expect(original?.aiCliPrompt).toBe('Original rejected prompt')
+        expect(original?.aiCliPrompt).toBe(blockedJob.aiCliPrompt)
+        expect(original?.aiCliPrompt).toContain('## Design Contract')
         expect(created?.status).toBe('queued')
       })
     })

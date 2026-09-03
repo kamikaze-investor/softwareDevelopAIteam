@@ -2,6 +2,11 @@ import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { canonicalizeJobUpdate, type Job, type ReviewResult } from '@ai-team/shared'
+import {
+  buildDesignContract,
+  loadEngineeringPrinciples,
+  selectPrincipleSlugs,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
 import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import type { DesignReviewRun, OutboxEventInput } from '../storage/interface'
@@ -189,6 +194,15 @@ function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, ded
   }
 }
 
+function appendBaseDesignContract(prompt: string): string {
+  const designContract = buildDesignContract({
+    slugs: selectPrincipleSlugs(),
+    principles: loadEngineeringPrinciples(),
+  })
+
+  return `${prompt}\n\n${designContract}`
+}
+
 
 /**
  * durableにqueuedとなったDesign Review runのexecutorをkickする。
@@ -251,7 +265,18 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(409).send({ error: 'Project is archived' })
     }
 
-    const designReviewCheck = checkImplementJobDesignReviewEvidence(result.data, storage.designReviewEvidence)
+    const jobInput: Omit<Job, 'id' | 'createdAt'> = {
+      ...result.data,
+      // workingDir はクライアントから受け取らない。MVP-Aの正規workingDirをここで設定する。
+      safeCommand: { ...result.data.safeCommand, workingDir: TARGET_WORKING_DIR },
+      status: 'queued',
+      aiCliPrompt: result.data.agentRole === 'developer_ai'
+        && result.data.aiCliMode === 'implement'
+        && result.data.aiCliPrompt !== undefined
+        ? appendBaseDesignContract(result.data.aiCliPrompt)
+        : result.data.aiCliPrompt,
+    }
+    const designReviewCheck = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
     if (!designReviewCheck.ok) {
       return reply.status(409).send({
         error: 'Implement Job requires an aligned pre-implementation Design Review',
@@ -260,12 +285,6 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const jobInput: Omit<Job, 'id' | 'createdAt'> = {
-      ...result.data,
-      // workingDir はクライアントから受け取らない。MVP-Aの正規workingDirをここで設定する。
-      safeCommand: { ...result.data.safeCommand, workingDir: TARGET_WORKING_DIR },
-      status: 'queued',
-    }
     const job = storage.jobs.create(jobInput)
     return reply.status(201).send(job)
   })
