@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
   BASE_PRINCIPLE_SLUGS,
   buildDesignContract,
+  buildEngineeringPrincipleReviewGuidance,
   loadEngineeringPrinciples,
   selectPrincipleSlugs,
 } from './engineeringPrinciples.js'
@@ -13,6 +16,15 @@ const principlePaths = [
 ] as const
 const missingPath = path.resolve(process.cwd(), '__missing__', '21_outcome_oriented_generalization_principle.md')
 
+function findExistingPrincipleSpecPath(): string {
+  const existingPath = principlePaths.find((candidatePath) => existsSync(candidatePath))
+  if (existingPath === undefined) {
+    throw new Error('principle spec fixture is missing')
+  }
+
+  return existingPath
+}
+
 describe('loadEngineeringPrinciples', () => {
   it('loads principle clauses by stable principle-id marker', () => {
     const result = loadEngineeringPrinciples(principlePaths)
@@ -21,7 +33,30 @@ describe('loadEngineeringPrinciples', () => {
     if (!result.ok) return
     expect(result.bySlug.get('evidence-not-spec')?.fullText).toContain('Current implementation is evidence, not specification.')
     expect(result.bySlug.get('stable-contract-first')?.fullText).toContain('Stable Contract First')
-    expect(result.bySlug.get('observable-behavior')?.oneLiner).toContain('observable behavior')
+    expect(result.bySlug.get('observable-behavior')?.oneLiner).toBe('Test observable behavior and invariants, not private structure.')
+  })
+
+  it('loads one-liners from principle-oneliner markers', () => {
+    const originalSpec = readFileSync(findExistingPrincipleSpecPath(), 'utf-8')
+    const customSpec = originalSpec.replace(
+      '<!-- principle-oneliner: Test observable behavior and invariants, not private structure. -->',
+      '<!-- principle-oneliner: Custom observable behavior marker. -->',
+    )
+    expect(customSpec).not.toBe(originalSpec)
+
+    const tempDir = mkdtempSync(path.join(tmpdir(), 'engineering-principles-'))
+    const tempPath = path.join(tempDir, '21_outcome_oriented_generalization_principle.md')
+
+    try {
+      writeFileSync(tempPath, customSpec)
+      const result = loadEngineeringPrinciples([tempPath])
+
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(result.bySlug.get('observable-behavior')?.oneLiner).toBe('Custom observable behavior marker.')
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
   })
 
   it('fails honestly when the spec file is missing', () => {
@@ -32,6 +67,29 @@ describe('loadEngineeringPrinciples', () => {
     if (result.ok) return
     expect(result.reason).toContain('21_outcome_oriented_generalization_principle.md')
     expect(result.triedPaths).toEqual([missingPath])
+  })
+})
+
+describe('buildEngineeringPrincipleReviewGuidance', () => {
+  it('renders reviewer guidance from loaded principle one-liners', () => {
+    const guidance = buildEngineeringPrincipleReviewGuidance(loadEngineeringPrinciples(principlePaths))
+
+    expect(guidance).toContain('- implementation_coupling: Prefer public APIs and stable contracts over incidental internals.')
+    expect(guidance).toContain('- over_constraint: Name the failure a constraint prevents before adding it.')
+    expect(guidance).toContain('- unverifiable_assumption: Report unverifiable claims honestly instead of turning guesses into PASS.')
+  })
+
+  it('renders an unavailable notice when principles are unavailable', () => {
+    const guidance = buildEngineeringPrincipleReviewGuidance({
+      ok: false,
+      reason: 'missing principle spec',
+      triedPaths: [missingPath],
+    })
+
+    expect(guidance).toContain('Engineering principles unavailable')
+    expect(guidance).toContain('do not treat them as applied')
+    expect(guidance).toContain('missing principle spec')
+    expect(guidance).not.toContain('implementation_coupling')
   })
 })
 

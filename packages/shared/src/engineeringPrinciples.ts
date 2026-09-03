@@ -52,19 +52,6 @@ export const BASE_PRINCIPLE_SLUGS: readonly PrincipleSlug[] = [
   'observable-behavior',
 ] as const
 
-const ONE_LINERS: Record<PrincipleSlug, string> = {
-  'evidence-not-spec': 'Define required outcomes first; current implementation is evidence, not specification.',
-  'standard-design-frame': 'Name the failure a constraint prevents before adding it.',
-  'stable-contract-first': 'Prefer public APIs and stable contracts over incidental internals.',
-  'deterministic-vs-heuristic': 'Use deterministic facts for gates; keep heuristics diagnostic unless justified.',
-  'honest-unverifiable': 'Report unverifiable claims honestly instead of turning guesses into PASS.',
-  'boundary-strictness': 'Keep security and data boundaries strict while preserving internal flexibility.',
-  'observable-behavior': 'Test observable behavior and invariants, not private structure.',
-  'review-integration': 'Extend existing review paths instead of creating duplicate review engines.',
-  'scale-to-risk': 'Scale design detail to risk; do not force large templates onto small changes.',
-  'existing-code-grandfather': 'Grandfather existing code and improve it incrementally when touched.',
-} as const
-
 const FOCUS_PRINCIPLE_SLUGS: Partial<Record<MetaReviewFocus, readonly PrincipleSlug[]>> = {
   safety_recovery: [
     'stable-contract-first',
@@ -189,19 +176,30 @@ export function buildDesignContract(input: {
   return lines.join('\n')
 }
 
-export function buildEngineeringPrincipleReviewGuidance(): string {
+export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringPrinciplesResult): string {
+  if (!principles.ok) {
+    return [
+      '## Engineering Principle Review Guidance',
+      `- Engineering principles unavailable; do not treat them as applied. Reason: ${principles.reason}`,
+    ].join('\n')
+  }
+
+  const stableContract = principles.bySlug.get('stable-contract-first')
+  const standardDesignFrame = principles.bySlug.get('standard-design-frame')
+  const honestUnverifiable = principles.bySlug.get('honest-unverifiable')
+
   return [
     '## Engineering Principle Review Guidance',
-    '- Flag findings or decisions coupled to current implementation details instead of stable contracts or observable behavior.',
-    '- Flag constraints that do not name the specific failure they prevent and the cost they add.',
-    '- Flag claims treated as verified without a formal interface that can prove them; prefer NOT_VERIFIABLE over false PASS.',
+    `- implementation_coupling: ${stableContract?.oneLiner ?? 'Principle stable-contract-first was not available; do not treat it as applied.'}`,
+    `- over_constraint: ${standardDesignFrame?.oneLiner ?? 'Principle standard-design-frame was not available; do not treat it as applied.'}`,
+    `- unverifiable_assumption: ${honestUnverifiable?.oneLiner ?? 'Principle honest-unverifiable was not available; do not treat it as applied.'}`,
   ].join('\n')
 }
 
 function extractEngineeringPrinciples(
   content: string,
 ): { ok: true; bySlug: Map<PrincipleSlug, EngineeringPrinciple> } | { ok: false; reason: string } {
-  const markerMatches = [...content.matchAll(/^<!--\s*principle-id:\s*([a-z0-9-]+)\s*-->\s*$/gmu)]
+  const markerMatches = [...content.matchAll(/^<!--[ \t]*principle-id:[ \t]*([a-z0-9-]+)[ \t]*-->[ \t]*$/gmu)]
   if (markerMatches.length === 0) {
     return { ok: false, reason: 'no principle-id markers found' }
   }
@@ -221,13 +219,24 @@ function extractEngineeringPrinciples(
 
     const textStart = (match.index ?? 0) + match[0].length
     const textEnd = markerMatches[index + 1]?.index ?? content.length
-    const fullText = content.slice(textStart, textEnd).trim()
+    const blockText = content.slice(textStart, textEnd).replace(/^\r?\n/, '')
+    const oneLinerMatch = blockText.match(/^<!--[ \t]*principle-oneliner:[ \t]*(.*?)[ \t]*-->[ \t]*(?:\r?\n|$)/u)
+    if (oneLinerMatch === null) {
+      return { ok: false, reason: `principle ${rawSlug} is missing principle-oneliner marker` }
+    }
+
+    const oneLiner = oneLinerMatch[1].trim()
+    if (oneLiner.length === 0) {
+      return { ok: false, reason: `principle ${rawSlug} one-liner is empty` }
+    }
+
+    const fullText = blockText.slice(oneLinerMatch[0].length).trim()
     if (fullText.length === 0) {
       return { ok: false, reason: `principle ${rawSlug} is empty` }
     }
 
     bySlug.set(rawSlug, {
-      oneLiner: ONE_LINERS[rawSlug],
+      oneLiner,
       fullText,
     })
   }

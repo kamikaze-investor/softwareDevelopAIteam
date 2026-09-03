@@ -27,7 +27,10 @@ import type {
   MetaReviewStatus,
   MetaReviewTargetArea,
 } from '@ai-team/shared'
-import { buildEngineeringPrincipleReviewGuidance } from '@ai-team/shared/src/engineeringPrinciples.js'
+import {
+  buildEngineeringPrincipleReviewGuidance,
+  loadEngineeringPrinciples,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
 
 const CONTROL_ROOT = process.env.CONTROL_ROOT ?? '/workspace/control'
 const META_REVIEWER_PROMPT_PATH = path.join(
@@ -151,7 +154,8 @@ export function buildMetaReviewRequest(
  */
 export function buildMetaReviewPrompt(request: MetaReviewRequest): string {
   const systemPrompt = readFileSync(META_REVIEWER_PROMPT_PATH, 'utf-8')
-  const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance()
+  const engineeringPrinciples = loadEngineeringPrinciples()
+  const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance(engineeringPrinciples)
   const generalChecklist = readFileSync(META_REVIEWER_CHECKLIST_PATH, 'utf-8')
   const fileChecklists = getFileChecklists(request.changedFiles)
 

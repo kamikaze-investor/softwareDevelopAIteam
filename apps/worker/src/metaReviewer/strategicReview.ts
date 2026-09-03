@@ -16,7 +16,10 @@ import type {
   StrategicMetaReviewResult,
 } from '@ai-team/shared'
 import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
-import { buildEngineeringPrincipleReviewGuidance } from '@ai-team/shared/src/engineeringPrinciples.js'
+import {
+  buildEngineeringPrincipleReviewGuidance,
+  loadEngineeringPrinciples,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
 // 判定ロジックはAPI（Control Plane）側でも再計算する必要があるため @ai-team/shared を正本とし、
 // ここでは再exportして既存の呼び出し元との互換を保つ。定義を二重化しないこと。
 import { applyIndependentReviewOverride, resolveFinalDecision } from '@ai-team/shared'
@@ -801,7 +804,8 @@ function buildReviewMaterialSection(
 }
 
 function buildFocusedOutputContract(): string {
-  const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance()
+  const engineeringPrinciples = loadEngineeringPrinciples()
+  const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance(engineeringPrinciples)
 
   return [
     principleReviewGuidance,
