@@ -71,18 +71,15 @@ ${constitutionPrinciplesPrompt}
 以下のルールを守ってください:
 - タスクは小さく分割する（1タスク = 最大2日の作業量）
 - 依存関係を正確に設定する（並列実行できるものは依存しない）
-- Phase 1 は基盤構築（型定義・DB・API骨格）
-- Phase 2 はMVP機能（最小限の動くもの）
-- Phase 3 は品質・改善
-- タスク数は合計10〜20件程度がデフォルトだが、Structured Constraints に max_task_count がある場合はその値を優先する
+- タスク数はプロジェクトの実際の範囲に比例させてください。単一ファイル・単一関数の変更であれば1〜2タスクで十分であり、複数ファイル・複数モジュール・新しいサブシステムを含む場合のみ分割を広げてください。デフォルトのタスク数_rangeは存在しません。要件に応じて比例的に Size してください。
+- Structured Constraints に max_task_count がある場合はその値を厳守してください
+- Phase はプロジェクトの範囲に応じて適切に設定してください。小規模変更では1フェーズで十分であり、基盤構築→MVP機能→品質改善の3フェーズ構造は、複数フェーズにまたがる複数の異なる成果物がある場合のみ使ってください
 - allowedPaths は実際に変更するディレクトリのみ（例: "apps/engine/src/"）
 - 各タスクには category を必ず設定する:
   - "implementation": 実際にコード/ドキュメント/設定の変更を行いプロジェクトの成果物を生み出すタスク
-  - "verification": 既に実装された変更のテスト・QA・検証を行うタスク
+  - "verification": 既に実装された変更のテスト・QA・検証を行うタスク。**注意**: 小規模変更では implementation タスクにテスト検証を組み込み、別途 verification タスクを生成しないこと。verification は変更が広範囲で検証が別途必要とされる場合のみ生成する
   - "control_plane_operation": AIteamOSの自動操作を複製するタスク（Design Review提出・Approval取得・ブランチ作成・コミット・PR作成・CI確認・Commit Gate実行など）— **このカテゴリのタスクは絶対に生成しないでください**。これらはTaskシステムの外で自動的に実行されるため、Taskとして生成しない
   - "other": 上記以外（ sparingly 使用し、可能な限り他の3つを優先する）
-
-Structured Constraints が max_task_count を含む場合、タスク数はその制限を厳守してください。デフォルトの10〜20件ではなく、制約の値が上限です。
 
 以下のJSON形式のみで回答してください。コードブロック・前置き・後書きは不要です:
 
@@ -171,6 +168,12 @@ ${analysis.mvpScope.excludedFeatures.map(f => `- ${f}`).join('\n')}
 
 ## Tech Stack
 ${analysis.techStack.map(t => `- ${t}`).join('\n')}
+
+## Scope Signals
+- MVP included features: ${analysis.mvpScope.includedFeatures.length}
+- MVP excluded features: ${analysis.mvpScope.excludedFeatures.length}
+- Tech stack size: ${analysis.techStack.length}
+- Structured constraints count: ${analysis.structuredConstraints.length}
 
 ## Structured Constraints
 ${JSON.stringify(analysis.structuredConstraints, null, 2)}

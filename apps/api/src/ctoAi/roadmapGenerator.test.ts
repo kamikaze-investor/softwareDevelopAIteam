@@ -149,6 +149,77 @@ describe('generateRoadmap (default model)', () => {
     expect(request?.messages[0]?.content).toContain('allowed_path_prefixes')
   })
 
+  it('system prompt does not contain the old unconditional 10-20 default when structuredConstraints is empty', async () => {
+    anthropicMocks.create.mockResolvedValueOnce({
+      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
+    })
+
+    const emptyConstraintsAnalysis: SpecAnalysis = {
+      ...MOCK_ANALYSIS,
+      structuredConstraints: [],
+    }
+
+    await generateRoadmap(emptyConstraintsAnalysis, { apiKey: 'test-api-key' })
+
+    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
+    expect(request?.system).not.toContain('10〜20件')
+    expect(request?.system).not.toContain('10-20')
+  })
+
+  it('system prompt contains proportional sizing guidance when structuredConstraints is empty', async () => {
+    anthropicMocks.create.mockResolvedValueOnce({
+      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
+    })
+
+    const emptyConstraintsAnalysis: SpecAnalysis = {
+      ...MOCK_ANALYSIS,
+      structuredConstraints: [],
+    }
+
+    await generateRoadmap(emptyConstraintsAnalysis, { apiKey: 'test-api-key' })
+
+    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
+    expect(request?.system).toContain('タスク数はプロジェクトの実際の範囲に比例させてください')
+    expect(request?.system).toContain('単一ファイル・単一関数の変更であれば1〜2タスクで十分')
+  })
+
+  it('explicit max_task_count in structuredConstraints is still instructed as the governing limit', async () => {
+    anthropicMocks.create.mockResolvedValueOnce({
+      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
+    })
+
+    const maxCountAnalysis: SpecAnalysis = {
+      ...MOCK_ANALYSIS,
+      structuredConstraints: [
+        {
+          kind: 'max_task_count',
+          value: 5,
+          description: 'At most 5 tasks.',
+          sourceText: 'at most 5 tasks',
+        },
+      ],
+    }
+
+    await generateRoadmap(maxCountAnalysis, { apiKey: 'test-api-key' })
+
+    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
+    expect(request?.system).toContain('max_task_count がある場合はその値を厳守')
+    expect(request?.messages[0]?.content).toContain('"kind": "max_task_count"')
+  })
+
+  it('surfaces scope signals in the project summary for sizing', async () => {
+    anthropicMocks.create.mockResolvedValueOnce({
+      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
+    })
+
+    await generateRoadmap(MOCK_ANALYSIS, { apiKey: 'test-api-key' })
+
+    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
+    expect(request?.messages[0]?.content).toContain('## Scope Signals')
+    expect(request?.messages[0]?.content).toContain('MVP included features: 2')
+    expect(request?.messages[0]?.content).toContain('Tech stack size: 3')
+  })
+
   it('adds priorAttemptFeedback to the real API prompt when provided', async () => {
     anthropicMocks.create.mockResolvedValueOnce({
       content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
