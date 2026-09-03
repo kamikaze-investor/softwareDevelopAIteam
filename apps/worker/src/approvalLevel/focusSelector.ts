@@ -40,7 +40,7 @@ function normalizePath(file: string): string {
   return file.replace(/\\/g, '/').replace(/^\.\//, '').trim()
 }
 
-function mapFileToFocuses(file: string): MetaReviewFocus[] {
+export function mapFileToFocuses(file: string): MetaReviewFocus[] {
   const lower = file.toLowerCase()
 
   if (lower.includes('/guards/') || lower.includes('guards/')) {

@@ -3,6 +3,11 @@ import Fastify, { type FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate, type DesignReviewEvidence, type Job, type Project, type Task } from '@ai-team/shared'
+import {
+  buildDesignContract,
+  loadEngineeringPrinciples,
+  selectPrincipleSlugs,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { designReviewEvidenceRoutes }, { resetStorage }] = await Promise.all([
@@ -113,6 +118,13 @@ async function createDesignReviewEvidence(
 
   expect(res.statusCode).toBe(201)
   return parseBody<DesignReviewEvidence>(res.body)
+}
+
+function appendBaseDesignContract(prompt: string): string {
+  return `${prompt}\n\n${buildDesignContract({
+    slugs: selectPrincipleSlugs(),
+    principles: loadEngineeringPrinciples(),
+  })}`
 }
 
 async function createJob(
@@ -399,12 +411,12 @@ describe('Job API', () => {
     })
   })
 
-  it('persists aiCliProvider/aiCliPrompt/aiCliMode across a DB round-trip', async () => {
+  it('persists aiCliProvider/aiCliPrompt/aiCliMode with a base Design Contract across a DB round-trip', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
       const task = await createTask(app, project.id)
       const prompt = 'Implement the requested change carefully.'
-      await createDesignReviewEvidence(app, task, prompt)
+      await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt))
       const created = await createJob(app, task, {
         aiCliProvider: 'codex',
         aiCliPrompt: prompt,
@@ -418,7 +430,9 @@ describe('Job API', () => {
       expect(res.statusCode).toBe(200)
       const fetched = parseBody<Job>(res.body)
       expect(fetched.aiCliProvider).toBe('codex')
-      expect(fetched.aiCliPrompt).toBe('Implement the requested change carefully.')
+      expect(fetched.aiCliPrompt).toContain('Implement the requested change carefully.')
+      expect(fetched.aiCliPrompt).toContain('## Design Contract')
+      expect(fetched.aiCliPrompt).toContain('current implementation is evidence, not specification')
       expect(fetched.aiCliMode).toBe('implement')
     })
   })
@@ -505,7 +519,8 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: implement the approved storage interface change.'
-        await createDesignReviewEvidence(app, task, prompt)
+        const finalPrompt = appendBaseDesignContract(prompt)
+        await createDesignReviewEvidence(app, task, finalPrompt)
 
         const res = await postImplementJob(app, task, prompt)
 
@@ -513,7 +528,7 @@ describe('Job API', () => {
         expect(parseBody<Job>(res.body)).toMatchObject({
           taskId: task.id,
           aiCliMode: 'implement',
-          aiCliPrompt: prompt,
+          aiCliPrompt: finalPrompt,
         })
       })
     })
@@ -540,7 +555,7 @@ describe('Job API', () => {
           const project = await createProject(app)
           const task = await createTask(app, project.id)
           const prompt = `Design: ${decision.toLowerCase()} result must fail closed.`
-          await createDesignReviewEvidence(app, task, prompt, { decision })
+          await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), { decision })
 
           const res = await postImplementJob(app, task, prompt)
 
@@ -555,7 +570,7 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: reviewer unavailable must not pass.'
-        await createDesignReviewEvidence(app, task, prompt, { decision: 'REVIEW_UNAVAILABLE' })
+        await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), { decision: 'REVIEW_UNAVAILABLE' })
 
         const res = await postImplementJob(app, task, prompt)
 
@@ -582,7 +597,7 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: critical meta-review change approved independently.'
-        await createDesignReviewEvidence(app, task, prompt, {
+        await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), {
           reviewLoad: 'critical',
           decision: 'ALIGNED',
           independentReviewRequired: true,
@@ -600,7 +615,7 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: critical change without independent approval.'
-        await createDesignReviewEvidence(app, task, prompt, {
+        await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), {
           reviewLoad: 'critical',
           decision: 'ALIGNED',
           independentReviewRequired: true,
@@ -1681,7 +1696,7 @@ describe('Job API', () => {
       })
       expect(rejectedCreate.statusCode).toBe(400)
 
-      await createDesignReviewEvidence(app, task, 'Manual recovery')
+      await createDesignReviewEvidence(app, task, appendBaseDesignContract('Manual recovery'))
       const manualResponse = await app.inject({
         method: 'POST',
         url: '/api/jobs',

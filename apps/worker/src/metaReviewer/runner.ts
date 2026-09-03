@@ -27,6 +27,7 @@ import type {
   MetaReviewStatus,
   MetaReviewTargetArea,
 } from '@ai-team/shared'
+import { buildEngineeringPrincipleReviewGuidance } from '@ai-team/shared/src/engineeringPrinciples.js'
 
 const CONTROL_ROOT = process.env.CONTROL_ROOT ?? '/workspace/control'
 const META_REVIEWER_PROMPT_PATH = path.join(
@@ -150,6 +151,7 @@ export function buildMetaReviewRequest(
  */
 export function buildMetaReviewPrompt(request: MetaReviewRequest): string {
   const systemPrompt = readFileSync(META_REVIEWER_PROMPT_PATH, 'utf-8')
+  const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance()
   const generalChecklist = readFileSync(META_REVIEWER_CHECKLIST_PATH, 'utf-8')
   const fileChecklists = getFileChecklists(request.changedFiles)
 
@@ -165,6 +167,10 @@ export function buildMetaReviewPrompt(request: MetaReviewRequest): string {
     : '## ファイル別チェックリスト\n\n（このPRに対応する専用チェックリストなし。汎用チェックリストと判定基準で評価すること）'
 
   return `${systemPrompt}
+
+---
+
+${principleReviewGuidance}
 
 ---
 
@@ -268,6 +274,9 @@ const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
   'scope_creep',
   'mvp_mismatch',
   'spec_violation',
+  'implementation_coupling',
+  'over_constraint',
+  'unverifiable_assumption',
 ]
 
 function extractJsonCandidates(rawResponse: string): string[] {

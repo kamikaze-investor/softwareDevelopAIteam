@@ -208,6 +208,14 @@ CEO確認そのものを安全策として濫用しない。CEO確認の最小�
 
 ---
 
+## 3.17 Outcome-Oriented Generalization Principle
+
+本原則は Outcome-Oriented Generalization Principle（`specs/21_outcome_oriented_generalization_principle.md`）を、AI Team OS 共通行動原則の一部として参照する。
+詳細な原則本文は同ファイルを正とし、本条には全文を複製しない。
+Developer AI / Reviewer AI への適用は `packages/shared/src/engineeringPrinciples.ts` の自動選択機構を通じて行い、Prompt へ全文を毎回埋め込むことはしない。
+
+---
+
 # 4. 実装方針（MVP優先の原則）
 
 現在はMVP完成を最優先とする。

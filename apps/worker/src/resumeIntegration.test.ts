@@ -203,7 +203,7 @@ interface StorageModule {
 
 interface TaskRoutesModule {
   taskRoutes: unknown
-  buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string
+  buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description' | 'allowedPaths'>, instruction: string): string
 }
 
 interface DesignReviewEvidencePolicyModule {
@@ -214,7 +214,7 @@ interface ResumeRouteApp {
   app: TestHttpApp
   storage: TestStorage
   resetStorage: () => void
-  buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description'>, instruction: string): string
+  buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description' | 'allowedPaths'>, instruction: string): string
   computeDesignTextHash(designText: string): string
 }
 

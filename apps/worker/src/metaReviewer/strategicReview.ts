@@ -16,6 +16,7 @@ import type {
   StrategicMetaReviewResult,
 } from '@ai-team/shared'
 import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
+import { buildEngineeringPrincipleReviewGuidance } from '@ai-team/shared/src/engineeringPrinciples.js'
 // 判定ロジックはAPI（Control Plane）側でも再計算する必要があるため @ai-team/shared を正本とし、
 // ここでは再exportして既存の呼び出し元との互換を保つ。定義を二重化しないこと。
 import { applyIndependentReviewOverride, resolveFinalDecision } from '@ai-team/shared'
@@ -88,6 +89,9 @@ const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
   'scope_creep',
   'mvp_mismatch',
   'spec_violation',
+  'implementation_coupling',
+  'over_constraint',
+  'unverifiable_assumption',
 ]
 
 const REQUIRED_TARGET_STRATEGIC_DOCS = [
@@ -797,7 +801,11 @@ function buildReviewMaterialSection(
 }
 
 function buildFocusedOutputContract(): string {
+  const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance()
+
   return [
+    principleReviewGuidance,
+    '',
     'Return JSON only:',
     '```json',
     '{',
@@ -806,7 +814,7 @@ function buildFocusedOutputContract(): string {
     '  "findings": [',
     '    {',
     '      "severity": "low" | "medium" | "high" | "critical",',
-    '      "category": "cage_violation" | "authority_change" | "repository_boundary" | "security_regression" | "architecture_drift" | "scope_creep" | "mvp_mismatch" | "spec_violation",',
+    `      "category": ${formatCategoryUnion(META_FINDING_CATEGORIES)},`,
     '      "message": "finding",',
     '      "file": "optional path",',
     '      "line": 1,',
@@ -816,6 +824,10 @@ function buildFocusedOutputContract(): string {
     '}',
     '```',
   ].join('\n')
+}
+
+function formatCategoryUnion(categories: readonly MetaFindingCategory[]): string {
+  return categories.map((category) => `"${category}"`).join(' | ')
 }
 
 function buildStrategicResult(input: {

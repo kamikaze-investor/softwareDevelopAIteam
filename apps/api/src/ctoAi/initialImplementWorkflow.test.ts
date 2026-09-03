@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
-import { createInitialImplementWorkflow } from './initialImplementWorkflow'
+import { buildInitialImplementAiCliPrompt, createInitialImplementWorkflow } from './initialImplementWorkflow'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 
@@ -22,6 +22,20 @@ function conflictingDeps() {
   }
 }
 
+describe('buildInitialImplementAiCliPrompt', () => {
+  it('appends a Design Contract using allowedPaths focus signals', () => {
+    const prompt = buildInitialImplementAiCliPrompt({
+      description: 'Implement T.',
+      allowedPaths: ['apps/api/src/storage/sqlite.ts'],
+    })
+
+    expect(prompt).toContain('Implement T.')
+    expect(prompt).toContain('## Design Contract')
+    expect(prompt).toContain('current implementation is evidence, not specification')
+    expect(prompt).toContain('Keep security and data boundaries strict')
+  })
+})
+
 describe('initial implement workflow', () => {
   let storage: IStorage
   let taskId: string
@@ -35,7 +49,7 @@ describe('initial implement workflow', () => {
     }).id
   })
 
-  it('creates exactly one reviewed initial implement Job with the Task description prompt', async () => {
+  it('creates exactly one reviewed initial implement Job with a Design Contract prompt', async () => {
     const first = await createInitialImplementWorkflow(storage, taskId, alignedDeps())
     const second = await createInitialImplementWorkflow(storage, taskId, alignedDeps())
 
@@ -44,9 +58,13 @@ describe('initial implement workflow', () => {
     const jobs = storage.jobs.findByTaskId(taskId)
     expect(jobs).toHaveLength(1)
     expect(jobs[0]).toMatchObject({
-      workflowStepKey: `task:${taskId}:initial-implement`, aiCliPrompt: 'Implement T.',
-      aiCliMode: 'implement', status: 'queued',
+      workflowStepKey: `task:${taskId}:initial-implement`,
+      aiCliMode: 'implement',
+      status: 'queued',
     })
+    expect(jobs[0].aiCliPrompt).toContain('Implement T.')
+    expect(jobs[0].aiCliPrompt).toContain('## Design Contract')
+    expect(jobs[0].aiCliPrompt).toContain('current implementation is evidence, not specification')
   })
 
   it('does not create a Job when Design Review is not aligned', async () => {
@@ -86,7 +104,7 @@ describe('initial implement workflow', () => {
     const task = storage.tasks.findById(taskId)!
     storage.designReviewEvidence.create({
       taskId,
-      designTextHash: computeDesignTextHash(task.description),
+      designTextHash: computeDesignTextHash(buildInitialImplementAiCliPrompt(task)),
       reviewLoad: 'medium',
       decision: 'ALIGNED',
       independentReviewRequired: false,
