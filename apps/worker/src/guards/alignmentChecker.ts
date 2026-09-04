@@ -17,7 +17,7 @@
 
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
+import { AGY_LIGHT_MODEL, callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
 import type { AlignmentIssue, AlignmentReport } from '@ai-team/shared'
 
 // プロジェクトルートからの相対パス（Control Repo の設計ドキュメント）
@@ -135,7 +135,9 @@ export async function runAlignmentCheck(
   const prompt = buildAlignmentPrompt(designDocs, rawDiff)
   const responseText = await callGeminiWithFallback(prompt, {
     preferCli: true,
-    cliModel: 'gemini-3.1-flash-lite',
+    // agy CLI は model と effort を分離して受け取る（AGY_LIGHT_MODEL の定義コメント参照）。
+    // apiModel は Gemini REST API 側の名前空間なので agy の命名へ寄せない。
+    ...AGY_LIGHT_MODEL,
     apiModel: 'gemini-3.1-flash-lite',
     featureName: 'alignment_check',
   })

@@ -34,6 +34,7 @@ vi.mock('./runner.js', () => ({
 }))
 
 import { createAiCliAdapter } from '../aiCli/factory.js'
+import { AGY_REVIEW_MODEL } from './geminiRouter.js'
 import { reviewWithProviderFallback } from './metaReviewFallbackRouter.js'
 import {
   buildMetaReviewPrompt,
@@ -547,6 +548,37 @@ describe('runStrategicMetaReview with reviewKind=roadmap', () => {
     ])
     expect(result.independentReviewResult?.verdict).toBe('approved')
     expect(result.finalDecision).toBe('ALIGNED')
+  })
+
+  // 2026-09-04 の production 障害: focused / integration review が effort 込みの旧識別子
+  // `gemini-3.5-flash-medium` を渡しており、現行 agy がこれを拒否するため3 focus すべてが
+  // UNCERTAIN → REVIEW_UNAVAILABLE で fail-closed していた。Whole-Roadmap Review の
+  // agy 呼び出しすべてが model と effort を対で渡すことを固定する。
+  it('passes a paired agy model+effort on every focused and integration review call', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'scope aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+    mockCodexReviewerRun('approved', 'independent roadmap review approved')
+
+    await runStrategicMetaReview({
+      reviewKind: 'roadmap',
+      subjectId: 'project-roadmap-model-pairing',
+      taskTitle: 'Whole-Roadmap Review',
+      changedFiles: [],
+      gitDiff: '# Roadmap Design Review Material detailing the planned roadmap',
+      workingDir: repoRoot,
+    })
+
+    // focused review ×3 + integration review
+    expect(mockReviewWithProviderFallback.mock.calls.length).toBeGreaterThanOrEqual(4)
+    for (const [, options] of mockReviewWithProviderFallback.mock.calls) {
+      const opts = options as { cliModel?: string; cliEffort?: string; apiModel?: string }
+      expect(opts.cliModel).toBe(AGY_REVIEW_MODEL.cliModel)
+      expect(opts.cliEffort).toBe(AGY_REVIEW_MODEL.cliEffort)
+      // apiModel は Gemini REST API の名前空間。agy 命名（effort 込み）へ寄せていないこと。
+      expect(opts.apiModel).not.toMatch(/-(low|medium|high)$/)
+    }
   })
 })
 

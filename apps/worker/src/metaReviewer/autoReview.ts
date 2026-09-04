@@ -48,6 +48,7 @@ async function main(): Promise<void> {
   const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } =
     await import('./runner.js')
   const { reviewWithProviderFallback, MetaReviewProviderError, sanitizeMessage } = await import('./metaReviewFallbackRouter.js')
+  const { AGY_REVIEW_MODEL } = await import('./geminiRouter.js')
 
   // --- 環境変数の読み取り ---
   const baseSha = process.env.BASE_SHA       // GitHub Actions: PR の base SHA
@@ -127,15 +128,18 @@ async function main(): Promise<void> {
   // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
   // GEMINI_MODEL は meta-review.yml が vars.GEMINI_MODEL（未設定時 gemini-2.5-flash）を渡す。
   // 未設定（ローカル実行等）の場合のみ、このプロジェクトが実運用として使ってきた既定値にフォールバックする。
-  const geminiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash'
+  // これは **Gemini REST API 側のモデル名**であり、agy CLI の識別子とは別の名前空間。
+  // 以前は同じ値を cliModel にも渡していたが、agy は REST 名を受け付けず確定的に失敗するため、
+  // CLI 側は AGY_REVIEW_MODEL（model + effort の対）を使う。
+  const geminiApiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash'
   console.log('\n🤖 Gemini にレビューを依頼中...')
   let rawResponse: string
   let providerUsed: 'gemini' | 'copilot' = 'gemini'
   try {
     const reviewResult = await reviewWithProviderFallback(prompt, {
       preferCli: true,
-      cliModel: geminiModel,
-      apiModel: geminiModel,
+      ...AGY_REVIEW_MODEL,
+      apiModel: geminiApiModel,
       featureName: 'meta_review',
       // autoReview.ts は使い捨ての CI/pre-push プロセスとして実行されるため、transient
       // （timeout/network/5xx）と判定された失敗を固定回数リトライしてよい。この opt-in が

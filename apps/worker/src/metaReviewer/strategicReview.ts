@@ -31,6 +31,7 @@ import {
   buildMetaReviewRequest,
   parseMetaReviewResult,
 } from './runner.js'
+import { AGY_REVIEW_MODEL } from './geminiRouter.js'
 import { reviewWithProviderFallback } from './metaReviewFallbackRouter.js'
 import { createReviewerAdapter } from '../approvalLevel/reviewerAdapter.js'
 
@@ -365,9 +366,9 @@ async function runLowLoadLegacyReview(
     const prompt = buildMetaReviewPrompt(request)
     const { raw: rawResponse } = await reviewWithProviderFallback(prompt, {
       preferCli: true,
-      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
-      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
-      cliModel: 'gemini-3.5-flash-medium',
+      // agy CLI は model と effort を分離して受け取る（AGY_REVIEW_MODEL の定義コメント参照）。
+      // apiModel は Gemini REST API 側の名前空間なので agy の命名へ寄せない。
+      ...AGY_REVIEW_MODEL,
       apiModel: 'gemini-3.5-flash',
       featureName: 'meta_review',
     })
@@ -416,9 +417,9 @@ async function runFocusedReview(
   try {
     const { raw: rawResponse } = await reviewWithProviderFallback(promptContext.prompt, {
       preferCli: true,
-      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
-      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
-      cliModel: 'gemini-3.5-flash-medium',
+      // agy CLI は model と effort を分離して受け取る（AGY_REVIEW_MODEL の定義コメント参照）。
+      // apiModel は Gemini REST API 側の名前空間なので agy の命名へ寄せない。
+      ...AGY_REVIEW_MODEL,
       apiModel: 'gemini-3.5-flash',
       featureName: `strategic-meta-review-${focus}`,
       cliJsonSchema: FOCUSED_REVIEW_JSON_SCHEMA,
@@ -445,9 +446,9 @@ async function runIntegrationReview(
   try {
     const { raw: rawResponse } = await reviewWithProviderFallback(prompt, {
       preferCli: true,
-      // agy の --model は Gemini API のモデル名と異なり effort 込みの識別子が必須
-      // （`gemini-3.5-flash` 単体は `--effort` 未指定エラーになる。2026-08-24 実測確認）。
-      cliModel: 'gemini-3.5-flash-medium',
+      // agy CLI は model と effort を分離して受け取る（AGY_REVIEW_MODEL の定義コメント参照）。
+      // apiModel は Gemini REST API 側の名前空間なので agy の命名へ寄せない。
+      ...AGY_REVIEW_MODEL,
       apiModel: 'gemini-3.5-flash',
       featureName: 'strategic-meta-review-integration',
       cliJsonSchema: INTEGRATION_REVIEW_JSON_SCHEMA,
