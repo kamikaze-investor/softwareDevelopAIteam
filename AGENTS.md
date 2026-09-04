@@ -88,7 +88,7 @@ Review責務（Gemini / ChatGPT / Human）と既存Multi-stage Reviewは**変更
 恒久固定するものではない**。Modelの着任は変更され得る。
 本節は**作業分担のみを変更し**、既存のPermission / Approval Gate / AV-001 / Control Repository /
 Production / Secret等の**Authority・Safety Boundaryを一切変更しない**。
-全Agentは既存Safety Ruleおよび`specs/00_constitution.md` §3.14〜3.16に従う。
+全Agentは既存Safety Ruleおよび`specs/00_constitution.md` §3.14〜3.17に従う。
 
 - **PL Role**（暫定着任Model: **Claude Opus**）。判断・委任・統合を担当し、
   **原則として自分で作業するAgentではない**。
