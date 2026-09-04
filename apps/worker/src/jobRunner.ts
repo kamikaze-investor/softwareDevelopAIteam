@@ -1327,9 +1327,19 @@ function withCleanupNote(base: string, note: string | undefined): string {
   return note === undefined ? base : `${base}\n[jobRunner] ${note}`
 }
 
-/** 先頭へ注記を置く。stderr が長くてもプレビュー/永続化の切り詰めで消えないようにするため。 */
+/** 先頭注記1件あたりの上限。注記が複数重なってもプレビューから押し出されないようにする。 */
+const LEADING_NOTE_MAX_LENGTH = 300
+
+/**
+ * 先頭へ注記を置く。stderr が長くてもプレビュー/永続化の切り詰めで消えないようにするため。
+ * 注記自体にも上限を設ける（注記が2件先頭へ積まれた場合でも、先に置かれた注記が
+ * プレビューの外へ押し出されないようにするため）。
+ */
 function withLeadingNote(base: string, note: string): string {
-  return `[jobRunner] ${note}\n${base}`
+  const bounded = note.length <= LEADING_NOTE_MAX_LENGTH
+    ? note
+    : `${note.slice(0, LEADING_NOTE_MAX_LENGTH)}…[note truncated]`
+  return `[jobRunner] ${bounded}\n${base}`
 }
 
 /**

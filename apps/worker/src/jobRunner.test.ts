@@ -971,6 +971,30 @@ describe('saveJobLogs 失敗は Job 結果に影響しない', () => {
     expect(result.status).toBe('failed')
     expect(result.exitCode).toBe(1)
   })
+
+  // T6: ログ保存失敗のエラーメッセージ自体が非常に長い場合でも、注記が2件先頭へ積まれる
+  // git_commit 経路で、先に置かれた証跡ログの注記がプレビューから押し出されないことを検証する
+  // （注記1件あたりの上限 LEADING_NOTE_MAX_LENGTH が効いていることの回帰テスト）。
+  it('T6: ログ保存失敗のエラーが極端に長くても、注記2件が両方とも結果のstderrに残る', async () => {
+    saveJobLogsMock.mockImplementation(() => {
+      throw new Error('y'.repeat(6000))
+    })
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+    mockGitCommitRun(BASE_COMMIT, 'aftercommit000000000000000000000000000000')
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
+    })
+    const result = await runJob(job, createPolicy())
+
+    expect(result.status).toBe('success')
+    expect(result.commitHash).toBe('aftercommit000000000000000000000000000000')
+    expect(result.stderr).toContain('Job result log could not be saved')
+    expect(result.stderr).toContain('Job evidence log could not be saved')
+  })
 })
 
 describe('Phase 2: git_commit staging verification', () => {
