@@ -141,6 +141,10 @@ vi.mock('./jobLogger.js', () => ({
     stdoutPreview: stdout.slice(0, 4000),
     stderrPreview: stderr.slice(0, 4000),
   })),
+  buildLogPreviews: vi.fn((stdout: string, stderr: string) => ({
+    stdoutPreview: stdout.slice(0, 4000),
+    stderrPreview: stderr.slice(0, 4000),
+  })),
 }))
 
 vi.mock('./guards/gateClient.js', () => ({
@@ -833,6 +837,88 @@ describe('runJob', () => {
     expect(result.rollbackInfo).toBeDefined()
     expect(result.rollbackInfo?.previousCommitHash).toBe('abc123')
     expect(result.rollbackInfo?.rollbackArgv).toContain('revert')
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// ログ保存失敗は非致命的（実行結果に影響しない）ことを保証する回帰テスト
+// jobLogger.saveJobLogs が throw しても、本当に成功した Job は成功のまま報告される。
+// ────────────────────────────────────────────────────────────
+
+describe('saveJobLogs 失敗は Job 結果に影響しない', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    sendAlertMock.mockResolvedValue([])
+    callGateCheckMock.mockResolvedValue(ALLOW_PROCEED_RESPONSE)
+    resolvePolicyMock.mockReturnValue({ policy: 'continue', reason: 'ok', apiAvailable: true })
+    permissionGuardWithGrantsMock.mockResolvedValue({ allowed: true })
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    // saveJobLogs が常に失敗する既定値
+    saveJobLogsMock.mockImplementation(() => {
+      throw new Error('disk full')
+    })
+  })
+
+  // T1: 非 git_commit の成功 Job（test 種別・exitCode 0）でログ保存失敗 → success のまま
+  it('T1: test種別の成功Jobでログ保存失敗でも、status: success / exitCode 0 / プレビューあり / パスなし', async () => {
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'test'], description: 'test' })
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'test') return 'all tests passed\n'
+      return gitFallback(args)
+    })
+
+    const result = await runJob(
+      createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+      createPolicy(),
+    )
+
+    expect(result.status).toBe('success')
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('all tests passed')
+    expect(result.stderr).toBeDefined()
+    expect(result.stdoutPath).toBeUndefined()
+    expect(result.stderrPath).toBeUndefined()
+  })
+
+  // T3a: ログ保存失敗の注記が stderr に含まれる（非 git_commit 経路）
+  it('T3a: ログ保存失敗のメッセージが報告される stderr に含まれる', async () => {
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'test'], description: 'test' })
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'test') return 'all tests passed\n'
+      return gitFallback(args)
+    })
+
+    const result = await runJob(
+      createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+      createPolicy(),
+    )
+
+    // T3: ログ保存失敗の注記が、成功結果の stderr に残る（失敗に見せかけない）
+    expect(result.status).toBe('success')
+    expect(result.stderr).toContain('Job result log could not be saved')
+    expect(result.stderr).toContain('disk full')
+  })
+
+  // T2 + T3b: git_commit が本当に commit を作り、ログ保存失敗 → 依然 success で commitHash 保持
+  it('T2: git_commit成功でログ保存失敗でも、status: success かつ commitHash を保持する', async () => {
+    resolveCommandMock.mockReturnValue({
+      argv: ['git', 'commit', '-m', 'test'],
+      description: 'git commit',
+    })
+    mockGitCommitRun(BASE_COMMIT, 'aftercommit000000000000000000000000000000')
+
+    const job = createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
+    })
+    const result = await runJob(job, createPolicy())
+
+    expect(result.status).toBe('success')
+    expect(result.commitHash).toBe('aftercommit000000000000000000000000000000')
+    // commit の証跡ログ保存失敗と結果ログ保存失敗の両方が注記される
+    expect(result.stderr).toContain('Job evidence log could not be saved')
+    expect(result.stderr).toContain('Job result log could not be saved')
+    expect(result.stdoutPath).toBeUndefined()
+    expect(result.stderrPath).toBeUndefined()
   })
 })
 

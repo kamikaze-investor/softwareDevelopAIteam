@@ -25,6 +25,21 @@ export function saveJobLogs(jobId: string, stdout: string, stderr: string): JobL
   return {
     stdoutPath,
     stderrPath,
+    ...buildLogPreviews(stdout, stderr),
+  }
+}
+
+/**
+ * stdout / stderr のプレビューを構築する。
+ * ログ永続化（ファイル書き込み）に失敗しても、実行結果とプレビューは
+ * 失われないようにするため、saveJobLogs の失敗時にもこのヘルパーを
+ * 単体で使えるよう分離して export する。
+ */
+export function buildLogPreviews(
+  stdout: string,
+  stderr: string,
+): { stdoutPreview: string; stderrPreview: string } {
+  return {
     stdoutPreview: buildPreview(stdout),
     stderrPreview: buildPreview(stderr),
   }
