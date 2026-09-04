@@ -85,8 +85,8 @@ PR #90 の説明文・独立レビュー依頼はいずれも agy model 互換�
 ### 対処
 
 - [x] read-only調査: `b2e48d3` を含む他のbranch/PRは存在しない（`git branch -a --contains`、`gh pr list`・`gh search prs` で "PL Console"/"LibreChat" は 0件）。他worktreeにも当該変更の未コミット作業はなく、進行中作業を破壊しないことを確認済み
-- [x] 正式なreview recordが存在しないため、当該docs変更を master から revert（本PR）
-- [ ] 同内容を独立したPRとして review-of-record に載せ直す（revert後に別PRで re-land）
+- [x] 正式なreview recordが存在しないため、当該docs変更を master から revert（PR #92、commit `6e0609f`）
+- [x] 同内容を独立したPRとして review-of-record に載せ直した（PR #93、commit `df34750`。内容は原文のまま、レビュー経路のみ変更）
 - [x] process-integrity incident として本ファイルへ記録（CEO指示、2026-09-04）
 
 ### 再発防止（未着手・別途検討）
@@ -96,4 +96,4 @@ commit前に「そのcommitが自分の変更範囲に収まっているか」�
 
 ### ステータス
 
-対処中（revert済み・re-land待ち）
+対処済み（PR #92 で revert・記録、PR #93 で正式に re-land）。再発防止のみ未着手
