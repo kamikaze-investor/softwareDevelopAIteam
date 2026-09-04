@@ -714,4 +714,180 @@ describe('callGeminiWithFallback', () => {
       expect(mockCallApi).toHaveBeenCalledOnce()
     })
   })
+
+  describe('cliEffort パラメータ', () => {
+    it('T1a: cliEffort が指定されたとき preferCli: true 分岐で argv に --effort が含まれる', async () => {
+      mockSpawnSync.mockReturnValue(cliSuccess('ok'))
+
+      await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'gemini-3.8-flash',
+        cliEffort: 'medium',
+        featureName: 'test',
+      })
+
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      const modelIdx = args.indexOf('--model')
+      expect(args[modelIdx]).toBe('--model')
+      expect(args[modelIdx + 1]).toBe('gemini-3.8-flash')
+      expect(args[modelIdx + 2]).toBe('--effort')
+      expect(args[modelIdx + 3]).toBe('medium')
+    })
+
+    it('T1b: cliEffort が指定されたとき preferCli: false + API失敗分岐で argv に --effort が含まれる', async () => {
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+      mockSpawnSync.mockReturnValue(cliSuccess('ok'))
+
+      await callGeminiWithFallback('prompt', {
+        preferCli: false,
+        cliModel: 'gemini-3.8-flash',
+        cliEffort: 'medium',
+        featureName: 'test',
+      })
+
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      const modelIdx = args.indexOf('--model')
+      expect(args[modelIdx]).toBe('--model')
+      expect(args[modelIdx + 1]).toBe('gemini-3.8-flash')
+      expect(args[modelIdx + 2]).toBe('--effort')
+      expect(args[modelIdx + 3]).toBe('medium')
+    })
+
+    it('T2: cliEffort 未指定時は argv に --effort が含まれない', async () => {
+      mockSpawnSync.mockReturnValue(cliSuccess('ok'))
+
+      await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'gemini-3.8-flash',
+        featureName: 'test',
+      })
+
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      expect(args).not.toContain('--effort')
+    })
+
+    it('T3: cliEffort 指定時でも argv の最後の2要素は --print とプロンプト', async () => {
+      mockSpawnSync.mockReturnValue(cliSuccess('ok'))
+
+      await callGeminiWithFallback('my review prompt', {
+        preferCli: true,
+        cliModel: 'gemini-3.8-flash',
+        cliEffort: 'high',
+        featureName: 'test',
+      })
+
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      expect(args[args.length - 2]).toBe('--print')
+      expect(args[args.length - 1]).toBe('my review prompt')
+    })
+
+    it('T4: cliEffort 指定 + Gemini 双方 quota で Antigravity/Claude フォールバック実行時、Claude の argv には --effort が含まれない', async () => {
+      mockSpawnSync.mockImplementation((_cmd, args) => {
+        const model = (args as string[])[1]
+        if (model === 'claude-sonnet-4-6') return cliSuccess('Claude ok')
+        return cli429()
+      })
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+
+      await callGeminiWithFallback('prompt', {
+        preferCli: false,
+        cliModel: 'gemini-3.8-flash',
+        cliEffort: 'medium',
+        featureName: 'test',
+      })
+
+      // Gemini-CLI 呼び出し（quota失敗）には --effort がある
+      const geminiArgs = mockSpawnSync.mock.calls[0][1] as string[]
+      expect(geminiArgs).toContain('--effort')
+
+      // Claude フォールバック呼び出しには --effort がなく、claude-sonnet-4-6 モデルが使われている
+      const claudeCallIdx = mockSpawnSync.mock.calls.length - 1
+      const claudeArgs = mockSpawnSync.mock.calls[claudeCallIdx][1] as string[]
+      expect(claudeArgs).not.toContain('--effort')
+      expect(claudeArgs).toContain('claude-sonnet-4-6')
+    })
+
+    it('T5 (BLOCKING): retryTransient: true + cliEffort + transient失敗でリトライ時、初期呼び出し・リトライ呼び出し両方に --effort が含まれる', async () => {
+      mockSpawnSync.mockReturnValue(cliTransient())
+      mockCallApi.mockRejectedValue(new Error('503 Service Unavailable'))
+
+      await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'gemini-3.8-flash',
+        cliEffort: 'medium',
+        retryTransient: true,
+        sleepImpl: noSleep,
+        featureName: 'test',
+      }).catch(() => undefined)
+
+      // retryTransient: true + preferCli: true → CLI 段が先に呼ばれる
+      // TRANSIENT_MAX_ATTEMPTS = 3（初回 + リトライ2回）
+      expect(mockSpawnSync).toHaveBeenCalledTimes(3)
+      for (let i = 0; i < mockSpawnSync.mock.calls.length; i++) {
+        const args = mockSpawnSync.mock.calls[i][1] as string[]
+        expect(args).toContain('--effort')
+        expect(args[args.indexOf('--effort') + 1]).toBe('medium')
+      }
+    })
+
+    it('T6: cliEffort と cliJsonSchema 同時指定時、argv の順序が正しい', async () => {
+      mockSpawnSync.mockReturnValue(
+        cliSuccess(JSON.stringify({ structured_output: { decision: 'ALIGNED' } }))
+      )
+
+      await callGeminiWithFallback('prompt', {
+        preferCli: true,
+        cliModel: 'gemini-3.8-flash',
+        cliEffort: 'medium',
+        cliJsonSchema: { type: 'object', properties: { decision: { type: 'string' } } },
+        featureName: 'test',
+      })
+
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      const schemaPath = args[args.indexOf('--json-schema') + 1]
+      // cliJsonSchema 指定時は withToolFreeInstruction() がプロンプトに前置される
+      const expected = ['--model', 'gemini-3.8-flash', '--effort', 'medium', '--output-format', 'json', '--json-schema', schemaPath, '--print', expect.stringContaining('prompt')]
+      expect(args).toEqual(expected)
+    })
+
+    it('T7: cliEffort 指定時でも failureClassification は変更されない（quota / transient / auth_or_config / unknown）', async () => {
+      // quota
+      mockSpawnSync.mockReturnValue(cli429())
+      mockCallApi.mockRejectedValue(new Error('429 quota exceeded'))
+      const e1 = await callGeminiWithFallback('prompt', {
+        preferCli: false, featureName: 'test', cliEffort: 'low', sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+      expect((e1 as MetaReviewProviderError).failureClass).toBe('quota')
+
+      vi.clearAllMocks()
+
+      // transient
+      mockSpawnSync.mockReturnValue(cliTransient())
+      mockCallApi.mockRejectedValue(new Error('503 Service Unavailable'))
+      const e2 = await callGeminiWithFallback('prompt', {
+        preferCli: false, featureName: 'test', cliEffort: 'high', sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+      expect((e2 as MetaReviewProviderError).failureClass).toBe('transient')
+
+      vi.clearAllMocks()
+
+      // auth_or_config
+      mockSpawnSync.mockReturnValue({ status: 1, stdout: '', stderr: 'API key not valid', pid: 1, output: [], signal: null } as unknown as ReturnType<typeof spawnSync>)
+      mockCallApi.mockRejectedValue(new Error('permission denied'))
+      const e3 = await callGeminiWithFallback('prompt', {
+        preferCli: false, featureName: 'test', cliEffort: 'medium', sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+      expect(['auth_or_config', 'unknown']).toContain((e3 as MetaReviewProviderError).failureClass)
+
+      vi.clearAllMocks()
+
+      // unknown
+      mockSpawnSync.mockReturnValue(cliError())
+      mockCallApi.mockRejectedValue(new Error('something weird'))
+      const e4 = await callGeminiWithFallback('prompt', {
+        preferCli: false, featureName: 'test', cliEffort: 'low', sleepImpl: noSleep,
+      }).catch((e: unknown) => e)
+      expect((e4 as MetaReviewProviderError).failureClass).toBe('unknown')
+    })
+  })
 })

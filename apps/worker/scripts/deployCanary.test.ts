@@ -15,7 +15,8 @@ describe('runGeminiCanary', () => {
     await runGeminiCanary()
 
     expect(reviewWithProviderFallback).toHaveBeenCalledTimes(1)
-    const [, options] = reviewWithProviderFallback.mock.calls[0] as [string, { cliModel?: string }]
+    const [, options] = reviewWithProviderFallback.mock.calls[0] as [string, { cliModel?: string; cliEffort?: string }]
     expect(options.cliModel).toBe('gemini-3.8-flash')
+    expect(options.cliEffort).toBe('medium')
   })
 })
