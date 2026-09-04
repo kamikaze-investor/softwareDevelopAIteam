@@ -173,7 +173,7 @@ severity と category を適切に設定すること。
   "findings": [
     {
       "severity": "low" | "medium" | "high" | "critical",
-      "category": "cage_violation" | "authority_change" | "repository_boundary" | "security_regression" | "architecture_drift" | "scope_creep" | "mvp_mismatch" | "spec_violation" | "implementation_coupling" | "over_constraint" | "unverifiable_assumption",
+      "category": {{META_FINDING_CATEGORY_UNION}},
       "message": "具体的な問題の説明",
       "file": "該当ファイル（任意）",
       "suggestion": "修正提案（任意）"

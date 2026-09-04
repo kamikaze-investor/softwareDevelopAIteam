@@ -42,6 +42,7 @@ const META_REVIEWER_CHECKLIST_PATH = path.join(
   'docs/meta_reviewer/checklist.md'
 )
 const CHECKLISTS_DIR = path.join(CONTROL_ROOT, 'docs/meta_reviewer/checklists')
+const META_FINDING_CATEGORY_UNION_PLACEHOLDER = '{{META_FINDING_CATEGORY_UNION}}'
 
 /**
  * 変更ファイルに対応するファイル別チェックリストを全て返す
@@ -153,7 +154,9 @@ export function buildMetaReviewRequest(
  * Meta Reviewer AIに渡すプロンプトを構築する
  */
 export function buildMetaReviewPrompt(request: MetaReviewRequest): string {
-  const systemPrompt = readFileSync(META_REVIEWER_PROMPT_PATH, 'utf-8')
+  const systemPrompt = injectMetaFindingCategoryUnion(
+    readFileSync(META_REVIEWER_PROMPT_PATH, 'utf-8')
+  )
   const engineeringPrinciples = loadEngineeringPrinciples()
   const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance(engineeringPrinciples)
   const generalChecklist = readFileSync(META_REVIEWER_CHECKLIST_PATH, 'utf-8')
@@ -269,7 +272,7 @@ const META_RISK_LEVELS: readonly MetaRiskLevel[] = [
   'critical',
 ]
 
-const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
+export const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
   'cage_violation',
   'authority_change',
   'repository_boundary',
@@ -282,6 +285,17 @@ const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
   'over_constraint',
   'unverifiable_assumption',
 ]
+
+export function injectMetaFindingCategoryUnion(systemPrompt: string): string {
+  return systemPrompt.replaceAll(
+    META_FINDING_CATEGORY_UNION_PLACEHOLDER,
+    formatCategoryUnion(META_FINDING_CATEGORIES),
+  )
+}
+
+function formatCategoryUnion(categories: readonly MetaFindingCategory[]): string {
+  return categories.map((category) => `"${category}"`).join(' | ')
+}
 
 function extractJsonCandidates(rawResponse: string): string[] {
   const candidates: string[] = []

@@ -1,5 +1,31 @@
+import { readFileSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { parseMetaReviewResult } from './runner.js'
+import {
+  injectMetaFindingCategoryUnion,
+  META_FINDING_CATEGORIES,
+  parseMetaReviewResult,
+} from './runner.js'
+
+const repoRoot = resolve(__dirname, '../../../..')
+
+describe('buildMetaReviewPrompt template', () => {
+  it('renders finding categories from META_FINDING_CATEGORIES', () => {
+    const template = readFileSync(join(repoRoot, 'docs/meta_reviewer/prompt.md'), 'utf-8')
+    const rendered = injectMetaFindingCategoryUnion(template)
+    const expectedCategoryUnion = META_FINDING_CATEGORIES
+      .map((category) => `"${category}"`)
+      .join(' | ')
+
+    expect(template).toContain('{{META_FINDING_CATEGORY_UNION}}')
+    expect(template).not.toContain(expectedCategoryUnion)
+    expect(rendered).toContain(`"category": ${expectedCategoryUnion},`)
+    expect(rendered).not.toContain('{{META_FINDING_CATEGORY_UNION}}')
+    for (const category of META_FINDING_CATEGORIES) {
+      expect(rendered).toContain(`"${category}"`)
+    }
+  })
+})
 
 describe('parseMetaReviewResult', () => {
   it('parses fenced JSON responses with uppercase language tags', () => {
