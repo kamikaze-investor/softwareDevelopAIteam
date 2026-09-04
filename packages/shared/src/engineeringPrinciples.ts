@@ -19,6 +19,7 @@ export type PrincipleSlug =
   | 'boundary-strictness'
   | 'observable-behavior'
   | 'review-integration'
+  | 'whole-artifact-consistency'
   | 'scale-to-risk'
   | 'existing-code-grandfather'
 
@@ -40,6 +41,7 @@ const ALL_PRINCIPLE_SLUGS: readonly PrincipleSlug[] = [
   'boundary-strictness',
   'observable-behavior',
   'review-integration',
+  'whole-artifact-consistency',
   'scale-to-risk',
   'existing-code-grandfather',
 ] as const
@@ -84,6 +86,14 @@ const RISK_PRINCIPLE_SLUGS: Partial<Record<MetaRiskLevel, readonly PrincipleSlug
   high: ['scale-to-risk', 'boundary-strictness'],
   critical: ['scale-to-risk', 'boundary-strictness', 'honest-unverifiable'],
 } as const
+
+// Repair jobs, review-finding resolutions, and any other re-entry into an
+// already-attempted task are exactly the "multiple accepted requirements have
+// accumulated" case this principle targets — not a new taxonomy, just one more
+// existing-style signal a caller can already identify from its own context.
+const ITERATIVE_FIX_PRINCIPLE_SLUGS: readonly PrincipleSlug[] = [
+  'whole-artifact-consistency',
+] as const
 
 const resultCache = new Map<string, EngineeringPrinciplesResult>()
 
@@ -130,6 +140,10 @@ export function loadEngineeringPrinciples(
 export function selectPrincipleSlugs(signals?: {
   predictedFocuses?: MetaReviewFocus[]
   riskLevel?: MetaRiskLevel
+  /** True when the caller already knows this is a repair, retry, or other
+   * re-entry into a task that has prior accepted requirements to stay
+   * consistent with — not derived here, the caller's own context is the signal. */
+  isIterativeFix?: boolean
 }): PrincipleSlug[] {
   const selected: PrincipleSlug[] = [...BASE_PRINCIPLE_SLUGS]
 
@@ -139,6 +153,10 @@ export function selectPrincipleSlugs(signals?: {
 
   if (signals?.riskLevel !== undefined) {
     selected.push(...(RISK_PRINCIPLE_SLUGS[signals.riskLevel] ?? []))
+  }
+
+  if (signals?.isIterativeFix === true) {
+    selected.push(...ITERATIVE_FIX_PRINCIPLE_SLUGS)
   }
 
   return uniqueSlugs(selected)
@@ -187,12 +205,14 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
   const stableContract = principles.bySlug.get('stable-contract-first')
   const standardDesignFrame = principles.bySlug.get('standard-design-frame')
   const honestUnverifiable = principles.bySlug.get('honest-unverifiable')
+  const wholeArtifactConsistency = principles.bySlug.get('whole-artifact-consistency')
 
   return [
     '## Engineering Principle Review Guidance',
     `- implementation_coupling: ${stableContract?.oneLiner ?? 'Principle stable-contract-first was not available; do not treat it as applied.'}`,
     `- over_constraint: ${standardDesignFrame?.oneLiner ?? 'Principle standard-design-frame was not available; do not treat it as applied.'}`,
     `- unverifiable_assumption: ${honestUnverifiable?.oneLiner ?? 'Principle honest-unverifiable was not available; do not treat it as applied.'}`,
+    `- whole_artifact_consistency: ${wholeArtifactConsistency?.oneLiner ?? 'Principle whole-artifact-consistency was not available; do not treat it as applied.'}`,
   ].join('\n')
 }
 

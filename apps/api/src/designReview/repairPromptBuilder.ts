@@ -159,7 +159,10 @@ function formatQaFacts(qaResults: RepairQaFacts[]): string[] {
 export function buildRepairPrompt(input: RepairPromptInput): string {
   const untrusted: string[] = []
   const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(),
+    // A repair prompt is by definition a re-entry into a task that already has
+    // prior accepted requirements (from the original description and/or the
+    // failure/review facts below) to stay consistent with.
+    slugs: selectPrincipleSlugs({ isIterativeFix: true }),
     principles: loadEngineeringPrinciples(),
   })
 

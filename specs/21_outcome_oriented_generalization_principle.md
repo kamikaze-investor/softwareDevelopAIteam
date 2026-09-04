@@ -59,6 +59,21 @@ integrate implementation_coupling / over_constraint / unverifiable_assumption ch
 into the appropriate existing review path(s); investigate integration with the existing focus system
 rather than adding a duplicate focus.
 
+<!-- principle-id: whole-artifact-consistency -->
+<!-- principle-oneliner: Before declaring multi-fix work done, check the whole artifact once against accepted outcomes and invariants — not just the latest diff — then stop. -->
+■ Whole-Artifact Consistency Before Completion: incremental fixes that are each locally correct do not
+guarantee the final artifact is correct as a whole. Once a round of fixes is otherwise complete, before
+declaring completion, check the whole artifact — not just the latest diff — once against every
+previously accepted Required Outcome, Non-Negotiable Invariant, and explicitly accepted requirement for
+this task. Look specifically for: an earlier accepted requirement that has since disappeared, a later
+fix that silently reverted an earlier one, a stale value or stale assumption left behind by an earlier
+step, a change that is locally correct but breaks the overall outcome, and contradictions between
+successive fixes. This is a single bounded check, not a license for repo-wide re-investigation, new
+design, a new Gate, a repeated review loop, or scope expansion. Applies identically to Developer AI
+self-completion judgment, PL completion judgment, and Reviewer guidance — one authoritative source, not
+three. If every accepted outcome and invariant is satisfied, stop there; do not use this check as a
+reason to start additional improvement.
+
 <!-- principle-id: scale-to-risk -->
 <!-- principle-oneliner: Scale design detail to risk; do not force large templates onto small changes. -->
 ■ Scale to risk: Lightweight (small local fix) -> brief Outcome/Invariant/coupling check. Standard

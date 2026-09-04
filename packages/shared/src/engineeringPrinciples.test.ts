@@ -34,6 +34,12 @@ describe('loadEngineeringPrinciples', () => {
     expect(result.bySlug.get('evidence-not-spec')?.fullText).toContain('Current implementation is evidence, not specification.')
     expect(result.bySlug.get('stable-contract-first')?.fullText).toContain('Stable Contract First')
     expect(result.bySlug.get('observable-behavior')?.oneLiner).toBe('Test observable behavior and invariants, not private structure.')
+    expect(result.bySlug.get('whole-artifact-consistency')?.oneLiner).toBe(
+      'Before declaring multi-fix work done, check the whole artifact once against accepted outcomes and invariants — not just the latest diff — then stop.',
+    )
+    expect(result.bySlug.get('whole-artifact-consistency')?.fullText).toContain(
+      'not a license for repo-wide re-investigation',
+    )
   })
 
   it('loads one-liners from principle-oneliner markers', () => {
@@ -74,9 +80,34 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
   it('renders reviewer guidance from loaded principle one-liners', () => {
     const guidance = buildEngineeringPrincipleReviewGuidance(loadEngineeringPrinciples(principlePaths))
 
+    expect(guidance.split('\n')).toHaveLength(5)
     expect(guidance).toContain('- implementation_coupling: Prefer public APIs and stable contracts over incidental internals.')
     expect(guidance).toContain('- over_constraint: Name the failure a constraint prevents before adding it.')
     expect(guidance).toContain('- unverifiable_assumption: Report unverifiable claims honestly instead of turning guesses into PASS.')
+    expect(guidance).toContain(
+      '- whole_artifact_consistency: Before declaring multi-fix work done, check the whole artifact once against accepted outcomes and invariants — not just the latest diff — then stop.',
+    )
+  })
+
+  it('renders fail-honest notices for missing reviewed principles', () => {
+    const guidance = buildEngineeringPrincipleReviewGuidance({
+      ok: true,
+      bySlug: new Map(),
+    })
+
+    expect(guidance.split('\n')).toHaveLength(5)
+    expect(guidance).toContain(
+      '- implementation_coupling: Principle stable-contract-first was not available; do not treat it as applied.',
+    )
+    expect(guidance).toContain(
+      '- over_constraint: Principle standard-design-frame was not available; do not treat it as applied.',
+    )
+    expect(guidance).toContain(
+      '- unverifiable_assumption: Principle honest-unverifiable was not available; do not treat it as applied.',
+    )
+    expect(guidance).toContain(
+      '- whole_artifact_consistency: Principle whole-artifact-consistency was not available; do not treat it as applied.',
+    )
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {
@@ -108,6 +139,19 @@ describe('selectPrincipleSlugs', () => {
       'deterministic-vs-heuristic',
       'honest-unverifiable',
       'boundary-strictness',
+    ])
+  })
+
+  it('does not add whole-artifact-consistency without the iterative-fix signal', () => {
+    expect(selectPrincipleSlugs()).not.toContain('whole-artifact-consistency')
+    expect(selectPrincipleSlugs({ predictedFocuses: ['safety_recovery'] }))
+      .not.toContain('whole-artifact-consistency')
+  })
+
+  it('adds whole-artifact-consistency only when isIterativeFix is true', () => {
+    expect(selectPrincipleSlugs({ isIterativeFix: true })).toEqual([
+      ...BASE_PRINCIPLE_SLUGS,
+      'whole-artifact-consistency',
     ])
   })
 })
