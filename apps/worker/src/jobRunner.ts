@@ -1089,7 +1089,7 @@ export async function runJob(
         // 作成済みで覆せないため、Job を failed 化せず注記のみ残して続行する。
         const note = `Job evidence log could not be saved: ${formatUnknownError(err)}`
         console.error(`[jobRunner] ${note}`)
-        stderr = withCleanupNote(stderr, note)
+        stderr = withLeadingNote(stderr, note)
       }
     }
 
@@ -1170,7 +1170,7 @@ export async function runJob(
     const note = `Job result log could not be saved: ${formatUnknownError(err)}`
     console.error(`[jobRunner] ${note}`)
     logPaths = undefined
-    stderr = withCleanupNote(stderr, note)
+    stderr = withLeadingNote(stderr, note)
   }
 
   // アトミックジョブの RollbackInfo を自動生成
@@ -1325,6 +1325,11 @@ export function revertBlockedJobChanges(
 /** 後始末の結果（スキップ・部分失敗）を Job 結果のメッセージへ連結する */
 function withCleanupNote(base: string, note: string | undefined): string {
   return note === undefined ? base : `${base}\n[jobRunner] ${note}`
+}
+
+/** 先頭へ注記を置く。stderr が長くてもプレビュー/永続化の切り詰めで消えないようにするため。 */
+function withLeadingNote(base: string, note: string): string {
+  return `[jobRunner] ${note}\n${base}`
 }
 
 /**

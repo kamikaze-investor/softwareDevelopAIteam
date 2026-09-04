@@ -920,6 +920,57 @@ describe('saveJobLogs 失敗は Job 結果に影響しない', () => {
     expect(result.stdoutPath).toBeUndefined()
     expect(result.stderrPath).toBeUndefined()
   })
+
+  // T4: stderr がプレビューの切り詰め長（4000文字）を超えていても、
+  // 注記を先頭へ置くことでログ保存失敗が Job 結果から消えないことを検証する。
+  it('T4: stderrが4000文字を超えてもログ保存失敗の注記が結果のstderrに残る', async () => {
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'test'], description: 'test' })
+    // 成功（exitCode 0）だが stderr が 4000 文字を超える出力を返す
+    const longStderr = 'x'.repeat(5000)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'test') {
+        const err = new Error('test command') as Error & { status: number; stdout: string; stderr: string }
+        ;(err as { status: number }).status = 0
+        ;(err as { stdout: string }).stdout = 'all tests passed\n'
+        ;(err as { stderr: string }).stderr = longStderr
+        throw err
+      }
+      return gitFallback(args)
+    })
+
+    const result = await runJob(
+      createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+      createPolicy(),
+    )
+
+    expect(result.status).toBe('success')
+    // 切り詰め後（先頭4000文字）でも注記が先頭に残っている
+    expect(result.stderr).toContain('Job result log could not be saved')
+  })
+
+  // T5: 本当に失敗するコマンドでログ保存も失敗しても、Job は failed のまま
+  // （注記の先頭挿入が成功を failed 化したり、逆に失敗を success 化しないこと）
+  it('T5: 本当に失敗するコマンドでログ保存も失敗しても status は failed のまま', async () => {
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'test'], description: 'test' })
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'test') {
+        const err = new Error('test command') as Error & { status: number; stdout: string; stderr: string }
+        ;(err as { status: number }).status = 1
+        ;(err as { stdout: string }).stdout = ''
+        ;(err as { stderr: string }).stderr = 'command failed'
+        throw err
+      }
+      return gitFallback(args)
+    })
+
+    const result = await runJob(
+      createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+      createPolicy(),
+    )
+
+    expect(result.status).toBe('failed')
+    expect(result.exitCode).toBe(1)
+  })
 })
 
 describe('Phase 2: git_commit staging verification', () => {
