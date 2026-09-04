@@ -61,7 +61,7 @@ import {
   stageApprovedPaths,
 } from './guards/changeManifest.js'
 import type { ApprovedFileState, ChangeManifest, ReflogBaseline, SensitiveBaseline } from './guards/changeManifest.js'
-import { saveJobLogs } from './jobLogger.js'
+import { buildLogPreviews, saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
 import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
 import type { GateCheckResponse } from './guards/gateClient.js'
@@ -1085,13 +1085,11 @@ export async function runJob(
         // commit作成直後、後続の最終検査より前にJob個別ログへ同期保存する。
         saveJobLogs(job.id, `${evidence}\n${stdout}`, stderr)
       } catch (err: unknown) {
-        return {
-          ...failTechnical(
-            startedAt,
-            `Commit ${createdCommitHash} was created, but its Job evidence log could not be saved: ${formatUnknownError(err)}`,
-          ),
-          commitHash: createdCommitHash,
-        }
+        // ログ保存失敗は非致命的（実行結果には影響しない）。commit は既に
+        // 作成済みで覆せないため、Job を failed 化せず注記のみ残して続行する。
+        const note = `Job evidence log could not be saved: ${formatUnknownError(err)}`
+        console.error(`[jobRunner] ${note}`)
+        stderr = withLeadingNote(stderr, note)
       }
     }
 
@@ -1159,14 +1157,20 @@ export async function runJob(
   const combinedStdout = commitEvidenceSection + (aiCliStdoutSection
     ? `${aiCliStdoutSection}\n=== SafeCommand (${job.safeCommand.kind}) ===\n${stdout}`
     : stdout)
-  let logPaths: ReturnType<typeof saveJobLogs>
+  let logPaths: ReturnType<typeof saveJobLogs> | undefined
+  let stdoutPath: string | undefined
+  let stderrPath: string | undefined
   try {
     logPaths = saveJobLogs(job.id, combinedStdout, stderr)
+    stdoutPath = logPaths.stdoutPath
+    stderrPath = logPaths.stderrPath
   } catch (err: unknown) {
-    return {
-      ...failTechnical(startedAt, `Job result log could not be saved: ${formatUnknownError(err)}`),
-      ...(createdCommitHash ? { commitHash: createdCommitHash } : {}),
-    }
+    // ログ保存失敗は非致命的（実行結果には影響しない）。adapter.ts と同じ扱いで
+    // 出力のパスは省略し、プレビューはインメモリ文字列から構築する。
+    const note = `Job result log could not be saved: ${formatUnknownError(err)}`
+    console.error(`[jobRunner] ${note}`)
+    logPaths = undefined
+    stderr = withLeadingNote(stderr, note)
   }
 
   // アトミックジョブの RollbackInfo を自動生成
@@ -1179,6 +1183,10 @@ export async function runJob(
     }
   }
 
+  const previews = logPaths
+    ? { stdoutPreview: logPaths.stdoutPreview, stderrPreview: logPaths.stderrPreview }
+    : buildLogPreviews(combinedStdout, stderr)
+
   return {
     status:
       exitCode === 0 &&
@@ -1187,10 +1195,10 @@ export async function runJob(
         ? 'success'
         : 'failed',
     exitCode,
-    stdout: logPaths.stdoutPreview,
-    stderr: logPaths.stderrPreview,
-    stdoutPath: logPaths.stdoutPath,
-    stderrPath: logPaths.stderrPath,
+    stdout: previews.stdoutPreview,
+    stderr: previews.stderrPreview,
+    stdoutPath,
+    stderrPath,
     changedFiles,
     commitHash: createdCommitHash,
     guardResult,
@@ -1317,6 +1325,21 @@ export function revertBlockedJobChanges(
 /** 後始末の結果（スキップ・部分失敗）を Job 結果のメッセージへ連結する */
 function withCleanupNote(base: string, note: string | undefined): string {
   return note === undefined ? base : `${base}\n[jobRunner] ${note}`
+}
+
+/** 先頭注記1件あたりの上限。注記が複数重なってもプレビューから押し出されないようにする。 */
+const LEADING_NOTE_MAX_LENGTH = 300
+
+/**
+ * 先頭へ注記を置く。stderr が長くてもプレビュー/永続化の切り詰めで消えないようにするため。
+ * 注記自体にも上限を設ける（注記が2件先頭へ積まれた場合でも、先に置かれた注記が
+ * プレビューの外へ押し出されないようにするため）。
+ */
+function withLeadingNote(base: string, note: string): string {
+  const bounded = note.length <= LEADING_NOTE_MAX_LENGTH
+    ? note
+    : `${note.slice(0, LEADING_NOTE_MAX_LENGTH)}…[note truncated]`
+  return `[jobRunner] ${bounded}\n${base}`
 }
 
 /**
