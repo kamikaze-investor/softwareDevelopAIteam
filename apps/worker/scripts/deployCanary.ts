@@ -33,7 +33,7 @@ export async function runGeminiCanary(): Promise<boolean> {
   try {
     const { providerUsed } = await reviewWithProviderFallback(
       'This is a production deploy canary check, not a real review. Reply with exactly: {"ok":true}',
-      { featureName: 'production-deploy-canary', retryTransient: true, cliModel: 'gemini-3.8-flash' },
+      { featureName: 'production-deploy-canary', retryTransient: true, cliModel: 'gemini-3.8-flash', cliEffort: 'medium' },
     )
     reportPass('gemini_provider_path', `providerUsed=${providerUsed}`)
     return true

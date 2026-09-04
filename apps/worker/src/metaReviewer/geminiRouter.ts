@@ -44,6 +44,8 @@ export interface GeminiRouterOptions {
   preferCli?: boolean
   /** agy コマンドで使うモデル */
   cliModel?: string
+  /** agy CLI に渡す推論強度。`gemini-3.8-flash` 等 `--effort` 必須モデル向け。未指定時は付けない（既存呼び出し元の挙動は不変）。 */
+  cliEffort?: 'low' | 'medium' | 'high'
   /** REST API で使うモデル */
   apiModel?: string
   /** 機能名（ログ・通知用） */
@@ -247,9 +249,11 @@ function callCliOnce(
   provider: ProviderFailureDiagnostics['provider'],
   stage: string,
   jsonSchema?: Record<string, unknown>,
+  cliEffort?: 'low' | 'medium' | 'high',
 ): CliOutcome {
   let schemaDir: string | undefined
   const argv = ['--model', cliModel]
+  if (cliEffort !== undefined) argv.push('--effort', cliEffort)
   let effectivePrompt = prompt
 
   if (jsonSchema !== undefined) {
@@ -328,8 +332,9 @@ function callCliDetailed(
   retryTransient: boolean,
   sleepImpl: (ms: number) => void,
   jsonSchema?: Record<string, unknown>,
+  cliEffort?: 'low' | 'medium' | 'high',
 ): CliOutcome {
-  let outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema)
+  let outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort)
   for (
     let attempt = 1;
     retryTransient &&
@@ -337,7 +342,7 @@ function callCliDetailed(
     attempt++
   ) {
     sleepImpl(TRANSIENT_RETRY_DELAYS_MS[attempt - 1])
-    outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema)
+    outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort)
   }
   return outcome
 }
@@ -500,6 +505,7 @@ export async function callGeminiWithFallback(
   const {
     preferCli = false,
     cliModel = 'gemini-2.5-flash',
+    cliEffort,
     apiModel,
     featureName = 'unknown',
     cliJsonSchema,
@@ -512,7 +518,7 @@ export async function callGeminiWithFallback(
 
   if (preferCli) {
     // CLI → API
-    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema)
+    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort)
     if (cliOutcome.ok) return cliOutcome.text as string
 
     apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel)
@@ -522,7 +528,7 @@ export async function callGeminiWithFallback(
     apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel)
     if (apiOutcome.ok) return apiOutcome.text as string
 
-    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema)
+    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort)
     if (cliOutcome.ok) return cliOutcome.text as string
   }
 
