@@ -1,3 +1,4 @@
+import { AGY_REVIEW_MODEL } from '../src/metaReviewer/geminiRouter.js'
 import { reviewWithProviderFallback, MetaReviewProviderError } from '../src/metaReviewer/metaReviewFallbackRouter.js'
 import { createReviewerAdapter, type ReviewerRequest } from '../src/approvalLevel/reviewerAdapter.js'
 
@@ -33,7 +34,10 @@ export async function runGeminiCanary(): Promise<boolean> {
   try {
     const { providerUsed } = await reviewWithProviderFallback(
       'This is a production deploy canary check, not a real review. Reply with exactly: {"ok":true}',
-      { featureName: 'production-deploy-canary', retryTransient: true, cliModel: 'gemini-3.8-flash', cliEffort: 'medium' },
+      // 実レビュー経路（strategicReview.ts の focused / integration review）が使う agy 設定を
+      // そのまま再利用する。canary 専用のモデルを別に持つと「canary PASS だがレビューは全滅」
+      // という状態が成立してしまう（2026-09-04 に実際に発生）。
+      { featureName: 'production-deploy-canary', retryTransient: true, ...AGY_REVIEW_MODEL },
     )
     reportPass('gemini_provider_path', `providerUsed=${providerUsed}`)
     return true

@@ -23,7 +23,9 @@ vi.mock('../src/aiCli/factory.js', () => ({
 }))
 
 const { callGeminiWithFallback } = await import('../src/metaReviewer/geminiRouter.js')
-vi.mock('../src/metaReviewer/geminiRouter.js', () => ({
+// callGeminiWithFallback だけを差し替え、AGY_* モデル定数など他の export は実物を使う。
+vi.mock('../src/metaReviewer/geminiRouter.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/metaReviewer/geminiRouter.js')>()),
   callGeminiWithFallback: vi.fn(),
 }))
 

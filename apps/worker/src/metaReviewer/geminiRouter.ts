@@ -39,12 +39,33 @@ const AGY_PATH = process.env.AGY_CLI_PATH ?? 'agy'
 // Claude フォールバックモデル。
 const ANTIGRAVITY_CLAUDE_FALLBACK_MODEL = 'claude-sonnet-4-6'
 
+/**
+ * agy CLI へ渡すモデル指定。**model と effort は必ず対で扱う。**
+ *
+ * agy は `--model <id> --effort <low|medium|high>` の分離形式のみを受け付け、Flash 系は
+ * `--effort` 必須（未指定は `--model X requires --effort` で確定的に失敗する）。effort 込みの
+ * 識別子（`gemini-3.5-flash-medium` 等、2026-08-24 時点の形式）は現行 agy では
+ * `not recognized as a known model` になる。2026-09-04 実測。
+ *
+ * ここで対のオブジェクトとして持つのは、片方だけを指定して確定的に失敗する呼び出しを
+ * 構造的に防ぐため。**これは Gemini REST API のモデル名とは別の名前空間**であり、
+ * `apiModel` 側へ流用してはならない。
+ */
+export const AGY_REVIEW_MODEL = { cliModel: 'gemini-3.6-flash', cliEffort: 'medium' } as const
+
+/** 軽量用途（alignment check・watchdog 分析・audit 説明文）向けの agy モデル指定。 */
+export const AGY_LIGHT_MODEL = { cliModel: 'gemini-3.6-flash', cliEffort: 'low' } as const
+
 export interface GeminiRouterOptions {
   /** CLI を優先する場合 true（デフォルト false = API優先） */
   preferCli?: boolean
   /** agy コマンドで使うモデル */
   cliModel?: string
-  /** agy CLI に渡す推論強度。`gemini-3.8-flash` 等 `--effort` 必須モデル向け。未指定時は付けない（既存呼び出し元の挙動は不変）。 */
+  /**
+   * agy CLI に渡す推論強度。現行 agy では Flash 系すべてが `--effort` 必須のため、
+   * 未指定時は `AGY_LIGHT_MODEL.cliEffort` が既定として補われる（`--effort` なしの argv は
+   * agy が必ず拒否するため、「付けない」という選択肢は実質存在しない）。
+   */
   cliEffort?: 'low' | 'medium' | 'high'
   /** REST API で使うモデル */
   apiModel?: string
@@ -504,8 +525,9 @@ export async function callGeminiWithFallback(
 ): Promise<string> {
   const {
     preferCli = false,
-    cliModel = 'gemini-2.5-flash',
-    cliEffort,
+    // model/effort は対で既定値を持つ。片方だけ既定にすると agy が確定的に失敗する。
+    cliModel = AGY_LIGHT_MODEL.cliModel,
+    cliEffort = AGY_LIGHT_MODEL.cliEffort,
     apiModel,
     featureName = 'unknown',
     cliJsonSchema,

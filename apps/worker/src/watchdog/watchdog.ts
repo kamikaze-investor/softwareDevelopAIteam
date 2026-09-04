@@ -8,7 +8,7 @@
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { Job, Project, Task } from '@ai-team/shared'
 import { checkStall } from './stallDetector.js'
-import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
+import { AGY_LIGHT_MODEL, callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
 import { sendAlert } from '../notifier/notifier.js'
 
 const WATCHDOG_INTERVAL_MS = Number(process.env.WATCHDOG_INTERVAL_MS ?? 30_000)
@@ -103,7 +103,9 @@ async function analyzeAndReport(
     const raw = await callGeminiWithFallback(prompt, {
       preferCli: false,
       apiModel: 'gemini-3.1-flash-lite',
-      cliModel: 'gemini-3.1-flash-lite',
+      // agy CLI は model と effort を分離して受け取る（AGY_LIGHT_MODEL の定義コメント参照）。
+      // apiModel は Gemini REST API 側の名前空間なので agy の命名へ寄せない。
+      ...AGY_LIGHT_MODEL,
       featureName: 'watchdog_analysis',
     })
     const parsed = parseStallAnalysis(raw)

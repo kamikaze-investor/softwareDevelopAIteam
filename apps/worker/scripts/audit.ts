@@ -40,7 +40,7 @@ import { runSafetyAudit } from '../src/guards/safetyAuditor.js'
 import { runAlignmentCheck } from '../src/guards/alignmentChecker.js'
 import { processGate, type GateResult } from '../src/guards/gateProcessor.js'
 import { appendExecutionLog } from '../src/executionLogStore.js'
-import { callGeminiWithFallback } from '../src/metaReviewer/geminiRouter.js'
+import { AGY_LIGHT_MODEL, callGeminiWithFallback } from '../src/metaReviewer/geminiRouter.js'
 import type { AuditReport, AlignmentReport } from '@ai-team/shared'
 import { randomUUID } from 'node:crypto'
 
@@ -149,7 +149,9 @@ async function generateWhyExplanation(
   try {
     const result = await callGeminiWithFallback(prompt, {
       preferCli: false,
-      cliModel: 'gemini-3.1-flash-lite',
+      // agy CLI は model と effort を分離して受け取る（AGY_LIGHT_MODEL の定義コメント参照）。
+      // apiModel は Gemini REST API 側の名前空間なので agy の命名へ寄せない。
+      ...AGY_LIGHT_MODEL,
       apiModel: 'gemini-3.1-flash-lite',
       featureName: 'audit_explanation',
     })

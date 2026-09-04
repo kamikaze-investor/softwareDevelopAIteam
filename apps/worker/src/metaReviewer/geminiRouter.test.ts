@@ -37,6 +37,7 @@ import { spawnSync } from 'node:child_process'
 import { callGeminiForReview } from './geminiClient.js'
 import { writeFileSync } from 'node:fs'
 import {
+  AGY_LIGHT_MODEL, AGY_REVIEW_MODEL,
   callGeminiWithFallback, classifyFailure, sanitizeMessage, MetaReviewProviderError,
 } from './geminiRouter.js'
 
@@ -753,7 +754,11 @@ describe('callGeminiWithFallback', () => {
       expect(args[modelIdx + 3]).toBe('medium')
     })
 
-    it('T2: cliEffort 未指定時は argv に --effort が含まれない', async () => {
+    // 旧 T2（PR #89）は「cliEffort 未指定なら --effort を付けない」という後方互換を保証していた。
+    // 現行 agy では Flash 系すべてが --effort 必須（未指定は
+    // `--model X requires --effort` で確定的に失敗、2026-09-04 実測）のため、その後方互換は
+    // 「必ず失敗する argv を組み立てる」ことと同義になった。既定値を対で持つ挙動へ差し替える。
+    it('T2: cliEffort 未指定時は既定の effort が補われる（--effort なし argv は agy が必ず拒否するため）', async () => {
       mockSpawnSync.mockReturnValue(cliSuccess('ok'))
 
       await callGeminiWithFallback('prompt', {
@@ -763,7 +768,20 @@ describe('callGeminiWithFallback', () => {
       })
 
       const args = mockSpawnSync.mock.calls[0][1] as string[]
-      expect(args).not.toContain('--effort')
+      expect(args).toContain('--effort')
+      expect(args[args.indexOf('--effort') + 1]).toBe(AGY_LIGHT_MODEL.cliEffort)
+    })
+
+    it('T2b: cliModel / cliEffort をどちらも指定しない場合、既定は対で入り --model と --effort が揃う', async () => {
+      mockSpawnSync.mockReturnValue(cliSuccess('ok'))
+
+      await callGeminiWithFallback('prompt', { preferCli: true, featureName: 'test' })
+
+      const args = mockSpawnSync.mock.calls[0][1] as string[]
+      const modelIdx = args.indexOf('--model')
+      expect(args[modelIdx + 1]).toBe(AGY_LIGHT_MODEL.cliModel)
+      expect(args[modelIdx + 2]).toBe('--effort')
+      expect(args[modelIdx + 3]).toBe(AGY_LIGHT_MODEL.cliEffort)
     })
 
     it('T3: cliEffort 指定時でも argv の最後の2要素は --print とプロンプト', async () => {
@@ -890,4 +908,20 @@ describe('callGeminiWithFallback', () => {
       expect((e4 as MetaReviewProviderError).failureClass).toBe('unknown')
     })
   })
+})
+
+// 2026-09-04: agy が model と effort を分離形式でのみ受け付けるようになり、effort 込みの
+// 識別子（`gemini-3.5-flash-medium` 等）は `not recognized as a known model` で確定的に
+// 失敗するようになった。定数が対で揃っていること・旧形式へ戻っていないことを固定する。
+describe('agy CLI モデル定数', () => {
+  for (const [name, pair] of [['AGY_REVIEW_MODEL', AGY_REVIEW_MODEL], ['AGY_LIGHT_MODEL', AGY_LIGHT_MODEL]] as const) {
+    it(`${name} は model と effort を対で持つ`, () => {
+      expect(pair.cliModel.length).toBeGreaterThan(0)
+      expect(['low', 'medium', 'high']).toContain(pair.cliEffort)
+    })
+
+    it(`${name} の model は effort 込みの旧識別子形式ではない`, () => {
+      expect(pair.cliModel).not.toMatch(/-(low|medium|high)$/)
+    })
+  }
 })

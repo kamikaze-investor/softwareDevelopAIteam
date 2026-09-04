@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('../metaReviewer/geminiRouter.js', () => ({
+// callGeminiWithFallback だけを差し替え、AGY_* モデル定数など他の export は実物を使う
+// （定数を落とすと呼び出し元の `...AGY_LIGHT_MODEL` が undefined 展開で壊れる）。
+vi.mock('../metaReviewer/geminiRouter.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../metaReviewer/geminiRouter.js')>()),
   callGeminiWithFallback: vi.fn(),
 }))
 
