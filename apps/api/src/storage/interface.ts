@@ -15,7 +15,11 @@ export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 
 export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
-  | { ok: false; code?: 'DESIGN_REVIEW_PRECONDITION_FAILED'; reason: string }
+  | {
+      ok: false
+      code?: 'DESIGN_REVIEW_PRECONDITION_FAILED' | 'WORKSPACE_QUARANTINED'
+      reason: string
+    }
 
 export type AdvanceWorkflowJobResult =
   | { ok: true; job: Job; nextJob: Job; nextJobCreated: boolean; deduplicated?: boolean }
@@ -62,6 +66,29 @@ export type PersistProviderTimeoutFailureResult =
 export type FailIfRunningJobResult =
   | { ok: true; updated: boolean; currentStatus: Job['status']; job: Job }
   | { ok: false; code: 'JOB_NOT_FOUND'; reason: string }
+
+/**
+ * PR-C Tranche 3: `running -> terminal` 遷移と修復意図の確定を**単一transaction**で行う結果。
+ *
+ * `updated:false` はCAS loser（Jobが最早 `running` ではない）を表し、副作用は一切発生しない。
+ * `quarantined` は、この遷移で workspace が all称之为 quarantine されたかを表す
+ * （non-verified workspace を `running -> blocked` した場合のみ true になる）。
+ */
+export type FailAndPrepareRepairResult =
+  | {
+      ok: true
+      updated: boolean
+      currentStatus: Job['status']
+      job: Job
+      quarantined: boolean
+      /** Outbox dedup により既に適用済みの結果をそのまま返した場合に true。 */
+      deduplicated?: boolean
+    }
+  | {
+      ok: false
+      code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
+      reason: string
+    }
 
 export type PersistReviewWorkflowResult =
   | {
@@ -221,6 +248,27 @@ export interface IJobStorage {
     jobId: string,
     failure: { stderr: string; completedAt: string },
   ): FailIfRunningJobResult
+  /**
+   * PR-C Tranche 3: `running` Job の終端化(position)と修復意図・quarantine 確定を単一transactionで行う。
+   *
+   * - Outbox dedup を先に検査する（一致なら元の durable outcome を `deduplicated:true` で返す）。
+   * - CAS（`WHERE id=? AND status='running'`）に負けたら副作用なしで `updated:false` を返す。
+   * - CAS勝利時のみ、修復決定を**このtransaction内のread**から算出して適用する
+   *   （escalate → Task blocked / queue → design-review intent / skip → 何もしない）。
+   * - `workspaceVerified:true` のときのみ Job を `failed`（所有権解放）にする。
+   *   それ以外は Job を `blocked` にして所有権を保持し、同一transactionで quarantine metadata を設定する。
+   *   未検証の workspace で所有権を解放してはならない。
+   */
+  failAndPrepareRepair(input: {
+    jobId: string
+    failure: { stderr: string; completedAt: string }
+    workspaceVerified: boolean
+    /** non-verified workspace を quarantine する際の理由。省略時は既定メッセージ。 */
+    quarantineReason?: string
+    /** 呼び出し元から届いた失敗付加情報（kind / workspaceState 等）。quarantine 時に保持される。 */
+    failureMetadata?: Job['failureMetadata']
+    outboxEvent?: OutboxEventInput
+  }): FailAndPrepareRepairResult
   /** workflow Jobの結果保存と次step Jobの作成を単一transactionで冪等に行う。 */
   updateAndCreateNextWorkflowJob(input: {
     jobId: string

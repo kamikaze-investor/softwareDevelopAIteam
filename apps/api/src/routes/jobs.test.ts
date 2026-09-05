@@ -398,6 +398,36 @@ describe('Job API', () => {
     })
   })
 
+  it('GET /api/jobs excludes queued Jobs while the workspace is quarantined', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const { getStorage } = await import('../storage/index.js')
+      // 未検証 workspace: crash復旧時に quarantine された Job（所有権保持・blocked）
+      getStorage().jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        failureMetadata: {
+          quarantined: true,
+          quarantineReason: 'workspace not verified safe after crash',
+        },
+      })
+      await createJob(app, task)
+
+      const res = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<Job[]>(res.body)
+      // Worker（fetchQueuedJob）は status==='queued' を選ぶため、quarantine中は新規作業を渡さない
+      expect(body.some((job) => job.status === 'queued')).toBe(false)
+      expect(body).toHaveLength(1)
+      expect(body[0].failureMetadata?.quarantined).toBe(true)
+    })
+  })
+
   it('GET /api/jobs/:id returns a job', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -997,6 +1027,7 @@ describe('Job API', () => {
         method: 'PATCH',
         url: `/api/jobs/${created.id}/fail-if-running`,
         payload: {
+          workspaceVerified: true,
           stderr: 'technical failure',
           completedAt: '2026-08-08T01:02:03.000Z',
         },
@@ -1039,6 +1070,7 @@ describe('Job API', () => {
           method: 'PATCH',
           url: `/api/jobs/${created.id}/fail-if-running`,
           payload: {
+            workspaceVerified: true,
             stderr: 'must not be saved',
             completedAt: '2026-08-08T01:02:03.000Z',
           },
@@ -1057,6 +1089,7 @@ describe('Job API', () => {
         method: 'PATCH',
         url: '/api/jobs/missing-job/fail-if-running',
         payload: {
+          workspaceVerified: true,
           stderr: 'technical failure',
           completedAt: '2026-08-08T01:02:03.000Z',
         },

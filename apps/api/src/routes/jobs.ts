@@ -15,7 +15,7 @@ import {
   canApplyJobResultStatus,
   describeApplicableJobStatuses,
 } from '../jobResultApplicationPolicy'
-import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from '../designReview/repairFlow'
+import { escalateTaskToHuman, executeQueuedRepair, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import { REPAIR_STEP_PREFIX } from '../designReview/repairPolicy'
 import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
 import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
@@ -164,6 +164,20 @@ const UpdateJobBody = z.object({
 const FailIfRunningJobBody = z.object({
   stderr: z.string(),
   completedAt: z.string(),
+  /**
+   * PR-C Tranche 3: caller が workspace を「クリーン」と検証したか。
+   * true のときのみ Job を `failed`（所有権解放）にできる。
+   * 省略時は false（fail-closed: quarantine / blocked し、所有権を保持する）。
+   */
+  workspaceVerified: z.boolean().optional(),
+  /** caller が検証できない場合の quarantine 理由（省略時は既定メッセージ）。 */
+  quarantineReason: z.string().optional(),
+  failureMetadata: z.object({
+    kind: z.string().optional(),
+    workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+  }).strict().optional(),
+  eventId: z.string().min(1).optional(),
+  payloadHash: z.string().min(1).optional(),
 }).strict()
 
 const ListQuerySchema = z.object({
@@ -258,7 +272,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Task not found' })
     }
 
-    return reply.send(storage.jobs.findByTaskId(query.data.taskId))
+    const jobs = storage.jobs.findByTaskId(query.data.taskId)
+
+    // PR-C Tranche 3: quarantine された workspace の Job をclaim可能な仕事として渡さない。
+    // Worker（fetchQueuedJob）はこのGETから `status==='queued'` を選ぶため、
+    // quarantine 中は queued Job を除外して、未検証 workspace へ新しい作業を割り当てない。
+    if (isWorkspaceQuarantined(jobs)) {
+      return reply.send(jobs.filter((job) => job.status !== 'queued'))
+    }
+
+    return reply.send(jobs)
   })
 
   app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {
@@ -318,16 +341,40 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
-    const transition = storage.jobs.failIfRunning(req.params.id, result.data)
+    const { eventId, payloadHash, quarantineReason, failureMetadata, ...failure } = result.data
+    // 省略時は fail-closed（workspace 未検証 → quarantine）。
+    const workspaceVerified = result.data.workspaceVerified === true
+    const outboxPayload: Record<string, unknown> = { ...failure, workspaceVerified, ...(quarantineReason ? { quarantineReason } : {}), ...(failureMetadata ? { failureMetadata } : {}) }
+    const outboxCheck = buildOutboxEvent(eventId, payloadHash, outboxPayload)
+    if (!outboxCheck.ok) {
+      return reply.status(outboxCheck.statusCode).send({ error: outboxCheck.error })
+    }
+
+    const transition = storage.jobs.failAndPrepareRepair({
+      jobId: req.params.id,
+      failure,
+      workspaceVerified,
+      quarantineReason,
+      failureMetadata,
+      outboxEvent: outboxCheck.outboxEvent,
+    })
     if (!transition.ok) {
+      if (transition.code === 'OUTBOX_HASH_MISMATCH') {
+        return reply.status(409).send({ error: transition.reason })
+      }
       return reply.status(404).send({ error: 'Job not found' })
     }
 
-    return reply.send({
+    const body: Record<string, unknown> = {
       updated: transition.updated,
       currentStatus: transition.currentStatus,
       job: transition.job,
-    })
+      quarantined: transition.quarantined,
+    }
+    if (transition.deduplicated === true && outboxCheck.outboxEvent) {
+      body.outbox = { eventId: outboxCheck.outboxEvent.eventId, deduplicated: true }
+    }
+    return reply.send(body)
   })
 
   app.patch<{ Params: { id: string } }>('/:id', async (req, reply) => {

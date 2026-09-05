@@ -313,6 +313,17 @@ export function escalateTaskToHuman(storage: IStorage, taskId: string): void {
 }
 
 /**
+ * workspace が quarantine されているかを判定する。
+ *
+ * 最新Jobだけを確認せず、そのTaskの**任意の**未解除quarantine Jobから判定する
+ * （quarantine は `running -> blocked` と同一transactionで一度だけ設定され、解除機構はない）。
+ * quota的 workspace に対しては新しいJob・repairを生成してはならない（fail-closed）。
+ */
+export function isWorkspaceQuarantined(jobs: readonly Job[]): boolean {
+  return jobs.some((job) => job.failureMetadata?.quarantined === true)
+}
+
+/**
  * durable にqueuedとなったrunを実行し、ALIGNEDならrepair Jobを作る。
  *
  * startup recovery からも、PATCH直後のkickからも同じ経路で呼ばれる。
@@ -335,6 +346,17 @@ export async function executeQueuedRepair(
     }
   }
   const taskId = run.taskId
+
+  // PR-C Tranche 3: quarantine された workspace への repair は fail-closed で拒否する。
+  // 未検証 workspace を持つ Task へ repair Job を生成・実行してはならない。
+  // このTaskの任意のquarantine Jobから判定する（最新Jobだけでなく）。
+  if (isWorkspaceQuarantined(storage.jobs.findByTaskId(taskId))) {
+    escalateTaskToHuman(storage, taskId)
+    return {
+      status: 'escalated',
+      reason: 'workspace is quarantined; repair cannot run until the workspace is verified safe',
+    }
+  }
 
   const sourceJobId = stepKey.slice(REPAIR_STEP_PREFIX.length).split(':')[0]
   const sourceJob = storage.jobs.findById(sourceJobId)

@@ -10,7 +10,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
@@ -18,6 +18,7 @@ import type { TaskContinuation } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import { escalateTaskToHuman, prepareRepairFlow } from '../designReview/repairFlow'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -443,6 +444,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   runMigrations(db)
   runDesignReviewSubjectMigration(db)
   runIndexMigrations(db)
+
+  // 各サブストレージのメソッド（jobs の repair decision 算出など）は呼び出し時に
+  // `storage` 全体へアクセスする必要がある。クロージャ経由で late-assign する。
+  let storage: IStorage
 
   const projects: IProjectStorage = {
     findAll() {
@@ -1359,6 +1364,111 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
       return transition()
     },
+    failAndPrepareRepair(input) {
+      const transition = db.transaction((): FailAndPrepareRepairResult => {
+        const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
+        if (dedup.status === 'conflict') {
+          return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        }
+
+        const existing = jobs.findById(input.jobId)
+        if (!existing) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+
+        if (dedup.status === 'deduplicated') {
+          // dedup で既に適用済みの結果が見つかった場合は、CAS loser のように振る舞わず
+          // 元の durable outcome（現在のJob状態）をそのまま返す。
+          return {
+            ok: true,
+            updated: true,
+            currentStatus: existing.status,
+            job: existing,
+            quarantined: existing.failureMetadata?.quarantined === true,
+            deduplicated: true,
+          }
+        }
+
+        // CAS WINNER のみここへ到達する。
+        // 目的語の状態は workspace 検証結果で決まる:
+        //   - verified safe → `failed`（所有権解放してよい。workspace はクリーンと証明済み）
+        //   - NOT verified → `blocked`（所有権を保持する。未検証 workspace は他人に渡さない）
+        // 「未検証 workspace で所有権を解放してはならない」が load-bearing rule。
+        const targetStatus: Job['status'] = input.workspaceVerified ? 'failed' : 'blocked'
+
+        const failureMetadata = input.workspaceVerified
+          ? (input.failureMetadata ?? {})
+          : {
+              ...(input.failureMetadata ?? {}),
+              quarantined: true,
+              quarantineReason: input.quarantineReason ?? 'workspace not verified safe after crash',
+            }
+
+        const casResult = db.prepare(`
+          UPDATE jobs SET status = ?, stderr = ?, completed_at = ?, failure_metadata = ?
+          WHERE id = ? AND status = 'running'
+        `).run(
+          targetStatus,
+          input.failure.stderr,
+          input.failure.completedAt,
+          Object.keys(failureMetadata).length > 0 ? JSON.stringify(failureMetadata) : null,
+          input.jobId,
+        )
+
+        if (casResult.changes !== 1) {
+          // CAS loser: 副作用は一切発生させない。
+          const current = jobs.findById(input.jobId)!
+          return {
+            ok: true,
+            updated: false,
+            currentStatus: current.status,
+            job: current,
+            quarantined: false,
+          }
+        }
+
+        recordOutboxEvent(db, input.jobId, input.outboxEvent)
+
+        // CAS WINNER 限定で、この transaction 内の read から修復決定を算出して適用する
+        // （関数外で計算した決定を受け取らない — 古い可能性があるため）。
+        const winner = jobs.findById(input.jobId)!
+
+        if (input.workspaceVerified) {
+          const preparation = prepareRepairFlow(storage, { failedJob: winner })
+          if (preparation.action === 'escalate') {
+            escalateTaskToHuman(storage, winner.taskId)
+          } else if (preparation.action === 'queue') {
+            // Job の終端状態と queued design_review_run を同一 transaction で確定し、
+            // lost-trigger window（Job は failed / run は無い）を生まない。
+            designReviewRuns.create(preparation.run)
+          }
+          // 'skip' → 追加の修復意図は作らない。
+        } else {
+          // workspace が quarantine された（='blocked'）ため、自律修復 Job は作れない。
+          // fail-closed に Human escalation（Task blocked）で所有権を保持する。
+          escalateTaskToHuman(storage, winner.taskId)
+        }
+
+        const final = jobs.findById(input.jobId)!
+        return {
+          ok: true,
+          updated: true,
+          currentStatus: final.status,
+          job: final,
+          quarantined: final.failureMetadata?.quarantined === true,
+        }
+      })
+
+      try {
+        return transition()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
     updateAndCreateNextWorkflowJob(input) {
       const transition = db.transaction((): AdvanceWorkflowJobResult => {
         const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
@@ -1555,6 +1665,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         const isEscalatedFailure = taskRow.status === 'blocked' && latestJob.status === 'failed'
         if (!isJobDirectlyBlocked && !isEscalatedFailure) {
           return { ok: false, reason: `Latest job status is ${latestJob.status}, not blocked` }
+        }
+
+        // PR-C Tranche 3: workspace quarantine は fail-closed に resume を拒否する。
+        // 最新Jobだけを見ず、このTaskの**任意の**未解除quarantine Jobから判定する
+        // （quarantine は `running -> blocked` と同一transactionで一度だけ設定され、解除機構はない）。
+        // 未検証 workspace を持つ Task へ新しい Job を生成してはならない。
+        if (taskJobs.some((job) => job.failureMetadata?.quarantined === true)) {
+          const reason = taskJobs.find((job) => job.failureMetadata?.quarantined === true)
+            ?.failureMetadata?.quarantineReason ?? 'workspace is quarantined'
+          return { ok: false, code: 'WORKSPACE_QUARANTINED', reason: `Cannot resume: ${reason}` }
         }
 
         if (taskJobs.some((job) => job.status === 'queued' || job.status === 'running')) {
@@ -3114,7 +3234,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  return { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, gateEvaluations, auditLog, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, gateEvaluations, auditLog, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  return storage
 }
 
 function deserializeProject(row: any): Project {
