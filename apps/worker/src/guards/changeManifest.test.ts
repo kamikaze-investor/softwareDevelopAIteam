@@ -11,6 +11,7 @@ import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   ChangeDetectionError,
+  FINGERPRINT_ABSENT,
   assertIndexClean,
   assertIndexMatchesApproved,
   assertNoResidualChanges,
@@ -20,6 +21,7 @@ import {
   buildWorktreeManifest,
   diffSensitiveBaseline,
   entryTypeFromMode,
+  fingerprintWorktreeEntries,
   lstatEntryType,
   scanSensitiveFiles,
   stageApprovedPaths,
@@ -440,5 +442,121 @@ describe('scanSensitiveFiles / diffSensitiveBaseline（.gitignore 対象を含�
     const baseline = scanSensitiveFiles(repo, SENSITIVE_PATTERNS)
 
     expect(baseline.has('src/normal.ts')).toBe(false)
+  })
+})
+
+describe('PR-C workspace baseline（porcelain v2 object id 保持 / fingerprint）', () => {
+  it('tracked 変更に HEAD / INDEX object id と生の XY を保持する（unstaged）', () => {
+    write('src/keep.ts', 'export const keep = 2\n')
+
+    const manifest = buildWorktreeManifest(repo)
+    const change = manifest.changes.find((c) => c.path === 'src/keep.ts')
+
+    expect(change?.kind).toBe('modified')
+    expect(change?.xyStatus).toBe('.M')
+    // porcelain v2 の hH / hI がそのまま保持される（beforeHash/afterHash とは別）
+    expect(change?.headHash).toBe(git('rev-parse', 'HEAD:src/keep.ts').trim())
+    expect(change?.indexHash).toBe(git('rev-parse', ':src/keep.ts').trim())
+  })
+
+  it('staged と両方 staged+unstaged を xyStatus で区別する', () => {
+    write('src/keep.ts', 'export const keep = 2\n')
+    git('add', '--', 'src/keep.ts')
+    expect(buildWorktreeManifest(repo).changes.find((c) => c.path === 'src/keep.ts')?.xyStatus).toBe('M.')
+
+    write('src/keep.ts', 'export const keep = 3\n')
+    const both = buildWorktreeManifest(repo).changes.find((c) => c.path === 'src/keep.ts')
+    expect(both?.xyStatus).toBe('MM')
+    expect(both?.kind).toBe('modified')
+  })
+
+  it('新規追加（tracked へ stage）で HEAD / INDEX object id を保持する', () => {
+    write('src/new.ts', 'export const added = 1\n')
+    git('add', '--', 'src/new.ts')
+
+    const change = buildWorktreeManifest(repo).changes.find((c) => c.path === 'src/new.ts')
+    expect(change?.kind).toBe('added')
+    expect(change?.headHash).toBeUndefined() // HEAD に無い = hH は 000000...0 相当でない生値
+    expect(change?.indexHash).toBe(git('rev-parse', ':src/new.ts').trim())
+    expect(change?.xyStatus).toBe('A.')
+  })
+
+  it('rename は旧パスを oldPath に保持し、両パスの object id も取得できる', () => {
+    git('mv', 'src/rename-me.ts', 'src/renamed.ts')
+
+    const change = buildWorktreeManifest(repo).changes.find((c) => c.kind === 'renamed')
+    expect(change?.oldPath).toBe('src/rename-me.ts')
+    expect(change?.path).toBe('src/renamed.ts')
+    expect(change?.indexHash).toBe(git('rev-parse', ':src/renamed.ts').trim())
+  })
+
+  it('mode / exec-bit 変化（staged）を mode と HEAD/INDEX id で区別できる', () => {
+    git('update-index', '--chmod=+x', 'src/keep.ts')
+
+    const change = buildWorktreeManifest(repo).changes.find((c) => c.path === 'src/keep.ts')
+    expect(change?.beforeMode).toBe('100644')
+    expect(change?.afterType).toBe('regular')
+    expect(change?.headHash).toBeDefined()
+    expect(change?.indexHash).toBeDefined()
+    expect(change?.xyStatus).toBe('M.')
+  })
+
+  it('fingerprintWorktreeEntries: 同一内容は同一 hash、変更で hash が変わる', () => {
+    write('src/keep.ts', 'export const keep = 2\n')
+    write('src/new.ts', 'export const added = 1\n')
+    const manifest = buildWorktreeManifest(repo)
+
+    const first = fingerprintWorktreeEntries(repo, manifest)
+    const second = fingerprintWorktreeEntries(repo, manifest)
+
+    expect(first).toEqual(second)
+    expect(first.get('src/keep.ts')).toBe(git('hash-object', '--', 'src/keep.ts').trim())
+    expect(first.get('src/new.ts')).toBe(git('hash-object', '--', 'src/new.ts').trim())
+
+    write('src/keep.ts', 'export const keep = 999\n')
+    const changed = fingerprintWorktreeEntries(repo, buildWorktreeManifest(repo))
+    expect(changed.get('src/keep.ts')).not.toBe(first.get('src/keep.ts'))
+  })
+
+  it('fingerprintWorktreeEntries: 削除パスは明示的な absent マーカーになる', () => {
+    unlinkSync(path.join(repo, 'src/remove.ts'))
+
+    const fingerprint = fingerprintWorktreeEntries(repo, buildWorktreeManifest(repo))
+
+    expect(fingerprint.get('src/remove.ts')).toBe(FINGERPRINT_ABSENT)
+    expect(fingerprint.size).toBe(1) // 削除のみなので他エントリは無い
+  })
+
+  it('fingerprintWorktreeEntries: rename は旧パスが absent、新パスが内容 hash', () => {
+    git('mv', 'src/rename-me.ts', 'src/renamed.ts')
+
+    const fingerprint = fingerprintWorktreeEntries(repo, buildWorktreeManifest(repo))
+
+    expect(fingerprint.get('src/rename-me.ts')).toBe(FINGERPRINT_ABSENT)
+    expect(fingerprint.get('src/renamed.ts')).toBe(git('hash-object', '--', 'src/renamed.ts').trim())
+  })
+
+  it('fingerprintWorktreeEntries: untracked symlink はリンク先文字列を hash する', () => {
+    if (!canCreateSymlink()) return
+
+    symlinkSync(path.join(repo, 'README.md'), path.join(repo, 'src/link.ts'))
+    const manifest = buildWorktreeManifest(repo)
+    const entry = manifest.changes.find((c) => c.path === 'src/link.ts')
+    expect(entry?.afterType).toBe('symlink')
+
+    const fingerprint = fingerprintWorktreeEntries(repo, manifest)
+    // dereference した内容（README.md）の hash ではなく、リンク先文字列の blob hash
+    expect(fingerprint.get('src/link.ts')).not.toBe(git('hash-object', '--', 'README.md').trim())
+    expect(fingerprint.get('src/link.ts')).toMatch(/^[0-9a-f]{40}$/)
+  })
+
+  it('fingerprintWorktreeEntries: 同一内容で再実行しても同じ hash（決定性）', () => {
+    write('src/keep.ts', 'export const keep = 2\n')
+    const manifest = buildWorktreeManifest(repo)
+
+    const first = fingerprintWorktreeEntries(repo, manifest)
+    const second = fingerprintWorktreeEntries(repo, manifest)
+
+    expect(second).toEqual(first)
   })
 })

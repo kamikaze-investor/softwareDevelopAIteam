@@ -1015,8 +1015,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO jobs
           (id, task_id, project_id, workflow_step_key, agent_role, status, safe_command,
-           ai_cli_provider, ai_cli_prompt, ai_cli_mode, dry_run, failure_metadata, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ai_cli_provider, ai_cli_prompt, ai_cli_mode, dry_run, failure_metadata,
+           workspace_baseline, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         job.id,
         job.taskId,
@@ -1030,6 +1031,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         job.aiCliMode ?? null,
         job.dryRun ? 1 : 0,
         job.failureMetadata ? JSON.stringify(job.failureMetadata) : null,
+        job.workspaceBaseline ? JSON.stringify(job.workspaceBaseline) : null,
         job.createdAt,
       )
       return job
@@ -1054,7 +1056,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         UPDATE jobs SET
           status=?, started_at=?, completed_at=?, exit_code=?,
           stdout=?, stderr=?, stdout_path=?, stderr_path=?, changed_files=?, commit_hash=?,
-          rollback_info=?, guard_result=?, failure_metadata=?, approval_id=?
+          rollback_info=?, guard_result=?, failure_metadata=?, approval_id=?, workspace_baseline=?
         WHERE id=?
       `).run(
         updated.status,
@@ -1071,6 +1073,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         updated.guardResult ? JSON.stringify(updated.guardResult) : null,
         updated.failureMetadata ? JSON.stringify(updated.failureMetadata) : null,
         updated.approvalId ?? null,
+        updated.workspaceBaseline ? JSON.stringify(updated.workspaceBaseline) : null,
         id,
       )
       return updated
@@ -3189,6 +3192,7 @@ function deserializeJob(row: any): Job {
     rollbackInfo: row.rollback_info ? JSON.parse(row.rollback_info) : undefined,
     guardResult: row.guard_result ? JSON.parse(row.guard_result) : undefined,
     failureMetadata: row.failure_metadata ? JSON.parse(row.failure_metadata) : undefined,
+    workspaceBaseline: row.workspace_baseline ? JSON.parse(row.workspace_baseline) : undefined,
     approvalId: row.approval_id ?? undefined,
     aiCliProvider: row.ai_cli_provider ?? undefined,
     aiCliPrompt: row.ai_cli_prompt ?? undefined,

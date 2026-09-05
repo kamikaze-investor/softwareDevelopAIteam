@@ -76,6 +76,7 @@ export const CREATE_TABLES = `
     failure_metadata TEXT,
     failure_explanation_json TEXT,
     approval_id TEXT,
+    workspace_baseline TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
@@ -379,6 +380,7 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'jobs', column: 'failure_metadata', definition: 'TEXT' },
   { table: 'jobs', column: 'failure_explanation_json', definition: 'TEXT' },
   { table: 'jobs', column: 'approval_id', definition: 'TEXT' },
+  { table: 'jobs', column: 'workspace_baseline', definition: 'TEXT' },
   { table: 'jobs', column: 'stdout_path', definition: 'TEXT' },
   { table: 'jobs', column: 'stderr_path', definition: 'TEXT' },
   { table: 'jobs', column: 'ai_cli_provider', definition: 'TEXT' },

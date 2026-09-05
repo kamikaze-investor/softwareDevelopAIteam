@@ -3,6 +3,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
+import type { JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage, SingleRunningProjectError } from './sqlite'
 import { CREATE_TABLES } from './schema'
 import { validateRoadmapTasks } from './roadmapTaskValidation'
@@ -1531,6 +1532,108 @@ describe('SQLiteStorage', () => {
       const migratedDb = new Database(legacyDbPath, { readonly: true })
       expect((migratedDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
         (column) => column.name === 'failure_metadata',
+      )).toBe(true)
+      migratedDb.close()
+    })
+
+    it('creates and migrates workspace_baseline and round-trips clean / dirty / NULL', () => {
+      // clean baseline（NORMAL Job: start HEAD のみ）
+      const cleanJob = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        workspaceBaseline: {
+          mode: 'clean',
+          startCommitHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+      })
+      expect(storage.jobs.findById(cleanJob.id)?.workspaceBaseline).toEqual({
+        mode: 'clean',
+        startCommitHash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      })
+
+      // dirty baseline（REPAIR Job: start HEAD + 全エントリの fingerprint）
+      const dirtyBaseline: Extract<JobWorkspaceBaseline, { mode: 'dirty' }> = {
+        mode: 'dirty' as const,
+        startCommitHash: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        entries: [
+          {
+            path: 'src/keep.ts',
+            kind: 'modified' as const,
+            xyStatus: ' M',
+            beforeType: 'regular' as const,
+            afterType: 'regular' as const,
+            beforeMode: '100644',
+            afterMode: '100644',
+            headHash: 'cccccccccccccccccccccccccccccccccccccccc',
+            indexHash: 'cccccccccccccccccccccccccccccccccccccccc',
+            worktreeHash: 'dddddddddddddddddddddddddddddddddddddddd',
+          },
+          {
+            path: 'src/remove.ts',
+            kind: 'deleted' as const,
+            worktreeHash: ':absent:',
+          },
+        ],
+      }
+      const dirtyJob = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        workspaceBaseline: dirtyBaseline,
+      })
+      expect(storage.jobs.findById(dirtyJob.id)?.workspaceBaseline).toEqual(dirtyBaseline)
+
+      // update 経由でも round-trip できる
+      const updatedDirtyBaseline = {
+        ...dirtyBaseline,
+        entries: dirtyBaseline.entries.concat({
+          path: 'src/new.ts',
+          kind: 'added' as const,
+          afterType: 'regular' as const,
+          afterMode: '100644',
+          worktreeHash: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+        }),
+      }
+      storage.jobs.update(dirtyJob.id, {
+        status: 'failed',
+        workspaceBaseline: updatedDirtyBaseline,
+      })
+      expect(storage.jobs.findById(dirtyJob.id)?.workspaceBaseline).toEqual(updatedDirtyBaseline)
+
+      // NULL は undefined に round-trip する
+      const noBaselineJob = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      })
+      expect(storage.jobs.findById(noBaselineJob.id)?.workspaceBaseline).toBeUndefined()
+
+      // 新規 DB には列があり、レガシー DB へもマイグレーションが適用される
+      const newDbPath = path.join(os.tmpdir(), `ai-team-workspace-baseline-new-${randomUUID()}.db`)
+      createSQLiteStorage(newDbPath)
+      const newDb = new Database(newDbPath, { readonly: true })
+      expect((newDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'workspace_baseline',
+      )).toBe(true)
+      newDb.close()
+
+      const legacyDbPath = path.join(os.tmpdir(), `ai-team-workspace-baseline-legacy-${randomUUID()}.db`)
+      const legacyDb = new Database(legacyDbPath)
+      legacyDb.exec(CREATE_TABLES.replace('    workspace_baseline TEXT,\n', ''))
+      legacyDb.close()
+
+      expect(() => createSQLiteStorage(legacyDbPath)).not.toThrow()
+      expect(() => createSQLiteStorage(legacyDbPath)).not.toThrow()
+      const migratedDb = new Database(legacyDbPath, { readonly: true })
+      expect((migratedDb.pragma('table_info(jobs)') as Array<{ name: string }>).some(
+        (column) => column.name === 'workspace_baseline',
       )).toBe(true)
       migratedDb.close()
     })
