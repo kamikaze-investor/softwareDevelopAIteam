@@ -21,9 +21,20 @@ const notifierMocks = vi.hoisted(() => ({
   sendAlert: vi.fn(),
 }))
 
+const jobRunnerMocks = vi.hoisted(() => ({
+  computeWorkspaceBaseline: vi.fn(),
+}))
+
 vi.mock('./outbox/outboxStore.js', () => outboxMocks)
 vi.mock('./watchdog/watchdog.js', () => watchdogMocks)
 vi.mock('./notifier/notifier.js', () => notifierMocks)
+vi.mock('./jobRunner.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./jobRunner.js')>()
+  return {
+    ...actual,
+    computeWorkspaceBaseline: jobRunnerMocks.computeWorkspaceBaseline,
+  }
+})
 vi.mock('./jobStateManager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./jobStateManager.js')>()
   return {
@@ -42,6 +53,8 @@ import {
 
 const NOW = '2026-08-08T01:02:03.000Z'
 const fetchMock = vi.fn<typeof fetch>()
+
+const CLEAN_BASELINE = { mode: 'clean', startCommitHash: 'abc123' }
 
 const job: Job = {
   id: 'job-1',
@@ -90,6 +103,7 @@ beforeEach(() => {
   jobStateMocks.recoverStaleJobs.mockReset()
   watchdogMocks.startWatchdog.mockReset()
   notifierMocks.sendAlert.mockReset()
+  jobRunnerMocks.computeWorkspaceBaseline.mockReset()
   outboxMocks.recordPending.mockReturnValue({
     eventId: 'event-1',
     payloadHash: 'payload-hash-1',
@@ -98,6 +112,7 @@ beforeEach(() => {
   outboxMocks.hasPending.mockReturnValue(false)
   jobStateMocks.recoverStaleJobs.mockResolvedValue(0)
   notifierMocks.sendAlert.mockResolvedValue([])
+  jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({ ok: true, baseline: CLEAN_BASELINE })
   vi.spyOn(console, 'log').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -489,6 +504,77 @@ describe('running transition', () => {
   })
 })
 
+describe('workspace baseline (PR-C)', () => {
+  it('bundles the workspace baseline into the running claim PATCH (atomic claim + baseline)', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const executeJob = vi.fn().mockResolvedValue(runResult)
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob,
+      executeJob,
+      now: () => NOW,
+    })
+
+    expect(status).toBe('success')
+    expect(jobRunnerMocks.computeWorkspaceBaseline).toHaveBeenCalledWith(job, '/workspace/target')
+    expect(patchJob.mock.calls[0]?.[1]).toEqual({
+      status: 'running',
+      startedAt: NOW,
+      workspaceBaseline: CLEAN_BASELINE,
+    })
+    expect(executeJob).toHaveBeenCalledTimes(1)
+  })
+
+  it('fails closed without claiming when the workspace baseline cannot be computed', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const executeJob = vi.fn()
+    jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({
+      ok: false,
+      reason: 'workspace has an in-progress git operation (index.lock); ' +
+        'cannot establish a durable baseline (fail-closed)',
+    })
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob,
+      executeJob,
+      now: () => NOW,
+    })
+
+    expect(status).toBeNull()
+    expect(executeJob).not.toHaveBeenCalled()
+    expect(patchJob).toHaveBeenCalledTimes(1)
+    expect(patchJob.mock.calls[0]?.[1]).toMatchObject({
+      status: 'failed',
+      stderr: expect.stringContaining('index.lock'),
+      completedAt: NOW,
+    })
+    expect(patchJob.mock.calls[0]?.[1]).not.toHaveProperty('status', 'running')
+  })
+
+  it('shuts down the Job on a dirty worktree for a normal Job (fail-closed gating)', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const executeJob = vi.fn()
+    jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({
+      ok: false,
+      reason: 'normal Job requires a clean worktree but found 1 changed path(s): src/dirty.ts',
+    })
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob,
+      executeJob,
+      now: () => NOW,
+    })
+
+    expect(status).toBeNull()
+    expect(executeJob).not.toHaveBeenCalled()
+    expect(patchJob).toHaveBeenCalledTimes(1)
+    expect(patchJob.mock.calls[0]?.[1]).toMatchObject({
+      status: 'failed',
+      stderr: expect.stringContaining('src/dirty.ts'),
+    })
+  })
+})
+
 describe('policy construction failure', () => {
   it('uses the shared retry/reconcile persistence path for running and failed updates', async () => {
     const patchJob = vi.fn().mockResolvedValue(true)
@@ -507,7 +593,11 @@ describe('policy construction failure', () => {
 
     expect(status).toBe('failed')
     expect(patchJob).toHaveBeenCalledTimes(2)
-    expect(patchJob.mock.calls[0]?.[1]).toEqual({ status: 'running', startedAt: NOW })
+    expect(patchJob.mock.calls[0]?.[1]).toEqual({
+      status: 'running',
+      startedAt: NOW,
+      workspaceBaseline: CLEAN_BASELINE,
+    })
     expect(patchJob.mock.calls[1]?.[1]).toMatchObject({
       status: 'failed',
       stderr: expect.stringContaining('invalid policy'),

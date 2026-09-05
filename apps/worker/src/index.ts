@@ -22,7 +22,7 @@ import type {
   ReconcileRunningFailure,
   ReconcileRunningJobResult,
 } from './jobStateManager.js'
-import { runJob } from './jobRunner.js'
+import { runJob, computeWorkspaceBaseline } from './jobRunner.js'
 import type { StructuredReviewContext } from './jobRunner.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
@@ -54,6 +54,7 @@ export type JobUpdate = Partial<Pick<
   | 'commitHash'
   | 'guardResult'
   | 'failureMetadata'
+  | 'workspaceBaseline'
 >> & {
   reviewResult?: Pick<ReviewResult, 'status' | 'summary' | 'findings'>
 }
@@ -353,9 +354,34 @@ async function confirmRunningTransition(
   dependencies: JobPersistenceDependencies,
 ): Promise<boolean> {
   assertTransition(job.status, 'running')
+
+  // ── PR-C: claim（queued -> running）と workspace baseline を同一 PATCH で原子化する ──
+  // baseline は Job の子プロセスが workspace を変更し得る**前**に durable に保存しなければ
+  // ならない。ここで Job はまだ queued であり、initial-implement 以外の queued Job は
+  // findWorkspaceOwningTaskId() により該当 Task が workspace を保有している扱いになる。
+  // Worker は systemd の flock で単一インスタンス化され、poll loop も単一スレッドのため、
+  // baseline 計算と claim の間に他 Task が workspace を奪うことは無い。
+  // baseline 取得に失敗したら claim せず fail-closed で failed へ落とす（子プロセスを起動しない）。
+  const baseline = computeWorkspaceBaseline(job, job.safeCommand.workingDir)
+  if (!baseline.ok) {
+    const message = `workspace baseline failure: ${baseline.reason}`
+    console.error(`[Worker] Job ${job.id} の開始を停止します: ${message}`)
+    // queued -> failed は Worker FSM 上には無い遷移のため assertTransition は通さない。
+    // API 側の Result State Application Policy は queued からの terminal 直行を許可しており、
+    // この PATCH は受理される。Outbox-durable な既存 terminal 経路で永続化する。
+    const failedPayload: JobUpdate = {
+      status: 'failed',
+      stderr: message,
+      completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    }
+    await persistTerminalUpdate(job.id, failedPayload, dependencies)
+    return false
+  }
+
   const runningPayload: JobUpdate = {
     status: 'running',
     startedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    workspaceBaseline: baseline.baseline,
   }
   const confirmed = await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload)
   if (confirmed) return true

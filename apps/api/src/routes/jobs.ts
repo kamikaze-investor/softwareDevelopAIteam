@@ -135,6 +135,29 @@ const UpdateJobBody = z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
   }).strict().optional(),
+  workspaceBaseline: z.discriminatedUnion('mode', [
+    z.object({
+      mode: z.literal('clean'),
+      startCommitHash: z.string(),
+    }).strict(),
+    z.object({
+      mode: z.literal('dirty'),
+      startCommitHash: z.string(),
+      entries: z.array(z.object({
+        path: z.string(),
+        oldPath: z.string().optional(),
+        kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+        xyStatus: z.string(),
+        beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        beforeMode: z.string().optional(),
+        afterMode: z.string().optional(),
+        headHash: z.string().optional(),
+        indexHash: z.string().optional(),
+        worktreeHash: z.string(),
+      })).min(1),
+    }).strict(),
+  ]).optional(),
   reviewResult: StructuredReviewResultSchema.optional(),
 }).strict()
 
