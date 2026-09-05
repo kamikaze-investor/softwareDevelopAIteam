@@ -1749,8 +1749,11 @@ function isIntentionallyDirtyJob(job: Job): boolean {
  * - 削除パス・rename 元のパスは fingerprint どおり明示的な不在マーカー（`:absent:`）を
  *   持ち、復旧時の完全一致比較から欠落しないよう、エントリとして残す。
  * - rename は「rename 元（absent）」と「rename 先（現内容 hash）」の2エントリになる。
+ *
+ * PR-C Tranche 4: 復旧側（workspaceVerification）はこの正規化関数を再利用し、
+ * admission 側の baseline と**同一の** entry 表現で現在の dirty 状態を再構築する。
  */
-function buildBaselineEntries(
+export function buildBaselineEntries(
   manifest: ChangeManifest,
   fingerprints: Map<string, string>,
 ): JobWorkspaceBaselineEntry[] {

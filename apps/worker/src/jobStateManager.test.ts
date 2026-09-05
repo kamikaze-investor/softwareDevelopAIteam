@@ -8,8 +8,37 @@ import {
 
 const fetchMock = vi.fn<typeof fetch>()
 
+const workspaceVerificationMocks = vi.hoisted(() => ({
+  verifyWorkspaceAgainstBaseline: vi.fn(),
+}))
+
+const notifierMocks = vi.hoisted(() => ({
+  sendAlert: vi.fn(),
+}))
+
+vi.mock('./workspaceVerification.js', () => workspaceVerificationMocks)
+vi.mock('./notifier/notifier.js', () => notifierMocks)
+
+import { verifyWorkspaceAgainstBaseline } from './workspaceVerification.js'
+import { sendAlert } from './notifier/notifier.js'
+
+const WORKING_DIR = '/workspace/target'
+
+function runningJob(id: string): Record<string, unknown> {
+  return {
+    id,
+    status: 'running',
+    taskId: 'task 1',
+    projectId: 'project 1',
+    safeCommand: { workingDir: WORKING_DIR },
+  }
+}
+
 beforeEach(() => {
   fetchMock.mockReset()
+  workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReset()
+  notifierMocks.sendAlert.mockReset()
+  notifierMocks.sendAlert.mockResolvedValue([])
   vi.stubGlobal('fetch', fetchMock)
   vi.spyOn(console, 'log').mockImplementation(() => {})
 })
@@ -148,12 +177,14 @@ describe('reconcileRunningJob', () => {
 
 describe('recoverStaleJobs', () => {
   it('reconciliationで実際にrunningからfailedへ遷移したJobだけを回収件数へ加算する', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
+
     fetchMock
       .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
       .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
       .mockResolvedValueOnce(jsonResponse([
-        { id: 'job-running', status: 'running' },
-        { id: 'job-raced', status: 'running' },
+        runningJob('job-running'),
+        runningJob('job-raced'),
       ]))
       .mockResolvedValueOnce(jsonResponse({
         updated: true,
@@ -199,7 +230,270 @@ describe('recoverStaleJobs', () => {
     expect(JSON.parse(String(updateOptions?.body))).toMatchObject({
       stderr: '[Worker] 前回の Worker が異常終了したため failed にリセットしました',
       completedAt: expect.any(String),
+      workspaceVerified: true,
     })
+  })
+
+  it('clean baseline + clean tree + matching HEAD => workspaceVerified:true を送信する', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
+    const job = {
+      ...runningJob('job-clean'),
+      workspaceBaseline: { mode: 'clean', startCommitHash: 'abc123' },
+    }
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([job]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'failed',
+        job: { id: 'job-clean', status: 'failed' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(1)
+    expect(verifyWorkspaceAgainstBaseline).toHaveBeenCalledWith(
+      WORKING_DIR,
+      { mode: 'clean', startCommitHash: 'abc123' },
+    )
+    const patchCall = fetchMock.mock.calls[3]
+    const body = JSON.parse(String(patchCall?.[1]?.body))
+    expect(body.workspaceVerified).toBe(true)
+    expect(body.quarantineReason).toBeUndefined()
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+  })
+
+  it('HEAD moved but tree clean => workspaceVerified:false（reason付き）を送信し、CRITICAL alert を出す', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'HEAD moved since job start (expected abc123, now def456)',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([runningJob('job-moved')]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-moved', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    const patchCall = fetchMock.mock.calls[3]
+    expect(patchCall?.[0]).toBe('http://api.test/api/jobs/job-moved/fail-if-running')
+    const body = JSON.parse(String(patchCall?.[1]?.body))
+    expect(body.workspaceVerified).toBe(false)
+    expect(body.quarantineReason).toContain('HEAD moved since job start')
+    expect(body.failureMetadata).toBeUndefined()
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({
+      severity: 'critical',
+      sourceType: 'workspace_quarantine',
+      sourceId: 'job-moved',
+    }))
+  })
+
+  it('git operation marker present => NOT verified', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'in-progress git operation detected (index.lock)',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([runningJob('job-gitmarker')]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-gitmarker', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    const body = JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))
+    expect(body.workspaceVerified).toBe(false)
+    expect(body.quarantineReason).toContain('in-progress git operation')
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('missing baseline => NOT verified', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'workspace baseline is missing (legacy row or crash before the baseline was written)',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ ...runningJob('job-nobaseline'), workspaceBaseline: undefined }]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-nobaseline', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    const body = JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))
+    expect(body.workspaceVerified).toBe(false)
+    expect(body.quarantineReason).toContain('workspace baseline is missing')
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('dirty baseline が完全一致 => verified（workspaceVerified:true）', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
+    const dirtyBaseline = {
+      mode: 'dirty' as const,
+      startCommitHash: 'abc123',
+      entries: [{
+        path: 'src/a.ts',
+        kind: 'modified' as const,
+        xyStatus: ' M',
+        afterType: 'regular' as const,
+        afterMode: '100644',
+        worktreeHash: 'hash1',
+      }],
+    }
+    const job = { ...runningJob('job-dirty'), workspaceBaseline: dirtyBaseline }
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([job]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'failed',
+        job: { id: 'job-dirty', status: 'failed' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(1)
+    expect(verifyWorkspaceAgainstBaseline).toHaveBeenCalledWith(WORKING_DIR, dirtyBaseline)
+    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body)).workspaceVerified).toBe(true)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+  })
+
+  it('dirty baseline が不一致（内容hash変更） => NOT verified', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'dirty entry differs at "src/a.ts": worktreeHash is "newhash" (expected "hashi")',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([runningJob('job-dirty-hash')]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-dirty-hash', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    const body = JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))
+    expect(body.workspaceVerified).toBe(false)
+    expect(body.quarantineReason).toContain('worktreeHash')
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('dirty baseline が不一致（余分なpath） => NOT verified', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'dirty entry count differs (baseline 1, current 2)',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([runningJob('job-dirty-extra')]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-dirty-extra', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body)).workspaceVerified).toBe(false)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('dirty baseline が不一致（path欠落） => NOT verified', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'dirty entry count differs (baseline 2, current 1)',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([runningJob('job-dirty-missing')]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-dirty-missing', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body)).workspaceVerified).toBe(false)
+  })
+
+  it('dirty baseline が不一致（xyStatus変更） => NOT verified', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'dirty entry differs at "src/a.ts": xyStatus is "M " (expected " M")',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([runningJob('job-dirty-xystatus')]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-dirty-xystatus', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body)).workspaceVerified).toBe(false)
+  })
+
+  it('safeCommand.workingDir が無い Job は fail-closed（NOT verified）', async () => {
+    const job = { id: 'job-nodir', status: 'running', taskId: 'task 1', projectId: 'project 1' }
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([job]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'blocked',
+        job: { id: 'job-nodir', status: 'blocked' },
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    expect(verifyWorkspaceAgainstBaseline).not.toHaveBeenCalled()
+    expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))).toMatchObject({
+      workspaceVerified: false,
+    })
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
   })
 })
 

@@ -7,12 +7,22 @@
 
 import type { Job, JobStatus, Project, Task } from '@ai-team/shared'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
+import { verifyWorkspaceAgainstBaseline } from './workspaceVerification.js'
+import { sendAlert } from './notifier/notifier.js'
 
 const RECONCILE_TIMEOUT_MS = 5_000
 
 export interface ReconcileRunningFailure {
   stderr: string
   completedAt: string
+  /**
+   * PR-C Tranche 4: caller が workspace を baseline と完全一致検証できたか。
+   * true のときのみ API は Job を failed（所有権解放）にする。
+   * 省略時は API 側で fail-closed（quarantine / blocked）。
+   */
+  workspaceVerified?: boolean
+  /** workspace を検証できなかった場合の quarantine 理由。 */
+  quarantineReason?: string
 }
 
 export type ReconcileRunningJobResult =
@@ -26,6 +36,12 @@ export type ReconcileRunningJobResult =
       updated: false
       currentStatus?: JobStatus
     }
+
+/**
+ * 復旧処理が Job 一覧から取得するために必要な最小フィールド（PR-C Tranche 4）。
+ * workspace baseline と safeCommand.workingDir を検証に使う。
+ */
+export type RecoverableJob = Pick<Job, 'id' | 'status' | 'taskId' | 'projectId' | 'workspaceBaseline' | 'safeCommand'>
 
 export interface ReconcileRunningJobOptions {
   apiBaseUrl?: string
@@ -134,7 +150,7 @@ export async function recoverStaleJobs(
     if (!tasks) continue
 
     for (const task of tasks) {
-      const jobs = await fetchJson<Pick<Job, 'id' | 'status'>[]>(
+      const jobs = await fetchJson<RecoverableJob[]>(
         `/api/jobs?taskId=${encodeURIComponent(task.id)}`,
         apiBaseUrl,
         headers
@@ -142,19 +158,43 @@ export async function recoverStaleJobs(
       if (!jobs) continue
 
       for (const job of jobs) {
-        if (job.status === 'running') {
-          assertTransition(job.status, 'failed')
-          const reconciliation = await reconcileRunningJob(
-            job.id,
-            {
-              stderr: '[Worker] 前回の Worker が異常終了したため failed にリセットしました',
-              completedAt: new Date().toISOString(),
-            },
-            { apiBaseUrl, headers },
-          )
-          if (reconciliation.outcome === 'reconciled' && reconciliation.updated) {
+        if (job.status !== 'running') continue
+
+        // PR-C Tranche 4: workspace が baseline（Job 開始時点）と完全一致する場合のみ
+        // 所有権を解放（failed 化）できる。不一致・検証不能なら quarantine（blocked）し、
+        // 所有権を保持する。検証は決して throw せず、必ず verified:true / false を返す。
+        const workingDir = job.safeCommand?.workingDir
+        const verification = workingDir
+          ? verifyWorkspaceAgainstBaseline(workingDir, job.workspaceBaseline)
+          : { verified: false as const, reason: 'job has no safeCommand.workingDir; cannot verify workspace' }
+        const workspaceVerified = verification.verified
+        const quarantineReason = workspaceVerified
+          ? undefined
+          : `workspace not verified safe after crash: ${verification.reason}`
+
+        if (!workspaceVerified) {
+          emitWorkspaceQuarantineAlert(job, workingDir ?? '(unknown)', verification.reason)
+        }
+
+        assertTransition(job.status, workspaceVerified ? 'failed' : 'blocked')
+        const reconciliation = await reconcileRunningJob(
+          job.id,
+          {
+            stderr: workspaceVerified
+              ? '[Worker] 前回の Worker が異常終了したため failed にリセットしました'
+              : `[Worker] workspace を検証できなかったため quarantine（blocked）にしました: ${verification.reason}`,
+            completedAt: new Date().toISOString(),
+            workspaceVerified,
+            ...(quarantineReason ? { quarantineReason } : {}),
+          },
+          { apiBaseUrl, headers },
+        )
+        if (reconciliation.outcome === 'reconciled' && reconciliation.updated) {
+          if (workspaceVerified) {
             recovered += 1
-            console.log(`[Recovery] Job ${job.id} を running -> failed にリセット`)
+            console.log(`[Recovery] Job ${job.id} を running -> failed にリセット（workspace verified）`)
+          } else {
+            console.log(`[Recovery] Job ${job.id} を running -> blocked に quarantine（workspace not verified）`)
           }
         }
       }
@@ -162,6 +202,44 @@ export async function recoverStaleJobs(
   }
 
   return recovered
+}
+
+/**
+ * workspace を検証できず quarantine された Job を CEO へ通報する（CRITICAL）。
+ * 既存の notifier（sendAlert）を使い、新しい通知機構は作らない。
+ */
+function emitWorkspaceQuarantineAlert(
+  job: { id: string; taskId: string; projectId: string },
+  workingDir: string,
+  reason: string,
+): void {
+  const payload = {
+    severity: 'critical' as const,
+    title: 'Worker 再起動後に workspace を検証できず quarantine（所有権保持）',
+    body: [
+      '前回の Worker 異常終了後、この Job の workspace がクラッシュ時の baseline と',
+      '完全一致することを検証できませんでした。未検証 workspace へ新しい作業を割り当てないよう、',
+      'Job は blocked に quarantine され、所有権は保持されています。CEO の確認が必要です。',
+      '',
+      `Job: ${job.id}`,
+      `Task: ${job.taskId}`,
+      `Project: ${job.projectId}`,
+      `WorkingDir: ${workingDir}`,
+      `理由: ${reason}`,
+      `検出時刻: ${new Date().toISOString()}`,
+      '',
+      '次のアクション:',
+      'workspace を確認し、必要な場合は修復後に Job を手動で resume してください。',
+    ].join('\n'),
+    sourceType: 'workspace_quarantine',
+    sourceId: job.id,
+  }
+  try {
+    void sendAlert(payload)
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.error(`[Recovery] workspace quarantine CRITICAL通知エラー: ${message}`)
+  }
 }
 
 async function fetchJson<T>(
