@@ -28,6 +28,14 @@ export interface JobFailureMetadata {
   quarantined?: boolean
   /** quarantine の理由（検出された変更差分・git 操作中状態など） */
   quarantineReason?: string
+  /**
+   * PR-C finding 14 修復: workspace が再検証によりクリーンと確認され、quarantine が
+   * 解除された時刻（ISO）。解除は成功した workspace 検証なしには起こらない
+   * （clear-quarantine は verified workspace の提示を強制する）。
+   */
+  quarantineClearedAt?: string
+  /** quarantine が解除された理由（例: startup recovery で workspace が baseline と一致） */
+  quarantineClearedReason?: string
 }
 
 /**

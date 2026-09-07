@@ -10,7 +10,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
@@ -1764,6 +1764,63 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       return resumeTransaction(input.taskId, input.instructionPrompt)
+    },
+    clearWorkspaceQuarantine(input) {
+      const clearTransaction = db.transaction((
+        jobId: string,
+        reason: string | undefined,
+      ): ClearWorkspaceQuarantineResult => {
+        const target = jobs.findById(jobId)
+        if (!target) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+
+        // このTaskの**任意の**未解除quarantine Jobを解除する（resumeBlockedTask /
+        // isWorkspaceQuarantined が「いずれかのquarantine Job」で判定するため）。
+        // 既に解除済みなら冪等に成功する（clearedJobCount:0 / alreadyCleared:true）。
+        const taskJobs = jobs.findByTaskId(target.taskId)
+        const quarantinedJobs = taskJobs.filter((job) => job.failureMetadata?.quarantined === true)
+        if (quarantinedJobs.length === 0) {
+          return {
+            ok: true,
+            job: target,
+            clearedJobCount: 0,
+            alreadyCleared: true,
+          }
+        }
+
+        const clearedAt = now()
+        for (const quarantined of quarantinedJobs) {
+          const metadata = quarantined.failureMetadata ?? {}
+          jobs.update(quarantined.id, {
+            failureMetadata: {
+              ...metadata,
+              quarantined: false,
+              // 解除を「削除」ではなく「記録」する。履歴が残り、監査できる。
+              quarantineClearedAt: clearedAt,
+              ...(reason !== undefined ? { quarantineClearedReason: reason } : {}),
+            },
+          })
+        }
+
+        const final = jobs.findById(jobId)!
+        return {
+          ok: true,
+          job: final,
+          clearedJobCount: quarantinedJobs.length,
+          alreadyCleared: false,
+        }
+      })
+
+      try {
+        return clearTransaction(input.jobId, input.reason)
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
     },
   }
 

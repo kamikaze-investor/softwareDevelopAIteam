@@ -1148,6 +1148,172 @@ describe('Job API', () => {
     })
   })
 
+  describe('PATCH /api/jobs/:id/clear-quarantine', () => {
+    async function quarantineJob(app: FastifyInstance, jobId: string): Promise<void> {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${jobId}`,
+        payload: { status: 'running' },
+      })
+      expect(res.statusCode).toBe(200)
+      const quarantine = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${jobId}/fail-if-running`,
+        payload: {
+          workspaceVerified: false,
+          stderr: 'crash without verification',
+          completedAt: '2026-08-08T01:02:03.000Z',
+          quarantineReason: 'workspace dirty after crash',
+        },
+      })
+      expect(quarantine.statusCode).toBe(200)
+      expect(parseBody<{ currentStatus: Job['status'] }>(quarantine.body).currentStatus).toBe('blocked')
+    }
+
+    it('clears quarantine when a successful workspace verification is presented, and records it', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const created = await createJob(app, task)
+        await quarantineJob(app, created.id)
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${created.id}/clear-quarantine`,
+          payload: {
+            workspaceVerified: true,
+            quarantineClearedReason: 'startup recovery: workspace verified clean',
+          },
+        })
+
+        expect(res.statusCode).toBe(200)
+        const body = parseBody<{
+          cleared: boolean
+          clearedJobCount: number
+          alreadyCleared: boolean
+          job: Job
+        }>(res.body)
+        expect(body).toMatchObject({ cleared: true, clearedJobCount: 1, alreadyCleared: false })
+        expect(body.job.failureMetadata).toMatchObject({
+          quarantined: false,
+          quarantineClearedAt: expect.any(String),
+          quarantineClearedReason: 'startup recovery: workspace verified clean',
+        })
+      })
+    })
+
+    it('rejects clearance when the verification result is explicitly NOT successful (no bypass)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const created = await createJob(app, task)
+        await quarantineJob(app, created.id)
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${created.id}/clear-quarantine`,
+          payload: { workspaceVerified: false, quarantineClearedReason: 'someone insisted' },
+        })
+
+        expect(res.statusCode).toBe(400)
+        // quarantine は解除されていない
+        const fetched = await app.inject({ method: 'GET', url: `/api/jobs/${created.id}` })
+        expect(parseBody<Job>(fetched.body).failureMetadata?.quarantined).toBe(true)
+      })
+    })
+
+    it('rejects clearance when no verification result is carried at all', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const created = await createJob(app, task)
+        await quarantineJob(app, created.id)
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${created.id}/clear-quarantine`,
+          payload: {},
+        })
+
+        expect(res.statusCode).toBe(400)
+      })
+    })
+
+    it('is idempotent: a second clearance reports alreadyCleared and preserves the recorded state', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const created = await createJob(app, task)
+        await quarantineJob(app, created.id)
+
+        const first = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${created.id}/clear-quarantine`,
+          payload: { workspaceVerified: true },
+        })
+        expect(first.statusCode).toBe(200)
+        expect(parseBody<{ clearedJobCount: number }>(first.body).clearedJobCount).toBe(1)
+
+        const afterFirst = await app.inject({ method: 'GET', url: `/api/jobs/${created.id}` })
+
+        const second = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${created.id}/clear-quarantine`,
+          payload: { workspaceVerified: true },
+        })
+        expect(second.statusCode).toBe(200)
+        const secondBody = parseBody<{ clearedJobCount: number; alreadyCleared: boolean }>(second.body)
+        expect(secondBody).toMatchObject({ clearedJobCount: 0, alreadyCleared: true })
+
+        const afterSecond = await app.inject({ method: 'GET', url: `/api/jobs/${created.id}` })
+        expect(parseBody<Job>(afterFirst.body).failureMetadata)
+          .toEqual(parseBody<Job>(afterSecond.body).failureMetadata)
+      })
+    })
+
+    it('clears every quarantined Job of the Task, not just the addressed one', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const first = await createJob(app, task)
+        const second = await createJob(app, task)
+        await quarantineJob(app, first.id)
+
+        // 同一Taskに2本目のquarantine Job（any-Job gate の検証に必要）
+        const { getStorage } = await import('../storage/index.js')
+        getStorage().jobs.update(second.id, {
+          failureMetadata: { quarantined: true, quarantineReason: 'sibling quarantine' },
+        })
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${first.id}/clear-quarantine`,
+          payload: { workspaceVerified: true },
+        })
+        expect(res.statusCode).toBe(200)
+        expect(parseBody<{ clearedJobCount: number }>(res.body).clearedJobCount).toBe(2)
+
+        for (const job of [first, second]) {
+          const fetched = await app.inject({ method: 'GET', url: `/api/jobs/${job.id}` })
+          expect(parseBody<Job>(fetched.body).failureMetadata?.quarantined).not.toBe(true)
+        }
+      })
+    })
+
+    it('returns 404 for a missing Job', async () => {
+      await withApp(async (app) => {
+        const res = await app.inject({
+          method: 'PATCH',
+          url: '/api/jobs/missing-job/clear-quarantine',
+          payload: { workspaceVerified: true },
+        })
+
+        expect(res.statusCode).toBe(404)
+        expect(parseBody<{ error: string }>(res.body).error).toBe('Job not found')
+      })
+    })
+  })
+
   it('PATCH /api/jobs/:id updates exitCode', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

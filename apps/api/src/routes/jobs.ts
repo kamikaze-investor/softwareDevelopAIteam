@@ -180,6 +180,21 @@ const FailIfRunningJobBody = z.object({
   payloadHash: z.string().min(1).optional(),
 }).strict()
 
+/**
+ * PR-C finding 14 修復: quarantine 解除（clearance）のボディ。
+ *
+ * `workspaceVerified` は `z.literal(true)` で**必ず true を強制**する。false・欠落・
+ * その他の値はすべて 400 で拒否される。つまり、成功した workspace 検証の提示なしには
+ * quarantine は絶対に解除できない（bypass / force / admin 経路は存在しない）。
+ * 検証そのものは workspace へ filesystem アクセスできる Worker が
+ * `verifyWorkspaceAgainstBaseline` で行い、その成功結果を提示する。
+ */
+const ClearQuarantineJobBody = z.object({
+  workspaceVerified: z.literal(true),
+  /** 解除理由（startup recovery で baseline と一致、等）。failure_metadata に記録される。 */
+  quarantineClearedReason: z.string().optional(),
+}).strict()
+
 const ListQuerySchema = z.object({
   taskId: z.string().min(1),
 })
@@ -387,6 +402,39 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       body.outbox = { eventId: outboxCheck.outboxEvent.eventId, deduplicated: true }
     }
     return reply.send(body)
+  })
+
+  // PR-C finding 14 修復: quarantine 解除（clearance）。
+  // 解除は「成功した workspace 検証の提示」なしには成立しない（ClearQuarantineJobBody が
+  // workspaceVerified:true を強制）。人力・force・admin による無条件解除経路は無い。
+  app.patch<{ Params: { id: string } }>('/:id/clear-quarantine', async (req, reply) => {
+    const result = ClearQuarantineJobBody.safeParse(req.body)
+    if (!result.success) {
+      // 検証成功の提示が無い限り拒否。無条件・無検証の解除経路を作らない。
+      return reply.status(400).send({
+        error: 'Clearance requires a successful workspace verification (workspaceVerified must be true)',
+        details: result.error.format(),
+      })
+    }
+
+    const transition = storage.jobs.clearWorkspaceQuarantine({
+      jobId: req.params.id,
+      reason: result.data.quarantineClearedReason,
+    })
+    if (!transition.ok) {
+      if (transition.code === 'STORAGE_ERROR') {
+        req.log.error({ jobId: req.params.id, reason: transition.reason }, 'clear-quarantine storage failure')
+        return reply.status(500).send({ error: transition.reason })
+      }
+      return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    return reply.send({
+      cleared: true,
+      job: transition.job,
+      clearedJobCount: transition.clearedJobCount,
+      alreadyCleared: transition.alreadyCleared,
+    })
   })
 
   app.patch<{ Params: { id: string } }>('/:id', async (req, reply) => {

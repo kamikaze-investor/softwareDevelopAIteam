@@ -495,6 +495,80 @@ describe('recoverStaleJobs', () => {
     })
     expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
   })
+
+  it('startup recovery clears a previously quarantined Job whose workspace now verifies clean', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
+    const quarantinedJob = {
+      id: 'job-quarantined',
+      status: 'blocked',
+      taskId: 'task 1',
+      projectId: 'project 1',
+      safeCommand: { workingDir: WORKING_DIR },
+      workspaceBaseline: { mode: 'clean', startCommitHash: 'abc123' },
+      failureMetadata: { quarantined: true, quarantineReason: 'workspace not verified safe after crash' },
+    }
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([quarantinedJob]))
+      .mockResolvedValueOnce(jsonResponse({
+        cleared: true,
+        clearedJobCount: 1,
+        alreadyCleared: false,
+      }))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    expect(verifyWorkspaceAgainstBaseline).toHaveBeenCalledWith(
+      WORKING_DIR,
+      { mode: 'clean', startCommitHash: 'abc123' },
+    )
+    const clearCall = fetchMock.mock.calls[3]
+    expect(clearCall?.[0]).toBe('http://api.test/api/jobs/job-quarantined/clear-quarantine')
+    expect(clearCall?.[1]).toMatchObject({
+      method: 'PATCH',
+      headers: {
+        authorization: 'Bearer token',
+        'Content-Type': 'application/json',
+      },
+    })
+    const body = JSON.parse(String(clearCall?.[1]?.body))
+    expect(body.workspaceVerified).toBe(true)
+    expect(body.quarantineClearedReason).toContain('startup recovery: workspace verified clean')
+    // 再検証は alert を再送しない（CRITICAL は対象外）
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+  })
+
+  it('startup recovery leaves a still-unverified quarantined Job alone (no clearance request, no duplicate alert)', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({
+      verified: false,
+      reason: 'HEAD moved since job start (expected abc123, now def456)',
+    })
+    const quarantinedJob = {
+      id: 'job-quarantined-bad',
+      status: 'blocked',
+      taskId: 'task 1',
+      projectId: 'project 1',
+      safeCommand: { workingDir: WORKING_DIR },
+      workspaceBaseline: { mode: 'clean', startCommitHash: 'abc123' },
+      failureMetadata: { quarantined: true, quarantineReason: 'workspace not verified safe after crash' },
+    }
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([quarantinedJob]))
+
+    const recovered = await recoverStaleJobs('http://api.test', { authorization: 'Bearer token' })
+
+    expect(recovered).toBe(0)
+    // clear-quarantine への要求は一切送らない（検証成功なしでは解除を申請しない）
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('clear-quarantine'))).toBe(false)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+  })
 })
 
 function jsonResponse(data: unknown): Response {

@@ -21,6 +21,31 @@ export type ResumeBlockedTaskResult =
       reason: string
     }
 
+/**
+ * PR-C finding 14 修復: quarantine 解除（clearance）の結果。
+ *
+ * clearance は **決して自動的に成立しない**。呼び出し元（Worker）が workspace を
+ * baseline と完全一致検証に成功し、それを提示した場合にのみ API が受理する
+ * （route 側で `workspaceVerified: true` を強制する。bypass / force / admin は無い）。
+ *
+ * この Task の**任意の** quarantine Job を解除して `resumeBlockedTask` が再開できるようにする。
+ * `alreadyCleared:true` は2回目以降の呼び出し（冪等）を示す。
+ */
+export type ClearWorkspaceQuarantineResult =
+  | {
+      ok: true
+      job: Job
+      /** 今回解除した quarantine Job の件数（既に解除済みだと 0）。 */
+      clearedJobCount: number
+      /** 呼び出し時点で既に quarantine が解除されていた場合 true（冪等）。 */
+      alreadyCleared: boolean
+    }
+  | {
+      ok: false
+      code: 'JOB_NOT_FOUND' | 'STORAGE_ERROR'
+      reason: string
+    }
+
 export type AdvanceWorkflowJobResult =
   | { ok: true; job: Job; nextJob: Job; nextJobCreated: boolean; deduplicated?: boolean }
   | {
@@ -288,6 +313,18 @@ export interface IJobStorage {
     taskId: string
     instructionPrompt: string
   }): ResumeBlockedTaskResult
+  /**
+   * PR-C finding 14 修復: quarantine を解除する（単一transaction・冪等）。
+   *
+   * route / route guard 側で「成功した workspace 検証の提示」を強制してから呼ばれる。
+   * 人力・force・admin による無条件解除経路は存在しない。解除は検証の成功をもってのみ
+   * 成立する（earned, never asserted）。
+   */
+  clearWorkspaceQuarantine(input: {
+    jobId: string
+    /** 解除理由（startup recovery 等）。failure_metadata に記録される。 */
+    reason?: string
+  }): ClearWorkspaceQuarantineResult
 }
 
 export interface IApprovalStorage {

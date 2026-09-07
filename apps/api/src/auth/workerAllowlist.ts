@@ -20,6 +20,7 @@ export const WORKER_ALLOWLIST: readonly WorkerAllowlistEntry[] = [
   { method: 'GET', url: '/api/jobs' },
   { method: 'PATCH', url: '/api/jobs/:id' },
   { method: 'PATCH', url: '/api/jobs/:id/fail-if-running' },
+  { method: 'PATCH', url: '/api/jobs/:id/clear-quarantine' },
   { method: 'GET', url: '/api/permission-grants' },
   { method: 'PATCH', url: '/api/permission-grants/:id/use' },
   { method: 'POST', url: '/api/gate/check' },

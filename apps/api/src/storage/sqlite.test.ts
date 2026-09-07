@@ -1943,6 +1943,118 @@ describe('SQLiteStorage', () => {
         expect(storage.designReviewRuns.findQueued()).toEqual([])
       })
 
+      describe('clearWorkspaceQuarantine', () => {
+        it('clears quarantine, records the clearance in failure_metadata, and makes resumeBlockedTask succeed', () => {
+          const job = createRunningJob()
+          storage.jobs.failAndPrepareRepair({
+            jobId: job.id,
+            failure: { stderr: 'crash without verification', completedAt: '2026-08-08T01:02:03.000Z' },
+            workspaceVerified: false,
+            quarantineReason: 'workspace dirty after crash',
+          })
+          expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+
+          // clearance 前は resume 拒否（既存の fail-closed 不変条件が保たれる）
+          const refusedBefore = storage.jobs.resumeBlockedTask({
+            taskId,
+            instructionPrompt: 'try again please',
+          })
+          expect(refusedBefore.ok).toBe(false)
+          if (!refusedBefore.ok) expect(refusedBefore.code).toBe('WORKSPACE_QUARANTINED')
+
+          // resume 成功には instruction prompt と一致する Design Review evidence が必要
+          const instructionPrompt = 'retry after the workspace verified clean'
+          storage.designReviewEvidence.create({
+            taskId,
+            designTextHash: computeDesignTextHash(instructionPrompt),
+            reviewLoad: 'medium',
+            decision: 'ALIGNED',
+            independentReviewRequired: false,
+          })
+
+          const cleared = storage.jobs.clearWorkspaceQuarantine({
+            jobId: job.id,
+            reason: 'startup recovery: workspace verified clean',
+          })
+          expect(cleared).toMatchObject({ ok: true, clearedJobCount: 1, alreadyCleared: false })
+          if (cleared.ok) {
+            // 解除は「削除」ではなく failure_metadata への「記録」として残る
+            expect(cleared.job.failureMetadata).toMatchObject({
+              quarantined: false,
+              quarantineClearedAt: expect.any(String),
+              quarantineClearedReason: 'startup recovery: workspace verified clean',
+            })
+          }
+
+          // 解除後は resume が正常に成功する
+          const resumed = storage.jobs.resumeBlockedTask({ taskId, instructionPrompt })
+          expect(resumed.ok).toBe(true)
+          if (resumed.ok) {
+            expect(resumed.job).toMatchObject({ taskId, status: 'queued' })
+          }
+        })
+
+        it('is idempotent: a second clearance changes nothing and reports alreadyCleared', () => {
+          const job = createRunningJob()
+          storage.jobs.failAndPrepareRepair({
+            jobId: job.id,
+            failure: { stderr: 'crash without verification', completedAt: '2026-08-08T01:02:03.000Z' },
+            workspaceVerified: false,
+          })
+
+          const first = storage.jobs.clearWorkspaceQuarantine({ jobId: job.id })
+          expect(first.ok).toBe(true)
+          if (first.ok) {
+            expect(first.clearedJobCount).toBe(1)
+            expect(first.alreadyCleared).toBe(false)
+          }
+          const metadataAfterFirst = storage.jobs.findById(job.id)?.failureMetadata
+
+          const second = storage.jobs.clearWorkspaceQuarantine({ jobId: job.id })
+          expect(second.ok).toBe(true)
+          if (second.ok) {
+            expect(second.clearedJobCount).toBe(0)
+            expect(second.alreadyCleared).toBe(true)
+            // 状態を一切書き換えない
+            expect(second.job.failureMetadata).toEqual(metadataAfterFirst)
+          }
+          expect(storage.jobs.findById(job.id)?.failureMetadata).toEqual(metadataAfterFirst)
+        })
+
+        it('clears every quarantined Job of the Task (resumeBlockedTask gates on ANY quarantined Job)', () => {
+          const first = createRunningJob()
+          const second = createRunningJob()
+          storage.jobs.failAndPrepareRepair({
+            jobId: first.id,
+            failure: { stderr: 'crash without verification', completedAt: '2026-08-08T01:02:03.000Z' },
+            workspaceVerified: false,
+          })
+          // 同一Taskに2本目のquarantine Jobが存在する状況を再現する
+          // （F9 guardによりfail-and-prepareでは2本目をquarantine不可のため、直接metadataを設定）
+          storage.jobs.update(second.id, {
+            failureMetadata: { quarantined: true, quarantineReason: 'sibling quarantine' },
+          })
+          expect(
+            storage.jobs.findByTaskId(taskId).filter((job) => job.failureMetadata?.quarantined === true),
+          ).toHaveLength(2)
+
+          const cleared = storage.jobs.clearWorkspaceQuarantine({ jobId: first.id })
+          expect(cleared.ok).toBe(true)
+          if (cleared.ok) {
+            expect(cleared.clearedJobCount).toBe(2)
+            expect(cleared.alreadyCleared).toBe(false)
+          }
+          expect(
+            storage.jobs.findByTaskId(taskId).some((job) => job.failureMetadata?.quarantined === true),
+          ).toBe(false)
+        })
+
+        it('returns JOB_NOT_FOUND for a missing Job', () => {
+          const cleared = storage.jobs.clearWorkspaceQuarantine({ jobId: 'missing-job' })
+          expect(cleared).toEqual({ ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' })
+        })
+      })
+
     })
 
     it('enforces one Job per non-NULL approval_id with the unique index', () => {
