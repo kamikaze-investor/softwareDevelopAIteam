@@ -498,7 +498,11 @@ describe('PR-C workspace baseline（porcelain v2 object id 保持 / fingerprint�
     expect(change?.afterType).toBe('regular')
     expect(change?.headHash).toBeDefined()
     expect(change?.indexHash).toBeDefined()
-    expect(change?.xyStatus).toBe('M.')
+    // index 列が 'M' = staged な mode 変更が記録されていること。これがこのテストの主眼。
+    // worktree 列はプラットフォーム依存: Windows は exec-bit を追跡しないため '.'、
+    // Linux では index(100755) と作業ファイル(100644) が食い違うため 'M' になる。
+    // 固定の 'M.' を期待すると Linux CI で落ちるので、index 列だけを pin する。
+    expect(change?.xyStatus?.[0]).toBe('M')
   })
 
   it('fingerprintWorktreeEntries: 同一内容は同一 hash、変更で hash が変わる', () => {
