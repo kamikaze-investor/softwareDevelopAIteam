@@ -16,7 +16,6 @@
  *     8. M-4対策: provider=codex のとき CLI実行後に lint を自動実行
  */
 
-import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, existsSync, unlinkSync } from 'node:fs'
 import path from 'node:path'
@@ -31,6 +30,10 @@ import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning,
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 import { buildTargetCommandEnv } from '../utils/safeEnv.js'
 import { buildWorktreeManifest } from '../guards/changeManifest.js'
+import {
+  isContainmentInfrastructureError,
+  runContainedOrThrow,
+} from '../execution/runContainedCommand.js'
 import { saveJobLogs } from '../jobLogger.js'
 
 // ────────────────────────────────────────────────────────────
@@ -119,6 +122,23 @@ export interface IAiCliAdapter {
 
 interface CodexLastMessageRequest extends AiCliRequest {
   codexOutputLastMessagePath?: string
+}
+
+/**
+ * containment cgroup の識別子。
+ * `AiCliRequest` は元々 Job ID を持たないため、渡されていれば jobId、無ければ taskId を使う。
+ * cgroup 名の一意性は attemptId 側で担保する。
+ */
+function containmentId(request: AiCliRequest): string {
+  return request.jobId ?? request.taskId
+}
+
+let containmentAttemptCounter = 0
+
+/** cgroup ディレクトリを決して再利用しないための、プロセス内で単調な試行 ID */
+function nextAttemptId(label: string): string {
+  containmentAttemptCounter += 1
+  return `${label}-${process.pid}-${containmentAttemptCounter}`
 }
 
 // ────────────────────────────────────────────────────────────
@@ -238,23 +258,37 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     let parsedOutputFromLastMessage: Record<string, unknown> | undefined
 
     try {
-      stdout = execFileSync(exe, [...prefixArgs, ...argv], {
-        cwd: request.workingDir,
-        shell: false,           // ⚠️ シェルを経由しない（インジェクション防止）
-        timeout,
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
+      // P1 Phase 2: AI CLI は子孫を fork し得るため per-job cgroup へ封じ込めて実行する。
+      // containment が安全と証明できなかった場合は ContainmentInfrastructureError が飛び、
+      // 下の catch では吸収せず再 throw する（通常の provider 失敗と混同してはならない）。
+      const contained = await runContainedOrThrow({
+        jobId: containmentId(request),
+        attemptId: nextAttemptId('ai-cli'),
+        argv: [exe, ...prefixArgs, ...argv],
+        cwd: request.workingDir,      // ⚠️ シェルを経由しない（インジェクション防止）
         env: buildSafeEnv(request.provider),
-        ...(stdinInput !== undefined ? { input: stdinInput } : {}),
+        timeoutMs: timeout,
+        input: stdinInput,
       })
+      stdout = contained.stdout
+      if (contained.exitCode === 0) {
+        stderr = contained.stderr
+      } else {
+        // execFileSync は非ゼロ終了で throw していたので、同じ分類をここで再現する。
+        exitCode = contained.exitCode ?? 1
+        stderr = contained.stderr
+        // timeout は cgroup.kill（SIGKILL）で起きるため signal 名では判定できない。
+        // containment が観測した timedOut を唯一の真実として使う。
+        if (contained.timedOut) providerFailureKind = 'provider_timeout'
+        // task-024: タイムアウト・APIエラーを分類
+        isTimeoutError = contained.timedOut || stderr.includes('ETIMEDOUT')
+        isApiError = exitCode >= 500 || stderr.includes('API Error') || stderr.includes('5xx')
+      }
     } catch (err: any) {
+      if (isContainmentInfrastructureError(err)) throw err
       exitCode = typeof err.status === 'number' ? err.status : 1
       stdout   = typeof err.stdout === 'string' ? err.stdout : ''
       stderr   = typeof err.stderr === 'string' ? err.stderr : String(err)
-      const isStructuredTimeout =
-        err.code === 'ETIMEDOUT' && err.status === null && err.signal === 'SIGTERM'
-      if (isStructuredTimeout) providerFailureKind = 'provider_timeout'
-      // task-024: タイムアウト・APIエラーを分類
       isTimeoutError = err.signal === 'SIGTERM' || (err.code === 'ETIMEDOUT') || stderr.includes('ETIMEDOUT')
       isApiError = exitCode >= 500 || stderr.includes('API Error') || stderr.includes('5xx')
     } finally {
@@ -286,7 +320,8 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     // postLint が明示的に false の場合のみスキップ。
     const shouldPostLint = request.provider === 'codex' && request.postLint !== false
     if (shouldPostLint && changedFiles.length > 0) {
-      runPostLint(request.workingDir)
+      // P1 Phase 2: await を落とすと containment 完了前に次へ進む（floating promise）。
+      await runPostLint(request.workingDir, containmentId(request))
     }
 
     // ── サマリー抽出（JSON出力があれば） ───────────────────
@@ -308,16 +343,18 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
         const retryInput = this.useStdinPrompt() ? retryPromptText : undefined
         let retryStdout = ''
         try {
-          retryStdout = execFileSync(exe, [...prefixArgs, ...retryArgv], {
+          const contained = await runContainedOrThrow({
+            jobId: containmentId(request),
+            attemptId: nextAttemptId(`ai-cli-retry-${retryCount}`),
+            argv: [exe, ...prefixArgs, ...retryArgv],
             cwd: request.workingDir,
-            shell: false,
-            timeout,
-            encoding: 'utf-8',
-            stdio: ['pipe', 'pipe', 'pipe'],
             env: buildSafeEnv(request.provider),
-            ...(retryInput !== undefined ? { input: retryInput } : {}),
+            timeoutMs: timeout,
+            input: retryInput,
           })
+          retryStdout = contained.stdout
         } catch (err: any) {
+          if (isContainmentInfrastructureError(err)) throw err
           retryStdout = typeof err.stdout === 'string' ? err.stdout : ''
         }
         parsedOutput = tryParseJson(retryStdout)
@@ -478,18 +515,23 @@ Repository Boundary:
  * Codex実行後のlint自動実行（Rule-001 M-4）
  * スタイル不一致を自動修正する。失敗しても実行は継続する（non-fatal）。
  */
-function runPostLint(workingDir: string): void {
+async function runPostLint(workingDir: string, jobId: string): Promise<void> {
   try {
     const pnpmPath = resolvePnpmPath()
     const { exe, prefixArgs } = resolveWindowsExe(pnpmPath)
-    execFileSync(exe, [...prefixArgs, 'lint', '--fix'], {
+    // P1 Phase 2: pnpm の lifecycle script は子孫を fork し得るため封じ込める。
+    await runContainedOrThrow({
+      jobId,
+      attemptId: nextAttemptId('post-lint'),
+      argv: [exe, ...prefixArgs, 'lint', '--fix'],
       cwd: workingDir,
-      shell: false,
-      encoding: 'utf-8',
-      timeout: 60_000,  // 1分
       env: buildTargetCommandEnv(),
+      timeoutMs: 60_000,  // 1分
     })
   } catch (err) {
+    // containment の失敗だけは non-fatal 扱いにしない。lint を諦めることと、
+    // workspace に生き残ったプロセスがいるかもしれないことは別問題である。
+    if (isContainmentInfrastructureError(err)) throw err
     // lint失敗は警告のみ（ブロックしない）
     // lint結果はFile Change Guard + Meta Reviewer AIが後から確認する
     const code = (err as NodeJS.ErrnoException).code ?? 'unknown'

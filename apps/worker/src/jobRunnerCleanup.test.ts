@@ -11,9 +11,15 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { buildWorktreeManifest } from './guards/changeManifest.js'
 import { revertBlockedJobChanges } from './jobRunner.js'
+
+
+vi.mock('./execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('./execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
 
 let repo: string
 
@@ -46,7 +52,7 @@ afterEach(() => {
 })
 
 describe('revertBlockedJobChanges', () => {
-  it('blocked Job が作った変更を取り消し、working tree を Job 開始時点まで戻す', () => {
+  it('blocked Job が作った変更を取り消し、working tree を Job 開始時点まで戻す', async () => {
     const startCommitHash = headHash()
 
     // "Job A": 既存ファイルを変更し、新規ファイルを作成する（範囲外の変更を想定）。
@@ -56,7 +62,7 @@ describe('revertBlockedJobChanges', () => {
     const manifest = buildWorktreeManifest(repo)
     expect(manifest.paths.sort()).toEqual(['base.txt', 'out-of-scope.txt'])
 
-    const note = revertBlockedJobChanges(repo, startCommitHash, manifest, [])
+    const note = await revertBlockedJobChanges(repo, startCommitHash, manifest, [])
 
     expect(note).toBeUndefined()
     expect(git('status', '--porcelain').trim()).toBe('')
@@ -64,13 +70,13 @@ describe('revertBlockedJobChanges', () => {
     expect(existsSync(path.join(repo, 'out-of-scope.txt'))).toBe(false)
   })
 
-  it('Job A の残置が無いため、直後の Job B は自分の変更だけを見る（汚染しない）', () => {
+  it('Job A の残置が無いため、直後の Job B は自分の変更だけを見る（汚染しない）', async () => {
     const startCommitHash = headHash()
 
     write('base.txt', 'modified by job A\n')
     write('out-of-scope.txt', 'created by job A\n')
     const jobAManifest = buildWorktreeManifest(repo)
-    revertBlockedJobChanges(repo, startCommitHash, jobAManifest, [])
+    await revertBlockedJobChanges(repo, startCommitHash, jobAManifest, [])
 
     // "Job B": Job A とは無関係な別ファイルだけを変更する。
     write('job-b.txt', 'created by job B\n')
@@ -79,7 +85,7 @@ describe('revertBlockedJobChanges', () => {
     expect(jobBManifest.paths).toEqual(['job-b.txt'])
   })
 
-  it('Job開始前から存在した無関係な未commit変更には一切触れない', () => {
+  it('Job開始前から存在した無関係な未commit変更には一切触れない', async () => {
     // Job 開始前から既に dirty な状態（他の作業や以前のセッションの残置を想定）。
     write('pre-existing.txt', 'pre-existing dirty content\n')
     const preExistingManifest = buildWorktreeManifest(repo)
@@ -93,7 +99,7 @@ describe('revertBlockedJobChanges', () => {
     const manifest = buildWorktreeManifest(repo)
     expect(manifest.paths.sort()).toEqual(['base.txt', 'pre-existing.txt'])
 
-    const note = revertBlockedJobChanges(repo, startCommitHash, manifest, preExistingManifest.paths)
+    const note = await revertBlockedJobChanges(repo, startCommitHash, manifest, preExistingManifest.paths)
 
     expect(note).toBeUndefined()
     // pre-existing.txt はそのまま残る（Job Aの成果ではないため取り消し対象外）。
@@ -103,7 +109,7 @@ describe('revertBlockedJobChanges', () => {
     expect(readFileSync(path.join(repo, 'base.txt'), 'utf-8')).toBe('baseline\n')
   })
 
-  it('Job中にHEADが動いていた場合（AIやSafeCommandがcommitした場合）は取り消しをスキップし、理由を返す', () => {
+  it('Job中にHEADが動いていた場合（AIやSafeCommandがcommitした場合）は取り消しをスキップし、理由を返す', async () => {
     const startCommitHash = headHash()
 
     write('base.txt', 'modified by job A\n')
@@ -114,7 +120,7 @@ describe('revertBlockedJobChanges', () => {
     git('add', '-A')
     git('commit', '-qm', 'HEAD moved during job')
 
-    const note = revertBlockedJobChanges(repo, startCommitHash, manifest, [])
+    const note = await revertBlockedJobChanges(repo, startCommitHash, manifest, [])
 
     expect(note).toBeDefined()
     expect(note).toContain('HEAD changed during job')
@@ -122,9 +128,9 @@ describe('revertBlockedJobChanges', () => {
     expect(readFileSync(path.join(repo, 'base.txt'), 'utf-8')).toBe('modified by job A\n')
   })
 
-  it('manifestが空なら何もしない', () => {
+  it('manifestが空なら何もしない', async () => {
     const startCommitHash = headHash()
-    const note = revertBlockedJobChanges(repo, startCommitHash, { changes: [], paths: [] }, [])
+    const note = await revertBlockedJobChanges(repo, startCommitHash, { changes: [], paths: [] }, [])
     expect(note).toBeUndefined()
   })
 })

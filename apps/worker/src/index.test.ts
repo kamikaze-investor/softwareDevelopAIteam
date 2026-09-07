@@ -1,6 +1,7 @@
 import type { Job, Task } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { JobRunResult } from './jobRunner.js'
+import { ContainmentInfrastructureError } from './execution/runContainedCommand.js'
 
 const outboxMocks = vi.hoisted(() => ({
   recordPending: vi.fn(),
@@ -667,3 +668,76 @@ function retryingPatchJob(): (
     sleepImpl: async () => {},
   })
 }
+
+/**
+ * P1 Phase 2（独立レビュー B3）:
+ * containment / 実行後 reconciliation の失敗が runJob から throw された場合、
+ * poll loop の logger まで素通りさせてはならない。素通りすると Job は `running` のまま
+ * 残り、誰も面倒を見ないまま workspace の所有権を保持し続ける。
+ */
+describe('P1 Phase 2: containment 失敗時の quarantine（B3）', () => {
+  const containmentFailure = (outcome: string): Error =>
+    new ContainmentInfrastructureError({
+      outcome,
+      exitCode: null,
+      signal: null,
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+      killedDescendants: false,
+      drainMs: 0,
+    } as never)
+
+  it('containment 失敗は blocked + quarantine になり、running のまま放置されない', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const executeJob = vi.fn().mockRejectedValue(
+      containmentFailure('drain_timeout'),
+    )
+    const alert = vi.fn().mockResolvedValue(undefined)
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob,
+      executeJob,
+      alert,
+      now: () => NOW,
+    })
+
+    expect(status).toBe('blocked')
+
+    const terminal = patchJob.mock.calls.at(-1)?.[1] as {
+      status?: string
+      failureMetadata?: { quarantined?: boolean; quarantineReason?: string; kind?: string }
+    }
+    // failed にしてはならない。failed は workspace を所有しないため、
+    // 生き残ったプロセスを抱えたまま次の Job へ引き渡してしまう。
+    expect(terminal.status).toBe('blocked')
+    expect(terminal.failureMetadata?.quarantined).toBe(true)
+    expect(terminal.failureMetadata?.kind).toBe('workspace_containment_failure')
+    expect(terminal.failureMetadata?.quarantineReason).toContain('drain_timeout')
+  })
+
+  it('containment 失敗では CRITICAL アラートを出す', async () => {
+    const alert = vi.fn().mockResolvedValue(undefined)
+
+    await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob: vi.fn().mockResolvedValue(true),
+      executeJob: vi.fn().mockRejectedValue(
+        containmentFailure('cleanup_failed'),
+      ),
+      alert,
+      now: () => NOW,
+    })
+
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }))
+  })
+
+  it('containment と無関係な例外はそのまま伝播する（quarantine で覆い隠さない）', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+
+    await expect(processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob,
+      executeJob: vi.fn().mockRejectedValue(new Error('unrelated bug')),
+      now: () => NOW,
+    })).rejects.toThrow('unrelated bug')
+  })
+})
