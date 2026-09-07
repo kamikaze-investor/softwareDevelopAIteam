@@ -14,6 +14,12 @@ export interface RoadmapSyncTaskInput {
   dependencies: string[]
   acceptanceCriteria: string[]
   allowedPaths: string[]
+  /**
+   * このタスクが解決すべきAI調査対象の不確実性への参照（`U1`, `U2`...）。
+   * Roadmap生成AIが付ける構造化参照で、`validateTechnicalUncertaintyRefs()`が
+   * 「全不確実性が最低1つのタスクから参照されているか」を決定論的に検査する。
+   */
+  technicalUncertaintyRefs?: string[]
 }
 
 export interface RoadmapTaskSpecConflict {
@@ -44,6 +50,8 @@ export type RoadmapValidationIssueCode =
   | 'disallowed_path'
   | 'dependency_count_exceeded'
   | 'control_plane_operation_task'
+  | 'unknown_technical_uncertainty_ref'
+  | 'unreferenced_technical_uncertainty'
 
 export interface RoadmapValidationIssue {
   code: RoadmapValidationIssueCode
@@ -379,4 +387,52 @@ export function validateRoadmapConstraints(
     checkedKinds: [...checkedKinds].sort(),
     uncheckedKinds: [...uncheckedKinds].sort(),
   }
+}
+
+/**
+ * AI調査対象の不確実性（`decisionOwner: 'ai'`のGap）が、生成されたRoadmapから
+ * 実際に参照されているかを決定論的に検証する。
+ *
+ * CEOへ質問しないと決めた不確実性は、誰かが調査しなければ誰も解決しない。
+ * 「関連タスクへ織り込んでください」というプロンプト指示だけではモデルが従ったか検証できず、
+ * 不変条件にならない。構造化された参照を必須にすることで、参照漏れを生成品質エラーとして
+ * 検出し、既存のRoadmap再生成（CONFLICT Recovery）へ載せられる。
+ *
+ * 新しいGate/Queueは追加しない。返したissueは既存の`validationIssues`へ合流し、
+ * 既存のbounded retryが`priorAttemptFeedback`付きで再生成する。
+ */
+export function validateTechnicalUncertaintyRefs(
+  tasks: RoadmapSyncTaskInput[],
+  knownRefs: readonly string[],
+): RoadmapValidationIssue[] {
+  if (knownRefs.length === 0) return []
+
+  const issues: RoadmapValidationIssue[] = []
+  const known = new Set(knownRefs)
+  const referenced = new Set<string>()
+
+  for (const task of tasks) {
+    for (const ref of task.technicalUncertaintyRefs ?? []) {
+      if (!known.has(ref)) {
+        issues.push({
+          code: 'unknown_technical_uncertainty_ref',
+          roadmapTaskKey: task.roadmapTaskKey,
+          message: `technicalUncertaintyRefs に未知の参照 "${ref}" が含まれています。提示されたID（${knownRefs.join(', ')}）のみ使用してください。`,
+        })
+        continue
+      }
+      referenced.add(ref)
+    }
+  }
+
+  for (const ref of knownRefs) {
+    if (!referenced.has(ref)) {
+      issues.push({
+        code: 'unreferenced_technical_uncertainty',
+        message: `AI調査対象の不確実性 "${ref}" を参照するタスクがありません。これを解決する必要があるタスクの technicalUncertaintyRefs へ "${ref}" を追加してください（調査だけの独立タスクは作らないこと）。`,
+      })
+    }
+  }
+
+  return issues
 }

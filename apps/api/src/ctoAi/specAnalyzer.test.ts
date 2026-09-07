@@ -61,6 +61,37 @@ describe('parseAnalysisJson', () => {
     expect(result.readinessScore).toBe(75)
   })
 
+  it('gapのdecisionOwnerを解析できる', () => {
+    const payload = {
+      ...JSON.parse(VALID_ANALYSIS_JSON),
+      gaps: [
+        { category: 'technical', description: 'a', severity: 'must_resolve', suggestion: 's', decisionOwner: 'ai' },
+        { category: 'business', description: 'b', severity: 'must_resolve', suggestion: 's', decisionOwner: 'ceo' },
+      ],
+    }
+
+    const result = parseAnalysisJson(JSON.stringify(payload))
+
+    expect(result.gaps.map((g) => g.decisionOwner)).toEqual(['ai', 'ceo'])
+  })
+
+  // PR #72 と同種の壊れ方（1つのgapの想定外の値で解析全体が500になる）を避ける。
+  // 解釈不能なownerは undefined になり、読み手側でCEO判断＝fail-closed に倒れる。
+  it('decisionOwnerが解釈不能・欠落でも解析全体を失敗させず、undefinedにする', () => {
+    const payload = {
+      ...JSON.parse(VALID_ANALYSIS_JSON),
+      gaps: [
+        { category: 'technical', description: 'a', severity: 'must_resolve', suggestion: 's', decisionOwner: 'unknown' },
+        { category: 'technical', description: 'b', severity: 'must_resolve', suggestion: 's', decisionOwner: null },
+        { category: 'technical', description: 'c', severity: 'must_resolve', suggestion: 's' },
+      ],
+    }
+
+    const result = parseAnalysisJson(JSON.stringify(payload))
+
+    expect(result.gaps).toHaveLength(3)
+    expect(result.gaps.every((g) => g.decisionOwner === undefined)).toBe(true)
+  })
   it('explicitly extracted structuredConstraintsを解析できる', () => {
     const payload = {
       ...JSON.parse(VALID_ANALYSIS_JSON),

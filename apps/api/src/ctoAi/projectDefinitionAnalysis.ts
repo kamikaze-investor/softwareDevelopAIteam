@@ -68,8 +68,35 @@ export interface ProjectDefinitionReadiness {
   readinessReason: string
 }
 
+/**
+ * CEOへ質問すべきGapかどうか。
+ *
+ * 判定軸は`gap.decisionOwner`（誰が解決できるか）**だけ**で、`category`（主題）は見ない。
+ * technicalな主題でもCEOの判断が要るもの（「既存の挙動を変えてよいか」等）はあり、
+ * 逆に`other`に分類された実装詳細もあるため、categoryは決定権の所在のproxyにならない。
+ *
+ * **明示的に`'ai'`のときだけ**CEOへの質問を抑制する。欠落（owner軸を持たない旧形式の応答・
+ * モデルが値を落とした応答）も、解釈不能な値も、すべてCEO側へfail-closedになる。
+ * `=== 'ceo'`ではなく`!== 'ai'`で判定しているのはそのため — CEOが決めるべき問いを黙って
+ * 落として誤った意図のままProjectを開始する方が、質問がノイズになるより重い。
+ *
+ * Zod側（`specAnalyzer.ts`のGapSchema）でも想定外の値はundefinedへ握りつぶしているが、
+ * `isProjectDefinitionReady()`はZodを通さないSpecAnalysisからも呼ばれうるため、ここでも
+ * 独立してfail-closedにする。
+ */
+function requiresCeoDecision(gap: SpecAnalysis['gaps'][number]): boolean {
+  return gap.decisionOwner !== 'ai'
+}
+
 export function isProjectDefinitionReady(analysis: SpecAnalysis): ProjectDefinitionReadiness {
-  const importantGaps = analysis.gaps.filter((gap) => gap.severity === 'must_resolve')
+  // `analysis.gaps`自体はここで絞らない。`decisionOwner: 'ai'`のGapはCEOへ出さないだけで、
+  // 情報としては破棄せず、既存のProject Memory（`projectMemoryWriter.ts`が全Gapを
+  // `docs/project_memory/gap_analysis.md`へ書き出す）に残り、後続AIがrepo/spec/testを
+  // 調査して解決するための内部情報になる。specAnalyzerはrepo/spec/testを見ていないため、
+  // 「AIが調査可能な種類の不確実性だ」と判定できても答えを知っているわけではない。
+  const importantGaps = analysis.gaps.filter(
+    (gap) => gap.severity === 'must_resolve' && requiresCeoDecision(gap),
+  )
   if (importantGaps.length > 0) {
     return {
       ready: false,
@@ -89,6 +116,8 @@ export function isProjectDefinitionReady(analysis: SpecAnalysis): ProjectDefinit
       description: READINESS_CLARIFICATION_GAP_DESCRIPTION,
       severity: 'must_resolve',
       suggestion: analysis.readinessReason,
+      // Project Definitionそのものの情報不足を尋ねる合成Gapなので、常にCEOの判断対象。
+      decisionOwner: 'ceo',
     }
     return {
       ready: false,

@@ -34,6 +34,7 @@ const MOCK_ROADMAP: Roadmap = {
       acceptanceCriteria: ['型エラーがない'],
       allowedPaths: ['packages/shared/src/'],
       estimatedComplexity: 'small',
+technicalUncertaintyRefs: [],
     },
   ],
   totalTasks: 1,

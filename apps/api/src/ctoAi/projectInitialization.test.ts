@@ -6,6 +6,7 @@ import type { Project } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage, RoadmapSyncResult } from '../storage/interface'
+import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow.js'
 import {
   initializeApprovedProject,
   ProjectInitializationError,
@@ -40,7 +41,10 @@ vi.mock('../designReview/designReviewCoordinator.js', async (importOriginal) => 
   }),
 }))
 
-vi.mock('./initialImplementWorkflow.js', () => ({
+// createInitialImplementWorkflow だけを差し替え、buildInitialImplementAiCliPrompt は実物を使う
+// （Implementer promptまでの経路を実コードで検証するため）。
+vi.mock('./initialImplementWorkflow.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./initialImplementWorkflow.js')>()),
   createInitialImplementWorkflow: workflowMocks.createInitialImplementWorkflow,
 }))
 
@@ -167,6 +171,7 @@ const ROADMAP: Roadmap = {
       acceptanceCriteria: ['The foundation task is implemented.'],
       allowedPaths: ['apps/api/src/'],
       estimatedComplexity: 'small',
+technicalUncertaintyRefs: [],
     },
   ],
   totalTasks: 1,
@@ -199,6 +204,7 @@ function makeRoadmap(taskCount: number, phaseCount: number, titlePrefix: string)
       acceptanceCriteria: [`${titlePrefix} ${index + 1} is complete.`],
       allowedPaths: ['apps/api/src/'],
       estimatedComplexity: 'small' as const,
+      technicalUncertaintyRefs: [],
     }
   })
 
@@ -518,5 +524,148 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
 
     expect(roadmapReviewCalls()).toHaveLength(1)
     expect(storage.tasks.findByProjectId(project.id)).toHaveLength(1)
+  })
+})
+
+// analysis.gaps -> roadmap generation -> structured refs -> deterministic validation
+// -> Task.description -> Implementer prompt を実際の不変条件として固定する。
+// プロンプト上の指示だけを hard invariant として扱わない。
+describe('AI-owned uncertainty: 構造化参照から Implementer prompt までの不変条件', () => {
+  let storage: IStorage
+  let tmpDir: string
+
+  const UNCERTAINTY_ANALYSIS: SpecAnalysis = {
+    ...ANALYSIS,
+    gaps: [
+      { category: 'technical', description: '依存関係の表現方法', severity: 'must_resolve', suggestion: '既存の型定義を調べる', decisionOwner: 'ai' },
+      { category: 'technical', description: '既存の動きを変えてよいか', severity: 'must_resolve', suggestion: '変えない', decisionOwner: 'ceo' },
+    ],
+  }
+
+  function roadmapWithRefs(refs: string[]): Roadmap {
+    const base = makeRoadmap(1, 1, 'Order check')
+    return { ...base, tasks: [{ ...base.tasks[0], technicalUncertaintyRefs: refs }] }
+  }
+
+  beforeEach(() => {
+    storage = createSQLiteStorage(':memory:')
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'project-initialization-uncertainty-'))
+    initGitRepo(tmpDir)
+    reviewMocks.execute.mockReset()
+    reviewMocks.execute.mockImplementation(async (input: string) => ({
+      ok: true,
+      timedOut: false,
+      stdout: stdoutForReviewInput(input),
+    }))
+    roadmapGeneratorMocks.generateRoadmap.mockReset()
+    workflowMocks.createInitialImplementWorkflow.mockClear()
+  })
+
+  it('参照されたGap本文がTask.descriptionへ機械的に展開され、Implementer promptまで到達する', async () => {
+    const project = createProject(storage)
+    const syncs = recordTaskSyncs(storage)
+    mockGenerateRoadmaps(roadmapWithRefs(['U1']))
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: UNCERTAINTY_ANALYSIS,
+      writeProjectMemory: true,
+    })
+
+    const syncedTask = syncs[0].tasks[0]
+    expect(syncedTask.description).toContain('依存関係の表現方法')
+    expect(syncedTask.description).toContain('既存の型定義を調べる')
+    // CEO判断のGapは実装AIの調査事項として混入しない
+    expect(syncedTask.description).not.toContain('既存の動きを変えてよいか')
+
+    // 既存の実装prompt経路をそのまま使い、Implementerまで到達することを固定する
+    const implementPrompt = buildInitialImplementAiCliPrompt({
+      description: syncedTask.description,
+      allowedPaths: syncedTask.allowedPaths,
+    })
+    expect(implementPrompt).toContain('依存関係の表現方法')
+    expect(implementPrompt).not.toContain('既存の動きを変えてよいか')
+  })
+
+  it('AI-owned Gapのrefが欠落したRoadmapはdeterministic validationで拒否される', async () => {
+    const project = createProject(storage)
+    const syncs = recordTaskSyncs(storage)
+    mockGenerateRoadmaps(roadmapWithRefs([]), roadmapWithRefs([]), roadmapWithRefs([]))
+
+    const error = await expectInitialization422(() => initializeApprovedProject(storage, project, tmpDir, {
+      analysis: UNCERTAINTY_ANALYSIS,
+      writeProjectMemory: true,
+    }))
+
+    const issues = error.details.issues as Array<{ code: string }>
+    expect(issues.some((i) => i.code === 'unreferenced_technical_uncertainty')).toBe(true)
+    // Task行は1件も作られない
+    expect(syncs).toHaveLength(0)
+    // 既存のbounded retryで再生成が試みられている（新しいGate/Queueは足していない）
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(3)
+  })
+
+  it('未知のrefを含むRoadmapも拒否される', async () => {
+    const project = createProject(storage)
+    mockGenerateRoadmaps(roadmapWithRefs(['U9']), roadmapWithRefs(['U9']), roadmapWithRefs(['U9']))
+
+    const error = await expectInitialization422(() => initializeApprovedProject(storage, project, tmpDir, {
+      analysis: UNCERTAINTY_ANALYSIS,
+      writeProjectMemory: true,
+    }))
+
+    const issues = error.details.issues as Array<{ code: string }>
+    expect(issues.some((i) => i.code === 'unknown_technical_uncertainty_ref')).toBe(true)
+  })
+
+  it('参照漏れは再生成feedbackとして次の試行へ渡り、修正されれば成功する', async () => {
+    const project = createProject(storage)
+    const syncs = recordTaskSyncs(storage)
+    mockGenerateRoadmaps(roadmapWithRefs([]), roadmapWithRefs(['U1']))
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: UNCERTAINTY_ANALYSIS,
+      writeProjectMemory: true,
+    })
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(2)
+    const secondCallOptions = roadmapGeneratorMocks.generateRoadmap.mock.calls[1][1] as { priorAttemptFeedback?: string }
+    expect(secondCallOptions.priorAttemptFeedback).toContain('unreferenced_technical_uncertainty')
+    expect(syncs[0].tasks[0].description).toContain('依存関係の表現方法')
+  })
+
+  it('AI-owned Gapごとの独立Taskは要求しない（1タスクが複数refを持てる）', async () => {
+    const project = createProject(storage)
+    const syncs = recordTaskSyncs(storage)
+    const twoAiGaps: SpecAnalysis = {
+      ...ANALYSIS,
+      gaps: [
+        { category: 'technical', description: '不確実性A', severity: 'must_resolve', suggestion: 'a', decisionOwner: 'ai' },
+        { category: 'other', description: '不確実性B', severity: 'should_resolve', suggestion: 'b', decisionOwner: 'ai' },
+      ],
+    }
+    mockGenerateRoadmaps(roadmapWithRefs(['U1', 'U2']))
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: twoAiGaps,
+      writeProjectMemory: true,
+    })
+
+    expect(syncs[0].tasks).toHaveLength(1)
+    expect(syncs[0].tasks[0].description).toContain('不確実性A')
+    expect(syncs[0].tasks[0].description).toContain('不確実性B')
+  })
+
+  it('AI-owned Gapが無い場合は既存の生成結果を一切変えない', async () => {
+    const project = createProject(storage)
+    const syncs = recordTaskSyncs(storage)
+    const base = makeRoadmap(1, 1, 'Plain task')
+    mockGenerateRoadmaps(base)
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+    })
+
+    expect(syncs[0].tasks[0].description).toBe(base.tasks[0].description)
   })
 })
