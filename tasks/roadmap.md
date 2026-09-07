@@ -2005,6 +2005,64 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 **MVP必須（このセクションの5項目）:**
 
+<!-- roadmap:id=codex-last-message-temp-file-in-target-repo state=planned -->
+0. [ ] **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる**（2026-09-07登録。
+   PR B（Codex Roadmap Generator基盤）の独立レビューで発覚。**本PRが持ち込んだ挙動ではなく
+   既存adapterの共通挙動**で、現在のCodex independent reviewも同じことをしている）。
+
+   **事実**: `expectJson: true`のとき`apps/worker/src/aiCli/adapter.ts`が
+   `.codex-last-message-*.json`を`request.workingDir`（＝`/workspace/target`）直下に作り、
+   `codexAdapter`が`--output-last-message`で渡す。実行後に削除されるが、プロセスが途中で
+   落ちると対象リポジトリにuntrackedファイルが残る。
+
+   **なぜ問題か**: レビュー・生成という読み取り専用のはずの工程が、対象リポジトリの
+   working treeを一時的に変化させる。File Change Guardや「working tree不変」を前提にした
+   検証と相性が悪く、crash時に残骸が次のJobの変更検出へ混入しうる。
+
+   **PR C（Roadmap topology cutover）までに解消すること**（CEO判断、2026-09-07）。
+   正常終了時は削除されるが、process crash / SIGKILL では対象repoに一時ファイルが残りうるため、
+   「read-only generator」としては未完成である。PR Bの時点ではproductionから新Generatorへの
+   到達が0件なので既存wartとして残してよいが、cutoverでCodexが実際にRoadmapを生成し始める
+   前に解決する。
+
+   **修正案と未検証点**: 一時ファイルをリポジトリ外（OS tempdir等）へ移すのが素直だが、
+   **`--sandbox read-only`下でCodex CLIがリポジトリ外へ書けるかを実測していない**。
+   書けない場合、既存のCodex independent reviewが壊れる。実Codex CLI / 実runnerで
+   安全に実測し、成功するなら既存adapterも含めてrepo外tempへ移す最小修正を行う。
+   失敗するなら推測で変更せず別案を調査する。
+
+   **未解決の間の表現**: 「モデルによるrepo変更は禁止される」とは言ってよいが、
+   **「filesystem上完全read-only」とは主張しない**。
+
+<!-- roadmap:id=opencode-feasibility-reviewer state=deferred -->
+0. [ ] **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider
+   topology検討中に実測して保留を決定。**Step 2をBLOCKしない**）。
+
+   **保留理由1: vendor不明**。VPS上の`opencode models`は`opencode/*`の7モデルのみで、
+   既定は`big-pickle`。公式にstealth modelでunderlying vendorが非公開のため、
+   **provider-independent expertとして数えられない**。無料枠は収集データがmodel improvementへ
+   使われうるため、実repoを読むproduction reviewerには使わない（CEO判断）。
+
+   **保留理由2: read-onlyを権限層で保証できていない**。`--dir`は作業ディレクトリ指定に
+   過ぎずread-only保証ではない。既定の`build` agentは`{"permission":"*","action":"allow"}`で
+   書き込み込みの全許可。`plan` agentは`edit: * → deny`を持つ一方、**`bash`は明示ルールが無く
+   ワイルドカードのallowに落ちる**。実測では書き込み指示を2回とも拒否したが、いずれも
+   モデルが「plan modeだから」と自己申告したもので、権限層が拒否した形跡は観測できていない。
+
+   **有効化の条件**: (1) underlying vendorを明示できるモデルを選べること
+   （第一候補はGrok 4.6だが、VPSのOpenCodeからは選択不可で、新規credentialと有料契約が要る。
+   CEOが追加しない判断のため現状は不可）。(2) OpenCodeの正式なpermission機構で
+   edit/write/bash/external_directory/subagent/skill/execute系とsecret readを明示denyした
+   AIteamOS専用agentを作り、**「書け」と明示指示しても権限層で拒否される**ことを実測できること。
+   runner所有のruntime configで強制し、対象repo内のconfigで弱められないようにする。`--pure`併用。
+   使い捨てdetached worktreeはprimary boundaryではなくdefense-in-depthとして併用する。
+
+   **上記を保証できない場合は完成させず、本項目のまま延期する**（CEO判断）。
+
+   **Step 2との関係**: Step 2のproduction topologyはCodex(OpenAI) generator /
+   Gemini(Google) focused ×3 / Claude Opus(Anthropic) final integrationの3 vendor構成で
+   成立するため、本項目の完了を待たない。OpenCodeは後から追加できる独立expertとして扱う。
+
 <!-- roadmap:id=continuation-get-liveness-dependency state=planned -->
 0. [ ] **Task ContinuationのGET依存解消（高優先度）**（2026-09-07登録。Project-start durability
    実装の独立レビューで発覚。**今回のProject-start変更が導入したものではなく既存設計**であり、

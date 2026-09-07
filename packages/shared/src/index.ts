@@ -47,3 +47,10 @@ export {
   determineApprovalLevel,
 } from './approvalLevelClassifier'
 export { resolveFinalDecision, applyIndependentReviewOverride } from './strategicDecision'
+export {
+  assertGeneratorSeparatedFromFinalReviewer,
+  isGeneratorSeparatedFromFinalReviewer,
+  ProviderSeparationError,
+  resolveReviewVendor,
+} from './reviewSeparation'
+export type { ReviewVendor } from './reviewSeparation'
