@@ -108,6 +108,35 @@ export function isProjectDefinitionReady(analysis: SpecAnalysis): ProjectDefinit
   }
 
   if (analysis.readinessScore < PROJECT_DEFINITION_READY_MIN_SCORE) {
+    // スコアだけで止める経路は`decisionOwner`を見ていなかったため、CEOに答えようのない
+    // 質問を無限に繰り返す状態になっていた（2026-09-07 production実測）。
+    //
+    // `readinessScore`はモデルが出すスカラーで、**既存コードベースについて分からないこと**でも
+    // 下がる。しかしspecAnalyzerはrepo/spec/testを読まないので、CEOが何を書いてもその不明点は
+    // 解消せず、スコアは上がらない。合成Gapの本文も「もう少し詳しく教えてください」という
+    // 汎用文で、答えるべき具体的な問いを含んでいない。結果、CEOが答える→再解析→また同じ質問、
+    // というループが終わらない。
+    //
+    // したがって「スコアが低い」だけでは止めない。CEOが答えられる対象が実在するかで判定する:
+    //   - AI調査対象のGapがある → モデルは「何が不明か」を具体的に述べた上で、それはAIが
+    //     調べれば決まると分類している。CEOへ聞くべきものは残っていないので進める。
+    //     Gapは破棄せずRoadmap/Task/Implementerへ渡り、AIが調査して解決する。
+    //   - Gapが1件も無い → 何が足りないかを言語化すらできていない＝本当に曖昧なProject
+    //     Definition。従来どおり合成Gapでfail-closedする。
+    //
+    // CEO判断が必要な`must_resolve` Gapは上のPath Aで既にブロックされているため、ここへ
+    // 到達している時点で「CEOが答えるべき必須の問い」は残っていない。
+    const aiOwnedGaps = analysis.gaps.filter((gap) => gap.decisionOwner === 'ai')
+    if (aiOwnedGaps.length > 0) {
+      return {
+        ready: true,
+        reason: 'Remaining uncertainty is AI-resolvable; no CEO decision is outstanding',
+        importantGaps: [],
+        readinessScore: analysis.readinessScore,
+        readinessReason: analysis.readinessReason,
+      }
+    }
+
     // 具体的なGapが無いまま単にスコアだけで止める場合、Mobileの回答画面に入力できる項目が
     // 無いままにしない。既存のGap回答フロー（category/description/suggestion + 自由記述欄）を
     // そのまま再利用する合成Gapを1件返す。
