@@ -332,8 +332,11 @@ function detectUnreportableWorkspaceState(workingDir: string): string | undefine
   for (const line of lsFiles.split(/\r?\n/)) {
     if (line === '') continue
     const tag = line[0]
-    // 小文字タグ = assume-unchanged / skip-worktree 等
-    if (tag >= "a" && tag <= "z") {
+    // `git ls-files -v` のタグ:
+    //   小文字（h 等） = assume-unchanged
+    //   大文字 S       = skip-worktree（独立レビュー指摘: 小文字だけ見ると見落とす）
+    // どちらも当該 path の変更が git status に出ないため、equality を主張できない。
+    if ((tag >= 'a' && tag <= 'z') || tag === 'S') {
       flagged.push(line.slice(2))
       if (flagged.length >= 5) break
     }

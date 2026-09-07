@@ -1131,6 +1131,12 @@ describe('Job API', () => {
         payload: { status: 'running' },
       })
 
+      // claim itself is refused while quarantined: listing フィルタだけでなく、
+      // 実際の queued -> running 書き込みが成立しないことを pin する（TOCTOU 対策）。
+      const afterClaim = await app.inject({ method: 'GET', url: `/api/jobs/${second.id}` })
+      expect(parseBody<Job>(afterClaim.body)).toMatchObject({ status: 'queued' })
+
+      // running になっていないので fail-if-running は CAS に負け、副作用を起こさない。
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${second.id}/fail-if-running`,
@@ -1144,7 +1150,7 @@ describe('Job API', () => {
       expect(res.statusCode).toBe(409)
       expect(parseBody<{ error: string }>(res.body).error).toContain('quarantined')
       const fetched = await app.inject({ method: 'GET', url: `/api/jobs/${second.id}` })
-      expect(parseBody<Job>(fetched.body)).toMatchObject({ status: 'running' })
+      expect(parseBody<Job>(fetched.body)).toMatchObject({ status: 'queued' })
     })
   })
 

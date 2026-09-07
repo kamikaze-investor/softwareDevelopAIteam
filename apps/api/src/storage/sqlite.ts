@@ -1045,6 +1045,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const existing = jobs.findById(id)
       if (!existing) return undefined
 
+
+      // PR-C: quarantine 中の claim（queued -> running）は書き込み自体を成立させない。
+      // listing 側の除外フィルタだけでは、取得後・claim前に quarantine された場合を
+      // 取りこぼす（TOCTOU）。ここは generic PATCH も updateWithOutboxEvent も必ず通る
+      // 単一の choke point であり、後者では同methodのtransaction内で評価されるため、
+      // 「quarantine された workspace へ実際に claim が書かれる」ことが起こり得ない。
+      if (data.status === 'running' && existing.status === 'queued') {
+        if (isWorkspaceQuarantined(jobs.findByTaskId(existing.taskId))) {
+          // 承認競合時（下記）と同じく、状態を変えずに現在値を返す。
+          return existing
+        }
+      }
       // Approval承認とWorkerのblocked結果保存が競合した場合、承認transactionがqueuedへ
       // 戻したJobを古いblocked結果で巻き戻さない。実行結果も再注入せず、現在値を返す。
       if (data.status === 'blocked' && existing.approvalId) {

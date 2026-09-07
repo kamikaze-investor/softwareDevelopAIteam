@@ -134,6 +134,13 @@ const UpdateJobBody = z.object({
   failureMetadata: z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
+    // Worker が正当に送る quarantine payload を API が 400 で弾き、
+    // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
+    quarantined: z.boolean().optional(),
+    quarantineReason: z.string().optional(),
+    quarantineClearedAt: z.string().optional(),
+    quarantineClearedReason: z.string().optional(),
   }).strict().optional(),
   workspaceBaseline: z.discriminatedUnion('mode', [
     z.object({
@@ -175,6 +182,13 @@ const FailIfRunningJobBody = z.object({
   failureMetadata: z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
+    // Worker が正当に送る quarantine payload を API が 400 で弾き、
+    // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
+    quarantined: z.boolean().optional(),
+    quarantineReason: z.string().optional(),
+    quarantineClearedAt: z.string().optional(),
+    quarantineClearedReason: z.string().optional(),
   }).strict().optional(),
   eventId: z.string().min(1).optional(),
   payloadHash: z.string().min(1).optional(),
