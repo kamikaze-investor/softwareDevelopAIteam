@@ -7,8 +7,9 @@ vi.mock('@anthropic-ai/sdk', () => ({
     messages = { create: anthropicMocks.create }
   },
 }))
-import { parseRoadmapJson, generateRoadmap } from './roadmapGenerator.js'
+import { parseRoadmapJson, generateRoadmap, buildRoadmapProjectSummary } from './roadmapGenerator.js'
 import type { SpecAnalysis } from './specAnalyzer.js'
+import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow.js'
 
 const MOCK_ANALYSIS: SpecAnalysis = {
   goal: 'コンテンツ配信を自動化するシステム',
@@ -249,5 +250,136 @@ describe('generateRoadmap (mockResponse)', () => {
     delete process.env.ANTHROPIC_API_KEY
     await expect(generateRoadmap(MOCK_ANALYSIS)).rejects.toThrow('ANTHROPIC_API_KEY')
     process.env.ANTHROPIC_API_KEY = origKey
+  })
+})
+
+// CEO質問から除外したGapが、実際にRoadmapを立てるAIへ届くことを固定する。
+// これが無いと `gap_analysis.md` へ書くだけの行き止まりになり（読み手が存在しない）、
+// 「CEOにも聞かれず、AIにも渡らない」情報になる。
+describe('buildRoadmapProjectSummary — AI-owned Gapの伝播', () => {
+  function analysisWith(gaps: SpecAnalysis['gaps']): SpecAnalysis {
+    return {
+      goal: 'G',
+      designPhilosophy: [],
+      mvpScope: { description: 'G', includedFeatures: [], excludedFeatures: [] },
+      targetUsers: [],
+      techStack: [],
+      gaps,
+      structuredConstraints: [],
+      requiredExternalServices: [],
+      readinessScore: 95,
+      readinessReason: 'r',
+    }
+  }
+
+  it('decisionOwner: ai のGapをプロンプト本文へ載せる', () => {
+    const summary = buildRoadmapProjectSummary(analysisWith([
+      { category: 'technical', description: '依存関係の表現方法', severity: 'must_resolve', suggestion: '既存の型を調べる', decisionOwner: 'ai' },
+    ]))
+
+    expect(summary).toContain('Open Technical Uncertainties')
+    expect(summary).toContain('依存関係の表現方法')
+    expect(summary).toContain('既存の型を調べる')
+  })
+
+  it('AI-owned Gapが無ければ余計なセクションを足さない', () => {
+    const summary = buildRoadmapProjectSummary(analysisWith([
+      { category: 'business', description: 'CEOが決める話', severity: 'must_resolve', suggestion: 's', decisionOwner: 'ceo' },
+    ]))
+
+    expect(summary).not.toContain('Open Technical Uncertainties')
+    expect(summary).not.toContain('CEOが決める話')
+  })
+})
+
+// analysis -> roadmap prompt -> generated Task -> buildInitialImplementAiCliPrompt -> Implementer
+// までを端から端まで固定する。Context Pack は未配線（deferred item）なので、Implementerへ届く
+// 決定的な経路は Task.description だけであり、そこが切れると誰も調査しないまま実装される。
+describe('AI-owned uncertainty: analysisからImplementer promptまでの経路', () => {
+  function analysisWith(gaps: SpecAnalysis['gaps']): SpecAnalysis {
+    return {
+      goal: 'G',
+      designPhilosophy: [],
+      mvpScope: { description: 'G', includedFeatures: [], excludedFeatures: [] },
+      targetUsers: [],
+      techStack: [],
+      gaps,
+      structuredConstraints: [],
+      requiredExternalServices: [],
+      readinessScore: 95,
+      readinessReason: 'r',
+    }
+  }
+
+  const aiGap: SpecAnalysis['gaps'][number] = {
+    category: 'technical',
+    description: '依存関係の表現方法',
+    severity: 'must_resolve',
+    suggestion: '既存の型定義を調べる',
+    decisionOwner: 'ai',
+  }
+
+  const ceoGap: SpecAnalysis['gaps'][number] = {
+    category: 'technical',
+    description: '既存の動きを変えてよいか',
+    severity: 'must_resolve',
+    suggestion: '変えない',
+    decisionOwner: 'ceo',
+  }
+
+  it('1. AI-owned GapがRoadmap promptへ入る', () => {
+    const summary = buildRoadmapProjectSummary(analysisWith([aiGap, ceoGap]))
+
+    expect(summary).toContain('Open Technical Uncertainties')
+    expect(summary).toContain(aiGap.description)
+    expect(summary).toContain(aiGap.suggestion)
+  })
+
+  it('4. CEO-owned GapはImplementer向けAI調査事項として混入しない', () => {
+    const summary = buildRoadmapProjectSummary(analysisWith([aiGap, ceoGap]))
+
+    expect(summary).not.toContain(ceoGap.description)
+  })
+
+  it('5. AI-owned Gapのためだけに独立Taskを作ることを要求していない', () => {
+    const summary = buildRoadmapProjectSummary(analysisWith([aiGap]))
+
+    expect(summary).toContain('調査だけの独立タスクは作らない')
+    // 参照IDを列挙させる指示であること（本文の書き写しをモデルに依存させない）
+    expect(summary).toContain('technicalUncertaintyRefs')
+  })
+
+  it('2+3. 生成Taskのdescriptionに調査責務が残り、Implementer promptまで到達する', () => {
+    // Roadmap生成AIがルールに従い、関連タスクのdescriptionへ織り込んだ場合の生成結果。
+    // ここから先（Task行 -> implement prompt）は決定論的な配線であり、それを固定する。
+    const generated = parseRoadmapJson(JSON.stringify({
+      phases: [{ number: 1, name: 'P1', goal: 'g', tasks: ['task-001'] }],
+      tasks: [{
+        id: 'task-001',
+        title: '実行前に順序の不備を検出する',
+        description: '実行を始める前に順序の不備を検出する。依存関係の表現方法は既存のコード・仕様・テストを確認してから決めること（推測で決め打ちしない）。',
+        phase: 1,
+        assignee: 'developer_ai',
+        category: 'implementation',
+        dependencies: [],
+        acceptanceCriteria: ['既存の正しい順序の結果は変わらない'],
+        allowedPaths: ['src/'],
+        estimatedComplexity: 'small',
+      }],
+      totalTasks: 1,
+      estimatedWeeks: 1,
+    }))
+
+    const task = generated.tasks[0]
+    expect(task.description).toContain('依存関係の表現方法')
+
+    const implementPrompt = buildInitialImplementAiCliPrompt({
+      description: task.description,
+      allowedPaths: task.allowedPaths,
+    })
+
+    expect(implementPrompt).toContain('依存関係の表現方法')
+    expect(implementPrompt).toContain('既存のコード・仕様・テストを確認してから')
+    expect(implementPrompt).not.toContain(ceoGap.description)
   })
 })

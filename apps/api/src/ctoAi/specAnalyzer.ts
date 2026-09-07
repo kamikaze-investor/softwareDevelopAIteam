@@ -23,11 +23,20 @@ import { z } from 'zod'
 // `z.ZodType<Gap>` 等で共有型との一致をコンパイル時に強制する。
 // ────────────────────────────────────────────────────────────
 
-export const GapSchema: z.ZodType<Gap> = z.object({
+// 入力型を `unknown` にしているのは `decisionOwner` の `.catch()`（想定外の値を握りつぶして
+// undefined にする）が入力型を広げるため。**出力型が `Gap` と一致することのコンパイル時強制は
+// そのまま維持される** — 検証したいのはLLM出力が共有型に適合することであり、入力側ではない。
+export const GapSchema: z.ZodType<Gap, z.ZodTypeDef, unknown> = z.object({
   category: z.enum(['business', 'technical', 'data', 'cost', 'legal', 'other']),
   description: z.string(),
   severity: z.enum(['must_resolve', 'should_resolve', 'optional']),
   suggestion: z.string(),
+  // optional + catch にしているのは、owner軸を持たない旧形式の応答・値を落とした応答・
+  // 想定外の値（'unknown'等）で safeParse 全体を失敗させないため。PR #72 と同種の、
+  // 単一 gap の欠損で解析全体を 500 にしてしまう壊れ方を避ける。
+  // 未指定・解釈不能はいずれも undefined になり、読み手側で 'ceo' 扱い＝fail-closed とする
+  // （CEOが決めるべき問いを黙って落とす方が、質問がノイズになるより重い）。
+  decisionOwner: z.enum(['ceo', 'ai']).optional().catch(undefined),
 })
 
 export const StructuredConstraintSchema: z.ZodType<StructuredConstraint> = z.object({
@@ -106,7 +115,25 @@ Structured constraint extraction:
 - Only populate structuredConstraints for constraints explicitly and unambiguously stated in the spec text, such as "only 1 task", "only touch docs/", "no new files", or "don't add X as a dependency".
 - Do not infer structuredConstraints. Copy the exact source phrase into sourceText.
 - The value field must be a concrete string, number, string array, or boolean; never use null or omit value. If no concrete value is available, omit the structured constraint or emit a gaps entry instead.
-- If a constraint-shaped statement is ambiguous or high-impact, do not guess. Emit a normal gaps entry with severity "must_resolve" and ask through the existing Gap flow.
+- If a constraint-shaped statement is ambiguous or high-impact, do not guess. Emit a normal gaps entry with severity "must_resolve" and ask through the existing Gap flow. Set its decisionOwner by the rule below (an ambiguous constraint is usually a "ceo" decision about what is allowed).
+
+Gap decisionOwner（誰が解決できるかの判定。categoryやseverityとは独立した軸）:
+- あなたはこの仕様書のテキストしか見ていない。既存のrepo・spec・testは読んでいない。
+  それでも「その不足情報が、どちらの種類か」は判定できる。それだけを判定すること。
+- "ceo": CEO（非エンジニア）にしか決められないsemantic decision。Goalの意図、期待する最終挙動、
+  何を許容し何を許容しないか、優先順位、Design Philosophy、policy/risk/cost/legalのtradeoff。
+  コードをいくら読んでも答えが出ない種類の問い。
+- "ai": 既存のrepo・spec・testを調査すれば答えが決まる技術的不確実性。内部データ構造の表現方法、
+  クラス/メソッド/ファイルの選択、処理の挿入箇所、API形状、実装手法、test戦略、
+  既存システムで既に決まっているarchitecture detail。
+  **"ai"と判定したものはCEOへ質問されない。後続のAIが調査して解決する。**
+- 判定の基準は主題がtechnicalかどうかではない。**答えが既存の成果物の中にあるか、
+  それとも人間の意図の中にしかないか**で決めること。technicalな主題でも、
+  「既存の挙動を変えてよいか」はceoの判断であり、「どの層で検証するか」はaiが調査して決める。
+- decisionOwnerが"ceo"のgapのdescriptionとsuggestionは、**非エンジニアが読んで理解できる
+  自然言語**で書くこと。ファイル名・メソッド名・クラス名・データ構造名・内部用語は出さない。
+  期待する挙動や許容範囲を、その人が普段使う言葉で尋ねること。
+- decisionOwnerが"ai"のgapは、後続AIが調査する内部メモとして残るため、技術的な書き方でよい。
 
 以下のJSON形式のみで回答してください。説明文・マークダウンコードブロック・前置き・後書きは一切不要です。
 
@@ -125,7 +152,8 @@ Structured constraint extraction:
       "category": "technical|business|data|cost|legal|other",
       "description": "不足している情報",
       "severity": "must_resolve|should_resolve|optional",
-      "suggestion": "解決案または仮決定案"
+      "suggestion": "解決案または仮決定案",
+      "decisionOwner": "ceo|ai"
     }
   ],
   "structuredConstraints": [
@@ -149,6 +177,7 @@ Structured constraint extraction:
 
 注意事項:
 - gaps は本当に重要な不足情報だけを列挙する（5件以内）
+- gaps の各要素には decisionOwner を必ず含める（上記の判定基準に従う）
 - readinessScore は 70以上なら開発開始可能とみなす
 - techStack は仕様書に明記されているものだけを含める（推測しない）`
 

@@ -10,13 +10,14 @@ import type { IStorage } from '../storage/interface.js'
 import {
   validateRoadmapConstraints,
   validateRoadmapPhases,
+  validateTechnicalUncertaintyRefs,
   validateRoadmapTasks,
   type RoadmapSyncPhaseInput,
   type RoadmapSyncTaskInput,
 } from '../storage/roadmapTaskValidation.js'
 import { writeProjectMemory } from './projectMemoryWriter.js'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow.js'
-import { generateRoadmap, type Roadmap, type RoadmapGeneratorOptions } from './roadmapGenerator.js'
+import { collectTechnicalUncertainties, generateRoadmap, type Roadmap, type RoadmapGeneratorOptions, type TechnicalUncertainty } from './roadmapGenerator.js'
 import { buildSpecTextFromProjectDefinition } from './projectDefinitionAnalysis.js'
 import { composeRoadmapReviewMaterial } from './roadmapReviewMaterial.js'
 import { buildRoadmapMd, writeRoadmap } from './roadmapWriter.js'
@@ -63,17 +64,53 @@ async function executeRoadmapReviewToTerminal(
   return result
 }
 
-function buildRoadmapTasks(roadmap: Roadmap): RoadmapSyncTaskInput[] {
+/**
+ * 参照されたAI調査対象の不確実性を、そのタスクの`description`へ決定論的に展開する。
+ *
+ * Implementerへ届く既存の唯一の経路は`Task.description`であり
+ * （`buildInitialImplementAiCliPrompt()`はdescriptionとallowedPathsしか使わない。
+ * Context Packは未配線）、生成AIが本文を書き写したかどうかに依存させると不変条件にならない。
+ * 生成AIには構造化された参照（`technicalUncertaintyRefs`）だけを返させ、本文の展開は
+ * ここで機械的に行う。
+ */
+function materializeUncertainties(
+  description: string,
+  refs: readonly string[] | undefined,
+  uncertaintyByRef: ReadonlyMap<string, TechnicalUncertainty>,
+): string {
+  // Zod schemaは`.default([])`を持つが、この関数はテストのモック等
+  // schemaを通らないRoadmapからも呼ばれうるため、欠損を許容する。
+  const resolved = (refs ?? [])
+    .map((ref) => uncertaintyByRef.get(ref))
+    .filter((u): u is TechnicalUncertainty => u !== undefined)
+  if (resolved.length === 0) return description
+
+  return [
+    description,
+    '',
+    '## 実装前に確定させる技術的事項',
+    'CEOへは質問されていない。答えは既存のコード・仕様・テストの中にあるので、推測で決め打ちせず調べてから実装すること。',
+    ...resolved.map((u) => `- ${u.description}（調査の手がかり: ${u.suggestion}）`),
+  ].join('\n')
+}
+
+function buildRoadmapTasks(
+  roadmap: Roadmap,
+  uncertainties: readonly TechnicalUncertainty[] = [],
+): RoadmapSyncTaskInput[] {
+  const uncertaintyByRef = new Map(uncertainties.map((u) => [u.ref, u] as const))
+
   return roadmap.tasks.map((task) => ({
     roadmapTaskKey: task.id,
     title: task.title,
-    description: task.description,
+    description: materializeUncertainties(task.description, task.technicalUncertaintyRefs, uncertaintyByRef),
     phase: task.phase,
     assignee: task.assignee,
     category: task.category,
     dependencies: task.dependencies,
     acceptanceCriteria: task.acceptanceCriteria,
     allowedPaths: task.allowedPaths,
+    technicalUncertaintyRefs: task.technicalUncertaintyRefs,
   }))
 }
 
@@ -135,15 +172,20 @@ export async function initializeApprovedProject(
   let roadmapPhases: RoadmapSyncPhaseInput[] | undefined
   let priorAttemptFeedback: string | undefined
 
+  // AI調査対象の不確実性は analysis から決定論的に導出する（生成・検証・展開が同じIDを再計算する）。
+  const technicalUncertainties = collectTechnicalUncertainties(analysis)
   for (let attempt = 1; attempt <= ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS; attempt += 1) {
     const candidateRoadmap = await generateRoadmap(analysis, { ...options, priorAttemptFeedback })
-    const candidateTasks = buildRoadmapTasks(candidateRoadmap)
+    const candidateTasks = buildRoadmapTasks(candidateRoadmap, technicalUncertainties)
     const candidatePhases = buildRoadmapPhases(candidateRoadmap)
     const constraintValidation = validateRoadmapConstraints(candidateTasks, analysis.structuredConstraints)
     const validationIssues = [
       ...validateRoadmapTasks(candidateTasks),
       ...validateRoadmapPhases(candidatePhases, candidateTasks),
       ...constraintValidation.issues,
+      // 参照漏れ・未知refは生成品質エラーとして扱い、既存のbounded retryで再生成させる。
+      // 新しいGate/Queueは追加しない。
+      ...validateTechnicalUncertaintyRefs(candidateTasks, technicalUncertainties.map((u) => u.ref)),
     ]
 
     if (validationIssues.length > 0) {

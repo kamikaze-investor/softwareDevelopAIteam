@@ -102,4 +102,45 @@ describe('writeProjectMemory', () => {
     writeProjectMemory(MOCK_ANALYSIS, tmpDir)
     expect(() => writeProjectMemory(MOCK_ANALYSIS, tmpDir)).not.toThrow()
   })
+
+  // CEOへ質問されないAI-resolvableなGapにとって、gap_analysis.md が後続AIへの唯一の
+  // 引き継ぎ点になる。ここから落ちると「CEOにも聞かれず、AIにも渡らない」情報になる。
+  it('AI-resolvableなGapもgap_analysis.mdへ残し、解決の担当を明記する', () => {
+    writeProjectMemory({
+      ...MOCK_ANALYSIS,
+      gaps: [
+        { category: 'technical', description: '依存関係の表現方法', severity: 'must_resolve', suggestion: '既存の型を調べる', decisionOwner: 'ai' },
+        { category: 'technical', description: '既存の動きを変えてよいか', severity: 'must_resolve', suggestion: '変えない', decisionOwner: 'ceo' },
+        { category: 'other', description: 'ownerなしの旧形式', severity: 'should_resolve', suggestion: 's' },
+      ],
+    }, tmpDir)
+
+    const content = readFileSync(path.join(tmpDir, 'docs', 'project_memory', 'gap_analysis.md'), 'utf-8')
+
+    expect(content).toContain('依存関係の表現方法')
+    expect(content).toContain('既存の動きを変えてよいか')
+    expect(content).toContain('ownerなしの旧形式')
+    expect(content).toContain('AI調査で解決')
+    expect(content).toContain('CEO判断')
+    // 欠落ownerはCEO判断側へ倒す（CEO質問側の判定と揃える）
+    expect(content.split('ownerなしの旧形式')[1]).toContain('CEO判断')
+  })
+
+  // 後続AIが機械的に読む経路。markdownの表示ラベルへ結合させないための構造化フィールド。
+  it('project_definition.jsonへAI調査担当Gapを構造化して書き出す', () => {
+    writeProjectMemory({
+      ...MOCK_ANALYSIS,
+      gaps: [
+        { category: 'technical', description: '依存関係の表現方法', severity: 'must_resolve', suggestion: '既存の型を調べる', decisionOwner: 'ai' },
+        { category: 'technical', description: '既存の動きを変えてよいか', severity: 'must_resolve', suggestion: '変えない', decisionOwner: 'ceo' },
+        { category: 'other', description: 'ownerなしの旧形式', severity: 'should_resolve', suggestion: 's' },
+      ],
+    }, tmpDir)
+
+    const parsed = JSON.parse(
+      readFileSync(path.join(tmpDir, 'docs', 'project_memory', 'project_definition.json'), 'utf-8'),
+    ) as { openTechnicalUncertainties: Array<{ description: string }> }
+
+    expect(parsed.openTechnicalUncertainties.map((u) => u.description)).toEqual(['依存関係の表現方法'])
+  })
 })

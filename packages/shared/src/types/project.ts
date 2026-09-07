@@ -87,6 +87,19 @@ export interface Gap {
   description: string
   severity: 'must_resolve' | 'should_resolve' | 'optional'
   suggestion: string
+  /**
+   * この不足情報を**誰が解決できるか**。`category`（主題）や`severity`（重要度）とは
+   * 別の軸で、CEOへ質問すべきかどうかはこの値だけで決まる。
+   *
+   * - `'ceo'`: CEOにしか決められないsemantic decision（Goalの意図・期待する最終挙動・
+   *   許容/非許容・優先順位・Design Philosophy・policy/risk tradeoff）。
+   * - `'ai'`: 既存のrepo/spec/testをread-onlyで調査すれば答えが決まる技術的不確実性
+   *   （内部データ構造・API形状・挿入箇所・実装手法・test戦略など）。
+   *
+   * 省略時は`'ceo'`として扱う（fail-closed）。owner軸を持たない旧形式の応答や、
+   * 判定できなかった応答でCEOへの質問を落とすより、ノイズを許容する方が安全なため。
+   */
+  decisionOwner?: 'ceo' | 'ai'
 }
 
 /**

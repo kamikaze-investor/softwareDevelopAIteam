@@ -118,6 +118,12 @@ ${analysis.techStack.map(t => `- ${t}`).join('\n')}
   const mustResolveGaps = analysis.gaps.filter(g => g.severity === 'must_resolve')
   const shouldResolveGaps = analysis.gaps.filter(g => g.severity === 'should_resolve')
   const optionalGaps = analysis.gaps.filter(g => g.severity === 'optional')
+  // `decisionOwner: 'ai'`のGapはCEOへ質問されない代わりに、ここが後続AIへの唯一の引き継ぎ点に
+  // なる。明示的に`'ai'`のときだけAI調査扱いとし、欠落・解釈不能はCEO判断側へ倒す（CEO質問側と同じ判定）。
+  const gapOwnerLabel = (g: SpecAnalysis['gaps'][number]): string =>
+    g.decisionOwner === 'ai'
+      ? 'AI調査で解決（既存repo/spec/testを調べて決める。CEOへは質問されない）'
+      : 'CEO判断'
 
   const gapContent = `# Gap Analysis
 
@@ -133,6 +139,7 @@ ${analysis.readinessReason}
 
 ${mustResolveGaps.length === 0 ? '特になし' : mustResolveGaps.map(g => `### ${g.description}
 - カテゴリ: ${g.category}
+- 解決の担当: ${gapOwnerLabel(g)}
 - 提案: ${g.suggestion}
 `).join('\n')}
 
@@ -140,6 +147,7 @@ ${mustResolveGaps.length === 0 ? '特になし' : mustResolveGaps.map(g => `### 
 
 ${shouldResolveGaps.length === 0 ? '特になし' : shouldResolveGaps.map(g => `### ${g.description}
 - カテゴリ: ${g.category}
+- 解決の担当: ${gapOwnerLabel(g)}
 - 提案: ${g.suggestion}
 `).join('\n')}
 
@@ -147,6 +155,7 @@ ${shouldResolveGaps.length === 0 ? '特になし' : shouldResolveGaps.map(g => `
 
 ${optionalGaps.length === 0 ? '特になし' : optionalGaps.map(g => `### ${g.description}
 - カテゴリ: ${g.category}
+- 解決の担当: ${gapOwnerLabel(g)}
 - 提案: ${g.suggestion}
 `).join('\n')}
 
@@ -184,6 +193,18 @@ ${analysis.requiredExternalServices.map(s => `## ${s.name}
     designPhilosophy: analysis.designPhilosophy,
     structuredConstraints,
     constraintsHash,
+    // CEOへ質問されなかった、AIが既存repo/spec/testを調査して解決すべき技術的不確実性。
+    // 人が読む`gap_analysis.md`とは別に、後続AIが機械的に読めるようここへ構造化して残す
+    // （markdownの日本語ラベルを読み手側でパースすると書き手と読み手が文字列結合してしまう。
+    // 独立レビュー指摘、2026-09-06）。
+    openTechnicalUncertainties: analysis.gaps
+      .filter((g) => g.decisionOwner === 'ai')
+      .map((g) => ({
+        description: g.description,
+        category: g.category,
+        severity: g.severity,
+        suggestion: g.suggestion,
+      })),
   }, null, 2) + '\n'
   writeFile(path.join(memoryDir, 'project_definition.json'), projectDefinitionContent)
   writtenFiles.push('docs/project_memory/project_definition.json')

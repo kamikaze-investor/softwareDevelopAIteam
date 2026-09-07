@@ -143,3 +143,99 @@ describe('isProjectDefinitionReady', () => {
     expect(result.importantGaps).toEqual([])
   })
 })
+
+// CEOへ質問するかどうかを決める軸は `decisionOwner`（誰が解決できるか）だけであり、
+// `category`（主題）ではない。2026-09-06のCEO指摘: 依存関係の表現方法・検証ロジックの挿入箇所
+// といった、既存repo/spec/testを調べれば決まる実装詳細がCEOへ質問として出ていた。
+describe('isProjectDefinitionReady — CEO decision vs AI-resolvable technical uncertainty', () => {
+  function analysisWithGaps(gaps: SpecAnalysis['gaps']): SpecAnalysis {
+    return {
+      goal: 'G',
+      designPhilosophy: [],
+      mvpScope: { description: 'G', includedFeatures: [], excludedFeatures: [] },
+      targetUsers: [],
+      techStack: [],
+      gaps,
+      structuredConstraints: [],
+      requiredExternalServices: [],
+      readinessScore: 95,
+      readinessReason: 'ready enough',
+    }
+  }
+
+  const aiTechnicalGap: SpecAnalysis['gaps'][number] = {
+    category: 'technical',
+    description: '依存関係をタスク名・ID・DAG構造のどれで表現しているか',
+    severity: 'must_resolve',
+    suggestion: '既存の型定義を調べる',
+    decisionOwner: 'ai',
+  }
+
+  const ceoTechnicalGap: SpecAnalysis['gaps'][number] = {
+    category: 'technical',
+    description: '正しい順序を渡したときの既存の動きは変えない方針でよいか',
+    severity: 'must_resolve',
+    suggestion: '変えない',
+    decisionOwner: 'ceo',
+  }
+
+  it('1. technical + AI-resolvable → CEO質問に出ない', () => {
+    const result = isProjectDefinitionReady(analysisWithGaps([aiTechnicalGap]))
+
+    expect(result.importantGaps).toHaveLength(0)
+    expect(result.ready).toBe(true)
+  })
+
+  it('2. technical + semantic decision → CEO質問に出る', () => {
+    const result = isProjectDefinitionReady(analysisWithGaps([ceoTechnicalGap]))
+
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.importantGaps[0].description).toBe(ceoTechnicalGap.description)
+    expect(result.ready).toBe(false)
+  })
+
+  it('3. non-technical + AI-resolvable → CEO質問に出ない', () => {
+    const result = isProjectDefinitionReady(analysisWithGaps([
+      { ...aiTechnicalGap, category: 'data', description: '保存済みデータの形式' },
+      { ...aiTechnicalGap, category: 'other', description: 'どの層に検証を入れるか' },
+    ]))
+
+    expect(result.importantGaps).toHaveLength(0)
+    expect(result.ready).toBe(true)
+  })
+
+  it('4. decisionOwner欠落 → CEO側へfail-closed', () => {
+    const { decisionOwner: _omitted, ...withoutOwner } = aiTechnicalGap
+    const result = isProjectDefinitionReady(analysisWithGaps([withoutOwner]))
+
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.ready).toBe(false)
+  })
+
+  it('4b. decisionOwnerが解釈不能な値 → CEO側へfail-closed（500にはしない）', () => {
+    const unknownOwner = { ...aiTechnicalGap, decisionOwner: 'unknown' } as unknown as SpecAnalysis['gaps'][number]
+    const result = isProjectDefinitionReady(analysisWithGaps([unknownOwner]))
+
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.ready).toBe(false)
+  })
+
+  it('categoryだけではCEO質問に出るかどうかを決めない（同じcategoryでownerが違えば結果が分かれる）', () => {
+    const result = isProjectDefinitionReady(analysisWithGaps([aiTechnicalGap, ceoTechnicalGap]))
+
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.importantGaps[0].decisionOwner).toBe('ceo')
+  })
+
+  // CEOへ出さないことと、情報ごと捨てることは同義ではない。specAnalyzerはrepo/spec/testを
+  // 見ていないため「AIが調査可能な種類だ」と判定できても答えは知らない。後続AIが調べるための
+  // 内部情報として `analysis.gaps` に残り続けなければならない。
+  it('AI-resolvableなGapはCEOへ出さないだけで、analysis.gapsからは捨てない', () => {
+    const analysis = analysisWithGaps([aiTechnicalGap, ceoTechnicalGap])
+    const result = isProjectDefinitionReady(analysis)
+
+    expect(result.importantGaps).toHaveLength(1)
+    expect(analysis.gaps).toHaveLength(2)
+    expect(analysis.gaps.map((g) => g.description)).toContain(aiTechnicalGap.description)
+  })
+})

@@ -38,6 +38,16 @@ export const GeneratedTaskSchema = z.object({
   acceptanceCriteria: z.array(z.string()).default([]),
   allowedPaths: z.array(z.string()).default([]),
   estimatedComplexity: z.enum(['small', 'medium', 'large']),
+  /**
+   * このタスクが解決すべきAI調査対象の不確実性への参照（`U1`, `U2`...）。
+   * プロンプトへ提示した Open Technical Uncertainties のIDをそのまま返す。
+   *
+   * 「descriptionへ書き写してください」という指示だけでは、モデルが従ったかどうかを
+   * 機械的に検証できない。構造化参照にすることで、deterministic validationで
+   * 「全不確実性が最低1つのタスクから参照されているか」「未知のrefが無いか」を検査でき、
+   * 参照された本文は`buildRoadmapTasks()`が決定論的にdescriptionへ展開できる。
+   */
+  technicalUncertaintyRefs: z.array(z.string()).default([]),
 })
 
 export const RoadmapSchema = z.object({
@@ -75,6 +85,17 @@ ${constitutionPrinciplesPrompt}
 - Structured Constraints に max_task_count がある場合はその値を厳守してください
 - Phase はプロジェクトの範囲に応じて適切に設定してください。小規模変更では1フェーズで十分であり、基盤構築→MVP機能→品質改善の3フェーズ構造は、複数フェーズにまたがる複数の異なる成果物がある場合のみ使ってください
 - allowedPaths は実際に変更するディレクトリのみ（例: "apps/engine/src/"）
+- Open Technical Uncertainties が渡された場合の扱い（一般ルール）:
+  - 無視しない。CEOへ質問されていないので、AIが解決しなければ誰も解決しない
+  - それを解決する必要がある**関連タスクの technicalUncertaintyRefs へIDを列挙する**。
+    本文はそのタスクのdescriptionへ自動展開されるため、あなたが書き写す必要はない
+  - **提示されたIDはすべて、最低1つのタスクから参照されていなければならない。**
+    参照漏れ・未知のIDがあるRoadmapは却下され再生成になる
+  - 独立した成果物にならない調査だけを別タスクへ切り出さない。調査は、それを必要とする
+    実装タスクの一部として扱う
+  - 実装詳細を推測で決め打ちしない。既存のコード・仕様・テストを確認してから実装する
+  - どの不確実性がどのタスクに関係するかはあなたが判断する。関係しないタスクへ機械的に
+    全件コピーしない
 - 各タスクには category を必ず設定する:
   - "implementation": 実際にコード/ドキュメント/設定の変更を行いプロジェクトの成果物を生み出すタスク
   - "verification": 既に実装された変更のテスト・QA・検証を行うタスク。**注意**: 小規模変更では implementation タスクにテスト検証を組み込み、別途 verification タスクを生成しないこと。verification は変更が広範囲で検証が別途必要とされる場合のみ生成する
@@ -103,7 +124,8 @@ ${constitutionPrinciplesPrompt}
       "dependencies": [],
       "acceptanceCriteria": ["テストが通る", "型エラーがない"],
       "allowedPaths": ["apps/engine/src/"],
-      "estimatedComplexity": "small"
+      "estimatedComplexity": "small",
+      "technicalUncertaintyRefs": []
     }
   ],
   "totalTasks": 12,
@@ -129,24 +151,69 @@ export interface RoadmapGeneratorOptions {
   priorAttemptFeedback?: string
 }
 
-export async function generateRoadmap(
+/**
+ * `decisionOwner: 'ai'`のGap（CEOへ質問されない、AIが既存repo/spec/testを調査して解決すべき
+ * 技術的不確実性）をRoadmap生成プロンプトへ渡す。
+ *
+ * これが無いと、CEO質問から除外したGapがどの後続AIにも届かない
+ * （`gap_analysis.md`は書き出されるだけで読み手が存在しない）。**除外は「解決済み」ではない**:
+ * specAnalyzerはrepo/spec/testを読んでいないため、不確実性の種類を判定できても答えは知らない。
+ * Roadmapを立てるAIが、調査そのものを計画へ織り込めるようにする。
+ */
+export interface TechnicalUncertainty {
+  /** この生成ラウンド内で安定した参照ID（`U1`, `U2`...）。 */
+  ref: string
+  description: string
+  category: string
+  severity: string
+  suggestion: string
+}
+
+/**
+ * `decisionOwner: 'ai'`のGapへ、この生成ラウンド内で安定した参照IDを振る。
+ * `analysis.gaps`の順序から決定論的に導出するため、生成・検証・展開の三者が
+ * 同じIDを再計算できる（IDを別に永続化する必要がない）。
+ */
+export function collectTechnicalUncertainties(analysis: SpecAnalysis): TechnicalUncertainty[] {
+  return analysis.gaps
+    .filter((gap) => gap.decisionOwner === 'ai')
+    .map((gap, index) => ({
+      ref: `U${index + 1}`,
+      description: gap.description,
+      category: gap.category,
+      severity: gap.severity,
+      suggestion: gap.suggestion,
+    }))
+}
+
+function buildOpenTechnicalUncertaintiesSection(analysis: SpecAnalysis): string {
+  const uncertainties = collectTechnicalUncertainties(analysis)
+  if (uncertainties.length === 0) return ''
+
+  return `
+## Open Technical Uncertainties (resolve by investigating the existing repo/spec/tests)
+
+これらはCEOへ質問されない。既存の実装・仕様・テストを調査すれば答えが決まる種類の不確実性であり、
+Roadmapを立てる時点で「調査して確定させる」対象として扱うこと。推測で決め打ちしない。
+
+**それぞれを解決する必要があるタスクの \`technicalUncertaintyRefs\` へ、下記のIDを列挙すること。**
+参照された本文は自動でそのタスクのdescriptionへ展開される（あなたが書き写す必要はない）。
+**すべてのIDが最低1つのタスクから参照されていなければRoadmapは却下され、再生成になる。**
+関係しないタスクへ機械的に全件コピーしないこと。調査だけの独立タスクは作らないこと。
+
+${uncertainties.map((u) => `- ${u.ref}: ${u.description}（${u.category} / ${u.severity}）\n  調査の手がかり: ${u.suggestion}`).join('\n')}
+`
+}
+
+/**
+ * Roadmap生成プロンプトへ渡すProject Summary本文。
+ * プロンプトへ実際に何が載るかをテストから検証できるよう、組み立てだけを切り出している。
+ */
+export function buildRoadmapProjectSummary(
   analysis: SpecAnalysis,
   options: RoadmapGeneratorOptions = {},
-): Promise<Roadmap> {
-  const { mockResponse, model = 'claude-haiku-4-5-20251001' } = options
-
-  if (mockResponse !== undefined) {
-    return parseRoadmapJson(mockResponse)
-  }
-
-  const apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY
-  if (!apiKey) {
-    throw new Error('[CTO AI] ANTHROPIC_API_KEY が設定されていません。')
-  }
-
-  const client = new Anthropic({ apiKey })
-
-  const projectSummary = `
+): string {
+  return `
 # Project Summary
 
 ${options.definitionHash ? `## Project Definition Hash\n${options.definitionHash}\n` : ''}
@@ -177,6 +244,7 @@ ${analysis.techStack.map(t => `- ${t}`).join('\n')}
 
 ## Structured Constraints
 ${JSON.stringify(analysis.structuredConstraints, null, 2)}
+${buildOpenTechnicalUncertaintiesSection(analysis)}
 ${options.priorAttemptFeedback ? `
 ## Previous Attempt Was Rejected -- Fix This
 
@@ -185,6 +253,26 @@ ${options.priorAttemptFeedback}
 Generate a NEW roadmap that addresses this specific problem. Do not repeat the same structural mistake.
 ` : ''}
 `.trim()
+}
+
+export async function generateRoadmap(
+  analysis: SpecAnalysis,
+  options: RoadmapGeneratorOptions = {},
+): Promise<Roadmap> {
+  const { mockResponse, model = 'claude-haiku-4-5-20251001' } = options
+
+  if (mockResponse !== undefined) {
+    return parseRoadmapJson(mockResponse)
+  }
+
+  const apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY
+  if (!apiKey) {
+    throw new Error('[CTO AI] ANTHROPIC_API_KEY が設定されていません。')
+  }
+
+  const client = new Anthropic({ apiKey })
+
+  const projectSummary = buildRoadmapProjectSummary(analysis, options)
 
   const message = await client.messages.create({
     model,
