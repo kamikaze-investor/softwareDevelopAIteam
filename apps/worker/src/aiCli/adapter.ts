@@ -18,7 +18,7 @@
 
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFileSync, existsSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, existsSync, unlinkSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type {
@@ -64,6 +64,58 @@ function resolvePnpmPath(): string {
   return 'pnpm'  // 見つからなければ 'pnpm' のまま（catch で non-fatal）
 }
 
+/** capture用一時ディレクトリの接頭辞。cleanupが「自分が作ったもの」を識別するために使う。 */
+const CAPTURE_DIR_PREFIX = 'codex-lastmsg-'
+
+/**
+ * パスを正規化する。realpathはsymlinkを解決するが、存在しないパスでは失敗するので
+ * その場合は`path.resolve`の結果へフォールバックする。Windowsは大文字小文字を区別しないため
+ * 比較用に小文字化する。
+ */
+function canonicalPath(target: string): string {
+  const resolved = path.resolve(target)
+
+  let real: string
+  try {
+    real = realpathSync(resolved)
+  } catch {
+    real = resolved
+  }
+
+  return process.platform === 'win32' ? real.toLowerCase() : real
+}
+
+/** `child`が`parent`と同一、またはその配下かを**正規化後のパスで**判定する。 */
+function isInside(child: string, parent: string): boolean {
+  const c = canonicalPath(child)
+  const p = canonicalPath(parent)
+
+  return c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep)
+}
+
+/**
+ * capture用一時ファイルを置くtemp rootを決める。
+ *
+ * **OS temp が対象リポジトリの外にあることを検証してから返す（fail-closed）。**
+ * `TMPDIR`（POSIX）や`TEMP`（Windows）はリポジトリ内を指しうるし、temp rootがリポジトリ内へ
+ * 解決されるsymlinkであることもある。その場合に黙って書くと、read-onlyの保証を
+ * **破っていることに気付けないまま**capture fileがリポジトリ内に作られる
+ * （独立レビュー指摘、2026-09-08。`TMPDIR=/workspace/target/.tmp`で実際に再現された）。
+ * 推測で別の場所を選ばず、ここで失敗させる。
+ */
+function resolveCaptureTempRoot(workingDir: string): string {
+  const tmpRoot = os.tmpdir()
+
+  if (isInside(tmpRoot, workingDir)) {
+    throw new Error(
+      `[aiCli] OS temp directory (${tmpRoot}) が対象リポジトリ (${workingDir}) の内側にあります。`
+      + `capture fileをリポジトリ内へ書くとread-only保証が壊れるため中止します。`,
+    )
+  }
+
+  return tmpRoot
+}
+
 /**
  * Codexの最終回答を確実に受け取るための`--output-last-message`用一時ファイルのパス。
  *
@@ -83,7 +135,7 @@ function buildCodexOutputLastMessagePath(request: AiCliRequest): string | undefi
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .slice(0, 64) || 'task'
 
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
+  const dir = mkdtempSync(path.join(resolveCaptureTempRoot(request.workingDir), CAPTURE_DIR_PREFIX))
 
   return path.join(
     dir,
@@ -101,19 +153,30 @@ function readCodexOutputLastMessage(filePath: string | undefined): Record<string
   }
 }
 
-function cleanupCodexOutputLastMessage(filePath: string | undefined): void {
+/** exported for tests: the traversal guard below is security-relevant and must be tested directly. */
+export function cleanupCodexOutputLastMessage(filePath: string | undefined): void {
   if (filePath === undefined) return
 
   try {
     if (existsSync(filePath)) unlinkSync(filePath)
 
     // `buildCodexOutputLastMessagePath`が作った専用ディレクトリごと消す。
-    // **OS temp配下であることを確認してからにする** — 万一呼び出し元が別のパスを
-    // 渡してきた場合に、対象リポジトリのディレクトリを消してしまわないため。
-    const dir = path.dirname(filePath)
-    if (dir.startsWith(path.join(os.tmpdir(), 'codex-lastmsg-'))) {
-      rmSync(dir, { recursive: true, force: true })
-    }
+    //
+    // **接頭辞の文字列一致だけで再帰削除を許可しない。** 素朴な`startsWith`は
+    // `/tmp/codex-lastmsg-x/../../srv/data` のようなパスを通してしまい、`rmSync`が
+    // `..`を解決した結果まったく別のディレクトリを再帰削除しうる。symlinkでも同じことが起きる
+    // （独立レビュー指摘、2026-09-08）。
+    // そこで**正規化（resolve + realpath）した上で**、
+    //   1. ディレクトリ名が自分の接頭辞で始まり
+    //   2. その親がOS temp root そのもの
+    // という、`mkdtemp`が作る形と厳密に一致する場合だけ削除する。
+    const dir = path.resolve(path.dirname(filePath))
+    if (!path.basename(dir).startsWith(CAPTURE_DIR_PREFIX)) return
+
+    const parent = path.dirname(dir)
+    if (canonicalPath(parent) !== canonicalPath(os.tmpdir())) return
+
+    rmSync(dir, { recursive: true, force: true })
   } catch {
     // cleanup failure is non-fatal; changed-file guards still inspect the worktree later.
   }

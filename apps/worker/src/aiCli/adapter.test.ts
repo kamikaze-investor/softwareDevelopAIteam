@@ -10,7 +10,7 @@
  *   - isPromptSafe() のパターンマッチ
  */
 
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -442,6 +442,53 @@ describe('CodexAdapter --output-last-message structured output', () => {
     // the dedicated temp directory is cleaned up as well, not just the file
     expect(existsSync(capturedPath)).toBe(false)
     expect(existsSync(path.dirname(capturedPath))).toBe(false)
+  })
+
+  // Independent review finding 1 (2026-09-08): a lexical `startsWith` prefix check authorised
+  // recursive deletion, so a path like `<tmp>/codex-lastmsg-x/../../srv/data/f.json` passed the
+  // check and then `rmSync` resolved the `..` and deleted an unrelated directory.
+  it('does not delete a directory reached by traversing out of the temp prefix', async () => {
+    const { cleanupCodexOutputLastMessage } = await import('./adapter.js')
+
+    const victim = mkdtempSync(path.join(os.tmpdir(), 'victim-'))
+    writeFileSync(path.join(victim, 'precious.txt'), 'do not delete', 'utf-8')
+
+    // Built by string concatenation on purpose: `path.join` would normalise the `..` away at
+    // construction time and the crafted path would never reach the guard. Lexically this still
+    // starts with the capture prefix, but it resolves to the victim directory -- which is exactly
+    // what the old `startsWith` check authorised `rmSync` to delete recursively.
+    const traversal = os.tmpdir() + path.sep + 'codex-lastmsg-fake' + path.sep + '..'
+      + path.sep + path.basename(victim) + path.sep + 'result.json'
+
+    cleanupCodexOutputLastMessage(traversal)
+
+    expect(existsSync(victim)).toBe(true)
+    expect(existsSync(path.join(victim, 'precious.txt'))).toBe(true)
+    rmSync(victim, { recursive: true, force: true })
+  })
+
+  // Independent review finding 2 (2026-09-08): `os.tmpdir()` was assumed to be outside the
+  // target repo. With TMPDIR pointing inside it, the capture file lands in the repository and
+  // silently breaks the read-only guarantee. Fail closed instead.
+  it('refuses to run when the OS temp dir resolves inside the target repo', async () => {
+    const workingDir = makeWorkingDir()
+    const insideRepo = path.join(workingDir, '.tmp')
+    mkdirSync(insideRepo, { recursive: true })
+
+    const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP }
+    process.env.TMPDIR = insideRepo
+    process.env.TEMP = insideRepo
+    process.env.TMP = insideRepo
+
+    try {
+      const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+      await expect(adapter.run(makeRequest(workingDir))).rejects.toThrow(/OS temp directory/)
+      expect(execFileSyncMock).not.toHaveBeenCalled()
+    } finally {
+      process.env.TMPDIR = saved.TMPDIR
+      process.env.TEMP = saved.TEMP
+      process.env.TMP = saved.TMP
+    }
   })
 
   it('falls back to stdout retry when last-message parsing fails', async () => {
