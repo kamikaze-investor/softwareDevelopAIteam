@@ -450,27 +450,36 @@ describe('CodexAdapter --output-last-message structured output', () => {
     expect(existsSync(path.dirname(capturedPath))).toBe(false)
   })
 
-  // Independent review finding 1 (2026-09-08): a lexical `startsWith` prefix check authorised
-  // recursive deletion, so a path like `<tmp>/codex-lastmsg-x/../../srv/data/f.json` passed the
-  // check and then `rmSync` resolved the `..` and deleted an unrelated directory.
-  it('does not delete a directory reached by traversing out of the temp prefix', async () => {
-    const { cleanupCodexOutputLastMessage } = await import('./adapter.js')
+  // Independent review, round 2 (2026-09-08): the earlier guard tried to prove ownership of a
+  // caller-supplied path string, which is not possible -- passing an unrelated path caused an
+  // unrelated file to be unlinked, and a same-prefixed sibling directory to be deleted whole.
+  // cleanup now takes the capture object this process created, so there is no untrusted-path
+  // entry point left to attack. What remains worth testing is that it removes ONLY its own
+  // directory and leaves a same-prefixed sibling alone.
+  it('removes only its own capture directory, not same-prefixed siblings', async () => {
+    const workingDir = makeWorkingDir()
+    const sibling = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
+    writeFileSync(path.join(sibling, 'other-run.json'), '{}', 'utf-8')
 
-    const victim = mkdtempSync(path.join(os.tmpdir(), 'victim-'))
-    writeFileSync(path.join(victim, 'precious.txt'), 'do not delete', 'utf-8')
+    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+    let ownDir: string | undefined
 
-    // Built by string concatenation on purpose: `path.join` would normalise the `..` away at
-    // construction time and the crafted path would never reach the guard. Lexically this still
-    // starts with the capture prefix, but it resolves to the victim directory -- which is exactly
-    // what the old `startsWith` check authorised `rmSync` to delete recursively.
-    const traversal = os.tmpdir() + path.sep + 'codex-lastmsg-fake' + path.sep + '..'
-      + path.sep + path.basename(victim) + path.sep + 'result.json'
+    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
+      const args = argv ?? []
+      const out = args[args.indexOf('--output-last-message') + 1]
+      if (out === undefined) throw new Error('missing --output-last-message path')
+      ownDir = path.dirname(out)
+      writeFileSync(out, '{"ok":true}', 'utf-8')
+      return 'not json'
+    })
 
-    cleanupCodexOutputLastMessage(traversal)
+    await adapter.run(makeRequest(workingDir))
 
-    expect(existsSync(victim)).toBe(true)
-    expect(existsSync(path.join(victim, 'precious.txt'))).toBe(true)
-    rmSync(victim, { recursive: true, force: true })
+    expect(ownDir).toBeTruthy()
+    expect(existsSync(ownDir as string)).toBe(false)
+    expect(existsSync(sibling)).toBe(true)
+    expect(existsSync(path.join(sibling, 'other-run.json'))).toBe(true)
+    rmSync(sibling, { recursive: true, force: true })
   })
 
   // Independent review finding 2 (2026-09-08): `os.tmpdir()` was assumed to be outside the
@@ -491,9 +500,13 @@ describe('CodexAdapter --output-last-message structured output', () => {
       await expect(adapter.run(makeRequest(workingDir))).rejects.toThrow(/OS temp directory/)
       expect(execFileSyncMock).not.toHaveBeenCalled()
     } finally {
-      process.env.TMPDIR = saved.TMPDIR
-      process.env.TEMP = saved.TEMP
-      process.env.TMP = saved.TMP
+      // Assigning undefined sets the literal string "undefined"; the var must be deleted instead,
+      // otherwise the next test mkdtemps into a path named "undefined" and fails with ENOENT
+      // (independent review finding, 2026-09-08).
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
     }
   })
 
