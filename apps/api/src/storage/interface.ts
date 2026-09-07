@@ -645,6 +645,16 @@ export interface IWatchdogEventStorage {
   findAll(): WatchdogEvent[]
   findByJobId(jobId: string): WatchdogEvent[]
   findById(id: string): WatchdogEvent | undefined
+  /**
+   * DB-007: 1つの stall episode = `(jobId, startedAt)`。
+   * Job は復旧後に再び running になり得て、そのとき startedAt は付け直されるので、
+   * これは「同じ Job の別の stall」と「同じ stall の重複報告」を区別できる。
+   */
+  findByEpisode(jobId: string, startedAt: string): WatchdogEvent | undefined
+  /**
+   * DB-007: episode 単位で冪等。同じ `(jobId, startedAt)` に対して何度呼んでも
+   * 行は増えず、既存の event を返す。Worker restart 後の再検出でも重複しない。
+   */
   create(event: Omit<WatchdogEvent, 'id' | 'createdAt'>): WatchdogEvent
   update(id: string, data: Partial<Pick<WatchdogEvent, 'status' | 'aiAnalysis' | 'isStuck' | 'resolvedAt'>>): WatchdogEvent | undefined
 }

@@ -44,6 +44,12 @@ export async function watchdogEventRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: body.error.message })
     }
     const storage = getStorage()
+    // DB-007: 同じ stall episode `(jobId, startedAt)` の再 POST は新しい行を作らない。
+    // Worker が restart しても、event 作成を retry しても、記録は1件に保たれる。
+    // 既存があれば 200（作成していない）、新規なら 201 を返し、呼び出し元が区別できるようにする。
+    const existing = storage.watchdogEvents.findByEpisode(body.data.jobId, body.data.startedAt)
+    if (existing) return reply.status(200).send(existing)
+
     const event = storage.watchdogEvents.create({
       ...body.data,
       commandKind: body.data.commandKind as any,
