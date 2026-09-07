@@ -17,7 +17,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync, existsSync, unlinkSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
+import { readFileSync, existsSync, unlinkSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type {
@@ -73,44 +73,56 @@ const CAPTURE_DIR_PREFIX = 'codex-lastmsg-'
 /**
  * OS が正準と見なす実パス。
  *
- * `realpathSync.native` を優先するのは、通常の `realpathSync` が **symlinkでない部分の綴りを
- * そのまま残す** ため。Windowsの8.3短縮名では `C:\WORKSP~1\TARGET~1\repo` と
- * `C:\Workspace\Target\repo` が同一の場所を指すのに文字列としては一致せず、
- * 小文字化しても一致しない（独立レビュー指摘、2026-09-08）。
- * nativeは長い正準形へ展開するのでこの抜け道を塞ぐ。
- *
- * **失敗したら例外を投げる（fail-closedのため意図的に握り潰さない）。**
+ * `realpathSync.native` のみを使う。通常の `realpathSync` は symlinkでない部分の綴りを
+ * 残すため、Windowsの8.3短縮名（`C:\WORKSP~1` と `C:\Workspace`）を同一と見なせない。
+ * **nativeが失敗しても綴りを畳めない実装へフォールバックしない** — 「解決できなかった」を
+ * 「安全」と読み替えないため（独立レビュー指摘、2026-09-08）。失敗は呼び出し元へ伝播する。
  */
 function canonicalRealPath(target: string): string {
-  const resolved = path.resolve(target)
-
-  try {
-    return realpathSync.native(resolved)
-  } catch {
-    // nativeが使えない環境向けのfallback。ここも失敗すれば例外がそのまま伝播する。
-    return realpathSync(resolved)
-  }
-}
-
-/** 比較専用の正規化。Windowsは大文字小文字を区別しないので畳む（実パスとしては使わない）。 */
-function comparablePath(target: string): string {
-  const real = canonicalRealPath(target)
-
-  return process.platform === 'win32' ? real.toLowerCase() : real
+  return realpathSync.native(path.resolve(target))
 }
 
 /**
- * `child` が `parent` と同一、またはその配下かを正準パスで判定する。
- * **正規化できなければ判定不能として例外を投げる。** 「解決できなかったから安全」は誤りで、
- * 一時的な EPERM/EIO で false を返すと、その直後にリポジトリ内へ書いてしまう
- * （独立レビュー指摘、2026-09-08）。
+ * 2つのパスが**同一のディレクトリ実体**かを inode で判定する。
+ *
+ * 文字列比較では不十分。bind mount / UNC alias / mount point は、
+ * 同じディレクトリに対して異なる正準文字列を与えうるので、
+ * `TMPDIR` をリポジトリのbind mount先へ向けるだけで文字列ベースの封じ込めは破れる
+ * （独立レビュー指摘、2026-09-08）。device + inode は綴りに依存しない同一性を与える。
+ */
+function isSameDirectory(a: string, b: string): boolean {
+  const sa = statSync(a)
+  const sb = statSync(b)
+
+  return sa.dev === sb.dev && sa.ino === sb.ino
+}
+
+/**
+ * `child` が `parent` と同一、またはその配下かを **inode 同一性**で判定する。
+ * 祖先を辿って `parent` と同じ実体に当たるかを見る。
+ * **解決できなければ例外を投げる**（判定不能を「安全」と扱わない）。
  */
 function isInside(child: string, parent: string): boolean {
-  const c = comparablePath(child)
-  const p = comparablePath(parent)
+  const parentReal = canonicalRealPath(parent)
+  let current = canonicalRealPath(child)
 
-  return c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep)
+  for (;;) {
+    if (isSameDirectory(current, parentReal)) return true
+
+    const next = path.dirname(current)
+    if (next === current) return false
+    current = next
+  }
 }
+
+/**
+ * このプロセスが作った capture ディレクトリの登録簿。
+ *
+ * cleanup は**ここに登録されたものだけ**を消す。引数の構造だけを信じると、
+ * 内部APIへ手で組んだオブジェクトを渡すだけで無関係なツリーを再帰削除できてしまう
+ * （独立レビュー指摘、2026-09-08）。所有権は実行時の事実として持つ。
+ */
+const OWNED_CAPTURE_DIRS = new Set<string>()
 
 function formatErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -143,7 +155,19 @@ function createCodexOutputCapture(request: AiCliRequest): CodexOutputCapture | u
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .slice(0, 64) || 'task'
 
-  const captureDir = mkdtempSync(path.join(canonicalRealPath(os.tmpdir()), CAPTURE_DIR_PREFIX))
+  // **作る前に**temp rootを検査する。作ってから消す方式だと、TMPDIRがリポジトリ内を
+  // 指しているときに一瞬だけリポジトリ内へディレクトリが現れ、その間にSIGKILLされると
+  // 残骸が残る（独立レビュー指摘、2026-09-08）。「一瞬も作らない」を実際に満たすため、
+  // 事前チェックと事後チェックの両方を持つ。事後チェックはこの後のTOCTOU用。
+  const tmpRoot = canonicalRealPath(os.tmpdir())
+  if (isInside(tmpRoot, request.workingDir)) {
+    throw new Error(
+      `[aiCli] OS temp directory (${tmpRoot}) が対象リポジトリ (${request.workingDir}) の内側です。`
+      + `capture fileをリポジトリ内へ書くとread-only保証が壊れるため中止します。`,
+    )
+  }
+
+  const captureDir = mkdtempSync(path.join(tmpRoot, CAPTURE_DIR_PREFIX))
 
   let insideRepo: boolean
   try {
@@ -164,6 +188,8 @@ function createCodexOutputCapture(request: AiCliRequest): CodexOutputCapture | u
       + `解決されました。capture fileをリポジトリ内へ書くとread-only保証が壊れるため中止します。`,
     )
   }
+
+  OWNED_CAPTURE_DIRS.add(captureDir)
 
   return {
     captureDir,
@@ -199,11 +225,15 @@ function readCodexOutputLastMessage(filePath: string | undefined): Record<string
  */
 export function cleanupCodexOutputCapture(capture: CodexOutputCapture | undefined): void {
   if (capture === undefined) return
+  // **このプロセスが実際に作ったディレクトリでなければ何もしない。**
+  if (!OWNED_CAPTURE_DIRS.has(capture.captureDir)) return
 
   try {
     rmSync(capture.captureDir, { recursive: true, force: true })
+    OWNED_CAPTURE_DIRS.delete(capture.captureDir)
   } catch {
-    // cleanup failure is non-fatal; changed-file guards still inspect the worktree later.
+    // 失敗しても登録は残す（次の機会に再試行できる）。OS temp配下なので
+    // 残ってもリポジトリのread-only保証は壊れない。
   }
 }
 

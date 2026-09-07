@@ -463,15 +463,18 @@ describe('CodexAdapter --output-last-message structured output', () => {
     const notOwned = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
     writeFileSync(path.join(notOwned, 'someone-elses-run.json'), '{}', 'utf-8')
 
+    // Round-4 hardening: cleanup only removes directories this process actually created,
+    // so a hand-built object is refused outright. Both directories must survive.
     cleanupCodexOutputCapture({
       captureDir: owned,
       filePath: path.join(notOwned, 'capture.json'),
     })
 
-    expect(existsSync(owned)).toBe(false)
+    expect(existsSync(owned)).toBe(true)
     expect(existsSync(notOwned)).toBe(true)
     expect(existsSync(path.join(notOwned, 'someone-elses-run.json'))).toBe(true)
 
+    rmSync(owned, { recursive: true, force: true })
     rmSync(notOwned, { recursive: true, force: true })
   })
 
