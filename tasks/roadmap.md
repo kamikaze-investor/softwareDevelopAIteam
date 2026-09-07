@@ -1299,6 +1299,47 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
 **将来項目（Step 2系の完了後に個別判断。今回は着手しない）**
 
+<!-- roadmap:id=meta-review-structured-output-robustness state=planned -->
+12. [ ] **Meta Reviewer structured-output robustness / false-BLOCKED の解消** — 2026-09-07、PR #98 / #99
+      の実測により登録。`project-auto-meta-review-hardening`（上記11、done）の後続で、**同じ既存
+      Meta Review経路の改善**である。新しいReviewer・新しいReview基盤・新しいGateは追加しない。
+
+      **観測された事象1: format/parse failure による false BLOCKED**
+      Geminiが JSON 指定にもかかわらず prose / fenced JSON（```json や「## フェーズ1: …」で始まる
+      説明文）を返すと、parserが失敗し `[critical] Meta Review AIの応答が不正なフォーマットです`
+      として fail-close BLOCKED になる。**substantive review自体は成功しているのに format だけで
+      失敗するケースがある**（PR #98 の1回目の実行では、ownership/quarantine機構に対する肯定的で
+      具体的な講評が応答内に出力された後、parse段で失敗している）。PR #98では3回連続で再現した。
+      同一failureへの blind retrigger は provider quota を浪費するだけで解消しない。
+      大きなdiffで再現しやすい可能性はあるが、**現時点では断定しない**（PR #98は約4,300行）。
+
+      **観測された事象2: 二点間diffによる phantom deletion で false BLOCKED**
+      `apps/worker/src/metaReviewer/autoReview.ts:75` が
+      `['diff', baseSha, headSha]`（**二点間diff**）でreview対象を構築している。`BASE_SHA` は
+      `.github/workflows/meta-review.yml:69` で `github.event.pull_request.base.sha`（**現在の**
+      base tip）が渡されるため、PR head が base の一部commitより古いと、**その base側commitが
+      「削除」として現れる**。実例: PR #99 は `tasks/roadmap.md` のみ71行追加のdocs PRだったが、
+      Meta Reviewは「Project開始ワークフロー全体が削除された」として `BLOCKED / critical` を返した
+      （PR #97 を含まないbaseからbranchを切っていたため）。rebase後に同じPRはPASSした。
+      本セッション中に同種のphantom deletionを複数回観測している。
+
+      **注意: これは「reviewの前にbaseを最新化する処理が無い」問題ではない。** baseはむしろ最新
+      であり、head側が古いまま**二点間**で比較されることが原因である。したがって新しい
+      「base最新化gate」を追加するのではなく、diffの取り方を直すのが正しい対処である。
+
+      **対応方針（実装時。新Reviewerを足さず既存Meta Reviewを改善する）**:
+      - provider側の structured output / JSON schema 強制（`geminiRouter.ts` は既に
+        `--output-format json --json-schema` を渡せる。Meta Review経路へ接続できるか確認する）
+      - fenced JSON（```json …```）の安全な正規化
+      - parse failure時に**既に得られている substantive response を捨てない**設計
+        （少なくともログ/PRコメントへ残し、人間が判断できるようにする）
+      - 同一 parse failure に対する bounded retry（無限・無制限の retrigger を避ける）
+      - 事象2は `autoReview.ts` の diff を三点間（merge-base起点、`baseSha...headSha` 相当）へ
+        変更することで解消する。既存のBASE_SHA受け渡し自体は変更しない
+
+      **今回実装しないもの（明記）**: 本項目はFinding記録であり、PR-C（#98）のmergeとは分離する。
+      新しいReviewer種別・新しいReview基盤・新しいmerge gate・base最新化専用gateは追加しない。
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
@@ -1321,6 +1362,14 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       running Jobを無条件failedにするため、Workerの2重起動は互いの実行中Jobを破壊する
       （`jobStateManager.ts:31-66`）。またWorkerのqueued Job取得と`running`更新が別リクエストのため
       atomicにclaimできない。MVPは単一Worker前提を維持する
+
+      **2026-09-07 追記（P1 Phase 2 独立レビュー B5）**: 同一 workspace を所有する Job が同時に
+      走らないことは、現状 **host レベルの `flock -n`（Worker unit の ExecStart）と Worker プロセス内の
+      `findWorkspaceOwningTaskId()` の組み合わせ**で担保されている。本番でこの flock は実測済みであり、
+      P1 Phase 2 の blocker ではない。ただし **`jobs` schema には `working_dir` の lease も
+      active-owner 制約も無い**ため、所有権は durable な制約ではなく運用構成に依存している。
+      これは containment とは別 root cause であり、本項目（atomic claim / ownership・lease）で扱う。
+      新規 Finding は起こさない（重複のため）。
 <!-- roadmap:id=project-auto-resource-allocation state=deferred -->
 4. [ ] **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に
       完全未登録であることを確認済み。単一Worker前提のMVPでは配分問題自体が発生しないため
@@ -2421,6 +2470,38 @@ startup reconciliation（および Phase 2 で実装予定の per-job cgroup con
       **今回実装しないもの（明記）:** Harness導入 / OpenHands導入 / Harness Adapter実装 /
       既存Job Runnerの置換 / 新しいsandbox基盤の構築。本項目はRoadmapへの将来方針と評価条件の
       記録のみであり、着手可否は既存High-priority Repair完了後に判断する。
+
+<!-- roadmap:id=containment-adversarial-escape-threat-model state=planned -->
+2. [ ] **Containment adversarial escape（cgroup migration / git external helper）— security Finding** —
+      2026-09-07、P1 Phase 2（async per-job cgroup containment）のCodex独立設計レビューで指摘。
+      **Phase 2の対象外としてCEO判断済み**であり、本項目は記録のみ。
+
+      **Phase 2が守る範囲（CEO確定のthreat model）**: trusted Worker / trusted execution tools /
+      accidental runaway・timeout・crash・daemonized descendant。
+      PR-Cで確定した Worker trust boundary をそのまま維持する。
+
+      **本項目が扱う、Phase 2の対象外**:
+      - **cgroup migration**: payload が per-job cgroup から自分のPIDを親/兄弟の `cgroup.procs` へ
+        書き込んで**意図的に脱出**するケース。`Delegate=yes` は delegated subtree 全体からの脱出は
+        防ぐが、subtree **内**の移動を本質的に禁じるものではない。`cgroup.kill` は kill 開始前に
+        移動し終えたプロセスには届かない。**本番で実際に移動可能かは UNVERIFIED**（未実測）
+      - **git external helper 経由の脱出**: `core.fsmonitor` hook や clean/process filter は
+        git が外部プロセスを fork する正規の仕組みであり、封じ込め対象外で実行される
+        `git status` / `git add` から起動され得る。repository-local な git 設定を無害化していない限り、
+        daemon 化した helper が worktree を変更し続け得る
+
+      **なぜPhase 2に入れないか**: いずれも「payload または trusted tool 自身が意図的に脱出する」
+      前提を必要とし、現行の trust boundary とは別の threat model に属する。防御するには
+      non-migration enforcement と全 git 呼び出しの hardened invocation が要り、
+      **新しい sandbox / security architecture の導入**になる。Phase 2 の目的（事故で残った
+      プロセスの確実な回収）とは責務が異なる。
+
+      **着手する場合の前提（実装ではなく判断材料）**: まず本番で「payload が親/兄弟 cgroup へ
+      migrate できるか」を実測すること。移動が実際に拒否されるなら、この経路の優先度は下がる。
+      関連: 上記1 Harness Bake-off（低レベル execution layer ごと差し替える選択肢）。
+
+      **今回実装しないもの（明記）**: non-migration enforcement / git設定のhardening /
+      新sandbox基盤 / attestation。本項目はFinding記録のみ。
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
