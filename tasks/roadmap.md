@@ -1321,6 +1321,14 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       running Jobを無条件failedにするため、Workerの2重起動は互いの実行中Jobを破壊する
       （`jobStateManager.ts:31-66`）。またWorkerのqueued Job取得と`running`更新が別リクエストのため
       atomicにclaimできない。MVPは単一Worker前提を維持する
+
+      **2026-09-07 追記（P1 Phase 2 独立レビュー B5）**: 同一 workspace を所有する Job が同時に
+      走らないことは、現状 **host レベルの `flock -n`（Worker unit の ExecStart）と Worker プロセス内の
+      `findWorkspaceOwningTaskId()` の組み合わせ**で担保されている。本番でこの flock は実測済みであり、
+      P1 Phase 2 の blocker ではない。ただし **`jobs` schema には `working_dir` の lease も
+      active-owner 制約も無い**ため、所有権は durable な制約ではなく運用構成に依存している。
+      これは containment とは別 root cause であり、本項目（atomic claim / ownership・lease）で扱う。
+      新規 Finding は起こさない（重複のため）。
 <!-- roadmap:id=project-auto-resource-allocation state=deferred -->
 4. [ ] **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に
       完全未登録であることを確認済み。単一Worker前提のMVPでは配分問題自体が発生しないため
@@ -2360,6 +2368,38 @@ startup reconciliation（および Phase 2 で実装予定の per-job cgroup con
       **今回実装しないもの（明記）:** Harness導入 / OpenHands導入 / Harness Adapter実装 /
       既存Job Runnerの置換 / 新しいsandbox基盤の構築。本項目はRoadmapへの将来方針と評価条件の
       記録のみであり、着手可否は既存High-priority Repair完了後に判断する。
+
+<!-- roadmap:id=containment-adversarial-escape-threat-model state=planned -->
+2. [ ] **Containment adversarial escape（cgroup migration / git external helper）— security Finding** —
+      2026-09-07、P1 Phase 2（async per-job cgroup containment）のCodex独立設計レビューで指摘。
+      **Phase 2の対象外としてCEO判断済み**であり、本項目は記録のみ。
+
+      **Phase 2が守る範囲（CEO確定のthreat model）**: trusted Worker / trusted execution tools /
+      accidental runaway・timeout・crash・daemonized descendant。
+      PR-Cで確定した Worker trust boundary をそのまま維持する。
+
+      **本項目が扱う、Phase 2の対象外**:
+      - **cgroup migration**: payload が per-job cgroup から自分のPIDを親/兄弟の `cgroup.procs` へ
+        書き込んで**意図的に脱出**するケース。`Delegate=yes` は delegated subtree 全体からの脱出は
+        防ぐが、subtree **内**の移動を本質的に禁じるものではない。`cgroup.kill` は kill 開始前に
+        移動し終えたプロセスには届かない。**本番で実際に移動可能かは UNVERIFIED**（未実測）
+      - **git external helper 経由の脱出**: `core.fsmonitor` hook や clean/process filter は
+        git が外部プロセスを fork する正規の仕組みであり、封じ込め対象外で実行される
+        `git status` / `git add` から起動され得る。repository-local な git 設定を無害化していない限り、
+        daemon 化した helper が worktree を変更し続け得る
+
+      **なぜPhase 2に入れないか**: いずれも「payload または trusted tool 自身が意図的に脱出する」
+      前提を必要とし、現行の trust boundary とは別の threat model に属する。防御するには
+      non-migration enforcement と全 git 呼び出しの hardened invocation が要り、
+      **新しい sandbox / security architecture の導入**になる。Phase 2 の目的（事故で残った
+      プロセスの確実な回収）とは責務が異なる。
+
+      **着手する場合の前提（実装ではなく判断材料）**: まず本番で「payload が親/兄弟 cgroup へ
+      migrate できるか」を実測すること。移動が実際に拒否されるなら、この経路の優先度は下がる。
+      関連: 上記1 Harness Bake-off（低レベル execution layer ごと差し替える選択肢）。
+
+      **今回実装しないもの（明記）**: non-migration enforcement / git設定のhardening /
+      新sandbox基盤 / attestation。本項目はFinding記録のみ。
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
