@@ -2039,6 +2039,32 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **未解決の間の表現**: 「モデルによるrepo変更は禁止される」とは言ってよいが、
    **「filesystem上完全read-only」とは主張しない**。
 
+<!-- roadmap:id=task-codex-review-cannot-read-repo state=planned priority=high -->
+0. [ ] **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、
+   **高優先度**。CEO判断: Roadmap topology cutover（PR C）とは別責務なので**PR Cへ混ぜない**）。
+
+   **事実**: task-kindのCodex independent reviewは、`buildReviewPrompt()`
+   （`apps/worker/src/approvalLevel/reviewerAdapter.ts:151`）が
+   `git diff`本文（post）または変更計画本文（pre）を**promptへ埋め込んで**渡している。
+   一方でCodexは`--sandbox read-only`下でshell commandを1つも実行できない
+   （roadmap: codex-sandbox-off-deprecated-landlock）。
+   つまりレビュアーは**渡されたdiffしか見ておらず、その周辺のコードを読んでいない**。
+
+   **影響**: レビューは機能しているが**degraded**である。
+   「この変更は既存の呼び出し元と整合しているか」「他に同じパターンの箇所は無いか」
+   「この関数の実際の契約はどうなっているか」といった、diff外の事実に依存する指摘は
+   原理的に出せない。**壊れてはいないが、想定より弱い。**
+
+   **運用上の注意**: 「Codex independent reviewがPASSした」ことを
+   「Codexがrepoを読んで確認した」証拠として扱わないこと。
+   過去のCodex APPROVEも同じ前提で読み直す必要がある。
+
+   **修正候補**: call-localな`-c use_legacy_landlock=true`をtask-kind reviewer経路にも適用すれば
+   repoを読めるようになる（Roadmap経路では実測済み）。ただし
+   **これはdeprecatedな暫定手段**であり、恒久解決は
+   `codex-sandbox-off-deprecated-landlock`側で行う。適用範囲を広げる変更は
+   既存production reviewerの挙動を変えるため、独立した変更として扱いCEO承認を得ること。
+
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
    **高優先度**。CEO判断: PR Cでは`use_legacy_landlock`を暫定的な安全経路としてのみ使用し、
