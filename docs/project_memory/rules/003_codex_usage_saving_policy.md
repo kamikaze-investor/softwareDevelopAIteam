@@ -128,3 +128,34 @@ Codexの利用枠上限に達した場合でも、既存の品質Gate（Independ
 
 *Created by: CEO（Codex Usage Saving Policy指示） + Claude Code*
 *関連: [001_codex_integration_risks.md](001_codex_integration_risks.md) / [002_codex_operation_rules.md](002_codex_operation_rules.md) / [AGENTS.md](../../../AGENTS.md) section 9*
+
+---
+
+## 例外: 初回Roadmap生成（2026-09-07 追加、CEO判断）
+
+### Rule-030: 初回Roadmap生成は節約対象から除外する
+
+```
+Project開始時の初回Roadmap生成は、本ルールのCodex節約原則の**明示的な例外**とする。
+Codex経路が有効化された際は、利用可能な最高能力のモデルと最高のreasoning設定
+（現行runtimeでは gpt-5.6-sol / model_reasoning_effort=xhigh）を、
+コスト節約より品質を優先して使用する。
+```
+
+**理由**: Roadmapは1つのFindingを検証する作業ではなく、**Project全体の構造を決める最上流の工程**である。
+ここでの分割粒度・依存関係・スコープの誤りは、以降の全Task・全Review・全実装へ波及し、
+後段でいくら丁寧にレビューしても回収できない。Rule-015が禁じている「ゼロから調べ直す」浪費とは
+性質が異なり、初回Roadmapは定義上ゼロから設計する工程である。
+
+**この例外が及ぶ範囲**: 初回Roadmap生成のみ。Roadmap再生成（CONFLICT Recovery）・
+independent review・difference review・Root Cause分析など、他のCodex利用は
+Rule-014〜Rule-021の節約原則に従う。
+
+**必要な調査は制限しない**: 初回Roadmap生成では、既存repository・仕様・テストを
+read-onlyで必要な範囲まで自力調査してよい（Rule-015の「探索範囲を限定する」は適用しない）。
+既存Architectureや再利用可能な機構を理解しないまま立てたRoadmapは、
+後段のreviewでは修復できないためである。
+
+**現時点の状態（2026-09-07）**: これはpolicyであり、現行のruntimeを述べたものではない。
+**この時点ではRoadmap生成はまだCodex経路ではない。** Codex Roadmap Generatorの
+provider topology cutoverは別途行い、その時点でこのpolicyが実際に適用される。

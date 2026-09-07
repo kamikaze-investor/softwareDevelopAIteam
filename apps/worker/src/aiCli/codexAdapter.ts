@@ -77,6 +77,12 @@ export class CodexAdapter extends BaseCliAdapter {
     // 未指定時は従来どおり Codex CLI のデフォルトモデルに委ねる
     // （実装用Jobの挙動を変えないため、ここで既定値を補わない）。
     const modelArgs = request.model ? ['--model', request.model] : []
+
+    // reasoning effort も任意。指定された場合のみ `-c model_reasoning_effort=...` を渡す。
+    // 未指定時は何も足さず、CLI自身の設定に委ねる（既存呼び出し元のargvは不変）。
+    const reasoningArgs = request.reasoningEffort
+      ? ['-c', `model_reasoning_effort="${request.reasoningEffort}"`]
+      : []
     const outputLastMessagePath =
       (request as CodexLastMessageRequest).codexOutputLastMessagePath
     const outputLastMessageArgs = outputLastMessagePath
@@ -87,6 +93,7 @@ export class CodexAdapter extends BaseCliAdapter {
       'exec',
       '--sandbox', sandboxMode,
       ...modelArgs,
+      ...reasoningArgs,
       '-C', request.workingDir,   // ワークスペースルートを明示（execFileSync の cwd と一致）
       '--ephemeral',               // Workerの自動実行ではセッションファイルを残さない
       ...outputLastMessageArgs,
