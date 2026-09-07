@@ -97,3 +97,83 @@ commit前に「そのcommitが自分の変更範囲に収まっているか」�
 ### ステータス
 
 対処済み（PR #92 で revert・記録、PR #93 で正式に re-land）。再発防止のみ未着手
+
+---
+
+## [AV-003] deploy対象serviceとrestart順序を「前回のdeploy手順」から推定していた（near-miss）
+
+- **日時**: 2026-09-07
+- **重大度**: medium（near-miss。production incidentには至っていない）
+- **カテゴリ**: deploy_safety / process_integrity
+- **検出者**: Claude（PR-C（PR #98）のproduction deploy中、Worker restart直前の確認で検出）
+
+### 何が起きたか
+
+直前のdeploy（PR #89、gemini `--effort`）がWorker側のみのdeltaだったため、その際の
+「**Worker-only restart**」手順をPR-Cにもそのまま適用しかけた。
+
+しかしPR-Cのdeltaは以下を**同時に**含んでいた:
+
+| 変更 | 実体 |
+|---|---|
+| API request schema | `UpdateJobBody` / `FailIfRunningJobBody` に `workspaceBaseline`・quarantine系フィールドを追加 |
+| shared contract | `packages/shared/src/types/job.ts` に `JobWorkspaceBaseline` 等を追加 |
+| DB migration | `jobs.workspace_baseline TEXT`（additive） |
+| Worker payload | `queued -> running` claim のPATCHに `workspaceBaseline` を同梱 |
+
+Workerだけを先にrestartしていた場合の実際の挙動:
+
+1. 新Workerが `PATCH /api/jobs/:id` に `workspaceBaseline` を載せて送る
+2. 稼働中の**旧API**の `UpdateJobBody` は `.strict()` であり `workspaceBaseline` を知らない
+3. strict zodは未知キーを**拒否**するため **400 Validation failed**
+4. `confirmRunningTransition` が false を返し、**すべてのJob claimがfail closed**
+5. 設計上fail-closedなので、大きなエラーではなく「静かにJobが動かなくなる」形で現れる
+
+さらに `runMigrations()`（`apps/api/src/storage/sqlite.ts`）はstorage生成時、すなわち
+**API起動時**に実行されるため、Worker-only restartでは `workspace_baseline` カラム自体が
+追加されない（実測: restart前は26カラム、API restart後に27カラム）。
+
+deploy前確認で検出したためproductionへの影響は無く、実際のdeployは
+**API restart → migration確認 → health確認 → Worker restart** の順で完了した（CEO承認済み）。
+
+### 何が問題か
+
+「前回のdeploy手順を再利用したこと」そのものではない。
+
+**root cause**: 今回のdeltaが**どのruntime / schema / protocol boundaryを変更しているか**を見て、
+restart対象serviceとrestart順序を決定する、という判断ステップが既存のdeploy手順に不足していた。
+そのため「前回はWorkerだけ再起動した」という**先例**が、今回のdeltaの実態を確認しないまま
+そのまま適用されようとした。
+
+deployの正しさは「どのファイルを触ったか」ではなく「**どのruntimeが、どの契約で、いつ入れ替わるか**」で
+決まる。API↔Worker間はversion skewが起こり得る2プロセス構成であり、片側だけを進めると
+protocol互換性が壊れる。
+
+### 改善方向（未着手・記録のみ）
+
+**新しいdeploy gateを追加する前に、既存のdeploy workflow / prompt / checklistの改善で解決できるかを
+優先する。** 最低限、deploy前に当該deltaから次を判定すること:
+
+- API runtime変更の有無
+- Worker runtime変更の有無
+- shared contract（`packages/shared`）変更の有無
+- DB migrationの有無
+- API↔Worker protocol互換性（skew時にどちらが先だと壊れるか）
+- restart対象service
+- restart順序
+- migration適用タイミング（本system ではAPI起動時）
+
+**やらないこと（明記）**: `apps/api/** を触ったら必ずAPI restart` のような
+**path-basedの固定ルールにはしない**。目的はパスの機械的判定ではなく、
+「変更内容から必要なruntime restart / migration / deploy orderを導出する」ことである。
+path-based ruleは、pathが変わっていなくても契約が変わる場合（shared type経由など）を取りこぼし、
+逆に無害な変更で不要なrestartを強制する。
+
+関連する既存項目: `tasks/roadmap.md`「VPS常駐運用化」節の「正式Production起動方式の確定」
+（起動**方式**の確定であり、本項目の「restart**対象と順序**の導出」とは別責務）。同節へ統合するか
+独立させるかは、改善に着手する時点で判断する。**本項目では仕組みの新設は行わない。**
+
+### ステータス
+
+**記録のみ**（near-miss、production影響なし）。改善は未着手。P1 Phase 2（async per-job containment）
+とは分離して扱う。
