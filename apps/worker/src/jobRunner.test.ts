@@ -16,6 +16,7 @@ import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { persistJobResult } from './index.js'
 import {
+  WorkspaceReconciliationError,
   buildStructuredReviewPrompt,
   computeWorkspaceBaseline,
   parseStructuredReviewOutput,
@@ -46,6 +47,21 @@ const { hoistedExecFileSync } = vi.hoisted(() => ({ hoistedExecFileSync: vi.fn()
 vi.mock('node:child_process', () => ({
   execFileSync: hoistedExecFileSync,
 }))
+
+// P1 Phase 2: main command / recovery git 操作は containment 経由になったため、
+// 既存の execFileSync mock による結果注入をブリッジ経由でそのまま活かす。
+// 実モジュールは `node:child_process` の `spawn` を import するが、この suite は
+// 同モジュールを execFileSync だけに mock しているため importOriginal は使えない。
+vi.mock('./execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('./execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
+
+import {
+  TestContainmentInfrastructureError,
+  clearContainedCommandOverride,
+  setContainedCommandOverride,
+} from './execution/containedCommandTestBridge.js'
 
 vi.mock('./commandResolver.js', () => ({
   resolveCommand: vi.fn(),
@@ -142,7 +158,9 @@ vi.mock('./guards/changeManifest.js', () => ({
 }))
 
 vi.mock('./guards/gitOperationState.js', () => ({
-  detectGitOperationState: vi.fn(),
+  // 既定は「進行中の git 操作なし」。P1 Phase 2 で実行後 reconciliation も
+  // このマーカー検査を通るため、undefined を返すと全 Job が fail-closed になる。
+  detectGitOperationState: vi.fn(() => []),
 }))
 
 vi.mock('./jobLogger.js', () => ({
@@ -814,7 +832,10 @@ describe('runJob', () => {
     expect(result.guardResult.fileViolations).toEqual(['../secret.txt'])
   })
 
-  it('git_commit job uses timeout=undefined (atomic)', async () => {
+  // P1 Phase 2: atomic Job の unbounded 実行を廃止した。timeout が発火しないと
+  // containment kill → drain → reconciliation へ到達できず、hang した git_commit が
+  // workspace を永久に所有し続けるため（CEO 承認済みの方針変更）。
+  it('git_commit job も JOB_TIMEOUT_MS で区切られる（atomic の unbounded 実行を廃止）', async () => {
     resolveCommandMock.mockReturnValue({
       argv: ['git', 'commit', '-m', 'test'],
       description: 'git commit',
@@ -831,7 +852,7 @@ describe('runJob', () => {
       (call) => Array.isArray(call[1]) && (call[1] as string[]).includes('commit')
     )
     expect(commitCall).toBeDefined()
-    expect((commitCall![2] as { timeout?: number }).timeout).toBeUndefined()
+    expect((commitCall![2] as { timeout?: number }).timeout).toBe(120_000)
   })
 
   it('git_commit job generates RollbackInfo', async () => {
@@ -1077,11 +1098,18 @@ assertNoResidualChangesMock.mockImplementation(() => {})
         throw new ChangeDetectionErrorStub('post-commit inspection failed')
       })
 
-    const result = await runJob(gitCommitJob(), createPolicy())
+    // P1 Phase 2 hard requirement 8/9: reconciliation が成功しない限り terminalize しない。
+    // 以前はここで `status:'failed'` を返していたが、failed は workspace を所有しないため
+    // 「実行後の状態を確認できないまま所有権を解放する」経路になっていた。
+    // 現在は quarantine へ送る（＝例外として伝播させる）。
+    const err = await runJob(gitCommitJob(), createPolicy()).then(
+      () => undefined,
+      (e: unknown) => e,
+    )
 
-    expect(result.status).toBe('failed')
-    expect(result.detectionFailure).toBe(true)
-    expect(result.commitHash).toBe(afterCommit)
+    expect(err).toBeInstanceOf(WorkspaceReconciliationError)
+    // commit は取り消せないので、quarantine されても hash は必ず運ばれる。
+    expect((err as WorkspaceReconciliationError).commitHash).toBe(afterCommit)
     expect(saveJobLogsMock).toHaveBeenCalledTimes(1)
     expect(saveJobLogsMock.mock.calls[0]?.[1]).toContain(`[commit-evidence] commitHash=${afterCommit}`)
     const commitCalls = execFileSyncMock.mock.calls.filter(
@@ -2468,15 +2496,14 @@ describe('task-022: AI CLI 実行ブロック', () => {
     }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
 
-    const result = await runJob(createJob({
+    // P1 Phase 2: final inspection が失敗した時点で workspace の状態は不明であり、
+    // provider timeout として通常の failed（＝所有権解放 + retry 対象）にしてはならない。
+    // quarantine が provider retry より優先される。
+    await expect(runJob(createJob({
       aiCliProvider: 'codex',
       aiCliPrompt: 'Implement the approved change.',
       aiCliMode: 'implement',
-    }), createPolicy())
-
-    expect(result.detectionFailure).toBe(true)
-    expect(result.providerFailureKind).toBe('provider_timeout')
-    expect(result.workspaceState).toBe('unknown')
+    }), createPolicy())).rejects.toBeInstanceOf(WorkspaceReconciliationError)
   })
 
   it('AI CLI が blocked: true → status: failed で早期リターン', async () => {
@@ -3714,5 +3741,171 @@ const result = computeWorkspaceBaseline(createJob(), '/workspace/target')
     if (!result.ok) {
       expect(result.reason).toBe('workspace baseline could not be established: Failed to resolve HEAD commit in "/workspace/target"')
     }
+  })
+})
+
+/**
+ * P1 Phase 2: containment / 実行後 reconciliation の失敗は「通常の Job 失敗」ではない。
+ * これらを failed へ潰すと、生き残ったプロセスや壊れた git 状態を抱えたまま
+ * workspace の所有権を解放してしまう（独立レビュー B3 / B4）。
+ */
+describe('P1 Phase 2: containment / reconciliation の失敗は握り潰さない', () => {
+  beforeEach(() => {
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'status' })
+    detectGitOperationStateMock.mockReturnValue([])
+  })
+
+  afterEach(() => {
+    clearContainedCommandOverride()
+  })
+
+  it('B3: main command の containment 失敗は failed へ潰さず伝播する', async () => {
+    setContainedCommandOverride(async () => {
+      throw new TestContainmentInfrastructureError('containment failed: drain_timeout')
+    })
+
+    await expect(runJob(createJob(), createPolicy())).rejects.toThrow(/drain_timeout/)
+  })
+
+  it('B3: containment 失敗は exitCode 付きの通常結果に変換されない', async () => {
+    setContainedCommandOverride(async () => {
+      throw new TestContainmentInfrastructureError('containment failed: cleanup_failed')
+    })
+
+    // resolve してしまう（= failed 結果を返す）なら、その時点で所有権解放の危険がある
+    const outcome = await runJob(createJob(), createPolicy()).then(
+      (result) => ({ resolved: true as const, result }),
+      (err: unknown) => ({ resolved: false as const, err }),
+    )
+
+    expect(outcome.resolved).toBe(false)
+  })
+
+  it('B4: 実行後に git 操作マーカーが残っていれば terminalize せず伝播する', async () => {
+    // 実行前（baseline 計算時）は clean、実行後の最終検査で index.lock が現れる状況。
+    detectGitOperationStateMock
+      .mockReturnValueOnce([])
+      .mockReturnValue(['index.lock'])
+
+    await expect(runJob(createJob(), createPolicy())).rejects.toThrow(/index\.lock/)
+  })
+
+  it('B4: マーカー検出は「プロセスが静止した」ことと別問題であると明示する', async () => {
+    detectGitOperationStateMock
+      .mockReturnValueOnce([])
+      .mockReturnValue(['index.lock'])
+
+    await expect(runJob(createJob(), createPolicy())).rejects.toThrow(
+      /process quiescence does not prove git consistency/,
+    )
+  })
+})
+
+/**
+ * P1 Phase 2（実装レビュー指摘）:
+ * AI CLI 経路の containment 失敗が、通常の AI 失敗（inspectAfterAiFailure → failed）へ
+ * 降格していた。降格すると processQueuedWork の quarantine 経路へ届かず、
+ * 生き残ったプロセスを抱えたまま所有権を解放してしまう。
+ */
+describe('P1 Phase 2: AI CLI 経路の containment 失敗も降格させない', () => {
+  beforeEach(() => {
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'status' })
+    detectGitOperationStateMock.mockReturnValue([])
+  })
+
+  afterEach(() => {
+    clearContainedCommandOverride()
+  })
+
+  it('adapter.run が containment 失敗を投げたら failed へ変換せず伝播する', async () => {
+    createAiCliAdapterMock.mockReturnValue({
+      run: vi.fn().mockRejectedValue(
+        new TestContainmentInfrastructureError('containment failed: drain_timeout'),
+      ),
+    } as never)
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'なにか変更してください',
+      aiCliMode: 'implement',
+    })
+
+    await expect(runJob(job, createPolicy())).rejects.toThrow(/drain_timeout/)
+  })
+
+  it('通常の AI CLI 失敗はこれまでどおり failed 結果として扱う（過剰反応しない）', async () => {
+    createAiCliAdapterMock.mockReturnValue({
+      run: vi.fn().mockRejectedValue(new Error('provider exploded')),
+    } as never)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) =>
+      gitFallback(args),
+    )
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'なにか変更してください',
+      aiCliMode: 'implement',
+    })
+
+    const result = await runJob(job, createPolicy())
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('provider exploded')
+  })
+
+  it('Job ID が containment のトレーサビリティのため AI CLI へ渡される', async () => {
+    const run = vi.fn().mockResolvedValue(makeCliResult())
+    createAiCliAdapterMock.mockReturnValue({ run } as never)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'status') return 'ok\n'
+      return gitFallback(args)
+    })
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'なにか変更してください',
+      aiCliMode: 'implement',
+    })
+    await runJob(job, createPolicy())
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ jobId: job.id }))
+  })
+})
+
+/**
+ * P1 Phase 2 hard requirement 8/9（最終レビュー指摘）:
+ * reconciliation が成功したときにだけ Job を terminalize してよい。
+ * 実行後の検査が「どんな理由であれ」失敗したなら workspace の状態は不明であり、
+ * failed（= workspace を所有しない）で終わらせてはならない。
+ */
+describe('P1 Phase 2: 実行後 reconciliation の失敗は種類を問わず quarantine へ送る', () => {
+  beforeEach(() => {
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'status' })
+    detectGitOperationStateMock.mockReturnValue([])
+  })
+
+  afterEach(() => {
+    clearContainedCommandOverride()
+  })
+
+  it('HEAD を解決できない等の一般的な検査失敗でも failed にせず伝播する', async () => {
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({ changes: [], paths: [] })
+      .mockImplementationOnce(() => {
+        throw new ChangeDetectionErrorStub('git rev-parse HEAD failed')
+      })
+
+    await expect(runJob(createJob(), createPolicy()))
+      .rejects.toBeInstanceOf(WorkspaceReconciliationError)
+  })
+
+  it('伝播する理由に「安全と証明できない」ことが示される', async () => {
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({ changes: [], paths: [] })
+      .mockImplementationOnce(() => {
+        throw new ChangeDetectionErrorStub('inspection exploded')
+      })
+
+    await expect(runJob(createJob(), createPolicy()))
+      .rejects.toThrow(/cannot prove the workspace is safe to release/)
   })
 })

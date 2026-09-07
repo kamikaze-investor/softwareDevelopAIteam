@@ -17,6 +17,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { createAiCliAdapter } from './factory.js'
 
+
+vi.mock('../execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('../execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
+
 const {
   execFileSyncMock,
   buildWorktreeManifestMock,

@@ -22,8 +22,9 @@ import type {
   ReconcileRunningFailure,
   ReconcileRunningJobResult,
 } from './jobStateManager.js'
-import { runJob, computeWorkspaceBaseline } from './jobRunner.js'
-import type { StructuredReviewContext } from './jobRunner.js'
+import { runJob, computeWorkspaceBaseline, WorkspaceReconciliationError } from './jobRunner.js'
+import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
+import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
@@ -337,16 +338,87 @@ export async function processQueuedWork(
   const runningConfirmed = await confirmRunningTransition(job, dependencies)
   if (!runningConfirmed) return null
 
-  const result = await (dependencies.executeJob ?? runJob)(
-    job,
-    policy,
-    buildStructuredReviewContext(job, task, jobs),
-  )
+  // ── P1 Phase 2: containment / reconciliation の失敗を Job 所有権protocolへ接続する ──
+  // これらの例外を poll loop の logger まで素通りさせると、Job は `running` のまま
+  // 残り、workspace の所有権を保持したまま誰も面倒を見ない状態になる。
+  // 「安全と証明できない限り所有権を解放しない」ため、`failed` ではなく
+  // quarantine 付き `blocked` へ落とす。
+  let result: JobRunResult
+  try {
+    result = await (dependencies.executeJob ?? runJob)(
+      job,
+      policy,
+      buildStructuredReviewContext(job, task, jobs),
+    )
+  } catch (err: unknown) {
+    if (!isUnsafeWorkspaceError(err)) throw err
+    await quarantineRunningJob(job, err, dependencies)
+    return 'blocked'
+  }
   const resultStatus = resolveResultStatus(result)
 
   assertTransition('running', resultStatus)
   await persistJobResult(job.id, result, resultStatus, dependencies)
   return resultStatus
+}
+
+/**
+ * P1 Phase 2: workspace が静止していると証明できなかったことを表す例外か。
+ * containment インフラの失敗（drain 未完了・cleanup 失敗・placement 失敗など）と、
+ * 実行後 reconciliation の失敗（git 操作マーカー残存など）の両方を含む。
+ */
+function isUnsafeWorkspaceError(err: unknown): boolean {
+  return isContainmentInfrastructureError(err) || err instanceof WorkspaceReconciliationError
+}
+
+/**
+ * running 中の Job を quarantine 付き `blocked` へ落とし、所有権を保持する。
+ * `failed` にしてはならない: `failed` は workspace を所有しないため、
+ * 生存プロセスや壊れた git 状態が残ったまま次の Job へ引き渡してしまう。
+ */
+async function quarantineRunningJob(
+  job: Job,
+  err: unknown,
+  dependencies: JobPersistenceDependencies,
+): Promise<void> {
+  const reason = formatUnknownError(err)
+  const message = `workspace could not be proven quiescent: ${reason}`
+  console.error(`[Worker] Job ${job.id} を quarantine します: ${message}`)
+
+  assertTransition('running', 'blocked')
+  await (dependencies.alert ?? sendAlert)({
+    severity: 'critical',
+    title: 'Workspace quarantined after Job execution',
+    body: [
+      `Job ID: ${job.id}`,
+      `Task ID: ${job.taskId}`,
+      `理由: ${reason}`,
+      'containment または実行後 reconciliation が完了を証明できませんでした。',
+      'Job を blocked にし、workspace 所有権を保持しています。',
+      'reconciliation が成功するまで resume / repair / 新規 claim は拒否されます。',
+    ].join('\n'),
+    sourceType: 'job_persistence',
+    sourceId: job.id,
+  }).catch((alertErr: unknown) => {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(alertErr)}`)
+  })
+
+  // reconciliation に失敗しても、この Job が作った commit は取り消せない。
+  // quarantine しても commit hash は必ず記録する（証跡を失わないため）。
+  const createdCommitHash = err instanceof WorkspaceReconciliationError ? err.commitHash : undefined
+
+  await persistTerminalUpdate(job.id, {
+    status: 'blocked',
+    stderr: `${message} (workspace quarantined; ownership retained)`,
+    completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    ...(createdCommitHash !== undefined ? { commitHash: createdCommitHash } : {}),
+    failureMetadata: {
+      kind: 'workspace_containment_failure',
+      workspaceState: 'unknown',
+      quarantined: true,
+      quarantineReason: message,
+    },
+  }, dependencies)
 }
 
 async function confirmRunningTransition(

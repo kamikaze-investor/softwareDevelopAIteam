@@ -75,8 +75,82 @@ import type { EffectivePolicy } from './guards/gatePolicy.js'
 import { toGateDecision } from './guards/safetyAuditor.js'
 import type { GateResult } from './guards/gateProcessor.js'
 import { sendAlert } from './notifier/notifier.js'
+import {
+  isContainmentInfrastructureError,
+  runContainedOrThrow,
+} from './execution/runContainedCommand.js'
 
 const JOB_TIMEOUT_MS = 120_000
+
+/** recovery git 操作の実行上限（P1 Phase 2）。従来は timeout が無かった */
+const RECOVERY_GIT_TIMEOUT_MS = 10_000
+
+/**
+ * 実行後の reconciliation が「workspace は安全」と証明できなかったことを表す（P1 Phase 2）。
+ *
+ * プロセスが静止した（`populated 0`）ことは、git が一貫した状態にあることを意味しない。
+ * `cgroup.kill` が `index.lock` を保持したままの git を落とした場合、drain は成功するが
+ * lock ファイルは残る。この状態で Job を terminalize すると、壊れた workspace の所有権を
+ * 解放してしまう。呼び出し元はこの例外を通常の検出失敗として握り潰さず、
+ * ownership を保持したまま quarantine すること。
+ */
+export class WorkspaceReconciliationError extends Error {
+  /**
+   * この Job が既に作成した commit。reconciliation に失敗しても commit は取り消せないため、
+   * quarantine payload まで運んで「どの commit が作られたか」を失わないようにする。
+   */
+  commitHash?: string
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'WorkspaceReconciliationError'
+  }
+}
+
+/**
+ * broad catch の先頭で呼ぶ。containment / reconciliation の失敗だけは握り潰さない。
+ * これらを通常の失敗へ降格させると「安全と証明できていない」事実が消える。
+ */
+function rethrowIfUnsafe(err: unknown, createdCommitHash?: string): void {
+  if (isContainmentInfrastructureError(err)) throw err
+  if (err instanceof WorkspaceReconciliationError) {
+    // commit は既に作られていて取り消せない。quarantine されても、どの commit が
+    // 作られたかは記録し続けなければならない。
+    if (createdCommitHash !== undefined && err.commitHash === undefined) {
+      err.commitHash = createdCommitHash
+    }
+    throw err
+  }
+}
+
+let containmentAttemptCounter = 0
+
+/** cgroup ディレクトリを決して再利用しないための、プロセス内で単調な試行 ID */
+function nextContainmentAttemptId(label: string): string {
+  containmentAttemptCounter += 1
+  return `${label}-${process.pid}-${containmentAttemptCounter}`
+}
+
+/**
+ * recovery git 操作を封じ込めて実行する。
+ * 非ゼロ終了は例外にして、これまで `execFileSync` が throw していた挙動を保つ
+ * （呼び出し元はそれを path 単位の失敗として集約する）。
+ * containment 自体の失敗は `ContainmentInfrastructureError` としてそのまま伝播する。
+ */
+async function runRecoveryGit(workingDir: string, args: readonly string[]): Promise<void> {
+  const result = await runContainedOrThrow({
+    jobId: 'revert',
+    attemptId: nextContainmentAttemptId('revert-git'),
+    argv: ['git', ...args],
+    cwd: workingDir,
+    env: process.env,
+    timeoutMs: RECOVERY_GIT_TIMEOUT_MS,
+  })
+  if (result.exitCode !== 0) {
+    const detail = result.stderr.trim() || `exit ${result.exitCode ?? 'unknown'}`
+    throw new Error(`git ${args.join(' ')} failed: ${detail}`)
+  }
+}
 
 /** 重複 CEO 通知防止: 同一 approvalRequestId には一度だけ通知する */
 const notifiedApprovalRequests = new Set<string>()
@@ -669,6 +743,7 @@ export async function runJob(
     try {
       cliResult = await adapter.run({
         taskId: job.taskId,
+        jobId: job.id,
         provider: job.aiCliProvider,
         workingDir: job.safeCommand.workingDir,
         prompt: effectiveAiCliPrompt,
@@ -678,12 +753,16 @@ export async function runJob(
         expectJson: job.aiCliMode === 'review',
       })
     } catch (err: unknown) {
+      // adapter.run() は containment 失敗をそのまま再 throw する。ここで通常の
+      // AI CLI 失敗として inspectAfterAiFailure へ流すと `failed` が返り、
+      // 上位 processQueuedWork の quarantine 経路へ届かないまま所有権を解放してしまう。
+      rethrowIfUnsafe(err)
       const message = err instanceof Error ? err.message : String(err)
       console.error(`[jobRunner] AI CLI 実行エラー (${job.aiCliProvider}): ${message}`)
       // AI が失敗しても、失敗するまでに書いた変更は残っている。
       // 検査せずに返すと次 Job がそれを新しいベースラインとして信頼してしまうため、
       // 成功・失敗に関わらず終了後検査を必ず実行する。
-      return inspectAfterAiFailure({
+      return await inspectAfterAiFailure({
         workingDir: job.safeCommand.workingDir,
         startCommitHash,
         preChangedPaths: preManifest.paths,
@@ -702,7 +781,7 @@ export async function runJob(
     const cliFailed = cliResult.blocked === true || (cliResult.exitCode !== 0 && !job.dryRun)
     if (cliFailed) {
       console.error(`[jobRunner] AI CLI 失敗 (${job.aiCliProvider}): exitCode=${cliResult.exitCode} blocked=${cliResult.blocked}`)
-      return inspectAfterAiFailure({
+      return await inspectAfterAiFailure({
         workingDir: job.safeCommand.workingDir,
         startCommitHash,
         preChangedPaths: preManifest.paths,
@@ -725,7 +804,7 @@ export async function runJob(
       const implementFailureReason = classifyClaudeImplementFailure(job.aiCliProvider, cliResult)
       if (implementFailureReason !== undefined) {
         console.error(`[jobRunner] implement Job が変更を生成しませんでした: ${implementFailureReason}`)
-        return inspectAfterAiFailure({
+        return await inspectAfterAiFailure({
           workingDir: job.safeCommand.workingDir,
           startCommitHash,
           preChangedPaths: preManifest.paths,
@@ -750,7 +829,7 @@ export async function runJob(
     if (job.aiCliMode === 'review') {
       structuredReviewResult = parseStructuredReviewOutput(cliResult.stdout)
       if (!structuredReviewResult) {
-        return inspectAfterAiFailure({
+        return await inspectAfterAiFailure({
           workingDir: job.safeCommand.workingDir,
           startCommitHash,
           preChangedPaths: preManifest.paths,
@@ -800,6 +879,7 @@ export async function runJob(
     stageAManifest = stageAInspection.manifest
     postDiffText = stageAInspection.diffText
   } catch (err: unknown) {
+    rethrowIfUnsafe(err)
     return failClosed(startedAt, formatChangeDetectionError(err), guardResult)
   }
   const postChangedFiles = stageAManifest.paths
@@ -830,7 +910,7 @@ export async function runJob(
     // Guard 違反で停止するなら、この Job が作った変更を作業ツリーへ残さない。
     // 残置すると次の Job の File Change Guard（HEAD との差分）が前 Job の変更で
     // 汚染され、自分では触れていないファイルまで拒否される（2026-08-24 実測）。
-    const workspaceCleanupNote = revertBlockedJobChanges(
+    const workspaceCleanupNote = await revertBlockedJobChanges(
       job.safeCommand.workingDir,
       startCommitHash,
       stageAManifest,
@@ -1059,14 +1139,33 @@ export async function runJob(
     }
 
     try {
-      stdout = execFileSync(resolved.argv[0], resolved.argv.slice(1), {
+      // P1 Phase 2: SafeCommand は子孫を fork し得るため per-job cgroup へ封じ込める。
+      // atomic Job もこれまでの unbounded 実行をやめて JOB_TIMEOUT_MS で区切る。
+      // unbounded のままだと timeout が発火せず、kill / drain / reconciliation へ
+      // 到達しないまま workspace を永久に所有し続けるため（Phase 2 の目的と両立しない）。
+      // timeout 時も通常 failure として即 terminalize せず、containment kill →
+      // populated=0 → git marker 確認 → reconciliation の共通 protocol を必ず通る。
+      const contained = await runContainedOrThrow({
+        jobId: job.id,
+        attemptId: nextContainmentAttemptId('safe-command'),
+        argv: resolved.argv,
         cwd: job.safeCommand.workingDir,
-        shell: false,
-        timeout: isAtomic ? undefined : JOB_TIMEOUT_MS,
-        encoding: 'utf-8',
         env: buildTargetCommandEnv(),
+        timeoutMs: JOB_TIMEOUT_MS,
       })
+      stdout = contained.stdout
+      if (contained.exitCode === 0) {
+        stderr = contained.stderr
+      } else {
+        exitCode = contained.exitCode ?? 1
+        stderr = contained.stderr || (contained.timedOut
+          ? `command timed out after ${JOB_TIMEOUT_MS}ms and was terminated by containment`
+          : '')
+      }
     } catch (err: unknown) {
+      // containment 失敗は通常のコマンド失敗ではない。ここで exitCode へ潰すと
+      // 「workspace が静止したと証明できていない」事実が消え、Job が terminalize され得る。
+      if (isContainmentInfrastructureError(err)) throw err
       const failure = toExecFileFailure(err)
       exitCode = typeof failure.status === 'number' ? failure.status : 1
       stdout = outputToString(failure.stdout)
@@ -1119,6 +1218,7 @@ export async function runJob(
     finalManifest = inspection.manifest
     finalDiffText = inspection.diffText
   } catch (err: unknown) {
+    rethrowIfUnsafe(err, createdCommitHash)
     return {
       ...failClosed(startedAt, formatChangeDetectionError(err), guardResult),
       ...(createdCommitHash ? { commitHash: createdCommitHash } : {}),
@@ -1134,7 +1234,7 @@ export async function runJob(
     // Stage A と同じ理由で、最終検査でも Guard 違反なら後始末を行う。
     // SafeCommand が commit を作った場合は HEAD が動いているためヘルパー側で
     // スキップされ、その旨が戻り値で報告される。
-    const workspaceCleanupNote = revertBlockedJobChanges(
+    const workspaceCleanupNote = await revertBlockedJobChanges(
       job.safeCommand.workingDir,
       startCommitHash,
       finalManifest,
@@ -1248,12 +1348,12 @@ export async function runJob(
  * 呼び出し元は戻り値を結果の stderr へ残すこと。**サイレントな失敗は許容しない**
  * （黙って失敗すると「blocked 後の残置」問題を再導入する）。
  */
-export function revertBlockedJobChanges(
+export async function revertBlockedJobChanges(
   workingDir: string,
   startCommitHash: string,
   manifest: ChangeManifest,
   preExistingPaths: readonly string[],
-): string | undefined {
+): Promise<string | undefined> {
   if (manifest.changes.length === 0) return undefined
 
   const currentHead = getCommitHash(workingDir)
@@ -1293,28 +1393,21 @@ export function revertBlockedJobChanges(
       change.kind === 'added' || change.kind === 'renamed' ? [change.path] : []
 
     try {
+      // P1 Phase 2: recovery git 操作も封じ込める。これらは shared worktree/index を
+      // 変更するうえ、従来は timeout すら無かった。git の clean/process filter は
+      // 子孫を fork し得るため、bounded timeout だけでは drain を保証できない。
       for (const p of restorePaths) {
-        execFileSync('git', ['checkout', '-q', startCommitHash, '--', p], {
-          cwd: workingDir,
-          shell: false,
-          encoding: 'utf-8',
-        })
+        await runRecoveryGit(workingDir, ['checkout', '-q', startCommitHash, '--', p])
       }
       for (const p of removePaths) {
         // staged 追加の可能性に備えて先に index から外す（untracked なら no-op）。
-        execFileSync('git', ['reset', '-q', 'HEAD', '--', p], {
-          cwd: workingDir,
-          shell: false,
-          encoding: 'utf-8',
-        })
+        await runRecoveryGit(workingDir, ['reset', '-q', 'HEAD', '--', p])
         // `-fdq` でも対象は `-- <path>` に限定される（repo 全体の clean は行わない）。
-        execFileSync('git', ['clean', '-fdq', '--', p], {
-          cwd: workingDir,
-          shell: false,
-          encoding: 'utf-8',
-        })
+        await runRecoveryGit(workingDir, ['clean', '-fdq', '--', p])
       }
     } catch (err: unknown) {
+      // containment 失敗を「この path の cleanup に失敗した」という警告文へ降格させない。
+      if (isContainmentInfrastructureError(err)) throw err
       failures.push(`${change.path}: ${formatUnknownError(err)}`)
     }
   }
@@ -1522,7 +1615,7 @@ interface AiFailureInspectionInput {
  * Guard 違反（＝blocked へ変換される結果）の場合は、次の Job を汚染しないよう
  * この Job 自身の変更を作業ツリーから取り消してから返す。
  */
-function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
+async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<JobRunResult> {
   let manifest: ChangeManifest | undefined
   let riskScan: ReturnType<typeof scanTargetProjectRisk> | undefined
   let workspaceState: JobRunResult['workspaceState']
@@ -1545,7 +1638,7 @@ function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
       )
       // blocked へ変換される結果と同じ扱い。残置すると次の Job の File Change Guard
       // （HEAD との差分）がこの失敗 Job の変更で汚染されるため取り消す。
-      workspaceCleanupNote = revertBlockedJobChanges(
+      workspaceCleanupNote = await revertBlockedJobChanges(
         input.workingDir,
         input.startCommitHash,
         manifest,
@@ -1559,6 +1652,10 @@ function inspectAfterAiFailure(input: AiFailureInspectionInput): JobRunResult {
     const summary = formatRiskScanSummary(riskScan)
     if (summary) console.warn(`[final][ai-failure] ${summary}`)
   } catch (err: unknown) {
+    // この try は buildFinalInspection だけでなく revertBlockedJobChanges も覆っている。
+    // containment 失敗をここで failed へ潰すと、生き残ったプロセスがいるかもしれない
+    // workspace の所有権を解放してしまう。
+    rethrowIfUnsafe(err)
     return {
       ...failClosed(input.startedAt, formatChangeDetectionError(err), input.guardResult),
       ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
@@ -1601,6 +1698,42 @@ function buildFinalInspection(
   reflogBaseline: ReflogBaseline,
   baseline: SensitiveBaseline,
 ): { manifest: ChangeManifest; diffText: string; workspaceState: 'unchanged' | 'changed' } {
+  // P1 Phase 2 hard requirement 8/9: reconciliation が成功したときにだけ Job を
+  // terminalize してよい。ここで投げられる例外は種類を問わず「workspace の状態を
+  // 確認できなかった」ことを意味するので、すべて WorkspaceReconciliationError へ
+  // 変換して quarantine 経路へ送る。従来は呼び出し元の catch が failClosed() を返し、
+  // それは `status:'failed'`（= workspace を所有しない）だったため、
+  // 例えば実行後の `git rev-parse HEAD` が失敗しただけで所有権を解放していた。
+  try {
+    return inspectFinalState(workingDir, startCommitHash, reflogBaseline, baseline)
+  } catch (err: unknown) {
+    if (err instanceof WorkspaceReconciliationError) throw err
+    if (isContainmentInfrastructureError(err)) throw err
+    throw new WorkspaceReconciliationError(
+      `final workspace inspection failed (${formatUnknownError(err)}); ` +
+      `cannot prove the workspace is safe to release (fail-closed)`,
+    )
+  }
+}
+
+function inspectFinalState(
+  workingDir: string,
+  startCommitHash: string,
+  reflogBaseline: ReflogBaseline,
+  baseline: SensitiveBaseline,
+): { manifest: ChangeManifest; diffText: string; workspaceState: 'unchanged' | 'changed' } {
+  // P1 Phase 2: 実行後の reconciliation では、まず進行中の git 操作マーカーを確認する。
+  // containment kill は index.lock や sequencer 状態を残したまま git を落とし得る。
+  // `computeWorkspaceBaseline` は claim **前**に同じ検査をしているが、実行**後**の
+  // 経路には検査が無く、壊れた workspace のまま terminalize できてしまっていた。
+  const gitOperations = detectGitOperationState(workingDir)
+  if (gitOperations.length > 0) {
+    throw new WorkspaceReconciliationError(
+      `workspace has an in-progress git operation after execution (${gitOperations.join(', ')}); ` +
+      `process quiescence does not prove git consistency (fail-closed)`,
+    )
+  }
+
   // currentHead が startCommitHash と一致していても、reset で一度別のcommitへ
   // 移動してから元のhashへ戻された可能性は排除できないため、HEAD一致による
   // 早期returnより前に必ず reflog を検証する（fail-closed）。

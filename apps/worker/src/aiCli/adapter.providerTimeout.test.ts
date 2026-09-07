@@ -2,6 +2,12 @@ import { execFileSync } from 'node:child_process'
 import type { AiCliRequest } from '@ai-team/shared'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+
+vi.mock('../execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('../execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
+
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),
 }))

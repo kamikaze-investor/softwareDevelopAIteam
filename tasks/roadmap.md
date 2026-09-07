@@ -2074,14 +2074,75 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    到達が0件なので既存wartとして残してよいが、cutoverでCodexが実際にRoadmapを生成し始める
    前に解決する。
 
-   **修正案と未検証点**: 一時ファイルをリポジトリ外（OS tempdir等）へ移すのが素直だが、
-   **`--sandbox read-only`下でCodex CLIがリポジトリ外へ書けるかを実測していない**。
-   書けない場合、既存のCodex independent reviewが壊れる。実Codex CLI / 実runnerで
-   安全に実測し、成功するなら既存adapterも含めてrepo外tempへ移す最小修正を行う。
-   失敗するなら推測で変更せず別案を調査する。
+   **実測済み（2026-09-07 20:07 JST、CEO承認canary）**: 実Codex CLI 0.147.0で
+   `--output-last-message`をOS temp directory（`/tmp/codex-lastmsg-*/lastmsg.json`）へ向け、
+   `--sandbox read-only`＋`-c use_legacy_landlock=true`下で実行したところ**正常に書き込めた**
+   （652 bytes）。同じ実行で対象リポジトリのHEAD / tracked diff / untracked files / 全ファイルの
+   sha256はすべて不変で、repo内に一時ファイルは残らなかった。
+   **したがってrepo外tempへ移す最小修正は実行可能**であり、PR C cutover前に入れる。
+
+   **ただし保証範囲に注意**: この一時ファイルを書くのは**Codex CLIプロセス自身**であって、
+   sandboxされているのはmodelが生成したshell commandの方である。よって上記の実測が示すのは
+   「移設が機能する」ことであって「sandboxがrepo外書き込みを許可した」ことではない。
 
    **未解決の間の表現**: 「モデルによるrepo変更は禁止される」とは言ってよいが、
    **「filesystem上完全read-only」とは主張しない**。
+
+<!-- roadmap:id=task-codex-review-cannot-read-repo state=planned priority=high -->
+0. [ ] **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、
+   **高優先度**。CEO判断: Roadmap topology cutover（PR C）とは別責務なので**PR Cへ混ぜない**）。
+
+   **事実**: task-kindのCodex independent reviewは、`buildReviewPrompt()`
+   （`apps/worker/src/approvalLevel/reviewerAdapter.ts:151`）が
+   `git diff`本文（post）または変更計画本文（pre）を**promptへ埋め込んで**渡している。
+   一方でCodexは`--sandbox read-only`下でshell commandを1つも実行できない
+   （roadmap: codex-sandbox-off-deprecated-landlock）。
+   つまりレビュアーは**渡されたdiffしか見ておらず、その周辺のコードを読んでいない**。
+
+   **影響**: レビューは機能しているが**degraded**である。
+   「この変更は既存の呼び出し元と整合しているか」「他に同じパターンの箇所は無いか」
+   「この関数の実際の契約はどうなっているか」といった、diff外の事実に依存する指摘は
+   原理的に出せない。**壊れてはいないが、想定より弱い。**
+
+   **運用上の注意**: 「Codex independent reviewがPASSした」ことを
+   「Codexがrepoを読んで確認した」証拠として扱わないこと。
+   過去のCodex APPROVEも同じ前提で読み直す必要がある。
+
+   **修正候補**: call-localな`-c use_legacy_landlock=true`をtask-kind reviewer経路にも適用すれば
+   repoを読めるようになる（Roadmap経路では実測済み）。ただし
+   **これはdeprecatedな暫定手段**であり、恒久解決は
+   `codex-sandbox-off-deprecated-landlock`側で行う。適用範囲を広げる変更は
+   既存production reviewerの挙動を変えるため、独立した変更として扱いCEO承認を得ること。
+
+<!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
+0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
+   **高優先度**。CEO判断: PR Cでは`use_legacy_landlock`を暫定的な安全経路としてのみ使用し、
+   恒久解決として扱わない）。
+
+   **事実**: このVPSではCodex 0.147.0の既定sandbox（bubblewrap）が動作しない。
+   `bwrap`はsystem PATHに無く、bundled bwrapはUbuntu 24.04の
+   `kernel.apparmor_restrict_unprivileged_userns=1`によりunprivileged user namespaceを
+   作れないため `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` で失敗する。
+   結果としてCodexは**shell commandを1つも実行できない**（＝repoを読めない）。
+   2026-08-19のインストール以来ずっとこの状態で、PR Bのcanaryで初めて発覚した。
+
+   **現在の回避策**: call-localな `-c use_legacy_landlock=true`。実測でrepo読み取り・
+   write拒否ともに成立した（PR C前提として採用）。global `~/.codex/config.toml`は変更していない。
+
+   **なぜ恒久解決でないか**: `codex features list`は
+   `use_legacy_landlock deprecated` / `use_linux_sandbox_bwrap removed` を報告する。
+   bwrapが無条件の既定になり、Landlockは撤去予定のfallbackである。
+   **Codexのupgrade一回でこの回避策は消えうる**。消えた瞬間、Codexは再びrepoを読めなくなり、
+   PR C後はRoadmap生成そのものが機能しなくなる。
+
+   **候補**: system bubblewrapの導入（apt install。Ubuntu版はuserns許可のAppArmor profileを同梱）、
+   またはAppArmor/sysctl設定の変更。**いずれもsudoによるhost変更でありYellow Zone**。
+   CEO承認なしに実施しないこと。
+
+   **既存Codex reviewerへの影響**: 現行のCodex independent reviewは
+   `buildReviewPrompt()`がgit diff / 計画本文をpromptへ埋め込むため、shell無しでも機能している。
+   ただし**diffの周辺コードを確認する能力は失われている**（degraded）。
+   「Codex reviewがPASSした」ことを「Codexがrepoを読んだ」証拠として扱わないこと。
 
 <!-- roadmap:id=opencode-feasibility-reviewer state=deferred -->
 0. [ ] **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider
@@ -2375,10 +2436,19 @@ Adapter実装を開始する指示ではない**。実装着手はHigh-priority 
 - agent runtime resume
 - low-level filesystem / network permissions
 
-**現行P1実装の位置づけ:** P1 Phase 1で実装した workspace baseline・quarantine・
-startup reconciliation（および Phase 2 で実装予定の per-job cgroup containment）は、**現在のAIteamOSを安全に運用するために必要なので継続する**。ただしこれらは
+**現行P1実装の位置づけ:** P1 Phase 1（workspace baseline・quarantine・startup reconciliation）と
+P1 Phase 2（async per-job cgroup containment）は**いずれも完了**している
+（Phase 2: 2026-09-08、master `5825433`、production deploy 済み）。これらは
+**現在のAIteamOSを安全に運用するために必要なので継続する**。ただしこれらは
 上記「委譲候補」に該当する低レベルexecution機能であり、**長期的なAIteamOS独自競争力とは位置付けず、
 将来的なHarness置換候補として扱う**。
+
+**Phase 2 完了時に実測した挙動（Harness評価時の比較基準として使える）:** 直接の子が exit 0 でも
+`setsid` した子孫が残っていれば success 扱いにせず containment kill する / recursive `populated=0`
+を確認する / cgroup cleanup を確認する / そこまで成功して初めて workspace reconciliation へ進み、
+reconciliation 成功後にのみ Job を terminalize する。production 実動確認では
+`outcome:'killed'` / `killedDescendants:true` / drain 22ms / cgroup 削除済み を実測し、
+deploy canary は全 PASS だった。
 
 <!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
 1. [ ] **Harness Bake-off / Execution Runtime Evaluation** — High-priority Recovery修正が一段落した後、
@@ -2439,8 +2509,57 @@ startup reconciliation（および Phase 2 で実装予定の per-job cgroup con
       migrate できるか」を実測すること。移動が実際に拒否されるなら、この経路の優先度は下がる。
       関連: 上記1 Harness Bake-off（低レベル execution layer ごと差し替える選択肢）。
 
+      **2026-09-08 production probe（部分的 evidence。UNVERIFIED は維持する）**:
+      Phase 2 deploy 後、本番 VPS で SSH session から Worker の cgroup へ自プロセスを移動しようと
+      `echo $$ > .../ai-team-worker.service/cgroup.procs` を実行したところ、**EACCES で拒否された**。
+      cgroup v2 は移動元・移動先の共通祖先に対する書き込み権限も要求するため、
+      delegated subtree の**外側にいるプロセス**は Worker cgroup へ入れない。
+
+      ただしこれは以下を**区別**して読むこと:
+      - **測定できたこと**: 外部プロセスからの migration は拒否される
+      - **測定していないこと**: trusted Worker subtree の**内部**で動く payload（＝Job の子孫。
+        既に Worker cgroup 配下にいるため共通祖先条件を満たし得る）が、意図的に親/兄弟 cgroup へ
+        escape できるかどうか。**こちらは未検証のまま**
+
+      したがって本 Finding の `UNVERIFIED` は取り下げない。「payload が絶対に escape できない」
+      ことを示した測定ではない。内部からの escape 可否を実測するまで、この項目の前提は変わらない。
+
       **今回実装しないもの（明記）**: non-migration enforcement / git設定のhardening /
       新sandbox基盤 / attestation。本項目はFinding記録のみ。
+
+<!-- roadmap:id=worker-cgroup-delegation-contract state=planned -->
+3. [ ] **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）** —
+      2026-09-08、P1 Phase 2 完了時に記録。**今すぐ unit file を変更しない。**
+
+      **現状（実測）**: production の `ai-team-worker.service` は `Delegate=no` である。
+      それでも per-job cgroup の作成・`cgroup.kill`・`cgroup.events`・`rmdir` はすべて動作する。
+      理由は、`user@.service` 配下の subtree が既にユーザーへ delegate されており、
+      Worker unit の cgroup ディレクトリが `ai-team` 所有で書き込み可能だからである。
+      Phase 2 の production 実動確認（`Delegate=no` のまま）は成功しており、
+      **`Delegate=yes` は Phase 2 の完了条件ではない**。
+
+      **それでも記録する理由**: 現在の動作は「user service subtree delegation という
+      *周辺の構成* にたまたま依存して成立している」状態であり、Worker が per-job cgroup を
+      作れる権限が **unit 自身の契約として明示されていない**。systemd のバージョン更新、
+      unit の slice 変更、user session 構成の変更、コンテナ化などで、
+      **予告なく作れなくなり得る**。その場合 containment は fail-closed で
+      `unavailable` を返し、containment 必須 Job が実行されなくなる（安全側ではあるが停止する）。
+
+      目的は「今たまたま動く」ではなく「**将来の systemd / config 変更後も per-job cgroup 作成権限が
+      明示的に保証される**」ことである。
+
+      **着手時にやること（実装ではなく再確認から始める）**:
+      - その時点の production unit と systemd delegation 構成を**再確認**する
+        （`systemctl --user show ai-team-worker.service -p Delegate`、
+        cgroup ディレクトリの所有者・書き込み可否、`user@.service` 側の delegation）
+      - その上で `Delegate=yes` の追加が**本当に必要か**を判断する。
+        既に別の形で明示保証されているなら追加しない
+      - 追加する場合も `KillMode=control-group` は維持し、controller は有効化しない
+      - 変更後は containment の実動確認（direct child exit 0 + 生存 descendant の kill、
+        `populated=0`、cgroup 削除）をやり直す
+
+      **今回実装しないもの（明記）**: unit file の変更 / delegation 構成の変更 /
+      新しい supervision 方式の導入。本項目は記録のみ。
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
