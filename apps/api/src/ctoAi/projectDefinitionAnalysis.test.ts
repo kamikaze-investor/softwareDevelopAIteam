@@ -239,3 +239,85 @@ describe('isProjectDefinitionReady — CEO decision vs AI-resolvable technical u
     expect(analysis.gaps.map((g) => g.description)).toContain(aiTechnicalGap.description)
   })
 })
+
+// 2026-09-07 production実測: CEO-owned Gapが0件で、残りがAI調査対象の不確実性だけなのに、
+// readinessScore < 70 の経路が decisionOwner を見ずに合成Gapを作り、CEOへ答えようのない
+// 汎用質問を繰り返していた。CEOが答えてもスコアは上がらないためループが終わらない。
+describe('isProjectDefinitionReady — 低スコア時にCEOへ聞くかどうかの判定', () => {
+  function analysis(gaps: SpecAnalysis['gaps'], readinessScore: number): SpecAnalysis {
+    return {
+      goal: 'G',
+      designPhilosophy: [],
+      mvpScope: { description: 'G', includedFeatures: [], excludedFeatures: [] },
+      targetUsers: [],
+      techStack: [],
+      gaps,
+      structuredConstraints: [],
+      requiredExternalServices: [],
+      readinessScore,
+      readinessReason: '既存のコード構造・依存関係表現・検証ポイントが不明なため調査フェーズが必要。',
+    }
+  }
+
+  const aiGap: SpecAnalysis['gaps'][number] = {
+    category: 'technical',
+    description: '依存関係の表現方法',
+    severity: 'must_resolve',
+    suggestion: '既存の型定義を調べる',
+    decisionOwner: 'ai',
+  }
+
+  it('低スコアでもAI調査対象のGapしか無ければCEOへ質問せず開始できる', () => {
+    const result = isProjectDefinitionReady(analysis([aiGap], 55))
+
+    expect(result.ready).toBe(true)
+    expect(result.importantGaps).toHaveLength(0)
+  })
+
+  it('AI調査対象のGapは破棄されず、後続AIへの引き継ぎ情報として残る', () => {
+    const input = analysis([aiGap], 55)
+
+    const result = isProjectDefinitionReady(input)
+
+    expect(result.ready).toBe(true)
+    expect(input.gaps).toHaveLength(1)
+    expect(input.gaps[0].decisionOwner).toBe('ai')
+  })
+
+  it('低スコアでGapが1件も無い場合は従来どおりfail-closedする（本当に曖昧なGoal）', () => {
+    const result = isProjectDefinitionReady(analysis([], 55))
+
+    expect(result.ready).toBe(false)
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.importantGaps[0].severity).toBe('must_resolve')
+    expect(result.importantGaps[0].decisionOwner).toBe('ceo')
+  })
+
+  it('CEO判断が必要なGapが残っていればスコアに関係なくブロックする', () => {
+    const result = isProjectDefinitionReady(analysis([
+      aiGap,
+      { category: 'technical', description: '既存の動きを変えてよいか', severity: 'must_resolve', suggestion: '変えない', decisionOwner: 'ceo' },
+    ], 55))
+
+    expect(result.ready).toBe(false)
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.importantGaps[0].description).toBe('既存の動きを変えてよいか')
+  })
+
+  it('ownerが欠落したGapしか無い低スコアはfail-closedのままCEOへ聞く', () => {
+    const { decisionOwner: _omitted, ...withoutOwner } = aiGap
+    const result = isProjectDefinitionReady(analysis([withoutOwner], 55))
+
+    expect(result.ready).toBe(false)
+    // Path A（must_resolve かつ CEO-owned）で止まる
+    expect(result.importantGaps).toHaveLength(1)
+    expect(result.importantGaps[0].description).toBe(aiGap.description)
+  })
+
+  it('スコアが閾値以上なら従来どおり開始できる', () => {
+    const result = isProjectDefinitionReady(analysis([], 95))
+
+    expect(result.ready).toBe(true)
+    expect(result.importantGaps).toHaveLength(0)
+  })
+})
