@@ -4,7 +4,8 @@
  * SLACK_WEBHOOK_URL: Incoming Webhook の URL
  */
 
-import type { AlertPayload } from './notifier.js'
+import type { AlertPayload, ChannelSendResult } from './notifier.js'
+import { isRetryableStatus } from './notifier.js'
 
 const FETCH_TIMEOUT_MS = 8_000
 
@@ -14,7 +15,7 @@ const SEVERITY_EMOJI: Record<string, string> = {
   critical: ':rotating_light:',
 }
 
-export async function sendSlack(payload: AlertPayload): Promise<{ success: boolean; error?: string }> {
+export async function sendSlack(payload: AlertPayload): Promise<ChannelSendResult> {
   const webhookUrl = process.env.SLACK_WEBHOOK_URL
   if (!webhookUrl) {
     return { success: false, error: 'SLACK_WEBHOOK_URL が未設定' }
@@ -36,11 +37,20 @@ export async function sendSlack(payload: AlertPayload): Promise<{ success: boole
 
     if (!res.ok) {
       const errBody = await res.text()
-      return { success: false, error: `Slack Webhook ${res.status}: ${errBody}` }
+      return {
+        success: false,
+        error: `Slack Webhook ${res.status}: ${errBody}`,
+        retryable: isRetryableStatus(res.status),
+      }
     }
 
     return { success: true }
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : String(err) }
+    // ネットワーク断・DNS 失敗・タイムアウト（AbortError）はいずれも一時的な可能性がある。
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+      retryable: true,
+    }
   }
 }
