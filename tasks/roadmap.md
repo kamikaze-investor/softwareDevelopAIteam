@@ -2232,6 +2232,77 @@ Evolution等）— いずれも本セクション追加より前から記載済�
       - 実際のSecretを使わないE2Eで再発防止を確認する
       **今回は対策実装しない**。新規roadmap itemも追加せず、本項目（VPS常駐運用化）へ統合する
 
+### Execution Runtime Boundary（AIteamOSの責務境界と、実行基盤のHarness委譲候補）
+
+**位置づけ:** 2026-09のP1（stuck-running-Job recovery）設計・実装を通じて、「AIteamOSが自作すべき責務」と
+「将来的に外部AI Harnessへ委譲した方が合理的な低レベル実行責務」の境界が実測により明確になったため、
+会話上の知見で終わらせず設計方針として記録する。**本節はRoadmap記録のみであり、Harness導入・OpenHands導入・
+Adapter実装を開始する指示ではない**。実装着手はHigh-priority Repairが一段落した後に別途判断する。
+
+既存の`Worker Registry / Worker Adapter Framework`（本ファイル「将来アーキテクチャ移行」節）は
+**「どのWorker（LLM/Agent/Tool/Script）に仕事を振るか」というRouting責務**の抽象化であり、本節の
+**「Agentプロセスをどの実行基盤で安全に動かし、確実に終了・復旧させるか」というExecution Runtime責務**
+とは別レイヤーである。両者を混同しない。
+
+**AIteamOS側に残す責務（＝長期的な競争力の所在）**
+- CEO / Mobile UI
+- Claude PL（判断・委任・統合）
+- Goal / Roadmap / Task orchestration
+- Approval / Risk Gate
+- Finding / Repair management
+- AI / model routing
+- Review policy
+- Project state / business workflow
+- 自己改善・運用判断
+
+**将来的にHarnessへ委譲候補とする責務（＝独自実装を競争力と位置付けない）**
+- agent process execution
+- process-tree containment / termination
+- sandbox / VM isolation
+- workspace isolation
+- command timeout / cancellation
+- child-process cleanup
+- Git execution
+- crash recovery at execution-runtime level
+- execution artifacts / logs
+- agent runtime resume
+- low-level filesystem / network permissions
+
+**現行P1実装の位置づけ:** P1で実装した per-job cgroup containment・workspace baseline・quarantine・
+startup reconciliation は、**現在のAIteamOSを安全に運用するために必要なので継続する**。ただしこれらは
+上記「委譲候補」に該当する低レベルexecution機能であり、**長期的なAIteamOS独自競争力とは位置付けず、
+将来的なHarness置換候補として扱う**。
+
+<!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
+1. [ ] **Harness Bake-off / Execution Runtime Evaluation** — High-priority Recovery修正が一段落した後、
+      **新規機能を増やす前に**実施する評価項目。第一候補としてOpenHands等のvendor-neutral /
+      self-host可能なHarnessを評価するが、**特定ベンダー前提にはしない**。
+
+      **評価方法の必須条件:** 機能表・ドキュメントの比較だけで判断しない。**AIteamOSで実際に発生した
+      障害を再現して比較する**こと。最低限、以下を再現・比較する:
+      - agent強制終了
+      - descendant process残存（`setsid`等でprocess groupを抜けるケースを含む）
+      - dirty workspace
+      - concurrent agent
+      - Worker / runtime crash
+      - Git操作の途中停止（`index.lock` / sequencer等の中途状態）
+      - timeout / cancellation
+      - resume / recovery
+      - workspace contamination防止
+      - APIからの自動制御
+      - 複数AI / model利用
+      - self-host / vendor lock-in
+
+      **移行判断基準:** Harnessが「安全性 / 復旧性 / 保守性 / 実装量 / vendor-neutrality / API統合性」
+      で**明確に優れる**と確認できた場合にのみ、
+      `AIteamOS Job Runner / execution runtime → Harness Adapter` への**段階的置換**を検討する。
+      **AIteamOS全体を置き換える前提にはしない**。上位OrchestrationはAIteamOSに残し、
+      **低レベルexecution layerだけを差し替え可能にする**方向を優先する。
+
+      **今回実装しないもの（明記）:** Harness導入 / OpenHands導入 / Harness Adapter実装 /
+      既存Job Runnerの置換 / 新しいsandbox基盤の構築。本項目はRoadmapへの将来方針と評価条件の
+      記録のみであり、着手可否は既存High-priority Repair完了後に判断する。
+
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
 **前提（正本）:** `specs/00_constitution.md`（最上位思想）、`specs/13_future_system_architecture.md`
