@@ -206,6 +206,20 @@ const FailIfRunningJobBody = z.object({
  *   - baseline 有り → observation と完全一致
  *   - baseline 無し → knownGood が全て成立し、かつ observation.mode==='clean'
  * 検証に失敗すれば quarantine は維持される。
+ *
+ * **Trust boundary（CEO判断 2026-09、B5 = ACCEPTED_TRUST_BOUNDARY）**:
+ * APIは設計上 workspace filesystem へ直接アクセスしない。したがって observation /
+ * knownGood が「実際に観測されたものか」をAPI自身が証明することはできない。これは
+ * clearance固有の話ではなく、changed files / commit hash / guard result / workspace
+ * verification など、実行環境の事実は既にすべて Worker 報告を信頼している既存モデルと
+ * 同じである。よってPR-Cでは **Worker を trust boundary 内の trusted component として
+ * 扱い**、Worker が検証を実行し結果を報告する、という前提を明示的に採用する。
+ * clearance だけを unforgeable にしても他の workspace fact は同じ trust model のまま
+ * 残るため、新しい filesystem verifier や attestation 機構は追加しない。
+ * 代わりに次を維持する: clearance要求は既存のWorker credential / allowlist経路のみ
+ * （`auth/workerAllowlist.ts`）／baselineがある場合はAPI側でも可能な整合チェックを行う／
+ * Worker側は検証成功後にのみ要求する（`jobStateManager.ts`）／client・mobile等の一般
+ * callerが任意のbooleanでclearできる経路は作らない／検証失敗時はquarantineを維持する。
  */
 const ClearQuarantineJobBody = z.object({
   /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
