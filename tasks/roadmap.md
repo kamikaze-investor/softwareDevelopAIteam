@@ -2268,8 +2268,8 @@ Adapter実装を開始する指示ではない**。実装着手はHigh-priority 
 - agent runtime resume
 - low-level filesystem / network permissions
 
-**現行P1実装の位置づけ:** P1で実装した per-job cgroup containment・workspace baseline・quarantine・
-startup reconciliation は、**現在のAIteamOSを安全に運用するために必要なので継続する**。ただしこれらは
+**現行P1実装の位置づけ:** P1 Phase 1で実装した workspace baseline・quarantine・
+startup reconciliation（および Phase 2 で実装予定の per-job cgroup containment）は、**現在のAIteamOSを安全に運用するために必要なので継続する**。ただしこれらは
 上記「委譲候補」に該当する低レベルexecution機能であり、**長期的なAIteamOS独自競争力とは位置付けず、
 将来的なHarness置換候補として扱う**。
 
