@@ -44,11 +44,17 @@ export interface SendResult {
 
 /**
  * 再送する価値がある HTTP status か。
- * 5xx はサーバ側の一時障害、429 はレート制限なので待てば通る。
+ *
+ * - 5xx: サーバ側の一時障害
+ * - 429: レート制限。待てば通る
+ * - 408: Request Timeout。サーバが「時間内に受け取れなかった」と言っているだけで、
+ *        内容が不正なわけではない。クライアント側 timeout（AbortError）を再送するのに
+ *        サーバ申告の timeout を恒久失敗にするのは一貫しない
+ *
  * それ以外の 4xx（URL 失効・権限・payload 不正）は何度送っても同じ。
  */
 export function isRetryableStatus(status: number): boolean {
-  return status >= 500 || status === 429
+  return status >= 500 || status === 429 || status === 408
 }
 
 /** 送信リトライの上限とバックオフ。既存 patchJobWithRetry と同じ形に揃える */
@@ -62,6 +68,18 @@ export interface SendAlertOptions {
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * alert の発生源を、ログから grep できる固定の形にする。
+ * 呼び出し元は既に `sourceType` / `sourceId` を渡している
+ * （例: `watchdog_event` + WatchdogEvent.id、`job_persistence` + Job.id）ので、
+ * 新しい識別子は導入せず、既にある情報をログへ出すだけにとどめる。
+ */
+function formatSource(payload: AlertPayload): string {
+  const type = payload.sourceType ?? 'unknown'
+  const id = payload.sourceId ?? 'unknown'
+  return `source=${type}:${id}`
+}
 
 /**
  * 1チャネルへの送信を、再試行可能な失敗に限って上限付きで再試行する。
@@ -125,23 +143,34 @@ export async function sendAlert(
   const succeeded = results.filter((r) => r.success)
   const failed = results.filter((r) => !r.success)
 
+  // 失敗ログには必ず alert の身元（source）を含める。どの Job / WatchdogEvent の
+  // 通知が落ちたのか後から特定できなければ、失敗を記録した意味がない。
+  const source = formatSource(payload)
+
   for (const s of succeeded) {
     const retried = s.attempts > 1 ? `（${s.attempts}回目で成功）` : ''
-    console.log(`[Notifier] ✅ 送信成功: ${s.channel}${retried}`)
+    console.log(`[Notifier] ✅ 送信成功: ${s.channel}${retried} ${source}`)
   }
   for (const f of failed) {
-    console.error(`[Notifier] ❌ 送信失敗: ${f.channel}（${f.attempts}回試行）— ${f.error}`)
+    console.error(
+      `[Notifier] ❌ 送信失敗: ${f.channel}（${f.attempts}回試行）${source} — ${f.error}`
+    )
   }
 
-  // 全チャネル失敗 = CEO には何も届いていない。critical では特に、
+  // 全チャネル失敗 = 誰にも届いていない。critical では特に、
   // 「アラートが出た」ことと「アラートが届いた」ことを混同してはならない。
+  //
+  // ここでは状態名だけでなく **alert の中身と身元** を必ず残す。
+  // `UNDELIVERED` とだけ書いて内容が消えるなら、後から何が失われたのか復元できない。
   if (succeeded.length === 0) {
-    const detail = results.map((r) => `${r.channel}: ${r.error ?? 'unknown'}`).join(' / ')
+    const detail = results
+      .map((r) => `${r.channel}=${r.error ?? 'unknown'}(${r.attempts}回試行)`)
+      .join(' / ')
     console.error(
-      `[Notifier] 🚨 UNDELIVERED (${payload.severity}) 全チャネルへの送信に失敗しました。` +
-      `通知は届いていません:\n` +
-      `  [${payload.severity.toUpperCase()}] ${payload.title}\n${payload.body}\n` +
-      `  失敗内訳: ${detail}`
+      `[Notifier] 🚨 UNDELIVERED severity=${payload.severity} ${source} ` +
+      `channels=[${detail}]\n` +
+      `  title: ${payload.title}\n` +
+      `  body: ${payload.body}`
     )
   }
 

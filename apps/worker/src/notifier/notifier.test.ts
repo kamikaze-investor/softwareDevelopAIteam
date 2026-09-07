@@ -201,3 +201,83 @@ describe('sendAlert — 再送とfallback（R5-N1）', () => {
     errorSpy.mockRestore()
   })
 })
+
+/**
+ * R5-N1 残件: `UNDELIVERED` という状態名だけ残って alert の中身と身元が消えるなら、
+ * 「何の通知が失われたのか」を後から特定できず、Finding は閉じていない。
+ */
+describe('sendAlert — 未配信 alert の追跡可能性（R5-N1 残件）', () => {
+  const noSleep = async (): Promise<void> => {}
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    delete process.env.LINE_CHANNEL_ACCESS_TOKEN
+    delete process.env.LINE_USER_ID
+    delete process.env.SLACK_WEBHOOK_URL
+  })
+
+  it('全チャネル失敗時、severity / title / 発生源 / チャネル別理由がすべてログに残る', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch.mockResolvedValue({ ok: false, status: 500, text: async () => 'boom' })
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const { sendAlert } = await importNotifier()
+    await sendAlert({
+      severity: 'critical',
+      title: 'Workspace quarantined after Job execution',
+      body: 'Job ID: job-42',
+      sourceType: 'watchdog_event',
+      sourceId: 'wde-99',
+    }, { sleepImpl: noSleep })
+
+    const undelivered = errorSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes('UNDELIVERED'))
+
+    expect(undelivered).toBeDefined()
+    expect(undelivered).toContain('severity=critical')
+    // 発生源（WatchdogEvent / Job）が特定できること
+    expect(undelivered).toContain('source=watchdog_event:wde-99')
+    // 何の alert だったのかが残ること
+    expect(undelivered).toContain('Workspace quarantined after Job execution')
+    expect(undelivered).toContain('job-42')
+    // どのチャネルがなぜ落ちたのか
+    expect(undelivered).toContain('slack=')
+    expect(undelivered).toContain('boom')
+    errorSpy.mockRestore()
+  })
+
+  it('チャネル単体の失敗ログにも発生源が含まれる', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch.mockResolvedValue({ ok: false, status: 403, text: async () => 'forbidden' })
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const { sendAlert } = await importNotifier()
+    await sendAlert({
+      severity: 'warning',
+      title: 't',
+      body: 'b',
+      sourceType: 'job_persistence',
+      sourceId: 'job-7',
+    }, { sleepImpl: noSleep })
+
+    const failure = errorSpy.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes('送信失敗'))
+    expect(failure).toContain('source=job_persistence:job-7')
+    errorSpy.mockRestore()
+  })
+
+  it('HTTP 408 Request Timeout は恒久失敗に巻き込まず再送する', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch
+      .mockResolvedValueOnce({ ok: false, status: 408, text: async () => 'request timeout' })
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => '' })
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert({ severity: 'critical', title: 't', body: 'b' }, { sleepImpl: noSleep })
+
+    expect(results[0].success).toBe(true)
+    expect(results[0].attempts).toBe(2)
+  })
+})
