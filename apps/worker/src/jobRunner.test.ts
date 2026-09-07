@@ -16,6 +16,7 @@ import { fileChangeGuard } from './guards/fileChangeGuard.js'
 import { saveJobLogs } from './jobLogger.js'
 import { persistJobResult } from './index.js'
 import {
+  WorkspaceReconciliationError,
   buildStructuredReviewPrompt,
   computeWorkspaceBaseline,
   parseStructuredReviewOutput,
@@ -1097,11 +1098,18 @@ assertNoResidualChangesMock.mockImplementation(() => {})
         throw new ChangeDetectionErrorStub('post-commit inspection failed')
       })
 
-    const result = await runJob(gitCommitJob(), createPolicy())
+    // P1 Phase 2 hard requirement 8/9: reconciliation が成功しない限り terminalize しない。
+    // 以前はここで `status:'failed'` を返していたが、failed は workspace を所有しないため
+    // 「実行後の状態を確認できないまま所有権を解放する」経路になっていた。
+    // 現在は quarantine へ送る（＝例外として伝播させる）。
+    const err = await runJob(gitCommitJob(), createPolicy()).then(
+      () => undefined,
+      (e: unknown) => e,
+    )
 
-    expect(result.status).toBe('failed')
-    expect(result.detectionFailure).toBe(true)
-    expect(result.commitHash).toBe(afterCommit)
+    expect(err).toBeInstanceOf(WorkspaceReconciliationError)
+    // commit は取り消せないので、quarantine されても hash は必ず運ばれる。
+    expect((err as WorkspaceReconciliationError).commitHash).toBe(afterCommit)
     expect(saveJobLogsMock).toHaveBeenCalledTimes(1)
     expect(saveJobLogsMock.mock.calls[0]?.[1]).toContain(`[commit-evidence] commitHash=${afterCommit}`)
     const commitCalls = execFileSyncMock.mock.calls.filter(
@@ -2488,15 +2496,14 @@ describe('task-022: AI CLI 実行ブロック', () => {
     }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
 
-    const result = await runJob(createJob({
+    // P1 Phase 2: final inspection が失敗した時点で workspace の状態は不明であり、
+    // provider timeout として通常の failed（＝所有権解放 + retry 対象）にしてはならない。
+    // quarantine が provider retry より優先される。
+    await expect(runJob(createJob({
       aiCliProvider: 'codex',
       aiCliPrompt: 'Implement the approved change.',
       aiCliMode: 'implement',
-    }), createPolicy())
-
-    expect(result.detectionFailure).toBe(true)
-    expect(result.providerFailureKind).toBe('provider_timeout')
-    expect(result.workspaceState).toBe('unknown')
+    }), createPolicy())).rejects.toBeInstanceOf(WorkspaceReconciliationError)
   })
 
   it('AI CLI が blocked: true → status: failed で早期リターン', async () => {
@@ -3861,5 +3868,44 @@ describe('P1 Phase 2: AI CLI 経路の containment 失敗も降格させない',
     await runJob(job, createPolicy())
 
     expect(run).toHaveBeenCalledWith(expect.objectContaining({ jobId: job.id }))
+  })
+})
+
+/**
+ * P1 Phase 2 hard requirement 8/9（最終レビュー指摘）:
+ * reconciliation が成功したときにだけ Job を terminalize してよい。
+ * 実行後の検査が「どんな理由であれ」失敗したなら workspace の状態は不明であり、
+ * failed（= workspace を所有しない）で終わらせてはならない。
+ */
+describe('P1 Phase 2: 実行後 reconciliation の失敗は種類を問わず quarantine へ送る', () => {
+  beforeEach(() => {
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'status' })
+    detectGitOperationStateMock.mockReturnValue([])
+  })
+
+  afterEach(() => {
+    clearContainedCommandOverride()
+  })
+
+  it('HEAD を解決できない等の一般的な検査失敗でも failed にせず伝播する', async () => {
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({ changes: [], paths: [] })
+      .mockImplementationOnce(() => {
+        throw new ChangeDetectionErrorStub('git rev-parse HEAD failed')
+      })
+
+    await expect(runJob(createJob(), createPolicy()))
+      .rejects.toBeInstanceOf(WorkspaceReconciliationError)
+  })
+
+  it('伝播する理由に「安全と証明できない」ことが示される', async () => {
+    buildWorktreeManifestMock
+      .mockReturnValueOnce({ changes: [], paths: [] })
+      .mockImplementationOnce(() => {
+        throw new ChangeDetectionErrorStub('inspection exploded')
+      })
+
+    await expect(runJob(createJob(), createPolicy()))
+      .rejects.toThrow(/cannot prove the workspace is safe to release/)
   })
 })

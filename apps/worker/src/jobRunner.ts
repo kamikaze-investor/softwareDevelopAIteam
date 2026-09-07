@@ -95,6 +95,12 @@ const RECOVERY_GIT_TIMEOUT_MS = 10_000
  * ownership を保持したまま quarantine すること。
  */
 export class WorkspaceReconciliationError extends Error {
+  /**
+   * この Job が既に作成した commit。reconciliation に失敗しても commit は取り消せないため、
+   * quarantine payload まで運んで「どの commit が作られたか」を失わないようにする。
+   */
+  commitHash?: string
+
   constructor(message: string) {
     super(message)
     this.name = 'WorkspaceReconciliationError'
@@ -105,9 +111,16 @@ export class WorkspaceReconciliationError extends Error {
  * broad catch の先頭で呼ぶ。containment / reconciliation の失敗だけは握り潰さない。
  * これらを通常の失敗へ降格させると「安全と証明できていない」事実が消える。
  */
-function rethrowIfUnsafe(err: unknown): void {
+function rethrowIfUnsafe(err: unknown, createdCommitHash?: string): void {
   if (isContainmentInfrastructureError(err)) throw err
-  if (err instanceof WorkspaceReconciliationError) throw err
+  if (err instanceof WorkspaceReconciliationError) {
+    // commit は既に作られていて取り消せない。quarantine されても、どの commit が
+    // 作られたかは記録し続けなければならない。
+    if (createdCommitHash !== undefined && err.commitHash === undefined) {
+      err.commitHash = createdCommitHash
+    }
+    throw err
+  }
 }
 
 let containmentAttemptCounter = 0
@@ -1205,7 +1218,7 @@ export async function runJob(
     finalManifest = inspection.manifest
     finalDiffText = inspection.diffText
   } catch (err: unknown) {
-    rethrowIfUnsafe(err)
+    rethrowIfUnsafe(err, createdCommitHash)
     return {
       ...failClosed(startedAt, formatChangeDetectionError(err), guardResult),
       ...(createdCommitHash ? { commitHash: createdCommitHash } : {}),
@@ -1680,6 +1693,30 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
  * その差分を必ず検査対象に含めるため。
  */
 function buildFinalInspection(
+  workingDir: string,
+  startCommitHash: string,
+  reflogBaseline: ReflogBaseline,
+  baseline: SensitiveBaseline,
+): { manifest: ChangeManifest; diffText: string; workspaceState: 'unchanged' | 'changed' } {
+  // P1 Phase 2 hard requirement 8/9: reconciliation が成功したときにだけ Job を
+  // terminalize してよい。ここで投げられる例外は種類を問わず「workspace の状態を
+  // 確認できなかった」ことを意味するので、すべて WorkspaceReconciliationError へ
+  // 変換して quarantine 経路へ送る。従来は呼び出し元の catch が failClosed() を返し、
+  // それは `status:'failed'`（= workspace を所有しない）だったため、
+  // 例えば実行後の `git rev-parse HEAD` が失敗しただけで所有権を解放していた。
+  try {
+    return inspectFinalState(workingDir, startCommitHash, reflogBaseline, baseline)
+  } catch (err: unknown) {
+    if (err instanceof WorkspaceReconciliationError) throw err
+    if (isContainmentInfrastructureError(err)) throw err
+    throw new WorkspaceReconciliationError(
+      `final workspace inspection failed (${formatUnknownError(err)}); ` +
+      `cannot prove the workspace is safe to release (fail-closed)`,
+    )
+  }
+}
+
+function inspectFinalState(
   workingDir: string,
   startCommitHash: string,
   reflogBaseline: ReflogBaseline,

@@ -392,7 +392,10 @@ async function runInsideCgroup(
      * 「Job が固まって workspace を持ったまま誰も気づかない」という
      * Phase 2 が無くそうとしている状態そのものになる。
      */
+    let killIssued = false
     const killThenBoundedWait = (): void => {
+      if (killIssued || settled) return
+      killIssued = true
       const killError = writeCgroupKill(cgroupPath)
       if (killError !== undefined) {
         // kill できない cgroup を待っても意味がない。ただちに諦めて
@@ -421,6 +424,11 @@ async function runInsideCgroup(
       killThenBoundedWait()
     }
     options.signal?.addEventListener('abort', onAbort, { once: true })
+    // 既に abort 済みの signal を渡された場合、addEventListener は発火しない。
+    // timeoutMs が無く、コマンドが終了しないケースでは kill も drain も走らず
+    // 永久待機になるため、登録直後に一度だけ自分で確認する
+    // （killThenBoundedWait / settle は冪等なので listener と競合しても安全）。
+    if (options.signal?.aborted === true) onAbort()
 
     // `close` ではなく `exit` を待つ。stdio を共有した別プロセスが生きていると
     // `close` は遅れる（まさに封じ込めたい状況で待たされる）。

@@ -403,10 +403,15 @@ async function quarantineRunningJob(
     console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(alertErr)}`)
   })
 
+  // reconciliation に失敗しても、この Job が作った commit は取り消せない。
+  // quarantine しても commit hash は必ず記録する（証跡を失わないため）。
+  const createdCommitHash = err instanceof WorkspaceReconciliationError ? err.commitHash : undefined
+
   await persistTerminalUpdate(job.id, {
     status: 'blocked',
     stderr: `${message} (workspace quarantined; ownership retained)`,
     completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    ...(createdCommitHash !== undefined ? { commitHash: createdCommitHash } : {}),
     failureMetadata: {
       kind: 'workspace_containment_failure',
       workspaceState: 'unknown',

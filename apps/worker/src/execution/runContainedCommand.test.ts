@@ -283,4 +283,24 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
       drainMs: 0,
     })).rejects.toThrow(/drain_timeout/)
   })
+
+  it("既に abort 済みの signal でも bounded に settle する（listener が発火しないケース）", async () => {
+    // addEventListener は既に abort 済みの signal を再生しない。timeoutMs 無しの
+    // 終了しないコマンドと組み合わせると、kill も drain も走らず永久待機になり得た。
+    const controller = new AbortController()
+    controller.abort()
+
+    const result = await runContainedCommand({
+      jobId: "job-pre-abort",
+      attemptId: String(Date.now()),
+      argv: ["/bin/sh", "-c", "sleep 60"],
+      cwd: process.cwd(),
+      env: process.env,
+      signal: controller.signal,
+      // timeoutMs は敢えて渡さない: abort だけが唯一の停止契機になる
+    })
+
+    expect(result.killedDescendants).toBe(true)
+    expect(isContainmentSafe(result.outcome)).toBe(true)
+  }, 30_000)
 })
