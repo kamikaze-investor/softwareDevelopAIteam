@@ -329,6 +329,8 @@ async function runInsideCgroup(
   let spawnError: string | undefined
   let timedOut = false
   let aborted = false
+  let killFailure: string | undefined
+  let directChildUnreaped = false
 
   // 出力はバイト数で数える。UTF-8 デコード後の文字数では execFileSync の maxBuffer を再現できない。
   const collect = (which: 'out' | 'err') => (chunk: Buffer): void => {
@@ -373,24 +375,50 @@ async function runInsideCgroup(
   // 終了・timeout・abort の一発勝負（one-shot）。どれが勝っても後始末は必ず1回だけ走る。
   const exited = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     let settled = false
+    let graceTimer: NodeJS.Timeout | undefined
     const settle = (value: { code: number | null; signal: NodeJS.Signals | null }): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearTimeout(graceTimer)
       options.signal?.removeEventListener('abort', onAbort)
       resolve(value)
+    }
+
+    /**
+     * kill を撃ったあと、直接の子の `exit` を無条件に待ってはならない。
+     * cgroup.kill が失敗した場合や、子が uninterruptible sleep (D-state) の場合、
+     * `exit` は永久に来ない。そこで待ち続けると drain にすら到達せず、
+     * 「Job が固まって workspace を持ったまま誰も気づかない」という
+     * Phase 2 が無くそうとしている状態そのものになる。
+     */
+    const killThenBoundedWait = (): void => {
+      const killError = writeCgroupKill(cgroupPath)
+      if (killError !== undefined) {
+        // kill できない cgroup を待っても意味がない。ただちに諦めて
+        // cleanup へ進み、そこで fail-closed に分類させる。
+        killFailure = killError
+        settle({ code: null, signal: null })
+        return
+      }
+      graceTimer = setTimeout(() => {
+        // kill は成功したのに子が刈り取られない = 直接の子は観測不能。
+        // 収穫を諦めて cleanup/drain へ進む（populated が残れば drain_timeout）。
+        directChildUnreaped = true
+        settle({ code: null, signal: null })
+      }, drainLimitMs)
     }
 
     const timer: NodeJS.Timeout | undefined = options.timeoutMs === undefined
       ? undefined
       : setTimeout(() => {
           timedOut = true
-          void writeCgroupKill(cgroupPath)
+          killThenBoundedWait()
         }, options.timeoutMs)
 
     const onAbort = (): void => {
       aborted = true
-      void writeCgroupKill(cgroupPath)
+      killThenBoundedWait()
     }
     options.signal?.addEventListener('abort', onAbort, { once: true })
 
@@ -418,6 +446,22 @@ async function runInsideCgroup(
   // exit code 126 での推測はしない（ワークロード自身が 126 を返し得るため）。
   const placementFailed = !placementAcked
 
+  // cgroup.kill 自体が失敗している場合、drain を待つ意味はない。後始末だけ試みて
+  // kill_failed として fail-closed にする（所有権は呼び出し元が保持する）。
+  if (killFailure !== undefined) {
+    const cleanup = await terminateAndCleanup(cgroupPath, 0, false)
+    return {
+      ...baseResult('kill_failed', {
+        cgroupPath,
+        detail: `cgroup.kill failed: ${killFailure}`,
+      }),
+      stdout,
+      stderr,
+      timedOut,
+      drainMs: cleanup.drainMs,
+    }
+  }
+
   // 出力上限超過・stdin 異常・abort・timeout・そして「正常終了でも cgroup が空でない」場合は kill する。
   const mustKill = timedOut || aborted || overflowed || stdinError !== undefined || placementFailed
   const cleanup = await terminateAndCleanup(cgroupPath, drainLimitMs, mustKill)
@@ -429,9 +473,19 @@ async function runInsideCgroup(
     stdout,
     stderr,
     timedOut,
-    killedDescendants: cleanup.killed,
+    killedDescendants: cleanup.killed || directChildUnreaped,
     drainMs: cleanup.drainMs,
     cgroupPath,
+  }
+
+  // 直接の子を刈り取れなかった場合でも、cgroup が空になり削除できたのなら
+  // workspace は静止している（= 安全）。ただし exit code は観測できていないので
+  // `exited.code` は null のままにし、成功として扱わせない。
+  if (directChildUnreaped && isContainmentSafe(cleanup.outcome)) {
+    return {
+      ...result,
+      detail: 'direct child never reported exit; containment drained the cgroup instead',
+    }
   }
 
   // 後始末が成功していても、実行そのものが安全でなかったケースを上書きする。

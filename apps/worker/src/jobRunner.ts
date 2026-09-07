@@ -730,6 +730,7 @@ export async function runJob(
     try {
       cliResult = await adapter.run({
         taskId: job.taskId,
+        jobId: job.id,
         provider: job.aiCliProvider,
         workingDir: job.safeCommand.workingDir,
         prompt: effectiveAiCliPrompt,
@@ -739,6 +740,10 @@ export async function runJob(
         expectJson: job.aiCliMode === 'review',
       })
     } catch (err: unknown) {
+      // adapter.run() は containment 失敗をそのまま再 throw する。ここで通常の
+      // AI CLI 失敗として inspectAfterAiFailure へ流すと `failed` が返り、
+      // 上位 processQueuedWork の quarantine 経路へ届かないまま所有権を解放してしまう。
+      rethrowIfUnsafe(err)
       const message = err instanceof Error ? err.message : String(err)
       console.error(`[jobRunner] AI CLI 実行エラー (${job.aiCliProvider}): ${message}`)
       // AI が失敗しても、失敗するまでに書いた変更は残っている。

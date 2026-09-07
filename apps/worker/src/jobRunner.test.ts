@@ -3793,3 +3793,73 @@ describe('P1 Phase 2: containment / reconciliation の失敗は握り潰さな�
     )
   })
 })
+
+/**
+ * P1 Phase 2（実装レビュー指摘）:
+ * AI CLI 経路の containment 失敗が、通常の AI 失敗（inspectAfterAiFailure → failed）へ
+ * 降格していた。降格すると processQueuedWork の quarantine 経路へ届かず、
+ * 生き残ったプロセスを抱えたまま所有権を解放してしまう。
+ */
+describe('P1 Phase 2: AI CLI 経路の containment 失敗も降格させない', () => {
+  beforeEach(() => {
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'status' })
+    detectGitOperationStateMock.mockReturnValue([])
+  })
+
+  afterEach(() => {
+    clearContainedCommandOverride()
+  })
+
+  it('adapter.run が containment 失敗を投げたら failed へ変換せず伝播する', async () => {
+    createAiCliAdapterMock.mockReturnValue({
+      run: vi.fn().mockRejectedValue(
+        new TestContainmentInfrastructureError('containment failed: drain_timeout'),
+      ),
+    } as never)
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'なにか変更してください',
+      aiCliMode: 'implement',
+    })
+
+    await expect(runJob(job, createPolicy())).rejects.toThrow(/drain_timeout/)
+  })
+
+  it('通常の AI CLI 失敗はこれまでどおり failed 結果として扱う（過剰反応しない）', async () => {
+    createAiCliAdapterMock.mockReturnValue({
+      run: vi.fn().mockRejectedValue(new Error('provider exploded')),
+    } as never)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) =>
+      gitFallback(args),
+    )
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'なにか変更してください',
+      aiCliMode: 'implement',
+    })
+
+    const result = await runJob(job, createPolicy())
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('provider exploded')
+  })
+
+  it('Job ID が containment のトレーサビリティのため AI CLI へ渡される', async () => {
+    const run = vi.fn().mockResolvedValue(makeCliResult())
+    createAiCliAdapterMock.mockReturnValue({ run } as never)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'status') return 'ok\n'
+      return gitFallback(args)
+    })
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'なにか変更してください',
+      aiCliMode: 'implement',
+    })
+    await runJob(job, createPolicy())
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ jobId: job.id }))
+  })
+})
