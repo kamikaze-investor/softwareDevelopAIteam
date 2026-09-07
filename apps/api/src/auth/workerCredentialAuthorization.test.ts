@@ -110,7 +110,7 @@ describe('Worker↔API authority separation — ADMIN credential', () => {
   })
 })
 
-describe('Worker↔API authority separation — WORKER credential: allowlist 11経路', () => {
+describe('Worker↔API authority separation — WORKER credential: allowlist 12経路', () => {
   it('GET /api/projects が通る', async () => {
     await withApp(async (app) => {
       const res = await app.inject({ method: 'GET', url: '/api/projects', headers: workerAuthHeader() })
@@ -154,6 +154,19 @@ describe('Worker↔API authority separation — WORKER credential: allowlist 11�
         url: '/api/jobs/non-existent-id/fail-if-running',
         headers: workerAuthHeader(),
         payload: { stderr: 'x', completedAt: new Date().toISOString() },
+      })
+      expect(res.statusCode).not.toBe(401)
+      expect(res.statusCode).not.toBe(403)
+    })
+  })
+
+  it('PATCH /api/jobs/:id/clear-quarantine が通る', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: '/api/jobs/non-existent-id/clear-quarantine',
+        headers: workerAuthHeader(),
+        payload: { workspaceVerified: true },
       })
       expect(res.statusCode).not.toBe(401)
       expect(res.statusCode).not.toBe(403)
