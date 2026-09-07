@@ -17,6 +17,8 @@ import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
 import { TARGET_ROOT } from '../utils/pathUtils.js'
 import {
   buildReviewPrompt,
+  ClaudeReviewerAdapter,
+  extractClaudeCliResultText,
   CodexReviewerAdapter,
   createReviewerAdapter,
   GeminiReviewerAdapter,
@@ -113,6 +115,19 @@ function makeAiCliResult(overrides: Partial<AiCliResult> = {}): AiCliResult {
     durationMs: 10,
     ...overrides,
   }
+}
+
+
+/** 2026-09-07に実測したClaude Code CLIの `--output-format json` envelope形状。 */
+function claudeEnvelope(inner: string, overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: inner,
+    duration_ms: 10,
+    ...overrides,
+  })
 }
 
 function mockCodexAdapterRun(): ReturnType<typeof vi.fn> {
@@ -515,8 +530,8 @@ describe('createReviewerAdapter', () => {
     expect(createReviewerAdapter('codex')).toBeInstanceOf(CodexReviewerAdapter)
   })
 
-  it('claude は未実装エラーをthrowする', () => {
-    expect(() => createReviewerAdapter('claude')).toThrow('ClaudeReviewerAdapter は未実装です')
+  it('claude は ClaudeReviewerAdapter を返す（2026-09-07に拡張ポイントを実装）', () => {
+    expect(createReviewerAdapter('claude')).toBeInstanceOf(ClaudeReviewerAdapter)
   })
 
   it('chatgpt は未実装エラーをthrowする', () => {
@@ -550,11 +565,14 @@ describe('reviewWithSeparation', () => {
     expect(mockCallGeminiWithFallback).toHaveBeenCalledOnce()
   })
 
-  it('implementerProvider:gemini は同一AIではなく claude を選ぶため未実装エラーになる', () => {
+  // Claude adapterは実装したが、task-kind reviewでの有効化はPR Cで別途判断する。
+  // ここでゲートしないと、gemini実装JobがPR C前にClaudeレビューを走らせ始める
+  // （＝PR Aがproduction topologyを変えてしまう。独立レビュー指摘、2026-09-07）。
+  it('implementerProvider:gemini のclaude経路はゲートされている（Roadmap cutover後も維持）', () => {
     expect(() => reviewWithSeparation({
       ...makeRequest({ implementerProvider: 'gemini' }),
       phase: 'pre',
-    })).toThrow('ClaudeReviewerAdapter は未実装です')
+    })).toThrow('task-kind reviewでのClaude有効化は行っていません')
   })
 })
 
@@ -571,5 +589,157 @@ describe('shouldEscalateToChatGpt', () => {
       makeApprovalLevelResult(),
       makeReviewerResult({ verdict: 'blocking', confidence: 0 }),
     )).toBe(false)
+  })
+})
+
+// Roadmap final integration reviewは、応答が取れないことを「問題なし」と解釈してはいけない。
+// 認証失敗・malformed・timeoutはいずれもfail-closed（blocking / confidence 0）にする。
+describe('ClaudeReviewerAdapter.review', () => {
+  function makeReq(): ReviewerRequest {
+    return {
+      jobId: 'job-1',
+      reviewKind: 'roadmap',
+      subjectId: 'project-1',
+      implementerProvider: 'codex',
+      reviewerProvider: 'claude',
+      phase: 'post',
+      purposeSummary: 'roadmap review',
+      targetFiles: [],
+    }
+  }
+
+  it('claude_code adapter を mode:review / expectJson:true / claude-opus-5 で呼ぶ', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({ provider: 'claude_code', stdout: claudeEnvelope(reviewerJson('approved')) }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(mockCreateAiCliAdapter).toHaveBeenCalledWith({ provider: 'claude_code' })
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      mode: 'review',
+      expectJson: true,
+      model: 'claude-opus-5',
+      provider: 'claude_code',
+    }))
+    expect(result.provider).toBe('claude')
+    expect(result.verdict).toBe('approved')
+  })
+
+  it('roadmap kindではtaskIdを偽装せず、正直なラベルを使う', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({ provider: 'claude_code' }))
+
+    await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      taskId: 'roadmap-review:project-1',
+    }))
+  })
+
+  it('認証失敗（非0 exit）はblockingでfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({
+      provider: 'claude_code',
+      exitCode: 1,
+      stdout: '',
+      stderr: 'Failed to authenticate: OAuth session expired and could not be refreshed',
+    }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+    expect(result.rawResponse).toContain('OAuth session expired')
+  })
+
+  it('malformed outputはblockingでfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({ provider: 'claude_code', stdout: 'not json at all' }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+  })
+
+  it('valid envelope + blocking verdict を正しく取り出す', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({ provider: 'claude_code', stdout: claudeEnvelope(reviewerJson('blocking')) }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+  })
+
+  it('envelopeのresultが欠落していればfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({
+      provider: 'claude_code',
+      stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false }),
+    }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+  })
+
+  it('resultが文字列でなければfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({
+      provider: 'claude_code',
+      stdout: claudeEnvelope('unused', { result: { verdict: 'approved' } }),
+    }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+  })
+
+  it('is_error:true のenvelopeは中身を信用せずfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({
+      provider: 'claude_code',
+      stdout: claudeEnvelope(reviewerJson('approved'), { is_error: true }),
+    }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+  })
+
+  it('envelope内のreviewer JSONが壊れていればfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({ provider: 'claude_code', stdout: claudeEnvelope('{not valid json') }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+  })
+
+  it('timeout等の例外はblockingでfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockRejectedValue(new Error('ETIMEDOUT'))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+    expect(result.summary).toContain('ETIMEDOUT')
+  })
+
+  it('guardにblockedされた場合もblockingでfail-closed', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult({ provider: 'claude_code', blocked: true, stdout: 'blocked by guard' }))
+
+    const result = await new ClaudeReviewerAdapter().review(makeReq())
+
+    expect(result.verdict).toBe('blocking')
+    expect(result.confidence).toBe(0)
+  })
+
+  it('createReviewerAdapter は claude で ClaudeReviewerAdapter を返す（旧throwの置き換え）', () => {
+    expect(createReviewerAdapter('claude')).toBeInstanceOf(ClaudeReviewerAdapter)
   })
 })
