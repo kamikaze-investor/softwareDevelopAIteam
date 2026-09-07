@@ -95,9 +95,21 @@ export interface AiCliRequest {
   /**
    * 使用モデルの明示指定（任意）
    * 未指定時は各CLIのデフォルトモデルに委ねる（既存動作を維持）。
-   * 現在サポートするのは Codex CLI の `--model` のみ。
+   * Codex CLI と Claude Code CLI の `--model` で使う。
    */
   model?: string
+
+  /**
+   * 推論強度の明示指定（任意）。現在サポートするのは Codex CLI のみで、
+   * `-c model_reasoning_effort="<value>"` として渡す。
+   *
+   * 未指定時は何も渡さず、CLI自身の設定（`~/.codex/config.toml`）に委ねる
+   * ＝既存呼び出し元のargvは不変。
+   *
+   * Codex CLIは値をローカル検証せずそのまま送るため、有効値はサーバ側が決める。
+   * 2026-09-07にproduction VPSで `gpt-5.6-sol` + `xhigh` の実動を確認済み。
+   */
+  reasoningEffort?: string
 
   // ────────────────────────────────────────────────────────
   // Rule-001 対策フィールド
