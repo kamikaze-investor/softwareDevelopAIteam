@@ -85,11 +85,19 @@ export class ClaudeCodeAdapter extends BaseCliAdapter {
 
     const fullPrompt = MODE_PREFIXES[request.mode] + request.prompt
 
+    // model は任意。指定された場合のみ --model を渡す（CodexAdapter と同じ方針）。
+    // 未指定時は Claude Code CLI の既定モデルに委ねる＝既存呼び出し元の挙動は不変。
+    const modelArgs = request.model ? ['--model', request.model] : []
+
     // Claude Code CLI の非対話モード
     // --print / -p: 入力を受けてそのまま出力して終了
-    // --output-format json: JSON形式で出力（パースしやすい）
+    // --output-format json: CLIの正式なenvelopeで出力する。**常に維持する** —
+    //   構造化出力の保証をモデルのprompt遵守へ戻さないため。envelopeの中身
+    //   （`result`文字列に入るモデル本文）の取り出しは、それを必要とする呼び出し元
+    //   （ClaudeReviewerAdapter）が二段階parseで行う。
     return [
       '--print', fullPrompt,
+      ...modelArgs,
       '--output-format', 'json',
       ...modeFlags,
     ]

@@ -18,6 +18,7 @@ import type { ApprovalLevelResult } from '@ai-team/shared'
 
 // callGeminiWithFallback だけを差し替え、AGY_* モデル定数など他の export は実物を使う
 // （定数を落とすと呼び出し元の `...AGY_LIGHT_MODEL` が undefined 展開で壊れる）。
+
 vi.mock('../metaReviewer/geminiRouter.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../metaReviewer/geminiRouter.js')>()),
   callGeminiWithFallback: vi.fn(),
@@ -201,12 +202,15 @@ describe('commitGate × reviewer分離チェーン（実コード経路）', () 
     expect(result.allowed).toBe(false)
   })
 
-  it('implementer:gemini → reviewer:claude は未実装のためrunPostReviewがthrowし、成果物欠落で allowed:false', async () => {
+  // Claude adapterは実装済みだが、task-kind reviewでの有効化はPR Cで別途判断するため
+  // ゲートしている（PR Aがproduction topologyを変えないようにするため）。
+  // ゲートの結果としてrunPostReviewはthrowし、成果物欠落でCommit Gateは通らない。
+  it('implementer:gemini → reviewer:claude はゲートされ、成果物欠落で allowed:false', async () => {
     mockCallGeminiWithFallback.mockResolvedValue(reviewerJson('approved'))
 
     await expect(runPostReview(makePostReviewInput({
       implementerProvider: 'gemini',
-    }))).rejects.toThrow('ClaudeReviewerAdapter は未実装です')
+    }))).rejects.toThrow('task-kind reviewでのClaude有効化は行っていません')
 
     // jobRunner と同じcatch経路: postReviewResult は undefined のまま shadow gate へ渡る
     const postReviewResult = await runPostReviewLikeJobRunner(makePostReviewInput({
