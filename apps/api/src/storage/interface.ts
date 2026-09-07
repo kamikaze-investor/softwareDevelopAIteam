@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -149,6 +149,18 @@ export interface IProjectStorage {
   findRunning(): Project | undefined
   create(project: Omit<Project, 'id' | 'createdAt' | 'updatedAt'>): Project
   update(id: string, data: Partial<Project>): Project | undefined
+  /**
+   * Project開始workflowのstageだけを更新する。`update()`と分けているのは、
+   * 進行中のworkflowがProject Definition（goal / designPhilosophy / status）を
+   * 書き換えられないようにするため。`blocked`以外へ遷移するときはblocked理由をクリアする。
+   */
+  updateStartStage(id: string, stage: ProjectStartStage, blockedReason?: string): Project | undefined
+  /**
+   * 中断されたProject開始workflowを返す（stageが設定済みで終端stageでないもの）。
+   * API起動時のrecoveryが再kickする対象。`completed`/`blocked`は含まない
+   * （`blocked`はCEO判断待ちの安全停止であり、自動再開してはいけない）。
+   */
+  findInterruptedStarts(): Project[]
 }
 
 export interface ITaskStorage {

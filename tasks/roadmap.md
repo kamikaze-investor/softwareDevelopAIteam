@@ -2005,6 +2005,31 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 **MVP必須（このセクションの5項目）:**
 
+<!-- roadmap:id=continuation-get-liveness-dependency state=planned -->
+0. [ ] **Task ContinuationのGET依存解消（高優先度）**（2026-09-07登録。Project-start durability
+   実装の独立レビューで発覚。**今回のProject-start変更が導入したものではなく既存設計**であり、
+   PR混入を避けるため別項目として登録した）。
+
+   **事実**: `GET /api/projects` と `GET /api/projects/:id` は read-only ではない。両ルートが
+   `retryRunningProjectContinuations()` を呼び、`retryPendingContinuationsForProject()` を
+   fire-and-forgetする（`apps/api/src/routes/projects.ts`）。これはJobを作りうる副作用である。
+   当該コードのコメント自身が「Mobileが両ルートを常時pollするので各poll tickがretryの機会になる」と
+   明言しており、**Mobile pollingがcontinuationのliveness driverになっている**。
+
+   **なぜ問題か**: CEO要件「Mobileを閉じてもProject全体の処理が継続する」に直接関わる。
+   Project-start workflowについてはbackend所有化済みで、GETなしで完走しGETでstageも進まない
+   ことをルート層のテストで固定した。しかしTask完了後の継続は依然としてclientのpollに依存する。
+   **この項目が未解決のまま、上記CEO要件をDONE扱いにしてはいけない。**
+
+   **作業範囲**: (1) GETをread-onlyへ戻す (2) Mobile pollingをcontinuationのliveness driverに
+   しない (3) 新Queue/Daemonを安易に作らない (4) 既存のcontinuation/recovery機構
+   （起動時recovery・Worker Outbox再送・`task_continuations`）でbackend-ownedな再駆動が
+   可能かをread-onlyで調査する。単純にGETから外すだけでは pending continuation を駆動する
+   ものが無くなるため、代替driverの設計とセットで行う。
+
+   **既存項目との関係（重複実装にしないこと）**: `project-pause-continuation-gap`（done）は
+   「アプリを閉じても最後まで進む」を確認する前に解決すること。
+
 <!-- roadmap:id=mobile-approval-role-docs state=deferred -->
 1. [ ] 2種類の承認の役割整理とMobile導線設計 — **Mobile導線は実装完了・文書整理のみ未完**。
    Project単位承認（`/api/approvals/pending`）とTask/Job単位Approval Gate

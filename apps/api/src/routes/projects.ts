@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import type { ProjectRoadmapCompletion, Task } from '@ai-team/shared'
 import { z } from 'zod'
 import { analyzeProjectDefinition } from '../ctoAi/projectDefinitionAnalysis'
-import { initializeApprovedProject } from '../ctoAi/projectInitialization'
+import { kickProjectStart } from '../ctoAi/projectStartWorkflow.js'
 import { retryPendingContinuationsForProject } from '../ctoAi/taskContinuation'
 import { getStorage } from '../storage'
 import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
@@ -193,7 +193,14 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     }
 
     try {
-      const updated = storage.projects.update(req.params.id, projectFields)
+      // 初回start（runningへ遷移し、まだRoadmapが無い）の場合だけ、status遷移と開始stageを
+      // **同一のstorage write**で確定させる。別writeにするとその間にcrash windowができ、
+      // recoveryが「runningだがstageが無い」を推測で拾う設計になってしまう。
+      const isFreshStartTransition = projectFields.status === 'running' && !existingHasActiveRoadmap
+      const updated = storage.projects.update(req.params.id, {
+        ...projectFields,
+        ...(isFreshStartTransition ? { startStage: 'roadmap_generation' as const } : {}),
+      })
       if (!updated) {
         return reply.status(404).send({ error: 'Project not found' })
       }
@@ -204,7 +211,13 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         .findByProjectId(updated.id)
         .some((task) => task.roadmapActive)
       if (updated.status === 'running' && !hasActiveRoadmap) {
-        await initializeApprovedProject(storage, updated, process.env.TARGET_ROOT ?? '/workspace/target', {
+        // 開始要求を受理して即座に返す。Roadmap生成〜Review〜Task syncはVPS側で
+        // client connectionと独立して継続し、進行段階はProjectへ永続化される。
+        // Mobileは`GET`でstageを読むだけで、pollしなくてもworkflowは完走する。
+        //
+        // ここで`await`しないのは、Codexの高reasoning生成とmulti-provider reviewで
+        // 所要時間が数分規模になり、HTTPリクエストのlifecycleに縛れないため。
+        kickProjectStart(storage, updated, {
           writeProjectMemory: true,
           analysis: freshStartAnalysis,
           canonicalDefinitionText: freshStartCanonicalDefinitionText,

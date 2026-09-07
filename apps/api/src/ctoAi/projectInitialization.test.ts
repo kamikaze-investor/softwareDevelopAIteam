@@ -8,6 +8,12 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage, RoadmapSyncResult } from '../storage/interface'
 import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow.js'
 import {
+  awaitProjectStartForTest,
+  kickProjectStart,
+  recoverInterruptedProjectStarts,
+  resetInFlightProjectStartsForTest,
+} from './projectStartWorkflow'
+import {
   initializeApprovedProject,
   ProjectInitializationError,
 } from './projectInitialization'
@@ -667,5 +673,94 @@ describe('AI-owned uncertainty: 構造化参照から Implementer prompt まで�
     })
 
     expect(syncs[0].tasks[0].description).toBe(base.tasks[0].description)
+  })
+})
+
+// kick / recovery層をstubで検証するだけでは、実際のinitializeApprovedProject()を通る
+// crash/replay契約を証明できない（独立レビュー指摘、2026-09-07）。ここではproviderだけを
+// mockし、**実装本体を通して**stage永続化とresume境界を固定する。
+describe('Project開始workflow: 実initialize経路のdurability', () => {
+  let storage: IStorage
+  let tmpDir: string
+
+  beforeEach(() => {
+    storage = createSQLiteStorage(':memory:')
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), 'project-start-integration-'))
+    initGitRepo(tmpDir)
+    reviewMocks.execute.mockReset()
+    reviewMocks.execute.mockImplementation(async (input: string) => ({
+      ok: true,
+      timedOut: false,
+      stdout: stdoutForReviewInput(input),
+    }))
+    roadmapGeneratorMocks.generateRoadmap.mockReset()
+    workflowMocks.createInitialImplementWorkflow.mockClear()
+    resetInFlightProjectStartsForTest()
+    process.env.TARGET_ROOT = tmpDir
+  })
+
+  afterEach(() => {
+    delete process.env.TARGET_ROOT
+  })
+
+  it('実initialize経路を通してstageが永続化され、completedに到達する', async () => {
+    const project = createProject(storage)
+    mockGenerateRoadmaps(ROADMAP)
+    const stages: string[] = []
+    const originalUpdate = storage.projects.updateStartStage.bind(storage.projects)
+    storage.projects.updateStartStage = (id, stage, reason) => {
+      stages.push(stage)
+      return originalUpdate(id, stage, reason)
+    }
+
+    kickProjectStart(storage, project, { analysis: ANALYSIS, writeProjectMemory: true })
+    await awaitProjectStartForTest(project.id)
+
+    expect(stages).toContain('roadmap_generation')
+    expect(stages).toContain('deterministic_validation')
+    expect(stages).toContain('task_sync')
+    expect(stages.at(-1)).toBe('completed')
+    expect(storage.tasks.findByProjectId(project.id)).toHaveLength(1)
+    expect(workflowMocks.createInitialImplementWorkflow).toHaveBeenCalledTimes(1)
+  })
+
+  it('Task sync後・Job作成前のcrashをresumeしても、Roadmapを作り直さず1件だけJobを作る', async () => {
+    const project = createProject(storage)
+    mockGenerateRoadmaps(ROADMAP)
+
+    // 1回目: 正常にsyncまで到達させる
+    kickProjectStart(storage, project, { analysis: ANALYSIS, writeProjectMemory: true })
+    await awaitProjectStartForTest(project.id)
+    const tasksAfterFirstRun = storage.tasks.findByProjectId(project.id)
+    expect(tasksAfterFirstRun).toHaveLength(1)
+
+    // Job作成前にcrashした状態を再現する（stageをtask_syncへ巻き戻す）
+    storage.projects.updateStartStage(project.id, 'task_sync')
+    workflowMocks.createInitialImplementWorkflow.mockClear()
+    resetInFlightProjectStartsForTest()
+
+    // restart後のRoadmap生成が**別内容**になるよう仕込む。resumeがこれを使ってしまうと、
+    // 旧Roadmap由来のTaskが非活性化され別Taskが作られる＝実質的な作り直しになる。
+    const divergentRoadmap = makeRoadmap(3, 2, 'Completely different plan')
+    mockGenerateRoadmaps(divergentRoadmap)
+    // 1回目の呼び出し履歴を消し、resumeで新たに呼ばれないことを検証できるようにする
+    roadmapGeneratorMocks.generateRoadmap.mockClear()
+
+    const { rekicked, resumed } = await recoverInterruptedProjectStarts(storage)
+
+    expect(rekicked).toEqual([])
+    expect(resumed).toEqual([project.id])
+    // Roadmap Generatorは呼ばれない（別内容のRoadmapは使われない）
+    expect(roadmapGeneratorMocks.generateRoadmap).not.toHaveBeenCalled()
+    // 旧Roadmap由来のTaskがそのまま残り、新旧が混在しない
+    const tasksAfterResume = storage.tasks.findByProjectId(project.id)
+    expect(tasksAfterResume.map((t) => t.roadmapTaskKey)).toEqual(
+      tasksAfterFirstRun.map((t) => t.roadmapTaskKey),
+    )
+    expect(tasksAfterResume.filter((t) => t.roadmapActive)).toHaveLength(1)
+    // 正しいTaskに初回Jobが1件だけ
+    expect(workflowMocks.createInitialImplementWorkflow).toHaveBeenCalledTimes(1)
+    expect(workflowMocks.createInitialImplementWorkflow).toHaveBeenCalledWith(storage, tasksAfterFirstRun[0].id)
+    expect(storage.projects.findById(project.id)?.startStage).toBe('completed')
   })
 })

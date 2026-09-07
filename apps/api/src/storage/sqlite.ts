@@ -496,21 +496,61 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       }
 
       const updated = { ...existing, ...data, updatedAt: now() }
+      // startStageを同じUPDATEで書けるようにする。status='running'への遷移と開始stageの
+      // 永続化を別writeにすると、その間のcrashで「runningだがstageが無い」Projectが残り、
+      // recoveryがそれを推測で拾わざるを得なくなる。推測に頼ると、start_stage列導入前から
+      // 存在するlegacy runningまで巻き込んで再初期化しかねない（独立レビュー指摘、2026-09-07）。
+      const writesStage = Object.prototype.hasOwnProperty.call(data, 'startStage')
       try {
         db.prepare(`
-          UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=? WHERE id=?
+          UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=?${
+            writesStage ? ', start_stage=?, start_stage_updated_at=?, start_blocked_reason=NULL' : ''
+          } WHERE id=?
         `).run(
           updated.name,
           updated.goal,
           JSON.stringify(updated.designPhilosophy),
           updated.status,
           updated.updatedAt,
+          ...(writesStage ? [updated.startStage ?? null, updated.updatedAt] : []),
           id,
         )
       } catch (err: unknown) {
         throwSingleRunningProjectError(err)
       }
       return updated
+    },
+
+    updateStartStage(id, stage, blockedReason) {
+      const existing = this.findById(id)
+      if (!existing) return undefined
+
+      // blocked以外へ遷移するときは前回のblocked理由を必ず消す。残すと、進行中のstageに
+      // 古い停止理由が張り付いたままMobileへ表示される。
+      const reason = stage === 'blocked' ? (blockedReason ?? null) : null
+      const stageUpdatedAt = now()
+      db.prepare(`
+        UPDATE projects SET start_stage=?, start_stage_updated_at=?, start_blocked_reason=? WHERE id=?
+      `).run(stage, stageUpdatedAt, reason, id)
+
+      return this.findById(id)
+    },
+
+    findInterruptedStarts() {
+      // 終端stage（completed / blocked）は除外する。blockedはCEO判断待ちの安全停止であり、
+      // 自動再開してはいけない（fail-closed）。
+      //
+      // stageが設定されていること自体が「開始要求を受理した」証拠になる。running遷移と
+      // 開始stageは同一UPDATEで書かれるため、その間にcrash windowは存在しない。
+      // stageがNULLのProjectは開始要求を受けていない（start_stage列導入前から存在する
+      // legacy runningを含む）ので、推測で拾わない。
+      const rows = db.prepare(`
+        SELECT * FROM projects
+        WHERE start_stage IS NOT NULL
+          AND start_stage NOT IN ('completed', 'blocked')
+        ORDER BY start_stage_updated_at
+      `).all()
+      return rows.map(deserializeProject)
     },
   }
 
@@ -3083,6 +3123,9 @@ function deserializeProject(row: any): Project {
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    ...(row.start_stage ? { startStage: row.start_stage } : {}),
+    ...(row.start_stage_updated_at ? { startStageUpdatedAt: row.start_stage_updated_at } : {}),
+    ...(row.start_blocked_reason ? { startBlockedReason: row.start_blocked_reason } : {}),
   }
 }
 
