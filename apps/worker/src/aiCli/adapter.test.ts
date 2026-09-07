@@ -450,36 +450,29 @@ describe('CodexAdapter --output-last-message structured output', () => {
     expect(existsSync(path.dirname(capturedPath))).toBe(false)
   })
 
-  // Independent review, round 2 (2026-09-08): the earlier guard tried to prove ownership of a
-  // caller-supplied path string, which is not possible -- passing an unrelated path caused an
-  // unrelated file to be unlinked, and a same-prefixed sibling directory to be deleted whole.
-  // cleanup now takes the capture object this process created, so there is no untrusted-path
-  // entry point left to attack. What remains worth testing is that it removes ONLY its own
-  // directory and leaves a same-prefixed sibling alone.
-  it('removes only its own capture directory, not same-prefixed siblings', async () => {
-    const workingDir = makeWorkingDir()
-    const sibling = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
-    writeFileSync(path.join(sibling, 'other-run.json'), '{}', 'utf-8')
+  // Independent review round 3 (2026-09-08): the previous sibling test could not detect a
+  // return to prefix-based cleanup, because the sibling was never handed to cleanup at all.
+  // This one pins the ownership semantics directly: filePath deliberately points into a
+  // DIFFERENT same-prefixed directory than the one that was created. Cleanup must follow the
+  // directory it created and ignore the file path entirely. A regression to
+  // "derive the directory from filePath and check its prefix" deletes the wrong one and fails.
+  it('removes the directory it created, not the one implied by the file path', async () => {
+    const { cleanupCodexOutputCapture } = await import('./adapter.js')
 
-    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
-    let ownDir: string | undefined
+    const owned = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
+    const notOwned = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
+    writeFileSync(path.join(notOwned, 'someone-elses-run.json'), '{}', 'utf-8')
 
-    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
-      const args = argv ?? []
-      const out = args[args.indexOf('--output-last-message') + 1]
-      if (out === undefined) throw new Error('missing --output-last-message path')
-      ownDir = path.dirname(out)
-      writeFileSync(out, '{"ok":true}', 'utf-8')
-      return 'not json'
+    cleanupCodexOutputCapture({
+      captureDir: owned,
+      filePath: path.join(notOwned, 'capture.json'),
     })
 
-    await adapter.run(makeRequest(workingDir))
+    expect(existsSync(owned)).toBe(false)
+    expect(existsSync(notOwned)).toBe(true)
+    expect(existsSync(path.join(notOwned, 'someone-elses-run.json'))).toBe(true)
 
-    expect(ownDir).toBeTruthy()
-    expect(existsSync(ownDir as string)).toBe(false)
-    expect(existsSync(sibling)).toBe(true)
-    expect(existsSync(path.join(sibling, 'other-run.json'))).toBe(true)
-    rmSync(sibling, { recursive: true, force: true })
+    rmSync(notOwned, { recursive: true, force: true })
   })
 
   // Independent review finding 2 (2026-09-08): `os.tmpdir()` was assumed to be outside the

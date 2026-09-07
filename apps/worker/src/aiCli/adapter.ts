@@ -70,25 +70,41 @@ function resolvePnpmPath(): string {
 /** capture用一時ディレクトリの接頭辞。 */
 const CAPTURE_DIR_PREFIX = 'codex-lastmsg-'
 
-/** symlinkを解決した実パス。存在しない場合は`path.resolve`の結果へフォールバックする。 */
-function realPath(target: string): string {
+/**
+ * OS が正準と見なす実パス。
+ *
+ * `realpathSync.native` を優先するのは、通常の `realpathSync` が **symlinkでない部分の綴りを
+ * そのまま残す** ため。Windowsの8.3短縮名では `C:\WORKSP~1\TARGET~1\repo` と
+ * `C:\Workspace\Target\repo` が同一の場所を指すのに文字列としては一致せず、
+ * 小文字化しても一致しない（独立レビュー指摘、2026-09-08）。
+ * nativeは長い正準形へ展開するのでこの抜け道を塞ぐ。
+ *
+ * **失敗したら例外を投げる（fail-closedのため意図的に握り潰さない）。**
+ */
+function canonicalRealPath(target: string): string {
   const resolved = path.resolve(target)
 
   try {
-    return realpathSync(resolved)
+    return realpathSync.native(resolved)
   } catch {
-    return resolved
+    // nativeが使えない環境向けのfallback。ここも失敗すれば例外がそのまま伝播する。
+    return realpathSync(resolved)
   }
 }
 
-/** **比較専用**の正規化。Windowsは大文字小文字を区別しないので畳む（実パスとしては使わない）。 */
+/** 比較専用の正規化。Windowsは大文字小文字を区別しないので畳む（実パスとしては使わない）。 */
 function comparablePath(target: string): string {
-  const real = realPath(target)
+  const real = canonicalRealPath(target)
 
   return process.platform === 'win32' ? real.toLowerCase() : real
 }
 
-/** `child`が`parent`と同一、またはその配下かを正規化後のパスで判定する。 */
+/**
+ * `child` が `parent` と同一、またはその配下かを正準パスで判定する。
+ * **正規化できなければ判定不能として例外を投げる。** 「解決できなかったから安全」は誤りで、
+ * 一時的な EPERM/EIO で false を返すと、その直後にリポジトリ内へ書いてしまう
+ * （独立レビュー指摘、2026-09-08）。
+ */
 function isInside(child: string, parent: string): boolean {
   const c = comparablePath(child)
   const p = comparablePath(parent)
@@ -96,8 +112,12 @@ function isInside(child: string, parent: string): boolean {
   return c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep)
 }
 
+function formatErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
 /** Codexの最終回答を受け取るcapture先。**このプロセスが作ったディレクトリを保持する。** */
-interface CodexOutputCapture {
+export interface CodexOutputCapture {
   filePath: string
   captureDir: string
 }
@@ -123,9 +143,21 @@ function createCodexOutputCapture(request: AiCliRequest): CodexOutputCapture | u
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .slice(0, 64) || 'task'
 
-  const captureDir = mkdtempSync(path.join(realPath(os.tmpdir()), CAPTURE_DIR_PREFIX))
+  const captureDir = mkdtempSync(path.join(canonicalRealPath(os.tmpdir()), CAPTURE_DIR_PREFIX))
 
-  if (isInside(captureDir, request.workingDir)) {
+  let insideRepo: boolean
+  try {
+    insideRepo = isInside(captureDir, request.workingDir)
+  } catch (err) {
+    // 正規化できない＝リポジトリ内かどうか判定できない。安全側に倒して中止する。
+    rmSync(captureDir, { recursive: true, force: true })
+    throw new Error(
+      `[aiCli] capture directory (${captureDir}) の正規化に失敗し、対象リポジトリ`
+      + `(${request.workingDir}) の内外を判定できませんでした: ${formatErrorMessage(err)}`,
+    )
+  }
+
+  if (insideRepo) {
     rmSync(captureDir, { recursive: true, force: true })
     throw new Error(
       `[aiCli] OS temp directory (${captureDir}) が対象リポジトリ (${request.workingDir}) の内側に`
@@ -165,7 +197,7 @@ function readCodexOutputLastMessage(filePath: string | undefined): Record<string
  * 判定ロジックは不要になった。ディレクトリごと消すためファイル単体のunlinkも要らない
  * （unlink失敗でrmSyncが巻き添えでskipされる問題も同時に消える）。
  */
-function cleanupCodexOutputCapture(capture: CodexOutputCapture | undefined): void {
+export function cleanupCodexOutputCapture(capture: CodexOutputCapture | undefined): void {
   if (capture === undefined) return
 
   try {
