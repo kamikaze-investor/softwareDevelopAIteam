@@ -1,5 +1,11 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
+
+vi.mock('../execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('../execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
+
 /**
  * Implementation Agent（provider非依存）へ Constitution 3.14〜3.15 が届くことの検証。
  *

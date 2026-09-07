@@ -61,6 +61,13 @@ export interface AiCliRequest {
   /** ジョブを識別するタスクID */
   taskId: string
 
+  /**
+   * 実行元の Job ID（P1 Phase 2 containment のトレーサビリティ用・任意）。
+   * per-job cgroup 名と quarantine metadata をどの Job の実行かに結び付ける。
+   * 省略時は taskId で代替する（cgroup 名の一意性は attempt ID 側で担保される）。
+   */
+  jobId?: string
+
   /** 使用するCLIプロバイダー */
   provider: AiCliProvider
 

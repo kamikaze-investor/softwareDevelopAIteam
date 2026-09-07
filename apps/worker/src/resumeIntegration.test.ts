@@ -13,6 +13,12 @@ import { resolvePolicy } from './guards/gatePolicy.js'
 import { permissionGuardWithGrants } from './guards/permissionGuard.js'
 import { runJob } from './jobRunner.js'
 
+
+vi.mock('./execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('./execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
+
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),
 }))
@@ -63,6 +69,14 @@ vi.mock('./guards/changeManifest.js', () => ({
     changes,
     paths: changes.map((c) => c.path),
   })),
+}))
+
+// 他の guard と同様に隔離する。P1 Phase 2 で実行後 reconciliation も
+// git 操作マーカーを検査するため、実 git を持たないこの suite では
+// 「進行中の操作なし」を返す必要がある。
+vi.mock('./guards/gitOperationState.js', () => ({
+  detectGitOperationState: vi.fn(() => []),
+  GitOperationStateError: class GitOperationStateError extends Error {},
 }))
 
 vi.mock('./jobLogger.js', () => ({

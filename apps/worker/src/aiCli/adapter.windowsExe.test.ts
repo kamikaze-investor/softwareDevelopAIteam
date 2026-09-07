@@ -8,6 +8,12 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
+
+vi.mock('../execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('../execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
+
 // vi.mock はホイストされるので import より前に評価される
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(() => ''),

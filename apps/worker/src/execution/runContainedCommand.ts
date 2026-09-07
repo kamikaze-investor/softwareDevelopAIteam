@@ -131,6 +131,27 @@ export class ContainmentInfrastructureError extends Error {
   }
 }
 
+/** 与えられた例外が containment インフラ失敗かどうか（broad catch での再 throw 判定用） */
+export function isContainmentInfrastructureError(err: unknown): err is ContainmentInfrastructureError {
+  return err instanceof ContainmentInfrastructureError
+}
+
+/**
+ * `runContainedCommand` の throw 版。
+ *
+ * workspace が静止していると証明できなかった場合（`clean` / `killed` 以外）に
+ * `ContainmentInfrastructureError` を投げる。呼び出し元の broad catch は
+ * この例外だけは飲み込まず再 throw し、Job ownership / quarantine protocol へ渡すこと。
+ * コマンド自体が非ゼロ終了しただけの場合は throw せず、通常の結果として返る。
+ */
+export async function runContainedOrThrow(
+  options: RunContainedCommandOptions,
+): Promise<ContainedResult> {
+  const result = await runContainedCommand(options)
+  if (!isContainmentSafe(result.outcome)) throw new ContainmentInfrastructureError(result)
+  return result
+}
+
 // ────────────────────────────────────────────────────────────
 // cgroup の解決
 // ────────────────────────────────────────────────────────────

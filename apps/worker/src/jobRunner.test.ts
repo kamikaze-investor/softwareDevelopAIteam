@@ -47,6 +47,21 @@ vi.mock('node:child_process', () => ({
   execFileSync: hoistedExecFileSync,
 }))
 
+// P1 Phase 2: main command / recovery git 操作は containment 経由になったため、
+// 既存の execFileSync mock による結果注入をブリッジ経由でそのまま活かす。
+// 実モジュールは `node:child_process` の `spawn` を import するが、この suite は
+// 同モジュールを execFileSync だけに mock しているため importOriginal は使えない。
+vi.mock('./execution/runContainedCommand.js', async () => {
+  const { createContainedCommandMock } = await import('./execution/containedCommandTestBridge.js')
+  return createContainedCommandMock()
+})
+
+import {
+  TestContainmentInfrastructureError,
+  clearContainedCommandOverride,
+  setContainedCommandOverride,
+} from './execution/containedCommandTestBridge.js'
+
 vi.mock('./commandResolver.js', () => ({
   resolveCommand: vi.fn(),
 }))
@@ -142,7 +157,9 @@ vi.mock('./guards/changeManifest.js', () => ({
 }))
 
 vi.mock('./guards/gitOperationState.js', () => ({
-  detectGitOperationState: vi.fn(),
+  // 既定は「進行中の git 操作なし」。P1 Phase 2 で実行後 reconciliation も
+  // このマーカー検査を通るため、undefined を返すと全 Job が fail-closed になる。
+  detectGitOperationState: vi.fn(() => []),
 }))
 
 vi.mock('./jobLogger.js', () => ({
@@ -814,7 +831,10 @@ describe('runJob', () => {
     expect(result.guardResult.fileViolations).toEqual(['../secret.txt'])
   })
 
-  it('git_commit job uses timeout=undefined (atomic)', async () => {
+  // P1 Phase 2: atomic Job の unbounded 実行を廃止した。timeout が発火しないと
+  // containment kill → drain → reconciliation へ到達できず、hang した git_commit が
+  // workspace を永久に所有し続けるため（CEO 承認済みの方針変更）。
+  it('git_commit job も JOB_TIMEOUT_MS で区切られる（atomic の unbounded 実行を廃止）', async () => {
     resolveCommandMock.mockReturnValue({
       argv: ['git', 'commit', '-m', 'test'],
       description: 'git commit',
@@ -831,7 +851,7 @@ describe('runJob', () => {
       (call) => Array.isArray(call[1]) && (call[1] as string[]).includes('commit')
     )
     expect(commitCall).toBeDefined()
-    expect((commitCall![2] as { timeout?: number }).timeout).toBeUndefined()
+    expect((commitCall![2] as { timeout?: number }).timeout).toBe(120_000)
   })
 
   it('git_commit job generates RollbackInfo', async () => {
@@ -3714,5 +3734,62 @@ const result = computeWorkspaceBaseline(createJob(), '/workspace/target')
     if (!result.ok) {
       expect(result.reason).toBe('workspace baseline could not be established: Failed to resolve HEAD commit in "/workspace/target"')
     }
+  })
+})
+
+/**
+ * P1 Phase 2: containment / 実行後 reconciliation の失敗は「通常の Job 失敗」ではない。
+ * これらを failed へ潰すと、生き残ったプロセスや壊れた git 状態を抱えたまま
+ * workspace の所有権を解放してしまう（独立レビュー B3 / B4）。
+ */
+describe('P1 Phase 2: containment / reconciliation の失敗は握り潰さない', () => {
+  beforeEach(() => {
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'status' })
+    detectGitOperationStateMock.mockReturnValue([])
+  })
+
+  afterEach(() => {
+    clearContainedCommandOverride()
+  })
+
+  it('B3: main command の containment 失敗は failed へ潰さず伝播する', async () => {
+    setContainedCommandOverride(async () => {
+      throw new TestContainmentInfrastructureError('containment failed: drain_timeout')
+    })
+
+    await expect(runJob(createJob(), createPolicy())).rejects.toThrow(/drain_timeout/)
+  })
+
+  it('B3: containment 失敗は exitCode 付きの通常結果に変換されない', async () => {
+    setContainedCommandOverride(async () => {
+      throw new TestContainmentInfrastructureError('containment failed: cleanup_failed')
+    })
+
+    // resolve してしまう（= failed 結果を返す）なら、その時点で所有権解放の危険がある
+    const outcome = await runJob(createJob(), createPolicy()).then(
+      (result) => ({ resolved: true as const, result }),
+      (err: unknown) => ({ resolved: false as const, err }),
+    )
+
+    expect(outcome.resolved).toBe(false)
+  })
+
+  it('B4: 実行後に git 操作マーカーが残っていれば terminalize せず伝播する', async () => {
+    // 実行前（baseline 計算時）は clean、実行後の最終検査で index.lock が現れる状況。
+    detectGitOperationStateMock
+      .mockReturnValueOnce([])
+      .mockReturnValue(['index.lock'])
+
+    await expect(runJob(createJob(), createPolicy())).rejects.toThrow(/index\.lock/)
+  })
+
+  it('B4: マーカー検出は「プロセスが静止した」ことと別問題であると明示する', async () => {
+    detectGitOperationStateMock
+      .mockReturnValueOnce([])
+      .mockReturnValue(['index.lock'])
+
+    await expect(runJob(createJob(), createPolicy())).rejects.toThrow(
+      /process quiescence does not prove git consistency/,
+    )
   })
 })
