@@ -1188,7 +1188,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       try {
-        return updateTransaction()
+        // PR-C: claim（queued -> running）を含むこのtransactionは IMMEDIATE で開始する。
+        // deferred のままだと最初の書き込みまで write lock を取らないため、quarantine 判定を
+        // 読んだ後・claim を書く前に別connectionが quarantine を書ける隙が残る。
+        // IMMEDIATE なら BEGIN 時点で write lock を取るので、判定と書き込みが直列化される。
+        return updateTransaction.immediate()
       } catch (err: unknown) {
         return {
           ok: false,
