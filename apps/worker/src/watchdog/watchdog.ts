@@ -53,6 +53,9 @@ async function checkRunningJobs(apiBaseUrl: string, headers: Record<string, stri
         const stall = checkStall(job.safeCommand.kind, job.startedAt)
         if (!stall.isStalled) continue
 
+        // DB-007: 同じ stall を並行して分析し直さないための即時マーク。
+        // ただしこれは最適化であって、重複防止の**正しさの根拠ではない**
+        // （正しさは API 側の `(jobId, startedAt)` 冪等性が担保する）。
         alertedJobs.add(job.id)
         console.warn(
           `[Watchdog] スタル検出: Job ${job.id} (${job.safeCommand.kind}) ` +
@@ -62,6 +65,12 @@ async function checkRunningJobs(apiBaseUrl: string, headers: Record<string, stri
 
         // 非同期で AI 分析を開始（ウォッチドッグループをブロックしない）
         void analyzeAndReport(job, stall.stallDurationMs, apiBaseUrl, headers)
+          .then((recorded) => {
+            // DB-007: event を記録できなかったなら「通知済み」として扱わない。
+            // 従来は無条件にマークしていたため、作成に失敗すると
+            // このプロセスが生きている限り二度と再試行されず、stall が記録されないまま消えた。
+            if (!recorded) alertedJobs.delete(job.id)
+          })
       }
     }
   }
@@ -75,7 +84,7 @@ async function analyzeAndReport(
   stallDurationMs: number,
   apiBaseUrl: string,
   headers: Record<string, string>,
-): Promise<void> {
+): Promise<boolean> {
   const detectedAt = new Date().toISOString()
 
   // WatchdogEvent を 'analyzing' 状態で作成
@@ -92,7 +101,7 @@ async function analyzeAndReport(
 
   if (!event) {
     console.error(`[Watchdog] WatchdogEvent の作成に失敗: Job ${job.id}`)
-    return
+    return false
   }
 
   // Gemini でスタル分析
@@ -148,6 +157,9 @@ async function analyzeAndReport(
       `  分析: ${aiAnalysis}`
     )
   }
+
+  // ここまで来た = WatchdogEvent は durable に記録できている。
+  return true
 }
 
 function buildStallAnalysisPrompt(job: Job, stallDurationMs: number): string {
