@@ -1299,6 +1299,47 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
 **将来項目（Step 2系の完了後に個別判断。今回は着手しない）**
 
+<!-- roadmap:id=meta-review-structured-output-robustness state=planned -->
+12. [ ] **Meta Reviewer structured-output robustness / false-BLOCKED の解消** — 2026-09-07、PR #98 / #99
+      の実測により登録。`project-auto-meta-review-hardening`（上記11、done）の後続で、**同じ既存
+      Meta Review経路の改善**である。新しいReviewer・新しいReview基盤・新しいGateは追加しない。
+
+      **観測された事象1: format/parse failure による false BLOCKED**
+      Geminiが JSON 指定にもかかわらず prose / fenced JSON（```json や「## フェーズ1: …」で始まる
+      説明文）を返すと、parserが失敗し `[critical] Meta Review AIの応答が不正なフォーマットです`
+      として fail-close BLOCKED になる。**substantive review自体は成功しているのに format だけで
+      失敗するケースがある**（PR #98 の1回目の実行では、ownership/quarantine機構に対する肯定的で
+      具体的な講評が応答内に出力された後、parse段で失敗している）。PR #98では3回連続で再現した。
+      同一failureへの blind retrigger は provider quota を浪費するだけで解消しない。
+      大きなdiffで再現しやすい可能性はあるが、**現時点では断定しない**（PR #98は約4,300行）。
+
+      **観測された事象2: 二点間diffによる phantom deletion で false BLOCKED**
+      `apps/worker/src/metaReviewer/autoReview.ts:75` が
+      `['diff', baseSha, headSha]`（**二点間diff**）でreview対象を構築している。`BASE_SHA` は
+      `.github/workflows/meta-review.yml:69` で `github.event.pull_request.base.sha`（**現在の**
+      base tip）が渡されるため、PR head が base の一部commitより古いと、**その base側commitが
+      「削除」として現れる**。実例: PR #99 は `tasks/roadmap.md` のみ71行追加のdocs PRだったが、
+      Meta Reviewは「Project開始ワークフロー全体が削除された」として `BLOCKED / critical` を返した
+      （PR #97 を含まないbaseからbranchを切っていたため）。rebase後に同じPRはPASSした。
+      本セッション中に同種のphantom deletionを複数回観測している。
+
+      **注意: これは「reviewの前にbaseを最新化する処理が無い」問題ではない。** baseはむしろ最新
+      であり、head側が古いまま**二点間**で比較されることが原因である。したがって新しい
+      「base最新化gate」を追加するのではなく、diffの取り方を直すのが正しい対処である。
+
+      **対応方針（実装時。新Reviewerを足さず既存Meta Reviewを改善する）**:
+      - provider側の structured output / JSON schema 強制（`geminiRouter.ts` は既に
+        `--output-format json --json-schema` を渡せる。Meta Review経路へ接続できるか確認する）
+      - fenced JSON（```json …```）の安全な正規化
+      - parse failure時に**既に得られている substantive response を捨てない**設計
+        （少なくともログ/PRコメントへ残し、人間が判断できるようにする）
+      - 同一 parse failure に対する bounded retry（無限・無制限の retrigger を避ける）
+      - 事象2は `autoReview.ts` の diff を三点間（merge-base起点、`baseSha...headSha` 相当）へ
+        変更することで解消する。既存のBASE_SHA受け渡し自体は変更しない
+
+      **今回実装しないもの（明記）**: 本項目はFinding記録であり、PR-C（#98）のmergeとは分離する。
+      新しいReviewer種別・新しいReview基盤・新しいmerge gate・base最新化専用gateは追加しない。
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
