@@ -277,6 +277,63 @@ describe('CodexAdapter — stdin prompt', () => {
     expect(argv[argv.length - 1]).toBe('-')
   })
 
+  it('reasoningEffort 指定時は -c model_reasoning_effort を argv に含め、末尾は - のままにする', () => {
+    class TestCodexAdapter extends CodexAdapter {
+      testArgv(r: AiCliRequest): string[] { return this.buildArgv(r) }
+    }
+    const adapter = new TestCodexAdapter({ provider: 'codex' })
+    const argv = adapter.testArgv({
+      provider: 'codex',
+      taskId: 't1',
+      workingDir: '/workspace/target/app',
+      prompt: 'hello world',
+      contextFiles: [],
+      mode: 'review',
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'xhigh',
+    })
+    const flagIndex = argv.indexOf('-c')
+
+    expect(flagIndex).toBeGreaterThanOrEqual(0)
+    expect(argv[flagIndex + 1]).toBe('model_reasoning_effort="xhigh"')
+    expect(argv[argv.length - 1]).toBe('-')
+  })
+
+  it('reasoningEffort 未指定時は -c を argv に含めない（既存呼び出し元のargvは不変）', () => {
+    class TestCodexAdapter extends CodexAdapter {
+      testArgv(r: AiCliRequest): string[] { return this.buildArgv(r) }
+    }
+    const adapter = new TestCodexAdapter({ provider: 'codex' })
+    const argv = adapter.testArgv({
+      provider: 'codex',
+      taskId: 't1',
+      workingDir: '/workspace/target/app',
+      prompt: 'hello world',
+      contextFiles: [],
+      mode: 'review',
+    })
+
+    expect(argv).not.toContain('-c')
+  })
+
+  it('review modeは --sandbox read-only で起動する（生成中にrepoを書き換えさせない）', () => {
+    class TestCodexAdapter extends CodexAdapter {
+      testArgv(r: AiCliRequest): string[] { return this.buildArgv(r) }
+    }
+    const adapter = new TestCodexAdapter({ provider: 'codex' })
+    const argv = adapter.testArgv({
+      provider: 'codex',
+      taskId: 't1',
+      workingDir: '/workspace/target/app',
+      prompt: 'p',
+      contextFiles: [],
+      mode: 'review',
+    })
+    const sandboxIndex = argv.indexOf('--sandbox')
+
+    expect(argv[sandboxIndex + 1]).toBe('read-only')
+  })
+
   it('model 未指定時は --model を argv に含めない', () => {
     class TestCodexAdapter extends CodexAdapter {
       testArgv(r: AiCliRequest): string[] { return this.buildArgv(r) }
