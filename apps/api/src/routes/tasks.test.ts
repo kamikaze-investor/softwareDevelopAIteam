@@ -886,7 +886,7 @@ describe('Task API', () => {
         })
         expect(refused.statusCode).toBe(409)
 
-        // 検証成功の提示なしでは解除できない
+        // 検証の観測の提示なしでは解除できない
         const bypassAttempt = await app.inject({
           method: 'PATCH',
           url: `/api/jobs/${job.id}/clear-quarantine`,
@@ -894,11 +894,21 @@ describe('Task API', () => {
         })
         expect(bypassAttempt.statusCode).toBe(400)
 
-        // workspace が再検証でクリーンになった → 解除
+        // workspace が再検証でクリーンになった → 解除（観測 + known-good を提示）
         const cleared = await app.inject({
           method: 'PATCH',
           url: `/api/jobs/${job.id}/clear-quarantine`,
-          payload: { workspaceVerified: true, quarantineClearedReason: 'startup recovery verified clean' },
+          payload: {
+            observation: { mode: 'clean', startCommitHash: 'abc123' },
+            knownGood: {
+              gitOperationMarkers: [],
+              worktreeClean: true,
+              indexClean: true,
+              headValid: true,
+              blindSpotsAbsent: true,
+            },
+            quarantineClearedReason: 'startup recovery verified clean',
+          },
         })
         expect(cleared.statusCode).toBe(200)
 

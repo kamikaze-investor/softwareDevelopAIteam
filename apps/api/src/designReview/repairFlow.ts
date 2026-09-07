@@ -384,17 +384,37 @@ export async function executeQueuedRepair(
   }
 
   // review済みpromptをそのままaiCliPromptにする（追記・変更しない）。
-  const repairJob = storage.jobs.create({
-    taskId,
-    projectId: sourceJob.projectId,
-    agentRole: sourceJob.agentRole,
-    status: 'queued',
-    workflowStepKey: stepKey,
-    safeCommand: sourceJob.safeCommand,
-    aiCliMode: 'implement',
-    aiCliProvider: sourceJob.aiCliProvider,
-    aiCliPrompt: run.designText,
-  } as never)
+  // 所有権ハンドオフ: repair Job の実体化と source Job（blocked、所有権保持中）の解放を
+  // **単一transaction** で行う。source Job は意図的に `blocked` のまま残して all-owned
+  // workspace を守っていたが、後続 repair Job が実体化した時点で他の所有者がいない
+  // 順序を作らないよう、後続を先に作ってから source を解放する。
+  const repairJob = storage.jobs.createRepairJobWithHandoff({
+    sourceJobId,
+    repairJob: {
+      taskId,
+      projectId: sourceJob.projectId,
+      agentRole: sourceJob.agentRole,
+      status: 'queued',
+      workflowStepKey: stepKey,
+      safeCommand: sourceJob.safeCommand,
+      aiCliMode: 'implement',
+      aiCliProvider: sourceJob.aiCliProvider,
+      aiCliPrompt: run.designText,
+    },
+  })
 
-  return { status: 'repair_job_created', jobId: repairJob.id, stepKey, attempt: run.attemptCount }
+  if (!repairJob.ok) {
+    // 後続の実体化に失敗した。transaction は rollback され、source Job は `blocked` の
+    // まま所有権を保持する。ここで workspace を放置せず、Human escalation（Task blocked）
+    // へ渡して後の介入を可能にする。
+    escalateTaskToHuman(storage, taskId)
+    return { status: 'escalated', reason: repairJob.reason }
+  }
+
+  return {
+    status: 'repair_job_created',
+    jobId: repairJob.repairJob.id,
+    stepKey,
+    attempt: run.attemptCount,
+  }
 }

@@ -10,6 +10,7 @@ const fetchMock = vi.fn<typeof fetch>()
 
 const workspaceVerificationMocks = vi.hoisted(() => ({
   verifyWorkspaceAgainstBaseline: vi.fn(),
+  observeWorkspace: vi.fn(),
 }))
 
 const notifierMocks = vi.hoisted(() => ({
@@ -19,7 +20,7 @@ const notifierMocks = vi.hoisted(() => ({
 vi.mock('./workspaceVerification.js', () => workspaceVerificationMocks)
 vi.mock('./notifier/notifier.js', () => notifierMocks)
 
-import { verifyWorkspaceAgainstBaseline } from './workspaceVerification.js'
+import { observeWorkspace, verifyWorkspaceAgainstBaseline } from './workspaceVerification.js'
 import { sendAlert } from './notifier/notifier.js'
 
 const WORKING_DIR = '/workspace/target'
@@ -37,6 +38,18 @@ function runningJob(id: string): Record<string, unknown> {
 beforeEach(() => {
   fetchMock.mockReset()
   workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReset()
+  workspaceVerificationMocks.observeWorkspace.mockReset()
+  // 既定: クリーンで known-good な workspace を観測する
+  workspaceVerificationMocks.observeWorkspace.mockReturnValue({
+    observation: { mode: 'clean', startCommitHash: 'abc123' },
+    knownGood: {
+      gitOperationMarkers: [],
+      worktreeClean: true,
+      indexClean: true,
+      headValid: true,
+      blindSpotsAbsent: true,
+    },
+  })
   notifierMocks.sendAlert.mockReset()
   notifierMocks.sendAlert.mockResolvedValue([])
   vi.stubGlobal('fetch', fetchMock)
@@ -535,8 +548,17 @@ describe('recoverStaleJobs', () => {
       },
     })
     const body = JSON.parse(String(clearCall?.[1]?.body))
-    expect(body.workspaceVerified).toBe(true)
-    expect(body.quarantineClearedReason).toContain('startup recovery: workspace verified clean')
+    // 自己申告ブールではなく、観測した observation + knownGood を送って再検証を依頼する
+    expect(body.observation).toEqual({ mode: 'clean', startCommitHash: 'abc123' })
+    expect(body.knownGood).toEqual({
+      gitOperationMarkers: [],
+      worktreeClean: true,
+      indexClean: true,
+      headValid: true,
+      blindSpotsAbsent: true,
+    })
+    expect(body.workspaceVerified).toBeUndefined()
+    expect(body.quarantineClearedReason).toContain('startup recovery')
     // 再検証は alert を再送しない（CRITICAL は対象外）
     expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
   })

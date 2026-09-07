@@ -33,6 +33,82 @@ export interface WorkspaceVerificationInput {
 }
 
 /**
+ * PR-C final blocker (BLOCKER B): quarantine 解除の申請時に Worker が送る
+ * 「今この瞬間に観測した workspace」の構造的事実（known-good）。
+ */
+export interface KnownGoodFacts {
+  gitOperationMarkers: string[]
+  worktreeClean: boolean
+  indexClean: boolean
+  headValid: boolean
+  blindSpotsAbsent: boolean
+}
+
+/** `observeWorkspace()` の結果。observation は workspace の baseline 形式記録。 */
+export interface ObserveWorkspaceResult {
+  observation?: JobWorkspaceBaseline
+  knownGood: KnownGoodFacts
+}
+
+/**
+ * PR-C final blocker (BLOCKER B): workspace を**観測**し、baseline 形式の observation と
+ * known-good 事実を返す。
+ *
+ * 既存の検証ヘルパー（detectGitOperationState / buildWorktreeManifest /
+ * fingerprintWorktreeEntries / buildBaselineEntries）を再利用し、porcelain-v2 の parse を
+ * 重複実装しない。この関数自体は決して throw しない（観測不能は knownGood の
+ * 各フラグを false に倒す）。
+ *
+ * 注意: observation は「以前の状態への復元」ではなく**新しい安全な参照点**であり、
+ * サーバー側で再検証される（assert ではない）。
+ */
+export function observeWorkspace(workingDir: string): ObserveWorkspaceResult {
+  const failClosed: KnownGoodFacts = {
+    gitOperationMarkers: [],
+    worktreeClean: false,
+    indexClean: false,
+    headValid: false,
+    blindSpotsAbsent: false,
+  }
+
+  try {
+    const gitOperationMarkers = detectGitOperationState(workingDir)
+    const manifest = buildWorktreeManifest(workingDir)
+    const head = getCommitHash(workingDir)
+    const headValid = head !== undefined && head !== ''
+    const blindSpotsAbsent = detectUnreportableWorkspaceState(workingDir) === undefined
+    const worktreeClean = manifest.paths.length === 0
+    // index がクリーンか = staged 変更が無いか。porcelain **v2** の XY は「変更なし」を
+    // 空白ではなく `.` で表す（v1 との差。本PRで既に同種の取り違えを1件修正している）。
+    // したがって index 列が `.` 以外なら staged 変更がある。untracked（XY無し）は非staged。
+    const indexClean = !manifest.changes.some(
+      (change) => change.xyStatus !== undefined && change.xyStatus[0] !== '.',
+    )
+    const knownGood = { gitOperationMarkers, worktreeClean, indexClean, headValid, blindSpotsAbsent }
+
+    if (!headValid) {
+      return { knownGood }
+    }
+    if (worktreeClean) {
+      return { observation: { mode: 'clean', startCommitHash: head as string }, knownGood }
+    }
+
+    const fingerprints = fingerprintWorktreeEntries(workingDir, manifest)
+    return {
+      observation: {
+        mode: 'dirty',
+        startCommitHash: head as string,
+        entries: buildBaselineEntries(manifest, fingerprints),
+      },
+      knownGood,
+    }
+  } catch {
+    // 観測不能は fail-closed（knownGood 全 false）。
+    return { knownGood: failClosed }
+  }
+}
+
+/**
  * workspace が baseline（Job 開始時点）と完全一致するかを検証する。
  *
  * 検証項目（すべて必須・一つでも満たさなければ `verified:false`）:

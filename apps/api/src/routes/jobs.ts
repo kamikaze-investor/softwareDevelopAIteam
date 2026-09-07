@@ -195,16 +195,51 @@ const FailIfRunningJobBody = z.object({
 }).strict()
 
 /**
- * PR-C finding 14 修復: quarantine 解除（clearance）のボディ。
+ * PR-C finding 14 修復 (BLOCKER B): quarantine 解除（clearance）のボディ。
  *
- * `workspaceVerified` は `z.literal(true)` で**必ず true を強制**する。false・欠落・
- * その他の値はすべて 400 で拒否される。つまり、成功した workspace 検証の提示なしには
- * quarantine は絶対に解除できない（bypass / force / admin 経路は存在しない）。
- * 検証そのものは workspace へ filesystem アクセスできる Worker が
- * `verifyWorkspaceAgainstBaseline` で行い、その成功結果を提示する。
+ * `workspaceVerified` のような**自己申告ブールは無い**。代わりに Worker が今この瞬間に
+ * 観測した `observation`（`JobWorkspaceBaseline` 形式）と、baseline が無い場合に
+ * required な構造的事実 `knownGood` を提示する。どちらか一方でも欠けたら 400 で拒否
+ * （bypass / force / admin 経路は存在しない）。
+ *
+ * サーバーは storage transaction 内で observation を**自ら再検証**する:
+ *   - baseline 有り → observation と完全一致
+ *   - baseline 無し → knownGood が全て成立し、かつ observation.mode==='clean'
+ * 検証に失敗すれば quarantine は維持される。
  */
 const ClearQuarantineJobBody = z.object({
-  workspaceVerified: z.literal(true),
+  /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
+  observation: z.discriminatedUnion('mode', [
+    z.object({
+      mode: z.literal('clean'),
+      startCommitHash: z.string(),
+    }).strict(),
+    z.object({
+      mode: z.literal('dirty'),
+      startCommitHash: z.string(),
+      entries: z.array(z.object({
+        path: z.string(),
+        oldPath: z.string().optional(),
+        kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+        xyStatus: z.string().optional(),
+        beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        beforeMode: z.string().optional(),
+        afterMode: z.string().optional(),
+        headHash: z.string().optional(),
+        indexHash: z.string().optional(),
+        worktreeHash: z.string(),
+      })),
+    }).strict(),
+  ]),
+  /** baseline が無い場合に required な構造的事実。 */
+  knownGood: z.object({
+    gitOperationMarkers: z.array(z.string()),
+    worktreeClean: z.boolean(),
+    indexClean: z.boolean(),
+    headValid: z.boolean(),
+    blindSpotsAbsent: z.boolean(),
+  }),
   /** 解除理由（startup recovery で baseline と一致、等）。failure_metadata に記録される。 */
   quarantineClearedReason: z.string().optional(),
 }).strict()
@@ -418,27 +453,33 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(body)
   })
 
-  // PR-C finding 14 修復: quarantine 解除（clearance）。
-  // 解除は「成功した workspace 検証の提示」なしには成立しない（ClearQuarantineJobBody が
-  // workspaceVerified:true を強制）。人力・force・admin による無条件解除経路は無い。
+  // PR-C finding 14 修復 (BLOCKER B): quarantine 解除（clearance）。
+  // 解除は「成功した workspace 検証の**観測**の提示 + サーバーによる再検証」なしには
+  // 成立しない（ClearQuarantineJobBody が observation / knownGood を必須化）。
+  // 人力・force・admin による無条件解除経路は無い。
   app.patch<{ Params: { id: string } }>('/:id/clear-quarantine', async (req, reply) => {
     const result = ClearQuarantineJobBody.safeParse(req.body)
     if (!result.success) {
-      // 検証成功の提示が無い限り拒否。無条件・無検証の解除経路を作らない。
+      // observation / knownGood の提示が無い限り拒否。無条件・無検証の解除経路を作らない。
       return reply.status(400).send({
-        error: 'Clearance requires a successful workspace verification (workspaceVerified must be true)',
+        error: 'Clearance requires an observed workspace baseline (observation) and known-good facts (knownGood)',
         details: result.error.format(),
       })
     }
 
     const transition = storage.jobs.clearWorkspaceQuarantine({
       jobId: req.params.id,
+      observation: result.data.observation,
+      knownGood: result.data.knownGood,
       reason: result.data.quarantineClearedReason,
     })
     if (!transition.ok) {
       if (transition.code === 'STORAGE_ERROR') {
         req.log.error({ jobId: req.params.id, reason: transition.reason }, 'clear-quarantine storage failure')
         return reply.status(500).send({ error: transition.reason })
+      }
+      if (transition.code === 'VERIFICATION_FAILED') {
+        return reply.status(409).send({ error: transition.reason })
       }
       return reply.status(404).send({ error: 'Job not found' })
     }

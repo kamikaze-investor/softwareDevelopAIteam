@@ -8,7 +8,7 @@ import { createSQLiteStorage, SingleRunningProjectError } from './sqlite'
 import { CREATE_TABLES } from './schema'
 import { validateRoadmapTasks } from './roadmapTaskValidation'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapTaskSpecConflict } from './interface'
-import type { JobStatus, PersistedTaskFailureExplanationV1, Task } from '@ai-team/shared'
+import type { Job, JobStatus, PersistedTaskFailureExplanationV1, Task } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 
 type ApprovalCreateInput = Parameters<IStorage['approvals']['create']>[0] & { projectId: string }
@@ -1944,14 +1944,32 @@ describe('SQLiteStorage', () => {
       })
 
       describe('clearWorkspaceQuarantine', () => {
-        it('clears quarantine, records the clearance in failure_metadata, and makes resumeBlockedTask succeed', () => {
-          const job = createRunningJob()
+        const CLEAN_OBSERVATION = { mode: 'clean', startCommitHash: 'abc123' } as const
+        const KNOWN_GOOD = {
+          gitOperationMarkers: [],
+          worktreeClean: true,
+          indexClean: true,
+          headValid: true,
+          blindSpotsAbsent: true,
+        }
+        const KNOWN_GOOD_CLEAN = {
+          observation: CLEAN_OBSERVATION,
+          knownGood: KNOWN_GOOD,
+        }
+
+        function quarantineJob(jobId: string): void {
           storage.jobs.failAndPrepareRepair({
-            jobId: job.id,
+            jobId,
             failure: { stderr: 'crash without verification', completedAt: '2026-08-08T01:02:03.000Z' },
             workspaceVerified: false,
             quarantineReason: 'workspace dirty after crash',
           })
+        }
+
+        it('clears quarantine when the observation exactly matches the persisted baseline, records the clearance, and makes resumeBlockedTask succeed', () => {
+          const job = createRunningJob()
+          quarantineJob(job.id)
+          storage.jobs.update(job.id, { workspaceBaseline: CLEAN_OBSERVATION })
           expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
 
           // clearance 前は resume 拒否（既存の fail-closed 不変条件が保たれる）
@@ -1974,7 +1992,9 @@ describe('SQLiteStorage', () => {
 
           const cleared = storage.jobs.clearWorkspaceQuarantine({
             jobId: job.id,
-            reason: 'startup recovery: workspace verified clean',
+            observation: CLEAN_OBSERVATION,
+            knownGood: KNOWN_GOOD,
+            reason: 'startup recovery: workspace reconciled to a safe reference point',
           })
           expect(cleared).toMatchObject({ ok: true, clearedJobCount: 1, alreadyCleared: false })
           if (cleared.ok) {
@@ -1982,7 +2002,7 @@ describe('SQLiteStorage', () => {
             expect(cleared.job.failureMetadata).toMatchObject({
               quarantined: false,
               quarantineClearedAt: expect.any(String),
-              quarantineClearedReason: 'startup recovery: workspace verified clean',
+              quarantineClearedReason: 'startup recovery: workspace reconciled to a safe reference point',
             })
           }
 
@@ -1994,15 +2014,81 @@ describe('SQLiteStorage', () => {
           }
         })
 
+        it('REFUSES clearance when the observation does NOT match the persisted baseline, quarantine remains', () => {
+          const job = createRunningJob()
+          quarantineJob(job.id)
+          storage.jobs.update(job.id, { workspaceBaseline: CLEAN_OBSERVATION })
+
+          const refused = storage.jobs.clearWorkspaceQuarantine({
+            jobId: job.id,
+            observation: { mode: 'clean', startCommitHash: 'different-head' },
+            knownGood: KNOWN_GOOD,
+          })
+          expect(refused.ok).toBe(false)
+          if (!refused.ok) expect(refused.code).toBe('VERIFICATION_FAILED')
+          // quarantine は維持される（fail-closed）
+          expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+        })
+
+        it('clears WITHOUT a persisted baseline when known-good all hold and observation.mode is clean, persisting observation as the new durable baseline', () => {
+          const job = createRunningJob()
+          quarantineJob(job.id)
+          expect(storage.jobs.findById(job.id)?.workspaceBaseline).toBeUndefined()
+
+          const cleared = storage.jobs.clearWorkspaceQuarantine({
+            jobId: job.id,
+            ...KNOWN_GOOD_CLEAN,
+          })
+          expect(cleared).toMatchObject({ ok: true, clearedJobCount: 1, alreadyCleared: false })
+          // observation は新しい安全な参照点として永続化される
+          expect(storage.jobs.findById(job.id)?.workspaceBaseline).toEqual(CLEAN_OBSERVATION)
+          expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(false)
+        })
+
+        it.each([
+          { ...KNOWN_GOOD, gitOperationMarkers: ['index.lock'] },
+          { ...KNOWN_GOOD, worktreeClean: false },
+          { ...KNOWN_GOOD, indexClean: false },
+          { ...KNOWN_GOOD, headValid: false },
+          { ...KNOWN_GOOD, blindSpotsAbsent: false },
+        ])('REFUSES without a persisted baseline when any known-good condition is false: %j', (knownGood) => {
+          const job = createRunningJob()
+          quarantineJob(job.id)
+
+          const refused = storage.jobs.clearWorkspaceQuarantine({
+            jobId: job.id,
+            observation: CLEAN_OBSERVATION,
+            knownGood,
+          })
+          expect(refused.ok).toBe(false)
+          if (!refused.ok) expect(refused.code).toBe('VERIFICATION_FAILED')
+          expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+          expect(storage.jobs.findById(job.id)?.workspaceBaseline).toBeUndefined()
+        })
+
+        it('REFUSES without a persisted baseline when observation.mode is NOT clean', () => {
+          const job = createRunningJob()
+          quarantineJob(job.id)
+
+          const refused = storage.jobs.clearWorkspaceQuarantine({
+            jobId: job.id,
+            observation: { mode: 'dirty', startCommitHash: 'abc123', entries: [] },
+            knownGood: KNOWN_GOOD,
+          })
+          expect(refused.ok).toBe(false)
+          if (!refused.ok) expect(refused.code).toBe('VERIFICATION_FAILED')
+          expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+        })
+
         it('is idempotent: a second clearance changes nothing and reports alreadyCleared', () => {
           const job = createRunningJob()
-          storage.jobs.failAndPrepareRepair({
-            jobId: job.id,
-            failure: { stderr: 'crash without verification', completedAt: '2026-08-08T01:02:03.000Z' },
-            workspaceVerified: false,
-          })
+          quarantineJob(job.id)
+          storage.jobs.update(job.id, { workspaceBaseline: CLEAN_OBSERVATION })
 
-          const first = storage.jobs.clearWorkspaceQuarantine({ jobId: job.id })
+          const first = storage.jobs.clearWorkspaceQuarantine({
+            jobId: job.id,
+            ...KNOWN_GOOD_CLEAN,
+          })
           expect(first.ok).toBe(true)
           if (first.ok) {
             expect(first.clearedJobCount).toBe(1)
@@ -2010,7 +2096,10 @@ describe('SQLiteStorage', () => {
           }
           const metadataAfterFirst = storage.jobs.findById(job.id)?.failureMetadata
 
-          const second = storage.jobs.clearWorkspaceQuarantine({ jobId: job.id })
+          const second = storage.jobs.clearWorkspaceQuarantine({
+            jobId: job.id,
+            ...KNOWN_GOOD_CLEAN,
+          })
           expect(second.ok).toBe(true)
           if (second.ok) {
             expect(second.clearedJobCount).toBe(0)
@@ -2021,37 +2110,155 @@ describe('SQLiteStorage', () => {
           expect(storage.jobs.findById(job.id)?.failureMetadata).toEqual(metadataAfterFirst)
         })
 
-        it('clears every quarantined Job of the Task (resumeBlockedTask gates on ANY quarantined Job)', () => {
+        it('clears EVERY quarantined Job with the SAME workingDir, but NOT a sibling with a different workingDir', () => {
           const first = createRunningJob()
-          const second = createRunningJob()
-          storage.jobs.failAndPrepareRepair({
-            jobId: first.id,
-            failure: { stderr: 'crash without verification', completedAt: '2026-08-08T01:02:03.000Z' },
-            workspaceVerified: false,
+          quarantineJob(first.id)
+          storage.jobs.update(first.id, { workspaceBaseline: CLEAN_OBSERVATION })
+
+          // 同一 workingDir の quarantine 兄弟（直接 metadata 設定）
+          const secondSameDir = storage.jobs.create({
+            taskId,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'test', workingDir: '/workspace/target' },
           })
-          // 同一Taskに2本目のquarantine Jobが存在する状況を再現する
-          // （F9 guardによりfail-and-prepareでは2本目をquarantine不可のため、直接metadataを設定）
-          storage.jobs.update(second.id, {
+          storage.jobs.update(secondSameDir.id, {
             failureMetadata: { quarantined: true, quarantineReason: 'sibling quarantine' },
+          })
+
+          // 別 workingDir の quarantine Job は解除されない
+          const otherDir = storage.jobs.create({
+            taskId,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'test', workingDir: '/workspace/other' },
+          })
+          storage.jobs.update(otherDir.id, {
+            failureMetadata: { quarantined: true, quarantineReason: 'other workspace' },
           })
           expect(
             storage.jobs.findByTaskId(taskId).filter((job) => job.failureMetadata?.quarantined === true),
-          ).toHaveLength(2)
+          ).toHaveLength(3)
 
-          const cleared = storage.jobs.clearWorkspaceQuarantine({ jobId: first.id })
+          const cleared = storage.jobs.clearWorkspaceQuarantine({
+            jobId: first.id,
+            ...KNOWN_GOOD_CLEAN,
+          })
           expect(cleared.ok).toBe(true)
           if (cleared.ok) {
             expect(cleared.clearedJobCount).toBe(2)
             expect(cleared.alreadyCleared).toBe(false)
           }
-          expect(
-            storage.jobs.findByTaskId(taskId).some((job) => job.failureMetadata?.quarantined === true),
-          ).toBe(false)
+          // same workingDir は解除・他 workingDir は維持
+          expect(storage.jobs.findById(first.id)?.failureMetadata?.quarantined).toBe(false)
+          expect(storage.jobs.findById(secondSameDir.id)?.failureMetadata?.quarantined).toBe(false)
+          expect(storage.jobs.findById(otherDir.id)?.failureMetadata?.quarantined).toBe(true)
         })
 
         it('returns JOB_NOT_FOUND for a missing Job', () => {
-          const cleared = storage.jobs.clearWorkspaceQuarantine({ jobId: 'missing-job' })
+          const cleared = storage.jobs.clearWorkspaceQuarantine({
+            jobId: 'missing-job',
+            ...KNOWN_GOOD_CLEAN,
+          })
           expect(cleared).toEqual({ ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' })
+        })
+      })
+
+      describe('createRepairJobWithHandoff', () => {
+        function createBlockedSourceJob(): { id: string; previous: Job } {
+          const source = storage.jobs.create({
+            taskId,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'original prompt',
+            aiCliMode: 'implement',
+            failureMetadata: {
+              kind: 'crash',
+              workspaceState: 'unchanged',
+            },
+          })
+          return { id: source.id, previous: storage.jobs.findById(source.id)! }
+        }
+
+        function repairJobInput(
+          sourceJobId: string,
+        ): Pick<Parameters<IStorage['jobs']['createRepairJobWithHandoff']>[0], 'repairJob' | 'sourceJobId'> {
+          return {
+            sourceJobId,
+            repairJob: {
+              taskId,
+              projectId,
+              agentRole: 'developer_ai',
+              status: 'queued' as const,
+              workflowStepKey: `repair:${sourceJobId}:1`,
+              safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+              aiCliMode: 'implement',
+              aiCliProvider: 'codex',
+              aiCliPrompt: 'reviewed repair prompt',
+            },
+          }
+        }
+
+        it('ownership never breaks: successor exists AND source Job is no longer ownership-retaining, from ONE call', () => {
+          const { id: sourceJobId } = createBlockedSourceJob()
+
+          const result = storage.jobs.createRepairJobWithHandoff(repairJobInput(sourceJobId))
+
+          expect(result.ok).toBe(true)
+          if (!result.ok) return
+          // 後続 repair Job が実体化している（queued + non-initial workflowStepKey = 所有権保持）
+          const repairJob = storage.jobs.findById(result.repairJob.id)!
+          expect(repairJob.status).toBe('queued')
+          expect(repairJob.workflowStepKey).toBe(`repair:${sourceJobId}:1`)
+          expect(repairJob.aiCliPrompt).toBe('reviewed repair prompt')
+          // source Job は所有権を持たない状態（failed）へ解放されている
+          expect(storage.jobs.findById(sourceJobId)?.status).toBe('failed')
+        })
+
+        it('transaction rolls back on successor creation failure, source Job REMAINS blocked (ownership retained)', () => {
+          const source = createBlockedSourceJob()
+
+          // 同一 workflowStepKey を別 Job に先に使わせて unique 制約を発生させる
+          const preexisting = storage.jobs.create({
+            taskId,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'queued',
+            workflowStepKey: `repair:${source.id}:1`,
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+          })
+
+          const result = storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id))
+          expect(result.ok).toBe(false)
+          if (result.ok) return
+          expect(result.code).toBe('STORAGE_ERROR')
+
+          // 全体 rollback: source Job は `blocked` のまま（所有権保持）、repair Job も作られていない
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+          expect(storage.jobs.findById(source.id)?.failureMetadata).toEqual(source.previous.failureMetadata)
+          // preexisting はそのまま（rollback 対象外）
+          expect(storage.jobs.findById(preexisting.id)?.workflowStepKey).toBe(`repair:${source.id}:1`)
+          expect(
+            storage.jobs.findByTaskId(taskId).filter((job) => job.workflowStepKey === `repair:${source.id}:1`),
+          ).toHaveLength(1)
+        })
+
+        it('applies the task/recovery state update that belongs with the handoff', () => {
+          const { id: sourceJobId } = createBlockedSourceJob()
+
+          const result = storage.jobs.createRepairJobWithHandoff({
+            ...repairJobInput(sourceJobId),
+            taskUpdate: { title: 'updated by handoff' },
+          })
+
+          expect(result.ok).toBe(true)
+          if (!result.ok) return
+          expect(storage.tasks.findById(taskId)?.title).toBe('updated by handoff')
         })
       })
 

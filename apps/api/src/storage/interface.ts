@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -31,6 +31,24 @@ export type ResumeBlockedTaskResult =
  * この Task の**任意の** quarantine Job を解除して `resumeBlockedTask` が再開できるようにする。
  * `alreadyCleared:true` は2回目以降の呼び出し（冪等）を示す。
  */
+/**
+ * PR-C finding 14 修復 (BLOCKER B): quarantine 解除（clearance）の結果。
+ *
+ * clearance は**決して自動的に成立しない**。呼び出し元（Worker）が workspace の
+ * **観測結果（observation）** を提示し、サーバーがそれを
+ *   - 既存 baseline と完全一致（has-baseline の場合）、または
+ *   - known-good 状態（baseline 無しの場合）
+ * として再検証した場合にのみ受理する（route / storage 両側で強制。bypass / force /
+ * admin による無条件解除経路は無い）。
+ *
+ * この clearance は「workspace を以前の状態へ戻した」ではなく
+ * **「安全な新しい参照点へ reconcile した」** ことを意味する。
+ * baseline 無しの場合は observation が新しい durable baseline として永続化される。
+ *
+ * この Task の**同一 workingDir** の quarantined Job を解除して
+ * `resumeBlockedTask` が再開できるようにする。`alreadyCleared:true` は2回目以降の
+ * 呼び出し（冪等）を示す。
+ */
 export type ClearWorkspaceQuarantineResult =
   | {
       ok: true
@@ -42,7 +60,7 @@ export type ClearWorkspaceQuarantineResult =
     }
   | {
       ok: false
-      code: 'JOB_NOT_FOUND' | 'STORAGE_ERROR'
+      code: 'JOB_NOT_FOUND' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR'
       reason: string
     }
 
@@ -112,6 +130,25 @@ export type FailAndPrepareRepairResult =
   | {
       ok: false
       code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'WORKSPACE_QUARANTINED' | 'STORAGE_ERROR'
+      reason: string
+    }
+
+/**
+ * PR-C final blocker (BLOCKER A): repair Job の実体化と source Job の所有権解放を
+ * **単一 transaction** で行う結果。
+ *
+ * load-bearing invariant:
+ *   - source Job （repair の元になった、`blocked` で所有権を保持する Job）を、
+ *     後続 repair Job を**先に**作成してから解放する。これにより
+ *     「workspace がどの Job にも属さない孤児になる」順序が存在しない。
+ *   - repair Job の作成が失敗したら transaction 全体が rollback し、
+ *     source Job は `blocked` のまま（所有権保持）となる。
+ */
+export type CreateRepairJobWithHandoffResult =
+  | { ok: true; repairJob: Job }
+  | {
+      ok: false
+      code: 'SOURCE_JOB_NOT_FOUND' | 'STORAGE_ERROR'
       reason: string
     }
 
@@ -294,6 +331,22 @@ export interface IJobStorage {
     failureMetadata?: Job['failureMetadata']
     outboxEvent?: OutboxEventInput
   }): FailAndPrepareRepairResult
+  /**
+   * PR-C final blocker (BLOCKER A): source Job の所有権保持状態から、後続 repair Job を
+   * **同一 transaction** で実体化して解放する。
+   *
+   * 順序（原子性・所有権の連続性のため）:
+   *   1. repair Job（`queued`、non-initial `workflowStepKey` → 所有権を保持）を作成
+   *   2. source Job を所有権保持状態（`blocked`）から `failed` へ解放
+   *   3. この handoff に属する Task / recovery 状態更新（あれば）を適用
+   * いずれかが失敗したら transaction 全体が rollback し、source Job は `blocked` のまま。
+   */
+  createRepairJobWithHandoff(input: {
+    sourceJobId: string
+    repairJob: Omit<Job, 'id' | 'createdAt' | 'status'> & { status?: 'queued' }
+    /** この handoff に属する Task / recovery 状態更新（任意）。 */
+    taskUpdate?: Partial<Task>
+  }): CreateRepairJobWithHandoffResult
   /** workflow Jobの結果保存と次step Jobの作成を単一transactionで冪等に行う。 */
   updateAndCreateNextWorkflowJob(input: {
     jobId: string
@@ -314,14 +367,34 @@ export interface IJobStorage {
     instructionPrompt: string
   }): ResumeBlockedTaskResult
   /**
-   * PR-C finding 14 修復: quarantine を解除する（単一transaction・冪等）。
+   * PR-C finding 14 修復 (BLOCKER B): quarantine を解除する（単一transaction・冪等）。
    *
-   * route / route guard 側で「成功した workspace 検証の提示」を強制してから呼ばれる。
-   * 人力・force・admin による無条件解除経路は存在しない。解除は検証の成功をもってのみ
-   * 成立する（earned, never asserted）。
+   * route / storage 側で「成功した workspace 検証の**観測**の提示」を再検証してから
+   * 解除する。人力・force・admin による無条件解除経路は存在しない。解除は再検証の
+   * 成功をもってのみ成立する（earned, never asserted）。
+   *
+   * - Job に `workspaceBaseline` がある場合: 提示された `observation` が baseline と
+   *   完全一致（検証と同じ比較 semantics）のときのみ解除。不一致なら拒否。
+   * - Job に `workspaceBaseline` が無い場合（baseline 計算失敗で quarantine された場合）:
+   *   `knownGood` がすべて成立し、かつ `observation.mode==='clean'` のときのみ、
+   *   observation を新しい durable baseline として永続化してから解除。
+   *   いずれの条件も満たさなければ拒否し、quarantine を維持する（fail-closed）。
+   *
+   * 解除対象は、検証した対象 Job と**同一 `safeCommand.workingDir`** の quarantined Job のみ
+   * （無関係な兄弟を一律解除しない）。
    */
   clearWorkspaceQuarantine(input: {
     jobId: string
+    /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
+    observation: JobWorkspaceBaseline
+    /** baseline が無い場合に required な構造的事実（held by the server を再検証する）。 */
+    knownGood: {
+      gitOperationMarkers: string[]
+      worktreeClean: boolean
+      indexClean: boolean
+      headValid: boolean
+      blindSpotsAbsent: boolean
+    }
     /** 解除理由（startup recovery 等）。failure_metadata に記録される。 */
     reason?: string
   }): ClearWorkspaceQuarantineResult

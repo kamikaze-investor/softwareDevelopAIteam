@@ -10,9 +10,9 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
 import { computeTaskDisplayStatus } from '@ai-team/shared'
-import type { Project, Task, Approval, Job, JobStatus, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
 import type { TaskContinuation } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -193,6 +193,67 @@ function sameStringArrayAsSet(left: string[] | undefined, right: string[] | unde
   if (leftValues.length !== rightValues.length) return false
 
   return leftValues.every((value, index) => value === rightValues[index])
+}
+
+/**
+ * PR-C final blocker (BLOCKER B): quarantine 解除の再検証用に、提示された observation が
+ * 永続化された workspace baseline と**完全一致**かを判定する。
+ *
+ * 比較は workspace 検証（verifyWorkspaceAgainstBaseline）と同じ semantics を使う:
+ *   - mode（'clean' / 'dirty'）が一致
+ *   - startCommitHash が一致
+ *   - dirty の場合: entry 件数が一致し、各 entry の記録済みフィールドが
+ *     path 昇順（同値なら oldPath 昇順）の並び順非依存で完全一致
+ * 1つでも不一致なら false（＝quarantine は維持される。fail-closed）。
+ */
+function baselineEqualsObservation(
+  baseline: JobWorkspaceBaseline,
+  observation: JobWorkspaceBaseline,
+): boolean {
+  if (baseline.mode !== observation.mode) return false
+  if (baseline.startCommitHash !== observation.startCommitHash) return false
+  if (baseline.mode === 'clean') return true
+
+  const a = baseline.entries
+  const b = (observation as Extract<JobWorkspaceBaseline, { mode: 'dirty' }>).entries
+  if (a.length !== b.length) return false
+
+  const sortEntries = (entries: JobWorkspaceBaselineEntry[]): JobWorkspaceBaselineEntry[] =>
+    [...entries].sort((x, y) => {
+      if (x.path < y.path) return -1
+      if (x.path > y.path) return 1
+      const xOld = x.oldPath ?? ''
+      const yOld = y.oldPath ?? ''
+      if (xOld < yOld) return -1
+      if (xOld > yOld) return 1
+      return 0
+    })
+
+  const sortedA = sortEntries(a)
+  const sortedB = sortEntries(b)
+  for (let i = 0; i < sortedA.length; i += 1) {
+    if (!baselineEntryEqual(sortedA[i], sortedB[i])) return false
+  }
+  return true
+}
+
+function baselineEntryEqual(a: JobWorkspaceBaselineEntry, b: JobWorkspaceBaselineEntry): boolean {
+  if (a.path !== b.path) return false
+  if (norm(a.oldPath) !== norm(b.oldPath)) return false
+  if (a.kind !== b.kind) return false
+  if (norm(a.xyStatus) !== norm(b.xyStatus)) return false
+  if (norm(a.beforeType) !== norm(b.beforeType)) return false
+  if (norm(a.afterType) !== norm(b.afterType)) return false
+  if (norm(a.beforeMode) !== norm(b.beforeMode)) return false
+  if (norm(a.afterMode) !== norm(b.afterMode)) return false
+  if (norm(a.headHash) !== norm(b.headHash)) return false
+  if (norm(a.indexHash) !== norm(b.indexHash)) return false
+  if (a.worktreeHash !== b.worktreeHash) return false
+  return true
+}
+
+function norm(value: string | undefined): string {
+  return value ?? ''
 }
 
 function resolveDependencyKeysForConflictCheck(
@@ -1497,6 +1558,55 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
       }
     },
+    createRepairJobWithHandoff(input) {
+      const handoffTransaction = db.transaction((): CreateRepairJobWithHandoffResult => {
+        // 1) 後続 repair Job を**先に**作成する。所有権保持（queued + non-initial
+        //    workflowStepKey）であり、source Job を解放する前に workspace の所有者が
+        //    1本でも存在することを保証する。
+        //    Job 作成が一意制約等で失敗したら例外が throw され、transaction 全体が
+        //    rollback して source Job は `blocked`（所有権保持）のまま残る。
+        const repairJob = jobs.create({
+          ...input.repairJob,
+          status: 'queued',
+        } as never)
+
+        // 2) source Job を所有権保持状態（`blocked` 等）から `failed` へ解放する。
+        //    `failed` は所有権を持たない（Job status からの所有権導出: running | blocked
+        //    | non-initial queued のみが所有）。既に failed なら no-op になる。
+        const source = jobs.findById(input.sourceJobId)
+        if (!source) {
+          // 所有権を保持し続けてよい repair Job が既に作られた後では rollback する
+          // （throw で transaction を abort し、repair Job の作成も巻き戻す）。
+          throw new Error(`source job ${input.sourceJobId} not found for repair handoff`)
+        }
+        jobs.update(source.id, { status: 'failed' })
+
+        // 3) この handoff に属する Task / recovery 状態更新を適用する。
+        if (input.taskUpdate) {
+          tasks.update(source.taskId, input.taskUpdate)
+        }
+
+        return { ok: true, repairJob }
+      })
+
+      try {
+        return handoffTransaction()
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (/not found for repair handoff/.test(message)) {
+          return {
+            ok: false,
+            code: 'SOURCE_JOB_NOT_FOUND',
+            reason: message,
+          }
+        }
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: message,
+        }
+      }
+    },
     updateAndCreateNextWorkflowJob(input) {
       const transition = db.transaction((): AdvanceWorkflowJobResult => {
         const dedup = checkOutboxEvent(db, input.jobId, input.outboxEvent)
@@ -1780,6 +1890,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     clearWorkspaceQuarantine(input) {
       const clearTransaction = db.transaction((
         jobId: string,
+        observation: JobWorkspaceBaseline,
+        knownGood: { gitOperationMarkers: string[]; worktreeClean: boolean; indexClean: boolean; headValid: boolean; blindSpotsAbsent: boolean },
         reason: string | undefined,
       ): ClearWorkspaceQuarantineResult => {
         const target = jobs.findById(jobId)
@@ -1787,12 +1899,29 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
         }
 
-        // このTaskの**任意の**未解除quarantine Jobを解除する（resumeBlockedTask /
-        // isWorkspaceQuarantined が「いずれかのquarantine Job」で判定するため）。
-        // 既に解除済みなら冪等に成功する（clearedJobCount:0 / alreadyCleared:true）。
+        // この Task の**任意の**未解除 quarantine Job を解除するのは対象 Job と
+        // **同一 workingDir** のものだけに限定する（無関係な兄弟を一律解除しない）。
+        // resumeBlockedTask / isWorkspaceQuarantined が「いずれかの quarantine Job」で
+        // 判定するため、同一 workspace（同一 workingDir）の quarantine をまとめて解除する。
+        const workingDir = target.safeCommand?.workingDir
         const taskJobs = jobs.findByTaskId(target.taskId)
-        const quarantinedJobs = taskJobs.filter((job) => job.failureMetadata?.quarantined === true)
+        const quarantinedJobs = taskJobs.filter(
+          (job) =>
+            job.failureMetadata?.quarantined === true &&
+            job.safeCommand?.workingDir === workingDir,
+        )
         if (quarantinedJobs.length === 0) {
+          if (target.failureMetadata?.quarantined === true) {
+            // 対象 Job 自体が quarantine だが、同一 workingDir 判定で外れた／他に無い —
+            // ここへ来るのは target が quarantine で、workingDir 不一致の兄弟だけしか
+            // 無い場合。これは検証対象と workspace が異なる可能性があるため fail-closed。
+            return {
+              ok: false,
+              code: 'VERIFICATION_FAILED',
+              reason: 'the quarantined target does not match the verified workspace (workingDir)',
+            }
+          }
+          // 既に解除済み（冪等）。
           return {
             ok: true,
             job: target,
@@ -1801,6 +1930,41 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
         }
 
+        // ── 再検証（サーバーが observation を自ら検査する。assert しない）──
+        //
+        // この clearance は「workspace を以前の状態へ戻した」ではなく、
+        // **「安全な新しい参照点へ reconcile した」** ことを意味する。
+        const baseline = target.workspaceBaseline
+        let verified: boolean
+        if (baseline) {
+          // has-baseline: observation が baseline と完全一致（検証と同じ比較 semantics）。
+          verified = baselineEqualsObservation(baseline, observation)
+        } else {
+          // 無 baseline（baseline 計算失敗で quarantine された場合）:
+          // 過去との一致は証明できないため、known-good 状態を要求し、observation を
+          // 新しい durable baseline として永続化する。
+          verified =
+            knownGood.gitOperationMarkers.length === 0 &&
+            knownGood.worktreeClean &&
+            knownGood.indexClean &&
+            knownGood.headValid &&
+            knownGood.blindSpotsAbsent &&
+            observation.mode === 'clean'
+        }
+
+        if (!verified) {
+          // 検証に失敗したら quarantine を**維持**し、解除しない。fail-closed。
+          return {
+            ok: false,
+            code: 'VERIFICATION_FAILED',
+            reason: baseline
+              ? 'submitted observation does not exactly match the persisted workspace baseline'
+              : 'no persisted baseline and observation/knownGood do not prove a known-good clean workspace',
+          }
+        }
+
+        // 検証成功。同一 workingDir の quarantine を解除し、解除を「記録」する
+        // （quarantineClearedAt / quarantineClearedReason。削除ではなく履歴として残す）。
         const clearedAt = now()
         for (const quarantined of quarantinedJobs) {
           const metadata = quarantined.failureMetadata ?? {}
@@ -1808,10 +1972,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             failureMetadata: {
               ...metadata,
               quarantined: false,
-              // 解除を「削除」ではなく「記録」する。履歴が残り、監査できる。
               quarantineClearedAt: clearedAt,
               ...(reason !== undefined ? { quarantineClearedReason: reason } : {}),
             },
+            // 無 baseline の場合は observation を新しい durable な参照点として永続化する。
+            ...(baseline ? {} : { workspaceBaseline: observation }),
           })
         }
 
@@ -1825,7 +1990,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       try {
-        return clearTransaction(input.jobId, input.reason)
+        return clearTransaction(input.jobId, input.observation, input.knownGood, input.reason)
       } catch (err: unknown) {
         return {
           ok: false,

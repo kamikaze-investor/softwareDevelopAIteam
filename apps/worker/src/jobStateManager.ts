@@ -7,7 +7,7 @@
 
 import type { Job, JobStatus, Project, Task } from '@ai-team/shared'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
-import { verifyWorkspaceAgainstBaseline } from './workspaceVerification.js'
+import { observeWorkspace, verifyWorkspaceAgainstBaseline } from './workspaceVerification.js'
 import { sendAlert } from './notifier/notifier.js'
 
 const RECONCILE_TIMEOUT_MS = 5_000
@@ -227,12 +227,15 @@ async function reconcileRunningJobAtStartup(
 }
 
 /**
- * PR-C finding 14 修復: blocked + quarantine の Job を startup で再検証し、
- * workspace が baseline と完全一致する場合のみ quarantine 解除を申請する。
+ * PR-C finding 14 修復 (BLOCKER B): blocked + quarantine の Job を startup で再観測し、
+ * workspace が安全と**再検証された場合のみ** quarantine 解除を申請する。
  *
- * 解除は**ここで検証に成功した場合のみ**申請する。失敗したら何もしない（quarantine 維持）。
- * 申請自体は workspaceVerified:true を提示する clear-quarantine API が受理し、
- * 機械的にここで検証した成立結果を主張する（bypass ではない）。
+ * 解除の申請は**ここで観測した observation / knownGood を送り、サーバーが再検証して
+ * 受理する**（自己申告ブールによる assert では成立しない）。
+ * - baseline 有りの Job: 既存検証（verifyWorkspaceAgainstBaseline）が成功した場合のみ申請。
+ * - baseline 無し（baseline 計算失敗）の Job: known-good が全て成立し、かつ
+ *   observation.mode==='clean' の場合のみ申請。
+ * 失敗したら何もしない（quarantine 維持）。
  */
 async function reconcileQuarantinedJobAtStartup(
   job: RecoverableJob,
@@ -240,34 +243,78 @@ async function reconcileQuarantinedJobAtStartup(
   headers: Record<string, string>,
 ): Promise<void> {
   const workingDir = job.safeCommand?.workingDir
-  const verification = workingDir
-    ? verifyWorkspaceAgainstBaseline(workingDir, job.workspaceBaseline)
-    : { verified: false as const, reason: 'job has no safeCommand.workingDir; cannot verify workspace' }
-
-  if (!verification.verified) {
+  if (!workingDir) {
     console.log(
-      `[Recovery] Job ${job.id} は quarantine のまま維持（workspace still not verified: ${verification.reason}）`,
+      `[Recovery] Job ${job.id} は quarantine のまま維持（safeCommand.workingDir が無いため観測不能）`,
     )
+    return
+  }
+
+  // まず workspace を観測する（observation + knownGood を取得）。
+  const observed = observeWorkspace(workingDir)
+
+  if (job.workspaceBaseline) {
+    // baseline 有り: 提示する observation は baseline と完全一致している必要がある。
+    // 既存の検証が成功した場合のみ申請する（earned）。
+    const verification = verifyWorkspaceAgainstBaseline(workingDir, job.workspaceBaseline)
+    if (!verification.verified) {
+      console.log(
+        `[Recovery] Job ${job.id} は quarantine のまま維持（workspace still not verified: ${verification.reason}）`,
+      )
+      return
+    }
+  } else {
+    // baseline 無し: 過去との一致は証明できない。known-good 状態のみで解除を申請する。
+    const kg = observed.knownGood
+    const knownGood =
+      kg.gitOperationMarkers.length === 0 &&
+      kg.worktreeClean &&
+      kg.indexClean &&
+      kg.headValid &&
+      kg.blindSpotsAbsent &&
+      observed.observation?.mode === 'clean'
+    if (!knownGood) {
+      console.log(
+        `[Recovery] Job ${job.id} は quarantine のまま維持（baseline 無し・known-good を観測できず）`,
+      )
+      return
+    }
+  }
+
+  if (!observed.observation) {
+    console.log(`[Recovery] Job ${job.id} は quarantine のまま維持（observation を構築できず）`)
     return
   }
 
   const clearedAt = new Date().toISOString()
   const cleared = await requestQuarantineClearance(job.id, apiBaseUrl, headers, {
-    quarantineClearedReason: `startup recovery: workspace verified clean against its baseline (${clearedAt})`,
+    observation: observed.observation,
+    knownGood: observed.knownGood,
+    quarantineClearedReason: `startup recovery: workspace reconciled to a safe reference point (${clearedAt})`,
   })
   if (cleared) {
-    console.log(`[Recovery] Job ${job.id} workspace がクリーンと検証されたため quarantine を解除しました（resume 可能）`)
+    console.log(`[Recovery] Job ${job.id} workspace が安全と再検証されたため quarantine を解除しました（resume 可能）`)
   } else {
-    console.log(`[Recovery] Job ${job.id} はクリーンと検証できたが quarantine 解除申請に失敗（別の起動で再試行）`)
+    console.log(`[Recovery] Job ${job.id} は安全と観測できたが quarantine 解除申請に失敗（別の起動で再試行）`)
   }
 }
 
-/** clear-quarantine API へ解除申請する。workspace 検証に成功した場合にのみ呼ばれる。 */
+/** clear-quarantine API へ解除申請する。workspace を観測し、再検証に供する場合のみ呼ばれる。 */
 async function requestQuarantineClearance(
   jobId: string,
   apiBaseUrl: string,
   headers: Record<string, string>,
-  extras: { quarantineClearedReason?: string },
+  extras: {
+    observation: Job['workspaceBaseline']
+    knownGood: {
+      gitOperationMarkers: string[]
+      worktreeClean: boolean
+      indexClean: boolean
+      headValid: boolean
+      blindSpotsAbsent: boolean
+    }
+    quarantineClearedReason?: string
+  },
 ): Promise<boolean> {
   try {
     const res = await fetch(
@@ -276,7 +323,8 @@ async function requestQuarantineClearance(
         method: 'PATCH',
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          workspaceVerified: true,
+          observation: extras.observation,
+          knownGood: extras.knownGood,
           ...(extras.quarantineClearedReason ? { quarantineClearedReason: extras.quarantineClearedReason } : {}),
         }),
       },
