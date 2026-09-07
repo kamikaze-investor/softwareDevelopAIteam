@@ -18,7 +18,8 @@
 
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFileSync, existsSync, unlinkSync } from 'node:fs'
+import { readFileSync, existsSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import type {
   AiCliRequest,
@@ -63,6 +64,18 @@ function resolvePnpmPath(): string {
   return 'pnpm'  // 見つからなければ 'pnpm' のまま（catch で non-fatal）
 }
 
+/**
+ * Codexの最終回答を確実に受け取るための`--output-last-message`用一時ファイルのパス。
+ *
+ * **対象リポジトリの外（OS temp）へ置く。** 以前は`request.workingDir`直下に作っていたため、
+ * レビュー・Roadmap生成という読み取り専用のはずの工程が対象リポジトリのworking treeを
+ * 一時的に変化させ、正常終了時は削除されるものの crash / SIGKILL では残骸が残りえた
+ * （roadmap: codex-last-message-temp-file-in-target-repo）。
+ *
+ * `--sandbox read-only`下でもOS tempへ書けることは実測済み（2026-09-07、CEO承認canary）。
+ * 専用ディレクトリをmkdtempで作るのは、実測した構成をそのまま再現するためと、
+ * 後片付けでファイル1個ではなくディレクトリごと確実に消せるようにするため。
+ */
 function buildCodexOutputLastMessagePath(request: AiCliRequest): string | undefined {
   if (request.provider !== 'codex' || request.expectJson !== true) return undefined
 
@@ -70,8 +83,10 @@ function buildCodexOutputLastMessagePath(request: AiCliRequest): string | undefi
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .slice(0, 64) || 'task'
 
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
+
   return path.join(
-    request.workingDir,
+    dir,
     `.codex-last-message-${safeTaskId}-${process.pid}-${Date.now()}-${randomUUID()}.json`,
   )
 }
@@ -91,6 +106,14 @@ function cleanupCodexOutputLastMessage(filePath: string | undefined): void {
 
   try {
     if (existsSync(filePath)) unlinkSync(filePath)
+
+    // `buildCodexOutputLastMessagePath`が作った専用ディレクトリごと消す。
+    // **OS temp配下であることを確認してからにする** — 万一呼び出し元が別のパスを
+    // 渡してきた場合に、対象リポジトリのディレクトリを消してしまわないため。
+    const dir = path.dirname(filePath)
+    if (dir.startsWith(path.join(os.tmpdir(), 'codex-lastmsg-'))) {
+      rmSync(dir, { recursive: true, force: true })
+    }
   } catch {
     // cleanup failure is non-fatal; changed-file guards still inspect the worktree later.
   }

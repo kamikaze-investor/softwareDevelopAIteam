@@ -10,7 +10,8 @@
  *   - isPromptSafe() のパターンマッチ
  */
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
@@ -403,6 +404,44 @@ describe('CodexAdapter --output-last-message structured output', () => {
     if (outputPath === undefined) throw new Error('missing --output-last-message path')
     expect(existsSync(outputPath)).toBe(false)
     expect(buildWorktreeManifestMock).toHaveBeenCalledWith(workingDir)
+  })
+
+  // Regression: the `--output-last-message` capture file used to be created directly inside
+  // `workingDir`, i.e. inside the target repository. It was removed afterwards, but a crash or
+  // SIGKILL between the two left an untracked file behind, and a "read-only" reviewer/generator
+  // that writes into the repo at all cannot honestly claim the repo is untouched.
+  // The assertion is deliberately stronger than "cleaned up afterwards": the repo must be
+  // untouched **during** the run too, which is what a mid-run snapshot checks.
+  it('creates the capture file outside workingDir and never writes into the repo', async () => {
+    const workingDir = makeWorkingDir()
+    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+    let repoContentsDuringRun: string[] | undefined
+    let capturedPath: string | undefined
+
+    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
+      const args = argv ?? []
+      capturedPath = args[args.indexOf('--output-last-message') + 1]
+      if (capturedPath === undefined) throw new Error('missing --output-last-message path')
+      writeFileSync(capturedPath, '{"ok":true}', 'utf-8')
+      // Snapshot the target repo at the moment Codex would be running.
+      repoContentsDuringRun = readdirSync(workingDir)
+      return 'not json'
+    })
+
+    const result = await adapter.run(makeRequest(workingDir))
+    expect(result.parsedOutput).toEqual({ ok: true })
+
+    if (capturedPath === undefined) throw new Error('missing --output-last-message path')
+    expect(capturedPath.startsWith(workingDir)).toBe(false)
+    expect(capturedPath.startsWith(os.tmpdir())).toBe(true)
+
+    // not even for an instant
+    expect(repoContentsDuringRun).toEqual([])
+    expect(readdirSync(workingDir)).toEqual([])
+
+    // the dedicated temp directory is cleaned up as well, not just the file
+    expect(existsSync(capturedPath)).toBe(false)
+    expect(existsSync(path.dirname(capturedPath))).toBe(false)
   })
 
   it('falls back to stdout retry when last-message parsing fails', async () => {

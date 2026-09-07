@@ -20,18 +20,14 @@
  *   したがって既存のコード・仕様・テストを必要に応じて自力で調査できる。
  *   Context Packは新設していない。
  *
- *   **正確な保証範囲**（独立レビュー指摘、2026-09-07）: 「対象リポジトリへ一切書かない」とは
- *   言えない。`expectJson: true`のとき`adapter.ts`がCodexの最終回答を確実に取得するための
- *   `--output-last-message`用一時ファイルを`workingDir`直下に作り、実行後に削除する。
- *   これは本runnerが持ち込んだ挙動ではなく、**既存のCodex reviewer経路が現在productionで
- *   行っているのと同じ**adapterの共通挙動である。保証できるのは
- *   「**モデルが生成した内容でリポジトリを書き換えることはできない**」ことと、
- *   「実行後に一時ファイルを残さない」ことまで。
- *   したがって**「filesystem上で完全にread-only」とは主張しない**。
- *   一時ファイルの置き場所をリポジトリ外へ移す改善は、`--sandbox read-only`下でCodexが
- *   リポジトリ外へ書けるかの実測が必要で、失敗すると既存のCodex independent reviewを
- *   壊すため本PRのscope外だが、**PR Cのcutoverまでには解消する**
- *   （roadmap: codex-last-message-temp-file-in-target-repo）。
+ *   **保証範囲**（2026-09-07更新）: 対象リポジトリへは書かない。`--sandbox read-only`により
+ *   モデルが生成した内容でリポジトリを書き換えることはできず、`--output-last-message`用の
+ *   一時ファイルも`adapter.ts`がOS temp配下へ置くようになったため、対象リポジトリには
+ *   一瞬もファイルを作らない（以前は`workingDir`直下に作っていた）。
+ *
+ *   ただし`bwrap`が動かないこのVPSでは、Codexがrepoを読むために
+ *   call-localな`-c use_legacy_landlock=true`が必要である。これは**deprecatedな暫定経路**で
+ *   あって恒久解決ではない（roadmap: codex-sandbox-off-deprecated-landlock）。
  *
  *   対象リポジトリが空でも同じ経路で動く。「ディレクトリが存在するか」で
  *   greenfield / existing を判定するような人工的な分岐は持たない
