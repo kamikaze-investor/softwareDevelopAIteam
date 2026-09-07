@@ -1859,19 +1859,39 @@ export function computeWorkspaceBaseline(job: Job, workingDir: string): Workspac
 }
 
 /**
+ * post-implement review Job の workflowStepKey の形。
+ *
+ * `implement:<sourceJobId>:review` は API 側（`routes/jobs.ts`）が生成し、
+ * Worker 側も同じ正規表現で解釈している。ここでも prefix ではなく**この形そのもの**で
+ * 判定するのは、将来 `implement:<id>:*` の別ステップが追加されたときに、
+ * dirty workspace の受け入れまで自動で継承させないため
+ * （安全条件を広げすぎない）。
+ */
+const IMPLEMENT_REVIEW_STEP_KEY = /^implement:(.+):review$/
+
+/**
  * INTENTIONALLY-DIRTY Job の分類（PR-C）。
  *
  * `repair:` / `resume:` / `retry:` で始まる workflowStepKey は、失敗した前 Job（implement /
  * repair 等）の後続として同一 Task の dirty worktree を正統に受け継ぐ Job である。
  * aiCliMode はこの判定に使わない（`task:<id>:initial-implement` のような NORMAL Job も
  * implement であり、dirty を受け継ぐ理由にならないため）。
+ *
+ * `implement:<sourceJobId>:review` も同じ理由で INTENTIONALLY-DIRTY である。
+ * この Job は「直前の implement Job が**未commitのまま残した**変更」をレビューするために
+ * 存在するので、clean worktree を要求すると**構造上絶対に通らない**。
+ * 2026-09-08 の operational E2E で、implement 成功直後の review Job が
+ * `normal Job requires a clean worktree` として quarantine され、chain が
+ * git-commit へ進めなくなることを実測した（fail-closed 自体は正しく働いていた）。
  */
 function isIntentionallyDirtyJob(job: Job): boolean {
   const stepKey = job.workflowStepKey
+  if (stepKey === undefined) return false
   return (
-    stepKey?.startsWith('repair:') === true ||
-    stepKey?.startsWith('resume:') === true ||
-    stepKey?.startsWith('retry:') === true
+    stepKey.startsWith('repair:') ||
+    stepKey.startsWith('resume:') ||
+    stepKey.startsWith('retry:') ||
+    IMPLEMENT_REVIEW_STEP_KEY.test(stepKey)
   )
 }
 
