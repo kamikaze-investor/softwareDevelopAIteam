@@ -325,6 +325,121 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
   }
 }
 
+/**
+ * Roadmap final integration review 用のモデル。
+ * 2026-09-07 に production の Anthropic key で `GET /v1/models` を実行し、利用可能を実測確認済み。
+ */
+const CLAUDE_REVIEWER_MODEL = 'claude-opus-5'
+
+/**
+ * Claude Code CLI の `--output-format json` envelope から、モデル本文を取り出す。
+ *
+ * 2026-09-07 に production VPS の sanitized runner env で実測した形:
+ *   `{ type: 'result', subtype: 'success', is_error: false, result: '<モデル本文>', ... }`
+ * `result` は**文字列**で、その中にreviewer JSONが入る。
+ *
+ * envelopeを維持したまま二段階でparseするのは、構造化出力の保証をモデルの
+ * prompt遵守へ戻さないため（「生JSONだけ返して」と頼む方式は、モデルが従わなければ壊れる）。
+ *
+ * 取り出せない場合は`undefined`を返し、呼び出し元がfail-closedにする。
+ * Claude都合で共通のReviewer schemaは一切変更していない。
+ */
+export function extractClaudeCliResultText(stdout: string): string | undefined {
+  let envelope: unknown
+  try {
+    envelope = JSON.parse(stdout)
+  } catch {
+    return undefined  // malformed outer envelope
+  }
+
+  if (typeof envelope !== 'object' || envelope === null) return undefined
+  const fields = envelope as Record<string, unknown>
+
+  if (fields.type !== 'result') return undefined
+  // CLIが自分でエラーを申告している場合、中身をレビュー結果として扱わない。
+  if (fields.is_error === true) return undefined
+  if (typeof fields.result !== 'string') return undefined  // missing / non-string result
+
+  return fields.result
+}
+
+/**
+ * Claude Code CLI によるReviewer。
+ *
+ * 認証は `$HOME` 配下の保存済みOAuth credentialで行う。design review runnerの
+ * `buildRunnerEnv()` は PATH/HOME/USERPROFILE/LANG/NODE_ENV だけを渡す厳格なallowlistで、
+ * APIキー類を意図的に渡さない設計のため、**SDKではなくCLI経路を使う**
+ * （agy/codex/copilotと同じ認証方式に揃える）。
+ *
+ * fail-closed: blocked / 非0 exit / パース失敗 / 例外のいずれも `verdict: 'blocking'` かつ
+ * `confidence: 0` を返す。CodexReviewerAdapterと同じ方針で、レビューが取得できないことを
+ * 「問題なし」と解釈させない。
+ */
+export class ClaudeReviewerAdapter implements IReviewerAdapter {
+  async review(req: ReviewerRequest): Promise<ReviewerResult> {
+    const prompt = buildReviewPrompt(req)
+    const adapter = createAiCliAdapter({ provider: 'claude_code' })
+
+    try {
+      const result = await adapter.run({
+        // CodexReviewerAdapterと同じ理由でlog-label用途。roadmap kindには実taskIdが無いため
+        // subjectIdをtaskIdに偽装せず、正直に接頭辞を付けたラベルを使う。
+        taskId: req.taskId ?? `roadmap-review:${req.subjectId}`,
+        provider: 'claude_code',
+        workingDir: TARGET_ROOT,
+        prompt,
+        contextFiles: [],
+        mode: 'review',
+        expectJson: true,
+        model: CLAUDE_REVIEWER_MODEL,
+      })
+
+      if (result.blocked) {
+        return buildFailureResult(result.stdout || result.stderr || '', 'claude', req.phase)
+      }
+
+      // 認証失敗・CLI障害はここに来る（例: "Failed to authenticate: OAuth session expired"）。
+      // 応答が無いことを ALIGNED と解釈させない。
+      if (result.exitCode !== 0) {
+        return {
+          provider: 'claude',
+          phase: req.phase,
+          verdict: 'blocking',
+          summary: `レビューAI呼び出しに失敗しました: exitCode=${result.exitCode}`,
+          issues: [],
+          confidence: 0,
+          generatedAt: new Date().toISOString(),
+          rawResponse: result.stdout || result.stderr || '',
+        }
+      }
+
+      // 二段階parse: (1) CLI envelope → (2) その中のreviewer JSON。
+      // どちらの段で壊れていてもfail-closed（buildFailureResult / parseReviewerResponseが
+      // それぞれblocking + confidence 0を返す）。
+      const innerText = extractClaudeCliResultText(result.stdout)
+      if (innerText === undefined) {
+        return buildFailureResult(result.stdout, 'claude', req.phase)
+      }
+
+      return parseReviewerResponse(innerText, 'claude', req.phase)
+    } catch (err) {
+      // timeout（execFileSyncのETIMEDOUT等）もここに落ちる。
+      const message = err instanceof Error ? err.message : String(err)
+
+      return {
+        provider: 'claude',
+        phase: req.phase,
+        verdict: 'blocking',
+        summary: `レビューAI呼び出しに失敗しました: ${message}`,
+        issues: [],
+        confidence: 0,
+        generatedAt: new Date().toISOString(),
+        rawResponse: '',
+      }
+    }
+  }
+}
+
 export function createReviewerAdapter(provider: ReviewerProvider): IReviewerAdapter {
   switch (provider) {
     case 'gemini':
@@ -332,7 +447,7 @@ export function createReviewerAdapter(provider: ReviewerProvider): IReviewerAdap
     case 'codex':
       return new CodexReviewerAdapter()
     case 'claude':
-      throw new Error('ClaudeReviewerAdapter は未実装です（将来拡張ポイント）')
+      return new ClaudeReviewerAdapter()
     case 'chatgpt':
       throw new Error('ChatGptReviewerAdapter は未実装です（将来のCost-aware Review Router用の拡張ポイント）')
   }
@@ -347,6 +462,26 @@ export function reviewWithSeparation(
   if (reviewerProvider === req.implementerProvider) {
     throw new Error(
       `[reviewerAdapter] 実装AI(${req.implementerProvider})とレビューAI(${reviewerProvider})が同一です。分離ルールに違反しています。`,
+    )
+  }
+
+  // Task-kind review topologyの現状維持ゲート（独立レビュー指摘、2026-09-07）。
+  //
+  // `selectReviewerProvider('gemini')`は以前からclaudeを返していたが、
+  // `createReviewerAdapter('claude')`がthrowしていたためproductionでは成立しない経路だった。
+  // Claude adapterを実装した今、このゲートが無いと**gemini実装Jobが即座にClaudeレビューを
+  // 走らせ始める**＝意図しないtopology変更になる（`Task.provider`は`AiCliProvider`を受けるため
+  // gemini実装Jobは到達可能）。
+  //
+  // **このゲートはRoadmap topology cutover（PR C）でも維持する。**
+  // Step 2で変更するのはRoadmap topologyだけ:
+  //   Roadmap: Codex generator → Gemini focused + OpenCode feasibility → Claude final integration
+  //   Task:    既存topologyのまま（変更しない）
+  // task-kind reviewでClaudeを使うことは別のtopology変更であり、明示的な判断なしに
+  // Roadmapの変更へ相乗りさせない（CEO判断、2026-09-07）。
+  if (reviewerProvider === 'claude') {
+    throw new Error(
+      '[reviewerAdapter] task-kind reviewでのClaude有効化は行っていません（Roadmap topologyとは別の変更として扱う）',
     )
   }
 
