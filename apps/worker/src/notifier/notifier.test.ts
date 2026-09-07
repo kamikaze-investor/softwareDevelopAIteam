@@ -83,3 +83,121 @@ describe('sendAlert', () => {
     expect(results[0].error).toContain('400')
   })
 })
+
+/**
+ * R5-N1: 通知は一発勝負ではない。一時的な失敗で CRITICAL alert を落とすと、
+ * Phase 2 の quarantine のように「通知が届いて初めて意味がある」機構が黙って壊れる。
+ */
+describe('sendAlert — 再送とfallback（R5-N1）', () => {
+  const noSleep = async (): Promise<void> => {}
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    delete process.env.LINE_CHANNEL_ACCESS_TOKEN
+    delete process.env.LINE_USER_ID
+    delete process.env.SLACK_WEBHOOK_URL
+  })
+
+  it('5xx は再送し、成功したら success を返す', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch
+      .mockResolvedValueOnce({ ok: false, status: 503, text: async () => 'unavailable' })
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => '' })
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert(
+      { severity: 'critical', title: 't', body: 'b' },
+      { sleepImpl: noSleep },
+    )
+
+    expect(results).toHaveLength(1)
+    expect(results[0].success).toBe(true)
+    expect(results[0].attempts).toBe(2)
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('429（レート制限）も再送対象', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch
+      .mockResolvedValueOnce({ ok: false, status: 429, text: async () => 'slow down' })
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => '' })
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert({ severity: 'warning', title: 't', body: 'b' }, { sleepImpl: noSleep })
+
+    expect(results[0].success).toBe(true)
+    expect(results[0].attempts).toBe(2)
+  })
+
+  it('ネットワークエラーは再送する', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch
+      .mockRejectedValueOnce(new Error('ECONNRESET'))
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => '' })
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert({ severity: 'critical', title: 't', body: 'b' }, { sleepImpl: noSleep })
+
+    expect(results[0].success).toBe(true)
+    expect(results[0].attempts).toBe(2)
+  })
+
+  it('恒久的な失敗（404）は再送せず1回で諦める', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch.mockResolvedValue({ ok: false, status: 404, text: async () => 'gone' })
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert({ severity: 'critical', title: 't', body: 'b' }, { sleepImpl: noSleep })
+
+    expect(results[0].success).toBe(false)
+    // 設定ミスに対して何度も投げても届かない。無駄な再送で他の通知を遅らせない。
+    expect(results[0].attempts).toBe(1)
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('再送上限を超えたら諦める（無限リトライしない）', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch.mockResolvedValue({ ok: false, status: 500, text: async () => 'boom' })
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert({ severity: 'critical', title: 't', body: 'b' }, { sleepImpl: noSleep })
+
+    expect(results[0].success).toBe(false)
+    expect(results[0].attempts).toBe(3)
+    expect(mockFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('片方のチャネルが恒久失敗でも、もう片方は独立して送信される（fallback）', async () => {
+    process.env.LINE_CHANNEL_ACCESS_TOKEN = 'token'
+    process.env.LINE_USER_ID = 'user'
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch.mockImplementation(async (url: string) => {
+      if (String(url).includes('line')) {
+        return { ok: false, status: 401, text: async () => 'bad token' }
+      }
+      return { ok: true, status: 200, text: async () => '' }
+    })
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert({ severity: 'critical', title: 't', body: 'b' }, { sleepImpl: noSleep })
+
+    const line = results.find((r) => r.channel === 'line')
+    const slack = results.find((r) => r.channel === 'slack')
+    expect(line?.success).toBe(false)
+    expect(slack?.success).toBe(true)
+  })
+
+  it('全チャネル失敗時は UNDELIVERED として区別できる形で報告する', async () => {
+    process.env.SLACK_WEBHOOK_URL = 'https://hooks.example.com/x'
+    mockFetch.mockResolvedValue({ ok: false, status: 500, text: async () => 'boom' })
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const { sendAlert } = await importNotifier()
+    const results = await sendAlert({ severity: 'critical', title: 'quarantined', body: 'b' }, { sleepImpl: noSleep })
+
+    expect(results.every((r) => !r.success)).toBe(true)
+    const undelivered = errorSpy.mock.calls.some((c) => String(c[0]).includes('UNDELIVERED'))
+    expect(undelivered).toBe(true)
+    errorSpy.mockRestore()
+  })
+})

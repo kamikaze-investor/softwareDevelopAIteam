@@ -5,7 +5,8 @@
  * LINE_USER_ID: 送信先ユーザー ID（マイ LINE ID）
  */
 
-import type { AlertPayload } from './notifier.js'
+import type { AlertPayload, ChannelSendResult } from './notifier.js'
+import { isRetryableStatus } from './notifier.js'
 
 const LINE_API = 'https://api.line.me/v2/bot/message/push'
 const FETCH_TIMEOUT_MS = 8_000
@@ -16,7 +17,7 @@ const SEVERITY_EMOJI: Record<string, string> = {
   critical: '🚨',
 }
 
-export async function sendLine(payload: AlertPayload): Promise<{ success: boolean; error?: string }> {
+export async function sendLine(payload: AlertPayload): Promise<ChannelSendResult> {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN
   const userId = process.env.LINE_USER_ID
   if (!token || !userId) {
@@ -45,11 +46,20 @@ export async function sendLine(payload: AlertPayload): Promise<{ success: boolea
 
     if (!res.ok) {
       const errBody = await res.text()
-      return { success: false, error: `LINE API ${res.status}: ${errBody}` }
+      return {
+        success: false,
+        error: `LINE API ${res.status}: ${errBody}`,
+        retryable: isRetryableStatus(res.status),
+      }
     }
 
     return { success: true }
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : String(err) }
+    // ネットワーク断・DNS 失敗・タイムアウト（AbortError）はいずれも一時的な可能性がある。
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+      retryable: true,
+    }
   }
 }
