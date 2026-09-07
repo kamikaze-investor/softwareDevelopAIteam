@@ -2025,14 +2025,49 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    到達が0件なので既存wartとして残してよいが、cutoverでCodexが実際にRoadmapを生成し始める
    前に解決する。
 
-   **修正案と未検証点**: 一時ファイルをリポジトリ外（OS tempdir等）へ移すのが素直だが、
-   **`--sandbox read-only`下でCodex CLIがリポジトリ外へ書けるかを実測していない**。
-   書けない場合、既存のCodex independent reviewが壊れる。実Codex CLI / 実runnerで
-   安全に実測し、成功するなら既存adapterも含めてrepo外tempへ移す最小修正を行う。
-   失敗するなら推測で変更せず別案を調査する。
+   **実測済み（2026-09-07 20:07 JST、CEO承認canary）**: 実Codex CLI 0.147.0で
+   `--output-last-message`をOS temp directory（`/tmp/codex-lastmsg-*/lastmsg.json`）へ向け、
+   `--sandbox read-only`＋`-c use_legacy_landlock=true`下で実行したところ**正常に書き込めた**
+   （652 bytes）。同じ実行で対象リポジトリのHEAD / tracked diff / untracked files / 全ファイルの
+   sha256はすべて不変で、repo内に一時ファイルは残らなかった。
+   **したがってrepo外tempへ移す最小修正は実行可能**であり、PR C cutover前に入れる。
+
+   **ただし保証範囲に注意**: この一時ファイルを書くのは**Codex CLIプロセス自身**であって、
+   sandboxされているのはmodelが生成したshell commandの方である。よって上記の実測が示すのは
+   「移設が機能する」ことであって「sandboxがrepo外書き込みを許可した」ことではない。
 
    **未解決の間の表現**: 「モデルによるrepo変更は禁止される」とは言ってよいが、
    **「filesystem上完全read-only」とは主張しない**。
+
+<!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
+0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
+   **高優先度**。CEO判断: PR Cでは`use_legacy_landlock`を暫定的な安全経路としてのみ使用し、
+   恒久解決として扱わない）。
+
+   **事実**: このVPSではCodex 0.147.0の既定sandbox（bubblewrap）が動作しない。
+   `bwrap`はsystem PATHに無く、bundled bwrapはUbuntu 24.04の
+   `kernel.apparmor_restrict_unprivileged_userns=1`によりunprivileged user namespaceを
+   作れないため `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted` で失敗する。
+   結果としてCodexは**shell commandを1つも実行できない**（＝repoを読めない）。
+   2026-08-19のインストール以来ずっとこの状態で、PR Bのcanaryで初めて発覚した。
+
+   **現在の回避策**: call-localな `-c use_legacy_landlock=true`。実測でrepo読み取り・
+   write拒否ともに成立した（PR C前提として採用）。global `~/.codex/config.toml`は変更していない。
+
+   **なぜ恒久解決でないか**: `codex features list`は
+   `use_legacy_landlock deprecated` / `use_linux_sandbox_bwrap removed` を報告する。
+   bwrapが無条件の既定になり、Landlockは撤去予定のfallbackである。
+   **Codexのupgrade一回でこの回避策は消えうる**。消えた瞬間、Codexは再びrepoを読めなくなり、
+   PR C後はRoadmap生成そのものが機能しなくなる。
+
+   **候補**: system bubblewrapの導入（apt install。Ubuntu版はuserns許可のAppArmor profileを同梱）、
+   またはAppArmor/sysctl設定の変更。**いずれもsudoによるhost変更でありYellow Zone**。
+   CEO承認なしに実施しないこと。
+
+   **既存Codex reviewerへの影響**: 現行のCodex independent reviewは
+   `buildReviewPrompt()`がgit diff / 計画本文をpromptへ埋め込むため、shell無しでも機能している。
+   ただし**diffの周辺コードを確認する能力は失われている**（degraded）。
+   「Codex reviewがPASSした」ことを「Codexがrepoを読んだ」証拠として扱わないこと。
 
 <!-- roadmap:id=opencode-feasibility-reviewer state=deferred -->
 0. [ ] **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider
