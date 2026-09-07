@@ -3986,6 +3986,13 @@ describe('computeWorkspaceBaseline: post-implement review Job の dirty 継承�
       'implement:job-1',
       'implement:',
       'preimplement:job-1:review',
+      // 独立レビュー指摘（2026-09-08）: 正規表現 `^implement:(.+):review$` では
+      // 以下が通ってしまっていた。`.+` は `:` を含み、JS の `$` は末尾改行の前にも一致するため。
+      'implement:job-1:extra:review',
+      'implement:job-1:review\n',
+      'implement::review',
+      'implement:job 1:review',
+      'implement:job-1:review:',
     ]) {
       const result = computeWorkspaceBaseline(createJob({ workflowStepKey: stepKey }), '/workspace/target')
       expect(result.ok, `${stepKey} は dirty 継承の対象外であるべき`).toBe(false)
@@ -4003,5 +4010,27 @@ describe('computeWorkspaceBaseline: post-implement review Job の dirty 継承�
 
     expect(result.ok).toBe(false)
     if (!result.ok) expect(result.reason).toContain('index.lock')
+  })
+})
+
+/**
+ * 独立レビュー指摘の補足: review Job でも HEAD 解決失敗は fail-closed のまま。
+ * dirty 継承を許可することと、状態を確認できないまま通すことは別問題。
+ */
+describe('post-implement review Job: HEAD 解決失敗は fail-closed', () => {
+  it('review Job でも HEAD を解決できなければ ok:false', () => {
+    detectGitOperationStateMock.mockReturnValue([])
+    buildWorktreeManifestMock.mockReturnValue({
+      paths: ['a.ts'],
+      changes: [{ path: 'a.ts', kind: 'added' as const, afterType: 'regular' as const }],
+    } as unknown as ChangeManifest)
+    execFileSyncMock.mockImplementation(() => { throw new Error('not a git repository') })
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'implement:job-1:review' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(false)
   })
 })

@@ -1859,15 +1859,30 @@ export function computeWorkspaceBaseline(job: Job, workingDir: string): Workspac
 }
 
 /**
- * post-implement review Job の workflowStepKey の形。
+ * `implement:<sourceJobId>:review` ちょうどこの形かどうか。
  *
- * `implement:<sourceJobId>:review` は API 側（`routes/jobs.ts`）が生成し、
- * Worker 側も同じ正規表現で解釈している。ここでも prefix ではなく**この形そのもの**で
- * 判定するのは、将来 `implement:<id>:*` の別ステップが追加されたときに、
- * dirty workspace の受け入れまで自動で継承させないため
- * （安全条件を広げすぎない）。
+ * これは「dirty worktree を受け入れてよいか」という**安全条件**なので、
+ * 正規表現ではなくセグメント分割で厳密に検査する。
+ * `/^implement:(.+):review$/` では次を取りこぼしていた:
+ *   - `.+` が `:` を含むため `implement:a:extra:review` まで一致する
+ *   - JS の `$` は末尾の改行の前にも一致するため `implement:a:review\n` が通る
+ * どちらも「安全条件を広げすぎない」という本修正の目的に反する
+ * （2026-09-08 独立レビュー指摘）。
+ *
+ * API 側（`routes/jobs.ts`）が生成する形がそのまま契約である。
+ * prefix（`implement:`）で広く許可しないのは、将来 `implement:<id>:*` の別ステップが
+ * 追加されたときに dirty workspace の受け入れまで自動継承させないため。
  */
-const IMPLEMENT_REVIEW_STEP_KEY = /^implement:(.+):review$/
+function isImplementReviewStepKey(stepKey: string): boolean {
+  const segments = stepKey.split(':')
+  return (
+    segments.length === 3 &&
+    segments[0] === 'implement' &&
+    segments[1].length > 0 &&
+    !/\s/.test(segments[1]) &&
+    segments[2] === 'review'
+  )
+}
 
 /**
  * INTENTIONALLY-DIRTY Job の分類（PR-C）。
@@ -1891,7 +1906,7 @@ function isIntentionallyDirtyJob(job: Job): boolean {
     stepKey.startsWith('repair:') ||
     stepKey.startsWith('resume:') ||
     stepKey.startsWith('retry:') ||
-    IMPLEMENT_REVIEW_STEP_KEY.test(stepKey)
+    isImplementReviewStepKey(stepKey)
   )
 }
 
