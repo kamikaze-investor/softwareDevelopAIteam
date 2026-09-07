@@ -7,6 +7,7 @@
  * Windows / Linux どちらでも決定的に検証する。
  */
 
+import { existsSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   buildCgroupName,
@@ -14,6 +15,7 @@ import {
   isContainmentSafe,
   resolveWorkerCgroup,
   runContainedCommand,
+  runContainedOrThrow,
 } from './runContainedCommand.js'
 
 const containmentAvailable = isContainmentAvailable()
@@ -235,5 +237,50 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
     expect(result.exitCode).toBe(126)
     expect(result.outcome).not.toBe('placement_failed')
     expect(isContainmentSafe(result.outcome)).toBe(true)
+  })
+
+  it('cgroup は削除される（populated 0 確認後の cleanup）', async () => {
+    const result = await runContainedCommand({
+      jobId: 'job-cleanup',
+      attemptId: String(Date.now()),
+      argv: ['/bin/sh', '-c', 'echo done'],
+      cwd: process.cwd(),
+      env: process.env,
+      timeoutMs: 30_000,
+    })
+
+    expect(result.outcome).toBe('clean')
+    expect(result.cgroupPath).toBeDefined()
+    expect(existsSync(result.cgroupPath!)).toBe(false)
+  })
+
+  it('drain が期限内に終わらなければ drain_timeout で fail closed になる', async () => {
+    // 直接の子は exit 0 だが setsid した孫が残る。drain 期限を 0 にすることで
+    // 「kill は出したが populated 0 を確認できなかった」状態を実際に発生させる。
+    const result = await runContainedCommand({
+      jobId: 'job-drain',
+      attemptId: String(Date.now()),
+      argv: ['/bin/sh', '-c', 'setsid sleep 30 >/dev/null 2>&1 < /dev/null & exit 0'],
+      cwd: process.cwd(),
+      env: process.env,
+      timeoutMs: 30_000,
+      drainMs: 0,
+    })
+
+    expect(result.outcome).toBe('drain_timeout')
+    expect(isContainmentSafe(result.outcome)).toBe(false)
+    expect(result.detail).toContain('still populated')
+  })
+
+  it('drain_timeout は runContainedOrThrow で例外になる（呼び出し元が握り潰せない）', async () => {
+    await expect(runContainedOrThrow({
+      jobId: 'job-drain-throw',
+      attemptId: String(Date.now()),
+      argv: ['/bin/sh', '-c', 'setsid sleep 30 >/dev/null 2>&1 < /dev/null & exit 0'],
+      cwd: process.cwd(),
+      env: process.env,
+      timeoutMs: 30_000,
+      drainMs: 0,
+    })).rejects.toThrow(/drain_timeout/)
   })
 })
