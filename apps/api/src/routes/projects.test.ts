@@ -667,6 +667,69 @@ describe('Project API', () => {
     })
   })
 
+
+  // Project開始workflowのlivenessをMobile pollingに依存させない、という契約のルート層検証。
+  // storage層の読み取りだけを叩くテストでは、このルート契約は証明できない
+  // （独立レビュー指摘、2026-09-07）。
+  describe('GET は Project開始workflowを進行させない', () => {
+    it('進行中stageのProjectをGETしてもstageは変わらず、Taskも作られない', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.updateStartStage(project.id, 'focused_review')
+        const before = storage.projects.findById(project.id)
+
+        for (let i = 0; i < 5; i += 1) {
+          expect((await app.inject({ method: 'GET', url: '/api/projects' })).statusCode).toBe(200)
+          expect((await app.inject({ method: 'GET', url: `/api/projects/${project.id}` })).statusCode).toBe(200)
+        }
+
+        const after = storage.projects.findById(project.id)
+        expect(after?.startStage).toBe('focused_review')
+        expect(after?.startStageUpdatedAt).toBe(before?.startStageUpdatedAt)
+        // 開始workflowはGETでは一切進まない
+        expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+      })
+    })
+
+    it('PATCHでStartした後、GETを一度も呼ばなくてもworkflowはcompletedまで完走する', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const { awaitProjectStartForTest } = await import('../ctoAi/projectStartWorkflow.js')
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/projects/${project.id}`,
+          payload: { status: 'running' },
+        })
+        expect(res.statusCode).toBe(200)
+
+        // ここから完了までGETを一切呼ばない
+        await awaitProjectStartForTest(project.id)
+
+        expect(getStorage().projects.findById(project.id)?.startStage).toBe('completed')
+        expect(getStorage().tasks.findByProjectId(project.id).length).toBeGreaterThan(0)
+      })
+    })
+
+    it('GETはpersisted stageをそのまま返す（Mobileの復元経路）', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        getStorage().projects.updateStartStage(project.id, 'blocked', 'CEO確認が必要です')
+
+        const res = await app.inject({ method: 'GET', url: `/api/projects/${project.id}` })
+
+        expect(res.statusCode).toBe(200)
+        const body = parseBody<{ startStage?: string; startBlockedReason?: string }>(res.body)
+        expect(body.startStage).toBe('blocked')
+        expect(body.startBlockedReason).toBe('CEO確認が必要です')
+      })
+    })
+  })
+
   describe('Interactive Project Definition / Readiness (Gap Analysis gating)', () => {
     it('an important (must_resolve) Gap blocks the running transition and is returned to the caller', async () => {
       await withApp(async (app) => {

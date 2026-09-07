@@ -3,6 +3,7 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import { buildInitialImplementAiCliPrompt, createInitialImplementWorkflow } from './initialImplementWorkflow'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
 
 function alignedDeps() {
   return {
@@ -149,5 +150,69 @@ describe('initial implement workflow', () => {
 
     expect(result).toMatchObject({ status: 'created' })
     expect(storage.jobs.findByTaskId(dependentId)).toHaveLength(1)
+  })
+})
+
+// Project-start完了時にJobを保証すべきなのは「今実行可能なTask」だけで、依存未達のTaskへ
+// 先回りしてJobを作ってはいけない（同じ共有workspaceへ依存元の完了前に書き込まれる）。
+describe('ensureInitialWorkflowsForActiveTasks の dependency eligibility', () => {
+  let storage: IStorage
+  let projectId: string
+  let a: string
+  let b: string
+  let c: string
+
+  beforeEach(() => {
+    storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'P', goal: 'G', designPhilosophy: [], status: 'running' })
+    projectId = project.id
+    const make = (title: string, dependencies: string[]): string => storage.tasks.create({
+      projectId, title, description: `Implement ${title}.`, status: 'pending',
+      assignee: 'developer_ai', dependencies, roadmapActive: true,
+    }).id
+    a = make('A', [])
+    b = make('B', [a])
+    c = make('C', [b])
+  })
+
+  const jobCount = (taskId: string): number => storage.jobs.findByTaskId(taskId).length
+
+  it('Project-start直後はAだけにJobを作り、B/Cには作らない', async () => {
+    await ensureInitialWorkflowsForActiveTasks(storage, projectId, alignedDeps())
+
+    expect(jobCount(a)).toBe(1)
+    expect(jobCount(b)).toBe(0)
+    expect(jobCount(c)).toBe(0)
+  })
+
+  it('A完了後はBだけが実行可能になり、Cはまだ作られない', async () => {
+    await ensureInitialWorkflowsForActiveTasks(storage, projectId, alignedDeps())
+    storage.tasks.update(a, { status: 'done' })
+
+    await ensureInitialWorkflowsForActiveTasks(storage, projectId, alignedDeps())
+
+    expect(jobCount(a)).toBe(1)
+    expect(jobCount(b)).toBe(1)
+    expect(jobCount(c)).toBe(0)
+  })
+
+  it('B完了後にCが実行可能になる', async () => {
+    storage.tasks.update(a, { status: 'done' })
+    storage.tasks.update(b, { status: 'done' })
+
+    await ensureInitialWorkflowsForActiveTasks(storage, projectId, alignedDeps())
+
+    expect(jobCount(c)).toBe(1)
+  })
+
+  it('restart recoveryの再実行でJobは重複せず、欠けているものだけが補修される', async () => {
+    await ensureInitialWorkflowsForActiveTasks(storage, projectId, alignedDeps())
+    // 同じ状態で何度呼んでも増えない
+    await ensureInitialWorkflowsForActiveTasks(storage, projectId, alignedDeps())
+    await ensureInitialWorkflowsForActiveTasks(storage, projectId, alignedDeps())
+
+    expect(jobCount(a)).toBe(1)
+    expect(jobCount(b)).toBe(0)
+    expect(jobCount(c)).toBe(0)
   })
 })

@@ -2,6 +2,37 @@
 
 export type ProjectStatus = 'draft' | 'running' | 'paused' | 'archived'
 
+/**
+ * Project開始workflowの進行段階。**Provider名ではなくsemantic stage**で表す
+ * （Providerを差し替えてもMobileの表示契約が変わらないようにするため）。
+ *
+ * Mobileはこの値を読んで表示するだけのthin clientであり、GETはProject-start workflowを
+ * 進行させない（Task continuationについてはGET側に既存の副作用が残っている）。
+ * 実処理はVPS側でclient connectionと独立して進み、stageだけが永続化される。
+ *
+ * 終端は`completed`と`blocked`の2つ。`blocked`はCEO判断待ちを含む安全停止であり、
+ * **自動では再開しない**（fail-closed）。それ以外は中断された進行中stageとみなし、
+ * API起動時のrecoveryが再kickする対象になる。
+ */
+export type ProjectStartStage =
+  | 'project_definition'
+  | 'roadmap_generation'
+  | 'deterministic_validation'
+  | 'focused_review'
+  | 'feasibility_review'
+  | 'integration_review'
+  | 'roadmap_regeneration'
+  | 'task_sync'
+  | 'completed'
+  | 'blocked'
+
+/** 自動再開してはいけない終端stage。 */
+export const TERMINAL_PROJECT_START_STAGES: readonly ProjectStartStage[] = ['completed', 'blocked']
+
+export function isTerminalProjectStartStage(stage: ProjectStartStage | undefined): boolean {
+  return stage !== undefined && TERMINAL_PROJECT_START_STAGES.includes(stage)
+}
+
 export interface Project {
   id: string
   name: string
@@ -10,6 +41,11 @@ export interface Project {
   status: ProjectStatus
   createdAt: string
   updatedAt: string
+  /** Project開始workflowの現在段階。開始要求を受理した時点で初めて設定される。 */
+  startStage?: ProjectStartStage
+  startStageUpdatedAt?: string
+  /** `blocked`のとき、なぜ止まったか（CEOへ提示する理由）。 */
+  startBlockedReason?: string
 }
 
 /**

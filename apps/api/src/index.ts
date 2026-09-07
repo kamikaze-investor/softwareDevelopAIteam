@@ -26,6 +26,7 @@ import { knowledgeGraphRoutes } from './routes/knowledgeGraph'
 import { healthRoutes } from './routes/health'
 import { apiTokenAuth } from './auth/apiToken'
 import { recoverAndRekickAtStartup } from './designReview/designReviewCoordinator'
+import { recoverInterruptedProjectStarts } from './ctoAi/projectStartWorkflow.js'
 
 const app = Fastify({ logger: true })
 
@@ -78,6 +79,22 @@ app.listen({ port: PORT, host: process.env.HOST ?? '0.0.0.0' }, (err) => {
 
   // API起動時に1回だけ、前プロセスが残したstale runningのDesign Reviewを回収し再kickする。
   // scheduler/cron/watchdogは追加しない。recoveryが失敗してもAPI起動は継続させる。
+  // 2つのrecoveryは**順番に**実行する。並行させると、`focused_review`で中断したProjectの
+  // 再開が、まだ回収されていないDesign Review runに対して`not_claimable`を繰り返し、
+  // bounded retryを使い切って`blocked`（終端）にしてしまう。Design Review側の回収が
+  // 先に終わっていれば、その評価を再利用して正常に続行できる（独立レビュー指摘、2026-09-07）。
   void recoverAndRekickAtStartup(getStorage())
-    .catch((recoveryError) => app.log.error({ err: recoveryError }, 'design review startup recovery failed'))
+    .catch((recoveryError) => {
+      app.log.error({ err: recoveryError }, 'design review startup recovery failed')
+    })
+    .then(() => recoverInterruptedProjectStarts(getStorage()))
+    .then((result) => {
+      if (result.rekicked.length > 0 || result.resumed.length > 0) {
+        app.log.info(
+          { rekicked: result.rekicked, resumed: result.resumed },
+          'project start startup recovery',
+        )
+      }
+    })
+    .catch((recoveryError) => app.log.error({ err: recoveryError }, 'project start startup recovery failed'))
 })

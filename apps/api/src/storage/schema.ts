@@ -353,6 +353,11 @@ export const CREATE_TABLES = `
  * CREATE TABLE IF NOT EXISTS does not change already-created tables.
  */
 export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; definition: string }> = [
+  // Project開始workflowの永続stage。長時間の開始処理をHTTP requestのlifecycleから
+  // 切り離し、Mobileがread-onlyで進捗を復元できるようにする（2026-09-07）。
+  { table: 'projects', column: 'start_stage', definition: 'TEXT' },
+  { table: 'projects', column: 'start_stage_updated_at', definition: 'TEXT' },
+  { table: 'projects', column: 'start_blocked_reason', definition: 'TEXT' },
   { table: 'tasks', column: 'provider', definition: 'TEXT' },
   { table: 'tasks', column: 'allowed_paths', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { table: 'tasks', column: 'forbidden_paths', definition: "TEXT NOT NULL DEFAULT '[]'" },

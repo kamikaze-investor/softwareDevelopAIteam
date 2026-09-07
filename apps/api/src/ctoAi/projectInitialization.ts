@@ -1,4 +1,4 @@
-import type { Project } from '@ai-team/shared'
+import type { Project, ProjectStartStage } from '@ai-team/shared'
 import {
   buildDefaultCoordinatorDeps,
   createAndExecuteRoadmapReview,
@@ -145,7 +145,42 @@ export function buildApprovedProjectAnalysis(project: Project): SpecAnalysis {
   }
 }
 
+/**
+ * 現行Roadmap（roadmapActiveなTask）全件について、初回Implement Jobが存在することを保証する。
+ *
+ * crash後のresumeでも使う。**既に永続化されたRoadmapが権威**であり、resume時にRoadmapを
+ * 生成し直さない — LLM生成は非決定的なので、再生成すると旧Roadmap由来のTaskが非活性化され、
+ * 別内容のTaskが作られてしまう。既にsync済みのRoadmapがあるなら、それを正として
+ * 「まだJobが無いTaskへJobを作る」だけで安全に完了へ持っていける。
+ */
+export async function ensureInitialWorkflowsForActiveTasks(
+  storage: IStorage,
+  projectId: string,
+  deps?: CoordinatorDeps,
+): Promise<Array<Awaited<ReturnType<typeof createInitialImplementWorkflow>>>> {
+  const activeTaskIds = storage.tasks
+    .findByProjectId(projectId)
+    .filter((task) => task.roadmapActive)
+    .map((task) => task.id)
+
+  // 候補をactive Task全件にしても、実際にJobが作られるかは
+  // `createInitialImplementWorkflow()`が既存のeligibility判定で決める。ここでゲートを
+  // 迂回しないことが重要で、依存未達のTaskは`dependencies are not yet done`でskipされ、
+  // 既にJobがあるTaskは`initial workflow job already exists`でskipされる。
+  return Promise.all(
+    activeTaskIds.map((taskId) => (
+      deps ? createInitialImplementWorkflow(storage, taskId, deps) : createInitialImplementWorkflow(storage, taskId)
+    )),
+  )
+}
+
 export interface ProjectInitializationOptions extends RoadmapGeneratorOptions {
+  /**
+   * 進行段階の通知。Project開始workflowがstageを永続化するために使う。
+   * **実際に到達した段階でのみ呼ぶ**（見せかけの進捗を出さないため、観測できない
+   * 段階は通知しない）。未指定なら何もしない＝既存の呼び出し元の挙動は不変。
+   */
+  onStage?: (stage: ProjectStartStage) => void
   analysis?: SpecAnalysis
   writeProjectMemory?: boolean
 }
@@ -174,8 +209,12 @@ export async function initializeApprovedProject(
 
   // AI調査対象の不確実性は analysis から決定論的に導出する（生成・検証・展開が同じIDを再計算する）。
   const technicalUncertainties = collectTechnicalUncertainties(analysis)
+  const notifyStage = (stage: ProjectStartStage): void => { options.onStage?.(stage) }
+
   for (let attempt = 1; attempt <= ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS; attempt += 1) {
+    notifyStage(attempt === 1 ? 'roadmap_generation' : 'roadmap_regeneration')
     const candidateRoadmap = await generateRoadmap(analysis, { ...options, priorAttemptFeedback })
+    notifyStage('deterministic_validation')
     const candidateTasks = buildRoadmapTasks(candidateRoadmap, technicalUncertainties)
     const candidatePhases = buildRoadmapPhases(candidateRoadmap)
     const constraintValidation = validateRoadmapConstraints(candidateTasks, analysis.structuredConstraints)
@@ -231,6 +270,11 @@ export async function initializeApprovedProject(
       break
     }
 
+    // Whole-Roadmap Reviewは現状1回の実行でfocused/integration/independentをまとめて返す。
+    // 観測できるのはこの単位なので、ここでは`focused_review`だけを通知する。
+    // `feasibility_review` / `integration_review`はprovider topology変更で実際に
+    // 独立した段になった時点で通知する（観測できない段階を先に出さない）。
+    notifyStage('focused_review')
     const reviewResult = await executeRoadmapReviewToTerminal(storage, project.id, reviewMaterial, deps)
     freshness = checkRoadmapDesignReviewFreshness(
       project.id,
@@ -277,6 +321,7 @@ export async function initializeApprovedProject(
     throw new Error('unreachable: roadmap recovery loop exited without an accepted roadmap or error')
   }
 
+  notifyStage('task_sync')
   const syncResult = storage.tasks.syncRoadmapTasks({
     projectId: project.id,
     tasks: roadmapTasks,
@@ -291,9 +336,11 @@ export async function initializeApprovedProject(
   }
 
   const roadmapFiles = writeRoadmap(roadmap, targetProjectRoot)
-  const initialWorkflow = await Promise.all(
-    syncResult.createdTaskIds.map((taskId) => createInitialImplementWorkflow(storage, taskId)),
-  )
+  // 初回Jobは`createdTaskIds`ではなく**現行Roadmapのactive Task全件**に対して用意する。
+  // replay時（既にsync済みのTaskがある状態での再実行）は`createdTaskIds`が空になるため、
+  // それだけを見ているとJobが1件も作られないまま完了扱いになる（独立レビュー指摘、2026-09-07）。
+  // `createInitialImplementWorkflow()`は既存Jobがあればskipするので、繰り返し呼んでも重複しない。
+  const initialWorkflow = await ensureInitialWorkflowsForActiveTasks(storage, project.id)
 
   return {
     analysis,
