@@ -1,7 +1,14 @@
 import type { ApprovalRequest, Job, Task, WatchdogEvent } from '@ai-team/shared'
 import { describe, expect, it } from 'vitest'
 
-import { canShowResumeUI, deriveJobDisplayState, manualWorkflowIsLocked } from './taskWorkflow'
+import {
+  allowsRoutineRecoveryActions,
+  canShowResumeUI,
+  deriveJobDisplayState,
+  deriveProjectExecutionHealth,
+  manualWorkflowIsLocked,
+  PROJECT_EXECUTION_HEALTH_LABEL,
+} from './taskWorkflow'
 
 function makeJob(overrides: Partial<Job>): Job {
   return {
@@ -215,5 +222,117 @@ describe('MOB-001: 実行状態の見分け', () => {
     expect(canShowResumeUI(task, [quarantined], [])).toBe(false)
     // quarantine でない通常の blocked では従来どおり出る
     expect(canShowResumeUI(task, [baseJob({ status: 'blocked' })], [])).toBe(true)
+  })
+})
+
+/**
+ * MOB-001 production evidence (2026-09-08 Phase 1/2 Operational E2E).
+ *
+ * 実運用で観測した状態をそのまま固定する:
+ *   Project.status = running
+ *   初回 implement Job = success
+ *   continuation review Job = quarantined (workspace_baseline_failure)
+ *   → workflow は完全停止していたが、Mobile は Running を表示し続けた。
+ */
+describe('MOB-001 Project実行健全性', () => {
+  const task = (id: string, status: Task['status'] = 'in_progress'): Task =>
+    ({ id, status } as Task)
+
+  const job = (over: Partial<Job>): Job =>
+    ({ id: 'j', status: 'success', ...over } as Job)
+
+  it('production再現: running Project + quarantined Job は「安全停止中」を主表示にする', () => {
+    const tasks = [task('t1')]
+    const jobsByTaskId = {
+      t1: [
+        job({ aiCliMode: 'implement', id: 'j1', status: 'success' }),
+        job({
+          aiCliMode: 'review',
+          failureMetadata: { quarantineReason: 'workspace_baseline_failure', quarantined: true },
+          id: 'j2',
+          status: 'blocked',
+        }),
+      ],
+    }
+
+    const health = deriveProjectExecutionHealth(tasks, jobsByTaskId, [])
+
+    expect(health).toBe('quarantined')
+    expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).toBe('安全停止中')
+    // 「実行中」を主表示にしてはいけない — これが実運用で起きた誤表示そのもの
+    expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).not.toBe('実行中')
+  })
+
+  it('quarantine では通常の Resume / Approval 操作を出さない', () => {
+    expect(allowsRoutineRecoveryActions('quarantined')).toBe(false)
+    expect(allowsRoutineRecoveryActions('approval_waiting')).toBe(true)
+    expect(allowsRoutineRecoveryActions('error')).toBe(true)
+    expect(allowsRoutineRecoveryActions('running_stalled')).toBe(true)
+  })
+
+  it('healthy running は「実行中」', () => {
+    const health = deriveProjectExecutionHealth(
+      [task('t1')],
+      { t1: [job({ id: 'j1', startedAt: '2026-09-08T00:00:00Z', status: 'running' })] },
+      [],
+    )
+    expect(health).toBe('running_healthy')
+    expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).toBe('実行中')
+  })
+
+  it('watchdog が stall と確認した running は「処理が進んでいません」', () => {
+    const startedAt = '2026-09-08T00:00:00Z'
+    const health = deriveProjectExecutionHealth(
+      [task('t1')],
+      { t1: [job({ id: 'j1', startedAt, status: 'running' })] },
+      [],
+      [{ isStuck: true, jobId: 'j1', startedAt, status: 'confirmed', taskId: 't1' } as WatchdogEvent],
+    )
+    expect(health).toBe('running_stalled')
+    expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).toBe('処理が進んでいません')
+  })
+
+  it('承認待ちは「承認待ち」', () => {
+    const health = deriveProjectExecutionHealth(
+      [task('t1')],
+      { t1: [job({ approvalId: 'a1', id: 'j1', status: 'blocked' })] },
+      [{ id: 'a1', status: 'WAITING_FOR_USER' } as ApprovalRequest],
+    )
+    expect(health).toBe('approval_waiting')
+    expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).toBe('承認待ち')
+  })
+
+  it('通常の失敗は「復旧が必要」', () => {
+    const health = deriveProjectExecutionHealth(
+      [task('t1', 'blocked')],
+      { t1: [job({ id: 'j1', status: 'failed' })] },
+      [],
+    )
+    expect(health).toBe('error')
+    expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).toBe('復旧が必要')
+  })
+
+  it('quarantine は running / approval / failure より優先される', () => {
+    const startedAt = '2026-09-08T00:00:00Z'
+    const health = deriveProjectExecutionHealth(
+      [task('t1'), task('t2')],
+      {
+        t1: [job({ id: 'j1', startedAt, status: 'running' })],
+        t2: [
+          job({ approvalId: 'a1', id: 'j2', status: 'blocked' }),
+          job({
+            failureMetadata: { quarantined: true },
+            id: 'j3',
+            status: 'blocked',
+          }),
+        ],
+      },
+      [{ id: 'a1', status: 'WAITING_FOR_USER' } as ApprovalRequest],
+    )
+    expect(health).toBe('quarantined')
+  })
+
+  it('実行signalが無ければ idle（lifecycle statusをそのまま見せてよい）', () => {
+    expect(deriveProjectExecutionHealth([task('t1', 'done')], { t1: [] }, [])).toBe('idle')
   })
 })

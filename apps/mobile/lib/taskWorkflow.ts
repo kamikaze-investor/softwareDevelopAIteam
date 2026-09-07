@@ -114,6 +114,84 @@ export function deriveJobDisplayState(
   return 'other'
 }
 
+/**
+ * MOB-001: Project画面の実行健全性。
+ *
+ * `Project.status` は **lifecycle**（draft / running / paused / archived）であって
+ * 「実際に処理が進んでいるか」ではない。両者を同じ表示に畳むと、止まっているのに
+ * 動いているように見える。実運用で再現済み（2026-09-08 Phase 1/2 Operational E2E）:
+ * Project.status='running' / 初回implement Job=success / continuation review Job=quarantined
+ * （quarantineReason='workspace_baseline_failure'）でworkflowは完全停止していたが、
+ * Mobileは「Running」を表示し続けた。
+ *
+ * **新しいbackend status体系は作らない。** 既存の Job.status / failureMetadata /
+ * WatchdogEvent / approval state / Task state から導出するだけ。
+ */
+export type ProjectExecutionHealth =
+  | 'running_healthy'      // 実際に進んでいる
+  | 'running_stalled'      // watchdogがstallと確認した
+  | 'quarantined'          // workspaceの安全性が証明できず所有権を保持している
+  | 'approval_waiting'     // CEOの承認待ち
+  | 'error'                // 通常の失敗。復旧が必要
+  | 'idle'                 // 実行signalが無い。lifecycle statusをそのまま見せてよい
+
+export const PROJECT_EXECUTION_HEALTH_LABEL: Record<ProjectExecutionHealth, string> = {
+  approval_waiting: '承認待ち',
+  error: '復旧が必要',
+  idle: '',
+  quarantined: '安全停止中',
+  running_healthy: '実行中',
+  running_stalled: '処理が進んでいません',
+}
+
+/**
+ * quarantine では通常の Resume / Approval を出さない。
+ *
+ * quarantine は「承認すれば進む」状態ではなく、workspace verification /
+ * reconciliation / clearance を経なければ解けない。ここで通常の復旧操作を見せると、
+ * CEO は「承認したのに進まない」誤った操作へ誘導される。
+ */
+export function allowsRoutineRecoveryActions(health: ProjectExecutionHealth): boolean {
+  return health !== 'quarantined'
+}
+
+/**
+ * Project全体の実行健全性を、既存データだけから導出する。
+ *
+ * 優先順位は「CEOが取るべき行動が変わる順」:
+ *   quarantined … 承認でもresumeでも解けない唯一の状態なので最優先
+ *   running_stalled … 進行中に見えて進んでいない異常
+ *   approval_waiting … 止まっているが原因も操作も明確
+ *   running_healthy … 実際に動いている作業がある
+ *   error … 動いている作業が無く、失敗/blockedが残っている
+ *
+ * `running_healthy` を `error` より先に見るのは、進行中の作業がある限り
+ * 「復旧が必要」を主表示にすると、過去に1件失敗しただけのProjectが恒久的に
+ * 異常表示になってしまうため。停止しているときだけ復旧を促す。
+ */
+export function deriveProjectExecutionHealth(
+  tasks: Task[],
+  jobsByTaskId: Record<string, Job[]>,
+  approvalRequests: ApprovalRequest[],
+  watchdogEvents: WatchdogEvent[] = [],
+): ProjectExecutionHealth {
+  const jobs = tasks.flatMap((task) => jobsByTaskId[task.id] ?? [])
+  const states = jobs.map(
+    (job) => deriveJobDisplayState(job, approvalRequests, watchdogEvents),
+  )
+
+  if (states.includes('quarantined')) return 'quarantined'
+  if (states.includes('running_stalled')) return 'running_stalled'
+  if (states.includes('approval_waiting')) return 'approval_waiting'
+  if (states.includes('running_healthy')) return 'running_healthy'
+
+  const hasFailure = jobs.some((job) => job.status === 'failed')
+    || states.includes('blocked')
+    || tasks.some((task) => task.status === 'blocked')
+
+  return hasFailure ? 'error' : 'idle'
+}
+
 export function hasWaitingLinkedApproval(
   jobs: Job[],
   approvalRequests: ApprovalRequest[],

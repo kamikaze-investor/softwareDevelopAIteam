@@ -5,6 +5,7 @@
 import type { ReactElement } from 'react'
 import { useCallback, useState } from 'react'
 import type {
+  ApprovalRequest,
   Job,
   JobStatus,
   Project,
@@ -12,6 +13,7 @@ import type {
   ProjectStatus,
   Task,
   TaskStatus,
+  WatchdogEvent,
 } from '@ai-team/shared'
 import { router, useLocalSearchParams } from 'expo-router'
 import {
@@ -24,6 +26,11 @@ import {
   View,
 } from 'react-native'
 
+import {
+  deriveProjectExecutionHealth,
+  PROJECT_EXECUTION_HEALTH_LABEL,
+  type ProjectExecutionHealth,
+} from '../../lib/taskWorkflow'
 import { apiFetch } from '../../lib/api'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
@@ -59,10 +66,12 @@ const STATUS_COLOR: Record<TaskStatus | JobStatus, string> = {
 }
 
 interface ProjectDetailData {
+  approvalRequests: ApprovalRequest[]
   jobsByTaskId: Record<string, Job[]>
   phases: ProjectRoadmapPhase[]
   project: Project
   tasks: Task[]
+  watchdogEvents: WatchdogEvent[]
 }
 
 interface TaskJobSummary {
@@ -121,6 +130,30 @@ async function fetchJobs(taskId: string): Promise<Job[]> {
   }
 
   return (await response.json()) as Job[]
+}
+
+/**
+ * MOB-001: 実行健全性の判定に使う。既存APIをそのまま読むだけで、新しいbackend status体系は
+ * 作らない。取得に失敗しても画面は壊さず、健全性表示が控えめになるだけに留める。
+ */
+async function fetchWaitingApprovals(): Promise<ApprovalRequest[]> {
+  try {
+    const response = await apiFetch('/api/approval-requests/waiting')
+    if (!response.ok) return []
+    return (await response.json()) as ApprovalRequest[]
+  } catch {
+    return []
+  }
+}
+
+async function fetchWatchdogEvents(): Promise<WatchdogEvent[]> {
+  try {
+    const response = await apiFetch('/api/watchdog-events')
+    if (!response.ok) return []
+    return (await response.json()) as WatchdogEvent[]
+  } catch {
+    return []
+  }
 }
 
 async function fetchJobsByTaskId(
@@ -309,15 +342,64 @@ function StatusBadge({
   )
 }
 
-function ProjectStatusSection({ project }: { project: Project }): ReactElement {
+const HEALTH_COLOR: Record<ProjectExecutionHealth, string> = {
+  approval_waiting: '#a855f7',
+  error: '#ef4444',
+  idle: '#737373',
+  quarantined: '#f97316',
+  running_healthy: '#3b82f6',
+  running_stalled: '#f59e0b',
+}
+
+/**
+ * MOB-001: lifecycle status と execution health を分けて見せる。
+ *
+ * `Project.status` は lifecycle（draft / running / paused / archived）でしかないので、
+ * それだけを大きく出すと「running なのに全workflowが停止している」状態が
+ * 「実行中」に見える。実運用で再現済み（2026-09-08 Phase 1/2 Operational E2E）。
+ * そこで **主表示は execution health**、lifecycle は補助表示に落とす。
+ */
+function ProjectStatusSection({
+  approvalRequests,
+  jobsByTaskId,
+  project,
+  tasks,
+  watchdogEvents,
+}: {
+  approvalRequests: ApprovalRequest[]
+  jobsByTaskId: Record<string, Job[]>
+  project: Project
+  tasks: Task[]
+  watchdogEvents: WatchdogEvent[]
+}): ReactElement {
+  const health = deriveProjectExecutionHealth(
+    tasks, jobsByTaskId, approvalRequests, watchdogEvents,
+  )
+  const healthLabel = PROJECT_EXECUTION_HEALTH_LABEL[health]
+
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>Project status</Text>
       <View style={styles.infoCard}>
-        <StatusBadge
-          color={PROJECT_STATUS_COLOR[project.status]}
-          status={project.status}
-        />
+        {healthLabel === '' ? (
+          <StatusBadge
+            color={PROJECT_STATUS_COLOR[project.status]}
+            status={project.status}
+          />
+        ) : (
+          <>
+            <StatusBadge color={HEALTH_COLOR[health]} status={healthLabel} />
+            <Text style={styles.lifecycleHint}>
+              Project lifecycle: {project.status}
+            </Text>
+            {health === 'quarantined' && (
+              <Text style={styles.quarantineHint}>
+                workspaceの安全性が確認できないため停止しています。
+                承認や再開では解除されません。workspaceの検証・整合性の回復が必要です。
+              </Text>
+            )}
+          </>
+        )}
       </View>
     </View>
   )
@@ -612,11 +694,13 @@ export default function ProjectDetailScreen(): ReactElement {
       }
 
       const tasks = await fetchTasks(projectId)
-      const [jobsByTaskId, phases] = await Promise.all([
+      const [jobsByTaskId, phases, approvalRequests, watchdogEvents] = await Promise.all([
         fetchJobsByTaskId(tasks),
         fetchRoadmapPhases(projectId),
+        fetchWaitingApprovals(),
+        fetchWatchdogEvents(),
       ])
-      setData({ jobsByTaskId, phases, project, tasks })
+      setData({ approvalRequests, jobsByTaskId, phases, project, tasks, watchdogEvents })
     } catch (loadError) {
       setError(getErrorMessage(loadError))
       Alert.alert('エラー', 'Project詳細の取得に失敗しました')
@@ -661,7 +745,13 @@ export default function ProjectDetailScreen(): ReactElement {
 
       {data !== null && (
         <>
-          <ProjectStatusSection project={data.project} />
+          <ProjectStatusSection
+            approvalRequests={data.approvalRequests}
+            jobsByTaskId={data.jobsByTaskId}
+            project={data.project}
+            tasks={data.tasks}
+            watchdogEvents={data.watchdogEvents}
+          />
           <GoalSection project={data.project} />
           <DesignPhilosophySection designPhilosophy={data.project.designPhilosophy} />
           <RoadmapSection phases={data.phases} tasks={data.tasks} />
@@ -687,6 +777,8 @@ export default function ProjectDetailScreen(): ReactElement {
 }
 
 const styles = StyleSheet.create({
+  lifecycleHint: { color: '#a3a3a3', fontSize: 12, marginTop: 8 },
+  quarantineHint: { color: '#fdba74', fontSize: 13, lineHeight: 19, marginTop: 8 },
   back: {
     marginRight: 12,
     paddingVertical: 4,
