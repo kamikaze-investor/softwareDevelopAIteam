@@ -147,7 +147,7 @@ const UpdateJobBody = z.object({
         path: z.string(),
         oldPath: z.string().optional(),
         kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
-        xyStatus: z.string(),
+        xyStatus: z.string().optional(),
         beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
         afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
         beforeMode: z.string().optional(),
@@ -155,7 +155,7 @@ const UpdateJobBody = z.object({
         headHash: z.string().optional(),
         indexHash: z.string().optional(),
         worktreeHash: z.string(),
-      })).min(1),
+      })),
     }).strict(),
   ]).optional(),
   reviewResult: StructuredReviewResultSchema.optional(),
@@ -361,6 +361,18 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     if (!transition.ok) {
       if (transition.code === 'OUTBOX_HASH_MISMATCH') {
         return reply.status(409).send({ error: transition.reason })
+      }
+      if (transition.code === 'WORKSPACE_QUARANTINED') {
+        return reply.status(409).send({ error: transition.reason })
+      }
+
+      // PR-C: storage失敗を404（Job not found）へ丸めない。丸めると復旧側は
+      // 「対象が無い」と解釈して打ち切り、workspaceを所有したままの running Job が
+      // 放置される（silent ownership retention）。not-found と technical failure を
+      // 分離し、後者は 500 で fail-closed かつ観測可能にする。
+      if (transition.code === 'STORAGE_ERROR') {
+        req.log.error({ jobId: req.params.id, reason: transition.reason }, 'fail-if-running storage failure')
+        return reply.status(500).send({ error: transition.reason })
       }
       return reply.status(404).send({ error: 'Job not found' })
     }

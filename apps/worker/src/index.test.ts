@@ -544,7 +544,7 @@ describe('workspace baseline (PR-C)', () => {
     expect(executeJob).not.toHaveBeenCalled()
     expect(patchJob).toHaveBeenCalledTimes(1)
     expect(patchJob.mock.calls[0]?.[1]).toMatchObject({
-      status: 'failed',
+      status: 'blocked',
       stderr: expect.stringContaining('index.lock'),
       completedAt: NOW,
     })
@@ -569,11 +569,59 @@ describe('workspace baseline (PR-C)', () => {
     expect(executeJob).not.toHaveBeenCalled()
     expect(patchJob).toHaveBeenCalledTimes(1)
     expect(patchJob.mock.calls[0]?.[1]).toMatchObject({
-      status: 'failed',
+      status: 'blocked',
       stderr: expect.stringContaining('src/dirty.ts'),
     })
   })
-})
+
+
+  it('baseline failure on an OWNING Job: ownership is retained (blocked + quarantined), not released', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const executeJob = vi.fn()
+    const alert = vi.fn().mockResolvedValue([])
+    // workflowStepKey が initial-implement ではない queued Job は、
+    // findWorkspaceOwningTaskId() 上すでに workspace を所有している。
+    const owningJob: Job = { ...job, workflowStepKey: 'repair:job-0:1' }
+    jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({
+      ok: false,
+      reason: 'fingerprint failed',
+    })
+
+    const status = await processQueuedWork({ job: owningJob, task, jobs: [owningJob] }, {
+      patchJob,
+      executeJob,
+      alert,
+      now: () => NOW,
+    })
+
+    expect(status).toBeNull()
+    expect(executeJob).not.toHaveBeenCalled()
+    const payload = patchJob.mock.calls[0]?.[1]
+    // 所有権を解放する 'failed' にしてはならない
+    expect(payload).toMatchObject({ status: 'blocked' })
+    expect(payload.failureMetadata).toMatchObject({ quarantined: true })
+    expect(alert).toHaveBeenCalled()
+  })
+
+  it('baseline failure on a NON-owning initial-implement Job may still report failed', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const executeJob = vi.fn()
+    const initialJob: Job = { ...job, workflowStepKey: `task:${job.taskId}:initial-implement` }
+    jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({
+      ok: false,
+      reason: 'dirty worktree',
+    })
+
+    await processQueuedWork({ job: initialJob, task, jobs: [initialJob] }, {
+      patchJob,
+      executeJob,
+      now: () => NOW,
+    })
+
+    expect(executeJob).not.toHaveBeenCalled()
+    // まだ workspace を所有していないので、保持すべき所有権が無い
+    expect(patchJob.mock.calls[0]?.[1]).toMatchObject({ status: 'failed' })
+  })})
 
 describe('policy construction failure', () => {
   it('uses the shared retry/reconcile persistence path for running and failed updates', async () => {

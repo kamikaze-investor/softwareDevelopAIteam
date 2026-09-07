@@ -18,7 +18,7 @@ import type { TaskContinuation } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
-import { escalateTaskToHuman, prepareRepairFlow } from '../designReview/repairFlow'
+import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -1389,6 +1389,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
         }
 
+        // F9: pre-transition quarantine guard（fail-closed）。
+        // このTaskの任意のJobが quarantine（未検証 workspace）状態にある場合、
+        // その所有権を荒らす遷移・介入を一切受け付けない。dedup replay（read-only）は
+        // 上の早回りで処理済みのため、ここで拒否されるのは常に「新しい遷移」のみ。
+        if (isWorkspaceQuarantined(jobs.findByTaskId(existing.taskId))) {
+          return {
+            ok: false,
+            code: 'WORKSPACE_QUARANTINED',
+            reason: 'Task has a quarantined (un-verified) workspace; refusing to transition, fail-closed',
+          }
+        }
+
         // CAS WINNER のみここへ到達する。
         // 目的語の状態は workspace 検証結果で決まる:
         //   - verified safe → `failed`（所有権解放してよい。workspace はクリーンと証明済み）
@@ -1441,6 +1453,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             // Job の終端状態と queued design_review_run を同一 transaction で確定し、
             // lost-trigger window（Job は failed / run は無い）を生まない。
             designReviewRuns.create(preparation.run)
+            // F8: queue intent は所有権を解放しない（Job を blocked に保つ）。
+            // run と repair Job の間に crash しても、workspace が進行中Jobのどれにも
+            // 属さない孤児になるのを防ぐ。repair Job が実体化した後の遷移に任せる。
+            jobs.update(input.jobId, { status: 'blocked' })
           }
           // 'skip' → 追加の修復意図は作らない。
         } else {

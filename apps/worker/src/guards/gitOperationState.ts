@@ -60,6 +60,13 @@ const FILE_MARKERS: Array<{ operation: string; name: string }> = [
   { operation: 'merge', name: 'MERGE_HEAD' },
   { operation: 'cherry-pick', name: 'CHERRY_PICK_HEAD' },
   { operation: 'revert', name: 'REVERT_HEAD' },
+
+  // 独立レビュー指摘（PR-C）: 以下は HEAD も worktree も変化させないまま残り得るため、
+  // 検出漏れがあると「変化なし」と誤判定して ownership を解放してしまう。
+  { operation: 'bisect', name: 'BISECT_START' },
+  { operation: 'head.lock', name: 'HEAD.lock' },
+  { operation: 'packed-refs.lock', name: 'packed-refs.lock' },
+  { operation: 'shallow.lock', name: 'shallow.lock' },
 ]
 
 const DIR_MARKERS: Array<{ operation: string; name: string }> = [

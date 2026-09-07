@@ -35,6 +35,10 @@ function initRepo(): string {
   // Windows での決定的な内容 hash のために行末変換を無効化する。
   gitIn(dir, 'config', 'core.autocrlf', 'false')
   gitIn(dir, 'config', 'user.email', 'test@example.com')
+  // PR-C: verification は core.filemode=true を前提に mode 比較の妥当性を主張する。
+  // Windows の既定は false のため、fixture 側で明示的に true にして本来の経路を通す
+  // （false のときに verified:false へ倒れることは専用テストで別途 pin する）。
+  gitIn(dir, 'config', 'core.filemode', 'true')
   gitIn(dir, 'config', 'user.name', 'test')
   writeFileSync(path.join(dir, 'README.md'), 'base\n', 'utf-8')
   gitIn(dir, 'add', '-A')
@@ -77,6 +81,23 @@ describe('verifyWorkspaceAgainstBaseline', () => {
     expect(verifyWorkspaceAgainstBaseline(repo, baseline)).toEqual({ verified: true })
   })
 
+
+  it('core.filemode が false なら verified にしない（exec-bit 変化が git status に出ないため）', () => {
+    const baseline = { mode: 'clean' as const, startCommitHash: getHead(repo) }
+    // 他条件はすべて一致しているが、mode 比較の前提が崩れている状態。
+    gitIn(repo, 'config', 'core.filemode', 'false')
+    const result = verifyWorkspaceAgainstBaseline(repo, baseline)
+    expect(result.verified).toBe(false)
+    if (!result.verified) expect(result.reason).toContain('core.filemode')
+  })
+
+  it('assume-unchanged な path があれば verified にしない（変更が git status に出ないため）', () => {
+    const baseline = { mode: 'clean' as const, startCommitHash: getHead(repo) }
+    gitIn(repo, 'update-index', '--assume-unchanged', 'README.md')
+    const result = verifyWorkspaceAgainstBaseline(repo, baseline)
+    expect(result.verified).toBe(false)
+    if (!result.verified) expect(result.reason).toContain('assume-unchanged')
+  })
   it('clean baseline + clean tree + HEAD moved => NOT verified（looks clean では不十分）', () => {
     const baselineHead = getHead(repo)
     // 2つ目のコミットを作る。working tree はクリーンなまま HEAD だけが進む。

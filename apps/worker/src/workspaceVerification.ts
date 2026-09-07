@@ -83,11 +83,26 @@ export function verifyWorkspaceAgainstBaseline(
       }
     }
 
-    if (baseline.mode === 'clean') {
-      return verifyCleanMode(workingDir)
+    const modeResult = baseline.mode === 'clean'
+      ? verifyCleanMode(workingDir)
+      : verifyDirtyMode(workingDir, baseline)
+    if (!modeResult.verified) return modeResult
+
+    // 独立レビュー指摘（PR-C）: ここまでの比較は `git status` が報告する範囲でしか
+    // equality を主張できない。status に出ない状態変化（core.filemode=false による
+    // exec-bit、assume-unchanged / skip-worktree の path）が有り得る場合、
+    // 「一致」と断定してはならない。verified を返す直前だけで判定するのは、
+    // 具体的な不一致理由（HEAD moved 等）を潰さないため。
+    const unreportable = detectUnreportableWorkspaceState(workingDir)
+    if (unreportable !== undefined) {
+      return {
+        verified: false,
+        reason: `${unreportable}; git status cannot prove the workspace is unchanged ` +
+          '- quarantining to retain ownership',
+      }
     }
 
-    return verifyDirtyMode(workingDir, baseline)
+    return modeResult
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err)
     return {
@@ -269,4 +284,63 @@ function formatChangedFiles(files: string[]): string {
   if (files.length === 0) return 'なし'
   const head = files.slice(0, 3).join(', ')
   return files.length > 3 ? `${head} …他${files.length - 3}件` : head
+}
+
+
+/** verification 用の git 実行。失敗時は throw し、呼び出し元が fail-closed に扱う。 */
+function runGitForVerification(workingDir: string, argv: readonly string[]): string {
+  return execFileSync('git', argv, {
+    cwd: workingDir,
+    encoding: 'utf-8',
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: GIT_TIMEOUT_MS,
+  })
+}
+
+/**
+ * `git status` では表に出ない状態変化の前提崩れを検出する。
+ *
+ * - `core.filemode=false`: exec-bit の変化が status に出ないため、mode 比較が無意味になる。
+ * - `assume-unchanged` / `skip-worktree`: 当該 path の変更が status に出ない。
+ *   `git ls-files -v` は通常の tracked file を大文字（H 等）、これらを小文字
+ *   （h/s/m 等）で報告するため、小文字タグの存在で検出する。
+ *
+ * ignored file（.gitignore 対象）は PR-C の workspace 同一性の対象外とする。
+ * これは意図的な境界であり、見落としではない。
+ *
+ * 検出できない/コマンドが失敗した場合も fail-closed 側（理由を返す）に倒す。
+ */
+function detectUnreportableWorkspaceState(workingDir: string): string | undefined {
+  let filemode: string
+  try {
+    filemode = runGitForVerification(workingDir, ['config', '--type=bool', '--default', 'true', '--get', 'core.filemode'])
+  } catch (err: unknown) {
+    return `could not read core.filemode (${err instanceof Error ? err.message : String(err)})`
+  }
+  if (filemode.trim() !== 'true') {
+    return 'core.filemode is not true, so executable-bit changes are invisible to git status'
+  }
+
+  let lsFiles: string
+  try {
+    lsFiles = runGitForVerification(workingDir, ['ls-files', '-v'])
+  } catch (err: unknown) {
+    return `could not enumerate index flags (${err instanceof Error ? err.message : String(err)})`
+  }
+  const flagged: string[] = []
+  for (const line of lsFiles.split(/\r?\n/)) {
+    if (line === '') continue
+    const tag = line[0]
+    // 小文字タグ = assume-unchanged / skip-worktree 等
+    if (tag >= "a" && tag <= "z") {
+      flagged.push(line.slice(2))
+      if (flagged.length >= 5) break
+    }
+  }
+  if (flagged.length > 0) {
+    return `paths marked assume-unchanged/skip-worktree are invisible to git status (${flagged.join(', ')})`
+  }
+
+  return undefined
 }

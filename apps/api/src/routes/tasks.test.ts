@@ -821,6 +821,36 @@ describe('Task API', () => {
   })
 
   describe('POST /api/tasks/:id/resume', () => {
+    it('rejects resume with 409 while the Task workspace is quarantined (fail-closed)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const job = await createJob(app, task)
+        await updateJob(app, job.id, { status: 'running' })
+
+        const quarantine = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}/fail-if-running`,
+          payload: {
+            workspaceVerified: false,
+            stderr: 'crash without verification',
+            completedAt: '2026-08-08T01:02:03.000Z',
+            quarantineReason: 'workspace dirty after crash',
+          },
+        })
+        expect(quarantine.statusCode).toBe(200)
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'try again please' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ error: string }>(res.body).error).toBe('Cannot resume: workspace dirty after crash')
+      })
+    })
+
     it('creates a queued job from the latest blocked job and keeps the blocked job unchanged', async () => {
       await withApp(async (app) => {
         const project = await createProject(app)

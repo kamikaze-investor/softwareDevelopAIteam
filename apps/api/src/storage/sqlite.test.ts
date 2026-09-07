@@ -1877,7 +1877,7 @@ describe('SQLiteStorage', () => {
         expect(first.ok).toBe(true)
         if (first.ok) {
           expect(first.updated).toBe(true)
-          expect(first.currentStatus).toBe('failed')
+          expect(first.currentStatus).toBe('blocked')
         }
         expect(storage.designReviewRuns.findActiveByTaskId(taskId)).toBeDefined()
 
@@ -1891,12 +1891,58 @@ describe('SQLiteStorage', () => {
         if (second.ok) {
           expect(second.deduplicated).toBe(true)
           expect(second.job.id).toBe(job.id)
-          expect(second.job.status).toBe('failed')
+          expect(second.job.status).toBe('blocked')
         }
         // 2本目の repair intent は作られない
         expect(storage.designReviewRuns.findQueued()).toHaveLength(1)
         expect(storage.tasks.findById(taskId)?.status).toBe('pending')
       })
+      it('verified-safe with a queued repair keeps the source Job blocked (ownership retained until the repair Job materializes)', () => {
+        const job = createRunningJob()
+
+        const result = storage.jobs.failAndPrepareRepair({
+          jobId: job.id,
+          failure: { stderr: 'build error', completedAt: '2026-08-08T01:02:03.000Z' },
+          workspaceVerified: true,
+        })
+
+        expect(result).toMatchObject({ ok: true, updated: true, currentStatus: 'blocked', quarantined: false })
+        if (result.ok) {
+          expect(result.job.status).toBe('blocked')
+          expect(result.job.failureMetadata?.quarantined).toBeUndefined()
+        }
+        // 所有権を保持しつつ、repair intent（queued design_review_run）は同一transactionで永続化される
+        expect(storage.designReviewRuns.findActiveByTaskId(taskId)).toBeDefined()
+        expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+      })
+
+      it('refuses all transitions while a quarantined sibling exists (pre-transition guard, fail-closed)', () => {
+        const first = createRunningJob()
+        const quarantine = storage.jobs.failAndPrepareRepair({
+          jobId: first.id,
+          failure: { stderr: 'crash without verification', completedAt: '2026-08-08T01:02:03.000Z' },
+          workspaceVerified: false,
+          quarantineReason: 'workspace dirty after crash',
+        })
+        expect(quarantine.ok).toBe(true)
+        if (quarantine.ok) expect(quarantine.currentStatus).toBe('blocked')
+
+        const second = createRunningJob()
+        const refused = storage.jobs.failAndPrepareRepair({
+          jobId: second.id,
+          failure: { stderr: 'should not land', completedAt: '2026-08-08T01:02:03.000Z' },
+          workspaceVerified: true,
+        })
+
+        expect(refused.ok).toBe(false)
+        if (!refused.ok) expect(refused.code).toBe('WORKSPACE_QUARANTINED')
+        // 副作用ゼロ: Job は running のまま（stderr 未保存）、Task は blocked のまま、run は作られない
+        expect(storage.jobs.findById(second.id)?.status).toBe('running')
+        expect(storage.jobs.findById(second.id)?.stderr).toBeUndefined()
+        expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+        expect(storage.designReviewRuns.findQueued()).toEqual([])
+      })
+
     })
 
     it('enforces one Job per non-NULL approval_id with the unique index', () => {

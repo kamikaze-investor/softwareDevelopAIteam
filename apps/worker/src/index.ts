@@ -366,13 +366,48 @@ async function confirmRunningTransition(
   if (!baseline.ok) {
     const message = `workspace baseline failure: ${baseline.reason}`
     console.error(`[Worker] Job ${job.id} の開始を停止します: ${message}`)
-    // queued -> failed は Worker FSM 上には無い遷移のため assertTransition は通さない。
-    // API 側の Result State Application Policy は queued からの terminal 直行を許可しており、
-    // この PATCH は受理される。Outbox-durable な既存 terminal 経路で永続化する。
-    const failedPayload: JobUpdate = {
-      status: 'failed',
-      stderr: message,
-      completedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    // 独立レビュー指摘（PR-C）: baseline を作れなかったということは workspace の状態を
+    // 特定できないということ。ここで `failed` にすると、既に workspace を所有している
+    // Job（repair/resume/retry のような initial-implement 以外の queued Job）の所有権を
+    // 「検証できていない workspace」に対して解放してしまう。これは PR-C の hard invariant
+    // （安全と証明できない限り所有権を解放しない）に反するため、所有している場合は
+    // quarantine 付きの `blocked` へ fail closed し、所有権を保持する。
+    // initial-implement Job はまだ workspace を所有していないので従来どおり `failed`。
+    const ownsWorkspaceBeforeClaim = !isInitialImplementStepKey(job.taskId, job.workflowStepKey)
+    const now = (dependencies.now ?? (() => new Date().toISOString()))()
+    const failedPayload: JobUpdate = ownsWorkspaceBeforeClaim
+      ? {
+          status: 'blocked',
+          stderr: `${message} (workspace quarantined; ownership retained)`,
+          completedAt: now,
+          failureMetadata: {
+            kind: 'workspace_baseline_failure',
+            workspaceState: 'unknown',
+            quarantined: true,
+            quarantineReason: message,
+          },
+        }
+      : {
+          status: 'failed',
+          stderr: message,
+          completedAt: now,
+        }
+    if (ownsWorkspaceBeforeClaim) {
+      await (dependencies.alert ?? sendAlert)({
+        severity: 'critical',
+        title: 'Workspace quarantined before Job start',
+        body: [
+          `Job ID: ${job.id}`,
+          `Task ID: ${job.taskId}`,
+          `理由: ${baseline.reason}`,
+          "workspace の状態を特定できないため Job を blocked にし、workspace 所有権を保持しました。",
+          "reconciliation が成功するまで resume / repair / 新規 claim は拒否されます。",
+        ].join('\n'),
+        sourceType: 'job_persistence',
+        sourceId: job.id,
+      }).catch((err: unknown) => {
+        console.error(`[Worker] CRITICAL通知エラー: ${err instanceof Error ? err.message : String(err)}`)
+      })
     }
     await persistTerminalUpdate(job.id, failedPayload, dependencies)
     return false

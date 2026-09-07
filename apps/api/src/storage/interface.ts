@@ -86,7 +86,7 @@ export type FailAndPrepareRepairResult =
     }
   | {
       ok: false
-      code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
+      code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'WORKSPACE_QUARANTINED' | 'STORAGE_ERROR'
       reason: string
     }
 

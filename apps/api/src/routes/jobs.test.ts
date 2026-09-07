@@ -1012,7 +1012,7 @@ describe('Job API', () => {
     })
   })
 
-  it('PATCH /api/jobs/:id/fail-if-running changes running to failed', async () => {
+  it('PATCH /api/jobs/:id/fail-if-running changes running to blocked when a repair is queued', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
       const task = await createTask(app, project.id)
@@ -1033,6 +1033,7 @@ describe('Job API', () => {
         },
       })
 
+      // F8: verified でも queue intent が作られた場合、所有権は解放せず blocked に保つ。
       expect(res.statusCode).toBe(200)
       expect(parseBody<{
         updated: boolean
@@ -1040,10 +1041,10 @@ describe('Job API', () => {
         job: Job
       }>(res.body)).toMatchObject({
         updated: true,
-        currentStatus: 'failed',
+        currentStatus: 'blocked',
         job: {
           id: created.id,
-          status: 'failed',
+          status: 'blocked',
           stderr: 'technical failure',
           completedAt: '2026-08-08T01:02:03.000Z',
         },
@@ -1097,6 +1098,53 @@ describe('Job API', () => {
 
       expect(res.statusCode).toBe(404)
       expect(parseBody<{ error: string }>(res.body).error).toBe('Job not found')
+    })
+  })
+
+  it('PATCH /api/jobs/:id/fail-if-running returns 409 while the Task workspace is quarantined', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const first = await createJob(app, task)
+      await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${first.id}`,
+        payload: { status: 'running' },
+      })
+
+      const quarantine = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${first.id}/fail-if-running`,
+        payload: {
+          workspaceVerified: false,
+          stderr: 'crash without verification',
+          completedAt: '2026-08-08T01:02:03.000Z',
+        },
+      })
+      expect(quarantine.statusCode).toBe(200)
+      expect(parseBody<{ currentStatus: Job['status'] }>(quarantine.body).currentStatus).toBe('blocked')
+
+      const second = await createJob(app, task)
+      await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${second.id}`,
+        payload: { status: 'running' },
+      })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${second.id}/fail-if-running`,
+        payload: {
+          workspaceVerified: true,
+          stderr: 'should be refused',
+          completedAt: '2026-08-08T01:02:03.000Z',
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('quarantined')
+      const fetched = await app.inject({ method: 'GET', url: `/api/jobs/${second.id}` })
+      expect(parseBody<Job>(fetched.body)).toMatchObject({ status: 'running' })
     })
   })
 

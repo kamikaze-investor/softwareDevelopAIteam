@@ -57,7 +57,13 @@ describe('detectGitOperationState', () => {
     ['rebase-merge/', 'rebase-merge/dummy', 'rebase-merge'],
     ['rebase-apply/', 'rebase-apply/dummy', 'rebase-apply'],
     ['sequencer/', 'sequencer/dummy', 'sequencer'],
-  ])('マーカー %s を検出する', (_label, markerPath, operation) => {
+
+    // 独立レビュー指摘（PR-C）: HEAD も worktree も変えずに残り得るマーカー群。
+    // 見落とすと「変化なし」と誤判定して ownership を解放してしまう。
+    ['BISECT_START', 'BISECT_START', 'bisect'],
+    ['HEAD.lock', 'HEAD.lock', 'head.lock'],
+    ['packed-refs.lock', 'packed-refs.lock', 'packed-refs.lock'],
+    ['shallow.lock', 'shallow.lock', 'shallow.lock'],  ])('マーカー %s を検出する', (_label, markerPath, operation) => {
     writeMarker(markerPath)
 
     expect(detectGitOperationState(repo)).toContain(operation)
