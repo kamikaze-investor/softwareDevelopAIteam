@@ -8,7 +8,7 @@
  * MVP-Aの正規workingDir（/workspace/target固定）をサーバー側で設定する。
  */
 
-import type { ApprovalRequest, Job, Task } from '@ai-team/shared'
+import type { ApprovalRequest, Job, Task, WatchdogEvent } from '@ai-team/shared'
 
 export function parseDateTime(value: string): number {
   const time = Date.parse(value)
@@ -41,6 +41,77 @@ export function findLinkedApproval(
 ): ApprovalRequest | undefined {
   if (!job?.approvalId) return undefined
   return approvalRequests.find(request => request.id === job.approvalId)
+}
+
+/**
+ * MOB-001: CEO が見分けられる必要のある実行状態。
+ *
+ * 新しい status 体系は作らない。すべて既存の状態（Job.status /
+ * failureMetadata.quarantined / WatchdogEvent / approval state）から導出する。
+ */
+export type JobDisplayState =
+  | 'running_healthy'      // 実行中で、watchdog は stall と確認していない
+  | 'running_stalled'      // 実行中だが watchdog が stall と確認した
+  | 'quarantined'          // workspace の安全性が証明できず所有権を保持している
+  | 'approval_waiting'     // CEO の承認待ち
+  | 'blocked'              // その他の停止（Guard 違反等）
+  | 'other'                // success / failed / queued 等
+
+/**
+ * MOB-001: quarantine されているか。
+ *
+ * P1 Phase 2 以降、`blocked` には意味の異なる2種類が混ざる:
+ *   - 承認待ち・Guard 違反 → 人間が判断すれば前に進む
+ *   - quarantine → workspace の状態が確認できないので所有権を保持している。
+ *     人間が「承認」しても前に進まない。reconciliation / clearance が要る
+ * この2つを同じ「停止中」として見せると、CEO は誤った操作へ誘導される。
+ */
+export function isQuarantined(job: Job | undefined): boolean {
+  return job?.status === 'blocked' && job.failureMetadata?.quarantined === true
+}
+
+/**
+ * MOB-001: watchdog が「本当に stall している」と確認したか。
+ * 検出しただけ（detected / analyzing）や誤検知（false_alarm）は含めない。
+ * `isStuck === false` と明示された誤検知は、確認済みでも stall とみなさない。
+ */
+export function isWatchdogConfirmedStalled(
+  job: Job | undefined,
+  watchdogEvents: WatchdogEvent[],
+): boolean {
+  if (job === undefined || job.status !== 'running') return false
+  return watchdogEvents.some((event) => (
+    event.jobId === job.id &&
+    // 同じ Job の**この実行**に対する event だけを見る（DB-007 の episode key と同じ考え方）。
+    // 過去の実行で stall した記録を、復帰後の健全な実行へ引きずらない。
+    event.startedAt === job.startedAt &&
+    event.isStuck === true &&
+    event.status !== 'false_alarm' &&
+    event.status !== 'resolved'
+  ))
+}
+
+/**
+ * MOB-001: 表示すべき状態を既存データだけから導出する。
+ * 優先順位は「CEO が取るべき行動が変わる順」。quarantine は承認では解けないので
+ * approval よりも先に判定する。
+ */
+export function deriveJobDisplayState(
+  job: Job | undefined,
+  approvalRequests: ApprovalRequest[],
+  watchdogEvents: WatchdogEvent[] = [],
+): JobDisplayState {
+  if (job === undefined) return 'other'
+  if (isQuarantined(job)) return 'quarantined'
+  if (job.status === 'running') {
+    return isWatchdogConfirmedStalled(job, watchdogEvents) ? 'running_stalled' : 'running_healthy'
+  }
+  if (job.status === 'blocked') {
+    return findLinkedApproval(job, approvalRequests)?.status === 'WAITING_FOR_USER'
+      ? 'approval_waiting'
+      : 'blocked'
+  }
+  return 'other'
 }
 
 export function hasWaitingLinkedApproval(
@@ -113,6 +184,14 @@ export function canShowResumeUI(
   approvalRequests: ApprovalRequest[],
 ): boolean {
   const latestJob = sortJobsByNewestFirst(jobs)[0]
+
+  // MOB-001 / P1 Phase 2: quarantine は resume で解けない。
+  // workspace の状態を確認できていないから所有権を保持しているのであって、
+  // 追加指示を出しても API 側の quarantine guard が claim を拒否する。
+  // ここで resume UI を出すと、CEO を「押しても失敗する操作」へ誘導することになる。
+  if (isQuarantined(latestJob)) {
+    return false
+  }
 
   const isJobDirectlyBlocked = latestJob?.status === 'blocked'
   const isEscalatedFailure = task.status === 'blocked' && latestJob?.status === 'failed'
