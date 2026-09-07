@@ -2114,6 +2114,49 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `codex-sandbox-off-deprecated-landlock`側で行う。適用範囲を広げる変更は
    既存production reviewerの挙動を変えるため、独立した変更として扱いCEO承認を得ること。
 
+<!-- roadmap:id=pl-review-process-supervision state=planned priority=high -->
+0. [ ] **長時間AI review/implementationをsession依存のbackground processで走らせない**
+   （2026-09-08登録、**高優先度**。CEO判断: 運用上の欠陥として扱う）。
+
+   **発生事象**: PR #108のCodex independent reviewを、PL作業として
+   `ssh <host> "codex exec ..."` の単純background processで起動した。
+   Bash toolのtimeoutでssh sessionがbackgroundへ回された時点で子processごと死亡し、
+   出力は0 byteのまま残った。**誰も異常を検知せず、CEOの進捗確認で初めて発覚した。**
+   「出力が返るまで放置」する運用そのものが原因である。
+
+   **read-only調査の結果、必要な不変条件はすでにproduction側に存在する**
+   （新しいqueue/daemonを作る必要は無く、再利用が正しい）:
+
+   - 実行状態の追跡 … `design_review_runs`（status / started_at / attempt_count / claim_token）
+   - session非依存 … `executeRunner()`はAPI processがspawnし、client接続に紐づかない
+   - process消失の自動検知 … `executeRunner()`はchildのclose/exitでsettleし、
+     timeout時はSIGTERM→SIGKILLへ昇格する（`designReviewCoordinator.ts:308-366`）
+   - verdict無しの終了を成功扱いしない … 非0 exit / parse失敗は`REVIEW_UNAVAILABLE`へ倒れ、
+     ALIGNEDにはならない（fail-closed）
+   - bounded retry … `DESIGN_REVIEW_MAX_ATTEMPTS = 3` + requeue
+   - 二重採用の防止 … `claim_token` によるstale completion fencing
+   - API crash後の回収 … `recoverStaleRunningAtStartup()`
+   - 失敗分類 … `geminiRouter.ts:152/155` のretryable / config-error 正規表現
+
+   **不足している点**:
+
+   1. **quota/usage limitのsignatureが分類器に無い**。`geminiRouter.ts:152`は
+      408/500/502/503/504とnetwork系のみで、429や`usage limit` / `try again at` を
+      拾わない。今回実際に踏んだ失敗モードが未分類のまま落ちる。
+   2. **PL作業（ad-hoc provider review）がこの機構の外にある**。run行も無く、retryも無く、
+      verdict有無の検査も無い。今回の欠陥はここに集中している。
+
+   **方針**: 新しいqueue/daemonを作らない。PL側review用に、
+   `setsid`によるsession非依存起動 + 実行状態ファイル（pid/開始/終了/exit code）+
+   **明示的な`VERDICT:`行が無ければ完了扱いしない**検査 + 上記分類器の再利用
+   （quota signatureを追加）+ bounded retry、を薄いwrapperとして用意する。
+   将来的にはPL reviewにも`design_review_runs`の行を持たせ、
+   claim_token fencingをそのまま継承させるのが筋。
+
+   **暫定運用ルール（即時適用）**: 数分以上かかるAI review/implementation/analysisを
+   単純なbackground processへ投げて放置しない。最低でも
+   **session非依存実行 + 明示的なliveness確認**をセットにする。
+
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
    **高優先度**。CEO判断: PR Cでは`use_legacy_landlock`を暫定的な安全経路としてのみ使用し、
