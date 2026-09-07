@@ -435,6 +435,9 @@ export async function taskRoutes(
     }
 
     if (!resumed.ok) {
+      if (resumed.code === 'WORKSPACE_QUARANTINED') {
+        return reply.status(409).send({ error: resumed.reason })
+      }
       return reply.status(400).send({ error: resumed.reason })
     }
 

@@ -22,7 +22,7 @@ import type {
   ReconcileRunningFailure,
   ReconcileRunningJobResult,
 } from './jobStateManager.js'
-import { runJob } from './jobRunner.js'
+import { runJob, computeWorkspaceBaseline } from './jobRunner.js'
 import type { StructuredReviewContext } from './jobRunner.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
@@ -54,6 +54,7 @@ export type JobUpdate = Partial<Pick<
   | 'commitHash'
   | 'guardResult'
   | 'failureMetadata'
+  | 'workspaceBaseline'
 >> & {
   reviewResult?: Pick<ReviewResult, 'status' | 'summary' | 'findings'>
 }
@@ -353,9 +354,69 @@ async function confirmRunningTransition(
   dependencies: JobPersistenceDependencies,
 ): Promise<boolean> {
   assertTransition(job.status, 'running')
+
+  // ── PR-C: claim（queued -> running）と workspace baseline を同一 PATCH で原子化する ──
+  // baseline は Job の子プロセスが workspace を変更し得る**前**に durable に保存しなければ
+  // ならない。ここで Job はまだ queued であり、initial-implement 以外の queued Job は
+  // findWorkspaceOwningTaskId() により該当 Task が workspace を保有している扱いになる。
+  // Worker は systemd の flock で単一インスタンス化され、poll loop も単一スレッドのため、
+  // baseline 計算と claim の間に他 Task が workspace を奪うことは無い。
+  // baseline 取得に失敗したら claim せず fail-closed で failed へ落とす（子プロセスを起動しない）。
+  const baseline = computeWorkspaceBaseline(job, job.safeCommand.workingDir)
+  if (!baseline.ok) {
+    const message = `workspace baseline failure: ${baseline.reason}`
+    console.error(`[Worker] Job ${job.id} の開始を停止します: ${message}`)
+    // 独立レビュー指摘（PR-C）: baseline を作れなかったということは workspace の状態を
+    // 特定できないということ。ここで `failed` にすると、既に workspace を所有している
+    // Job（repair/resume/retry のような initial-implement 以外の queued Job）の所有権を
+    // 「検証できていない workspace」に対して解放してしまう。これは PR-C の hard invariant
+    // （安全と証明できない限り所有権を解放しない）に反するため、所有している場合は
+    // quarantine 付きの `blocked` へ fail closed し、所有権を保持する。
+    // initial-implement Job はまだ workspace を所有していないので従来どおり `failed`。
+    const ownsWorkspaceBeforeClaim = !isInitialImplementStepKey(job.taskId, job.workflowStepKey)
+    const now = (dependencies.now ?? (() => new Date().toISOString()))()
+    const failedPayload: JobUpdate = ownsWorkspaceBeforeClaim
+      ? {
+          status: 'blocked',
+          stderr: `${message} (workspace quarantined; ownership retained)`,
+          completedAt: now,
+          failureMetadata: {
+            kind: 'workspace_baseline_failure',
+            workspaceState: 'unknown',
+            quarantined: true,
+            quarantineReason: message,
+          },
+        }
+      : {
+          status: 'failed',
+          stderr: message,
+          completedAt: now,
+        }
+    if (ownsWorkspaceBeforeClaim) {
+      await (dependencies.alert ?? sendAlert)({
+        severity: 'critical',
+        title: 'Workspace quarantined before Job start',
+        body: [
+          `Job ID: ${job.id}`,
+          `Task ID: ${job.taskId}`,
+          `理由: ${baseline.reason}`,
+          "workspace の状態を特定できないため Job を blocked にし、workspace 所有権を保持しました。",
+          "reconciliation が成功するまで resume / repair / 新規 claim は拒否されます。",
+        ].join('\n'),
+        sourceType: 'job_persistence',
+        sourceId: job.id,
+      }).catch((err: unknown) => {
+        console.error(`[Worker] CRITICAL通知エラー: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
+    await persistTerminalUpdate(job.id, failedPayload, dependencies)
+    return false
+  }
+
   const runningPayload: JobUpdate = {
     status: 'running',
     startedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
+    workspaceBaseline: baseline.baseline,
   }
   const confirmed = await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload)
   if (confirmed) return true

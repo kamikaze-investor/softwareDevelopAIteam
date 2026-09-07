@@ -15,7 +15,7 @@ import {
   canApplyJobResultStatus,
   describeApplicableJobStatuses,
 } from '../jobResultApplicationPolicy'
-import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from '../designReview/repairFlow'
+import { escalateTaskToHuman, executeQueuedRepair, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import { REPAIR_STEP_PREFIX } from '../designReview/repairPolicy'
 import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
 import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
@@ -134,13 +134,128 @@ const UpdateJobBody = z.object({
   failureMetadata: z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
+    // Worker が正当に送る quarantine payload を API が 400 で弾き、
+    // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
+    quarantined: z.boolean().optional(),
+    quarantineReason: z.string().optional(),
+    quarantineClearedAt: z.string().optional(),
+    quarantineClearedReason: z.string().optional(),
   }).strict().optional(),
+  workspaceBaseline: z.discriminatedUnion('mode', [
+    z.object({
+      mode: z.literal('clean'),
+      startCommitHash: z.string(),
+    }).strict(),
+    z.object({
+      mode: z.literal('dirty'),
+      startCommitHash: z.string(),
+      entries: z.array(z.object({
+        path: z.string(),
+        oldPath: z.string().optional(),
+        kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+        xyStatus: z.string().optional(),
+        beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        beforeMode: z.string().optional(),
+        afterMode: z.string().optional(),
+        headHash: z.string().optional(),
+        indexHash: z.string().optional(),
+        worktreeHash: z.string(),
+      })),
+    }).strict(),
+  ]).optional(),
   reviewResult: StructuredReviewResultSchema.optional(),
 }).strict()
 
 const FailIfRunningJobBody = z.object({
   stderr: z.string(),
   completedAt: z.string(),
+  /**
+   * PR-C Tranche 3: caller が workspace を「クリーン」と検証したか。
+   * true のときのみ Job を `failed`（所有権解放）にできる。
+   * 省略時は false（fail-closed: quarantine / blocked し、所有権を保持する）。
+   */
+  workspaceVerified: z.boolean().optional(),
+  /** caller が検証できない場合の quarantine 理由（省略時は既定メッセージ）。 */
+  quarantineReason: z.string().optional(),
+  failureMetadata: z.object({
+    kind: z.string().optional(),
+    workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
+    // Worker が正当に送る quarantine payload を API が 400 で弾き、
+    // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
+    quarantined: z.boolean().optional(),
+    quarantineReason: z.string().optional(),
+    quarantineClearedAt: z.string().optional(),
+    quarantineClearedReason: z.string().optional(),
+  }).strict().optional(),
+  eventId: z.string().min(1).optional(),
+  payloadHash: z.string().min(1).optional(),
+}).strict()
+
+/**
+ * PR-C finding 14 修復 (BLOCKER B): quarantine 解除（clearance）のボディ。
+ *
+ * `workspaceVerified` のような**自己申告ブールは無い**。代わりに Worker が今この瞬間に
+ * 観測した `observation`（`JobWorkspaceBaseline` 形式）と、baseline が無い場合に
+ * required な構造的事実 `knownGood` を提示する。どちらか一方でも欠けたら 400 で拒否
+ * （bypass / force / admin 経路は存在しない）。
+ *
+ * サーバーは storage transaction 内で observation を**自ら再検証**する:
+ *   - baseline 有り → observation と完全一致
+ *   - baseline 無し → knownGood が全て成立し、かつ observation.mode==='clean'
+ * 検証に失敗すれば quarantine は維持される。
+ *
+ * **Trust boundary（CEO判断 2026-09、B5 = ACCEPTED_TRUST_BOUNDARY）**:
+ * APIは設計上 workspace filesystem へ直接アクセスしない。したがって observation /
+ * knownGood が「実際に観測されたものか」をAPI自身が証明することはできない。これは
+ * clearance固有の話ではなく、changed files / commit hash / guard result / workspace
+ * verification など、実行環境の事実は既にすべて Worker 報告を信頼している既存モデルと
+ * 同じである。よってPR-Cでは **Worker を trust boundary 内の trusted component として
+ * 扱い**、Worker が検証を実行し結果を報告する、という前提を明示的に採用する。
+ * clearance だけを unforgeable にしても他の workspace fact は同じ trust model のまま
+ * 残るため、新しい filesystem verifier や attestation 機構は追加しない。
+ * 代わりに次を維持する: clearance要求は既存のWorker credential / allowlist経路のみ
+ * （`auth/workerAllowlist.ts`）／baselineがある場合はAPI側でも可能な整合チェックを行う／
+ * Worker側は検証成功後にのみ要求する（`jobStateManager.ts`）／client・mobile等の一般
+ * callerが任意のbooleanでclearできる経路は作らない／検証失敗時はquarantineを維持する。
+ */
+const ClearQuarantineJobBody = z.object({
+  /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
+  observation: z.discriminatedUnion('mode', [
+    z.object({
+      mode: z.literal('clean'),
+      startCommitHash: z.string(),
+    }).strict(),
+    z.object({
+      mode: z.literal('dirty'),
+      startCommitHash: z.string(),
+      entries: z.array(z.object({
+        path: z.string(),
+        oldPath: z.string().optional(),
+        kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+        xyStatus: z.string().optional(),
+        beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+        beforeMode: z.string().optional(),
+        afterMode: z.string().optional(),
+        headHash: z.string().optional(),
+        indexHash: z.string().optional(),
+        worktreeHash: z.string(),
+      })),
+    }).strict(),
+  ]),
+  /** baseline が無い場合に required な構造的事実。 */
+  knownGood: z.object({
+    gitOperationMarkers: z.array(z.string()),
+    worktreeClean: z.boolean(),
+    indexClean: z.boolean(),
+    headValid: z.boolean(),
+    blindSpotsAbsent: z.boolean(),
+  }),
+  /** 解除理由（startup recovery で baseline と一致、等）。failure_metadata に記録される。 */
+  quarantineClearedReason: z.string().optional(),
 }).strict()
 
 const ListQuerySchema = z.object({
@@ -235,7 +350,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Task not found' })
     }
 
-    return reply.send(storage.jobs.findByTaskId(query.data.taskId))
+    const jobs = storage.jobs.findByTaskId(query.data.taskId)
+
+    // PR-C Tranche 3: quarantine された workspace の Job をclaim可能な仕事として渡さない。
+    // Worker（fetchQueuedJob）はこのGETから `status==='queued'` を選ぶため、
+    // quarantine 中は queued Job を除外して、未検証 workspace へ新しい作業を割り当てない。
+    if (isWorkspaceQuarantined(jobs)) {
+      return reply.send(jobs.filter((job) => job.status !== 'queued'))
+    }
+
+    return reply.send(jobs)
   })
 
   app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {
@@ -295,15 +419,90 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
-    const transition = storage.jobs.failIfRunning(req.params.id, result.data)
+    const { eventId, payloadHash, quarantineReason, failureMetadata, ...failure } = result.data
+    // 省略時は fail-closed（workspace 未検証 → quarantine）。
+    const workspaceVerified = result.data.workspaceVerified === true
+    const outboxPayload: Record<string, unknown> = { ...failure, workspaceVerified, ...(quarantineReason ? { quarantineReason } : {}), ...(failureMetadata ? { failureMetadata } : {}) }
+    const outboxCheck = buildOutboxEvent(eventId, payloadHash, outboxPayload)
+    if (!outboxCheck.ok) {
+      return reply.status(outboxCheck.statusCode).send({ error: outboxCheck.error })
+    }
+
+    const transition = storage.jobs.failAndPrepareRepair({
+      jobId: req.params.id,
+      failure,
+      workspaceVerified,
+      quarantineReason,
+      failureMetadata,
+      outboxEvent: outboxCheck.outboxEvent,
+    })
     if (!transition.ok) {
+      if (transition.code === 'OUTBOX_HASH_MISMATCH') {
+        return reply.status(409).send({ error: transition.reason })
+      }
+      if (transition.code === 'WORKSPACE_QUARANTINED') {
+        return reply.status(409).send({ error: transition.reason })
+      }
+
+      // PR-C: storage失敗を404（Job not found）へ丸めない。丸めると復旧側は
+      // 「対象が無い」と解釈して打ち切り、workspaceを所有したままの running Job が
+      // 放置される（silent ownership retention）。not-found と technical failure を
+      // 分離し、後者は 500 で fail-closed かつ観測可能にする。
+      if (transition.code === 'STORAGE_ERROR') {
+        req.log.error({ jobId: req.params.id, reason: transition.reason }, 'fail-if-running storage failure')
+        return reply.status(500).send({ error: transition.reason })
+      }
+      return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    const body: Record<string, unknown> = {
+      updated: transition.updated,
+      currentStatus: transition.currentStatus,
+      job: transition.job,
+      quarantined: transition.quarantined,
+    }
+    if (transition.deduplicated === true && outboxCheck.outboxEvent) {
+      body.outbox = { eventId: outboxCheck.outboxEvent.eventId, deduplicated: true }
+    }
+    return reply.send(body)
+  })
+
+  // PR-C finding 14 修復 (BLOCKER B): quarantine 解除（clearance）。
+  // 解除は「成功した workspace 検証の**観測**の提示 + サーバーによる再検証」なしには
+  // 成立しない（ClearQuarantineJobBody が observation / knownGood を必須化）。
+  // 人力・force・admin による無条件解除経路は無い。
+  app.patch<{ Params: { id: string } }>('/:id/clear-quarantine', async (req, reply) => {
+    const result = ClearQuarantineJobBody.safeParse(req.body)
+    if (!result.success) {
+      // observation / knownGood の提示が無い限り拒否。無条件・無検証の解除経路を作らない。
+      return reply.status(400).send({
+        error: 'Clearance requires an observed workspace baseline (observation) and known-good facts (knownGood)',
+        details: result.error.format(),
+      })
+    }
+
+    const transition = storage.jobs.clearWorkspaceQuarantine({
+      jobId: req.params.id,
+      observation: result.data.observation,
+      knownGood: result.data.knownGood,
+      reason: result.data.quarantineClearedReason,
+    })
+    if (!transition.ok) {
+      if (transition.code === 'STORAGE_ERROR') {
+        req.log.error({ jobId: req.params.id, reason: transition.reason }, 'clear-quarantine storage failure')
+        return reply.status(500).send({ error: transition.reason })
+      }
+      if (transition.code === 'VERIFICATION_FAILED') {
+        return reply.status(409).send({ error: transition.reason })
+      }
       return reply.status(404).send({ error: 'Job not found' })
     }
 
     return reply.send({
-      updated: transition.updated,
-      currentStatus: transition.currentStatus,
+      cleared: true,
       job: transition.job,
+      clearedJobCount: transition.clearedJobCount,
+      alreadyCleared: transition.alreadyCleared,
     })
   })
 

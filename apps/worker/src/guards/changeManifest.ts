@@ -41,6 +41,20 @@ export interface FileChange {
   /** commit tree 比較時の blob hash（内容変更の判別に使う） */
   beforeHash?: string
   afterHash?: string
+  /**
+   * porcelain v2 の HEAD object id（`buildWorktreeManifest` でのみ設定）。
+   * `beforeHash` は commit tree 比較（`buildCommitTreeManifest`）の意味を持つため、
+   * 意味を変えないよう別フィールドとして保持する（PR-C）。
+   */
+  headHash?: string
+  /** porcelain v2 の INDEX object id（`buildWorktreeManifest` でのみ設定）。同上 */
+  indexHash?: string
+  /**
+   * porcelain v2 の生の XY ステータス対（例: ' M' = unstaged modified、'M ' = staged、
+   * 'MM' = 両方）。index 側と worktree 側の区別を保つため、集約済みの `kind` は変えず
+   * この生値を追加で保持する（PR-C）。untracked ('?') レコードには XY が無いため未設定。
+   */
+  xyStatus?: string
 }
 
 export interface ChangeManifest {
@@ -94,6 +108,24 @@ function runGit(workingDir: string, argv: string[]): string {
   }
 }
 
+/** stdin へ入力を渡して git を実行する（--stdin-paths / --stdin 用）。repo を変更しない */
+function runGitWithInput(workingDir: string, argv: string[], input: string): string {
+  try {
+    return execFileSync('git', argv, {
+      cwd: workingDir,
+      shell: false,
+      encoding: 'utf-8',
+      timeout: GIT_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024,
+      input,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    throw new ChangeDetectionError(`git ${argv.join(' ')} failed in ${workingDir}: ${message}`)
+  }
+}
+
 /**
  * workingDir が「それ自身の git 作業ツリーのルート」であることを検証する。
  *
@@ -103,7 +135,7 @@ function runGit(workingDir: string, argv: string[]): string {
  * 実測でホーム配下の一時ディレクトリからホームのリポジトリが検出されたため、
  * 上位への遡りは明示的に拒否する。
  */
-function assertWorktreeRoot(workingDir: string): void {
+export function assertWorktreeRoot(workingDir: string): void {
   const toplevel = runGit(workingDir, ['rev-parse', '--show-toplevel']).trim()
   if (toplevel === '') {
     throw new ChangeDetectionError(`Not a git worktree: "${workingDir}"`)
@@ -315,6 +347,15 @@ function kindFromXY(x: string, y: string): ChangeKind {
  *   上記以外            → throw
  *   submodule (sub!=N)  → throw
  */
+/**
+ * porcelain v2 の object id は「存在しない」を全ゼロ（0000...）で表す。
+ * baseline 比較では `undefined`（不在）として扱いたいため正規化する。
+ */
+function normalizeObjectId(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined
+  return /^0+$/.test(raw) ? undefined : raw
+}
+
 export function buildWorktreeManifest(workingDir: string): ChangeManifest {
   assertWorktreeRoot(workingDir)
   const raw = runGit(workingDir, ['status', '--porcelain=v2', '-z', '--untracked-files=all'])
@@ -340,6 +381,9 @@ export function buildWorktreeManifest(workingDir: string): ChangeManifest {
         afterType: resolveAfterType(workingDir, filePath, kind, modeWorktree, modeIndex),
         beforeMode: modeHead === MODE_ABSENT ? undefined : modeHead,
         afterMode: afterModeOf(modeWorktree, modeIndex),
+        headHash: normalizeObjectId(fields[6]),
+        indexHash: normalizeObjectId(fields[7]),
+        xyStatus: xy,
       })
       continue
     }
@@ -370,6 +414,9 @@ export function buildWorktreeManifest(workingDir: string): ChangeManifest {
         afterType: resolveAfterType(workingDir, newPath, 'renamed', modeWorktree, modeIndex),
         beforeMode: modeHead === MODE_ABSENT ? undefined : modeHead,
         afterMode: afterModeOf(modeWorktree, modeIndex),
+        headHash: normalizeObjectId(fields[6]),
+        indexHash: normalizeObjectId(fields[7]),
+        xyStatus: fields[1],
       })
       continue
     }
@@ -429,6 +476,128 @@ function resolveAfterType(
   if (mode !== undefined) return entryTypeFromMode(mode)
 
   return lstatEntryType(workingDir, filePath)
+}
+
+// ────────────────────────────────────────────────────────────
+// working tree 内容 fingerprint（PR-C workspace baseline 用）
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 削除パス（worktree に内容が無いパス）を表す明示的な「不在」マーカー。
+ * blob object id は常に 40 文字の hex であるため、この値と衝突しない。
+ */
+export const FINGERPRINT_ABSENT = ':absent:'
+
+/**
+ * manifest の各エントリについて、worktree の**現内容**の blob object id を
+ * path をキーに返す（PR-C の dirty workspace baseline 用）。
+ *
+ * - worktree に内容があるエントリ（tracked の modified / added と untracked）
+ *   は `git hash-object` で内容 hash を計算する。
+ * - 削除パス（deleted、および rename の旧パス）は `FINGERPRINT_ABSENT` を入れる。
+ * - symlink は dereference せず、**リンク先文字列**を blob 化した hash を使う
+ *   （git が symlink を保存する際の blob 内容 == リンク先 text に一致する）。
+ * - 通常ファイルは `git hash-object --stdin-paths` の**1回のバッチ呼び出し**で
+ *   まとめて hash する。改行を含むパスのみ個別に hash する（--stdin-paths は
+ *   LF 区切りのため）。
+ *
+ * この関数は repo を変更しない（--stdin-paths / --stdin は -w を付けない限り
+ * object database へ書かない）。分類できない種別は fail-closed で throw する。
+ */
+export function fingerprintWorktreeEntries(
+  workingDir: string,
+  manifest: ChangeManifest,
+): Map<string, string> {
+  assertWorktreeRoot(workingDir)
+  const result = new Map<string, string>()
+
+  const batchForStdinPaths: string[] = []
+  const batchForSplitPaths: string[] = []
+
+  for (const change of manifest.changes) {
+    // rename は旧パス（不在）と新パス（worktree 内容）の両方を持つ
+    if (change.kind === 'renamed' && change.oldPath !== undefined) {
+      result.set(change.oldPath, FINGERPRINT_ABSENT)
+    }
+
+    if (change.kind === 'deleted') {
+      result.set(change.path, FINGERPRINT_ABSENT)
+      continue
+    }
+
+    collectFingerprintSource(change, batchForStdinPaths, batchForSplitPaths)
+  }
+
+  if (batchForStdinPaths.length > 0) {
+    const raw = runGitWithInput(
+      workingDir,
+      ['hash-object', '--stdin-paths'],
+      batchForStdinPaths.map((filePath) => `${filePath}\n`).join(''),
+    )
+    const hashes = raw.split(/\r?\n/).filter((line) => line !== '')
+    if (hashes.length !== batchForStdinPaths.length) {
+      throw new ChangeDetectionError(
+        `git hash-object --stdin-paths returned ${hashes.length} hashes for ` +
+          `${batchForStdinPaths.length} paths (fail-closed)`,
+      )
+    }
+    batchForStdinPaths.forEach((filePath, i) => result.set(filePath, hashes[i]))
+  }
+
+  for (const filePath of batchForSplitPaths) {
+    result.set(filePath, hashSinglePath(workingDir, filePath))
+  }
+
+  return result
+}
+
+/** fingerprint 対象の present エントリをバッチ/個別リストへ振り分ける */
+function collectFingerprintSource(
+  change: FileChange,
+  batchForStdinPaths: string[],
+  batchForSplitPaths: string[],
+): void {
+  if (change.afterType === 'symlink') {
+    // symlink は dereference せずリンク先文字列を hash するため個別処理へ
+    batchForSplitPaths.push(change.path)
+    return
+  }
+  if (change.afterType !== 'regular') {
+    throw new ChangeDetectionError(
+      `Cannot fingerprint "${change.path}" with afterType "${change.afterType ?? 'undefined'}" ` +
+        `(regular / symlink のみ対応。gitlink / special は fail-closed)`,
+    )
+  }
+  if (change.path.includes('\n') || change.path.includes('\r')) {
+    batchForSplitPaths.push(change.path)
+  } else {
+    batchForStdinPaths.push(change.path)
+  }
+}
+
+/** 単一パスの worktree 内容 hash。symlink はリンク先文字列を blob 化する */
+function hashSinglePath(workingDir: string, relativePath: string): string {
+  const absolute = resolveInsideWorktree(workingDir, relativePath)
+  if (lstatStatIsSymlink(absolute)) {
+    let target: string
+    try {
+      target = readlinkSync(absolute)
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err)
+      throw new ChangeDetectionError(`readlink failed for "${relativePath}": ${message}`)
+    }
+    return runGitWithInput(workingDir, ['hash-object', '--stdin'], target).trim()
+  }
+  return runGit(workingDir, ['hash-object', '--', relativePath]).trim()
+}
+
+function lstatStatIsSymlink(absolute: string): boolean {
+  try {
+    return lstatSync(absolute).isSymbolicLink()
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    throw new ChangeDetectionError(`lstat failed while fingerprinting "${absolute}": ${message}`)
+  }
 }
 
 // ────────────────────────────────────────────────────────────

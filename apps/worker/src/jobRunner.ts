@@ -15,6 +15,8 @@ import type {
   AiCliResult,
   Job,
   JobGuardResult,
+  JobWorkspaceBaseline,
+  JobWorkspaceBaselineEntry,
   PermissionBlockEvent,
   RollbackInfo,
   ApprovalLevelResult,
@@ -43,6 +45,7 @@ import { ALWAYS_FORBIDDEN_PATTERNS, fileChangeGuard } from './guards/fileChangeG
 import type { RuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import {
   ChangeDetectionError,
+  FINGERPRINT_ABSENT,
   assertIndexClean,
   assertIndexMatchesApproved,
   assertNoResidualChanges,
@@ -53,6 +56,7 @@ import {
   buildWorktreeManifest,
   captureReflogBaseline,
   diffSensitiveBaseline,
+  fingerprintWorktreeEntries,
   getCommitRangeDiffText,
   getWorktreeDiffText,
   manifestFromChanges,
@@ -61,6 +65,7 @@ import {
   stageApprovedPaths,
 } from './guards/changeManifest.js'
 import type { ApprovedFileState, ChangeManifest, ReflogBaseline, SensitiveBaseline } from './guards/changeManifest.js'
+import { detectGitOperationState } from './guards/gitOperationState.js'
 import { buildLogPreviews, saveJobLogs } from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
 import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
@@ -1650,6 +1655,137 @@ function getCommitHash(workingDir: string): string | undefined {
   } catch {
     return undefined
   }
+}
+
+export type WorkspaceBaselineResult =
+  | { ok: true; baseline: JobWorkspaceBaseline }
+  | { ok: false; reason: string }
+
+/**
+ * PR-C: Job の子プロセスを起動する**前**に workspace の durable baseline を計算する。
+ *
+ * - repo に対していかなる変更も行わない（read-only）。
+ * - 進行中の git 操作（index.lock / MERGE_HEAD / rebase-merge 等）が残っている workspace は
+ *   Job 種別によらず無効な開始状態として `ok:false` を返す（fail-closed）。中途半端な
+ *   操作を巻き込んだ baseline を記録すると、復旧時の完全一致比較が成立しなくなるため。
+ * - NORMAL Job はクリーンな worktree を要求し、変更が1つでもあれば `ok:false`（変更パスを
+ *   理由に含める）。
+ * - INTENTIONALLY-DIRTY Job（workflowStepKey が `repair:` / `resume:` / `retry:` で始まる
+ *   後続 Job）は、失敗した前 Job が残した dirty worktree を正統に引き継ぐため
+ *   クリーン要件を免除し、HEAD + dirty 内容の fingerprint を `mode:'dirty'` の baseline として
+ *   返す。worktree がたまたまクリーンな場合も `mode:'dirty'` + 空 `entries` を返して
+ *   復旧比較を完全一致に保つ。
+ *
+ * 検出エラーはすべて `ok:false` へ変換し、この関数自体は throw しない。
+ */
+export function computeWorkspaceBaseline(job: Job, workingDir: string): WorkspaceBaselineResult {
+  try {
+    // 進行中の git 操作は Job 種別に関係なく無効な開始状態（fail-closed）。
+    const gitOperations = detectGitOperationState(workingDir)
+    if (gitOperations.length > 0) {
+      return {
+        ok: false,
+        reason:
+          `workspace has an in-progress git operation (${gitOperations.join(', ')}); ` +
+          `cannot establish a durable baseline (fail-closed)`,
+      }
+    }
+
+    const startCommitHash = requireCommitHash(workingDir)
+    const manifest = buildWorktreeManifest(workingDir)
+
+    if (!isIntentionallyDirtyJob(job)) {
+      if (manifest.paths.length > 0) {
+        return {
+          ok: false,
+          reason:
+            `normal Job requires a clean worktree but found ${manifest.paths.length} changed ` +
+            `path(s): ${formatChangedFiles(manifest.paths)}`,
+        }
+      }
+      return { ok: true, baseline: { mode: 'clean', startCommitHash } }
+    }
+
+    const fingerprints = fingerprintWorktreeEntries(workingDir, manifest)
+    return {
+      ok: true,
+      baseline: {
+        mode: 'dirty',
+        startCommitHash,
+        entries: buildBaselineEntries(manifest, fingerprints),
+      },
+    }
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      reason: `workspace baseline could not be established: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    }
+  }
+}
+
+/**
+ * INTENTIONALLY-DIRTY Job の分類（PR-C）。
+ *
+ * `repair:` / `resume:` / `retry:` で始まる workflowStepKey は、失敗した前 Job（implement /
+ * repair 等）の後続として同一 Task の dirty worktree を正統に受け継ぐ Job である。
+ * aiCliMode はこの判定に使わない（`task:<id>:initial-implement` のような NORMAL Job も
+ * implement であり、dirty を受け継ぐ理由にならないため）。
+ */
+function isIntentionallyDirtyJob(job: Job): boolean {
+  const stepKey = job.workflowStepKey
+  return (
+    stepKey?.startsWith('repair:') === true ||
+    stepKey?.startsWith('resume:') === true ||
+    stepKey?.startsWith('retry:') === true
+  )
+}
+
+/**
+ * manifest の各変更を baseline entry へ変換する（PR-C）。
+ *
+ * - 各エントリの worktreeHash は fingerprint（現内容 hash）から充填する。
+ * - 削除パス・rename 元のパスは fingerprint どおり明示的な不在マーカー（`:absent:`）を
+ *   持ち、復旧時の完全一致比較から欠落しないよう、エントリとして残す。
+ * - rename は「rename 元（absent）」と「rename 先（現内容 hash）」の2エントリになる。
+ *
+ * PR-C Tranche 4: 復旧側（workspaceVerification）はこの正規化関数を再利用し、
+ * admission 側の baseline と**同一の** entry 表現で現在の dirty 状態を再構築する。
+ */
+export function buildBaselineEntries(
+  manifest: ChangeManifest,
+  fingerprints: Map<string, string>,
+): JobWorkspaceBaselineEntry[] {
+  const entries: JobWorkspaceBaselineEntry[] = []
+  for (const change of manifest.changes) {
+    if (change.kind === 'renamed' && change.oldPath !== undefined) {
+      entries.push({
+        path: change.oldPath,
+        kind: 'renamed',
+        xyStatus: change.xyStatus,
+        beforeType: change.beforeType,
+        beforeMode: change.beforeMode,
+        headHash: change.headHash,
+        indexHash: change.indexHash,
+        worktreeHash: fingerprints.get(change.oldPath) ?? FINGERPRINT_ABSENT,
+      })
+    }
+    entries.push({
+      path: change.path,
+      oldPath: change.kind === 'renamed' ? change.oldPath : undefined,
+      kind: change.kind,
+      xyStatus: change.xyStatus,
+      beforeType: change.beforeType,
+      afterType: change.afterType,
+      beforeMode: change.beforeMode,
+      afterMode: change.afterMode,
+      headHash: change.headHash,
+      indexHash: change.indexHash,
+      worktreeHash: fingerprints.get(change.path) ?? FINGERPRINT_ABSENT,
+    })
+  }
+  return entries
 }
 
 // getChangedFiles() / getPreGateDiffText() は削除した。

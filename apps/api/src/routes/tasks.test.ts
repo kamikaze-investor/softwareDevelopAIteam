@@ -821,6 +821,112 @@ describe('Task API', () => {
   })
 
   describe('POST /api/tasks/:id/resume', () => {
+    it('rejects resume with 409 while the Task workspace is quarantined (fail-closed)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const job = await createJob(app, task)
+        await updateJob(app, job.id, { status: 'running' })
+
+        const quarantine = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}/fail-if-running`,
+          payload: {
+            workspaceVerified: false,
+            stderr: 'crash without verification',
+            completedAt: '2026-08-08T01:02:03.000Z',
+            quarantineReason: 'workspace dirty after crash',
+          },
+        })
+        expect(quarantine.statusCode).toBe(200)
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'try again please' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ error: string }>(res.body).error).toBe('Cannot resume: workspace dirty after crash')
+      })
+    })
+
+    it('resume succeeds after a verified clear-quarantine (workflow: quarantine -> resume refused -> cleared -> resume succeeds)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id, {
+          title: 'Fix blocked deployment',
+          description: 'Update only the allowed API files.',
+        })
+        const job = await createJob(app, task, {
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'Initial implementation prompt',
+          aiCliMode: 'implement',
+        })
+        await updateJob(app, job.id, { status: 'running' })
+
+        // quarantine する（workspace 未検証で crash 扱い）
+        const quarantine = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}/fail-if-running`,
+          payload: {
+            workspaceVerified: false,
+            stderr: 'crash without verification',
+            completedAt: '2026-08-08T01:02:03.000Z',
+            quarantineReason: 'workspace dirty after crash',
+          },
+        })
+        expect(quarantine.statusCode).toBe(200)
+
+        // quarantine 中は resume が 409 で拒否される
+        const refused = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction: 'try again please' },
+        })
+        expect(refused.statusCode).toBe(409)
+
+        // 検証の観測の提示なしでは解除できない
+        const bypassAttempt = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}/clear-quarantine`,
+          payload: { quarantineClearedReason: 'CEO asked for it' },
+        })
+        expect(bypassAttempt.statusCode).toBe(400)
+
+        // workspace が再検証でクリーンになった → 解除（観測 + known-good を提示）
+        const cleared = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${job.id}/clear-quarantine`,
+          payload: {
+            observation: { mode: 'clean', startCommitHash: 'abc123' },
+            knownGood: {
+              gitOperationMarkers: [],
+              worktreeClean: true,
+              indexClean: true,
+              headValid: true,
+              blindSpotsAbsent: true,
+            },
+            quarantineClearedReason: 'startup recovery verified clean',
+          },
+        })
+        expect(cleared.statusCode).toBe(200)
+
+        // 解除後は resume が正常に成功する
+        const instruction = 'Use the reviewer-approved narrower approach.'
+        await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
+        const resumed = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction },
+        })
+        expect(resumed.statusCode).toBe(201)
+        const resumedJob = parseBody<Job>(resumed.body)
+        expect(resumedJob).toMatchObject({ taskId: task.id, status: 'queued' })
+        expect(resumedJob.id).not.toBe(job.id)
+      })
+    })
+
     it('creates a queued job from the latest blocked job and keeps the blocked job unchanged', async () => {
       await withApp(async (app) => {
         const project = await createProject(app)

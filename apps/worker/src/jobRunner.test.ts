@@ -17,10 +17,12 @@ import { saveJobLogs } from './jobLogger.js'
 import { persistJobResult } from './index.js'
 import {
   buildStructuredReviewPrompt,
+  computeWorkspaceBaseline,
   parseStructuredReviewOutput,
   runJob,
 } from './jobRunner.js'
 import {
+  FINGERPRINT_ABSENT,
   assertIndexClean,
   assertIndexMatchesApproved,
   assertNoHistoryRewrite,
@@ -30,9 +32,12 @@ import {
   buildIndexStateMap,
   buildWorktreeManifest,
   diffSensitiveBaseline,
+  fingerprintWorktreeEntries,
   scanSensitiveFiles,
   stageApprovedPaths,
+  type ChangeManifest,
 } from './guards/changeManifest.js'
+import { detectGitOperationState } from './guards/gitOperationState.js'
 import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
 import { resolvePolicy } from './guards/gatePolicy.js'
 
@@ -64,6 +69,8 @@ vi.mock('./guards/changeManifest.js', () => ({
     }
   },
   captureReflogBaseline: vi.fn(() => ({ headHashes: [] })),
+  FINGERPRINT_ABSENT: ':absent:',
+  fingerprintWorktreeEntries: vi.fn(),
   assertNoHistoryRewrite: vi.fn(),
   assertIndexClean: vi.fn(),
   assertIndexMatchesApproved: vi.fn(),
@@ -132,6 +139,10 @@ vi.mock('./guards/changeManifest.js', () => ({
     changes,
     paths: changes.map((c) => c.path),
   })),
+}))
+
+vi.mock('./guards/gitOperationState.js', () => ({
+  detectGitOperationState: vi.fn(),
 }))
 
 vi.mock('./jobLogger.js', () => ({
@@ -239,6 +250,8 @@ const assertNoHistoryRewriteMock = vi.mocked(assertNoHistoryRewrite)
 const assertNoResidualChangesMock = vi.mocked(assertNoResidualChanges)
 const scanSensitiveFilesMock = vi.mocked(scanSensitiveFiles)
 const diffSensitiveBaselineMock = vi.mocked(diffSensitiveBaseline)
+const fingerprintWorktreeEntriesMock = vi.mocked(fingerprintWorktreeEntries)
+const detectGitOperationStateMock = vi.mocked(detectGitOperationState)
 
 /** テスト内で ChangeDetectionError 相当を投げるためのスタブ */
 class ChangeDetectionErrorStub extends Error {
@@ -1013,7 +1026,11 @@ describe('Phase 2: git_commit staging verification', () => {
     assertIndexCleanMock.mockImplementation(() => {})
     stageApprovedPathsMock.mockImplementation(() => {})
     assertIndexMatchesApprovedMock.mockImplementation(() => {})
-    assertNoResidualChangesMock.mockImplementation(() => {})
+assertNoResidualChangesMock.mockImplementation(() => {})
+
+  // PR-C workspace baseline: 既定はクリーンな git 操作状態。
+  // computeWorkspaceBaseline の各テストが個別に上書きする。
+  detectGitOperationStateMock.mockReturnValue([])
     resolveCommandMock.mockReturnValue({
       argv: ['git', 'commit', '-m', 'test'],
       description: 'git commit',
@@ -3576,6 +3593,126 @@ describe('Shadow Commit Gate (Phase 1 observation wiring)', () => {
       expect(comparisonLog).toContain('riskLevel=LOW')
     } finally {
       logSpy.mockRestore()
+    }
+  })
+})
+
+describe('computeWorkspaceBaseline (PR-C)', () => {
+  const BASE_HASH = 'basecommit0000000000000000000000000000000'
+  const cleanManifest = { changes: [], paths: [] }
+
+  it('NORMAL Job + クリーン worktree: clean baseline を返し fingerprint を呼ばない', () => {
+    detectGitOperationStateMock.mockReturnValue([])
+    buildWorktreeManifestMock.mockReturnValue(cleanManifest as ChangeManifest)
+
+    const result = computeWorkspaceBaseline(createJob(), '/workspace/target')
+
+    expect(result).toEqual({
+      ok: true,
+      baseline: { mode: 'clean', startCommitHash: BASE_HASH },
+    })
+    expect(fingerprintWorktreeEntriesMock).not.toHaveBeenCalled()
+  })
+
+  it('NORMAL Job + dirty worktree: fail-closed で ok:false（理由に変更パスを含める）', () => {
+    detectGitOperationStateMock.mockReturnValue([])
+    buildWorktreeManifestMock.mockReturnValue({
+      changes: [{ path: 'src/dirty.ts', kind: 'modified', afterType: 'regular' }],
+      paths: ['src/dirty.ts'],
+    } as ChangeManifest)
+
+    const result = computeWorkspaceBaseline(createJob(), '/workspace/target')
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.reason).toContain('src/dirty.ts')
+      expect(result.reason).toContain('clean worktree')
+    }
+    expect(fingerprintWorktreeEntriesMock).not.toHaveBeenCalled()
+  })
+
+  it('repair/resume/retry Job: dirty baseline を返し fingerprint エントリを反映する', () => {
+    detectGitOperationStateMock.mockReturnValue([])
+    const manifest = {
+      changes: [
+        { path: 'src/fix.ts', kind: 'modified' as const, afterType: 'regular' as const },
+        { path: 'src/removed.ts', kind: 'deleted' as const },
+        { path: 'src/renamed.ts', oldPath: 'src/old.ts', kind: 'renamed' as const },
+      ],
+      paths: ['src/fix.ts', 'src/removed.ts', 'src/renamed.ts', 'src/old.ts'],
+    } as ChangeManifest
+    buildWorktreeManifestMock.mockReturnValue(manifest)
+    fingerprintWorktreeEntriesMock.mockReturnValue(new Map<string, string>([
+      ['src/fix.ts', 'hash-fix'],
+      ['src/removed.ts', FINGERPRINT_ABSENT],
+      ['src/renamed.ts', 'hash-renamed'],
+      ['src/old.ts', FINGERPRINT_ABSENT],
+    ]))
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'repair:job-x:1' }),
+      '/workspace/target',
+    )
+
+    expect(result).toEqual({
+      ok: true,
+      baseline: {
+        mode: 'dirty',
+        startCommitHash: BASE_HASH,
+        entries: [
+          { path: 'src/fix.ts', kind: 'modified', afterType: 'regular' as const, worktreeHash: 'hash-fix' },
+          { path: 'src/removed.ts', kind: 'deleted' as const, worktreeHash: FINGERPRINT_ABSENT },
+          { path: 'src/old.ts', kind: 'renamed' as const, worktreeHash: FINGERPRINT_ABSENT },
+          { path: 'src/renamed.ts', oldPath: 'src/old.ts', kind: 'renamed' as const, worktreeHash: 'hash-renamed' },
+        ],
+      },
+    })
+    expect(fingerprintWorktreeEntriesMock).toHaveBeenCalledWith('/workspace/target', manifest)
+  })
+
+  it('repair Job でも worktree がクリーンなら dirty baseline + 空 entries（完全一致比較を維持）', () => {
+    detectGitOperationStateMock.mockReturnValue([])
+    buildWorktreeManifestMock.mockReturnValue(cleanManifest as ChangeManifest)
+    fingerprintWorktreeEntriesMock.mockReturnValue(new Map())
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'resume:job-x:1' }),
+      '/workspace/target',
+    )
+
+    expect(result).toEqual({
+      ok: true,
+      baseline: { mode: 'dirty', startCommitHash: BASE_HASH, entries: [] },
+    })
+    expect(fingerprintWorktreeEntriesMock).toHaveBeenCalledWith('/workspace/target', cleanManifest)
+  })
+
+  it('進行中の git 操作がある workspace は fail-closed（Job 種別によらず ok:false）', () => {
+    detectGitOperationStateMock.mockReturnValue(['index.lock', 'merge'])
+    buildWorktreeManifestMock.mockReturnValue(cleanManifest as ChangeManifest)
+
+    const normal = computeWorkspaceBaseline(createJob(), '/workspace/target')
+    const repair = computeWorkspaceBaseline(createJob({ workflowStepKey: 'repair:job-x:1' }), '/workspace/target')
+
+    expect(normal.ok).toBe(false)
+    expect(repair.ok).toBe(false)
+    if (!normal.ok && !repair.ok) {
+      expect(normal.reason).toContain('index.lock')
+      expect(repair.reason).toContain('index.lock')
+    }
+    // HEAD 解決や manifest 構築より先に検出される
+    expect(buildWorktreeManifestMock).not.toHaveBeenCalled()
+  })
+
+  it('HEAD 解決に失敗したら ok:false（fail-closed）', () => {
+    detectGitOperationStateMock.mockReturnValue([])
+    execFileSyncMock.mockImplementation(() => { throw new Error('not a git repository') })
+
+const result = computeWorkspaceBaseline(createJob(), '/workspace/target')
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.reason).toBe('workspace baseline could not be established: Failed to resolve HEAD commit in "/workspace/target"')
     }
   })
 })
