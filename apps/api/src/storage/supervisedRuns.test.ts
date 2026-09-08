@@ -14,7 +14,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
-import { createSQLiteStorage } from './sqlite'
+import { createSQLiteStorage, MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS } from './sqlite'
 import type { IStorage } from './interface'
 
 const baseInput = {
@@ -77,7 +77,7 @@ describe('supervised_runs storage', () => {
       const oldToken = created.claimToken!
 
       storage.supervisedRuns.markStalled(created.run.id, oldToken, 'no progress')
-      const recovered = storage.supervisedRuns.claimForRecovery(created.run.id, 3, 'worker_watchdog')
+      const recovered = storage.supervisedRuns.claimForRecovery(created.run.id, 'worker_watchdog')
 
       expect(recovered.claimToken).toBeTruthy()
       expect(recovered.claimToken).not.toBe(oldToken)
@@ -95,7 +95,7 @@ describe('supervised_runs storage', () => {
       const oldToken = created.claimToken!
 
       storage.supervisedRuns.markStalled(created.run.id, oldToken, 'no progress')
-      const recovered = storage.supervisedRuns.claimForRecovery(created.run.id, 3, 'worker_watchdog')
+      const recovered = storage.supervisedRuns.claimForRecovery(created.run.id, 'worker_watchdog')
 
       // fail-closed も終端書き込みである以上、fencing を免除してはならない。
       // 免除すると claimForRecovery による無効化が骨抜きになる。
@@ -152,17 +152,17 @@ describe('supervised_runs storage', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
       let token = claimToken!
 
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      for (let attempt = 1; attempt <= MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS; attempt++) {
         expect(storage.supervisedRuns.markStalled(run.id, token, 'stalled')).toBe(true)
-        const claimed = storage.supervisedRuns.claimForRecovery(run.id, 2, 'delegate_watchdog')
+        const claimed = storage.supervisedRuns.claimForRecovery(run.id, 'delegate_watchdog')
         expect(claimed.claimToken).toBeTruthy()
         expect(claimed.run?.recoveryAttemptCount).toBe(attempt)
         token = claimed.claimToken!
       }
 
-      // 3回目は上限超過 → 引き取らず terminal で終わる。RUNNING のまま残さない。
+      // 上限超過 → 引き取らず terminal で終わる。RUNNING のまま残さない。
       expect(storage.supervisedRuns.markStalled(run.id, token, 'stalled again')).toBe(true)
-      const exhausted = storage.supervisedRuns.claimForRecovery(run.id, 2, 'delegate_watchdog')
+      const exhausted = storage.supervisedRuns.claimForRecovery(run.id, 'delegate_watchdog')
 
       expect(exhausted.exhausted).toBe(true)
       expect(exhausted.claimToken).toBeUndefined()
@@ -174,7 +174,7 @@ describe('supervised_runs storage', () => {
 
     it('stalled でない run は recovery の対象にならない', () => {
       const { run } = storage.supervisedRuns.create(baseInput)
-      const claimed = storage.supervisedRuns.claimForRecovery(run.id, 3, 'worker_watchdog')
+      const claimed = storage.supervisedRuns.claimForRecovery(run.id, 'worker_watchdog')
 
       expect(claimed.run).toBeUndefined()
       expect(claimed.claimToken).toBeUndefined()
@@ -208,12 +208,14 @@ describe('supervised_runs storage', () => {
       const { run } = storage.supervisedRuns.create(baseInput)
       // 所有者（wrapper）が死んだ想定。誰も現在の token を持っていない。
 
-      // 1. 監視側が旗を立てる（終端書き込みではないので token 不要）
-      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'owner unreachable')).toBe(true)
+      // 1. 監視側が旗を立てる（終端書き込みではないので token 不要）。
+      //    ただし「進捗が観測できていない」ことを示す時刻を根拠として渡す必要がある。
+      const noProgressSince = new Date(Date.now() + 60_000).toISOString()
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'owner unreachable', noProgressSince)).toBe(true)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('stalled')
 
       // 2. bounded に所有権を取得する
-      const claimed = storage.supervisedRuns.claimForRecovery(run.id, 3, 'worker_watchdog')
+      const claimed = storage.supervisedRuns.claimForRecovery(run.id, 'worker_watchdog')
       expect(claimed.claimToken).toBeTruthy()
 
       // 3. 新しい所有者が終端させられる → RUNNING のまま残らない
@@ -225,8 +227,22 @@ describe('supervised_runs storage', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
       storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
 
-      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'too late')).toBe(false)
+      const noProgressSince = new Date(Date.now() + 60_000).toISOString()
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'too late', noProgressSince)).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('succeeded')
+    })
+
+    it('進捗が観測できている run は stalled にできない — 健全な run の所有権を奪えない（独立レビュー第2ラウンド）', () => {
+      const { run } = storage.supervisedRuns.create(baseInput)
+
+      // run は「今」進捗している。それより前の時刻を根拠にした停止主張は通らない。
+      const staleClaim = new Date(Date.now() - 60_000).toISOString()
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'bogus stall claim', staleClaim)).toBe(false)
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('running')
+
+      // したがって所有権の横取り（stalled にしてから claimForRecovery）も成立しない。
+      const claimed = storage.supervisedRuns.claimForRecovery(run.id, 'opportunistic_actor')
+      expect(claimed.claimToken).toBeUndefined()
     })
   })
 

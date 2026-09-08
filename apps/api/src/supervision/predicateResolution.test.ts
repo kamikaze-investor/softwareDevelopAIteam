@@ -88,7 +88,7 @@ describe('resolvePredicateForRun', () => {
     const created = storage.supervisedRuns.create(baseInput)
     const oldToken = created.claimToken!
     storage.supervisedRuns.markStalled(created.run.id, oldToken, 'stalled')
-    storage.supervisedRuns.claimForRecovery(created.run.id, 3, 'worker_watchdog')
+    storage.supervisedRuns.claimForRecovery(created.run.id, 'worker_watchdog')
 
     const result = resolvePredicateForRun(storage, created.run, oldToken)
 

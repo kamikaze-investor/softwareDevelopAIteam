@@ -619,9 +619,14 @@ export interface ISupervisedRunStorage {
   ): boolean
   /**
    * stalled run を引き取る。**新しいclaimTokenを発行**し、旧所有者を無効化する。
-   * recoveryAttemptCount が maxRecoveryAttempts 以上なら引き取らず `failed` で終端する（C-6）。
+   * recoveryAttemptCount が上限以上なら引き取らず `failed` で終端する（C-6）。
+   *
+   * 上限は呼び出し側から渡さない（独立レビュー指摘 2026-09-08 第2ラウンド）。
+   * 引数にすると「bounded であること」が呼び出し側の善意に依存してしまい、
+   * 大きな値で C-6 を無効化することも、0 で即座に recovery_exhausted を強制することもできる。
+   * bound は system policy（`MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS`）として固定する。
    */
-  claimForRecovery(id: string, maxRecoveryAttempts: number, supervisor: string): ClaimSupervisedRunResult
+  claimForRecovery(id: string, supervisor: string): ClaimSupervisedRunResult
   /**
    * fail-closed 終端（D-2）。predicate を解決できず run を評価できない場合に使う。
    * **RUNNINGのまま放置しないための経路**だが、**終端書き込みなので fencing を免除しない**
@@ -639,8 +644,16 @@ export interface ISupervisedRunStorage {
    *
    * これが無いと、所有者が死んだ run は誰も stalled にできず、recovery も終端もできないまま
    * running で残る（実障害ケース1と同じ結末）。
+   *
+   * **`noProgressSince` より後に進捗が観測されている run は stalled にできない**
+   * （独立レビュー指摘 2026-09-08 第2ラウンド）。tokenless な旗立てを無条件に許すと、
+   * 健全に進行中のrunを誰でも stalled にして所有権を奪えてしまう。
+   * 停止の主張は**観測可能な事実（lastProgressAt）に裏付けられていなければならない**
+   * — C-2a（進捗を見ずに停止と判定しない）と C-5（診断してから動く）そのものである。
+   *
+   * @param noProgressSince この時刻以降に進捗があれば false を返す（＝生きている）
    */
-  markStalledBySupervisor(id: string, reason: string): boolean
+  markStalledBySupervisor(id: string, reason: string, noProgressSince: string): boolean
   /**
    * process crash後の起動時回収。前プロセスが残した running を `stalled` へ倒す。
    *

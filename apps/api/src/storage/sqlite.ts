@@ -371,6 +371,15 @@ function collectRoadmapPhaseSpecConflicts(
 }
 
 const DEFAULT_SUMMARY_LIMIT = 50
+
+/**
+ * supervised run の recovery 上限（Contract C-6）。**system policy であり、呼び出し側の引数にしない。**
+ *
+ * 独立レビュー指摘(2026-09-08 第2ラウンド): 上限を引数で受けると「bounded であること」が
+ * 呼び出し側の善意に依存する。大きな値を渡せば C-6 は無効化でき、0 を渡せば健全な run を
+ * 即座に recovery_exhausted へ落とせてしまう。bound は一箇所で固定する。
+ */
+export const MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS = 3
 const MAX_SUMMARY_LIMIT = 100
 
 function normalizeSummaryLimit(limit?: number): number {
@@ -2902,7 +2911,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       )
       return result.changes === 1
     },
-    claimForRecovery(id, maxRecoveryAttempts, supervisor) {
+    claimForRecovery(id, supervisor) {
+      const maxRecoveryAttempts = MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS
       const claimTransaction = db.transaction((): ClaimSupervisedRunResult => {
         const current = db.prepare('SELECT * FROM supervised_runs WHERE id = ?').get(id) as any
         if (!current || current.status !== 'stalled') {
@@ -2955,16 +2965,22 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).run(error, now(), id, claimToken)
       return result.changes === 1
     },
-    markStalledBySupervisor(id, reason) {
+    markStalledBySupervisor(id, reason, noProgressSince) {
       // 監視側が所有者に到達できない run へ旗を立てる。**終端書き込みではない**ので
       // claim_token を要求しない（fencing の対象は終端の確定であって、停止の疑いではない）。
       // これが無いと、所有者が死んだ run は stalled にできず recovery にも入れないまま
       // running で残り続ける（実障害ケース1と同じ結末）。
+      //
+      // ただし無条件の旗立ては許さない（独立レビュー指摘 2026-09-08 第2ラウンド）:
+      // `last_progress_at >= noProgressSince` の run、つまり**進捗が観測できている run は
+      // stalled にできない**。停止の主張は観測可能な事実に裏付けられていなければならず、
+      // これが無いと健全に進行中の run を誰でも stalled にして所有権を奪えてしまう。
+      // C-2a（進捗を見ずに停止と判定しない）と C-5（診断してから動く）の実装である。
       const result = db.prepare(`
         UPDATE supervised_runs
         SET status = 'stalled', error = ?
-        WHERE id = ? AND status = 'running'
-      `).run(reason, id)
+        WHERE id = ? AND status = 'running' AND last_progress_at < ?
+      `).run(reason, id, noProgressSince)
       return result.changes === 1
     },
     markOrphanedRunsStalledAtStartup(startedBefore) {
