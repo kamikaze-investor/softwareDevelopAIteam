@@ -369,9 +369,19 @@ function normalizeObjectId(raw: string | undefined): string | undefined {
 export function worktreeContainsName(workingDir: string, needle: string): boolean {
   assertWorktreeRoot(workingDir)
 
+  // **pathspecでsentinelだけに絞る。** 絞らないと`--ignored`がnode_modules等の無視ツリーを
+  // すべて列挙し、`runGit`のtimeout/maxBufferへ近づく。実測（control repo 909MB /
+  // node_modules 74,030ファイル）: 絞らない場合 7.3MB / 0.65s、絞った場合 0B / 0.41s。
+  // 走査自体は同じでも出力が定数サイズになるため、リポジトリの大きさに依存しなくなる。
+  //
+  // `**/`はリポジトリ直下にも一致する（実測済み）。sentinel名は
+  // `.codex-capture-probe-<pid>-<uuid>`でglobメタ文字を含まない。
   return runGit(
     workingDir,
-    ['status', '--porcelain', '--untracked-files=all', '--ignored'],
+    [
+      'status', '--porcelain', '--untracked-files=all', '--ignored',
+      '--', `:(glob)**/${needle}`,
+    ],
   ).includes(needle)
 }
 

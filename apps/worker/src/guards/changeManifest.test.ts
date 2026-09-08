@@ -602,9 +602,11 @@ describe('worktreeContainsName', () => {
     mkdirSync(path.join(repo, '.tmp'), { recursive: true })
     writeFileSync(path.join(repo, '.tmp', '.probe-ignored'), '', 'utf-8')
 
+    // 実際の用途と同じく**ファイル名**で問い合わせる（ディレクトリ名ではない）。
     // ここが取りこぼされると、.gitignore 済みディレクトリへ mount された場合に
     // capture file がリポジトリ内へ入っても検出できない。
-    expect(worktreeContainsName(repo, '.tmp')).toBe(true)
+    // 本番相当の実測（control repo の node_modules 配下）でも同じ経路を確認済み。
+    expect(worktreeContainsName(repo, '.probe-ignored')).toBe(true)
   })
 
   it('リポジトリ外のファイルは検出しない', () => {
