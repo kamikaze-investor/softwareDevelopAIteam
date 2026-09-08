@@ -10,7 +10,7 @@
  *   - isPromptSafe() のパターンマッチ
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -513,6 +513,39 @@ describe('CodexAdapter --output-last-message structured output', () => {
   // Independent review finding 2 (2026-09-08): `os.tmpdir()` was assumed to be outside the
   // target repo. With TMPDIR pointing inside it, the capture file lands in the repository and
   // silently breaks the read-only guarantee. Fail closed instead.
+  // Checkpoint 3: an ordinary symlink alias must be rejected. TMPDIR points at a symlink that
+  // lives outside the repo but resolves into it -- pure string comparison would accept this.
+  it('refuses when TMPDIR is a symlink resolving into the target repo', async () => {
+    const workingDir = makeWorkingDir()
+    const insideRepo = path.join(workingDir, '.inner-tmp')
+    mkdirSync(insideRepo, { recursive: true })
+
+    const linkDir = mkdtempSync(path.join(os.tmpdir(), 'tmplink-'))
+    const link = path.join(linkDir, 'points-inside')
+    try {
+      symlinkSync(insideRepo, link, 'junction')
+    } catch {
+      return // symlink creation not permitted in this environment; covered on POSIX CI
+    }
+
+    const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP }
+    process.env.TMPDIR = link
+    process.env.TEMP = link
+    process.env.TMP = link
+
+    try {
+      const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+      await expect(adapter.run(makeRequest(workingDir))).rejects.toThrow(/OS temp directory/)
+      expect(execFileSyncMock).not.toHaveBeenCalled()
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      rmSync(linkDir, { force: true, recursive: true })
+    }
+  })
+
   it('refuses to run when the OS temp dir resolves inside the target repo', async () => {
     const workingDir = makeWorkingDir()
     const insideRepo = path.join(workingDir, '.tmp')
