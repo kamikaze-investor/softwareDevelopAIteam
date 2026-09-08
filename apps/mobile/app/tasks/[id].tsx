@@ -719,7 +719,12 @@ function TaskFailureExplanationSection({
   task: Task
 }): ReactElement | null {
   const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
-  const shouldShow = latestJob?.status === 'failed' || task.status === 'blocked'
+  // MOB-001: blocked な Job も対象にする。Guard 違反で Job が blocked でも Task.status は
+  // pending のまま残るため、従来の条件では「停止しているのに失敗の説明が出ない」画面になり、
+  // 実行状態バナーが案内している先が存在しない状態だった。
+  const shouldShow = latestJob?.status === 'failed'
+    || latestJob?.status === 'blocked'
+    || task.status === 'blocked'
   const explanationKey = shouldShow
     ? `${task.id}:${task.status}:${latestJob?.id ?? 'no-job'}`
     : null
