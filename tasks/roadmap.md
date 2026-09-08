@@ -2223,6 +2223,58 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    ---
 
+   ---
+
+   ### 実障害ケース3: PR #123のCI待ちでPL control loopがresumeしなかった（2026-09-08）
+
+   **発生事象**: PLがPR #123を作成し、CEOへ「CI監視中。確定次第報告する」と宣言した。
+   GitHub Actionsは短時間でgreenになったが、**PLは自律的に再開せず待機したままだった**。
+   CEOの指摘で初めて発覚した。
+
+   **実測タイムライン（すべてUTC。read-only確認済み）**:
+
+   | 時刻 | 事象 |
+   |---|---|
+   | 05:49:40 | PR #123 作成 |
+   | 05:49:43 | CI / Meta Review の両run開始 |
+   | 05:50:25 | `Meta Reviewer AI (Gemini)` success（38s） |
+   | 05:51:11 | `Typecheck & Test` success（1m25s）→ **この時点で全check green** |
+   | 06:06 | CEOの指摘で発覚。watcherは`running`のまま、eventを1件も出していない |
+
+   **green到達からPLが気付くまで約15分**。全checkはPR作成から**91秒**で完了していた。
+
+   **実際に使っていたwatch mechanism（read-only確認）**: harnessのMonitor（background bash task、
+   task id `bt9tsssnf`）。30秒間隔で`gh pr checks 123 --json name,bucket`をpollし、
+   `jq`で非pendingのcheckを抽出、`comm`で差分をstdoutへ出し、
+   `jq -e` で全check非pendingになったらループを抜ける、という構成だった。
+
+   **watcherは「存在した」が「機能していなかった」**:
+
+   - task statusは最後まで`running`。**armされていたことは事実**である
+   - しかし **`jq`がこのWindows環境のbash PATHに存在しない**（`gh`は存在し、`--json`出力も正常）
+   - そのため抽出結果は毎回空になり、**progress eventが1件も出なかった**
+   - 完了判定も`jq -e`だったため常にfalseになり、**ループは一度もbreakしなかった**
+     （＝completionを検知する手段が最初から無かった）
+   - `jq: command not found` はstderrへ31回出ていたが、
+     **Monitorはstderrをeventにしない仕様**のため、この失敗はPLへ届かなかった
+
+   **Confirmed root cause**: watcherのcompletion predicateが**実行環境で成立しない道具（`jq`）に
+   依存**しており、かつ**watcher自身の失敗がsilent**だった。CI・GitHub Actions側には問題が無い。
+
+   **障害の分類（C-11）**: **monitoring failure**。ケース1（supervisorごと消滅）と同種だが、
+   今回は「watcherプロセスは生きているのに検知能力がゼロ」という形をしている。
+   **ケース2（completion-detection failure）とも構造が同じ**である —
+   Expoは「TTYが無いのでQRが出ない」、今回は「`jq`が無いので判定式が動かない」。
+   どちらも **completion signalが実行環境で成立するかを検証していない**（C-3a違反）。
+
+   **Finding**: *external background operationのcompletion後にPL control loopを再開する仕組みが
+   保証されていない。* 「監視中」と宣言することと、監視が成立していることは別である。
+
+   **scope拡張**: **CI待ちもBackground Task Supervision Contractの対象に含める。**
+   対象は自前でspawnしたprocessに限らず、**GitHub Actions等のexternal background operationの
+   完了待ちを含む**。これらは自前のchild processが存在しないため、
+   `PID alive`ベースの監視が原理的に使えず、external probe（C-2a）が唯一の手段になる。
+
    ### Background Task Supervision Contract（共通化するのは実装ではなく契約）
 
    他セッションでも長時間監視対策を調査中である。**この件を理由に新しい watchdog / supervisor /
@@ -2317,6 +2369,24 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    回収できる**設計とする。これはAcceptance **Case Cの実例**であり、
    Case Cはもはや仮想ケースではなく再現済みの実障害である。
 
+   **C-13. 「監視中」という宣言を監視成立とみなさない（ケース3）。** watcherをarmしたと述べることと、
+   completionを検知してcontrol loopがresumeすることは別である。次の3点を
+   **機械的に確認できる**必要がある:
+
+   1. **watcher / poller / webhook等が実際にarmされている**（task id等の実体が取得できる）
+   2. **completionを検知できる**（判定に使う道具・signalが実行環境に実在することを、
+      待ち始める前に確認する。ケース3は`jq`不在で判定式が一度も評価できなかった）
+   3. **completion時にcontrol loopが自動resumeする**（検知しただけで通知経路が無い状態にしない）
+
+   加えて **watcher自身の失敗をsilentにしない**。ケース3では`jq: command not found`が31回
+   stderrへ出ていたが、stderrはevent化されない経路だったため誰にも届かなかった。
+   **監視の失敗は、監視対象の失敗と同じ重さで表面化させる**（C-11のmonitoring failure）。
+   silenceをhealthyの証拠として扱わない — 「何も来ていない」は
+   「順調」と「watcherが死んでいる」の両方と区別がつかない。
+
+   実装上の含意: watcherは**armされた時点でheartbeatを出す**べきであり、
+   一定時間eventもheartbeatも無いwatcherは、監視対象ではなく**watcher自身をstalled扱い**にする。
+
    ---
 
    ### C-10の受け皿: 汎用 `supervised_runs`（新規。`design_review_runs`へは相乗りしない）
@@ -2357,6 +2427,12 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **`ai_delegation` と `expo_restart` のみ**とする。`deploy` / `build` は
    **Contractの適用例としては残すが、#110初期実装では接続しない**。
    `kind`は将来拡張可能な形（新しい値の追加がschema変更を要求しない形）で設計する。
+
+   **D-1補足（ケース3を受けた未決事項）**: CI待ち（`external_ci`）はContractの対象に含めたが、
+   **初期`kind`へ追加するかはCEO未判断**である。D-1の初期スコープは変更していない。
+   external CIは自前のchild processを持たないため、progress sourceもcompletion predicateも
+   `ai_delegation` / `expo_restart` とは異なる形（GitHub APIのpoll、あるいはwebhook）になる。
+   初期実装へ含めるか、Contract適用例として据え置くかを決める必要がある。
 
    **D-2. completion predicateをDBで実行しない。** predicateを自由文字列やDB内DSLとして保存し、
    それを解釈・実行する経路は作らない。DBに保存するのは
@@ -2412,11 +2488,19 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    - **Case E**: stalled → recovery不能 → 無限RUNNINGにならずBLOCKED / ERROR等で終わり、
      PL / CEOへ必要な情報が出る
    - **Case F**: CEOがMobileを閉じて再度開く → backendで継続した現在の実状態へ復帰する
+   - **Case G**（ケース3由来）: watcherが判定に使う道具・signalが実行環境に存在しない
+     → **watcher自身がstalled / 起動失敗として表面化する**。eventもheartbeatも出ないまま
+     `running`を維持し続けないこと。監視対象がgreenになっても誰も気付かない状態を作らない
 
    **Expo / Metro regression（ケース2の再現試験。Case Cの具体化）**: stdoutをnon-TTYへredirectし、
    QRのconsole outputが無く、Metroは正常起動して manifest 200 / bundle 200 を返す状態を再現し、
    **監視がSTALLEDではなくREADY / SUCCEEDEDと判定できること**を確認する。
    また、**QR artifactはrepoではなくtmp等へ生成し、`git add`等でproduction sourceへ混入させないこと**。
+
+   **CI wait regression（ケース3の再現試験）**: watcherが依存する外部コマンドを不在にした状態で
+   external CI待ちを開始し、**watcher自身の異常が一定時間内に表面化すること**、および
+   CIがgreenになった際に**control loopが自動resumeすること**を確認する。
+   「eventが来ない」状態がhealthyと区別できることを試験の合格条件に含める。
 
    **現状**: 本項目は設計フェーズ。**実装は未着手であり、着手前にこのcontractのCEOレビューを受ける。**
 
