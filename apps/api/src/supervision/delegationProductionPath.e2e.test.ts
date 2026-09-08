@@ -7,7 +7,9 @@
  *   → delegate.sh                （実スクリプト）
  *   → delegate-watchdog.sh       （実スクリプト。marker検出 → formal verdict生成）
  *   → trusted runDir
- *   → Worker reconcile           （reconcileSupervisedDelegations。routeが呼ぶ本体）
+ *   → Worker poll の reconcileSupervisedRuns()
+ *   → HTTP POST /api/supervised-runs/reconcile   （実 listen した Fastify。app.inject は使わない）
+ *   → reconcileSupervisedDelegations
  *   → formal verdict
  *   → supervised_runs terminal
  *   → continuation
@@ -20,6 +22,7 @@
  * 別 observer（このテストプロセス）で継続・終端・continuation を確認することで示す。
  */
 
+import Fastify from 'fastify'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs'
@@ -30,6 +33,7 @@ import { resetPredicateRegistryForTest } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { reconcileSupervisedDelegations } from './reconcile'
+import { supervisedRunRoutes } from '../routes/supervisedRuns'
 import { setDelegationContinuation } from './delegationSupervisor'
 import { resetAiDelegationPredicateRegistrationForTest } from './aiDelegationPredicate'
 import { runDirFor } from './runDirectory'
@@ -103,6 +107,48 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
     return bin
   }
 
+  /**
+   * Worker が実際に使う経路で reconcile を1回起こす:
+   *   Worker の `reconcileSupervisedRuns()` → HTTP POST /api/supervised-runs/reconcile → route → reconcile
+   *
+   * 本物の Fastify を listen させ、Worker 側の関数を `API_BASE_URL` 付きで動的 import する。
+   * `app.inject()` は HTTP hop を飛ばすので使わない。
+   */
+  async function reconcileViaWorkerHttpPath(): Promise<{ terminal: number; observed: number }> {
+    const app = Fastify()
+    ;(app as unknown as { storageOverride?: IStorage }).storageOverride = storage
+    app.register(supervisedRunRoutes, { prefix: '/api' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+
+    const address = app.server.address()
+    if (address === null || typeof address === 'string') throw new Error('failed to bind the test API')
+    const baseUrl = `http://127.0.0.1:${address.port}`
+
+    // route が実際に何を返したかを取れるよう、同じ HTTP 呼び出しを観測用にも1本通す。
+    const observed: { terminal: number; observed: number } = { terminal: 0, observed: 0 }
+    try {
+      process.env.API_BASE_URL = baseUrl
+      // Worker 側の実装を、その module が読む API_BASE_URL 込みで読み込む。
+      const workerModule = await import(
+        pathToFileURL(path.join(REPO_ROOT, 'apps/worker/src/index.ts')).href
+      ) as { reconcileSupervisedRuns: () => Promise<void> }
+
+      await workerModule.reconcileSupervisedRuns()
+
+      // Worker 側は結果を返さない（fire-and-forget）ため、同じ route をもう一度叩いて
+      // 「もう active な run が無い」ことを確認する。1回目で terminal 化されていれば observed=0 になる。
+      const confirm = await fetch(`${baseUrl}/api/supervised-runs/reconcile`, { method: 'POST' })
+      const body = await confirm.json() as { observed: number }
+      observed.observed = body.observed
+      // 1回目（Worker 経由）で終端していれば、2回目には見えるものが無い。
+      observed.terminal = body.observed === 0 ? 1 : 0
+    } finally {
+      delete process.env.API_BASE_URL
+      await app.close()
+    }
+    return observed
+  }
+
   /** launcher を**別プロセス**として起動し、終了を待つ。戻り値は runId。 */
   async function launchFromSeparateProcess(subjectId: string, providerBin: string): Promise<string> {
     const launcherScript = path.join(sandbox, 'launcher.mts')
@@ -169,13 +215,15 @@ process.exit(0)
     expect(await waitFor(() => existsSync(verdictPath))).toBe(true)
     expect(readFileSync(verdictPath, 'utf-8').trim()).toBe('COMPLETED')
 
-    // 5-6. Worker reconcile が durable state へ反映し、continuation を発火させる。
+    // 5-6. **Worker の poll cycle が叩く経路そのもの**で reconcile させる。
+    //      reconcileSupervisedDelegations() を直接呼ぶと Worker → HTTP → route の hop を
+    //      飛ばしてしまい、production 経路の証明にならない（独立レビュー Step 3 第2ラウンド #3）。
     const continuations: Array<{ terminal: string; verdict: string }> = []
     setDelegationContinuation(({ terminal, terminalVerdict }) => {
       continuations.push({ terminal, verdict: terminalVerdict })
     })
 
-    const summary = await reconcileSupervisedDelegations(storage)
+    const summary = await reconcileViaWorkerHttpPath()
     expect(summary.terminal).toBe(1)
 
     const finished = storage.supervisedRuns.findById(runId)!

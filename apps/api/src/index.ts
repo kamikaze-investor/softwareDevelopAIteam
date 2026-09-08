@@ -21,6 +21,7 @@ import { summaryEngineRoutes } from './routes/summaryEngine'
 import { permissionGrantRoutes } from './routes/permissionGrants'
 import { watchdogEventRoutes } from './routes/watchdogEvents'
 import { supervisedRunRoutes } from './routes/supervisedRuns'
+import { registerDelegationContinuation } from './supervision/continuation'
 import { dashboardRoutes } from './routes/dashboard'
 import { approvalGateRoutes } from './routes/approvalGate'
 import { knowledgeGraphRoutes } from './routes/knowledgeGraph'
@@ -85,6 +86,8 @@ app.listen({ port: PORT, host: process.env.HOST ?? '0.0.0.0' }, (err) => {
   // 再開が、まだ回収されていないDesign Review runに対して`not_claimable`を繰り返し、
   // bounded retryを使い切って`blocked`（終端）にしてしまう。Design Review側の回収が
   // 先に終わっていれば、その評価を再利用して正常に続行できる（独立レビュー指摘、2026-09-07）。
+  // 委任の終端時に continuation が実際に走るよう、起動時に一度だけ登録する（#110 Step 3）。
+  registerDelegationContinuation()
   void recoverAndRekickAtStartup(getStorage())
     .catch((recoveryError) => {
       app.log.error({ err: recoveryError }, 'design review startup recovery failed')
