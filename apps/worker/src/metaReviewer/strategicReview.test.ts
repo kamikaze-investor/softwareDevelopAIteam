@@ -622,6 +622,23 @@ describe('roadmap kind: Claude はGeminiのfindingを握り潰せない', () => 
     }
   }
 
+  // 独立レビュー指摘（2026-09-08）: roadmap は常に critical なので、reviewLoad だけで
+  // independentReviewRequired を決めると true になり、全 expert が ALIGNED でも
+  // CEO承認が要求される。存在しない independent review を前提にした値でもある。
+  it('全ALIGNEDのroadmapはCEO承認を要求せず、independent review必須にもしない', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'scope aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+    mockClaudeIntegrationRun('ALIGNED', 'claude integration aligned')
+
+    const result = await runStrategicMetaReview(roadmapInput('roadmap-no-spurious-approval'))
+
+    expect(result.finalDecision).toBe('ALIGNED')
+    expect(result.independentReviewRequired).toBe(false)
+    expect(result.requiresCeoApproval).toBe(false)
+  })
+
   it('Gemini focused の CONFLICT は Claude が ALIGNED と言っても最終 CONFLICT', async () => {
     mockReviewWithProviderFallback
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })

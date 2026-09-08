@@ -394,7 +394,10 @@ async function runLowLoadLegacyReview(
     const legacyResult = parseMetaReviewResult(rawResponse, input.subjectId)
     const finalDecision = mapMetaReviewStatusToStrategicDecision(legacyResult.status)
 
-    const independentReviewRequired = classification.reviewLoad === 'critical'
+    // roadmap kind は常に critical なのでこの legacy low-load 経路には来ないが、
+    // 判定式を1か所だけ kind-aware にすると差分が生まれるので揃えておく。
+    const independentReviewRequired = reviewKind !== 'roadmap'
+      && classification.reviewLoad === 'critical'
     const requiresCeoApprovalOverride = legacyResult.requiresCeoApproval
       || requiresCeoApprovalForDecision(finalDecision, independentReviewRequired)
 
@@ -930,7 +933,14 @@ function buildStrategicResult(input: {
   finalDecision: StrategicDecision | 'REVIEW_UNAVAILABLE'
   requiresCeoApprovalOverride?: boolean
 }): StrategicMetaReviewResult {
-  const independentReviewRequired = input.classification.reviewLoad === 'critical'
+  // **kind-aware**: roadmap kind は別建ての independent review を持たない（PR C）。
+  // ここを reviewLoad だけで決めると、roadmap は常に critical なので
+  // independentReviewRequired=true になり、`requiresCeoApprovalForDecision()` が
+  // ALIGNED でも承認要求を返す。全 expert が ALIGNED と言った Roadmap に対して
+  // CEO承認を要求してしまい、存在しない independent review を前提にした値が
+  // 結果へ載り続ける（独立レビュー指摘、2026-09-08）。API側の recompute とも食い違う。
+  const independentReviewRequired = input.reviewKind !== 'roadmap'
+    && input.classification.reviewLoad === 'critical'
   const strategicAlignmentResult = input.focusedReviewResults.find((result) => {
     return result.focus === 'strategic_alignment'
   })
