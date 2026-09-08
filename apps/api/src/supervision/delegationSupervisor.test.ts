@@ -33,14 +33,12 @@ describe('supervised ai_delegation', () => {
   let storage: IStorage
   let dbPath: string
   let workspace: string
-  let logPath: string
   let spawnCalls: number
 
   const launchInput = () => ({
     subjectId: 'pr-108',
     model: 'opencode/big-pickle',
     prompt: 'review this',
-    logPath,
     repoRoot: workspace,
   })
 
@@ -55,7 +53,7 @@ describe('supervised ai_delegation', () => {
     const log = path.join(runDir, 'delegation.log')
     if (opts.logText !== undefined) {
       writeFileSync(log, opts.logText)
-      writeFileSync(path.join(runDir, 'current_log'), log)
+      writeFileSync(path.join(runDir, 'current_log'), 'delegation.log')
     }
     if (opts.verdict !== undefined) {
       writeFileSync(path.join(runDir, 'verdict'), opts.verdict)
@@ -80,7 +78,6 @@ describe('supervised ai_delegation', () => {
     dbPath = path.join(os.tmpdir(), `delegation-${randomUUID()}.db`)
     storage = createSQLiteStorage(dbPath)
     workspace = mkdtempSync(path.join(os.tmpdir(), 'delegation-ws-'))
-    logPath = path.join(workspace, 'delegation.log')
   })
 
   afterEach(() => {
@@ -202,6 +199,26 @@ describe('supervised ai_delegation', () => {
   })
 
   describe('progress heartbeat（PID ではなく実出力を見る）', () => {
+    it('出力が1 byteも無い初回観測を progress 扱いしない（独立レビュー Step 3 #4）', async () => {
+      const launched = launchSupervisedDelegation(storage, launchInput(), fakeSpawner)
+      if (launched.status !== 'launched') throw new Error('launch failed')
+      // run_dir はあるが log がまだ1 byteも無い状態。
+      mkdirSync(launched.runDir, { recursive: true })
+
+      const outcome = await observeAndAdvance(storage, launched.run.id, launched.claimToken)
+
+      // 「まだ何も出ていない」を「生きている証拠」にしない。
+      expect(outcome.status).toBe('waiting')
+    })
+
+    it('空ファイルができただけでも progress にしない', async () => {
+      const launched = launchSupervisedDelegation(storage, launchInput(), fakeSpawner)
+      if (launched.status !== 'launched') throw new Error('launch failed')
+      writeRunDir(launched.runDir, { logText: '' })
+
+      expect((await observeAndAdvance(storage, launched.run.id, launched.claimToken)).status).toBe('waiting')
+    })
+
     it('log が伸びたときだけ heartbeat が進む', async () => {
       const launched = launchSupervisedDelegation(storage, launchInput(), fakeSpawner)
       if (launched.status !== 'launched') throw new Error('launch failed')

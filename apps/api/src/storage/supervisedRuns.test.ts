@@ -18,6 +18,9 @@ import { createSQLiteStorage, MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS } from './sql
 import { SUPERVISED_RUN_STALE_THRESHOLD_MS } from '@ai-team/shared'
 import type { IStorage } from './interface'
 
+/** succeeded は storage 境界で formal verdict と evidence を要求する（独立レビュー Step 3 #5）。 */
+const SUCCEEDED_INPUT = { terminalVerdict: 'COMPLETED', completionEvidence: { formalVerdict: 'COMPLETED' } }
+
 const baseInput = {
   kind: 'ai_delegation' as const,
   subjectId: 'pr-108',
@@ -57,7 +60,7 @@ describe('supervised_runs storage', () => {
 
     it('終端済みの run は active ではないので、同じ subject で新しい run を作れる', () => {
       const first = storage.supervisedRuns.create(baseInput)
-      storage.supervisedRuns.complete(first.run.id, first.claimToken!, 'succeeded')
+      storage.supervisedRuns.complete(first.run.id, first.claimToken!, 'succeeded', SUCCEEDED_INPUT)
 
       const second = storage.supervisedRuns.create(baseInput)
       expect(second.created).toBe(true)
@@ -69,7 +72,7 @@ describe('supervised_runs storage', () => {
     it('claimToken が一致しない complete は拒否される', () => {
       const { run } = storage.supervisedRuns.create(baseInput)
 
-      expect(storage.supervisedRuns.complete(run.id, 'wrong-token', 'succeeded')).toBe(false)
+      expect(storage.supervisedRuns.complete(run.id, 'wrong-token', 'succeeded', SUCCEEDED_INPUT)).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('running')
     })
 
@@ -84,11 +87,11 @@ describe('supervised_runs storage', () => {
       expect(recovered.claimToken).not.toBe(oldToken)
 
       // 旧所有者（死んだはずの wrapper）が後から成功を書こうとしても通らない。
-      expect(storage.supervisedRuns.complete(created.run.id, oldToken, 'succeeded')).toBe(false)
+      expect(storage.supervisedRuns.complete(created.run.id, oldToken, 'succeeded', SUCCEEDED_INPUT)).toBe(false)
       expect(storage.supervisedRuns.findById(created.run.id)?.status).toBe('running')
 
       // 新しい所有者は書ける。
-      expect(storage.supervisedRuns.complete(created.run.id, recovered.claimToken!, 'succeeded')).toBe(true)
+      expect(storage.supervisedRuns.complete(created.run.id, recovered.claimToken!, 'succeeded', SUCCEEDED_INPUT)).toBe(true)
     })
 
     it('所有権を奪われた旧 token は fail-closed 経由でも終端を書けない（独立レビュー指摘 2026-09-08）', () => {
@@ -108,9 +111,36 @@ describe('supervised_runs storage', () => {
 
     it('終端済みの run へは、正しい token でも二度目は書けない', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
-      expect(storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')).toBe(true)
+      expect(storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded', SUCCEEDED_INPUT)).toBe(true)
       expect(storage.supervisedRuns.complete(run.id, claimToken!, 'failed')).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('succeeded')
+    })
+  })
+
+  describe('terminal verdict は storage 境界でも必須（独立レビュー Step 3 #5）', () => {
+    it('verdict 無しの succeeded は作れない — status 文字列を verdict 代用にしない', () => {
+      const { run, claimToken } = storage.supervisedRuns.create(baseInput)
+
+      expect(() => storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded'))
+        .toThrow(/requires an explicit terminalVerdict/)
+      expect(() => storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded', { terminalVerdict: 'succeeded' }))
+        .toThrow(/requires an explicit terminalVerdict/)
+
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('running')
+    })
+
+    it('evidence 無しの succeeded も作れない', () => {
+      const { run, claimToken } = storage.supervisedRuns.create(baseInput)
+
+      expect(() => storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded', { terminalVerdict: 'COMPLETED' }))
+        .toThrow(/requires completionEvidence/)
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('running')
+    })
+
+    it('failed / timed_out は verdict 無しでも終端できる（失敗を書けなくして放置させない）', () => {
+      const { run, claimToken } = storage.supervisedRuns.create(baseInput)
+      expect(storage.supervisedRuns.complete(run.id, claimToken!, 'failed', { error: 'boom' })).toBe(true)
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('failed')
     })
   })
 
@@ -142,7 +172,7 @@ describe('supervised_runs storage', () => {
 
     it('終端済みの run には進捗を記録できない', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
-      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
+      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded', SUCCEEDED_INPUT)
 
       expect(storage.supervisedRuns.recordProgress(run.id, claimToken!, { currentStage: 'zombie' })).toBe(false)
     })
@@ -197,7 +227,7 @@ describe('supervised_runs storage', () => {
 
     it('既に終端した run は fail-closed で書き換えられない', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
-      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
+      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded', SUCCEEDED_INPUT)
 
       expect(storage.supervisedRuns.failClosed(run.id, claimToken!, 'too late')).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('succeeded')
@@ -237,7 +267,7 @@ describe('supervised_runs storage', () => {
 
     it('markStalledBySupervisor は running のときだけ効き、終端済みの run を巻き戻さない', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
-      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
+      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded', SUCCEEDED_INPUT)
 
       expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'too late')).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('succeeded')
@@ -377,7 +407,7 @@ describe('supervised_runs storage', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
       expect(storage.supervisedRuns.findActive('ai_delegation', 'pr-108')?.id).toBe(run.id)
 
-      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
+      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded', SUCCEEDED_INPUT)
       expect(storage.supervisedRuns.findActive('ai_delegation', 'pr-108')).toBeUndefined()
     })
 

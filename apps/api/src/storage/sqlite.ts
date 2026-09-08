@@ -2898,6 +2898,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return result.changes === 1
     },
     complete(id, claimToken, status, input) {
+      // 独立レビュー指摘(2026-09-08 Step 3 #5): storage 境界でも terminal verdict を必須にする。
+      // 以前は terminalVerdict 省略時に status 文字列で埋めていたため、
+      // 「formal verdict も evidence も無い succeeded」を storage 層から作れてしまった。
+      // completion の正しさを observeAndAdvance 側だけに依存させない。
+      // status 文字列の verdict 代用は行わない（'succeeded' は verdict ではない）。
+      if (status === 'succeeded') {
+        const verdict = input?.terminalVerdict?.trim()
+        if (!verdict || verdict === status) {
+          throw new Error(
+            `supervisedRuns.complete: 'succeeded' requires an explicit terminalVerdict ` +
+            `(status strings are not verdicts); run=${id}`,
+          )
+        }
+        if (!input?.completionEvidence || Object.keys(input.completionEvidence).length === 0) {
+          throw new Error(
+            `supervisedRuns.complete: 'succeeded' requires completionEvidence; run=${id}`,
+          )
+        }
+      }
+
       const result = db.prepare(`
         UPDATE supervised_runs
         SET status = ?, terminal_verdict = ?, completion_evidence = ?, error = ?,

@@ -1,15 +1,20 @@
 /**
  * ai_delegation の supervision（Contract C-1〜C-13、Step 3）
  *
- * **新しい daemon は追加しない。** 既存の `scripts/delegate.sh` /
- * `scripts/delegate-watchdog.sh` をそのまま実行主体として使い、
- * ここは「launch と supervised_run 登録を不可分にする」層と
- * 「run_dir の観測を durable state へ写す」層だけを足す。
+ * **新しい daemon も、run ごとの新しい supervisor process も追加しない**（CEO確定構造）。
+ * 責務は次のとおり分かれている:
  *
- * 監視主体は **run ごとの detached process** であり、常駐daemonではない
- * （delegate-watchdog.sh が既にその形をしているのと同じ）。
- * その supervisor 自身が死んだ場合は、Step 2 で入れた
- * markStalledBySupervisor → claimForRecovery → 終端 の経路が受け止める。
+ * ```
+ * launchSupervisedDelegation → supervised_runs 登録 → trusted runId/runDir
+ *   → delegate.sh → delegate-watchdog.sh
+ *        … 実processの監督 / progress監視 / marker・verdict生成 / stalled診断 / bounded retry
+ *   → 既存Worker poll/watchdog（reconcile.ts）
+ *        … runDir の事実を supervised_runs へ反映 / watchdog自身が死んだrunの検出 / continuation
+ * ```
+ *
+ * - `delegate-watchdog.sh` … **retry actor はここだけ**
+ * - `supervised_runs`      … durable な正本
+ * - Worker poll/watchdog   … reconcile と continuation。**retry しない**（二重化禁止）
  */
 
 import { spawn } from 'node:child_process'
@@ -17,6 +22,7 @@ import path from 'node:path'
 import { mkdirSync } from 'node:fs'
 import type { IStorage, SupervisedRun } from '../storage/interface'
 import { resolvePredicateForRun } from './predicateResolution'
+import { runDirFor } from './runDirectory'
 import {
   AI_DELEGATION_PREDICATE_KEY,
   AI_DELEGATION_PREDICATE_VERSION,
@@ -34,8 +40,6 @@ export interface LaunchSupervisedDelegationInput {
   subjectId: string
   model: string
   prompt: string
-  /** delegate.sh が書く log の先。run_dir はこの隣に作る。 */
-  logPath: string
   repoRoot: string
 }
 
@@ -44,20 +48,40 @@ export type LaunchSupervisedDelegationResult =
   | { status: 'already_active'; run: SupervisedRun }
   | { status: 'launch_failed'; run: SupervisedRun; error: string }
 
-export interface DelegationSpawner {
-  (input: { runDir: string; logPath: string; model: string; prompt: string; repoRoot: string }): void
+export interface DelegationSpawnInput {
+  runDir: string
+  logPath: string
+  model: string
+  prompt: string
+  repoRoot: string
+  /**
+   * spawn が**非同期に**失敗したときに呼ばれる（独立レビュー指摘 Step 3 #2）。
+   * `spawn()` は戻った後に 'error' を出し得るため、同期 throw だけを捕まえていると
+   * `bash` 不在・EACCES・cwd 不正で **DB 行だけ RUNNING で残る**。
+   */
+  onAsyncError: (error: Error) => void
 }
 
+export type DelegationSpawner = (input: DelegationSpawnInput) => void
+
 /** 既定の spawner。`scripts/delegate.sh` を detached で起動し、呼び出し元 session から切り離す。 */
-export const spawnDelegateScript: DelegationSpawner = ({ runDir, logPath, model, prompt, repoRoot }) => {
-  const child = spawn('bash', [path.join(repoRoot, 'scripts', 'delegate.sh'), model, logPath, prompt], {
-    cwd: repoRoot,
-    // session / SSH が終了しても委任と supervision が生き残るための要件（Step 3）。
-    // 親の stdio を握ったままだと、親 session の終了で SIGHUP / EPIPE が波及する。
-    detached: true,
-    stdio: 'ignore',
-    env: { ...process.env, DELEGATION_RUN_DIR: runDir },
-  })
+export const spawnDelegateScript: DelegationSpawner = (input) => {
+  const child = spawn(
+    'bash',
+    [path.join(input.repoRoot, 'scripts', 'delegate.sh'), input.model, input.logPath, input.prompt],
+    {
+      cwd: input.repoRoot,
+      // session / SSH が終了しても委任と supervision が生き残るための要件（Step 3）。
+      // 親の stdio を握ったままだと、親 session の終了で SIGHUP / EPIPE が波及する。
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, DELEGATION_RUN_DIR: input.runDir },
+    },
+  )
+
+  // spawn の失敗は同期 throw では来ない。ここで拾わないと行が RUNNING のまま残る。
+  child.on('error', (err) => input.onAsyncError(err instanceof Error ? err : new Error(String(err))))
+
   // 親のイベントループから切り離す。以後この child は親の生死と無関係に走る。
   child.unref()
 }
@@ -69,8 +93,11 @@ export const spawnDelegateScript: DelegationSpawner = ({ runDir, logPath, model,
  * これにより「起動したが誰も見ていない委任」が構造的に作れなくなる
  * （実障害ケース1がまさにこれだった）。
  *
- * 逆に、行を作った後に spawn が失敗した場合は、その場で run を fail-closed 終端させる。
- * 登録だけ残って RUNNING で放置される状態も作らない（C-1）。
+ * 逆に、行を作った後に spawn が失敗した場合は、同期・非同期どちらでも
+ * その場で run を fail-closed 終端させる。登録だけ残って RUNNING で放置される状態も作らない（C-1）。
+ *
+ * runDir は **server 生成の runId のみ**から決まる（独立レビュー指摘 Step 3 #3）。
+ * 呼び出し元は log path も runDir も指定できない。
  */
 export function launchSupervisedDelegation(
   storage: IStorage,
@@ -79,8 +106,6 @@ export function launchSupervisedDelegation(
 ): LaunchSupervisedDelegationResult {
   registerAiDelegationPredicate()
 
-  const runDir = path.join(path.dirname(input.logPath), `.delegate-${input.subjectId}-${Date.now()}`)
-
   const created = storage.supervisedRuns.create({
     kind: 'ai_delegation',
     subjectId: input.subjectId,
@@ -88,8 +113,7 @@ export function launchSupervisedDelegation(
     predicateVersion: AI_DELEGATION_PREDICATE_VERSION,
     supervisor: DELEGATION_SUPERVISOR_NAME,
     progressSource: DELEGATION_PROGRESS_SOURCE,
-    // run_dir は completion predicate の入力そのものなので、起動前に確定して記録する。
-    progressEvidence: { runDir, model: input.model },
+    progressEvidence: { model: input.model },
     currentStage: 'launching',
   })
 
@@ -99,21 +123,50 @@ export function launchSupervisedDelegation(
     return { status: 'already_active', run: created.run }
   }
 
+  const claimToken = created.claimToken
+  const runId = created.run.id
+
+  let runDir: string
   try {
-    mkdirSync(runDir, { recursive: true })
-    spawner({ runDir, logPath: input.logPath, model: input.model, prompt: input.prompt, repoRoot: input.repoRoot })
+    runDir = runDirFor(runId)
   } catch (err) {
-    const error = `delegation launch failed: ${err instanceof Error ? err.message : String(err)}`
-    storage.supervisedRuns.failClosed(created.run.id, created.claimToken, error)
+    const error = `cannot derive a trusted run directory: ${err instanceof Error ? err.message : String(err)}`
+    storage.supervisedRuns.failClosed(runId, claimToken, error)
     return { status: 'launch_failed', run: created.run, error }
   }
 
-  storage.supervisedRuns.recordProgress(created.run.id, created.claimToken, {
+  // log も runDir 配下に固定する。current_log は runDir 配下しか許可しないので、
+  // ここを外に置くと predicate が自分の log を読めなくなる。
+  const logPath = path.join(runDir, 'delegation.log')
+
+  const failClosedOnSpawnError = (err: Error): void => {
+    const error = `delegation launch failed: ${err.message}`
+    // 既に終端していれば false が返るだけで、二重終端にはならない。
+    storage.supervisedRuns.failClosed(runId, claimToken, error)
+  }
+
+  try {
+    mkdirSync(runDir, { recursive: true })
+    spawner({
+      runDir,
+      logPath,
+      model: input.model,
+      prompt: input.prompt,
+      repoRoot: input.repoRoot,
+      onAsyncError: failClosedOnSpawnError,
+    })
+  } catch (err) {
+    const error = `delegation launch failed: ${err instanceof Error ? err.message : String(err)}`
+    storage.supervisedRuns.failClosed(runId, claimToken, error)
+    return { status: 'launch_failed', run: created.run, error }
+  }
+
+  storage.supervisedRuns.recordProgress(runId, claimToken, {
     currentStage: 'delegating',
-    progressEvidence: { runDir, model: input.model },
+    progressEvidence: { model: input.model, runDir },
   })
 
-  return { status: 'launched', run: created.run, claimToken: created.claimToken, runDir }
+  return { status: 'launched', run: created.run, claimToken, runDir }
 }
 
 export type ObserveOutcome =
@@ -225,11 +278,20 @@ export async function observeAndAdvance(
     return { status: 'terminal', terminal, formalVerdict }
   }
 
-  // まだ終わっていない。実進捗（log が伸びた）が観測できたときだけ heartbeat を進める。
+  // まだ終わっていない。**実際に出力が増えたときだけ** heartbeat を進める。
+  //
+  // 独立レビュー指摘(Step 3 #4): 以前は previousBytes の既定を -1 にしていたため、
+  // log が空・不在（observedBytes = 0）の初回観測が「0 !== -1」で progress 扱いになっていた。
+  // 1 byte も出ていない状態を「生きている証拠」にするのは、この機構が潰そうとしている
+  // 「PID は生きているから healthy」と同じ誤りである。
   const observedBytes = Number(evaluation.evidence.logBytes ?? 0)
-  const previousBytes = Number(run.progressEvidence?.logBytes ?? -1)
+  const previousBytes = Number(run.progressEvidence?.logBytes ?? 0)
 
-  if (observedBytes !== previousBytes) {
+  // 出力が実際に増えた場合だけ progress とみなす。減少（log rotation / attempt 切替）は
+  // 増加ではないので heartbeat を進めない — 進捗の証拠になっていないため。
+  const grew = observedBytes > previousBytes
+
+  if (grew) {
     const ok = storage.supervisedRuns.recordProgress(run.id, claimToken, {
       currentStage: 'delegating',
       progressEvidence: { ...(run.progressEvidence ?? {}), ...evaluation.evidence },

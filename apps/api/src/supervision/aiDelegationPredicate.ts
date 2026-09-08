@@ -21,6 +21,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { registerPredicate } from '@ai-team/shared'
 import type { PredicateContext, PredicateEvaluation } from '@ai-team/shared'
+import { resolveInsideRunDir, runDirFor } from './runDirectory'
 
 export const AI_DELEGATION_PREDICATE_KEY = 'ai_delegation.formal_verdict'
 export const AI_DELEGATION_PREDICATE_VERSION = 1
@@ -50,6 +51,8 @@ export interface DelegationRunDirState {
   logMtimeMs: number
   hasDoneMarker: boolean
   hasBlockedMarker: boolean
+  /** current_log が runDir 外を指していたため読まなかった。 */
+  logRejected: boolean
 }
 
 function readTrimmed(file: string): string | undefined {
@@ -64,55 +67,86 @@ function readTrimmed(file: string): string | undefined {
 
 /**
  * run_dir の観測。**判定ではなく観測**であり、結果はそのまま evidence として保存できる形にする。
- * 進捗 heartbeat（log の bytes / mtime）もここで採る — PID の生死は見ない（C-2 / PID alive != healthy）。
+ *
+ * `runDir` は呼び出し元から受け取らず、常に `runDirFor(runId)`（server 生成 id 由来）を渡すこと。
+ * `current_log` は runDir 配下の**相対 path のみ**許可し、symlink / traversal で
+ * 外を指すものは読まない（独立レビュー指摘 Step 3 #3）。
+ *
+ * PID の生死は一切見ない（C-2 / PID alive != healthy）。
  */
 export function observeDelegationRunDir(runDir: string): DelegationRunDirState {
   const verdict = readTrimmed(path.join(runDir, 'verdict'))
-  const currentLog = readTrimmed(path.join(runDir, 'current_log'))
+  const declaredLog = readTrimmed(path.join(runDir, 'current_log'))
 
+  let currentLog: string | undefined
   let logBytes = 0
   let logMtimeMs = 0
   let hasDoneMarker = false
   let hasBlockedMarker = false
+  let logRejected = false
 
-  if (currentLog && existsSync(currentLog)) {
-    try {
-      const stat = statSync(currentLog)
-      logBytes = stat.size
-      logMtimeMs = stat.mtimeMs
-      const text = readFileSync(currentLog, 'utf-8')
-      hasDoneMarker = text.includes(DONE_MARKER)
-      hasBlockedMarker = text.includes(BLOCKED_MARKER)
-    } catch {
-      // 読めない = 観測できないだけ。ここでは判定しない。
+  if (declaredLog !== undefined) {
+    const safeLog = resolveInsideRunDir(runDir, declaredLog)
+    if (safeLog === undefined) {
+      // runDir の外を指す current_log は読まない。DONE marker 検査の偽装経路を塞ぐ。
+      logRejected = true
+    } else {
+      currentLog = safeLog
+      try {
+        const stat = statSync(safeLog)
+        logBytes = stat.size
+        logMtimeMs = stat.mtimeMs
+        const text = readFileSync(safeLog, 'utf-8')
+        hasDoneMarker = text.includes(DONE_MARKER)
+        hasBlockedMarker = text.includes(BLOCKED_MARKER)
+      } catch {
+        // 読めない = 観測できないだけ。ここでは判定しない。
+      }
     }
   }
 
-  return { verdict, currentLog, logBytes, logMtimeMs, hasDoneMarker, hasBlockedMarker }
+  return { verdict, currentLog, logBytes, logMtimeMs, hasDoneMarker, hasBlockedMarker, logRejected }
 }
 
 /**
  * completion predicate 本体。
  *
- * `progressEvidence.runDir` から run_dir を復元する。run_dir が分からなければ判定不能であり、
- * **待ち続けずに fail-closed へ倒す**（C-1: 判定できないものを RUNNING のまま残さない）。
+ * 入力は **`context.runId` から導出する**。evidence に書かれた path は信用しない
+ * （独立レビュー指摘 Step 3 #3: 呼び出し元由来の path を信用すると判定自体が偽装できる）。
  */
 export async function evaluateAiDelegationCompletion(context: PredicateContext): Promise<PredicateEvaluation> {
-  const runDir = context.progressEvidence?.runDir
-  if (typeof runDir !== 'string' || runDir.length === 0) {
-    return { outcome: 'unevaluatable', reason: 'supervised run has no runDir in its progress evidence' }
+  let runDir: string
+  try {
+    runDir = runDirFor(context.runId)
+  } catch (err) {
+    return { outcome: 'unevaluatable', reason: err instanceof Error ? err.message : String(err) }
   }
+
   if (!existsSync(runDir)) {
     return { outcome: 'unevaluatable', reason: `delegation run directory is gone: ${runDir}` }
   }
 
   const state = observeDelegationRunDir(runDir)
 
+  if (state.logRejected) {
+    return {
+      outcome: 'unevaluatable',
+      reason: 'current_log points outside the trusted run directory (symlink or traversal); refusing to read it',
+    }
+  }
+
   // verdict がまだ無い = まだ終わっていない。**成功でも失敗でもない。**
   if (state.verdict === undefined) {
     return {
       outcome: 'not_satisfied',
-      evidence: { runDir, logBytes: state.logBytes, logMtimeMs: state.logMtimeMs, reason: 'no formal verdict yet' },
+      evidence: {
+        runDir,
+        logBytes: state.logBytes,
+        logMtimeMs: state.logMtimeMs,
+        // 実出力が1 byteも無い状態を「観測できた進捗」と混同させないための明示フラグ。
+        hasOutput: state.currentLog !== undefined && state.logBytes > 0,
+        reason: 'no formal verdict yet',
+      },
     }
   }
 

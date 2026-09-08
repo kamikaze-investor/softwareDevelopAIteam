@@ -504,6 +504,26 @@ async function confirmRunningTransition(
   return false
 }
 
+/**
+ * supervised run の reconcile を1回起動する（#110 Step 3）。
+ *
+ * 失敗しても poll cycle を壊さない。次の cycle で再試行されるだけであり、
+ * ここで throw すると Job intake ごと止まってしまう。
+ */
+export async function reconcileSupervisedRuns(): Promise<void> {
+  try {
+    const response = await fetch(`${API_BASE}/api/supervised-runs/reconcile`, {
+      method: 'POST',
+      headers: buildApiAuthHeaders(),
+    })
+    if (!response.ok) {
+      console.warn(`[Worker] supervised run reconcile failed: HTTP ${response.status}`)
+    }
+  } catch (err: unknown) {
+    console.warn(`[Worker] supervised run reconcile error: ${formatUnknownError(err)}`)
+  }
+}
+
 export async function pollJobs(): Promise<never> {
   // pendingが連続して残ったpoll cycle数。起動直後もこの1ループに合流するため、
   // startup専用の別ループは持たない（start()は本関数を即座に呼ぶだけ）。
@@ -536,6 +556,16 @@ export async function pollJobs(): Promise<never> {
       } else {
         pendingOutboxStreak = 0
         pendingOutboxAlertSent = false
+
+        // supervised run の reconcile を既存 poll cycle に相乗りさせる（#110 Step 3）。
+        // 新しい daemon / scheduler は追加しない（Outbox 再送を同じ cycle に載せているのと同じ形）。
+        //
+        // Worker はここで **retry しない**。retry は delegate-watchdog.sh の責務であり、
+        // 二重の retry actor を作らない（CEO確定構造）。ここが担うのは
+        // 「runDir の事実を durable state へ反映」「supervisor 自身が死んだ run の検出」
+        // 「terminal 後の continuation 起動」だけである。
+        await reconcileSupervisedRuns()
+
         const work = await fetchQueuedJob()
         if (work) {
           const { job } = work
