@@ -2450,6 +2450,32 @@ reconciliation 成功後にのみ Job を terminalize する。production 実動
 `outcome:'killed'` / `killedDescendants:true` / drain 22ms / cgroup 削除済み を実測し、
 deploy canary は全 PASS だった。
 
+**Operational E2E verified（2026-09-08）:** P1 Phase 1 / Phase 2 は unit・Linux cgroup smoke だけでなく、
+**実際の Mobile 入口から最後まで**通したことを確認済み（Run 3、project「Mobile E2E 3」）。
+DB 直接操作・人工 Job 作成・手動 workflow 介入は一切行っていない。
+
+通した経路: Mobile Project start → Roadmap → Task → initial implement → `workspace_baseline` 保存 →
+AI CLI containment → implement success → **dirty workspace 上で `implement:<jobId>:review` claim** →
+review success → **dirty workspace 上で `review:<jobId>:git-commit` claim** → CEO Approval Gate →
+git-commit success → workspace clean → cgroup cleanup → final reconciliation → ownership release → Task done。
+
+実測値: false quarantine 0 / containment error 0 / stale per-job cgroup 0 /
+Worker・API の想定外 restart 0 / 400・500 が 0 / commit `b5fc0f9` /
+final workspace clean / owning jobs `[]`。
+
+**記録の正確性について（過大に読まないこと）:**
+
+1. **cgroup の `populated=0` は直接 sample できていない。** observer は 100ms 間隔で、実測 drain は
+   約20ms のため、cgroup の**作成と削除は観測**したが 0 の瞬間は捉えていない。実装上 `rmdir` は
+   drain 成功後にしか実行されないため削除の観測は**強い間接証拠**だが、**直接観測済みとは書かない**。
+   直接追跡するには success path のログが要る（下記 containment observability 項目）。
+2. **Project 自体は `running` のまま。** Task は `done` になり、存在した work について continuation は
+   正常終了した。生成された Task が1件だったため後続 work は無い。
+   **Project auto-completion は Phase 1/2 の PASS 条件に含めない**（別項目
+   `project-auto-completion-detection` で扱う）。
+3. **401 anomaly は継続中**（本 run でも 469 件）。#115 の別 Finding として扱い、本 E2E への影響は
+   無かった。**Phase 1/2 へ戻して混ぜない。**
+
 <!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
 1. [ ] **Harness Bake-off / Execution Runtime Evaluation** — High-priority Recovery修正が一段落した後、
       **新規機能を増やす前に**実施する評価項目。第一候補としてOpenHands等のvendor-neutral /
@@ -2560,6 +2586,100 @@ deploy canary は全 PASS だった。
 
       **今回実装しないもの（明記）**: unit file の変更 / delegation 構成の変更 /
       新しい supervision 方式の導入。本項目は記録のみ。
+
+<!-- roadmap:id=dirty-worktree-admission-regression state=done -->
+4. [x] **dirty-worktree admission regression — CLOSED / VERIFIED（2026-09-08）** —
+      Phase 1 の two-case admission が、implement chain の**後続2ステップ**を
+      NORMAL Job（clean worktree 必須）と誤分類していた。**2件で1つの root cause**であり、
+      別 Finding には分けない。
+
+      **誤分類していたステップ**（どちらも「直前ステップが未commitで残した変更」を対象にするため、
+      clean worktree を要求すると構造上絶対に claim できない）:
+      - `implement:<sourceJobId>:review` … その変更をレビューする
+      - `review:<sourceJobId>:git-commit` … その変更を commit する
+
+      **root cause**: `isIntentionallyDirtyJob()` の allowlist が `repair:` / `resume:` / `retry:` だけで、
+      implement chain の中間2ステップを含んでいなかった。chain 先頭
+      `task:<taskId>:initial-implement` は clean 開始要求のままで正しい（継承すべき前ステップが無い）。
+
+      **fail-closed 自体は毎回正しく動作していた**（ownership 保持・quarantine・CRITICAL alert）。
+      欠陥は「危険を通した」ことではなく「**正当なステップを不正と誤分類した**」こと。
+
+      **修正**: 両ステップとも `<prefix>:<sourceJobId>:<suffix>` の**厳密一致**で判定する
+      （ちょうど3セグメント／prefix・suffix 完全一致／中間セグメント非空・空白なし）。
+      `startsWith()` にはしていないため、将来 `implement:<id>:*` や `review:<id>:*` が
+      追加されても dirty admission を自動継承しない。
+      PR #114（review step）/ PR #118（git-commit step）。
+
+      **CLOSED / VERIFIED の根拠**: 2026-09-08 Run 3 で、production 上で両ステップとも
+      dirty workspace 上を正常 claim し、commit `b5fc0f9` まで完走した。
+
+      **implementation note（再発防止）**: 最初の修正は不完全だった。PL が
+      「`review:` は既に whitelist 済み」と**記憶ベースで誤認**して報告し、実際の allowlist を
+      読み直さなかったため。結果として E2E を1周分余計に消費した。
+
+      **原則**: **workflow classification を変更するときは、記憶や既存の説明文ではなく、
+      実際の construction site と predicate の bounded inventory から判断する。**
+      （新しい gate や workflow は追加しない。判断材料の取り方の問題であって、
+      仕組みを増やして解決する問題ではない。）
+
+<!-- roadmap:id=fail-closed-recovery-path-gap state=planned -->
+5. [ ] **fail-closed 後に正規 recovery path が無く CEO 手作業が必要になる（cleanup-deadlock）** —
+      2026-09-08 までに**2回実測**。記録のみ。**今 cleanup subsystem を新設しない。**
+
+      **循環している状態**:
+      1. Job が baseline を作れず quarantine される（baseline 無しで `blocked` + `quarantined`）
+      2. その quarantine の正規 clearance は、baseline が無い場合
+         **known-good（worktree clean 等）を要求**する
+      3. しかし workspace は dirty のままであり、**workspace を clean へ戻す正規経路が存在しない**
+      4. → 自力復旧できない
+
+      **重要**: root cause は「quarantine されること」**ではない**。quarantine と fail-closed は
+      設計どおり正しく動作している。root cause は「**fail-closed したあと、安全な正規 recovery path が
+      無く、CEO の手作業が必要になる**」こと。
+
+      **実測（2回とも同じ形）**: どちらも CEO が「この2ファイルだけ削除」を**明示承認**しなければ
+      復旧できなかった。`git clean` / `git reset --hard` / DB 直接更新 / force quarantine clear は
+      いずれも禁止（workspace や他 Job を壊すため）で、安全な自動経路は無かった。
+      - 1回目: `implement:<jobId>:review` が誤分類で quarantine → worktree に未commitの2ファイル
+      - 2回目: `review:<jobId>:git-commit` が誤分類で quarantine → 同じ2ファイル
+      （誤分類そのものは上記4で CLOSED。ただし**誤分類が無くても、baseline を作れない別要因で
+      quarantine されれば同じ循環に入る**ため、本項目は独立した root cause として残す。）
+
+      **既存項目との関係（dedup 済み）**: `project-auto-recovery-e2e`（上記8）は復旧シナリオの
+      **検証項目**であり、その完了条件「復旧後に正しい位置から再開できる」を本件は満たさない。
+      本項目はその完了条件を満たすために**先に解くべき前提**として扱う。
+      `design-review-conflict-recovery` は Design Review CONFLICT 専用で別責務。
+      quarantine clearance 自体の仕組みは PR-C で実装済みであり、**不足しているのは
+      「clearance が要求する clean state を安全に作る経路」**である。
+
+      **着手する場合の方向性（実装ではなく検討材料）**: 新しい cleanup subsystem を作る前に、
+      既存の `revertBlockedJobChanges()`（Job 開始時点への path 限定復元。既に
+      「開始前から存在した変更には触れない」設計）を、quarantine 復旧経路から**再利用**できないかを
+      先に確認する。baseline が無い場合に何を「開始時点」と見なせるかが核心。
+
+      **今回実装しないもの（明記）**: cleanup subsystem / 自動 workspace 復元 /
+      force clearance / 新しい recovery gate。本項目は Finding 記録のみ。
+
+<!-- roadmap:id=containment-success-path-observability state=planned -->
+6. [ ] **containment success path が通常ログから追跡できない（observability hardening・低優先）** —
+      2026-09-08 記録。**Phase 1/2 は reopen しない。実装も今は始めない。**
+
+      **現状**: `runContainedCommand` は**失敗時にしかログを残さない**。success path の
+      「cgroup created → `populated=0` confirmed → cgroup removed」が通常ログに出ないため、
+      containment が実際に効いたことを**運用ログだけでは事後確認できない**。
+
+      **実測での影響**: 2026-09-08 の operational E2E では、この不足を補うために 100ms 間隔の
+      外部 observer を用意して cgroup の作成・削除を観測した。それでも実 drain が約20ms のため
+      **`populated=0` の瞬間は直接 sample できなかった**。`rmdir` が drain 成功後にしか実行されない
+      という実装上の性質から強い間接証拠は得られたが、直接証拠にはならない。
+
+      **対応方向（実装時）**: 新しい telemetry 基盤は作らず、既存のログ出力に
+      containment 1回あたりの構造化 1行（jobId / attempt / call-site / outcome / drain 所要 /
+      killedDescendants / cgroup path）を追加できるかを先に確認する。
+
+      **優先度**: 低。containment の**正しさ**は Linux real-cgroup テストと production 実動確認で
+      担保できており、本項目は**事後追跡性**の改善である。
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
