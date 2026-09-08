@@ -605,6 +605,75 @@ describe('runStrategicMetaReview with reviewKind=roadmap', () => {
   })
 })
 
+/**
+ * Claude は最終統合を担うが、deterministic aggregation の上位には立たない。
+ * Gemini の expert finding を Claude が ALIGNED へ塗り替えられないことを固定する。
+ * これが崩れると「レビューを通すために最終AIへ言い聞かせる」経路が生まれる。
+ */
+describe('roadmap kind: Claude はGeminiのfindingを握り潰せない', () => {
+  function roadmapInput(subjectId: string) {
+    return {
+      reviewKind: 'roadmap' as const,
+      subjectId,
+      taskTitle: 'Whole-Roadmap Review',
+      changedFiles: [],
+      gitDiff: '# Roadmap Design Review Material detailing the planned roadmap',
+      workingDir: repoRoot,
+    }
+  }
+
+  it('Gemini focused の CONFLICT は Claude が ALIGNED と言っても最終 CONFLICT', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('CONFLICT', 'scope conflict found'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+    mockClaudeIntegrationRun('ALIGNED', 'claude thinks everything is fine')
+
+    const result = await runStrategicMetaReview(roadmapInput('roadmap-claude-cannot-clear-conflict'))
+
+    expect(result.finalDecision).toBe('CONFLICT')
+    expect(result.independentReviewResult).toBeUndefined()
+  })
+
+  it('Gemini focused の UNCERTAIN は Claude が ALIGNED と言っても最低でも UNCERTAIN', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('UNCERTAIN', 'scope unclear'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+    mockClaudeIntegrationRun('ALIGNED', 'claude thinks everything is fine')
+
+    const result = await runStrategicMetaReview(roadmapInput('roadmap-claude-cannot-clear-uncertain'))
+
+    expect(result.finalDecision).toBe('UNCERTAIN')
+  })
+
+  it('Claude 自身の CONFLICT は最終 CONFLICT（安全側へは倒せる）', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'scope aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+    mockClaudeIntegrationRun('CONFLICT', 'claude found a cross-cutting contradiction')
+
+    const result = await runStrategicMetaReview(roadmapInput('roadmap-claude-can-escalate'))
+
+    expect(result.finalDecision).toBe('CONFLICT')
+  })
+
+  it('Claude が応答不能なら integration を省略せず REVIEW_UNAVAILABLE', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'scope aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
+    mockCreateAiCliAdapter.mockReturnValue({
+      run: vi.fn().mockResolvedValue({ blocked: false, exitCode: 1, stdout: '', stderr: 'claude unavailable' }),
+    } as unknown as ReturnType<typeof createAiCliAdapter>)
+
+    const result = await runStrategicMetaReview(roadmapInput('roadmap-claude-unavailable'))
+
+    expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+  })
+})
+
 describe('two-root control context resolution (control-plane vs target-project)', () => {
   it('positive: roadmap review succeeds with target docs in target root and control docs in control root', async () => {
     const { targetRoot, controlRoot } = await createTwoRootSetup({
