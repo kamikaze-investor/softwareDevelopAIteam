@@ -182,6 +182,19 @@ describe('MOB-001: 実行状態の見分け', () => {
     expect(deriveJobDisplayState(rerun, [], [oldStall])).toBe('running_healthy')
   })
 
+  it('別 Job の watchdog event では stalled にしない（jobId 一致が必要）', () => {
+    // stall 判定は (jobId, startedAt) の両方一致が条件。片方でも違えば別 episode。
+    const job = baseJob({ status: 'running' })
+    const otherJobsStall = stallEvent({ jobId: 'job-999' })
+    expect(deriveJobDisplayState(job, [], [otherJobsStall])).toBe('running_healthy')
+  })
+
+  it('watchdog event が無い running は healthy のまま（通常の running 表示）', () => {
+    const job = baseJob({ status: 'running' })
+    expect(deriveJobDisplayState(job, [], [])).toBe('running_healthy')
+    // WatchdogEvent の取得に失敗して空配列になった場合も、画面は healthy running を保つ
+    expect(deriveJobDisplayState(job, [], undefined as never)).toBe('running_healthy')
+  })
   it('quarantine を通常の blocked と区別する', () => {
     const quarantined = baseJob({
       status: 'blocked',
