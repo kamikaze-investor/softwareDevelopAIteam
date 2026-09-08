@@ -2494,6 +2494,107 @@ Adapter実装を開始する指示ではない**。実装着手はHigh-priority 
 - agent runtime resume
 - low-level filesystem / network permissions
 
+## P1 stuck-running-Job recovery — CLOSED（2026-09-08）
+
+**P1 は Phase 1 / Phase 2 / Phase 3 すべて完了。** 以下はその完了記録であり、
+ここに列挙した「別扱いで open のまま維持する項目」は P1 の未完を意味しない。
+
+### Phase 1 — crash-safe startup recovery（CLOSED）
+workspace baseline の durable 保存 / quarantine と ownership safety /
+startup reconciliation。master 反映・production deploy 済み。
+
+Operational E2E で、正規 workflow が dirty workspace を継承する2経路
+（`implement:<jobId>:review` / `review:<jobId>:git-commit`）が normal Job 扱いされ
+quarantine していた admission classification の漏れを2件発見し、
+どちらも exact-shape 判定として修正・test・review・deploy 済み。
+production 上で正常 claim を確認済みのため、同一 root cause として CLOSED / VERIFIED。
+
+### Phase 2 — async per-job cgroup containment（CLOSED）
+per-job cgroup 作成 / 配置 / 非同期実行 / timeout・kill・drain /
+子孫 cleanup / 実行後 workspace reconciliation / ownership 解放の安全性。
+master 反映・production deploy 済み。production 実動確認で、直接の子が exit 0 でも
+`setsid` 子孫が残る場合に `outcome:'killed'` / `killedDescendants:true` /
+drain 22ms / cgroup 削除 を実測。deploy canary 全 PASS。
+
+### Phase 3 — 残 Finding 3件（CLOSED）
+- **R5-N1** 通知の再送・fallback: merged / deployed / operational check PASS
+- **DB-007** WatchdogEvent の durable dedup: merged / migration 適用済み / operational check PASS
+  （dedup key は `(job_id, started_at)`。復旧後の正当な再 stall を潰さないため job_id 単独にしない）
+- **MOB-001** Mobile の stalled / quarantine 可視化: merged（#113 / #116 / #117）
+
+MOB-001 は CEO 実機確認で UX defect を検出し #117 で修正。
+別 provider による bounded UI/UX independent review は **APPROVE**（6観点すべて RESOLVED）。
+
+**UNVERIFIED — no naturally quarantined production Job available**:
+修正版 quarantine UI の再実機確認だけは、確認時点で自然発生した quarantined Job が
+0件のため未実施。**P1 completion の blocker とはしない**（人工的な quarantine を
+production に作らない方針のため）。将来自然な quarantine が発生した時点で
+operational observation として確認する。
+
+### P1 完了時点の production 実測
+API health 200 / API・Worker とも active・NRestarts=0 / production tree clean /
+`/workspace/target` clean / running Job 0 / quarantined Job 0 /
+DB `integrity_check` ok / Worker エラーログ 0。
+
+### P1 とは分離して open のまま維持する項目（P1 の未完ではない）
+これらは P1 の実装で顕在化した、または隣接する別責務であり、重複 Finding は作らない。
+
+- shared-workspace leakage / cleanup-deadlock（本節の該当項目へ集約済み）
+- worktree isolation（`project-auto-worker-trust-boundary`）
+- adversarial cgroup escape（`containment-adversarial-escape-threat-model`）
+- `Delegate=yes` hardening（`worker-cgroup-delegation-contract`）
+- containment success path の可観測性（`containment-success-path-observability`）
+- Meta Reviewer robustness（`meta-review-structured-output-robustness`）
+- background-task supervision
+- legacy `API_TOKEN` → ADMIN / WORKER split credential migration
+
+
+### 次に着手すべき root-cause cluster（P1 完了時点の handoff・2026-09-08）
+
+**選定: shared workspace の dirty leakage → 恒久 quarantine（cleanup-deadlock）→ worktree isolation**
+
+**なぜ次か**: open 項目の中で、**実際に production の workflow を止め、
+CEO 承認の手動介入を要した唯一のクラスタ**であるため。2026-09-08 の Operational E2E で
+2回実測しており、再現性がある（別 Project でも再発）。他の open 項目は
+hardening（`Delegate=yes`・containment observability）、対象外と判断済みの threat model
+（adversarial escape）、あるいは別系統（Meta Reviewer robustness）であり、
+いずれも現時点で production を停止させていない。
+
+**既存実装との関係**:
+- P1 Phase 1 がこの問題を**可視化**した。以前は「前 attempt の未 commit 変更が
+  次 Job へ静かに混入する」汚染だったものが、baseline admission により
+  `workspace_baseline_failure` quarantine として**停止**するようになった。
+  Phase 1 が原因ではなく、既存の欠陥を検出できるようにしただけである
+- P1 Phase 2（containment）はこの問題に触れていない。cgroup はプロセスを回収するが、
+  ファイルシステム上に残った変更は回収しない
+- **clearance の known-good 要件を緩めて解決してはならない。** それは
+  「安全と証明できない限り所有権を解放しない」という hard invariant そのもの。
+  不足しているのは安全性チェックではなく、**dirty から正規に known-good へ戻す経路**
+
+**ledger 上の注意（着手前に解消すべき）**: この root cause を扱う
+`project-auto-worker-trust-boundary` は `state=done` になっている。
+これは「設計項目（実装を伴わない）」として完了した経緯によるもので、
+worktree isolation の**実装は未着手**。つまり現状、この cluster には
+**open な owner 項目が無い**。新しい重複 Finding を作るのではなく、
+この項目の state を実態に合わせるか、実装用の後継項目を1件立てるかを先に決めること。
+
+**最初に行う read-only 調査（実装前）**:
+1. 残った変更の**帰属**を既存情報だけで特定できるか。`workspace_baseline` /
+   `buildWorktreeManifest` / `fingerprintWorktreeEntries` / repair 情報から
+   「どの source Job が作った変更か」を判定できるか
+2. `revertBlockedJobChanges()` の適用条件（現在は File Change Guard 違反時のみ、
+   かつ manifest 由来の変更のみ）を、untracked を含む一般的な cleanup へ
+   安全に広げられるか。広げられない場合は何が不足しているか
+3. worktree isolation（1 Job = 1 worktree）を既存 `resumeBlockedTask()` の
+   「新 Job 行を作る」形へ載せられるか。roadmap 424-470 行の既存設計案が
+   現在の Phase 1/2 実装（baseline / quarantine / containment）と整合するか
+4. 帰属不能な変更が残った場合の扱い。**自動削除はしない**方針を維持したまま、
+   quarantine 維持 + PL エスカレーションで運用が回るか
+
+**着手時の禁止事項**: 曖昧な変更の自動削除 / CEO への Git 判断の要求 /
+clearance 条件の緩和 / 新しい cleanup subsystem の先行実装。
+
+
 **現行P1実装の位置づけ:** P1 Phase 1（workspace baseline・quarantine・startup reconciliation）と
 P1 Phase 2（async per-job cgroup containment）は**いずれも完了**している
 （Phase 2: 2026-09-08、master `5825433`、production deploy 済み）。これらは
