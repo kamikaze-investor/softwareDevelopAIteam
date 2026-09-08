@@ -54,3 +54,25 @@ export function isTerminalSupervisedRunStatus(status: SupervisedRunStatus): stat
 export function isActiveSupervisedRunStatus(status: SupervisedRunStatus): boolean {
   return !isTerminalSupervisedRunStatus(status)
 }
+
+/**
+ * 「進捗が無い」と判定してよいまでの無出力許容時間（C-4）。**kind ごとに異なる。**
+ *
+ * 一律の短いtimeoutで判定しない（C-4）: 正常な無出力時間はtaskごとに違う。
+ * 実障害ケース2では、idle な Metro はログを出さないのに「ログが古い＝停止」と判定して
+ * 健全なサービスを停止扱いにした。
+ *
+ * **この値は policy であって呼び出し側の引数ではない**（独立レビュー指摘 2026-09-08 第3ラウンド）。
+ * cutoff を呼び出し側から渡せると、未来時刻を渡すだけで健全に進行中の run を stalled にでき、
+ * そのまま所有権を奪えてしまう。cutoff は storage 内部で
+ * 「現在時刻 − この閾値」として算出する。
+ */
+export const SUPERVISED_RUN_STALE_THRESHOLD_MS: Record<SupervisedRunKind, number> = {
+  // AI委任は思考中に無出力の時間が長い。delegate-watchdog.sh の inactivity 既定(120s)より
+  // 保守的に取り、監視側が先走って所有権を奪わないようにする。
+  ai_delegation: 600_000,   // 10min
+  // Expo restart は ready 到達まで通常数秒〜数分。ただし ready 後の Metro は
+  // client activity が無い限りログを出さないため、log ではなく external probe が
+  // 進捗signalになる（C-2a）。ここは probe が一切記録されない場合の上限として使う。
+  expo_restart: 300_000,    // 5min
+}

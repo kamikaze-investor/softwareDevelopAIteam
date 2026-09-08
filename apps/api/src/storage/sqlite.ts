@@ -11,7 +11,8 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
-import { computeTaskDisplayStatus } from '@ai-team/shared'
+import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS } from '@ai-team/shared'
+import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
 import type { TaskContinuation } from '@ai-team/shared'
@@ -2965,23 +2966,42 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).run(error, now(), id, claimToken)
       return result.changes === 1
     },
-    markStalledBySupervisor(id, reason, noProgressSince) {
+    markStalledBySupervisor(id, reason) {
       // 監視側が所有者に到達できない run へ旗を立てる。**終端書き込みではない**ので
       // claim_token を要求しない（fencing の対象は終端の確定であって、停止の疑いではない）。
       // これが無いと、所有者が死んだ run は stalled にできず recovery にも入れないまま
       // running で残り続ける（実障害ケース1と同じ結末）。
       //
-      // ただし無条件の旗立ては許さない（独立レビュー指摘 2026-09-08 第2ラウンド）:
-      // `last_progress_at >= noProgressSince` の run、つまり**進捗が観測できている run は
-      // stalled にできない**。停止の主張は観測可能な事実に裏付けられていなければならず、
-      // これが無いと健全に進行中の run を誰でも stalled にして所有権を奪えてしまう。
+      // ただし無条件の旗立ては許さない: **進捗が観測できている run は stalled にできない**。
+      // 停止の主張は観測可能な事実に裏付けられていなければならず、これが無いと健全に
+      // 進行中の run を誰でも stalled にして所有権を奪えてしまう。
       // C-2a（進捗を見ずに停止と判定しない）と C-5（診断してから動く）の実装である。
-      const result = db.prepare(`
-        UPDATE supervised_runs
-        SET status = 'stalled', error = ?
-        WHERE id = ? AND status = 'running' AND last_progress_at < ?
-      `).run(reason, id, noProgressSince)
-      return result.changes === 1
+      //
+      // **cutoff は呼び出し側から受け取らない**（独立レビュー指摘 2026-09-08 第3ラウンド）。
+      // 引数にすると未来時刻を渡すだけで条件を素通りでき、ガードとして何も証明しない。
+      // ここでは kind ごとの policy（SUPERVISED_RUN_STALE_THRESHOLD_MS）と現在時刻から
+      // storage 内部で算出する。閾値を kind 別にするのは C-4（正常な無出力時間は task ごとに
+      // 異なるので一律の短い timeout で判定しない）に従うためである。
+      const sweepTransaction = db.transaction((): boolean => {
+        const current = db.prepare('SELECT kind, status FROM supervised_runs WHERE id = ?').get(id) as any
+        if (!current || current.status !== 'running') return false
+
+        const threshold = SUPERVISED_RUN_STALE_THRESHOLD_MS[current.kind as SupervisedRunKind]
+        if (threshold === undefined) {
+          // 未知の kind は閾値を決められない。勝手に stalled にはせず、判定を見送る
+          // （fail-closed 側の判断は predicate 解決経路が担当する）。
+          return false
+        }
+
+        const staleCutoff = new Date(Date.now() - threshold).toISOString()
+        const result = db.prepare(`
+          UPDATE supervised_runs
+          SET status = 'stalled', error = ?
+          WHERE id = ? AND status = 'running' AND last_progress_at < ?
+        `).run(reason, id, staleCutoff)
+        return result.changes === 1
+      })
+      return sweepTransaction()
     },
     markOrphanedRunsStalledAtStartup(startedBefore) {
       const sweepTransaction = db.transaction((): SupervisedRun[] => {

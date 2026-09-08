@@ -645,15 +645,17 @@ export interface ISupervisedRunStorage {
    * これが無いと、所有者が死んだ run は誰も stalled にできず、recovery も終端もできないまま
    * running で残る（実障害ケース1と同じ結末）。
    *
-   * **`noProgressSince` より後に進捗が観測されている run は stalled にできない**
-   * （独立レビュー指摘 2026-09-08 第2ラウンド）。tokenless な旗立てを無条件に許すと、
+   * **進捗が観測できている run は stalled にできない。** tokenless な旗立てを無条件に許すと、
    * 健全に進行中のrunを誰でも stalled にして所有権を奪えてしまう。
    * 停止の主張は**観測可能な事実（lastProgressAt）に裏付けられていなければならない**
    * — C-2a（進捗を見ずに停止と判定しない）と C-5（診断してから動く）そのものである。
    *
-   * @param noProgressSince この時刻以降に進捗があれば false を返す（＝生きている）
+   * 判定に使う cutoff は**呼び出し側から受け取らない**（独立レビュー指摘 2026-09-08 第3ラウンド）。
+   * 引数にすると未来時刻を渡すだけで素通りでき、ガードとして何も証明しない。
+   * cutoff は kind ごとの policy（`SUPERVISED_RUN_STALE_THRESHOLD_MS`）と現在時刻から
+   * storage 内部で算出する。
    */
-  markStalledBySupervisor(id: string, reason: string, noProgressSince: string): boolean
+  markStalledBySupervisor(id: string, reason: string): boolean
   /**
    * process crash後の起動時回収。前プロセスが残した running を `stalled` へ倒す。
    *

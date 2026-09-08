@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { createSQLiteStorage, MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS } from './sqlite'
+import { SUPERVISED_RUN_STALE_THRESHOLD_MS } from '@ai-team/shared'
 import type { IStorage } from './interface'
 
 const baseInput = {
@@ -204,14 +205,25 @@ describe('supervised_runs storage', () => {
   })
 
   describe('所有者が死んだ run も終端できる（無期限RUNNINGを塞ぐ完全な経路）', () => {
+    /** 実際に無出力時間が経過した状況を作る。cutoff は storage 内部で決まるので、時刻の側を動かす。 */
+    function backdateProgress(runId: string, msAgo: number): void {
+      const db = new Database(dbPath)
+      try {
+        db.prepare('UPDATE supervised_runs SET last_progress_at = ? WHERE id = ?')
+          .run(new Date(Date.now() - msAgo).toISOString(), runId)
+      } finally {
+        db.close()
+      }
+    }
+
     it('sweep → recovery → 終端まで、tokenの持ち主が居なくても到達できる', () => {
       const { run } = storage.supervisedRuns.create(baseInput)
       // 所有者（wrapper）が死んだ想定。誰も現在の token を持っていない。
+      // kind の閾値を超えて無出力が続いた状態を作る。
+      backdateProgress(run.id, SUPERVISED_RUN_STALE_THRESHOLD_MS.ai_delegation + 60_000)
 
-      // 1. 監視側が旗を立てる（終端書き込みではないので token 不要）。
-      //    ただし「進捗が観測できていない」ことを示す時刻を根拠として渡す必要がある。
-      const noProgressSince = new Date(Date.now() + 60_000).toISOString()
-      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'owner unreachable', noProgressSince)).toBe(true)
+      // 1. 監視側が旗を立てる（終端書き込みではないので token 不要）
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'owner unreachable')).toBe(true)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('stalled')
 
       // 2. bounded に所有権を取得する
@@ -227,22 +239,43 @@ describe('supervised_runs storage', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
       storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
 
-      const noProgressSince = new Date(Date.now() + 60_000).toISOString()
-      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'too late', noProgressSince)).toBe(false)
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'too late')).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('succeeded')
     })
 
-    it('進捗が観測できている run は stalled にできない — 健全な run の所有権を奪えない（独立レビュー第2ラウンド）', () => {
+    it('進捗が観測できている run は stalled にできない — 健全な run の所有権を奪えない', () => {
       const { run } = storage.supervisedRuns.create(baseInput)
 
-      // run は「今」進捗している。それより前の時刻を根拠にした停止主張は通らない。
-      const staleClaim = new Date(Date.now() - 60_000).toISOString()
-      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'bogus stall claim', staleClaim)).toBe(false)
+      // run は「今」進捗している。閾値に達していないので停止主張は通らない。
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'bogus stall claim')).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('running')
 
       // したがって所有権の横取り（stalled にしてから claimForRecovery）も成立しない。
       const claimed = storage.supervisedRuns.claimForRecovery(run.id, 'opportunistic_actor')
       expect(claimed.claimToken).toBeUndefined()
+    })
+
+    it('cutoff は呼び出し側が動かせない — 閾値未満の run は誰が呼んでも stalled にできない（独立レビュー第3ラウンド）', () => {
+      const { run } = storage.supervisedRuns.create(baseInput)
+
+      // 閾値のちょうど手前まで無出力にしても、まだ stalled にはできない。
+      backdateProgress(run.id, SUPERVISED_RUN_STALE_THRESHOLD_MS.ai_delegation - 60_000)
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'too early')).toBe(false)
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('running')
+
+      // 閾値を超えて初めて成立する。判定材料は呼び出し側の主張ではなく DB 上の事実である。
+      backdateProgress(run.id, SUPERVISED_RUN_STALE_THRESHOLD_MS.ai_delegation + 60_000)
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'genuinely quiet')).toBe(true)
+    })
+
+    it('閾値は kind ごとに異なる（C-4: 一律の短い timeout で判定しない）', () => {
+      expect(SUPERVISED_RUN_STALE_THRESHOLD_MS.ai_delegation)
+        .not.toBe(SUPERVISED_RUN_STALE_THRESHOLD_MS.expo_restart)
+
+      const expo = storage.supervisedRuns.create({ ...baseInput, kind: 'expo_restart', subjectId: 'manage-master' })
+      // ai_delegation なら未達だが expo_restart の閾値は超える経過時間。
+      backdateProgress(expo.run.id, SUPERVISED_RUN_STALE_THRESHOLD_MS.expo_restart + 60_000)
+      expect(storage.supervisedRuns.markStalledBySupervisor(expo.run.id, 'quiet')).toBe(true)
     })
   })
 
