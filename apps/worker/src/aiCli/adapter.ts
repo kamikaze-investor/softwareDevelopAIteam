@@ -132,7 +132,23 @@ function isInside(child: string, parent: string): boolean {
  *
  * 判定できない場合（gitが無い等）は fail-closed。
  */
+/**
+ * containment 検証の結果キャッシュ。キーは (temp root, workingDir) の正準パス。
+ *
+ * 検証は `--ignored` 付きの `git status` を伴い、`node_modules` のような無視ディレクトリまで
+ * 走査するため、巨大リポジトリでは既存の `buildWorktreeManifest` より重くなりうる。
+ * Codex 呼び出しのたびに走らせると、`--ignored` 無しなら成功する構成でタイムアウトさせて
+ * しまう（独立レビュー指摘、2026-09-08。既存 reviewer の contract を壊さないこと）。
+ *
+ * 検証しているのは **mount / symlink 構成**であって実行ごとに変わる情報ではないので、
+ * プロセス内で1組につき1回で足りる。信頼済みホスト前提（構成は実行中に敵対的へ変化しない）。
+ */
+const CONTAINMENT_VERIFIED = new Set<string>()
+
 function assertCaptureDirIsOutsideRepo(captureDir: string, workingDir: string): void {
+  const cacheKey = `${canonicalRealPath(os.tmpdir())}::${canonicalRealPath(workingDir)}`
+  if (CONTAINMENT_VERIFIED.has(cacheKey)) return
+
   const sentinelName = `.codex-capture-probe-${process.pid}-${randomUUID()}`
   const sentinelPath = path.join(captureDir, sentinelName)
 
@@ -145,6 +161,8 @@ function assertCaptureDirIsOutsideRepo(captureDir: string, workingDir: string): 
         + `現れます（bind mount 等の別名経由）。read-only保証が壊れるため中止します。`,
       )
     }
+
+    CONTAINMENT_VERIFIED.add(cacheKey)
   } finally {
     try {
       unlinkSync(sentinelPath)

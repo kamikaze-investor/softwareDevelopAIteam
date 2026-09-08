@@ -424,6 +424,32 @@ describe('CodexAdapter --output-last-message structured output', () => {
   // that writes into the repo at all cannot honestly claim the repo is untouched.
   // The assertion is deliberately stronger than "cleaned up afterwards": the repo must be
   // untouched **during** the run too, which is what a mid-run snapshot checks.
+  // Narrow-verification finding (2026-09-08): the containment probe uses
+  // `git status --ignored`, which descends into ignored trees such as node_modules and inherits
+  // git's timeout and output cap. Running it on every Codex call could fail configurations that
+  // succeed today, so it is verified once per (temp root, repo) per process -- the mount/symlink
+  // layout it checks does not change between calls on a trusted host.
+  it('verifies containment once per process, not on every call', async () => {
+    const workingDir = makeWorkingDir()
+    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+
+    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
+      const args = argv ?? []
+      const out = args[args.indexOf('--output-last-message') + 1]
+      if (out === undefined) throw new Error('missing --output-last-message path')
+      writeFileSync(out, '{"ok":true}', 'utf-8')
+      return 'not json'
+    })
+
+    worktreeContainsNameMock.mockClear()
+    await adapter.run(makeRequest(workingDir))
+    const afterFirst = worktreeContainsNameMock.mock.calls.length
+    await adapter.run(makeRequest(workingDir))
+
+    expect(afterFirst).toBeGreaterThan(0)
+    expect(worktreeContainsNameMock.mock.calls.length).toBe(afterFirst)
+  })
+
   it('creates the capture file outside workingDir and never writes into the repo', async () => {
     const workingDir = makeWorkingDir()
     const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
