@@ -8,7 +8,7 @@
  * MVP-Aの正規workingDir（/workspace/target固定）をサーバー側で設定する。
  */
 
-import type { ApprovalRequest, Job, Task, WatchdogEvent } from '@ai-team/shared'
+import type { ApprovalRequest, Job, Task, TaskSummary, WatchdogEvent } from '@ai-team/shared'
 
 export function parseDateTime(value: string): number {
   const time = Date.parse(value)
@@ -112,6 +112,52 @@ export function deriveJobDisplayState(
       : 'blocked'
   }
   return 'other'
+}
+
+/**
+ * MOB-001: 一覧・詳細・Dashboard で共通に使う状態ラベル。
+ * 画面ごとに文言がずれると、CEO は「同じ状態なのか別の状態なのか」を判断できない。
+ */
+export const JOB_DISPLAY_STATE_LABEL: Record<JobDisplayState, string> = {
+  approval_waiting: '承認待ち',
+  blocked: '停止中',
+  other: '',
+  quarantined: '安全停止中',
+  running_healthy: '実行中',
+  running_stalled: '停滞中',
+}
+
+/**
+ * MOB-001: 作業を前へ進める操作（実装 / 独立レビュー / 変更を反映）を出してよい状態か。
+ *
+ * quarantine では **false**。これらはいずれも `POST /api/jobs` で新しい Job を作り、
+ * その Job は workspace を claim しようとする。安全性が確認できていない workspace に対して
+ * 実行してよい操作ではない。
+ *
+ * 「backend が拒否するから UI は押せてもよい」という設計にはしない。押せる状態で見せること
+ * 自体が、CEO に「これを押せば進む」という誤った期待を持たせる。
+ */
+export function allowsProgressActions(state: JobDisplayState): boolean {
+  return state !== 'quarantined'
+}
+
+/**
+ * MOB-001: quarantine 時に CEO へ示す状況説明。
+ *
+ * **「自動復旧中」とは書かない。** 2026-09-08 の調査で、それが事実でないことが判明している:
+ *   - quarantine の再検証は Worker 起動時の `recoverJobsAtStartup()` だけで、定期実行は無い
+ *   - 本番の workspace は実際に dirty（untracked ファイルが残っている）ため、
+ *     再検証しても再び quarantine になるだけで、Worker restart では本質的に解消しない
+ *   - 同じ clean-worktree quarantine が別 Project でも再発している
+ *
+ * 進行中でない復旧を「進行中」と表示すると、CEO は待っていれば直ると誤解し、
+ * 実際には誰も動いていない状態が放置される。事実に一致する表現だけを出す。
+ */
+export function quarantineGuidanceText(): string {
+  return '安全のため停止しています。'
+    + '承認や再開では解除されません。'
+    + '自動では復旧しません。AI開発チーム側で作業領域の復旧が必要です。'
+    + 'CEOによる操作は必要ありません。'
 }
 
 /**
@@ -283,4 +329,54 @@ export function canShowResumeUI(
   }
 
   return true
+}
+
+/**
+ * MOB-001: TaskSummary（一覧/Dashboard が使う read-model）から実行状態を導出する。
+ * 詳細画面の deriveJobDisplayState と **同じ優先順位・同じ episode key** を使う。
+ * 画面ごとに判定がずれると、CEO は同じ状態を別物として受け取ってしまう。
+ */
+export function deriveSummaryDisplayState(
+  summary: TaskSummary,
+  watchdogEvents: WatchdogEvent[] = [],
+): JobDisplayState {
+  const job = summary.latestJob
+  if (job === undefined) return 'other'
+  if (job.status === 'blocked' && job.quarantined === true) return 'quarantined'
+  if (job.status === 'running') {
+    const stalled = watchdogEvents.some((event) => (
+      event.jobId === job.jobId &&
+      event.startedAt === job.startedAt &&
+      event.isStuck === true &&
+      event.status !== 'false_alarm' &&
+      event.status !== 'resolved'
+    ))
+    return stalled ? 'running_stalled' : 'running_healthy'
+  }
+  if (job.status === 'blocked') {
+    return summary.approvalSummary.hasWaitingApproval ? 'approval_waiting' : 'blocked'
+  }
+  return 'other'
+}
+
+/** Dashboard カードに出す、Project 単位の代表状態。優先順位は詳細画面と同じ。 */
+const SUMMARY_STATE_PRIORITY: readonly JobDisplayState[] = [
+  'quarantined',
+  'running_stalled',
+  'approval_waiting',
+  'blocked',
+  'running_healthy',
+]
+
+/**
+ * MOB-001: Project 配下の Task 群から、Dashboard に出す代表状態を決める。
+ * CEO が Dashboard を見ただけで異常に気付けることが目的なので、
+ * 「対応が要る状態」を優先して昇格させる。
+ */
+export function deriveProjectSummaryState(
+  summaries: TaskSummary[],
+  watchdogEvents: WatchdogEvent[] = [],
+): JobDisplayState {
+  const states = new Set(summaries.map((s) => deriveSummaryDisplayState(s, watchdogEvents)))
+  return SUMMARY_STATE_PRIORITY.find((state) => states.has(state)) ?? 'other'
 }

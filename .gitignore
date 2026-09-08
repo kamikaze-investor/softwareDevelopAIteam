@@ -67,3 +67,6 @@ apps/worker/data/
 # SQLite DB本体・一時承認ディレクトリ（data/README.md等の追跡ファイルは対象外）
 data/*.db
 data/.tmp_approval/
+
+# PL作業で生成する一時QR画像（リポジトリへ入れない）
+expo-qr*.svg

@@ -28,11 +28,25 @@ import {
 
 import {
   deriveProjectExecutionHealth,
+  isQuarantined,
+  quarantineGuidanceText,
   PROJECT_EXECUTION_HEALTH_LABEL,
   type ProjectExecutionHealth,
 } from '../../lib/taskWorkflow'
 import { apiFetch } from '../../lib/api'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
+
+/**
+ * MOB-001: Project lifecycle を CEO 向けの言葉にする。
+ * `running` を「実行中」と訳すと安全停止と矛盾して見えるため、
+ * 「継続中」＝Project を続ける意思、という意味に寄せる。
+ */
+const PROJECT_LIFECYCLE_LABEL: Record<string, string> = {
+  archived: '終了',
+  draft: '準備中',
+  paused: '一時停止中',
+  running: '継続中',
+}
 
 const MAX_TASKS_FOR_RECENT_JOBS = 3
 const MAX_JOBS_PER_TASK = 2
@@ -293,7 +307,14 @@ function selectFailedTaskJobs(
       ),
       task,
     }))
-    .filter(({ jobs, task }) => task.status === 'blocked' || jobs.length > 0)
+    .filter(({ jobs, task }) => (
+      task.status === 'blocked' ||
+      jobs.length > 0 ||
+      // MOB-001（独立UXレビュー指摘）: quarantine された Task が「要対応Taskはありません」に
+      // 埋もれていた。Task.status は 'pending' のままで、Job も 'failed' ではなく 'blocked' の
+      // ため、従来の条件では拾えない。安全停止は最も対応が要る状態なので必ず出す。
+      (jobsByTaskId[task.id] ?? []).some(isQuarantined)
+    ))
 }
 
 function selectRecentJobs(
@@ -389,13 +410,15 @@ function ProjectStatusSection({
         ) : (
           <>
             <StatusBadge color={HEALTH_COLOR[health]} status={healthLabel} />
+            {/* MOB-001: lifecycle は「実行中」と読ませない。Project を続ける意思の話であって、
+                いま処理が進んでいるかどうかではない。 */}
             <Text style={styles.lifecycleHint}>
-              Project lifecycle: {project.status}
+              Project自体の状態: {PROJECT_LIFECYCLE_LABEL[project.status] ?? project.status}
             </Text>
             {health === 'quarantined' && (
               <Text style={styles.quarantineHint}>
-                workspaceの安全性が確認できないため停止しています。
-                承認や再開では解除されません。workspaceの検証・整合性の回復が必要です。
+                作業領域の安全性を確認できないため停止しています。
+                {quarantineGuidanceText()}
               </Text>
             )}
           </>
@@ -614,6 +637,11 @@ function FailedTasksSection({
           <Text style={styles.itemTitle} numberOfLines={2}>
             {task.title}
           </Text>
+          {(jobsByTaskId[task.id] ?? []).some(isQuarantined) && (
+            <Text style={[styles.failureText, { color: '#dc2626' }]}>
+              安全停止中 — AI開発チームによる作業領域の復旧が必要です（CEOの操作は不要）
+            </Text>
+          )}
           {task.status === 'blocked' && (
             <Text style={[styles.failureText, { color: STATUS_COLOR.blocked }]}>
               停止中 / 要対応（Approval待ち・安全停止等を含む）

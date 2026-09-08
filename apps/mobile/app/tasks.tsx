@@ -4,8 +4,9 @@
 
 import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
-import type { JobStatus, TaskDisplayStatus, TaskSummary } from '@ai-team/shared'
+import type { JobStatus, TaskDisplayStatus, TaskSummary, WatchdogEvent } from '@ai-team/shared'
 import { router } from 'expo-router'
+import { JOB_DISPLAY_STATE_LABEL, type JobDisplayState } from '../lib/taskWorkflow'
 import {
   ActivityIndicator,
   Alert,
@@ -64,6 +65,16 @@ const JOB_STATUS_TEXT_STYLE: Record<JobStatus, { color: string }> = {
   queued: { color: '#a3a3a3' },
   running: { color: '#60a5fa' },
   success: { color: '#22c55e' },
+}
+
+async function fetchWatchdogEventsSafe(): Promise<WatchdogEvent[]> {
+  try {
+    const response = await apiFetch('/api/watchdog-events')
+    if (!response.ok) return []
+    return (await response.json()) as WatchdogEvent[]
+  } catch {
+    return []
+  }
 }
 
 async function fetchTaskSummaries(): Promise<TaskSummary[]> {
@@ -156,7 +167,49 @@ function getAttentionText(displayStatus: TaskDisplayStatus): string | null {
   return null
 }
 
-function TaskCard({ task }: { task: TaskSummary }): ReactElement {
+/**
+ * MOB-001: 一覧でも quarantine / stalled を単なる「停止中」に畳まない。
+ * CEO は一覧を見た時点で「対応が要るもの」と「待っていればよいもの」を区別できる必要がある。
+ *
+ * 新しい status は作らない。既存の latestJob.status / latestJob.quarantined /
+ * approvalSummary / WatchdogEvent から導出する。
+ */
+function deriveSummaryState(
+  task: TaskSummary,
+  watchdogEvents: WatchdogEvent[],
+): JobDisplayState {
+  const job = task.latestJob
+  if (job === undefined) return 'other'
+  if (job.status === 'blocked' && job.quarantined === true) return 'quarantined'
+  if (job.status === 'running') {
+    // 詳細画面と同じ episode key (jobId, startedAt) で判定する。
+    const stalled = watchdogEvents.some((event) => (
+      event.jobId === job.jobId &&
+      event.startedAt === job.startedAt &&
+      event.isStuck === true &&
+      event.status !== 'false_alarm' &&
+      event.status !== 'resolved'
+    ))
+    return stalled ? 'running_stalled' : 'running_healthy'
+  }
+  if (job.status === 'blocked') {
+    return task.approvalSummary.hasWaitingApproval ? 'approval_waiting' : 'blocked'
+  }
+  return 'other'
+}
+
+/** 一覧バッジの色。quarantine と stalled は「気づかせる」ため強い色にする。 */
+const SUMMARY_STATE_COLOR: Record<JobDisplayState, string> = {
+  approval_waiting: '#a855f7',
+  blocked: '#f59e0b',
+  other: '#737373',
+  quarantined: '#dc2626',
+  running_healthy: '#3b82f6',
+  running_stalled: '#f97316',
+}
+function TaskCard({ task, watchdogEvents }: { task: TaskSummary; watchdogEvents: WatchdogEvent[] }): ReactElement {
+  const execState = deriveSummaryState(task, watchdogEvents)
+  const execLabel = JOB_DISPLAY_STATE_LABEL[execState]
   const statusBadgeStyle = getTaskStatusBadgeStyle(task.displayStatus)
   const statusTextStyle = getTaskStatusTextStyle(task.displayStatus)
   const attentionText = getAttentionText(task.displayStatus)
@@ -173,10 +226,17 @@ function TaskCard({ task }: { task: TaskSummary }): ReactElement {
         <Text style={styles.projectName} numberOfLines={1}>
           {task.projectName}
         </Text>
-        <View style={[styles.statusBadge, statusBadgeStyle]}>
-          <Text style={[styles.statusText, statusTextStyle]}>
-            {formatDisplayStatus(task.displayStatus)}
-          </Text>
+        <View style={styles.badgeRow}>
+          {execLabel !== '' && (
+            <View style={[styles.execBadge, { backgroundColor: SUMMARY_STATE_COLOR[execState] }]}>
+              <Text style={styles.execBadgeText}>{execLabel}</Text>
+            </View>
+          )}
+          <View style={[styles.statusBadge, statusBadgeStyle]}>
+            <Text style={[styles.statusText, statusTextStyle]}>
+              {formatDisplayStatus(task.displayStatus)}
+            </Text>
+          </View>
         </View>
       </View>
 
@@ -217,6 +277,8 @@ function TaskCard({ task }: { task: TaskSummary }): ReactElement {
 
 export default function TasksScreen(): ReactElement {
   const [tasks, setTasks] = useState<TaskSummary[]>([])
+  // MOB-001: stalled を一覧でも見分けるため。既存エンドポイントを読むだけ。
+  const [watchdogEvents, setWatchdogEvents] = useState<WatchdogEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -226,6 +288,8 @@ export default function TasksScreen(): ReactElement {
       setError(null)
       const taskSummaries = await fetchTaskSummaries()
       setTasks(taskSummaries)
+      // 取得失敗は致命的でない: stalled 表示が出ないだけで一覧は壊さない。
+      setWatchdogEvents(await fetchWatchdogEventsSafe())
     } catch (loadError) {
       const message =
         loadError instanceof Error
@@ -281,7 +345,7 @@ export default function TasksScreen(): ReactElement {
       )}
 
       {tasks.map((task) => (
-        <TaskCard key={task.taskId} task={task} />
+        <TaskCard key={task.taskId} task={task} watchdogEvents={watchdogEvents} />
       ))}
 
       <View style={styles.bottomSpacer} />
@@ -317,6 +381,21 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     marginBottom: 12,
     padding: 16,
+  },
+  badgeRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 6,
+  },
+  execBadge: {
+    borderRadius: 5,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  execBadgeText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '700',
   },
   cardTop: {
     alignItems: 'center',
