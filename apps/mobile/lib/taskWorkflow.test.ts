@@ -3,6 +3,9 @@ import { describe, expect, it } from 'vitest'
 
 import {
   allowsProgressActions,
+  allRoadmapTasksDone,
+  blockerNeedsHumanDecision,
+  visibleTaskActions,
   allowsRoutineRecoveryActions,
   canShowResumeUI,
   deriveJobDisplayState,
@@ -436,5 +439,56 @@ describe('MOB-001: 一覧・Dashboard の状態導出と action gating', () => {
     expect(JOB_DISPLAY_STATE_LABEL.running_stalled).toBe('停滞中')
     expect(JOB_DISPLAY_STATE_LABEL.approval_waiting).toBe('承認待ち')
     expect(JOB_DISPLAY_STATE_LABEL.blocked).toBe('停止中')
+  })
+})
+
+/**
+ * MOB-001 CEO実機再確認 follow-up: workflow state に対して意味のある操作だけを出す。
+ */
+describe('MOB-001: action eligibility と完了表示', () => {
+  const job = (over: Partial<Job>): Job => makeJob({ ...over })
+
+  it('ordinary blocked では作業を進める3操作を出さない（resume/recoveryの領分）', () => {
+    const v = visibleTaskActions('blocked', [job({ status: 'blocked' })], [])
+    expect(v).toEqual({ implement: false, review: false, reflect: false })
+  })
+
+  it('承認待ちでも3操作は出さない（承認が先）', () => {
+    const v = visibleTaskActions('approval_waiting', [job({ status: 'blocked' })], [])
+    expect(v).toEqual({ implement: false, review: false, reflect: false })
+  })
+
+  it('安全停止中でも出さない（既存の挙動を維持）', () => {
+    const v = visibleTaskActions('quarantined', [job({ status: 'blocked' })], [])
+    expect(v).toEqual({ implement: false, review: false, reflect: false })
+  })
+
+  it('実装成功後は「独立レビュー」だけを出し、実装開始は出さない', () => {
+    const jobs = [job({ id: 'i1', status: 'success', aiCliMode: 'implement' })]
+    const v = visibleTaskActions('other', jobs, [])
+    expect(v.review).toBe(true)
+    expect(v.implement).toBe(false)
+  })
+
+  it('成果が無ければ「実装を開始」だけを出す', () => {
+    const v = visibleTaskActions('other', [], [])
+    expect(v.implement).toBe(true)
+    expect(v.review).toBe(false)
+    expect(v.reflect).toBe(false)
+  })
+
+  it('技術的blockerではCEOの自由入力を必須にしない', () => {
+    for (const c of ['code', 'environment', 'configuration'] as const) {
+      expect(blockerNeedsHumanDecision(c)).toBe(false)
+    }
+    // Goal・方針レベルだけCEO判断
+    expect(blockerNeedsHumanDecision('approval_or_policy')).toBe(true)
+  })
+
+  it('全Task完了のProjectは「作業中」に見せない', () => {
+    const done = [{ taskId: 't1', taskStatus: 'done', latestJob: { jobId: 'j', status: 'success' } }] as never
+    const notDone = [{ taskId: 't1', taskStatus: 'pending', latestJob: { jobId: 'j', status: 'blocked' } }] as never
+    expect(allRoadmapTasksDone(done)).toBe(true)
+    expect(allRoadmapTasksDone(notDone)).toBe(false)
   })
 })

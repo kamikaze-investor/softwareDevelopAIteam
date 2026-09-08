@@ -8,7 +8,14 @@
  * MVP-Aの正規workingDir（/workspace/target固定）をサーバー側で設定する。
  */
 
-import type { ApprovalRequest, Job, Task, TaskSummary, WatchdogEvent } from '@ai-team/shared'
+import type {
+  ApprovalRequest,
+  Job,
+  Task,
+  TaskFailureClassification,
+  TaskSummary,
+  WatchdogEvent,
+} from '@ai-team/shared'
 
 export function parseDateTime(value: string): number {
   const time = Date.parse(value)
@@ -379,4 +386,64 @@ export function deriveProjectSummaryState(
 ): JobDisplayState {
   const states = new Set(summaries.map((s) => deriveSummaryDisplayState(s, watchdogEvents)))
   return SUMMARY_STATE_PRIORITY.find((state) => states.has(state)) ?? 'other'
+}
+
+/**
+ * MOB-001（CEO実機再確認）: 「システム内部で可能な操作」ではなく
+ * 「CEOが今この状態で実際に判断・操作すべきもの」だけを出すための可視判定。
+ *
+ * 既存の can* predicate をそのまま再利用し、新しい workflow state machine は作らない。
+ * 変えたのは「無効化して見せる」から「出さない」への一点だけ。押せるボタンが並ぶこと自体が
+ * 「これを押せば進む」という誤った期待を作る。
+ */
+export interface VisibleTaskActions {
+  implement: boolean
+  review: boolean
+  reflect: boolean
+}
+
+export function visibleTaskActions(
+  state: JobDisplayState,
+  jobs: Job[],
+  approvalRequests: ApprovalRequest[],
+): VisibleTaskActions {
+  const none: VisibleTaskActions = { implement: false, review: false, reflect: false }
+
+  // 安全停止中は workspace の安全性が未確認。いずれの操作も新しい Job を作って claim を試みる。
+  if (state === 'quarantined') return none
+
+  // 停止中（Guard 違反・承認待ち）で必要なのは「新しい作業の開始」ではなく、
+  // その blocker に対する resume / recovery。実装や反映を並べても前へ進まない。
+  if (state === 'blocked' || state === 'approval_waiting') return none
+
+  // 実行中は割り込ませない（既存 manualWorkflowIsLocked と同じ意図）。
+  if (manualWorkflowIsLocked(jobs, approvalRequests)) return none
+
+  return {
+    // 実装は「まだレビュー待ち・反映待ちの成果が無い」ときにだけ意味がある。
+    implement: !canRunReview(jobs, approvalRequests) && !canReflectChanges(jobs, approvalRequests),
+    review: canRunReview(jobs, approvalRequests),
+    reflect: canReflectChanges(jobs, approvalRequests),
+  }
+}
+
+/**
+ * MOB-001: blocker の解消を CEO の自由入力に頼ってよいかどうか。
+ *
+ * 既存の `TaskFailureClassification` をそのまま使う。新しい classifier は作らない。
+ * code / environment / configuration は技術的な問題であり、CEO に
+ * 「何を指示すればよいか」を考えさせるのは筋が悪い。AI/PL 側の復旧経路が主で、
+ * 自由入力は主導線にしない。
+ */
+export function blockerNeedsHumanDecision(
+  classification: TaskFailureClassification | undefined,
+): boolean {
+  return classification === 'approval_or_policy'
+}
+
+/** 全 roadmap Task が完了しているか（Dashboard で「作業中」に見せないための判定） */
+export function allRoadmapTasksDone(summaries: TaskSummary[]): boolean {
+  const roadmapTasks = summaries.filter((s) => s.latestJob !== undefined || s.taskStatus === 'done')
+  if (roadmapTasks.length === 0) return false
+  return roadmapTasks.every((s) => s.taskStatus === 'done')
 }

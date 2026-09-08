@@ -18,6 +18,7 @@ import type {
 import { router } from 'expo-router'
 import {
   JOB_DISPLAY_STATE_LABEL,
+  allRoadmapTasksDone,
   deriveProjectSummaryState,
   type JobDisplayState,
 } from '../lib/taskWorkflow'
@@ -278,11 +279,14 @@ function ProjectCard({
   project,
   onStarted,
   health,
+  allTasksDone,
 }: {
   project: Project
   onStarted: () => void
   /** MOB-001: 既存状態から導出した実行状態。lifecycle status とは別物。 */
   health?: JobDisplayState
+  /** MOB-001: 全 roadmap Task 完了。running のままでも作業中に見せないため。 */
+  allTasksDone?: boolean
 }) {
   const [tasks, setTasks] = useState<Task[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
@@ -404,6 +408,11 @@ function ProjectCard({
           {project.name}
         </Text>
         <View style={styles.badgeGroup}>
+          {allTasksDone === true && (health === undefined || health === 'other') && (
+            <View style={[styles.badge, { backgroundColor: '#22c55e' }]}>
+              <Text style={styles.badgeText}>完了</Text>
+            </View>
+          )}
           {health !== undefined && health !== 'other' && (
             <View style={[styles.badge, { backgroundColor: HEALTH_BADGE_COLOR[health] }]}>
               <Text style={styles.badgeText}>{JOB_DISPLAY_STATE_LABEL[health]}</Text>
@@ -625,6 +634,9 @@ export default function Dashboard() {
   const [projects, setProjects] = useState<Project[]>([])
   const [pendingApprovalCount, setPendingApprovalCount] = useState<number | null>(null)
   const [healthByProject, setHealthByProject] = useState<Record<string, JobDisplayState>>({})
+  // MOB-001: Project lifecycle に completed は存在せず、明示終了まで running のまま。
+  // そのため「全Task完了」を別途導出しないと、終わった Project が作業中に見える。
+  const [doneByProject, setDoneByProject] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -648,6 +660,9 @@ export default function Dashboard() {
       }
       setHealthByProject(Object.fromEntries(
         Object.entries(byProject).map(([id, list]) => [id, deriveProjectSummaryState(list, watchdog)]),
+      ))
+      setDoneByProject(Object.fromEntries(
+        Object.entries(byProject).map(([id, list]) => [id, allRoadmapTasksDone(list)]),
       ))
 
       if (projectsResult.status === 'fulfilled') {
@@ -716,6 +731,7 @@ export default function Dashboard() {
         {projects.map((project) => (
           <ProjectCard
             key={project.id}
+            allTasksDone={doneByProject[project.id] === true}
             health={healthByProject[project.id]}
             onStarted={load}
             project={project}
