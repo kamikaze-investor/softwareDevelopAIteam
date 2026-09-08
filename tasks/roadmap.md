@@ -2318,6 +2318,38 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    実障害ケース1〜3はいずれも「満たしていないoperationがworkflowをblockする位置に置かれた」結果であり、
    個別のbug修正では再発を止められない。
 
+   **E-1. admission ruleは維持する。** 新規に作るもの、および新しく正式運用へ載せる
+   workflow-blocking async operationは、Supervision Contract未充足なら**原則禁止**である。
+   下記のlegacy exceptionは、この原則の緩和ではなく**既存運用を壊さないための期限付き猶予**である。
+
+   #### Legacy exception registry（CEO判断、2026-09-08。期限付き。open-endedにしない）
+
+   **E-2. 対象は「現時点で既に運用されている未配線operation」だけ**とする。
+   下表に**明示登録されたものに限り**、supervised_runsへの正式配線が完了するまでの間、
+   workflow-blockingな使用を認める。
+
+   **E-3. 各exceptionは必ず4項目を持つ。** owner / 不足しているcontract要件 / 暫定監視方法 /
+   解消条件。**解消条件は「いつか直す」ではなく「supervised_runsへの正式配線完了」**とする
+   （sunset条件）。配線が完了した時点でその行は削除する。
+
+   **E-4. 新しい種類のexception追加は禁止する。** 今後新しいworkflow-blocking async operationが
+   現れた場合、「legacyだから」を理由に本表へ追加してはならない。**先にContractへ適合させる。**
+   本表は増えない表であり、配線が進むにつれて減っていく表である。
+
+   **E-5. exception中でも無期限RUNNINGは禁止する（C-1はexceptionの対象外）。** 正式配線前でも、
+   既存のwatch / poll / manual check等でterminal outcomeを確認する暫定運用を必ず持つ。
+   **「何も監視せず待つ」は例外としても認めない。** これは今回の3件すべての直接原因であり、
+   ここを緩めるとexceptionを設ける意味がなくなる。
+
+   | kind | owner | 不足しているcontract要件 | 暫定監視方法（E-5） | 解消条件（sunset） |
+   |---|---|---|---|---|
+   | `deploy` | PL Role | durable run/state・observable progress・completion predicate・stall detection・bounded recovery・automatic continuation・session非依存（**ほぼ全項目**）。VPS deployは`jobs`を経由しないPL手順であり、run行が存在しない | 手順の各stepで**明示的なmanual check**（systemd unitのactive確認、`/health`応答確認）を行い、確認できるまで次stepへ進まない。結果は作業報告へ必ず残す | `supervised_runs`へ`deploy` kindを配線し、8要求を満たすこと |
+   | `build` | PL Role | observable progress（`checkStall()`が`startedAt`のみで、log等の実進捗を見ない）。durable state・terminal・automatic continuationは既存`jobs` + jobRunnerの`JOB_TIMEOUT_MS`とpoll loopで**すでに満たしている** | 既存のJob経路をそのまま使う（`jobs`行 + Worker watchdogのstall検知 + timeoutによる強制終端）。**Job経路を迂回した直接実行はexceptionの対象外**とする | `stallDetector.checkStall()`へ進捗signalを渡せるようにし、`supervised_runs`へ配線すること |
+   | `external_ci` | PL Role | durable run/state・automatic continuation（実障害ケース3で実証）。自前のchild processが無いためPID系の監視は原理的に使えない | **watcherをarmする前に、判定に使うコマンドの実在を確認する**（ケース3の直接の再発防止）。加えてwatcher任せにせず、**明示的な再確認を1回は行う**まで完了と報告しない | `supervised_runs`へ`external_ci` kindを配線し、GitHub API pollまたはwebhookでautomatic continuationを満たすこと |
+
+   **登録されていないoperationはexceptionではない。** 表に無いworkflow-blocking async operationは
+   E-1の原則どおり禁止であり、必要なら先にContractへ適合させる。
+
    #### 実装方針（機構は統合しない）
 
    他セッションでも長時間監視対策を調査中である。**この件を理由に新しい watchdog / supervisor /
@@ -2474,16 +2506,17 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `deploy` / `build` / `external_ci` も定義上すでに対象である。D-1が決めているのは
    **どの順で既存supervisorを配線するか**だけである。
 
-   **未決事項（CEO判断待ち）**: admission ruleとD-1を素直に併せると、
-   **まだ配線されていないasync operation（`deploy` / `build` / `external_ci`）は
-   「workflowをblockする形では正式運用経路に載せられない」**ことになる。
-   現に今それらを運用で使っているため、次のいずれかを選ぶ必要がある:
-   (a) 配線されるまで期限付きの明示的例外として扱う、
-   (b) rollout順序を前倒しして先に配線する、
-   (c) blockしない形（結果を待たない運用）へ一時的に落とす。
-   **この判断が済むまで実装着手しない。**
-   なお`external_ci`は自前のchild processを持たないため、progress sourceもcompletion predicateも
+   **決定済み（CEO判断、2026-09-08）**: admission ruleとD-1を併せると、まだ配線されていない
+   `deploy` / `build` / `external_ci` はworkflow-blockingな形で使えないことになるが、
+   これらは現に運用中である。**選択肢(a)「期限付きの明示的例外」を採用する。**
+   実体は上記「Legacy exception registry」であり、E-1〜E-5の制約下でのみ有効である。
+   採用しなかった案: (b) rollout前倒し、(c) blockしない形へ一時的に落とす。
+
+   **D-1のrollout順序**: まず `ai_delegation` / `expo_restart` を配線し、
+   **その後legacy exceptionを順次解消する**（registryの行を1つずつ消していく）。
+   `external_ci`は自前のchild processを持たないため、progress sourceもcompletion predicateも
    `ai_delegation` / `expo_restart` とは異なる形（GitHub APIのpoll、あるいはwebhook）になる。
+   registryが空になった時点で、E-1の原則が例外なく適用される状態になる。
 
    **D-2. completion predicateをDBで実行しない。** predicateを自由文字列やDB内DSLとして保存し、
    それを解釈・実行する経路は作らない。DBに保存するのは
