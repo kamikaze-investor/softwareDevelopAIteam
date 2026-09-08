@@ -2114,6 +2114,29 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `codex-sandbox-off-deprecated-landlock`側で行う。適用範囲を広げる変更は
    既存production reviewerの挙動を変えるため、独立した変更として扱いCEO承認を得ること。
 
+<!-- roadmap:id=roadmap-evidence-before-task-sync-crash-window state=planned -->
+0. [ ] **evidence登録後〜Task sync前のcrashでRoadmapが再生成されうる**（2026-09-08登録。
+   PR Cのprovider-separated reviewで指摘。**PR Cのblockingにはしない**（CEO判断））。
+
+   **事実**: Roadmap design review evidenceは`designReviewCoordinator.ts`で登録され、
+   Task行は後から`projectInitialization.ts`のTask syncで作られる。
+   `hasActiveRoadmap()`（`projectStartWorkflow.ts:63`）は**active Task行だけ**を見るため、
+   この間にcrashするとrecoveryは「Roadmapがまだ無い」と判断し`kickProjectStart()`で
+   頭から作り直す。
+
+   **Step 1 durability契約を破ってはいない**: 契約は「persisted authoritative Roadmapを
+   再生成しない」であり、authoritativeの定義はこれまでもTask行の存在だった。
+   evidenceだけがある状態はauthoritativeとして扱われてこなかった。
+   ただし**契約の適用範囲が言葉の印象より狭い**ことは記録しておく価値がある。
+
+   **PR Cで変わったのはコストと結果の重さ**: 破棄されるのは
+   Codex `gpt-5.6-sol`/xhighが生成し、Gemini focused ×3 と Claude Opus integrationが
+   ALIGNEDと判定したRoadmapである。再生成はLLMなので同じ内容にならない。
+   E2E中にこれが起きた場合、原因不明の再生成に見えるので誤診しないこと。
+
+   **やること**: authoritativeの判定をTask行の存在だけに依存させず、
+   「acceptedなevidenceがある」段階もrecoveryが認識できるようにする。
+   新しいstatus体系を作らず、既存のevidence行とstart_stageで表現できるかをまず検討する。
 <!-- roadmap:id=review-substage-progress-reporting state=planned -->
 0. [ ] **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。
 
