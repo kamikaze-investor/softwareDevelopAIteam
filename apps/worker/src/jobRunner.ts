@@ -1859,19 +1859,62 @@ export function computeWorkspaceBaseline(job: Job, workingDir: string): Workspac
 }
 
 /**
+ * `<prefix>:<sourceJobId>:<suffix>` ちょうどこの形かどうか。
+ *
+ * これは「dirty worktree を受け入れてよいか」という**安全条件**なので、
+ * 正規表現ではなくセグメント分割で厳密に検査する。
+ * `/^implement:(.+):review$/` のような正規表現では次を取りこぼす:
+ *   - `.+` が `:` を含むため `implement:a:extra:review` まで一致する
+ *   - JS の `$` は末尾の改行の前にも一致するため `implement:a:review\n` が通る
+ * どちらも「安全条件を広げすぎない」という目的に反する（2026-09-08 独立レビュー指摘）。
+ *
+ * API 側（`routes/jobs.ts`）が生成する形がそのまま契約である。
+ * prefix だけで広く許可しないのは、将来 `<prefix>:<id>:*` の別ステップが追加されたときに
+ * dirty workspace の受け入れまで自動継承させないため。
+ */
+function isExactWorkflowStepKey(stepKey: string, prefix: string, suffix: string): boolean {
+  const segments = stepKey.split(':')
+  return (
+    segments.length === 3 &&
+    segments[0] === prefix &&
+    segments[1].length > 0 &&
+    !/\s/.test(segments[1]) &&
+    segments[2] === suffix
+  )
+}
+
+/**
  * INTENTIONALLY-DIRTY Job の分類（PR-C）。
  *
  * `repair:` / `resume:` / `retry:` で始まる workflowStepKey は、失敗した前 Job（implement /
  * repair 等）の後続として同一 Task の dirty worktree を正統に受け継ぐ Job である。
  * aiCliMode はこの判定に使わない（`task:<id>:initial-implement` のような NORMAL Job も
  * implement であり、dirty を受け継ぐ理由にならないため）。
+ *
+ * implement chain の後続2ステップも同じ理由で INTENTIONALLY-DIRTY である。
+ * どちらも「直前のステップが**未commitのまま残した**変更」を対象にするため、
+ * clean worktree を要求すると**構造上絶対に通らない**:
+ *   - `implement:<sourceJobId>:review`     … その変更をレビューする
+ *   - `review:<sourceJobId>:git-commit`    … その変更を commit する（commit 対象が
+ *                                             worktree にある状態で始まるのが正常）
+ *
+ * 2026-09-08 の operational E2E で両方を実測した。まず implement 直後の review Job が、
+ * 修正後は続けて git-commit Job が `normal Job requires a clean worktree` として
+ * quarantine され、chain が commit へ到達できなかった
+ * （fail-closed 自体は毎回正しく働いており、欠陥は正当なステップの誤分類だった）。
+ *
+ * chain の先頭 `task:<taskId>:initial-implement` は clean 開始を要求したままにする
+ * （前ステップが無いので dirty を受け継ぐ理由が無い）。
  */
 function isIntentionallyDirtyJob(job: Job): boolean {
   const stepKey = job.workflowStepKey
+  if (stepKey === undefined) return false
   return (
-    stepKey?.startsWith('repair:') === true ||
-    stepKey?.startsWith('resume:') === true ||
-    stepKey?.startsWith('retry:') === true
+    stepKey.startsWith('repair:') ||
+    stepKey.startsWith('resume:') ||
+    stepKey.startsWith('retry:') ||
+    isExactWorkflowStepKey(stepKey, 'implement', 'review') ||
+    isExactWorkflowStepKey(stepKey, 'review', 'git-commit')
   )
 }
 

@@ -3909,3 +3909,231 @@ describe('P1 Phase 2: 実行後 reconciliation の失敗は種類を問わず qu
       .rejects.toThrow(/cannot prove the workspace is safe to release/)
   })
 })
+
+/**
+ * P1 regression（2026-09-08 operational E2E で実測）:
+ * implement Job が成功したあとの `implement:<jobId>:review` Job は、
+ * 直前の implement が**未commitのまま残した**変更をレビューするために存在する。
+ * これを NORMAL Job（clean worktree 必須）として扱うと構造上絶対に claim できず、
+ * chain が git-commit へ進めないまま quarantine される。
+ */
+describe('computeWorkspaceBaseline: post-implement review Job の dirty 継承（P1 regression）', () => {
+  const dirtyManifest = {
+    paths: ['e2e/phase12-smoke.js', 'e2e/phase12-smoke.test.js'],
+    changes: [
+      { path: 'e2e/phase12-smoke.js', kind: 'added' as const, afterType: 'regular' as const },
+      { path: 'e2e/phase12-smoke.test.js', kind: 'added' as const, afterType: 'regular' as const },
+    ],
+  } as unknown as ChangeManifest
+
+  const REVIEW_BASE_HASH = 'basecommit0000000000000000000000000000000'
+
+  beforeEach(() => {
+    detectGitOperationStateMock.mockReturnValue([])
+    // HEAD 解決を成立させる（この describe を自己完結させる）
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) =>
+      Array.isArray(args) && args[0] === 'rev-parse' ? `${REVIEW_BASE_HASH}\n` : '',
+    )
+  })
+
+  it('implement 直後の dirty worktree でも review Job は claim できる（dirty baseline を得る）', () => {
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+    fingerprintWorktreeEntriesMock.mockReturnValue(new Map<string, string>([
+      ['e2e/phase12-smoke.js', 'hash-a'],
+      ['e2e/phase12-smoke.test.js', 'hash-b'],
+    ]))
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'implement:job-implement-1:review' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      // review Job にも durable な baseline が保存される（mode:'dirty'）
+      expect(result.baseline.mode).toBe('dirty')
+      expect(result.baseline.startCommitHash).toBe(REVIEW_BASE_HASH)
+    }
+  })
+
+  it('通常 Job は dirty worktree では従来どおり拒否される（fail-closed を弱めない）', () => {
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    const result = computeWorkspaceBaseline(createJob(), '/workspace/target')
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.reason).toContain('normal Job requires a clean worktree')
+    }
+  })
+
+  it('initial-implement Job は dirty worktree では拒否されたまま（clean 開始を要求する）', () => {
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'task:task-1:initial-implement' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(false)
+  })
+
+  it('implement: で始まっても :review 以外は dirty 継承しない（安全条件を広げない）', () => {
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    for (const stepKey of [
+      'implement:job-1:something-else',
+      'implement:job-1',
+      'implement:',
+      'preimplement:job-1:review',
+      // 独立レビュー指摘（2026-09-08）: 正規表現 `^implement:(.+):review$` では
+      // 以下が通ってしまっていた。`.+` は `:` を含み、JS の `$` は末尾改行の前にも一致するため。
+      'implement:job-1:extra:review',
+      'implement:job-1:review\n',
+      'implement::review',
+      'implement:job 1:review',
+      'implement:job-1:review:',
+    ]) {
+      const result = computeWorkspaceBaseline(createJob({ workflowStepKey: stepKey }), '/workspace/target')
+      expect(result.ok, `${stepKey} は dirty 継承の対象外であるべき`).toBe(false)
+    }
+  })
+
+  it('進行中の git 操作があれば review Job でも fail-closed（既存の優先順位を維持）', () => {
+    detectGitOperationStateMock.mockReturnValue(['index.lock'])
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'implement:job-implement-1:review' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain('index.lock')
+  })
+})
+
+/**
+ * 独立レビュー指摘の補足: review Job でも HEAD 解決失敗は fail-closed のまま。
+ * dirty 継承を許可することと、状態を確認できないまま通すことは別問題。
+ */
+describe('post-implement review Job: HEAD 解決失敗は fail-closed', () => {
+  it('review Job でも HEAD を解決できなければ ok:false', () => {
+    detectGitOperationStateMock.mockReturnValue([])
+    buildWorktreeManifestMock.mockReturnValue({
+      paths: ['a.ts'],
+      changes: [{ path: 'a.ts', kind: 'added' as const, afterType: 'regular' as const }],
+    } as unknown as ChangeManifest)
+    execFileSyncMock.mockImplementation(() => { throw new Error('not a git repository') })
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'implement:job-1:review' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(false)
+  })
+})
+
+/**
+ * P1 regression（同一 root cause の2件目。2026-09-08 operational E2E Run 2 で実測）:
+ * `review:<sourceJobId>:git-commit` は、implement / review が残した未commit変更を
+ * **commit するため**のステップなので、commit 対象が worktree にある状態で始まるのが正常。
+ * NORMAL Job（clean worktree 必須）として扱うと構造上絶対に claim できず、
+ * chain は commit へ到達できない。
+ */
+describe('computeWorkspaceBaseline: git-commit Job の dirty 継承（P1 regression）', () => {
+  const COMMIT_BASE_HASH = 'basecommit0000000000000000000000000000000'
+  const dirtyManifest = {
+    paths: ['e2e/phase12-smoke.js', 'e2e/phase12-smoke.test.js'],
+    changes: [
+      { path: 'e2e/phase12-smoke.js', kind: 'added' as const, afterType: 'regular' as const },
+      { path: 'e2e/phase12-smoke.test.js', kind: 'added' as const, afterType: 'regular' as const },
+    ],
+  } as unknown as ChangeManifest
+
+  beforeEach(() => {
+    detectGitOperationStateMock.mockReturnValue([])
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) =>
+      Array.isArray(args) && args[0] === 'rev-parse' ? `${COMMIT_BASE_HASH}\n` : '',
+    )
+    fingerprintWorktreeEntriesMock.mockReturnValue(new Map<string, string>([
+      ['e2e/phase12-smoke.js', 'hash-a'],
+      ['e2e/phase12-smoke.test.js', 'hash-b'],
+    ]))
+  })
+
+  it('git-commit Job は dirty worktree 上で claim できる（commit 対象がある状態が正常）', () => {
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'review:job-review-1:git-commit' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.baseline.mode).toBe('dirty')
+      expect(result.baseline.startCommitHash).toBe(COMMIT_BASE_HASH)
+    }
+  })
+
+  it('通常 Job は dirty worktree では従来どおり拒否（fail-closed を弱めない）', () => {
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    const result = computeWorkspaceBaseline(createJob(), '/workspace/target')
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain('normal Job requires a clean worktree')
+  })
+
+  it('review: で始まっても :git-commit の厳密な形以外は dirty 継承しない', () => {
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    for (const stepKey of [
+      'review:a:extra:git-commit',   // 余分な colon セグメント
+      'review::git-commit',          // 空の sourceJobId
+      'review:a:git-commit\n',       // 末尾改行
+      'review:a:git commit',         // suffix 不一致
+      'review:a b:git-commit',       // sourceJobId に空白
+      'review:a:git-commit:',        // 末尾 colon
+      'review:a:something-else',     // 別 suffix（将来 review:<id>:* が増えても自動許可しない）
+      'review:a',
+      'preview:a:git-commit',
+    ]) {
+      const result = computeWorkspaceBaseline(createJob({ workflowStepKey: stepKey }), '/workspace/target')
+      expect(result.ok, `${stepKey} は dirty 継承の対象外であるべき`).toBe(false)
+    }
+  })
+
+  it('git-commit Job でも進行中 git 操作があれば fail-closed', () => {
+    detectGitOperationStateMock.mockReturnValue(['index.lock'])
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'review:job-review-1:git-commit' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toContain('index.lock')
+  })
+
+  it('commit 後の clean worktree でも git-commit Job は claim できる（dirty baseline + 空 entries）', () => {
+    // commit が完了して worktree が clean になった状態でも、
+    // INTENTIONALLY-DIRTY 判定は完全一致比較のため mode:'dirty' を維持する。
+    buildWorktreeManifestMock.mockReturnValue({ paths: [], changes: [] } as unknown as ChangeManifest)
+    fingerprintWorktreeEntriesMock.mockReturnValue(new Map())
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'review:job-review-1:git-commit' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.baseline.mode).toBe('dirty')
+      if (result.baseline.mode === 'dirty') expect(result.baseline.entries).toEqual([])
+    }
+  })
+})

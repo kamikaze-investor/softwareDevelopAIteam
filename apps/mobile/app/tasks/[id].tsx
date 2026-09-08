@@ -17,6 +17,7 @@ import type {
   TaskFailureQuestionResponse,
   TaskFailureQuestionTurn,
   TaskStatus,
+  WatchdogEvent,
 } from '@ai-team/shared'
 import { router, useLocalSearchParams } from 'expo-router'
 import {
@@ -35,12 +36,16 @@ import { apiFetch } from '../../lib/api'
 import {
   canReflectChanges,
   canRunReview,
+  allowsProgressActions,
   canShowResumeUI,
+  deriveJobDisplayState,
   isImplementJob,
+  isQuarantined,
   isJobBusy,
   isReviewJob,
   manualWorkflowIsLocked,
   parseDateTime,
+  quarantineGuidanceText,
   sortJobsByNewestFirst,
 } from '../../lib/taskWorkflow'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
@@ -184,6 +189,8 @@ interface TaskDetailData {
   task: Task
   jobs: Job[]
   approvalRequests: ApprovalRequest[]
+  /** MOB-001: stall を「検出しただけ」と「確認済み」に分けて表示するため */
+  watchdogEvents: WatchdogEvent[]
 }
 
 async function fetchTask(taskId: string): Promise<Task | null> {
@@ -226,6 +233,21 @@ async function fetchApprovalRequests(
   }
 
   return (await response.json()) as ApprovalRequest[]
+}
+
+/**
+ * MOB-001: watchdog が stall と確認したかを表示に反映するために取得する。
+ * 新しい backend workflow は作らず、既存の WatchdogEvent 取得APIをそのまま読むだけ。
+ * 取得に失敗しても詳細画面は壊さない（stall表示が出ないだけに留める）。
+ */
+async function fetchWatchdogEvents(taskId: string): Promise<WatchdogEvent[]> {
+  const response = await apiFetch(
+    `/api/watchdog-events`,
+    { method: 'GET' },
+  )
+  if (!response.ok) return []
+  const all = (await response.json()) as WatchdogEvent[]
+  return all.filter((event) => event.taskId === taskId)
 }
 
 async function fetchTaskFailureExplanation(
@@ -416,7 +438,7 @@ async function postResumeInstruction(
   }
 }
 
-function TaskInfoSection({ task }: { task: Task }): ReactElement {
+function TaskInfoSection({ task, safetyStopped }: { task: Task; safetyStopped: boolean }): ReactElement {
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>Task情報</Text>
@@ -427,14 +449,26 @@ function TaskInfoSection({ task }: { task: Task }): ReactElement {
         </Text>
 
         <Text style={styles.detailLabel}>状態</Text>
-        <Text
-          style={[
-            styles.statusText,
-            STATUS_TEXT_STYLE[task.status] ?? styles.statusTextFallback,
-          ]}
-        >
-          {formatTaskStatus(task.status)}
-        </Text>
+        {safetyStopped ? (
+          <>
+            {/* MOB-001: 安全停止中に Task 本来の lifecycle（未着手 等）を主表示にすると、
+                「まだ始まっていないだけ」と読めて安全停止を打ち消してしまう。
+                operational safety state を優先し、lifecycle は補助情報へ落とす。 */}
+            <Text style={[styles.statusText, { color: '#dc2626' }]}>安全停止中</Text>
+            <Text style={styles.secondaryStatusText}>
+              Task自体の状態: {formatTaskStatus(task.status)}
+            </Text>
+          </>
+        ) : (
+          <Text
+            style={[
+              styles.statusText,
+              STATUS_TEXT_STYLE[task.status] ?? styles.statusTextFallback,
+            ]}
+          >
+            {formatTaskStatus(task.status)}
+          </Text>
+        )}
       </View>
     </View>
   )
@@ -598,6 +632,75 @@ function TaskFailureQuestionModal({
   )
 }
 
+/**
+ * MOB-001: 実行状態を CEO が見分けられるようにする。
+ *
+ * 新しい status 体系は作らず、既存の Job.status / failureMetadata.quarantined /
+ * WatchdogEvent / approval state から導出して表示するだけ。
+ *
+ * 重要なのは quarantine を通常の停止と混同させないこと。quarantine は
+ * 「承認すれば進む」状態ではなく、workspace の状態が確認できないので所有権を
+ * 保持している状態であり、必要なのは reconciliation / clearance である。
+ */
+const EXECUTION_STATE_VIEW: Record<string, { color: string; label: string; detail: string } | undefined> = {
+  approval_waiting: {
+    color: '#f59e0b',
+    label: '承認待ち',
+    detail: 'CEOの承認を待っています。承認すると続きが実行されます。',
+  },
+  blocked: {
+    color: '#f59e0b',
+    label: '停止中',
+    detail: 'Guard違反などで停止しています。追加指示を送って再開できます。',
+  },
+  quarantined: {
+    color: '#dc2626',
+    label: '安全停止中',
+    detail:
+      '実行後の作業領域が安全だと確認できなかったため、この Job が作業領域を保持したまま停止しています。' +
+      '承認や再開では解消しません。作業領域の照合（reconciliation）と解除が必要です。',
+  },
+  running_healthy: {
+    color: '#3b82f6',
+    label: '実行中',
+    detail: '正常に実行中です。',
+  },
+  running_stalled: {
+    color: '#f97316',
+    label: '実行中（停滞を確認）',
+    detail: '実行中ですが、watchdog が停滞と判断しました。進んでいない可能性があります。',
+  },
+}
+
+function ExecutionStateSection({
+  approvalRequests,
+  jobs,
+  watchdogEvents,
+}: {
+  approvalRequests: ApprovalRequest[]
+  jobs: Job[]
+  watchdogEvents: WatchdogEvent[]
+}): ReactElement | null {
+  const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
+  const state = deriveJobDisplayState(latestJob, approvalRequests, watchdogEvents)
+  const view = EXECUTION_STATE_VIEW[state]
+  if (view === undefined) return null
+
+  const reason = latestJob?.failureMetadata?.quarantineReason
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>実行状態</Text>
+      <View style={[styles.executionStateBadge, { backgroundColor: view.color }]}>
+        <Text style={styles.executionStateBadgeText}>{view.label}</Text>
+      </View>
+      <Text style={styles.executionStateDetail}>{view.detail}</Text>
+      {state === 'quarantined' && reason !== undefined && (
+        <Text style={styles.executionStateReason}>理由: {reason}</Text>
+      )}
+    </View>
+  )
+}
 function TaskFailureExplanationSection({
   jobs,
   task,
@@ -858,13 +961,29 @@ function JobActionsSection({
   jobs,
   onCreated,
   task,
+  watchdogEvents,
 }: {
   approvalRequests: ApprovalRequest[]
   jobs: Job[]
   onCreated: () => void
   task: Task
+  watchdogEvents: WatchdogEvent[]
 }): ReactElement {
   const [runningAction, setRunningAction] = useState<JobActionKind | null>(null)
+
+  // MOB-001: quarantine 中は作業を進める操作を **表示しない**。
+  // 3つのボタンはいずれも POST /api/jobs で新しい Job を作り、その Job は workspace を
+  // claim しようとする。安全性が確認できていない workspace に対して実行してよい操作ではない。
+  const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
+  const displayState = deriveJobDisplayState(latestJob, approvalRequests, watchdogEvents)
+  if (!allowsProgressActions(displayState)) {
+    return (
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>作業</Text>
+        <Text style={styles.actionHelpText}>{quarantineGuidanceText()}</Text>
+      </View>
+    )
+  }
 
   const actionsLocked = runningAction !== null || manualWorkflowIsLocked(jobs, approvalRequests)
   const reviewEnabled = runningAction === null && canRunReview(jobs, approvalRequests)
@@ -1156,11 +1275,12 @@ export default function TaskDetailScreen(): ReactElement {
 
       // ApprovalRequestはtaskId単位の関連履歴であり、現状Jobとの厳密な1対1対応は追跡していない。
       // 詳細画面では3APIを並列に各1回だけ取得し、Job単位の追加fetchは行わない。
-      const [taskResult, jobsResult, approvalRequestsResult] =
+      const [taskResult, jobsResult, approvalRequestsResult, watchdogResult] =
         await Promise.allSettled([
           fetchTask(taskId),
           fetchJobs(taskId),
           fetchApprovalRequests(taskId),
+          fetchWatchdogEvents(taskId),
         ])
 
       if (taskResult.status === 'rejected') {
@@ -1185,6 +1305,8 @@ export default function TaskDetailScreen(): ReactElement {
         approvalRequests: approvalRequestsResult.value,
         jobs: jobsResult.value,
         task: taskResult.value,
+        // 取得失敗は致命的でない: stall 表示が出ないだけで、他の状態表示は保つ。
+        watchdogEvents: watchdogResult.status === 'fulfilled' ? watchdogResult.value : [],
       })
     } catch (loadError) {
       const message = getErrorMessage(loadError)
@@ -1295,7 +1417,15 @@ export default function TaskDetailScreen(): ReactElement {
 
       {data !== null && (
         <>
-          <TaskInfoSection task={data.task} />
+          <TaskInfoSection
+            safetyStopped={data.jobs.some(isQuarantined)}
+            task={data.task}
+          />
+          <ExecutionStateSection
+            approvalRequests={data.approvalRequests}
+            jobs={data.jobs}
+            watchdogEvents={data.watchdogEvents}
+          />
           <TaskFailureExplanationSection
             jobs={data.jobs}
             task={data.task}
@@ -1303,6 +1433,7 @@ export default function TaskDetailScreen(): ReactElement {
           <JobActionsSection
             approvalRequests={data.approvalRequests}
             jobs={data.jobs}
+            watchdogEvents={data.watchdogEvents}
             onCreated={() => void loadTaskDetail()}
             task={data.task}
           />
@@ -1740,6 +1871,28 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginBottom: 12,
   },
+  executionStateBadge: {
+    alignSelf: 'flex-start',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  executionStateBadgeText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  executionStateDetail: {
+    color: '#d4d4d4',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 8,
+  },
+  executionStateReason: {
+    color: '#a3a3a3',
+    fontSize: 12,
+    marginTop: 6,
+  },
   sectionTitle: {
     color: '#fff',
     fontSize: 16,
@@ -1761,6 +1914,11 @@ const styles = StyleSheet.create({
     color: '#d4d4d4',
     fontSize: 14,
     fontWeight: '700',
+  },
+  secondaryStatusText: {
+    color: '#a3a3a3',
+    fontSize: 12,
+    marginTop: 4,
   },
   statusTextFallback: {
     color: '#d4d4d4',

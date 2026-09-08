@@ -1128,6 +1128,64 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       未commit変更が次Jobから見える（`apps/worker/src/jobRunner.ts:671`）。worktree隔離はroadmap上の
       計画だけで未実装。このためStage 1は「prompt完全一致かつworktree/HEAD変更なし」に限定し、
       failure contextや変更済みworktreeを扱う再実装はtrusted経路完成後のStage 2へ分離する。
+
+      **2026-09-08 追記（PR-C 以降の新しい consequence。重複Findingは作らず本項目へ集約）**:
+      この「共有 `/workspace/target` が失敗後も reset されず、前 attempt の未commit変更が
+      次 Job から見える」問題は、**P1 Phase 1（workspace baseline 導入）以降、症状が変わった**。
+
+      以前は「前 attempt の変更が次 Job の差分へ混入する（汚染）」だった。現在は、
+      次の normal Job が clean worktree を要求する baseline を取得できず、
+      **`workspace_baseline_failure` として quarantine される**（実測した理由文字列:
+      `normal Job requires a clean worktree but found 2 changed path(s): ...`）。
+      つまり静かな汚染ではなく、**workflow の停止**として顕在化する。
+
+      **決定的な問題は、その quarantine を解除する actor が存在しないこと。**
+      quarantine の再検証は Worker 起動時の `recoverJobsAtStartup()` →
+      `recoverStaleJobs()`（`apps/worker/src/index.ts:605-607`）だけで、定期実行は無い。
+      しかも clearance は clean worktree を要求するため、**未追跡ファイルが残っている限り
+      Worker を再起動しても再び quarantine になるだけ**で、本質的に解消しない。
+      2026-09-08 実測: production の `/workspace/target` は `? e2e/` が untracked のまま残り、
+      同一の clean-worktree quarantine が「Mobile E2E」「Mobile E2E 2」の2 Project で連続発生した。
+
+      したがって現状は **放置しても復旧しない**。root cause は本項目が扱う
+      「共有 workspace を Job 間で reset しない」ことであり、根本対処は本項目の
+      worktree 隔離（1 Job = 1 worktree）である。**新しい recovery subsystem を先に作らない。**
+
+      **着手時に確認すること**: 残った変更をどの source Job が作ったかを
+      persisted baseline / manifest / 既存 repair 情報から特定できるか、
+      既存 `repairFlow` / reconciliation / manifest ロジックで
+      継続・commit・revert・quarantine維持 のいずれかを安全に選べるか。
+      **曖昧な変更を自動削除しない。安全に帰属できない場合は quarantine を維持し PL へエスカレートする。**
+      CEO に Git 判断をさせない。
+
+      **Cleanup-deadlock（2026-09-08 Phase 1/2 Operational E2E で2回実測。上記と同一 root cause のため
+      別Findingにせず本項目へ集約）**: baseline を持たない quarantine と dirty workspace が重なると、
+      **循環して抜け出せない**状態になる。
+
+      - baseline 計算に失敗した quarantine には persisted baseline が無い。したがって clearance は
+        「過去との一致」ではなく **known-good（clean worktree / clean index / marker 無し）** を要求する
+        （PR-C で意図的にそう設計した。復元を主張できない以上、新しい安全な基準点を要求するのが正しい）
+      - しかし workspace は dirty のままであり、**clean へ戻す正規の recovery path が存在しない**。
+        `revertBlockedJobChanges()` は File Change Guard 違反時にしか走らず、しかも manifest 由来の
+        変更しか対象にしない。untracked ファイルはどの経路でも掃除されない
+      - 結果: clearance には clean が要るが、clean にする手段が無い → **quarantine が恒久化する**
+
+      2回とも、CEO 承認を得た **path を限定した手動 cleanup** で脱出した。これは運用として持続しない。
+
+      **注意（設計を弱めないこと）**: この deadlock の解決策として「clearance の known-good 要件を
+      緩める」ことを選んではならない。その要件は「安全と証明できない限り所有権を解放しない」という
+      hard invariant そのものである。**必要なのは clearance を緩めることではなく、workspace を
+      安全に clean へ戻す正規経路**であり、それは本項目の worktree 隔離
+      （1 Job = 1 worktree、破棄すれば dirty は残らない）で構造的に解消する。
+
+      **今すぐ新しい cleanup subsystem は作らない。** 着手時は、残った変更の帰属を
+      persisted baseline / manifest / 既存 repair 情報から特定できるかを先に確認し、
+      安全に帰属できない場合は quarantine を維持して PL へエスカレートする。
+      曖昧な変更の自動削除はしない。
+
+      **UI 側の扱い（MOB-001 で対応済み・別責務）**: 自動復旧 actor が無い事実を
+      Mobile 上で正直に表示する（「自動では復旧しません」）。復旧機構そのものは本項目の担当。
+
       **既知の穴（実コード検証済み）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
       `projectId`とTaskのProjectの一致検証も無い（`routes/jobs.ts:122-137`）。
       `Task.status`を自動更新するコードが存在せず事実上`pending`のまま。
@@ -2910,10 +2968,19 @@ Adapter実装を開始する指示ではない**。実装着手はHigh-priority 
 - agent runtime resume
 - low-level filesystem / network permissions
 
-**現行P1実装の位置づけ:** P1 Phase 1で実装した workspace baseline・quarantine・
-startup reconciliation（および Phase 2 で実装予定の per-job cgroup containment）は、**現在のAIteamOSを安全に運用するために必要なので継続する**。ただしこれらは
+**現行P1実装の位置づけ:** P1 Phase 1（workspace baseline・quarantine・startup reconciliation）と
+P1 Phase 2（async per-job cgroup containment）は**いずれも完了**している
+（Phase 2: 2026-09-08、master `5825433`、production deploy 済み）。これらは
+**現在のAIteamOSを安全に運用するために必要なので継続する**。ただしこれらは
 上記「委譲候補」に該当する低レベルexecution機能であり、**長期的なAIteamOS独自競争力とは位置付けず、
 将来的なHarness置換候補として扱う**。
+
+**Phase 2 完了時に実測した挙動（Harness評価時の比較基準として使える）:** 直接の子が exit 0 でも
+`setsid` した子孫が残っていれば success 扱いにせず containment kill する / recursive `populated=0`
+を確認する / cgroup cleanup を確認する / そこまで成功して初めて workspace reconciliation へ進み、
+reconciliation 成功後にのみ Job を terminalize する。production 実動確認では
+`outcome:'killed'` / `killedDescendants:true` / drain 22ms / cgroup 削除済み を実測し、
+deploy canary は全 PASS だった。
 
 <!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
 1. [ ] **Harness Bake-off / Execution Runtime Evaluation** — High-priority Recovery修正が一段落した後、
@@ -2974,8 +3041,79 @@ startup reconciliation（および Phase 2 で実装予定の per-job cgroup con
       migrate できるか」を実測すること。移動が実際に拒否されるなら、この経路の優先度は下がる。
       関連: 上記1 Harness Bake-off（低レベル execution layer ごと差し替える選択肢）。
 
+      **2026-09-08 production probe（部分的 evidence。UNVERIFIED は維持する）**:
+      Phase 2 deploy 後、本番 VPS で SSH session から Worker の cgroup へ自プロセスを移動しようと
+      `echo $$ > .../ai-team-worker.service/cgroup.procs` を実行したところ、**EACCES で拒否された**。
+      cgroup v2 は移動元・移動先の共通祖先に対する書き込み権限も要求するため、
+      delegated subtree の**外側にいるプロセス**は Worker cgroup へ入れない。
+
+      ただしこれは以下を**区別**して読むこと:
+      - **測定できたこと**: 外部プロセスからの migration は拒否される
+      - **測定していないこと**: trusted Worker subtree の**内部**で動く payload（＝Job の子孫。
+        既に Worker cgroup 配下にいるため共通祖先条件を満たし得る）が、意図的に親/兄弟 cgroup へ
+        escape できるかどうか。**こちらは未検証のまま**
+
+      したがって本 Finding の `UNVERIFIED` は取り下げない。「payload が絶対に escape できない」
+      ことを示した測定ではない。内部からの escape 可否を実測するまで、この項目の前提は変わらない。
+
       **今回実装しないもの（明記）**: non-migration enforcement / git設定のhardening /
       新sandbox基盤 / attestation。本項目はFinding記録のみ。
+
+<!-- roadmap:id=worker-cgroup-delegation-contract state=planned -->
+3. [ ] **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）** —
+      2026-09-08、P1 Phase 2 完了時に記録。**今すぐ unit file を変更しない。**
+
+      **現状（実測）**: production の `ai-team-worker.service` は `Delegate=no` である。
+      それでも per-job cgroup の作成・`cgroup.kill`・`cgroup.events`・`rmdir` はすべて動作する。
+      理由は、`user@.service` 配下の subtree が既にユーザーへ delegate されており、
+      Worker unit の cgroup ディレクトリが `ai-team` 所有で書き込み可能だからである。
+      Phase 2 の production 実動確認（`Delegate=no` のまま）は成功しており、
+      **`Delegate=yes` は Phase 2 の完了条件ではない**。
+
+      **それでも記録する理由**: 現在の動作は「user service subtree delegation という
+      *周辺の構成* にたまたま依存して成立している」状態であり、Worker が per-job cgroup を
+      作れる権限が **unit 自身の契約として明示されていない**。systemd のバージョン更新、
+      unit の slice 変更、user session 構成の変更、コンテナ化などで、
+      **予告なく作れなくなり得る**。その場合 containment は fail-closed で
+      `unavailable` を返し、containment 必須 Job が実行されなくなる（安全側ではあるが停止する）。
+
+      目的は「今たまたま動く」ではなく「**将来の systemd / config 変更後も per-job cgroup 作成権限が
+      明示的に保証される**」ことである。
+
+      **着手時にやること（実装ではなく再確認から始める）**:
+      - その時点の production unit と systemd delegation 構成を**再確認**する
+        （`systemctl --user show ai-team-worker.service -p Delegate`、
+        cgroup ディレクトリの所有者・書き込み可否、`user@.service` 側の delegation）
+      - その上で `Delegate=yes` の追加が**本当に必要か**を判断する。
+        既に別の形で明示保証されているなら追加しない
+      - 追加する場合も `KillMode=control-group` は維持し、controller は有効化しない
+      - 変更後は containment の実動確認（direct child exit 0 + 生存 descendant の kill、
+        `populated=0`、cgroup 削除）をやり直す
+
+      **今回実装しないもの（明記）**: unit file の変更 / delegation 構成の変更 /
+      新しい supervision 方式の導入。本項目は記録のみ。
+
+<!-- roadmap:id=containment-success-path-observability state=planned -->
+4. [ ] **Containment success path の可観測性（低優先 hardening）** — 2026-09-08、P1 Phase 1/2
+      Operational E2E の完走後に記録。**Phase 1/2 を reopen する必要は無い。動作は正常。**
+
+      **現状**: 失敗経路（drain_timeout / cleanup_failed / kill_failed 等）は quarantine と
+      CRITICAL alert として明確に残るが、**成功経路**の
+      `per-job cgroup 作成 → recursive populated=0 → cgroup 削除` は通常ログから追いにくい。
+      そのため「containment が実際に効いている」ことを、事後に運用ログだけで確認しづらい。
+
+      Phase 2 の実装自体は必要な情報を既に持っている（`ContainedResult` に
+      `outcome` / `killedDescendants` / `drainMs` / `cgroupPath` があり、
+      成功時に `outcome:'killed'` と `killedDescendants:true` を返す実測も取れている）。
+      不足しているのは **その情報を通常運用ログへ出していない**ことだけ。
+
+      **着手時の方針**: 新しい telemetry 基盤・新しいログ収集系は作らない。既存の
+      `console.log` / journalctl 経路へ、成功時も1行の構造化サマリ（jobId / attempt /
+      outcome / drainMs / killedDescendants）を出す程度に留める。
+      ログ量が増えるため、Job あたり1行以内に抑えること。
+
+      **今回実装しないもの（明記）**: metrics backend / トレーシング / 新しいログ基盤。
+      本項目は記録のみ。
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 

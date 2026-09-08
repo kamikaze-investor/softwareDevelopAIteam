@@ -452,6 +452,9 @@ function buildTaskSummary(
       approvalId: latestJob.approvalId,
       startedAt: latestJob.startedAt,
       completedAt: latestJob.completedAt,
+      // MOB-001: 既存の failureMetadata をそのまま公開する（新しい status は作らない）。
+      // 一覧で quarantine を通常の blocked と区別するために必要。
+      quarantined: latestJob.failureMetadata?.quarantined === true,
     } : undefined,
     approvalSummary: {
       hasWaitingApproval: approvalRequests.some(request => request.status === 'WAITING_FOR_USER'),
@@ -2172,25 +2175,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  const watchdogEvents: IWatchdogEventStorage = {
-    findAll() {
-      const rows = db.prepare('SELECT * FROM watchdog_events ORDER BY created_at DESC').all() as any[]
-      return rows.map(deserializeWatchdogEvent)
-    },
-    findByJobId(jobId) {
-      const rows = db.prepare('SELECT * FROM watchdog_events WHERE job_id = ? ORDER BY created_at DESC').all(jobId) as any[]
-      return rows.map(deserializeWatchdogEvent)
-    },
-    findById(id) {
-      const row = db.prepare('SELECT * FROM watchdog_events WHERE id = ?').get(id) as any
-      return row ? deserializeWatchdogEvent(row) : undefined
-    },
-    create(data) {
-      const event: WatchdogEvent = {
-        ...data,
-        id: randomUUID(),
-        createdAt: now(),
-      }
+  function insertWatchdogEventRow(event: WatchdogEvent): void {
       db.prepare(`
         INSERT INTO watchdog_events
           (id, job_id, task_id, command_kind, working_dir, started_at, detected_at,
@@ -2211,6 +2196,61 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         event.resolvedAt ?? null,
         event.createdAt,
       )
+  }
+
+  const watchdogEvents: IWatchdogEventStorage = {
+    findAll() {
+      const rows = db.prepare('SELECT * FROM watchdog_events ORDER BY created_at DESC').all() as any[]
+      return rows.map(deserializeWatchdogEvent)
+    },
+    findByJobId(jobId) {
+      const rows = db.prepare('SELECT * FROM watchdog_events WHERE job_id = ? ORDER BY created_at DESC').all(jobId) as any[]
+      return rows.map(deserializeWatchdogEvent)
+    },
+    findById(id) {
+      const row = db.prepare('SELECT * FROM watchdog_events WHERE id = ?').get(id) as any
+      return row ? deserializeWatchdogEvent(row) : undefined
+    },
+    /**
+     * DB-007: stall episode 単位で冪等に作成する。
+     *
+     * dedup key は `(job_id, started_at)`。Job は `failed -> queued` /
+     * `blocked -> queued` を経て再び `running` になり得る（jobStateManager の
+     * ALLOWED_TRANSITIONS）。そのたびに `startedAt` は付け直されるので、
+     * これは「この実行の、この stall」を一意に指す。
+     *
+     * `(job_id)` や `(job_id, event_type)` を key にすると、復旧後に**正当に再発した**
+     * stall まで潰してしまう。将来の再 stall は記録されなければならない。
+     *
+     * 既存 event があればそれを返す。Worker が restart して同じ stall を再検出しても、
+     * また event 作成の retry が起きても、行が増えないのはここで保証する
+     * （in-memory の alertedJobs は速度のための最適化であって、正しさの根拠ではない）。
+     */
+    findByEpisode(jobId, startedAt) {
+      const row = db.prepare(
+        'SELECT * FROM watchdog_events WHERE job_id = ? AND started_at = ? LIMIT 1',
+      ).get(jobId, startedAt) as any
+      return row ? deserializeWatchdogEvent(row) : undefined
+    },
+    create(data) {
+      const existing = watchdogEvents.findByEpisode(data.jobId, data.startedAt)
+      if (existing) return existing
+
+      const event: WatchdogEvent = {
+        ...data,
+        id: randomUUID(),
+        createdAt: now(),
+      }
+      try {
+        insertWatchdogEventRow(event)
+      } catch (err) {
+        // UNIQUE 制約違反 = 同じ episode を別経路が先に作った（並行 POST / retry）。
+        // competing writer の行を返す。ここが CAS の役割を果たすので、
+        // 汎用 CAS framework は要らない。
+        const raced = watchdogEvents.findByEpisode(data.jobId, data.startedAt)
+        if (raced) return raced
+        throw err
+      }
       return event
     },
     update(id, data) {

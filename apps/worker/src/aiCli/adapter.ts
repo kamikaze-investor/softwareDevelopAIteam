@@ -17,7 +17,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync, existsSync, unlinkSync } from 'node:fs'
+import { readFileSync, existsSync, unlinkSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import type {
   AiCliRequest,
@@ -29,7 +30,7 @@ import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 import { buildTargetCommandEnv } from '../utils/safeEnv.js'
-import { buildWorktreeManifest } from '../guards/changeManifest.js'
+import { buildWorktreeManifest, worktreeContainsName } from '../guards/changeManifest.js'
 import {
   isContainmentInfrastructureError,
   runContainedOrThrow,
@@ -66,17 +67,205 @@ function resolvePnpmPath(): string {
   return 'pnpm'  // 見つからなければ 'pnpm' のまま（catch で non-fatal）
 }
 
-function buildCodexOutputLastMessagePath(request: AiCliRequest): string | undefined {
+/** capture用一時ディレクトリの接頭辞。 */
+const CAPTURE_DIR_PREFIX = 'codex-lastmsg-'
+
+/**
+ * OS が正準と見なす実パス。
+ *
+ * `realpathSync.native` のみを使う。通常の `realpathSync` は symlinkでない部分の綴りを
+ * 残すため、Windowsの8.3短縮名（`C:\WORKSP~1` と `C:\Workspace`）を同一と見なせない。
+ * **nativeが失敗しても綴りを畳めない実装へフォールバックしない** — 「解決できなかった」を
+ * 「安全」と読み替えないため（独立レビュー指摘、2026-09-08）。失敗は呼び出し元へ伝播する。
+ */
+function canonicalRealPath(target: string): string {
+  return realpathSync.native(path.resolve(target))
+}
+
+/**
+ * 2つのパスが**同一のディレクトリ実体**かを inode で判定する。
+ *
+ * 文字列比較では不十分。bind mount / UNC alias / mount point は、
+ * 同じディレクトリに対して異なる正準文字列を与えうるので、
+ * `TMPDIR` をリポジトリのbind mount先へ向けるだけで文字列ベースの封じ込めは破れる
+ * （独立レビュー指摘、2026-09-08）。device + inode は綴りに依存しない同一性を与える。
+ */
+function isSameDirectory(a: string, b: string): boolean {
+  const sa = statSync(a)
+  const sb = statSync(b)
+
+  return sa.dev === sb.dev && sa.ino === sb.ino
+}
+
+/**
+ * `child` が `parent` と同一、またはその配下かを **inode 同一性**で判定する。
+ * 祖先を辿って `parent` と同じ実体に当たるかを見る。
+ * **解決できなければ例外を投げる**（判定不能を「安全」と扱わない）。
+ */
+function isInside(child: string, parent: string): boolean {
+  const parentReal = canonicalRealPath(parent)
+  let current = canonicalRealPath(child)
+
+  for (;;) {
+    if (isSameDirectory(current, parentReal)) return true
+
+    const next = path.dirname(current)
+    if (next === current) return false
+    current = next
+  }
+}
+
+/**
+ * capture ディレクトリが **対象リポジトリの作業ツリーの中に無いこと** を、
+ * リポジトリ側から実際に確認する。
+ *
+ * パス演算では判定できない。`/workspace/target/.tmp` を `/var/tmp/target-temp` へ
+ * bind mount して `TMPDIR` をそこへ向けると、mount の内側からは元の親ディレクトリが
+ * 見えないため、祖先を辿る方式（inode比較を含む）は必ず「外側」と誤判定する
+ * （独立レビュー指摘、2026-09-08。攻撃者不要、静的な構成だけで再現する）。
+ *
+ * そこで「そのパスは外側か」を計算するのをやめ、**リポジトリに実際に現れるか**を訊く。
+ * capture ディレクトリへ目印ファイルを置き、対象リポジトリ側の `git status` に
+ * それが出るかどうかを見る。git は作業ツリーを実際に列挙するので、
+ * どんな別名・bind mount 経由で内側にあっても検出できる。
+ * `--ignored` を付けるのは、`.gitignore` されたパスへ mount された場合を取りこぼさないため。
+ *
+ * 判定できない場合（gitが無い等）は fail-closed。
+ */
+/**
+ * containment 検証の結果キャッシュ。キーは (temp root, workingDir) の正準パス。
+ *
+ * 検証は `--ignored` 付きの `git status` を伴い、`node_modules` のような無視ディレクトリまで
+ * 走査するため、巨大リポジトリでは既存の `buildWorktreeManifest` より重くなりうる。
+ * Codex 呼び出しのたびに走らせると、`--ignored` 無しなら成功する構成でタイムアウトさせて
+ * しまう（独立レビュー指摘、2026-09-08。既存 reviewer の contract を壊さないこと）。
+ *
+ * 検証しているのは **mount / symlink 構成**であって実行ごとに変わる情報ではないので、
+ * プロセス内で1組につき1回で足りる。信頼済みホスト前提（構成は実行中に敵対的へ変化しない）。
+ */
+const CONTAINMENT_VERIFIED = new Set<string>()
+
+function assertCaptureDirIsOutsideRepo(captureDir: string, workingDir: string): void {
+  const cacheKey = `${canonicalRealPath(os.tmpdir())}::${canonicalRealPath(workingDir)}`
+  if (CONTAINMENT_VERIFIED.has(cacheKey)) return
+
+  const sentinelName = `.codex-capture-probe-${process.pid}-${randomUUID()}`
+  const sentinelPath = path.join(captureDir, sentinelName)
+
+  writeFileSync(sentinelPath, '', 'utf-8')
+
+  try {
+    if (worktreeContainsName(workingDir, sentinelName)) {
+      throw new Error(
+        `[aiCli] capture directory (${captureDir}) は対象リポジトリ (${workingDir}) の作業ツリー内に`
+        + `現れます（bind mount 等の別名経由）。read-only保証が壊れるため中止します。`,
+      )
+    }
+
+    CONTAINMENT_VERIFIED.add(cacheKey)
+  } finally {
+    try {
+      unlinkSync(sentinelPath)
+    } catch {
+      // 目印の後始末に失敗しても、capture ディレクトリごと後で消える。
+    }
+  }
+}
+
+/**
+ * このプロセスが作った capture ディレクトリの登録簿。
+ *
+ * cleanup は**ここに登録されたものだけ**を消す。引数の構造だけを信じると、
+ * 内部APIへ手で組んだオブジェクトを渡すだけで無関係なツリーを再帰削除できてしまう
+ * （独立レビュー指摘、2026-09-08）。所有権は実行時の事実として持つ。
+ */
+const OWNED_CAPTURE_DIRS = new Set<string>()
+
+function formatErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/** Codexの最終回答を受け取るcapture先。**このプロセスが作ったディレクトリを保持する。** */
+export interface CodexOutputCapture {
+  filePath: string
+  captureDir: string
+}
+
+/**
+ * `--output-last-message`用のcapture先を作る。
+ *
+ * **対象リポジトリの外（OS temp）へ置く。** 以前は`request.workingDir`直下に作っていたため、
+ * 読み取り専用のはずのレビュー・Roadmap生成が対象リポジトリのworking treeを一時的に変化させ、
+ * crash / SIGKILL では残骸が残りえた（roadmap: codex-last-message-temp-file-in-target-repo）。
+ * `--sandbox read-only`下でもOS tempへ書けることは実測済み（2026-09-07、CEO承認canary）。
+ *
+ * **検証はディレクトリを作った「後」に行う。** `TMPDIR`/`TEMP`がリポジトリ内を指しうるうえ、
+ * 事前にtemp rootを検証しても、その直後にsymlinkを張り替えられれば検証は無意味になる
+ * （TOCTOU。独立レビュー指摘、2026-09-08）。実際に作られたディレクトリ自身を検証すれば、
+ * temp rootが途中で何を指すようになっていても「ファイルが実際に置かれる場所」を判定できる。
+ * リポジトリ内だった場合は作ったものを消してから失敗させる（fail-closed）。
+ */
+function createCodexOutputCapture(request: AiCliRequest): CodexOutputCapture | undefined {
   if (request.provider !== 'codex' || request.expectJson !== true) return undefined
 
   const safeTaskId = request.taskId
     .replace(/[^A-Za-z0-9._-]/g, '_')
     .slice(0, 64) || 'task'
 
-  return path.join(
-    request.workingDir,
-    `.codex-last-message-${safeTaskId}-${process.pid}-${Date.now()}-${randomUUID()}.json`,
-  )
+  // **作る前に**temp rootを検査する。作ってから消す方式だと、TMPDIRがリポジトリ内を
+  // 指しているときに一瞬だけリポジトリ内へディレクトリが現れ、その間にSIGKILLされると
+  // 残骸が残る（独立レビュー指摘、2026-09-08）。「一瞬も作らない」を実際に満たすため、
+  // 事前チェックと事後チェックの両方を持つ。事後チェックはこの後のTOCTOU用。
+  const tmpRoot = canonicalRealPath(os.tmpdir())
+  if (isInside(tmpRoot, request.workingDir)) {
+    throw new Error(
+      `[aiCli] OS temp directory (${tmpRoot}) が対象リポジトリ (${request.workingDir}) の内側です。`
+      + `capture fileをリポジトリ内へ書くとread-only保証が壊れるため中止します。`,
+    )
+  }
+
+  const captureDir = mkdtempSync(path.join(tmpRoot, CAPTURE_DIR_PREFIX))
+
+  // 1) 祖先を辿る判定（symlink等の通常の別名を捕まえる）
+  let insideRepo: boolean
+  try {
+    insideRepo = isInside(captureDir, request.workingDir)
+  } catch (err) {
+    // 正規化できない＝リポジトリ内かどうか判定できない。安全側に倒して中止する。
+    rmSync(captureDir, { recursive: true, force: true })
+    throw new Error(
+      `[aiCli] capture directory (${captureDir}) の正規化に失敗し、対象リポジトリ`
+      + `(${request.workingDir}) の内外を判定できませんでした: ${formatErrorMessage(err)}`,
+    )
+  }
+
+  if (insideRepo) {
+    rmSync(captureDir, { recursive: true, force: true })
+    throw new Error(
+      `[aiCli] OS temp directory (${captureDir}) が対象リポジトリ (${request.workingDir}) の内側に`
+      + `解決されました。capture fileをリポジトリ内へ書くとread-only保証が壊れるため中止します。`,
+    )
+  }
+
+  // 2) リポジトリ側からの実測（bind mount 等、パス演算では見えない別名を捕まえる）
+  try {
+    assertCaptureDirIsOutsideRepo(captureDir, request.workingDir)
+  } catch (err) {
+    rmSync(captureDir, { recursive: true, force: true })
+    throw err instanceof Error
+      ? err
+      : new Error(`[aiCli] capture directory の検証に失敗しました: ${formatErrorMessage(err)}`)
+  }
+
+  OWNED_CAPTURE_DIRS.add(captureDir)
+
+  return {
+    captureDir,
+    filePath: path.join(
+      captureDir,
+      `.codex-last-message-${safeTaskId}-${process.pid}-${Date.now()}-${randomUUID()}.json`,
+    ),
+  }
 }
 
 function readCodexOutputLastMessage(filePath: string | undefined): Record<string, unknown> | undefined {
@@ -89,13 +278,30 @@ function readCodexOutputLastMessage(filePath: string | undefined): Record<string
   }
 }
 
-function cleanupCodexOutputLastMessage(filePath: string | undefined): void {
-  if (filePath === undefined) return
+/**
+ * capture先を後片付けする。
+ *
+ * **このプロセスが`mkdtemp`で作ったディレクトリだけを、パスを推測せずに消す。**
+ * 以前は任意の文字列を受け取り「接頭辞が一致するか」で削除可否を判断していたが、
+ * 文字列からowner shipは証明できない —
+ * `/srv/data/f.json`を渡せば無関係なファイルがunlinkされ、
+ * `/tmp/codex-lastmsg-backup/result.json`を渡せば無関係なディレクトリが再帰削除された
+ * （独立レビュー指摘、2026-09-08）。
+ * 引数を`CodexOutputCapture`にして**信頼できないパスを受け取る入口自体を無くした**ので、
+ * 判定ロジックは不要になった。ディレクトリごと消すためファイル単体のunlinkも要らない
+ * （unlink失敗でrmSyncが巻き添えでskipされる問題も同時に消える）。
+ */
+export function cleanupCodexOutputCapture(capture: CodexOutputCapture | undefined): void {
+  if (capture === undefined) return
+  // **このプロセスが実際に作ったディレクトリでなければ何もしない。**
+  if (!OWNED_CAPTURE_DIRS.has(capture.captureDir)) return
 
   try {
-    if (existsSync(filePath)) unlinkSync(filePath)
+    rmSync(capture.captureDir, { recursive: true, force: true })
+    OWNED_CAPTURE_DIRS.delete(capture.captureDir)
   } catch {
-    // cleanup failure is non-fatal; changed-file guards still inspect the worktree later.
+    // 失敗しても登録は残す（次の機会に再試行できる）。OS temp配下なので
+    // 残ってもリポジトリのread-only保証は壊れない。
   }
 }
 
@@ -239,9 +445,9 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
     //   CommandKind Guard との統合は task-009（Worker Job実行エンジン）で設計する。
     //
     // finalPrompt = H-1注入済みプロンプト（Codexの場合のみCLAUDE.md先頭付与）
-    const codexOutputLastMessagePath = buildCodexOutputLastMessagePath(request)
-    const argvRequest: CodexLastMessageRequest = codexOutputLastMessagePath
-      ? { ...request, prompt: finalPrompt, codexOutputLastMessagePath }
+    const codexOutputCapture = createCodexOutputCapture(request)
+    const argvRequest: CodexLastMessageRequest = codexOutputCapture
+      ? { ...request, prompt: finalPrompt, codexOutputLastMessagePath: codexOutputCapture.filePath }
       : { ...request, prompt: finalPrompt }
     const argv = this.buildArgv(argvRequest)
     // task-024: request > config > デフォルト(5分) の優先順位でタイムアウト決定
@@ -292,8 +498,8 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
       isTimeoutError = err.signal === 'SIGTERM' || (err.code === 'ETIMEDOUT') || stderr.includes('ETIMEDOUT')
       isApiError = exitCode >= 500 || stderr.includes('API Error') || stderr.includes('5xx')
     } finally {
-      parsedOutputFromLastMessage = readCodexOutputLastMessage(codexOutputLastMessagePath)
-      cleanupCodexOutputLastMessage(codexOutputLastMessagePath)
+      parsedOutputFromLastMessage = readCodexOutputLastMessage(codexOutputCapture?.filePath)
+      cleanupCodexOutputCapture(codexOutputCapture)
     }
 
     // task-024: フォールバックポリシーが設定されていて条件を満たす場合は再実行
