@@ -2172,10 +2172,29 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    数秒〜数分でMetro process起動 → port listen → ready state → exp:// URL / QR生成まで到達する処理であり、
    約25分RUNNING表示のままだったため、正常な長時間処理とは考えにくい状態だった。
 
-   **UNVERIFIED（断定しないこと）**: process自体が死んでいたのか / processは生きているが待ち状態だったのか /
-   Metroは起動したがtask completionを検知できなかったのか / log・progress監視が止まっていたのか、
-   はいずれも未確認である。**root causeを「Expoがハングした」と断定してはならない。**
-   Expo固有bugとしても未確定である。
+   **Corrected diagnosis（2026-09-08 追加調査で確定。当初のstalled疑いは誤りだった）**:
+   **Metro自体はハングしていなかった。** 実測値:
+
+   - Metroは 8081 を listen していた
+   - bundle requestを行うと 953 modules を正常compile
+   - manifest endpoint: HTTP 200
+   - Expo Go bundle endpoint: HTTP 200 / bundle size 7,122,031 bytes / response 約1.2秒
+   - restart後のready判定は約9秒
+
+   **ログが止まって見えた理由**: Metroはclient activityが無いidle状態ではログを出さない。
+   したがって **`lastLogAtが古い = stalled` という判定は誤りになり得る**。
+
+   **QRが出なかった理由**: ExpoはTTYへ接続されたconsoleでのみQRをrenderする。background taskでは
+   stdoutをfileへpipeしていたため、**QRがconsoleへ出ること自体が不可能だった**。
+   つまり「QRがログへ出るまで待つ」というcompletion predicateはbackground executionで成立しなかった。
+   今回は exp:// URL を既知のhost/portから生成し、QRを別途生成することで解決した。
+
+   **Confirmed root cause**: Expo / Metro itself was healthy. The background task lacked a
+   completion predicate valid for a non-TTY execution environment and waited on an
+   interactive-only QR / log signal.
+
+   **障害の分類（C-11参照）**: これは **workload failureではなく completion-detection failure** である。
+   当初この項目に記録した「Expoがハングした疑い」は撤回する。
 
    **Finding（本項目で扱う確定事項）**:
    *Background task can remain RUNNING indefinitely without progress/completion monitoring* —
@@ -2184,6 +2203,13 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **AI delegation以外のbackground taskにも存在する**ことを示す2例目である。
    したがって本項目の対象は「PL delegation」ではなく、
    **AI delegation / Expo restart / deploy / build を含むbackground task一般**へ拡張する。
+
+   **Generalized defect（追加調査後の最終形）**: *Background task supervision must validate actual
+   task outcome through environment-independent completion predicates rather than equating
+   process / log activity with progress.*
+   ケース1は「completion signalが無い」ことによる無期限RUNNING、ケース2は
+   「completion signalはあったが実行環境で成立しない形をしていた」ことによる無期限RUNNINGであり、
+   **同じcontract欠落の異なる現れ方**である。
 
    **Risk scenario（Observedではない。今回未確認）**: Mobile中心の自律運転では、
    CEOがProjectを開始 → AIがbackgroundで長時間処理 → CEOがアプリを閉じる →
@@ -2212,13 +2238,35 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    **C-2. 経過時間だけでstalled判定しない（progress predicate）。** 固定タイマーのみで判定せず、
    可能なtaskでは既存の実進捗signalを使う。**PIDが生きているだけでhealthyと判定しない。**
-   Expo restartなら process存在 / Metro log更新 / port 8081 listen / Metro ready / exp:// URL生成。
+
+   **C-2a. log activityをprogressの唯一の根拠にしない（ケース2で実証）。** taskによっては
+   正常なidle状態でログが出ない（Metroはclient activityが無い間ログを出さない）。
+   `process alive` / `last log update` / `elapsed time` の3つだけでstalled判定してはならない。
+   可能なら**task固有のexternal health / completion probeを優先する**（Expoなら port listen と
+   manifest / bundle endpointへの実probe）。
 
    **C-3. taskごとにcompletion predicateを持てるようにする。** 「成功」の意味はtaskごとに異なる。
    Expoなら`Expo process spawned`ではなく`MetroがreadyになりCEO端末から接続可能な入口が生成された`
    ところまでが成功。deployならhealth 200、buildならexit 0、reviewならverdict取得、
    delegated AIならDONE/BLOCKED/ERROR。**新しい汎用状態機械を過剰に作る前に、既存task/watchdogの
    completion判定を拡張できないか必ず先に確認する。**
+
+   **C-3a. completion predicateが「実行環境でも成立すること」を確認する（ケース2の直接の原因）。**
+   interactive / TTY環境では成立しても、background / redirected stdout / detached実行では
+   成立しないsignalがある。実例: interactive ExpoはconsoleへQRを出すが、background Expoは
+   stdoutがpipeなのでQRを出さない。completion signalを設計するときは必ず次を確認する:
+
+   - interactive専用のsignalではないか
+   - TTY依存ではないか
+   - stdoutをpipeへredirectしても取得できるか
+   - detached executionでも成立するか
+
+   **C-3b. observable side effectをsuccess判定に使う。** 描画・表示といったpresentation artifactを
+   成功条件にしない。Expo restartのsuccess predicateは今後:
+   (1) Metro processが存在 → (2) expected port 8081がlisten → (3) manifest endpointが200 →
+   (4) Expo Goが要求するbundle endpointが200 → (5) exp:// URLを生成可能、まで確認できればREADY。
+   **「QRがconsoleに描画されたこと」は成功条件にしない。**
+   QRはURLから別途生成可能なpresentation artifactとして扱う。
 
    **C-4. progress heartbeat / stale detection。** lastProgressAt / lastLogAt / currentStage を
    既存情報から取得できるようにする。一定時間進捗がなければ`still running`ではなく
@@ -2228,7 +2276,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **C-5. stalled検知後は自動診断を先に行う（blind retry禁止）。** 最低限:
    process存在 / expected child process存在 / log更新 / expected port・resourceのready /
    **completion predicateを既に満たしていないか** / stale・duplicate processの有無。
-   Expo事例なら Metro process・8081 listener・latest Metro log・ready/QR state・duplicate Metro。
+   Expo事例なら Metro process・8081 listener・manifest 200・bundle 200・duplicate Metro。
+   **`latest Metro log` と `QR state` は診断根拠にしない**（ケース2で、どちらも健全なMetroに対して
+   誤った停止判定を出す原因だったことが実測で確定した）。
 
    **C-6. recoveryはboundedにする。** diagnose → stale process cleanup → 1回restart →
    completion predicate再確認 → success / failed / escalated。無限retryは禁止。
@@ -2250,6 +2300,23 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    「今どのbackground taskが走っていて、最後に進捗したのはいつで、terminal verdictは何か」を
    backend側で1箇所から観測できなければ C-1 / C-7 / C-8 / C-9 はどれも成立しない。
 
+   **C-11. monitoring failureをworkload failureと誤認しない。** 記録・通知・recovery判断では次の3つを
+   区別する:
+
+   - **workload failure** … 実処理そのものが失敗した（Metroが起動しない、buildがexit≠0 等）
+   - **monitoring failure** … 監視側が死んだ・見ていなかった（ケース1: supervisorごと消滅）
+   - **completion-detection failure** … 実処理は成功しているが完了を検知できない（ケース2）
+
+   **正常なserviceを「ログが止まった」という理由だけでkill / restartしてはならない。**
+   これはC-5（診断を先に行う）とC-6（bounded recovery）の存在理由そのものである。
+
+   **C-12. STALLED と READY-but-wrapper-waiting を区別する。** ケース2の実状態は
+   `Metro = READY` / `background wrapper = RUNNING` だった。child / serviceが既に目的を達成
+   しているのに、wrapperだけterminal stateへ遷移しないケースがある。監視側はcompletion predicateを
+   **wrapperの状態と独立に再評価し、predicate satisfiedならwrapperがRUNNINGでもSUCCEEDEDとして
+   回収できる**設計とする。これはAcceptance **Case Cの実例**であり、
+   Case Cはもはや仮想ケースではなく再現済みの実障害である。
+
    ---
 
    ### C-10の受け皿: 汎用 `supervised_runs`（新規。`design_review_runs`へは相乗りしない）
@@ -2267,12 +2334,13 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    保持すべき最小の列（実装時に確定させる。ここでは契約として必要なものだけ列挙する）:
 
-   - `kind` … `ai_delegation` / `expo_restart` / `deploy` / `build` 等。completion predicateの選択キー
+   - `kind` … supervised runの種別。**registry lookupのキーであり、判定ロジックそのものは持たない。**
    - `subject_id` … PR番号 / project id / task key 等
    - `status` … RUNNING / SUCCEEDED / FAILED / STALLED / TIMED_OUT（C-1のterminal集合）
    - `started_at` / `last_progress_at` / `current_stage` … C-4のheartbeat
    - `progress_source` … 何を進捗signalとして見ているか（log mtime / port listen / marker等）
-   - `completion_predicate` … C-3。何をもって成功とするか
+   - `predicate_key` / `predicate_version` … C-3。**判定ロジックはDBに置かず、code側registryを引くキーだけを保存する**（下記「D-2」）
+   - progress / completion evidence … predicateが「満たされた」と判断した根拠（観測値）。判定式ではなく観測結果を保存する
    - `recovery_attempt_count` … C-6のbounded recovery
    - `terminal_verdict` / `error` … 終端理由
    - `supervisor` … どの機構が見ているか（`worker_watchdog` / `delegate_watchdog` / なし）。
@@ -2280,6 +2348,30 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    `claim_token` によるstale completion fencingは `design_review_runs` の実装が有効性を実証済みなので、
    **パターンとして踏襲する（テーブルを共有するのではなく、設計を踏襲する）。**
+
+   ---
+
+   ### 実装前提として固定した決定（CEO判断、2026-09-08。#110初期実装のスコープ）
+
+   **D-1. 初期`kind`は2つに限定する。** #110の初期実装で`supervised_runs`へ接続するのは
+   **`ai_delegation` と `expo_restart` のみ**とする。`deploy` / `build` は
+   **Contractの適用例としては残すが、#110初期実装では接続しない**。
+   `kind`は将来拡張可能な形（新しい値の追加がschema変更を要求しない形）で設計する。
+
+   **D-2. completion predicateをDBで実行しない。** predicateを自由文字列やDB内DSLとして保存し、
+   それを解釈・実行する経路は作らない。DBに保存するのは
+   `predicate_key` / `predicate_version` / progress・completion evidence だけとし、
+   **実際の判定ロジックは`kind`ごとのcode側registryで解決する。**
+
+   - **再起動後にも同じpredicateを復元できること**。`predicate_key` + `predicate_version` から
+     registryを引き直せば、process再起動をまたいでも同じ判定が再現される。
+     `predicate_version`を持つのは、registry側のロジックを更新したときに
+     「どのversionの判定で終端したか」が過去のrunから読めなくなるのを防ぐため。
+   - **unknown predicateはfail-closedにすること**。registryに存在しない`predicate_key`、
+     または解決できない`predicate_version`に遭遇したrunは、
+     SUCCEEDEDにもRUNNING継続にもせず、**terminal（FAILED / 要escalation）へ倒す**。
+     「判定できないので成功とみなす」「判定できないので待ち続ける」はどちらも禁止
+     （後者はC-1違反そのものであり、今回の障害を再生産する）。
 
    ---
 
@@ -2313,12 +2405,18 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    - **Case A**: processは生きているが進捗が止まる → stalled検知できる
    - **Case B**: process自体が消える → stalled / failed検知できる
    - **Case C**: processは生きておりcompletion predicateも達成済みだが、task wrapperだけ終了しない
-     → successを再確認して回収できる。**今回のExpo事例で十分あり得るfailure modeであり、絶対に落とさない。**
-     現行のどの機構もこの経路を持っていないため、新規に設計が必要な唯一のケースである
+     → successを再確認して回収できる。**2026-09-08のExpo事例で実際に発生済み**（Metro READY /
+     wrapper RUNNING）。仮想ケースではない。現行のどの機構もこの経路を持っていないため、
+     新規に設計が必要な唯一のケースである
    - **Case D**: stalled → recovery成功 → taskが再開しterminal successになる
    - **Case E**: stalled → recovery不能 → 無限RUNNINGにならずBLOCKED / ERROR等で終わり、
      PL / CEOへ必要な情報が出る
    - **Case F**: CEOがMobileを閉じて再度開く → backendで継続した現在の実状態へ復帰する
+
+   **Expo / Metro regression（ケース2の再現試験。Case Cの具体化）**: stdoutをnon-TTYへredirectし、
+   QRのconsole outputが無く、Metroは正常起動して manifest 200 / bundle 200 を返す状態を再現し、
+   **監視がSTALLEDではなくREADY / SUCCEEDEDと判定できること**を確認する。
+   また、**QR artifactはrepoではなくtmp等へ生成し、`git add`等でproduction sourceへ混入させないこと**。
 
    **現状**: 本項目は設計フェーズ。**実装は未着手であり、着手前にこのcontractのCEOレビューを受ける。**
 
