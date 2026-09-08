@@ -185,7 +185,16 @@ export function recomputeDecision(
   const expectedFocuses = reviewKind === 'roadmap'
     ? selectRoadmapReviewFocuses()
     : selectFocuses(reviewLoad, changedFiles)
-  const independentReviewRequired = reviewLoad === 'critical'
+  // **task kind のみ** 別建ての independent review を要求する。
+  // roadmap kind の第二意見は Claude の integration review が担うようになったので
+  // （PR C: Codex generator → Gemini focused ×3 → Claude Opus integration）、
+  // ここで Codex independent を要求し続けると、Worker が作らないものをAPIが求める
+  // 恒久的な不整合になり、新topologyは一度も成立しない。
+  const independentReviewRequired = reviewKind !== 'roadmap' && reviewLoad === 'critical'
+
+  // roadmap kind では integration review の存在そのものを必須にする（fail-closed）。
+  // 「Claudeが落ちたので統合を省いて続行」を許すと、単独のGemini群だけで承認が通る。
+  const integrationReviewRequired = reviewKind === 'roadmap'
 
   const reject = (rejectedReason: string): RecomputeOutcome => ({
     decision: 'UNCERTAIN',
@@ -226,6 +235,10 @@ export function recomputeDecision(
   }
 
   const integration = raw.integrationReviewResult as { decision?: string } | undefined
+
+  if (integrationReviewRequired && (!integration || typeof integration.decision !== 'string')) {
+    return reject('roadmap review requires an integration review result')
+  }
 
   let decision: RecomputedDecision = resolveFinalDecision(
     raw.focusedReviewResults as never,

@@ -121,74 +121,20 @@ export async function ctoAiRoutes(app: FastifyInstance): Promise<void> {
     }
   })
 
-  // POST /api/cto/generate-roadmap
-  app.post('/generate-roadmap', async (req, reply) => {
-    const parsed = GenerateRoadmapBody.safeParse(req.body)
-    if (!parsed.success) {
-      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
-    }
-
-    const { projectId, analysis, targetProjectRoot, mockResponse } = parsed.data
-
-    const project = storage.projects.findById(projectId)
-    if (!project) return reply.status(404).send({ error: 'Project not found' })
-
-    if (project.status !== 'running') {
-      return reply.status(409).send({ error: 'Project is not running', detail: `status=${project.status}` })
-    }
-
-    // [codex-review P1] パス境界検証
-    const pathCheck = validateTargetRoot(targetProjectRoot)
-    if (!pathCheck.ok) {
-      return reply.status(400).send({ error: 'パス検証エラー', detail: pathCheck.reason })
-    }
-
-    if (path.resolve(targetProjectRoot) !== path.resolve(CONFIGURED_TARGET_ROOT)) {
-      return reply.status(400).send({
-        error: 'targetProjectRoot が設定値と一致しません',
-        detail: `configured=${CONFIGURED_TARGET_ROOT}`,
-      })
-    }
-
-    try {
-      const result = await initializeApprovedProject(storage, project, targetProjectRoot, {
-        analysis,
-        mockResponse,
-      })
-      const { roadmap, syncResult, initialWorkflow } = result
-
-      return reply.status(201).send({
-        status: 'roadmap_generated',
-        totalTasks: roadmap.totalTasks,
-        estimatedWeeks: roadmap.estimatedWeeks,
-        phaseCount: roadmap.phases.length,
-        syncSummary: {
-          created: syncResult.createdTaskIds.length,
-          updated: syncResult.updatedTaskIds.length,
-          reactivated: syncResult.reactivatedTaskIds.length,
-          deactivated: syncResult.deactivatedTaskIds.length,
-          phasesCreated: syncResult.createdPhaseNumbers.length,
-          phasesUpdated: syncResult.updatedPhaseNumbers.length,
-          phasesReactivated: syncResult.reactivatedPhaseNumbers.length,
-          phasesDeactivated: syncResult.deactivatedPhaseNumbers.length,
-        },
-        initialWorkflow,
-        writtenFiles: result.writtenFiles,
-        targetDir: result.targetDir,
-        roadmap,
-        message: `ロードマップを生成しました（${roadmap.totalTasks} タスク / ${roadmap.phases.length} フェーズ）`,
-      })
-    } catch (err: any) {
-      if (err instanceof ProjectInitializationError) {
-        return reply.status(err.statusCode).send({ error: err.message, ...err.details })
-      }
-      const isApiKeyError = err.message?.includes('ANTHROPIC_API_KEY')
-      return reply.status(isApiKeyError ? 503 : 500).send({
-        error: isApiKeyError
-          ? 'ANTHROPIC_API_KEY が設定されていません'
-          : 'Roadmap 生成に失敗しました',
-        detail: err.message,
-      })
-    }
-  })
+  // POST /api/cto/generate-roadmap was removed in PR C.
+  //
+  // It called initializeApprovedProject() without writeProjectMemory, so
+  // projectInitialization short-circuited straight to Task sync: no Gemini focused reviews,
+  // no integration review, no evidence registered. That made it a second Roadmap workflow
+  // bypassing the review gate entirely, which contradicts the guarantee this PR exists to
+  // establish -- that every Roadmap reaching Task sync was reviewed under the current topology.
+  //
+  // It had no legitimate consumer: not referenced by Mobile, by any script, doc or CI job,
+  // only by its own tests, and 0 production invocations in the checked window. Roadmap
+  // generation runs through the canonical Project-start path instead
+  // (projectStartWorkflow -> initializeApprovedProject with writeProjectMemory).
+  //
+  // Deliberately NOT "fixed" by passing writeProjectMemory: a second entry point into the same
+  // workflow is a drift source, and the guarantee would then depend on two paths agreeing
+  // forever (CEO judgement, 2026-09-08).
 }

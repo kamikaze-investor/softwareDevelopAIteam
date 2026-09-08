@@ -128,113 +128,137 @@ describe('parseRoadmapJson', () => {
   })
 })
 
-describe('generateRoadmap (default model)', () => {
-  it('uses the current Anthropic Haiku model by default', async () => {
-    anthropicMocks.create.mockResolvedValueOnce({
-      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
-    })
+/**
+ * Roadmap生成はCodex CLI runner経路になった（PR C）。以前はAnthropic SDKへ投げていたので、
+ * テストは `messages.create` の引数を見ていた。今はrunnerへ渡すJSONを見る。
+ * SYSTEM_PROMPT と Project Summary は1本の `prompt` に連結されるため、
+ * 旧 `system` / `messages[0].content` への assertion はどちらも `prompt` を見る。
+ */
+function captureRunner(stdout: string = MOCK_ROADMAP_JSON) {
+  const sent: { input?: RunnerInput } = {}
+  const deps = {
+    runnerCommand: 'unused',
+    runnerArgs: [],
+    homeDirectory: '/home/test',
+    workingDir: '/repo',
+    execute: async (raw: string) => {
+      sent.input = JSON.parse(raw) as RunnerInput
+      return { ok: true, stdout, timedOut: false }
+    },
+  }
+
+  return { deps, read: () => {
+    if (sent.input === undefined) throw new Error('runner was never invoked')
+    return sent.input
+  } }
+}
+
+interface RunnerInput {
+  subjectId: string
+  prompt: string
+  workingDir: string
+  model?: string
+  reasoningEffort?: string
+  useLegacyLandlockSandbox?: boolean
+}
+
+describe('generateRoadmap (Codex runner wiring)', () => {
+  it('generates with gpt-5.6-sol at xhigh, reading the target repo under legacy Landlock', async () => {
+    const { deps, read } = captureRunner()
 
     await generateRoadmap(MOCK_ANALYSIS, {
-      apiKey: 'test-api-key',
-      canonicalDefinitionText: '# Goal\n\nCanonical goal',
+      runnerDeps: deps,
+      targetProjectRoot: '/workspace/target',
+      canonicalDefinitionText: '# Goal' + String.fromCharCode(10) + String.fromCharCode(10) + 'Canonical goal',
       definitionHash: 'abc123',
     })
 
-    expect(anthropicMocks.create).toHaveBeenCalledWith(expect.objectContaining({
-      model: 'claude-haiku-4-5-20251001',
-    }))
-    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
-    expect(request?.messages[0]?.content).toContain('Project Definition Hash')
-    expect(request?.messages[0]?.content).toContain('abc123')
-    expect(request?.messages[0]?.content).toContain('Canonical goal')
-    expect(request?.messages[0]?.content).toContain('allowed_path_prefixes')
+    const sent = read()
+    expect(sent.model).toBe('gpt-5.6-sol')
+    expect(sent.reasoningEffort).toBe('xhigh')
+    // bubblewrapが動かないホストでは、これが無いとCodexはrepoを読めない（deprecatedな暫定経路）
+    expect(sent.useLegacyLandlockSandbox).toBe(true)
+    // 対象リポジトリを読みながら計画する。制御リポジトリではない。
+    expect(sent.workingDir).toBe('/workspace/target')
+    expect(sent.prompt).toContain('Project Definition Hash')
+    expect(sent.prompt).toContain('abc123')
+    expect(sent.prompt).toContain('Canonical goal')
+    expect(sent.prompt).toContain('allowed_path_prefixes')
+  })
+
+  it('fails closed when the runner fails instead of yielding an empty roadmap', async () => {
+    const deps = {
+      runnerCommand: 'unused',
+      runnerArgs: [],
+      homeDirectory: '/home/test',
+      workingDir: '/repo',
+      execute: async () => ({ ok: false, stdout: '', error: 'runner exploded', timedOut: false }),
+    }
+
+    await expect(generateRoadmap(MOCK_ANALYSIS, { runnerDeps: deps }))
+      .rejects.toThrow(/Roadmap生成に失敗しました/)
   })
 
   it('system prompt does not contain the old unconditional 10-20 default when structuredConstraints is empty', async () => {
-    anthropicMocks.create.mockResolvedValueOnce({
-      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
-    })
+    const { deps, read } = captureRunner()
+    const emptyConstraintsAnalysis: SpecAnalysis = { ...MOCK_ANALYSIS, structuredConstraints: [] }
 
-    const emptyConstraintsAnalysis: SpecAnalysis = {
-      ...MOCK_ANALYSIS,
-      structuredConstraints: [],
-    }
+    await generateRoadmap(emptyConstraintsAnalysis, { runnerDeps: deps })
 
-    await generateRoadmap(emptyConstraintsAnalysis, { apiKey: 'test-api-key' })
-
-    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
-    expect(request?.system).not.toContain('10〜20件')
-    expect(request?.system).not.toContain('10-20')
+    expect(read().prompt).not.toContain('10〜20件')
+    expect(read().prompt).not.toContain('10-20')
   })
 
   it('system prompt contains proportional sizing guidance when structuredConstraints is empty', async () => {
-    anthropicMocks.create.mockResolvedValueOnce({
-      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
-    })
+    const { deps, read } = captureRunner()
+    const emptyConstraintsAnalysis: SpecAnalysis = { ...MOCK_ANALYSIS, structuredConstraints: [] }
 
-    const emptyConstraintsAnalysis: SpecAnalysis = {
-      ...MOCK_ANALYSIS,
-      structuredConstraints: [],
-    }
+    await generateRoadmap(emptyConstraintsAnalysis, { runnerDeps: deps })
 
-    await generateRoadmap(emptyConstraintsAnalysis, { apiKey: 'test-api-key' })
-
-    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
-    expect(request?.system).toContain('タスク数はプロジェクトの実際の範囲に比例させてください')
-    expect(request?.system).toContain('単一ファイル・単一関数の変更であれば1〜2タスクで十分')
+    const prompt = read().prompt
+    expect(prompt).toContain('タスク数はプロジェクトの実際の範囲に比例させてください')
+    expect(prompt).toContain('単一ファイル・単一関数の変更であれば1〜2タスクで十分')
   })
 
   it('explicit max_task_count in structuredConstraints is still instructed as the governing limit', async () => {
-    anthropicMocks.create.mockResolvedValueOnce({
-      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
-    })
-
+    const { deps, read } = captureRunner()
     const maxCountAnalysis: SpecAnalysis = {
       ...MOCK_ANALYSIS,
       structuredConstraints: [
-        {
-          kind: 'max_task_count',
-          value: 5,
-          description: 'At most 5 tasks.',
-          sourceText: 'at most 5 tasks',
-        },
+        { kind: 'max_task_count', value: 5, description: 'At most 5 tasks.', sourceText: 'at most 5 tasks' },
       ],
     }
 
-    await generateRoadmap(maxCountAnalysis, { apiKey: 'test-api-key' })
+    await generateRoadmap(maxCountAnalysis, { runnerDeps: deps })
 
-    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
-    expect(request?.system).toContain('max_task_count がある場合はその値を厳守')
-    expect(request?.messages[0]?.content).toContain('"kind": "max_task_count"')
+    const prompt = read().prompt
+    expect(prompt).toContain('max_task_count がある場合はその値を厳守')
+    expect(prompt).toContain('"kind": "max_task_count"')
   })
 
   it('surfaces scope signals in the project summary for sizing', async () => {
-    anthropicMocks.create.mockResolvedValueOnce({
-      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
-    })
+    const { deps, read } = captureRunner()
 
-    await generateRoadmap(MOCK_ANALYSIS, { apiKey: 'test-api-key' })
+    await generateRoadmap(MOCK_ANALYSIS, { runnerDeps: deps })
 
-    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
-    expect(request?.messages[0]?.content).toContain('## Scope Signals')
-    expect(request?.messages[0]?.content).toContain('MVP included features: 2')
-    expect(request?.messages[0]?.content).toContain('Tech stack size: 3')
+    const prompt = read().prompt
+    expect(prompt).toContain('## Scope Signals')
+    expect(prompt).toContain('MVP included features: 2')
+    expect(prompt).toContain('Tech stack size: 3')
   })
 
-  it('adds priorAttemptFeedback to the real API prompt when provided', async () => {
-    anthropicMocks.create.mockResolvedValueOnce({
-      content: [{ type: 'text', text: MOCK_ROADMAP_JSON }],
-    })
+  it('adds priorAttemptFeedback to the prompt when provided', async () => {
+    const { deps, read } = captureRunner()
 
     await generateRoadmap(MOCK_ANALYSIS, {
-      apiKey: 'test-api-key',
+      runnerDeps: deps,
       priorAttemptFeedback: 'scope_simplicity rejected the previous roadmap as over-split.',
     })
 
-    const request = anthropicMocks.create.mock.calls.at(-1)?.[0]
-    expect(request?.messages[0]?.content).toContain('Previous Attempt Was Rejected -- Fix This')
-    expect(request?.messages[0]?.content).toContain('scope_simplicity rejected the previous roadmap as over-split.')
-    expect(request?.messages[0]?.content).toContain('Generate a NEW roadmap')
+    const prompt = read().prompt
+    expect(prompt).toContain('Previous Attempt Was Rejected -- Fix This')
+    expect(prompt).toContain('scope_simplicity rejected the previous roadmap as over-split.')
+    expect(prompt).toContain('Generate a NEW roadmap')
   })
 })
 
@@ -245,11 +269,20 @@ describe('generateRoadmap (mockResponse)', () => {
     expect(roadmap.phases[0].name).toBe('基盤構築')
   })
 
-  it('mockResponse なし & APIキーなしはエラー', async () => {
-    const origKey = process.env.ANTHROPIC_API_KEY
-    delete process.env.ANTHROPIC_API_KEY
-    await expect(generateRoadmap(MOCK_ANALYSIS)).rejects.toThrow('ANTHROPIC_API_KEY')
-    process.env.ANTHROPIC_API_KEY = origKey
+  // Roadmap生成はCodex CLI経路になったので ANTHROPIC_API_KEY は要らない（PR C）。
+  // 代わりに固定するのは「生成できなければ失敗する」こと — 生成できなかったことを
+  // 空のRoadmapとして下流へ流すと、Taskが0件のProjectが正常完了したように見えてしまう。
+  it('mockResponse なし & runner失敗時は空Roadmapではなくエラー', async () => {
+    const deps = {
+      runnerCommand: 'unused',
+      runnerArgs: [],
+      homeDirectory: '/home/test',
+      workingDir: '/repo',
+      execute: async () => ({ ok: false, stdout: '', error: 'codex unavailable', timedOut: false }),
+    }
+
+    await expect(generateRoadmap(MOCK_ANALYSIS, { runnerDeps: deps }))
+      .rejects.toThrow(/Roadmap生成に失敗しました/)
   })
 })
 

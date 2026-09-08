@@ -92,22 +92,13 @@ function roadmapStdout(
           }]
         : [],
     })),
-    integrationReviewResult: { decision: 'ALIGNED', summary: 'Integrated review aligned.' },
-    independentReviewResult: decision === 'REVIEW_UNAVAILABLE'
-      ? {
-          provider: 'codex',
-          verdict: 'approved',
-          summary: 'independent reviewer output could not be parsed',
-          unavailable: true,
-        }
-      : {
-          provider: 'codex',
-          verdict: 'approved',
-          summary: 'Independent review approved.',
-          unavailable: false,
-        },
+    ...(decision === 'REVIEW_UNAVAILABLE'
+      ? {}
+      : { integrationReviewResult: { decision: 'ALIGNED', summary: 'Integrated review aligned.' } }),
+    // PR C: roadmap kind に independent review は無い。第二意見は Claude の integration review。
+    // 取得できなかった場合は integration 側が欠落する（=fail-closed）ことで表現する。
     finalDecision: decision,
-    independentReviewRequired: true,
+    independentReviewRequired: false,
     requiresCeoApproval: decision !== 'ALIGNED',
     createdAt: '2026-09-02T00:00:00.000Z',
   })
@@ -338,8 +329,8 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
       subjectId: project.id,
       decision: 'ALIGNED',
       reviewLoad: 'critical',
-      independentReviewRequired: true,
-      independentReviewVerdict: 'approved',
+      // roadmap kind は independent review を要求しない（PR C）。
+      independentReviewRequired: false,
     })
     expect(storage.tasks.findByProjectId(project.id)).toHaveLength(1)
   })

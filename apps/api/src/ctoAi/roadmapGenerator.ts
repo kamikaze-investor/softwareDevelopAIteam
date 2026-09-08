@@ -10,9 +10,15 @@
  *   - タスク一覧（依存関係付き、実装順に並んでいる）
  */
 
-import Anthropic from '@anthropic-ai/sdk'
+import path from 'node:path'
+import { buildRunnerEnv, executeRunner, type CoordinatorDeps } from '../designReview/designReviewCoordinator.js'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
-import { ROADMAP_TASK_CATEGORIES, type RoadmapTaskCategory } from '@ai-team/shared'
+import {
+  assertRoadmapTopologySeparated,
+  ROADMAP_GENERATOR_PROVIDER,
+  ROADMAP_TASK_CATEGORIES,
+  type RoadmapTaskCategory,
+} from '@ai-team/shared'
 import { z } from 'zod'
 import type { SpecAnalysis } from './specAnalyzer.js'
 
@@ -149,6 +155,12 @@ export interface RoadmapGeneratorOptions {
    * Goal/Design Philosophy content -- purely "here's what failed, fix this."
    */
   priorAttemptFeedback?: string
+
+  /** 対象リポジトリのルート。Codexがここを読みながらRoadmapを立てる。 */
+  targetProjectRoot?: string
+
+  /** テストから差し替えるためのrunner起動設定。未指定なら既定。 */
+  runnerDeps?: CoordinatorDeps
 }
 
 /**
@@ -255,45 +267,89 @@ Generate a NEW roadmap that addresses this specific problem. Do not repeat the s
 `.trim()
 }
 
+/** Roadmap生成に使うCodexのモデルと推論強度。Roadmapは全体の骨格を決めるので最上位を使う。 */
+export const ROADMAP_GENERATOR_MODEL = 'gpt-5.6-sol'
+export const ROADMAP_GENERATOR_REASONING_EFFORT = 'xhigh'
+/** vendor separationの正本は packages/shared/src/roadmapTopology.ts。ここでは再輸出だけ。 */
+export { ROADMAP_GENERATOR_PROVIDER }
+
+/** Roadmap生成runnerの既定起動設定。designReviewと同じ形（新しいQueue/Daemonは作らない）。 */
+export function buildDefaultRoadmapGeneratorDeps(): CoordinatorDeps {
+  const repoRoot = process.env.DESIGN_REVIEW_REPO_ROOT ?? path.resolve(process.cwd(), '../..')
+
+  return {
+    runnerCommand: process.env.DESIGN_REVIEW_RUNNER_COMMAND ?? 'npx',
+    runnerArgs: [
+      ...(process.env.DESIGN_REVIEW_RUNNER_COMMAND ? [] : ['tsx']),
+      path.join(repoRoot, 'apps', 'worker', 'scripts', 'roadmapGeneratorRunner.ts'),
+    ],
+    homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? repoRoot,
+    workingDir: repoRoot,
+  }
+}
+
+/**
+ * Roadmapを生成する。
+ *
+ * **生成者はCodex（gpt-5.6-sol / reasoning effort xhigh）。**
+ * 以前はClaude Haikuへ Anthropic SDK で投げていたが、それでは対象リポジトリを読めない —
+ * SDK経路のモデルはファイルにアクセスできないので、既存のコード・仕様・テストを見ずに
+ * Roadmapを立てることになる。Codex CLIは `-C <target>` を読みながら計画できる。
+ *
+ * runnerは `--sandbox read-only` で動き、capture fileはOS temp配下に置かれるので、
+ * 生成中に対象リポジトリを書き換えない。
+ *
+ * ⚠️ このVPSではbubblewrapが動かないため `use_legacy_landlock=true` をcall-localに渡す。
+ * deprecatedな暫定経路（roadmap: codex-sandbox-off-deprecated-landlock）。
+ */
 export async function generateRoadmap(
   analysis: SpecAnalysis,
   options: RoadmapGeneratorOptions = {},
 ): Promise<Roadmap> {
-  const { mockResponse, model = 'claude-haiku-4-5-20251001' } = options
+  const { mockResponse } = options
 
   if (mockResponse !== undefined) {
     return parseRoadmapJson(mockResponse)
   }
 
-  const apiKey = options.apiKey ?? process.env.ANTHROPIC_API_KEY
-  if (!apiKey) {
-    throw new Error('[CTO AI] ANTHROPIC_API_KEY が設定されていません。')
-  }
-
-  const client = new Anthropic({ apiKey })
+  // **モデルを呼ぶ前に**分離を検証する。生成後に気付くと最上位モデルの枠を捨てることになる。
+  // 同一vendor / 未知のvendorはfail-closed（reviewSeparation.ts）。
+  assertRoadmapTopologySeparated()
 
   const projectSummary = buildRoadmapProjectSummary(analysis, options)
+  const targetRepo = options.targetProjectRoot ?? process.env.TARGET_ROOT ?? '/workspace/target'
+  const deps = options.runnerDeps ?? buildDefaultRoadmapGeneratorDeps()
 
-  const message = await client.messages.create({
-    model,
-    max_tokens: 4096,
-    system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: `以下のProject Memoryからロードマップを生成してください:\n\n${projectSummary}`,
-      },
-    ],
+  const runnerInput = JSON.stringify({
+    subjectId: options.definitionHash ?? 'roadmap',
+    prompt: [
+      SYSTEM_PROMPT,
+      '',
+      '以下のProject Memoryからロードマップを生成してください:',
+      '',
+      projectSummary,
+    ].join(String.fromCharCode(10)),
+    workingDir: targetRepo,
+    model: ROADMAP_GENERATOR_MODEL,
+    reasoningEffort: ROADMAP_GENERATOR_REASONING_EFFORT,
+    useLegacyLandlockSandbox: true,
   })
 
-  const rawText = message.content
-    .filter(block => block.type === 'text')
-    .map(block => (block as { type: 'text'; text: string }).text)
-    .join('')
+  // designReviewCoordinator と同じ呼び出し規約: テストは deps.execute で差し替える。
+  const execution = deps.execute
+    ? await deps.execute(runnerInput)
+    : await executeRunner(deps, runnerInput)
 
-  return parseRoadmapJson(rawText)
+  if (!execution.ok) {
+    // Roadmapが得られないことを「空のRoadmap」として下流へ流さない（fail-closed）。
+    throw new Error(
+      '[CTO AI] Roadmap生成に失敗しました: ' + (execution.error ?? 'unknown')
+      + (execution.stderr ? ' / ' + execution.stderr : ''),
+    )
+  }
+
+  return parseRoadmapJson(execution.stdout)
 }
-
 // ────────────────────────────────────────────────────────────
 // JSONパース + バリデーション
 // ────────────────────────────────────────────────────────────
