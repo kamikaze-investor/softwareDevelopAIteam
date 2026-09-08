@@ -17,6 +17,7 @@ import type {
   TaskFailureQuestionResponse,
   TaskFailureQuestionTurn,
   TaskStatus,
+  WatchdogEvent,
 } from '@ai-team/shared'
 import { router, useLocalSearchParams } from 'expo-router'
 import {
@@ -36,6 +37,7 @@ import {
   canReflectChanges,
   canRunReview,
   canShowResumeUI,
+  deriveJobDisplayState,
   isImplementJob,
   isJobBusy,
   isReviewJob,
@@ -184,6 +186,8 @@ interface TaskDetailData {
   task: Task
   jobs: Job[]
   approvalRequests: ApprovalRequest[]
+  /** MOB-001: stall を「検出しただけ」と「確認済み」に分けて表示するため */
+  watchdogEvents: WatchdogEvent[]
 }
 
 async function fetchTask(taskId: string): Promise<Task | null> {
@@ -226,6 +230,21 @@ async function fetchApprovalRequests(
   }
 
   return (await response.json()) as ApprovalRequest[]
+}
+
+/**
+ * MOB-001: watchdog が stall と確認したかを表示に反映するために取得する。
+ * 新しい backend workflow は作らず、既存の WatchdogEvent 取得APIをそのまま読むだけ。
+ * 取得に失敗しても詳細画面は壊さない（stall表示が出ないだけに留める）。
+ */
+async function fetchWatchdogEvents(taskId: string): Promise<WatchdogEvent[]> {
+  const response = await apiFetch(
+    `/api/watchdog-events`,
+    { method: 'GET' },
+  )
+  if (!response.ok) return []
+  const all = (await response.json()) as WatchdogEvent[]
+  return all.filter((event) => event.taskId === taskId)
 }
 
 async function fetchTaskFailureExplanation(
@@ -598,6 +617,75 @@ function TaskFailureQuestionModal({
   )
 }
 
+/**
+ * MOB-001: 実行状態を CEO が見分けられるようにする。
+ *
+ * 新しい status 体系は作らず、既存の Job.status / failureMetadata.quarantined /
+ * WatchdogEvent / approval state から導出して表示するだけ。
+ *
+ * 重要なのは quarantine を通常の停止と混同させないこと。quarantine は
+ * 「承認すれば進む」状態ではなく、workspace の状態が確認できないので所有権を
+ * 保持している状態であり、必要なのは reconciliation / clearance である。
+ */
+const EXECUTION_STATE_VIEW: Record<string, { color: string; label: string; detail: string } | undefined> = {
+  approval_waiting: {
+    color: '#f59e0b',
+    label: '承認待ち',
+    detail: 'CEOの承認を待っています。承認すると続きが実行されます。',
+  },
+  blocked: {
+    color: '#f59e0b',
+    label: '停止中',
+    detail: 'Guard違反などで停止しています。追加指示を送って再開できます。',
+  },
+  quarantined: {
+    color: '#dc2626',
+    label: '作業領域の安全確認待ち（quarantine）',
+    detail:
+      '実行後の作業領域が安全だと確認できなかったため、この Job が作業領域を保持したまま停止しています。' +
+      '承認や再開では解消しません。作業領域の照合（reconciliation）と解除が必要です。',
+  },
+  running_healthy: {
+    color: '#3b82f6',
+    label: '実行中',
+    detail: '正常に実行中です。',
+  },
+  running_stalled: {
+    color: '#f97316',
+    label: '実行中（停滞を確認）',
+    detail: '実行中ですが、watchdog が停滞と判断しました。進んでいない可能性があります。',
+  },
+}
+
+function ExecutionStateSection({
+  approvalRequests,
+  jobs,
+  watchdogEvents,
+}: {
+  approvalRequests: ApprovalRequest[]
+  jobs: Job[]
+  watchdogEvents: WatchdogEvent[]
+}): ReactElement | null {
+  const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
+  const state = deriveJobDisplayState(latestJob, approvalRequests, watchdogEvents)
+  const view = EXECUTION_STATE_VIEW[state]
+  if (view === undefined) return null
+
+  const reason = latestJob?.failureMetadata?.quarantineReason
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>実行状態</Text>
+      <View style={[styles.executionStateBadge, { backgroundColor: view.color }]}>
+        <Text style={styles.executionStateBadgeText}>{view.label}</Text>
+      </View>
+      <Text style={styles.executionStateDetail}>{view.detail}</Text>
+      {state === 'quarantined' && reason !== undefined && (
+        <Text style={styles.executionStateReason}>理由: {reason}</Text>
+      )}
+    </View>
+  )
+}
 function TaskFailureExplanationSection({
   jobs,
   task,
@@ -1156,11 +1244,12 @@ export default function TaskDetailScreen(): ReactElement {
 
       // ApprovalRequestはtaskId単位の関連履歴であり、現状Jobとの厳密な1対1対応は追跡していない。
       // 詳細画面では3APIを並列に各1回だけ取得し、Job単位の追加fetchは行わない。
-      const [taskResult, jobsResult, approvalRequestsResult] =
+      const [taskResult, jobsResult, approvalRequestsResult, watchdogResult] =
         await Promise.allSettled([
           fetchTask(taskId),
           fetchJobs(taskId),
           fetchApprovalRequests(taskId),
+          fetchWatchdogEvents(taskId),
         ])
 
       if (taskResult.status === 'rejected') {
@@ -1185,6 +1274,8 @@ export default function TaskDetailScreen(): ReactElement {
         approvalRequests: approvalRequestsResult.value,
         jobs: jobsResult.value,
         task: taskResult.value,
+        // 取得失敗は致命的でない: stall 表示が出ないだけで、他の状態表示は保つ。
+        watchdogEvents: watchdogResult.status === 'fulfilled' ? watchdogResult.value : [],
       })
     } catch (loadError) {
       const message = getErrorMessage(loadError)
@@ -1296,6 +1387,11 @@ export default function TaskDetailScreen(): ReactElement {
       {data !== null && (
         <>
           <TaskInfoSection task={data.task} />
+          <ExecutionStateSection
+            approvalRequests={data.approvalRequests}
+            jobs={data.jobs}
+            watchdogEvents={data.watchdogEvents}
+          />
           <TaskFailureExplanationSection
             jobs={data.jobs}
             task={data.task}
@@ -1739,6 +1835,28 @@ const styles = StyleSheet.create({
     color: '#737373',
     fontSize: 14,
     marginBottom: 12,
+  },
+  executionStateBadge: {
+    alignSelf: 'flex-start',
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  executionStateBadgeText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  executionStateDetail: {
+    color: '#d4d4d4',
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 8,
+  },
+  executionStateReason: {
+    color: '#a3a3a3',
+    fontSize: 12,
+    marginTop: 6,
   },
   sectionTitle: {
     color: '#fff',
