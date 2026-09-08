@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
-import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS } from '@ai-team/shared'
+import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
@@ -2986,12 +2986,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         const current = db.prepare('SELECT kind, status FROM supervised_runs WHERE id = ?').get(id) as any
         if (!current || current.status !== 'running') return false
 
-        const threshold = SUPERVISED_RUN_STALE_THRESHOLD_MS[current.kind as SupervisedRunKind]
-        if (threshold === undefined) {
+        // kind は schema 上ただの TEXT なので、DB から来た値を素の object index で引かない
+        // （独立レビュー指摘 2026-09-08 第4ラウンド: `toString` や `constructor` のような値は
+        // prototype 由来のプロパティに解決されてしまい、undefined 判定を素通りして
+        // `new Date(Date.now() - <function>)` が Invalid Date として throw する）。
+        // 既知 kind の集合に対する明示的なメンバーシップ判定だけを信用する。
+        const kind: string = String(current.kind)
+        if (!isSupervisedRunKind(kind)) {
           // 未知の kind は閾値を決められない。勝手に stalled にはせず、判定を見送る
           // （fail-closed 側の判断は predicate 解決経路が担当する）。
           return false
         }
+        const threshold = SUPERVISED_RUN_STALE_THRESHOLD_MS[kind]
 
         const staleCutoff = new Date(Date.now() - threshold).toISOString()
         const result = db.prepare(`

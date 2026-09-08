@@ -268,6 +268,30 @@ describe('supervised_runs storage', () => {
       expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'genuinely quiet')).toBe(true)
     })
 
+    it.each(['toString', 'constructor', 'unknown_future_kind'])(
+      'kind="%s" のような未知の値でも throw せず、勝手に stalled にもしない（独立レビュー第4ラウンド: prototype 由来のプロパティに解決されないこと）',
+      (bogusKind) => {
+        // kind は schema 上ただの TEXT。create() を通さず直接書き込んだ行を模す。
+        const id = randomUUID()
+        const stamp = new Date(Date.now() - 3_600_000).toISOString()
+        const db = new Database(dbPath)
+        try {
+          db.prepare(`
+            INSERT INTO supervised_runs
+              (id, kind, subject_id, status, predicate_key, predicate_version, recovery_attempt_count,
+               claim_token, created_at, started_at, last_progress_at)
+            VALUES (?, ?, 'x', 'running', 'k', 1, 0, 'tok', ?, ?, ?)
+          `).run(id, bogusKind, stamp, stamp, stamp)
+        } finally {
+          db.close()
+        }
+
+        expect(() => storage.supervisedRuns.markStalledBySupervisor(id, 'sweep')).not.toThrow()
+        expect(storage.supervisedRuns.markStalledBySupervisor(id, 'sweep')).toBe(false)
+        expect(storage.supervisedRuns.findById(id)?.status).toBe('running')
+      },
+    )
+
     it('閾値は kind ごとに異なる（C-4: 一律の短い timeout で判定しない）', () => {
       expect(SUPERVISED_RUN_STALE_THRESHOLD_MS.ai_delegation)
         .not.toBe(SUPERVISED_RUN_STALE_THRESHOLD_MS.expo_restart)
