@@ -440,7 +440,7 @@ function roadmapAlignedRaw(): Record<string, unknown> {
     selectedFocuses: ROADMAP_FOCUSES,
     focusedReviewResults: ROADMAP_FOCUSES.map((focus) => ({ focus, decision: 'ALIGNED' })),
     integrationReviewResult: { decision: 'ALIGNED' },
-    independentReviewResult: { verdict: 'approved' },
+    // PR C: roadmap kind に independent review は無い。第二意見は Claude の integration review。
     finalDecision: 'ALIGNED',
   }
 }
@@ -451,7 +451,8 @@ describe('recomputeDecision with reviewKind=roadmap', () => {
 
     expect(outcome.decision).toBe('ALIGNED')
     expect(outcome.reviewLoad).toBe('critical')
-    expect(outcome.independentReviewRequired).toBe(true)
+    // roadmap kind は別建ての independent review を要求しない（Worker も生成しない）。
+    expect(outcome.independentReviewRequired).toBe(false)
     expect(outcome.rejectedReason).toBeUndefined()
   })
 
@@ -465,14 +466,47 @@ describe('recomputeDecision with reviewKind=roadmap', () => {
     expect(outcome.rejectedReason).toContain('focus set mismatch')
   })
 
-  it('criticalなのにindependent reviewが欠落していれば採用しない', () => {
+  // PR C: roadmap の第二意見は Claude の integration review。これが欠けたまま
+  // 「Gemini群だけ揃ったので承認」にしてはならない。
+  it('integration reviewが欠落していれば採用しない（fail-closed）', () => {
     const raw = roadmapAlignedRaw()
-    delete raw.independentReviewResult
+    delete raw.integrationReviewResult
 
     const outcome = recomputeDecision(raw, 'roadmap', [])
 
     expect(outcome.decision).not.toBe('ALIGNED')
-    expect(outcome.rejectedReason).toContain('independent review')
+    expect(outcome.rejectedReason).toContain('integration review')
+  })
+
+  it('Gemini focused の CONFLICT は ALIGNED にならない', () => {
+    const raw = roadmapAlignedRaw()
+    const focuses = raw.focusedReviewResults as Array<{ focus: string; decision: string }>
+    focuses[1] = { focus: focuses[1].focus, decision: 'CONFLICT' }
+
+    expect(recomputeDecision(raw, 'roadmap', []).decision).toBe('CONFLICT')
+  })
+
+  it('Gemini focused の UNCERTAIN は ALIGNED にならない', () => {
+    const raw = roadmapAlignedRaw()
+    const focuses = raw.focusedReviewResults as Array<{ focus: string; decision: string }>
+    focuses[1] = { focus: focuses[1].focus, decision: 'UNCERTAIN' }
+
+    expect(recomputeDecision(raw, 'roadmap', []).decision).toBe('UNCERTAIN')
+  })
+
+  // task kind の契約は変えない。critical では従来どおり independent review を要求する。
+  it('task kind の critical は従来どおり independent review を要求する', () => {
+    const raw = roadmapAlignedRaw()
+    raw.reviewKind = 'task'
+    delete raw.independentReviewResult
+
+    const outcome = recomputeDecision(
+      raw,
+      'task',
+      ['apps/api/src/storage/sqlite.ts', 'apps/worker/src/jobRunner.ts'],
+    )
+
+    expect(outcome.decision).not.toBe('ALIGNED')
   })
 })
 

@@ -329,7 +329,7 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
  * Roadmap final integration review 用のモデル。
  * 2026-09-07 に production の Anthropic key で `GET /v1/models` を実行し、利用可能を実測確認済み。
  */
-const CLAUDE_REVIEWER_MODEL = 'claude-opus-5'
+export const CLAUDE_REVIEWER_MODEL = 'claude-opus-5'
 
 /**
  * Claude Code CLI の `--output-format json` envelope から、モデル本文を取り出す。
@@ -475,7 +475,7 @@ export function reviewWithSeparation(
   //
   // **このゲートはRoadmap topology cutover（PR C）でも維持する。**
   // Step 2で変更するのはRoadmap topologyだけ:
-  //   Roadmap: Codex generator → Gemini focused + OpenCode feasibility → Claude final integration
+  //   Roadmap: Codex generator → Gemini focused ×3 → Claude final integration
   //   Task:    既存topologyのまま（変更しない）
   // task-kind reviewでClaudeを使うことは別のtopology変更であり、明示的な判断なしに
   // Roadmapの変更へ相乗りさせない（CEO判断、2026-09-07）。
