@@ -329,7 +329,7 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
  * Roadmap final integration review 用のモデル。
  * 2026-09-07 に production の Anthropic key で `GET /v1/models` を実行し、利用可能を実測確認済み。
  */
-const CLAUDE_REVIEWER_MODEL = 'claude-opus-5'
+export const CLAUDE_REVIEWER_MODEL = 'claude-opus-5'
 
 /**
  * Claude Code CLI の `--output-format json` envelope から、モデル本文を取り出す。

@@ -53,4 +53,5 @@ export {
   ProviderSeparationError,
   resolveReviewVendor,
 } from './reviewSeparation'
+export * from './roadmapTopology'
 export type { ReviewVendor } from './reviewSeparation'

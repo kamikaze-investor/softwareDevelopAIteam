@@ -33,7 +33,18 @@ import {
 } from './runner.js'
 import { AGY_REVIEW_MODEL } from './geminiRouter.js'
 import { reviewWithProviderFallback } from './metaReviewFallbackRouter.js'
-import { createReviewerAdapter } from '../approvalLevel/reviewerAdapter.js'
+import {
+  CLAUDE_REVIEWER_MODEL,
+  createReviewerAdapter,
+  extractClaudeCliResultText,
+} from '../approvalLevel/reviewerAdapter.js'
+import { createAiCliAdapter } from '../aiCli/factory.js'
+import { TARGET_ROOT } from '../utils/pathUtils.js'
+import {
+  assertRoadmapTopologySeparated,
+  ROADMAP_FINAL_REVIEWER_PROVIDER,
+  resolveReviewVendor,
+} from '@ai-team/shared'
 
 /**
  * Reviewer used for the CRITICAL-only Independent Review.
@@ -226,8 +237,16 @@ export async function runStrategicMetaReview(
     ? 'REVIEW_UNAVAILABLE'
     : resolveFinalDecision(focusedReviewResults, integrationReviewResult)
 
+  // Independent Review は **task kind のみ**。
+  // roadmap kind では最終統合を Claude が行うので、ここで Codex を呼ぶと
+  // 「Codexが生成してCodexが独立レビューする」自己レビューになる。
+  // `INDEPENDENT_REVIEWER_PROVIDER` は削除していない — task kind の既存topologyはそのまま。
   let independentReviewResult: IndependentReviewOutcome | undefined
-  if (classification.reviewLoad === 'critical' && finalDecision !== 'REVIEW_UNAVAILABLE') {
+  if (
+    reviewKind !== 'roadmap'
+    && classification.reviewLoad === 'critical'
+    && finalDecision !== 'REVIEW_UNAVAILABLE'
+  ) {
     independentReviewResult = await runIndependentReview(input)
     finalDecision = applyIndependentReviewOverride(finalDecision, independentReviewResult)
   }
@@ -437,11 +456,76 @@ async function runFocusedReview(
   }
 }
 
+/**
+ * roadmap kind の統合レビューを Claude で行う。
+ *
+ * **Claude は deterministic aggregation の上位に立つ裁判官ではない。** ここが返すのは
+ * 他の expert と同じ1件の `IntegrationReviewResult` で、最終判定は `resolveFinalDecision` が
+ * focused 群と併せて安全側へ倒して決める。したがって Gemini の CONFLICT / UNCERTAIN を
+ * Claude が握り潰す経路は存在しない（多数決でもない）。
+ *
+ * プロンプトと応答スキーマは Gemini 経路と同一（`buildIntegrationReviewPrompt` /
+ * `parseIntegrationReviewResponse`）。変わるのは実行するproviderだけ。
+ *
+ * fail-closed: blocked / 非0 exit / envelope破損 / 例外のいずれも `unavailable` を返し、
+ * 呼び出し元が REVIEW_UNAVAILABLE へ倒す。**「integration review を省略して続行」はしない。**
+ */
+async function runRoadmapIntegrationReviewWithClaude(
+  prompt: string,
+  subjectId: string,
+): Promise<ReviewOutcome<IntegrationReviewResult>> {
+  const unavailable = (reason: string): ReviewOutcome<IntegrationReviewResult> => ({
+    result: { decision: 'UNCERTAIN', summary: `Claude integration review unavailable: ${reason}` },
+    unavailable: true,
+  })
+
+  try {
+    // 生成者と最終レビュアーが別vendorであることをここでも確認する（fail-closed）。
+    // API側は生成前に同じ検証をしているが、再レビュー等で生成を伴わずここへ来る経路もある。
+    assertRoadmapTopologySeparated()
+
+    // reviewer namespace の識別子（`claude`）と CLI harness の識別子（`claude_code`）は別物。
+    // 同じ Anthropic を指していることを実際に確認してから CLI を選ぶ。
+    if (resolveReviewVendor(ROADMAP_FINAL_REVIEWER_PROVIDER) !== 'anthropic') {
+      return unavailable(
+        `configured final reviewer (${ROADMAP_FINAL_REVIEWER_PROVIDER}) is not the Anthropic CLI path`,
+      )
+    }
+
+    const adapter = createAiCliAdapter({ provider: 'claude_code' })
+    const result = await adapter.run({
+      taskId: `roadmap-integration:${subjectId}`,
+      provider: 'claude_code',
+      workingDir: TARGET_ROOT,
+      prompt,
+      contextFiles: [],
+      mode: 'review',
+      expectJson: true,
+      model: CLAUDE_REVIEWER_MODEL,
+    })
+
+    if (result.blocked) return unavailable('guard blocked the reviewer')
+    if (result.exitCode !== 0) return unavailable(`exitCode=${result.exitCode}`)
+
+    const inner = extractClaudeCliResultText(result.stdout)
+    if (inner === undefined) return unavailable('CLI envelope could not be parsed')
+
+    return parseIntegrationReviewResponse(inner)
+  } catch (err) {
+    return unavailable(formatError(err))
+  }
+}
 async function runIntegrationReview(
   input: StrategicReviewInput,
   focusedReviewResults: readonly FocusedReviewResult[],
 ): Promise<ReviewOutcome<IntegrationReviewResult>> {
   const prompt = buildIntegrationReviewPrompt(input, focusedReviewResults)
+
+  // roadmap kind の最終統合は Claude（generatorのCodexとは別vendor）。
+  // task kind はここを通らず、従来どおり Gemini のまま。
+  if (input.reviewKind === 'roadmap') {
+    return runRoadmapIntegrationReviewWithClaude(prompt, input.subjectId)
+  }
 
   try {
     const { raw: rawResponse } = await reviewWithProviderFallback(prompt, {

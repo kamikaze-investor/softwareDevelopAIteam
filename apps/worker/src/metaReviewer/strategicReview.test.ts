@@ -75,6 +75,27 @@ function mockCodexReviewerRun(
   } as unknown as ReturnType<typeof createAiCliAdapter>)
 }
 
+/**
+ * roadmap kind の統合レビューは Claude CLI 経路（PR C）。
+ * Claude Code CLI は `--output-format json` の envelope を返し、レビュー本体はその `result`
+ * フィールドの中に入っている。二段階parseを実際に通すため、その形をそのまま模す。
+ */
+function mockClaudeIntegrationRun(decision: string, summary = 'claude integration review'): void {
+  const envelope = {
+    type: 'result',
+    is_error: false,
+    result: JSON.stringify({ decision, summary }),
+  }
+  mockCreateAiCliAdapter.mockReturnValue({
+    run: vi.fn().mockResolvedValue({
+      blocked: false,
+      exitCode: 0,
+      stdout: JSON.stringify(envelope),
+      stderr: '',
+    }),
+  } as unknown as ReturnType<typeof createAiCliAdapter>)
+}
+
 function mockCodexReviewerFailure(): void {
   mockCreateAiCliAdapter.mockReturnValue({
     run: vi.fn().mockResolvedValue({ blocked: false, exitCode: 1, stdout: '', stderr: 'codex unavailable' }),
@@ -178,7 +199,6 @@ describe('runStrategicMetaReview', () => {
     expect(mockCreateAiCliAdapter).toHaveBeenCalledTimes(1)
     expect(result.independentReviewResult).toBeDefined()
     expect(result.independentReviewResult?.provider).toBe('codex')
-    expect(result.independentReviewResult?.verdict).toBe('approved')
     expect(result.finalDecision).toBe('ALIGNED')
   })
 
@@ -527,7 +547,7 @@ describe('runStrategicMetaReview with reviewKind=roadmap', () => {
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'scope aligned'), providerUsed: 'gemini' })
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
-    mockCodexReviewerRun('approved', 'independent roadmap review approved')
+    mockClaudeIntegrationRun('ALIGNED', 'claude integration aligned')
 
     const result = await runStrategicMetaReview({
       reviewKind: 'roadmap',
@@ -546,7 +566,9 @@ describe('runStrategicMetaReview with reviewKind=roadmap', () => {
       'scope_simplicity',
       'architecture_responsibility',
     ])
-    expect(result.independentReviewResult?.verdict).toBe('approved')
+    // roadmap kind では旧Codex independent reviewを一切呼ばない（generatorと同一vendorになるため）。
+    // 最終統合はClaudeが担い、その結果は他のexpertと同じ1票として集約される。
+    expect(result.independentReviewResult).toBeUndefined()
     expect(result.finalDecision).toBe('ALIGNED')
   })
 
@@ -559,7 +581,7 @@ describe('runStrategicMetaReview with reviewKind=roadmap', () => {
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'scope aligned'), providerUsed: 'gemini' })
       .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'architecture aligned'), providerUsed: 'gemini' })
-    mockCodexReviewerRun('approved', 'independent roadmap review approved')
+    mockClaudeIntegrationRun('ALIGNED', 'claude integration aligned')
 
     await runStrategicMetaReview({
       reviewKind: 'roadmap',
@@ -570,8 +592,9 @@ describe('runStrategicMetaReview with reviewKind=roadmap', () => {
       workingDir: repoRoot,
     })
 
-    // focused review ×3 + integration review
-    expect(mockReviewWithProviderFallback.mock.calls.length).toBeGreaterThanOrEqual(4)
+    // roadmap kind の agy 呼び出しは focused review ×3 のみ。
+    // integration は Claude へ移ったので agy は4回目を呼ばない（PR C）。
+    expect(mockReviewWithProviderFallback.mock.calls.length).toBe(3)
     for (const [, options] of mockReviewWithProviderFallback.mock.calls) {
       const opts = options as { cliModel?: string; cliEffort?: string; apiModel?: string }
       expect(opts.cliModel).toBe(AGY_REVIEW_MODEL.cliModel)
@@ -591,6 +614,9 @@ describe('two-root control context resolution (control-plane vs target-project)'
     })
 
     try {
+      // roadmap kind の統合レビューは Claude 経路（PR C）。共有 beforeEach は Codex を
+      // モックしているが、roadmap kind はそれを使わないので明示的に差し替える。
+      mockClaudeIntegrationRun('ALIGNED', 'claude integration aligned')
       const result = await runStrategicMetaReview({
         reviewKind: 'roadmap',
         subjectId: 'project-two-root-1',
@@ -624,6 +650,9 @@ describe('two-root control context resolution (control-plane vs target-project)'
     })
 
     try {
+      // roadmap kind の統合レビューは Claude 経路（PR C）。共有 beforeEach は Codex を
+      // モックしているが、roadmap kind はそれを使わないので明示的に差し替える。
+      mockClaudeIntegrationRun('ALIGNED', 'claude integration aligned')
       const result = await runStrategicMetaReview({
         reviewKind: 'roadmap',
         subjectId: 'project-two-root-constitution-missing',
@@ -722,6 +751,9 @@ describe('two-root control context resolution (control-plane vs target-project)'
       await rm(targetSpecs, { recursive: true, force: true })
       await rm(targetChecklists, { recursive: true, force: true })
 
+      // roadmap kind の統合レビューは Claude 経路（PR C）。共有 beforeEach は Codex を
+      // モックしているが、roadmap kind はそれを使わないので明示的に差し替える。
+      mockClaudeIntegrationRun('ALIGNED', 'claude integration aligned')
       const result = await runStrategicMetaReview({
         reviewKind: 'roadmap',
         subjectId: 'project-reset-survival',

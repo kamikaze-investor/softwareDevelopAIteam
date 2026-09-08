@@ -13,7 +13,12 @@
 import path from 'node:path'
 import { buildRunnerEnv, executeRunner, type CoordinatorDeps } from '../designReview/designReviewCoordinator.js'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
-import { ROADMAP_TASK_CATEGORIES, type RoadmapTaskCategory } from '@ai-team/shared'
+import {
+  assertRoadmapTopologySeparated,
+  ROADMAP_GENERATOR_PROVIDER,
+  ROADMAP_TASK_CATEGORIES,
+  type RoadmapTaskCategory,
+} from '@ai-team/shared'
 import { z } from 'zod'
 import type { SpecAnalysis } from './specAnalyzer.js'
 
@@ -265,8 +270,8 @@ Generate a NEW roadmap that addresses this specific problem. Do not repeat the s
 /** Roadmap生成に使うCodexのモデルと推論強度。Roadmapは全体の骨格を決めるので最上位を使う。 */
 export const ROADMAP_GENERATOR_MODEL = 'gpt-5.6-sol'
 export const ROADMAP_GENERATOR_REASONING_EFFORT = 'xhigh'
-/** vendor separation判定に使う、実際に使うgenerator provider識別子。 */
-export const ROADMAP_GENERATOR_PROVIDER = 'codex'
+/** vendor separationの正本は packages/shared/src/roadmapTopology.ts。ここでは再輸出だけ。 */
+export { ROADMAP_GENERATOR_PROVIDER }
 
 /** Roadmap生成runnerの既定起動設定。designReviewと同じ形（新しいQueue/Daemonは作らない）。 */
 export function buildDefaultRoadmapGeneratorDeps(): CoordinatorDeps {
@@ -306,6 +311,10 @@ export async function generateRoadmap(
   if (mockResponse !== undefined) {
     return parseRoadmapJson(mockResponse)
   }
+
+  // **モデルを呼ぶ前に**分離を検証する。生成後に気付くと最上位モデルの枠を捨てることになる。
+  // 同一vendor / 未知のvendorはfail-closed（reviewSeparation.ts）。
+  assertRoadmapTopologySeparated()
 
   const projectSummary = buildRoadmapProjectSummary(analysis, options)
   const targetRepo = options.targetProjectRoot ?? process.env.TARGET_ROOT ?? '/workspace/target'
