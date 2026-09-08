@@ -226,17 +226,22 @@ function TaskCard({ task, watchdogEvents }: { task: TaskSummary; watchdogEvents:
         <Text style={styles.projectName} numberOfLines={1}>
           {task.projectName}
         </Text>
+        {/* MOB-001: CEO向け primary status は1つに統合する。
+            Task lifecycle と実行状態を両方バッジ化すると、同じ「停止中」が二重に出て
+            別々の状態があるように見える。実行状態が導出できるときはそれを唯一の主表示にし、
+            導出できないときだけ Task lifecycle を出す。 */}
         <View style={styles.badgeRow}>
-          {execLabel !== '' && (
+          {execLabel !== '' ? (
             <View style={[styles.execBadge, { backgroundColor: SUMMARY_STATE_COLOR[execState] }]}>
               <Text style={styles.execBadgeText}>{execLabel}</Text>
             </View>
+          ) : (
+            <View style={[styles.statusBadge, statusBadgeStyle]}>
+              <Text style={[styles.statusText, statusTextStyle]}>
+                {formatDisplayStatus(task.displayStatus)}
+              </Text>
+            </View>
           )}
-          <View style={[styles.statusBadge, statusBadgeStyle]}>
-            <Text style={[styles.statusText, statusTextStyle]}>
-              {formatDisplayStatus(task.displayStatus)}
-            </Text>
-          </View>
         </View>
       </View>
 

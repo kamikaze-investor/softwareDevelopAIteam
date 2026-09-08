@@ -19,6 +19,9 @@
  *                        Copilot フォールバック
  *   - auth_or_config:  認証エラー・設定不備・CLIバイナリ不在等 → リトライせず fail-closed
  *   - unknown:         上記いずれにも一致しない → リトライせず fail-closed（安全側デフォルト）
+ *
+ * 2026-09-08 CEO承認: Codex/Claude CLI の usage-limit / reset-time quota signature 分類追加。
+ * 素の "usage limit" 部分一致は禁止（PROVIDER_USAGE_LIMIT_PATTERN のコメント参照）。
  * 分類に使う診断情報（provider/stage/failureClass/httpStatus/exitCode/timedOut/message）は
  * すべて allowlist 方式。message は sanitizeMessage() で secret を redact・長さを制限してから
  * ログ・エラーに含める。raw stderr / stdout をそのまま外部（ログ・PRコメント）に出さない。
@@ -161,6 +164,36 @@ const AUTH_OR_CONFIG_PATTERN =
  */
 const QUOTA_PATTERN = /\b429\b|RESOURCE_EXHAUSTED|quota[\s_-]*(exceeded|exhausted)|rate[\s_-]*limit(ed)?/i
 
+/**
+ * 時刻・日付らしきトークン（"2:05 AM" / "Sep 2nd, 2026" / "3pm" / "2026-09-08"）。
+ * "try again at your convenience" のような無関係な文を quota 扱いしないための anchor である。
+ */
+const TIME_TOKEN = String.raw`(?:\d|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|midnight|noon)`
+
+/**
+ * Codex / Claude CLI が usage limit 到達時に返す文言（QUOTA_PATTERN が拾えない形）。
+ *
+ * **素の "usage limit" 部分一致は使わない。** 過去に
+ * `stderr.includes('usage limit')` で判定して実害を出している:
+ * Constitution overlay としてプロンプト先頭へ注入される AGENTS.md の本文自体に
+ * 「usage limit」という語が含まれるため、provider が既に回復していても
+ * その語が stderr へ echo されるだけで「still rate-limited」と誤報告し続けた
+ * （`docs/project_memory/decisions/native_runtime_verification_codex_phase2_real_e2e.md`）。
+ *
+ * そのため単語ではなく**エラー文の「形」**だけを拾う。実測文言:
+ *   Codex: `ERROR: You've hit your usage limit. ... try again at Sep 2nd, 2026 2:05 AM.`
+ */
+const PROVIDER_USAGE_LIMIT_PATTERN = new RegExp(
+  [
+    String.raw`hit your usage limit`,
+    String.raw`usage limit (?:has been )?reached`,
+    String.raw`limit will reset at`,
+    String.raw`resets? at\s+${TIME_TOKEN}`,
+    String.raw`try again at\s+${TIME_TOKEN}`,
+  ].join('|'),
+  'i',
+)
+
 /** 4分類の判定。quota → transient → auth_or_config → unknown の優先順で確定させる。 */
 export function classifyFailure(opts: {
   text: string
@@ -169,7 +202,7 @@ export function classifyFailure(opts: {
   timedOut?: boolean
 }): FailureClass {
   const { text, httpStatus, exitCode, timedOut } = opts
-  if (httpStatus === 429 || QUOTA_PATTERN.test(text)) return 'quota'
+  if (httpStatus === 429 || QUOTA_PATTERN.test(text) || PROVIDER_USAGE_LIMIT_PATTERN.test(text)) return 'quota'
   if (
     timedOut === true ||
     (httpStatus !== undefined && [500, 502, 503, 504].includes(httpStatus)) ||
