@@ -10,8 +10,6 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
-  ChangeDetectionError,
-  FINGERPRINT_ABSENT,
   assertIndexClean,
   assertIndexMatchesApproved,
   assertNoResidualChanges,
@@ -19,13 +17,16 @@ import {
   buildCommitTreeManifest,
   buildIndexStateMap,
   buildWorktreeManifest,
+  ChangeDetectionError,
   diffSensitiveBaseline,
   entryTypeFromMode,
+  FINGERPRINT_ABSENT,
   fingerprintWorktreeEntries,
   lstatEntryType,
   scanSensitiveFiles,
   stageApprovedPaths,
   type ApprovedFileState,
+  worktreeContainsName,
 } from './changeManifest.js'
 
 const SENSITIVE_PATTERNS = [/^\.env$/, /^\.env\./, /\.pem$/, /\.key$/, /^id_rsa/]
@@ -562,5 +563,54 @@ describe('PR-C workspace baseline（porcelain v2 object id 保持 / fingerprint�
     const second = fingerprintWorktreeEntries(repo, manifest)
 
     expect(second).toEqual(first)
+  })
+})
+
+/**
+ * 独立レビュー指摘（2026-09-08、round 5）への対応。
+ *
+ * `--output-last-message` の capture ディレクトリが対象リポジトリの内側に無いことを、
+ * **パス演算ではなくリポジトリ側の列挙で**確かめる。bind mount の内側からは元の親が
+ * 見えないため、祖先を辿る方式（inode比較を含む）は原理的に外側と誤判定する。
+ * git は作業ツリーを実際に列挙するので、どの別名経由で内側にあっても検出できる。
+ */
+describe('worktreeContainsName', () => {
+  let repo: string
+  let outside: string
+
+  beforeEach(() => {
+    repo = mkdtempSync(path.join(tmpdir(), 'wt-repo-'))
+    outside = mkdtempSync(path.join(tmpdir(), 'wt-outside-'))
+    execFileSync('git', ['init', '-q'], { cwd: repo })
+    execFileSync('git', ['config', 'user.email', 't@example.com'], { cwd: repo })
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: repo })
+  })
+
+  afterEach(() => {
+    rmSync(repo, { force: true, recursive: true })
+    rmSync(outside, { force: true, recursive: true })
+  })
+
+  it('リポジトリ内に現れるファイルを検出する', () => {
+    writeFileSync(path.join(repo, '.probe-inside'), '', 'utf-8')
+    expect(worktreeContainsName(repo, '.probe-inside')).toBe(true)
+  })
+
+  it('gitignore されたパスの中でも検出する（--ignored）', () => {
+    const nl = String.fromCharCode(10)
+    writeFileSync(path.join(repo, '.gitignore'), '.tmp/' + nl, 'utf-8')
+    mkdirSync(path.join(repo, '.tmp'), { recursive: true })
+    writeFileSync(path.join(repo, '.tmp', '.probe-ignored'), '', 'utf-8')
+
+    // 実際の用途と同じく**ファイル名**で問い合わせる（ディレクトリ名ではない）。
+    // ここが取りこぼされると、.gitignore 済みディレクトリへ mount された場合に
+    // capture file がリポジトリ内へ入っても検出できない。
+    // 本番相当の実測（control repo の node_modules 配下）でも同じ経路を確認済み。
+    expect(worktreeContainsName(repo, '.probe-ignored')).toBe(true)
+  })
+
+  it('リポジトリ外のファイルは検出しない', () => {
+    writeFileSync(path.join(outside, '.probe-outside'), '', 'utf-8')
+    expect(worktreeContainsName(repo, '.probe-outside')).toBe(false)
   })
 })
