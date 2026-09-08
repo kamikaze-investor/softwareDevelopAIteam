@@ -10,16 +10,12 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest'
+import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import { createSQLiteStorage } from './sqlite'
 import type { IStorage } from './interface'
-
-function freshStorage(): IStorage {
-  const dbPath = path.join(os.tmpdir(), `supervised-runs-${randomUUID()}.db`)
-  return createSQLiteStorage(dbPath)
-}
 
 const baseInput = {
   kind: 'ai_delegation' as const,
@@ -30,9 +26,11 @@ const baseInput = {
 
 describe('supervised_runs storage', () => {
   let storage: IStorage
+  let dbPath: string
 
   beforeEach(() => {
-    storage = freshStorage()
+    dbPath = path.join(os.tmpdir(), `supervised-runs-${randomUUID()}.db`)
+    storage = createSQLiteStorage(dbPath)
   })
 
   describe('create — launch と supervision 登録が不可分', () => {
@@ -90,6 +88,21 @@ describe('supervised_runs storage', () => {
 
       // 新しい所有者は書ける。
       expect(storage.supervisedRuns.complete(created.run.id, recovered.claimToken!, 'succeeded')).toBe(true)
+    })
+
+    it('所有権を奪われた旧 token は fail-closed 経由でも終端を書けない（独立レビュー指摘 2026-09-08）', () => {
+      const created = storage.supervisedRuns.create(baseInput)
+      const oldToken = created.claimToken!
+
+      storage.supervisedRuns.markStalled(created.run.id, oldToken, 'no progress')
+      const recovered = storage.supervisedRuns.claimForRecovery(created.run.id, 3, 'worker_watchdog')
+
+      // fail-closed も終端書き込みである以上、fencing を免除してはならない。
+      // 免除すると claimForRecovery による無効化が骨抜きになる。
+      expect(storage.supervisedRuns.failClosed(created.run.id, oldToken, 'stale actor')).toBe(false)
+      expect(storage.supervisedRuns.findById(created.run.id)?.status).toBe('running')
+
+      expect(storage.supervisedRuns.failClosed(created.run.id, recovered.claimToken!, 'legit')).toBe(true)
     })
 
     it('終端済みの run へは、正しい token でも二度目は書けない', () => {
@@ -170,10 +183,10 @@ describe('supervised_runs storage', () => {
   })
 
   describe('fail-closed（D-2）— predicate を解決できない run を放置しない', () => {
-    it('claimToken 無しで terminal へ倒せる', () => {
-      const { run } = storage.supervisedRuns.create(baseInput)
+    it('現所有者は terminal へ倒せる', () => {
+      const { run, claimToken } = storage.supervisedRuns.create(baseInput)
 
-      expect(storage.supervisedRuns.failClosed(run.id, 'unknown completion predicate "x"')).toBe(true)
+      expect(storage.supervisedRuns.failClosed(run.id, claimToken!, 'unknown completion predicate "x"')).toBe(true)
       const failed = storage.supervisedRuns.findById(run.id)!
       expect(failed.status).toBe('failed')
       expect(failed.terminalVerdict).toBe('fail_closed')
@@ -185,8 +198,73 @@ describe('supervised_runs storage', () => {
       const { run, claimToken } = storage.supervisedRuns.create(baseInput)
       storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
 
-      expect(storage.supervisedRuns.failClosed(run.id, 'too late')).toBe(false)
+      expect(storage.supervisedRuns.failClosed(run.id, claimToken!, 'too late')).toBe(false)
       expect(storage.supervisedRuns.findById(run.id)?.status).toBe('succeeded')
+    })
+  })
+
+  describe('所有者が死んだ run も終端できる（無期限RUNNINGを塞ぐ完全な経路）', () => {
+    it('sweep → recovery → 終端まで、tokenの持ち主が居なくても到達できる', () => {
+      const { run } = storage.supervisedRuns.create(baseInput)
+      // 所有者（wrapper）が死んだ想定。誰も現在の token を持っていない。
+
+      // 1. 監視側が旗を立てる（終端書き込みではないので token 不要）
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'owner unreachable')).toBe(true)
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('stalled')
+
+      // 2. bounded に所有権を取得する
+      const claimed = storage.supervisedRuns.claimForRecovery(run.id, 3, 'worker_watchdog')
+      expect(claimed.claimToken).toBeTruthy()
+
+      // 3. 新しい所有者が終端させられる → RUNNING のまま残らない
+      expect(storage.supervisedRuns.failClosed(run.id, claimed.claimToken!, 'predicate unresolvable')).toBe(true)
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('failed')
+    })
+
+    it('markStalledBySupervisor は running のときだけ効き、終端済みの run を巻き戻さない', () => {
+      const { run, claimToken } = storage.supervisedRuns.create(baseInput)
+      storage.supervisedRuns.complete(run.id, claimToken!, 'succeeded')
+
+      expect(storage.supervisedRuns.markStalledBySupervisor(run.id, 'too late')).toBe(false)
+      expect(storage.supervisedRuns.findById(run.id)?.status).toBe('succeeded')
+    })
+  })
+
+  describe('DB制約 — status semantics を TypeScript の union だけに頼らない', () => {
+    it('未知の status を直接書き込めない', () => {
+      const { run } = storage.supervisedRuns.create(baseInput)
+      const db = new Database(dbPath)
+      try {
+        expect(() =>
+          db.prepare("UPDATE supervised_runs SET status = 'bogus' WHERE id = ?").run(run.id),
+        ).toThrow(/CHECK constraint/i)
+      } finally {
+        db.close()
+      }
+    })
+
+    it('終端 status なのに completed_at が無い行は作れない', () => {
+      const { run } = storage.supervisedRuns.create(baseInput)
+      const db = new Database(dbPath)
+      try {
+        expect(() =>
+          db.prepare("UPDATE supervised_runs SET status = 'succeeded' WHERE id = ?").run(run.id),
+        ).toThrow(/CHECK constraint/i)
+      } finally {
+        db.close()
+      }
+    })
+
+    it('active なのに所有者(claim_token)が居ない行は作れない', () => {
+      const { run } = storage.supervisedRuns.create(baseInput)
+      const db = new Database(dbPath)
+      try {
+        expect(() =>
+          db.prepare('UPDATE supervised_runs SET claim_token = NULL WHERE id = ?').run(run.id),
+        ).toThrow(/CHECK constraint/i)
+      } finally {
+        db.close()
+      }
     })
   })
 

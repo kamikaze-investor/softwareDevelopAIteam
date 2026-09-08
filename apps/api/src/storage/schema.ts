@@ -212,7 +212,8 @@ export const CREATE_TABLES = `
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
     subject_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'running',
+    status TEXT NOT NULL DEFAULT 'running'
+      CHECK (status IN ('running','stalled','succeeded','failed','timed_out')),
     -- D-2: 判定ロジックはDBに置かない。code側 registry を引くキーと版だけを保存する。
     predicate_key TEXT NOT NULL,
     predicate_version INTEGER NOT NULL,
@@ -230,7 +231,14 @@ export const CREATE_TABLES = `
     created_at TEXT NOT NULL,
     started_at TEXT NOT NULL,
     last_progress_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    -- 独立レビュー指摘(2026-09-08): status semantics を TypeScript の union だけに頼らない。
+    -- 不正な書き込みで「終端したのに completed_at が無い」「activeなのに所有者がいない」行が
+    -- できると、その行は findActiveRuns() からも recovery からも漏れて無期限に取り残される。
+    -- 終端 <=> completed_at がある。
+    CHECK ((status IN ('succeeded','failed','timed_out')) = (completed_at IS NOT NULL)),
+    -- active な行は必ず所有者(claim_token)を持つ。持たない行は誰も終端させられなくなる。
+    CHECK (status NOT IN ('running','stalled') OR claim_token IS NOT NULL)
   );
 
   CREATE TABLE IF NOT EXISTS watchdog_events (

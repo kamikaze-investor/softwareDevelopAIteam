@@ -2937,15 +2937,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
       return claimTransaction()
     },
-    failClosed(id, error) {
-      // D-2: predicate を解決できない run を RUNNING のまま残さないための最後の経路。
-      // claim_token を要求しない（そもそも所有者が判定不能な状況で使うため）。
+    failClosed(id, claimToken, error) {
+      // D-2: predicate を解決できない run を RUNNING のまま残さないための経路。
+      //
+      // 独立レビュー指摘(2026-09-08)で claim_token 要求を追加した。終端書き込みである以上、
+      // fencing を免除してはならない。免除すると claimForRecovery で所有権を奪われた旧所有者が
+      // この経路から終端を書けてしまい、「死んだwrapperが後から結果を書けない」という
+      // 不変条件そのものが崩れる。
+      //
+      // 所有者が死んでtokenの持ち主がいない run は、markStalledBySupervisor() →
+      // claimForRecovery() で正当に所有権を取得してから終端させる。
       const result = db.prepare(`
         UPDATE supervised_runs
         SET status = 'failed', terminal_verdict = 'fail_closed', error = ?,
             completed_at = ?, claim_token = NULL
-        WHERE id = ? AND status IN ('running','stalled')
-      `).run(error, now(), id)
+        WHERE id = ? AND claim_token = ? AND status IN ('running','stalled')
+      `).run(error, now(), id, claimToken)
+      return result.changes === 1
+    },
+    markStalledBySupervisor(id, reason) {
+      // 監視側が所有者に到達できない run へ旗を立てる。**終端書き込みではない**ので
+      // claim_token を要求しない（fencing の対象は終端の確定であって、停止の疑いではない）。
+      // これが無いと、所有者が死んだ run は stalled にできず recovery にも入れないまま
+      // running で残り続ける（実障害ケース1と同じ結末）。
+      const result = db.prepare(`
+        UPDATE supervised_runs
+        SET status = 'stalled', error = ?
+        WHERE id = ? AND status = 'running'
+      `).run(reason, id)
       return result.changes === 1
     },
     markOrphanedRunsStalledAtStartup(startedBefore) {

@@ -623,11 +623,24 @@ export interface ISupervisedRunStorage {
    */
   claimForRecovery(id: string, maxRecoveryAttempts: number, supervisor: string): ClaimSupervisedRunResult
   /**
-   * fail-closed 終端（D-2）。claimToken を持たない呼び出し元（predicate を解決できず、
-   * そもそも run を評価できない場合）から使う。**RUNNINGのまま放置しないための最後の経路**であり、
-   * 未終端run に対してのみ作用する。
+   * fail-closed 終端（D-2）。predicate を解決できず run を評価できない場合に使う。
+   * **RUNNINGのまま放置しないための経路**だが、**終端書き込みなので fencing を免除しない**
+   * （独立レビュー指摘 2026-09-08: 免除すると、所有権を奪われた旧所有者が後から終端を書けてしまい、
+   * claimForRecovery による無効化が骨抜きになる）。
+   *
+   * 所有者が既に死んでいて誰もtokenを持たない場合は、
+   * `markStalledBySupervisor()` → `claimForRecovery()` で正当に所有権を取得してから呼ぶ。
    */
-  failClosed(id: string, error: string): boolean
+  failClosed(id: string, claimToken: string, error: string): boolean
+  /**
+   * 監視側（watchdog sweep）が、所有者に到達できない run を stalled として旗を立てる。
+   * **claimToken を要求しない**が、これは終端書き込みではないので fencing の対象外である
+   * （終端させるには、この後 `claimForRecovery()` で bounded に所有権を取得する必要がある）。
+   *
+   * これが無いと、所有者が死んだ run は誰も stalled にできず、recovery も終端もできないまま
+   * running で残る（実障害ケース1と同じ結末）。
+   */
+  markStalledBySupervisor(id: string, reason: string): boolean
   /**
    * process crash後の起動時回収。前プロセスが残した running を `stalled` へ倒す。
    *
