@@ -36,6 +36,7 @@ import { apiFetch } from '../../lib/api'
 import {
   canReflectChanges,
   canRunReview,
+  allowsProgressActions,
   canShowResumeUI,
   deriveJobDisplayState,
   isImplementJob,
@@ -43,6 +44,7 @@ import {
   isReviewJob,
   manualWorkflowIsLocked,
   parseDateTime,
+  quarantineGuidanceText,
   sortJobsByNewestFirst,
 } from '../../lib/taskWorkflow'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
@@ -946,13 +948,29 @@ function JobActionsSection({
   jobs,
   onCreated,
   task,
+  watchdogEvents,
 }: {
   approvalRequests: ApprovalRequest[]
   jobs: Job[]
   onCreated: () => void
   task: Task
+  watchdogEvents: WatchdogEvent[]
 }): ReactElement {
   const [runningAction, setRunningAction] = useState<JobActionKind | null>(null)
+
+  // MOB-001: quarantine 中は作業を進める操作を **表示しない**。
+  // 3つのボタンはいずれも POST /api/jobs で新しい Job を作り、その Job は workspace を
+  // claim しようとする。安全性が確認できていない workspace に対して実行してよい操作ではない。
+  const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
+  const displayState = deriveJobDisplayState(latestJob, approvalRequests, watchdogEvents)
+  if (!allowsProgressActions(displayState)) {
+    return (
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>作業</Text>
+        <Text style={styles.actionHelpText}>{quarantineGuidanceText()}</Text>
+      </View>
+    )
+  }
 
   const actionsLocked = runningAction !== null || manualWorkflowIsLocked(jobs, approvalRequests)
   const reviewEnabled = runningAction === null && canRunReview(jobs, approvalRequests)
@@ -1399,6 +1417,7 @@ export default function TaskDetailScreen(): ReactElement {
           <JobActionsSection
             approvalRequests={data.approvalRequests}
             jobs={data.jobs}
+            watchdogEvents={data.watchdogEvents}
             onCreated={() => void loadTaskDetail()}
             task={data.task}
           />

@@ -452,6 +452,9 @@ function buildTaskSummary(
       approvalId: latestJob.approvalId,
       startedAt: latestJob.startedAt,
       completedAt: latestJob.completedAt,
+      // MOB-001: 既存の failureMetadata をそのまま公開する（新しい status は作らない）。
+      // 一覧で quarantine を通常の blocked と区別するために必要。
+      quarantined: latestJob.failureMetadata?.quarantined === true,
     } : undefined,
     approvalSummary: {
       hasWaitingApproval: approvalRequests.some(request => request.status === 'WAITING_FOR_USER'),
