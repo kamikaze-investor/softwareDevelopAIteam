@@ -200,6 +200,39 @@ export const CREATE_TABLES = `
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
 
+  -- Background Task Supervision Contract の共通run state（C-10）。
+  -- 対象は「workflow progressionをblockし得るasynchronous / background / external-wait operation」であり、
+  -- 個別task種別の列挙ではない。kind は completion predicate を引くキーとして持つだけなので、
+  -- 新しい kind の追加が schema 変更を要求しないよう TEXT にしてある。
+  --
+  -- design_review_runs へは相乗りさせない（CEO判断 2026-09-08）。あちらは Gate / evidence の
+  -- 根拠テーブルであり、review 以外の run を混ぜると unique index・startup recovery・
+  -- fail-closed 分岐の意味がすべて曖昧になるため。fencing の設計だけを踏襲する。
+  CREATE TABLE IF NOT EXISTS supervised_runs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    subject_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    -- D-2: 判定ロジックはDBに置かない。code側 registry を引くキーと版だけを保存する。
+    predicate_key TEXT NOT NULL,
+    predicate_version INTEGER NOT NULL,
+    -- 判定式ではなく「観測結果」を保存する。
+    progress_evidence TEXT,
+    completion_evidence TEXT,
+    progress_source TEXT,
+    current_stage TEXT,
+    -- C-9: 「自動復旧中」と表示してよいのは、ここに実在する recovery actor がある場合だけ。
+    supervisor TEXT,
+    recovery_attempt_count INTEGER NOT NULL DEFAULT 0,
+    claim_token TEXT,
+    terminal_verdict TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    last_progress_at TEXT NOT NULL,
+    completed_at TEXT
+  );
+
   CREATE TABLE IF NOT EXISTS watchdog_events (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL,
@@ -403,6 +436,10 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at ON design_review_evidence(task_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_subject_created_at ON design_review_evidence(review_kind, subject_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC)',
+  // 同一 (kind, subject_id) で active な run を1本に保つ。二重起票ではなく既存runを返すために使う。
+  "CREATE UNIQUE INDEX IF NOT EXISTS ux_supervised_runs_subject_active ON supervised_runs(kind, subject_id) WHERE status IN ('running','stalled')",
+  // 未終端runの掃き出し（stall sweep / startup recovery）を index で引けるようにする。
+  "CREATE INDEX IF NOT EXISTS ix_supervised_runs_active_progress ON supervised_runs(status, last_progress_at) WHERE status IN ('running','stalled')",
   'DROP INDEX IF EXISTS ux_design_review_runs_task_active',
   "CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_subject_active ON design_review_runs(review_kind, subject_id) WHERE status IN ('queued','running')",
   // DB-007: stall episode の重複記録を DB 側で保証する。
