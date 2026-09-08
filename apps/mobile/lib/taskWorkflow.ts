@@ -156,7 +156,7 @@ export function allowsProgressActions(state: JobDisplayState): boolean {
 export function quarantineGuidanceText(): string {
   return '安全のため停止しています。'
     + '承認や再開では解除されません。'
-    + 'AI開発チーム側で作業領域の復旧が必要です。'
+    + '自動では復旧しません。AI開発チーム側で作業領域の復旧が必要です。'
     + 'CEOによる操作は必要ありません。'
 }
 

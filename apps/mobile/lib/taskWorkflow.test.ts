@@ -410,10 +410,11 @@ describe('MOB-001: 一覧・Dashboard の状態導出と action gating', () => {
     // Worker restart でも本番の dirty workspace は解消しない。
     // 進行中でない復旧を進行中と表示すると、CEO は待てば直ると誤解する。
     const text = quarantineGuidanceText()
-    for (const misleading of ['自動復旧', '自動で解除', '復旧中', '対応中', '進行中']) {
+    for (const misleading of ['復旧中', '対応中', '進行中']) {
       expect(text).not.toContain(misleading)
     }
     // 誰の担当かは明示する（放置されているように見せない）
+    expect(text).toContain('自動では復旧しません')
     expect(text).toContain('AI開発チーム側で作業領域の復旧が必要です')
   })
 

@@ -28,6 +28,7 @@ import {
 
 import {
   deriveProjectExecutionHealth,
+  isQuarantined,
   PROJECT_EXECUTION_HEALTH_LABEL,
   type ProjectExecutionHealth,
 } from '../../lib/taskWorkflow'
@@ -293,7 +294,14 @@ function selectFailedTaskJobs(
       ),
       task,
     }))
-    .filter(({ jobs, task }) => task.status === 'blocked' || jobs.length > 0)
+    .filter(({ jobs, task }) => (
+      task.status === 'blocked' ||
+      jobs.length > 0 ||
+      // MOB-001（独立UXレビュー指摘）: quarantine された Task が「要対応Taskはありません」に
+      // 埋もれていた。Task.status は 'pending' のままで、Job も 'failed' ではなく 'blocked' の
+      // ため、従来の条件では拾えない。安全停止は最も対応が要る状態なので必ず出す。
+      (jobsByTaskId[task.id] ?? []).some(isQuarantined)
+    ))
 }
 
 function selectRecentJobs(
@@ -614,6 +622,11 @@ function FailedTasksSection({
           <Text style={styles.itemTitle} numberOfLines={2}>
             {task.title}
           </Text>
+          {(jobsByTaskId[task.id] ?? []).some(isQuarantined) && (
+            <Text style={[styles.failureText, { color: '#dc2626' }]}>
+              安全停止中 — AI開発チームによる作業領域の復旧が必要です（CEOの操作は不要）
+            </Text>
+          )}
           {task.status === 'blocked' && (
             <Text style={[styles.failureText, { color: STATUS_COLOR.blocked }]}>
               停止中 / 要対応（Approval待ち・安全停止等を含む）
