@@ -485,6 +485,29 @@ describe('MOB-001: action eligibility と完了表示', () => {
     expect(blockerNeedsHumanDecision('approval_or_policy')).toBe(true)
   })
 
+  it('Task 0件のProjectを vacuous truth で完了にしない', () => {
+    expect(allRoadmapTasksDone([])).toBe(false)
+  })
+
+  it('未着手Taskが残っていれば完了にしない（実行歴の有無で母集団を絞らない）', () => {
+    // 以前の実装は「Job実行歴がある or done」で filter していたため、一度も実行されて
+    // いない pending Task が母集団から外れ、この構成が誤って完了と判定されていた。
+    const mixed = [
+      { taskId: 'a', taskStatus: 'done', latestJob: { jobId: 'j', status: 'success' } },
+      { taskId: 'b', taskStatus: 'pending' },
+      { taskId: 'c', taskStatus: 'pending' },
+    ] as never
+    expect(allRoadmapTasksDone(mixed)).toBe(false)
+  })
+
+  it('対象Taskが1件以上あり全件doneのときだけ完了', () => {
+    const allDone = [
+      { taskId: 'a', taskStatus: 'done' },
+      { taskId: 'b', taskStatus: 'done' },
+    ] as never
+    expect(allRoadmapTasksDone(allDone)).toBe(true)
+  })
+
   it('全Task完了のProjectは「作業中」に見せない', () => {
     const done = [{ taskId: 't1', taskStatus: 'done', latestJob: { jobId: 'j', status: 'success' } }] as never
     const notDone = [{ taskId: 't1', taskStatus: 'pending', latestJob: { jobId: 'j', status: 'blocked' } }] as never

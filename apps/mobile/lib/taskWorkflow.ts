@@ -441,9 +441,15 @@ export function blockerNeedsHumanDecision(
   return classification === 'approval_or_policy'
 }
 
-/** 全 roadmap Task が完了しているか（Dashboard で「作業中」に見せないための判定） */
+/**
+ * 全 roadmap Task が完了しているか（Dashboard で「作業中」に見せないための判定）。
+ *
+ * - Task が1件も無い Project を vacuous truth で「完了」にしない
+ * - **対象 Task を絞り込まない**。以前は「Job実行歴がある or done」で filter していたため、
+ *   一度も実行されていない pending Task が母集団から外れ、
+ *   「1件 done + 2件 未着手」の Project が誤って完了と判定されていた
+ */
 export function allRoadmapTasksDone(summaries: TaskSummary[]): boolean {
-  const roadmapTasks = summaries.filter((s) => s.latestJob !== undefined || s.taskStatus === 'done')
-  if (roadmapTasks.length === 0) return false
-  return roadmapTasks.every((s) => s.taskStatus === 'done')
+  if (summaries.length === 0) return false
+  return summaries.every((summary) => summary.taskStatus === 'done')
 }

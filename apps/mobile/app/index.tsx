@@ -408,7 +408,12 @@ function ProjectCard({
           {project.name}
         </Text>
         <View style={styles.badgeGroup}>
-          {allTasksDone === true && (health === undefined || health === 'other') && (
+          {/* MOB-001: 「完了」を出すのは lifecycle が running のときだけ。
+              running だけが「作業中」と誤読される状態であり、paused / archived / draft は
+              lifecycle バッジ自体が既に意味を伝えている。そこへ「完了」を重ねると、
+              CEO 自身が行った終了・一時停止の操作を上書きされたように見える。 */}
+          {allTasksDone === true && project.status === 'running'
+            && (health === undefined || health === 'other') && (
             <View style={[styles.badge, { backgroundColor: '#22c55e' }]}>
               <Text style={styles.badgeText}>完了</Text>
             </View>
