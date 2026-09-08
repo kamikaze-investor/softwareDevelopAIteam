@@ -356,6 +356,33 @@ function normalizeObjectId(raw: string | undefined): string | undefined {
   return /^0+$/.test(raw) ? undefined : raw
 }
 
+/**
+ * 指定した名前が対象リポジトリの**作業ツリーに実際に現れるか**を git に訊く。
+ *
+ * 「そのパスはリポジトリの外か」をパス演算で求めることはできない。bind mount の内側からは
+ * 元の親ディレクトリが見えないため、祖先を辿る方式は inode 比較でも必ず外側と誤判定する。
+ * git は作業ツリーを実際に列挙するので、どんな別名経由で内側にあっても検出できる。
+ *
+ * **pathspec で sentinel だけに絞る。** 絞らないと `--ignored` が node_modules 等の無視ツリーを
+ * すべて列挙し、`runGit` の timeout / maxBuffer へ近づく。実測（control repo 909MB /
+ * node_modules 74,030ファイル）: 絞らない場合 7.3MB / 0.65s、絞った場合 0B / 0.41s。
+ * glob prefix はリポジトリ直下（深さ0）にも一致する（実測済み）。sentinel 名は
+ * `.codex-capture-probe-<pid>-<uuid>` で glob メタ文字を含まない。
+ *
+ * 判定できなければ `ChangeDetectionError` が伝播する（fail-closed）。
+ */
+export function worktreeContainsName(workingDir: string, needle: string): boolean {
+  assertWorktreeRoot(workingDir)
+
+  return runGit(
+    workingDir,
+    [
+      'status', '--porcelain', '--untracked-files=all', '--ignored',
+      '--', `:(glob)**/${needle}`,
+    ],
+  ).includes(needle)
+}
+
 export function buildWorktreeManifest(workingDir: string): ChangeManifest {
   assertWorktreeRoot(workingDir)
   const raw = runGit(workingDir, ['status', '--porcelain=v2', '-z', '--untracked-files=all'])
