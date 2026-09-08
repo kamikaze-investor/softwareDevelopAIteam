@@ -362,20 +362,18 @@ function normalizeObjectId(raw: string | undefined): string | undefined {
  * 「そのパスはリポジトリの外か」をパス演算で求めることはできない。bind mount の内側からは
  * 元の親ディレクトリが見えないため、祖先を辿る方式は inode 比較でも必ず外側と誤判定する。
  * git は作業ツリーを実際に列挙するので、どんな別名経由で内側にあっても検出できる。
- * `--ignored` を付けるのは `.gitignore` 対象のパスへ mount された場合を取りこぼさないため。
+ *
+ * **pathspec で sentinel だけに絞る。** 絞らないと `--ignored` が node_modules 等の無視ツリーを
+ * すべて列挙し、`runGit` の timeout / maxBuffer へ近づく。実測（control repo 909MB /
+ * node_modules 74,030ファイル）: 絞らない場合 7.3MB / 0.65s、絞った場合 0B / 0.41s。
+ * `**/` はリポジトリ直下にも一致する（実測済み）。sentinel 名は
+ * `.codex-capture-probe-<pid>-<uuid>` で glob メタ文字を含まない。
  *
  * 判定できなければ `ChangeDetectionError` が伝播する（fail-closed）。
  */
 export function worktreeContainsName(workingDir: string, needle: string): boolean {
   assertWorktreeRoot(workingDir)
 
-  // **pathspecでsentinelだけに絞る。** 絞らないと`--ignored`がnode_modules等の無視ツリーを
-  // すべて列挙し、`runGit`のtimeout/maxBufferへ近づく。実測（control repo 909MB /
-  // node_modules 74,030ファイル）: 絞らない場合 7.3MB / 0.65s、絞った場合 0B / 0.41s。
-  // 走査自体は同じでも出力が定数サイズになるため、リポジトリの大きさに依存しなくなる。
-  //
-  // `**/`はリポジトリ直下にも一致する（実測済み）。sentinel名は
-  // `.codex-capture-probe-<pid>-<uuid>`でglobメタ文字を含まない。
   return runGit(
     workingDir,
     [
@@ -1384,7 +1382,7 @@ export function mergeManifests(...manifests: ChangeManifest[]): ChangeManifest {
 
   for (const manifest of manifests) {
     for (const change of manifest.changes) {
-      const key = `${change.kind}\u0000${change.path}\u0000${change.oldPath ?? ''}\u0000${change.afterType ?? ''}`
+      const key = `${change.kind} ${change.path} ${change.oldPath ?? ''} ${change.afterType ?? ''}`
       if (seen.has(key)) continue
       seen.add(key)
       merged.push(change)
