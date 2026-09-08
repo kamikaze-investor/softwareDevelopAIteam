@@ -1384,7 +1384,7 @@ export function mergeManifests(...manifests: ChangeManifest[]): ChangeManifest {
 
   for (const manifest of manifests) {
     for (const change of manifest.changes) {
-      const key = `${change.kind} ${change.path} ${change.oldPath ?? ''} ${change.afterType ?? ''}`
+      const key = `${change.kind}\u0000${change.path}\u0000${change.oldPath ?? ''}\u0000${change.afterType ?? ''}`
       if (seen.has(key)) continue
       seen.add(key)
       merged.push(change)
