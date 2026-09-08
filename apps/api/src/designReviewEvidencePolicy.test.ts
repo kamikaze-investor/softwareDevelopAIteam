@@ -85,8 +85,11 @@ describe('checkRoadmapDesignReviewFreshness', () => {
       code: 'ROADMAP_DESIGN_REVIEW_NOT_ALIGNED',
     })
   })
-
-  it('ROADMAP_DESIGN_REVIEW_INDEPENDENT_REVIEW_NOT_APPROVED when roadmap (always critical) evidence lacks approved verdict', () => {
+  // PR C: Roadmap の第二意見は Claude の integration review が担うようになり、
+  // Codex independent review は task kind 専用になった。Worker は roadmap 向けの
+  // independent verdict を生成しないので、evidence 側でそれを要求すると恒久的に落ちる。
+  // 代わりに要求するのは generator と final reviewer が別vendorであること。
+  it('roadmap evidence は independent verdict 無しでも ALIGNED なら成立する', () => {
     const storage = createStorage()
     const projectId = 'project-no-independent'
     storage.designReviewEvidence.create({
@@ -95,15 +98,31 @@ describe('checkRoadmapDesignReviewFreshness', () => {
       designTextHash: computeDesignTextHash(REVIEW_MATERIAL),
       reviewLoad: 'critical',
       decision: 'ALIGNED',
-      independentReviewRequired: true,
+      independentReviewRequired: false,
     })
 
     const result = checkRoadmapDesignReviewFreshness(projectId, REVIEW_MATERIAL, storage.designReviewEvidence)
 
-    expect(result).toMatchObject({
-      ok: false,
-      code: 'ROADMAP_DESIGN_REVIEW_INDEPENDENT_REVIEW_NOT_APPROVED',
+    expect(result.ok).toBe(true)
+  })
+
+  // Gemini / Claude のいずれかが CONFLICT・UNCERTAIN なら安全側集約で ALIGNED にならず、
+  // ここで evidence も成立しない。
+  it('roadmap evidence は ALIGNED でなければ成立しない', () => {
+    const storage = createStorage()
+    const projectId = 'project-not-aligned'
+    storage.designReviewEvidence.create({
+      reviewKind: 'roadmap',
+      subjectId: projectId,
+      designTextHash: computeDesignTextHash(REVIEW_MATERIAL),
+      reviewLoad: 'critical',
+      decision: 'CONFLICT',
+      independentReviewRequired: false,
     })
+
+    const result = checkRoadmapDesignReviewFreshness(projectId, REVIEW_MATERIAL, storage.designReviewEvidence)
+
+    expect(result).toMatchObject({ ok: false, code: 'ROADMAP_DESIGN_REVIEW_NOT_ALIGNED' })
   })
 
   it('ignores task-kind evidence when checking roadmap freshness for a project', () => {
