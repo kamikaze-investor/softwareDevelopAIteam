@@ -2114,6 +2114,28 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `codex-sandbox-off-deprecated-landlock`側で行う。適用範囲を広げる変更は
    既存production reviewerの挙動を変えるため、独立した変更として扱いCEO承認を得ること。
 
+<!-- roadmap:id=review-substage-progress-reporting state=planned -->
+0. [ ] **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。
+
+   **現状**: APIから見るとWhole-Roadmap Reviewは`executeRoadmapReviewToTerminal()`の
+   **1回のatomicな呼び出し**である。focused review（Gemini ×3）が終わって
+   integration review（Claude Opus）が始まる境界はrunner/Worker内部で起きるため、
+   API側からは観測できない。
+
+   **したがってPR Cでは`integration_review`を発火させていない。** 観測できない境界で
+   stageを更新すると、表示される進捗が実際の処理と対応しなくなる。これは
+   `feasibility_review`を偽って発火させないのと同じ理由である（CEO判断、2026-09-08）。
+
+   **現在実際に発火するstage**:
+   `roadmap_generation` → `deterministic_validation` → `focused_review`
+   →（必要なら`roadmap_regeneration`）→ `task_sync` → `completed` / `blocked`
+
+   **やること**: runner/Workerが実行中のsub-stageをAPIへ報告できる経路を用意し、
+   `integration_review`を**実際にClaude統合が始まる直前**に更新できるようにする。
+   provider失敗時に「どの段で止まったか」が分かるようになるのが主目的。
+
+   **やらないこと**: 新しいQueue/Daemon/進捗専用DBを作らない。
+   既存の`design_review_runs`行やrunnerのstdout契約の拡張で足りるかをまず検討すること。
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
    **高優先度**。CEO判断: PR Cでは`use_legacy_landlock`を暫定的な安全経路としてのみ使用し、
