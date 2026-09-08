@@ -2115,8 +2115,12 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    既存production reviewerの挙動を変えるため、独立した変更として扱いCEO承認を得ること。
 
 <!-- roadmap:id=pl-review-process-supervision state=planned priority=high -->
-0. [ ] **長時間AI review/implementationをsession依存のbackground processで走らせない**
-   （2026-09-08登録、**高優先度**。CEO判断: 運用上の欠陥として扱う）。
+0. [ ] **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**
+   （2026-09-08登録、**高優先度**。CEO判断: 運用上の欠陥として扱う。
+   当初はPL delegation限定で登録したが、実障害ケース2により
+   **background task一般**へ対象を拡張した）。
+
+   ### 実障害ケース1: PR #108のCodex independent reviewが0 byteのまま放置された（2026-09-08）
 
    **発生事象**: PR #108のCodex independent reviewを、PL作業として
    `ssh <host> "codex exec ..."` の単純background processで起動した。
@@ -2150,12 +2154,173 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `setsid`によるsession非依存起動 + 実行状態ファイル（pid/開始/終了/exit code）+
    **明示的な`VERDICT:`行が無ければ完了扱いしない**検査 + 上記分類器の再利用
    （quota signatureを追加）+ bounded retry、を薄いwrapperとして用意する。
-   将来的にはPL reviewにも`design_review_runs`の行を持たせ、
-   claim_token fencingをそのまま継承させるのが筋。
+   ~~将来的にはPL reviewにも`design_review_runs`の行を持たせ、claim_token fencingを
+   そのまま継承させるのが筋。~~ **撤回（2026-09-08、実障害ケース2を受けたCEO判断）**:
+   Gate / evidence用テーブルへreview以外のrunを混ぜない。受け皿は下記C-10の
+   汎用`supervised_runs`とし、claim_token fencingは**設計だけを踏襲する**。
 
    **暫定運用ルール（即時適用）**: 数分以上かかるAI review/implementation/analysisを
    単純なbackground processへ投げて放置しない。最低でも
    **session非依存実行 + 明示的なliveness確認**をセットにする。
+
+   ---
+
+   ### 実障害ケース2: Expo restart background taskが約25分RUNNINGのままになった（2026-09-08）
+
+   **Observed（確認済みの事実のみ）**: Phase 3 Mobile確認中、`Restart Expo on manage master`
+   というbackground taskが約25分間RUNNING表示のままだった。Expo / Metro restartは通常
+   数秒〜数分でMetro process起動 → port listen → ready state → exp:// URL / QR生成まで到達する処理であり、
+   約25分RUNNING表示のままだったため、正常な長時間処理とは考えにくい状態だった。
+
+   **UNVERIFIED（断定しないこと）**: process自体が死んでいたのか / processは生きているが待ち状態だったのか /
+   Metroは起動したがtask completionを検知できなかったのか / log・progress監視が止まっていたのか、
+   はいずれも未確認である。**root causeを「Expoがハングした」と断定してはならない。**
+   Expo固有bugとしても未確定である。
+
+   **Finding（本項目で扱う確定事項）**:
+   *Background task can remain RUNNING indefinitely without progress/completion monitoring* —
+   workflow progressionをblockするbackground taskが、実進捗またはcompletionを監視されないまま
+   無期限RUNNINGになれる。ケース1（PR #108のCodex review 0 byte放置）と同じ欠陥が、
+   **AI delegation以外のbackground taskにも存在する**ことを示す2例目である。
+   したがって本項目の対象は「PL delegation」ではなく、
+   **AI delegation / Expo restart / deploy / build を含むbackground task一般**へ拡張する。
+
+   **Risk scenario（Observedではない。今回未確認）**: Mobile中心の自律運転では、
+   CEOがProjectを開始 → AIがbackgroundで長時間処理 → CEOがアプリを閉じる →
+   background taskが実質停止 → statusだけRUNNING → PL/Workerも完了を待ち続ける →
+   誰も異常を認識せず、Projectが永久に再開しない、という状態が起こり得る。
+   **「Mobileを閉じたら実際にtaskが停止した」事実は今回確認されていない。**
+   このchainは検証対象のrisk scenarioとして記録するにとどめ、確定した障害として扱わない。
+
+   **仕様上の原則**: **「processが存在すること」と「taskが正常に進行していること」を同一視しない
+   （PID alive != healthy）。**
+
+   ---
+
+   ### Background Task Supervision Contract（共通化するのは実装ではなく契約）
+
+   他セッションでも長時間監視対策を調査中である。**この件を理由に新しい watchdog / supervisor /
+   monitoring daemonを新設しない。** runtime Worker watchdog（`apps/worker/src/watchdog/watchdog.ts`）と
+   `scripts/delegate-watchdog.sh` は監視対象・実行主体・障害モードが異なるため、
+   **実行機構は責務を分けたままでよい。統合しない。**
+   共通化するのは下記のcontract（原則とinterface）と、C-10の永続run stateだけとする。
+
+   AIteamOSがworkflow progressionを待つすべてのbackground taskは、次を満たさなければならない。
+
+   **C-1. 必ずterminal stateへ到達できる。** RUNNING / SUCCEEDED / FAILED / STALLED / TIMED_OUT 等、
+   最終的に必ずterminal verdictへ到達する。**無期限RUNNINGは禁止。**
+
+   **C-2. 経過時間だけでstalled判定しない（progress predicate）。** 固定タイマーのみで判定せず、
+   可能なtaskでは既存の実進捗signalを使う。**PIDが生きているだけでhealthyと判定しない。**
+   Expo restartなら process存在 / Metro log更新 / port 8081 listen / Metro ready / exp:// URL生成。
+
+   **C-3. taskごとにcompletion predicateを持てるようにする。** 「成功」の意味はtaskごとに異なる。
+   Expoなら`Expo process spawned`ではなく`MetroがreadyになりCEO端末から接続可能な入口が生成された`
+   ところまでが成功。deployならhealth 200、buildならexit 0、reviewならverdict取得、
+   delegated AIならDONE/BLOCKED/ERROR。**新しい汎用状態機械を過剰に作る前に、既存task/watchdogの
+   completion判定を拡張できないか必ず先に確認する。**
+
+   **C-4. progress heartbeat / stale detection。** lastProgressAt / lastLogAt / currentStage を
+   既存情報から取得できるようにする。一定時間進捗がなければ`still running`ではなく
+   `stalled suspected`として監視側が調査する。正常な無出力時間はtaskごとに異なるため、
+   一律の短いtimeoutだけで判断しない。
+
+   **C-5. stalled検知後は自動診断を先に行う（blind retry禁止）。** 最低限:
+   process存在 / expected child process存在 / log更新 / expected port・resourceのready /
+   **completion predicateを既に満たしていないか** / stale・duplicate processの有無。
+   Expo事例なら Metro process・8081 listener・latest Metro log・ready/QR state・duplicate Metro。
+
+   **C-6. recoveryはboundedにする。** diagnose → stale process cleanup → 1回restart →
+   completion predicate再確認 → success / failed / escalated。無限retryは禁止。
+   同じ失敗を繰り返してprovider quotaやVPS resourceを消費しない。
+
+   **C-7. 監視主体と監視対象を同時に殺さない。** PLが「background taskが終わるまで待つ」状態のまま、
+   監視自体を同じsession / 同じbackground processに依存させない。
+   既存watchdog / persisted Job stateへ統合できるならそれを優先する。
+
+   **C-8. Mobile / sessionを閉じても監視・復旧は継続する。** task state / current stage / last progress /
+   stalled判定 / retry・recovery / terminal verdict はbackend側で継続する。
+   Mobile再オープン時は見せかけのtimerではなく、**backendで実際にどこまで進んでいるか**へ復帰する。
+
+   **C-9. stalledをrunningと表示しない。** MOB-001と同じ問題。既存状態から導出可能な範囲で
+   「正常進行中 / 長時間処理中 / 停滞を検知・確認中 / 自動復旧中 / 復旧失敗・AI開発チーム対応必要」
+   を区別して表示する。**recovery actorが実際に動いていないのに「自動復旧中」と表示してはならない。**
+
+   **C-10. 共通の永続run stateを1つ持つ（唯一の共通実装）。** 実行機構は分けたままにするが、
+   「今どのbackground taskが走っていて、最後に進捗したのはいつで、terminal verdictは何か」を
+   backend側で1箇所から観測できなければ C-1 / C-7 / C-8 / C-9 はどれも成立しない。
+
+   ---
+
+   ### C-10の受け皿: 汎用 `supervised_runs`（新規。`design_review_runs`へは相乗りしない）
+
+   **`design_review_runs` への相乗りは採用しない（CEO判断、2026-09-08）。**
+   同テーブルはGate / evidenceの根拠であり、`completeWithEvidence()` が
+   `design_review_evidence` を単一transactionで発行する経路を持つ。ここへreview以外のrun
+   （Expo restart / deploy / build / AI delegation）を混ぜると、Gateの根拠テーブルに
+   Gateと無関係な行が入り、`ux_design_review_runs_subject_active` の意味・
+   `recoverAndRekickAtStartup()` の再kick対象・fail-closed分岐がすべて曖昧になる。
+   **Gate / evidence用テーブルへreview以外のrunを混ぜない。**
+
+   `delegation_runs` も採用しない。今回の対象はAI delegationに限らないため名前が狭すぎる。
+   **候補名: `supervised_runs`（第一候補）/ `background_runs`。**
+
+   保持すべき最小の列（実装時に確定させる。ここでは契約として必要なものだけ列挙する）:
+
+   - `kind` … `ai_delegation` / `expo_restart` / `deploy` / `build` 等。completion predicateの選択キー
+   - `subject_id` … PR番号 / project id / task key 等
+   - `status` … RUNNING / SUCCEEDED / FAILED / STALLED / TIMED_OUT（C-1のterminal集合）
+   - `started_at` / `last_progress_at` / `current_stage` … C-4のheartbeat
+   - `progress_source` … 何を進捗signalとして見ているか（log mtime / port listen / marker等）
+   - `completion_predicate` … C-3。何をもって成功とするか
+   - `recovery_attempt_count` … C-6のbounded recovery
+   - `terminal_verdict` / `error` … 終端理由
+   - `supervisor` … どの機構が見ているか（`worker_watchdog` / `delegate_watchdog` / なし）。
+     **C-9で「自動復旧中」と表示してよいのは、ここに実在するrecovery actorが記録されている場合だけ。**
+
+   `claim_token` によるstale completion fencingは `design_review_runs` の実装が有効性を実証済みなので、
+   **パターンとして踏襲する（テーブルを共有するのではなく、設計を踏襲する）。**
+
+   ---
+
+   ### 既存機構の調査結果と最小接続案（read-only確認済み。実装はまだ行わない）
+
+   | 機構 | 監視対象 | 進捗signal | terminal保証 | contract上の欠落 |
+   |---|---|---|---|---|
+   | Worker Job watchdog<br>`watchdog/watchdog.ts` + `stallDetector.ts` | `jobs` の running行 | **無し**。`checkStall(commandKind, startedAt)`は経過時間のみ | **無し**。`watchdog_events`へ記録し通知するが、Jobをterminalへ遷移させない | C-1 / C-2 / C-3 / C-6。閾値表は`CommandKind`固定でAI CLI実行・外部process系のkindが無い |
+   | delegated-task watchdog<br>`scripts/delegate-watchdog.sh` | detached opencode child | log size/mtime + child process有無（inactivity 120s / long_tool 600s） | **有り**。marker必須で`verdict`と`telemetry.json`を必ず書く | provider決め打ち（`is_opencode_pid`）。run_dirがローカルのみでbackendへ載らない（C-8 / C-10） |
+   | design_review_runs<br>`designReviewCoordinator.ts` | API processがspawnするrunner | 無し（同期await） | **有り**。fail-closed + claim_token fencing + bounded attempt + startup recovery | timeout 120s固定で長時間task不可。API process内awaitのためC-7を満たさない。**相乗り先にはしない** |
+   | Mobile status derivation<br>`apps/mobile/lib/taskWorkflow.ts` | 上記の結果を表示 | `isWatchdogConfirmedStalled()`がwatchdog_eventsを参照 | — | `running_healthy` / `running_stalled` の2値のみ。C-9が要求する「停滞を確認中」「自動復旧中」「復旧失敗」に相当する表示が無い |
+
+   **最小接続の方針（新daemonを作らない）**:
+
+   1. **`stallDetector.checkStall()` の拡張** — 現在 `startedAt` しか見ておらず、これがC-2 / C-4欠落の根本。
+      `lastProgressAt` を引数に取れるようにする。`jobs.stdout_path` / `stderr_path` は既に存在するため、
+      log mtimeをheartbeat sourceにする経路は新規テーブル無しで作れる見込み。
+   2. **`supervised_runs` への書き込みは各supervisorが行う** — Worker watchdogと
+      delegate-watchdog.shはそれぞれ自分の観測結果を同じ表へ書く。読む側（Mobile / PL）は1箇所を見る。
+      **実行機構は統合しない。共有するのはこの表だけ。**
+   3. **Case Cの回収経路** — 現行のどの機構も「completion predicateは満たしているがwrapperが終わらない」を
+      検出できない。C-5の診断に completion predicate 再評価を必ず含め、満たしていれば
+      wrapperの生死に関わらず SUCCEEDED で回収する。
+   4. **Mobile** — `JobDisplayState` / `ProjectExecutionHealth` はいずれも既存状態からの導出であり、
+      `supervised_runs` を導出元に追加するだけで拡張できる。新しいstatus体系は作らない。
+
+   ---
+
+   ### Acceptance（長時間task監視のE2E / 回帰試験に必ず含める）
+
+   - **Case A**: processは生きているが進捗が止まる → stalled検知できる
+   - **Case B**: process自体が消える → stalled / failed検知できる
+   - **Case C**: processは生きておりcompletion predicateも達成済みだが、task wrapperだけ終了しない
+     → successを再確認して回収できる。**今回のExpo事例で十分あり得るfailure modeであり、絶対に落とさない。**
+     現行のどの機構もこの経路を持っていないため、新規に設計が必要な唯一のケースである
+   - **Case D**: stalled → recovery成功 → taskが再開しterminal successになる
+   - **Case E**: stalled → recovery不能 → 無限RUNNINGにならずBLOCKED / ERROR等で終わり、
+     PL / CEOへ必要な情報が出る
+   - **Case F**: CEOがMobileを閉じて再度開く → backendで継続した現在の実状態へ復帰する
+
+   **現状**: 本項目は設計フェーズ。**実装は未着手であり、着手前にこのcontractのCEOレビューを受ける。**
 
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
