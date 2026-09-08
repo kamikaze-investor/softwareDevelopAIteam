@@ -37,6 +37,7 @@ import {
   canReflectChanges,
   canRunReview,
   allowsProgressActions,
+  visibleTaskActions,
   canShowResumeUI,
   deriveJobDisplayState,
   isImplementJob,
@@ -51,8 +52,15 @@ import {
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
+// MOB-001: 自由入力を「停止時の既定の対処」に見せない。
+// 技術的な停止（コード・環境・設定）はAI開発チーム側の復旧対象であり、CEOに
+// 「何を書けばよいか」を考えさせる筋合いではない。ここで求めるのは Goal・仕様・
+// 優先度といった経営判断だけだと明示する。原因と推奨対応は「失敗の説明」に出る。
 const RESUME_HELP_TEXT =
-  '元の停止した作業は履歴として残し、追加指示を含む新しい作業を開始します。危険な変更が含まれる場合は再び承認待ちになります。'
+  'Goalや仕様の変更・優先度の判断など、CEOの判断が必要な場合にだけ入力してください。'
+  + '技術的な原因の修正はAI開発チーム側で対応します。'
+  + '入力すると、元の停止した作業は履歴として残し、追加指示を含む新しい作業を開始します。'
+  + '危険な変更が含まれる場合は再び承認待ちになります。'
 const RESUME_ERROR_MESSAGE_FALLBACK =
   '追加指示の送信に失敗しました。時間をおいて再度お試しください。'
 const RESUME_ERROR_MESSAGE_BY_REASON: Record<string, string> = {
@@ -650,8 +658,10 @@ const EXECUTION_STATE_VIEW: Record<string, { color: string; label: string; detai
   },
   blocked: {
     color: '#f59e0b',
+    // MOB-001: 「追加指示を送って再開できます」だけでは、CEO は何を書けばよいか判断できない。
+    // 既存の「失敗の説明」（分類 + 推奨アクション）へ誘導し、自由入力を主導線にしない。
     label: '停止中',
-    detail: 'Guard違反などで停止しています。追加指示を送って再開できます。',
+    detail: '安全チェックにより停止しています。下の「失敗の説明」で原因と次の対応を確認できます。',
   },
   quarantined: {
     color: '#dc2626',
@@ -709,7 +719,12 @@ function TaskFailureExplanationSection({
   task: Task
 }): ReactElement | null {
   const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
-  const shouldShow = latestJob?.status === 'failed' || task.status === 'blocked'
+  // MOB-001: blocked な Job も対象にする。Guard 違反で Job が blocked でも Task.status は
+  // pending のまま残るため、従来の条件では「停止しているのに失敗の説明が出ない」画面になり、
+  // 実行状態バナーが案内している先が存在しない状態だった。
+  const shouldShow = latestJob?.status === 'failed'
+    || latestJob?.status === 'blocked'
+    || task.status === 'blocked'
   const explanationKey = shouldShow
     ? `${task.id}:${task.status}:${latestJob?.id ?? 'no-job'}`
     : null
@@ -968,7 +983,7 @@ function JobActionsSection({
   onCreated: () => void
   task: Task
   watchdogEvents: WatchdogEvent[]
-}): ReactElement {
+}): ReactElement | null {
   const [runningAction, setRunningAction] = useState<JobActionKind | null>(null)
 
   // MOB-001: quarantine 中は作業を進める操作を **表示しない**。
@@ -976,6 +991,7 @@ function JobActionsSection({
   // claim しようとする。安全性が確認できていない workspace に対して実行してよい操作ではない。
   const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
   const displayState = deriveJobDisplayState(latestJob, approvalRequests, watchdogEvents)
+  const visible = visibleTaskActions(displayState, jobs, approvalRequests)
   if (!allowsProgressActions(displayState)) {
     return (
       <View style={styles.section}>
@@ -1043,10 +1059,15 @@ function JobActionsSection({
     ])
   }, [runAction, task.title])
 
+  // MOB-001: 現在の workflow state で意味のある操作が無ければ、セクションごと出さない。
+  // 押しても進まないボタンを並べること自体が誤操作を誘う。
+  if (!visible.implement && !visible.review && !visible.reflect) return null
+
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>作業</Text>
 
+      {visible.implement && (
       <TouchableOpacity
         disabled={actionsLocked}
         onPress={handleImplement}
@@ -1059,7 +1080,9 @@ function JobActionsSection({
         {runningAction === 'implement' && <ActivityIndicator color="#fff" size="small" />}
         <Text style={styles.actionButtonText}>実装を開始</Text>
       </TouchableOpacity>
+      )}
 
+      {visible.review && (
       <TouchableOpacity
         disabled={!reviewEnabled}
         onPress={handleReview}
@@ -1072,7 +1095,9 @@ function JobActionsSection({
         {runningAction === 'review' && <ActivityIndicator color="#fff" size="small" />}
         <Text style={styles.actionButtonText}>独立レビューを実行</Text>
       </TouchableOpacity>
+      )}
 
+      {visible.reflect && (
       <TouchableOpacity
         disabled={!reflectEnabled}
         onPress={handleReflect}
@@ -1085,8 +1110,6 @@ function JobActionsSection({
         {runningAction === 'reflect' && <ActivityIndicator color="#fff" size="small" />}
         <Text style={styles.actionButtonText}>変更を反映</Text>
       </TouchableOpacity>
-      {!reflectEnabled && !actionsLocked && (
-        <Text style={styles.actionHelpText}>独立レビュー完了後に反映できます</Text>
       )}
     </View>
   )
