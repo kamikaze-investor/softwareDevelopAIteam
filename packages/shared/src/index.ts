@@ -24,6 +24,8 @@ export * from './types/actor'
 export * from './types/approvalLevel'
 export * from './types/audit_log'
 export * from './types/project_roadmap'
+export * from './types/supervised_run'
+export * from './supervision/predicateRegistry'
 export * from './outbox/canonicalize'
 // `constitutionPrinciples` は node:fs / node:path に依存するため、ここからは再exportしない。
 // Mobile（React Native）は `@ai-team/shared` をこのbarrel経由で読み込むため、

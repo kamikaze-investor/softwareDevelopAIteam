@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -516,6 +516,156 @@ export type DesignReviewRunCreateInput =
   Omit<DesignReviewRun, 'id' | 'reviewKind' | 'subjectId' | 'status' | 'attemptCount' | 'claimToken' | 'resultJson' | 'error' | 'createdAt' | 'startedAt' | 'completedAt'> &
   Partial<Pick<DesignReviewRun, 'reviewKind' | 'subjectId'>>
 
+/**
+ * Supervised Run — Background Task Supervision Contract の共通run state（C-10）。
+ *
+ * `design_review_runs` とはテーブルを共有しない（Gate / evidence の根拠テーブルへ
+ * review以外のrunを混ぜない）。踏襲するのは claim_token による fencing の**設計**だけである。
+ *
+ * 所有権モデル:
+ *   - `create()` が run行と最初の claimToken を同時に発行する（launchとsupervision登録が不可分）
+ *   - 進捗記録・終端はすべて claimToken 一致を要求する
+ *   - stalled run を別の actor が引き取るときは `claimForRecovery()` が**新しいtoken**を発行し、
+ *     古い所有者の書き込みを恒久的に無効化する。死んだwrapperが後から成功を書けない
+ */
+export interface SupervisedRun {
+  id: string
+  kind: SupervisedRunKind
+  subjectId: string
+  status: SupervisedRunStatus
+  /** D-2: 判定ロジックはDBに置かない。code側 registry を引くキーと版だけを持つ。 */
+  predicateKey: string
+  predicateVersion: number
+  /** 判定式ではなく観測結果。 */
+  progressEvidence?: Record<string, unknown>
+  completionEvidence?: Record<string, unknown>
+  /** 何を進捗signalとして見ているか（log mtime / port listen / marker 等）。 */
+  progressSource?: string
+  currentStage?: string
+  /** どの機構が見ているか。C-9: 実在しない限り「自動復旧中」と表示してはならない。 */
+  supervisor?: string
+  recoveryAttemptCount: number
+  claimToken?: string
+  terminalVerdict?: string
+  error?: string
+  createdAt: string
+  startedAt: string
+  lastProgressAt: string
+  completedAt?: string
+}
+
+export interface SupervisedRunCreateInput {
+  kind: SupervisedRunKind
+  subjectId: string
+  predicateKey: string
+  predicateVersion: number
+  progressSource?: string
+  currentStage?: string
+  supervisor?: string
+  progressEvidence?: Record<string, unknown>
+}
+
+/**
+ * create結果。`created: false` は「同一 (kind, subject_id) に既にactiveなrunがあった」ことを表し、
+ * その場合 claimToken は発行されない（既存の所有者から所有権を奪わない）。
+ */
+export interface CreateSupervisedRunResult {
+  run: SupervisedRun
+  created: boolean
+  claimToken?: string
+}
+
+/** recovery claim結果。boundedを超えた場合は run/claimToken とも undefined で返る。 */
+export interface ClaimSupervisedRunResult {
+  run?: SupervisedRun
+  claimToken?: string
+  /** bounded recovery 超過で terminal へ倒したときに true。 */
+  exhausted?: boolean
+}
+
+export interface SupervisedRunProgressInput {
+  currentStage?: string
+  progressSource?: string
+  progressEvidence?: Record<string, unknown>
+}
+
+export interface ISupervisedRunStorage {
+  findById(id: string): SupervisedRun | undefined
+  /** 同一 (kind, subjectId) の未終端run。無ければ undefined。 */
+  findActive(kind: SupervisedRunKind, subjectId: string): SupervisedRun | undefined
+  /**
+   * launchと同時にsupervision登録する。既にactiveなrunがあれば作成せず既存を返す
+   * （partial unique index `ux_supervised_runs_subject_active` と同じ条件）。
+   */
+  create(input: SupervisedRunCreateInput): CreateSupervisedRunResult
+  /** 未終端run一覧。stall sweep / startup recovery 用。 */
+  findActiveRuns(): SupervisedRun[]
+  /**
+   * heartbeat（C-4）。claimToken 一致かつ未終端のときだけ lastProgressAt を進める。
+   * 進捗が無いまま呼んでも意味を持たせないため、呼び出し側は実際に観測できたときだけ呼ぶこと。
+   */
+  recordProgress(id: string, claimToken: string, input: SupervisedRunProgressInput): boolean
+  /** 進捗停止を検知した（C-4）。終端ではない。診断（C-5）と bounded recovery（C-6）が続く。 */
+  markStalled(id: string, claimToken: string, reason: string): boolean
+  /**
+   * 終端させる（C-1）。claimToken 一致時のみ。
+   * stale attempt（recoveryで所有権が移った後の旧所有者）の書き込みは false で弾かれる。
+   */
+  complete(
+    id: string,
+    claimToken: string,
+    status: SupervisedRunTerminalStatus,
+    input?: { terminalVerdict?: string; completionEvidence?: Record<string, unknown>; error?: string },
+  ): boolean
+  /**
+   * stalled run を引き取る。**新しいclaimTokenを発行**し、旧所有者を無効化する。
+   * recoveryAttemptCount が上限以上なら引き取らず `failed` で終端する（C-6）。
+   *
+   * 上限は呼び出し側から渡さない（独立レビュー指摘 2026-09-08 第2ラウンド）。
+   * 引数にすると「bounded であること」が呼び出し側の善意に依存してしまい、
+   * 大きな値で C-6 を無効化することも、0 で即座に recovery_exhausted を強制することもできる。
+   * bound は system policy（`MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS`）として固定する。
+   */
+  claimForRecovery(id: string, supervisor: string): ClaimSupervisedRunResult
+  /**
+   * fail-closed 終端（D-2）。predicate を解決できず run を評価できない場合に使う。
+   * **RUNNINGのまま放置しないための経路**だが、**終端書き込みなので fencing を免除しない**
+   * （独立レビュー指摘 2026-09-08: 免除すると、所有権を奪われた旧所有者が後から終端を書けてしまい、
+   * claimForRecovery による無効化が骨抜きになる）。
+   *
+   * 所有者が既に死んでいて誰もtokenを持たない場合は、
+   * `markStalledBySupervisor()` → `claimForRecovery()` で正当に所有権を取得してから呼ぶ。
+   */
+  failClosed(id: string, claimToken: string, error: string): boolean
+  /**
+   * 監視側（watchdog sweep）が、所有者に到達できない run を stalled として旗を立てる。
+   * **claimToken を要求しない**が、これは終端書き込みではないので fencing の対象外である
+   * （終端させるには、この後 `claimForRecovery()` で bounded に所有権を取得する必要がある）。
+   *
+   * これが無いと、所有者が死んだ run は誰も stalled にできず、recovery も終端もできないまま
+   * running で残る（実障害ケース1と同じ結末）。
+   *
+   * **進捗が観測できている run は stalled にできない。** tokenless な旗立てを無条件に許すと、
+   * 健全に進行中のrunを誰でも stalled にして所有権を奪えてしまう。
+   * 停止の主張は**観測可能な事実（lastProgressAt）に裏付けられていなければならない**
+   * — C-2a（進捗を見ずに停止と判定しない）と C-5（診断してから動く）そのものである。
+   *
+   * 判定に使う cutoff は**呼び出し側から受け取らない**（独立レビュー指摘 2026-09-08 第3ラウンド）。
+   * 引数にすると未来時刻を渡すだけで素通りでき、ガードとして何も証明しない。
+   * cutoff は kind ごとの policy（`SUPERVISED_RUN_STALE_THRESHOLD_MS`）と現在時刻から
+   * storage 内部で算出する。
+   */
+  markStalledBySupervisor(id: string, reason: string): boolean
+  /**
+   * process crash後の起動時回収。前プロセスが残した running を `stalled` へ倒す。
+   *
+   * `failed` ではなく `stalled` にするのは C-5（診断を先に行う）に従うため。
+   * completion predicate を既に満たしている可能性があり（C-12 / Case C）、
+   * 生死だけを見て失敗と決めつけない。
+   */
+  markOrphanedRunsStalledAtStartup(startedBefore: string): SupervisedRun[]
+}
+
 export interface IDesignReviewRunStorage {
   findById(id: string): DesignReviewRun | undefined
   findActiveByTaskId(taskId: string): DesignReviewRun | undefined
@@ -747,6 +897,7 @@ export interface IStorage {
   approvalRequests: IApprovalRequestStorage
   designReviewEvidence: IDesignReviewEvidenceStorage
   designReviewRuns: IDesignReviewRunStorage
+  supervisedRuns: ISupervisedRunStorage
   gateEvaluations: IGateEvaluationStorage
   auditLog: IAuditLogStorage
   taskContinuations: ITaskContinuationStorage

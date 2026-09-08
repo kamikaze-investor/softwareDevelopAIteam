@@ -10,8 +10,9 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
-import { computeTaskDisplayStatus } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
+import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
+import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
 import type { TaskContinuation } from '@ai-team/shared'
@@ -371,6 +372,15 @@ function collectRoadmapPhaseSpecConflicts(
 }
 
 const DEFAULT_SUMMARY_LIMIT = 50
+
+/**
+ * supervised run の recovery 上限（Contract C-6）。**system policy であり、呼び出し側の引数にしない。**
+ *
+ * 独立レビュー指摘(2026-09-08 第2ラウンド): 上限を引数で受けると「bounded であること」が
+ * 呼び出し側の善意に依存する。大きな値を渡せば C-6 は無効化でき、0 を渡せば健全な run を
+ * 即座に recovery_exhausted へ落とせてしまう。bound は一箇所で固定する。
+ */
+export const MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS = 3
 const MAX_SUMMARY_LIMIT = 100
 
 function normalizeSummaryLimit(limit?: number): number {
@@ -2778,6 +2788,250 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  /**
+   * Supervised Run storage — Background Task Supervision Contract の共通run state（C-10）。
+   *
+   * 所有権は claim_token で表す。create が最初のtokenを発行し（launchとsupervision登録が不可分）、
+   * recovery で所有権が移ると新しいtokenが発行されて旧所有者の書き込みは恒久的に無効になる。
+   * これにより「死んだwrapperが後から成功を書く」経路が塞がれる。
+   */
+  const supervisedRuns: ISupervisedRunStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM supervised_runs WHERE id = ?').get(id) as any
+      return row ? deserializeSupervisedRun(row) : undefined
+    },
+    findActive(kind, subjectId) {
+      const row = db.prepare(
+        "SELECT * FROM supervised_runs WHERE kind = ? AND subject_id = ? AND status IN ('running','stalled') LIMIT 1"
+      ).get(kind, subjectId) as any
+      return row ? deserializeSupervisedRun(row) : undefined
+    },
+    findActiveRuns() {
+      const rows = db.prepare(
+        "SELECT * FROM supervised_runs WHERE status IN ('running','stalled') ORDER BY last_progress_at ASC, rowid ASC"
+      ).all() as any[]
+      return rows.map(deserializeSupervisedRun)
+    },
+    create(input) {
+      const createTransaction = db.transaction((): CreateSupervisedRunResult => {
+        const findActive = () => db.prepare(
+          "SELECT * FROM supervised_runs WHERE kind = ? AND subject_id = ? AND status IN ('running','stalled') LIMIT 1"
+        ).get(input.kind, input.subjectId) as any
+
+        // 二重起票ではなく既存runを返す。**claimTokenは発行しない** —
+        // 既にactiveな所有者がいるので、その所有権を奪ってはならない。
+        const existing = findActive()
+        if (existing) {
+          return { run: deserializeSupervisedRun(existing), created: false }
+        }
+
+        const timestamp = now()
+        const claimToken = randomUUID()
+        const run: SupervisedRun = {
+          id: randomUUID(),
+          kind: input.kind,
+          subjectId: input.subjectId,
+          status: 'running',
+          predicateKey: input.predicateKey,
+          predicateVersion: input.predicateVersion,
+          progressEvidence: input.progressEvidence,
+          progressSource: input.progressSource,
+          currentStage: input.currentStage,
+          supervisor: input.supervisor,
+          recoveryAttemptCount: 0,
+          claimToken,
+          createdAt: timestamp,
+          startedAt: timestamp,
+          lastProgressAt: timestamp,
+        }
+
+        try {
+          db.prepare(`
+            INSERT INTO supervised_runs
+              (id, kind, subject_id, status, predicate_key, predicate_version, progress_evidence,
+               completion_evidence, progress_source, current_stage, supervisor, recovery_attempt_count,
+               claim_token, terminal_verdict, error, created_at, started_at, last_progress_at, completed_at)
+            VALUES (?, ?, ?, 'running', ?, ?, ?, NULL, ?, ?, ?, 0, ?, NULL, NULL, ?, ?, ?, NULL)
+          `).run(
+            run.id, run.kind, run.subjectId, run.predicateKey, run.predicateVersion,
+            run.progressEvidence ? JSON.stringify(run.progressEvidence) : null,
+            run.progressSource ?? null, run.currentStage ?? null, run.supervisor ?? null,
+            claimToken, run.createdAt, run.startedAt, run.lastProgressAt,
+          )
+        } catch (err) {
+          // partial unique index 違反 = 別経路が先にactive runを作った。例外にせず既存を返す。
+          const existingAfterConflict = findActive()
+          if (!existingAfterConflict) throw err
+          return { run: deserializeSupervisedRun(existingAfterConflict), created: false }
+        }
+
+        return { run, created: true, claimToken }
+      })
+      return createTransaction()
+    },
+    recordProgress(id, claimToken, input) {
+      // 進捗が観測できたということは stalled ではない。stalled から running へ戻す
+      // （C-12: 生きているのに停止扱いのまま放置しない）。
+      const result = db.prepare(`
+        UPDATE supervised_runs
+        SET last_progress_at = ?,
+            status = 'running',
+            current_stage = COALESCE(?, current_stage),
+            progress_source = COALESCE(?, progress_source),
+            progress_evidence = COALESCE(?, progress_evidence)
+        WHERE id = ? AND claim_token = ? AND status IN ('running','stalled')
+      `).run(
+        now(),
+        input.currentStage ?? null,
+        input.progressSource ?? null,
+        input.progressEvidence ? JSON.stringify(input.progressEvidence) : null,
+        id, claimToken,
+      )
+      return result.changes === 1
+    },
+    markStalled(id, claimToken, reason) {
+      const result = db.prepare(`
+        UPDATE supervised_runs
+        SET status = 'stalled', error = ?
+        WHERE id = ? AND claim_token = ? AND status = 'running'
+      `).run(reason, id, claimToken)
+      return result.changes === 1
+    },
+    complete(id, claimToken, status, input) {
+      const result = db.prepare(`
+        UPDATE supervised_runs
+        SET status = ?, terminal_verdict = ?, completion_evidence = ?, error = ?,
+            completed_at = ?, claim_token = NULL
+        WHERE id = ? AND claim_token = ? AND status IN ('running','stalled')
+      `).run(
+        status,
+        input?.terminalVerdict ?? status,
+        input?.completionEvidence ? JSON.stringify(input.completionEvidence) : null,
+        input?.error ?? null,
+        now(), id, claimToken,
+      )
+      return result.changes === 1
+    },
+    claimForRecovery(id, supervisor) {
+      const maxRecoveryAttempts = MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS
+      const claimTransaction = db.transaction((): ClaimSupervisedRunResult => {
+        const current = db.prepare('SELECT * FROM supervised_runs WHERE id = ?').get(id) as any
+        if (!current || current.status !== 'stalled') {
+          return {}
+        }
+
+        // bounded recovery（C-6）: 超過分は引き取らず failed で終端させる。
+        // 無期限RUNNINGにしないことがここでの load-bearing な性質である。
+        if (current.recovery_attempt_count >= maxRecoveryAttempts) {
+          db.prepare(`
+            UPDATE supervised_runs
+            SET status = 'failed', terminal_verdict = 'recovery_exhausted', error = ?,
+                completed_at = ?, claim_token = NULL
+            WHERE id = ? AND status = 'stalled'
+          `).run(`recovery attempts exhausted (max ${maxRecoveryAttempts})`, now(), id)
+          return { exhausted: true }
+        }
+
+        // 新しいtokenを発行して旧所有者を無効化する。
+        const claimToken = randomUUID()
+        const result = db.prepare(`
+          UPDATE supervised_runs
+          SET status = 'running', recovery_attempt_count = recovery_attempt_count + 1,
+              claim_token = ?, supervisor = ?, last_progress_at = ?, error = NULL
+          WHERE id = ? AND status = 'stalled'
+        `).run(claimToken, supervisor, now(), id)
+
+        if (result.changes !== 1) return {}
+
+        const claimed = db.prepare('SELECT * FROM supervised_runs WHERE id = ?').get(id) as any
+        return { run: deserializeSupervisedRun(claimed), claimToken }
+      })
+      return claimTransaction()
+    },
+    failClosed(id, claimToken, error) {
+      // D-2: predicate を解決できない run を RUNNING のまま残さないための経路。
+      //
+      // 独立レビュー指摘(2026-09-08)で claim_token 要求を追加した。終端書き込みである以上、
+      // fencing を免除してはならない。免除すると claimForRecovery で所有権を奪われた旧所有者が
+      // この経路から終端を書けてしまい、「死んだwrapperが後から結果を書けない」という
+      // 不変条件そのものが崩れる。
+      //
+      // 所有者が死んでtokenの持ち主がいない run は、markStalledBySupervisor() →
+      // claimForRecovery() で正当に所有権を取得してから終端させる。
+      const result = db.prepare(`
+        UPDATE supervised_runs
+        SET status = 'failed', terminal_verdict = 'fail_closed', error = ?,
+            completed_at = ?, claim_token = NULL
+        WHERE id = ? AND claim_token = ? AND status IN ('running','stalled')
+      `).run(error, now(), id, claimToken)
+      return result.changes === 1
+    },
+    markStalledBySupervisor(id, reason) {
+      // 監視側が所有者に到達できない run へ旗を立てる。**終端書き込みではない**ので
+      // claim_token を要求しない（fencing の対象は終端の確定であって、停止の疑いではない）。
+      // これが無いと、所有者が死んだ run は stalled にできず recovery にも入れないまま
+      // running で残り続ける（実障害ケース1と同じ結末）。
+      //
+      // ただし無条件の旗立ては許さない: **進捗が観測できている run は stalled にできない**。
+      // 停止の主張は観測可能な事実に裏付けられていなければならず、これが無いと健全に
+      // 進行中の run を誰でも stalled にして所有権を奪えてしまう。
+      // C-2a（進捗を見ずに停止と判定しない）と C-5（診断してから動く）の実装である。
+      //
+      // **cutoff は呼び出し側から受け取らない**（独立レビュー指摘 2026-09-08 第3ラウンド）。
+      // 引数にすると未来時刻を渡すだけで条件を素通りでき、ガードとして何も証明しない。
+      // ここでは kind ごとの policy（SUPERVISED_RUN_STALE_THRESHOLD_MS）と現在時刻から
+      // storage 内部で算出する。閾値を kind 別にするのは C-4（正常な無出力時間は task ごとに
+      // 異なるので一律の短い timeout で判定しない）に従うためである。
+      const sweepTransaction = db.transaction((): boolean => {
+        const current = db.prepare('SELECT kind, status FROM supervised_runs WHERE id = ?').get(id) as any
+        if (!current || current.status !== 'running') return false
+
+        // kind は schema 上ただの TEXT なので、DB から来た値を素の object index で引かない
+        // （独立レビュー指摘 2026-09-08 第4ラウンド: `toString` や `constructor` のような値は
+        // prototype 由来のプロパティに解決されてしまい、undefined 判定を素通りして
+        // `new Date(Date.now() - <function>)` が Invalid Date として throw する）。
+        // 既知 kind の集合に対する明示的なメンバーシップ判定だけを信用する。
+        const kind: string = String(current.kind)
+        if (!isSupervisedRunKind(kind)) {
+          // 未知の kind は閾値を決められない。勝手に stalled にはせず、判定を見送る
+          // （fail-closed 側の判断は predicate 解決経路が担当する）。
+          return false
+        }
+        const threshold = SUPERVISED_RUN_STALE_THRESHOLD_MS[kind]
+
+        const staleCutoff = new Date(Date.now() - threshold).toISOString()
+        const result = db.prepare(`
+          UPDATE supervised_runs
+          SET status = 'stalled', error = ?
+          WHERE id = ? AND status = 'running' AND last_progress_at < ?
+        `).run(reason, id, staleCutoff)
+        return result.changes === 1
+      })
+      return sweepTransaction()
+    },
+    markOrphanedRunsStalledAtStartup(startedBefore) {
+      const sweepTransaction = db.transaction((): SupervisedRun[] => {
+        const orphans = db.prepare(
+          "SELECT * FROM supervised_runs WHERE status = 'running' AND started_at < ?"
+        ).all(startedBefore) as any[]
+
+        for (const orphan of orphans) {
+          // failed ではなく stalled にする（C-5: 診断を先に行う）。completion predicate を
+          // 既に満たしている可能性があり（C-12 / Case C）、生死だけで失敗と決めつけない。
+          // claim_token は**残す** — 前プロセスとは無関係に supervisor がまだ生きている場合、
+          // その supervisor が recordProgress で running へ戻せるようにするため。
+          db.prepare(`
+            UPDATE supervised_runs SET status = 'stalled', error = ?
+            WHERE id = ? AND status = 'running'
+          `).run('orphaned by process restart; needs diagnosis before recovery', orphan.id)
+        }
+
+        return orphans.map((row) => deserializeSupervisedRun({ ...row, status: 'stalled' }))
+      })
+      return sweepTransaction()
+    },
+  }
+
   const designReviewRuns: IDesignReviewRunStorage = {
     findById(id) {
       const row = db.prepare('SELECT * FROM design_review_runs WHERE id = ?').get(id) as any
@@ -3528,7 +3782,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, gateEvaluations, auditLog, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, supervisedRuns, gateEvaluations, auditLog, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
   return storage
 }
 
@@ -3747,6 +4001,46 @@ function deserializeGateEvaluation(row: any): GateEvaluationEvidence {
     approvedContentHash: row.approved_content_hash ?? undefined,
     resultingCommit: row.resulting_commit ?? undefined,
     createdAt: row.created_at,
+  }
+}
+
+function deserializeSupervisedRun(row: any): SupervisedRun {
+  return {
+    id: row.id,
+    kind: row.kind as SupervisedRun['kind'],
+    subjectId: row.subject_id,
+    status: row.status as SupervisedRun['status'],
+    predicateKey: row.predicate_key,
+    predicateVersion: row.predicate_version,
+    progressEvidence: parseJsonObject(row.progress_evidence),
+    completionEvidence: parseJsonObject(row.completion_evidence),
+    progressSource: row.progress_source ?? undefined,
+    currentStage: row.current_stage ?? undefined,
+    supervisor: row.supervisor ?? undefined,
+    recoveryAttemptCount: row.recovery_attempt_count,
+    claimToken: row.claim_token ?? undefined,
+    terminalVerdict: row.terminal_verdict ?? undefined,
+    error: row.error ?? undefined,
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    lastProgressAt: row.last_progress_at,
+    completedAt: row.completed_at ?? undefined,
+  }
+}
+
+/**
+ * evidence列のJSONを読む。壊れた値で行全体を読めなくしないため、
+ * parse失敗時は undefined を返す（evidence は監査情報であり、判定の根拠ではない）。
+ */
+function parseJsonObject(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined
+  try {
+    const parsed = JSON.parse(value)
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined
+  } catch {
+    return undefined
   }
 }
 
