@@ -51,6 +51,8 @@ export interface RoadmapGeneratorRunnerInput {
   model?: string
   /** 推論強度。未指定ならCLI設定に委ねる。 */
   reasoningEffort?: string
+  /** legacy Landlock sandboxを使うか（このVPSでrepoを読むために必要。deprecatedな暫定経路）。 */
+  useLegacyLandlockSandbox?: boolean
 }
 
 function readStdin(): string {
@@ -75,6 +77,7 @@ export async function runRoadmapGeneration(input: RoadmapGeneratorRunnerInput): 
     postLint: false,
     ...(input.model ? { model: input.model } : {}),
     ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
+    ...(input.useLegacyLandlockSandbox ? { useLegacyLandlockSandbox: true } : {}),
   })
 
   if (result.blocked) {
