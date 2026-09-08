@@ -1859,19 +1859,54 @@ export function computeWorkspaceBaseline(job: Job, workingDir: string): Workspac
 }
 
 /**
+ * `implement:<sourceJobId>:review` ちょうどこの形かどうか。
+ *
+ * これは「dirty worktree を受け入れてよいか」という**安全条件**なので、
+ * 正規表現ではなくセグメント分割で厳密に検査する。
+ * `/^implement:(.+):review$/` では次を取りこぼしていた:
+ *   - `.+` が `:` を含むため `implement:a:extra:review` まで一致する
+ *   - JS の `$` は末尾の改行の前にも一致するため `implement:a:review\n` が通る
+ * どちらも「安全条件を広げすぎない」という本修正の目的に反する
+ * （2026-09-08 独立レビュー指摘）。
+ *
+ * API 側（`routes/jobs.ts`）が生成する形がそのまま契約である。
+ * prefix（`implement:`）で広く許可しないのは、将来 `implement:<id>:*` の別ステップが
+ * 追加されたときに dirty workspace の受け入れまで自動継承させないため。
+ */
+function isImplementReviewStepKey(stepKey: string): boolean {
+  const segments = stepKey.split(':')
+  return (
+    segments.length === 3 &&
+    segments[0] === 'implement' &&
+    segments[1].length > 0 &&
+    !/\s/.test(segments[1]) &&
+    segments[2] === 'review'
+  )
+}
+
+/**
  * INTENTIONALLY-DIRTY Job の分類（PR-C）。
  *
  * `repair:` / `resume:` / `retry:` で始まる workflowStepKey は、失敗した前 Job（implement /
  * repair 等）の後続として同一 Task の dirty worktree を正統に受け継ぐ Job である。
  * aiCliMode はこの判定に使わない（`task:<id>:initial-implement` のような NORMAL Job も
  * implement であり、dirty を受け継ぐ理由にならないため）。
+ *
+ * `implement:<sourceJobId>:review` も同じ理由で INTENTIONALLY-DIRTY である。
+ * この Job は「直前の implement Job が**未commitのまま残した**変更」をレビューするために
+ * 存在するので、clean worktree を要求すると**構造上絶対に通らない**。
+ * 2026-09-08 の operational E2E で、implement 成功直後の review Job が
+ * `normal Job requires a clean worktree` として quarantine され、chain が
+ * git-commit へ進めなくなることを実測した（fail-closed 自体は正しく働いていた）。
  */
 function isIntentionallyDirtyJob(job: Job): boolean {
   const stepKey = job.workflowStepKey
+  if (stepKey === undefined) return false
   return (
-    stepKey?.startsWith('repair:') === true ||
-    stepKey?.startsWith('resume:') === true ||
-    stepKey?.startsWith('retry:') === true
+    stepKey.startsWith('repair:') ||
+    stepKey.startsWith('resume:') ||
+    stepKey.startsWith('retry:') ||
+    isImplementReviewStepKey(stepKey)
   )
 }
 

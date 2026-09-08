@@ -405,6 +405,20 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS ix_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC)',
   'DROP INDEX IF EXISTS ux_design_review_runs_task_active',
   "CREATE UNIQUE INDEX IF NOT EXISTS ux_design_review_runs_subject_active ON design_review_runs(review_kind, subject_id) WHERE status IN ('queued','running')",
+  // DB-007: stall episode の重複記録を DB 側で保証する。
+  // dedup key が (job_id, started_at) なのは、Job が failed/blocked -> queued -> running と
+  // 復帰でき、そのたび startedAt が付け直されるため。job_id だけを key にすると
+  // **復旧後に正当に再発した stall** まで潰してしまう。
+  // UNIQUE index を張る前に、既存の重複行を最古の1件だけ残して削除する
+  // （本番は重複ゼロを実測済みだが、開発DBには残り得るため index 作成が失敗しないようにする）。
+  `DELETE FROM watchdog_events WHERE id NOT IN (
+     SELECT id FROM (
+       SELECT id, ROW_NUMBER() OVER (
+         PARTITION BY job_id, started_at ORDER BY created_at ASC, id ASC
+       ) rn FROM watchdog_events
+     ) WHERE rn = 1
+   )`,
+  'CREATE UNIQUE INDEX IF NOT EXISTS ux_watchdog_events_episode ON watchdog_events(job_id, started_at)',
   'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_task_created_at ON gate_evaluations(task_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_gate_evaluations_target ON gate_evaluations(target_commit, target_diff_hash)',
   // 1 ALLOW = 1 git_commit = 1 resulting_commit。
