@@ -423,10 +423,14 @@ function ProjectCard({
               <Text style={styles.badgeText}>{JOB_DISPLAY_STATE_LABEL[health]}</Text>
             </View>
           )}
-          {/* lifecycle status は二次情報として残す（running でも止まっていることがある） */}
-          <View style={[styles.lifecycleBadge, { borderColor: statusColor }]}>
-            <Text style={[styles.lifecycleBadgeText, { color: statusColor }]}>{project.status}</Text>
-          </View>
+          {/* lifecycle status は二次情報として残す（running でも止まっていることがある）。
+              ただし「完了」を出しているときは running を並べない。作業が終わっているのに
+              running が見えると、CEO には「まだ動いているのか終わったのか」が判断できない。 */}
+          {!(allTasksDone === true && project.status === 'running') && (
+            <View style={[styles.lifecycleBadge, { borderColor: statusColor }]}>
+              <Text style={[styles.lifecycleBadgeText, { color: statusColor }]}>{project.status}</Text>
+            </View>
+          )}
         </View>
       </View>
 
