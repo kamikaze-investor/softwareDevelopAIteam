@@ -366,7 +366,7 @@ function normalizeObjectId(raw: string | undefined): string | undefined {
  * **pathspec で sentinel だけに絞る。** 絞らないと `--ignored` が node_modules 等の無視ツリーを
  * すべて列挙し、`runGit` の timeout / maxBuffer へ近づく。実測（control repo 909MB /
  * node_modules 74,030ファイル）: 絞らない場合 7.3MB / 0.65s、絞った場合 0B / 0.41s。
- * `**/` はリポジトリ直下にも一致する（実測済み）。sentinel 名は
+ * glob prefix はリポジトリ直下（深さ0）にも一致する（実測済み）。sentinel 名は
  * `.codex-capture-probe-<pid>-<uuid>` で glob メタ文字を含まない。
  *
  * 判定できなければ `ChangeDetectionError` が伝播する（fail-closed）。
