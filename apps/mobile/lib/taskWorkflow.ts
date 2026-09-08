@@ -142,17 +142,22 @@ export function allowsProgressActions(state: JobDisplayState): boolean {
 }
 
 /**
- * MOB-001: quarantine 時に CEO へ示す「次に何が起きるか」。
+ * MOB-001: quarantine 時に CEO へ示す状況説明。
  *
- * 前提（2026-09-08 実装確認）: quarantine の再検証は Worker 起動時の
- * `recoverJobsAtStartup()` → `recoverStaleJobs()` だけが行う。定期的な再検証は無い。
- * したがって「放置すれば必ず自動で戻る」とは言えない。CEO に git 操作をさせないため、
- * 技術的な復旧手順ではなく **状況と次の担当** を伝える。
+ * **「自動復旧中」とは書かない。** 2026-09-08 の調査で、それが事実でないことが判明している:
+ *   - quarantine の再検証は Worker 起動時の `recoverJobsAtStartup()` だけで、定期実行は無い
+ *   - 本番の workspace は実際に dirty（untracked ファイルが残っている）ため、
+ *     再検証しても再び quarantine になるだけで、Worker restart では本質的に解消しない
+ *   - 同じ clean-worktree quarantine が別 Project でも再発している
+ *
+ * 進行中でない復旧を「進行中」と表示すると、CEO は待っていれば直ると誤解し、
+ * 実際には誰も動いていない状態が放置される。事実に一致する表現だけを出す。
  */
 export function quarantineGuidanceText(): string {
-  return 'AIチームが作業領域を再確認して自動復旧を試みます。'
-    + '自動で解除できない場合は担当（PL）へエスカレーションされます。'
-    + 'この状態はCEOの承認では解除できません。CEOの操作は不要です。'
+  return '安全のため停止しています。'
+    + '承認や再開では解除されません。'
+    + 'AI開発チーム側で作業領域の復旧が必要です。'
+    + 'CEOによる操作は必要ありません。'
 }
 
 /**

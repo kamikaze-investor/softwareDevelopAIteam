@@ -397,11 +397,24 @@ describe('MOB-001: 一覧・Dashboard の状態導出と action gating', () => {
 
   it('quarantine の案内は CEO に git 操作を求めない', () => {
     const text = quarantineGuidanceText()
-    expect(text).toContain('自動復旧')
-    expect(text).toContain('CEOの操作は不要')
+    expect(text).toContain('安全のため停止しています')
+    expect(text).toContain('承認や再開では解除されません')
+    expect(text).toContain('CEOによる操作は必要ありません')
     for (const technical of ['git', 'commit', 'worktree', 'reset', 'clean']) {
       expect(text.toLowerCase()).not.toContain(technical)
     }
+  })
+
+  it('復旧actorが無い間は「自動復旧中」と誤認させない', () => {
+    // 2026-09-08 調査: quarantine を実際に解消する actor は存在せず、
+    // Worker restart でも本番の dirty workspace は解消しない。
+    // 進行中でない復旧を進行中と表示すると、CEO は待てば直ると誤解する。
+    const text = quarantineGuidanceText()
+    for (const misleading of ['自動復旧', '自動で解除', '復旧中', '対応中', '進行中']) {
+      expect(text).not.toContain(misleading)
+    }
+    // 誰の担当かは明示する（放置されているように見せない）
+    expect(text).toContain('AI開発チーム側で作業領域の復旧が必要です')
   })
 
   it('Dashboard / 一覧 / 詳細でラベルが一致する', () => {
