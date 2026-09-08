@@ -2117,8 +2117,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 <!-- roadmap:id=pl-review-process-supervision state=planned priority=high -->
 0. [ ] **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**
    （2026-09-08登録、**高優先度**。CEO判断: 運用上の欠陥として扱う。
-   当初はPL delegation限定で登録したが、実障害ケース2により
-   **background task一般**へ対象を拡張した）。
+   当初はPL delegation限定で登録したが、**個別task列挙ではなく性質による定義**へ改めた。
+   scopeの正本は下記「対象の定義」であり、実障害ケース1〜3はscopeそのものではなく
+   **contractを検証する実例**である）。
 
    ### 実障害ケース1: PR #108のCodex independent reviewが0 byteのまま放置された（2026-09-08）
 
@@ -2201,8 +2202,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    workflow progressionをblockするbackground taskが、実進捗またはcompletionを監視されないまま
    無期限RUNNINGになれる。ケース1（PR #108のCodex review 0 byte放置）と同じ欠陥が、
    **AI delegation以外のbackground taskにも存在する**ことを示す2例目である。
-   したがって本項目の対象は「PL delegation」ではなく、
-   **AI delegation / Expo restart / deploy / build を含むbackground task一般**へ拡張する。
+   したがって本項目の対象は「PL delegation」という特定の作業種別ではない。
+   **対象は性質で定義する**（下記「対象の定義」）。本ケースはその定義を満たす一例にすぎない。
 
    **Generalized defect（追加調査後の最終形）**: *Background task supervision must validate actual
    task outcome through environment-independent completion predicates rather than equating
@@ -2270,20 +2271,62 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **Finding**: *external background operationのcompletion後にPL control loopを再開する仕組みが
    保証されていない。* 「監視中」と宣言することと、監視が成立していることは別である。
 
-   **scope拡張**: **CI待ちもBackground Task Supervision Contractの対象に含める。**
-   対象は自前でspawnしたprocessに限らず、**GitHub Actions等のexternal background operationの
-   完了待ちを含む**。これらは自前のchild processが存在しないため、
-   `PID alive`ベースの監視が原理的に使えず、external probe（C-2a）が唯一の手段になる。
+   **contractへの含意**: CI待ちは「対象の定義」を当然に満たす（workflow progressionをblockする
+   external-wait operationである）。**scopeを拡張したのではなく、定義から自動的に含まれる**。
+   本ケースが示す固有の論点は、external operationには**自前のchild processが存在しない**ため
+   `PID alive`ベースの監視が原理的に使えず、external probe（C-2a）が唯一の手段になる、という点である。
 
    ### Background Task Supervision Contract（共通化するのは実装ではなく契約）
+
+   #### 対象の定義（scopeの正本。個別task列挙にしない）
+
+   本contractの対象は、**workflow progressionをblockし得るすべての asynchronous /
+   background / external-wait operation** である。
+
+   判定は「どの種類のtaskか」ではなく、**次の性質を持つか**で行う:
+
+   - 呼び出し元が結果を待つ間、**workflowが前に進まない**
+   - 完了が**同期的な戻り値では得られない**（別process / 別host / 外部service / 後続event待ち）
+
+   自前でspawnしたchild processか、外部serviceの完了待ちか、
+   人間の応答待ちかは問わない。**この性質を持つ限り対象である。**
+
+   **AI delegation / Expo restart / CI wait / deploy / build はscopeの定義ではない。**
+   これらはcontractを検証する**実障害例およびacceptance例**として扱う。
+   **新しい種類のasync処理が追加されるたびに個別のwatchdog仕様を追記しないと漏れる設計は禁止する。**
+   新種のasync operationは、列挙へ追加されたから対象になるのではなく、
+   上記の性質を満たす時点で**既定で対象**である（closed by default）。
+
+   #### 最低限の共通要求（下記C-1〜C-13はこの8項目の具体化である）
+
+   | 要求 | 内容 | 対応する条項 |
+   |---|---|---|
+   | durable run/state | run stateがprocess再起動をまたいで残る | C-10 |
+   | observable progress | 実進捗が観測可能（経過時間・PID生存だけに依らない） | C-2 / C-2a / C-4 |
+   | task-specific completion predicate | 「成功」の定義をtaskごとに持ち、実行環境で成立する | C-3 / C-3a / C-3b |
+   | stall detection | 進捗停止を検知し、診断してから動く | C-4 / C-5 / C-11 |
+   | bounded recovery | recoveryは有限回で打ち切る | C-6 |
+   | terminal verdict | 必ず終端へ到達する（無期限RUNNING禁止） | C-1 / C-12 |
+   | automatic continuation | 完了時にcontrol loopが自動resumeする | C-13 |
+   | session / Mobile非依存 | 監視主体が呼び出し元sessionと運命を共にしない | C-7 / C-8 |
+
+   #### 正式運用経路への参入条件（admission rule）
+
+   **workflowをblockするasync operationは、この8要求を満たさない限り正式運用経路に載せない。**
+   満たさないまま使う場合は、workflowをblockしない形（fire-and-forget、
+   または結果を待たない補助的用途）に限る。
+   実障害ケース1〜3はいずれも「満たしていないoperationがworkflowをblockする位置に置かれた」結果であり、
+   個別のbug修正では再発を止められない。
+
+   #### 実装方針（機構は統合しない）
 
    他セッションでも長時間監視対策を調査中である。**この件を理由に新しい watchdog / supervisor /
    monitoring daemonを新設しない。** runtime Worker watchdog（`apps/worker/src/watchdog/watchdog.ts`）と
    `scripts/delegate-watchdog.sh` は監視対象・実行主体・障害モードが異なるため、
    **実行機構は責務を分けたままでよい。統合しない。**
-   共通化するのは下記のcontract（原則とinterface）と、C-10の永続run stateだけとする。
+   共通化するのは上記の要求（contract）と、C-10の永続run stateだけとする。
 
-   AIteamOSがworkflow progressionを待つすべてのbackground taskは、次を満たさなければならない。
+   以下、個別条項。
 
    **C-1. 必ずterminal stateへ到達できる。** RUNNING / SUCCEEDED / FAILED / STALLED / TIMED_OUT 等、
    最終的に必ずterminal verdictへ到達する。**無期限RUNNINGは禁止。**
@@ -2423,16 +2466,24 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    ### 実装前提として固定した決定（CEO判断、2026-09-08。#110初期実装のスコープ）
 
-   **D-1. 初期`kind`は2つに限定する。** #110の初期実装で`supervised_runs`へ接続するのは
-   **`ai_delegation` と `expo_restart` のみ**とする。`deploy` / `build` は
-   **Contractの適用例としては残すが、#110初期実装では接続しない**。
+   **D-1. 初期接続`kind`は2つに限定する（scopeではなくrollout順序）。** #110の初期実装で
+   `supervised_runs`へ接続するのは **`ai_delegation` と `expo_restart` のみ**とする。
    `kind`は将来拡張可能な形（新しい値の追加がschema変更を要求しない形）で設計する。
 
-   **D-1補足（ケース3を受けた未決事項）**: CI待ち（`external_ci`）はContractの対象に含めたが、
-   **初期`kind`へ追加するかはCEO未判断**である。D-1の初期スコープは変更していない。
-   external CIは自前のchild processを持たないため、progress sourceもcompletion predicateも
+   **これはcontractのscopeを狭める決定ではない。** contractの対象は「対象の定義」で決まり、
+   `deploy` / `build` / `external_ci` も定義上すでに対象である。D-1が決めているのは
+   **どの順で既存supervisorを配線するか**だけである。
+
+   **未決事項（CEO判断待ち）**: admission ruleとD-1を素直に併せると、
+   **まだ配線されていないasync operation（`deploy` / `build` / `external_ci`）は
+   「workflowをblockする形では正式運用経路に載せられない」**ことになる。
+   現に今それらを運用で使っているため、次のいずれかを選ぶ必要がある:
+   (a) 配線されるまで期限付きの明示的例外として扱う、
+   (b) rollout順序を前倒しして先に配線する、
+   (c) blockしない形（結果を待たない運用）へ一時的に落とす。
+   **この判断が済むまで実装着手しない。**
+   なお`external_ci`は自前のchild processを持たないため、progress sourceもcompletion predicateも
    `ai_delegation` / `expo_restart` とは異なる形（GitHub APIのpoll、あるいはwebhook）になる。
-   初期実装へ含めるか、Contract適用例として据え置くかを決める必要がある。
 
    **D-2. completion predicateをDBで実行しない。** predicateを自由文字列やDB内DSLとして保存し、
    それを解釈・実行する経路は作らない。DBに保存するのは
