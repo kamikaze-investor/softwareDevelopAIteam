@@ -1128,6 +1128,64 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       未commit変更が次Jobから見える（`apps/worker/src/jobRunner.ts:671`）。worktree隔離はroadmap上の
       計画だけで未実装。このためStage 1は「prompt完全一致かつworktree/HEAD変更なし」に限定し、
       failure contextや変更済みworktreeを扱う再実装はtrusted経路完成後のStage 2へ分離する。
+
+      **2026-09-08 追記（PR-C 以降の新しい consequence。重複Findingは作らず本項目へ集約）**:
+      この「共有 `/workspace/target` が失敗後も reset されず、前 attempt の未commit変更が
+      次 Job から見える」問題は、**P1 Phase 1（workspace baseline 導入）以降、症状が変わった**。
+
+      以前は「前 attempt の変更が次 Job の差分へ混入する（汚染）」だった。現在は、
+      次の normal Job が clean worktree を要求する baseline を取得できず、
+      **`workspace_baseline_failure` として quarantine される**（実測した理由文字列:
+      `normal Job requires a clean worktree but found 2 changed path(s): ...`）。
+      つまり静かな汚染ではなく、**workflow の停止**として顕在化する。
+
+      **決定的な問題は、その quarantine を解除する actor が存在しないこと。**
+      quarantine の再検証は Worker 起動時の `recoverJobsAtStartup()` →
+      `recoverStaleJobs()`（`apps/worker/src/index.ts:605-607`）だけで、定期実行は無い。
+      しかも clearance は clean worktree を要求するため、**未追跡ファイルが残っている限り
+      Worker を再起動しても再び quarantine になるだけ**で、本質的に解消しない。
+      2026-09-08 実測: production の `/workspace/target` は `? e2e/` が untracked のまま残り、
+      同一の clean-worktree quarantine が「Mobile E2E」「Mobile E2E 2」の2 Project で連続発生した。
+
+      したがって現状は **放置しても復旧しない**。root cause は本項目が扱う
+      「共有 workspace を Job 間で reset しない」ことであり、根本対処は本項目の
+      worktree 隔離（1 Job = 1 worktree）である。**新しい recovery subsystem を先に作らない。**
+
+      **着手時に確認すること**: 残った変更をどの source Job が作ったかを
+      persisted baseline / manifest / 既存 repair 情報から特定できるか、
+      既存 `repairFlow` / reconciliation / manifest ロジックで
+      継続・commit・revert・quarantine維持 のいずれかを安全に選べるか。
+      **曖昧な変更を自動削除しない。安全に帰属できない場合は quarantine を維持し PL へエスカレートする。**
+      CEO に Git 判断をさせない。
+
+      **Cleanup-deadlock（2026-09-08 Phase 1/2 Operational E2E で2回実測。上記と同一 root cause のため
+      別Findingにせず本項目へ集約）**: baseline を持たない quarantine と dirty workspace が重なると、
+      **循環して抜け出せない**状態になる。
+
+      - baseline 計算に失敗した quarantine には persisted baseline が無い。したがって clearance は
+        「過去との一致」ではなく **known-good（clean worktree / clean index / marker 無し）** を要求する
+        （PR-C で意図的にそう設計した。復元を主張できない以上、新しい安全な基準点を要求するのが正しい）
+      - しかし workspace は dirty のままであり、**clean へ戻す正規の recovery path が存在しない**。
+        `revertBlockedJobChanges()` は File Change Guard 違反時にしか走らず、しかも manifest 由来の
+        変更しか対象にしない。untracked ファイルはどの経路でも掃除されない
+      - 結果: clearance には clean が要るが、clean にする手段が無い → **quarantine が恒久化する**
+
+      2回とも、CEO 承認を得た **path を限定した手動 cleanup** で脱出した。これは運用として持続しない。
+
+      **注意（設計を弱めないこと）**: この deadlock の解決策として「clearance の known-good 要件を
+      緩める」ことを選んではならない。その要件は「安全と証明できない限り所有権を解放しない」という
+      hard invariant そのものである。**必要なのは clearance を緩めることではなく、workspace を
+      安全に clean へ戻す正規経路**であり、それは本項目の worktree 隔離
+      （1 Job = 1 worktree、破棄すれば dirty は残らない）で構造的に解消する。
+
+      **今すぐ新しい cleanup subsystem は作らない。** 着手時は、残った変更の帰属を
+      persisted baseline / manifest / 既存 repair 情報から特定できるかを先に確認し、
+      安全に帰属できない場合は quarantine を維持して PL へエスカレートする。
+      曖昧な変更の自動削除はしない。
+
+      **UI 側の扱い（MOB-001 で対応済み・別責務）**: 自動復旧 actor が無い事実を
+      Mobile 上で正直に表示する（「自動では復旧しません」）。復旧機構そのものは本項目の担当。
+
       **既知の穴（実コード検証済み）**: `POST /api/jobs`に同一Taskのqueued/running重複チェックが無く、
       `projectId`とTaskのProjectの一致検証も無い（`routes/jobs.ts:122-137`）。
       `Task.status`を自動更新するコードが存在せず事実上`pending`のまま。
@@ -2560,6 +2618,28 @@ deploy canary は全 PASS だった。
 
       **今回実装しないもの（明記）**: unit file の変更 / delegation 構成の変更 /
       新しい supervision 方式の導入。本項目は記録のみ。
+
+<!-- roadmap:id=containment-success-path-observability state=planned -->
+4. [ ] **Containment success path の可観測性（低優先 hardening）** — 2026-09-08、P1 Phase 1/2
+      Operational E2E の完走後に記録。**Phase 1/2 を reopen する必要は無い。動作は正常。**
+
+      **現状**: 失敗経路（drain_timeout / cleanup_failed / kill_failed 等）は quarantine と
+      CRITICAL alert として明確に残るが、**成功経路**の
+      `per-job cgroup 作成 → recursive populated=0 → cgroup 削除` は通常ログから追いにくい。
+      そのため「containment が実際に効いている」ことを、事後に運用ログだけで確認しづらい。
+
+      Phase 2 の実装自体は必要な情報を既に持っている（`ContainedResult` に
+      `outcome` / `killedDescendants` / `drainMs` / `cgroupPath` があり、
+      成功時に `outcome:'killed'` と `killedDescendants:true` を返す実測も取れている）。
+      不足しているのは **その情報を通常運用ログへ出していない**ことだけ。
+
+      **着手時の方針**: 新しい telemetry 基盤・新しいログ収集系は作らない。既存の
+      `console.log` / journalctl 経路へ、成功時も1行の構造化サマリ（jobId / attempt /
+      outcome / drainMs / killedDescendants）を出す程度に留める。
+      ログ量が増えるため、Job あたり1行以内に抑えること。
+
+      **今回実装しないもの（明記）**: metrics backend / トレーシング / 新しいログ基盤。
+      本項目は記録のみ。
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 

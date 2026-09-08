@@ -36,13 +36,16 @@ import { apiFetch } from '../../lib/api'
 import {
   canReflectChanges,
   canRunReview,
+  allowsProgressActions,
   canShowResumeUI,
   deriveJobDisplayState,
   isImplementJob,
+  isQuarantined,
   isJobBusy,
   isReviewJob,
   manualWorkflowIsLocked,
   parseDateTime,
+  quarantineGuidanceText,
   sortJobsByNewestFirst,
 } from '../../lib/taskWorkflow'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
@@ -435,7 +438,7 @@ async function postResumeInstruction(
   }
 }
 
-function TaskInfoSection({ task }: { task: Task }): ReactElement {
+function TaskInfoSection({ task, safetyStopped }: { task: Task; safetyStopped: boolean }): ReactElement {
   return (
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>Task情報</Text>
@@ -446,14 +449,26 @@ function TaskInfoSection({ task }: { task: Task }): ReactElement {
         </Text>
 
         <Text style={styles.detailLabel}>状態</Text>
-        <Text
-          style={[
-            styles.statusText,
-            STATUS_TEXT_STYLE[task.status] ?? styles.statusTextFallback,
-          ]}
-        >
-          {formatTaskStatus(task.status)}
-        </Text>
+        {safetyStopped ? (
+          <>
+            {/* MOB-001: 安全停止中に Task 本来の lifecycle（未着手 等）を主表示にすると、
+                「まだ始まっていないだけ」と読めて安全停止を打ち消してしまう。
+                operational safety state を優先し、lifecycle は補助情報へ落とす。 */}
+            <Text style={[styles.statusText, { color: '#dc2626' }]}>安全停止中</Text>
+            <Text style={styles.secondaryStatusText}>
+              Task自体の状態: {formatTaskStatus(task.status)}
+            </Text>
+          </>
+        ) : (
+          <Text
+            style={[
+              styles.statusText,
+              STATUS_TEXT_STYLE[task.status] ?? styles.statusTextFallback,
+            ]}
+          >
+            {formatTaskStatus(task.status)}
+          </Text>
+        )}
       </View>
     </View>
   )
@@ -640,7 +655,7 @@ const EXECUTION_STATE_VIEW: Record<string, { color: string; label: string; detai
   },
   quarantined: {
     color: '#dc2626',
-    label: '作業領域の安全確認待ち（quarantine）',
+    label: '安全停止中',
     detail:
       '実行後の作業領域が安全だと確認できなかったため、この Job が作業領域を保持したまま停止しています。' +
       '承認や再開では解消しません。作業領域の照合（reconciliation）と解除が必要です。',
@@ -946,13 +961,29 @@ function JobActionsSection({
   jobs,
   onCreated,
   task,
+  watchdogEvents,
 }: {
   approvalRequests: ApprovalRequest[]
   jobs: Job[]
   onCreated: () => void
   task: Task
+  watchdogEvents: WatchdogEvent[]
 }): ReactElement {
   const [runningAction, setRunningAction] = useState<JobActionKind | null>(null)
+
+  // MOB-001: quarantine 中は作業を進める操作を **表示しない**。
+  // 3つのボタンはいずれも POST /api/jobs で新しい Job を作り、その Job は workspace を
+  // claim しようとする。安全性が確認できていない workspace に対して実行してよい操作ではない。
+  const latestJob = useMemo(() => sortJobsByNewestFirst(jobs)[0], [jobs])
+  const displayState = deriveJobDisplayState(latestJob, approvalRequests, watchdogEvents)
+  if (!allowsProgressActions(displayState)) {
+    return (
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>作業</Text>
+        <Text style={styles.actionHelpText}>{quarantineGuidanceText()}</Text>
+      </View>
+    )
+  }
 
   const actionsLocked = runningAction !== null || manualWorkflowIsLocked(jobs, approvalRequests)
   const reviewEnabled = runningAction === null && canRunReview(jobs, approvalRequests)
@@ -1386,7 +1417,10 @@ export default function TaskDetailScreen(): ReactElement {
 
       {data !== null && (
         <>
-          <TaskInfoSection task={data.task} />
+          <TaskInfoSection
+            safetyStopped={data.jobs.some(isQuarantined)}
+            task={data.task}
+          />
           <ExecutionStateSection
             approvalRequests={data.approvalRequests}
             jobs={data.jobs}
@@ -1399,6 +1433,7 @@ export default function TaskDetailScreen(): ReactElement {
           <JobActionsSection
             approvalRequests={data.approvalRequests}
             jobs={data.jobs}
+            watchdogEvents={data.watchdogEvents}
             onCreated={() => void loadTaskDetail()}
             task={data.task}
           />
@@ -1879,6 +1914,11 @@ const styles = StyleSheet.create({
     color: '#d4d4d4',
     fontSize: 14,
     fontWeight: '700',
+  },
+  secondaryStatusText: {
+    color: '#a3a3a3',
+    fontSize: 12,
+    marginTop: 4,
   },
   statusTextFallback: {
     color: '#d4d4d4',

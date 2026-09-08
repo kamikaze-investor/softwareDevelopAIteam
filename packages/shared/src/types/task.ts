@@ -93,6 +93,12 @@ export interface TaskSummary {
     approvalId?: string
     startedAt?: string
     completedAt?: string
+    /**
+     * MOB-001: この Job が workspace 安全確認待ち（quarantine）かどうか。
+     * 新しい status ではなく、既存 `failureMetadata.quarantined` をそのまま公開するだけ。
+     * 一覧画面で quarantine を通常の blocked と区別するために必要。
+     */
+    quarantined?: boolean
   }
   approvalSummary: {
     hasWaitingApproval: boolean

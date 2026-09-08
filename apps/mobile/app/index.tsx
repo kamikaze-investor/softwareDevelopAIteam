@@ -12,8 +12,15 @@ import type {
   Project,
   ProjectStatus,
   Task,
+  TaskSummary,
+  WatchdogEvent,
 } from '@ai-team/shared'
 import { router } from 'expo-router'
+import {
+  JOB_DISPLAY_STATE_LABEL,
+  deriveProjectSummaryState,
+  type JobDisplayState,
+} from '../lib/taskWorkflow'
 import {
   ActivityIndicator,
   Alert,
@@ -48,6 +55,27 @@ const STARTABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['draft', 'paused']
 const PAUSABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['running']
 const ARCHIVABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['draft', 'paused']
 const RESTORABLE_PROJECT_STATUSES: readonly ProjectStatus[] = ['archived']
+
+/**
+ * MOB-001: Dashboard で異常に気付けるようにするため、Project 配下の実行状態を導出する材料を取る。
+ * 既存の cross-project サマリと WatchdogEvent を読むだけで、新しい backend は作らない。
+ * 取得失敗時はバッジが出ないだけで Dashboard 自体は壊さない。
+ */
+async function fetchTaskSummariesSafe(): Promise<TaskSummary[]> {
+  try {
+    const response = await apiFetch('/api/tasks/summary')
+    if (!response.ok) return []
+    return (await response.json()) as TaskSummary[]
+  } catch { return [] }
+}
+
+async function fetchWatchdogEventsSafe(): Promise<WatchdogEvent[]> {
+  try {
+    const response = await apiFetch('/api/watchdog-events')
+    if (!response.ok) return []
+    return (await response.json()) as WatchdogEvent[]
+  } catch { return [] }
+}
 
 async function fetchProjects(): Promise<Project[]> {
   const response = await apiFetch('/api/projects')
@@ -237,12 +265,24 @@ function getStatusColor(status: string): string {
   return STATUS_COLOR[status] ?? '#737373'
 }
 
+const HEALTH_BADGE_COLOR: Record<JobDisplayState, string> = {
+  approval_waiting: '#a855f7',
+  blocked: '#f59e0b',
+  other: '#737373',
+  quarantined: '#dc2626',
+  running_healthy: '#3b82f6',
+  running_stalled: '#f97316',
+}
+
 function ProjectCard({
   project,
   onStarted,
+  health,
 }: {
   project: Project
   onStarted: () => void
+  /** MOB-001: 既存状態から導出した実行状態。lifecycle status とは別物。 */
+  health?: JobDisplayState
 }) {
   const [tasks, setTasks] = useState<Task[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
@@ -363,8 +403,16 @@ function ProjectCard({
         <Text style={styles.cardTitle} numberOfLines={1}>
           {project.name}
         </Text>
-        <View style={[styles.badge, { backgroundColor: statusColor }]}>
-          <Text style={styles.badgeText}>{project.status}</Text>
+        <View style={styles.badgeGroup}>
+          {health !== undefined && health !== 'other' && (
+            <View style={[styles.badge, { backgroundColor: HEALTH_BADGE_COLOR[health] }]}>
+              <Text style={styles.badgeText}>{JOB_DISPLAY_STATE_LABEL[health]}</Text>
+            </View>
+          )}
+          {/* lifecycle status は二次情報として残す（running でも止まっていることがある） */}
+          <View style={[styles.lifecycleBadge, { borderColor: statusColor }]}>
+            <Text style={[styles.lifecycleBadgeText, { color: statusColor }]}>{project.status}</Text>
+          </View>
         </View>
       </View>
 
@@ -576,6 +624,7 @@ function ApiTokenSettings(): ReactElement {
 export default function Dashboard() {
   const [projects, setProjects] = useState<Project[]>([])
   const [pendingApprovalCount, setPendingApprovalCount] = useState<number | null>(null)
+  const [healthByProject, setHealthByProject] = useState<Record<string, JobDisplayState>>({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -583,10 +632,23 @@ export default function Dashboard() {
   const load = useCallback(async (): Promise<void> => {
     try {
       setError(null)
-      const [projectsResult, approvalCountResult] = await Promise.allSettled([
+      const [projectsResult, approvalCountResult, summariesResult, watchdogResult] = await Promise.allSettled([
         fetchProjects(),
         fetchPendingApprovalCount(),
+        fetchTaskSummariesSafe(),
+        fetchWatchdogEventsSafe(),
       ])
+
+      // Project ごとに、対応が要る状態を優先して1つの代表状態へ畳む。
+      const summaries = summariesResult.status === 'fulfilled' ? summariesResult.value : []
+      const watchdog = watchdogResult.status === 'fulfilled' ? watchdogResult.value : []
+      const byProject: Record<string, TaskSummary[]> = {}
+      for (const summary of summaries) {
+        (byProject[summary.projectId] ??= []).push(summary)
+      }
+      setHealthByProject(Object.fromEntries(
+        Object.entries(byProject).map(([id, list]) => [id, deriveProjectSummaryState(list, watchdog)]),
+      ))
 
       if (projectsResult.status === 'fulfilled') {
         setProjects(projectsResult.value)
@@ -652,7 +714,12 @@ export default function Dashboard() {
         )}
 
         {projects.map((project) => (
-          <ProjectCard key={project.id} onStarted={load} project={project} />
+          <ProjectCard
+            key={project.id}
+            health={healthByProject[project.id]}
+            onStarted={load}
+            project={project}
+          />
         ))}
       </ScrollView>
 
@@ -727,6 +794,21 @@ const styles = StyleSheet.create({
   approvalText: {
     color: '#f59e0b',
     fontSize: 15,
+    fontWeight: '600',
+  },
+  badgeGroup: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 6,
+  },
+  lifecycleBadge: {
+    borderRadius: 5,
+    borderWidth: 1,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  },
+  lifecycleBadgeText: {
+    fontSize: 10,
     fontWeight: '600',
   },
   badge: {

@@ -1,13 +1,18 @@
-import type { ApprovalRequest, Job, Task, WatchdogEvent } from '@ai-team/shared'
+import type { ApprovalRequest, Job, Task, TaskSummary, WatchdogEvent } from '@ai-team/shared'
 import { describe, expect, it } from 'vitest'
 
 import {
+  allowsProgressActions,
   allowsRoutineRecoveryActions,
   canShowResumeUI,
   deriveJobDisplayState,
   deriveProjectExecutionHealth,
+  deriveProjectSummaryState,
+  deriveSummaryDisplayState,
+  JOB_DISPLAY_STATE_LABEL,
   manualWorkflowIsLocked,
   PROJECT_EXECUTION_HEALTH_LABEL,
+  quarantineGuidanceText,
 } from './taskWorkflow'
 
 function makeJob(overrides: Partial<Job>): Job {
@@ -347,5 +352,89 @@ describe('MOB-001 Project実行健全性', () => {
 
   it('実行signalが無ければ idle（lifecycle statusをそのまま見せてよい）', () => {
     expect(deriveProjectExecutionHealth([task('t1', 'done')], { t1: [] }, [])).toBe('idle')
+  })
+})
+
+/**
+ * MOB-001 CEO実機フィードバック: Dashboard / 一覧 / 詳細で状態表現が一致し、
+ * quarantine 中に作業を進める操作が出ないことを固定する。
+ */
+describe('MOB-001: 一覧・Dashboard の状態導出と action gating', () => {
+  const summary = (over: Partial<TaskSummary>): TaskSummary => ({
+    taskId: 't1', projectId: 'p1', projectName: 'P', title: 'T', description: '',
+    taskStatus: 'pending', displayStatus: 'blocked', updatedAt: '2026-09-08T00:00:00.000Z',
+    approvalSummary: { hasWaitingApproval: false, hasRejectedApproval: false },
+    ...over,
+  } as TaskSummary)
+
+  it('一覧でも quarantine を通常の blocked と区別する', () => {
+    const q = summary({ latestJob: { jobId: 'j1', status: 'blocked', quarantined: true } })
+    const b = summary({ latestJob: { jobId: 'j2', status: 'blocked', quarantined: false } })
+    expect(deriveSummaryDisplayState(q)).toBe('quarantined')
+    expect(deriveSummaryDisplayState(b)).toBe('blocked')
+  })
+
+  it('一覧の承認待ちは approval_waiting になる', () => {
+    const s = summary({
+      latestJob: { jobId: 'j1', status: 'blocked' },
+      approvalSummary: { hasWaitingApproval: true, hasRejectedApproval: false },
+    })
+    expect(deriveSummaryDisplayState(s)).toBe('approval_waiting')
+  })
+
+  it('一覧の stalled も episode key (jobId, startedAt) 一致が条件', () => {
+    const running = summary({
+      latestJob: { jobId: 'j1', status: 'running', startedAt: '2026-09-08T00:00:00.000Z' },
+    })
+    const match = [{ jobId: 'j1', startedAt: '2026-09-08T00:00:00.000Z', isStuck: true, status: 'confirmed' }] as never
+    const otherRun = [{ jobId: 'j1', startedAt: '2026-09-08T09:00:00.000Z', isStuck: true, status: 'confirmed' }] as never
+    expect(deriveSummaryDisplayState(running, match)).toBe('running_stalled')
+    expect(deriveSummaryDisplayState(running, otherRun)).toBe('running_healthy')
+  })
+
+  it('Dashboard は対応が要る状態を優先して代表表示にする', () => {
+    const healthy = summary({ taskId: 'a', latestJob: { jobId: 'ja', status: 'running' } })
+    const quarantined = summary({ taskId: 'b', latestJob: { jobId: 'jb', status: 'blocked', quarantined: true } })
+    // 健全な作業が同居していても、quarantine があれば Dashboard で気付けなければならない
+    expect(deriveProjectSummaryState([healthy, quarantined])).toBe('quarantined')
+    expect(deriveProjectSummaryState([healthy])).toBe('running_healthy')
+  })
+
+  it('quarantine では作業を進める操作を出さない', () => {
+    expect(allowsProgressActions('quarantined')).toBe(false)
+    // ordinary blocked / approval waiting では従来どおり操作を残す
+    expect(allowsProgressActions('blocked')).toBe(true)
+    expect(allowsProgressActions('approval_waiting')).toBe(true)
+    expect(allowsProgressActions('running_healthy')).toBe(true)
+  })
+
+  it('quarantine の案内は CEO に git 操作を求めない', () => {
+    const text = quarantineGuidanceText()
+    expect(text).toContain('安全のため停止しています')
+    expect(text).toContain('承認や再開では解除されません')
+    expect(text).toContain('CEOによる操作は必要ありません')
+    for (const technical of ['git', 'commit', 'worktree', 'reset', 'clean']) {
+      expect(text.toLowerCase()).not.toContain(technical)
+    }
+  })
+
+  it('復旧actorが無い間は「自動復旧中」と誤認させない', () => {
+    // 2026-09-08 調査: quarantine を実際に解消する actor は存在せず、
+    // Worker restart でも本番の dirty workspace は解消しない。
+    // 進行中でない復旧を進行中と表示すると、CEO は待てば直ると誤解する。
+    const text = quarantineGuidanceText()
+    for (const misleading of ['復旧中', '対応中', '進行中']) {
+      expect(text).not.toContain(misleading)
+    }
+    // 誰の担当かは明示する（放置されているように見せない）
+    expect(text).toContain('自動では復旧しません')
+    expect(text).toContain('AI開発チーム側で作業領域の復旧が必要です')
+  })
+
+  it('Dashboard / 一覧 / 詳細でラベルが一致する', () => {
+    expect(JOB_DISPLAY_STATE_LABEL.quarantined).toBe('安全停止中')
+    expect(JOB_DISPLAY_STATE_LABEL.running_stalled).toBe('停滞中')
+    expect(JOB_DISPLAY_STATE_LABEL.approval_waiting).toBe('承認待ち')
+    expect(JOB_DISPLAY_STATE_LABEL.blocked).toBe('停止中')
   })
 })
