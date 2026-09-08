@@ -10,7 +10,8 @@
  *   - isPromptSafe() のパターンマッチ
  */
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
@@ -23,11 +24,13 @@ vi.mock('../execution/runContainedCommand.js', async () => {
 })
 
 const {
+  worktreeContainsNameMock,
   execFileSyncMock,
   buildWorktreeManifestMock,
   saveJobLogsMock,
 } = vi.hoisted(() => ({
   execFileSyncMock: vi.fn(),
+  worktreeContainsNameMock: vi.fn(() => false),
   buildWorktreeManifestMock: vi.fn(),
   saveJobLogsMock: vi.fn(),
 }))
@@ -38,6 +41,10 @@ vi.mock('node:child_process', () => ({
 
 vi.mock('../guards/changeManifest.js', () => ({
   buildWorktreeManifest: buildWorktreeManifestMock,
+  // capture dir がリポジトリ内に現れないことの実測は changeManifest.test.ts 側で
+  // 実 git リポジトリを使って検証する。ここでは workingDir が git repo ではないので
+  // その経路だけスタブし、adapter のオーケストレーションに集中する。
+  worktreeContainsName: worktreeContainsNameMock,
 }))
 
 vi.mock('../jobLogger.js', () => ({
@@ -409,6 +416,159 @@ describe('CodexAdapter --output-last-message structured output', () => {
     if (outputPath === undefined) throw new Error('missing --output-last-message path')
     expect(existsSync(outputPath)).toBe(false)
     expect(buildWorktreeManifestMock).toHaveBeenCalledWith(workingDir)
+  })
+
+  // Regression: the `--output-last-message` capture file used to be created directly inside
+  // `workingDir`, i.e. inside the target repository. It was removed afterwards, but a crash or
+  // SIGKILL between the two left an untracked file behind, and a "read-only" reviewer/generator
+  // that writes into the repo at all cannot honestly claim the repo is untouched.
+  // The assertion is deliberately stronger than "cleaned up afterwards": the repo must be
+  // untouched **during** the run too, which is what a mid-run snapshot checks.
+  // Narrow-verification finding (2026-09-08): the containment probe uses
+  // `git status --ignored`, which descends into ignored trees such as node_modules and inherits
+  // git's timeout and output cap. Running it on every Codex call could fail configurations that
+  // succeed today, so it is verified once per (temp root, repo) per process -- the mount/symlink
+  // layout it checks does not change between calls on a trusted host.
+  it('verifies containment once per process, not on every call', async () => {
+    const workingDir = makeWorkingDir()
+    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+
+    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
+      const args = argv ?? []
+      const out = args[args.indexOf('--output-last-message') + 1]
+      if (out === undefined) throw new Error('missing --output-last-message path')
+      writeFileSync(out, '{"ok":true}', 'utf-8')
+      return 'not json'
+    })
+
+    worktreeContainsNameMock.mockClear()
+    await adapter.run(makeRequest(workingDir))
+    const afterFirst = worktreeContainsNameMock.mock.calls.length
+    await adapter.run(makeRequest(workingDir))
+
+    expect(afterFirst).toBeGreaterThan(0)
+    expect(worktreeContainsNameMock.mock.calls.length).toBe(afterFirst)
+  })
+
+  it('creates the capture file outside workingDir and never writes into the repo', async () => {
+    const workingDir = makeWorkingDir()
+    const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+    let repoContentsDuringRun: string[] | undefined
+    let capturedPath: string | undefined
+
+    execFileSyncMock.mockImplementation((_exe: string, argv: readonly string[] | undefined): string => {
+      const args = argv ?? []
+      capturedPath = args[args.indexOf('--output-last-message') + 1]
+      if (capturedPath === undefined) throw new Error('missing --output-last-message path')
+      writeFileSync(capturedPath, '{"ok":true}', 'utf-8')
+      // Snapshot the target repo at the moment Codex would be running.
+      repoContentsDuringRun = readdirSync(workingDir)
+      return 'not json'
+    })
+
+    const result = await adapter.run(makeRequest(workingDir))
+    expect(result.parsedOutput).toEqual({ ok: true })
+
+    if (capturedPath === undefined) throw new Error('missing --output-last-message path')
+    expect(capturedPath.startsWith(workingDir)).toBe(false)
+    expect(capturedPath.startsWith(os.tmpdir())).toBe(true)
+
+    // not even for an instant
+    expect(repoContentsDuringRun).toEqual([])
+    expect(readdirSync(workingDir)).toEqual([])
+
+    // the dedicated temp directory is cleaned up as well, not just the file
+    expect(existsSync(capturedPath)).toBe(false)
+    expect(existsSync(path.dirname(capturedPath))).toBe(false)
+  })
+
+  // Independent review round 3 (2026-09-08): the previous sibling test could not detect a
+  // return to prefix-based cleanup, because the sibling was never handed to cleanup at all.
+  // This one pins the ownership semantics directly: filePath deliberately points into a
+  // DIFFERENT same-prefixed directory than the one that was created. Cleanup must follow the
+  // directory it created and ignore the file path entirely. A regression to
+  // "derive the directory from filePath and check its prefix" deletes the wrong one and fails.
+  it('removes the directory it created, not the one implied by the file path', async () => {
+    const { cleanupCodexOutputCapture } = await import('./adapter.js')
+
+    const owned = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
+    const notOwned = mkdtempSync(path.join(os.tmpdir(), 'codex-lastmsg-'))
+    writeFileSync(path.join(notOwned, 'someone-elses-run.json'), '{}', 'utf-8')
+
+    // Round-4 hardening: cleanup only removes directories this process actually created,
+    // so a hand-built object is refused outright. Both directories must survive.
+    cleanupCodexOutputCapture({
+      captureDir: owned,
+      filePath: path.join(notOwned, 'capture.json'),
+    })
+
+    expect(existsSync(owned)).toBe(true)
+    expect(existsSync(notOwned)).toBe(true)
+    expect(existsSync(path.join(notOwned, 'someone-elses-run.json'))).toBe(true)
+
+    rmSync(owned, { recursive: true, force: true })
+    rmSync(notOwned, { recursive: true, force: true })
+  })
+
+  // Independent review finding 2 (2026-09-08): `os.tmpdir()` was assumed to be outside the
+  // target repo. With TMPDIR pointing inside it, the capture file lands in the repository and
+  // silently breaks the read-only guarantee. Fail closed instead.
+  // Checkpoint 3: an ordinary symlink alias must be rejected. TMPDIR points at a symlink that
+  // lives outside the repo but resolves into it -- pure string comparison would accept this.
+  it('refuses when TMPDIR is a symlink resolving into the target repo', async () => {
+    const workingDir = makeWorkingDir()
+    const insideRepo = path.join(workingDir, '.inner-tmp')
+    mkdirSync(insideRepo, { recursive: true })
+
+    const linkDir = mkdtempSync(path.join(os.tmpdir(), 'tmplink-'))
+    const link = path.join(linkDir, 'points-inside')
+    try {
+      symlinkSync(insideRepo, link, 'junction')
+    } catch {
+      return // symlink creation not permitted in this environment; covered on POSIX CI
+    }
+
+    const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP }
+    process.env.TMPDIR = link
+    process.env.TEMP = link
+    process.env.TMP = link
+
+    try {
+      const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+      await expect(adapter.run(makeRequest(workingDir))).rejects.toThrow(/OS temp directory/)
+      expect(execFileSyncMock).not.toHaveBeenCalled()
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      rmSync(linkDir, { force: true, recursive: true })
+    }
+  })
+
+  it('refuses to run when the OS temp dir resolves inside the target repo', async () => {
+    const workingDir = makeWorkingDir()
+    const insideRepo = path.join(workingDir, '.tmp')
+    mkdirSync(insideRepo, { recursive: true })
+
+    const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP }
+    process.env.TMPDIR = insideRepo
+    process.env.TEMP = insideRepo
+    process.env.TMP = insideRepo
+
+    try {
+      const adapter = new CodexAdapter({ provider: 'codex', cliPath: 'codex', maxRetries: 2 })
+      await expect(adapter.run(makeRequest(workingDir))).rejects.toThrow(/OS temp directory/)
+      expect(execFileSyncMock).not.toHaveBeenCalled()
+    } finally {
+      // Assigning undefined sets the literal string "undefined"; the var must be deleted instead,
+      // otherwise the next test mkdtemps into a path named "undefined" and fails with ENOENT
+      // (independent review finding, 2026-09-08).
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 
   it('falls back to stdout retry when last-message parsing fails', async () => {
