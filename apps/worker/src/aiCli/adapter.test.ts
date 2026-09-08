@@ -24,11 +24,13 @@ vi.mock('../execution/runContainedCommand.js', async () => {
 })
 
 const {
+  worktreeContainsNameMock,
   execFileSyncMock,
   buildWorktreeManifestMock,
   saveJobLogsMock,
 } = vi.hoisted(() => ({
   execFileSyncMock: vi.fn(),
+  worktreeContainsNameMock: vi.fn(() => false),
   buildWorktreeManifestMock: vi.fn(),
   saveJobLogsMock: vi.fn(),
 }))
@@ -39,6 +41,10 @@ vi.mock('node:child_process', () => ({
 
 vi.mock('../guards/changeManifest.js', () => ({
   buildWorktreeManifest: buildWorktreeManifestMock,
+  // capture dir がリポジトリ内に現れないことの実測は changeManifest.test.ts 側で
+  // 実 git リポジトリを使って検証する。ここでは workingDir が git repo ではないので
+  // その経路だけスタブし、adapter のオーケストレーションに集中する。
+  worktreeContainsName: worktreeContainsNameMock,
 }))
 
 vi.mock('../jobLogger.js', () => ({

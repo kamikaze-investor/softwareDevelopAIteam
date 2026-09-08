@@ -356,6 +356,25 @@ function normalizeObjectId(raw: string | undefined): string | undefined {
   return /^0+$/.test(raw) ? undefined : raw
 }
 
+/**
+ * 指定した名前が対象リポジトリの**作業ツリーに実際に現れるか**を git に訊く。
+ *
+ * 「そのパスはリポジトリの外か」をパス演算で求めることはできない。bind mount の内側からは
+ * 元の親ディレクトリが見えないため、祖先を辿る方式は inode 比較でも必ず外側と誤判定する。
+ * git は作業ツリーを実際に列挙するので、どんな別名経由で内側にあっても検出できる。
+ * `--ignored` を付けるのは `.gitignore` 対象のパスへ mount された場合を取りこぼさないため。
+ *
+ * 判定できなければ `ChangeDetectionError` が伝播する（fail-closed）。
+ */
+export function worktreeContainsName(workingDir: string, needle: string): boolean {
+  assertWorktreeRoot(workingDir)
+
+  return runGit(
+    workingDir,
+    ['status', '--porcelain', '--untracked-files=all', '--ignored'],
+  ).includes(needle)
+}
+
 export function buildWorktreeManifest(workingDir: string): ChangeManifest {
   assertWorktreeRoot(workingDir)
   const raw = runGit(workingDir, ['status', '--porcelain=v2', '-z', '--untracked-files=all'])

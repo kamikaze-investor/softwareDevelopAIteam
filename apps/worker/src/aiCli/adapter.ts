@@ -17,7 +17,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync, existsSync, unlinkSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs'
+import { readFileSync, existsSync, unlinkSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type {
@@ -30,7 +30,7 @@ import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 import { buildTargetCommandEnv } from '../utils/safeEnv.js'
-import { buildWorktreeManifest } from '../guards/changeManifest.js'
+import { buildWorktreeManifest, worktreeContainsName } from '../guards/changeManifest.js'
 import {
   isContainmentInfrastructureError,
   runContainedOrThrow,
@@ -116,6 +116,45 @@ function isInside(child: string, parent: string): boolean {
 }
 
 /**
+ * capture ディレクトリが **対象リポジトリの作業ツリーの中に無いこと** を、
+ * リポジトリ側から実際に確認する。
+ *
+ * パス演算では判定できない。`/workspace/target/.tmp` を `/var/tmp/target-temp` へ
+ * bind mount して `TMPDIR` をそこへ向けると、mount の内側からは元の親ディレクトリが
+ * 見えないため、祖先を辿る方式（inode比較を含む）は必ず「外側」と誤判定する
+ * （独立レビュー指摘、2026-09-08。攻撃者不要、静的な構成だけで再現する）。
+ *
+ * そこで「そのパスは外側か」を計算するのをやめ、**リポジトリに実際に現れるか**を訊く。
+ * capture ディレクトリへ目印ファイルを置き、対象リポジトリ側の `git status` に
+ * それが出るかどうかを見る。git は作業ツリーを実際に列挙するので、
+ * どんな別名・bind mount 経由で内側にあっても検出できる。
+ * `--ignored` を付けるのは、`.gitignore` されたパスへ mount された場合を取りこぼさないため。
+ *
+ * 判定できない場合（gitが無い等）は fail-closed。
+ */
+function assertCaptureDirIsOutsideRepo(captureDir: string, workingDir: string): void {
+  const sentinelName = `.codex-capture-probe-${process.pid}-${randomUUID()}`
+  const sentinelPath = path.join(captureDir, sentinelName)
+
+  writeFileSync(sentinelPath, '', 'utf-8')
+
+  try {
+    if (worktreeContainsName(workingDir, sentinelName)) {
+      throw new Error(
+        `[aiCli] capture directory (${captureDir}) は対象リポジトリ (${workingDir}) の作業ツリー内に`
+        + `現れます（bind mount 等の別名経由）。read-only保証が壊れるため中止します。`,
+      )
+    }
+  } finally {
+    try {
+      unlinkSync(sentinelPath)
+    } catch {
+      // 目印の後始末に失敗しても、capture ディレクトリごと後で消える。
+    }
+  }
+}
+
+/**
  * このプロセスが作った capture ディレクトリの登録簿。
  *
  * cleanup は**ここに登録されたものだけ**を消す。引数の構造だけを信じると、
@@ -169,6 +208,7 @@ function createCodexOutputCapture(request: AiCliRequest): CodexOutputCapture | u
 
   const captureDir = mkdtempSync(path.join(tmpRoot, CAPTURE_DIR_PREFIX))
 
+  // 1) 祖先を辿る判定（symlink等の通常の別名を捕まえる）
   let insideRepo: boolean
   try {
     insideRepo = isInside(captureDir, request.workingDir)
@@ -187,6 +227,16 @@ function createCodexOutputCapture(request: AiCliRequest): CodexOutputCapture | u
       `[aiCli] OS temp directory (${captureDir}) が対象リポジトリ (${request.workingDir}) の内側に`
       + `解決されました。capture fileをリポジトリ内へ書くとread-only保証が壊れるため中止します。`,
     )
+  }
+
+  // 2) リポジトリ側からの実測（bind mount 等、パス演算では見えない別名を捕まえる）
+  try {
+    assertCaptureDirIsOutsideRepo(captureDir, request.workingDir)
+  } catch (err) {
+    rmSync(captureDir, { recursive: true, force: true })
+    throw err instanceof Error
+      ? err
+      : new Error(`[aiCli] capture directory の検証に失敗しました: ${formatErrorMessage(err)}`)
   }
 
   OWNED_CAPTURE_DIRS.add(captureDir)
