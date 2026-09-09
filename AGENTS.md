@@ -176,11 +176,22 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   - 本Policyは暫定運用ルールであり、**新Retry System / watchdog / Routerは実装しない**。
     将来Routerでは `OpenCode dispatch → progress check → bounded retry → degradation →
     model fallback` として自動化対象にする。
-  - **Delegation Wrapper（`scripts/delegate.sh`）**: PLがAIへ委任する際は本wrapperを使い、
-    委任開始と120秒後のreminderを1操作で完了する。reminderは時間経過を知らせるだけであり、
-    進捗判定・retry判断はPLが個別に行う。これは**運用保証であり機械強制ではない**
-    （wrapperを経由せず生のCLIを直接叩けばreminderは付かない）。
-    全AI delegationへの共通化は今後の課題として扱う。
+  - **Delegation Wrapper（`scripts/delegate.sh`）**: 委任の実行主体。detached起動・
+    inactivity/long-tool検知・bounded retry・formal verdict（`AI_TEAM_OS_STATUS:DONE|BLOCKED`）の
+    書き出しを担う。
+  - **正式運用経路は `launchSupervisedDelegation()`（`apps/api/src/supervision/delegationSupervisor.ts`）**
+    （2026-09-08、#110 Step 3）。**supervision無しのbackground launchを正式運用経路で使わない。**
+    この関数は `supervised_runs` の行を**先に**作り、作れなければ委任を起動しない。
+    起動後に spawn が失敗した場合はその場で fail-closed 終端させる。
+    したがって「起動したが誰も見ていない委任」が構造的に作れない
+    （実障害ケース1 = PR #108 の 0 byte 放置が、この不可分化で塞がれる形である）。
+    completion判定は formal verdict であり、**exit 0 + 空出力 / verdict無しは success にならない**。
+    停止時は診断 → bounded recovery → terminal verdict まで自動で進み、
+    終端時に automatic continuation が走る。
+    これは**OS上で生のshell実行を禁止するものではない**（それは要求範囲外）。
+    禁止しているのは、AIteamOSの正式運用経路でsupervision無しの委任を使うことである。
+    詳細な契約は `tasks/roadmap.md` の `roadmap:id=pl-review-process-supervision`
+    （Background Task Supervision Contract C-1〜C-13）を参照。
 
 **Review Level 0〜3:** 変更内容はLevel 0（軽微・Codexのみ）/ Level 1（通常実装・Codex+Gemini postReview）/
 Level 2（中リスク・Claude計画+Gemini pre/postReview、必要ならChatGPT）/ Level 3（高リスク・Claude設計+
