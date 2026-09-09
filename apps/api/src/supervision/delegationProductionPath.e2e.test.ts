@@ -442,7 +442,17 @@ process.exit(0)
 
     it('Case E: recovery 不能 → 無限 RUNNING にせず terminal（recovery_exhausted）で終わる', async () => {
       // verdict を出さないまま生き続ける provider。何度引き取っても完了判定は得られない。
-      const runId = await launchFromSeparateProcess('e2e-case-e', writeFakeProvider('silent'))
+      //
+      // ここで検証したいのは **supervised_runs 側の bounded recovery** である。
+      // delegate-watchdog.sh 自身の inactivity retry（Case B で検証済み）が同時に走ると、
+      // attempt log の切り替えで進捗が観測され run が running へ戻り、段階が乱れる。
+      // watchdog 側の retry がテスト中に発火しないよう inactivity timeout を十分長くして、
+      // 測定対象を1つに絞る。**production の stall policy は変更していない。**
+      const runId = await launchFromSeparateProcess(
+        'e2e-case-e',
+        writeFakeProvider('silent'),
+        { DELEGATION_INACTIVITY_TIMEOUT_SECONDS: '600' },
+      )
       const runDir = runDirFor(runId)
       expect(await waitFor(() => existsSync(path.join(runDir, 'current_log')))).toBe(true)
 
@@ -453,12 +463,19 @@ process.exit(0)
       // reconcile 1回につき状態は1段しか進まないので、単発版を使って段階を数える
       // （running→stalled、stalled→引き取り、を交互に踏む）。
       // 引き取りのたびに lastProgressAt が更新されるため、毎回 fixture 側で過去へ戻す。
-      const maxSteps = (MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS + 2) * 2
+      // 必要なのは (stall + 引き取り) × 上限 + (stall + 打ち切り) = 8 段。
+      // 段数を数え切ることが目的ではないので、余裕を持たせて terminal まで回す。
+      const maxSteps = 40
+      const observedStatuses: string[] = []
       for (let step = 0; step < maxSteps; step++) {
-        if (storage.supervisedRuns.findById(runId)?.status === 'failed') break
+        const current = storage.supervisedRuns.findById(runId)!
+        observedStatuses.push(current.status)
+        if (current.status === 'failed') break
         backdateProgress(runId, BEYOND_STALE)
         await reconcileOnceViaWorkerHttpPath()
       }
+      // 途中で stalled を経由していること（＝ stall 検知経路を実際に通ったこと）。
+      expect(observedStatuses).toContain('stalled')
 
       const run = storage.supervisedRuns.findById(runId)!
       // RUNNING のまま残らないことが要点である。
