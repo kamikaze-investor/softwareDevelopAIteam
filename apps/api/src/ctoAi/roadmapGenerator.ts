@@ -12,6 +12,9 @@
 
 import path from 'node:path'
 import { buildRunnerEnv, executeRunner, type CoordinatorDeps } from '../designReview/designReviewCoordinator.js'
+// sanitizeMessage は Worker 側の既存実装を **import のみ** で再利用する。
+// geminiRouter.ts は CONTROL REPOSITORY（編集禁止）。新しい sanitizer を作らない。
+import { sanitizeMessage } from '@ai-team/worker/src/metaReviewer/geminiRouter.js'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import {
   assertRoadmapTopologySeparated,
@@ -345,8 +348,13 @@ export async function generateRoadmap(
   if (!execution.ok) {
     // Roadmapが得られないことを「空のRoadmap」として下流へ流さない（fail-closed）。
     throw new Error(
-      '[CTO AI] Roadmap生成に失敗しました: ' + (execution.error ?? 'unknown')
-      + (execution.stderr ? ' / ' + execution.stderr : ''),
+      // 生の stderr を message へ載せない。この message は例外として上位へ流れ、
+      // 経路によってはログやプロンプトへ入りうる。Codex CLI の stderr には sandbox 診断・
+      // パス・環境情報が混ざる（独立レビュー指摘、2026-09-10）。
+      // 既存の sanitizeMessage（env値照合 + token shape redact + 長さ上限）を再利用する。
+      '[CTO AI] Roadmap生成に失敗しました: '
+      + sanitizeMessage(execution.error ?? 'unknown')
+      + (execution.stderr ? ' / ' + sanitizeMessage(execution.stderr) : ''),
     )
   }
 
@@ -356,19 +364,42 @@ export async function generateRoadmap(
 // JSONパース + バリデーション
 // ────────────────────────────────────────────────────────────
 
+/**
+ * **モデル出力の内容が使えない**ときだけ投げる。再生成すれば直りうる失敗の目印。
+ *
+ * retry可否をmessageの文字列一致で判定しない。生成経路の例外には、再生成しても直らないもの
+ * （vendor separation違反 / quota / auth / CLI実行失敗 / infrastructure）が混ざっており、
+ * それらをfeedback付きで投げ直すのは「同じ失敗を3回繰り返して原因をぼかす」だけになる。
+ * 構造上の境界＝この型かどうか、で分ける（独立レビュー指摘、2026-09-10）。
+ */
+export class RoadmapContentError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RoadmapContentError'
+  }
+}
+
 export function parseRoadmapJson(raw: string): Roadmap {
   const jsonMatch = raw.match(/```json\n?([\s\S]+?)\n?```/) ??
                     raw.match(/(\{[\s\S]+\})/)
 
   if (!jsonMatch) {
-    throw new Error(`[CTO AI] Roadmap JSONが見つかりません。応答:\n${raw.slice(0, 300)}`)
+    throw new RoadmapContentError(`[CTO AI] Roadmap JSONが見つかりません。応答:\n${raw.slice(0, 300)}`)
   }
 
-  const parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0])
+  // 素の SyntaxError のままだと、生成経路の他の失敗（quota / auth / infra）と区別できない。
+  // これは「モデルが壊れたJSONを出した」であって再生成で直りうる種類の失敗なので型で示す。
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0])
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new RoadmapContentError(`[CTO AI] Roadmap JSONを解析できません: ${detail}`)
+  }
   const result = RoadmapSchema.safeParse(parsed)
 
   if (!result.success) {
-    throw new Error(
+    throw new RoadmapContentError(
       `[CTO AI] Roadmap JSONの構造が不正です:\n${JSON.stringify(result.error.format(), null, 2)}`
     )
   }

@@ -17,7 +17,7 @@ import {
 } from '../storage/roadmapTaskValidation.js'
 import { writeProjectMemory } from './projectMemoryWriter.js'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow.js'
-import { collectTechnicalUncertainties, generateRoadmap, type Roadmap, type RoadmapGeneratorOptions, type TechnicalUncertainty } from './roadmapGenerator.js'
+import { collectTechnicalUncertainties, generateRoadmap, RoadmapContentError, type Roadmap, type RoadmapGeneratorOptions, type TechnicalUncertainty } from './roadmapGenerator.js'
 import { buildSpecTextFromProjectDefinition } from './projectDefinitionAnalysis.js'
 import { composeRoadmapReviewMaterial } from './roadmapReviewMaterial.js'
 import { buildRoadmapMd, writeRoadmap } from './roadmapWriter.js'
@@ -224,17 +224,30 @@ export async function initializeApprovedProject(
     try {
       candidateRoadmap = await generateRoadmap(analysis, { ...options, priorAttemptFeedback })
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error)
+      // **再生成で直りうる失敗だけ** retry する。
+      //
+      // `generateRoadmap()` は内容起因以外でも throw する: vendor separation の fail-closed、
+      // quota / auth / CLI 実行失敗、runner の infrastructure 失敗。それらを feedback 付きで
+      // 投げ直しても直らず、同じ失敗を上限まで繰り返して原因をぼかすだけになる。
+      // rate limit では backoff 無しの連射で状況を悪化させる（独立レビュー指摘、2026-09-10）。
+      //
+      // 判定は **例外の型**で行う。message の文字列一致で分岐すると、文言が変わった時に
+      // 黙って挙動が変わる。
+      if (!(error instanceof RoadmapContentError)) {
+        throw error
+      }
 
       // 上限まで達したら fail-closed。**空のRoadmapや値の丸めで成功扱いにしない。**
       if (attempt === ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS) {
         throw new ProjectInitializationError('ロードマップの生成に失敗しました', 422, {
-          issues: [message],
+          issues: [error.message],
           attempts: attempt,
         })
       }
 
-      priorAttemptFeedback = `Roadmap generation failed and must be corrected: ${message}`
+      // feedback へ載るのは RoadmapContentError の message だけ = モデル自身の出力に関する
+      // 指摘であって、runner の stderr ではない。
+      priorAttemptFeedback = `Roadmap generation failed and must be corrected: ${error.message}`
       continue
     }
     notifyStage('deterministic_validation')

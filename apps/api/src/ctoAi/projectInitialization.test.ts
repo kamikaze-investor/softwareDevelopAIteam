@@ -5,6 +5,7 @@ import path from 'node:path'
 import type { Project } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
+import { RoadmapContentError } from './roadmapGenerator.js'
 import type { IStorage, RoadmapSyncResult } from '../storage/interface'
 import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow.js'
 import {
@@ -297,7 +298,7 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
   it('生成がschema不正で失敗しても、feedback付きで再生成して継続する', async () => {
     const project = createProject(storage)
     roadmapGeneratorMocks.generateRoadmap
-      .mockRejectedValueOnce(new Error('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
+      .mockRejectedValueOnce(new RoadmapContentError('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
       .mockResolvedValue(ROADMAP)
 
     await initializeApprovedProject(storage, project, tmpDir, {
@@ -316,7 +317,7 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
   it('全attemptで生成が失敗したら上限で停止し、Tasksは0のまま（空Roadmapで成功扱いしない）', async () => {
     const project = createProject(storage)
     roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(
-      new Error('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
+      new RoadmapContentError('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
 
     await expect(initializeApprovedProject(storage, project, tmpDir, {
       analysis: ANALYSIS,
@@ -326,6 +327,37 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
 
     expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS)
     expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+  })
+
+  // 再生成で直らない失敗まで retry すると、同じ失敗を上限まで繰り返して原因をぼかし、
+  // rate limit では連射で悪化させる。attempt を消費させないことを型で固定する。
+  it('provider失敗（quota/auth/CLI/infra）はregeneration attemptを消費せず即座に伝播する', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(
+      new Error('[CTO AI] Roadmap生成に失敗しました: You have hit your usage limit'))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow(/usage limit/)
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
+    expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+  })
+
+  it('vendor separationのfail-closedは再生成せずそのまま失敗する', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(
+      new Error('[reviewSeparation] Roadmap生成者と最終レビュアーが同一vendorです'))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow(/同一vendor/)
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
   })
 
   it('valid Roadmapなら余計な再生成をしない', async () => {
