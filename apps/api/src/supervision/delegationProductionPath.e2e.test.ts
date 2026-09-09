@@ -33,7 +33,6 @@ import Database from 'better-sqlite3'
 import { resetPredicateRegistryForTest, SUPERVISED_RUN_STALE_THRESHOLD_MS } from '@ai-team/shared'
 import { createSQLiteStorage, MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { reconcileSupervisedDelegations } from './reconcile'
 import { supervisedRunRoutes } from '../routes/supervisedRuns'
 import { setDelegationContinuation } from './delegationSupervisor'
 import { resetAiDelegationPredicateRegistrationForTest } from './aiDelegationPredicate'
@@ -55,6 +54,13 @@ const REPO_ROOT = path.resolve(process.cwd(), '../..')
 const BASH_AVAILABLE = spawnSync('bash', ['-c', 'echo ok'], { encoding: 'utf-8' }).stdout?.trim() === 'ok'
 const CAN_RUN_E2E = BASH_AVAILABLE && process.platform !== 'win32'
 
+/**
+ * Worker module が module scope で1度だけ読む API_BASE_URL に合わせるための固定 port。
+ * テストごとに別 port へ bind すると、cache された Worker module は最初の port を
+ * 使い続けてしまう（実測: Case E が reconcile されず running のまま 40 回観測された）。
+ */
+const TEST_API_PORT = Number(process.env.E2E_API_PORT ?? 39517)
+
 async function waitFor(check: () => boolean, timeoutMs = 40_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -70,6 +76,7 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
   let runRoot: string
   let storage: IStorage
   let previousRunRoot: string | undefined
+  let previousApiBase: string | undefined
 
   beforeEach(() => {
     resetPredicateRegistryForTest()
@@ -81,6 +88,9 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
     runRoot = path.join(sandbox, 'runs')
     previousRunRoot = process.env.SUPERVISED_RUN_ROOT
     process.env.SUPERVISED_RUN_ROOT = runRoot
+    // Worker module が読む前に確定させる（module scope で一度きり読まれるため）。
+    previousApiBase = process.env.API_BASE_URL
+    process.env.API_BASE_URL = `http://127.0.0.1:${TEST_API_PORT}`
 
     storage = createSQLiteStorage(dbPath)
   })
@@ -88,6 +98,8 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
   afterEach(() => {
     if (previousRunRoot === undefined) delete process.env.SUPERVISED_RUN_ROOT
     else process.env.SUPERVISED_RUN_ROOT = previousRunRoot
+    if (previousApiBase === undefined) delete process.env.API_BASE_URL
+    else process.env.API_BASE_URL = previousApiBase
     resetPredicateRegistryForTest()
     resetAiDelegationPredicateRegistrationForTest()
     setDelegationContinuation(undefined)
@@ -130,65 +142,32 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
    * `app.inject()` は HTTP hop を飛ばすので使わない。
    */
   /**
-   * Worker → HTTP → route → reconcile を **1回だけ** 起こす。
+   * Worker → HTTP → route → reconcile を **1回だけ** 起こす。これが唯一の駆動経路である。
    *
-   * `reconcileViaWorkerHttpPath()` は確認用にもう1回 route を叩くため、1呼び出しで
-   * 状態が2段進む。stall → recovery → stall … と段階を数えたい場合はこちらを使う。
+   * **固定 port を使う理由**: Worker 側は `API_BASE = process.env.API_BASE_URL ?? ...` を
+   * **module scope で1度だけ**読む（`apps/worker/src/index.ts:34`）。dynamic import は
+   * cache されるため、port 0 で毎回別 port に bind すると、2 テスト目以降の Worker 呼び出しは
+   * **最初のテストの死んだ port** へ POST してしまい、reconcile が一切起きない。
+   * 実際これで Case E が「40回とも running のまま」になっていた。
+   *
+   * また、以前ここには確認用の `fetch` を1本足していたが、それが**本当の駆動源**に
+   * なってしまい Worker hop の不達を隠していた。確認用の呼び出しは廃止し、
+   * 結果は DB を直接読んで検証する。
    */
   async function reconcileOnceViaWorkerHttpPath(): Promise<void> {
     const app = Fastify()
     ;(app as unknown as { storageOverride?: IStorage }).storageOverride = storage
     app.register(supervisedRunRoutes, { prefix: '/api' })
-    await app.listen({ port: 0, host: '127.0.0.1' })
-
-    const address = app.server.address()
-    if (address === null || typeof address === 'string') throw new Error('failed to bind the test API')
+    await app.listen({ port: TEST_API_PORT, host: '127.0.0.1' })
 
     try {
-      process.env.API_BASE_URL = `http://127.0.0.1:${address.port}`
       const workerModule = await import(
         pathToFileURL(path.join(REPO_ROOT, 'apps/worker/src/index.ts')).href
       ) as { reconcileSupervisedRuns: () => Promise<void> }
       await workerModule.reconcileSupervisedRuns()
     } finally {
-      delete process.env.API_BASE_URL
       await app.close()
     }
-  }
-
-  async function reconcileViaWorkerHttpPath(): Promise<{ terminal: number; observed: number }> {
-    const app = Fastify()
-    ;(app as unknown as { storageOverride?: IStorage }).storageOverride = storage
-    app.register(supervisedRunRoutes, { prefix: '/api' })
-    await app.listen({ port: 0, host: '127.0.0.1' })
-
-    const address = app.server.address()
-    if (address === null || typeof address === 'string') throw new Error('failed to bind the test API')
-    const baseUrl = `http://127.0.0.1:${address.port}`
-
-    // route が実際に何を返したかを取れるよう、同じ HTTP 呼び出しを観測用にも1本通す。
-    const observed: { terminal: number; observed: number } = { terminal: 0, observed: 0 }
-    try {
-      process.env.API_BASE_URL = baseUrl
-      // Worker 側の実装を、その module が読む API_BASE_URL 込みで読み込む。
-      const workerModule = await import(
-        pathToFileURL(path.join(REPO_ROOT, 'apps/worker/src/index.ts')).href
-      ) as { reconcileSupervisedRuns: () => Promise<void> }
-
-      await workerModule.reconcileSupervisedRuns()
-
-      // Worker 側は結果を返さない（fire-and-forget）ため、同じ route をもう一度叩いて
-      // 「もう active な run が無い」ことを確認する。1回目で terminal 化されていれば observed=0 になる。
-      const confirm = await fetch(`${baseUrl}/api/supervised-runs/reconcile`, { method: 'POST' })
-      const body = await confirm.json() as { observed: number }
-      observed.observed = body.observed
-      // 1回目（Worker 経由）で終端していれば、2回目には見えるものが無い。
-      observed.terminal = body.observed === 0 ? 1 : 0
-    } finally {
-      delete process.env.API_BASE_URL
-      await app.close()
-    }
-    return observed
   }
 
   /**
@@ -290,8 +269,8 @@ process.exit(0)
       continuations.push({ terminal, verdict: terminalVerdict })
     })
 
-    const summary = await reconcileViaWorkerHttpPath()
-    expect(summary.terminal).toBe(1)
+    // 駆動源は Worker → HTTP → route の1本だけ。結果は DB を直接読んで確かめる。
+    await reconcileOnceViaWorkerHttpPath()
 
     const finished = storage.supervisedRuns.findById(runId)!
     expect(finished.status).toBe('succeeded')
@@ -302,8 +281,8 @@ process.exit(0)
     expect(continuations).toEqual([{ terminal: 'succeeded', verdict: 'COMPLETED' }])
 
     // reconcile を再度回しても二重終端・二重continuationにならない。
-    const second = await reconcileSupervisedDelegations(storage)
-    expect(second.observed).toBe(0)
+    await reconcileOnceViaWorkerHttpPath()
+    expect(storage.supervisedRuns.findById(runId)?.status).toBe('succeeded')
     expect(continuations).toHaveLength(1)
   }, 90_000)
 
@@ -315,7 +294,7 @@ process.exit(0)
     expect(await waitFor(() => existsSync(path.join(runDir, 'current_log')))).toBe(true)
     expect(existsSync(path.join(runDir, 'verdict'))).toBe(false)
 
-    await reconcileSupervisedDelegations(storage)
+    await reconcileOnceViaWorkerHttpPath()
 
     const run = storage.supervisedRuns.findById(runId)!
     // 終端していないこと。stalled になるのは kind の閾値を超えてからである。
@@ -339,12 +318,12 @@ process.exit(0)
       expect(existsSync(path.join(runDir, 'verdict'))).toBe(false)
 
       // 閾値未満では stalled にしない（健全な run を奪わない）。
-      await reconcileViaWorkerHttpPath()
+      await reconcileOnceViaWorkerHttpPath()
       expect(storage.supervisedRuns.findById(runId)?.status).toBe('running')
 
       // 閾値を超えた無出力を作ってから、同じ経路で reconcile する。
       backdateProgress(runId, BEYOND_STALE)
-      await reconcileViaWorkerHttpPath()
+      await reconcileOnceViaWorkerHttpPath()
 
       const run = storage.supervisedRuns.findById(runId)!
       expect(run.status).toBe('stalled')
@@ -372,7 +351,7 @@ process.exit(0)
       const continuations: string[] = []
       setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
 
-      await reconcileViaWorkerHttpPath()
+      await reconcileOnceViaWorkerHttpPath()
 
       const run = storage.supervisedRuns.findById(runId)!
       expect(run.status).toBe('failed')
@@ -394,7 +373,7 @@ process.exit(0)
       expect(existsSync(path.join(runDir, 'verdict'))).toBe(false)
 
       backdateProgress(runId, BEYOND_STALE)
-      await reconcileViaWorkerHttpPath()
+      await reconcileOnceViaWorkerHttpPath()
       expect(storage.supervisedRuns.findById(runId)?.status).toBe('stalled')
       return runId
     }
@@ -411,7 +390,7 @@ process.exit(0)
       setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
 
       // reconcile は stalled を blind retry せず、まず completion predicate を再評価する。
-      await reconcileViaWorkerHttpPath()
+      await reconcileOnceViaWorkerHttpPath()
 
       const run = storage.supervisedRuns.findById(runId)!
       expect(run.status).toBe('succeeded')
@@ -428,7 +407,7 @@ process.exit(0)
       const continuations: string[] = []
       setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
 
-      await reconcileViaWorkerHttpPath()
+      await reconcileOnceViaWorkerHttpPath()
 
       const run = storage.supervisedRuns.findById(runId)!
       // recovery が bounded に所有権を取り直したことが記録に残る（C-9: recovery actor が実在する）。
