@@ -2531,6 +2531,40 @@ MOB-001 は CEO 実機確認で UX defect を検出し #117 で修正。
 production に作らない方針のため）。将来自然な quarantine が発生した時点で
 operational observation として確認する。
 
+**CEO 実機再確認（2026-09-09〜10）— MOB-001 の残 2 項目**:
+
+- **approval waiting**: `UNVERIFIED — no naturally pending approval available`。
+  確認時点で自然発生した approval 待ち Job が 0 件のため未実施。quarantine UI と同じ扱いで
+  P1 completion の blocker とはしない（人工的な approval を production に作らない方針）。
+
+- **failure explanation / AI question**: `FAIL — API refused before the AI call` → **#130 で修正**。
+  「実行失敗の説明」「AIに質問する」の両方が AI 障害の文言を返していたが、production log で
+  **AI が一度も呼ばれていなかった**ことが判明した。CEO の 3 リクエスト（Task `11066c6f`）は
+  いずれも HTTP 200 / 4.7ms・44.7ms・5.5ms で完了し `level:40` warn は 0 件。provider を実コードで
+  直接叩いた実測は 1 回 66〜74 秒なので、5ms は AI 呼び出し前の早期 return を意味する。
+
+  原因は Mobile と API の表示述語の乖離。Mobile (`[id].tsx:725`) は
+  `failed || blocked || task.blocked`、API (`tasks.ts:192`) は `failed || task.blocked` で、
+  `blocked` が欠けていた。**Job が blocked でも Task は `pending` に留まる**ため、
+  この状態の Task（production 上 3 件: `11066c6f` / `94c42709` / `d7a654be`）では
+  Mobile が説明セクションを表示するのに API が「対象なし」を返していた。
+
+  元実装 `4ad0fb6` では両者は一致していた。`d8bcf0c`（#124）で **Mobile 側だけを広げた
+  regression** であり、MOB-001 自身の責務内。既存 AI provider / router の障害ではない
+  （quota・auth・timeout・parse failure・missing record のいずれでもない）。
+
+  修正は共通経路 1 点。API 側で既存 `isTaskFailureJob()` を `shouldExplain` にも共有させ、
+  両サイトが二度と別々に書かれないようにした。あわせて Mobile が `result.error` /
+  `answer.error` をそのまま表示するようにし、AI 以外の原因（対象 Job なし・通信エラー）を
+  AI 障害として誤報しないようにした。この誤報が診断を困難にしていた二次欠陥である。
+
+**派生 Finding（本 PR では修正しない・別扱いで open）**:
+`cheapAiClient` の実測レイテンシが 1 回 66〜74 秒で、`CHEAP_AI_CONFIG.timeoutMs = 60_000` を
+超えているのに 2 回の probe が成功した（`spawn({ timeout })` が子を終了させていない）。
+述語修正後は実際に AI 生成が走るようになるため表面化する。60s 設定値と Cloudflare の
+100s 上限の両方に近いことも含め、`containment-success-path-observability` とは別の
+`cheap-ai-latency-and-timeout-contract` として扱う。
+
 ### P1 完了時点の production 実測
 API health 200 / API・Worker とも active・NRestarts=0 / production tree clean /
 `/workspace/target` clean / running Job 0 / quarantined Job 0 /
@@ -2547,6 +2581,7 @@ DB `integrity_check` ok / Worker エラーログ 0。
 - Meta Reviewer robustness（`meta-review-structured-output-robustness`）
 - background-task supervision
 - legacy `API_TOKEN` → ADMIN / WORKER split credential migration
+- cheap AI（説明・質問経路）の latency と timeout 契約（`cheap-ai-latency-and-timeout-contract`）
 
 
 ### 次に着手すべき root-cause cluster（P1 完了時点の handoff・2026-09-08）
