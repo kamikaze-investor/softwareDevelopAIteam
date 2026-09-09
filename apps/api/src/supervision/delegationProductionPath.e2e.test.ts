@@ -129,6 +129,33 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
    * 本物の Fastify を listen させ、Worker 側の関数を `API_BASE_URL` 付きで動的 import する。
    * `app.inject()` は HTTP hop を飛ばすので使わない。
    */
+  /**
+   * Worker → HTTP → route → reconcile を **1回だけ** 起こす。
+   *
+   * `reconcileViaWorkerHttpPath()` は確認用にもう1回 route を叩くため、1呼び出しで
+   * 状態が2段進む。stall → recovery → stall … と段階を数えたい場合はこちらを使う。
+   */
+  async function reconcileOnceViaWorkerHttpPath(): Promise<void> {
+    const app = Fastify()
+    ;(app as unknown as { storageOverride?: IStorage }).storageOverride = storage
+    app.register(supervisedRunRoutes, { prefix: '/api' })
+    await app.listen({ port: 0, host: '127.0.0.1' })
+
+    const address = app.server.address()
+    if (address === null || typeof address === 'string') throw new Error('failed to bind the test API')
+
+    try {
+      process.env.API_BASE_URL = `http://127.0.0.1:${address.port}`
+      const workerModule = await import(
+        pathToFileURL(path.join(REPO_ROOT, 'apps/worker/src/index.ts')).href
+      ) as { reconcileSupervisedRuns: () => Promise<void> }
+      await workerModule.reconcileSupervisedRuns()
+    } finally {
+      delete process.env.API_BASE_URL
+      await app.close()
+    }
+  }
+
   async function reconcileViaWorkerHttpPath(): Promise<{ terminal: number; observed: number }> {
     const app = Fastify()
     ;(app as unknown as { storageOverride?: IStorage }).storageOverride = storage
@@ -422,12 +449,15 @@ process.exit(0)
       const continuations: string[] = []
       setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
 
-      // 「無出力 → stalled → 引き取り → やはり無出力」を上限まで繰り返す。
-      // 引き取りのたびに lastProgressAt が更新されるので、そのつど fixture 側で過去へ戻す。
-      for (let cycle = 0; cycle < MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS + 2; cycle++) {
+      // 「無出力 → stalled → 引き取り → やはり無出力」を上限に達するまで繰り返す。
+      // reconcile 1回につき状態は1段しか進まないので、単発版を使って段階を数える
+      // （running→stalled、stalled→引き取り、を交互に踏む）。
+      // 引き取りのたびに lastProgressAt が更新されるため、毎回 fixture 側で過去へ戻す。
+      const maxSteps = (MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS + 2) * 2
+      for (let step = 0; step < maxSteps; step++) {
         if (storage.supervisedRuns.findById(runId)?.status === 'failed') break
         backdateProgress(runId, BEYOND_STALE)
-        await reconcileViaWorkerHttpPath()
+        await reconcileOnceViaWorkerHttpPath()
       }
 
       const run = storage.supervisedRuns.findById(runId)!
