@@ -271,7 +271,8 @@ async function fetchTaskFailureExplanation(
     }
     return (await response.json()) as TaskFailureExplanationResponse
   } catch {
-    return { ok: false, error: 'AIによる分析を生成できませんでした' }
+    // 通信・HTTP失敗をAI障害と誤って報告しない（原因の取り違えを表示に出さない）。
+    return { ok: false, error: '分析の取得に失敗しました（API通信エラー）' }
   }
 }
 
@@ -294,7 +295,7 @@ async function askTaskFailureQuestion(
     }
     return (await response.json()) as TaskFailureQuestionResponse
   } catch {
-    return { ok: false, error: 'AIから回答を取得できませんでした' }
+    return { ok: false, error: '回答の取得に失敗しました（API通信エラー）' }
   }
 }
 
@@ -779,7 +780,8 @@ function TaskFailureExplanationSection({
     const answer = await askTaskFailureQuestion(task.id, trimmedQuestion, turns)
     setQuestionLoading(false)
     if (!answer.ok) {
-      setQuestionError('AIから回答を取得できませんでした')
+      // APIが返した理由をそのまま出す。AI以外の原因をAI障害として表示しない。
+      setQuestionError(answer.error)
       return
     }
 
@@ -815,7 +817,10 @@ function TaskFailureExplanationSection({
         {result !== null && !result.ok && (
           <View style={styles.failureAiErrorBox}>
             <Text style={styles.failureAiErrorText}>
-              AIによる分析を取得できませんでした。Task情報・Job履歴・再開機能は引き続き利用できます。
+              {result.error}
+            </Text>
+            <Text style={styles.failureAiErrorText}>
+              Task情報・Job履歴・再開機能は引き続き利用できます。
             </Text>
           </View>
         )}

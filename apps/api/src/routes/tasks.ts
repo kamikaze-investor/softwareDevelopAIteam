@@ -189,7 +189,12 @@ export async function taskRoutes(
   function resolveTaskFailureAiContext(task: Task): TaskFailureAiContext | null {
     const jobs = storage.jobs.findByTaskId(task.id)
     const latestJob = jobs[0]
-    const shouldExplain = latestJob?.status === 'failed' || task.status === 'blocked'
+    // Mobile 側の表示条件（[id].tsx の shouldShow）と同一の述語であること。
+    // 以前ここだけ `failed` のままで Mobile が `blocked` も表示するよう広がったため、
+    // 「説明が表示されるのに API が対象なしを返す」乖離が起きた。既存の
+    // isTaskFailureJob() を共有して二度と別々に書かないようにする。
+    const shouldExplain = (latestJob !== undefined && isTaskFailureJob(latestJob))
+      || task.status === 'blocked'
     if (!shouldExplain) return null
 
     const targetJob = jobs.find(isTaskFailureJob)
