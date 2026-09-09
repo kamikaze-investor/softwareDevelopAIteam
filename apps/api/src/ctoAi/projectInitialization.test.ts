@@ -290,6 +290,57 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
     vi.useRealTimers()
   })
 
+  // Production E2E（2026-09-09）で実際に踏んだ失敗を固定する。
+  // Codexが `estimatedWeeks` を小数で返し、Zodが弾き、`parseRoadmapJson()` が throw。
+  // その例外は bounded regeneration loop の外へ抜けていたため、retryが3回残っているのに
+  // 1度も使われないまま Project start が BLOCKED になった。
+  it('生成がschema不正で失敗しても、feedback付きで再生成して継続する', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap
+      .mockRejectedValueOnce(new Error('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
+      .mockResolvedValue(ROADMAP)
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(2)
+    // 2回目には「何が不正だったか」が渡ること。推測で直させない。
+    const secondCall = roadmapGeneratorMocks.generateRoadmap.mock.calls[1]?.[1] as { priorAttemptFeedback?: string }
+    expect(secondCall?.priorAttemptFeedback).toContain('estimatedWeeks')
+    expect(storage.tasks.findByProjectId(project.id).length).toBeGreaterThan(0)
+  })
+
+  it('全attemptで生成が失敗したら上限で停止し、Tasksは0のまま（空Roadmapで成功扱いしない）', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(
+      new Error('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow(/ロードマップの生成に失敗しました/)
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS)
+    expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+  })
+
+  it('valid Roadmapなら余計な再生成をしない', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockResolvedValue(ROADMAP)
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
+  })
+
   it('stores ALIGNED roadmap evidence before syncing any Task rows', async () => {
     const project = createProject(storage)
     const events: string[] = []

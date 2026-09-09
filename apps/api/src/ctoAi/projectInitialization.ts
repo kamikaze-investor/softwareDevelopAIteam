@@ -213,7 +213,30 @@ export async function initializeApprovedProject(
 
   for (let attempt = 1; attempt <= ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS; attempt += 1) {
     notifyStage(attempt === 1 ? 'roadmap_generation' : 'roadmap_regeneration')
-    const candidateRoadmap = await generateRoadmap(analysis, { ...options, priorAttemptFeedback })
+    // 生成そのものの失敗（Roadmap JSONがschemaに合わない等）も、deterministic validation失敗と
+    // 同じ**既存の**bounded regeneration loopで扱う。以前はここで例外がloopを素通りし、
+    // 1フィールドの型違い（実測: `estimatedWeeks` がfloat）だけでProject startが即BLOCKEDに
+    // なっていた — retry上限が3回残っているのに1度も使われないまま停止していた。
+    //
+    // 新しいretry機構は作らない。エラー本文をそのまま`priorAttemptFeedback`へ載せ、
+    // 次の生成へ「何が不正だったか」を伝えるだけ。
+    let candidateRoadmap: Roadmap
+    try {
+      candidateRoadmap = await generateRoadmap(analysis, { ...options, priorAttemptFeedback })
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+
+      // 上限まで達したら fail-closed。**空のRoadmapや値の丸めで成功扱いにしない。**
+      if (attempt === ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS) {
+        throw new ProjectInitializationError('ロードマップの生成に失敗しました', 422, {
+          issues: [message],
+          attempts: attempt,
+        })
+      }
+
+      priorAttemptFeedback = `Roadmap generation failed and must be corrected: ${message}`
+      continue
+    }
     notifyStage('deterministic_validation')
     const candidateTasks = buildRoadmapTasks(candidateRoadmap, technicalUncertainties)
     const candidatePhases = buildRoadmapPhases(candidateRoadmap)
