@@ -29,8 +29,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync
 import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { resetPredicateRegistryForTest } from '@ai-team/shared'
-import { createSQLiteStorage } from '../storage/sqlite'
+import Database from 'better-sqlite3'
+import { resetPredicateRegistryForTest, SUPERVISED_RUN_STALE_THRESHOLD_MS } from '@ai-team/shared'
+import { createSQLiteStorage, MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { reconcileSupervisedDelegations } from './reconcile'
 import { supervisedRunRoutes } from '../routes/supervisedRuns'
@@ -97,12 +98,26 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
    * 委任先 CLI の代役。`delegate.sh` は `$DELEGATION_OPENCODE_BIN run ...` として起動するので、
    * ファイル名に "opencode" を含めて `delegate-watchdog.sh` の PID 判定にも合わせる。
    */
-  function writeFakeProvider(behaviour: 'done' | 'silent'): string {
-    const bin = path.join(sandbox, 'fake-opencode')
-    const body = behaviour === 'done'
-      ? `#!/usr/bin/env bash\necho "working on it"\nsleep 1\necho "AI_TEAM_OS_STATUS:DONE"\n`
-      : `#!/usr/bin/env bash\nsleep 120\n`
-    writeFileSync(bin, body)
+  type ProviderBehaviour = 'done' | 'silent' | 'vanish' | 'done-then-linger' | 'late-done'
+
+  function writeFakeProvider(behaviour: ProviderBehaviour): string {
+    // 振る舞いごとに別ファイルにする（同一 sandbox で複数 provider を使い分けるため）。
+    const bin = path.join(sandbox, `fake-opencode-${behaviour}`)
+    const bodies: Record<ProviderBehaviour, string> = {
+      // 出力し DONE marker を出して終了する。
+      done: '#!/usr/bin/env bash\necho "working on it"\nsleep 1\necho "AI_TEAM_OS_STATUS:DONE"\n',
+      // 何も出さずに生き続ける。PID は alive だが進捗はゼロ（Case A / E）。
+      silent: '#!/usr/bin/env bash\nsleep 300\n',
+      // marker を出さず即消える。delegate-watchdog.sh の bounded retry を実際に踏ませる（Case B）。
+      vanish: '#!/usr/bin/env bash\nexit 0\n',
+      // 実処理は完了しているのに wrapper が残り続ける（Case C / D）。
+      'done-then-linger': '#!/usr/bin/env bash\necho "AI_TEAM_OS_STATUS:DONE"\nsleep 300\n',
+      // しばらく無出力のあとで DONE を出し、その後も残り続ける。
+      // 「先に stalled と判定され、あとから完了が判明する」という Case C / D の順序を
+      // 実際の stall 判定経路で作るために使う（inactivity timeout 15s より短く出す）。
+      'late-done': '#!/usr/bin/env bash\nsleep 8\necho "AI_TEAM_OS_STATUS:DONE"\nsleep 300\n',
+    }
+    writeFileSync(bin, bodies[behaviour])
     chmodSync(bin, 0o755)
     return bin
   }
@@ -149,8 +164,32 @@ describe.skipIf(!CAN_RUN_E2E)('supervised delegation — production path E2E', (
     return observed
   }
 
+  /**
+   * fixture 側で「無出力時間が経過した」状況を作る。
+   *
+   * **production の stall policy は弱めない**（`SUPERVISED_RUN_STALE_THRESHOLD_MS` は本番値のまま）。
+   * 閾値を下げる代わりに `last_progress_at` を十分過去へ戻し、
+   * 実際の reconcile / stall 判定経路をそのまま駆動する。
+   */
+  function backdateProgress(runId: string, msAgo: number): void {
+    const db = new Database(dbPath)
+    try {
+      db.prepare('UPDATE supervised_runs SET last_progress_at = ? WHERE id = ?')
+        .run(new Date(Date.now() - msAgo).toISOString(), runId)
+    } finally {
+      db.close()
+    }
+  }
+
+  /** 閾値を確実に超える経過時間。 */
+  const BEYOND_STALE = SUPERVISED_RUN_STALE_THRESHOLD_MS.ai_delegation + 60_000
+
   /** launcher を**別プロセス**として起動し、終了を待つ。戻り値は runId。 */
-  async function launchFromSeparateProcess(subjectId: string, providerBin: string): Promise<string> {
+  async function launchFromSeparateProcess(
+    subjectId: string,
+    providerBin: string,
+    extraEnv: Record<string, string> = {},
+  ): Promise<string> {
     const launcherScript = path.join(sandbox, 'launcher.mts')
     const outFile = path.join(sandbox, 'launcher-out.json')
 
@@ -180,6 +219,7 @@ process.exit(0)
         // watchdog を短周期にして E2E を現実的な時間に収める。
         DELEGATION_POLL_INTERVAL_SECONDS: '1',
         DELEGATION_INACTIVITY_TIMEOUT_SECONDS: '15',
+        ...extraEnv,
       },
     })
 
@@ -255,4 +295,147 @@ process.exit(0)
     expect(['running', 'stalled']).toContain(run.status)
     expect(run.completedAt).toBeUndefined()
   }, 90_000)
+
+  /**
+   * Acceptance Case A〜E を**実 production 経路**で確認する。
+   *
+   * 経路はすべて launchSupervisedDelegation → delegate.sh → delegate-watchdog.sh →
+   * trusted runDir → Worker poll の reconcileSupervisedRuns() → HTTP → route → reconcile。
+   * Worker 側に retry actor は足していない（retry は delegate-watchdog.sh のみ）。
+   */
+  describe('Acceptance A〜E（実 production 経路）', () => {
+    it('Case A: process は生きているが進捗が無い → stalled を検知する', async () => {
+      // 無出力のまま生き続ける provider。PID は生きているので「PID alive = healthy」なら見逃す。
+      const runId = await launchFromSeparateProcess('e2e-case-a', writeFakeProvider('silent'))
+      const runDir = runDirFor(runId)
+      expect(await waitFor(() => existsSync(path.join(runDir, 'current_log')))).toBe(true)
+      expect(existsSync(path.join(runDir, 'verdict'))).toBe(false)
+
+      // 閾値未満では stalled にしない（健全な run を奪わない）。
+      await reconcileViaWorkerHttpPath()
+      expect(storage.supervisedRuns.findById(runId)?.status).toBe('running')
+
+      // 閾値を超えた無出力を作ってから、同じ経路で reconcile する。
+      backdateProgress(runId, BEYOND_STALE)
+      await reconcileViaWorkerHttpPath()
+
+      const run = storage.supervisedRuns.findById(runId)!
+      expect(run.status).toBe('stalled')
+      expect(run.error).toMatch(/no progress and no verdict/)
+    }, 120_000)
+
+    it('Case B: provider が消滅 → delegate-watchdog の bounded retry を経て failed で終端する', async () => {
+      // 即座に消える provider。retry は **delegate-watchdog.sh が行う**（Worker 側では retry しない）。
+      const runId = await launchFromSeparateProcess(
+        'e2e-case-b',
+        writeFakeProvider('vanish'),
+        { DELEGATION_MAX_RECOVERY_RETRIES: '1' },
+      )
+      const runDir = runDirFor(runId)
+
+      // watchdog が bounded retry を使い切り、formal verdict を書くところまで実際に走らせる。
+      const verdictPath = path.join(runDir, 'verdict')
+      expect(await waitFor(() => existsSync(verdictPath))).toBe(true)
+      expect(readFileSync(verdictPath, 'utf-8').trim()).toBe('ESCALATE:recovery_exhausted')
+
+      // watchdog が実際に retry したことを確認する（retry actor は watchdog 側だけ）。
+      const attempts = Number(readFileSync(path.join(runDir, 'recovery_attempt_count'), 'utf-8').trim())
+      expect(attempts).toBeGreaterThanOrEqual(1)
+
+      const continuations: string[] = []
+      setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
+
+      await reconcileViaWorkerHttpPath()
+
+      const run = storage.supervisedRuns.findById(runId)!
+      expect(run.status).toBe('failed')
+      expect(run.terminalVerdict).toBe('ESCALATE:recovery_exhausted')
+      expect(run.completedAt).toBeTruthy()
+      expect(continuations).toEqual(['ESCALATE:recovery_exhausted'])
+    }, 120_000)
+
+    /**
+     * 「まだ verdict が無い段階で stalled と判定させ、その後に完了が判明する」順序を
+     * **実際の stall 判定経路で**作る。status を直接書き換えるとその経路を迂回してしまうため、
+     * backdate → reconcile で reconcile 自身に stalled を立てさせる。
+     */
+    async function driveToStalledBeforeCompletion(subjectId: string): Promise<string> {
+      const runId = await launchFromSeparateProcess(subjectId, writeFakeProvider('late-done'))
+      const runDir = runDirFor(runId)
+      expect(await waitFor(() => existsSync(path.join(runDir, 'current_log')))).toBe(true)
+      // まだ DONE は出ていない（provider は 8 秒待つ）。
+      expect(existsSync(path.join(runDir, 'verdict'))).toBe(false)
+
+      backdateProgress(runId, BEYOND_STALE)
+      await reconcileViaWorkerHttpPath()
+      expect(storage.supervisedRuns.findById(runId)?.status).toBe('stalled')
+      return runId
+    }
+
+    it('Case C: stalled 判定後に完了が判明 → blind retry せず success として回収する', async () => {
+      const runId = await driveToStalledBeforeCompletion('e2e-case-c')
+      const runDir = runDirFor(runId)
+
+      // 実処理はこの後で完了する。wrapper（provider）は DONE の後も生き続ける。
+      expect(await waitFor(() => existsSync(path.join(runDir, 'verdict')))).toBe(true)
+      expect(readFileSync(path.join(runDir, 'verdict'), 'utf-8').trim()).toBe('COMPLETED')
+
+      const continuations: string[] = []
+      setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
+
+      // reconcile は stalled を blind retry せず、まず completion predicate を再評価する。
+      await reconcileViaWorkerHttpPath()
+
+      const run = storage.supervisedRuns.findById(runId)!
+      expect(run.status).toBe('succeeded')
+      expect(run.terminalVerdict).toBe('COMPLETED')
+      expect(run.completionEvidence?.hasDoneMarker).toBe(true)
+      expect(continuations).toEqual(['COMPLETED'])
+    }, 150_000)
+
+    it('Case D: stalled → bounded recovery が成功し terminal success + continuation まで進む', async () => {
+      const runId = await driveToStalledBeforeCompletion('e2e-case-d')
+      const runDir = runDirFor(runId)
+      expect(await waitFor(() => existsSync(path.join(runDir, 'verdict')))).toBe(true)
+
+      const continuations: string[] = []
+      setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
+
+      await reconcileViaWorkerHttpPath()
+
+      const run = storage.supervisedRuns.findById(runId)!
+      // recovery が bounded に所有権を取り直したことが記録に残る（C-9: recovery actor が実在する）。
+      expect(run.recoveryAttemptCount).toBeGreaterThanOrEqual(1)
+      expect(run.recoveryAttemptCount).toBeLessThanOrEqual(MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS)
+      expect(run.supervisor).toBe('delegate_watchdog')
+      expect(run.status).toBe('succeeded')
+      expect(run.completedAt).toBeTruthy()
+      expect(continuations).toEqual(['COMPLETED'])
+    }, 150_000)
+
+    it('Case E: recovery 不能 → 無限 RUNNING にせず terminal（recovery_exhausted）で終わる', async () => {
+      // verdict を出さないまま生き続ける provider。何度引き取っても完了判定は得られない。
+      const runId = await launchFromSeparateProcess('e2e-case-e', writeFakeProvider('silent'))
+      const runDir = runDirFor(runId)
+      expect(await waitFor(() => existsSync(path.join(runDir, 'current_log')))).toBe(true)
+
+      const continuations: string[] = []
+      setDelegationContinuation(({ terminalVerdict }) => { continuations.push(terminalVerdict) })
+
+      // 「無出力 → stalled → 引き取り → やはり無出力」を上限まで繰り返す。
+      // 引き取りのたびに lastProgressAt が更新されるので、そのつど fixture 側で過去へ戻す。
+      for (let cycle = 0; cycle < MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS + 2; cycle++) {
+        if (storage.supervisedRuns.findById(runId)?.status === 'failed') break
+        backdateProgress(runId, BEYOND_STALE)
+        await reconcileViaWorkerHttpPath()
+      }
+
+      const run = storage.supervisedRuns.findById(runId)!
+      // RUNNING のまま残らないことが要点である。
+      expect(run.status).toBe('failed')
+      expect(run.terminalVerdict).toBe('recovery_exhausted')
+      expect(run.completedAt).toBeTruthy()
+      expect(run.recoveryAttemptCount).toBe(MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS)
+    }, 180_000)
+  })
 })
