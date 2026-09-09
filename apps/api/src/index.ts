@@ -74,6 +74,32 @@ app.register(healthRoutes, { prefix: '/api' })
 
 const PORT = Number(process.env.PORT) || 3000
 
+/**
+ * 委任の終端時に continuation が実際に走るよう、**listen より前に**登録する（#110 Step 3）。
+ *
+ * 独立レビュー指摘（最終ラウンド #2）: listen 後に非同期登録していると、その隙間に届いた
+ * Worker の reconcile が run を終端させても `continuationHook` が未設定で、
+ * 「終端したのに誰も知らない」が起きる。数ミリ秒後には登録が済むはずでも、
+ * それはこの機構が防ごうとしている当の失敗そのものなので、順序で塞ぐ。
+ *
+ * 通知の実体はここで注入する（continuation.ts 側は worker package を import しない）。
+ * 解決できない環境（既知の packaging gap: `node dist/index.js`）でも **API 起動は落とさない**。
+ * continuation が無いまま黙って進むのではなく、無いことをログに残す。
+ */
+async function installDelegationContinuation(): Promise<void> {
+  try {
+    const { sendAlert } = await import('@ai-team/worker/src/notifier/notifier.js')
+    registerDelegationContinuation(sendAlert)
+  } catch (err: unknown) {
+    console.error(
+      '[supervision] delegation continuation is NOT registered; ' +
+      'supervised runs will still reach a terminal state but nothing will be notified: ' +
+      `${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+}
+
+void installDelegationContinuation().then(() => {
 app.listen({ port: PORT, host: process.env.HOST ?? '0.0.0.0' }, (err) => {
   if (err) {
     app.log.error(err)
@@ -86,19 +112,6 @@ app.listen({ port: PORT, host: process.env.HOST ?? '0.0.0.0' }, (err) => {
   // 再開が、まだ回収されていないDesign Review runに対して`not_claimable`を繰り返し、
   // bounded retryを使い切って`blocked`（終端）にしてしまう。Design Review側の回収が
   // 先に終わっていれば、その評価を再利用して正常に続行できる（独立レビュー指摘、2026-09-07）。
-  // 委任の終端時に continuation が実際に走るよう、起動時に一度だけ登録する（#110 Step 3）。
-  // 通知の実体はここで注入する（continuation.ts 側は worker package を import しない）。
-  // 解決できない環境（既知の packaging gap: `node dist/index.js`）でも **API 起動を落とさない**。
-  // continuation が無いまま黙って進むのではなく、無いことをログに残す。
-  void import('@ai-team/worker/src/notifier/notifier.js')
-    .then(({ sendAlert }) => registerDelegationContinuation(sendAlert))
-    .catch((err: unknown) => {
-      console.error(
-        '[supervision] delegation continuation is NOT registered; ' +
-        'supervised runs will still reach a terminal state but nothing will be notified: ' +
-        `${err instanceof Error ? err.message : String(err)}`,
-      )
-    })
   void recoverAndRekickAtStartup(getStorage())
     .catch((recoveryError) => {
       app.log.error({ err: recoveryError }, 'design review startup recovery failed')
@@ -113,4 +126,5 @@ app.listen({ port: PORT, host: process.env.HOST ?? '0.0.0.0' }, (err) => {
       }
     })
     .catch((recoveryError) => app.log.error({ err: recoveryError }, 'project start startup recovery failed'))
+})
 })

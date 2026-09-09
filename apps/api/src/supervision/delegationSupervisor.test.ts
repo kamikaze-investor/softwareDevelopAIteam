@@ -251,6 +251,30 @@ describe('supervised ai_delegation', () => {
       expect(storage.supervisedRuns.findById(launched.run.id)?.status).toBe('succeeded')
     })
 
+    it('recovery 上限超過の終端でも continuation が発火する（独立レビュー 最終ラウンド #1）', async () => {
+      const fired: string[] = []
+      setDelegationContinuation(({ terminal, terminalVerdict }) => {
+        fired.push(`${terminal}:${terminalVerdict}`)
+      })
+
+      const launched = launchSupervisedDelegation(storage, launchInput(), fakeSpawner)
+      if (launched.status !== 'launched') throw new Error('launch failed')
+      writeRunDir(launched.runDir, { logText: 'no verdict ever' })
+
+      let token = launched.claimToken
+      for (let i = 0; i < 3; i++) {
+        storage.supervisedRuns.markStalled(launched.run.id, token, 'quiet')
+        token = storage.supervisedRuns.claimForRecovery(launched.run.id, 'delegate_watchdog').claimToken!
+      }
+      storage.supervisedRuns.markStalled(launched.run.id, token, 'quiet')
+
+      expect(await diagnoseAndRecover(storage, launched.run.id)).toEqual({ status: 'recovery_exhausted' })
+
+      // 終端だけして黙らない。回収不能で終わった run こそ知らせる必要がある。
+      expect(fired).toEqual(['failed:recovery_exhausted'])
+      expect(storage.supervisedRuns.findById(launched.run.id)?.status).toBe('failed')
+    })
+
     it('recovery が上限を超えたら RUNNING のまま残さず terminal で終える', async () => {
       const launched = launchSupervisedDelegation(storage, launchInput(), fakeSpawner)
       if (launched.status !== 'launched') throw new Error('launch failed')

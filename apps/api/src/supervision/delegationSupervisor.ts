@@ -320,7 +320,15 @@ export async function diagnoseAndRecover(
   if (!stalled || stalled.status !== 'stalled') return { status: 'not_stalled' }
 
   const claimed = storage.supervisedRuns.claimForRecovery(runId, supervisor)
-  if (claimed.exhausted) return { status: 'recovery_exhausted' }
+  if (claimed.exhausted) {
+    // 独立レビュー指摘（最終ラウンド #1）: 上限超過の終端は `claimForRecovery()` の中で
+    // 起きるため、observeAndAdvance を通らない。ここで continuation を呼ばないと
+    // **「recovery できずに終わった run」だけが誰にも通知されない**という、
+    // 最も知らせるべきケースが黙って消える。
+    // 終端は claimForRecovery 内で確定済みなので、二重終端にはならない。
+    await runContinuation(storage, runId, 'failed', 'recovery_exhausted')
+    return { status: 'recovery_exhausted' }
+  }
   if (!claimed.claimToken) return { status: 'not_stalled' }
 
   // 所有権を取ってから、まず**診断としての再評価**を行う。

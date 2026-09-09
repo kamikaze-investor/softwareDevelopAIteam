@@ -462,6 +462,11 @@ process.exit(0)
       expect(run.terminalVerdict).toBe('recovery_exhausted')
       expect(run.completedAt).toBeTruthy()
       expect(run.recoveryAttemptCount).toBe(MAX_SUPERVISED_RUN_RECOVERY_ATTEMPTS)
+
+      // **回収できずに終わった run こそ通知が要る。** 終端だけして黙るのは
+      // この機構が防ごうとしている失敗そのものなので、continuation の発火まで確認する
+      // （独立レビュー指摘 最終ラウンド #1: この assert が無かったため見逃していた）。
+      expect(continuations).toEqual(['recovery_exhausted'])
     }, 180_000)
   })
 })
