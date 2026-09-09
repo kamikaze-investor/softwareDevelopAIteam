@@ -131,7 +131,7 @@ export function launchSupervisedDelegation(
     runDir = runDirFor(runId)
   } catch (err) {
     const error = `cannot derive a trusted run directory: ${err instanceof Error ? err.message : String(err)}`
-    storage.supervisedRuns.failClosed(runId, claimToken, error)
+    void failClosedAndNotify(storage, runId, claimToken, error)
     return { status: 'launch_failed', run: created.run, error }
   }
 
@@ -142,7 +142,8 @@ export function launchSupervisedDelegation(
   const failClosedOnSpawnError = (err: Error): void => {
     const error = `delegation launch failed: ${err.message}`
     // 既に終端していれば false が返るだけで、二重終端にはならない。
-    storage.supervisedRuns.failClosed(runId, claimToken, error)
+    // 通知も対で行う（fail-closed で終わった委任を黙って捨てない）。
+    void failClosedAndNotify(storage, runId, claimToken, error)
   }
 
   try {
@@ -157,7 +158,7 @@ export function launchSupervisedDelegation(
     })
   } catch (err) {
     const error = `delegation launch failed: ${err instanceof Error ? err.message : String(err)}`
-    storage.supervisedRuns.failClosed(runId, claimToken, error)
+    void failClosedAndNotify(storage, runId, claimToken, error)
     return { status: 'launch_failed', run: created.run, error }
   }
 
@@ -200,6 +201,28 @@ export function setDelegationContinuation(hook: DelegationContinuation | undefin
   continuationHook = hook
 }
 
+/**
+ * fail-closed 終端 + continuation を1つにまとめる。
+ *
+ * 独立レビュー指摘（最終ラウンド）: 終端させる出口が複数あるのに continuation を呼ぶのは
+ * 成功経路だけだったため、**fail-closed で終わった run は誰にも通知されなかった**。
+ * 「終端したのに誰も知らない」を潰すのがこの機構の目的なので、
+ * 終端の書き込みと通知は必ず対で行う。ここを唯一の fail-closed 経路にする。
+ *
+ * `void` で呼べるよう戻り値は「終端できたか」だけにし、通知は内部で待つ。
+ */
+async function failClosedAndNotify(
+  storage: IStorage,
+  runId: string,
+  claimToken: string,
+  error: string,
+): Promise<boolean> {
+  const fenced = storage.supervisedRuns.failClosed(runId, claimToken, error)
+  // fencing で弾かれた（＝終端していない）なら通知もしない。
+  if (fenced) await runContinuation(storage, runId, 'failed', 'fail_closed')
+  return fenced
+}
+
 async function runContinuation(
   storage: IStorage,
   runId: string,
@@ -240,7 +263,10 @@ export async function observeAndAdvance(
   // 解決できなければ resolvePredicateForRun がその場で fail-closed 終端させる。
   const resolved = resolvePredicateForRun(storage, run, claimToken)
   if (!resolved.ok) {
-    return resolved.terminated ? { status: 'fail_closed', error: resolved.error } : { status: 'stale_owner' }
+    if (!resolved.terminated) return { status: 'stale_owner' }
+    // predicateResolution 側が既に終端させているので、ここでは通知だけ行う。
+    await runContinuation(storage, run.id, 'failed', 'fail_closed')
+    return { status: 'fail_closed', error: resolved.error }
   }
 
   const evaluation = await resolved.evaluate({
@@ -252,7 +278,7 @@ export async function observeAndAdvance(
 
   if (evaluation.outcome === 'unevaluatable') {
     // 判定不能を「待ち続ける」に倒さない（C-1 / D-2）。
-    const fenced = storage.supervisedRuns.failClosed(run.id, claimToken, evaluation.reason)
+    const fenced = await failClosedAndNotify(storage, run.id, claimToken, evaluation.reason)
     return fenced ? { status: 'fail_closed', error: evaluation.reason } : { status: 'stale_owner' }
   }
 
@@ -260,7 +286,7 @@ export async function observeAndAdvance(
     const formalVerdict = String(evaluation.evidence.formalVerdict ?? '')
     if (!isFormalVerdict(formalVerdict)) {
       const error = `predicate reported satisfied without a formal verdict: ${formalVerdict.slice(0, 120)}`
-      const fenced = storage.supervisedRuns.failClosed(run.id, claimToken, error)
+      const fenced = await failClosedAndNotify(storage, run.id, claimToken, error)
       return fenced ? { status: 'fail_closed', error } : { status: 'stale_owner' }
     }
 

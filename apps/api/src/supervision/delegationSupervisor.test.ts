@@ -334,6 +334,43 @@ describe('supervised ai_delegation', () => {
       expect(fired).toHaveLength(1)
     })
 
+    it.each([
+      ['空出力の COMPLETED（fail-closed）', { verdict: 'COMPLETED', logText: '' }],
+      ['未知の verdict（fail-closed）', { verdict: 'not a verdict', logText: 'AI_TEAM_OS_STATUS:DONE' }],
+    ])('%s でも continuation が発火する（独立レビュー 最終ラウンド: fail-closed 終端が無通知だった）',
+      async (_label, runDirContent) => {
+        const fired: string[] = []
+        setDelegationContinuation(({ terminal, terminalVerdict }) => {
+          fired.push(`${terminal}:${terminalVerdict}`)
+        })
+
+        const launched = launchSupervisedDelegation(storage, launchInput(), fakeSpawner)
+        if (launched.status !== 'launched') throw new Error('launch failed')
+        writeRunDir(launched.runDir, runDirContent)
+
+        const outcome = await observeAndAdvance(storage, launched.run.id, launched.claimToken)
+
+        expect(outcome.status).toBe('fail_closed')
+        expect(storage.supervisedRuns.findById(launched.run.id)?.status).toBe('failed')
+        // 終端したのに黙る経路を残さない。
+        expect(fired).toEqual(['failed:fail_closed'])
+      })
+
+    it('launch が spawn 失敗で fail-closed になった場合も continuation が発火する', async () => {
+      const fired: string[] = []
+      setDelegationContinuation(({ terminalVerdict }) => { fired.push(terminalVerdict) })
+
+      const result = launchSupervisedDelegation(storage, launchInput(), () => {
+        throw new Error('spawn exploded')
+      })
+
+      expect(result.status).toBe('launch_failed')
+      expect(storage.supervisedRuns.findById(result.run.id)?.status).toBe('failed')
+      // 通知は fire-and-forget なので、microtask を1つ空ける。
+      await Promise.resolve()
+      expect(fired).toEqual(['fail_closed'])
+    })
+
     it('continuation が throw しても終端は巻き戻らない（終端済みなのに誰も知らない状態へ戻さない）', async () => {
       setDelegationContinuation(() => { throw new Error('notification channel down') })
 
