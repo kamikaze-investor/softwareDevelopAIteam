@@ -158,10 +158,25 @@ async function seedPendingContinuation(
   return { nextTask, continuation }
 }
 
-async function reconcile(app: FastifyInstance): Promise<ReconcileSummary> {
-  const res = await app.inject({ method: 'POST', url: '/api/task-continuations/reconcile' })
-  expect(res.statusCode).toBe(200)
-  return JSON.parse(res.body) as ReconcileSummary
+/**
+ * sweep本体を直接呼ぶ。routeは202を即返すfire-and-forgetになったため（Workerのpoll cycleを
+ * design reviewの完了まで止めないため）、HTTP経由では戻り値のsummaryを観測できない。
+ * route自体の契約は下の専用テストで確認する。
+ */
+async function reconcile(_app: FastifyInstance): Promise<ReconcileSummary> {
+  const { reconcileTaskContinuations } = await import('../ctoAi/taskContinuation.js')
+  const storage = await getStorageForTest()
+  return reconcileTaskContinuations(storage)
+}
+
+/** 条件が満たされるまで短く待つ（fire-and-forgetの効果は非同期に現れる）。 */
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(predicate()).toBe(true)
 }
 
 beforeEach(() => {
@@ -357,6 +372,44 @@ describe('POST /api/task-continuations/reconcile', () => {
       expect(storage.taskContinuations.findById(continuationId)?.status).toBe('completed')
     } finally {
       await restarted.close()
+    }
+  })
+
+  it('routeは202を即返し、Workerのpoll cycleをsweep完了まで待たせない', async () => {
+    const app = await buildApp()
+    try {
+      const { project, sourceTask, storage } = await createRunningProjectWithTask(app)
+      const { nextTask } = await seedPendingContinuation(storage, project.id, sourceTask.id)
+
+      // design review をテスト側で握り、sweep を完了させないまま POST する。
+      // これで「sweep が終わっていないのに 202 が返る」ことを決定的に確認できる。
+      let releaseReview: (() => void) | undefined
+      const reviewStarted = new Promise<void>((resolveStarted) => {
+        designReviewMocks.execute.mockImplementation(async (input: string) => {
+          resolveStarted()
+          await new Promise<void>((resolveHeld) => { releaseReview = resolveHeld })
+          return { ok: true, timedOut: false, stdout: stdoutForReviewInput(input) }
+        })
+      })
+
+      const res = await app.inject({
+        method: 'POST', url: '/api/task-continuations/reconcile',
+      })
+
+      // sweepはawaitされない。design reviewは最大120sかかりうるため、ここを待つと
+      // Worker側がOutbox再送にもqueued Job取得にも到達できなくなる。
+      expect(res.statusCode).toBe(202)
+      expect(JSON.parse(res.body)).toMatchObject({ accepted: true })
+
+      // 応答時点で design review はまだ解放していない = sweep は未完了。
+      await reviewStarted
+      expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(0)
+
+      // 解放すれば回収自体は非同期に完走する。
+      releaseReview?.()
+      await waitFor(() => storage.jobs.findByTaskId(nextTask.id).length === 1)
+    } finally {
+      await app.close()
     }
   })
 })

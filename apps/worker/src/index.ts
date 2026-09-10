@@ -518,7 +518,10 @@ async function confirmRunningTransition(
  * 'pending' のまま残り、Mobile の GET /api/projects 系でしか回収されない
  * （= client を閉じたままでは次 Task へ進めない）。
  *
- * ここでは retry も gate 判定もしない。判定は API 側 createInitialImplementWorkflow() が持つ。
+ * API 側は 202 を即返し、sweep 自体は fire-and-forget で走る。したがってここは
+ * **起動をキックするだけ**であり、design review 等の長い処理を待たない
+ * （待つと Outbox 再送と queued Job 取得へ到達できなくなる）。
+ * 回収件数のログは API 側が出す。ここでは retry も gate 判定もしない。
  */
 export async function reconcileTaskContinuations(): Promise<void> {
   try {
@@ -528,18 +531,6 @@ export async function reconcileTaskContinuations(): Promise<void> {
     })
     if (!response.ok) {
       console.warn(`[Worker] task continuation reconcile failed: HTTP ${response.status}`)
-      return
-    }
-    // recovered=0 を毎 cycle 出力すると POLL_INTERVAL_MS ごとにログを埋めるため、
-    // 実際に状態が動いたときだけ残す（効果検証は task_continuations の durable state が正本）。
-    const summary = (await response.json()) as { recovered?: number, failed?: number, stillPending?: number }
-    const recovered = summary.recovered ?? 0
-    const failed = summary.failed ?? 0
-    if (recovered > 0 || failed > 0) {
-      console.log(
-        `[Worker] task continuation reconcile: recovered=${recovered} failed=${failed} ` +
-        `stillPending=${summary.stillPending ?? 0}`,
-      )
     }
   } catch (err: unknown) {
     console.warn(`[Worker] task continuation reconcile error: ${formatUnknownError(err)}`)
