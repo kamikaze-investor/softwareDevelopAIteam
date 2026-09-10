@@ -2747,6 +2747,105 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
 
+<!-- roadmap:id=strategic-decision-unknown-value-fail-open state=planned -->
+0. [ ] **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）**
+   （2026-09-10登録、**高優先度・安全性**。PR #136（continuation reconcile）の作業中に発見。
+   **#136へは混ぜず独立Findingとする**）。
+
+   **内容**: `packages/shared/src/strategicDecision.ts:22-40` は decisions に `'CONFLICT'` が
+   含まれれば CONFLICT、空か `'UNCERTAIN'` を含めば UNCERTAIN を返し、
+   **それ以外は無条件に `return 'ALIGNED'`** する。有効な `StrategicDecision` は
+   `ALIGNED | CONFLICT | UNCERTAIN` のみ（`packages/shared/src/types/meta_review.ts:115`）だが、
+   focused / integration の decision 値はこのenumに対して検証されていない。
+
+   **実測（2026-09-10）**: continuation reconcileのテストで、design reviewを意図的に
+   不一致にするため `decision: 'NOT_ALIGNED'`（実在しない値）を返させたところ、
+   **ALIGNEDとして受理され**、design review evidenceが登録され、implement Jobが作られた。
+   `'CONFLICT'` に変えて初めてテストが正しく落ちた。
+
+   **リスク**: この出力は design review evidence になり、Job Gate が implement Job の
+   実行可否を判断する根拠である。runnerのschema drift・typo・provider差し替えによる
+   語彙違い・truncateされた値のいずれでも「未レビュー同然の変更が承認される」。
+
+   **非対称性**: `recomputeDecision`（`apps/api/src/designReview/designReviewCoordinator.ts:176-260`）は
+   independent review verdict の未知値は明示的にrejectし、focus集合の不一致もrejectする。
+   **decision値だけが素通りする。**
+
+   **方針（実装前に確認）**: fail-closedへ倒す。parse境界でdecision値をenum検証するか、
+   `resolveFinalDecision` を「全decisionが厳密に `'ALIGNED'` のときだけALIGNED、
+   未知値はUNCERTAIN」へ反転する。未知値がALIGNEDにならない回帰テストを追加する。
+   `packages/shared` はapi/worker双方が参照するため、AGENTS.mdのReview Levelに従うこと。
+
+<!-- roadmap:id=approval-resume-liveness-dependency state=planned -->
+0. [ ] **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
+   （2026-09-10登録。PR #136の調査で判明。**#136へは混ぜず独立Findingとする**）。
+
+   **内容**: CEOがblocked な git_commit Job を承認しても、Jobは自力で再開しない。
+
+   1. `apps/worker/src/jobRunner.ts:490-560` — Gateが `block_until_approved` を返すと
+      Workerは通知して `return { status: 'blocked' }` する。待機もGate再pollもせず、Jobは終端する。
+   2. `apps/api/src/routes/approvals.ts:75-89` — `PATCH /api/approvals/:id` は承認行を
+      書くだけで、Jobを作らず再queueもしない。
+   3. 復旧は `POST /api/tasks/:id/resume`（`resumeBlockedTask()`）= **client起点**。
+
+   **帰結**: 1 Taskあたり **承認 + resume の2回のclient操作**が要る。
+   これは PR #136 が解消したGET polling依存とは**別**のliveness依存であり、
+   「clientを閉じたままProject完了」は現状不可能である。
+
+   **前提（変更しないこと）**: `git_commit` は riskLevel に関わらず無条件でCEO承認必須
+   （`apps/api/src/routes/approvalGate.ts:415-417`）。low-risk auto approvalの設定・env flagは
+   存在せず、`apps/worker/src/guards/safetyAuditor.ts:74` は `autoApprove` というキーワード自体を
+   CRITICALとして検出する。**auto-approvalは本Findingの解決策ではなく**、
+   採用するならセキュリティモデル変更としてCEO承認が要る。
+
+   **問うべき範囲**: 「**正当な承認が既に存在する**場合に、blocked git_commit Job の再開を
+   backend側（既存のWorker poll cycle / reconcile）が行ってよいか」。
+   `resumeBlockedTask()` が既に持つdedupとGate再チェックを再利用する前提で、
+   まずread-onlyで調査し、call pathと最小変更案を出してから実装する。
+
+<!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=planned -->
+0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無く、productionで403になる**
+   （2026-09-10登録。PR #136 のIndependent Reviewで同型の欠陥が指摘され、
+   既存経路にも同じ漏れがあることが判明した）。
+
+   **内容**: Workerは毎poll cycleで `POST /api/supervised-runs/reconcile` を呼ぶ
+   （`apps/worker/src/index.ts`）が、このrouteは `WORKER_ALLOWLIST`
+   （`apps/api/src/auth/workerAllowlist.ts`）に**含まれていない**。
+   WORKER credentialはDefault Denyなので（`apps/api/src/auth/apiToken.ts:103`）、
+   credential splitが有効なproduction（`/srv/ai-team/env/worker.env`）では**毎cycle 403**になる。
+
+   **帰結**: Worker側は `!response.ok` をwarnして返すだけなので**静かに失敗し続ける**。
+   supervised run の reconcile が一度も成立せず、完了済みの委任が RUNNING のまま残り、
+   `#110 Step 3` で配線した「terminal後のcontinuation起動」も動かない可能性が高い。
+   **production実機での確認が必要**（本項目はまず事実確認から）。
+
+   **注意**: PR #136 は自分が追加した `POST /api/task-continuations/reconcile` のみを
+   allowlistへ追加した（MVPスコープ維持のため）。本項目はその**既存側の同型欠陥**であり、
+   #136には混ぜていない。
+
+   **再発防止（本項目の一部として検討）**: allowlist漏れはunit testでは検出しにくい
+   （`WORKER_ALLOWLIST` を反復するテストは追加後に自動でpassする）。
+   Workerが呼ぶroute一覧とallowlistの整合を確認する手段を持つか、
+   `workerCredentialAuthorization.test.ts` に経路ごとの統合テストを足すかを決める。
+
+<!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
+0. [ ] **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**
+   （2026-09-10登録。PR #136 のIndependent Reviewで指摘。
+   **MVP完了を阻害しないため延期**。CEO方針: MVPスコープを広げない）。
+
+   1. **sweepが毎cycle全Projectを走査する** — `reconcileTaskContinuations()` は
+      `projects.findAll()`（`SELECT * FROM projects ORDER BY created_at DESC`）を毎cycle実行する。
+      `ux_projects_single_running` により実作業は最大1 Projectに限られるため実害は小さいが、
+      走査自体はfull-tableである。**CEO方針により、性能上の実測問題が出るまで新queryは追加しない。**
+      対応するなら `findRunning()` 相当の追加。
+   2. **continuationの実エラーが握り潰される** — `ensureTaskContinuation()` の catch は
+      workflow生成時の例外を捕捉して**何もログしない**（`apps/api/src/ctoAi/taskContinuation.ts`）。
+      routeは `stillPending` を含む結果を返すが、ログは recovered/failed が動いた時だけ出る。
+      永続的なstorage障害・design review基盤障害があると、無限にretryし続けて
+      API側に何のエラー signal も残らない。**この catch は #136 以前からの既存挙動**であり、
+      #136 が新規に持ち込んだものではない。状態は壊れず durable state は正しいままなので、
+      MVP後に扱う。
+
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
    **高優先度**。CEO判断: PR Cでは`use_legacy_landlock`を暫定的な安全経路としてのみ使用し、
