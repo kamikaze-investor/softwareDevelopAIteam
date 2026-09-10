@@ -27,6 +27,10 @@ export const WORKER_ALLOWLIST: readonly WorkerAllowlistEntry[] = [
   { method: 'POST', url: '/api/approval-requests/:id/consume' },
   { method: 'POST', url: '/api/watchdog-events' },
   { method: 'PATCH', url: '/api/watchdog-events/:id' },
+  // Task continuation の回収は Worker の poll cycle が唯一の起動契機であり、
+  // これが無いと production（credential split 有効）では 403 になり、
+  // continuation が Mobile の GET 副作用でしか進まない状態へ戻る。
+  { method: 'POST', url: '/api/task-continuations/reconcile' },
 ]
 
 export function isWorkerRouteAllowed(method: string | undefined, url: string | undefined): boolean {
