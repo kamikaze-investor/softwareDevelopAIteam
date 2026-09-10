@@ -3383,8 +3383,34 @@ deploy canary は全 PASS だった。
 
 
 <!-- roadmap:id=failure-explanation-pregeneration state=planned -->
-5. [ ] **Failure Explanation の事前生成と CEO 向け構造化（次段改善）** — 2026-09-10 登録。
+5. [ ] **Failure Explanation の事前生成と CEO 向け構造化（次段改善）— `post-MVP`** —
+      2026-09-10 登録。**本項目は明示的に post-MVP。MVP 完成まで説明品質改善を理由に
+      本線を止めない**（CEO 判断・2026-09-10）。
       #130（predicate regression 修正）とは**別責務**。#130 / Phase 3 closure を先に完了する。
+
+      **2026-09-10 CEO 実機確認の結果**: 技術的な実経路
+      （Mobile → API → failure explanation 生成 → AI response → Mobile 表示）は**成立**し、
+      Phase 3 の **functional PASS** として記録済み。以下は品質課題であり
+      **functional blocker として扱わない**。MVP 前の追加修正は行わない。
+
+      同確認で挙がった UX / quality 課題（**新規 item を作らず本項目へ統合**）:
+      - 非エンジニア向けとして分かりにくい
+      - technical vocabulary が多い
+      - 技術的確認を `recommendedNextAction` として CEO へ提示する場合がある
+      - **CEO がすべきこと / AI 開発チームがすべきことの責任分離が弱い**
+      - 説明フォーマットが十分に固定されていない
+
+      **CEO 向け固定フォーマット（post-MVP で実装する形）**: 少なくとも次の5問に
+      一貫して答える形へ固定する。technical details は secondary 表示へ分離する。
+      1. 何が起きた？
+      2. なぜ止まった？
+      3. 今どうなっている？
+      4. 次に何が行われる？
+      5. CEO がすることは？
+
+      あわせて、**AI 側で解決可能な技術作業を CEO へ要求しない**こと、
+      **CEO 判断が必要な場合のみ**具体的な質問を提示することを満たす。
+
 
       **Goal**: Job が failed / blocked になった時点でバックグラウンドに説明を生成・レビュー・
       保存し、CEO が Mobile を開いた時には**原則完成済みの説明が即表示**される状態にする。
