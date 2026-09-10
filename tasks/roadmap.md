@@ -3123,7 +3123,24 @@ operational observation として確認する。
   確認時点で自然発生した approval 待ち Job が 0 件のため未実施。quarantine UI と同じ扱いで
   P1 completion の blocker とはしない（人工的な approval を production に作らない方針）。
 
-- **failure explanation / AI question**: `FAIL — API refused before the AI call` → **#130 で修正**。
+- **failure explanation / AI question**: `PASS — functional`（2026-09-10 CEO 実機確認）。
+  当初は `FAIL — API refused before the AI call` として記録したが、**#130 で修正し
+  production 反映後に実経路で PASS を確認**した。実経路
+  Mobile → API → failure explanation 生成 → AI response → Mobile 表示 が成立。
+
+  **実測 evidence**: target Job `ecfa0132-cbb0-4293-baf9-0c25aa93c593` の
+  `failure_explanation_json` が **NULL → 生成済み**（`classification=configuration`、
+  `likelyCause` / `impact` / `recommendedNextAction` すべて充足、
+  `generatedAt` 2026-09-10T09:24:12Z）。DB 全体の生成済み件数も **0 → 1** で、
+  その1件が対象 Job 本体であることを帰属レベルで確認済み（候補 Task は14件あるため、
+  DB 全体件数だけでは帰属を示せない）。「AIに質問する」も同 Task で回答本文を実機確認。
+
+  説明品質（非エンジニア向けの分かりやすさ・technical vocabulary の多さ・
+  CEO と AI 開発チームの責任分離・フォーマット固定）の課題は **functional blocker とせず**、
+  既存 item `failure-explanation-pregeneration`（**post-MVP**）へ統合済み。
+  MVP 完成まで説明品質改善を理由に本線を止めない（CEO 判断・2026-09-10）。
+
+  以下は当初 FAIL の原因記録として残す。
   「実行失敗の説明」「AIに質問する」の両方が AI 障害の文言を返していたが、production log で
   **AI が一度も呼ばれていなかった**ことが判明した。CEO の 3 リクエスト（Task `11066c6f`）は
   いずれも HTTP 200 / 4.7ms・44.7ms・5.5ms で完了し `level:40` warn は 0 件。provider を実コードで
@@ -3132,7 +3149,8 @@ operational observation として確認する。
   原因は Mobile と API の表示述語の乖離。Mobile (`[id].tsx:725`) は
   `failed || blocked || task.blocked`、API (`tasks.ts:192`) は `failed || task.blocked` で、
   `blocked` が欠けていた。**Job が blocked でも Task は `pending` に留まる**ため、
-  この状態の Task（production 上 3 件: `11066c6f` / `94c42709` / `d7a654be`）では
+  この状態の Task（production 上 **14 件**。当初 3 件と報告したが直近25件しか見ておらず、
+  全件走査で14件と判明）では
   Mobile が説明セクションを表示するのに API が「対象なし」を返していた。
 
   元実装 `4ad0fb6` では両者は一致していた。`d8bcf0c`（#124）で **Mobile 側だけを広げた
