@@ -97,13 +97,23 @@ wait_for_death() {
 # DELEG-001: 子孫 PID を深さ優先で列挙する（末端から先に kill するため）。
 # 旧実装は親だけを kill しており、tool として起動された孫 process が
 # orphan として生き残った（stale/duplicate child）。
+#
+# 深さは明示的に打ち切る（独立レビュー指摘: 無制限再帰にしない）。
+# 実運用の provider → tool は数段で、これを超える深さは異常なので
+# 打ち切って上位の kill と再走査に委ねる。
+MAX_DESCENDANT_DEPTH="${DELEGATION_MAX_DESCENDANT_DEPTH:-8}"
+
 collect_descendants() {
   local parent_pid="$1"
+  local depth="${2:-0}"
+  if [ "$depth" -ge "$MAX_DESCENDANT_DEPTH" ]; then
+    return 0
+  fi
   local child
   local candidates
   candidates=$(pgrep -P "$parent_pid" 2>/dev/null || ps --ppid "$parent_pid" -o pid= 2>/dev/null || true)
   for child in $candidates; do
-    collect_descendants "$child"
+    collect_descendants "$child" $(( depth + 1 ))
     echo "$child"
   done
 }
@@ -126,30 +136,48 @@ terminate_process_tree() {
     return 1
   fi
 
-  local descendants
-  descendants=$(collect_descendants "$pid")
-
-  local p
-  for p in $descendants; do
-    kill "$p" 2>/dev/null || true
-  done
-  kill "$pid" 2>/dev/null || true
-
-  if ! wait_for_death "$pid" 1000; then
-    for p in $descendants; do
-      kill -9 "$p" 2>/dev/null || true
+  # 独立レビュー指摘: 子孫を1回スナップショットしただけでは、
+  # 走査後・親の死亡前に新しく fork された子孫を取りこぼす。
+  # 親がまだ生きている（＝新しい子を作れる）間は、走査と kill を
+  # 「新しい子孫が見つからなくなるまで」有限回繰り返す。
+  local sweep
+  local descendants=""
+  local round
+  for round in 1 2 3 4 5; do
+    sweep=$(collect_descendants "$pid")
+    [ -n "$sweep" ] || break
+    descendants="$descendants $sweep"
+    local p
+    for p in $sweep; do
+      kill "$p" 2>/dev/null || true
     done
+    for p in $sweep; do
+      wait_for_death "$p" 500 || kill -9 "$p" 2>/dev/null || true
+    done
+  done
+
+  # 子孫を止めてから親を落とす。順序が逆だと親の死亡で子が reparent され、
+  # pgrep -P では二度と辿れなくなる。
+  kill "$pid" 2>/dev/null || true
+  if ! wait_for_death "$pid" 1000; then
     kill -9 "$pid" 2>/dev/null || true
     wait_for_death "$pid" 1000 || return 1
   fi
 
-  # 親が死んでも孫は生き残り得るので、明示的に刈り取る。
-  for p in $descendants; do
-    if is_pid_alive "$p"; then
-      kill -9 "$p" 2>/dev/null || true
-      wait_for_death "$p" 500 || return 1
+  # 記録した子孫がすべて死んでいることを最後に確認する。
+  local q
+  for q in $descendants; do
+    if is_pid_alive "$q"; then
+      kill -9 "$q" 2>/dev/null || true
+      wait_for_death "$q" 500 || return 1
     fi
   done
+
+  # 親の死亡後に残った子孫が無いことも確認する（reparent 済みで辿れないものは
+  # 上のループで刈れているはず。ここで見つかるなら確認失敗として扱う）。
+  if [ -n "$(collect_descendants "$pid")" ]; then
+    return 1
+  fi
 
   return 0
 }

@@ -15,7 +15,25 @@ const watchdogTestScript = fileURLToPath(
  * 修正の完了条件として、繰り返し実行して毎回通ることを要求する。
  * 回数は `DELEGATE_WATCHDOG_TEST_RUNS` で上書きできる（既定 3）。
  */
-const RUNS = Number(process.env.DELEGATE_WATCHDOG_TEST_RUNS ?? 3)
+/**
+ * 独立レビュー指摘: 上書き値を検証していないと、`0` / 負値 / 非数値を渡したときに
+ * ループが一度も回らず、**shell test 全体を素通りさせたまま緑になる**。
+ * recurrence detection のための harness が、設定ミスで沈黙するのは本末転倒なので
+ * 1以上の整数だけを受け付け、それ以外は明示的に失敗させる。
+ */
+function resolveRuns(raw: string | undefined): number {
+  if (raw === undefined) return 3
+  const parsed = Number(raw)
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(
+      `DELEGATE_WATCHDOG_TEST_RUNS must be an integer >= 1; got ${JSON.stringify(raw)}. ` +
+      'Refusing to run, because a bad value would silently skip the shell suite.',
+    )
+  }
+  return parsed
+}
+
+const RUNS = resolveRuns(process.env.DELEGATE_WATCHDOG_TEST_RUNS)
 
 describe('delegation watchdog shell flow', () => {
   it(`fails closed, bounds retries, preserves logs, and protects unrelated PIDs (x${RUNS}, DELEG-001 非決定性の回帰)`, () => {
