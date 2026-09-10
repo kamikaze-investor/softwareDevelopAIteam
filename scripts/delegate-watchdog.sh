@@ -103,10 +103,18 @@ wait_for_death() {
 # 打ち切って上位の kill と再走査に委ねる。
 MAX_DESCENDANT_DEPTH="${DELEGATION_MAX_DESCENDANT_DEPTH:-8}"
 
+# 深さ上限で打ち切ったことを呼び出し元へ伝えるフラグ。
+# 独立レビュー指摘: 打ち切りを黙って「子孫なし」と同じ扱いにすると、
+# 上限より深い子孫が記録されないまま最深の祖先を kill することになり、
+# それらは orphan 化して親PID起点の再走査からも消える。
+# 打ち切りは **fail-closed**（確認できなかった）として扱う。
+DESCENDANT_TRUNCATED=0
+
 collect_descendants() {
   local parent_pid="$1"
   local depth="${2:-0}"
   if [ "$depth" -ge "$MAX_DESCENDANT_DEPTH" ]; then
+    DESCENDANT_TRUNCATED=1
     return 0
   fi
   local child
@@ -143,9 +151,15 @@ terminate_process_tree() {
   local sweep
   local descendants=""
   local round
+  local drained=0
+  DESCENDANT_TRUNCATED=0
   for round in 1 2 3 4 5; do
     sweep=$(collect_descendants "$pid")
-    [ -n "$sweep" ] || break
+    if [ -z "$sweep" ]; then
+      # 空の走査を1回得られて初めて「子孫は残っていない」と言える。
+      drained=1
+      break
+    fi
     descendants="$descendants $sweep"
     local p
     for p in $sweep; do
@@ -158,10 +172,24 @@ terminate_process_tree() {
 
   # 子孫を止めてから親を落とす。順序が逆だと親の死亡で子が reparent され、
   # pgrep -P では二度と辿れなくなる。
+  # ここまでで確認しきれていなくても親は落とす（これ以上 fork させないため）が、
+  # **成功としては報告しない**。
   kill "$pid" 2>/dev/null || true
   if ! wait_for_death "$pid" 1000; then
     kill -9 "$pid" 2>/dev/null || true
     wait_for_death "$pid" 1000 || return 1
+  fi
+
+  # 独立レビュー指摘: 5周回りきったこと（上限到達）と「子孫が居なくなったこと」は
+  # 別である。上限で抜けた場合、直近の走査以降に fork された子は reparent されて
+  # 親PID起点では追えないため、**確認できなかった**として非0で返す。
+  if [ "$drained" -ne 1 ]; then
+    echo "Warning: descendants of PID $pid still appearing after $round sweeps; cannot confirm the tree is dead" >&2
+    return 1
+  fi
+  if [ "$DESCENDANT_TRUNCATED" -eq 1 ]; then
+    echo "Warning: descendant scan for PID $pid hit MAX_DESCENDANT_DEPTH; deeper children may survive" >&2
+    return 1
   fi
 
   # 記録した子孫がすべて死んでいることを最後に確認する。
@@ -172,12 +200,6 @@ terminate_process_tree() {
       wait_for_death "$q" 500 || return 1
     fi
   done
-
-  # 親の死亡後に残った子孫が無いことも確認する（reparent 済みで辿れないものは
-  # 上のループで刈れているはず。ここで見つかるなら確認失敗として扱う）。
-  if [ -n "$(collect_descendants "$pid")" ]; then
-    return 1
-  fi
 
   return 0
 }
