@@ -2735,6 +2735,31 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    - `scripts/delegate-watchdog.test.sh` を**繰り返し実行しても安定して通る**ことを完了条件にする
      （1回passでは非決定性を潰した証明にならない）
 
+   **進捗（2026-09-10、hardening PR）— 本FindingはCLOSEしない**:
+
+   | risk | 状態 |
+   |---|---|
+   | 1. respawn時に旧childを確実に終了できない | **mitigation implemented** — PID同定失敗時は素通りせず **fail-closed**（respawnせず terminal verdict へ倒す）。TERM/KILL 後に **death confirmation** を追加 |
+   | 4. stale / duplicate child が残る | **mitigation implemented** — 子孫を深さ優先で列挙し、子孫→親の順にkillし、事後にも刈り取る |
+   | 2. recovery attemptが二重計上される | **root cause unresolved** |
+   | 3. bounded recoveryが予定より早くexhaustする | **root cause unresolved**（2の帰結のため） |
+
+   **二重計上の原因は特定できていない。** 当初仮説「respawn直後は `ps` が exec に追いつかず
+   `is_opencode_pid` が一瞬falseになり即座に2回目のretryが走る」は、Linuxでの直接測定
+   （200回のrespawn中 mismatch **0回**）により**否定された**。実証できない原因に対する
+   settle window等のtiming hackは**追加しない**方針とする（CEO判断）。
+   修正前コードも Linux ローカルでは再現せず（無負荷8/8 pass、CPU 3倍過負荷でも6/6 pass）。
+
+   **反復実行testは recurrence detection であって causal proof ではない。**
+   `delegateWatchdog.test.ts` は shell suite を既定3回実行し、何回目で落ちたかを報告する
+   （`DELEGATE_WATCHDOG_TEST_RUNS` で上書き可）。**繰り返しPASSしたこと自体は
+   原因を直した証拠にならない。**
+
+   **CLOSE条件**: 元の `recovery_attempt_count 1→2` を再現・原因特定し、
+   **1 recovery = 1 count** を実経路で証明できた時点でCLOSE判断する。
+   それまでは、production に supervision が載っていても
+   `ai_delegation` の retry 挙動は設計値どおりとみなさない。
+
    **重複確認済み（2026-09-10）**: 本Findingと重なる既存項目は無い。
    `worker-cgroup-delegation-contract` は systemd の cgroup delegation 契約であり無関係。
    `pl-review-process-supervision`（#110）は `delegate-watchdog.sh` を機構として参照しているが、
