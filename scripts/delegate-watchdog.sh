@@ -80,6 +80,30 @@ get_child_pids() {
   done
 }
 
+# DELEG-001: SIGSTOP が**実際に効いた**ことを確認する。
+#
+# 独立レビュー指摘（第5ラウンド）: `kill -STOP` は signal を送るだけで、
+# 停止の成立を待たない。送信直後に走査すると、まだ動いている親が
+# その後 fork でき、「新しい PID なし」を閉包と誤認する。
+# 停止（`ps` の stat が T）か、死亡（fork できないので同じく安全）まで待つ。
+wait_for_stopped() {
+  local pid="$1"
+  local budget_ms="$2"
+  local waited=0
+  local state
+  while [ "$waited" -lt "$budget_ms" ]; do
+    # 死んでいれば fork し得ないので、凍結できたのと同じ扱いでよい。
+    is_pid_alive "$pid" || return 0
+    state=$(ps -p "$pid" -o stat= 2>/dev/null || true)
+    case "$state" in
+      *T*) return 0 ;;
+    esac
+    sleep 0.05
+    waited=$(( waited + 50 ))
+  done
+  return 1
+}
+
 # DELEG-001: PID の死亡を「待って確認する」共通処理。
 # 以前は SIGTERM 後に 0.5s 待ち、まだ生きていれば SIGKILL を送って**待たずに**戻っていた。
 # 呼び出し元はその直後に respawn するため、旧 child が生きたまま新 child が起動し得た。
@@ -167,7 +191,12 @@ terminate_process_tree() {
   # そこで **走査の前に SIGSTOP で凍結する**。停止した process は fork できないので、
   # 「凍結済み集合に新しい子孫が加わらなくなった」時点で走査は閉じたと言える。
   # 親を最初に止めるのが要点で、これで新たな子は増えなくなる。
+  # 独立レビュー指摘（第5ラウンド）: STOP は非同期なので、**停止の成立を確認してから**
+  # 走査する。確認前に走査すると、まだ動いている親が走査後に fork でき、
+  # 「新しい PID なし」が閉包の証拠にならない。
+  local froze_all=1
   kill -STOP "$pid" 2>/dev/null || true
+  wait_for_stopped "$pid" 1000 || froze_all=0
 
   local frozen="$pid"
   local sweep round p new
@@ -180,17 +209,21 @@ terminate_process_tree() {
       case " $frozen " in
         *" $p "*) ;;
         *)
-          # 見つけ次第 止める。停止した process はそれ以上 fork できない。
           kill -STOP "$p" 2>/dev/null || true
           new="$new $p"
           ;;
       esac
     done
     if [ -z "$new" ]; then
-      # 新しい子孫が現れなくなった = 凍結済み集合で閉じている。
+      # 記録済みがすべて停止済みである状態で、新しい PID が現れなかった。
+      # 停止した process は fork できないので、この時点で集合は閉じている。
       settled=1
       break
     fi
+    # 次の走査を「全員停止済み」の状態で行うため、ここで停止の成立を待つ。
+    for p in $new; do
+      wait_for_stopped "$p" 1000 || froze_all=0
+    done
     frozen="$frozen$new"
   done
 
@@ -213,6 +246,12 @@ terminate_process_tree() {
 
   if [ "$dead" -ne 1 ]; then
     echo "Warning: could not confirm every process under PID $pid is dead" >&2
+    return 1
+  fi
+  if [ "$froze_all" -ne 1 ]; then
+    # 停止を確認できなかった process があるなら、その間に fork された子孫を
+    # 見落とした可能性が残る。閉包を主張しない。
+    echo "Warning: could not confirm every process under PID $pid was stopped before scanning" >&2
     return 1
   fi
   if [ "$settled" -ne 1 ]; then
