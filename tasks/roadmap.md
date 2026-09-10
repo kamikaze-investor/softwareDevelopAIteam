@@ -3242,7 +3242,18 @@ deploy canary は全 PASS だった。
       - **`supervised_runs`（#126 / #128、2026-09-09 merged）** — 「workflow progression を
         block し得る asynchronous / background operation」の共通 run state。
         `(kind, subject_id)` の active unique index が**二重生成を防ぎ**、`claim_token` /
-        startup recovery / stall sweep も設計済み。**非同期生成の host はこれが第一候補**
+        startup recovery / stall sweep も設計済み。**有力な再利用候補**だが、
+        **本 Roadmap では新用途への利用を絶対条件にしない**（CEO 判断・2026-09-10）。
+
+        着手時に、`background execution` / `deduplication` / `recovery` / `terminal state` /
+        `subject ownership` の各責務が Failure Explanation 生成にも**自然に適合するか**を
+        確認すること。適合するなら**新しい queue / daemon を作らず再利用**する。
+        不自然な責務拡張になる場合にのみ別案を検討する。
+
+        なお既存 D-1（CEO 判断・2026-09-08）は初期接続 `kind` を `ai_delegation` と
+        `expo_restart` に限定しているが、これは **rollout 順序の決定であって contract の
+        scope を狭める決定ではない**と同項に明記されている。新 `kind` の追加自体は
+        schema 変更を要求しない設計。
       - **Worker Outbox** — at-least-once が必要な場合の既存経路
       - **independent review**: 既存 designReview coordinator と `reviewSeparation.ts`
         （同一 vendor / 未知 vendor を fail-closed で弾く provider 分離アサーション）。
@@ -3326,23 +3337,29 @@ deploy canary は全 PASS だった。
       ⚠️ `copilotRouter.ts` / `copilotAdapter.ts` / `geminiRouter.ts` はいずれも
       **CONTROL REPOSITORY（AI 編集禁止）**。**import して使うだけ**にし、編集しない。
 
-      **Generator fallback**: 現在 `cheap_explainer` には **provider fallback が存在しない**
-      （`requestText` は key 不在で throw、`runOpenCodeCli` は失敗でそのまま throw）。
-      既存 router / provider 統合の範囲で最小限の fallback を検討する。
+      **Generator fallback（CEO 裁定・2026-09-10 確定）**: 現在 `cheap_explainer` には
+      **provider fallback が存在しない**（`requestText` は key 不在で throw、
+      `runOpenCodeCli` は失敗でそのまま throw）。既存 router / provider 統合の範囲で
+      最小限の fallback を用意する。
 
-      - fallback するのは **provider が利用不能なときだけ**: quota / provider unavailable /
-        auth・config / CLI・runtime execution failure
-      - **schema / content failure、「対象 Job なし」は fallback しない**。これらは
-        provider failure ではない。判定は既存の構造境界（`parseRoadmapJson` 相当の出力失敗か、
-        実行経路の失敗か）で行い、分類には既存 `classifyFailure` を使う
+      **既存 `metaReviewFallbackRouter` の fail-closed 方針を優先する。**
+      同 router の `COPILOT_ELIGIBLE_FAILURE_CLASSES = {quota, transient}` と同じ境界を採り、
+      既存挙動を変えない。
+
+      | 既存分類 | fallback するか |
+      |---|---|
+      | `quota` | ✅ する |
+      | `transient`（一時的な provider unavailable） | ✅ する |
+      | `auth_or_config` | ❌ **しない**。設定不備を fallback で隠さない |
+      | `unknown` | ❌ **しない**（既存分類で安全に fallback 可能と証明できない限り） |
+      | input / 対象 Job 不備 | ❌ しない。provider failure ではない |
+
+      - **schema / parse / structured-output failure は provider failure と分ける。**
+        これらは fallback ではなく**既存 bounded regeneration**（`priorAttemptFeedback`）で扱う
+      - 判定は既存の構造境界（出力内容の失敗か、実行経路の失敗か）で行い、分類には既存
+        `classifyFailure` を使う。**新しい error classifier を追加しない**
       - fallback 先は **既存 Codex 統合の軽量構成**。新しい汎用 model router を作らない
-      - **通常時に Codex を消費しない**。OpenCode 失敗時のみ発火する構成を優先する
-
-      ⚠️ **着手時に解決すべき既存セマンティクスとの不整合**: 既存
-      `metaReviewFallbackRouter.ts` は `COPILOT_ELIGIBLE_FAILURE_CLASSES = {quota, transient}` と
-      しており、**`auth_or_config` と `unknown` は fallback せず re-throw**（設定不備を
-      fallback で隠さない fail-closed 設計）。一方 CEO 指定では auth/config も fallback 対象。
-      どちらを採るかは実装前に判断すること。既存挙動を黙って変えない。
+      - **通常時に Codex を消費しない**。OpenCode が上表の対象クラスで失敗した時のみ発火する
 
       ⚠️ **VPS 制約（実測済み・2026-09-07）**: この VPS では Codex の bubblewrap sandbox が
       動かず、**Codex は shell command を一切実行できない**。ただし prompt → text の
