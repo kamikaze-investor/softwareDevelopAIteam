@@ -3216,6 +3216,175 @@ deploy canary は全 PASS だった。
       **今回実装しないもの（明記）**: metrics backend / トレーシング / 新しいログ基盤。
       本項目は記録のみ。
 
+
+<!-- roadmap:id=failure-explanation-pregeneration state=planned -->
+5. [ ] **Failure Explanation の事前生成と CEO 向け構造化（次段改善）** — 2026-09-10 登録。
+      #130（predicate regression 修正）とは**別責務**。#130 / Phase 3 closure を先に完了する。
+
+      **Goal**: Job が failed / blocked になった時点でバックグラウンドに説明を生成・レビュー・
+      保存し、CEO が Mobile を開いた時には**原則完成済みの説明が即表示**される状態にする。
+      現状は Mobile を開いてから on-demand 生成が走り、cheap explainer の実測が
+      1回 66〜74 秒のため待たされる（`POST /api/tasks/:id/failure-explanation`）。
+
+      **着手前に再利用可否を確認すること（新規 framework を作らない）**:
+      調査済みの再利用候補を以下に記す。作り直しの前にこれらを潰すこと。
+
+      - **`TaskFailureFacts.whatHappened`** — 「何が起きたか」は**既にコード構築の事実として存在**。
+        AI に作らせない
+      - **technical details の分離も既に存在** — `facts`（`stderrExcerpt` / `stdoutExcerpt` /
+        `exitCode` / `changedFiles` / `guardResult`）と `aiAnalysis` は型で分かれており、
+        Mobile も `TaskFailureFactsView` と AI 分析ボックスを別描画している。新設不要
+      - **`failure_explanation_json`（`PersistedTaskFailureExplanationV1`）** — 永続化・
+        `contentHash` による invalidation・`schemaVersion` / `inputVersion` は既にある。
+        事前生成の保存先はこれ。新テーブルを作らない
+      - **`cheapAiClient` / `requestText`** — provider 呼び出し経路。`opencode-go` / `mimo-v2.5`、
+        隔離 HOME、`permission:deny`。新しい client を作らない
+      - **`supervised_runs`（#126 / #128、2026-09-09 merged）** — 「workflow progression を
+        block し得る asynchronous / background operation」の共通 run state。
+        `(kind, subject_id)` の active unique index が**二重生成を防ぎ**、`claim_token` /
+        startup recovery / stall sweep も設計済み。**有力な再利用候補**だが、
+        **本 Roadmap では新用途への利用を絶対条件にしない**（CEO 判断・2026-09-10）。
+
+        着手時に、`background execution` / `deduplication` / `recovery` / `terminal state` /
+        `subject ownership` の各責務が Failure Explanation 生成にも**自然に適合するか**を
+        確認すること。適合するなら**新しい queue / daemon を作らず再利用**する。
+        不自然な責務拡張になる場合にのみ別案を検討する。
+
+        なお既存 D-1（CEO 判断・2026-09-08）は初期接続 `kind` を `ai_delegation` と
+        `expo_restart` に限定しているが、これは **rollout 順序の決定であって contract の
+        scope を狭める決定ではない**と同項に明記されている。新 `kind` の追加自体は
+        schema 変更を要求しない設計。
+      - **Worker Outbox** — at-least-once が必要な場合の既存経路
+      - **independent review**: 既存 designReview coordinator と `reviewSeparation.ts`
+        （同一 vendor / 未知 vendor を fail-closed で弾く provider 分離アサーション）。
+        新しい review framework を作らない
+      - **bounded regeneration**: `priorAttemptFeedback` +
+        `ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS` の既存パターン
+
+      **既存 schema の gap 分析（実測）**: CEO が求める6点のうち、既存 field で賄えるものは
+      再利用し、不足分のみ最小追加する。`TaskFailureAiAnalysis` は現在
+      `classification` / `likelyCause` / `impact` / `recommendedNextAction` の4 field。
+
+      | CEO が知りたいこと | 既存で賄えるか |
+      |---|---|
+      | 何が起きたか | ✅ `facts.whatHappened`（コード構築） |
+      | なぜ起きたか | ✅ `aiAnalysis.likelyCause` |
+      | 現在どういう状態か | ✅ `aiAnalysis.impact` + `facts.taskStatus` / `facts.jobStatus` |
+      | 次に**何が行われるか**（誰が） | ❌ 不足。`recommendedNextAction` は「すべきこと」で、実行主体が無い |
+      | CEO の操作が必要か | ❌ 不足（真偽値が無い） |
+      | 何を判断してほしいか | ❌ 不足（CEO 判断が要る時の具体的な問い） |
+
+      → 最小追加は3項目。ただし**「次に何が行われるか」を AI に推測させない**こと。
+      復旧 actor が実在するかは `supervised_runs.supervisor` から**導出**する。
+      これは MOB-001 で確定した「実在する recovery actor が無い限り『自動復旧中』と
+      表示しない」という原則そのもの（同じ制約が supervised_runs schema の C-9 コメントにもある）。
+
+      **Pre-generation の制約**:
+      - Job の failed / blocked 確定を **AI 生成完了待ちにしない**
+      - 説明生成の失敗が Job lifecycle・workspace ownership を壊さないこと
+        （P1 Phase 1/2 の ownership 不変条件を侵さない）
+      - Mobile からの on-demand 生成は**未生成時の fallback として残す**
+
+      **Prompt contract**: 確認済みの Job / Task / failure facts のみを入力し、入力に無い原因を
+      推測しない／原因不明なら不明と明記／非エンジニア向け日本語／Git・worktree・process 等の
+      専門語は平易に翻訳／AI 側で処理可能な技術問題を CEO へ丸投げしない／CEO 判断が必要な時
+      だけ具体的な問いを出す。自由作文に依存せず既存 schema による structured output を優先。
+      既存 system prompt（`EXPLANATION_SYSTEM_PROMPT`）には未信頼データ扱い・
+      blocked を失敗と断定しない等が既にあるので、置き換えず**追記で拡張**する。
+
+      **Independent explanation review**: 生成担当とは別 provider / model による bounded review。
+      観点は factual correctness / unsupported inference が無い / 非エンジニア CEO が理解できる /
+      next action が明確 / CEO action required の真偽が正しい / technical repair を CEO へ
+      不必要に要求していない / 不確実な原因を断定していない。
+      FAIL 時は review feedback を使った**最大1回程度の bounded regeneration**。
+
+      ⚠️ **blind retry しないこと。** `fix/roadmap-parse-failure-retry` の review で実測した
+      同種の欠陥を繰り返さない: そこでは `catch` が無条件で全 error を regeneration へ流し、
+      provider quota / auth / CLI 実行失敗 / infra まで内容 feedback 付きで再試行していた。
+      **retry 可否は「出力内容の失敗」か「provider / infra の失敗」かの構造境界で決める。**
+      分類には既存 `classifyFailure`（`quota` / `transient` / `auth_or_config` / `unknown`）を
+      使い、新しい classifier を作らない。prompt / log へ出す診断は既存 `sanitizeMessage` を
+      通し、raw stderr・巨大 stack trace・secret を混ぜない。
+      **reviewer 自体の失敗で元 Job を壊さないこと。**
+
+      **Mobile**: 生成済み analysis を優先表示。生成中は事実どおり「説明を作成中」等を表示して
+      よいが、**生成 actor が動いていない場合に「作成中」と表示しない**（MOB-001 と同じ honesty
+      原則）。生成失敗時は **AI 障害とその他の取得失敗を区別**する（#130 で入れた
+      `result.error` をそのまま出す方針を維持し、固定文言へ戻さない）。
+
+      **Acceptance（実入口で確認する）**:
+      `failed / blocked` → **Mobile を開かずに** explanation generation が始まる →
+      independent review → persistence → Mobile を開く → **reviewed explanation が即座に出る**。
+
+      さらに次の3ケースで CEO 向け説明が正しく変わることを pin する:
+      1. technical failure / CEO action 不要
+      2. Goal・spec decision / CEO action 必要
+      3. cause uncertain
+
+      **Model routing（CEO 指定・2026-09-10）**: 生成担当と review 担当を**分離**する。
+      同一 provider / model へ固定しないことを最優先とする。
+
+      | 役割 | 第一候補 | 実測した既存資産 |
+      |---|---|---|
+      | Generator | 既存 `cheap_explainer` | `opencode-go` / `mimo-v2.5`（`cheapAiClient.ts` の `CHEAP_AI_CONFIG`） |
+      | Reviewer | 既存 Copilot 統合の軽量 model | `DEFAULT_COPILOT_META_REVIEW_MODEL = 'mai-code-1.1-flash'`（`copilotRouter.ts`） |
+
+      OpenCode の別 model を Reviewer に使うこと自体は禁止しないが、**通常系では provider
+      diversity を優先し Copilot を Reviewer 第一候補**とする。分離の強制には既存
+      `packages/shared/src/reviewSeparation.ts`（同一 vendor / 未知 vendor を fail-closed で
+      弾く）を再利用し、新しい分離機構を作らない。
+
+      ⚠️ `copilotRouter.ts` / `copilotAdapter.ts` / `geminiRouter.ts` はいずれも
+      **CONTROL REPOSITORY（AI 編集禁止）**。**import して使うだけ**にし、編集しない。
+
+      **Generator fallback（CEO 裁定・2026-09-10 確定）**: 現在 `cheap_explainer` には
+      **provider fallback が存在しない**（`requestText` は key 不在で throw、
+      `runOpenCodeCli` は失敗でそのまま throw）。既存 router / provider 統合の範囲で
+      最小限の fallback を用意する。
+
+      **既存 `metaReviewFallbackRouter` の fail-closed 方針を優先する。**
+      同 router の `COPILOT_ELIGIBLE_FAILURE_CLASSES = {quota, transient}` と同じ境界を採り、
+      既存挙動を変えない。
+
+      | 既存分類 | fallback するか |
+      |---|---|
+      | `quota` | ✅ する |
+      | `transient`（一時的な provider unavailable） | ✅ する |
+      | `auth_or_config` | ❌ **しない**。設定不備を fallback で隠さない |
+      | `unknown` | ❌ **しない**（既存分類で安全に fallback 可能と証明できない限り） |
+      | input / 対象 Job 不備 | ❌ しない。provider failure ではない |
+
+      - **schema / parse / structured-output failure は provider failure と分ける。**
+        これらは fallback ではなく**既存 bounded regeneration**（`priorAttemptFeedback`）で扱う
+      - 判定は既存の構造境界（出力内容の失敗か、実行経路の失敗か）で行い、分類には既存
+        `classifyFailure` を使う。**新しい error classifier を追加しない**
+      - fallback 先は **既存 Codex 統合の軽量構成**。新しい汎用 model router を作らない
+      - **通常時に Codex を消費しない**。OpenCode が上表の対象クラスで失敗した時のみ発火する
+
+      ⚠️ **VPS 制約（実測済み・2026-09-07）**: この VPS では Codex の bubblewrap sandbox が
+      動かず、**Codex は shell command を一切実行できない**。ただし prompt → text の
+      単純呼び出しにはこの制約は効かない（既存 Codex independent review が成立しているのと同じ理由）。
+      Generator fallback は repo 探索を要求しない使い方に留めること。
+
+      **Reviewer fallback**: Copilot が利用不能なら既存 OpenCode の**別 model**で review 可能か
+      検討する。ただし **Generator と Reviewer が同一 model にならないこと**（`reviewSeparation`
+      で強制）。
+
+      - **Reviewer failure は元 Job lifecycle を壊さない**
+      - 説明生成済みだが review 未完了の場合は「**review 待ち**」として残し、後から再試行可能に
+        する。`supervised_runs` の run state（`running` / `stalled` / `succeeded` / `failed` /
+        `timed_out`）と `(kind, subject_id)` active unique index を使えば、再試行の二重起票を
+        防ぎつつ後追いできる
+      - **blind retry は禁止**。再試行は失敗分類に基づいて行う
+
+      **今回実装しないもの（明記）**: 新しい AI framework / reviewer framework / queue /
+      汎用 model router、
+      新しい provider、新しい logging 基盤。本項目は登録のみ。
+
+      **隣接する別項目（統合しない）**: cheap explainer の latency と timeout 契約
+      （`spawn({ timeout })` が 60s で子を終了させていない実測。#122 に記録）は
+      **別責務**。本項目は「いつ生成するか」、あちらは「1回の生成の時間契約」。
+
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
 **前提（正本）:** `specs/00_constitution.md`（最上位思想）、`specs/13_future_system_architecture.md`
