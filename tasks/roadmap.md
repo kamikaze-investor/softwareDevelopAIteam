@@ -3080,6 +3080,160 @@ Adapter実装を開始する指示ではない**。実装着手はHigh-priority 
 - agent runtime resume
 - low-level filesystem / network permissions
 
+## P1 stuck-running-Job recovery — CLOSED（2026-09-08）
+
+**P1 は Phase 1 / Phase 2 / Phase 3 すべて完了。** 以下はその完了記録であり、
+ここに列挙した「別扱いで open のまま維持する項目」は P1 の未完を意味しない。
+
+### Phase 1 — crash-safe startup recovery（CLOSED）
+workspace baseline の durable 保存 / quarantine と ownership safety /
+startup reconciliation。master 反映・production deploy 済み。
+
+Operational E2E で、正規 workflow が dirty workspace を継承する2経路
+（`implement:<jobId>:review` / `review:<jobId>:git-commit`）が normal Job 扱いされ
+quarantine していた admission classification の漏れを2件発見し、
+どちらも exact-shape 判定として修正・test・review・deploy 済み。
+production 上で正常 claim を確認済みのため、同一 root cause として CLOSED / VERIFIED。
+
+### Phase 2 — async per-job cgroup containment（CLOSED）
+per-job cgroup 作成 / 配置 / 非同期実行 / timeout・kill・drain /
+子孫 cleanup / 実行後 workspace reconciliation / ownership 解放の安全性。
+master 反映・production deploy 済み。production 実動確認で、直接の子が exit 0 でも
+`setsid` 子孫が残る場合に `outcome:'killed'` / `killedDescendants:true` /
+drain 22ms / cgroup 削除 を実測。deploy canary 全 PASS。
+
+### Phase 3 — 残 Finding 3件（CLOSED）
+- **R5-N1** 通知の再送・fallback: merged / deployed / operational check PASS
+- **DB-007** WatchdogEvent の durable dedup: merged / migration 適用済み / operational check PASS
+  （dedup key は `(job_id, started_at)`。復旧後の正当な再 stall を潰さないため job_id 単独にしない）
+- **MOB-001** Mobile の stalled / quarantine 可視化: merged（#113 / #116 / #117）
+
+MOB-001 は CEO 実機確認で UX defect を検出し #117 で修正。
+別 provider による bounded UI/UX independent review は **APPROVE**（6観点すべて RESOLVED）。
+
+**UNVERIFIED — no naturally quarantined production Job available**:
+修正版 quarantine UI の再実機確認だけは、確認時点で自然発生した quarantined Job が
+0件のため未実施。**P1 completion の blocker とはしない**（人工的な quarantine を
+production に作らない方針のため）。将来自然な quarantine が発生した時点で
+operational observation として確認する。
+
+**CEO 実機再確認（2026-09-09〜10）— MOB-001 の残 2 項目**:
+
+- **approval waiting**: `UNVERIFIED — no naturally pending approval available`。
+  確認時点で自然発生した approval 待ち Job が 0 件のため未実施。quarantine UI と同じ扱いで
+  P1 completion の blocker とはしない（人工的な approval を production に作らない方針）。
+
+- **failure explanation / AI question**: `PASS — functional`（2026-09-10 CEO 実機確認）。
+  当初は `FAIL — API refused before the AI call` として記録したが、**#130 で修正し
+  production 反映後に実経路で PASS を確認**した。実経路
+  Mobile → API → failure explanation 生成 → AI response → Mobile 表示 が成立。
+
+  **実測 evidence**: target Job `ecfa0132-cbb0-4293-baf9-0c25aa93c593` の
+  `failure_explanation_json` が **NULL → 生成済み**（`classification=configuration`、
+  `likelyCause` / `impact` / `recommendedNextAction` すべて充足、
+  `generatedAt` 2026-09-10T09:24:12Z）。DB 全体の生成済み件数も **0 → 1** で、
+  その1件が対象 Job 本体であることを帰属レベルで確認済み（候補 Task は14件あるため、
+  DB 全体件数だけでは帰属を示せない）。「AIに質問する」も同 Task で回答本文を実機確認。
+
+  説明品質（非エンジニア向けの分かりやすさ・technical vocabulary の多さ・
+  CEO と AI 開発チームの責任分離・フォーマット固定）の課題は **functional blocker とせず**、
+  既存 item `failure-explanation-pregeneration`（**post-MVP**）へ統合済み。
+  MVP 完成まで説明品質改善を理由に本線を止めない（CEO 判断・2026-09-10）。
+
+  以下は当初 FAIL の原因記録として残す。
+  「実行失敗の説明」「AIに質問する」の両方が AI 障害の文言を返していたが、production log で
+  **AI が一度も呼ばれていなかった**ことが判明した。CEO の 3 リクエスト（Task `11066c6f`）は
+  いずれも HTTP 200 / 4.7ms・44.7ms・5.5ms で完了し `level:40` warn は 0 件。provider を実コードで
+  直接叩いた実測は 1 回 66〜74 秒なので、5ms は AI 呼び出し前の早期 return を意味する。
+
+  原因は Mobile と API の表示述語の乖離。Mobile (`[id].tsx:725`) は
+  `failed || blocked || task.blocked`、API (`tasks.ts:192`) は `failed || task.blocked` で、
+  `blocked` が欠けていた。**Job が blocked でも Task は `pending` に留まる**ため、
+  この状態の Task（production 上 **14 件**。当初 3 件と報告したが直近25件しか見ておらず、
+  全件走査で14件と判明）では
+  Mobile が説明セクションを表示するのに API が「対象なし」を返していた。
+
+  元実装 `4ad0fb6` では両者は一致していた。`d8bcf0c`（#124）で **Mobile 側だけを広げた
+  regression** であり、MOB-001 自身の責務内。既存 AI provider / router の障害ではない
+  （quota・auth・timeout・parse failure・missing record のいずれでもない）。
+
+  修正は共通経路 1 点。API 側で既存 `isTaskFailureJob()` を `shouldExplain` にも共有させ、
+  両サイトが二度と別々に書かれないようにした。あわせて Mobile が `result.error` /
+  `answer.error` をそのまま表示するようにし、AI 以外の原因（対象 Job なし・通信エラー）を
+  AI 障害として誤報しないようにした。この誤報が診断を困難にしていた二次欠陥である。
+
+**派生 Finding（本 PR では修正しない・別扱いで open）**:
+`cheapAiClient` の実測レイテンシが 1 回 66〜74 秒で、`CHEAP_AI_CONFIG.timeoutMs = 60_000` を
+超えているのに 2 回の probe が成功した（`spawn({ timeout })` が子を終了させていない）。
+述語修正後は実際に AI 生成が走るようになるため表面化する。60s 設定値と Cloudflare の
+100s 上限の両方に近いことも含め、`containment-success-path-observability` とは別の
+`cheap-ai-latency-and-timeout-contract` として扱う。
+
+### P1 完了時点の production 実測
+API health 200 / API・Worker とも active・NRestarts=0 / production tree clean /
+`/workspace/target` clean / running Job 0 / quarantined Job 0 /
+DB `integrity_check` ok / Worker エラーログ 0。
+
+### P1 とは分離して open のまま維持する項目（P1 の未完ではない）
+これらは P1 の実装で顕在化した、または隣接する別責務であり、重複 Finding は作らない。
+
+- shared-workspace leakage / cleanup-deadlock（本節の該当項目へ集約済み）
+- worktree isolation（`project-auto-worker-trust-boundary`）
+- adversarial cgroup escape（`containment-adversarial-escape-threat-model`）
+- `Delegate=yes` hardening（`worker-cgroup-delegation-contract`）
+- containment success path の可観測性（`containment-success-path-observability`）
+- Meta Reviewer robustness（`meta-review-structured-output-robustness`）
+- background-task supervision
+- legacy `API_TOKEN` → ADMIN / WORKER split credential migration
+- cheap AI（説明・質問経路）の latency と timeout 契約（`cheap-ai-latency-and-timeout-contract`）
+
+
+### 次に着手すべき root-cause cluster（P1 完了時点の handoff・2026-09-08）
+
+**選定: shared workspace の dirty leakage → 恒久 quarantine（cleanup-deadlock）→ worktree isolation**
+
+**なぜ次か**: open 項目の中で、**実際に production の workflow を止め、
+CEO 承認の手動介入を要した唯一のクラスタ**であるため。2026-09-08 の Operational E2E で
+2回実測しており、再現性がある（別 Project でも再発）。他の open 項目は
+hardening（`Delegate=yes`・containment observability）、対象外と判断済みの threat model
+（adversarial escape）、あるいは別系統（Meta Reviewer robustness）であり、
+いずれも現時点で production を停止させていない。
+
+**既存実装との関係**:
+- P1 Phase 1 がこの問題を**可視化**した。以前は「前 attempt の未 commit 変更が
+  次 Job へ静かに混入する」汚染だったものが、baseline admission により
+  `workspace_baseline_failure` quarantine として**停止**するようになった。
+  Phase 1 が原因ではなく、既存の欠陥を検出できるようにしただけである
+- P1 Phase 2（containment）はこの問題に触れていない。cgroup はプロセスを回収するが、
+  ファイルシステム上に残った変更は回収しない
+- **clearance の known-good 要件を緩めて解決してはならない。** それは
+  「安全と証明できない限り所有権を解放しない」という hard invariant そのもの。
+  不足しているのは安全性チェックではなく、**dirty から正規に known-good へ戻す経路**
+
+**ledger 上の注意（着手前に解消すべき）**: この root cause を扱う
+`project-auto-worker-trust-boundary` は `state=done` になっている。
+これは「設計項目（実装を伴わない）」として完了した経緯によるもので、
+worktree isolation の**実装は未着手**。つまり現状、この cluster には
+**open な owner 項目が無い**。新しい重複 Finding を作るのではなく、
+この項目の state を実態に合わせるか、実装用の後継項目を1件立てるかを先に決めること。
+
+**最初に行う read-only 調査（実装前）**:
+1. 残った変更の**帰属**を既存情報だけで特定できるか。`workspace_baseline` /
+   `buildWorktreeManifest` / `fingerprintWorktreeEntries` / repair 情報から
+   「どの source Job が作った変更か」を判定できるか
+2. `revertBlockedJobChanges()` の適用条件（現在は File Change Guard 違反時のみ、
+   かつ manifest 由来の変更のみ）を、untracked を含む一般的な cleanup へ
+   安全に広げられるか。広げられない場合は何が不足しているか
+3. worktree isolation（1 Job = 1 worktree）を既存 `resumeBlockedTask()` の
+   「新 Job 行を作る」形へ載せられるか。roadmap 424-470 行の既存設計案が
+   現在の Phase 1/2 実装（baseline / quarantine / containment）と整合するか
+4. 帰属不能な変更が残った場合の扱い。**自動削除はしない**方針を維持したまま、
+   quarantine 維持 + PL エスカレーションで運用が回るか
+
+**着手時の禁止事項**: 曖昧な変更の自動削除 / CEO への Git 判断の要求 /
+clearance 条件の緩和 / 新しい cleanup subsystem の先行実装。
+
+
 **現行P1実装の位置づけ:** P1 Phase 1（workspace baseline・quarantine・startup reconciliation）と
 P1 Phase 2（async per-job cgroup containment）は**いずれも完了**している
 （Phase 2: 2026-09-08、master `5825433`、production deploy 済み）。これらは
