@@ -6,7 +6,7 @@
 **セッション開始時に必ず `AGENTS.md`（リポジトリルート）も読むこと。**
 AGENTS.md には Claude Code・Codex 共同運用ルールと TypeScript 品質ルールが含まれる。
 
-**AI Team OS全体の共通行動原則の正本**: `specs/00_constitution.md` 3.14〜3.16（最小検証・必要最小反証／CEO確認最小化・自律判断／複雑性防止・状態空間削減）。明示的なSafety Ruleを常に優先する。
+**AI Team OS全体の共通行動原則の正本**: `specs/00_constitution.md` 3.14〜3.17（最小検証・必要最小反証／CEO確認最小化・自律判断／複雑性防止・状態空間削減）。明示的なSafety Ruleを常に優先する。
 
 ---
 
