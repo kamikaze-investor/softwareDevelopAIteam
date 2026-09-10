@@ -606,6 +606,77 @@ describe('Task failure explanation routes', () => {
     }
   })
 
+  // production regression（2026-09-09 CEO実機）: Task は pending のまま、最新 Job だけが
+  // blocked という状態が正規に存在する（Job が blocked でも Task は pending に留まる）。
+  // Mobile はこの状態で説明セクションを表示するのに、API 側の述語が `failed` のみだったため
+  // 「対象なし」を 5ms で返し、AI を一度も呼ばずに「AI分析を取得できませんでした」と
+  // 表示されていた。両者の述語一致をここで固定する。
+  it('explains a blocked latest Job even while the Task is still pending', async () => {
+    const { app, storage } = await buildApp()
+    try {
+      const task = createTask(storage, 'pending')
+      createFailureJob(storage, task, 'blocked')
+
+      const body = await postFailureExplanation(app, task.id)
+
+      expect(body.ok).toBe(true)
+      if (!body.ok) throw new Error('expected an explanation')
+      expect(body.explanation.aiAnalysis.classification).toBe('environment')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('answers a question about a blocked latest Job while the Task is still pending', async () => {
+    const { app, storage } = await buildApp()
+    try {
+      const task = createTask(storage, 'pending')
+      createFailureJob(storage, task, 'blocked')
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/failure-ask`,
+        payload: { question: 'なぜ止まっていますか？' },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(response.json<TaskFailureQuestionResponse>()).toEqual({
+        ok: true,
+        answer: 'AIによる分析: まずstderrの記録を確認してください。',
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
+  // 広げすぎないことも固定する。Job が terminal success なら説明対象ではない。
+  it('does not explain when the latest Job succeeded and the Task is pending', async () => {
+    const { app, storage } = await buildApp()
+    try {
+      const task = createTask(storage, 'pending')
+      const created = storage.jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        aiCliProvider: 'codex',
+        aiCliPrompt: 'Succeeded prompt',
+        aiCliMode: 'implement',
+      })
+      storage.jobs.update(created.id, { status: 'success', exitCode: 0 })
+
+      const body = await postFailureExplanation(app, task.id)
+
+      expect(body).toEqual({
+        ok: false,
+        error: '説明対象の失敗・停止Jobが見つかりませんでした',
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
   it('answers a question without persisting client-supplied history', async () => {
     const { app, storage } = await buildApp()
     try {
