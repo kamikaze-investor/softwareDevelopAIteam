@@ -2805,7 +2805,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 <!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=planned -->
 0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無く、productionで403になる**
-   （2026-09-10登録。PR #136 のIndependent Reviewで同型の欠陥が指摘され、
+   （2026-09-10登録、**高優先度 — live production defect**。CEO判断: PR #136 には混ぜず、
+   continuation E2E完了後に別PRで扱う。PR #136 のIndependent Reviewで同型の欠陥が指摘され、
    既存経路にも同じ漏れがあることが判明した）。
 
    **内容**: Workerは毎poll cycleで `POST /api/supervised-runs/reconcile` を呼ぶ
