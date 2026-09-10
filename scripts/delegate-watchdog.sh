@@ -101,7 +101,17 @@ wait_for_death() {
 # 深さは明示的に打ち切る（独立レビュー指摘: 無制限再帰にしない）。
 # 実運用の provider → tool は数段で、これを超える深さは異常なので
 # 打ち切って上位の kill と再走査に委ねる。
-MAX_DESCENDANT_DEPTH="${DELEGATION_MAX_DESCENDANT_DEPTH:-8}"
+# 独立レビュー指摘（第4ラウンド）: 非数値を渡すと line 121 の比較が
+# `integer expected` を出すだけで、if 条件内なので set -e も止めず、
+# **深さ上限が事実上無効化される**。既存の MAX_RECOVERY_RETRIES と同じ形で検証する。
+REQUESTED_MAX_DESCENDANT_DEPTH="${DELEGATION_MAX_DESCENDANT_DEPTH:-8}"
+case "$REQUESTED_MAX_DESCENDANT_DEPTH" in
+  *[!0-9]*|"") MAX_DESCENDANT_DEPTH=8 ;;
+  *) MAX_DESCENDANT_DEPTH=$((10#$REQUESTED_MAX_DESCENDANT_DEPTH)) ;;
+esac
+if [ "$MAX_DESCENDANT_DEPTH" -lt 1 ]; then
+  MAX_DESCENDANT_DEPTH=8
+fi
 
 # 深さ上限で打ち切ったことを呼び出し元へ伝える。
 #
@@ -150,63 +160,69 @@ terminate_process_tree() {
     return 1
   fi
 
-  # 独立レビュー指摘: 子孫を1回スナップショットしただけでは、
-  # 走査後・親の死亡前に新しく fork された子孫を取りこぼす。
-  # 親がまだ生きている（＝新しい子を作れる）間は、走査と kill を
-  # 「新しい子孫が見つからなくなるまで」有限回繰り返す。
-  local sweep
-  local descendants=""
-  local round
-  local drained=0
+  # 独立レビュー指摘（第4ラウンド）: 有限回の再走査では snapshot race は閉じない。
+  # 走査した直後に fork された子は、記録済みの親が死んだ時点で reparent され、
+  # 親PID起点では二度と辿れなくなる。
+  #
+  # そこで **走査の前に SIGSTOP で凍結する**。停止した process は fork できないので、
+  # 「凍結済み集合に新しい子孫が加わらなくなった」時点で走査は閉じたと言える。
+  # 親を最初に止めるのが要点で、これで新たな子は増えなくなる。
+  kill -STOP "$pid" 2>/dev/null || true
+
+  local frozen="$pid"
+  local sweep round p new
+  local settled=0
   local truncated=0
   for round in 1 2 3 4 5; do
-    # 走査の終了コードで深さ打ち切りを受け取る（subshell を跨ぐため変数では渡せない）。
     if sweep=$(collect_descendants "$pid"); then :; else truncated=1; fi
-    if [ -z "$sweep" ]; then
-      # 空の走査を1回得られて初めて「子孫は残っていない」と言える。
-      drained=1
+    new=""
+    for p in $sweep; do
+      case " $frozen " in
+        *" $p "*) ;;
+        *)
+          # 見つけ次第 止める。停止した process はそれ以上 fork できない。
+          kill -STOP "$p" 2>/dev/null || true
+          new="$new $p"
+          ;;
+      esac
+    done
+    if [ -z "$new" ]; then
+      # 新しい子孫が現れなくなった = 凍結済み集合で閉じている。
+      settled=1
       break
     fi
-    descendants="$descendants $sweep"
-    local p
-    for p in $sweep; do
-      kill "$p" 2>/dev/null || true
-    done
-    for p in $sweep; do
-      wait_for_death "$p" 500 || kill -9 "$p" 2>/dev/null || true
-    done
+    frozen="$frozen$new"
   done
 
-  # 子孫を止めてから親を落とす。順序が逆だと親の死亡で子が reparent され、
-  # pgrep -P では二度と辿れなくなる。
-  # ここまでで確認しきれていなくても親は落とす（これ以上 fork させないため）が、
-  # **成功としては報告しない**。
-  kill "$pid" 2>/dev/null || true
-  if ! wait_for_death "$pid" 1000; then
-    kill -9 "$pid" 2>/dev/null || true
-    wait_for_death "$pid" 1000 || return 1
-  fi
+  # 凍結したものは必ず始末する。ここで return してしまうと STOP されたままの
+  # process を残すことになり、stale child を増やす側に回ってしまう。
+  # 子孫 → 親 の順に落とす。
+  local ordered=""
+  for p in $frozen; do
+    [ "$p" = "$pid" ] || ordered="$p $ordered"
+  done
+  for p in $ordered; do
+    kill -9 "$p" 2>/dev/null || true
+  done
+  kill -9 "$pid" 2>/dev/null || true
 
-  # 独立レビュー指摘: 5周回りきったこと（上限到達）と「子孫が居なくなったこと」は
-  # 別である。上限で抜けた場合、直近の走査以降に fork された子は reparent されて
-  # 親PID起点では追えないため、**確認できなかった**として非0で返す。
-  if [ "$drained" -ne 1 ]; then
-    echo "Warning: descendants of PID $pid still appearing after $round sweeps; cannot confirm the tree is dead" >&2
+  local dead=1
+  for p in $frozen; do
+    wait_for_death "$p" 1000 || dead=0
+  done
+
+  if [ "$dead" -ne 1 ]; then
+    echo "Warning: could not confirm every process under PID $pid is dead" >&2
+    return 1
+  fi
+  if [ "$settled" -ne 1 ]; then
+    echo "Warning: new descendants of PID $pid kept appearing across $round sweeps; tree not confirmed" >&2
     return 1
   fi
   if [ "$truncated" -eq 1 ]; then
     echo "Warning: descendant scan for PID $pid hit MAX_DESCENDANT_DEPTH; deeper children may survive" >&2
     return 1
   fi
-
-  # 記録した子孫がすべて死んでいることを最後に確認する。
-  local q
-  for q in $descendants; do
-    if is_pid_alive "$q"; then
-      kill -9 "$q" 2>/dev/null || true
-      wait_for_death "$q" 500 || return 1
-    fi
-  done
 
   return 0
 }
