@@ -40,6 +40,7 @@ async function buildApp(): Promise<FastifyInstance> {
     { approvalGateRoutes },
     { approvalRoutes },
     { knowledgeGraphRoutes },
+    { taskContinuationRoutes },
     { resetStorage },
   ] = await Promise.all([
     import('../routes/projects.js'),
@@ -50,6 +51,7 @@ async function buildApp(): Promise<FastifyInstance> {
     import('../routes/approvalGate.js'),
     import('../routes/approvals.js'),
     import('../routes/knowledgeGraph.js'),
+    import('../routes/taskContinuations.js'),
     import('../storage/index.js'),
   ])
 
@@ -68,6 +70,7 @@ async function buildApp(): Promise<FastifyInstance> {
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(approvalRoutes, { prefix: '/api' })
   app.register(knowledgeGraphRoutes, { prefix: '/api' })
+  app.register(taskContinuationRoutes, { prefix: '/api' })
   await app.ready()
   return app
 }
@@ -243,6 +246,20 @@ describe('Worker↔API authority separation — WORKER credential: allowlist 12�
         url: '/api/watchdog-events/non-existent-id',
         headers: workerAuthHeader(),
         payload: {},
+      })
+      expect(res.statusCode).not.toBe(401)
+      expect(res.statusCode).not.toBe(403)
+    })
+  })
+
+  // production は credential split が有効なため、allowlist 漏れは 403 になる。
+  // Worker 側は !response.ok を warn して返すだけなので、continuation が黙って止まる。
+  it('POST /api/task-continuations/reconcile が通る', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/task-continuations/reconcile',
+        headers: workerAuthHeader(),
       })
       expect(res.statusCode).not.toBe(401)
       expect(res.statusCode).not.toBe(403)
