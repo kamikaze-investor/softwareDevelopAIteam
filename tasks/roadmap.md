@@ -2804,30 +2804,45 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    まずread-onlyで調査し、call pathと最小変更案を出してから実装する。
 
 <!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=planned -->
-0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無く、productionで403になる**
-   （2026-09-10登録、**高優先度 — live production defect**。CEO判断: PR #136 には混ぜず、
-   continuation E2E完了後に別PRで扱う。PR #136 のIndependent Reviewで同型の欠陥が指摘され、
-   既存経路にも同じ漏れがあることが判明した）。
+0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**
+   （2026-09-10登録。PR #136 のIndependent Reviewで同型の欠陥が指摘され、
+   既存経路にも同じ漏れがあることが判明した。**PR #136 には混ぜない**）。
 
    **内容**: Workerは毎poll cycleで `POST /api/supervised-runs/reconcile` を呼ぶ
    （`apps/worker/src/index.ts`）が、このrouteは `WORKER_ALLOWLIST`
    （`apps/api/src/auth/workerAllowlist.ts`）に**含まれていない**。
-   WORKER credentialはDefault Denyなので（`apps/api/src/auth/apiToken.ts:103`）、
-   credential splitが有効なproduction（`/srv/ai-team/env/worker.env`）では**毎cycle 403**になる。
+   WORKER credentialはDefault Denyのため（`apps/api/src/auth/apiToken.ts:103`）、
+   **credential splitを有効化した時点で毎cycle 403**になる。
 
-   **帰結**: Worker側は `!response.ok` をwarnして返すだけなので**静かに失敗し続ける**。
-   supervised run の reconcile が一度も成立せず、完了済みの委任が RUNNING のまま残り、
-   `#110 Step 3` で配線した「terminal後のcontinuation起動」も動かない可能性が高い。
-   **production実機での確認が必要**（本項目はまず事実確認から）。
+   **重要な訂正（2026-09-10、production実測）**: 登録時は「live production defectであり
+   現に403になっている」と記載したが、**これは誤りだった**。本番APIの実プロセス環境変数は
+   `API_TOKEN` のみで、`ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` は**設定されていない**。
+   したがって `apiToken.ts` は `legacySingleTokenAuth` へ落ち、**allowlistは一切評価されない**。
 
-   **注意**: PR #136 は自分が追加した `POST /api/task-continuations/reconcile` のみを
-   allowlistへ追加した（MVPスコープ維持のため）。本項目はその**既存側の同型欠陥**であり、
-   #136には混ぜていない。
+   実測（PR #136 deploy直後、WORKER credentialで実行）:
+   - `POST /api/supervised-runs/reconcile` → **200**（403ではない）
+   - split有効時にWORKERへ明示的に禁止される `PATCH /api/approvals/:id` → **404**
+     （routeに到達している = allowlist不適用）
+   - Worker journalにも403警告は出ていない
+
+   **現状の正しい評価**: 稼働中のproductionは壊れていない。**潜在欠陥**であり、
+   credential split（`ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` の設定）を
+   有効化した瞬間に顕在化する。したがって
+   **「splitを有効化する作業」の前提条件**として扱うのが正しい。
+
+   **顕在化した場合の帰結**: Worker側は `!response.ok` をwarnして返すだけなので
+   静かに失敗し続ける。supervised run の reconcile が成立せず、完了済みの委任が
+   RUNNING のまま残り、`#110 Step 3` で配線した「terminal後のcontinuation起動」も動かない。
+
+   **付随して確認が要る点**: credential splitが現在無効ということは、
+   `docs`・memory類にある「本番はauth splitを強制している」という記述が事実と異なる。
+   splitを有効化する予定があるのか、既に廃止されたのかをCEOへ確認すること。
 
    **再発防止（本項目の一部として検討）**: allowlist漏れはunit testでは検出しにくい
    （`WORKER_ALLOWLIST` を反復するテストは追加後に自動でpassする）。
-   Workerが呼ぶroute一覧とallowlistの整合を確認する手段を持つか、
-   `workerCredentialAuthorization.test.ts` に経路ごとの統合テストを足すかを決める。
+   PR #136 では自分が追加したrouteについて、実route登録＋auth hookを通す統合テストを
+   `workerCredentialAuthorization.test.ts` へ足した。同型のテストを既存の
+   Worker呼び出し経路すべてに用意するか、経路一覧とallowlistの整合を確認する手段を持つか決める。
 
 <!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
 0. [ ] **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**
