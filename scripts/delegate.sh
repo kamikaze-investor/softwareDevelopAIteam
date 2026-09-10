@@ -32,9 +32,60 @@ fi
 RUN_DIR="${DELEGATION_RUN_DIR:-$(dirname "$LOG")/.delegate-$(date +%s)-$$}"
 mkdir -p "$RUN_DIR"
 
-nohup "$OPENCODE_BIN" run "$PROMPT" -m "$MODEL" --dir "$(pwd)" > "$LOG" 2>&1 &
-PID=$!
+# DELEG-001: provider は **専用の process group** で起動する。
+# delegate-watchdog.sh は終了を PGID 単位で行うため、初回起動から同じ契約にしないと
+# 旧 provider を group ごと止められない。
+# setsid が無い環境では fallback せず unsupported として失敗させる
+# （旧 PID tree kill は安全性を証明できなかったため戻さない）。
+if ! command -v setsid >/dev/null 2>&1; then
+  echo "setsid is unavailable; supervised delegation is unsupported on this platform" >&2
+  exit 1
+fi
+
+OWN_PGID=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || echo "")
+
+# PID/PGID は provider 自身に exec 前に報告させる。親から ps で後追いすると、
+# 起動直後に終了する provider の group を特定できず fail-closed に倒れる。
+REPORT="$RUN_DIR/provider_identity"
+rm -f "$REPORT" "$REPORT.tmp"
+
+setsid bash -c '
+pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d " ")
+printf "%s %s\n" "$$" "$pgid" > "$1.tmp" && mv "$1.tmp" "$1"
+shift
+exec "$@"
+' _ "$REPORT" "$OPENCODE_BIN" run "$PROMPT" -m "$MODEL" --dir "$(pwd)" < /dev/null > "$LOG" 2>&1 &
+SPAWN_PID=$!
+
+WAITED=0
+while [ ! -s "$REPORT" ] && [ "$WAITED" -lt 2000 ]; do
+  sleep 0.02
+  WAITED=$(( WAITED + 20 ))
+done
+if [ ! -s "$REPORT" ]; then
+  echo "provider did not report its process group" >&2
+  kill -KILL "$SPAWN_PID" 2>/dev/null || true
+  exit 1
+fi
+
+PID=""
+PGID=""
+read -r PID PGID < "$REPORT"
+case "$PID" in
+  ''|*[!0-9]*) echo "provider reported a non-numeric pid '$PID'" >&2; kill -KILL "$SPAWN_PID" 2>/dev/null || true; exit 1 ;;
+esac
+case "$PGID" in
+  ''|*[!0-9]*) echo "provider reported a non-numeric pgid '$PGID'" >&2; kill -KILL "$PID" 2>/dev/null || true; exit 1 ;;
+esac
+# setsid が効いていれば provider は session/process group leader なので pid == pgid。
+if [ "$PGID" = "1" ] || [ "$PID" != "$PGID" ] || { [ -n "$OWN_PGID" ] && [ "$PGID" = "$OWN_PGID" ]; }; then
+  echo "provider did not get its own process group (pid=$PID pgid=$PGID)" >&2
+  kill -KILL "$PID" 2>/dev/null || true
+  exit 1
+fi
+
 echo "$PID" > "$RUN_DIR/pid"
+echo "$PGID" > "$RUN_DIR/pgid"
 echo "$LOG" > "$RUN_DIR/current_log"
 echo "$LOG" > "$RUN_DIR/base_log"
 echo 1 > "$RUN_DIR/attempt"

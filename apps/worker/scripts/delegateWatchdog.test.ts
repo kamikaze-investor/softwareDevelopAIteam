@@ -1,10 +1,32 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
 const watchdogTestScript = fileURLToPath(
   new URL('../../../scripts/delegate-watchdog.test.sh', import.meta.url),
 )
+
+/**
+ * DELEG-001: provider は専用 process group (setsid) で起動する契約になった。
+ * setsid が無い platform では supervised delegation 自体を unsupported として
+ * fail-closed させる方針なので、この shell test も実行できない。
+ *
+ * ただし **黙って skip させない**。skip が既定になると
+ * 「監視していると宣言しているだけで監視していない」状態を CI が緑で隠してしまう。
+ * CI は Linux (ubuntu-latest) なので、Linux で setsid が無い場合は skip ではなく失敗させる。
+ */
+function hasSetsid(): boolean {
+  const probe = spawnSync('bash', ['-lc', 'command -v setsid'], { encoding: 'utf8' })
+  return probe.status === 0 && (probe.stdout ?? '').trim().length > 0
+}
+
+const SETSID_AVAILABLE = hasSetsid()
+if (!SETSID_AVAILABLE && process.platform === 'linux') {
+  throw new Error(
+    'setsid is missing on a Linux host. The delegate-watchdog shell suite would be skipped, ' +
+    'which would hide the DELEG-001 process-group behaviour from CI. Refusing to skip.',
+  )
+}
 
 /**
  * DELEG-001: この shell test は非決定的に失敗していた
@@ -35,7 +57,7 @@ function resolveRuns(raw: string | undefined): number {
 
 const RUNS = resolveRuns(process.env.DELEGATE_WATCHDOG_TEST_RUNS)
 
-describe('delegation watchdog shell flow', () => {
+describe.skipIf(!SETSID_AVAILABLE)('delegation watchdog shell flow', () => {
   it(`fails closed, bounds retries, preserves logs, and protects unrelated PIDs (x${RUNS}, DELEG-001 非決定性の回帰)`, () => {
     for (let run = 1; run <= RUNS; run++) {
       let output: string

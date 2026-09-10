@@ -2740,7 +2740,40 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    | risk | 状態 |
    |---|---|
    | 1. respawn時に旧childを確実に終了できない | **mitigation implemented** — PID同定失敗時は素通りせず **fail-closed**（respawnせず terminal verdict へ倒す）。TERM/KILL 後に **death confirmation** を追加 |
-   | 4. stale / duplicate child が残る | **mitigation implemented** — 子孫を深さ優先で列挙し、子孫→親の順にkillし、事後にも刈り取る |
+   | 4. stale / duplicate child が残る | **mitigation implemented** — provider を `setsid` で**専用 process group** に置き、終了を **PGID単位**で TERM → bounded wait → KILL → bounded 確認する。旧groupの終了を確認できるまで replacement を起動しない |
+
+   **PID tree走査から専用 process group へ切り替えた（2026-09-10、CEO方針1）**。
+   走査方式は「列挙とkillの間にforkされた子」を構造的に取りこぼし、SIGSTOPによる凍結を
+   足しても停止確認前にexitした子の孫が漏れる経路が残った（独立レビュー第4〜6ラウンド）。
+   継ぎ足しをやめ、`delegate.sh` の初回起動と watchdog の respawn の**両方**を同一契約にした。
+   **`setsid` が無いplatformでは旧PID tree killへfallbackせず unsupported として失敗させる。**
+
+   **PGIDが全子孫を必ず捕捉すると主張はしない。** 子自身が `setsid`/`setpgid` で group を
+   離脱した場合は捕捉できない。実provider経路でgroup escapeが起きないことは
+   E2E・独立レビューで確認する。escapeが見つかった場合もPID走査へは戻さず、
+   既存の cgroup containment の再利用を検討する。
+
+   **process group化の作業中に別の欠陥を発見・修正した（2026-09-10）**:
+   当初の実装は起動後に親から `ps -o pgid=` をpollして provider の PGID を特定していた。
+   この方式では**起動直後に終了する provider**（不正なmodel名・認証失敗・即時crash）の
+   PGIDを取得できず、**retryすべき場面で `ESCALATE:stale_child` に fail-closed する**。
+   Linux実測で、即死providerの50回retryケースが `ESCALATE:recovery_exhausted` ではなく
+   `ESCALATE:stale_child` に化けた。しかも `ps` が死にゆくprocessを捕まえられるかは
+   タイミング依存のため、**同一コードで通ったり落ちたりする非決定的失敗**として現れた
+   （同じsuiteが5回連続passした後に失敗）。
+   修正: PID/PGIDの特定を親からの後追い観測ではなく、**provider自身が `exec` の前に
+   報告する**方式へ変更した（atomic な `mv` で `provider_identity` へ記録）。
+   `setsid` が効いていれば provider は session/process group leader なので
+   **pid == pgid** が成立し、これを不変条件として検証する（不一致ならfail-closed）。
+   これにより即死providerでも記録が必ず残り、観測タイミングへの依存が無くなる。
+
+   **これは risk 2（recovery attempt二重計上）の原因ではない。** 本欠陥は process group 化の
+   過程で新たに作り込んだもので、元の `recovery_attempt_count 1→2` とは別物である。
+   元の非決定性の原因は依然として未解明である。
+
+   **retry accounting の位置も修正した**: `record_retry_event`（`recovery_attempt_count` を
+   加算する処理）は respawn の起動**前**に呼ばれていたため、launch に失敗して terminal へ
+   倒れた回まで計上され得た。**replacement が実際に起動できた後**にだけ計上する位置へ移した。
    | 2. recovery attemptが二重計上される | **root cause unresolved** |
    | 3. bounded recoveryが予定より早くexhaustする | **root cause unresolved**（2の帰結のため） |
 
