@@ -25,7 +25,11 @@ if [[ "$PROMPT" != *"AI_TEAM_OS_STATUS:"* ]]; then
   PROMPT="${PROMPT}${MARKER_INSTRUCTION}"
 fi
 
-RUN_DIR="$(dirname "$LOG")/.delegate-$(date +%s)-$$"
+# Supervised launch (apps/api/src/supervision/delegationSupervisor.ts) needs the run_dir to be
+# known BEFORE the delegation starts, because it is the completion predicate's input and is
+# recorded on the supervised_runs row at creation time. Without this override the run_dir is only
+# discoverable by parsing this script's stdout, which cannot be done atomically with the launch.
+RUN_DIR="${DELEGATION_RUN_DIR:-$(dirname "$LOG")/.delegate-$(date +%s)-$$}"
 mkdir -p "$RUN_DIR"
 
 nohup "$OPENCODE_BIN" run "$PROMPT" -m "$MODEL" --dir "$(pwd)" > "$LOG" 2>&1 &

@@ -83,6 +83,12 @@ export class CodexAdapter extends BaseCliAdapter {
     const reasoningArgs = request.reasoningEffort
       ? ['-c', `model_reasoning_effort="${request.reasoningEffort}"`]
       : []
+
+    // sandbox互換フラグも任意。立てた呼び出しだけに付き、既存呼び出し元のargvは不変。
+    // このVPSではbubblewrapが動かず、これが無いとCodexはrepoを読めない（deprecatedな暫定経路）。
+    const sandboxCompatArgs = request.useLegacyLandlockSandbox
+      ? ['-c', 'use_legacy_landlock=true']
+      : []
     const outputLastMessagePath =
       (request as CodexLastMessageRequest).codexOutputLastMessagePath
     const outputLastMessageArgs = outputLastMessagePath
@@ -94,6 +100,7 @@ export class CodexAdapter extends BaseCliAdapter {
       '--sandbox', sandboxMode,
       ...modelArgs,
       ...reasoningArgs,
+      ...sandboxCompatArgs,
       '-C', request.workingDir,   // ワークスペースルートを明示（execFileSync の cwd と一致）
       '--ephemeral',               // Workerの自動実行ではセッションファイルを残さない
       ...outputLastMessageArgs,

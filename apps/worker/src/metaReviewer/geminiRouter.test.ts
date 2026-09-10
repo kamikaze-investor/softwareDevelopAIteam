@@ -94,6 +94,30 @@ describe('classifyFailure', () => {
     expect(classifyFailure({ text: 'invalid quota project id' })).not.toBe('quota')
   })
 
+  it('Codex/Claude CLI の usage-limit / reset-time 文言 → quota（2026-09-08 CEO承認で追加）', () => {
+    // Codex の実測文言（native_runtime_verification_codex_phase2_real_e2e.md に記録）
+    expect(classifyFailure({
+      text: "ERROR: You've hit your usage limit. Try your request again later or try again at Sep 2nd, 2026 2:05 AM.",
+    })).toBe('quota')
+    expect(classifyFailure({ text: 'Usage limit reached for this account' })).toBe('quota')
+    expect(classifyFailure({ text: 'Claude usage limit reached. Your limit will reset at 3pm.' })).toBe('quota')
+    expect(classifyFailure({ text: 'Quota resets at 2026-09-09T00:00:00Z' })).toBe('quota')
+    expect(classifyFailure({ text: 'Please try again at Sep 2nd, 2026 2:05 AM' })).toBe('quota')
+  })
+
+  it('prompt 本文に "usage limit" が echo されても quota 判定しない（過去バグの回帰: stderr.includes("usage limit") で provider 回復後も誤って rate-limited と報告し続けた）', () => {
+    // AGENTS.md の実文。Constitution overlay としてプロンプト先頭へ注入され、stderr へ echo され得る。
+    const overlayEcho =
+      '加えて**General Fallback**として、他Agent/Modelがusage limit・provider障害・一時的利用不能・' +
+      'その他resource制約になった場合、PL判断でResearch／Implementation／Design Challenger／' +
+      'QA・Investigation／必要なら一時的PL代行の代替要員に使ってよい。'
+    expect(classifyFailure({ text: overlayEcho })).not.toBe('quota')
+    expect(classifyFailure({ text: 'usage limit時も品質Gateは飛ばさない' })).not.toBe('quota')
+    // 時刻 anchor が無い "try again at" / "resets at" も quota 扱いしない
+    expect(classifyFailure({ text: 'try again at your convenience' })).not.toBe('quota')
+    expect(classifyFailure({ text: 'the counter resets at rollout' })).not.toBe('quota')
+  })
+
   it('timeout / network / 5xx → transient', () => {
     expect(classifyFailure({ text: 'ETIMEDOUT' })).toBe('transient')
     expect(classifyFailure({ text: 'fetch failed' })).toBe('transient')

@@ -8,6 +8,84 @@ Claude Code・Codex 両エージェントが従う共同運用ルール。
 
 ---
 
+## 0. TEMP_MVP_COMPLETION_POLICY（期限付き — MVP完成宣言時に削除する）
+
+<!-- TEMP_MVP_COMPLETION_POLICY:BEGIN -->
+
+**TEMP_MVP_COMPLETION_POLICY**
+
+> Temporary policy — valid only until MVP completion.
+> This policy MUST be removed when MVP completion is declared.
+> It is not a permanent Design Philosophy or development principle.
+
+これは恒久的なDesign Philosophy・一般開発原則ではない。MVP完成宣言時に削除する**期限付き方針**である。
+本方針の内容を `CLAUDE.md` 3章 Design Philosophy や `specs/00_constitution.md` へ自動転記しないこと。
+MVP後に残すべき原則がある場合は、本方針とは切り離して別途判断する。
+
+**適用範囲:** 全開発セッション（Claude / Codex / OpenCode / Gemini / ChatGPT）へ共通適用する。
+本方針が変更するのは**スコープ判断のみ**であり、Safety Rule・Authority Principle・Repository Boundary・
+Approval Gate・既存の品質Gateは一切緩めない。
+
+**適用開始（2026-09-10）:** 既に進行中の作業を巻き戻す・再設計する必要はない。以後の追加修正・
+Finding判断・スコープ判断から適用する。
+
+### 方針
+
+現在はMVP完成を最優先する。新しい問題・Finding・改善案が見つかっても、**原則としてMVPスコープを拡張しない**。
+
+**MVP前に修正する（例外）** — 次のいずれかに該当するもの:
+
+- データ破壊、二重実行、重複commit、誤った状態遷移など、結果の正しさを損なう
+- Approval Gate、権限、安全境界を迂回できる
+- crash / interruption後に状態が壊れ、合理的な正規手段で復旧できない
+- MVPの主要Happy Pathを妨げる
+- source of truth、ownership、状態遷移、retry境界などの基盤欠陥で、後から直すと修正範囲が大幅に広がる
+- Goal / Design Philosophy / 既存仕様への明確な逸脱
+
+**MVP後へ送る（それ以外は原則こちら）** — 特に次はMVP成立に必須でないため後回しにする:
+
+- rare caseの完全自動復旧
+- observability / loggingの追加改善
+- UI/UXの細かな改善
+- provider fallbackの高度化
+- 一般化・抽象化
+- 将来拡張だけを目的とした実装
+- 新しいreview / gate / workflow / safety mechanism
+- 「ついで」の改善
+
+### 異常系に求める水準
+
+異常系は完全自動復旧まで要求しない。MVPでは次を満たせばよい。
+
+```text
+異常検出 → 安全に停止 → 状態を壊さない → 原因を確認できる → 既存の正規手段で再開または復旧できる
+```
+
+### Finding発生時の扱い
+
+Findingは必ず次のどちらかへ分類し、**理由を短く記録する**。
+
+- **MVP前に必須修正**
+- **MVP後へ延期**
+
+延期Findingは削除しない。既存の管理先（`tasks/roadmap.md` / `tasks/task_graph.md` 等の既存backlog）へ残す。
+**新しいFinding管理方式・新しい台帳ファイル・新しいworkflowは作らない。**
+
+既存機能・既存ルール・既存workflowの修正で解決できる場合、新規機構を追加しない。
+
+### 目的
+
+現在のarchitectureを不用意に拡張せず、主要Happy Pathを実入口から最後まで通し、**blocker 0でMVPを完成させる**こと。
+
+### 削除条件
+
+`specs/10_mvp_scope.md` 12章「MVP Exit Criteria」の `TEMP_MVP_COMPLETION_POLICY cleanup` を参照。
+このcleanupが完了するまでMVPを「完成」と記録しない。
+
+<!-- TEMP_MVP_COMPLETION_POLICY:END -->
+
+---
+
 ## 1. ワークツリー境界（最重要）
 
 | エージェント | 作業ディレクトリ | 触れるもの |
@@ -176,11 +254,22 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
   - 本Policyは暫定運用ルールであり、**新Retry System / watchdog / Routerは実装しない**。
     将来Routerでは `OpenCode dispatch → progress check → bounded retry → degradation →
     model fallback` として自動化対象にする。
-  - **Delegation Wrapper（`scripts/delegate.sh`）**: PLがAIへ委任する際は本wrapperを使い、
-    委任開始と120秒後のreminderを1操作で完了する。reminderは時間経過を知らせるだけであり、
-    進捗判定・retry判断はPLが個別に行う。これは**運用保証であり機械強制ではない**
-    （wrapperを経由せず生のCLIを直接叩けばreminderは付かない）。
-    全AI delegationへの共通化は今後の課題として扱う。
+  - **Delegation Wrapper（`scripts/delegate.sh`）**: 委任の実行主体。detached起動・
+    inactivity/long-tool検知・bounded retry・formal verdict（`AI_TEAM_OS_STATUS:DONE|BLOCKED`）の
+    書き出しを担う。
+  - **正式運用経路は `launchSupervisedDelegation()`（`apps/api/src/supervision/delegationSupervisor.ts`）**
+    （2026-09-08、#110 Step 3）。**supervision無しのbackground launchを正式運用経路で使わない。**
+    この関数は `supervised_runs` の行を**先に**作り、作れなければ委任を起動しない。
+    起動後に spawn が失敗した場合はその場で fail-closed 終端させる。
+    したがって「起動したが誰も見ていない委任」が構造的に作れない
+    （実障害ケース1 = PR #108 の 0 byte 放置が、この不可分化で塞がれる形である）。
+    completion判定は formal verdict であり、**exit 0 + 空出力 / verdict無しは success にならない**。
+    停止時は診断 → bounded recovery → terminal verdict まで自動で進み、
+    終端時に automatic continuation が走る。
+    これは**OS上で生のshell実行を禁止するものではない**（それは要求範囲外）。
+    禁止しているのは、AIteamOSの正式運用経路でsupervision無しの委任を使うことである。
+    詳細な契約は `tasks/roadmap.md` の `roadmap:id=pl-review-process-supervision`
+    （Background Task Supervision Contract C-1〜C-13）を参照。
 
 **Review Level 0〜3:** 変更内容はLevel 0（軽微・Codexのみ）/ Level 1（通常実装・Codex+Gemini postReview）/
 Level 2（中リスク・Claude計画+Gemini pre/postReview、必要ならChatGPT）/ Level 3（高リスク・Claude設計+

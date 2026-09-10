@@ -18,6 +18,7 @@ import type {
 import { router } from 'expo-router'
 import {
   JOB_DISPLAY_STATE_LABEL,
+  allRoadmapTasksDone,
   deriveProjectSummaryState,
   type JobDisplayState,
 } from '../lib/taskWorkflow'
@@ -278,11 +279,14 @@ function ProjectCard({
   project,
   onStarted,
   health,
+  allTasksDone,
 }: {
   project: Project
   onStarted: () => void
   /** MOB-001: 既存状態から導出した実行状態。lifecycle status とは別物。 */
   health?: JobDisplayState
+  /** MOB-001: 全 roadmap Task 完了。running のままでも作業中に見せないため。 */
+  allTasksDone?: boolean
 }) {
   const [tasks, setTasks] = useState<Task[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
@@ -404,15 +408,29 @@ function ProjectCard({
           {project.name}
         </Text>
         <View style={styles.badgeGroup}>
+          {/* MOB-001: 「完了」を出すのは lifecycle が running のときだけ。
+              running だけが「作業中」と誤読される状態であり、paused / archived / draft は
+              lifecycle バッジ自体が既に意味を伝えている。そこへ「完了」を重ねると、
+              CEO 自身が行った終了・一時停止の操作を上書きされたように見える。 */}
+          {allTasksDone === true && project.status === 'running'
+            && (health === undefined || health === 'other') && (
+            <View style={[styles.badge, { backgroundColor: '#22c55e' }]}>
+              <Text style={styles.badgeText}>完了</Text>
+            </View>
+          )}
           {health !== undefined && health !== 'other' && (
             <View style={[styles.badge, { backgroundColor: HEALTH_BADGE_COLOR[health] }]}>
               <Text style={styles.badgeText}>{JOB_DISPLAY_STATE_LABEL[health]}</Text>
             </View>
           )}
-          {/* lifecycle status は二次情報として残す（running でも止まっていることがある） */}
-          <View style={[styles.lifecycleBadge, { borderColor: statusColor }]}>
-            <Text style={[styles.lifecycleBadgeText, { color: statusColor }]}>{project.status}</Text>
-          </View>
+          {/* lifecycle status は二次情報として残す（running でも止まっていることがある）。
+              ただし「完了」を出しているときは running を並べない。作業が終わっているのに
+              running が見えると、CEO には「まだ動いているのか終わったのか」が判断できない。 */}
+          {!(allTasksDone === true && project.status === 'running') && (
+            <View style={[styles.lifecycleBadge, { borderColor: statusColor }]}>
+              <Text style={[styles.lifecycleBadgeText, { color: statusColor }]}>{project.status}</Text>
+            </View>
+          )}
         </View>
       </View>
 
@@ -625,6 +643,9 @@ export default function Dashboard() {
   const [projects, setProjects] = useState<Project[]>([])
   const [pendingApprovalCount, setPendingApprovalCount] = useState<number | null>(null)
   const [healthByProject, setHealthByProject] = useState<Record<string, JobDisplayState>>({})
+  // MOB-001: Project lifecycle に completed は存在せず、明示終了まで running のまま。
+  // そのため「全Task完了」を別途導出しないと、終わった Project が作業中に見える。
+  const [doneByProject, setDoneByProject] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -648,6 +669,9 @@ export default function Dashboard() {
       }
       setHealthByProject(Object.fromEntries(
         Object.entries(byProject).map(([id, list]) => [id, deriveProjectSummaryState(list, watchdog)]),
+      ))
+      setDoneByProject(Object.fromEntries(
+        Object.entries(byProject).map(([id, list]) => [id, allRoadmapTasksDone(list)]),
       ))
 
       if (projectsResult.status === 'fulfilled') {
@@ -716,6 +740,7 @@ export default function Dashboard() {
         {projects.map((project) => (
           <ProjectCard
             key={project.id}
+            allTasksDone={doneByProject[project.id] === true}
             health={healthByProject[project.id]}
             onStarted={load}
             project={project}

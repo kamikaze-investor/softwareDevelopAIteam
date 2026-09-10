@@ -5,6 +5,7 @@ import path from 'node:path'
 import type { Project } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
+import { RoadmapContentError } from './roadmapGenerator.js'
 import type { IStorage, RoadmapSyncResult } from '../storage/interface'
 import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow.js'
 import {
@@ -92,22 +93,13 @@ function roadmapStdout(
           }]
         : [],
     })),
-    integrationReviewResult: { decision: 'ALIGNED', summary: 'Integrated review aligned.' },
-    independentReviewResult: decision === 'REVIEW_UNAVAILABLE'
-      ? {
-          provider: 'codex',
-          verdict: 'approved',
-          summary: 'independent reviewer output could not be parsed',
-          unavailable: true,
-        }
-      : {
-          provider: 'codex',
-          verdict: 'approved',
-          summary: 'Independent review approved.',
-          unavailable: false,
-        },
+    ...(decision === 'REVIEW_UNAVAILABLE'
+      ? {}
+      : { integrationReviewResult: { decision: 'ALIGNED', summary: 'Integrated review aligned.' } }),
+    // PR C: roadmap kind に independent review は無い。第二意見は Claude の integration review。
+    // 取得できなかった場合は integration 側が欠落する（=fail-closed）ことで表現する。
     finalDecision: decision,
-    independentReviewRequired: true,
+    independentReviewRequired: false,
     requiresCeoApproval: decision !== 'ALIGNED',
     createdAt: '2026-09-02T00:00:00.000Z',
   })
@@ -299,6 +291,129 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
     vi.useRealTimers()
   })
 
+  // Production E2E（2026-09-09）で実際に踏んだ失敗を固定する。
+  // Codexが `estimatedWeeks` を小数で返し、Zodが弾き、`parseRoadmapJson()` が throw。
+  // その例外は bounded regeneration loop の外へ抜けていたため、retryが3回残っているのに
+  // 1度も使われないまま Project start が BLOCKED になった。
+  it('生成がschema不正で失敗しても、feedback付きで再生成して継続する', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap
+      .mockRejectedValueOnce(new RoadmapContentError('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
+      .mockResolvedValue(ROADMAP)
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(2)
+    // 2回目には「何が不正だったか」が渡ること。推測で直させない。
+    const secondCall = roadmapGeneratorMocks.generateRoadmap.mock.calls[1]?.[1] as { priorAttemptFeedback?: string }
+    expect(secondCall?.priorAttemptFeedback).toContain('estimatedWeeks')
+    expect(storage.tasks.findByProjectId(project.id).length).toBeGreaterThan(0)
+  })
+
+  it('全attemptで生成が失敗したら上限で停止し、Tasksは0のまま（空Roadmapで成功扱いしない）', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(
+      new RoadmapContentError('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks Expected integer, received float'))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow(/ロードマップの生成に失敗しました/)
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS)
+    expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+  })
+
+  // 再生成で直らない失敗まで retry すると、同じ失敗を上限まで繰り返して原因をぼかし、
+  // rate limit では連射で悪化させる。attempt を消費させないことを型で固定する。
+  it('provider失敗（quota/auth/CLI/infra）はregeneration attemptを消費せず即座に伝播する', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(
+      new Error('[CTO AI] Roadmap生成に失敗しました: You have hit your usage limit'))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow(/usage limit/)
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
+    expect(storage.tasks.findByProjectId(project.id)).toHaveLength(0)
+  })
+
+  it('vendor separationのfail-closedは再生成せずそのまま失敗する', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(
+      new Error('[reviewSeparation] Roadmap生成者と最終レビュアーが同一vendorです'))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow(/同一vendor/)
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
+  })
+
+  // CEO確認点3: non-content error や raw stderr が次のCodex promptへ入る経路が0であること。
+  // 型ゲートで構造的に閉じているが、「閉じている」ことを実際に観測して固定する。
+  it('non-content errorのmessageは次attemptのpromptへ渡らない（そもそも再生成しない）', async () => {
+    const project = createProject(storage)
+    const secretish = 'runner exited with code 1: /srv/ai-team/env/worker.env AIzaSyEXAMPLE'
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(new Error(secretish))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow()
+
+    // 1回しか呼ばれない = feedbackを載せた次attemptが存在しない
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
+    // 呼び出しに渡ったoptionsのどれにも、その文字列が現れないこと
+    for (const call of roadmapGeneratorMocks.generateRoadmap.mock.calls) {
+      const options = call[1] as { priorAttemptFeedback?: string } | undefined
+      expect(options?.priorAttemptFeedback ?? '').not.toContain('worker.env')
+      expect(options?.priorAttemptFeedback ?? '').not.toContain('AIzaSy')
+    }
+  })
+
+  it('content errorのfeedbackはモデル出力の指摘だけを含む', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap
+      .mockRejectedValueOnce(new RoadmapContentError('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks'))
+      .mockResolvedValue(ROADMAP)
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })
+
+    const second = roadmapGeneratorMocks.generateRoadmap.mock.calls[1]?.[1] as { priorAttemptFeedback?: string }
+    expect(second?.priorAttemptFeedback).toContain('estimatedWeeks')
+    expect(second?.priorAttemptFeedback).not.toContain('runner exited')
+    expect(second?.priorAttemptFeedback).not.toContain('worker.env')
+  })
+
+  it('valid Roadmapなら余計な再生成をしない', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap.mockResolvedValue(ROADMAP)
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })
+
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
+  })
+
   it('stores ALIGNED roadmap evidence before syncing any Task rows', async () => {
     const project = createProject(storage)
     const events: string[] = []
@@ -338,8 +453,8 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
       subjectId: project.id,
       decision: 'ALIGNED',
       reviewLoad: 'critical',
-      independentReviewRequired: true,
-      independentReviewVerdict: 'approved',
+      // roadmap kind は independent review を要求しない（PR C）。
+      independentReviewRequired: false,
     })
     expect(storage.tasks.findByProjectId(project.id)).toHaveLength(1)
   })

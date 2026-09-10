@@ -232,6 +232,17 @@ describe('terminal result persistence', () => {
 /** 既存POLL_INTERVAL_MSの既定値（テスト内で時間を進めるため）。 */
 const POLL_INTERVAL_FOR_TEST = 5_000
 
+/**
+ * Outbox gating が守っているのは「pending がある間は新しい Job を claim しない」ことであって、
+ * 「HTTP を一切出さない」ことではない。#110 Step 3 で supervised run の reconcile を
+ * poll cycle 先頭へ置いたため（Outbox 滞留で supervision が止まらないようにするため）、
+ * ここでは **queued Job fetch だけが呼ばれていない**ことを確認する。
+ */
+function expectNoQueuedJobFetch(): void {
+  const jobFetches = fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/jobs'))
+  expect(jobFetches).toHaveLength(0)
+}
+
 describe('outbox gating', () => {
   it('pollJobs skips queued Job fetch while pending Outbox events exist', async () => {
     vi.useFakeTimers()
@@ -243,7 +254,7 @@ describe('outbox gating', () => {
     await Promise.resolve()
 
     expect(outboxMocks.hasPending).toHaveBeenCalled()
-    expect(fetchMock).not.toHaveBeenCalled()
+    expectNoQueuedJobFetch()
   })
 
   it('pendingがある間はresendPendingを呼び、新しいJob fetchはしない', async () => {
@@ -257,7 +268,7 @@ describe('outbox gating', () => {
     await Promise.resolve()
 
     expect(outboxMocks.resendPending).toHaveBeenCalled()
-    expect(fetchMock).not.toHaveBeenCalled()
+    expectNoQueuedJobFetch()
   })
 
   it('resend成功でpendingが消えると、次のpollから通常のJob fetchへ戻る', async () => {
@@ -272,7 +283,7 @@ describe('outbox gating', () => {
     await Promise.resolve()
 
     expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
-    expect(fetchMock).not.toHaveBeenCalled()
+    expectNoQueuedJobFetch()
 
     await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
     await Promise.resolve()
@@ -292,7 +303,7 @@ describe('outbox gating', () => {
 
     // 1 pollにつき1 resend batchであり、同一poll内で繰り返さない
     expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
-    expect(fetchMock).not.toHaveBeenCalled()
+    expectNoQueuedJobFetch()
 
     await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
     await Promise.resolve()
@@ -339,6 +350,27 @@ describe('outbox gating', () => {
     resolveResend?.()
   })
 
+  it('pending Outbox が滞留していても supervised run の reconcile は止まらない（独立レビュー Step 3 第2ラウンド #2）', async () => {
+    vi.useFakeTimers()
+    // Outbox が詰まっている間 supervision も止まると、完了済みの委任が RUNNING のまま残る。
+    // Job intake を止める理由（workspace 競合）は supervision には当てはまらない。
+    outboxMocks.hasPending.mockReturnValue(true)
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const reconcileCalls = fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes('/api/supervised-runs/reconcile'),
+    )
+    expect(reconcileCalls.length).toBeGreaterThanOrEqual(1)
+    // それでも新しい Job は claim しない（既存の Outbox gating は維持）。
+    expectNoQueuedJobFetch()
+  })
+
   it('start does not wait for pending Outbox events before startup recovery/watchdog/polling', async () => {
     vi.useFakeTimers()
     fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
@@ -351,6 +383,10 @@ describe('outbox gating', () => {
     await Promise.resolve()
     await Promise.resolve()
     await Promise.resolve()
+    // #110 Step 3 で poll cycle の先頭に supervised run の reconcile（HTTP 1本）が入ったため、
+    // resendPending へ到達するまでの microtask が1段増えている。
+    await Promise.resolve()
+    await Promise.resolve()
 
     // startup sweepとwatchdogは、pending Outboxの解消を待たずに開始する
     expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
@@ -359,7 +395,7 @@ describe('outbox gating', () => {
     // pollJobs自体も開始しており、最初のcycleでpendingの再送を試みている
     expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
     // pendingが残っている間はqueued Job fetchだけがこのcycleでskipされる（既存仕様）
-    expect(fetchMock).not.toHaveBeenCalled()
+    expectNoQueuedJobFetch()
   })
 
   it('startupでpending Outboxが残ったままでも、Worker全体とwatchdogは停止しない', async () => {

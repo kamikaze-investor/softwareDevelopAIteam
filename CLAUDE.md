@@ -6,6 +6,11 @@
 **セッション開始時に必ず `AGENTS.md`（リポジトリルート）も読むこと。**
 AGENTS.md には Claude Code・Codex 共同運用ルールと TypeScript 品質ルールが含まれる。
 
+**期限付き方針（MVP完成まで）**: `AGENTS.md` 0章 `TEMP_MVP_COMPLETION_POLICY` を必ず読むこと。
+MVP完成を最優先し、原則としてMVPスコープを拡張しない。Findingは「MVP前に必須修正」か
+「MVP後へ延期」へ分類する。**これは恒久的なDesign Philosophyではなく、MVP完成宣言時に削除する。**
+本ファイル3章（Design Philosophy）へ転記しないこと。
+
 **AI Team OS全体の共通行動原則の正本**: `specs/00_constitution.md` 3.14〜3.16（最小検証・必要最小反証／CEO確認最小化・自律判断／複雑性防止・状態空間削減）。明示的なSafety Ruleを常に優先する。
 
 ---

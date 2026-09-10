@@ -118,6 +118,24 @@ export interface AiCliRequest {
    */
   reasoningEffort?: string
 
+  /**
+   * Codex CLIのsandboxを **legacy Landlock** 経路へ切り替える（call-localな設定）。
+   *
+   * このVPSではCodex 0.147.0の既定sandbox（bubblewrap）が動作しない。`bwrap`がsystem PATHに
+   * 無く、bundled bwrapはUbuntu 24.04の
+   * `kernel.apparmor_restrict_unprivileged_userns=1` によりunprivileged user namespaceを
+   * 作れないため、Codexは **shell commandを1つも実行できない** ＝リポジトリを読めない。
+   * `use_legacy_landlock=true` で読めるようになることをproduction VPSで実測済み（2026-09-08）。
+   *
+   * **global な `~/.codex/config.toml` は変更しない。** 立てた呼び出しだけに適用されるので、
+   * task-kind reviewer 等の既存経路の argv は不変のまま。
+   *
+   * ⚠️ `use_legacy_landlock` は **deprecated**（`use_linux_sandbox_bwrap` は既に removed）。
+   * PR C を成立させるための暫定経路であって恒久解決ではない。移行は別課題
+   * （roadmap: codex-sandbox-off-deprecated-landlock）。
+   */
+  useLegacyLandlockSandbox?: boolean
+
   // ────────────────────────────────────────────────────────
   // Rule-001 対策フィールド
   // ────────────────────────────────────────────────────────
