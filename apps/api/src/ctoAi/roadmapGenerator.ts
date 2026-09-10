@@ -348,13 +348,15 @@ export async function generateRoadmap(
   if (!execution.ok) {
     // Roadmapが得られないことを「空のRoadmap」として下流へ流さない（fail-closed）。
     throw new Error(
-      // 生の stderr を message へ載せない。この message は例外として上位へ流れ、
-      // 経路によってはログやプロンプトへ入りうる。Codex CLI の stderr には sandbox 診断・
-      // パス・環境情報が混ざる（独立レビュー指摘、2026-09-10）。
-      // 既存の sanitizeMessage（env値照合 + token shape redact + 長さ上限）を再利用する。
-      '[CTO AI] Roadmap生成に失敗しました: '
-      + sanitizeMessage(execution.error ?? 'unknown')
-      + (execution.stderr ? ' / ' + sanitizeMessage(execution.stderr) : ''),
+      // `executeRunner()` の error は既に stderr を含む
+      // （`runner exited with code N: <stderr>`）。別途 `execution.stderr` を足すと同じ内容が
+      // 二重に載るだけなので足さない。
+      //
+      // その error を sanitize してから載せる。この message は例外として上位へ流れ、
+      // `start_blocked_reason` として永続化されMobileへ表示され、ログにも出る。
+      // Codex CLI の stderr には sandbox 診断・パス・環境情報が混ざる。
+      // sanitizeMessage は既存実装（env値照合 + token shape redact + 長さ上限）を再利用する。
+      '[CTO AI] Roadmap生成に失敗しました: ' + sanitizeMessage(execution.error ?? 'unknown'),
     )
   }
 

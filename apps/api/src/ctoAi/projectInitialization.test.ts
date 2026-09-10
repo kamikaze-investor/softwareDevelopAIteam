@@ -360,6 +360,47 @@ describe('initializeApprovedProject Whole-Roadmap Design Review gate', () => {
     expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
   })
 
+  // CEO確認点3: non-content error や raw stderr が次のCodex promptへ入る経路が0であること。
+  // 型ゲートで構造的に閉じているが、「閉じている」ことを実際に観測して固定する。
+  it('non-content errorのmessageは次attemptのpromptへ渡らない（そもそも再生成しない）', async () => {
+    const project = createProject(storage)
+    const secretish = 'runner exited with code 1: /srv/ai-team/env/worker.env AIzaSyEXAMPLE'
+    roadmapGeneratorMocks.generateRoadmap.mockRejectedValue(new Error(secretish))
+
+    await expect(initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })).rejects.toThrow()
+
+    // 1回しか呼ばれない = feedbackを載せた次attemptが存在しない
+    expect(roadmapGeneratorMocks.generateRoadmap).toHaveBeenCalledTimes(1)
+    // 呼び出しに渡ったoptionsのどれにも、その文字列が現れないこと
+    for (const call of roadmapGeneratorMocks.generateRoadmap.mock.calls) {
+      const options = call[1] as { priorAttemptFeedback?: string } | undefined
+      expect(options?.priorAttemptFeedback ?? '').not.toContain('worker.env')
+      expect(options?.priorAttemptFeedback ?? '').not.toContain('AIzaSy')
+    }
+  })
+
+  it('content errorのfeedbackはモデル出力の指摘だけを含む', async () => {
+    const project = createProject(storage)
+    roadmapGeneratorMocks.generateRoadmap
+      .mockRejectedValueOnce(new RoadmapContentError('[CTO AI] Roadmap JSONの構造が不正です: estimatedWeeks'))
+      .mockResolvedValue(ROADMAP)
+
+    await initializeApprovedProject(storage, project, tmpDir, {
+      analysis: ANALYSIS,
+      writeProjectMemory: true,
+      canonicalDefinitionText: '# Goal',
+    })
+
+    const second = roadmapGeneratorMocks.generateRoadmap.mock.calls[1]?.[1] as { priorAttemptFeedback?: string }
+    expect(second?.priorAttemptFeedback).toContain('estimatedWeeks')
+    expect(second?.priorAttemptFeedback).not.toContain('runner exited')
+    expect(second?.priorAttemptFeedback).not.toContain('worker.env')
+  })
+
   it('valid Roadmapなら余計な再生成をしない', async () => {
     const project = createProject(storage)
     roadmapGeneratorMocks.generateRoadmap.mockResolvedValue(ROADMAP)
