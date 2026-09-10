@@ -80,27 +80,84 @@ get_child_pids() {
   done
 }
 
-safe_kill_process() {
+# DELEG-001: PID の死亡を「待って確認する」共通処理。
+# 以前は SIGTERM 後に 0.5s 待ち、まだ生きていれば SIGKILL を送って**待たずに**戻っていた。
+# 呼び出し元はその直後に respawn するため、旧 child が生きたまま新 child が起動し得た。
+wait_for_death() {
   local pid="$1"
+  local budget_ms="$2"
+  local waited=0
+  while is_pid_alive "$pid" && [ "$waited" -lt "$budget_ms" ]; do
+    sleep 0.05
+    waited=$(( waited + 50 ))
+  done
+  ! is_pid_alive "$pid"
+}
+
+# DELEG-001: 子孫 PID を深さ優先で列挙する（末端から先に kill するため）。
+# 旧実装は親だけを kill しており、tool として起動された孫 process が
+# orphan として生き残った（stale/duplicate child）。
+collect_descendants() {
+  local parent_pid="$1"
+  local child
+  local candidates
+  candidates=$(pgrep -P "$parent_pid" 2>/dev/null || ps --ppid "$parent_pid" -o pid= 2>/dev/null || true)
+  for child in $candidates; do
+    collect_descendants "$child"
+    echo "$child"
+  done
+}
+
+# DELEG-001: process tree ごと終了させ、**終了を確認できたときだけ 0 を返す**。
+#
+#   - 子孫 → 親 の順に kill する（親だけ殺して孫を orphan にしない）
+#   - SIGTERM で死ななければ SIGKILL へ昇格し、そのあとも死亡を待つ
+#   - opencode process と同定できない PID は**素通りさせず**非0で返す（fail-closed）
+#     旧実装は「安全のため skip」と称して kill せずに 0 を返しており、
+#     呼び出し元はそれを成功と区別できないまま respawn していた
+terminate_process_tree() {
+  local pid="$1"
+  [ -n "$pid" ] || return 0
   if ! is_pid_alive "$pid"; then
     return 0
   fi
   if ! is_opencode_pid "$pid"; then
-    echo "Warning: PID $pid is not an opencode process, skipping kill for safety" >&2
-    return 0
+    echo "Warning: PID $pid is not an opencode process; refusing to respawn over it" >&2
+    return 1
   fi
 
+  local descendants
+  descendants=$(collect_descendants "$pid")
+
+  local p
+  for p in $descendants; do
+    kill "$p" 2>/dev/null || true
+  done
   kill "$pid" 2>/dev/null || true
 
-  local count=0
-  while is_pid_alive "$pid" && [ "$count" -lt 10 ]; do
-    sleep 0.05
-    count=$((count + 1))
+  if ! wait_for_death "$pid" 1000; then
+    for p in $descendants; do
+      kill -9 "$p" 2>/dev/null || true
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    wait_for_death "$pid" 1000 || return 1
+  fi
+
+  # 親が死んでも孫は生き残り得るので、明示的に刈り取る。
+  for p in $descendants; do
+    if is_pid_alive "$p"; then
+      kill -9 "$p" 2>/dev/null || true
+      wait_for_death "$p" 500 || return 1
+    fi
   done
 
-  if is_pid_alive "$pid"; then
-    kill -9 "$pid" 2>/dev/null || true
-  fi
+  return 0
+}
+
+# 終端経路（watchdog 自身の中断・recovery 打ち切り）用。
+# ここでは kill の成否で分岐しないため、戻り値は捨ててよい。
+safe_kill_process() {
+  terminate_process_tree "$1" || true
 }
 
 get_file_size() {
@@ -361,7 +418,14 @@ while true; do
     exit 0
   fi
 
-  safe_kill_process "$PID"
+  # DELEG-001: **旧 process tree の終了を確認してから**でなければ respawn しない。
+  # 確認できない場合は retry せず terminal verdict へ倒す。
+  # 生きているかもしれない child の上に新しい child を重ねると、
+  # duplicate provider が並走し、recovery の数え方も壊れる。
+  if ! terminate_process_tree "$PID"; then
+    write_telemetry "ESCALATE:stale_child" "$RETRY_TRIGGERED"
+    exit 0
+  fi
 
   NEXT_ATTEMPT=$(( ATTEMPT + 1 ))
   NEXT_RECOVERY_COUNT=$(( RECOVERY_COUNT + 1 ))

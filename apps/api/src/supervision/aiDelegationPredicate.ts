@@ -32,6 +32,11 @@ export const FORMAL_VERDICTS = [
   'ESCALATE:blocked',
   'ESCALATE:recovery_exhausted',
   'ESCALATE:watchdog_interrupted',
+  // DELEG-001: 旧 child の終了を確認できず respawn を見送ったときに watchdog が書く。
+  // watchdog が新しく出せるようになった verdict をここへ載せないと、
+  // predicate 側では unknown 扱いになり fail-closed の理由が「未知の verdict」に化ける。
+  // 終端はするので安全側だが、診断が失われるので語彙を揃える（C-3a と同じ論点）。
+  'ESCALATE:stale_child',
 ] as const
 
 export type FormalVerdict = (typeof FORMAL_VERDICTS)[number]
