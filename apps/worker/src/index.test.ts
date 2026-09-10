@@ -243,6 +243,17 @@ function expectNoQueuedJobFetch(): void {
   expect(jobFetches).toHaveLength(0)
 }
 
+/**
+ * poll cycle が Outbox 分岐へ到達するまで microtask を流し切る。
+ *
+ * 以前は `await Promise.resolve()` を必要段数だけ並べていたが、poll cycle 先頭の
+ * reconcile（supervised run / task continuation）が1つ増えるたびに全テストの段数を
+ * 数え直す必要があり壊れやすかった。実時間は進めないので POLL_INTERVAL_MS は跨がない。
+ */
+async function flushPollCycle(): Promise<void> {
+  await vi.advanceTimersByTimeAsync(0)
+}
+
 describe('outbox gating', () => {
   it('pollJobs skips queued Job fetch while pending Outbox events exist', async () => {
     vi.useFakeTimers()
@@ -250,8 +261,7 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     expect(outboxMocks.hasPending).toHaveBeenCalled()
     expectNoQueuedJobFetch()
@@ -264,8 +274,7 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     expect(outboxMocks.resendPending).toHaveBeenCalled()
     expectNoQueuedJobFetch()
@@ -279,8 +288,7 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
     expectNoQueuedJobFetch()
@@ -298,8 +306,7 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     // 1 pollにつき1 resend batchであり、同一poll内で繰り返さない
     expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
@@ -319,8 +326,7 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     expect(outboxMocks.resendPending).not.toHaveBeenCalled()
     expect(fetchMock).toHaveBeenCalled()
@@ -336,8 +342,7 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
 
@@ -359,14 +364,33 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
     await Promise.resolve()
 
     const reconcileCalls = fetchMock.mock.calls.filter(([url]) =>
       String(url).includes('/api/supervised-runs/reconcile'),
     )
     expect(reconcileCalls.length).toBeGreaterThanOrEqual(1)
+    // それでも新しい Job は claim しない（既存の Outbox gating は維持）。
+    expectNoQueuedJobFetch()
+  })
+
+  it('pending Outbox が滞留していても task continuation の reconcile は止まらない', async () => {
+    vi.useFakeTimers()
+    // continuation 回収まで Outbox gating に巻き込むと、次 Task へ進めない状態が
+    // Outbox の詰まりが解けるまで続く。Job intake を止める理由（workspace 競合）は
+    // continuation 回収には当てはまらない（実際に Job を作るかは API 側の gate が決める）。
+    outboxMocks.hasPending.mockReturnValue(true)
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await flushPollCycle()
+
+    const continuationCalls = fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes('/api/task-continuations/reconcile'),
+    )
+    expect(continuationCalls.length).toBeGreaterThanOrEqual(1)
     // それでも新しい Job は claim しない（既存の Outbox gating は維持）。
     expectNoQueuedJobFetch()
   })
@@ -380,13 +404,7 @@ describe('outbox gating', () => {
     outboxMocks.hasPending.mockReturnValue(true)
 
     void start()
-    await Promise.resolve()
-    await Promise.resolve()
-    await Promise.resolve()
-    // #110 Step 3 で poll cycle の先頭に supervised run の reconcile（HTTP 1本）が入ったため、
-    // resendPending へ到達するまでの microtask が1段増えている。
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     // startup sweepとwatchdogは、pending Outboxの解消を待たずに開始する
     expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
@@ -427,8 +445,7 @@ describe('outbox gating', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
     expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
 
     await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
@@ -457,8 +474,7 @@ describe('outbox gating', () => {
     outboxMocks.hasPending.mockImplementation(() => pending)
 
     void pollJobs()
-    await Promise.resolve()
-    await Promise.resolve()
+    await flushPollCycle()
 
     await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
     await Promise.resolve()

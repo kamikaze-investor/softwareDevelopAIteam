@@ -510,6 +510,42 @@ async function confirmRunningTransition(
  * 失敗しても poll cycle を壊さない。次の cycle で再試行されるだけであり、
  * ここで throw すると Job intake ごと止まってしまう。
  */
+/**
+ * Task continuation の reconcile を既存 poll cycle に相乗りさせる。
+ *
+ * 新しい queue / daemon / scheduler は追加しない（reconcileSupervisedRuns() と同じ形）。
+ * これが無いと、commit 成功時に次 Project が paused だった continuation は
+ * 'pending' のまま残り、Mobile の GET /api/projects 系でしか回収されない
+ * （= client を閉じたままでは次 Task へ進めない）。
+ *
+ * ここでは retry も gate 判定もしない。判定は API 側 createInitialImplementWorkflow() が持つ。
+ */
+export async function reconcileTaskContinuations(): Promise<void> {
+  try {
+    const response = await fetch(`${API_BASE}/api/task-continuations/reconcile`, {
+      method: 'POST',
+      headers: buildApiAuthHeaders(),
+    })
+    if (!response.ok) {
+      console.warn(`[Worker] task continuation reconcile failed: HTTP ${response.status}`)
+      return
+    }
+    // recovered=0 を毎 cycle 出力すると POLL_INTERVAL_MS ごとにログを埋めるため、
+    // 実際に状態が動いたときだけ残す（効果検証は task_continuations の durable state が正本）。
+    const summary = (await response.json()) as { recovered?: number, failed?: number, stillPending?: number }
+    const recovered = summary.recovered ?? 0
+    const failed = summary.failed ?? 0
+    if (recovered > 0 || failed > 0) {
+      console.log(
+        `[Worker] task continuation reconcile: recovered=${recovered} failed=${failed} ` +
+        `stillPending=${summary.stillPending ?? 0}`,
+      )
+    }
+  } catch (err: unknown) {
+    console.warn(`[Worker] task continuation reconcile error: ${formatUnknownError(err)}`)
+  }
+}
+
 export async function reconcileSupervisedRuns(): Promise<void> {
   try {
     const response = await fetch(`${API_BASE}/api/supervised-runs/reconcile`, {
@@ -545,6 +581,11 @@ export async function pollJobs(): Promise<never> {
       // 「runDir の事実を durable state へ反映」「supervisor 自身が死んだ run の検出」
       // 「terminal 後の continuation 起動」だけである。
       await reconcileSupervisedRuns()
+      // Task continuation の回収も同じ位置（**Outbox 分岐より前**）に置く。
+      // else 側に置くと、Outbox に配送できない event が1件でも残っている間 continuation が
+      // 一切進まなくなる。Job intake を止める理由（workspace 競合）は continuation 回収には
+      // 当てはまらない（実際に次 Job を作るかどうかは API 側の既存 gate が決める）。
+      await reconcileTaskContinuations()
 
       if (outboxStore.hasPending()) {
         console.warn('[Worker] Pending Outbox events remain; skipping queued Job fetch for this poll cycle.')
