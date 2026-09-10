@@ -12,9 +12,6 @@
 
 import path from 'node:path'
 import { buildRunnerEnv, executeRunner, type CoordinatorDeps } from '../designReview/designReviewCoordinator.js'
-// sanitizeMessage は Worker 側の既存実装を **import のみ** で再利用する。
-// geminiRouter.ts は CONTROL REPOSITORY（編集禁止）。新しい sanitizer を作らない。
-import { sanitizeMessage } from '@ai-team/worker/src/metaReviewer/geminiRouter.js'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import {
   assertRoadmapTopologySeparated,
@@ -349,14 +346,20 @@ export async function generateRoadmap(
     // Roadmapが得られないことを「空のRoadmap」として下流へ流さない（fail-closed）。
     throw new Error(
       // `executeRunner()` の error は既に stderr を含む
-      // （`runner exited with code N: <stderr>`）。別途 `execution.stderr` を足すと同じ内容が
-      // 二重に載るだけなので足さない。
+      // （`runner exited with code N: <stderr>`）。別途 `execution.stderr` を足すと二重になるので足さない。
       //
-      // その error を sanitize してから載せる。この message は例外として上位へ流れ、
-      // `start_blocked_reason` として永続化されMobileへ表示され、ログにも出る。
-      // Codex CLI の stderr には sandbox 診断・パス・環境情報が混ざる。
-      // sanitizeMessage は既存実装（env値照合 + token shape redact + 長さ上限）を再利用する。
-      '[CTO AI] Roadmap生成に失敗しました: ' + sanitizeMessage(execution.error ?? 'unknown'),
+      // ここで sanitize はしない。一度 `sanitizeMessage()` を挟んだが2つ理由で戻した:
+      //   1. 300字で切るため、末尾にある本体（例: `401 Unauthorized`）が落ちる。
+      //      再生成されない失敗ほど原文が要る。
+      //   2. `geminiRouter.ts` は `spawnSync` を持つprovider routerで、APIからimportすると
+      //      Workerのprovider/CLI機構がAPI runtimeへ入る。同じ理由で
+      //      `designReviewCoordinator.ts` は worker側 strategicReview のimportを避けている。
+      //      既存の focusSelector / reviewLoadClassifier は純粋なleaf moduleで、性質が違う。
+      //
+      // prompt へ流れる経路は型ゲートで塞がっている（RoadmapContentError 以外は再生成しない）。
+      // `execution.error` が `start_blocked_reason` やログへ出るのは、design review経路と同じ
+      // 既存の `executeRunner()` の振る舞いであって、この変更が持ち込んだものではない。
+      '[CTO AI] Roadmap生成に失敗しました: ' + (execution.error ?? 'unknown'),
     )
   }
 
