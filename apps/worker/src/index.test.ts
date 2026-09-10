@@ -395,6 +395,29 @@ describe('outbox gating', () => {
     expectNoQueuedJobFetch()
   })
 
+  it('task continuation の reconcile が失敗しても poll cycle は止まらない', async () => {
+    vi.useFakeTimers()
+    // reconcile は liveness driver であって gate ではない。ここで throw したときに
+    // poll cycle ごと落ちると、Job intake も Outbox 再送も巻き添えで止まる。
+    outboxMocks.hasPending.mockReturnValue(false)
+    fetchMock.mockImplementation(async (url: unknown) => {
+      if (String(url).includes('/api/task-continuations/reconcile')) {
+        throw new TypeError('fetch failed')
+      }
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    void pollJobs()
+    await flushPollCycle()
+
+    // reconcile が投げても、同じ cycle で Job intake 側（fetchQueuedJob）へ到達する。
+    // fetchQueuedJob() は GET /api/projects から始まるので、そこへ届いていれば
+    // poll cycle は reconcile の例外で中断していない。
+    const intakeFetches = fetchMock.mock.calls.filter(([url]) => String(url).includes('/api/projects'))
+    expect(intakeFetches.length).toBeGreaterThanOrEqual(1)
+  })
+
   it('start does not wait for pending Outbox events before startup recovery/watchdog/polling', async () => {
     vi.useFakeTimers()
     fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))

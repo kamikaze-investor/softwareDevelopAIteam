@@ -412,4 +412,42 @@ describe('POST /api/task-continuations/reconcile', () => {
       await app.close()
     }
   })
+
+  it('sweep実行中に再度呼ばれてもin-flight guardで重複起動しない', async () => {
+    const app = await buildApp()
+    try {
+      const { project, sourceTask, storage } = await createRunningProjectWithTask(app)
+      const { nextTask } = await seedPendingContinuation(storage, project.id, sourceTask.id)
+
+      let releaseReview: (() => void) | undefined
+      const reviewStarted = new Promise<void>((resolveStarted) => {
+        designReviewMocks.execute.mockImplementation(async (input: string) => {
+          resolveStarted()
+          await new Promise<void>((resolveHeld) => { releaseReview = resolveHeld })
+          return { ok: true, timedOut: false, stdout: stdoutForReviewInput(input) }
+        })
+      })
+
+      const callsBefore = designReviewMocks.execute.mock.calls.length
+
+      const first = await app.inject({ method: 'POST', url: '/api/task-continuations/reconcile' })
+      expect(first.statusCode).toBe(202)
+      expect(JSON.parse(first.body)).toMatchObject({ accepted: true })
+      await reviewStarted
+
+      // Worker は POLL_INTERVAL_MS(5s) ごとに呼ぶが、design review は最大120sかかる。
+      // guard が無いと同一 continuation に対する sweep が積み上がる。
+      const second = await app.inject({ method: 'POST', url: '/api/task-continuations/reconcile' })
+      expect(second.statusCode).toBe(202)
+      expect(JSON.parse(second.body)).toMatchObject({ accepted: false })
+
+      releaseReview?.()
+      await waitFor(() => storage.jobs.findByTaskId(nextTask.id).length === 1)
+
+      // 2回POSTしてもdesign reviewの起動は1回だけ。
+      expect(designReviewMocks.execute.mock.calls.length - callsBefore).toBe(1)
+    } finally {
+      await app.close()
+    }
+  })
 })
