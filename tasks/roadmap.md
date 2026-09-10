@@ -2859,6 +2859,17 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
    （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
 
+**MVP完成宣言前の必須クリーンアップ（MVP必須5項目とは別枠。最後に実施する）:**
+
+<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=planned -->
+- [ ] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — MVP完成宣言の**直前**に、期限付き方針
+      `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章 と `CLAUDE.md` 冒頭のポインタ段落）を
+      共通指示から完全に削除し、repository全文検索で共通開発指示として残っていないことを確認し、
+      削除commitをMVP completionに含める。
+      **完了条件・手順の正本**: `specs/10_mvp_scope.md` 12章「TEMP_MVP_COMPLETION_POLICY cleanup」。
+      **このcleanupが完了するまでMVPを「完成」と記録しない。**
+      一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。
+
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
 - [x] MobileがAPI tokenの`Authorization`ヘッダーを送っていない — **解消済み（2026-08-17
@@ -3258,8 +3269,10 @@ deploy canary は全 PASS だった。
       - **independent review**: 既存 designReview coordinator と `reviewSeparation.ts`
         （同一 vendor / 未知 vendor を fail-closed で弾く provider 分離アサーション）。
         新しい review framework を作らない
-      - **bounded regeneration**: `priorAttemptFeedback` +
-        `ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS` の既存パターン
+      - **bounded regeneration**: まず Failure Explanation 自身の既存経路に
+        regeneration / repair があるかを確認する。無い場合の**形の参考**として
+        `priorAttemptFeedback` + `ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS`（Roadmap generator
+        固有）があるが、**同じ機構への依存は要求しない**
 
       **既存 schema の gap 分析（実測）**: CEO が求める6点のうち、既存 field で賄えるものは
       再利用し、不足分のみ最小追加する。`TaskFailureAiAnalysis` は現在
@@ -3354,8 +3367,12 @@ deploy canary は全 PASS だった。
       | `unknown` | ❌ **しない**（既存分類で安全に fallback 可能と証明できない限り） |
       | input / 対象 Job 不備 | ❌ しない。provider failure ではない |
 
-      - **schema / parse / structured-output failure は provider failure と分ける。**
-        これらは fallback ではなく**既存 bounded regeneration**（`priorAttemptFeedback`）で扱う
+      - **schema / parse / structured-output failure は provider failure と区別する。**
+        **provider fallback では処理しない。** 着手時に Failure Explanation の既存経路に
+        bounded regeneration / repair があるかを確認し、あれば再利用する。無ければ
+        **同一 Generator へ validation feedback を返す最大1回程度の bounded regeneration**を
+        最小実装として検討する。Roadmap generator 固有の `priorAttemptFeedback` へ
+        依存することは要求しない（形として参考にするだけ）
       - 判定は既存の構造境界（出力内容の失敗か、実行経路の失敗か）で行い、分類には既存
         `classifyFailure` を使う。**新しい error classifier を追加しない**
       - fallback 先は **既存 Codex 統合の軽量構成**。新しい汎用 model router を作らない
