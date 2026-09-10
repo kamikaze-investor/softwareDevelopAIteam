@@ -103,27 +103,33 @@ wait_for_death() {
 # 打ち切って上位の kill と再走査に委ねる。
 MAX_DESCENDANT_DEPTH="${DELEGATION_MAX_DESCENDANT_DEPTH:-8}"
 
-# 深さ上限で打ち切ったことを呼び出し元へ伝えるフラグ。
+# 深さ上限で打ち切ったことを呼び出し元へ伝える。
+#
 # 独立レビュー指摘: 打ち切りを黙って「子孫なし」と同じ扱いにすると、
 # 上限より深い子孫が記録されないまま最深の祖先を kill することになり、
 # それらは orphan 化して親PID起点の再走査からも消える。
 # 打ち切りは **fail-closed**（確認できなかった）として扱う。
-DESCENDANT_TRUNCATED=0
-
+#
+# 伝達に global 変数を使わないこと（独立レビュー指摘 第3ラウンド）:
+# 呼び出しは `sweep=$(collect_descendants "$pid")` という **command substitution**、
+# つまり subshell なので、その中での代入は親シェルへ戻らず、
+# せっかくのガードが不発になる。**exit status** で返す。
+# `$(...)` の終了コードは中のコマンドの終了コードなので、そのまま受け取れる。
 collect_descendants() {
   local parent_pid="$1"
   local depth="${2:-0}"
   if [ "$depth" -ge "$MAX_DESCENDANT_DEPTH" ]; then
-    DESCENDANT_TRUNCATED=1
-    return 0
+    return 1
   fi
+  local truncated=0
   local child
   local candidates
   candidates=$(pgrep -P "$parent_pid" 2>/dev/null || ps --ppid "$parent_pid" -o pid= 2>/dev/null || true)
   for child in $candidates; do
-    collect_descendants "$child" $(( depth + 1 ))
+    collect_descendants "$child" $(( depth + 1 )) || truncated=1
     echo "$child"
   done
+  return "$truncated"
 }
 
 # DELEG-001: process tree ごと終了させ、**終了を確認できたときだけ 0 を返す**。
@@ -152,9 +158,10 @@ terminate_process_tree() {
   local descendants=""
   local round
   local drained=0
-  DESCENDANT_TRUNCATED=0
+  local truncated=0
   for round in 1 2 3 4 5; do
-    sweep=$(collect_descendants "$pid")
+    # 走査の終了コードで深さ打ち切りを受け取る（subshell を跨ぐため変数では渡せない）。
+    if sweep=$(collect_descendants "$pid"); then :; else truncated=1; fi
     if [ -z "$sweep" ]; then
       # 空の走査を1回得られて初めて「子孫は残っていない」と言える。
       drained=1
@@ -187,7 +194,7 @@ terminate_process_tree() {
     echo "Warning: descendants of PID $pid still appearing after $round sweeps; cannot confirm the tree is dead" >&2
     return 1
   fi
-  if [ "$DESCENDANT_TRUNCATED" -eq 1 ]; then
+  if [ "$truncated" -eq 1 ]; then
     echo "Warning: descendant scan for PID $pid hit MAX_DESCENDANT_DEPTH; deeper children may survive" >&2
     return 1
   fi
