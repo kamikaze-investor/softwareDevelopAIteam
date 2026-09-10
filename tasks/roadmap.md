@@ -2859,6 +2859,17 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
    （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
 
+**MVP完成宣言前の必須クリーンアップ（MVP必須5項目とは別枠。最後に実施する）:**
+
+<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=planned -->
+- [ ] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — MVP完成宣言の**直前**に、期限付き方針
+      `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章 と `CLAUDE.md` 冒頭のポインタ段落）を
+      共通指示から完全に削除し、repository全文検索で共通開発指示として残っていないことを確認し、
+      削除commitをMVP completionに含める。
+      **完了条件・手順の正本**: `specs/10_mvp_scope.md` 12章「TEMP_MVP_COMPLETION_POLICY cleanup」。
+      **このcleanupが完了するまでMVPを「完成」と記録しない。**
+      一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。
+
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
 - [x] MobileがAPI tokenの`Authorization`ヘッダーを送っていない — **解消済み（2026-08-17
