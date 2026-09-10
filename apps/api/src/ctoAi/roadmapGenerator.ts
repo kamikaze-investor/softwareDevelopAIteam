@@ -102,6 +102,8 @@ ${constitutionPrinciplesPrompt}
   - 実装詳細を推測で決め打ちしない。既存のコード・仕様・テストを確認してから実装する
   - どの不確実性がどのタスクに関係するかはあなたが判断する。関係しないタスクへ機械的に
     全件コピーしない
+- totalTasks と estimatedWeeks は**整数**で出力する（小数は不可）。
+  端数になる場合は切り上げた整数を使うこと
 - 各タスクには category を必ず設定する:
   - "implementation": 実際にコード/ドキュメント/設定の変更を行いプロジェクトの成果物を生み出すタスク
   - "verification": 既に実装された変更のテスト・QA・検証を行うタスク。**注意**: 小規模変更では implementation タスクにテスト検証を組み込み、別途 verification タスクを生成しないこと。verification は変更が広範囲で検証が別途必要とされる場合のみ生成する
@@ -343,8 +345,21 @@ export async function generateRoadmap(
   if (!execution.ok) {
     // Roadmapが得られないことを「空のRoadmap」として下流へ流さない（fail-closed）。
     throw new Error(
-      '[CTO AI] Roadmap生成に失敗しました: ' + (execution.error ?? 'unknown')
-      + (execution.stderr ? ' / ' + execution.stderr : ''),
+      // `executeRunner()` の error は既に stderr を含む
+      // （`runner exited with code N: <stderr>`）。別途 `execution.stderr` を足すと二重になるので足さない。
+      //
+      // ここで sanitize はしない。一度 `sanitizeMessage()` を挟んだが2つ理由で戻した:
+      //   1. 300字で切るため、末尾にある本体（例: `401 Unauthorized`）が落ちる。
+      //      再生成されない失敗ほど原文が要る。
+      //   2. `geminiRouter.ts` は `spawnSync` を持つprovider routerで、APIからimportすると
+      //      Workerのprovider/CLI機構がAPI runtimeへ入る。同じ理由で
+      //      `designReviewCoordinator.ts` は worker側 strategicReview のimportを避けている。
+      //      既存の focusSelector / reviewLoadClassifier は純粋なleaf moduleで、性質が違う。
+      //
+      // prompt へ流れる経路は型ゲートで塞がっている（RoadmapContentError 以外は再生成しない）。
+      // `execution.error` が `start_blocked_reason` やログへ出るのは、design review経路と同じ
+      // 既存の `executeRunner()` の振る舞いであって、この変更が持ち込んだものではない。
+      '[CTO AI] Roadmap生成に失敗しました: ' + (execution.error ?? 'unknown'),
     )
   }
 
@@ -354,19 +369,42 @@ export async function generateRoadmap(
 // JSONパース + バリデーション
 // ────────────────────────────────────────────────────────────
 
+/**
+ * **モデル出力の内容が使えない**ときだけ投げる。再生成すれば直りうる失敗の目印。
+ *
+ * retry可否をmessageの文字列一致で判定しない。生成経路の例外には、再生成しても直らないもの
+ * （vendor separation違反 / quota / auth / CLI実行失敗 / infrastructure）が混ざっており、
+ * それらをfeedback付きで投げ直すのは「同じ失敗を3回繰り返して原因をぼかす」だけになる。
+ * 構造上の境界＝この型かどうか、で分ける（独立レビュー指摘、2026-09-10）。
+ */
+export class RoadmapContentError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RoadmapContentError'
+  }
+}
+
 export function parseRoadmapJson(raw: string): Roadmap {
   const jsonMatch = raw.match(/```json\n?([\s\S]+?)\n?```/) ??
                     raw.match(/(\{[\s\S]+\})/)
 
   if (!jsonMatch) {
-    throw new Error(`[CTO AI] Roadmap JSONが見つかりません。応答:\n${raw.slice(0, 300)}`)
+    throw new RoadmapContentError(`[CTO AI] Roadmap JSONが見つかりません。応答:\n${raw.slice(0, 300)}`)
   }
 
-  const parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0])
+  // 素の SyntaxError のままだと、生成経路の他の失敗（quota / auth / infra）と区別できない。
+  // これは「モデルが壊れたJSONを出した」であって再生成で直りうる種類の失敗なので型で示す。
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0])
+  } catch (error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new RoadmapContentError(`[CTO AI] Roadmap JSONを解析できません: ${detail}`)
+  }
   const result = RoadmapSchema.safeParse(parsed)
 
   if (!result.success) {
-    throw new Error(
+    throw new RoadmapContentError(
       `[CTO AI] Roadmap JSONの構造が不正です:\n${JSON.stringify(result.error.format(), null, 2)}`
     )
   }
