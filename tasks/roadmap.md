@@ -2691,6 +2691,62 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    **現状**: 本項目は設計フェーズ。**実装は未着手であり、着手前にこのcontractのCEOレビューを受ける。**
 
+<!-- roadmap:id=deleg-001-watchdog-respawn state=planned -->
+0. [ ] **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**
+   （2026-09-10登録。#110 Step 3（PR #128）のCI中に**Linux実測**したため、Windows固有ではなく
+   **実運用上の既知欠陥**として扱う）。**#128へは混ぜず独立Findingとする**（CEO判断）。
+
+   **実測（Linux CI、2026-09-09）**: `scripts/delegate-watchdog.test.sh` が
+   `expected recovery_attempt_count '1', got '2'` で失敗した。**同一コードの再実行では pass**（9660ms）。
+   したがって決定的な失敗ではなく**非決定的挙動**である。
+   これまでWindowsローカルでのみ観測していたが（`ps -p <pid> -o args=` によるprovider同定が
+   MSYSで機能しない件とは別）、**Linuxでも再現することが確認された**。
+
+   **リスク**:
+
+   1. **respawn時に旧childを確実に終了できない** — `safe_kill_process()` は
+      `is_opencode_pid()` が真のときしか kill せず、判定に失敗すると
+      「Warning: PID N is not an opencode process, skipping kill for safety」で**素通りする**。
+   2. **recovery attemptが二重計上される** — 1回の失敗に対して `recovery_attempt_count` が
+      2進むケースがある（上記の実測）。
+   3. **bounded recoveryが予定より早くexhaustする** — 2の帰結。
+      本来 `DELEGATION_MAX_RECOVERY_RETRIES` 回試せるはずの委任が、半分程度で
+      `ESCALATE:recovery_exhausted` に倒れ得る。**C-6（bounded recovery）の bound が
+      設計値どおりに効かない**ことを意味する。
+   4. **stale / duplicate child が残る** — 1の帰結。旧childが生きたまま新childが起動すると、
+      同一委任に対して2つのprovider processが並走し得る。
+
+   **なぜ今これが効くか**: #110 Step 3 で `ai_delegation` の実行監督を
+   `delegate-watchdog.sh` に寄せた（**retry actorはここだけ**という構造をCEOが確定）。
+   したがって本欠陥は、`supervised_runs` 側の bounded recovery とは独立に、
+   **委任1件あたりのretry回数を設計値から狂わせる**。
+   Step 3 の Acceptance A〜E は実経路でPASSしているが、それらは
+   `supervised_runs` 側の bound を検証したものであり、**watchdog側のbound精度は別問題**である。
+
+   **方針**: **既存 `delegate-watchdog.sh` の責務内で最小修正する。**
+   **新しい watchdog / supervisor は追加しない**（#110 の構造決定に従う）。
+   想定する修正の方向（実装時に確定）:
+
+   - respawn の**前に**旧childの終了を確定させる（kill後に終了を待ち、待てない場合は
+     retryせず terminal verdict へ倒す。素通りさせない）
+   - `is_opencode_pid()` が判定できないときに「安全のためskip」ではなく
+     **fail-closed（retryせずescalate）**へ倒す。現状は判定不能が実質「無視」になっている
+   - `recovery_attempt_count` の加算を、respawn 1回につき1回だけ起きる位置へ寄せる
+   - `scripts/delegate-watchdog.test.sh` を**繰り返し実行しても安定して通る**ことを完了条件にする
+     （1回passでは非決定性を潰した証明にならない）
+
+   **重複確認済み（2026-09-10）**: 本Findingと重なる既存項目は無い。
+   `worker-cgroup-delegation-contract` は systemd の cgroup delegation 契約であり無関係。
+   `pl-review-process-supervision`（#110）は `delegate-watchdog.sh` を機構として参照しているが、
+   そこで挙げている欠落は「provider決め打ち」「run_dirがbackendへ載らない」であり、
+   **respawn/二重計上は含まれていない**。
+
+   **#110 Legacy exception registry との関係**: 同registryには `deploy` / `build` / `external_ci` の
+   3行があり、**`ai_delegation` の行は存在しない**（Step 3 で正式配線したため、そもそも
+   exception対象ではない）。ただし本Findingが解消するまでは、
+   **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
+   Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
+
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
    **高優先度**。CEO判断: PR Cでは`use_legacy_landlock`を暫定的な安全経路としてのみ使用し、
