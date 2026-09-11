@@ -48,7 +48,12 @@ export {
   shouldEscalateToAiReview,
   determineApprovalLevel,
 } from './approvalLevelClassifier'
-export { resolveFinalDecision, applyIndependentReviewOverride } from './strategicDecision'
+export {
+  resolveFinalDecision,
+  applyIndependentReviewOverride,
+  isStrategicDecision,
+  STRATEGIC_DECISIONS,
+} from './strategicDecision'
 export {
   assertGeneratorSeparatedFromFinalReviewer,
   isGeneratorSeparatedFromFinalReviewer,

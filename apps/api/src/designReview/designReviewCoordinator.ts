@@ -24,6 +24,7 @@ import { selectFocuses, selectRoadmapReviewFocuses } from '@ai-team/worker/src/a
 // 芋づるでimportするため、APIからimportするとWorkerのprovider/CLI機構がAPI runtimeへ入る。
 import {
   applyIndependentReviewOverride,
+  isStrategicDecision,
   resolveFinalDecision,
   type DesignReviewEvidence,
   type DesignReviewKind,
@@ -219,6 +220,17 @@ export function recomputeDecision(
     )
   }
 
+  // decision 値も enum に対して明示的に検証する。ここを素通りさせると
+  // `resolveFinalDecision` は未知値を（fail-closed 化後も）UNCERTAIN へ丸めるだけで、
+  // 「runner が何を返したのか」が evidence から失われる。independent review verdict と
+  // 同じく、受理できない語彙は理由付きで reject する（下の verdict チェックと対称）。
+  const invalidDecisions = raw.focusedReviewResults
+    .map((item) => item.decision)
+    .filter((decision) => !isStrategicDecision(decision))
+  if (invalidDecisions.length > 0) {
+    return reject(`unknown focused review decision(s): ${invalidDecisions.join(', ')}`)
+  }
+
   const independent = raw.independentReviewResult as
     | { verdict?: string; unavailable?: boolean }
     | undefined
@@ -238,6 +250,13 @@ export function recomputeDecision(
 
   if (integrationReviewRequired && (!integration || typeof integration.decision !== 'string')) {
     return reject('roadmap review requires an integration review result')
+  }
+
+  // integration 側も同様に enum 検証する。integration review は roadmap kind では必須で、
+  // かつ focused が全件 ALIGNED でもここ1件で最終判定を動かせるため、未知値を
+  // 黙って UNCERTAIN へ丸めず reject して理由を残す。
+  if (integration !== undefined && !isStrategicDecision(integration.decision)) {
+    return reject(`unknown integration review decision: ${String(integration.decision)}`)
   }
 
   let decision: RecomputedDecision = resolveFinalDecision(

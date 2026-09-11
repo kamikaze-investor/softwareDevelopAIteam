@@ -329,6 +329,86 @@ describe('3. decision authority', () => {
     expect(outcome.decision).not.toBe('ALIGNED')
   })
 
+  // 未知のdecision値は independent review verdict と同じく明示的に reject する。
+  // これが無いと、runner の schema drift / typo / provider 差し替えによる語彙違いが
+  // 「未レビュー同然の変更の承認」として evidence に載る（2026-09-10 実測）。
+  it('未知のfocused decision値はALIGNEDにならず理由付きで不採用', () => {
+    const outcome = recomputeDecision(
+      {
+        focusedReviewResults: [
+          { focus: 'strategic_alignment', decision: 'ALIGNED' },
+          { focus: 'scope_simplicity', decision: 'NOT_ALIGNED' },
+        ],
+        integrationReviewResult: { decision: 'ALIGNED' },
+        independentReviewResult: { verdict: 'approved' },
+        finalDecision: 'ALIGNED',
+      },
+      'task',
+      ['specs/00_constitution.md'],
+    )
+
+    expect(outcome.decision).not.toBe('ALIGNED')
+    expect(outcome.rejectedReason).toContain('NOT_ALIGNED')
+  })
+
+  it('未知のintegration decision値もALIGNEDにならず理由付きで不採用', () => {
+    const outcome = recomputeDecision(
+      {
+        focusedReviewResults: [
+          { focus: 'strategic_alignment', decision: 'ALIGNED' },
+          { focus: 'scope_simplicity', decision: 'ALIGNED' },
+        ],
+        integrationReviewResult: { decision: 'LOOKS_FINE' },
+        independentReviewResult: { verdict: 'approved' },
+        finalDecision: 'ALIGNED',
+      },
+      'task',
+      ['specs/00_constitution.md'],
+    )
+
+    expect(outcome.decision).not.toBe('ALIGNED')
+    expect(outcome.rejectedReason).toContain('LOOKS_FINE')
+  })
+
+  it('runnerが自己申告した finalDecision:ALIGNED は未知値を救済しない', () => {
+    // API は runner の自己申告を採用せず自前で再計算する、という既存の decision authority を
+    // 未知値ケースでも維持する。
+    const outcome = recomputeDecision(
+      {
+        focusedReviewResults: [
+          { focus: 'strategic_alignment', decision: 'NOT_ALIGNED' },
+          { focus: 'scope_simplicity', decision: 'NOT_ALIGNED' },
+        ],
+        integrationReviewResult: { decision: 'ALIGNED' },
+        independentReviewResult: { verdict: 'approved' },
+        finalDecision: 'ALIGNED',
+      },
+      'task',
+      ['specs/00_constitution.md'],
+    )
+
+    expect(outcome.decision).not.toBe('ALIGNED')
+  })
+
+  it('有効値のみのALIGNED経路は従来どおり通る（回帰防止）', () => {
+    const outcome = recomputeDecision(
+      {
+        focusedReviewResults: [
+          { focus: 'strategic_alignment', decision: 'ALIGNED' },
+          { focus: 'scope_simplicity', decision: 'ALIGNED' },
+        ],
+        integrationReviewResult: { decision: 'ALIGNED' },
+        independentReviewResult: { verdict: 'approved' },
+        finalDecision: 'ALIGNED',
+      },
+      'task',
+      ['specs/00_constitution.md'],
+    )
+
+    expect(outcome.decision).toBe('ALIGNED')
+    expect(outcome.rejectedReason).toBeUndefined()
+  })
+
   it('壊れた出力ではevidenceを登録せず失敗として確定する', async () => {
     const run = storage.designReviewRuns.create(baseInput(taskId))
     const result = await executeDesignReviewRun(
