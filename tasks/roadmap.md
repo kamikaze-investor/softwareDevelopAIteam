@@ -2746,6 +2746,162 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
 
+<!-- roadmap:id=strategic-decision-unknown-value-fail-open state=planned -->
+0. [ ] **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）**
+   （2026-09-10登録、**高優先度・安全性**。PR #136（continuation reconcile）の作業中に発見。
+   **#136へは混ぜず独立Findingとする**）。
+
+   **内容**: `packages/shared/src/strategicDecision.ts:22-40` は decisions に `'CONFLICT'` が
+   含まれれば CONFLICT、空か `'UNCERTAIN'` を含めば UNCERTAIN を返し、
+   **それ以外は無条件に `return 'ALIGNED'`** する。有効な `StrategicDecision` は
+   `ALIGNED | CONFLICT | UNCERTAIN` のみ（`packages/shared/src/types/meta_review.ts:115`）だが、
+   focused / integration の decision 値はこのenumに対して検証されていない。
+
+   **実測（2026-09-10）**: continuation reconcileのテストで、design reviewを意図的に
+   不一致にするため `decision: 'NOT_ALIGNED'`（実在しない値）を返させたところ、
+   **ALIGNEDとして受理され**、design review evidenceが登録され、implement Jobが作られた。
+   `'CONFLICT'` に変えて初めてテストが正しく落ちた。
+
+   **リスク**: この出力は design review evidence になり、Job Gate が implement Job の
+   実行可否を判断する根拠である。runnerのschema drift・typo・provider差し替えによる
+   語彙違い・truncateされた値のいずれでも「未レビュー同然の変更が承認される」。
+
+   **非対称性**: `recomputeDecision`（`apps/api/src/designReview/designReviewCoordinator.ts:176-260`）は
+   independent review verdict の未知値は明示的にrejectし、focus集合の不一致もrejectする。
+   **decision値だけが素通りする。**
+
+   **方針（実装前に確認）**: fail-closedへ倒す。parse境界でdecision値をenum検証するか、
+   `resolveFinalDecision` を「全decisionが厳密に `'ALIGNED'` のときだけALIGNED、
+   未知値はUNCERTAIN」へ反転する。未知値がALIGNEDにならない回帰テストを追加する。
+   `packages/shared` はapi/worker双方が参照するため、AGENTS.mdのReview Levelに従うこと。
+
+<!-- roadmap:id=approval-resume-liveness-dependency state=planned -->
+0. [ ] **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
+   （2026-09-10登録。PR #136の調査で判明。**#136へは混ぜず独立Findingとする**）。
+
+   **内容**: CEOがblocked な git_commit Job を承認しても、Jobは自力で再開しない。
+
+   1. `apps/worker/src/jobRunner.ts:490-560` — Gateが `block_until_approved` を返すと
+      Workerは通知して `return { status: 'blocked' }` する。待機もGate再pollもせず、Jobは終端する。
+   2. `apps/api/src/routes/approvals.ts:75-89` — `PATCH /api/approvals/:id` は承認行を
+      書くだけで、Jobを作らず再queueもしない。
+   3. 復旧は `POST /api/tasks/:id/resume`（`resumeBlockedTask()`）= **client起点**。
+
+   **帰結**: 1 Taskあたり **承認 + resume の2回のclient操作**が要る。
+   これは PR #136 が解消したGET polling依存とは**別**のliveness依存であり、
+   「clientを閉じたままProject完了」は現状不可能である。
+
+   **前提（変更しないこと）**: `git_commit` は riskLevel に関わらず無条件でCEO承認必須
+   （`apps/api/src/routes/approvalGate.ts:415-417`）。low-risk auto approvalの設定・env flagは
+   存在せず、`apps/worker/src/guards/safetyAuditor.ts:74` は `autoApprove` というキーワード自体を
+   CRITICALとして検出する。**auto-approvalは本Findingの解決策ではなく**、
+   採用するならセキュリティモデル変更としてCEO承認が要る。
+
+   **問うべき範囲**: 「**正当な承認が既に存在する**場合に、blocked git_commit Job の再開を
+   backend側（既存のWorker poll cycle / reconcile）が行ってよいか」。
+   `resumeBlockedTask()` が既に持つdedupとGate再チェックを再利用する前提で、
+   まずread-onlyで調査し、call pathと最小変更案を出してから実装する。
+
+<!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=planned -->
+0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**
+   （2026-09-10登録。PR #136 のIndependent Reviewで同型の欠陥が指摘され、
+   既存経路にも同じ漏れがあることが判明した。**PR #136 には混ぜない**）。
+
+   **内容**: Workerは毎poll cycleで `POST /api/supervised-runs/reconcile` を呼ぶ
+   （`apps/worker/src/index.ts`）が、このrouteは `WORKER_ALLOWLIST`
+   （`apps/api/src/auth/workerAllowlist.ts`）に**含まれていない**。
+   WORKER credentialはDefault Denyのため（`apps/api/src/auth/apiToken.ts:103`）、
+   **credential splitを有効化した時点で毎cycle 403**になる。
+
+   **重要な訂正（2026-09-10、production実測）**: 登録時は「live production defectであり
+   現に403になっている」と記載したが、**これは誤りだった**。本番APIの実プロセス環境変数は
+   `API_TOKEN` のみで、`ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` は**設定されていない**。
+   したがって `apiToken.ts` は `legacySingleTokenAuth` へ落ち、**allowlistは一切評価されない**。
+
+   実測（PR #136 deploy直後、WORKER credentialで実行）:
+   - `POST /api/supervised-runs/reconcile` → **200**（403ではない）
+   - split有効時にWORKERへ明示的に禁止される `PATCH /api/approvals/:id` → **404**
+     （routeに到達している = allowlist不適用）
+   - Worker journalにも403警告は出ていない
+
+   **現状の正しい評価**: 稼働中のproductionは壊れていない。**潜在欠陥**であり、
+   credential split（`ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` の設定）を
+   有効化した瞬間に顕在化する。したがって
+   **「splitを有効化する作業」の前提条件**として扱うのが正しい。
+
+   **顕在化した場合の帰結**: Worker側は `!response.ok` をwarnして返すだけなので
+   静かに失敗し続ける。supervised run の reconcile が成立せず、完了済みの委任が
+   RUNNING のまま残り、`#110 Step 3` で配線した「terminal後のcontinuation起動」も動かない。
+
+   **付随して確認が要る点**: credential splitが現在無効ということは、
+   `docs`・memory類にある「本番はauth splitを強制している」という記述が事実と異なる。
+   splitを有効化する予定があるのか、既に廃止されたのかをCEOへ確認すること。
+
+   **再発防止（本項目の一部として検討）**: allowlist漏れはunit testでは検出しにくい
+   （`WORKER_ALLOWLIST` を反復するテストは追加後に自動でpassする）。
+   PR #136 では自分が追加したrouteについて、実route登録＋auth hookを通す統合テストを
+   `workerCredentialAuthorization.test.ts` へ足した。同型のテストを既存の
+   Worker呼び出し経路すべてに用意するか、経路一覧とallowlistの整合を確認する手段を持つか決める。
+
+<!-- roadmap:id=task-allowed-paths-not-normalized state=planned -->
+0. [ ] **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**
+   （2026-09-11登録。continuation E2E（Production E2E test 4）で実際に1サイクル失った。
+   **MVP後へ延期** — 回避策は仕様書のパス表記を相対にするだけでコード変更が不要なため）。
+
+   **内容**: File Change Guard は git が報告する **リポジトリ相対**の changedFiles と
+   task の `allowedPaths` を比較する（`apps/worker/src/guards/fileChangeGuard.ts`）。
+   `allowedPaths` に**絶対パス**が入ると、どの changedFile とも一致せず
+   **常に fileChangeAllowed=false** になる。
+
+   実測（2026-09-11, Production E2E test 4 / task-001）:
+   ```
+   allowed_paths = ["/workspace/target/test.js"]
+   changed_files = ["test.js"]
+   guard_result  = {"permissionAllowed":true,"fileChangeAllowed":false,"fileViolations":["test.js"]}
+   stderr        = File Change Guard blocked (stage A): test.js
+   ```
+   過去に成功した全タスクの `allowedPaths` は相対だった（`test.js` / `e2e/` /
+   `e2e/phase12-smoke.js`）。絶対パスが入ったのは今回が初。
+
+   **直接原因は仕様書側**: 投入した仕様書が対象ファイルを
+   `/workspace/target/test.js` と絶対パスで書いており、Roadmap generator が
+   その表記を `allowedPaths` へそのまま採用した。**Guardの挙動は設計どおり**で、
+   許可側の over-block は安全側（同ファイルのコメントに明記あり）。
+
+   **したがって製品欠陥ではなく入力検証の欠落**。ただし以下が実運用コストになる:
+   - task sync 時点で「このallowedPathsはどのchangedFileにも一致し得ない」ことを検出しない
+   - 失敗メッセージが `File Change Guard blocked: test.js` であり、
+     **allowedPaths自体が不一致である**ことを示さない。CEO/AIは
+     「test.jsが禁止されている」と誤読する（今回実際に調査時間を要した）
+
+   **対応方針（MVP後）**: 次のいずれか。新しいGate/仕組みは作らない。
+   1. task sync 時に `allowedPaths` をリポジトリ相対へ正規化する（workingDir prefixを剥がす）
+   2. 正規化せず、絶対パスを task sync 時に**検証エラーとして弾く**（fail-fast）
+   3. Guardのblockメッセージに allowedPaths を含め、不一致の原因が読めるようにする
+
+   3 は単独でも誤読コストを消せるので、最小対応として有力。
+
+   **なお状態は壊れていない**: guard block後も worktree は clean に戻り、
+   `test.js` は未変更、verify.js baseline も FAIL のままだった。
+   異常検出 → 安全停止 → 状態保全 → 原因特定可能 → 正規手段で再開、は満たしている。
+
+<!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
+0. [ ] **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**
+   （2026-09-10登録。PR #136 のIndependent Reviewで指摘。
+   **MVP完了を阻害しないため延期**。CEO方針: MVPスコープを広げない）。
+
+   1. **sweepが毎cycle全Projectを走査する** — `reconcileTaskContinuations()` は
+      `projects.findAll()`（`SELECT * FROM projects ORDER BY created_at DESC`）を毎cycle実行する。
+      `ux_projects_single_running` により実作業は最大1 Projectに限られるため実害は小さいが、
+      走査自体はfull-tableである。**CEO方針により、性能上の実測問題が出るまで新queryは追加しない。**
+      対応するなら `findRunning()` 相当の追加。
+   2. **continuationの実エラーが握り潰される** — `ensureTaskContinuation()` の catch は
+      workflow生成時の例外を捕捉して**何もログしない**（`apps/api/src/ctoAi/taskContinuation.ts`）。
+      routeは `stillPending` を含む結果を返すが、ログは recovered/failed が動いた時だけ出る。
+      永続的なstorage障害・design review基盤障害があると、無限にretryし続けて
+      API側に何のエラー signal も残らない。**この catch は #136 以前からの既存挙動**であり、
+      #136 が新規に持ち込んだものではない。状態は壊れず durable state は正しいままなので、
+      MVP後に扱う。
    ### 訂正（2026-09-11、CEO指示）— 「Step 3 で正式配線した」は誤りだった
 
    本項は以前「Step 3 で正式配線したため exception 対象ではない」と記載していたが、
