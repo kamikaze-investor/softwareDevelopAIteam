@@ -1233,11 +1233,16 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       新attempt自動生成（1回まで）／2回目の状態不明でfail-closed停止し、CEO承認を要求せず
       既存のJob/Task失敗可視化経路にそのまま乗ること／replay-safeでないJob（既存
       `CommandKindSchema`に無い外部作用を伴うJob）は本メカニズムの対象にしないこと。
-<!-- roadmap:id=project-auto-completion-detection state=planned -->
-9. [ ] Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。
-      **既知の穴**: `ProjectStatus`に`completed`が無い（`draft/running/paused/archived`のみ。
-      `types/project.ts:3`）ため、計算値にするか状態として持つかの決定が必要。
-      **完了条件**: 完了/未完了がAPIで取得でき、Mobileから確認できること
+<!-- roadmap:id=project-auto-completion-detection state=done -->
+9. [x] Project全体の完了判定 — **完了（2026-09-11 の棚卸しで実態を確認。実装は MOB-001 系で
+      到達済みだったが ledger が追随していなかった）**。全Task完了をもってProject完了とみなす判定。
+      **既知の穴（決着済み）**: `ProjectStatus`に`completed`が無い（`draft/running/paused/archived`のみ。
+      `types/project.ts:3`）問題は、**状態を増やさず計算値にする**方向で決着した。
+      **完了条件（達成）**: 完了/未完了がAPIで取得でき、Mobileから確認できること。
+      `getRoadmapCompletion()`（`apps/api/src/routes/projects.ts:33`）が `roadmapActive` な Task
+      だけを対象に `completedTaskCount` / `totalTaskCount` / `isComplete` を計算し、
+      `GET /api/projects/:id/roadmap` が `completion` として返す。Mobile は
+      `apps/mobile/app/index.tsx` で全 roadmap Task 完了時に「完了」バッジを表示する。
 <!-- roadmap:id=project-auto-ceo-alignment state=planned -->
 10. [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
       **通知後も開発は継続し、通常チェックポイントでは停止しない**。既存の`notifier`
@@ -1691,7 +1696,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       `packages/shared`（4ファイル/54テスト）全て成功、3パッケージとも`tsc --noEmit`成功。
       Meta Reviewer AI・Typecheck & Test 両requiredチェックとも green（bypassなし）。
       PR #61は通常のmerge手順でmaster統合済み（`b01b9c3`）。
-<!-- roadmap:id=design-review-conflict-recovery state=planned -->
+<!-- roadmap:id=design-review-conflict-recovery state=done -->
 7. [x] **Design Review CONFLICT Recovery — 完了（2026-09-02）**（2026-09-01登録。上記と同じ経緯で、
       Codexからの登録報告が本リポジトリに見つからなかったため正式登録し直す）。
 
@@ -2775,6 +2780,11 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    未知値はUNCERTAIN」へ反転する。未知値がALIGNEDにならない回帰テストを追加する。
    `packages/shared` はapi/worker双方が参照するため、AGENTS.mdのReview Levelに従うこと。
 
+   **MVP blocker（CEO判断・2026-09-11）= M0。** Exit Criteria本文には現れないが、Exit Criteria
+   2（AIがタスク生成）・3（AIが実装）が依拠するReview Gateそのものの健全性であり、
+   `AGENTS.md` 0章の例外条件「Approval Gate・権限・安全境界を迂回できる」に該当する。
+   **新しいReview機構は作らず、既存のdecision解釈・validation境界のみを最小変更する。**
+
 <!-- roadmap:id=approval-resume-liveness-dependency state=planned -->
 0. [ ] **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
    （2026-09-10登録。PR #136の調査で判明。**#136へは混ぜず独立Findingとする**）。
@@ -2801,6 +2811,73 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    backend側（既存のWorker poll cycle / reconcile）が行ってよいか」。
    `resumeBlockedTask()` が既に持つdedupとGate再チェックを再利用する前提で、
    まずread-onlyで調査し、call pathと最小変更案を出してから実装する。
+
+   **MVP blocker（CEO判断・2026-09-11）= M2。** Exit Criterion 5「Goal変更以外で開発が止まらない」
+   に直撃する。
+
+   **2026-09-11 read-only調査で判明した追加事実（深刻度が登録時の想定より高い）**:
+   `findWorkspaceOwningTaskId()`（`apps/worker/src/index.ts:92`）は **`blocked` Job を
+   workspace の所有者として扱う**。`fetchQueuedJob()` は所有者がいる間、**他のすべての Task の
+   queued Job を skip する**（同 124行）。したがって承認待ちで blocked になった git_commit Job は、
+   承認後も誰も resume しない限り workspace を握り続け、**当該 Task だけでなく Worker 全体が
+   1件も Job を拾わなくなる**。「Taskごとにclient操作が1回増える」ではなく**全体停止**である。
+   過去の Production E2E が完走できたのは、client が手動 resume を呼んだためである。
+
+   **完了条件（CEO確定・2026-09-11）**: Approval が CONSUMED された後、client の
+   `POST /api/tasks/:id/resume` なしに既存 Worker 処理で後続 Job が進み、blocked Job の
+   workspace ownership が解消されること。duplicate resume / duplicate Job を起こさないこと。
+   Approval Gate 自体（`git_commit` の無条件CEO承認）は維持する。
+
+<!-- roadmap:id=workspace-dirty-leakage-cleanup state=planned -->
+0. [ ] **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
+   （2026-09-11登録。**MVP blocker = M1**。P1 completion handoff が
+   「この cluster には open な owner 項目が無い」と指摘していた root cause の正式な owner 項目。
+   root cause の記述自体は `project-auto-task-job-chain`（done）の本文に残っているが、
+   **実装責務は本項目が持つ**。重複 Finding を作らないこと）。
+
+   **root cause（2026-09-11 read-only調査でコード確認済み）**: worktree から変更を除去する
+   コードはシステム全体で `revertBlockedJobChanges()`（`apps/worker/src/jobRunner.ts:1351`）の
+   1箇所だけで（`git clean` / `git reset` の実呼び出しは同1404-1406行のみ）、
+   その呼び出し元3箇所（913 / 1237 / 1641）は**すべて File Change Guard 違反
+   （`!guard.allowed`）条件下**にある。したがって AI CLI が失敗しても変更が
+   `allowedPaths` 内に収まっていれば cleanup は一度も走らない。
+
+   **roadmap 既存記述の訂正**: `project-auto-task-job-chain` 本文の
+   「untracked ファイルはどの経路でも掃除されない」は不正確。
+   `revertBlockedJobChanges()` は `added` を `git reset -q HEAD -- <path>` +
+   `git clean -fdq -- <path>` で **path 限定に削除でき、untracked も掃除できる**。
+   欠けているのは能力ではなく**呼び出し条件**である。
+
+   **現在の表面症状（P1 Phase 1 の admission 分類修正後）**: repair が
+   `MAX_REPAIR_ATTEMPTS=3` を使い切ると `escalateTaskToHuman()` が Task を `blocked` にするが
+   worktree には触れない。その Job は `failed` で終わり、`failed` は
+   `findWorkspaceOwningTaskId()` の所有者条件に入らないため**所有者不在のまま dirty が残る**。
+   次 Task の `task:<id>:initial-implement` は `computeWorkspaceBaseline()` で
+   `normal Job requires a clean worktree but found N changed path(s)` となり、
+   `ownsWorkspaceBeforeClaim=false` のため **quarantine ではなく `failed`** になる
+   （`apps/worker/src/index.ts:448`）。以後すべての新規 Task が同じ場所で死ぬ。
+   roadmap が記録した「quarantine が恒久化する」症状のうち
+   `implement:<id>:review` / `review:<id>:git-commit` の誤分類分は P1 Phase 1 で
+   `isIntentionallyDirtyJob()` へ追加され解消済み。**構造欠陥は同一だが症状が変わっている。**
+
+   **方針（CEO確定・2026-09-11）**: **worktree isolation は導入しない。**
+   帰属データは既に durable に永続化されている（`jobs.changed_files` /
+   `jobs.workspace_baseline`、`apps/api/src/storage/schema.ts:72,79`）。
+   repair/retry がその dirty state を**もう継承しないと確定した terminal transition**で、
+   その Job に帰属できる変更だけを**既存の `revertBlockedJobChanges()` により** cleanup する。
+   `prepareRepairFlow()` / `escalateTaskToHuman()` は cleanup 開始条件を確定する地点として
+   利用してよいが、**API 側へ cleanup ロジックを複製せず**、実際の cleanup は既存
+   architecture の責務（Worker）に合わせて最小変更で行う。
+   **新しい cleanup subsystem / 新 status / 新 Gate は追加しない。**
+
+   **維持すること（CEO確定）**: `preExistingPaths` は触らない ／ 帰属不能な変更は削除しない ／
+   HEAD が変わっている場合の既存 skip 条件を維持 ／ known-good 条件を緩めない ／
+   cleanup 失敗・不完全時は fail-open せず escalation を維持 ／
+   repair/retry が dirty state を正当に継承する経路を壊さない ／
+   duplicate cleanup を起こさない。
+
+   **完了条件**: 人間の手動 git cleanup が通常復旧手段として必要な状態を解消すること。
+   M3 production E2E で手動 git 操作なしに複数 Task が通ることで実測する。
 
 <!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=planned -->
 0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**
@@ -3034,8 +3111,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    Gemini(Google) focused ×3 / Claude Opus(Anthropic) final integrationの3 vendor構成で
    成立するため、本項目の完了を待たない。OpenCodeは後から追加できる独立expertとして扱う。
 
-<!-- roadmap:id=continuation-get-liveness-dependency state=planned -->
-0. [ ] **Task ContinuationのGET依存解消（高優先度）**（2026-09-07登録。Project-start durability
+<!-- roadmap:id=continuation-get-liveness-dependency state=done -->
+0. [x] **Task ContinuationのGET依存解消（高優先度）— 完了（2026-09-11）**（2026-09-07登録。Project-start durability
    実装の独立レビューで発覚。**今回のProject-start変更が導入したものではなく既存設計**であり、
    PR混入を避けるため別項目として登録した）。
 
@@ -3058,6 +3135,23 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    **既存項目との関係（重複実装にしないこと）**: `project-pause-continuation-gap`（done）は
    「アプリを閉じても最後まで進む」を確認する前に解決すること。
+
+   **完了（2026-09-11）**: 作業範囲4点すべてを満たした。(1)(2) `GET /api/projects` /
+   `GET /api/projects/:id` から `retryPendingContinuationsForProject()` の fire-and-forget を
+   削除し純粋 read-only へ戻した（PR #143）。(3) 新Queue/Daemonは追加していない。
+   (4) backend-owned な再駆動は Worker poll cycle からの
+   `POST /api/task-continuations/reconcile` として実装済み（PR #136）。continuation を進める
+   経路は commit 成功時の `PATCH /api/jobs/:id`（非2xxならWorker Outbox再送）／
+   `PATCH /api/projects/:id` の resume retry ／ Worker poll cycle の reconcile の3本で、
+   いずれも backend で完結する。実測は
+   `docs/project_memory/decisions/continuation_get_liveness_dependency_e2e.md`
+   （Production E2E test 5。2 Task・依存あり・両Task commit 成功）。
+   **未取得の証拠**: Worker sweep が Production で実際に pending を回収した事例は未観測
+   （他経路が先に成立し sweep の出番が無かったため）。sweep 自体の回収能力は
+   deterministic test で確認済み。
+   **本項目の完了は「clientを閉じたままProject完了」を意味しない。**
+   別 liveness 依存である `approval-resume-liveness-dependency`（M2）が残るため、
+   その完了をもって初めて M3 で通しの実測を行う。
 
 <!-- roadmap:id=mobile-approval-role-docs state=deferred -->
 1. [ ] 2種類の承認の役割整理とMobile導線設計 — **Mobile導線は実装完了・文書整理のみ未完**。
@@ -3114,6 +3208,17 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       上記3の「cleanup 完了確認」を parser ベースの自動 check に委ねると、
       本項目を見落としたまま通過し得る。MVP Exit を実施する担当は、
       **手動で確認するか、先に整形（`- [ ]` → 番号付き）を直してから自動 check を使うこと。**
+      **CEO判断（2026-09-11）: M4 着手前に正規形式へ直す。**
+
+      **同種の parser 不整合（2026-09-11 実測。いずれも MVP 本線を block しないため今回は直さない）**:
+      `pnpm roadmap:check` は本項目を含め5件を報告する — `priority=high` 付き metadata 3件
+      （parser の `ROADMAP_METADATA_REGEX` が `id` と `state` の2属性しか受け付けない）、
+      `roadmap-generation-constraint-compliance` の `[~]` 表記1件
+      （`CHECKBOX_LINE_REGEX` が `( |x)` しか受け付けない）、本項目の `- [ ]` 1件。
+      **帰結**: `roadmap:sync` は validation を前提とするため実行できず、
+      `docs/PROJECT_CURRENT_STATE.md` の `AUTO-GENERATED:ROADMAP_CURRENT_STATE` ブロックは
+      **stale のまま**である（CI は `typecheck` / `test` のみを実行するため CI は落ちない）。
+      M4 で本項目を正規形式へ直す際に、残り4件も併せて解消するか判断すること。
 
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
