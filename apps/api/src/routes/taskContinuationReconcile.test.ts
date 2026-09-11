@@ -28,8 +28,14 @@ const TASK_ALIGNED_STDOUT = JSON.stringify({
 })
 /**
  * 有効なStrategicDecisionは 'ALIGNED' | 'CONFLICT' | 'UNCERTAIN' のみ
- * （packages/shared/src/types/meta_review.ts）。未知の文字列を使うと
- * resolveFinalDecision()がALIGNEDへfall throughするため、実在する値を使う。
+ * （packages/shared/src/types/meta_review.ts）。ここで CONFLICT を明示するのは、
+ * 「design reviewが通らない」ケースをその意味どおり表現するためである。
+ *
+ * 履歴: 本コメントは元々「未知の文字列はresolveFinalDecision()がALIGNEDへ
+ * fall throughするので実在する値を使うこと」という注意書きだった。その fall-through は
+ * fail-open欠陥として修正済み（未知値はUNCERTAINへ倒れ、recomputeDecision()が
+ * 理由付きでrejectする）。回帰テストは packages/shared/src/strategicDecision.test.ts と
+ * designReviewCoordinator.test.ts にある。
  */
 const TASK_CONFLICT_STDOUT = JSON.stringify({
   focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }],
