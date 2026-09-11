@@ -2798,6 +2798,22 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    4. F4（子孫の group escape）は cgroup で解消される
    を行う。**単独の F7 修正 PR は作らない**（当該経路が未配線のため。CEO判断 2026-09-11）。
 
+   **非決定性の再現記録（2026-09-11）— master 上でまだ生きている**:
+   **docs のみを変更した PR #141** の CI が
+   `expected recovery_attempt_count '1', got '2'` で失敗した。
+   同PRはコードを1行も変更していないため、**master 側の既存 flake**である。
+   空コミットのみ追加した再実行では **pass**（同一コードで pass/fail が分かれる）。
+   同じ master のコードを開発機 WSL で **20回連続実行しても 20/20 pass** しており、
+   GitHub runner（共有CPUで負荷が高い）でのみ観測される点も、
+   当初の「負荷依存の race」という観測と整合する。
+   なお master の `delegateWatchdog.test.ts` は shell suite を **1回だけ**実行する
+   （反復実行版は #132 に含まれていたため master には入っていない）。
+
+   **運用上の影響**: 本 flake は required check を確率的に落とすため、
+   **無関係な PR の merge を妨げ得る**。当該経路は未配線で修正は MVP後へ延期しているので、
+   当面は「落ちたら再実行」で運用する。CI から外す（skip / quarantine）判断は
+   **CEO判断が要る**（検証していないものを緑に見せることになるため、独断では行わない）。
+
    **検証可能性の制約（実測）**: containment の実封じ込めテストは CI で実行されない。
    #132 の CI 実測で `runContainedCommand.test.ts` は **20 tests / 13 skipped**
    （`isContainmentAvailable()` gate）。開発機の WSL も cgroup v1 hybrid で作成不可。
