@@ -7,12 +7,19 @@ function initialStepKey(taskId: string): string {
 
 /**
  * paused中に保留された（`retryable`なskipで残された）'pending' continuationを、対象Project
- * について再試行する。running遷移直後の1回だけでなく、`GET /api/projects`・
- * `GET /api/projects/:id`（Mobileが既に継続的にpollしている既存endpoint）からも呼ぶことで、
- * 1回の再試行が失敗しても「その後二度と拾われない」状態にしない。新しいQueue/daemon/pollingは
- * 追加せず、Mobileの既存poll cycleに相乗りする（Worker側`pollJobs()`がOutbox再送を自分の
- * poll cycleに相乗りさせているのと同じパターン）。個々の失敗はログのみで、呼び出し元の
- * レスポンスをブロックしない設計を前提に、呼び出し元でfire-and-forgetすること。
+ * について再試行する。
+ *
+ * 呼び出し元は **`PATCH /api/projects/:id` で running へ戻したときの1回だけ**である。
+ * 以前は `GET /api/projects` / `GET /api/projects/:id` からも呼んでいたが、それは読み取りに
+ * 副作用を持たせるものであり、Mobileのpollがcontinuationのliveness driverになっていた
+ * （continuation-get-liveness-dependency）。GETは純粋read-onlyへ戻したため、
+ * この関数をGETから呼ぶ経路は無い。
+ *
+ * この1回の再試行が失敗しても恒久的に止まらないことは、Worker poll cycleの
+ * `POST /api/task-continuations/reconcile`（`reconcileTaskContinuations`）が保証する。
+ *
+ * 個々の失敗はログのみで、呼び出し元のレスポンスをブロックしない設計を前提に、
+ * 呼び出し元でfire-and-forgetすること。
  */
 export async function retryPendingContinuationsForProject(storage: IStorage, projectId: string): Promise<void> {
   const pending = storage.taskContinuations.findPendingByProjectId(projectId)

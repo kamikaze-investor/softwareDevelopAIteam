@@ -428,7 +428,7 @@ describe('Project API', () => {
     })
   })
 
-  it('a resume attempt that cannot complete yet is retried by the next poll, not stranded forever', async () => {
+  it('GETは副作用を持たず、pendingのcontinuationはWorker reconcileだけが回収する', async () => {
     await withApp(async (app) => {
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
@@ -473,12 +473,26 @@ describe('Project API', () => {
       // The blocker resolves later, independent of any further PATCH from the CEO.
       storage.tasks.update(blockerTask.id, { status: 'done' })
 
-      // Mobile's existing poll of GET /api/projects/:id (usePolling) is what recovers it --
-      // not a second manual resume action.
-      const pollRes = await app.inject({ method: 'GET', url: `/api/projects/${project.id}` })
-      expect(pollRes.statusCode).toBe(200)
+      // GETを何度呼んでもcontinuationは進まない（読み取りに副作用が無い）。
+      // 以前はここでGET /api/projects/:id がcontinuationを回収していた＝
+      // Mobile pollingがliveness driverだった。
+      for (let i = 0; i < 3; i += 1) {
+        const listRes = await app.inject({ method: 'GET', url: '/api/projects' })
+        expect(listRes.statusCode).toBe(200)
+        const oneRes = await app.inject({ method: 'GET', url: `/api/projects/${project.id}` })
+        expect(oneRes.statusCode).toBe(200)
+      }
       await new Promise((resolve) => setTimeout(resolve, 50))
 
+      expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(0)
+      expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('pending')
+
+      // 回収するのはWorker poll cycleのreconcileだけ（POST /api/task-continuations/reconcile
+      // が呼ぶ本体）。これが「一度失敗したら二度と拾われない」を防ぐ唯一のfallbackになった。
+      const { reconcileTaskContinuations } = await import('../ctoAi/taskContinuation.js')
+      const summary = await reconcileTaskContinuations(storage)
+
+      expect(summary).toMatchObject({ recovered: 1 })
       expect(storage.jobs.findByTaskId(nextTask.id)).toHaveLength(1)
       expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')
     })
@@ -507,9 +521,9 @@ describe('Project API', () => {
         nextTaskId: nextTask.id, status: 'pending',
       })
 
-      // Simulates the resume-time sweep and a poll-triggered sweep (GET /:id or GET /)
-      // landing at nearly the same moment -- the exact race the Outbox 503 path already had
-      // to be safe against via the workflow_step_key unique index.
+      // resume時のretryとWorker reconcileのsweepがほぼ同時に着弾する状況を再現する。
+      // （GET経由の経路は削除済みなので、競合するのはこの2者だけになった。）
+      // workflow_step_keyのunique indexで重複Jobは防がれる。
       await Promise.all([
         retryPendingContinuationsForProject(storage, project.id),
         retryPendingContinuationsForProject(storage, project.id),
