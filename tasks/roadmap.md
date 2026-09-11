@@ -2785,9 +2785,11 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `AGENTS.md` 0章の例外条件「Approval Gate・権限・安全境界を迂回できる」に該当する。
    **新しいReview機構は作らず、既存のdecision解釈・validation境界のみを最小変更する。**
 
-<!-- roadmap:id=approval-resume-liveness-dependency state=planned -->
-0. [ ] **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
-   （2026-09-10登録。PR #136の調査で判明。**#136へは混ぜず独立Findingとする**）。
+<!-- roadmap:id=approval-resume-liveness-dependency state=done -->
+0. [x] **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
+   — **前提が誤っていた。実装は既に存在しており、本Findingはcloseする（2026-09-11）**
+   （2026-09-10登録。PR #136の調査で判明したとされたが、**参照したrouteが別物だった**。
+   下記「訂正」参照）。
 
    **内容**: CEOがblocked な git_commit Job を承認しても、Jobは自力で再開しない。
 
@@ -2819,14 +2821,61 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `findWorkspaceOwningTaskId()`（`apps/worker/src/index.ts:92`）は **`blocked` Job を
    workspace の所有者として扱う**。`fetchQueuedJob()` は所有者がいる間、**他のすべての Task の
    queued Job を skip する**（同 124行）。したがって承認待ちで blocked になった git_commit Job は、
-   承認後も誰も resume しない限り workspace を握り続け、**当該 Task だけでなく Worker 全体が
-   1件も Job を拾わなくなる**。「Taskごとにclient操作が1回増える」ではなく**全体停止**である。
-   過去の Production E2E が完走できたのは、client が手動 resume を呼んだためである。
+   誰も再開させない限り workspace を握り続け、**当該 Task だけでなく Worker 全体が
+   1件も Job を拾わなくなる**。したがって「承認待ちで止まる」の影響範囲は Task 単位ではなく
+   **Project横断の全体停止**である。
+   （⚠️ 登録当初ここには「承認後も誰も resume しない限り」「過去の Production E2E が完走できたのは
+   client が手動 resume を呼んだためである」と書いていたが、**後者は検証していない推測で誤り**。
+   承認は auto-resume を伴う。下記「訂正」を参照。所有権機構の記述自体は正しい。）
 
    **完了条件（CEO確定・2026-09-11）**: Approval が CONSUMED された後、client の
    `POST /api/tasks/:id/resume` なしに既存 Worker 処理で後続 Job が進み、blocked Job の
    workspace ownership が解消されること。duplicate resume / duplicate Job を起こさないこと。
    Approval Gate 自体（`git_commit` の無条件CEO承認）は維持する。
+
+   ### 訂正（2026-09-11、実routeでの検証により）— **本Findingの前提は誤り。実装済みだった**
+
+   **何が間違っていたか**: 本Findingは `PATCH /api/approvals/:id`
+   （`apps/api/src/routes/approvals.ts:73-87`）が「承認行を書くだけでJobを再queueしない」ことを
+   根拠にしていた。しかしこのrouteは**Project単位の `approvals` テーブル**のものであり、
+   **git_commit の Approval Gate とは別系統**である。git_commit Gate が作るのは
+   `approval_requests` で、承認口は `PATCH /api/approval-requests/:id/status`
+   （`apps/api/src/routes/approvalGate.ts:773`）である。
+
+   **実際の挙動**: そのrouteは `requestedAction === 'git_commit'` かつ `APPROVED` の場合、
+   `storage.approvalRequests.approveAndResumeJob()`（`apps/api/src/storage/sqlite.ts:2389`）を
+   呼ぶ。この関数は**単一transaction**で
+   (a) approval_request を APPROVED にし、
+   (b) `jobs.approval_id` で紐づく Job を `status='queued'` へ戻し、前回実行の結果
+   （stdout/stderr/exitCode/changedFiles/commitHash/guardResult 等）をクリアする。
+   したがって**承認だけで Job は再開し、client の `/resume` は不要**である。
+   同一 Job 行を再利用するため duplicate Job にもならず、`approval_id` の紐づきが保たれるので
+   後続の `consume` も成立する。expired / 二重承認 / Job不一致 / Design Review evidence 不成立は
+   いずれも 404/409 で fail-closed（承認自体が成立しない）。
+   競合時の巻き戻し防止も既にあり、Worker の blocked 書き戻しが承認後に届いても
+   `jobs.update()`（`sqlite.ts:1136`）が APPROVED/CONSUMED を見て queued を維持する。
+
+   **同時に訂正すべき記述**: 上記「深刻度」欄で「過去の Production E2E が完走できたのは
+   client が手動 resume を呼んだためである」と書いたが、**これは検証していない推測であり誤り**。
+   承認だけで再開するため、E2E の完走は auto-resume で説明できる。
+   `findWorkspaceOwningTaskId()` が `blocked` Job を所有者として扱い Worker 全体を止める、
+   という機構の記述自体は正しい。正しくないのは「承認しても解放されない」という部分で、
+   実際には**承認によって blocked が queued へ変わり所有権は解放される**。
+
+   **client `/resume` が依然として必要な経路（MVP blocker ではない）**: approval が
+   STALE / SUPERSEDED / EXPIRED / REJECTED になった場合は Job が blocked のまま残り、
+   `POST /api/tasks/:id/resume` が要る（`resumeBlockedGitCommitJob.test.ts` が対象）。
+   これは異常系であり、`AGENTS.md` 0章の異常系水準「既存の正規手段で再開または復旧できる」を
+   Mobile の Task 詳細「追加指示して再開」で満たしている。MVP後の改善対象とする。
+
+   **本Findingで実際に行った作業**: production code は変更していない。既存挙動を固定する
+   回帰テスト `apps/api/src/routes/approvalAutoResumeLiveness.test.ts`（8件）を追加した。
+   実route（`PATCH /api/approval-requests/:id/status`）経由で、承認だけで queued へ戻ること、
+   同一 Job 行であること、前回結果がクリアされること、**blocked Job が残らない
+   （workspace ownership が解放される）**こと、Worker が claim に使う
+   `GET /api/jobs?taskId=` から queued として見えること、二重承認が 409 で拒否され Job が
+   増えないこと、REJECTED では queued へ戻らないこと、未承認なら blocked のままであることを
+   固定した。**M3 の production E2E で「手動 resume なし」を実測して最終確認する。**
 
 <!-- roadmap:id=workspace-dirty-leakage-cleanup state=planned -->
 0. [ ] **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
