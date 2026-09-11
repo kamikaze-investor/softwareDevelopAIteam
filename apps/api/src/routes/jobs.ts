@@ -854,9 +854,28 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     if (updated.queuedDesignReviewRun && preparation?.action === 'queue') {
       kickQueuedDesignReview(storage, req.log, updated.queuedDesignReviewRun, preparation.stepKey)
     }
-    if (outboxEvent) {
-      return reply.send(outboxResponse(updated.job, outboxEvent, updated.deduplicated))
-    }
-    return reply.send(updated.job)
+
+    // 共有 workspace の後始末条件（M1: `workspace-dirty-leakage-cleanup`）。
+    //
+    // escalate は「repair を作らずこの失敗を確定させる」判断であり（repairPolicy.ts）、
+    // **この Job の dirty worktree を継承する後続 Job が二度と作られない**ことを意味する。
+    // 共有 `/workspace/target` は Job 間で reset されないため、ここで誰も掃除しないと
+    // 変更が残り続け、以後の normal Job が `computeWorkspaceBaseline()` の
+    // clean worktree 要件で admission できなくなる。
+    //
+    // 掃除そのものは Worker の責務（`revertBlockedJobChanges()`。repo を持つのは Worker 側で、
+    // API はリポジトリを触らない）。API はその**開始条件だけ**を応答で伝える。
+    // 判断材料は既に手元にあるので新しい state / route / sweep は増やさない。
+    //
+    // `queue` の場合は付けない。repair Job が INTENTIONALLY-DIRTY として dirty を
+    // 正統に継承するため、掃除してはならない。
+    const workspaceCleanupRequired = preparation?.action === 'escalate'
+
+    const body = outboxEvent
+      ? outboxResponse(updated.job, outboxEvent, updated.deduplicated)
+      : updated.job
+    return reply.send(
+      workspaceCleanupRequired ? { ...body, workspaceCleanupRequired: true } : body,
+    )
   })
 }

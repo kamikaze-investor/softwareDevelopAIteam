@@ -735,7 +735,7 @@ describe('policy construction failure', () => {
 function retryingPatchJob(): (
   jobId: string,
   payload: Parameters<typeof patchJobWithRetry>[1],
-) => Promise<boolean> {
+) => Promise<Awaited<ReturnType<typeof patchJobWithRetry>>> {
   return async (jobId, payload) => patchJobWithRetry(jobId, payload, {
     apiBaseUrl: 'http://api.test',
     headers: { authorization: 'Bearer token' },

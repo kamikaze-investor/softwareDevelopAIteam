@@ -2928,6 +2928,42 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **完了条件**: 人間の手動 git cleanup が通常復旧手段として必要な状態を解消すること。
    M3 production E2E で手動 git 操作なしに複数 Task が通ることで実測する。
 
+   ### 実装（2026-09-11）— worktree isolation なし・既存関数の呼び出し条件の追加のみ
+
+   **変更したのは「いつ呼ぶか」だけで、`revertBlockedJobChanges()` 自体は無変更**。
+   安全性（path 限定 / `preExistingPaths` 不可触 / HEAD 移動時 skip / 失敗は握り潰さない）は
+   すべて既存関数のまま。新しい subsystem / status / Gate / route / sweep は追加していない。
+
+   - **API（開始条件だけを伝える。リポジトリは触らない）**: `PATCH /api/jobs/:id` が
+     `prepareRepairFlow()` の結果 `escalate` のとき応答へ `workspaceCleanupRequired: true` を
+     付ける。`queue`（repair 生成）のときは付けない —— repair Job は INTENTIONALLY-DIRTY として
+     dirty を正統に継承するため、掃除してはならない。
+   - **Worker（掃除の実体）**: `patchJobWithRetry()` が応答本文からこのフラグを読み、
+     `persistJobResult()` が `cleanupEscalatedWorkspace()` 経由で既存
+     `revertBlockedJobChanges()` を呼ぶ。材料（`workingDir` / `startCommitHash` /
+     `preChangedPaths`）は `JobRunResult.workspaceCleanup` として実行結果に持たせる。
+     Worker 側で repair/escalate の判定を再実装しない（`decideRepairAction()` は API の責務）。
+   - **fail-open しない**: skip / 部分失敗時は CRITICAL 通知を出す。Task は既に escalate 済み
+     （`blocked`）なので、既存の Human escalation 経路がそのまま受け皿になる。
+   - **後方互換**: `PatchJob` は素の boolean も受け付ける（`normalizePatchJobResult()`）。
+
+   **カバー範囲（正直な記述）**: 自動で掃除されるのは「implement/repair Job 自身が失敗し、
+   repair budget を使い切って escalate した」経路。これが 2026-09-08 に production で
+   観測された経路である。
+   review が changes_requested で implement Job を escalate する経路と、
+   `executeQueuedRepair()` 内の escalate は**フラグを付けていない**。理由は回避ではなく
+   **帰属**で、それらの時点で dirty を作ったのは既に terminal な別の Job であり、
+   PATCH 中の Job から見ると `preChangedPaths` に入る（＝`revertBlockedJobChanges()` は
+   触らない）。「帰属不能な変更は削除しない」制約に従うと、そこで消せるものは無い。
+   この経路の復旧は既存の正規手段（Mobile Task詳細「追加指示して再開」→ `resume:` Job は
+   INTENTIONALLY-DIRTY なので dirty 上で実行できる）で完結し、**人間の手動 git 操作は要らない**。
+
+   **検証**: `apps/worker/src/workspaceEscalationCleanup.test.ts`（8件・実 git リポジトリ）で
+   「escalate 後に `computeWorkspaceBaseline()` が次の normal Job を admission できる」
+   ことを直接固定した。あわせて repair 継承経路を壊さないこと、`preChangedPaths` 不可触、
+   HEAD 移動時の skip + CRITICAL 通知、manifest 無しでは掃除しない、PATCH 失敗時は掃除しない、
+   二重実行耐性を固定。API 側は `apps/api/src/routes/workspaceCleanupSignal.test.ts`（4件）。
+
 <!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=planned -->
 0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**
    （2026-09-10登録。PR #136 のIndependent Reviewで同型の欠陥が指摘され、

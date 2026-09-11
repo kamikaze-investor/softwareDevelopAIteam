@@ -22,7 +22,12 @@ import type {
   ReconcileRunningFailure,
   ReconcileRunningJobResult,
 } from './jobStateManager.js'
-import { runJob, computeWorkspaceBaseline, WorkspaceReconciliationError } from './jobRunner.js'
+import {
+  runJob,
+  computeWorkspaceBaseline,
+  revertBlockedJobChanges,
+  WorkspaceReconciliationError,
+} from './jobRunner.js'
 import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
@@ -140,11 +145,32 @@ export interface PatchJobWithRetryOptions {
   sleepImpl?: (ms: number) => Promise<void>
 }
 
+/**
+ * `PATCH /api/jobs/:id` の結果。
+ *
+ * 従来は boolean だけを返していた。`workspaceCleanupRequired` を読むために応答本文が
+ * 必要になったので構造化したが、**既存の呼び出し元・テストダブルが返す素の boolean も
+ * そのまま受け付ける**（`normalizePatchJobResult()`）。
+ */
+export interface PatchJobResult {
+  ok: boolean
+  /**
+   * API が「この Job の dirty worktree を継承する後続 Job は作られない」と確定した
+   * （= repair を作らず escalate した）ことを示す。Worker はこれを受けて
+   * 既存の `revertBlockedJobChanges()` で自分の変更だけを取り消す。
+   */
+  workspaceCleanupRequired?: boolean
+}
+
+export function normalizePatchJobResult(value: boolean | PatchJobResult): PatchJobResult {
+  return typeof value === 'boolean' ? { ok: value } : value
+}
+
 export async function patchJobWithRetry(
   jobId: string,
   payload: JobUpdate,
   options: PatchJobWithRetryOptions = {},
-): Promise<boolean> {
+): Promise<PatchJobResult> {
   const apiBaseUrl = options.apiBaseUrl ?? API_BASE
   const headers = options.headers ?? buildApiAuthHeaders()
   const fetchImpl = options.fetchImpl ?? fetch
@@ -168,7 +194,18 @@ export async function patchJobWithRetry(
           signal: controller.signal,
         },
       )
-      if (response.ok) return true
+      if (response.ok) {
+        // 応答本文は後始末条件を読むためだけに使う。壊れていても PATCH の成功は覆さない
+        // （掃除しないほうへ倒れるだけで、状態は壊れない）。
+        let workspaceCleanupRequired = false
+        try {
+          const body = await response.json() as { workspaceCleanupRequired?: unknown }
+          workspaceCleanupRequired = body?.workspaceCleanupRequired === true
+        } catch {
+          workspaceCleanupRequired = false
+        }
+        return { ok: true, workspaceCleanupRequired }
+      }
     } catch {
       // A network error and an AbortController timeout are both retryable here.
     } finally {
@@ -180,10 +217,11 @@ export async function patchJobWithRetry(
     }
   }
 
-  return false
+  return { ok: false }
 }
 
-type PatchJob = (jobId: string, payload: JobUpdate) => Promise<boolean>
+/** 既存のテストダブルが素の boolean を返すのを壊さないため、両方を受け付ける。 */
+type PatchJob = (jobId: string, payload: JobUpdate) => Promise<boolean | PatchJobResult>
 type ReconcileJob = (
   jobId: string,
   failure: ReconcileRunningFailure,
@@ -223,7 +261,16 @@ export async function persistJobResult(
     reviewResult: result.reviewResult,
   }
   const persisted = await persistTerminalUpdate(jobId, resultUpdate, dependencies)
-  if (persisted) {
+
+  // M1（`workspace-dirty-leakage-cleanup`）: API が escalate を確定した場合にだけ、
+  // この Job が共有 workspace に残した**自分の変更**を取り消す。
+  // 判断は API（`decideRepairAction()` が repair を作らないと決めた）、掃除は Worker、
+  // 使う関数は既存の `revertBlockedJobChanges()` のままで、新しい機構は足していない。
+  if (persisted.ok && persisted.workspaceCleanupRequired === true) {
+    await cleanupEscalatedWorkspace(jobId, result, dependencies)
+  }
+
+  if (persisted.ok) {
     if (result.reviewResult && result.reviewResult.status !== 'approved') {
       try {
         await (dependencies.alert ?? sendAlert)({
@@ -240,28 +287,102 @@ export async function persistJobResult(
   }
 }
 
+/**
+ * escalate が確定した Job が共有 workspace に残した変更を取り消す（M1）。
+ *
+ * 【なぜ必要か】共有 `/workspace/target` は Job 間で reset されない。通常は失敗の後続
+ * （`repair:` / `retry:` / `resume:`）が INTENTIONALLY-DIRTY として dirty を正統に継承するが、
+ * escalate は「repair を作らずこの失敗を確定させる」判断なので**継承者が二度と現れない**。
+ * 誰も掃除しないと、以後の normal Job が `computeWorkspaceBaseline()` の clean worktree
+ * 要件で admission できなくなり、人間の手動 git 操作でしか復旧できなくなる。
+ *
+ * 【安全性はすべて既存 `revertBlockedJobChanges()` に委ねる】
+ * - 対象はこの Job の manifest に現れた path のみ（blanket な reset --hard / clean はしない）
+ * - Job 開始時点で既に変更のあった path（`preChangedPaths`）には一切触れない
+ * - HEAD が Job 開始時から動いていれば取り消さず、理由を返してスキップする
+ * - path 単位の失敗は握り潰さず警告文として返る
+ *
+ * 【fail-open しない】掃除が skip / 部分失敗した場合は CRITICAL 通知を出す。Task は
+ * escalate 済み（`blocked`）なので、既存の Human escalation 経路がそのまま次の受け皿になる。
+ * ここで Job の状態は変えない（既に terminal で、workspace の所有者でもない）。
+ */
+async function cleanupEscalatedWorkspace(
+  jobId: string,
+  result: JobRunResult,
+  dependencies: JobPersistenceDependencies,
+): Promise<void> {
+  const cleanup = result.workspaceCleanup
+  const manifest = result.finalChangeManifest
+  if (!cleanup || !manifest) {
+    // 材料が無い = 変更検出そのものに失敗した経路。帰属を判定できないので掃除しない。
+    console.warn(
+      `[Worker] Job ${jobId} は escalate されましたが、変更の帰属を特定できないため workspace cleanup を行いません`,
+    )
+    return
+  }
+  if (manifest.changes.length === 0) return
+
+  let note: string | undefined
+  try {
+    note = await revertBlockedJobChanges(
+      cleanup.workingDir,
+      cleanup.startCommitHash,
+      manifest,
+      cleanup.preChangedPaths,
+    )
+  } catch (err: unknown) {
+    note = `workspace cleanup threw: ${formatUnknownError(err)}`
+  }
+
+  if (note === undefined) {
+    console.log(
+      `[Worker] Job ${jobId} の escalate に伴い、この Job が作った ${manifest.changes.length} 件の変更を取り消しました`,
+    )
+    return
+  }
+
+  console.error(`[Worker] Job ${jobId} の workspace cleanup が完了しませんでした: ${note}`)
+  await (dependencies.alert ?? sendAlert)({
+    severity: 'critical',
+    title: 'Workspace cleanup incomplete after escalation',
+    body: [
+      `Job ID: ${jobId}`,
+      `理由: ${note}`,
+      'escalate により後続 Job は作られないため、この変更を継承するものがありません。',
+      '共有 workspace に変更が残っている可能性があります。',
+      '次の normal Job は clean worktree 要件で admission できない場合があります。',
+    ].join('\n'),
+    sourceType: 'job_persistence',
+    sourceId: jobId,
+  }).catch((alertErr: unknown) => {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(alertErr)}`)
+  })
+}
+
 async function persistTerminalUpdate(
   jobId: string,
   payload: JobUpdate,
   dependencies: JobPersistenceDependencies,
-): Promise<boolean> {
+): Promise<PatchJobResult> {
   const outboxEvent = outboxStore.recordPending(jobId, payload)
   const deliveryPayload = {
     ...payload,
     eventId: outboxEvent.eventId,
     payloadHash: outboxEvent.payloadHash,
   }
-  const persisted = await (dependencies.patchJob ?? patchJobWithRetry)(jobId, deliveryPayload)
-  if (persisted) {
+  const persisted = normalizePatchJobResult(
+    await (dependencies.patchJob ?? patchJobWithRetry)(jobId, deliveryPayload),
+  )
+  if (persisted.ok) {
     outboxStore.deletePending(jobId)
-    return true
+    return persisted
   }
 
   console.warn(
     `[Worker] Job ${jobId} terminal update PATCH failed after retries, but the result is persisted in the local Outbox. ` +
     'It will be resent before startup recovery on the next Worker start.',
   )
-  return false
+  return persisted
 }
 
 async function reconcileAfterPatchFailure(
@@ -584,7 +705,7 @@ export async function pollJobs(): Promise<never> {
         // 既存のpoll cycleに相乗りする。
         // 1 pollにつき1 resend batch。失敗時はpendingを保持し、tight loopせず次pollで再試行する。
         try {
-          await outboxStore.resendPending((jobId, payload) => patchJobWithRetry(jobId, payload))
+          await outboxStore.resendPending(async (jobId, payload) => (await patchJobWithRetry(jobId, payload)).ok)
         } catch (err: unknown) {
           console.error(`[Worker] Outbox再送エラー: ${formatUnknownError(err)}。次のpollで再試行します`)
         }
