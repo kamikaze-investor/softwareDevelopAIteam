@@ -2742,10 +2742,82 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **respawn/二重計上は含まれていない**。
 
    **#110 Legacy exception registry との関係**: 同registryには `deploy` / `build` / `external_ci` の
-   3行があり、**`ai_delegation` の行は存在しない**（Step 3 で正式配線したため、そもそも
-   exception対象ではない）。ただし本Findingが解消するまでは、
+   3行があり、**`ai_delegation` の行は存在しない**。ただし本Findingが解消するまでは、
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
+
+   ### 訂正（2026-09-11、CEO指示）— 「Step 3 で正式配線した」は誤りだった
+
+   本項は以前「Step 3 で正式配線したため exception 対象ではない」と記載していたが、
+   **これは Production normal path への配線完了を意味しない**。実測（grep）で
+   `launchSupervisedDelegation()` には **test 以外の呼び出し元が存在しない**ことが判明した
+   （参照は `*.test.ts` と `delegationProductionPath.e2e.test.ts` のみ）。
+   production deploy 後に `supervised_runs=0` だった事実とも整合する。
+
+   - **実装済み**: `supervised_runs` schema / storage、completion predicate registry、
+     `launchSupervisedDelegation()`、reconcile route、Worker poll からの reconcile 呼び出し、
+     `delegate.sh` / `delegate-watchdog.sh`、Acceptance A〜E の実経路E2E
+   - **未配線**: `launchSupervisedDelegation()` を呼ぶ **production の実入口**。
+     したがって production では supervised delegation が1件も発生していない
+   - 製品の AI 実行（MVP Workflow の「Developer実装」）は別経路
+     `jobRunner.ts → aiCli adapter → runContainedOrThrow()` を通り、
+     **こちらは per-job cgroup containment 済み**である
+
+   ### 進捗（2026-09-11、CEO判断）— #132 は不採用・close。残作業は formal wiring と同時に行う
+
+   **#132（process group 方式の hardening）は merge せず close した。**
+   独立レビューにより、process group は **signaling scope であって containment ではない**ことが
+   確認された（子が `setsid`/`setpgid` すれば group を離脱し、supervisor は
+   「group 空＝成功」と誤報告し得る）。さらに check→kill 間の TOCTOU
+   （最後の member が消えて同じ数値 PGID が別 group に再利用される）も process group だけでは
+   閉じられない。shell 側へ cgroup プロトコルを二重実装する案も不採用（**両方式を重ねない**）。
+   したがって master には PGID / setsid のコードは入っていない。
+
+   **既存 cgroup containment 資産（再利用先）**: `apps/worker/src/execution/runContainedCommand.ts`
+   （P1 Phase 2、本番実測済み）。1 job = 1 unique cgroup、workload 開始前に `cgroup.procs` へ配置、
+   `cgroup.kill` → `cgroup.events populated 0` → `rmdir` まで確認し、
+   `isContainmentSafe()` が false の結果では terminalize させない。
+   **`setsid` した孫も cgroup からは抜けない**（本番実測済み）。
+
+   **MVP判定（既存 `specs/10_mvp_scope.md` のみで判定）**: MVP Exit Criteria は
+   「仕様書からプロジェクト生成 / AIがタスク生成 / **AIが実装** / Dashboardで状況確認 /
+   Goal変更以外で開発が止まらない」であり、MVP Workflow の実装工程は「Developer実装」である。
+   これは配線済みの jobRunner 経路が満たす。`launchSupervisedDelegation` / `delegate.sh` は
+   `specs/10_mvp_scope.md` に一度も現れず、AGENTS.md が定める
+   **PL role の委任 wrapper（運用ツール）**である。
+   よって **supervised ai_delegation の production 配線は MVP 必須ではない → MVP後へ延期**。
+
+   **延期作業（1つの変更としてまとめて行う。単独では着手しない）**:
+   formal supervised delegation を production へ配線する際に、同じ変更で
+   1. 既存 cgroup containment（`runContainedCommand.ts`）の再利用
+   2. **F7 の修正**: `safe_kill_process` は PID 同定に失敗して kill を skip しても、
+      `kill -9` 後に対象が生存していても `return 0` を返す（fail-open）。
+      cleanup 未確認を上位へ伝播させ、`ESCALATE:stale_child` 等へ倒す
+   3. 独立レビュー由来の F1（pgid未記録でrespawn）/ F2（`kill -- -0` 等の危険な PGID 値）/
+      F5（PID単体killと未検証operand）は **cgroup 方式では不要**になるため持ち込まない
+   4. F4（子孫の group escape）は cgroup で解消される
+   を行う。**単独の F7 修正 PR は作らない**（当該経路が未配線のため。CEO判断 2026-09-11）。
+
+   **非決定性の再現記録（2026-09-11）— master 上でまだ生きている**:
+   **docs のみを変更した PR #141** の CI が
+   `expected recovery_attempt_count '1', got '2'` で失敗した。
+   同PRはコードを1行も変更していないため、**master 側の既存 flake**である。
+   空コミットのみ追加した再実行では **pass**（同一コードで pass/fail が分かれる）。
+   同じ master のコードを開発機 WSL で **20回連続実行しても 20/20 pass** しており、
+   GitHub runner（共有CPUで負荷が高い）でのみ観測される点も、
+   当初の「負荷依存の race」という観測と整合する。
+   なお master の `delegateWatchdog.test.ts` は shell suite を **1回だけ**実行する
+   （反復実行版は #132 に含まれていたため master には入っていない）。
+
+   **運用上の影響**: 本 flake は required check を確率的に落とすため、
+   **無関係な PR の merge を妨げ得る**。当該経路は未配線で修正は MVP後へ延期しているので、
+   当面は「落ちたら再実行」で運用する。CI から外す（skip / quarantine）判断は
+   **CEO判断が要る**（検証していないものを緑に見せることになるため、独断では行わない）。
+
+   **検証可能性の制約（実測）**: containment の実封じ込めテストは CI で実行されない。
+   #132 の CI 実測で `runContainedCommand.test.ts` は **20 tests / 13 skipped**
+   （`isContainmentAvailable()` gate）。開発機の WSL も cgroup v1 hybrid で作成不可。
+   よって cgroup 側の Acceptance は **production でしか検証できない**前提で計画すること。
 
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
