@@ -390,6 +390,47 @@ describe('3. decision authority', () => {
     expect(outcome.decision).not.toBe('ALIGNED')
   })
 
+  // 独立レビュー指摘（2026-09-11）: enum 検証を `!== undefined` だけで書くと、runner が
+  // `"integrationReviewResult": null` を返す task kind で null 参照の TypeError になり、
+  // 既存の reject 経路で終端できず claim した run が running のまま残る。
+  it('task kind で integrationReviewResult が null でも throw せず、従来どおり扱う', () => {
+    const outcome = recomputeDecision(
+      {
+        focusedReviewResults: [
+          { focus: 'strategic_alignment', decision: 'ALIGNED' },
+          { focus: 'scope_simplicity', decision: 'ALIGNED' },
+        ],
+        integrationReviewResult: null,
+        independentReviewResult: { verdict: 'approved' },
+        finalDecision: 'ALIGNED',
+      } as unknown as Parameters<typeof recomputeDecision>[0],
+      'task',
+      ['specs/00_constitution.md'],
+    )
+
+    // null は「integration 無し」= undefined と同じ扱い（本変更前の挙動を維持）。
+    expect(outcome.decision).toBe('ALIGNED')
+  })
+
+  it('roadmap kind で integrationReviewResult が null なら必須チェックで不採用', () => {
+    const outcome = recomputeDecision(
+      {
+        focusedReviewResults: [
+          { focus: 'strategic_alignment', decision: 'ALIGNED' },
+          { focus: 'scope_simplicity', decision: 'ALIGNED' },
+          { focus: 'architecture_responsibility', decision: 'ALIGNED' },
+        ],
+        integrationReviewResult: null,
+        finalDecision: 'ALIGNED',
+      } as unknown as Parameters<typeof recomputeDecision>[0],
+      'roadmap',
+      [],
+    )
+
+    expect(outcome.decision).not.toBe('ALIGNED')
+    expect(outcome.rejectedReason).toContain('integration review result')
+  })
+
   it('有効値のみのALIGNED経路は従来どおり通る（回帰防止）', () => {
     const outcome = recomputeDecision(
       {

@@ -255,7 +255,15 @@ export function recomputeDecision(
   // integration 側も同様に enum 検証する。integration review は roadmap kind では必須で、
   // かつ focused が全件 ALIGNED でもここ1件で最終判定を動かせるため、未知値を
   // 黙って UNCERTAIN へ丸めず reject して理由を残す。
-  if (integration !== undefined && !isStrategicDecision(integration.decision)) {
+  //
+  // `null` は `undefined` と同じく「integration 無し」として扱う（独立レビュー指摘）。
+  // task kind では integration review は任意であり、runner が JSON で
+  // `"integrationReviewResult": null` を返すことがある。`!== undefined` だけで判定すると
+  // そこで `integration.decision` が TypeError を投げ、この関数の呼び出し元は
+  // 既存の失敗確定 catch の外にあるため、**claim した run が running のまま残り**
+  // 既存の reject 経路で終端できなくなる。roadmap kind の `null` は上の
+  // `integrationReviewRequired` チェック（`!integration`）が先に reject する。
+  if (integration !== undefined && integration !== null && !isStrategicDecision(integration.decision)) {
     return reject(`unknown integration review decision: ${String(integration.decision)}`)
   }
 
