@@ -1798,6 +1798,40 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
       **完了条件**: 防止方式（生成時制約／生成後検出／両方）の採択、Design Review側で検出する場合の
       チェックリスト・focus設計方針がCEOに採択されていること。実装着手はCEO承認後
+<!-- roadmap:id=roadmap-marker-priority-unparsed state=planned -->
+0. [ ] **`priority=` 付き roadmap marker がparserに認識されず、roadmap checkが常時失敗している**
+      （2026-09-08登録。#110の調査中に副次的に発見。**#110へは混ぜない別Finding**）。
+
+      **事象**: `ROADMAP_METADATA_REGEX`（`apps/worker/scripts/roadmap/roadmapParser.ts:63`）は
+      `<!-- roadmap:id=X state=Y -->` の形しか受理しない（`state=([^\s]+)\s+-->`）。
+      実際のroadmapには `state=planned priority=high` の形のmarkerが存在し、これらは
+      `ROADMAP_METADATA_PREFIX_REGEX` にだけ引っかかって `invalid_metadata` issueになり、
+      **その項目自体が `items` に入らない**（IDで参照できず、state更新の対象にもならない）。
+
+      **実測（2026-09-08、`master` = c756ef0 時点）**: `parseRoadmapMarkdown(tasks/roadmap.md)` は
+      items 38 / issues 4。内訳は `invalid_metadata` 2件
+      （`task-codex-review-cannot-read-repo` / `codex-sandbox-off-deprecated-landlock`。
+      どちらも `priority=high` 付き）と、独立した既存2件
+      （`design-review-conflict-recovery` の `checkbox_state_mismatch`、
+      `roadmap-generation-constraint-compliance` の `missing_checkbox`）。
+
+      **影響**: `getValidRoadmapItems()` は issue が1件でもあれば
+      `RoadmapValidationError` を投げる（`roadmapParser.ts:146-150`）。
+      `cli.ts:82` の `collectCheckIssues()` は issue があると
+      `generateRoadmapCurrentStateBlock()` 以降を丸ごとskipするため、
+      **`docs/PROJECT_CURRENT_STATE.md` の生成ブロック同期チェックが現在まったく走っていない**。
+      `priority=` 付きの項目は「roadmapに書かれているがtoolingからは存在しない」状態にある。
+
+      **未確認**: いつからこの状態か（`priority=` 付きmarkerが導入された時点以降と推定されるが、
+      git履歴での確定はしていない）。CI がこのcheckを実行しているかも未確認。
+
+      **方針（実装はまだ行わない）**: 次の2択をCEO判断で決める。
+      (a) parser側を拡張して `priority=` 等の追加keyを受理する（marker側は変更しない）、
+      (b) marker側から `priority=` を落とし、優先度は本文へ書く（parserは変更しない）。
+      いずれにせよ、**既存の `checkbox_state_mismatch` / `missing_checkbox` 2件も併せて解消しないと
+      check全体は通らない**。この項目のscopeはparser/markerの不整合に限定し、
+      #110（Background Task Supervision Contract）とは混ぜない。
+
 <!-- roadmap:id=roadmap-generation-constraint-compliance state=in_progress -->
 9. [~] **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行
       `phase 1c v2`（Project ID `4a55dd0f-6b2f-4ad6-8864-f699d586d9b4`）で、1回目とは独立に再現。
