@@ -91,6 +91,10 @@ ${constitutionPrinciplesPrompt}
 - Structured Constraints に max_task_count がある場合はその値を厳守してください
 - Phase はプロジェクトの範囲に応じて適切に設定してください。小規模変更では1フェーズで十分であり、基盤構築→MVP機能→品質改善の3フェーズ構造は、複数フェーズにまたがる複数の異なる成果物がある場合のみ使ってください
 - allowedPaths は実際に変更するディレクトリのみ（例: "apps/engine/src/"）
+- allowedPaths は**必ずrepository-relative path**で書いてください。**絶対パスは禁止**です。
+  リポジトリのルートを起点とした相対パスだけを書きます（正: "test.js" / "apps/engine/src/"、
+  誤: "/workspace/target/test.js" / "C:/repo/src"）。先頭の "./" も付けないでください。
+  絶対パスを含むRoadmapは決定論的に却下され、再生成になります
 - Open Technical Uncertainties が渡された場合の扱い（一般ルール）:
   - 無視しない。CEOへ質問されていないので、AIが解決しなければ誰も解決しない
   - それを解決する必要がある**関連タスクの technicalUncertaintyRefs へIDを列挙する**。

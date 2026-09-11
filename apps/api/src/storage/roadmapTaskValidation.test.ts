@@ -113,6 +113,75 @@ describe('validateRoadmapTasks', () => {
       code: 'circular_dependency',
     }))
   })
+
+  // allowedPaths が repository-relative であることの決定論的検証。
+  // 2026-09-11 production 実測: 生成AIが "/workspace/target/test.js" を出力し、
+  // File Change Guard の逐語比較に一致せず初回 implement Job が block された。
+  describe('allowedPaths must be repository-relative', () => {
+    function taskWithPaths(allowedPaths: string[]): RoadmapSyncTaskInput {
+      return { ...task('task-001'), allowedPaths }
+    }
+
+    it('rejects the POSIX absolute path measured in production', () => {
+      const issues = validateRoadmapTasks([taskWithPaths(['/workspace/target/test.js'])])
+
+      expect(issues).toContainEqual(expect.objectContaining({
+        code: 'non_relative_allowed_path',
+        roadmapTaskKey: 'task-001',
+      }))
+    })
+
+    it('tells the regenerating AI how to fix it', () => {
+      const [issue] = validateRoadmapTasks([taskWithPaths(['/workspace/target/test.js'])])
+
+      // この message はそのまま priorAttemptFeedback として再生成AIへ渡る
+      expect(issue?.message).toContain('/workspace/target/test.js')
+      expect(issue?.message).toContain('repository-relative')
+    })
+
+    it.each([
+      ['UNC path', '\\\\server\\share\\test.js'],
+      ['drive-letter path', 'C:/repo/src/index.ts'],
+      ['backslash drive-letter path', 'C:\\repo\\src\\index.ts'],
+      ['parent traversal', '../outside/test.js'],
+      ['nested parent traversal', 'src/../../outside/test.js'],
+      ['leading ./', './test.js'],
+      ['empty string', ''],
+      ['whitespace only', '   '],
+    ])('rejects a %s', (_label, path) => {
+      const issues = validateRoadmapTasks([taskWithPaths([path])])
+
+      expect(issues).toContainEqual(expect.objectContaining({
+        code: 'non_relative_allowed_path',
+      }))
+    })
+
+    it.each([
+      ['a repository-relative file', 'test.js'],
+      ['a repository-relative directory', 'apps/engine/src/'],
+      ['a nested file', 'src/runner/workflow-runner.js'],
+      // "..over" は ".." セグメントではない。セグメント単位で判定していることの回帰固定
+      ['a filename starting with dots', 'src/..overrides.ts'],
+    ])('accepts %s', (_label, path) => {
+      expect(validateRoadmapTasks([taskWithPaths([path])])).toEqual([])
+    })
+
+    it('reports every offending entry, not just the first', () => {
+      const issues = validateRoadmapTasks([
+        taskWithPaths(['/abs/one.ts', 'ok/two.ts', '/abs/three.ts']),
+      ])
+
+      expect(issues).toHaveLength(2)
+    })
+
+    it('runs even when the Project declares no structured constraints', () => {
+      // buildDisallowedPathIssues() は allowed_path_prefixes 宣言時しか動かない。
+      // 今回の production ケースは制約宣言が無かったため、常時検証である必要がある。
+      const issues = validateRoadmapTasks([taskWithPaths(['/workspace/target/test.js'])])
+
+      expect(issues).not.toEqual([])
+    })
+  })
 })
 
 describe('validateRoadmapPhases', () => {
