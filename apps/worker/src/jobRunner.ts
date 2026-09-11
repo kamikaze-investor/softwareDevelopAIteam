@@ -330,6 +330,25 @@ export interface JobRunResult {
    */
   finalChangeManifest?: ChangeManifest
   /**
+   * 共有 workspace の後始末に必要な入力（M1: `workspace-dirty-leakage-cleanup`）。
+   *
+   * `revertBlockedJobChanges()` が要求する `startCommitHash` と `preExistingPaths` を、
+   * Job 実行が終わったあとでも使えるよう結果へ持ち出す。manifest は
+   * `finalChangeManifest` を使う。
+   *
+   * これは「掃除しろ」という指示ではなく**掃除の材料**である。実際に掃除するかは、
+   * API が `PATCH /api/jobs/:id` の応答で返す `workspaceCleanupRequired`
+   * （= escalate により後続が dirty を継承しないと確定した）だけが決める。
+   * Job 実行中に判断しないのは、repair を作るか escalate するかが
+   * `decideRepairAction()`（API 側・prior job 数に依存）の判断であり、
+   * Worker 側で同じ判定を再実装しないため。
+   */
+  workspaceCleanup?: {
+    workingDir: string
+    startCommitHash: string
+    preChangedPaths: string[]
+  }
+  /**
    * 変更検出・ポリシー構築などの**技術的失敗**であることを示す。
    *
    * Guard 違反（fileChangeAllowed:false）と区別するために持つ。
@@ -1318,6 +1337,13 @@ export async function runJob(
     postReviewResult,
     safetyVerificationResult,
     finalChangeManifest: finalManifest,
+    // AI CLI 失敗経路（inspectAfterAiFailure）と同じ後始末の材料。こちらは
+    // AI CLI が exit 0 でも test/review/guard で failed になる経路を拾う。
+    workspaceCleanup: {
+      workingDir: job.safeCommand.workingDir,
+      startCommitHash,
+      preChangedPaths: [...preManifest.paths],
+    },
     reviewResult: structuredReviewResult,
   }
 }
@@ -1680,6 +1706,15 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     approvalLevelResult: input.approvalLevelResult,
     targetProjectRiskScanResult: riskScan,
     finalChangeManifest: manifest,
+    // escalate が確定した場合にだけ Worker 側で使う後始末の材料。
+    // Guard 違反で既に取り消した場合も manifest は空にならないが、
+    // `revertBlockedJobChanges()` は同じ path へ二度実行しても no-op（checkout/clean は
+    // べき等）なので duplicate cleanup にはならない。
+    workspaceCleanup: {
+      workingDir: input.workingDir,
+      startCommitHash: input.startCommitHash,
+      preChangedPaths: [...input.preChangedPaths],
+    },
     ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
     workspaceState,
   }
