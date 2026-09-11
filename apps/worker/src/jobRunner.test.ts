@@ -3955,6 +3955,27 @@ describe('computeWorkspaceBaseline: post-implement review Job の dirty 継承�
       expect(result.baseline.startCommitHash).toBe(REVIEW_BASE_HASH)
     }
   })
+  it('review-failure-escalation からの resume: Job は dirty worktree を引き継げる（quarantine に入らない）', () => {
+    // review が structured result を返せず失敗すると、implement の正当な成果が未コミットで残る。
+    // その状態から CEO が resume すると `resume:<元Job>:1` の Job が作られる（sqlite.ts）。
+    // これが clean 要件で弾かれると quarantine になり、スマホから復旧できなくなる。
+    buildWorktreeManifestMock.mockReturnValue(dirtyManifest)
+    fingerprintWorktreeEntriesMock.mockReturnValue(new Map<string, string>([
+      ['e2e/phase12-smoke.js', 'hash-a'],
+      ['e2e/phase12-smoke.test.js', 'hash-b'],
+    ]))
+
+    const result = computeWorkspaceBaseline(
+      createJob({ workflowStepKey: 'resume:job-review-failed-1:1' }),
+      '/workspace/target',
+    )
+
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.baseline.mode).toBe('dirty')
+      expect(result.baseline.startCommitHash).toBe(REVIEW_BASE_HASH)
+    }
+  })
 
   it('通常 Job は dirty worktree では従来どおり拒否される（fail-closed を弱めない）', () => {
     buildWorktreeManifestMock.mockReturnValue(dirtyManifest)

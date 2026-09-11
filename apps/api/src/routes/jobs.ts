@@ -662,12 +662,45 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated === true))
     }
 
-    if (isReviewJob && jobUpdate.status === 'success') {
+    // review が structured result を返せずに終了したケース（review-failure-escalation gap）。
+    //
+    // 原因は schema 違反・provider 障害・auth 失敗など様々だが、いずれも `reviewResult` が
+    // 無いため上の Stage 2 分岐（prepareRepairFlow / escalateTaskToHuman）へ入れない。
+    // ここで Task を `pending` のまま放置すると、次の連鎖で**スマホから復旧できなくなる**:
+    //   1. implement の正当な成果が未コミットで worktree に残る
+    //      （guard 違反ではないので revertBlockedJobChanges は走らない。それは正しい）
+    //   2. 次の通常 Job が clean worktree 要件を満たせず quarantine される
+    //   3. `resumeBlockedTask` は quarantine を fail-closed で拒否し、解除機構も無い
+    // 実際に Production E2E test 8 でこの状態に陥り、UI から復旧不能になった。
+    //
+    // 対処は既存の `escalateTaskToHuman()` の再利用のみ。Task を `blocked` にすれば
+    // `resumeBlockedTask` の `isEscalatedFailure`（task=blocked かつ latestJob=failed）が
+    // 成立し、CEO は既存の resume 操作から `resume:` Job を作れる。`resume:` は
+    // intentionally-dirty 経路なので clean worktree 要件を免除され、未コミット成果を
+    // 正統に引き継ぐ = **quarantine をそもそも発生させない**。
+    //
+    // quarantine の判定も clear-quarantine の条件も変更しない。dirty worktree の自動破棄も
+    // しない。新しい state / queue / recovery 機構も追加しない。
+    //
+    // status が 'failed' のケースも含める理由: Worker は structured result を解析できないとき
+    // `inspectAfterAiFailure()` 経由で **failed** を報告する（jobRunner.ts）。success だけを
+    // 見ていると、実際に production で起きた経路（test 8）を取りこぼす。
+    if (isReviewJob && (jobUpdate.status === 'success' || jobUpdate.status === 'failed')) {
       const failedUpdate: Partial<Job> = {
         ...jobUpdate,
         status: 'failed',
         stderr: jobUpdate.stderr ?? 'Structured review result is missing (fail-closed)',
       }
+
+      // 再送（deduplicated）では escalate しない。既存 Stage 2 の `!persisted.deduplicated`
+      // と同じ判断で、CEO が resume した後に同じ Outbox event が再送されても
+      // Task を blocked へ戻さない。`escalateTaskToHuman` 自体も冪等ではあるが、
+      // 「復旧済みの Task を再び止めない」ことを呼び出し側で保証する。
+      const escalate = (deduplicated: boolean): void => {
+        if (deduplicated) return
+        escalateTaskToHuman(storage, existing.taskId)
+      }
+
       if (outboxEvent) {
         const failed = storage.jobs.updateWithOutboxEvent(existing.id, failedUpdate, outboxEvent)
         if (!failed.ok) {
@@ -676,10 +709,12 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           }
           return reply.status(failed.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: failed.reason })
         }
+        escalate(failed.deduplicated === true)
         return reply.send(outboxResponse(failed.job, outboxEvent, failed.deduplicated))
       }
 
       const failed = storage.jobs.update(existing.id, failedUpdate)
+      escalate(false)
       return reply.send(failed)
     }
 
