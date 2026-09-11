@@ -2793,6 +2793,45 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    それまでは、production に supervision が載っていても
    `ai_delegation` の retry 挙動は設計値どおりとみなさない。
 
+   ### 進捗（2026-09-11、CEO判断）— #132 は不採用・close。残作業は formal wiring と同時に行う
+
+   **#132（process group 方式の hardening）は merge せず close した。**
+   process group は signaling scope であって containment ではないことが独立レビューで確認され、
+   さらに shell 側へ cgroup プロトコルを二重実装する案も不採用となった（両方式を重ねない）。
+   よって master には PGID / setsid のコードは入っていない（master は従来の
+   `is_opencode_pid` ベースのまま）。
+
+   **調査で判明した前提の変化**: `launchSupervisedDelegation()` は
+   **production の実入口から呼ばれていない**（上記「訂正」を参照）。
+   一方、製品の AI 実行は `jobRunner → aiCli adapter → runContainedOrThrow()` を通り、
+   **既に per-job cgroup containment 済み**である（`apps/worker/src/execution/runContainedCommand.ts`。
+   `cgroup.kill` → `cgroup.events populated 0` → `rmdir` まで確認し、
+   `isContainmentSafe()` が false の結果では terminalize させない）。
+
+   **MVP判定（既存 `specs/10_mvp_scope.md` のみで判定）**: MVP Exit Criteria は
+   「仕様書からプロジェクト生成 / AIがタスク生成 / **AIが実装** / Dashboardで状況確認 /
+   Goal変更以外で開発が止まらない」であり、MVP Workflow の実装工程は「Developer実装」である。
+   これは配線済みの jobRunner 経路が満たす。`launchSupervisedDelegation` /
+   `delegate.sh` は `specs/10_mvp_scope.md` に一度も現れず、AGENTS.md が定める
+   **PL role の委任 wrapper（運用ツール）**である。
+   よって **supervised ai_delegation の production 配線は MVP 必須ではない → MVP後へ延期**。
+
+   **延期作業（1つの変更としてまとめて行う。単独では着手しない）**:
+   formal supervised delegation を production へ配線する際に、同じ変更で
+   1. 既存 cgroup containment（`runContainedCommand.ts` の資産）の再利用
+   2. **F7 の修正**: `safe_kill_process` が kill を skip しても `kill -9` 後に生存していても
+      `return 0` を返す fail-open を解消し、cleanup 未確認を上位へ伝播させる
+      （現状 master に存在。方式非依存の欠陥）
+   3. 独立レビューで出た F1/F2/F5（PGID固有のguard）は cgroup 方式では**不要**になるため、
+      PGID 前提の guard を持ち込まない
+   4. F4（子孫の group escape）は cgroup で解消される
+   を行う。**単独の F7 修正 PR は作らない**（未配線経路のため。CEO判断 2026-09-11）。
+
+   **検証可能性の制約（実測）**: containment の実封じ込めテストは CI で実行されない。
+   #132 の CI 実測で `runContainedCommand.test.ts` は **20 tests / 13 skipped**
+   （`isContainmentAvailable()` gate）。開発機の WSL も cgroup v1 hybrid で作成不可。
+   よって cgroup 側の Acceptance は **production でしか検証できない**ことを前提に計画すること。
+
    **重複確認済み（2026-09-10）**: 本Findingと重なる既存項目は無い。
    `worker-cgroup-delegation-contract` は systemd の cgroup delegation 契約であり無関係。
    `pl-review-process-supervision`（#110）は `delegate-watchdog.sh` を機構として参照しているが、
@@ -2800,10 +2839,25 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **respawn/二重計上は含まれていない**。
 
    **#110 Legacy exception registry との関係**: 同registryには `deploy` / `build` / `external_ci` の
-   3行があり、**`ai_delegation` の行は存在しない**（Step 3 で正式配線したため、そもそも
-   exception対象ではない）。ただし本Findingが解消するまでは、
+   3行があり、**`ai_delegation` の行は存在しない**。ただし本Findingが解消するまでは、
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
+
+   **訂正（2026-09-11、CEO指示）— 「Step 3 で正式配線した」は誤りだった**:
+   本項は以前「Step 3 で正式配線したため exception 対象ではない」と記載していたが、
+   **これは Production normal path への配線完了を意味しない**。実測（grep）で
+   `launchSupervisedDelegation()` には **test 以外の呼び出し元が存在しない**ことが判明した
+   （参照は `*.test.ts` と `delegationProductionPath.e2e.test.ts` のみ）。
+   production deploy 後に `supervised_runs=0` だった事実とも整合する。
+
+   - **実装済み**: `supervised_runs` schema / storage、completion predicate registry、
+     `launchSupervisedDelegation()`、reconcile route、Worker poll からの reconcile 呼び出し、
+     `delegate.sh` / `delegate-watchdog.sh`、Acceptance A〜E の実経路E2E
+   - **未配線**: `launchSupervisedDelegation()` を呼ぶ **production の実入口**。
+     したがって production では supervised delegation が1件も発生していない
+   - 製品の AI 実行（MVP Workflow の「Developer実装」）は別経路
+     `jobRunner.ts → aiCli adapter → runContainedOrThrow()` を通り、
+     **こちらは per-job cgroup containment 済み**である
 
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、

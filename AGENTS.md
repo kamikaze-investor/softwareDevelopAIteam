@@ -188,6 +188,15 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
     completion判定は formal verdict であり、**exit 0 + 空出力 / verdict無しは success にならない**。
     停止時は診断 → bounded recovery → terminal verdict まで自動で進み、
     終端時に automatic continuation が走る。
+  - **配線状況の明記（2026-09-11 訂正）**: 上記は「PL が委任するならこの関数を使う」という
+    **規範**であって、**production の実入口へ配線済みという意味ではない**。実測で
+    `launchSupervisedDelegation()` には test 以外の呼び出し元が無く、production の
+    `supervised_runs` は 0 件である。**実装済みだが未配線**。
+    なお製品の AI 実行（MVP Workflow の「Developer実装」）はこの経路ではなく
+    `jobRunner → aiCli adapter → runContainedOrThrow()` を通り、per-job cgroup で封じ込め済み。
+    formal wiring は MVP 必須ではない（`specs/10_mvp_scope.md` の Exit Criteria に含まれない）ため
+    MVP後に、既存 cgroup containment の再利用と併せて行う。
+    詳細は `tasks/roadmap.md` の `deleg-001-watchdog-respawn`。
     これは**OS上で生のshell実行を禁止するものではない**（それは要求範囲外）。
     禁止しているのは、AIteamOSの正式運用経路でsupervision無しの委任を使うことである。
     詳細な契約は `tasks/roadmap.md` の `roadmap:id=pl-review-process-supervision`
