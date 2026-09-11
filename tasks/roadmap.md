@@ -3047,6 +3047,61 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `test.js` は未変更、verify.js baseline も FAIL のままだった。
    異常検出 → 安全停止 → 状態保全 → 原因特定可能 → 正規手段で再開、は満たしている。
 
+<!-- roadmap:id=quarantined-dirty-task-generic-recovery state=planned -->
+0. [ ] **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い**
+   （2026-09-11登録、**高優先度**。Production E2E test 8 で実際に復旧不能になった。
+   PR #150 には混ぜない）。
+
+   **PR #150 との関係（重要）**:
+   #150 は「review が structured result を返せず失敗した Task」が quarantine へ落ちる
+   **将来の経路を塞ぐ**（Task を blocked へ escalate し、既存 resume の `resume:` Job =
+   intentionally-dirty 経路へ合流させる）。
+   **しかし既に quarantine 済みの Task は救済しない。** #150 は予防であって治療ではない。
+
+   **現状の解除手段と、それが効かない理由**:
+   - `PATCH /api/jobs/:id/clear-quarantine` は実在するが、`observation` と `knownGood` の
+     提示を必須とし、サーバ側で再検証する（`apps/api/src/routes/jobs.ts`）。
+     **人力・force・admin による無条件解除経路は無い**（意図的な設計）。
+   - 自動申請は Worker 起動時の `recoverStaleJobs` →
+     `reconcileQuarantinedJobAtStartup` のみ（`apps/worker/src/jobStateManager.ts`）。
+     baseline がある場合は `verifyWorkspaceAgainstBaseline` の成功が必要、
+     baseline が無い場合は `worktreeClean` を含む known-good 観測が必要。
+   - **dirty worktree ではどちらも成立しない**ため、Worker を再起動しても解除されない。
+   - `resumeBlockedTask` は Task の任意の未解除 quarantine Job を見て fail-closed で拒否する
+     （`WORKSPACE_QUARANTINED`）。
+   - Mobile は quarantine 時に進行ボタンを隠す（`allowsProgressActions()` が false）。
+     案内文も「承認や再開では解除されません。自動では復旧しません。
+     AI開発チーム側で作業領域の復旧が必要です」と明記している。
+
+   **結果**: CEO はスマホから一切復旧できない。MVP の目的（スマホだけで運営）と正面から衝突する。
+
+   **安全上の核心 — ここが本 Finding の難所**:
+   dirty worktree の中身は、多くの場合 **implement が作った正当な未コミット成果**である
+   （test 8 では Task 1 の正しい変更がそのまま残っていた）。
+   したがって「quarantine を解除する」＝「その成果を捨てる or 引き継ぐ」の判断が必要で、
+   **正当な未コミット成果を誰が破棄してよいかが安全上の核心**になる。
+   - 自動破棄は、レビュー済み・承認待ちの正当な変更を消す危険がある
+   - 自動引き継ぎは、検証できない workspace 上で次の Job を走らせることになり、
+     quarantine が守っていた前提そのものを壊す
+
+   **やってはいけないこと**:
+   **generic unquarantine / force cleanup を安易に追加しない。**
+   `clear-quarantine` の observation + knownGood 要件を緩めない。
+   無条件解除は quarantine の存在意義を消すため、追加するなら
+   「誰が・何を根拠に・何を捨てるか」を明示した設計が先。
+
+   **#150 後も残る到達経路（要確認）**:
+   Worker が implement 実行中に crash / kill されると Job は `running` のまま残り、
+   起動時 `reconcileRunningJobAtStartup` が workspace を検証する。
+   implement の baseline は `mode:'clean'` なので、部分的な変更が残った worktree は
+   検証に失敗し **quarantine される**。この経路は #150 では塞がれない。
+   なお deploy 手順の preflight は `jobs_running = 0` を要求するため、
+   計画的な再起動では発生しない。想定外の crash / OOM / kill が引き金になる。
+
+   **再現証拠**: Production E2E test 8（`733643fe`）を失敗記録として保持している。
+   quarantine 済み Job `01de09fc` と `quarantineReason` がそのまま残っており、
+   本 Finding の実機再現材料として参照できる。
+
 <!-- roadmap:id=implement-acceptance-criteria-not-mechanically-verified state=planned -->
 0. [ ] **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**
    （2026-09-11登録、**高優先度**。Production E2E test 9 で実害として観測。
