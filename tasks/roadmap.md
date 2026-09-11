@@ -2844,6 +2844,48 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `workerCredentialAuthorization.test.ts` へ足した。同型のテストを既存の
    Worker呼び出し経路すべてに用意するか、経路一覧とallowlistの整合を確認する手段を持つか決める。
 
+<!-- roadmap:id=task-allowed-paths-not-normalized state=planned -->
+0. [ ] **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**
+   （2026-09-11登録。continuation E2E（Production E2E test 4）で実際に1サイクル失った。
+   **MVP後へ延期** — 回避策は仕様書のパス表記を相対にするだけでコード変更が不要なため）。
+
+   **内容**: File Change Guard は git が報告する **リポジトリ相対**の changedFiles と
+   task の `allowedPaths` を比較する（`apps/worker/src/guards/fileChangeGuard.ts`）。
+   `allowedPaths` に**絶対パス**が入ると、どの changedFile とも一致せず
+   **常に fileChangeAllowed=false** になる。
+
+   実測（2026-09-11, Production E2E test 4 / task-001）:
+   ```
+   allowed_paths = ["/workspace/target/test.js"]
+   changed_files = ["test.js"]
+   guard_result  = {"permissionAllowed":true,"fileChangeAllowed":false,"fileViolations":["test.js"]}
+   stderr        = File Change Guard blocked (stage A): test.js
+   ```
+   過去に成功した全タスクの `allowedPaths` は相対だった（`test.js` / `e2e/` /
+   `e2e/phase12-smoke.js`）。絶対パスが入ったのは今回が初。
+
+   **直接原因は仕様書側**: 投入した仕様書が対象ファイルを
+   `/workspace/target/test.js` と絶対パスで書いており、Roadmap generator が
+   その表記を `allowedPaths` へそのまま採用した。**Guardの挙動は設計どおり**で、
+   許可側の over-block は安全側（同ファイルのコメントに明記あり）。
+
+   **したがって製品欠陥ではなく入力検証の欠落**。ただし以下が実運用コストになる:
+   - task sync 時点で「このallowedPathsはどのchangedFileにも一致し得ない」ことを検出しない
+   - 失敗メッセージが `File Change Guard blocked: test.js` であり、
+     **allowedPaths自体が不一致である**ことを示さない。CEO/AIは
+     「test.jsが禁止されている」と誤読する（今回実際に調査時間を要した）
+
+   **対応方針（MVP後）**: 次のいずれか。新しいGate/仕組みは作らない。
+   1. task sync 時に `allowedPaths` をリポジトリ相対へ正規化する（workingDir prefixを剥がす）
+   2. 正規化せず、絶対パスを task sync 時に**検証エラーとして弾く**（fail-fast）
+   3. Guardのblockメッセージに allowedPaths を含め、不一致の原因が読めるようにする
+
+   3 は単独でも誤読コストを消せるので、最小対応として有力。
+
+   **なお状態は壊れていない**: guard block後も worktree は clean に戻り、
+   `test.js` は未変更、verify.js baseline も FAIL のままだった。
+   異常検出 → 安全停止 → 状態保全 → 原因特定可能 → 正規手段で再開、は満たしている。
+
 <!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
 0. [ ] **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**
    （2026-09-10登録。PR #136 のIndependent Reviewで指摘。
