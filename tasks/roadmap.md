@@ -3671,6 +3671,62 @@ deploy canary は全 PASS だった。
       （`spawn({ timeout })` が 60s で子を終了させていない実測。#122 に記録）は
       **別責務**。本項目は「いつ生成するか」、あちらは「1回の生成の時間契約」。
 
+<!-- roadmap:id=worker-jobs-401-anomaly state=planned -->
+6. [ ] **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）** —
+      2026-09-08、Phase 1/2 operational E2E の観測中に発見。E2E は阻害していないため
+      **記録と原因特定まで**とし、P1 regression 修正を優先した。
+
+      **実測できたこと**:
+      - **発生元は Worker プロセス自身**。`ss -tnp` で `:3000` へ接続しているのは
+        Worker(pid) と API(pid) のみ。外部クライアントは存在しない
+      - **401 になるのは `GET /api/jobs?taskId=...` だけ**。同一 Worker からの
+        `/api/projects`・`/api/tasks`・他の `/api/jobs` 呼び出しは 200 を返している
+        （観測窓: 200 が 7,291 件に対し 401 が 627 件、直近2分でも 961:81）
+      - **周期は 1〜6 秒**（4〜6秒が最頻）。Worker の `POLL_INTERVAL_MS = 5000` と一致し、
+        Watchdog の 30 秒周期とは**一致しない**
+      - 401 対象の taskId は **paused / archived Project に属する Task**。
+        ところが poll loop（`index.ts` の `fetchQueuedJob`）は
+        `project.status !== 'running'` を skip するため、本来これらを問い合わせないはずである
+      - Worker / API を再起動しても継続する。Phase 2 containment とは無関係で、
+        **Phase 2 以前から存在する**（containment 経路を通らない読み取り専用 GET）
+      - 現時点で**機能影響は観測されていない**。E2E は完走し、Job claim・
+        workspace_baseline 保存・containment・terminalize はすべて成功した
+
+      **未特定（この項目で解くべきこと）**:
+      1. **どの call site が出しているか。** poll loop は running Project しか見ないのに、
+         401 の taskId は non-running Project のもので、周期は poll loop と一致する。
+         この矛盾が本件の核心。候補は `watchdog.ts:checkRunningJobs`（Project status で
+         絞らず全 Project を走査する唯一の経路。ただし周期は 30 秒）、
+         `jobStateManager.ts:recoverStaleJobs`（同じく全 Project 走査。既定引数
+         `headers = {}` を持つが、`index.ts:607` の呼び出しでは認証ヘッダを渡している）、
+         および未特定の第三の経路
+      2. **auth header 欠落か、誤 credential か。** 同一プロセス・同一ヘッダで
+         `/api/projects` が 200 を返している以上、単純なヘッダ欠落では説明できない。
+         API 側 hook / WORKER allowlist の扱いも含めて確認する
+      3. **同一 Worker PID 内で 200 と 401 が混在する理由**（上記1・2の帰結）
+      4. **resource / log impact**: 1時間あたり約 600 件の無駄な往復とログ行。
+         journal のノイズになり、本当に見るべき 401 を埋もれさせる
+      5. **実機能への影響**: もし 401 を出しているのが Watchdog なら、
+         **stall 検出が実質的に機能していない**（Job 一覧を取得できないため）可能性がある。
+         これは記録段階では未確認であり、最初に確かめるべき点である
+
+      **調査の起点（推奨）**: Worker 側で 401 応答を受けた時点の呼び出し元を一度だけ
+      ログに出す（既存の `fetchJson` は `!res.ok` で `null` を返すだけで、
+      **status を捨てている**）。新しい仕組みを作らず、この戻り値の握り潰しを直すだけで
+      call site は特定できるはずである。
+
+      **今回実装しないもの（明記）**: 認証まわりの変更 / Watchdog の再設計 /
+      新しい retry・auth framework。本項目は記録と原因特定まで。
+      P1 regression（`implement:<jobId>:review` の dirty 継承）や Phase 3 とは混ぜない。
+
+      **2026-09-11 再実測（記録のみ・調査範囲は広げない）**: 本 Finding は**未解決のまま
+      継続中**である。production API ログ（`ai-team-api.service`、2026-09-11 09:00:01〜
+      10:26:56 JST の約87分）で `"statusCode":401` が **3,588 件**、同窓の
+      `"statusCode":200` が **44,041 件**。401:200 比は約 **1:12.3** で、2026-09-08 観測時の
+      627:7,291（約 1:11.6）と**ほぼ同じ**。比が変わらず絶対数だけ増えているのは
+      全体トラフィックが増えたためであり、**新しい事象ではない**。
+      call site・根本原因は依然として未特定で、上記「未特定」項目に変更はない。
+
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 
 **前提（正本）:** `specs/00_constitution.md`（最上位思想）、`specs/13_future_system_architecture.md`
