@@ -190,8 +190,10 @@ describe('review-failure-escalation gap', () => {
       expect(first.statusCode).toBe(200)
       expect(storage.tasks.findById(task.id)?.status).toBe('blocked')
 
-      // CEO が resume した状況を模す（Task は blocked から外れる）。
-      storage.tasks.update(task.id, { status: 'in_progress' })
+      // Task が進行して commit 済みになった状況を模す。
+      // （`resumeBlockedTask` は Task の status を変えないため、実際に pending から動くのは
+      //   `blocked` と `done` だけ。ここでは復旧しきった `done` を使う。）
+      storage.tasks.update(task.id, { status: 'done' })
 
       // 同じ Outbox event が再送される。deduplicated なので escalate してはならない。
       const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${review.id}`, payload: body })
@@ -199,7 +201,7 @@ describe('review-failure-escalation gap', () => {
       expect(JSON.parse(replay.body).outbox?.deduplicated).toBe(true)
 
       // 復旧済みの Task を blocked へ戻していない。
-      expect(storage.tasks.findById(task.id)?.status).toBe('in_progress')
+      expect(storage.tasks.findById(task.id)?.status).toBe('done')
       // Job も増えていない。
       expect(storage.jobs.findByTaskId(task.id)).toHaveLength(2)
     })
@@ -291,6 +293,41 @@ describe('review-failure-escalation gap', () => {
 
       // quarantine 済みの Job は一つも作られていない（そもそも発生させない）。
       expect(storage.jobs.findByTaskId(task.id).some((j) => j.failureMetadata?.quarantined === true)).toBe(false)
+    })
+  })
+
+  it('永続化後 escalate 前に落ちても、再送（deduplicated）で escalate される', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(project.id)
+      const { review } = await createImplementAndReview(task)
+      const storage = await getStorage()
+
+      // 独立レビュー指摘（CLAIM 1）の再現:
+      // `updateWithOutboxEvent` は Job 更新と Outbox event 記録を同一 transaction で確定する。
+      // その直後・escalate 前に API が落ちた状態を、storage を直接叩いて作る。
+      const payload = {
+        status: 'failed' as const,
+        exitCode: 1,
+        stderr: 'Structured review output failed strict schema validation (fail-closed)',
+      }
+      const body = withOutbox(payload, 'event-crash-window-1')
+      const persisted = storage.jobs.updateWithOutboxEvent(
+        review.id,
+        { ...payload, status: 'failed' },
+        { eventId: 'event-crash-window-1', payloadHash: calculatePayloadHash(payload) },
+      )
+      expect(persisted.ok).toBe(true)
+      // escalate は実行されていない = crash した状態
+      expect(storage.tasks.findById(task.id)?.status).toBe('pending')
+
+      // Worker が同じ Outbox event を再送する。storage は deduplicated を返し状態を再適用しない。
+      const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${review.id}`, payload: body })
+      expect(replay.statusCode).toBe(200)
+      expect(JSON.parse(replay.body).outbox?.deduplicated).toBe(true)
+
+      // それでも Task は escalate され、pending に取り残されない。
+      expect(storage.tasks.findById(task.id)?.status).toBe('blocked')
     })
   })
 })

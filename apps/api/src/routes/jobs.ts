@@ -692,12 +692,20 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         stderr: jobUpdate.stderr ?? 'Structured review result is missing (fail-closed)',
       }
 
-      // 再送（deduplicated）では escalate しない。既存 Stage 2 の `!persisted.deduplicated`
-      // と同じ判断で、CEO が resume した後に同じ Outbox event が再送されても
-      // Task を blocked へ戻さない。`escalateTaskToHuman` 自体も冪等ではあるが、
-      // 「復旧済みの Task を再び止めない」ことを呼び出し側で保証する。
-      const escalate = (deduplicated: boolean): void => {
-        if (deduplicated) return
+      // escalate の判定は **Task の現在状態**で行う（deduplicated では判定しない）。
+      //
+      // 独立レビュー指摘（CLAIM 1）: `updateWithOutboxEvent` は Job の更新と Outbox event の
+      // 記録を同一 transaction で確定させる。その直後・escalate 実行前に API が落ちると、
+      // 再送は `deduplicated: true` を返して状態を再適用しない。`deduplicated` で skip して
+      // いると **Task が pending のまま取り残され、本 PR が塞ぐはずの穴がそのまま残る**。
+      //
+      // 代わりに「まだ pending なら escalate する」で判定する。冪等であり crash window も
+      // 塞ぐ。API が Task を pending から動かすのは `blocked`（既に目的達成）と
+      // `done`（commit 済み = 復旧済み）だけで、`resumeBlockedTask` は Task の status を
+      // 変えない（Job を queue するだけ）。したがって escalate 済み・進行済みの Task を
+      // 取り違えて blocked へ戻すことはない。
+      const escalate = (): void => {
+        if (storage.tasks.findById(existing.taskId)?.status !== 'pending') return
         escalateTaskToHuman(storage, existing.taskId)
       }
 
@@ -709,12 +717,12 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           }
           return reply.status(failed.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: failed.reason })
         }
-        escalate(failed.deduplicated === true)
+        escalate()
         return reply.send(outboxResponse(failed.job, outboxEvent, failed.deduplicated))
       }
 
       const failed = storage.jobs.update(existing.id, failedUpdate)
-      escalate(false)
+      escalate()
       return reply.send(failed)
     }
 
