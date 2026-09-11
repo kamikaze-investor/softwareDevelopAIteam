@@ -29,6 +29,7 @@ import {
   WorkspaceReconciliationError,
 } from './jobRunner.js'
 import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
+import { getCommitHash } from './jobRunner.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildWorktreeManifest } from './guards/changeManifest.js'
@@ -152,6 +153,7 @@ export function resolveWorkspaceOwnership(
   perTask: readonly { task: Task; jobs: Job[] }[],
   workingDir: string = TARGET_ROOT,
   readDirtyPaths: (dir: string) => readonly string[] = (dir) => buildWorktreeManifest(dir).paths,
+  readHead: (dir: string) => string | undefined = getCommitHash,
 ): WorkspaceOwnership {
   const existing = findWorkspaceOwningTaskId(perTask)
   if (existing !== undefined) return { kind: 'owner', taskId: existing }
@@ -171,10 +173,40 @@ export function resolveWorkspaceOwnership(
   }
   if (dirtyPaths.size === 0) return { kind: 'none' }
 
+  // 独立レビュー指摘（CLAIM 7）: `changedFiles` は**過去の記録**であり、同じ path が今 dirty でも
+  // 「その dirty がその Job のものだ」とは限らない。path 一致だけで owner を決めると、
+  // 既にコミット済み/戻し済みの Task を誤って owner にできてしまう。2段で絞る。
+  //
+  // (a) その Job の baseline commit が現在の HEAD と一致すること。
+  //     一致しなければ、その Job 以降に何かがコミットされており、記録された dirty は
+  //     もう worktree 上の同じものではない（= 帰属を主張できない）。
+  //     baseline が無い Job も帰属を証明できないので候補にしない（fail-closed）。
+  const head = readHead(workingDir)
+  const ownsRecordedDirt = (job: Job): boolean => (
+    head !== undefined &&
+    job.workspaceBaseline?.startCommitHash === head &&
+    (job.changedFiles ?? []).some((path) => dirtyPaths.has(path))
+  )
+
   const candidates = blockedTasks.filter(({ jobs }) => (
-    canInheritDirtyWorkspace(jobs) &&
-    jobs.some((job) => (job.changedFiles ?? []).some((path) => dirtyPaths.has(path)))
+    canInheritDirtyWorkspace(jobs) && jobs.some(ownsRecordedDirt)
   ))
+
+  // (b) 現在の dirty が候補の記録で**すべて説明できる**こと。説明できない path が1つでも
+  //     あれば、由来不明の変更（人手・別経路）が混ざっている。任意に owner を決めず fail-closed。
+  if (candidates.length === 1) {
+    const explained = new Set(
+      candidates[0].jobs.filter(ownsRecordedDirt).flatMap((job) => job.changedFiles ?? []),
+    )
+    const unexplained = [...dirtyPaths].filter((path) => !explained.has(path))
+    if (unexplained.length > 0) {
+      console.warn(
+        `[Worker] dirty workspace に帰属不明の変更が含まれます ` +
+        `(${unexplained.slice(0, 5).join(', ')})。owner を決めず claim を見送ります。`,
+      )
+      return { kind: 'ambiguous' }
+    }
+  }
 
   if (candidates.length === 0) return { kind: 'none' }
   if (candidates.length > 1) {

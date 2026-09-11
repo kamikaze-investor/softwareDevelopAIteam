@@ -28,9 +28,17 @@ vi.mock('./outbox/outboxStore.js', () => outboxMocks)
 vi.mock('./watchdog/watchdog.js', () => ({ startWatchdog: vi.fn() }))
 vi.mock('./notifier/notifier.js', () => ({ sendAlert: vi.fn() }))
 
+// fetchQueuedJob 経由のテストでは実 worktree を読ませない（HEAD も注入する）。
+const jobRunnerMocks = vi.hoisted(() => ({ getCommitHash: vi.fn() }))
+vi.mock('./jobRunner.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./jobRunner.js')>()),
+  getCommitHash: jobRunnerMocks.getCommitHash,
+}))
+
 import { fetchQueuedJob, resolveWorkspaceOwnership } from './index.js'
 
 const PROJECT_ID = 'project-1'
+const HEAD = 'head0000000000000000000000000000000000000'
 
 function task(id: string, overrides: Partial<Task> = {}): Task {
   return {
@@ -46,17 +54,20 @@ function job(id: string, taskId: string, overrides: Partial<Job> = {}): Job {
     id, taskId, projectId: PROJECT_ID, agentRole: 'developer_ai', status: 'failed',
     safeCommand: { kind: 'test', workingDir: '/workspace/target' },
     createdAt: '2026-09-11T00:00:00.000Z',
+    workspaceBaseline: { mode: 'clean', startCommitHash: HEAD },
     ...overrides,
   }
 }
 
 /** dirty path を注入して所有権だけを判定する（ファイルシステムに触れない）。 */
-function resolve(perTask: Array<{ task: Task; jobs: Job[] }>, dirtyPaths: string[]) {
-  return resolveWorkspaceOwnership(perTask, '/workspace/target', () => dirtyPaths)
+function resolve(perTask: Array<{ task: Task; jobs: Job[] }>, dirtyPaths: string[], head: string | undefined = HEAD) {
+  return resolveWorkspaceOwnership(perTask, '/workspace/target', () => dirtyPaths, () => head)
 }
 
 beforeEach(() => {
   manifestMocks.buildWorktreeManifest.mockReset()
+  jobRunnerMocks.getCommitHash.mockReset()
+  jobRunnerMocks.getCommitHash.mockReturnValue(HEAD)
   outboxMocks.hasPending.mockReturnValue(false)
   vi.spyOn(console, 'warn').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -175,6 +186,36 @@ describe('resolveWorkspaceOwnership', () => {
     const second = resolve(perTask, ['test.js'])
     expect(first).toEqual(second)
     expect(first).toEqual({ kind: 'owner', taskId: 'task-a' })
+  })
+
+  it('その Job 以降に何かがコミットされていれば（HEAD が baseline と不一致）owner にしない', () => {
+    // 独立レビュー指摘（CLAIM 7）: A の変更が既に commit 済みで、同じ path が別の由来で
+    // 再び dirty になっただけ、というケースで A を誤って owner にしてはいけない。
+    const a = task('task-a', { status: 'blocked' })
+    const perTask = [
+      { task: a, jobs: [job('job-a', a.id, { status: 'failed', changedFiles: ['src/foo.ts'] })] },
+    ]
+
+    expect(resolve(perTask, ['src/foo.ts'], 'different000000000000000000000000000000')).toEqual({ kind: 'none' })
+  })
+
+  it('baseline を持たない Job は帰属を証明できないので owner にしない', () => {
+    const a = task('task-a', { status: 'blocked' })
+    const perTask = [
+      { task: a, jobs: [job('job-a', a.id, { status: 'failed', changedFiles: ['src/foo.ts'], workspaceBaseline: undefined })] },
+    ]
+
+    expect(resolve(perTask, ['src/foo.ts'])).toEqual({ kind: 'none' })
+  })
+
+  it('帰属を説明できない dirty path が混ざっていれば fail-closed', () => {
+    // A の記録で説明できない変更（人手・別経路）が残っている場合、A を owner に決めない。
+    const a = task('task-a', { status: 'blocked' })
+    const perTask = [
+      { task: a, jobs: [job('job-a', a.id, { status: 'failed', changedFiles: ['test.js'] })] },
+    ]
+
+    expect(resolve(perTask, ['test.js', 'someone-elses.ts'])).toEqual({ kind: 'ambiguous' })
   })
 })
 
