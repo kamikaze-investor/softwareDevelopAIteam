@@ -25,4 +25,8 @@ describe('isWorkerRouteAllowed', () => {
   it('allowlist外の代表的なroute（CEO approval decision）は許可しない', () => {
     expect(isWorkerRouteAllowed('PATCH', '/api/approval-requests/:id/status')).toBe(false)
   })
+
+  it('Task continuation reconcile を許可する（Worker poll cycle が唯一の起動契機）', () => {
+    expect(isWorkerRouteAllowed('POST', '/api/task-continuations/reconcile')).toBe(true)
+  })
 })

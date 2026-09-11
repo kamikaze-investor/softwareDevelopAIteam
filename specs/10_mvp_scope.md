@@ -229,6 +229,24 @@ Dashboardで状況確認できる
 Goal変更以外で開発が止まらない
 ```
 
+## TEMP_MVP_COMPLETION_POLICY cleanup（MVP完成宣言前の必須作業）
+
+MVP完成宣言の**直前**に、期限付き方針 `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章）を撤去する。
+
+1. `AGENTS.md` 0章の `TEMP_MVP_COMPLETION_POLICY` セクションを、`<!-- TEMP_MVP_COMPLETION_POLICY:BEGIN -->`
+   〜 `<!-- TEMP_MVP_COMPLETION_POLICY:END -->` マーカーごと完全に削除する
+2. `CLAUDE.md` 冒頭の `TEMP_MVP_COMPLETION_POLICY` ポインタ段落を削除する
+3. repository内を `TEMP_MVP_COMPLETION_POLICY` で全文検索し、この一時ポリシーが**共通開発指示として**
+   残っていないことを確認する（`CLAUDE.md` / `AGENTS.md` / `specs/` / `docs/` のルール文書 /
+   prompt template）。`tasks/roadmap.md`・`tasks/task_graph.md`・commit履歴に残る完了記録は
+   履歴であり削除不要
+4. 削除commitをMVP completionに含める
+
+**このcleanupが完了するまで、MVPを「完成」と記録しない。**
+
+一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。MVP後に残すべき
+原則がある場合は、一時ポリシーとは切り離して別途判断する。
+
 ---
 
 # 13. Failure Criteria

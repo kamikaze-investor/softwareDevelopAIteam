@@ -510,6 +510,33 @@ async function confirmRunningTransition(
  * 失敗しても poll cycle を壊さない。次の cycle で再試行されるだけであり、
  * ここで throw すると Job intake ごと止まってしまう。
  */
+/**
+ * Task continuation の reconcile を既存 poll cycle に相乗りさせる。
+ *
+ * 新しい queue / daemon / scheduler は追加しない（reconcileSupervisedRuns() と同じ形）。
+ * これが無いと、commit 成功時に次 Project が paused だった continuation は
+ * 'pending' のまま残り、Mobile の GET /api/projects 系でしか回収されない
+ * （= client を閉じたままでは次 Task へ進めない）。
+ *
+ * API 側は 202 を即返し、sweep 自体は fire-and-forget で走る。したがってここは
+ * **起動をキックするだけ**であり、design review 等の長い処理を待たない
+ * （待つと Outbox 再送と queued Job 取得へ到達できなくなる）。
+ * 回収件数のログは API 側が出す。ここでは retry も gate 判定もしない。
+ */
+export async function reconcileTaskContinuations(): Promise<void> {
+  try {
+    const response = await fetch(`${API_BASE}/api/task-continuations/reconcile`, {
+      method: 'POST',
+      headers: buildApiAuthHeaders(),
+    })
+    if (!response.ok) {
+      console.warn(`[Worker] task continuation reconcile failed: HTTP ${response.status}`)
+    }
+  } catch (err: unknown) {
+    console.warn(`[Worker] task continuation reconcile error: ${formatUnknownError(err)}`)
+  }
+}
+
 export async function reconcileSupervisedRuns(): Promise<void> {
   try {
     const response = await fetch(`${API_BASE}/api/supervised-runs/reconcile`, {
@@ -545,6 +572,11 @@ export async function pollJobs(): Promise<never> {
       // 「runDir の事実を durable state へ反映」「supervisor 自身が死んだ run の検出」
       // 「terminal 後の continuation 起動」だけである。
       await reconcileSupervisedRuns()
+      // Task continuation の回収も同じ位置（**Outbox 分岐より前**）に置く。
+      // else 側に置くと、Outbox に配送できない event が1件でも残っている間 continuation が
+      // 一切進まなくなる。Job intake を止める理由（workspace 競合）は continuation 回収には
+      // 当てはまらない（実際に次 Job を作るかどうかは API 側の既存 gate が決める）。
+      await reconcileTaskContinuations()
 
       if (outboxStore.hasPending()) {
         console.warn('[Worker] Pending Outbox events remain; skipping queued Job fetch for this poll cycle.')

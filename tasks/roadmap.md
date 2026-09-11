@@ -2742,8 +2742,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **respawn/二重計上は含まれていない**。
 
    **#110 Legacy exception registry との関係**: 同registryには `deploy` / `build` / `external_ci` の
-   3行があり、**`ai_delegation` の行は存在しない**（Step 3 で正式配線したため、そもそも
-   exception対象ではない）。ただし本Findingが解消するまでは、
+   3行があり、**`ai_delegation` の行は存在しない**。ただし本Findingが解消するまでは、
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
 
@@ -2903,6 +2902,78 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       API側に何のエラー signal も残らない。**この catch は #136 以前からの既存挙動**であり、
       #136 が新規に持ち込んだものではない。状態は壊れず durable state は正しいままなので、
       MVP後に扱う。
+   ### 訂正（2026-09-11、CEO指示）— 「Step 3 で正式配線した」は誤りだった
+
+   本項は以前「Step 3 で正式配線したため exception 対象ではない」と記載していたが、
+   **これは Production normal path への配線完了を意味しない**。実測（grep）で
+   `launchSupervisedDelegation()` には **test 以外の呼び出し元が存在しない**ことが判明した
+   （参照は `*.test.ts` と `delegationProductionPath.e2e.test.ts` のみ）。
+   production deploy 後に `supervised_runs=0` だった事実とも整合する。
+
+   - **実装済み**: `supervised_runs` schema / storage、completion predicate registry、
+     `launchSupervisedDelegation()`、reconcile route、Worker poll からの reconcile 呼び出し、
+     `delegate.sh` / `delegate-watchdog.sh`、Acceptance A〜E の実経路E2E
+   - **未配線**: `launchSupervisedDelegation()` を呼ぶ **production の実入口**。
+     したがって production では supervised delegation が1件も発生していない
+   - 製品の AI 実行（MVP Workflow の「Developer実装」）は別経路
+     `jobRunner.ts → aiCli adapter → runContainedOrThrow()` を通り、
+     **こちらは per-job cgroup containment 済み**である
+
+   ### 進捗（2026-09-11、CEO判断）— #132 は不採用・close。残作業は formal wiring と同時に行う
+
+   **#132（process group 方式の hardening）は merge せず close した。**
+   独立レビューにより、process group は **signaling scope であって containment ではない**ことが
+   確認された（子が `setsid`/`setpgid` すれば group を離脱し、supervisor は
+   「group 空＝成功」と誤報告し得る）。さらに check→kill 間の TOCTOU
+   （最後の member が消えて同じ数値 PGID が別 group に再利用される）も process group だけでは
+   閉じられない。shell 側へ cgroup プロトコルを二重実装する案も不採用（**両方式を重ねない**）。
+   したがって master には PGID / setsid のコードは入っていない。
+
+   **既存 cgroup containment 資産（再利用先）**: `apps/worker/src/execution/runContainedCommand.ts`
+   （P1 Phase 2、本番実測済み）。1 job = 1 unique cgroup、workload 開始前に `cgroup.procs` へ配置、
+   `cgroup.kill` → `cgroup.events populated 0` → `rmdir` まで確認し、
+   `isContainmentSafe()` が false の結果では terminalize させない。
+   **`setsid` した孫も cgroup からは抜けない**（本番実測済み）。
+
+   **MVP判定（既存 `specs/10_mvp_scope.md` のみで判定）**: MVP Exit Criteria は
+   「仕様書からプロジェクト生成 / AIがタスク生成 / **AIが実装** / Dashboardで状況確認 /
+   Goal変更以外で開発が止まらない」であり、MVP Workflow の実装工程は「Developer実装」である。
+   これは配線済みの jobRunner 経路が満たす。`launchSupervisedDelegation` / `delegate.sh` は
+   `specs/10_mvp_scope.md` に一度も現れず、AGENTS.md が定める
+   **PL role の委任 wrapper（運用ツール）**である。
+   よって **supervised ai_delegation の production 配線は MVP 必須ではない → MVP後へ延期**。
+
+   **延期作業（1つの変更としてまとめて行う。単独では着手しない）**:
+   formal supervised delegation を production へ配線する際に、同じ変更で
+   1. 既存 cgroup containment（`runContainedCommand.ts`）の再利用
+   2. **F7 の修正**: `safe_kill_process` は PID 同定に失敗して kill を skip しても、
+      `kill -9` 後に対象が生存していても `return 0` を返す（fail-open）。
+      cleanup 未確認を上位へ伝播させ、`ESCALATE:stale_child` 等へ倒す
+   3. 独立レビュー由来の F1（pgid未記録でrespawn）/ F2（`kill -- -0` 等の危険な PGID 値）/
+      F5（PID単体killと未検証operand）は **cgroup 方式では不要**になるため持ち込まない
+   4. F4（子孫の group escape）は cgroup で解消される
+   を行う。**単独の F7 修正 PR は作らない**（当該経路が未配線のため。CEO判断 2026-09-11）。
+
+   **非決定性の再現記録（2026-09-11）— master 上でまだ生きている**:
+   **docs のみを変更した PR #141** の CI が
+   `expected recovery_attempt_count '1', got '2'` で失敗した。
+   同PRはコードを1行も変更していないため、**master 側の既存 flake**である。
+   空コミットのみ追加した再実行では **pass**（同一コードで pass/fail が分かれる）。
+   同じ master のコードを開発機 WSL で **20回連続実行しても 20/20 pass** しており、
+   GitHub runner（共有CPUで負荷が高い）でのみ観測される点も、
+   当初の「負荷依存の race」という観測と整合する。
+   なお master の `delegateWatchdog.test.ts` は shell suite を **1回だけ**実行する
+   （反復実行版は #132 に含まれていたため master には入っていない）。
+
+   **運用上の影響**: 本 flake は required check を確率的に落とすため、
+   **無関係な PR の merge を妨げ得る**。当該経路は未配線で修正は MVP後へ延期しているので、
+   当面は「落ちたら再実行」で運用する。CI から外す（skip / quarantine）判断は
+   **CEO判断が要る**（検証していないものを緑に見せることになるため、独断では行わない）。
+
+   **検証可能性の制約（実測）**: containment の実封じ込めテストは CI で実行されない。
+   #132 の CI 実測で `runContainedCommand.test.ts` は **20 tests / 13 skipped**
+   （`isContainmentAvailable()` gate）。開発機の WSL も cgroup v1 hybrid で作成不可。
+   よって cgroup 側の Acceptance は **production でしか検証できない**前提で計画すること。
 
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
@@ -3015,6 +3086,34 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 <!-- roadmap:id=mobile-task-resume-ui state=done -->
 5. [x] 再実行・追加指示UI（Mobile） — 完了。Task詳細画面に「追加指示して再開」機能を実装
    （`POST /api/tasks/:id/resume`。コミット`c90d50e`, `d184d87`）
+
+**MVP完成宣言前の必須クリーンアップ（MVP必須5項目とは別枠。最後に実施する）:**
+
+<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=planned -->
+- [ ] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — MVP完成宣言の**直前**に、期限付き方針
+      `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章 と `CLAUDE.md` 冒頭のポインタ段落）を
+      共通指示から完全に削除し、repository全文検索で共通開発指示として残っていないことを確認し、
+      削除commitをMVP completionに含める。
+      **完了条件・手順の正本**: `specs/10_mvp_scope.md` 12章「TEMP_MVP_COMPLETION_POLICY cleanup」。
+      **このcleanupが完了するまでMVPを「完成」と記録しない。**
+      一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。
+
+      **本項目は MVP Exit Criteria である（CEO 訂正・2026-09-10）。「MVP後へ延期」ではない。**
+      Exit 必須条件として維持するのは次の3点:
+      1. `TEMP_MVP_COMPLETION_POLICY` の削除
+      2. 関連する temporary marker / wording の cleanup
+      3. **cleanup 完了確認**
+
+      **上記とは区別すること**: 2026-09-10 に roadmap parser が本項目に対して
+      「metadata が checkbox 行に続いていない」を報告している。この**整形問題そのものは
+      MVP 本線を block しない**。原因は parser の
+      `CHECKBOX_LINE_REGEX = /^(\s*\d+\.\s+\[)( |x)(\]\s+)(.*)$/` が**番号付き**項目
+      （`1. [ ]`）を要求する一方、本項目が箇条書き（`- [ ]`）で書かれているため。
+
+      ⚠️ ただし帰結として、**本項目は `getValidRoadmapItems()` から見えない**。
+      上記3の「cleanup 完了確認」を parser ベースの自動 check に委ねると、
+      本項目を見落としたまま通過し得る。MVP Exit を実施する担当は、
+      **手動で確認するか、先に整形（`- [ ]` → 番号付き）を直してから自動 check を使うこと。**
 
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
@@ -3226,6 +3325,160 @@ Adapter実装を開始する指示ではない**。実装着手はHigh-priority 
 - agent runtime resume
 - low-level filesystem / network permissions
 
+## P1 stuck-running-Job recovery — CLOSED（2026-09-08）
+
+**P1 は Phase 1 / Phase 2 / Phase 3 すべて完了。** 以下はその完了記録であり、
+ここに列挙した「別扱いで open のまま維持する項目」は P1 の未完を意味しない。
+
+### Phase 1 — crash-safe startup recovery（CLOSED）
+workspace baseline の durable 保存 / quarantine と ownership safety /
+startup reconciliation。master 反映・production deploy 済み。
+
+Operational E2E で、正規 workflow が dirty workspace を継承する2経路
+（`implement:<jobId>:review` / `review:<jobId>:git-commit`）が normal Job 扱いされ
+quarantine していた admission classification の漏れを2件発見し、
+どちらも exact-shape 判定として修正・test・review・deploy 済み。
+production 上で正常 claim を確認済みのため、同一 root cause として CLOSED / VERIFIED。
+
+### Phase 2 — async per-job cgroup containment（CLOSED）
+per-job cgroup 作成 / 配置 / 非同期実行 / timeout・kill・drain /
+子孫 cleanup / 実行後 workspace reconciliation / ownership 解放の安全性。
+master 反映・production deploy 済み。production 実動確認で、直接の子が exit 0 でも
+`setsid` 子孫が残る場合に `outcome:'killed'` / `killedDescendants:true` /
+drain 22ms / cgroup 削除 を実測。deploy canary 全 PASS。
+
+### Phase 3 — 残 Finding 3件（CLOSED）
+- **R5-N1** 通知の再送・fallback: merged / deployed / operational check PASS
+- **DB-007** WatchdogEvent の durable dedup: merged / migration 適用済み / operational check PASS
+  （dedup key は `(job_id, started_at)`。復旧後の正当な再 stall を潰さないため job_id 単独にしない）
+- **MOB-001** Mobile の stalled / quarantine 可視化: merged（#113 / #116 / #117）
+
+MOB-001 は CEO 実機確認で UX defect を検出し #117 で修正。
+別 provider による bounded UI/UX independent review は **APPROVE**（6観点すべて RESOLVED）。
+
+**UNVERIFIED — no naturally quarantined production Job available**:
+修正版 quarantine UI の再実機確認だけは、確認時点で自然発生した quarantined Job が
+0件のため未実施。**P1 completion の blocker とはしない**（人工的な quarantine を
+production に作らない方針のため）。将来自然な quarantine が発生した時点で
+operational observation として確認する。
+
+**CEO 実機再確認（2026-09-09〜10）— MOB-001 の残 2 項目**:
+
+- **approval waiting**: `UNVERIFIED — no naturally pending approval available`。
+  確認時点で自然発生した approval 待ち Job が 0 件のため未実施。quarantine UI と同じ扱いで
+  P1 completion の blocker とはしない（人工的な approval を production に作らない方針）。
+
+- **failure explanation / AI question**: `PASS — functional`（2026-09-10 CEO 実機確認）。
+  当初は `FAIL — API refused before the AI call` として記録したが、**#130 で修正し
+  production 反映後に実経路で PASS を確認**した。実経路
+  Mobile → API → failure explanation 生成 → AI response → Mobile 表示 が成立。
+
+  **実測 evidence**: target Job `ecfa0132-cbb0-4293-baf9-0c25aa93c593` の
+  `failure_explanation_json` が **NULL → 生成済み**（`classification=configuration`、
+  `likelyCause` / `impact` / `recommendedNextAction` すべて充足、
+  `generatedAt` 2026-09-10T09:24:12Z）。DB 全体の生成済み件数も **0 → 1** で、
+  その1件が対象 Job 本体であることを帰属レベルで確認済み（候補 Task は14件あるため、
+  DB 全体件数だけでは帰属を示せない）。「AIに質問する」も同 Task で回答本文を実機確認。
+
+  説明品質（非エンジニア向けの分かりやすさ・technical vocabulary の多さ・
+  CEO と AI 開発チームの責任分離・フォーマット固定）の課題は **functional blocker とせず**、
+  既存 item `failure-explanation-pregeneration`（**post-MVP**）へ統合済み。
+  MVP 完成まで説明品質改善を理由に本線を止めない（CEO 判断・2026-09-10）。
+
+  以下は当初 FAIL の原因記録として残す。
+  「実行失敗の説明」「AIに質問する」の両方が AI 障害の文言を返していたが、production log で
+  **AI が一度も呼ばれていなかった**ことが判明した。CEO の 3 リクエスト（Task `11066c6f`）は
+  いずれも HTTP 200 / 4.7ms・44.7ms・5.5ms で完了し `level:40` warn は 0 件。provider を実コードで
+  直接叩いた実測は 1 回 66〜74 秒なので、5ms は AI 呼び出し前の早期 return を意味する。
+
+  原因は Mobile と API の表示述語の乖離。Mobile (`[id].tsx:725`) は
+  `failed || blocked || task.blocked`、API (`tasks.ts:192`) は `failed || task.blocked` で、
+  `blocked` が欠けていた。**Job が blocked でも Task は `pending` に留まる**ため、
+  この状態の Task（production 上 **14 件**。当初 3 件と報告したが直近25件しか見ておらず、
+  全件走査で14件と判明）では
+  Mobile が説明セクションを表示するのに API が「対象なし」を返していた。
+
+  元実装 `4ad0fb6` では両者は一致していた。`d8bcf0c`（#124）で **Mobile 側だけを広げた
+  regression** であり、MOB-001 自身の責務内。既存 AI provider / router の障害ではない
+  （quota・auth・timeout・parse failure・missing record のいずれでもない）。
+
+  修正は共通経路 1 点。API 側で既存 `isTaskFailureJob()` を `shouldExplain` にも共有させ、
+  両サイトが二度と別々に書かれないようにした。あわせて Mobile が `result.error` /
+  `answer.error` をそのまま表示するようにし、AI 以外の原因（対象 Job なし・通信エラー）を
+  AI 障害として誤報しないようにした。この誤報が診断を困難にしていた二次欠陥である。
+
+**派生 Finding（本 PR では修正しない・別扱いで open）**:
+`cheapAiClient` の実測レイテンシが 1 回 66〜74 秒で、`CHEAP_AI_CONFIG.timeoutMs = 60_000` を
+超えているのに 2 回の probe が成功した（`spawn({ timeout })` が子を終了させていない）。
+述語修正後は実際に AI 生成が走るようになるため表面化する。60s 設定値と Cloudflare の
+100s 上限の両方に近いことも含め、`containment-success-path-observability` とは別の
+`cheap-ai-latency-and-timeout-contract` として扱う。
+
+### P1 完了時点の production 実測
+API health 200 / API・Worker とも active・NRestarts=0 / production tree clean /
+`/workspace/target` clean / running Job 0 / quarantined Job 0 /
+DB `integrity_check` ok / Worker エラーログ 0。
+
+### P1 とは分離して open のまま維持する項目（P1 の未完ではない）
+これらは P1 の実装で顕在化した、または隣接する別責務であり、重複 Finding は作らない。
+
+- shared-workspace leakage / cleanup-deadlock（本節の該当項目へ集約済み）
+- worktree isolation（`project-auto-worker-trust-boundary`）
+- adversarial cgroup escape（`containment-adversarial-escape-threat-model`）
+- `Delegate=yes` hardening（`worker-cgroup-delegation-contract`）
+- containment success path の可観測性（`containment-success-path-observability`）
+- Meta Reviewer robustness（`meta-review-structured-output-robustness`）
+- background-task supervision
+- legacy `API_TOKEN` → ADMIN / WORKER split credential migration
+- cheap AI（説明・質問経路）の latency と timeout 契約（`cheap-ai-latency-and-timeout-contract`）
+
+
+### 次に着手すべき root-cause cluster（P1 完了時点の handoff・2026-09-08）
+
+**選定: shared workspace の dirty leakage → 恒久 quarantine（cleanup-deadlock）→ worktree isolation**
+
+**なぜ次か**: open 項目の中で、**実際に production の workflow を止め、
+CEO 承認の手動介入を要した唯一のクラスタ**であるため。2026-09-08 の Operational E2E で
+2回実測しており、再現性がある（別 Project でも再発）。他の open 項目は
+hardening（`Delegate=yes`・containment observability）、対象外と判断済みの threat model
+（adversarial escape）、あるいは別系統（Meta Reviewer robustness）であり、
+いずれも現時点で production を停止させていない。
+
+**既存実装との関係**:
+- P1 Phase 1 がこの問題を**可視化**した。以前は「前 attempt の未 commit 変更が
+  次 Job へ静かに混入する」汚染だったものが、baseline admission により
+  `workspace_baseline_failure` quarantine として**停止**するようになった。
+  Phase 1 が原因ではなく、既存の欠陥を検出できるようにしただけである
+- P1 Phase 2（containment）はこの問題に触れていない。cgroup はプロセスを回収するが、
+  ファイルシステム上に残った変更は回収しない
+- **clearance の known-good 要件を緩めて解決してはならない。** それは
+  「安全と証明できない限り所有権を解放しない」という hard invariant そのもの。
+  不足しているのは安全性チェックではなく、**dirty から正規に known-good へ戻す経路**
+
+**ledger 上の注意（着手前に解消すべき）**: この root cause を扱う
+`project-auto-worker-trust-boundary` は `state=done` になっている。
+これは「設計項目（実装を伴わない）」として完了した経緯によるもので、
+worktree isolation の**実装は未着手**。つまり現状、この cluster には
+**open な owner 項目が無い**。新しい重複 Finding を作るのではなく、
+この項目の state を実態に合わせるか、実装用の後継項目を1件立てるかを先に決めること。
+
+**最初に行う read-only 調査（実装前）**:
+1. 残った変更の**帰属**を既存情報だけで特定できるか。`workspace_baseline` /
+   `buildWorktreeManifest` / `fingerprintWorktreeEntries` / repair 情報から
+   「どの source Job が作った変更か」を判定できるか
+2. `revertBlockedJobChanges()` の適用条件（現在は File Change Guard 違反時のみ、
+   かつ manifest 由来の変更のみ）を、untracked を含む一般的な cleanup へ
+   安全に広げられるか。広げられない場合は何が不足しているか
+3. worktree isolation（1 Job = 1 worktree）を既存 `resumeBlockedTask()` の
+   「新 Job 行を作る」形へ載せられるか。roadmap 424-470 行の既存設計案が
+   現在の Phase 1/2 実装（baseline / quarantine / containment）と整合するか
+4. 帰属不能な変更が残った場合の扱い。**自動削除はしない**方針を維持したまま、
+   quarantine 維持 + PL エスカレーションで運用が回るか
+
+**着手時の禁止事項**: 曖昧な変更の自動削除 / CEO への Git 判断の要求 /
+clearance 条件の緩和 / 新しい cleanup subsystem の先行実装。
+
+
 **現行P1実装の位置づけ:** P1 Phase 1（workspace baseline・quarantine・startup reconciliation）と
 P1 Phase 2（async per-job cgroup containment）は**いずれも完了**している
 （Phase 2: 2026-09-08、master `5825433`、production deploy 済み）。これらは
@@ -3375,8 +3628,34 @@ deploy canary は全 PASS だった。
 
 
 <!-- roadmap:id=failure-explanation-pregeneration state=planned -->
-5. [ ] **Failure Explanation の事前生成と CEO 向け構造化（次段改善）** — 2026-09-10 登録。
+5. [ ] **Failure Explanation の事前生成と CEO 向け構造化（次段改善）— `post-MVP`** —
+      2026-09-10 登録。**本項目は明示的に post-MVP。MVP 完成まで説明品質改善を理由に
+      本線を止めない**（CEO 判断・2026-09-10）。
       #130（predicate regression 修正）とは**別責務**。#130 / Phase 3 closure を先に完了する。
+
+      **2026-09-10 CEO 実機確認の結果**: 技術的な実経路
+      （Mobile → API → failure explanation 生成 → AI response → Mobile 表示）は**成立**し、
+      Phase 3 の **functional PASS** として記録済み。以下は品質課題であり
+      **functional blocker として扱わない**。MVP 前の追加修正は行わない。
+
+      同確認で挙がった UX / quality 課題（**新規 item を作らず本項目へ統合**）:
+      - 非エンジニア向けとして分かりにくい
+      - technical vocabulary が多い
+      - 技術的確認を `recommendedNextAction` として CEO へ提示する場合がある
+      - **CEO がすべきこと / AI 開発チームがすべきことの責任分離が弱い**
+      - 説明フォーマットが十分に固定されていない
+
+      **CEO 向け固定フォーマット（post-MVP で実装する形）**: 少なくとも次の5問に
+      一貫して答える形へ固定する。technical details は secondary 表示へ分離する。
+      1. 何が起きた？
+      2. なぜ止まった？
+      3. 今どうなっている？
+      4. 次に何が行われる？
+      5. CEO がすることは？
+
+      あわせて、**AI 側で解決可能な技術作業を CEO へ要求しない**こと、
+      **CEO 判断が必要な場合のみ**具体的な質問を提示することを満たす。
+
 
       **Goal**: Job が failed / blocked になった時点でバックグラウンドに説明を生成・レビュー・
       保存し、CEO が Mobile を開いた時には**原則完成済みの説明が即表示**される状態にする。
@@ -3547,6 +3826,62 @@ deploy canary は全 PASS だった。
       **隣接する別項目（統合しない）**: cheap explainer の latency と timeout 契約
       （`spawn({ timeout })` が 60s で子を終了させていない実測。#122 に記録）は
       **別責務**。本項目は「いつ生成するか」、あちらは「1回の生成の時間契約」。
+
+<!-- roadmap:id=worker-jobs-401-anomaly state=planned -->
+6. [ ] **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）** —
+      2026-09-08、Phase 1/2 operational E2E の観測中に発見。E2E は阻害していないため
+      **記録と原因特定まで**とし、P1 regression 修正を優先した。
+
+      **実測できたこと**:
+      - **発生元は Worker プロセス自身**。`ss -tnp` で `:3000` へ接続しているのは
+        Worker(pid) と API(pid) のみ。外部クライアントは存在しない
+      - **401 になるのは `GET /api/jobs?taskId=...` だけ**。同一 Worker からの
+        `/api/projects`・`/api/tasks`・他の `/api/jobs` 呼び出しは 200 を返している
+        （観測窓: 200 が 7,291 件に対し 401 が 627 件、直近2分でも 961:81）
+      - **周期は 1〜6 秒**（4〜6秒が最頻）。Worker の `POLL_INTERVAL_MS = 5000` と一致し、
+        Watchdog の 30 秒周期とは**一致しない**
+      - 401 対象の taskId は **paused / archived Project に属する Task**。
+        ところが poll loop（`index.ts` の `fetchQueuedJob`）は
+        `project.status !== 'running'` を skip するため、本来これらを問い合わせないはずである
+      - Worker / API を再起動しても継続する。Phase 2 containment とは無関係で、
+        **Phase 2 以前から存在する**（containment 経路を通らない読み取り専用 GET）
+      - 現時点で**機能影響は観測されていない**。E2E は完走し、Job claim・
+        workspace_baseline 保存・containment・terminalize はすべて成功した
+
+      **未特定（この項目で解くべきこと）**:
+      1. **どの call site が出しているか。** poll loop は running Project しか見ないのに、
+         401 の taskId は non-running Project のもので、周期は poll loop と一致する。
+         この矛盾が本件の核心。候補は `watchdog.ts:checkRunningJobs`（Project status で
+         絞らず全 Project を走査する唯一の経路。ただし周期は 30 秒）、
+         `jobStateManager.ts:recoverStaleJobs`（同じく全 Project 走査。既定引数
+         `headers = {}` を持つが、`index.ts:607` の呼び出しでは認証ヘッダを渡している）、
+         および未特定の第三の経路
+      2. **auth header 欠落か、誤 credential か。** 同一プロセス・同一ヘッダで
+         `/api/projects` が 200 を返している以上、単純なヘッダ欠落では説明できない。
+         API 側 hook / WORKER allowlist の扱いも含めて確認する
+      3. **同一 Worker PID 内で 200 と 401 が混在する理由**（上記1・2の帰結）
+      4. **resource / log impact**: 1時間あたり約 600 件の無駄な往復とログ行。
+         journal のノイズになり、本当に見るべき 401 を埋もれさせる
+      5. **実機能への影響**: もし 401 を出しているのが Watchdog なら、
+         **stall 検出が実質的に機能していない**（Job 一覧を取得できないため）可能性がある。
+         これは記録段階では未確認であり、最初に確かめるべき点である
+
+      **調査の起点（推奨）**: Worker 側で 401 応答を受けた時点の呼び出し元を一度だけ
+      ログに出す（既存の `fetchJson` は `!res.ok` で `null` を返すだけで、
+      **status を捨てている**）。新しい仕組みを作らず、この戻り値の握り潰しを直すだけで
+      call site は特定できるはずである。
+
+      **今回実装しないもの（明記）**: 認証まわりの変更 / Watchdog の再設計 /
+      新しい retry・auth framework。本項目は記録と原因特定まで。
+      P1 regression（`implement:<jobId>:review` の dirty 継承）や Phase 3 とは混ぜない。
+
+      **2026-09-11 再実測（記録のみ・調査範囲は広げない）**: 本 Finding は**未解決のまま
+      継続中**である。production API ログ（`ai-team-api.service`、2026-09-11 09:00:01〜
+      10:26:56 JST の約87分）で `"statusCode":401` が **3,588 件**、同窓の
+      `"statusCode":200` が **44,041 件**。401:200 比は約 **1:12.3** で、2026-09-08 観測時の
+      627:7,291（約 1:11.6）と**ほぼ同じ**。比が変わらず絶対数だけ増えているのは
+      全体トラフィックが増えたためであり、**新しい事象ではない**。
+      call site・根本原因は依然として未特定で、上記「未特定」項目に変更はない。
 
 ### 将来アーキテクチャ移行（Constitution / Team・Service Extension構想。MVP後・未着手）
 

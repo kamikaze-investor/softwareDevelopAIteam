@@ -8,6 +8,84 @@ Claude Code・Codex 両エージェントが従う共同運用ルール。
 
 ---
 
+## 0. TEMP_MVP_COMPLETION_POLICY（期限付き — MVP完成宣言時に削除する）
+
+<!-- TEMP_MVP_COMPLETION_POLICY:BEGIN -->
+
+**TEMP_MVP_COMPLETION_POLICY**
+
+> Temporary policy — valid only until MVP completion.
+> This policy MUST be removed when MVP completion is declared.
+> It is not a permanent Design Philosophy or development principle.
+
+これは恒久的なDesign Philosophy・一般開発原則ではない。MVP完成宣言時に削除する**期限付き方針**である。
+本方針の内容を `CLAUDE.md` 3章 Design Philosophy や `specs/00_constitution.md` へ自動転記しないこと。
+MVP後に残すべき原則がある場合は、本方針とは切り離して別途判断する。
+
+**適用範囲:** 全開発セッション（Claude / Codex / OpenCode / Gemini / ChatGPT）へ共通適用する。
+本方針が変更するのは**スコープ判断のみ**であり、Safety Rule・Authority Principle・Repository Boundary・
+Approval Gate・既存の品質Gateは一切緩めない。
+
+**適用開始（2026-09-10）:** 既に進行中の作業を巻き戻す・再設計する必要はない。以後の追加修正・
+Finding判断・スコープ判断から適用する。
+
+### 方針
+
+現在はMVP完成を最優先する。新しい問題・Finding・改善案が見つかっても、**原則としてMVPスコープを拡張しない**。
+
+**MVP前に修正する（例外）** — 次のいずれかに該当するもの:
+
+- データ破壊、二重実行、重複commit、誤った状態遷移など、結果の正しさを損なう
+- Approval Gate、権限、安全境界を迂回できる
+- crash / interruption後に状態が壊れ、合理的な正規手段で復旧できない
+- MVPの主要Happy Pathを妨げる
+- source of truth、ownership、状態遷移、retry境界などの基盤欠陥で、後から直すと修正範囲が大幅に広がる
+- Goal / Design Philosophy / 既存仕様への明確な逸脱
+
+**MVP後へ送る（それ以外は原則こちら）** — 特に次はMVP成立に必須でないため後回しにする:
+
+- rare caseの完全自動復旧
+- observability / loggingの追加改善
+- UI/UXの細かな改善
+- provider fallbackの高度化
+- 一般化・抽象化
+- 将来拡張だけを目的とした実装
+- 新しいreview / gate / workflow / safety mechanism
+- 「ついで」の改善
+
+### 異常系に求める水準
+
+異常系は完全自動復旧まで要求しない。MVPでは次を満たせばよい。
+
+```text
+異常検出 → 安全に停止 → 状態を壊さない → 原因を確認できる → 既存の正規手段で再開または復旧できる
+```
+
+### Finding発生時の扱い
+
+Findingは必ず次のどちらかへ分類し、**理由を短く記録する**。
+
+- **MVP前に必須修正**
+- **MVP後へ延期**
+
+延期Findingは削除しない。既存の管理先（`tasks/roadmap.md` / `tasks/task_graph.md` 等の既存backlog）へ残す。
+**新しいFinding管理方式・新しい台帳ファイル・新しいworkflowは作らない。**
+
+既存機能・既存ルール・既存workflowの修正で解決できる場合、新規機構を追加しない。
+
+### 目的
+
+現在のarchitectureを不用意に拡張せず、主要Happy Pathを実入口から最後まで通し、**blocker 0でMVPを完成させる**こと。
+
+### 削除条件
+
+`specs/10_mvp_scope.md` 12章「MVP Exit Criteria」の `TEMP_MVP_COMPLETION_POLICY cleanup` を参照。
+このcleanupが完了するまでMVPを「完成」と記録しない。
+
+<!-- TEMP_MVP_COMPLETION_POLICY:END -->
+
+---
+
 ## 1. ワークツリー境界（最重要）
 
 | エージェント | 作業ディレクトリ | 触れるもの |
@@ -188,6 +266,15 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
     completion判定は formal verdict であり、**exit 0 + 空出力 / verdict無しは success にならない**。
     停止時は診断 → bounded recovery → terminal verdict まで自動で進み、
     終端時に automatic continuation が走る。
+  - **配線状況の明記（2026-09-11 訂正）**: 上記は「PL が委任するならこの関数を使う」という
+    **規範**であって、**production の実入口へ配線済みという意味ではない**。実測で
+    `launchSupervisedDelegation()` には test 以外の呼び出し元が無く、production の
+    `supervised_runs` は 0 件である。**実装済みだが未配線**。
+    なお製品の AI 実行（MVP Workflow の「Developer実装」）はこの経路ではなく
+    `jobRunner → aiCli adapter → runContainedOrThrow()` を通り、per-job cgroup で封じ込め済み。
+    formal wiring は MVP 必須ではない（`specs/10_mvp_scope.md` の Exit Criteria に含まれない）ため
+    MVP後に、既存 cgroup containment の再利用と併せて行う。
+    詳細は `tasks/roadmap.md` の `deleg-001-watchdog-respawn`。
     これは**OS上で生のshell実行を禁止するものではない**（それは要求範囲外）。
     禁止しているのは、AIteamOSの正式運用経路でsupervision無しの委任を使うことである。
     詳細な契約は `tasks/roadmap.md` の `roadmap:id=pl-review-process-supervision`
