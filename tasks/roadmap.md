@@ -2855,6 +2855,16 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    競合時の巻き戻し防止も既にあり、Worker の blocked 書き戻しが承認後に届いても
    `jobs.update()`（`sqlite.ts:1136`）が APPROVED/CONSUMED を見て queued を維持する。
 
+   **Production 実測（2026-09-11、continuation E2E test 9 の audit_log）**: 本番 DB の
+   `audit_log` を read-only で確認したところ、git_commit の承認2件はいずれも
+   **`approve success` の1行のみ**で、当日 `resume` 系の監査エントリは **0件**だった。
+   ```
+   approval-20260911-b75bcfcf  06:12:53  approve success   (Task 1 commit)
+   approval-20260911-d1884c76  06:21:15  approve success   (Task 2 commit)
+   resume entries today:       (none)
+   ```
+   CEO は approve しか押しておらず、それだけで Job が再開して commit まで到達している。
+   コード読解だけでなく**実機の実行痕跡でも auto-resume が裏づけられた**。
    **同時に訂正すべき記述**: 上記「深刻度」欄で「過去の Production E2E が完走できたのは
    client が手動 resume を呼んだためである」と書いたが、**これは検証していない推測であり誤り**。
    承認だけで再開するため、E2E の完走は auto-resume で説明できる。

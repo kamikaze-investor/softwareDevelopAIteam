@@ -108,7 +108,15 @@ Production endpoint 自体も、実 credential で
 `tasks/roadmap.md` へ登録済み:
 
 - `resolveFinalDecision` が未知 decision 値を ALIGNED へ fall-through する（fail-open）
-- approval 後に blocked git_commit Job が自動 resume せず client の `/resume` が要る
+- ~~approval 後に blocked git_commit Job が自動 resume せず client の `/resume` が要る~~
+  **訂正（2026-09-11）: これは誤りだった。** 参照した `PATCH /api/approvals/:id` は
+  Project 単位の `approvals` テーブル用で、git_commit Gate とは別系統。Mobile が使う
+  `PATCH /api/approval-requests/:id/status` は `approveAndResumeJob()` を呼び、
+  **approval の APPROVED 化と linked Job の queued 戻しを同一 transaction で行う**。
+  つまり **approve だけで自動 requeue され、client の `/resume` は不要**。
+  本番 audit_log でも当日の承認2件は `approve success` のみで resume 監査は0件だった。
+  `/api/tasks/:id/resume` は STALE / EXPIRED 等の異常系のための別経路。
+  本文中の「approve + resume」という記述はすべてこの訂正に従って読むこと。
 - `POST /api/supervised-runs/reconcile` が `WORKER_ALLOWLIST` に無い（**潜在**欠陥。
   本番は credential split 未有効のため現時点では 403 にならない）
 - continuation reconcile の NON-BLOCKING 指摘 2 件（full-table 走査 / エラーの握り潰し）
