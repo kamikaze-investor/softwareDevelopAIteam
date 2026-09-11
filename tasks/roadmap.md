@@ -2870,6 +2870,23 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       **このcleanupが完了するまでMVPを「完成」と記録しない。**
       一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。
 
+      **本項目は MVP Exit Criteria である（CEO 訂正・2026-09-10）。「MVP後へ延期」ではない。**
+      Exit 必須条件として維持するのは次の3点:
+      1. `TEMP_MVP_COMPLETION_POLICY` の削除
+      2. 関連する temporary marker / wording の cleanup
+      3. **cleanup 完了確認**
+
+      **上記とは区別すること**: 2026-09-10 に roadmap parser が本項目に対して
+      「metadata が checkbox 行に続いていない」を報告している。この**整形問題そのものは
+      MVP 本線を block しない**。原因は parser の
+      `CHECKBOX_LINE_REGEX = /^(\s*\d+\.\s+\[)( |x)(\]\s+)(.*)$/` が**番号付き**項目
+      （`1. [ ]`）を要求する一方、本項目が箇条書き（`- [ ]`）で書かれているため。
+
+      ⚠️ ただし帰結として、**本項目は `getValidRoadmapItems()` から見えない**。
+      上記3の「cleanup 完了確認」を parser ベースの自動 check に委ねると、
+      本項目を見落としたまま通過し得る。MVP Exit を実施する担当は、
+      **手動で確認するか、先に整形（`- [ ]` → 番号付き）を直してから自動 check を使うこと。**
+
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
 - [x] MobileがAPI tokenの`Authorization`ヘッダーを送っていない — **解消済み（2026-08-17
