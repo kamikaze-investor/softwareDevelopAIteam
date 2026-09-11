@@ -49,23 +49,18 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
   const singleRunningProjectResponse = { error: 'Another project is already running' }
 
-  // Retries any Task continuation still 'pending' for a running Project. Fire-and-forget:
-  // never blocks or fails the GET it rides on. This -- not this specific PATCH transition --
-  // is what guarantees a continuation left 'pending' by a failed resume-time attempt is not
-  // stranded forever: Mobile already polls both routes below continuously (usePolling), so
-  // each poll tick is another retry opportunity, matching the same "piggyback on an existing
-  // poll cycle instead of adding a new one" pattern the Worker's pollJobs() already uses for
-  // its own Outbox resend.
-  function retryRunningProjectContinuations(project: { id: string; status: string } | undefined): void {
-    if (project?.status !== 'running') return
-    void retryPendingContinuationsForProject(storage, project.id)
-      .catch((error: unknown) => app.log.error({ err: error, projectId: project.id }, 'continuation retry sweep failed'))
-  }
+  // **GETは純粋なread-onlyである。** 以前はここでpending continuationのretryを
+  // fire-and-forgetしており、Mobileのpollがcontinuationのliveness driverになっていた。
+  // clientを閉じると次Taskへ進めない、という依存（continuation-get-liveness-dependency）の
+  // 実体がこれだった。読み取りに副作用を持たせない。
+  //
+  // continuationを進めるのは以下の3経路のみで、いずれもbackend側で完結する:
+  //   1. commit成功時の `PATCH /api/jobs/:id`（+ 非2xxならWorker Outbox再送）
+  //   2. `PATCH /api/projects/:id` で running へ戻したときの retry（CEO操作。下記）
+  //   3. Worker poll cycleの `POST /api/task-continuations/reconcile`（fallback）
 
   app.get('/', async (_req, reply) => {
-    const projects = storage.projects.findAll()
-    for (const project of projects) retryRunningProjectContinuations(project)
-    return reply.send(projects)
+    return reply.send(storage.projects.findAll())
   })
 
   app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {
@@ -73,7 +68,6 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     if (!project) {
       return reply.status(404).send({ error: 'Project not found' })
     }
-    retryRunningProjectContinuations(project)
     return reply.send(project)
   })
 
@@ -227,10 +221,11 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         // Resuming an already-initialized Project: retry any Task continuation left
         // 'pending' while paused (see initialImplementWorkflow.ts's retryable pause skip
         // and jobs.ts's matching ack-without-503 branch). This first attempt is a
-        // convenience, not the guarantee -- if it fails, retryRunningProjectContinuations()
-        // above (wired into GET / and GET /:id, which Mobile already polls) keeps retrying
-        // on every subsequent poll tick, so a transient failure here never stalls a
-        // continuation forever.
+        // convenience, not the guarantee -- if it fails, the Worker poll cycle の
+        // `POST /api/task-continuations/reconcile` が次のcycleで拾い直すため、
+        // 一過性の失敗でcontinuationが恒久的に止まることはない。
+        // （以前はGET / と GET /:id の副作用がこの役割を担っていたが、GETを
+        //   read-onlyにしたので、fallbackはWorker側のreconcileだけになった。）
         void retryPendingContinuationsForProject(storage, updated.id)
           .catch((error: unknown) => req.log.error({ err: error, projectId: updated.id }, 'continuation retry sweep failed'))
       }
