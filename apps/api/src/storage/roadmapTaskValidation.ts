@@ -48,6 +48,7 @@ export type RoadmapValidationIssueCode =
   | 'unknown_phase'
   | 'task_count_exceeded'
   | 'disallowed_path'
+  | 'non_relative_allowed_path'
   | 'dependency_count_exceeded'
   | 'control_plane_operation_task'
   | 'unknown_technical_uncertainty_ref'
@@ -178,6 +179,58 @@ function buildCircularDependencyIssues(
  * DB書き込み前に、ロードマップ全体の整合性を検証する。
  * 検証対象はロードマップ入力データ自身の自己整合性のみ（DBは見ない）。
  */
+/**
+ * `allowedPaths` の1件がrepository-relativeでない理由を返す。問題なければ`undefined`。
+ *
+ * **なぜ決定論的に弾く必要があるか（2026-09-11、production実測）**: File Change Guard
+ * （`apps/worker/src/guards/fileChangeGuard.ts`）は、worktree相対へ正規化した変更パスと
+ * `allowedPaths`の各要素を**逐語比較**する（末尾スラッシュを剥がすだけ）。したがって
+ * `"/workspace/target/test.js"`のような綴りは、同じファイルを指していても`"test.js"`と
+ * 永久に一致せず、**初回implement Jobが必ずGuardでblockされる**。
+ * Project `e03fd43a`で実測（`fileViolations: ["test.js"]`、exit 1）。前日の同種Projectは
+ * `["test.js"]`を生成して成功しており、これは回帰ではなく**生成AIの出力揺れ**である。
+ *
+ * Guard側は変更しない（CONTROL REPOSITORY であり、照合を緩めることは許可範囲の拡大になる）。
+ * 絶対パスを相対へ自動書き換えることもしない（Guardのポリシー入力を実質的に広げるため）。
+ * ここで**生成物を不正と判定**し、既存のbounded regeneration loopへ差し戻すだけにする。
+ */
+function nonRelativePathReason(path: string): string | undefined {
+  if (path.trim() === '') return 'must not be empty'
+  // POSIX絶対パス（今回のproduction実測ケース）
+  if (path.startsWith('/')) return 'must not be an absolute path'
+  // UNCパス / Windowsドライブレター。target側はLinuxだが、綴りとして受理しない
+  if (path.startsWith('\\')) return 'must not be a UNC path'
+  if (/^[A-Za-z]:[/\\]/.test(path)) return 'must not be an absolute (drive-letter) path'
+  // `..`セグメントはrepository外を指しうる。Guardはtraversalとして別途拒否するが、
+  // 生成段階で弾いた方がフィードバックが具体的になる
+  if (path.split(/[/\\]/).includes('..')) return 'must not contain a ".." segment'
+  // `./`接頭辞はrelativeではあるが、Guardの逐語比較では`test.js`と一致しない。
+  // 上記の絶対パスと**同一のroot cause（逐語比較）**であり、別ルールではない
+  if (path.startsWith('./')) return 'must not start with "./"'
+  return undefined
+}
+
+function buildNonRelativePathIssues(tasks: RoadmapSyncTaskInput[]): RoadmapValidationIssue[] {
+  const issues: RoadmapValidationIssue[] = []
+  for (const task of tasks) {
+    for (const path of task.allowedPaths) {
+      const reason = nonRelativePathReason(path)
+      if (reason !== undefined) {
+        issues.push({
+          code: 'non_relative_allowed_path' as const,
+          roadmapTaskKey: task.roadmapTaskKey,
+          // このmessageはそのまま`priorAttemptFeedback`として再生成AIへ渡るため、
+          // 「何が悪いか」だけでなく「どう直すか」まで書く。
+          message: `Task ${task.roadmapTaskKey} has allowedPaths entry "${path}" that ${reason}. `
+            + 'allowedPaths entries must be repository-relative paths '
+            + '(e.g. "src/index.ts" or "apps/engine/src/"), never absolute paths.',
+        })
+      }
+    }
+  }
+  return issues
+}
+
 export function validateRoadmapTasks(tasks: RoadmapSyncTaskInput[]): RoadmapValidationIssue[] {
   const roadmapTaskKeys = new Set(tasks.map((task) => task.roadmapTaskKey))
 
@@ -189,6 +242,10 @@ export function validateRoadmapTasks(tasks: RoadmapSyncTaskInput[]): RoadmapVali
     ...buildDuplicateIssues(tasks),
     ...buildDependencyIssues(tasks, roadmapTaskKeys),
     ...buildCircularDependencyIssues(tasks, roadmapTaskKeys),
+    // Project固有のstructured constraintの有無に依存しない**常時**検証として置く。
+    // `buildDisallowedPathIssues()`は`allowed_path_prefixes`が宣言されたProjectでしか
+    // 動かないため、そちらへ相乗りさせると今回のケース（制約宣言なし）を拾えない。
+    ...buildNonRelativePathIssues(tasks),
   ]
 }
 
