@@ -3047,6 +3047,88 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `test.js` は未変更、verify.js baseline も FAIL のままだった。
    異常検出 → 安全停止 → 状態保全 → 原因特定可能 → 正規手段で再開、は満たしている。
 
+<!-- roadmap:id=implement-acceptance-criteria-not-mechanically-verified state=planned -->
+0. [ ] **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**
+   （2026-09-11登録、**高優先度**。Production E2E test 9 で実害として観測。
+   continuation / quarantine の修正には混ぜない）。
+
+   **内容**: implement Job の SafeCommand は `kind: 'test'`（= `node test.js` / `pnpm test`）
+   固定であり、Task の `acceptanceCriteria` に書かれた検証コマンドは**一切実行されない**。
+   その結果、受入条件を満たさない成果物でも Job は `success` になる。
+
+   **実測（2026-09-11, Production E2E test 9 / task-001 の 1 回目）**:
+   受入条件は「先頭行が `// Executed: YYYY-MM-DDTHH:mm:ssZ` 形式」「`node verify.js 1` が
+   exit code 0 で PASS」だったが、実装は次を出力した:
+   ```
+   // 2026-09-11T14:04:56+09:00     ← `Executed: ` 欠落、UTC `Z` ではなく `+09:00`
+   ```
+   `node verify.js 1` は exit 1（FAIL）。それでも `node test.js` は README を見るだけなので
+   通り、**Job は success** になった。
+
+   **救ったのは review**: 後続の review Job が同じ 2 点（書式違反 / `verify.js` の実行証跡なし）を
+   指摘して `changes_requested` を返し、`repair:` Job が正しい形へ修正した。
+   系としては自己回復したが、**最後の砦が LLM レビュー1枚**という状態である。
+
+   **リスク**: review が甘い判定をした場合、受入条件を満たさない変更がそのまま
+   Approval Gate へ進む。CEO は「レビュー済み」として承認することになる。
+
+   **対応方針（MVP後）**: 新しい Gate は作らない。既存の SafeCommand 機構の中で、
+   Task の受入条件に現れる検証コマンドを implement Job の判定に反映できないか検討する。
+   最小案としては「受入条件に実行可能なコマンドが含まれる場合、それを SafeCommand として
+   実行し、失敗したら Job を success にしない」。
+
+<!-- roadmap:id=outbox-blocked-critical-false-alarm state=planned -->
+0. [ ] **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**
+   （2026-09-11登録、**中優先度**。Production E2E test 9 で観測）。
+
+   **内容**: commit 成功時に continuation が pending だと `PATCH /api/jobs/:id` は
+   **意図的に非 2xx（503）を返す**。Worker は Outbox イベントを保持して poll cycle ごとに
+   再送し、continuation が完了したら 200 を受けて解消する — これは設計どおりの正常系である。
+
+   ところが `notifyOutboxDeliveryBlocked()` は pending が **3 cycle** 続いた時点で
+   CRITICAL 通知を上げる。Task の design review を伴う continuation は 30 秒前後かかり、
+   poll 間隔が 5 秒なので **正常系で容易に 3 cycle を超える**。
+
+   **実測（2026-09-11）**:
+   ```
+   15:12:57  PATCH failed after retries → persisted in Outbox
+   15:13:02 / 15:13:09 / 15:13:15   Pending Outbox events remain
+   15:13:17  [CRITICAL] Worker Outbox resend is blocked
+             New Job intake is paused until delivery succeeds
+   15:13:22 / 15:13:28              Pending Outbox events remain
+   15:13:33  Task 2 implement 開始（= 正常に完了した）
+   ```
+
+   **リスク**: 障害でないのに CRITICAL が鳴り続けると、本番で通知が信用されなくなる
+   （狼少年）。実際この E2E では「Job intake is paused」という文面が出ているが、
+   実際には 36 秒後に正常へ復帰している。
+
+   **対応方針（MVP後）**: 新しい通知機構は作らない。既存の閾値・文面の調整で足りるはず。
+   continuation 起因の 503 滞留を「想定内」として区別できるか、あるいは閾値を
+   design review の所要時間より長くするか。
+
+<!-- roadmap:id=review-structured-output-schema-strictness state=planned -->
+0. [ ] **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**
+   （2026-09-11登録、**中優先度**。Production E2E test 8 で観測。test 9 では再発せず）。
+
+   **内容**: review 結果のスキーマは `rule: string` を必須にしている
+   （`packages/shared/src/types/approvalLevel.ts:52`）。レビューモデルが findings の一部に
+   `"rule": null` を出力すると strict validation が弾き、Job が
+   `Structured review output failed strict schema validation (fail-closed)` で failed になる。
+
+   **fail-closed 自体は正しい**（解釈できないレビューを承認扱いにしない）。
+   問題は、**そこから先の復旧経路が無かった**こと。test 8 では review 失敗により
+   Task 1 の実装成果が未コミットのまま残り、以後の通常 Job が clean worktree 要件で
+   quarantine され、UI から復旧不能になった。
+   → その復旧不能性は `quarantine recovery` として別途 MVP-BLOCKING で扱う。
+
+   **断続的**: test 5 / test 7 / test 9 の review は同じ経路で成功している。
+   findings を伴うレビューで出やすい可能性があるが、test 9 は findings ありで成功したため
+   確定していない。
+
+   **対応方針（MVP後）**: `rule` を optional にするか、parse 前に `null` を除去/正規化するか。
+   いずれも既存スキーマの調整で足り、新しい仕組みは不要。
+
 <!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
 0. [ ] **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**
    （2026-09-10登録。PR #136 のIndependent Reviewで指摘。
