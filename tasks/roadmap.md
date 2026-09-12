@@ -3174,6 +3174,34 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    最小案としては「受入条件に実行可能なコマンドが含まれる場合、それを SafeCommand として
    実行し、失敗したら Job を success にしない」。
 
+   ### CEO判断（2026-09-11）: **MVP blocker にしない。MVP後へ defer。高優先度は維持**
+
+   **defer の根拠（read-only 調査で確認した構造）**:
+   - implement success から commit への**直通経路が無い**。`git_commit` Job が作られるのは
+     `approved && isAutomaticReviewJob` のときだけ（`apps/api/src/routes/jobs.ts`）
+   - review は必ず通る。結果は3分岐し、いずれも安全側:
+     approved → commit / changes_requested → `repair:` / structured result 無し → **escalate（PR #150）**
+   - review プロンプトには `acceptanceCriteria` が JSON で明示的に渡っている
+     （`apps/worker/src/jobRunner.ts:232`。diff / changedFiles / SafeCommand 結果と併記）
+   - review failure は fail-closed
+   - `git_commit` にはさらに CEO Approval Gate がある（二段目の人間ゲート）
+   - **実測**: Production E2E test 9 で、書式違反（`Executed:` 欠落 / `+09:00`）の成果物を
+     review が実際に検出して `changes_requested` を返し、`repair:` Job が自動修正して PASS した
+
+   したがって残るリスクは**構造的な穴ではなく review LLM の判断品質**であり、MVP 完成を阻害しない。
+
+   **A / B は現時点では実装しない（CEO判断）**: 特に A（`CommandKind` に `verify` を追加して
+   `pnpm run verify` へ解決）は **repo 単位**であり、**Task 固有の acceptance criteria を
+   十分に表現できないため本質解決にならない**。
+
+   **MVP後の第一候補は C**: 既存 review prompt を最小変更で強化し、「acceptance criteria に
+   実行可能な検証条件が含まれる場合、その実行証跡が無ければ approved にしない」ことを明示する。
+   コード変更は prompt 文字列に限定される。
+
+   **将来、機械保証が必要になった場合**: natural-language acceptance criteria と
+   executable verification を**型として分離する**設計を別途検討する。現行の
+   `acceptanceCriteria: string[]` は両者を区別せず、「テストが通る」（roadmapGenerator の
+   サンプル値）と「`node verify.js 1` が exit 0」が同じ型・同じ扱いになっている。
 <!-- roadmap:id=outbox-blocked-critical-false-alarm state=planned -->
 0. [ ] **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**
    （2026-09-11登録、**中優先度**。Production E2E test 9 で観測）。
