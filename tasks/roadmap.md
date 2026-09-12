@@ -3197,10 +3197,10 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / HEAD 未解決 /
    各検出の失敗時 fail-closed / 候補複数時の fail-closed / poll cost）である。
 
-<!-- roadmap:id=m3-final-production-e2e state=planned -->
-0. [ ] **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
+<!-- roadmap:id=m3-final-production-e2e state=done -->
+0. [x] **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）** — **PASS（2026-09-13）**
    （2026-09-13登録、**MVP-BLOCKING**。これが PASS するまで
-   `TEMP_MVP_COMPLETION_POLICY` を削除しない）。
+   `TEMP_MVP_COMPLETION_POLICY` を削除しない、としていた条件を満たした）。
 
    **要件**（すべて満たすこと）:
    - 実アプリから新規 Project Start
@@ -3221,6 +3221,17 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **その run で掘り当てた MVP-BLOCKING 2件は修正済み**:
    `approval-expired-waiting-blocks-resume`（PR #156）と
    `done-task-stale-blocked-job-owns-workspace`（PR #158）。
+
+   **PASS（2026-09-13, Project `ec7d5e1f`）**: 要件6項目すべてを Production で実測した。
+   Roadmap Generator が `task-001`（phase 1 / `allowedPaths=["checks.js"]`）と
+   `task-002`（phase 2 / `deps=[task-001]` / `allowedPaths=["test.js"]`）を自力で生成し、
+   手動 Task 追加は無い。CEO 操作は `approval-20260912-1958c3e1` の承認1回のみ。
+   承認後、**Task 1 commit 成功（`8dfaf33`）から Task 2 Approval Gate 到達まで 101 秒**を
+   すべて backend 駆動で通過した（continuation `7ae7d9e0` → Task 2 initial-implement →
+   review → git_commit blocked → 新 Approval Request `cf65df28` が waiting 一覧に出現）。
+   **手動 resume は 0**: `resume:` / `repair:` / `retry:` Job はいずれも 0 件、
+   API ログの `/resume` リクエストも 0 件。
+   記録: `docs/project_memory/decisions/m3_final_production_e2e.md`。
 
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
@@ -3631,14 +3642,27 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 **MVP完成宣言前の必須クリーンアップ（MVP必須5項目とは別枠。最後に実施する）:**
 
-<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=planned -->
-- [ ] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — MVP完成宣言の**直前**に、期限付き方針
+<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=done -->
+- [x] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — **完了（2026-09-13）**。MVP完成宣言の**直前**に、期限付き方針
       `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章 と `CLAUDE.md` 冒頭のポインタ段落）を
       共通指示から完全に削除し、repository全文検索で共通開発指示として残っていないことを確認し、
       削除commitをMVP completionに含める。
       **完了条件・手順の正本**: `specs/10_mvp_scope.md` 12章「TEMP_MVP_COMPLETION_POLICY cleanup」。
       **このcleanupが完了するまでMVPを「完成」と記録しない。**
       一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。
+
+      **完了（2026-09-13）**: M3 最終 Production E2E の PASS を受けて実施した。
+      (1) `AGENTS.md` 0章を `<!-- TEMP_MVP_COMPLETION_POLICY:BEGIN -->`〜`:END -->` マーカーごと削除。
+      (2) `CLAUDE.md` 冒頭のポインタ段落を削除。
+      (3) repository 全文検索で、共通開発指示として残っていないことを確認した。
+      残存は `specs/10_mvp_scope.md` 12章（cleanup 手順そのもの＝完了記録付き）、
+      `docs/project_memory/decisions/` の履歴、本 `tasks/roadmap.md` の完了記録のみで、
+      いずれも手順3が明示的に「履歴であり削除不要」としている区分に当たる。
+      一時ポリシーの内容は Design Philosophy・一般開発原則へ転記していない。
+
+      **確認方法**: 本項目は箇条書き（`- [ ]`）のため parser から見えず、
+      `roadmap check` の自動確認対象に入らない。項目自身の指示どおり**手動で確認**した。
+      整形（`- [ ]` → 番号付き）は既存の CEO 判断どおり M4 着手前に行う。
 
       **本項目は MVP Exit Criteria である（CEO 訂正・2026-09-10）。「MVP後へ延期」ではない。**
       Exit 必須条件として維持するのは次の3点:
