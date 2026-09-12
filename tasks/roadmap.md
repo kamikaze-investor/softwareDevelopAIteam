@@ -3642,14 +3642,27 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 **MVP完成宣言前の必須クリーンアップ（MVP必須5項目とは別枠。最後に実施する）:**
 
-<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=planned -->
-- [ ] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — MVP完成宣言の**直前**に、期限付き方針
+<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=done -->
+- [x] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — **完了（2026-09-13）**。MVP完成宣言の**直前**に、期限付き方針
       `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章 と `CLAUDE.md` 冒頭のポインタ段落）を
       共通指示から完全に削除し、repository全文検索で共通開発指示として残っていないことを確認し、
       削除commitをMVP completionに含める。
       **完了条件・手順の正本**: `specs/10_mvp_scope.md` 12章「TEMP_MVP_COMPLETION_POLICY cleanup」。
       **このcleanupが完了するまでMVPを「完成」と記録しない。**
       一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。
+
+      **完了（2026-09-13）**: M3 最終 Production E2E の PASS を受けて実施した。
+      (1) `AGENTS.md` 0章を `<!-- TEMP_MVP_COMPLETION_POLICY:BEGIN -->`〜`:END -->` マーカーごと削除。
+      (2) `CLAUDE.md` 冒頭のポインタ段落を削除。
+      (3) repository 全文検索で、共通開発指示として残っていないことを確認した。
+      残存は `specs/10_mvp_scope.md` 12章（cleanup 手順そのもの＝完了記録付き）、
+      `docs/project_memory/decisions/` の履歴、本 `tasks/roadmap.md` の完了記録のみで、
+      いずれも手順3が明示的に「履歴であり削除不要」としている区分に当たる。
+      一時ポリシーの内容は Design Philosophy・一般開発原則へ転記していない。
+
+      **確認方法**: 本項目は箇条書き（`- [ ]`）のため parser から見えず、
+      `roadmap check` の自動確認対象に入らない。項目自身の指示どおり**手動で確認**した。
+      整形（`- [ ]` → 番号付き）は既存の CEO 判断どおり M4 着手前に行う。
 
       **本項目は MVP Exit Criteria である（CEO 訂正・2026-09-10）。「MVP後へ延期」ではない。**
       Exit 必須条件として維持するのは次の3点:

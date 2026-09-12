@@ -244,6 +244,20 @@ MVP完成宣言の**直前**に、期限付き方針 `TEMP_MVP_COMPLETION_POLICY
 
 **このcleanupが完了するまで、MVPを「完成」と記録しない。**
 
+### 実施記録（2026-09-13 — 完了）
+
+M3 最終 Production E2E（`docs/project_memory/decisions/m3_final_production_e2e.md`）の PASS を
+受けて、上記1〜4を実施した。
+
+- 1: `AGENTS.md` 0章を BEGIN/END マーカーごと削除した
+- 2: `CLAUDE.md` 冒頭のポインタ段落を削除した
+- 3: 全文検索で、共通開発指示としての残存が無いことを確認した。残るのは本章（手順と本記録）、
+  `docs/project_memory/decisions/` の履歴、`tasks/roadmap.md` の完了記録のみで、
+  いずれも手順3が「履歴であり削除不要」とした区分に当たる
+- 4: 削除commitを MVP completion に含めた
+
+一時ポリシーの内容は Design Philosophy・一般開発原則へ転記していない。
+
 一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。MVP後に残すべき
 原則がある場合は、一時ポリシーとは切り離して別途判断する。
 
