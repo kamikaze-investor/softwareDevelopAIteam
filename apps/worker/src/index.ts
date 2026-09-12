@@ -29,8 +29,11 @@ import {
   WorkspaceReconciliationError,
 } from './jobRunner.js'
 import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
+import { getCommitHash } from './jobRunner.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
+import { buildWorktreeManifest } from './guards/changeManifest.js'
+import { TARGET_ROOT } from './utils/pathUtils.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
 import { sendAlert } from './notifier/notifier.js'
@@ -94,6 +97,54 @@ function isInitialImplementStepKey(taskId: string, workflowStepKey: string | und
   return workflowStepKey === `task:${taskId}:initial-implement`
 }
 
+/**
+ * 共有 workspace の所有権判定。
+ *
+ * **既存条件が最優先**（`kind: 'owner'`）。running / blocked / initial-implement 以外の queued
+ * Job を持つ Task がいれば、その Task が従来どおり所有者であり、以下の fallback は評価しない。
+ *
+ * **fallback（M1-a）**: 既存条件で所有者が見つからないときだけ worktree を1回だけ read-only で
+ * 観測する。PR #150 以降、review が structured result を返せず escalate された Task は
+ * Job が `failed`・Task が `blocked` になる。この dirty は `resume:` が正統に継承するため
+ * **掃除してはならない**が、`failed` Job は既存の所有者条件に入らないため所有者不在になり、
+ * Worker は次の Task へ進んでその initial-implement が clean worktree 要件で死んでいた。
+ *
+ * そこで「現に dirty が残っており、それを durable な attribution で説明でき、かつ
+ * repair/retry/resume が継承しうる blocked Task」を fallback 所有者として扱う。
+ *
+ * `changedFiles` と `failureMetadata.workspaceState` は **cleanup より前に確定する**ため
+ * 「今も dirty か」を表さない（revert 済みでも `changed` のまま）。したがって現在の dirty は
+ * worktree の実観測でしか判定できない。観測は「今も残っているか」にだけ使い、
+ * **帰属は既存の durable な `job.changedFiles`** で行う。新しい永続 state は追加しない。
+ *
+ * 候補が複数ある場合は attribution が曖昧なので、**任意に1件を選ばず fail-closed** にする
+ * （`kind: 'ambiguous'`）。この cycle では誰も claim しない。
+ *
+ * ---
+ * **既知の制約（CEO 受容済み / 2026-09-12）— content identity は証明しない**
+ *
+ * この fallback は `current HEAD` + `current dirty paths` + durable な `job.changedFiles`
+ * までで帰属を判定する。**dirty の内容そのものが当該 Job のものか**は証明しない。
+ * 証明するには per-path content hash など新しい永続 state が必要で、M1-a では追加しない。
+ *
+ * したがって次の誤判定が起こりうる: blocked Task の変更を **HEAD を動かさずに**手動 revert し、
+ * その後で人間が **同じ path だけ**を別内容で編集した場合、元の Task を owner と誤認する。
+ *
+ * 影響は安全側に倒れる:
+ * - 他 Task はその cycle で claim せず停止する（説明のつかない dirty がある以上、
+ *   停止自体は本来正しい挙動であり、進めても clean worktree 要件で失敗するだけ）。
+ * - 本判定は **cleanup には一切使わない**。誤判定だけでデータが削除されることはない。
+ * - ただし owner Task の `resume:` が out-of-band な手動編集を引き継ぐ可能性は残る。
+ *
+ * よって MVP では **active / blocked な target workspace を人間が直接編集しない**ことを
+ * 運用境界（非対応）とする。ledger: `workspace-ownership-content-identity`。
+ */
+export type WorkspaceOwnership =
+  | { kind: 'none' }
+  | { kind: 'owner', taskId: string }
+  | { kind: 'ambiguous' }
+
+/** 既存の所有者条件（挙動を変えない）。 */
 function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
   for (const { task, jobs } of perTask) {
     const owns = jobs.some((job) => (
@@ -104,6 +155,87 @@ function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }
     if (owns) return task.id
   }
   return undefined
+}
+
+/**
+ * repair / retry / resume が今後この Task の dirty を継承しうるか。
+ *
+ * quarantine されている Task は `resumeBlockedTask()` が fail-closed で拒否するため
+ * 継承先が無い。それは本 fallback の対象ではなく、別 Finding（quarantine 復旧）の領域なので
+ * ここでは候補にしない。
+ */
+function canInheritDirtyWorkspace(jobs: readonly Job[]): boolean {
+  return !jobs.some((job) => job.failureMetadata?.quarantined === true)
+}
+
+export function resolveWorkspaceOwnership(
+  perTask: readonly { task: Task; jobs: Job[] }[],
+  workingDir: string = TARGET_ROOT,
+  readDirtyPaths: (dir: string) => readonly string[] = (dir) => buildWorktreeManifest(dir).paths,
+  readHead: (dir: string) => string | undefined = getCommitHash,
+): WorkspaceOwnership {
+  const existing = findWorkspaceOwningTaskId(perTask)
+  if (existing !== undefined) return { kind: 'owner', taskId: existing }
+
+  // blocked Task が1つも無ければ worktree を読む必要すら無い。
+  const blockedTasks = perTask.filter(({ task }) => task.status === 'blocked')
+  if (blockedTasks.length === 0) return { kind: 'none' }
+
+  let dirtyPaths: ReadonlySet<string>
+  try {
+    dirtyPaths = new Set(readDirtyPaths(workingDir))
+  } catch (err: unknown) {
+    // workspace を観測できないなら「dirty が無い」とみなしてはいけない。
+    // 誰も claim しない側へ倒す（どのみち claim しても computeWorkspaceBaseline が fail-closed する）。
+    console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
+    return { kind: 'ambiguous' }
+  }
+  if (dirtyPaths.size === 0) return { kind: 'none' }
+
+  // 独立レビュー指摘（CLAIM 7）: `changedFiles` は**過去の記録**であり、同じ path が今 dirty でも
+  // 「その dirty がその Job のものだ」とは限らない。path 一致だけで owner を決めると、
+  // 既にコミット済み/戻し済みの Task を誤って owner にできてしまう。2段で絞る。
+  //
+  // (a) その Job の baseline commit が現在の HEAD と一致すること。
+  //     一致しなければ、その Job 以降に何かがコミットされており、記録された dirty は
+  //     もう worktree 上の同じものではない（= 帰属を主張できない）。
+  //     baseline が無い Job も帰属を証明できないので候補にしない（fail-closed）。
+  const head = readHead(workingDir)
+  const ownsRecordedDirt = (job: Job): boolean => (
+    head !== undefined &&
+    job.workspaceBaseline?.startCommitHash === head &&
+    (job.changedFiles ?? []).some((path) => dirtyPaths.has(path))
+  )
+
+  const candidates = blockedTasks.filter(({ jobs }) => (
+    canInheritDirtyWorkspace(jobs) && jobs.some(ownsRecordedDirt)
+  ))
+
+  // (b) 現在の dirty が候補の記録で**すべて説明できる**こと。説明できない path が1つでも
+  //     あれば、由来不明の変更（人手・別経路）が混ざっている。任意に owner を決めず fail-closed。
+  if (candidates.length === 1) {
+    const explained = new Set(
+      candidates[0].jobs.filter(ownsRecordedDirt).flatMap((job) => job.changedFiles ?? []),
+    )
+    const unexplained = [...dirtyPaths].filter((path) => !explained.has(path))
+    if (unexplained.length > 0) {
+      console.warn(
+        `[Worker] dirty workspace に帰属不明の変更が含まれます ` +
+        `(${unexplained.slice(0, 5).join(', ')})。owner を決めず claim を見送ります。`,
+      )
+      return { kind: 'ambiguous' }
+    }
+  }
+
+  if (candidates.length === 0) return { kind: 'none' }
+  if (candidates.length > 1) {
+    console.warn(
+      `[Worker] dirty workspace の帰属が複数 Task に一致しました ` +
+      `(${candidates.map(({ task }) => task.id).join(', ')})。任意に選ばず claim を見送ります。`,
+    )
+    return { kind: 'ambiguous' }
+  }
+  return { kind: 'owner', taskId: candidates[0].task.id }
 }
 
 export async function fetchQueuedJob(): Promise<QueuedWork | null> {
@@ -124,10 +256,12 @@ export async function fetchQueuedJob(): Promise<QueuedWork | null> {
     }
   }
 
-  const workspaceOwnerTaskId = findWorkspaceOwningTaskId(perTask)
+  const ownership = resolveWorkspaceOwnership(perTask)
+  // attribution が曖昧なときは誰も claim しない（fail-closed）。
+  if (ownership.kind === 'ambiguous') return null
 
   for (const { task, jobs } of perTask) {
-    if (workspaceOwnerTaskId !== undefined && workspaceOwnerTaskId !== task.id) continue
+    if (ownership.kind === 'owner' && ownership.taskId !== task.id) continue
 
     const queued = jobs.find((job) => job.status === 'queued')
     if (queued) return { job: queued, task, jobs }

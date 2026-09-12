@@ -1813,7 +1813,7 @@ function requireCommitHash(workingDir: string): string {
   return hash
 }
 
-function getCommitHash(workingDir: string): string | undefined {
+export function getCommitHash(workingDir: string): string | undefined {
   try {
     return execFileSync('git', ['rev-parse', 'HEAD'], {
       cwd: workingDir,
