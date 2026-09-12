@@ -2885,6 +2885,12 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    これは異常系であり、`AGENTS.md` 0章の異常系水準「既存の正規手段で再開または復旧できる」を
    Mobile の Task 詳細「追加指示して再開」で満たしている。MVP後の改善対象とする。
 
+   **訂正（2026-09-12, 実測）**: 直上の「Mobile の Task 詳細『追加指示して再開』で満たしている」は
+   **`WAITING_FOR_USER` のまま期限切れになった場合には成立しない**。期限切れ行は
+   `findWaiting()` から除外されて Mobile の承認画面に出ず、かつ `resumeBlockedTask()` が
+   status だけを見て resume を拒否するため、スマホからは一切復旧できなかった。
+   詳細と修正は `approval-expired-waiting-blocks-resume` を参照。
+
    **本Findingで実際に行った作業**: production code は変更していない。既存挙動を固定する
    回帰テスト `apps/api/src/routes/approvalAutoResumeLiveness.test.ts`（8件）を追加した。
    実route（`PATCH /api/approval-requests/:id/status`）経由で、承認だけで queued へ戻ること、
@@ -3118,6 +3124,48 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **再現証拠**: Production E2E test 8（`733643fe`）を失敗記録として保持している。
    quarantine 済み Job `01de09fc` と `quarantineReason` がそのまま残っており、
    本 Finding の実機再現材料として参照できる。
+
+<!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
+0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
+   — 完了（2026-09-13）
+   （2026-09-12登録、**MVP-BLOCKING（CEO判断）**。M3 Production E2E の準備中に Production で
+   実際に発生し、M3 が開始できなくなったことで発覚）。
+
+   **内容**: `expiresAt` は参照時の遅延判定で、期限切れ行を掃除する actor は存在しない。
+   そのため `WAITING_FOR_USER` のまま 24h 経過すると、次の3つが同時に成立して Task が
+   **スマホから一切復旧できなくなる**（Design Philosophy 1「スマホ完結」に抵触）。
+   1. `findWaiting()` が `expires_at > now` で除外するため、`GET /api/approval-requests/waiting`
+      に出ない = Mobile の承認画面から承認ボタンへ到達できない
+   2. `approveAndResumeJob()` は期限切れを `EXPIRED` として拒否する（正しい fail-closed）
+   3. `resumeBlockedTask()` が status だけを見て「承認待ち」として resume を拒否する
+   行を `EXPIRED` へ進める actor が居ないため、2 も 3 も永久に成立し続ける。
+
+   **Production 実測（2026-09-12）**: Project「Production E2E test 10」の Task `1d50d5d7` が
+   `review:…:git-commit` Job `e60ba617` で blocked。承認 `approval-20260911-63d33155` は
+   `WAITING_FOR_USER` / `expires_at=2026-09-12T08:31:31Z`（当時 14:45Z = 6時間超過）。
+   同時刻の `GET /api/approval-requests/waiting` は **0 件**を返した。
+
+   **修正（最小・1条件）**: `resumeBlockedTask()` の「有効な承認待ち」を**未期限の**
+   `WAITING_FOR_USER` だけに限定した（`apps/api/src/storage/sqlite.ts`）。
+   期限切れ承認は resume を妨げない。resume は Approval Gate を迂回せず、新 Job が
+   `/gate/check` で**新しい** Approval Request を発行し、CEO が Mobile から承認する
+   正規経路へ戻す。
+
+   **やっていないこと（CEO 指示）**: expired approval の自動承認／Approval Gate の迂回／
+   古い approval 行の force delete／新 daemon・reaper・scheduler の追加／
+   「押しても必ず失敗する expired approval」の Mobile 再表示／共通 expiry 処理への拡張。
+
+   **適用範囲（独立レビュー CLAIM 5 を受けて明示）**: この条件は git_commit 分岐より手前にあるため、
+   **非 git_commit（AI CLI）の resume にも等しく効く。これは意図した適用範囲である** —— 罠は
+   `requestedAction` ではなく「期限切れ行を `EXPIRED` へ進める actor が居ない」ことに由来し、
+   非 git_commit の承認待ち（`POST /api/approval-requests` 由来）でも同じく復旧不能になるため。
+   迂回にはならない: 非 git_commit では Design Review evidence 判定が閉じたまま（test 11、
+   runner は差し替え済みで外部呼び出しをしない）、git_commit では Gate 再実行が新しい
+   Approval Request を要求する（test 3・4・8）。
+
+   **回帰テスト**: `apps/api/src/routes/resumeExpiredApproval.test.ts`（13件）。
+   修正を外すと 8 件が落ち、既存挙動を固定する 5 件（未期限 WAITING / APPROVED / REJECTED /
+   期限切れ APPROVED / 非 git_commit の未期限 WAITING）は修正の有無にかかわらず通ることを確認済み。
 
 <!-- roadmap:id=orphan-dirty-workspace-no-owner state=deferred -->
 0. [ ] **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**

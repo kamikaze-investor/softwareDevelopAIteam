@@ -1841,7 +1841,31 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         ).get(taskId) as any
         const latestApproval = latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined
 
-        if (latestApproval?.status === 'WAITING_FOR_USER') {
+        // 有効な承認待ちがあるうちは resume しない（承認と resume の二重駆動を避ける）。
+        //
+        // ただし `WAITING_FOR_USER` は**期限切れでも行として残る**（expiry は参照時の遅延判定で、
+        // 定期的に掃除する actor はいない）。期限切れまで「承認待ち」として扱うと、Task は
+        // どこからも復旧できなくなる:
+        //   - `GET /api/approval-requests/waiting` は `findWaiting()` が `expires_at > now` で
+        //     除外するため、Mobile の承認画面に出ない = CEO は承認ボタンに到達できない
+        //   - `approveAndResumeJob()` は期限切れを `EXPIRED` として拒否する（正しい fail-closed）
+        //   - つまり行を `EXPIRED` へ進める actor が居らず、resume も永久に拒否され続ける
+        // 2026-09-12 に Production で実際にこの状態に入った（Job は blocked、承認一覧は 0 件）。
+        //
+        // したがって「有効な承認待ち」は **未期限の `WAITING_FOR_USER` だけ**とする。
+        //
+        // この判定は git_commit 分岐より手前にあるため、**非 git_commit（AI CLI）の resume にも
+        // 等しく効く。これは意図した適用範囲である** —— 罠は `requestedAction` ではなく
+        // 「期限切れ行を `EXPIRED` へ進める actor が居ない」ことに由来しており、非 git_commit の
+        // 承認待ち（`POST /api/approval-requests` 由来）でも同じく復旧不能になるため。
+        // 迂回にはならない: この門を通しても下流の門はそのまま効く。
+        // `resumeExpiredApproval.test.ts` で固定している内訳は
+        //   - 非 git_commit の Design Review evidence 判定が閉じたままであること: test 11
+        //   - git_commit が Gate 再実行で新しい Approval Request を要求すること: test 3・4・8
+        // 期限切れの承認は resume を妨げない。resume は Approval Gate を迂回せず、
+        // 古い行を承認・削除もしない: 新 Job が `/gate/check` で**新しい**Approval Request を
+        // 発行し、CEO が Mobile からそれを承認する、という正規経路へ戻すだけである。
+        if (latestApproval?.status === 'WAITING_FOR_USER' && new Date(latestApproval.expiresAt) > new Date(now())) {
           return { ok: false, reason: 'The latest approval request is waiting for user review' }
         }
 
