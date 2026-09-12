@@ -30,6 +30,12 @@ vi.mock('./guards/changeManifest.js', async (importOriginal) => ({
   buildWorktreeManifest: manifestMocks.buildWorktreeManifest,
 }))
 
+const gitOpMocks = vi.hoisted(() => ({ detectGitOperationState: vi.fn() }))
+vi.mock('./guards/gitOperationState.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./guards/gitOperationState.js')>()),
+  detectGitOperationState: gitOpMocks.detectGitOperationState,
+}))
+
 const outboxMocks = vi.hoisted(() => ({
   recordPending: vi.fn(), deletePending: vi.fn(), resendPending: vi.fn(), hasPending: vi.fn(),
 }))
@@ -67,9 +73,15 @@ function job(id: string, taskId: string, overrides: Partial<Job> = {}): Job {
   }
 }
 
-/** dirty path を注入して所有権だけを判定する（ファイルシステムに触れない）。 */
-function resolve(perTask: Array<{ task: Task; jobs: Job[] }>, dirtyPaths: string[]) {
-  return resolveWorkspaceOwnership(perTask, '/workspace/target', () => dirtyPaths, () => HEAD)
+/** dirty path と進行中 git 操作を注入して所有権だけを判定する（ファイルシステムに触れない）。 */
+function resolve(
+  perTask: Array<{ task: Task; jobs: Job[] }>,
+  dirtyPaths: string[],
+  gitOperations: string[] = [],
+) {
+  return resolveWorkspaceOwnership(
+    perTask, '/workspace/target', () => dirtyPaths, () => HEAD, () => gitOperations,
+  )
 }
 
 /**
@@ -135,6 +147,8 @@ beforeEach(() => {
   manifestMocks.buildWorktreeManifest.mockReturnValue({ paths: [], changes: [] })
   jobRunnerMocks.getCommitHash.mockReset()
   jobRunnerMocks.getCommitHash.mockReturnValue(HEAD)
+  gitOpMocks.detectGitOperationState.mockReset()
+  gitOpMocks.detectGitOperationState.mockReturnValue([])
   outboxMocks.hasPending.mockReturnValue(false)
   vi.spyOn(console, 'warn').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -222,6 +236,50 @@ describe('dirty が残っている間は手放さない（durable な自己申�
     expect(resolve(perTask, ['test.js'])).toEqual({ kind: 'ambiguous' })
   })
 
+  /**
+   * 独立レビュー指摘（CLAIM 19）: `computeWorkspaceBaseline()` は manifest を読む**前に**
+   * `detectGitOperationState()` で fail-closed する。manifest が空でも `index.lock` /
+   * `MERGE_HEAD` / rebase 途中が残っていれば次の Task は始められないため、
+   * そこで手放すと所有者不在のまま後続 Task が必ず落ちる。
+   */
+  it('manifest が空でも進行中の git 操作があれば owner を維持する（admission と同じ clean 定義）', () => {
+    const done = task('task-done', { status: 'done' })
+    const perTask = [
+      { task: done, jobs: [job('stale-blocked', done.id, { status: 'blocked' })] },
+    ]
+
+    expect(resolve(perTask, [], ['MERGE_HEAD'])).toEqual({ kind: 'owner', taskId: 'task-done' })
+  })
+
+  it('git 操作の検出に失敗した場合も「無い」とみなさず owner を維持する', () => {
+    const done = task('task-done', { status: 'done' })
+    const perTask = [
+      { task: done, jobs: [job('stale-blocked', done.id, { status: 'blocked' })] },
+    ]
+
+    const result = resolveWorkspaceOwnership(
+      perTask, '/workspace/target', () => [], () => HEAD,
+      () => { throw new Error('git status failed') },
+    )
+
+    expect(result).toEqual({ kind: 'owner', taskId: 'task-done' })
+  })
+
+  it('進行中の git 操作の確認は manifest が空のときだけ行う（dirty なら呼ばない）', () => {
+    const done = task('task-done', { status: 'done' })
+    const perTask = [
+      { task: done, jobs: [job('stale-blocked', done.id, { status: 'blocked' })] },
+    ]
+
+    const readGitOps = vi.fn(() => [] as string[])
+    const result = resolveWorkspaceOwnership(
+      perTask, '/workspace/target', () => ['test.js'], () => HEAD, readGitOps,
+    )
+
+    expect(result).toEqual({ kind: 'owner', taskId: 'task-done' })
+    expect(readGitOps).not.toHaveBeenCalled()
+  })
+
   it('worktree を観測できない場合は「dirty 無し」とみなさず fail-closed', () => {
     const done = task('task-done', { status: 'done' })
     const perTask = [
@@ -230,7 +288,7 @@ describe('dirty が残っている間は手放さない（durable な自己申�
 
     const result = resolveWorkspaceOwnership(perTask, '/workspace/target', () => {
       throw new Error('git failed')
-    }, () => HEAD)
+    }, () => HEAD, () => [])
 
     expect(result).toEqual({ kind: 'ambiguous' })
   })
@@ -266,7 +324,7 @@ describe('quarantine された blocked Job は worktree が clean でも手放�
     ]
 
     const readDirty = vi.fn(() => [] as string[])
-    const result = resolveWorkspaceOwnership(perTask, '/workspace/target', readDirty, () => HEAD)
+    const result = resolveWorkspaceOwnership(perTask, '/workspace/target', readDirty, () => HEAD, () => [])
 
     expect(result).toEqual({ kind: 'owner', taskId: 'task-done' })
     expect(readDirty).not.toHaveBeenCalled()
@@ -281,7 +339,7 @@ describe('running / queued の判定は変更していない', () => {
     ]
 
     const readDirty = vi.fn(() => [] as string[])
-    const result = resolveWorkspaceOwnership(perTask, '/workspace/target', readDirty, () => HEAD)
+    const result = resolveWorkspaceOwnership(perTask, '/workspace/target', readDirty, () => HEAD, () => [])
 
     expect(result).toEqual({ kind: 'owner', taskId: 'task-done' })
     expect(readDirty).not.toHaveBeenCalled()
@@ -320,7 +378,7 @@ describe('running / queued の判定は変更していない', () => {
     ]
 
     const readDirty = vi.fn(() => [] as string[])
-    const result = resolveWorkspaceOwnership(perTask, '/workspace/target', readDirty, () => HEAD)
+    const result = resolveWorkspaceOwnership(perTask, '/workspace/target', readDirty, () => HEAD, () => [])
 
     expect(result).toEqual({ kind: 'owner', taskId: 'task-pending' })
     expect(readDirty).not.toHaveBeenCalled()
@@ -508,7 +566,10 @@ describe('fetchQueuedJob: clean になれば running Project でも所有権を�
     expect(manifestMocks.buildWorktreeManifest).not.toHaveBeenCalled()
   })
 
-  it('poll cost: 滞留行の解決に要る観測は 1 cycle あたり最大1回', async () => {
+  // 注: これは**所有権判定が行う観測**の回数。claim 後の
+  // `computeWorkspaceBaseline()` は admission のために別途 manifest を読むので、
+  // poll cycle 全体としては 1 回ではない（それは本 PR 以前からの既存挙動）。
+  it('poll cost: 所有権判定が行う worktree 観測は 1 cycle あたり最大1回', async () => {
     const done = task('task-1', { status: 'done' })
     const next = task('task-2')
     mockApi([done, next], {

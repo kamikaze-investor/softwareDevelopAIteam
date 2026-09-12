@@ -33,6 +33,7 @@ import { getCommitHash } from './jobRunner.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildWorktreeManifest } from './guards/changeManifest.js'
+import { detectGitOperationState } from './guards/gitOperationState.js'
 import { TARGET_ROOT } from './utils/pathUtils.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
@@ -204,11 +205,37 @@ function canInheritDirtyWorkspace(jobs: readonly Job[]): boolean {
   return !jobs.some((job) => job.failureMetadata?.quarantined === true)
 }
 
+/**
+ * 取り残された blocked 行が所有権を手放してよいか。
+ *
+ * 判定は **admission（`computeWorkspaceBaseline()`）と同じ clean の定義**にそろえる。
+ * admission は manifest を読む**前に** `detectGitOperationState()` で fail-closed するため、
+ * manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中が残っていれば次の Task は始められない。
+ * ここで手放すと所有者不在のまま後続 Task が必ず落ちるので、両方を満たすまで保持する。
+ *
+ * git 操作の検出に失敗した場合も「無い」とみなさず保持する（fail-closed）。
+ * 検出は manifest が空のときだけ行うので、通常の cycle には追加コストが乗らない。
+ */
+function isReleasableForNextTask(
+  workingDir: string,
+  dirtyPaths: ReadonlySet<string>,
+  readGitOperations: (dir: string) => readonly string[],
+): boolean {
+  if (dirtyPaths.size > 0) return false
+  try {
+    return readGitOperations(workingDir).length === 0
+  } catch (err: unknown) {
+    console.error(`[Worker] git 操作状態を確認できないため所有権を保持します: ${formatUnknownError(err)}`)
+    return false
+  }
+}
+
 export function resolveWorkspaceOwnership(
   perTask: readonly { task: Task; jobs: Job[] }[],
   workingDir: string = TARGET_ROOT,
   readDirtyPaths: (dir: string) => readonly string[] = (dir) => buildWorktreeManifest(dir).paths,
   readHead: (dir: string) => string | undefined = getCommitHash,
+  readGitOperations: (dir: string) => readonly string[] = detectGitOperationState,
 ): WorkspaceOwnership {
   const existing = findWorkspaceOwningTaskId(perTask)
   if (existing !== undefined) return { kind: 'owner', taskId: existing }
@@ -231,13 +258,18 @@ export function resolveWorkspaceOwnership(
     console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
     return { kind: 'ambiguous' }
   }
-  // 取り残された blocked 行は、dirty が残っている間だけ所有者として振る舞う。
-  // clean なら「その Task の変更はもう worktree に無い」ので所有権を手放す
-  // （archive / pause を人手で行わなくても自然に解放される）。
+  // 取り残された blocked 行は、workspace がまだ使用中の間だけ所有者として振る舞う。
+  // 手放してよいのは「次の Task が実際に始められる状態」になったときだけなので、
+  // **admission（`computeWorkspaceBaseline()`）と同じ clean の定義**を使う:
+  //   - worktree に差分が無いこと（manifest が空）
+  //   - **進行中の git 操作が無いこと**（`detectGitOperationState()`）
+  // manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中などが残っていれば
+  // admission は fail-closed する。そこで手放すと、後続 Task の initial-implement が
+  // 必ず失敗する（所有者不在のまま Task だけが落ちる）。両方を満たすまで保持する。
+  //
   // dirty なら由来を問わず保持する: commit 後に残った差分でも、外部から `done` にされただけの
-  // Task の未 commit 変更でも、手放すと後続 Task の initial-implement が clean worktree 要件で
-  // 死ぬため、保持が安全側である。
-  if (dirtyPaths.size > 0 && staleOwners.length > 0) {
+  // Task の未 commit 変更でも、保持が安全側である。
+  if (staleOwners.length > 0 && !isReleasableForNextTask(workingDir, dirtyPaths, readGitOperations)) {
     if (staleOwners.length > 1) return { kind: 'ambiguous' }
     return { kind: 'owner', taskId: staleOwners[0].task.id }
   }

@@ -3148,9 +3148,17 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `9a9c9423`/`7a014347`（E2E確認用プロジェクト9）。
 
    **修正（最小）**: 「終わった Task に取り残された blocked 行」は所有権を**無条件には**持たず、
-   **worktree がまだ dirty な間だけ**所有者として振る舞う。clean になれば自然に手放す。
+   **workspace がまだ使用中の間だけ**所有者として振る舞う。手放してよい状態になれば自然に解放する。
    候補条件は (1) Task が `done` (2) その blocked Job が quarantine されていない の2つだけで、
    解放するか否かは worktree の実観測が決める。
+
+   **解放条件は admission と同じ定義にそろえる（独立レビュー round 3 の指摘）**:
+   `computeWorkspaceBaseline()` は manifest を読む**前に** `detectGitOperationState()` で
+   fail-closed する。したがって manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中が
+   残っていれば次の Task は始められない。manifest の空だけで手放すと、所有者不在のまま後続 Task の
+   initial-implement が必ず失敗する。そこで解放条件を「manifest が空 **かつ** 進行中の git 操作が
+   無い」とした。git 操作の検出に失敗した場合も「無い」とみなさず保持する（fail-closed）。
+   検出は manifest が空のときだけ行うので、通常の cycle に追加コストは乗らない。
    `running` / `queued` の判定、cleanup / quarantine / resume / repair の条件は一切変更していない。
 
    **durable な自己申告を信用しない（独立レビュー round 1・2 の指摘）**: 当初案は
@@ -3169,19 +3177,24 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    （PR-C の hard invariant「安全と証明できない限り所有権を解放しない」を優先）。
    この場合は worktree を観測せずに owner を確定する。
 
-   **poll cost**: 観測が必要なのは「強い owner が居ない かつ 滞留候補または blocked Task が居る」
-   cycle だけで、その場合も `buildWorktreeManifest()` は最大1回。通常の poll では観測しない
-   （M1-a で確立した性質をそのまま維持している）。
+   **poll cost**: **所有権判定が行う**観測は「強い owner が居ない かつ 滞留候補または
+   blocked Task が居る」cycle だけで、その場合も `buildWorktreeManifest()` は最大1回
+   （M1-a で確立した性質をそのまま維持している）。強い owner が居る cycle では一切観測しない。
+   なお claim 後の `computeWorkspaceBaseline()` は admission のために別途 manifest を読むため、
+   **poll cycle 全体としては 1 回ではない**。これは本項目以前からの既存挙動で、変更していない。
 
    **旧 blocked 行は残したまま**にしている。行を残すのは既存設計で
    `resumeBlockedGitCommitJob.test.ts` が固定しており、監査証跡でもあるため、
    行には触れず**所有権の述語だけ**を直した。
-   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（36件）。
-   上記 Production 4件を fixture として使用している。修正を外すと 15 件が落ち、
-   既存挙動を固定する 21 件（running / queued / pending / blocked / quarantine /
-   initial-implement / M1-a fallback / resume・repair 中の dirty / 外部 PATCH で done に
-   されただけ + dirty / commit 後の残差 dirty / 観測失敗時の fail-closed / 候補複数時の
-   fail-closed / poll cost）は修正の有無にかかわらず通る。
+   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（39件）。
+   上記 Production 4件を fixture として使用している。修正を外すと 15 件が落ち、残り 24 件は
+   修正の有無にかかわらず通る。後者には既存挙動の固定（running / queued / pending / blocked /
+   quarantine / initial-implement / M1-a fallback / resume・repair 中の dirty / 強い owner が
+   居る cycle では観測しない）に加え、新しい分岐が成立したときの保持側の挙動
+   （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / git 操作検出の失敗 /
+   候補複数時の fail-closed / 観測失敗時の fail-closed）が含まれる。
+   後者は「修正を外しても通る」= 保持側なので落ちない、という意味であり、
+   新分岐そのものの検証は前者 15 件が担う。
 
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
