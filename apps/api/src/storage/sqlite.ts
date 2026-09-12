@@ -1853,6 +1853,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 2026-09-12 に Production で実際にこの状態に入った（Job は blocked、承認一覧は 0 件）。
         //
         // したがって「有効な承認待ち」は **未期限の `WAITING_FOR_USER` だけ**とする。
+        //
+        // この判定は git_commit 分岐より手前にあるため、**非 git_commit（AI CLI）の resume にも
+        // 等しく効く。これは意図した適用範囲である** —— 罠は `requestedAction` ではなく
+        // 「期限切れ行を `EXPIRED` へ進める actor が居ない」ことに由来しており、非 git_commit の
+        // 承認待ち（`POST /api/approval-requests` 由来）でも同じく復旧不能になるため。
+        // 迂回にはならない: 下流の Design Review evidence 判定も、再実行される Gate も
+        // そのまま効き続ける（`resumeExpiredApproval.test.ts` の 9〜11 で固定）。
         // 期限切れの承認は resume を妨げない。resume は Approval Gate を迂回せず、
         // 古い行を承認・削除もしない: 新 Job が `/gate/check` で**新しい**Approval Request を
         // 発行し、CEO が Mobile からそれを承認する、という正規経路へ戻すだけである。

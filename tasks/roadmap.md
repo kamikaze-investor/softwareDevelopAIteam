@@ -3155,9 +3155,15 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    古い approval 行の force delete／新 daemon・reaper・scheduler の追加／
    「押しても必ず失敗する expired approval」の Mobile 再表示／共通 expiry 処理への拡張。
 
-   **回帰テスト**: `apps/api/src/routes/resumeExpiredApproval.test.ts`（10件）。
-   修正を外すと 6 件が落ち、既存挙動を固定する 4 件（未期限 WAITING / APPROVED / REJECTED /
-   期限切れ APPROVED）は修正の有無にかかわらず通ることを確認済み。
+   **適用範囲（独立レビュー CLAIM 5 を受けて明示）**: この条件は git_commit 分岐より手前にあるため、
+   **非 git_commit（AI CLI）の resume にも等しく効く。これは意図した適用範囲である** —— 罠は
+   `requestedAction` ではなく「期限切れ行を `EXPIRED` へ進める actor が居ない」ことに由来し、
+   非 git_commit の承認待ち（`POST /api/approval-requests` 由来）でも同じく復旧不能になるため。
+   迂回にはならず、下流の Design Review evidence 判定も再実行される Gate もそのまま効く。
+
+   **回帰テスト**: `apps/api/src/routes/resumeExpiredApproval.test.ts`（13件）。
+   修正を外すと 8 件が落ち、既存挙動を固定する 5 件（未期限 WAITING / APPROVED / REJECTED /
+   期限切れ APPROVED / 非 git_commit の未期限 WAITING）は修正の有無にかかわらず通ることを確認済み。
 
 <!-- roadmap:id=orphan-dirty-workspace-no-owner state=deferred -->
 0. [ ] **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**

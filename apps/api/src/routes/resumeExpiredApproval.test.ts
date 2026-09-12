@@ -126,6 +126,47 @@ async function createBlockedGitCommitJobWithWaitingApproval(
   return { job, approval }
 }
 
+/**
+ * 非 git_commit（AI CLI）の blocked Job と、それに紐づく `WAITING_FOR_USER` Approval を用意する。
+ *
+ * 非 git_commit の Approval Request は `POST /api/approval-requests` から作られる
+ * （`requestedAction: 'git_commit'` はそこでは拒否され、`/gate/check` 専用）。
+ * こちらも `expiresAt` はサーバー計算なので、期限切れ行は storage を直接使って再現する。
+ */
+async function createBlockedAiCliJobWithWaitingApproval(
+  task: Task,
+  expiresInMs: number,
+  aiCliMode: 'implement' | 'review' = 'review',
+): Promise<{ job: Job; approval: ApprovalRequest }> {
+  const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
+
+  const job = storage.jobs.create({
+    taskId: task.id,
+    projectId: task.projectId,
+    agentRole: 'developer_ai',
+    status: 'blocked',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target', params: {} },
+    aiCliProvider: 'claude_code',
+    aiCliMode,
+    aiCliPrompt: 'original prompt',
+  })
+
+  const approval = storage.approvalRequests.create({
+    taskId: task.id,
+    targetBranch: 'master',
+    targetCommit: 'commit-at-request-time',
+    targetDiffHash: 'diff-at-request-time',
+    riskLevel: 'HIGH',
+    requestedAction: 'test',
+    status: 'WAITING_FOR_USER',
+    expiresAt: new Date(Date.now() + expiresInMs).toISOString(),
+    invalidIf: [],
+  })
+
+  return { job, approval }
+}
+
 async function resumeTask(app: FastifyInstance, taskId: string): Promise<{ statusCode: number; body: unknown }> {
   const res = await app.inject({
     method: 'POST',
@@ -401,6 +442,64 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       expect(waiting[0].id).toBe(gate.approvalRequest?.id)
       expect(waiting[0].id).not.toBe(expired.id)
       expect(waiting[0].status).toBe('WAITING_FOR_USER')
+    })
+  })
+  /**
+   * 独立レビュー指摘（CLAIM 5）: この条件は git_commit 分岐より**手前**にあるため、
+   * 非 git_commit（AI CLI）の resume にも効く。これは意図した挙動である —— 罠は
+   * `requestedAction` ではなく「期限切れ行を EXPIRED へ進める actor が居ない」ことに
+   * 由来しており、非 git_commit でも同じく復旧不能になるため。
+   * 迂回が起きていないこと（Gate・Design Review evidence が依然として効くこと）を固定する。
+   */
+  it('9. non-git_commit path: an expired waiting approval likewise stops blocking resume', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { approval: expired } = await createBlockedAiCliJobWithWaitingApproval(task, -1 * HOUR)
+
+      const { statusCode, body } = await resumeTask(app, task.id)
+
+      expect(statusCode).toBe(201)
+      const resumedJob = body as Job
+      expect(resumedJob.status).toBe('queued')
+      expect(resumedJob.aiCliMode).toBe('review')
+      expect(resumedJob.approvalId).toBeUndefined()
+
+      // 古い行は自動承認も削除もされない。
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().approvalRequests.findById(expired.id)?.status).toBe('WAITING_FOR_USER')
+    })
+  })
+
+  it('10. non-git_commit path: a NON-expired waiting approval still blocks resume', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      await createBlockedAiCliJobWithWaitingApproval(task, 30 * 60 * 1000)
+
+      const { statusCode, body } = await resumeTask(app, task.id)
+
+      expect(statusCode).toBe(400)
+      expect((body as { error?: string }).error).toContain('waiting for user review')
+    })
+  })
+
+  it('11. non-git_commit path: an expired approval does NOT bypass the Design Review gate', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      // implement モードは Design Review evidence を要求する。evidence は用意しない。
+      await createBlockedAiCliJobWithWaitingApproval(task, -1 * HOUR, 'implement')
+
+      const { statusCode, body } = await resumeTask(app, task.id)
+
+      // 承認待ちの門は通っても、Design Review の門で fail-closed のまま止まる。
+      // route は resume 指示文を再レビューし、evidence が登録できなければ 409 を返す。
+      expect(statusCode).toBe(409)
+      expect((body as { error?: string }).error).toContain('Design Review')
+
+      const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
+      expect(parseBody<Job[]>(jobsRes.body).filter((j) => j.status === 'queued')).toHaveLength(0)
     })
   })
 })
