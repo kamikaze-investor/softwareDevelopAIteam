@@ -3125,6 +3125,78 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    quarantine 済み Job `01de09fc` と `quarantineReason` がそのまま残っており、
    本 Finding の実機再現材料として参照できる。
 
+<!-- roadmap:id=done-task-stale-blocked-job-owns-workspace state=done -->
+0. [x] **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける** — 完了（2026-09-13）
+   （2026-09-12登録、**MVP-BLOCKING（CEO判断）**。`approval-expired-waiting-blocks-resume` の
+   修正を Production で検証した直後に発覚。commit は成功したのに後続が進まなかった）。
+
+   **内容**: `findWorkspaceOwningTaskId()`（`apps/worker/src/index.ts`）は Job の status だけで
+   所有者を決め、**Task の status を一切見ていなかった**。`resumeBlockedTask()` は新しい Job を
+   別行として作り、旧 `blocked` 行を監査証跡として残す（`approveAndResumeJob()` は同一行を
+   `blocked -> queued` へ UPDATE するので滞留しない）。そのため resume 経路でだけ
+   「`done` Task に blocked 行が残る」状態が生まれ、所有権が永久に解放されなかった。
+
+   **実害**: 期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が解放されず、
+   後続 Task / Project が進まない。解放手段が **archive / pause しか無い**状態は
+   Design Philosophy 1「スマホ完結」を満たさない。
+
+   **Production 実測（2026-09-12）**: 同一形状が **4件**。いずれも
+   `review:…:git-commit` の blocked 行 + より新しい Job 1件で、いずれも archived / paused。
+   つまり過去の run はすべて archive/pause でしか解放されていなかった。
+   `1d50d5d7`/`e60ba617`（Production E2E test 10）、`240d1949`/`9b1789e2`（Phase1b Approval Level
+   較正検証用）、`3a1aff17`/`83041277`（Phase1 Shadow Gate 検証用）、
+   `9a9c9423`/`7a014347`（E2E確認用プロジェクト9）。
+
+   **修正（最小）**: 「終わった Task に取り残された blocked 行」は所有権を**無条件には**持たず、
+   **workspace がまだ使用中の間だけ**所有者として振る舞う。手放してよい状態になれば自然に解放する。
+   候補条件は (1) Task が `done` (2) その blocked Job が quarantine されていない の2つだけで、
+   解放するか否かは worktree の実観測が決める。
+
+   **解放条件は admission の拒否条件すべてにそろえる（独立レビュー round 3・4・5 の指摘）**:
+   `computeWorkspaceBaseline()` が clean を拒否する条件は3つあり、どれか1つでも成立していれば
+   次の Task は始められない。manifest の空だけで手放すと、所有者不在のまま後続 Task の
+   initial-implement が必ず失敗する。そこで解放条件を次の3つすべてとした:
+   1. manifest が空
+   2. 進行中の git 操作が無い（`detectGitOperationState()`。manifest を読む**前に**判定される。
+      `index.lock` / `MERGE_HEAD` / rebase 途中など）
+   3. HEAD を解決できる（`requireCommitHash()` と同じく undefined と空文字の両方を拒否）
+   2・3 の確認に失敗した場合も「問題無し」とみなさず保持する（fail-closed）。
+   2・3 は manifest が空のときだけ行うので、通常の cycle に追加コストは乗らない。
+   `running` / `queued` の判定、cleanup / quarantine / resume / repair の条件は一切変更していない。
+
+   **durable な自己申告を信用しない（独立レビュー round 1・2 の指摘）**: 当初案は
+   `task.status === 'done'` だけを、次案は `commitHash` + `createdAt` の追い越しを条件にしたが、
+   **どれも「もう dirty が無い」ことの証明にならない**ことが判明した。
+   - `task.status` は `PATCH /api/tasks/:id` が検証なしで書き込む（`apps/api/src/routes/tasks.ts`）
+   - `job.commitHash` は `PATCH /api/jobs/:id` が検証なしで受け取る（`apps/api/src/routes/jobs.ts`）。
+     逆に commit 後・永続化前に落ちれば欠ける
+   - `createdAt` の大小は因果順ではない（clock skew で逆転しうる）
+   - 正当な commit でも、commit 後に残る差分（post-commit dirt）はありうる
+   いずれの経路でも、誤って手放すと後続 Task の initial-implement が clean worktree 要件で死ぬ。
+   そこで判定を durable state から **worktree の実観測**へ移した。dirty なら由来を問わず保持する
+   （安全側）。これにより上記4経路はすべて構造的に無効化される。
+
+   **例外**: quarantine された blocked Job は worktree が clean でも所有権を維持する
+   （PR-C の hard invariant「安全と証明できない限り所有権を解放しない」を優先）。
+   この場合は worktree を観測せずに owner を確定する。
+
+   **poll cost**: **所有権判定が行う**観測は「強い owner が居ない かつ 滞留候補または
+   blocked Task が居る」cycle だけで、その場合も `buildWorktreeManifest()` は最大1回
+   （M1-a で確立した性質をそのまま維持している）。強い owner が居る cycle では一切観測しない。
+   なお claim 後の `computeWorkspaceBaseline()` は admission のために別途 manifest を読むため、
+   **poll cycle 全体としては 1 回ではない**。これは本項目以前からの既存挙動で、変更していない。
+
+   **旧 blocked 行は残したまま**にしている。行を残すのは既存設計で
+   `resumeBlockedGitCommitJob.test.ts` が固定しており、監査証跡でもあるため、
+   行には触れず**所有権の述語だけ**を直した。
+   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（41件）。
+   上記 Production 4件を fixture として使用している。**修正を外すと 15 件が落ちる**
+   （解放側 = 本項目が直した挙動）。残りは既存挙動の固定（running / queued / pending /
+   blocked / quarantine / initial-implement / M1-a fallback / resume・repair 中の dirty /
+   強い owner が居る cycle では観測しない）と、保持側の新分岐
+   （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / HEAD 未解決 /
+   各検出の失敗時 fail-closed / 候補複数時の fail-closed / poll cost）である。
+
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
    — 完了（2026-09-13）

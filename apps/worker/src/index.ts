@@ -33,6 +33,7 @@ import { getCommitHash } from './jobRunner.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildWorktreeManifest } from './guards/changeManifest.js'
+import { detectGitOperationState } from './guards/gitOperationState.js'
 import { TARGET_ROOT } from './utils/pathUtils.js'
 import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
@@ -144,12 +145,48 @@ export type WorkspaceOwnership =
   | { kind: 'owner', taskId: string }
   | { kind: 'ambiguous' }
 
-/** 既存の所有者条件（挙動を変えない）。 */
+/**
+ * この blocked 行は「終わった Task に取り残された行」の候補か。
+ *
+ * `resumeBlockedTask()` は新しい Job を**別行**として作り、旧 `blocked` 行を監査証跡として
+ * 残す（`approveAndResumeJob()` は同一行を `blocked -> queued` へ UPDATE するので滞留しない）。
+ * そのため resume 経路でだけ「終わった Task に blocked 行が残る」状態が生まれ、
+ * その行が workspace 所有権を永久に握り続けていた。
+ *
+ * **ここは「候補」しか決めない。解放するかどうかは worktree の実観測で決める。**
+ * durable な自己申告はどれも「もう dirty が無い」ことの証明にならないため:
+ *   - `task.status` は `PATCH /api/tasks/:id` が検証なしで書き込める
+ *     （`apps/api/src/routes/tasks.ts`）
+ *   - `job.commitHash` は `PATCH /api/jobs/:id` が検証なしで受け取る
+ *     （`apps/api/src/routes/jobs.ts`）。逆に commit 後・永続化前に落ちれば欠ける
+ *   - `createdAt` の大小は因果順ではない（clock skew で逆転しうる）
+ * 実際に dirty が残っていないかは worktree を見るしかないので、そうする。
+ *
+ * quarantine された行は候補にしない。PR-C の hard invariant
+ * 「安全と証明できない限り所有権を解放しない」を優先し、worktree が clean でも保持する。
+ */
+function isStaleBlockedJobOfFinishedTask(task: Task, job: Job): boolean {
+  return (
+    job.status === 'blocked' &&
+    task.status === 'done' &&
+    job.failureMetadata?.quarantined !== true
+  )
+}
+
+/**
+ * 無条件に workspace を保有する条件。`running` / `queued` の判定は変更していない。
+ *
+ * blocked Job も原則としてここに入るが、`isStaleBlockedJobOfFinishedTask()` に当たる行だけは
+ * ここでは確定させず、`resolveWorkspaceOwnership()` が worktree を観測してから決める。
+ *
+ * 旧 blocked 行そのものには触れない。行を残すのは既存設計で
+ * `resumeBlockedGitCommitJob.test.ts` が固定しているため、所有権の述語だけを直す。
+ */
 function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
   for (const { task, jobs } of perTask) {
     const owns = jobs.some((job) => (
       job.status === 'running' ||
-      job.status === 'blocked' ||
+      (job.status === 'blocked' && !isStaleBlockedJobOfFinishedTask(task, job)) ||
       (job.status === 'queued' && !isInitialImplementStepKey(task.id, job.workflowStepKey))
     ))
     if (owns) return task.id
@@ -168,18 +205,57 @@ function canInheritDirtyWorkspace(jobs: readonly Job[]): boolean {
   return !jobs.some((job) => job.failureMetadata?.quarantined === true)
 }
 
+/**
+ * 取り残された blocked 行が所有権を手放してよいか。
+ *
+ * 判定は **admission（`computeWorkspaceBaseline()`）が clean を拒否する条件すべて**にそろえる。
+ * admission が拒否するのに所有権を手放すと、所有者不在のまま後続 Task の initial-implement が
+ * 必ず落ちるため、admission が通らない状態では保持し続ける。admission の拒否条件は3つ:
+ *
+ *   1. 進行中の git 操作がある（`detectGitOperationState()`。manifest を読む**前に**判定される）
+ *      → manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中なら次の Task は始められない
+ *   2. HEAD を解決できない（`requireCommitHash()`。unborn / 読めない HEAD / 空文字）
+ *   3. manifest が空でない（clean worktree 要件）
+ *
+ * 1 と 2 の検出に失敗した場合も「問題無し」とみなさず保持する（fail-closed）。
+ * 1 と 2 は manifest が空のときだけ確認するので、通常の cycle には追加コストが乗らない。
+ */
+function isReleasableForNextTask(
+  workingDir: string,
+  dirtyPaths: ReadonlySet<string>,
+  readGitOperations: (dir: string) => readonly string[],
+  readHead: (dir: string) => string | undefined,
+): boolean {
+  if (dirtyPaths.size > 0) return false
+  try {
+    if (readGitOperations(workingDir).length > 0) return false
+    // `requireCommitHash()` は undefined と空文字の両方を拒否する。同じ判定にそろえる。
+    const head = readHead(workingDir)
+    return head !== undefined && head !== ''
+  } catch (err: unknown) {
+    console.error(`[Worker] workspace の解放可否を確認できないため所有権を保持します: ${formatUnknownError(err)}`)
+    return false
+  }
+}
+
 export function resolveWorkspaceOwnership(
   perTask: readonly { task: Task; jobs: Job[] }[],
   workingDir: string = TARGET_ROOT,
   readDirtyPaths: (dir: string) => readonly string[] = (dir) => buildWorktreeManifest(dir).paths,
   readHead: (dir: string) => string | undefined = getCommitHash,
+  readGitOperations: (dir: string) => readonly string[] = detectGitOperationState,
 ): WorkspaceOwnership {
   const existing = findWorkspaceOwningTaskId(perTask)
   if (existing !== undefined) return { kind: 'owner', taskId: existing }
 
-  // blocked Task が1つも無ければ worktree を読む必要すら無い。
+  // 終わった Task に取り残された blocked 行。次の Task をまだ始められない間だけ所有権を保持する。
+  const staleOwners = perTask.filter(({ task, jobs }) => (
+    jobs.some((job) => isStaleBlockedJobOfFinishedTask(task, job))
+  ))
+
+  // 観測が要るのは fallback 候補がある場合だけ。通常の poll では worktree を読まない。
   const blockedTasks = perTask.filter(({ task }) => task.status === 'blocked')
-  if (blockedTasks.length === 0) return { kind: 'none' }
+  if (blockedTasks.length === 0 && staleOwners.length === 0) return { kind: 'none' }
 
   let dirtyPaths: ReadonlySet<string>
   try {
@@ -190,6 +266,23 @@ export function resolveWorkspaceOwnership(
     console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
     return { kind: 'ambiguous' }
   }
+  // 取り残された blocked 行は、次の Task をまだ始められない間だけ所有者として振る舞う。
+  // 手放してよいのは「次の Task が実際に始められる状態」になったときだけなので、
+  // **admission（`computeWorkspaceBaseline()`）と同じ clean の定義**を使う:
+  //   - worktree に差分が無いこと（manifest が空）
+  //   - **進行中の git 操作が無いこと**（`detectGitOperationState()`）
+  //   - **HEAD を解決できること**（`requireCommitHash()` 相当）
+  // manifest が空でも git 操作の途中や unborn HEAD なら admission は fail-closed する。
+  // そこで手放すと、後続 Task の initial-implement が必ず失敗する
+  // （所有者不在のまま Task だけが落ちる）。3つすべてを満たすまで保持する。
+  //
+  // dirty なら由来を問わず保持する: commit 後に残った差分でも、外部から `done` にされただけの
+  // Task の未 commit 変更でも、保持が安全側である。
+  if (staleOwners.length > 0 && !isReleasableForNextTask(workingDir, dirtyPaths, readGitOperations, readHead)) {
+    if (staleOwners.length > 1) return { kind: 'ambiguous' }
+    return { kind: 'owner', taskId: staleOwners[0].task.id }
+  }
+
   if (dirtyPaths.size === 0) return { kind: 'none' }
 
   // 独立レビュー指摘（CLAIM 7）: `changedFiles` は**過去の記録**であり、同じ path が今 dirty でも
