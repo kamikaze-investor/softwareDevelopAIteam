@@ -3197,10 +3197,10 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / HEAD 未解決 /
    各検出の失敗時 fail-closed / 候補複数時の fail-closed / poll cost）である。
 
-<!-- roadmap:id=m3-final-production-e2e state=planned -->
-0. [ ] **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
+<!-- roadmap:id=m3-final-production-e2e state=done -->
+0. [x] **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）** — **PASS（2026-09-13）**
    （2026-09-13登録、**MVP-BLOCKING**。これが PASS するまで
-   `TEMP_MVP_COMPLETION_POLICY` を削除しない）。
+   `TEMP_MVP_COMPLETION_POLICY` を削除しない、としていた条件を満たした）。
 
    **要件**（すべて満たすこと）:
    - 実アプリから新規 Project Start
@@ -3221,6 +3221,17 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **その run で掘り当てた MVP-BLOCKING 2件は修正済み**:
    `approval-expired-waiting-blocks-resume`（PR #156）と
    `done-task-stale-blocked-job-owns-workspace`（PR #158）。
+
+   **PASS（2026-09-13, Project `ec7d5e1f`）**: 要件6項目すべてを Production で実測した。
+   Roadmap Generator が `task-001`（phase 1 / `allowedPaths=["checks.js"]`）と
+   `task-002`（phase 2 / `deps=[task-001]` / `allowedPaths=["test.js"]`）を自力で生成し、
+   手動 Task 追加は無い。CEO 操作は `approval-20260912-1958c3e1` の承認1回のみ。
+   承認後、**Task 1 commit 成功（`8dfaf33`）から Task 2 Approval Gate 到達まで 101 秒**を
+   すべて backend 駆動で通過した（continuation `7ae7d9e0` → Task 2 initial-implement →
+   review → git_commit blocked → 新 Approval Request `cf65df28` が waiting 一覧に出現）。
+   **手動 resume は 0**: `resume:` / `repair:` / `retry:` Job はいずれも 0 件、
+   API ログの `/resume` リクエストも 0 件。
+   記録: `docs/project_memory/decisions/m3_final_production_e2e.md`。
 
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
