@@ -2900,8 +2900,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    増えないこと、REJECTED では queued へ戻らないこと、未承認なら blocked のままであることを
    固定した。**M3 の production E2E で「手動 resume なし」を実測して最終確認する。**
 
-<!-- roadmap:id=workspace-dirty-leakage-cleanup state=planned -->
-0. [ ] **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
+<!-- roadmap:id=workspace-dirty-leakage-cleanup state=done -->
+0. [x] **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
+   — **完了（2026-09-11, PR #148 / commit `2759a76`）。予防側のみで、治療側は別項目。**
    （2026-09-11登録。**MVP blocker = M1**。P1 completion handoff が
    「この cluster には open な owner 項目が無い」と指摘していた root cause の正式な owner 項目。
    root cause の記述自体は `project-auto-task-job-chain`（done）の本文に残っているが、
@@ -2980,6 +2981,14 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    触らない）。「帰属不能な変更は削除しない」制約に従うと、そこで消せるものは無い。
    この経路の復旧は既存の正規手段（Mobile Task詳細「追加指示して再開」→ `resume:` Job は
    INTENTIONALLY-DIRTY なので dirty 上で実行できる）で完結し、**人間の手動 git 操作は要らない**。
+
+   **本項目が閉じた範囲と、閉じていない範囲（2026-09-13 追記）**: 本項目は **予防**
+   （escalate 確定時に、その Job に帰属する変更を残さない）だけを閉じた。**治療**
+   （既に dirty / quarantine になってしまった Task を復旧する）は別項目である:
+   `quarantined-dirty-task-generic-recovery`（quarantine 済み Task の復旧・**open**）、
+   `orphan-dirty-workspace-no-owner`（M1-b・帰属不能な orphan dirty・MVP後 defer）、
+   および review 失敗経路の予防を担う PR #150 `review-failure-escalation-gap`。
+   本項目の done をもって「dirty workspace 問題が解決した」と読まないこと。
 
    **検証**: `apps/worker/src/workspaceEscalationCleanup.test.ts`（8件・実 git リポジトリ）で
    「escalate 後に `computeWorkspaceBaseline()` が次の normal Job を admission できる」
