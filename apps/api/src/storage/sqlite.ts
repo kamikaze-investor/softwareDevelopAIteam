@@ -1858,8 +1858,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 等しく効く。これは意図した適用範囲である** —— 罠は `requestedAction` ではなく
         // 「期限切れ行を `EXPIRED` へ進める actor が居ない」ことに由来しており、非 git_commit の
         // 承認待ち（`POST /api/approval-requests` 由来）でも同じく復旧不能になるため。
-        // 迂回にはならない: 下流の Design Review evidence 判定も、再実行される Gate も
-        // そのまま効き続ける（`resumeExpiredApproval.test.ts` の 9〜11 で固定）。
+        // 迂回にはならない: この門を通しても下流の門はそのまま効く。
+        // `resumeExpiredApproval.test.ts` で固定している内訳は
+        //   - 非 git_commit の Design Review evidence 判定が閉じたままであること: test 11
+        //   - git_commit が Gate 再実行で新しい Approval Request を要求すること: test 3・4・8
         // 期限切れの承認は resume を妨げない。resume は Approval Gate を迂回せず、
         // 古い行を承認・削除もしない: 新 Job が `/gate/check` で**新しい**Approval Request を
         // 発行し、CEO が Mobile からそれを承認する、という正規経路へ戻すだけである。

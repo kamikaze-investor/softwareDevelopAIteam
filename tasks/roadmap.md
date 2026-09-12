@@ -3159,7 +3159,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **非 git_commit（AI CLI）の resume にも等しく効く。これは意図した適用範囲である** —— 罠は
    `requestedAction` ではなく「期限切れ行を `EXPIRED` へ進める actor が居ない」ことに由来し、
    非 git_commit の承認待ち（`POST /api/approval-requests` 由来）でも同じく復旧不能になるため。
-   迂回にはならず、下流の Design Review evidence 判定も再実行される Gate もそのまま効く。
+   迂回にはならない: 非 git_commit では Design Review evidence 判定が閉じたまま（test 11、
+   runner は差し替え済みで外部呼び出しをしない）、git_commit では Gate 再実行が新しい
+   Approval Request を要求する（test 3・4・8）。
 
    **回帰テスト**: `apps/api/src/routes/resumeExpiredApproval.test.ts`（13件）。
    修正を外すと 8 件が落ち、既存挙動を固定する 5 件（未期限 WAITING / APPROVED / REJECTED /

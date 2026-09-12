@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Job, Project, Task } from '@ai-team/shared'
 
 /**
@@ -17,7 +17,10 @@ import type { ApprovalRequest, Job, Project, Task } from '@ai-team/shared'
  * expired approval を自動承認せず、Approval Gate も迂回せず、古い行も削除しない。
  */
 
-async function buildApp(): Promise<FastifyInstance> {
+/** `taskRoutes` の options（Design Review deps の差し替えに使う）。 */
+type TaskRouteOptions = Parameters<typeof import('./tasks.js').taskRoutes>[1]
+
+async function buildApp(taskRouteOptions?: TaskRouteOptions): Promise<FastifyInstance> {
   process.env.DB_PATH = ':memory:'
 
   const [{ approvalGateRoutes }, { taskRoutes }, { jobRoutes }, { resetStorage }] = await Promise.all([
@@ -31,14 +34,17 @@ async function buildApp(): Promise<FastifyInstance> {
 
   const app = Fastify()
   app.register(approvalGateRoutes, { prefix: '/api' })
-  app.register(taskRoutes, { prefix: '/api/tasks' })
+  app.register(taskRoutes, { ...(taskRouteOptions ?? {}), prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app
 }
 
-async function withApp(run: (app: FastifyInstance) => Promise<void>): Promise<void> {
-  const app = await buildApp()
+async function withApp(
+  run: (app: FastifyInstance) => Promise<void>,
+  taskRouteOptions?: TaskRouteOptions,
+): Promise<void> {
+  const app = await buildApp(taskRouteOptions)
   try {
     await run(app)
   } finally {
@@ -485,6 +491,17 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
   })
 
   it('11. non-git_commit path: an expired approval does NOT bypass the Design Review gate', async () => {
+    // Design Review runner は外部プロセスなので必ず差し替える（テストを環境依存にしない）。
+    // CONFLICT を返させ、evidence が登録されない = 門が閉じたままであることを決定的に再現する。
+    const execute = vi.fn(async () => ({
+      ok: true,
+      stdout: JSON.stringify({
+        focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }],
+        integrationReviewResult: { decision: 'CONFLICT' },
+      }),
+      timedOut: false,
+    }))
+
     await withApp(async (app) => {
       const project = await createProject()
       const task = await createTask(project.id)
@@ -497,9 +514,18 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       // route は resume 指示文を再レビューし、evidence が登録できなければ 409 を返す。
       expect(statusCode).toBe(409)
       expect((body as { error?: string }).error).toContain('Design Review')
+      expect(execute).toHaveBeenCalledTimes(1)
 
       const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
       expect(parseBody<Job[]>(jobsRes.body).filter((j) => j.status === 'queued')).toHaveLength(0)
+    }, {
+      resumeDesignReviewDeps: {
+        runnerCommand: 'mock',
+        runnerArgs: [],
+        homeDirectory: '/tmp',
+        workingDir: '/tmp',
+        execute,
+      },
     })
   })
 })
