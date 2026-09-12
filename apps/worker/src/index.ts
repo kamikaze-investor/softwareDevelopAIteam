@@ -144,12 +144,34 @@ export type WorkspaceOwnership =
   | { kind: 'owner', taskId: string }
   | { kind: 'ambiguous' }
 
-/** 既存の所有者条件（挙動を変えない）。 */
+/**
+ * 既存の所有者条件。`running` / `queued` の判定は変更していない。
+ *
+ * **blocked Job は原則として所有者だが、その Task が `done` なら所有者から外す。**
+ * Task が `done` になるのは commit 適用トランザクション内の1箇所だけ（`git_commit` 成功時）で、
+ * `done` は「その Task の変更は commit 済み＝保留中の dirty は無い」を意味する。
+ * したがって done Task の blocked 行は、もう workspace を代表していない。
+ *
+ * この行が残るのは `resumeBlockedTask()` が**新しい Job を別行として作り、旧 blocked 行を
+ * 監査証跡としてそのまま残す**ためである（`approveAndResumeJob()` は同一行を
+ * `blocked -> queued` へ UPDATE するので滞留しない）。つまり滞留は resume 経路でだけ起きる。
+ * 旧行を残すこと自体は既存設計であり `resumeBlockedGitCommitJob.test.ts` が固定しているので、
+ * 行には触れず**所有権の述語だけ**を直す。
+ *
+ * 直さないと、期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が
+ * 解放されず、後続 Task / Project が進まない。解放手段が archive / pause しか無い状態は
+ * 「スマホ完結の復旧」と言えない（Production で同一形状を4件観測。いずれも archived/paused）。
+ *
+ * **例外**: quarantine された blocked Job は `done` でも所有権を保持する。PR-C の hard
+ * invariant「安全と証明できない限り所有権を解放しない」を優先する。なお Task が `done` の後に
+ * 新しい Job は作られない（`updateAndCreateNextWorkflowJob` が done を拒否する）ため、
+ * この組合せは実際には到達しない想定の保険である。
+ */
 function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
   for (const { task, jobs } of perTask) {
     const owns = jobs.some((job) => (
       job.status === 'running' ||
-      job.status === 'blocked' ||
+      (job.status === 'blocked' && (task.status !== 'done' || job.failureMetadata?.quarantined === true)) ||
       (job.status === 'queued' && !isInitialImplementStepKey(task.id, job.workflowStepKey))
     ))
     if (owns) return task.id

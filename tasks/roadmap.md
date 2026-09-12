@@ -3125,6 +3125,50 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    quarantine 済み Job `01de09fc` と `quarantineReason` がそのまま残っており、
    本 Finding の実機再現材料として参照できる。
 
+<!-- roadmap:id=done-task-stale-blocked-job-owns-workspace state=done -->
+0. [x] **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける** — 完了（2026-09-13）
+   （2026-09-12登録、**MVP-BLOCKING（CEO判断）**。`approval-expired-waiting-blocks-resume` の
+   修正を Production で検証した直後に発覚。commit は成功したのに後続が進まなかった）。
+
+   **内容**: `findWorkspaceOwningTaskId()`（`apps/worker/src/index.ts`）は Job の status だけで
+   所有者を決め、**Task の status を一切見ていなかった**。`resumeBlockedTask()` は新しい Job を
+   別行として作り、旧 `blocked` 行を監査証跡として残す（`approveAndResumeJob()` は同一行を
+   `blocked -> queued` へ UPDATE するので滞留しない）。そのため resume 経路でだけ
+   「`done` Task に blocked 行が残る」状態が生まれ、所有権が永久に解放されなかった。
+
+   **実害**: 期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が解放されず、
+   後続 Task / Project が進まない。解放手段が **archive / pause しか無い**状態は
+   Design Philosophy 1「スマホ完結」を満たさない。
+
+   **Production 実測（2026-09-12）**: 同一形状が **4件**。いずれも
+   `review:…:git-commit` の blocked 行 + より新しい Job 1件で、いずれも archived / paused。
+   つまり過去の run はすべて archive/pause でしか解放されていなかった。
+   `1d50d5d7`/`e60ba617`（Production E2E test 10）、`240d1949`/`9b1789e2`（Phase1b Approval Level
+   較正検証用）、`3a1aff17`/`83041277`（Phase1 Shadow Gate 検証用）、
+   `9a9c9423`/`7a014347`（E2E確認用プロジェクト9）。
+
+   **修正（最小・blocked 分岐のみ）**: blocked Job は原則として所有者だが、**その Task が
+   `done` なら所有者から外す**。Task が `done` になるのは commit 適用トランザクション内の1箇所だけ
+   （`git_commit` 成功時）であり、`done` は「変更は commit 済み＝保留中の dirty は無い」を意味する。
+   `running` / `queued` の判定、cleanup / quarantine / resume / repair の条件は一切変更していない。
+   **例外**: quarantine された blocked Job は `done` でも所有権を維持する（PR-C の hard invariant
+   「安全と証明できない限り所有権を解放しない」を優先）。
+
+   **旧 blocked 行は残したまま**にしている。行を残すのは既存設計で
+   `resumeBlockedGitCommitJob.test.ts` が固定しており、監査証跡でもあるため、
+   行には触れず**所有権の述語だけ**を直した。
+
+   **なぜ「より新しい Job があれば旧 blocked は owner でない」案を採らなかったか**:
+   Production で blast radius を実測したところ、done 条件は 4件（すべて archived/paused =
+   running な Project への影響ゼロ）、newer-job 条件は 14件でうち 10件が `pending` Task だった。
+   pending Task の blocked 行は dirty を正当に保持しうるため、解放すると後続 Task が
+   dirty worktree で死ぬ。done 条件が最小かつ安全側。
+
+   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（23件）。
+   上記 Production 4件を fixture として使用している。修正を外すと 12 件が落ち、
+   既存挙動を固定する 11 件（running / queued / pending / blocked / quarantine /
+   initial-implement / M1-a fallback / resume・repair 中の dirty）は修正の有無にかかわらず通る。
+
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
    — 完了（2026-09-13）
