@@ -3197,6 +3197,31 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / HEAD 未解決 /
    各検出の失敗時 fail-closed / 候補複数時の fail-closed / poll cost）である。
 
+<!-- roadmap:id=m3-final-production-e2e state=planned -->
+0. [ ] **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
+   （2026-09-13登録、**MVP-BLOCKING**。これが PASS するまで
+   `TEMP_MVP_COMPLETION_POLICY` を削除しない）。
+
+   **要件**（すべて満たすこと）:
+   - 実アプリから新規 Project Start
+   - **Roadmap Generator 自身が 2 Task + dependency を生成する**（手動 Task 追加なし）
+   - CEO 操作は Approval のみ
+   - **手動 resume なし**
+   - Task 1 commit → backend continuation → Task 2 implement/review → Task 2 Approval Gate
+     まで到達すること
+
+   **2026-09-12〜13 の run は PASS に数えない（CEO 判断）**: Generator が Task を1件しか
+   生成せず、Task 2 を手動 `POST /api/tasks` で追加したため。用途を限定し
+   「CEO approval 後、手動 resume なしで Task 1 commit まで進める happy-path regression」の
+   証拠として記録した。**後半（continuation → Task 2 implement/review）は証明していない**:
+   手動追加した Task は `roadmap_active = 0` であり `selectNextContinuableTask()` の
+   対象に入らないため、continuation は `next_task_id: null` で終了した。
+   記録: `docs/project_memory/decisions/approval_to_commit_happy_path_regression.md`。
+
+   **その run で掘り当てた MVP-BLOCKING 2件は修正済み**:
+   `approval-expired-waiting-blocks-resume`（PR #156）と
+   `done-task-stale-blocked-job-owns-workspace`（PR #158）。
+
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
    — 完了（2026-09-13）
