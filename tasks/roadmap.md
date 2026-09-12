@@ -2751,8 +2751,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
 
-<!-- roadmap:id=strategic-decision-unknown-value-fail-open state=planned -->
-0. [ ] **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）**
+<!-- roadmap:id=strategic-decision-unknown-value-fail-open state=done -->
+0. [x] **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open） — 完了（2026-09-11, `4a0fbaf` / PR #146）**
    （2026-09-10登録、**高優先度・安全性**。PR #136（continuation reconcile）の作業中に発見。
    **#136へは混ぜず独立Findingとする**）。
 
@@ -2784,6 +2784,13 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    2（AIがタスク生成）・3（AIが実装）が依拠するReview Gateそのものの健全性であり、
    `AGENTS.md` 0章の例外条件「Approval Gate・権限・安全境界を迂回できる」に該当する。
    **新しいReview機構は作らず、既存のdecision解釈・validation境界のみを最小変更する。**
+
+   **完了（2026-09-11, commit `4a0fbaf` / PR #146）**: `resolveFinalDecision()` を反転し、
+   **判定が1件以上ありその全件が厳密に `'ALIGNED'` のときだけ ALIGNED**、それ以外（空・
+   UNCERTAIN混在・enum外の未知値）はすべて `'UNCERTAIN'` へ倒すようにした。
+   判定語彙の正本を `STRATEGIC_DECISIONS` に1箇所化し、`isStrategicDecision()` を追加している
+   （`packages/shared/src/strategicDecision.ts`）。新しいReview機構は追加していない。
+   **本 entry が `state=planned` のまま残っていたのは記録漏れであり、2026-09-12 に是正した。**
 
 <!-- roadmap:id=approval-resume-liveness-dependency state=done -->
 0. [x] **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
@@ -3111,6 +3118,38 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **再現証拠**: Production E2E test 8（`733643fe`）を失敗記録として保持している。
    quarantine 済み Job `01de09fc` と `quarantineReason` がそのまま残っており、
    本 Finding の実機再現材料として参照できる。
+
+<!-- roadmap:id=orphan-dirty-workspace-no-owner state=deferred -->
+0. [ ] **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**
+   （2026-09-12登録、**高優先度・MVP後defer**。M1 を M1-a / M1-b に分割したうちの後半。
+   M1-a は PR #154 で完了済み。**本項目の実装は MVP 完成まで開始しない**）。
+
+   **内容**: `resolveWorkspaceOwnership()`（`apps/worker/src/index.ts`）の fallback は、
+   dirty を説明できる blocked Task が**1つも無い**場合 `{ kind: 'none' }` を返す。
+   その結果 Worker は次の Task を claim し、その initial-implement が clean worktree 要件で
+   失敗する。dirty の持ち主が居ないので `resume:` / `retry:` / `repair:` のどれも起動できず、
+   **自動復旧経路が存在しない**。人手で worktree を戻すまで系は前に進まない。
+
+   **到達経路（少なくとも2つ）**:
+   1. Worker が implement 実行中に crash / kill され、部分的な変更だけが残る
+      （`quarantined-dirty-task-generic-recovery` と重なるが、あちらは quarantine 済み Task の
+      復旧、こちらは**そもそも帰属先 Task が無い**場合であり、別問題として扱う）
+   2. `workspaceBaseline` を持たない**旧い Job** しか残っていない場合。M1-a の gate は
+      baseline commit と HEAD の一致を要求するため、baseline が null の Job は候補にならない。
+
+   **実測（2026-09-12, Production, M1-a deploy 直後）**: `/workspace/target` は `M test.js` で
+   dirty、blocked Task は 9 件あるが、**その 9 件の Job はすべて `workspace_baseline` が NULL**
+   （baseline 永続化より前に作られた行。DB全体では 148 Job 中 34 Job のみ baseline を持つ）。
+   現時点では blocked な `review:...:git-commit` Job `e60ba617` が**既存条件で** owner なので
+   fallback は評価されないが、その Job が解けた後に同じ dirty が残ると orphan dirty になる。
+
+   **やってはいけないこと**: **誤判定で worktree を自動 cleanup しない。**
+   M1-a と同様、帰属を証明できない変更を系が勝手に捨ててはならない。
+   汎用 force cleanup を追加するなら「誰が・何を根拠に・何を捨てるか」の設計が先。
+
+   **関連**: `workspace-ownership-content-identity`（M1-a の受容済み既知制約）、
+   `quarantined-dirty-task-generic-recovery`（quarantine 済み Task の復旧）。
+   3項目は**別 Finding として分離したまま**扱い、まとめて1つの機構にしない。
 
 <!-- roadmap:id=workspace-ownership-content-identity state=deferred -->
 0. [ ] **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**
