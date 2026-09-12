@@ -145,46 +145,38 @@ export type WorkspaceOwnership =
   | { kind: 'ambiguous' }
 
 /**
- * この blocked Job は「commit 済みの Task に取り残された行」か。
+ * この blocked 行は「終わった Task に取り残された行」の候補か。
  *
  * `resumeBlockedTask()` は新しい Job を**別行**として作り、旧 `blocked` 行を監査証跡として
  * 残す（`approveAndResumeJob()` は同一行を `blocked -> queued` へ UPDATE するので滞留しない）。
  * そのため resume 経路でだけ「終わった Task に blocked 行が残る」状態が生まれ、
  * その行が workspace 所有権を永久に握り続けていた。
  *
- * 判定には **Task の status だけを信用しない**。`PATCH /api/tasks/:id` は
- * `status: 'done'` を**検証なしでそのまま書き込む**（`apps/api/src/routes/tasks.ts`）ため、
- * dirty を抱えたまま外部から `done` にされうる。そこで durable な**実際の commit 痕跡**を要求する:
+ * **ここは「候補」しか決めない。解放するかどうかは worktree の実観測で決める。**
+ * durable な自己申告はどれも「もう dirty が無い」ことの証明にならないため:
+ *   - `task.status` は `PATCH /api/tasks/:id` が検証なしで書き込める
+ *     （`apps/api/src/routes/tasks.ts`）
+ *   - `job.commitHash` は `PATCH /api/jobs/:id` が検証なしで受け取る
+ *     （`apps/api/src/routes/jobs.ts`）。逆に commit 後・永続化前に落ちれば欠ける
+ *   - `createdAt` の大小は因果順ではない（clock skew で逆転しうる）
+ * 実際に dirty が残っていないかは worktree を見るしかないので、そうする。
  *
- *   1. Task が `done` である
- *   2. その Task に `commitHash` を持つ Job があり、**当該 blocked 行より後に作られている**
- *      = その blocked 行は「後から commit された Job」に追い越されている
- *   3. その blocked Job が quarantine されていない
- *
- * 2 が「変更は実際に landed した」ことの証拠であり、status の自己申告ではない。
- * 同時刻（createdAt が同値）なら追い越しと見なさず所有権を残す（安全側）。
- *
- * 3 は PR-C の hard invariant「安全と証明できない限り所有権を解放しない」を優先するための例外。
- * quarantine された行は commit 済みでも所有権を維持する。
+ * quarantine された行は候補にしない。PR-C の hard invariant
+ * 「安全と証明できない限り所有権を解放しない」を優先し、worktree が clean でも保持する。
  */
-function isSupersededByLandedCommit(task: Task, jobs: readonly Job[], blockedJob: Job): boolean {
-  if (task.status !== 'done') return false
-  if (blockedJob.failureMetadata?.quarantined === true) return false
-  return jobs.some((other) => (
-    other.commitHash !== undefined &&
-    other.createdAt > blockedJob.createdAt
-  ))
+function isStaleBlockedJobOfFinishedTask(task: Task, job: Job): boolean {
+  return (
+    job.status === 'blocked' &&
+    task.status === 'done' &&
+    job.failureMetadata?.quarantined !== true
+  )
 }
 
 /**
- * 既存の所有者条件。`running` / `queued` の判定は変更していない。
+ * 無条件に workspace を保有する条件。`running` / `queued` の判定は変更していない。
  *
- * blocked Job は原則として所有者だが、`isSupersededByLandedCommit()` が成立する行
- * （= commit が landed した後に取り残された行）だけは所有者から外す。
- *
- * 直さないと、期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が
- * 解放されず、後続 Task / Project が進まない。解放手段が archive / pause しか無い状態は
- * 「スマホ完結の復旧」と言えない（Production で同一形状を4件観測。いずれも archived/paused）。
+ * blocked Job も原則としてここに入るが、`isStaleBlockedJobOfFinishedTask()` に当たる行だけは
+ * ここでは確定させず、`resolveWorkspaceOwnership()` が worktree を観測してから決める。
  *
  * 旧 blocked 行そのものには触れない。行を残すのは既存設計で
  * `resumeBlockedGitCommitJob.test.ts` が固定しているため、所有権の述語だけを直す。
@@ -193,7 +185,7 @@ function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }
   for (const { task, jobs } of perTask) {
     const owns = jobs.some((job) => (
       job.status === 'running' ||
-      (job.status === 'blocked' && !isSupersededByLandedCommit(task, jobs, job)) ||
+      (job.status === 'blocked' && !isStaleBlockedJobOfFinishedTask(task, job)) ||
       (job.status === 'queued' && !isInitialImplementStepKey(task.id, job.workflowStepKey))
     ))
     if (owns) return task.id
@@ -221,9 +213,14 @@ export function resolveWorkspaceOwnership(
   const existing = findWorkspaceOwningTaskId(perTask)
   if (existing !== undefined) return { kind: 'owner', taskId: existing }
 
-  // blocked Task が1つも無ければ worktree を読む必要すら無い。
+  // 終わった Task に取り残された blocked 行。worktree がまだ dirty な間だけ所有権を保持する。
+  const staleOwners = perTask.filter(({ task, jobs }) => (
+    jobs.some((job) => isStaleBlockedJobOfFinishedTask(task, job))
+  ))
+
+  // 観測が要るのは fallback 候補がある場合だけ。通常の poll では worktree を読まない。
   const blockedTasks = perTask.filter(({ task }) => task.status === 'blocked')
-  if (blockedTasks.length === 0) return { kind: 'none' }
+  if (blockedTasks.length === 0 && staleOwners.length === 0) return { kind: 'none' }
 
   let dirtyPaths: ReadonlySet<string>
   try {
@@ -234,6 +231,17 @@ export function resolveWorkspaceOwnership(
     console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
     return { kind: 'ambiguous' }
   }
+  // 取り残された blocked 行は、dirty が残っている間だけ所有者として振る舞う。
+  // clean なら「その Task の変更はもう worktree に無い」ので所有権を手放す
+  // （archive / pause を人手で行わなくても自然に解放される）。
+  // dirty なら由来を問わず保持する: commit 後に残った差分でも、外部から `done` にされただけの
+  // Task の未 commit 変更でも、手放すと後続 Task の initial-implement が clean worktree 要件で
+  // 死ぬため、保持が安全側である。
+  if (dirtyPaths.size > 0 && staleOwners.length > 0) {
+    if (staleOwners.length > 1) return { kind: 'ambiguous' }
+    return { kind: 'owner', taskId: staleOwners[0].task.id }
+  }
+
   if (dirtyPaths.size === 0) return { kind: 'none' }
 
   // 独立レビュー指摘（CLAIM 7）: `changedFiles` は**過去の記録**であり、同じ path が今 dirty でも

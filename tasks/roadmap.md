@@ -3147,44 +3147,41 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    較正検証用）、`3a1aff17`/`83041277`（Phase1 Shadow Gate 検証用）、
    `9a9c9423`/`7a014347`（E2E確認用プロジェクト9）。
 
-   **修正（最小・blocked 分岐のみ）**: blocked Job は原則として所有者だが、
-   **commit が landed した後に取り残された行だけ**所有者から外す。条件は次の3つ:
-   (1) Task が `done` (2) その Task に `commitHash` を持つ Job があり、**当該 blocked 行より
-   後に作られている** (3) その blocked Job が quarantine されていない。
+   **修正（最小）**: 「終わった Task に取り残された blocked 行」は所有権を**無条件には**持たず、
+   **worktree がまだ dirty な間だけ**所有者として振る舞う。clean になれば自然に手放す。
+   候補条件は (1) Task が `done` (2) その blocked Job が quarantine されていない の2つだけで、
+   解放するか否かは worktree の実観測が決める。
    `running` / `queued` の判定、cleanup / quarantine / resume / repair の条件は一切変更していない。
 
-   **Task status だけを信用しない（独立レビュー round 1 の指摘）**: 当初案は `task.status === 'done'`
-   だけを条件にしていたが、**`PATCH /api/tasks/:id` は `status: 'done'` を検証なしでそのまま
-   書き込む**（`apps/api/src/routes/tasks.ts`）。dirty を抱えたまま外部から `done` にされた Task の
-   変更が owner 不在になり、後続 Task の initial-implement が clean worktree 要件で死ぬ経路が
-   残っていた。そこで status の自己申告ではなく durable な**実際の commit 痕跡**を要求する形へ
-   直した。`createdAt` が同値なら追い越しと見なさず所有権を残す（安全側）。
-   （当初案が挙げていた「`done` は commit トランザクション内の1箇所だけで設定される」
-   「`updateAndCreateNextWorkflowJob` が done Task を拒否する」という記述はいずれも誤りだった。）
+   **durable な自己申告を信用しない（独立レビュー round 1・2 の指摘）**: 当初案は
+   `task.status === 'done'` だけを、次案は `commitHash` + `createdAt` の追い越しを条件にしたが、
+   **どれも「もう dirty が無い」ことの証明にならない**ことが判明した。
+   - `task.status` は `PATCH /api/tasks/:id` が検証なしで書き込む（`apps/api/src/routes/tasks.ts`）
+   - `job.commitHash` は `PATCH /api/jobs/:id` が検証なしで受け取る（`apps/api/src/routes/jobs.ts`）。
+     逆に commit 後・永続化前に落ちれば欠ける
+   - `createdAt` の大小は因果順ではない（clock skew で逆転しうる）
+   - 正当な commit でも、commit 後に残る差分（post-commit dirt）はありうる
+   いずれの経路でも、誤って手放すと後続 Task の initial-implement が clean worktree 要件で死ぬ。
+   そこで判定を durable state から **worktree の実観測**へ移した。dirty なら由来を問わず保持する
+   （安全側）。これにより上記4経路はすべて構造的に無効化される。
 
-   **例外**: quarantine された blocked Job は commit 済みでも所有権を維持する（PR-C の hard
-   invariant「安全と証明できない限り所有権を解放しない」を優先）。
+   **例外**: quarantine された blocked Job は worktree が clean でも所有権を維持する
+   （PR-C の hard invariant「安全と証明できない限り所有権を解放しない」を優先）。
+   この場合は worktree を観測せずに owner を確定する。
+
+   **poll cost**: 観測が必要なのは「強い owner が居ない かつ 滞留候補または blocked Task が居る」
+   cycle だけで、その場合も `buildWorktreeManifest()` は最大1回。通常の poll では観測しない
+   （M1-a で確立した性質をそのまま維持している）。
 
    **旧 blocked 行は残したまま**にしている。行を残すのは既存設計で
    `resumeBlockedGitCommitJob.test.ts` が固定しており、監査証跡でもあるため、
    行には触れず**所有権の述語だけ**を直した。
-
-   **なぜ「より新しい Job があれば旧 blocked は owner でない」案を単独では採らなかったか**:
-   Production で blast radius を実測したところ、newer-job 条件だけでは 14件が該当し、
-   うち 10件が `pending` Task だった。pending Task の blocked 行は dirty を正当に保持しうるため、
-   解放すると後続 Task が dirty worktree で死ぬ。採用した条件（done + commit 痕跡 + 非 quarantine）
-   の該当は上記 4件のみで、すべて archived/paused = running な Project への影響はゼロ。
-
-   **commit 痕跡の実測**: `done` な Task 13件すべてが `commitHash` を持つ Job を保有しており、
-   上記 4件も blocked 行より後に作られた `commitHash` 持ちの Job を持つ。
-   `commitHash` を条件に使っても既存の正常系を取りこぼさないことを確認済み。
-
-   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（27件）。
-   上記 Production 4件を fixture として使用している。修正を外すと 12 件が落ち、
-   既存挙動を固定する 15 件（running / queued / pending / blocked / quarantine /
+   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（36件）。
+   上記 Production 4件を fixture として使用している。修正を外すと 15 件が落ち、
+   既存挙動を固定する 21 件（running / queued / pending / blocked / quarantine /
    initial-implement / M1-a fallback / resume・repair 中の dirty / 外部 PATCH で done に
-   されただけの Task / commit が blocked 行より前 / createdAt 同値）は
-   修正の有無にかかわらず通る。
+   されただけ + dirty / commit 後の残差 dirty / 観測失敗時の fail-closed / 候補複数時の
+   fail-closed / poll cost）は修正の有無にかかわらず通る。
 
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
