@@ -3186,15 +3186,13 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **旧 blocked 行は残したまま**にしている。行を残すのは既存設計で
    `resumeBlockedGitCommitJob.test.ts` が固定しており、監査証跡でもあるため、
    行には触れず**所有権の述語だけ**を直した。
-   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（39件）。
-   上記 Production 4件を fixture として使用している。修正を外すと 15 件が落ち、残り 24 件は
-   修正の有無にかかわらず通る。後者には既存挙動の固定（running / queued / pending / blocked /
-   quarantine / initial-implement / M1-a fallback / resume・repair 中の dirty / 強い owner が
-   居る cycle では観測しない）に加え、新しい分岐が成立したときの保持側の挙動
-   （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / git 操作検出の失敗 /
-   候補複数時の fail-closed / 観測失敗時の fail-closed）が含まれる。
-   後者は「修正を外しても通る」= 保持側なので落ちない、という意味であり、
-   新分岐そのものの検証は前者 15 件が担う。
+   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（41件）。
+   上記 Production 4件を fixture として使用している。**修正を外すと 15 件が落ちる**
+   （解放側 = 本項目が直した挙動）。残りは既存挙動の固定（running / queued / pending /
+   blocked / quarantine / initial-implement / M1-a fallback / resume・repair 中の dirty /
+   強い owner が居る cycle では観測しない）と、保持側の新分岐
+   （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / HEAD 未解決 /
+   各検出の失敗時 fail-closed / 候補複数時の fail-closed / poll cost）である。
 
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**

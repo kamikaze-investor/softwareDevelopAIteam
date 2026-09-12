@@ -208,24 +208,30 @@ function canInheritDirtyWorkspace(jobs: readonly Job[]): boolean {
 /**
  * 取り残された blocked 行が所有権を手放してよいか。
  *
- * 判定は **admission（`computeWorkspaceBaseline()`）と同じ clean の定義**にそろえる。
- * admission は manifest を読む**前に** `detectGitOperationState()` で fail-closed するため、
- * manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中が残っていれば次の Task は始められない。
- * ここで手放すと所有者不在のまま後続 Task が必ず落ちるので、両方を満たすまで保持する。
+ * 判定は **admission（`computeWorkspaceBaseline()`）が clean を拒否する条件すべて**にそろえる。
+ * admission が拒否するのに所有権を手放すと、所有者不在のまま後続 Task の initial-implement が
+ * 必ず落ちるため、admission が通らない状態では保持し続ける。admission の拒否条件は3つ:
  *
- * git 操作の検出に失敗した場合も「無い」とみなさず保持する（fail-closed）。
- * 検出は manifest が空のときだけ行うので、通常の cycle には追加コストが乗らない。
+ *   1. 進行中の git 操作がある（`detectGitOperationState()`。manifest を読む**前に**判定される）
+ *      → manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中なら次の Task は始められない
+ *   2. HEAD を解決できない（`requireCommitHash()`。unborn / 読めない HEAD）
+ *   3. manifest が空でない（clean worktree 要件）
+ *
+ * 1 と 2 の検出に失敗した場合も「問題無し」とみなさず保持する（fail-closed）。
+ * 1 と 2 は manifest が空のときだけ確認するので、通常の cycle には追加コストが乗らない。
  */
 function isReleasableForNextTask(
   workingDir: string,
   dirtyPaths: ReadonlySet<string>,
   readGitOperations: (dir: string) => readonly string[],
+  readHead: (dir: string) => string | undefined,
 ): boolean {
   if (dirtyPaths.size > 0) return false
   try {
-    return readGitOperations(workingDir).length === 0
+    if (readGitOperations(workingDir).length > 0) return false
+    return readHead(workingDir) !== undefined
   } catch (err: unknown) {
-    console.error(`[Worker] git 操作状態を確認できないため所有権を保持します: ${formatUnknownError(err)}`)
+    console.error(`[Worker] workspace の解放可否を確認できないため所有権を保持します: ${formatUnknownError(err)}`)
     return false
   }
 }
@@ -263,13 +269,14 @@ export function resolveWorkspaceOwnership(
   // **admission（`computeWorkspaceBaseline()`）と同じ clean の定義**を使う:
   //   - worktree に差分が無いこと（manifest が空）
   //   - **進行中の git 操作が無いこと**（`detectGitOperationState()`）
-  // manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中などが残っていれば
-  // admission は fail-closed する。そこで手放すと、後続 Task の initial-implement が
-  // 必ず失敗する（所有者不在のまま Task だけが落ちる）。両方を満たすまで保持する。
+  //   - **HEAD を解決できること**（`requireCommitHash()` 相当）
+  // manifest が空でも git 操作の途中や unborn HEAD なら admission は fail-closed する。
+  // そこで手放すと、後続 Task の initial-implement が必ず失敗する
+  // （所有者不在のまま Task だけが落ちる）。3つすべてを満たすまで保持する。
   //
   // dirty なら由来を問わず保持する: commit 後に残った差分でも、外部から `done` にされただけの
   // Task の未 commit 変更でも、保持が安全側である。
-  if (staleOwners.length > 0 && !isReleasableForNextTask(workingDir, dirtyPaths, readGitOperations)) {
+  if (staleOwners.length > 0 && !isReleasableForNextTask(workingDir, dirtyPaths, readGitOperations, readHead)) {
     if (staleOwners.length > 1) return { kind: 'ambiguous' }
     return { kind: 'owner', taskId: staleOwners[0].task.id }
   }

@@ -13,8 +13,10 @@
  * **解放の判断は durable な自己申告ではなく worktree の実観測で行う。**
  * `task.status` は `PATCH /api/tasks/:id` が、`job.commitHash` は `PATCH /api/jobs/:id` が
  * いずれも検証なしで書き込めるうえ、`createdAt` の大小は因果順ではない。
- * 「もう dirty が無い」ことを証明できるのは worktree だけなので、そこを見る。
- * 取り残された行は **dirty が残っている間だけ**所有者として振る舞い、clean になれば手放す。
+ * 「もう使用中でない」ことを証明できるのは worktree だけなので、そこを見る。
+ * 解放条件は **admission（`computeWorkspaceBaseline()`）が clean を拒否する条件すべて**に
+ * そろえる: manifest が空 かつ 進行中の git 操作が無い かつ HEAD を解決できる。
+ * ひとつでも満たさなければ保持する（手放すと後続 Task の initial-implement が必ず落ちる）。
  *
  * 修正は `findWorkspaceOwningTaskId()` の blocked 分岐と、その候補を worktree 観測で解決する
  * `resolveWorkspaceOwnership()` の1段のみ。running / queued の判定、cleanup / quarantine /
@@ -278,6 +280,34 @@ describe('dirty が残っている間は手放さない（durable な自己申�
 
     expect(result).toEqual({ kind: 'owner', taskId: 'task-done' })
     expect(readGitOps).not.toHaveBeenCalled()
+  })
+
+  it('manifest が空でも HEAD を解決できなければ owner を維持する（admission と同じ clean 定義）', () => {
+    const done = task('task-done', { status: 'done' })
+    const perTask = [
+      { task: done, jobs: [job('stale-blocked', done.id, { status: 'blocked' })] },
+    ]
+
+    const result = resolveWorkspaceOwnership(
+      perTask, '/workspace/target', () => [], () => undefined, () => [],
+    )
+
+    expect(result).toEqual({ kind: 'owner', taskId: 'task-done' })
+  })
+
+  it('HEAD の読み取りが投げた場合も「問題無し」とみなさず owner を維持する', () => {
+    const done = task('task-done', { status: 'done' })
+    const perTask = [
+      { task: done, jobs: [job('stale-blocked', done.id, { status: 'blocked' })] },
+    ]
+
+    const result = resolveWorkspaceOwnership(
+      perTask, '/workspace/target', () => [],
+      () => { throw new Error('rev-parse failed') },
+      () => [],
+    )
+
+    expect(result).toEqual({ kind: 'owner', taskId: 'task-done' })
   })
 
   it('worktree を観測できない場合は「dirty 無し」とみなさず fail-closed', () => {
@@ -564,12 +594,13 @@ describe('fetchQueuedJob: clean になれば running Project でも所有権を�
     await fetchQueuedJob()
 
     expect(manifestMocks.buildWorktreeManifest).not.toHaveBeenCalled()
+    expect(gitOpMocks.detectGitOperationState).not.toHaveBeenCalled()
   })
 
   // 注: これは**所有権判定が行う観測**の回数。claim 後の
   // `computeWorkspaceBaseline()` は admission のために別途 manifest を読むので、
   // poll cycle 全体としては 1 回ではない（それは本 PR 以前からの既存挙動）。
-  it('poll cost: 所有権判定が行う worktree 観測は 1 cycle あたり最大1回', async () => {
+  it('poll cost: 所有権判定の観測は manifest 1回 + 解放可否の確認1回まで', async () => {
     const done = task('task-1', { status: 'done' })
     const next = task('task-2')
     mockApi([done, next], {
@@ -582,5 +613,7 @@ describe('fetchQueuedJob: clean になれば running Project でも所有権を�
     await fetchQueuedJob()
 
     expect(manifestMocks.buildWorktreeManifest).toHaveBeenCalledTimes(1)
+    // manifest が空のときだけ解放可否を確認する（この cycle では1回）。
+    expect(gitOpMocks.detectGitOperationState).toHaveBeenCalledTimes(1)
   })
 })
