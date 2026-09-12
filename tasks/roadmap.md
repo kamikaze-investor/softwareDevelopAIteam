@@ -3112,6 +3112,38 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    quarantine 済み Job `01de09fc` と `quarantineReason` がそのまま残っており、
    本 Finding の実機再現材料として参照できる。
 
+<!-- roadmap:id=workspace-ownership-content-identity state=deferred -->
+0. [ ] **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**
+   （2026-09-12登録。M1-a / PR #154 の独立レビュー CLAIM 7。**Codex Sol round 2 は
+   `REJECT blocking=1` のまま**であり、blocking 0 にはなっていない。
+   CEO が「accepted known limitation」として merge を判断した）。
+
+   **判定範囲**: `resolveWorkspaceOwnership()`（`apps/worker/src/index.ts`）の fallback は
+   `current HEAD` + `current dirty paths` + durable な `job.changedFiles` までで帰属を判定する。
+   **dirty の内容そのものが当該 Job のものか（content identity）は証明しない。**
+
+   **誤判定の条件**: blocked Task の変更を **HEAD を動かさずに**手動 revert し、その後で人間が
+   **同じ path だけ**を別内容で編集した場合、現在の dirty paths と記録された `changedFiles` が
+   一致し、baseline commit も HEAD と一致するため、元の Task を owner と誤認する。
+
+   **なぜ塞がないか**: 内容の同一性を証明するには per-path content hash 等の
+   **新しい永続 state** が必要で、M1-a の要件「新しい永続 state を追加しない」と衝突する。
+   MVP 直前に永続 state と移行を増やすコストが、下記のとおり安全側に倒れる残存リスクに
+   見合わないと判断した。
+
+   **影響（すべて安全側）**:
+   - 他 Task はその cycle で claim せず停止する。説明のつかない dirty がある状況では
+     停止自体が本来正しい挙動であり、進めても clean worktree 要件で失敗するだけ。
+   - **本判定は cleanup には一切使わない。誤判定だけでデータが削除されることはない。**
+   - ただし owner Task の `resume:` が out-of-band な手動編集を引き継ぐ可能性は残る。
+     なお `resume:` が dirty を継承するか否かは `isIntentionallyDirtyJob()` が決めており、
+     M1-a はこれを変更していない（この経路自体は M1-a 以前から同じ）。
+
+   **MVP運用境界（非対応）**: **active / blocked な target workspace を人間が VPS 上で
+   直接編集しない。** out-of-band manual edit は MVP では非対応とする。
+
+   **本項目と M1-b（真の orphan dirty）は別 Finding**であり、まとめて扱わない。
+
 <!-- roadmap:id=implement-acceptance-criteria-not-mechanically-verified state=planned -->
 0. [ ] **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**
    （2026-09-11登録、**高優先度**。Production E2E test 9 で実害として観測。

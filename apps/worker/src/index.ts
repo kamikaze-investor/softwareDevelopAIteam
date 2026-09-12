@@ -119,6 +119,25 @@ function isInitialImplementStepKey(taskId: string, workflowStepKey: string | und
  *
  * 候補が複数ある場合は attribution が曖昧なので、**任意に1件を選ばず fail-closed** にする
  * （`kind: 'ambiguous'`）。この cycle では誰も claim しない。
+ *
+ * ---
+ * **既知の制約（CEO 受容済み / 2026-09-12）— content identity は証明しない**
+ *
+ * この fallback は `current HEAD` + `current dirty paths` + durable な `job.changedFiles`
+ * までで帰属を判定する。**dirty の内容そのものが当該 Job のものか**は証明しない。
+ * 証明するには per-path content hash など新しい永続 state が必要で、M1-a では追加しない。
+ *
+ * したがって次の誤判定が起こりうる: blocked Task の変更を **HEAD を動かさずに**手動 revert し、
+ * その後で人間が **同じ path だけ**を別内容で編集した場合、元の Task を owner と誤認する。
+ *
+ * 影響は安全側に倒れる:
+ * - 他 Task はその cycle で claim せず停止する（説明のつかない dirty がある以上、
+ *   停止自体は本来正しい挙動であり、進めても clean worktree 要件で失敗するだけ）。
+ * - 本判定は **cleanup には一切使わない**。誤判定だけでデータが削除されることはない。
+ * - ただし owner Task の `resume:` が out-of-band な手動編集を引き継ぐ可能性は残る。
+ *
+ * よって MVP では **active / blocked な target workspace を人間が直接編集しない**ことを
+ * 運用境界（非対応）とする。ledger: `workspace-ownership-content-identity`。
  */
 export type WorkspaceOwnership =
   | { kind: 'none' }
