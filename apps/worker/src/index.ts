@@ -214,7 +214,7 @@ function canInheritDirtyWorkspace(jobs: readonly Job[]): boolean {
  *
  *   1. 進行中の git 操作がある（`detectGitOperationState()`。manifest を読む**前に**判定される）
  *      → manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中なら次の Task は始められない
- *   2. HEAD を解決できない（`requireCommitHash()`。unborn / 読めない HEAD）
+ *   2. HEAD を解決できない（`requireCommitHash()`。unborn / 読めない HEAD / 空文字）
  *   3. manifest が空でない（clean worktree 要件）
  *
  * 1 と 2 の検出に失敗した場合も「問題無し」とみなさず保持する（fail-closed）。
@@ -229,7 +229,9 @@ function isReleasableForNextTask(
   if (dirtyPaths.size > 0) return false
   try {
     if (readGitOperations(workingDir).length > 0) return false
-    return readHead(workingDir) !== undefined
+    // `requireCommitHash()` は undefined と空文字の両方を拒否する。同じ判定にそろえる。
+    const head = readHead(workingDir)
+    return head !== undefined && head !== ''
   } catch (err: unknown) {
     console.error(`[Worker] workspace の解放可否を確認できないため所有権を保持します: ${formatUnknownError(err)}`)
     return false
@@ -246,7 +248,7 @@ export function resolveWorkspaceOwnership(
   const existing = findWorkspaceOwningTaskId(perTask)
   if (existing !== undefined) return { kind: 'owner', taskId: existing }
 
-  // 終わった Task に取り残された blocked 行。worktree がまだ dirty な間だけ所有権を保持する。
+  // 終わった Task に取り残された blocked 行。次の Task をまだ始められない間だけ所有権を保持する。
   const staleOwners = perTask.filter(({ task, jobs }) => (
     jobs.some((job) => isStaleBlockedJobOfFinishedTask(task, job))
   ))
@@ -264,7 +266,7 @@ export function resolveWorkspaceOwnership(
     console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
     return { kind: 'ambiguous' }
   }
-  // 取り残された blocked 行は、workspace がまだ使用中の間だけ所有者として振る舞う。
+  // 取り残された blocked 行は、次の Task をまだ始められない間だけ所有者として振る舞う。
   // 手放してよいのは「次の Task が実際に始められる状態」になったときだけなので、
   // **admission（`computeWorkspaceBaseline()`）と同じ clean の定義**を使う:
   //   - worktree に差分が無いこと（manifest が空）

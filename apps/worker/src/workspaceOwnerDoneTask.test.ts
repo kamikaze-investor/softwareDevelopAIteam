@@ -595,12 +595,13 @@ describe('fetchQueuedJob: clean になれば running Project でも所有権を�
 
     expect(manifestMocks.buildWorktreeManifest).not.toHaveBeenCalled()
     expect(gitOpMocks.detectGitOperationState).not.toHaveBeenCalled()
+    expect(jobRunnerMocks.getCommitHash).not.toHaveBeenCalled()
   })
 
   // 注: これは**所有権判定が行う観測**の回数。claim 後の
   // `computeWorkspaceBaseline()` は admission のために別途 manifest を読むので、
   // poll cycle 全体としては 1 回ではない（それは本 PR 以前からの既存挙動）。
-  it('poll cost: 所有権判定の観測は manifest 1回 + 解放可否の確認1回まで', async () => {
+  it('poll cost: 所有権判定の観測は manifest・git 操作・HEAD が各1回まで', async () => {
     const done = task('task-1', { status: 'done' })
     const next = task('task-2')
     mockApi([done, next], {
@@ -613,7 +614,8 @@ describe('fetchQueuedJob: clean になれば running Project でも所有権を�
     await fetchQueuedJob()
 
     expect(manifestMocks.buildWorktreeManifest).toHaveBeenCalledTimes(1)
-    // manifest が空のときだけ解放可否を確認する（この cycle では1回）。
+    // manifest が空のときだけ解放可否を確認する（この cycle では git 操作・HEAD を各1回）。
     expect(gitOpMocks.detectGitOperationState).toHaveBeenCalledTimes(1)
+    expect(jobRunnerMocks.getCommitHash).toHaveBeenCalledTimes(1)
   })
 })

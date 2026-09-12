@@ -3152,13 +3152,16 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    候補条件は (1) Task が `done` (2) その blocked Job が quarantine されていない の2つだけで、
    解放するか否かは worktree の実観測が決める。
 
-   **解放条件は admission と同じ定義にそろえる（独立レビュー round 3 の指摘）**:
-   `computeWorkspaceBaseline()` は manifest を読む**前に** `detectGitOperationState()` で
-   fail-closed する。したがって manifest が空でも `index.lock` / `MERGE_HEAD` / rebase 途中が
-   残っていれば次の Task は始められない。manifest の空だけで手放すと、所有者不在のまま後続 Task の
-   initial-implement が必ず失敗する。そこで解放条件を「manifest が空 **かつ** 進行中の git 操作が
-   無い」とした。git 操作の検出に失敗した場合も「無い」とみなさず保持する（fail-closed）。
-   検出は manifest が空のときだけ行うので、通常の cycle に追加コストは乗らない。
+   **解放条件は admission の拒否条件すべてにそろえる（独立レビュー round 3・4・5 の指摘）**:
+   `computeWorkspaceBaseline()` が clean を拒否する条件は3つあり、どれか1つでも成立していれば
+   次の Task は始められない。manifest の空だけで手放すと、所有者不在のまま後続 Task の
+   initial-implement が必ず失敗する。そこで解放条件を次の3つすべてとした:
+   1. manifest が空
+   2. 進行中の git 操作が無い（`detectGitOperationState()`。manifest を読む**前に**判定される。
+      `index.lock` / `MERGE_HEAD` / rebase 途中など）
+   3. HEAD を解決できる（`requireCommitHash()` と同じく undefined と空文字の両方を拒否）
+   2・3 の確認に失敗した場合も「問題無し」とみなさず保持する（fail-closed）。
+   2・3 は manifest が空のときだけ行うので、通常の cycle に追加コストは乗らない。
    `running` / `queued` の判定、cleanup / quarantine / resume / repair の条件は一切変更していない。
 
    **durable な自己申告を信用しない（独立レビュー round 1・2 の指摘）**: 当初案は
