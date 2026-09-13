@@ -26,6 +26,49 @@ Claude Code・Codex 両エージェントが従う共同運用ルール。
 - Target Repository → read-write でコンテナに渡す
 - エージェントは物理的に Control Repository を書けない
 
+### 1-1. Control Repository の定義（2026-09-13 明確化。境界の緩和ではない）
+
+AIteamOS 自身の自己開発（Stable / Candidate 方式）を始めるにあたり、
+「Control Repository」が指すものを明確にする。**禁止範囲は変更していない。**
+
+**Control Repository ＝ 稼働中 Stable インスタンスの control plane。** 具体的には
+稼働中のコード・その DB・その env であり、production では次を指す:
+
+| | production の実体 | 扱い |
+|---|---|---|
+| Stable のコード | `/srv/ai-team/softwareDevelopAIteam`（systemd `WorkingDirectory`） | **AI編集禁止** |
+| Stable の DB | `/srv/ai-team/data/e2e-ai-team.db` | **AI編集禁止** |
+| Stable の Outbox | `apps/worker/data/outbox.db` | **AI編集禁止** |
+| Stable の env | `/srv/ai-team/env/*.env` | **AI編集禁止**（読み取りもしない） |
+
+**Control Repository ＝「AIteamOS ソースのあらゆる checkout」ではない。**
+`/workspace/target` に置かれた**隔離された Candidate clone** は、中身が AIteamOS の
+ソースであっても **開発 target として編集してよい**。Candidate は稼働中の control plane
+ではなく、破棄・再作成可能な検証用の作業コピーだからである。
+
+**物理強制は従来どおりで、新しい安全機構は追加していない。**
+`isInsideTargetRoot()`（`apps/worker/src/utils/pathUtils.ts`）が `/workspace/target` の外への
+書き込みを拒否するため、Stable のコード・DB・env は**現行の仕組みだけで保護される**。
+`buildTargetCommandEnv()`（`apps/worker/src/utils/safeEnv.ts`）の allowlist により、
+target 側コマンドには `DB_PATH` / `API_TOKEN` / provider key / `HOME` が渡らないので、
+Candidate 上の `typecheck` / `test` / `lint` / `build` から production state へ到達する経路は無い
+（2026-09-13 に本番で実測確認。production DB は size・mtime とも不変だった）。
+
+**Candidate 内でも編集してはならないもの**は従来どおり:
+`ALWAYS_FORBIDDEN_PATTERNS`（`apps/worker/src/guards/fileChangeGuard.ts`）が保護する
+安全中核（`permissionGuard` / `fileChangeGuard` / `changeManifest` / `jobRunner` /
+`pathUtils` / `safeEnv` / `apiAuth` / `gateClient` / `gatePolicy` / `safetyAuditor` /
+`alignmentChecker` / `gateProcessor` / `types/safety_guard` / `metaReviewer/geminiClient` /
+`aiCli/adapter.ts` / `worker/src/index.ts`）と、`.env` / 鍵 / `sandbox/` / `git push --force`。
+
+**Candidate の運用規律**:
+- 専用 branch（`candidate/*`）で開発し、**master へ直接反映しない**。
+  Promotion は既存の PR → CI → verified SHA → `--ff-only` deploy 経路のみ
+- Candidate clone は自己開発中 **Mobile AIteamOS 側の専有 workspace** とする。
+  同じ clone を複数セッションが並行編集しない（2026-09-13 に外部セッション間で
+  commit 混入が実際に発生したため。まず単一所有と commit 前 diff 確認で防ぎ、
+  再発する場合にのみ locking の一般化を検討する）
+
 ---
 
 ## 2. コミットメッセージ規約
