@@ -4160,6 +4160,126 @@ DB `integrity_check` ok / Worker エラーログ 0。
 - cheap AI（説明・質問経路）の latency と timeout 契約（`cheap-ai-latency-and-timeout-contract`）
 
 
+### AIteamOS 自己開発への移行（Stable / Candidate。2026-09-13 CEO 方針・Multi-Project とは別マイルストーン）
+
+**目的**: AIteamOS 自身の残 Roadmap 開発を、外部 Claude / Codex セッション中心から
+**Mobile 上の Stable AIteamOS 自身による通常の Roadmap 開発へ移す**。AIteamOS の実運用試験を兼ねる。
+**Multi-Project 基盤の完成を待たない。**
+
+**正式 Roadmap は1つだけ**: 正式な AIteamOS Project と正式 Roadmap（本ファイル）は1つのまま維持する。
+Candidate は正式な別 Project ではなく、**次バージョンを検証するための隔離された
+Disposable Test Environment** である。Candidate 内部の Project / Roadmap / DB はテスト専用でよく、
+**正式 Roadmap や運用 state を Candidate 側へ複製・二重管理しない**。
+Candidate は必要に応じて破棄・再作成できること。
+
+**最重要の調査結果（2026-09-13）: 自己開発は `project-workspace-isolation` に依存しない。**
+production の実配置は Stable のコードが `/srv/ai-team/softwareDevelopAIteam`（systemd
+`WorkingDirectory`）、target workspace が `/workspace/target`（**git remote を持たない
+使い捨ての E2E Target Project 用 repo**。実プロダクト repo ではない）、API DB が
+`/srv/ai-team/data/e2e-ai-team.db`。つまり:
+
+- 自己開発時の running Project は **AIteamOS 自身の1つだけ**なので、
+  `ux_projects_single_running` interlock と単一共有 workspace は**そもそも制約にならない**
+- `/workspace/target` を **Candidate clone に差し替えるだけ**でよく、コード変更を伴わない
+- Stable 自身のコード（`/srv/ai-team/...`）は `isInsideTargetRoot()` が既に書き込みを禁じており、
+  **新しい安全機構を足さずに現行の仕組みだけで保護される**
+
+したがって自己開発の切替点は Multi-Project より**大幅に手前**にある。
+
+**Repository / Workspace の選択（PL 決定）: 同一 canonical repository の「別 clone」**。
+worktree と別 repository は採らない。
+- **worktree を採らない理由**: `.git` を Stable 側と共有するため、Candidate での破壊的テスト
+  （下記テスト種別1）が Stable の object store / refs を壊しうる。`rm -rf` で捨てられず
+  disposability 要件を満たさない
+- **別 repository を採らない理由**: CI / secrets / repository 設定が二重化し、Git 履歴の一貫性が切れ、
+  Candidate が恒久的な別 Product に見えてしまう（CEO 方針で禁止）
+- **別 clone を採る理由**: `.git` が独立するので破棄・再作成が自由。remote は同一なので
+  **Promotion は既存の push → PR → GitHub Actions CI → verified-SHA `--ff-only` deploy を
+  そのまま再利用**でき、新規機構がゼロ。Stable の deploy ディレクトリ自体も同 repo の clone であり、
+  Candidate はその兄弟 clone になる
+
+**Candidate 検証の2種別（区別する）**:
+1. **Synthetic / Destructive Test** — テスト専用の Project / Roadmap / DB を使い、
+   dirty workspace・quarantine・provider failure・stuck state・他 Project への不正アクセス等を
+   意図的に発生させてよい環境
+2. **Upgrade Compatibility Test** — 本番 state / DB の**安全な snapshot コピー**を
+   Candidate 専用環境へ複製し、migration・startup reconciliation・resume・既存 state 互換性を確認する。
+   **Candidate から本番 DB / 本番 runtime state を直接操作してはならない**
+   （snapshot は既存の `ai-team-db-backup.service` を再利用する。新しい backup 機構は作らない）
+
+<!-- roadmap:id=aiteamos-self-development-tier-a state=planned -->
+1. [ ] **Tier A: 自己開発の最初の安全な切替点（Candidate runtime 不要）** — 最優先。
+      **これが「最短地点」である。**
+
+      **成立根拠**: 外部 Claude / Codex セッションが今まさに行っている AIteamOS 開発も、
+      第2の AIteamOS インスタンスを起動してはいない。編集 → typecheck / test →
+      Independent Review → commit → PR → CI → deploy で回している。Stable の Worker には
+      この一連を実行する機構が**すべて既にある**（`CommandKind` の `typecheck` / `test` / `lint` /
+      `build` / `git_commit`、Independent Review、Approval Gate、File Change Guard）。
+      よって **typecheck / test / CI / Independent Review で正しさを示せる変更**は、
+      Candidate runtime 無しで自己開発できる。
+
+      **Tier A に必要なもの（いずれも小さい。新規サブシステムなし）**:
+      - [ ] `/workspace/target` を Candidate clone（同一 canonical repo・同一 remote）へ差し替える。
+            運用手順であってコード変更ではない
+      - [ ] `AGENTS.md` §1「ワークツリー境界」の **文言明確化**（緩和ではない）。
+            「Control Repository」＝**稼働中 Stable インスタンスのコードと state**
+            （`/srv/ai-team/softwareDevelopAIteam`・その DB・env）であり、
+            「AIteamOS ソースのあらゆる checkout」ではないことを明記する。
+            物理強制は現行の `isInsideTargetRoot()` のままで**安全機構は変更しない**
+      - [ ] Tier A 対象 Task の `forbiddenPaths` に **CONTROL REPOSITORY 保護対象**
+            （`apps/worker/src/index.ts` / `jobRunner.ts` / `guards/permissionGuard.ts` 等）を指定する。
+            既存の File Change Guard で表現でき、新機構は不要
+      - [ ] Mobile から自己開発 Task を投入して1周する Operational E2E を1回
+            （Goal/指示入力 → Task → 実装 → Independent Review → commit → PR）
+
+      **Tier A で扱えない変更（Tier B へ回す）**: Worker / API runtime の挙動そのもの、
+      DB migration、startup reconciliation、resume / recovery、guard・claim 経路。
+      **`project-workspace-isolation` の S1〜S3 自身がこれに該当する**ため、
+      **AIteamOS は自分の workspace isolation を Tier A では自己開発できない**。
+      当面この種の変更は外部セッションに残る。
+
+      **既知の品質制約（blocker ではない）**: production VPS では Codex が shell command を
+      実行できない（bubblewrap / AppArmor。`codex-sandbox-off-deprecated-landlock` 参照）。
+      Independent Review は prompt 埋め込みの diff で成立するため機能するが、
+      **周辺コードとの突き合わせができない degraded 状態**である。
+      Codex review が通ったことを「Codex が repo を読んだ」証拠として扱わないこと。
+
+      **完了時の CEO 報告（通常の進捗報告に埋め込まない。CEO 指示・2026-09-13）**:
+      切替条件を満たした時点で「**AIteamOS 自己開発への移行準備が整いました**」という表題で、
+      非エンジニア向けに次を説明する — 何が安全になったか / まだできないこと /
+      Mobile AIteamOS から何を入力すれば開始できるか / Stable と Candidate がどう分離されるか /
+      問題発生時にどう rollback するか / 外部セッションからどこまで作業を移せるか。
+
+      **移行後の原則**: 以降の AIteamOS 通常 Roadmap 開発は **Mobile AIteamOS 側を第一選択**とする。
+      外部 Claude / Codex セッションは、AIteamOS 自体が停止している / Candidate・Promotion 機構が
+      壊れている / AIteamOS から自己修復できない / Design Philosophy・CEO 判断が必要、
+      といった **AIteamOS 内部で適切に処理できない場合の復旧・監査経路**として残す。
+
+<!-- roadmap:id=aiteamos-self-development-tier-b state=planned -->
+2. [ ] **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）** —
+      Tier A の後。Tier A を待たせない。
+
+      runtime 挙動・migration・startup reconciliation・resume を伴う変更は、テストと CI だけでは
+      正しさを示せないため、**Candidate 専用の API / Worker / DB を別ポート・別 DB パス・
+      別 systemd user unit で起動**して検証する。上記テスト種別1・2の実行環境がこれにあたる。
+
+      **設計上の制約**: Candidate の Worker は Stable の DB / Outbox / env を参照してはならない。
+      既存の systemd user unit 構成（`EnvironmentFile` 分離・`flock` による単一インスタンス強制）を
+      複製する形にし、**新しい supervision 方式・新しい container 基盤は作らない**。
+      Promotion は Tier A と同じく既存の verified-SHA `--ff-only` deploy を使う。
+
+      **依存**: 「正式Production起動方式の確定」（本ファイル VPS 常駐運用化の節）と整合させる。
+      1ユニット=1インスタンス強制の議論はそちらが正本。
+
+**Multi-Project との関係（同一マイルストーンにしない。CEO 指示）**:
+自己開発移行は Candidate 分離が成立した時点で先に開始する。
+Project #2 の並行開始は別途、`project-workspace-isolation` / Project 内 claim isolation /
+Project 間 failure containment / Multi-Project Operational E2E /
+`SingleRunningProjectError` の安全な解除が成立した時点で行う。
+最終形は Project #1 = AIteamOS（全 Roadmap 完遂まで継続）と Project #2+ = 実事業 / Product を
+同時に AIteamOS から開発できる状態。
+
 ### 次に着手すべき root-cause cluster（P1 完了時点の handoff・2026-09-08）
 
 **選定: shared workspace の dirty leakage → 恒久 quarantine（cleanup-deadlock）→ worktree isolation**
@@ -4300,6 +4420,14 @@ deploy canary は全 PASS だった。
       **本項目では閉じない**（per-job worktree 側の課題）。
       複数 Worker 対応も含めない（`project-auto-multi-worker`。単一 Worker 前提と
       host の `flock -n` は維持する）。
+
+      **2026-09-13 追記: 自己開発移行は本項目に依存しない（同一マイルストーンにしない）**。
+      AIteamOS 自身の自己開発は running Project が1つで足りるため、interlock も共有 workspace も
+      制約にならない（根拠は `aiteamos-self-development-tier-a`）。本項目の完成を
+      **自己開発移行の前提条件にしないこと**。
+      逆向きの依存だけが存在する: **本項目の S1〜S3 は guard・claim 経路を変えるため
+      Tier A（typecheck / test / CI / Review で示せる変更）では自己開発できず、
+      Tier B または外部セッションが担当する**。
 
       **廃止する既存機構は無い**。admission（`computeWorkspaceBaseline`）・quarantine・
       startup reconciliation・M1-a fallback・#158 の stale-blocked 解放判定は、
