@@ -1281,6 +1281,72 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       Explainer は技術判断をせず、確定事実の言い換えに限る（推測・改変の禁止は同項目を正本とする）。
       着手順は `cross-project-state-api` の後が自然（横断状態が取れてからの方が入力が揃うため）。
       本項目の state・優先度は変更しない。
+
+      **2026-09-13 追記2（Milestone Report の具体設計と着手順。PL 判断）**: 上記の統合方針どおり
+      **新規項目は立てない**。本項目が Milestone Report の**事実収集と記録**の owner である。
+
+      **2層に分ける**:
+      1. **Milestone Snapshot（machine-readable な正式記録）** — 到達時点の事実を決定論的コードで
+         組み立てて保存する。LLM を使わない。保存後は書き換えない（append-only）。
+      2. **CEO Report（非エンジニア向け説明）** — 1 だけを入力に Explainer が生成する派生物。
+         再生成可能で**正式記録ではない**。生成責務は `failure-explanation-pregeneration`。
+         保存形式は既存 `PersistedTaskFailureExplanationV1`
+         （`packages/shared/src/types/task_failure_explanation.ts` の `schemaVersion` /
+         `inputVersion` / `contentHash`）に倣い、「snapshot が正・説明が従」を型で固定する。
+
+      **なぜ「後から再構築」ではなく snapshot なのか（実測・2026-09-13）**: roadmap 再同期は消えた
+      Phase / Task を削除せず `roadmap_active=0` にする（`apps/api/src/storage/sqlite.ts`）。
+      `GET /api/projects/:id/roadmap` は active な Phase だけを返し、`getRoadmapCompletion()`
+      （`apps/api/src/routes/projects.ts:33`）も active な Task だけを数える。したがって
+      **次の Roadmap へ進んだ瞬間に、その Milestone 時点の Roadmap と消化率は現在状態から
+      再構築できなくなる**。新しい履歴基盤が欲しいからではなく、この非可逆性が理由である。
+
+      **入力（DB 側。上記の `tasks/roadmap.md` / `audit_log` / `executionLogStore` に加えて）**:
+      `project_roadmap_phases`（非 active 含む）・`tasks`（`roadmapTaskKey` / `phase` / `status` /
+      `acceptanceCriteria` / `commitHash`）・`jobs`（`commit_hash` / terminal state /
+      `failure_explanation_json`）・`review_results`（`findings`）・`design_review_evidence`
+      （`decision` / `independent_review_verdict`）・`qa_results`・`approval_requests` /
+      `gate_evaluations`・`watchdog_events`・`task_continuations` / `supervised_runs`・
+      `incident_records` / `decision_records`。**新しい収集経路は作らない。**
+
+      **Metrics / Cost**: token・課金額の計測はリポジトリに1箇所も存在しない（`Model Usage Telemetry`
+      に実測を記載済み）。本項目で cost 計測基盤は作らない。v1 の Metrics は既存事実から決定論的に
+      導出できるもの（Task / Job 件数、失敗・repair・retry 件数、承認回数、人手介入回数、
+      Milestone 開始〜到達の経過時間）に限る。
+
+      **Milestone は planning entity ではない**。上記6（done）の「Milestone entity・Phase UUID・
+      generic versioning system を追加しない」を維持し、報告時点のラベルとして扱う。追加 schema は
+      **append-only の1テーブルまで**を上限とし、`design_review_evidence` と同じ「hash 付きの確定記録」の
+      形に倣う。
+
+      **着手順（PL 判断・2026-09-13。本項目の state・優先度は変えない）**:
+      `project-workspace-isolation`（production を止めているクラスタ）→ `cross-project-state-api`
+      → **Stage A: snapshot の収集・永続化・参照・到達通知（LLM なし）** →
+      `failure-explanation-pregeneration` → **Stage B: CEO Report 生成**。
+      Stage B を先に作らない（Explainer 経路の二重実装になる）。
+
+      **完了条件（Stage A）**: Milestone 到達時点の snapshot が保存され、その後 Roadmap を再同期しても
+      **保存済み snapshot が変化しない**こと。snapshot だけから次を LLM なしで再現できること —
+      目的／完成したもの／未完了・延期したもの／システム上の変更／Runtime・E2E 等の実動確認結果／
+      Independent Review・品質確認／発生した問題・Finding／重要な設計変更／Metrics・開発効率／
+      残 Technical Debt・Known Limitations／次の Roadmap 段階。Mobile から参照でき、到達時に通知が届き、
+      **開発が止まらない**こと。CEO 向け非エンジニア説明は Stage B。
+
+      **順序制約（hard）**: 同一 Project で次の Roadmap へ進む経路を有効化する**前に** Stage A を
+      着地させる。現状その経路は**存在しない**（現 Roadmap の消化は `getRoadmapCompletion().isComplete`
+      として導出されるだけで、次 Roadmap を作る実装は無い。`ProjectStartStage` の `roadmap_regeneration`
+      は Project 開始 workflow 内の作り直しであり、Milestone 後の継続ではない）。実装順は
+      `snapshot 保存 → 次 Roadmap 生成 → task_sync` とし、snapshot 未保存のまま `roadmap_active=0` に
+      しない。roadmap 再同期は消える Task / Phase に active Job があると throw で拒否するため
+      （`Cannot deactivate roadmap task ...`）、切り替えは active Job 0 の時点でのみ成立する。
+
+      **Control Repository 自身（AIteamOS 本体）の Milestone 記録**: 既存の
+      `docs/project_memory/decisions/*.md`（`mvp_completion.md` / `m3_final_production_e2e.md` 等）を
+      手書きで継続する。**生成基盤は作らない。** 上記の Report 項目一覧は共通の見出しとして流用してよい。
+
+      **今回実装しないもの（明記）**: 新しい Reporting 基盤 / 新しい log・telemetry・metrics 基盤 /
+      cost 計測 / 新しい review 基盤 / 新しい queue・daemon / Milestone planning entity /
+      Task 単位の詳細 Report。本追記は設計方針と着手順の確定まで。
 <!-- roadmap:id=project-auto-meta-review-hardening state=done -->
 11. [x] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
       foundation実装完了。2026-08-14、残り3 Acceptance Criteria全件を実production経路への
@@ -1434,123 +1500,6 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
       **今回実装しないもの（明記）**: 本項目はFinding記録であり、PR-C（#98）のmergeとは分離する。
       新しいReviewer種別・新しいReview基盤・新しいmerge gate・base最新化専用gateは追加しない。
-
-**Milestone Reporting（2026-09-13 CEO方針追加。PLが優先順位を判断済み）**
-
-<!-- roadmap:id=milestone-report-snapshot state=planned -->
-13. [ ] **Milestone Report — 到達時点のsnapshot永続化と、CEO向け説明の分離** — 2026-09-13 CEO方針追加。
-
-      **モデル（CEO確定）**: Projectは最終Goal達成まで継続する。**ProjectをMilestoneごとに分割しない**。
-      `Project継続 → Milestone到達 → 詳細Report生成・保存 → 同一Projectで次のRoadmapへ継続`。
-      詳細Reportは**意味のある大きなMilestone限定**（MVP完了・主要Phase完了・大規模な能力追加完了）で、
-      毎Task・毎Jobでは生成しない。
-
-      **2層に分ける（CEO方針）**:
-      1. **Milestone Snapshot（machine-readableな正式記録）** — 到達時点の事実を決定論的コードで
-         組み立てて保存する。LLMを使わない。保存後は書き換えない（append-only）。
-      2. **CEO Report（非エンジニア向け説明）** — 1のsnapshotだけを入力にExplainerが生成する派生物。
-         再生成可能であり、**正式記録ではない**。既存 `PersistedTaskFailureExplanationV1`
-         （`packages/shared/src/types/task_failure_explanation.ts`）の `schemaVersion` /
-         `inputVersion` / `contentHash` と同じ形で保存し、「snapshotが正・説明が従」を型で固定する。
-
-      **なぜ「後から再構築」ではなくsnapshotなのか（実測・2026-09-13）**: roadmap再同期は消えた
-      Phase/Taskを削除せず `roadmap_active=0` にする（`apps/api/src/storage/sqlite.ts`、
-      `project_roadmap_phases` / `tasks.roadmap_active`）。`GET /api/projects/:id/roadmap` は
-      `roadmapActive` なPhaseのみを返し、`getRoadmapCompletion()`
-      （`apps/api/src/routes/projects.ts:33`）も `roadmapActive` なTaskだけを数える。
-      したがって**次のRoadmapへ進んだ瞬間に、そのMilestone時点のRoadmapと完了率は現在状態から
-      再構築できなくなる**。到達時点で確定させる理由はこれであり、新しい履歴基盤が欲しいからではない。
-
-      **再利用棚卸し（2026-09-13 実測。新しいReporting基盤を作る前にここを潰す）**:
-
-      | Report項目 | 既存source（そのまま使う） |
-      |---|---|
-      | Milestoneの目的 / 次のRoadmap段階 | `projects.goal` / `project_roadmap_phases`（active・非activeの両方） |
-      | 完成したもの / 未完了・延期したもの | `tasks`（`roadmapTaskKey` / `phase` / `status` / `acceptanceCriteria` / `commitHash`） |
-      | システム上何が変わったか | `jobs`（`commit_hash` / changedFiles / terminal state）、Worker側 `execution_log.jsonl`（`JOB_LOG_DIR`。DBには無いためpointerとして扱う） |
-      | Runtime / E2E等の実動確認結果 | `jobs` のterminal結果・`qa_results`・`watchdog_events`・`task_continuations`・`supervised_runs` |
-      | Independent Review / 品質確認 | `review_results`・`design_review_evidence`（`decision` / `independent_review_required` / `independent_review_verdict`）・`design_review_runs` |
-      | 発生した問題・Finding | `review_results.findings`（`ReviewFinding`）・`jobs.failure_explanation_json`・`incident_records` |
-      | 重要な設計変更・CEO判断 | `decision_records`・`approval_requests`・`gate_evaluations`・`audit_log` |
-      | Metrics / 開発効率 | 上記から導出（Task/Job件数・失敗/repair/retry件数・承認回数・所要時間） |
-      | CEO向け非エンジニア説明 | `apps/api/src/aiExplain/cheapAiClient.ts`（`CHEAP_AI_CONFIG` = `opencode-go` / `mimo-v2.5`）と既存の説明系prompt |
-      | 到達通知 | 既存 `apps/worker/src/notifier/`（LINE / Slack） |
-
-      → **新しい収集経路・新しいlog基盤・新しいreview基盤は要らない**。不足しているのは
-      「到達時点でこれらを1つの記録へ固定する場所」だけである。
-
-      **Metrics / Cost の扱い（実測に基づく制限）**: token・課金額の計測は**リポジトリ上に存在しない**
-      （`costUsd` / `tokenUsage` 等の実装は0件。`Cost-aware Review Router` は将来の拡張点コメントのみ）。
-      本項目で**cost計測基盤は作らない**。v1のMetricsは既存事実から決定論的に導出できるもの
-      （Task/Job件数、失敗・repair・retry件数、承認回数、人手介入回数、Milestone開始〜到達の経過時間）に
-      限定する。cost計測が必要になった場合は Design Philosophy 8（効果検証可能性）に従い別項目で判断する。
-
-      **既存決定との整合**: 上記6 `project-auto-project-roadmap-visibility`（done）は
-      「Milestone entity・Phase UUID・generic versioning systemを追加しない」と決めている。本項目もこれを維持し、
-      **Milestoneはplanning entityではなく報告時点のラベル**として扱う。Phase/Taskが所属する新しい階層は作らない。
-
-      **既存項目の統合**: 上記10 `project-auto-ceo-alignment`（Phase完了・主要機能完成時のCEO通知）は
-      本項目の通知経路として統合する。**同じ通知を二重に実装しない**。通知後も開発を止めないという
-      同項目の条件はそのまま引き継ぐ。
-
-      **段階（PL判断・2026-09-13）**:
-      - **Stage A（先行・LLM無し）** — Milestone Snapshotの組み立て・永続化・取得API・Mobile表示・
-        既存notifierによる到達通知。追加schemaは**append-onlyの1テーブルまで**を上限とし、
-        `design_review_evidence` と同じ「hash付きの確定記録」の形に倣う。
-      - **Stage B（後続・Explainer）** — snapshotからのCEO Report生成・独立review・bounded regeneration。
-        **上記5 `failure-explanation-pregeneration` が確立する経路（generator/reviewer分離・
-        `packages/shared/src/reviewSeparation.ts`・失敗分類に基づくfallback・`supervised_runs` による
-        background実行）をそのまま再利用する**。Stage Bを先に作らない。
-
-      **順序制約（hard）**: Stage Aは、下記14（同一Project内での次Roadmap継続）を有効化する**前に**着地させる。
-      snapshot未保存のまま現Roadmapを非activeにすると、その時点の事実は復元できない。
-
-      **優先度（PL判断・2026-09-13）**: productionを止めているクラスタ
-      （shared workspace dirty leakage → quarantine → worktree isolation）と、安価で影響の大きい既存Finding
-      （`worker-jobs-401-anomaly` 等）を**先に片付ける**。本項目はその後、
-      **Stage A →（`failure-explanation-pregeneration`）→ Stage B** の順で着手する。
-      理由: (1) Stage Aは既存DBの読み取りとappend-onlyの書き込みだけで、Job lifecycle・workspace所有権に
-      触れないため低リスク、(2) Stage Bを単独で作ると explainer 経路を二重実装する、
-      (3) 14を先に有効化すると記録が失われる**非可逆な**損失が出る。
-
-      **完了条件（Stage A）**: Milestone到達時点のsnapshotが1レコードとして保存され、その後にRoadmapを
-      再同期しても**保存済みsnapshotの内容が変化しない**こと。snapshotだけからReport必須項目
-      （目的／完成したもの／未完了・延期／システム上の変更／実動確認結果／Independent Review・品質確認／
-      発生した問題・Finding／重要な設計変更／Metrics・開発効率／残Technical Debt・Known Limitations／
-      次のRoadmap段階）をLLM無しで再現できること。Mobileから参照でき、到達時にCEOへ通知が届き、
-      **開発が止まらない**こと。
-
-      **完了条件（Stage B）**: 保存済みsnapshotのみを入力にCEO向け説明が生成され、生成失敗・review失敗が
-      Project進行を止めないこと。説明を再生成してもsnapshotが不変であること。
-
-      **今回実装しないもの（明記）**: 新しいReporting基盤 / 新しいlog・telemetry・metrics基盤 / cost計測 /
-      新しいreview基盤 / 新しいqueue・daemon / Milestone planning entity / Task単位の詳細Report /
-      `docs/` への自動書き込み。本項目は登録と優先順位の確定まで。
-
-      **Control Repository自身（AIteamOS本体）のMilestone記録**: 既存の
-      `docs/project_memory/decisions/*.md`（`mvp_completion.md` / `m3_final_production_e2e.md` 等）を
-      手書きで継続する。**本項目の実装対象はProject（AIteamOSが運営する開発対象）側であり、
-      Control Repository向けの生成基盤は作らない**。上記のReport項目一覧は共通の見出しとして流用してよい。
-
-<!-- roadmap:id=project-next-roadmap-continuation state=planned -->
-14. [ ] **同一Project内で次のRoadmapへ継続する（Milestone後の継続開発）** — 2026-09-13、CEO方針
-      「ProjectはMilestoneごとに分割せず最終Goalまで継続する」から派生して登録。依存: 上記13 Stage A。
-
-      **現状（実測・2026-09-13）**: 現Roadmapの完了は `getRoadmapCompletion().isComplete` として
-      **導出されるだけ**で、次のRoadmapを作る経路が無い。`ProjectStartStage` の `roadmap_regeneration`
-      （`packages/shared/src/types/project.ts`）は**Project開始workflow内でreview指摘を受けて作り直す段階**であり、
-      Milestone到達後の継続用ではない。現在CEOが継続する手段は追加Task作成（`mobile-task-create`）のみで、
-      Roadmap単位の次段階は存在しない。
-
-      **既知の制約（着手前提）**: roadmap再同期は、消えるTask/Phaseに**active Jobがあるとthrowで拒否**する
-      （`apps/api/src/storage/sqlite.ts`、`Cannot deactivate roadmap task ... because job ... is ...`）。
-      次Roadmapへの切り替えはactive Jobが0の時点でのみ成立する。
-
-      **順序（hard）**: `Milestone Snapshot保存 → 次Roadmap生成 → task_sync`。
-      snapshot未保存のまま `roadmap_active=0` にしない。
-
-      **今回実装しないもの（明記）**: Roadmap自動生成の品質改善 / 新しいplanning algorithm /
-      `ProjectStatus` への新状態追加 / Milestone planning entity。本項目は登録のみ。
 
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
