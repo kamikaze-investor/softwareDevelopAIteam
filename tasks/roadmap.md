@@ -1243,12 +1243,44 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       だけを対象に `completedTaskCount` / `totalTaskCount` / `isComplete` を計算し、
       `GET /api/projects/:id/roadmap` が `completion` として返す。Mobile は
       `apps/mobile/app/index.tsx` で全 roadmap Task 完了時に「完了」バッジを表示する。
+
+      **2026-09-13 訂正（Project Model 原則との整合。schema・status は増やさない）**:
+      本項目の表題「全Task完了をもってProject完了とみなす判定」は、CEO が確定した
+      **Project Model 原則**（1 Project = 1 Product / Business / System、Project は最終 Goal 達成まで
+      継続、MVP・Phase・Release は Project 分割ではなく Roadmap 上の Milestone）と**矛盾する**。
+      正しくは「**現ロードマップ消化判定**」であり、Project の完了ではない。
+
+      **調査結果（2026-09-13）**: 実装側は既に原則と整合していた。`ProjectStatus` に `completed` は
+      無く、Project を自動で `archived` / `paused` にするコードも存在しない（検索0件）。
+      `taskContinuation` は次 Task が無ければ静かに終わるだけで Project を終了させない。
+      **矛盾しているのは表示の意味づけだけ**である。
+
+      **最小修正（これ以上の変更はしない）**:
+      1. Mobile のバッジ文言を「完了」→「ロードマップ消化済み」相当へ変更
+         （`apps/mobile/app/index.tsx`。表示文字列のみ。schema 変更なし）
+      2. `ProjectRoadmapCompletion`（`packages/shared/src/types/project.ts`）へ、
+         `isComplete` が Goal 達成ではなく現ロードマップ消化を意味する旨の doc comment を追加
+         （改名は任意・低優先）
+      3. **Project 完了 = Goal 達成であり、CEO が判断する。自動導出しない**ことを
+         `specs/` の Project Model 原則へ明記する
+      放置すると AIteamOS 自身が Roadmap 途中で「完了」と表示される。
 <!-- roadmap:id=project-auto-ceo-alignment state=planned -->
 10. [ ] CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。
       **通知後も開発は継続し、通常チェックポイントでは停止しない**。既存の`notifier`
       （LINE/Slack）・`summaryEngine.ts`・Approval Gateの再利用を前提とし、新しい停止Gateは作らない。
       **完了条件**: Phase完了時にCEOへ通知が届き、開発が止まらないこと。CEOが修正指示を返す経路は
       「追加開発指示（追加Task作成）」を使う
+
+      **2026-09-13 追記: Milestone Report をここへ統合候補として残す（新規項目は立てない）**。
+      Project Model 原則により MVP / Phase / Release は Project 分割ではなく Roadmap 上の
+      Milestone であるため、Milestone 到達時の CEO 向け報告は**本項目の責務**に含める。
+      **新規の大規模 Reporting 基盤は作らない。** 入力はすべて既存の確定済み記録を使う:
+      `tasks/roadmap.md`（計画と差分）・Review 結果・E2E / Runtime 記録・`audit_log`・
+      `executionLogStore`。表現（非エンジニア向け日本語化）は Explainer 責務
+      （`failure-explanation-pregeneration` が扱う）へ委譲し、ここでは**事実の収集経路**だけを扱う。
+      Explainer は技術判断をせず、確定事実の言い換えに限る（推測・改変の禁止は同項目を正本とする）。
+      着手順は `cross-project-state-api` の後が自然（横断状態が取れてからの方が入力が揃うため）。
+      本項目の state・優先度は変更しない。
 <!-- roadmap:id=project-auto-meta-review-hardening state=done -->
 11. [x] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
       foundation実装完了。2026-08-14、残り3 Acceptance Criteria全件を実production経路への
@@ -1403,6 +1435,123 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **今回実装しないもの（明記）**: 本項目はFinding記録であり、PR-C（#98）のmergeとは分離する。
       新しいReviewer種別・新しいReview基盤・新しいmerge gate・base最新化専用gateは追加しない。
 
+**Milestone Reporting（2026-09-13 CEO方針追加。PLが優先順位を判断済み）**
+
+<!-- roadmap:id=milestone-report-snapshot state=planned -->
+13. [ ] **Milestone Report — 到達時点のsnapshot永続化と、CEO向け説明の分離** — 2026-09-13 CEO方針追加。
+
+      **モデル（CEO確定）**: Projectは最終Goal達成まで継続する。**ProjectをMilestoneごとに分割しない**。
+      `Project継続 → Milestone到達 → 詳細Report生成・保存 → 同一Projectで次のRoadmapへ継続`。
+      詳細Reportは**意味のある大きなMilestone限定**（MVP完了・主要Phase完了・大規模な能力追加完了）で、
+      毎Task・毎Jobでは生成しない。
+
+      **2層に分ける（CEO方針）**:
+      1. **Milestone Snapshot（machine-readableな正式記録）** — 到達時点の事実を決定論的コードで
+         組み立てて保存する。LLMを使わない。保存後は書き換えない（append-only）。
+      2. **CEO Report（非エンジニア向け説明）** — 1のsnapshotだけを入力にExplainerが生成する派生物。
+         再生成可能であり、**正式記録ではない**。既存 `PersistedTaskFailureExplanationV1`
+         （`packages/shared/src/types/task_failure_explanation.ts`）の `schemaVersion` /
+         `inputVersion` / `contentHash` と同じ形で保存し、「snapshotが正・説明が従」を型で固定する。
+
+      **なぜ「後から再構築」ではなくsnapshotなのか（実測・2026-09-13）**: roadmap再同期は消えた
+      Phase/Taskを削除せず `roadmap_active=0` にする（`apps/api/src/storage/sqlite.ts`、
+      `project_roadmap_phases` / `tasks.roadmap_active`）。`GET /api/projects/:id/roadmap` は
+      `roadmapActive` なPhaseのみを返し、`getRoadmapCompletion()`
+      （`apps/api/src/routes/projects.ts:33`）も `roadmapActive` なTaskだけを数える。
+      したがって**次のRoadmapへ進んだ瞬間に、そのMilestone時点のRoadmapと完了率は現在状態から
+      再構築できなくなる**。到達時点で確定させる理由はこれであり、新しい履歴基盤が欲しいからではない。
+
+      **再利用棚卸し（2026-09-13 実測。新しいReporting基盤を作る前にここを潰す）**:
+
+      | Report項目 | 既存source（そのまま使う） |
+      |---|---|
+      | Milestoneの目的 / 次のRoadmap段階 | `projects.goal` / `project_roadmap_phases`（active・非activeの両方） |
+      | 完成したもの / 未完了・延期したもの | `tasks`（`roadmapTaskKey` / `phase` / `status` / `acceptanceCriteria` / `commitHash`） |
+      | システム上何が変わったか | `jobs`（`commit_hash` / changedFiles / terminal state）、Worker側 `execution_log.jsonl`（`JOB_LOG_DIR`。DBには無いためpointerとして扱う） |
+      | Runtime / E2E等の実動確認結果 | `jobs` のterminal結果・`qa_results`・`watchdog_events`・`task_continuations`・`supervised_runs` |
+      | Independent Review / 品質確認 | `review_results`・`design_review_evidence`（`decision` / `independent_review_required` / `independent_review_verdict`）・`design_review_runs` |
+      | 発生した問題・Finding | `review_results.findings`（`ReviewFinding`）・`jobs.failure_explanation_json`・`incident_records` |
+      | 重要な設計変更・CEO判断 | `decision_records`・`approval_requests`・`gate_evaluations`・`audit_log` |
+      | Metrics / 開発効率 | 上記から導出（Task/Job件数・失敗/repair/retry件数・承認回数・所要時間） |
+      | CEO向け非エンジニア説明 | `apps/api/src/aiExplain/cheapAiClient.ts`（`CHEAP_AI_CONFIG` = `opencode-go` / `mimo-v2.5`）と既存の説明系prompt |
+      | 到達通知 | 既存 `apps/worker/src/notifier/`（LINE / Slack） |
+
+      → **新しい収集経路・新しいlog基盤・新しいreview基盤は要らない**。不足しているのは
+      「到達時点でこれらを1つの記録へ固定する場所」だけである。
+
+      **Metrics / Cost の扱い（実測に基づく制限）**: token・課金額の計測は**リポジトリ上に存在しない**
+      （`costUsd` / `tokenUsage` 等の実装は0件。`Cost-aware Review Router` は将来の拡張点コメントのみ）。
+      本項目で**cost計測基盤は作らない**。v1のMetricsは既存事実から決定論的に導出できるもの
+      （Task/Job件数、失敗・repair・retry件数、承認回数、人手介入回数、Milestone開始〜到達の経過時間）に
+      限定する。cost計測が必要になった場合は Design Philosophy 8（効果検証可能性）に従い別項目で判断する。
+
+      **既存決定との整合**: 上記6 `project-auto-project-roadmap-visibility`（done）は
+      「Milestone entity・Phase UUID・generic versioning systemを追加しない」と決めている。本項目もこれを維持し、
+      **Milestoneはplanning entityではなく報告時点のラベル**として扱う。Phase/Taskが所属する新しい階層は作らない。
+
+      **既存項目の統合**: 上記10 `project-auto-ceo-alignment`（Phase完了・主要機能完成時のCEO通知）は
+      本項目の通知経路として統合する。**同じ通知を二重に実装しない**。通知後も開発を止めないという
+      同項目の条件はそのまま引き継ぐ。
+
+      **段階（PL判断・2026-09-13）**:
+      - **Stage A（先行・LLM無し）** — Milestone Snapshotの組み立て・永続化・取得API・Mobile表示・
+        既存notifierによる到達通知。追加schemaは**append-onlyの1テーブルまで**を上限とし、
+        `design_review_evidence` と同じ「hash付きの確定記録」の形に倣う。
+      - **Stage B（後続・Explainer）** — snapshotからのCEO Report生成・独立review・bounded regeneration。
+        **上記5 `failure-explanation-pregeneration` が確立する経路（generator/reviewer分離・
+        `packages/shared/src/reviewSeparation.ts`・失敗分類に基づくfallback・`supervised_runs` による
+        background実行）をそのまま再利用する**。Stage Bを先に作らない。
+
+      **順序制約（hard）**: Stage Aは、下記14（同一Project内での次Roadmap継続）を有効化する**前に**着地させる。
+      snapshot未保存のまま現Roadmapを非activeにすると、その時点の事実は復元できない。
+
+      **優先度（PL判断・2026-09-13）**: productionを止めているクラスタ
+      （shared workspace dirty leakage → quarantine → worktree isolation）と、安価で影響の大きい既存Finding
+      （`worker-jobs-401-anomaly` 等）を**先に片付ける**。本項目はその後、
+      **Stage A →（`failure-explanation-pregeneration`）→ Stage B** の順で着手する。
+      理由: (1) Stage Aは既存DBの読み取りとappend-onlyの書き込みだけで、Job lifecycle・workspace所有権に
+      触れないため低リスク、(2) Stage Bを単独で作ると explainer 経路を二重実装する、
+      (3) 14を先に有効化すると記録が失われる**非可逆な**損失が出る。
+
+      **完了条件（Stage A）**: Milestone到達時点のsnapshotが1レコードとして保存され、その後にRoadmapを
+      再同期しても**保存済みsnapshotの内容が変化しない**こと。snapshotだけからReport必須項目
+      （目的／完成したもの／未完了・延期／システム上の変更／実動確認結果／Independent Review・品質確認／
+      発生した問題・Finding／重要な設計変更／Metrics・開発効率／残Technical Debt・Known Limitations／
+      次のRoadmap段階）をLLM無しで再現できること。Mobileから参照でき、到達時にCEOへ通知が届き、
+      **開発が止まらない**こと。
+
+      **完了条件（Stage B）**: 保存済みsnapshotのみを入力にCEO向け説明が生成され、生成失敗・review失敗が
+      Project進行を止めないこと。説明を再生成してもsnapshotが不変であること。
+
+      **今回実装しないもの（明記）**: 新しいReporting基盤 / 新しいlog・telemetry・metrics基盤 / cost計測 /
+      新しいreview基盤 / 新しいqueue・daemon / Milestone planning entity / Task単位の詳細Report /
+      `docs/` への自動書き込み。本項目は登録と優先順位の確定まで。
+
+      **Control Repository自身（AIteamOS本体）のMilestone記録**: 既存の
+      `docs/project_memory/decisions/*.md`（`mvp_completion.md` / `m3_final_production_e2e.md` 等）を
+      手書きで継続する。**本項目の実装対象はProject（AIteamOSが運営する開発対象）側であり、
+      Control Repository向けの生成基盤は作らない**。上記のReport項目一覧は共通の見出しとして流用してよい。
+
+<!-- roadmap:id=project-next-roadmap-continuation state=planned -->
+14. [ ] **同一Project内で次のRoadmapへ継続する（Milestone後の継続開発）** — 2026-09-13、CEO方針
+      「ProjectはMilestoneごとに分割せず最終Goalまで継続する」から派生して登録。依存: 上記13 Stage A。
+
+      **現状（実測・2026-09-13）**: 現Roadmapの完了は `getRoadmapCompletion().isComplete` として
+      **導出されるだけ**で、次のRoadmapを作る経路が無い。`ProjectStartStage` の `roadmap_regeneration`
+      （`packages/shared/src/types/project.ts`）は**Project開始workflow内でreview指摘を受けて作り直す段階**であり、
+      Milestone到達後の継続用ではない。現在CEOが継続する手段は追加Task作成（`mobile-task-create`）のみで、
+      Roadmap単位の次段階は存在しない。
+
+      **既知の制約（着手前提）**: roadmap再同期は、消えるTask/Phaseに**active Jobがあるとthrowで拒否**する
+      （`apps/api/src/storage/sqlite.ts`、`Cannot deactivate roadmap task ... because job ... is ...`）。
+      次Roadmapへの切り替えはactive Jobが0の時点でのみ成立する。
+
+      **順序（hard）**: `Milestone Snapshot保存 → 次Roadmap生成 → task_sync`。
+      snapshot未保存のまま `roadmap_active=0` にしない。
+
+      **今回実装しないもの（明記）**: Roadmap自動生成の品質改善 / 新しいplanning algorithm /
+      `ProjectStatus` への新状態追加 / Milestone planning entity。本項目は登録のみ。
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
@@ -1433,6 +1582,23 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       active-owner 制約も無い**ため、所有権は durable な制約ではなく運用構成に依存している。
       これは containment とは別 root cause であり、本項目（atomic claim / ownership・lease）で扱う。
       新規 Finding は起こさない（重複のため）。
+
+      **2026-09-13 訂正（stale ledger の是正。挙動変更なし）**: 上記本文の
+      「`recoverStaleJobs()` が起動時に全Projectの running Job を無条件 failed にする」は
+      **PR-C 以前の記述であり、現在は事実ではない**。現行の `recoverStaleJobs()`
+      （`jobStateManager.ts:138-183`）は Project / Task を走査するが、実際の処理は
+      **per-job** の `reconcileRunningJobAtStartup(job)` で、
+      `verifyWorkspaceAgainstBaseline(job.safeCommand.workingDir, job.workspaceBaseline)` により
+      検証し、検証できない場合は quarantine する（無条件 failed ではない）。
+      同じ stale な記述が `project-auto-worker-trust-boundary`（done）本文にも残っているが、
+      そちらは**完了時点の調査記録**なので履歴として保持し、書き換えない。
+      本項目が扱う真の欠落（`jobs` schema の `working_dir` lease / active-owner 制約が無いこと、
+      queued 取得と `running` 更新が非 atomic であること）は上記のとおり変わらない。
+
+      **2026-09-13 追記（依存関係）**: 本項目の前提は `project-workspace-isolation` である。
+      Project 単位で workspace が分離されるまで、複数 Worker は同一 workspace を奪い合う。
+      分離後も**単一 Worker 前提と `flock -n` は維持する**（`project-workspace-isolation` の
+      スコープ外と明記済み）。本項目は `deferred` のまま据え置く。
 <!-- roadmap:id=project-auto-resource-allocation state=deferred -->
 4. [ ] **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に
       完全未登録であることを確認済み。単一Worker前提のMVPでは配分問題自体が発生しないため
@@ -2202,6 +2368,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    新しいstatus体系を作らず、既存のevidence行とstart_stageで表現できるかをまず検討する。
 <!-- roadmap:id=review-substage-progress-reporting state=planned -->
 0. [ ] **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。
+
+   **2026-09-13 追記**: 本項目は `cross-project-state-api`（Review 状態の横断読み出し）に
+   **包含される**。単独で着手せず、同項目の受入条件として扱う（重複実装を避けるため）。
 
    **現状**: APIから見るとWhole-Roadmap Reviewは`executeRoadmapReviewToTerminal()`の
    **1回のatomicな呼び出し**である。focused review（Gemini ×3）が終わって
@@ -3081,6 +3250,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 <!-- roadmap:id=quarantined-dirty-task-generic-recovery state=planned -->
 0. [ ] **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い**
+   **【2026-09-13 注記】`project-workspace-isolation` は本項目を閉じない。** 分離後も
+   1 Project 内で quarantine は発生し、復旧手段が無い状態は変わらない。
+   縮小するのは影響範囲（他 Project が巻き添えで停止しなくなる）だけである。
    （2026-09-11登録、**高優先度**。Production E2E test 8 で実際に復旧不能になった。
    PR #150 には混ぜない）。
 
@@ -3286,6 +3458,10 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 <!-- roadmap:id=orphan-dirty-workspace-no-owner state=deferred -->
 0. [ ] **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**
+   **【2026-09-13 注記】`project-workspace-isolation`（Project 単位 workspace 分離）は本項目を
+   閉じない。** per-project 分離が縮小するのは波及範囲（他 Project を巻き込まなくなる）だけで、
+   1 Project 内の orphan dirty は残る。本項目を構造的に解消しうるのは
+   **per-job worktree 分離（1 Job = 1 worktree）**であり、それは別ステップである。
    （2026-09-12登録、**高優先度・MVP後defer**。M1 を M1-a / M1-b に分割したうちの後半。
    M1-a は PR #154 で完了済み。**本項目の実装は MVP 完成まで開始しない**）。
 
@@ -3318,6 +3494,10 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 <!-- roadmap:id=workspace-ownership-content-identity state=deferred -->
 0. [ ] **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**
+   **【2026-09-13 注記】`project-workspace-isolation` は本項目を閉じない。** 分離後も
+   1 Project 内の fallback ownership は同じ根拠で判定するため、content identity は依然として
+   証明しない。運用境界（active / blocked な target workspace を人間が直接編集しない）も
+   Project ごとに同じまま維持する。
    （2026-09-12登録。M1-a / PR #154 の独立レビュー CLAIM 7。**Codex Sol round 2 は
    `REJECT blocking=1` のまま**であり、blocking 0 にはなっていない。
    CEO が「accepted known limitation」として merge を判断した）。
@@ -3652,7 +3832,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 **MVP完成宣言前の必須クリーンアップ（MVP必須5項目とは別枠。最後に実施する）:**
 
 <!-- roadmap:id=temp-mvp-completion-policy-cleanup state=done -->
-- [x] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — **完了（2026-09-13）**。MVP完成宣言の**直前**に、期限付き方針
+1. [x] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — **完了（2026-09-13）**。MVP完成宣言の**直前**に、期限付き方針
       `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章 と `CLAUDE.md` 冒頭のポインタ段落）を
       共通指示から完全に削除し、repository全文検索で共通開発指示として残っていないことを確認し、
       削除commitをMVP completionに含める。
@@ -3700,6 +3880,18 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       `docs/PROJECT_CURRENT_STATE.md` の `AUTO-GENERATED:ROADMAP_CURRENT_STATE` ブロックは
       **stale のまま**である（CI は `typecheck` / `test` のみを実行するため CI は落ちない）。
       M4 で本項目を正規形式へ直す際に、残り4件も併せて解消するか判断すること。
+
+      **2026-09-13 進捗**: 本項目の `- [ ]` → `1. [x]` 是正は**完了**（Post-MVP 棚卸しの一環）。
+      `pnpm roadmap:check` の報告は **5件 → 4件**へ減った。残る4件はいずれも
+      **roadmap.md の編集では直せず parser 側の修正を要する**ため未着手:
+      `priority=high` 付き metadata 3件（`ROADMAP_METADATA_REGEX` が `id` / `state` の2属性しか
+      受け付けない。line 2203 / 2277 / 3575）と、`roadmap-generation-constraint-compliance` の
+      `[~]` 表記1件（`CHECKBOX_LINE_REGEX` が `( |x)` しか受け付けない。line 1855）。
+      `[~]` を `[ ]` へ倒すと「進行中」という情報が失われるため、**parser 側で `~` と
+      追加属性を受け付ける**のが正しい修正である（`apps/worker/scripts/roadmap/`。テストを伴う
+      コード変更のため、roadmap 統合とは別タスクとして扱う）。
+      **`roadmap:sync` は依然として実行できず、`PROJECT_CURRENT_STATE.md` の自動生成ブロックは
+      stale のままである。** 本ファイルと実装を直接読む場合はその前提で扱うこと。
 
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
@@ -4048,6 +4240,16 @@ worktree isolation の**実装は未着手**。つまり現状、この cluster 
 **open な owner 項目が無い**。新しい重複 Finding を作るのではなく、
 この項目の state を実態に合わせるか、実装用の後継項目を1件立てるかを先に決めること。
 
+**→ 決着（2026-09-13, CEO承認済み）**: **後継項目を1件だけ立てる**方を選んだ。
+`project-workspace-isolation`（下記 0 番）がこの cluster の実装 owner である。
+`project-auto-worker-trust-boundary` は設計項目としては実際に完了しているので
+`state=done` のまま触らない。**新しい重複 Finding は作っていない。**
+
+ただし後継項目のスコープは、この handoff が想定していた
+**「1 Job = 1 worktree」ではなく「1 Project = 1 workspace」**である。両者は分離可能な
+別ステップであり、`project-workspace-isolation` は後者のみを扱う
+（理由と、前者でなければ解消しない Finding については当該項目を参照）。
+
 **最初に行う read-only 調査（実装前）**:
 1. 残った変更の**帰属**を既存情報だけで特定できるか。`workspace_baseline` /
    `buildWorktreeManifest` / `fingerprintWorktreeEntries` / repair 情報から
@@ -4078,6 +4280,119 @@ P1 Phase 2（async per-job cgroup containment）は**いずれも完了**して�
 reconciliation 成功後にのみ Job を terminalize する。production 実動確認では
 `outcome:'killed'` / `killedDescendants:true` / drain 22ms / cgroup 削除済み を実測し、
 deploy canary は全 PASS だった。
+
+<!-- roadmap:id=project-workspace-isolation state=planned -->
+0. [ ] **Project 単位 workspace 分離（Multi-Project の前提・最優先）** — 2026-09-13登録。
+      上記 cluster の**実装 owner 項目**（`project-auto-worker-trust-boundary` の後継1件）。
+      CEO が 4-3 安全境界方針を承認済み。S1〜S3 は通常の Roadmap 開発として進めてよい。
+
+      **解く問題**: 現在すべての Project が単一の `/workspace/target` を共有し、
+      `fetchQueuedJob()` が全 running Project の Task を1配列へ平坦化して
+      **グローバルに単一の** `resolveWorkspaceOwnership()` を解く。結果、Project A の dirty /
+      `ambiguous` / 進行中 git 操作が **Project B を含む全 Project の claim を止める**。
+      これは「Multi-Project が未実装」ではなく「**動かすと相互に停止する**」状態である。
+
+      **今それが表面化していない理由（＝着手順序を決めている制約）**: DB の partial unique index
+      `ux_projects_single_running`（`schema.ts`）が running Project を1件に制限している。
+      この interlock が共有 workspace を現在安全に保っている。**先に workspace を分けずに
+      interlock を外すと即座に事故る。** 順序は選択ではなく強制されている。
+
+      **調査で判明した最重要事実（2026-09-13, read-only 調査）**: 実行・recovery 経路は
+      **すでに `workingDir` パラメータ駆動**である。`jobRunner.ts` は全面的に
+      `job.safeCommand.workingDir` を使い（`436` / `785` / `922` ほか）、
+      `computeWorkspaceBaseline(job, workingDir)` / `verifyWorkspaceAgainstBaseline(workingDir, ...)` /
+      `detectGitOperationState(workingDir)` / `buildWorktreeManifest(workingDir)` /
+      `observeWorkspace(workingDir)` はいずれも引数で受け取る。`resolveWorkspaceOwnership()` も
+      第2引数に `workingDir` を持つ。**`TARGET_ROOT` はデータ経路ではなく値の供給元が固定されて
+      いるだけ**であり、新しい workspace 管理サブシステムは要らない。
+
+      **`TARGET_ROOT` / `TARGET_WORKING_DIR` 実参照（dist・test 除く）**:
+      (A) 検証境界2箇所（`guards/permissionGuard.ts:110`・`aiCli/adapter.ts:393`）、
+      (B) デフォルト引数2箇所（`utils/pathUtils.ts:49`・`index.ts:243`）、
+      (C) レビュー経路のハードコード3箇所（`approvalLevel/reviewerAdapter.ts:267` /
+      `:389`・`metaReviewer/strategicReview.ts:502`）、
+      (D) API 側 Job 生成時の値7箇所（`routes/jobs.ts`・`storage/sqlite.ts`・
+      `ctoAi/initialImplementWorkflow.ts`・`routes/approvalGate.ts`）。
+      加えて `routes/ctoAi.ts:81` が設定値と異なる `targetProjectRoot` を能動的に拒否する。
+
+      **workspace root の決定方式（CEO 安全不変条件・2026-09-13）**:
+      **任意 path を永続化しない。** Project ID から server 側で決定的に導出する。
+      `projects.id` は `randomUUID()` で **server 生成**・PK・不変・一意であるため、
+      導出結果は自動的に「server 側のみが生成」「一意」「作成後変更不可」「client 偽造不能」を満たす。
+      - `derived` レイアウト: `join(WORKSPACE_BASE, 'projects', project.id)`
+      - `legacy` レイアウト: 定数 `/workspace/target`（既存 Project 用。**移行しない**）
+      - 永続化するのは **path ではなくレイアウト選択子**のみ:
+        `projects.workspace_layout TEXT NOT NULL DEFAULT 'legacy'`（`'legacy'|'derived'`）。
+        新規 Project のみ server が `'derived'` を設定する
+      - `workspace_layout` は `CreateProjectBody` / `UpdateProjectBody` のどちらにも追加しない
+        （後者は `.strict()` のため未知キーは 400 で拒否される）
+      - 解決結果は常に canonical 化し、`WORKSPACE_BASE` 配下であることを再検証する
+      - **Job payload（`job.safeCommand.workingDir`）を Source of Truth にしない。**
+        Worker は project レコードから独立に解決し、Job の値と**一致するか**を検証する
+      → **Project B が Project A の workspace root を指定する余地は構造的に存在しない**
+        （導出関数の入力が `project.id` だけであるため）。
+
+      **既知の受容事項**: `legacy` な既存 Project 同士は引き続き同一 root を共有する
+      （＝今日と同じ挙動）。これは interlock が running を1件に制限している限り安全であり、
+      本項目では移行しない。interlock 解除時の扱いは下記受入条件を参照。
+
+      **安全境界（CEO 承認済み・2026-09-13）**: `isInsideTargetRoot()` の定数境界を
+      **2段判定**へ置き換える。
+      1. `dir` が `WORKSPACE_BASE` 配下か（偽造不能。現在と同等の強度を維持）
+      2. `dir` が当該 Job の Project root と一致するか（**現在は存在しない追加制約**）
+      判定1が現行保証を維持し、判定2が Project 間アクセスを新たに禁止する。
+      よって境界は緩まず**厳しくなる**。API が `safeCommand.workingDir` を server 側で
+      上書きする既存不変条件（`routes/jobs.ts:395`）は維持する。
+
+      **本項目のスコープ外（明記）**: **1 Job = 1 worktree（per-job 分離）は含めない。**
+      per-project 分離は波及範囲を1 Project へ縮小するだけで、Project 内の orphan dirty は
+      解消しない。`orphan-dirty-workspace-no-owner`（M1-b）・
+      `quarantined-dirty-task-generic-recovery`・`workspace-ownership-content-identity` は
+      **本項目では閉じない**（per-job worktree 側の課題）。
+      複数 Worker 対応も含めない（`project-auto-multi-worker`。単一 Worker 前提と
+      host の `flock -n` は維持する）。
+
+      **廃止する既存機構は無い**。admission（`computeWorkspaceBaseline`）・quarantine・
+      startup reconciliation・M1-a fallback・#158 の stale-blocked 解放判定は、
+      1 Project 内でも同じ理由で必要であり全て残す。変わるのは適用範囲
+      （全体で1つ → Project ごとに1つ）だけである。
+
+      **段階導入（各段階で前段へ rollback 可能）**:
+      - **S1**: `workspace_layout` 列を additive に追加（誰も読まない・誰も書かない）。
+        旧コードは列を無視するため rollback 互換
+      - **S2**: 解決関数を導入。既存 Project は全て `'legacy'` のため
+        **全員 `/workspace/target` に解決＝本番挙動ゼロ変化**
+      - **S3**: 2段ガード・レビュー3経路・`fetchQueuedJob()` の claim ループを変更。
+        **2つ目の Project はまだ作らない**。`ambiguous` 時の `return null` を
+        `continue` へ変えるのが Project 間波及を断つ本質的な差分
+      - **S4**: 検証環境で2つ目の Project を作り下記 E2E を実施（本項目の完了条件）
+      **S3 までは本番挙動が変わらない**（全 Project が `'legacy'` に解決されるため）。
+      これが最大の安全弁である。
+
+      **S3 の必須検証（CEO 指示・省略しない）**: 既存単一 Project の regression、
+      Independent Review、Runtime / E2E、deploy canary。Guard と claim 経路そのものが
+      変わるため、「挙動互換だから省略してよい」とは扱わない。
+
+      **Project 間非波及 E2E（検証環境。A=既存 legacy / B=新規 derived）**:
+      - E2E-1: A の workspace を dirty で放置 → A 停止・**B は claim して完走**
+      - E2E-2: A を quarantine → A は fail-closed 維持・**B 無影響**
+      - E2E-3: A に `index.lock` / `MERGE_HEAD` を残す → A の admission fail-closed・**B 無影響**
+      - E2E-4: A を承認待ち blocked で放置し B で commit して HEAD を進める →
+        A の帰属判定が B の HEAD 移動で壊れない（別 workspace のため構造的に不可能なことを確認）。
+        **現行設計で最も起きやすい相互破壊がこれ**
+      - E2E-5: B の Job が A の workspace path を指す偽造 Job → Permission Guard が拒否（判定2）
+
+      **`SingleRunningProjectError` 解除の受入条件（解除は本項目と分離した後続変更）**:
+      1. S1〜S3 完了、既存 Project が無変更で動作すること
+      2. 2段ガードが Project 間アクセスを拒否することをテストで固定
+      3. レビュー3経路が subject の Project root を使うこと
+      4. claim の ownership 判定が Project 内で閉じること
+      5. E2E-1〜5 が実測 PASS
+      6. 単一 Worker 前提を維持（`flock -n` はそのまま）
+      7. 解除時は `ux_projects_single_running` を**撤廃ではなく縮小**する:
+         「running な `legacy` Project は最大1件」へ置き換える。`derived` Project は無制約。
+         legacy 同士の root 共有という受容事項が、解除後も破られないようにするため
+      **上記が全て満たされるまで interlock は維持する（CEO 指示）。**
 
 <!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
 1. [ ] **Harness Bake-off / Execution Runtime Evaluation** — High-priority Recovery修正が一段落した後、
@@ -4194,6 +4509,11 @@ deploy canary は全 PASS だった。
 4. [ ] **Containment success path の可観測性（低優先 hardening）** — 2026-09-08、P1 Phase 1/2
       Operational E2E の完走後に記録。**Phase 1/2 を reopen する必要は無い。動作は正常。**
 
+      **2026-09-13 追記**: 本項目は `cross-project-state-api` に**包含される**。
+      単独で着手せず、同項目の受入条件として扱う（重複実装を避けるため）。
+      本項目の方針「新しい telemetry 基盤・ログ収集系は作らない／Job あたり1行以内」は
+      そのまま `cross-project-state-api` 側でも維持する。
+
       **現状**: 失敗経路（drain_timeout / cleanup_failed / kill_failed 等）は quarantine と
       CRITICAL alert として明確に残るが、**成功経路**の
       `per-job cgroup 作成 → recursive populated=0 → cgroup 削除` は通常ログから追いにくい。
@@ -4218,6 +4538,33 @@ deploy canary は全 PASS だった。
       2026-09-10 登録。**本項目は明示的に post-MVP。MVP 完成まで説明品質改善を理由に
       本線を止めない**（CEO 判断・2026-09-10）。
       #130（predicate regression 修正）とは**別責務**。#130 / Phase 3 closure を先に完了する。
+
+      **2026-09-13 スコープ拡張: 本項目を Explainer 責務の owner とする（新規項目は立てない）**。
+      調査の結果、Explainer は**既に3箇所に散在して実装済み**であることを確認した:
+      `apps/api/src/aiExplain/cheapAiClient.ts`（`role: 'cheap_explainer'`、
+      `opencode-go` / `mimo-v2.5` をハードコード）を
+      `approvalExplain/approvalAi.ts` と `taskFailureExplain/taskFailureAi.ts` が共用し、
+      `/approval-requests/:id/explanation`・`/:id/ask`・`/:id/failure-explanation`・
+      `/:id/failure-ask` が稼働している。**したがって新規能力の追加ではなく、
+      散在した3つを1責務へ統合し、対象を失敗説明から進捗・完了・Milestone 報告へ広げる作業**である。
+      **4つ目の Explainer 実装を作らないこと。**
+
+      あわせて、これまで別枠に置かれていた UX 残タスク
+      「承認画面の説明導線（`apps/mobile/app/approvals.tsx:158` の文言に対応する導線が無い）」は
+      **本項目へ吸収する**（重複管理しない）。
+
+      **Explainer の責務境界（固定する）**: 技術判断をしない。
+      入力は PL / Review / Test / Runtime が**既に確定させた事実**のみ
+      （Source of Truth はそれらの記録であり、Explainer 自身ではない）。
+      何をやったか / 何が実現したか / 何が問題だったか / ユーザーから見て何が変わるか /
+      未解決事項 / 次に何をするか を、専門用語を最小限にした日本語で述べる。
+      **推測・改変を禁止し、不明なことは「不明」と出力する。**
+      最高性能モデルの常用は不要で、軽量モデルを選択できることを要件とする
+      （モデル選択は `role-model-registry` の対応表で行い、ここに別の選択機構を作らない）。
+
+      **依存**: `role-model-registry`（役割別に軽量モデルを指定できるようになってから着手するのが自然）。
+      Milestone Report の文章表現は本項目が担い、事実収集は
+      `project-auto-ceo-alignment` が担う（責務分離）。
 
       **2026-09-10 CEO 実機確認の結果**: 技術的な実経路
       （Mobile → API → failure explanation 生成 → AI response → Mobile 表示）は**成立**し、
@@ -4653,6 +5000,41 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
       成功/失敗・Retry回数・Rubric達成状況・Reviewで発見された重大問題・**修正/再試行を含む完了までの
       総コスト**を記録する。既存Telemetry（`executionLogStore.ts`等）へ統合し、独立コンポーネントにしない
 
+      **2026-09-13 追記（実測）**: 現在リポジトリ全体に `tokenUsage` / `inputTokens` / `costUsd`
+      等のコスト・使用量記録は**1箇所も存在しない**（検索ヒット0件）。したがって本項目は
+      「既存記録の拡張」ではなく**最初の1本を通す**作業である。ただし新しい metrics backend は
+      作らず、既存 `executionLogStore.ts` への追記に留める方針は変えない。
+      Design Philosophy 8（効果検証可能性）を満たすための前提であり、
+      `role-model-registry` の効果測定もこの記録が無いと行えない。
+
+<!-- roadmap:id=role-model-registry state=planned -->
+1. [ ] **Role / Provider / Model Registry（役割別ルーティング設定表）** — 2026-09-13登録。
+      **新規サブシステムではなく、既に散在している設定を1箇所へ引き上げる作業**である。
+
+      **既に存在するもの（作り直さない）**: `AiCliRequest`（`packages/shared/src/types/ai_cli.ts`）は
+      `model` / `reasoningEffort` / `fallbackPolicy` / `timeoutMs` を**既に持つ**。
+      `Task.provider`（1タスク=1プロバイダー原則）と `aiCli/factory.ts` の4 adapter も稼働中。
+      2026-09-07 に production VPS で `gpt-5.6-sol` + `xhigh` の実動を確認済み。
+      `apps/api/src/aiExplain/cheapAiClient.ts` は `role: 'cheap_explainer'` /
+      `provider: 'opencode-go'` / `model: 'mimo-v2.5'` を**ハードコード定数**として持つ。
+      **欠けているのは「役割 → 設定」の対応表1枚だけ**である。
+
+      **やること**: PL / Implementer / Reviewer / Researcher / Meta Reviewer / Explainer 等の役割ごとに
+      provider・model・reasoning level・fallback・cost policy・data sensitivity を
+      設定・変更できる単一の対応表を持つ。`CHEAP_AI_CONFIG` と `Task.provider` の既定値を
+      そこへ引き上げる。高性能モデルを全処理へ使わず、役割に必要な能力で選べるようにする。
+
+      **維持する不変条件**: 生成担当と独立Review担当の provider 分離（既存の独立性原則）を
+      対応表で表現できること。ここを緩める設定を可能にしない。
+
+      **今回やらないこと（明記）**: Dynamic Model Routing / 自動モデル昇格 / ベンチマーク基盤 /
+      Model Registry Lite 本体（Phase 2）/ 新しい Gate。本項目は静的な対応表のみ。
+      `project-auto-gemini-worker-eligibility` は本項目の**最初の適用事例**として扱い、
+      別枠の Provider 評価の仕組みは作らない。
+
+      **依存**: `project-workspace-isolation` とは独立で、並行実施できる。
+      Model Usage Telemetry（上記）と対で入れると効果検証が可能になる。
+
 **MVP完成後・Phase 2:**
 - [ ] Model Registry Lite — Plannerが参照する、モデルの能力・制約・コスト・状態のレジストリ
       （provider・model identifier・状態・コスト・コンテキスト上限・対応機能・推奨用途・既知の制約・
@@ -4936,6 +5318,41 @@ Docker Up / systemd active / URL 200 だけでは、アプリ内部の主要処�
 **位置づけ:** 将来の重要基盤だが、**現在の完成作業を遅らせない低優先度タスク**。
 Phase 1c E2E・Recovery・Worker・Gate・Roadmap実行系などの**本線安定化を常に優先する**。
 本セクションは検討・評価のための項目であり、登録時点では実装・PoC・本線変更を一切行っていない。
+
+**2026-09-13 追記**: 下記 PL Console 4項目（いずれも `deferred`）の**前提**として
+`cross-project-state-api` を新規登録した。見た目の Console より先に
+「正確な状態・イベントが取得できること」を優先する方針であり、
+PL Console 4項目の state・優先度は変更していない。
+
+<!-- roadmap:id=cross-project-state-api state=planned -->
+0. [ ] **横断状態読み出し API（Console より先に、状態が取れることを優先）** — 2026-09-13登録。
+      **新しい UI・新しい telemetry 基盤・新しいダッシュボードは作らない。**
+
+      **解く問題**: 既存エンドポイントはすべて Project 単位か entity 単位であり、
+      「いまシステム全体で何が起きているか」に答えられるものが無い。
+      人間だけでなく **AI 自身が現在状態を理解できること**を目的とする。
+
+      **既に存在する素材（再利用する）**: `/dashboard`・`/kg/health-score`・`/kg/timeline`・
+      `/watchdog-events`・`gate_evaluations`・`design_review_runs`・`supervised_runs`・
+      `audit_log`・`executionLogStore`・`jobs.failure_explanation_json`。
+      不足しているのは**横断して1度に読む口**と、下記の `project_id` である。
+
+      **やること**:
+      - Project ごとに Roadmap 進捗 / Current Task / Job / Provider・Model / Review 状態 /
+        Approval 待ち / error / retry / recovery / cost / runtime progress を返す読み出し口
+      - `audit_log` へ `project_id` を追加（**additive**。既存4箇所程度の書き込み側を更新）。
+        Project 単位で event を切れるようにする
+      - cost は `role-model-registry` 対の Model Usage Telemetry が入って初めて実値になる。
+        未記録の間は「未計測」を明示し、**推測値を返さない**
+
+      **AIcompanyOS 互換の最小範囲**: `audit_log.project_id` と上記読み出し口までを
+      「後から全 Project を大改修せずに済む最小情報構造」とする。
+      **Business Goal / Success Metrics / Target Customer 等の Business Management 項目は
+      AIteamOS へ持ち込まない**（AIteamOS と AIcompanyOS の責務境界を維持する）。
+
+      **依存**: `project-workspace-isolation`（Project が実際に並行しないと横断の意味が薄い）。
+      `containment-success-path-observability` と `review-substage-progress-reporting` は
+      本項目に**包含される**（重複実装しない。両項目は本項目の受入条件へ畳む）。
 
 **目的:**
 - CEOがPC/スマホからPL（Project Lead Role）へ指示を出す画面を、特定ベンダーUI
