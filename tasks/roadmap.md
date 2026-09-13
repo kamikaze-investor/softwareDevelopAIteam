@@ -3134,6 +3134,114 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    quarantine 済み Job `01de09fc` と `quarantineReason` がそのまま残っており、
    本 Finding の実機再現材料として参照できる。
 
+<!-- roadmap:id=done-task-stale-blocked-job-owns-workspace state=done -->
+0. [x] **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける** — 完了（2026-09-13）
+   （2026-09-12登録、**MVP-BLOCKING（CEO判断）**。`approval-expired-waiting-blocks-resume` の
+   修正を Production で検証した直後に発覚。commit は成功したのに後続が進まなかった）。
+
+   **内容**: `findWorkspaceOwningTaskId()`（`apps/worker/src/index.ts`）は Job の status だけで
+   所有者を決め、**Task の status を一切見ていなかった**。`resumeBlockedTask()` は新しい Job を
+   別行として作り、旧 `blocked` 行を監査証跡として残す（`approveAndResumeJob()` は同一行を
+   `blocked -> queued` へ UPDATE するので滞留しない）。そのため resume 経路でだけ
+   「`done` Task に blocked 行が残る」状態が生まれ、所有権が永久に解放されなかった。
+
+   **実害**: 期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が解放されず、
+   後続 Task / Project が進まない。解放手段が **archive / pause しか無い**状態は
+   Design Philosophy 1「スマホ完結」を満たさない。
+
+   **Production 実測（2026-09-12）**: 同一形状が **4件**。いずれも
+   `review:…:git-commit` の blocked 行 + より新しい Job 1件で、いずれも archived / paused。
+   つまり過去の run はすべて archive/pause でしか解放されていなかった。
+   `1d50d5d7`/`e60ba617`（Production E2E test 10）、`240d1949`/`9b1789e2`（Phase1b Approval Level
+   較正検証用）、`3a1aff17`/`83041277`（Phase1 Shadow Gate 検証用）、
+   `9a9c9423`/`7a014347`（E2E確認用プロジェクト9）。
+
+   **修正（最小）**: 「終わった Task に取り残された blocked 行」は所有権を**無条件には**持たず、
+   **workspace がまだ使用中の間だけ**所有者として振る舞う。手放してよい状態になれば自然に解放する。
+   候補条件は (1) Task が `done` (2) その blocked Job が quarantine されていない の2つだけで、
+   解放するか否かは worktree の実観測が決める。
+
+   **解放条件は admission の拒否条件すべてにそろえる（独立レビュー round 3・4・5 の指摘）**:
+   `computeWorkspaceBaseline()` が clean を拒否する条件は3つあり、どれか1つでも成立していれば
+   次の Task は始められない。manifest の空だけで手放すと、所有者不在のまま後続 Task の
+   initial-implement が必ず失敗する。そこで解放条件を次の3つすべてとした:
+   1. manifest が空
+   2. 進行中の git 操作が無い（`detectGitOperationState()`。manifest を読む**前に**判定される。
+      `index.lock` / `MERGE_HEAD` / rebase 途中など）
+   3. HEAD を解決できる（`requireCommitHash()` と同じく undefined と空文字の両方を拒否）
+   2・3 の確認に失敗した場合も「問題無し」とみなさず保持する（fail-closed）。
+   2・3 は manifest が空のときだけ行うので、通常の cycle に追加コストは乗らない。
+   `running` / `queued` の判定、cleanup / quarantine / resume / repair の条件は一切変更していない。
+
+   **durable な自己申告を信用しない（独立レビュー round 1・2 の指摘）**: 当初案は
+   `task.status === 'done'` だけを、次案は `commitHash` + `createdAt` の追い越しを条件にしたが、
+   **どれも「もう dirty が無い」ことの証明にならない**ことが判明した。
+   - `task.status` は `PATCH /api/tasks/:id` が検証なしで書き込む（`apps/api/src/routes/tasks.ts`）
+   - `job.commitHash` は `PATCH /api/jobs/:id` が検証なしで受け取る（`apps/api/src/routes/jobs.ts`）。
+     逆に commit 後・永続化前に落ちれば欠ける
+   - `createdAt` の大小は因果順ではない（clock skew で逆転しうる）
+   - 正当な commit でも、commit 後に残る差分（post-commit dirt）はありうる
+   いずれの経路でも、誤って手放すと後続 Task の initial-implement が clean worktree 要件で死ぬ。
+   そこで判定を durable state から **worktree の実観測**へ移した。dirty なら由来を問わず保持する
+   （安全側）。これにより上記4経路はすべて構造的に無効化される。
+
+   **例外**: quarantine された blocked Job は worktree が clean でも所有権を維持する
+   （PR-C の hard invariant「安全と証明できない限り所有権を解放しない」を優先）。
+   この場合は worktree を観測せずに owner を確定する。
+
+   **poll cost**: **所有権判定が行う**観測は「強い owner が居ない かつ 滞留候補または
+   blocked Task が居る」cycle だけで、その場合も `buildWorktreeManifest()` は最大1回
+   （M1-a で確立した性質をそのまま維持している）。強い owner が居る cycle では一切観測しない。
+   なお claim 後の `computeWorkspaceBaseline()` は admission のために別途 manifest を読むため、
+   **poll cycle 全体としては 1 回ではない**。これは本項目以前からの既存挙動で、変更していない。
+
+   **旧 blocked 行は残したまま**にしている。行を残すのは既存設計で
+   `resumeBlockedGitCommitJob.test.ts` が固定しており、監査証跡でもあるため、
+   行には触れず**所有権の述語だけ**を直した。
+   **回帰テスト**: `apps/worker/src/workspaceOwnerDoneTask.test.ts`（41件）。
+   上記 Production 4件を fixture として使用している。**修正を外すと 15 件が落ちる**
+   （解放側 = 本項目が直した挙動）。残りは既存挙動の固定（running / queued / pending /
+   blocked / quarantine / initial-implement / M1-a fallback / resume・repair 中の dirty /
+   強い owner が居る cycle では観測しない）と、保持側の新分岐
+   （外部 PATCH で done + dirty / commit 後の残差 dirty / 進行中 git 操作 / HEAD 未解決 /
+   各検出の失敗時 fail-closed / 候補複数時の fail-closed / poll cost）である。
+
+<!-- roadmap:id=m3-final-production-e2e state=done -->
+0. [x] **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）** — **PASS（2026-09-13）**
+   （2026-09-13登録、**MVP-BLOCKING**。これが PASS するまで
+   `TEMP_MVP_COMPLETION_POLICY` を削除しない、としていた条件を満たした）。
+
+   **要件**（すべて満たすこと）:
+   - 実アプリから新規 Project Start
+   - **Roadmap Generator 自身が 2 Task + dependency を生成する**（手動 Task 追加なし）
+   - CEO 操作は Approval のみ
+   - **手動 resume なし**
+   - Task 1 commit → backend continuation → Task 2 implement/review → Task 2 Approval Gate
+     まで到達すること
+
+   **2026-09-12〜13 の run は PASS に数えない（CEO 判断）**: Generator が Task を1件しか
+   生成せず、Task 2 を手動 `POST /api/tasks` で追加したため。用途を限定し
+   「CEO approval 後、手動 resume なしで Task 1 commit まで進める happy-path regression」の
+   証拠として記録した。**後半（continuation → Task 2 implement/review）は証明していない**:
+   手動追加した Task は `roadmap_active = 0` であり `selectNextContinuableTask()` の
+   対象に入らないため、continuation は `next_task_id: null` で終了した。
+   記録: `docs/project_memory/decisions/approval_to_commit_happy_path_regression.md`。
+
+   **その run で掘り当てた MVP-BLOCKING 2件は修正済み**:
+   `approval-expired-waiting-blocks-resume`（PR #156）と
+   `done-task-stale-blocked-job-owns-workspace`（PR #158）。
+
+   **PASS（2026-09-13, Project `ec7d5e1f`）**: 要件6項目すべてを Production で実測した。
+   Roadmap Generator が `task-001`（phase 1 / `allowedPaths=["checks.js"]`）と
+   `task-002`（phase 2 / `deps=[task-001]` / `allowedPaths=["test.js"]`）を自力で生成し、
+   手動 Task 追加は無い。CEO 操作は `approval-20260912-1958c3e1` の承認1回のみ。
+   承認後、**Task 1 commit 成功（`8dfaf33`）から Task 2 Approval Gate 到達まで 101 秒**を
+   すべて backend 駆動で通過した（continuation `7ae7d9e0` → Task 2 initial-implement →
+   review → git_commit blocked → 新 Approval Request `cf65df28` が waiting 一覧に出現）。
+   **手動 resume は 0**: `resume:` / `repair:` / `retry:` Job はいずれも 0 件、
+   API ログの `/resume` リクエストも 0 件。
+   記録: `docs/project_memory/decisions/m3_final_production_e2e.md`。
+
 <!-- roadmap:id=approval-expired-waiting-blocks-resume state=done -->
 0. [x] **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
    — 完了（2026-09-13）
@@ -3543,14 +3651,27 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 **MVP完成宣言前の必須クリーンアップ（MVP必須5項目とは別枠。最後に実施する）:**
 
-<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=planned -->
-- [ ] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — MVP完成宣言の**直前**に、期限付き方針
+<!-- roadmap:id=temp-mvp-completion-policy-cleanup state=done -->
+- [x] **`TEMP_MVP_COMPLETION_POLICY cleanup`** — **完了（2026-09-13）**。MVP完成宣言の**直前**に、期限付き方針
       `TEMP_MVP_COMPLETION_POLICY`（`AGENTS.md` 0章 と `CLAUDE.md` 冒頭のポインタ段落）を
       共通指示から完全に削除し、repository全文検索で共通開発指示として残っていないことを確認し、
       削除commitをMVP completionに含める。
       **完了条件・手順の正本**: `specs/10_mvp_scope.md` 12章「TEMP_MVP_COMPLETION_POLICY cleanup」。
       **このcleanupが完了するまでMVPを「完成」と記録しない。**
       一時ポリシーの内容を恒久的なDesign Philosophy・一般開発原則へ自動転記しないこと。
+
+      **完了（2026-09-13）**: M3 最終 Production E2E の PASS を受けて実施した。
+      (1) `AGENTS.md` 0章を `<!-- TEMP_MVP_COMPLETION_POLICY:BEGIN -->`〜`:END -->` マーカーごと削除。
+      (2) `CLAUDE.md` 冒頭のポインタ段落を削除。
+      (3) repository 全文検索で、共通開発指示として残っていないことを確認した。
+      残存は `specs/10_mvp_scope.md` 12章（cleanup 手順そのもの＝完了記録付き）、
+      `docs/project_memory/decisions/` の履歴、本 `tasks/roadmap.md` の完了記録のみで、
+      いずれも手順3が明示的に「履歴であり削除不要」としている区分に当たる。
+      一時ポリシーの内容は Design Philosophy・一般開発原則へ転記していない。
+
+      **確認方法**: 本項目は箇条書き（`- [ ]`）のため parser から見えず、
+      `roadmap check` の自動確認対象に入らない。項目自身の指示どおり**手動で確認**した。
+      整形（`- [ ]` → 番号付き）は既存の CEO 判断どおり M4 着手前に行う。
 
       **本項目は MVP Exit Criteria である（CEO 訂正・2026-09-10）。「MVP後へ延期」ではない。**
       Exit 必須条件として維持するのは次の3点:
