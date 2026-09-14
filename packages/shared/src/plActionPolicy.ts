@@ -211,9 +211,28 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
     gates: ['approval_gate'],
     reason: 'a retried job re-enters the existing gate/check path before it may act',
   },
+  /**
+   * blocked な Task の再開。
+   *
+   * **`approval_gate` を up-front 要件から外した。** resume 自体は commit しない。
+   * 行うのは「queued な Job を1つ作る」ことだけで、その Job が
+   *   - `git_commit` なら `/gate/check` が**現在の diff に対して新しい Approval Request を発行**し、
+   *     CEO が承認するまで blocked のままになる（承認は迂回されず、下流で必ず要求される）
+   *   - AI CLI なら `resumeBlockedTask()` 自身が Design Review evidence を fail-closed で検査する
+   * だからである。
+   *
+   * up-front に `approval_gate` を要求すると、**「新しい承認サイクルを始めるために既存の承認が要る」**
+   * という循環になる。実際 production で、承認が STALE 化した blocked commit Job が
+   * この循環で誰にも復旧できなくなった（2026-09-15）。
+   *
+   * `design_review` は残す。AI CLI の resume は workspace を書き換えるため、
+   * その prompt に対する ALIGNED evidence が要る（これは実レコードで検証できる）。
+   */
   resume_task: {
-    gates: ['design_review', 'approval_gate'],
-    reason: 'resume requires the existing design review evidence and gate check to hold',
+    gates: ['design_review'],
+    reason:
+      'resume only queues a job; a git_commit resume must still obtain a fresh approval downstream, '
+      + 'and an AI CLI resume is fail-closed on design review evidence',
   },
   clear_workspace_quarantine: {
     gates: ['safety_review', 'approval_gate'],

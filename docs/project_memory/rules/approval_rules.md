@@ -17,6 +17,35 @@
 
 ---
 
+## Candidate Freeze — Approval が pending の間は Candidate を動かさない（2026-09-15 運用不変条件）
+
+**Approval Request は Candidate の HEAD（`target_commit`）と diff hash に紐付く。**
+`invalid_if` に「commit hash が変わった場合 / git diff の内容が変わった場合」が入っており、
+どちらかが起きた時点で承認は `STALE` になる。
+
+したがって **Approval Request が pending になってから解決するまで**、次を行わない:
+
+- Candidate（`/workspace/target`）の HEAD を進めない
+- master を merge / fast-forward しない
+- diff を変更しない（未コミット変更を足す・消す・revert する）
+- **deploy 準備のために Candidate を同期しない**
+
+**Stable deploy と Candidate workspace 更新は別物として扱う。**
+`/srv/ai-team/softwareDevelopAIteam`（Stable）の ff-only deploy と API/Worker 再起動は、
+pending 中でも行ってよい。**同じ手順の中で `/workspace/target` を触らないこと**が要点である。
+
+**実際に起きた事故（2026-09-15）**: pending 中に deploy 手順の一部として
+`cd /workspace/target && git merge --ff-only origin/master` を実行し、HEAD が
+`8ddad05` → `af60412` へ動いて承認が STALE 化した。CEO の承認操作は死んだリクエストに当たり、
+`git-commit` Job は blocked のまま、`approval_waiting` も消えて誰にも気付かれなくなった。
+**安全機構は正しく動作しており、誤っていたのは操作順序である。**
+
+**復旧**: STALE な承認は再利用・再承認しない。`POST /api/tasks/:id/resume` で Job を作り直すと、
+`/gate/check` が**現在の diff に対する新しい Approval Request** を発行する。
+
+**新しい locking subsystem は作らない。** 上記は手順の順序で守る（deploy 前に pending の有無を確認し、
+あれば Candidate 同期だけを後回しにする）。
+
 ## CEOの承認が必要（Yellow Zone）
 
 以下の場合のみCEOに通知・承認を求める。
