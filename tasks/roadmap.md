@@ -6082,6 +6082,24 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - **CEO Approval に scope 束縛を追加。** 操作種別ごとに要求する `ApprovalType` を固定し、
         用途の違う承認を流用できないようにした
 
+      **【独立レビュー 3巡目（OpenAI / Codex, 2026-09-14）: changes_requested → 修正済み】**
+      fail-open は見つからなかった一方、対象種別を固定したことで**永久に充足不能な操作**が
+      生まれていた（安全側だが「根拠を積めば通るはず」という誤解を招く）。修正:
+      - `adopt_roadmap_item`（project 対象）は **roadmap-kind の Design Review evidence**
+        （`subjectId` が projectId）で束縛できるようにした。Task 対象は従来どおり task-kind
+      - `deploy_production`（system 対象）は Task/Project スコープの Review 根拠を
+        構造的に結び付けられない。**充足不能であることを `unbindableGates()` が明示する**
+        （missing に紛れ込ませない）。deploy スコープの Review 根拠の用意は配線側の責務
+
+      **【独立レビュー 4巡目（OpenAI / Codex, 2026-09-14）: changes_requested → 修正済み】**
+      Task スコープの照合が `taskId` 一致だけで、`reviewKind` を見ていなかった。
+      `taskId` を持つ roadmap-kind の record が Task 単位の Gate を満たし得たため、
+      kind も明示的に照合するようにし、回帰テストで固定した。
+
+      **【独立レビュー 5巡目（OpenAI / Codex, 2026-09-14）: approved】**
+      「fix → re-review」を Gate 結果として扱い、approved になるまで merge しなかった。
+      provider 分離: 実装は Anthropic / Claude、Independent Review は OpenAI / Codex。
+
       **指摘のうち、ここでは直さず `vps-pl-execution-loop` の受入条件へ回したもの**:
       - `changedFiles` も `providerChange` も PL の申告値であり、**実差分・実構成との束縛は
         この層では行えない**。権威ある判定は既存の File Change Guard と Job の `gate/check` が行う。

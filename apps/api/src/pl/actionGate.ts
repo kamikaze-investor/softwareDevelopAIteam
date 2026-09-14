@@ -28,6 +28,9 @@
  * - 対象 Job の risk / production 影響の継承、実行者の Role・Production 操作権限。
  * - CEO Approval の Project スコープ束縛。`approvals.findById()` が `projectId` を返さないため、
  *   現状は Approval の `type` による束縛までしかできない（`findById` の additive 拡張が要る）。
+ * - `deploy_production` は `system` 対象なので Task/Project スコープの Review 根拠を
+ *   結び付けられず、**この層では充足不能**である（`unbindableGates()` が明示する）。
+ *   deploy スコープの Review 根拠を用意するのは配線側の責務。
  *
  * ## 新しい Gate は作っていない
  *
@@ -175,41 +178,64 @@ interface EvidenceCheck {
   rejection?: string
 }
 
-function resolveTargetTaskId(storage: IStorage, target: PlActionTarget): string | undefined {
-  if (target.kind === 'task') return target.taskId
-  if (target.kind !== 'job') return undefined
-  // 申告された taskId が本当にその Job のものかを DB で照合する。
-  const job = storage.jobs.findById(target.jobId)
-  if (!job || job.taskId !== target.taskId) return undefined
-  return job.taskId
+/**
+ * 対象から、根拠を束縛できる範囲を引き出す。
+ *
+ * `job` では**申告された `taskId` が本当にその Job のものか**を DB で照合する。
+ * `system` は束縛できる範囲を持たない（= Task/Project スコープの根拠を受け付けない）。
+ */
+function resolveEvidenceScope(
+  storage: IStorage,
+  target: PlActionTarget,
+): { taskId?: string; projectId?: string } {
+  if (target.kind === 'task') return { taskId: target.taskId }
+  if (target.kind === 'project') return { projectId: target.projectId }
+  if (target.kind === 'job') {
+    const job = storage.jobs.findById(target.jobId)
+    if (!job || job.taskId !== target.taskId) return {}
+    return { taskId: job.taskId, projectId: job.projectId }
+  }
+  return {}
 }
+
+type EvidenceScope = ReturnType<typeof resolveEvidenceScope>
 
 function checkDesignReview(
   storage: IStorage,
   evidenceId: string,
-  targetTaskId: string | undefined,
+  scope: EvidenceScope,
   requireIndependent: boolean,
 ): EvidenceCheck {
   const label = requireIndependent ? 'independent_review' : 'design_review'
-  if (targetTaskId === undefined) {
-    return { satisfied: false, rejection: `${label} evidence cannot be bound to the action target` }
-  }
 
   const evidence = storage.designReviewEvidence.findById(evidenceId)
   if (!evidence) {
     return { satisfied: false, rejection: `${label} evidence ${evidenceId} does not exist` }
   }
-  if (evidence.taskId !== targetTaskId) {
-    return {
-      satisfied: false,
-      rejection: `${label} evidence ${evidenceId} belongs to another task`,
+
+  // 古い ALIGNED を持ち出して新しい判定を上書きできないよう、その対象の最新 evidence に限る。
+  // Task 対象は task-kind、Project 対象は roadmap-kind（`subjectId` が projectId）を見る。
+  let latest
+  if (scope.taskId !== undefined) {
+    // `taskId` 一致だけに頼らない。roadmap-kind の record が `taskId` を持っていた場合に
+    // Task 単位の Gate を満たしてしまうため、kind も明示的に照合する。
+    if (evidence.reviewKind !== 'task' || evidence.taskId !== scope.taskId) {
+      return { satisfied: false, rejection: `${label} evidence ${evidenceId} belongs to another task` }
     }
+    latest = storage.designReviewEvidence.findLatestByTaskId(scope.taskId)
+  } else if (scope.projectId !== undefined) {
+    if (evidence.reviewKind !== 'roadmap' || evidence.subjectId !== scope.projectId) {
+      return { satisfied: false, rejection: `${label} evidence ${evidenceId} belongs to another project` }
+    }
+    latest = storage.designReviewEvidence.findLatestBySubjectId('roadmap', scope.projectId)
+  } else {
+    // system 対象には Task/Project スコープの Review 根拠を結び付けられない。
+    // 「束縛できない＝充足しているとみなす」にはしない（fail-closed）。
+    return { satisfied: false, rejection: `${label} evidence cannot be bound to a system-scoped action` }
   }
 
-  // 古い ALIGNED を持ち出して新しい判定を上書きできないよう、その Task の最新 evidence に限る。
-  const latest = storage.designReviewEvidence.findLatestByTaskId(targetTaskId)
   if (!latest || latest.id !== evidence.id) {
-    return { satisfied: false, rejection: `${label} evidence ${evidenceId} is not the latest for the task` }
+    return { satisfied: false, rejection: `${label} evidence ${evidenceId} is not the latest for the target` }
   }
 
   if (requireIndependent) {
@@ -235,8 +261,9 @@ function checkDesignReview(
 function checkApprovalGate(
   storage: IStorage,
   approvalRequestId: string,
-  targetTaskId: string | undefined,
+  scope: EvidenceScope,
 ): EvidenceCheck {
+  const targetTaskId = scope.taskId
   if (targetTaskId === undefined) {
     return { satisfied: false, rejection: 'approval_gate evidence cannot be bound to the action target' }
   }
@@ -290,15 +317,15 @@ function verifyEvidence(
   storage: IStorage,
   ref: GateEvidenceRef,
   kind: PlActionKind,
-  targetTaskId: string | undefined,
+  scope: EvidenceScope,
 ): EvidenceCheck {
   switch (ref.gate) {
     case 'design_review':
-      return checkDesignReview(storage, ref.designReviewEvidenceId, targetTaskId, false)
+      return checkDesignReview(storage, ref.designReviewEvidenceId, scope, false)
     case 'independent_review':
-      return checkDesignReview(storage, ref.designReviewEvidenceId, targetTaskId, true)
+      return checkDesignReview(storage, ref.designReviewEvidenceId, scope, true)
     case 'approval_gate':
-      return checkApprovalGate(storage, ref.approvalRequestId, targetTaskId)
+      return checkApprovalGate(storage, ref.approvalRequestId, scope)
     case 'ceo_approval':
       return checkCeoApproval(storage, ref.approvalId, kind)
     default: {
@@ -306,6 +333,33 @@ function verifyEvidence(
       return { satisfied: false, rejection: `unknown gate evidence kind: ${String(unknown.gate)}` }
     }
   }
+}
+
+/**
+ * その対象に対して**そもそも根拠を結び付けられない** Gate を返す。
+ *
+ * 独立レビュー3巡目（2026-09-14）の指摘: 対象種別を固定したことで、`deploy_production` が
+ * `system` 対象なのに Task スコープの `independent_review` を要求し、**永久に充足不能**に
+ * なっていた。fail-closed なので危険ではないが、「根拠を積めば通るはず」という誤解を招く。
+ *
+ * 通らない理由を黙って missing に紛れ込ませず、**構造的に結び付けられない**と明示する。
+ * 解消は `vps-pl-execution-loop` の配線側で deploy スコープの Review 根拠を用意することによる。
+ */
+function unbindableGates(
+  requiredGates: readonly RequiredGate[],
+  scope: EvidenceScope,
+): RequiredGate[] {
+  const unbindable: RequiredGate[] = []
+  for (const gate of requiredGates) {
+    if ((gate === 'design_review' || gate === 'independent_review') &&
+        scope.taskId === undefined && scope.projectId === undefined) {
+      unbindable.push(gate)
+    }
+    if (gate === 'approval_gate' && scope.taskId === undefined) {
+      unbindable.push(gate)
+    }
+  }
+  return unbindable
 }
 
 // ────────────────────────────────────────────────────────────
@@ -365,12 +419,17 @@ export function authorizePlAction(
     ])
   }
 
-  const targetTaskId = resolveTargetTaskId(storage, request.target)
+  const scope = resolveEvidenceScope(storage, request.target)
   const satisfied = new Set<RequiredGate>()
   const rejections: string[] = []
 
+  // 根拠を積む前に、そもそも結び付けられない Gate を名指しする。
+  for (const gate of unbindableGates(decision.requiredGates, scope)) {
+    rejections.push(`${gate} cannot be bound to a ${request.target.kind} target`)
+  }
+
   for (const ref of request.evidence ?? []) {
-    const check = verifyEvidence(storage, ref, kind, targetTaskId)
+    const check = verifyEvidence(storage, ref, kind, scope)
     if (check.satisfied) {
       satisfied.add(ref.gate)
     } else if (check.rejection) {

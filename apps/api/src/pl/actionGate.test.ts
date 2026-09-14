@@ -442,6 +442,99 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
   })
 })
 
+describe('authorizePlAction — 対象スコープと Review 根拠の対応', () => {
+  it('Project 対象では roadmap-kind の Review evidence を束縛できる', () => {
+    const { storage, projectId } = seed()
+    const evidence = storage.designReviewEvidence.create({
+      reviewKind: 'roadmap',
+      subjectId: projectId,
+      designTextHash: 'hash',
+      reviewLoad: 'low',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'adopt_roadmap_item' },
+      target: { kind: 'project', projectId },
+      evidence: [{ gate: 'design_review', designReviewEvidenceId: evidence.id }],
+    })
+
+    // design_review は束縛できて充足する。残るのは検証手段の無い strategic_alignment_review だけ。
+    expect(blocked.missingGates).toEqual(['strategic_alignment_review'])
+  })
+
+  it('別 Project の roadmap evidence では束縛できない', () => {
+    const { storage, projectId } = seed()
+    // running は1つだけという既存の interlock があるので、別 Project は paused で作る。
+    const otherProject = storage.projects.create({
+      name: 'other',
+      goal: 'g',
+      designPhilosophy: [],
+      status: 'paused',
+    })
+    const evidence = storage.designReviewEvidence.create({
+      reviewKind: 'roadmap',
+      subjectId: otherProject.id,
+      designTextHash: 'hash',
+      reviewLoad: 'low',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'adopt_roadmap_item' },
+      target: { kind: 'project', projectId },
+      evidence: [{ gate: 'design_review', designReviewEvidenceId: evidence.id }],
+    })
+
+    expect(blocked.missingGates).toContain('design_review')
+    expect(blocked.rejectedEvidence.join(' ')).toContain('belongs to another project')
+  })
+
+  it('taskId を持つ roadmap-kind evidence では Task 単位の Gate を満たせない', () => {
+    const { storage, taskId } = seed()
+    const evidence = storage.designReviewEvidence.create({
+      taskId,
+      reviewKind: 'roadmap',
+      subjectId: taskId,
+      designTextHash: 'hash',
+      reviewLoad: 'low',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+    const approvalRequestId = addApprovalRequest(storage, taskId)
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'resume_task' },
+      target: { kind: 'task', taskId },
+      evidence: [
+        { gate: 'design_review', designReviewEvidenceId: evidence.id },
+        { gate: 'approval_gate', approvalRequestId },
+      ],
+    })
+
+    expect(blocked.missingGates).toEqual(['design_review'])
+  })
+
+  it('system 対象に Review 根拠を結び付けられないことを黙らせない', () => {
+    const { storage, taskId } = seed()
+    const designReviewEvidenceId = addDesignReviewEvidence(storage, taskId, {
+      independentReviewRequired: true,
+      independentReviewVerdict: 'approved',
+    })
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'deploy_production' },
+      target: { kind: 'system' },
+      evidence: [{ gate: 'independent_review', designReviewEvidenceId }],
+    })
+
+    expect(blocked.missingGates).toContain('independent_review')
+    expect(blocked.rejectedEvidence.join(' ')).toContain('cannot be bound to a system target')
+  })
+})
+
 describe('authorizePlAction — 検証手段の無い Gate は充足できない', () => {
   it('safety_review を要求する操作は、根拠を積んでも通らない（fail-closed）', () => {
     const { storage, jobId, taskId } = seed()
