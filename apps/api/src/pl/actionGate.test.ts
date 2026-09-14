@@ -3,25 +3,30 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import {
   authorizePlAction,
-  assertPlActionExecutable,
+  previewPlActionPolicy,
   PlActionBlockedError,
   UNVERIFIABLE_GATES,
+  type PlActionRequest,
 } from './actionGate'
 
 const FUTURE = new Date(Date.now() + 60 * 60 * 1000).toISOString()
 const PAST = new Date(Date.now() - 60 * 60 * 1000).toISOString()
 
-function seedProject(storage: IStorage): string {
-  return storage.projects.create({
+interface Fixture {
+  storage: IStorage
+  projectId: string
+  taskId: string
+  jobId: string
+}
+
+function seed(): Fixture {
+  const storage = createSQLiteStorage(':memory:')
+  const project = storage.projects.create({
     name: 'AIteamOS',
     goal: 'g',
     designPhilosophy: [],
     status: 'running',
-  }).id
-}
-
-function seedTask(storage: IStorage): string {
-  const project = { id: seedProject(storage) }
+  })
   const task = storage.tasks.create({
     projectId: project.id,
     title: 'T',
@@ -32,10 +37,31 @@ function seedTask(storage: IStorage): string {
     roadmapActive: true,
     phase: 1,
   } as Parameters<IStorage['tasks']['create']>[0])
-  return task.id
+  const job = storage.jobs.create({
+    taskId: task.id,
+    projectId: project.id,
+    agentRole: 'developer_ai',
+    status: 'failed',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    dryRun: false,
+  } as Parameters<IStorage['jobs']['create']>[0])
+  return { storage, projectId: project.id, taskId: task.id, jobId: job.id }
 }
 
-function createDesignReviewEvidence(
+function addTask(storage: IStorage, projectId: string): string {
+  return storage.tasks.create({
+    projectId,
+    title: 'other',
+    description: '',
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+    roadmapActive: true,
+    phase: 1,
+  } as Parameters<IStorage['tasks']['create']>[0]).id
+}
+
+function addDesignReviewEvidence(
   storage: IStorage,
   taskId: string,
   over: { decision?: string; independentReviewRequired?: boolean; independentReviewVerdict?: string } = {},
@@ -52,7 +78,7 @@ function createDesignReviewEvidence(
   } as Parameters<IStorage['designReviewEvidence']['create']>[0]).id
 }
 
-function createApprovalRequest(storage: IStorage, taskId: string, over: Record<string, unknown> = {}): string {
+function addApprovalRequest(storage: IStorage, taskId: string, over: Record<string, unknown> = {}): string {
   return storage.approvalRequests.create({
     taskId,
     requestedAction: 'git_commit',
@@ -68,268 +94,370 @@ function createApprovalRequest(storage: IStorage, taskId: string, over: Record<s
   } as Parameters<IStorage['approvalRequests']['create']>[0]).id
 }
 
+function addCeoApproval(
+  storage: IStorage,
+  projectId: string,
+  over: { type?: string; status?: string } = {},
+): string {
+  const approval = storage.approvals.create({
+    projectId,
+    title: 't',
+    reason: 'r',
+    type: (over.type ?? 'deployment') as never,
+    status: 'pending',
+  } as Parameters<IStorage['approvals']['create']>[0])
+  storage.approvals.update(approval.id, { status: (over.status ?? 'approved') as never })
+  return approval.id
+}
+
+function expectBlocked(storage: IStorage, request: PlActionRequest): PlActionBlockedError {
+  let thrown: unknown
+  try {
+    authorizePlAction(storage, request)
+  } catch (error) {
+    thrown = error
+  }
+  expect(thrown).toBeInstanceOf(PlActionBlockedError)
+  return thrown as PlActionBlockedError
+}
+
+describe('previewPlActionPolicy — 見るだけで、許可ではない', () => {
+  it('必要 Gate を返すが、記録も実行権も伴わない', () => {
+    const { storage } = seed()
+
+    const decision = previewPlActionPolicy({ kind: 'rollback_commit' })
+
+    expect(decision.requiredGates).toContain('ceo_approval')
+    expect(storage.auditLog.findAll()).toHaveLength(0)
+  })
+})
+
 describe('authorizePlAction — 判定を必ず監査記録へ残す', () => {
-  it('許可された操作も記録する（境界が効いているかを後から検証できるように）', () => {
-    const storage = createSQLiteStorage(':memory:')
+  it('許可されたときも記録する（境界が効いているかを後から検証できるように）', () => {
+    const { storage, taskId, jobId } = seed()
+    const approvalRequestId = addApprovalRequest(storage, taskId)
 
-    const { decision, actionId } = authorizePlAction(storage, { kind: 'retry_job' })
+    const { actionId } = authorizePlAction(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'job', jobId, taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId }],
+    })
 
-    expect(decision.disposition).toBe('gates_required')
     const entries = storage.auditLog.findByEntity('pl_action', actionId)
     expect(entries).toHaveLength(1)
-    expect(entries[0].operation).toBe('pl_action_policy')
-    expect(entries[0].result).toBe('gates_required')
+    expect(entries[0].operation).toBe('pl_action_authorize')
+    expect(entries[0].result).toBe('authorized')
     expect(entries[0].detail).toContain('kind=retry_job')
     expect(entries[0].detail).toContain('policy=pl-action-policy-v1')
   })
 
   it('禁止された操作も記録する', () => {
-    const storage = createSQLiteStorage(':memory:')
+    const { storage } = seed()
 
-    const { decision, actionId } = authorizePlAction(storage, { kind: 'override_gate_block' })
+    expectBlocked(storage, {
+      proposal: { kind: 'override_gate_block' },
+      target: { kind: 'system' },
+    })
 
-    expect(decision.disposition).toBe('forbidden')
-    expect(storage.auditLog.findByEntity('pl_action', actionId)[0].result).toBe('forbidden')
+    const entries = storage.auditLog.findAll()
+    expect(entries).toHaveLength(1)
+    expect(entries[0].result).toBe('forbidden')
   })
 
   it('detail に diff や prompt のような大きな payload を載せない', () => {
-    const storage = createSQLiteStorage(':memory:')
+    const { storage, taskId } = seed()
 
-    const { actionId } = authorizePlAction(storage, {
-      kind: 'propose_code_change',
-      changedFiles: ['apps/api/src/storage/migrations/004_x.ts'],
-      plRiskOpinion: { level: 'LOW', rationale: 'x'.repeat(5000) },
+    expectBlocked(storage, {
+      proposal: {
+        kind: 'propose_code_change',
+        changedFiles: ['apps/api/src/storage/migrations/004_x.ts'],
+        plRiskOpinion: { level: 'LOW', rationale: 'x'.repeat(5000) },
+      },
+      target: { kind: 'task', taskId },
     })
 
-    const detail = storage.auditLog.findByEntity('pl_action', actionId)[0].detail ?? ''
+    const detail = storage.auditLog.findAll()[0].detail ?? ''
     expect(detail.length).toBeLessThan(200)
     expect(detail).not.toContain('xxxxx')
   })
 })
 
-describe('assertPlActionExecutable — 呼び出し側の判定を信じない', () => {
-  it('提案から判定を作り直すので、偽装した判定を渡す余地が無い', () => {
-    const storage = createSQLiteStorage(':memory:')
+describe('authorizePlAction — 呼び出し側の判定を信じない', () => {
+  it('許可を得る経路は1つで、判定オブジェクトを差し込む引数が存在しない', () => {
+    const { storage, jobId, taskId } = seed()
 
-    // 引数は「提案」だけ。judgement オブジェクトを差し込む口が存在しない。
-    expect(() => assertPlActionExecutable(storage, { kind: 'rollback_commit' }, [])).toThrow(
-      PlActionBlockedError,
-    )
+    // 渡せるのは提案・対象・根拠だけ。「もう通っている」と主張する手段が無い。
+    expectBlocked(storage, {
+      proposal: { kind: 'rollback_commit' },
+      target: { kind: 'job', jobId, taskId },
+    })
   })
 
   it('forbidden な操作は、どんな根拠を積んでも通らない', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const evidenceId = createDesignReviewEvidence(storage, taskId)
-    const approvalRequestId = createApprovalRequest(storage, taskId)
+    const { storage, taskId, projectId } = seed()
+    const designReviewEvidenceId = addDesignReviewEvidence(storage, taskId)
+    const approvalRequestId = addApprovalRequest(storage, taskId)
+    const approvalId = addCeoApproval(storage, projectId)
 
-    expect(() =>
-      assertPlActionExecutable(storage, { kind: 'change_own_permission' }, [
-        { gate: 'design_review', designReviewEvidenceId: evidenceId },
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'change_own_permission' },
+      target: { kind: 'task', taskId },
+      evidence: [
+        { gate: 'design_review', designReviewEvidenceId },
         { gate: 'approval_gate', approvalRequestId },
-      ]),
-    ).toThrow(PlActionBlockedError)
+        { gate: 'ceo_approval', approvalId },
+      ],
+    })
+
+    expect(blocked.decision.disposition).toBe('forbidden')
   })
 
   it('Gate を要さない観測操作はそのまま通る', () => {
-    const storage = createSQLiteStorage(':memory:')
+    const { storage } = seed()
 
-    const decision = assertPlActionExecutable(storage, { kind: 'observe_state' })
+    const { decision } = authorizePlAction(storage, {
+      proposal: { kind: 'observe_state' },
+      target: { kind: 'system' },
+    })
     expect(decision.disposition).toBe('no_gate_required')
   })
 })
 
-describe('assertPlActionExecutable — 充足は DB の実レコードで検証する', () => {
+describe('authorizePlAction — 根拠は操作対象へ束縛する', () => {
+  it('別 Task の ALIGNED evidence では resume_task は通らない', () => {
+    const { storage, projectId, taskId } = seed()
+    const otherTaskId = addTask(storage, projectId)
+    const foreignEvidenceId = addDesignReviewEvidence(storage, otherTaskId)
+    const approvalRequestId = addApprovalRequest(storage, taskId)
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'resume_task' },
+      target: { kind: 'task', taskId },
+      evidence: [
+        { gate: 'design_review', designReviewEvidenceId: foreignEvidenceId },
+        { gate: 'approval_gate', approvalRequestId },
+      ],
+    })
+
+    expect(blocked.missingGates).toEqual(['design_review'])
+    expect(blocked.rejectedEvidence.join(' ')).toContain('belongs to another task')
+  })
+
+  it('別 Task の Approval Request では通らない', () => {
+    const { storage, projectId, taskId, jobId } = seed()
+    const otherTaskId = addTask(storage, projectId)
+    const foreignApprovalRequestId = addApprovalRequest(storage, otherTaskId)
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'job', jobId, taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId: foreignApprovalRequestId }],
+    })
+
+    expect(blocked.missingGates).toEqual(['approval_gate'])
+  })
+
+  it('Job に属さない taskId を申告しても束縛は成立しない', () => {
+    const { storage, projectId, jobId, taskId } = seed()
+    const otherTaskId = addTask(storage, projectId)
+    const approvalRequestId = addApprovalRequest(storage, otherTaskId)
+
+    // jobId は本物、taskId は別 Task。DB 側で照合するので通らない。
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'job', jobId, taskId: otherTaskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId }],
+    })
+
+    expect(blocked.missingGates).toEqual(['approval_gate'])
+    expect(taskId).not.toBe(otherTaskId)
+  })
+
+  it('操作種別に合わない対象は通らない', () => {
+    const { storage, taskId } = seed()
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'task', taskId },
+    })
+
+    expect(blocked.rejectedEvidence.join(' ')).toContain('requires a job target')
+  })
+
+  it('その Task の最新でない evidence は使えない（古い ALIGNED の持ち出し禁止）', () => {
+    const { storage, taskId } = seed()
+    const staleEvidenceId = addDesignReviewEvidence(storage, taskId, { decision: 'ALIGNED' })
+    addDesignReviewEvidence(storage, taskId, { decision: 'UNCERTAIN' })
+    const approvalRequestId = addApprovalRequest(storage, taskId)
+
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'resume_task' },
+      target: { kind: 'task', taskId },
+      evidence: [
+        { gate: 'design_review', designReviewEvidenceId: staleEvidenceId },
+        { gate: 'approval_gate', approvalRequestId },
+      ],
+    })
+
+    expect(blocked.missingGates).toEqual(['design_review'])
+    expect(blocked.rejectedEvidence.join(' ')).toContain('not the latest')
+  })
+
+  it('対象の最新 ALIGNED evidence と承認済み Approval なら resume_task は通る', () => {
+    const { storage, taskId } = seed()
+    const designReviewEvidenceId = addDesignReviewEvidence(storage, taskId)
+    const approvalRequestId = addApprovalRequest(storage, taskId)
+
+    const { decision } = authorizePlAction(storage, {
+      proposal: { kind: 'resume_task' },
+      target: { kind: 'task', taskId },
+      evidence: [
+        { gate: 'design_review', designReviewEvidenceId },
+        { gate: 'approval_gate', approvalRequestId },
+      ],
+    })
+
+    expect(decision.kind).toBe('resume_task')
+  })
+})
+
+describe('authorizePlAction — レコードの状態を実際に読む', () => {
   it('存在しない根拠 ID は充足にならない', () => {
-    const storage = createSQLiteStorage(':memory:')
+    const { storage, jobId, taskId } = seed()
 
-    let thrown: unknown
-    try {
-      assertPlActionExecutable(storage, { kind: 'retry_job' }, [
-        { gate: 'approval_gate', approvalRequestId: 'does-not-exist' },
-      ])
-    } catch (error) {
-      thrown = error
-    }
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'job', jobId, taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId: 'does-not-exist' }],
+    })
 
-    const blocked = thrown as PlActionBlockedError
-    expect(blocked).toBeInstanceOf(PlActionBlockedError)
     expect(blocked.missingGates).toEqual(['approval_gate'])
     expect(blocked.rejectedEvidence[0]).toContain('does not exist')
   })
 
   it('承認待ちの Approval Request は充足にならない', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const approvalRequestId = createApprovalRequest(storage, taskId, { status: 'WAITING_FOR_USER' })
+    const { storage, jobId, taskId } = seed()
+    const approvalRequestId = addApprovalRequest(storage, taskId, { status: 'WAITING_FOR_USER' })
 
-    expect(() =>
-      assertPlActionExecutable(storage, { kind: 'retry_job' }, [
-        { gate: 'approval_gate', approvalRequestId },
-      ]),
-    ).toThrow(PlActionBlockedError)
+    expectBlocked(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'job', jobId, taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId }],
+    })
   })
 
   it('期限切れの Approval Request は充足にならない', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const approvalRequestId = createApprovalRequest(storage, taskId, { expiresAt: PAST })
+    const { storage, jobId, taskId } = seed()
+    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: PAST })
 
-    expect(() =>
-      assertPlActionExecutable(storage, { kind: 'retry_job' }, [
-        { gate: 'approval_gate', approvalRequestId },
-      ]),
-    ).toThrow(PlActionBlockedError)
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'job', jobId, taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId }],
+    })
+
+    expect(blocked.rejectedEvidence.join(' ')).toContain('expired')
   })
 
-  it('承認済み Approval Request なら retry_job は通る', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const approvalRequestId = createApprovalRequest(storage, taskId)
+  it('読めない期限値は「未失効」として通さない', () => {
+    const { storage, jobId, taskId } = seed()
+    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: 'not-a-date' })
 
-    const decision = assertPlActionExecutable(storage, { kind: 'retry_job' }, [
-      { gate: 'approval_gate', approvalRequestId },
-    ])
-    expect(decision.kind).toBe('retry_job')
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'retry_job' },
+      target: { kind: 'job', jobId, taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId }],
+    })
+
+    expect(blocked.rejectedEvidence.join(' ')).toContain('unreadable expiry')
   })
 
   it('ALIGNED でない Design Review evidence は充足にならない', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const evidenceId = createDesignReviewEvidence(storage, taskId, { decision: 'UNCERTAIN' })
-    const approvalRequestId = createApprovalRequest(storage, taskId)
+    const { storage, taskId } = seed()
+    const designReviewEvidenceId = addDesignReviewEvidence(storage, taskId, { decision: 'UNCERTAIN' })
+    const approvalRequestId = addApprovalRequest(storage, taskId)
 
-    let thrown: unknown
-    try {
-      assertPlActionExecutable(storage, { kind: 'resume_task' }, [
-        { gate: 'design_review', designReviewEvidenceId: evidenceId },
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'resume_task' },
+      target: { kind: 'task', taskId },
+      evidence: [
+        { gate: 'design_review', designReviewEvidenceId },
         { gate: 'approval_gate', approvalRequestId },
-      ])
-    } catch (error) {
-      thrown = error
-    }
+      ],
+    })
 
-    expect((thrown as PlActionBlockedError).missingGates).toEqual(['design_review'])
+    expect(blocked.missingGates).toEqual(['design_review'])
   })
 
   it('独立レビューを実行していない evidence は independent_review の根拠にならない', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const evidenceId = createDesignReviewEvidence(storage, taskId, {
+    const { storage, taskId } = seed()
+    const designReviewEvidenceId = addDesignReviewEvidence(storage, taskId, {
       independentReviewRequired: false,
     })
 
-    let thrown: unknown
-    try {
-      assertPlActionExecutable(storage, { kind: 'deploy_production' }, [
-        { gate: 'independent_review', designReviewEvidenceId: evidenceId },
-      ])
-    } catch (error) {
-      thrown = error
-    }
-
-    expect((thrown as PlActionBlockedError).missingGates).toContain('independent_review')
-  })
-
-  it('independent review の verdict が approved でなければ充足にならない', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const evidenceId = createDesignReviewEvidence(storage, taskId, {
-      independentReviewRequired: true,
-      independentReviewVerdict: 'blocking',
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'deploy_production' },
+      target: { kind: 'system' },
+      evidence: [{ gate: 'independent_review', designReviewEvidenceId }],
     })
 
-    expect(() =>
-      assertPlActionExecutable(storage, { kind: 'deploy_production' }, [
-        { gate: 'independent_review', designReviewEvidenceId: evidenceId },
-      ]),
-    ).toThrow(PlActionBlockedError)
+    expect(blocked.missingGates).toContain('independent_review')
   })
 
   it('pending な CEO Approval は充足にならない', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const projectId = seedProject(storage)
-    const approvalId = storage.approvals.create({
-      projectId,
-      title: 't',
-      reason: 'r',
-      type: 'deployment',
-      status: 'pending',
-    } as Parameters<IStorage['approvals']['create']>[0]).id
+    const { storage, projectId } = seed()
+    const approvalId = addCeoApproval(storage, projectId, { status: 'pending' })
 
-    expect(() =>
-      assertPlActionExecutable(storage, { kind: 'restart_service' }, [
-        { gate: 'ceo_approval', approvalId },
-      ]),
-    ).toThrow(PlActionBlockedError)
+    expectBlocked(storage, {
+      proposal: { kind: 'restart_service' },
+      target: { kind: 'system' },
+      evidence: [{ gate: 'ceo_approval', approvalId }],
+    })
   })
 
-  it('承認済みの CEO Approval なら restart_service は通る', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const projectId = seedProject(storage)
-    const approval = storage.approvals.create({
-      projectId,
-      title: 't',
-      reason: 'r',
-      type: 'deployment',
-      status: 'pending',
-    } as Parameters<IStorage['approvals']['create']>[0])
-    storage.approvals.update(approval.id, { status: 'approved' })
+  it('用途の違う CEO Approval は流用できない', () => {
+    const { storage, projectId } = seed()
+    const approvalId = addCeoApproval(storage, projectId, { type: 'billing' })
 
-    const decision = assertPlActionExecutable(storage, { kind: 'restart_service' }, [
-      { gate: 'ceo_approval', approvalId: approval.id },
-    ])
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'restart_service' },
+      target: { kind: 'system' },
+      evidence: [{ gate: 'ceo_approval', approvalId }],
+    })
+
+    expect(blocked.rejectedEvidence.join(' ')).toContain("not 'deployment'")
+  })
+
+  it('用途の合う承認済み CEO Approval なら restart_service は通る', () => {
+    const { storage, projectId } = seed()
+    const approvalId = addCeoApproval(storage, projectId, { type: 'deployment' })
+
+    const { decision } = authorizePlAction(storage, {
+      proposal: { kind: 'restart_service' },
+      target: { kind: 'system' },
+      evidence: [{ gate: 'ceo_approval', approvalId }],
+    })
+
     expect(decision.kind).toBe('restart_service')
   })
 })
 
-describe('assertPlActionExecutable — 検証手段の無い Gate は充足できない', () => {
+describe('authorizePlAction — 検証手段の無い Gate は充足できない', () => {
   it('safety_review を要求する操作は、根拠を積んでも通らない（fail-closed）', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const approvalRequestId = createApprovalRequest(storage, taskId)
+    const { storage, jobId, taskId } = seed()
+    const approvalRequestId = addApprovalRequest(storage, taskId)
 
-    let thrown: unknown
-    try {
-      assertPlActionExecutable(storage, { kind: 'clear_workspace_quarantine' }, [
-        { gate: 'approval_gate', approvalRequestId },
-      ])
-    } catch (error) {
-      thrown = error
-    }
+    const blocked = expectBlocked(storage, {
+      proposal: { kind: 'clear_workspace_quarantine' },
+      target: { kind: 'job', jobId, taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId }],
+    })
 
-    expect((thrown as PlActionBlockedError).missingGates).toEqual(['safety_review'])
+    expect(blocked.missingGates).toEqual(['safety_review'])
   })
 
   it('検証できない Gate の一覧が明示されている', () => {
     expect(UNVERIFIABLE_GATES).toContain('safety_review')
     expect(UNVERIFIABLE_GATES).toContain('strategic_alignment_review')
-  })
-})
-
-describe('assertPlActionExecutable — 実行可否の判断も監査に残せる', () => {
-  it('actionId を渡すと blocked / executable が記録される', () => {
-    const storage = createSQLiteStorage(':memory:')
-    const taskId = seedTask(storage)
-    const approvalRequestId = createApprovalRequest(storage, taskId)
-    const { actionId } = authorizePlAction(storage, { kind: 'retry_job' })
-
-    expect(() => assertPlActionExecutable(storage, { kind: 'retry_job' }, [], { actionId })).toThrow(
-      PlActionBlockedError,
-    )
-    assertPlActionExecutable(
-      storage,
-      { kind: 'retry_job' },
-      [{ gate: 'approval_gate', approvalRequestId }],
-      { actionId },
-    )
-
-    const results = storage.auditLog
-      .findByEntity('pl_action', actionId)
-      .filter((entry) => entry.operation === 'pl_action_execute')
-      .map((entry) => entry.result)
-
-    // findByEntity の並び順には依存しない。両方が記録されていることだけを固定する。
-    expect([...results].sort()).toEqual(['blocked', 'executable'])
   })
 })

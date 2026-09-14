@@ -6,46 +6,121 @@
  *
  * ## 設計の中心: 呼び出し側から渡されたものを信じない
  *
- * 独立レビュー（OpenAI / Codex, 2026-09-14）の指摘で最も重いのはここだった。
- * 当初の実装は「判定結果オブジェクト」と「充足済み Gate の文字列配列」を引数で受け取っていた。
- * PL ループは外部プロセス（LLM + provider CLI）であり、どちらも PL が作れる。
- * つまり **Policy Engine を置いても、seam が PL の作った値を信じるなら境界は存在しない**。
+ * 独立レビュー（OpenAI / Codex）の2回のラウンドで、この層が境界として成立するために
+ * 必要な条件が確定した。いずれも「PL ループは外部プロセスであり、渡す値は全て PL が作れる」
+ * という前提から来ている。
  *
- * そこで本 seam は:
+ * 1. **判定は必ず再計算する。** 判定結果オブジェクトを引数で受け取らない
+ *    （`recomputeDecision()` が runner の `finalDecision` を採用しないのと同じ理由・同じ形）。
+ * 2. **充足の根拠は DB の実レコードで検証する。** Gate 名の文字列を渡せば通る経路を作らない。
+ * 3. **根拠は操作対象へ束縛する。** Task A の ALIGNED evidence で Task B の resume を
+ *    通せてはならない。**通るかどうかの判断に、対象と無関係なレコードを使わせない。**
+ * 4. **判定と充足検証を分けない。** 「認可した提案」と「検証した提案」がズレる隙間を作らない。
+ *    許可を得る手段は `authorizePlAction()` **一つだけ**で、そこへ渡した提案そのものに対してしか
+ *    許可は出ない。
+ * 5. **時刻は呼び出し側から受け取らない。** 期限判定を呼び出し側の時計に依存させない。
  *
- * 1. **判定を必ず再計算する**（`recomputeDecision()` が runner の `finalDecision` を採用せず
- *    API 側で再計算するのと同じ理由・同じ形）。呼び出し側の判定結果は受け取らない。
- * 2. **充足の根拠を DB の実レコードで検証する**。文字列 `'ceo_approval'` を渡せば通る、
- *    という経路を作らない。渡せるのは「どのレコードか」だけで、状態の解釈は seam が行う。
- * 3. **検証手段の無い Gate は充足できない**（fail-closed）。Strategic/Alignment Review と
- *    Safety Review は現時点で参照できる永続レコードが無いため、それを要求する操作は
- *    PL からは実行できない。配線が入るまで実行できないのが正しい。
+ * ## この層が保証しないこと（`vps-pl-execution-loop` の受入条件へ回した）
+ *
+ * - 許可を得た提案と、**実際に実行される操作**が一致すること。ここは「この提案は通る」までしか
+ *   言えない。executor を提案から構造的に dispatch するのは配線側の責務である。
+ * - `changedFiles` / `providerChange` を実差分・実構成へ束縛すること。
+ * - 対象 Job の risk / production 影響の継承、実行者の Role・Production 操作権限。
+ * - CEO Approval の Project スコープ束縛。`approvals.findById()` が `projectId` を返さないため、
+ *   現状は Approval の `type` による束縛までしかできない（`findById` の additive 拡張が要る）。
  *
  * ## 新しい Gate は作っていない
  *
- * `requiredGates` は既存工程（Strategic/Alignment Review・Design Review・Safety Review・
- * Independent Review・Approval Gate・CEO Approval）への参照でしかなく、ここが行うのは
- * 判定の再計算・記録・充足検証だけである。記録は既存 `audit_log` を使い、テーブルは足さない。
+ * `requiredGates` は既存工程への参照でしかなく、ここが行うのは判定の再計算・対象束縛付きの
+ * 充足検証・記録だけである。記録は既存 `audit_log` を使い、テーブルは足さない。
  */
 
 import { randomUUID } from 'node:crypto'
 import {
   resolvePlActionPolicy,
+  type PlActionKind,
   type PlActionPolicyDecision,
   type PlActionProposal,
   type RequiredGate,
 } from '@ai-team/shared'
+import type { ApprovalType } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 
 /** 監査記録で使う語彙。`audit_log` の既存スキーマをそのまま使う。 */
-const AUDIT_OPERATION = 'pl_action_policy'
-const AUDIT_EXECUTE_OPERATION = 'pl_action_execute'
+const AUDIT_OPERATION = 'pl_action_authorize'
 const AUDIT_ENTITY_TYPE = 'pl_action'
+
+// ────────────────────────────────────────────────────────────
+// 操作対象
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 操作の対象。**根拠レコードはこの対象に属していなければ充足として数えない。**
+ *
+ * `job` が `taskId` も持つのは、Job 経由の操作で Task 単位の根拠（Design Review evidence /
+ * Approval Request）を引くときに、申告された taskId が本当にその Job のものかを
+ * DB 側で照合するためである。
+ */
+export type PlActionTarget =
+  | { kind: 'task'; taskId: string }
+  | { kind: 'job'; jobId: string; taskId: string }
+  | { kind: 'project'; projectId: string }
+  | { kind: 'system' }
+
+/** 操作種別ごとに要求する対象の種類。ズレていれば通さない。 */
+const REQUIRED_TARGET_KIND: Record<PlActionKind, PlActionTarget['kind'] | 'any'> = {
+  observe_state: 'any',
+  read_logs: 'any',
+  read_roadmap: 'any',
+
+  retry_job: 'job',
+  resume_task: 'task',
+  clear_workspace_quarantine: 'job',
+  abort_task: 'task',
+  rollback_commit: 'job',
+
+  adopt_roadmap_item: 'project',
+  delegate_implementation: 'task',
+  propose_code_change: 'task',
+
+  restart_service: 'system',
+  deploy_production: 'system',
+  switch_provider: 'system',
+
+  // forbidden な種別は対象の検査まで到達しない。
+  change_safety_boundary: 'any',
+  change_own_permission: 'any',
+  override_gate_block: 'any',
+  skip_required_review: 'any',
+}
+
+/**
+ * CEO Approval の scope 束縛。**その操作のために出された承認であることを型で照合する。**
+ * Project スコープの照合は `approvals.findById()` が `projectId` を返さないため未実施
+ * （モジュール冒頭の「保証しないこと」を参照）。
+ */
+const REQUIRED_CEO_APPROVAL_TYPE: Partial<Record<PlActionKind, ApprovalType>> = {
+  rollback_commit: 'deployment',
+  restart_service: 'deployment',
+  deploy_production: 'deployment',
+  switch_provider: 'external_service',
+}
+
+/**
+ * 現時点で永続レコードから検証できない Gate。
+ *
+ * **これらを要求する操作は PL から実行できない。** 「検証手段が無い＝充足しているとみなす」は
+ * Gate を無くすのと同じなので fail-closed のままにする。配線は `vps-pl-execution-loop` で行う。
+ */
+export const UNVERIFIABLE_GATES: readonly RequiredGate[] = Object.freeze([
+  'strategic_alignment_review',
+  'safety_review',
+])
 
 /**
  * 充足の根拠として渡せるもの。**Gate 名そのものは渡せない。**
- * 渡せるのは「どのレコードを根拠にするか」だけで、そのレコードが充足を意味するかどうかは
- * seam が DB を読んで判断する。
+ * 渡せるのは「どのレコードか」だけで、そのレコードが充足を意味するかどうか、
+ * そして**対象に属しているかどうか**は seam が DB を読んで判断する。
  */
 export type GateEvidenceRef =
   | { gate: 'design_review'; designReviewEvidenceId: string }
@@ -53,23 +128,10 @@ export type GateEvidenceRef =
   | { gate: 'approval_gate'; approvalRequestId: string }
   | { gate: 'ceo_approval'; approvalId: string }
 
-/**
- * 現時点で永続レコードから検証できない Gate。
- *
- * **これらを要求する操作は PL から実行できない。** 「検証手段が無い＝充足しているとみなす」は
- * Gate を無くすのと同じなので、fail-closed のままにする。
- * 配線は `vps-pl-execution-loop` の受入条件として扱う。
- */
-export const UNVERIFIABLE_GATES: readonly RequiredGate[] = Object.freeze([
-  'strategic_alignment_review',
-  'safety_review',
-])
-
-export interface PlActionAuthorization {
-  /** seam が再計算した判定。呼び出し側はこれを書き換えても意味を持たない（実行時に再計算する）。 */
-  decision: PlActionPolicyDecision
-  /** 監査記録の entityId。 */
-  actionId: string
+export interface PlActionRequest {
+  proposal: PlActionProposal
+  target: PlActionTarget
+  evidence?: readonly GateEvidenceRef[]
 }
 
 /**
@@ -95,37 +157,17 @@ export class PlActionBlockedError extends Error {
 }
 
 /**
- * PL の操作案を判定し、結果を `audit_log` へ記録する。
+ * 必要 Gate を「見るだけ」。**許可ではない。**
  *
- * **判定の成否によらず必ず記録する。** forbidden だけを記録すると「何回この境界を通ったか」が
- * 分からず、境界が効いているのかを後から検証できない（Design Philosophy 8: 効果検証可能性）。
- *
- * この関数は**実行を許可しない**。実行可否は `assertPlActionExecutable()` が
- * 提案から判定を作り直したうえで決める。
+ * CEO への説明や PL の計画立案に使う read-only の導出で、記録もしないし実行権も与えない。
+ * 許可を得る手段は `authorizePlAction()` だけである。
  */
-export function authorizePlAction(
-  storage: IStorage,
-  proposal: PlActionProposal,
-  options: { targetId?: string } = {},
-): PlActionAuthorization {
-  const decision = resolvePlActionPolicy(proposal)
-  const actionId = options.targetId ?? randomUUID()
-
-  storage.auditLog.record({
-    actor: 'api',
-    operation: AUDIT_OPERATION,
-    entityType: AUDIT_ENTITY_TYPE,
-    entityId: actionId,
-    result: decision.disposition,
-    // 秘密情報・長大な payload を載せない。kind と Gate 名と policy 版だけで足りる。
-    detail: `kind=${decision.kind} gates=${decision.requiredGates.join('|') || 'none'} policy=${decision.policyVersion}`,
-  })
-
-  return { decision, actionId }
+export function previewPlActionPolicy(proposal: PlActionProposal): PlActionPolicyDecision {
+  return resolvePlActionPolicy(proposal)
 }
 
 // ────────────────────────────────────────────────────────────
-// 充足検証
+// 充足検証（対象束縛つき）
 // ────────────────────────────────────────────────────────────
 
 interface EvidenceCheck {
@@ -133,60 +175,95 @@ interface EvidenceCheck {
   rejection?: string
 }
 
-function checkDesignReview(storage: IStorage, evidenceId: string): EvidenceCheck {
+function resolveTargetTaskId(storage: IStorage, target: PlActionTarget): string | undefined {
+  if (target.kind === 'task') return target.taskId
+  if (target.kind !== 'job') return undefined
+  // 申告された taskId が本当にその Job のものかを DB で照合する。
+  const job = storage.jobs.findById(target.jobId)
+  if (!job || job.taskId !== target.taskId) return undefined
+  return job.taskId
+}
+
+function checkDesignReview(
+  storage: IStorage,
+  evidenceId: string,
+  targetTaskId: string | undefined,
+  requireIndependent: boolean,
+): EvidenceCheck {
+  const label = requireIndependent ? 'independent_review' : 'design_review'
+  if (targetTaskId === undefined) {
+    return { satisfied: false, rejection: `${label} evidence cannot be bound to the action target` }
+  }
+
   const evidence = storage.designReviewEvidence.findById(evidenceId)
   if (!evidence) {
-    return { satisfied: false, rejection: `design_review evidence ${evidenceId} does not exist` }
+    return { satisfied: false, rejection: `${label} evidence ${evidenceId} does not exist` }
   }
+  if (evidence.taskId !== targetTaskId) {
+    return {
+      satisfied: false,
+      rejection: `${label} evidence ${evidenceId} belongs to another task`,
+    }
+  }
+
+  // 古い ALIGNED を持ち出して新しい判定を上書きできないよう、その Task の最新 evidence に限る。
+  const latest = storage.designReviewEvidence.findLatestByTaskId(targetTaskId)
+  if (!latest || latest.id !== evidence.id) {
+    return { satisfied: false, rejection: `${label} evidence ${evidenceId} is not the latest for the task` }
+  }
+
+  if (requireIndependent) {
+    if (!evidence.independentReviewRequired) {
+      return { satisfied: false, rejection: `evidence ${evidenceId} did not run an independent review` }
+    }
+    if (evidence.independentReviewVerdict !== 'approved') {
+      return {
+        satisfied: false,
+        rejection: `independent review verdict is ${evidence.independentReviewVerdict ?? 'absent'}`,
+      }
+    }
+    return { satisfied: true }
+  }
+
   // ALIGNED 以外（CONFLICT / UNCERTAIN / REVIEW_UNAVAILABLE）は通過ではない。
   if (evidence.decision !== 'ALIGNED') {
-    return {
-      satisfied: false,
-      rejection: `design_review evidence ${evidenceId} decided ${evidence.decision}`,
-    }
+    return { satisfied: false, rejection: `design_review evidence ${evidenceId} decided ${evidence.decision}` }
   }
   return { satisfied: true }
 }
 
-function checkIndependentReview(storage: IStorage, evidenceId: string): EvidenceCheck {
-  const evidence = storage.designReviewEvidence.findById(evidenceId)
-  if (!evidence) {
-    return { satisfied: false, rejection: `independent_review evidence ${evidenceId} does not exist` }
+function checkApprovalGate(
+  storage: IStorage,
+  approvalRequestId: string,
+  targetTaskId: string | undefined,
+): EvidenceCheck {
+  if (targetTaskId === undefined) {
+    return { satisfied: false, rejection: 'approval_gate evidence cannot be bound to the action target' }
   }
-  // 「独立レビューが不要だった」evidence は独立レビューの充足根拠にならない。
-  if (!evidence.independentReviewRequired) {
-    return {
-      satisfied: false,
-      rejection: `evidence ${evidenceId} did not run an independent review`,
-    }
-  }
-  if (evidence.independentReviewVerdict !== 'approved') {
-    return {
-      satisfied: false,
-      rejection: `independent review verdict is ${evidence.independentReviewVerdict ?? 'absent'}`,
-    }
-  }
-  return { satisfied: true }
-}
 
-function checkApprovalGate(storage: IStorage, approvalRequestId: string, nowMs: number): EvidenceCheck {
   const request = storage.approvalRequests.findById(approvalRequestId)
   if (!request) {
     return { satisfied: false, rejection: `approval request ${approvalRequestId} does not exist` }
   }
-  if (request.status !== 'APPROVED') {
-    return {
-      satisfied: false,
-      rejection: `approval request ${approvalRequestId} is ${request.status}`,
-    }
+  if (request.taskId !== targetTaskId) {
+    return { satisfied: false, rejection: `approval request ${approvalRequestId} belongs to another task` }
   }
-  if (new Date(request.expiresAt).getTime() <= nowMs) {
+  if (request.status !== 'APPROVED') {
+    return { satisfied: false, rejection: `approval request ${approvalRequestId} is ${request.status}` }
+  }
+
+  // 壊れた期限値を「未失効」として通さない（NaN <= now は false になるため明示的に弾く）。
+  const expiresAtMs = new Date(request.expiresAt).getTime()
+  if (!Number.isFinite(expiresAtMs)) {
+    return { satisfied: false, rejection: `approval request ${approvalRequestId} has an unreadable expiry` }
+  }
+  if (expiresAtMs <= Date.now()) {
     return { satisfied: false, rejection: `approval request ${approvalRequestId} has expired` }
   }
   return { satisfied: true }
 }
 
-function checkCeoApproval(storage: IStorage, approvalId: string): EvidenceCheck {
+function checkCeoApproval(storage: IStorage, approvalId: string, kind: PlActionKind): EvidenceCheck {
   const approval = storage.approvals.findById(approvalId)
   if (!approval) {
     return { satisfied: false, rejection: `approval ${approvalId} does not exist` }
@@ -194,67 +271,106 @@ function checkCeoApproval(storage: IStorage, approvalId: string): EvidenceCheck 
   if (approval.status !== 'approved') {
     return { satisfied: false, rejection: `approval ${approvalId} is ${approval.status}` }
   }
+
+  const requiredType = REQUIRED_CEO_APPROVAL_TYPE[kind]
+  if (requiredType === undefined) {
+    // scope を照合できない操作で CEO 承認を要求していたら、それは表の穴である。fail-closed。
+    return { satisfied: false, rejection: `no CEO approval scope is defined for ${kind}` }
+  }
+  if (approval.type !== requiredType) {
+    return {
+      satisfied: false,
+      rejection: `approval ${approvalId} is a '${approval.type}' approval, not '${requiredType}'`,
+    }
+  }
   return { satisfied: true }
 }
 
-function verifyEvidence(storage: IStorage, ref: GateEvidenceRef, nowMs: number): EvidenceCheck {
+function verifyEvidence(
+  storage: IStorage,
+  ref: GateEvidenceRef,
+  kind: PlActionKind,
+  targetTaskId: string | undefined,
+): EvidenceCheck {
   switch (ref.gate) {
     case 'design_review':
-      return checkDesignReview(storage, ref.designReviewEvidenceId)
+      return checkDesignReview(storage, ref.designReviewEvidenceId, targetTaskId, false)
     case 'independent_review':
-      return checkIndependentReview(storage, ref.designReviewEvidenceId)
+      return checkDesignReview(storage, ref.designReviewEvidenceId, targetTaskId, true)
     case 'approval_gate':
-      return checkApprovalGate(storage, ref.approvalRequestId, nowMs)
+      return checkApprovalGate(storage, ref.approvalRequestId, targetTaskId)
     case 'ceo_approval':
-      return checkCeoApproval(storage, ref.approvalId)
+      return checkCeoApproval(storage, ref.approvalId, kind)
     default: {
-      // 未知の gate 名は素通しにしない。
       const unknown = ref as { gate?: unknown }
       return { satisfied: false, rejection: `unknown gate evidence kind: ${String(unknown.gate)}` }
     }
   }
 }
 
-/**
- * 実行してよいかを決める。**提案から判定を作り直す**ため、呼び出し側は判定を偽装できない。
- *
- * @param proposal PL の操作案。判定はここから再計算する。
- * @param evidence 充足の根拠レコードへの参照。**Gate 名の羅列ではない。**
- * @returns 再計算した判定（呼び出し側はこれを記録・説明に使える）
- * @throws PlActionBlockedError forbidden な操作、または必要 Gate が実データで揃っていないとき
- */
-export function assertPlActionExecutable(
-  storage: IStorage,
-  proposal: PlActionProposal,
-  evidence: readonly GateEvidenceRef[] = [],
-  options: { nowMs?: number; actionId?: string } = {},
-): PlActionPolicyDecision {
-  // 呼び出し側が持ってきた判定は受け取らない。必ず作り直す。
-  const decision = resolvePlActionPolicy(proposal)
-  const nowMs = options.nowMs ?? Date.now()
+// ────────────────────────────────────────────────────────────
+// 唯一の許可経路
+// ────────────────────────────────────────────────────────────
 
-  const recordAttempt = (result: string, detail: string): void => {
-    if (options.actionId === undefined) return
+export interface PlActionAuthorization {
+  /** seam が再計算した判定。 */
+  decision: PlActionPolicyDecision
+  /** 監査記録の entityId。 */
+  actionId: string
+}
+
+/**
+ * PL の操作案を判定し、対象束縛つきで必要 Gate の充足を検証し、結果を `audit_log` へ記録する。
+ *
+ * **許可を得る手段はこれ一つだけ**である。判定と充足検証を分けると「認可した提案」と
+ * 「検証した提案」がズレる隙間ができるため、意図的に一つの呼び出しに閉じている。
+ *
+ * **結果によらず必ず記録する。** blocked だけを記録すると「何回この境界を通ったか」が分からず、
+ * 境界が効いているのかを後から検証できない（Design Philosophy 8: 効果検証可能性）。
+ *
+ * @throws PlActionBlockedError forbidden な操作、対象種別が合わない操作、
+ *   または必要 Gate が実データで揃っていないとき
+ */
+export function authorizePlAction(
+  storage: IStorage,
+  request: PlActionRequest,
+): PlActionAuthorization {
+  // 呼び出し側が持ってきた判定は受け取らない。必ず提案から作り直す。
+  const decision = resolvePlActionPolicy(request.proposal)
+  const actionId = randomUUID()
+
+  const record = (result: string, detail: string): void => {
     storage.auditLog.record({
       actor: 'api',
-      operation: AUDIT_EXECUTE_OPERATION,
+      operation: AUDIT_OPERATION,
       entityType: AUDIT_ENTITY_TYPE,
-      entityId: options.actionId,
+      entityId: actionId,
       result,
+      // 秘密情報・長大な payload を載せない。kind と Gate 名と policy 版だけで足りる。
       detail,
     })
   }
 
   if (decision.disposition === 'forbidden') {
-    recordAttempt('forbidden', `kind=${decision.kind}`)
+    record('forbidden', `kind=${decision.kind} policy=${decision.policyVersion}`)
     throw new PlActionBlockedError(decision, [])
   }
 
+  const kind = decision.kind as PlActionKind
+  const expectedTargetKind = REQUIRED_TARGET_KIND[kind]
+  if (expectedTargetKind !== 'any' && request.target.kind !== expectedTargetKind) {
+    record('blocked', `kind=${kind} target_mismatch=${request.target.kind}`)
+    throw new PlActionBlockedError(decision, decision.requiredGates, [
+      `action ${kind} requires a ${expectedTargetKind} target, got ${request.target.kind}`,
+    ])
+  }
+
+  const targetTaskId = resolveTargetTaskId(storage, request.target)
   const satisfied = new Set<RequiredGate>()
   const rejections: string[] = []
 
-  for (const ref of evidence) {
-    const check = verifyEvidence(storage, ref, nowMs)
+  for (const ref of request.evidence ?? []) {
+    const check = verifyEvidence(storage, ref, kind, targetTaskId)
     if (check.satisfied) {
       satisfied.add(ref.gate)
     } else if (check.rejection) {
@@ -263,12 +379,14 @@ export function assertPlActionExecutable(
   }
 
   const missing = decision.requiredGates.filter((gate) => !satisfied.has(gate))
-
   if (missing.length > 0) {
-    recordAttempt('blocked', `kind=${decision.kind} missing=${missing.join('|')}`)
+    record('blocked', `kind=${kind} missing=${missing.join('|')} policy=${decision.policyVersion}`)
     throw new PlActionBlockedError(decision, missing, rejections)
   }
 
-  recordAttempt('executable', `kind=${decision.kind} gates=${decision.requiredGates.join('|') || 'none'}`)
-  return decision
+  record(
+    'authorized',
+    `kind=${kind} gates=${decision.requiredGates.join('|') || 'none'} policy=${decision.policyVersion}`,
+  )
+  return { decision, actionId }
 }

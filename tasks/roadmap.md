@@ -6030,7 +6030,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 0. [~] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
       **【2026-09-14 進捗: Policy Engine と enforcement seam を実装。残りは PL ループからの配線】**
       `resolvePlActionPolicy()`（`packages/shared/src/plActionPolicy.ts`）と
-      `authorizePlAction()` / `assertPlActionExecutable()`（`apps/api/src/pl/actionGate.ts`）を追加した。
+`authorizePlAction()` / `previewPlActionPolicy()`（`apps/api/src/pl/actionGate.ts`）を追加した。
       **新しい Gate 本体・新しい Review 工程・新しいテーブルは作っていない**（記録は既存 `audit_log`）。
 
       実装した不変条件（テストで固定）:
@@ -6053,7 +6053,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       PL ループは外部プロセス（LLM + provider CLI）であり、そのどちらも PL が作れる。
       **Policy Engine を置いても、seam が PL の作った値を信じるなら境界は存在しない**という
       指摘は正しく、以下を修正した:
-      - `assertPlActionExecutable()` は**提案から判定を作り直す**。判定オブジェクトを
+      - 許可経路は**提案から判定を作り直す**。判定オブジェクトを
         差し込む引数を廃止した（`recomputeDecision()` が runner の自己申告を採用しないのと同じ形）
       - 充足の根拠は **DB の実レコードで検証する**。渡せるのは「どのレコードか」だけで、
         Gate 名の文字列を渡せば通る経路を無くした。Design Review evidence は `ALIGNED` のみ、
@@ -6067,6 +6067,21 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         全て外せる穴を塞いだ
       - `resume_task` の必要 Gate に `design_review` を追加（理由文と Gate 一覧が不一致だった）
 
+      **【独立レビュー 2巡目（OpenAI / Codex, 2026-09-14）: changes_requested → 修正済み】**
+      1巡目の修正でも「根拠が対象へ束縛されていない」「認可と検証の間に隙間がある」という
+      指摘が残り、以下を修正した:
+      - **根拠を操作対象へ束縛する。** Task A の ALIGNED evidence で Task B の resume を
+        通せない。`job` 対象では申告された `taskId` が本当にその Job のものかを DB で照合する。
+        操作種別ごとに要求する対象種別（task / job / project / system）も固定した
+      - **古い ALIGNED の持ち出しを禁止。** Design Review evidence はその Task の最新1件のみ有効
+      - **認可と充足検証を1つの呼び出しに閉じた。** `assertPlActionExecutable()` を廃止し、
+        許可を得る経路は `authorizePlAction()` だけにした。「認可した提案」と「検証した提案」が
+        ズレる隙間を無くすため。見るだけの `previewPlActionPolicy()` は記録も実行権も持たない
+      - **時刻を呼び出し側から受け取らない。** 期限判定を呼び出し側の時計に依存させない。
+        壊れた期限値（`NaN`）を「未失効」として通さない
+      - **CEO Approval に scope 束縛を追加。** 操作種別ごとに要求する `ApprovalType` を固定し、
+        用途の違う承認を流用できないようにした
+
       **指摘のうち、ここでは直さず `vps-pl-execution-loop` の受入条件へ回したもの**:
       - `changedFiles` も `providerChange` も PL の申告値であり、**実差分・実構成との束縛は
         この層では行えない**。権威ある判定は既存の File Change Guard と Job の `gate/check` が行う。
@@ -6076,10 +6091,15 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - `allowedResponsesWhenBlocked` は情報であって強制ではない。BLOCK 後の再提案を
         別種の action で回避できないようにするのは配線側の責務
       - 実行者の Role・Production 操作権限はこの層では表現していない
+      - 許可した提案と、**実際に実行される操作**が一致すること。この層は「この提案は通る」までしか
+        言えない。executor を提案から構造的に dispatch するのは配線側の責務
+      - CEO Approval の Project スコープ束縛。`approvals.findById()` が `projectId` を返さないため、
+        現状は Approval の `type` による束縛までしかできない（`findById` の additive 拡張が要る）
 
       **残っている作業（本項目は完了にしない）**: PL 実行ループからの配線。
       `vps-pl-execution-loop` の受入条件に「PL の全 write 操作が `authorizePlAction()` を通ること」
-      「`satisfiedGates` は PL 出力ではなくシステム観測の根拠から組むこと」を含める。
+      「充足の根拠は PL 出力ではなく DB の実レコードであること」「executor は許可した提案から
+      構造的に dispatch すること」を含める。
 
       **CEO 確定の不変条件（2026-09-14）**。PL の思考・原因分析・方針判断は制限しない。
       安全性は「PL が判断できないようにする」ことではなく、**PL が決めた変更・操作を必ず既存 Gate へ
