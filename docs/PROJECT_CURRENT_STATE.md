@@ -202,6 +202,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）
 - **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
 - **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
+- **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い
 - **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける**
 - **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
 - **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
@@ -213,6 +214,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`TEMP_MVP_COMPLETION_POLICY cleanup`**
 - **roadmap parser が追加属性と `[~]` 表記を受理できるようにする
 - **正式 Roadmap の1項目を実行可能な Task として採用する最小経路
+- **Tier A: 自己開発の最初の安全な切替点
+- **cleanup だけが失敗した containment が Job を quarantine させる
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
@@ -232,7 +235,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**（state: planned）
 - **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**（state: planned）
 - **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**（state: planned）
-- **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い**（state: planned）
 - **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: deferred）
 - **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
 - **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）
@@ -242,14 +244,13 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
-- **Tier A: 自己開発の最初の安全な切替点（Candidate runtime 不要）**（state: planned）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
+- **Roadmap 採用経路の残作業2件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）**（state: planned）
 - **Project 単位 workspace 分離（Multi-Project の前提・最優先）**（state: planned）
 - **Harness Bake-off / Execution Runtime Evaluation**（state: planned）
 - **Containment adversarial escape（cgroup migration / git external helper）（state: planned）
 - **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）**（state: planned）
-- **cleanup だけが失敗した containment が Job を quarantine させる（`populated=0` でも `rmdir` EBUSY）**（state: planned）
 - **Containment success path の可観測性（低優先 hardening）**（state: planned）
 - **Failure Explanation の事前生成と CEO 向け構造化（次段改善）（state: planned）
 - **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）

@@ -3262,8 +3262,15 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `test.js` は未変更、verify.js baseline も FAIL のままだった。
    異常検出 → 安全停止 → 状態保全 → 原因特定可能 → 正規手段で再開、は満たしている。
 
-<!-- roadmap:id=quarantined-dirty-task-generic-recovery state=planned -->
-0. [ ] **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い**
+<!-- roadmap:id=quarantined-dirty-task-generic-recovery state=done -->
+0. [x] **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い — 完了（2026-09-14, PR #166）**
+   **【2026-09-14 完了】** 真因は空 dirty baseline（`mode:'dirty', entries:[]`）と clean observation の
+   `mode` 不一致で、`baselineEqualsObservation()` が解除要求を必ず 409 にしていたこと。比較前の正規化で修正した
+   （`entries` 非空は従来どおり厳密比較 / `startCommitHash` 一致必須 / 実差分があれば解除しない）。
+   **production 実測**: stuck していた実 Job `cf259578` で safe observation → quarantine release
+   （`quarantineClearedAt` 記録）→ ownership 回復 → resume 可能まで到達した。
+   Milestone 記録: `docs/project_memory/decisions/tier_a_self_development_e2e.md`。
+
    **【2026-09-13 注記】`project-workspace-isolation` は本項目を閉じない。** 分離後も
    1 Project 内で quarantine は発生し、復旧手段が無い状態は変わらない。
    縮小するのは影響範囲（他 Project が巻き添えで停止しなくなる）だけである。
@@ -4416,8 +4423,18 @@ worktree と別 repository は採らない。
       `implementationScope` を追加し、description は ledger 全文のまま、プロンプト上のスコープだけを
       上書きする形が最小。**ledger 側へサブ項目の構造化（A-1 相当）は持ち込まない。**
 
-<!-- roadmap:id=aiteamos-self-development-tier-a state=planned -->
-1. [ ] **Tier A: 自己開発の最初の安全な切替点（Candidate runtime 不要）** — 最優先。
+<!-- roadmap:id=aiteamos-self-development-tier-a state=done -->
+1. [x] **Tier A: 自己開発の最初の安全な切替点 — 完了（2026-09-14）**
+      **Milestone: AIteamOS Self-Development Tier A Operational E2E Complete。**
+      Project `AIteamOS Post-MVP Development`（`6d1a5c87`）で、AIteamOS 自身が正式 Roadmap 項目
+      `continuation-reconcile-nonblocking-followups`（項目2）を実装 → validation → Independent Review
+      → commit（`78220e6`）まで完走した。PR #169 → master `8571dd0`。CEO 操作は承認1回のみ、
+      人間が書いたコードは0行。**Project は完了扱いにせず running のまま継続する。**
+      詳細な snapshot: `docs/project_memory/decisions/tier_a_self_development_e2e.md`。
+      **移行後の第一選択**: typecheck / test / CI / Independent Review で正しさを示せる変更は Mobile。
+      **まだ外部セッションが必要**: push / PR（`worker-restricted-remote-publish`）、採用 API の実行
+      （Mobile UI 未実装）、Tier B 変更、production deploy。
+
       **これが「最短地点」である。**
 
       **成立根拠**: 外部 Claude / Codex セッションが今まさに行っている AIteamOS 開発も、
@@ -4506,6 +4523,31 @@ worktree と別 repository は採らない。
       **依存**: Independent Review 必須（secret 境界に触れるため）。
       `aiteamos-self-development-tier-a` の E2E は、本項目の完了前は
       **bootstrap 例外として外部セッションが push / PR を担当**してよい。
+
+<!-- roadmap:id=roadmap-adoption-followups state=planned -->
+2. [ ] **Roadmap 採用経路の残作業2件（`roadmap-item-adoption` の後続）** — 2026-09-14登録。
+      親項目 `roadmap-item-adoption`（done）は採用経路そのものを実装済み。以下は Tier A E2E で
+      実運用して判明した**残作業**であり、親項目の再オープンではなく後続として扱う。
+
+      **(1) 採用時に implementation scope を明示できない** — description は ledger 項目の本文全文に
+      なるため、複数サブ項目を含む項目では対象外まで実装対象と解釈される。E2E 初回で実際に
+      `allowedPaths` 外を変更し File Change Guard に停止させられた（安全機構は正しく作動）。
+      resume の追加指示で回避できたが、毎回 PL が言い直すのは運用として弱い。
+      **最小案**: 採用 API へ任意の `implementationScope` を追加し、description は ledger 全文のまま
+      プロンプト上のスコープだけを上書きする。**ledger 側へサブ項目の構造化は持ち込まない。**
+
+      **(2) paused / draft の Project へ採用しても初回 Job が作られない** —
+      `createInitialImplementWorkflow()` は `project.status !== 'running'` を `retryable` で skip し、
+      `PATCH /api/projects/:id` の resume 分岐は `retryPendingContinuationsForProject()` しか呼ばず
+      `ensureInitialWorkflowsForActiveTasks()` を呼ばない。`reconcileTaskContinuations()` も
+      `task_continuations` 行しか sweep しないため、running 化後に拾い直す経路が無い。
+      E2E では採用 API の再実行（冪等）で回避した。
+      **最小案**: resume 分岐でも `ensureInitialWorkflowsForActiveTasks()` を呼ぶ。
+      **Project lifecycle の変更**なので Independent Review 必須。
+
+      **関連**: Mobile に採用 UI が無く PL が API を実行している点は Known Limitation として
+      `docs/project_memory/decisions/tier_a_self_development_e2e.md` に記録済み。
+      UI 実装は本項目に含めない（自己開発移行を遅らせないため）。
 
 <!-- roadmap:id=aiteamos-self-development-tier-b state=planned -->
 2. [ ] **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）** —
@@ -4833,8 +4875,17 @@ deploy canary は全 PASS だった。
       **今回実装しないもの（明記）**: unit file の変更 / delegation 構成の変更 /
       新しい supervision 方式の導入。本項目は記録のみ。
 
-<!-- roadmap:id=containment-cleanup-ebusy-quarantine state=planned -->
-3. [ ] **cleanup だけが失敗した containment が Job を quarantine させる（`populated=0` でも `rmdir` EBUSY）**
+<!-- roadmap:id=containment-cleanup-ebusy-quarantine state=done -->
+3. [x] **cleanup だけが失敗した containment が Job を quarantine させる — 完了（2026-09-14, PR #167 / #168）**
+      **【2026-09-14 完了】** 真因は AIteamOS 自身のテストが `drain_timeout` 用 cgroup を残し、自己開発では
+      それが Job の cgroup の**子**になって親を削除できないこと。テスト側の後片付けで修正した（#168。
+      production コードは無変更）。bounded retry と診断情報（#167）は一過性 EBUSY への備えとして維持し、
+      この真因特定を可能にした。**production 実測**: 修正後の Job chain で cleanup 成功、
+      quarantine に入らず残留 cgroup 0件。
+      **残す follow-up（本項目では実装しない）**: production 側で「空の子 cgroup を削除してから親を
+      `rmdir`」すべきかは未決。安全経路の挙動変更であり本当のリークを隠す副作用もあるため、
+      必要性が実証されるまで実装しない。
+
       — 2026-09-14、Tier A 自己開発 E2E の production 実測で登録。**高優先度**。
       既存 containment 項目（上記 `worker-cgroup-delegation-contract` / 下記
       `containment-success-path-observability`）は delegation 契約と成功経路の可観測性を扱っており、
