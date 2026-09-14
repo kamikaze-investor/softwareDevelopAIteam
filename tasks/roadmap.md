@@ -6026,8 +6026,32 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 - 将来着手する際も、**まず隔離環境でPoCしてから統合する**
 - 外部サービス追加・課金・認証・本番公開に該当する判断はYellow Zone（CEO承認必須）
 
-<!-- roadmap:id=mandatory-gate-policy state=planned -->
-0. [ ] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
+<!-- roadmap:id=mandatory-gate-policy state=in_progress -->
+0. [~] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
+      **【2026-09-14 進捗: Policy Engine と enforcement seam を実装。残りは PL ループからの配線】**
+      `resolvePlActionPolicy()`（`packages/shared/src/plActionPolicy.ts`）と
+      `authorizePlAction()` / `assertPlActionExecutable()`（`apps/api/src/pl/actionGate.ts`）を追加した。
+      **新しい Gate 本体・新しい Review 工程・新しいテーブルは作っていない**（記録は既存 `audit_log`）。
+
+      実装した不変条件（テストで固定）:
+      - `plRiskOpinion` は `requiredGates` の算出に**一切使わない**（記録のみ）。
+        全 action kind について、LOW 申告でも CRITICAL 申告でも requiredGates が同一になることを検査している
+      - `plProposedGates` は **union にしか効かない**（増やせるが減らせない）。
+        解決できない Gate 名は無視するだけで、減らす方向には働かない
+      - `change_safety_boundary` / `change_own_permission` / `override_gate_block` /
+        `skip_required_review` は常に `forbidden`。自己申告を足しても解けない
+      - **未知の action kind は素通しではなく forbidden**（語彙を1つ増やすだけで Gate を回避できない）
+      - Independent Review の独立性条件は PL より上位。同一 vendor になる provider 切替と、
+        vendor を特定できない provider への切替は `forbidden`（`reviewSeparation` を再利用）
+      - BLOCK 時に PL が取れるのは fix / re-review / 代替案 / CEO Escalation の4つのみ。
+        **override 経路は型としても存在しない**
+      - 変更ファイルがあるときは既存 `runRiskReview()` と `runMechanicalGate()` へそのまま通し、
+        HIGH/CRITICAL で independent_review、CRITICAL と Mechanical Gate hit で ceo_approval まで上げる
+
+      **残っている作業（本項目は完了にしない）**: PL 実行ループからの配線。
+      `vps-pl-execution-loop` の受入条件に「PL の全 write 操作が `authorizePlAction()` を通ること」
+      「`satisfiedGates` は PL 出力ではなくシステム観測の根拠から組むこと」を含める。
+
       **CEO 確定の不変条件（2026-09-14）**。PL の思考・原因分析・方針判断は制限しない。
       安全性は「PL が判断できないようにする」ことではなく、**PL が決めた変更・操作を必ず既存 Gate へ
       通す**ことで担保する。
