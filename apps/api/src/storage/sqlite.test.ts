@@ -2033,7 +2033,7 @@ describe('SQLiteStorage', () => {
         // ── entries が空の dirty baseline（resume/repair/retry が clean な worktree から始まると記録される）
         // 2026-09-14 production: この組み合わせで解除要求が必ず 409 になり Task が復旧不能になった。
         describe('empty dirty baseline is equivalent to clean', () => {
-          const EMPTY_DIRTY = { mode: 'dirty', startCommitHash: 'abc123', entries: [] } as const
+          const EMPTY_DIRTY: JobWorkspaceBaseline = { mode: 'dirty', startCommitHash: 'abc123', entries: [] }
 
           it('clears when the baseline is dirty-but-empty and the workspace observes clean', () => {
             const job = createRunningJob()
@@ -2061,7 +2061,7 @@ describe('SQLiteStorage', () => {
               observation: {
                 mode: 'dirty',
                 startCommitHash: 'abc123',
-                entries: [{ path: 'src/leftover.ts', kind: 'worktree' }],
+                entries: [{ path: 'src/leftover.ts', kind: 'modified', worktreeHash: 'h1' }],
               },
               knownGood: { ...KNOWN_GOOD, worktreeClean: false },
             })
@@ -2094,7 +2094,7 @@ describe('SQLiteStorage', () => {
               workspaceBaseline: {
                 mode: 'dirty',
                 startCommitHash: 'abc123',
-                entries: [{ path: 'src/a.ts', kind: 'worktree' }],
+                entries: [{ path: 'src/a.ts', kind: 'modified', worktreeHash: 'h2' }],
               },
             })
 
