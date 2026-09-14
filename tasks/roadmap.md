@@ -6562,6 +6562,36 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **Explainer との関係**: 回答文の平易化は `failure-explanation-pregeneration`（Explainer 責務）
       が担う。本項目は**事実の取得と、既存の安全な操作の呼び出し**に徹する。
 
+<!-- roadmap:id=failed-job-produces-no-attention state=planned -->
+3. [ ] **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない** —
+      2026-09-15登録（移管直後の実測）。
+
+      **実測**: VPS へ移管した直後、VPS 自身が採用済み Task の implement Job を実行し、
+      provider（`claude_code`）が timeout して Job は `failed`（`{"kind":"provider_timeout",
+      "workspaceState":"changed"}`）。この結果:
+      - Task は `pending` / `roadmapActive` のまま、初回 Job は**既に存在する**ので
+        `createInitialImplementWorkflow()` は `initial workflow job already exists` で skip する
+        → **誰も再試行しない**
+      - `task_ready_without_job` は「Job が無い」条件なので**出ない**
+      - `buildSystemState()` の attention 種別に **`failed` は無い**（`job_blocked` /
+        `workspace_quarantined` / `job_running_long` 等のみ）→ **PL からは何も見えない**
+      - Candidate workspace には当該 Job の変更が2件残る（`autoReview.ts` 変更 +
+        `autoReview.test.ts` 未追跡）。**allowedPaths 内に収まっており**、
+        `implementationScope` は意図どおり働いた（前回は5ファイルが範囲外だった）
+
+      **つまり「静かに止まる」形が1つ残っている。** これは `vps-pl-execution-loop` が潰したはずの
+      失敗モードそのもの（外部が気付くまで誰も再開しない）であり、移管後の自律性を直接損なう。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - `failed` を一律 attention にすると、履歴上の失敗（既に別 Job で解決済み・Task が done 等）まで
+        鳴り続ける。**「その Task の最新 Job が failed で、後続 Job が無く、Task が未完了」**のような
+        条件で絞れるか。`done な Task の blocked Job` と同じ構図なので同じ判定を使えないか
+      - 復旧操作は既存のどれか（resume / retry / repair）で足りるか。**新しい Recovery 機構を作らない**
+      - PL に実行させるなら必要 Gate は何か。workspace を書き換える操作なので
+        `rekick_design_review` の理屈（無 Gate）は**適用しない**
+      - 残った dirty をどう扱うか。**曖昧な変更の自動削除はしない**という既存方針は維持する
+        （本件の dirty は失敗 Job の `changed_files` に記録済みで帰属は明確）
+
 <!-- roadmap:id=pl-autonomous-roadmap-adoption state=planned -->
 4. [ ] **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）** —
       2026-09-15登録。**本線を VPS へ移管した時点で判明した最大のギャップ。**
