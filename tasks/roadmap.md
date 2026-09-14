@@ -4304,6 +4304,53 @@ worktree と別 repository は採らない。
    **Candidate から本番 DB / 本番 runtime state を直接操作してはならない**
    （snapshot は既存の `ai-team-db-backup.service` を再利用する。新しい backup 機構は作らない）
 
+<!-- roadmap:id=roadmap-item-adoption state=done -->
+0. [x] **正式 Roadmap の1項目を実行可能な Task として採用する最小経路 — 完了（2026-09-14）**
+      （Tier A Operational E2E の前提。`POST /api/projects/:id/roadmap-adoptions`）。
+
+      **解いた問題**: Project が Roadmap を得る唯一の手段が「生成」だったため、
+      `tasks/roadmap.md` という**既に存在する正式 Roadmap** を持つ AIteamOS 自身の Project を
+      開始できなかった。`paused → running` にすると `hasActiveRoadmap=false` のため
+      `kickProjectStart()` が走り、`roadmapWriter` が `docs/roadmap.md` と
+      **実在の `tasks/task_graph.md` を上書きして commit** してしまう。
+
+      **設計**: ledger 全体を Task 化しない。Roadmap は Finding・設計メモ・deferred 項目・
+      調査記録を含む**長期台帳のまま維持**し、「PL が次に実装すると決めた1件だけ」を
+      実行可能な Task specification へ具体化して採用する。
+
+      **PL が明示するもの（ledger の散文から推測しない）**: `allowedPaths` と
+      `acceptanceCriteria`。実行時の安全境界と完成判定そのものであり、空なら fail-closed で拒否する。
+
+      **既存情報から決まるもの**: `roadmapTaskKey` = `roadmap:id`（追跡可能性）、
+      `title` と `description` = ledger から取得。
+      **固定 default**: `assignee='developer_ai'`（`selectNextContinuableTask()` と初回 Implement Job の
+      eligibility が要求するため実質1択）、`category='implementation'`、`dependencies=[]`、
+      `phase=1`（単一固定 Phase。ledger へ Phase 体系を導入するものではなく、
+      `GET /api/projects/:id/roadmap` が Phase 単位で返すため Mobile から見えるようにする最小措置）。
+
+      **再利用した既存機構（新規は作っていない）**: `roadmapParser`（`getValidRoadmapItems` が
+      ledger の不整合で throw する = fail-closed）、`validateRoadmapTasks` /
+      `validateRoadmapPhases`（allowedPaths の repository-relative 検証を含む）、
+      `syncRoadmapTasks`（`roadmap_task_key` キーで冪等）、
+      `ensureInitialWorkflowsForActiveTasks`（採用直後に初回 Implement Job を作る）。
+      **新しい adoption state / 管理テーブル / Task status / Project status は追加していない。**
+
+      **累積集合を持たない根拠（実装を確認して決定）**: `syncRoadmapTasks` は入力に無い既存
+      roadmapActive Task を非活性化するが、次 Task 選択の `selectNextContinuableTask()` は
+      `status === 'pending'` を要求するため**完了済み Task はそもそも候補にならない**
+      （`roadmapActive` の値によらない）。よって「直前に採用した1件だけが roadmapActive」で
+      continuation・resume・履歴はすべて成立する。累積集合を管理する仕組みは作らない。
+      ただし **0件同期は禁止**（全非活性化 → `hasActiveRoadmap=false` → 次の running 遷移で再生成）。
+
+      **確認した不変条件**: Roadmap を再生成しない（LLM を呼ばない）／
+      `docs/roadmap.md`・`tasks/task_graph.md` を書かない（`roadmapWriter` を使わない）／
+      `roadmap:id` と Task の対応が追跡できる／`allowedPaths` と `acceptanceCriteria` が必ず明示される／
+      同じ `roadmap:id` を重複実行しない（Job 実行済みなら `ALREADY_EXECUTED`）／
+      `done` 項目は再実行しない／adoption 失敗時は Task を作らない（fail-closed）／
+      採用後は `hasActiveRoadmap=true` になり pause/resume で再生成へ戻らない。
+
+      **検証**: `roadmapAdoption.test.ts` 15/15 PASS、`apps/api` 全体 1230 passed。
+
 <!-- roadmap:id=aiteamos-self-development-tier-a state=planned -->
 1. [ ] **Tier A: 自己開発の最初の安全な切替点（Candidate runtime 不要）** — 最優先。
       **これが「最短地点」である。**
