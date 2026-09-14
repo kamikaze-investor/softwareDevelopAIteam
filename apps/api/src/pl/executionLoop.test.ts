@@ -1,4 +1,7 @@
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, beforeEach, beforeAll, afterAll } from 'vitest'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState } from '../state/systemState'
@@ -12,6 +15,7 @@ import {
   verifyOutcome,
   type PlLoopDeps,
 } from './executionLoop'
+import { PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
 
 /**
  * ここで固定しているのは「PL が自分の権限で動かない」ことと「操作したら必ず確かめる」ことである。
@@ -60,6 +64,8 @@ function deps(over: Partial<PlLoopDeps> = {}): PlLoopDeps {
     diagnose: async () => JSON.stringify({ actionKind: 'rekick_design_review', rationale: 'queued run is idle', riskLevel: 'LOW' }),
     rekickDesignReview: async () => ({ status: 'evidence_registered' }),
     escalate: async () => {},
+    // 既定では採用候補を空にする。採用経路を検証するテストだけが ledger を渡す。
+    readLedger: () => '',
     ...over,
   }
 }
@@ -447,6 +453,105 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
       await runPlTick(storage, d)
     }
 
+    expect(escalations.length).toBe(1)
+  })
+})
+
+describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する', () => {
+  // Gate は呼び出し側から ledger を受け取らない（偽造防止）ので、実ファイルを置いて TARGET_ROOT を向ける。
+  let ledgerRoot: string
+  let previousTargetRoot: string | undefined
+
+  beforeAll(() => {
+    ledgerRoot = mkdtempSync(join(tmpdir(), 'pl-loop-adopt-'))
+    mkdirSync(join(ledgerRoot, 'tasks'), { recursive: true })
+    writeFileSync(
+      join(ledgerRoot, 'tasks', 'roadmap.md'),
+      ['# Roadmap', '', '<!-- roadmap:id=next-item state=planned -->', '1. [ ] **次にやる項目** — 採用できる'].join('\n'),
+      'utf-8',
+    )
+    previousTargetRoot = process.env.TARGET_ROOT
+    process.env.TARGET_ROOT = ledgerRoot
+  })
+
+  afterAll(() => {
+    if (previousTargetRoot === undefined) delete process.env.TARGET_ROOT
+    else process.env.TARGET_ROOT = previousTargetRoot
+    rmSync(ledgerRoot, { recursive: true, force: true })
+  })
+
+  const LEDGER = [
+    '# Roadmap',
+    '',
+    '<!-- roadmap:id=next-item state=planned -->',
+    '1. [ ] **次にやる項目** — 採用できる',
+  ].join('\n')
+
+  const PROPOSAL = JSON.stringify({
+    roadmapId: 'next-item',
+    implementationScope: 'この範囲だけ',
+    allowedPaths: ['apps/api/src/ctoAi'],
+    acceptanceCriteria: ['test が通る'],
+    rationale: '小さく安全',
+  })
+
+  function idleProject(): IStorage {
+    const storage = createSQLiteStorage(':memory:')
+    storage.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+    return storage
+  }
+
+  it('attention が無く手が空いていれば採用を試み、結果を audit に残す', async () => {
+    const storage = idleProject()
+    const adopted: string[] = []
+
+    const result = await runPlTick(storage, deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => PROPOSAL,
+      adopt: async (_s, input) => {
+        adopted.push(input.roadmapId)
+        return { ok: true as const, taskId: 'task-1', roadmapTaskKey: input.roadmapId, title: 't' }
+      },
+    }))
+
+    expect(adopted).toEqual(['next-item'])
+    expect(result.status).toBe('acted')
+    expect(result.proposedKind).toBe('adopt_roadmap_item')
+    expect(storage.auditLog.findAll().some((e) => e.entityId === `adopt:${storage.projects.findAll()[0]!.id}`)).toBe(true)
+  })
+
+  it('attention が1件でもあるうちは採用しない（止まっているものを放置して仕事を増やさない）', async () => {
+    const { storage } = seedIdleDesignReview()
+    let adoptCalls = 0
+
+    await runPlTick(storage, deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => PROPOSAL,
+      adopt: async () => { adoptCalls += 1; return { ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' } },
+    }))
+
+    expect(adoptCalls).toBe(0)
+  })
+
+  it('採用が続けて失敗したら、再試行ではなく CEO へ上げる', async () => {
+    const storage = idleProject()
+    const escalations: string[] = []
+    const d = deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => 'これは JSON ではない',
+      escalate: async (p) => { escalations.push(p.title) },
+    })
+
+    for (let i = 0; i < PL_MAX_ADOPTION_ATTEMPTS; i += 1) {
+      resetPlLoopInFlightForTest()
+      const r = await runPlTick(storage, d)
+      expect(r.status, `attempt ${i + 1}`).toBe('blocked')
+    }
+
+    resetPlLoopInFlightForTest()
+    const escalated = await runPlTick(storage, d)
+
+    expect(escalated.status).toBe('escalated')
     expect(escalations.length).toBe(1)
   })
 })
