@@ -258,7 +258,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
 - **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: in_progress）
 - **Mandatory Gate Policy（state: in_progress）
-- **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**（state: planned）
+- **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**（state: in_progress）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: planned）
 - **Mobile 内の運用指示窓口（Operator Chat）**（state: planned）

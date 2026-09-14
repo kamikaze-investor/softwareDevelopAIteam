@@ -31,6 +31,19 @@ import { healthRoutes } from './routes/health'
 import { apiTokenAuth } from './auth/apiToken'
 import { recoverAndRekickAtStartup } from './designReview/designReviewCoordinator'
 import { recoverInterruptedProjectStarts } from './ctoAi/projectStartWorkflow.js'
+import { plRoutes } from './routes/pl'
+import { runPlTick } from './pl/executionLoop'
+
+/**
+ * VPS PL Execution Loop の起動設定。**既定は無効**である。
+ *
+ * 有効化は env だけで行い、コード側の既定を変えない。deploy しただけでは production の
+ * 挙動は変わらず、CEO が `PL_LOOP_ENABLED=true` を置いたときにだけ tick が回り始める。
+ * 新しい常駐プロセス・systemd unit・scheduler は追加していない（既存 API プロセス内の
+ * interval が 1 本増えるだけで、実体は `POST /api/pl/tick` と同じ関数を呼ぶ）。
+ */
+const PL_LOOP_ENABLED = process.env.PL_LOOP_ENABLED === 'true'
+const PL_LOOP_INTERVAL_MS = Number.parseInt(process.env.PL_LOOP_INTERVAL_MS ?? '60000', 10)
 
 const app = Fastify({ logger: true })
 
@@ -58,6 +71,7 @@ app.get('/health', async () => {
 // Routes (Phase 1で追加予定)
 app.register(projectRoutes, { prefix: '/api/projects' })
 app.register(systemStateRoutes, { prefix: '/api' })
+app.register(plRoutes, { prefix: '/api' })
 app.register(approvalRoutes, { prefix: '/api' })
 app.register(taskRoutes, { prefix: '/api/tasks' })
 app.register(jobRoutes, { prefix: '/api/jobs' })
@@ -130,5 +144,22 @@ app.listen({ port: PORT, host: process.env.HOST ?? '0.0.0.0' }, (err) => {
       }
     })
     .catch((recoveryError) => app.log.error({ err: recoveryError }, 'project start startup recovery failed'))
+
+  // VPS 上で PL 判断ループを回す唯一の常設トリガー。**既定では起動しない。**
+  // 1 tick は `POST /api/pl/tick` と同じ関数で、実行可否は Mandatory Gate Policy が決める。
+  // 失敗しても API は落とさない（次の tick で再評価される）。
+  if (PL_LOOP_ENABLED && Number.isFinite(PL_LOOP_INTERVAL_MS) && PL_LOOP_INTERVAL_MS > 0) {
+    app.log.info({ intervalMs: PL_LOOP_INTERVAL_MS }, 'PL execution loop enabled')
+    setInterval(() => {
+      void runPlTick(getStorage())
+        .then((result) => {
+          // idle / skipped を毎回書くとログが埋まるので、動いたときだけ残す。
+          if (result.status !== 'idle' && result.status !== 'skipped_in_flight') {
+            app.log.info({ plTick: result }, 'PL tick')
+          }
+        })
+        .catch((tickError) => app.log.error({ err: tickError }, 'PL tick failed'))
+    }, PL_LOOP_INTERVAL_MS).unref()
+  }
 })
 })

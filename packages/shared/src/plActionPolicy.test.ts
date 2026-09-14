@@ -273,13 +273,27 @@ describe('resolvePlActionPolicy — 実在する復旧操作が語彙から漏�
     expect(decision.disposition).toBe('no_gate_required')
   })
 
-  it('Design Review の再kick は forbidden ではなく、既存の bounded retry 経路へ載る', () => {
+  it('Design Review の再kick は forbidden ではなく、up-front の Gate も要さない', () => {
     // vps-pl-execution-loop の production evidence（requeue された run を誰も再開しなかった）で
     // 実際に必要だった操作。ここが forbidden だと PL 基盤の動機そのものが満たせない。
+    // workspace を変えず、attempt が有界で、判定は API 側で再計算されるため up-front Gate は課さない。
     const decision = resolvePlActionPolicy({ kind: 'rekick_design_review' })
 
-    expect(decision.disposition).toBe('gates_required')
-    expect(decision.requiredGates).toEqual(['approval_gate'])
+    expect(decision.disposition).toBe('no_gate_required')
+    expect(decision.requiredGates).toEqual([])
+  })
+
+  it('無 Gate なのは再kickだけで、workspace を書き換える復旧へは波及していない', () => {
+    // 「下流が Gate されているから無 Gate でよい」を一般化しないための境界テスト。
+    for (const kind of ['retry_job', 'resume_task', 'delegate_implementation'] as const) {
+      const decision = resolvePlActionPolicy({
+        kind,
+        ...(kind === 'delegate_implementation' ? { changedFiles: ['docs/notes.md'] } : {}),
+      })
+
+      expect(decision.disposition, `kind=${kind}`).toBe('gates_required')
+      expect(decision.requiredGates.length, `kind=${kind}`).toBeGreaterThan(0)
+    }
   })
 
   it('停止 Job の強制終端は abort と同じ扱いで、無Gateでは通らない', () => {

@@ -6189,8 +6189,44 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **Role / Provider / Model Routing との関係**: 独立 Review の provider 分離等の必須制約は
       **PL より上位の Policy として強制**する（`role-model-registry` から PL が緩められないようにする）。
 
-<!-- roadmap:id=vps-pl-execution-loop state=planned -->
-1. [ ] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
+<!-- roadmap:id=vps-pl-execution-loop state=in_progress -->
+1. [~] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
+      **【2026-09-14 進捗: 最小ループを実装。残りは VPS 上の Operational E2E】**
+      `runPlTick()`（`apps/api/src/pl/executionLoop.ts`）と `POST /api/pl/tick`（`routes/pl.ts`）を実装した。
+      1 tick で `Observe → Diagnose → Decide → Mandatory Gate → Execute → Verify → Continue / Escalate`
+      を1件だけ進める。**常駐 Agent・新しい state store・新しい Recovery subsystem・新しいテーブルは
+      作っていない。**
+
+      - **Observe** … `buildSystemState()`（`GET /api/state` の実体）をそのまま呼ぶ。PL 専用の状態収集経路は無い
+      - **Diagnose** … 既存 provider CLI 経路（`aiExplain/cheapAiClient` = OpenCode CLI）。
+        従量課金 API は追加していない。role / model の選択は `role-model-registry` の責務として
+        差し替え口（`PlLoopDeps.diagnose`）1箇所に閉じた
+      - **Decide** … PL の出力から取り出すのは `actionKind` の**文字列だけ**。補正も推測もしない。
+        未知値は `resolvePlActionPolicy()` が forbidden にする
+      - **Gate** … `authorizePlAction()` が唯一の許可経路。PL の `plRiskOpinion` は判定に効かない
+      - **Execute** … v1 の executor は `rekick_design_review`（既存 `executeDesignReviewRun()`）と
+        `escalate_to_ceo`（既存 `sendAlert()`）のみ。**attempt を使い切った run は盲目的に再kickしない**
+      - **Verify** … 操作後に状態を読み直し、`normalized` / `unchanged` / `different_anomaly` /
+        `needs_gate_or_ceo` に分類する。**実行側の戻り値だけで成功扱いにしない**
+      - **有界性** … 同一対象への試行は `audit_log` から数えて2回で打ち切り、以降は再試行ではなく
+        CEO Escalation（同一対象へ重複通知しない）
+
+      **`rekick_design_review` の Gate を up-front 無しに確定した**（`mandatory-gate-policy` 側も更新）。
+      workspace を変えない / `DESIGN_REVIEW_MAX_ATTEMPTS` で有界 / 判定は `recomputeDecision()` が
+      API 側で再計算する、の3点を満たすためで、**この理屈を workspace を書き換える復旧へ広げない**
+      ことを境界テストで固定した。
+
+      **既定では起動しない**。`PL_LOOP_ENABLED=true` を置いたときだけ API プロセス内の interval が
+      tick を呼ぶ（`PL_LOOP_INTERVAL_MS` 既定 60s）。deploy しただけでは production の挙動は変わらない。
+
+      **CONTROL REPOSITORY 変更を含む（CEO 承認が必要）**: `apps/api/src/index.ts` への
+      route 登録と interval 追加。`apps/worker/src/index.ts` は
+      `ALWAYS_FORBIDDEN_PATTERNS` に該当するため触っていない（Worker poll cycle へは載せられない）。
+
+      **残っている作業（本項目は完了にしない）**: VPS 上での Operational E2E。
+      異常検知 → PL 起動 → 調査 → action 提案 → Gate → 既存操作 → 状態再確認 までを実測する。
+      最初の実戦候補は `design-review-runner-production-timeout`（stalled review）。
+
       **問題**: PL 判断能力が無いのではなく、**PL が VPS 上で継続実行される経路へ接続されていない**。
       現在 PL 判断（状態把握・停滞検知・原因分析・調査・証拠収集・方針判断・次Task選択・委任・
       Review 評価・復旧方法選択・CEO Escalation）はすべてローカルの Claude / Codex セッションが担う。
