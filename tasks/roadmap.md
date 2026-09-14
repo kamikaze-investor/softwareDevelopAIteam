@@ -2869,6 +2869,60 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
 
+<!-- roadmap:id=design-review-provider-unavailable-fail-open state=planned -->
+0. [ ] **Provider が使えないとき resume の Design Review gate が fail-open する（201 で通す）**
+   （2026-09-14登録、**高優先度・安全性**。Tier A の restricted env 検証中に production VPS で実測。
+   `strategic-decision-unknown-value-fail-open`（下記・完了済み）とは**別経路の同種欠陥**であり、
+   PR #146 では塞がれていない）。
+
+   **実測（production VPS `/workspace/target` の Candidate clone 上）**: `apps/api` の
+   `jobs.test.ts` >「rejects the resume path when no matching Design Review evidence exists」は
+   `POST /api/tasks/:id/resume` が **409 を返すこと**（Design Review evidence が無ければ再開を拒否する）
+   を固定するテストである。これが env によって結果が変わる:
+
+   | env | 所要 | 結果 |
+   |---|---|---|
+   | full env | 1.9s | **409（正しい。fail-closed）** |
+   | restricted env（`buildTargetCommandEnv()` 相当） | 13.2s | **201（誤り。fail-open）** |
+
+   既定 timeout 5s では restricted env 側が timeout として現れるため、**この fail-open は
+   「遅いテスト」に見えて long timeout を与えるまで表面化しない**。90s timeout で実行して初めて
+   201 が観測できる。workspace の dirty 状態は無関係であることも切り分け済み（full env は
+   dirty でも 409 を返す）。
+
+   **機構（コード上の経路）**: `buildDefaultCoordinatorDeps()` は
+   `homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? repoRoot` とし、
+   `buildRunnerEnv(homeDirectory)` がそれを runner の `HOME` として渡す。restricted env では
+   `HOME` が無いため **`HOME` が repoRoot になり**、Copilot CLI の OAuth credential（実 HOME 配下）
+   へ到達できない。つまり**レビュー provider が1つも使えない状態**になる。
+   この状態で `routes/tasks.ts` の resume 経路は
+   `review.status === 'evidence_registered'` を得て resume を成立させ 201 を返している。
+   `RecomputedDecision` には `REVIEW_UNAVAILABLE` が定義されているのに、この経路では
+   そこへ倒れず ALIGNED 相当として evidence が登録されている。
+
+   **なぜ重要か**: 「レビューできなかった」が「レビューを通過した」として扱われる。
+   Constitution の fail-closed 原則と、resume に Design Review を要求する設計意図そのものに反する。
+
+   **production への影響範囲（誇張しないこと）**: 本番 API は systemd の `EnvironmentFile` で
+   full env を持つため、この fail-open 条件（provider credential 不在）に**通常は該当しない**。
+   したがって現時点で本番が誤承認しているという証拠は無い。問題は
+   **gate の fail-closed 性が ambient env に依存している**ことであり、credential 失効・
+   OAuth 期限切れ・HOME 変更・container 化などで同じ条件は本番でも起こり得る。
+
+   **Tier A との関係**: `aiteamos-self-development-tier-a` の受入条件
+   「restricted env で Full Suite PASS」は**本項目を修正するまで満たせない**。
+   本項目は runtime 挙動と safety gate の変更であり **Tier B 相当**。Independent Review 必須。
+
+   **着手時の方針（実装ではなく方針）**: provider が1つも使えない場合を
+   `REVIEW_UNAVAILABLE` として扱い fail-closed にする。**新しい Gate・新しい status は作らない**
+   （既存の `RecomputedDecision` と既存の 409 経路で表現できる）。
+   `safeEnv.ts` の allowlist は**緩めない**。credential を restricted env へ流す方向で解決しない。
+
+   **関連**: `strategic-decision-unknown-value-fail-open`（下記・同種で完了済み）、
+   `design-review-fail-open`（Project Memory）。
+   npx 依存の除去（`646e3eb`）は本項目とは別件で、**本項目を解消しない**
+   （修正前 13.2s / 修正後 10.5s、いずれも 201）。
+
 <!-- roadmap:id=strategic-decision-unknown-value-fail-open state=done -->
 0. [x] **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open） — 完了（2026-09-11, `4a0fbaf` / PR #146）**
    （2026-09-10登録、**高優先度・安全性**。PR #136（continuation reconcile）の作業中に発見。
@@ -4255,6 +4309,48 @@ worktree と別 repository は採らない。
       外部 Claude / Codex セッションは、AIteamOS 自体が停止している / Candidate・Promotion 機構が
       壊れている / AIteamOS から自己修復できない / Design Philosophy・CEO 判断が必要、
       といった **AIteamOS 内部で適切に処理できない場合の復旧・監査経路**として残す。
+
+<!-- roadmap:id=worker-restricted-remote-publish state=planned -->
+3. [ ] **最小かつ制限された remote 公開能力（push / PR）** — 2026-09-14登録。CEO 方針:
+      push / PR を恒久的に人間・外部セッション必須にはしない。**今回の bootstrap に限り
+      外部セッションでの push / PR を許容し、本項目で早期に解消する。**
+
+      **現状（実測）**: `CommandKind` は11種（`git_status` / `git_diff` / `git_log` /
+      `git_branch_create` / `git_checkout` / `git_commit` / `git_revert` / `typecheck` /
+      `test` / `build` / `lint`）で **push は存在しない**。VPS には `gh` 2.97.0 が導入済みで、
+      `git ls-remote origin` は credential helper 無しで成功する。
+
+      **既存機能では実現できない理由（確認済み）**: SafeCommand は
+      `buildTargetCommandEnv()` の allowlist（`PATH` / 一時ディレクトリ / locale / `CI` のみ）で
+      実行されるため、**push に必要な credential が子プロセスへ一切渡らない**。
+      これは意図的な設計（secret の唯一の関所）であり、**ここを緩めて解決してはならない**。
+      したがって push は SafeCommand の env 経路に相乗りできず、
+      Design Review runner と同じく **API 側が明示的に env を構築して起動する専用経路**として
+      設計する必要がある。これが本項目を「小さな CommandKind 追加」にできない理由である。
+
+      **能力の定義（自由な git 操作にしない）**: 「現在の Candidate / feature branch を
+      canonical origin へ安全に公開し、PR / CI 経路へ進める」ことだけを行う。
+
+      **維持する制約（CEO 指定）**:
+      - origin 以外への push 禁止
+      - `master` / Stable branch への直接 push 禁止
+      - force push 禁止
+      - 任意 refspec 禁止（branch 名は server 側で決定・検証する）
+      - Candidate / feature branch のみ
+      - audit 可能（既存 `audit_log` を使う。新しい台帳は作らない）
+      - **credential を Job payload へ渡さない**
+      - Stable への反映は PR / CI / verified-SHA deploy のみ
+
+      **PR 作成**: 既存能力は無い。`gh` が導入済みなので、不足分は Tier A に必要な最小
+      （branch を push し PR を1本開く）に限定する。**PR の merge 能力は含めない**
+      （merge は既存の required checks + Ruleset 経路のままとする）。
+
+      **今回実装しないもの（明記）**: 任意 git コマンドの開放 / merge / release /
+      tag 操作 / `safeEnv.ts` の allowlist 緩和 / 新しい secret 配布経路。
+
+      **依存**: Independent Review 必須（secret 境界に触れるため）。
+      `aiteamos-self-development-tier-a` の E2E は、本項目の完了前は
+      **bootstrap 例外として外部セッションが push / PR を担当**してよい。
 
 <!-- roadmap:id=aiteamos-self-development-tier-b state=planned -->
 2. [ ] **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）** —
