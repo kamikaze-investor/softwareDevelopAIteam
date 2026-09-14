@@ -4613,6 +4613,25 @@ quarantine / retry / recovery / Review / Approval / runtime progress / cost を1
 **write 側**: 既存の `POST /api/tasks/:id/resume`・`PATCH /api/jobs/:id/clear-quarantine`・
 `PATCH /api/approval-requests/:id/status` 等をそのまま使う。**新しい Control subsystem を作らない。**
 
+### 横断制約: 従量課金APIを新しい標準経路にしない（CEO 追加指示・2026-09-14）
+
+Operator Chat・MCP・Explainer のいずれについても、OpenAI API / Anthropic API 等の**従量課金 API を
+新たな標準経路として導入しない**。既存の provider abstraction と Claude / Codex 等の CLI 実行経路を
+再利用する。
+
+**MCP の向き**: `ChatGPT → MCP → AIteamOS Control / State Interface`。
+**AIteamOS 側が ChatGPT との接続のために OpenAI API を呼ぶ構造を前提にしない。**
+推論は接続元の契約で行われ、AIteamOS は接続口と事実の提供に徹する。
+深い分析・判断が要る場合は Control Interface から**既存の PL / Role 実行経路**へ渡す。
+
+**現行実装は既にこの形である**（実測）: 既存 Explainer（`aiExplain/cheapAiClient.ts`）は
+OpenCode CLI を spawn しており、`AiCliProvider` も claude_code / codex / gemini / copilot と
+すべて CLI 経路。よって本制約は**新しい制限ではなく既存パターンの明文化**である。
+
+**ただし密結合はしない**: 特定 provider / CLI へ固定せず、`role-model-registry` から交換可能な
+設計を維持する。将来 API 経路が合理的になった場合も Registry の1エントリとして扱えるようにし、
+経路の種別を Role 側へ埋め込まない。
+
 ### PL が決定した優先順位
 
 | 順 | 項目 | 理由 |
@@ -5057,6 +5076,15 @@ deploy canary は全 PASS だった。
 
 <!-- roadmap:id=failure-explanation-pregeneration state=planned -->
 5. [ ] **Failure Explanation の事前生成と CEO 向け構造化（次段改善）— `post-MVP`** —
+      **【制約: 従量課金APIを標準利用しない（CEO 指示・2026-09-14）】**
+      Explainer も従量課金 API を標準利用せず、**既存 CLI / provider 実行経路から Role として
+      割り当てる**方向を優先する。
+      **現行実装は既にこの形である**（実測）: `apps/api/src/aiExplain/cheapAiClient.ts` は
+      OpenCode CLI（`node_modules/opencode-ai/bin/opencode`）を spawn しており、raw HTTP endpoint は
+      rollback 用のコメントとしてのみ残っている。したがって本項目は経路の作り直しではなく、
+      **Role 割り当てを `role-model-registry` 経由へ寄せる**作業である。
+      ただし特定 provider / CLI へ密結合させず、Registry から交換可能な設計を維持する。
+
       2026-09-10 登録。**本項目は明示的に post-MVP。MVP 完成まで説明品質改善を理由に
       本線を止めない**（CEO 判断・2026-09-10）。
       #130（predicate regression 修正）とは**別責務**。#130 / Phase 3 closure を先に完了する。
@@ -5531,6 +5559,13 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
 
 <!-- roadmap:id=role-model-registry state=planned -->
 1. [ ] **Role / Provider / Model Registry（役割別ルーティング設定表）** — 2026-09-13登録。
+      **【制約: 実行経路は CLI を既定とし、特定 provider へ密結合しない（CEO 指示・2026-09-14）】**
+      Role への provider/model 割り当ては、**既存の CLI 実行経路（`AiCliProvider`）を既定**とする。
+      Operator Chat / MCP / Explainer のために従量課金 API を新しい標準経路として追加しない。
+      一方で**特定の provider / CLI へ密結合させない**。Registry から交換可能であることを維持し、
+      将来 API 経路が合理的になった場合も Registry の1エントリとして扱えるようにする
+      （経路の種別を Role 側へ埋め込まない）。
+
       **【2026-09-14 追記: CEO のコスト / 性能方針】**
       OpenAI・Claude とも現在は利用枠に余裕がある。**コスト節約を過度に優先して性能を下げない。**
       PL 判断・設計・Root Cause 分析・Independent Review・Safety 判断では、必要な推論能力を確保する
@@ -5917,6 +5952,13 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
 <!-- roadmap:id=chatgpt-mcp-inspect state=planned -->
 1. [ ] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
+      **【制約: 従量課金APIを新しい標準経路にしない（CEO 指示・2026-09-14）】**
+      AIteamOS 側が ChatGPT との接続のために **OpenAI API を呼ぶ構造を前提にしない**。
+      MCP は `ChatGPT → MCP → AIteamOS Control / State Interface` の**接続口**に徹し、
+      推論は接続元（ChatGPT 自身）の契約で行われる。
+      深い分析・判断が必要な場合は、Control Interface から**既存の PL / Role 実行経路へ渡し**、
+      契約済み CLI（`AiCliProvider`: claude_code / codex / gemini / copilot）を利用する。
+
       **MCP 導入そのものを目的にしない。** 目的は ChatGPT から AIteamOS の状態を理解・監査できること。
 
       **前提**: `cross-project-state-api`（上記0番）。**同項目が read 側の唯一の入口**であり、
@@ -5939,6 +5981,18 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
 <!-- roadmap:id=operator-chat-mobile state=planned -->
 2. [ ] **Mobile 内の運用指示窓口（Operator Chat）** — 2026-09-14登録。
+      **【制約: 従量課金APIを新しい標準経路にしない（CEO 指示・2026-09-14）】**
+      会話処理や PL への指示伝達のために、OpenAI API / Anthropic API 等の従量課金 API を
+      **新たな標準経路として導入しない**。既存の provider abstraction と CLI 実行経路を再利用する。
+
+      ```text
+      Mobile Operator Chat
+        → AIteamOS Control / State Interface
+        → 既存 PL 実行経路
+        → provider CLI
+        → PL による調査・判断・説明・正式 Control 操作
+      ```
+
       **万能 Chat Agent は作らない。** 例外対応・運用指示に絞る。
 
       **最初の目標**: 次の6問に答えられること。
