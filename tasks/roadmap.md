@@ -6471,6 +6471,34 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **本項目より先に着手しない。** 本項目の実運用データ（PL 起動頻度・rule だけで閉じる異常の割合）を
       見てから具体化する。効果検証に必要な記録の要件は当該項目に記載した。
 
+<!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
+3. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
+      2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
+      同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
+
+      **実測**: Task `bd80c4ce` の Design Review run `4032eec3` が attempt 3 すべて
+      `runner timed out after 300000ms` で失敗。**stderr 保持（`ce9df9b`）のおかげで原因が残っていた**:
+      `[503 Service Unavailable] ... models/gemini-3.5-flash:generateContent`。
+      Gemini 側の一時障害である。約20分後に同じ model へ probe したところ **200 で復帰**していた。
+
+      **問題はここから**: provider が復帰しても、**run は既に `failed` 終端で attempt も 3/3**。
+      誰も再実行しないので Task は止まったままになる。PL は不変条件6に従って
+      「attempt を使い切った run を盲目的に再kickしない」ため、正しく Escalation へ倒れる
+      （＝安全だが、外部要因が消えても自力復帰しない）。
+
+      **つまり「一時的な外部障害」と「恒久的な失敗」を attempt 予算が区別していない。**
+      transient 失敗で予算を使い切った run と、レビュー内容が原因で失敗した run が同じ終端になる。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - `geminiRouter` は既に `failureClass` を持つ（`transient` / `config-error` 等）。
+        **この分類を run の終端理由まで伝播**できれば、transient 起因の終端だけを別扱いにできないか
+      - 再実行の入口は既存のどれか（PL の `rekick_design_review` / startup recovery / 採用 API の冪等再実行）で
+        足りるか。**新しい scheduler / watchdog を足さない**
+      - 予算そのものを増やすのは筋が悪い（外部障害が長引けば同じことが起きる）。
+        「transient 起因の失敗は attempt を消費しない」方が実態に合うか、実測で確かめる
+      - PL に「transient 起因なら再kickしてよい」と判断させる場合、**PL の自己申告ではなく
+        記録された `failureClass` を根拠にする**こと
+
 <!-- roadmap:id=design-review-runner-production-timeout state=planned -->
 2. [ ] **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）** — 2026-09-14登録。
       **盲目的に re-kick しないこと**（CEO 指示）。
