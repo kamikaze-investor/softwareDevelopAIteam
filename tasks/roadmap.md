@@ -3267,6 +3267,51 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **【2026-09-13 注記】`project-workspace-isolation` は本項目を閉じない。** 分離後も
    1 Project 内で quarantine は発生し、復旧手段が無い状態は変わらない。
    縮小するのは影響範囲（他 Project が巻き添えで停止しなくなる）だけである。
+
+   ---
+   **【2026-09-14 production 実測。真因を特定した — 優先度を上げる根拠】**
+
+   Tier A 自己開発 E2E（Project `6d1a5c87` / Task `9adb35e5` / Job `cf259578`）で**実際に発生**し、
+   **Mobile 単独では復旧不能**だった。`resumeBlockedTask()` が quarantine を fail-closed で
+   拒否するため、CEO はスマホからどの操作をしても先へ進めない。
+
+   **真因（今回初めて特定。従来の「復旧手段が無い」より具体的）**:
+   quarantine 解除は `baselineEqualsObservation()`（`apps/api/src/storage/sqlite.ts:210`）で
+   永続 baseline と Worker の観測を比較するが、**その先頭が `mode` の一致を要求する**
+   （`:214` `if (baseline.mode !== observation.mode) return false`）。
+
+   | | 値 |
+   |---|---|
+   | 永続 baseline（Job `cf259578`） | `{"mode":"dirty","startCommitHash":"ae7c583…","entries":[]}` |
+   | clean な workspace の観測 | `{"mode":"clean","startCommitHash":"ae7c583…"}` |
+
+   `observeWorkspace()`（`apps/worker/src/workspaceVerification.ts:93`）は **worktree が空なら
+   `mode:'clean'` しか返さない**。`mode:'dirty'` かつ `entries:[]` を返す経路は存在しない。
+   したがって **この Job の quarantine を解除できる観測値は原理的に存在せず**、
+   解除要求は workspace が安全でも**必ず HTTP 409（`VERIFICATION_FAILED`）になる**。
+
+   **Worker 自身は workspace を安全と観測できている**。実測ログ:
+   `[Recovery] Job cf259578… は安全と観測できたが quarantine 解除申請に失敗（別の起動で再試行）`。
+   つまり検証は通っており、**比較の入口で落ちている**。
+
+   **影響は今回限りではない**: `computeWorkspaceBaseline()`（`apps/worker/src/jobRunner.ts:1865`〜）は
+   intentionally-dirty Job（`resume:` / `repair:` / `retry:`）に対し、**worktree が空でも
+   `mode:'dirty', entries:[]` を記録する**。よって **clean な状態から開始した
+   resume / repair / retry Job が quarantine すると、すべて同じ理由で復旧不能になりうる**。
+
+   **最小修正の方向（実装は本項目で行う。Safety Gate 変更のため Independent Review 必須）**:
+   比較時に「`entries.length === 0` の dirty baseline は clean と等価」と正規化する。
+   **比較時正規化を優先する理由は、既に stuck している永続行を救済できるため**。
+   根本側（空なら `mode:'clean'` を記録する）は再発防止として併せて評価してよいが、
+   **それだけでは既存 stuck 行を救えない**ので後方互換を考慮すること。
+   緩和してはならない条件: `entries` 非空の dirty baseline は従来どおり厳密比較 /
+   `startCommitHash` 一致は必須 / その他既存 baseline 条件も一致必須 /
+   実際に差分がある workspace は解除しない。
+   **新 status・新 Gate・新 Recovery subsystem は追加しない。**
+
+   **関連**: `containment-cleanup-ebusy-quarantine`（今回 quarantine に入った**きっかけ**。
+   責務が異なるため別項目。同じ復旧クラスタとして扱うが、1つの PR にまとめない）。
+   ---
    （2026-09-11登録、**高優先度**。Production E2E test 8 で実際に復旧不能になった。
    PR #150 には混ぜない）。
 
@@ -4351,6 +4396,26 @@ worktree と別 repository は採らない。
 
       **検証**: `roadmapAdoption.test.ts` 15/15 PASS、`apps/api` 全体 1230 passed。
 
+      **【2026-09-14 production 実測。後続改善の評価対象】**
+      Tier A 自己開発 E2E で本経路を初めて実運用し、**採用そのものは設計どおり動いた**
+      （Roadmap 再生成なし / `tasks/task_graph.md` 無変更 / `hasActiveRoadmap=true` /
+      `roadmap:id` と Task の対応が追跡可能）。一方で **Task specification の質に問題が出た**。
+
+      **事象**: description は ledger 項目の**本文全文**になる。採用した
+      `continuation-reconcile-nonblocking-followups` は**項目1と項目2の2つ**を含み、本文の冒頭が
+      項目1（`reconcileTaskContinuations` の full-table scan → `findRunning()` 化）で占められていた。
+      `acceptanceCriteria` で「項目1は対象外」と明示していたにもかかわらず、実装 AI は項目1にも着手し、
+      `allowedPaths` 外の `apps/api/src/routes/taskContinuations.ts` を変更して
+      **File Change Guard に停止させられた**（安全機構としては正しく作動。workspace も自動 revert された）。
+
+      **回避できた**: Mobile の「追加指示して再開」で対象を項目2へ絞り、変更禁止パスを明示したところ、
+      2回目は**スコープ内2ファイルのみ**の正しい実装になった。よって**本項目は E2E blocker ではない**。
+
+      **評価する最小改善（本項目の後続。基盤修正より後でよい）**: 採用時に、選択した `roadmap:id` とは別に
+      **その実行時の implementation scope を PL が明示できる**ようにする。案としては採用 API へ任意の
+      `implementationScope` を追加し、description は ledger 全文のまま、プロンプト上のスコープだけを
+      上書きする形が最小。**ledger 側へサブ項目の構造化（A-1 相当）は持ち込まない。**
+
 <!-- roadmap:id=aiteamos-self-development-tier-a state=planned -->
 1. [ ] **Tier A: 自己開発の最初の安全な切替点（Candidate runtime 不要）** — 最優先。
       **これが「最短地点」である。**
@@ -4767,6 +4832,48 @@ deploy canary は全 PASS だった。
 
       **今回実装しないもの（明記）**: unit file の変更 / delegation 構成の変更 /
       新しい supervision 方式の導入。本項目は記録のみ。
+
+<!-- roadmap:id=containment-cleanup-ebusy-quarantine state=planned -->
+3. [ ] **cleanup だけが失敗した containment が Job を quarantine させる（`populated=0` でも `rmdir` EBUSY）**
+      — 2026-09-14、Tier A 自己開発 E2E の production 実測で登録。**高優先度**。
+      既存 containment 項目（上記 `worker-cgroup-delegation-contract` / 下記
+      `containment-success-path-observability`）は delegation 契約と成功経路の可観測性を扱っており、
+      **cleanup 失敗そのものの扱い**は射程外のため、最小の後継項目として1件だけ立てる。
+
+      **実測（Job `cf259578`）**: AI CLI の実装は**正常に完了**していた。その後の containment
+      cleanup で per-job cgroup の `rmdir` が EBUSY になり、Job は次の理由で quarantine へ入った:
+
+      ```
+      workspace could not be proven quiescent: containment failed: cleanup_failed
+      (EBUSY: resource busy or locked, rmdir '.../job-cf259578-…-safe-command-3136700-4')
+      (workspace quarantined; ownership retained)
+      ```
+
+      **ところがその cgroup は実際には空だった**。直後に実測した値:
+      `cgroup.procs` = 0 行 / `cgroup.events` = `populated 0`。
+      Worker を再起動すると残留 cgroup は 0 件になった（サービスの cgroup subtree ごと破棄）。
+      つまり **プロセスは1つも残っておらず、`rmdir` だけが一時的に失敗していた**。
+
+      **なぜ重要か**: 実装が完了しているのに**後片付けの一時的失敗だけで Job が失敗扱いになり、
+      さらに quarantine 経由で Task が復旧不能になった**
+      （復旧不能の真因は別項目 `quarantined-dirty-task-generic-recovery`）。
+      Tier A 自己開発 E2E はこれで停止した。
+
+      **着手時の順序（EBUSY を単に無視しないこと）**:
+      1. まず観測する — `cgroup.events` の `populated`、tracked process と descendants の有無、
+         cleanup を実行するタイミング、`rmdir` 直前／直後の状態
+      2. `populated=0` かつ process 0 で起きる**一時的 EBUSY** に対して、
+         **bounded retry → short grace → 再確認 → cleanup** で安全に解消できないかを最優先で検討する
+      3. それでも残る場合に限り、「containment は正常終了しており cleanup だけが失敗した」ケースを
+         Job failure / quarantine にする必要があるかを既存の安全設計と照合する。
+         安全性を下げずに cleanup を deferred にできる既存経路があれば**そちらを優先する**
+
+      **維持する不変条件**: プロセスが残っている場合の fail-closed は**緩めない**。
+      `populated` が 0 でないとき、drain timeout、kill 失敗は従来どおり quarantine とする。
+      新しい supervision 方式・新しい sandbox 基盤は作らない。
+
+      **関連**: `quarantined-dirty-task-generic-recovery`（この quarantine から**出られない**理由。
+      同じ復旧クラスタだが根本原因と責務が異なるため、**1つの実装 / PR にまとめない**）。
 
 <!-- roadmap:id=containment-success-path-observability state=planned -->
 4. [ ] **Containment success path の可観測性（低優先 hardening）** — 2026-09-08、P1 Phase 1/2
