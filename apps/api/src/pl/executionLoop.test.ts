@@ -285,6 +285,32 @@ describe('runPlTick — 無限ループを作らない', () => {
     expect(afterBudget.reason).toContain('already escalated')
   })
 
+  it('Escalation 済みの対象には Diagnose を走らせない（provider を焼き続けない）', async () => {
+    // production 初回 tick（2026-09-14）で判明した実挙動への回帰テスト。
+    // escalation は attempt として数えないため、選択段階で外さないと CEO の判断待ちの間ずっと
+    // tick ごとに provider CLI（実測 25 秒）を呼び続けることになる。
+    const { storage } = seedIdleDesignReview()
+    let diagnoseCalls = 0
+    const d = deps({
+      diagnose: async () => {
+        diagnoseCalls += 1
+        return JSON.stringify({ actionKind: 'escalate_to_ceo', rationale: 'needs CEO', riskLevel: 'HIGH' })
+      },
+    })
+
+    const first = await runPlTick(storage, d)
+    expect(first.status).toBe('escalated')
+    expect(diagnoseCalls).toBe(1)
+
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    expect(second.status).toBe('idle')
+    expect(second.reason).toContain('already escalated')
+    // 2回目は診断すら呼ばない
+    expect(diagnoseCalls).toBe(1)
+  })
+
   it('試行回数は audit_log から数える（新しいテーブルを持たない）', async () => {
     const { storage } = seedIdleDesignReview()
     await runPlTick(storage, deps())
