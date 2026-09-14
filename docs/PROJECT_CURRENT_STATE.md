@@ -212,6 +212,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - 再実行・追加指示UI（Mobile）
 - **`TEMP_MVP_COMPLETION_POLICY cleanup`**
 - **roadmap parser が追加属性と `[~]` 表記を受理できるようにする
+- **正式 Roadmap の1項目を実行可能な Task として採用する最小経路
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）

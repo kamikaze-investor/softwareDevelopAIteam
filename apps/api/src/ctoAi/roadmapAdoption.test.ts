@@ -1,0 +1,255 @@
+import { describe, expect, it, vi } from 'vitest'
+import { createSQLiteStorage } from '../storage/sqlite'
+import type { IStorage } from '../storage/interface'
+import { adoptRoadmapItem, extractItemDescription } from './roadmapAdoption'
+
+const LEDGER = [
+  '# Roadmap',
+  '',
+  '<!-- roadmap:id=first-item state=planned -->',
+  '1. [ ] **最初の項目** — これは実装対象である',
+  '   詳細な本文がここに続く。',
+  '',
+  '<!-- roadmap:id=second-item state=in_progress priority=high -->',
+  '2. [~] **進行中の項目** — 追加属性つき',
+  '',
+  '<!-- roadmap:id=finished-item state=done -->',
+  '3. [x] **完了済みの項目** — 再実行してはいけない',
+].join('\n')
+
+function makeStorage(): { storage: IStorage; projectId: string } {
+  const storage = createSQLiteStorage(':memory:')
+  const project = storage.projects.create({
+    name: 'AIteamOS Continuous Development',
+    goal: '正式Roadmapの続きから開発する',
+    designPhilosophy: [],
+    status: 'paused',
+  })
+  return { storage, projectId: project.id }
+}
+
+const SPEC = {
+  allowedPaths: ['apps/worker/scripts/roadmap'],
+  acceptanceCriteria: ['roadmap:check が通る'],
+}
+
+function deps(ensure = vi.fn().mockResolvedValue([])) {
+  return { readRoadmap: () => LEDGER, ensureInitialWorkflows: ensure }
+}
+
+describe('adoptRoadmapItem — 選択した1件だけを実行可能なTaskへ採用する', () => {
+  it('roadmap:id を roadmapTaskKey にして追跡可能な roadmapActive Task を作る', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+
+    expect(result.roadmapTaskKey).toBe('first-item')
+    const task = storage.tasks.findById(result.taskId)
+    expect(task?.roadmapTaskKey).toBe('first-item')
+    expect(task?.roadmapActive).toBe(true)
+    expect(task?.status).toBe('pending')
+    expect(task?.assignee).toBe('developer_ai')
+    // PL が明示した spec がそのまま Task へ載る（ledger の散文からは推測しない）。
+    expect(task?.allowedPaths).toEqual(SPEC.allowedPaths)
+    expect(task?.acceptanceCriteria).toEqual(SPEC.acceptanceCriteria)
+    // 本文は ledger からそのまま取る。
+    expect(task?.description).toContain('詳細な本文がここに続く')
+  })
+
+  it('採用すると hasActiveRoadmap 相当が true になり、running 遷移で再生成へ戻らない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    expect(storage.tasks.findByProjectId(projectId).some((t) => t.roadmapActive)).toBe(false)
+
+    await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+
+    // projects.ts の再生成ゲートと同一の判定。
+    expect(storage.tasks.findByProjectId(projectId).some((t) => t.roadmapActive)).toBe(true)
+  })
+
+  it('採用しただけで初回 Implement Job 生成の既存経路を呼ぶ（running な Project でも着火する）', async () => {
+    const { storage, projectId } = makeStorage()
+    const ensure = vi.fn().mockResolvedValue([])
+
+    await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps(ensure))
+
+    expect(ensure).toHaveBeenCalledTimes(1)
+    expect(ensure).toHaveBeenCalledWith(storage, projectId)
+  })
+
+  it('追加属性つき・[~] 表記の項目も採用できる', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'second-item', ...SPEC }, deps())
+
+    expect(result.ok).toBe(true)
+  })
+})
+
+describe('adoptRoadmapItem — fail-closed', () => {
+  it('allowedPaths が空なら採用しない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', allowedPaths: ['  '], acceptanceCriteria: SPEC.acceptanceCriteria },
+      deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'SPEC_INVALID' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('acceptanceCriteria が空なら採用しない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', allowedPaths: SPEC.allowedPaths, acceptanceCriteria: [] },
+      deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'SPEC_INVALID' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('allowedPaths が repository-relative でなければ既存 validation が弾く', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', allowedPaths: ['/workspace/target/apps'], acceptanceCriteria: SPEC.acceptanceCriteria },
+      deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'SPEC_INVALID' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('存在しない roadmap:id は採用しない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'no-such-item', ...SPEC }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ITEM_NOT_FOUND' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('done の項目は再実行しない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'finished-item', ...SPEC }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ITEM_ALREADY_DONE' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('ledger 自体が壊れていれば採用しない（既存 parser の検証をそのまま使う）', async () => {
+    const { storage, projectId } = makeStorage()
+    const broken = ['<!-- roadmap:id=broken state=planned -->', 'not a checkbox'].join('\n')
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'broken', ...SPEC },
+      { readRoadmap: () => broken, ensureInitialWorkflows: vi.fn() },
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'ROADMAP_INVALID' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('ledger を読めなければ採用しない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC },
+      {
+        readRoadmap: () => { throw new Error('ENOENT') },
+        ensureInitialWorkflows: vi.fn(),
+      },
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'ROADMAP_UNREADABLE' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+})
+
+describe('adoptRoadmapItem — 重複実行の防止', () => {
+  it('同じ roadmap:id を再採用しても Task が重複しない（既存同期の冪等性）', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+    const second = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+
+    expect(first.ok).toBe(true)
+    expect(second.ok).toBe(true)
+    if (!first.ok || !second.ok) return
+
+    expect(second.taskId).toBe(first.taskId)
+    expect(storage.tasks.findByProjectId(projectId).filter((t) => t.roadmapTaskKey === 'first-item')).toHaveLength(1)
+  })
+
+  it('既に Job が動いた roadmap:id は採用し直さない', async () => {
+    const { storage, projectId } = makeStorage()
+    const adopted = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+    expect(adopted.ok).toBe(true)
+    if (!adopted.ok) return
+
+    storage.jobs.create({
+      taskId: adopted.taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+
+    const again = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+
+    expect(again).toMatchObject({ ok: false, code: 'ALREADY_EXECUTED' })
+  })
+
+  it('別項目を採用しても、完了済み Task の履歴と Job は失われない', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+    expect(first.ok).toBe(true)
+    if (!first.ok) return
+
+    storage.jobs.create({
+      taskId: first.taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    const second = await adoptRoadmapItem(storage, { projectId, roadmapId: 'second-item', ...SPEC }, deps())
+    expect(second.ok).toBe(true)
+
+    // 直前の Task は roadmapActive=false の履歴になるが、行も Job も消えない。
+    const previous = storage.tasks.findById(first.taskId)
+    expect(previous?.status).toBe('done')
+    expect(storage.jobs.findByTaskId(first.taskId)).toHaveLength(1)
+    // 新しく採用した1件が roadmapActive なので、再生成ゲートは引き続き閉じている。
+    expect(storage.tasks.findByProjectId(projectId).some((t) => t.roadmapActive)).toBe(true)
+  })
+})
+
+describe('extractItemDescription', () => {
+  it('次の roadmap metadata 行の直前までを本文として取る', () => {
+    const items = [
+      { id: 'first-item', checkboxLineIndex: 3 },
+    ]
+    const description = extractItemDescription(LEDGER, items[0] as never)
+
+    expect(description).toContain('最初の項目')
+    expect(description).toContain('詳細な本文がここに続く')
+    expect(description).not.toContain('進行中の項目')
+  })
+})

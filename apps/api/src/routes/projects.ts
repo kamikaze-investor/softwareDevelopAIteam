@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { analyzeProjectDefinition } from '../ctoAi/projectDefinitionAnalysis'
 import { kickProjectStart } from '../ctoAi/projectStartWorkflow.js'
 import { retryPendingContinuationsForProject } from '../ctoAi/taskContinuation'
+import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
 import { getStorage } from '../storage'
 import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
 
@@ -45,6 +46,11 @@ function stringArraysEqual(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
+const AdoptRoadmapItemBody = z.object({
+  roadmapId: z.string().min(1),
+  allowedPaths: z.array(z.string().min(1)).min(1),
+  acceptanceCriteria: z.array(z.string().min(1)).min(1),
+}).strict()
 export async function projectRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
   const singleRunningProjectResponse = { error: 'Another project is already running' }
@@ -85,6 +91,37 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ phases: activePhases, completion })
   })
 
+  // POST /api/projects/:id/roadmap-adoptions
+  // 正式 Roadmap ledger の1項目を、実行可能な Task specification として採用する。
+  // Roadmap は再生成しない。docs/roadmap.md / tasks/task_graph.md も書かない。
+  app.post<{ Params: { id: string } }>('/:id/roadmap-adoptions', async (req, reply) => {
+    const parsed = AdoptRoadmapItemBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    }
+
+    const project = storage.projects.findById(req.params.id)
+    if (!project) {
+      return reply.status(404).send({ error: 'Project not found' })
+    }
+    if (project.status === 'archived') {
+      return reply.status(409).send({ error: 'Project is archived' })
+    }
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId: project.id,
+      roadmapId: parsed.data.roadmapId,
+      allowedPaths: parsed.data.allowedPaths,
+      acceptanceCriteria: parsed.data.acceptanceCriteria,
+    })
+
+    if (!result.ok) {
+      const status = result.code === 'ITEM_NOT_FOUND' ? 404 : 409
+      return reply.status(status).send({ error: result.reason, code: result.code, details: result.details })
+    }
+
+    return reply.status(201).send(result)
+  })
   app.post('/', async (req, reply) => {
     const result = CreateProjectBody.safeParse(req.body)
     if (!result.success) {
