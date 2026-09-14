@@ -76,6 +76,8 @@ export const PL_ACTION_KINDS = [
   'clear_workspace_quarantine',
   'abort_task',
   'rollback_commit',
+  'rekick_design_review',
+  'fail_stuck_job',
 
   // ── 開発の進行 ──
   'adopt_roadmap_item',
@@ -86,6 +88,9 @@ export const PL_ACTION_KINDS = [
   'restart_service',
   'deploy_production',
   'switch_provider',
+
+  // ── 常に利用可能。Gate で塞いではならない ──
+  'escalate_to_ceo',
 
   // ── PL が自分では決められないもの（常に forbidden） ──
   'change_safety_boundary',
@@ -222,6 +227,26 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
     gates: ['safety_review', 'approval_gate', 'ceo_approval'],
     reason: 'rollback rewrites what is considered the accepted state',
   },
+  /**
+   * Design Review の再kick。`vps-pl-execution-loop` の production evidence
+   * （timeout → requeue した run を誰も再開せず Task が止まった）で実際に必要だった操作である。
+   * 表に無いと fail-closed で forbidden になり、**PL 基盤を作る動機になった復旧そのものが取れない**。
+   * 新しい判断を通すのではなく bounded retry を再実行するだけなので retry_job と同じ扱いにする。
+   * attempt 上限（`DESIGN_REVIEW_MAX_ATTEMPTS`）は既存 coordinator が持ち、ここでは緩めない。
+   */
+  rekick_design_review: {
+    gates: ['approval_gate'],
+    reason: 'a re-kicked design review re-enters the existing bounded review path before it may act',
+  },
+  /**
+   * 停止した running Job の強制終端（`PATCH /api/jobs/:id/fail-if-running`）。
+   * 既存経路は fail-closed で、workspace 未検証なら quarantine へ倒す。
+   * 進行中の作業を破棄して状態を変えるため abort_task と同じ扱いにする。
+   */
+  fail_stuck_job: {
+    gates: ['approval_gate'],
+    reason: 'force-failing a running job discards in-flight work and re-quarantines an unverified workspace',
+  },
 
   // 開発の進行
   adopt_roadmap_item: {
@@ -249,6 +274,17 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
   switch_provider: {
     gates: ['ceo_approval'],
     reason: 'changing providers changes who reviews whom',
+  },
+
+  /**
+   * CEO Escalation。**Gate で塞いではならない唯一の write 操作である。**
+   * `allowedResponsesWhenBlocked` は BLOCK のたびに `escalate_to_ceo` を返すので、これを
+   * forbidden にすると「PL に残された4つの行動」が実際には取れないことになる（自己矛盾）。
+   * 通知は CEO へ判断を求めるだけで、システム状態を変えない。
+   */
+  escalate_to_ceo: {
+    gates: [],
+    reason: 'escalation is the response this policy guarantees to PL; it must never be gated',
   },
 
   // PL が自分では決められないもの

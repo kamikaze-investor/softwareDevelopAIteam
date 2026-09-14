@@ -247,3 +247,51 @@ describe('resolvePlActionPolicy — 観測と表の網羅性', () => {
     expect(a.requiredGates).toEqual(b.requiredGates)
   })
 })
+
+describe('resolvePlActionPolicy — 実在する復旧操作が語彙から漏れていない', () => {
+  /**
+   * fail-closed は正しいが、**語彙に無い操作は「実行できない操作」と同義**である。
+   * ここで固定しているのは、実際の復旧経路が表に載っていることであって、
+   * fail-closed の緩和ではない（未知の値は依然として forbidden）。
+   */
+  it('CEO Escalation は Gate を要さず、決して forbidden にならない', () => {
+    const decision = resolvePlActionPolicy({ kind: 'escalate_to_ceo' })
+
+    expect(decision.disposition).toBe('no_gate_required')
+    expect(decision.requiredGates).toEqual([])
+    // BLOCK 時に PL へ返す選択肢に含まれている以上、それ自体が塞がれていてはならない
+    expect(PL_BLOCKED_RESPONSES).toContain('escalate_to_ceo')
+  })
+
+  it('PL の自己申告では CEO Escalation にも Gate を足せない…わけではない（union は許す）が、外せない', () => {
+    const decision = resolvePlActionPolicy({
+      kind: 'escalate_to_ceo',
+      plRiskOpinion: { level: 'CRITICAL', rationale: 'PL が重大だと考えた' },
+    })
+
+    // 自己申告は判定に効かない。escalation は常に通る
+    expect(decision.disposition).toBe('no_gate_required')
+  })
+
+  it('Design Review の再kick は forbidden ではなく、既存の bounded retry 経路へ載る', () => {
+    // vps-pl-execution-loop の production evidence（requeue された run を誰も再開しなかった）で
+    // 実際に必要だった操作。ここが forbidden だと PL 基盤の動機そのものが満たせない。
+    const decision = resolvePlActionPolicy({ kind: 'rekick_design_review' })
+
+    expect(decision.disposition).toBe('gates_required')
+    expect(decision.requiredGates).toEqual(['approval_gate'])
+  })
+
+  it('停止 Job の強制終端は abort と同じ扱いで、無Gateでは通らない', () => {
+    const decision = resolvePlActionPolicy({ kind: 'fail_stuck_job' })
+
+    expect(decision.disposition).toBe('gates_required')
+    expect(decision.requiredGates).toEqual(['approval_gate'])
+  })
+
+  it('語彙に追加しても「未知は forbidden」は保たれている', () => {
+    for (const kind of ['rekick_design_reviews', 'fail_stuck_jobs', 'escalate', 'restart']) {
+      expect(resolvePlActionPolicy({ kind }).disposition, `kind=${kind}`).toBe('forbidden')
+    }
+  })
+})

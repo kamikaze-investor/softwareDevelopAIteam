@@ -81,6 +81,13 @@ const REQUIRED_TARGET_KIND: Record<PlActionKind, PlActionTarget['kind'] | 'any'>
   clear_workspace_quarantine: 'job',
   abort_task: 'task',
   rollback_commit: 'job',
+  // design_review_runs は Task に属する。Task 単位の根拠（evidence / approval）と同じ対象で照合する。
+  rekick_design_review: 'task',
+  // 強制終端の対象は Job 本体。Job 経由なので taskId も併せて照合される。
+  fail_stuck_job: 'job',
+  // Escalation は Task / Job / Project / System のいずれについても起こりうる。
+  // Gate を要さないため、対象種別で絞る意味も無い。
+  escalate_to_ceo: 'any',
 
   adopt_roadmap_item: 'project',
   delegate_implementation: 'task',
