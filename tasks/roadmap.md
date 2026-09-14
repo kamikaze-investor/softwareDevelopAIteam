@@ -2884,59 +2884,55 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **`ai_delegation` の retry 挙動は設計値どおりとみなさない**こと。
    Step 3 完了をもって「委任監督は完全に解決済み」とは扱わない。
 
-<!-- roadmap:id=design-review-provider-unavailable-fail-open state=planned -->
-0. [ ] **Provider が使えないとき resume の Design Review gate が fail-open する（201 で通す）**
-   （2026-09-14登録、**高優先度・安全性**。Tier A の restricted env 検証中に production VPS で実測。
-   `strategic-decision-unknown-value-fail-open`（下記・完了済み）とは**別経路の同種欠陥**であり、
-   PR #146 では塞がれていない）。
+<!-- roadmap:id=resume-design-review-test-not-hermetic state=done -->
+0. [x] **resume 経路のテストが実 LLM レビューの判定に依存していた（非 hermetic）— 完了（2026-09-14）**
+   （2026-09-14登録・同日完了。Tier A の restricted env 検証中に production VPS で発見）。
 
-   **実測（production VPS `/workspace/target` の Candidate clone 上）**: `apps/api` の
-   `jobs.test.ts` >「rejects the resume path when no matching Design Review evidence exists」は
-   `POST /api/tasks/:id/resume` が **409 を返すこと**（Design Review evidence が無ければ再開を拒否する）
-   を固定するテストである。これが env によって結果が変わる:
+   **重要な訂正**: 本項目は当初 `design-review-provider-unavailable-fail-open` として
+   「Review provider が使えないと resume の Design Review gate が fail-open する」**Safety defect
+   として登録したが、その診断は誤りだった**。実測で runner の raw 出力まで確認した結果、
+   **fail-open は起きていない**。誤った Finding を ledger に残さないため、本項目へ差し替える。
 
-   | env | 所要 | 結果 |
-   |---|---|---|
-   | full env | 1.9s | **409（正しい。fail-closed）** |
-   | restricted env（`buildTargetCommandEnv()` 相当） | 13.2s | **201（誤り。fail-open）** |
+   **実際に起きていたこと（runner の raw stdout を実測して確定）**: restricted env でも
+   Design Review runner は正常に完了し、**実在の LLM が本物のレビュー結果 `ALIGNED` を返していた**
+   （`focusedReviewResults: [{focus:'scope_simplicity', decision:'ALIGNED', summary:'The proposed
+   design maintains scope discipline and MVP simplicity...'}]`、`stderr` 空）。
+   review が ALIGNED なら evidence が登録され resume が成立して 201 を返すのは
+   **route の設計どおりの正しい挙動**である。
 
-   既定 timeout 5s では restricted env 側が timeout として現れるため、**この fail-open は
-   「遅いテスト」に見えて long timeout を与えるまで表面化しない**。90s timeout で実行して初めて
-   201 が観測できる。workspace の dirty 状態は無関係であることも切り分け済み（full env は
-   dirty でも 409 を返す）。
+   full env では同じ review が `UNCERTAIN` を返し 409 になっていた。つまり
+   **env によって LLM の判定が変わっていただけ**で、安全機構は両方とも正しく動作していた。
 
-   **機構（コード上の経路）**: `buildDefaultCoordinatorDeps()` は
-   `homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? repoRoot` とし、
-   `buildRunnerEnv(homeDirectory)` がそれを runner の `HOME` として渡す。restricted env では
-   `HOME` が無いため **`HOME` が repoRoot になり**、Copilot CLI の OAuth credential（実 HOME 配下）
-   へ到達できない。つまり**レビュー provider が1つも使えない状態**になる。
-   この状態で `routes/tasks.ts` の resume 経路は
-   `review.status === 'evidence_registered'` を得て resume を成立させ 201 を返している。
-   `RecomputedDecision` には `REVIEW_UNAVAILABLE` が定義されているのに、この経路では
-   そこへ倒れず ALIGNED 相当として evidence が登録されている。
+   **真の欠陥はテスト側**: `apps/api/src/routes/jobs.test.ts` の `buildApp()` が `taskRoutes` を
+   **options 無しで register** していたため、resume 経路が `buildDefaultCoordinatorDeps()` に
+   fall back し、**実 subprocess を spawn して実 LLM を呼んでいた**。その結果
+   「rejects the resume path when no matching Design Review evidence exists」が
+   **LLM の気分次第で 409 にも 201 にもなる**状態だった。CI で通っていたのは
+   CI に provider credential が無く review が unavailable → UNCERTAIN → 409 に倒れていたためで、
+   **偶然の成立**だった。
 
-   **なぜ重要か**: 「レビューできなかった」が「レビューを通過した」として扱われる。
-   Constitution の fail-closed 原則と、resume に Design Review を要求する設計意図そのものに反する。
+   **修正**: `jobs.test.ts` の `buildApp()` で `resumeDesignReviewDeps` を注入し、
+   「review を完了できなかった」を決定論的に再現するようにした。これにより
+   **review が成立しない限り resume させない** fail-closed 契約そのものをテストが固定する。
+   注入口（`routes/tasks.ts` の `options.resumeDesignReviewDeps`）は既存で、
+   `tasks.test.ts` / `resumeExpiredApproval.test.ts` が既に使っている。
+   **新しい仕組み・新しい Gate・production コードの変更はいずれも無い。**
 
-   **production への影響範囲（誇張しないこと）**: 本番 API は systemd の `EnvironmentFile` で
-   full env を持つため、この fail-open 条件（provider credential 不在）に**通常は該当しない**。
-   したがって現時点で本番が誤承認しているという証拠は無い。問題は
-   **gate の fail-closed 性が ambient env に依存している**ことであり、credential 失効・
-   OAuth 期限切れ・HOME 変更・container 化などで同じ条件は本番でも起こり得る。
+   **fail-closed の確認（コード上。今回の実測で覆るものは無かった）**:
+   runner が起動できない / 非0終了 → `!execution.ok` → `finalizeFailure`。
+   timeout → 同上（`timedOut`）。出力が壊れている → `unparsable output` で失敗確定。
+   focused review が解析不能 → `unavailableFocusedResult()` が `UNCERTAIN`（ALIGNED にしない）。
+   independent review が unavailable → `applyIndependentReviewOverride` が安全側へ倒す。
+   未知の decision 値 → `strategic-decision-unknown-value-fail-open`（PR #146）で reject 済み。
+   いずれも「Review できなかった」と「Review して approve された」を同一視していない。
 
-   **Tier A との関係**: `aiteamos-self-development-tier-a` の受入条件
-   「restricted env で Full Suite PASS」は**本項目を修正するまで満たせない**。
-   本項目は runtime 挙動と safety gate の変更であり **Tier B 相当**。Independent Review 必須。
+   **検証**: restricted env（`buildTargetCommandEnv()` と同一の PATH / TMPDIR / LANG / CI のみ）で
+   `apps/api` 1222/1222 PASS。同 env で `apps/worker` 1291/1291・`packages/shared` 99/99・
+   `apps/mobile` 45/45 も PASS し、**Full Suite 2657/2657** を満たした。
 
-   **着手時の方針（実装ではなく方針）**: provider が1つも使えない場合を
-   `REVIEW_UNAVAILABLE` として扱い fail-closed にする。**新しい Gate・新しい status は作らない**
-   （既存の `RecomputedDecision` と既存の 409 経路で表現できる）。
-   `safeEnv.ts` の allowlist は**緩めない**。credential を restricted env へ流す方向で解決しない。
-
-   **関連**: `strategic-decision-unknown-value-fail-open`（下記・同種で完了済み）、
-   `design-review-fail-open`（Project Memory）。
-   npx 依存の除去（`646e3eb`）は本項目とは別件で、**本項目を解消しない**
-   （修正前 13.2s / 修正後 10.5s、いずれも 201）。
+   **教訓**: 実 provider を呼ぶテストは、provider の判定に依存した assertion を置いてはならない。
+   既存の注入口があるテストで注入を省くと、CI の「たまたま credential が無い」状態に
+   正しさを依存させることになる。
 
 <!-- roadmap:id=strategic-decision-unknown-value-fail-open state=done -->
 0. [x] **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open） — 完了（2026-09-11, `4a0fbaf` / PR #146）**

@@ -23,7 +23,32 @@ async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify()
   app.register(cors, { origin: true })
   app.register(projectRoutes, { prefix: '/api/projects' })
-  app.register(taskRoutes, { prefix: '/api/tasks' })
+  // Design Review runner を**必ず注入する**。既定の `buildDefaultCoordinatorDeps()` は
+  // 実 subprocess を spawn し、実 LLM provider を呼ぶ。そのため resume 経路のテストが
+  // 「LLM がその時どう判定したか」に依存し、環境によって結果が変わっていた
+  // （2026-09-14 に production VPS で実測: restricted env では review が ALIGNED を返して
+  // resume が成立し 201、full env では UNCERTAIN で 409。どちらも route としては正しい挙動で、
+  // 非決定なのはテスト側だった）。
+  //
+  // ここでは「review を完了できなかった」を決定論的に再現する。これにより
+  // **review が成立しない限り resume させない**という fail-closed 契約そのものを固定できる。
+  // 既に `tasks.test.ts` / `resumeExpiredApproval.test.ts` が使っている注入口を再利用しており、
+  // 新しい仕組みは追加していない。
+  app.register(taskRoutes, {
+    prefix: '/api/tasks',
+    resumeDesignReviewDeps: {
+      runnerCommand: 'mock',
+      runnerArgs: [],
+      homeDirectory: '/tmp',
+      workingDir: '/tmp',
+      execute: async () => ({
+        ok: false,
+        stdout: '',
+        error: 'design review runner is not available in tests',
+        timedOut: false,
+      }),
+    },
+  })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   app.register(designReviewEvidenceRoutes, { prefix: '/api' })
   await app.ready()
