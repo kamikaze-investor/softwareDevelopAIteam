@@ -39,6 +39,14 @@ export interface AttentionItem {
   projectName: string
   taskId?: string
   jobId?: string
+  /**
+   * その attention の同一性を決める id（あれば）。
+   *
+   * 例: approval 待ちは Task 単位ではなく **approval request 単位**で1件である。
+   * ここが無いと「同じ Task の2回目の承認待ち」を1回目と同一視してしまい、
+   * 通知の重複排除が効きすぎて2回目を誰にも知らせないことになる。
+   */
+  referenceId?: string
   /** 観測事実のみ。対処方法は書かない（PL が決める）。 */
   detail: string
   /** 判明していれば、その状態が続いている時間。 */
@@ -337,7 +345,10 @@ export function buildSystemState(
           projectId: project.id,
           projectName: project.name,
           taskId: task.id,
-          detail: `approval request ${approval.id} is waiting for a human decision`,
+          referenceId: approval.id,
+          detail:
+            `approval request ${approval.id} (${approval.requestedAction}, risk ${approval.riskLevel}) `
+            + 'is waiting for a human decision',
           stuckForMs: elapsedMs(approval.createdAt, nowMs),
         })
       }

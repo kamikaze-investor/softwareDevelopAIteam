@@ -555,3 +555,54 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(escalations.length).toBe(1)
   })
 })
+
+describe('runPlTick — CEO 判断待ちは黙って放置しない', () => {
+  function seedApproval(storage: IStorage, taskId: string): string {
+    const created = storage.approvalRequests.create({
+      taskId,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: 'abc1234',
+      targetDiffHash: 'hash',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt: '2026-09-16T00:00:00.000Z',
+      invalidIf: [],
+      changedFiles: ['docs/notes.md'],
+      triggeredRules: ['git_commit requires CEO approval (policy)'],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    return created.id
+  }
+
+  it('承認待ちは診断も Gate も経ずに1回だけ通知する', async () => {
+    const { storage, taskId } = seed()
+    const approvalId = seedApproval(storage, taskId)
+    const escalations: string[] = []
+    let diagnosed = 0
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => { diagnosed += 1; return '{}' },
+      escalate: async (p) => { escalations.push(p.body) },
+    }))
+
+    expect(result.status).toBe('escalated')
+    expect(result.target?.kind).toBe('approval_waiting')
+    // provider を消費しない（PL にできることは無いので分析しても意味が無い）
+    expect(diagnosed).toBe(0)
+    expect(escalations).toHaveLength(1)
+    expect(escalations[0]).toContain(approvalId)
+  })
+
+  it('同じ承認を毎 tick 通知しない', async () => {
+    const { storage, taskId } = seed()
+    seedApproval(storage, taskId)
+    const escalations: string[] = []
+    const d = deps({ escalate: async (p) => { escalations.push(p.body) } })
+
+    await runPlTick(storage, d)
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, d)
+
+    expect(escalations).toHaveLength(1)
+  })
+})

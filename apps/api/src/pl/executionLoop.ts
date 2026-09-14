@@ -70,6 +70,7 @@ const AUDIT_ENTITY_TYPE = 'pl_loop_target'
  * （ledger: `outbox-blocked-critical-false-alarm` と同じ失敗）。
  */
 const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
+  'approval_waiting',
   'design_review_idle',
   'design_review_failed',
   // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
@@ -85,6 +86,8 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
  * 一度に全部やろうとすると、失敗が連鎖したときに何が原因か分からなくなる。
  */
 const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
+  // CEO の判断待ちが最優先。人を待たせている時間が一番長くなりやすい。
+  'approval_waiting',
   'design_review_idle',
   'design_review_failed',
   // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
@@ -200,10 +203,20 @@ export interface PlLoopDeps {
  */
 let inFlight = false
 
+/**
+ * PL が「実行」ではなく「人へ伝える」だけを行う attention。
+ *
+ * **CEO の判断そのものが進行を止めている**ケースであり、PL にできることは無い。
+ * 診断（provider CLI）も回さず、1回だけ通知して終わる。通知チャネルを用意した目的が
+ * まさにこれで、**承認待ちに誰も気付かないまま止まる**状態を無くす。
+ */
+const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = ['approval_waiting']
+
 function targetKeyOf(item: AttentionItem): string {
   // 対象の同一性は「どの attention がどの実体に出ているか」で決まる。
-  // Job > Task > Project の順で最も具体的な id を使う。
-  const subject = item.jobId ?? item.taskId ?? item.projectId
+  // `referenceId`（例: approval request id）があればそれを優先する。無いと
+  // 「同じ Task の2回目の承認待ち」を1回目と同一視し、通知の重複排除が効きすぎる。
+  const subject = item.referenceId ?? item.jobId ?? item.taskId ?? item.projectId
   return `${item.kind}:${subject}`
 }
 
@@ -445,6 +458,14 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
       ...(item.jobId !== undefined ? { jobId: item.jobId } : {}),
     }
+    // ── 人へ伝えるだけの attention は、診断も Gate も経ずに1回通知して終わる ──────
+    // `escalate_to_ceo` 相当の行為であり Gate を要しない（Policy 上も無 Gate）。
+    // 既に通知済みの対象は選択段階で外れているので、ここへは来ない。
+    if (NOTIFY_ONLY_ATTENTION_KINDS.includes(item.kind)) {
+      await escalateTo(storage, deps, key, item, 'CEO の判断待ちで進行が止まっています。')
+      return { status: 'escalated', target, reason: 'human decision required', attempt: 1 }
+    }
+
     const attempt = countPriorAttempts(storage, key) + 1
 
     // ── 試行上限。ここを超えたら再試行ではなく Escalation ──────────
