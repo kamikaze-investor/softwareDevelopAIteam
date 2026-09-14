@@ -33,6 +33,7 @@ describe('resolvePlActionPolicy — PL は Gate を減らせない', () => {
   it('plRiskOpinion は判定に使われないが、記録としては残る', () => {
     const decision = resolvePlActionPolicy({
       kind: 'propose_code_change',
+      changedFiles: ['apps/api/src/routes/tasks.test.ts'],
       plRiskOpinion: { level: 'LOW', rationale: 'テストだけの変更なので低リスク' },
     })
 
@@ -191,6 +192,28 @@ describe('resolvePlActionPolicy — 変更ファイルは既存判定器へそ�
     })
 
     expect(decision.requiredGates).toEqual(['design_review', 'approval_gate'])
+  })
+
+  // 独立レビュー指摘（2026-09-14）: 申告を空にすれば file 由来の Gate が全て外れてしまう。
+  it.each(['propose_code_change', 'delegate_implementation'] as const)(
+    '%s は変更集合の申告が無ければ forbidden（空申告で Gate を外せない）',
+    (kind) => {
+      expect(resolvePlActionPolicy({ kind }).disposition).toBe('forbidden')
+      expect(resolvePlActionPolicy({ kind, changedFiles: [] }).disposition).toBe('forbidden')
+    },
+  )
+
+  it('変更集合の申告を絞っても、申告分に対する Gate は必ず付く', () => {
+    // 申告を docs だけに絞っても design_review / approval_gate は残る。
+    // 実差分に対する権威ある判定は File Change Guard と Job の gate/check が行う。
+    const narrowed = resolvePlActionPolicy({
+      kind: 'propose_code_change',
+      changedFiles: ['docs/notes.md'],
+    })
+
+    expect(narrowed.disposition).toBe('gates_required')
+    expect(narrowed.requiredGates).toContain('design_review')
+    expect(narrowed.requiredGates).toContain('approval_gate')
   })
 })
 

@@ -28,6 +28,18 @@
  * 具体的には `plRiskOpinion` は `requiredGates` の算出に一切使わず（記録のみ）、
  * `plProposedGates` は **union にしか効かない**（増やせるが減らせない）。
  *
+ * ## この関数が保証しないこと（独立レビュー指摘, 2026-09-14）
+ *
+ * `changedFiles` は **PL が申告する値**であり、実際の差分ではない。したがってここでの
+ * risk 判定は「申告された変更集合に対する**上乗せ**」でしかなく、
+ * **申告を絞れば Gate が減る**。これを最後の防壁にしてはならない。
+ * 実際の差分に対する権威ある判定は既存の File Change Guard と Job の `gate/check` が行う。
+ * 申告できないケースを素通しにしないため、変更を伴う操作は
+ * `changedFiles` が空なら `forbidden` にする（`KINDS_REQUIRING_CHANGE_SET`）。
+ *
+ * 同様に `providerChange` も申告値であり、**実際に投入される構成との束縛はここでは行えない**。
+ * 実構成との照合は `vps-pl-execution-loop` の配線側の責務とする。
+ *
  * ## 副作用を持たない
  *
  * 実行も記録もしない純粋関数である。記録は呼び出し側（API の enforcement seam）が
@@ -82,6 +94,8 @@ export const PL_ACTION_KINDS = [
   'skip_required_review',
 ] as const
 
+Object.freeze(PL_ACTION_KINDS)
+
 export type PlActionKind = (typeof PL_ACTION_KINDS)[number]
 
 /** 既存の Gate / Review 工程。**この語彙は新設ではなく、既存工程への参照である。** */
@@ -121,6 +135,8 @@ export const PL_BLOCKED_RESPONSES = [
   'propose_alternative',
   'escalate_to_ceo',
 ] as const
+
+Object.freeze(PL_BLOCKED_RESPONSES)
 
 export type PlBlockedResponse = (typeof PL_BLOCKED_RESPONSES)[number]
 
@@ -191,7 +207,7 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
     reason: 'a retried job re-enters the existing gate/check path before it may act',
   },
   resume_task: {
-    gates: ['approval_gate'],
+    gates: ['design_review', 'approval_gate'],
     reason: 'resume requires the existing design review evidence and gate check to hold',
   },
   clear_workspace_quarantine: {
@@ -262,6 +278,18 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
 // 判定
 // ────────────────────────────────────────────────────────────
 
+/**
+ * 変更集合の申告が無ければ判定できない操作。
+ *
+ * 申告が無いときに「変更ファイルが無い＝低リスク」として通すと、申告を空にするだけで
+ * file 由来の Gate（independent_review / safety_review / ceo_approval）を全て外せてしまう。
+ * 申告できないなら通さない。
+ */
+const KINDS_REQUIRING_CHANGE_SET: readonly PlActionKind[] = [
+  'propose_code_change',
+  'delegate_implementation',
+]
+
 function isPlActionKind(value: string): value is PlActionKind {
   return (PL_ACTION_KINDS as readonly string[]).includes(value)
 }
@@ -315,6 +343,14 @@ export function resolvePlActionPolicy(proposal: PlActionProposal): PlActionPolic
 
   // ── 変更ファイルがあるなら既存の risk 判定へそのまま通す ──
   const changedFiles = proposal.changedFiles ?? []
+
+  if (changedFiles.length === 0 && KINDS_REQUIRING_CHANGE_SET.includes(kind)) {
+    return forbid(
+      kind,
+      `${kind} without a declared change set cannot be risk-classified; an empty declaration must not remove file-derived gates`,
+    )
+  }
+
   if (changedFiles.length > 0) {
     const risk = runRiskReview([...changedFiles])
     if (risk.riskLevel === 'HIGH' || risk.riskLevel === 'CRITICAL') {

@@ -6048,6 +6048,35 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 変更ファイルがあるときは既存 `runRiskReview()` と `runMechanicalGate()` へそのまま通し、
         HIGH/CRITICAL で independent_review、CRITICAL と Mechanical Gate hit で ceo_approval まで上げる
 
+      **【独立レビュー（OpenAI / Codex, 2026-09-14）の指摘と、それを受けた修正】**
+      初版は「判定結果オブジェクト」と「充足済み Gate の文字列配列」を引数で受け取っていた。
+      PL ループは外部プロセス（LLM + provider CLI）であり、そのどちらも PL が作れる。
+      **Policy Engine を置いても、seam が PL の作った値を信じるなら境界は存在しない**という
+      指摘は正しく、以下を修正した:
+      - `assertPlActionExecutable()` は**提案から判定を作り直す**。判定オブジェクトを
+        差し込む引数を廃止した（`recomputeDecision()` が runner の自己申告を採用しないのと同じ形）
+      - 充足の根拠は **DB の実レコードで検証する**。渡せるのは「どのレコードか」だけで、
+        Gate 名の文字列を渡せば通る経路を無くした。Design Review evidence は `ALIGNED` のみ、
+        Independent Review は `independentReviewRequired` かつ verdict が `approved` のときのみ、
+        Approval Request は `APPROVED` かつ未失効のみ、CEO Approval は `approved` のみを充足とする
+      - **検証手段の無い Gate は充足できない**（fail-closed）。`strategic_alignment_review` と
+        `safety_review` は参照できる永続レコードが無いため、それを要求する操作
+        （`clear_workspace_quarantine` / `rollback_commit` / `adopt_roadmap_item`）は
+        配線が入るまで PL から実行できない。これは欠陥ではなく意図した fail-closed である
+      - `changedFiles` が空の変更操作は `forbidden`。申告を空にするだけで file 由来の Gate を
+        全て外せる穴を塞いだ
+      - `resume_task` の必要 Gate に `design_review` を追加（理由文と Gate 一覧が不一致だった）
+
+      **指摘のうち、ここでは直さず `vps-pl-execution-loop` の受入条件へ回したもの**:
+      - `changedFiles` も `providerChange` も PL の申告値であり、**実差分・実構成との束縛は
+        この層では行えない**。権威ある判定は既存の File Change Guard と Job の `gate/check` が行う。
+        配線時に「申告ではなく実際の対象」を渡すこと
+      - `retry_job` / `resume_task` は対象 Job の分類を引き継いでいない。配線時に
+        対象 Job の risk / production 影響を継承させること
+      - `allowedResponsesWhenBlocked` は情報であって強制ではない。BLOCK 後の再提案を
+        別種の action で回避できないようにするのは配線側の責務
+      - 実行者の Role・Production 操作権限はこの層では表現していない
+
       **残っている作業（本項目は完了にしない）**: PL 実行ループからの配線。
       `vps-pl-execution-loop` の受入条件に「PL の全 write 操作が `authorizePlAction()` を通ること」
       「`satisfiedGates` は PL 出力ではなくシステム観測の根拠から組むこと」を含める。
