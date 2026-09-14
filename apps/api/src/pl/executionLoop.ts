@@ -46,7 +46,12 @@ import {
   type PlAdoptionResult,
 } from './adoptionStep'
 import type { IStorage } from '../storage/interface'
-import { authorizePlAction, PlActionBlockedError, type PlActionTarget } from './actionGate'
+import {
+  authorizePlAction,
+  PlActionBlockedError,
+  type GateEvidenceRef,
+  type PlActionTarget,
+} from './actionGate'
 
 /** 1つの対象に対して PL が試せる回数。超えたら再試行せず Escalation へ倒す。 */
 export const PL_MAX_ATTEMPTS_PER_TARGET = 2
@@ -71,6 +76,9 @@ const AUDIT_ENTITY_TYPE = 'pl_loop_target'
  */
 const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   'approval_waiting',
+  // blocked は notify-only にしない。blocked reason を読んで sanctioned な復旧を選ばせる
+  // （CEO 指示・2026-09-15）。executor が無い・判断不能なら fail-closed で Escalation へ倒れる。
+  'job_blocked',
   'design_review_idle',
   'design_review_failed',
   // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
@@ -88,6 +96,10 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
 const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   // CEO の判断待ちが最優先。人を待たせている時間が一番長くなりやすい。
   'approval_waiting',
+  // blocked は workflow を止めているので早く見る。
+  // **`ACTIONABLE_ATTENTION_KINDS` に入れてもここに無ければ永久に選ばれない**（selectTarget が
+  // この順序を走査するため）。両方に入れること。
+  'job_blocked',
   'design_review_idle',
   'design_review_failed',
   // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
@@ -193,6 +205,8 @@ export interface PlLoopDeps {
   readLedger?: PlAdoptionDeps['readLedger']
   /** 採用の実行（テスト差し替え用）。既定は既存 adoptRoadmapItem。 */
   adopt?: PlAdoptionDeps['adopt']
+  /** resume に添える指示文（テスト差し替え用）。既定は DEFAULT_RESUME_INSTRUCTION。 */
+  resumeInstruction?: string
   coordinatorDeps?: CoordinatorDeps
   now?: () => string
 }
@@ -265,10 +279,128 @@ function record(
   })
 }
 
+/**
+ * PL の resume に添える指示文。
+ *
+ * `git_commit` の resume では `resumeBlockedTask()` がこの文字列を使わない（新 Job は同じ
+ * SafeCommand を引き継ぐ）。AI CLI の resume では prompt になるが、その経路は Design Review
+ * evidence を fail-closed で要求するため、**この文字列だけで実装内容が変わることはない**。
+ */
+export const DEFAULT_RESUME_INSTRUCTION =
+  '前回の実行は完了前に停止した。作業中の変更は保持したまま、同じ受入条件・同じ allowedPaths の範囲で続きを行うこと。'
+
+/**
+ * Gate へ渡す根拠を**システム側の観測**から組み立てる。
+ *
+ * **PL の申告は一切混ぜない。** ここで積めるのは DB に実在するレコードの id だけで、
+ * それが充足を意味するかどうかは seam が改めて検証する（対象への帰属も含む）。
+ * 該当レコードが無ければ何も積まず、Gate が missing として止める（fail-closed）。
+ */
+function collectSystemEvidence(
+  storage: IStorage,
+  item: AttentionItem,
+): GateEvidenceRef[] {
+  if (item.taskId === undefined) return []
+
+  const evidence: GateEvidenceRef[] = []
+
+  // Design Review: その Task の ALIGNED evidence があれば積む。
+  const aligned = storage.designReviewEvidence
+    .findByTaskId(item.taskId)
+    .filter((row) => row.decision === 'ALIGNED')
+    .pop()
+  if (aligned) {
+    evidence.push({ gate: 'design_review', designReviewEvidenceId: aligned.id })
+  }
+
+  // Approval Gate: **承認済み**の approval request だけを積む。
+  // WAITING / STALE / EXPIRED は充足ではないので積まない（seam 側でも弾かれる）。
+  const approval = storage.approvalRequests.findActiveByTaskId(item.taskId)
+  if (approval?.status === 'APPROVED') {
+    evidence.push({ gate: 'approval_gate', approvalRequestId: approval.id })
+  }
+
+  return evidence
+}
+
+/** 止まっている Job の「なぜ止まったか」。PL はこれを読んで判断する。 */
+function describeStuckJob(storage: IStorage, jobId: string): unknown {
+  const job = storage.jobs.findById(jobId)
+  if (!job) return { jobId, note: 'job not found' }
+  return {
+    id: job.id,
+    status: job.status,
+    workflowStepKey: job.workflowStepKey,
+    commandKind: job.safeCommand.kind,
+    exitCode: job.exitCode,
+    changedFiles: job.changedFiles,
+    // blocked の理由はここに出る（File Change Guard 違反・approval 待ち等）。
+    guardResult: job.guardResult,
+    failureMetadata: job.failureMetadata,
+    stderrTail: tailText(job.stderr, 300),
+  }
+}
+
+/** その Task の最新 approval。STALE / EXPIRED も含めて見せる（「なぜ承認が効いていないか」の材料）。 */
+function describeLatestApproval(storage: IStorage, taskId: string): unknown {
+  const approval = storage.approvalRequests.findActiveByTaskId(taskId)
+  if (!approval) return { note: 'no approval request for this task' }
+  return {
+    id: approval.id,
+    status: approval.status,
+    requestedAction: approval.requestedAction,
+    riskLevel: approval.riskLevel,
+    targetCommit: approval.targetCommit,
+    expiresAt: approval.expiresAt,
+  }
+}
+
+function tailText(value: string | undefined, max: number): string | undefined {
+  if (value === undefined) return undefined
+  const trimmed = value.trim()
+  if (trimmed === '') return undefined
+  return trimmed.length <= max ? trimmed : `…${trimmed.slice(-max)}`
+}
+
+/**
+ * attention の種類ごとに PL が選べる action。
+ *
+ * **ここに載せることは「実行してよい」を意味しない。** 可否は必ず `authorizePlAction()` が決める。
+ * 載せるのは「PL に考えさせる選択肢」であり、Gate に落ちれば実行されない。
+ * 一覧に無い値を PL が出した場合は Policy が未知値として forbidden にする。
+ */
+function allowedActionsFor(kind: AttentionItem['kind']): readonly string[] {
+  switch (kind) {
+    case 'design_review_idle':
+    case 'design_review_failed':
+      return ['rekick_design_review', 'escalate_to_ceo']
+    case 'job_blocked':
+      // CEO 指示（2026-09-15）: blocked reason と周辺状態を読んで、
+      // sanctioned retry / resume / quarantine recovery / 新しい approval cycle / wait /
+      // CEO escalation から選べるようにする。**新しい Recovery 機構は作らない**ので、
+      // ここに並ぶのはすべて既存の正式操作である。
+      // `observe_state` は「待つ」（既存の復旧が進行中なので今回は何もしない）を表す。
+      return [
+        'resume_task',
+        'retry_job',
+        'clear_workspace_quarantine',
+        'observe_state',
+        'escalate_to_ceo',
+      ]
+    case 'job_failed':
+      return ['resume_task', 'retry_job', 'observe_state', 'escalate_to_ceo']
+    default:
+      return ['escalate_to_ceo']
+  }
+}
+
 /** 対象の周辺状態だけを抜く。全 Project の状態を PL へ丸ごと渡さない（Context 重視）。 */
-function buildContext(state: SystemStateSnapshot, item: AttentionItem): unknown {
+function buildContext(storage: IStorage, state: SystemStateSnapshot, item: AttentionItem): unknown {
   const project = state.projects.find((p) => p.id === item.projectId)
   return {
+    // blocked / failed は「なぜ止まったか」を読まないと判断できない。該当時だけ載せる。
+    ...(item.jobId !== undefined ? { blockedJob: describeStuckJob(storage, item.jobId) } : {}),
+    ...(item.taskId !== undefined ? { latestApproval: describeLatestApproval(storage, item.taskId) } : {}),
     generatedAt: state.generatedAt,
     attention: item,
     project: project
@@ -406,6 +538,32 @@ async function executeAction(
     return { ok: result.status !== 'stale', summary: `design review rekick: ${result.status}` }
   }
 
+  if (kind === 'observe_state') {
+    // 「待つ」。既存の復旧が進行中だと PL が判断した場合。何も実行しない。
+    // 状態が変わらなければ verification が `unchanged` になり、試行上限で Escalation へ倒れる
+    // ので、待ち続けて放置されることはない。
+    return { ok: true, summary: 'waiting: PL judged that an existing recovery is already in progress' }
+  }
+
+  if (kind === 'resume_task') {
+    if (item.taskId === undefined) {
+      return { ok: false, summary: 'attention has no taskId; cannot resume' }
+    }
+    // **既存の正式操作をそのまま呼ぶ。** 新しい Recovery 機構は作らない。
+    // `resumeBlockedTask()` 自身が fail-closed の門を持つ（quarantine / 有効な承認待ち /
+    // queued・running の重複 / AI CLI の Design Review evidence）。ここで緩めない。
+    // git_commit の resume なら、新 Job が `/gate/check` で**現在の diff に対する新しい
+    // Approval Request** を発行する（STALE な旧 approval は再利用されない）。
+    const resumed = storage.jobs.resumeBlockedTask({
+      taskId: item.taskId,
+      instructionPrompt: deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION,
+    })
+    if (!resumed.ok) {
+      return { ok: false, summary: `resume refused: ${resumed.reason}` }
+    }
+    return { ok: true, summary: `resume queued job ${resumed.job.id}` }
+  }
+
   // Gate は通ったが v1 に executor が無い操作。**勝手に別の操作で代替しない。**
   return { ok: false, summary: `no executor wired for '${kind}' in this loop version` }
 }
@@ -483,8 +641,8 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     try {
       raw = await diagnose({
         attention: item,
-        context: buildContext(before, item),
-        allowedActionKinds: ['rekick_design_review', 'escalate_to_ceo'],
+        context: buildContext(storage, before, item),
+        allowedActionKinds: allowedActionsFor(item.kind),
       })
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
@@ -519,6 +677,9 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
             : {}),
         },
         target: plActionTarget,
+        // 根拠は**システムが観測した実レコード**から積む。PL の申告は渡さない。
+        // 該当が無ければ空のままで、Gate が missing として止める（fail-closed）。
+        evidence: collectSystemEvidence(storage, item),
       })
     } catch (error: unknown) {
       if (error instanceof PlActionBlockedError) {
