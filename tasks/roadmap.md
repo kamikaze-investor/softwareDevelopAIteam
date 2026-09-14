@@ -6516,6 +6516,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 3. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
       同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
+      **担当境界（2026-09-15）**: 本項目は「transient 起因の失敗が attempt 予算を食い潰す」こと、
+      つまり**同じ provider のまま予算の数え方を直す**話である。
+      予算を使い切って終端した後に**別 provider へ正式再審査を依頼する**能力は
+      `review-provider-exhausted-alternate-rereview` が持つ。両者は補完関係にあり重複しない。
 
       **実測**: Task `bd80c4ce` の Design Review run `4032eec3` が attempt 3 すべて
       `runner timed out after 300000ms` で失敗。**stderr 保持（`ce9df9b`）のおかげで原因が残っていた**:
@@ -6652,6 +6656,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         表を二重に持たない。Registry 側の不変条件「生成担当と独立Review担当の provider 分離を
         表現でき、緩める設定を可能にしない」をそのまま使う
       - PL action の配線そのものは `vps-pl-execution-loop` の受け皿に載せる
+      - `provider-outage-burns-attempt-budget` … **同じ provider のまま attempt 予算の数え方を直す**。
+        本項目は予算を使い切って終端した後の話であり、別の層を担当する
 
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
