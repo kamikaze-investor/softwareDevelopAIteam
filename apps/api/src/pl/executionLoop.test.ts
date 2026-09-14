@@ -683,6 +683,38 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.status === 'queued')).toBe(false)
   })
 
+  it('Job 単位の操作には Job 対象が渡る（Task 対象では target_mismatch で必ず落ちていた）', async () => {
+    // 2026-09-15 production 実測: `kind=retry_job target_mismatch=task`。
+    // 候補に並んでいるのに構造的に一度も Gate の根拠照合へ届かない操作があった。
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'retry_job', rationale: 'transient', riskLevel: 'LOW' }),
+    }))
+
+    // Gate の根拠照合まで到達している。approval_gate の根拠が無いので止まるが、
+    // 理由は「対象種別のズレ」ではなく「根拠が足りない」でなければならない。
+    expect(result.status).toBe('blocked')
+    expect(result.reason).not.toContain('requires a job target')
+    expect(result.reason).not.toContain('cannot be addressed')
+    expect(result.reason).toContain('approval_gate')
+  })
+
+  it('要求される対象を組み立てられない提案は、Gate を呼ばずに fail-closed で止める', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+
+    const result = await runPlTick(storage, deps({
+      // system 対象の操作は PL ループの候補に無い。壊れた提案として通さない。
+      diagnose: async () => JSON.stringify({ actionKind: 'restart_service', rationale: 'x', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.status).toBe('blocked')
+    expect(result.reason).toContain('cannot be addressed')
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.status === 'queued')).toBe(false)
+  })
+
   it('executor の無い操作を選んだら実行せず、試行上限で CEO へ上げる', async () => {
     const { storage, taskId, projectId } = seed()
     blockedCommitJob(storage, taskId, projectId)

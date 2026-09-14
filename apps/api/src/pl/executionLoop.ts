@@ -49,6 +49,7 @@ import type { IStorage } from '../storage/interface'
 import {
   authorizePlAction,
   PlActionBlockedError,
+  requiredTargetKindFor,
   type GateEvidenceRef,
   type PlActionTarget,
 } from './actionGate'
@@ -394,6 +395,45 @@ function allowedActionsFor(kind: AttentionItem['kind']): readonly string[] {
   }
 }
 
+/**
+ * Gate へ渡す対象を、**その操作が要求する種類**で組み立てる。
+ *
+ * 以前は attention に taskId があれば常に Task 対象を渡していた。そのため `retry_job` /
+ * `clear_workspace_quarantine` のような **Job 単位の操作は必ず `target_mismatch` で落ちた** —
+ * 2026-09-15 の production で実測（`kind=retry_job target_mismatch=task`）。PL から見ると
+ * 候補に並んでいるのに構造的に一度も通らない操作があったことになる。
+ *
+ * ここで直すのは**宛先だけ**で、必要な Gate は一つも変えない。要求種別を組み立てられない場合は
+ * Gate を呼ばずに fail-closed で止める（当たりそうな別種別を代わりに渡さない）。
+ */
+function resolvePlActionTarget(kind: string, item: AttentionItem): PlActionTarget | undefined {
+  const required = requiredTargetKindFor(kind)
+  if (required === undefined) return undefined
+
+  const job: PlActionTarget | undefined =
+    item.jobId !== undefined && item.taskId !== undefined
+      ? { kind: 'job', jobId: item.jobId, taskId: item.taskId }
+      : undefined
+  const task: PlActionTarget | undefined =
+    item.taskId !== undefined ? { kind: 'task', taskId: item.taskId } : undefined
+  const project: PlActionTarget = { kind: 'project', projectId: item.projectId }
+
+  switch (required) {
+    case 'job':
+      return job
+    case 'task':
+      return task
+    case 'project':
+      return project
+    // system 対象（restart_service / deploy_production / switch_provider）は PL ループの
+    // 候補に無い。届いたら提案が壊れているので通さない。
+    case 'system':
+      return undefined
+    case 'any':
+      return job ?? task ?? project
+  }
+}
+
 /** 対象の周辺状態だけを抜く。全 Project の状態を PL へ丸ごと渡さない（Context 重視）。 */
 function buildContext(storage: IStorage, state: SystemStateSnapshot, item: AttentionItem): unknown {
   const project = state.projects.find((p) => p.id === item.projectId)
@@ -426,6 +466,16 @@ const DIAGNOSIS_SYSTEM = [
   '- You do not decide whether a gate, review or CEO approval is required.',
   '- You cannot override a BLOCK. Your options are fix / re-review / alternative / escalate.',
   '- If no listed action is clearly safe and appropriate, propose "escalate_to_ceo".',
+  '',
+  // 何が起きるかを知らないまま選ばせない。**どれを選んでよいかは決めていない** —
+  // 可否は Gate が判定する。ここは各操作の意味を揃えるだけである。
+  'What the listed actions actually do (all of them are existing operations):',
+  '- retry_job: the job failed for a transient reason and running the same job again can work.',
+  '- resume_task: the task stalled and needs a fresh run. A blocked commit whose approval is',
+  '  STALE, EXPIRED or missing can only move this way: it starts a NEW approval cycle, and the',
+  '  CEO still has to approve it. Re-approving the old request does nothing.',
+  '- clear_workspace_quarantine: the workspace is quarantined and that quarantine is the blocker.',
+  '- observe_state: a recovery is already in flight, or the blocker is outside this system; wait.',
   '',
   'Answer with a single JSON object and nothing else:',
   '{"actionKind": "<one of the allowed kinds>", "rationale": "<one sentence>",',
@@ -663,10 +713,12 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     }
 
     // ── Mandatory Gate（唯一の許可経路）──────────────────────────
-    const plActionTarget: PlActionTarget =
-      item.taskId !== undefined
-        ? { kind: 'task', taskId: item.taskId }
-        : { kind: 'project', projectId: item.projectId }
+    const plActionTarget = resolvePlActionTarget(proposal.kind, item)
+    if (plActionTarget === undefined) {
+      const reason = `action ${proposal.kind} cannot be addressed at this attention item's scope`
+      record(storage, key, 'blocked', `kind=${proposal.kind} ${reason}`)
+      return { status: 'blocked', target, proposedKind: proposal.kind, reason, attempt }
+    }
 
     try {
       authorizePlAction(storage, {
