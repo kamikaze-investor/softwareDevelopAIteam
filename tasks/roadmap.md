@@ -6292,11 +6292,23 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       PL の CEO Escalation は `[Notifier] 通知チャネルが未設定です` としてジャーナルにしか出ない。
       **PC を閉じても継続する**という目的に対しては、Escalation が CEO へ届く経路の設定が前提になる。
 
-      **残っている作業（本項目は完了にしない）**: Phase 2。上記修正を deploy した上で
-      `PL_LOOP_ENABLED=true` にし、VPS 単独で 異常認識 → 分析 → Gate → 正式操作 → 結果確認 →
-      継続または Escalation が成立することを実運用で観測する。
-      なお **Execute で実際の復旧操作（`rekick_design_review`）が走る経路は production 未実証**である
-      （今回の対象は attempt を使い切っており、再kickは不変条件6で禁止されているため）。
+      **【2026-09-14 Phase 2: interval 有効化・観測 PASS】** 修正を `df2d71a` として deploy し、
+      `PL_LOOP_ENABLED=true` / `PL_LOOP_INTERVAL_MS=60000` を **systemd drop-in**
+      （`~/.config/systemd/user/ai-team-api.service.d/pl-loop.conf`）で有効化した。
+      **`/srv/ai-team/env/*.env` は読み書きしていない**（無効化は drop-in の削除のみ）。
+      起動ログ `PL execution loop enabled (intervalMs=60000)` を確認し、約8分（≒8 tick）観測:
+      非 idle tick 0 件 / 新規 `audit_log` 行 0 件 / Escalation 再送 0 件 / `PL tick failed` 0 件 /
+      API・Worker とも active。**ローカル PC 無しで PL が回り続け、既に CEO へ上げた案件については
+      provider も消費せず何もしない**ことを実測した。
+      実測記録: `docs/project_memory/decisions/vps_pl_execution_loop_operational_verification.md`。
+
+      **残っている作業（本項目は完了にしない）**:
+      1. **Execute で実際の復旧操作（`rekick_design_review`）が走る経路が production 未実証**。
+         今回の対象は attempt を使い切っており、再kickは CEO 承認済み不変条件6で禁止されているため、
+         PL は正しく Escalation を選んだ。attempt が残った idle / failed な run が現れたときが実証機会。
+      2. **Escalation の到達経路が未設定**。通知チャネルが無く、CEO への Escalation は
+         ジャーナルにしか出ない。「PC を閉じても継続する」目的には、届く経路の設定が前提になる
+         （既存 notifier の設定であり、新しい通知基盤は作らない）。
 
       **問題**: PL 判断能力が無いのではなく、**PL が VPS 上で継続実行される経路へ接続されていない**。
       現在 PL 判断（状態把握・停滞検知・原因分析・調査・証拠収集・方針判断・次Task選択・委任・
