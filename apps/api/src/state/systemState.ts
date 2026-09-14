@@ -253,7 +253,14 @@ export function buildSystemState(
             detail: job.failureMetadata?.quarantineReason ?? 'workspace is quarantined',
             stuckForMs: elapsedMs(job.completedAt ?? job.createdAt, nowMs),
           })
-        } else if (job.status === 'blocked') {
+        } else if (job.status === 'blocked' && task.status !== 'done') {
+          // **done な Task の blocked Job は attention にしない。**
+          // Task が終端に達している以上その Job は履歴であり、誰も解消できない
+          // （resume の対象は blocked Task であって done Task ではない）。
+          // ここを出し続けると、PL は毎 tick それを見て何もできず、attention が永久に消えない。
+          // 実例（2026-09-15）: `roadmap-adoption-followups` の implement Job が File Change Guard で
+          // blocked → 実装は外部セッションで完了し Task は done。以後 `job_blocked` だけが残り続けた。
+          // workspace の quarantine は Task status と無関係に実在の異常なので、上の分岐で従来どおり出す。
           attention.push({
             kind: 'job_blocked',
             projectId: project.id,

@@ -88,6 +88,52 @@ describe('buildSystemState — 横断状態の読み取り', () => {
     expect(state.attention.filter((a) => a.jobId === job.id)).toHaveLength(1)
   })
 
+  it('done な Task の blocked Job は attention に出さない（誰も解消できない履歴を残さない）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+
+    // Task が pending の間は出る（従来どおり）
+    expect(buildSystemState(storage, { now }).attention.some((a) => a.kind === 'job_blocked')).toBe(true)
+
+    storage.tasks.update(task.id, { status: 'done', roadmapActive: false })
+    const after = buildSystemState(storage, { now })
+
+    expect(after.attention.some((a) => a.kind === 'job_blocked')).toBe(false)
+    // totals の集計からは消さない（履歴としては残っている）
+    expect(after.totals.jobs.blocked).toBe(1)
+    expect(job.status).toBe('blocked')
+  })
+
+  it('done な Task でも quarantine は attention に出し続ける（workspace の実異常は Task status と無関係）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.jobs.update(job.id, {
+      failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
+    })
+    storage.tasks.update(task.id, { status: 'done', roadmapActive: false })
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'workspace_quarantined')).toBe(true)
+    expect(state.totals.quarantinedJobs).toBe(1)
+  })
+
   it('長時間 running の Job を attention に出す（閾値未満は出さない）', () => {
     const { storage, projectId } = seed()
     const task = addTask(storage, projectId, { status: 'in_progress' })
