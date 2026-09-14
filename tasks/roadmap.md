@@ -6119,6 +6119,39 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       「充足の根拠は PL 出力ではなく DB の実レコードであること」「executor は許可した提案から
       構造的に dispatch すること」を含める。
 
+      **【2026-09-14 追記: 実操作の棚卸しと語彙の網羅性】**
+      正式な操作を実経路から棚卸しし、判定表との差分を埋めた（**新しい Gate は作っていない**）。
+
+      | 操作 | 実行経路 | 既存の強制 | production 影響 | 可逆性 |
+      |---|---|---|---|---|
+      | Task resume | `POST /api/tasks/:id/resume` | resume 用 prompt を **Design Review へ再投入**してから resume（元 prompt の evidence を流用しない）。quarantine 中は 409 | 無 | 可逆（Job 追加） |
+      | quarantine 解除 | `PATCH /api/jobs/:id/clear-quarantine` | `observation` + `knownGood` 必須 + **サーバ側再検証**。force / admin による無条件解除経路は無い | 無 | 可逆 |
+      | 停止 Job の強制終端 | `PATCH /api/jobs/:id/fail-if-running` | `workspaceVerified` 省略時は **fail-closed で quarantine** | 無 | 不可逆（実行中の作業は失われる） |
+      | Job 完了報告 | `PATCH /api/jobs/:id` | continuation pending 中は意図的に 503 → Outbox 再送 | 無 | — |
+      | Roadmap 採用 | `POST /api/projects/:id/roadmap-adoptions` | `allowedPaths` / 受入条件は**呼び出し側が明示**（ledger 散文から推測しない） | 無 | 可逆 |
+      | 承認 | `PATCH /api/approval-requests/:id/status` | CEO 権限。PL の語彙に入れない（未知 → forbidden） | 無 | 可逆 |
+      | Design Review 再kick | **API 経路が無い**（`recoverAndRekickAtStartup()` は API 起動時のみ） | — | 無 | 可逆 |
+      | service 再起動 / deploy / rollback | **AIteamOS の外**（systemd / deploy script / git） | 既存 deploy 手順（ff-only・verified SHA） | 有 | deploy は rollback 可能 |
+
+      判定表に無い操作は fail-closed で forbidden になるため、**語彙の穴は「その操作が永久に取れない」ことと
+      同義**である。棚卸しの結果、次の3件を追加した（**fail-closed は緩めていない**。未知の値は依然 forbidden）:
+      - `escalate_to_ceo` … BLOCK 時に PL へ返す4択に含まれるのに語彙に無く、提案すると forbidden になる
+        自己矛盾があった。**Gate を要さない**（escalation を塞ぐと PL に残された行動が実際には取れない）
+      - `rekick_design_review` … `vps-pl-execution-loop` の production evidence で実際に必要だった復旧。
+        bounded retry の再実行なので `retry_job` と同じ `approval_gate`。attempt 上限は既存 coordinator が持つ
+      - `fail_stuck_job` … 既存の fail-closed 経路。進行中の作業を破棄するため `abort_task` と同じ `approval_gate`
+
+      **未決の Policy 判断（CEO 判断事項。AI 側で変更しない）**: `rollback_commit` は現在
+      `safety_review` + `approval_gate` + `ceo_approval` を要求するが、CLAUDE.md 4章は**ロールバックを
+      Green Zone** に置き、Design Philosophy 4・10 は「失敗しても即座に戻せる」ことを要求している。
+      復旧手段が障害より重い Gate を要求する状態は、`project-auto-incident-pattern-improvement` が
+      Incident 候補として扱う**過剰安全策**にあたる。推奨は target repository の git rollback（Green・可逆）と
+      production deploy の rollback（Yellow・本番影響）を分け、前者を `approval_gate` のみにすること。
+      **CEO Approval の要否を変える判断であるため、本変更には含めていない。**
+
+      **Design Review 再kick の実行経路が無い点は本項目の scope 外**（`vps-pl-execution-loop` 側で扱う）。
+      Policy は「その操作にどの Gate が要るか」だけを決め、実行は既存 API 経路を使う。
+
       **CEO 確定の不変条件（2026-09-14）**。PL の思考・原因分析・方針判断は制限しない。
       安全性は「PL が判断できないようにする」ことではなく、**PL が決めた変更・操作を必ず既存 Gate へ
       通す**ことで担保する。
