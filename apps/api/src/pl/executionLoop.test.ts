@@ -13,6 +13,7 @@ import {
   resetPlLoopInFlightForTest,
   runPlTick,
   verifyOutcome,
+  type PlDiagnosisInput,
   type PlLoopDeps,
 } from './executionLoop'
 import { PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
@@ -604,5 +605,103 @@ describe('runPlTick — CEO 判断待ちは黙って放置しない', () => {
     await runPlTick(storage, d)
 
     expect(escalations).toHaveLength(1)
+  })
+})
+
+describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を選ぶ', () => {
+  function blockedCommitJob(storage: IStorage, taskId: string, projectId: string): string {
+    const job = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { stderr: 'blocked: approval required' })
+    storage.tasks.update(taskId, { status: 'blocked' })
+    return job.id
+  }
+
+  function alignedEvidence(storage: IStorage, taskId: string): void {
+    storage.designReviewEvidence.create({
+      taskId,
+      reviewKind: 'task',
+      subjectId: taskId,
+      designTextHash: 'hash',
+      reviewLoad: 'low',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+  }
+
+  it('blocked reason と approval 状態を診断へ渡す', async () => {
+    const { storage, taskId, projectId } = seed()
+    const jobId = blockedCommitJob(storage, taskId, projectId)
+    let seen: PlDiagnosisInput | undefined
+
+    await runPlTick(storage, deps({
+      diagnose: async (input) => {
+        seen = input
+        return JSON.stringify({ actionKind: 'observe_state', rationale: 'wait', riskLevel: 'LOW' })
+      },
+    }))
+
+    expect(seen?.attention.kind).toBe('job_blocked')
+    const ctx = JSON.stringify(seen?.context)
+    expect(ctx).toContain(jobId)
+    expect(ctx).toContain('approval required')
+    // PL が選べる候補に sanctioned な復旧と escalation が並ぶ
+    expect(seen?.allowedActionKinds).toContain('resume_task')
+    expect(seen?.allowedActionKinds).toContain('escalate_to_ceo')
+  })
+
+  it('ALIGNED evidence があれば resume を Gate に通し、既存の正式操作で新 Job を作る', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    alignedEvidence(storage, taskId)
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: '新しい承認サイクルへ', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.status).toBe('acted')
+    expect(result.executionSummary).toContain('resume queued job')
+    // 既存経路が作る resume Job（新しい workflowStepKey）
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey?.startsWith('resume:'))).toBe(true)
+  })
+
+  it('evidence が無ければ resume は Gate に止められる（自己申告では通らない）', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'やりたい', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.status).toBe('blocked')
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.status === 'queued')).toBe(false)
+  })
+
+  it('executor の無い操作を選んだら実行せず、試行上限で CEO へ上げる', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    alignedEvidence(storage, taskId)
+    const escalations: string[] = []
+    const d = deps({
+      // clear_workspace_quarantine は safety_review を要するため Gate で止まる（fail-closed）
+      diagnose: async () => JSON.stringify({ actionKind: 'clear_workspace_quarantine', rationale: 'x', riskLevel: 'LOW' }),
+      escalate: async (p) => { escalations.push(p.title) },
+    })
+
+    for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, d)
+    }
+    resetPlLoopInFlightForTest()
+    const escalated = await runPlTick(storage, d)
+
+    expect(escalated.status).toBe('escalated')
+    expect(escalations.length).toBe(1)
   })
 })
