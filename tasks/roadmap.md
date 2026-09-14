@@ -5699,6 +5699,9 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
       **今回やらないこと（明記）**: Dynamic Model Routing / 自動モデル昇格 / ベンチマーク基盤 /
       Model Registry Lite 本体（Phase 2）/ 新しい Gate。本項目は静的な対応表のみ。
       `project-auto-gemini-worker-eligibility` は本項目の**最初の適用事例**として扱い、
+      **2026-09-15 追記**: `review-provider-exhausted-alternate-rereview` も本項目の利用者である
+      （Reviewer Role の provider 候補順を Registry で表現し、生成担当との vendor 分離を
+      緩められない形で持つ）。候補表を本項目の外に二重に作らないこと。
       別枠の Provider 評価の仕組みは作らない。
 
       **依存**: `project-workspace-isolation` とは独立で、並行実施できる。
@@ -6505,11 +6508,76 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **残: worst case（CLI 経路の exec 120 秒 × 3 + Copilot fallback）は依然未収容。**
       これは caller の timeout を伸ばして解くのではなく、**runner 側の retry 予算を deadline で縛る**
       のが筋であり、本項目の後続作業として残す。新しい retry framework は作らない
+
+      **2026-09-15 追記（担当境界）**: 本項目は「run が走っている最中」の予算の話に限る。
+      **attempt 枯渇で終端した後の正式再審査**は `review-provider-exhausted-alternate-rereview`
+      が持つ。どちらか一方だけでは 2026-09-14 の停止は解けない。
       （`geminiRouter` の既存 retry に上限を渡す形にする）。
 
       **関連**: 本件は `vps-pl-execution-loop` の production evidence でもある
       （VPS 上の PL が居れば検知・調査・復旧できたはず）。実際 2026-09-14 の実復旧 E2E では、
       PL がこの timeout を2回観測して「systemic な問題」と判断し CEO Escalation へ倒した。
+
+<!-- roadmap:id=review-provider-exhausted-alternate-rereview state=planned priority=high -->
+2. [ ] **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする** — 2026-09-15登録。
+      **CEO 判断（2026-09-15）**: Review 要件の緩和は承認しない。Review を skip しない。
+      既存 BLOCK を override しない。attempt を使い切った run を無理に再利用しない。
+      **新しい正式 Review として実行し、結果は既存の API 側判定（`recomputeDecision()`）を通す。**
+
+      **事象（production 実測 2026-09-14）**: Task `bd80c4ce`（Meta Reviewer structured-output
+      robustness）の Design Review run `4032eec3` が 3/3 attempt を使い切って `failed` 終端。
+      stderr に残っていた実際の原因は
+      `[503 Service Unavailable] This model is currently experiencing high demand`（Gemini API）で、
+      `geminiRouter` が `transient` と分類し、`metaReviewFallbackRouter` が
+      **Copilot CLI へフォールバックしたところで runner が 300s deadline で kill された**。
+      実装内容の問題ではなく provider 側の一時障害である（CEO 判断と実測が一致）。
+      VPS PL は 3/3 を検出して **re-kick を拒否し CEO Escalation へ倒した**（設計どおり）。
+
+      **既に存在するもの（作り直さない）**:
+      - `createAndExecuteDesignReview()`（`designReviewCoordinator.ts`）— **新しい run を作り直す
+        正式経路**。attempt 予算が新品になり、evidence 登録は `recomputeDecision()` を必ず通る。
+        **production 実績あり**: 同日 Task `76ea5ff3` は run `944ce2e0` が 3/3 failed した後、
+        新 run `d584882e` が succeeded して復旧している
+      - `reviewWithProviderFallback()`（`metaReviewFallbackRouter.ts`）— run 内の provider 連鎖
+      - `createReviewerAdapter('codex')` / `INDEPENDENT_REVIEWER_PROVIDER`（`strategicReview.ts`）—
+        **契約済みの OpenAI レビュアー**。CRITICAL Independent Review で既に稼働している
+      - `reviewSeparation.ts` — vendor 分離判定。**`copilot` は underlying vendor を特定できないため
+        意図的に未登録**であり、独立性の根拠には使えない
+      - `role-model-registry` — provider 候補表の置き場。**新しい Registry を作らない**
+      - `plActionPolicy` / `actionGate` — PL の action 語彙と強制 Gate
+
+      **不足している最小分（ここだけ補う）**:
+      1. **PL に「新しい正式 Review run を作る」action が無い。** `rekick_design_review` は
+         3/3 を正しく拒否するだけで、そこから先が無い。`PL_ACTION_KINDS` / `ACTION_GATE_TABLE` /
+         `REQUIRED_TARGET_KIND` へ追加しないと、未知 kind は fail-closed で `forbidden` になる
+      2. **新しい run に「どの provider で審査するか」を指定できない。** `DesignReviewRun` に
+         provider 欄が無く、provider 選択は `strategicReview.ts` 内に固定されている
+      3. **どの provider が実際に応答したかが DB に残らない。** `reviewWithProviderFallback()` は
+         `providerUsed` を返すが、`strategicReview.ts` は `{ raw }` だけを取り出して捨てている
+         （`autoReview.ts` は結果ファイルへ書いている）。**記録が無いと「別 provider で再審査した」
+         ことを後から検証できない**（Design Philosophy 8: 効果検証可能性）。additive に持たせる
+
+      **維持する不変条件**:
+      - **Review を skip しない / BLOCK を override しない / 3/3 の run を再利用しない。**
+        必ず新しい run を作り、判定は既存の `recomputeDecision()` が再計算する
+      - **独立性**: 代替レビュアーは生成担当と同一 vendor にしない。Task Design Review の
+        implementer は `claude_code`（Anthropic）なので、代替先は Anthropic 以外。
+        `copilot` は vendor 不明のため**独立レビュアーの根拠にはできない**
+        （通常 Design Review の縮退先としては現状どおり使える）
+      - **有界**: 代替 provider での再審査は固定回数まで。尽きたら CEO Escalation。
+        provider を無限に巡回させない
+
+      **やらないこと（明記）**: 新しい Gate / 新しい Review 工程 / 新しい retry framework /
+      新しい従量課金 API 経路 / Dynamic Model Routing。
+
+      **重複しない境界**:
+      - `design-review-runner-production-timeout` が持つのは「**runner の retry 予算を deadline で
+        縛る**」であり、run が走っている最中の話。**本項目は run が attempt 枯渇で終端した後**の
+        正式再審査であり、別物。どちらか一方では今回の停止は解けない
+      - `role-model-registry` が provider 候補表の正本。本項目はその**最初の実利用者**であり、
+        表を二重に持たない。Registry 側の不変条件「生成担当と独立Review担当の provider 分離を
+        表現でき、緩める設定を可能にしない」をそのまま使う
+      - PL action の配線そのものは `vps-pl-execution-loop` の受け皿に載せる
 
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
