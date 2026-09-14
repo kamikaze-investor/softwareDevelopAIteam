@@ -2030,6 +2030,85 @@ describe('SQLiteStorage', () => {
           expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
         })
 
+        // ── entries が空の dirty baseline（resume/repair/retry が clean な worktree から始まると記録される）
+        // 2026-09-14 production: この組み合わせで解除要求が必ず 409 になり Task が復旧不能になった。
+        describe('empty dirty baseline is equivalent to clean', () => {
+          const EMPTY_DIRTY: JobWorkspaceBaseline = { mode: 'dirty', startCommitHash: 'abc123', entries: [] }
+
+          it('clears when the baseline is dirty-but-empty and the workspace observes clean', () => {
+            const job = createRunningJob()
+            quarantineJob(job.id)
+            storage.jobs.update(job.id, { workspaceBaseline: EMPTY_DIRTY })
+
+            const cleared = storage.jobs.clearWorkspaceQuarantine({
+              jobId: job.id,
+              observation: CLEAN_OBSERVATION,
+              knownGood: KNOWN_GOOD,
+              reason: 'startup recovery',
+            })
+
+            expect(cleared).toMatchObject({ ok: true, clearedJobCount: 1 })
+            expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(false)
+          })
+
+          it('still REFUSES when the workspace actually has changes (safety is not weakened)', () => {
+            const job = createRunningJob()
+            quarantineJob(job.id)
+            storage.jobs.update(job.id, { workspaceBaseline: EMPTY_DIRTY })
+
+            const refused = storage.jobs.clearWorkspaceQuarantine({
+              jobId: job.id,
+              observation: {
+                mode: 'dirty',
+                startCommitHash: 'abc123',
+                entries: [{ path: 'src/leftover.ts', kind: 'modified', worktreeHash: 'h1' }],
+              },
+              knownGood: { ...KNOWN_GOOD, worktreeClean: false },
+            })
+
+            expect(refused.ok).toBe(false)
+            if (!refused.ok) expect(refused.code).toBe('VERIFICATION_FAILED')
+            expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+          })
+
+          it('still REFUSES when startCommitHash differs', () => {
+            const job = createRunningJob()
+            quarantineJob(job.id)
+            storage.jobs.update(job.id, { workspaceBaseline: EMPTY_DIRTY })
+
+            const refused = storage.jobs.clearWorkspaceQuarantine({
+              jobId: job.id,
+              observation: { mode: 'clean', startCommitHash: 'moved-head' },
+              knownGood: KNOWN_GOOD,
+            })
+
+            expect(refused.ok).toBe(false)
+            if (!refused.ok) expect(refused.code).toBe('VERIFICATION_FAILED')
+            expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+          })
+
+          it('still REFUSES a NON-empty dirty baseline against a clean observation (strict comparison kept)', () => {
+            const job = createRunningJob()
+            quarantineJob(job.id)
+            storage.jobs.update(job.id, {
+              workspaceBaseline: {
+                mode: 'dirty',
+                startCommitHash: 'abc123',
+                entries: [{ path: 'src/a.ts', kind: 'modified', worktreeHash: 'h2' }],
+              },
+            })
+
+            const refused = storage.jobs.clearWorkspaceQuarantine({
+              jobId: job.id,
+              observation: CLEAN_OBSERVATION,
+              knownGood: KNOWN_GOOD,
+            })
+
+            expect(refused.ok).toBe(false)
+            if (!refused.ok) expect(refused.code).toBe('VERIFICATION_FAILED')
+            expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+          })
+        })
         it('clears WITHOUT a persisted baseline when known-good all hold and observation.mode is clean, persisting observation as the new durable baseline', () => {
           const job = createRunningJob()
           quarantineJob(job.id)

@@ -207,10 +207,41 @@ function sameStringArrayAsSet(left: string[] | undefined, right: string[] | unde
  *     path 昇順（同値なら oldPath 昇順）の並び順非依存で完全一致
  * 1つでも不一致なら false（＝quarantine は維持される。fail-closed）。
  */
+/**
+ * **entries が空の dirty baseline は clean と同義**なので、比較前に clean へ正規化する。
+ *
+ * これが無いと解除不能な組み合わせが生まれる。`computeWorkspaceBaseline()`
+ * (`apps/worker/src/jobRunner.ts`) は intentionally-dirty Job（`resume:` / `repair:` / `retry:`）に
+ * 対し、**worktree が空でも** `mode:'dirty', entries:[]` を記録する。一方
+ * `observeWorkspace()` (`apps/worker/src/workspaceVerification.ts`) は worktree が空なら
+ * `mode:'clean'` しか返さず、`mode:'dirty'` かつ `entries:[]` を返す経路は存在しない。
+ * よって mode 一致を先に要求すると、**workspace が安全でも解除要求が必ず 409 になる**。
+ *
+ * 2026-09-14 に production で実際に発生した（Job `cf259578`）。Worker 自身は
+ * 「安全と観測できた」とログしており検証は通っていたのに、比較の入口で落ちて
+ * Task が Mobile から復旧不能になった。ledger: `quarantined-dirty-task-generic-recovery`。
+ *
+ * **安全性は下げていない。** 正規化するのは「記録された差分が1件も無い」場合だけで、
+ * 差分の中身を無視する経路は作らない:
+ *   - `entries` が1件でもあれば dirty のまま従来どおり厳密比較する
+ *   - `startCommitHash` の一致要求は変えない
+ *   - baseline が空 dirty（=clean 相当）でも、観測側に**実際の差分があれば**
+ *     観測は dirty のままなので mode 不一致で false になる（＝解除されない）
+ */
+function normalizeEmptyDirtyBaseline(baseline: JobWorkspaceBaseline): JobWorkspaceBaseline {
+  if (baseline.mode === 'dirty' && baseline.entries.length === 0) {
+    return { mode: 'clean', startCommitHash: baseline.startCommitHash }
+  }
+  return baseline
+}
+
 function baselineEqualsObservation(
-  baseline: JobWorkspaceBaseline,
-  observation: JobWorkspaceBaseline,
+  rawBaseline: JobWorkspaceBaseline,
+  rawObservation: JobWorkspaceBaseline,
 ): boolean {
+  const baseline = normalizeEmptyDirtyBaseline(rawBaseline)
+  const observation = normalizeEmptyDirtyBaseline(rawObservation)
+
   if (baseline.mode !== observation.mode) return false
   if (baseline.startCommitHash !== observation.startCommitHash) return false
   if (baseline.mode === 'clean') return true
