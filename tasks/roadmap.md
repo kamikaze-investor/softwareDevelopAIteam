@@ -4575,6 +4575,19 @@ worktree と別 repository は採らない。
       親項目 `roadmap-item-adoption`（done）は採用経路そのものを実装済み。以下は Tier A E2E で
       実運用して判明した**残作業**であり、親項目の再オープンではなく後続として扱う。
 
+      **【2026-09-15: (1) 実装済み。(2) は未着手のまま】** 採用 API へ任意の `implementationScope` を
+      追加し、指定時のみ description の先頭へ「今回実装する範囲」を載せる（ledger 本文はその後に残す）。
+      未指定時の description は従来と同一で、**ledger の書式は一切変更していない**。
+      `buildAdoptedDescription()`（`ctoAi/roadmapAdoption.ts`）に閉じた純粋関数で、
+      回帰テストで指定時・未指定時・空白のみ・ledger 本文の非改変を固定した。
+
+      **本項目を選んだ根拠（production 実測・2026-09-14）**: 同じ欠陥が**2回目**の再現をした。
+      `roadmap-adoption-followups` 自身を採用した Task の implement Job が、対象外と明記した
+      サブ項目(2)側の `storage/schema.ts` / `storage/sqlite.ts` / `types/task.ts` / `routes/tasks.ts` /
+      `storage/roadmapTaskValidation.ts` を変更し、File Change Guard が `fileChangeAllowed:false` で
+      停止させた（安全機構は正しく作動し、変更は revert 済み。workspace は clean）。
+      **自己開発では抜け出せない欠陥**（Implementer は毎回スコープ外へ出るため）なので外部セッションで実装した。
+
       **(1) 採用時に implementation scope を明示できない** — description は ledger 項目の本文全文に
       なるため、複数サブ項目を含む項目では対象外まで実装対象と解釈される。E2E 初回で実際に
       `allowedPaths` 外を変更し File Change Guard に停止させられた（安全機構は正しく作動）。

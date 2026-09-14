@@ -50,6 +50,11 @@ const AdoptRoadmapItemBody = z.object({
   roadmapId: z.string().min(1),
   allowedPaths: z.array(z.string().min(1)).min(1),
   acceptanceCriteria: z.array(z.string().min(1)).min(1),
+  /**
+   * 今回実装する範囲。**任意**（未指定なら従来どおりの description になる）。
+   * 複数サブ項目を含む ledger 項目で、対象サブ項目だけを Implementer へ伝えるために使う。
+   */
+  implementationScope: z.string().min(1).optional(),
 }).strict()
 export async function projectRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
@@ -113,6 +118,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       roadmapId: parsed.data.roadmapId,
       allowedPaths: parsed.data.allowedPaths,
       acceptanceCriteria: parsed.data.acceptanceCriteria,
+      ...(parsed.data.implementationScope !== undefined
+        ? { implementationScope: parsed.data.implementationScope }
+        : {}),
     })
 
     if (!result.ok) {

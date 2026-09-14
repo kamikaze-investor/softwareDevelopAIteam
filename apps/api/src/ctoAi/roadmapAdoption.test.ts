@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { adoptRoadmapItem, extractItemDescription } from './roadmapAdoption'
+import { adoptRoadmapItem, buildAdoptedDescription, extractItemDescription } from './roadmapAdoption'
 
 const LEDGER = [
   '# Roadmap',
@@ -251,5 +251,63 @@ describe('extractItemDescription', () => {
     expect(description).toContain('最初の項目')
     expect(description).toContain('詳細な本文がここに続く')
     expect(description).not.toContain('進行中の項目')
+  })
+})
+
+/**
+ * implementation scope（`roadmap-adoption-followups` サブ項目(1)）。
+ *
+ * production で2回踏んだ欠陥への回帰テスト: description が ledger 本文全文になるため、
+ * 複数サブ項目を含む項目では対象外のサブ項目まで実装され、File Change Guard が停止させていた。
+ */
+describe('adoptRoadmapItem — 今回実装する範囲の明示', () => {
+  it('implementationScope を指定すると description の先頭に載り、ledger 本文もその後に残る', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(
+      storage,
+      {
+        projectId,
+        roadmapId: 'first-item',
+        ...SPEC,
+        implementationScope: 'サブ項目(1) のみ。(2) は対象外',
+      },
+      deps(),
+    )
+
+    expect(result.ok).toBe(true)
+    const task = storage.tasks.findById((result as { taskId: string }).taskId)!
+    const scopeIndex = task.description.indexOf('今回実装する範囲')
+    const bodyIndex = task.description.indexOf('詳細な本文がここに続く')
+
+    expect(scopeIndex).toBeGreaterThanOrEqual(0)
+    expect(task.description).toContain('サブ項目(1) のみ。(2) は対象外')
+    // ledger 本文は削らない。scope はその**前**に出る
+    expect(bodyIndex).toBeGreaterThan(scopeIndex)
+    expect(task.description).toContain('上記以外は対象外である')
+  })
+
+  it('implementationScope 未指定なら従来どおり ledger 本文だけになる（後方互換）', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+
+    expect(result.ok).toBe(true)
+    const task = storage.tasks.findById((result as { taskId: string }).taskId)!
+    expect(task.description).not.toContain('今回実装する範囲')
+    expect(task.description).toContain('詳細な本文がここに続く')
+  })
+
+  it('空文字・空白のみの scope は指定なしと同じに扱う（見出しだけの無意味な上書きを作らない）', () => {
+    expect(buildAdoptedDescription('本文', undefined)).toBe('本文')
+    expect(buildAdoptedDescription('本文', '')).toBe('本文')
+    expect(buildAdoptedDescription('本文', '   \n  ')).toBe('本文')
+  })
+
+  it('ledger 本文そのものは書き換えない（採用は ledger へ構造を持ち込まない）', () => {
+    const body = '1. [ ] **項目** — 本文\n   続き'
+    const built = buildAdoptedDescription(body, 'ここだけ')
+
+    expect(built.endsWith(body)).toBe(true)
   })
 })
