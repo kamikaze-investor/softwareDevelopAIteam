@@ -6026,8 +6026,99 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 - 将来着手する際も、**まず隔離環境でPoCしてから統合する**
 - 外部サービス追加・課金・認証・本番公開に該当する判断はYellow Zone（CEO承認必須）
 
-<!-- roadmap:id=mandatory-gate-policy state=planned -->
-0. [ ] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
+<!-- roadmap:id=mandatory-gate-policy state=in_progress -->
+0. [~] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
+      **【2026-09-14 進捗: Policy Engine と enforcement seam を実装。残りは PL ループからの配線】**
+      `resolvePlActionPolicy()`（`packages/shared/src/plActionPolicy.ts`）と
+`authorizePlAction()` / `previewPlActionPolicy()`（`apps/api/src/pl/actionGate.ts`）を追加した。
+      **新しい Gate 本体・新しい Review 工程・新しいテーブルは作っていない**（記録は既存 `audit_log`）。
+
+      実装した不変条件（テストで固定）:
+      - `plRiskOpinion` は `requiredGates` の算出に**一切使わない**（記録のみ）。
+        全 action kind について、LOW 申告でも CRITICAL 申告でも requiredGates が同一になることを検査している
+      - `plProposedGates` は **union にしか効かない**（増やせるが減らせない）。
+        解決できない Gate 名は無視するだけで、減らす方向には働かない
+      - `change_safety_boundary` / `change_own_permission` / `override_gate_block` /
+        `skip_required_review` は常に `forbidden`。自己申告を足しても解けない
+      - **未知の action kind は素通しではなく forbidden**（語彙を1つ増やすだけで Gate を回避できない）
+      - Independent Review の独立性条件は PL より上位。同一 vendor になる provider 切替と、
+        vendor を特定できない provider への切替は `forbidden`（`reviewSeparation` を再利用）
+      - BLOCK 時に PL が取れるのは fix / re-review / 代替案 / CEO Escalation の4つのみ。
+        **override 経路は型としても存在しない**
+      - 変更ファイルがあるときは既存 `runRiskReview()` と `runMechanicalGate()` へそのまま通し、
+        HIGH/CRITICAL で independent_review、CRITICAL と Mechanical Gate hit で ceo_approval まで上げる
+
+      **【独立レビュー（OpenAI / Codex, 2026-09-14）の指摘と、それを受けた修正】**
+      初版は「判定結果オブジェクト」と「充足済み Gate の文字列配列」を引数で受け取っていた。
+      PL ループは外部プロセス（LLM + provider CLI）であり、そのどちらも PL が作れる。
+      **Policy Engine を置いても、seam が PL の作った値を信じるなら境界は存在しない**という
+      指摘は正しく、以下を修正した:
+      - 許可経路は**提案から判定を作り直す**。判定オブジェクトを
+        差し込む引数を廃止した（`recomputeDecision()` が runner の自己申告を採用しないのと同じ形）
+      - 充足の根拠は **DB の実レコードで検証する**。渡せるのは「どのレコードか」だけで、
+        Gate 名の文字列を渡せば通る経路を無くした。Design Review evidence は `ALIGNED` のみ、
+        Independent Review は `independentReviewRequired` かつ verdict が `approved` のときのみ、
+        Approval Request は `APPROVED` かつ未失効のみ、CEO Approval は `approved` のみを充足とする
+      - **検証手段の無い Gate は充足できない**（fail-closed）。`strategic_alignment_review` と
+        `safety_review` は参照できる永続レコードが無いため、それを要求する操作
+        （`clear_workspace_quarantine` / `rollback_commit` / `adopt_roadmap_item`）は
+        配線が入るまで PL から実行できない。これは欠陥ではなく意図した fail-closed である
+      - `changedFiles` が空の変更操作は `forbidden`。申告を空にするだけで file 由来の Gate を
+        全て外せる穴を塞いだ
+      - `resume_task` の必要 Gate に `design_review` を追加（理由文と Gate 一覧が不一致だった）
+
+      **【独立レビュー 2巡目（OpenAI / Codex, 2026-09-14）: changes_requested → 修正済み】**
+      1巡目の修正でも「根拠が対象へ束縛されていない」「認可と検証の間に隙間がある」という
+      指摘が残り、以下を修正した:
+      - **根拠を操作対象へ束縛する。** Task A の ALIGNED evidence で Task B の resume を
+        通せない。`job` 対象では申告された `taskId` が本当にその Job のものかを DB で照合する。
+        操作種別ごとに要求する対象種別（task / job / project / system）も固定した
+      - **古い ALIGNED の持ち出しを禁止。** Design Review evidence はその Task の最新1件のみ有効
+      - **認可と充足検証を1つの呼び出しに閉じた。** `assertPlActionExecutable()` を廃止し、
+        許可を得る経路は `authorizePlAction()` だけにした。「認可した提案」と「検証した提案」が
+        ズレる隙間を無くすため。見るだけの `previewPlActionPolicy()` は記録も実行権も持たない
+      - **時刻を呼び出し側から受け取らない。** 期限判定を呼び出し側の時計に依存させない。
+        壊れた期限値（`NaN`）を「未失効」として通さない
+      - **CEO Approval に scope 束縛を追加。** 操作種別ごとに要求する `ApprovalType` を固定し、
+        用途の違う承認を流用できないようにした
+
+      **【独立レビュー 3巡目（OpenAI / Codex, 2026-09-14）: changes_requested → 修正済み】**
+      fail-open は見つからなかった一方、対象種別を固定したことで**永久に充足不能な操作**が
+      生まれていた（安全側だが「根拠を積めば通るはず」という誤解を招く）。修正:
+      - `adopt_roadmap_item`（project 対象）は **roadmap-kind の Design Review evidence**
+        （`subjectId` が projectId）で束縛できるようにした。Task 対象は従来どおり task-kind
+      - `deploy_production`（system 対象）は Task/Project スコープの Review 根拠を
+        構造的に結び付けられない。**充足不能であることを `unbindableGates()` が明示する**
+        （missing に紛れ込ませない）。deploy スコープの Review 根拠の用意は配線側の責務
+
+      **【独立レビュー 4巡目（OpenAI / Codex, 2026-09-14）: changes_requested → 修正済み】**
+      Task スコープの照合が `taskId` 一致だけで、`reviewKind` を見ていなかった。
+      `taskId` を持つ roadmap-kind の record が Task 単位の Gate を満たし得たため、
+      kind も明示的に照合するようにし、回帰テストで固定した。
+
+      **【独立レビュー 5巡目（OpenAI / Codex, 2026-09-14）: approved】**
+      「fix → re-review」を Gate 結果として扱い、approved になるまで merge しなかった。
+      provider 分離: 実装は Anthropic / Claude、Independent Review は OpenAI / Codex。
+
+      **指摘のうち、ここでは直さず `vps-pl-execution-loop` の受入条件へ回したもの**:
+      - `changedFiles` も `providerChange` も PL の申告値であり、**実差分・実構成との束縛は
+        この層では行えない**。権威ある判定は既存の File Change Guard と Job の `gate/check` が行う。
+        配線時に「申告ではなく実際の対象」を渡すこと
+      - `retry_job` / `resume_task` は対象 Job の分類を引き継いでいない。配線時に
+        対象 Job の risk / production 影響を継承させること
+      - `allowedResponsesWhenBlocked` は情報であって強制ではない。BLOCK 後の再提案を
+        別種の action で回避できないようにするのは配線側の責務
+      - 実行者の Role・Production 操作権限はこの層では表現していない
+      - 許可した提案と、**実際に実行される操作**が一致すること。この層は「この提案は通る」までしか
+        言えない。executor を提案から構造的に dispatch するのは配線側の責務
+      - CEO Approval の Project スコープ束縛。`approvals.findById()` が `projectId` を返さないため、
+        現状は Approval の `type` による束縛までしかできない（`findById` の additive 拡張が要る）
+
+      **残っている作業（本項目は完了にしない）**: PL 実行ループからの配線。
+      `vps-pl-execution-loop` の受入条件に「PL の全 write 操作が `authorizePlAction()` を通ること」
+      「充足の根拠は PL 出力ではなく DB の実レコードであること」「executor は許可した提案から
+      構造的に dispatch すること」を含める。
+
       **CEO 確定の不変条件（2026-09-14）**。PL の思考・原因分析・方針判断は制限しない。
       安全性は「PL が判断できないようにする」ことではなく、**PL が決めた変更・操作を必ず既存 Gate へ
       通す**ことで担保する。

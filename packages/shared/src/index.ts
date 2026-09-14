@@ -61,4 +61,18 @@ export {
   resolveReviewVendor,
 } from './reviewSeparation'
 export * from './roadmapTopology'
+export {
+  PL_ACTION_KINDS,
+  PL_ACTION_POLICY_VERSION,
+  PL_BLOCKED_RESPONSES,
+  resolvePlActionPolicy,
+} from './plActionPolicy'
+export type {
+  PlActionDisposition,
+  PlActionKind,
+  PlActionPolicyDecision,
+  PlActionProposal,
+  PlBlockedResponse,
+  RequiredGate,
+} from './plActionPolicy'
 export type { ReviewVendor } from './reviewSeparation'
