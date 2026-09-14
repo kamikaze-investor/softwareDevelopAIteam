@@ -6732,9 +6732,19 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **Explainer との関係**: 回答文の平易化は `failure-explanation-pregeneration`（Explainer 責務）
       が担う。本項目は**事実の取得と、既存の安全な操作の呼び出し**に徹する。
 
-<!-- roadmap:id=failed-job-produces-no-attention state=planned -->
-3. [ ] **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない** —
+<!-- roadmap:id=failed-job-produces-no-attention state=done -->
+3. [x] **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない** —
       2026-09-15登録（移管直後の実測）。
+
+      **【2026-09-15 実装済み】** 未完了 Task に **動かせる Job（queued / running / blocked）が1つも無く、
+      quarantine でない failed Job が残っている**場合だけ `job_failed` として attention に出す。
+      done な Task の failed、後続 Job がある failed、quarantine 済みの failed は**出さない**（履歴は totals に残る）。
+      「最新 Job が failed か」を createdAt 順で判定する案は、同一ミリ秒の Job で順序が曖昧になり
+      実際に回帰テストが落ちたため採らなかった。
+      PL 側は本 kind を actionable に含める。**executor はまだ無い**ので、PL は Diagnose して操作を
+      提案するが Gate（根拠不足）で止まり、試行上限で CEO へ Escalation する。
+      止まったことが人へ確実に伝わる状態までが本項目の範囲であり、
+      **PL に復旧操作そのものを許すかは権限の問題**として `pl-autonomous-roadmap-adoption` と同様に別途扱う。
 
       **実測**: VPS へ移管した直後、VPS 自身が採用済み Task の implement Job を実行し、
       provider（`claude_code`）が timeout して Job は `failed`（`{"kind":"provider_timeout",

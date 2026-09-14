@@ -134,6 +134,90 @@ describe('buildSystemState — 横断状態の読み取り', () => {
     expect(state.totals.quarantinedJobs).toBe(1)
   })
 
+  it('未完了 Task の最新 Job が failed なら attention に出す（いま止まっているもの）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.jobs.update(job.id, { stderr: 'provider timed out' })
+
+    const item = buildSystemState(storage, { now }).attention.find((a) => a.kind === 'job_failed')
+
+    expect(item).toBeDefined()
+    expect(item?.jobId).toBe(job.id)
+    expect(item?.detail).toContain('provider timed out')
+  })
+
+  it('done な Task の failed Job は出さない（履歴として残すだけ）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.tasks.update(task.id, { status: 'done', roadmapActive: false })
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'job_failed')).toBe(false)
+    expect(state.totals.jobs.failed).toBe(1)
+  })
+
+  it('動かせる Job が残っていれば failed は出さない（既に引き継がれている）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    // 後続として作られた Job（これが動く限り、止まってはいない）
+    storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+
+    expect(buildSystemState(storage, { now }).attention.some((a) => a.kind === 'job_failed')).toBe(false)
+  })
+
+  it('quarantine された failed は job_failed として二重に出さない', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.jobs.update(job.id, {
+      failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
+    })
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'job_failed')).toBe(false)
+    expect(state.attention.some((a) => a.kind === 'workspace_quarantined')).toBe(true)
+  })
+
   it('長時間 running の Job を attention に出す（閾値未満は出さない）', () => {
     const { storage, projectId } = seed()
     const task = addTask(storage, projectId, { status: 'in_progress' })

@@ -94,6 +94,42 @@ describe('runPlTick — Observe', () => {
   })
 })
 
+describe('runPlTick — 停止した failed Job', () => {
+  it('停止した failed Job を PL が拾い、Gate に止められた上で最終的に Escalation する', async () => {
+    // executor が無いので「実行できない」が、**黙って無視せず人へ伝える**ことを固定する。
+    const { storage } = seed()
+    const task = storage.tasks.findByProjectId(storage.projects.findAll()[0]!.id)[0]!
+    storage.jobs.create({
+      taskId: task.id,
+      projectId: task.projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    const escalations: string[] = []
+    const d = deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: '再開したい', riskLevel: 'LOW' }),
+      escalate: async (p) => { escalations.push(p.title) },
+    })
+
+    // 1〜2回目: Gate が根拠不足で止める（workspace を書き換える操作なので当然）
+    for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {
+      resetPlLoopInFlightForTest()
+      const r = await runPlTick(storage, d)
+      expect(r.status, `attempt ${i + 1}`).toBe('blocked')
+      expect(r.target?.kind).toBe('job_failed')
+    }
+
+    // 3回目: 試行上限に達したので CEO へ上げる
+    resetPlLoopInFlightForTest()
+    const escalated = await runPlTick(storage, d)
+
+    expect(escalated.status).toBe('escalated')
+    expect(escalations.length).toBe(1)
+  })
+})
+
 describe('runPlTick — Decide / Gate', () => {
   it('PL が未知の action を出しても実行せず blocked になる（自然言語を信用しない）', async () => {
     const { storage } = seedIdleDesignReview()

@@ -63,6 +63,12 @@ const AUDIT_ENTITY_TYPE = 'pl_loop_target'
 const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   'design_review_idle',
   'design_review_failed',
+  // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
+  // workspace を書き換えるため Gate の根拠が要り、そこで止まる。試行上限に達すると CEO へ Escalation
+  // される。**それが今の正しい振る舞い**である（止まったことを人へ確実に伝える）。
+  // 「PL に何を実行させてよいか」は権限の問題であり、`pl-autonomous-roadmap-adoption` と同じく
+  // 別途 CEO 判断で決める。ここで黙って実行可能にしない。
+  'job_failed',
 ]
 
 /**
@@ -72,6 +78,12 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
 const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   'design_review_idle',
   'design_review_failed',
+  // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
+  // workspace を書き換えるため Gate の根拠が要り、そこで止まる。試行上限に達すると CEO へ Escalation
+  // される。**それが今の正しい振る舞い**である（止まったことを人へ確実に伝える）。
+  // 「PL に何を実行させてよいか」は権限の問題であり、`pl-autonomous-roadmap-adoption` と同じく
+  // 別途 CEO 判断で決める。ここで黙って実行可能にしない。
+  'job_failed',
 ]
 
 export type PlTickStatus =

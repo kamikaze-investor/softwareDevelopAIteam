@@ -23,6 +23,8 @@ export const DEFAULT_STALL_HINT_MS = 5 * 60 * 1000
 
 export type AttentionKind =
   | 'job_blocked'
+  /** 未完了 Task の最新 Job が failed で、後続が無い＝いま止まっている。履歴上の失敗は含めない。 */
+  | 'job_failed'
   | 'workspace_quarantined'
   | 'approval_waiting'
   | 'design_review_failed'
@@ -240,6 +242,35 @@ export function buildSystemState(
 
     for (const task of tasks) {
       const jobs = jobsByTask.get(task.id) ?? []
+
+      // **いま Task を止めている failed Job だけを attention にする。**
+      // `failed` を一律に出すと、過去に失敗して後続 Job で解決済みのものまで永久に鳴り続ける。
+      // 出すのは次をすべて満たすときだけ:
+      //   1. Task が未完了（done なら履歴であり、誰も動かさない）
+      //   2. その Task の**最新 Job** が failed（後続 Job があれば既に引き継がれている）
+      //   3. quarantine ではない（quarantine は専用の attention があり、二重に出さない）
+      // 実測（2026-09-15 production）: implement Job が provider timeout で failed になると、
+      // Task は止まっているのに `task_ready_without_job`（Job が無い条件）にも該当せず、
+      // attention が一切出なかった。**PL から見えないまま静かに止まる**状態だった。
+      // 「最新の Job が failed か」を createdAt の順序で決めない。同一ミリ秒の Job が並ぶと
+      // 順序が曖昧になり、判定が揺れる（実際にこの書き方で回帰テストが落ちた）。
+      // 代わりに **「動かせる Job が1つも無いか」** を見る。queued / running は Worker が進め、
+      // blocked は resume の対象で `job_blocked` が別に出る。どれも無ければ誰も進めない。
+      const hasMovableJob = jobs.some((job) => (
+        job.status === 'queued' || job.status === 'running' || job.status === 'blocked'
+      ))
+      const stallingFailure = jobs.find((job) => job.status === 'failed' && !isQuarantined(job))
+      if (task.status !== 'done' && !hasMovableJob && stallingFailure !== undefined) {
+        attention.push({
+          kind: 'job_failed',
+          projectId: project.id,
+          projectName: project.name,
+          taskId: task.id,
+          jobId: stallingFailure.id,
+          detail: tail(stallingFailure.stderr, 200) ?? 'job failed and nothing is left to move the task',
+          stuckForMs: elapsedMs(stallingFailure.completedAt ?? stallingFailure.createdAt, nowMs),
+        })
+      }
 
       for (const job of jobs) {
         if (isQuarantined(job)) {
