@@ -16,8 +16,12 @@ describe('checkStall', () => {
 
   it('ちょうど閾値は isStalled=false（境界値: >で判定）', () => {
     const threshold = getStallThreshold('git_commit') // 60000
-    const startedAt = new Date(Date.now() - threshold).toISOString()
-    const result = checkStall('git_commit', startedAt)
+    // nowMs を注入して境界値を決定論的に固定する。`Date.now()` を2回呼ぶ書き方だと、
+    // startedAt の生成と checkStall の内部時刻取得の間に経過した分だけ elapsed が
+    // threshold を超え、`>` 判定で isStalled=true になって落ちる（CI で実際に発生）。
+    const base = 1_700_000_000_000
+    const startedAt = new Date(base).toISOString()
+    const result = checkStall('git_commit', startedAt, base + threshold)
     // stallDurationMs == threshold → false (> でなく ==)
     expect(result.isStalled).toBe(false)
   })
