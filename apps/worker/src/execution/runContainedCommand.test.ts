@@ -7,8 +7,9 @@
  * Windows / Linux どちらでも決定的に検証する。
  */
 
-import { existsSync } from 'node:fs'
-import { describe, expect, it } from 'vitest'
+import { existsSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { afterAll, describe, expect, it } from 'vitest'
 import {
   buildCgroupName,
   isContainmentAvailable,
@@ -16,6 +17,7 @@ import {
   resolveWorkerCgroup,
   runContainedCommand,
   runContainedOrThrow,
+  isContainmentInfrastructureError,
   removeCgroupWithRetry,
   CLEANUP_RETRY_DELAYS_MS,
   DEFAULT_DRAIN_MS,
@@ -24,6 +26,46 @@ import {
 
 const containmentAvailable = isContainmentAvailable()
 const describeLinux = containmentAvailable ? describe : describe.skip
+
+/**
+ * テストが**意図的に残した** cgroup を後片付けする。
+ *
+ * `drain_timeout` を再現するテストは `drainMs: 0` で生存子孫を残すため、production と同じく
+ * `rmdir` へ到達せず cgroup が残る。production ではそれは Job 自身の cgroup なので無害だが、
+ * **AIteamOS 自身を開発する場合（Tier A 自己開発）はテストが Job の cgroup の内側で走る**ため、
+ * 残骸が子 cgroup になり、親 Job の `rmdir` が ENOTEMPTY で失敗して Job が quarantine へ落ちる。
+ * 2026-09-14 に production で実際に発生した（Job `cd2e90b9`）。
+ * ledger: `containment-cleanup-ebusy-quarantine`。
+ *
+ * 生存子孫がいる可能性があるので、まず `cgroup.kill` してから `populated 0` を待って削除する。
+ * 失敗しても**テストは落とさない**（後片付けであって検証対象ではない）。
+ */
+async function removeLeftoverCgroup(cgroupPath: string | undefined): Promise<void> {
+  if (cgroupPath === undefined || !existsSync(cgroupPath)) return
+  try {
+    writeFileSync(path.join(cgroupPath, 'cgroup.kill'), '1')
+  } catch {
+    // kill できなくても drain 待ちへ進む
+  }
+  for (let i = 0; i < 100; i += 1) {
+    if (!existsSync(cgroupPath)) return
+    try {
+      if (readFileSync(path.join(cgroupPath, 'cgroup.events'), 'utf-8').includes('populated 0')) {
+        rmdirSync(cgroupPath)
+        return
+      }
+    } catch {
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
+
+/** 念のための保険: このファイルが作った残骸を最後にまとめて掃除する。 */
+const createdCgroupPaths = new Set<string>()
+afterAll(async () => {
+  for (const cgroupPath of createdCgroupPaths) await removeLeftoverCgroup(cgroupPath)
+})
 
 describe('isContainmentSafe', () => {
   it('clean と killed のみを安全と判定する', () => {
@@ -274,9 +316,15 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
     expect(result.outcome).toBe('drain_timeout')
     expect(isContainmentSafe(result.outcome)).toBe(false)
     expect(result.detail).toContain('still populated')
+
+    // drain_timeout は意図的に cgroup を残すので、テスト側で後片付けする（上記 helper 参照）。
+    if (result.cgroupPath !== undefined) createdCgroupPaths.add(result.cgroupPath)
+    await removeLeftoverCgroup(result.cgroupPath)
+    expect(existsSync(result.cgroupPath!)).toBe(false)
   })
 
   it('drain_timeout は runContainedOrThrow で例外になる（呼び出し元が握り潰せない）', async () => {
+    let thrown: unknown
     await expect(runContainedOrThrow({
       jobId: 'job-drain-throw',
       attemptId: String(Date.now()),
@@ -285,7 +333,13 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
       env: process.env,
       timeoutMs: 30_000,
       drainMs: 0,
-    })).rejects.toThrow(/drain_timeout/)
+    }).catch((err: unknown) => { thrown = err; throw err })).rejects.toThrow(/drain_timeout/)
+
+    // 例外経路でも cgroup は残るので同様に後片付けする。
+    const cgroupPath = isContainmentInfrastructureError(thrown) ? thrown.result.cgroupPath : undefined
+    if (cgroupPath !== undefined) createdCgroupPaths.add(cgroupPath)
+    await removeLeftoverCgroup(cgroupPath)
+    expect(cgroupPath === undefined || !existsSync(cgroupPath)).toBe(true)
   })
 
   it("既に abort 済みの signal でも bounded に settle する（listener が発火しないケース）", async () => {
