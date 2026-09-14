@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, vi, afterAll } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
@@ -7,6 +7,9 @@ import type { IStorage } from '../storage/interface'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
   DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES,
+  DESIGN_REVIEW_RUNNER_TIMEOUT_MS,
+  DESIGN_REVIEW_STDERR_TAIL_CHARS,
+  appendRunnerStderr,
   buildRunnerEnv,
   createAndExecuteDesignReview,
   createAndExecuteRoadmapReview,
@@ -839,3 +842,84 @@ describe('executeRunner stderr cap enforcement', () => {
     }
   })
 })
+
+/**
+ * `design-review-runner-production-timeout` の Root Cause 調査（2026-09-14 production 実測）で
+ * 判明した3点への回帰テスト。
+ *
+ * 1. timeout 時に stderr を捨てていたため、原因（provider の transient 失敗）が DB に残らなかった
+ * 2. timeout の kill が直接の子にしか届かず、孫プロセスが孤児化していた
+ * 3. runner 内部の retry 予算（待機だけで 40 秒）に対して caller の上限が 120 秒と短すぎた
+ */
+describe('runner 失敗の診断可能性と終了処理', () => {
+  it('timeout の理由に runner stderr の末尾が残る（原因を DB から追える）', () => {
+    const diag = '[geminiRouter] attempt failed: provider=gemini_api failureClass=transient httpStatus=503'
+    const merged = appendRunnerStderr('runner timed out after 300000ms', `noise\n${diag}`)
+
+    expect(merged).toContain('runner timed out after 300000ms')
+    expect(merged).toContain(diag)
+  })
+
+  it('stderr が無ければ既存の理由文をそのまま使う', () => {
+    expect(appendRunnerStderr('runner failed', undefined)).toBe('runner failed')
+    expect(appendRunnerStderr('runner failed', '   ')).toBe('runner failed')
+  })
+
+  it('stderr は末尾だけを上限つきで残す（error 列を診断ログにしない）', () => {
+    const long = `${'x'.repeat(5000)}THE-LAST-LINE`
+    const merged = appendRunnerStderr('runner failed', long)
+
+    expect(merged).toContain('THE-LAST-LINE')
+    expect(merged.length).toBeLessThan(DESIGN_REVIEW_STDERR_TAIL_CHARS + 200)
+  })
+
+  it('runner の上限は runner 内部の transient retry 予算（待機 40 秒）を収容する', () => {
+    // geminiRouter の TRANSIENT_RETRY_DELAYS_MS = [10s, 30s] を API 経路・CLI 経路で個別に消費する。
+    // 120 秒では「レビュー自体は正常でも provider が不安定なら超過する」状態だった。
+    expect(DESIGN_REVIEW_RUNNER_TIMEOUT_MS).toBeGreaterThan(40_000 * 2)
+  })
+
+  // プロセスグループ kill は POSIX の負 PID に依存する。production も CI も Linux。
+  // Windows には同等物が無く killTree は直接の子への kill へフォールバックするため、
+  // ここで検証しても意味が無い（誤って緑になる）ので明示的に skip する。
+  const itPosix = process.platform === 'win32' ? it.skip : it
+
+  itPosix('timeout 時は子だけでなくプロセスグループごと落とす（孫を孤児にしない）', async () => {
+    const marker = join(mkdtempSync(join(tmpdir(), 'runner-kill-')), 'grandchild-alive')
+    const grandchild =
+      `setInterval(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, String(Date.now())), 50)`
+    const script =
+      `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}], { stdio: 'ignore' });`
+      + `setTimeout(() => {}, 60000);`
+
+    const execution = await executeRunner(
+      {
+        runnerCommand: process.execPath,
+        runnerArgs: ['-e', script],
+        homeDirectory: tmpdir(),
+        workingDir: tmpdir(),
+        timeoutMs: 2_000,
+      },
+      '{}',
+    )
+
+    expect(execution.timedOut).toBe(true)
+
+    // **まず孫が実在したことを確かめる。** これが無いと「何も起きていない」を合格にしてしまう。
+    await new Promise((resolve) => setTimeout(resolve, 1_500))
+    const first = readFileIfExists(marker)
+    expect(first, 'grandchild never ran; the assertion below would be vacuous').toBeDefined()
+
+    // 回収できていれば更新が止まる。孤児化していれば 50ms ごとに書き換わり続ける。
+    await new Promise((resolve) => setTimeout(resolve, 1_000))
+    expect(readFileIfExists(marker)).toBe(first)
+  }, 20_000)
+})
+
+function readFileIfExists(p: string): string | undefined {
+  try {
+    return readFileSync(p, 'utf-8')
+  } catch {
+    return undefined
+  }
+}
