@@ -51,14 +51,43 @@ CEO の判断待ちの間ずっと tick ごとに Diagnose（provider CLI、実�
 つまり **ローカル PC 無しで VPS 上の PL が回り続け、既に CEO へ上げた案件については
 何もしない**（provider も消費しない）ことを実測した。
 
+## Phase 3: 実復旧の Operational E2E（VPS 単独・無人）— 完走
+
+**安全なケースの作り方**: 障害を人工的に作らず、**既存の採用 API を同一スコープで呼び直した**
+（`POST /api/projects/:id/roadmap-adoptions` へ DB 上の現行 `allowedPaths` / `acceptanceCriteria` を
+そのまま渡す）。停止中 Task を進めるための正規操作であり、結果として新しい Design Review run が
+作られ、既知の 120s timeout により **requeue → idle**（`attempt_count=1/3`、残2）になった。
+以降は**手動 tick を使わず 60 秒 interval に任せた**。
+
+| 時刻 (UTC) | 監査 / 実測 |
+|---|---|
+| 09:52:59.054 | `pl_action_authorize / authorized` — `kind=rekick_design_review gates=none policy=pl-action-policy-v1` |
+| 09:52:59.058 | run `944ce2e0` が `queued → running`、`attempt_count` 1→2、`started_at` 設定（**実際に再実行された**） |
+| 09:55:04.078 | `pl_loop / acted` — `kind=rekick_design_review exec_ok=true verify=unchanged`（runner がまた 120s timeout → requeue） |
+| 09:55:50.112 | `pl_action_authorize / authorized` — `kind=escalate_to_ceo` |
+| 09:55:50.125 | `pl_loop / escalated` — 「2回 timeout で失敗しており systemic な問題。上位の介入が要る」 |
+
+- PL は attempt 上限（3）を待たず **2回目で自ら Escalation を選択**（run は残1で停止）
+- 既に escalate 済みの `design_review_failed` キーへは**重複通知なし**
+- Job は1件も作られず（`jobs created today: 0`）、`/workspace/target` は HEAD `5079a2f`・dirty 0・branch 不変
+- 検証用の使い捨て Project は archived 済み。running Project は本番の1件のみ
+
+**正常化はしていない。** 再実行そのものは成功したが、`design-review-runner-production-timeout`
+が未解決のため review はまた timeout した。**PL ループの欠陥ではなく、当該 Finding が実復旧の
+成立を塞いでいる。**
+
+（付随観測: paused な Project では `createInitialImplementWorkflow()` が
+`project is not running` で skip するため、使い捨ての paused Project では Design Review run を
+作れない。安全な検証ケースを作る際の制約として記録する。）
+
 ## 未実証（本項目を完了にしない理由）
 
-1. **Execute で実際の復旧操作（`rekick_design_review`）が走る経路は production 未実証**。
-   今回の対象は attempt を使い切っており、再kickは CEO 承認済み不変条件6で禁止されているため、
-   PL は正しく Escalation を選んだ。attempt が残った idle/failed な run が現れたときが実証機会になる。
-2. **Escalation の到達経路が未設定**。通知チャネルが無いため
-   `[Notifier] 通知チャネルが未設定です` としてジャーナルにしか出ない。
-   「PC を閉じても継続する」という目的に対しては、Escalation が CEO へ届く経路の設定が前提になる。
+1. **Escalation の到達経路が未設定**。`sendAlert()` は LINE（`LINE_CHANNEL_ACCESS_TOKEN` +
+   `LINE_USER_ID`）か Slack（`SLACK_WEBHOOK_URL`）が無いとコンソールへ落ちる。API・Worker とも
+   未設定であることを journal で確認済み。**新しい通知基盤は不要で既存 notifier の設定だけで足りる**が、
+   外部サービス選定・credential 取得・production env への書き込みは CEO 判断・CEO 操作である
+   （AI は `/srv/ai-team/env/*.env` を読み書きしない）。設定後はコード変更なしで次の Escalation が届く。
+2. **正常化を伴う実復旧は未達**。`design-review-runner-production-timeout` の解決が前提になる。
 3. 対象の attention 種別は `design_review_idle` / `design_review_failed` の2つだけである。
    他の停止形態（quarantine・blocked Job 等）に executor は無く、PL は放置する
    （既に `GET /api/state` に出ており、二重通知しない設計）。
