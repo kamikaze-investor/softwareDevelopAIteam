@@ -200,7 +200,9 @@ export function buildSystemState(
 
     let designReview: ProjectStateSummary['designReview']
     if (currentTask) {
-      const run = storage.designReviewRuns.findActiveByTaskId(currentTask.id)
+      // 終端した run も見る。failed で終わった review は findActiveByTaskId では観測できず、
+      // 停止理由（= なぜ Job が作られないか）が attention から落ちるため。
+      const run = storage.designReviewRuns.findLatestByTaskId(currentTask.id)
       if (run) {
         // `queued` のまま誰も実行していない run は、外部が気付くまで進まない。
         const idle = run.status === 'queued' && run.startedAt === undefined
