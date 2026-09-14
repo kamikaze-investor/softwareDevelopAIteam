@@ -2831,6 +2831,12 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 <!-- roadmap:id=deleg-001-watchdog-respawn state=planned -->
 0. [ ] **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**
+   **【2026-09-14 追記: CI でも flake するようになった】** 本テストは従来「Windows ローカル固有の
+   失敗」として MVP 完成記録に整理されていたが、**Ubuntu の GitHub Actions でも失敗を実測**した
+   （PR #173。docs のみの変更で、テスト内容に影響し得ない変更だった）。同日の他 PR では通っている
+   ため確定的な失敗ではなく flake である。**CI を不定期にブロックする**ため、本項目の優先度は
+   「非決定性を潰す」観点でも評価すること（完了条件に「繰り返し実行しても安定して通る」が既にある）。
+
    （2026-09-10登録。#110 Step 3（PR #128）のCI中に**Linux実測**したため、Windows固有ではなく
    **実運用上の既知欠陥**として扱う）。**#128へは混ぜず独立Findingとする**（CEO判断）。
 
