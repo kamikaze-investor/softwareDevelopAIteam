@@ -231,12 +231,46 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
    * Design Review の再kick。`vps-pl-execution-loop` の production evidence
    * （timeout → requeue した run を誰も再開せず Task が止まった）で実際に必要だった操作である。
    * 表に無いと fail-closed で forbidden になり、**PL 基盤を作る動機になった復旧そのものが取れない**。
-   * 新しい判断を通すのではなく bounded retry を再実行するだけなので retry_job と同じ扱いにする。
-   * attempt 上限（`DESIGN_REVIEW_MAX_ATTEMPTS`）は既存 coordinator が持ち、ここでは緩めない。
+   *
+   * **up-front の Gate を課さない。** 理由は「軽い操作だから」ではなく、この操作が
+   * 次の3点をすべて満たすからである:
+   *   1. workspace を変更しない（ファイルにも commit にも触れない）
+   *   2. `claim()` が `DESIGN_REVIEW_MAX_ATTEMPTS` を強制するので**回数が有界**である
+   *   3. 出力の採否は `recomputeDecision()` が API 側で再計算し、ALIGNED のときだけ
+   *      evidence が登録される。つまり**この操作の結果は必ず既存 Design Review Gate を通る**
+   *
+   * ここで `approval_gate` を要求すると、seam の evidence モデル上「承認レコードが先に存在する
+   * 復旧しか実行できない」ことになり、system が自分で queue した review を再実行するだけの操作に
+   * CEO 承認を要求することになる（Design Philosophy 3「承認最小」に反する過剰安全策）。
+   *
+   * **下流が Gate されていることを理由に無 Gate にしてよいのはここまで**である。
+   * workspace を書き換える操作（`retry_job` / `resume_task` / `delegate_implementation` 等）は
+   * 上の 1 を満たさないので、同じ理屈を適用しないこと。
+   *
+   * ## CEO 判断（2026-09-14・承認済み）
+   *
+   * この操作は「Review を承認する操作」ではなく、**停止・停滞した同一 Design Review を、
+   * 既存の bounded retry 契約の範囲内でもう一度実行する操作**として扱う。
+   * 次を不変条件として固定する:
+   *
+   *   1. workspace を書き換えない
+   *   2. Review 結果を変更・上書きしない
+   *   3. Review Gate を skip しない
+   *   4. API 側の decision 再計算を必ず通す
+   *   5. `DESIGN_REVIEW_MAX_ATTEMPTS` 等の既存 attempt 上限を尊重する
+   *   6. attempt 上限到達後は再kickしない
+   *   7. **同一 Review の再実行以外へ権限を広げない**
+   *   8. Review が依然解決しない場合は Escalation へ進む
+   *   9. **PL 自身がこの境界を変更できない**
+   *
+   * **未知操作や近似した別 action へこの許可を流用しない。**
+   * 1〜8 の実装上の強制は `apps/api/src/pl/executionLoop.ts` にあり、同ファイルのテストで固定している。
    */
   rekick_design_review: {
-    gates: ['approval_gate'],
-    reason: 'a re-kicked design review re-enters the existing bounded review path before it may act',
+    gates: [],
+    reason:
+      'a re-kicked design review changes no workspace, is bounded by DESIGN_REVIEW_MAX_ATTEMPTS, ' +
+      'and its verdict is recomputed by the API before any evidence is registered',
   },
   /**
    * 停止した running Job の強制終端（`PATCH /api/jobs/:id/fail-if-running`）。
