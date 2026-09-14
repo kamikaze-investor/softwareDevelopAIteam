@@ -207,6 +207,42 @@ describe('runPlTick — Execute / Verify', () => {
     expect(result.verification).toBe('unchanged')
   })
 
+  it('再kickの対象は attention が指す Task の Review だけで、他 Task の Review へ広がらない', async () => {
+    // CEO 判断（2026-09-14）の不変条件 7:「同一 Review の再実行以外へ権限を広げない」。
+    const { storage, taskId, runId } = seedIdleDesignReview()
+    // 同一 Project 内の別 Task（`ux_projects_single_running` があるので Project は増やさない）。
+    const otherTask = storage.tasks.create({
+      projectId: storage.tasks.findById(taskId)!.projectId,
+      title: 'other',
+      description: '',
+      status: 'pending',
+      assignee: 'developer_ai',
+      dependencies: [],
+      roadmapActive: true,
+      phase: 1,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const otherRun = storage.designReviewRuns.create({
+      taskId: otherTask.id,
+      taskTitle: 'other design',
+      designText: 'other',
+      designTextHash: 'hash-2',
+      changedFiles: ['docs/other.md'],
+    })
+    const touched: string[] = []
+
+    await runPlTick(
+      storage,
+      deps({ rekickDesignReview: async (_s, id) => { touched.push(id); return { status: 'evidence_registered' } } }),
+    )
+
+    expect(touched).toEqual([runId])
+    expect(touched).not.toContain(otherRun.id)
+    // 他 Task の run は queued のまま、attempt も増えていない
+    expect(storage.designReviewRuns.findById(otherRun.id)?.status).toBe('queued')
+    expect(storage.designReviewRuns.findById(otherRun.id)?.attemptCount).toBe(0)
+    expect(taskId).not.toBe(otherTask.id)
+  })
+
   it('attempt を使い切った run は盲目的に再kickせず、実行しない', async () => {
     const { storage, runId } = seedIdleDesignReview()
     // 3 attempt すべて消費した状態にする

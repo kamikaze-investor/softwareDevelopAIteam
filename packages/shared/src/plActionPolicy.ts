@@ -246,6 +246,25 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
    * **下流が Gate されていることを理由に無 Gate にしてよいのはここまで**である。
    * workspace を書き換える操作（`retry_job` / `resume_task` / `delegate_implementation` 等）は
    * 上の 1 を満たさないので、同じ理屈を適用しないこと。
+   *
+   * ## CEO 判断（2026-09-14・承認済み）
+   *
+   * この操作は「Review を承認する操作」ではなく、**停止・停滞した同一 Design Review を、
+   * 既存の bounded retry 契約の範囲内でもう一度実行する操作**として扱う。
+   * 次を不変条件として固定する:
+   *
+   *   1. workspace を書き換えない
+   *   2. Review 結果を変更・上書きしない
+   *   3. Review Gate を skip しない
+   *   4. API 側の decision 再計算を必ず通す
+   *   5. `DESIGN_REVIEW_MAX_ATTEMPTS` 等の既存 attempt 上限を尊重する
+   *   6. attempt 上限到達後は再kickしない
+   *   7. **同一 Review の再実行以外へ権限を広げない**
+   *   8. Review が依然解決しない場合は Escalation へ進む
+   *   9. **PL 自身がこの境界を変更できない**
+   *
+   * **未知操作や近似した別 action へこの許可を流用しない。**
+   * 1〜8 の実装上の強制は `apps/api/src/pl/executionLoop.ts` にあり、同ファイルのテストで固定している。
    */
   rekick_design_review: {
     gates: [],

@@ -1516,6 +1516,46 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **今回実装しないもの（明記）**: 本項目はFinding記録であり、PR-C（#98）のmergeとは分離する。
       新しいReviewer種別・新しいReview基盤・新しいmerge gate・base最新化専用gateは追加しない。
 
+<!-- roadmap:id=independent-review-verdict-instability state=planned -->
+13. [ ] **Safety / Authority 変更に対する Independent Review の判定が安定しない** — 2026-09-14登録
+      （CEO 指示により独立 Finding として記録）。**本項目は記録であり、今は実装しない。**
+
+      **上記 `meta-review-structured-output-robustness` とは向きが逆である。** あちらは
+      parse 失敗・phantom deletion による **false BLOCKED**（安全側へ倒れる誤り）を扱う。
+      本項目は **critical な Authority 指摘が再実行で消える**（危険側へ倒れうる誤り）を扱う。
+      同じ Meta Review 経路の改善であり、**新しい Reviewer・新しい Review 基盤・新しい merge gate は
+      追加しない**。実装時は当該項目と一緒に扱い、重複実装しない。
+
+      **実測（PR #181・2026-09-14）**:
+
+      | run | commit | 判定 | 指摘 |
+      |---|---|---|---|
+      | 1回目 | `8429d93` | **BLOCKED / critical** | 「`rekick_design_review` の up-front Gate 削除は**AI のコアな権限境界（Cage）の変更**にあたる。CEO の明示的承認を得るまでブロック」 |
+      | 2回目 | `50b9226` | **APPROVED / medium** | 「既存 Mandatory Gate Policy と安全原則を遵守しており、**Cage の弱体化は見られません**」。Gate 変更への言及自体が消えた |
+
+      2つの commit の差は **`.env.example` へ環境変数2件を追記しただけ**（1回目の medium 指摘への対応）で、
+      **Gate 変更の差分は一字も変わっていない**。それでも critical な Authority 指摘が消え、
+      要約は正反対の結論になった。
+
+      **なぜ重要か**: `AGENTS.md` 3-1 は「required checks PASS ＋ **独立レビュー PASS**」を
+      AI が merge してよい条件にしている。同じ権限境界変更に対する判定が実行ごとに反転するなら、
+      **この merge 条件は想定された強度を持たない**。とくに危険なのは、BLOCKED を受けた AI が
+      無関係な指摘を1つ直して再実行するだけで APPROVED を得られてしまう経路である
+      （今回は意図せずその経路を踏み、CEO へ明示的に判断を求めることで回避した）。
+
+      **今回の扱い（CEO 判断・2026-09-14）**: `rekick_design_review` の Gate 方針は
+      **CEO 判断としてその場で確定**した。したがって本 Finding を理由に #181 を無期限に止めない。
+      Safety / Authority 変更に対する判定安定性の改善が必要かは**別途評価する**。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - 判定のブレが provider の非決定性（temperature / model 版）か、prompt 側の入力差
+        （`.env.example` 追加で diff 構成が変わったこと）か、どちらに由来するか
+      - Safety / Authority に触れる差分だけを**決定的に**判定できるか
+        （例: `ALWAYS_FORBIDDEN_PATTERNS` / `ACTION_GATE_TABLE` / `guards/` の変更検出は
+        LLM ではなく機械的ルールで先に拾い、LLM の判定に依存させない）
+      - 既存の `reviewLoadClassifier` / `runMechanicalGate` が同じ役割を果たせないか
+        （**新しい分類器を作る前に既存の再利用を確認する**）
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
