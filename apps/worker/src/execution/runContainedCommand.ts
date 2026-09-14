@@ -16,7 +16,7 @@
  */
 
 import { spawn } from 'node:child_process'
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs'
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 /** cgroup v2 の標準マウントポイント */
@@ -578,18 +578,113 @@ async function terminateAndCleanup(
 
   const drainMs = Date.now() - started
 
-  try {
-    rmdirSync(cgroupPath)
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code
-    // ENOENT は「この試行の cgroup が `populated 0` になったことを確認済み」の場合のみ
-    // 冪等な成功として扱う（systemd による unit tree 掃除と競合し得るため）。
-    if (code !== 'ENOENT') {
-      return { outcome: 'cleanup_failed', killed, drainMs, detail: describeError(err) }
-    }
+  const removal = await removeCgroupWithRetry(cgroupPath)
+  if (!removal.ok) {
+    return { outcome: 'cleanup_failed', killed, drainMs, detail: removal.detail }
   }
 
   return { outcome: killed ? 'killed' : 'clean', killed, drainMs }
+}
+
+/**
+ * cleanup の `rmdir` 再試行の待機列（ms）。**必要最小限。無限 retry はしない。**
+ * 合計 260ms で、drain の既定上限（10秒）に対して十分小さい。
+ */
+export const CLEANUP_RETRY_DELAYS_MS: readonly number[] = [10, 50, 200]
+
+export interface RemoveCgroupDeps {
+  rmdir: (cgroupPath: string) => void
+  readPopulated: (cgroupPath: string) => boolean
+  listChildCgroups: (cgroupPath: string) => string[]
+  sleep: (ms: number) => Promise<void>
+}
+
+const defaultRemoveCgroupDeps: RemoveCgroupDeps = {
+  rmdir: rmdirSync,
+  readPopulated,
+  listChildCgroups: (cgroupPath) => {
+    try {
+      return readdirSync(cgroupPath, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+    } catch {
+      return []
+    }
+  },
+  sleep,
+}
+
+/**
+ * `populated 0` を確認した後の cgroup を削除する。EBUSY / ENOTEMPTY に限り短く再試行する。
+ *
+ * **なぜ再試行するか**: `populated` が 0 になるのは最後のタスクが終了した時点だが、
+ * カーネル側の解体が完了するまでの僅かな窓で `rmdir` が EBUSY を返しうる。
+ * 2026-09-14 に production で実際に発生した（Job `cf259578`）。そのとき
+ * `cgroup.procs` は 0 行、`cgroup.events` は `populated 0`、つまり**プロセスは1つも
+ * 残っていないのに `rmdir` だけが失敗**し、Job が `cleanup_failed` → quarantine へ落ちた。
+ * 実装は正常完了していたのに後片付けの一過性失敗だけで Task が復旧不能になった。
+ * ledger: `containment-cleanup-ebusy-quarantine`。
+ *
+ * **EBUSY を握り潰してはいない。** 安全性は次で担保する:
+ *   - 再試行の前に毎回 `populated` を**読み直す**。1 に戻っていたら（＝プロセスが現れた）
+ *     再試行せず即座に失敗させる。これは一過性の解体遅延ではなく本物の封じ込め問題である
+ *   - 再試行するのは EBUSY / ENOTEMPTY のみ。EPERM 等は一過性ではないので即座に失敗させる
+ *   - 再試行回数・待機は固定で有限。尽きたら従来どおり `cleanup_failed` を返す（挙動不変）
+ *   - 失敗時は診断情報（最終 populated 値・残っている子 cgroup 名）を detail へ載せる。
+ *     子 cgroup が原因の ENOTEMPTY を、一過性 EBUSY と取り違えないため
+ */
+export async function removeCgroupWithRetry(
+  cgroupPath: string,
+  deps: RemoveCgroupDeps = defaultRemoveCgroupDeps,
+): Promise<{ ok: true } | { ok: false; detail: string }> {
+  let lastError: unknown
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      deps.rmdir(cgroupPath)
+      return { ok: true }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      // ENOENT は「この試行の cgroup が `populated 0` になったことを確認済み」の場合のみ
+      // 冪等な成功として扱う（systemd による unit tree 掃除と競合し得るため）。
+      if (code === 'ENOENT') return { ok: true }
+      if (code !== 'EBUSY' && code !== 'ENOTEMPTY') {
+        return { ok: false, detail: describeError(err) }
+      }
+      lastError = err
+    }
+
+    if (attempt >= CLEANUP_RETRY_DELAYS_MS.length) break
+
+    // short grace -> 状態再確認 -> 再試行。
+    await deps.sleep(CLEANUP_RETRY_DELAYS_MS[attempt])
+
+    let stillEmpty: boolean
+    try {
+      stillEmpty = !deps.readPopulated(cgroupPath)
+    } catch (err) {
+      return {
+        ok: false,
+        detail: `${describeError(lastError)}; cgroup.events unreadable during cleanup retry: ${describeError(err)}`,
+      }
+    }
+    if (!stillEmpty) {
+      return {
+        ok: false,
+        detail: `${describeError(lastError)}; cgroup became populated again during cleanup retry (not a transient teardown)`,
+      }
+    }
+  }
+
+  const children = deps.listChildCgroups(cgroupPath)
+  const childDetail = children.length === 0
+    ? 'no child cgroups'
+    : `child cgroups remain: ${children.slice(0, 5).join(', ')}`
+  return {
+    ok: false,
+    detail: `${describeError(lastError)}; still failing after ${CLEANUP_RETRY_DELAYS_MS.length} retries `
+      + `(populated 0, ${childDetail})`,
+  }
 }
 
 /** `cgroup.events` の `populated` を読む。読み取り・解析の失敗は例外にして fail-closed にする */

@@ -16,6 +16,10 @@ import {
   resolveWorkerCgroup,
   runContainedCommand,
   runContainedOrThrow,
+  removeCgroupWithRetry,
+  CLEANUP_RETRY_DELAYS_MS,
+  DEFAULT_DRAIN_MS,
+  type RemoveCgroupDeps,
 } from './runContainedCommand.js'
 
 const containmentAvailable = isContainmentAvailable()
@@ -303,4 +307,112 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
     expect(result.killedDescendants).toBe(true)
     expect(isContainmentSafe(result.outcome)).toBe(true)
   }, 30_000)
+})
+
+describe('removeCgroupWithRetry — 一過性 EBUSY を短い再試行で解消する', () => {
+  function deps(overrides: Partial<RemoveCgroupDeps> = {}): RemoveCgroupDeps & { slept: number[] } {
+    const slept: number[] = []
+    return {
+      rmdir: () => undefined,
+      readPopulated: () => false,
+      listChildCgroups: () => [],
+      sleep: async (ms: number) => { slept.push(ms) },
+      slept,
+      ...overrides,
+    } as RemoveCgroupDeps & { slept: number[] }
+  }
+
+  function ebusy(): NodeJS.ErrnoException {
+    const err = new Error('EBUSY: resource busy or locked') as NodeJS.ErrnoException
+    err.code = 'EBUSY'
+    return err
+  }
+
+  it('1回目で成功するときは待機も再試行もしない', async () => {
+    const d = deps()
+    const result = await removeCgroupWithRetry('/cg', d)
+
+    expect(result.ok).toBe(true)
+    expect(d.slept).toEqual([])
+  })
+
+  it('EBUSY が続いた後に成功すれば ok を返す（production で起きた一過性の解体遅延）', async () => {
+    let calls = 0
+    const d = deps({
+      rmdir: () => {
+        calls += 1
+        if (calls <= 2) throw ebusy()
+      },
+    })
+
+    const result = await removeCgroupWithRetry('/cg', d)
+
+    expect(result.ok).toBe(true)
+    expect(calls).toBe(3)
+    expect(d.slept).toEqual([10, 50])
+  })
+
+  it('ENOENT は冪等な成功として扱う', async () => {
+    const d = deps({
+      rmdir: () => {
+        const err = new Error('ENOENT') as NodeJS.ErrnoException
+        err.code = 'ENOENT'
+        throw err
+      },
+    })
+
+    expect((await removeCgroupWithRetry('/cg', d)).ok).toBe(true)
+    expect(d.slept).toEqual([])
+  })
+
+  it('再試行中に populated へ戻ったら即座に失敗させる（本物の封じ込め問題を握り潰さない）', async () => {
+    const d = deps({
+      rmdir: () => { throw ebusy() },
+      readPopulated: () => true,
+    })
+
+    const result = await removeCgroupWithRetry('/cg', d)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.detail).toContain('became populated again')
+    // 1回だけ待って再確認し、そこで打ち切る
+    expect(d.slept).toEqual([10])
+  })
+
+  it('EBUSY / ENOTEMPTY 以外は一過性でないので再試行しない', async () => {
+    const d = deps({
+      rmdir: () => {
+        const err = new Error('EPERM') as NodeJS.ErrnoException
+        err.code = 'EPERM'
+        throw err
+      },
+    })
+
+    const result = await removeCgroupWithRetry('/cg', d)
+
+    expect(result.ok).toBe(false)
+    expect(d.slept).toEqual([])
+  })
+
+  it('再試行を使い切ったら従来どおり失敗し、診断情報を残す（無限 retry にしない）', async () => {
+    const d = deps({
+      rmdir: () => { throw ebusy() },
+      listChildCgroups: () => ['leftover-child'],
+    })
+
+    const result = await removeCgroupWithRetry('/cg', d)
+
+    expect(result.ok).toBe(false)
+    if (!result.ok) {
+      expect(result.detail).toContain(`after ${CLEANUP_RETRY_DELAYS_MS.length} retries`)
+      expect(result.detail).toContain('child cgroups remain: leftover-child')
+    }
+    expect(d.slept).toEqual([...CLEANUP_RETRY_DELAYS_MS])
+  })
+
+  it('待機列は有限かつ短い（drain 上限より十分小さい）', () => {
+    const total = CLEANUP_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0)
+    expect(CLEANUP_RETRY_DELAYS_MS.length).toBeLessThanOrEqual(5)
+    expect(total).toBeLessThan(DEFAULT_DRAIN_MS)
+  })
 })
