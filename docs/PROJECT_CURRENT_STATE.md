@@ -218,6 +218,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **cleanup だけが失敗した containment が Job を quarantine させる
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
+- **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
@@ -267,7 +268,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
 - **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: planned）
 - **Mobile 内の運用指示窓口（Operator Chat）**（state: planned）
-- **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**（state: planned）
 - **CEO Escalation を AIteamOS Mobile Push で届ける（将来の正式第一通知チャネル）**（state: planned）
 - **PL Console候補の評価（調査のみ・コード変更なし）**（state: deferred）
 - **隔離PoC（AIteamOS本体と非接続）**（state: deferred）

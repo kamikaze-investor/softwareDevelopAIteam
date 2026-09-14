@@ -39,6 +39,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import {
   resolvePlActionPolicy,
   type PlActionKind,
@@ -123,7 +126,10 @@ const REQUIRED_CEO_APPROVAL_TYPE: Partial<Record<PlActionKind, ApprovalType>> = 
  * Gate を無くすのと同じなので fail-closed のままにする。配線は `vps-pl-execution-loop` で行う。
  */
 export const UNVERIFIABLE_GATES: readonly RequiredGate[] = Object.freeze([
-  'strategic_alignment_review',
+  // `strategic_alignment_review` は **Roadmap 採用に限り**検証可能になった
+  // （ledger に未完了で実在するか、という機械的事実で判定する。`checkRoadmapItemAlignment()`）。
+  // それ以外の用途では依然として根拠を作れないが、現在この Gate を要求するのは
+  // `adopt_roadmap_item` だけなので、ここには残さない。
   'safety_review',
 ])
 
@@ -137,6 +143,11 @@ export type GateEvidenceRef =
   | { gate: 'independent_review'; designReviewEvidenceId: string }
   | { gate: 'approval_gate'; approvalRequestId: string }
   | { gate: 'ceo_approval'; approvalId: string }
+  /**
+   * Roadmap 採用の戦略妥当性。**根拠は「PL がそう思った」ではなく ledger の実体**である。
+   * seam が `tasks/roadmap.md` を読み、その id が**未完了で実在する**ことを確認する。
+   */
+  | { gate: 'strategic_alignment_review'; roadmapItemId: string }
 
 export interface PlActionRequest {
   proposal: PlActionProposal
@@ -320,6 +331,110 @@ function checkCeoApproval(storage: IStorage, approvalId: string, kind: PlActionK
   return { satisfied: true }
 }
 
+/** 採用時に PL が宣言できる `allowedPaths` の最小セグメント数。 */
+export const MIN_ALLOWED_PATH_SEGMENTS = 2
+
+/**
+ * PL が宣言した採用スコープが**機械的に妥当か**を検査する。
+ *
+ * `allowedPaths` は File Change Guard の効き方そのものを決める。PL が
+ * `.` や `apps` のような広いパスを宣言できると、Guard は形だけ残って実質無効になる。
+ * **ここは PL の説明を読まない。パス文字列の形だけを見る。**
+ *
+ * 満たすべきこと:
+ *   - 1件以上ある
+ *   - repository-relative（絶対パス・`..` を含まない）。既存 `validateRoadmapTasks` と同じ方向の検査で、
+ *     ここでは採用前に fail-fast させるために先に見る
+ *   - **セグメントが2つ以上**（`apps/api/src/ctoAi` は可、`apps` や `.` は不可）
+ *
+ * `ALWAYS_FORBIDDEN_PATTERNS`（安全中核）は allowedPaths に関係なく Job 実行時に効くので、
+ * ここで重複して列挙しない。
+ *
+ * @throws PlActionBlockedError 宣言が広すぎる・形が不正なとき
+ */
+export function assertAdoptionScopeIsBounded(
+  decision: PlActionPolicyDecision,
+  allowedPaths: readonly string[],
+): void {
+  const problems: string[] = []
+
+  if (allowedPaths.length === 0) {
+    problems.push('allowedPaths is empty; an adoption must state where it may write')
+  }
+
+  for (const raw of allowedPaths) {
+    const value = raw.trim()
+    if (value === '') {
+      problems.push('allowedPaths contains an empty entry')
+      continue
+    }
+    if (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)) {
+      problems.push(`allowedPaths must be repository-relative, got absolute "${value}"`)
+      continue
+    }
+    if (value.split(/[\\/]/).includes('..')) {
+      problems.push(`allowedPaths must not escape the repository, got "${value}"`)
+      continue
+    }
+    const segments = value.split(/[\\/]/).filter((segment) => segment !== '' && segment !== '.')
+    if (segments.length < MIN_ALLOWED_PATH_SEGMENTS) {
+      problems.push(
+        `allowedPaths entry "${value}" is too broad; at least ${MIN_ALLOWED_PATH_SEGMENTS} path segments are required`,
+      )
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new PlActionBlockedError(decision, decision.requiredGates, problems)
+  }
+}
+
+/**
+ * 採用しようとしている Roadmap 項目が、**CEO 承認済み ledger に未完了で実在する**かを確かめる。
+ *
+ * これが `strategic_alignment_review` の根拠である。PL の自己申告ではなく、
+ * `tasks/roadmap.md` を既存 parser で読んだ結果だけを見る。
+ * **ledger に無い項目・既に done の項目は採用できない。**
+ *
+ * ledger が壊れていれば fail-closed（採用させない）。
+ * **新しい Roadmap metadata も新しい承認経路も作らない。**
+ */
+function checkRoadmapItemAlignment(roadmapItemId: string, kind: PlActionKind): EvidenceCheck {
+  if (kind !== 'adopt_roadmap_item') {
+    return {
+      satisfied: false,
+      rejection: `roadmap item alignment is only evidence for adopt_roadmap_item, not ${kind}`,
+    }
+  }
+
+  let items: ReturnType<typeof getValidRoadmapItems>
+  try {
+    items = getValidRoadmapItems(readFileSync(resolveRoadmapPath(), 'utf-8'))
+  } catch (error: unknown) {
+    return {
+      satisfied: false,
+      rejection: `roadmap ledger could not be read or is invalid: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    }
+  }
+
+  const item = items.find((candidate) => candidate.id === roadmapItemId)
+  if (!item) {
+    return { satisfied: false, rejection: `roadmap item "${roadmapItemId}" is not in the ledger` }
+  }
+  if (item.state === 'done') {
+    return { satisfied: false, rejection: `roadmap item "${roadmapItemId}" is already done` }
+  }
+
+  return { satisfied: true }
+}
+
+/** ledger の所在。採用 API（`roadmapAdoption.ts`）と同じ既定を使い、別経路を作らない。 */
+function resolveRoadmapPath(): string {
+  return path.join(process.env.TARGET_ROOT ?? '/workspace/target', 'tasks', 'roadmap.md')
+}
+
 function verifyEvidence(
   storage: IStorage,
   ref: GateEvidenceRef,
@@ -335,6 +450,8 @@ function verifyEvidence(
       return checkApprovalGate(storage, ref.approvalRequestId, scope)
     case 'ceo_approval':
       return checkCeoApproval(storage, ref.approvalId, kind)
+    case 'strategic_alignment_review':
+      return checkRoadmapItemAlignment(ref.roadmapItemId, kind)
     default: {
       const unknown = ref as { gate?: unknown }
       return { satisfied: false, rejection: `unknown gate evidence kind: ${String(unknown.gate)}` }

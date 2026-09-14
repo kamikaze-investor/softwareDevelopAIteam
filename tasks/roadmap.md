@@ -6800,9 +6800,26 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 残った dirty をどう扱うか。**曖昧な変更の自動削除はしない**という既存方針は維持する
         （本件の dirty は失敗 Job の `changed_files` に記録済みで帰属は明確）
 
-<!-- roadmap:id=pl-autonomous-roadmap-adoption state=planned -->
-4. [ ] **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）** —
+<!-- roadmap:id=pl-autonomous-roadmap-adoption state=done -->
+4. [x] **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）** —
       2026-09-15登録。**本線を VPS へ移管した時点で判明した最大のギャップ。**
+
+      **【2026-09-15 実装済み】** PL が手の空いた Project へ次項目を採用できるようにした。
+      設計・実装・独立レビューはすべて外部セッションで行い、**VPS PL 自身には実装させていない**。
+
+      許可の与え方:
+      - `strategic_alignment_review` は**残したまま検証可能にした**。根拠は PL の自己申告ではなく、
+        その id が CEO 承認済み ledger に**未完了で実在すること**（seam が信頼できるファイルを自分で読む。
+        **呼び出し側から ledger 本文を受け取らない**ので、PL が根拠を偽造できない）
+      - `design_review` は up-front 要件から外した。**迂回ではない**: 採用操作の内側で必ず実行され、
+        ALIGNED で evidence が登録されない限り implement Job は作られない。up-front に要求すると
+        「まだ存在しない Task の evidence」を求めることになり構造的に充足不能だった
+      - PL が具体化する allowedPaths は **seam が機械的に検証**する（repository-relative /
+        2セグメント以上 / `..` 不可）。広い宣言で File Change Guard を骨抜きにできない
+      - 採用は attention が1件も無いときだけ行う（止まっているものを放置して仕事を増やさない）。
+        同一 Project への採用試行は2回で打ち切り、以降は再試行ではなく CEO Escalation
+
+      **Gate bypass も PL の自己権限変更も行っていない。** 判定は従来どおり  を通る。
 
       **問題**: VPS PL は採用済み Task の停滞を復旧できるが、**Task が完了した後に次の項目を採用できない**。
       `adopt_roadmap_item` は語彙にあるが `strategic_alignment_review` + `design_review` を要求し、

@@ -283,9 +283,33 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
   },
 
   // 開発の進行
+  /**
+   * Roadmap 項目の採用。
+   *
+   * **`strategic_alignment_review` は残す。** ただし「PL が戦略妥当性を自己申告する」形ではなく、
+   * **その項目が CEO 承認済みの ledger に未完了として実在すること**を根拠にする
+   * （`apps/api/src/pl/actionGate.ts` の `checkRoadmapItemAlignment()`）。
+   * ledger（`tasks/roadmap.md`）は CEO が確定する Source of Truth であり、そこに載っていること自体が
+   * 「やると決まっている」ことの記録である。**PL は載っていない項目を採用できない。**
+   *
+   * **`design_review` は up-front 要件から外した。** 採用操作そのものが
+   * `ensureInitialWorkflowsForActiveTasks()` → `createAndExecuteDesignReview()` を走らせ、
+   * **ALIGNED で evidence が登録されない限り implement Job は作られない**
+   * （`createInitialImplementWorkflow()` の `checkImplementJobDesignReviewEvidence()` gate）。
+   * つまり Design Review は迂回されるのではなく、**採用の内側で必ず実行される**。
+   * up-front に要求すると「まだ存在しない Task の design review evidence」を求めることになり、
+   * 構造的に充足不能（＝採用が永久に不可能）になる。
+   *
+   * **PL が決めてよいのは「どの項目を次にやるか」までで、変更の可否ではない。**
+   * `allowedPaths` / `acceptanceCriteria` / `implementationScope` は PL が具体化するが、
+   * それらは File Change Guard の効き方を決めるため、seam 側で機械的に検証する
+   * （`assertAdoptionScopeIsBounded()`）。`ALWAYS_FORBIDDEN_PATTERNS` は allowedPaths に関係なく効く。
+   */
   adopt_roadmap_item: {
-    gates: ['strategic_alignment_review', 'design_review'],
-    reason: 'adopting a roadmap item commits the project to new scope',
+    gates: ['strategic_alignment_review'],
+    reason:
+      'adoption is bounded by the CEO-approved ledger, and the design review runs inside the adoption '
+      + 'itself before any job can be created',
   },
   delegate_implementation: {
     gates: ['design_review', 'approval_gate'],

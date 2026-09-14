@@ -488,8 +488,11 @@ describe('authorizePlAction — 対象スコープと Review 根拠の対応', (
       evidence: [{ gate: 'design_review', designReviewEvidenceId: evidence.id }],
     })
 
-    expect(blocked.missingGates).toContain('design_review')
+    // `adopt_roadmap_item` は design_review を up-front に要求しなくなった（採用の内側で必ず走る）。
+    // それでも**他 Project の evidence を持ち込めば拒否される**ことは変わらない。
     expect(blocked.rejectedEvidence.join(' ')).toContain('belongs to another project')
+    // 採用の根拠は ledger 実在性なので、それが無ければ通らない
+    expect(blocked.missingGates).toContain('strategic_alignment_review')
   })
 
   it('taskId を持つ roadmap-kind evidence では Task 単位の Gate を満たせない', () => {
@@ -551,6 +554,8 @@ describe('authorizePlAction — 検証手段の無い Gate は充足できない
 
   it('検証できない Gate の一覧が明示されている', () => {
     expect(UNVERIFIABLE_GATES).toContain('safety_review')
-    expect(UNVERIFIABLE_GATES).toContain('strategic_alignment_review')
+    // `strategic_alignment_review` は **Roadmap 採用に限り**検証可能になった（ledger 実在性で判定する）。
+    // 「検証手段が無い＝充足しているとみなす」は作らないという原則は変えていない。
+    expect(UNVERIFIABLE_GATES).not.toContain('strategic_alignment_review')
   })
 })

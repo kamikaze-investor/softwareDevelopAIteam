@@ -39,6 +39,12 @@ import {
 } from '../designReview/designReviewCoordinator'
 import { requestText } from '../aiExplain/cheapAiClient'
 import { buildSystemState, type AttentionItem, type SystemStateSnapshot } from '../state/systemState'
+import {
+  PL_MAX_ADOPTION_ATTEMPTS,
+  runAdoptionStep,
+  type PlAdoptionDeps,
+  type PlAdoptionResult,
+} from './adoptionStep'
 import type { IStorage } from '../storage/interface'
 import { authorizePlAction, PlActionBlockedError, type PlActionTarget } from './actionGate'
 
@@ -47,6 +53,9 @@ export const PL_MAX_ATTEMPTS_PER_TARGET = 2
 
 /** 診断に使える時間。既存 cheap client の timeout と同じ桁に収める。 */
 export const PL_DIAGNOSIS_MAX_TOKENS = 700
+
+/** 採用提案は scope と受入条件を書くぶん少し長い。 */
+export const PL_ADOPTION_MAX_TOKENS = 900
 
 /** `audit_log` 上の語彙。新しいテーブルを足さないための相乗り先。 */
 const AUDIT_OPERATION = 'pl_loop'
@@ -175,6 +184,12 @@ export interface PlLoopDeps {
   ) => Promise<ExecuteDesignReviewResult>
   /** CEO Escalation。既定は既存 notifier（`sendAlert`）。新しい通知基盤は作らない。 */
   escalate?: (payload: { title: string; body: string }) => Promise<void>
+  /** 次項目の選択と具体化。既定は診断と同じ provider CLI 経路。 */
+  proposeAdoption?: PlAdoptionDeps['propose']
+  /** ledger の読み取り（テスト差し替え用）。 */
+  readLedger?: PlAdoptionDeps['readLedger']
+  /** 採用の実行（テスト差し替え用）。既定は既存 adoptRoadmapItem。 */
+  adopt?: PlAdoptionDeps['adopt']
   coordinatorDeps?: CoordinatorDeps
   now?: () => string
 }
@@ -406,6 +421,12 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     )
     const item = selectTarget(actionable)
     if (!item) {
+      // **手が空いたら次の Roadmap 項目を採用する。**
+      // attention が1つでもあるうちは採用しない（止まっているものを放置して新しい仕事を
+      // 増やさない）。採用可否そのものは `runAdoptionStep()` 内で Gate が決める。
+      const adoption = await maybeAdoptNext(storage, before, deps)
+      if (adoption) return adoption
+
       return {
         status: 'idle',
         reason:
@@ -559,6 +580,78 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     }
   } finally {
     inFlight = false
+  }
+}
+
+/**
+ * 手が空いた Project に次の Roadmap 項目を採用する。**採用しなかったときは undefined を返す。**
+ *
+ * 採用してよい状況の判定はここだけに置く:
+ *   - attention が1件も無い（止まっているものを放置して新しい仕事を増やさない）
+ *   - running な Project である（Worker が実際に進められる）
+ *   - 進行中の Task が無い＝手が空いている
+ *   - 同じ Project への採用試行が上限未満（`audit_log` から数える。新しい表は持たない）
+ */
+async function maybeAdoptNext(
+  storage: IStorage,
+  state: SystemStateSnapshot,
+  deps: PlLoopDeps,
+): Promise<PlTickResult | undefined> {
+  if (state.attention.length > 0) return undefined
+
+  const project = state.projects.find((candidate) => (
+    candidate.status === 'running' && candidate.currentTask === undefined
+  ))
+  if (!project) return undefined
+
+  const key = `adopt:${project.id}`
+  const attempt = countPriorAttempts(storage, key) + 1
+  if (attempt > PL_MAX_ADOPTION_ATTEMPTS) {
+    if (hasEscalated(storage, key)) return undefined
+    await escalateTo(
+      storage,
+      deps,
+      key,
+      {
+        kind: 'task_ready_without_job',
+        projectId: project.id,
+        projectName: project.name,
+        detail: 'PL could not adopt the next roadmap item',
+      },
+      `PL は ${PL_MAX_ADOPTION_ATTEMPTS} 回試しましたが、次の Roadmap 項目を採用できませんでした。`,
+    )
+    return { status: 'escalated', reason: 'adoption attempt budget exhausted', attempt }
+  }
+
+  const propose = deps.proposeAdoption
+    ?? ((system: string, user: string) => requestText(system, user, {}, PL_ADOPTION_MAX_TOKENS))
+
+  let result: PlAdoptionResult
+  try {
+    result = await runAdoptionStep(storage, project.id, {
+      propose,
+      ...(deps.readLedger ? { readLedger: deps.readLedger } : {}),
+      ...(deps.adopt ? { adopt: deps.adopt } : {}),
+    })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    record(storage, key, 'diagnosis_failed', message)
+    return { status: 'diagnosis_failed', reason: message, attempt }
+  }
+
+  if (result.status === 'no_candidate') {
+    // ledger を全部やり切った状態。異常ではないので記録も Escalation もしない。
+    return undefined
+  }
+
+  record(storage, key, result.status === 'adopted' ? 'acted' : 'blocked', `adoption=${result.status} ${result.reason ?? result.roadmapId ?? ''}`)
+
+  return {
+    status: result.status === 'adopted' ? 'acted' : 'blocked',
+    proposedKind: 'adopt_roadmap_item',
+    executionSummary: `adoption ${result.status}${result.roadmapId ? ` (${result.roadmapId})` : ''}`,
+    ...(result.reason !== undefined ? { reason: result.reason } : {}),
+    attempt,
   }
 }
 
