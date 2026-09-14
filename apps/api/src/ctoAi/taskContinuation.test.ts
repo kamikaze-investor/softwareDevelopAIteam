@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { ensureTaskContinuation } from './taskContinuation'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow'
@@ -16,12 +16,16 @@ function createFixture() {
   const next = storage.tasks.create({ projectId: project.id, title: 'Next', description: 'Implement next.', status: 'pending', assignee: 'developer_ai', dependencies: [source.id], roadmapActive: true, phase: 2 })
   const sourceJob = storage.jobs.create({ taskId: source.id, projectId: project.id, agentRole: 'developer_ai', status: 'success', safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' } })
   const continuation = storage.taskContinuations.create({ sourceJobId: sourceJob.id, projectId: project.id, completedTaskId: source.id, nextTaskId: next.id, status: 'pending' })
-  return { storage, next, continuation }
+  return { storage, project, sourceJob, next, continuation }
 }
 
 describe('ensureTaskContinuation', () => {
   beforeEach(() => {
     createInitialImplementWorkflowMock.mockReset()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
   })
 
   it('leaves a retryable Design Review outcome pending, then completes on a later replay', async () => {
@@ -41,6 +45,28 @@ describe('ensureTaskContinuation', () => {
     await ensureTaskContinuation(storage, continuation.id)
     expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')
     expect(storage.jobs.findByTaskId(next.id)).toHaveLength(1)
+  })
+
+  it('makes an infrastructure exception observable in the log while keeping the handoff pending for the next resend', async () => {
+    const { storage, project, sourceJob, next, continuation } = createFixture()
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createInitialImplementWorkflowMock.mockRejectedValueOnce(new Error('storage is unavailable'))
+
+    await ensureTaskContinuation(storage, continuation.id)
+
+    expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('pending')
+    expect(storage.tasks.findById(next.id)?.status).toBe('pending')
+    expect(errorLog).toHaveBeenCalledTimes(1)
+    const line = errorLog.mock.calls[0]!.join(' ')
+    expect(line).not.toContain('\n')
+    expect(line).toContain(`jobId=${sourceJob.id}`)
+    expect(line).toContain(`taskId=${next.id}`)
+    expect(line).toContain(`projectId=${project.id}`)
+    expect(line).toContain('storage is unavailable')
+
+    createInitialImplementWorkflowMock.mockResolvedValueOnce({ taskId: next.id, status: 'created', job: {} as never })
+    await ensureTaskContinuation(storage, continuation.id)
+    expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')
   })
 
   it('marks a terminal failure observable by blocking the target Task and recording an audit entry', async () => {

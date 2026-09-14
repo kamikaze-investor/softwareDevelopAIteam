@@ -45,6 +45,14 @@ export async function ensureTaskContinuation(storage: IStorage, continuationId: 
     failContinuation(storage, continuation.id, continuation.nextTaskId, result)
   } catch (error: unknown) {
     // Retryable infrastructure failure: leave the durable handoff pending for the next Outbox resend.
+    // ただし無言で握り潰さない。恒久的なstorage障害・design review基盤障害だと、pendingのまま
+    // 無限にretryし続けるだけでAPI側に何のsignalも残らないため、識別子付きの1行だけ残す。
+    // 状態遷移も戻り値の契約も変えない（retryableな失敗はpendingのまま次の再送へ残す）。
+    console.error(
+      `[taskContinuation] ensure failed: continuationId=${continuation.id} jobId=${continuation.sourceJobId} ` +
+      `taskId=${continuation.nextTaskId} projectId=${continuation.projectId}: ` +
+      `${error instanceof Error ? error.message : String(error)}`,
+    )
   }
 }
 
