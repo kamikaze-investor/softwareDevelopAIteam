@@ -6302,13 +6302,38 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       provider も消費せず何もしない**ことを実測した。
       実測記録: `docs/project_memory/decisions/vps_pl_execution_loop_operational_verification.md`。
 
+      **【2026-09-14 実復旧 Operational E2E: 完走（VPS 単独・無人）】**
+      安全なケースの作り方: 障害を人工的に作らず、**既存の採用 API を同一スコープで呼び直した**
+      （`POST /api/projects/:id/roadmap-adoptions` に DB 上の現行 `allowedPaths` /
+      `acceptanceCriteria` をそのまま渡す）。これは停止中 Task を進めるための正規操作であり、
+      結果として新しい Design Review run が作られ、既知の 120s timeout で **requeue → idle** になった
+      （production evidence と同型。attempt 1/3、残 2）。以降は**手動 tick を使わず 60 秒 interval に任せた**。
+
+      | 時刻 | 監査 | 実測 |
+      |---|---|---|
+      | 09:52:59.054 | `pl_action_authorize / authorized` | `kind=rekick_design_review gates=none policy=pl-action-policy-v1` |
+      | 09:52:59.058 | — | run `944ce2e0` が `queued → running`、`attempt_count` 1→2、`started_at` 設定（**実際に再実行された**） |
+      | 09:55:04.078 | `pl_loop / acted` | `kind=rekick_design_review exec_ok=true verify=unchanged`（runner がまた 120s timeout → requeue） |
+      | 09:55:50.112 | `pl_action_authorize / authorized` | `kind=escalate_to_ceo` |
+      | 09:55:50.125 | `pl_loop / escalated` | 「2回 timeout で失敗しており、systemic な問題で上位の介入が要る」 |
+
+      **PL は attempt 上限（3）を待たず、2回目で自ら Escalation を選んだ**（run は `attempt_count=2`・
+      残1で停止）。既に escalate 済みの `design_review_failed` キーへは**重複通知していない**。
+      Job は1件も作られず（`jobs created today: 0`）、`/workspace/target` は HEAD `5079a2f`・dirty 0・
+      branch 不変。検証用に作った使い捨て Project は archived 済みで、running Project は本番の1件のみ。
+
+      **正常化はしていない。** 再実行そのものは成功したが、`design-review-runner-production-timeout`
+      が未解決のため review 自体はまた timeout した。**PL ループの欠陥ではなく、当該 Finding が
+      実復旧の成立を塞いでいる**（＝ VPS PL 完成後の優先 Root Cause 調査候補という位置づけを裏づける）。
+
       **残っている作業（本項目は完了にしない）**:
-      1. **Execute で実際の復旧操作（`rekick_design_review`）が走る経路が production 未実証**。
-         今回の対象は attempt を使い切っており、再kickは CEO 承認済み不変条件6で禁止されているため、
-         PL は正しく Escalation を選んだ。attempt が残った idle / failed な run が現れたときが実証機会。
-      2. **Escalation の到達経路が未設定**。通知チャネルが無く、CEO への Escalation は
-         ジャーナルにしか出ない。「PC を閉じても継続する」目的には、届く経路の設定が前提になる
-         （既存 notifier の設定であり、新しい通知基盤は作らない）。
+      **Escalation の到達経路が未設定**。`sendAlert()` は LINE（`LINE_CHANNEL_ACCESS_TOKEN` +
+      `LINE_USER_ID`）か Slack（`SLACK_WEBHOOK_URL`）のいずれかが env に無いとコンソール出力へ落ちる。
+      API・Worker とも未設定であることを journal で確認済み（`通知チャネルが未設定です`）。
+      **新しい通知基盤は作らない。既存 notifier の設定だけで足りる**が、
+      外部サービスの選定・credential の取得・production env への書き込みはいずれも
+      **CEO 判断・CEO 操作**（Yellow Zone、かつ AI は `/srv/ai-team/env/*.env` を読み書きしない）。
+      設定後は次の CEO Escalation がそのまま届く（コード変更は不要）。
 
       **問題**: PL 判断能力が無いのではなく、**PL が VPS 上で継続実行される経路へ接続されていない**。
       現在 PL 判断（状態把握・停滞検知・原因分析・調査・証拠収集・方針判断・次Task選択・委任・
