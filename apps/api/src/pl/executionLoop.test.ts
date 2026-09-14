@@ -6,6 +6,7 @@ import {
   PL_MAX_ATTEMPTS_PER_TARGET,
   countPriorAttempts,
   extractProposedKind,
+  isRecoveryTargetResolved,
   resetPlLoopInFlightForTest,
   runPlTick,
   verifyOutcome,
@@ -359,5 +360,57 @@ describe('extractProposedKind / verifyOutcome', () => {
         attention: [{ kind: 'approval_waiting' as const, projectId: 'p1', projectName: 'P', taskId: 't1', detail: 'w' }],
       }),
     ).toBe('needs_gate_or_ceo')
+  })
+})
+
+describe('Recovery 成功の判定（対象が解消したか）', () => {
+  it('対象が消えていれば、後続状態が出ていても Recovery 成功として扱う', () => {
+    expect(isRecoveryTargetResolved('normalized')).toBe(true)
+    expect(isRecoveryTargetResolved('different_anomaly')).toBe(true)
+  })
+
+  it('対象が残っている / 人の判断が要る場合は成功扱いにしない', () => {
+    expect(isRecoveryTargetResolved('unchanged')).toBe(false)
+    expect(isRecoveryTargetResolved('needs_gate_or_ceo')).toBe(false)
+  })
+
+  it('復旧が成功して後続状態が現れただけなら、試行上限でも Escalation しない', async () => {
+    // production 実測（2026-09-14）と同じ形: 停止した Design Review を再kickして evidence 登録まで
+    // 到達したが、同じ Task に task_ready_without_job が現れて verdict が different_anomaly になった。
+    // これを Escalation すると、**成功するたびに CEO を呼ぶ**ことになる。
+    const { storage } = seedIdleDesignReview()
+    const escalations: string[] = []
+    const d = deps({
+      rekickDesignReview: async (s, id) => {
+        const claim = s.designReviewRuns.claim(id, 3)
+        if (claim.claimToken) s.designReviewRuns.complete(id, claim.claimToken, 'succeeded', '{}', undefined)
+        return { status: 'evidence_registered' }
+      },
+      escalate: async (p) => { escalations.push(p.title) },
+    })
+
+    const result = await runPlTick(storage, d)
+
+    // 対象（design_review_idle）は消え、同じ Task に task_ready_without_job が出ている
+    expect(result.verification).toBe('different_anomaly')
+    expect(result.status).toBe('acted')
+    expect(escalations).toEqual([])
+  })
+
+  it('対象が残ったままなら従来どおり試行上限で Escalation する', async () => {
+    const { storage } = seedIdleDesignReview()
+    const escalations: string[] = []
+    const d = deps({
+      // 「成功した」と言うだけで何もしない実行 → 対象は消えない
+      rekickDesignReview: async () => ({ status: 'evidence_registered' }),
+      escalate: async (p) => { escalations.push(p.title) },
+    })
+
+    for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, d)
+    }
+
+    expect(escalations.length).toBe(1)
   })
 })

@@ -97,6 +97,28 @@ export type PlVerificationVerdict =
   | 'different_anomaly'
   | 'needs_gate_or_ceo'
 
+/**
+ * その verdict は「復旧対象が解消した」と言えるか。
+ *
+ * **`normalized` だけを成功とすると、直した結果として次の工程が現れたケースを失敗と誤判定する。**
+ * 実測（2026-09-14 production）: 停止していた Design Review を PL が再kickして ALIGNED・evidence 登録まで
+ * 到達したのに、同じ Task に後続状態 `task_ready_without_job` が現れたため verdict は `different_anomaly` に
+ * なった。**復旧操作そのものは成功している。** pipeline では「1つ解けると次が見える」のが正常であり、
+ * これを Recovery 失敗として扱うと、成功するたびに CEO へ Escalation が飛ぶ。
+ *
+ * - `normalized` … 対象が消え、同じ subject に他の attention も無い
+ * - `different_anomaly` … **対象は消えた**。同じ subject に後続の別状態が現れただけで、
+ *   それは次の tick で独立した attention として扱われる
+ * - `needs_gate_or_ceo` … 対象は消えたが、後続が approval 待ち / quarantine である。
+ *   **PL には executor が無く人の判断が要る**ので、ここは成功扱いにしない（Escalation の対象）
+ * - `unchanged` … 対象がそのまま残っている＝復旧できていない
+ *
+ * **新しい状態モデルは作らない。** verdict の語彙は4つのままで、判定の読み方だけをここに集約する。
+ */
+export function isRecoveryTargetResolved(verdict: PlVerificationVerdict): boolean {
+  return verdict === 'normalized' || verdict === 'different_anomaly'
+}
+
 export interface PlTickResult {
   status: PlTickStatus
   /** 扱った attention（あれば）。 */
@@ -490,7 +512,14 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     )
 
     // ── Continue / Escalate ────────────────────────────────────
-    if (verification !== 'normalized' && attempt >= PL_MAX_ATTEMPTS_PER_TARGET && !hasEscalated(storage, key)) {
+    // **復旧対象が解消していれば Escalation しない。** 直した結果として次の工程が現れるのは
+    // pipeline の正常な進み方であり、それは次の tick で独立した attention として扱われる
+    // （`isRecoveryTargetResolved()` 参照）。
+    if (
+      !isRecoveryTargetResolved(verification) &&
+      attempt >= PL_MAX_ATTEMPTS_PER_TARGET &&
+      !hasEscalated(storage, key)
+    ) {
       await escalateTo(
         storage,
         deps,
