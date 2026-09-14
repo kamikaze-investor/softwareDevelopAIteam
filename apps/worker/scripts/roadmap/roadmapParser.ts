@@ -60,9 +60,32 @@ export class RoadmapValidationError extends Error {
   }
 }
 
-const ROADMAP_METADATA_REGEX = /^\s*<!--\s+roadmap:id=([^\s]+)\s+state=([^\s]+)\s+-->\s*$/
+/**
+ * `id` と `state` の後ろに、追加の `key=value` 属性を任意個許す。
+ *
+ * ledger では `priority=high` のような補足属性が実際に使われているが、以前は2属性しか
+ * 受け付けず `invalid_metadata` として弾いていた。弾かれた項目は `getValidRoadmapItems()`
+ * から見えなくなり、さらに `roadmap:check` が落ちるため `roadmap:sync` も実行できず、
+ * `docs/PROJECT_CURRENT_STATE.md` の自動生成ブロックが stale のまま放置されていた。
+ *
+ * 追加属性は**解釈せず素通しする**（本 parser の関心は id / state / checkbox だけ）。
+ * 新しい属性を足すたびに parser を改修せずに済むようにするためで、属性を意味づける
+ * 新しいモデルは追加しない。
+ */
+const ROADMAP_METADATA_REGEX =
+  /^\s*<!--\s+roadmap:id=([^\s]+)\s+state=([^\s]+)((?:\s+[A-Za-z_][\w-]*=[^\s]+)*)\s+-->\s*$/
 const ROADMAP_METADATA_PREFIX_REGEX = /^\s*<!--\s*roadmap:/
-const CHECKBOX_LINE_REGEX = /^(\s*\d+\.\s+\[)( |x)(\]\s+)(.*)$/
+
+/**
+ * checkbox マーカーは `x`（完了）/ ` `（未完了）に加えて `~` も受け付ける。
+ *
+ * ledger では進行中を `[~]` と書く箇所があるが、以前は受け付けず `missing_checkbox`
+ * として扱われていた。`~` は**完了ではない**マーカーなので、既存の
+ * `CheckboxState`（`checked` | `unchecked`）のうち `unchecked` へ写す。
+ * 新しい CheckboxState は追加しない（`expectedCheckboxForState()` の
+ * 「done 以外は unchecked」という既存判定がそのまま成立する）。
+ */
+const CHECKBOX_LINE_REGEX = /^(\s*\d+\.\s+\[)( |x|~)(\]\s+)(.*)$/
 const STATE_SET: ReadonlySet<string> = new Set(ALLOWED_ROADMAP_STATES)
 
 export function isRoadmapState(value: string): value is RoadmapState {
@@ -290,7 +313,12 @@ function expectedCheckboxForState(state: RoadmapState): CheckboxState {
 }
 
 function syncCheckboxLine(line: string, state: RoadmapState): string {
-  const checkboxValue = state === 'done' ? 'x' : ' '
+  // done は必ず `x` へ寄せる。非 done のときは**既存のマーカーを保持する**:
+  // `[~]`（進行中）を `[ ]` へ書き換えると、著者が明示した進行中の情報を
+  // state 更新の副作用で失う。`~` も `[ ]` も等しく「未完了」なので、
+  // `expectedCheckboxForState()` の判定はどちらでも成立する。
+  const current = line.match(CHECKBOX_LINE_REGEX)?.[2]
+  const checkboxValue = state === 'done' ? 'x' : current === '~' ? '~' : ' '
   return line.replace(CHECKBOX_LINE_REGEX, `$1${checkboxValue}$3$4`)
 }
 

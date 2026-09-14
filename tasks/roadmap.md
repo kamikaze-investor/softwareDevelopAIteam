@@ -3907,6 +3907,38 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       **`roadmap:sync` は依然として実行できず、`PROJECT_CURRENT_STATE.md` の自動生成ブロックは
       stale のままである。** 本ファイルと実装を直接読む場合はその前提で扱うこと。
 
+      **2026-09-14 解消**: `roadmap-parser-metadata-and-checkbox-tolerance`（下記）で
+      parser を修正し、残り4件はすべて解消した。`pnpm roadmap:check` は
+      **OK（69 items, PROJECT_CURRENT_STATE.md is synced）**で通り、`roadmap:sync` も実行できる。
+      上記の「stale のまま」という前提は**もはや成立しない**。
+
+<!-- roadmap:id=roadmap-parser-metadata-and-checkbox-tolerance state=done -->
+1. [x] **roadmap parser が追加属性と `[~]` 表記を受理できるようにする — 完了（2026-09-14）**
+      （2026-09-14 着手。`temp-mvp-completion-policy-cleanup` が「parser 側の修正を要する」として
+      積み残していた4件を解消する項目。**既存 Roadmap 採用機能の前提整備**でもある）。
+
+      **解いた問題**: `ROADMAP_METADATA_REGEX` が `id` / `state` の2属性しか受け付けず、
+      ledger で実際に使われている `priority=high` を `invalid_metadata` として弾いていた（3件）。
+      `CHECKBOX_LINE_REGEX` が `( |x)` しか受け付けず、進行中を表す `[~]` を
+      `missing_checkbox` として弾いていた（1件）。弾かれた項目は `getValidRoadmapItems()` から
+      見えず、さらに `roadmap:check` が落ちるため `roadmap:sync` も実行できず、
+      `docs/PROJECT_CURRENT_STATE.md` の自動生成ブロックが stale のまま放置されていた。
+
+      **修正（最小・新モデル無し）**:
+      - metadata は `id` / `state` の後ろに任意個の `key=value` を許し、**解釈せず素通しする**。
+        属性を意味づける新しいモデルは追加していない
+      - checkbox は `x` / ` ` に加えて `~` を受理し、既存の `CheckboxState` の
+        `unchecked` へ写す。**新しい CheckboxState は追加していない**ため、
+        `expectedCheckboxForState()` の「done 以外は unchecked」がそのまま成立する
+      - `syncCheckboxLine()` は非 done への更新時に `[~]` を保持する
+        （`[ ]` へ潰すと著者が明示した進行中表記を state 更新の副作用で失うため）
+
+      **検証**: `scripts/roadmap/` 24/24 PASS（新規5件: 追加属性1個/複数個、壊れた metadata は
+      従来どおり弾く、`[~]` の解釈、`[~]`＋done は従来どおり mismatch、done 更新で `[x]` 化、
+      非 done 更新で `[~]` 保持）。実 ledger に対して
+      `pnpm roadmap:check` が **OK: 69 roadmap items, PROJECT_CURRENT_STATE.md is synced**。
+      `pnpm roadmap:sync` で stale だった生成ブロックを更新済み。
+
 **セキュリティ残タスク（2026-07-29 Codexレビューで発見。MVP必須5項目とは別枠）:**
 
 - [x] MobileがAPI tokenの`Authorization`ヘッダーを送っていない — **解消済み（2026-08-17

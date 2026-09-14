@@ -92,6 +92,90 @@ describe('parseRoadmapMarkdown validation', () => {
   })
 })
 
+
+describe('metadata tolerance — 追加属性を許す', () => {
+  it('priority のような追加属性があっても項目として解釈する', () => {
+    const markdown = [
+      '<!-- roadmap:id=with-priority state=planned priority=high -->',
+      '1. [ ] Has an extra attribute — details',
+    ].join('\n')
+
+    const { items, issues } = parseRoadmapMarkdown(markdown)
+
+    expect(issues).toEqual([])
+    expect(items).toHaveLength(1)
+    expect(items[0].id).toBe('with-priority')
+    expect(items[0].state).toBe('planned')
+    expect(items[0].checkbox).toBe('unchecked')
+  })
+
+  it('追加属性が複数あっても解釈する', () => {
+    const markdown = [
+      '<!-- roadmap:id=multi state=done priority=high owner=pl -->',
+      '1. [x] Two extra attributes — details',
+    ].join('\n')
+
+    expect(issueCodes(markdown)).toEqual([])
+    expect(parseRoadmapMarkdown(markdown).items[0].id).toBe('multi')
+  })
+
+  it('壊れた metadata は従来どおり invalid_metadata として弾く', () => {
+    const markdown = [
+      '<!-- roadmap:id=broken -->',
+      '1. [ ] Missing state — details',
+    ].join('\n')
+
+    expect(issueCodes(markdown)).toContain('invalid_metadata')
+  })
+})
+
+describe('checkbox tolerance — [~] を未完了として受け付ける', () => {
+  it('[~] を unchecked として解釈し、非 done state と矛盾しない', () => {
+    const markdown = [
+      '<!-- roadmap:id=in-progress-item state=in_progress -->',
+      '1. [~] Work in progress — details',
+    ].join('\n')
+
+    const { items, issues } = parseRoadmapMarkdown(markdown)
+
+    expect(issues).toEqual([])
+    expect(items[0].checkbox).toBe('unchecked')
+    expect(items[0].title).toBe('Work in progress')
+  })
+
+  it('[~] が done state と組み合わされたら従来どおり mismatch として報告する', () => {
+    const markdown = [
+      '<!-- roadmap:id=wrong state=done -->',
+      '1. [~] Claims done but not checked — details',
+    ].join('\n')
+
+    expect(issueCodes(markdown)).toContain('checkbox_state_mismatch')
+  })
+
+  it('done へ更新すると [~] は [x] になる', () => {
+    const markdown = [
+      '<!-- roadmap:id=item state=in_progress -->',
+      '1. [~] Work in progress — details',
+    ].join('\n')
+
+    const updated = updateRoadmapState(markdown, 'item', 'done').markdown
+
+    expect(updated).toContain('1. [x] Work in progress — details')
+    expect(updated).toContain('state=done')
+  })
+
+  it('非 done へ更新しても [~] を [ ] へ潰さない（著者が書いた進行中表記を失わない）', () => {
+    const markdown = [
+      '<!-- roadmap:id=item state=in_progress -->',
+      '1. [~] Work in progress — details',
+    ].join('\n')
+
+    const updated = updateRoadmapState(markdown, 'item', 'blocked').markdown
+
+    expect(updated).toContain('1. [~] Work in progress — details')
+    expect(updated).toContain('state=blocked')
+  })
+})
 function issueCodes(markdown: string): RoadmapIssueCode[] {
   return parseRoadmapMarkdown(markdown).issues.map((issue) => issue.code)
 }

@@ -193,28 +193,71 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **本体DB安全・復旧基盤**
 - **Project別Roadmap可視化**
 - **Task→Job自動生成と連続実行**
+- Project全体の完了判定
 - **Meta Review MVP Hardening
 - **Interactive Project Definition / Readiness
+- **Design Review CONFLICT Recovery
 - **Project Pause / Continuation-Control Gap
+- **resume 経路のテストが実 LLM レビューの判定に依存していた（非 hermetic）
+- **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）
+- **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
+- **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
+- **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける**
+- **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
+- **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
+- **Task ContinuationのGET依存解消（高優先度）
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
 - 追加開発指示（追加Task作成）画面（Mobile）
 - 再実行・追加指示UI（Mobile）
+- **`TEMP_MVP_COMPLETION_POLICY cleanup`**
+- **roadmap parser が追加属性と `[~]` 表記を受理できるようにする
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
-- Project全体の完了判定: 全Task完了をもってProject完了とみなす判定。（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
+- **Meta Reviewer structured-output robustness / false-BLOCKED の解消**（state: planned）
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
 - **複数Worker対応**（state: deferred）
 - **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
-- **Design Review CONFLICT Recovery**（2026-09-01登録。上記と同じ経緯で、Codexからの登録報告が（state: planned）
-- **Roadmap Task / Control-Plane Workflow Separation**（2026-09-01登録。Phase 1c Minimal（state: planned）
-- **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行（state: planned）
+- **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行（state: in_progress）
+- **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる**（2026-09-07登録。（state: planned）
+- **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、（state: planned）
+- **evidence登録後〜Task sync前のcrashでRoadmapが再生成されうる**（2026-09-08登録。（state: planned）
+- **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。（state: planned）
+- **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**（state: planned）
+- **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**（state: planned）
+- **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**（state: planned）
+- **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**（state: planned）
+- **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い**（state: planned）
+- **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: deferred）
+- **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
+- **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）
+- **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**（state: planned）
+- **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**（state: planned）
+- **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: planned）
+- **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
+- **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
+- **Tier A: 自己開発の最初の安全な切替点（Candidate runtime 不要）**（state: planned）
+- **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
+- **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）**（state: planned）
+- **Project 単位 workspace 分離（Multi-Project の前提・最優先）**（state: planned）
+- **Harness Bake-off / Execution Runtime Evaluation**（state: planned）
+- **Containment adversarial escape（cgroup migration / git external helper）（state: planned）
+- **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）**（state: planned）
+- **Containment success path の可観測性（低優先 hardening）**（state: planned）
+- **Failure Explanation の事前生成と CEO 向け構造化（次段改善）（state: planned）
+- **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）
+- **Role / Provider / Model Registry（役割別ルーティング設定表）**（state: planned）
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
+- **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: planned）
+- **PL Console候補の評価（調査のみ・コード変更なし）**（state: deferred）
+- **隔離PoC（AIteamOS本体と非接続）**（state: deferred）
+- **PL Gateway設計（設計のみ・実装は本統合で行う）**（state: deferred）
+- **本統合（着手条件付き）**（state: deferred）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
