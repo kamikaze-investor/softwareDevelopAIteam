@@ -4632,6 +4632,32 @@ OpenCode CLI を spawn しており、`AiCliProvider` も claude_code / codex / 
 設計を維持する。将来 API 経路が合理的になった場合も Registry の1エントリとして扱えるようにし、
 経路の種別を Role 側へ埋め込まない。
 
+### 優先順位の再評価（2026-09-14 夜・PL不在の実証を受けて）
+
+**上記の順位は下記で置き換える。** 初回の自律 Task 実行で「VPS 上に PL が居ない」ことが
+production で実証されたため（`vps-pl-execution-loop` の evidence）、PL 実行基盤を最優先へ繰り上げる。
+
+| 順 | 項目 | 理由 |
+|---|---|---|
+| **1** | `cross-project-state-api` | PL の Observe の入口。これが無いと VPS 上の PL も判断できない。他の全項目の前提 |
+| **2** | `mandatory-gate-policy` | PL に判断を任せる前に**強制境界**を確定させる。既存 Gate の再利用が大半で、不足は薄い Policy Engine 1つ |
+| **3** | `vps-pl-execution-loop` | **単一障害点（ローカル PC 依存）の除去**。1・2 の上に載る |
+| 4 | `design-review-runner-production-timeout` | 現在の自律開発を実際に止めている。3 の最初の実戦対象にもなる |
+| 5 | `operator-chat-mobile` → `chatgpt-mcp-inspect` | 1 の同じ interface を消費。PL へのアクセス経路 |
+| 6 | `roadmap-adoption-followups` (1) | 有用だが**PL が居てこそ効く**改善。順位を下げる |
+| 7 | `worker-restricted-remote-publish` | 外部依存の除去。PL 基盤の後で十分 |
+| 8 | `role-model-registry` → `failure-explanation-pregeneration` | Escalation の説明品質に効く |
+| 9 | `project-workspace-isolation` → Project #2 | 最大規模・最高リスク。PL 基盤が整ってから着手する方が安全 |
+
+**`roadmap-adoption-followups` を 1 位から 6 位へ下げた理由**: 採用スコープの改善は「PL が毎回
+口頭で言い直す手間」を減らすものであり、**PL が VPS 上に居なければ効果が出ない**。
+PL 基盤が先である（CEO 指摘・2026-09-14）。
+
+**Project #2 の約10日目安について**: PL 基盤を先に置くことで見かけ上は遠回りに見えるが、
+Multi-Project は「並行する2つの Project を誰が見張るのか」という問題を必然的に伴うため、
+PL 基盤なしに Project #2 を開始しても運用が成立しない。**安全性を優先し hard deadline にしない**
+という CEO 方針に従う。
+
 ### PL が決定した優先順位
 
 | 順 | 項目 | 理由 |
@@ -5949,6 +5975,107 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 - **他タスクのついでに接続・配線しない**（PL Console起因の変更は必ず独立タスクとして扱う）
 - 将来着手する際も、**まず隔離環境でPoCしてから統合する**
 - 外部サービス追加・課金・認証・本番公開に該当する判断はYellow Zone（CEO承認必須）
+
+<!-- roadmap:id=mandatory-gate-policy state=planned -->
+0. [ ] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
+      **CEO 確定の不変条件（2026-09-14）**。PL の思考・原因分析・方針判断は制限しない。
+      安全性は「PL が判断できないようにする」ことではなく、**PL が決めた変更・操作を必ず既存 Gate へ
+      通す**ことで担保する。
+
+      ```text
+      PL → 変更案 / 実行案 → Policy Engine が必要Gateを自動判定
+         → 既存Gateへ強制ルーティング → 通過したものだけ実行可能
+      ```
+
+      **PL が自分で変更・回避できないもの（不変条件）**: Strategic / Alignment Review の要否 /
+      Design Review の要否 / Safety Review・Safety Gate の要否 / Independent Review の要否 /
+      CEO Approval の要否 / Production 操作権限 / Safety boundary / 自身の Role・Permission level /
+      Independent Review の独立性条件 / **Gate の BLOCK 結果**。
+      PL がリスク分類や推奨 Gate を出すことは可能だが**参考情報に留め**、最終的な Gate 適用は
+      システム側が決定する。**PL の自己申告だけで Low Risk 化して Gate を減らせる構造にしない。**
+
+      **BLOCK されたときに PL が取れる行動**: 修正 / 再 Review / 代替案提示 / CEO Escalation の4つのみ。
+      **override による実行は不可。**
+
+      **既に満たされている部分（実測。再利用する）**:
+      - `reviewLoadClassifier.ts` — review load を **changedFiles から客観的に算出**する（自己申告ではない）
+      - `designReviewCoordinator.recomputeDecision()` — runner の `finalDecision` を**採用せず API が再計算**する
+      - `guards/gatePolicy.ts` — ローカル判定と API 判定を統合し**安全側へ escalate** する純粋関数。
+        かつ **CONTROL REPOSITORY（AI編集禁止）**
+      - `guards/permissionGuard.ts` / `fileChangeGuard.ts` / Approval Gate — いずれも CONTROL REPOSITORY
+      - `ALWAYS_FORBIDDEN_PATTERNS` — 安全中核ファイルの変更を機械的に拒否
+
+      **不足している最小分（ここだけ補う）**: 上記はいずれも「Job / 変更ファイル」を入力とする。
+      PL が提案する**操作（action）**（例: API 再起動 / quarantine 解除 / retry / rollback /
+      provider 切替 / Task 中止）に対して必要 Gate を決める入口が無い。
+      変更対象・変更種類・Production 影響・DB 変更・権限変更・Safety boundary・Design Philosophy・
+      不可逆性から**必要 Gate を決定する薄い Policy Engine** を1つ足す。
+      **新しい Gate 本体・新しい Review 工程は作らない**（既存 Gate へルーティングするだけ）。
+
+      **Role / Provider / Model Routing との関係**: 独立 Review の provider 分離等の必須制約は
+      **PL より上位の Policy として強制**する（`role-model-registry` から PL が緩められないようにする）。
+
+<!-- roadmap:id=vps-pl-execution-loop state=planned -->
+1. [ ] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
+      **問題**: PL 判断能力が無いのではなく、**PL が VPS 上で継続実行される経路へ接続されていない**。
+      現在 PL 判断（状態把握・停滞検知・原因分析・調査・証拠収集・方針判断・次Task選択・委任・
+      Review 評価・復旧方法選択・CEO Escalation）はすべてローカルの Claude / Codex セッションが担う。
+      **ローカル PC を落とすとこれらが全部止まる。**
+
+      **production evidence（2026-09-14 実測）**: Design Review が timeout → requeue → attempt 2 で
+      `queued` のまま**実行プロセス無し**で停止。外部 PL（ローカルセッション）が気づくまで
+      誰も再開しなかった。`recoverAndRekickAtStartup()` は API 起動時にしか走らないため、
+      **timeout→requeue した run を再kickする常時経路が無い**。Worker の poll は
+      `task-continuations/reconcile` と `supervised-runs/reconcile` は叩くが design review は叩かない。
+
+      **制御ループ**: Observe → Diagnose → Investigate → Decide → Select Action →
+      **既存 Gate / Review**（`mandatory-gate-policy`）→ Execute → Verify → Continue / Escalate。
+
+      **常駐 Agent の新規作成を目的にしない。** event-driven / scheduled check / 既存 Worker・API の
+      実行経路 / 既存 provider CLI を比較し、**最も単純で自然な構造**を選ぶ。
+      Worker の poll cycle に載せるのが最小である可能性が高い（既に reconcile を2種類叩いている）。
+
+      **新しい Recovery subsystem を作らない。** 既存の Resume / Retry / re-kick / reconciliation /
+      quarantine recovery / provider fallback / API・Worker restart / rollback / Review 再実行を
+      **PL が適切に選択して呼べる**ようにする。既存で合理的に復旧できない場合のみ新機構を検討する。
+
+      **推論経路**: 従量課金 API を新標準にしない。既存 provider CLI（`AiCliProvider`）を使う
+      （横断制約・2026-09-14）。重要な PL 判断・設計・Root Cause 分析・Independent Review では
+      性能を優先してよい（`role-model-registry`）。
+
+      **CEO Escalation の要件**: 「エラーです」では不十分。何が起きているか / 原因として何が分かって
+      いるか / 何を調べたか / 選択肢 / PL の推奨案 / それぞれのリスク を**非エンジニア向けに**説明する。
+      代表例: Design Philosophy 変更 / Safety boundary 変更 / 新規権限 / 重大な不可逆操作 /
+      既存 Gate の削除・弱体化 / Business Goal 変更 / 経営判断が要る複数選択肢 /
+      原因不明で安全な復旧方法を確定できない / 同じ Recovery を規定回数試しても改善しない。
+
+      **依存**: `cross-project-state-api`（状態取得。PL の Observe の入口）→ 本項目 →
+      `operator-chat-mobile`（Mobile から PL へ問い合わせ・指示）。
+      **Console UI は後**。まず正確な状態取得と判断ループを優先する。
+
+<!-- roadmap:id=design-review-runner-production-timeout state=planned -->
+2. [ ] **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）** — 2026-09-14登録。
+      **盲目的に re-kick しないこと**（CEO 指示）。
+
+      **事象**: Project `bb509fee` の初回 Task で Design Review が attempt 1〜3 すべて
+      `runner timed out after 120000ms` となり `failed` 終端。初回 Implement Job が作られず Task が進まない。
+
+      **切り分け済み（すべて除外）**:
+      - runner 自体は正常 — 手動実行で **10〜14秒 / exit 0** で実レビュー結果を返す（3回再現）
+      - designText の長さではない — 本番と同一の 1331 字で **11秒**
+      - `controlContextDir` の有無でもない — 付与して **10秒**
+      - stdin の扱いではない — coordinator は `write()` 後に `end()` している
+      - `repoRoot` / script パスでもない — API の実 cwd は `apps/api` で `repoRoot` は正しく解決され、
+        runner も実在する（当初 MainPID の cwd を見て誤診しかけた）
+      - `HOME` / credential でもない — API プロセスの `HOME=/home/ai-team`、CLI credential も存在
+      - プロセスが起動していないのでもない — 再kick 時に runner プロセスの起動を実測
+
+      **未解明**: 上記を除外してなお、**spawn 経由でのみ 120s を超える**。手動では再現しない。
+      次に見るべき候補: 同時実行数（再kick 時に runner 関連プロセスを6件観測）/ API プロセスの
+      event loop 飽和 / provider 側の同時接続制限。
+
+      **関連**: 本件は `vps-pl-execution-loop` の production evidence でもある
+      （VPS 上の PL が居れば検知・調査・復旧できたはず）。
 
 <!-- roadmap:id=chatgpt-mcp-inspect state=planned -->
 1. [ ] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
