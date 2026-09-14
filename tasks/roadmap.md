@@ -1340,13 +1340,28 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       しない。roadmap 再同期は消える Task / Phase に active Job があると throw で拒否するため
       （`Cannot deactivate roadmap task ...`）、切り替えは active Job 0 の時点でのみ成立する。
 
-      **Control Repository 自身（AIteamOS 本体）の Milestone 記録**: 既存の
-      `docs/project_memory/decisions/*.md`（`mvp_completion.md` / `m3_final_production_e2e.md` 等）を
-      手書きで継続する。**生成基盤は作らない。** 上記の Report 項目一覧は共通の見出しとして流用してよい。
+      **対象 Project の一本化（CEO 方針・2026-09-14）**: Milestone Report は **AIteamOS 自身を含む
+      全 Project で一本化**する。AIteamOS は将来 **Project #1** として、他の Product / Business /
+      System と同じ Project Model・Milestone Model・**同一の Milestone Snapshot schema** で扱う。
+      **「通常 Project 用」と「Control Repository 用」という2つの恒久的な Reporting 概念には分けない。**
+      AIteamOS 専用の Report システムは作らない。
 
-      **今回実装しないもの（明記）**: 新しい Reporting 基盤 / 新しい log・telemetry・metrics 基盤 /
-      cost 計測 / 新しい review 基盤 / 新しい queue・daemon / Milestone planning entity /
-      Task 単位の詳細 Report。本追記は設計方針と着手順の確定まで。
+      **今すぐ統一するのは概念と schema であって、取得元ではない。** 現時点で許容する差分は
+      **入力 adapter だけ**（Source of Truth が今は異なるため）:
+      - 通常 Project — 上記の DB 側 source（`tasks` / `jobs` / `review_results` /
+        `design_review_evidence` / `audit_log` / runtime records 等）
+      - AIteamOS 自身 — Control Repository の `tasks/roadmap.md`・Git 履歴・Review・CI・
+        Production E2E・`docs/project_memory/decisions/*.md` から**同じ schema へ**事実を収集する
+
+      `docs/project_memory/decisions/*.md` を手書きで維持する方式は**移行期間の暫定 Source に留め、
+      恒久設計にはしない**。`aiteamos-self-development-tier-a` により AIteamOS 自身が AIteamOS 上の
+      Project #1 として開発される段階で、**通常 Project と同じ生成経路へ収束**させる。
+      したがって分岐は **adapter 層だけに閉じ込め**、snapshot schema・Report 項目・保存先・参照 API・
+      Explainer 経路は**最初から共通**にする。
+
+      **今回実装しないもの（明記）**: 新しい Reporting 基盤 / AIteamOS 専用 Report システム /
+      新しい log・telemetry・metrics 基盤 / cost 計測 / 新しい review 基盤 / 新しい queue・daemon /
+      Milestone planning entity / Task 単位の詳細 Report。本追記は設計方針と着手順の確定まで。
 <!-- roadmap:id=project-auto-meta-review-hardening state=done -->
 11. [x] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
       foundation実装完了。2026-08-14、残り3 Acceptance Criteria全件を実production経路への
