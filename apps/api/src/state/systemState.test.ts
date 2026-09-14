@@ -88,6 +88,72 @@ describe('buildSystemState — 横断状態の読み取り', () => {
     expect(state.attention.filter((a) => a.jobId === job.id)).toHaveLength(1)
   })
 
+  it('生きている承認待ちで止まった Job は job_blocked にしない（approval_waiting と二重に出さない）', () => {
+    // 2026-09-15 production 実測: 新しい Approval Request を発行した直後、同じ停滞が
+    // `approval_waiting` と `job_blocked` の両方で出た。PL は人の判断待ちの相手に復旧を試み、
+    // 試行上限まで使って**二重に CEO を呼ぶ**。
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    const created = storage.approvalRequests.createForJob({
+      taskId: task.id,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: 'af60412',
+      targetDiffHash: 'hash',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt: '2026-09-15T10:00:00.000Z',
+      invalidIf: [],
+      changedFiles: ['apps/worker/src/metaReviewer/autoReview.ts'],
+      triggeredRules: ['git_commit requires CEO approval (policy)'],
+    } as Parameters<IStorage['approvalRequests']['createForJob']>[0], job.id)
+    expect(created.ok).toBe(true)
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'approval_waiting')).toBe(true)
+    expect(state.attention.some((a) => a.kind === 'job_blocked')).toBe(false)
+  })
+
+  it('期限切れ / STALE な承認で止まった Job は job_blocked として出す（誰も進められない本物の停滞）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    const created = storage.approvalRequests.createForJob({
+      taskId: task.id,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: '8ddad05',
+      targetDiffHash: 'hash',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'STALE',
+      expiresAt: '2026-09-15T10:00:00.000Z',
+      invalidIf: [],
+      changedFiles: ['apps/worker/src/metaReviewer/autoReview.ts'],
+      triggeredRules: ['git_commit requires CEO approval (policy)'],
+    } as Parameters<IStorage['approvalRequests']['createForJob']>[0], job.id)
+    expect(created.ok).toBe(true)
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'job_blocked')).toBe(true)
+  })
+
   it('done な Task の blocked Job は attention に出さない（誰も解消できない履歴を残さない）', () => {
     const { storage, projectId } = seed()
     const task = addTask(storage, projectId)

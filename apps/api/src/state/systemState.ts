@@ -18,6 +18,23 @@
 import type { IStorage } from '../storage/interface'
 import type { Job, Task, Project } from '@ai-team/shared'
 
+/**
+ * その Job が「生きている承認待ち」で止まっているか。
+ *
+ * 承認待ちで止まっている Job は **`approval_waiting` が既に表している**。同じ停滞を
+ * `job_blocked` としても出すと、PL は人の判断待ちの相手に対して復旧を試み、試行上限まで
+ * 使い切って**二重に CEO を呼ぶ**（2026-09-15 production で実測）。
+ *
+ * 期限切れ / STALE / REJECTED は対象外 — そちらは**誰も進められない本物の停滞**であり、
+ * `job_blocked` として PL に見せなければならない（この状態が今回の復旧対象そのものだった）。
+ */
+function isWaitingOnLiveApproval(storage: IStorage, job: Job, nowMs: number): boolean {
+  if (job.approvalId === undefined) return false
+  const approval = storage.approvalRequests.findById(job.approvalId)
+  if (approval?.status !== 'WAITING_FOR_USER') return false
+  return new Date(approval.expiresAt).getTime() > nowMs
+}
+
 /** 停滞とみなす既定の閾値。Watchdog の閾値とは別で、こちらは「PL へ知らせるか」の目安。 */
 export const DEFAULT_STALL_HINT_MS = 5 * 60 * 1000
 
@@ -292,7 +309,7 @@ export function buildSystemState(
             detail: job.failureMetadata?.quarantineReason ?? 'workspace is quarantined',
             stuckForMs: elapsedMs(job.completedAt ?? job.createdAt, nowMs),
           })
-        } else if (job.status === 'blocked' && task.status !== 'done') {
+        } else if (job.status === 'blocked' && task.status !== 'done' && !isWaitingOnLiveApproval(storage, job, nowMs)) {
           // **done な Task の blocked Job は attention にしない。**
           // Task が終端に達している以上その Job は履歴であり、誰も解消できない
           // （resume の対象は blocked Task であって done Task ではない）。
