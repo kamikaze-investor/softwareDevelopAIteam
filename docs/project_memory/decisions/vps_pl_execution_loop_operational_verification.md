@@ -80,14 +80,35 @@ CEO の判断待ちの間ずっと tick ごとに Diagnose（provider CLI、実�
 `project is not running` で skip するため、使い捨ての paused Project では Design Review run を
 作れない。安全な検証ケースを作る際の制約として記録する。）
 
+## Escalation の到達経路（2026-09-15 充足）
+
+CEO が LINE Messaging API の credential を `/srv/ai-team/env/api.env` へ設定し、API を再起動して反映した。
+**AI は env ファイルを読み書きしていない**（手順提示と、値を出さない検証のみ）。
+**新しい通知基盤は作っていない**（既存 `sendAlert()` → `lineAdapter` をそのまま使った）。
+
+- `LINE_CHANNEL_ACCESS_TOKEN=SET(len=172)` / `LINE_USER_ID=SET(len=33, wellFormed=true)`
+  （`U` + 16進32文字。表示名や `@` 付き LINE ID ではないことを形式で確認）
+- env 更新 01:29:21 → API 起動 01:31:13。**編集後に再起動されている**
+  （systemd は EnvironmentFile を起動時にしか読まないため、この前後関係が有効化の証拠）
+- 既存 `sendAlert()` の1回実行で `[{"channel":"line","success":true,"attempts":3}]`。**CEO が受信を確認**
+- 安定性確認として `sendLine()` を直接2回 → いずれも1回目で成功（482ms / 354ms）。
+  初回の `attempts:3` は一過性であり、systematic な不安定さではない
+- ファイル権限は `mode=600 owner=ai-team` のまま維持
+
+**既知の限界（意図的に未設定）**: `worker.env` は未設定のため、Worker 由来の CRITICAL 通知
+（Outbox 滞留等）は引き続きコンソールのみ。PL の CEO Escalation は API プロセスなので本条件は充足する。
+また `MAX_SEND_ATTEMPTS = 3` のため、LINE 側が連続で失敗すると通知は失われる。
+
 ## 未実証（本項目を完了にしない理由）
 
-1. **Escalation の到達経路が未設定**。`sendAlert()` は LINE（`LINE_CHANNEL_ACCESS_TOKEN` +
-   `LINE_USER_ID`）か Slack（`SLACK_WEBHOOK_URL`）が無いとコンソールへ落ちる。API・Worker とも
-   未設定であることを journal で確認済み。**新しい通知基盤は不要で既存 notifier の設定だけで足りる**が、
-   外部サービス選定・credential 取得・production env への書き込みは CEO 判断・CEO 操作である
-   （AI は `/srv/ai-team/env/*.env` を読み書きしない）。設定後はコード変更なしで次の Escalation が届く。
-2. **正常化を伴う実復旧は未達**。`design-review-runner-production-timeout` の解決が前提になる。
+1. ~~**Escalation の到達経路が未設定**~~ → **2026-09-15 充足**（上記「Escalation の到達経路」参照）。
+2. **正常化を伴う実復旧は未達**。Phase 3 では復旧操作そのものは完走したが、系は正常化しなかった。
+   `design-review-runner-production-timeout` の Root Cause は 2026-09-14 に特定・修正・deploy 済み
+   （master `ce9df9b`。provider の transient retry 予算 40 秒×2 に対し上限 120 秒が短すぎたこと、
+   timeout 時に stderr を捨てて原因を消していたこと、kill が孫に届かず孤児化していたこと）。
+   修正後、同じレビューは attempt 1 で成功した。
+   **残るのは「PL 自身が実行した復旧で正常化する」ケースの実測**であり、
+   安全に再現できる案件（attempt 残ありの idle run）が自然発生した時点で記録する。
 3. 対象の attention 種別は `design_review_idle` / `design_review_failed` の2つだけである。
    他の停止形態（quarantine・blocked Job 等）に executor は無く、PL は放置する
    （既に `GET /api/state` に出ており、二重通知しない設計）。
