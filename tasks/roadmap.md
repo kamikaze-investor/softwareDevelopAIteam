@@ -6326,6 +6326,14 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       が未解決のため review 自体はまた timeout した。**PL ループの欠陥ではなく、当該 Finding が
       実復旧の成立を塞いでいる**（＝ VPS PL 完成後の優先 Root Cause 調査候補という位置づけを裏づける）。
 
+      **【進行ルール（CEO 指示・2026-09-15）】** 残る evidence（実復旧 → 正常化）の**自然発生待ちを
+      理由に、AIteamOS 全体の Roadmap 開発を停止しない。** 安全に独立して進められる他項目は、
+      正式 Roadmap の dependency / Safety / Leverage に従って通常どおり継続する。
+      **done 判定のためだけに production へ危険な障害を人工注入しない。**
+      自然発生した復旧可能事象で
+      `Observe → Diagnose → Decide → Mandatory Gate → Existing Recovery Action → Verify → normalized`
+      が VPS PL 単独で成立したら、その audit evidence を記録して done 判定する。
+
       **【done 判定の条件（CEO 確定・2026-09-14）】** 次の2つが揃った時点で done とする。
 
       **1. 正常化まで到達する実復旧の Operational E2E（現時点 未充足）。**
@@ -6343,8 +6351,11 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       値を出さない形での検証のみ）、API を再起動して反映した。
 
       検証（値を一切表示していない）:
-      - `LINE_CHANNEL_ACCESS_TOKEN=SET(len=172)` / `LINE_USER_ID=SET(len=33, wellFormed=true)`
-        （`U` + 16進32文字。表示名や `@` 付き LINE ID ではないことを形式で確認）
+      - `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` ともに **configured**。
+        User ID については**形式が妥当であることのみ確認**した（表示名や `@` 付き LINE ID の
+        取り違えを検出するため）。**値・長さ・形式そのものは記録しない**（CEO 指示・2026-09-15:
+        secret の確認は configured / not configured を基本とし、機能上必要でない限り
+        長さ・形式も出力しない）
       - env の更新 01:29:21 に対し API の起動 01:31:13。**編集後に再起動されている**
         （systemd は EnvironmentFile を起動時にしか読まないため、この前後関係が有効化の証拠）
       - 既存 `sendAlert()` の1回実行で `[{"channel":"line","success":true,"attempts":3}]`。
