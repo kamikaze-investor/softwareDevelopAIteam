@@ -6399,12 +6399,36 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - `HOME` / credential でもない — API プロセスの `HOME=/home/ai-team`、CLI credential も存在
       - プロセスが起動していないのでもない — 再kick 時に runner プロセスの起動を実測
 
-      **未解明**: 上記を除外してなお、**spawn 経由でのみ 120s を超える**。手動では再現しない。
-      次に見るべき候補: 同時実行数（再kick 時に runner 関連プロセスを6件観測）/ API プロセスの
-      event loop 飽和 / provider 側の同時接続制限。
+      ~~**未解明**: 上記を除外してなお、**spawn 経由でのみ 120s を超える**。手動では再現しない。~~
+      **【2026-09-14 Root Cause 特定（production 実測）。仮説「spawn 経由でのみ遅い」は誤りだった】**
+
+      **なぜ3回の調査で到達できなかったか**: `executeRunner()` が timeout 時に
+      `stderr: undefined` として**捕捉済みの stderr を捨てていた**ため、DB に残る `error` は
+      `runner timed out after 120000ms` だけだった。原因は記録から消えていた。
+
+      **実測**: 同一入力・同一 spawn（`npx tsx designReviewRunner.ts`・同じ cwd・同じ制限 env）を
+      API プロセスの外で走らせると **2.3 秒 / 15.4 秒 / 44.6 秒**とばらついた。44.6 秒の回の stderr は
+      `[geminiRouter] attempt failed: provider=gemini_api ... failureClass=transient`。
+      つまり**ばらつきは spawn 方法ではなく provider の transient 失敗と retry 待機**由来である。
+      `geminiRouter` は `TRANSIENT_RETRY_DELAYS_MS = [10s, 30s]` を API 経路と CLI 経路で個別に消費し、
+      **待機だけで最大 40 秒 × 2**、さらに Copilot fallback がある。**上限 120 秒はこれを収容していない。**
+
+      **副次の欠陥（孤児化）**: timeout 中のプロセス木を production で直接観測したところ、runner の実体は
+      `npx → npm exec → sh -c → tsx → node` と4段深く、**kill 後も末端の node 2つが生き残って
+      systemd へ reparent されていた**。孤児は provider 接続を掴んだままなので、次の attempt の
+      transient 失敗を増やす側に働く（旧調査の「runner 関連プロセス6件」と整合）。
+      Linux 上で kill 意味論を直接検証: `kill(pid)` だと孫が生存、`kill(-pid)`（プロセスグループ）で回収。
+
+      **対処済み（別 PR）**: timeout 理由へ stderr 末尾を添える / プロセスグループごと kill する /
+      上限 120s→300s（API 経路の transient retry 1周を収容）。
+      **残: worst case（CLI 経路の exec 120 秒 × 3 + Copilot fallback）は依然未収容。**
+      これは caller の timeout を伸ばして解くのではなく、**runner 側の retry 予算を deadline で縛る**
+      のが筋であり、本項目の後続作業として残す。新しい retry framework は作らない
+      （`geminiRouter` の既存 retry に上限を渡す形にする）。
 
       **関連**: 本件は `vps-pl-execution-loop` の production evidence でもある
-      （VPS 上の PL が居れば検知・調査・復旧できたはず）。
+      （VPS 上の PL が居れば検知・調査・復旧できたはず）。実際 2026-09-14 の実復旧 E2E では、
+      PL がこの timeout を2回観測して「systemic な問題」と判断し CEO Escalation へ倒した。
 
 <!-- roadmap:id=chatgpt-mcp-inspect state=planned -->
 1. [ ] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
