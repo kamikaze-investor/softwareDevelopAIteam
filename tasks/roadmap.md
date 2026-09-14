@@ -6336,15 +6336,31 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       ただし当該 timeout が最も適切な実証対象であれば先に Root Cause を修正してよい。
       より小さく安全な復旧ケースがあるならそちらを優先する。
 
-      **2. CEO Escalation が実際に CEO へ届くこと（現時点 未充足）。**
-      `sendAlert()` は LINE（`LINE_CHANNEL_ACCESS_TOKEN` + `LINE_USER_ID`）か
-      Slack（`SLACK_WEBHOOK_URL`）のいずれかが env に無いとコンソール出力へ落ちる。
-      API・Worker とも未設定であることを journal で確認済み（`通知チャネルが未設定です`）。
-      **新しい通知基盤は作らない。既存 notifier の設定だけで足りる。**
-      外部サービスの選定・credential の取得・production env への書き込みは **CEO 判断・CEO 操作**
-      （AI は `/srv/ai-team/env/*.env` を読み書きしない）。設定後はコード変更なしで届く。
+      **2. CEO Escalation が実際に CEO へ届くこと（2026-09-15 充足）。**
+      **新しい通知基盤は作っていない。既存 notifier（`sendAlert()` → `lineAdapter`）の設定だけで足りた。**
+      CEO が LINE Messaging API の credential を `/srv/ai-team/env/api.env` へ設定し
+      （**AI は env ファイルを読み書きしていない**。AI が行ったのは設定手順の提示と、
+      値を出さない形での検証のみ）、API を再起動して反映した。
+
+      検証（値を一切表示していない）:
+      - `LINE_CHANNEL_ACCESS_TOKEN=SET(len=172)` / `LINE_USER_ID=SET(len=33, wellFormed=true)`
+        （`U` + 16進32文字。表示名や `@` 付き LINE ID ではないことを形式で確認）
+      - env の更新 01:29:21 に対し API の起動 01:31:13。**編集後に再起動されている**
+        （systemd は EnvironmentFile を起動時にしか読まないため、この前後関係が有効化の証拠）
+      - 既存 `sendAlert()` の1回実行で `[{"channel":"line","success":true,"attempts":3}]`。
+        **CEO が受信を確認済み**
+      - 安定性の確認として `sendLine()` を直接2回: いずれも1回目で成功（482ms / 354ms）。
+        初回の `attempts:3` は一過性であり、systematic な不安定さではない
+      - ファイル権限は `mode=600 owner=ai-team` のまま維持
+
+      **既知の限界（意図的に未設定）**: `worker.env` には未設定のため、**Worker 側の CRITICAL 通知**
+      （Outbox 滞留等）は引き続きコンソールのみである。PL の CEO Escalation は API プロセスなので
+      本条件は充足するが、Worker 由来の通知も届けたい場合は同じ2行を `worker.env` へ追加する。
+      また `MAX_SEND_ATTEMPTS = 3` なので、LINE 側が連続で失敗すると通知は失われる
+      （現状は単発成功しているため追加対処はしない）。
+
       **将来の正式第一チャネルは Mobile Push（`mobile-push-ceo-escalation`）**であり、
-      LINE / Slack はそこへ至るまでの bootstrap 通知として位置づける（CEO 方針・2026-09-14）。
+      LINE はそこへ至るまでの bootstrap 通知として位置づける（CEO 方針・2026-09-14）。
 
       **問題**: PL 判断能力が無いのではなく、**PL が VPS 上で継続実行される経路へ接続されていない**。
       現在 PL 判断（状態把握・停滞検知・原因分析・調査・証拠収集・方針判断・次Task選択・委任・
