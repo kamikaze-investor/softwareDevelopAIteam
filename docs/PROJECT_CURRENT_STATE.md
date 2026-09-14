@@ -261,6 +261,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
 - **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: in_progress）
 - **Mandatory Gate Policy（state: in_progress）
+- **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
 - **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
