@@ -6471,6 +6471,47 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **本項目より先に着手しない。** 本項目の実運用データ（PL 起動頻度・rule だけで閉じる異常の割合）を
       見てから具体化する。効果検証に必要な記録の要件は当該項目に記載した。
 
+<!-- roadmap:id=lowrisk-candidate-commit-auto-approval-evaluation state=planned -->
+2. [ ] **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）** —
+      2026-09-15登録（CEO 指示）。**本項目は評価であり、実装でも Policy 変更でもない。**
+      **既存 Safety Policy は今この時点では一切変更しない。**
+
+      **確認された事実（production 実測・2026-09-15）**: VPS が Candidate 内で自律実装を完了し、
+      変更は `allowedPaths` 内の2ファイルのみ・risk_level は `LOW` だったが、
+      `triggered_rules` は `git_commit requires CEO approval (policy)` で承認待ちになった。
+      **すべての `git_commit` が risk level に関係なく CEO 承認必須**であり
+      （`apps/api/src/routes/approvalGate.ts`）、これが**連続自律開発の human bottleneck** である。
+      1 Task ごとに CEO を待つため、Roadmap を連続で消化できない。
+
+      **重複確認済み**: 既存 `approval-resume-liveness-dependency`（done）が
+      「low-risk auto approval の設定・env flag は存在せず、`safetyAuditor.ts` は `autoApprove` という
+      キーワード自体を CRITICAL 検出する。auto-approval は当該 Finding の解決策ではなく、
+      採用するならセキュリティモデル変更として CEO 承認が要る」と記録している。
+      **本項目はその「採用するなら」の評価を担う後続**であり、当該項目を再オープンしない。
+      他に auto-approval を扱う項目は無い（`autoApprove` / 自動承認で ledger を検索して確認）。
+
+      **評価する前提候補（CEO 提示。すべて満たす場合に限る、を出発点とする）**:
+      - **Candidate 環境のみ**（`/workspace/target` の Candidate clone 内。Stable には一切触れない）
+      - 変更が **`allowedPaths` 内**に収まっている
+      - **protected / safety files の変更が無い**（`ALWAYS_FORBIDDEN_PATTERNS` 相当）
+      - **tests / required validation が PASS**
+      - **Independent Review が PASS**
+      - **Mandatory Gate が PASS**
+      - **Stable Promotion / production deploy とは別権限**（自動承認は commit までで、
+        promotion・deploy には一切及ばない）
+
+      **引き続き CEO Approval 対象として残すもの（緩和しない）**: Safety boundary /
+      production 操作 / 権限変更 / DB migration / protected files / Goal・Design Philosophy 変更。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - `safetyAuditor.ts` が `autoApprove` を CRITICAL 検出する設計をどう扱うか。
+        **検出を弱めるのではなく**、自動承認が「Gate を迂回する経路」ではないことを
+        構造で示せるか（例: 承認レコード自体は作られ、誰が承認したかが監査に残る）
+      - 上記7条件を**機械的に検証できるか**。1つでも自己申告に依存するなら採用しない
+      - 効果検証可能性（Design Philosophy 8）: 自動承認した commit と CEO 承認した commit を
+        後から区別・比較できる記録経路を同時に設計する
+      - 撤回可能性: 自動承認を止めたいとき、**設定1つで即座に全件 CEO 承認へ戻せる**こと
+
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
 3. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
