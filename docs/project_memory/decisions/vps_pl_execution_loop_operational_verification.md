@@ -86,8 +86,9 @@ CEO が LINE Messaging API の credential を `/srv/ai-team/env/api.env` へ設�
 **AI は env ファイルを読み書きしていない**（手順提示と、値を出さない検証のみ）。
 **新しい通知基盤は作っていない**（既存 `sendAlert()` → `lineAdapter` をそのまま使った）。
 
-- `LINE_CHANNEL_ACCESS_TOKEN=SET(len=172)` / `LINE_USER_ID=SET(len=33, wellFormed=true)`
-  （`U` + 16進32文字。表示名や `@` 付き LINE ID ではないことを形式で確認）
+- `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` ともに **configured**。
+  User ID は**形式が妥当であることのみ確認**した（表示名や `@` 付き LINE ID の取り違え検出のため）。
+  **値・長さ・形式そのものは記録しない**（CEO 指示・2026-09-15）
 - env 更新 01:29:21 → API 起動 01:31:13。**編集後に再起動されている**
   （systemd は EnvironmentFile を起動時にしか読まないため、この前後関係が有効化の証拠）
 - 既存 `sendAlert()` の1回実行で `[{"channel":"line","success":true,"attempts":3}]`。**CEO が受信を確認**

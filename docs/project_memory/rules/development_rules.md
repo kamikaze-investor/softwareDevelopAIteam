@@ -69,10 +69,25 @@ pnpm --filter @ai-team/worker audit:gate
   現在の結論へ更新する。各項目冒頭へ「現在の結論サマリー」を機械的に追加する運用は、
   本文との二重Truthを生むため採用しない
 
+## Secret の確認結果の出し方（CEO 指示・2026-09-15）
+
+credential が設定されているかを確認したとき、AI が出力してよいのは
+**`configured` / `not configured` まで**である。
+
+- **値を出さないのは当然として、長さ・接頭辞・文字種・形式の妥当性も出さない。**
+  いずれも secret に関する情報であり、確認報告に載せる必要が無い
+- 形式検査が機能上必要な場合（例: LINE の User ID を入れるべき場所に表示名が入っている取り違えの検出）は、
+  **検査は行ってよいが、出力するのは判定結果だけ**にする（「形式は妥当」/「形式が違う」）
+- この規則は chat 出力だけでなく、**commit する ledger・決定記録にも同じく適用する**
+
+実例（是正済み）: `LINE_CHANNEL_ACCESS_TOKEN=SET(len=172)` のような長さ付きの報告を行い、
+CEO から中止の指示を受けた。該当箇所は `configured` 表記へ書き換えた。
+
 ## 禁止事項
 
 - Control Repository (`apps/api/`, `apps/worker/`, `sandbox/`) の改変
 - `.env` / secret filesの読み書き
+- secret の値・長さ・形式を AI 出力へ載せること（上記参照）
 - `sudo`, `rm -rf /`, `curl | sh` などの危険コマンド
 - mainへの直接push
 
