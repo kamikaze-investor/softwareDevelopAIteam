@@ -70,6 +70,14 @@ export interface AdoptRoadmapItemInput {
   allowedPaths: string[]
   /** PL が明示する完了条件。ledger の散文からは推測しない。 */
   acceptanceCriteria: string[]
+  /**
+   * 今回実装する範囲。**任意**。
+   *
+   * 複数サブ項目を含む ledger 項目を採用するとき、対象サブ項目だけを明示するために使う。
+   * 指定すると description の先頭へ「今回実装する範囲」として載り、ledger 本文はその後ろに残る。
+   * **ledger 側の書式は一切変えない**（`buildAdoptedDescription()` 参照）。
+   */
+  implementationScope?: string
 }
 
 export interface AdoptRoadmapItemDeps {
@@ -89,6 +97,42 @@ function resolveTargetRoot(): string {
  * parser が返す行 index をそのまま使い、checkbox 行から次の roadmap metadata 行の直前までを
  * description とする。**parser へ新しい抽出責務を足さない**ための切り出しである。
  */
+/**
+ * 採用した Task の description を組み立てる。
+ *
+ * **問題**: description は ledger 項目の本文全文になる。複数サブ項目を含む項目では、
+ * Implementer が対象外のサブ項目まで実装対象と解釈する。production で2回再現した
+ * （直近: `roadmap-adoption-followups` の採用で、対象外と明記したサブ項目(2)側の
+ * `schema.ts` / `sqlite.ts` / `types/task.ts` 等を変更し、File Change Guard が
+ * `fileChangeAllowed:false` で停止させた。安全機構は正しく働いたが、Task は進まなかった）。
+ *
+ * **最小の対処**: 採用時に「今回実装する範囲」を**プロンプト上だけ**で上書きできるようにする。
+ * ledger 本文はそのまま後ろに残す（文脈として必要であり、**ledger 側へサブ項目の構造化は
+ * 持ち込まない**という本項目の方針にも従う）。
+ *
+ * `implementationScope` 未指定なら、従来どおり ledger 本文だけを返す（後方互換）。
+ */
+export function buildAdoptedDescription(
+  ledgerBody: string,
+  implementationScope: string | undefined,
+): string {
+  const scope = implementationScope?.trim()
+  if (!scope) return ledgerBody
+
+  return [
+    '## 今回実装する範囲（この Task の対象）',
+    '',
+    scope,
+    '',
+    '**上記以外は対象外である。** 以下は採用元 Roadmap 項目の本文であり、',
+    '文脈として残しているだけで実装対象の定義ではない。',
+    '',
+    '---',
+    '',
+    ledgerBody,
+  ].join('\n')
+}
+
 export function extractItemDescription(markdown: string, item: RoadmapItem): string {
   const lines = markdown.split(/\r?\n/)
   const start = item.checkboxLineIndex
@@ -170,7 +214,10 @@ export async function adoptRoadmapItem(
   const taskInput: RoadmapSyncTaskInput = {
     roadmapTaskKey: item.id,
     title: item.title,
-    description: extractItemDescription(markdown, item),
+    description: buildAdoptedDescription(
+      extractItemDescription(markdown, item),
+      input.implementationScope,
+    ),
     phase: ADOPTED_PHASE_NUMBER,
     // 採用した項目は「実装して commit まで到達させる」ものなので固定でよい。
     // `selectNextContinuableTask()` と初回 Implement Job の eligibility が
