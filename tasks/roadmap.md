@@ -4595,6 +4595,17 @@ worktree と別 repository は採らない。
       **最小案**: 採用 API へ任意の `implementationScope` を追加し、description は ledger 全文のまま
       プロンプト上のスコープだけを上書きする。**ledger 側へサブ項目の構造化は持ち込まない。**
 
+      **【2026-09-15 追記: (2) の範囲を実測で拡張する。別項目は立てない】**
+      同じ「`retryable` で skip したあと誰も拾い直さない」形が **running な Project でも起きる**。
+      実測: 採用時の design review の attempt 1 が失敗 → `createInitialImplementWorkflow()` が
+      `design review did not align (requeued)` で retryable skip → その後 attempt 2 が成功して
+      evidence が登録されても、**`ensureInitialWorkflowsForActiveTasks()` を再実行する経路が無いため
+      初回 Job が作られないまま Task が `task_ready_without_job` で止まる**（外部から採用 API を
+      再実行して回避した）。
+      したがって (2) の本質は Project status ではなく **「retryable skip の再拾い上げ経路が無い」**ことである。
+      最小案も同じ: **既存の `ensureInitialWorkflowsForActiveTasks()` を呼び直せる経路を1つ用意する**
+      （resume 分岐に加え、requeue 後の再評価も同じ経路に載せる）。新しい queue / daemon は作らない。
+
       **(2) paused / draft の Project へ採用しても初回 Job が作られない** —
       `createInitialImplementWorkflow()` は `project.status !== 'running'` を `retryable` で skip し、
       `PATCH /api/projects/:id` の resume 分岐は `retryPendingContinuationsForProject()` しか呼ばず
@@ -6349,13 +6360,31 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **【done 判定の条件（CEO 確定・2026-09-14）】** 次の2つが揃った時点で done とする。
 
-      **1. 正常化まで到達する実復旧の Operational E2E（現時点 未充足）。**
-      上記の実測は「検知 → 分析 → 判断 → Gate → 正式操作 → 状態再確認 → 適切な Escalation」までを
-      VPS 単独で完走したが、**正常状態への復旧は実証できていない**ため条件は満たしていない。
-      既存システム内で**安全に再現可能な復旧可能事象**を1件選び、正常化までを実測する。
+      **1. 正常化まで到達する実復旧の Operational E2E（2026-09-15: 復旧は成功。verdict は `normalized` ではない）。**
+
+      **自然発生した事象で、VPS PL が無人で復旧に成功した**（人工注入なし。次項目の採用作業中に
+      design review の attempt 1 が失敗 → requeue → `design_review_idle` になったものを PL が拾った）。
+
+      | 時刻 (UTC) | 監査 |
+      |---|---|
+      | 17:24:02.419 | `pl_action_authorize / authorized` — `kind=rekick_design_review gates=none policy=pl-action-policy-v1` |
+      | 17:26:34.093 | `pl_loop / acted` — `kind=rekick_design_review exec_ok=true verify=different_anomaly design review rekick: evidence_registered` |
+
+      対象は `design_review_idle:bd80c4ce…`。**再kickされた review は ALIGNED で evidence が登録され**、
+      停止していた Task はその後 implement Job の実行まで進んだ。
+      つまり `Observe → Diagnose → Decide → Mandatory Gate → Existing Recovery Action → Verify` は
+      VPS 単独で完走し、**復旧対象そのものは解消した**。
+
+      **ただし記録された verdict は `normalized` ではなく `different_anomaly` である。**
+      `design_review_idle` は消えたが、同じ Task に後続状態 `task_ready_without_job` が現れたため、
+      `verifyOutcome()` が「別の異常」と分類した。CEO 確定の条件は verdict が `normalized` であることなので、
+      **本項目は自動では done にしていない。** 判断は次のいずれか:
+      (a) 「復旧対象が解消し、現れたのが pipeline の後続状態である」ケースを `normalized` と区別して
+      扱えるよう `verifyOutcome()` を精緻化してから再実測する、(b) 今回の実測をもって充足と見なす。
+      **(a) は verdict 意味論の変更であり、PL の自己申告で緩めてはならない種類の判断なので CEO 判断とする。**
+
       **`design-review-runner-production-timeout` の解決を本項目の必須依存にはしない**（別 Finding）。
-      ただし当該 timeout が最も適切な実証対象であれば先に Root Cause を修正してよい。
-      より小さく安全な復旧ケースがあるならそちらを優先する。
+      なお当該 Root Cause は 2026-09-14 に特定・修正・deploy 済みで、今回の再kickが成功したのはその効果である。
 
       **2. CEO Escalation が実際に CEO へ届くこと（2026-09-15 充足）。**
       **新しい通知基盤は作っていない。既存 notifier（`sendAlert()` → `lineAdapter`）の設定だけで足りた。**
@@ -6532,6 +6561,31 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **Explainer との関係**: 回答文の平易化は `failure-explanation-pregeneration`（Explainer 責務）
       が担う。本項目は**事実の取得と、既存の安全な操作の呼び出し**に徹する。
+
+<!-- roadmap:id=pl-autonomous-roadmap-adoption state=planned -->
+4. [ ] **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）** —
+      2026-09-15登録。**本線を VPS へ移管した時点で判明した最大のギャップ。**
+
+      **問題**: VPS PL は採用済み Task の停滞を復旧できるが、**Task が完了した後に次の項目を採用できない**。
+      `adopt_roadmap_item` は語彙にあるが `strategic_alignment_review` + `design_review` を要求し、
+      両者は `UNVERIFIABLE_GATES` なので **PL からは実行不能**（fail-closed として正しい）。
+      結果として、1 Task 終わるごとに外部セッションが採用 API を叩く必要がある。
+      CEO 方針「CEO が毎回次 Task を指定する運用へ戻さない」を満たすには、ここが要る。
+
+      **これは Authority 変更である。** 採用は「Project に新しいスコープを約束する」操作であり、
+      PL に与えてよいかは**CEO 判断**。実装も、PL が自分の権限を広げるコードを自分で書く形にしない
+      （`change_own_permission` が禁止されている趣旨に反する）。**外部セッション + Independent Review** で行う。
+
+      **着手前に決めること（実装方針を先に決めない）**:
+      - 採用に必要な Gate をどう検証可能にするか。`strategic_alignment_review` を人が承認する
+        代わりに、**ledger 側の既存情報**（CEO が確定した優先順位表・依存関係）で機械的に満たせないか
+      - PL が選べる範囲を絞るか（例: CEO が承認済みの優先順位表の上位 N 件からのみ）
+      - `allowedPaths` / `acceptanceCriteria` / `implementationScope` を PL が決めてよいか。
+        これらは File Change Guard の効き目そのものなので、**PL の自己申告で緩まない形**が要る
+      - 失敗時の扱い（採用したが design review が CONFLICT を返した場合）
+
+      **やらないこと**: 新しい Gate・新しい Review 工程・PL 専用の採用経路。
+      既存 `POST /api/projects/:id/roadmap-adoptions` と `authorizePlAction()` の上に載せる。
 
 <!-- roadmap:id=mobile-push-ceo-escalation state=planned -->
 3. [ ] **CEO Escalation を AIteamOS Mobile Push で届ける（将来の正式第一通知チャネル）** —
