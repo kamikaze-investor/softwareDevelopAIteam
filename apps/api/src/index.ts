@@ -10,6 +10,7 @@ import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import { getStorage } from './storage'
 import { projectRoutes } from './routes/projects'
+import { systemStateRoutes } from './routes/systemState.js'
 import { approvalRoutes } from './routes/approvals'
 import { taskRoutes } from './routes/tasks'
 import { jobRoutes } from './routes/jobs'
@@ -56,6 +57,7 @@ app.get('/health', async () => {
 
 // Routes (Phase 1で追加予定)
 app.register(projectRoutes, { prefix: '/api/projects' })
+app.register(systemStateRoutes, { prefix: '/api' })
 app.register(approvalRoutes, { prefix: '/api' })
 app.register(taskRoutes, { prefix: '/api/tasks' })
 app.register(jobRoutes, { prefix: '/api/jobs' })

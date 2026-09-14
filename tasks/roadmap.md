@@ -5922,8 +5922,31 @@ Phase 1c E2E・Recovery・Worker・Gate・Roadmap実行系などの**本線安�
 「正確な状態・イベントが取得できること」を優先する方針であり、
 PL Console 4項目の state・優先度は変更していない。
 
-<!-- roadmap:id=cross-project-state-api state=planned -->
-0. [ ] **横断状態読み出し API（Console より先に、状態が取れることを優先）** — 2026-09-13登録。
+<!-- roadmap:id=cross-project-state-api state=in_progress -->
+0. [~] **横断状態読み出し API（Console より先に、状態が取れることを優先）** — 2026-09-13登録。
+      **【2026-09-14 進捗: read 口を実装。残りは `audit_log.project_id`】**
+      `GET /api/state`（`apps/api/src/routes/systemState.ts` / `src/state/systemState.ts`）を実装した。
+      **read-only で副作用を持たない**（既存 GET の契約を維持。回帰テストで固定）。
+      権限判断もしない（必要 Gate の決定は `mandatory-gate-policy` の責務）。
+
+      返すもの: Project ごとの status / roadmap 進捗 / current task（allowedPaths 含む）/
+      Job の status 別件数と最新 Job（provider・exitCode・commitHash・changedFiles・stderr 末尾・
+      quarantine 状態）/ 承認待ち件数 / pending continuation 件数 / Design Review の status・attempt・
+      error・**idle 判定**。加えて全体 totals（Project/Job の status 別、quarantine 数、承認待ち、
+      continuation、active design review、active supervised run）。
+
+      **`attention` 配列が PL 向けの中核**である。単なる状態羅列ではなく「いま止まっている / 判断が要る」
+      ものだけを返す: `job_blocked` / `workspace_quarantined` / `approval_waiting` /
+      `design_review_failed` / **`design_review_idle`** / `continuation_pending` /
+      **`task_ready_without_job`** / `job_running_long`。
+      `design_review_idle` と `task_ready_without_job` は、今回 production で実際に発生した
+      「誰も再開しないまま止まる」2形態をそのまま検出する。
+      **`attention` は観測事実のみで、対処方法は含めない**（行動選択は PL、実行可否は Gate）。
+
+      **残っている作業（本項目は完了にしない）**: `audit_log` への `project_id` 追加（additive）。
+      AIcompanyOS 互換の最小構造であり、PL ループには必須でないため後続で行う。
+      archived Project は観測対象から除外している（履歴は既存の Project 単位経路で読む）。
+
       **【2026-09-14 追記: 本項目は MCP と Operator Chat の共通基盤である】**
       CEO 方針 item 4（MCP 用と Mobile Chat 用に別々の操作系を作らない）の受け皿は本項目とする。
       `chatgpt-mcp-inspect` と `operator-chat-mobile` は**どちらも本項目の read 口を消費**し、
