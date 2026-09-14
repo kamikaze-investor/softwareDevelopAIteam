@@ -4872,6 +4872,44 @@ deploy canary は全 PASS だった。
       `populated` が 0 でないとき、drain timeout、kill 失敗は従来どおり quarantine とする。
       新しい supervision 方式・新しい sandbox 基盤は作らない。
 
+      **【2026-09-14 追記: 真因を特定。当初の「一過性 EBUSY」仮説は誤りだった】**
+
+      bounded retry（PR #167）を入れたところ、同時に追加した診断情報が真因を暴いた:
+
+      ```
+      still failing after 3 retries (populated 0, child cgroups remain:
+        job-job-drain-1789359652300, job-job-drain-throw-1789359652319)
+      ```
+
+      **一過性ではなく、誰も消さない空の子 cgroup が残っていた**（実測: 両方とも
+      `populated=0` / `cgroup.procs` 0 行の空ディレクトリ）。親の `rmdir` は ENOTEMPTY 相当で
+      必ず失敗するため、短い retry では原理的に解消しない。
+
+      **子 cgroup の出所は AIteamOS 自身のテスト**だった。
+      `apps/worker/src/execution/runContainedCommand.test.ts` の `drain_timeout` 再現テスト2件
+      （`jobId: 'job-drain'` / `'job-drain-throw'`）は、`drainMs: 0` と生存する `setsid sleep 30` で
+      **意図的に drain_timeout を起こす**。`drain_timeout` 経路は production と同じく `rmdir` へ
+      到達しないため cgroup が残る。
+
+      **これは自己開発でのみ問題になる自己参照**である。通常運用では残るのは「その Job 自身の
+      cgroup」であり、親は systemd 所有の Worker cgroup なので誰も `rmdir` せず無害。
+      ところが **Tier A 自己開発では Candidate 上で `pnpm test` が Job の cgroup の内側で走る**ため、
+      テストが作る cgroup が**その Job の子**になり、Job 終了時の `rmdir` を妨げる。
+      よって **worker テストスイートを実行する自己開発 Task では決定論的に再発する**。
+
+      **修正（テスト側。production コードは変更しない）**: 当該2件のテストが、意図的に残した
+      cgroup を `cgroup.kill` → `populated 0` 待ち → `rmdir` で後片付けする。
+      production の `drain_timeout` 挙動（cgroup を残す fail-closed）は**変更しない**。
+
+      **PR #167 の retry は無駄ではない**: 一過性 EBUSY への備えとして妥当であり、
+      何より**追加した診断情報がこの真因の特定を可能にした**。EBUSY を単に ignore していたら、
+      空の子 cgroup が残り続ける本当の問題は見えないままだった。
+
+      **未決（本項目に残す）**: production 側で「空の子 cgroup を削除してから親を `rmdir` する」
+      ようにすべきかは別途判断する。payload が正当に入れ子 cgroup を作る場合
+      （nested container 等）に備える価値はあるが、**安全経路の挙動変更**であり、
+      本当のリークを隠す副作用もあるため、必要性が実証されるまで実装しない。
+
       **関連**: `quarantined-dirty-task-generic-recovery`（この quarantine から**出られない**理由。
       同じ復旧クラスタだが根本原因と責務が異なるため、**1つの実装 / PR にまとめない**）。
 
