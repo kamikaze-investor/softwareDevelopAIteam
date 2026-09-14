@@ -6326,14 +6326,25 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       が未解決のため review 自体はまた timeout した。**PL ループの欠陥ではなく、当該 Finding が
       実復旧の成立を塞いでいる**（＝ VPS PL 完成後の優先 Root Cause 調査候補という位置づけを裏づける）。
 
-      **残っている作業（本項目は完了にしない）**:
-      **Escalation の到達経路が未設定**。`sendAlert()` は LINE（`LINE_CHANNEL_ACCESS_TOKEN` +
-      `LINE_USER_ID`）か Slack（`SLACK_WEBHOOK_URL`）のいずれかが env に無いとコンソール出力へ落ちる。
+      **【done 判定の条件（CEO 確定・2026-09-14）】** 次の2つが揃った時点で done とする。
+
+      **1. 正常化まで到達する実復旧の Operational E2E（現時点 未充足）。**
+      上記の実測は「検知 → 分析 → 判断 → Gate → 正式操作 → 状態再確認 → 適切な Escalation」までを
+      VPS 単独で完走したが、**正常状態への復旧は実証できていない**ため条件は満たしていない。
+      既存システム内で**安全に再現可能な復旧可能事象**を1件選び、正常化までを実測する。
+      **`design-review-runner-production-timeout` の解決を本項目の必須依存にはしない**（別 Finding）。
+      ただし当該 timeout が最も適切な実証対象であれば先に Root Cause を修正してよい。
+      より小さく安全な復旧ケースがあるならそちらを優先する。
+
+      **2. CEO Escalation が実際に CEO へ届くこと（現時点 未充足）。**
+      `sendAlert()` は LINE（`LINE_CHANNEL_ACCESS_TOKEN` + `LINE_USER_ID`）か
+      Slack（`SLACK_WEBHOOK_URL`）のいずれかが env に無いとコンソール出力へ落ちる。
       API・Worker とも未設定であることを journal で確認済み（`通知チャネルが未設定です`）。
-      **新しい通知基盤は作らない。既存 notifier の設定だけで足りる**が、
-      外部サービスの選定・credential の取得・production env への書き込みはいずれも
-      **CEO 判断・CEO 操作**（Yellow Zone、かつ AI は `/srv/ai-team/env/*.env` を読み書きしない）。
-      設定後は次の CEO Escalation がそのまま届く（コード変更は不要）。
+      **新しい通知基盤は作らない。既存 notifier の設定だけで足りる。**
+      外部サービスの選定・credential の取得・production env への書き込みは **CEO 判断・CEO 操作**
+      （AI は `/srv/ai-team/env/*.env` を読み書きしない）。設定後はコード変更なしで届く。
+      **将来の正式第一チャネルは Mobile Push（`mobile-push-ceo-escalation`）**であり、
+      LINE / Slack はそこへ至るまでの bootstrap 通知として位置づける（CEO 方針・2026-09-14）。
 
       **問題**: PL 判断能力が無いのではなく、**PL が VPS 上で継続実行される経路へ接続されていない**。
       現在 PL 判断（状態把握・停滞検知・原因分析・調査・証拠収集・方針判断・次Task選択・委任・
@@ -6458,6 +6469,42 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **Explainer との関係**: 回答文の平易化は `failure-explanation-pregeneration`（Explainer 責務）
       が担う。本項目は**事実の取得と、既存の安全な操作の呼び出し**に徹する。
 
+<!-- roadmap:id=mobile-push-ceo-escalation state=planned -->
+3. [ ] **CEO Escalation を AIteamOS Mobile Push で届ける（将来の正式第一通知チャネル）** —
+      2026-09-14登録（CEO 方針）。
+      **着手条件**: `vps-pl-execution-loop` の完成後。**本項目のために VPS PL 最小実装・
+      Mandatory Gate・Operational E2E を止めない。** 着手順は CEO の列挙順をそのまま固定優先順位に
+      せず、`operator-chat-mobile` / `chatgpt-mcp-inspect` / `monitoring-tiering-watchdog-monitor-pl`
+      との依存・Safety・Leverage を **PL が再評価して決める**。
+
+      **棚卸し結果（新規基盤が要ると確認した。重複は無い）**:
+      - `apps/mobile/package.json` に `expo-notifications` 等の通知依存は**無く**、push token 取得・
+        permission 要求・通知ハンドラの実装も**無い**（grep 0 件）。よって FCM / APNs /
+        device token 管理 / permission 管理は新規に要る
+      - **deep link は素地がある**: `app.json` の `scheme: "ai-dev-team"` と Expo Router の既存ルート
+        （`/tasks` `/approvals` `/projects` `/create`）。deep link 基盤を新設する前にこれを使う
+      - 既存 Roadmap に push / 通知基盤の項目は**無い**。`notifier.ts`（Phase 1 の「通知ルーター」）は
+        LINE / Slack のチャネル実装であって Mobile Push ではない
+
+      **目標構造（Push 専用の Escalation ロジックを作らない）**:
+
+      ```text
+      VPS PL → CEO Escalation → 既存 notifier / alert 経路 → AIteamOS Mobile Push
+             → 通知タップ → 対象 Project / Task / Incident / Approval / Operator Chat を直接開く
+      ```
+
+      **Source of Truth は既存の CEO Escalation / notifier** であり、Push はその送信先を1つ増やす
+      だけにする。判断・分類・宛先決定・状態取得を Push 側へ重複実装しない。
+
+      **通知内容の最低要件**: 何が起きたか / 対象 Project・Task / CEO 判断が必要か / 緊急度 /
+      アプリ内で確認すべき場所。将来 Operator Chat・Approval・Incident 画面が整ったときに
+      その画面へ deep link できる構造を考慮しておく。
+
+      **LINE / Slack の位置づけ**: **正式な操作画面にはしない。** VPS PL 完成までの bootstrap 通知 /
+      将来の fallback / 冗長通知として利用可能にする。Mobile Push 稼働後はアプリ通知を第一経路とする。
+
+      **やらないこと**: Push 専用の Escalation 判定 / 新しい通知 Source of Truth /
+      Push 専用の状態取得経路 / 既存 `sendAlert()` と並立する2つ目の通知経路。
 
 <!-- roadmap:id=pl-console-candidate-evaluation state=deferred -->
 1. [ ] **PL Console候補の評価（調査のみ・コード変更なし）**
