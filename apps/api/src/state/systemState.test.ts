@@ -151,3 +151,53 @@ describe('buildSystemState — 横断状態の読み取り', () => {
     expect(second).toEqual(first)
   })
 })
+
+describe('buildSystemState — 終端した Design Review も観測できる（production 検証で判明した欠落）', () => {
+  it('failed で終わった design review を attention に出す', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const run = storage.designReviewRuns.create({
+      reviewKind: 'task',
+      subjectId: task.id,
+      taskId: task.id,
+      designText: 'd',
+      designTextHash: 'h',
+      taskTitle: 'T',
+      changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    expect(claimed.run).toBeDefined()
+    storage.designReviewRuns.complete(run.id, claimed.run!.claimToken!, 'failed', undefined, 'runner timed out after 120000ms')
+
+    const state = buildSystemState(storage, { now })
+
+    const item = state.attention.find((a) => a.kind === 'design_review_failed')
+    expect(item).toBeDefined()
+    expect(item?.detail).toContain('timed out')
+    // 停止理由として Project サマリにも残る
+    expect(state.projects[0].designReview?.status).toBe('failed')
+    expect(state.projects[0].designReview?.idle).toBe(false)
+  })
+
+  it('succeeded な review は attention に出さない（正常系を異常扱いしない）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const run = storage.designReviewRuns.create({
+      reviewKind: 'task',
+      subjectId: task.id,
+      taskId: task.id,
+      designText: 'd',
+      designTextHash: 'h',
+      taskTitle: 'T',
+      changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(run.id, claimed.run!.claimToken!, 'succeeded', '{}')
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'design_review_failed')).toBe(false)
+    expect(state.attention.some((a) => a.kind === 'design_review_idle')).toBe(false)
+    expect(state.projects[0].designReview?.status).toBe('succeeded')
+  })
+})

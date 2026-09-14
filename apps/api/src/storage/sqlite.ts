@@ -3118,6 +3118,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
+    findLatestByTaskId(taskId) {
+      const row = db.prepare(
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+      ).get(taskId) as any
+      return row ? deserializeDesignReviewRun(row) : undefined
+    },
     findQueued() {
       const rows = db.prepare(
         "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"

@@ -669,6 +669,13 @@ export interface ISupervisedRunStorage {
 export interface IDesignReviewRunStorage {
   findById(id: string): DesignReviewRun | undefined
   findActiveByTaskId(taskId: string): DesignReviewRun | undefined
+  /**
+   * 終端した run も含めて、その Task の最新 run を返す。
+   * `findActiveByTaskId()` は queued/running しか返さないため、**failed で終わった review が
+   * 観測できない**。停止理由を知るために read-only の導出として追加した
+   * （ledger: `cross-project-state-api` の production 検証で欠落が判明）。
+   */
+  findLatestByTaskId(taskId: string): DesignReviewRun | undefined
   /** 同一Taskにqueued/running中のrunがある場合は作成せず既存を返す（partial unique index準拠）。 */
   create(input: DesignReviewRunCreateInput): DesignReviewRun
   /** startup recovery後に再kick対象となるqueued run一覧。 */
