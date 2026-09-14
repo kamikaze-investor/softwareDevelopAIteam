@@ -360,8 +360,15 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
   try {
     // ── Observe ───────────────────────────────────────────────
     const before = buildSystemState(storage, deps.now ? { now: deps.now } : {})
-    const actionable = before.attention.filter((item) =>
-      ACTIONABLE_ATTENTION_KINDS.includes(item.kind),
+    // **Escalation 済みの対象は選択段階で外す。**
+    // production の初回 tick（2026-09-14）で判明: escalation は attempt として数えないため、
+    // 選択段階で外さないと、既に CEO へ上げた対象に対して tick ごとに Diagnose（provider CLI 実行、
+    // 実測 25 秒）を走らせ、最後に「already escalated」で捨てることになる。
+    // CEO の判断待ちの間ずっとモデル枠を焼く挙動であり、
+    // 「一時的・既知の異常による不要な PL 起動を減らす」という本項目の目的に反する。
+    const actionable = before.attention.filter(
+      (item) =>
+        ACTIONABLE_ATTENTION_KINDS.includes(item.kind) && !hasEscalated(storage, targetKeyOf(item)),
     )
     const item = selectTarget(actionable)
     if (!item) {
@@ -370,7 +377,8 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
         reason:
           before.attention.length === 0
             ? 'no attention items'
-            : `no wired executor for the ${before.attention.length} attention item(s) present`,
+            : `nothing actionable among the ${before.attention.length} attention item(s) ` +
+              '(no wired executor, or already escalated and waiting on the CEO)',
       }
     }
 

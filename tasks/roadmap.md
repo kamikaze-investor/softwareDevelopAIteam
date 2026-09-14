@@ -6263,9 +6263,40 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       route 登録と interval 追加。`apps/worker/src/index.ts` は
       `ALWAYS_FORBIDDEN_PATTERNS` に該当するため触っていない（Worker poll cycle へは載せられない）。
 
-      **残っている作業（本項目は完了にしない）**: VPS 上での Operational E2E。
-      異常検知 → PL 起動 → 調査 → action 提案 → Gate → 既存操作 → 状態再確認 までを実測する。
-      最初の実戦候補は `design-review-runner-production-timeout`（stalled review）。
+      **【2026-09-14 Phase 1 Operational E2E: PASS（production 実測）】**
+      master `d06436d` を production へ deploy し（API+Worker を停止 → ff-only → API 起動 → 健全性確認 →
+      Worker 起動。DB backup 取得済み）、**`PL_LOOP_ENABLED` は false のまま** `POST /api/pl/tick` を
+      **1回だけ**手動実行した。対象は実在の停止状態
+      （Project `bb509fee` / Task `76ea5ff3` / `design_review_failed`「runner timed out after 120000ms」、
+      約2.6時間停止）。
+
+      | 検査項目 | 実測 |
+      |---|---|
+      | 対象 Task / Review の特定 | `design_review_failed:76ea5ff3…` を選択（同 Task の他 run へは触れず） |
+      | PL の判断根拠 | 「複数回の timeout 失敗は systemic な問題を示し、retry では安全に解決できない」 |
+      | 提案 action | `escalate_to_ceo`（**`rekick_design_review` を含む想定外操作は行わなかった**） |
+      | Mandatory Gate | `audit_log` に `pl_action_authorize / authorized / kind=escalate_to_ceo gates=none policy=pl-action-policy-v1` |
+      | workspace 変更 | **ゼロ**（`/workspace/target` HEAD `5079a2f`・dirty 0・branch 不変、前後一致） |
+      | attempt 上限 | run `060b8c66` は `attempt_count=3 / failed` のまま。**再kickしていない** |
+      | 結果確認 | `GET /api/state` を再取得。attention は不変（= 正常化していない）と正しく判定 |
+      | 盲目的 retry | 無し。1 tick で Escalation へ倒れた |
+      | 監査 | `pl_action_authorize`（Gate）と `pl_loop`（判断・結果）の2行が残った |
+      | 所要 | 25.3 秒（大半は Diagnose の provider CLI 実行） |
+
+      **Phase 1 で判明した欠陥（修正済み）**: escalation は attempt として数えないため、
+      **Escalation 済みの対象を選択段階で外さないと、CEO の判断待ちの間 tick ごとに Diagnose
+      （実測25秒の provider CLI）を走らせて最後に捨てる**。60秒 interval では枠を焼き続ける挙動であり、
+      本項目の目的（不要な PL 起動を減らす）に反する。選択段階で除外し、回帰テストで固定した。
+
+      **Phase 1 で判明した運用上のギャップ（コード欠陥ではない）**: 通知チャネル未設定のため、
+      PL の CEO Escalation は `[Notifier] 通知チャネルが未設定です` としてジャーナルにしか出ない。
+      **PC を閉じても継続する**という目的に対しては、Escalation が CEO へ届く経路の設定が前提になる。
+
+      **残っている作業（本項目は完了にしない）**: Phase 2。上記修正を deploy した上で
+      `PL_LOOP_ENABLED=true` にし、VPS 単独で 異常認識 → 分析 → Gate → 正式操作 → 結果確認 →
+      継続または Escalation が成立することを実運用で観測する。
+      なお **Execute で実際の復旧操作（`rekick_design_review`）が走る経路は production 未実証**である
+      （今回の対象は attempt を使い切っており、再kickは不変条件6で禁止されているため）。
 
       **問題**: PL 判断能力が無いのではなく、**PL が VPS 上で継続実行される経路へ接続されていない**。
       現在 PL 判断（状態把握・停滞検知・原因分析・調査・証拠収集・方針判断・次Task選択・委任・
