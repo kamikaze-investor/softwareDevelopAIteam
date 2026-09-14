@@ -36,14 +36,51 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 /** bounded attempt。超過したrunはrequeueせずfailedで終端する。 */
 export const DESIGN_REVIEW_MAX_ATTEMPTS = 3
 
-/** runner の実行上限。既存 JOB_TIMEOUT_MS と同値に揃える。 */
-export const DESIGN_REVIEW_RUNNER_TIMEOUT_MS = 120_000
+/**
+ * runner の実行上限。
+ *
+ * **元は 120_000（JOB_TIMEOUT_MS と同値）だったが、runner 内部の retry 予算と噛み合っていなかった。**
+ * `geminiRouter` は transient 失敗（timeout / network / 5xx）を
+ * `TRANSIENT_RETRY_DELAYS_MS = [10s, 30s]` で最大3回試し、**待機だけで 40 秒**を使う。
+ * これを API 経路と CLI 経路で個別に行い、さらに Copilot fallback がある。
+ * つまり provider が少しでも不安定な瞬間に当たると、レビュー自体は正常でも 120 秒を超える。
+ *
+ * production 実測（2026-09-14、同一入力・同一 spawn）: 2.3s / 15.4s / 44.6s。
+ * 44.6s の回は `[geminiRouter] attempt failed: provider=gemini_api ... failureClass=transient` を
+ * 出しており、**所要時間のばらつきは provider 由来**であることが確認できた。
+ * 一方 production の attempt は3回連続で 120s 超過していた（`design-review-runner-production-timeout`）。
+ *
+ * ここでは「API 経路が transient retry を1周する（待機 40 秒 + 実試行3回）」を収容できる値に上げる。
+ * **worst case（CLI 経路の exec 120 秒 × 3 + Copilot fallback）は依然として収容していない。**
+ * それを収容するには caller の timeout を伸ばすのではなく **runner 側の retry 予算を deadline で
+ * 縛る**必要があり、別項目として扱う（`design-review-runner-production-timeout`）。
+ */
+export const DESIGN_REVIEW_RUNNER_TIMEOUT_MS = 300_000
 
 /** SIGTERMを無視するchildを確実に終わらせるための猶予。 */
 export const DESIGN_REVIEW_RUNNER_SIGKILL_GRACE_MS = 5_000
 
 /** runner出力の上限。超過した時点でchildを止め、APIプロセスのメモリを守る。 */
 export const DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES = 10 * 1024 * 1024
+
+/** 失敗理由へ添える runner stderr の長さ上限。DB の error 列を診断ログにしないための箍。 */
+export const DESIGN_REVIEW_STDERR_TAIL_CHARS = 500
+
+/**
+ * 失敗理由へ runner stderr の末尾を添える。
+ *
+ * 原因は末尾に出る（最後の attempt の失敗理由・fallback の結末）ため先頭ではなく末尾を残す。
+ * stderr が無ければ理由文をそのまま返す（既存の error 文言は変えない）。
+ */
+export function appendRunnerStderr(error: string, stderr: string | undefined): string {
+  const trimmed = stderr?.trim()
+  if (!trimmed) return error
+  const tail =
+    trimmed.length <= DESIGN_REVIEW_STDERR_TAIL_CHARS
+      ? trimmed
+      : `…${trimmed.slice(-DESIGN_REVIEW_STDERR_TAIL_CHARS)}`
+  return `${error} | runner stderr: ${tail}`
+}
 
 /** reviewerAdapter が返し得る verdict の全集合。 */
 const INDEPENDENT_REVIEW_VERDICTS = ['approved', 'changes_requested', 'blocking'] as const
@@ -312,9 +349,12 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
   const timeoutMs = deps.timeoutMs ?? DESIGN_REVIEW_RUNNER_TIMEOUT_MS
 
   return new Promise<RunnerExecution>((resolvePromise) => {
+    // `detached: true` は「切り離して放置する」ためではなく、**まとめて止められるようにする**ため。
+    // 子を新しいプロセスグループのリーダーにしておかないと、timeout 時に孫を回収できない（killTree 参照）。
     const child = spawn(deps.runnerCommand, deps.runnerArgs, {
       env: buildRunnerEnv(deps.homeDirectory),
       cwd: deps.workingDir,
+      detached: true,
     })
 
     let stdout = ''
@@ -325,13 +365,40 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
     let killTimer: NodeJS.Timeout | undefined
 
     /**
+     * 直接の子だけでなく**プロセスグループ全体**へ送る。
+     *
+     * runner は `npx tsx <script>` で起動するため、実体は
+     * `npx → npm exec → sh -c → tsx → node` と4段深くなる。`child.kill()` は先頭の1つしか
+     * 落とさないので、**timeout のたびに孫プロセスが生き残って孤児化する**
+     * （2026-09-14 production 実測: kill 後も runner の node 2つが systemd へ reparent されて
+     * 走り続けていた）。孤児は provider 接続を掴んだままなので、次の attempt の transient 失敗を
+     * 増やし、timeout を再発させる側に働く。
+     *
+     * `detached: true` で子を新しいプロセスグループのリーダーにし、`-pid` へ送って全員を止める。
+     * グループが既に消えている場合（ESRCH）は直接の子へフォールバックする。
+     */
+    const killTree = (signal: NodeJS.Signals): void => {
+      const pid = child.pid
+      if (pid === undefined) return
+      try {
+        process.kill(-pid, signal)
+      } catch {
+        try {
+          child.kill(signal)
+        } catch {
+          // 既に終了している。何もしない。
+        }
+      }
+    }
+
+    /**
      * SIGTERMを無視するchildでもPromiseが宙吊りにならないよう、SIGKILLへ必ず昇格させ、
      * さらにその猶予後には close を待たずに settle する。
      */
     const terminate = (execution: RunnerExecution): void => {
-      child.kill('SIGTERM')
+      killTree('SIGTERM')
       killTimer = setTimeout(() => {
-        child.kill('SIGKILL')
+        killTree('SIGKILL')
         settle(execution)
       }, DESIGN_REVIEW_RUNNER_SIGKILL_GRACE_MS)
     }
@@ -346,7 +413,7 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
 
     const timer = setTimeout(() => {
       timedOut = true
-      terminate({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true, stderr: undefined })
+      terminate({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true, stderr: stderr || undefined })
     }, timeoutMs)
 
     child.stdout.on('data', (chunk: Buffer) => {
@@ -389,7 +456,7 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
 
     child.on('close', (code) => {
       if (timedOut) {
-        settle({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true, stderr: undefined })
+        settle({ ok: false, stdout, error: `runner timed out after ${timeoutMs}ms`, timedOut: true, stderr: stderr || undefined })
         return
       }
       if (overflowed) {
@@ -501,7 +568,17 @@ export async function executeDesignReviewRun(
   }
 
   if (!execution.ok) {
-    return finalizeFailure(storage, claimed.run, claimToken, execution.error ?? 'runner failed')
+    // **stderr を捨てない。** timeout で終わった run の `error` が
+    // 「runner timed out after Nms」だけだと、原因（provider の transient 失敗と retry 待機など）が
+    // どこにも残らない。実際 `design-review-runner-production-timeout` は、この情報が
+    // 落ちていたために3回の調査でも原因へ到達できなかった。
+    // 末尾のみ・長さ上限つきで付ける（runner の env には token を渡していない）。
+    return finalizeFailure(
+      storage,
+      claimed.run,
+      claimToken,
+      appendRunnerStderr(execution.error ?? 'runner failed', execution.stderr),
+    )
   }
 
   let raw: RawStrategicResult
