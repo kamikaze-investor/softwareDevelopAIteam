@@ -4728,6 +4728,13 @@ Multi-Project は「並行する2つの Project を誰が見張るのか」と�
 PL 基盤なしに Project #2 を開始しても運用が成立しない。**安全性を優先し hard deadline にしない**
 という CEO 方針に従う。
 
+**後続項目の位置づけ（2026-09-14 追加・CEO 方針）**: 監視責務の段階分離
+（`monitoring-tiering-watchdog-monitor-pl`）は **上表のどこにも割り込ませない**。
+3（`vps-pl-execution-loop`）の最小実装と VPS 上の実運用 E2E が完了し、その実測データが出るまで
+着手しない。**まず State 取得 → Mandatory Gate → VPS PL 実行ループ → 既存操作の呼び出し →
+結果確認 / Escalation → VPS 上での実運用 E2E を完成させる。**
+段階分離は VPS PL 本体と責務を分けるが、状態取得・Control Interface・Gate は同じものを再利用する。
+
 ### PL が決定した優先順位
 
 | 順 | 項目 | 理由 |
@@ -6451,6 +6458,11 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `operator-chat-mobile`（Mobile から PL へ問い合わせ・指示）。
       **Console UI は後**。まず正確な状態取得と判断ループを優先する。
 
+      **後続（本項目の完了後に着手する最適化）**: `monitoring-tiering-watchdog-monitor-pl`
+      （監視責務の Watchdog / Lightweight Monitor / VPS PL への段階分離）。
+      **本項目より先に着手しない。** 本項目の実運用データ（PL 起動頻度・rule だけで閉じる異常の割合）を
+      見てから具体化する。効果検証に必要な記録の要件は当該項目に記載した。
+
 <!-- roadmap:id=design-review-runner-production-timeout state=planned -->
 2. [ ] **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）** — 2026-09-14登録。
       **盲目的に re-kick しないこと**（CEO 指示）。
@@ -6498,6 +6510,91 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **関連**: 本件は `vps-pl-execution-loop` の production evidence でもある
       （VPS 上の PL が居れば検知・調査・復旧できたはず）。実際 2026-09-14 の実復旧 E2E では、
       PL がこの timeout を2回観測して「systemic な問題」と判断し CEO Escalation へ倒した。
+
+<!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
+3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
+      **【着手条件（CEO 指示・2026-09-14）: `vps-pl-execution-loop` の最小実装と VPS 上の実運用 E2E が
+      完了し、その実測データが出るまで着手しない。VPS PL 本体の実装より先に着手しない】**
+      **今は設計・実装を深掘りしない。** 本項目は方針の記録であり、具体化は実測後に行う。
+
+      **解く問題**: VPS PL を常時監視・単純な異常検知に使い続けると、高性能 PL のモデル枠が
+      単純監視で消費され、一時的・既知の異常で不要な PL 起動が繰り返される。監視責務を段階分離し、
+      PL を重要判断へ集中させる。
+
+      **想定構造**:
+
+      ```text
+      Deterministic Watchdog / Rules → Lightweight Monitor → VPS PL → Mandatory Gate → 正式操作
+      ```
+
+      **Level 0: Watchdog / deterministic detection（AI 無しで判定できるもの）**
+      Job / Task stall・timeout・retry exhausted・Worker 停止・quarantine・recovery failure・
+      provider failure・Outbox 滞留・state inconsistency・containment 残留 等は、
+      **既存 Watchdog・state・rule で検知する**。
+      **新しい監視システムを重複して作らない。既存機構の改善を優先する。**
+      既存の素材: `apps/worker/src/watchdog/watchdog.ts` + `stallDetector.ts`・`watchdog_events`・
+      `supervised_runs`・`GET /api/state` の `attention` 配列・Outbox 滞留通知・quarantine state。
+
+      **Level 1: Lightweight Monitor（一次分類・要約）**
+      Watchdog event をすべて高性能 PL へ送らず、必要に応じて軽量 AI が次の4点だけを判定する:
+      1. 通常の自動 retry / recovery 中なので待てばよいか
+      2. 既知の一時エラーか
+      3. VPS PL による判断が必要か
+      4. PL へ渡すべき状態・ログは何か
+
+      **原則として強い操作権限を持たせない**（read + 分類 + 要約に留め、実行は Level 2 の判断と
+      Mandatory Gate を経る）。Copilot 等の比較的軽量な CLI provider を候補として評価するが、
+      **特定 provider へ固定しない**（選択は `role-model-registry` の1エントリとして表現し、
+      ここに別の provider 選択機構を作らない）。
+      **注意（既存実装の制約）**: `resolveReviewVendor('copilot')` は underlying vendor 不明として
+      `undefined` を返す（`packages/shared/src/reviewSeparation.ts`）。Level 1 の出力を
+      **Review・独立性の証拠として扱わない**こと（分類・要約は Review ではない）。
+
+      **Level 2: VPS PL（高性能な判断資源）**
+      原因分析 / 複数状態の統合 / 仮説形成 / 追加調査 / 復旧方法選択 / Roadmap 判断 /
+      CEO Escalation 判断。**理想的には常時監視ではなく、Watchdog / Monitor から必要時に
+      呼び出される event-driven な責任者へ寄せる。**
+
+      **目的**: 高性能 PL のモデル枠を単純監視に消費しない / PL を重要判断へ集中させる /
+      一時的・既知の異常による不要な PL 起動を減らす / 24時間監視を低コスト・高安定で行う /
+      Operator Chat・MCP からも同じ監視・PL 基盤を利用する。
+
+      **共通基盤は VPS PL 本体と共有する（責務だけを分ける）**: 状態取得は
+      `cross-project-state-api`（`GET /api/state`）、Control Interface は既存 write API、
+      Gate は `mandatory-gate-policy`。**Monitor 専用の状態取得経路・操作経路・Gate を作らない。**
+
+      **重複排除の棚卸し（新規項目は本1件のみ。他はすべて既存 owner のまま）**:
+
+      | 既存項目 | 関係 | 判定 |
+      |---|---|---|
+      | `vps-pl-execution-loop` | Level 2 本体 | **本項目はその後続**。先に着手しない |
+      | `cross-project-state-api` の `attention` 配列 | `job_blocked` / `workspace_quarantined` / `design_review_idle` / `task_ready_without_job` / `job_running_long` 等、Level 0 の観測出力そのもの | **既存で充足**。Level 0 用の別の検知面を作らない |
+      | `pl-review-process-supervision`（#110） | `supervised_runs`・heartbeat（C-4）・supervisor 列・「監視の失敗を監視対象の失敗と誤認しない」（C-11） | **既存が owner**。#110 の「新しい watchdog / supervisor を追加しない」構造決定に従う |
+      | `deleg-001-watchdog-respawn` | 既存 watchdog の欠陥修正 | **既存が owner**。Level 0 の「既存機構の改善を優先」の実例。本項目へ吸収しない |
+      | `outbox-blocked-critical-false-alarm` | 正常系を CRITICAL と誤発報する = Level 0 の rule 精度問題 | **既存が owner**。本項目で重複して閾値調整しない |
+      | `containment-success-path-observability` | containment 残留の可観測性 | `cross-project-state-api` へ**包含済み**（当該項目に記載） |
+      | Quota Policy / provider fallback（本ファイル冒頭の Review Orchestration 表） | provider failure 時の挙動（wait / handoff_fallback） | **既存が owner**。検知は Level 0、fallback 実行は既存経路。新しい fallback 機構を作らない |
+      | `role-model-registry` | Level 1 の provider / model 選択 | **既存が owner**。Registry の1エントリとして表現する |
+      | `failure-explanation-pregeneration` | 軽量 AI の既存実行経路（`aiExplain/cheapAiClient.ts` = OpenCode CLI） | **経路は再利用、責務は別**（Explainer は確定事実の説明、Monitor は一次分類）。当該項目の「4つ目の Explainer 実装を作らない」制約を継承する |
+      | `project-auto-incident-pattern-improvement` | 反復インシデントの事後分析・改善提案 | **時間軸が違う**（事後分析 vs リアルタイム経路）ため統合しない。ただし「この機能自身が大量 token / LLM を消費しない」という当該項目の制約は本項目にも適用する |
+      | `mandatory-gate-policy` | Monitor / PL いずれの提案も同じ Gate を通す | **既存が owner**。Monitor に強い操作権限を与えない不変条件は Gate 側で表現する |
+
+      **具体化の前提（実測データを見てから決める論点）**: VPS PL の実運用後に次を再評価する。
+      - PL が実際にどれくらいの頻度で起動するか
+      - どの異常が rule だけで処理できるか（＝ Level 0 で閉じるか）
+      - どこから軽量 AI が有効か
+      - Monitor にどこまで操作を許可すべきか
+
+      **効果検証可能性（Design Philosophy 8）**: 上記の再評価を可能にするため、
+      `vps-pl-execution-loop` の実装時点で最低限、PL 起動1回ごとの trigger（どの Level 0 検知に
+      由来するか）/ 起動結果（rule だけで足りた・PL 判断が必要だった・CEO Escalation）/
+      検知から解消までの時間と、その間に自動 recovery が動いていたか、を後から集計できる状態にしておく。
+      **本項目のための新しい telemetry 基盤は作らない**。既存の `watchdog_events` /
+      `supervised_runs` / `audit_log` / `attention` で足りるかをまず確認する。
+
+      **やらないこと（明記）**: 新しい監視 daemon / 新しい supervisor / 新しい Recovery subsystem /
+      新しい通知基盤 / 新しいダッシュボード / Monitor 専用 DB。既存の改善で足りない場合のみ、
+      その時点で不足を具体的に示してから検討する。
 
 <!-- roadmap:id=chatgpt-mcp-inspect state=planned -->
 1. [ ] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。

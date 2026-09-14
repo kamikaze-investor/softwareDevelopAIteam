@@ -261,6 +261,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Mandatory Gate Policy（state: in_progress）
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**（state: in_progress）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
+- **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
 - **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: planned）
 - **Mobile 内の運用指示窓口（Operator Chat）**（state: planned）
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**（state: planned）
