@@ -5943,6 +5943,27 @@ PL Console 4項目の state・優先度は変更していない。
       「誰も再開しないまま止まる」2形態をそのまま検出する。
       **`attention` は観測事実のみで、対処方法は含めない**（行動選択は PL、実行可否は Gate）。
 
+      **【2026-09-14 Operational Verification: production の実停止状態で検証済み】**
+      Stable `bb46910` を production へ deploy し、実際に止まっている状態へ当てて検証した。
+      結果: `attention` は2件のみを返し、両方とも実際に止まっている Task `76ea5ff3` のものだった。
+      `design_review_failed`（detail: `design review failed after 3 attempt(s): runner timed out
+      after 120000ms`）と `task_ready_without_job`。**誤検出ゼロ**（archived 57 Project と、
+      archived 配下の queued Job 3件はいずれも `attention` に出ない）。
+      **副作用ゼロ**を実測で確認した（呼び出し前後で 10 テーブルの件数と内容 hash が完全一致:
+      `40c4879f044dd12f`）。
+
+      **この検証で見つけた欠落と、その修正（PR #175 / `bb46910`）**: 初回 deploy 時点では
+      `design_review_failed` が出なかった。`findActiveByTaskId()` が queued/running しか返さず、
+      **failed で終端した review＝まさに停止理由そのものが観測対象から外れていた**ためである。
+      read-only の導出 `findLatestByTaskId()` を追加して修正した。
+      `design_review_idle` は現時点の production に queued/running の review が存在しないため
+      実機では観測できていない（検出経路は unit test で固定済み）。**観測できていないものを
+      「検証済み」とは書かない。**
+
+      この結果をもって、本項目は VPS PL 基盤の Observe 入口として**実運用で機能することが
+      確認された**。最初に検出した停止理由がそのまま open Finding
+      `design-review-runner-production-timeout` を指しており、PL 基盤完成後の最初の実戦対象になる。
+
       **残っている作業（本項目は完了にしない）**: `audit_log` への `project_id` 追加（additive）。
       AIcompanyOS 互換の最小構造であり、PL ループには必須でないため後続で行う。
       archived Project は観測対象から除外している（履歴は既存の Project 単位経路で読む）。
