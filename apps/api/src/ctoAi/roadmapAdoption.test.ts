@@ -311,3 +311,74 @@ describe('adoptRoadmapItem — 今回実装する範囲の明示', () => {
     expect(built.endsWith(body)).toBe(true)
   })
 })
+
+/**
+ * 「done な Task の blocked Job が以後の採用を恒久的に詰まらせる」への回帰テスト。
+ *
+ * 2026-09-15 production 実測: 外部セッションで実装を完了させて Task を done にした後、
+ * 次項目の採用が `Cannot deactivate roadmap task ... because job ... is blocked` で 409 になった。
+ * blocked Job は resume の対象だが、resume が向くのは blocked Task であって done Task ではないため、
+ * この状態は自力で解けない。
+ */
+describe('adoptRoadmapItem — 直前 Task の残 Job が採用を詰まらせない', () => {
+  function blockedJobOn(storage: IStorage, taskId: string, projectId: string): void {
+    const job = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    expect(job.status).toBe('blocked')
+  }
+
+  it('done な Task に blocked Job が残っていても次の項目を採用できる', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+    expect(first.ok).toBe(true)
+
+    const firstTaskId = (first as { taskId: string }).taskId
+    blockedJobOn(storage, firstTaskId, projectId)
+    storage.tasks.update(firstTaskId, { status: 'done' })
+
+    const second = await adoptRoadmapItem(storage, { projectId, roadmapId: 'second-item', ...SPEC }, deps())
+
+    expect(second.ok).toBe(true)
+    // 直前 Task は非活性化され、Job 自体は履歴として残る
+    expect(storage.tasks.findById(firstTaskId)!.roadmapActive).toBe(false)
+    expect(storage.jobs.findByTaskId(firstTaskId)[0]!.status).toBe('blocked')
+  })
+
+  it('done でない Task の blocked Job は従来どおり採用を止める（進行中の作業を黙って捨てない）', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+    const firstTaskId = (first as { taskId: string }).taskId
+    blockedJobOn(storage, firstTaskId, projectId)
+
+    const second = await adoptRoadmapItem(storage, { projectId, roadmapId: 'second-item', ...SPEC }, deps())
+
+    expect(second.ok).toBe(false)
+    expect((second as { reason: string }).reason).toContain('blocked')
+  })
+
+  it('done な Task でも queued Job が残っていれば止める（Worker が掴み得るため）', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+    const firstTaskId = (first as { taskId: string }).taskId
+    storage.jobs.create({
+      taskId: firstTaskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.tasks.update(firstTaskId, { status: 'done' })
+
+    const second = await adoptRoadmapItem(storage, { projectId, roadmapId: 'second-item', ...SPEC }, deps())
+
+    expect(second.ok).toBe(false)
+    expect((second as { reason: string }).reason).toContain('queued')
+  })
+})

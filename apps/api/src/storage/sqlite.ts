@@ -878,8 +878,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         ))
 
         for (const task of disappearedTasks) {
+          // **done な Task の blocked Job は「まだ動いている作業」ではない。**
+          // ガードの意図は「進行中の作業を持つ Task を黙って非活性化しない」ことなので、
+          // Task が終端に達していれば blocked Job は履歴である（resume の対象は blocked Task であって
+          // done Task ではなく、誰もその Job を進めない）。
+          // ここを区別しないと、**blocked Job が1件あるだけで以後の Roadmap 採用が恒久的に詰まる**
+          // （2026-09-15 実測: 外部セッションで実装を完了させて Task を done にした後、
+          //   次項目の採用が `Cannot deactivate roadmap task ... because job ... is blocked` で 409）。
+          // queued / running は Worker が実際に掴み得るので、Task の状態によらず従来どおり拒否する。
+          const blockingStatuses = task.status === 'done'
+            ? (['queued', 'running'] as const)
+            : undefined
           const activeJob = (jobsByTaskId.get(task.id) ?? [])
-            .find((job) => ACTIVE_JOB_STATUSES.has(job.status))
+            .find((job) => (
+              blockingStatuses
+                ? (blockingStatuses as readonly JobStatus[]).includes(job.status)
+                : ACTIVE_JOB_STATUSES.has(job.status)
+            ))
 
           if (activeJob) {
             throw new Error(
