@@ -6260,8 +6260,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **Role / Provider / Model Routing との関係**: 独立 Review の provider 分離等の必須制約は
       **PL より上位の Policy として強制**する（`role-model-registry` から PL が緩められないようにする）。
 
-<!-- roadmap:id=vps-pl-execution-loop state=in_progress -->
-1. [~] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
+<!-- roadmap:id=vps-pl-execution-loop state=done -->
+1. [x] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
       **【2026-09-14 進捗: 最小ループを実装。残りは VPS 上の Operational E2E】**
       `runPlTick()`（`apps/api/src/pl/executionLoop.ts`）と `POST /api/pl/tick`（`routes/pl.ts`）を実装した。
       1 tick で `Observe → Diagnose → Decide → Mandatory Gate → Execute → Verify → Continue / Escalate`
@@ -6365,9 +6365,9 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `Observe → Diagnose → Decide → Mandatory Gate → Existing Recovery Action → Verify → normalized`
       が VPS PL 単独で成立したら、その audit evidence を記録して done 判定する。
 
-      **【done 判定の条件（CEO 確定・2026-09-14）】** 次の2つが揃った時点で done とする。
+      **【done 判定（CEO 確定・2026-09-15）: 下記2条件をいずれも充足したため done】**
 
-      **1. 正常化まで到達する実復旧の Operational E2E（2026-09-15: 復旧は成功。verdict は `normalized` ではない）。**
+      **1. 実復旧の Operational E2E（2026-09-15 充足）。**
 
       **自然発生した事象で、VPS PL が無人で復旧に成功した**（人工注入なし。次項目の採用作業中に
       design review の attempt 1 が失敗 → requeue → `design_review_idle` になったものを PL が拾った）。
@@ -6382,13 +6382,18 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       つまり `Observe → Diagnose → Decide → Mandatory Gate → Existing Recovery Action → Verify` は
       VPS 単独で完走し、**復旧対象そのものは解消した**。
 
-      **ただし記録された verdict は `normalized` ではなく `different_anomaly` である。**
-      `design_review_idle` は消えたが、同じ Task に後続状態 `task_ready_without_job` が現れたため、
-      `verifyOutcome()` が「別の異常」と分類した。CEO 確定の条件は verdict が `normalized` であることなので、
-      **本項目は自動では done にしていない。** 判断は次のいずれか:
-      (a) 「復旧対象が解消し、現れたのが pipeline の後続状態である」ケースを `normalized` と区別して
-      扱えるよう `verifyOutcome()` を精緻化してから再実測する、(b) 今回の実測をもって充足と見なす。
-      **(a) は verdict 意味論の変更であり、PL の自己申告で緩めてはならない種類の判断なので CEO 判断とする。**
+      記録された verdict は `different_anomaly` である（`design_review_idle` は消えたが、
+      同じ Task に後続状態 `task_ready_without_job` が現れたため）。
+      **CEO 判断（2026-09-15）: これは Recovery 失敗ではない。**「対象異常が解消し期待した前進が起きた／
+      その後に別の異常が出た」ケースを失敗として扱わないよう、完了条件と実装を実態へ合わせた。
+
+      実装側も同じ読み方へ揃えた（**新しい状態モデルは作っていない**。verdict の語彙は4つのまま）:
+      `isRecoveryTargetResolved()`（`apps/api/src/pl/executionLoop.ts`）を単一の判定点にし、
+      `normalized` / `different_anomaly` を「対象が解消した」、
+      `unchanged` / `needs_gate_or_ceo` を「解消していない（Escalation 対象）」とする。
+      これが無いと**復旧に成功するたびに CEO へ Escalation が飛ぶ**（後続工程が現れるのは pipeline の正常形）。
+      `needs_gate_or_ceo` を成功扱いにしないのは、後続が approval 待ち / quarantine で
+      **PL に executor が無く人の判断が要る**ためである。
 
       **`design-review-runner-production-timeout` の解決を本項目の必須依存にはしない**（別 Finding）。
       なお当該 Root Cause は 2026-09-14 に特定・修正・deploy 済みで、今回の再kickが成功したのはその効果である。
