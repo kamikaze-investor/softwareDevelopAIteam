@@ -602,14 +602,41 @@ export async function createAndExecuteRoadmapReview(
  * 既定のrunner起動設定。index.ts側を最小変更に保つため、既定値の構築はここに置く。
  * secretは一切含めない（envはbuildRunnerEnvが明示構築する）。
  */
+/**
+ * runner の起動コマンドを**決定的に**解決する。
+ *
+ * 以前は既定を `npx tsx <script>` にしていたが、`npx` は解決時に npm の設定・cache・
+ * registry へ到達しうる。Worker の restricted env（`buildTargetCommandEnv()`。`HOME` も
+ * npm 関連変数も渡らない）配下ではこれが hang し、呼び出し側が timeout するまで戻らない
+ * （2026-09-13 に production で実測。同じ呼び出しが full env では即座に返る）。
+ *
+ * runner は**このリポジトリ内のスクリプト**であり、外部から取得する必要は無い。
+ * よって repo-local の `node_modules/.bin/tsx` を直接起動し、npx 依存を除去する。
+ * tsx が無い場合は spawn が ENOENT で**即座に失敗**する（既存の spawn 失敗経路で
+ * `ok:false` として扱われる）。hang して timeout を待つより、速く・明示的に失敗する方が良い。
+ *
+ * `DESIGN_REVIEW_RUNNER_COMMAND` による明示指定は従来どおり最優先で尊重する。
+ */
+export function resolveDesignReviewRunner(repoRoot: string): { command: string; args: string[] } {
+  const runnerScript = path.join(repoRoot, 'apps', 'worker', 'scripts', 'designReviewRunner.ts')
+  const explicit = process.env.DESIGN_REVIEW_RUNNER_COMMAND
+  if (explicit) return { command: explicit, args: [runnerScript] }
+
+  const localTsx = path.join(
+    repoRoot,
+    'node_modules',
+    '.bin',
+    process.platform === 'win32' ? 'tsx.cmd' : 'tsx',
+  )
+  return { command: localTsx, args: [runnerScript] }
+}
+
 export function buildDefaultCoordinatorDeps(): CoordinatorDeps {
   const repoRoot = process.env.DESIGN_REVIEW_REPO_ROOT ?? path.resolve(process.cwd(), '../..')
+  const runner = resolveDesignReviewRunner(repoRoot)
   return {
-    runnerCommand: process.env.DESIGN_REVIEW_RUNNER_COMMAND ?? 'npx',
-    runnerArgs: [
-      ...(process.env.DESIGN_REVIEW_RUNNER_COMMAND ? [] : ['tsx']),
-      path.join(repoRoot, 'apps', 'worker', 'scripts', 'designReviewRunner.ts'),
-    ],
+    runnerCommand: runner.command,
+    runnerArgs: runner.args,
     homeDirectory: process.env.HOME ?? process.env.USERPROFILE ?? repoRoot,
     workingDir: repoRoot,
     controlContextDir: process.env.DESIGN_REVIEW_CONTROL_CONTEXT_DIR ?? resolveDefaultControlContextDir(),

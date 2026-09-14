@@ -14,6 +14,7 @@ import {
   executeRunner,
   recomputeDecision,
   recoverAndRekickAtStartup,
+  resolveDesignReviewRunner,
 } from './designReviewCoordinator'
 import type { CoordinatorDeps } from './designReviewCoordinator'
 
@@ -837,5 +838,37 @@ describe('executeRunner stderr cap enforcement', () => {
       if (prevWindir === undefined) delete process.env.windir
       else process.env.windir = prevWindir
     }
+  })
+})
+
+describe('resolveDesignReviewRunner — restricted env でも決定的に解決する', () => {
+  const prev = process.env.DESIGN_REVIEW_RUNNER_COMMAND
+
+  afterAll(() => {
+    if (prev === undefined) delete process.env.DESIGN_REVIEW_RUNNER_COMMAND
+    else process.env.DESIGN_REVIEW_RUNNER_COMMAND = prev
+  })
+
+  it('npx を使わず repo-local の tsx を直接起動する', () => {
+    delete process.env.DESIGN_REVIEW_RUNNER_COMMAND
+    const { command, args } = resolveDesignReviewRunner('/repo')
+
+    // npx は npm の設定・cache・registry へ到達しうる。Worker の restricted env
+    // （HOME も npm 関連変数も渡らない）では hang して呼び出し側が timeout する。
+    expect(command).not.toContain('npx')
+    expect(args).not.toContain('tsx')
+
+    expect(command).toBe(
+      join('/repo', 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx'),
+    )
+    expect(args).toEqual([join('/repo', 'apps', 'worker', 'scripts', 'designReviewRunner.ts')])
+  })
+
+  it('DESIGN_REVIEW_RUNNER_COMMAND の明示指定を最優先で尊重する', () => {
+    process.env.DESIGN_REVIEW_RUNNER_COMMAND = '/custom/runner'
+    const { command, args } = resolveDesignReviewRunner('/repo')
+
+    expect(command).toBe('/custom/runner')
+    expect(args).toEqual([join('/repo', 'apps', 'worker', 'scripts', 'designReviewRunner.ts')])
   })
 })
