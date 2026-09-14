@@ -108,6 +108,19 @@ const REQUIRED_TARGET_KIND: Record<PlActionKind, PlActionTarget['kind'] | 'any'>
 }
 
 /**
+ * その操作が要求する対象の種類。呼び出し側が**要求どおりの対象を組み立てる**ために公開する。
+ *
+ * これは照合の代わりではない。`authorizePlAction()` は渡された対象を改めて
+ * `REQUIRED_TARGET_KIND` と突き合わせる。ここを読んだからといって照合は省かれない。
+ * 未知の kind には `undefined` を返し、呼び出し側を fail-closed に倒す。
+ */
+export function requiredTargetKindFor(kind: string): PlActionTarget['kind'] | 'any' | undefined {
+  return Object.prototype.hasOwnProperty.call(REQUIRED_TARGET_KIND, kind)
+    ? REQUIRED_TARGET_KIND[kind as PlActionKind]
+    : undefined
+}
+
+/**
  * CEO Approval の scope 束縛。**その操作のために出された承認であることを型で照合する。**
  * Project スコープの照合は `approvals.findById()` が `projectId` を返さないため未実施
  * （モジュール冒頭の「保証しないこと」を参照）。
