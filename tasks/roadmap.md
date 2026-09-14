@@ -4573,6 +4573,69 @@ Project 間 failure containment / Multi-Project Operational E2E /
 最終形は Project #1 = AIteamOS（全 Roadmap 完遂まで継続）と Project #2+ = 実事業 / Product を
 同時に AIteamOS から開発できる状態。
 
+## CEO優先方針の統合とPL優先順位決定（2026-09-14）
+
+**位置づけ**: 2026-09-14 の CEO 方針10項目を既存 Roadmap へ最小変更で統合し、PL が最終的な
+優先順位を決定した記録。**CEO の列挙順を Roadmap 順にしていない**（CEO 指示による）。
+
+**運用原則（item 1）**: 今後の AIteamOS 自身の開発は `tasks/roadmap.md` を Source of Truth とし、
+**PL が Roadmap 全体を見て次項目を判断する**。CEO が毎回次 Task を指定しない。新しい CEO 方針・
+要求・Finding が出たら Roadmap へ最小変更で統合し、その後は Roadmap ベースの自律開発へ戻る。
+
+### 棚卸し結果（重複を作らないための対応表）
+
+| CEO方針 | 既存項目 | 判定 |
+|---|---|---|
+| 2. ChatGPT↔MCP | 無し（`MCP` は repo 全体で参照0件） | **新規1件**: `chatgpt-mcp-inspect` |
+| 3. Operator Chat | PL Console 4件（deferred。LibreChat 評価等の重量級） | **新規1件**: `operator-chat-mobile`（PL Console は deferred のまま） |
+| 4. MCP/Chat 共通基盤 | `cross-project-state-api` | **既存強化**。新 Control subsystem は作らない |
+| 5. Remote Publish | `worker-restricted-remote-publish` | **既存**。優先度を上げる |
+| 6. Adoption 残作業 | `roadmap-adoption-followups` | **既存**。最優先へ |
+| 7. Multi-Project | `project-workspace-isolation` | **既存**。維持 |
+| 8. Explainer | `failure-explanation-pregeneration` | **既存**。責務は登録済み |
+| 9. Role/Provider/Model | `role-model-registry` | **既存強化**（コスト方針を追記） |
+| 10. AIcompanyOS 互換 | `cross-project-state-api` 内の `audit_log.project_id` | **既存で充足**。Business 機能は入れない |
+
+**新規は2件だけ**。他はすべて既存項目の強化・優先度変更で足りる。
+
+### item 4 の結論: 共通基盤は `cross-project-state-api` が担う
+
+MCP 用と Mobile Chat 用に別々の操作系を作らない。両方とも次の1本を消費する。
+
+```text
+ChatGPT → MCP adapter ─┐
+                       ├→ cross-project-state-api（read）+ 既存API（write）
+Mobile Operator Chat ──┘
+```
+
+**read 側**: `cross-project-state-api` が Project / Roadmap / Task / Job / blocked 理由 /
+quarantine / retry / recovery / Review / Approval / runtime progress / cost を1本で返す。
+**write 側**: 既存の `POST /api/tasks/:id/resume`・`PATCH /api/jobs/:id/clear-quarantine`・
+`PATCH /api/approval-requests/:id/status` 等をそのまま使う。**新しい Control subsystem を作らない。**
+
+### PL が決定した優先順位
+
+| 順 | 項目 | 理由 |
+|---|---|---|
+| **1** | `roadmap-adoption-followups` (1) implementation scope | **最小コストで最大の複利**。以後の全採用が使う。Tier A 安全で Mobile が実施できる。E2E で実際に踏んだ欠陥 |
+| 2 | `cross-project-state-api` | MCP・Operator Chat・AIcompanyOS 互換の**共通前提**。Tier A 安全。ここが無いと 2/3/4/10 が動けない |
+| 3 | `worker-restricted-remote-publish` | 自己開発の**最後の外部依存**を除去。ただし secret 境界に触れるため Independent Review 必須 |
+| 4 | `role-model-registry` → `failure-explanation-pregeneration` | Explainer が軽量モデルを選べるようにしてから Explainer 本体。CEO の理解可能性は品質の一部 |
+| 5 | `chatgpt-mcp-inspect`（read 中心） | 2 の上に薄く載る。inspect / audit / explain から |
+| 6 | `operator-chat-mobile` | 同じく 2 の上。既存 resume / recovery / approval を再利用 |
+| 7 | `project-workspace-isolation` → Project #2 | 最大規模・最高リスク。約10日目安だが hard deadline にしない |
+| — | `roadmap-adoption-followups` (2) paused/draft の Task 初期化 | Project lifecycle 変更のため Tier B。1 と同時ではなく直後 |
+
+**なぜ 1 が最初か**: Project #1 開始後、あらゆる作業が「Roadmap 項目を採用する」ことから始まる。
+現状は ledger 本文全文が description になり、複数サブ項目を含む項目では対象外まで実装対象と
+解釈される（E2E 初回で実際に File Change Guard に停止させられた）。ここを直さないと、
+**以後の全 Task で PL が毎回口頭でスコープを言い直す**ことになる。最小の変更で複利が最も大きい。
+
+**なぜ Multi-Project が最後か**: 最も価値が大きいが、全 guard の信頼境界に触れる最高リスク変更
+であり、他項目への依存も無い。安全インターロック（`ux_projects_single_running`）は
+**isolation が実測されるまで解除しない**（CEO 指示・`project-workspace-isolation` の受入条件7）。
+
+
 ### 次に着手すべき root-cause cluster（P1 完了時点の handoff・2026-09-08）
 
 **選定: shared workspace の dirty leakage → 恒久 quarantine（cleanup-deadlock）→ worktree isolation**
@@ -5468,6 +5531,15 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
 
 <!-- roadmap:id=role-model-registry state=planned -->
 1. [ ] **Role / Provider / Model Registry（役割別ルーティング設定表）** — 2026-09-13登録。
+      **【2026-09-14 追記: CEO のコスト / 性能方針】**
+      OpenAI・Claude とも現在は利用枠に余裕がある。**コスト節約を過度に優先して性能を下げない。**
+      PL 判断・設計・Root Cause 分析・Independent Review・Safety 判断では、必要な推論能力を確保する
+      （本 E2E で2回続けて誤診断した経緯からも、これらで性能を削るのは割に合わない）。
+      一方 Explainer・定型処理は軽量モデルでよい。
+      **契約プラン固有の上限値をコードや Design Philosophy へ固定しない**（枠は変わるため、
+      設定値として扱い、判断ロジックへ埋め込まない）。
+      本項目は `failure-explanation-pregeneration`（Explainer）の前提でもある。
+
       **新規サブシステムではなく、既に散在している設定を1箇所へ引き上げる作業**である。
 
       **既に存在するもの（作り直さない）**: `AiCliRequest`（`packages/shared/src/types/ai_cli.ts`）は
@@ -5785,6 +5857,16 @@ PL Console 4項目の state・優先度は変更していない。
 
 <!-- roadmap:id=cross-project-state-api state=planned -->
 0. [ ] **横断状態読み出し API（Console より先に、状態が取れることを優先）** — 2026-09-13登録。
+      **【2026-09-14 追記: 本項目は MCP と Operator Chat の共通基盤である】**
+      CEO 方針 item 4（MCP 用と Mobile Chat 用に別々の操作系を作らない）の受け皿は本項目とする。
+      `chatgpt-mcp-inspect` と `operator-chat-mobile` は**どちらも本項目の read 口を消費**し、
+      write 側は既存 API（`POST /api/tasks/:id/resume` / `PATCH /api/jobs/:id/clear-quarantine` /
+      `PATCH /api/approval-requests/:id/status` 等）をそのまま使う。
+      **新しい Control subsystem は作らない。**
+      したがって本項目は単独の観測改善ではなく、**2/3/4/10 の共通前提**として優先度が上がる。
+      返す情報には blocked 理由・quarantine・retry / resume 状況・Recovery / Watchdog も含める
+      （Operator Chat の6問に答えるために必要）。
+
       **新しい UI・新しい telemetry 基盤・新しいダッシュボードは作らない。**
 
       **解く問題**: 既存エンドポイントはすべて Project 単位か entity 単位であり、
@@ -5832,6 +5914,51 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 - **他タスクのついでに接続・配線しない**（PL Console起因の変更は必ず独立タスクとして扱う）
 - 将来着手する際も、**まず隔離環境でPoCしてから統合する**
 - 外部サービス追加・課金・認証・本番公開に該当する判断はYellow Zone（CEO承認必須）
+
+<!-- roadmap:id=chatgpt-mcp-inspect state=planned -->
+1. [ ] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
+      **MCP 導入そのものを目的にしない。** 目的は ChatGPT から AIteamOS の状態を理解・監査できること。
+
+      **前提**: `cross-project-state-api`（上記0番）。**同項目が read 側の唯一の入口**であり、
+      MCP はその薄い adapter に徹する。**新しい Control subsystem・新しい state 収集系は作らない。**
+
+      **Phase 1（read 中心。ここから始める）**: Project / Roadmap / Task / Job 状態、blocked 理由、
+      quarantine、retry / resume 状況、Review / Approval、Recovery / Watchdog、runtime progress、
+      Finding / audit 情報を ChatGPT から読める状態にする。
+
+      **Phase 2（既存 Gate で安全に実行可能な範囲のみ）**: resume / retry / recovery request。
+      **既存 API をそのまま使う**（`POST /api/tasks/:id/resume`・
+      `PATCH /api/jobs/:id/clear-quarantine` 等）。MCP 専用の resume / recovery 経路は作らない。
+      Approval Gate・Permission Guard・quarantine の fail-closed は**一切迂回しない**。
+
+      **今回実装しないもの**: 自由な write API / Gate を迂回する操作 / MCP 専用の state store /
+      credential の MCP 側保持。
+
+      **関連**: `operator-chat-mobile`（同じ interface を Mobile 側から使う）。
+      **両者で別々の操作システムを作らない**（CEO 指示・2026-09-14）。
+
+<!-- roadmap:id=operator-chat-mobile state=planned -->
+2. [ ] **Mobile 内の運用指示窓口（Operator Chat）** — 2026-09-14登録。
+      **万能 Chat Agent は作らない。** 例外対応・運用指示に絞る。
+
+      **最初の目標**: 次の6問に答えられること。
+      「なぜ止まっている？」「現在何が起きている？」「復旧可能？」「安全なら再開して」
+      「CEO判断が必要？」「次に何をすればよい？」
+
+      **前提**: `cross-project-state-api`。`chatgpt-mcp-inspect` と**同じ interface を消費する**。
+
+      **再利用するもの（新規に作らない）**: 既存の Task / Job state、`resume`、Recovery、
+      Approval、Watchdog、`audit_log`。**Chat 専用の Resume / Recovery 機構は作らない。**
+
+      **PL Console（下記 deferred 4件）との関係**: 別物である。PL Console は「ベンダー非依存の
+      PL 指示 UI」（LibreChat 等の評価・Gateway・Provider Adapter を含む重量級）で、本項目は
+      **既存 Mobile app 内の運用窓口**という軽量な範囲に限る。**PL Console 4件は deferred のまま
+      据え置き、本項目で reopen しない。** 本項目で運用上十分と判明した場合、PL Console の要否を
+      改めて判断する。
+
+      **Explainer との関係**: 回答文の平易化は `failure-explanation-pregeneration`（Explainer 責務）
+      が担う。本項目は**事実の取得と、既存の安全な操作の呼び出し**に徹する。
+
 
 <!-- roadmap:id=pl-console-candidate-evaluation state=deferred -->
 1. [ ] **PL Console候補の評価（調査のみ・コード変更なし）**
