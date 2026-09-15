@@ -202,6 +202,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）
 - **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
 - **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
+- **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**
 - **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い
 - **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける**
 - **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
@@ -239,7 +240,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**（state: planned）
 - **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**（state: planned）
 - **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**（state: planned）
-- **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**（state: planned）
 - **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: planned）
 - **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
 - **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）
@@ -265,6 +265,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Mandatory Gate Policy（state: in_progress）
 - **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
+- **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**（state: planned）
+- **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**（state: planned）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）

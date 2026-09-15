@@ -3292,11 +3292,30 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `workerCredentialAuthorization.test.ts` へ足した。同型のテストを既存の
    Worker呼び出し経路すべてに用意するか、経路一覧とallowlistの整合を確認する手段を持つか決める。
 
-<!-- roadmap:id=task-allowed-paths-not-normalized state=planned -->
-0. [ ] **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**
-   （2026-09-11登録。continuation E2E（Production E2E test 4）で実際に1サイクル失った。
-   **MVP後へ延期** — 回避策は仕様書のパス表記を相対にするだけでコード変更が不要なため）。
-   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
+<!-- roadmap:id=task-allowed-paths-not-normalized state=done -->
+0. [x] **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**
+   — **完了（PR #144 / `c4fcf02` で既に解決済み。2026-09-15 に実測確認して close）**
+
+   **【2026-09-15 close の根拠】** PL がこの項目を自律採用したあと Design Review が `CONFLICT` を
+   返したため、下記「対応方針」を実装コードと突き合わせた。結果、**本項目の中心課題は既に解決済み**だった。
+
+   - **対応方針2（絶対パスを task sync 時に検証エラーとして弾く）は実装済み。**
+     `nonRelativePathReason()` / `buildNonRelativePathIssues()`
+     （`apps/api/src/storage/roadmapTaskValidation.ts`）が、空文字 / POSIX 絶対パス / UNC /
+     ドライブレター / `..` セグメント / `./` 接頭辞を弾く。**本項目に載っている実測ケース
+     `/workspace/target/test.js` をそのコメントが名指しで引用している。**
+     `validateRoadmapTasks()` は**生成経路**（`projectInitialization.ts`）と
+     **採用経路**（`roadmapAdoption.ts`）の両方から呼ばれ、テストもある
+   - **対応方針1（正規化して workingDir prefix を剥がす）は、実装側が明示的に却下している。**
+     同ファイルに「絶対パスを相対へ自動書き換えることもしない（Guard のポリシー入力を
+     実質的に広げるため）」と日付つきで書かれている。**採用時の implementationScope は
+     この却下済みの案（canonical form への正規化）を含んでいた**ため、Design Review の
+     `scope_simplicity` CONFLICT は妥当だった（PL は override せず、判定を支持する）
+   - **対応方針3（Guard の block メッセージに allowedPaths を含める）だけが残っている。**
+     別項目 `guard-block-message-omits-allowed-paths` として切り出した
+
+   つまり **CONFLICT の2つ目の根拠（より軽い代替がある）は正しく、しかも「代替がある」より強い
+   「既に実装されている」だった。** PL の統合判断として本項目を close する。
 
    **内容**: File Change Guard は git が報告する **リポジトリ相対**の changedFiles と
    task の `allowedPaths` を比較する（`apps/worker/src/guards/fileChangeGuard.ts`）。
@@ -6721,8 +6740,50 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: hold で終わった質問がどれだけあり、
         そのうち何件が PL へ届いたかを後から数えられること
 
+<!-- roadmap:id=guard-block-message-omits-allowed-paths state=planned -->
+5. [ ] **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する** —
+      2026-09-15登録。`task-allowed-paths-not-normalized`（close 済み）の**対応方針3だけが残ったもの**。
+
+      **事象**: Job の stderr は `File Change Guard blocked (stage A): test.js` で終わる
+      （`apps/worker/src/jobRunner.ts`）。これは「`test.js` が禁止されている」と読めるが、
+      実際の原因は **`allowedPaths` がどの changedFile とも一致し得ない**ことである。
+      2026-09-11 の実測では CEO / AI の双方がこれを誤読し、調査時間を要した。
+
+      **根拠はすでに計算されている。** `fileChangeGuard` は per-file の `reasons` を返しており、
+      `jobRunner` はそれを `console.error` へ出している（journal には出る）。
+      **Job の stderr（= CEO が Mobile で見る場所）に入っていないだけ**である。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - **`jobRunner.ts` は `ALWAYS_FORBIDDEN_PATTERNS` に入っている protected file であり、
+        Candidate の AI は変更できない。** 誰が実装するかを先に決める必要がある
+        （関連: `control-repository-header-vs-enforced-guard`）
+      - 既存の `reasons` を stderr へ載せるだけで足りるか。**新しいエラー型や新しい通知は作らない**
+      - stderr に載せる情報量。`allowedPaths` 全件か、不一致の理由1行か
+      - 効果検証可能性（Design Philosophy 8）: 誤読による調査時間が減ったことを、
+        Guard block 後の再質問回数などで後から見られるか
+
+<!-- roadmap:id=no-status-for-closing-a-task-without-implementing state=planned -->
+6. [ ] **採用した Task を「実装せずに閉じる」正式な状態が無い** — 2026-09-15登録（実運用で詰まった）。
+
+      **事象**: PL が自律採用した Task `21d69075` は、調査の結果**実装すべきでない**と判明した
+      （対象の Roadmap 項目が既に PR #144 で解決済みだった）。しかし `TaskStatus` は
+      `pending / in_progress / review / done / blocked` の5つしかなく、
+      **「着手せず取り下げる」を表す値が無い**。
+
+      `done` にすると「受入条件を満たした」と読めてしまい、`pending` のまま残すと
+      `currentTask` を占有して **autonomous adoption が永久に止まる**
+      （`maybeAdoptNext()` は `currentTask === undefined` を要求する）。
+      今回は description に理由を書いたうえで `done` にしたが、**記録としては正確でない**。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - **新しい status を増やす前に**、既存の `roadmapActive=false` だけで十分か
+        （Task は残るが候補から外れる）。state 空間を広げない方が望ましい
+      - 自律運用では**誰が取り下げを決めるか**。PL の統合判断で足りるのか、CEO 承認が要るのか
+      - 取り下げた Task が後から再開されうるか。されるなら履歴をどう残すか
+      - 効果検証可能性（Design Philosophy 8）: 取り下げ件数とその理由を後から数えられること
+
 <!-- roadmap:id=adopted-item-blocked-by-stale-deferral-text state=planned -->
-5. [ ] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される** —
+7. [ ] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される** —
       2026-09-15登録（production 実測。**CEO 判断が要る**）。
 
       **事象**: PL が `task-allowed-paths-not-normalized` を自律採用した直後、Design Review が
@@ -6755,7 +6816,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         そのうち何件が表記起因だったかを後から数えられること
 
 <!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
-6. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
+8. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
       2026-09-15登録（CEO の承認画面での指摘が発端）。
 
       **確認された事実（2026-09-15 実測）**:
@@ -6802,7 +6863,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `docs/project_memory/decisions/autoreview_diff_range_review_findings.md`。
 
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
-7. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
+9. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
       同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
       **担当境界（2026-09-15）**: 本項目は「transient 起因の失敗が attempt 予算を食い潰す」こと、
