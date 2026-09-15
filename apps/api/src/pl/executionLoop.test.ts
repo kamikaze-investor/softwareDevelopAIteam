@@ -534,6 +534,42 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(adoptCalls).toBe(0)
   })
 
+  it('採用に成功したら予算は仕切り直す（2件目で打ち止めにならない）', async () => {
+    // 2026-09-15 production 実測: 1件目の採用に2回（proposal_unusable → adopted）使った結果、
+    // 次のサイクルは 1 tick 目で「PL は 2 回試しましたが採用できませんでした」になり、
+    // **採用できる状態（currentTask 無し / attention 0）なのに連続自律開発が止まった。**
+    // 予算が縛るべきは連続した失敗であって生涯試行回数ではない。
+    const storage = idleProject()
+    const adopted: string[] = []
+    const escalations: string[] = []
+    let proposalIsBroken = true
+    const d = deps({
+      readLedger: () => LEDGER,
+      // 1回目は壊れた提案（= 1 attempt 消費）、以後は正しい提案
+      proposeAdoption: async () => (proposalIsBroken ? 'これは JSON ではない' : PROPOSAL),
+      adopt: async (_s, input) => {
+        adopted.push(input.roadmapId)
+        return { ok: true as const, taskId: `task-${adopted.length}`, roadmapTaskKey: input.roadmapId, title: 't' }
+      },
+      escalate: async (p) => { escalations.push(p.title) },
+    })
+
+    // 1サイクル目: 失敗 → 成功（合計2 attempt。従来はここで生涯予算を使い切っていた）
+    const first = await runPlTick(storage, d)
+    expect(first.status).toBe('blocked')
+    proposalIsBroken = false
+    resetPlLoopInFlightForTest()
+    expect((await runPlTick(storage, d)).status).toBe('acted')
+
+    // 2サイクル目: 成功で仕切り直しているので、また採用できる
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    expect(second.status).toBe('acted')
+    expect(adopted).toHaveLength(2)
+    expect(escalations).toEqual([])
+  })
+
   it('採用が続けて失敗したら、再試行ではなく CEO へ上げる', async () => {
     const storage = idleProject()
     const escalations: string[] = []
