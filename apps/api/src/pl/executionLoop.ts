@@ -38,7 +38,12 @@ import {
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
 import { requestText } from '../aiExplain/cheapAiClient'
-import { buildSystemState, type AttentionItem, type SystemStateSnapshot } from '../state/systemState'
+import {
+  buildSystemState,
+  DEFAULT_STALL_HINT_MS,
+  type AttentionItem,
+  type SystemStateSnapshot,
+} from '../state/systemState'
 import {
   PL_MAX_ADOPTION_ATTEMPTS,
   runAdoptionStep,
@@ -77,6 +82,10 @@ const AUDIT_ENTITY_TYPE = 'pl_loop_target'
  */
 const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   'approval_waiting',
+  // 採用した Task に Job が作られないまま止まる状態。**通知だけ**する（下の NOTIFY_ONLY 参照）。
+  // PL に新しい権限は与えない。2026-09-15 production 実測で、ここに無かったために
+  // 自律採用の直後にチェーンが**誰にも気付かれず停止**した。
+  'task_ready_without_job',
   // blocked は notify-only にしない。blocked reason を読んで sanctioned な復旧を選ばせる
   // （CEO 指示・2026-09-15）。executor が無い・判断不能なら fail-closed で Escalation へ倒れる。
   'job_blocked',
@@ -97,6 +106,8 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
 const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   // CEO の判断待ちが最優先。人を待たせている時間が一番長くなりやすい。
   'approval_waiting',
+  // 採用したのに動き出さない Task も、人を待たせている点では同じ。
+  'task_ready_without_job',
   // blocked は workflow を止めているので早く見る。
   // **`ACTIONABLE_ATTENTION_KINDS` に入れてもここに無ければ永久に選ばれない**（selectTarget が
   // この順序を走査するため）。両方に入れること。
@@ -225,7 +236,23 @@ let inFlight = false
  * 診断（provider CLI）も回さず、1回だけ通知して終わる。通知チャネルを用意した目的が
  * まさにこれで、**承認待ちに誰も気付かないまま止まる**状態を無くす。
  */
-const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = ['approval_waiting']
+const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
+  'approval_waiting',
+  // 採用した Task に Job が作られない。PL には直せない（Job 生成は Design Review evidence が要り、
+  // その判定を PL が覆すことは許されない）。**だから通知だけする。**
+  'task_ready_without_job',
+]
+
+/**
+ * 採用直後は Job がまだ無いのが正常なので、すぐには鳴らさない。
+ *
+ * `createInitialImplementWorkflow()` は Job を作る前に Design Review を回す。実測（2026-09-15）で
+ * その1回に **4分29秒** かかった。その間ずっと `task_ready_without_job` が立っているため、
+ * 即通知にすると**採用のたびに誤報**になる。
+ *
+ * 既存の停滞閾値（`DEFAULT_STALL_HINT_MS` = 5分）と同じ値を使う。新しい閾値の概念を増やさない。
+ */
+const READY_TASK_STALL_THRESHOLD_MS = DEFAULT_STALL_HINT_MS
 
 function targetKeyOf(item: AttentionItem): string {
   // 対象の同一性は「どの attention がどの実体に出ているか」で決まる。
@@ -233,6 +260,54 @@ function targetKeyOf(item: AttentionItem): string {
   // 「同じ Task の2回目の承認待ち」を1回目と同一視し、通知の重複排除が効きすぎる。
   const subject = item.referenceId ?? item.jobId ?? item.taskId ?? item.projectId
   return `${item.kind}:${subject}`
+}
+
+/**
+ * まだ待つべき段階か。
+ *
+ * `task_ready_without_job` は**採用直後に必ず一度立つ**（Job を作る前に Design Review を回すため）。
+ * その時点で鳴らすと採用のたびに誤報になるので、既存の停滞閾値を過ぎたものだけを対象にする。
+ * 他の種類は従来どおり即座に対象とする（停滞の定義がすでに種類側に入っているため）。
+ */
+function hasStalledLongEnough(item: AttentionItem): boolean {
+  if (item.kind !== 'task_ready_without_job') return true
+  return (item.stuckForMs ?? 0) >= READY_TASK_STALL_THRESHOLD_MS
+}
+
+/**
+ * 通知だけで終える attention に添える理由。
+ *
+ * `task_ready_without_job` は「Job が作られない」という**結果**しか持たない。原因はたいてい
+ * Design Review の判定であり、それを添えないと CEO は何を判断すればよいか分からない。
+ * 判定は**システムが記録した実レコード**から引く（PL の推測は載せない）。
+ */
+function notifyOnlyReason(storage: IStorage, item: AttentionItem): string {
+  if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) {
+    return 'CEO の判断待ちで進行が止まっています。'
+  }
+
+  // 終端した run も返す既存の導出を使う（`findActiveByTaskId()` では failed / succeeded が見えない）。
+  const latest = storage.designReviewRuns.findLatestByTaskId(item.taskId)
+  if (!latest?.resultJson) {
+    return '採用した Task に実装 Job が作られないまま止まっています。'
+  }
+
+  let decision: unknown
+  let summary: unknown
+  try {
+    const parsed = JSON.parse(latest.resultJson) as Record<string, unknown>
+    decision = parsed.finalDecision
+    summary = (parsed.integrationReviewResult as Record<string, unknown> | undefined)?.summary
+  } catch {
+    return '採用した Task に実装 Job が作られないまま止まっています（Design Review の結果を読めませんでした）。'
+  }
+
+  return [
+    '採用した Task に実装 Job が作られないまま止まっています。',
+    `直近の Design Review の判定: ${String(decision ?? 'unknown')}`,
+    summary ? `理由: ${String(summary)}` : undefined,
+    'この判定は Binding Review です。PL は妥当性を評価できますが、BLOCK を覆せません。',
+  ].filter((line) => line !== undefined).join('\n')
 }
 
 function selectTarget(attention: readonly AttentionItem[]): AttentionItem | undefined {
@@ -638,7 +713,9 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     // 「一時的・既知の異常による不要な PL 起動を減らす」という本項目の目的に反する。
     const actionable = before.attention.filter(
       (item) =>
-        ACTIONABLE_ATTENTION_KINDS.includes(item.kind) && !hasEscalated(storage, targetKeyOf(item)),
+        ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
+        && !hasEscalated(storage, targetKeyOf(item))
+        && hasStalledLongEnough(item),
     )
     const item = selectTarget(actionable)
     if (!item) {
@@ -670,7 +747,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     // `escalate_to_ceo` 相当の行為であり Gate を要しない（Policy 上も無 Gate）。
     // 既に通知済みの対象は選択段階で外れているので、ここへは来ない。
     if (NOTIFY_ONLY_ATTENTION_KINDS.includes(item.kind)) {
-      await escalateTo(storage, deps, key, item, 'CEO の判断待ちで進行が止まっています。')
+      await escalateTo(storage, deps, key, item, notifyOnlyReason(storage, item))
       return { status: 'escalated', target, reason: 'human decision required', attempt: 1 }
     }
 

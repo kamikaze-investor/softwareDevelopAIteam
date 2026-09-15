@@ -608,6 +608,78 @@ describe('runPlTick — CEO 判断待ちは黙って放置しない', () => {
   })
 })
 
+describe('runPlTick — 採用したのに動き出さない Task を黙って放置しない', () => {
+  // 2026-09-15 production 実測: 自律採用の直後、Design Review が CONFLICT を返して実装 Job が
+  // 作られず、`task_ready_without_job` だけが残った。当時この kind は PL の対象外だったため、
+  // **誰にも通知されないままチェーンが停止**した。
+  function seedAdoptedTaskWithReview(decision: string): { storage: IStorage; taskId: string } {
+    const { storage, taskId } = seed()
+    const run = storage.designReviewRuns.create({
+      taskId,
+      taskTitle: 'adopted',
+      designText: 'design text',
+      designTextHash: 'hash-adopted',
+      changedFiles: [],
+    })
+    const claim = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(
+      run.id,
+      claim.claimToken as string,
+      'succeeded',
+      JSON.stringify({
+        finalDecision: decision,
+        integrationReviewResult: { decision, summary: 'MVP scope discipline と衝突する' },
+      }),
+      undefined,
+    )
+    return { storage, taskId }
+  }
+
+  /** seed した Task の実 createdAt から相対で観測時刻を作る（NOW は固定日付なので使えない）。 */
+  function atMinutesAfterTaskCreated(storage: IStorage, taskId: string, minutes: number): string {
+    const createdAt = storage.tasks.findById(taskId)?.createdAt as string
+    return new Date(new Date(createdAt).getTime() + minutes * 60 * 1000).toISOString()
+  }
+
+  it('採用直後は鳴らさない（Job を作る前に Design Review が走るため、即通知は誤報になる）', async () => {
+    const { storage, taskId } = seedAdoptedTaskWithReview('CONFLICT')
+    const escalations: string[] = []
+    const soon = atMinutesAfterTaskCreated(storage, taskId, 1)
+
+    const result = await runPlTick(storage, deps({
+      now: () => soon,
+      escalate: async (p) => { escalations.push(p.body) },
+    }))
+
+    // まだ Design Review 中でありうる時間。ここで鳴らすと採用のたびに誤報になる
+    expect(result.status).not.toBe('escalated')
+    expect(escalations).toEqual([])
+  })
+
+  it('停滞閾値を過ぎたら1回だけ CEO へ通知し、Design Review の判定を添える', async () => {
+    const { storage, taskId } = seedAdoptedTaskWithReview('CONFLICT')
+    const escalations: string[] = []
+    // 閾値（5分）を超えた時刻から観測する
+    const later = atMinutesAfterTaskCreated(storage, taskId, 10)
+    const d = deps({ now: () => later, escalate: async (p) => { escalations.push(p.body) } })
+
+    const first = await runPlTick(storage, d)
+
+    expect(first.status).toBe('escalated')
+    expect(escalations).toHaveLength(1)
+    // 「Job が無い」だけでは CEO は判断できない。止めている判定を載せる
+    expect(escalations[0]).toContain('CONFLICT')
+    expect(escalations[0]).toContain('MVP scope discipline')
+    expect(escalations[0]).toContain('Binding Review')
+
+    // 2回目以降は鳴らさない（通知の信用を落とさない）
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+    expect(second.status).not.toBe('escalated')
+    expect(escalations).toHaveLength(1)
+  })
+})
+
 describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を選ぶ', () => {
   function blockedCommitJob(storage: IStorage, taskId: string, projectId: string): string {
     const job = storage.jobs.create({
