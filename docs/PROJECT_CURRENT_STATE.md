@@ -253,7 +253,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - 2種類の承認の役割整理とMobile導線設計（state: planned）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
 - **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
-- **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）**（state: planned）
+- **Maintenance Lane v0 = Tier B: 自分では触れない変更を、正本を手放さずに管理する**（state: planned）
 - **Project 単位 workspace 分離（Multi-Project の前提・最優先）**（state: planned）
 - **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）**（state: planned）
 - **Containment adversarial escape（cgroup migration / git external helper）（state: planned）
