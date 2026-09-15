@@ -6740,8 +6740,33 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: hold で終わった質問がどれだけあり、
         そのうち何件が PL へ届いたかを後から数えられること
 
-<!-- roadmap:id=guard-block-message-omits-allowed-paths state=planned -->
-5. [ ] **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する** —
+<!-- roadmap:id=guard-block-message-omits-allowed-paths state=done -->
+5. [x] **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
+      — **完了（2026-09-15, PR #216。Tier B / protected file 変更）**。
+
+      **実装は Candidate ではなく外部セッションが行った。** 対象が `jobRunner.ts`
+      （`ALWAYS_FORBIDDEN_PATTERNS` の protected file）であり、CEO が**この Task に限って**
+      承認した。Candidate AI の権限拡大・`ALWAYS_FORBIDDEN_PATTERNS` の緩和・protected 指定の解除・
+      Safety Guard の迂回・`allowedPaths` の拡張は**一切行っていない**。
+      **`fileChangeGuard.ts` は変更していない**（判定基準は不変。変えたのは表示だけ）。
+
+      `formatGuardBlockNote()` が per-file の理由と `allowedPaths` を1行にまとめ、既存
+      `withLeadingNote()` で **stderr の先頭**へ置く（末尾だと `saveJobLogs()` の
+      プレビュー切り詰め 4000字で診断ごと消えるため）。
+
+      Independent Review（Codex `gpt-5.6-sol`）は **3ラウンド**。`changes_requested` 2回は
+      いずれも実欠陥だった: 末尾追記による切り詰め消失 / path と reason を連結してから切ると
+      長いファイル名が理由を食い潰す / 300字上限で `allowedPaths` が押し出される /
+      **こちらが書いたテストの1件が vacuous だった**（変数を渡しておらず何も検証していなかった）/
+      制御文字注入で偽の診断行が作れる / 「only these are permitted」は言い過ぎ。
+      最終 `approved`、残 Low 3件は記録済み。
+
+      Task 側の扱いは `no-status-for-closing-a-task-without-implementing` を参照
+      （外部 Tier B 完了を Task へ reconcile する既存経路が無い）。
+
+      ---
+      以下は登録時の記録。
+
       2026-09-15登録。`task-allowed-paths-not-normalized`（close 済み）の**対応方針3だけが残ったもの**。
 
       **事象**: Job の stderr は `File Change Guard blocked (stage A): test.js` で終わる
@@ -6784,6 +6809,28 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **同じ責務の新しい status や workflow を安易に追加しないこと。**
 
+      **同じ責務としてここへ統合した別ケース（2026-09-15, Tier B 実測）**:
+      **外部 Tier B が完了した Task を、既存経路では Task へ reconcile できない。**
+      Task `7bd4a65a`（`guard-block-message-omits-allowed-paths`）は protected file を要したため
+      CEO 承認のもと外部セッションが実装し、master `40bfed1` として production へ入った。
+      しかし調べた範囲では、**Task を正しく終端させる既存経路が無い**:
+      - Task が自動で `done` になるのは `applyCommitResult`（Candidate 自身の git_commit 成功）だけ。
+        **外部 merge からは走らない**
+      - 受入条件の機械検証は存在しない（既存項目
+        `implement-acceptance-criteria-not-mechanically-verified` に登録済み）
+      - Candidate を master と同期しても、resume した実装 Job は「既に実装済み」で
+        `no file changes` になり失敗する。検証経路として使えない
+      - 残るのは `PATCH /api/tasks/:id` に `status: 'done'` を直接書くことだけで、
+        これは**未検証のまま done にする**ことであり CEO が明示的に禁じた
+
+      **したがって「未検証 done」も「DB 直書き」もせず、Task は `pending` のまま残している。**
+      新しい仕組みを作る前に、この不足を CEO へ報告済み（CEO 指示どおり）。
+
+      **着手時に確認すること（上記と共通の方針で）**:
+      - 外部完了の reconcile も、新しい workflow ではなく**既存の continuation / Job lifecycle の
+        小さな拡張**で表現できないか
+      - 「誰が外部完了を宣言してよいか」は権限問題。PL の自己申告で done にできてはならない
+
       **着手時に確認すること（実装方針を先に決めない）**:
       - **新しい status を増やす前に**、既存の `roadmapActive=false` だけで十分か
         （Task は残るが候補から外れる）。state 空間を広げない方が望ましい
@@ -6791,8 +6838,57 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 取り下げた Task が後から再開されうるか。されるなら履歴をどう残すか
       - 効果検証可能性（Design Philosophy 8）: 取り下げ件数とその理由を後から数えられること
 
-<!-- roadmap:id=adopted-item-blocked-by-stale-deferral-text state=planned -->
-7. [ ] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される** —
+<!-- roadmap:id=adoption-does-not-check-implementation-feasibility state=planned -->
+7. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
+      2026-09-15登録（production 実測）。CEO 指示により**既存 adoption / Design Review /
+      PL diagnosis の改善候補**として記録する。
+
+      **事象**: PL が `guard-block-message-omits-allowed-paths` を自律採用 → Design Review は
+      **ALIGNED** → implement Job 作成、まで進んだ。しかし対象は `jobRunner.ts` /
+      `fileChangeGuard.ts`（**`ALWAYS_FORBIDDEN_PATTERNS` の protected file**）で、
+      採用時の `allowedPaths` は `apps/api/src/ctoAi` / `packages/shared/src` だった。
+      実装 Job は `implementation produced no file changes`（exit 0 / `changedFiles: []` /
+      `workspaceState: unchanged`）で失敗。**File Change Guard すら発動していない**
+      （そもそも触れるファイルが範囲内に無い）。
+
+      **つまり「その Task は Candidate では原理的に完了できない」ことを、
+      採用も Review も検出していない。** 判明するのは provider を1回消費したあとである。
+      （この Task 自体は CEO 承認のもと Tier B として外部実装し、master `40bfed1` で解決した。
+      ここで扱うのは**次に同じことが起きるのを防ぐ**話である。）
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - **新しい Gate も新しい Review 段も作らない。** 既存のどこで検出できるかを先に決める:
+        採用時の `validateRoadmapTasks()` か、Design Review の focus か、
+        `createInitialImplementWorkflow()` の eligibility か
+      - 判定材料は既にある。`ALWAYS_FORBIDDEN_PATTERNS` と `allowedPaths` の突き合わせは
+        `fileChangeGuard` と同じ情報源でできる。**Guard 側は変更しない**
+      - ただし「実装対象ファイル」は採用時点では宣言されていない（`allowedPaths` は範囲であって
+        対象一覧ではない）。**推測で弾くと正当な Task まで落とす**ので、
+        どこまでなら機械的に言い切れるかを先に見極める
+      - 検出できたとき何をするか。自動で Tier B へ回すのか、CEO Escalation か。
+        **PL に権限を与える話にしない**
+      - 効果検証可能性（Design Philosophy 8）: 「採用したが allowedPaths 内で実装不能だった」
+        件数を後から数えられること
+
+<!-- roadmap:id=adopted-item-blocked-by-stale-deferral-text state=done -->
+8. [x] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
+      — **完了（2026-09-15, PR #211）**。CEO 判断により、ledger 全体の時点整合を取って解消した。
+
+      **やったこと**: MVP 関連の記述を全走査して各出現を囲う item と state に対応づけ、
+      open item 9件へ「延期条件は充足済み」の注記を入れ、延期理由が MVP 待ちだけだった2件を
+      `deferred` → `planned` にした。**現在の可否は `state=` が正本**という規則を ledger 冒頭へ置き、
+      `readAdoptionCandidates()` を `planned` のみに絞って **`deferred` を実際に効かせた**
+      （従来は `!== 'done'` で、「現在も実装禁止」を表す手段が事実上存在しなかった）。
+      **新しい state 体系も metadata も追加していない。**
+
+      **今回の Task 固有の対応はしていない**（CEO 指示: 個別 Task 専用の例外処理を作らない）。
+
+      なお、同じ「採用したのに進めない」症状でも**原因が別**のものは
+      `adoption-does-not-check-implementation-feasibility` へ分けた。
+
+      ---
+      以下は登録時の記録。
+
       2026-09-15登録（production 実測。**CEO 判断が要る**）。
 
       **事象**: PL が `task-allowed-paths-not-normalized` を自律採用した直後、Design Review が
@@ -6825,7 +6921,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         そのうち何件が表記起因だったかを後から数えられること
 
 <!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
-8. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
+9. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
       2026-09-15登録（CEO の承認画面での指摘が発端）。
 
       **確認された事実（2026-09-15 実測）**:
@@ -6872,7 +6968,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `docs/project_memory/decisions/autoreview_diff_range_review_findings.md`。
 
 <!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
-9. [ ] **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）** —
+10. [ ] **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）** —
       2026-09-15登録（production 実測）。**CEO が読む通知の中身の問題であり、機構ではなく品質。**
 
       **事象**: Task `7bd4a65a` の implement Job が失敗したとき、PL は CEO へ
@@ -6895,7 +6991,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
 
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
-10. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
+11. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
       同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
       **担当境界（2026-09-15）**: 本項目は「transient 起因の失敗が attempt 予算を食い潰す」こと、
