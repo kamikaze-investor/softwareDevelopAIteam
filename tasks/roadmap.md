@@ -4571,7 +4571,7 @@ worktree と別 repository は採らない。
       **bootstrap 例外として外部セッションが push / PR を担当**してよい。
 
 <!-- roadmap:id=roadmap-adoption-followups state=planned -->
-2. [ ] **Roadmap 採用経路の残作業2件（`roadmap-item-adoption` の後続）** — 2026-09-14登録。
+2. [ ] **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）** — 2026-09-14登録。
       親項目 `roadmap-item-adoption`（done）は採用経路そのものを実装済み。以下は Tier A E2E で
       実運用して判明した**残作業**であり、親項目の再オープンではなく後続として扱う。
 
@@ -4614,6 +4614,29 @@ worktree と別 repository は採らない。
       E2E では採用 API の再実行（冪等）で回避した。
       **最小案**: resume 分岐でも `ensureInitialWorkflowsForActiveTasks()` を呼ぶ。
       **Project lifecycle の変更**なので Independent Review 必須。
+
+      **(3) アプリ（Mobile）から追加された Task が採用経路の入口に無い** — 2026-09-15 実測・登録。
+      production DB で確認: `POST /api/tasks` で作られた Task `3d8878e9`（「copilotのモデル指定」/
+      Project `bb509fee`）は `roadmap_active=0` / `roadmapTaskKey=null` のまま、Job も Design Review run も
+      0件で pending に滞留している。手動 Task の既定は `roadmapActive=false`（`storage/interface.ts`）で、
+      初回 Job 生成の eligibility（`initialImplementWorkflow.ts`）も `attention` の
+      `task_ready_without_job`（`state/systemState.ts`）も `roadmapActive` を要求するため、
+      **PL の Observe（`buildSystemState()`）に一切現れず、誰も拾わない**。
+      `project-auto-ceo-alignment` は「CEO が修正指示を返す経路は追加開発指示（追加Task作成）」と
+      定めているので、その経路が**PL からは見えない**ままになっている。
+
+      **方向性（CEO 指示・2026-09-15）**: 追加 Task を**無条件に `roadmapActive=true` にしない**。
+      PL が追加 Task を観測し、**既存 Roadmap 項目へ統合 / 新規 Roadmap item として採用 / 保留・却下**を
+      **既存 adoption 機構の延長**（`runAdoptionStep()` / `adopt_roadmap_item` / `ACTION_GATE_TABLE`）で
+      判断できる形にする。**新しい task orchestration / queue / 専用 state store を作らない。**
+
+      **境界（重複させない）**: 観測面の語彙は `cross-project-state-api`（`attention`）が owner であり、
+      別の検知面を作らない。PL の action 語彙と強制 Gate は `mandatory-gate-policy` / 既存 PL action が owner。
+      本サブ項目が持つのは「**追加 Task が採用経路へ入る入口が無い**」ことだけである。
+
+      **着手時に決める（実装方針を先に固定しない）**: 既存 `attention` で表現できるか新しい kind が要るか /
+      保留・却下を既存 state（`task.status` / `audit_log`）で表現できるか（**新しい Task status を足さない**）/
+      採用時に手動 Task 自身を roadmapActive 化するのか、ledger 項目として採用し直すのか。
 
       **関連**: Mobile に採用 UI が無く PL が API を実行している点は Known Limitation として
       `docs/project_memory/decisions/tier_a_self_development_e2e.md` に記録済み。
@@ -5704,6 +5727,25 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
       緩められない形で持つ）。候補表を本項目の外に二重に作らないこと。
       別枠の Provider 評価の仕組みは作らない。
 
+      **【2026-09-15 追記: Copilot の Meta / Design Review fallback model は本項目が正本】**
+      アプリ追加要求（Task `3d8878e9`）のうち「fallback 時に model を明示指定する」側は**本項目へ統合する**。
+      新規項目は立てない。Reviewer Role の1エントリとして **Copilot fallback の model を明示**し、
+      **`auto` / 未指定を許さない**（`copilot --model` は `auto` を受け付けるが、これを使わない）。
+      fallback policy（いつ Copilot へ落ちるか）は既存 `COPILOT_ELIGIBLE_FAILURE_CLASSES`
+      （quota / transient）が正本であり、本項目はそれを**表現するだけで緩めない**。
+
+      **採用 model（2026-09-15 production 実測。ledger の値を無条件に信用せず再確認した）**:
+      `copilot` CLI 1.0.83 で `--model mai-code-1.1-flash` が exit 0 で応答した。未知 model は
+      exit 1 で拒否される（利用可能一覧を返す subcommand は無く、可否は実行で確かめるしかない）。
+      よって現時点の採用値は **`mai-code-1.1-flash`**。ただし model ID は変わりうるため
+      **Registry の設定値として持ち、判断ロジックへ埋め込まない**（本項目の既存方針どおり）。
+      `copilotRouter.ts` の `DEFAULT_COPILOT_META_REVIEW_MODEL` は protected 側の既定値なので、
+      Registry 値と一致することを確認し、**乖離したら fail-closed**（どちらかを黙って優先しない）。
+
+      **独立性を緩めない**: model を固定しても `reviewSeparation.ts` の copilot 未登録は変えない。
+      model 固定を Independent Reviewer への昇格根拠にしない
+      （`review-provider-exhausted-alternate-rereview` の不変条件と同じ）。
+
       **依存**: `project-workspace-isolation` とは独立で、並行実施できる。
       Model Usage Telemetry（上記）と対で入れると効果検証が可能になる。
 
@@ -6634,6 +6676,39 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
          `providerUsed` を返すが、`strategicReview.ts` は `{ raw }` だけを取り出して捨てている
          （`autoReview.ts` は結果ファイルへ書いている）。**記録が無いと「別 provider で再審査した」
          ことを後から検証できない**（Design Philosophy 8: 効果検証可能性）。additive に持たせる
+
+      **【2026-09-15 追記: provenance へ model を含める（CEO 指示）。アプリ追加要求の統合先】**
+      アプリから追加された要求（Task `3d8878e9`「copilotのモデル指定」）は**本項目へ統合する**。
+      新規項目は立てない。対象は**既存の Meta / Design Review fallback 経路のみ**とし、
+      **Copilot を Independent Review の provider へ追加しない**（`ReviewerProvider` union は変えない）。
+
+      上記 3 の記録内容へ**使用モデルを含める**: `providerUsed` に加えて **requested model**
+      （どの model を指定したか）を残す。model の正本は `role-model-registry` であり、
+      候補表を本項目へ二重に持たない。
+
+      **actual model 用の別 field は作らない（実測に基づく判断・2026-09-15）**: production の
+      `copilot` CLI 1.0.83 は未知・利用不可の model を `Error: Model "..." is not available.` /
+      **exit 1** で拒否し、**silent fallback しない**（`--model definitely-not-a-real-model` で実測）。
+      したがって exit 0 での完了自体が「指定 model が受理された」証跡になる。成功時の stdout に
+      モデル名は出ないため、**確認できない値を field として持たない**。
+
+      **model を確認できない場合は正常 review として扱わない**: 既存の fail-closed
+      （非0 exit / 空応答 → `MetaReviewProviderError` → blocked）をそのまま使う。
+      **新しい Gate も新しい失敗分類も追加しない。**
+
+      **保存先（schema 変更なしで足りる見込み）**: `design_review_runs.result_json` は runner の
+      stdout をそのまま保存している（`designReviewRunner.ts` の `JSON.stringify(result)` →
+      `completeWithEvidence()`）。`strategicReview` の戻り値へ additive に足すだけで DB に残るため、
+      **列追加より `result_json` への追記を優先する**（migration は API 起動時にしか走らず、
+      deploy 順序の制約を増やすため）。
+
+      **protected file を変更しない境界（CEO 指示・2026-09-15）**: `copilotRouter.ts` /
+      `metaReviewFallbackRouter.ts` は変更しない。`providerUsed` は既に返っており（捨てているのは
+      caller 側の `strategicReview.ts`）、requested model は `DEFAULT_COPILOT_META_REVIEW_MODEL` を
+      **import して**記録できる。Registry 値と同定数が乖離した場合は fail-closed にし、既定値の drift を
+      沈黙させない。**Registry が router 既定と別 model を要求する場合にだけ** protected 変更が要る。
+      その最小案は `reviewWithProviderFallback()` へ optional な copilot model を1つ渡せるようにする
+      additive 変更（既定は現状維持）であり、**必要性が実測で示されるまで行わない**。
 
       **維持する不変条件**:
       - **Review を skip しない / BLOCK を override しない / 3/3 の run を再利用しない。**
