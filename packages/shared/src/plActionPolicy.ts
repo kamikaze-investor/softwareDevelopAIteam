@@ -227,6 +227,13 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
    *
    * `design_review` は残す。AI CLI の resume は workspace を書き換えるため、
    * その prompt に対する ALIGNED evidence が要る（これは実レコードで検証できる）。
+   *
+   * **CEO 承認（2026-09-15）は無条件ではない。** 6つの不変条件が維持されることを条件としており、
+   * 正本は `docs/project_memory/rules/approval_rules.md`「resume は Gate を代替しない」章。
+   * 要旨: resume は最終操作の Gate を代替しない / `git_commit` は現 HEAD・現 diff に対する新しい
+   * Approval を必ず通す / Design Review 要件を維持する / deploy・production・Safety boundary・
+   * authority 変更はそれぞれ既存 Gate を維持する / BLOCK 済み操作を resume だけで実行できない /
+   * STALE Approval を再利用しない。**これが崩れるなら up-front `approval_gate` を戻す。**
    */
   resume_task: {
     gates: ['design_review'],

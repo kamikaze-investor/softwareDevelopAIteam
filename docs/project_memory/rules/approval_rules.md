@@ -46,6 +46,31 @@ pending 中でも行ってよい。**同じ手順の中で `/workspace/target` �
 **新しい locking subsystem は作らない。** 上記は手順の順序で守る（deploy 前に pending の有無を確認し、
 あれば Candidate 同期だけを後回しにする）。
 
+---
+
+## resume は Gate を代替しない（2026-09-15 CEO 承認条件）
+
+`resume_task` の **up-front `approval_gate` は外した**（`packages/shared/src/plActionPolicy.ts`）。
+外さないと「新しい承認サイクルを始めるために既存の承認が要る」という循環になり、STALE 承認で
+止まった Job を**構造的に誰も復旧できなかった**（2026-09-15 に production で実際に発生）。
+
+CEO はこの変更を承認したが、**承認要件そのものを省略するものではない**。次を不変条件として維持する。
+
+1. **`resume_task` は最終操作の Gate を代替しない。** resume が通ることと、その先の操作が
+   通ることは別である。
+2. **`git_commit` は現在の HEAD / diff に対する新しい Approval を必ず通す。** resume が作る Job は
+   `approval_id` を継承せず、`/gate/check` が現 diff に対して新規発行する。
+3. **Design Review 要件を維持する。** `resume_task` の `design_review` gate は残っており、AI CLI の
+   resume は `resumeBlockedTask()` 自身が evidence を fail-closed で検査する。
+4. **deploy / production / Safety boundary / authority 変更は、それぞれ既存の Gate を維持する。**
+   resume 経由でこれらが緩むことはない。
+5. **BLOCK 済みの操作を resume だけで直接実行できない。** resume は Job を作り直すだけで、
+   BLOCK の結果を覆さない。
+6. **STALE Approval を再利用しない。** 再承認しても何も起きない。必ず新しい Approval を発行する。
+
+この6点が崩れる変更は、`resume_task` の Gate 構成を戻すこと（= up-front `approval_gate` の復活）を
+検討する合図である。
+
 ## CEOの承認が必要（Yellow Zone）
 
 以下の場合のみCEOに通知・承認を求める。
