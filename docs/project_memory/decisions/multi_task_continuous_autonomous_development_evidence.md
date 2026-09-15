@@ -249,3 +249,69 @@ attention には残るので CEO / Mobile からは見え続ける。
 | PL が CEO へ Escalate した | **成立**（LINE 3通、いずれも配信成功） |
 | Tier B だけ外部へ安全に handoff した | **成立**（`fileChangeGuard.ts` 不変・権限拡大なし・Independent Review 3ラウンド） |
 | 完了後に VPS 自律運転へ復帰できた | **未成立** — 外部完了を Task へ reconcile する既存経路が無いため |
+
+---
+
+# 第4ラウンド: Tier B 往復の 1本の E2E（同日 16:00〜17:15）
+
+CEO 指示により、**「Candidate 自律 → protected boundary 停止 → CEO Escalation → Tier B 外部
+handoff → external 実装/Review/merge/deploy → formal reconcile → VPS 自律復帰」までを1本の
+Operational Evidence として記録する**。
+
+## 通し記録（すべて production、時刻は UTC）
+
+| 段階 | 記録 |
+|---|---|
+| **Candidate 自律開発** | `04:54:53 adoption=adopted guard-block-message-omits-allowed-paths` → Design Review **ALIGNED** → implement Job 作成 |
+| **protected boundary で停止** | `c640473c` は何も書けず失敗。`e8f04766`（repair）は **`apps/worker/src/guards/fileGuardBlockMessage.ts` を新規作成して protected file を迂回しようとし、File Change Guard が blocked**（`fileChangeAllowed: false`） |
+| **CEO Escalation** | `05:01:13` job_failed → escalate_to_ceo、`05:10:10` job_blocked → Escalation。**LINE 配信成功** |
+| **Tier B 外部 handoff** | CEO が「この Task に限る」protected file 変更を承認。隔離 worktree で実装 |
+| **external 実装 / Review** | **Independent Review（Codex `gpt-5.6-sol`）3ラウンド**。`changes_requested` 2回はいずれも実欠陥（切り詰めで診断消失 / path と reason の連結で理由が消える / **こちらのテスト1件が vacuous**）。最終 `approved` |
+| **merge / deploy** | PR #216 → master `40bfed1` → Stable へ deploy。`fileChangeGuard.ts` は不変 |
+| **formal reconcile** | `07:43:43` CEO が UI で承認 → `07:44:19 pl_action_authorize kind=reconcile_external_completion gates=approval_gate` → `07:44:20 reconcile_external_completion` |
+| **Task 終端** | Task `7bd4a65a` → **done**、`currentTask` 解放、failed/blocked Job は履歴として保持、**DB 直書きなし** |
+| **VPS 自律復帰** | `08:10:59 adoption=adopted mobile-approval-role-docs` → Design Review **succeeded**（4分12秒）→ implement Job `8664cddc` **running**。**外部から次 Task を指定していない** |
+
+## 復帰の途中で見つけた欠陥（同じ circular fail-closed の3例目）
+
+reconcile 直後、PL は採用を再開したが**完了したばかりの項目を選び直して2回却下され、
+Escalation して二度と採用しなくなった**:
+
+```
+07:45:25 blocked   adoption_rejected "guard-block-message-omits-allowed-paths" already has an executed Task
+07:46:17 blocked   同上
+07:47:01 escalated 予算切れ → 以後 hasEscalated が永久に真
+```
+
+原因は2つ重なっていた:
+
+1. **Candidate の ledger が master に遅れる。** 採用候補の正本は Candidate 側の
+   `tasks/roadmap.md` だが、master で done にしても自動では追従しない
+2. **予算切れ Escalation から戻る道が無い。** 区切りが「直近の成功」だけなので、
+   成功するには採用が要り、採用するには予算が要る、という循環
+
+修正（master `5174482`）: 実行済み項目を候補から除く（DB は ledger より新しい事実）／
+予算の窓を Escalation でも区切る。**どちらも新しい state を持たない。**
+
+修正後の実測が上表の「VPS 自律復帰」行である。`08:05:28` に1回
+`strategic_alignment_review` 不足で fail-closed 却下され（＝窓が開いた証拠）、
+次の試行で採用が成立した。
+
+## 残した後続確認事項（CEO 指示・reconcile のブロッカーではない）
+
+`reconcile-evidence-not-fully-machine-verified`:
+
+1. **canonical master 包含と running Stable 包含を分けていない。**
+   現状は `git merge-base --is-ancestor <sha> HEAD`（Stable HEAD に対する祖先判定）のみ。
+   Stable が `origin/master` からしか ff されない運用のもとでは master 包含も含意するが、
+   **運用上の不変条件であって独立した証明ではない**
+2. **Independent Review の `approved` は caller の自己申告である。**
+   保存済み Review record とは照合していない。**追加実装が要る**
+   （CEO 確認事項2への回答は「既にそうなっている」ではない）
+
+## この E2E が示したこと
+
+**権限境界を保ったまま、Candidate の能力を超える作業を外部へ出し、正式な経路で戻して、
+自律運転を再開できた。** 途中で AI が protected file を迂回しようとしたが Guard が止め、
+権限は一切拡大されなかった。人が介在したのは **CEO の承認操作2回だけ**（Tier B 許可と
+reconcile 承認）で、次 Task の選択は外部から与えていない。
