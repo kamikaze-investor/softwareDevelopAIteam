@@ -27,6 +27,9 @@ const LEDGER = [
   '',
   '<!-- roadmap:id=finished-item state=done -->',
   '3. [x] **完了済みの項目** — 候補にしない',
+  '',
+  '<!-- roadmap:id=deferred-item state=deferred -->',
+  '4. [ ] **現在は着手しない項目** — 本文に「MVP後へ延期」とあっても state が正本',
 ].join('\n')
 
 /**
@@ -75,11 +78,21 @@ function deps(over: Partial<Parameters<typeof runAdoptionStep>[2]> = {}) {
 }
 
 describe('readAdoptionCandidates', () => {
-  it('done は候補にしない', () => {
+  it('候補は planned だけ（現在の可否は state が正本）', () => {
+    // 2026-09-15 CEO 決定: 「以前は延期されていた」と「現在も実装禁止」を区別する手段は
+    // **既存の `state=`**。新しい state 体系も metadata も作らない。
     const ids = readAdoptionCandidates(() => LEDGER).map((c) => c.id)
 
-    expect(ids).toContain('open-item')
-    expect(ids).toContain('in-progress-item')
+    expect(ids).toEqual(['open-item'])
+  })
+
+  it('deferred は候補にしない（本文の延期文言ではなく state で止める）', () => {
+    // 従来は `!== 'done'` だったため deferred も候補に入り、PL がそれを選んでから
+    // Design Review が本文の「MVP後へ延期」で止める、という回り道になっていた。
+    const ids = readAdoptionCandidates(() => LEDGER).map((c) => c.id)
+
+    expect(ids).not.toContain('deferred-item')
+    expect(ids).not.toContain('in-progress-item')
     expect(ids).not.toContain('finished-item')
   })
 })

@@ -240,7 +240,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**（state: planned）
 - **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**（state: planned）
 - **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**（state: planned）
-- **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: deferred）
+- **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: planned）
 - **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
 - **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）
 - **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**（state: planned）
@@ -248,7 +248,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: planned）
 - **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
-- 2種類の承認の役割整理とMobile導線設計（state: deferred）
+- 2種類の承認の役割整理とMobile導線設計（state: planned）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
 - **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）**（state: planned）

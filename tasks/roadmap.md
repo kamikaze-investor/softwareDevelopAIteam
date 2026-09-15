@@ -5,6 +5,31 @@
 
 ---
 
+## 現在の可否は `state=` が正本（2026-09-15 CEO 決定）
+
+**`MVP は 2026-09-13 に正式完了した。`** したがって本文中の
+「MVP後へ延期」「MVP完成後」「post-MVP」「MVP 完成まで開始しない」といった表現は、
+**その項目が書かれた時点の記録**であり、**現在の BLOCK 条件ではない**。
+延期条件はすでに充足している。
+
+**「以前は延期されていた」と「現在も実装禁止」を混同しないこと。** 区別は本文ではなく
+**既存の `state=` で表す**（新しい state 体系も metadata も追加しない）:
+
+| `state=` | 意味 |
+|---|---|
+| `planned` | **現在着手してよい。** 本文に「MVP後」と書いてあっても、条件は充足済み |
+| `deferred` | **現在は着手しない。** 延期理由は MVP とは別にあり、今も生きている |
+| `done` | 完了。履歴として残す |
+
+PL の採用候補は `planned` だけである（`deferred` は候補に入らない）。
+**Design Review・PL は、本文の古い延期文言を現在の BLOCK 根拠にしてはならない。**
+現在も止めるべき項目は `state=deferred` で表現されている。
+
+これは Review 結果の override ではなく、**Source of Truth の時点整合修正**である。
+経緯: `docs/project_memory/decisions/multi_task_continuous_autonomous_development_evidence.md`。
+
+---
+
 ## Phase 1: 基盤構築（現在）
 
 目的: **安全に自律開発できる基盤を作る**
@@ -1693,6 +1718,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       失わずに保存し続けていることの確認のみ行い、新規実装は行わない
 
       **MVP完成後・初期実装（最小構成）**: 既存ログからのIncident Candidate抽出／類似Incident
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
       clustering／Repeat検知／重大Incidentの即時昇格／上位1〜2件だけの原因分析／Improvement
       Proposal生成／CEOへ週1〜2件提出。これ以上の巨大な品質管理システムを最初から構築しない
 
@@ -3270,6 +3296,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 0. [ ] **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**
    （2026-09-11登録。continuation E2E（Production E2E test 4）で実際に1サイクル失った。
    **MVP後へ延期** — 回避策は仕様書のパス表記を相対にするだけでコード変更が不要なため）。
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
 
    **内容**: File Change Guard は git が報告する **リポジトリ相対**の changedFiles と
    task の `allowedPaths` を比較する（`apps/worker/src/guards/fileChangeGuard.ts`）。
@@ -3568,13 +3595,14 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    修正を外すと 8 件が落ち、既存挙動を固定する 5 件（未期限 WAITING / APPROVED / REJECTED /
    期限切れ APPROVED / 非 git_commit の未期限 WAITING）は修正の有無にかかわらず通ることを確認済み。
 
-<!-- roadmap:id=orphan-dirty-workspace-no-owner state=deferred -->
+<!-- roadmap:id=orphan-dirty-workspace-no-owner state=planned -->
 0. [ ] **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**
    **【2026-09-13 注記】`project-workspace-isolation`（Project 単位 workspace 分離）は本項目を
    閉じない。** per-project 分離が縮小するのは波及範囲（他 Project を巻き込まなくなる）だけで、
    1 Project 内の orphan dirty は残る。本項目を構造的に解消しうるのは
    **per-job worktree 分離（1 Job = 1 worktree）**であり、それは別ステップである。
    （2026-09-12登録、**高優先度・MVP後defer**。M1 を M1-a / M1-b に分割したうちの後半。
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    M1-a は PR #154 で完了済み。**本項目の実装は MVP 完成まで開始しない**）。
 
    **内容**: `resolveWorkspaceOwnership()`（`apps/worker/src/index.ts`）の fallback は、
@@ -3666,6 +3694,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    Approval Gate へ進む。CEO は「レビュー済み」として承認することになる。
 
    **対応方針（MVP後）**: 新しい Gate は作らない。既存の SafeCommand 機構の中で、
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    Task の受入条件に現れる検証コマンドを implement Job の判定に反映できないか検討する。
    最小案としては「受入条件に実行可能なコマンドが含まれる場合、それを SafeCommand として
    実行し、失敗したら Job を success にしない」。
@@ -3697,6 +3726,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    実際には 36 秒後に正常へ復帰している。
 
    **対応方針（MVP後）**: 新しい通知機構は作らない。既存の閾値・文面の調整で足りるはず。
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    continuation 起因の 503 滞留を「想定内」として区別できるか、あるいは閾値を
    design review の所要時間より長くするか。
 
@@ -3720,6 +3750,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    確定していない。
 
    **対応方針（MVP後）**: `rule` を optional にするか、parse 前に `null` を除去/正規化するか。
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    いずれも既存スキーマの調整で足り、新しい仕組みは不要。
 
 <!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
@@ -3739,6 +3770,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
       API側に何のエラー signal も残らない。**この catch は #136 以前からの既存挙動**であり、
       #136 が新規に持ち込んだものではない。状態は壊れず durable state は正しいままなので、
       MVP後に扱う。
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    ### 訂正（2026-09-11、CEO指示）— 「Step 3 で正式配線した」は誤りだった
 
    本項は以前「Step 3 で正式配線したため exception 対象ではない」と記載していたが、
@@ -3913,12 +3945,13 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    別 liveness 依存である `approval-resume-liveness-dependency`（M2）が残るため、
    その完了をもって初めて M3 で通しの実測を行う。
 
-<!-- roadmap:id=mobile-approval-role-docs state=deferred -->
+<!-- roadmap:id=mobile-approval-role-docs state=planned -->
 1. [ ] 2種類の承認の役割整理とMobile導線設計 — **Mobile導線は実装完了・文書整理のみ未完**。
    Project単位承認（`/api/approvals/pending`）とTask/Job単位Approval Gate
    （`/api/approval-requests/waiting`）は、統合せず併存させる形で`approvals.tsx`に実装済み
    （一覧取得・承認/却下操作とも動作）。**未完了なのは両者の役割・使い分けの文書化のみ**で、
    これはMVP必須ではなく非ブロッキング（スマホ操作サイクルは現状の併存実装で完結するため、
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    項目4の後またはMVP後に実施してよい）
 <!-- roadmap:id=mobile-task-job-detail-ui state=done -->
 2. [x] Task/Job一覧・詳細画面（Mobile） — 完了。Task一覧（`tasks.tsx`）・Task詳細（`tasks/[id].tsx`、
@@ -5295,6 +5328,7 @@ deploy canary は全 PASS だった。
       2026-09-10 登録。**本項目は明示的に post-MVP。MVP 完成まで説明品質改善を理由に
       本線を止めない**（CEO 判断・2026-09-10）。
       #130（predicate regression 修正）とは**別責務**。#130 / Phase 3 closure を先に完了する。
+   **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
 
       **2026-09-13 スコープ拡張: 本項目を Explainer 責務の owner とする（新規項目は立てない）**。
       調査の結果、Explainer は**既に3箇所に散在して実装済み**であることを確認した:
