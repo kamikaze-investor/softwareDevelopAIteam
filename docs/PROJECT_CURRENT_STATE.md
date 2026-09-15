@@ -219,6 +219,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **cleanup だけが失敗した containment が Job を quarantine させる
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
+- **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
+- **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
 
@@ -265,9 +267,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Mandatory Gate Policy（state: in_progress）
 - **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
-- **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**（state: planned）
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
-- **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**（state: planned）
+- **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）**（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
