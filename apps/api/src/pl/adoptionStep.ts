@@ -81,7 +81,14 @@ export function readAdoptionCandidates(
   readLedger: () => string = () => readFileSync(resolveLedgerPath(), 'utf-8'),
 ): RoadmapCandidate[] {
   return getValidRoadmapItems(readLedger())
-    .filter((item) => item.state !== 'done')
+    // **`planned` だけを候補にする。** 既存の `state=`（planned / in_progress / blocked /
+    // deferred / done）をそのまま可否の正本として使う。新しい state 体系は作らない。
+    //
+    // 従来は `!== 'done'` だったため、`deferred`（= 現在は着手しない）も候補に入っていた。
+    // 2026-09-15 実測で `deferred` が採用を止めておらず、「現在も実装禁止」を表す手段が
+    // 事実上無かった。`in_progress` / `blocked` も、着手済み・停止中のものを重ねて採用する
+    // 意味が無いので候補から外す。
+    .filter((item) => item.state === 'planned')
     .map((item) => ({ id: item.id, title: item.title.replace(/\*\*/g, '').slice(0, 90), state: item.state }))
     .slice(0, PL_ADOPTION_CANDIDATE_LIMIT)
 }
