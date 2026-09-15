@@ -534,6 +534,44 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(adoptCalls).toBe(0)
   })
 
+  it('Escalation 後も、原因が直れば採用を再開できる（永久に止まらない）', async () => {
+    // 2026-09-15 production 実測: Candidate の ledger が master に遅れていたため PL が完了済み
+    // 項目を選び、ALREADY_EXECUTED 却下を2回出して Escalation。**ledger を直した後も再開しなかった。**
+    // 成功だけを予算の区切りにすると「成功するには採用が要り、採用するには予算が要る」循環になる。
+    const storage = idleProject()
+    const adopted: string[] = []
+    const escalations: string[] = []
+    let broken = true
+    const d = deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => (broken ? 'これは JSON ではない' : PROPOSAL),
+      adopt: async (_s, input) => {
+        adopted.push(input.roadmapId)
+        return { ok: true as const, taskId: `task-${adopted.length}`, roadmapTaskKey: input.roadmapId, title: 't' }
+      },
+      escalate: async (p) => { escalations.push(p.title) },
+    })
+
+    // 予算を使い切って Escalation させる
+    for (let i = 0; i < PL_MAX_ADOPTION_ATTEMPTS; i += 1) {
+      resetPlLoopInFlightForTest()
+      expect((await runPlTick(storage, d)).status, `attempt ${i + 1}`).toBe('blocked')
+    }
+    resetPlLoopInFlightForTest()
+    expect((await runPlTick(storage, d)).status).toBe('escalated')
+    expect(escalations).toHaveLength(1)
+
+    // 原因が直った（= 提案が壊れなくなった）
+    broken = false
+    resetPlLoopInFlightForTest()
+    const resumed = await runPlTick(storage, d)
+
+    expect(resumed.status).toBe('acted')
+    expect(adopted).toEqual(['next-item'])
+    // 通知は窓ごとに1回のまま（鳴り続けない）
+    expect(escalations).toHaveLength(1)
+  })
+
   it('採用に成功したら予算は仕切り直す（2件目で打ち止めにならない）', async () => {
     // 2026-09-15 production 実測: 1件目の採用に2回（proposal_unusable → adopted）使った結果、
     // 次のサイクルは 1 tick 目で「PL は 2 回試しましたが採用できませんでした」になり、

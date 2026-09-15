@@ -361,11 +361,22 @@ function hasEscalated(storage: IStorage, targetKey: string): boolean {
  * 予算が縛るべきは「**連続した失敗**」であって生涯試行回数ではない。
  * **新しいテーブルは作らない。** 既存 `audit_log` を直近の成功で区切るだけである。
  */
-function adoptionEntriesSinceLastSuccess(storage: IStorage, targetKey: string): AuditLogEntry[] {
+function adoptionEntriesInCurrentWindow(storage: IStorage, targetKey: string): AuditLogEntry[] {
   // `findByEntity()` は新しい順に返す。
   const entries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, targetKey)
-  const lastSuccess = entries.findIndex((entry) => entry.result === 'acted')
-  return lastSuccess === -1 ? entries : entries.slice(0, lastSuccess)
+  // **Escalation も区切りにする。**
+  //
+  // 成功だけを区切りにすると、採用が一度 Escalation で終わった時点で予算が永久に尽きたままになり、
+  // **原因を直しても採用が再開しない**（成功するには採用が要り、採用するには予算が要る、という循環）。
+  // 実測（2026-09-15 production）: Candidate の ledger が master に遅れていたため PL が完了済み
+  // 項目を選び、`ALREADY_EXECUTED` 却下を2回出して Escalation。ledger を直した後も再開しなかった。
+  //
+  // Escalation で区切れば、CEO へ知らせたうえで次の窓から再試行できる。通知は窓ごとに1回のままで、
+  // 鳴り続けることはない。**新しい state は持たない** — 既存 `audit_log` の区切り方だけを変える。
+  const boundary = entries.findIndex(
+    (entry) => entry.result === 'acted' || entry.result === 'escalated',
+  )
+  return boundary === -1 ? entries : entries.slice(0, boundary)
 }
 
 function record(
@@ -957,10 +968,11 @@ async function maybeAdoptNext(
   const key = `adopt:${project.id}`
   // **採用が成功したら予算は仕切り直す。** 縛るのは連続した失敗であって生涯試行回数ではない
   // （そうしないと2件目の採用で打ち止めになる。2026-09-15 production 実測）。
-  const sinceLastSuccess = adoptionEntriesSinceLastSuccess(storage, key)
-  const attempt = sinceLastSuccess.filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length + 1
+  const currentWindow = adoptionEntriesInCurrentWindow(storage, key)
+  const attempt = currentWindow.filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length + 1
   if (attempt > PL_MAX_ADOPTION_ATTEMPTS) {
-    if (sinceLastSuccess.some((entry) => entry.result === 'escalated')) return undefined
+    // 窓の内側で既に通知済みなら黙る（鳴り続けない）。窓は Escalation で切り替わる。
+    if (currentWindow.some((entry) => entry.result === 'escalated')) return undefined
     await escalateTo(
       storage,
       deps,

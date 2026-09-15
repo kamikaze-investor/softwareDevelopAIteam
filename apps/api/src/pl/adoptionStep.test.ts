@@ -200,3 +200,54 @@ describe('runAdoptionStep — PL は ledger の外を採用できない', () => 
     expect(result.status).toBe('no_candidate')
   })
 })
+
+describe('runAdoptionStep — 実行済みの項目は候補にしない', () => {
+  // 2026-09-15 production 実測: Candidate の ledger が master に遅れている間、PL は完了済み
+  // 項目を open と見て選び、ALREADY_EXECUTED 却下で attempt 予算を2回消費した。
+  // DB（実行済みか）は ledger より新しい事実なので、候補の段階で除く。
+  it('Job を持つ Task がある roadmap item は PL へ提示しない', async () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const done = storage.tasks.create({
+      projectId: project.id, title: 'done one', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item',
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: done.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    let offered: string | undefined
+    const result = await runAdoptionStep(storage, project.id, {
+      propose: async (_system, user) => { offered = user; return '{}' },
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
+    })
+
+    // LEDGER の open item は 'open-item' だけ。実行済みなので候補が空になる
+    expect(result.status).toBe('no_candidate')
+    expect(offered).toBeUndefined()
+  })
+
+  it('Job がまだ無い Task の項目は候補に残る（採用前の Task を締め出さない）', async () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    storage.tasks.create({
+      projectId: project.id, title: 'not started', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item',
+    } as Parameters<IStorage['tasks']['create']>[0])
+
+    let offered = ''
+    await runAdoptionStep(storage, project.id, {
+      propose: async (_system, user) => { offered = user; return '{}' },
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
+    })
+
+    expect(offered).toContain('open-item')
+  })
+})

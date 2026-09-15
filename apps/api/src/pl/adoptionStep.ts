@@ -179,7 +179,22 @@ export async function runAdoptionStep(
   projectId: string,
   deps: PlAdoptionDeps,
 ): Promise<PlAdoptionResult> {
+  // **既に実行済みの Task を持つ項目は候補に混ぜない。**
+  //
+  // ledger（Candidate 側）は master の更新に対して遅れることがある。遅れている間、PL は
+  // 完了済みの項目を open と見て選び、`adoptRoadmapItem()` が `ALREADY_EXECUTED` で正しく
+  // 弾く — が、その却下は attempt 予算を消費する。2026-09-15 production 実測では、これを
+  // 2回繰り返して予算を使い切り、**ledger を直した後も採用が再開しなくなった**。
+  //
+  // DB（実行済みかどうか）は ledger より新しい事実なので、候補の段階で除く。
+  // **新しい state は持たない** — 既存の Task / Job を見るだけである。
+  const executedKeys = new Set(
+    storage.tasks.findByProjectId(projectId)
+      .filter((task) => task.roadmapTaskKey !== undefined && storage.jobs.findByTaskId(task.id).length > 0)
+      .map((task) => task.roadmapTaskKey as string),
+  )
   const candidates = readAdoptionCandidates(deps.readLedger)
+    .filter((candidate) => !executedKeys.has(candidate.id))
   if (candidates.length === 0) {
     return { status: 'no_candidate', reason: 'no open roadmap item in the ledger' }
   }

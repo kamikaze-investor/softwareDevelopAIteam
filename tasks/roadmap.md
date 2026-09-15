@@ -6740,8 +6740,43 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: hold で終わった質問がどれだけあり、
         そのうち何件が PL へ届いたかを後から数えられること
 
+<!-- roadmap:id=reconcile-evidence-not-fully-machine-verified state=planned -->
+5. [ ] **external completion reconcile の根拠2つが、まだ機械照合になっていない** —
+      2026-09-15登録（CEO 指示の後続確認事項）。**初回 reconcile のブロッカーではない**
+      （CEO 判断で実行済み）。経路そのものは master `828878a` で稼働している。
+
+      **(1) canonical master への包含と、running Stable への包含を分けていない。**
+      `verifyExternalCompletion()` が行うのは
+      `git merge-base --is-ancestor <sha> HEAD`（**Stable の HEAD に対する**祖先判定）だけである。
+      Stable が `origin/master` からしか fast-forward されない運用のもとでは master 包含も
+      含意するが、**それは運用上の不変条件であって独立した証明ではない**。
+      今回は PR #216 の merge 済み事実を別途確認しているため問題にしていない。
+
+      **(2) Independent Review の `approved` は caller の自己申告である。**
+      現状の検査は
+      `evidence.independentReviewVerdict.trim().toLowerCase() !== 'approved'` で弾くだけで、
+      **「approved」と書いた caller はそのまま通る**。保存済みの正式 Review record とは
+      照合していない。**ここは追加実装が要る**（CEO 確認事項2への回答: 「既にそうなっている」
+      ではない）。
+
+      そもそも今回の Independent Review は**外部セッションが Codex CLI で実行**したもので、
+      その結果は DB に保存されていない。`design_review_evidence` は Design Review のレコードであり
+      別物である。**「どこに保存するか」から決める必要がある。**
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - (1) について: `origin/master` の ref と Stable HEAD を**別々に**照合できるか。
+        API が fetch を打つのは避けたいので、**deploy 手順側が記録した master SHA** を
+        既存のどこか（`audit_log` の deploy 記録など）から読めないか
+      - (2) について: 外部 Tier B の Independent Review 結果を**保存する既存の置き場**があるか。
+        無い場合でも、**新しい review subsystem は作らない** — 既存 `design_review_evidence` の
+        reviewKind を増やす等、既存構造の小さな拡張で足りないかを先に見る
+      - **どちらも fail-closed の方向にしか変えない。** 現在通っているものを通らなくする変更は
+        既存 reconcile 済み Task を壊さないこと（冪等性は `ALREADY_DONE` で担保済み）
+      - 効果検証可能性（Design Philosophy 8）: reconcile が何回使われ、そのうち何件が
+        機械照合で弾かれたかを後から数えられること
+
 <!-- roadmap:id=guard-block-message-omits-allowed-paths state=done -->
-5. [x] **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
+6. [x] **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
       — **完了（2026-09-15, PR #216。Tier B / protected file 変更）**。
 
       **実装は Candidate ではなく外部セッションが行った。** 対象が `jobRunner.ts`
@@ -6788,7 +6823,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         Guard block 後の再質問回数などで後から見られるか
 
 <!-- roadmap:id=no-status-for-closing-a-task-without-implementing state=planned -->
-6. [ ] **採用した Task を「実装せずに閉じる」正式な状態が無い** — 2026-09-15登録（実運用で詰まった）。
+7. [ ] **採用した Task を「実装せずに閉じる」正式な状態が無い** — 2026-09-15登録（実運用で詰まった）。
 
       **事象**: PL が自律採用した Task `21d69075` は、調査の結果**実装すべきでない**と判明した
       （対象の Roadmap 項目が既に PR #144 で解決済みだった）。しかし `TaskStatus` は
@@ -6839,7 +6874,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: 取り下げ件数とその理由を後から数えられること
 
 <!-- roadmap:id=adoption-does-not-check-implementation-feasibility state=planned -->
-7. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
+8. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
       2026-09-15登録（production 実測）。CEO 指示により**既存 adoption / Design Review /
       PL diagnosis の改善候補**として記録する。
 
@@ -6871,7 +6906,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         件数を後から数えられること
 
 <!-- roadmap:id=adopted-item-blocked-by-stale-deferral-text state=done -->
-8. [x] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
+9. [x] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
       — **完了（2026-09-15, PR #211）**。CEO 判断により、ledger 全体の時点整合を取って解消した。
 
       **やったこと**: MVP 関連の記述を全走査して各出現を囲う item と state に対応づけ、
@@ -6921,7 +6956,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         そのうち何件が表記起因だったかを後から数えられること
 
 <!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
-9. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
+10. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
       2026-09-15登録（CEO の承認画面での指摘が発端）。
 
       **確認された事実（2026-09-15 実測）**:
@@ -6968,7 +7003,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `docs/project_memory/decisions/autoreview_diff_range_review_findings.md`。
 
 <!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
-10. [ ] **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）** —
+11. [ ] **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）** —
       2026-09-15登録（production 実測）。**CEO が読む通知の中身の問題であり、機構ではなく品質。**
 
       **事象**: Task `7bd4a65a` の implement Job が失敗したとき、PL は CEO へ
@@ -6991,7 +7026,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
 
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
-11. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
+12. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
       同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
       **担当境界（2026-09-15）**: 本項目は「transient 起因の失敗が attempt 予算を食い潰す」こと、
