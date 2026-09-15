@@ -6687,8 +6687,41 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: hold で終わった質問がどれだけあり、
         そのうち何件が PL へ届いたかを後から数えられること
 
+<!-- roadmap:id=adopted-item-blocked-by-stale-deferral-text state=planned -->
+5. [ ] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される** —
+      2026-09-15登録（production 実測。**CEO 判断が要る**）。
+
+      **事象**: PL が `task-allowed-paths-not-normalized` を自律採用した直後、Design Review が
+      `finalDecision: CONFLICT` を返して実装 Job が作られず、連続自律開発が2件目で止まった。
+      経緯と全ログは
+      `docs/project_memory/decisions/multi_task_continuous_autonomous_development_evidence.md`。
+
+      **CONFLICT の根拠は2つあり、性質が違う**:
+      1. **「post-MVP へ延期されている」** — 採用元 ledger 項目の本文が
+         「**MVP後へ延期** — 回避策は仕様書のパス表記を相対にするだけでコード変更が不要なため」と
+         書いている。しかし **MVP は 2026-09-13 に完了**し `TEMP_MVP_COMPLETION_POLICY` も削除済みで、
+         **延期条件はすでに満たされている**。ledger 本文が古いまま残っていることが誤読を招いた
+      2. **「より軽い代替がある」** — 絶対パスを警告する / guard のメッセージに `allowedPaths` を
+         書く、といった選択肢に比べて path 正規化層は複雑すぎる、という指摘。
+         **これは (1) と独立に成立する**（scope_simplicity）
+
+      **外部セッションはここを解決しない。** ledger 本文を書き換えれば CONFLICT は消えるが、
+      それは **Binding Review の入力を外から操作して判定を覆す**ことに等しい。
+      `approval_rules.md`「Review finding の扱い」章に従い、Second Independent Review →
+      Meta Review → CEO Escalation で再評価する。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - 「MVP後へ延期」と書かれた ledger 項目が他に何件あるか。**MVP 完了後もこの表記が残っている限り、
+        PL が何を採用しても同じ CONFLICT が再発しうる**。個別対応ではなく表記の扱いを決める
+      - 延期条件の充足を Design Review が読めるか。読めないなら、ledger 側で
+        「延期 → 解除済み」を機械的に表せるか（**新しい state 語彙を増やさずに**）
+      - (2) の scope_simplicity 指摘は正当か。正当なら、採用時の `implementationScope` を
+        より軽い案へ絞れば通るのか
+      - 効果検証可能性（Design Philosophy 8）: CONFLICT で止まった採用が何件あり、
+        そのうち何件が表記起因だったかを後から数えられること
+
 <!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
-5. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
+6. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
       2026-09-15登録（CEO の承認画面での指摘が発端）。
 
       **確認された事実（2026-09-15 実測）**:
@@ -6735,7 +6768,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `docs/project_memory/decisions/autoreview_diff_range_review_findings.md`。
 
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
-6. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
+7. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
       同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
       **担当境界（2026-09-15）**: 本項目は「transient 起因の失敗が attempt 予算を食い潰す」こと、

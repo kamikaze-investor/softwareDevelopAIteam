@@ -265,6 +265,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Mandatory Gate Policy（state: in_progress）
 - **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
+- **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**（state: planned）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
