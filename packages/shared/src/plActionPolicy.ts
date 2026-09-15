@@ -81,6 +81,9 @@ export const PL_ACTION_KINDS = [
 
   // ── 開発の進行 ──
   'adopt_roadmap_item',
+  // 外部（Tier B）で正式に完了した成果を Task state へ反映するだけの操作。
+  // **実装も権限付与も行わない。** 既存の completion transition を呼ぶだけである。
+  'reconcile_external_completion',
   'delegate_implementation',
   'propose_code_change',
 
@@ -248,6 +251,22 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
   abort_task: {
     gates: ['approval_gate'],
     reason: 'aborting discards in-flight work and changes project state',
+  },
+  /**
+   * 外部（Tier B）で完了した成果を Task completion へ取り込む。
+   *
+   * **この操作は実装を行わない。** protected file を書く権限も、Safety Boundary を動かす権限も
+   * 与えない。やるのは「既に canonical master へ入り production へ出た成果」を Task state へ
+   * 反映することだけである（CEO 指示・2026-09-15）。
+   *
+   * それでも **Task を done にする**のは進行に影響する状態遷移なので、既存 Approval 機構を
+   * そのまま要求する。**呼び出し側の自己申告では通らない**（根拠は server 側で機械照合する）。
+   */
+  reconcile_external_completion: {
+    gates: ['approval_gate'],
+    reason:
+      'marking a Task done without the Candidate doing the work needs a human to confirm '
+      + 'the external result is real; the action itself grants no write or boundary permission',
   },
   rollback_commit: {
     gates: ['safety_review', 'approval_gate', 'ceo_approval'],

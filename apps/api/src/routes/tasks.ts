@@ -14,6 +14,8 @@ import {
   selectPrincipleSlugs,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
 import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
+import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
+import { verifyExternalCompletion } from '../reconcile/externalCompletion'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
@@ -129,6 +131,24 @@ const UpdateTaskBody = z.object({
 const ListQuerySchema = z.object({
   projectId: z.string().min(1),
 })
+
+/**
+ * 外部完了の申告。**すべて必須**で、空文字は通さない（記録が形骸化するため）。
+ * `approvalRequestId` は既存 Approval 機構の承認レコード。Gate 側が APPROVED か照合する。
+ */
+const ReconcileExternalCompletionBody = z.object({
+  approvalRequestId: z.string().min(1),
+  sourceJobId: z.string().min(1),
+  evidence: z.object({
+    roadmapItemId: z.string().trim().min(1),
+    commitSha: z.string().trim().min(7),
+    pullRequestUrl: z.string().trim().min(1),
+    independentReviewVerdict: z.string().trim().min(1),
+    ciResult: z.string().trim().min(1),
+    acceptanceEvidence: z.string().trim().min(1),
+    approvedScope: z.string().trim().min(1),
+  }).strict(),
+}).strict()
 
 const ResumeTaskBody = z.object({
   instruction: z.string().trim().min(1).max(2000),
@@ -447,6 +467,78 @@ export async function taskRoutes(
     }
 
     return reply.status(201).send(resumed.job)
+  })
+
+  /**
+   * POST /:id/reconcile-external-completion
+   *
+   * Candidate 以外（Tier B 外部実装）で正式に完了した成果を Task completion へ戻す。
+   *
+   * **この操作は実装をしない。** protected file を書く権限も Safety Boundary を動かす権限も
+   * 与えない。既に canonical master へ入り production へ出ている成果を、既存の completion
+   * transition で Task state へ反映するだけである（CEO 指示・2026-09-15）。
+   *
+   * 順序は **根拠の機械検証 → Mandatory Gate → 既存 completion transition**。
+   * 呼び出し側の自己申告だけでは done にならない。
+   */
+  app.post<{ Params: { id: string } }>('/:id/reconcile-external-completion', async (req, reply) => {
+    const parsed = ReconcileExternalCompletionBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    }
+
+    const task = storage.tasks.findById(req.params.id)
+    if (!task) {
+      return reply.status(404).send({ error: 'Task not found' })
+    }
+
+    // 1) 根拠。repository と DB で確かめられるものはここで確かめる（fail-closed）。
+    const verification = verifyExternalCompletion(storage, task.id, parsed.data.evidence)
+    if (!verification.ok) {
+      return reply.status(422).send({ error: verification.reason })
+    }
+
+    // 2) Mandatory Gate。**Task completion を起こす正式操作なので必ず通す。**
+    //    充足の根拠は seam が DB の実レコードで検証する（Gate 名の文字列では通らない）。
+    try {
+      authorizePlAction(storage, {
+        proposal: { kind: 'reconcile_external_completion' },
+        target: { kind: 'task', taskId: task.id },
+        evidence: [{ gate: 'approval_gate', approvalRequestId: parsed.data.approvalRequestId }],
+      })
+    } catch (error: unknown) {
+      if (error instanceof PlActionBlockedError) {
+        return reply.status(403).send({ error: error.message })
+      }
+      throw error
+    }
+
+    // 3) 既存 completion transition。新しい完了経路は作っていない。
+    const reconciled = storage.jobs.reconcileExternalCompletion({
+      taskId: task.id,
+      sourceJobId: parsed.data.sourceJobId,
+    })
+    if (!reconciled.ok) {
+      return reply.status(reconciled.code === 'ALREADY_DONE' ? 409 : 400).send({ error: reconciled.reason })
+    }
+
+    // 4) 根拠を残す。機械照合できなかった項目も含めてそのまま監査へ載せる。
+    storage.auditLog.record({
+      actor: 'api',
+      operation: 'reconcile_external_completion',
+      entityType: 'task',
+      entityId: task.id,
+      result: 'done',
+      detail: JSON.stringify({
+        ...parsed.data.evidence,
+        sourceJobId: parsed.data.sourceJobId,
+        approvalRequestId: parsed.data.approvalRequestId,
+        verifiedChangedFiles: verification.verified.changedFiles,
+        verifiedAgainstStableHead: verification.verified.stableHead,
+      }).slice(0, 4000),
+    })
+
+    return reply.send({ task: reconciled.task, continuation: reconciled.continuation })
   })
 
   app.patch<{ Params: { id: string } }>('/:id', async (req, reply) => {

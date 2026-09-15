@@ -14,7 +14,11 @@ import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalSto
 import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
-import type { ITaskContinuationStorage, PersistCommitSuccessWithContinuationResult } from './interface'
+import type {
+  ITaskContinuationStorage,
+  PersistCommitSuccessWithContinuationResult,
+  ReconcileExternalCompletionResult,
+} from './interface'
 import type { TaskContinuation } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
@@ -1105,6 +1109,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  /**
+   * **Task 完了の唯一の遷移。** 「Task を done にして continuation を作る」責務だけを持つ。
+   *
+   * Candidate の git_commit 成功（`persistCommitSuccessWithContinuation`）と、
+   * 外部 Tier B 完了の取り込み（`reconcileExternalCompletion`）の**両方がここを通る**。
+   * 完了経路を増やすのではなく、既存の遷移を共有するための切り出しである
+   * （CEO 指示・2026-09-15）。**呼び出し側は必ず transaction 内で呼ぶこと。**
+   */
+  function completeTaskAndCreateContinuation(task: Task, sourceJobId: string): TaskContinuation {
+    if (task.status !== 'done') {
+      tasks.update(task.id, { status: 'done' })
+    }
+
+    const project = projects.findById(task.projectId)
+    const nextTask = project?.status === 'archived'
+      ? undefined
+      : selectNextContinuableTask(tasks.findByProjectId(task.projectId))
+
+    return taskContinuations.findByCompletedTaskId(task.id)
+      ?? taskContinuations.create({
+        sourceJobId,
+        projectId: task.projectId,
+        completedTaskId: task.id,
+        nextTaskId: nextTask?.id,
+        status: nextTask ? 'pending' : 'completed',
+      })
+  }
+
   const jobs: IJobStorage = {
     findByTaskId(taskId) {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
@@ -1291,24 +1323,47 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         recordOutboxEvent(db, input.jobId, input.outboxEvent)
 
-        if (sourceTask.status !== 'done') {
-          tasks.update(sourceTask.id, { status: 'done' })
-        }
-
-        const project = projects.findById(sourceTask.projectId)
-        const nextTask = project?.status === 'archived'
-          ? undefined
-          : selectNextContinuableTask(tasks.findByProjectId(sourceTask.projectId))
-        const continuation = taskContinuations.findByCompletedTaskId(sourceTask.id)
-          ?? taskContinuations.create({
-            sourceJobId: source.id,
-            projectId: sourceTask.projectId,
-            completedTaskId: sourceTask.id,
-            nextTaskId: nextTask?.id,
-            status: nextTask ? 'pending' : 'completed',
-          })
+        const continuation = completeTaskAndCreateContinuation(sourceTask, source.id)
 
         return { ok: true, job: updated, continuation, deduplicated: false }
+      })
+
+      try {
+        return persistTransaction()
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          code: 'STORAGE_ERROR',
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+
+    reconcileExternalCompletion(input) {
+      const persistTransaction = db.transaction((): ReconcileExternalCompletionResult => {
+        const task = tasks.findById(input.taskId)
+        if (!task) {
+          return { ok: false, code: 'TASK_NOT_FOUND', reason: 'Task not found' }
+        }
+        // 既に done なら二重に continuation を作らない（冪等）。
+        if (task.status === 'done') {
+          return { ok: false, code: 'ALREADY_DONE', reason: 'Task is already done' }
+        }
+        // continuation の出所は実在する Job でなければならない。外部完了でも
+        // 「どの試行の後始末か」を辿れるようにするため、新規 Job は作らず既存 Job を指す。
+        const source = jobs.findById(input.sourceJobId)
+        if (!source || source.taskId !== task.id) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found for this Task' }
+        }
+
+        // **Candidate commit と同じ遷移を共有する。** ここに別の完了ロジックは無い。
+        const continuation = completeTaskAndCreateContinuation(task, source.id)
+        const updated = tasks.findById(task.id)
+        if (!updated) {
+          return { ok: false, code: 'STORAGE_ERROR', reason: 'Task disappeared during completion' }
+        }
+
+        return { ok: true, task: updated, continuation }
       })
 
       try {
