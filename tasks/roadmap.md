@@ -6636,6 +6636,23 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 承認画面へ「この変更対象に保護対象が含まれるか」を事実として出せるか
         （`triggeredRules` に相当する形で。AI の判断ではなく機械判定として）
 
+      **CEO 指示（2026-09-15）— 解消の条件**:
+      **master への Promotion 前に本項目を解消すること。**
+      Task `bd80c4ce` の Candidate commit 自体は承認されたが、Promotion はこの解消を待つ。
+
+      **単純にヘッダを削除・書き換えて済ませない。** 次を確認したうえで、
+      **正式な Safety Boundary を一本化する**こと:
+      - `CONTROL REPOSITORY` の正式な意味
+      - どのファイルが**本当に** AI 編集禁止なのか
+      - `ALWAYS_FORBIDDEN_PATTERNS` が正式な強制境界なのか
+      - `allowedPaths` との関係
+      - **コメントと機械強制のどちらを Source of Truth とするのか**
+
+      **AI 側が自分の権限を広げる形で解決してはならない。**
+      Safety Boundary 変更に当たる場合は CEO へ Escalate する。
+      finding の統合判断の記録は
+      `docs/project_memory/decisions/autoreview_diff_range_review_findings.md`。
+
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
 6. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
