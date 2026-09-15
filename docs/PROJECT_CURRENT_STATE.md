@@ -269,6 +269,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**（state: planned）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
+- **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）**（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）

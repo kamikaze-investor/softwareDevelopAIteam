@@ -6871,8 +6871,31 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       finding の統合判断の記録は
       `docs/project_memory/decisions/autoreview_diff_range_review_findings.md`。
 
+<!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
+9. [ ] **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）** —
+      2026-09-15登録（production 実測）。**CEO が読む通知の中身の問題であり、機構ではなく品質。**
+
+      **事象**: Task `7bd4a65a` の implement Job が失敗したとき、PL は CEO へ
+      「**外部の `ANTHROPIC_API_KEY` の設定問題**であり自動復旧できない」と上げた。
+      しかし実際の失敗理由は `implementation produced no file changes`
+      （exit 0 / `workspaceState: unchanged` / 変更ファイル0件）で、
+      `ANTHROPIC_API_KEY` の行は **stderr 冒頭の警告**（connector が無効という注意書き）にすぎない。
+      真因は「対象ファイルが `allowedPaths` の外（しかも protected file）で何も書けなかった」である。
+
+      **なぜ問題か**: Escalation は CEO が判断するための唯一の入力である。原因を取り違えた本文は、
+      **CEO を存在しない設定問題の調査へ誘導する**。Design Philosophy 8（効果検証可能性）にも反する。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - stderr の**警告行と失敗理由を分離**して渡せるか。今は末尾数百字をそのまま渡している
+      - `failureMetadata`（`workspaceState: unchanged` 等）や `changedFiles` の空を、
+        診断 context で**より強い手がかり**として提示できるか
+      - 「allowedPaths の外を触ろうとした」を機械的に判定して context に載せられるか
+        （`guard-block-message-omits-allowed-paths` と同じ情報源）
+      - **新しい診断機構は作らない。** 渡す context の作り方（`buildContext()`）の改善で足りるか
+      - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
+
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
-9. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
+10. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
       同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
       **担当境界（2026-09-15）**: 本項目は「transient 起因の失敗が attempt 予算を食い潰す」こと、

@@ -779,6 +779,24 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey?.startsWith('resume:'))).toBe(true)
   })
 
+  it('evidence が複数あっても最新だけを Gate へ出す（古いものへ遡らない）', async () => {
+    // 2026-09-15 production 実測: `findByTaskId()` は新しい順に返すのに `.pop()` していたため
+    // **最も古い** evidence を出しており、Gate に
+    // `design_review evidence ... is not the latest for the target` で2回とも弾かれた。
+    // evidence が1件の Task では偶然一致して通るので、2件目ができるまで気付けなかった。
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    alignedEvidence(storage, taskId)   // 古い方
+    alignedEvidence(storage, taskId)   // 新しい方（Gate が要求するのはこちら）
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: '新しい承認サイクルへ', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.reason ?? '').not.toContain('is not the latest for the target')
+    expect(result.status).toBe('acted')
+  })
+
   it('evidence が無ければ resume は Gate に止められる（自己申告では通らない）', async () => {
     const { storage, taskId, projectId } = seed()
     blockedCommitJob(storage, taskId, projectId)
