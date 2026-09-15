@@ -250,7 +250,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
-- **Roadmap 採用経路の残作業2件（`roadmap-item-adoption` の後続）**（state: planned）
+- **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）**（state: planned）
 - **Project 単位 workspace 分離（Multi-Project の前提・最優先）**（state: planned）
 - **Harness Bake-off / Execution Runtime Evaluation**（state: planned）
