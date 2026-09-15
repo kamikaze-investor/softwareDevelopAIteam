@@ -4225,27 +4225,54 @@ Adapter実装を開始する指示ではない**。実装着手はHigh-priority 
 
 **AIteamOS側に残す責務（＝長期的な競争力の所在）**
 - CEO / Mobile UI
+- CEO authority（承認権限そのもの）
 - Claude PL（判断・委任・統合）
+- Goal / Design Philosophy
 - Goal / Roadmap / Task orchestration
-- Approval / Risk Gate
+- Project / Roadmap / Task state
+- Approval / Risk Gate（Risk / Approval Policy の正本）
 - Finding / Repair management
 - AI / model routing
-- Review policy
+- Review policy / Independent Review policy
+- Decision history
+- Organizational Knowledge / Learnings（`docs/project_memory/` の lessons_learned を含む）
+- Project Graph
+- Cross-project knowledge propagation
 - Project state / business workflow
 - 自己改善・運用判断
 
 **将来的にHarnessへ委譲候補とする責務（＝独自実装を競争力と位置付けない）**
 - agent process execution
+- durable execution
 - process-tree containment / termination
-- sandbox / VM isolation
+- sandbox / VM isolation / code execution
 - workspace isolation
 - command timeout / cancellation
 - child-process cleanup
 - Git execution
 - crash recovery at execution-runtime level
 - execution artifacts / logs
-- agent runtime resume
+- agent runtime resume（crash / interruption後のexecution resume）
+- low-level observability / tracing
+- agent deployment
+- multi-agent transport / A2A
+- session等の一時的runtime state
 - low-level filesystem / network permissions
+
+**正本（authoritative source）は外部Agent Platformへ移管しない（2026-09-15追記。正本は
+`specs/00_constitution.md` 3.7 Vendor Independence・3.8 Knowledge First）**
+
+上の「残す責務」側は、単に自作を続けるという意味ではなく、**状態・知識・governance・decision history の
+authoritative sourceをAIteamOS / AIcompanyOS側に置き続ける**という意味である。外部Agent Platform
+（OpenHands / Google Agent Runtime・ADK等）には**executionを委譲してよいが、会社・Projectの正本にはしない**。
+判定基準は次の一点に集約する: 外部platformが利用不能になったとき、
+**「会社やProjectを再構築する」のではなく「execution backendを交換する」だけで継続できるか**。
+できないなら、その責務は委譲候補ではない。
+
+なお `Cost / Revenue attribution` と `Capital allocation` も同様に外部へ移管しない正本だが、これらは
+**AIcompanyOS側の責務**であり、本節に挙げることはAIteamOSへ今それを実装する意味ではない
+（Business機能をAIteamOSへ持ち込まない既存境界を維持する。本ファイル `cross-project-state-api` の
+「AIcompanyOS 互換の最小範囲」を参照）。
 
 ## P1 stuck-running-Job recovery — CLOSED（2026-09-08）
 
@@ -4973,9 +5000,12 @@ deploy canary は全 PASS だった。
       **上記が全て満たされるまで interlock は維持する（CEO 指示）。**
 
 <!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
-1. [ ] **Harness Bake-off / Execution Runtime Evaluation** — High-priority Recovery修正が一段落した後、
+1. [ ] **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）** —
+      High-priority Recovery修正が一段落した後、
       **新規機能を増やす前に**実施する評価項目。第一候補としてOpenHands等のvendor-neutral /
-      self-host可能なHarnessを評価するが、**特定ベンダー前提にはしない**。
+      self-host可能なHarnessを評価するが、**特定ベンダー前提にはしない**。評価候補には
+      **self-host型Harness（OpenHands等）と managed Agent Platform（Google Agent Runtime / ADK 等）の
+      両方**を含める（後者の評価条件は本項目後半の「外部managed Agent Platform…」節を参照）。
 
       **評価方法の必須条件:** 機能表・ドキュメントの比較だけで判断しない。**AIteamOSで実際に発生した
       障害を再現して比較する**こと。最低限、以下を再現・比較する:
@@ -4998,9 +5028,60 @@ deploy canary は全 PASS だった。
       **AIteamOS全体を置き換える前提にはしない**。上位OrchestrationはAIteamOSに残し、
       **低レベルexecution layerだけを差し替え可能にする**方向を優先する。
 
-      **今回実装しないもの（明記）:** Harness導入 / OpenHands導入 / Harness Adapter実装 /
-      既存Job Runnerの置換 / 新しいsandbox基盤の構築。本項目はRoadmapへの将来方針と評価条件の
-      記録のみであり、着手可否は既存High-priority Repair完了後に判断する。
+      **外部managed Agent Platform（Google Agent Runtime / ADK 等）の評価（2026-09-15・CEO指示で本項目へ統合）**
+
+      目的が本項目と同一（**低レベルexecution layerだけを差し替え可能にする**）なので、新規Roadmap項目を
+      作らず本項目へ統合する。検証したいのは、以下の**非コア領域を今後自前開発・強化せず外部Agent Platformへ
+      委譲できるか**である: agent runtime / durable execution / crash・interruption後のexecution resume /
+      sandbox・code execution / low-level observability・tracing / agent deployment /
+      multi-agent transport・A2A / session等の一時的runtime state。
+
+      **移管しない正本**は本ファイル「Execution Runtime Boundary」節の「正本（authoritative source）は
+      外部Agent Platformへ移管しない」に従う（Project / Roadmap / Task state / Goal / Design Philosophy /
+      Risk・Approval Policy / CEO authority / Independent Review policy / Decision history /
+      Organizational Knowledge・Learnings / Project Graph / Cost・Revenue attribution / Capital allocation /
+      Cross-project knowledge propagation）。同じ内容を本項目に再掲せず、境界の正本は1箇所に置く。
+
+      **これはAIteamOSをGoogleへ移行するTaskではない。** 現在のproduction AIteamOS / Worker / Recovery /
+      Project State を置換・変更しない。最初は**完全に隔離した評価**として実施する。
+
+      - **Phase 1: Shadow Evaluation** — 既に完了済みの代表的Taskを使い、同等入力をGoogle側runtimeで
+        再実行する。**production repositoryへのwriteは禁止**。AIteamOSの既存execution pathは変更しない。
+        結果は比較評価のみ。評価項目: task完遂能力 / 長時間実行 / interruption・resume / cancellation /
+        failure handling / observability / cost / latency / Independent Reviewとの接続容易性 /
+        vendor lock-in / Google停止時の代替可能性。
+      - **Phase 2: Isolated Runtime Evaluation** — Phase 1で有望だった場合のみ、**専用test repository /
+        disposable project**で検証する: execution / intentional crash / restart・resume / approval待ち /
+        cancellation / duplicate execution防止 / state recovery / failure visibility。
+        上記の障害再現リスト（agent強制終了・descendant残存・dirty workspace 等）もこのtest repositoryに対して
+        適用する。**production Projectは使用しない。**
+      - **Phase 3: Optional Backend Evaluation** — Phase 1・2で既存runtimeより**明確なメリット**が確認できた
+        場合のみ検討する。既存execution境界を維持したまま `current executor` / `google executor` を選択可能に
+        する。**defaultは `current executor` のままとし、Googleをproduction defaultへ変更しない。**
+
+      **着手条件:** 現在優先しているAIteamOSのproduction運用安定化・MCP監査（`chatgpt-mcp-inspect`）・
+      Blocked / Resume 系を妨げないこと。具体的には `cross-project-state-api` / `mandatory-gate-policy`
+      （いずれも in_progress）等の進行中項目が一段落した後、**または** production Projectに触れない独立した
+      検証環境で安全に実行可能になった時点で着手する。本項目の追加自体では既存production実装を変更しない。
+
+      **この着手条件は機械的に強制されない（2026-09-15 実装確認）。** PL の採用候補は
+      `readAdoptionCandidates()` が `state !== 'done'` で絞るだけであり、`deferred` / `blocked` へ変えても
+      採用は妨げられない。`checkRoadmapItemAlignment()` も「ledger に実在し done でない」ことしか見ず、
+      ledger には優先度・依存関係を機械判定する metadata が無い（`priority=` は parser が
+      **解釈せず素通し**し、PL の選択プロンプトにも渡らない）。本項目の title に着手条件を併記しているのは、
+      選択時に PL へ届く項目単位の情報が `id — state — title` だけだからであり、
+      **enforcement ではなく選択時の判断材料**である。**この抑止のためだけに state を変更しない。**
+
+      **Yellow Zone（CEO承認が必要な範囲）:** Google / GCP 等の**外部サービスへの実操作・resource作成 /
+      credential設定 / 課金を伴う評価の開始**にCEO承認を要する（`CLAUDE.md` 4章 Authority Principle の
+      「外部サービス追加 / 課金発生」）。**ドキュメント調査や、外部サービスを変更しない事前調査は承認対象に
+      広げない**（Design Philosophy「承認最小」）。
+
+      **今回実装しないもの（明記）:** Harness導入 / OpenHands導入 / Google Agent Runtime・ADK導入 /
+      Harness・executor Adapter実装 / executor選択機構 / 既存Job Runnerの置換 / 新しいsandbox基盤の構築 /
+      GCPアカウント作成・課金設定 / production defaultの変更 / 新しい Gate・Roadmap state の追加。
+      本項目はRoadmapへの将来方針と評価条件の記録のみであり、着手可否は既存High-priority Repair
+      完了後に判断する。
 
 <!-- roadmap:id=containment-adversarial-escape-threat-model state=planned -->
 2. [ ] **Containment adversarial escape（cgroup migration / git external helper）— security Finding** —
