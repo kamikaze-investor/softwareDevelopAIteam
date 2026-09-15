@@ -198,6 +198,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Interactive Project Definition / Readiness
 - **Design Review CONFLICT Recovery
 - **Project Pause / Continuation-Control Gap
+- **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる**
 - **resume 経路のテストが実 LLM レビューの判定に依存していた（非 hermetic）
 - **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）
 - **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
@@ -235,7 +236,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
 - **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行（state: in_progress）
-- **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる**（2026-09-07登録。（state: planned）
 - **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、（state: planned）
 - **evidence登録後〜Task sync前のcrashでRoadmapが再生成されうる**（2026-09-08登録。（state: planned）
 - **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。（state: planned）
@@ -263,6 +263,17 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）
 - **Role / Provider / Model Registry（役割別ルーティング設定表）**（state: planned）
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
+- **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
+- **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった**（state: planned）
+- **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる**（state: planned）
+- **PL Escalation が未配達でも `escalated` と記録し、以後その対象の処理を永久に止める**（state: planned）
+- **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**（state: planned）
+- **cheap AI（説明・質問経路）の latency と timeout 契約**（state: planned）
+- **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる**（state: planned）
+- **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める**（state: planned）
+- **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）**（state: planned）
+- **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**（state: planned）
+- **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）**（state: planned）
 - **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: in_progress）
 - **Mandatory Gate Policy（state: in_progress）
 - **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
