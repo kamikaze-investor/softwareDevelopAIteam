@@ -267,6 +267,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Mandatory Gate Policy（state: in_progress）
 - **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
+- **external completion reconcile の根拠2つが、まだ機械照合になっていない**（state: planned）
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
