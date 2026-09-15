@@ -410,13 +410,22 @@ function collectSystemEvidence(
 
   const evidence: GateEvidenceRef[] = []
 
-  // Design Review: その Task の ALIGNED evidence があれば積む。
-  const aligned = storage.designReviewEvidence
-    .findByTaskId(item.taskId)
-    .filter((row) => row.decision === 'ALIGNED')
-    .pop()
-  if (aligned) {
-    evidence.push({ gate: 'design_review', designReviewEvidenceId: aligned.id })
+  // Design Review: **Gate が見るのと同じ「最新の evidence」だけ**を積む。
+  //
+  // Gate は `findLatestByTaskId()` と id が一致しない根拠を
+  // 「is not the latest for the target」で弾く（古い ALIGNED を持ち出して新しい判定を
+  // 上書きさせないための性質であり、緩めない）。
+  //
+  // 以前はここで `findByTaskId().filter(ALIGNED).pop()` を使っていたが、
+  // `findByTaskId()` は**新しい順**に返すため `.pop()` は**最も古い** evidence を取っていた。
+  // evidence が1件の Task では偶然一致して通り、**2件目ができた瞬間から必ず落ちる**。
+  // 実測（2026-09-15 production）: Task `7bd4a65a` で resume が2回とも
+  // `design_review evidence ... is not the latest for the target` で止まり、Escalation した。
+  //
+  // 最新が ALIGNED でない / task-kind でない場合は**何も積まない**（古いものへ遡らない）。
+  const latest = storage.designReviewEvidence.findLatestByTaskId(item.taskId)
+  if (latest?.decision === 'ALIGNED' && latest.reviewKind === 'task') {
+    evidence.push({ gate: 'design_review', designReviewEvidenceId: latest.id })
   }
 
   // Approval Gate: **承認済み**の approval request だけを積む。
