@@ -79,8 +79,8 @@ PL の採用候補は `planned` だけである（`deferred` は候補に入ら�
 - [x] GeminiCliAdapter（Reviewer AI）
 - [x] CodexAdapter（将来用プレースホルダー）
 - [x] AGENTS.md・session-log・コミットプレフィックス対応 (task-021)
-- [ ] CLI出力パーサー + JSONリトライ機構 (task-023)
-- [ ] CLI timeout / retry / cancel設計 (task-024)
+- [x] CLI出力パーサー + JSONリトライ機構 (task-023) — 実装済み（`apps/worker/src/aiCli/adapter.ts` の `retryCount`/`maxRetries`/JSON再プロンプト。test: `adapter.test.ts`）。2026-09-15 監査で確認し、`tasks/task_graph.md` の `[x]` と揃えた
+- [x] CLI timeout / retry / cancel設計 (task-024) — 実装済み（`adapter.ts` の `request.timeoutMs ?? defaultTimeoutMs` → cgroup SIGKILL。test: `adapter.providerTimeout.test.ts`）。2026-09-15 監査で確認
 
 ### task-022: AI CLI → jobRunner 接続 ✅
 - [x] Job型に aiCliProvider / aiCliPrompt / aiCliMode 追加 (388358d)
@@ -1597,6 +1597,24 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       接続時は秘密情報検査とサイズ上限を必須とする（`gatherRelevantFiles()`は絶対パスの
       `allowedPaths`を検証せず読むため、`validateAllowedPaths()`相当の事前検証が要る）。
       1-F「contextFiles 拡張（Context Manager 連携）」はこの項目で追跡する
+
+      **2026-09-15 repository 腐敗監査によるスコープ追記（新規 item は作らない）**:
+      本項目が未接続である結果として、**Design Philosophy が実行中の Developer AI へ届く経路が
+      現在 1 本も存在しない**ことが判明した。3 つが重なっている:
+      (1) 本項目のとおり Context Pack 自体が implement 経路へ未接続、
+      (2) 仮に通しても `buildInstruction()`（`apps/api/src/ctoAi/contextManager.ts`）は
+      `projectMemory.goal` しか描画せず `designPhilosophy` を**一度もレンダリングしない**
+      （`ContextPack` response object には載る）、
+      (3) `projectMemoryWriter.ts` は番号付きリスト `N. **...**` を書くのに
+      `contextManager.ts` は `- ` / `* ` の bullet しか受け付けないため、
+      `summary.designPhilosophy` は**生成ファイルでも本 repository 自身の
+      `design_philosophy.md`（`## N. ...` 形式）でも常に `[]`** になる。
+      `CLAUDE.md` は「Developer AIはProject Memoryを直接読まない / Context Pack経由でのみ
+      情報を参照する」と規定しているので、現状はその保証が未提供という状態である。
+      **接続時の受入条件へ (2)(3) を含めること**（いずれも既存関数の修正で足り、新規機構は不要）。
+      関連: `docs/project_memory/design_philosophy.md` は CLAUDE.md §3 の 8 原則のうち
+      **#8「効果検証可能性」を欠いている**。この差分は alignmentChecker が読む正本側にあるため、
+      下記「Repository 腐敗監査 由来の Finding」節の docs sweep で扱う。
 <!-- roadmap:id=project-auto-multi-worker state=deferred -->
 3. [ ] **複数Worker対応** — atomic Job claim／Worker ownership・lease／stale recoveryのWorker識別／
       単一Worker制約を解除する条件の確定。現在は`recoverStaleJobs()`が起動時に全Projectの
@@ -2313,8 +2331,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
 **MVP必須（このセクションの5項目）:**
 
-<!-- roadmap:id=codex-last-message-temp-file-in-target-repo state=planned -->
-0. [ ] **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる**（2026-09-07登録。
+<!-- roadmap:id=codex-last-message-temp-file-in-target-repo state=done -->
+0. [x] **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる** — **完了（2026-09-15 監査で確認。実装は 2026-09-07/08 に着地済みで state だけが planned に残っていた。`apps/worker/src/aiCli/adapter.ts` の `createCodexOutputCapture()` が OS temp へ `mkdtempSync` し、pre/post の TOCTOU 検査つき。同ファイルのコメントが本 roadmap id を過去の動機として引用している。test: `adapter.test.ts` が capture path が workingDir 外であることを assert）**（2026-09-07登録。
    PR B（Codex Roadmap Generator基盤）の独立レビューで発覚。**本PRが持ち込んだ挙動ではなく
    既存adapterの共通挙動**で、現在のCodex independent reviewも同じことをしている）。
 
@@ -4432,6 +4450,9 @@ DB `integrity_check` ok / Worker エラーログ 0。
 - background-task supervision
 - legacy `API_TOKEN` → ADMIN / WORKER split credential migration
 - cheap AI（説明・質問経路）の latency と timeout 契約（`cheap-ai-latency-and-timeout-contract`）
+  → **2026-09-15 監査で、この id が ledger に存在しないことが判明した**（実測 0 件）。
+  PL の `adopt_roadmap_item` は ledger 上の id 実在を検証するため、**構造的に採用できなかった**。
+  下記「Repository 腐敗監査 由来の Finding」節で正式な item として登録した。
 
 
 ### AIteamOS 自己開発への移行（Stable / Candidate。2026-09-13 CEO 方針・Multi-Project とは別マイルストーン）
@@ -4837,7 +4858,10 @@ PL 基盤なしに Project #2 を開始しても運用が成立しない。**安
 結果確認 / Escalation → VPS 上での実運用 E2E を完成させる。**
 段階分離は VPS PL 本体と責務を分けるが、状態取得・Control Interface・Gate は同じものを再利用する。
 
-### PL が決定した優先順位
+### PL が決定した優先順位（**SUPERSEDED — 上の「優先順位の再評価（2026-09-14 夜）」が正本。以下は履歴**）
+
+> **2026-09-15 監査で付記**: 本表は置換済みだが置換後の表より下に置かれているため、
+> 上から読むと最後に目に入る。supersede を明示する。
 
 | 順 | 項目 | 理由 |
 |---|---|---|
@@ -6161,6 +6185,606 @@ Docker Up / systemd active / URL 200 だけでは、アプリ内部の主要処�
 - [ ] target-project側への実際の実装（別タスク・別プロジェクト）
 - [ ] VPS Doctor Lite側の実装（別タスク・別プロジェクト）
 
+## Repository 腐敗監査 由来の Finding（2026-09-15）
+
+**出典**: 2026-09-15 の repository 全体 read-only 監査（92 Finding）。
+統合判断の記録は `docs/project_memory/decisions/repository_rot_audit_2026_09_15.md`。
+
+**採用方針（PL）**: 92 Finding を機械的に item 化しない。
+**既存 item の scope / acceptance criteria の改善で解決できるものは新規 item を作らない。**
+Safety Boundary 系 6 件は `control-repository-header-vs-enforced-guard` へ、
+Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
+
+**master 側で既に解決済みだったもの（監査側を取り下げた）**:
+- 延期表記（「MVP後へ延期」）の扱いは **#211 が「現在の可否は `state=` が正本」という方針で解決済み**。
+  監査が用意していた棚卸し（7 箇所の一覧）と CEO 判断の提起は**不要になったため追加しない**。
+  `adopted-item-blocked-by-stale-deferral-text` は本統合中に **#217 で `state=done`** になった。
+  監査側からは一切触れていない
+- `task-allowed-paths-not-normalized` は **#212 が `state=done` で close 済み**。
+  監査の関連 Finding（空配列）は**別の失敗方向**なので下記に独立 item として登録する。
+  なお **#216 が `guard-block-message-omits-allowed-paths` を `state=done`** にした際、
+  block メッセージへ `(empty - so this is NOT an allowedPaths mismatch)` を追加している。
+  これは空配列が guard へ到達して「不一致ではない」と扱われることを**明示した**ものであり、
+  下記 `allowed-paths-empty-disables-file-change-guard` の裏付けになる（解消ではない）
+- 憲法の共通行動原則の範囲表記（3.14〜3.15 / 3.16 / 3.17 の不一致）は
+  **PR #85 / #87 が扱っているため本節では扱わない**
+
+**全 item 共通の制約**: **新しい Gate / Review / Workflow / telemetry 基盤を追加しない。**
+いずれも既存実装・既存ルール・既存 validation・既存生成処理の修正で成立する。
+
+---
+
+### 優先度 1: 実動作上の安全性・Approval / Gate 境界
+
+<!-- roadmap:id=safe-work-only-not-applied-to-ai-cli state=planned priority=high -->
+0. [ ] **`continue_safe_work_only` が AI CLI のコード変更を止めていない** — 2026-09-15 監査（Confirmed / P1。2026-09-15 の master で再確認済み）。
+
+   **事実**: `apps/worker/src/guards/gatePolicy.ts` の `SAFE_WORK_ALLOWED_COMMAND_KINDS`
+   （`git_status` / `git_diff` / `git_log` / `typecheck` / `test` / `lint`）は
+   「読み取り・テスト・品質チェックのみ。**コード変更・commit は禁止**」と定義されている。
+   `apps/worker/src/jobRunner.ts` はこれを `job.safeCommand.kind` にだけ適用し、
+   その後の AI CLI 実行ブロックは `gateResult.policy` を**一切参照しない**（実測: 当該ブロック内に
+   `gateResult` / `policy` の参照が 0 件）。
+   implement Job は `safeCommand: { kind: 'test' }` + `aiCliMode: 'implement'` で作られる
+   （`apps/api/src/ctoAi/initialImplementWorkflow.ts`）ため、`'test'` が許可リストにあることで
+   safe-work チェックを通過し、直後に任意のコードを書く AI CLI が走る。
+
+   **到達性（通しで確認）**: gate は Job 開始時点の worktree 差分で評価される。
+   blocked commit 後に resume した implement Job はその差分を持ち、
+   `auth` / `guards` / `migration` 等に触れていれば HIGH → `/gate/check` が
+   `BLOCKED` + `continue_safe_work_only` → `kind === 'test'` で通過 → AI CLI が更にコードを書く。
+   通常の `resume:<jobId>:1` フローであり例外経路ではない。
+
+   **同じ決定点のもう1つの欠落（同時に直す）**: `gatePolicy.resolvePolicy` に
+   **`decision === 'REJECTED'` の分岐が無く**、`policyMap[apiPolicy]` = `continue_safe_work_only` へ落ちる。
+   上記と重なると **CEO が明示的に却下した変更でも implement Job の AI CLI が走る**。
+   `apps/worker/src/guards/gateClient.ts` は「実挙動では policyMap 経由の一般経路を通っていた
+   （挙動は不変）」と記録しており、**挙動ではなく型の方を挙動へ合わせた**形になっている。
+
+   **P0 ではない理由**: `git_commit` は許可リストに無いため commit 自体は依然ゲートされる。
+   壊れているのは「承認待ち・却下中は作業を止める」という Approval Gate の意味である。
+
+   **着手時に確認すること（実装方針を先に決めない）**:
+   - safe-work 判定を Job の**実効行為**に対して行えるか（`aiCliMode` が非 read-only のとき拒否する等）
+   - `REJECTED` を `block_until_approved` へ倒す。併せて `gateClient.ts` の判断を再評価する
+   - **新しい Gate を作らない。** 既存 `SAFE_WORK_ALLOWED_COMMAND_KINDS` と `resolvePolicy` の範囲で表現する
+   - 効果検証可能性: safe_work_only 下で AI CLI を止めた件数が既存 `gate_evaluations` /
+     `observationLog` から数えられること
+
+<!-- roadmap:id=review-gate-layers-implemented-but-unwired state=planned priority=high -->
+0. [ ] **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった** — 2026-09-15 監査（Confirmed / P1）。個別の未配線ではなく **1 つの問題**として扱う。
+
+   **(1) Alignment Checker / Safety Auditor / `processGate` が Job 経路で一度も走らない**:
+   `apps/worker/src/jobRunner.ts` の `buildLocalGateResult()` は `runRiskReview(changedFiles)` を
+   呼ぶだけで **`alignmentRiskLevel: 'LOW'` を固定値で返す**。
+   `runSafetyAudit` / `runAlignmentCheck` / `processGate` の production caller は
+   `apps/worker/scripts/audit.ts`（= 手動 `pnpm audit:gate`）**のみ**である（2026-09-15 master で実測）。
+   結果として `gatePolicy.ts` の「API が continue でもローカルが HIGH/CRITICAL なら escalate」は
+   **API 側が既に実行したのと同一の純関数を同一入力で呼んだ結果**と比較しており、原理的に発火しない。
+   `alignmentChecker.ts`（承認フロー迂回・Design Philosophy 違反の検出）と
+   `safetyAuditor.ts` の `DANGEROUS_KEYWORDS`（diff 本文の `autoApprove` / `bypassApproval` 検出）は
+   どちらも Job 判定に一度も寄与していない。
+
+   **(2) `/gate/check` の Secret Scan（Step D）が production caller から到達不能**:
+   `apps/api/src/routes/approvalGate.ts` の secret scan は `if (diffText !== undefined)` の中にある。
+   `callGateCheck` の唯一の production 呼び出し（`jobRunner.ts`）は `changedFiles` のみを渡す。
+   同ファイルは「Step D 実装済み: diffText 内容スキャン（シークレット検出）」と主張している。
+
+   **(3) `safetyVerifier.overallPassed` が構造的に常に false で、その結果 commit gate が緩和された**:
+   `jobRunner.ts` のコメント自身が「TYPECHECK/RELATED_TESTS/FULL_TESTS の3チェックが未接続のため
+   fail-closed であり、any severity で実行しても overallPassed は常に false（構造的問題）」と述べる。
+   その結果 `apps/worker/src/approvalLevel/commitGate.ts` が**全 tier の必須成果物から
+   `SAFETY_VERIFICATION_RESULT` を外した**。恒久的に赤いチェックを迂回するために gate を弱めた形であり、
+   `overallPassed` は情報量ゼロの信号になっている。
+
+   **(4) Shadow Commit Gate が観測記録を残さない**: `jobRunner.ts` は
+   「判定結果はconsole.logのみ。停止・通知・永続化は行わない（Job結果にも載せない）」。
+   直後の `appendObservationLog` に commit-gate フィールドが無い。
+   **「観測してから Gate にする」ことが唯一の目的の機構が、shadow と real の一致率を
+   後から問い合わせられる記録を残していない**（Design Philosophy 8 に抵触）。
+
+   **(5) 併せて棚卸しする未配線モジュール（いずれも理由がコードに明記済み。事故ではない）**:
+   `apps/worker/src/approvalLevel/preReviewer.ts` の `runPreReview`（caller 無し。
+   `PRE_REVIEW_RESULT` は全 reviewPolicy の必須から外されている）、
+   `apps/worker/src/approvalLevel/finalReviewPacket.ts`（非テスト importer 0）、
+   `reviewerAdapter.ts` の `shouldEscalateToChatGpt`（本体が `return false` のみ）。
+
+   **なぜ1つの item にするか**: 個別に直すと「どの層が本当に効いているのか」の答えがまた分散する。
+   **現在 Job 判定に実際に寄与している層の一覧を1つ確定させる**ことが目的である。
+
+   **着手時に確認すること（実装方針を先に決めない）**:
+   - (1)〜(3) は **配線する / 記述と必須指定を実態へ合わせる** のどちらかを層ごとに決める。
+     **両方の正本を残さない**（`control-repository-header-vs-enforced-guard` と同じ原則）
+   - (2) は server 側が既に `targetDiffHash` と照合するため、`diffText` を渡すだけで成立するかを先に見る
+   - (3) を配線する場合、`commitGate.ts` の必須成果物を戻せるかまで含めて判断する
+   - (4) は既存 `observationLog` へフィールドを足すだけにする。**新しい telemetry 基盤を作らない**
+   - (5) は「残す（理由を再確認）」「消す」のどちらかを明示的に決め、宙吊りにしない
+
+<!-- roadmap:id=allowed-paths-empty-disables-file-change-guard state=planned priority=high -->
+0. [ ] **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる** — 2026-09-15 監査（Confirmed / P1。**#212 が close した `task-allowed-paths-not-normalized` とは失敗方向が逆の別 Finding**）。
+
+   **事実**: `apps/worker/src/guards/fileChangeGuard.ts` は
+   `// 4. タスクのallowedPathsチェック（指定がある場合のみ）` `if (policy.allowedPaths.length > 0) { ... }`。
+   空配列だと範囲制限がスキップされ、`ALWAYS_FORBIDDEN_PATTERNS` と `forbiddenPaths` だけが残る。
+
+   **空配列を生む経路がある（2026-09-15 master で再確認）**:
+   `apps/api/src/ctoAi/roadmapGenerator.ts` の schema は `allowedPaths: z.array(z.string()).default([])`、
+   `projectInitialization.ts` がそのまま渡し、`apps/api/src/storage/roadmapTaskValidation.ts` は
+   `for (const path of task.allowedPaths)` で**各要素**を検証するが、**配列長は検証しない**。
+   PR #144 で入った `nonRelativePathReason()` は `'must not be empty'` を持つが、これは
+   **空文字列の要素**に対するもので、**空配列ではループ自体が回らない**。
+   一方 `apps/api/src/ctoAi/roadmapAdoption.ts` は空配列を fail-closed で拒否し
+   （`'allowedPaths must be explicitly provided and non-empty'`）、
+   `apps/api/src/pl/actionGate.ts` の `assertAdoptionScopeIsBounded()` も同様。
+   **同一責務に対する2経路で扱いが逆。**
+
+   **原則との関係**: `actionGate.ts` が既に明記している —
+   「`allowedPaths` は File Change Guard の効き方そのものを決める。PL が `.` や `apps` のような
+   広いパスを宣言できると、Guard は形だけ残って実質無効になる」。**空配列は `.` より広い。**
+
+   **`task-allowed-paths-not-normalized`（#212 で done）との関係**: あちらは絶対パス →
+   **常に不一致で over-block**（fail-closed・安全側）。本項目は空配列 → **範囲チェック消失**（fail-open）。
+   **修正は同じ関数（`validateRoadmapTasks()`）に着地する**ので、着手時はそちらの実装を必ず参照すること。
+
+   **着手時に確認すること（実装方針を先に決めない）**:
+   - `validateRoadmapTasks()` に `roadmapAdoption.ts` と同じ長さ検証を足す形でよいか
+   - `fileChangeGuard` 側の空ポリシーを「何も許可しない」へ倒すべきか
+     （倒すと既存の空 `allowedPaths` Task がすべて block される。移行影響を先に測る）
+   - **新しい Gate を作らない。** 既存の検証関数と guard の範囲で表現する
+   - 効果検証可能性: 空 `allowedPaths` で作られた Task が過去に何件あったかを DB から数えられること
+
+---
+
+### 優先度 2: Escalation / recovery / resume
+
+<!-- roadmap:id=pl-escalation-recorded-without-delivery state=planned priority=high -->
+0. [ ] **PL Escalation が未配達でも `escalated` と記録し、以後その対象の処理を永久に止める** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
+
+   **事実**: `apps/api/src/pl/executionLoop.ts` の `escalateTo()` は
+   `await escalate({...})` の直後に**無条件で** `record(storage, key, 'escalated', reason)` する。
+   `defaultEscalate` は `sendAlert` の**戻り値を捨てている**。
+   `apps/worker/src/notifier/notifier.ts` は通知チャネル未設定時に `console.warn` の後**正常 resolve** し、
+   全チャネル失敗時（`🚨 UNDELIVERED`）も正常 resolve する。
+   そして `executionLoop.ts` は `hasEscalated()` で escalated 済み対象を
+   `actionable` から**恒久的に除外**する。
+
+   **情報は既に手元にある**: `sendAlert` は `SendResult[]` を返しており、成功チャネルの有無は判定できる。
+   捨てているだけである。
+
+   **`hasEscalated` の抑制自体は正しい**（CEO 判断待ちの間 tick ごとに Diagnose で
+   provider CLI を回すのを避けるため、理由がコードに明記されている）。
+   **直すべきは抑制ではなく「届いていないのに escalated と記録する」点**である。
+
+   **`vps-operation-docs-current-truth` と重なると深刻**: 文書化された API 起動 env allowlist は
+   `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` / `SLACK_WEBHOOK_URL` を含まない。
+   **手順どおりに再起動すると、この経路は必ず「未配達だが escalated と記録」になる。**
+
+   **隣接 item との責務分離**: `pl-escalation-blames-the-wrong-cause` は Escalation **本文の原因誤認**、
+   `mobile-push-ceo-escalation` は**将来の第一チャネル**の話であり、いずれも別責務。
+   本項目は**配達結果と記録の整合**だけを扱う。
+
+   **着手時に確認すること（実装方針を先に決めない）**:
+   - `escalateTo` が `SendResult[]` を見て、**1チャネル以上成功した時のみ** `escalated` を記録できるか
+   - 失敗時の result 名をどうするか（**再試行を抑止しない**別値にする）
+   - 配達結果を後から数えられるようにするか。`IStorage` に notifications store は無い。
+     **新しいテーブルを作る前に、既存 `audit_log` の detail へ載せて足りるかを先に見る**
+   - **新しい通知基盤を作らない。**
+
+<!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=planned -->
+0. [ ] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。
+
+   **事実（2026-09-15 master で再確認）**: HTTP route 側（`apps/api/src/routes/tasks.ts`）は
+   `resumeBlockedTask` を呼び、`DESIGN_REVIEW_PRECONDITION_FAILED` のときは
+   **新しい指示 prompt に対して `createAndExecuteDesignReview` を走らせてから再試行する**
+   （「再開指示は元Jobとは異なる実装promptになるため、元promptへのevidenceを流用しない」）。
+   PL ループ側（`apps/api/src/pl/executionLoop.ts`）は `storage.jobs.resumeBlockedTask(...)` を
+   `DEFAULT_RESUME_INSTRUCTION` で直接呼ぶだけで、この復旧を持たない。
+
+   **なぜ必ず失敗するか**: `apps/api/src/storage/sqlite.ts` は AI CLI 分岐を
+   `checkImplementJobDesignReviewEvidence({ aiCliPrompt: instructionPrompt })` でゲートし、
+   `computeDesignTextHash(instructionPrompt)` を `evidence.designTextHash` と比較する。
+   保存されている evidence は**元の implement prompt** に対するものなので
+   `DEFAULT_RESUME_INSTRUCTION` とは一致し得ない。結果として毎回
+   `resume refused: Latest Design Review evidence was created for different design text` を返し、
+   attempt を消費し、`PL_MAX_ATTEMPTS_PER_TARGET` 到達後に CEO へ escalate する。
+
+   **#214 との関係（別バグ）**: #214 は `collectSystemEvidence()` が
+   **最古の** ALIGNED evidence を Gate へ出していた問題を直した（`findLatestByTaskId()` を使う）。
+   本項目は「どの evidence を選ぶか」ではなく「**resume 用 prompt の hash がそもそも一致しない**」
+   という別の層の問題であり、#214 の修正では解消しない。
+
+   **着手時に確認すること（実装方針を先に決めない）**:
+   - route 側の「design review をやり直してから resume」を関数へ切り出し、**両方から呼ぶ**形にできるか
+     （`重複排除` / `既存機能への合理的統合`）
+   - PL が resume 時に使う instruction をどう決めるか。`DEFAULT_RESUME_INSTRUCTION` 固定のままでよいか
+   - **新しい recovery 経路を作らない。** 既存の 2 経路を 1 本へ寄せる
+   - 効果検証可能性: この理由で消費された attempt / escalation の件数が後から数えられること
+
+<!-- roadmap:id=cheap-ai-latency-and-timeout-contract state=planned -->
+0. [ ] **cheap AI（説明・質問経路）の latency と timeout 契約** — 2026-09-15 監査により**正式登録**（それ以前は本文中で open と宣言されながら `roadmap:id` を持たず、PL が構造的に採用できなかった）。
+
+   **登録経緯**: 本ファイルの「### P1 とは分離して open のまま維持する項目」で
+   `cheap-ai-latency-and-timeout-contract` として open と宣言されていたが、
+   ledger に `roadmap:id` メタデータが存在しなかった（実測 0 件）。
+   PL の `adopt_roadmap_item` は ledger 上の id 実在を検証するため、
+   **宣言だけあって構造的に採用できない状態**だった。
+
+   **内容**: `apps/api/src/aiExplain/cheapAiClient.ts` は `timeoutMs: 60_000` を持つが、
+   記録されている実 latency は 66〜74 秒である。kill は `spawn({ timeout })` に依存している。
+   影響範囲は `/approval-requests/:id/explanation`・`/:id/ask`・
+   `/:id/failure-explanation`・`/:id/failure-ask`、および PL の diagnosis / adoption。
+
+   **着手時に確認すること**: 実測 latency の分布 / timeout 値の根拠 / timeout 時に
+   PL の attempt を消費してよいか（`provider-outage-burns-attempt-budget` と隣接）。
+   **新しい timeout 機構を作らない。**
+
+---
+
+### 優先度 3: AI へ注入される Current Truth の誤情報
+
+<!-- roadmap:id=vps-operation-docs-current-truth state=planned priority=high -->
+0. [ ] **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる** — 2026-09-15 監査（Confirmed / P1）。「VPS常駐運用化」節をまとめて現在の実態へ更新する。
+
+   **(1) 起動 env allowlist が API の実際の読み取りを欠いている（最も実害が大きい）**:
+   本ファイル「VPS常駐運用化」節の「**正式Production起動方式の確定**」は `set -a; . .env` を禁止したうえで
+   「APIのallowlistは `PATH`/`HOME`/`NODE_ENV`/`HOST`/`PORT`/`DB_PATH`/`API_TOKEN`/
+   `ADMIN_TOKEN_SHA256`/`WORKER_TOKEN_SHA256`/`OPENCODE_GO_API_KEY` のみ」と確定している。
+   しかし API が実際に読む次が入っていない:
+   - `ACTIONS_READONLY_TOKEN_SHA256`（`apps/api/src/auth/apiToken.ts`）。無いと第3 credential class が
+     存在せず、`gate-evidence-check.yml` の `verify-commit` が認証できない
+   - `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` / `SLACK_WEBHOOK_URL`。
+     **API プロセス自身が CEO Escalation を送る**（`apps/api/src/pl/executionLoop.ts` と
+     `apps/api/src/index.ts` が `@ai-team/worker/src/notifier/notifier.js` を動的 import して
+     `sendAlert` を呼ぶ）。`.env.example` は「どちらも未設定だとコンソール（journal）にしか出ない」と明記
+   本ファイル自身が後に、CEO が LINE credential を `/srv/ai-team/env/api.env` へ入れたことと
+   `PL_LOOP_*` を systemd drop-in で有効化したことを記録しているが、
+   **canonical な allowlist 記述だけが更新されていない**。
+   `pl-escalation-recorded-without-delivery` と重なると
+   「届いていない escalation を `escalated` と記録して以後止める」状態になる。
+
+   **(2) 完了済み項目が未着手として並んでいる**: 同節の未チェック項目のうち、HTTPS化・
+   ヘルスチェック（`apps/api/src/routes/health.ts` が `docs/vps_app_runtime_standard.md` v1 準拠で
+   実装・登録済み）・再起動耐性（systemd user units `ai-team-api.service` / `ai-team-worker.service`）は
+   **既に達成済み**である。本当に open なのは **Docker化** と **ログ保存 / rotation 方針**。
+   同じ drift が `specs/11_runtime_environment.md` にもある（同時に直す）。
+
+   **(3) `sandbox/hooks/pre-push` は成功しえないのに `setup-hooks.sh` が VPS への設置を指示している**:
+   `pre-push` は `pnpm --filter @ai-team/worker tsx src/metaReviewer/autoReview.ts` を実行するが、
+   `apps/worker/package.json` に `tsx` script は無い（動作する形は CI と同じ `exec tsx`）。
+   さらに `set -e` により `EXIT_CODE=$?` 以降の分岐（BLOCKED / 実行失敗）は**到達不能**。
+   指示どおり設置すると**そのマシンからの全 push が pnpm エラーでブロックされる**。
+
+   **(4) 復元手順が存在しないのに `done` item の完了条件に含まれている**:
+   `project-auto-db-safety`（`state=done`）の完了条件は「定期バックアップ／世代管理／**復元手順**／
+   **実際の復元テスト**」。`apps/api/scripts/dbRestoreTest.ts` は存在するが、
+   `apps/api/ops/systemd/README.md` は backup timer の設置しか書かず、repository 内の全 `.md` を
+   検索しても復元手順への参照は 0 件、`package.json` の wrapper も起動する systemd unit も無い。
+
+   **(5) CI と production で Meta Review のモデルが違う**: `.github/workflows/meta-review.yml` は
+   `GEMINI_MODEL` に `gemini-2.5-flash` を必ず渡す。コード既定は
+   `apps/worker/src/metaReviewer/autoReview.ts` の `gemini-3.5-flash` で、
+   同ファイルのコメントは 3.5-flash を「このプロジェクトが実運用として使ってきた既定値」と説明する。
+   **merge gate が実運用と違うモデルで判定している。**
+
+   **(6) `.env.example` がコードの読む変数を欠く（`AGENTS.md` Q7 違反）**:
+   未記載で production コードが読むもの: `ANTHROPIC_API_KEY`（**最も実害が大きい** —
+   `apps/api/src/ctoAi/specAnalyzer.ts` は `CLAUDE_API_KEY` へフォールバックせず throw する。
+   Worker は `adapter.ts` で橋渡しするが **API プロセスには橋が無い**）、
+   `ACTIONS_READONLY_TOKEN_SHA256`、`DB_PATH`、`DB_BACKUP_DIR`、`TARGET_ROOT`、
+   `WATCHDOG_INTERVAL_MS`、`AGY_CLI_PATH`、`CODEX_CLI_PATH`、`SUPERVISED_RUN_ROOT`、
+   `DESIGN_REVIEW_{REPO_ROOT,RUNNER_COMMAND,CONTROL_CONTEXT_DIR}`、`DELEGATION_*`。
+   逆に `CONTROL_REPO_PATH` / `TARGET_REPO_PATH` / `GIT_USER_NAME` / `GIT_USER_EMAIL` は
+   **どのコードも読まない**（`sandbox/docker-compose.yml` 専用）。
+   併せて `BACKUP_KEEP_COUNT = 28`（= 7日分）がどこにも文書化されていない。
+
+   **CEO へ渡す判断**: production を生かしている systemd unit
+   `ai-team-api.service` / `ai-team-worker.service`（`PL_LOOP_*` drop-in と `flock` 単一インスタンス強制を含む）は
+   **repository に存在せず VPS 上にしかない**。version 管理下に置くかは production 設定の扱いに関わるため
+   CEO 判断とする（`worker-cgroup-delegation-contract` の前提でもある）。
+
+   **着手時の制約**: **(1)〜(6) はすべて記述・設定側の修正で足りる。新しい仕組みを作らない。**
+   production への操作（再起動・env 変更）は本項目の範囲外で、別途 CEO 承認のうえ既存 deploy 手順で行う。
+
+<!-- roadmap:id=current-truth-dual-record-prevention state=planned priority=high -->
+0. [ ] **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める** — 2026-09-15 監査（Confirmed / P1）。監査 92 Finding の**共通根本原因**。
+
+   **#211 が既に一部を解決している（重複しないこと）**: #211 は
+   「現在の可否は `state=` が正本」という方針を本ファイル冒頭へ加え、
+   ledger 本文の延期表記を「書かれた時点の記録」と位置づけた。
+   **本項目はその方針を前提とし、ledger 以外の surface と機械側の 2 点だけを扱う。**
+
+   **観測された事実**: repository には既に正しいルールがある —
+   `docs/project_memory/rules/development_rules.md` の
+   「**Current Truth優先 — 該当箇所そのものを現在の結論へ更新する**」。
+   しかし実際には**追記的**に適用されてきた:
+   - `specs/11_runtime_environment.md` は §18 に「Current Truth（2026-08-14修正）」を足したが、
+     §3b / §4 / §6 / §7 の旧記述（Docker Sandbox が現行機構・`/workspace/project`）を残した
+   - `AGENTS.md` は §1-1 を足したが、§1 の「Docker が物理的に強制する」を残した
+   - `project-auto-completion-detection` は `state=done` の item の**後ろ**に訂正を足した
+     （結果、訂正が生成ブロックの未完了一覧に現れない）
+   - `docs/project_memory/decisions/006_ai_cli_adapter.md`（Status: active）は
+     「Meta Reviewer AI は CLI ではなく API を使う」と規定したまま、実装が `preferCli: true` へ
+     変わったことを記録していない
+
+   **本項目でやらないこと（明記）**: **新しい Review / Gate / Workflow / doc-lint 基盤を追加しない。**
+   「文書更新を強制する新しいゲート」を作ると、それ自体が次の二重正本になる。
+
+   **(A) 既存ルールの改善 — `development_rules.md` の Current Truth 章**:
+   現行は「該当箇所そのものを更新する」で止まっており、
+   **置換できない場合（履歴として残す必要がある場合）の扱いが書かれていない**ため、
+   実務では追記が選ばれてきた。追記を選ぶときは
+   **旧記述側に supersede マーカーと日付を付ける**、という 1 点を足せば、
+   二重正本は機械的にも人的にも識別可能になる。
+   `docs/adr/0001` / `0002` は既にこの形（冒頭に正本ポインタ）を実践しており、**手本が repository 内にある**。
+   #211 が roadmap の `state=` について行った整理を、他の surface へ一般化する作業でもある。
+
+   **(B) 既存 validation を CI で走らせる**:
+   `pnpm roadmap:check` は既に存在し root `package.json` の `verify` にも含まれているが、
+   **`.github/workflows/ci.yml` は `pnpm -r typecheck` と `pnpm -r test` しか実行しない**。
+   そのため roadmap のメタデータ不整合と `PROJECT_CURRENT_STATE.md` の同期ずれは PR で検出されない。
+   **既存 workflow に 1 step 足すだけ**で再発は防げる。
+   新しい workflow も新しい required check も追加しない（required 化の要否は CEO 判断）。
+
+   **(C) 既存生成処理の破損修正 — `extractTitle()`**:
+   `apps/worker/scripts/roadmap/roadmapParser.ts` の `extractTitle()` は
+   `checkboxText.indexOf('—')` で最初の em-dash までを title とし、
+   `CHECKBOX_LINE_REGEX` は**1 行しか読まない**。結果、
+   `docs/PROJECT_CURRENT_STATE.md` の自動生成ブロックに **`**` 不整合が 18 件**残っている
+   （2026-09-15 master で実測）。加えて 1 行目が折り返している item は文中で切れる。
+   最悪例は生成結果が `- **`⚠️ CONTROL REPOSITORY（state: planned）` となり、
+   原文「…注記と実際に強制される保護範囲が一致していない」に対し**意味が反転している**。
+   `roadmap:check` は byte 一致を見るだけなのでこの破損を検知しない。
+   なお `**Title** — 説明`（em-dash が bold の外）の形は現在の実装でも正しく処理される。
+
+   **着手時に確認すること（実装方針を先に決めない）**:
+   - (A) は `development_rules.md` への**1 段落追加**で足りるか。Importance Level と Status は既存のまま
+   - (B) は `ci.yml` への**1 step 追加**で足りるか。required 化するかは分けて判断する
+   - (C) は `extractTitle()` を emphasis-aware にするか、title を `**...**` の範囲で取るか、
+     折り返し行を連結するか。**既存の roadmap 本文を一括書き換えして回避しない**
+   - 効果検証可能性: (B) 導入後に CI が drift を検出した件数が数えられること
+
+---
+
+### 優先度 4: implementation ↔ docs 不一致
+
+<!-- roadmap:id=governance-and-spec-docs-current-truth-sweep state=planned -->
+0. [ ] **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）** — 2026-09-15 監査（Confirmed / P2）。個別 item 化せず 1 回の sweep として扱う。`current-truth-dual-record-prevention` (A) を最初に適用する対象でもある。
+
+   **本 sweep が扱わないもの（重複回避）**: 憲法の共通行動原則の範囲表記
+   （3.14〜3.15 / 3.16 / 3.17 の不一致）は **PR #85 / #87 が扱っている**ため対象外。
+   ledger 本文の延期表記は **#211 が方針で解決済み**のため対象外。
+
+   **最優先（AI へ注入されるため）**:
+   - `docs/multi_ai_step_review_flow.md` **全体が「Claude Sonnet が実装者」という旧 Role 体制のまま**。
+     `AGENTS.md` §3-2（`CLAUDE.md` が正本と宣言）では PL Role は Claude Opus で
+     **原則として自分で作業する Agent ではなく**、実装は OpenCode Go / Codex Sol。
+     この 2 つは当該文書に **0 回**登場し、supersede 注記も無い。
+     `role-model-registry` が完成するまでの間の正本ポインタとして最低限 §3-2 を指すこと
+   - `docs/project_memory/design_philosophy.md` に **Design Philosophy #8「効果検証可能性」が無い**
+     （`CLAUDE.md` §3 は 8 原則、こちらは 7 原則）。**機械が読むのはこちら**
+     （`apps/worker/src/guards/alignmentChecker.ts` の `DESIGN_DOCS_PATHS`。`CLAUDE.md` は含まれない）。
+     結果 #8 は Gemini Alignment Review へ一度も提示されていない
+   - `AGENTS.md` §4「自律修正ループ（暫定 — task-009実装まで）」は**自らの削除条件を満たしている**
+     （task-009 は両 ledger で `[x]`、`jobRunner.ts` は稼働コード）。さらに §4 の
+     「マージは **CEO（人間）が行う**。AIはマージしない。」が §3-1 の
+     「…すべて満たす通常変更は、AI側でmergeまで進めてよい」と**同一ファイル内で無条件に矛盾**している
+   - `AGENTS.md` と `docs/multi_ai_step_review_flow.md` が **Review Level 1 で正反対**
+     （前者は「Codex+Gemini postReview」、後者は「原則Gemini不要」）
+   - `CLAUDE.md` §7 の Project Memory 構造に **`features/` と `lessons_learned/` が存在しない**
+     （`specs/05` の Layer 4 / Layer 6、`specs/10` では Feature Knowledge が MVP Required）。
+     未記載の `docs/project_memory/specs/` がある
+
+   **specs/**:
+   - `specs/10_mvp_scope.md` が**出荷済みの 5 機能**（Reviewer AI / QA AI / Drift Detection /
+     Notification System / Health Metrics）を「除外 / Phase 2 Candidates」と記載。
+     同章に残る `Memory Governance` と `Context Feedback Loop` は本当に未実装なので
+     **リストの半分だけが正しい**。`mvp_completion.md` が「判定根拠はこれのみ」と指定した文書である
+   - `specs/10` の「Storage: Markdown Files のみ / DB不要」→ Decision-003 で SQLite へ変更済み
+   - `specs/11` の「認証（現状はAPI Token方式のみ）」→ 3 モード実装済み
+   - `specs/11` の Current Truth ブロック自身が古い（`execFileSync` → 現在は per-job cgroup 封じ込め）。
+     「コンテナ隔離・Job単位 mount namespace は未実装」という狭い主張は依然 true で、
+     **機構の説明だけが古い**。`jobRunner.ts` の docstring も同じ
+   - `specs/11` が Workspace Boundary を **`/workspace/project`** と書く（実装は `/workspace/target`）
+   - `specs/11` の Command Allowlist が `CommandKind`（11種）と一致せず、
+     `npm install` / `python -m pytest` を許可と読める
+   - `specs/03` が未実装の復旧設計（隔離環境を破棄して 1 回だけ自動再実行）を現行挙動として記載。
+     実際は `jobStateManager.ts` が**workspace を保持して quarantine する**
+   - `specs/04` の Meta Reviewer provider 記述が 4 段フォールバック
+     （Gemini API → Gemini CLI → Antigravity/Claude → Copilot）を反映していない。
+     Claude 段が発動すると **spec が挙げる相関バイアス排除の根拠が崩れる**
+   - `specs/09` の「作成直後の状態: `Running`」→ 実装は `default('draft')`。
+     `specs/08` に実装されたことのない `Maintenance` があり `draft` が無い
+   - 本ファイルが `specs/14_technology_sourcing_oss_reuse_team.md` を「正本とする」と参照するが**存在しない**
+   - `specs/03/05/06/07` に実装ステータス注記が無く、未実装の設計目標が現在形で書かれている。
+     `specs/11`/`13`/`20` は持っている形式。**設計目標そのものは古いという理由で変更しない**
+   - **「MVP開発中」という発動条件が消滅した制約**が `specs/00`（3 箇所）/ `specs/20`（2 箇所）/
+     `specs/13`（1 箇所）で現在形のまま AI の振る舞いをゲートしている。
+     #211 は ledger の `state=` について解決したが、**spec 側のこの表現は対象外**だった。
+     対象機能（Diagnosis / Research / Experiment / Evolution 等）は本当に未実装なので
+     **未実装ステータス自体は正しい**。問題は条件文だけ。
+     継続するかは Constitution §3.15 に基づく **CEO 判断**
+
+   **decision records / API 記述**:
+   - `006_ai_cli_adapter.md`（Status: active）が「Meta Reviewer は CLI ではなく API を使う」と
+     規定するが、実装は `preferCli: true` で CLI 優先、さらに Copilot CLI / Antigravity CLI 段を持つ
+   - 削除済み `POST /api/cto/generate-roadmap` が本ファイルの 6 箇所で現在形のまま
+     （`ctoAi.ts` に `// removed in PR C.`）。`roadmap_topology_cutover_step2_production_e2e.md` は
+     正しく削除を記録しており、**ledger 側だけが古い**
+   - 本ファイルが存在しない `POST /api/tasks/:id/failure-questions` を将来実装者への確認対象として
+     指示している（実在は `/failure-ask`）
+   - `docs/PROJECT_CURRENT_STATE.md` の「現在Productionで稼働しているcommit」が 2026-08-19 のまま
+     （以降の deploy を本ファイルが記録している）。ヘッダの `最終更新` も同様
+   - 件数・行番号 drift: test ファイル数（記載 52 / 実測 147）、共有型（19種 → 25 ファイル）、
+     `specs/`（01〜11 → 15 ファイル）、workflows（2 → 3）、
+     Mobile app（`{index,create,approvals}.tsx` → **実測 8 画面**。同ファイルの自動生成ブロックは
+     Task/Job 一覧・詳細画面を完了項目として列挙しており**自己矛盾**）、
+     「`apps/mobile` は test を持たない」→ 実在する、
+     「`scripts/` ディレクトリごと存在しない」→ 実在する（削除は `scripts/metaReview.ts` 単体）、
+     Codex `--approval-mode auto-edit` → 実際は `exec --sandbox`
+
+   **着手時の制約**: **実装は一切変更しない。** 記述のみ。
+   `current-truth-dual-record-prevention` (A) を適用し、**置換できないものには supersede マーカーを付ける**。
+   量が多いため、AI へ注入される 4 件（`multi_ai_step_review_flow.md` / `design_philosophy.md` /
+   `AGENTS.md` §4 / Review Level 1）を先に片付けること。
+
+<!-- roadmap:id=project-completion-badge-wording-correction state=planned -->
+0. [ ] **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない** — 2026-09-15 監査（Confirmed / P2。2026-09-15 master で 3 件とも未実施を再確認）。
+
+   **事実**: `project-auto-completion-detection`（`state=done`）の `[x]` item の**後ろ**に
+   2026-09-13 の訂正が追記され、3 つの最小修正を指示し
+   「放置すると AIteamOS 自身が Roadmap 途中で「完了」と表示される」と結んでいる。3 件とも未実施:
+   1. Mobile のバッジを「完了」→「ロードマップ消化済み」相当へ —
+      `apps/mobile/app/index.tsx` は今も `<Text style={styles.badgeText}>完了</Text>`
+   2. `ProjectRoadmapCompletion` に doc コメント — `packages/shared/src/types/project.ts` は
+      3 フィールドのみでコメント無し
+   3. Project Model 原則を `specs/` へ — `grep -rn "Project Model" specs/` → 0 件
+
+   **なぜ独立 item にするか**: 親 item が `state=done` のため、この訂正は
+   `docs/PROJECT_CURRENT_STATE.md` の自動生成「未完了・保留項目」に**現れない**。
+   訂正が可視化機構から構造的に漏れている。
+   これは `current-truth-dual-record-prevention` が扱う「追記型 Current Truth」の具体例でもある。
+
+   **着手時の制約**: 文言と doc コメントのみ。**判定ロジックは変更しない**（訂正自身がそう指示している）。
+
+---
+
+### 優先度 5-6: dead / orphan / obsolete と単純 cleanup
+
+<!-- roadmap:id=audit-2026-09-15-low-priority-cleanup state=planned -->
+0. [ ] **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）** — Confirmed / P3。
+
+   **重要**: 以下はすべて**現時点で実害が確認されていない**。
+   **「古いから」という理由だけで削除しない。** 各項目の理由を確認してから触ること。
+
+   **dead / orphan（削除前に理由を確認する）**:
+   - どこからも参照されない export 8 件: `currentStateSync.ts` の 2 件、`roadmapParser.ts` の 1 件、
+     `types/actor.ts` の `DEFAULT_AGENT_ROLES`、`types/command.ts` の `COMMAND_ZONES`、
+     `types/meta_review.ts` の `META_REVIEW_BLOCKED_TRIGGERS`、`types/project.ts` の 1 件、
+     `types/supervised_run.ts` の 1 件。
+     **`COMMAND_ZONES` は単純削除より先に確認が要る**: 全 `CommandKind` を `'green'` にマップしており
+     `git_commit` も含むが、現行ポリシーは逆（`routes/approvalGate.ts` の
+     `GIT_COMMIT_POLICY_LABEL = 'git_commit requires CEO approval (policy)'`）。
+     CLAUDE.md §4 の Green/Yellow/Red Zone へ配線されると commit を Green と誤分類する。
+     **dead かつ現行ポリシーと矛盾**
+   - `apps/worker/src/guards/approvalGate.ts`（re-export shim。production importer 0）と、
+     そこに複製された `computeDiffHash`（`routes/approvalGate.ts` と同一実装。
+     「computeDiffHash 互換性」テストがあり分裂を認識している）
+   - invoker の無い CLI: `apps/worker/scripts/deployCanary.ts`（本ファイルが「deploy canary 全 PASS」を
+     運用事実として記録しているので**手動実行されている**が、起動コマンドがどこにも記録されていない）、
+     `apps/api/scripts/dbRestoreTest.ts`（`vps-operation-docs-current-truth` (4) と同根）
+   - `apps/api/src/designReview/repairFlow.ts` の `runRepairFlow` — production caller 無し。
+     live な経路は同ファイルの `prepareRepairFlow` / `executeQueuedRepair` / `escalateTaskToHuman`。
+     **他の未配線コードと違い理由コメントが無い**ので、存廃を明示的に決める
+   - 意図的に非到達な provider 分岐（**理由がコードに明記済み。削除しないこと**）:
+     `copilot` provider（API ingress schema が除外。2026-08-26 独立レビューの記録あり）、
+     `ClaudeReviewerAdapter`、`case 'chatgpt'`。`reviewSeparation` 周りの「常に false な条件」も
+     **将来の定数変更を検知する tripwire** なので削除しない
+   - `.gitignore` の `data/quota-exhausted.json` は `geminiRouter.ts` が書かなくなったため無効。
+     コメントが参照する `data/README.md` も `data/` ごと存在しない
+
+   **fix 後に残ったコメント・記述**:
+   - `apps/worker/src/approvalLevel/safetyVerifier.ts` の「Step3時点ではPost-Reviewは未実装のため…」→
+     `postReviewer` は実装済みで `jobRunner.ts` が渡している
+   - `docs/project_memory/rules/001_codex_integration_risks.md` の「⏳ …は task-009 で実装」は
+     **両方向に誤り**（task-009 は完了、adapter 側 `shouldFallback()` も実装済み。
+     ただし `fallbackPolicy` は未配線で、それは `AGENTS.md` が正しく記述している）
+   - `docs/project_memory/decisions/native_runtime_verification_codex_phase2_real_e2e.md` が
+     「一時ファイルは `workingDir` 配下に作られ…File Guard管理外にはならない」と
+     **現在形の一般的な安全保証**として書いているが、
+     `codex-last-message-temp-file-in-target-repo` の修正により OS temp（`workingDir` の外）へ移った。
+     日付スコープを付ける
+   - `packages/shared/src/types/approval_gate.ts` と `approvalGateLogic.ts` の
+     「TODO: Phase 2 で Independent AI Review に差し替え」— 独立レビューは**別機構で稼働中**
+     （`reviewerAdapter.ts` / `strategicReview.ts` / `pl/actionGate.ts`）で、
+     `RiskReviewResult.independentReviewResult` は未使用。かつ live な verdict 語彙は別値
+     （`routes/designReviewEvidence.ts` の `['approved','changes_requested','blocking']`）。
+     **同名・別値・片方 dead** なのでどちらが正本かを決める
+
+   **その他**:
+   - `apps/api/src/storage/schema.ts` の `DELETE FROM watchdog_events` が
+     `INDEX_STATEMENTS` という名前のリストに入り毎起動実行される。範囲は限定的で初回以降 no-op だが、
+     `production state を破壊しない` 原則から一度きりの guarded migration へ移す
+   - `.github/workflows/gate-evidence-check.yml` — header は `pull_request_target` を使う理由を
+     長く説明するが実際の trigger は `workflow_dispatch` のみ。かつ
+     `github.event.pull_request.number` を読むため手動実行では `PR_NUMBER` が空になり
+     `gh api "repos/.../pulls//commits"` が 404 → `set -euo pipefail` で中断する。
+     「適用対象外」という判断自体は正しく記録されているので、header か inputs のどちらかを合わせる
+   - Meta Review の fallback 順序が 3 箇所のコメントで逆
+     （`meta-review.yml` / `metaReviewFallbackRouter.ts` / `geminiCliAdapter.ts`）。
+     実際は `preferCli: true` により CLI(agy) → API → Antigravity/Claude → Copilot。
+     `docs/multi_ai_step_review_flow.md` だけが正しい。**挙動は安全**なのでコメントのみ
+   - `docs/multi_ai_step_review_flow.md` の**見出し番号が衝突している**（Final Review Packet
+     テンプレートが `## 1.`〜`## 15.` を文書自身の章番号と同じレベルで使う。
+     `## 2-2` が `## 2-1` より前、`### 19-1/19-2` が `## 20` の下）。
+     これが原因で `CLAUDE.md`（10-1章）、`AGENTS.md`（11-1章）、`specs/00`、`specs/13` の参照が
+     **すべて存在しない章を指している**。テンプレート部を `###` 以下へ落とすか code fence 化し、
+     参照側を直す。**憲法の範囲表記そのものは PR #85 / #87 の担当なので触らない**
+   - commit / branch 規約がいずれも実運用と違う（`CLAUDE.md` / `AGENTS.md` / `development_rules.md`）。
+     default branch は `master`、実際の commit は Conventional Commits + PR 番号で
+     agent/task prefix 無し。`AGENTS.md` の「`git log --oneline` が誰が何をしたかのタイムラインとして
+     読める状態を維持する」は現状成立していない
+   - `SUBPHASE_PROGRESS.md`（repository root、**日付なし**）が自己矛盾。
+     表は SP-1〜SP-7 を `✅ done` とするが本文は `## SP-2〜SP-7（予定）`、
+     SP-1 の完了条件チェックリストは全て `[ ]`、「本流復帰ポイント」は既に完了した作業を指す。
+     **表側が正しい**（KG の全エンドポイントが実在、`knowledgeGraphRoutes` は登録済み）。
+     完了日付と history ラベルを付ける
+   - `ALIGNMENT_VIOLATIONS.md` AV-001 の未チェック行とチェック済み行が**同一 entry 内で矛盾**
+   - 本ファイル内で「`cross-project-state-api` に包含される」と自ら宣言しながら `state=planned` のまま
+     独立 open item として数えられている 2 件
+     （`review-substage-progress-reporting` / `containment-success-path-observability`）
+   - 本ファイルが cheap AI の spawn 先を `node_modules/opencode-ai/bin/opencode` と書いているが、
+     実装は `bin/opencode.exe`。**`.exe` が正しい**（下記 false positive 参照）。記述側を直す
+   - `docs/codex_prompt_footer.md` は repository 内のどこからも参照されていない orphan doc で、
+     内容も Windows PowerShell 前提（`docs/env-notes.md` も同様に完了済み task の指示と、
+     死んだ `tasks/active/` 運用のチェックリストを残している）
+   - `docs/adr/0002` の `process.env` 一覧が drift（行番号が全てずれ、7 変数が未収載）
+   - `docs/meta_reviewer/checklist.md` の 2 パスが `src/` 抜け。
+     `docs/meta_reviewer/checklists/sandbox.md` は「`curl` 等が追加されていない」を要求するが
+     `sandbox/Dockerfile` が `curl` を install しており、**自リポジトリの Dockerfile を fail させる**。
+     `runner.ts` の `getFileChecklists()` は `apps/api/src/{pl,ctoAi,supervision,designReview,auth}/` と
+     `apps/worker/scripts/` に専用 checklist を当てない（カバレッジのギャップ）
+   - `tasks/task_graph.md` は `*Updated: 2026-06-06*`、`Phase 2 進行中`、
+     Target Project が別製品（`ai-distribution-engine`、Windows パス）のまま。
+     control repo 側を更新する自動経路は存在しない（`summaryEngine.ts` と `roadmapWriter` は
+     **targetProjectRoot 配下にのみ**書き、`roadmapAdoption.ts` は書かないと明記）。
+     `tasks/active/` の 12 ファイルはすべて完了済み作業。
+     `CLAUDE.md`「タスク完了時は必ず `task_graph.md` を更新する」が実行不能な状態なので、
+     **CLAUDE.md §8 を実態（roadmap.md が正本）へ合わせるか、両者に history ラベルを付けるか**を決める
+
+   **本項目では新しい仕組みを一切作らない。**
+
+---
+
+### 監査で false positive と確定した Finding（記録のみ・対応不要）
+
+- **「`cheapAiClient` が Linux production で Windows バイナリを解決する」→ false positive。**
+  `apps/api/src/aiExplain/cheapAiClient.ts` の
+  `join('node_modules','opencode-ai','bin','opencode.exe')` は**正しい**。
+  2026-09-15 に npm registry の実配布物で確定した:
+  `opencode-ai@1.18.16` の `package.json` は `bin = {"opencode": "bin/opencode.exe"}` を
+  `os: ["darwin","linux","win32"]` すべてに対して宣言し、tarball の bin ファイルは
+  `package/bin/opencode.exe` の**1 つだけ**。`postinstall.mjs` は
+  `sourceBinary = platform === "windows" ? "opencode.exe" : "opencode"` を
+  **全 platform で `targetBinary = bin/opencode.exe` へコピーする**。
+  すなわち Linux 上でも `bin/opencode.exe` が正規パスであり、中身は Linux バイナリである。
+  production で PL adoption がこの経路を通って成功している観測とも整合する。
+  **コードは正しく、本ファイルの記述（`bin/opencode`）の方が不正確**（上記 cleanup item で扱う）。
+
+### 追加調査が要る Finding（item 化しない）
+
+- Design Review の idle 検知が `currentTask` に限定されている（`systemState.ts`）。
+  2 つの design-review run が同時に queued になる経路を特定できなかった。
+  緩和策は存在する（`totals.activeDesignReviews` は全体集計、`recoverAndRekickAtStartup` は全 queued を drain）
+- Watchdog の stall 閾値が AI CLI Job（`kind: 'test'`）を想定していないが、
+  AI CLI 自身の timeout が先に発火するのが通常で、live な誤報を確認できなかった
+- `requiresIndependentReview` が分岐に使われていないが、`gate_evaluations` 行に
+  evidence として載っているかを未確認（載っていれば有効）
+- root `pnpm build` と per-app `start` が成立しない件は本ファイルが既に記録済み
+- ledger に id が無いまま open と宣言されている「legacy `API_TOKEN` → ADMIN / WORKER split
+  credential migration」は、対応する item が存在しない。**CEO 判断**（production cutover を伴うため）
+
+---
+
 ## PL Console（ベンダー非依存のPL指示UI。低優先・本線安定化後に着手）
 
 **位置づけ:** 将来の重要基盤だが、**現在の完成作業を遅らせない低優先度タスク**。
@@ -7001,6 +7625,68 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       Safety Boundary 変更に当たる場合は CEO へ Escalate する。
       finding の統合判断の記録は
       `docs/project_memory/decisions/autoreview_diff_range_review_findings.md`。
+
+      **2026-09-15 repository 腐敗監査によるスコープ拡張（新規 item は作らない）**:
+      本項目の acceptance criteria（「`CONTROL REPOSITORY` の正式な意味を決める」
+      「コメントと機械強制のどちらを Source of Truth とするのか」「**2つの正本を残さない**」）は、
+      監査で見つかった以下にもそのまま適用される。**同一の決定を一度に反映する**こと。
+      別 item に切ると Safety Boundary の正本が再び分裂するため、ここへ集約する。
+
+      - **憲法の境界名が実在しない**: `CLAUDE.md` §4/§5（「最重要」）・`AGENTS.md` §1・
+        `specs/11_runtime_environment.md` が `ai-team-backend/` / `target-project/` という
+        **この repository に存在しないディレクトリ名**で境界を定義している。実際に強制しているのは
+        絶対 root 封じ込め（`apps/worker/src/utils/pathUtils.ts` の `TARGET_ROOT` +
+        `isInsideTargetRoot()`、`apps/api/src/utils/pathGuard.ts`、`ALWAYS_FORBIDDEN_PATTERNS`）。
+        `fileChangeGuard.ts` のヘッダは「`target-project/`配下のみ許可」と書くが、
+        実装は `target-project/` prefix を**一度も判定していない**。
+        同一境界に 5 つの呼び名が流通している。
+      - **Meta Reviewer が存在しないルールを毎回監査している**: `docs/meta_reviewer/prompt.md` が
+        「`fileChangeGuard` の target-project 限定を解除している」を Cage 弱体化の判定基準に挙げ、
+        `docs/meta_reviewer/checklist.md` が「target-project/配下のみ許可のロジックが維持されている」を
+        チェック項目にしている。**そのロジックは存在しないため恒久的に判定不能**である。
+      - **「Docker が物理的に強制する」という安全性主張が誤り**: `AGENTS.md` §1 の
+        「分離の仕組み（手動ではなくDockerが強制）… エージェントは物理的に Control Repository を書けない」は、
+        `specs/11_runtime_environment.md` の Current Truth（2026-08-14修正）が明示的に否定しており、
+        実際の隔離は per-job cgroup v2（`apps/worker/src/execution/runContainedCommand.ts`）である。
+        `AGENTS.md` は**同一ファイルの §1-1 で正しく path ベース guard と書いており内部矛盾**。
+        同じ誤りが `docs/PROJECT_CURRENT_STATE.md` と `docs/env-notes.md` にもある。
+        `AGENTS.md` は全 ContextPack へ注入されるため、全 AI が誤った安全前提を受け取っている。
+      - **active な rule 文書が CEO 承認済みの自己開発を禁止している**:
+        `docs/project_memory/rules/development_rules.md`（**Importance Level: 1 / Status: active**）が
+        「Control Repository (`apps/api/`, `apps/worker/`, `sandbox/`) の改変」を禁止と書く。
+        `AGENTS.md` §1-1（2026-09-13）は Control Repository を「稼働中 Stable インスタンスの
+        control plane」と再定義し、隔離された Candidate clone の編集を明示的に許可している。
+        **この文書は `apps/worker/src/guards/alignmentChecker.ts` の `DESIGN_DOCS_PATHS` に含まれる
+        = Gemini Alignment Review の入力正本**であり、放置すると正当な Tier A 自己開発を
+        violation と判定しうる。
+      - **CODEOWNERS が安全ロジックの現在地を保護していない**: `.github/CODEOWNERS` は
+        `apps/worker/src/guards/` / `sandbox/` / `CLAUDE.md` / `docs/meta_reviewer/` /
+        `packages/shared/src/types/agent.ts` を保護するが、`AGENTS.md`
+        （`AGENTS.md` 自身が「CEOが具体的diffを明示承認した場合に限り実施する」と宣言している）、
+        `packages/shared/src/{approvalGateLogic,approvalLevelClassifier,plActionPolicy,reviewSeparation,
+        strategicDecision}.ts`、`apps/api/src/auth/**`、`apps/api/src/pl/actionGate.ts`、
+        `apps/api/src/routes/approvalGate.ts`、`apps/api/src/designReviewEvidencePolicy.ts`、
+        `apps/worker/src/approvalLevel/**`、`apps/worker/src/execution/runContainedCommand.ts`、
+        `docs/project_memory/`（alignmentChecker が読む正本群）は**未保護**。
+        「どのファイルが本当に保護対象か」という本項目の答えが、そのまま CODEOWNERS の対象定義になる。
+        **CODEOWNERS 変更は Safety Boundary 変更に当たるため CEO 承認が要る。**
+      - **存在しないファイルに対する live な保護ルール**:
+        `packages/shared/src/approvalLevelClassifier.ts` が `/postTestHook\.ps1$/` を
+        Mechanical Gate Level 3 固定ルールとして持ち、
+        `apps/worker/src/approvalLevel/safetyVerifier.ts` に `checkPostTestHookUntouched` がある。
+        しかし `postTestHook.ps1` は repository に存在しない（`git ls-files` で 0 件）。
+        `docs/PROJECT_CURRENT_STATE.md` の R-007 は「意図的な未追跡」と説明しているため、
+        **VPS 上の存在確認を先に行う**こと。
+      - **`TARGET_ROOT` に 3 つの解決方式が並存する**: (1) env 駆動・既定 `/workspace/target`
+        （`apps/api` の 6 箇所）、(2) ハードコードで env 非対応
+        （`apps/worker/src/utils/pathUtils.ts` — **`isInsideTargetRoot()` が実際に強制するのはこれ**）、
+        (3) ハードコードかつ env を明示的に拒否（`apps/api/src/config/targetWorkingDir.ts`、
+        ヘッダに理由記載）。既定以外を設定すると API の roadmap/adoption パスだけが動き、
+        Worker の書き込み guard と Job の `workingDir` は動かない。
+
+      **追加制約**: 上記はいずれも**記述側の修正で足り、新しい Guard・Gate・Review は不要**である
+      （CODEOWNERS の対象追加のみ CEO 承認事項）。
+      **AI 側が自分の権限を広げる形で解決してはならない**という既存の制約を全項目へ適用する。
 
 <!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
 11. [ ] **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）** —
