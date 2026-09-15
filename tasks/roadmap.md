@@ -7794,8 +7794,27 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **AI 側が自分の権限を広げる形で解決してはならない**という既存の制約を全項目へ適用する。
 
 <!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
-11. [ ] **PL の Escalation 本文が原因を取り違える（目立つ警告行に引っ張られる）** —
-      2026-09-15登録（production 実測）。**CEO が読む通知の中身の問題であり、機構ではなく品質。**
+11. [ ] **CEO / PL に届く停止理由が、実際の原因を指していない** —
+      2026-09-15登録（production 実測）。**機構ではなく、届く情報の品質の問題。**
+
+      **【2026-09-15 追記】原因側は大きく改善した。残っているのは attention の detail。**
+
+      Tier B（PR #216）で Job の stderr **先頭**に診断が入ったあと、PL の Escalation 本文は
+      「file guard violations outside allowed paths, requiring higher-level decision to adjust
+      scope or paths」と**正しい原因**を書くようになった（下記の誤診と対照的）。
+
+      一方で **`attention` の `detail` は依然として噛み合っていない**:
+      `systemState.ts` は `tail(job.stderr, 200)` で**末尾**200字を取るが、診断は**先頭**にある
+      （末尾に置くとプレビュー切り詰め 4000 字で消えるため先頭にした）。結果、Mobile と PL が
+      受け取る `detail` は `⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY…` という
+      **無関係な警告**のままである。**stderr の生産側と消費側が「どちらの端が重要か」で食い違っている。**
+
+      **着手時に確認すること**: `tail` を `head` に変えるだけで足りるか（末尾が重要なケースが
+      他にあるか要確認）。**新しいフィールドも新しい抽出機構も作らない。**
+      `apps/api/src/state/systemState.ts` は protected file ではないので **VPS 側で実装できる**。
+
+      ---
+      以下は登録時の記録（誤診の実例）。
 
       **事象**: Task `7bd4a65a` の implement Job が失敗したとき、PL は CEO へ
       「**外部の `ANTHROPIC_API_KEY` の設定問題**であり自動復旧できない」と上げた。
