@@ -4742,8 +4742,95 @@ worktree と別 repository は採らない。
       `docs/project_memory/decisions/tier_a_self_development_e2e.md` に記録済み。
       UI 実装は本項目に含めない（自己開発移行を遅らせないため）。
 
-<!-- roadmap:id=aiteamos-self-development-tier-b state=planned -->
-2. [ ] **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）** —
+<!-- roadmap:id=aiteamos-self-development-tier-b state=planned priority=high -->
+2. [ ] **Maintenance Lane v0 = Tier B: 自分では触れない変更を、正本を手放さずに管理する** —
+      **最優先テーマ（CEO 指示・2026-09-15）**。
+      AIteamOS が Task / Review / Gate / Audit / Approval の正本を保持したまま、
+      protected file 等に到達する変更を外部実行者へ出して回収できるようにする。
+
+      **本項目が Maintenance Lane v0 の正本である。新しい項目は作らない。**
+      元々「Candidate 専用 runtime / DB / Worker」として登録されていた項目に、
+      CEO の Maintenance Lane v0 要件を統合した（重複を作らないため）。
+
+      ---
+
+      ### なぜ今これが最優先か（2026-09-15 実測）
+
+      protected file を要する Task に当たったとき、現在の運用は**手動 handoff**になる:
+
+      ```text
+      AIteamOS → 外部 Claude → 外部実装 → 外部 Independent Review → merge / deploy
+               → AIteamOS へ reconcile
+      ```
+
+      この経路は今日 1 往復を実際に完走した（`docs/project_memory/decisions/
+      multi_task_continuous_autonomous_development_evidence.md` 第4ラウンド）。
+      **成立はしたが、正本が AIteamOS の外にある。** 特に Independent Review の結果は
+      外部セッションのローカルにしか無く、reconcile 時には**申告として渡している**だけである。
+
+      ### Goal
+
+      上記 handoff を、**AIteamOS 自身が正本を保持したまま管理できる形**へ変える。
+      外部セッションは「AIteamOS が指示した最小差分を実装する実行者」に縮小し、
+      判断・記録・承認は AIteamOS 側に残す。
+
+      ### v0 の対象（CEO 提示。これ未満では v0 と呼ばない）
+
+      - **Maintenance 専用 isolated workspace**（通常 Candidate と分離）
+      - **通常 Candidate と分離された権限**
+      - **production 直接編集の禁止**
+      - **exact implementation commit SHA の固定**
+      - **その exact SHA に対する Independent Review**
+      - **Review 結果を caller 自己申告ではなく正式 record として保存**
+      - **reviewer / provider / model / timestamp / reviewed SHA の保存**
+      - **CI 結果と commit の紐付け**
+      - **canonical master 包含の確認**
+      - **Stable 包含の確認**
+      - **merge / deploy / Task completion の audit**
+      - **完了後の VPS autonomous adoption への自動復帰**
+
+      ### 既存項目との関係（重複を作らないための対応表）
+
+      | v0 要件 | 既存項目 | 扱い |
+      |---|---|---|
+      | isolated workspace / 権限分離 | 本項目（元の Candidate 専用 runtime）| **本項目で実装** |
+      | master 包含・Stable 包含の**独立**確認 | `reconcile-evidence-not-fully-machine-verified` (1) | **既存を消化**。ここで再定義しない |
+      | Review 結果の正式 record 保存 | `reconcile-evidence-not-fully-machine-verified` (2) | **既存を消化**。保存先は既存構造の小さな拡張で足りるかを先に見る |
+      | Task completion の audit | `external completion reconcile`（実装済み・master `828878a`）| **既存を再利用**。新しい completion 経路を作らない |
+      | 完了後の autonomous 復帰 | 実装済み（2026-09-15 実測で復帰確認）| **既存で充足** |
+      | protected file の境界定義 | `control-repository-header-vs-enforced-guard` | **依存**。注記と実強制の不一致を先に解消する |
+      | Gate 層が Job 経路へ未配線 | `review-gate-layers-implemented-but-unwired` | **別問題**。Maintenance Lane とは独立に進む |
+      | Multi-Project の workspace 分離 | `project-workspace-isolation` | **別目的**。Maintenance Lane は 1 Project 内の話 |
+
+      **`Review Class A/B/C` は Roadmap に既存項目が無い**（全文検索で0件）。
+      ただし **CEO 指示により v0 には含めない** — 下記「v0 に含めないもの」を参照。
+
+      ### v0 に含めないもの（CEO 指示）
+
+      - **CEO Approval の削減**。Maintenance Lane の**最終実行または promotion については
+        CEO Approval を維持する**
+      - **Review Class B による CEO Approval 削減**。これは
+        **Maintenance Lane v0 の Operational E2E が成立した後**に別途扱う
+
+      ### Bootstrap の進め方（CEO 指示）
+
+      - **VPS AIteamOS 自身で変更できる部分は VPS に実装させる。** 外部セッションが先回りしない
+      - VPS が **Safety Boundary / Authority / protected file / Gate・Guard 根幹**へ到達したら、
+        **PL は自分で権限を拡張せず、Guard も迂回しない**。**その最小変更だけ**を Tier B として
+        外部セッションへ Escalate する
+      - 外部 Tier B は**必要最小差分だけ**を実装し、Independent Review / CI / 既存 Gate を通して
+        正式経路（`reconcile_external_completion`）で VPS へ返す
+
+      ### 将来の依存低減
+
+      現在 CEO → VPS PL の正式な対話経路が無いため、ローカル Claude セッションを
+      **暫定 Control Proxy** として使っている。`chatgpt-mcp-inspect` / `operator-chat-mobile` が
+      成立したら、**この Control Proxy 依存を減らせる形**にしておくこと。
+
+      ---
+
+      以下は登録時の技術設計（そのまま有効）。
+
       Tier A の後。Tier A を待たせない。
 
       runtime 挙動・migration・startup reconciliation・resume を伴う変更は、テストと CI だけでは
@@ -7369,6 +7456,12 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       2026-09-15登録（CEO 指示の後続確認事項）。**初回 reconcile のブロッカーではない**
       （CEO 判断で実行済み）。経路そのものは master `828878a` で稼働している。
 
+      **本項目は `aiteamos-self-development-tier-b`（Maintenance Lane v0）の構成要素である。**
+      v0 要件のうち「canonical master 包含の確認」「Stable 包含の確認」
+      「Review 結果を caller 自己申告ではなく正式 record として保存」
+      「reviewer / provider / model / timestamp / reviewed SHA の保存」は**ここで消化する**。
+      Maintenance Lane 側で再定義しないこと（重複を作らない）。
+
       **(1) canonical master への包含と、running Stable への包含を分けていない。**
       `verifyExternalCompletion()` が行うのは
       `git merge-base --is-ancestor <sha> HEAD`（**Stable の HEAD に対する**祖先判定）だけである。
@@ -7501,6 +7594,18 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 8. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
       2026-09-15登録（production 実測）。CEO 指示により**既存 adoption / Design Review /
       PL diagnosis の改善候補**として記録する。
+
+      **2例目（同日 08:20 頃、実測）**: PL が `mobile-approval-role-docs` を自律採用し、
+      `allowedPaths: ["docs/approval-roles"]` を宣言した。実装 AI は実際には
+      `docs/project_memory/rules/approval_rules.md` と `docs/approval_roles_and_mobile_flow.md`
+      を書き、**File Change Guard が blocked**（`fileChangeAllowed: false`）。
+      `docs/approval-roles` という**存在しないディレクトリ**を範囲に選んでいた。
+      1例目（protected file）と原因は違うが、**「採用時に宣言した範囲が実装先と噛み合わない」
+      という同じ症状**である。頻度は低くない。
+
+      なお、このとき stderr には Tier B（PR #216）で入れた診断がそのまま出ており、
+      **原因の特定に追加調査を要さなかった**:
+      `File Change Guard blocked. Why: … — Not in task.allowedPaths: … allowedPaths scope …`
 
       **事象**: PL が `guard-block-message-omits-allowed-paths` を自律採用 → Design Review は
       **ALIGNED** → implement Job 作成、まで進んだ。しかし対象は `jobRunner.ts` /
