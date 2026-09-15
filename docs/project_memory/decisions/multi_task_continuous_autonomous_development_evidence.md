@@ -117,3 +117,62 @@ Binding Review の入力を外から操作して判定を覆すことに等し�
 **「複数 Task 連続自律開発」は未達。** 2件目の Task が着手に至っていない。
 ただし**停止の原因は自律機構ではなく Review 判定**であり、自律ループ側（観測・判断・Gate・採用・
 通知）は最後まで設計どおり動いた。次の検証は CONFLICT の扱いが決まったあとに行う。
+
+---
+
+# 第2ラウンド（同日 13:00〜14:10, CEO 判断反映後）
+
+CEO が (1) MVP 延期文言の時点整合、(2) 軽い代替案の再評価、を指示。以後も**外部から次 Task を
+一切指定していない**。
+
+## 到達: **3件目の Task まで自律で進んだ**
+
+```
+（1件目 = bd80c4ce: CEO 承認 → commit 6d958c2 → done）
+（2件目 = 21d69075: 自律採用 → Design Review CONFLICT → 実装不要と判明し close）
+13:54:53  adoption=adopted  guard-block-message-omits-allowed-paths   ← 3件目を自律採用
+          Design Review ALIGNED → implement Job 作成
+13:59〜   implement Job 失敗 → PL 診断 → escalate_to_ceo（LINE 送信成功）
+14:08〜   後続 Job が blocked → PL が resume_task を2回提案 → Gate が却下 → Escalation（LINE 送信成功）
+```
+
+**LINE は3通とも配信成功**（13:09:55 / 14:01:13 / 14:10:10）。
+
+## 3ラウンドで見つかった「静かに止まる / 構造的に止まる」欠陥
+
+いずれも**自律で回して初めて出た**もので、単体テストでは出なかった。
+
+| 欠陥 | 症状 | 修正 |
+|---|---|---|
+| `task_ready_without_job` が PL の対象外 | 採用直後に止まっても**誰にも通知されない** | `a71a7e3` |
+| 採用の attempt 予算が成功後もリセットされない | 対象キーが `adopt:<projectId>` で恒久のため、**1 Project あたり生涯2件しか採用できない** | `15aca53` |
+| PL が**最も古い** Design Review evidence を Gate へ出す | `findByTaskId()` は新しい順なのに `.pop()` していた。**evidence が1件だと偶然通り、2件目から必ず落ちる** | `eaebf37` |
+| `deferred` が採用を止めていない | 「現在も実装禁止」を表す手段が事実上無かった | `df9bfa9` |
+
+## 現在の停止点: **protected file を要する項目に当たった（設計どおり）**
+
+3件目の項目 `guard-block-message-omits-allowed-paths` は `jobRunner.ts` / `fileChangeGuard.ts` を
+必要とする。これらは `ALWAYS_FORBIDDEN_PATTERNS` の protected file であり、
+**Candidate の AI は変更できない**。
+
+implement Job は `implementation produced no file changes`（exit 0 / `changedFiles: []` /
+`workspaceState: unchanged`）で失敗した。**File Change Guard は発動していない**
+（`fileChangeAllowed: true`）— そもそも allowedPaths（`apps/api/src/ctoAi`, `packages/shared/src`）に
+対象が無く、何も書けずに終わった。
+
+**権限は一切拡大されていない。** PL は Escalation へ倒れ、CEO 判断待ちで停止している。
+CEO 指示（2026-09-15）「protected file や Safety Boundary を必要とする場合は PL 自身で権限を
+拡大せず、既存 Gate に従って Tier B / CEO Escalation」に一致する。
+
+## 評価
+
+| 区間 | 第1ラウンド | 第2ラウンド |
+|---|---|---|
+| Approval → commit → Task 完了 | 成立 | — |
+| Roadmap 再評価 → autonomous adoption | 成立（1件） | **成立（さらに2件）** |
+| adoption → 次 Task 着手 | 未成立 | **成立**（Design Review ALIGNED → implement Job 作成） |
+| 実装完了 | — | **未成立**（protected file が要る項目に当たった） |
+| 停止の可視化 | 修正後に成立 | **成立**（3通とも LINE 配信） |
+
+**連続自律採用は成立した。** 止まっているのは**能力ではなく権限**であり、それは設計どおりである。
+次の検証は、protected file を要さない項目を PL が選んだときに実装完走するかで行う。
