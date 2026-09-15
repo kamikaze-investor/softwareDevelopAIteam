@@ -6775,6 +6775,15 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       （`maybeAdoptNext()` は `currentTask === undefined` を要求する）。
       今回は description に理由を書いたうえで `done` にしたが、**記録としては正確でない**。
 
+      **CEO 指示（2026-09-15）**: 今回 `done` を使ったのは **currentTask を解放するための暫定措置**
+      であり、「受入条件を満たして完了した Task」と意味が混ざる。**恒久運用にはしない。**
+      着手時は**新しい TaskStatus を追加する前に**、次だけで正確に表現できないかを優先して確認する:
+      - `roadmapActive=false`
+      - 既存の terminal state
+      - 既存 Task / Job lifecycle の**小さな拡張**
+
+      **同じ責務の新しい status や workflow を安易に追加しないこと。**
+
       **着手時に確認すること（実装方針を先に決めない）**:
       - **新しい status を増やす前に**、既存の `roadmapActive=false` だけで十分か
         （Task は残るが候補から外れる）。state 空間を広げない方が望ましい

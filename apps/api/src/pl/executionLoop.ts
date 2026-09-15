@@ -50,6 +50,7 @@ import {
   type PlAdoptionDeps,
   type PlAdoptionResult,
 } from './adoptionStep'
+import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import {
   authorizePlAction,
@@ -324,18 +325,47 @@ function selectTarget(attention: readonly AttentionItem[]): AttentionItem | unde
  * **新しいテーブルを作らずに attempt を有界にするための唯一の情報源**である。
  * 数えるのは「実際に何かをした / 止められた試行」だけで、`idle` や in-flight skip は数えない。
  */
+/** 「試行した」と数える結果。`idle` と in-flight skip は数えない。 */
+const ATTEMPT_RESULTS: readonly string[] = [
+  'acted',
+  'blocked',
+  'diagnosis_unusable',
+  'diagnosis_failed',
+]
+
 export function countPriorAttempts(storage: IStorage, targetKey: string): number {
   return storage.auditLog
     .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
-    .filter((entry) =>
-      ['acted', 'blocked', 'diagnosis_unusable', 'diagnosis_failed'].includes(entry.result),
-    ).length
+    .filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length
 }
 
 function hasEscalated(storage: IStorage, targetKey: string): boolean {
   return storage.auditLog
     .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
     .some((entry) => entry.result === 'escalated')
+}
+
+/**
+ * 直近の成功（`acted`）より後の記録だけを返す。**採用サイクル専用**。
+ *
+ * 復旧対象のキーは `job_blocked:<jobId>` のように実体ごとに変わるので、生涯カウントでも
+ * 問題にならない。しかし**採用のキーは `adopt:<projectId>` で Project が続く限り変わらない**。
+ * そのまま `countPriorAttempts()` を使うと過去のサイクルの試行が累積し続け、
+ * **2件目を採用した時点で予算を使い切って以後ずっと Escalation** になる。
+ *
+ * 実測（2026-09-15 production）: 1件目の採用に2回（`proposal_unusable` → `adopted`）使った結果、
+ * 次のサイクルは 1 tick 目で「PL は 2 回試しましたが採用できませんでした」になり、
+ * **連続自律開発がそこで止まった**（`currentTask=UNDEFINED` / `attention=0` で、
+ * 採用できる状態だったにもかかわらず）。
+ *
+ * 予算が縛るべきは「**連続した失敗**」であって生涯試行回数ではない。
+ * **新しいテーブルは作らない。** 既存 `audit_log` を直近の成功で区切るだけである。
+ */
+function adoptionEntriesSinceLastSuccess(storage: IStorage, targetKey: string): AuditLogEntry[] {
+  // `findByEntity()` は新しい順に返す。
+  const entries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  const lastSuccess = entries.findIndex((entry) => entry.result === 'acted')
+  return lastSuccess === -1 ? entries : entries.slice(0, lastSuccess)
 }
 
 function record(
@@ -916,9 +946,12 @@ async function maybeAdoptNext(
   if (!project) return undefined
 
   const key = `adopt:${project.id}`
-  const attempt = countPriorAttempts(storage, key) + 1
+  // **採用が成功したら予算は仕切り直す。** 縛るのは連続した失敗であって生涯試行回数ではない
+  // （そうしないと2件目の採用で打ち止めになる。2026-09-15 production 実測）。
+  const sinceLastSuccess = adoptionEntriesSinceLastSuccess(storage, key)
+  const attempt = sinceLastSuccess.filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length + 1
   if (attempt > PL_MAX_ADOPTION_ATTEMPTS) {
-    if (hasEscalated(storage, key)) return undefined
+    if (sinceLastSuccess.some((entry) => entry.result === 'escalated')) return undefined
     await escalateTo(
       storage,
       deps,
