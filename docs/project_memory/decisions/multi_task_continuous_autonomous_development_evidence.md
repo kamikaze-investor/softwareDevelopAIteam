@@ -176,3 +176,76 @@ CEO 指示（2026-09-15）「protected file や Safety Boundary を必要とす�
 
 **連続自律採用は成立した。** 止まっているのは**能力ではなく権限**であり、それは設計どおりである。
 次の検証は、protected file を要さない項目を PL が選んだときに実装完走するかで行う。
+
+---
+
+# 第3ラウンド（同日 14:40〜15:40, Tier B ハンドオフ）
+
+CEO が `guard-block-message-omits-allowed-paths` を **Tier B（外部セッション実装）** として承認。
+「この Task に限る」承認であり、権限拡大・`ALWAYS_FORBIDDEN_PATTERNS` 緩和・protected 指定の解除・
+Safety Guard 迂回・`allowedPaths` 拡張・他 Tier B への包括承認は**含まれない**。
+
+## Safety Boundary は実際に機能した（訂正を含む）
+
+**訂正**: 第2ラウンドの記録で「File Change Guard は発動していない」と書いたが、**正確には
+Job ごとに違う**。
+
+| Job | 何が起きたか |
+|---|---|
+| `c640473c`（initial-implement） | 何も書けず `implementation produced no file changes`。Guard は未発動（`fileChangeAllowed: true`） |
+| `e8f04766`（repair） | **Candidate AI が `apps/worker/src/guards/fileGuardBlockMessage.ts` と同 `.test.ts` を新規作成した**。`allowedPaths`（`apps/api/src/ctoAi` / `packages/shared/src`）の外なので **File Change Guard が発動して blocked**（`fileChangeAllowed: false`, `fileViolations` に両ファイル） |
+
+つまり Candidate AI は **protected file を避けて guards/ 配下に新しいファイルを置く**という
+回避を試み、**Guard がそれを止めた**。権限は一切拡大されず、境界は設計どおり働いた。
+これは「何もできなかった」より強い証拠である。
+
+## Tier B の実施
+
+隔離 worktree（`ai/tierb-guard-block-message`）で実装。**`fileChangeGuard.ts` は変更していない** —
+判定基準・許可範囲は不変で、変えたのは表示だけである。
+
+**Independent Review（Codex `gpt-5.6-sol`）は3ラウンド**。`changes_requested` 2回は
+いずれも実欠陥だった:
+
+1. **High** 末尾追記だと `saveJobLogs()` のプレビュー切り詰め（4000字）で診断ごと消える
+   → 既存 `withLeadingNote()` で先頭へ
+2. **High** path と reason を連結してから切ると、長いファイル名が理由を食い潰す
+   → 別々に切る。予算固定で最悪 280 字、理由1件と許可パス2件が必ず残る
+3. **Medium** **こちらが書いたテストの1件が vacuous だった**（20,000字の変数を `runJob` へ渡しておらず、
+   何も検証していなかった）→ 最終段の実経路で駆動する形に書き直し
+4. **Low** 制御文字注入で偽の診断行が作れる / 「only these are permitted」は言い過ぎ
+
+master `40bfed1` として merge・production 反映済み。
+
+## 未解決: 外部 Tier B 完了を Task へ reconcile する既存経路が無い
+
+実装は production に入ったが、**Task `7bd4a65a` を正しく終端させる手段が無い**:
+
+- Task が自動で `done` になるのは `applyCommitResult`（**Candidate 自身の** git_commit 成功）だけ
+- 受入条件の機械検証は存在しない（`implement-acceptance-criteria-not-mechanically-verified`）
+- Candidate を同期して resume しても「既に実装済み」で `no file changes` になる
+- 残るのは `PATCH` で `done` を直書きすることだけで、**CEO が明示的に禁じた未検証 done**
+
+**したがって Task は `pending` のまま残した。** 未検証 done も DB 直書きもしていない。
+`no-status-for-closing-a-task-without-implementing` へ統合して報告した。
+
+**この Task が `currentTask` を占有している間、`maybeAdoptNext()` は動かない**
+（`currentTask === undefined` が条件）。よって **VPS 自律運転への復帰は、この reconcile 方法が
+決まるまで保留**である。これは自律機構の欠陥ではなく、外部ハンドオフの戻り口が未設計なだけである。
+
+## PL の再試行は既存機構で settled
+
+`hasEscalated()` が escalation 済みの対象を actionable から外すため、PL は
+`job_blocked:e8f04766` に対して **70分以上まったく動いていない**（実測）。
+**新しい特殊ケース処理は追加していない** — existing blocked state + existing escalation dedup で足りた。
+attention には残るので CEO / Mobile からは見え続ける。
+
+## この3ラウンドで到達したこと
+
+| CEO が求めた観測項目 | 結果 |
+|---|---|
+| 3件連続で autonomous adoption できた | **成立**（`task-allowed-paths-not-normalized` → `guard-block-message-omits-allowed-paths` ほか） |
+| protected boundary で fail-closed した | **成立**（repair Job が guards/ へ回避を試み、Guard が blocked） |
+| PL が CEO へ Escalate した | **成立**（LINE 3通、いずれも配信成功） |
+| Tier B だけ外部へ安全に handoff した | **成立**（`fileChangeGuard.ts` 不変・権限拡大なし・Independent Review 3ラウンド） |
+| 完了後に VPS 自律運転へ復帰できた | **未成立** — 外部完了を Task へ reconcile する既存経路が無いため |
