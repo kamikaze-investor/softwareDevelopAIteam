@@ -93,6 +93,8 @@ const REQUIRED_TARGET_KIND: Record<PlActionKind, PlActionTarget['kind'] | 'any'>
   escalate_to_ceo: 'any',
 
   adopt_roadmap_item: 'project',
+  // 外部完了の反映先は Task 本体。Task 単位の根拠（approval）と同じ対象で照合する。
+  reconcile_external_completion: 'task',
   delegate_implementation: 'task',
   propose_code_change: 'task',
 

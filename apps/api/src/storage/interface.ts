@@ -92,6 +92,13 @@ export type PersistCommitSuccessWithContinuationResult =
       code: 'JOB_NOT_FOUND' | 'OUTBOX_HASH_MISMATCH' | 'STORAGE_ERROR'
       reason: string
     }
+export type ReconcileExternalCompletionResult =
+  | { ok: true; task: Task; continuation: TaskContinuation }
+  | {
+      ok: false
+      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'STORAGE_ERROR'
+      reason: string
+    }
 export type PersistProviderTimeoutFailureResult =
   | {
       ok: true
@@ -301,6 +308,21 @@ export interface IJobStorage {
     update: Partial<Job>
     outboxEvent?: OutboxEventInput
   }): PersistCommitSuccessWithContinuationResult
+  /**
+   * Candidate 以外（Tier B 外部実装）で完了した成果を Task completion へ取り込む。
+   *
+   * **`persistCommitSuccessWithContinuation()` と同じ completion transition を共有する。**
+   * 別の完了経路を作るのではなく、「Task を done にして continuation を作る」責務だけを
+   * 切り出して再利用している（CEO 指示・2026-09-15）。
+   *
+   * ここは**状態遷移だけ**を行う。根拠の検証・Gate は呼び出し側（route）の責務で、
+   * 検証を通らないものはここまで来ない。Job は作らない（外部で実装済みのため）。
+   */
+  reconcileExternalCompletion(input: {
+    taskId: string
+    /** continuation の出所として記録する既存 Job。外部完了なので新規 Job は作らない。 */
+    sourceJobId: string
+  }): ReconcileExternalCompletionResult
   persistProviderTimeoutFailure(input: {
     jobId: string
     update: Partial<Job>

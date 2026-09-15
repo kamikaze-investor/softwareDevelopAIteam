@@ -559,3 +559,69 @@ describe('authorizePlAction — 検証手段の無い Gate は充足できない
     expect(UNVERIFIABLE_GATES).not.toContain('strategic_alignment_review')
   })
 })
+
+describe('reconcile_external_completion — 外部完了は Gate を通ってしか反映されない', () => {
+  it('APPROVED な承認が無ければ通さない（自己申告で Task を done にできない）', () => {
+    const { storage, taskId } = seed()
+
+    expect(() => authorizePlAction(storage, {
+      proposal: { kind: 'reconcile_external_completion' },
+      target: { kind: 'task', taskId },
+      evidence: [],
+    })).toThrow(PlActionBlockedError)
+  })
+
+  it('WAITING な承認では通さない（承認前に反映させない）', () => {
+    const { storage, taskId } = seed()
+    const approvalId = addApprovalRequest(storage, taskId, { status: 'WAITING_FOR_USER' })
+
+    expect(() => authorizePlAction(storage, {
+      proposal: { kind: 'reconcile_external_completion' },
+      target: { kind: 'task', taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId: approvalId }],
+    })).toThrow(PlActionBlockedError)
+  })
+
+  it('別 Task の承認では通さない（対象束縛）', () => {
+    const { storage, taskId, projectId } = seed()
+    const other = storage.tasks.create({
+      projectId, title: 'other', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const approvalId = addApprovalRequest(storage, other.id)
+
+    expect(() => authorizePlAction(storage, {
+      proposal: { kind: 'reconcile_external_completion' },
+      target: { kind: 'task', taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId: approvalId }],
+    })).toThrow(PlActionBlockedError)
+  })
+
+  it('APPROVED な承認があれば通る', () => {
+    const { storage, taskId } = seed()
+    const approvalId = addApprovalRequest(storage, taskId)
+
+    const authorization = authorizePlAction(storage, {
+      proposal: { kind: 'reconcile_external_completion' },
+      target: { kind: 'task', taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId: approvalId }],
+    })
+
+    expect(authorization.decision.disposition).toBe('gates_required')
+    expect(authorization.decision.requiredGates).toContain('approval_gate')
+  })
+
+  it('この操作は protected file を書く権限を与えない（forbidden 群は依然 forbidden）', () => {
+    const { storage, taskId } = seed()
+    const approvalId = addApprovalRequest(storage, taskId)
+
+    // 承認があっても、権限側の操作は別物として forbidden のまま
+    for (const kind of ['change_safety_boundary', 'change_own_permission', 'override_gate_block']) {
+      expect(() => authorizePlAction(storage, {
+        proposal: { kind },
+        target: { kind: 'task', taskId },
+        evidence: [{ gate: 'approval_gate', approvalRequestId: approvalId }],
+      }), kind).toThrow(PlActionBlockedError)
+    }
+  })
+})
