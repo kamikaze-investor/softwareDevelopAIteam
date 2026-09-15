@@ -27,6 +27,15 @@ const validExplanationJson = JSON.stringify({
   nextMinimalAction: '対象ファイルと差分を確認してください。',
 })
 
+const validAnswerJson = JSON.stringify({
+  issue: '失敗したときに何が起きるかが論点です。',
+  policyView: 'triggeredRules は git_commit のCEO承認要求のみです。',
+  fileVerdict: '対象は表示された差分のファイルだけです。',
+  recommendation: 'approve',
+  recommendationReason: 'レビューとテストの結果が揃っています。',
+  missingInformation: 'なし',
+})
+
 function runGit(workingDir: string, args: string[]): string {
   return execFileSync('git', args, {
     cwd: workingDir,
@@ -55,6 +64,7 @@ function createFixtureRepository(): string {
 async function buildApp(
   workingDir: string,
   explanationMockResponse = validExplanationJson,
+  questionMockResponse = validAnswerJson,
 ): Promise<{ app: FastifyInstance; storage: IStorage }> {
   process.env.DB_PATH = ':memory:'
   const [{ approvalGateRoutes }, { getStorage, resetStorage }] = await Promise.all([
@@ -68,7 +78,7 @@ async function buildApp(
     prefix: '/api',
     targetWorkingDir: workingDir,
     explanationAiOptions: { mockResponse: explanationMockResponse },
-    questionAiOptions: { mockResponse: '承認に失敗した場合は処理が停止します。' },
+    questionAiOptions: { mockResponse: questionMockResponse },
   })
   await app.ready()
   return { app, storage: getStorage() }
@@ -203,11 +213,35 @@ describe('Approval explanation routes', () => {
       })
 
       expect(response.statusCode).toBe(200)
-      expect(response.json<ApprovalQuestionResponse>()).toEqual({
-        ok: true,
-        answer: '承認に失敗した場合は処理が停止します。',
-        diffStatus: 'exact',
+      const body = response.json<ApprovalQuestionResponse>()
+      expect(body.ok).toBe(true)
+      expect(body.diffStatus).toBe('exact')
+      if (!body.ok) return
+      // CEO が判断できる項目が揃った平文であること（生テキストの素通しではない）
+      expect(body.answer).toContain('【何が問題か】')
+      expect(body.answer).toContain('【推奨】承認してよい')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('tool call が返ってきても画面へは出さない（2026-09-15 production 実測の再発防止）', async () => {
+    const workingDir = createFixtureRepository()
+    const leaked = '<tool_call>\n<function>\n<parameter>Search for "Safety Boundary"</parameter>\n</function>\n</tool_call>'
+    const { app, storage } = await buildApp(workingDir, validExplanationJson, leaked)
+    try {
+      const approval = createApproval(storage, workingDir)
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/approval-requests/${approval.id}/ask`,
+        payload: { question: '承認してよいですか？', history: [] },
       })
+
+      expect(response.statusCode).toBe(200)
+      const body = response.json<ApprovalQuestionResponse>()
+      expect(body.ok).toBe(false)
+      expect(JSON.stringify(body)).not.toContain('tool_call')
+      expect(JSON.stringify(body)).not.toContain('Safety Boundary')
     } finally {
       await app.close()
     }

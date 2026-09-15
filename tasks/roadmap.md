@@ -6512,8 +6512,90 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         後から区別・比較できる記録経路を同時に設計する
       - 撤回可能性: 自動承認を止めたいとき、**設定1つで即座に全件 CEO 承認へ戻せる**こと
 
+<!-- roadmap:id=approval-qa-leaks-internal-representation state=done -->
+3. [x] **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した** —
+      2026-09-15登録・同日修正（CEO 実機報告）。
+
+      **事象**: CEO がスマホの承認画面から「CONTROL REPOSITORY と allowedPaths の矛盾について、
+      今回の変更を承認してよいか」と質問したところ、回答欄に**リポジトリ検索用の内部プロンプトと
+      `<tool_call><function><parameter>…` 相当の文字列がそのまま表示**された。
+      非エンジニアが判断できる回答になっておらず、Explainer の実運用上の欠陥である。
+
+      **Root cause**: `answerApprovalQuestion()`（`apps/api/src/approvalExplain/approvalAi.ts`）が
+      **モデルの生テキストを無検証でそのまま返していた**。説明生成側
+      （`generateApprovalExplanation()`）は Zod schema で形を固定していたのに、
+      **質問応答側だけ素通し**だった。`POST /api/approval-requests/:id/ask` はそれを
+      `answer` としてそのまま返す。モデルは「リポジトリを調べる」ためにツール呼び出しを
+      出力したが、この経路にツールは無いので、呼び出しの意図がそのまま文字列として表示された。
+
+      **修正**: 回答を CEO 判断用の項目へ固定した（`ApprovalAnswerSchema`）—
+      何が問題か / Safety Policy 上の扱い / 今回変更してよいか /
+      推奨（approve・reject・hold）/ 足りない情報。
+      加えて `containsInternalRepresentation()` で `<tool_call>` 等を検出し、
+      **見つかったら整形せず fail-closed**（既存の「AIから回答を取得できませんでした」を出す）。
+      同じ漏洩は説明生成側にも起こりうるため、そちらの prose にも同じ検査を掛けた。
+      system prompt にも「ツールもリポジトリ検索も無い。検索指示・ツール呼び出しを出力しない。
+      事実が足りなければ hold にして不足を書く」を明記した。
+
+      **回帰テスト**: 実際に表示された `<tool_call>` 文字列を入力にして、route まで含めて
+      `ok:false` になり **レスポンス全体に `tool_call` も検索語も含まれない**ことを固定した。
+
+<!-- roadmap:id=approval-qa-cannot-answer-repository-questions state=planned -->
+4. [ ] **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い** —
+      2026-09-15登録（CEO 指示）。`approval-qa-leaks-internal-representation` の**構造的な残り**。
+
+      **事象**: Explainer は「この画面を閉じるまでのやり取りだけ」で答える設計で、入力は
+      Approval payload（task / approvalRequest / review / QA / exactDiff）のみ。
+      CEO の実際の質問は「`CONTROL REPOSITORY` 注記と `allowedPaths` の矛盾」で、
+      **答えるには repository の中身（`ALWAYS_FORBIDDEN_PATTERNS` やヘッダ注記の分布）が要る**。
+      直前の修正で「hold にして不足情報を示し、PL へ回す」ところまでは倒せるようになったが、
+      **CEO がスマホから PL へ正式に問い合わせる経路が無い**（現状は CLI セッション頼み）。
+
+      **CEO 指示（重複防止）**: **新しいチャット基盤を重複して作らない。**
+      既存 Explainer・PL 実行経路の改善で解決できないかを優先する。
+      将来の Operator Chat / Control Interface を作る場合も、既存 PL 経路へ正式に問い合わせる形にする。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - 既存の `POST /api/tasks/:id/failure-questions` が同型の問い合わせ口として使えるか。
+        使えるなら**承認向けに一般化**できるか（新設ではなく拡張で足りるか）
+      - PL 経路へ回す場合、**Mandatory Gate を通る**こと。Q&A が調査のために勝手に
+        操作を実行できてはならない（read-only 系の既存操作に限る）
+      - 「この画面内だけ」という現在の契約を変えるなら、履歴を保存しない前提が崩れないか
+      - 効果検証可能性（Design Philosophy 8）: hold で終わった質問がどれだけあり、
+        そのうち何件が PL へ届いたかを後から数えられること
+
+<!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
+5. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
+      2026-09-15登録（CEO の承認画面での指摘が発端）。
+
+      **確認された事実（2026-09-15 実測）**:
+      - 当該ヘッダは **30以上のファイル**に付いており、`alignmentChecker.test.ts` /
+        `safetyAuditor.test.ts` / `geminiRouter.test.ts` のような**純粋なテストファイルにも付いている**
+      - 一方、**機械的に強制される**のは `ALWAYS_FORBIDDEN_PATTERNS`
+        （`apps/worker/src/guards/fileChangeGuard.ts`）だけで、こちらは
+        guard 群 / `jobRunner` / `safeEnv` / `apiAuth` / `gateClient` / `gatePolicy` /
+        `metaReviewer/geminiClient` 等に**日付つきの根拠コメントを添えて厳選**されている
+      - 実例: `apps/worker/src/metaReviewer/autoReview.ts` はヘッダで「AI編集禁止」と宣言しているが
+        `ALWAYS_FORBIDDEN_PATTERNS` に無く、`allowedPaths` に入れば AI が変更できる
+        （実際に Task `bd80c4ce` がこの状態で承認待ちになった）
+
+      **なぜ問題か**: **注記が boundary として使えない。** CEO が承認画面で
+      「AI編集禁止と書いてあるが変更してよいのか」と判断できない。
+      注記を信じると Tier A 自己開発がほぼ全面停止し、注記を無視すると
+      「禁止と書いてあるものを無視してよい」という運用が常態化する。どちらも良くない。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - 注記の意味を**1つに決める**。「変更に追加の Review が要る」なのか
+        「AI は一切触れない」なのか。今は両方の読み方ができる
+      - 決めた意味を**機械で強制できる形**にする（`ALWAYS_FORBIDDEN_PATTERNS` へ寄せる／
+        注記を機械可読にして guard が読む／注記を落として一覧を単一の正本にする）。
+        **2つの正本を残さない**
+      - **新しい Guard を作らない。** 既存 `fileChangeGuard` の範囲で表現できるかを先に見る
+      - 承認画面へ「この変更対象に保護対象が含まれるか」を事実として出せるか
+        （`triggeredRules` に相当する形で。AI の判断ではなく機械判定として）
+
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
-3. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
+6. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
       同じ Meta Review 経路の改善として扱う。**新しい retry framework は作らない。**
       **担当境界（2026-09-15）**: 本項目は「transient 起因の失敗が attempt 予算を食い潰す」こと、
