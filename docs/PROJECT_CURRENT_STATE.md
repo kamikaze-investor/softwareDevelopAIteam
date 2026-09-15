@@ -217,6 +217,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Tier A: 自己開発の最初の安全な切替点
 - **cleanup だけが失敗した containment が Job を quarantine させる
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
+- **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
 
@@ -249,7 +250,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
 - 2種類の承認の役割整理とMobile導線設計（state: deferred）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
-- **Roadmap 採用経路の残作業2件（`roadmap-item-adoption` の後続）**（state: planned）
+- **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Tier B: Candidate 専用 runtime / DB / Worker（runtime・migration 変更を自己開発するため）**（state: planned）
 - **Project 単位 workspace 分離（Multi-Project の前提・最優先）**（state: planned）
 - **Harness Bake-off / Execution Runtime Evaluation**（state: planned）
@@ -263,6 +264,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: in_progress）
 - **Mandatory Gate Policy（state: in_progress）
 - **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
+- **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
+- **`⚠️ CONTROL REPOSITORY（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）

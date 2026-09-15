@@ -101,18 +101,72 @@ describe('generateApprovalExplanation', () => {
 })
 
 describe('answerApprovalQuestion', () => {
-  it('returns free-form text and accepts session history', async () => {
+  const answerJson = (over: Record<string, string> = {}): string => JSON.stringify({
+    issue: 'CONTROL REPOSITORY 注記のあるファイルを変更してよいかが論点です。',
+    policyView: 'triggeredRules は git_commit のCEO承認要求のみで、Safety Boundary変更は含まれません。',
+    fileVerdict: '渡された事実の範囲では、変更対象は allowedPaths 内の2ファイルです。',
+    recommendation: 'approve',
+    recommendationReason: 'review は承認、test は全てパスしています。',
+    missingInformation: 'なし',
+    ...over,
+  })
+
+  it('CEOが判断できる項目を平文で返す（生テキストをそのまま返さない）', async () => {
     const result = await answerApprovalQuestion(
       createContext('+exact'),
-      '失敗するとどうなりますか？',
+      'この変更を承認してよいですか？',
       [{ role: 'user', content: '本番影響はありますか？' }],
-      { mockResponse: '変更はまだ承認前なので、本番には反映されていません。' },
+      { mockResponse: answerJson() },
     )
 
-    expect(result).toEqual({
-      ok: true,
-      answer: '変更はまだ承認前なので、本番には反映されていません。',
-    })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.answer).toContain('【何が問題か】')
+    expect(result.answer).toContain('【Safety Policy上の扱い】')
+    expect(result.answer).toContain('【今回の変更について】')
+    expect(result.answer).toContain('【推奨】承認してよい')
+    expect(result.answer).toContain('【足りない情報】')
+  })
+
+  it('hold のときは既存の PL / CLI へ回す案内を添える（新しいチャット口を案内しない）', async () => {
+    const result = await answerApprovalQuestion(
+      createContext('+exact'),
+      'CONTROL REPOSITORY と allowedPaths の矛盾について教えて',
+      [],
+      {
+        mockResponse: answerJson({
+          recommendation: 'hold',
+          missingInformation: 'ALWAYS_FORBIDDEN_PATTERNS に当該ファイルが含まれるかの確認',
+        }),
+      },
+    )
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.answer).toContain('【推奨】保留')
+    expect(result.answer).toContain('PL（CLIセッション）')
+  })
+
+  it('tool call / 内部プロンプトが返ってきたら、表示せず失敗として扱う（2026-09-15 production 実測）', async () => {
+    // 実際に CEO の画面へ出てしまった形。整形して見せるのではなく、出さない。
+    const leaked = '<tool_call>\n<function>\n<parameter>Search for any files related to "Safety Boundary"</parameter>\n</function>\n</tool_call>'
+
+    const raw = await answerApprovalQuestion(
+      createContext('+exact'),
+      'この変更を承認してよいですか？',
+      [],
+      { mockResponse: leaked },
+    )
+    expect(raw.ok).toBe(false)
+
+    // 形は合っているが本文に内部表現が紛れ込んだ場合も落とす
+    const smuggled = await answerApprovalQuestion(
+      createContext('+exact'),
+      'この変更を承認してよいですか？',
+      [],
+      { mockResponse: answerJson({ issue: '調査します <tool_call><function>search</function></tool_call>' }) },
+    )
+    expect(smuggled.ok).toBe(false)
   })
 
   it('returns a failure result when no API key is configured', async () => {

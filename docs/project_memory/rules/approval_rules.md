@@ -71,6 +71,34 @@ CEO はこの変更を承認したが、**承認要件そのものを省略す�
 この6点が崩れる変更は、`resume_task` の Gate 構成を戻すこと（= up-front `approval_gate` の復活）を
 検討する合図である。
 
+## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
+
+**「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を
+確認したうえで統合判断する。ただし**種類によって PL の権限が違う**。
+
+### 通常の品質・設計 finding — PL が統合判断してよい
+
+PL が事実に照らして妥当性を評価し、**変更する / 変更しない**を決めてよい。
+変更しないと決めた場合は**根拠を残す**（どの事実によってその finding が解消済み・非該当なのか）。
+「Reviewer の指摘だから」も「PL が納得しないから」も、それ単独では理由にならない。
+
+### Binding Review に関わる finding — PL は評価できるが BLOCK を override できない
+
+対象: **Safety Boundary / Authority / protected file** に関わるもの。
+
+- PL は内容の妥当性を**評価してよい**（事実として正しいか、影響範囲はどこか）
+- しかし **PL 自身が BLOCK を override してはならない**
+- **AI が自分の権限を広げる形で解決してはならない。** 「この制約は不要だから外す」は PL の判断範囲外である
+- Safety Boundary 変更に当たるなら **CEO へ Escalate する**
+
+### PL と Binding Reviewer の意見が割れた場合
+
+次の順で再評価する。PL の一存で終わらせない。
+
+1. **Second Independent Review**（別 provider の独立レビュー）
+2. **Meta Review**
+3. 必要なら **CEO Escalation**
+
 ## CEOの承認が必要（Yellow Zone）
 
 以下の場合のみCEOに通知・承認を求める。
