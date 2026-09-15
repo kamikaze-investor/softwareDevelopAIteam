@@ -42,7 +42,7 @@ import { appendObservationLog } from './approvalLevel/observationLog.js'
 import { resolveCommand } from './commandResolver.js'
 import { buildTargetCommandEnv } from './utils/safeEnv.js'
 import { ALWAYS_FORBIDDEN_PATTERNS, fileChangeGuard } from './guards/fileChangeGuard.js'
-import type { RuntimeTaskPolicy } from './guards/fileChangeGuard.js'
+import type { FileGuardResult, RuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import {
   ChangeDetectionError,
   FINGERPRINT_ABSENT,
@@ -943,7 +943,12 @@ export async function runJob(
       exitCode: 1,
       stdout: '',
       stderr: withCleanupNote(
-        `File Change Guard blocked (stage A): ${stageAGuard.violations.join(', ')}`,
+        withLeadingNote(
+          // 列挙も sanitize / 有界化する。パス名に改行が混ざると**偽の診断行**が作れてしまう
+          // （Independent Review 指摘・2026-09-15）。
+          `File Change Guard blocked (stage A): ${summarizeGuardDetailItems(stageAGuard.violations, GUARD_DETAIL_MAX_VIOLATIONS)}`,
+          formatGuardBlockNote(stageAGuard, policy.allowedPaths),
+        ),
         workspaceCleanupNote,
       ),
       changedFiles: stageAManifest.paths,
@@ -1260,7 +1265,13 @@ export async function runJob(
       preManifest.paths,
     )
     // saveJobLogs より前に連結するため、警告は永続化される Job ログにも残る。
-    stderr = withCleanupNote(stderr, workspaceCleanupNote)
+    // Stage A と同じく、**なぜ止まったか**も stderr に残す（表示のみ。判定は変えていない）。
+    // **先頭**へ置く。provider の出力が長いと、末尾へ足した診断は
+    // `saveJobLogs()` のプレビュー切り詰め（4000字）で消える（Independent Review 指摘）。
+    stderr = withCleanupNote(
+      withLeadingNote(stderr, formatGuardBlockNote(fileGuard, policy.allowedPaths)),
+      workspaceCleanupNote,
+    )
   }
 
   // 最終成果に対する secret / diff 検査と Risk 検査
@@ -1449,6 +1460,101 @@ export async function revertBlockedJobChanges(
 /** 後始末の結果（スキップ・部分失敗）を Job 結果のメッセージへ連結する */
 function withCleanupNote(base: string, note: string | undefined): string {
   return note === undefined ? base : `${base}\n[jobRunner] ${note}`
+}
+
+/**
+ * 診断1件あたりに並べる項目数と、1項目の長さの上限。
+ *
+ * **`withLeadingNote()` の 300 字上限に収まる大きさ**にしてある。収まらないと注記側で
+ * 切り落とされ、肝心の `allowedPaths` が消える（Independent Review 指摘・2026-09-15）。
+ */
+/**
+ * 診断の予算配分。**`withLeadingNote()` の 300 字上限に必ず収まる**ように決めてある。
+ *
+ * 収まらないと注記側で末尾から切られ、**肝心の `allowedPaths` が消える**
+ * （Independent Review 指摘・2026-09-15）。そのため
+ *   - 違反は**先頭1件**だけ全文に近い形で出し、残りは件数だけ
+ *   - パスと理由は**別々に**切る（連結してから切ると、長いファイル名が理由を食い潰す）
+ *   - `allowedPaths` は2件まで
+ * とし、最悪ケースでも「なぜ止まったか」と「どこなら許されるか」が1件ずつ必ず残る。
+ *
+ * 最悪長（切り詰め記号 `…` の1字と4桁の件数まで見込む）:
+ *   "File Change Guard blocked. Why: "(32) + (41 + 3 + 41 + " (+9999 more)"=13)
+ *   + ". allowedPaths scope (other guard rules also apply): "(53) + (41 + 2 + 41 + 13)
+ *   = 280 字 ≦ 300。
+ */
+const GUARD_DETAIL_MAX_VIOLATIONS = 1
+const GUARD_DETAIL_MAX_ALLOWED = 2
+const GUARD_DETAIL_MAX_ITEM_LENGTH = 40
+
+const CONTROL_CHARACTER_PLACEHOLDER = '?'
+
+function isControlCharacter(ch: string): boolean {
+  const code = ch.charCodeAt(0)
+  return code < 0x20 || code === 0x7f
+}
+
+/**
+ * 改行・制御文字を潰し、長さも切る。
+ *
+ * パス名に混入した改行で**偽の診断行を作らせない**ため（Independent Review 指摘・2026-09-15）。
+ */
+function sanitizeGuardDetailItem(value: string): string {
+  const flattened = Array.from(value, (ch) => (isControlCharacter(ch) ? CONTROL_CHARACTER_PLACEHOLDER : ch)).join('')
+  return flattened.length <= GUARD_DETAIL_MAX_ITEM_LENGTH
+    ? flattened
+    : `${flattened.slice(0, GUARD_DETAIL_MAX_ITEM_LENGTH)}…`
+}
+
+function summarizeGuardDetailItems(items: readonly string[], limit: number): string {
+  if (items.length === 0) return '(none)'
+  const shown = items.slice(0, limit).map(sanitizeGuardDetailItem)
+  const rest = items.length - shown.length
+  return rest > 0 ? `${shown.join(', ')} (+${rest} more)` : shown.join(', ')
+}
+
+/**
+ * File Change Guard が止めた理由を、**運用者がそのまま読める1行**にする。
+ *
+ * `File Change Guard blocked (stage A): test.js` だけだと「`test.js` が禁止されている」と読める。
+ * 実際には **`task.allowedPaths` がどの changedFile とも一致しない**ことが多い。
+ * 2026-09-11 の production 実測（`allowed_paths=["/workspace/target/test.js"]` /
+ * `changed_files=["test.js"]`）では CEO・AI の双方がこれを誤読し、調査時間を要した。
+ *
+ * per-file の理由は Guard が既に計算しており（`FileGuardResult.reasons`）、`console.error` へは
+ * 出ていたが **Job の stderr（CEO が Mobile で見る場所）に入っていなかった**。ここで載せる。
+ *
+ * **先頭注記として置く。** stderr の末尾へ足すと、provider の出力が長いときに
+ * `saveJobLogs()` のプレビュー切り詰め（4000字）で診断ごと消える。
+ *
+ * **Guard の判定基準は一切変えていない。** 追加しているのは表示だけで、
+ * 許可も禁止も、どのファイルが通るかも変わらない。
+ */
+function formatGuardBlockNote(
+  guard: Pick<FileGuardResult, 'violations' | 'reasons'>,
+  allowedPaths: readonly string[],
+): string {
+  // **パスと理由を別々に切る。** 連結してから切ると、長いファイル名が理由を丸ごと食い潰し、
+  // 「なぜ止まったか」が消える（Independent Review 指摘・2026-09-15）。
+  const shownViolations = guard.violations.slice(0, GUARD_DETAIL_MAX_VIOLATIONS).map((file) => {
+    const path = sanitizeGuardDetailItem(file)
+    const reason = sanitizeGuardDetailItem(guard.reasons[file] ?? 'blocked')
+    return `${path} — ${reason}`
+  })
+  const restViolations = guard.violations.length - shownViolations.length
+  const blocked = shownViolations.length === 0
+    ? '(none)'
+    : restViolations > 0
+      ? `${shownViolations.join(', ')} (+${restViolations} more)`
+      : shownViolations.join(', ')
+
+  const allowed = allowedPaths.length > 0
+    ? summarizeGuardDetailItems(allowedPaths, GUARD_DETAIL_MAX_ALLOWED)
+    : '(empty - so this is NOT an allowedPaths mismatch)'
+
+  // 「only these are permitted」とは書かない。allowedPaths 内でも traversal / forbiddenPaths /
+  // always-forbidden などで拒否されうるため、言い過ぎになる（Independent Review 指摘）。
+  return `File Change Guard blocked. Why: ${blocked}. allowedPaths scope (other guard rules also apply): ${allowed}`
 }
 
 /** 先頭注記1件あたりの上限。注記が複数重なってもプレビューから押し出されないようにする。 */
@@ -1646,6 +1752,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
   let riskScan: ReturnType<typeof scanTargetProjectRisk> | undefined
   let workspaceState: JobRunResult['workspaceState']
   let workspaceCleanupNote: string | undefined
+  let guardBlockNote: string | undefined
   try {
     const inspection = buildFinalInspection(
       input.workingDir,
@@ -1662,6 +1769,8 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
       console.error(
         `[jobRunner] AI CLI 失敗後にも Guard 違反が残っています: ${JSON.stringify(guard.reasons)}`,
       )
+      // Stage A と同じく、**なぜ止まったか**を stderr にも残す（表示のみ。判定は変えていない）。
+      guardBlockNote = formatGuardBlockNote(guard, input.policy.allowedPaths)
       // blocked へ変換される結果と同じ扱い。残置すると次の Job の File Change Guard
       // （HEAD との差分）がこの失敗 Job の変更で汚染されるため取り消す。
       workspaceCleanupNote = await revertBlockedJobChanges(
@@ -1693,10 +1802,14 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     status: 'failed',
     exitCode: input.exitCode,
     stdout: input.stdout,
-    stderr:
-      workspaceCleanupNote === undefined
+    stderr: ((): string | undefined => {
+      // 診断は**先頭**へ置く（末尾だとプレビュー切り詰めで消える）。
+      const base = guardBlockNote === undefined
         ? input.stderr
-        : withCleanupNote(input.stderr ?? '', workspaceCleanupNote),
+        : withLeadingNote(input.stderr ?? '', guardBlockNote)
+      if (workspaceCleanupNote === undefined) return base
+      return withCleanupNote(base ?? '', workspaceCleanupNote)
+    })(),
     stdoutPath: input.stdoutPath,
     stderrPath: input.stderrPath,
     changedFiles: manifest.paths,

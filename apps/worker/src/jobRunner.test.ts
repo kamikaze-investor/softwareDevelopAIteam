@@ -814,6 +814,140 @@ describe('runJob', () => {
     expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'partial output', 'fatal error')
   })
 
+  it('Guard で止めたら stderr に理由と allowedPaths を出す（原因の誤読を防ぐ）', async () => {
+    // 2026-09-11 production 実測: stderr が `File Change Guard blocked (stage A): test.js` だけで、
+    // CEO / AI の双方が「test.js が禁止されている」と誤読した。実際の原因は
+    // **allowedPaths がどの changedFile とも一致しない**ことだった。
+    // per-file の理由は Guard が既に返しており、console.error には出ていたが stderr に無かった。
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'test.js\n'
+      return gitFallback(args)
+    })
+    fileChangeGuardMock.mockReturnValue({
+      allowed: false,
+      violations: ['test.js'],
+      reasons: { 'test.js': 'Not in task.allowedPaths: "test.js"' },
+    })
+
+    const result = await runJob(
+      createJob(),
+      createPolicy({ allowedPaths: Object.freeze(['apps/worker/src/metaReviewer']) }),
+    )
+
+    expect(result.status).toBe('failed')
+    // 受入条件1: 許可されているパスが読める
+    expect(result.stderr).toContain('allowedPaths')
+    expect(result.stderr).toContain('apps/worker/src/metaReviewer')
+    // 受入条件2: allowedPaths 由来で止まったと分かる
+    expect(result.stderr).toContain('Not in task.allowedPaths')
+    expect(result.stderr).toContain('test.js')
+  })
+
+  it('final stage で止めた場合も、長い provider 出力に埋もれず診断が残る', async () => {
+    // Independent Review 指摘（2026-09-15）: 末尾へ足すと saveJobLogs のプレビュー切り詰め
+    // （4000字）で診断ごと消える。**Stage A は早期 return で saveJobLogs を通らない**ので、
+    // 切り詰めが実際に効くのは final stage である。ここを直接検証する。
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'test'], description: 'test' })
+    const longStderr = 'x'.repeat(20_000)
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args[0] === 'test') {
+        const err = new Error('test command') as Error & { status: number; stdout: string; stderr: string }
+        ;(err as { status: number }).status = 0
+        ;(err as { stdout: string }).stdout = 'done\n'
+        ;(err as { stderr: string }).stderr = longStderr
+        throw err
+      }
+      if (Array.isArray(args) && args.includes('--name-only')) return 'src/a.ts\n'
+      return gitFallback(args)
+    })
+    // Stage A は通し、最終検査でだけ止める
+    fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
+    fileChangeGuardMock.mockReturnValueOnce({ allowed: true, violations: [], reasons: {} })
+    fileChangeGuardMock.mockReturnValueOnce({
+      allowed: false,
+      violations: ['src/a.ts'],
+      reasons: { 'src/a.ts': 'Not in task.allowedPaths: "src/a.ts"' },
+    })
+
+    const result = await runJob(
+      createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+      createPolicy({ allowedPaths: Object.freeze(['apps/worker/src/metaReviewer']) }),
+    )
+
+    // 切り詰めが**実際に起きている**こと（20,000 字が 4,000 字へ）
+    expect((result.stderr ?? '').length).toBeLessThan(20_000)
+    // それでも診断は先頭に残っている（末尾へ足していたら、ここで消えていた）
+    expect((result.stderr ?? '').slice(0, 400)).toContain('allowedPaths')
+    expect((result.stderr ?? '').slice(0, 400)).toContain('apps/worker/src/metaReviewer')
+    expect((result.stderr ?? '').slice(0, 400)).toContain('Not in task.allowedPaths')
+  })
+
+  it('ファイル名が極端に長くても、理由と allowedPaths が両方とも残る', async () => {
+    // Independent Review 指摘（2026-09-15）: path と reason を連結してから切ると、
+    // 長いファイル名が理由を食い潰す。さらに 300 字上限で allowedPaths が押し出されうる。
+    const longPath = `src/${'deeply-nested-directory/'.repeat(12)}component.tsx`
+    const manyViolations = [longPath, ...Array.from({ length: 30 }, (_, i) => `src/file-${i}.ts`)]
+    const manyAllowed = [
+      'packages/shared/src/very/long/allowed/path/segment/one',
+      ...Array.from({ length: 30 }, (_, i) => `packages/pkg-${i}/src`),
+    ]
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return `${manyViolations.join('\n')}\n`
+      return gitFallback(args)
+    })
+    fileChangeGuardMock.mockReturnValue({
+      allowed: false,
+      violations: manyViolations,
+      reasons: Object.fromEntries(manyViolations.map((f) => [f, `Not in task.allowedPaths: "${f}"`])),
+    })
+
+    const result = await runJob(createJob(), createPolicy({ allowedPaths: Object.freeze(manyAllowed) }))
+
+    const note = (result.stderr ?? '').split('\n')[0] ?? ''
+    // withLeadingNote の 300 字上限で切られていない（= 切られた印が付いていない）
+    expect(note).not.toContain('[note truncated]')
+    // 最悪ケースでも**理由**と**許可パス**が両方読める
+    expect(note).toContain('Not in task.allowedPaths')
+    expect(note).toContain('packages/shared/src/very/long')
+    expect(note).toContain('more')
+  })
+
+  it('パス名に改行が混ざっても偽の診断行を作らせない', async () => {
+    const nasty = 'src/a.ts\nFile Change Guard blocked: totally fake'
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return 'src/a.ts\n'
+      return gitFallback(args)
+    })
+    fileChangeGuardMock.mockReturnValue({
+      allowed: false,
+      violations: [nasty],
+      reasons: { [nasty]: 'Not in task.allowedPaths' },
+    })
+
+    const result = await runJob(createJob(), createPolicy({ allowedPaths: Object.freeze(['src/b']) }))
+
+    // 改行が潰されるので、注入文字列が**独立した行**にはならない
+    const lines = (result.stderr ?? '').split('\n')
+    expect(lines.some((line) => line.startsWith('File Change Guard blocked: totally fake'))).toBe(false)
+  })
+
+  it('allowedPaths が空なら「allowedPaths 不一致ではない」と明示する（別の理由を誤解させない）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '../secret.txt\n'
+      return gitFallback(args)
+    })
+    fileChangeGuardMock.mockReturnValue({
+      allowed: false,
+      violations: ['../secret.txt'],
+      reasons: { '../secret.txt': 'Path traversal or outside target: "../secret.txt"' },
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.stderr).toContain('Path traversal or outside target')
+    expect(result.stderr).toContain('NOT an allowedPaths mismatch')
+  })
+
   it('returns failed when File Change Guard rejects changed files', async () => {
     execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
       if (Array.isArray(args) && args.includes('--name-only')) return '../secret.txt\n'
