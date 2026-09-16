@@ -44,6 +44,10 @@ export interface RoadmapCandidate {
   id: string
   title: string
   state: string
+  /** ledger 本文の先頭。title だけでは「何の作業か」が分からないため付ける。 */
+  bodyPreview: string
+  /** ledger の metadata 行に `priority=high` があるか。既存表記をそのまま読む。 */
+  highPriority: boolean
 }
 
 export interface PlAdoptionProposal {
@@ -77,10 +81,15 @@ export function resolveLedgerPath(): string {
  * 採用候補を ledger から読む。**done は候補にしない。**
  * 既存 parser をそのまま使い、新しい抽出責務を足さない。
  */
+/** ledger の行分割。改行コードは環境差があるため LF で切り、行末 CR は下流で吸収する。 */
+const LINE_SEPARATOR = String.fromCharCode(10)
+
 export function readAdoptionCandidates(
   readLedger: () => string = () => readFileSync(resolveLedgerPath(), 'utf-8'),
 ): RoadmapCandidate[] {
-  return getValidRoadmapItems(readLedger())
+  const ledger = readLedger()
+  const lines = ledger.split(LINE_SEPARATOR)
+  return getValidRoadmapItems(ledger)
     // **`planned` だけを候補にする。** 既存の `state=`（planned / in_progress / blocked /
     // deferred / done）をそのまま可否の正本として使う。新しい state 体系は作らない。
     //
@@ -89,8 +98,65 @@ export function readAdoptionCandidates(
     // 事実上無かった。`in_progress` / `blocked` も、着手済み・停止中のものを重ねて採用する
     // 意味が無いので候補から外す。
     .filter((item) => item.state === 'planned')
-    .map((item) => ({ id: item.id, title: item.title.replace(/\*\*/g, '').slice(0, 90), state: item.state }))
-    .slice(0, PL_ADOPTION_CANDIDATE_LIMIT)
+    .map((item) => ({
+      id: item.id,
+      title: item.title.replace(/\*\*/g, '').slice(0, 90),
+      state: item.state,
+      bodyPreview: extractBodyPreview(lines, item.checkboxLineIndex),
+      // `priority=high` は ledger の metadata 行に既にある表記。parser へ責務を足さず行を直接読む。
+      highPriority: (lines[item.metadataLineIndex] ?? '').includes('priority=high'),
+    }))
+  // **ここでは切らない。** 絞り込みは `selectAdoptionCandidates()` の責務である。
+}
+
+/**
+ * checkbox 行から次の roadmap metadata 行の手前までを本文とみなし、先頭だけ返す。
+ *
+ * `buildAdoptedDescription()`（`ctoAi/roadmapAdoption.ts`）と**同じ切り出し方**である。
+ * parser へ新しい抽出責務を足さないため、既存の行 index をそのまま使う。
+ */
+function extractBodyPreview(lines: readonly string[], checkboxLineIndex: number): string {
+  const body: string[] = []
+  for (let i = checkboxLineIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i] ?? ''
+    if (line.includes('<!-- roadmap:id=')) break
+    body.push(line)
+  }
+  const flattened = body.join(' ').replace(/\s+/g, ' ').trim()
+  return flattened.length <= CANDIDATE_BODY_PREVIEW_CHARS
+    ? flattened
+    : `${flattened.slice(0, CANDIDATE_BODY_PREVIEW_CHARS)}…`
+}
+
+/**
+ * 実際に PL へ提示する候補を選ぶ。
+ *
+ * **問題**: planned が上限（現在40）を超えると、`.slice(0, limit)` では ledger 後方の項目が
+ * **一度も PL に提示されない**。2026-09-16 実測で planned 55件に対し **15件が恒久的に不可視**で、
+ * その中に今回の原因項目 `adoption-does-not-check-implementation-feasibility` 自身も含まれていた。
+ *
+ * **単純に上限を上げない**（本文を載せるぶん prompt が膨らむため）。代わりに:
+ *   1. `priority=high` は**常に載せる**（CEO が優先度を付けた意味を失わせない）
+ *   2. 残り枠は**回転窓**で埋める。窓は採用サイクルごとにずれるので、
+ *      **すべての planned 項目がいずれ候補になる**
+ *
+ * 回転位置は呼び出し側が既存 `audit_log` の採用試行回数から渡す。**新しい state は持たない。**
+ */
+export function selectAdoptionCandidates(
+  all: readonly RoadmapCandidate[],
+  limit: number,
+  rotationOffset: number,
+): RoadmapCandidate[] {
+  if (all.length <= limit) return [...all]
+
+  const high = all.filter((c) => c.highPriority)
+  const rest = all.filter((c) => !c.highPriority)
+  const slots = Math.max(0, limit - high.length)
+  if (slots === 0 || rest.length === 0) return high.slice(0, limit)
+
+  const start = ((rotationOffset % rest.length) + rest.length) % rest.length
+  const rotated = [...rest.slice(start), ...rest.slice(0, start)]
+  return [...high, ...rotated.slice(0, slots)]
 }
 
 /**
@@ -136,12 +202,49 @@ export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefin
   }
 }
 
+/**
+ * 採用判断のために PL が知っておくべき**固定の事実**。
+ *
+ * 2026-09-15 の production 事故: PL は `id — state — title` しか渡されておらず、
+ * `mobile-approval-role-docs — 2種類の承認の役割整理とMobile導線設計` という1行から
+ * **存在しない `docs/approval-roles` を allowedPaths として創作**した。実際の正本は
+ * `docs/project_memory/rules/approval_rules.md` だった。
+ * **PL の能力不足ではなく、判断材料が無かった。**
+ *
+ * ここに置くのは「毎回変わらない小さな地図」だけである。**Repository 全体や Finding 全件を
+ * prompt へ入れない**（Design Philosophy: Context 重視 / 必要な情報だけ渡す）。
+ * 個々の Task の詳細は、実装時に現物を確認する側の責務とする。
+ */
+const ADOPTION_REPOSITORY_MAP = [
+  'Where things actually live (verify against the repository before you decide):',
+  '- Approval / development rules -> docs/project_memory/rules/',
+  '- Decision history, operational E2E records, lessons -> docs/project_memory/decisions/',
+  '- Project goal and design philosophy (synced views) -> docs/project_memory/goal.md, design_philosophy.md',
+  '- Roadmap ledger (the source of truth for what is open) -> tasks/roadmap.md',
+  '- PL loop, gates, state API, design review, storage -> apps/api/src/',
+  '- Job execution, guards, meta review, notifier, AI CLI adapters -> apps/worker/src/',
+  '- Shared types and the PL action policy -> packages/shared/src/',
+  '- Mobile app -> apps/mobile/',
+  '',
+  'You cannot write these no matter what allowedPaths says:',
+  '- apps/worker/src/guards/** (file change guard, safety auditor, alignment checker, gate policy)',
+  '- apps/worker/src/jobRunner.ts, apps/worker/src/index.ts',
+  '- apps/worker/src/utils/safeEnv.ts, apps/worker/src/utils/apiAuth.ts',
+  '- .env and any secret material',
+  'An item that needs those is not implementable here; say so in rationale and pick another item.',
+].join('\n')
+
 export const ADOPTION_SYSTEM_PROMPT = [
   'You are the Project Lead (PL). The project finished its current task and needs the next one.',
   'Choose exactly ONE item from the roadmap ledger below and specify how to execute it.',
   '',
   'Rules you cannot change:',
   '- You may only choose an id from the provided list. Anything else is refused.',
+  '- **Never invent a path.** Do not derive allowedPaths from the item title. Decide it in this order:',
+  '  read the item body -> recall where that kind of thing already lives (map below) ->',
+  '  pick the narrowest existing directory that actually holds it -> check it is not forbidden.',
+  '  If the body names a concrete file or directory, that is your answer.',
+  '  A path you cannot point to in the repository is wrong, even if the name sounds right.',
   '- Prefer items that are small, safe and independent. Avoid items that touch safety guards,',
   '  production infrastructure, secrets, or that depend on unfinished work.',
   '- allowedPaths decides where the implementer may write. Keep it as narrow as the item allows;',
@@ -150,15 +253,43 @@ export const ADOPTION_SYSTEM_PROMPT = [
   '  ledger item contains several sub-items.',
   '- acceptanceCriteria must be mechanically checkable statements.',
   '',
+  '',
+  ADOPTION_REPOSITORY_MAP,
+  '',
   'Answer with a single JSON object and nothing else:',
   '{"roadmapId": "...", "implementationScope": "...", "allowedPaths": ["..."],',
   ' "acceptanceCriteria": ["..."], "rationale": "one sentence"}',
 ].join('\n')
 
-export function buildAdoptionPrompt(candidates: readonly RoadmapCandidate[]): string {
+/** 候補1件あたりに載せる本文の長さ。全文を載せると ledger 全体（20万字超）になるため切る。 */
+const CANDIDATE_BODY_PREVIEW_CHARS = 200
+
+/**
+ * 採用判断用の user prompt。
+ *
+ * **title だけでは何の作業か分からない。** 2026-09-15 の事故では
+ * `mobile-approval-role-docs — 2種類の承認の役割整理とMobile導線設計` の1行から
+ * PL が存在しない path を創作した。本文の先頭を添えると「既存の承認ルール文書へ追記する話」だと
+ * 読めるようになる。**全文は載せない**（planned 全件で20万字を超えるため）。
+ *
+ * Goal は「どの項目を選ぶか」の判断に効くので短い要約を先頭へ置く。
+ * Design Philosophy 全文は載せず、採用判断に効く原則だけを system prompt 側へ固定してある。
+ */
+export function buildAdoptionPrompt(
+  candidates: readonly RoadmapCandidate[],
+  projectGoal?: string,
+): string {
+  const goalSection = projectGoal !== undefined && projectGoal.trim() !== ''
+    ? ['Project goal (what all of this is for):', projectGoal.trim().slice(0, 600), '']
+    : []
+
   return [
-    'Roadmap items still open (id — state — title):',
-    ...candidates.map((c) => `- ${c.id} — ${c.state} — ${c.title}`),
+    ...goalSection,
+    'Roadmap items still open. Read the body, not just the title:',
+    ...candidates.flatMap((c) => [
+      `- ${c.id} — ${c.state}${c.highPriority ? ' — PRIORITY:HIGH' : ''} — ${c.title}`,
+      c.bodyPreview === '' ? '  (no body)' : `  ${c.bodyPreview}`,
+    ]),
   ].join('\n')
 }
 
@@ -193,13 +324,24 @@ export async function runAdoptionStep(
       .filter((task) => task.roadmapTaskKey !== undefined && storage.jobs.findByTaskId(task.id).length > 0)
       .map((task) => task.roadmapTaskKey as string),
   )
-  const candidates = readAdoptionCandidates(deps.readLedger)
+  const open = readAdoptionCandidates(deps.readLedger)
     .filter((candidate) => !executedKeys.has(candidate.id))
-  if (candidates.length === 0) {
+  if (open.length === 0) {
     return { status: 'no_candidate', reason: 'no open roadmap item in the ledger' }
   }
 
-  const raw = await deps.propose(ADOPTION_SYSTEM_PROMPT, buildAdoptionPrompt(candidates))
+  // 回転位置は**既存 `audit_log` の採用試行回数**から取る。新しい state は持たない。
+  // これにより、上限を超える planned 項目もサイクルを跨げばいずれ候補に載る。
+  const rotationOffset = storage.auditLog
+    .findByEntity('pl_loop_target', `adopt:${projectId}`)
+    .length
+  const candidates = selectAdoptionCandidates(open, PL_ADOPTION_CANDIDATE_LIMIT, rotationOffset)
+
+  const projectGoal = storage.projects.findById(projectId)?.goal
+  const raw = await deps.propose(
+    ADOPTION_SYSTEM_PROMPT,
+    buildAdoptionPrompt(candidates, projectGoal),
+  )
   const proposal = parseAdoptionProposal(raw)
   if (!proposal) {
     return { status: 'proposal_unusable', reason: 'PL did not produce a complete adoption proposal' }
