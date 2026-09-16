@@ -4715,6 +4715,24 @@ worktree と別 repository は採らない。
       **最小案**: resume 分岐でも `ensureInitialWorkflowsForActiveTasks()` を呼ぶ。
       **Project lifecycle の変更**なので Independent Review 必須。
 
+      **(4) 上限を超えた planned 項目が PL へ一度も提示されない** — 2026-09-16 実測・登録。
+      **【同日対応済み。単純な上限引き上げはしていない】**
+
+      `PL_ADOPTION_CANDIDATE_LIMIT = 40` に対し planned が **55件**あり、`.slice(0, 40)` で
+      ledger 後方の **15件が恒久的に不可視**だった。その中には今回の原因項目
+      `adoption-does-not-check-implementation-feasibility` 自身、
+      `reconcile-evidence-not-fully-machine-verified`、`control-repository-header-vs-enforced-guard`、
+      `chatgpt-mcp-inspect`、`operator-chat-mobile` 等が含まれていた。
+      **PL がいくら正しく判断しても、見えない項目は選べない。**
+
+      CEO 指示（2026-09-16）により上限を上げるだけの対処はしない（本文を載せるぶん prompt が
+      膨らむため）。既存情報だけで解いた:
+      - **`priority=high` は常に提示する**（ledger の既存表記をそのまま読む。CEO が付けた優先度を失わせない）
+      - 残り枠は**回転窓**で埋める。回転位置は**既存 `audit_log` の採用試行回数**から取るので、
+        **新しい state を持たずに全 planned 項目がいずれ候補になる**
+      - **新しい selection subsystem は作っていない**（`selectAdoptionCandidates()` は
+        既存 candidate 生成の内側の純粋関数）
+
       **(3) アプリ（Mobile）から追加された Task が採用経路の入口に無い** — 2026-09-15 実測・登録。
       production DB で確認: `POST /api/tasks` で作られた Task `3d8878e9`（「copilotのモデル指定」/
       Project `bb509fee`）は `roadmap_active=0` / `roadmapTaskKey=null` のまま、Job も Design Review run も
@@ -6593,6 +6611,27 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
      「Meta Reviewer AI は CLI ではなく API を使う」と規定したまま、実装が `preferCli: true` へ
      変わったことを記録していない
 
+   **【2026-09-16: Goal / Design Philosophy / `CLAUDE.md` §7 を本項目の範囲として処理した】**
+
+   read-only 調査で、**Project 固有の Goal と Design Philosophy が2系統あり内容が違う**ことが判明した。
+   どちらも**生きていて別々の消費者が読んでいた**:
+   - **Project レコード**（`projects.goal` / `projects.designPhilosophy`）… Roadmap 生成・Project 定義分析が読む。
+     CEO-authored の15原則と4点 Goal が入っている
+   - **`docs/project_memory/goal.md` / `design_philosophy.md`** … `contextManager.ts` が
+     **実装 AI へ渡る Context Pack** として読む。2026-05-28 の旧 Mission と旧8原則のまま
+
+   CEO 指示（2026-09-16）に従い、**正本を Project レコードへ一本化**し、
+   2つの Markdown は**独立した正本ではなく同期された View** として扱う形に直した
+   （先頭に「正本は Project レコード。食い違ったら Project レコードを正とする」と明記）。
+   **新しい Roadmap item は作っていない。**
+
+   併せて **`CLAUDE.md` §7 の stale な事実記述**を実体へ同期した（CEO が限定承認）。
+   §7 は存在しない `features/` と `lessons_learned/` を正式 home として記載し、
+   **実在する `specs/` を記載していなかった**。実物を確認して置き換え、
+   Lessons は実際の置き場である `decisions/` に集約すると明記した。
+   **Design Philosophy / Safety Boundary / Authority / Approval / Gate / Guard 要件は変更していない。**
+   原則の追加・削除もしていない。事実記述の同期のみである。
+
    **本項目でやらないこと（明記）**: **新しい Review / Gate / Workflow / doc-lint 基盤を追加しない。**
    「文書更新を強制する新しいゲート」を作ると、それ自体が次の二重正本になる。
 
@@ -7594,6 +7633,26 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 8. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
       2026-09-15登録（production 実測）。CEO 指示により**既存 adoption / Design Review /
       PL diagnosis の改善候補**として記録する。
+
+      **【2026-09-16: 予防側を実施した。検出側（validation）はまだ入れていない】**
+
+      read-only 調査で**真因が判明した。PL の能力不足ではなく、判断材料が無かった。**
+      `buildAdoptionPrompt()` が PL へ渡していたのは `id — state — title` だけで、
+      Project Goal・Design Philosophy・**ledger 本文**・Source of Truth・repository の実在構造は
+      **1文字も含まれていなかった**（`ADOPTION_SYSTEM_PROMPT` を grep して0件）。
+      `mobile-approval-role-docs — 2種類の承認の役割整理とMobile導線設計` という1行から
+      `docs/approval-roles` を推測したのは、与えられた情報の範囲では自然な出力である。
+
+      実施した最小改善（**新しい Knowledge system / Context subsystem は作っていない**。
+      既存 `buildAdoptionPrompt()` / `ADOPTION_SYSTEM_PROMPT` の改善のみ）:
+      - 候補に **ledger 本文の先頭200字**を添える（全文は載せない。planned 全件で20万字超）
+      - **Project Goal の要約**（524字）を prompt 先頭へ
+      - **実在する home の小さな地図**と、**allowedPaths を名称から創作するな**という原則
+      - **触れない範囲**（guards / jobRunner / safeEnv / apiAuth / .env）を明示し、
+        採用段階で実装不能な項目を選ばせない
+
+      **CEO 指示により、ここで新しい Gate は追加しない。** まず Operational Evidence を取り、
+      **存在しない path の生成がなお再発する場合のみ**、既存 validation への最小追加を検討する。
 
       **2例目（同日 08:20 頃、実測）**: PL が `mobile-approval-role-docs` を自律採用し、
       `allowedPaths: ["docs/approval-roles"]` を宣言した。実装 AI は実際には

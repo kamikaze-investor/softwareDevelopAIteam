@@ -7,6 +7,10 @@ import type { IStorage } from '../storage/interface'
 import {
   parseAdoptionProposal,
   readAdoptionCandidates,
+  selectAdoptionCandidates,
+  buildAdoptionPrompt,
+  ADOPTION_SYSTEM_PROMPT,
+  type RoadmapCandidate,
   runAdoptionStep,
   type PlAdoptionProposal,
 } from './adoptionStep'
@@ -249,5 +253,87 @@ describe('runAdoptionStep — 実行済みの項目は候補にしない', () =>
     })
 
     expect(offered).toContain('open-item')
+  })
+})
+
+describe('採用 context — PL に判断材料を渡す', () => {
+  // 2026-09-15 事故: PL は `id — state — title` しか渡されておらず、
+  // `mobile-approval-role-docs — 2種類の承認の役割整理とMobile導線設計` の1行から
+  // 存在しない `docs/approval-roles` を創作した。原因は能力ではなく材料不足だった。
+  it('候補には title だけでなく本文の先頭が載る', () => {
+    const ledger = [
+      '# Roadmap', '',
+      '<!-- roadmap:id=approval-docs state=planned -->',
+      '1. [ ] **2種類の承認の役割整理** — 未完了なのは文書化のみ。',
+      '   正本は docs/project_memory/rules/approval_rules.md にある。',
+    ].join('\n')
+
+    const [c] = readAdoptionCandidates(() => ledger)
+
+    expect(c?.bodyPreview).toContain('docs/project_memory/rules/approval_rules.md')
+    expect(buildAdoptionPrompt([c as RoadmapCandidate])).toContain('approval_rules.md')
+  })
+
+  it('本文は先頭だけ。ledger 全文を prompt へ入れない', () => {
+    const long = 'あ'.repeat(5000)
+    const ledger = [
+      '# Roadmap', '',
+      '<!-- roadmap:id=big state=planned -->',
+      '1. [ ] **大きい項目**',
+      '   ' + long,
+    ].join('\n')
+
+    const [c] = readAdoptionCandidates(() => ledger)
+
+    expect((c?.bodyPreview.length ?? 0)).toBeLessThan(260)
+  })
+
+  it('Goal が渡されれば prompt の先頭に載る', () => {
+    const prompt = buildAdoptionPrompt(
+      [{ id: 'x', title: 't', state: 'planned', bodyPreview: 'b', highPriority: false }],
+      'AIteamOS の正式 Roadmap を完遂する。',
+    )
+
+    expect(prompt).toContain('Project goal')
+    expect(prompt).toContain('正式 Roadmap を完遂する')
+  })
+
+  it('system prompt が path 創作を禁じ、実在する home を示す', () => {
+    expect(ADOPTION_SYSTEM_PROMPT).toContain('Never invent a path')
+    expect(ADOPTION_SYSTEM_PROMPT).toContain('docs/project_memory/rules/')
+    // 触れないものも明示する（採用段階で実装不能な項目を選ばせない）
+    expect(ADOPTION_SYSTEM_PROMPT).toContain('apps/worker/src/guards/**')
+  })
+})
+
+describe('selectAdoptionCandidates — 全項目がいずれ候補になる', () => {
+  const make = (id: string, high = false): RoadmapCandidate =>
+    ({ id, title: id, state: 'planned', bodyPreview: '', highPriority: high })
+
+  it('上限以下ならそのまま全件', () => {
+    const all = [make('a'), make('b')]
+    expect(selectAdoptionCandidates(all, 40, 0).map((c) => c.id)).toEqual(['a', 'b'])
+  })
+
+  it('priority=high は回転に関わらず常に載る', () => {
+    const all = [make('h', true), ...Array.from({ length: 10 }, (_, i) => make(`n${i}`))]
+    for (const offset of [0, 1, 5, 9, 100]) {
+      expect(selectAdoptionCandidates(all, 3, offset).map((c) => c.id), `offset ${offset}`).toContain('h')
+    }
+  })
+
+  it('回転により、上限を超える項目もいずれ全部が候補になる', () => {
+    // 2026-09-16 実測: planned 55件 / 上限 40 で 15件が恒久的に不可視だった。
+    const all = Array.from({ length: 10 }, (_, i) => make(`n${i}`))
+    const seen = new Set<string>()
+    for (let offset = 0; offset < 10; offset += 1) {
+      for (const c of selectAdoptionCandidates(all, 3, offset)) seen.add(c.id)
+    }
+    expect(seen.size).toBe(10)
+  })
+
+  it('負の回転位置でも壊れない', () => {
+    const all = Array.from({ length: 5 }, (_, i) => make(`n${i}`))
+    expect(selectAdoptionCandidates(all, 2, -3)).toHaveLength(2)
   })
 })

@@ -124,13 +124,20 @@ Project Memoryは `docs/project_memory/` で管理する。
 
 ```
 docs/project_memory/
-├── goal.md
-├── design_philosophy.md
-├── decisions/        # Decision History (旧ADR)
-├── features/         # Feature Knowledge
-├── rules/            # Operational Knowledge
-└── lessons_learned/  # Lessons Learned
+├── goal.md              # Project Goal の View（正本は Project DB。下記参照）
+├── design_philosophy.md # Design Philosophy の View（正本は Project DB。下記参照）
+├── decisions/           # Decision History（旧ADR）・運用判断・Operational E2E 記録・Lessons
+├── rules/               # Operational Knowledge（承認ルール・開発ルール等）
+└── specs/               # Phase 固有の仕様メモ
 ```
+
+**`goal.md` / `design_philosophy.md` は独立した正本ではない。** Project 固有の Goal と
+Design Philosophy の正本は **Project レコード**（`projects.goal` / `projects.designPhilosophy`）で、
+この2ファイルはそこへ同期された View である（実装 AI へ渡る Context Pack が読む先）。
+内容が食い違っていたら**Project レコード側を正とする**。
+
+**Lessons Learned は `decisions/` に置く。** 専用ディレクトリは作らない
+（判断の記録と学びを別の場所へ分けると、同じ出来事が二重に記録されるため）。
 
 保存する情報: 将来の判断に影響する情報のみ
 保存しない情報: 一時的な会話・実装ログ・使い捨ての思考
