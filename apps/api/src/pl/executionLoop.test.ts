@@ -11,6 +11,7 @@ import {
   extractProposedKind,
   isRecoveryTargetResolved,
   resetPlLoopInFlightForTest,
+  DIAGNOSIS_SYSTEM_FOR_TEST,
   runPlTick,
   verifyOutcome,
   type PlDiagnosisInput,
@@ -800,6 +801,69 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     // PL が選べる候補に sanctioned な復旧と escalation が並ぶ
     expect(seen?.allowedActionKinds).toContain('resume_task')
     expect(seen?.allowedActionKinds).toContain('escalate_to_ceo')
+  })
+
+  it('protected file の違反は allowedPaths の問題と区別して診断へ渡す', async () => {
+    // 2026-09-16 production 実測: PL は fileChangeGuard.ts を触ろうとして止まった Job を
+    // 「mismatched allowed paths … configuration issue」と診断した。**正しく Escalate したが
+    // 分類を外した** — allowedPaths を広げれば通る、と読める。実際には絶対に通らない。
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      guardResult: {
+        permissionAllowed: true,
+        fileChangeAllowed: false,
+        fileViolations: ['apps/worker/src/guards/fileChangeGuard.ts', 'docs/notes.md'],
+      },
+    } as Parameters<IStorage['jobs']['update']>[1])
+    storage.tasks.update(taskId, { status: 'blocked' })
+    let seen: PlDiagnosisInput | undefined
+
+    await runPlTick(storage, deps({
+      diagnose: async (input) => {
+        seen = input
+        return JSON.stringify({ actionKind: 'observe_state', rationale: 'wait', riskLevel: 'LOW' })
+      },
+    }))
+
+    const ctx = JSON.stringify(seen?.context)
+    // 恒久的に書けないものだけが挙がる。scope の問題（docs/notes.md）と混ぜない
+    expect(ctx).toContain('protectedViolations')
+    expect(ctx).toContain('apps/worker/src/guards/fileChangeGuard.ts')
+    const parsed = JSON.parse(ctx) as { blockedJob?: { protectedViolations?: string[] } }
+    expect(parsed.blockedJob?.protectedViolations).toEqual(['apps/worker/src/guards/fileChangeGuard.ts'])
+  })
+
+  it('scope だけの違反なら protectedViolations は空（誤って protected 扱いしない）', async () => {
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      guardResult: { permissionAllowed: true, fileChangeAllowed: false, fileViolations: ['docs/a.md'] },
+    } as Parameters<IStorage['jobs']['update']>[1])
+    storage.tasks.update(taskId, { status: 'blocked' })
+    let seen: PlDiagnosisInput | undefined
+
+    await runPlTick(storage, deps({
+      diagnose: async (input) => {
+        seen = input
+        return JSON.stringify({ actionKind: 'observe_state', rationale: 'wait', riskLevel: 'LOW' })
+      },
+    }))
+
+    const parsed = JSON.parse(JSON.stringify(seen?.context)) as { blockedJob?: { protectedViolations?: string[] } }
+    expect(parsed.blockedJob?.protectedViolations).toEqual([])
+  })
+
+  it('診断 prompt が「protected は allowedPaths では解決しない」と明示する', () => {
+    // 文言そのものを固定する（ここが消えると PL は再び configuration issue と書く）
+    expect(DIAGNOSIS_SYSTEM_FOR_TEST).toContain('permanently forbidden')
+    expect(DIAGNOSIS_SYSTEM_FOR_TEST).toContain('No allowedPaths value can ever permit them')
   })
 
   it('ALIGNED evidence があれば resume を Gate に通し、既存の正式操作で新 Job を作る', async () => {

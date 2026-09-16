@@ -37,6 +37,7 @@ import {
   type CoordinatorDeps,
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
+import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
 import { requestText } from '../aiExplain/cheapAiClient'
 import {
   buildSystemState,
@@ -449,6 +450,22 @@ function collectSystemEvidence(
   return evidence
 }
 
+/**
+ * 違反ファイルのうち、**allowedPaths を直しても絶対に書けない**もの。
+ *
+ * 2026-09-16 production 実測: PL は `fileChangeGuard.ts` を変更しようとして止まった Job を
+ * 「mismatched allowed paths … this configuration issue」と診断した。**正しく Escalate したが
+ * 分類を外した** — allowedPaths を広げれば通る、と読める表現になっている。実際には
+ * `ALWAYS_FORBIDDEN_PATTERNS` に載っているため**どんな allowedPaths でも通らない**。
+ *
+ * 判定は Guard 本体の export をそのまま使う。**一覧を複製しない**（複製すると必ずずれる）。
+ */
+function protectedViolations(fileViolations: readonly string[] | undefined): string[] {
+  return (fileViolations ?? []).filter(
+    (file: string) => ALWAYS_FORBIDDEN_PATTERNS.some((pattern) => pattern.test(file)),
+  )
+}
+
 /** 止まっている Job の「なぜ止まったか」。PL はこれを読んで判断する。 */
 function describeStuckJob(storage: IStorage, jobId: string): unknown {
   const job = storage.jobs.findById(jobId)
@@ -462,6 +479,8 @@ function describeStuckJob(storage: IStorage, jobId: string): unknown {
     changedFiles: job.changedFiles,
     // blocked の理由はここに出る（File Change Guard 違反・approval 待ち等）。
     guardResult: job.guardResult,
+    // **allowedPaths では解決できない違反**。空なら scope の問題、非空なら protected の問題。
+    protectedViolations: protectedViolations(job.guardResult?.fileViolations),
     failureMetadata: job.failureMetadata,
     stderrTail: tailText(job.stderr, 300),
   }
@@ -602,10 +621,18 @@ const DIAGNOSIS_SYSTEM = [
   '- clear_workspace_quarantine: the workspace is quarantined and that quarantine is the blocker.',
   '- observe_state: a recovery is already in flight, or the blocker is outside this system; wait.',
   '',
+  'If context.blockedJob.protectedViolations is NOT empty, those files are permanently forbidden.',
+  'No allowedPaths value can ever permit them, so retry and resume cannot help. Propose',
+  '"escalate_to_ceo" and say plainly that the task needs a protected file and must be handled',
+  'outside this workspace - do not describe it as an allowedPaths or configuration problem.',
+  '',
   'Answer with a single JSON object and nothing else:',
   '{"actionKind": "<one of the allowed kinds>", "rationale": "<one sentence>",',
   ' "riskLevel": "LOW|MEDIUM|HIGH|CRITICAL"}',
 ].join('\n')
+
+/** 診断 prompt の文言をテストから固定するための再公開。実体は同一。 */
+export const DIAGNOSIS_SYSTEM_FOR_TEST = DIAGNOSIS_SYSTEM
 
 async function defaultDiagnose(input: PlDiagnosisInput): Promise<string> {
   const user = [
