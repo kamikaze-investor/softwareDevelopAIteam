@@ -7888,6 +7888,124 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: CONFLICT で止まった採用が何件あり、
         そのうち何件が表記起因だったかを後から数えられること
 
+<!-- roadmap:id=executed-item-remaining-work-has-no-continuation state=deferred -->
+10. [ ] **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）** —
+      2026-09-17登録（read-only 調査 + production 実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: Roadmap 項目が ledger 上まだ open で、その項目の Task が既に done、
+      かつ本文に残作業がある状態になると、**人手なしでは二度と先へ進めない**。
+      既存経路が全部断る（in-memory SQLite で再現、2026-09-17）:
+
+      | 経路 | 結果 |
+      |---|---|
+      | `readAdoptionCandidates()` | 候補に出さない（`executedKeys` で除外） |
+      | `adoptRoadmapItem()` | `ITEM_NOT_ADOPTABLE`（in_progress のとき） |
+      | `adoptRoadmapItem()`（state を `planned` へ戻しても） | **`ALREADY_EXECUTED`** |
+      | `resumeBlockedTask()` | 拒否（`Latest job status is success, not blocked`） |
+      | `task_continuations` | commit 時点で `status=completed` / `nextTaskId=null` として**既に終端済み** |
+      | `buildSystemState()` の `attention` | **NONE**（PL には何も見えない） |
+
+      その後 PL は `maybeAdoptNext()` で**次の planned 項目を採用して先へ進む**。
+      残作業は誰にも気付かれずに落ちる。**失敗として観測されない**のが最も危険な点である。
+
+      **root cause（単独の欠陥ではなく4つの組み合わせ）**:
+      1. 採用は 1 Roadmap 項目につき実質 1 Task。`syncRoadmapTasks()` は入力外の
+         roadmapActive Task を落とすので、2件目の Task は存在しない
+      2. 一度でも Job が走ると `ALREADY_EXECUTED` で**再採用が恒久的に不可能**になる
+         （`roadmapAdoption.ts`。`adoptionStep.ts` の `executedKeys` も同じ事実で候補から外す）
+      3. `selectNextContinuableTask()` は**既存の pending roadmapActive Task しか選ばない**。
+         Task を作る責務をどこも持っていない
+      4. `AttentionKind` は全て Task / Job / continuation スコープで、`systemState.ts` は
+         **ledger を一切読まない**。「項目に残作業がある」ことを表す事実がシステム内に存在しない
+
+      **PR #226 の planned-only は原因ではない。** `state` を `planned` へ戻しても
+      `ALREADY_EXECUTED` で詰まることを実測している（上表）。
+      planned-only は refusal を1つ増やしただけで、行き止まり自体はそれ以前から存在する。
+
+      **production 実測（2026-09-17・read-only）**: CEO が例示した3項目
+      （`mandatory-gate-policy` / `cross-project-state-api` /
+      `roadmap-generation-constraint-compliance`）は**いずれも Task が1件も無い**
+      （外部セッションが実装したため採用経路を通っていない）。
+      よって3件とも **Case A = 詰まっていない**。人が `pnpm roadmap:update <id> planned` で
+      state を戻せば通常どおり採用でき、`task_ready_without_job` も正常に出る（再現確認済み）。
+
+      **実際に詰まっているのは別の項目である。** `roadmap_task_key` を持つ Task を
+      production DB で全件照合した結果、**ledger で open なのに Task が実行済み**なものが実在する:
+
+      | roadmap id | ledger | Task | jobs |
+      |---|---|---|---|
+      | `roadmap-adoption-followups` | planned | done | 1 |
+      | `meta-review-structured-output-robustness` | planned | done | 5 |
+      | `mobile-approval-role-docs` | planned | done | 6 |
+      | `continuation-reconcile-nonblocking-followups` | planned | done | 6 |
+      | `allowed-paths-empty-disables-file-change-guard` | planned | pending | 1 |
+
+      **重要な差異（CEO 提示の定義より範囲が広い）**: 上記はすべて `in_progress` ではなく
+      **`planned`** である。行き止まりの条件は `state === 'in_progress'` ではなく
+      **「ledger で open ＋ その項目の Task が既に Job を実行済み」**である。
+      `in_progress` は手動 CLI でしか書かれない（`roadmap:update` のみ）ので、
+      実際には `planned` のまま残っている方が多い。
+      なお下2件は別の pending Task / 未終了 Task を持つため進行経路は残っている（再採用だけ不可）。
+      完全な行き止まりは上3件。
+
+      **設計原則（CEO 指示・2026-09-17。実装時に守る）**:
+      - **planned-only の initial adoption は維持する。`in_progress` を通常の採用対象へ戻さない**
+      - 「既に実行済みの open 項目に残作業がある場合**だけ**、bounded な follow-up Task を作る」
+        という**狭い continuation** として設計する
+      - 新しい continuation system / workflow / TaskStatus / Roadmap state を**先に作らない**。
+        既存の `adoptRoadmapItem` / Task 生成 / `implementationScope` / Design Review /
+        Mandatory Gate / Independent Review / PL / State API の再利用を優先する
+
+      **成立の最低条件（実装時の受入条件）**:
+      prior executed Task あり / active Task なし / pending continuation なし /
+      旧 Task は resume 不可 / **新しい `implementationScope` を必須**にする /
+      **新 Task として作る**（旧 Task を再利用しない）/ Design Review・Gate・`allowedPaths` を
+      **再計算する** / **過去の approval・authority を一切継承しない**。
+
+      **Detection（先に検討する順序）**: 「open な項目に残作業があるが active Task が無い」を
+      **既存 State API / `attention` へ載せられないか**を最初に見る。
+      既存 `AttentionKind` で表現できるなら**新しい kind を増やさない**。
+      ただし現状の `attention` は Task / Job / continuation からしか作られず、
+      `systemState.ts` は ledger を読まないため、**事実の入口が無い**のが実装上の争点になる。
+      観測面の語彙は `cross-project-state-api` が owner なので、そちらと重複させない。
+
+      **関連項目（重複させない）**:
+      - `roadmap-adoption-followups`（planned）— サブ項目(3)は「**手動作成 Task** が採用経路の
+        入口に無い」問題で、本項目の「**実行済み項目の残作業**」とは別。ただし直す seam は同じ
+        adoption 経路なので、着手するなら同時に設計する。
+        **この項目自身が上表の行き止まり実例でもある**
+      - `no-status-for-closing-a-task-without-implementing`（planned）— 「実装せず閉じる」状態が
+        無い問題。本項目は「閉じたが残っている」側であり別
+      - `adoption-does-not-check-implementation-feasibility`（planned）— 採用時点でスコープの
+        実現可能性が分からない問題。本項目とは別
+      - `pl-autonomous-roadmap-adoption`（done）/ `mandatory-gate-policy` — action 語彙と
+        強制 Gate の owner。本項目で新しい PL 権限を作らない
+
+      **state=deferred の理由（CEO 判断・2026-09-17）**: 本 Finding の最終的な解決は
+      `ALREADY_EXECUTED` に対する**限定的な例外**、すなわち既存の adoption authority を
+      条件付きで広げる形になる可能性が高い。CEO がその境界を決める前に PL がこの項目を
+      自律採用しないよう、`deferred` にする。
+      **Finding の存在・優先度を下げる意味ではない。実装着手だけを保留する。**
+      `deferred` は PR #226 以降、候補一覧・直接採用・Gate alignment の3経路すべてで
+      機械的に効くので、この保留は文言ではなく強制である。
+
+      **着手手順**: 次の4点の境界を CEO へ提示し、承認を得てから `state=planned` へ戻す。
+      (1) どの条件なら executed item の follow-up を許すか /
+      (2) `ALREADY_EXECUTED` のどこまでを維持するか /
+      (3) follow-up が新 Task として Design Review・Gate・`allowedPaths` を全て再計算すること /
+      (4) 過去の approval・authority を一切継承しないこと。
+
+      **Detection と Action を別 Finding へ分割しない（CEO 指示・2026-09-17）。**
+      両者は同じ root cause（実行済み項目の残作業を表す事実がシステム内に存在しない）から
+      出ているため、本項目にまとめて残す。
+
+      **やらないこと（non-goals）**: `ALREADY_EXECUTED` を単純に撤去すること
+      （同じ Task の二重実行を防いでいる既存の防御であり、外すと 2026-09-15 の
+      attempt 予算消費事故が戻る）/ `in_progress` を採用対象へ戻すこと /
+      新しい Task status・Roadmap state・継続専用テーブルの追加 /
+      本 Finding を根拠に Safety・Approval 境界を動かすこと。
+      **`ALREADY_EXECUTED` に例外を設けるのは既存 guard の緩和にあたるため、CEO 判断事項とする。**
+
 <!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
 10. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
       2026-09-15登録（CEO の承認画面での指摘が発端）。
