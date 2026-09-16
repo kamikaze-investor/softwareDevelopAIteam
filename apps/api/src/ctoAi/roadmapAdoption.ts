@@ -29,7 +29,9 @@
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
+  ADOPTABLE_ROADMAP_STATES,
   getValidRoadmapItems,
+  isRoadmapItemAdoptable,
   RoadmapValidationError,
   type RoadmapItem,
 } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
@@ -54,6 +56,7 @@ export type AdoptRoadmapItemFailure =
   | 'ROADMAP_INVALID'
   | 'ITEM_NOT_FOUND'
   | 'ITEM_ALREADY_DONE'
+  | 'ITEM_NOT_ADOPTABLE'
   | 'ALREADY_EXECUTED'
   | 'SPEC_INVALID'
   | 'SYNC_FAILED'
@@ -196,6 +199,16 @@ export async function adoptRoadmapItem(
   // 完了済み項目を再実行しない。
   if (item.state === 'done') {
     return { ok: false, code: 'ITEM_ALREADY_DONE', reason: `Roadmap item "${input.roadmapId}" is already done` }
+  }
+
+  // done 以外の非採用 state（deferred / blocked）も採用しない。ledger 上の
+  // 「今はやらない」「前提が解消していない」という意思表示を、採用経路でも機械的に守る。
+  if (!isRoadmapItemAdoptable(item.state)) {
+    return {
+      ok: false,
+      code: 'ITEM_NOT_ADOPTABLE',
+      reason: `Roadmap item "${input.roadmapId}" is ${item.state}; only ${ADOPTABLE_ROADMAP_STATES.join(' / ')} items can be adopted`,
+    }
   }
 
   // 同じ roadmap:id を誤って重複実行しない。既に Job が動いた Task がある場合は採用し直さない

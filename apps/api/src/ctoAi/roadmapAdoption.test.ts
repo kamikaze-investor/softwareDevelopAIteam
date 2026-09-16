@@ -10,11 +10,20 @@ const LEDGER = [
   '1. [ ] **最初の項目** — これは実装対象である',
   '   詳細な本文がここに続く。',
   '',
-  '<!-- roadmap:id=second-item state=in_progress priority=high -->',
+  '<!-- roadmap:id=second-item state=planned priority=high -->',
   '2. [~] **進行中の項目** — 追加属性つき',
+  '',
+  '<!-- roadmap:id=in-progress-item state=in_progress -->',
+  '6. [~] **着手済みの項目** — 重ねて採用しない',
   '',
   '<!-- roadmap:id=finished-item state=done -->',
   '3. [x] **完了済みの項目** — 再実行してはいけない',
+  '',
+  '<!-- roadmap:id=deferred-item state=deferred -->',
+  '4. [ ] **今はやらない項目** — deferred は自律採用しない',
+  '',
+  '<!-- roadmap:id=blocked-item state=blocked -->',
+  '5. [ ] **前提が解消していない項目** — blocked も自律採用しない',
 ].join('\n')
 
 function makeStorage(): { storage: IStorage; projectId: string } {
@@ -144,6 +153,38 @@ describe('adoptRoadmapItem — fail-closed', () => {
     const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'finished-item', ...SPEC }, deps())
 
     expect(result).toMatchObject({ ok: false, code: 'ITEM_ALREADY_DONE' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('in_progress の項目は id を直接指定しても採用しない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    // CEO 決定（2026-09-15 / PR #211）。着手済みのものを重ねて採用しない。
+    // 候補一覧だけでなく採用 API 側でも止める（PR #211 は候補一覧しか塞いでいなかった）。
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'in-progress-item', ...SPEC }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ITEM_NOT_ADOPTABLE' })
+    if (!result.ok) expect(result.reason).toContain('in_progress')
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('deferred の項目は id を直接指定しても採用しない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    // 候補一覧を経由せず採用 API を直接叩いても、ledger 上の「今はやらない」は守られる。
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'deferred-item', ...SPEC }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ITEM_NOT_ADOPTABLE' })
+    if (!result.ok) expect(result.reason).toContain('deferred')
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('blocked の項目も id を直接指定して採用できない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'blocked-item', ...SPEC }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ITEM_NOT_ADOPTABLE' })
     expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
   })
 

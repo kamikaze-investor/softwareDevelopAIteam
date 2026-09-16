@@ -25,7 +25,10 @@
 
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
+import {
+  getValidRoadmapItems,
+  isRoadmapItemAdoptable,
+} from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
 import type { IStorage } from '../storage/interface'
 import {
@@ -78,8 +81,9 @@ export function resolveLedgerPath(): string {
 }
 
 /**
- * 採用候補を ledger から読む。**done は候補にしない。**
- * 既存 parser をそのまま使い、新しい抽出責務を足さない。
+ * 採用候補を ledger から読む。**採用可能な state の項目だけを候補にする**
+ * （`isRoadmapItemAdoptable()`。`deferred` / `blocked` / `done` は候補にしない）。
+ * 既存 parser をそのまま使い、新しい抽出責務も新しい state も足さない。
  */
 /** ledger の行分割。改行コードは環境差があるため LF で切り、行末 CR は下流で吸収する。 */
 const LINE_SEPARATOR = String.fromCharCode(10)
@@ -97,7 +101,11 @@ export function readAdoptionCandidates(
     // 2026-09-15 実測で `deferred` が採用を止めておらず、「現在も実装禁止」を表す手段が
     // 事実上無かった。`in_progress` / `blocked` も、着手済み・停止中のものを重ねて採用する
     // 意味が無いので候補から外す。
-    .filter((item) => item.state === 'planned')
+    //
+    // 判定は `isRoadmapItemAdoptable()`（parser 側の allowlist）に一本化してあり、
+    // 採用 API・Gate alignment と同じ述語を共有する。ここだけ塞いでも、id 直接指定の
+    // 採用と Gate 側が素通しなら `deferred` は止まらない。
+    .filter((item) => isRoadmapItemAdoptable(item.state))
     .map((item) => ({
       id: item.id,
       title: item.title.replace(/\*\*/g, '').slice(0, 90),

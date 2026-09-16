@@ -92,6 +92,39 @@ export function isRoadmapState(value: string): value is RoadmapState {
   return STATE_SET.has(value)
 }
 
+/**
+ * 自律採用（PL の `adopt_roadmap_item`）の対象にしてよい state。
+ *
+ * **allowlist である。** 除外リスト（「done 以外は採用可」）にすると、新しい state を足したときの
+ * 既定が「採用可能」になり、意味が決まる前に PL が拾ってしまう。既定は採用不可でなければならない。
+ *
+ * - `planned` … 現在着手してよい。**唯一の採用対象**
+ * - `in_progress` … 着手済み。**採用しない**（CEO 決定 2026-09-15 / PR #211）。
+ *   既に始まっている作業を重ねて採用する意味が無い。残作業の継続は adoption の責務ではなく、
+ *   既存の Task / resume / continuation 経路が扱う
+ * - `deferred` … 「現在は着手しない」という ledger 上の意思表示。**採用しない**
+ * - `blocked` … 前提が解消していない。**採用しない**
+ * - `done` … 完了済み（履歴）。**採用しない**
+ *
+ * この判定をここに置くのは、`ALLOWED_ROADMAP_STATES` / `RoadmapState` /
+ * `expectedCheckboxForState()` という **state の意味づけが既にこのファイルに集約されている**ためである。
+ * 採用経路3箇所（`readAdoptionCandidates` / `adoptRoadmapItem` / `checkRoadmapItemAlignment`）は
+ * いずれも既にこの parser を import しており、判定を重複実装せず共有できる。
+ */
+export const ADOPTABLE_ROADMAP_STATES: readonly RoadmapState[] = ['planned']
+
+const ADOPTABLE_STATE_SET: ReadonlySet<string> = new Set(ADOPTABLE_ROADMAP_STATES)
+
+/**
+ * その state の Roadmap 項目を自律採用してよいか。
+ *
+ * 未知の文字列は `false`（fail-closed）。state 文字列をそのまま受けるのは、
+ * 呼び出し側が `RoadmapItem.state` をそのまま渡せるようにするためである。
+ */
+export function isRoadmapItemAdoptable(state: string): boolean {
+  return ADOPTABLE_STATE_SET.has(state)
+}
+
 export function parseRoadmapMarkdown(markdown: string): RoadmapParseResult {
   const lines = splitMarkdown(markdown).lines
   const items: ParsedRoadmapItem[] = []
