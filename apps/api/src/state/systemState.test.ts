@@ -154,6 +154,52 @@ describe('buildSystemState — 横断状態の読み取り', () => {
     expect(state.attention.some((a) => a.kind === 'job_blocked')).toBe(true)
   })
 
+  it('停止理由は provider の警告ではなく jobRunner の診断を出す（CEO 通知の Root Cause）', () => {
+    // 2026-09-15 production 実測: 実際の原因は File Change Guard の allowedPaths 不一致だったのに、
+    // Escalation 本文の「何が起きているか」は
+    // `⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY …` だった。
+    // jobRunner は診断を stderr の**先頭**へ置くが、ここは `tail()` で**末尾**を取っていたため。
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.jobs.update(job.id, {
+      stderr: '[jobRunner] File Change Guard blocked. Why: docs/a.md — Not in task.allowedPaths.'
+        + ' allowedPaths scope (other guard rules also apply): docs/approval-roles\n'
+        + '⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set',
+    })
+
+    const item = buildSystemState(storage, { now }).attention.find((a) => a.kind === 'job_blocked')
+
+    expect(item?.detail).toContain('File Change Guard blocked')
+    expect(item?.detail).toContain('allowedPaths')
+    expect(item?.detail).not.toContain('ANTHROPIC_API_KEY')
+  })
+
+  it('jobRunner の先頭注記が無ければ従来どおり末尾を使う（provider 出力が理由のケースを壊さない）', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    storage.jobs.update(job.id, { stderr: 'compiling...\nrunning tests...\nFAIL: 3 tests failed' })
+
+    const item = buildSystemState(storage, { now }).attention.find((a) => a.kind === 'job_blocked')
+
+    expect(item?.detail).toContain('FAIL: 3 tests failed')
+  })
+
   it('done な Task の blocked Job は attention に出さない（誰も解消できない履歴を残さない）', () => {
     const { storage, projectId } = seed()
     const task = addTask(storage, projectId)

@@ -143,6 +143,29 @@ function tail(value: string | undefined, max = 400): string | undefined {
   return trimmed.length <= max ? trimmed : trimmed.slice(-max)
 }
 
+/**
+ * 停止理由として人へ見せる1片。**`[jobRunner]` の先頭注記があればそれを優先する。**
+ *
+ * `jobRunner` は Guard で止めたとき、決定的な診断を **stderr の先頭**へ置く
+ * （`withLeadingNote()`。末尾へ足すとプレビュー切り詰め 4000 字で消えるため）。
+ * 一方ここは `tail()` で**末尾**を取っていたので、両者が「どちらの端が重要か」で食い違い、
+ * CEO への Escalation 本文に **Root Cause と無関係な provider 警告**が載っていた。
+ *
+ * 実測（2026-09-15）: 実際の原因は File Change Guard の allowedPaths 不一致だったのに、
+ * 通知の「何が起きているか」は
+ * `⚠ claude.ai connectors are disabled because ANTHROPIC_API_KEY …` だった。
+ *
+ * 先頭注記が無ければ**従来どおり末尾**を使う。provider の出力そのものが理由になるケース
+ * （テスト失敗の末尾など）を壊さないため。**新しいフィールドも抽出機構も作らない。**
+ */
+function stopReason(value: string | undefined, max = 200): string | undefined {
+  const firstLine = value?.trimStart().split('\n')[0]?.trim()
+  if (firstLine !== undefined && firstLine.startsWith('[jobRunner] ')) {
+    return firstLine.length <= max ? firstLine : firstLine.slice(0, max)
+  }
+  return tail(value, max)
+}
+
 function elapsedMs(from: string | undefined, nowMs: number): number | undefined {
   if (from === undefined) return undefined
   const started = Date.parse(from)
@@ -292,7 +315,7 @@ export function buildSystemState(
           projectName: project.name,
           taskId: task.id,
           jobId: stallingFailure.id,
-          detail: tail(stallingFailure.stderr, 200) ?? 'job failed and nothing is left to move the task',
+          detail: stopReason(stallingFailure.stderr) ?? 'job failed and nothing is left to move the task',
           stuckForMs: elapsedMs(stallingFailure.completedAt ?? stallingFailure.createdAt, nowMs),
         })
       }
@@ -323,7 +346,7 @@ export function buildSystemState(
             projectName: project.name,
             taskId: task.id,
             jobId: job.id,
-            detail: tail(job.stderr, 200) ?? 'job is blocked',
+            detail: stopReason(job.stderr) ?? 'job is blocked',
             stuckForMs: elapsedMs(job.completedAt ?? job.createdAt, nowMs),
           })
         }
