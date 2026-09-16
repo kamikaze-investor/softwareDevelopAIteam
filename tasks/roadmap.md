@@ -7189,6 +7189,151 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **Role / Provider / Model Routing との関係**: 独立 Review の provider 分離等の必須制約は
       **PL より上位の Policy として強制**する（`role-model-registry` から PL が緩められないようにする）。
 
+<!-- roadmap:id=review-class-b-enhanced-ai-review state=deferred -->
+4. [ ] **Review Class B（強化AIレビュー）: 通常AI判断とCEO必須判断の中間を埋める（Tier Bとは別概念・CEO承認が着手条件）** —
+      2026-09-15登録（CEO 指示）。**本項目は登録であり、この指示だけを根拠に Safety Policy を変更しない。**
+
+      **名称の注意**: 既存の `aiteamos-self-development-tier-a` / `aiteamos-self-development-tier-b` の
+      **Tier B（外部セッションで protected / high-risk 変更を扱う運用形態）とは別概念**である。
+      Tier は「誰がどの環境で作業するか」、Class は「その変更にどれだけの証拠を要求するか」。混同しないこと。
+
+      **Goal**: 通常 AI 判断（Class A）と CEO 必須判断（Class C）の間に、**十分な独立レビューと
+      機械的検証を通せば AI だけで妥当に完結してよい Class B** を置く。CEO を呼ぶ回数を減らすことが
+      目的ではなく、**CEO を呼ぶべき変更の識別精度**を上げることが目的である。
+
+      **current problem（2026-09-15 実測。推測ではない）**: 既存3分類器
+      （`runRiskReview()` / `runMechanicalGate()`+`classifyApprovalLevel()` / `classifyReviewLoad()`）へ
+      同じ入力を通して測定した結果は次のとおり。
+
+      | 実変更 | runRiskReview | reviewLoad | ApprovalLevel |
+      |---|---|---|---|
+      | `guards/fileChangeGuard.ts` に**ログ行を1行足すだけ** | HIGH | critical | **Level 3 / ceo_required** |
+      | `guards/fileChangeGuard.ts` の**拒否条件を env で外す** | HIGH | critical | **Level 3 / ceo_required** |
+      | 後方互換 migration（`ADD COLUMN ... NULL`） | HIGH | high | Level 2 |
+      | 破壊的 migration（`DROP COLUMN`） | HIGH | high | Level 2 |
+
+      1と2、3と4は**意味が正反対なのに出力が同一**である。さらに:
+      - 破壊的 migration が `destructive operation` ルールを引いたのは**ファイル名に `drop` が
+        入っていたから**にすぎず、`0043_cleanup_owner.ts` と改名すると後方互換 migration と
+        **全分類器で完全に同一判定**になる（実測）
+      - 2 と同じ差分を **protected でないファイル**（`apps/api/src/pl/executionLoop.ts`）で行うと
+        `runRiskReview=LOW` / `reviewLoad=medium` まで落ち、Level 3 を保っているのは
+        `UNMATCHED_FALLBACK`（confidence 0.4）という「**知らないものは全部 Level 3**」の既定だけである（実測）
+
+      つまり現在の粗さは2方向に出ている。**(a) 安全な変更まで CEO へ寄る**（過剰安全策。
+      `project-auto-incident-pattern-improvement` が Incident 候補として扱う対象）。
+      **(b) 危険な「意味」を path でしか捕まえていない**。
+      **(b) を放置したまま (a) だけ緩めてはならない。本項目は (b) を先に埋める。**
+
+      **根本原因**: `classifyReviewLoad()` は `changedFiles` しか受け取らず **diff 本文を見ていない**。
+      `runRiskReview()` も changedFiles の**パス文字列**へ正規表現を当てているだけである。
+      意味を判定する材料が、そもそも入口に存在しない。
+
+      **Class A / B / C の役割**:
+      - **Class A（通常 AI 判断）** — 既存どおり。変更しない
+      - **Class B（強化 AI レビュー）** — machine facts が「CEO 領域に触れている」と言うが、
+        **意味は既存 Policy の範囲内**だと強い証拠で確認できる変更。CEO Approval を必須にしない。
+        候補: protected file 内のバグ修正で Safety Boundary 不変 / Guard・Gate のログ・診断・
+        observability 改善 / 既存 Safety Policy へ実装を適合させる修正 / 権限を**狭める**変更 /
+        Control Repository 内の挙動・authority 不変なリファクタリング / 後方互換かつ rollback 可能な
+        DB 変更（nullable column 追加・index 追加等、既存の意味を壊さないもの）
+      - **Class C（CEO 必須。Class B へ降格させない）** — AI の authority を拡大する /
+        protected・forbidden 範囲を縮小する / Guard・Gate・Approval 要件を弱める /
+        Safety Boundary を弱める / CEO Approval を不要化する / production で不可逆または重大な
+        destructive 変更 / rollback 困難な migration / データの意味・所有権を変更する migration /
+        Design Philosophy・Goal そのものの変更 / AI が自分の権限を広げる変更 /
+        Binding Safety Review との重要な衝突が未解消
+
+      **machine facts と AI semantic judgment の分離**:
+      - **machine facts** … サーバ側が**実際の変更**から算出する。AI の自己申告を入力にしない。
+        protected file か / Safety・Gate・Guard・Approval 関連か / migration を含むか /
+        permission・authority 関連か / Design Philosophy 関連か / production destructive を含むか /
+        不可逆の可能性があるか。**PL が LOW と自己申告しても Gate は弱まらない**
+      - **AI semantic judgment** … machine facts が立った差分に対してのみ実行し、diff と既存 Policy を
+        根拠に最低限 `policy_maintained` / `policy_strengthened` / `policy_weakened` /
+        `authority_expanded` / `irreversible_or_destructive` / `design_philosophy_change` /
+        `undecidable` を区別する
+      - **巨大な if 文やファイル名だけで「意味」まで機械判定しようとしない。** 逆に、意味判定を
+        LLM 単独へ委ねもしない（machine facts が立たない限り Class B の土俵に乗らない）
+
+      **disagreement 時の fail-closed**: Class B の成立を**単一 AI の YES/NO で決めない**。
+      2名が独立に `policy_maintained` と判定し、かつ機械 Gate / CI が PASS のときだけ Class B とする。
+      重要な不一致（維持 vs 弱化 / 安全 vs authority 拡大 / `undecidable` 混在）があれば
+      `Second Independent Review → Meta Review → 未解消なら CEO Escalation` へ**安全側へのみ**倒す。
+      目的は「AI の判断を常に正しくする」ことではなく、**判断が揺れたときに必ず上へ上がる構造**を作ること。
+
+      **existing mechanism reuse（新しい Review system を重複して作らない）**:
+
+      | 必要なもの | 再利用する既存機構 | 必要な最小変更 |
+      |---|---|---|
+      | machine facts | `classifyReviewLoad()`（`apps/worker/src/approvalLevel/reviewLoadClassifier.ts`） | 出力へ **additive に facts を足す**。`ReviewLoad` の語彙は増やさない。**`diffText` を受け取れるようにすることが最小の本質**（現在は changedFiles のみ） |
+      | 破壊的・不可逆の検出 | `MECHANICAL_GATE_PATTERNS`（diff 型パターンが既にある） | migration 本文向けの diff パターンを追加し、ファイル名依存をやめる |
+      | 意味判定の実行 | Focused Review（`MetaReviewFocus` / `selectFocuses()`） | **focus を1つ足すだけ**。新しい Reviewer・新しいプロンプト基盤・新しい JSON パーサーを作らない |
+      | 2名の独立性 | `isGeneratorSeparatedFromFinalReviewer()`（`packages/shared/src/reviewSeparation.ts`） | そのまま |
+      | 不一致の fail-closed | `resolveFinalDecision()` / `applyIndependentReviewOverride()`（`packages/shared/src/strategicDecision.ts`） | **そのまま使える**。既に「全件 ALIGNED のときだけ ALIGNED」「未知値は UNCERTAIN」「independent は安全側にのみ倒す」 |
+      | 強い Independent Review の発火 | `recomputeDecision()` の「reviewLoad が critical なら independentReviewRequired」 | そのまま |
+      | 必要 Gate の決定 | `resolvePlActionPolicy()` / `authorizePlAction()`（`mandatory-gate-policy`） | Class を `requiredGates` 算出の**入力**として足す |
+      | 記録 | 既存 `audit_log` / `data/logs/review_observation.jsonl` | そのまま |
+
+      **統合先の第一候補は `mandatory-gate-policy` の Policy Engine である。** Class A/B/C を新しい
+      並行分類軸として持たせるのではなく、**既存 classifier の出力と policy decision を拡張する**形にする。
+      新しい Class enum を上位の語彙として増やさない。
+
+      **関連項目（重複実装しないこと）**:
+      - `mandatory-gate-policy`（in_progress）— 必要 Gate を決める入口。**本項目はその入力を精緻化する**もので、
+        Gate を減らす仕組みではない。`plRiskOpinion` を `requiredGates` の算出に使わない不変条件は維持する
+      - `independent-review-verdict-instability`（planned）— 同じ差分への判定が実行ごとに反転する実測。
+        本項目の disagreement fail-closed と**同じ問題の別側面**であり、着手時は一緒に扱う。
+        当該項目の「着手時に確認すること」（Safety/Authority 差分は LLM より先に機械ルールで拾う／
+        新しい分類器を作る前に `reviewLoadClassifier`・`runMechanicalGate` の再利用を確認する）は
+        **本項目の方針そのもの**である
+      - `meta-review-structured-output-robustness`（planned）— parse 失敗による **false BLOCKED**。向きが逆
+      - `project-auto-incident-pattern-improvement`（planned）— 過剰安全策・過剰レビューを Incident 候補として扱う。
+        Class B の効果（CEO 呼び出し回数の変化と取りこぼしの有無）はここで測る
+
+      **non-goals**:
+      - 新しい Review system / 新しい Reviewer 種別 / 新しい Gate 本体 / 新しい承認経路 / 新しいテーブル
+      - 既存 Risk Level（LOW/MEDIUM/HIGH/CRITICAL）・Review Level 0〜3・`ReviewLoad`・`ApprovalLevel` の**置き換え**
+      - Tier A / Tier B（作業形態）の再定義
+      - **CEO Gate の迂回路**にすること / PL が protected file を自由に変更する権限 /
+        Safety Boundary を緩和する仕組み / **PL 自身が自分の risk を下げる仕組み**
+      - Policy そのものを変える変更を Class B で通すこと（それは定義上 Class C）
+
+      **operational validation 条件（机上のルール追加で完了にしない）**: 実変更例で次を**測定**して示す。
+      1〜4 は上の実測表がそのまま before として使える。
+      1. protected file だがログ・診断改善のみ → Class B 候補になる
+      2. protected file で Guard 条件を弱める → Class C になる（**ファイル名を変えても保たれること**）
+      3. rollback 可能な後方互換 DB migration → Class B 候補になる
+      4. destructive / irreversible migration → Class C になる（**ファイル名に `drop` が無くても**）
+      5. Reviewer 同士が重要点で不一致 → CEO 側へ安全に昇格する
+      6. PL が LOW と自己申告しても、実 diff が Class C なら Class C になる
+         （現状 `resolvePlActionPolicy()` は LOW 申告でも CRITICAL 申告でも `requiredGates` が
+         同一であることを実測済み。この不変条件を Class 導入後も回帰テストで固定する）
+
+      **効果検証可能性（Design Philosophy 8）**: Class 判定・machine facts・2名の semantic verdict・
+      不一致の有無・最終 disposition を既存 `audit_log` / `review_observation.jsonl` へ記録し、後から
+      「Class B により CEO 呼び出しがどれだけ減ったか」「Class C の取りこぼしが出ていないか」を
+      判定できるようにする。**記録経路を持たない実装で完了にしない。**
+
+      **state=deferred の理由（CEO 判断・2026-09-15）**: 本項目自体が「どの変更を CEO Approval 必須から
+      AI 完結可能へ移すか」という Authority / Safety 境界の変更であり、**本項目の定義に照らして Class C** である。
+      よって PL の自律採用対象から外す意図で `deferred` とする。
+
+      **着手手順（この順序を飛ばさない）**:
+      1. PL が Class A / B / C の境界表を**具体例つき**で CEO へ提示する（実装ではなく境界表だけ）
+      2. CEO が境界表を承認する
+      3. `state=planned` へ変更して実装着手する
+
+      **⚠ 現状の機構では `deferred` は採用を機械的に止めない（2026-09-15 実測）**: 採用経路の state 判定は
+      3箇所とも **`done` だけ**を除外しており、`deferred` / `blocked` / `planned` は等しく採用可能である。
+      - `apps/api/src/pl/adoptionStep.ts` の `readAdoptionCandidates()` … `filter(item => item.state !== 'done')`
+      - `apps/api/src/ctoAi/roadmapAdoption.ts` … `if (item.state === 'done') return ITEM_ALREADY_DONE`
+      - `apps/api/src/pl/actionGate.ts` の `checkRoadmapItemAlignment()` … 同じく `done` のみ拒否
+
+      したがって `deferred` は**意図の記録であって強制ではない**。上記手順を機械的に強制したい場合は
+      別項目として「採用可能な state を明示的に限定する」最小変更が要る（本項目の scope 外。
+      `mandatory-gate-policy` の fail-closed 方針と同じ形で扱えるが、**新しい状態モデルは足さないこと**）。
+
 <!-- roadmap:id=vps-pl-execution-loop state=done -->
 1. [x] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
       **【2026-09-14 進捗: 最小ループを実装。残りは VPS 上の Operational E2E】**

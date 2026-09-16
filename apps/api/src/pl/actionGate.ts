@@ -41,7 +41,11 @@
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
-import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
+import {
+  ADOPTABLE_ROADMAP_STATES,
+  getValidRoadmapItems,
+  isRoadmapItemAdoptable,
+} from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import {
   resolvePlActionPolicy,
   type PlActionKind,
@@ -409,7 +413,8 @@ export function assertAdoptionScopeIsBounded(
  *
  * これが `strategic_alignment_review` の根拠である。PL の自己申告ではなく、
  * `tasks/roadmap.md` を既存 parser で読んだ結果だけを見る。
- * **ledger に無い項目・既に done の項目は採用できない。**
+ * **ledger に無い項目・採用可能な state でない項目（`deferred` / `blocked` / `done`）は採用できない。**
+ * 採用可否の判定は `isRoadmapItemAdoptable()` へ一本化し、採用経路ごとに書かない。
  *
  * ledger が壊れていれば fail-closed（採用させない）。
  * **新しい Roadmap metadata も新しい承認経路も作らない。**
@@ -440,6 +445,12 @@ function checkRoadmapItemAlignment(roadmapItemId: string, kind: PlActionKind): E
   }
   if (item.state === 'done') {
     return { satisfied: false, rejection: `roadmap item "${roadmapItemId}" is already done` }
+  }
+  if (!isRoadmapItemAdoptable(item.state)) {
+    return {
+      satisfied: false,
+      rejection: `roadmap item "${roadmapItemId}" is ${item.state}; only ${ADOPTABLE_ROADMAP_STATES.join(' / ')} items can be adopted`,
+    }
   }
 
   return { satisfied: true }

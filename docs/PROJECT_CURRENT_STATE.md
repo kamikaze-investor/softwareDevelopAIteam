@@ -276,6 +276,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）**（state: planned）
 - **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: in_progress）
 - **Mandatory Gate Policy（state: in_progress）
+- **Review Class B（強化AIレビュー）: 通常AI判断とCEO必須判断の中間を埋める（Tier Bとは別概念・CEO承認が着手条件）**（state: deferred）
 - **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
 - **external completion reconcile の根拠2つが、まだ機械照合になっていない**（state: planned）

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  ADOPTABLE_ROADMAP_STATES,
+  ALLOWED_ROADMAP_STATES,
+  isRoadmapItemAdoptable,
   parseRoadmapMarkdown,
   updateRoadmapState,
   type RoadmapIssueCode,
@@ -17,6 +20,32 @@ const ROADMAP_FIXTURE = [
   '3. [ ] 開発指示（Task作成）画面（Mobile） — details',
   '',
 ].join('\n')
+
+describe('isRoadmapItemAdoptable — 自律採用してよい state の allowlist', () => {
+  it('planned だけが採用対象', () => {
+    expect(isRoadmapItemAdoptable('planned')).toBe(true)
+  })
+
+  it('in_progress / deferred / blocked / done は採用対象にしない', () => {
+    // in_progress の除外は CEO 決定（2026-09-15 / PR #211）。着手済みのものを重ねて採用しない。
+    expect(isRoadmapItemAdoptable('in_progress')).toBe(false)
+    expect(isRoadmapItemAdoptable('deferred')).toBe(false)
+    expect(isRoadmapItemAdoptable('blocked')).toBe(false)
+    expect(isRoadmapItemAdoptable('done')).toBe(false)
+  })
+
+  it('未知の state は fail-closed で採用不可', () => {
+    // allowlist なので、新しい state を足したときの既定は「採用不可」でなければならない。
+    // ここが false でなくなったら、意味の決まっていない state を PL が拾える。
+    expect(isRoadmapItemAdoptable('archived')).toBe(false)
+    expect(isRoadmapItemAdoptable('')).toBe(false)
+  })
+
+  it('ALLOWED_ROADMAP_STATES の全件がどちらかに分類される（取りこぼしを作らない）', () => {
+    const adoptable = ALLOWED_ROADMAP_STATES.filter((state) => isRoadmapItemAdoptable(state))
+    expect(adoptable).toEqual([...ADOPTABLE_ROADMAP_STATES])
+  })
+})
 
 describe('roadmapParser updateRoadmapState', () => {
   it('updates the requested metadata state', () => {

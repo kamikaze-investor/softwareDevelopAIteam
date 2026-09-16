@@ -1,9 +1,15 @@
-import { describe, expect, it, beforeAll, afterAll } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import {
+  ADOPTABLE_ROADMAP_STATES,
+  ALLOWED_ROADMAP_STATES,
+} from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
+import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
+import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import {
   parseAdoptionProposal,
   readAdoptionCandidates,
@@ -20,6 +26,9 @@ import {
  * 宣言したスコープが広すぎれば通らない」ことである。
  */
 
+
+/** 改行1文字。ledger を組み立てるときの join 区切りに使う。 */
+const LF = String.fromCharCode(10)
 const LEDGER = [
   '# Roadmap',
   '',
@@ -34,6 +43,9 @@ const LEDGER = [
   '',
   '<!-- roadmap:id=deferred-item state=deferred -->',
   '4. [ ] **現在は着手しない項目** — 本文に「MVP後へ延期」とあっても state が正本',
+  '',
+  '<!-- roadmap:id=blocked-item state=blocked -->',
+  '5. [ ] **前提が解消していない項目** — blocked も自律採用しない',
 ].join('\n')
 
 /**
@@ -90,14 +102,103 @@ describe('readAdoptionCandidates', () => {
     expect(ids).toEqual(['open-item'])
   })
 
-  it('deferred は候補にしない（本文の延期文言ではなく state で止める）', () => {
+  it('deferred / blocked は候補にしない（本文の延期文言ではなく state で止める）', () => {
     // 従来は `!== 'done'` だったため deferred も候補に入り、PL がそれを選んでから
     // Design Review が本文の「MVP後へ延期」で止める、という回り道になっていた。
     const ids = readAdoptionCandidates(() => LEDGER).map((c) => c.id)
 
     expect(ids).not.toContain('deferred-item')
+    expect(ids).not.toContain('blocked-item')
     expect(ids).not.toContain('in-progress-item')
     expect(ids).not.toContain('finished-item')
+  })
+})
+
+describe('Roadmap state と自律採用の一致 — 3経路が同じ判定になる', () => {
+  /**
+   * 判定を3箇所へ重複実装しないことの回帰テスト。
+   * `readAdoptionCandidates` / `adoptRoadmapItem` / Gate の alignment 検証が
+   * **同じ state に対して同じ結論**を出すことを、全 state について固定する。
+   */
+  const ledgerFor = (state: string): string =>
+    [
+      '# Roadmap',
+      '',
+      `<!-- roadmap:id=probe-item state=${state} -->`,
+      `1. [${state === 'done' ? 'x' : ' '}] **判定対象** — state=${state}`,
+      '',
+    ].join(LF)
+
+  /** Gate は呼び出し側の文字列を信じず TARGET_ROOT のファイルを読むので、実ファイルを差し替える。 */
+  function withLedger<T>(state: string, run: () => T): T {
+    writeFileSync(join(ledgerRoot, 'tasks', 'roadmap.md'), ledgerFor(state), 'utf-8')
+    try {
+      return run()
+    } finally {
+      writeFileSync(join(ledgerRoot, 'tasks', 'roadmap.md'), LEDGER, 'utf-8')
+    }
+  }
+
+  function authorizeAdoption(storage: IStorage, projectId: string): void {
+    authorizePlAction(storage, {
+      proposal: { kind: 'adopt_roadmap_item' },
+      target: { kind: 'project', projectId },
+      evidence: [{ gate: 'strategic_alignment_review', roadmapItemId: 'probe-item' }],
+    })
+  }
+
+  it.each([...ALLOWED_ROADMAP_STATES])('state=%s では3経路の判定が一致する', async (state) => {
+    const expected = (ADOPTABLE_ROADMAP_STATES as readonly string[]).includes(state)
+    const ledger = ledgerFor(state)
+
+    const isCandidate = readAdoptionCandidates(() => ledger).some((c) => c.id === 'probe-item')
+
+    const { storage, projectId } = seed()
+    const adoption = await adoptRoadmapItem(
+      storage,
+      {
+        projectId,
+        roadmapId: 'probe-item',
+        allowedPaths: ['apps/api/src/ctoAi'],
+        acceptanceCriteria: ['test'],
+      },
+      { readRoadmap: () => ledger, ensureInitialWorkflows: vi.fn().mockResolvedValue([]) },
+    )
+
+    const gateOk = withLedger(state, () => {
+      try {
+        authorizeAdoption(storage, projectId)
+        return true
+      } catch (error) {
+        if (error instanceof PlActionBlockedError) return false
+        throw error
+      }
+    })
+
+    expect({ isCandidate, adopted: adoption.ok, gateOk }).toEqual({
+      isCandidate: expected,
+      adopted: expected,
+      gateOk: expected,
+    })
+  })
+
+  it('deferred は Gate の alignment 検証でも通らない', () => {
+    const { storage, projectId } = seed()
+
+    const thrown = withLedger('deferred', () => {
+      try {
+        authorizeAdoption(storage, projectId)
+        return undefined
+      } catch (error) {
+        return error
+      }
+    })
+
+    expect(thrown).toBeInstanceOf(PlActionBlockedError)
+    const blocked = thrown as PlActionBlockedError
+    expect(blocked.missingGates).toContain('strategic_alignment_review')
+    // 「ledger に無い」ではなく「deferred だから通らない」という理由が残る。
+    expect(blocked.rejectedEvidence.join(' ')).toContain('deferred')
   })
 })
 
@@ -155,6 +256,20 @@ describe('runAdoptionStep — PL は ledger の外を採用できない', () => 
 
     // 候補一覧にも載らないので、そもそも選べない
     expect(result.status).toBe('proposal_unusable')
+  })
+
+  it('deferred な項目は採用しない', async () => {
+    const { storage, projectId } = seed()
+
+    const result = await runAdoptionStep(
+      storage,
+      projectId,
+      deps({ propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'deferred-item' }) }),
+    )
+
+    // 候補一覧に載らないので、PL が名指ししても選べない。
+    expect(result.status).toBe('proposal_unusable')
+    expect(result.reason).toContain('deferred-item')
   })
 
   it('広すぎる allowedPaths は Gate 後の検査で止める', async () => {
