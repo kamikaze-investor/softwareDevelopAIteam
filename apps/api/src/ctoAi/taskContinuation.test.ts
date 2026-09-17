@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { ensureTaskContinuation } from './taskContinuation'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow'
+import { abortTask } from '../pl/abortTask'
 
 vi.mock('./initialImplementWorkflow', () => ({
   createInitialImplementWorkflow: vi.fn(),
@@ -50,7 +51,7 @@ describe('ensureTaskContinuation', () => {
       status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
     } as never)
     storage.approvalRequests.updateStatus(request.id, 'APPROVED')
-    const parked = (await import('../pl/abortTask')).abortTask(storage, {
+    const parked = abortTask(storage, {
       taskId: next.id, approvalRequestId: request.id, reason: 'parked before the continuation ran',
     })
     expect(parked).toMatchObject({ ok: true, status: 'parked' })

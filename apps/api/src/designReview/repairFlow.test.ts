@@ -5,6 +5,7 @@ import type { Job } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { MAX_REPAIR_ATTEMPTS } from './repairPolicy'
 import { runRepairFlow } from './repairFlow'
+import { abortTask } from '../pl/abortTask'
 
 /**
  * Stage 2 Task Flow統合の検証。
@@ -76,6 +77,69 @@ function exhaustAttempts(storage: IStorage, ids: { taskId: string; projectId: st
     createFailedJob(storage, ids, { workflowStepKey: 'repair:' + ids.taskId + ':' + i, exitCode: i })
   }
 }
+
+describe('park された Task は repair chain へ入らない', () => {
+  let storage: IStorage
+  let ids: { taskId: string; projectId: string }
+
+  /** abort_task と同じ経路で park する（DB を直接書き換えない）。 */
+  function park(taskId: string): void {
+    storage.tasks.update(taskId, { status: 'pending', roadmapActive: true })
+    const request = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH',
+      targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    } as never)
+    storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+    const parked = abortTask(storage, { taskId, approvalRequestId: request.id, reason: 'parked' })
+    if (!parked.ok || parked.status !== 'parked') throw new Error('fixture failed to park')
+  }
+
+  beforeEach(() => {
+    storage = createStorage()
+    ids = seed(storage)
+  })
+
+  it('park された Task の失敗では repair Job を作らない', async () => {
+    const failed = createFailedJob(storage, ids)
+    park(ids.taskId)
+
+    const outcome = await runRepairFlow(storage, { failedJob: failed }, deps())
+
+    expect(outcome.status).toBe('skipped')
+    expect(storage.jobs.findByTaskId(ids.taskId).filter((job) => job.status === 'queued')).toHaveLength(0)
+    expect(storage.tasks.findById(ids.taskId)!.roadmapActive).toBe(false)
+  })
+
+  it('park された Task を blocked へ escalate しない（park の取り消しになるため）', async () => {
+    exhaustAttempts(storage, ids)
+    const failed = createFailedJob(storage, ids, { exitCode: 99 })
+    park(ids.taskId)
+
+    await runRepairFlow(storage, { failedJob: failed }, deps())
+
+    // blocked は roadmapActive に関係なく project を占有し、resume は park を理由に拒否する。
+    // 上げてしまうと誰も解消できない状態になる。
+    expect(storage.tasks.findById(ids.taskId)!.status).toBe('pending')
+  })
+
+  it('Design Review 中に park されたら、通過していても repair Job を作らない', async () => {
+    const failed = createFailedJob(storage, ids)
+    const parkingDeps = {
+      ...deps(),
+      execute: async () => {
+        park(ids.taskId)
+        return { ok: true as const, stdout: ALIGNED_STDOUT, timedOut: false }
+      },
+    }
+
+    const outcome = await runRepairFlow(storage, { failedJob: failed }, parkingDeps)
+
+    expect(outcome.status).toBe('skipped')
+    expect(storage.jobs.findByTaskId(ids.taskId).filter((job) => job.status === 'queued')).toHaveLength(0)
+  })
+})
 
 describe('invariant 1: Human escalationの実在性', () => {
   let storage: IStorage

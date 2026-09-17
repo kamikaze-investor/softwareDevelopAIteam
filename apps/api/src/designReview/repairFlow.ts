@@ -109,9 +109,7 @@ function toPriorRepairJobs(
  * blockedのTaskはStage 1 retryの対象外であり、既存のresumeエンドポイントで再開できる。
  */
 function escalateToHuman(storage: IStorage, task: Task, reason: string): RepairFlowOutcome {
-  if (task.status !== 'blocked') {
-    storage.tasks.update(task.id, { status: 'blocked' })
-  }
+  escalateTaskToHuman(storage, task.id)
   return { status: 'escalated', reason }
 }
 
@@ -138,6 +136,11 @@ export async function runRepairFlow(
   }
   if (task.status === 'blocked' || task.status === 'done') {
     return { status: 'skipped', reason: `task is ${task.status}` }
+  }
+  // park された Task の失敗を修復しない。repair は queued Job を作る経路であり、
+  // Worker は Task の状態を見ずにそれを拾うため、park が黙って取り消される。
+  if (storage.tasks.isParked(task.id)) {
+    return { status: 'skipped', reason: 'task was parked by abort_task' }
   }
 
   const priorJobs = storage.jobs.findByTaskId(task.id)
@@ -209,6 +212,12 @@ export async function runRepairFlow(
       task,
       `design review did not align (${reviewOutcome.status}${reviewOutcome.decision ? `: ${reviewOutcome.decision}` : ''})`,
     )
+  }
+
+  // Design Review を待っている間に `abort_task` がこの Task を park しうる。
+  // 待つ前の判定のまま queued Job を作ると park が黙って取り消される。
+  if (storage.tasks.isParked(task.id)) {
+    return { status: 'skipped', reason: 'task was parked by abort_task while the review ran' }
   }
 
   // review済みpromptをそのままaiCliPromptにする（追記・変更しない）。
@@ -306,6 +315,14 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
 
 /** Taskを既存のHuman escalation（blocked）へ入れる。呼び出し元から明示的に使う。 */
 export function escalateTaskToHuman(storage: IStorage, taskId: string): void {
+  // **park された Task を blocked へ上げない。**
+  //
+  // blocked は `roadmapActive` に関係なく project を占有する（`occupiesProject()`）ため、
+  // park した Task をここで上げると park が事実上取り消され、しかも
+  // `resumeBlockedTask()` は park を理由に拒否するので誰も解消できなくなる。
+  // park された Task について「人へ渡す」相手はもう居ない —— CEO が既に判断した結果である。
+  if (storage.tasks.isParked(taskId)) return
+
   const task = storage.tasks.findById(taskId)
   if (task && task.status !== 'blocked') {
     storage.tasks.update(taskId, { status: 'blocked' })
@@ -381,6 +398,13 @@ export async function executeQueuedRepair(
 
   if (storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === stepKey)) {
     return { status: 'already_started', stepKey }
+  }
+
+  // Design Review を待っている間に `abort_task` がこの Task を park しうる。
+  // ここで repair Job を作ると park が黙って取り消される（escalate もしない —
+  // park された Task を blocked へ上げるのは park の取り消しと同じ結果になる）。
+  if (storage.tasks.isParked(taskId)) {
+    return { status: 'skipped', reason: 'task was parked by abort_task while the review ran' }
   }
 
   // review済みpromptをそのままaiCliPromptにする（追記・変更しない）。
