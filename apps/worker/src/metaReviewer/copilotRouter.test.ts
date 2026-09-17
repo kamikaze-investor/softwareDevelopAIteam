@@ -15,7 +15,7 @@ vi.mock('node:child_process', () => ({
 }))
 
 import { spawnSync } from 'node:child_process'
-import { callCopilotForMetaReview, DEFAULT_COPILOT_META_REVIEW_MODEL } from './copilotRouter.js'
+import { callCopilotForMetaReview, COPILOT_ARGV_PROMPT_BYTE_LIMIT, DEFAULT_COPILOT_META_REVIEW_MODEL } from './copilotRouter.js'
 
 const mockSpawnSync = vi.mocked(spawnSync)
 
@@ -238,5 +238,34 @@ describe('callCopilotForMetaReview bounded retry (attempt 1 -> 10s -> attempt 2 
     } finally {
       process.env = originalEnv
     }
+  })
+})
+
+describe('large prompt handling (E2BIG)', () => {
+  it('小さい prompt は従来どおり -p で渡す', () => {
+    mockSpawnSync.mockReturnValue(success('ok'))
+    callCopilotForMetaReview('small prompt')
+
+    const argv = mockSpawnSync.mock.calls[0][1] as string[]
+    const options = mockSpawnSync.mock.calls[0][2] as { input?: string }
+    expect(argv).toContain('-p')
+    expect(argv).toContain('small prompt')
+    expect(options.input).toBeUndefined()
+  })
+
+  it('argv 上限を超える prompt は stdin で渡す（E2BIG を避ける）', () => {
+    mockSpawnSync.mockReturnValue(success('ok'))
+    const huge = 'x'.repeat(COPILOT_ARGV_PROMPT_BYTE_LIMIT + 1)
+    callCopilotForMetaReview(huge)
+
+    const argv = mockSpawnSync.mock.calls[0][1] as string[]
+    const options = mockSpawnSync.mock.calls[0][2] as { input?: string }
+    // prompt を argv へ載せない。
+    expect(argv).not.toContain('-p')
+    expect(argv.some((a) => a.length > 1000)).toBe(false)
+    expect(options.input).toBe(huge)
+    // ツール無効化は入力経路に依存せず維持する。
+    expect(argv).toContain('--available-tools')
+    expect(argv).toContain('--model')
   })
 })
