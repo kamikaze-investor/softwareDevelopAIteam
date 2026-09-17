@@ -195,8 +195,12 @@ function checkFollowUpEligibility(
     )
   }
 
-  // 2. 先行 Task が実行済みであること。Job が1つも無いなら、まだ初回が動いていない。
-  const executed = siblings.filter((task) => storage.jobs.findByTaskId(task.id).length > 0)
+  // 2. 先行 Task が実行済みであること。
+  //    **queued は「まだ動いていない」である**（独立レビュー Finding 4）。
+  //    queued しか無い Task を「実行済み」と数えると、一度も走っていない項目へ follow-up が付く。
+  const executed = siblings.filter(
+    (task) => storage.jobs.findByTaskId(task.id).some((job) => job.status !== 'queued'),
+  )
   if (executed.length === 0) {
     return fail(
       'FOLLOW_UP_NOT_ELIGIBLE',
@@ -206,7 +210,12 @@ function checkFollowUpEligibility(
 
   // 3. active Task が残っていないこと。blocked / failed を follow-up で迂回させない。
   //    blocked は resume 経路、failed は PL diagnosis / recovery 経路が正規の復旧手段である。
-  const active = siblings.find((task) => task.status !== 'done')
+  //
+  //    **同一項目の兄弟だけでなく Project 全体を見る**（独立レビュー Finding 5）。
+  //    CEO 確定の成立条件は「active Task なし」であって「この項目に active Task なし」ではない。
+  //    PL tick は手前で Project の idle を確かめるが、採用 seam は直接も叩かれるため
+  //    ここが権威ある判定でなければならない。
+  const active = projectTasks.find((task) => task.status !== 'done')
   if (active) {
     return fail(
       'FOLLOW_UP_NOT_ELIGIBLE',
@@ -236,9 +245,17 @@ function checkFollowUpEligibility(
   // 6. 前の Task と同じ作業を繰り返していないこと。
   //    **上限 10 を待たずここで止める。** 上限は最後の非常ブレーキであって、
   //    重複検知の主役ではない。
+  //
+  //    比較は **description 全体**に対して行う（独立レビュー Finding 3）。
+  //    marker を頼りに切り出すと、(a) marker を持たない旧 Task が検査対象から丸ごと外れ、
+  //    (b) scope 本文に marker と同じ文字列を混ぜるだけで切り出し位置をずらして
+  //    同一 scope を通せてしまう。どちらも「同じ仕事の再実行」を素通りさせる。
+  const normalizedScope = normalizeScope(scope)
   const repeated = siblings.find((task) => {
-    const previous = extractImplementationScope(task.description)
-    return previous !== undefined && normalizeScope(previous) === normalizeScope(scope)
+    const extracted = extractImplementationScope(task.description)
+    if (extracted !== undefined && normalizeScope(extracted) === normalizedScope) return true
+    // marker が無い / 偽装された場合でも、本文に同じ scope が現れていれば繰り返しとみなす。
+    return normalizeScope(task.description).includes(normalizedScope)
   })
   if (repeated) {
     return fail(
@@ -367,6 +384,18 @@ export async function adoptRoadmapItem(
       return { ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE', reason: minted.reason }
     }
     taskKey = minted.roadmapTaskKey
+
+    // 発番した identity が既に居るなら、読み取りから書き込みまでの間に別の採用が走っている。
+    // `syncRoadmapTasks()` は **Job を持たない Task を可変として扱う**ので、ここを素通りさせると
+    // 相手の pending Task の scope を上書きしうる（独立レビュー Finding 1）。
+    // 単一 API プロセス前提が崩れた場合に、静かに混ざるのではなく**失敗させる**。
+    if (projectTasks.some((task) => task.roadmapTaskKey === taskKey)) {
+      return {
+        ok: false,
+        code: 'FOLLOW_UP_NOT_ELIGIBLE',
+        reason: `task identity "${taskKey}" already exists; a concurrent adoption is in flight`,
+      }
+    }
   }
 
   // 同一 Task identity の二重実行を拒否する（既存防御）。
@@ -377,7 +406,11 @@ export async function adoptRoadmapItem(
     return {
       ok: false,
       code: 'ALREADY_EXECUTED',
-      reason: `"${taskKey}" already has an executed Task (${existingTask.id})`,
+      // 通常採用の文面は**一字も変えない**（独立レビュー Finding 7）。
+      // follow-up のときだけ、どの identity で止まったのかが分かる文面にする。
+      reason: input.followUp === true
+        ? `task identity "${taskKey}" already has an executed Task (${existingTask.id})`
+        : `Roadmap item "${input.roadmapId}" already has an executed Task (${existingTask.id})`,
     }
   }
 
@@ -434,6 +467,20 @@ export async function adoptRoadmapItem(
     .find((task) => task.roadmapTaskKey === taskKey)
   if (!adopted) {
     return { ok: false, code: 'SYNC_FAILED', reason: 'Task was not present after a successful sync' }
+  }
+
+  // 取れた Task が**今回渡した spec そのもの**であることを確かめる。
+  // 競合した相手の Task を掴んで「採用できた」と返すと、Design Review へ渡す prompt と
+  // 実際に保存された allowedPaths がずれる（独立レビュー Finding 1）。
+  if (
+    adopted.description !== taskInput.description
+    || adopted.allowedPaths?.join('\u0000') !== allowedPaths.join('\u0000')
+  ) {
+    return {
+      ok: false,
+      code: 'SYNC_FAILED',
+      reason: `task "${taskKey}" does not carry the spec this adoption submitted; a concurrent adoption may have won`,
+    }
   }
 
   // Project が既に running の場合、continuation は「Task 完了時」にしか発火しないため、

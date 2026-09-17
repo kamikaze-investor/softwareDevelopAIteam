@@ -34,26 +34,40 @@ export const MAX_FOLLOW_UPS_PER_ROADMAP_ITEM = 10
 const FIRST_FOLLOW_UP_SEQUENCE = 2
 
 /**
- * `<base>#<sequence>`。sequence は十進数のみ。
+ * `<base>#<sequence>`。sequence は **2 以上・先頭ゼロなし・3桁まで**に限る。
  *
- * 末尾一致にしているのは、ledger id 自体が `#` を含み得るためである
- * （parser の `roadmap:id` は空白以外を許す）。base 側は貪欲に取り、最後の `#<digits>` だけを
- * sequence と解釈する。
+ * ledger の `roadmap:id` は空白以外を許すため、`foo#2` という **正当な ledger id** が存在し得る
+ * （独立レビュー Finding 2）。形式を絞っても曖昧さは完全には消えないので、
+ * ledger を参照できる呼び出し側は `getBaseRoadmapId(key, knownLedgerIds)` を使い、
+ * **実在する ledger id を優先**して解決すること。
+ *
+ * `#0` / `#1` / `#01` / 巨大数は sequence として受け付けない（初回 Task は suffix を持たず 1 に相当する）。
  */
-const FOLLOW_UP_KEY_PATTERN = /^(.+)#(\d+)$/
+const FOLLOW_UP_KEY_PATTERN = /^(.+)#([2-9]|[1-9]\d{1,2})$/
 
 /**
  * Task identity から、それが属する Roadmap ledger item の id を返す。
  *
  * 通常 Task ではそのまま同じ値が返る。**ledger を引くときは必ずこれを通すこと。**
  */
-export function getBaseRoadmapId(roadmapTaskKey: string): string {
+export function getBaseRoadmapId(
+  roadmapTaskKey: string,
+  knownLedgerIds?: ReadonlySet<string>,
+): string {
+  // key そのものが実在の ledger id なら、それは follow-up ではなく通常 Task の key である。
+  // `foo` と `foo#2` が両方 ledger に居る場合の取り違えを防ぐ唯一の確実な手掛かり。
+  if (knownLedgerIds?.has(roadmapTaskKey)) return roadmapTaskKey
+
   const match = FOLLOW_UP_KEY_PATTERN.exec(roadmapTaskKey)
   return match ? (match[1] as string) : roadmapTaskKey
 }
 
 /** その Task identity が follow-up のものか。 */
-export function isFollowUpTaskKey(roadmapTaskKey: string): boolean {
+export function isFollowUpTaskKey(
+  roadmapTaskKey: string,
+  knownLedgerIds?: ReadonlySet<string>,
+): boolean {
+  if (knownLedgerIds?.has(roadmapTaskKey)) return false
   return FOLLOW_UP_KEY_PATTERN.test(roadmapTaskKey)
 }
 

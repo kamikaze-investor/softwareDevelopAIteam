@@ -66,6 +66,7 @@ const AUDIT_ENTITY_TYPE = 'roadmap_item'
 export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
 export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
 export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
+export const AUDIT_FOLLOW_UP_ADOPTED = 'follow_up_candidate_adopted'
 
 /**
  * 1 件の open Roadmap item が、いま採用経路から見てどの状態にあるか。
@@ -144,6 +145,7 @@ export function classifyAdoptionCandidates(
  */
 function recordFollowUpAudit(
   storage: IStorage,
+  projectId: string,
   roadmapId: string,
   operation: string,
   detail: string,
@@ -152,16 +154,27 @@ function recordFollowUpAudit(
     actor: 'api',
     operation,
     entityType: AUDIT_ENTITY_TYPE,
-    entityId: roadmapId,
+    // **Project ごとに分ける**（独立レビュー Finding 6）。同じ roadmap id でも別 Project の
+    // skip 履歴が順序へ影響してはならない。archived な Project の履歴も混ざらない。
+    entityId: followUpAuditKey(projectId, roadmapId),
     result: 'success',
     detail,
   })
 }
 
+/** audit の entityId。`<projectId>/<roadmapId>`。 */
+export function followUpAuditKey(projectId: string, roadmapId: string): string {
+  return `${projectId}/${roadmapId}`
+}
+
 /** その候補が、直近で連続して何回 skip されたか。**時間は見ない**（CEO 指示）。 */
-export function countConsecutiveSkips(storage: IStorage, roadmapId: string): number {
+export function countConsecutiveSkips(
+  storage: IStorage,
+  projectId: string,
+  roadmapId: string,
+): number {
   // `findByEntity()` は **新しい順**（created_at DESC）で返す。先頭から見るのが「直近」である。
-  const entries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, roadmapId)
+  const entries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, followUpAuditKey(projectId, roadmapId))
   let skips = 0
   for (const entry of entries) {
     if (entry.operation === AUDIT_FOLLOW_UP_SKIPPED) {
@@ -184,11 +197,12 @@ export function countConsecutiveSkips(storage: IStorage, roadmapId: string): num
  */
 export function applyFollowUpBoost(
   storage: IStorage,
+  projectId: string,
   candidates: readonly ClassifiedCandidate[],
 ): ClassifiedCandidate[] {
   const marked = candidates.map((candidate) => (
     candidate.kind === 'follow_up'
-      && countConsecutiveSkips(storage, candidate.id) >= FOLLOW_UP_SKIPS_BEFORE_BOOST
+      && countConsecutiveSkips(storage, projectId, candidate.id) >= FOLLOW_UP_SKIPS_BEFORE_BOOST
       ? { ...candidate, boosted: true }
       : candidate
   ))
@@ -489,7 +503,7 @@ export async function runAdoptionStep(
   // 後段で切り捨ててから判定すると、rotation の巡り合わせ次第で follow-up 候補が
   // 永久に観測されない（2026-09-15 の予算枯渇と同じ「見えないまま止まる」形になる）。
   const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(deps.readLedger))
-  const available = applyFollowUpBoost(storage, classified)
+  const available = applyFollowUpBoost(storage, projectId, classified)
     .filter((candidate) => candidate.kind !== 'not_available')
   if (available.length === 0) {
     return { status: 'no_candidate', reason: 'no open roadmap item in the ledger' }
@@ -498,10 +512,10 @@ export async function runAdoptionStep(
   // 検出できたことを残す。選ばれたかどうかは下で別途記録する。
   for (const candidate of available) {
     if (candidate.kind !== 'follow_up') continue
-    recordFollowUpAudit(storage, candidate.id, AUDIT_FOLLOW_UP_DETECTED,
+    recordFollowUpAudit(storage, projectId, candidate.id, AUDIT_FOLLOW_UP_DETECTED,
       candidate.boosted ? 'detected (boosted after consecutive skips)' : 'detected')
     if (candidate.boosted) {
-      recordFollowUpAudit(storage, candidate.id, AUDIT_FOLLOW_UP_BOOSTED,
+      recordFollowUpAudit(storage, projectId, candidate.id, AUDIT_FOLLOW_UP_BOOSTED,
         `ordered ahead after ${FOLLOW_UP_SKIPS_BEFORE_BOOST} consecutive skips`)
     }
   }
@@ -531,8 +545,8 @@ export async function runAdoptionStep(
   // **時間ベースの boost は入れない**（CEO 指示）。数えるのは「採用機会を何回通過したか」である。
   for (const candidate of candidates) {
     if (candidate.kind !== 'follow_up' || candidate.id === proposal.roadmapId) continue
-    recordFollowUpAudit(storage, candidate.id, AUDIT_FOLLOW_UP_SKIPPED,
-      `not selected in this adoption opportunity (consecutive skips: ${countConsecutiveSkips(storage, candidate.id) + 1})`)
+    recordFollowUpAudit(storage, projectId, candidate.id, AUDIT_FOLLOW_UP_SKIPPED,
+      `not selected in this adoption opportunity (consecutive skips: ${countConsecutiveSkips(storage, projectId, candidate.id) + 1})`)
   }
 
   if (!chosen) {
@@ -579,6 +593,13 @@ export async function runAdoptionStep(
 
   if (!result.ok) {
     return { status: 'adoption_rejected', roadmapId: proposal.roadmapId, reason: result.reason }
+  }
+
+  // **採用できたら連続 skip を切る**（独立レビュー Finding 6）。
+  // これを書かないと、間に採用が挟まっても次の候補が boost されたままになる。
+  if (chosen.kind === 'follow_up') {
+    recordFollowUpAudit(storage, projectId, proposal.roadmapId, AUDIT_FOLLOW_UP_ADOPTED,
+      `adopted as task ${result.taskId}`)
   }
 
   return { status: 'adopted', roadmapId: proposal.roadmapId, taskId: result.taskId }

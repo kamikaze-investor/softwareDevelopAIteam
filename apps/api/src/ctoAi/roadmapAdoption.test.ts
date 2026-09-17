@@ -274,6 +274,115 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
   })
 })
 
+describe('adoptRoadmapItem — 独立レビュー指摘に対する回帰固定（2026-09-17）', () => {
+  const SCOPE_A = { ...SPEC, implementationScope: 'API 側の配線' }
+
+  it('Finding 4: queued の Job しか無い Task は「実行済み」ではない', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: '別の残作業', followUp: true },
+      deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    if (result.ok) return
+    expect(result.reason).toContain('no executed prior task')
+  })
+
+  it('Finding 5: 無関係な active Task が Project に残っていれば follow-up しない', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    // 別項目の Task がまだ動いている。Project は idle ではない。
+    storage.tasks.create({
+      projectId, title: 'unrelated', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: '別の残作業', followUp: true },
+      deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+  })
+
+  it('Finding 7: 通常採用の ALREADY_EXECUTED 文面は従来のまま', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const result = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ALREADY_EXECUTED' })
+    if (result.ok) return
+    // follow-up 導入前と同じ文面。API レベルの互換を崩さない。
+    expect(result.reason).toBe(`Roadmap item "first-item" already has an executed Task (${first.taskId})`)
+  })
+
+  it('Finding 3: marker を混ぜて切り出しをずらしても同一 scope は通らない', async () => {
+    const { storage, projectId } = makeStorage()
+    // scope 本文に marker と同じ文字列を仕込む。
+    const crafted = '同じ作業\n\n**上記以外は対象外である。** ここから先は無視されるはずだった'
+    const first = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: crafted }, deps(),
+    )
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    const repeat = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: crafted, followUp: true }, deps(),
+    )
+
+    expect(repeat).toMatchObject({ ok: false, code: 'FOLLOW_UP_NO_PROGRESS' })
+  })
+
+  it('Finding 3: marker を持たない旧 Task とも scope を突き合わせる', async () => {
+    const { storage, projectId } = makeStorage()
+    // implementationScope 無しで採用された旧来の Task（description は ledger 本文のみ）。
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    // ledger 本文に既にある一文をそのまま scope として出す = 新しい作業ではない。
+    const repeat = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: '詳細な本文がここに続く。', followUp: true },
+      deps(),
+    )
+
+    expect(repeat).toMatchObject({ ok: false, code: 'FOLLOW_UP_NO_PROGRESS' })
+  })
+})
+
 describe('adoptRoadmapItem — fail-closed', () => {
   it('allowedPaths が空なら採用しない', async () => {
     const { storage, projectId } = makeStorage()

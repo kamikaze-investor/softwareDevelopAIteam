@@ -12,8 +12,10 @@ import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import {
   applyFollowUpBoost,
+  AUDIT_FOLLOW_UP_ADOPTED,
   AUDIT_FOLLOW_UP_BOOSTED,
   AUDIT_FOLLOW_UP_SKIPPED,
+  followUpAuditKey,
   classifyAdoptionCandidates,
   countConsecutiveSkips,
   FOLLOW_UP_SKIPS_BEFORE_BOOST,
@@ -267,23 +269,23 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
 
     for (let round = 1; round <= FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
       await runAdoptionStep(storage, projectId, chooseOther)
-      expect(countConsecutiveSkips(storage, 'open-item'), `round ${round}`).toBe(round)
+      expect(countConsecutiveSkips(storage, projectId, 'open-item'), `round ${round}`).toBe(round)
     }
 
     const skips = storage.auditLog
-      .findByEntity('roadmap_item', 'open-item')
+      .findByEntity('roadmap_item', followUpAuditKey(projectId, 'open-item'))
       .filter((entry) => entry.operation === AUDIT_FOLLOW_UP_SKIPPED)
     expect(skips).toHaveLength(FOLLOW_UP_SKIPS_BEFORE_BOOST)
 
     // 閾値に達したので、次からは先頭へ出る。
     const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
-    const boosted = applyFollowUpBoost(storage, classified)
+    const boosted = applyFollowUpBoost(storage, projectId, classified)
     expect(boosted[0]?.id).toBe('open-item')
     expect(boosted[0]?.boosted).toBe(true)
 
     await runAdoptionStep(storage, projectId, chooseOther)
     const boostEvents = storage.auditLog
-      .findByEntity('roadmap_item', 'open-item')
+      .findByEntity('roadmap_item', followUpAuditKey(projectId, 'open-item'))
       .filter((entry) => entry.operation === AUDIT_FOLLOW_UP_BOOSTED)
     expect(boostEvents.length).toBeGreaterThan(0)
   })
@@ -293,12 +295,12 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     for (let round = 0; round < FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
       storage.auditLog.record({
         actor: 'api', operation: AUDIT_FOLLOW_UP_SKIPPED, entityType: 'roadmap_item',
-        entityId: 'open-item', result: 'success', detail: 'test',
+        entityId: followUpAuditKey(projectId, 'open-item'), result: 'success', detail: 'test',
       })
     }
     const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
 
-    const boosted = applyFollowUpBoost(storage, classified)
+    const boosted = applyFollowUpBoost(storage, projectId, classified)
 
     // 並び替えただけ。集合も kind も同じ。
     expect(boosted.map((c) => c.id).sort()).toEqual(classified.map((c) => c.id).sort())
@@ -307,20 +309,41 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     }
   })
 
-  it('採用されれば連続 skip は途切れる', () => {
-    const { storage } = projectWithExecutedItem()
-    storage.auditLog.record({
-      actor: 'api', operation: AUDIT_FOLLOW_UP_SKIPPED, entityType: 'roadmap_item',
-      entityId: 'open-item', result: 'success', detail: 'test',
-    })
-    expect(countConsecutiveSkips(storage, 'open-item')).toBe(1)
+  it('採用されれば連続 skip は途切れる（採用イベントは本番経路が書く）', async () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    const chooseOther = {
+      propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'in-progress-item' }),
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
+    }
+    await runAdoptionStep(storage, projectId, chooseOther)
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(1)
 
-    storage.auditLog.record({
-      actor: 'api', operation: 'follow_up_adopted', entityType: 'roadmap_item',
-      entityId: 'open-item', result: 'success', detail: 'test',
+    // 今度は follow-up 候補そのものを選ぶ。**採用イベントは runAdoptionStep が書く**
+    // （テストが手で書かない。書いていなければこのテストが落ちる）。
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'open-item' }),
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'open-item#2', title: 't' }),
     })
 
-    expect(countConsecutiveSkips(storage, 'open-item')).toBe(0)
+    const adopted = storage.auditLog
+      .findByEntity('roadmap_item', followUpAuditKey(projectId, 'open-item'))
+      .filter((entry) => entry.operation === AUDIT_FOLLOW_UP_ADOPTED)
+    expect(adopted.length).toBeGreaterThan(0)
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(0)
+  })
+
+  it('別 Project の skip 履歴は順序へ影響しない', () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    for (let round = 0; round < FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
+      storage.auditLog.record({
+        actor: 'api', operation: AUDIT_FOLLOW_UP_SKIPPED, entityType: 'roadmap_item',
+        entityId: followUpAuditKey('some-other-project', 'open-item'), result: 'success', detail: 'test',
+      })
+    }
+
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(0)
   })
 })
 
