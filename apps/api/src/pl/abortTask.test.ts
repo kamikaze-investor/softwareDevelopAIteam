@@ -266,6 +266,103 @@ describe('abortTask — 承認と対象の束縛', () => {
     })).toMatchObject({ ok: false, code: 'FOREIGN_BLOCKED_JOB' })
   })
 
+  // 2026-09-17 の production Operational E2E で実測: AIteamOS project には done な Task に
+  // 紐づく古い blocked 行が4本残っており、それらを所有者と数えたせいで abort が丸ごと通らなかった。
+  // 既存 `findWorkspaceOwningTaskId()` はこれらを所有者と見なしていない。
+  it('done な Task に残る古い blocked Job は所有者として数えない', () => {
+    const fx = seed()
+    const finished = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'finished long ago', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const staleJob = fx.storage.jobs.create({
+      taskId: finished.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    // 対象 Task 側は通常どおり cleanup 要求へ進める。
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'cleanup_requested', jobIds: [fx.jobId] })
+
+    // 古い blocked 行は印も付かず、状態も変わらない。
+    expect(fx.storage.jobs.findById(staleJob.id)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
+    expect(fx.storage.jobs.findById(staleJob.id)?.status).toBe('blocked')
+  })
+
+  // 取り残された行が所有者でないと言えるのは、workspace を観測して
+  // 「次の Task を始められる状態」だと確かめたときだけである（Worker と同じ判定）。
+  // 対象 Task 自身に解放すべき Job が無ければ、その観測の当てが無い。
+  it('観測の当てが無ければ、取り残された blocked Job を所有者として扱う', () => {
+    const fx = seed()
+    // 対象 Task 側の blocked Job を消す（= 段階操作へ進まない直接 park 経路）。
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    const finished = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'finished long ago', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    fx.storage.jobs.create({
+      taskId: finished.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'FOREIGN_BLOCKED_JOB' })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  // 証明は観測した workspace にしか効かない。別の workingDir に取り残された行について、
+  // こちらの workspace が clean だったことは何も言っていない。
+  it('別 workspace に取り残された blocked Job は、こちらの証明では見逃さない', () => {
+    const fx = seed()
+    const finished = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'finished elsewhere', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const elsewhere = fx.storage.jobs.create({
+      taskId: finished.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/other' }, dryRun: false,
+      workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0]).id
+
+    // 対象 Task の cleanup は /workspace/target しか観測しない。
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'FOREIGN_BLOCKED_JOB' })
+
+    expect(fx.storage.jobs.findById(elsewhere)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  // **この1件はこの修正の証拠ではない**（独立レビューの指摘どおり、旧実装でも通る）。
+  // 「done なら見逃す」を将来 quarantine まで広げてしまわないための固定として残す。
+  it('quarantine された blocked Job は done な Task のものでも所有者として数える', () => {
+    const fx = seed()
+    const finished = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'finished but unproven', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    fx.storage.jobs.create({
+      taskId: finished.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      failureMetadata: { quarantined: true },
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    // 未検証の workspace を持つ行は done でも手放していない（既存 quarantine の不変条件）。
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'FOREIGN_BLOCKED_JOB' })
+  })
+
   it('他 Task の blocked Job には cleanup を要求しない（承認の流用を作らない）', () => {
     const fx = seed()
     const other = fx.storage.tasks.create({
@@ -421,6 +518,36 @@ describe('abortTask — blocked Job を1本残さない', () => {
 
     expect(fx.storage.jobs.findById(stale)?.status).toBe('blocked')
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  // 観測は必ずどこかの workspace で採られている。対象 Job 側に workingDir が無いと、
+  // その観測がこの Job の workspace の話だという対応が付かない。
+  // （`jobs.update()` は `safe_command` を書かないので、この形は create 時にしか作れない。）
+  it('対象 Job に workingDir が無ければ park しない（証明の結び先が無い）', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'legacy', description: 'd', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    // 古い行はこの形で読めることがある（`SafeCommand.workingDir` は型上必須だが永続化は別）。
+    const legacyJob = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test' }, dryRun: false, workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(abortTask(storage, {
+      taskId: task.id, approvalRequestId: approve(storage, task.id), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'cleanup_requested' })
+
+    expect(completeAbortCleanup(storage, {
+      jobId: legacyJob.id, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+
+    expect(storage.jobs.findById(legacyJob.id)?.status).toBe('blocked')
+    expect(storage.tasks.findById(task.id)?.roadmapActive).toBe(true)
   })
 
   it('baseline を持たない blocked Job が残っていれば park しない', () => {

@@ -43,7 +43,7 @@
  * dirty なまま残った blocked Job の revert は別責務（Finding）として分離する。
  */
 
-import { isLiveJob } from '@ai-team/shared'
+import { holdsWorkspaceWhenBlocked, isLiveJob, isStaleBlockedJobCandidate } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import type { Job, JobWorkspaceBaseline } from '@ai-team/shared'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
@@ -76,9 +76,16 @@ export type AbortTaskResult =
     details?: unknown
   }
 
-/** 所有権を保持している（= park の妨げになる）Job か。 */
-function holdsWorkspaceOwnership(job: Job): boolean {
-  return job.status === 'blocked'
+/**
+ * 所有権を保持している（= park の妨げになる）Job か。
+ *
+ * **`blocked` であることと所有していることは同じではない。** done な Task に残る blocked 行は
+ * 履歴であって所有者ではない、というのが既存 `findWorkspaceOwningTaskId()` の判定である。
+ * ここで独自に「blocked なら所有者」と決めていたため、2026-09-17 の Operational E2E では
+ * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
+ */
+function holdsWorkspaceOwnership(task: { status: string }, job: Job): boolean {
+  return holdsWorkspaceWhenBlocked(task, job)
 }
 
 export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskResult {
@@ -147,14 +154,12 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   //
   // 対象は**この Task の Job だけ**である。他 Task の blocked Job にこの Task の承認で
   // 印を付けると、その承認で別 Task が park できてしまう（独立レビュー Finding 2）。
-  const owning = storage.jobs.findByTaskId(task.id).filter((job) => holdsWorkspaceOwnership(job))
+  const owning = storage.jobs.findByTaskId(task.id).filter((job) => holdsWorkspaceOwnership(task, job))
 
   // 他 Task が workspace を所有したままなら park しても workspace は解放されない。
-  // 既存 `parkTask()` の前提（project に blocked Job が無いこと）と揃えて fail-closed にする。
-  const foreign = projectTasks
-    .filter((candidate) => candidate.id !== task.id)
-    .flatMap((candidate) =>
-      storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(job)))
+  const otherTasks = projectTasks.filter((candidate) => candidate.id !== task.id)
+  const foreign = otherTasks.flatMap((candidate) =>
+    storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(candidate, job)))
   if (foreign.length > 0) {
     return {
       ok: false,
@@ -165,6 +170,21 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
         + '(parking this task would not release the workspace)',
     }
   }
+
+  // ── 終わった Task に取り残された blocked 行 ──
+  //
+  // これは「所有していない」ではなく「**workspace を観測しないと決められない**」である。
+  // Worker は同じ行について worktree を観測し、次の Task を始められる状態
+  // （差分なし / 進行中の git 操作なし / HEAD 解決可）になって初めて所有権を手放したと見なす。
+  //
+  // 対象 Task 自身に解放すべき blocked Job があるなら、この後の段階操作で Worker が観測を報告し、
+  // API が `knownGood`（worktree・index が clean、git 操作なし、HEAD 有効、死角なし）を
+  // 検証してからでなければ park は成立しない。その検証は上記の解放条件より強いので、
+  // 通過した時点で取り残された行が所有者でないことも同時に証明されている。
+  //
+  // 観測の当てが無い（＝解放すべき Job が無い）場合は証明が取れないため、所有者として扱う。
+  const staleCandidates = otherTasks.flatMap((candidate) =>
+    storage.jobs.findByTaskId(candidate.id).filter((job) => isStaleBlockedJobCandidate(candidate, job)))
 
   const quarantined = owning.find((job) => job.failureMetadata?.quarantined === true)
   if (quarantined) {
@@ -178,6 +198,17 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   }
 
   if (owning.length === 0) {
+    if (staleCandidates.length > 0) {
+      return {
+        ok: false,
+        code: 'FOREIGN_BLOCKED_JOB',
+        reason:
+          `task ${staleCandidates[0].taskId} has a blocked job (${staleCandidates[0].id}) left over `
+          + 'from a finished task, and this task has no job whose cleanup would prove the workspace '
+          + 'is clean; refusing to park without that proof',
+      }
+    }
+
     const parked = storage.jobs.parkTask({
       taskId: task.id,
       reason: input.reason,
@@ -185,6 +216,28 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     })
     if (!parked.ok) return { ok: false, code: 'PARK_FAILED', reason: parked.reason }
     return { ok: true, status: 'parked', taskId: task.id }
+  }
+
+  // 証明が及ぶのは、これから観測する workspace だけである。別の workingDir に取り残された行は
+  // その証明の外側にあるので、所有者として扱う（独立レビュー round 2）。
+  // workingDir が読めない行は「同じ workspace だ」と言えないので証明の外側に置く
+  // （`SafeCommand.workingDir` は型上必須だが、古い行から undefined で読めることがある）。
+  const provenDirs = new Set(
+    owning.map((job) => job.safeCommand?.workingDir).filter((dir): dir is string => Boolean(dir)),
+  )
+  const outsideProof = staleCandidates.find((job) => {
+    const dir = job.safeCommand?.workingDir
+    return dir === undefined || dir === '' || !provenDirs.has(dir)
+  })
+  if (outsideProof) {
+    return {
+      ok: false,
+      code: 'FOREIGN_BLOCKED_JOB',
+      reason:
+        `task ${outsideProof.taskId} has a blocked job (${outsideProof.id}) left over from a `
+        + `finished task in ${outsideProof.safeCommand?.workingDir}, which this cleanup would not `
+        + 'observe; refusing to park without proof for that workspace',
+    }
   }
 
   // cleanup を要求する。**実体の掃除・観測は Worker の既存経路が行う。**

@@ -6,7 +6,12 @@
  * → IStorage インターフェースを実装した別クラスに切り替えるだけでよい
  */
 
-import { LIVE_JOB_STATUSES, OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
+import {
+  holdsWorkspaceWhenBlocked,
+  isStaleBlockedJobCandidate,
+  LIVE_JOB_STATUSES,
+  OCCUPIES_PROJECT_SQL,
+} from '@ai-team/shared'
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
@@ -667,6 +672,54 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).all()
       return rows.map(deserializeProject)
     },
+  }
+
+  /**
+   * この Project の blocked Job のうち、workspace を所有しているものを1つ返す。
+   *
+   * `blocked` を無条件に所有者と数えない代わりに、**観測なしで結論できるものだけ**を数える。
+   * done な Task に取り残された行は「観測しないと決められない」ので、
+   * **どの workspace を証明したか**を `provenWorkingDir` で渡して呼び分ける:
+   *
+   * - `provenWorkingDir` 無し … workspace の観測が手に入らない経路（直接 park）。
+   *   取り残された行はすべて所有者として扱う。手放したと言える根拠が無いため fail-closed。
+   * - `provenWorkingDir` あり … 同じ transaction で `knownGood`（worktree・index が clean、
+   *   進行中の git 操作なし、HEAD 有効、死角なし）を検証済みの経路。その検証は Worker の
+   *   「次の Task を始められる」条件より強いので、取り残された行が所有者でないことも
+   *   同時に証明されている —— **ただし証明したのはその workingDir 1つだけである。**
+   *   別の workingDir に取り残された行については何も分かっていないので、所有者として扱う
+   *   （独立レビュー round 2: 証明は観測した workspace にしか効かない）。
+   *
+   * 判定の実体は `@ai-team/shared` 側の述語1箇所にある。SQL で書き直すと
+   * quarantine の JSON 判定まで二重定義になるため、行を引いて述語へ渡す。
+   */
+  function findBlockedOwnerInProject(
+    projectId: string,
+    options: { excludeTaskId?: string; provenWorkingDir?: string },
+  ): { job: Job; task: Task } | undefined {
+    const rows = db.prepare(
+      "SELECT j.* FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status = 'blocked'",
+    ).all(projectId) as any[]
+    for (const row of rows) {
+      const job = deserializeJob(row)
+      if (options.excludeTaskId !== undefined && job.taskId === options.excludeTaskId) continue
+      const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(job.taskId) as any
+      if (!taskRow) continue
+      const task = deserializeTask(taskRow)
+      if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
+      // ここへ来るのは stale 候補だけ。証明の及ぶ workspace のものだけを見逃す。
+      //
+      // **どちらかの workingDir が読めなければ「同じ workspace だ」と言えない。**
+      // `SafeCommand.workingDir` は型の上では必須だが、古い行から undefined で
+      // 読めることがある（コード側も `?.` で守っている）。両方 undefined を
+      // 「一致」と数えると、何も証明していない行を見逃すことになる。
+      const proven = options.provenWorkingDir
+      const candidateDir = job.safeCommand?.workingDir
+      if (proven === undefined || proven === '') return { job, task }
+      if (candidateDir === undefined || candidateDir !== proven) return { job, task }
+    }
+    return undefined
   }
 
   /**
@@ -2228,15 +2281,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
 
           // 所有権を保持する Job も live Job も残っていないことを transaction 内で再確認する。
-          const holding = db.prepare(
+          const live = db.prepare(
             "SELECT j.id AS id, j.status AS status FROM jobs j JOIN tasks t ON t.id = j.task_id "
-            + "WHERE t.project_id = ? AND j.status IN ('queued','running','blocked') LIMIT 1",
+            + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
           ).get(task.projectId) as { id: string; status: string } | undefined
-          if (holding) {
+          if (live) {
             return {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
-              reason: `project still has job ${holding.id} (${holding.status}); refusing to park`,
+              reason: `project still has job ${live.id} (${live.status}); refusing to park`,
+            }
+          }
+          // 直接 park は観測を1つも持たないので、証明の及ぶ workspace は無い。
+          const owner = findBlockedOwnerInProject(task.projectId, {})
+          if (owner) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `project still has job ${owner.job.id} (blocked); refusing to park`,
             }
           }
 
@@ -2330,23 +2392,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
 
-          // 他 Task が blocked Job で workspace を所有していないことも transaction 内で再確認する
-          // （stage 1 の `FOREIGN_BLOCKED_JOB` と同じ条件。判定から書き込みまでの間に
-          // 別 Task が所有者になっていたら park しても workspace は解放されない）。
-          const foreign = db.prepare(
-            "SELECT j.id AS id, j.task_id AS taskId FROM jobs j JOIN tasks t ON t.id = j.task_id "
-            + "WHERE t.project_id = ? AND j.task_id != ? AND j.status = 'blocked' LIMIT 1",
-          ).get(task.projectId, task.id) as { id: string; taskId: string } | undefined
-          if (foreign) {
-            return {
-              ok: false as const,
-              code: 'PRECONDITION_FAILED' as const,
-              reason:
-                `task ${foreign.taskId} holds the workspace through blocked job ${foreign.id}; `
-                + 'refusing to park',
-            }
-          }
-
           // ── 観測の再検証。ここだけが所有権解放の根拠である ──
           if (!job.workspaceBaseline) {
             return {
@@ -2408,7 +2453,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // ことであり、状態モデルが間違っているまま先へ進む場面そのものである。
           // 所有権は「安全だと分かったから解放する」ものであって、
           // 「危険だと言い切れないから解放する」ものではない（独立レビュー round 5 Finding 1）。
+          // **証明を結びつける先が読めないなら、そもそも解放しない。**
+          //
+          // `workingDir` が無い Job は「どの workspace の話なのか」を誰も言えない。
+          // 観測は必ずどこかの workspace で採られているので、その対応が付かない以上、
+          // 提示された観測がこの Job の workspace を表している保証がない。
+          // 兄弟の一致判定も undefined 同士が一致してしまい、意味を失う
+          // （独立レビュー: 対象 Job 側の workingDir 欠落が塞がれていなかった）。
           const workingDir = job.safeCommand?.workingDir
+          if (workingDir === undefined || workingDir === '') {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `job ${job.id} has no recorded workingDir, so an observation cannot be tied to `
+                + 'its workspace; ownership is retained (fail-closed)',
+            }
+          }
+
           const unproven = blockedSiblings.find((sibling) => (
             sibling.safeCommand?.workingDir !== workingDir
             || !sibling.workspaceBaseline
@@ -2438,6 +2500,29 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason:
                 `job ${quarantinedSibling.id} is quarantined; clear the quarantine through the `
                 + 'existing path first',
+            }
+          }
+
+          // ── ここで初めて「この workspace は clean で、次の Task を始められる」が証明された ──
+          //
+          // 他 Task が blocked Job で workspace を所有していないことを transaction 内で再確認する
+          // （stage 1 の `FOREIGN_BLOCKED_JOB` と同じ条件。判定から書き込みまでの間に
+          // 別 Task が所有者になっていたら park しても workspace は解放されない）。
+          //
+          // **証明が及ぶのは、いま検証した Job の workingDir 1つだけである。** 別の workspace に
+          // 取り残された行については何も分かっていないので所有者として扱う
+          // （独立レビュー round 2）。
+          const foreign = findBlockedOwnerInProject(task.projectId, {
+            excludeTaskId: task.id,
+            provenWorkingDir: job.safeCommand?.workingDir,
+          })
+          if (foreign) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `task ${foreign.task.id} holds the workspace through blocked job ${foreign.job.id}; `
+                + 'refusing to park',
             }
           }
 

@@ -39,6 +39,48 @@ export function isLiveJob(job: { status: string }): boolean {
 }
 
 /**
+ * **終わった Task に取り残された blocked 行か。**
+ *
+ * `apps/worker/src/index.ts` の `isStaleBlockedJobOfFinishedTask()` と同じ判定である。
+ *
+ * **これは「所有していない」という意味ではない。** Worker は該当行を見つけると
+ * `resolveWorkspaceOwnership()` で **worktree を観測**し、
+ * 「次の Task を実際に始められる状態」（worktree に差分が無い / 進行中の git 操作が無い /
+ * HEAD を解決できる）になって初めて所有権を手放したと見なす。それまでは所有者のままである。
+ *
+ * つまりこの述語が真でも、workspace の観測抜きに「所有していない」と結論してはならない。
+ * quarantine されている行はそもそも候補にならない（安全と証明されるまで保有し続ける）。
+ */
+export function isStaleBlockedJobCandidate(
+  task: { status: string },
+  job: { status: string; failureMetadata?: { quarantined?: boolean } | null },
+): boolean {
+  return job.status === 'blocked'
+    && task.status === 'done'
+    && job.failureMetadata?.quarantined !== true
+}
+
+/**
+ * **その blocked Job は、workspace を観測するまでもなく所有者か。**
+ *
+ * `findWorkspaceOwningTaskId()` が観測なしで所有者と確定させる条件と同じ。
+ * stale 候補（上）はここでは false になるが、**それは「所有していない」ではなく
+ * 「観測しないと決められない」**である。呼び出し側は観測による証明を用意するか、
+ * 用意できないなら所有者として扱うこと（fail-closed）。
+ *
+ * **この意味を使う側が自前で書き直さないこと。** 2026-09-17 の Operational E2E で、
+ * `abort_task` が「blocked なら無条件に所有者」と独自に判定していたために、
+ * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
+ */
+export function holdsWorkspaceWhenBlocked(
+  task: { status: string },
+  job: { status: string; failureMetadata?: { quarantined?: boolean } | null },
+): boolean {
+  if (job.status !== 'blocked') return false
+  return !isStaleBlockedJobCandidate(task, job)
+}
+
+/**
  * 上と同じ判定を SQL で書いたもの。`tasks` テーブルへの WHERE 断片。
  *
  * **`occupiesProject()` と必ず同じ意味にすること。** 片方だけ変えると、
