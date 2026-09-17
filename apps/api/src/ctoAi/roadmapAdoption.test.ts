@@ -98,6 +98,182 @@ describe('adoptRoadmapItem — 選択した1件だけを実行可能なTaskへ�
   })
 })
 
+describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2026-09-17）', () => {
+  const SCOPE_A = { ...SPEC, implementationScope: 'API 側の配線' }
+  const SCOPE_B = { ...SPEC, implementationScope: 'Worker 側の配線' }
+
+  /** 初回 Task を採用し、Job を1本走らせて done にした状態を作る。 */
+  async function withExecutedInitialTask(): Promise<{ storage: IStorage; projectId: string; taskId: string }> {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+
+    const job = storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    void job
+    storage.tasks.update(first.taskId, { status: 'done' })
+    return { storage, projectId, taskId: first.taskId }
+  }
+
+  it('初回 Task の後に #2 を作る', async () => {
+    const { storage, projectId } = await withExecutedInitialTask()
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: true, roadmapTaskKey: 'first-item#2' })
+    if (!result.ok) return
+    const task = storage.tasks.findById(result.taskId)
+    // 旧 Task を再利用せず、別 Task として作る。
+    expect(task?.roadmapTaskKey).toBe('first-item#2')
+    expect(task?.status).toBe('pending')
+    // allowedPaths / acceptanceCriteria は今回の申告から作り直す（過去の値を継承しない）。
+    expect(task?.allowedPaths).toEqual(SCOPE_B.allowedPaths)
+  })
+
+  it('#2 が実行済みなら #3 を作る', async () => {
+    const { storage, projectId } = await withExecutedInitialTask()
+    const second = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+    if (!second.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: second.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(second.taskId, { status: 'done' })
+
+    const third = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: 'Mobile 側の配線', followUp: true },
+      deps(),
+    )
+
+    expect(third).toMatchObject({ ok: true, roadmapTaskKey: 'first-item#3' })
+  })
+
+  it('同じ identity の二重生成は ALREADY_EXECUTED で拒否する', async () => {
+    const { storage, projectId } = await withExecutedInitialTask()
+    const second = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+    if (!second.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: second.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(second.taskId, { status: 'done' })
+
+    // #2 と同じ scope をもう一度出す = 同じ仕事の再実行。上限を待たずここで止める。
+    const repeat = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(repeat).toMatchObject({ ok: false, code: 'FOLLOW_UP_NO_PROGRESS' })
+  })
+
+  it('active Task が残っていれば follow-up しない（blocked / failed を迂回させない）', async () => {
+    const { storage, projectId, taskId } = await withExecutedInitialTask()
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    if (result.ok) return
+    expect(result.reason).toContain('resume / recovery')
+  })
+
+  it('pending continuation があれば follow-up しない', async () => {
+    const { storage, projectId, taskId } = await withExecutedInitialTask()
+    const other = storage.tasks.create({
+      projectId, title: 'next', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const sourceJob = storage.jobs.findByTaskId(taskId)[0]
+    storage.taskContinuations.create({
+      sourceJobId: sourceJob?.id ?? '', projectId, completedTaskId: taskId, nextTaskId: other.id, status: 'pending',
+    } as Parameters<IStorage['taskContinuations']['create']>[0])
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    if (result.ok) return
+    expect(result.reason).toContain('pending')
+  })
+
+  it('新しい implementationScope が無ければ follow-up しない', async () => {
+    const { storage, projectId } = await withExecutedInitialTask()
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SPEC, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    if (result.ok) return
+    expect(result.reason).toContain('implementationScope')
+  })
+
+  it('先行 Task が未実行なら follow-up ではなく通常採用である', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    if (result.ok) return
+    expect(result.reason).toContain('no executed prior task')
+  })
+
+  it('11 回目の follow-up は作らず診断へ回す', async () => {
+    const { storage, projectId } = await withExecutedInitialTask()
+
+    for (let sequence = 2; sequence <= 11; sequence += 1) {
+      const result = await adoptRoadmapItem(
+        storage,
+        { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: `残作業 ${sequence}`, followUp: true },
+        deps(),
+      )
+      expect(result.ok, `follow-up #${sequence}`).toBe(true)
+      if (!result.ok) return
+      storage.jobs.create({
+        taskId: result.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      storage.tasks.update(result.taskId, { status: 'done' })
+    }
+
+    const eleventh = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: '残作業 12', followUp: true },
+      deps(),
+    )
+
+    expect(eleventh).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    if (eleventh.ok) return
+    expect(eleventh.reason).toContain('maximum')
+  })
+
+  it('followUp を指定しない通常採用は従来どおり ALREADY_EXECUTED で止まる', async () => {
+    const { storage, projectId } = await withExecutedInitialTask()
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'ALREADY_EXECUTED' })
+  })
+})
+
 describe('adoptRoadmapItem — fail-closed', () => {
   it('allowedPaths が空なら採用しない', async () => {
     const { storage, projectId } = makeStorage()

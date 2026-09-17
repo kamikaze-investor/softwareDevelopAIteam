@@ -266,7 +266,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
 - **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった**（state: planned）
 - **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる**（state: planned）
-- **PL Escalation が未配達でも `escalated` と記録し、以後その対象の処理を永久に止める**（state: planned）
+- **PL Escalation が未配達でも `escalated` と記録し、以後 PL の全作業が永久に止まる**（state: planned）
 - **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**（state: planned）
 - **cheap AI（説明・質問経路）の latency と timeout 契約**（state: planned）
 - **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる**（state: planned）
@@ -282,7 +282,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **external completion reconcile の根拠2つが、まだ機械照合になっていない**（state: planned）
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
-- **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: deferred）
+- **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: in_progress）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）

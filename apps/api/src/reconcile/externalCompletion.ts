@@ -31,11 +31,22 @@
 
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
+import { getBaseRoadmapId, isFollowUpTaskKey } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 
 /** 呼び出し側が主張する根拠。**機械照合できるものは下で照合する。** */
 export interface ExternalCompletionEvidence {
-  /** 採用元 Roadmap item。Task の `roadmapTaskKey` と一致しなければ通さない。 */
+  /**
+   * **その Task の identity**（`task.roadmapTaskKey`）。完全一致でなければ通さない。
+   *
+   * **名前は `roadmapItemId` だが、要求しているのは ledger item の id ではなく Task identity である。**
+   * 通常 Task では両者が同じなので差が出ないが、follow-up Task では
+   * `<ledger id>#<sequence>`（例 `roadmap-adoption-followups#2`）でなければならない。
+   * ledger id だけを渡すと、**別 Task の成果で follow-up を閉じられてしまう**ため拒否する。
+   *
+   * wire 互換のためフィールド名は変えていない（`.strict()` の外部 API 契約）。
+   * 意味の曖昧さは、ここと照合エラーの文面で解消する。
+   */
   roadmapItemId: string
   /** 外部実装の commit（canonical master 上）。 */
   commitSha: string
@@ -102,10 +113,20 @@ export function verifyExternalCompletion(
   if (task.status === 'done') return { ok: false, reason: 'Task is already done' }
 
   // 採用元との一致。別 Task の成果で別 Task を閉じられないようにする。
+  // **Task identity の完全一致**を要求する（base id への緩和はしない）。
   if (task.roadmapTaskKey !== evidence.roadmapItemId) {
+    // follow-up Task に base id だけを渡した場合は、間違いの内容が分かる文面にする。
+    // 判定そのものは緩めない。
+    const taskKey = task.roadmapTaskKey
+    const looksLikeBaseOfFollowUp = taskKey !== undefined
+      && isFollowUpTaskKey(taskKey)
+      && getBaseRoadmapId(taskKey) === evidence.roadmapItemId
     return {
       ok: false,
-      reason: `roadmapItemId "${evidence.roadmapItemId}" does not match this Task's roadmapTaskKey`,
+      reason: looksLikeBaseOfFollowUp
+        ? `roadmapItemId "${evidence.roadmapItemId}" is the base roadmap item; `
+          + `this Task is a follow-up and requires its full task identity "${taskKey}"`
+        : `roadmapItemId "${evidence.roadmapItemId}" does not match this Task's roadmapTaskKey`,
     }
   }
 

@@ -35,6 +35,12 @@ import {
   RoadmapValidationError,
   type RoadmapItem,
 } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
+import {
+  createFollowUpTaskKey,
+  getBaseRoadmapId,
+  isFollowUpTaskKey,
+  MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
+} from '@ai-team/shared'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapSyncPhaseInput } from '../storage/interface'
 import { validateRoadmapTasks, validateRoadmapPhases } from '../storage/roadmapTaskValidation'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
@@ -58,6 +64,8 @@ export type AdoptRoadmapItemFailure =
   | 'ITEM_ALREADY_DONE'
   | 'ITEM_NOT_ADOPTABLE'
   | 'ALREADY_EXECUTED'
+  | 'FOLLOW_UP_NOT_ELIGIBLE'
+  | 'FOLLOW_UP_NO_PROGRESS'
   | 'SPEC_INVALID'
   | 'SYNC_FAILED'
 
@@ -67,7 +75,13 @@ export type AdoptRoadmapItemResult =
 
 export interface AdoptRoadmapItemInput {
   projectId: string
-  /** `tasks/roadmap.md` の `roadmap:id`。そのまま `roadmapTaskKey` になる（追跡可能性）。 */
+  /**
+   * `tasks/roadmap.md` の `roadmap:id`（= baseRoadmapId）。
+   *
+   * 通常採用ではそのまま `roadmapTaskKey` になる（追跡可能性）。
+   * follow-up では base のまま受け取り、**Task identity はサーバ側が決める**
+   * （`createFollowUpTaskKey()`。caller に key を入力させない）。
+   */
   roadmapId: string
   /** PL が明示する変更許可範囲。ledger の散文からは推測しない。 */
   allowedPaths: string[]
@@ -81,6 +95,17 @@ export interface AdoptRoadmapItemInput {
    * **ledger 側の書式は一切変えない**（`buildAdoptedDescription()` 参照）。
    */
   implementationScope?: string
+  /**
+   * 既に実行済みの Roadmap 項目に対する **follow-up 採用**として扱う。
+   *
+   * 既定（`false` / 未指定）では従来どおりの初回採用であり、**挙動は一切変わらない**。
+   * `true` のときだけ、別 Task identity（`<base>#<sequence>`）を作る経路へ入り、
+   * `assertFollowUpEligible()` の前提条件をすべて満たす場合にのみ通す。
+   *
+   * CEO 判断（2026-09-17）: これは `ALREADY_EXECUTED` の緩和ではなく、
+   * 「同一 Task identity の二重実行は禁止」への精緻化である。
+   */
+  followUp?: boolean
 }
 
 export interface AdoptRoadmapItemDeps {
@@ -115,6 +140,117 @@ function resolveTargetRoot(): string {
  *
  * `implementationScope` 未指定なら、従来どおり ledger 本文だけを返す（後方互換）。
  */
+/**
+ * 採用時に埋め込んだ「今回実装する範囲」を description から取り出す。
+ *
+ * `buildAdoptedDescription()` が書いた形だけを読む。見出しが無ければ `undefined`
+ * （= scope 未指定で採用された従来の Task）。
+ */
+export function extractImplementationScope(description: string): string | undefined {
+  const heading = '## 今回実装する範囲（この Task の対象）'
+  const start = description.indexOf(heading)
+  if (start === -1) return undefined
+
+  const rest = description.slice(start + heading.length)
+  const end = rest.indexOf('**上記以外は対象外である。**')
+  const scope = (end === -1 ? rest : rest.slice(0, end)).trim()
+  return scope === '' ? undefined : scope
+}
+
+/** 比較用に scope を正規化する。空白の揺れだけで「別の作業」と誤認しないため。 */
+function normalizeScope(scope: string): string {
+  return scope.replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+type FollowUpEligibility =
+  | { ok: true }
+  | { ok: false; failure: AdoptRoadmapItemResult & { ok: false } }
+
+/**
+ * follow-up を作ってよい状態かを機械的に確かめる。**AI の申告は一切見ない。**
+ *
+ * CEO 確定の成立条件（2026-09-17）をそのまま実装する。1つでも欠ければ follow-up は作らない。
+ * blocked / failed を follow-up で迂回させないことがとくに重要で、それらには
+ * 既存の resume / diagnosis 経路という正規の復旧手段がある。
+ */
+function checkFollowUpEligibility(
+  storage: IStorage,
+  input: AdoptRoadmapItemInput,
+  projectTasks: readonly { id: string; status: string; roadmapTaskKey?: string; description: string }[],
+): FollowUpEligibility {
+  const fail = (code: AdoptRoadmapItemFailure, reason: string): FollowUpEligibility => ({
+    ok: false,
+    failure: { ok: false, code, reason },
+  })
+
+  const siblings = projectTasks.filter(
+    (task) => task.roadmapTaskKey !== undefined && getBaseRoadmapId(task.roadmapTaskKey) === input.roadmapId,
+  )
+
+  // 1. 先行 Task が実在すること。無いなら follow-up ではなく通常採用である。
+  if (siblings.length === 0) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      `roadmap item "${input.roadmapId}" has no prior task; adopt it normally instead of as a follow-up`,
+    )
+  }
+
+  // 2. 先行 Task が実行済みであること。Job が1つも無いなら、まだ初回が動いていない。
+  const executed = siblings.filter((task) => storage.jobs.findByTaskId(task.id).length > 0)
+  if (executed.length === 0) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      `roadmap item "${input.roadmapId}" has no executed prior task; nothing has run yet`,
+    )
+  }
+
+  // 3. active Task が残っていないこと。blocked / failed を follow-up で迂回させない。
+  //    blocked は resume 経路、failed は PL diagnosis / recovery 経路が正規の復旧手段である。
+  const active = siblings.find((task) => task.status !== 'done')
+  if (active) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      `task ${active.id} for "${input.roadmapId}" is still ${active.status}; ` +
+        'resolve it through the existing resume / recovery path instead of creating a follow-up',
+    )
+  }
+
+  // 4. pending continuation が無いこと。進行中のチェーンと競合させない。
+  const pending = storage.taskContinuations.findPendingByProjectId(input.projectId)
+  if (pending.length > 0) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      `${pending.length} task continuation(s) are still pending in this project; let the existing chain settle first`,
+    )
+  }
+
+  // 5. 新しい implementationScope が明示されていること。**follow-up では必須**である。
+  const scope = input.implementationScope?.trim()
+  if (!scope) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      'a follow-up requires an explicit implementationScope naming the remaining work',
+    )
+  }
+
+  // 6. 前の Task と同じ作業を繰り返していないこと。
+  //    **上限 10 を待たずここで止める。** 上限は最後の非常ブレーキであって、
+  //    重複検知の主役ではない。
+  const repeated = siblings.find((task) => {
+    const previous = extractImplementationScope(task.description)
+    return previous !== undefined && normalizeScope(previous) === normalizeScope(scope)
+  })
+  if (repeated) {
+    return fail(
+      'FOLLOW_UP_NO_PROGRESS',
+      `the requested scope is identical to task ${repeated.id}; ` +
+        'a follow-up must name work that the prior task did not do',
+    )
+  }
+
+  return { ok: true }
+}
+
 export function buildAdoptedDescription(
   ledgerBody: string,
   implementationScope: string | undefined,
@@ -211,21 +347,42 @@ export async function adoptRoadmapItem(
     }
   }
 
-  // 同じ roadmap:id を誤って重複実行しない。既に Job が動いた Task がある場合は採用し直さない
-  // （spec だけ書き換えて再実行させると、実行済みの変更と新しい指示が混ざる）。
-  const existingTask = storage.tasks
-    .findByProjectId(input.projectId)
-    .find((task) => task.roadmapTaskKey === input.roadmapId)
+  // ── Task identity を決める ──────────────────────────────
+  // 通常採用では taskKey === input.roadmapId であり、以降の判定は従来と完全に同一に働く。
+  // follow-up のときだけ別 identity を **サーバ側で** 発番する（caller は key を選べない）。
+  const projectTasks = storage.tasks.findByProjectId(input.projectId)
+
+  let taskKey = input.roadmapId
+  if (input.followUp === true) {
+    const eligibility = checkFollowUpEligibility(storage, input, projectTasks)
+    if (!eligibility.ok) return eligibility.failure
+
+    const minted = createFollowUpTaskKey(
+      input.roadmapId,
+      projectTasks
+        .map((task) => task.roadmapTaskKey)
+        .filter((key): key is string => key !== undefined),
+    )
+    if (!minted.ok) {
+      return { ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE', reason: minted.reason }
+    }
+    taskKey = minted.roadmapTaskKey
+  }
+
+  // 同一 Task identity の二重実行を拒否する（既存防御）。
+  // **判定対象を「Roadmap item」から「Task identity」へ精緻化しただけで、緩めていない。**
+  // 通常採用では taskKey === input.roadmapId なので、結果は従来と1ビットも変わらない。
+  const existingTask = projectTasks.find((task) => task.roadmapTaskKey === taskKey)
   if (existingTask && storage.jobs.findByTaskId(existingTask.id).length > 0) {
     return {
       ok: false,
       code: 'ALREADY_EXECUTED',
-      reason: `Roadmap item "${input.roadmapId}" already has an executed Task (${existingTask.id})`,
+      reason: `"${taskKey}" already has an executed Task (${existingTask.id})`,
     }
   }
 
   const taskInput: RoadmapSyncTaskInput = {
-    roadmapTaskKey: item.id,
+    roadmapTaskKey: taskKey,
     title: item.title,
     description: buildAdoptedDescription(
       extractItemDescription(markdown, item),
@@ -274,7 +431,7 @@ export async function adoptRoadmapItem(
 
   const adopted = storage.tasks
     .findByProjectId(input.projectId)
-    .find((task) => task.roadmapTaskKey === item.id)
+    .find((task) => task.roadmapTaskKey === taskKey)
   if (!adopted) {
     return { ok: false, code: 'SYNC_FAILED', reason: 'Task was not present after a successful sync' }
   }
@@ -285,5 +442,5 @@ export async function adoptRoadmapItem(
   const ensure = deps.ensureInitialWorkflows ?? ensureInitialWorkflowsForActiveTasks
   await ensure(storage, input.projectId)
 
-  return { ok: true, taskId: adopted.id, roadmapTaskKey: item.id, title: item.title }
+  return { ok: true, taskId: adopted.id, roadmapTaskKey: taskKey, title: item.title }
 }
