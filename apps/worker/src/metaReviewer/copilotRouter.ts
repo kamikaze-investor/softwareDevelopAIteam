@@ -37,6 +37,16 @@ import path from 'node:path'
 export const DEFAULT_COPILOT_META_REVIEW_MODEL = 'mai-code-1.1-flash'
 
 /**
+ * argv で prompt を渡してよい上限（バイト）。これを超えたら stdin へ切り替える。
+ *
+ * **暫定値である。** Linux の `MAX_ARG_STRLEN` は概ね 128KiB（32 ページ）で、
+ * 実測（PR #234, 179,994 文字）はそれを超えて `E2BIG` になった。
+ * 余裕を見て 64KiB に置く。根拠は OS 上限であり、観測された分布ではない。
+ * 変更するときは、どの実測を見てそう決めたかを併記すること。
+ */
+export const COPILOT_ARGV_PROMPT_BYTE_LIMIT = 64 * 1024
+
+/**
  * Copilot CLI 子プロセスへ渡す env。GITHUB_TOKEN 以外の秘密情報を渡さない
  * （adapter.ts の buildSafeEnv() / geminiRouter.ts の buildAgyEnv() と同じ allowlist方式）。
  */
@@ -129,18 +139,30 @@ function attemptCopilotCall(
   // 呼び出しごとの使い捨て隔離ディレクトリ（bare tmpdir() は他ステップと共有されるため使わない）
   const isolatedCwd = mkdtempSync(path.join(tmpdir(), 'copilot-meta-review-'))
 
+  // **巨大な prompt は argv で渡せない。**
+  //
+  // 2026-09-17 実測（PR #234）: prompt 179,994 文字で `spawnSync copilot E2BIG`。
+  // OS の引数長上限（Linux は 1 引数あたり概ね 128KB）を超えると、プロセスすら起動しない。
+  // Copilot CLI は piped stdin からの入力に対応しているので、大きいときだけそちらを使う。
+  //
+  // **小さい prompt では従来どおり `-p` を使う。** `-p` 経路は 2026-08-26 の独立レビューで
+  // `--available-tools` によるツール無効化まで含めて実測確認済みであり、そこを不用意に動かさない。
+  // `--available-tools` は入力経路に依存しないフラグなので、stdin 経路でも同じく渡す。
+  const useStdin = Buffer.byteLength(prompt, 'utf-8') > COPILOT_ARGV_PROMPT_BYTE_LIMIT
+  const argv = useStdin
+    ? ['-s', '--no-color', '--model', model, '--available-tools']
+    : ['-p', prompt, '-s', '--no-color', '--model', model, '--available-tools']
+
   try {
     const result = spawnSync(
       'copilot',
-      [
-        '-p', prompt, '-s', '--no-color', '--model', model,
-        '--available-tools',  // 値なし = 空allowlist。ツールをモデルから完全に見えなくする（実測確認済み）
-      ],
+      argv,
       {
         encoding: 'utf-8',
         timeout,
         env: buildCopilotEnv(),
         cwd: isolatedCwd,
+        ...(useStdin ? { input: prompt } : {}),
       },
     )
 
