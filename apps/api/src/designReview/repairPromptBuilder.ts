@@ -158,9 +158,10 @@ function formatQaFacts(qaResults: RepairQaFacts[]): string[] {
  */
 export function buildRepairPrompt(input: RepairPromptInput): string {
   const untrusted: string[] = []
+  const principles = loadEngineeringPrinciples()
   const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(),
-    principles: loadEngineeringPrinciples(),
+    slugs: selectPrincipleSlugs(undefined, principles),
+    principles,
   })
 
   if (input.job) untrusted.push(...formatJobFacts(input.job), '')
