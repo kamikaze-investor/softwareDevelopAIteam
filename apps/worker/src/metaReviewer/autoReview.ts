@@ -45,7 +45,7 @@ import { dirname, resolve } from 'node:path'
 
 async function main(): Promise<void> {
   // .env ロード後に runner.ts / geminiRouter.ts / metaReviewFallbackRouter.ts を評価させるため動的 import する
-  const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult } =
+  const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult, classifyFormalVerdict } =
     await import('./runner.js')
   const { reviewWithProviderFallback, MetaReviewProviderError, sanitizeMessage } = await import('./metaReviewFallbackRouter.js')
   const { AGY_REVIEW_MODEL } = await import('./geminiRouter.js')
@@ -147,6 +147,11 @@ async function main(): Promise<void> {
       // （watchdog.ts 等）からも呼んでおり、そちらで同期リトライの待機が event loop を
       // ブロックしないようにするため（独立レビュー指摘、2026-09-01）。
       retryTransient: true,
+      // **provider attempt の成功条件をここで決める。**
+      // text が返っただけでは成功とせず、valid な formal verdict が成立して初めて成功とする。
+      // 不成立は transient として既存の bounded retry -> 次 stage -> Copilot へ流れる。
+      // 判定の中身では分岐しないので、BLOCKED を別 provider で取り直す経路は生まれない。
+      classifyVerdict: classifyFormalVerdict,
     })
     rawResponse = reviewResult.raw
     providerUsed = reviewResult.providerUsed
@@ -154,8 +159,15 @@ async function main(): Promise<void> {
       console.log('   ℹ️  Gemini が失敗したため Copilot CLI（Microsoft系モデル）で審査しました')
     }
   } catch (err) {
-    console.error('❌ Meta Review プロバイダー呼び出しに失敗しました:', err)
     const failureClass = err instanceof MetaReviewProviderError ? err.failureClass : 'unknown'
+    // **raw の err をそのままログへ出さない。**
+    // copilotRouter は raw stderr/stdout をエラーメッセージへ含めるため、CI ログへ
+    // credential が echo され得る（独立レビュー指摘 2026-09-17。CI では GITHUB_TOKEN を
+    // copilot 子プロセスへ渡すようになったので、この経路の危険度が上がっている）。
+    console.error(
+      '❌ Meta Review プロバイダー呼び出しに失敗しました:',
+      sanitizeMessage(err instanceof Error ? err.message : String(err)),
+    )
     // PRコメントに載る finding.message は、MetaReviewProviderError 以外（Copilot フォールバック
     // 自体の失敗を含む。copilotRouter.ts は raw stderr/stdout をそのままエラーメッセージに含める）
     // も含めて必ず sanitizeMessage() を通す。geminiRouter.ts 内の診断情報は個別に sanitize 済みだが、
@@ -189,7 +201,27 @@ async function main(): Promise<void> {
   // providerUsed は監査証跡用にファイル書き込み時のみ additive に付与する
   // （2026-08-26 独立レビュー指摘: 実際に応答したプロバイダーが記録されず、
   //   PRコメントが常に「Reviewed by Gemini」と表示されていた問題への対応）。
-  const result = parseMetaReviewResult(rawResponse, taskId)
+  const parsedResult = parseMetaReviewResult(rawResponse, taskId)
+
+  // **成功経路の本文も sink へ出る前に通す。**
+  // summary / findings は result ファイル・CI ログ・公開 PR コメントの3箇所へ出る。
+  // CI では Copilot 子プロセスへ job token を渡すようになったため、
+  // provider が token を formal な欄へ echo した場合の露出経路を塞ぐ
+  // （独立レビュー指摘 2026-09-17 R2。失敗経路は既に sanitize 済み）。
+  const result = {
+    ...parsedResult,
+    summary: sanitizeMessage(parsedResult.summary),
+    // **provider が値を決める文字列はすべて通す。** spread で素通りする項目
+    // （`file` 等）を残すと、そこに token が入った場合に result ファイルへ
+    // そのまま書き出される（独立レビュー指摘 2026-09-17 R3）。
+    findings: parsedResult.findings.map((f) => ({
+      ...f,
+      message: sanitizeMessage(f.message),
+      ...(f.file === undefined ? {} : { file: sanitizeMessage(f.file) }),
+      ...(f.suggestion === undefined ? {} : { suggestion: sanitizeMessage(f.suggestion) }),
+    })),
+  }
+
   writeResultFile({ ...result, providerUsed }, resultFilePath)
   printResult(result)
 

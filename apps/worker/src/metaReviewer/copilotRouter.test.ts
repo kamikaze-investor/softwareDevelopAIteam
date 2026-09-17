@@ -99,6 +99,10 @@ describe('callCopilotForMetaReview', () => {
     try {
       mockSpawnSync.mockReturnValue(success('ok'))
 
+      // **このケースは GitHub Actions 外**（CI でも走るので明示的に外す）。
+      // GitHub Actions 内の挙動は下の専用ケースで固定する。
+      delete process.env.GITHUB_ACTIONS
+
       callCopilotForMetaReview('prompt')
 
       const options = mockSpawnSync.mock.calls[0][2] as { env?: NodeJS.ProcessEnv }
@@ -200,5 +204,39 @@ describe('callCopilotForMetaReview bounded retry (attempt 1 -> 10s -> attempt 2 
     expect(result).toBe('ok-on-attempt-1')
     expect(mockSpawnSync).toHaveBeenCalledTimes(1)
     expect(sleepImpl).not.toHaveBeenCalled()
+  })
+  it('GitHub Actions のときだけ job token を渡し、PAT 変数は読まない（2026-09-17 CEO 承認）', () => {
+    const originalEnv = process.env
+    process.env = { ...originalEnv }
+    process.env.GITHUB_ACTIONS = 'true'
+    process.env.GITHUB_TOKEN = 'ghs-job-token-example'
+    process.env.COPILOT_GITHUB_TOKEN = 'pat-must-not-be-used'
+    process.env.GH_TOKEN = 'pat-must-not-be-used-either'
+
+    try {
+      mockSpawnSync.mockReturnValue(success('ok'))
+
+      callCopilotForMetaReview('prompt')
+
+      const options = mockSpawnSync.mock.calls[0][2] as { env?: NodeJS.ProcessEnv }
+      const env = options.env as NodeJS.ProcessEnv
+
+      // CI では job token だけを渡す（Copilot は CI で認証できないままだった問題の修正）。
+      expect(env.GITHUB_TOKEN).toBe('ghs-job-token-example')
+      // **PAT は復活させない。**
+      expect(env).not.toHaveProperty('COPILOT_GITHUB_TOKEN')
+      expect(env).not.toHaveProperty('GH_TOKEN')
+      expect(Object.values(env)).not.toContain('pat-must-not-be-used')
+      expect(Object.values(env)).not.toContain('pat-must-not-be-used-either')
+      // それ以外の秘密情報は従来どおり渡さない。
+      expect(env.GEMINI_API_KEY).toBeUndefined()
+      expect(env.API_TOKEN).toBeUndefined()
+      // キーは allowlist + job token に限る。
+      for (const key of Object.keys(env)) {
+        expect(['PATH', 'HOME', 'LANG', 'TERM', 'GITHUB_TOKEN']).toContain(key)
+      }
+    } finally {
+      process.env = originalEnv
+    }
   })
 })

@@ -46,10 +46,33 @@ function buildCopilotEnv(): NodeJS.ProcessEnv {
   if (process.env.HOME !== undefined) env.HOME = process.env.HOME
   if (process.env.LANG !== undefined) env.LANG = process.env.LANG
   if (process.env.TERM !== undefined) env.TERM = process.env.TERM
+
+  // **GitHub Actions のときだけ**、その job に対して GitHub が発行する短命 token を渡す
+  // （CEO 承認 2026-09-17）。
+  //
+  // 背景: 2026-08-28 に production の Copilot 認証を ai-team ユーザーの保存済み OAuth
+  // credential（HOME 配下）へ一本化し、PAT 配線を撤去した。これは VPS では成立するが、
+  // GitHub Actions の使い捨て runner には該当 credential が存在しないため、
+  // Copilot fallback は CI で認証不能なまま放置されていた
+  // （2026-09-17 実測: "No authentication information found."）。
+  //
+  // **PAT は復活させない。** 読むのは `GITHUB_TOKEN` だけで、
+  // `COPILOT_GITHUB_TOKEN` / `GH_TOKEN`（PAT が入り得る変数）は読まない。
+  // production / VPS の認証方式は変更していない。この値は copilot 子プロセスの env に
+  // 入るだけで、他へは伝播しない。ログへ出す経路も無い
+  // （診断メッセージは sanitizeMessage() を通り、GITHUB_TOKEN は SECRET_ENV_KEYS に含まれる）。
+  if (process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_TOKEN !== undefined) {
+    env.GITHUB_TOKEN = process.env.GITHUB_TOKEN
+  }
   // 認証は ai-team ユーザーの保存済みOAuth credential（HOME配下）で行う
   // （2026-08-28: PAT/token配線を撤去。COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN
   //  のいずれもこの子プロセスへは渡さない）。
   return env
+}
+
+/** テスト専用の再公開。実体は同一（env 構成の不変条件を回帰テストで固定するため）。 */
+export function buildCopilotEnvForTest(): NodeJS.ProcessEnv {
+  return buildCopilotEnv()
 }
 
 export interface CopilotFallbackOptions {
@@ -61,6 +84,14 @@ export interface CopilotFallbackOptions {
    */
   usage?: string
   timeoutMs?: number
+  /**
+   * 応答が formal verdict を構成するか。
+   *
+   * 渡すと、**非0 exit でも stdout に成立した verdict があればそれを採用する**。
+   * 成立した BLOCKED を exit code だけで捨てて retry すると、後の attempt が
+   * APPROVED を返し得る = review shopping になる（独立レビュー指摘 2026-09-17）。
+   */
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative'
   /** テストでの差し替え用。既定はAtomics.waitによる同期sleep。 */
   sleepImpl?: (ms: number) => void
 }
@@ -93,6 +124,7 @@ function attemptCopilotCall(
   model: string,
   usage: string,
   timeout: number,
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative',
 ): CopilotAttemptFailure | CopilotAttemptSuccess {
   // 呼び出しごとの使い捨て隔離ディレクトリ（bare tmpdir() は他ステップと共有されるため使わない）
   const isolatedCwd = mkdtempSync(path.join(tmpdir(), 'copilot-meta-review-'))
@@ -115,6 +147,18 @@ function attemptCopilotCall(
     const stdout = result.stdout ?? ''
     const stderr = result.stderr ?? ''
 
+    // **成立した verdict を exit code だけで捨てない**（独立レビュー指摘 2026-09-17）。
+    // process 異常でも negative は保持する（捨てると Review Shopping になる）。
+    // positive は process が正常終了したときだけ採用する（CEO 指示 2026-09-17）。
+    const processFailed = result.status !== 0 || result.error !== undefined
+    const verdictClass = classifyVerdict !== undefined && stdout.trim()
+      ? classifyVerdict(stdout)
+      : 'none'
+
+    if (verdictClass === 'negative' || (verdictClass === 'positive' && !processFailed)) {
+      return { ok: true, stdout }
+    }
+
     if (result.error) {
       return { ok: false, errorMessage: `[copilotRouter] Copilot CLI 実行エラー（usage=${usage}）: ${result.error.message}` }
     }
@@ -123,6 +167,13 @@ function attemptCopilotCall(
     }
     if (!stdout.trim()) {
       return { ok: false, errorMessage: `[copilotRouter] Copilot CLI の応答が空でした（usage=${usage}）` }
+    }
+
+    // exit 0 でも formal verdict が成立していなければ失敗として扱い、bounded retry を使う。
+    // ここで成功を返すと retry を素通りし、外側の判定まで不成立が持ち越される
+    // （独立レビュー指摘 2026-09-17）。
+    if (classifyVerdict !== undefined && verdictClass === 'none') {
+      return { ok: false, errorMessage: `[copilotRouter] Copilot CLI の応答から formal verdict を解釈できませんでした（usage=${usage}）` }
     }
 
     return { ok: true, stdout }
@@ -154,7 +205,7 @@ export function callCopilotForMetaReview(
 
   let lastErrorMessage = ''
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const outcome = attemptCopilotCall(prompt, model, usage, timeout)
+    const outcome = attemptCopilotCall(prompt, model, usage, timeout, options?.classifyVerdict)
     if (outcome.ok) return outcome.stdout
 
     lastErrorMessage = outcome.errorMessage

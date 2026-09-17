@@ -210,6 +210,124 @@ ${request.gitDiff}
 }
 
 /**
+ * **formal verdict が成立したときだけ** 結果を返す。成立しなければ `undefined`。
+ *
+ * これが「provider attempt が成功したか」の判定基準である。
+ * text が返ってきたことは成功ではない — empty / truncated / malformed /
+ * 未知の status はいずれもここで `undefined` になり、呼び出し側は
+ * **formal review 不成立**として既存の retry / fallback へ進める
+ * （`meta-review-structured-output-robustness`）。
+ *
+ * **判定の中身（APPROVED / CHANGES_REQUESTED / BLOCKED のどれか）では分岐しない。**
+ * 分岐させると「BLOCKED だったから別 provider で聞き直す」という review shopping に
+ * なるため、成立したかどうかだけを見る。
+ */
+export function tryParseMetaReviewResult(
+  rawResponse: string,
+  taskId: string,
+): MetaReviewResult | undefined {
+  for (const jsonStr of extractJsonCandidates(rawResponse)) {
+    try {
+      const parsed: unknown = JSON.parse(jsonStr)
+      if (!isRecord(parsed)) {
+        throw new Error('Parsed value is not an object')
+      }
+      // buildMetaReviewResult() は未知の status で throw する。
+      // したがって「invalid / unknown verdict」もここで不成立になる。
+      return buildMetaReviewResult(parsed, taskId)
+    } catch {
+      // 別候補を試す。全候補が失敗した場合だけ不成立とする。
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * provider の応答が formal verdict を構成するか。
+ *
+ * router がこの述語を使って attempt の成否を決める。`taskId` は生成される id にしか
+ * 使われないので、判定目的の呼び出しではプレースホルダで問題ない。
+ */
+export function hasFormalVerdict(rawResponse: string): boolean {
+  return classifyFormalVerdict(rawResponse) !== 'none'
+}
+
+/**
+ * formal verdict の分類。
+ *
+ * - `none`: 成立していない（empty / truncated / malformed / 未知 status / 契約違反）
+ * - `positive`: APPROVED
+ * - `negative`: CHANGES_REQUESTED / BLOCKED
+ *
+ * **process の正常終了とは非対称に扱う**（CEO 指示 2026-09-17）:
+ * - positive を Gate の green にするには、structured verdict が正しいだけでなく
+ *   **provider attempt 自体が正常終了した**ことも要求する
+ * - negative は process failure を理由に捨てない。捨てて別 provider へ進むと
+ *   Review Shopping / Safety weakening になる
+ */
+export function classifyFormalVerdict(rawResponse: string): 'none' | 'positive' | 'negative' {
+  const strict = findStrictVerdictObject(rawResponse)
+  if (strict === undefined) {
+    return 'none'
+  }
+  return strict.status === 'approved' ? 'positive' : 'negative'
+}
+
+/**
+ * gate 述語のための**厳しい**判定。最終 parser（`parseMetaReviewResult`）の寛容さを流用しない。
+ *
+ * 独立レビュー指摘（2026-09-17）: `buildMetaReviewResult()` は status 以外を既定値で埋めるため、
+ * `{"status":"approved"} trailing {` のように**切れた応答の中に早期の完全オブジェクトが
+ * 含まれるだけ**でも「verdict 成立」と判定されてしまう。それでは truncated を弾くという
+ * 本修正の目的を果たせない。
+ *
+ * ここでは reviewer が実際に埋めるべきフィールドが**すべて揃っている**ことを要求する。
+ * **厳しすぎる方向は安全側である** — 不成立と判定すれば retry / fallback へ進み、
+ * 最終的に誰も verdict を出せなければ fail-closed BLOCK になるだけで、緩む方向には倒れない。
+ */
+function findStrictVerdictObject(rawResponse: string): Record<string, unknown> | undefined {
+  for (const jsonStr of extractJsonCandidates(rawResponse)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(jsonStr)
+    } catch {
+      continue
+    }
+    if (!isRecord(parsed)) {
+      continue
+    }
+    if (!isMetaReviewStatus(parsed.status)) {
+      continue
+    }
+    // reviewer が省略しないはずの項目。1つでも欠けていれば「途中で切れた」可能性が高い。
+    if (!isMetaRiskLevel(parsed.riskLevel)) {
+      continue
+    }
+    if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
+      continue
+    }
+    if (!Array.isArray(parsed.findings)) {
+      continue
+    }
+    // 要素まで **MetaReviewFinding の契約で**見る。
+    //
+    // message だけを見ていたときは、severity / category が欠けた finding でも成立扱いになり、
+    // normalizeFindings() が既定値で埋めて APPROVED だけが残った（独立レビュー指摘 R2 / R3）。
+    // 切れた応答は途中の finding が不完全になりやすいので、ここは契約どおり要求する。
+    if (!parsed.findings.every(isStrictFinding)) {
+      continue
+    }
+    if (typeof parsed.requiresCeoApproval !== 'boolean') {
+      continue
+    }
+    return parsed
+  }
+
+  return undefined
+}
+
+/**
  * Meta Review Resultのvalidation
  * AIが不正なJSONを返した場合は blocked として扱う
  */
@@ -217,16 +335,21 @@ export function parseMetaReviewResult(
   rawResponse: string,
   taskId: string
 ): MetaReviewResult {
-  for (const jsonStr of extractJsonCandidates(rawResponse)) {
-    try {
-      const parsed: unknown = JSON.parse(jsonStr)
-      if (!isRecord(parsed)) {
-        throw new Error('Parsed value is not an object')
-      }
-      return buildMetaReviewResult(parsed, taskId)
-    } catch {
-      // 別候補を試す。全候補が失敗した場合だけ blocked に倒す。
-    }
+  // **検証した object と最終採用する object を一致させる。**
+  //
+  // 独立レビュー指摘（2026-09-17 R2）: gate 述語が「どこかに厳密な verdict がある」ことだけを
+  // 見て、最終 parse は「最初に緩く読めた候補」を返していたため、
+  // `{"status":"approved"}` の後ろに完全な BLOCKED が続く応答で
+  // **BLOCKED が捨てられ APPROVED が採用される**経路があった。
+  // 厳密な候補があるなら必ずそれを採る。
+  const strict = findStrictVerdictObject(rawResponse)
+  if (strict !== undefined) {
+    return buildMetaReviewResult(strict, taskId)
+  }
+
+  const parsed = tryParseMetaReviewResult(rawResponse, taskId)
+  if (parsed !== undefined) {
+    return parsed
   }
 
   // パース失敗は最も安全な方向（blocked）に倒す
@@ -395,6 +518,35 @@ function normalizeFindings(value: unknown, fallbackSeverity: MetaRiskLevel): Met
       line: typeof finding.line === 'number' ? finding.line : undefined,
       suggestion: typeof finding.suggestion === 'string' ? finding.suggestion : undefined,
     }))
+}
+
+/**
+ * gate 述語が要求する finding の形。**normalizeFindings() の既定値埋めに頼らない。**
+ * 省略可能な項目は「無い」か「正しい型」のどちらかであることまで見る。
+ */
+function isStrictFinding(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false
+  }
+  if (!isMetaRiskLevel(value.severity)) {
+    return false
+  }
+  if (!isMetaFindingCategory(value.category)) {
+    return false
+  }
+  if (typeof value.message !== 'string' || value.message.trim().length === 0) {
+    return false
+  }
+  if (value.file !== undefined && typeof value.file !== 'string') {
+    return false
+  }
+  if (value.line !== undefined && typeof value.line !== 'number') {
+    return false
+  }
+  if (value.suggestion !== undefined && typeof value.suggestion !== 'string') {
+    return false
+  }
+  return true
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
