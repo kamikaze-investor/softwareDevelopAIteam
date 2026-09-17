@@ -1551,6 +1551,23 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       応答本文・prompt 本文・token は出さない。これにより Meta Review 総数 / 段別失敗数 /
       truncation 件数 / Copilot fallback 発動数・成功数 / 最終 BLOCK 数を後から数えられる。
 
+      **【2026-09-17 production 実測で見つけた regression と、その恒久対策】**
+      #241 で追加した観測ログが **Design Review runner の stdout プロトコルを壊していた**。
+      `designReviewRunner.ts:136` は stdout を JSON channel として使い、coordinator は
+      `JSON.parse(execution.stdout)` する。`geminiRouter.ts` / `metaReviewFallbackRouter.ts` は
+      **autoReview（stdout = 単なるログ）と designReviewRunner（stdout = プロトコル）の両方**から
+      読み込まれるため、`console.log` で出した診断行が JSON に混ざり、本番の Design Review が
+      `runner returned unparsable output` で失敗していた（production SHA 5d88047 の時点で既に潜在）。
+
+      **検出したのは Principle Management の production Operational E2E である。** CI でも
+      ローカルテストでも出ず、実際に runner を本番で走らせて初めて表面化した。
+
+      **恒久対策は文章ではなくテストにした**（`observation-closes-loop`）: 該当 4 箇所を
+      `console.error` へ移したうえで、`runnerStdoutProtocol.test.ts` が runner の読み込む
+      モジュール（geminiRouter / metaReviewFallbackRouter / copilotRouter / strategicReview / runner）に
+      `console.log` が入ったら落ちるようにした。**再評価条件は「このテストが落ちたとき」であり、
+      人の記憶に依存しない。**
+
       **将来の Model Router との関係**: Copilot より後段の provider routing は本項目では作らない。
       `role-model-registry` が Model Router の owner であり、そちらが実装された時点で
       **Meta Review の post-Copilot fallback もその適用対象とする**（同項目の受入条件に統合済み）。
