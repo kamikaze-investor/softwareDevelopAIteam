@@ -202,11 +202,41 @@ ${request.relatedSpecs.map((s) => `- ${s}`).join('\n')}
 
 **Git Diff**:
 \`\`\`diff
-${request.gitDiff}
+${boundDiffForPrompt(request.gitDiff)}
 \`\`\`
 
 上記のdiffを確認し、MetaReviewResultのJSON形式で回答してください。
 `
+}
+
+/**
+ * prompt へ載せる diff を上限で切る。
+ *
+ * 実測（2026-09-17, PR #234 / probe #236）: prompt 186,872 文字に対し応答 773 文字で
+ * 途中切断（`unclosedFence=true` / `braceDelta=+2`）。`gemini-2.5-flash` は thinking model で
+ * `maxOutputTokens`(8192) を thinking と出力で共有するため、巨大 prompt が出力予算を
+ * 食い潰した疑いを検証する。**diff はこれまでまったく上限が無かった。**
+ *
+ * **切り捨てたことを必ず本文へ明示する。** 黙って一部だけ見せると、
+ * 部分的な証拠のまま approved が出る（= Gate の弱体化）。
+ */
+export const META_REVIEW_DIFF_CHAR_BUDGET = 60_000
+
+export function boundDiffForPrompt(
+  diff: string,
+  budget: number = META_REVIEW_DIFF_CHAR_BUDGET,
+): string {
+  if (diff.length <= budget) {
+    return diff
+  }
+
+  const omitted = diff.length - budget
+  return [
+    diff.slice(0, budget),
+    '',
+    `[TRUNCATED] このdiffは全体の一部です。${omitted} 文字を省略しました（全 ${diff.length} 文字）。`,
+    '省略部分は確認できていません。approved と判断する場合は、その限界を summary に明記してください。',
+  ].join('\n')
 }
 
 /**
