@@ -210,6 +210,50 @@ ${request.gitDiff}
 }
 
 /**
+ * **formal verdict が成立したときだけ** 結果を返す。成立しなければ `undefined`。
+ *
+ * これが「provider attempt が成功したか」の判定基準である。
+ * text が返ってきたことは成功ではない — empty / truncated / malformed /
+ * 未知の status はいずれもここで `undefined` になり、呼び出し側は
+ * **formal review 不成立**として既存の retry / fallback へ進める
+ * （`meta-review-structured-output-robustness`）。
+ *
+ * **判定の中身（APPROVED / CHANGES_REQUESTED / BLOCKED のどれか）では分岐しない。**
+ * 分岐させると「BLOCKED だったから別 provider で聞き直す」という review shopping に
+ * なるため、成立したかどうかだけを見る。
+ */
+export function tryParseMetaReviewResult(
+  rawResponse: string,
+  taskId: string,
+): MetaReviewResult | undefined {
+  for (const jsonStr of extractJsonCandidates(rawResponse)) {
+    try {
+      const parsed: unknown = JSON.parse(jsonStr)
+      if (!isRecord(parsed)) {
+        throw new Error('Parsed value is not an object')
+      }
+      // buildMetaReviewResult() は未知の status で throw する。
+      // したがって「invalid / unknown verdict」もここで不成立になる。
+      return buildMetaReviewResult(parsed, taskId)
+    } catch {
+      // 別候補を試す。全候補が失敗した場合だけ不成立とする。
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * provider の応答が formal verdict を構成するか。
+ *
+ * router がこの述語を使って attempt の成否を決める。`taskId` は生成される id にしか
+ * 使われないので、判定目的の呼び出しではプレースホルダで問題ない。
+ */
+export function hasFormalVerdict(rawResponse: string): boolean {
+  return tryParseMetaReviewResult(rawResponse, 'verdict-probe') !== undefined
+}
+
+/**
  * Meta Review Resultのvalidation
  * AIが不正なJSONを返した場合は blocked として扱う
  */
@@ -217,16 +261,9 @@ export function parseMetaReviewResult(
   rawResponse: string,
   taskId: string
 ): MetaReviewResult {
-  for (const jsonStr of extractJsonCandidates(rawResponse)) {
-    try {
-      const parsed: unknown = JSON.parse(jsonStr)
-      if (!isRecord(parsed)) {
-        throw new Error('Parsed value is not an object')
-      }
-      return buildMetaReviewResult(parsed, taskId)
-    } catch {
-      // 別候補を試す。全候補が失敗した場合だけ blocked に倒す。
-    }
+  const parsed = tryParseMetaReviewResult(rawResponse, taskId)
+  if (parsed !== undefined) {
+    return parsed
   }
 
   // パース失敗は最も安全な方向（blocked）に倒す
