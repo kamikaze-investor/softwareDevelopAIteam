@@ -567,8 +567,20 @@ export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalPars
   try {
     parsed = JSON.parse(match[1] ?? match[0])
   } catch (error: unknown) {
-    // JSON.parse のメッセージは入力そのものを含まない（位置と種類だけ）。
-    return { ok: false, reason: `json_parse_error: ${error instanceof Error ? error.message : 'unknown'}` }
+    // **`JSON.parse` のメッセージをそのまま載せない。**
+    //
+    // Node 22 のメッセージは入力の断片を**そのまま含む**（実測:
+    // `Unexpected token 's', ..."          sk-SECRET-"... is not valid JSON`）。
+    // これを理由として保存すると、値を載せない約束が崩れるだけでなく、
+    // raw の上限より後ろにある断片が上限を迂回して混入しうる。
+    // 位置（数値）だけを取り出す。分類にはそれで足り、内容は raw 側で上限付きで見る。
+    const position = error instanceof Error
+      ? /at position (d+)/.exec(error.message)?.[1]
+      : undefined
+    return {
+      ok: false,
+      reason: position === undefined ? 'json_parse_error' : `json_parse_error_at_position: ${position}`,
+    }
   }
   if (typeof parsed !== 'object' || parsed === null) return { ok: false, reason: 'not_an_object' }
 

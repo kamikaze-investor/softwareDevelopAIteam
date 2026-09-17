@@ -472,6 +472,28 @@ describe('proposal_unusable — 観測して忘れない', () => {
     expect(diagnostic?.rawLength).toBe(raw.length)
   })
 
+  // Node 22 の JSON.parse は入力の断片をメッセージへそのまま入れる（実測）。
+  // それを理由として保存すると、値を載せない約束が崩れ、raw の上限も迂回される。
+  it('JSON parse エラーの理由に入力内容を載せない', async () => {
+    const { storage, projectId } = seedAdoptable()
+    const secretish = 'sk-NOT-A-REAL-TOKEN-0123456789'
+    // 断片が raw の上限より後ろに来るようにして、上限の迂回も同時に見る。
+    const raw = `{ "roadmapId": ${' '.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 100)}${secretish} }`
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.reason).toMatch(/^json_parse_error(_at_position: d+)?$/)
+    expect(diagnostic?.reason).not.toContain(secretish)
+    expect(diagnostic?.reason).not.toContain('sk-')
+    // raw 側は上限で切れているので、断片はそもそも入っていない。
+    expect(diagnostic?.raw).not.toContain(secretish)
+    expect(diagnostic?.rawTruncated).toBe(true)
+  })
+
   it('記録に失敗しても採用の結果は変えない（観測が挙動を動かさない）', async () => {
     const { storage, projectId } = seedAdoptable()
     const broken = {
