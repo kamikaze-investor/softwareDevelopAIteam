@@ -201,7 +201,23 @@ async function main(): Promise<void> {
   // providerUsed は監査証跡用にファイル書き込み時のみ additive に付与する
   // （2026-08-26 独立レビュー指摘: 実際に応答したプロバイダーが記録されず、
   //   PRコメントが常に「Reviewed by Gemini」と表示されていた問題への対応）。
-  const result = parseMetaReviewResult(rawResponse, taskId)
+  const parsedResult = parseMetaReviewResult(rawResponse, taskId)
+
+  // **成功経路の本文も sink へ出る前に通す。**
+  // summary / findings は result ファイル・CI ログ・公開 PR コメントの3箇所へ出る。
+  // CI では Copilot 子プロセスへ job token を渡すようになったため、
+  // provider が token を formal な欄へ echo した場合の露出経路を塞ぐ
+  // （独立レビュー指摘 2026-09-17 R2。失敗経路は既に sanitize 済み）。
+  const result = {
+    ...parsedResult,
+    summary: sanitizeMessage(parsedResult.summary),
+    findings: parsedResult.findings.map((f) => ({
+      ...f,
+      message: sanitizeMessage(f.message),
+      ...(f.suggestion === undefined ? {} : { suggestion: sanitizeMessage(f.suggestion) }),
+    })),
+  }
+
   writeResultFile({ ...result, providerUsed }, resultFilePath)
   printResult(result)
 

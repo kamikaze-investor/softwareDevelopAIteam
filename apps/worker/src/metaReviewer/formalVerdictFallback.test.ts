@@ -289,3 +289,41 @@ describe('Independent Review 2026-09-17: gate predicate strictness and no-shoppi
     expect(hasFormalVerdict(lenientlyParseable)).toBe(false)
   })
 })
+
+describe('Independent Review 2026-09-17 R2: validated object == finalized object', () => {
+  it('早期の緩い APPROVED より後続の厳密な BLOCKED を採用する', () => {
+    // 独立レビュー R2 の再現形。検証と最終採用が別の object を選んでいた。
+    const mixed = [
+      '```json',
+      JSON.stringify({ status: 'approved' }),
+      '```',
+      '',
+      '```json',
+      JSON.stringify({
+        status: 'blocked', riskLevel: 'critical', summary: 'real verdict',
+        findings: [{ severity: 'critical', category: 'security_regression', message: 'm' }],
+        requiresCeoApproval: true,
+      }),
+      '```',
+    ].join('\n')
+
+    expect(hasFormalVerdict(mixed)).toBe(true)
+    // **BLOCKED が捨てられて APPROVED が残ってはいけない。**
+    expect(parseMetaReviewResult(mixed, 't').status).toBe('blocked')
+  })
+
+  it('findings の要素が空オブジェクトなら成立にしない', () => {
+    expect(hasFormalVerdict(JSON.stringify({
+      status: 'approved', riskLevel: 'low', summary: 's',
+      findings: [{}], requiresCeoApproval: false,
+    }))).toBe(false)
+  })
+
+  it('findings に message があれば成立する', () => {
+    expect(hasFormalVerdict(JSON.stringify({
+      status: 'changes_requested', riskLevel: 'medium', summary: 's',
+      findings: [{ severity: 'warning', category: 'scope_creep', message: 'm' }],
+      requiresCeoApproval: false,
+    }))).toBe(true)
+  })
+})

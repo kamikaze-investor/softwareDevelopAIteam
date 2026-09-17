@@ -289,6 +289,11 @@ function findStrictVerdictObject(rawResponse: string): Record<string, unknown> |
     if (!Array.isArray(parsed.findings)) {
       continue
     }
+    // 要素まで見る。`findings: [{}]` のような中身の無い配列を通すと、
+    // normalizeFindings() が黙って落として APPROVED だけが残る（独立レビュー指摘 R2）。
+    if (!parsed.findings.every((f) => isRecord(f) && typeof f.message === 'string')) {
+      continue
+    }
     if (typeof parsed.requiresCeoApproval !== 'boolean') {
       continue
     }
@@ -306,6 +311,18 @@ export function parseMetaReviewResult(
   rawResponse: string,
   taskId: string
 ): MetaReviewResult {
+  // **検証した object と最終採用する object を一致させる。**
+  //
+  // 独立レビュー指摘（2026-09-17 R2）: gate 述語が「どこかに厳密な verdict がある」ことだけを
+  // 見て、最終 parse は「最初に緩く読めた候補」を返していたため、
+  // `{"status":"approved"}` の後ろに完全な BLOCKED が続く応答で
+  // **BLOCKED が捨てられ APPROVED が採用される**経路があった。
+  // 厳密な候補があるなら必ずそれを採る。
+  const strict = findStrictVerdictObject(rawResponse)
+  if (strict !== undefined) {
+    return buildMetaReviewResult(strict, taskId)
+  }
+
   const parsed = tryParseMetaReviewResult(rawResponse, taskId)
   if (parsed !== undefined) {
     return parsed

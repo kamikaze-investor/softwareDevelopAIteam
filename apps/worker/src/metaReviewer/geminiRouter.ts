@@ -463,7 +463,9 @@ function callCliDetailed(
     attempt++
   ) {
     sleepImpl(TRANSIENT_RETRY_DELAYS_MS[attempt - 1])
-    outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort)
+    // **retry でも validator を落とさない。** 落とすと 2 回目以降が
+    // 「text が返れば成功」へ戻り、malformed を受理してしまう（独立レビュー指摘 2026-09-17 R2）。
+    outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort, validateResponse)
   }
   return outcome
 }
