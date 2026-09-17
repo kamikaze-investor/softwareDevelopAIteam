@@ -7912,6 +7912,29 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **原因の特定に追加調査を要さなかった**:
       `File Change Guard blocked. Why: … — Not in task.allowedPaths: … allowedPaths scope …`
 
+      **3例目（2026-09-16、実測。#227 適用後）**: PL が
+      `allowed-paths-empty-disables-file-change-guard` を自律採用し、
+      `allowedPaths: ["apps/api/src/**"]` を宣言した。しかし **File Change Guard は glob を
+      解釈しない**。突き合わせは前方一致である（`fileChangeGuard.ts`:
+      `normalized === normalizedAp || normalized.startsWith(normalizedAp + '/')`）。
+      よって `apps/api/src/**` という**文字列**は、`apps/api/src/pl/executionLoop.ts` を含め
+      **何にも一致しない**。宣言した範囲は「狭すぎた」のではなく、**実質的に空**だった。
+
+      症状は 1・2例目と同じ（宣言した範囲が実装先と噛み合わない）が、**原因はさらに別**である。
+      1例目は protected file、2例目は存在しないディレクトリ、そして今回は
+      **path は実在するのに記法が Guard の仕様と違う**。したがって #227 で入れた
+      「名称から path を創作するな」では防げない — `apps/api/src` は実在し、創作でもない。
+
+      **prompt 側の欠落として確認済み**: `ADOPTION_SYSTEM_PROMPT` は allowedPaths に
+      「repository-relative で2階層以上」とだけ要求し、**前方一致であること・glob が使えないことを
+      一度も述べていない**。PL の出力は与えられた規約に反していない。
+
+      **着手時に確認することへの追加**: 上の「どこまでなら機械的に言い切れるか」に対する
+      **答えの一部がここにある**。glob metacharacter（`*` `?` `[`）を含む allowedPaths 要素は、
+      実装対象ファイルを推測しなくても **Guard 上で必ず不一致になる**と言い切れる。
+      実装対象の予測を要する protected 判定とは違い、**誤検出の余地が無い**。
+      ただし**どこで弾くかは着手時に決める**（新しい Gate も新しい Review 段も作らない、は不変）。
+
       **事象**: PL が `guard-block-message-omits-allowed-paths` を自律採用 → Design Review は
       **ALIGNED** → implement Job 作成、まで進んだ。しかし対象は `jobRunner.ts` /
       `fileChangeGuard.ts`（**`ALWAYS_FORBIDDEN_PATTERNS` の protected file**）で、
