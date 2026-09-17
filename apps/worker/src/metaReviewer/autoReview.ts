@@ -133,6 +133,9 @@ async function main(): Promise<void> {
   // CLI 側は AGY_REVIEW_MODEL（model + effort の対）を使う。
   const geminiApiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash'
   console.log('\n🤖 Gemini にレビューを依頼中...')
+  // prompt 長も残す。「diff が大きいほど truncation が再現しやすい」という既存の観察を、
+  // 次の失敗時に応答長と突き合わせて確かめられるようにする（推測で直さないため）。
+  console.log(`[metaReview] prompt chars=${prompt.length}`)
   let rawResponse: string
   let providerUsed: 'gemini' | 'copilot' = 'gemini'
   try {

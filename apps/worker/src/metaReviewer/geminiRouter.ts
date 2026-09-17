@@ -552,6 +552,42 @@ function handleBothExhausted(featureName: string, diagnostics: ProviderFailureDi
  * （プロンプト不正・agy 未認証等）では Claude フォールバックを試みず、そのまま両方失敗として
  * 扱う（無条件フォールバックにしない）。
  */
+/**
+ * 応答が「どの段から、どれだけの長さで」返ってきたかを 1 行で残す。
+ *
+ * **応答本文そのものは出さない。** 出すのは段・モデル・長さ・構造的な形の真偽値だけで、
+ * PR コメントにもログにも review 内容や secret が漏れない。
+ *
+ * 2026-09-17 の実測（PR #234）で、Meta Review 応答が 848〜859 文字で**文字列の途中で
+ * 切れている**ことが分かったが、既存ログからは**どの段が返したのかすら分からなかった**。
+ * `preferCli: true` なので CLI 段が有力だが、CLI 失敗時は API 段へ落ちるため断定できない。
+ * 原因を推測で直さないために、まず段を確定させる（`specs/21` observation-closes-loop）。
+ */
+function logResponseShape(input: {
+  featureName: string
+  stage: string
+  model: string | undefined
+  text: string
+  usedJsonSchema: boolean
+}): void {
+  const text = input.text
+  const trimmed = text.trimEnd()
+  // 「フェンスを開いたまま閉じていない」「JSON の括弧が閉じていない」は truncation の強い兆候。
+  const openFences = (text.match(/```/gu) ?? []).length
+  const shape = {
+    feature: input.featureName,
+    stage: input.stage,
+    model: input.model ?? "(default)",
+    chars: text.length,
+    usedJsonSchema: input.usedJsonSchema,
+    fenceCount: openFences,
+    unclosedFence: openFences % 2 === 1,
+    braceDelta: (text.match(/\{/gu) ?? []).length - (text.match(/\}/gu) ?? []).length,
+    endsWithCloser: /[}\]`]$/u.test(trimmed),
+  }
+  console.log(`[metaReview] response shape ${JSON.stringify(shape)}`)
+}
+
 export async function callGeminiWithFallback(
   prompt: string,
   options?: GeminiRouterOptions,
@@ -574,17 +610,29 @@ export async function callGeminiWithFallback(
   if (preferCli) {
     // CLI → API
     cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort)
-    if (cliOutcome.ok) return cliOutcome.text as string
+    if (cliOutcome.ok) {
+      logResponseShape({ featureName, stage: 'gemini_cli', model: cliModel, text: cliOutcome.text as string, usedJsonSchema: cliJsonSchema !== undefined })
+      return cliOutcome.text as string
+    }
 
     apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel)
-    if (apiOutcome.ok) return apiOutcome.text as string
+    if (apiOutcome.ok) {
+      logResponseShape({ featureName, stage: 'gemini_api', model: apiModel, text: apiOutcome.text as string, usedJsonSchema: false })
+      return apiOutcome.text as string
+    }
   } else {
     // API → CLI
     apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel)
-    if (apiOutcome.ok) return apiOutcome.text as string
+    if (apiOutcome.ok) {
+      logResponseShape({ featureName, stage: 'gemini_api', model: apiModel, text: apiOutcome.text as string, usedJsonSchema: false })
+      return apiOutcome.text as string
+    }
 
     cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort)
-    if (cliOutcome.ok) return cliOutcome.text as string
+    if (cliOutcome.ok) {
+      logResponseShape({ featureName, stage: 'gemini_cli', model: cliModel, text: cliOutcome.text as string, usedJsonSchema: cliJsonSchema !== undefined })
+      return cliOutcome.text as string
+    }
   }
 
   // Gemini（API・CLI 双方）が quota 起因で失敗した場合だけ Antigravity/Claude を試す。
@@ -595,7 +643,10 @@ export async function callGeminiWithFallback(
     claudeOutcome = callCliDetailed(
       prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, 'antigravity_claude_cli', featureName, retryTransient, sleepImpl, cliJsonSchema,
     )
-    if (claudeOutcome.ok) return claudeOutcome.text as string
+    if (claudeOutcome.ok) {
+      logResponseShape({ featureName, stage: 'antigravity_claude_cli', model: ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, text: claudeOutcome.text as string, usedJsonSchema: cliJsonSchema !== undefined })
+      return claudeOutcome.text as string
+    }
     // 2026-08-26 独立レビュー指摘: Claude段が非quota理由（認証エラー・プログラムエラー等）で
     // 失敗した場合、それをquota起因と混同してCopilotへ静かにフォールバックしてはいけない。
     // 以降の combineFailureClasses() が claudeOutcome の診断情報も含めて再判定するため、
