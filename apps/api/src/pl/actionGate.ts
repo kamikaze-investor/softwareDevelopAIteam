@@ -295,10 +295,25 @@ function checkDesignReview(
   return { satisfied: true }
 }
 
+/**
+ * `approval_gate` evidence が満たすべき `ApprovalRequest.requestedAction`。
+ *
+ * ApprovalRequest は task 単位で発行されるため、**target 束縛だけでは
+ * 「この Task の何かを承認した」以上の意味を持たない**。別 action（git_commit 等）の
+ * 承認で park を通さないよう、action 名まで一致を要求する。
+ *
+ * ここに載っていない action の検証は変えていない（既存経路の挙動は不変）。
+ * 束縛材料は既存の `requestedAction` であり、新しい承認種別は追加していない。
+ */
+const REQUIRED_APPROVAL_REQUEST_ACTION: Partial<Record<PlActionKind, string>> = {
+  abort_task: 'abort_task',
+}
+
 function checkApprovalGate(
   storage: IStorage,
   approvalRequestId: string,
   scope: EvidenceScope,
+  kind: PlActionKind,
 ): EvidenceCheck {
   const targetTaskId = scope.taskId
   if (targetTaskId === undefined) {
@@ -314,6 +329,15 @@ function checkApprovalGate(
   }
   if (request.status !== 'APPROVED') {
     return { satisfied: false, rejection: `approval request ${approvalRequestId} is ${request.status}` }
+  }
+
+  const requiredAction = REQUIRED_APPROVAL_REQUEST_ACTION[kind]
+  if (requiredAction !== undefined && request.requestedAction !== requiredAction) {
+    return {
+      satisfied: false,
+      rejection:
+        `approval request ${approvalRequestId} approved "${request.requestedAction}", not "${requiredAction}"`,
+    }
   }
 
   // 壊れた期限値を「未失効」として通さない（NaN <= now は false になるため明示的に弾く）。
@@ -473,7 +497,7 @@ function verifyEvidence(
     case 'independent_review':
       return checkDesignReview(storage, ref.designReviewEvidenceId, scope, true)
     case 'approval_gate':
-      return checkApprovalGate(storage, ref.approvalRequestId, scope)
+      return checkApprovalGate(storage, ref.approvalRequestId, scope, kind)
     case 'ceo_approval':
       return checkCeoApproval(storage, ref.approvalId, kind)
     case 'strategic_alignment_review':

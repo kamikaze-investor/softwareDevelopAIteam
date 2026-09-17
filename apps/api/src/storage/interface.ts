@@ -261,6 +261,14 @@ export interface IProjectStorage {
 
 export interface ITaskStorage {
   findByProjectId(projectId: string): Task[]
+  /**
+   * abort_task で park された Task か。**park 判定の唯一の定義**である。
+   *
+   * 既存 `audit_log` の `task_aborted` 行だけで判る（新しい flag も status も持たない）。
+   * sync の再活性化・attention 抑制・Job 生成・resume が同じ述語を使う。
+   * 場所ごとに別の park 判定を作ると、片方だけが park を尊重する状態になる。
+   */
+  isParked(taskId: string): boolean
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   /**
@@ -430,6 +438,48 @@ export interface IJobStorage {
    * 解除対象は、検証した対象 Job と**同一 `safeCommand.workingDir`** の quarantined Job のみ
    * （無関係な兄弟を一律解除しない）。
    */
+  /**
+   * abort_task の最終段。**所有権解放と park を単一 transaction で行う。**
+   *
+   * 前段で Worker が観測した workspace を **API 側で再検証**し、対象 Job の baseline と
+   * 一致するときだけ `blocked` → `failed` にして所有権を解放し、続けて Task を park する。
+   * Worker の自己申告だけで解放しない（`clearWorkspaceQuarantine()` と同じ形）。
+   *
+   * 片方だけ成立する状態を作らないため、解放・park・audit は同じ transaction に入れる。
+   * 検証に失敗したら **何も変えない**（Job は blocked のまま所有権を保持する）。
+   */
+  /**
+   * 解放すべき blocked Job が無い Task を park する。**park と audit を同一 transaction で行う。**
+   * 片方だけ成立する状態を作らない（CEO 指示・2026-09-17）。
+   */
+  parkTask(input: {
+    taskId: string
+    reason: string
+    approvalRequestId: string
+  }): ReleaseBlockedJobAndParkTaskResult
+  releaseBlockedJobAndParkTask(input: {
+    jobId: string
+    taskId: string
+    /** Worker が今この瞬間に観測した workspace。baseline と同じ形式。 */
+    observation: JobWorkspaceBaseline
+    /**
+     * 観測と同時に採った構造的事実。**baseline 一致だけでは所有権を解放しない。**
+     * HEAD と manifest が一致していても rebase / merge が進行中だったり、
+     * assume-unchanged / skip-worktree で観測に出ない変更が隠れていることがある。
+     * 既存 quarantine 解除経路と同じ材料を、同じ理由で要求する。
+     */
+    knownGood: {
+      gitOperationMarkers: string[]
+      worktreeClean: boolean
+      indexClean: boolean
+      headValid: boolean
+      blindSpotsAbsent: boolean
+    }
+    /** audit に残す park 理由。 */
+    reason: string
+    /** 承認の出所。transaction 内で束縛を再検証し、CONSUMED まで進める。 */
+    approvalRequestId: string
+  }): ReleaseBlockedJobAndParkTaskResult
   clearWorkspaceQuarantine(input: {
     jobId: string
     /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
@@ -446,6 +496,14 @@ export interface IJobStorage {
     reason?: string
   }): ClearWorkspaceQuarantineResult
 }
+
+export type ReleaseBlockedJobAndParkTaskResult =
+  | { ok: true; job: Job; task: Task }
+  | {
+    ok: false
+    code: 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR'
+    reason: string
+  }
 
 export interface IApprovalStorage {
   /** 全Project横断でpending状態の承認のみを1クエリで取得する（N+1回避用） */

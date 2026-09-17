@@ -1,7 +1,9 @@
+import type { JobWorkspaceBaseline } from '@ai-team/shared'
+import { completeAbortCleanup } from '../pl/abortTask'
 import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
-import { canonicalizeJobUpdate, type Job, type ReviewResult } from '@ai-team/shared'
+import { canonicalizeJobUpdate, isLiveJob, type Job, type ReviewResult } from '@ai-team/shared'
 import {
   buildDesignContract,
   loadEngineeringPrinciples,
@@ -221,39 +223,50 @@ const FailIfRunningJobBody = z.object({
  * Worker側は検証成功後にのみ要求する（`jobStateManager.ts`）／client・mobile等の一般
  * callerが任意のbooleanでclearできる経路は作らない／検証失敗時はquarantineを維持する。
  */
+/** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
+const WorkspaceObservationSchema = z.discriminatedUnion('mode', [
+  z.object({
+    mode: z.literal('clean'),
+    startCommitHash: z.string(),
+  }).strict(),
+  z.object({
+    mode: z.literal('dirty'),
+    startCommitHash: z.string(),
+    entries: z.array(z.object({
+      path: z.string(),
+      oldPath: z.string().optional(),
+      kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+      xyStatus: z.string().optional(),
+      beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+      afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+      beforeMode: z.string().optional(),
+      afterMode: z.string().optional(),
+      headHash: z.string().optional(),
+      indexHash: z.string().optional(),
+      worktreeHash: z.string(),
+    })),
+  }).strict(),
+])
+
+/** 観測と同時に採った構造的事実（進行中の git 操作・観測に出ない変更の有無）。 */
+const KnownGoodFactsSchema = z.object({
+  gitOperationMarkers: z.array(z.string()),
+  worktreeClean: z.boolean(),
+  indexClean: z.boolean(),
+  headValid: z.boolean(),
+  blindSpotsAbsent: z.boolean(),
+})
+
+// abort cleanup も quarantine 解除と**同じ材料**を同じ厳密さで要求する。
+// 所有権の解放は quarantine 解除より重く、緩い検証で通してよい理由がない。
+const AbortCleanupResultBody = z.object({
+  observation: WorkspaceObservationSchema,
+  knownGood: KnownGoodFactsSchema,
+}).strict()
+
 const ClearQuarantineJobBody = z.object({
-  /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
-  observation: z.discriminatedUnion('mode', [
-    z.object({
-      mode: z.literal('clean'),
-      startCommitHash: z.string(),
-    }).strict(),
-    z.object({
-      mode: z.literal('dirty'),
-      startCommitHash: z.string(),
-      entries: z.array(z.object({
-        path: z.string(),
-        oldPath: z.string().optional(),
-        kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
-        xyStatus: z.string().optional(),
-        beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
-        afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
-        beforeMode: z.string().optional(),
-        afterMode: z.string().optional(),
-        headHash: z.string().optional(),
-        indexHash: z.string().optional(),
-        worktreeHash: z.string(),
-      })),
-    }).strict(),
-  ]),
-  /** baseline が無い場合に required な構造的事実。 */
-  knownGood: z.object({
-    gitOperationMarkers: z.array(z.string()),
-    worktreeClean: z.boolean(),
-    indexClean: z.boolean(),
-    headValid: z.boolean(),
-    blindSpotsAbsent: z.boolean(),
-  }),
+  observation: WorkspaceObservationSchema,
+  knownGood: KnownGoodFactsSchema,
   /** 解除理由（startup recovery で baseline と一致、等）。failure_metadata に記録される。 */
   quarantineClearedReason: z.string().optional(),
 }).strict()
@@ -389,6 +402,17 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(409).send({ error: 'Project is archived' })
     }
 
+    // **park された Task へ新しい Job を作らない。** Worker は Task の状態を見ずに
+    // queued Job を拾うため、ここを塞がないと park した Task がそのまま走り出し、
+    // workspace も占有し直す（独立レビュー Finding 7）。park の解除は CEO の判断であって、
+    // Job 作成の副作用として起きてよいものではない。
+    if (storage.tasks.isParked(task.id)) {
+      return reply.status(409).send({
+        error: 'Task was parked by abort_task; creating a job would silently un-park it',
+        code: 'TASK_PARKED',
+      })
+    }
+
     const jobInput: Omit<Job, 'id' | 'createdAt'> = {
       ...result.data,
       // workingDir はクライアントから受け取らない。MVP-Aの正規workingDirをここで設定する。
@@ -471,6 +495,31 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
   // 解除は「成功した workspace 検証の**観測**の提示 + サーバーによる再検証」なしには
   // 成立しない（ClearQuarantineJobBody が observation / knownGood を必須化）。
   // 人力・force・admin による無条件解除経路は無い。
+  /**
+   * POST /:id/abort-cleanup-result
+   *
+   * abort_task が cleanup を要求した Job について、Worker が観測した workspace を受け取る。
+   * **観測はサーバ側で再検証する**（`clear-quarantine` と同じ形）。一致したときだけ
+   * 所有権を解放し、同一 transaction で Task を park する。一致しなければ何も変えない。
+   */
+  app.post<{ Params: { id: string } }>('/:id/abort-cleanup-result', async (req, reply) => {
+    const parsed = AbortCleanupResultBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    }
+
+    const result = completeAbortCleanup(storage, {
+      jobId: req.params.id,
+      observation: parsed.data.observation as JobWorkspaceBaseline,
+      knownGood: parsed.data.knownGood,
+    })
+    if (!result.ok) {
+      const status = result.code === 'NOT_FOUND' ? 404 : 409
+      return reply.status(status).send({ error: result.reason, code: result.code })
+    }
+    return reply.send({ parked: true, ...result })
+  })
+
   app.patch<{ Params: { id: string } }>('/:id/clear-quarantine', async (req, reply) => {
     const result = ClearQuarantineJobBody.safeParse(req.body)
     if (!result.success) {
@@ -525,6 +574,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const existing = storage.jobs.findById(req.params.id)
     if (!existing) {
       return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    // **park された Task の Job を live な status へ戻さない。**
+    //
+    // `canApplyJobResultStatus()` は terminal からの requeue を許すため、park で
+    // `failed` へ解放した Job をこの汎用経路から `queued` へ戻せてしまう。Worker は
+    // Task の状態を見ずに queued Job を拾うので、park が黙って取り消される。
+    // これは遅れて届いた報告ではなく「park された Task をもう一度動かせ」という要求なので、
+    // stale 遷移として黙って落とすのではなく、理由を返して拒否する。
+    if (
+      jobUpdate.status !== undefined
+      && isLiveJob({ status: jobUpdate.status })
+      && storage.tasks.isParked(existing.taskId)
+    ) {
+      return reply.status(409).send({
+        error: 'Task was parked by abort_task; its jobs cannot be made live again',
+        code: 'TASK_PARKED',
+      })
     }
 
     // Result State Application Policy。

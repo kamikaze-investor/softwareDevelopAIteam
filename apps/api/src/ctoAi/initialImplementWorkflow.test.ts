@@ -3,6 +3,7 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import { buildInitialImplementAiCliPrompt, createInitialImplementWorkflow } from './initialImplementWorkflow'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { abortTask } from '../pl/abortTask'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
 
 function alignedDeps() {
@@ -48,6 +49,35 @@ describe('initial implement workflow', () => {
       projectId: project.id, title: 'T', description: 'Implement T.', status: 'pending',
       assignee: 'developer_ai', dependencies: [], roadmapActive: true,
     }).id
+  })
+
+  // Design Review の待ち時間は数分単位になりうる。その間に CEO が abort_task を承認して
+  // Task を park しても、待つ前の判定のまま Job を作れば park は黙って取り消される
+  // （Worker は Task の状態を見ずに queued Job を拾う）。
+  it('Design Review 中に park された Task へは Job を作らない', async () => {
+    const parkingDeps = {
+      ...alignedDeps(),
+      execute: async () => {
+        const request = storage.approvalRequests.create({
+          taskId, requestedAction: 'abort_task', riskLevel: 'HIGH',
+          targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+          changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
+          status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        } as Parameters<IStorage['approvalRequests']['create']>[0])
+        storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+        const parked = abortTask(storage, {
+          taskId, approvalRequestId: request.id, reason: 'CEO parked it while the review ran',
+        })
+        expect(parked).toMatchObject({ ok: true, status: 'parked' })
+        return alignedDeps().execute()
+      },
+    }
+
+    const result = await createInitialImplementWorkflow(storage, taskId, parkingDeps)
+
+    expect(result).toMatchObject({ status: 'skipped' })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
+    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(false)
   })
 
   it('creates exactly one reviewed initial implement Job with a Design Contract prompt', async () => {

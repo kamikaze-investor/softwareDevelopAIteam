@@ -306,11 +306,25 @@ export function buildSystemState(
       // 順序が曖昧になり、判定が揺れる（実際にこの書き方で回帰テストが落ちた）。
       // 代わりに **「動かせる Job が1つも無いか」** を見る。queued / running は Worker が進め、
       // blocked は resume の対象で `job_blocked` が別に出る。どれも無ければ誰も進めない。
+      // **park された Task の履歴を「いま対応が要る」扱いにしない。**
+      //
+      // abort_task は Task を done にせず `roadmapActive=false` にするだけなので、
+      // blocked / failed だった Job は履歴としてそのまま残る（Mobile からも audit からも消えない）。
+      // ただし parent Task が park 済みなら、それを解消できる者はいない。
+      // 出し続けると PL は毎 tick それを見て何もできず、attention が永久に消えない —
+      // done な Task の blocked Job を除外している既存の判断と同じ理由である。
+      // **park だけを対象にする。** `roadmapActive === false` は sync による非活性化や
+      // 手動 Task でも起きるので、それらの attention まで消してはならない
+      // （独立レビュー Finding 6）。park 判定は storage の唯一の述語を使う。
+      const parentIsParked = task.roadmapActive !== true
+        && task.status !== 'done'
+        && storage.tasks.isParked(task.id)
+
       const hasMovableJob = jobs.some((job) => (
         job.status === 'queued' || job.status === 'running' || job.status === 'blocked'
       ))
       const stallingFailure = jobs.find((job) => job.status === 'failed' && !isQuarantined(job))
-      if (task.status !== 'done' && !hasMovableJob && stallingFailure !== undefined) {
+      if (task.status !== 'done' && !parentIsParked && !hasMovableJob && stallingFailure !== undefined) {
         attention.push({
           kind: 'job_failed',
           projectId: project.id,
@@ -334,7 +348,12 @@ export function buildSystemState(
             detail: job.failureMetadata?.quarantineReason ?? 'workspace is quarantined',
             stuckForMs: elapsedMs(job.completedAt ?? job.createdAt, nowMs),
           })
-        } else if (job.status === 'blocked' && task.status !== 'done' && !isWaitingOnLiveApproval(storage, job, nowMs)) {
+        } else if (
+          job.status === 'blocked'
+          && task.status !== 'done'
+          && !parentIsParked
+          && !isWaitingOnLiveApproval(storage, job, nowMs)
+        ) {
           // **done な Task の blocked Job は attention にしない。**
           // Task が終端に達している以上その Job は履歴であり、誰も解消できない
           // （resume の対象は blocked Task であって done Task ではない）。

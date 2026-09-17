@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { ensureTaskContinuation } from './taskContinuation'
 import { createInitialImplementWorkflow } from './initialImplementWorkflow'
+import { abortTask } from '../pl/abortTask'
 
 vi.mock('./initialImplementWorkflow', () => ({
   createInitialImplementWorkflow: vi.fn(),
@@ -36,6 +37,36 @@ describe('ensureTaskContinuation', () => {
     createInitialImplementWorkflowMock.mockResolvedValueOnce({ taskId: continuation.nextTaskId!, status: 'created', job: {} as never })
     await ensureTaskContinuation(storage, continuation.id)
     expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('completed')
+  })
+
+  // blocked は roadmapActive に関係なく project を占有するため、park された Task を
+  // blocked へ上げると park が事実上取り消される。しかも resume は park を理由に拒否するので、
+  // 誰も解消できない状態になる。
+  it('park された Task を blocked へ escalate しない', async () => {
+    const { storage, next, continuation } = createFixture()
+    const request = storage.approvalRequests.create({
+      taskId: next.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+      targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    } as never)
+    storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+    const parked = abortTask(storage, {
+      taskId: next.id, approvalRequestId: request.id, reason: 'parked before the continuation ran',
+    })
+    expect(parked).toMatchObject({ ok: true, status: 'parked' })
+
+    // park 済みなので initial workflow は成立しない。これは異常ではなく CEO が決めた結果。
+    createInitialImplementWorkflowMock.mockResolvedValueOnce({
+      taskId: next.id, status: 'skipped', reason: 'task was parked by abort_task',
+    })
+
+    await ensureTaskContinuation(storage, continuation.id)
+
+    expect(storage.taskContinuations.findById(continuation.id)?.status).toBe('failed')
+    // **Task は pending のまま。** blocked にすると park が取り消されたのと同じになる。
+    expect(storage.tasks.findById(next.id)?.status).toBe('pending')
+    expect(storage.tasks.findById(next.id)?.roadmapActive).toBe(false)
   })
 
   it('recovers a crash after initial Job creation by recognizing the deterministic existing Job', async () => {
