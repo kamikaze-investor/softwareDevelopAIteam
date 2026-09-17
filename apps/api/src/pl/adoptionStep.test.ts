@@ -19,7 +19,10 @@ import {
   classifyAdoptionCandidates,
   countConsecutiveSkips,
   FOLLOW_UP_SKIPS_BEFORE_BOOST,
+  adoptionPromptVersion,
+  findProposalDiagnostics,
   parseAdoptionProposal,
+  PROPOSAL_DIAGNOSTIC_RAW_LIMIT,
   readAdoptionCandidates,
   selectAdoptionCandidates,
   buildAdoptionPrompt,
@@ -392,6 +395,111 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     }
 
     expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(0)
+  })
+})
+
+describe('proposal_unusable — 観測して忘れない', () => {
+  /** 採用候補が1件以上ある最小の Project。 */
+  function seedAdoptable(): { storage: IStorage; projectId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    return { storage, projectId: project.id }
+  }
+
+  const LEDGER = [
+    '<!-- roadmap:id=open-item state=planned -->',
+    '1. [ ] **開いている項目** — 本文',
+  ].join('\n')
+
+  it('parse に失敗したら raw output と分類材料が必ず残る', async () => {
+    const { storage, projectId } = seedAdoptable()
+    const raw = 'すみません、JSON ではなく散文で答えます。open-item をやりましょう。'
+
+    const result = await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      proposerId: 'opencode-go/mimo-v2.5',
+      readLedger: () => LEDGER,
+    })
+
+    expect(result.status).toBe('proposal_unusable')
+
+    const diagnostics = findProposalDiagnostics(storage, projectId)
+    expect(diagnostics).toHaveLength(1)
+    const [diagnostic] = diagnostics
+    // **raw output そのもの**が読めること。これが無いと原因を分類できない。
+    expect(diagnostic?.raw).toBe(raw)
+    expect(diagnostic?.reason).toBe('no_json_object_found')
+    expect(diagnostic?.proposer).toBe('opencode-go/mimo-v2.5')
+    expect(diagnostic?.promptVersion).toBe(adoptionPromptVersion())
+    expect(diagnostic?.candidateCount).toBeGreaterThan(0)
+    expect(diagnostic?.followUpCandidateCount).toBe(0)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+    expect(diagnostic?.rawTruncated).toBe(false)
+  })
+
+  it('どのフィールドで落ちたかが残る（prompt 起因と parser 起因を分けるため）', async () => {
+    const { storage, projectId } = seedAdoptable()
+
+    const result = await runAdoptionStep(storage, projectId, {
+      propose: async () => JSON.stringify({ roadmapId: 'open-item', implementationScope: 'x' }),
+      readLedger: () => LEDGER,
+    })
+
+    expect(result.status).toBe('proposal_unusable')
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.reason).toContain('missing_or_invalid_fields')
+    expect(diagnostic?.reason).toContain('allowedPaths')
+    expect(diagnostic?.reason).toContain('acceptanceCriteria')
+    // 値は載せない（ledger 本文や prompt を巻き込まないため）。
+    expect(diagnostic?.reason).not.toContain('open-item')
+  })
+
+  it('巨大な出力は上限で切り、切ったことを残す', async () => {
+    const { storage, projectId } = seedAdoptable()
+    const raw = 'x'.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 5000)
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.raw).toHaveLength(PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+    expect(diagnostic?.rawTruncated).toBe(true)
+    // 実際の長さは分かるようにする（切った量を知らないと「途中で切れた出力」と区別できない）。
+    expect(diagnostic?.rawLength).toBe(raw.length)
+  })
+
+  it('採用に成功したときは何も残さない（成功時の全出力保存へ広げない）', async () => {
+    const { storage, projectId } = seedAdoptable()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => JSON.stringify({
+        roadmapId: 'open-item',
+        implementationScope: '残りの実装',
+        allowedPaths: ['apps/api/src/pl'],
+        acceptanceCriteria: ['通ること'],
+      }),
+      readLedger: () => LEDGER,
+    })
+
+    expect(findProposalDiagnostics(storage, projectId)).toHaveLength(0)
+  })
+
+  // 観測が PL の挙動を変えてはならない。attempt 予算と候補の回転位置は
+  // 同じ entity の行数・件数を読んでいるので、そこへ足すと観測しただけで挙動が動く。
+  it('診断行は採用サイクルの attempt 予算と回転位置を動かさない', async () => {
+    const { storage, projectId } = seedAdoptable()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => 'not json',
+      readLedger: () => LEDGER,
+    })
+
+    expect(storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)).toHaveLength(0)
+    expect(findProposalDiagnostics(storage, projectId)).toHaveLength(1)
   })
 })
 

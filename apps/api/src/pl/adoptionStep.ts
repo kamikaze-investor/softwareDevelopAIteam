@@ -23,6 +23,7 @@
  * ledger への新しい metadata / PL 専用の状態表。
  */
 
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
@@ -118,6 +119,32 @@ export const FOLLOW_UP_SKIPS_BEFORE_BOOST = 3
 
 /** audit_log の語彙。**新しいテーブルも metrics backend も作らない。** */
 const AUDIT_ENTITY_TYPE = 'roadmap_item'
+
+/**
+ * 採用提案が解釈できなかったときの診断記録。
+ *
+ * **`proposal_unusable` のためだけにある。** 成功時の出力は保存しない。
+ *
+ * 置き場所は既存 `audit_log` で、新しい table も metrics backend も作っていない。
+ * ただし entity_id は採用サイクルのキー（`adopt:<projectId>`）と**別にする**:
+ * attempt 予算（`adoptionEntriesInCurrentWindow()`）と候補の回転位置
+ * （`rotationOffset`、同 entity の**行数**を読む）が同じキーを数えているため、
+ * ここに足すと観測しただけで PL の挙動が変わってしまう。
+ */
+export const AUDIT_PROPOSAL_UNPARSED = 'adoption_proposal_unparsed'
+const PL_TARGET_ENTITY_TYPE = 'pl_loop_target'
+
+function proposalDiagnosticKey(projectId: string): string {
+  return `adopt-diagnostic:${projectId}`
+}
+
+/**
+ * 保存する raw 出力の上限。
+ *
+ * 原因分類（JSON が無い / 途中で切れた / フィールド欠落 / 契約外の散文）には十分で、
+ * 失敗のたびに際限なく膨らませない。**切り詰めたことは記録に残す。**
+ */
+export const PROPOSAL_DIAGNOSTIC_RAW_LIMIT = 4000
 export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
 export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
 export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
@@ -219,6 +246,86 @@ export function classifyAdoptionCandidates(
  * `(entity_type, entity_id, created_at DESC)` の既存 index で後から集計できる形にしてある:
  * 検出 → 初回で採用 / skip 1・2・3 → boost → boost 後に採用 / 取り残し、までを1本の系列で追える。
  */
+/**
+ * 採用 prompt / 出力契約の版。**内容そのものは保存せず、一致判定だけできるようにする。**
+ *
+ * 「あのとき出ていた prompt と今のものが同じか」を後から言えないと、
+ * prompt を直した後でこの診断を読み違える。
+ */
+export function adoptionPromptVersion(): string {
+  return createHash('sha256').update(ADOPTION_SYSTEM_PROMPT).digest('hex').slice(0, 12)
+}
+
+/** 記録するときに渡す材料。 */
+export interface ProposalDiagnostic {
+  reason: string
+  proposer: string
+  promptVersion: string
+  candidateCount: number
+  followUpCandidateCount: number
+  raw: string
+}
+
+/**
+ * 実際に保存された形。`raw` は上限で切られていることがあるので、
+ * **元の長さと切ったかどうか**を併せて持つ（切れた出力と短い出力を取り違えないため）。
+ */
+export interface PersistedProposalDiagnostic extends ProposalDiagnostic {
+  rawLength: number
+  rawTruncated: boolean
+}
+
+/**
+ * parse 失敗の診断を1件だけ残す。**成功時は何も残さない。**
+ *
+ * timestamp と projectId は audit 行そのもの（`created_at` / `entity_id`）が持つので重複させない。
+ * 保存するのは model の出力とその周辺の数値だけで、prompt 本文も credential も入れない
+ * （prompt には ledger 本文が丸ごと入るため、意図的に載せていない）。
+ */
+function recordProposalDiagnostic(
+  storage: IStorage,
+  projectId: string,
+  diagnostic: ProposalDiagnostic,
+): void {
+  const truncated = diagnostic.raw.length > PROPOSAL_DIAGNOSTIC_RAW_LIMIT
+  const payload = {
+    reason: diagnostic.reason,
+    proposer: diagnostic.proposer,
+    promptVersion: diagnostic.promptVersion,
+    candidateCount: diagnostic.candidateCount,
+    followUpCandidateCount: diagnostic.followUpCandidateCount,
+    rawLength: diagnostic.raw.length,
+    rawTruncated: truncated,
+    raw: truncated ? diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT) : diagnostic.raw,
+  }
+
+  storage.auditLog.record({
+    actor: 'api',
+    operation: AUDIT_PROPOSAL_UNPARSED,
+    entityType: PL_TARGET_ENTITY_TYPE,
+    entityId: proposalDiagnosticKey(projectId),
+    result: 'failure',
+    detail: JSON.stringify(payload),
+  })
+}
+
+/** 診断を読み出す。運用時に `audit_log` を直接読まずに済ませるための入口。 */
+export function findProposalDiagnostics(
+  storage: IStorage,
+  projectId: string,
+): PersistedProposalDiagnostic[] {
+  return storage.auditLog
+    .findByEntity(PL_TARGET_ENTITY_TYPE, proposalDiagnosticKey(projectId))
+    .filter((entry) => entry.operation === AUDIT_PROPOSAL_UNPARSED)
+    .flatMap((entry) => {
+      try {
+        return [JSON.parse(entry.detail ?? '{}') as PersistedProposalDiagnostic]
+      } catch {
+        return []
+      }
+    })
+}
+
 function recordFollowUpAudit(
   storage: IStorage,
   projectId: string,
@@ -423,16 +530,36 @@ export function selectAdoptionCandidates<T extends RoadmapCandidate & { boosted?
  * ここで緩めると「PL が書いた文字列」と「実際に採用された範囲」がズレる。
  */
 export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefined {
+  const result = parseAdoptionProposalDetailed(raw)
+  return result.ok ? result.proposal : undefined
+}
+
+/**
+ * 上と同じ判定に、**なぜ通らなかったのか**を付けたもの。実装はここ1本だけである。
+ *
+ * 理由を持たない `undefined` だけでは、production で `proposal_unusable` が出たときに
+ * 「JSON が無い」のか「フィールドが欠けている」のかすら後から分からない
+ * （2026-09-17 の Operational E2E で実際に分からなかった）。
+ *
+ * **理由は分類のためだけに使い、採用可否は一切変えない。** 補正も推測もしない fail-closed は
+ * そのままである。
+ */
+export type AdoptionProposalParseResult =
+  | { ok: true; proposal: PlAdoptionProposal }
+  | { ok: false; reason: string }
+
+export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalParseResult {
   const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return undefined
+  if (!match) return { ok: false, reason: 'no_json_object_found' }
 
   let parsed: unknown
   try {
     parsed = JSON.parse(match[1] ?? match[0])
-  } catch {
-    return undefined
+  } catch (error: unknown) {
+    // JSON.parse のメッセージは入力そのものを含まない（位置と種類だけ）。
+    return { ok: false, reason: `json_parse_error: ${error instanceof Error ? error.message : 'unknown'}` }
   }
-  if (typeof parsed !== 'object' || parsed === null) return undefined
+  if (typeof parsed !== 'object' || parsed === null) return { ok: false, reason: 'not_an_object' }
 
   const obj = parsed as Record<string, unknown>
   const strings = (value: unknown): string[] | undefined => (
@@ -446,16 +573,28 @@ export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefin
   const allowedPaths = strings(obj.allowedPaths)
   const acceptanceCriteria = strings(obj.acceptanceCriteria)
 
-  if (roadmapId === '' || implementationScope === '' || !allowedPaths || !acceptanceCriteria) {
-    return undefined
+  // **どのフィールドで落ちたか**が分からないと A（prompt 起因）と B（parser が正当な出力を
+  // 拒否）を切り分けられない。キー名だけを並べ、値は載せない。
+  const missing = [
+    roadmapId === '' ? 'roadmapId' : undefined,
+    implementationScope === '' ? 'implementationScope' : undefined,
+    !allowedPaths ? 'allowedPaths' : undefined,
+    !acceptanceCriteria ? 'acceptanceCriteria' : undefined,
+  ].filter((key): key is string => key !== undefined)
+
+  if (missing.length > 0) {
+    return { ok: false, reason: `missing_or_invalid_fields: ${missing.join(', ')}` }
   }
 
   return {
-    roadmapId,
-    implementationScope,
-    allowedPaths,
-    acceptanceCriteria,
-    ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    ok: true,
+    proposal: {
+      roadmapId,
+      implementationScope,
+      allowedPaths: allowedPaths as string[],
+      acceptanceCriteria: acceptanceCriteria as string[],
+      ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    },
   }
 }
 
@@ -563,6 +702,13 @@ export function buildAdoptionPrompt(
 export interface PlAdoptionDeps {
   /** 選択と具体化。既定は PL ループと同じ provider CLI 経路。 */
   propose: (system: string, user: string) => Promise<string>
+  /**
+   * `propose` が誰なのか（`provider/model`）。診断にだけ使う。
+   *
+   * 出力元が分からない診断では「provider が契約外の出力を返した」のか
+   * 「prompt が原因」なのかを切り分けられない。既定の経路を使う呼び出し元が渡す。
+   */
+  proposerId?: string
   readLedger?: () => string
   adopt?: typeof adoptRoadmapItem
 }
@@ -623,14 +769,27 @@ export async function runAdoptionStep(
     ADOPTION_SYSTEM_PROMPT,
     buildAdoptionPrompt(candidates, projectGoal),
   )
-  const proposal = parseAdoptionProposal(raw)
-  if (!proposal) {
+  const parsed = parseAdoptionProposalDetailed(raw)
+  if (!parsed.ok) {
+    // **観測して忘れない。** ここで残さないと、production で起きた1回を後から分類できない
+    // （2026-09-17 の Operational E2E で実際に分類できなかった）。
+    recordProposalDiagnostic(storage, projectId, {
+      reason: parsed.reason,
+      proposer: deps.proposerId ?? 'unknown',
+      promptVersion: adoptionPromptVersion(),
+      candidateCount: candidates.length,
+      followUpCandidateCount: candidates.filter((candidate) => candidate.kind === 'follow_up').length,
+      raw,
+    })
+    // `failureCode` は master 側で追加されたもので、**落とさない**。
+    // 診断を足したこの変更が、既存の失敗分類を消してしまってはいけない。
     return {
       status: 'proposal_unusable',
       failureCode: 'unparsable_proposal',
       reason: 'PL did not produce a complete adoption proposal',
     }
   }
+  const proposal = parsed.proposal
 
   // 提示していない id を選んだ場合は、ここで落とす前に Gate でも落ちる（ledger 照合）。
   // ただし理由を分かりやすくするため先に見る。

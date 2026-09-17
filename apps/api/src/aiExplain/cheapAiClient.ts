@@ -11,6 +11,12 @@ export const CHEAP_AI_CONFIG = {
   timeoutMs: 60_000,
 } as const
 
+/**
+ * この経路が誰に問い合わせているか。**診断の記録用**で、選択には使わない。
+ * 出力元が分からない診断では provider 起因か prompt 起因かを切り分けられない。
+ */
+export const CHEAP_AI_PROPOSER_ID = `${CHEAP_AI_CONFIG.provider}/${CHEAP_AI_CONFIG.model}`
+
 // Previous raw transport endpoint, retained only as a rollback reference:
 // https://opencode.ai/zen/go/v1/chat/completions
 const OPENCODE_PROJECT_CONFIG = {

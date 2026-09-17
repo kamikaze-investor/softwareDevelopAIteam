@@ -52,7 +52,8 @@ import {
   type CoordinatorDeps,
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
-import { requestText } from '../aiExplain/cheapAiClient'
+import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
+import { CHEAP_AI_PROPOSER_ID, requestText } from '../aiExplain/cheapAiClient'
 import {
   buildTriageEscalationBody,
   formatTriageAuditDetail,
@@ -1440,13 +1441,17 @@ async function maybeAdoptNext(
     return { status: 'escalated', reason: 'adoption attempt budget exhausted', attempt }
   }
 
+  // 既定経路を使うときだけ、その provider/model を診断へ渡す。注入された propose の素性は
+  // ここでは分からないので、分かったふりをしない。
   const propose = deps.proposeAdoption
     ?? ((system: string, user: string) => requestText(system, user, {}, PL_ADOPTION_MAX_TOKENS))
+  const proposerId = deps.proposeAdoption ? 'injected' : CHEAP_AI_PROPOSER_ID
 
   let result: PlAdoptionResult
   try {
     result = await runAdoptionStep(storage, project.id, {
       propose,
+      proposerId,
       ...(deps.readLedger ? { readLedger: deps.readLedger } : {}),
       ...(deps.adopt ? { adopt: deps.adopt } : {}),
     })
