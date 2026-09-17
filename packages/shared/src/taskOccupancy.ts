@@ -39,18 +39,37 @@ export function isLiveJob(job: { status: string }): boolean {
 }
 
 /**
- * **その blocked Job はまだ workspace を所有しているか。**
+ * **終わった Task に取り残された blocked 行か。**
  *
- * `apps/worker/src/index.ts` の `findWorkspaceOwningTaskId()` が昔からこの意味で
- * 所有者を決めている: blocked Job は原則として workspace を保有するが、
- * **Task が `done` になった後に残っている blocked 行は履歴であって所有者ではない**
- * （quarantine されている行だけは例外で、安全と証明されるまで保有し続ける）。
+ * `apps/worker/src/index.ts` の `isStaleBlockedJobOfFinishedTask()` と同じ判定である。
  *
- * 旧 blocked 行を残すのは既存設計（`resumeBlockedGitCommitJob.test.ts` が固定している）なので、
- * 行を消すのではなく所有権の述語でだけ区別する。
+ * **これは「所有していない」という意味ではない。** Worker は該当行を見つけると
+ * `resolveWorkspaceOwnership()` で **worktree を観測**し、
+ * 「次の Task を実際に始められる状態」（worktree に差分が無い / 進行中の git 操作が無い /
+ * HEAD を解決できる）になって初めて所有権を手放したと見なす。それまでは所有者のままである。
+ *
+ * つまりこの述語が真でも、workspace の観測抜きに「所有していない」と結論してはならない。
+ * quarantine されている行はそもそも候補にならない（安全と証明されるまで保有し続ける）。
+ */
+export function isStaleBlockedJobCandidate(
+  task: { status: string },
+  job: { status: string; failureMetadata?: { quarantined?: boolean } | null },
+): boolean {
+  return job.status === 'blocked'
+    && task.status === 'done'
+    && job.failureMetadata?.quarantined !== true
+}
+
+/**
+ * **その blocked Job は、workspace を観測するまでもなく所有者か。**
+ *
+ * `findWorkspaceOwningTaskId()` が観測なしで所有者と確定させる条件と同じ。
+ * stale 候補（上）はここでは false になるが、**それは「所有していない」ではなく
+ * 「観測しないと決められない」**である。呼び出し側は観測による証明を用意するか、
+ * 用意できないなら所有者として扱うこと（fail-closed）。
  *
  * **この意味を使う側が自前で書き直さないこと。** 2026-09-17 の Operational E2E で、
- * `abort_task` が「blocked なら所有者」と独自に判定していたために、
+ * `abort_task` が「blocked なら無条件に所有者」と独自に判定していたために、
  * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
  */
 export function holdsWorkspaceWhenBlocked(
@@ -58,8 +77,7 @@ export function holdsWorkspaceWhenBlocked(
   job: { status: string; failureMetadata?: { quarantined?: boolean } | null },
 ): boolean {
   if (job.status !== 'blocked') return false
-  if (job.failureMetadata?.quarantined === true) return true
-  return task.status !== 'done'
+  return !isStaleBlockedJobCandidate(task, job)
 }
 
 /**

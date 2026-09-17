@@ -43,7 +43,7 @@
  * dirty なまま残った blocked Job の revert は別責務（Finding）として分離する。
  */
 
-import { holdsWorkspaceWhenBlocked, isLiveJob } from '@ai-team/shared'
+import { holdsWorkspaceWhenBlocked, isLiveJob, isStaleBlockedJobCandidate } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import type { Job, JobWorkspaceBaseline } from '@ai-team/shared'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
@@ -157,11 +157,9 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   const owning = storage.jobs.findByTaskId(task.id).filter((job) => holdsWorkspaceOwnership(task, job))
 
   // 他 Task が workspace を所有したままなら park しても workspace は解放されない。
-  // 既存 `parkTask()` の前提（project に blocked Job が無いこと）と揃えて fail-closed にする。
-  const foreign = projectTasks
-    .filter((candidate) => candidate.id !== task.id)
-    .flatMap((candidate) =>
-      storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(candidate, job)))
+  const otherTasks = projectTasks.filter((candidate) => candidate.id !== task.id)
+  const foreign = otherTasks.flatMap((candidate) =>
+    storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(candidate, job)))
   if (foreign.length > 0) {
     return {
       ok: false,
@@ -172,6 +170,21 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
         + '(parking this task would not release the workspace)',
     }
   }
+
+  // ── 終わった Task に取り残された blocked 行 ──
+  //
+  // これは「所有していない」ではなく「**workspace を観測しないと決められない**」である。
+  // Worker は同じ行について worktree を観測し、次の Task を始められる状態
+  // （差分なし / 進行中の git 操作なし / HEAD 解決可）になって初めて所有権を手放したと見なす。
+  //
+  // 対象 Task 自身に解放すべき blocked Job があるなら、この後の段階操作で Worker が観測を報告し、
+  // API が `knownGood`（worktree・index が clean、git 操作なし、HEAD 有効、死角なし）を
+  // 検証してからでなければ park は成立しない。その検証は上記の解放条件より強いので、
+  // 通過した時点で取り残された行が所有者でないことも同時に証明されている。
+  //
+  // 観測の当てが無い（＝解放すべき Job が無い）場合は証明が取れないため、所有者として扱う。
+  const staleCandidates = otherTasks.flatMap((candidate) =>
+    storage.jobs.findByTaskId(candidate.id).filter((job) => isStaleBlockedJobCandidate(candidate, job)))
 
   const quarantined = owning.find((job) => job.failureMetadata?.quarantined === true)
   if (quarantined) {
@@ -185,6 +198,17 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   }
 
   if (owning.length === 0) {
+    if (staleCandidates.length > 0) {
+      return {
+        ok: false,
+        code: 'FOREIGN_BLOCKED_JOB',
+        reason:
+          `task ${staleCandidates[0].taskId} has a blocked job (${staleCandidates[0].id}) left over `
+          + 'from a finished task, and this task has no job whose cleanup would prove the workspace '
+          + 'is clean; refusing to park without that proof',
+      }
+    }
+
     const parked = storage.jobs.parkTask({
       taskId: task.id,
       reason: input.reason,

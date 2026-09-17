@@ -297,6 +297,29 @@ describe('abortTask — 承認と対象の束縛', () => {
     expect(fx.storage.jobs.findById(staleJob.id)?.status).toBe('blocked')
   })
 
+  // 取り残された行が所有者でないと言えるのは、workspace を観測して
+  // 「次の Task を始められる状態」だと確かめたときだけである（Worker と同じ判定）。
+  // 対象 Task 自身に解放すべき Job が無ければ、その観測の当てが無い。
+  it('観測の当てが無ければ、取り残された blocked Job を所有者として扱う', () => {
+    const fx = seed()
+    // 対象 Task 側の blocked Job を消す（= 段階操作へ進まない直接 park 経路）。
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    const finished = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'finished long ago', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    fx.storage.jobs.create({
+      taskId: finished.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'FOREIGN_BLOCKED_JOB' })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
   it('quarantine された blocked Job は done な Task のものでも所有者として数える', () => {
     const fx = seed()
     const finished = fx.storage.tasks.create({

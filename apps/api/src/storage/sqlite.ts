@@ -6,7 +6,12 @@
  * → IStorage インターフェースを実装した別クラスに切り替えるだけでよい
  */
 
-import { holdsWorkspaceWhenBlocked, LIVE_JOB_STATUSES, OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
+import {
+  holdsWorkspaceWhenBlocked,
+  isStaleBlockedJobCandidate,
+  LIVE_JOB_STATUSES,
+  OCCUPIES_PROJECT_SQL,
+} from '@ai-team/shared'
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
@@ -670,16 +675,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   /**
-   * この Project で **まだ workspace を所有している** blocked Job を1つ返す。
+   * この Project の blocked Job のうち、workspace を所有しているものを1つ返す。
    *
-   * `blocked` を無条件に所有者と数えない。done な Task に残る blocked 行は履歴であって
-   * 所有者ではない、というのが既存 `findWorkspaceOwningTaskId()` の判定であり、
-   * 判定の実体は `holdsWorkspaceWhenBlocked()`（`@ai-team/shared`）1箇所にある。
-   * SQL で書き直すと quarantine の JSON 判定まで二重定義になるため、行を引いて述語へ渡す。
+   * `blocked` を無条件に所有者と数えない代わりに、**観測なしで結論できるものだけ**を数える。
+   * done な Task に取り残された行は `includeStale` で呼び分ける:
+   *
+   * - `includeStale=true` … workspace の観測が手に入らない経路（直接 park）。
+   *   取り残された行も所有者として扱う。手放したと言える根拠が無いため fail-closed。
+   * - `includeStale=false` … 同じ transaction で `knownGood`（worktree・index が clean、
+   *   進行中の git 操作なし、HEAD 有効、死角なし）を検証済みの経路。
+   *   その検証は Worker の「次の Task を始められる」条件より強いので、
+   *   取り残された行が所有者でないことも同時に証明されている。
+   *
+   * 判定の実体は `@ai-team/shared` 側の述語1箇所にある。SQL で書き直すと
+   * quarantine の JSON 判定まで二重定義になるため、行を引いて述語へ渡す。
    */
   function findBlockedOwnerInProject(
     projectId: string,
-    excludeTaskId?: string,
+    options: { excludeTaskId?: string; includeStale: boolean },
   ): { job: Job; task: Task } | undefined {
     const rows = db.prepare(
       "SELECT j.* FROM jobs j JOIN tasks t ON t.id = j.task_id "
@@ -687,11 +700,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     ).all(projectId) as any[]
     for (const row of rows) {
       const job = deserializeJob(row)
-      if (excludeTaskId !== undefined && job.taskId === excludeTaskId) continue
+      if (options.excludeTaskId !== undefined && job.taskId === options.excludeTaskId) continue
       const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(job.taskId) as any
       if (!taskRow) continue
       const task = deserializeTask(taskRow)
       if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
+      if (options.includeStale && isStaleBlockedJobCandidate(task, job)) return { job, task }
     }
     return undefined
   }
@@ -2266,7 +2280,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `project still has job ${live.id} (${live.status}); refusing to park`,
             }
           }
-          const owner = findBlockedOwnerInProject(task.projectId)
+          const owner = findBlockedOwnerInProject(task.projectId, { includeStale: true })
           if (owner) {
             return {
               ok: false as const,
@@ -2368,7 +2382,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // 他 Task が blocked Job で workspace を所有していないことも transaction 内で再確認する
           // （stage 1 の `FOREIGN_BLOCKED_JOB` と同じ条件。判定から書き込みまでの間に
           // 別 Task が所有者になっていたら park しても workspace は解放されない）。
-          const foreign = findBlockedOwnerInProject(task.projectId, task.id)
+          const foreign = findBlockedOwnerInProject(task.projectId, {
+            excludeTaskId: task.id,
+            includeStale: false,
+          })
           if (foreign) {
             return {
               ok: false as const,
