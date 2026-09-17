@@ -683,7 +683,7 @@ function logMetaReviewAttempt(
   model: string | undefined,
   text: string,
 ): void {
-  console.log(`[metaReview] attempt ${JSON.stringify({
+  console.error(`[metaReview] attempt ${JSON.stringify({
     feature: featureName, outcome: 'formal_verdict', stage, model: model ?? '(default)',
     promptChars, responseChars: text.length,
   })}`)
@@ -707,7 +707,7 @@ function logStageFallback(
   if (d === undefined) {
     return
   }
-  console.log(`[metaReview] attempt ${JSON.stringify({
+  console.error(`[metaReview] attempt ${JSON.stringify({
     feature: featureName, outcome: 'no_formal_verdict', stage: d.stage, provider: d.provider,
     failureClass: d.failureClass, exitCode: d.exitCode, httpStatus: d.httpStatus,
     timedOut: d.timedOut, promptChars, message: d.message,
