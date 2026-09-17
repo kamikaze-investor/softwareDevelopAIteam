@@ -6783,6 +6783,15 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    `pnpm roadmap:check` は既に存在し root `package.json` の `verify` にも含まれているが、
    **`.github/workflows/ci.yml` は `pnpm -r typecheck` と `pnpm -r test` しか実行しない**。
    そのため roadmap のメタデータ不整合と `PROJECT_CURRENT_STATE.md` の同期ずれは PR で検出されない。
+
+   **2026-09-17 実測（この欠落が実際に master を壊した）**: `blocked-job-revert-material-not-persisted` が
+   `tasks/roadmap.md` に 2 箇所存在し、**master 上で `roadmap:check` が失敗する**状態が発生した。
+   #240（Finding 登録・`state=deferred`）と #235（実装 PR・`state=planned`）が同じ item を
+   それぞれ持ったまま両方 merge されたため。どちらの PR も CI は green だった —
+   `ci.yml` が `roadmap:check` を実行しないので、**重複 ID は誰にも検知されずに master へ入った**。
+   検知されたのは、無関係な作業中に手元で `pnpm verify` を回したときである。
+   修復は別 PR で行い、内容が superset だった #240 側（`deferred`）を残して #235 側を削除した。
+   **本項目の (B) が入っていれば、この重複は PR の時点で落ちていた。**
    **既存 workflow に 1 step 足すだけ**で再発は防げる。
    新しい workflow も新しい required check も追加しない（required 化の要否は CEO 判断）。
 
@@ -8062,52 +8071,6 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         より軽い案へ絞れば通るのか
       - 効果検証可能性（Design Philosophy 8）: CONFLICT で止まった採用が何件あり、
         そのうち何件が表記起因だったかを後から数えられること
-
-<!-- roadmap:id=blocked-job-revert-material-not-persisted state=planned -->
-11. [ ] **blocked になった Job の変更を、後から安全に取り消す材料が残っていない** —
-      2026-09-17登録（`abort_task` 実装中に実測）。**本項目は Finding であり、まだ実装しない。**
-
-      **事象**: `revertBlockedJobChanges()`（`apps/worker/src/jobRunner.ts`）は
-      `(workingDir, startCommitHash, manifest: ChangeManifest, preExistingPaths)` を要求するが、
-      **後ろ2つが Job 行に永続化されていない**。実行中プロセスの `JobRunResult` にしか存在しないため、
-      **過去に blocked になった Job に対しては呼べない**。
-
-      現在の起動経路は job 報告時の1本だけで、API が escalate を確定したとき
-      `workspaceCleanupRequired: true` を返し、Worker がその場の in-memory 結果で掃除する。
-      Worker が再起動すれば材料は消える。
-
-      **永続化されている情報では代用できない**:
-      - `jobs.changed_files` … **パスだけ**。`ChangeManifest.changes` が持つ種別
-        （added / modified / deleted / renamed）が無い。種別なしでは「復元」か「削除」かを
-        推測することになり、逆向きの操作をすれば被害が出る
-      - `preExistingPaths` … 一切残っていない。これが無いと
-        「Job 開始前から dirty だったパスには触れない」という同関数の中核原則を守れない
-      - `jobs.workspace_baseline` … 開始時点の参照点であって、**この Job が何を変えたか**ではない
-
-      **影響**: dirty なまま blocked になった Job は、どの経路からも安全に掃除できない。
-      所有権解放には workspace 検証が要り（`failAndPrepareRepair`:
-      「未検証の workspace で所有権を解放してはならない」）、検証を通すには掃除が要る、という循環になる。
-      `clearWorkspaceQuarantine()` は quarantine metadata を消すだけで status を変えないので、
-      所有権は解放されない。
-
-      **`abort_task` との関係**: #235 は **verification-only** で成立している
-      （workspace が baseline と一致していれば park、不一致なら fail-closed）。
-      2026-09-17 の production 実測では対象 workspace が既に baseline と一致していたため、
-      revert は不要だった。**本項目の問題は #235 を止めない**が、
-      dirty なまま残った場合に abort できないという制約は残る。
-
-      **着手時に比較すること（実装方針を先に決めない）**:
-      - revert に必要な情報（manifest の種別 + preExistingPaths）を**永続化する最小変更**。
-        既存 `jobs` 列への追加で足りるか、量・秘密情報の観点で問題ないか
-      - 既存 `changed_files` + `workspace_baseline` + git の実状態から**復元可能か**
-        （種別を git から再導出できるか。できるなら永続化は不要）
-      - **blocked にする時点で掃除まで終わらせる**方が自然ではないか。
-        材料がある唯一の瞬間はそこであり、後から掃除する経路を作るより状態空間が小さい
-      - **新しい cleanup subsystem を先に作らない。** 上記3案を比較してから決める
-
-      **関連**: `workspace-dirty-leakage-cleanup`（done）が escalate 時の掃除を入れた項目。
-      本項目はその**適用範囲外**（blocked のまま残った Job）を扱う。重複実装しないこと。
-
 <!-- roadmap:id=executed-item-remaining-work-has-no-continuation state=in_progress -->
 10. [~] **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）** —
       2026-09-17登録（read-only 調査 + production 実測）。**本項目は Finding であり、まだ実装しない。**
