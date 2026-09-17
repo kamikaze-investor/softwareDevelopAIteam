@@ -368,6 +368,76 @@ describe('abortTask — 観測の検証は baseline 一致だけではない', (
   })
 })
 
+describe('abortTask — blocked Job を1本残さない', () => {
+  /** resume は新しい Job 行を作り、古い blocked 行を履歴として残す。2本並ぶのは異常ではない。 */
+  function addSecondBlockedJob(fx: Fixture, workingDir = '/workspace/target'): string {
+    return fx.storage.jobs.create({
+      taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir }, dryRun: false, workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0]).id
+  }
+
+  it('同じ Task の blocked Job が複数あれば、park と同時に全部解放する', () => {
+    const fx = seed()
+    const second = addSecondBlockedJob(fx)
+
+    const requested = abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+    expect(requested).toMatchObject({ ok: true, status: 'cleanup_requested' })
+
+    // Worker は1本ぶんの観測しか報告しない。
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+
+    // **1本も blocked を残さない。** 残すと所有者と見なされ続け、しかも Task は
+    // もう roadmap-active でないので2本目の報告はもう通らない（park したのに止まる）。
+    const blocked = fx.storage.jobs.findByTaskId(fx.taskId).filter((job) => job.status === 'blocked')
+    expect(blocked).toHaveLength(0)
+    expect(fx.storage.jobs.findById(second)?.status).toBe('failed')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
+  })
+
+  it('別 workspace の blocked Job が残っていれば park しない（検証したのは1つだけ）', () => {
+    const fx = seed()
+    const elsewhere = addSecondBlockedJob(fx, '/workspace/other')
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+    expect(fx.storage.jobs.findById(elsewhere)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  it('報告までの間に他 Task が所有者になっていたら park しない', () => {
+    const fx = seed()
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    // stage 1 を通った後に別 Task が blocked になる。park しても workspace は解放されない。
+    const other = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'other', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    fx.storage.jobs.create({
+      taskId: other.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+})
+
 describe('abortTask — park した Task を別経路で再武装させない', () => {
   it('resume は park された Task を進めない', () => {
     const fx = seed()

@@ -2326,6 +2326,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
 
+          // 他 Task が blocked Job で workspace を所有していないことも transaction 内で再確認する
+          // （stage 1 の `FOREIGN_BLOCKED_JOB` と同じ条件。判定から書き込みまでの間に
+          // 別 Task が所有者になっていたら park しても workspace は解放されない）。
+          const foreign = db.prepare(
+            "SELECT j.id AS id, j.task_id AS taskId FROM jobs j JOIN tasks t ON t.id = j.task_id "
+            + "WHERE t.project_id = ? AND j.task_id != ? AND j.status = 'blocked' LIMIT 1",
+          ).get(task.projectId, task.id) as { id: string; taskId: string } | undefined
+          if (foreign) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `task ${foreign.taskId} holds the workspace through blocked job ${foreign.id}; `
+                + 'refusing to park',
+            }
+          }
+
           // ── 観測の再検証。ここだけが所有権解放の根拠である ──
           if (!job.workspaceBaseline) {
             return {
@@ -2369,6 +2386,43 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
 
+          // ── この Task の blocked Job を**1つ残らず**解放する ──
+          //
+          // Task は blocked Job を複数持ちうる。resume は新しい Job 行を作り、古い blocked 行を
+          // 履歴として残すため、これは異常な形ではない。1本だけ解放して park すると、
+          // 残った blocked 行が `findWorkspaceOwningTaskId()` から所有者と見なされ続け、
+          // しかも Task はもう roadmap-active ではないので**2本目の報告はもう通らない**
+          // （承認も使い切られている）。park したのに project が止まったままになる
+          // ——このPRが防ぐはずの状態そのものである（独立レビュー round 3 Finding 1）。
+          const blockedSiblings = jobs.findByTaskId(task.id).filter((sibling) => sibling.status === 'blocked')
+
+          // 検証できたのは**報告された Job の workingDir 1つ**だけである。
+          // 別の workingDir を持つ blocked Job の workspace は未検証なので、
+          // その所有権は解放しない（「未検証の workspace で所有権を解放してはならない」）。
+          const workingDir = job.safeCommand?.workingDir
+          const elsewhere = blockedSiblings.find((sibling) => sibling.safeCommand?.workingDir !== workingDir)
+          if (elsewhere) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id} also holds blocked job ${elsewhere.id} in a different workspace `
+                + `(${elsewhere.safeCommand?.workingDir}); that workspace was not verified`,
+            }
+          }
+          const quarantinedSibling = blockedSiblings.find(
+            (sibling) => sibling.failureMetadata?.quarantined === true,
+          )
+          if (quarantinedSibling) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `job ${quarantinedSibling.id} is quarantined; clear the quarantine through the `
+                + 'existing path first',
+            }
+          }
+
           // 承認は**この Task**へ束縛されていなければならない。Job から Task を導く経路なので、
           // ここを通さないと別 Task 向けの承認で park が通る（独立レビュー Finding 2）。
           const approval = verifyAndConsumeAbortApproval(task.id, input.approvalRequestId)
@@ -2377,13 +2431,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
 
           // ── 解放 → park → audit。すべて同じ transaction ──
+          //
+          // 解放してよい理由は「観測が baseline と一致し、かつ worktree / index が clean だと
+          // 証明できた」ことである。守るべき未コミットの作業がその workspace に無い以上、
+          // どの Job の claim も残す理由がない。
           const completedAt = new Date().toISOString()
-          jobs.update(job.id, {
-            status: 'failed',
-            completedAt,
-            stderr: [job.stderr ?? '', `[abort_task] released for parking: ${input.reason}`]
-              .filter(Boolean).join('\n'),
-          })
+          for (const sibling of blockedSiblings) {
+            jobs.update(sibling.id, {
+              status: 'failed',
+              completedAt,
+              stderr: [sibling.stderr ?? '', `[abort_task] released for parking: ${input.reason}`]
+                .filter(Boolean).join('\n'),
+            })
+          }
           tasks.update(task.id, { roadmapActive: false })
           auditLog.record({
             actor: 'api',
@@ -2392,7 +2452,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             entityId: task.id,
             result: 'success',
             detail:
-              `parked (status kept as ${task.status}, job ${job.id} released, `
+              `parked (status kept as ${task.status}, `
+              + `job(s) ${blockedSiblings.map((sibling) => sibling.id).join(', ')} released, `
               + `approval ${input.approvalRequestId}): ${input.reason.slice(0, 300)}`,
           })
 
