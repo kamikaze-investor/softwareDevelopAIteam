@@ -6,6 +6,7 @@
  * → IStorage インターフェースを実装した別クラスに切り替えるだけでよい
  */
 
+import { LIVE_JOB_STATUSES, OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
@@ -839,7 +840,67 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         projectId: string,
         roadmapTasks: RoadmapSyncTaskInput[],
         roadmapPhases: RoadmapSyncPhaseInput[],
+        requireNewTaskKeys: readonly string[],
+        requireNoActiveTasks: boolean,
+        requireNoLiveJobs: boolean,
+        requireNoPendingContinuations: boolean,
       ): RoadmapSyncResult => {
+        // **新規であることを要求された key が既に居たら、この transaction ごと失敗させる。**
+        // 呼び出し側が transaction の外で発番した identity を、挿入までの間に別の採用が
+        // 先取りしていた場合にここで止まる。通常の upsert 経路（Job を持たない Task は可変）が
+        // 相手の spec を静かに上書きするのを防ぐ唯一の不可分な地点である。
+        for (const requiredKey of requireNewTaskKeys) {
+          const existing = db.prepare(
+            'SELECT id FROM tasks WHERE project_id = ? AND roadmap_task_key = ?',
+          ).get(projectId, requiredKey) as { id: string } | undefined
+          if (existing) {
+            // 既存 catch が Error を failureReason へ写すので、専用の型は足さない。
+            throw new Error(
+              `task key "${requiredKey}" must be new but task ${existing.id} already has it`,
+            )
+          }
+        }
+
+        // 呼び出し側の snapshot 判定と挿入の間に状態が変わっていないかを、ここで再確認する。
+        if (requireNoActiveTasks) {
+          // `occupiesProject()` と同じ意味。parked Task は占有として数えない。
+          const active = db.prepare(
+            `SELECT id, status FROM tasks WHERE project_id = ? AND ${OCCUPIES_PROJECT_SQL} LIMIT 1`,
+          ).get(projectId) as { id: string; status: string } | undefined
+          if (active) {
+            throw new Error(
+              `project has an active task (${active.id} is ${active.status}); refusing to add work`,
+            )
+          }
+        }
+        if (requireNoLiveJobs) {
+          const placeholders = LIVE_JOB_STATUSES.map(() => '?').join(',')
+          // **Project との結び付きは `tasks` 経由で見る。**
+          // `jobs.project_id` は `POST /api/jobs` が caller の申告値をそのまま保存しており、
+          // `task.projectId` と一致する保証が無い（FK も task_id にしか無い）。
+          // Worker は tasks を辿って job を拾うので、そちらが権威ある関連付けである。
+          // 非正規化列で見ると、実際に claim される job を見落とす／無関係な job で誤って塞ぐ。
+          const live = db.prepare(
+            `SELECT jobs.id AS id, jobs.status AS status
+               FROM jobs JOIN tasks ON tasks.id = jobs.task_id
+              WHERE tasks.project_id = ? AND jobs.status IN (${placeholders})
+              LIMIT 1`,
+          ).get(projectId, ...LIVE_JOB_STATUSES) as { id: string; status: string } | undefined
+          if (live) {
+            throw new Error(
+              `project has a live job (${live.id} is ${live.status}); refusing to add work`,
+            )
+          }
+        }
+        if (requireNoPendingContinuations) {
+          const pending = db.prepare(
+            "SELECT COUNT(*) AS c FROM task_continuations WHERE project_id = ? AND status = 'pending'",
+          ).get(projectId) as { c: number }
+          if (pending.c > 0) {
+            throw new Error(`project has ${pending.c} pending task continuation(s); refusing to add work`)
+          }
+        }
+
         const createdTaskIds: string[] = []
         const updatedTaskIdSet = new Set<string>()
         const reactivatedTaskIds: string[] = []
@@ -1088,7 +1149,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       try {
-        return syncTransaction(input.projectId, input.tasks, input.phases ?? [])
+        return syncTransaction(
+          input.projectId,
+          input.tasks,
+          input.phases ?? [],
+          input.requireNewTaskKeys ?? [],
+          input.requireNoActiveTasks === true,
+          input.requireNoLiveJobs === true,
+          input.requireNoPendingContinuations === true,
+        )
       } catch (err: unknown) {
         if (err instanceof RoadmapTaskConflictError) {
           return emptyFailureResult(err.message, err.conflicts, err.phaseConflicts)

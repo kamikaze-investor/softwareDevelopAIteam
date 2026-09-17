@@ -8012,8 +8012,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: CONFLICT で止まった採用が何件あり、
         そのうち何件が表記起因だったかを後から数えられること
 
-<!-- roadmap:id=executed-item-remaining-work-has-no-continuation state=deferred -->
-10. [ ] **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）** —
+<!-- roadmap:id=executed-item-remaining-work-has-no-continuation state=in_progress -->
+10. [~] **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）** —
       2026-09-17登録（read-only 調査 + production 実測）。**本項目は Finding であり、まだ実装しない。**
 
       **事象**: Roadmap 項目が ledger 上まだ open で、その項目の Task が既に done、
@@ -8105,7 +8105,33 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - `pl-autonomous-roadmap-adoption`（done）/ `mandatory-gate-policy` — action 語彙と
         強制 Gate の owner。本項目で新しい PL 権限を作らない
 
-      **state=deferred の理由（CEO 判断・2026-09-17）**: 本 Finding の最終的な解決は
+      **【2026-09-17 更新: CEO が follow-up 境界を確定し、`deferred` → `in_progress` へ】**
+
+      保留理由は解消した。deferral の根拠は「解決策が `ALREADY_EXECUTED` への例外＝adoption authority の
+      条件付き拡大になる可能性が高く、CEO がその境界を決める前に PL が採用しないため」だった。
+      CEO が 2026-09-17 に follow-up の成立条件・上限・Class 境界・検出方式を確定したため、この理由は無くなった。
+
+      **`planned` を経由せず直接 `in_progress` にしている。** 本項目はローカルセッションが実装担当であり、
+      `planned` に戻すと VPS PL の自律採用対象になって同じ項目を二重に着手しうるためである
+      （CEO 指示・2026-09-17）。**採用可能 state は `planned` のみという既存 allowlist は変更していない。**
+
+      **確定した境界（実装はこれに従う）**:
+      - follow-up は許可する。ただし**必ず新しい Task** として作り、旧 Task を resume・再利用しない
+      - Task identity を `<ledger id>#<sequence>` で分けることで、**`ALREADY_EXECUTED` 本体は緩めない**。
+        保証は「この Roadmap item は永久に禁止」から「**同一 Task identity の二重実行は禁止**」へ精緻化する
+      - 成立条件（AND）: 元 item が open / prior Task が done / active Task なし / pending continuation なし /
+        prior を resume すべき状態でない / 未完了作業を特定できる / 新しい `implementationScope` が明示されている
+      - blocked は既存 resume 経路、failed は既存 PL diagnosis・recovery 経路。**follow-up で迂回しない**
+      - 上限は 1 item あたり follow-up 10 回。**これは通常作業の制限ではなく最後の異常センサー**であり、
+        同一 scope・進捗なし・同一失敗の反復は 10 回を待たず早期停止する
+      - follow-up は毎回 Design Review / Gate / allowedPaths / risk / Review を**再計算**し、
+        過去の Approval・authority・evidence を**継承しない**
+      - follow-up 自体は最低でも Class B。Safety Boundary / Authority / security model / 現行 Policy 上の
+        DB migration / destructive・不可逆 / Reviewer 間の重要な不一致が未解消、は Class C
+      - 検出は B+ 方式。**candidate limit / priority / rotation より前**に open 全件へ機械判定を当て、
+        skip は `audit_log` へ記録し、3 回連続 skip で**順序だけ**繰り上げる（Gate・Class 判定は弱めない）
+
+      **（履歴）当初 `state=deferred` とした理由（CEO 判断・2026-09-17）**: 本 Finding の最終的な解決は
       `ALREADY_EXECUTED` に対する**限定的な例外**、すなわち既存の adoption authority を
       条件付きで広げる形になる可能性が高い。CEO がその境界を決める前に PL がこの項目を
       自律採用しないよう、`deferred` にする。

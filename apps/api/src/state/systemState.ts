@@ -15,6 +15,7 @@
  * `mandatory-gate-policy` が決める（本 API は権限判断をしない）。
  */
 
+import { occupiesProject } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import type { Job, Task, Project } from '@ai-team/shared'
 
@@ -236,9 +237,10 @@ export function buildSystemState(
     const latest = [...projectJobs].sort((a, b) => a.createdAt.localeCompare(b.createdAt)).pop()
 
     // 「現在の Task」は、着手中があればそれ、無ければ次に着手できる roadmapActive な pending。
+    // 判定は `occupiesProject()` に一本化してある（follow-up 成立条件と同じ意味を共有するため）。
     const currentTask =
       tasks.find((task) => task.status === 'in_progress' || task.status === 'blocked') ??
-      activeTasks.find((task) => task.status === 'pending')
+      tasks.find((task) => occupiesProject(task))
 
     const continuationsPending = storage.taskContinuations.findPendingByProjectId(project.id).length
     continuationsPendingTotal += continuationsPending

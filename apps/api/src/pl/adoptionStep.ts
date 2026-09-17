@@ -29,6 +29,13 @@ import {
   getValidRoadmapItems,
   isRoadmapItemAdoptable,
 } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
+import {
+  getBaseRoadmapId,
+  isFollowUpTaskKey,
+  MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
+  isLiveJob,
+  occupiesProject,
+} from '@ai-team/shared'
 import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
 import type { IStorage } from '../storage/interface'
 import {
@@ -51,6 +58,180 @@ export interface RoadmapCandidate {
   bodyPreview: string
   /** ledger の metadata 行に `priority=high` があるか。既存表記をそのまま読む。 */
   highPriority: boolean
+}
+
+/** follow-up 候補が連続 skip されたとき、順序を繰り上げるまでの回数。 */
+export const FOLLOW_UP_SKIPS_BEFORE_BOOST = 3
+
+/** audit_log の語彙。**新しいテーブルも metrics backend も作らない。** */
+const AUDIT_ENTITY_TYPE = 'roadmap_item'
+export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
+export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
+export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
+export const AUDIT_FOLLOW_UP_ADOPTED = 'follow_up_candidate_adopted'
+
+/**
+ * 1 件の open Roadmap item が、いま採用経路から見てどの状態にあるか。
+ *
+ * **candidate limit / priority / rotation より前に、open 全件へこれを当てる**
+ * （CEO 指示 P5・B+ 方式）。後段で切り捨ててから判定すると、rotation の巡り合わせ次第で
+ * follow-up 候補が永久に観測されない。
+ */
+export type AdoptionKind = 'fresh' | 'follow_up' | 'not_available'
+
+export interface ClassifiedCandidate extends RoadmapCandidate {
+  kind: AdoptionKind
+  /** `follow_up` のとき、これまでに作られた follow-up の数。 */
+  followUpCount: number
+  /** この項目で**実際に実行された** Task の数。prompt はこちらを使う。 */
+  executedTaskCount: number
+  /** 連続 skip 回数が閾値に達し、順序だけ繰り上げた候補か。 */
+  boosted: boolean
+}
+
+/**
+ * open item を `fresh` / `follow_up` / `not_available` へ分類する。
+ *
+ * 機械的に確認するのはここまでで、「本当に残作業があるか」は判定しない。
+ * それは diff と ledger 本文を読む AI の仕事であり、採用提案の中で具体的な
+ * `implementationScope` として示されなければ `adoptRoadmapItem()` が拒否する。
+ * **「何か残っていそう」で follow-up を作らせないための役割分担である。**
+ */
+export function classifyAdoptionCandidates(
+  storage: IStorage,
+  projectId: string,
+  open: readonly RoadmapCandidate[],
+): ClassifiedCandidate[] {
+  const projectTasks = storage.tasks.findByProjectId(projectId)
+  const pendingContinuations = storage.taskContinuations.findPendingByProjectId(projectId).length
+  // 実在する ledger id を優先して base を解決する（独立レビュー Finding 2）。
+  const ledgerIds = new Set(open.map((candidate) => candidate.id))
+  // **採用 seam と同じ条件で見る。** seam は Project 全体の active Task を見て follow-up を拒否するので、
+  // ここで Project が busy なのに候補として出すと、PL が選んだ末に FOLLOW_UP_NOT_ELIGIBLE で落ち、
+  // 採用 attempt 予算だけを焼く（2026-09-15 の事故と同じ形）。検出と強制を一致させる。
+  // 既存 `currentTask` と同じ意味。parked Task（pending かつ roadmapActive=false）は占有しない。
+  const projectHasActiveTask = projectTasks.some((task) => occupiesProject(task))
+  // parked Task にも queued Job は残りうる。Worker はそれを実行するので、動いていないとは言えない。
+  const projectHasLiveJob = projectTasks.some(
+    (task) => storage.jobs.findByTaskId(task.id).some((job) => isLiveJob(job)),
+  )
+
+  return open.map((candidate) => {
+    const siblings = projectTasks.filter(
+      (task) => task.roadmapTaskKey !== undefined
+        && getBaseRoadmapId(task.roadmapTaskKey, ledgerIds) === candidate.id,
+    )
+    if (siblings.length === 0) {
+      return { ...candidate, kind: 'fresh' as const, followUpCount: 0, executedTaskCount: 0, boosted: false }
+    }
+
+    const followUpCount = siblings.filter(
+      (task) => task.roadmapTaskKey !== undefined && isFollowUpTaskKey(task.roadmapTaskKey, ledgerIds),
+    ).length
+    // **queued は「まだ動いていない」**。採用 seam と同じ定義を使う（独立レビュー Finding 4）。
+    // 件数も数える。prompt へ「この項目で実際に何本走ったか」を伝えるため（独立レビュー NEW 3）。
+    const executedCount = siblings.filter(
+      (task) => storage.jobs.findByTaskId(task.id).some((job) => job.status !== 'queued'),
+    ).length
+    const executed = executedCount > 0
+    const active = siblings.some((task) => occupiesProject(task))
+
+    // **まだ一度も Job が走っていない Task は従来どおり `fresh` 扱いである。**
+    // 採用し直すと `syncRoadmapTasks()` の isUnstarted 分岐が spec を更新するだけで、
+    // 実行済みの変更と新しい指示が混ざる余地が無い。ここを follow-up 側へ倒すと、
+    // 「採用したがまだ動いていない Task」を PL から見えなくしてしまう。
+    if (!executed) {
+      return { ...candidate, kind: 'fresh' as const, followUpCount, executedTaskCount: executedCount, boosted: false }
+    }
+
+    const eligible = !active
+      && !projectHasActiveTask
+      && !projectHasLiveJob
+      && pendingContinuations === 0
+      && followUpCount < MAX_FOLLOW_UPS_PER_ROADMAP_ITEM
+
+    return {
+      ...candidate,
+      kind: eligible ? ('follow_up' as const) : ('not_available' as const),
+      followUpCount,
+      executedTaskCount: executedCount,
+      boosted: false,
+    }
+  })
+}
+
+/**
+ * follow-up の観測を既存 `audit_log` へ残す。**新しい metrics backend は作らない。**
+ *
+ * `(entity_type, entity_id, created_at DESC)` の既存 index で後から集計できる形にしてある:
+ * 検出 → 初回で採用 / skip 1・2・3 → boost → boost 後に採用 / 取り残し、までを1本の系列で追える。
+ */
+function recordFollowUpAudit(
+  storage: IStorage,
+  projectId: string,
+  roadmapId: string,
+  operation: string,
+  detail: string,
+): void {
+  storage.auditLog.record({
+    actor: 'api',
+    operation,
+    entityType: AUDIT_ENTITY_TYPE,
+    // **Project ごとに分ける**（独立レビュー Finding 6）。同じ roadmap id でも別 Project の
+    // skip 履歴が順序へ影響してはならない。archived な Project の履歴も混ざらない。
+    entityId: followUpAuditKey(projectId, roadmapId),
+    result: 'success',
+    detail,
+  })
+}
+
+/** audit の entityId。`<projectId>/<roadmapId>`。 */
+export function followUpAuditKey(projectId: string, roadmapId: string): string {
+  return `${projectId}/${roadmapId}`
+}
+
+/** その候補が、直近で連続して何回 skip されたか。**時間は見ない**（CEO 指示）。 */
+export function countConsecutiveSkips(
+  storage: IStorage,
+  projectId: string,
+  roadmapId: string,
+): number {
+  // `findByEntity()` は **新しい順**（created_at DESC）で返す。先頭から見るのが「直近」である。
+  const entries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, followUpAuditKey(projectId, roadmapId))
+  let skips = 0
+  for (const entry of entries) {
+    if (entry.operation === AUDIT_FOLLOW_UP_SKIPPED) {
+      skips += 1
+      continue
+    }
+    // 検出と boost は「skip されたかどうか」を変えないので連続を途切れさせない。
+    if (entry.operation === AUDIT_FOLLOW_UP_DETECTED || entry.operation === AUDIT_FOLLOW_UP_BOOSTED) continue
+    // それ以外（採用された等）が現れたら、そこで連続は途切れる。
+    break
+  }
+  return skips
+}
+
+/**
+ * follow-up 候補を、通常候補より前へ出す。
+ *
+ * **順序だけを変える。** Gate・Class 判定・Review 要件には一切触れない
+ * （CEO 指示: boost が Safety を弱めてはならない）。
+ */
+export function applyFollowUpBoost(
+  storage: IStorage,
+  projectId: string,
+  candidates: readonly ClassifiedCandidate[],
+): ClassifiedCandidate[] {
+  const marked = candidates.map((candidate) => (
+    candidate.kind === 'follow_up'
+      && countConsecutiveSkips(storage, projectId, candidate.id) >= FOLLOW_UP_SKIPS_BEFORE_BOOST
+      ? { ...candidate, boosted: true }
+      : candidate
+  ))
+  const boosted = marked.filter((candidate) => candidate.boosted)
+  if (boosted.length === 0) return [...marked]
+  return [...boosted, ...marked.filter((candidate) => !candidate.boosted)]
 }
 
 export interface PlAdoptionProposal {
@@ -150,15 +331,19 @@ function extractBodyPreview(lines: readonly string[], checkboxLineIndex: number)
  *
  * 回転位置は呼び出し側が既存 `audit_log` の採用試行回数から渡す。**新しい state は持たない。**
  */
-export function selectAdoptionCandidates(
-  all: readonly RoadmapCandidate[],
+export function selectAdoptionCandidates<T extends RoadmapCandidate & { boosted?: boolean }>(
+  all: readonly T[],
   limit: number,
   rotationOffset: number,
-): RoadmapCandidate[] {
+): T[] {
   if (all.length <= limit) return [...all]
 
-  const high = all.filter((c) => c.highPriority)
-  const rest = all.filter((c) => !c.highPriority)
+  // **boost された候補は rotation で窓から外れてはならない**（独立レビュー NEW 2）。
+  // 連続 skip の末に順位を上げたのに、次の rotation で候補一覧から消えては意味がない。
+  // priority と同じ「必ず載る」側へ入れ、boost 分を先頭に置く。
+  const boosted = all.filter((c) => c.boosted === true)
+  const high = [...boosted, ...all.filter((c) => c.highPriority && c.boosted !== true)]
+  const rest = all.filter((c) => !c.highPriority && c.boosted !== true)
   const slots = Math.max(0, limit - high.length)
   if (slots === 0 || rest.length === 0) return high.slice(0, limit)
 
@@ -290,7 +475,7 @@ const CANDIDATE_BODY_PREVIEW_CHARS = 200
  * Design Philosophy 全文は載せず、採用判断に効く原則だけを system prompt 側へ固定してある。
  */
 export function buildAdoptionPrompt(
-  candidates: readonly RoadmapCandidate[],
+  candidates: readonly (RoadmapCandidate & { kind?: AdoptionKind; executedTaskCount?: number })[],
   projectGoal?: string,
 ): string {
   const goalSection = projectGoal !== undefined && projectGoal.trim() !== ''
@@ -301,7 +486,11 @@ export function buildAdoptionPrompt(
     ...goalSection,
     'Roadmap items still open. Read the body, not just the title:',
     ...candidates.flatMap((c) => [
-      `- ${c.id} — ${c.state}${c.highPriority ? ' — PRIORITY:HIGH' : ''} — ${c.title}`,
+      `- ${c.id} — ${c.state}${c.highPriority ? ' — PRIORITY:HIGH' : ''}${
+        c.kind === 'follow_up'
+          ? ` — FOLLOW-UP (${c.executedTaskCount ?? 0} task(s) already ran for this item; name ONLY work they did not do)`
+          : ''
+      } — ${c.title}`,
       c.bodyPreview === '' ? '  (no body)' : `  ${c.bodyPreview}`,
     ]),
   ].join('\n')
@@ -324,7 +513,7 @@ export async function runAdoptionStep(
   projectId: string,
   deps: PlAdoptionDeps,
 ): Promise<PlAdoptionResult> {
-  // **既に実行済みの Task を持つ項目は候補に混ぜない。**
+  // **実行済みの項目は「もう終わり」ではなく、3通りに分ける（CEO 指示 P5・B+ 方式）。**
   //
   // ledger（Candidate 側）は master の更新に対して遅れることがある。遅れている間、PL は
   // 完了済みの項目を open と見て選び、`adoptRoadmapItem()` が `ALREADY_EXECUTED` で正しく
@@ -333,15 +522,29 @@ export async function runAdoptionStep(
   //
   // DB（実行済みかどうか）は ledger より新しい事実なので、候補の段階で除く。
   // **新しい state は持たない** — 既存の Task / Job を見るだけである。
-  const executedKeys = new Set(
-    storage.tasks.findByProjectId(projectId)
-      .filter((task) => task.roadmapTaskKey !== undefined && storage.jobs.findByTaskId(task.id).length > 0)
-      .map((task) => task.roadmapTaskKey as string),
-  )
-  const open = readAdoptionCandidates(deps.readLedger)
-    .filter((candidate) => !executedKeys.has(candidate.id))
-  if (open.length === 0) {
+  //   fresh         … 一度も採用されていない。従来どおり
+  //   follow_up     … 実行済みで active Task も pending continuation も無い。残作業があれば続けられる
+  //   not_available … 進行中・上限到達。ここでは出さない（既存の resume / recovery 経路が扱う）
+  //
+  // **分類は candidate limit / priority / rotation より前に open 全件へ当てる。**
+  // 後段で切り捨ててから判定すると、rotation の巡り合わせ次第で follow-up 候補が
+  // 永久に観測されない（2026-09-15 の予算枯渇と同じ「見えないまま止まる」形になる）。
+  const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(deps.readLedger))
+  const available = applyFollowUpBoost(storage, projectId, classified)
+    .filter((candidate) => candidate.kind !== 'not_available')
+  if (available.length === 0) {
     return { status: 'no_candidate', reason: 'no open roadmap item in the ledger' }
+  }
+
+  // 検出できたことを残す。選ばれたかどうかは下で別途記録する。
+  for (const candidate of available) {
+    if (candidate.kind !== 'follow_up') continue
+    recordFollowUpAudit(storage, projectId, candidate.id, AUDIT_FOLLOW_UP_DETECTED,
+      candidate.boosted ? 'detected (boosted after consecutive skips)' : 'detected')
+    if (candidate.boosted) {
+      recordFollowUpAudit(storage, projectId, candidate.id, AUDIT_FOLLOW_UP_BOOSTED,
+        `ordered ahead after ${FOLLOW_UP_SKIPS_BEFORE_BOOST} consecutive skips`)
+    }
   }
 
   // 回転位置は**既存 `audit_log` の採用試行回数**から取る。新しい state は持たない。
@@ -349,7 +552,7 @@ export async function runAdoptionStep(
   const rotationOffset = storage.auditLog
     .findByEntity('pl_loop_target', `adopt:${projectId}`)
     .length
-  const candidates = selectAdoptionCandidates(open, PL_ADOPTION_CANDIDATE_LIMIT, rotationOffset)
+  const candidates = selectAdoptionCandidates(available, PL_ADOPTION_CANDIDATE_LIMIT, rotationOffset)
 
   const projectGoal = storage.projects.findById(projectId)?.goal
   const raw = await deps.propose(
@@ -363,7 +566,17 @@ export async function runAdoptionStep(
 
   // 提示していない id を選んだ場合は、ここで落とす前に Gate でも落ちる（ledger 照合）。
   // ただし理由を分かりやすくするため先に見る。
-  if (!candidates.some((candidate) => candidate.id === proposal.roadmapId)) {
+  const chosen = candidates.find((candidate) => candidate.id === proposal.roadmapId)
+
+  // 提示した follow-up 候補のうち、今回選ばれなかったものを skip として残す。
+  // **時間ベースの boost は入れない**（CEO 指示）。数えるのは「採用機会を何回通過したか」である。
+  for (const candidate of candidates) {
+    if (candidate.kind !== 'follow_up' || candidate.id === proposal.roadmapId) continue
+    recordFollowUpAudit(storage, projectId, candidate.id, AUDIT_FOLLOW_UP_SKIPPED,
+      `not selected in this adoption opportunity (consecutive skips: ${countConsecutiveSkips(storage, projectId, candidate.id) + 1})`)
+  }
+
+  if (!chosen) {
     return {
       status: 'proposal_unusable',
       roadmapId: proposal.roadmapId,
@@ -400,10 +613,20 @@ export async function runAdoptionStep(
     allowedPaths: proposal.allowedPaths,
     acceptanceCriteria: proposal.acceptanceCriteria,
     implementationScope: proposal.implementationScope,
+    // 実行済み項目なら follow-up として採用する。**成立条件は adoptRoadmapItem() が機械判定する**
+    // （ここで true を渡しても、前提を満たさなければ FOLLOW_UP_NOT_ELIGIBLE で落ちる）。
+    ...(chosen.kind === 'follow_up' ? { followUp: true } : {}),
   })
 
   if (!result.ok) {
     return { status: 'adoption_rejected', roadmapId: proposal.roadmapId, reason: result.reason }
+  }
+
+  // **採用できたら連続 skip を切る**（独立レビュー Finding 6）。
+  // これを書かないと、間に採用が挟まっても次の候補が boost されたままになる。
+  if (chosen.kind === 'follow_up') {
+    recordFollowUpAudit(storage, projectId, proposal.roadmapId, AUDIT_FOLLOW_UP_ADOPTED,
+      `adopted as task ${result.taskId}`)
   }
 
   return { status: 'adopted', roadmapId: proposal.roadmapId, taskId: result.taskId }

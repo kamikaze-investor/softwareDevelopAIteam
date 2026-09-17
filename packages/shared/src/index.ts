@@ -60,6 +60,8 @@ export {
   ProviderSeparationError,
   resolveReviewVendor,
 } from './reviewSeparation'
+export * from './roadmapTaskIdentity'
+export * from './taskOccupancy'
 export * from './roadmapTopology'
 export {
   PL_ACTION_KINDS,

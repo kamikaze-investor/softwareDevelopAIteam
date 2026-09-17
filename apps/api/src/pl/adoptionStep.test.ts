@@ -11,6 +11,14 @@ import type { IStorage } from '../storage/interface'
 import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import {
+  applyFollowUpBoost,
+  AUDIT_FOLLOW_UP_ADOPTED,
+  AUDIT_FOLLOW_UP_BOOSTED,
+  AUDIT_FOLLOW_UP_SKIPPED,
+  followUpAuditKey,
+  classifyAdoptionCandidates,
+  countConsecutiveSkips,
+  FOLLOW_UP_SKIPS_BEFORE_BOOST,
   parseAdoptionProposal,
   readAdoptionCandidates,
   selectAdoptionCandidates,
@@ -202,6 +210,191 @@ describe('Roadmap state と自律採用の一致 — 3経路が同じ判定に�
   })
 })
 
+describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', () => {
+  /** open-item を実行済み・done にした Project を作る。 */
+  function projectWithExecutedItem(): { storage: IStorage; projectId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'done one', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item',
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    return { storage, projectId: project.id }
+  }
+
+  it('実行済み・active なし・continuation なしを follow_up として分類する', () => {
+    const { storage, projectId } = projectWithExecutedItem()
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('follow_up')
+  })
+
+  it('一度も採用されていない項目は従来どおり fresh', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+
+    const classified = classifyAdoptionCandidates(storage, project.id, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('fresh')
+  })
+
+  it('Project に active Task があれば follow-up 候補にしない（検出と強制を一致させる）', () => {
+    // 採用 seam は Project 全体の active Task を見て拒否する。検出側が甘いと、PL が選んだ末に
+    // FOLLOW_UP_NOT_ELIGIBLE で落ちて採用 attempt 予算だけを焼く。
+    const { storage, projectId } = projectWithExecutedItem()
+    // occupying な Task にする（手動 Task の既定 roadmapActive=false は parked で占有しない）。
+    const unrelated = storage.tasks.create({
+      projectId, title: 'unrelated', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(unrelated.id, { status: 'in_progress' })
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('not_available')
+  })
+
+  it('parked Task が queued Job を持っていれば follow-up 候補にしない（分類器層）', () => {
+    // 分類器も seam と同じ条件で見る。ここだけ甘いと、PL が選んだ末に seam が拒否し
+    // 採用 attempt 予算を焼く。
+    const { storage, projectId } = projectWithExecutedItem()
+    const parked = storage.tasks.create({
+      projectId, title: 'parked', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(parked.id, { roadmapActive: false })
+    storage.jobs.create({
+      taskId: parked.id, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('not_available')
+  })
+
+  it('parked Task に生きた Job が無ければ follow-up 候補のまま（過剰拒否しない）', () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    const parked = storage.tasks.create({
+      projectId, title: 'parked', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(parked.id, { roadmapActive: false })
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('follow_up')
+  })
+
+  it('candidate limit より前に follow-up を検出する', () => {
+    const { storage, projectId } = projectWithExecutedItem()
+
+    // limit 1 でも、分類は open 全件へ先に当たっているので follow_up の事実は失われない。
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+    const selected = selectAdoptionCandidates(classified, 1, 0)
+
+    expect(classified.some((c) => c.kind === 'follow_up')).toBe(true)
+    expect(selected).toHaveLength(1)
+  })
+
+  it('skip を audit へ記録し、3回連続で順序を繰り上げる', async () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    // PL は毎回別の項目を選ぶ = open-item は毎回 skip される。
+    const chooseOther = {
+      propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'in-progress-item' }),
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
+    }
+
+    for (let round = 1; round <= FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
+      await runAdoptionStep(storage, projectId, chooseOther)
+      expect(countConsecutiveSkips(storage, projectId, 'open-item'), `round ${round}`).toBe(round)
+    }
+
+    const skips = storage.auditLog
+      .findByEntity('roadmap_item', followUpAuditKey(projectId, 'open-item'))
+      .filter((entry) => entry.operation === AUDIT_FOLLOW_UP_SKIPPED)
+    expect(skips).toHaveLength(FOLLOW_UP_SKIPS_BEFORE_BOOST)
+
+    // 閾値に達したので、次からは先頭へ出る。
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+    const boosted = applyFollowUpBoost(storage, projectId, classified)
+    expect(boosted[0]?.id).toBe('open-item')
+    expect(boosted[0]?.boosted).toBe(true)
+
+    await runAdoptionStep(storage, projectId, chooseOther)
+    const boostEvents = storage.auditLog
+      .findByEntity('roadmap_item', followUpAuditKey(projectId, 'open-item'))
+      .filter((entry) => entry.operation === AUDIT_FOLLOW_UP_BOOSTED)
+    expect(boostEvents.length).toBeGreaterThan(0)
+  })
+
+  it('boost は順序だけを変え、候補の種別や件数を変えない', () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    for (let round = 0; round < FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
+      storage.auditLog.record({
+        actor: 'api', operation: AUDIT_FOLLOW_UP_SKIPPED, entityType: 'roadmap_item',
+        entityId: followUpAuditKey(projectId, 'open-item'), result: 'success', detail: 'test',
+      })
+    }
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    const boosted = applyFollowUpBoost(storage, projectId, classified)
+
+    // 並び替えただけ。集合も kind も同じ。
+    expect(boosted.map((c) => c.id).sort()).toEqual(classified.map((c) => c.id).sort())
+    for (const candidate of boosted) {
+      expect(candidate.kind).toBe(classified.find((c) => c.id === candidate.id)?.kind)
+    }
+  })
+
+  it('採用されれば連続 skip は途切れる（採用イベントは本番経路が書く）', async () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    const chooseOther = {
+      propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'in-progress-item' }),
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
+    }
+    await runAdoptionStep(storage, projectId, chooseOther)
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(1)
+
+    // 今度は follow-up 候補そのものを選ぶ。**採用イベントは runAdoptionStep が書く**
+    // （テストが手で書かない。書いていなければこのテストが落ちる）。
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'open-item' }),
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'open-item#2', title: 't' }),
+    })
+
+    const adopted = storage.auditLog
+      .findByEntity('roadmap_item', followUpAuditKey(projectId, 'open-item'))
+      .filter((entry) => entry.operation === AUDIT_FOLLOW_UP_ADOPTED)
+    expect(adopted.length).toBeGreaterThan(0)
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(0)
+  })
+
+  it('別 Project の skip 履歴は順序へ影響しない', () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    for (let round = 0; round < FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
+      storage.auditLog.record({
+        actor: 'api', operation: AUDIT_FOLLOW_UP_SKIPPED, entityType: 'roadmap_item',
+        entityId: followUpAuditKey('some-other-project', 'open-item'), result: 'success', detail: 'test',
+      })
+    }
+
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(0)
+  })
+})
+
 describe('parseAdoptionProposal — fail-closed', () => {
   it('完全な提案だけを受け取る', () => {
     expect(parseAdoptionProposal(JSON.stringify(GOOD))?.roadmapId).toBe('open-item')
@@ -320,11 +513,16 @@ describe('runAdoptionStep — PL は ledger の外を採用できない', () => 
   })
 })
 
-describe('runAdoptionStep — 実行済みの項目は候補にしない', () => {
+describe('runAdoptionStep — 実行済みの項目は follow-up 候補として提示する', () => {
   // 2026-09-15 production 実測: Candidate の ledger が master に遅れている間、PL は完了済み
   // 項目を open と見て選び、ALREADY_EXECUTED 却下で attempt 予算を2回消費した。
-  // DB（実行済みか）は ledger より新しい事実なので、候補の段階で除く。
-  it('Job を持つ Task がある roadmap item は PL へ提示しない', async () => {
+  //
+  // **2026-09-17 CEO 判断で方針が変わった。** 実行済みでも ledger 上 open で、active Task も
+  // pending continuation も無いなら、残作業に対する follow-up を作れる。そのため候補からは
+  // 除かず、**FOLLOW-UP と明示して提示する**。予算を無駄に焼かない防御は候補除外ではなく、
+  // 「新しい implementationScope を名指しできなければ `adoptRoadmapItem()` が拒否する」
+  // （FOLLOW_UP_NOT_ELIGIBLE / FOLLOW_UP_NO_PROGRESS）ことで担保する。
+  it('Job を持つ done Task の roadmap item は FOLLOW-UP として提示する', async () => {
     const storage = createSQLiteStorage(':memory:')
     const project = storage.projects.create({
       name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
@@ -345,7 +543,34 @@ describe('runAdoptionStep — 実行済みの項目は候補にしない', () =>
       adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
     })
 
-    // LEDGER の open item は 'open-item' だけ。実行済みなので候補が空になる
+    // 候補として提示される。stub の propose が '{}' を返すので採用自体は成立しない。
+    expect(result.status).toBe('proposal_unusable')
+    expect(offered).toContain('open-item')
+    expect(offered).toContain('FOLLOW-UP')
+  })
+
+  it('active Task が残っていれば follow-up 候補にしない（resume 経路の領分）', async () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const stuck = storage.tasks.create({
+      projectId: project.id, title: 'stuck', description: '', status: 'blocked',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item',
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: stuck.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    let offered: string | undefined
+    const result = await runAdoptionStep(storage, project.id, {
+      propose: async (_system, user) => { offered = user; return '{}' },
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
+    })
+
+    // blocked な Task は resume 経路が扱う。follow-up で迂回させない。
     expect(result.status).toBe('no_candidate')
     expect(offered).toBeUndefined()
   })

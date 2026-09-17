@@ -12,6 +12,7 @@ export type CheckboxState = 'checked' | 'unchecked'
 
 export type RoadmapIssueCode =
   | 'duplicate_id'
+  | 'follow_up_shaped_id'
   | 'invalid_metadata'
   | 'invalid_state'
   | 'missing_checkbox'
@@ -93,6 +94,18 @@ export function isRoadmapState(value: string): value is RoadmapState {
 }
 
 /**
+ * follow-up の Task identity（`<id>#<sequence>`）と衝突する形の `roadmap:id` を禁じる。
+ *
+ * ledger が `foo` と `foo#2` を同時に持てると、`foo` の follow-up が `foo#2` を名乗り、
+ * 実在の別項目になりすます。provenance も sequence も上限計算も壊れる（独立レビュー 3巡目）。
+ * **曖昧さは解決するのではなく、成立させないのが正しい。** 現行 ledger に該当 id は無いので、
+ * これは将来そういう id が書かれるのを止める validation である。
+ */
+export function isFollowUpShapedRoadmapId(id: string): boolean {
+  return /#\d+$/.test(id)
+}
+
+/**
  * 自律採用（PL の `adopt_roadmap_item`）の対象にしてよい state。
  *
  * **allowlist である。** 除外リスト（「done 以外は採用可」）にすると、新しい state を足したときの
@@ -146,6 +159,15 @@ export function parseRoadmapMarkdown(markdown: string): RoadmapParseResult {
     }
 
     const [, id, state] = metadataMatch
+    if (id !== undefined && isFollowUpShapedRoadmapId(id)) {
+      issues.push({
+        code: 'follow_up_shaped_id',
+        id,
+        message:
+          `Roadmap id "${id}" ends with "#<number>", which collides with follow-up task identities`,
+        line: lineIndex + 1,
+      })
+    }
     const checkboxLineIndex = findNextNonEmptyLine(lines, lineIndex + 1)
     const checkboxLine = checkboxLineIndex === null ? null : lines[checkboxLineIndex]
     const checkboxMatch = checkboxLine?.match(CHECKBOX_LINE_REGEX) ?? null
