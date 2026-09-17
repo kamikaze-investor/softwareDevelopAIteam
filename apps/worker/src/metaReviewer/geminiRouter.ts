@@ -563,6 +563,34 @@ function handleBothExhausted(featureName: string, diagnostics: ProviderFailureDi
  * `preferCli: true` なので CLI 段が有力だが、CLI 失敗時は API 段へ落ちるため断定できない。
  * 原因を推測で直さないために、まず段を確定させる（`specs/21` observation-closes-loop）。
  */
+/**
+ * **後続段が成功しても、落ちた段の診断を捨てない。**
+ *
+ * 既存実装は全段失敗時（`handleBothExhausted`）にしか診断を出さないため、
+ * 「CLI が落ちて API が拾った」ケースが**ログ上まったく見えなかった**。
+ * 2026-09-17 の Meta Review 失敗調査では、どの段が応答を返したのかすら
+ * 特定できず、原因究明が一度空振りしている（`meta-review-structured-output-robustness`）。
+ *
+ * `diagnostics` は既に raw stderr/stdout を含まない allowlist 型なので、そのまま出せる。
+ */
+function logStageFallback(featureName: string, promptChars: number, outcome: { diagnostics?: ProviderFailureDiagnostics }): void {
+  const d = outcome.diagnostics
+  if (d === undefined) {
+    return
+  }
+  console.log(`[metaReview] stage fell through ${JSON.stringify({
+    feature: featureName,
+    promptChars,
+    provider: d.provider,
+    stage: d.stage,
+    failureClass: d.failureClass,
+    exitCode: d.exitCode,
+    httpStatus: d.httpStatus,
+    timedOut: d.timedOut,
+    message: d.message,
+  })}`)
+}
+
 function logResponseShape(input: {
   featureName: string
   stage: string
@@ -615,6 +643,8 @@ export async function callGeminiWithFallback(
       return cliOutcome.text as string
     }
 
+    logStageFallback(featureName, prompt.length, cliOutcome)
+
     apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel)
     if (apiOutcome.ok) {
       logResponseShape({ featureName, stage: 'gemini_api', model: apiModel, text: apiOutcome.text as string, usedJsonSchema: false })
@@ -627,6 +657,8 @@ export async function callGeminiWithFallback(
       logResponseShape({ featureName, stage: 'gemini_api', model: apiModel, text: apiOutcome.text as string, usedJsonSchema: false })
       return apiOutcome.text as string
     }
+
+    logStageFallback(featureName, prompt.length, apiOutcome)
 
     cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort)
     if (cliOutcome.ok) {
