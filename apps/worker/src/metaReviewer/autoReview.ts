@@ -211,9 +211,13 @@ async function main(): Promise<void> {
   const result = {
     ...parsedResult,
     summary: sanitizeMessage(parsedResult.summary),
+    // **provider が値を決める文字列はすべて通す。** spread で素通りする項目
+    // （`file` 等）を残すと、そこに token が入った場合に result ファイルへ
+    // そのまま書き出される（独立レビュー指摘 2026-09-17 R3）。
     findings: parsedResult.findings.map((f) => ({
       ...f,
       message: sanitizeMessage(f.message),
+      ...(f.file === undefined ? {} : { file: sanitizeMessage(f.file) }),
       ...(f.suggestion === undefined ? {} : { suggestion: sanitizeMessage(f.suggestion) }),
     })),
   }

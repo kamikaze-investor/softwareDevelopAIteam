@@ -322,8 +322,25 @@ describe('Independent Review 2026-09-17 R2: validated object == finalized object
   it('findings に message があれば成立する', () => {
     expect(hasFormalVerdict(JSON.stringify({
       status: 'changes_requested', riskLevel: 'medium', summary: 's',
-      findings: [{ severity: 'warning', category: 'scope_creep', message: 'm' }],
+      findings: [{ severity: 'medium', category: 'scope_creep', message: 'm' }],
       requiresCeoApproval: false,
+    }))).toBe(true)
+  })
+})
+
+describe('Independent Review 2026-09-17 R3', () => {
+  it('finding の severity / category が欠けていれば成立にしない', () => {
+    const base = { status: 'approved', riskLevel: 'low', summary: 's', requiresCeoApproval: false }
+    expect(hasFormalVerdict(JSON.stringify({ ...base, findings: [{ message: 'm' }] }))).toBe(false)
+    expect(hasFormalVerdict(JSON.stringify({
+      ...base, findings: [{ severity: 'low', message: 'm' }],
+    }))).toBe(false)
+    expect(hasFormalVerdict(JSON.stringify({
+      ...base, findings: [{ severity: 'low', category: 'scope_creep', message: '  ' }],
+    }))).toBe(false)
+    // 契約を満たせば成立する。
+    expect(hasFormalVerdict(JSON.stringify({
+      ...base, findings: [{ severity: 'low', category: 'scope_creep', message: 'm' }],
     }))).toBe(true)
   })
 })

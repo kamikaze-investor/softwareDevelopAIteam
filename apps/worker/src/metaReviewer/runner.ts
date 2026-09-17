@@ -289,9 +289,12 @@ function findStrictVerdictObject(rawResponse: string): Record<string, unknown> |
     if (!Array.isArray(parsed.findings)) {
       continue
     }
-    // 要素まで見る。`findings: [{}]` のような中身の無い配列を通すと、
-    // normalizeFindings() が黙って落として APPROVED だけが残る（独立レビュー指摘 R2）。
-    if (!parsed.findings.every((f) => isRecord(f) && typeof f.message === 'string')) {
+    // 要素まで **MetaReviewFinding の契約で**見る。
+    //
+    // message だけを見ていたときは、severity / category が欠けた finding でも成立扱いになり、
+    // normalizeFindings() が既定値で埋めて APPROVED だけが残った（独立レビュー指摘 R2 / R3）。
+    // 切れた応答は途中の finding が不完全になりやすいので、ここは契約どおり要求する。
+    if (!parsed.findings.every(isStrictFinding)) {
       continue
     }
     if (typeof parsed.requiresCeoApproval !== 'boolean') {
@@ -494,6 +497,35 @@ function normalizeFindings(value: unknown, fallbackSeverity: MetaRiskLevel): Met
       line: typeof finding.line === 'number' ? finding.line : undefined,
       suggestion: typeof finding.suggestion === 'string' ? finding.suggestion : undefined,
     }))
+}
+
+/**
+ * gate 述語が要求する finding の形。**normalizeFindings() の既定値埋めに頼らない。**
+ * 省略可能な項目は「無い」か「正しい型」のどちらかであることまで見る。
+ */
+function isStrictFinding(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false
+  }
+  if (!isMetaRiskLevel(value.severity)) {
+    return false
+  }
+  if (!isMetaFindingCategory(value.category)) {
+    return false
+  }
+  if (typeof value.message !== 'string' || value.message.trim().length === 0) {
+    return false
+  }
+  if (value.file !== undefined && typeof value.file !== 'string') {
+    return false
+  }
+  if (value.line !== undefined && typeof value.line !== 'number') {
+    return false
+  }
+  if (value.suggestion !== undefined && typeof value.suggestion !== 'string') {
+    return false
+  }
+  return true
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
