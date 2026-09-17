@@ -1095,8 +1095,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
 
           if (!existingTask.roadmapActive) {
-            tasks.update(existingTask.id, { roadmapActive: true })
-            reactivatedTaskIds.push(existingTask.id)
+            // **abort_task で park された Task だけは再活性化しない。**
+            // sync が黙って現役へ戻すと park が無意味になる（CEO 指示・2026-09-17）。
+            // 「park されたか」は既存 `audit_log` の `task_aborted` で判る。
+            // **新しい flag も status も足さない。** sync で非活性化されただけの Task を
+            // 仕様一致で戻す既存挙動（"reactivates inactive locked tasks"）はそのまま残す。
+            const parked = db.prepare(
+              "SELECT 1 FROM audit_log WHERE entity_type = 'task' AND entity_id = ? AND operation = 'task_aborted' LIMIT 1",
+            ).get(existingTask.id)
+            if (!parked) {
+              tasks.update(existingTask.id, { roadmapActive: true })
+              reactivatedTaskIds.push(existingTask.id)
+            }
           }
         }
 

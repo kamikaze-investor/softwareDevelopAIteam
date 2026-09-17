@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { abortTask } from '../pl/abortTask'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import {
@@ -148,6 +149,11 @@ const ReconcileExternalCompletionBody = z.object({
     acceptanceEvidence: z.string().trim().min(1),
     approvedScope: z.string().trim().min(1),
   }).strict(),
+}).strict()
+
+const AbortTaskBody = z.object({
+  approvalRequestId: z.string().min(1),
+  reason: z.string().trim().min(1).max(2000),
 }).strict()
 
 const ResumeTaskBody = z.object({
@@ -423,6 +429,36 @@ export async function taskRoutes(
 
     const task = storage.tasks.create(result.data)
     return reply.status(201).send(task)
+  })
+
+  /**
+   * POST /:id/abort
+   *
+   * 未完了 Task を **done にせず** park する。Roadmap 項目の残作業は消えない
+   * （再開は follow-up 採用の責務であり、ここでは Task を作らない）。
+   * 必要 Gate は既存 `ACTION_GATE_TABLE` が決めており、`approval_gate` =
+   * 対象 Task に紐づく APPROVED な ApprovalRequest、すなわち CEO の承認操作である。
+   */
+  app.post<{ Params: { id: string } }>('/:id/abort', async (req, reply) => {
+    const parsed = AbortTaskBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    }
+
+    const result = abortTask(storage, {
+      taskId: req.params.id,
+      approvalRequestId: parsed.data.approvalRequestId,
+      reason: parsed.data.reason,
+    })
+
+    if (!result.ok) {
+      const status = result.code === 'TASK_NOT_FOUND'
+        ? 404
+        : result.code === 'NOT_AUTHORIZED' ? 403 : 409
+      return reply.status(status).send({ error: result.reason, code: result.code, details: result.details })
+    }
+
+    return reply.status(200).send(result)
   })
 
   app.post<{ Params: { id: string } }>('/:id/resume', async (req, reply) => {
