@@ -3,6 +3,7 @@ import { basename, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type {
   DesignReviewKind,
+  AppliedPrinciple,
   FocusedReviewResult,
   IndependentReviewOutcome,
   IntegrationReviewResult,
@@ -17,8 +18,12 @@ import type {
 } from '@ai-team/shared'
 import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
 import {
+  buildApplicablePrinciplesSection,
   buildEngineeringPrincipleReviewGuidance,
   loadEngineeringPrinciples,
+  normalizeAppliedPrinciples,
+  selectPrinciples,
+  type PrincipleSelection,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
 // 判定ロジックはAPI（Control Plane）側でも再計算する必要があるため @ai-team/shared を正本とし、
 // ここでは再exportして既存の呼び出し元との互換を保つ。定義を二重化しないこと。
@@ -148,12 +153,26 @@ const FINDING_SCHEMA = {
   required: ['message'],
 } as const
 
+const APPLIED_PRINCIPLE_SCHEMA = {
+  type: 'object',
+  properties: {
+    principleId: { type: 'string' },
+    verdict: { type: 'string', enum: [...STRATEGIC_DECISIONS] },
+    reason: { type: 'string' },
+  },
+  required: ['principleId', 'verdict'],
+} as const
+
 const FOCUSED_REVIEW_JSON_SCHEMA = {
   type: 'object',
   properties: {
     decision: { type: 'string', enum: [...STRATEGIC_DECISIONS] },
     summary: { type: 'string' },
     findings: { type: 'array', items: FINDING_SCHEMA },
+    // **required に入れない。** 原則判定が返らないことを review の失敗にしない
+    // （`meta-review-structured-output-robustness` が解消するまでの間、
+    // 出力契約の拡張が新しい false BLOCKED を生まないようにする）。
+    appliedPrinciples: { type: 'array', items: APPLIED_PRINCIPLE_SCHEMA },
   },
   required: ['decision', 'summary'],
 } as const
@@ -292,6 +311,9 @@ export async function runIndependentReview(
 
     return {
       provider: result.provider,
+      // **独立 Reviewer の原則判定をここで落とさない。** 落とすと independent stage の行が
+      // 1 件も残らず、stage 間の disagreement 集計が永久に空になる（独立レビュー指摘 2026-09-17）。
+      appliedPrinciples: result.appliedPrinciples,
       verdict: result.verdict === 'blocking' ? 'blocking' : result.verdict,
       summary: result.summary,
       unavailable: result.confidence === 0 && result.verdict === 'blocking' && result.issues.length === 0,
@@ -317,6 +339,7 @@ export function mapMetaReviewStatusToStrategicDecision(status: 'approved' | 'cha
 export function parseFocusedReviewResponse(
   rawResponse: string,
   focus: MetaReviewFocus,
+  selection: readonly PrincipleSelection[] = [],
 ): ReviewOutcome<FocusedReviewResult> {
   const parsed = parseJsonObject(rawResponse)
 
@@ -337,6 +360,7 @@ export function parseFocusedReviewResponse(
       decision: parsed.decision,
       summary: typeof parsed.summary === 'string' ? parsed.summary : '(summary not provided)',
       findings: normalizeFindings(parsed.findings, parsed.decision),
+      appliedPrinciples: normalizeAppliedPrinciples(parsed.appliedPrinciples, selection),
     },
     unavailable: false,
   }
@@ -427,7 +451,10 @@ async function runFocusedReview(
   input: StrategicReviewInput,
   focus: MetaReviewFocus,
 ): Promise<ReviewOutcome<FocusedReviewResult>> {
-  const promptContext = await buildFocusedReviewPrompt(input, focus)
+  // 選択は1回だけ行い、prompt と parse で同じものを使う。
+  // 別々に選び直すと「promptに載せた原則」と「記録した原則」がずれ得る。
+  const selection = selectFocusPrinciples(focus)
+  const promptContext = await buildFocusedReviewPrompt(input, focus, selection)
 
   if (promptContext.unavailableReason) {
     return {
@@ -446,7 +473,7 @@ async function runFocusedReview(
       featureName: `strategic-meta-review-${focus}`,
       cliJsonSchema: FOCUSED_REVIEW_JSON_SCHEMA,
     })
-    return parseFocusedReviewResponse(rawResponse, focus)
+    return parseFocusedReviewResponse(rawResponse, focus, selection)
   } catch (err) {
     return {
       result: unavailableFocusedResult(
@@ -552,9 +579,19 @@ async function runIntegrationReview(
   }
 }
 
+/**
+ * この focus に適用する原則を選ぶ。**riskLevel は使わない。**
+ * Review 経路が持っているのは reviewLoad（レビューの認知負荷）であって
+ * `MetaRiskLevel`（変更のリスク）ではなく、両者は別物なので読み替えない。
+ */
+export function selectFocusPrinciples(focus: MetaReviewFocus): PrincipleSelection[] {
+  return selectPrinciples({ predictedFocuses: [focus] }, loadEngineeringPrinciples())
+}
+
 async function buildFocusedReviewPrompt(
   input: StrategicReviewInput,
   focus: MetaReviewFocus,
+  selection: readonly PrincipleSelection[],
 ): Promise<{ prompt: string; unavailableReason?: string }> {
   if (focus === 'strategic_alignment') {
     const context = await buildStrategicAlignmentContext(input)
@@ -576,7 +613,7 @@ async function buildFocusedReviewPrompt(
         '',
         buildReviewMaterialSection(input.gitDiff, input.materialKind ?? 'diff'),
         '',
-        buildFocusedOutputContract(),
+        buildFocusedOutputContract(selection),
       ].join('\n'),
     }
   }
@@ -602,7 +639,7 @@ async function buildFocusedReviewPrompt(
       '',
       buildReviewMaterialSection(input.gitDiff, input.materialKind ?? 'diff'),
       '',
-      buildFocusedOutputContract(),
+      buildFocusedOutputContract(selection),
     ].join('\n'),
   }
 }
@@ -891,12 +928,14 @@ function buildReviewMaterialSection(
   ].join('\n')
 }
 
-function buildFocusedOutputContract(): string {
+export function buildFocusedOutputContract(selection: readonly PrincipleSelection[]): string {
   const engineeringPrinciples = loadEngineeringPrinciples()
   const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance(engineeringPrinciples)
 
   return [
     principleReviewGuidance,
+    '',
+    buildApplicablePrinciplesSection(selection),
     '',
     'Return JSON only:',
     '```json',
@@ -911,6 +950,13 @@ function buildFocusedOutputContract(): string {
     '      "file": "optional path",',
     '      "line": 1,',
     '      "suggestion": "optional suggestion"',
+    '    }',
+    '  ],',
+    '  "appliedPrinciples": [',
+    '    {',
+    '      "principleId": "one of the Applicable Principles ids above",',
+    '      "verdict": "ALIGNED" | "CONFLICT" | "UNCERTAIN",',
+    '      "reason": "one sentence"',
     '    }',
     '  ]',
     '}',

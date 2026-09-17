@@ -1,3 +1,12 @@
+import {
+  buildApplicablePrinciplesSection,
+  loadEngineeringPrinciples,
+  normalizeAppliedPrinciples,
+  selectPrinciples,
+  type PrincipleSelection,
+} from '@ai-team/shared/src/engineeringPrinciples.js'
+import type { AppliedPrinciple } from '@ai-team/shared'
+import { mapFileToFocuses } from './focusSelector'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { ApprovalLevelResult, DesignReviewKind } from '@ai-team/shared'
 import { createAiCliAdapter } from '../aiCli/factory.js'
@@ -45,6 +54,11 @@ export interface ReviewerResult {
   generatedAt: string
   /** レビュー生テキスト（監査用に保持） */
   rawResponse: string
+  /**
+   * 原則単位の判定。**optional。** 返ってこなくても review は失敗させない。
+   * 独立 Reviewer 側の判定なので、Design Review 側と突き合わせて disagreement を出せる。
+   */
+  appliedPrinciples?: AppliedPrinciple[]
 }
 
 export interface IReviewerAdapter {
@@ -52,6 +66,7 @@ export interface IReviewerAdapter {
 }
 
 interface ParsedReviewerResponse {
+  appliedPrinciples?: unknown
   verdict?: unknown
   summary?: unknown
   issues?: unknown
@@ -116,6 +131,7 @@ function buildReviewerResultFromParsedOutput(
   provider: ReviewerProvider,
   phase: ReviewPhase,
   raw: string,
+  principleSelection: readonly PrincipleSelection[] = [],
 ): ReviewerResult | undefined {
   if (!isReviewVerdict(parsed.verdict)) {
     return undefined
@@ -127,6 +143,7 @@ function buildReviewerResultFromParsedOutput(
     verdict: parsed.verdict,
     summary: typeof parsed.summary === 'string' ? parsed.summary : '(summary not provided)',
     issues: normalizeIssues(parsed.issues),
+    appliedPrinciples: normalizeAppliedPrinciples(parsed.appliedPrinciples, principleSelection),
     confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
       ? parsed.confidence
       : 0.5,
@@ -148,7 +165,23 @@ export function selectReviewerProvider(implementer: ImplementerProvider): Review
   }
 }
 
-export function buildReviewPrompt(req: ReviewerRequest): string {
+/**
+ * この review に適用する原則を選ぶ。
+ *
+ * **prompt と parse で同じ選択を使う**ため、`review()` 側で1回だけ呼んで両方へ渡すこと。
+ * 別々に選び直すと「promptへ載せた原則」と「記録した原則」がずれ得る。
+ */
+export function selectReviewPrinciples(req: ReviewerRequest): PrincipleSelection[] {
+  return selectPrinciples(
+    { predictedFocuses: req.targetFiles.flatMap(mapFileToFocuses) },
+    loadEngineeringPrinciples(),
+  )
+}
+
+export function buildReviewPrompt(
+  req: ReviewerRequest,
+  principleSelection: readonly PrincipleSelection[] = selectReviewPrinciples(req),
+): string {
   const targetFileList = req.targetFiles.map(file => `- ${file}`).join('\n')
   const constitutionPrinciples = loadConstitutionPrinciples()
   const constitutionPrinciplesWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
@@ -174,6 +207,8 @@ export function buildReviewPrompt(req: ReviewerRequest): string {
     'AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。',
     buildConstitutionPrinciplesPrompt(constitutionPrinciples),
     '',
+    buildApplicablePrinciplesSection(principleSelection),
+    '',
     '実装目的・タスク説明:',
     req.purposeSummary,
     '',
@@ -186,7 +221,8 @@ export function buildReviewPrompt(req: ReviewerRequest): string {
     '  "verdict": "approved" | "changes_requested" | "blocking",',
     '  "summary": "レビューの要約（日本語1-2文）",',
     '  "issues": [{ "severity": "info"|"warning"|"critical", "description": "..." }],',
-    '  "confidence": 0.0から1.0の数値',
+    '  "confidence": 0.0から1.0の数値,',
+    '  "appliedPrinciples": [{ "principleId": "上のApplicable Principlesのid", "verdict": "ALIGNED"|"CONFLICT"|"UNCERTAIN", "reason": "1文" }]',
     '}',
     '```',
   ].join('\n')
@@ -196,6 +232,7 @@ export function parseReviewerResponse(
   raw: string,
   provider: ReviewerProvider,
   phase: ReviewPhase,
+  principleSelection: readonly PrincipleSelection[] = [],
 ): ReviewerResult {
   const jsonBlockMatch = /```json\s*([\s\S]*?)\s*```/iu.exec(raw)
   const jsonText = jsonBlockMatch?.[1] ?? raw
@@ -207,7 +244,7 @@ export function parseReviewerResponse(
       return buildFailureResult(raw, provider, phase)
     }
 
-    return buildReviewerResultFromParsedOutput(parsed, provider, phase, raw)
+    return buildReviewerResultFromParsedOutput(parsed, provider, phase, raw, principleSelection)
       ?? buildFailureResult(raw, provider, phase)
   } catch {
     return buildFailureResult(raw, provider, phase)
@@ -216,14 +253,15 @@ export function parseReviewerResponse(
 
 export class GeminiReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {
-    const prompt = buildReviewPrompt(req)
+    const principleSelection = selectReviewPrinciples(req)
+    const prompt = buildReviewPrompt(req, principleSelection)
 
     try {
       const raw = await callGeminiWithFallback(prompt, {
         featureName: `approval-level-${req.phase}-review`,
       })
 
-      return parseReviewerResponse(raw, 'gemini', req.phase)
+      return parseReviewerResponse(raw, 'gemini', req.phase, principleSelection)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
 
@@ -251,7 +289,8 @@ const CODEX_REVIEWER_MODEL = 'gpt-5.6-sol'
 
 export class CodexReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {
-    const prompt = buildReviewPrompt(req)
+    const principleSelection = selectReviewPrinciples(req)
+    const prompt = buildReviewPrompt(req, principleSelection)
     const adapter = createAiCliAdapter({ provider: 'codex' })
 
     try {
@@ -304,10 +343,11 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
           'codex',
           req.phase,
           result.stdout,
+          principleSelection,
         ) ?? buildFailureResult(result.stdout, 'codex', req.phase)
       }
 
-      return parseReviewerResponse(result.stdout, 'codex', req.phase)
+      return parseReviewerResponse(result.stdout, 'codex', req.phase, principleSelection)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
 
@@ -377,7 +417,8 @@ export function extractClaudeCliResultText(stdout: string): string | undefined {
  */
 export class ClaudeReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {
-    const prompt = buildReviewPrompt(req)
+    const principleSelection = selectReviewPrinciples(req)
+    const prompt = buildReviewPrompt(req, principleSelection)
     const adapter = createAiCliAdapter({ provider: 'claude_code' })
 
     try {
@@ -421,7 +462,7 @@ export class ClaudeReviewerAdapter implements IReviewerAdapter {
         return buildFailureResult(result.stdout, 'claude', req.phase)
       }
 
-      return parseReviewerResponse(innerText, 'claude', req.phase)
+      return parseReviewerResponse(innerText, 'claude', req.phase, principleSelection)
     } catch (err) {
       // timeout（execFileSyncのETIMEDOUT等）もここに落ちる。
       const message = err instanceof Error ? err.message : String(err)

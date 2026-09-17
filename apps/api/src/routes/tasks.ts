@@ -179,11 +179,12 @@ function isTaskFailureJob(job: Job): job is TaskFailureJob {
 }
 
 export function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description' | 'allowedPaths'>, instruction: string): string {
+  const principles = loadEngineeringPrinciples()
   const designContract = buildDesignContract({
     slugs: selectPrincipleSlugs({
       predictedFocuses: (task.allowedPaths ?? []).flatMap(mapFileToFocuses),
-    }),
-    principles: loadEngineeringPrinciples(),
+    }, principles),
+    principles,
   })
 
   return `[Task] ${task.title}

@@ -16,7 +16,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
 import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
@@ -26,6 +26,7 @@ import type {
   ReconcileExternalCompletionResult,
 } from './interface'
 import type { TaskContinuation } from '@ai-team/shared'
+import type { PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleApplication, PrincipleApplicationInput, PrincipleDisagreementRow, PrincipleReviewStage, StrategicDecision } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
@@ -3990,6 +3991,233 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  /**
+ * 原則の適用・判定の記録。
+ *
+ * **集計はここで SQL として持つ。** 新しい metrics backend を作らない（CEO 指示 2026-09-17）。
+ * 書き込みは best-effort であり、重複は黙って捨てる。Review を止めないことを優先する。
+ */
+  /**
+   * 適用記録の集計。`aggregate` と `aggregateByVersion` の違いは GROUP BY だけなので、
+   * 絞り込み条件と率の計算をここ 1 か所に集約する（2 か所に書くと必ずずれる）。
+   */
+  function aggregatePrincipleApplications(
+    query: PrincipleAggregateQuery | undefined,
+    groupBy: string,
+  ): Array<PrincipleAggregateRow & { principleVersionHash?: string }> {
+    const conditions: string[] = []
+    const params: string[] = []
+    if (query?.projectId !== undefined) {
+      conditions.push('project_id = ?')
+      params.push(query.projectId)
+    }
+    if (query?.reviewStage !== undefined) {
+      conditions.push('review_stage = ?')
+      params.push(query.reviewStage)
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+    const rows = db.prepare(`
+      SELECT
+        principle_id AS principleId,
+        principle_version_hash AS principleVersionHash,
+        COUNT(*) AS applications,
+        SUM(CASE WHEN verdict = 'ALIGNED' THEN 1 ELSE 0 END) AS aligned,
+        SUM(CASE WHEN verdict = 'CONFLICT' THEN 1 ELSE 0 END) AS conflict,
+        SUM(CASE WHEN verdict = 'UNCERTAIN' THEN 1 ELSE 0 END) AS uncertain
+      FROM principle_applications
+      ${where}
+      GROUP BY ${groupBy}
+      ORDER BY applications DESC, principleId ASC
+    `).all(...params) as any[]
+
+    return rows.map((row) => {
+      const applications = Number(row.applications)
+      const conflict = Number(row.conflict)
+      const uncertain = Number(row.uncertain)
+      return {
+        principleId: String(row.principleId),
+        principleVersionHash: row.principleVersionHash === null ? undefined : String(row.principleVersionHash),
+        applications,
+        aligned: Number(row.aligned),
+        conflict,
+        uncertain,
+        // applications が 0 の行は GROUP BY からそもそも出ないが、0 除算を式で防いでおく。
+        conflictRate: applications === 0 ? 0 : conflict / applications,
+        uncertainRate: applications === 0 ? 0 : uncertain / applications,
+      }
+    })
+  }
+
+  const principleApplications: IPrincipleApplicationStorage = {
+    recordMany(entries) {
+      if (entries.length === 0) {
+        return 0
+      }
+
+      // 同じ run / stage / principle の二重計上を防ぐ。retry で run が再実行されても
+      // 適用数が水増しされないようにする（partial unique index がこれを保証する）。
+      //
+      // **OR IGNORE は CHECK 制約違反も黙って捨てる。** ここへ来る verdict / selection_source /
+      // review_stage は `normalizeAppliedPrinciples()` が enum を保証した値だけなので、
+      // CHECK 違反が起きるとすればそれは上流のコードバグである。その場合は挿入件数が
+      // 期待より少なくなり、呼び出し側が受け取る `recorded` に現れる（黙って成功扱いにはならない）。
+      const insert = db.prepare(`
+        INSERT OR IGNORE INTO principle_applications (
+          id, project_id, roadmap_item_id, task_id, principle_id, principle_version_hash,
+          selection_source, selection_reason, review_stage, verdict, review_run_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+
+      const createdAt = now()
+      const insertAll = db.transaction((rows: readonly PrincipleApplicationInput[]) => {
+        let inserted = 0
+        for (const row of rows) {
+          const info = insert.run(
+            randomUUID(),
+            row.projectId,
+            row.roadmapItemId ?? null,
+            row.taskId ?? null,
+            row.principleId,
+            row.principleVersionHash,
+            row.selectionSource,
+            row.selectionReason,
+            row.reviewStage,
+            row.verdict,
+            row.reviewRunId ?? null,
+            createdAt,
+          )
+          inserted += info.changes
+        }
+        return inserted
+      })
+
+      return insertAll(entries)
+    },
+
+    findAll() {
+      const rows = db.prepare(
+        'SELECT * FROM principle_applications ORDER BY created_at DESC, rowid DESC'
+      ).all() as any[]
+      return rows.map(deserializePrincipleApplication)
+    },
+
+    findByPrincipleId(principleId) {
+      const rows = db.prepare(
+        'SELECT * FROM principle_applications WHERE principle_id = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(principleId) as any[]
+      return rows.map(deserializePrincipleApplication)
+    },
+
+    aggregateByVersion(query) {
+      return aggregatePrincipleApplications(query, 'principle_id, principle_version_hash')
+        .map((row) => ({ ...row, principleVersionHash: String(row.principleVersionHash) }))
+    },
+
+    aggregate(query) {
+      return aggregatePrincipleApplications(query, 'principle_id')
+        .map(({ principleVersionHash: _ignored, ...row }) => row)
+    },
+
+    findDisagreements(query) {
+      const conditions: string[] = []
+      const params: string[] = []
+      if (query?.projectId !== undefined) {
+        conditions.push('project_id = ?')
+        params.push(query.projectId)
+      }
+      if (query?.reviewStage !== undefined) {
+        conditions.push('review_stage = ?')
+        params.push(query.reviewStage)
+      }
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+      // subject は task_id を第一候補にし、無ければ roadmap_item_id、さらに無ければ project_id。
+      // 「どの単位について判定が割れたか」を 1 列で表現する。
+      const rows = db.prepare(`
+        SELECT
+          principle_id AS principleId,
+          principle_version_hash AS principleVersionHash,
+          review_run_id AS reviewRunId,
+          project_id AS projectId,
+          COALESCE(task_id, roadmap_item_id, project_id) AS subjectId,
+          CASE
+            WHEN task_id IS NOT NULL THEN 'task'
+            WHEN roadmap_item_id IS NOT NULL THEN 'roadmap_item'
+            ELSE 'project'
+          END AS subjectKind,
+          review_stage AS reviewStage,
+          verdict AS verdict
+        FROM principle_applications
+        ${where}
+        ORDER BY principleId ASC, subjectId ASC, reviewStage ASC
+      `).all(...params) as any[]
+
+      const grouped = new Map<string, {
+        principleId: string
+        subjectKind: PrincipleDisagreementRow['subjectKind']
+        subjectId: string
+        reviewRunId: string | null
+        verdicts: PrincipleDisagreementRow['verdicts']
+      }>()
+
+      for (const row of rows) {
+        // **同一 review run の中でだけ突き合わせる。**
+        //
+        // run を key に入れないと、別々の Review で出た判定が「不一致」に見える。
+        // 実際には時間が違うだけで、2人の reviewer が同じものを見て割れたわけではない
+        // （独立レビュー指摘 2026-09-17 第2回）。run を跨がないので principle 版も自動的に揃う。
+        // run が無い行は突き合わせようがないので、後段で落とす。
+        // 版まで key に入れる。同一 run でも focused と independent は registry を別々に読むため、
+        // run の途中で spec が書き換わると**違う本文について**の判定を突き合わせ得る
+        // （独立レビュー指摘 2026-09-17 第4回）。同じ版を見た判定だけを比べる。
+        const key = `${row.principleId}\u0000${row.principleVersionHash}\u0000${row.reviewRunId}\u0000${row.subjectKind}\u0000${row.projectId}\u0000${row.subjectId}`
+        const existing = grouped.get(key)
+        const verdictEntry = {
+          reviewStage: row.reviewStage as PrincipleReviewStage,
+          verdict: row.verdict as StrategicDecision,
+        }
+        if (existing) {
+          existing.verdicts.push(verdictEntry)
+          continue
+        }
+        grouped.set(key, {
+          principleId: String(row.principleId),
+          subjectKind: row.subjectKind as PrincipleDisagreementRow['subjectKind'],
+          subjectId: String(row.subjectId),
+          reviewRunId: row.reviewRunId === null ? null : String(row.reviewRunId),
+          verdicts: [verdictEntry],
+        })
+      }
+
+      // **Reviewer disagreement は「別々の Review 工程が違う判定を出した」ことである。**
+      //
+      // 判定の種類が割れているだけでは足りない。同じ design stage の 2 回の run が
+      // ALIGNED と CONFLICT を出した場合、それは時間差であって reviewer 間の不一致ではない
+      // （独立レビュー指摘 2026-09-17）。stage が 2 種類以上あることを条件に加える。
+      return [...grouped.values()]
+        // run に紐づかない行は「同じ Review を見た」と言えないので突き合わせ対象にしない。
+        .filter((entry) => entry.reviewRunId !== null)
+        .filter((entry) => {
+          // **stage ごとに1つの判定へ畳んでから比べる。**
+          // verdict 種類と stage 種類を独立に数えると、design が 2 行（別 run）あるだけで
+          // 「stage も verdict も割れている」と誤検出する。
+          const byStage = new Map<string, Set<string>>()
+          for (const item of entry.verdicts) {
+            const bucket = byStage.get(item.reviewStage) ?? new Set<string>()
+            bucket.add(item.verdict)
+            byStage.set(item.reviewStage, bucket)
+          }
+          if (byStage.size < 2) {
+            return false
+          }
+          const representative = [...byStage.values()].map((verdicts) => [...verdicts].sort().join('|'))
+          return new Set(representative).size > 1
+        })
+        .map(({ reviewRunId: _runId, ...entry }) => entry)
+    },
+  }
+
   function generateKGNodeId(): string {
     const date = new Date().toISOString().slice(0, 10).replace(/-/g, '')
     const rows = db.prepare(
@@ -4477,7 +4705,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, supervisedRuns, gateEvaluations, auditLog, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, supervisedRuns, gateEvaluations, auditLog, principleApplications, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
   return storage
 }
 
@@ -4771,6 +4999,23 @@ function deserializeTaskContinuation(row: any): TaskContinuation {
     error: row.error ?? undefined,
     createdAt: row.created_at,
     completedAt: row.completed_at ?? undefined,
+  }
+}
+
+function deserializePrincipleApplication(row: any): PrincipleApplication {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    roadmapItemId: row.roadmap_item_id ?? undefined,
+    taskId: row.task_id ?? undefined,
+    principleId: row.principle_id,
+    principleVersionHash: row.principle_version_hash,
+    selectionSource: row.selection_source,
+    selectionReason: row.selection_reason,
+    reviewStage: row.review_stage,
+    verdict: row.verdict,
+    reviewRunId: row.review_run_id ?? undefined,
+    createdAt: row.created_at,
   }
 }
 

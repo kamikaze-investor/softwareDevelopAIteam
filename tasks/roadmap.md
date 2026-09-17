@@ -1554,6 +1554,12 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **将来の Model Router との関係**: Copilot より後段の provider routing は本項目では作らない。
       `role-model-registry` が Model Router の owner であり、そちらが実装された時点で
       **Meta Review の post-Copilot fallback もその適用対象とする**（同項目の受入条件に統合済み）。
+
+      **事象2（二点間 diff による phantom deletion）の実例も同時に観測した（2026-09-17）**:
+      PR #234 の1回目（base `7bd180a`）で Gemini は「follow-up 機能が削除されている」と指摘したが、
+      これは **#233 の追加を削除と読んだ phantom deletion** だった（PR の head が base より古く
+      二点間 diff になっていた）。最新 master へ rebase した2回目では**この指摘は消えた**。
+      したがって事象2 は rebase で回避でき、三点間 diff 化の優先度は下げてよい。
       大きなdiffで再現しやすい可能性はあるが、**現時点では断定しない**（PR #98は約4,300行）。
 
       **観測された事象2: 二点間diffによる phantom deletion で false BLOCKED**
@@ -1755,6 +1761,12 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       - Context不足等のSystem CauseをActor責任と誤認しない
       - 改善案は新規機能追加より既存機能改善を優先する
       - 過剰安全策・過剰レビュー自体もIncident候補として扱う
+
+      **2026-09-17 追記（重複防止）**: 原則自体の品質劣化シグナル
+      （CONFLICT 率・UNCERTAIN 率・Reviewer 判定不一致・未使用原則）も、
+      **本項目の Improvement Planner → CEO Proposal 経路を再利用する**。
+      `principle-quality-sensor-to-review` 側に別の改善エンジンを作らないこと。
+      入力元だけが違い（`principle_applications` table）、改善提案の作り方・出し方は同じである
       - この機能自身が大量token・大量LLMレビューを消費しない（全Jobへの追加LLMレビュー・
         全Taskの常時LLM再分析は行わない。既存ログ・既存レビュー結果の再利用を基本とする）
       - CEOへの通常Improvement Proposalは週1〜2件、Criticalのみ件数制限なし
@@ -4214,7 +4226,15 @@ Evolution等）— いずれも本セクション追加より前から記載済�
 - [ ] 効果検証可能性の原則の本格検討（MVP後の改善課題）: 改善・監視・レビュー・自動判定・最適化・
       安全化など、何かを良くする目的で仕組みを追加する場合は、後から客観データで効果を判断できる
       状態にする。ただしMVP段階では過剰な設計負荷を避け、まずは`review_observation.jsonl`による
-      観察データ蓄積を優先する（詳細は`docs/multi_ai_step_review_flow.md` 2-3章）
+      観察データ蓄積を優先する（詳細は`docs/multi_ai_step_review_flow.md` 2-3章）。
+
+      **2026-09-17 追記**: 本項目の「観察と言ったなら後から判断できる状態にする」という要求は、
+      機械可読な原則 `observation-closes-loop`（`specs/21`）として登録され、
+      core 原則として全 prompt に載るようになった（CEO 指示 2026-09-17）。
+      同原則は観察対象・計測値・発火条件・閾値・再評価条件・再評価先・Escalation 条件を
+      **同じ変更の中で**書くことを要求する。本項目はその原則の**適用先の整理**であって、
+      別の原則ではない。原則本体の管理は
+      「Principle 管理（Registry / 適用記録 / Review 統合）」節が担当する
 - [ ] Mobile: Dashboard/approvals間の画面遷移遅延の原因調査（E2E-4で発見。主要操作は
       ブロックしていないためMVP後のUX改善候補として保留）
 - [ ] Mobile: Dashboardの`ScrollView`＋大量ProjectCard＋N+1 fetch（Project毎にTask/Job取得）の
@@ -9015,6 +9035,201 @@ grep が 0 件であることによる）。
       1% / 5% / 20% の段階配信は**現時点では過剰**である可能性が高い。
       **本項目は「顧客が存在する前に段階配信基盤を作る」ことを意味しない。**
       着手条件は、外部利用者または複数 Project の同時利用が実際に発生することとする。
+
+---
+
+## Principle 管理（Registry / 適用記録 / Review 統合）（2026-09-17 CEO 指示）
+
+**CEO 指示（2026-09-17）**: 原則数が増えたため「毎回すべての原則を prompt へ貼る」方式をやめ、
+Task / changedFiles / risk / Roadmap item から**関連する原則を機械的に選択**し、**既存 Review で
+遵守確認**する。さらに適用履歴と Review 結果を蓄積し、**原則自体の品質改善**に使えるようにする。
+
+### 着手前に必ず読むこと: 既に動いているもの（2026-09-17 実測）
+
+**「contextual principle selection」は既に実装され、本番の prompt 経路で動いている。作り直さないこと。**
+下表は推測ではなく、各ファイルを実際に読んで確認した。
+
+| 要素 | 実体 | 状態 |
+|---|---|---|
+| 機械可読な原則本文 | `specs/21_outcome_oriented_generalization_principle.md` の `principle-id` / `principle-oneliner` マーカー | 稼働 |
+| Registry loader | `packages/shared/src/engineeringPrinciples.ts`（`PrincipleSlug` 11 件 + 失敗を隠さない `ok:false`） | 稼働 |
+| contextual selection | `selectPrincipleSlugs({ predictedFocuses, riskLevel })` | 稼働（下記 (1) の欠落あり） |
+| changedFiles → 選択signal | `mapFileToFocuses()`（`apps/worker/src/approvalLevel/focusSelector.ts`） | 稼働 |
+| prompt への注入 | `buildDesignContract()` → implement / resume / repair prompt | 稼働 |
+| Review 側への原則提示 | `buildEngineeringPrincipleReviewGuidance()` → `buildFocusedOutputContract()` | 稼働（下記 (2) の欠落あり） |
+| 判定語彙 | `StrategicDecision`（ALIGNED / CONFLICT / UNCERTAIN。`types/meta_review.ts`） | 稼働（focus 単位） |
+
+**実測で判明した欠落**（4 つの `selectPrincipleSlugs()` 呼び出し箇所すべてと Review 側を読んで確認した）:
+
+1. **`riskLevel` はどの呼び出し箇所からも渡されていない。** `RISK_PRINCIPLE_SLUGS`
+   （medium / high / critical）は定義されているが **production では一度も効いていない**。
+   `routes/tasks.ts:177` と `ctoAi/initialImplementWorkflow.ts:27` は `predictedFocuses` のみ、
+   `routes/jobs.ts:314` と `designReview/repairPromptBuilder.ts:162` は**引数なし**（= core 原則だけ）。
+   つまり repair prompt と `appendBaseDesignContract()` 経路には contextual selection が効いていない
+2. ~~**Review 側は contextual selection を使っていない。**~~ → **2026-09-17 解消。**
+   `buildFocusedOutputContract(selection)` が focus ごとの選択結果を受け取るようになり、
+   固定 3 件ではなくなった（`buildEngineeringPrincipleReviewGuidance()` の
+   finding category ヒント 3 件はそのまま残してある。役割が別なので削っていない）
+3. ~~**原則単位の判定が存在しない。**~~ → **2026-09-17 解消。**
+   `FocusedReviewResult.appliedPrinciples` / `IndependentReviewOutcome.appliedPrinciples` を追加。
+   判定語彙は `StrategicDecision` を再利用し、第二の enum を作っていない
+4. ~~**適用履歴が残らない。**~~ → **2026-09-17 解消。** `principle_applications` table を追加
+5. **原則が 5 ファイルに散っており、機械可読なのは 1 つだけ。**
+   `specs/21`（機械可読・id あり）/ `specs/00` 3.14〜3.18（`constitutionPrinciples.ts` が
+   **章まるごと本文を貼る**。id も選択も無い）/ `specs/20` / `specs/22`（どちらも機械可読化されていない）/
+   `CLAUDE.md` §3 Design Philosophy 8 件（機械が読まない）/
+   `docs/project_memory/design_philosophy.md` 7 件（`alignmentChecker.ts` の `DESIGN_DOCS_PATHS` が読む側）
+6. **`specs/21` は Roadmap に登録されていない。** PR #84 で item 無しに入り、
+   同ファイル末尾の `home-and-criteria` が自ら完了条件
+   （「full document を毎回貼るのではなく marker ID で選択されること」）を宣言しているのに、
+   その達成を追跡する先が無かった。**本節がその追跡先である。**
+
+### Source of Truth の決定（2026-09-17 CEO 指示。以後変更しない）
+
+**原則本文・定義は Git が正本。DB を正本にしない。**
+DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（rule 本文・severity・カテゴリ）は入れない。
+これは `supervised_runs` schema の D-2（「判定ロジックは DB に置かない。code 側 registry を引く
+キーと版だけを保存する」）と同じ形であり、新しい方針ではない。
+
+**二重正本を作らないこと。** 原則本文を DB・別 spec・Mobile 画面へコピーしない。
+記録側が持つのは `principle_id` と **version/hash** だけであり、本文は Git から引く。
+
+<!-- roadmap:id=principle-registry-and-compliance-ledger state=in_progress -->
+1. [ ] **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録** — 2026-09-17登録。
+      **2026-09-17 CEO 指示により Step 1 を実装済み。** 残りは下記「未了」のみ。
+
+      **実装済み（このブランチ）**:
+      - **Registry metadata の一般化** — 既存 marker 方式をそのまま拡張した。新しい Registry
+        ファイルは作っていない。追加 marker は `principle-category` / `principle-scope` /
+        `principle-tier` / `principle-tags` の 4 つで、**本文と同じ marker block に置く**ので
+        metadata 専用の第二の正本ができない。`principle-tier` は必須で、欠けていたら
+        黙って contextual へ倒さず `ok:false` で失敗する（core 原則が全 prompt から
+        消えたことに誰も気づけない状態を作らない）
+      - **core の二重正本を解消** — `BASE_PRINCIPLE_SLUGS`（TypeScript のハードコード配列）を廃止し、
+        `corePrincipleSlugs()` が `principle-tier: core` marker から導出する
+      - **版の導出** — `versionHash` を本文から算出（手書きの版番号を持たせない）。
+        CRLF / LF のチェックアウト差では変わらない
+      - **選択理由の構造化** — `selectPrinciples()` が `{ slug, versionHash, source, reason }` を返す。
+        `selection_source` / `selection_reason` を記録側が後から作文しない
+      - **Review 統合** — `buildFocusedOutputContract(selection)` に Applicable Principles を追加し、
+        `appliedPrinciples` を出力契約と JSON schema へ入れた。Independent Review 側も
+        `reviewerAdapter` の prompt / parse を同じ形で拡張した。**新しい Review workflow は作っていない**
+      - **`principle_applications` table** — 列は CEO 指定の最小形。`reviewer` / provider / model /
+        cost / prompt 全文は**持たない**（`review_run_id` から既存 review レコードを引ける）
+      - **集計** — `GET /api/principles/stats`。既存 SQLite への集計 SQL のみ。
+        新しい metrics backend も Dashboard も作っていない
+      - **E2E** — 選択 → prompt → 原則単位判定 → DB 保存 → 集計 → センサー発火を
+        `apps/api/src/principles/ledgerE2E.test.ts` で 1 本に通した（本番の coordinator を経由する）
+
+      **設計上の不変条件（変更するときはここを読むこと）**:
+      - **記録は Gate ではない。** `recordPrincipleApplications()` は例外を握って warn するだけで、
+        Review の判定を変えない。計測を足したことが新しい停止要因になってはならない
+      - **`appliedPrinciples` は required schema に入れない。** 原則判定が返らないことを
+        review の失敗にしない（`meta-review-structured-output-robustness` が解消するまでの
+        暫定ではなく、恒久的にこの方針とする）
+      - **聞いたのに答えなかった原則は UNCERTAIN として残す。** 消すと適用数が実態より少なくなり、
+        「一度も CONFLICT しない原則」という判断が甘く出る
+      - **複数 focus が同じ原則を判定したら強い方（CONFLICT > UNCERTAIN > ALIGNED）を残す。**
+        先勝ちにすると衝突を見逃す方向へ倒れる
+
+      **Independent Review（Codex / 2026-09-17）で直した実欠陥**:
+      初回実装は `changes_requested` だった。主張どおりでなかった点を直してある。
+      - **独立 Reviewer の原則判定が捨てられていた** — `runIndependentReview()` が
+        `ReviewerResult.appliedPrinciples` を `IndependentReviewOutcome` へ写していなかった。
+        結果 independent stage の行が 1 件も入らず、**stage 間 disagreement が構造的に常に空**だった
+      - **記録経路が Review を落とし得た** — `storage.tasks.findById` が ledger の try/catch の外
+        にあり、そこで投げると Reviewer 実行後・run 終端前に抜けて run が running のまま残った。
+        「記録は Gate ではない」という本項目の不変条件に反していた
+      - **disagreement が stage 差を要求していなかった** — 同じ design stage の 2 回の run で
+        判定が割れただけのものを不一致として数えていた（時間差であって reviewer 間の不一致ではない）
+      - **捏造された原則 id を永続化できた** — runner の JSON を registry 照合なしで保存していた。
+        ledger 側で registry に無い id を落とすようにした（信頼境界での検証）
+      - **registry キャッシュが無期限だった** — spec を書き換えてもプロセス再起動まで
+        古い tier と古い版 hash が使われ続けた。tier は prompt に載る原則を決めるので、
+        「古い文章で判定して新しい版として記録する」ことが起き得た。mtime + size で invalidate する
+      - **版 hash に tier が入っていなかった** — 文言を変えずに contextual → core へ上げると、
+        contextual として集めた実績がそのまま core 降格センサーの根拠になった。tier も hash 入力に含めた
+      - **センサーが版を跨いで数えていた** — 原則本文を書き換えても旧版の実績を引き継ぎ、
+        **今は存在しない文章についての実績**で降格を提案し得た。センサーは現在の版の行だけを数える
+
+      - **記録が fence の前だった** — claim を失った stale attempt の判定が先に入り、受理された
+        attempt の判定が `INSERT OR IGNORE` に弾かれ得た。両分岐とも fence 成功後に記録する
+      - **disagreement が run を跨いでいた** — 別々の Review で出た判定を不一致として数えていた。
+        同一 run・同一版の中でだけ、stage ごとに畳んでから比べる
+      - **版 hash の形式を検証していなかった** — `"x"` のような値でも記録でき、実在しない版の行が作れた
+      - **run id 無しで記録できた** — 重複排除 index は `review_run_id IS NOT NULL` にしか効かないため、
+        同じ結果を2回処理すると適用数が増えた。run id の無い記録は拒否する
+
+      Independent Review は計4ラウンド実施し、最終ラウンドの指摘3件も解消して `approved` を得た。
+      回帰テストは `apps/api/src/principles/independentReviewFindings.test.ts` に固定してある。
+
+      **Independent Review で指摘され、直さずに受容した制約**（いずれも本項目の scope 外か既存事象）:
+      - 候補パスの fallback が、壊れた primary を stale な secondary で覆い隠し得る。**既存挙動**。
+        本番の探索順では最初の候補が存在するため現状は発現しない
+      - `review_run_id` が NULL の行は重複排除されない。**現在の呼び出し元は必ず run.id を渡す**ので
+        実害は無いが、将来 meta stage を繋ぐときに再確認すること
+      - センサー発火の重複排除が check-then-insert で、`audit_log` に unique 制約が無い。
+        API プロセスが複数になったら重複し得る（現在は単一プロセス）
+      - `principle_applications` に保持期間が無い。件数が増えたときの集計コストは未測定
+      - 版 hash は one-liner だけでなく本文全体を含む。prompt に出るのは one-liner なので、
+        hash は「reviewer が見た bytes」ではなく**原則の版**を指す。意図どおりだが同一ではない
+      **未了**:
+      - **本番 DB migration は未実行。** schema 追加は `CREATE TABLE IF NOT EXISTS` と
+        index 追加なので、**merge して API が再起動した時点で適用される**。
+        DB migration は現行方針どおり **Class C** であり、
+        **merge / deploy の判断そのものが既存 CEO Gate にあたる**（CEO 指示 2026-09-17）。
+        本指示は DB migration 一般の Class B 化を意味しない
+      - **`specs/00` 3.14〜3.18 / `specs/20` / `specs/22` / Design Philosophy は未移設。**
+        意図的に `specs/21` の 11 件だけで通した。記録が実際に取れることを確かめてから範囲を広げる
+        （`constitutionPrinciples.ts` は今も章まるごと本文を貼っている）
+      - **`riskLevel` は Review 経路から渡していない。** Review 側が持つのは
+        `reviewLoad`（レビューの認知負荷）であって `MetaRiskLevel`（変更のリスク）ではなく、
+        **両者は別物なので読み替えなかった**。`selection_source='risk'` は
+        実装 prompt 側の経路用に残っている。ここを埋めるなら
+        `review-class-b-enhanced-ai-review` の Risk 5 次元と一緒に設計すること
+      - **`review_stage='meta'` は未配線。** enum には入れてあるが、
+        GitHub Actions 側の `autoReview.ts` は DB を持たない。必要になってから繋ぐ
+
+<!-- roadmap:id=principle-quality-sensor-to-review state=in_progress -->
+2. [ ] **原則自体の再Review候補を、適用記録から機械的に起こす** — 2026-09-17登録。
+      **2026-09-17 CEO 指示によりセンサー本体を実装済み。**
+
+      **CEO 指摘（2026-09-17）**: 当初この項目は `deferred` で登録していたが、
+      `observation-closes-loop` の「50 件で core 継続を再評価する」という条件は
+      **適用履歴が保存されないので 50 件到達を検出できない**状態だった。
+      これは今回採用した原則そのものに反する。よって履歴・センサー部分を
+      将来 TODO として `deferred` に置かず、Step 1 と同時に実装した。
+
+      **実装済み（`apps/api/src/principles/ledger.ts`）**:
+      - センサー1 `core-principle-never-conflicts`: core 原則について
+        `applications >= 50 AND conflict = 0 AND uncertain = 0` で
+        **core → contextual 降格の再Review候補**を発生させる
+      - センサー2 `principle-review-not-discriminating`: 全体で
+        `applications >= 200 AND conflict + uncertain = 0` のとき、
+        **原則管理方式そのもの**の再Review候補を発生させる。
+        「原則が完璧だから」と「Reviewer が原則を見ていないから」はこの数字だけでは
+        区別できないので、自動で何も変えずに候補として出す
+      - 評価タイミングは**記録直後**。新しい scheduler も cron も増やしていない。
+        新しいデータが入った瞬間だけが評価の必要なタイミングなので、これで閉ループになる
+      - 発火は `audit_log`（`entity_type='principle_sensor'`）へ **1 回だけ**記録する。
+        ここは高頻度の多次元集計ではなく「このセンサーは発火済みか」という 1 entity の問い合わせなので、
+        既存 `ix_audit_log_entity` にそのまま載る（適用記録を専用 table にした判断と矛盾しない）
+      - **原則は自動で書き換えない。** 再評価を発火させるところまでが責務である（CEO 指示）
+
+      **閾値は暫定値である（実データ 0 件の状態で決めたもの）**:
+      - `50`: CEO が 2026-09-17 に指定。「1 つの原則について降格を議論するに足る回数」であり、
+        観測された分布からの導出ではない
+      - `200`: 上の 4 倍。core 原則が 4 件あるため「core 全件がそれぞれ降格閾値に達した規模」を
+        機構全体の評価開始点にした。これも分布からの導出ではない
+      - **変更するときは、変更後の値だけでなく「どの実測を見てそう決めたか」を併記すること。**
+        定義と根拠は `PRINCIPLE_SENSOR_THRESHOLDS` の doc comment が正本
+
+      **未了**:
+      - **候補の受け皿がまだ `audit_log` の行と stats API だけである。**
+        `project-auto-incident-pattern-improvement` の Improvement Planner → CEO Proposal 経路が
+        実装されたら、そこへ繋ぐ。**別の改善エンジンを作らない**（同項目を参照。ここでは重複記述しない）
+      - **実データでの閾値見直しは未実施。** 判定が 100 件以上溜まってから分布を見る。
+        溜まる前に閾値を精密化しない
 
 ---
 

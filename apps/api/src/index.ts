@@ -15,6 +15,7 @@ import { approvalRoutes } from './routes/approvals'
 import { taskRoutes } from './routes/tasks'
 import { jobRoutes } from './routes/jobs'
 import { reviewRoutes, qaRoutes } from './routes/reviews'
+import { principleRoutes } from './routes/principles'
 import { ctoAiRoutes } from './routes/ctoAi'
 import { contextPackRoutes } from './routes/contextPack'
 import { developerAiRoutes } from './routes/developerAi'
@@ -88,6 +89,7 @@ app.register(taskContinuationRoutes, { prefix: '/api' })
 app.register(dashboardRoutes, { prefix: '/api' })
 app.register(approvalGateRoutes, { prefix: '/api' })
 app.register(knowledgeGraphRoutes, { prefix: '/api' })
+app.register(principleRoutes, { prefix: '/api' })
 app.register(healthRoutes, { prefix: '/api' })
 
 const PORT = Number(process.env.PORT) || 3000
