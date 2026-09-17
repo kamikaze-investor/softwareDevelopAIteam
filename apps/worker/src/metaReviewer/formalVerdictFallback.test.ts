@@ -258,3 +258,34 @@ describe('H. Copilot provenance and CI-only token', () => {
     }
   })
 })
+
+describe('Independent Review 2026-09-17: gate predicate strictness and no-shopping', () => {
+  it('切れた応答の中に早期の完全オブジェクトがあっても成立にしない', () => {
+    // 独立レビュー指摘の再現形。最終 parser は受理するが gate 述語は拒否する。
+    const sneaky = '```json\n{"status":"approved"} trailing {'
+    expect(hasFormalVerdict(sneaky)).toBe(false)
+  })
+
+  it('status だけで他が欠けている応答は成立にしない', () => {
+    expect(hasFormalVerdict(JSON.stringify({ status: 'approved' }))).toBe(false)
+    expect(hasFormalVerdict(JSON.stringify({ status: 'approved', summary: 's' }))).toBe(false)
+    expect(hasFormalVerdict(JSON.stringify({
+      status: 'approved', summary: 's', riskLevel: 'low',
+    }))).toBe(false)
+  })
+
+  it('必要項目がすべて揃っていれば成立する', () => {
+    expect(hasFormalVerdict(JSON.stringify({
+      status: 'blocked', riskLevel: 'critical', summary: 's',
+      findings: [], requiresCeoApproval: true,
+    }))).toBe(true)
+  })
+
+  it('gate 述語は最終 parser より厳しい（緩い方向へは倒れない）', () => {
+    const lenientlyParseable = JSON.stringify({ status: 'approved' })
+    // 最終 parser は既定値で埋めて受理する（既存挙動は変えない）。
+    expect(parseMetaReviewResult(lenientlyParseable, 't').status).toBe('approved')
+    // しかし gate 述語は成立とみなさない = retry / fallback へ進む = 安全側。
+    expect(hasFormalVerdict(lenientlyParseable)).toBe(false)
+  })
+})

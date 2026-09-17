@@ -159,8 +159,15 @@ async function main(): Promise<void> {
       console.log('   ℹ️  Gemini が失敗したため Copilot CLI（Microsoft系モデル）で審査しました')
     }
   } catch (err) {
-    console.error('❌ Meta Review プロバイダー呼び出しに失敗しました:', err)
     const failureClass = err instanceof MetaReviewProviderError ? err.failureClass : 'unknown'
+    // **raw の err をそのままログへ出さない。**
+    // copilotRouter は raw stderr/stdout をエラーメッセージへ含めるため、CI ログへ
+    // credential が echo され得る（独立レビュー指摘 2026-09-17。CI では GITHUB_TOKEN を
+    // copilot 子プロセスへ渡すようになったので、この経路の危険度が上がっている）。
+    console.error(
+      '❌ Meta Review プロバイダー呼び出しに失敗しました:',
+      sanitizeMessage(err instanceof Error ? err.message : String(err)),
+    )
     // PRコメントに載る finding.message は、MetaReviewProviderError 以外（Copilot フォールバック
     // 自体の失敗を含む。copilotRouter.ts は raw stderr/stdout をそのままエラーメッセージに含める）
     // も含めて必ず sanitizeMessage() を通す。geminiRouter.ts 内の診断情報は個別に sanitize 済みだが、

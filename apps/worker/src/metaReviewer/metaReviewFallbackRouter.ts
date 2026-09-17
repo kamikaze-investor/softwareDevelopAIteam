@@ -55,7 +55,7 @@ export async function reviewWithProviderFallback(
       ' Copilot CLI（Microsoft系モデル）にフォールバックします。'
     )
 
-    const raw = callCopilotForMetaReview(prompt, { usage: 'meta_review' })
+    const raw = callCopilotForMetaReview(prompt, { usage: 'meta_review', hasVerdict: validateResponse })
 
     // **Copilot にも同じ成功条件を適用する。** text が返っただけでは成立とみなさない。
     // ここで fail-open すると、Copilot の truncated / malformed 応答が

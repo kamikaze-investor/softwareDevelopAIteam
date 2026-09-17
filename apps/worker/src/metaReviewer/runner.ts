@@ -250,7 +250,52 @@ export function tryParseMetaReviewResult(
  * 使われないので、判定目的の呼び出しではプレースホルダで問題ない。
  */
 export function hasFormalVerdict(rawResponse: string): boolean {
-  return tryParseMetaReviewResult(rawResponse, 'verdict-probe') !== undefined
+  return findStrictVerdictObject(rawResponse) !== undefined
+}
+
+/**
+ * gate 述語のための**厳しい**判定。最終 parser（`parseMetaReviewResult`）の寛容さを流用しない。
+ *
+ * 独立レビュー指摘（2026-09-17）: `buildMetaReviewResult()` は status 以外を既定値で埋めるため、
+ * `{"status":"approved"} trailing {` のように**切れた応答の中に早期の完全オブジェクトが
+ * 含まれるだけ**でも「verdict 成立」と判定されてしまう。それでは truncated を弾くという
+ * 本修正の目的を果たせない。
+ *
+ * ここでは reviewer が実際に埋めるべきフィールドが**すべて揃っている**ことを要求する。
+ * **厳しすぎる方向は安全側である** — 不成立と判定すれば retry / fallback へ進み、
+ * 最終的に誰も verdict を出せなければ fail-closed BLOCK になるだけで、緩む方向には倒れない。
+ */
+function findStrictVerdictObject(rawResponse: string): Record<string, unknown> | undefined {
+  for (const jsonStr of extractJsonCandidates(rawResponse)) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(jsonStr)
+    } catch {
+      continue
+    }
+    if (!isRecord(parsed)) {
+      continue
+    }
+    if (!isMetaReviewStatus(parsed.status)) {
+      continue
+    }
+    // reviewer が省略しないはずの項目。1つでも欠けていれば「途中で切れた」可能性が高い。
+    if (!isMetaRiskLevel(parsed.riskLevel)) {
+      continue
+    }
+    if (typeof parsed.summary !== 'string' || parsed.summary.trim().length === 0) {
+      continue
+    }
+    if (!Array.isArray(parsed.findings)) {
+      continue
+    }
+    if (typeof parsed.requiresCeoApproval !== 'boolean') {
+      continue
+    }
+    return parsed
+  }
+
+  return undefined
 }
 
 /**

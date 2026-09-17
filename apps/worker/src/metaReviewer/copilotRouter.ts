@@ -84,6 +84,14 @@ export interface CopilotFallbackOptions {
    */
   usage?: string
   timeoutMs?: number
+  /**
+   * 応答が formal verdict を構成するか。
+   *
+   * 渡すと、**非0 exit でも stdout に成立した verdict があればそれを採用する**。
+   * 成立した BLOCKED を exit code だけで捨てて retry すると、後の attempt が
+   * APPROVED を返し得る = review shopping になる（独立レビュー指摘 2026-09-17）。
+   */
+  hasVerdict?: (raw: string) => boolean
   /** テストでの差し替え用。既定はAtomics.waitによる同期sleep。 */
   sleepImpl?: (ms: number) => void
 }
@@ -116,6 +124,7 @@ function attemptCopilotCall(
   model: string,
   usage: string,
   timeout: number,
+  hasVerdict?: (raw: string) => boolean,
 ): CopilotAttemptFailure | CopilotAttemptSuccess {
   // 呼び出しごとの使い捨て隔離ディレクトリ（bare tmpdir() は他ステップと共有されるため使わない）
   const isolatedCwd = mkdtempSync(path.join(tmpdir(), 'copilot-meta-review-'))
@@ -137,6 +146,11 @@ function attemptCopilotCall(
 
     const stdout = result.stdout ?? ''
     const stderr = result.stderr ?? ''
+
+    // **成立した verdict を exit code だけで捨てない**（独立レビュー指摘 2026-09-17）。
+    if (hasVerdict !== undefined && stdout.trim() && hasVerdict(stdout)) {
+      return { ok: true, stdout }
+    }
 
     if (result.error) {
       return { ok: false, errorMessage: `[copilotRouter] Copilot CLI 実行エラー（usage=${usage}）: ${result.error.message}` }
@@ -177,7 +191,7 @@ export function callCopilotForMetaReview(
 
   let lastErrorMessage = ''
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const outcome = attemptCopilotCall(prompt, model, usage, timeout)
+    const outcome = attemptCopilotCall(prompt, model, usage, timeout, options?.hasVerdict)
     if (outcome.ok) return outcome.stdout
 
     lastErrorMessage = outcome.errorMessage

@@ -386,6 +386,16 @@ function callCliOnce(
     const timedOut = result.signal !== null && result.signal !== undefined
     const rawText = [stderr, stdout, result.error?.message ?? ''].filter(Boolean).join(' ') || '(no output)'
 
+    // **成立した verdict を exit code だけで捨てない。**
+    //
+    // 独立レビュー指摘（2026-09-17）: 非0 exit でも stdout に完全な BLOCKED /
+    // CHANGES_REQUESTED が出ていることがあり、それを失敗として捨てると
+    // 次段・次 provider が APPROVED を返し得る = review shopping になる。
+    // 先に verdict の有無を見る。
+    if (validateResponse !== undefined && stdout.trim() && validateResponse(stdout)) {
+      return { ok: true, text: stdout, unavailable: false }
+    }
+
     if (result.status !== 0 || !stdout.trim()) {
       const failureClass = classifyFailure({ text: rawText, exitCode: result.status, timedOut })
       return {
