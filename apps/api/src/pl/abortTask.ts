@@ -218,6 +218,21 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     return { ok: true, status: 'parked', taskId: task.id }
   }
 
+  // 証明が及ぶのは、これから観測する workspace だけである。別の workingDir に取り残された行は
+  // その証明の外側にあるので、所有者として扱う（独立レビュー round 2）。
+  const provenDirs = new Set(owning.map((job) => job.safeCommand?.workingDir))
+  const outsideProof = staleCandidates.find((job) => !provenDirs.has(job.safeCommand?.workingDir))
+  if (outsideProof) {
+    return {
+      ok: false,
+      code: 'FOREIGN_BLOCKED_JOB',
+      reason:
+        `task ${outsideProof.taskId} has a blocked job (${outsideProof.id}) left over from a `
+        + `finished task in ${outsideProof.safeCommand?.workingDir}, which this cleanup would not `
+        + 'observe; refusing to park without proof for that workspace',
+    }
+  }
+
   // cleanup を要求する。**実体の掃除・観測は Worker の既存経路が行う。**
   const requestedAt = new Date().toISOString()
   for (const job of owning) {

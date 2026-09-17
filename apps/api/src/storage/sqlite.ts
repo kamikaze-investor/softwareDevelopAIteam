@@ -678,21 +678,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * この Project の blocked Job のうち、workspace を所有しているものを1つ返す。
    *
    * `blocked` を無条件に所有者と数えない代わりに、**観測なしで結論できるものだけ**を数える。
-   * done な Task に取り残された行は `includeStale` で呼び分ける:
+   * done な Task に取り残された行は「観測しないと決められない」ので、
+   * **どの workspace を証明したか**を `provenWorkingDir` で渡して呼び分ける:
    *
-   * - `includeStale=true` … workspace の観測が手に入らない経路（直接 park）。
-   *   取り残された行も所有者として扱う。手放したと言える根拠が無いため fail-closed。
-   * - `includeStale=false` … 同じ transaction で `knownGood`（worktree・index が clean、
-   *   進行中の git 操作なし、HEAD 有効、死角なし）を検証済みの経路。
-   *   その検証は Worker の「次の Task を始められる」条件より強いので、
-   *   取り残された行が所有者でないことも同時に証明されている。
+   * - `provenWorkingDir` 無し … workspace の観測が手に入らない経路（直接 park）。
+   *   取り残された行はすべて所有者として扱う。手放したと言える根拠が無いため fail-closed。
+   * - `provenWorkingDir` あり … 同じ transaction で `knownGood`（worktree・index が clean、
+   *   進行中の git 操作なし、HEAD 有効、死角なし）を検証済みの経路。その検証は Worker の
+   *   「次の Task を始められる」条件より強いので、取り残された行が所有者でないことも
+   *   同時に証明されている —— **ただし証明したのはその workingDir 1つだけである。**
+   *   別の workingDir に取り残された行については何も分かっていないので、所有者として扱う
+   *   （独立レビュー round 2: 証明は観測した workspace にしか効かない）。
    *
    * 判定の実体は `@ai-team/shared` 側の述語1箇所にある。SQL で書き直すと
    * quarantine の JSON 判定まで二重定義になるため、行を引いて述語へ渡す。
    */
   function findBlockedOwnerInProject(
     projectId: string,
-    options: { excludeTaskId?: string; includeStale: boolean },
+    options: { excludeTaskId?: string; provenWorkingDir?: string },
   ): { job: Job; task: Task } | undefined {
     const rows = db.prepare(
       "SELECT j.* FROM jobs j JOIN tasks t ON t.id = j.task_id "
@@ -705,7 +708,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       if (!taskRow) continue
       const task = deserializeTask(taskRow)
       if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
-      if (options.includeStale && isStaleBlockedJobCandidate(task, job)) return { job, task }
+      // ここへ来るのは stale 候補だけ。証明の及ぶ workspace のものだけを見逃す。
+      if (options.provenWorkingDir === undefined) return { job, task }
+      if (job.safeCommand?.workingDir !== options.provenWorkingDir) return { job, task }
     }
     return undefined
   }
@@ -2280,7 +2285,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `project still has job ${live.id} (${live.status}); refusing to park`,
             }
           }
-          const owner = findBlockedOwnerInProject(task.projectId, { includeStale: true })
+          // 直接 park は観測を1つも持たないので、証明の及ぶ workspace は無い。
+          const owner = findBlockedOwnerInProject(task.projectId, {})
           if (owner) {
             return {
               ok: false as const,
@@ -2379,23 +2385,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
 
-          // 他 Task が blocked Job で workspace を所有していないことも transaction 内で再確認する
-          // （stage 1 の `FOREIGN_BLOCKED_JOB` と同じ条件。判定から書き込みまでの間に
-          // 別 Task が所有者になっていたら park しても workspace は解放されない）。
-          const foreign = findBlockedOwnerInProject(task.projectId, {
-            excludeTaskId: task.id,
-            includeStale: false,
-          })
-          if (foreign) {
-            return {
-              ok: false as const,
-              code: 'PRECONDITION_FAILED' as const,
-              reason:
-                `task ${foreign.task.id} holds the workspace through blocked job ${foreign.job.id}; `
-                + 'refusing to park',
-            }
-          }
-
           // ── 観測の再検証。ここだけが所有権解放の根拠である ──
           if (!job.workspaceBaseline) {
             return {
@@ -2487,6 +2476,29 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason:
                 `job ${quarantinedSibling.id} is quarantined; clear the quarantine through the `
                 + 'existing path first',
+            }
+          }
+
+          // ── ここで初めて「この workspace は clean で、次の Task を始められる」が証明された ──
+          //
+          // 他 Task が blocked Job で workspace を所有していないことを transaction 内で再確認する
+          // （stage 1 の `FOREIGN_BLOCKED_JOB` と同じ条件。判定から書き込みまでの間に
+          // 別 Task が所有者になっていたら park しても workspace は解放されない）。
+          //
+          // **証明が及ぶのは、いま検証した Job の workingDir 1つだけである。** 別の workspace に
+          // 取り残された行については何も分かっていないので所有者として扱う
+          // （独立レビュー round 2）。
+          const foreign = findBlockedOwnerInProject(task.projectId, {
+            excludeTaskId: task.id,
+            provenWorkingDir: job.safeCommand?.workingDir,
+          })
+          if (foreign) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `task ${foreign.task.id} holds the workspace through blocked job ${foreign.job.id}; `
+                + 'refusing to park',
             }
           }
 
