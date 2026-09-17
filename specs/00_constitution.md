@@ -216,6 +216,31 @@ Developer AI / Reviewer AI への適用は `packages/shared/src/engineeringPrinc
 
 ---
 
+## 3.18 Safety / Approval Design Principle
+
+本原則は Safety / Approval 設計原則（`specs/22_safety_approval_design_principle.md`）を、Safety機構・Approval機構を
+**設計・変更するときの**共通原則として参照する。詳細な原則本文は同ファイルを正とし、本条には全文を複製しない。
+2026-09-17 CEO 指示により採用。
+
+要点のみ:
+
+- Human Approvalは通常のSafety mechanismではなく、**最後のSafety Boundary**として扱う。CEO判断はPolicy / Value /
+  irreversible decisionへ寄せる方向を目指す
+- Safetyは**多層防御**で作る（Isolation / Simulation / Mechanical Validation / Independent Multi-Model Review /
+  Test・E2E / Limited Rollout / Runtime Monitoring / Fast Rollback）。どれか1つを単独の根拠にしない
+- Riskは変更内容だけでなく、**Blast radius / Detectability / Recoverability / Irreversibility** も併せて評価する
+- AIが自己申告したrisk levelでGate・Review・Approval・Isolation・Rollout制限を弱めない
+- 高リスク変更ではRecoverabilityを**実装前に**確認し、Monitoringを**変更後のReview**として扱う
+- 実装は既存機構（Mandatory Gate / Review Load Classifier / Independent Review / Meta Review / Candidate・Stable /
+  E2E / Watchdog / State API / Recovery / Rollback / audit log）の改善・統合を優先し、新しいSafety subsystemを先に作らない
+
+**本条および `specs/22` は、それ自体では既存のGate・Approval・Guard・Permissionを弱めない。** 本ドキュメント1章の
+適用範囲注意がそのまま適用され、現行の運用ルールとの差分は `specs/22` 14章に「要調整・現行有効」として列挙される。
+3.6 Safety First・3.13 Risk-based Review・3.15 Autonomous Judgment を置き換えるものではなく、
+それらを**どの設計方向で強化するか**を定める。
+
+---
+
 # 4. 実装方針（MVP優先の原則）
 
 現在はMVP完成を最優先とする。
@@ -236,5 +261,6 @@ MVP開発中に、将来機能を先回りして大規模実装してはなら�
 - 将来のCore/Extension構造と現状マッピング: `specs/13_future_system_architecture.md`
 - VPS常駐運用の正本: `specs/11_runtime_environment.md`
 - AI利用量抑制方針: `specs/20_token_efficient_intelligence_policy.md`
+- Safety / Approval 設計原則（3.18の正本）: `specs/22_safety_approval_design_principle.md`
 - 既存の設計思想ドキュメント（第1〜3弾、要整理・将来統合検討）: `docs/AI_TEAM_OS_DESIGN.md`
 - MVP後の実装タスク: `tasks/roadmap.md`

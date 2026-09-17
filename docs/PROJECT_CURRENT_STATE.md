@@ -296,6 +296,9 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **隔離PoC（AIteamOS本体と非接続）**（state: deferred）
 - **PL Gateway設計（設計のみ・実装は本統合で行う）**（state: deferred）
 - **本統合（着手条件付き）**（state: deferred）
+- **高リスク変更の実行前に rollback path の存在を確認する**（state: deferred）
+- **dry-run が「実行を飛ばす」だけで simulation になっていない**（state: deferred）
+- **段階投入（feature flag / canary / 段階配信）が無い**（state: deferred）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
