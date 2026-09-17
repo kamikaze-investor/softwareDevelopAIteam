@@ -61,7 +61,7 @@ export async function reviewWithProviderFallback(
     // ここで fail-open すると、Copilot の truncated / malformed 応答が
     // Meta Review 結果として採用されてしまう。
     if (classifyVerdict !== undefined && classifyVerdict(raw) === 'none') {
-      console.log(`[metaReview] attempt ${JSON.stringify({
+      console.error(`[metaReview] attempt ${JSON.stringify({
         feature: 'meta_review', outcome: 'no_formal_verdict', stage: 'copilot_cli',
         provider: 'copilot', vendor: 'microsoft', model: DEFAULT_COPILOT_META_REVIEW_MODEL,
         transport: 'copilot_cli', responseChars: raw.length,
@@ -73,7 +73,7 @@ export async function reviewWithProviderFallback(
       )
     }
 
-    console.log(`[metaReview] attempt ${JSON.stringify({
+    console.error(`[metaReview] attempt ${JSON.stringify({
       feature: 'meta_review', outcome: 'formal_verdict', stage: 'copilot_cli',
       provider: 'copilot', vendor: 'microsoft', model: DEFAULT_COPILOT_META_REVIEW_MODEL,
       transport: 'copilot_cli', responseChars: raw.length,
