@@ -534,6 +534,99 @@ describe('独立レビュー2巡目の指摘に対する回帰固定（2026-09-1
   })
 })
 
+describe('follow-up 前提条件を層ごとに固定する（独立レビュー 2026-09-17）', () => {
+  /** queued Job を持つ parked Task を用意する。`jobs.project_id` は意図的に別 Project を名乗らせる。 */
+  function projectWithMislabelledLiveJob(): { storage: IStorage; projectId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const other = storage.projects.create({
+      name: 'other', goal: 'g', designPhilosophy: [], status: 'paused',
+    })
+    const parked = storage.tasks.create({
+      projectId: project.id, title: 'parked', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(parked.id, { roadmapActive: false })
+    // `POST /api/jobs` は caller 申告の projectId をそのまま保存するため、task の Project と
+    // 食い違う job が実在しうる。Worker は tasks を辿るので、これは claim され得る生きた仕事である。
+    storage.jobs.create({
+      taskId: parked.id, projectId: other.id, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    return { storage, projectId: project.id }
+  }
+
+  it('transaction 層: jobs.project_id が別 Project を名乗っていても、task 経由で生きた Job を検出する', () => {
+    const { storage, projectId } = projectWithMislabelledLiveJob()
+
+    const result = storage.tasks.syncRoadmapTasks({
+      projectId,
+      tasks: [{
+        roadmapTaskKey: 'first-item#2', title: 't', description: 'd', phase: 1,
+        assignee: 'developer_ai', category: 'implementation', dependencies: [],
+        acceptanceCriteria: ['x'], allowedPaths: ['apps/api/src/pl'],
+      }],
+      phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
+      requireNewTaskKeys: ['first-item#2'],
+      requireNoLiveJobs: true,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.failureReason).toContain('live job')
+  })
+
+  it('transaction 層: 生きた Job が無ければ通る', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+
+    const result = storage.tasks.syncRoadmapTasks({
+      projectId: project.id,
+      tasks: [{
+        roadmapTaskKey: 'first-item#2', title: 't', description: 'd', phase: 1,
+        assignee: 'developer_ai', category: 'implementation', dependencies: [],
+        acceptanceCriteria: ['x'], allowedPaths: ['apps/api/src/pl'],
+      }],
+      phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
+      requireNewTaskKeys: ['first-item#2'],
+      requireNoLiveJobs: true,
+      requireNoActiveTasks: true,
+      requireNoPendingContinuations: true,
+    })
+
+    expect(result.ok).toBe(true)
+  })
+
+  it('transaction 層: 占有している Task があれば通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const busy = storage.tasks.create({
+      projectId: project.id, title: 'busy', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(busy.id, { status: 'in_progress' })
+
+    const result = storage.tasks.syncRoadmapTasks({
+      projectId: project.id,
+      tasks: [{
+        roadmapTaskKey: 'first-item#2', title: 't', description: 'd', phase: 1,
+        assignee: 'developer_ai', category: 'implementation', dependencies: [],
+        acceptanceCriteria: ['x'], allowedPaths: ['apps/api/src/pl'],
+      }],
+      phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
+      requireNoActiveTasks: true,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.failureReason).toContain('active task')
+  })
+})
+
 describe('adoptRoadmapItem — fail-closed', () => {
   it('allowedPaths が空なら採用しない', async () => {
     const { storage, projectId } = makeStorage()

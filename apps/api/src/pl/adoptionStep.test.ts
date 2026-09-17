@@ -263,6 +263,38 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('not_available')
   })
 
+  it('parked Task が queued Job を持っていれば follow-up 候補にしない（分類器層）', () => {
+    // 分類器も seam と同じ条件で見る。ここだけ甘いと、PL が選んだ末に seam が拒否し
+    // 採用 attempt 予算を焼く。
+    const { storage, projectId } = projectWithExecutedItem()
+    const parked = storage.tasks.create({
+      projectId, title: 'parked', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(parked.id, { roadmapActive: false })
+    storage.jobs.create({
+      taskId: parked.id, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('not_available')
+  })
+
+  it('parked Task に生きた Job が無ければ follow-up 候補のまま（過剰拒否しない）', () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    const parked = storage.tasks.create({
+      projectId, title: 'parked', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(parked.id, { roadmapActive: false })
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('follow_up')
+  })
+
   it('candidate limit より前に follow-up を検出する', () => {
     const { storage, projectId } = projectWithExecutedItem()
 

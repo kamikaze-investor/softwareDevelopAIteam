@@ -875,8 +875,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         if (requireNoLiveJobs) {
           const placeholders = LIVE_JOB_STATUSES.map(() => '?').join(',')
+          // **Project との結び付きは `tasks` 経由で見る。**
+          // `jobs.project_id` は `POST /api/jobs` が caller の申告値をそのまま保存しており、
+          // `task.projectId` と一致する保証が無い（FK も task_id にしか無い）。
+          // Worker は tasks を辿って job を拾うので、そちらが権威ある関連付けである。
+          // 非正規化列で見ると、実際に claim される job を見落とす／無関係な job で誤って塞ぐ。
           const live = db.prepare(
-            `SELECT id, status FROM jobs WHERE project_id = ? AND status IN (${placeholders}) LIMIT 1`,
+            `SELECT jobs.id AS id, jobs.status AS status
+               FROM jobs JOIN tasks ON tasks.id = jobs.task_id
+              WHERE tasks.project_id = ? AND jobs.status IN (${placeholders})
+              LIMIT 1`,
           ).get(projectId, ...LIVE_JOB_STATUSES) as { id: string; status: string } | undefined
           if (live) {
             throw new Error(
