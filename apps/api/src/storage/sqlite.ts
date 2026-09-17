@@ -2453,7 +2453,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // ことであり、状態モデルが間違っているまま先へ進む場面そのものである。
           // 所有権は「安全だと分かったから解放する」ものであって、
           // 「危険だと言い切れないから解放する」ものではない（独立レビュー round 5 Finding 1）。
+          // **証明を結びつける先が読めないなら、そもそも解放しない。**
+          //
+          // `workingDir` が無い Job は「どの workspace の話なのか」を誰も言えない。
+          // 観測は必ずどこかの workspace で採られているので、その対応が付かない以上、
+          // 提示された観測がこの Job の workspace を表している保証がない。
+          // 兄弟の一致判定も undefined 同士が一致してしまい、意味を失う
+          // （独立レビュー: 対象 Job 側の workingDir 欠落が塞がれていなかった）。
           const workingDir = job.safeCommand?.workingDir
+          if (workingDir === undefined || workingDir === '') {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `job ${job.id} has no recorded workingDir, so an observation cannot be tied to `
+                + 'its workspace; ownership is retained (fail-closed)',
+            }
+          }
+
           const unproven = blockedSiblings.find((sibling) => (
             sibling.safeCommand?.workingDir !== workingDir
             || !sibling.workspaceBaseline

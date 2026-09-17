@@ -520,6 +520,36 @@ describe('abortTask — blocked Job を1本残さない', () => {
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
   })
 
+  // 観測は必ずどこかの workspace で採られている。対象 Job 側に workingDir が無いと、
+  // その観測がこの Job の workspace の話だという対応が付かない。
+  // （`jobs.update()` は `safe_command` を書かないので、この形は create 時にしか作れない。）
+  it('対象 Job に workingDir が無ければ park しない（証明の結び先が無い）', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'legacy', description: 'd', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    // 古い行はこの形で読めることがある（`SafeCommand.workingDir` は型上必須だが永続化は別）。
+    const legacyJob = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test' }, dryRun: false, workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(abortTask(storage, {
+      taskId: task.id, approvalRequestId: approve(storage, task.id), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'cleanup_requested' })
+
+    expect(completeAbortCleanup(storage, {
+      jobId: legacyJob.id, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+
+    expect(storage.jobs.findById(legacyJob.id)?.status).toBe('blocked')
+    expect(storage.tasks.findById(task.id)?.roadmapActive).toBe(true)
+  })
+
   it('baseline を持たない blocked Job が残っていれば park しない', () => {
     const fx = seed()
     const legacy = addSecondBlockedJob(fx, { workspaceBaseline: undefined })
