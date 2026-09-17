@@ -261,6 +261,14 @@ export interface IProjectStorage {
 
 export interface ITaskStorage {
   findByProjectId(projectId: string): Task[]
+  /**
+   * abort_task で park された Task か。**park 判定の唯一の定義**である。
+   *
+   * 既存 `audit_log` の `task_aborted` 行だけで判る（新しい flag も status も持たない）。
+   * sync の再活性化・attention 抑制・Job 生成・resume が同じ述語を使う。
+   * 場所ごとに別の park 判定を作ると、片方だけが park を尊重する状態になる。
+   */
+  isParked(taskId: string): boolean
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   /**
@@ -454,9 +462,22 @@ export interface IJobStorage {
     taskId: string
     /** Worker が今この瞬間に観測した workspace。baseline と同じ形式。 */
     observation: JobWorkspaceBaseline
+    /**
+     * 観測と同時に採った構造的事実。**baseline 一致だけでは所有権を解放しない。**
+     * HEAD と manifest が一致していても rebase / merge が進行中だったり、
+     * assume-unchanged / skip-worktree で観測に出ない変更が隠れていることがある。
+     * 既存 quarantine 解除経路と同じ材料を、同じ理由で要求する。
+     */
+    knownGood: {
+      gitOperationMarkers: string[]
+      worktreeClean: boolean
+      indexClean: boolean
+      headValid: boolean
+      blindSpotsAbsent: boolean
+    }
     /** audit に残す park 理由。 */
     reason: string
-    /** 承認の出所。audit に残す。 */
+    /** 承認の出所。transaction 内で束縛を再検証し、CONSUMED まで進める。 */
     approvalRequestId: string
   }): ReleaseBlockedJobAndParkTaskResult
   clearWorkspaceQuarantine(input: {

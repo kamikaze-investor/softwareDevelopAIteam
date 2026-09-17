@@ -313,7 +313,12 @@ export function buildSystemState(
       // ただし parent Task が park 済みなら、それを解消できる者はいない。
       // 出し続けると PL は毎 tick それを見て何もできず、attention が永久に消えない —
       // done な Task の blocked Job を除外している既存の判断と同じ理由である。
-      const parentIsParked = task.roadmapActive !== true && task.status !== 'done'
+      // **park だけを対象にする。** `roadmapActive === false` は sync による非活性化や
+      // 手動 Task でも起きるので、それらの attention まで消してはならない
+      // （独立レビュー Finding 6）。park 判定は storage の唯一の述語を使う。
+      const parentIsParked = task.roadmapActive !== true
+        && task.status !== 'done'
+        && storage.tasks.isParked(task.id)
 
       const hasMovableJob = jobs.some((job) => (
         job.status === 'queued' || job.status === 'running' || job.status === 'blocked'

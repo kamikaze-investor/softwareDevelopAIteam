@@ -29,4 +29,10 @@ describe('isWorkerRouteAllowed', () => {
   it('Task continuation reconcile を許可する（Worker poll cycle が唯一の起動契機）', () => {
     expect(isWorkerRouteAllowed('POST', '/api/task-continuations/reconcile')).toBe(true)
   })
+
+  // 無いと credential split 有効な production で 403 になり、abort_task の
+  // 段階操作が第2段へ進めない（Worker の観測報告が唯一の起動契機である）。
+  it('abort cleanup の観測報告を許可する', () => {
+    expect(isWorkerRouteAllowed('POST', '/api/jobs/:id/abort-cleanup-result')).toBe(true)
+  })
 })

@@ -1026,7 +1026,9 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
         console.warn(
           `[Worker] Job ${requested.id} の workspace を観測できませんでした（park は成立しません）`,
         )
-        return true
+        // **通常の Job intake は止めない。** ここで true を返すと、観測が失敗し続ける限り
+        // Worker が毎 poll で intake を飛ばし、park とは無関係な Job まで止まる。
+        return false
       }
 
       console.log(`[Worker] Job ${requested.id} の workspace を観測し、abort cleanup 結果を報告します`)
@@ -1036,7 +1038,13 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
           {
             method: 'POST',
             headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
-            body: JSON.stringify({ observation: observed.observation }),
+            // 観測と一緒に採った構造的事実も送る。**判定は API が行う。**
+            // Worker 側で「安全だ」と判断して送る材料を絞ると、API は
+            // 進行中の git 操作や観測に出ない変更を見られなくなる。
+            body: JSON.stringify({
+              observation: observed.observation,
+              knownGood: observed.knownGood,
+            }),
           },
         )
         if (!response.ok) {
@@ -1044,9 +1052,13 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
           console.warn(
             `[Worker] Job ${requested.id} の abort cleanup は成立しませんでした: HTTP ${response.status}`,
           )
+          // 成立しなかった poll では intake を飛ばさない。403（allowlist 漏れ等）や
+          // 恒久的な不一致が続いても、Worker 全体は止まらない。
+          return false
         }
       } catch (err: unknown) {
         console.warn(`[Worker] abort cleanup 報告エラー: ${formatUnknownError(err)}`)
+        return false
       }
       return true
     }

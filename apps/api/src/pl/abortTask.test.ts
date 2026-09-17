@@ -8,6 +8,15 @@ import { abortTask, completeAbortCleanup } from './abortTask'
 const FUTURE = new Date(Date.now() + 60 * 60 * 1000).toISOString()
 const BASELINE: JobWorkspaceBaseline = { mode: 'clean', startCommitHash: '0805249b' }
 
+/** 進行中の git 操作も観測できない変更も無い、という Worker からの報告。 */
+const KNOWN_GOOD = {
+  gitOperationMarkers: [] as string[],
+  worktreeClean: true,
+  indexClean: true,
+  headValid: true,
+  blindSpotsAbsent: true,
+}
+
 interface Fixture {
   storage: IStorage
   projectId: string
@@ -34,9 +43,9 @@ function seed(): Fixture {
   return { storage, projectId: project.id, taskId: task.id, jobId: job.id }
 }
 
-function approve(storage: IStorage, taskId: string): string {
+function approve(storage: IStorage, taskId: string, action = 'abort_task'): string {
   const request = storage.approvalRequests.create({
-    taskId, requestedAction: 'abort', riskLevel: 'HIGH',
+    taskId, requestedAction: action, riskLevel: 'HIGH',
     targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
     changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
     status: 'WAITING_FOR_USER', expiresAt: FUTURE,
@@ -51,7 +60,9 @@ function parkFully(fx: Fixture): void {
     taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: '別の項目を先に進める',
   })
   if (!requested.ok || requested.status !== 'cleanup_requested') throw new Error('expected cleanup_requested')
-  const done = completeAbortCleanup(fx.storage, { jobId: fx.jobId, observation: BASELINE })
+  const done = completeAbortCleanup(fx.storage, {
+    jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+  })
   if (!done.ok) throw new Error(`cleanup failed: ${done.reason}`)
 }
 
@@ -88,6 +99,18 @@ describe('abortTask — 段階1: 前提条件と承認', () => {
 
     expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId: request.id, reason: 'r' }))
       .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+  })
+
+  it('別 action の承認は流用できない（approval は task 単位で出るため action 束縛が要る）', () => {
+    const fx = seed()
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId,
+      approvalRequestId: approve(fx.storage, fx.taskId, 'git_commit'),
+      reason: 'r',
+    })).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+    expect(fx.storage.jobs.findById(fx.jobId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
   })
 
   it('別 Task の承認は流用できない', () => {
@@ -181,6 +204,7 @@ describe('abortTask — 段階2: 観測の再検証と所有権解放', () => {
     const result = completeAbortCleanup(fx.storage, {
       jobId: fx.jobId,
       observation: { mode: 'clean', startCommitHash: 'deadbeef' },
+      knownGood: KNOWN_GOOD,
     })
 
     expect(result).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
@@ -192,7 +216,9 @@ describe('abortTask — 段階2: 観測の再検証と所有権解放', () => {
   it('要求されていない Job の所有権は解放できない', () => {
     const fx = seed()
 
-    const result = completeAbortCleanup(fx.storage, { jobId: fx.jobId, observation: BASELINE })
+    const result = completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })
 
     expect(result).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
     expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
@@ -220,6 +246,155 @@ describe('abortTask — 段階2: 観測の再検証と所有権解放', () => {
   })
 })
 
+describe('abortTask — 承認と対象の束縛', () => {
+  it('他 Task が blocked Job で workspace を所有していれば park しない（fail-closed）', () => {
+    const fx = seed()
+    // 対象 Task 側には解放すべき Job が無い状態にして、他 Task の所有だけを残す。
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    const other = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'owner', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    fx.storage.jobs.create({
+      taskId: other.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'FOREIGN_BLOCKED_JOB' })
+  })
+
+  it('他 Task の blocked Job には cleanup を要求しない（承認の流用を作らない）', () => {
+    const fx = seed()
+    const other = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'other', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const otherJob = fx.storage.jobs.create({
+      taskId: other.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const result = abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    expect(result).toMatchObject({ ok: true, status: 'cleanup_requested', jobIds: [fx.jobId] })
+    expect(fx.storage.jobs.findById(otherJob.id)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
+  })
+
+  it('承認は park で使い切られ、二度目には使えない', () => {
+    const fx = seed()
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+
+    expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' }))
+      .toMatchObject({ ok: true, status: 'parked' })
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('CONSUMED')
+
+    // 同じ承認で別 Task を park できない。
+    const second = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'second', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    expect(abortTask(fx.storage, { taskId: second.id, approvalRequestId, reason: 'r' }))
+      .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
+    expect(fx.storage.tasks.findById(second.id)?.roadmapActive).toBe(true)
+  })
+
+  it('cleanup 要求後に承認が失効していれば park しない', () => {
+    const fx = seed()
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })
+
+    // CEO が承認を取り消した / 期限切れになった、に相当する。
+    fx.storage.approvalRequests.updateStatus(approvalRequestId, 'REJECTED')
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+})
+
+describe('abortTask — 観測の検証は baseline 一致だけではない', () => {
+  it('進行中の git 操作が残っていれば park しない', () => {
+    const fx = seed()
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    const result = completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId,
+      observation: BASELINE,
+      knownGood: { ...KNOWN_GOOD, gitOperationMarkers: ['rebase-merge'] },
+    })
+
+    expect(result).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  it('観測に出ない変更が否定できなければ park しない', () => {
+    const fx = seed()
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: { ...KNOWN_GOOD, blindSpotsAbsent: false },
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  it('段階操作の途中で Task が動き出していたら park しない', () => {
+    const fx = seed()
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    // in_progress / blocked は roadmapActive に関係なく占有と数えられるため、
+    // ここで park しても PL は解放されない。「park できたのに進めない」を作らない。
+    fx.storage.tasks.update(fx.taskId, { status: 'in_progress' })
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+})
+
+describe('abortTask — park した Task を別経路で再武装させない', () => {
+  it('resume は park された Task を進めない', () => {
+    const fx = seed()
+    parkFully(fx)
+
+    const resumed = fx.storage.jobs.resumeBlockedTask({
+      taskId: fx.taskId, instructionPrompt: 'continue',
+    })
+
+    expect(resumed.ok).toBe(false)
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
+  })
+
+  it('park 判定は audit にもとづく（roadmapActive=false だけでは park ではない）', () => {
+    const fx = seed()
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+
+    fx.storage.tasks.update(fx.taskId, { roadmapActive: false })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+
+    fx.storage.tasks.update(fx.taskId, { roadmapActive: true })
+    parkFully(fx)
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(true)
+  })
+})
+
 describe('abortTask — park 後は PL を止めない', () => {
   it('currentTask から外れ、blocked 履歴の attention も出なくなる', () => {
     const fx = seed()
@@ -235,6 +410,17 @@ describe('abortTask — park 後は PL を止めない', () => {
     expect(after.attention.some((i) => i.kind === 'job_blocked' && i.taskId === fx.taskId)).toBe(false)
     // **事実は残る。** Job 行は消えていない。
     expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
+  })
+
+  it('park ではない非活性 Task の attention は消さない', () => {
+    const fx = seed()
+    // sync による非活性化や手動 Task はここに入る。park していないので
+    // blocked Job は依然「誰かが対応できる」ものであり、attention を消してはならない。
+    fx.storage.tasks.update(fx.taskId, { roadmapActive: false })
+
+    const state = buildSystemState(fx.storage)
+
+    expect(state.attention.some((i) => i.kind === 'job_blocked' && i.taskId === fx.taskId)).toBe(true)
   })
 })
 
@@ -258,6 +444,34 @@ describe('abortTask — sync が park を取り消さない', () => {
     expect(result.ok).toBe(true)
     expect(result.reactivatedTaskIds).not.toContain(fx.taskId)
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
+  })
+
+  it('Job 履歴が無いまま park された Task も再活性化されない', () => {
+    // 解放すべき Job が無い経路（その場で park）。この Task は Job を1つも持たないため、
+    // sync の「未着手 Task」分岐へ入る。そこが park を踏み越えると、park が黙って取り消される。
+    const fx = seed()
+    const bare = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'stuck one', description: 'd', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 1,
+      roadmapTaskKey: 'bare-item', allowedPaths: ['apps/api/src/pl'], acceptanceCriteria: ['x'],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    // 対象 Task の blocked Job が project の workspace を持っていると park を拒否するので外す。
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+
+    expect(abortTask(fx.storage, {
+      taskId: bare.id, approvalRequestId: approve(fx.storage, bare.id), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'parked' })
+    expect(fx.storage.jobs.findByTaskId(bare.id)).toHaveLength(0)
+
+    const result = fx.storage.tasks.syncRoadmapTasks({
+      projectId: fx.projectId,
+      tasks: [spec('some-item'), { ...spec('bare-item') }],
+      phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
+    })
+
+    expect(result.ok).toBe(true)
+    expect(result.reactivatedTaskIds).not.toContain(bare.id)
+    expect(fx.storage.tasks.findById(bare.id)?.roadmapActive).toBe(false)
   })
 
   it('park されていない非活性 Task の既存再活性化は変えていない', () => {

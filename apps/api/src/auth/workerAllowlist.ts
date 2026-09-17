@@ -21,6 +21,10 @@ export const WORKER_ALLOWLIST: readonly WorkerAllowlistEntry[] = [
   { method: 'PATCH', url: '/api/jobs/:id' },
   { method: 'PATCH', url: '/api/jobs/:id/fail-if-running' },
   { method: 'PATCH', url: '/api/jobs/:id/clear-quarantine' },
+  // abort_task の cleanup は Worker の観測報告が唯一の起動契機である。
+  // これが無いと credential split 有効な production では 403 になり、
+  // 段階操作が第2段へ進めないまま Task が永久に park されない。
+  { method: 'POST', url: '/api/jobs/:id/abort-cleanup-result' },
   { method: 'GET', url: '/api/permission-grants' },
   { method: 'PATCH', url: '/api/permission-grants/:id/use' },
   { method: 'POST', url: '/api/gate/check' },

@@ -669,7 +669,80 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  /**
+   * abort_task で park された Task か。**park 判定はここ1箇所だけ**である。
+   *
+   * 既存 `audit_log` の `task_aborted` 行を見るだけで、新しい列も flag も持たない。
+   * `roadmapActive === false` は park 以外（sync による非活性化・手動 Task）でも起きるため、
+   * それを park と同一視してはならない。
+   */
+  function isParkedTaskId(taskId: string): boolean {
+    const row = db.prepare(
+      "SELECT 1 FROM audit_log WHERE entity_type = 'task' AND entity_id = ? "
+      + "AND operation = 'task_aborted' AND result = 'success' LIMIT 1",
+    ).get(taskId)
+    return row !== undefined
+  }
+
+  /**
+   * park を確定させる直前に、承認が**いまも**この操作を許しているかを確かめ、使い切る。
+   *
+   * ApprovalRequest は Task 単位で発行されるため、target 束縛だけでは
+   * 「この Task の何かを承認した」以上の意味を持たない。**action 名まで一致を要求する。**
+   * Gate 判定（stage 1）と park 確定（stage 2）は別 request なので、その間に
+   * 失効・取り消し・別用途での消費が起きていないことをここで再確認する。
+   *
+   * 使い切りは既存の一回限り承認契約（`ApprovalGateStatus.CONSUMED`）そのままで、
+   * 新しい承認種別も新しい遷移も足していない。
+   */
+  function verifyAndConsumeAbortApproval(
+    taskId: string,
+    approvalRequestId: string,
+  ): { ok: true } | { ok: false; reason: string } {
+    const row = db.prepare('SELECT * FROM approval_requests WHERE id = ?').get(approvalRequestId) as any
+    if (!row) {
+      return { ok: false, reason: `approval request ${approvalRequestId} does not exist` }
+    }
+    const request = deserializeApprovalRequest(row)
+    if (request.taskId !== taskId) {
+      return {
+        ok: false,
+        reason:
+          `approval request ${approvalRequestId} is bound to task ${request.taskId}, not ${taskId}`,
+      }
+    }
+    if (request.requestedAction !== 'abort_task') {
+      return {
+        ok: false,
+        reason:
+          `approval request ${approvalRequestId} approved "${request.requestedAction}", not "abort_task"`,
+      }
+    }
+    if (request.status !== 'APPROVED') {
+      return { ok: false, reason: `approval request ${approvalRequestId} is ${request.status}` }
+    }
+    // 壊れた期限値を「未失効」として通さない（NaN <= now は false になるため明示的に弾く）。
+    const expiresAtMs = new Date(request.expiresAt).getTime()
+    if (!Number.isFinite(expiresAtMs)) {
+      return { ok: false, reason: `approval request ${approvalRequestId} has an unreadable expiry` }
+    }
+    if (expiresAtMs <= Date.now()) {
+      return { ok: false, reason: `approval request ${approvalRequestId} has expired` }
+    }
+
+    const consumed = db.prepare(
+      "UPDATE approval_requests SET status = 'CONSUMED' WHERE id = ? AND status = 'APPROVED'",
+    ).run(approvalRequestId)
+    if (consumed.changes !== 1) {
+      return { ok: false, reason: `approval request ${approvalRequestId} changed concurrently` }
+    }
+    return { ok: true }
+  }
+
   const tasks: ITaskStorage = {
+    isParked(taskId) {
+      return isParkedTaskId(taskId)
+    },
     findByProjectId(projectId) {
       const rows = db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as any[]
       return rows.map(deserializeTask)
@@ -1067,6 +1140,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           const taskJobs = jobsByTaskId.get(existingTask.id) ?? []
           const isUnstarted = taskJobs.length === 0 && existingTask.status === 'pending'
 
+          // **park された Task は sync で現役へ戻さない。** abort_task は Job が1つも無い
+          // Task も park できるため、この判定を「未着手」分岐より先に行わないと、
+          // Job 履歴の無い park が次の sync で黙って取り消される（独立レビュー Finding 5）。
+          // spec の同期そのものは続ける。park は「現役から外れている」だけで、
+          // Roadmap 項目の内容が古いままでよい理由にはならない。
+          const parked = isParkedTaskId(existingTask.id)
+
           if (isUnstarted) {
             dependencyUpdateKeys.add(roadmapTask.roadmapTaskKey)
 
@@ -1077,7 +1157,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               existingTask.assignee !== roadmapTask.assignee ||
               !sameStringArray(existingTask.allowedPaths, roadmapTask.allowedPaths) ||
               !sameStringArray(existingTask.acceptanceCriteria, roadmapTask.acceptanceCriteria) ||
-              existingTask.roadmapActive !== true
+              (!parked && existingTask.roadmapActive !== true)
 
             if (specChanged) {
               tasks.update(existingTask.id, {
@@ -1087,26 +1167,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 assignee: roadmapTask.assignee,
                 allowedPaths: roadmapTask.allowedPaths,
                 acceptanceCriteria: roadmapTask.acceptanceCriteria,
-                roadmapActive: true,
+                ...(parked ? {} : { roadmapActive: true }),
               })
               updatedTaskIdSet.add(existingTask.id)
             }
             continue
           }
 
-          if (!existingTask.roadmapActive) {
-            // **abort_task で park された Task だけは再活性化しない。**
-            // sync が黙って現役へ戻すと park が無意味になる（CEO 指示・2026-09-17）。
-            // 「park されたか」は既存 `audit_log` の `task_aborted` で判る。
-            // **新しい flag も status も足さない。** sync で非活性化されただけの Task を
-            // 仕様一致で戻す既存挙動（"reactivates inactive locked tasks"）はそのまま残す。
-            const parked = db.prepare(
-              "SELECT 1 FROM audit_log WHERE entity_type = 'task' AND entity_id = ? AND operation = 'task_aborted' LIMIT 1",
-            ).get(existingTask.id)
-            if (!parked) {
-              tasks.update(existingTask.id, { roadmapActive: true })
-              reactivatedTaskIds.push(existingTask.id)
-            }
+          if (!existingTask.roadmapActive && !parked) {
+            // sync で非活性化されただけの Task を仕様一致で戻す既存挙動
+            // （"reactivates inactive locked tasks"）はそのまま残す。
+            // park された Task だけを除外する（CEO 指示・2026-09-17）。
+            tasks.update(existingTask.id, { roadmapActive: true })
+            reactivatedTaskIds.push(existingTask.id)
           }
         }
 
@@ -2002,6 +2075,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, reason: `Latest job status is ${latestJob.status}, not blocked` }
         }
 
+        // **park された Task は resume しない。** abort_task は Task を done にせず
+        // 現役から外すだけなので、最新 Job は blocked / failed のまま残る。
+        // ここを塞がないと、park した Task が既存の resume 経路から新しい Job を得て
+        // そのまま走り出す（独立レビュー Finding 7）。park の解除は CEO の判断であり、
+        // resume の副作用として起きてよいものではない。
+        if (isParkedTaskId(taskId)) {
+          return {
+            ok: false,
+            reason: 'This task was parked by abort_task; resuming it would silently un-park it',
+          }
+        }
+
         // PR-C Tranche 3: workspace quarantine は fail-closed に resume を拒否する。
         // 最新Jobだけを見ず、このTaskの**任意の**未解除quarantine Jobから判定する
         // （quarantine は `running -> blocked` と同一transactionで一度だけ設定され、解除機構はない）。
@@ -2125,11 +2210,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (!taskRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Task not found' }
           const task = deserializeTask(taskRow)
 
-          if (task.status === 'done' || task.roadmapActive !== true) {
+          // stage 1 の前提（pending / roadmapActive）を transaction 内で作り直す。
+          // `occupiesProject()` は in_progress / blocked を roadmapActive に関係なく占有と数えるため、
+          // それ以外の status で park しても PL から外れず、「park したのに進めない」状態になる。
+          if (task.status !== 'pending' || task.roadmapActive !== true) {
             return {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
-              reason: `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; nothing to park`,
+              reason:
+                `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; `
+                + 'parking only takes effect for a pending, roadmap-active task',
             }
           }
 
@@ -2144,6 +2234,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               code: 'PRECONDITION_FAILED' as const,
               reason: `project still has job ${holding.id} (${holding.status}); refusing to park`,
             }
+          }
+
+          const approval = verifyAndConsumeAbortApproval(task.id, input.approvalRequestId)
+          if (!approval.ok) {
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
           tasks.update(task.id, { roadmapActive: false })
@@ -2204,11 +2299,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `job ${job.id} is quarantined; clear the quarantine through the existing path first`,
             }
           }
-          if (task.status === 'done' || task.roadmapActive !== true) {
+          // stage 1 の前提を transaction 内で作り直す。段階操作の間に Task が
+          // in_progress / blocked へ動いていると、`occupiesProject()` は roadmapActive に
+          // 関係なくそれを占有と数えるため、park しても PL は解放されない —
+          // 「park したのに進めない」状態を成功として返さない（独立レビュー Finding 8）。
+          if (task.status !== 'pending' || task.roadmapActive !== true) {
             return {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
-              reason: `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; nothing to park`,
+              reason:
+                `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; `
+                + 'parking only takes effect for a pending, roadmap-active task',
             }
           }
 
@@ -2241,6 +2342,38 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 `the observed workspace does not match job ${job.id}'s baseline; `
                 + 'ownership is retained (fail-closed)',
             }
+          }
+
+          // baseline 一致だけでは足りない。HEAD と manifest が一致していても、
+          // rebase / merge が途中で止まっていたり、assume-unchanged / skip-worktree で
+          // observation に出ない変更が隠れていることがある。既存 quarantine 解除経路が
+          // `knownGood` を要求しているのと同じ理由で、ここでも要求する
+          // （独立レビュー Finding 4）。所有権の解放は quarantine 解除より重い操作である。
+          const knownGood = input.knownGood
+          if (
+            knownGood.gitOperationMarkers.length > 0
+            || !knownGood.worktreeClean
+            || !knownGood.indexClean
+            || !knownGood.headValid
+            || !knownGood.blindSpotsAbsent
+          ) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `job ${job.id}'s workspace is not provably known-good `
+                + `(git operations: ${knownGood.gitOperationMarkers.join(', ') || 'none'}, `
+                + `worktreeClean=${knownGood.worktreeClean}, indexClean=${knownGood.indexClean}, `
+                + `headValid=${knownGood.headValid}, blindSpotsAbsent=${knownGood.blindSpotsAbsent}); `
+                + 'ownership is retained (fail-closed)',
+            }
+          }
+
+          // 承認は**この Task**へ束縛されていなければならない。Job から Task を導く経路なので、
+          // ここを通さないと別 Task 向けの承認で park が通る（独立レビュー Finding 2）。
+          const approval = verifyAndConsumeAbortApproval(task.id, input.approvalRequestId)
+          if (!approval.ok) {
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
           // ── 解放 → park → audit。すべて同じ transaction ──

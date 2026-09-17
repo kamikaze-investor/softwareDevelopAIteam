@@ -68,6 +68,7 @@ export type AbortTaskResult =
       | 'TASK_NOT_PARKABLE'
       | 'TASK_NOT_ACTIVE'
       | 'LIVE_JOB_PRESENT'
+      | 'FOREIGN_BLOCKED_JOB'
       | 'JOB_QUARANTINED'
       | 'NOT_AUTHORIZED'
       | 'PARK_FAILED'
@@ -143,8 +144,27 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   }
 
   // ── 所有権を保持する Job を**サーバ側が**特定する。caller は Job を指定できない ──
-  const owning = projectTasks.flatMap((candidate) =>
-    storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(job)))
+  //
+  // 対象は**この Task の Job だけ**である。他 Task の blocked Job にこの Task の承認で
+  // 印を付けると、その承認で別 Task が park できてしまう（独立レビュー Finding 2）。
+  const owning = storage.jobs.findByTaskId(task.id).filter((job) => holdsWorkspaceOwnership(job))
+
+  // 他 Task が workspace を所有したままなら park しても workspace は解放されない。
+  // 既存 `parkTask()` の前提（project に blocked Job が無いこと）と揃えて fail-closed にする。
+  const foreign = projectTasks
+    .filter((candidate) => candidate.id !== task.id)
+    .flatMap((candidate) =>
+      storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(job)))
+  if (foreign.length > 0) {
+    return {
+      ok: false,
+      code: 'FOREIGN_BLOCKED_JOB',
+      reason:
+        `task ${foreign[0].taskId} still holds the workspace through blocked job ${foreign[0].id}; `
+        + 'resolve that task through the existing resume / fail path first '
+        + '(parking this task would not release the workspace)',
+    }
+  }
 
   const quarantined = owning.find((job) => job.failureMetadata?.quarantined === true)
   if (quarantined) {
@@ -196,7 +216,17 @@ export type CompleteAbortCleanupResult =
  */
 export function completeAbortCleanup(
   storage: IStorage,
-  input: { jobId: string; observation: JobWorkspaceBaseline },
+  input: {
+    jobId: string
+    observation: JobWorkspaceBaseline
+    knownGood: {
+      gitOperationMarkers: string[]
+      worktreeClean: boolean
+      indexClean: boolean
+      headValid: boolean
+      blindSpotsAbsent: boolean
+    }
+  },
 ): CompleteAbortCleanupResult {
   const job = storage.jobs.findById(input.jobId)
   if (!job) return { ok: false, code: 'NOT_FOUND', reason: `Job ${input.jobId} does not exist` }
@@ -211,10 +241,13 @@ export function completeAbortCleanup(
     }
   }
 
+  // taskId は Job から導くが、**承認がその Task に束縛されているか**は
+  // `releaseBlockedJobAndParkTask()` が transaction 内で検証する。ここでは決めない。
   const released = storage.jobs.releaseBlockedJobAndParkTask({
     jobId: job.id,
     taskId: job.taskId,
     observation: input.observation,
+    knownGood: input.knownGood,
     reason: metadata.abortReason ?? 'abort_task',
     approvalRequestId: metadata.abortApprovalRequestId,
   })
