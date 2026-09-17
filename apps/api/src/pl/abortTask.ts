@@ -43,7 +43,7 @@
  * dirty なまま残った blocked Job の revert は別責務（Finding）として分離する。
  */
 
-import { isLiveJob } from '@ai-team/shared'
+import { holdsWorkspaceWhenBlocked, isLiveJob } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import type { Job, JobWorkspaceBaseline } from '@ai-team/shared'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
@@ -76,9 +76,16 @@ export type AbortTaskResult =
     details?: unknown
   }
 
-/** 所有権を保持している（= park の妨げになる）Job か。 */
-function holdsWorkspaceOwnership(job: Job): boolean {
-  return job.status === 'blocked'
+/**
+ * 所有権を保持している（= park の妨げになる）Job か。
+ *
+ * **`blocked` であることと所有していることは同じではない。** done な Task に残る blocked 行は
+ * 履歴であって所有者ではない、というのが既存 `findWorkspaceOwningTaskId()` の判定である。
+ * ここで独自に「blocked なら所有者」と決めていたため、2026-09-17 の Operational E2E では
+ * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
+ */
+function holdsWorkspaceOwnership(task: { status: string }, job: Job): boolean {
+  return holdsWorkspaceWhenBlocked(task, job)
 }
 
 export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskResult {
@@ -147,14 +154,14 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   //
   // 対象は**この Task の Job だけ**である。他 Task の blocked Job にこの Task の承認で
   // 印を付けると、その承認で別 Task が park できてしまう（独立レビュー Finding 2）。
-  const owning = storage.jobs.findByTaskId(task.id).filter((job) => holdsWorkspaceOwnership(job))
+  const owning = storage.jobs.findByTaskId(task.id).filter((job) => holdsWorkspaceOwnership(task, job))
 
   // 他 Task が workspace を所有したままなら park しても workspace は解放されない。
   // 既存 `parkTask()` の前提（project に blocked Job が無いこと）と揃えて fail-closed にする。
   const foreign = projectTasks
     .filter((candidate) => candidate.id !== task.id)
     .flatMap((candidate) =>
-      storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(job)))
+      storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(candidate, job)))
   if (foreign.length > 0) {
     return {
       ok: false,

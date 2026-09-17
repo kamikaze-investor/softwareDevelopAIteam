@@ -6,7 +6,7 @@
  * → IStorage インターフェースを実装した別クラスに切り替えるだけでよい
  */
 
-import { LIVE_JOB_STATUSES, OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
+import { holdsWorkspaceWhenBlocked, LIVE_JOB_STATUSES, OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
@@ -667,6 +667,33 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).all()
       return rows.map(deserializeProject)
     },
+  }
+
+  /**
+   * この Project で **まだ workspace を所有している** blocked Job を1つ返す。
+   *
+   * `blocked` を無条件に所有者と数えない。done な Task に残る blocked 行は履歴であって
+   * 所有者ではない、というのが既存 `findWorkspaceOwningTaskId()` の判定であり、
+   * 判定の実体は `holdsWorkspaceWhenBlocked()`（`@ai-team/shared`）1箇所にある。
+   * SQL で書き直すと quarantine の JSON 判定まで二重定義になるため、行を引いて述語へ渡す。
+   */
+  function findBlockedOwnerInProject(
+    projectId: string,
+    excludeTaskId?: string,
+  ): { job: Job; task: Task } | undefined {
+    const rows = db.prepare(
+      "SELECT j.* FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status = 'blocked'",
+    ).all(projectId) as any[]
+    for (const row of rows) {
+      const job = deserializeJob(row)
+      if (excludeTaskId !== undefined && job.taskId === excludeTaskId) continue
+      const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(job.taskId) as any
+      if (!taskRow) continue
+      const task = deserializeTask(taskRow)
+      if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
+    }
+    return undefined
   }
 
   /**
@@ -2228,15 +2255,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
 
           // 所有権を保持する Job も live Job も残っていないことを transaction 内で再確認する。
-          const holding = db.prepare(
+          const live = db.prepare(
             "SELECT j.id AS id, j.status AS status FROM jobs j JOIN tasks t ON t.id = j.task_id "
-            + "WHERE t.project_id = ? AND j.status IN ('queued','running','blocked') LIMIT 1",
+            + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
           ).get(task.projectId) as { id: string; status: string } | undefined
-          if (holding) {
+          if (live) {
             return {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
-              reason: `project still has job ${holding.id} (${holding.status}); refusing to park`,
+              reason: `project still has job ${live.id} (${live.status}); refusing to park`,
+            }
+          }
+          const owner = findBlockedOwnerInProject(task.projectId)
+          if (owner) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `project still has job ${owner.job.id} (blocked); refusing to park`,
             }
           }
 
@@ -2333,16 +2368,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // 他 Task が blocked Job で workspace を所有していないことも transaction 内で再確認する
           // （stage 1 の `FOREIGN_BLOCKED_JOB` と同じ条件。判定から書き込みまでの間に
           // 別 Task が所有者になっていたら park しても workspace は解放されない）。
-          const foreign = db.prepare(
-            "SELECT j.id AS id, j.task_id AS taskId FROM jobs j JOIN tasks t ON t.id = j.task_id "
-            + "WHERE t.project_id = ? AND j.task_id != ? AND j.status = 'blocked' LIMIT 1",
-          ).get(task.projectId, task.id) as { id: string; taskId: string } | undefined
+          const foreign = findBlockedOwnerInProject(task.projectId, task.id)
           if (foreign) {
             return {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
               reason:
-                `task ${foreign.taskId} holds the workspace through blocked job ${foreign.id}; `
+                `task ${foreign.task.id} holds the workspace through blocked job ${foreign.job.id}; `
                 + 'refusing to park',
             }
           }

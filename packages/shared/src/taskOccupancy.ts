@@ -39,6 +39,30 @@ export function isLiveJob(job: { status: string }): boolean {
 }
 
 /**
+ * **その blocked Job はまだ workspace を所有しているか。**
+ *
+ * `apps/worker/src/index.ts` の `findWorkspaceOwningTaskId()` が昔からこの意味で
+ * 所有者を決めている: blocked Job は原則として workspace を保有するが、
+ * **Task が `done` になった後に残っている blocked 行は履歴であって所有者ではない**
+ * （quarantine されている行だけは例外で、安全と証明されるまで保有し続ける）。
+ *
+ * 旧 blocked 行を残すのは既存設計（`resumeBlockedGitCommitJob.test.ts` が固定している）なので、
+ * 行を消すのではなく所有権の述語でだけ区別する。
+ *
+ * **この意味を使う側が自前で書き直さないこと。** 2026-09-17 の Operational E2E で、
+ * `abort_task` が「blocked なら所有者」と独自に判定していたために、
+ * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
+ */
+export function holdsWorkspaceWhenBlocked(
+  task: { status: string },
+  job: { status: string; failureMetadata?: { quarantined?: boolean } | null },
+): boolean {
+  if (job.status !== 'blocked') return false
+  if (job.failureMetadata?.quarantined === true) return true
+  return task.status !== 'done'
+}
+
+/**
  * 上と同じ判定を SQL で書いたもの。`tasks` テーブルへの WHERE 断片。
  *
  * **`occupiesProject()` と必ず同じ意味にすること。** 片方だけ変えると、

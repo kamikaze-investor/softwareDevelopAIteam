@@ -13,6 +13,7 @@
  */
 
 import type { Job, Project, ReviewResult, Task } from '@ai-team/shared'
+import { holdsWorkspaceWhenBlocked } from '@ai-team/shared'
 import {
   assertTransition,
   reconcileRunningJob,
@@ -167,11 +168,9 @@ export type WorkspaceOwnership =
  * 「安全と証明できない限り所有権を解放しない」を優先し、worktree が clean でも保持する。
  */
 function isStaleBlockedJobOfFinishedTask(task: Task, job: Job): boolean {
-  return (
-    job.status === 'blocked' &&
-    task.status === 'done' &&
-    job.failureMetadata?.quarantined !== true
-  )
+  // 判定の実体は `@ai-team/shared` の `holdsWorkspaceWhenBlocked()` に置いてある。
+  // API 側（`abort_task`）が同じ意味を必要とするため、定義を1つにした。
+  return job.status === 'blocked' && !holdsWorkspaceWhenBlocked(task, job)
 }
 
 /**
