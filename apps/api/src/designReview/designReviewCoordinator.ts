@@ -31,7 +31,9 @@ import {
 } from '@ai-team/shared'
 import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { IStorage, DesignReviewRun } from '../storage/interface'
+import type { AppliedPrinciple } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { recordPrincipleApplications } from '../principles/ledger'
 
 /** bounded attempt。超過したrunはrequeueせずfailedで終端する。 */
 export const DESIGN_REVIEW_MAX_ATTEMPTS = 3
@@ -116,6 +118,77 @@ export interface RawStrategicResult {
 }
 
 export type RecomputedDecision = 'ALIGNED' | 'CONFLICT' | 'UNCERTAIN' | 'REVIEW_UNAVAILABLE'
+
+/**
+ * Review 1 回分の原則判定を ledger へ渡す。
+ *
+ * `RawStrategicResult` のフィールドは `unknown` なので、ここで narrowing する。
+ * **形が想定と違えば静かに 0 件として扱う。** 記録が取れないことと Review の失敗は別事象であり、
+ * 片方をもう片方に巻き込まない。
+ */
+/**
+ * **この関数全体が try で囲われていること自体が不変条件である。**
+ *
+ * `recordPrincipleApplications()` の内部 catch だけでは足りない: その手前の Task 参照や
+ * narrowing で投げると、Reviewer 実行後・run 終端前に `executeDesignReviewRun` を抜けてしまい、
+ * claim した run が running のまま取り残される（独立レビュー指摘 2026-09-17）。
+ * 記録は Gate ではないので、ここで起きたことが Review の結果を変えてはならない。
+ */
+function recordPrincipleApplicationsForRun(
+  storage: IStorage,
+  run: DesignReviewRun,
+  raw: RawStrategicResult,
+): void {
+  try {
+    recordPrincipleApplicationsForRunUnsafe(storage, run, raw)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    console.warn('[designReview] principle ledger recording failed (review unaffected): ' + reason)
+  }
+}
+
+function recordPrincipleApplicationsForRunUnsafe(
+  storage: IStorage,
+  run: DesignReviewRun,
+  raw: RawStrategicResult,
+): void {
+  // roadmap kind の subjectId は projectId そのもの（design_review_runs schema のコメント参照）。
+  // task kind は Task から projectId を引く。引けなければ記録しない — projectId を捏造しない。
+  const task = run.reviewKind === 'task' && run.taskId !== undefined
+    ? storage.tasks.findById(run.taskId)
+    : undefined
+  const projectId = run.reviewKind === 'roadmap' ? run.subjectId : task?.projectId
+
+  if (projectId === undefined) {
+    return
+  }
+
+  recordPrincipleApplications(
+    storage,
+    {
+      projectId,
+      taskId: task?.id,
+      roadmapItemId: task?.roadmapTaskKey,
+      reviewRunId: run.id,
+    },
+    {
+      focusedReviewResults: Array.isArray(raw.focusedReviewResults)
+        ? raw.focusedReviewResults.map(toAppliedPrincipleCarrier)
+        : [],
+      independentReviewResult: toAppliedPrincipleCarrier(raw.independentReviewResult),
+    },
+  )
+}
+
+/** `appliedPrinciples` を持ち得るオブジェクトだけを取り出す。それ以外は undefined。 */
+function toAppliedPrincipleCarrier(value: unknown): { appliedPrinciples?: AppliedPrinciple[] } | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined
+  }
+
+  const applied = (value as { appliedPrinciples?: unknown }).appliedPrinciples
+  return Array.isArray(applied) ? { appliedPrinciples: applied as AppliedPrinciple[] } : undefined
+}
 
 export interface RecomputeOutcome {
   decision: RecomputedDecision
@@ -590,6 +663,14 @@ export async function executeDesignReviewRun(
 
   const outcome = recomputeDecision(raw, run.reviewKind, changedFiles)
 
+  // **記録は fence を通った後にだけ行う。**
+  //
+  // ここで先に書くと、claim を失った stale attempt の判定が先に入り、
+  // 受理された attempt の判定が `INSERT OR IGNORE` に弾かれる
+  // （同じ run.id なので unique index が後勝ちを許さない）。
+  // 結果として **Review が採用しなかった判定が ledger に残る**（独立レビュー指摘 2026-09-17 第2回）。
+  // ALIGNED でない結果も記録したいので、両方の分岐の fence 直後に置く。
+
   if (outcome.decision !== 'ALIGNED') {
     if (execution.stderr) {
       console.warn(`[designReview] runner stderr (decision=${outcome.decision}): ${execution.stderr}`)
@@ -604,6 +685,7 @@ export async function executeDesignReviewRun(
     if (!fenced) {
       return { status: 'stale' }
     }
+    recordPrincipleApplicationsForRun(storage, run, raw)
     return { status: 'not_aligned', decision: outcome.decision, error: outcome.rejectedReason }
   }
 
@@ -621,6 +703,8 @@ export async function executeDesignReviewRun(
   if (!evidence) {
     return { status: 'stale' }
   }
+
+  recordPrincipleApplicationsForRun(storage, run, raw)
 
   return { status: 'evidence_registered', decision: 'ALIGNED', evidence }
 }

@@ -299,6 +299,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **高リスク変更の実行前に rollback path の存在を確認する**（state: deferred）
 - **dry-run が「実行を飛ばす」だけで simulation になっていない**（state: deferred）
 - **段階投入（feature flag / canary / 段階配信）が無い**（state: deferred）
+- **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**（state: in_progress）
+- **原則自体の再Review候補を、適用記録から機械的に起こす**（state: in_progress）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
