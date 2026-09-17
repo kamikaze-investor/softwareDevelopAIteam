@@ -1512,6 +1512,48 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       失敗するケースがある**（PR #98 の1回目の実行では、ownership/quarantine機構に対する肯定的で
       具体的な講評が応答内に出力された後、parse段で失敗している）。PR #98では3回連続で再現した。
       同一failureへの blind retrigger は provider quota を浪費するだけで解消しない。
+
+      **【2026-09-17 訂正・原因確定・修正済み】事象1の記述「fenced JSON を返すと parser が失敗する」は誤りだった。**
+
+      実測で否定された。`extractJsonCandidates()` は ```json フェンス / ``` フェンス /
+      前後に散文がある場合をすべて処理できる（`parseMetaReviewResult()` を直接叩いて確認）。
+      **フェンス正規化は既に実装済みで、そこを直しても何も変わらない。**
+
+      **実際の機構は 2 つ**:
+      1. **応答の切り捨て（非決定的）** — PR #234 / probe #236 で応答 773〜848 文字、
+         末尾が文字列の途中で切れる（閉じ引用符・閉じ波括弧・閉じフェンスなし）。
+         ただし probe #237 では **prompt 187,878 文字の完全な diff で応答 2,087 文字が完結し APPROVED**。
+         つまり閾値ではなく**確率**であり、「大規模 diff は分割必須」とは言えない
+      2. **責務境界のずれ** — `metaReviewFallbackRouter.ts` は
+         `callGeminiWithFallback` が throw しない限り成功として返し、parse は
+         `autoReview.ts` で **chain の外**で行われていた。よって truncated / malformed でも
+         fallback へ戻れず、その場で fail-closed BLOCK していた。
+         fallback 条件が狭いのではなく、**成功判定の位置が間違っていた**
+
+      **修正（2026-09-17。CEO 明示指示により CONTROL REPOSITORY を編集。`geminiClient.ts` は強制 Guard 対象のため不変）**:
+      - provider attempt の成功条件を「text が返った」から
+        **「valid な formal verdict が成立した」**へ変更（`validateResponse` を router へ注入）
+      - 不成立は既存 taxonomy の `transient` として、**既存の bounded retry → 次 stage → Copilot** へ流す。
+        新しい retry 機構・routing subsystem・chunking は作っていない
+      - **判定の中身では分岐しない。** APPROVED / CHANGES_REQUESTED / BLOCKED はどれも成立で chain 終了。
+        review shopping は構造的に起きない（回帰テストで固定）
+      - agy が PATH に無ければ spawn せず skip（実測: CI は毎回 `spawnSync agy ENOENT`）
+
+      **Copilot fallback は CI で認証できていなかった（2026-09-17 実測）。**
+      2026-08-28 の `7b5fc2c` で production の認証を ai-team の保存済み OAuth credential へ
+      一本化した際、**GitHub Actions の使い捨て runner には該当 credential が無い**ままだった
+      （`No authentication information found.`）。quota 枯渇が起きていなかったため誰も気づかなかった。
+      GitHub Actions のときだけ job token を渡すよう修正し、**CI で認証成功を実測**
+      （`AUTH_OK`、model `mai-code-1.1-flash`）。**PAT は復活させていない。**
+
+      **観測（既存 CI ログのみ。新 Telemetry backend なし）**: `[metaReview] attempt {...}` を
+      成功・不成立の両方で出す。段 / provider / model / failureClass / prompt 長 / 応答長を含み、
+      応答本文・prompt 本文・token は出さない。これにより Meta Review 総数 / 段別失敗数 /
+      truncation 件数 / Copilot fallback 発動数・成功数 / 最終 BLOCK 数を後から数えられる。
+
+      **将来の Model Router との関係**: Copilot より後段の provider routing は本項目では作らない。
+      `role-model-registry` が Model Router の owner であり、そちらが実装された時点で
+      **Meta Review の post-Copilot fallback もその適用対象とする**（同項目の受入条件に統合済み）。
       大きなdiffで再現しやすい可能性はあるが、**現時点では断定しない**（PR #98は約4,300行）。
 
       **観測された事象2: 二点間diffによる phantom deletion で false BLOCKED**
@@ -5965,6 +6007,15 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
       本項目は `failure-explanation-pregeneration`（Explainer）の前提でもある。
 
       **新規サブシステムではなく、既に散在している設定を1箇所へ引き上げる作業**である。
+
+      **受入条件に統合（2026-09-17）**: **Meta Review の post-Copilot fallback も本 Router の適用対象とする。**
+      現在の Meta Review は Gemini CLI → Gemini API →（quota 時のみ Antigravity Claude）→ Copilot →
+      fail-closed で終端し、Copilot より後段の provider routing を持たない
+      （`meta-review-structured-output-robustness` で意図的に作らなかった）。
+      provider availability / model selection / quota を本 Router が一元的に扱えるようになった時点で、
+      **Meta Review 専用の第二の Router を作らず**この機構へ寄せること。その際
+      `[metaReview] attempt {...}` の実測（段別失敗数・truncation 率・Copilot 成功率）を
+      routing 設計の入力として使う。
 
       **既に存在するもの（作り直さない）**: `AiCliRequest`（`packages/shared/src/types/ai_cli.ts`）は
       `model` / `reasoningEffort` / `fallbackPolicy` / `timeoutMs` を**既に持つ**。
