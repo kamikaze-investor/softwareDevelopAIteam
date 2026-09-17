@@ -235,3 +235,56 @@ one-liner 1 行（約 20 token）なので core に置くほうが正直であ�
 - **同じ判断基準から逆の結論が出ることがある。** `audit_log` は適用記録には不適（多次元集計）だが、
   センサー発火には適する（1 entity の問い合わせ）。
   「audit_log を使わない」を一般則として覚えると、次に誤る
+
+## 15. Production deploy と Operational E2E（2026-09-17）
+
+CEO の Class C 承認（**今回確認済みの migration に限定**。DB migration 一般の Class B 化ではない）
+のもとで production へ deploy した。
+
+**deploy**: master `247d407`。`ai-team-api.service` / `ai-team-worker.service` とも `active`。
+migration は `CREATE TABLE IF NOT EXISTS principle_applications` と index 4 本のみで、
+`ALTER` も既存 table への破壊的変更も無い。API 再起動時に適用された。
+
+**migration 前 backup の退避**: 既存の `pre_deploy_*.db` 命名規約へ退避した。
+`rotateBackups()`（`apps/api/src/storage/backup.ts`）が走査するのは `/^backup-.*\.db$/` だけで、
+`BACKUP_KEEP_COUNT = 28` の 6 時間 rotation はこの命名に一致しない。
+**そのため新しい backup system も protected 機構も作っていない**（CEO 指示）。
+退避後に file 存在 / size 一致 / SHA-256 一致 / `PRAGMA integrity_check = ok` /
+table 数 / 主要 table の件数を確認した（値は運用記録側に置き、ここには残さない）。
+
+**Operational E2E の実測（deploy 後、本番 DB を read-only で参照）**:
+
+| 観測点 | 実測 |
+| --- | --- |
+| `principle_applications` | PRESENT。index 4 本（部分 unique `ux_..._run_stage_principle` を含む） |
+| 記録行数 | 38 行 / 3 review run / 10 原則 |
+| stage 別 | `design` 22 / `independent` 16 / **`meta` 0** |
+| 判定別 | `ALIGNED` 28 / `CONFLICT` 3 / `UNCERTAIN` 7 |
+| `audit_log` の `principle_sensor` | 0 件 |
+
+**`design` と `independent` の両方に行がある**ことが重要で、
+stage 間 disagreement は「片側が構造的に常に空」ではなくなっている
+（Independent Review で指摘された実欠陥がここで解消していることの本番側の裏付け）。
+
+**センサー発火 0 件は正しい状態である。** 理由は 2 つあり、どちらも「経路が壊れている」ではない。
+- センサー1（core 降格候補）は 1 原則あたり 50 件を要求する。本番はまだ 38 行 / 10 原則である
+- センサー2（機構そのものの再Review候補）は `conflict + uncertain = 0` を要求する。
+  本番は `CONFLICT` 3 / `UNCERTAIN` 7 で、**原則判定が実際に割れている**。
+  つまり「Reviewer が原則を見ていないので全部 ALIGNED になる」という失敗様態には陥っていない
+
+**`review_stage='meta'` は schema 予約であって必須 scope ではない**（read-only で確定）。
+CEO の当初指示は「**既存 Review** で遵守確認する（新しい独立 Review workflow を先に作らない）」で、
+接続先として選んだのは Design Review（`buildFocusedOutputContract()`）と
+Independent Review（`reviewerAdapter`）の 2 箇所である。meta stage は設計時点で 13 章
+「意図的に実装しなかったもの」へ置いてあり、Acceptance Criteria に入っていない。
+実装上も、GitHub Actions 側の Meta Review（`autoReview.ts` → `runner.ts`）は storage を
+一切 import していない。ここへ書き手を足すことは **CI 経路へ DB 依存を新設する**ことであり、
+「enum を使い切ること自体を目的に新しい機能を作らない」という CEO 指示に反する。
+本番実測でも `meta` は 0 行で、`buildPrincipleStats()` の stage 別内訳に 0 として出るだけである。
+
+**この Operational E2E が本番の実欠陥を 1 件見つけた。**
+`console.log('[metaReview] attempt ...')` が `designReviewRunner.ts` の stdout JSON protocol を
+壊しており、`runner returned unparsable output` になっていた。deploy 前の production SHA `5d88047`
+から既に潜在していた。`#246` で 4 箇所を `console.error` へ移し、
+`runnerStdoutProtocol.test.ts` を再発センサーとして固定した（実測記録は `#247`）。
+**回帰テストが再発センサーになっているので、別の「様子見 Task」は作らない**（CEO 指示）。

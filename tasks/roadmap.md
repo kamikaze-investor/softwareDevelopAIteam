@@ -1757,6 +1757,12 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         でないか／既に対策済みでないか／既存機能で対応できないか／重複にならないか／改善コストが
         利益を上回らないか／別の非効率を生まないか／安全性を過剰に高め速度を落とさないかを自問）を
         通過したものだけ候補とする。**過剰安全策・過剰レビュー自体もIncident候補として扱う**
+      - **Improvement Planner の入力に `principle_sensor` を含める**（2026-09-17 追記）。
+        `principle-quality-sensor-to-review` が `audit_log`（`entity_type='principle_sensor'`）へ
+        「原則自体の再Review候補」を発火させている。現在の受け皿はその行と
+        `GET /api/principles/stats` だけで、**同項目は done なので誰も見に来ない**。
+        原則側に別の改善エンジンを作らないための片割れであり、ここに書いていないと
+        発火した候補がそのまま埋もれる
       - **CEO Proposal**: 個別Incidentの一覧ではなく改善提案単位で提出する。**通常は週1〜2件**
         （CEOレビューが新たなボトルネックにならないようにする）。ただしCritical
         （データ消失リスク・セキュリティ重大問題・復旧困難・大規模障害・大きな金銭損失・
@@ -9111,9 +9117,10 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 **二重正本を作らないこと。** 原則本文を DB・別 spec・Mobile 画面へコピーしない。
 記録側が持つのは `principle_id` と **version/hash** だけであり、本文は Git から引く。
 
-<!-- roadmap:id=principle-registry-and-compliance-ledger state=in_progress -->
-1. [ ] **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録** — 2026-09-17登録。
-      **2026-09-17 CEO 指示により Step 1 を実装済み。** 残りは下記「未了」のみ。
+<!-- roadmap:id=principle-registry-and-compliance-ledger state=done -->
+1. [x] **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録** — 2026-09-17登録・完了。
+      **2026-09-17 CEO 承認のもと production へ deploy 済み（master `247d407`）。**
+      下記「意図的に scope 外とした点」は、いずれも本項目の Acceptance Criteria ではない。
 
       **実装済み（このブランチ）**:
       - **Registry metadata の一般化** — 既存 marker 方式をそのまま拡張した。新しい Registry
@@ -9190,12 +9197,24 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       - `principle_applications` に保持期間が無い。件数が増えたときの集計コストは未測定
       - 版 hash は one-liner だけでなく本文全体を含む。prompt に出るのは one-liner なので、
         hash は「reviewer が見た bytes」ではなく**原則の版**を指す。意図どおりだが同一ではない
-      **未了**:
-      - **本番 DB migration は未実行。** schema 追加は `CREATE TABLE IF NOT EXISTS` と
-        index 追加なので、**merge して API が再起動した時点で適用される**。
-        DB migration は現行方針どおり **Class C** であり、
+      **完了条件の充足（2026-09-17 CEO 指示の Acceptance Criteria）**:
+      Registry / 選択 / 原則単位判定 / Design Review 統合 / Independent Review 統合 /
+      DB 記録 / stats / stage 間 disagreement / センサー / 本番 migration / Operational E2E。
+      production 実測の記録は
+      `docs/project_memory/decisions/principle_management_design_2026_09_17.md` 15 章。
+      - **本番 DB migration 実行済み。** 追加は `CREATE TABLE IF NOT EXISTS` と index のみで、
+        `ALTER` も既存 table への破壊的変更も無く、API 再起動時に適用された。
+        migration 前 backup は rotation 対象外へ退避済み（`pre_deploy_*.db`。
+        `rotateBackups()` は `/^backup-.*\.db$/` にしか一致しないので、この命名は自然に除外される。
+        **新しい backup system は作っていない**）。
+        DB migration は現行方針どおり **Class C** のままであり、
         **merge / deploy の判断そのものが既存 CEO Gate にあたる**（CEO 指示 2026-09-17）。
-        本指示は DB migration 一般の Class B 化を意味しない
+        本件承認は DB migration 一般の Class B 化を意味しない
+      - **センサーの発火実績が 0 件であることは完了を妨げない。** 確認したのは
+        「閾値に達したら発火する経路が production に存在すること」であって、発火そのものではない。
+        **「実際に 50 件溜まるまで待つ」ことを Acceptance Criteria にしない**（CEO 指示 2026-09-17）
+
+      **意図的に scope 外とした点（本項目の完了を妨げない）**:
       - **`specs/00` 3.14〜3.18 / `specs/20` / `specs/22` / Design Philosophy は未移設。**
         意図的に `specs/21` の 11 件だけで通した。記録が実際に取れることを確かめてから範囲を広げる
         （`constitutionPrinciples.ts` は今も章まるごと本文を貼っている）
@@ -9204,12 +9223,20 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         **両者は別物なので読み替えなかった**。`selection_source='risk'` は
         実装 prompt 側の経路用に残っている。ここを埋めるなら
         `review-class-b-enhanced-ai-review` の Risk 5 次元と一緒に設計すること
-      - **`review_stage='meta'` は未配線。** enum には入れてあるが、
-        GitHub Actions 側の `autoReview.ts` は DB を持たない。必要になってから繋ぐ
+      - **`review_stage='meta'` は schema 予約であって必須 scope ではない**
+        （2026-09-17 に read-only で確定）。CEO の当初指示は「**既存 Review** で遵守確認する」で、
+        接続先として選んだのは Design Review（`buildFocusedOutputContract()`）と
+        Independent Review（`reviewerAdapter`）の 2 箇所である。meta stage は設計決定の時点で
+        「意図的に実装しなかったもの」側にある（設計決定 13 章）。
+        実装上も、GitHub Actions 側の Meta Review（`autoReview.ts` → `runner.ts`）は
+        storage を一切 import しておらず、書き手を足すことは **CI 経路へ DB 依存を新設する**ことを意味する。
+        現在 `'meta'` はどこからも書かれず、`buildPrincipleStats()` の stage 別内訳に 0 として出るだけである。
+        **enum が未使用であること自体を理由に本項目を未完成扱いにしない。
+        enum を使い切ること自体を目的にした配線もしない**（CEO 指示 2026-09-17）
 
-<!-- roadmap:id=principle-quality-sensor-to-review state=in_progress -->
-2. [ ] **原則自体の再Review候補を、適用記録から機械的に起こす** — 2026-09-17登録。
-      **2026-09-17 CEO 指示によりセンサー本体を実装済み。**
+<!-- roadmap:id=principle-quality-sensor-to-review state=done -->
+2. [x] **原則自体の再Review候補を、適用記録から機械的に起こす** — 2026-09-17登録・完了。
+      **2026-09-17 CEO 指示によりセンサー本体を実装し、production へ deploy 済み（master `247d407`）。**
 
       **CEO 指摘（2026-09-17）**: 当初この項目は `deferred` で登録していたが、
       `observation-closes-loop` の「50 件で core 継続を再評価する」という条件は
@@ -9241,12 +9268,20 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       - **変更するときは、変更後の値だけでなく「どの実測を見てそう決めたか」を併記すること。**
         定義と根拠は `PRINCIPLE_SENSOR_THRESHOLDS` の doc comment が正本
 
-      **未了**:
-      - **候補の受け皿がまだ `audit_log` の行と stats API だけである。**
-        `project-auto-incident-pattern-improvement` の Improvement Planner → CEO Proposal 経路が
-        実装されたら、そこへ繋ぐ。**別の改善エンジンを作らない**（同項目を参照。ここでは重複記述しない）
-      - **実データでの閾値見直しは未実施。** 判定が 100 件以上溜まってから分布を見る。
-        溜まる前に閾値を精密化しない
+      **scope は「候補を機械的に起こすところまで」で充足している**（項目名のとおり）。
+      候補の受け皿を Improvement Planner → CEO Proposal 経路へ繋ぐのは
+      `project-auto-incident-pattern-improvement` の scope であり、**別の改善エンジンをここで作らない**。
+      本項目が done になると誰も見に来なくなるので、**受け取り側（同項目の Improvement Planner）へ
+      「`principle_sensor` を入力に含める」ことを明記した**。
+      片側にだけ TODO を書き残す形にしない（`observation-closes-loop`）。
+
+      **完了を妨げない既知の制約**:
+      - **実データでの閾値見直しは未実施。** 50 / 200 は実データ 0 件の状態で決めた暫定値である。
+        判定が 100 件以上溜まってから分布を見る。溜まる前に閾値を精密化しない。
+        **暫定値であること自体は完了を妨げない**（CEO 指示 2026-09-17）
+      - **production でセンサーが実際に発火した実績はまだ無い。** 確認したのは、
+        閾値に達したら発火する経路が production に存在することである。
+        **「実際に 50 件溜まるまで待つ」ことを Acceptance Criteria にしない**（同上）
 
 ---
 
