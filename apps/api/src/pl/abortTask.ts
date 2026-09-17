@@ -220,8 +220,15 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
 
   // 証明が及ぶのは、これから観測する workspace だけである。別の workingDir に取り残された行は
   // その証明の外側にあるので、所有者として扱う（独立レビュー round 2）。
-  const provenDirs = new Set(owning.map((job) => job.safeCommand?.workingDir))
-  const outsideProof = staleCandidates.find((job) => !provenDirs.has(job.safeCommand?.workingDir))
+  // workingDir が読めない行は「同じ workspace だ」と言えないので証明の外側に置く
+  // （`SafeCommand.workingDir` は型上必須だが、古い行から undefined で読めることがある）。
+  const provenDirs = new Set(
+    owning.map((job) => job.safeCommand?.workingDir).filter((dir): dir is string => Boolean(dir)),
+  )
+  const outsideProof = staleCandidates.find((job) => {
+    const dir = job.safeCommand?.workingDir
+    return dir === undefined || dir === '' || !provenDirs.has(dir)
+  })
   if (outsideProof) {
     return {
       ok: false,

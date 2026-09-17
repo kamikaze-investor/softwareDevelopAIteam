@@ -709,8 +709,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const task = deserializeTask(taskRow)
       if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
       // ここへ来るのは stale 候補だけ。証明の及ぶ workspace のものだけを見逃す。
-      if (options.provenWorkingDir === undefined) return { job, task }
-      if (job.safeCommand?.workingDir !== options.provenWorkingDir) return { job, task }
+      //
+      // **どちらかの workingDir が読めなければ「同じ workspace だ」と言えない。**
+      // `SafeCommand.workingDir` は型の上では必須だが、古い行から undefined で
+      // 読めることがある（コード側も `?.` で守っている）。両方 undefined を
+      // 「一致」と数えると、何も証明していない行を見逃すことになる。
+      const proven = options.provenWorkingDir
+      const candidateDir = job.safeCommand?.workingDir
+      if (proven === undefined || proven === '') return { job, task }
+      if (candidateDir === undefined || candidateDir !== proven) return { job, task }
     }
     return undefined
   }
