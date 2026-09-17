@@ -8156,6 +8156,104 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       本 Finding を根拠に Safety・Approval 境界を動かすこと。
       **`ALREADY_EXECUTED` に例外を設けるのは既存 guard の緩和にあたるため、CEO 判断事項とする。**
 
+<!-- roadmap:id=blocked-job-revert-material-not-persisted state=deferred -->
+11. [ ] **blocked になった Job の変更を、後から安全に取り消す材料が残っていない** —
+      2026-09-17登録（`abort_task` 実装中に実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: `revertBlockedJobChanges()`（`apps/worker/src/jobRunner.ts`）は
+      `(workingDir, startCommitHash, manifest: ChangeManifest, preExistingPaths)` を要求するが、
+      **後ろ2つが Job 行に永続化されていない**。実行中プロセスの `JobRunResult` にしか存在しないため、
+      **過去に blocked になった Job に対しては呼べない**。
+
+      現在の起動経路は job 報告時の1本だけで、API が escalate を確定したとき
+      `workspaceCleanupRequired: true` を返し、Worker がその場の in-memory 結果で掃除する。
+      Worker が再起動すれば材料は消える。
+
+      **永続化されている情報では代用できない**:
+      - `jobs.changed_files` … **パスだけ**。`ChangeManifest.changes` が持つ種別
+        （added / modified / deleted / renamed）が無い。種別なしでは「復元」か「削除」かを
+        推測することになり、逆向きの操作をすれば被害が出る
+      - `preExistingPaths` … 一切残っていない。これが無いと
+        「Job 開始前から dirty だったパスには触れない」という同関数の中核原則を守れない
+      - `jobs.workspace_baseline` … 開始時点の参照点であって、**この Job が何を変えたか**ではない
+
+      **影響**: dirty なまま blocked になった Job は、どの経路からも安全に掃除できない。
+      所有権解放には workspace 検証が要り（`failAndPrepareRepair`:
+      「未検証の workspace で所有権を解放してはならない」）、検証を通すには掃除が要る、という循環になる。
+      `clearWorkspaceQuarantine()` は quarantine metadata を消すだけで status を変えないので、
+      所有権は解放されない。
+
+      **`abort_task`（#235）との関係**: #235 は **verification-only** で成立している
+      （workspace が baseline と一致し、かつ known-good であれば park、そうでなければ fail-closed）。
+      2026-09-17 の production 実測では対象 workspace が既に baseline と一致していたため、
+      revert は不要だった。**本項目は #235 を止めない**が、
+      dirty なまま残った blocked Job は abort できない、という制約は残る。
+
+      **着手時に比較すること（実装方針を先に決めない）**:
+      - revert に必要な情報（manifest の種別 + preExistingPaths）を**永続化する最小変更**。
+        既存 `jobs` 列への追加で足りるか、量・秘密情報の観点で問題ないか
+      - 既存 `changed_files` + `workspace_baseline` + git の実状態から**復元可能か**
+        （種別を git から再導出できるか。できるなら永続化は不要）
+      - **blocked にする時点で掃除まで終わらせる**方が自然ではないか。
+        材料がある唯一の瞬間はそこであり、後から掃除する経路を作るより状態空間が小さい
+      - **新しい cleanup subsystem を先に作らない。** 上記3案を比較してから決める
+
+      **`state=deferred` の理由**: 上記3案のうち2案（材料の永続化 / blocked 時点での掃除）は
+      `jobs` 表のスキーマ変更を伴う。現行 Policy 上 DB migration は Class C であり、
+      どの案を採るかを CEO が決める前に PL が自律採用しないよう `deferred` にする。
+      **Finding の優先度を下げる意味ではない。実装着手だけを保留する。**
+
+      **関連**: `workspace-dirty-leakage-cleanup`（done）が escalate 時の掃除を入れた項目。
+      本項目はその**適用範囲外**（blocked のまま残った Job）を扱う。重複実装しないこと。
+
+<!-- roadmap:id=approval-gate-evidence-not-action-bound state=deferred -->
+12. [ ] **`approval_gate` evidence は action へ束縛されず、Gate 経路では使い切られない** —
+      2026-09-17登録（#235 の独立レビュー Finding 3 から分離）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: `checkApprovalGate()`（`apps/api/src/pl/actionGate.ts`）は
+      ApprovalRequest について **target Task / `APPROVED` / 期限**しか見ない。
+
+      - **どの action への承認かを見ない。** ApprovalRequest は Task 単位で発行されるため、
+        同じ Task に対する別 action（例: `git_commit`）の承認が、
+        `approval_gate` を要求する**別の PL action の evidence として通る**
+      - **使い切らない。** Gate を通過しても `CONSUMED` へ遷移しないため、
+        同じ承認が**何度でも**別の action を authorize できる。
+        これは `packages/shared/src/types/approval_gate.ts` の
+        「承認は特定 commit/diff に対する**一回限りの許可**」という契約と食い違う
+
+      **現在の影響範囲**: `resolvePlActionPolicy()` が `approval_gate` を要求する action は
+      複数ある（`packages/shared/src/plActionPolicy.ts`）。`git_commit` 系は
+      `POST /api/approval-requests/:id/consume` という**別経路**で使い切られており、
+      そこでは `requestedAction !== job.safeCommand.kind` の照合もある。
+      **Gate 経路だけがその2つを持っていない。**
+
+      **`abort_task`（#235）は本項目の影響を受けない**: #235 は `abort_task` について
+      `requestedAction === 'abort_task'` の一致を要求し、park transaction 内で
+      `APPROVED → CONSUMED` まで進める。**他 action の挙動は #235 では変えていない**
+      （既存 action の承認 semantics を広く変える改修になるため、本項目へ分離した）。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - action → 必要 `requestedAction` の対応表を全 action へ広げられるか。
+        既存の承認がどの文字列で発行されているかを**実データで**確認してから決める
+        （対応表を先に書くと、既存の承認が一斉に弾かれて全 PL action が止まりうる）
+      - Gate 経路での consume をどこに置くか。**Gate 判定の時点では action はまだ実行されていない**ため、
+        判定時に consume すると「承認を使ったのに何も起きなかった」状態を作る。
+        #235 は「実行を確定させる transaction の中で consume する」形を採った
+      - 既存 `/consume` 経路と**二重に**使い切らないこと。同じ承認が両経路から
+        consume されると、片方が STATUS_CONFLICT で失敗する
+      - 効果検証可能性（Design Philosophy 8）: 束縛を入れた後に
+        「action 不一致で弾かれた承認」が何件あるかを `audit_log` から数えられること
+
+      **`state=deferred` の理由**: これは既存 Approval の semantics を全 action へ広げる変更であり、
+      `specs/22_safety_approval_design_principle.md` の Human Approval 境界に直接触れる。
+      誤ると**全 PL action が承認を得られず停止する**方向にも、
+      **承認が実質無検証になる**方向にも倒れうる。CEO が境界を決める前に自律採用しないよう
+      `deferred` にする。**Finding の優先度を下げる意味ではない。**
+
+      **やらないこと（non-goals）**: 新しい承認種別・新しい Gate・新しい状態語彙の追加 /
+      `approval_gate` を要求する action 一覧の変更 / 本 Finding を根拠に
+      Yellow Zone・Safety Boundary を動かすこと。
+
 <!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
 10. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
       2026-09-15登録（CEO の承認画面での指摘が発端）。

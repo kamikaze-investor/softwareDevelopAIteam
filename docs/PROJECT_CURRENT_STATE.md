@@ -283,6 +283,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
 - **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: in_progress）
+- **blocked になった Job の変更を、後から安全に取り消す材料が残っていない**（state: deferred）
+- **`approval_gate` evidence は action へ束縛されず、Gate 経路では使い切られない**（state: deferred）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
