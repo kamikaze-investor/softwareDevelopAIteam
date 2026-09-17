@@ -33,6 +33,7 @@ import {
   getBaseRoadmapId,
   isFollowUpTaskKey,
   MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
+  isLiveJob,
   occupiesProject,
 } from '@ai-team/shared'
 import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
@@ -110,6 +111,10 @@ export function classifyAdoptionCandidates(
   // 採用 attempt 予算だけを焼く（2026-09-15 の事故と同じ形）。検出と強制を一致させる。
   // 既存 `currentTask` と同じ意味。parked Task（pending かつ roadmapActive=false）は占有しない。
   const projectHasActiveTask = projectTasks.some((task) => occupiesProject(task))
+  // parked Task にも queued Job は残りうる。Worker はそれを実行するので、動いていないとは言えない。
+  const projectHasLiveJob = projectTasks.some(
+    (task) => storage.jobs.findByTaskId(task.id).some((job) => isLiveJob(job)),
+  )
 
   return open.map((candidate) => {
     const siblings = projectTasks.filter(
@@ -141,6 +146,7 @@ export function classifyAdoptionCandidates(
 
     const eligible = !active
       && !projectHasActiveTask
+      && !projectHasLiveJob
       && pendingContinuations === 0
       && followUpCount < MAX_FOLLOW_UPS_PER_ROADMAP_ITEM
 

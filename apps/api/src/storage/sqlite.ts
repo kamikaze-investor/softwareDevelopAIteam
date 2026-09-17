@@ -6,7 +6,7 @@
  * → IStorage インターフェースを実装した別クラスに切り替えるだけでよい
  */
 
-import { OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
+import { LIVE_JOB_STATUSES, OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
@@ -842,6 +842,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         roadmapPhases: RoadmapSyncPhaseInput[],
         requireNewTaskKeys: readonly string[],
         requireNoActiveTasks: boolean,
+        requireNoLiveJobs: boolean,
         requireNoPendingContinuations: boolean,
       ): RoadmapSyncResult => {
         // **新規であることを要求された key が既に居たら、この transaction ごと失敗させる。**
@@ -869,6 +870,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (active) {
             throw new Error(
               `project has an active task (${active.id} is ${active.status}); refusing to add work`,
+            )
+          }
+        }
+        if (requireNoLiveJobs) {
+          const placeholders = LIVE_JOB_STATUSES.map(() => '?').join(',')
+          const live = db.prepare(
+            `SELECT id, status FROM jobs WHERE project_id = ? AND status IN (${placeholders}) LIMIT 1`,
+          ).get(projectId, ...LIVE_JOB_STATUSES) as { id: string; status: string } | undefined
+          if (live) {
+            throw new Error(
+              `project has a live job (${live.id} is ${live.status}); refusing to add work`,
             )
           }
         }
@@ -1135,6 +1147,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           input.phases ?? [],
           input.requireNewTaskKeys ?? [],
           input.requireNoActiveTasks === true,
+          input.requireNoLiveJobs === true,
           input.requireNoPendingContinuations === true,
         )
       } catch (err: unknown) {

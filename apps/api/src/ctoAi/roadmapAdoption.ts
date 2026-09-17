@@ -40,6 +40,7 @@ import {
   getBaseRoadmapId,
   isFollowUpTaskKey,
   MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
+  isLiveJob,
   occupiesProject,
 } from '@ai-team/shared'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapSyncPhaseInput } from '../storage/interface'
@@ -229,6 +230,19 @@ function checkFollowUpEligibility(
       'FOLLOW_UP_NOT_ELIGIBLE',
       `task ${active.id} for "${input.roadmapId}" is still ${active.status}; ` +
         'resolve it through the existing resume / recovery path instead of creating a follow-up',
+    )
+  }
+
+  // 3-2. 生きている Job が無いこと。
+  //    **parked Task でも queued Job は Worker が実行する**（独立レビュー）。
+  //    Task の状態だけを見ると、動いている作業を見落として follow-up を足してしまう。
+  const liveJobTask = projectTasks.find(
+    (task) => storage.jobs.findByTaskId(task.id).some((job) => isLiveJob(job)),
+  )
+  if (liveJobTask) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      `task ${liveJobTask.id} still has a queued or running job; the project is not idle`,
     )
   }
 
@@ -488,6 +502,7 @@ export async function adoptRoadmapItem(
         requireNewTaskKeys: [taskKey],
         // snapshot 判定と挿入の間に状態が変わっていないかを transaction 内で再確認する。
         requireNoActiveTasks: true,
+        requireNoLiveJobs: true,
         requireNoPendingContinuations: true,
       }
       : {}),

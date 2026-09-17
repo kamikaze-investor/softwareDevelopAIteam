@@ -328,6 +328,42 @@ describe('adoptRoadmapItem — 独立レビュー指摘に対する回帰固定�
     expect(result.ok).toBe(true)
   })
 
+  it('parked Task に queued Job が残っていれば follow-up しない', async () => {
+    // parked = 占有しない、だが **Worker は running Project の全 Task から queued Job を拾う**
+    // （roadmapActive も Task status も見ない）。占有だけを見ると動いている作業を見落とす。
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: 'API 側の配線' }, deps(),
+    )
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    const parked = storage.tasks.create({
+      projectId, title: 'parked', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(parked.id, { roadmapActive: false })
+    // park しても Job は生きたまま残りうる。
+    storage.jobs.create({
+      taskId: parked.id, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: 'Worker 側の配線', followUp: true },
+      deps(),
+    )
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    if (result.ok) return
+    expect(result.reason).toContain('queued or running job')
+  })
+
   it('Finding 5: 無関係な active Task が Project に残っていれば follow-up しない', async () => {
     const { storage, projectId } = makeStorage()
     const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())

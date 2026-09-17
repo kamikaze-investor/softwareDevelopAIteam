@@ -24,6 +24,21 @@ export function occupiesProject(task: { status: string; roadmapActive?: boolean 
 }
 
 /**
+ * **Task の状態とは別に、Job が生きているか。**
+ *
+ * parked（`pending` かつ `roadmapActive=false`）でも、その Task に queued Job が残っていれば
+ * Worker は実行する — `apps/worker/src/index.ts` の claim は running Project の**全 Task**を
+ * 走査し、`roadmapActive` も Task status も見ずに queued Job を拾う（独立レビューで確認）。
+ * したがって「占有していない」ことだけでは「動いていない」と言えない。
+ * follow-up の成立条件はこの両方を見なければならない。
+ */
+export const LIVE_JOB_STATUSES = ['queued', 'running'] as const
+
+export function isLiveJob(job: { status: string }): boolean {
+  return (LIVE_JOB_STATUSES as readonly string[]).includes(job.status)
+}
+
+/**
  * 上と同じ判定を SQL で書いたもの。`tasks` テーブルへの WHERE 断片。
  *
  * **`occupiesProject()` と必ず同じ意味にすること。** 片方だけ変えると、

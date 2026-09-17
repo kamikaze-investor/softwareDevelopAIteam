@@ -297,6 +297,12 @@ export interface ITaskStorage {
      * のに follow-up が生まれる**（独立レビュー 3巡目）。ここで再確認して落とす。
      */
     requireNoActiveTasks?: boolean
+    /**
+     * transaction の内側で「Project に queued / running Job が無いこと」を再確認する。
+     *
+     * parked Task でも Job は生きうる。Task 状態だけでは「動いていない」と言えない。
+     */
+    requireNoLiveJobs?: boolean
     /** 同上。pending continuation が無いことを transaction 内で再確認する。 */
     requireNoPendingContinuations?: boolean
   }): RoadmapSyncResult
