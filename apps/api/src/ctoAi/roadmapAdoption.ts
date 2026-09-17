@@ -178,6 +178,7 @@ function checkFollowUpEligibility(
   input: AdoptRoadmapItemInput,
   projectTasks: readonly { id: string; status: string; roadmapTaskKey?: string; description: string }[],
   knownLedgerIds: ReadonlySet<string>,
+  ledgerBody: string,
 ): FollowUpEligibility {
   const fail = (code: AdoptRoadmapItemFailure, reason: string): FollowUpEligibility => ({
     ok: false,
@@ -244,21 +245,22 @@ function checkFollowUpEligibility(
     )
   }
 
-  // 6. 前の Task と同じ作業を繰り返していないこと。
+  // 6. 前の Task と**丸ごと同じ指示**を出し直していないこと。
   //    **上限 10 を待たずここで止める。** 上限は最後の非常ブレーキであって、
   //    重複検知の主役ではない。
   //
-  //    比較は **description 全体**に対して行う（独立レビュー Finding 3）。
-  //    marker を頼りに切り出すと、(a) marker を持たない旧 Task が検査対象から丸ごと外れ、
-  //    (b) scope 本文に marker と同じ文字列を混ぜるだけで切り出し位置をずらして
-  //    同一 scope を通せてしまう。どちらも「同じ仕事の再実行」を素通りさせる。
-  const normalizedScope = normalizeScope(scope)
-  const repeated = siblings.find((task) => {
-    const extracted = extractImplementationScope(task.description)
-    if (extracted !== undefined && normalizeScope(extracted) === normalizedScope) return true
-    // marker が無い / 偽装された場合でも、本文に同じ scope が現れていれば繰り返しとみなす。
-    return normalizeScope(task.description).includes(normalizedScope)
-  })
+  //    判定は「今回組み立てる description が、既存 Task の description と一致するか」だけを見る
+  //    （独立レビュー 3巡目）。前版は description 全体に対する部分一致で、
+  //    **正当な残作業まで弾いていた** — description には ledger 本文が丸ごと入るので、
+  //    ledger のサブ項目を引用した新しい scope が「既出」と誤判定される。
+  //    marker を切り出す方式も、scope 本文に marker を混ぜられると位置がずれる。
+  //    完全一致なら偽装できず、誤検出も出ない。
+  //
+  //    **言い換え・パラフレーズによる重複はここでは捕まえない。** それは意味判断であり、
+  //    Design Review と Independent Review の担当である（Class B の設計どおり）。
+  //    ここが担うのは「機械的に同一と言い切れるもの」だけである。
+  const candidateDescription = buildAdoptedDescription(ledgerBody, scope)
+  const repeated = siblings.find((task) => task.description === candidateDescription)
   if (repeated) {
     return fail(
       'FOLLOW_UP_NO_PROGRESS',
@@ -378,6 +380,7 @@ export async function adoptRoadmapItem(
       input,
       projectTasks,
       new Set(items.map((candidate) => candidate.id)),
+      extractItemDescription(markdown, item),
     )
     if (!eligibility.ok) return eligibility.failure
 
@@ -395,6 +398,16 @@ export async function adoptRoadmapItem(
       return { ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE', reason: minted.reason }
     }
     taskKey = minted.roadmapTaskKey
+
+    // 発番した key が実在の ledger 項目と同名になってはならない（独立レビュー 3巡目）。
+    // ledger 側の validation で本来起こらないが、古い ledger からの移行中に備えて二重に守る。
+    if (ledgerIds.has(taskKey)) {
+      return {
+        ok: false,
+        code: 'FOLLOW_UP_NOT_ELIGIBLE',
+        reason: `follow-up key "${taskKey}" collides with an existing roadmap item id`,
+      }
+    }
 
     // 発番した identity が既に居るなら、読み取りから書き込みまでの間に別の採用が走っている。
     // `syncRoadmapTasks()` は **Job を持たない Task を可変として扱う**ので、ここを素通りさせると
@@ -465,7 +478,14 @@ export async function adoptRoadmapItem(
     phases: [phaseInput],
     // follow-up の identity は transaction の外で発番している。挿入までの間に別の採用が
     // 同じ identity を作っていたら、**transaction の内側で**失敗させる（独立レビュー Finding 1）。
-    ...(input.followUp === true ? { requireNewTaskKeys: [taskKey] } : {}),
+    ...(input.followUp === true
+      ? {
+        requireNewTaskKeys: [taskKey],
+        // snapshot 判定と挿入の間に状態が変わっていないかを transaction 内で再確認する。
+        requireNoActiveTasks: true,
+        requireNoPendingContinuations: true,
+      }
+      : {}),
   })
   if (!syncResult.ok) {
     return {

@@ -361,7 +361,7 @@ describe('adoptRoadmapItem — 独立レビュー指摘に対する回帰固定�
     expect(repeat).toMatchObject({ ok: false, code: 'FOLLOW_UP_NO_PROGRESS' })
   })
 
-  it('Finding 3: marker を持たない旧 Task とも scope を突き合わせる', async () => {
+  it('Finding 3: ledger 本文から引用した正当な残作業は弾かない', async () => {
     const { storage, projectId } = makeStorage()
     // implementationScope 無しで採用された旧来の Task（description は ledger 本文のみ）。
     const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SPEC }, deps())
@@ -372,11 +372,34 @@ describe('adoptRoadmapItem — 独立レビュー指摘に対する回帰固定�
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.tasks.update(first.taskId, { status: 'done' })
 
-    // ledger 本文に既にある一文をそのまま scope として出す = 新しい作業ではない。
-    const repeat = await adoptRoadmapItem(
+    // ledger 本文のサブ項目を引用して残作業を名指しするのは**正当**である。
+    // PL は本文を読んで scope を切り出すよう指示されており、description には ledger 本文が
+    // 丸ごと入る。部分一致で弾くと、正しい follow-up がほぼ全部通らなくなる
+    // （独立レビュー 3巡目で指摘された過剰拒否）。
+    const legitimate = await adoptRoadmapItem(
       storage,
       { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: '詳細な本文がここに続く。', followUp: true },
       deps(),
+    )
+
+    expect(legitimate.ok).toBe(true)
+  })
+
+  it('Finding 3: 前回とまったく同じ指示の出し直しは弾く', async () => {
+    const { storage, projectId } = makeStorage()
+    const scope = 'API 側の配線'
+    const first = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: scope }, deps(),
+    )
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    const repeat = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: scope, followUp: true }, deps(),
     )
 
     expect(repeat).toMatchObject({ ok: false, code: 'FOLLOW_UP_NO_PROGRESS' })

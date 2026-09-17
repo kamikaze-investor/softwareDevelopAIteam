@@ -81,6 +81,8 @@ export interface ClassifiedCandidate extends RoadmapCandidate {
   kind: AdoptionKind
   /** `follow_up` のとき、これまでに作られた follow-up の数。 */
   followUpCount: number
+  /** この項目で**実際に実行された** Task の数。prompt はこちらを使う。 */
+  executedTaskCount: number
   /** 連続 skip 回数が閾値に達し、順序だけ繰り上げた候補か。 */
   boosted: boolean
 }
@@ -113,16 +115,18 @@ export function classifyAdoptionCandidates(
         && getBaseRoadmapId(task.roadmapTaskKey, ledgerIds) === candidate.id,
     )
     if (siblings.length === 0) {
-      return { ...candidate, kind: 'fresh' as const, followUpCount: 0, boosted: false }
+      return { ...candidate, kind: 'fresh' as const, followUpCount: 0, executedTaskCount: 0, boosted: false }
     }
 
     const followUpCount = siblings.filter(
       (task) => task.roadmapTaskKey !== undefined && isFollowUpTaskKey(task.roadmapTaskKey, ledgerIds),
     ).length
     // **queued は「まだ動いていない」**。採用 seam と同じ定義を使う（独立レビュー Finding 4）。
-    const executed = siblings.some(
+    // 件数も数える。prompt へ「この項目で実際に何本走ったか」を伝えるため（独立レビュー NEW 3）。
+    const executedCount = siblings.filter(
       (task) => storage.jobs.findByTaskId(task.id).some((job) => job.status !== 'queued'),
-    )
+    ).length
+    const executed = executedCount > 0
     const active = siblings.some((task) => task.status !== 'done')
 
     // **まだ一度も Job が走っていない Task は従来どおり `fresh` 扱いである。**
@@ -130,7 +134,7 @@ export function classifyAdoptionCandidates(
     // 実行済みの変更と新しい指示が混ざる余地が無い。ここを follow-up 側へ倒すと、
     // 「採用したがまだ動いていない Task」を PL から見えなくしてしまう。
     if (!executed) {
-      return { ...candidate, kind: 'fresh' as const, followUpCount, boosted: false }
+      return { ...candidate, kind: 'fresh' as const, followUpCount, executedTaskCount: executedCount, boosted: false }
     }
 
     const eligible = !active
@@ -142,6 +146,7 @@ export function classifyAdoptionCandidates(
       ...candidate,
       kind: eligible ? ('follow_up' as const) : ('not_available' as const),
       followUpCount,
+      executedTaskCount: executedCount,
       boosted: false,
     }
   })
@@ -462,7 +467,7 @@ const CANDIDATE_BODY_PREVIEW_CHARS = 200
  * Design Philosophy 全文は載せず、採用判断に効く原則だけを system prompt 側へ固定してある。
  */
 export function buildAdoptionPrompt(
-  candidates: readonly (RoadmapCandidate & { kind?: AdoptionKind; followUpCount?: number })[],
+  candidates: readonly (RoadmapCandidate & { kind?: AdoptionKind; executedTaskCount?: number })[],
   projectGoal?: string,
 ): string {
   const goalSection = projectGoal !== undefined && projectGoal.trim() !== ''
@@ -475,7 +480,7 @@ export function buildAdoptionPrompt(
     ...candidates.flatMap((c) => [
       `- ${c.id} — ${c.state}${c.highPriority ? ' — PRIORITY:HIGH' : ''}${
         c.kind === 'follow_up'
-          ? ` — FOLLOW-UP (${(c.followUpCount ?? 0) + 1} task(s) already ran for this item; name ONLY work they did not do)`
+          ? ` — FOLLOW-UP (${c.executedTaskCount ?? 0} task(s) already ran for this item; name ONLY work they did not do)`
           : ''
       } — ${c.title}`,
       c.bodyPreview === '' ? '  (no body)' : `  ${c.bodyPreview}`,

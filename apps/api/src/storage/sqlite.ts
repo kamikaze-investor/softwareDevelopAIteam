@@ -840,6 +840,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         roadmapTasks: RoadmapSyncTaskInput[],
         roadmapPhases: RoadmapSyncPhaseInput[],
         requireNewTaskKeys: readonly string[],
+        requireNoActiveTasks: boolean,
+        requireNoPendingContinuations: boolean,
       ): RoadmapSyncResult => {
         // **新規であることを要求された key が既に居たら、この transaction ごと失敗させる。**
         // 呼び出し側が transaction の外で発番した identity を、挿入までの間に別の採用が
@@ -854,6 +856,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             throw new Error(
               `task key "${requiredKey}" must be new but task ${existing.id} already has it`,
             )
+          }
+        }
+
+        // 呼び出し側の snapshot 判定と挿入の間に状態が変わっていないかを、ここで再確認する。
+        if (requireNoActiveTasks) {
+          const active = db.prepare(
+            "SELECT id, status FROM tasks WHERE project_id = ? AND status != 'done' LIMIT 1",
+          ).get(projectId) as { id: string; status: string } | undefined
+          if (active) {
+            throw new Error(
+              `project has an active task (${active.id} is ${active.status}); refusing to add work`,
+            )
+          }
+        }
+        if (requireNoPendingContinuations) {
+          const pending = db.prepare(
+            "SELECT COUNT(*) AS c FROM task_continuations WHERE project_id = ? AND status = 'pending'",
+          ).get(projectId) as { c: number }
+          if (pending.c > 0) {
+            throw new Error(`project has ${pending.c} pending task continuation(s); refusing to add work`)
           }
         }
 
@@ -1110,6 +1132,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           input.tasks,
           input.phases ?? [],
           input.requireNewTaskKeys ?? [],
+          input.requireNoActiveTasks === true,
+          input.requireNoPendingContinuations === true,
         )
       } catch (err: unknown) {
         if (err instanceof RoadmapTaskConflictError) {

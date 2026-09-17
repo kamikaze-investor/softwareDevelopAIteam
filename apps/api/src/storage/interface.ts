@@ -289,6 +289,16 @@ export interface ITaskStorage {
      * **不可分性はこのフラグで担保する**（独立レビュー Finding 1）。
      */
     requireNewTaskKeys?: readonly string[]
+    /**
+     * transaction の内側で「Project に未完了 Task が無いこと」を再確認する。
+     *
+     * follow-up の成立条件は呼び出し側が transaction の外で読んだ snapshot で判定される。
+     * 判定から挿入までの間に別の採用や continuation が Task を作ると、**active Task がある
+     * のに follow-up が生まれる**（独立レビュー 3巡目）。ここで再確認して落とす。
+     */
+    requireNoActiveTasks?: boolean
+    /** 同上。pending continuation が無いことを transaction 内で再確認する。 */
+    requireNoPendingContinuations?: boolean
   }): RoadmapSyncResult
 }
 
