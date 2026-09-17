@@ -388,6 +388,38 @@ export const CREATE_TABLES = `
     detail TEXT,
     created_at TEXT NOT NULL
   );
+
+  -- どの Task にどの原則が適用され、どの Review 工程がどう判定したかの記録（2026-09-17 CEO 指示）。
+  --
+  -- **原則の本文・定義はここに入れない。** 正本は Git（specs/21_...md の marker）で、
+  -- ここが持つのは id と本文 hash だけである（supervised_runs の D-2 と同じ形）。
+  --
+  -- audit_log へ相乗りさせなかった理由は性能ではなく**クエリ形状**である。audit_log の索引は
+  -- (entity_type, entity_id) の1本だけで、安い経路は「ある1 entity の履歴」に限られる。
+  -- ここで必要なのは principle_id / project_id / verdict / review_stage を跨ぐ多次元 GROUP BY と、
+  -- 同一 subject・同一原則に対する stage 間の自己 JOIN（Reviewer disagreement）であり、
+  -- 1次元キーでは表現できない。detail JSON に入れれば全件 scan になり、索引を張るには
+  -- 全監査利用者が共有する audit_log に列を足すことになる。
+  --
+  -- reviewer / provider / model / cost / prompt 全文は**保存しない**。review_run_id から
+  -- 既存 review レコードを引けば分かるため、ここへ複製すると二重管理になる（CEO 指示）。
+  CREATE TABLE IF NOT EXISTS principle_applications (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    roadmap_item_id TEXT,
+    task_id TEXT,
+    principle_id TEXT NOT NULL,
+    principle_version_hash TEXT NOT NULL,
+    selection_source TEXT NOT NULL
+      CHECK (selection_source IN ('core','contextual','risk','explicit')),
+    selection_reason TEXT NOT NULL DEFAULT '',
+    review_stage TEXT NOT NULL
+      CHECK (review_stage IN ('design','independent','meta')),
+    verdict TEXT NOT NULL
+      CHECK (verdict IN ('ALIGNED','CONFLICT','UNCERTAIN')),
+    review_run_id TEXT,
+    created_at TEXT NOT NULL
+  );
 `
 
 /**
@@ -444,6 +476,14 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_task_created_at ON design_review_evidence(task_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_design_review_evidence_subject_created_at ON design_review_evidence(review_kind, subject_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS ix_audit_log_entity ON audit_log(entity_type, entity_id, created_at DESC)',
+  // 原則ごとの適用数・CONFLICT 率を引く主経路。
+  'CREATE INDEX IF NOT EXISTS ix_principle_applications_principle ON principle_applications(principle_id, created_at DESC)',
+  // Project 別傾向。
+  'CREATE INDEX IF NOT EXISTS ix_principle_applications_project ON principle_applications(project_id, principle_id)',
+  // Reviewer disagreement: 同一 subject・同一原則を stage 跨ぎで突き合わせる。
+  'CREATE INDEX IF NOT EXISTS ix_principle_applications_subject ON principle_applications(task_id, principle_id)',
+  // 同じ run の同じ stage で同じ原則を二重計上しない。retry で run が再実行されても水増ししない。
+  'CREATE UNIQUE INDEX IF NOT EXISTS ux_principle_applications_run_stage_principle ON principle_applications(review_run_id, review_stage, principle_id) WHERE review_run_id IS NOT NULL',
   // 同一 (kind, subject_id) で active な run を1本に保つ。二重起票ではなく既存runを返すために使う。
   "CREATE UNIQUE INDEX IF NOT EXISTS ux_supervised_runs_subject_active ON supervised_runs(kind, subject_id) WHERE status IN ('running','stalled')",
   // 未終端runの掃き出し（stall sweep / startup recovery）を index で引けるようにする。

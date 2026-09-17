@@ -23,11 +23,12 @@ function initialWorkflowStepKey(taskId: string): string {
 }
 
 export function buildInitialImplementAiCliPrompt(task: Pick<Task, 'description' | 'allowedPaths'>): string {
+  const principles = loadEngineeringPrinciples()
   const designContract = buildDesignContract({
     slugs: selectPrincipleSlugs({
       predictedFocuses: (task.allowedPaths ?? []).flatMap(mapFileToFocuses),
-    }),
-    principles: loadEngineeringPrinciples(),
+    }, principles),
+    principles,
   })
 
   return `${task.description}\n\n${designContract}`

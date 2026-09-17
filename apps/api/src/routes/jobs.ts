@@ -310,9 +310,10 @@ function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, ded
 }
 
 function appendBaseDesignContract(prompt: string): string {
+  const principles = loadEngineeringPrinciples()
   const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(),
-    principles: loadEngineeringPrinciples(),
+    slugs: selectPrincipleSlugs(undefined, principles),
+    principles,
   })
 
   return `${prompt}\n\n${designContract}`

@@ -146,9 +146,10 @@ async function createDesignReviewEvidence(
 }
 
 function appendBaseDesignContract(prompt: string): string {
+  const principles = loadEngineeringPrinciples()
   return `${prompt}\n\n${buildDesignContract({
-    slugs: selectPrincipleSlugs(),
-    principles: loadEngineeringPrinciples(),
+    slugs: selectPrincipleSlugs(undefined, principles),
+    principles,
   })}`
 }
 

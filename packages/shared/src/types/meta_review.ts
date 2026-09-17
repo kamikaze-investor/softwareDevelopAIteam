@@ -1,3 +1,4 @@
+import type { AppliedPrinciple } from './principle.js'
 /**
  * Meta Review型定義
  *
@@ -124,6 +125,14 @@ export interface FocusedReviewResult {
   decision: StrategicDecision
   summary: string
   findings: MetaReviewFinding[]
+  /**
+   * この focus の review で提示した原則と、その原則単位の判定。
+   *
+   * **optional である。** 出力契約へフィールドを足したことが新しい false BLOCKED の原因に
+   * ならないよう、欠落・不正は「原則判定なし」として扱い、review 自体は失敗させない
+   * （`meta-review-structured-output-robustness` との依存関係）。
+   */
+  appliedPrinciples?: AppliedPrinciple[]
 }
 
 export interface IntegrationReviewResult {
@@ -141,6 +150,8 @@ export interface IntegrationReviewResult {
  */
 export interface IndependentReviewOutcome {
   provider: string
+  /** 独立 Reviewer 側の原則単位の判定。design stage と突き合わせて disagreement を出す。 */
+  appliedPrinciples?: AppliedPrinciple[]
   verdict: 'approved' | 'changes_requested' | 'blocking'
   summary: string
   /** true when the independent reviewer itself could not be reached/parsed (fail-closed). */

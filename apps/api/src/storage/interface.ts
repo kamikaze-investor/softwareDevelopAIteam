@@ -9,6 +9,7 @@
 
 import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
+import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
 export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -845,6 +846,34 @@ export interface IAuditLogStorage {
   record(data: Omit<AuditLogEntry, 'id' | 'createdAt'>): AuditLogEntry
 }
 
+/**
+ * 原則の適用・判定の記録。**集計はここで SQL として持つ**（新しい metrics backend を作らない）。
+ *
+ * 書き込みは best-effort であり、**Review を失敗させてはならない**。
+ * 計測の失敗が判定の失敗になると、観測を足したこと自体が新しい停止要因になる。
+ */
+export interface IPrincipleApplicationStorage {
+  /**
+   * まとめて記録する。同じ (review_run_id, review_stage, principle_id) の重複は黙って捨てる
+   * （retry で run が再実行されても適用数を水増ししない）。返り値は実際に挿入できた件数。
+   */
+  recordMany(entries: readonly PrincipleApplicationInput[]): number
+  findAll(): PrincipleApplication[]
+  findByPrincipleId(principleId: string): PrincipleApplication[]
+  /** 原則ごとの適用数・ALIGNED / CONFLICT / UNCERTAIN 数と率。 */
+  aggregate(query?: PrincipleAggregateQuery): PrincipleAggregateRow[]
+  /**
+   * 原則 × 本文版ごとの集計。センサーはこちらを使い、現在の版の行だけを数える。
+   * 版を跨いだ実績を混ぜると、書き換えた直後の原則が旧版の実績を引き継いでしまう。
+   */
+  aggregateByVersion(query?: PrincipleAggregateQuery): PrincipleVersionAggregateRow[]
+  /**
+   * 同一 subject・同一原則に対して複数 stage の判定が割れているものだけを返す。
+   * reviewer / provider はここへ保存していないので、必要なら review_run_id から引く。
+   */
+  findDisagreements(query?: PrincipleAggregateQuery): PrincipleDisagreementRow[]
+}
+
 export interface IWatchdogEventStorage {
   findAll(): WatchdogEvent[]
   findByJobId(jobId: string): WatchdogEvent[]
@@ -954,6 +983,7 @@ export interface IStorage {
   supervisedRuns: ISupervisedRunStorage
   gateEvaluations: IGateEvaluationStorage
   auditLog: IAuditLogStorage
+  principleApplications: IPrincipleApplicationStorage
   taskContinuations: ITaskContinuationStorage
   projectRoadmapPhases: IProjectRoadmapPhaseStorage
   knowledgeGraph: IKnowledgeGraphStorage
