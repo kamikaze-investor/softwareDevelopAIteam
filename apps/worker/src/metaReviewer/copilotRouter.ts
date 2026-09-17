@@ -46,10 +46,33 @@ function buildCopilotEnv(): NodeJS.ProcessEnv {
   if (process.env.HOME !== undefined) env.HOME = process.env.HOME
   if (process.env.LANG !== undefined) env.LANG = process.env.LANG
   if (process.env.TERM !== undefined) env.TERM = process.env.TERM
+
+  // **GitHub Actions のときだけ**、その job に対して GitHub が発行する短命 token を渡す
+  // （CEO 承認 2026-09-17）。
+  //
+  // 背景: 2026-08-28 に production の Copilot 認証を ai-team ユーザーの保存済み OAuth
+  // credential（HOME 配下）へ一本化し、PAT 配線を撤去した。これは VPS では成立するが、
+  // GitHub Actions の使い捨て runner には該当 credential が存在しないため、
+  // Copilot fallback は CI で認証不能なまま放置されていた
+  // （2026-09-17 実測: "No authentication information found."）。
+  //
+  // **PAT は復活させない。** 読むのは `GITHUB_TOKEN` だけで、
+  // `COPILOT_GITHUB_TOKEN` / `GH_TOKEN`（PAT が入り得る変数）は読まない。
+  // production / VPS の認証方式は変更していない。この値は copilot 子プロセスの env に
+  // 入るだけで、他へは伝播しない。ログへ出す経路も無い
+  // （診断メッセージは sanitizeMessage() を通り、GITHUB_TOKEN は SECRET_ENV_KEYS に含まれる）。
+  if (process.env.GITHUB_ACTIONS === 'true' && process.env.GITHUB_TOKEN !== undefined) {
+    env.GITHUB_TOKEN = process.env.GITHUB_TOKEN
+  }
   // 認証は ai-team ユーザーの保存済みOAuth credential（HOME配下）で行う
   // （2026-08-28: PAT/token配線を撤去。COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN
   //  のいずれもこの子プロセスへは渡さない）。
   return env
+}
+
+/** テスト専用の再公開。実体は同一（env 構成の不変条件を回帰テストで固定するため）。 */
+export function buildCopilotEnvForTest(): NodeJS.ProcessEnv {
+  return buildCopilotEnv()
 }
 
 export interface CopilotFallbackOptions {

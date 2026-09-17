@@ -28,6 +28,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -72,6 +73,15 @@ export interface GeminiRouterOptions {
   cliEffort?: 'low' | 'medium' | 'high'
   /** REST API で使うモデル */
   apiModel?: string
+  /**
+   * 応答が **formal verdict を構成するか**の判定。
+   *
+   * これを渡すと、provider attempt の成功条件が「text が返った」から
+   * 「valid な formal verdict が成立した」へ変わる。不成立は `transient` として
+   * 既存の bounded retry → 次 stage → 次 provider の順に流れる。
+   * 未指定なら従来どおり「text が返れば成功」（既存呼び出し元の挙動を変えない）。
+   */
+  validateResponse?: (raw: string) => boolean
   /** 機能名（ログ・通知用） */
   featureName?: string
   /**
@@ -297,6 +307,31 @@ function extractStructuredOutput(stdout: string): string | undefined {
 }
 
 /** agy CLI を1回だけ呼び出す。失敗時は分類済み診断情報を添えて返す。 */
+/**
+ * agy が PATH 上に無いなら、毎回 spawn して確実に ENOENT を踏むのをやめる。
+ *
+ * 2026-09-17 実測: GitHub Actions には agy が入っておらず、CLI 段は毎回
+ * `spawnSync agy ENOENT` で落ちてから API 段へ回っていた。
+ * **新しい health check 機構は作らない** — Node が既に持っている存在確認だけを使い、
+ * 判定できないときは従来どおり spawn する（skip 側へ倒さない = fail-closed）。
+ */
+function isAgyAvailable(): boolean {
+  // 絶対パス指定なら実ファイルの有無で判定できる。
+  if (AGY_PATH.includes('/') || AGY_PATH.includes(String.fromCharCode(92))) {
+    return existsSync(AGY_PATH)
+  }
+
+  const pathEnv = process.env.PATH
+  if (pathEnv === undefined) {
+    return true   // 判定材料が無いなら従来どおり試す
+  }
+
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : ['']
+  return pathEnv.split(path.delimiter).some((dir) => {
+    return dir.length > 0 && exts.some((ext) => existsSync(path.join(dir, AGY_PATH + ext)))
+  })
+}
+
 function callCliOnce(
   prompt: string,
   cliModel: string,
@@ -304,7 +339,21 @@ function callCliOnce(
   stage: string,
   jsonSchema?: Record<string, unknown>,
   cliEffort?: 'low' | 'medium' | 'high',
+  validateResponse?: (raw: string) => boolean,
 ): CliOutcome {
+  if (!isAgyAvailable()) {
+    return {
+      ok: false,
+      text: null,
+      unavailable: true,
+      diagnostics: {
+        provider, stage, failureClass: 'auth_or_config',
+        exitCode: null, timedOut: false,
+        message: `${AGY_PATH} is not available on PATH; skipping this stage without spawning`,
+      },
+    }
+  }
+
   let schemaDir: string | undefined
   const argv = ['--model', cliModel]
   if (cliEffort !== undefined) argv.push('--effort', cliEffort)
@@ -354,11 +403,18 @@ function callCliOnce(
     if (jsonSchema !== undefined) {
       const extracted = extractStructuredOutput(stdout)
       if (extracted !== undefined) {
+        if (validateResponse !== undefined && !validateResponse(extracted)) {
+          return { ok: false, text: null, unavailable: false, diagnostics: noFormalVerdictDiagnostics(provider, stage, extracted) }
+        }
         return { ok: true, text: extracted, unavailable: false }
       }
       // structured_output を取り出せなかった場合は生の stdout のまま返す。
       // 呼び出し元パーサーは複数候補から JSON を探すため、そのまま渡しても壊れない
       // （fail-open ではなく、既存の多段パースにそのまま委ねるだけ）。
+    }
+
+    if (validateResponse !== undefined && !validateResponse(stdout)) {
+      return { ok: false, text: null, unavailable: false, diagnostics: noFormalVerdictDiagnostics(provider, stage, stdout) }
     }
 
     return { ok: true, text: stdout, unavailable: false }
@@ -387,8 +443,9 @@ function callCliDetailed(
   sleepImpl: (ms: number) => void,
   jsonSchema?: Record<string, unknown>,
   cliEffort?: 'low' | 'medium' | 'high',
+  validateResponse?: (raw: string) => boolean,
 ): CliOutcome {
-  let outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort)
+  let outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort, validateResponse)
   for (
     let attempt = 1;
     retryTransient &&
@@ -401,6 +458,29 @@ function callCliDetailed(
   return outcome
 }
 
+/**
+ * 「応答は返ったが formal verdict が成立しなかった」を失敗として表現する。
+ *
+ * **`transient` に分類するのは意図的である。** 実測（2026-09-17）でこの truncation は
+ * 非決定的で、同じ prompt でも成立したりしなかったりする。したがって既存の
+ * transient recovery（bounded retry → 次 stage）に載せるのが正しく、
+ * 新しい retry 機構を足す必要はない。
+ */
+function noFormalVerdictDiagnostics(
+  provider: ProviderFailureDiagnostics['provider'],
+  stage: string,
+  text: string,
+): ProviderFailureDiagnostics {
+  return {
+    provider,
+    stage,
+    failureClass: 'transient',
+    exitCode: null,
+    timedOut: false,
+    message: `provider returned ${text.length} chars but no valid Meta Review formal verdict could be parsed`,
+  }
+}
+
 interface ApiOutcome {
   ok: boolean
   text: string | null
@@ -408,9 +488,17 @@ interface ApiOutcome {
 }
 
 /** REST API を1回だけ呼び出す。失敗時は分類済み診断情報を添えて返す。 */
-async function callApiOnce(prompt: string, stage: string, apiModel?: string): Promise<ApiOutcome> {
+async function callApiOnce(
+  prompt: string,
+  stage: string,
+  apiModel?: string,
+  validateResponse?: (raw: string) => boolean,
+): Promise<ApiOutcome> {
   try {
     const text = await callGeminiForReview(prompt, apiModel)
+    if (validateResponse !== undefined && !validateResponse(text)) {
+      return { ok: false, text: null, diagnostics: noFormalVerdictDiagnostics('gemini_api', stage, text) }
+    }
     return { ok: true, text }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -441,8 +529,9 @@ async function callApiDetailed(
   retryTransient: boolean,
   sleepImpl: (ms: number) => void,
   apiModel?: string,
+  validateResponse?: (raw: string) => boolean,
 ): Promise<ApiOutcome> {
-  let outcome = await callApiOnce(prompt, stage, apiModel)
+  let outcome = await callApiOnce(prompt, stage, apiModel, validateResponse)
   for (
     let attempt = 1;
     retryTransient &&
@@ -450,7 +539,7 @@ async function callApiDetailed(
     attempt++
   ) {
     sleepImpl(TRANSIENT_RETRY_DELAYS_MS[attempt - 1])
-    outcome = await callApiOnce(prompt, stage, apiModel)
+    outcome = await callApiOnce(prompt, stage, apiModel, validateResponse)
   }
   return outcome
 }
@@ -552,6 +641,50 @@ function handleBothExhausted(featureName: string, diagnostics: ProviderFailureDi
  * （プロンプト不正・agy 未認証等）では Claude フォールバックを試みず、そのまま両方失敗として
  * 扱う（無条件フォールバックにしない）。
  */
+/**
+ * 成功した attempt を 1 行で残す。**応答本文は出さない**（段・モデル・長さだけ）。
+ *
+ * 既存の CI 実行ログ上で、Meta Review 総数 / 段別成功数 / prompt 規模を後から数えられる。
+ * 新しい Telemetry backend は作らない。
+ */
+function logMetaReviewAttempt(
+  featureName: string,
+  promptChars: number,
+  stage: string,
+  model: string | undefined,
+  text: string,
+): void {
+  console.log(`[metaReview] attempt ${JSON.stringify({
+    feature: featureName, outcome: 'formal_verdict', stage, model: model ?? '(default)',
+    promptChars, responseChars: text.length,
+  })}`)
+}
+
+/**
+ * **後続段が成功しても、落ちた段の診断を捨てない。**
+ *
+ * 既存実装は全段失敗時（`handleBothExhausted`）にしか診断を出さないため、
+ * 「CLI が落ちて API が拾った」ケースがログ上まったく見えなかった。
+ * 2026-09-17 の調査では、どの段が応答を返したのかすら特定できず一度空振りしている。
+ *
+ * `diagnostics` は raw stderr/stdout を含まない allowlist 型なのでそのまま出せる。
+ */
+function logStageFallback(
+  featureName: string,
+  promptChars: number,
+  outcome: { diagnostics?: ProviderFailureDiagnostics },
+): void {
+  const d = outcome.diagnostics
+  if (d === undefined) {
+    return
+  }
+  console.log(`[metaReview] attempt ${JSON.stringify({
+    feature: featureName, outcome: 'no_formal_verdict', stage: d.stage, provider: d.provider,
+    failureClass: d.failureClass, exitCode: d.exitCode, httpStatus: d.httpStatus,
+    timedOut: d.timedOut, promptChars, message: d.message,
+  })}`)
+}
+
 export async function callGeminiWithFallback(
   prompt: string,
   options?: GeminiRouterOptions,
@@ -566,6 +699,7 @@ export async function callGeminiWithFallback(
     cliJsonSchema,
     retryTransient = false,
     sleepImpl = defaultSleepSync,
+    validateResponse,
   } = options ?? {}
 
   let cliOutcome: CliOutcome
@@ -573,18 +707,34 @@ export async function callGeminiWithFallback(
 
   if (preferCli) {
     // CLI → API
-    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort)
-    if (cliOutcome.ok) return cliOutcome.text as string
+    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort, validateResponse)
+    if (cliOutcome.ok) {
+      logMetaReviewAttempt(featureName, prompt.length, 'gemini_cli', cliModel, cliOutcome.text as string)
+      return cliOutcome.text as string
+    }
+    logStageFallback(featureName, prompt.length, cliOutcome)
 
-    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel)
-    if (apiOutcome.ok) return apiOutcome.text as string
+    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel, validateResponse)
+    if (apiOutcome.ok) {
+      logMetaReviewAttempt(featureName, prompt.length, 'gemini_api', apiModel, apiOutcome.text as string)
+      return apiOutcome.text as string
+    }
+    logStageFallback(featureName, prompt.length, apiOutcome)
   } else {
     // API → CLI
-    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel)
-    if (apiOutcome.ok) return apiOutcome.text as string
+    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel, validateResponse)
+    if (apiOutcome.ok) {
+      logMetaReviewAttempt(featureName, prompt.length, 'gemini_api', apiModel, apiOutcome.text as string)
+      return apiOutcome.text as string
+    }
+    logStageFallback(featureName, prompt.length, apiOutcome)
 
-    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort)
-    if (cliOutcome.ok) return cliOutcome.text as string
+    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort, validateResponse)
+    if (cliOutcome.ok) {
+      logMetaReviewAttempt(featureName, prompt.length, 'gemini_cli', cliModel, cliOutcome.text as string)
+      return cliOutcome.text as string
+    }
+    logStageFallback(featureName, prompt.length, cliOutcome)
   }
 
   // Gemini（API・CLI 双方）が quota 起因で失敗した場合だけ Antigravity/Claude を試す。
@@ -593,9 +743,13 @@ export async function callGeminiWithFallback(
   let claudeOutcome: CliOutcome | undefined
   if (geminiBothQuota) {
     claudeOutcome = callCliDetailed(
-      prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, 'antigravity_claude_cli', featureName, retryTransient, sleepImpl, cliJsonSchema,
+      prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, 'antigravity_claude_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, undefined, validateResponse,
     )
-    if (claudeOutcome.ok) return claudeOutcome.text as string
+    if (claudeOutcome.ok) {
+      logMetaReviewAttempt(featureName, prompt.length, 'antigravity_claude_cli', ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, claudeOutcome.text as string)
+      return claudeOutcome.text as string
+    }
+    logStageFallback(featureName, prompt.length, claudeOutcome)
     // 2026-08-26 独立レビュー指摘: Claude段が非quota理由（認証エラー・プログラムエラー等）で
     // 失敗した場合、それをquota起因と混同してCopilotへ静かにフォールバックしてはいけない。
     // 以降の combineFailureClasses() が claudeOutcome の診断情報も含めて再判定するため、

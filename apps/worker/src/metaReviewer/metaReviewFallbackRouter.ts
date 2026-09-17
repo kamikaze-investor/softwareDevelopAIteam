@@ -17,7 +17,7 @@
  */
 
 import { callGeminiWithFallback, MetaReviewProviderError, type GeminiRouterOptions } from './geminiRouter.js'
-import { callCopilotForMetaReview } from './copilotRouter.js'
+import { callCopilotForMetaReview, DEFAULT_COPILOT_META_REVIEW_MODEL } from './copilotRouter.js'
 
 export {
   MetaReviewProviderError, sanitizeMessage, type FailureClass, type ProviderFailureDiagnostics,
@@ -40,6 +40,8 @@ export async function reviewWithProviderFallback(
   prompt: string,
   geminiOptions?: GeminiRouterOptions,
 ): Promise<MetaReviewFallbackResult> {
+  const validateResponse = geminiOptions?.validateResponse
+
   try {
     const raw = await callGeminiWithFallback(prompt, geminiOptions)
     return { raw, providerUsed: 'gemini' }
@@ -54,6 +56,29 @@ export async function reviewWithProviderFallback(
     )
 
     const raw = callCopilotForMetaReview(prompt, { usage: 'meta_review' })
+
+    // **Copilot にも同じ成功条件を適用する。** text が返っただけでは成立とみなさない。
+    // ここで fail-open すると、Copilot の truncated / malformed 応答が
+    // Meta Review 結果として採用されてしまう。
+    if (validateResponse !== undefined && !validateResponse(raw)) {
+      console.log(`[metaReview] attempt ${JSON.stringify({
+        feature: 'meta_review', outcome: 'no_formal_verdict', stage: 'copilot_cli',
+        provider: 'copilot', vendor: 'microsoft', model: DEFAULT_COPILOT_META_REVIEW_MODEL,
+        transport: 'copilot_cli', responseChars: raw.length,
+      })}`)
+      throw new MetaReviewProviderError(
+        'Copilot returned a response but no valid Meta Review formal verdict could be parsed',
+        'unknown',
+        [],
+      )
+    }
+
+    console.log(`[metaReview] attempt ${JSON.stringify({
+      feature: 'meta_review', outcome: 'formal_verdict', stage: 'copilot_cli',
+      provider: 'copilot', vendor: 'microsoft', model: DEFAULT_COPILOT_META_REVIEW_MODEL,
+      transport: 'copilot_cli', responseChars: raw.length,
+    })}`)
+
     return { raw, providerUsed: 'copilot' }
   }
 }

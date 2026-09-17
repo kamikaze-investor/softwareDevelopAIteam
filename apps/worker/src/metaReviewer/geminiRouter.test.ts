@@ -30,6 +30,9 @@ vi.mock('node:fs', async () => {
     mkdirSync: vi.fn(),
     mkdtempSync: actual.mkdtempSync,
     rmSync: actual.rmSync,
+    // agy の存在確認に使う。既存ケースはすべて「agy はある」前提で spawn 経路を検証しているので
+    // true を返す（agy 不在時の skip は formalVerdictFallback.test.ts が別途固定する）。
+    existsSync: () => true,
   }
 })
 

@@ -20,6 +20,8 @@ vi.mock('./geminiRouter.js', async (importOriginal) => {
 })
 vi.mock('./copilotRouter.js', () => ({
   callCopilotForMetaReview: vi.fn(),
+  // provenance ログ用に実装が参照する。値は実物と同じ Microsoft 系モデル。
+  DEFAULT_COPILOT_META_REVIEW_MODEL: 'mai-code-1.1-flash',
 }))
 
 import { callGeminiWithFallback, MetaReviewProviderError, type FailureClass } from './geminiRouter.js'
