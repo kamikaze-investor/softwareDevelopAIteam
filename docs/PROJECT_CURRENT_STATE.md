@@ -224,6 +224,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
+- **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**
+- **原則自体の再Review候補を、適用記録から機械的に起こす**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
@@ -301,8 +303,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **高リスク変更の実行前に rollback path の存在を確認する**（state: deferred）
 - **dry-run が「実行を飛ばす」だけで simulation になっていない**（state: deferred）
 - **段階投入（feature flag / canary / 段階配信）が無い**（state: deferred）
-- **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**（state: in_progress）
-- **原則自体の再Review候補を、適用記録から機械的に起こす**（state: in_progress）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
