@@ -6438,12 +6438,51 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - **新しい Gate を作らない。** 既存の検証関数と guard の範囲で表現する
    - 効果検証可能性: 空 `allowedPaths` で作られた Task が過去に何件あったかを DB から数えられること
 
+   ---
+
+   **【2026-09-17 CEO 判断: A / B に分離する。B を A に混ぜて通常 Executor へ流さない】**
+
+   **A: 非 protected — 入口を塞ぐ（通常の VPS Candidate で実装可能）**
+   - 対象: `apps/api/src/storage/roadmapTaskValidation.ts`
+   - 内容: 空 `allowedPaths` を validation error として拒否する
+   - 位置づけ: 既に `roadmapAdoption.ts`（`allowedPaths.length === 0` で fail-closed）と
+     `actionGate.ts` の `assertAdoptionScopeIsBounded()` が同じ要件を持つ。**同一責務の3経路のうち
+     ここだけが素通し**なので、生成ロジックの変更ではなく既存 validation の整合修正である。
+   - 新しい Gate / workflow / state を追加しない
+
+   **B: protected — 既存分を塞ぐ（Maintenance Lane / Tier B でのみ実装可能）**
+   - 対象: `apps/worker/src/guards/fileChangeGuard.ts`
+   - 内容: `if (policy.allowedPaths.length > 0)` を、空なら Task 単位の変更範囲を
+     fail-closed にする向きへ倒す
+   - `ALWAYS_FORBIDDEN_PATTERNS` 対象。**通常 Executor では原理的に実装できない**
+   - 既存影響を確認してから実施する。**着手直前に件数と state 別内訳を測り直す**
+     （過去値を使い回さない）
+
+   **B の移行影響（2026-09-17 実測。着手時は再測定すること）**:
+   空 `allowedPaths` は 45 / 206。ただし **44 件は archived project 所属**である。
+   稼働中の project は `AIteamOS` のみ（7 tasks）で、そのうち空は1件だけ
+   （`copilotのモデル指定` / `pending` / `roadmapActive=false` / **Job 0件** / 2026-09-15 以降未実行）。
+   `completeTaskAndCreateContinuation()` は archived project の継続を作らないため、
+   **B の実影響は休眠中の1件**である。当初懸念した「45件が一斉に block」は起きない。
+
+   **【重要: この item は既に PL から採用不能になっている】**
+
+   この item には Task `6f8b41ef` があり、Job `d913fa9d` が実行済み（blocked）である。
+   そのため `state=` を何にしても PL はこの item を二度と採用できない。
+   機構と根本原因は既存 Finding **`executed-item-remaining-work-has-no-continuation`**
+   （`state=deferred`）に記録済みなので**ここでは繰り返さない**。本項目はその実例である。
+
+   **結果として A も B も、PL の autonomous adoption では着手できない。**
+   どちらも Maintenance Lane / Tier B 等、採用経路を通らない実装手段が要る。
+   `planned` / `deferred` の使い分けでは表現できない（採用可否は state ではなく
+   Job 実行履歴で決まるため）。CEO 指示により、**新しい state も workflow も追加しない**。
+
 ---
 
 ### 優先度 2: Escalation / recovery / resume
 
 <!-- roadmap:id=pl-escalation-recorded-without-delivery state=planned priority=high -->
-0. [ ] **PL Escalation が未配達でも `escalated` と記録し、以後その対象の処理を永久に止める** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
+0. [ ] **PL Escalation が未配達でも `escalated` と記録し、以後 PL の全作業が永久に止まる** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
 
    **事実**: `apps/api/src/pl/executionLoop.ts` の `escalateTo()` は
    `await escalate({...})` の直後に**無条件で** `record(storage, key, 'escalated', reason)` する。
@@ -6474,6 +6513,51 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - 配達結果を後から数えられるようにするか。`IStorage` に notifications store は無い。
      **新しいテーブルを作る前に、既存 `audit_log` の detail へ載せて足りるかを先に見る**
    - **新しい通知基盤を作らない。**
+
+   ---
+
+   **【2026-09-17 実態修正: 止まるのは「その対象」ではなく PL の全作業である】**
+
+   表題の「以後**その対象の**処理を永久に止める」は実態より軽い。production 実測で、
+   **escalate 済みの attention が1つでもあると PL は採用も含めて一切前進しなくなる**ことが判明した。
+
+   **実測（2026-09-16〜17）**: 2026-09-16T09:59:02Z に `job_blocked:d913fa9d` を escalate。
+   以後 **15時間以上 `audit_log` が1行も増えていない**。api / worker は `active` で、
+   PL tick は数秒ごとに走っている（`/api/jobs?taskId=...` のポーリングが journal に出続けている）。
+   **ループは生きていて、何も選べない状態**だった。
+
+   **原因は独立した2条件の組み合わせで、片方だけ見ても分からない**:
+   - `runPlTick()` は `actionable` を作るとき `hasEscalated()` で escalate 済みを**除外**する
+     → 復旧対象として選ばれない（この抑制自体は上記のとおり正しい）
+   - しかし `maybeAdoptNext()` の先頭は `if (state.attention.length > 0) return undefined` で、
+     **除外前の `state.attention`** を見ている
+     → attention は消えていないので**採用も止まる**
+
+   つまり除外は「復旧」側にしか効かず、「採用」側には効かない。結果として
+   **直せない対象が1つあるだけで、無関係な Roadmap 項目の採用まで恒久的に止まる。**
+
+   **この状態を外から解く手段が現状ない**（2026-09-17 read-only 確認）:
+   - `job_blocked` attention の条件は `task.status !== 'done'`。消すには Task を `done` にするしかない
+   - `TaskStatus` は `pending | in_progress | review | done | blocked` で、
+     **`done` 以外の終端状態が無い**
+   - `roadmapActive=false` にしても `currentTask` からは外れるが、attention は
+     `roadmapActive` を見ていないので**残る**（採用は止まったまま）
+   - `abort_task` は `PL_ACTION_KINDS` と gate table に**定義はある**が、
+     `executeAction()` に executor が無く、専用 route も無い。提案されても
+     `no executor wired for 'abort_task'` で終わる
+     （`allowedActionsFor('job_blocked')` にも入っていないので、そもそも提案されない）
+
+   → 未達成の Task を `done` にするか、新しい状態を足すか以外に出口が無い。
+   **どちらも CEO 指示で禁止されている。**
+
+   **着手時に確認すること（追加分。新しい recovery subsystem は作らない）**:
+   - `maybeAdoptNext()` の `state.attention.length > 0` を、`actionable` と**同じ除外**を通した
+     attention で判定するだけで解けるか。
+     「止まっているものを放置して新しい仕事を増やさない」という元の意図は、
+     **未 escalate の停滞に対しては維持される**（escalate 済み＝既に人の判断待ち、である）
+   - `job_blocked` attention が `task.roadmapActive` を見ていない点を併せて直すか、分けるか
+   - 既存 `no-status-for-closing-a-task-without-implementing` と同じ出口の問題である。
+     **新しい TaskStatus を足す前に**そちらの検討結果と突き合わせる
 
 <!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=planned -->
 0. [ ] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。

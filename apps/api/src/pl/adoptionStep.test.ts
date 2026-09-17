@@ -419,6 +419,15 @@ describe('採用 context — PL に判断材料を渡す', () => {
     // 触れないものも明示する（採用段階で実装不能な項目を選ばせない）
     expect(ADOPTION_SYSTEM_PROMPT).toContain('apps/worker/src/guards/**')
   })
+
+  it('system prompt が allowedPaths の記法（前方一致・glob 不可）を明示する', () => {
+    // 2026-09-16 実測: PL は `apps/api/src/**` を宣言した。Guard は前方一致なので
+    // この文字列は **何にも一致しない** — 範囲が狭いのではなく実質的に空だった。
+    // 「path を創作するな」では防げない（`apps/api/src` は実在する）。記法の問題である。
+    expect(ADOPTION_SYSTEM_PROMPT).toContain('allowedPaths is not a glob')
+    expect(ADOPTION_SYSTEM_PROMPT).toContain('matches NOTHING')
+    expect(ADOPTION_SYSTEM_PROMPT).toContain('never "apps/api/src/**"')
+  })
 })
 
 describe('selectAdoptionCandidates — 全項目がいずれ候補になる', () => {
