@@ -22,6 +22,7 @@ import {
   adoptionPromptVersion,
   findProposalDiagnostics,
   parseAdoptionProposal,
+  PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION,
   PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT,
   PROPOSAL_DIAGNOSTIC_RAW_LIMIT,
   readAdoptionCandidates,
@@ -487,12 +488,64 @@ describe('proposal_unusable — 観測して忘れない', () => {
     })
 
     const [diagnostic] = findProposalDiagnostics(storage, projectId)
-    expect(diagnostic?.reason).toMatch(/^json_parse_error(_at_position: d+)?$/)
+    // この入力は Node が「断片入り」の形で返すので、種別だけになる。
+    expect(diagnostic?.reason).toBe('json_parse_error')
     expect(diagnostic?.reason).not.toContain(secretish)
     expect(diagnostic?.reason).not.toContain('sk-')
     // raw 側は上限で切れているので、断片はそもそも入っていない。
     expect(diagnostic?.raw).not.toContain(secretish)
     expect(diagnostic?.rawTruncated).toBe(true)
+  })
+
+  // 1件あたりの上限だけでは総量が抑えられない。provider が壊れた出力を返し続けると、
+  // PL は escalate のたびに採用ウィンドウを切り直してまた試すため、診断が延々と増える。
+  it('同じ prompt 版の診断は一定数で打ち止めになる', async () => {
+    const { storage, projectId } = seedAdoptable()
+
+    for (let i = 0; i < PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION + 10; i += 1) {
+      await runAdoptionStep(storage, projectId, {
+        propose: async () => `not json #${i}`,
+        readLedger: () => LEDGER,
+      })
+    }
+
+    expect(findProposalDiagnostics(storage, projectId))
+      .toHaveLength(PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION)
+  })
+
+  // 位置が取れる形では**実際に位置が入る**こと。緩く書くと抽出が壊れていても通る
+  // （独立レビュー指摘: 最初の版は正規表現から \d が落ちており、テストも同じ形だった）。
+  it('位置が分かる parse エラーでは位置を残す', async () => {
+    const { storage, projectId } = seedAdoptable()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => '{"roadmapId":1,}',
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.reason).toMatch(/^json_parse_error_at_position: \d+$/)
+  })
+
+  // 「途中で切れた」と「そもそも JSON を書いていない」は原因が違う
+  // （前者は長さ切れ＝provider 側、後者は契約無視＝prompt 側）。
+  // 抽出の正規表現が閉じ括弧を要求するため、切れた出力は JSON.parse まで届かない。
+  it('出力が途中で切れたことと、散文で答えたことを区別する', async () => {
+    const cut = seedAdoptable()
+    await runAdoptionStep(cut.storage, cut.projectId, {
+      propose: async () => '{"roadmapId": "open-item", "allowedPaths": [',
+      readLedger: () => LEDGER,
+    })
+    expect(findProposalDiagnostics(cut.storage, cut.projectId)[0]?.reason)
+      .toBe('no_json_object_found: unterminated')
+
+    const prose = seedAdoptable()
+    await runAdoptionStep(prose.storage, prose.projectId, {
+      propose: async () => '次は open-item をやりましょう。',
+      readLedger: () => LEDGER,
+    })
+    expect(findProposalDiagnostics(prose.storage, prose.projectId)[0]?.reason)
+      .toBe('no_json_object_found')
   })
 
   it('payload に上限の無い欄を残さない', async () => {

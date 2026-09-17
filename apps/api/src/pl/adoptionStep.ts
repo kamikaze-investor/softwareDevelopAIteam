@@ -148,6 +148,19 @@ export const PROPOSAL_DIAGNOSTIC_RAW_LIMIT = 4000
 
 /** `proposer` の上限。呼び出し元から渡る自由文字列はここで止める。 */
 export const PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT = 120
+
+/**
+ * 同じ prompt 版について、1 Project あたり保存する診断の上限。
+ *
+ * **1件あたりの上限だけでは総量が抑えられない。** provider が非 JSON を返し続けると、
+ * PL は escalate したあと採用ウィンドウを切り直してまた試すため（`adoptionEntriesInCurrentWindow()`
+ * は escalate を区切りにする）、失敗が続く限り診断が延々と増える。
+ * 60 秒 tick なら 3 分ごとに 2 件、止まらない（独立レビュー指摘）。
+ *
+ * 同じ失敗を何百件集めても分類は進まないので、**先頭の数件だけ**を残す。
+ * prompt を直したら版が変わり、新しい予算が開く —— 直した後の挙動は改めて観測できる。
+ */
+export const PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION = 20
 export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
 export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
 export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
@@ -303,6 +316,19 @@ function recordProposalDiagnostic(
     rawLength: diagnostic.raw.length,
     rawTruncated: truncated,
     raw: truncated ? diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT) : diagnostic.raw,
+  }
+
+  // 同じ prompt 版の診断が十分に溜まっていたら、もう足さない。
+  // 分類に必要なのは最初の数件であって、同じ失敗の山ではない。
+  const existing = findProposalDiagnostics(storage, projectId)
+    .filter((entry) => entry.promptVersion === diagnostic.promptVersion)
+  if (existing.length >= PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION) {
+    console.warn(
+      `[adoptionStep] proposal diagnostics for project ${projectId} already at `
+      + `${PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION} for prompt ${diagnostic.promptVersion}; `
+      + 'not recording more until the prompt changes',
+    )
+    return
   }
 
   // **記録に失敗しても採用の結果は変えない。**
@@ -546,6 +572,26 @@ export function selectAdoptionCandidates<T extends RoadmapCandidate & { boosted?
  * **補正も推測もしない。** 足りない・型が違う場合は採用しない（fail-closed）。
  * ここで緩めると「PL が書いた文字列」と「実際に採用された範囲」がズレる。
  */
+/**
+ * `JSON.parse` の失敗を、**入力内容を一切含まない**分類名へ落とす。
+ *
+ * メッセージ本文は保存しない。ここで返る文字列は固定語と数字だけである。
+ */
+function classifyJsonParseError(error: unknown): string {
+  if (!(error instanceof Error)) return 'json_parse_error'
+
+  // 出力が途中で終わっている。max tokens 切れの典型で、prompt 起因か provider 起因かの分岐点。
+  if (error.message.includes('Unexpected end of JSON input')) {
+    return 'json_parse_error: unexpected_end_of_input'
+  }
+
+  const position = /at position (\d+)/.exec(error.message)?.[1]
+  if (position !== undefined) return `json_parse_error_at_position: ${position}`
+
+  // 残りは入力断片を含む形なので、種別だけにとどめる。内容は raw 側を上限付きで見る。
+  return 'json_parse_error'
+}
+
 export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefined {
   const result = parseAdoptionProposalDetailed(raw)
   return result.ok ? result.proposal : undefined
@@ -567,7 +613,19 @@ export type AdoptionProposalParseResult =
 
 export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalParseResult {
   const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return { ok: false, reason: 'no_json_object_found' }
+  if (!match) {
+    // **「散文で答えた」と「途中で切れた」を分ける。**
+    //
+    // 抽出の正規表現は閉じ括弧を要求するので、出力が max tokens で切れた場合は
+    // `JSON.parse` まで届かず、ここで落ちる（実測）。つまり
+    // `Unexpected end of JSON input` はこの経路では出ない。両者を同じ理由にすると、
+    // prompt 起因（契約を無視して散文）と provider 起因（長さ切れ）を分けられない。
+    // 判定材料は「開き括弧があるか」だけで、内容は一切見ない。
+    return {
+      ok: false,
+      reason: raw.includes('{') ? 'no_json_object_found: unterminated' : 'no_json_object_found',
+    }
+  }
 
   let parsed: unknown
   try {
@@ -575,18 +633,15 @@ export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalPars
   } catch (error: unknown) {
     // **`JSON.parse` のメッセージをそのまま載せない。**
     //
-    // Node 22 のメッセージは入力の断片を**そのまま含む**（実測:
-    // `Unexpected token 's', ..."          sk-SECRET-"... is not valid JSON`）。
-    // これを理由として保存すると、値を載せない約束が崩れるだけでなく、
-    // raw の上限より後ろにある断片が上限を迂回して混入しうる。
-    // 位置（数値）だけを取り出す。分類にはそれで足り、内容は raw 側で上限付きで見る。
-    const position = error instanceof Error
-      ? /at position (d+)/.exec(error.message)?.[1]
-      : undefined
-    return {
-      ok: false,
-      reason: position === undefined ? 'json_parse_error' : `json_parse_error_at_position: ${position}`,
-    }
+    // Node 22 のメッセージは3形ある（実測）:
+    //   1. `... in JSON at position 7 (line 1 column 8)`   … 位置あり・内容なし
+    //   2. `Unexpected end of JSON input`                   … 内容なし。**出力が途中で切れた**印
+    //   3. `Unexpected token 's', ..."   sk-SECRET-"... is not valid JSON` … **入力断片を含む**
+    //
+    // 3をそのまま保存すると、値を載せない約束が崩れるだけでなく、raw の上限より後ろにある
+    // 断片が上限を迂回して混入する。そこで**内容を含まない形へ分類してから**保存する。
+    // 2 を潰さないのは、これが「max tokens で切れた」という最も知りたい区別だからである。
+    return { ok: false, reason: classifyJsonParseError(error) }
   }
   if (typeof parsed !== 'object' || parsed === null) return { ok: false, reason: 'not_an_object' }
 
