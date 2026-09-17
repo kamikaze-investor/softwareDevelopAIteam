@@ -109,6 +109,20 @@ export async function createInitialImplementWorkflow(
   }
   if (!gate.ok) return { taskId, status: 'skipped', reason: gate.reason }
 
+  // **Job を作る直前に Task をもう一度読む。**
+  //
+  // Design Review を待っている間に `abort_task` がこの Task を park しうる。
+  // 待つ前の判定のまま queued Job を作ると、Worker は Task の状態を見ずにそれを拾うので、
+  // park が黙って取り消される。park の解除は CEO の判断であり、
+  // 待ち時間の長さで決まってよいものではない。
+  const current = storage.tasks.findById(task.id)
+  if (!current || !isInitialWorkflowTarget(current)) {
+    return { taskId, status: 'skipped', reason: 'task is no longer an initial workflow target' }
+  }
+  if (storage.tasks.isParked(current.id)) {
+    return { taskId, status: 'skipped', reason: 'task was parked by abort_task' }
+  }
+
   try {
     return { taskId, status: 'created', job: storage.jobs.create(jobInput) }
   } catch (error: unknown) {

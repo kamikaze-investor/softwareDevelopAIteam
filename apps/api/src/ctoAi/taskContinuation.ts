@@ -72,15 +72,22 @@ function failContinuation(
     error: reason,
     completedAt: new Date().toISOString(),
   })
+  // **park された Task を blocked へ上げない。**
+  //
+  // blocked は `roadmapActive` に関係なく project を占有する（`occupiesProject()`）ため、
+  // ここで上げると park は事実上取り消され、しかも resume は park を理由に拒否するので
+  // 誰も解消できない状態になる。continuation が成立しない理由が「park されたから」である以上、
+  // それは異常ではなく CEO が決めた結果であり、escalate する相手がいない。
+  const parked = storage.tasks.isParked(taskId)
   const task = storage.tasks.findById(taskId)
-  if (task?.status !== 'blocked') storage.tasks.update(taskId, { status: 'blocked' })
+  if (!parked && task?.status !== 'blocked') storage.tasks.update(taskId, { status: 'blocked' })
   storage.auditLog.record({
     actor: 'api',
     operation: 'task_continuation_failed',
     entityType: 'task_continuation',
     entityId: continuationId,
     result: 'failure',
-    detail: reason,
+    detail: parked ? `${reason} (task is parked; not escalated to blocked)` : reason,
   })
 }
 
