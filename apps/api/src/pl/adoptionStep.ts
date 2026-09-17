@@ -100,6 +100,10 @@ export function classifyAdoptionCandidates(
 ): ClassifiedCandidate[] {
   const projectTasks = storage.tasks.findByProjectId(projectId)
   const pendingContinuations = storage.taskContinuations.findPendingByProjectId(projectId).length
+  // **採用 seam と同じ条件で見る。** seam は Project 全体の active Task を見て follow-up を拒否するので、
+  // ここで Project が busy なのに候補として出すと、PL が選んだ末に FOLLOW_UP_NOT_ELIGIBLE で落ち、
+  // 採用 attempt 予算だけを焼く（2026-09-15 の事故と同じ形）。検出と強制を一致させる。
+  const projectHasActiveTask = projectTasks.some((task) => task.status !== 'done')
 
   return open.map((candidate) => {
     const siblings = projectTasks.filter(
@@ -125,6 +129,7 @@ export function classifyAdoptionCandidates(
     }
 
     const eligible = !active
+      && !projectHasActiveTask
       && pendingContinuations === 0
       && followUpCount < MAX_FOLLOW_UPS_PER_ROADMAP_ITEM
 

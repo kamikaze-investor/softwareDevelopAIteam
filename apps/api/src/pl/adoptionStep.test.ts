@@ -247,6 +247,20 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('fresh')
   })
 
+  it('Project に active Task があれば follow-up 候補にしない（検出と強制を一致させる）', () => {
+    // 採用 seam は Project 全体の active Task を見て拒否する。検出側が甘いと、PL が選んだ末に
+    // FOLLOW_UP_NOT_ELIGIBLE で落ちて採用 attempt 予算だけを焼く。
+    const { storage, projectId } = projectWithExecutedItem()
+    storage.tasks.create({
+      projectId, title: 'unrelated', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('not_available')
+  })
+
   it('candidate limit より前に follow-up を検出する', () => {
     const { storage, projectId } = projectWithExecutedItem()
 
