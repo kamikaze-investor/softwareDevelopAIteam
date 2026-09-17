@@ -7193,6 +7193,22 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 4. [ ] **Review Class B（強化AIレビュー）: 通常AI判断とCEO必須判断の中間を埋める（Tier Bとは別概念・CEO承認が着手条件）** —
       2026-09-15登録（CEO 指示）。**本項目は登録であり、この指示だけを根拠に Safety Policy を変更しない。**
 
+      **上位原則（2026-09-17 追記）**: 本項目の Class A / B / C は
+      **`specs/22_safety_approval_design_principle.md`（2026-09-17 CEO 採用。同ファイルが正本）** の 10 章に従って設計する。
+      同原則の採用によって本項目の**着手手順は免除されない**（下記「着手手順」1〜3 はそのまま有効であり、
+      `state=deferred` も維持する）。CEO が与えたのは Class A/B/C の**定義**であって、
+      着手手順 1 が要求する**具体例つき境界表**とその承認ではない。
+
+      同原則から本項目へ入る追加要求は次の 3 点である。
+      - **Risk は変更内容だけで判定しない**（同原則 3 章）。machine facts には最低限
+        **blast radius / detectability / recoverability / irreversibility** に対応する事実を含める。
+        「protected file か」「migration を含むか」だけでは同原則 3 章を満たさない
+      - **Recoverability を実装前に確認する**（同原則 8 章）。Class B の成立条件に
+        「rollback path が存在し、previous stable state が分かり、rollback 後の整合性確認方法がある」ことを含める。
+        **rollback 可能性を Reviewer の自己申告で埋めない**
+      - **Class B の効果は CEO 呼び出し回数では測らない**（同原則 0 章）。測るのは
+        「CEO を呼ぶべき変更の識別精度」であり、**Class C の取りこぼしが 0 であること**が先に来る
+
       **名称の注意**: 既存の `aiteamos-self-development-tier-a` / `aiteamos-self-development-tier-b` の
       **Tier B（外部セッションで protected / high-risk 変更を扱う運用形態）とは別概念**である。
       Tier は「誰がどの環境で作業するか」、Class は「その変更にどれだけの証拠を要求するか」。混同しないこと。
@@ -7324,15 +7340,16 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       2. CEO が境界表を承認する
       3. `state=planned` へ変更して実装着手する
 
-      **⚠ 現状の機構では `deferred` は採用を機械的に止めない（2026-09-15 実測）**: 採用経路の state 判定は
-      3箇所とも **`done` だけ**を除外しており、`deferred` / `blocked` / `planned` は等しく採用可能である。
-      - `apps/api/src/pl/adoptionStep.ts` の `readAdoptionCandidates()` … `filter(item => item.state !== 'done')`
-      - `apps/api/src/ctoAi/roadmapAdoption.ts` … `if (item.state === 'done') return ITEM_ALREADY_DONE`
-      - `apps/api/src/pl/actionGate.ts` の `checkRoadmapItemAlignment()` … 同じく `done` のみ拒否
+      **`deferred` は現在は機械的に強制される（2026-09-17 確認。2026-09-15 時点の記述を訂正）**:
+      登録時点では採用経路3箇所とも `done` だけを除外しており `deferred` は素通りしていたが、
+      その後 `isRoadmapItemAdoptable()` による **`planned` のみの allowlist** へ統一され、
+      3経路すべてが同じ述語を共有している。
+      - `apps/api/src/pl/adoptionStep.ts` の `readAdoptionCandidates()` … `.filter(item => isRoadmapItemAdoptable(item.state))`
+      - `apps/api/src/ctoAi/roadmapAdoption.ts` … `ITEM_NOT_ADOPTABLE`
+      - `apps/api/src/pl/actionGate.ts` の `checkRoadmapItemAlignment()` … 同じ述語で拒否
 
-      したがって `deferred` は**意図の記録であって強制ではない**。上記手順を機械的に強制したい場合は
-      別項目として「採用可能な state を明示的に限定する」最小変更が要る（本項目の scope 外。
-      `mandatory-gate-policy` の fail-closed 方針と同じ形で扱えるが、**新しい状態モデルは足さないこと**）。
+      したがって本項目の `state=deferred` は**意図の記録であると同時に実効的な停止**でもある。
+      着手には上記手順 3（`state=planned` への変更）が必要で、その前に CEO の境界表承認が要る。
 
 <!-- roadmap:id=vps-pl-execution-loop state=done -->
 1. [x] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
@@ -7910,6 +7927,124 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         より軽い案へ絞れば通るのか
       - 効果検証可能性（Design Philosophy 8）: CONFLICT で止まった採用が何件あり、
         そのうち何件が表記起因だったかを後から数えられること
+
+<!-- roadmap:id=executed-item-remaining-work-has-no-continuation state=deferred -->
+10. [ ] **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）** —
+      2026-09-17登録（read-only 調査 + production 実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: Roadmap 項目が ledger 上まだ open で、その項目の Task が既に done、
+      かつ本文に残作業がある状態になると、**人手なしでは二度と先へ進めない**。
+      既存経路が全部断る（in-memory SQLite で再現、2026-09-17）:
+
+      | 経路 | 結果 |
+      |---|---|
+      | `readAdoptionCandidates()` | 候補に出さない（`executedKeys` で除外） |
+      | `adoptRoadmapItem()` | `ITEM_NOT_ADOPTABLE`（in_progress のとき） |
+      | `adoptRoadmapItem()`（state を `planned` へ戻しても） | **`ALREADY_EXECUTED`** |
+      | `resumeBlockedTask()` | 拒否（`Latest job status is success, not blocked`） |
+      | `task_continuations` | commit 時点で `status=completed` / `nextTaskId=null` として**既に終端済み** |
+      | `buildSystemState()` の `attention` | **NONE**（PL には何も見えない） |
+
+      その後 PL は `maybeAdoptNext()` で**次の planned 項目を採用して先へ進む**。
+      残作業は誰にも気付かれずに落ちる。**失敗として観測されない**のが最も危険な点である。
+
+      **root cause（単独の欠陥ではなく4つの組み合わせ）**:
+      1. 採用は 1 Roadmap 項目につき実質 1 Task。`syncRoadmapTasks()` は入力外の
+         roadmapActive Task を落とすので、2件目の Task は存在しない
+      2. 一度でも Job が走ると `ALREADY_EXECUTED` で**再採用が恒久的に不可能**になる
+         （`roadmapAdoption.ts`。`adoptionStep.ts` の `executedKeys` も同じ事実で候補から外す）
+      3. `selectNextContinuableTask()` は**既存の pending roadmapActive Task しか選ばない**。
+         Task を作る責務をどこも持っていない
+      4. `AttentionKind` は全て Task / Job / continuation スコープで、`systemState.ts` は
+         **ledger を一切読まない**。「項目に残作業がある」ことを表す事実がシステム内に存在しない
+
+      **PR #226 の planned-only は原因ではない。** `state` を `planned` へ戻しても
+      `ALREADY_EXECUTED` で詰まることを実測している（上表）。
+      planned-only は refusal を1つ増やしただけで、行き止まり自体はそれ以前から存在する。
+
+      **production 実測（2026-09-17・read-only）**: CEO が例示した3項目
+      （`mandatory-gate-policy` / `cross-project-state-api` /
+      `roadmap-generation-constraint-compliance`）は**いずれも Task が1件も無い**
+      （外部セッションが実装したため採用経路を通っていない）。
+      よって3件とも **Case A = 詰まっていない**。人が `pnpm roadmap:update <id> planned` で
+      state を戻せば通常どおり採用でき、`task_ready_without_job` も正常に出る（再現確認済み）。
+
+      **実際に詰まっているのは別の項目である。** `roadmap_task_key` を持つ Task を
+      production DB で全件照合した結果、**ledger で open なのに Task が実行済み**なものが実在する:
+
+      | roadmap id | ledger | Task | jobs |
+      |---|---|---|---|
+      | `roadmap-adoption-followups` | planned | done | 1 |
+      | `meta-review-structured-output-robustness` | planned | done | 5 |
+      | `mobile-approval-role-docs` | planned | done | 6 |
+      | `continuation-reconcile-nonblocking-followups` | planned | done | 6 |
+      | `allowed-paths-empty-disables-file-change-guard` | planned | pending | 1 |
+
+      **重要な差異（CEO 提示の定義より範囲が広い）**: 上記はすべて `in_progress` ではなく
+      **`planned`** である。行き止まりの条件は `state === 'in_progress'` ではなく
+      **「ledger で open ＋ その項目の Task が既に Job を実行済み」**である。
+      `in_progress` は手動 CLI でしか書かれない（`roadmap:update` のみ）ので、
+      実際には `planned` のまま残っている方が多い。
+      なお下2件は別の pending Task / 未終了 Task を持つため進行経路は残っている（再採用だけ不可）。
+      完全な行き止まりは上3件。
+
+      **設計原則（CEO 指示・2026-09-17。実装時に守る）**:
+      - **planned-only の initial adoption は維持する。`in_progress` を通常の採用対象へ戻さない**
+      - 「既に実行済みの open 項目に残作業がある場合**だけ**、bounded な follow-up Task を作る」
+        という**狭い continuation** として設計する
+      - 新しい continuation system / workflow / TaskStatus / Roadmap state を**先に作らない**。
+        既存の `adoptRoadmapItem` / Task 生成 / `implementationScope` / Design Review /
+        Mandatory Gate / Independent Review / PL / State API の再利用を優先する
+
+      **成立の最低条件（実装時の受入条件）**:
+      prior executed Task あり / active Task なし / pending continuation なし /
+      旧 Task は resume 不可 / **新しい `implementationScope` を必須**にする /
+      **新 Task として作る**（旧 Task を再利用しない）/ Design Review・Gate・`allowedPaths` を
+      **再計算する** / **過去の approval・authority を一切継承しない**。
+
+      **Detection（先に検討する順序）**: 「open な項目に残作業があるが active Task が無い」を
+      **既存 State API / `attention` へ載せられないか**を最初に見る。
+      既存 `AttentionKind` で表現できるなら**新しい kind を増やさない**。
+      ただし現状の `attention` は Task / Job / continuation からしか作られず、
+      `systemState.ts` は ledger を読まないため、**事実の入口が無い**のが実装上の争点になる。
+      観測面の語彙は `cross-project-state-api` が owner なので、そちらと重複させない。
+
+      **関連項目（重複させない）**:
+      - `roadmap-adoption-followups`（planned）— サブ項目(3)は「**手動作成 Task** が採用経路の
+        入口に無い」問題で、本項目の「**実行済み項目の残作業**」とは別。ただし直す seam は同じ
+        adoption 経路なので、着手するなら同時に設計する。
+        **この項目自身が上表の行き止まり実例でもある**
+      - `no-status-for-closing-a-task-without-implementing`（planned）— 「実装せず閉じる」状態が
+        無い問題。本項目は「閉じたが残っている」側であり別
+      - `adoption-does-not-check-implementation-feasibility`（planned）— 採用時点でスコープの
+        実現可能性が分からない問題。本項目とは別
+      - `pl-autonomous-roadmap-adoption`（done）/ `mandatory-gate-policy` — action 語彙と
+        強制 Gate の owner。本項目で新しい PL 権限を作らない
+
+      **state=deferred の理由（CEO 判断・2026-09-17）**: 本 Finding の最終的な解決は
+      `ALREADY_EXECUTED` に対する**限定的な例外**、すなわち既存の adoption authority を
+      条件付きで広げる形になる可能性が高い。CEO がその境界を決める前に PL がこの項目を
+      自律採用しないよう、`deferred` にする。
+      **Finding の存在・優先度を下げる意味ではない。実装着手だけを保留する。**
+      `deferred` は PR #226 以降、候補一覧・直接採用・Gate alignment の3経路すべてで
+      機械的に効くので、この保留は文言ではなく強制である。
+
+      **着手手順**: 次の4点の境界を CEO へ提示し、承認を得てから `state=planned` へ戻す。
+      (1) どの条件なら executed item の follow-up を許すか /
+      (2) `ALREADY_EXECUTED` のどこまでを維持するか /
+      (3) follow-up が新 Task として Design Review・Gate・`allowedPaths` を全て再計算すること /
+      (4) 過去の approval・authority を一切継承しないこと。
+
+      **Detection と Action を別 Finding へ分割しない（CEO 指示・2026-09-17）。**
+      両者は同じ root cause（実行済み項目の残作業を表す事実がシステム内に存在しない）から
+      出ているため、本項目にまとめて残す。
+
+      **やらないこと（non-goals）**: `ALREADY_EXECUTED` を単純に撤去すること
+      （同じ Task の二重実行を防いでいる既存の防御であり、外すと 2026-09-15 の
+      attempt 予算消費事故が戻る）/ `in_progress` を採用対象へ戻すこと /
+      新しい Task status・Roadmap state・継続専用テーブルの追加 /
+      本 Finding を根拠に Safety・Approval 境界を動かすこと。
+      **`ALREADY_EXECUTED` に例外を設けるのは既存 guard の緩和にあたるため、CEO 判断事項とする。**
 
 <!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
 10. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
@@ -8546,4 +8681,74 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
 ---
 
-*Updated: 2026-09-04*
+## Safety / Approval 設計原則の未充足層（2026-09-17 実測）
+
+**上位原則**: `specs/22_safety_approval_design_principle.md`（2026-09-17 CEO 採用）。
+同原則 2 章の 8 層防御を現行実装へ突き合わせ、実測した結果が下表である。
+**推測ではなく、各ファイルを実際に読んで確認した**（Q2 の 0/4 は `apps/` + `packages/shared/` 全体への
+grep が 0 件であることによる）。
+
+| 層 | 状態 | 根拠 |
+|---|---|---|
+| 1 Isolation | **実装済み・配線済み** | `runContainedOrThrow`（cgroup v2）/ `isInsideTargetRoot()` / `buildTargetCommandEnv()` |
+| 2 Simulation / Preflight | **部分的** | `dryRun` は `adapter.ts` で `exitCode:0` を返して**実行を飛ばすだけ**。diff を作らず Gate にも当てない |
+| 3 Mechanical Validation | **実装済み・配線済み** | `runMechanicalGate` / `MECHANICAL_GATE_PATTERNS` / `runPolicyGuard` / `runRiskReview` |
+| 4 Independent Multi-Model Review | **実装済み・配線済み** | `isGeneratorSeparatedFromFinalReviewer()` / `runIndependentReview` |
+| 5 Test / E2E | **実装済み**（CI 強制は本 checkout では未確認。`.github/workflows/` が無い） | worker の `typecheck` / `test` / `lint` gated command |
+| 6 Limited Rollout | **部分的** | `deployCanary.ts` は reviewer 経路の単発チェック。feature flag / 段階配信は無い |
+| 7 Runtime Monitoring | **実装済み・配線済み** | `startWatchdog()` / `checkStall()` / `watchdogEvents` |
+| 8 Fast Rollback / Recovery | **実装済み・配線済み** | `revertBlockedJobChanges()` / `rollbackInfo.rollbackArgv` / `rollback_commit` gate |
+| （原則 8 章）実行前の Recoverability 確認 | **無い** | `rollbackInfo` は commit **後**に記録される。`authorizePlAction()` は「rollback path が存在するか」を一度も見ない |
+| （原則 11 章）事故→Learning | **部分的** | Incident DB と Context Pack 同梱まで。test / prompt / classifier を自動で更新する経路は無い |
+
+**Risk の 5 次元（原則 3 章）**: `blast radius` / `detectability` / `recoverability` / `irreversibility` は
+**4 つとも実入力として存在しない**（型・フィールド・概念のいずれとしても 0 件）。
+現行分類器の入力は changed files のパス文字列・diff パターン・ファイル数・action kind enum のみである。
+この不足の解消は `review-class-b-enhanced-ai-review` の scope に含めた（同項目の「上位原則」節を参照）。
+
+**事故→Learning は `project-auto-incident-pattern-improvement`（planned）が担当する。**
+本セクションでは重複登録しない。
+
+<!-- roadmap:id=recoverability-precheck-before-risky-change state=deferred -->
+1. [ ] **高リスク変更の実行前に rollback path の存在を確認する** — 2026-09-17登録。
+      `specs/22_safety_approval_design_principle.md` 8 章。**現状は「壊れたら戻せます」が誰にも検証されていない。**
+
+      **実測（2026-09-17）**: `rollbackInfo`（`previousCommitHash` / `rollbackArgv`）は
+      `jobRunner.ts` が **commit した後**に記録する。`authorizePlAction()` / `resolvePlActionPolicy()` は
+      evidence と approval の有無しか見ず、「この操作に戻り道があるか」を入力に持たない。
+
+      **最小変更の方向**: 新しい Gate を足さない。`resolvePlActionPolicy()` の入力へ
+      「rollback path が判明しているか」の**機械的事実**を足し、判明しない操作を安全側へ倒す。
+      rollback 可能性を Reviewer / PL の自己申告で埋めない（同原則 7 章）。
+
+      **着手前に確認すること**: `rollback_commit` が既に CEO gate である以上、
+      本項目が実際に減らすリスクは何かを先に言語化する。名前を言えない失敗のために制約を足さない
+      （`specs/21` standard-design-frame）。
+
+<!-- roadmap:id=dry-run-does-not-simulate state=deferred -->
+2. [ ] **dry-run が「実行を飛ばす」だけで simulation になっていない** — 2026-09-17登録。
+      `specs/22_safety_approval_design_principle.md` 2 章 第2層。
+
+      **実測（2026-09-17）**: `apps/worker/src/aiCli/adapter.ts:420` で `request.dryRun` は
+      `exitCode: 0` / `changedFiles: []` を即返す。**diff を生成せず、Gate にも Review にも当たらない。**
+      したがって現状の dry-run は「変更を適用せずに危険性を測る」用途に使えない。
+
+      **着手前に確認すること**: simulation が本当に要るのは Candidate が使えない場面だけではないか。
+      Candidate clone 上での実行が既に第2層を満たしているなら、本項目は不要になり得る。
+      **不要だと分かったら closed にする**（新しい実行モードを増やさないこと）。
+
+<!-- roadmap:id=staged-rollout-absent state=deferred -->
+3. [ ] **段階投入（feature flag / canary / 段階配信）が無い** — 2026-09-17登録。
+      `specs/22_safety_approval_design_principle.md` 4 章。
+
+      **実測（2026-09-17）**: `deployCanary.ts` は deploy 後に reviewer 経路を1回叩く単発チェックであり、
+      **製品の段階配信ではない**。feature flag も percentage rollout も存在しない（`flagger*` は 0 件）。
+
+      **現状の段階は `Candidate → Stable` の2段だけである。** 外部顧客がまだ存在しないため、
+      1% / 5% / 20% の段階配信は**現時点では過剰**である可能性が高い。
+      **本項目は「顧客が存在する前に段階配信基盤を作る」ことを意味しない。**
+      着手条件は、外部利用者または複数 Project の同時利用が実際に発生することとする。
+
+---
+
+*Updated: 2026-09-17*

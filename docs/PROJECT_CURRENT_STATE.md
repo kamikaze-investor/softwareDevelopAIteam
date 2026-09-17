@@ -282,6 +282,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **external completion reconcile の根拠2つが、まだ機械照合になっていない**（state: planned）
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
+- **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: deferred）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
@@ -295,6 +296,9 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **隔離PoC（AIteamOS本体と非接続）**（state: deferred）
 - **PL Gateway設計（設計のみ・実装は本統合で行う）**（state: deferred）
 - **本統合（着手条件付き）**（state: deferred）
+- **高リスク変更の実行前に rollback path の存在を確認する**（state: deferred）
+- **dry-run が「実行を飛ばす」だけで simulation になっていない**（state: deferred）
+- **段階投入（feature flag / canary / 段階配信）が無い**（state: deferred）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->

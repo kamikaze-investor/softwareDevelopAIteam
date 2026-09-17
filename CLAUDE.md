@@ -83,6 +83,15 @@ CEOの承認が必要（Yellow Zone）:
   sudo / rm -rf / curl | sh などの危険コマンド
 ```
 
+**上記 Zone 区分は現行有効である。** ただし Safety機構・Approval機構を**設計・変更する**ときは
+`specs/22_safety_approval_design_principle.md`（2026-09-17 CEO 採用。正本）に従う。
+同原則は Human Approval を通常の Safety mechanism ではなく**最後の Safety Boundary** として扱い、
+Isolation / Simulation / Mechanical Validation / Independent Review / Test・E2E / Limited Rollout /
+Monitoring / Fast Rollback の多層防御で AI の自律実行範囲を広げる方向を定める。
+
+**同原則は、それ自体では上記 Yellow Zone を1つも緩めない。** 差分は同原則 14 章に
+「要調整・現行有効」として列挙されており、**個別に CEO 承認を経るまで現行 Zone が優先する。**
+
 ---
 
 ## 5. Repository Boundary（最重要）
