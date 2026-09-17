@@ -430,6 +430,35 @@ export interface IJobStorage {
    * 解除対象は、検証した対象 Job と**同一 `safeCommand.workingDir`** の quarantined Job のみ
    * （無関係な兄弟を一律解除しない）。
    */
+  /**
+   * abort_task の最終段。**所有権解放と park を単一 transaction で行う。**
+   *
+   * 前段で Worker が観測した workspace を **API 側で再検証**し、対象 Job の baseline と
+   * 一致するときだけ `blocked` → `failed` にして所有権を解放し、続けて Task を park する。
+   * Worker の自己申告だけで解放しない（`clearWorkspaceQuarantine()` と同じ形）。
+   *
+   * 片方だけ成立する状態を作らないため、解放・park・audit は同じ transaction に入れる。
+   * 検証に失敗したら **何も変えない**（Job は blocked のまま所有権を保持する）。
+   */
+  /**
+   * 解放すべき blocked Job が無い Task を park する。**park と audit を同一 transaction で行う。**
+   * 片方だけ成立する状態を作らない（CEO 指示・2026-09-17）。
+   */
+  parkTask(input: {
+    taskId: string
+    reason: string
+    approvalRequestId: string
+  }): ReleaseBlockedJobAndParkTaskResult
+  releaseBlockedJobAndParkTask(input: {
+    jobId: string
+    taskId: string
+    /** Worker が今この瞬間に観測した workspace。baseline と同じ形式。 */
+    observation: JobWorkspaceBaseline
+    /** audit に残す park 理由。 */
+    reason: string
+    /** 承認の出所。audit に残す。 */
+    approvalRequestId: string
+  }): ReleaseBlockedJobAndParkTaskResult
   clearWorkspaceQuarantine(input: {
     jobId: string
     /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
@@ -446,6 +475,14 @@ export interface IJobStorage {
     reason?: string
   }): ClearWorkspaceQuarantineResult
 }
+
+export type ReleaseBlockedJobAndParkTaskResult =
+  | { ok: true; job: Job; task: Task }
+  | {
+    ok: false
+    code: 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR'
+    reason: string
+  }
 
 export interface IApprovalStorage {
   /** 全Project横断でpending状態の承認のみを1クエリで取得する（N+1回避用） */

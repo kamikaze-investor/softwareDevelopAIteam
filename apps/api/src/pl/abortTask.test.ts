@@ -1,18 +1,21 @@
 import { describe, expect, it } from 'vitest'
+import type { JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState } from '../state/systemState'
-import { abortTask } from './abortTask'
+import { abortTask, completeAbortCleanup } from './abortTask'
 
 const FUTURE = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+const BASELINE: JobWorkspaceBaseline = { mode: 'clean', startCommitHash: '0805249b' }
 
 interface Fixture {
   storage: IStorage
   projectId: string
   taskId: string
+  jobId: string
 }
 
-/** roadmapActive な pending Task に blocked Job が1本ある状態（production の 6f8b41ef と同じ形）。 */
+/** production の `6f8b41ef` と同じ形: roadmapActive な pending Task + blocked Job 1本。 */
 function seed(): Fixture {
   const storage = createSQLiteStorage(':memory:')
   const project = storage.projects.create({
@@ -23,11 +26,12 @@ function seed(): Fixture {
     assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 1,
     roadmapTaskKey: 'some-item', allowedPaths: ['apps/api/src/pl'], acceptanceCriteria: ['x'],
   } as Parameters<IStorage['tasks']['create']>[0])
-  storage.jobs.create({
+  const job = storage.jobs.create({
     taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
     safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    workspaceBaseline: BASELINE,
   } as Parameters<IStorage['jobs']['create']>[0])
-  return { storage, projectId: project.id, taskId: task.id }
+  return { storage, projectId: project.id, taskId: task.id, jobId: job.id }
 }
 
 function approve(storage: IStorage, taskId: string): string {
@@ -41,139 +45,196 @@ function approve(storage: IStorage, taskId: string): string {
   return request.id
 }
 
-describe('abortTask — CEO 承認済みの park', () => {
-  it('承認があれば park できる。status は変えず Job 履歴も残す', () => {
-    const { storage, taskId } = seed()
-    const approvalRequestId = approve(storage, taskId)
+/** 段階操作をまとめて通す（正常系のヘルパー）。 */
+function parkFully(fx: Fixture): void {
+  const requested = abortTask(fx.storage, {
+    taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: '別の項目を先に進める',
+  })
+  if (!requested.ok || requested.status !== 'cleanup_requested') throw new Error('expected cleanup_requested')
+  const done = completeAbortCleanup(fx.storage, { jobId: fx.jobId, observation: BASELINE })
+  if (!done.ok) throw new Error(`cleanup failed: ${done.reason}`)
+}
 
-    const result = abortTask(storage, { taskId, approvalRequestId, reason: '別の項目を先に進める' })
+describe('abortTask — 段階1: 前提条件と承認', () => {
+  it('所有権を保持する Job があるので、まず cleanup を要求する（この時点では park しない）', () => {
+    const fx = seed()
 
-    expect(result).toMatchObject({ ok: true })
-    const task = storage.tasks.findById(taskId)
-    // **done にしない。** 受入条件を満たしたと読める状態にしてはならない。
-    expect(task?.status).toBe('pending')
-    expect(task?.roadmapActive).toBe(false)
-    // Job 履歴はそのまま。Mobile / audit から事実が消えない。
-    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
-    expect(storage.jobs.findByTaskId(taskId)[0]?.status).toBe('blocked')
+    const result = abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    expect(result).toMatchObject({ ok: true, status: 'cleanup_requested', jobIds: [fx.jobId] })
+    // **まだ park していない。** 所有権が解放されるまで Task は現役のまま。
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
   })
 
-  it('承認が無ければ park しない', () => {
-    const { storage, taskId } = seed()
+  it('承認が無ければ何も要求しない', () => {
+    const fx = seed()
 
-    const result = abortTask(storage, { taskId, approvalRequestId: 'no-such-approval', reason: 'r' })
+    const result = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId: 'nope', reason: 'r' })
 
     expect(result).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
-    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
+    expect(fx.storage.jobs.findById(fx.jobId)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
   })
 
-  it('承認が WAITING のままなら park しない', () => {
-    const { storage, taskId } = seed()
-    const request = storage.approvalRequests.create({
-      taskId, requestedAction: 'abort', riskLevel: 'HIGH',
+  it('承認が WAITING のままなら何も要求しない', () => {
+    const fx = seed()
+    const request = fx.storage.approvalRequests.create({
+      taskId: fx.taskId, requestedAction: 'abort', riskLevel: 'HIGH',
       targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
       changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
       status: 'WAITING_FOR_USER', expiresAt: FUTURE,
     } as Parameters<IStorage['approvalRequests']['create']>[0])
 
-    const result = abortTask(storage, { taskId, approvalRequestId: request.id, reason: 'r' })
-
-    expect(result).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
-    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
+    expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId: request.id, reason: 'r' }))
+      .toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
   })
 
   it('別 Task の承認は流用できない', () => {
-    const { storage, projectId, taskId } = seed()
-    const other = storage.tasks.create({
-      projectId, title: 'other', description: '', status: 'pending',
+    const fx = seed()
+    const other = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'other', description: '', status: 'pending',
       assignee: 'developer_ai', dependencies: [], roadmapActive: true,
     } as Parameters<IStorage['tasks']['create']>[0])
-    const approvalRequestId = approve(storage, other.id)
 
-    const result = abortTask(storage, { taskId, approvalRequestId, reason: 'r' })
-
-    expect(result).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
-    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, other.id), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
   })
 
-  it('live Job があれば fail-closed で拒否する（Worker は roadmapActive を見ずに claim する）', () => {
-    const { storage, projectId, taskId } = seed()
-    storage.jobs.create({
-      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+  it('live Job があれば fail-closed で拒否する', () => {
+    const fx = seed()
+    fx.storage.jobs.create({
+      taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'queued',
       safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
     } as Parameters<IStorage['jobs']['create']>[0])
-    const approvalRequestId = approve(storage, taskId)
 
-    const result = abortTask(storage, { taskId, approvalRequestId, reason: 'r' })
-
-    expect(result).toMatchObject({ ok: false, code: 'LIVE_JOB_PRESENT' })
-    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'LIVE_JOB_PRESENT' })
   })
 
-  it('done な Task は park しない', () => {
-    const { storage, taskId } = seed()
-    storage.tasks.update(taskId, { status: 'done' })
-    const approvalRequestId = approve(storage, taskId)
+  it('quarantine 中の Job があれば拒否する（既存の解除経路が先）', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { failureMetadata: { quarantined: true } })
 
-    expect(abortTask(storage, { taskId, approvalRequestId, reason: 'r' }))
-      .toMatchObject({ ok: false, code: 'TASK_ALREADY_DONE' })
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'JOB_QUARANTINED' })
   })
 
-  it('pending 以外は park しない（半分だけ効く操作にしない）', () => {
-    const { storage, taskId } = seed()
-    storage.tasks.update(taskId, { status: 'blocked' })
-    const approvalRequestId = approve(storage, taskId)
+  it('done / pending 以外 / 既に park 済みは拒否する', () => {
+    const done = seed()
+    done.storage.tasks.update(done.taskId, { status: 'done' })
+    expect(abortTask(done.storage, {
+      taskId: done.taskId, approvalRequestId: approve(done.storage, done.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'TASK_ALREADY_DONE' })
 
-    const result = abortTask(storage, { taskId, approvalRequestId, reason: 'r' })
+    const blocked = seed()
+    blocked.storage.tasks.update(blocked.taskId, { status: 'blocked' })
+    expect(abortTask(blocked.storage, {
+      taskId: blocked.taskId, approvalRequestId: approve(blocked.storage, blocked.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'TASK_NOT_PARKABLE' })
 
-    expect(result).toMatchObject({ ok: false, code: 'TASK_NOT_PARKABLE' })
-    if (result.ok) return
-    expect(result.reason).toContain('resume / fail-stuck-job')
+    const parked = seed()
+    parked.storage.tasks.update(parked.taskId, { roadmapActive: false })
+    expect(abortTask(parked.storage, {
+      taskId: parked.taskId, approvalRequestId: approve(parked.storage, parked.taskId), reason: 'r',
+    })).toMatchObject({ ok: false, code: 'TASK_NOT_ACTIVE' })
   })
 
-  it('誰が・なぜ park したかを audit へ残す', () => {
-    const { storage, taskId } = seed()
-    const approvalRequestId = approve(storage, taskId)
+  it('解放すべき Job が無ければその場で park する', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
 
-    abortTask(storage, { taskId, approvalRequestId, reason: '先に別項目を進めるため', actor: 'ceo' })
+    const result = abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
 
-    const entries = storage.auditLog.findByEntity('task', taskId)
-      .filter((entry) => entry.operation === 'task_aborted')
-    expect(entries).toHaveLength(1)
-    expect(entries[0]?.detail).toContain('先に別項目を進めるため')
-    expect(entries[0]?.detail).toContain('ceo')
-    expect(entries[0]?.detail).toContain('status kept as pending')
-  })
-
-  it('follow-up Task を作らない（残作業の再開は #233 の責務）', () => {
-    const { storage, projectId, taskId } = seed()
-    const approvalRequestId = approve(storage, taskId)
-
-    abortTask(storage, { taskId, approvalRequestId, reason: 'r' })
-
-    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(1)
+    expect(result).toMatchObject({ ok: true, status: 'parked' })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
+    expect(fx.storage.tasks.findById(fx.taskId)?.status).toBe('pending')
   })
 })
 
-describe('abortTask — park した Task が PL を止めなくなる', () => {
-  it('currentTask から外れ、blocked Job の attention も出なくなる', () => {
-    const { storage, projectId, taskId } = seed()
+describe('abortTask — 段階2: 観測の再検証と所有権解放', () => {
+  it('観測が baseline と一致すれば解放して park する。status は変えず Job 履歴も残す', () => {
+    const fx = seed()
 
-    const before = buildSystemState(storage)
-    const beforeProject = before.projects.find((p) => p.id === projectId)
-    expect(beforeProject?.currentTask?.id).toBe(taskId)
-    expect(before.attention.some((item) => item.kind === 'job_blocked' && item.taskId === taskId)).toBe(true)
+    parkFully(fx)
 
-    abortTask(storage, { taskId, approvalRequestId: approve(storage, taskId), reason: 'r' })
+    const task = fx.storage.tasks.findById(fx.taskId)
+    // **done にしない。**
+    expect(task?.status).toBe('pending')
+    expect(task?.roadmapActive).toBe(false)
+    // Job は消えず、terminal になって所有権を手放す。
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('failed')
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
+  })
 
-    const after = buildSystemState(storage)
-    const afterProject = after.projects.find((p) => p.id === projectId)
-    // PL の「現在の仕事」から外れる。
-    expect(afterProject?.currentTask).toBeUndefined()
-    // 履歴由来の attention で PL 全体を止めない。
-    expect(after.attention.some((item) => item.kind === 'job_blocked' && item.taskId === taskId)).toBe(false)
-    // **Job 自体は消えていない。** 事実は Mobile からも audit からも辿れる。
-    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  it('観測が baseline と食い違えば park しない（fail-closed）', () => {
+    const fx = seed()
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    const result = completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId,
+      observation: { mode: 'clean', startCommitHash: 'deadbeef' },
+    })
+
+    expect(result).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    // Job は blocked のまま所有権を保持し、Task も現役のまま。
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  it('要求されていない Job の所有権は解放できない', () => {
+    const fx = seed()
+
+    const result = completeAbortCleanup(fx.storage, { jobId: fx.jobId, observation: BASELINE })
+
+    expect(result).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+  })
+
+  it('park と audit は同時に成立する', () => {
+    const fx = seed()
+
+    parkFully(fx)
+
+    const entries = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'task_aborted')
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.detail).toContain('別の項目を先に進める')
+    expect(entries[0]?.detail).toContain('status kept as pending')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
+  })
+
+  it('follow-up Task を作らない（残作業の再開は #233 の責務）', () => {
+    const fx = seed()
+
+    parkFully(fx)
+
+    expect(fx.storage.tasks.findByProjectId(fx.projectId)).toHaveLength(1)
+  })
+})
+
+describe('abortTask — park 後は PL を止めない', () => {
+  it('currentTask から外れ、blocked 履歴の attention も出なくなる', () => {
+    const fx = seed()
+
+    const before = buildSystemState(fx.storage)
+    expect(before.projects.find((p) => p.id === fx.projectId)?.currentTask?.id).toBe(fx.taskId)
+    expect(before.attention.some((i) => i.kind === 'job_blocked' && i.taskId === fx.taskId)).toBe(true)
+
+    parkFully(fx)
+
+    const after = buildSystemState(fx.storage)
+    expect(after.projects.find((p) => p.id === fx.projectId)?.currentTask).toBeUndefined()
+    expect(after.attention.some((i) => i.kind === 'job_blocked' && i.taskId === fx.taskId)).toBe(false)
+    // **事実は残る。** Job 行は消えていない。
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
   })
 })
 
@@ -185,33 +246,33 @@ describe('abortTask — sync が park を取り消さない', () => {
   })
 
   it('park した Task は後続 sync で再活性化されない', () => {
-    const { storage, projectId, taskId } = seed()
-    abortTask(storage, { taskId, approvalRequestId: approve(storage, taskId), reason: 'r' })
+    const fx = seed()
+    parkFully(fx)
 
-    const result = storage.tasks.syncRoadmapTasks({
-      projectId,
+    const result = fx.storage.tasks.syncRoadmapTasks({
+      projectId: fx.projectId,
       tasks: [spec('some-item')],
       phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
     })
 
     expect(result.ok).toBe(true)
-    expect(result.reactivatedTaskIds).not.toContain(taskId)
-    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(false)
+    expect(result.reactivatedTaskIds).not.toContain(fx.taskId)
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
   })
 
   it('park されていない非活性 Task の既存再活性化は変えていない', () => {
-    const { storage, projectId, taskId } = seed()
-    // abort を経ずに非活性化された（sync が落とした）Task。
-    storage.tasks.update(taskId, { roadmapActive: false })
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    fx.storage.tasks.update(fx.taskId, { roadmapActive: false })
 
-    const result = storage.tasks.syncRoadmapTasks({
-      projectId,
+    const result = fx.storage.tasks.syncRoadmapTasks({
+      projectId: fx.projectId,
       tasks: [spec('some-item')],
       phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
     })
 
     expect(result.ok).toBe(true)
-    expect(result.reactivatedTaskIds).toContain(taskId)
-    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
+    expect(result.reactivatedTaskIds).toContain(fx.taskId)
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
   })
 })

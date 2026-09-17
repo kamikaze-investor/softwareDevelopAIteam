@@ -36,6 +36,19 @@ export interface JobFailureMetadata {
   quarantineClearedAt?: string
   /** quarantine が解除された理由（例: startup recovery で workspace が baseline と一致） */
   quarantineClearedReason?: string
+  /**
+   * abort_task が「この Job の所有権を解放したい」と要求した時刻（ISO）。
+   *
+   * **サーバ側でしか付かない**（abort_task が有効な CEO Approval を確認したうえで、
+   * 自分で対象 Job を特定して付ける）。Worker はこの印を見て既存の観測経路を起動し、
+   * API がその観測を再検証して初めて所有権が解放される。
+   * 新しい Job status も cancellation queue も持たないための、既存 metadata への最小の印である。
+   */
+  abortCleanupRequestedAt?: string
+  /** 上記要求の根拠となった ApprovalRequest。解放時の audit に載る。 */
+  abortApprovalRequestId?: string
+  /** 上記要求の理由。解放時の audit に載る。 */
+  abortReason?: string
 }
 
 /**

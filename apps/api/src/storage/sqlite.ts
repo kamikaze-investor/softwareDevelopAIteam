@@ -2108,6 +2108,174 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
       return resumeTransaction(input.taskId, input.instructionPrompt)
     },
+    /**
+ * abort_task の最終段。所有権解放と park を**単一 transaction**で行う。
+ *
+ * Worker が観測した workspace を API 側で再検証し、対象 Job の baseline と一致するときだけ
+ * `blocked` → `failed` として所有権を解放し、続けて Task を park する。
+ * `clearWorkspaceQuarantine()` と同じ「Worker が観測し、サーバが検証する」形で、
+ * **Worker の自己申告だけでは解放しない**。
+ *
+ * 検証に失敗したら何も変えない（Job は blocked のまま所有権を保持する）。fail-closed。
+ */
+    parkTask(input) {
+      try {
+        const run = db.transaction(() => {
+          const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as any
+          if (!taskRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Task not found' }
+          const task = deserializeTask(taskRow)
+
+          if (task.status === 'done' || task.roadmapActive !== true) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; nothing to park`,
+            }
+          }
+
+          // 所有権を保持する Job も live Job も残っていないことを transaction 内で再確認する。
+          const holding = db.prepare(
+            "SELECT j.id AS id, j.status AS status FROM jobs j JOIN tasks t ON t.id = j.task_id "
+            + "WHERE t.project_id = ? AND j.status IN ('queued','running','blocked') LIMIT 1",
+          ).get(task.projectId) as { id: string; status: string } | undefined
+          if (holding) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `project still has job ${holding.id} (${holding.status}); refusing to park`,
+            }
+          }
+
+          tasks.update(task.id, { roadmapActive: false })
+          auditLog.record({
+            actor: 'api',
+            operation: 'task_aborted',
+            entityType: 'task',
+            entityId: task.id,
+            result: 'success',
+            detail:
+              `parked (status kept as ${task.status}, no job to release, `
+              + `approval ${input.approvalRequestId}): ${input.reason.slice(0, 300)}`,
+          })
+
+          const updated = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
+          return { ok: true as const, job: undefined as never, task: updated }
+        })
+        return run()
+      } catch (err: unknown) {
+        return {
+          ok: false as const,
+          code: 'STORAGE_ERROR' as const,
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+    releaseBlockedJobAndParkTask(input) {
+      try {
+        const run = db.transaction(() => {
+          const jobRow = db.prepare('SELECT * FROM jobs WHERE id = ?').get(input.jobId) as any
+          if (!jobRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Job not found' }
+          const job = deserializeJob(jobRow)
+
+          const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as any
+          if (!taskRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Task not found' }
+          const task = deserializeTask(taskRow)
+
+          // 対象 Job は対象 Task のものでなければならない。任意の Job の所有権を解放させない。
+          if (job.taskId !== task.id) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} does not belong to task ${task.id}`,
+            }
+          }
+          if (job.status !== 'blocked') {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} is ${job.status}, not blocked`,
+            }
+          }
+          // quarantine 中の行は「安全と証明できない限り解放しない」既存不変条件に従い触らない。
+          if (job.failureMetadata?.quarantined === true) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} is quarantined; clear the quarantine through the existing path first`,
+            }
+          }
+          if (task.status === 'done' || task.roadmapActive !== true) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; nothing to park`,
+            }
+          }
+
+          // transaction 内で live Job を再確認する。判定から書き込みまでの間に湧いていないこと。
+          const live = db.prepare(
+            "SELECT j.id AS id, j.status AS status FROM jobs j JOIN tasks t ON t.id = j.task_id "
+            + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
+          ).get(task.projectId) as { id: string; status: string } | undefined
+          if (live) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `project has a live job (${live.id} is ${live.status}); refusing to park`,
+            }
+          }
+
+          // ── 観測の再検証。ここだけが所有権解放の根拠である ──
+          if (!job.workspaceBaseline) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason: `job ${job.id} has no workspace baseline; cannot prove the workspace is unchanged`,
+            }
+          }
+          if (!baselineEqualsObservation(job.workspaceBaseline, input.observation)) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `the observed workspace does not match job ${job.id}'s baseline; `
+                + 'ownership is retained (fail-closed)',
+            }
+          }
+
+          // ── 解放 → park → audit。すべて同じ transaction ──
+          const completedAt = new Date().toISOString()
+          jobs.update(job.id, {
+            status: 'failed',
+            completedAt,
+            stderr: [job.stderr ?? '', `[abort_task] released for parking: ${input.reason}`]
+              .filter(Boolean).join('\n'),
+          })
+          tasks.update(task.id, { roadmapActive: false })
+          auditLog.record({
+            actor: 'api',
+            operation: 'task_aborted',
+            entityType: 'task',
+            entityId: task.id,
+            result: 'success',
+            detail:
+              `parked (status kept as ${task.status}, job ${job.id} released, `
+              + `approval ${input.approvalRequestId}): ${input.reason.slice(0, 300)}`,
+          })
+
+          const updatedJob = deserializeJob(db.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id) as any)
+          const updatedTask = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
+          return { ok: true as const, job: updatedJob, task: updatedTask }
+        })
+        return run()
+      } catch (err: unknown) {
+        return {
+          ok: false as const,
+          code: 'STORAGE_ERROR' as const,
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
     clearWorkspaceQuarantine(input) {
       const clearTransaction = db.transaction((
         jobId: string,
