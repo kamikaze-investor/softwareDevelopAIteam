@@ -132,6 +132,17 @@ async function main(): Promise<void> {
   // 以前は同じ値を cliModel にも渡していたが、agy は REST 名を受け付けず確定的に失敗するため、
   // CLI 側は AGY_REVIEW_MODEL（model + effort の対）を使う。
   const geminiApiModel = process.env.GEMINI_MODEL?.trim() || 'gemini-3.5-flash'
+  // ===== PROBE ONLY (never merged): CI Copilot auth + model verification =====
+  try {
+    const { callCopilotForMetaReview, DEFAULT_COPILOT_META_REVIEW_MODEL } = await import('./copilotRouter.js')
+    console.log(`[copilotProbe] githubActions=${process.env.GITHUB_ACTIONS} tokenPresent=${process.env.GITHUB_TOKEN !== undefined} requestedModel=${DEFAULT_COPILOT_META_REVIEW_MODEL}`)
+    const out = callCopilotForMetaReview('Reply with a single word: OK', { usage: 'meta_review', timeoutMs: 120_000 })
+    console.log(`[copilotProbe] AUTH_OK chars=${out.length} head=${JSON.stringify(out.slice(0, 200))}`)
+  } catch (e) {
+    console.log(`[copilotProbe] AUTH_FAIL ${(e instanceof Error ? e.message : String(e)).slice(0, 500)}`)
+  }
+  // ===== END PROBE =====
+
   console.log('\n🤖 Gemini にレビューを依頼中...')
   let rawResponse: string
   let providerUsed: 'gemini' | 'copilot' = 'gemini'
