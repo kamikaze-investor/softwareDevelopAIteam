@@ -472,6 +472,25 @@ describe('proposal_unusable — 観測して忘れない', () => {
     expect(diagnostic?.rawLength).toBe(raw.length)
   })
 
+  it('記録に失敗しても採用の結果は変えない（観測が挙動を動かさない）', async () => {
+    const { storage, projectId } = seedAdoptable()
+    const broken = {
+      ...storage,
+      auditLog: {
+        ...storage.auditLog,
+        record: () => { throw new Error('audit storage unavailable') },
+      },
+    } as unknown as IStorage
+
+    const result = await runAdoptionStep(broken, projectId, {
+      propose: async () => 'not json',
+      readLedger: () => LEDGER,
+    })
+
+    // `diagnosis_failed` へ化けない。観測できなかっただけで、採用の結論は同じ。
+    expect(result.status).toBe('proposal_unusable')
+  })
+
   it('採用に成功したときは何も残さない（成功時の全出力保存へ広げない）', async () => {
     const { storage, projectId } = seedAdoptable()
 

@@ -299,14 +299,25 @@ function recordProposalDiagnostic(
     raw: truncated ? diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT) : diagnostic.raw,
   }
 
-  storage.auditLog.record({
-    actor: 'api',
-    operation: AUDIT_PROPOSAL_UNPARSED,
-    entityType: PL_TARGET_ENTITY_TYPE,
-    entityId: proposalDiagnosticKey(projectId),
-    result: 'failure',
-    detail: JSON.stringify(payload),
-  })
+  // **記録に失敗しても採用の結果は変えない。**
+  // ここで throw すると `maybeAdoptNext()` の catch が拾い、`proposal_unusable` が
+  // `diagnosis_failed` に化ける —— 観測したせいで PL の挙動が変わることになる。
+  // 記録できなかったこと自体は log へ出す（黙って落とさない）。
+  try {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: AUDIT_PROPOSAL_UNPARSED,
+      entityType: PL_TARGET_ENTITY_TYPE,
+      entityId: proposalDiagnosticKey(projectId),
+      result: 'failure',
+      detail: JSON.stringify(payload),
+    })
+  } catch (error: unknown) {
+    console.error(
+      `[adoptionStep] proposal diagnostic could not be recorded for project ${projectId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
 }
 
 /** 診断を読み出す。運用時に `audit_log` を直接読まずに済ませるための入口。 */
