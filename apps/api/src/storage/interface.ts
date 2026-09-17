@@ -280,6 +280,15 @@ export interface ITaskStorage {
     projectId: string
     tasks: RoadmapSyncTaskInput[]
     phases?: RoadmapSyncPhaseInput[]
+    /**
+     * ここに挙げた `roadmapTaskKey` は **新規作成でなければならない**。
+     *
+     * 既存 Task があれば transaction 内で失敗させる。follow-up の identity 発番は
+     * transaction の外側で行うため、発番と挿入の間に別の採用が同じ identity を作ると、
+     * 通常の upsert 経路が「Job を持たない Task は可変」として相手の spec を上書きしてしまう。
+     * **不可分性はこのフラグで担保する**（独立レビュー Finding 1）。
+     */
+    requireNewTaskKeys?: readonly string[]
   }): RoadmapSyncResult
 }
 

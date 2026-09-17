@@ -839,7 +839,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         projectId: string,
         roadmapTasks: RoadmapSyncTaskInput[],
         roadmapPhases: RoadmapSyncPhaseInput[],
+        requireNewTaskKeys: readonly string[],
       ): RoadmapSyncResult => {
+        // **新規であることを要求された key が既に居たら、この transaction ごと失敗させる。**
+        // 呼び出し側が transaction の外で発番した identity を、挿入までの間に別の採用が
+        // 先取りしていた場合にここで止まる。通常の upsert 経路（Job を持たない Task は可変）が
+        // 相手の spec を静かに上書きするのを防ぐ唯一の不可分な地点である。
+        for (const requiredKey of requireNewTaskKeys) {
+          const existing = db.prepare(
+            'SELECT id FROM tasks WHERE project_id = ? AND roadmap_task_key = ?',
+          ).get(projectId, requiredKey) as { id: string } | undefined
+          if (existing) {
+            // 既存 catch が Error を failureReason へ写すので、専用の型は足さない。
+            throw new Error(
+              `task key "${requiredKey}" must be new but task ${existing.id} already has it`,
+            )
+          }
+        }
+
         const createdTaskIds: string[] = []
         const updatedTaskIdSet = new Set<string>()
         const reactivatedTaskIds: string[] = []
@@ -1088,7 +1105,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       try {
-        return syncTransaction(input.projectId, input.tasks, input.phases ?? [])
+        return syncTransaction(
+          input.projectId,
+          input.tasks,
+          input.phases ?? [],
+          input.requireNewTaskKeys ?? [],
+        )
       } catch (err: unknown) {
         if (err instanceof RoadmapTaskConflictError) {
           return emptyFailureResult(err.message, err.conflicts, err.phaseConflicts)

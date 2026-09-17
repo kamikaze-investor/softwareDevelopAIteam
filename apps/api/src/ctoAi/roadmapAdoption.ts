@@ -177,6 +177,7 @@ function checkFollowUpEligibility(
   storage: IStorage,
   input: AdoptRoadmapItemInput,
   projectTasks: readonly { id: string; status: string; roadmapTaskKey?: string; description: string }[],
+  knownLedgerIds: ReadonlySet<string>,
 ): FollowUpEligibility {
   const fail = (code: AdoptRoadmapItemFailure, reason: string): FollowUpEligibility => ({
     ok: false,
@@ -184,7 +185,8 @@ function checkFollowUpEligibility(
   })
 
   const siblings = projectTasks.filter(
-    (task) => task.roadmapTaskKey !== undefined && getBaseRoadmapId(task.roadmapTaskKey) === input.roadmapId,
+    (task) => task.roadmapTaskKey !== undefined
+      && getBaseRoadmapId(task.roadmapTaskKey, knownLedgerIds) === input.roadmapId,
   )
 
   // 1. 先行 Task が実在すること。無いなら follow-up ではなく通常採用である。
@@ -371,14 +373,23 @@ export async function adoptRoadmapItem(
 
   let taskKey = input.roadmapId
   if (input.followUp === true) {
-    const eligibility = checkFollowUpEligibility(storage, input, projectTasks)
+    const eligibility = checkFollowUpEligibility(
+      storage,
+      input,
+      projectTasks,
+      new Set(items.map((candidate) => candidate.id)),
+    )
     if (!eligibility.ok) return eligibility.failure
 
+    // 実在の ledger id 集合を渡し、`foo` と `foo#2` が両方 ledger に居るケースを取り違えない
+    // （独立レビュー Finding 2）。
+    const ledgerIds = new Set(items.map((candidate) => candidate.id))
     const minted = createFollowUpTaskKey(
       input.roadmapId,
       projectTasks
         .map((task) => task.roadmapTaskKey)
         .filter((key): key is string => key !== undefined),
+      ledgerIds,
     )
     if (!minted.ok) {
       return { ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE', reason: minted.reason }
@@ -452,6 +463,9 @@ export async function adoptRoadmapItem(
     projectId: input.projectId,
     tasks: [taskInput],
     phases: [phaseInput],
+    // follow-up の identity は transaction の外で発番している。挿入までの間に別の採用が
+    // 同じ identity を作っていたら、**transaction の内側で**失敗させる（独立レビュー Finding 1）。
+    ...(input.followUp === true ? { requireNewTaskKeys: [taskKey] } : {}),
   })
   if (!syncResult.ok) {
     return {
@@ -475,6 +489,9 @@ export async function adoptRoadmapItem(
   if (
     adopted.description !== taskInput.description
     || adopted.allowedPaths?.join('\u0000') !== allowedPaths.join('\u0000')
+    // acceptanceCriteria も含める。scope と paths が同じで受入条件だけ違う二重採用を
+    // 「成功」と返さない（独立レビュー NEW 1）。
+    || adopted.acceptanceCriteria?.join('\u0000') !== acceptanceCriteria.join('\u0000')
   ) {
     return {
       ok: false,

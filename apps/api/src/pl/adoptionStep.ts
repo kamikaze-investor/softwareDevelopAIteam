@@ -100,6 +100,8 @@ export function classifyAdoptionCandidates(
 ): ClassifiedCandidate[] {
   const projectTasks = storage.tasks.findByProjectId(projectId)
   const pendingContinuations = storage.taskContinuations.findPendingByProjectId(projectId).length
+  // 実在する ledger id を優先して base を解決する（独立レビュー Finding 2）。
+  const ledgerIds = new Set(open.map((candidate) => candidate.id))
   // **採用 seam と同じ条件で見る。** seam は Project 全体の active Task を見て follow-up を拒否するので、
   // ここで Project が busy なのに候補として出すと、PL が選んだ末に FOLLOW_UP_NOT_ELIGIBLE で落ち、
   // 採用 attempt 予算だけを焼く（2026-09-15 の事故と同じ形）。検出と強制を一致させる。
@@ -108,16 +110,19 @@ export function classifyAdoptionCandidates(
   return open.map((candidate) => {
     const siblings = projectTasks.filter(
       (task) => task.roadmapTaskKey !== undefined
-        && getBaseRoadmapId(task.roadmapTaskKey) === candidate.id,
+        && getBaseRoadmapId(task.roadmapTaskKey, ledgerIds) === candidate.id,
     )
     if (siblings.length === 0) {
       return { ...candidate, kind: 'fresh' as const, followUpCount: 0, boosted: false }
     }
 
     const followUpCount = siblings.filter(
-      (task) => task.roadmapTaskKey !== undefined && isFollowUpTaskKey(task.roadmapTaskKey),
+      (task) => task.roadmapTaskKey !== undefined && isFollowUpTaskKey(task.roadmapTaskKey, ledgerIds),
     ).length
-    const executed = siblings.some((task) => storage.jobs.findByTaskId(task.id).length > 0)
+    // **queued は「まだ動いていない」**。採用 seam と同じ定義を使う（独立レビュー Finding 4）。
+    const executed = siblings.some(
+      (task) => storage.jobs.findByTaskId(task.id).some((job) => job.status !== 'queued'),
+    )
     const active = siblings.some((task) => task.status !== 'done')
 
     // **まだ一度も Job が走っていない Task は従来どおり `fresh` 扱いである。**
@@ -313,15 +318,19 @@ function extractBodyPreview(lines: readonly string[], checkboxLineIndex: number)
  *
  * 回転位置は呼び出し側が既存 `audit_log` の採用試行回数から渡す。**新しい state は持たない。**
  */
-export function selectAdoptionCandidates<T extends RoadmapCandidate>(
+export function selectAdoptionCandidates<T extends RoadmapCandidate & { boosted?: boolean }>(
   all: readonly T[],
   limit: number,
   rotationOffset: number,
 ): T[] {
   if (all.length <= limit) return [...all]
 
-  const high = all.filter((c) => c.highPriority)
-  const rest = all.filter((c) => !c.highPriority)
+  // **boost された候補は rotation で窓から外れてはならない**（独立レビュー NEW 2）。
+  // 連続 skip の末に順位を上げたのに、次の rotation で候補一覧から消えては意味がない。
+  // priority と同じ「必ず載る」側へ入れ、boost 分を先頭に置く。
+  const boosted = all.filter((c) => c.boosted === true)
+  const high = [...boosted, ...all.filter((c) => c.highPriority && c.boosted !== true)]
+  const rest = all.filter((c) => !c.highPriority && c.boosted !== true)
   const slots = Math.max(0, limit - high.length)
   if (slots === 0 || rest.length === 0) return high.slice(0, limit)
 
@@ -466,7 +475,7 @@ export function buildAdoptionPrompt(
     ...candidates.flatMap((c) => [
       `- ${c.id} — ${c.state}${c.highPriority ? ' — PRIORITY:HIGH' : ''}${
         c.kind === 'follow_up'
-          ? ` — FOLLOW-UP (${c.followUpCount ?? 0} done already; name ONLY the work the prior task did not do)`
+          ? ` — FOLLOW-UP (${(c.followUpCount ?? 0) + 1} task(s) already ran for this item; name ONLY work they did not do)`
           : ''
       } — ${c.title}`,
       c.bodyPreview === '' ? '  (no body)' : `  ${c.bodyPreview}`,

@@ -383,6 +383,65 @@ describe('adoptRoadmapItem — 独立レビュー指摘に対する回帰固定�
   })
 })
 
+describe('独立レビュー2巡目の指摘に対する回帰固定（2026-09-17）', () => {
+  it('Finding 1: 発番済み identity を別経路が先取りしていたら transaction 内で失敗する', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    // 既に `item#2` が居る状態を作る。
+    storage.tasks.create({
+      projectId: project.id, title: 'racer', description: 'other spec', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'item#2',
+    } as Parameters<IStorage['tasks']['create']>[0])
+
+    // 同じ key を「新規である」と要求して sync すると、上書きせず失敗する。
+    const result = storage.tasks.syncRoadmapTasks({
+      projectId: project.id,
+      tasks: [{
+        roadmapTaskKey: 'item#2', title: 't', description: 'my spec', phase: 1,
+        assignee: 'developer_ai', category: 'implementation', dependencies: [],
+        acceptanceCriteria: ['x'], allowedPaths: ['apps/api/src/pl'],
+      }],
+      phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
+      requireNewTaskKeys: ['item#2'],
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.failureReason).toContain('must be new')
+    // 相手の spec は無傷。
+    const untouched = storage.tasks.findByProjectId(project.id)
+      .find((task) => task.roadmapTaskKey === 'item#2')
+    expect(untouched?.description).toBe('other spec')
+  })
+
+  it('Finding 1: requireNewTaskKeys を渡さない通常 sync は従来どおり upsert する', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    storage.tasks.create({
+      projectId: project.id, title: 'old', description: 'old spec', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'item',
+    } as Parameters<IStorage['tasks']['create']>[0])
+
+    const result = storage.tasks.syncRoadmapTasks({
+      projectId: project.id,
+      tasks: [{
+        roadmapTaskKey: 'item', title: 'new', description: 'new spec', phase: 1,
+        assignee: 'developer_ai', category: 'implementation', dependencies: [],
+        acceptanceCriteria: ['x'], allowedPaths: ['apps/api/src/pl'],
+      }],
+      phases: [{ phaseNumber: 1, name: 'p', goal: 'g' }],
+    })
+
+    expect(result.ok).toBe(true)
+    const updated = storage.tasks.findByProjectId(project.id)
+      .find((task) => task.roadmapTaskKey === 'item')
+    expect(updated?.description).toBe('new spec')
+  })
+})
+
 describe('adoptRoadmapItem — fail-closed', () => {
   it('allowedPaths が空なら採用しない', async () => {
     const { storage, projectId } = makeStorage()

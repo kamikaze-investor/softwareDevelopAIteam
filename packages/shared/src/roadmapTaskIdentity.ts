@@ -101,6 +101,7 @@ export type CreateFollowUpTaskKeyResult =
 export function createFollowUpTaskKey(
   baseRoadmapId: string,
   existingTaskKeys: readonly string[],
+  knownLedgerIds?: ReadonlySet<string>,
 ): CreateFollowUpTaskKeyResult {
   // base 自体が `#<digits>` で終わると base と follow-up の区別が付かなくなる。
   // 実在の ledger id は kebab-case だが、曖昧なまま identity を作らない。
@@ -115,7 +116,7 @@ export function createFollowUpTaskKey(
   }
 
   const siblingSequences = existingTaskKeys
-    .filter((key) => getBaseRoadmapId(key) === baseRoadmapId)
+    .filter((key) => key !== baseRoadmapId && getBaseRoadmapId(key, knownLedgerIds) === baseRoadmapId)
     .map((key) => getFollowUpSequence(key))
     .filter((sequence): sequence is number => sequence !== undefined)
 
