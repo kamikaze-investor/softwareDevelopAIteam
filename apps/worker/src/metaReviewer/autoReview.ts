@@ -45,7 +45,7 @@ import { dirname, resolve } from 'node:path'
 
 async function main(): Promise<void> {
   // .env ロード後に runner.ts / geminiRouter.ts / metaReviewFallbackRouter.ts を評価させるため動的 import する
-  const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult, hasFormalVerdict } =
+  const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult, classifyFormalVerdict } =
     await import('./runner.js')
   const { reviewWithProviderFallback, MetaReviewProviderError, sanitizeMessage } = await import('./metaReviewFallbackRouter.js')
   const { AGY_REVIEW_MODEL } = await import('./geminiRouter.js')
@@ -151,7 +151,7 @@ async function main(): Promise<void> {
       // text が返っただけでは成功とせず、valid な formal verdict が成立して初めて成功とする。
       // 不成立は transient として既存の bounded retry -> 次 stage -> Copilot へ流れる。
       // 判定の中身では分岐しないので、BLOCKED を別 provider で取り直す経路は生まれない。
-      validateResponse: hasFormalVerdict,
+      classifyVerdict: classifyFormalVerdict,
     })
     rawResponse = reviewResult.raw
     providerUsed = reviewResult.providerUsed

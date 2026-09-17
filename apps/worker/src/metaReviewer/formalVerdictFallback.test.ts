@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { hasFormalVerdict, parseMetaReviewResult, tryParseMetaReviewResult } from './runner'
+import { classifyFormalVerdict, hasFormalVerdict, parseMetaReviewResult, tryParseMetaReviewResult } from './runner'
 
 /**
  * `meta-review-structured-output-robustness` の受入条件。
@@ -104,7 +104,7 @@ describe('provider chain: formal-verdict-aware fallback', () => {
     featureName: 'meta_review',
     retryTransient: true,
     sleepImpl: () => {},
-    validateResponse: hasFormalVerdict,
+    classifyVerdict: classifyFormalVerdict,
   }
 
   it('A. Gemini が valid APPROVED なら Copilot を呼ばない', async () => {
@@ -342,5 +342,129 @@ describe('Independent Review 2026-09-17 R3', () => {
     expect(hasFormalVerdict(JSON.stringify({
       ...base, findings: [{ severity: 'low', category: 'scope_creep', message: 'm' }],
     }))).toBe(true)
+  })
+})
+
+describe('process status x verdict の非対称ルール（CEO 指示 2026-09-17）', () => {
+  const ORIGINAL_ENV = { ...process.env }
+
+  beforeEach(() => {
+    vi.resetModules()
+    vi.doUnmock('./geminiClient.js')
+    vi.doUnmock('./copilotRouter.js')
+    process.env.AGY_CLI_PATH = '/usr/bin/agy-for-test'
+  })
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV }
+    vi.restoreAllMocks()
+  })
+
+  async function loadCli(runs: Array<{ status: number; stdout: string; signal?: string }>) {
+    const calls: number[] = []
+    vi.doMock('node:fs', async () => {
+      const actual = await vi.importActual<typeof import('node:fs')>('node:fs')
+      return {
+        writeFileSync: vi.fn(), mkdirSync: vi.fn(),
+        mkdtempSync: actual.mkdtempSync, rmSync: actual.rmSync,
+        existsSync: () => true,   // agy はあることにする
+      }
+    })
+    vi.doMock('node:child_process', () => ({
+      spawnSync: vi.fn(() => {
+        const r = runs[calls.length] ?? runs[runs.length - 1]
+        calls.push(1)
+        return { status: r.status, stdout: r.stdout, stderr: '', signal: r.signal ?? null, error: undefined }
+      }),
+    }))
+    vi.doMock('./geminiClient.js', () => ({
+      callGeminiForReview: vi.fn(async () => { throw new Error('api intentionally unavailable') }),
+    }))
+
+    const { callGeminiWithFallback } = await import('./geminiRouter.js')
+    return { callGeminiWithFallback, calls }
+  }
+
+  const cliOpts = {
+    preferCli: true, featureName: 'test', retryTransient: true,
+    sleepImpl: () => {}, classifyVerdict: classifyFormalVerdict,
+  }
+
+  it('exit 0 + APPROVED → APPROVED を採用', async () => {
+    const { callGeminiWithFallback, calls } = await loadCli([{ status: 0, stdout: verdict('approved') }])
+    const raw = await callGeminiWithFallback('p', cliOpts)
+    expect(parseMetaReviewResult(raw, 't').status).toBe('approved')
+    expect(calls).toHaveLength(1)
+  })
+
+  it('non-zero + APPROVED → 採用せず retry/fallback へ', async () => {
+    const { callGeminiWithFallback } = await loadCli([{ status: 1, stdout: verdict('approved') }])
+    // CLI は失敗扱い、API も落とすので最終的に throw（= green にしない）。
+    await expect(callGeminiWithFallback('p', cliOpts)).rejects.toThrow()
+  })
+
+  it('timeout + APPROVED → 採用せず retry/fallback へ', async () => {
+    const { callGeminiWithFallback } = await loadCli([{ status: 0, stdout: verdict('approved'), signal: 'SIGTERM' }])
+    await expect(callGeminiWithFallback('p', cliOpts)).rejects.toThrow()
+  })
+
+  it('non-zero + BLOCKED → BLOCKED を保持し、後続 provider を呼ばない', async () => {
+    const { callGeminiWithFallback, calls } = await loadCli([{ status: 1, stdout: verdict('blocked') }])
+    const raw = await callGeminiWithFallback('p', cliOpts)
+    expect(parseMetaReviewResult(raw, 't').status).toBe('blocked')
+    // retry も次段も呼ばずに1回で確定する。
+    expect(calls).toHaveLength(1)
+  })
+
+  it('non-zero + CHANGES_REQUESTED → 同様に保持して停止', async () => {
+    const { callGeminiWithFallback, calls } = await loadCli([{ status: 1, stdout: verdict('changes_requested') }])
+    const raw = await callGeminiWithFallback('p', cliOpts)
+    expect(parseMetaReviewResult(raw, 't').status).toBe('changes_requested')
+    expect(calls).toHaveLength(1)
+  })
+
+  it('non-zero + truncated → retry/fallback へ', async () => {
+    const { callGeminiWithFallback } = await loadCli([{ status: 1, stdout: TRUNCATED }])
+    await expect(callGeminiWithFallback('p', cliOpts)).rejects.toThrow()
+  })
+
+  it('classifyFormalVerdict の分類', () => {
+    expect(classifyFormalVerdict(verdict('approved'))).toBe('positive')
+    expect(classifyFormalVerdict(verdict('blocked'))).toBe('negative')
+    expect(classifyFormalVerdict(verdict('changes_requested'))).toBe('negative')
+    expect(classifyFormalVerdict(TRUNCATED)).toBe('none')
+  })
+})
+
+describe('round-4: classifier enum must not be used as a boolean', () => {
+  const ORIGINAL_ENV = { ...process.env }
+  beforeEach(() => { vi.resetModules(); vi.doUnmock('./geminiClient.js'); vi.doUnmock('./copilotRouter.js') })
+  afterEach(() => { process.env = { ...ORIGINAL_ENV }; vi.restoreAllMocks() })
+
+  it('exit 0 + formal verdict 不成立 → 成功にせず retry/fallback へ', async () => {
+    process.env.AGY_CLI_PATH = '/usr/bin/agy-for-test'
+    vi.doMock('node:fs', async () => {
+      const actual = await vi.importActual<typeof import('node:fs')>('node:fs')
+      return {
+        writeFileSync: vi.fn(), mkdirSync: vi.fn(),
+        mkdtempSync: actual.mkdtempSync, rmSync: actual.rmSync, existsSync: () => true,
+      }
+    })
+    // exit 0 だが中身は不完全（'none'）。truthy な 'none' を boolean 扱いすると成功になってしまう。
+    vi.doMock('node:child_process', () => ({
+      spawnSync: vi.fn(() => ({
+        status: 0, stdout: JSON.stringify({ status: 'approved' }), stderr: '', signal: null, error: undefined,
+      })),
+    }))
+    vi.doMock('./geminiClient.js', () => ({
+      callGeminiForReview: vi.fn(async () => { throw new Error('api unavailable') }),
+    }))
+
+    const { callGeminiWithFallback } = await import('./geminiRouter.js')
+
+    await expect(callGeminiWithFallback('p', {
+      preferCli: true, featureName: 'test', retryTransient: false,
+      sleepImpl: () => {}, classifyVerdict: classifyFormalVerdict,
+    })).rejects.toThrow()
   })
 })

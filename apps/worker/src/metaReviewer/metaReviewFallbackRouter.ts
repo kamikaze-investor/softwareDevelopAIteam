@@ -40,7 +40,7 @@ export async function reviewWithProviderFallback(
   prompt: string,
   geminiOptions?: GeminiRouterOptions,
 ): Promise<MetaReviewFallbackResult> {
-  const validateResponse = geminiOptions?.validateResponse
+  const classifyVerdict = geminiOptions?.classifyVerdict
 
   try {
     const raw = await callGeminiWithFallback(prompt, geminiOptions)
@@ -55,12 +55,12 @@ export async function reviewWithProviderFallback(
       ' Copilot CLI（Microsoft系モデル）にフォールバックします。'
     )
 
-    const raw = callCopilotForMetaReview(prompt, { usage: 'meta_review', hasVerdict: validateResponse })
+    const raw = callCopilotForMetaReview(prompt, { usage: 'meta_review', classifyVerdict })
 
     // **Copilot にも同じ成功条件を適用する。** text が返っただけでは成立とみなさない。
     // ここで fail-open すると、Copilot の truncated / malformed 応答が
     // Meta Review 結果として採用されてしまう。
-    if (validateResponse !== undefined && !validateResponse(raw)) {
+    if (classifyVerdict !== undefined && classifyVerdict(raw) === 'none') {
       console.log(`[metaReview] attempt ${JSON.stringify({
         feature: 'meta_review', outcome: 'no_formal_verdict', stage: 'copilot_cli',
         provider: 'copilot', vendor: 'microsoft', model: DEFAULT_COPILOT_META_REVIEW_MODEL,

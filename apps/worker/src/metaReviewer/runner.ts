@@ -250,7 +250,28 @@ export function tryParseMetaReviewResult(
  * 使われないので、判定目的の呼び出しではプレースホルダで問題ない。
  */
 export function hasFormalVerdict(rawResponse: string): boolean {
-  return findStrictVerdictObject(rawResponse) !== undefined
+  return classifyFormalVerdict(rawResponse) !== 'none'
+}
+
+/**
+ * formal verdict の分類。
+ *
+ * - `none`: 成立していない（empty / truncated / malformed / 未知 status / 契約違反）
+ * - `positive`: APPROVED
+ * - `negative`: CHANGES_REQUESTED / BLOCKED
+ *
+ * **process の正常終了とは非対称に扱う**（CEO 指示 2026-09-17）:
+ * - positive を Gate の green にするには、structured verdict が正しいだけでなく
+ *   **provider attempt 自体が正常終了した**ことも要求する
+ * - negative は process failure を理由に捨てない。捨てて別 provider へ進むと
+ *   Review Shopping / Safety weakening になる
+ */
+export function classifyFormalVerdict(rawResponse: string): 'none' | 'positive' | 'negative' {
+  const strict = findStrictVerdictObject(rawResponse)
+  if (strict === undefined) {
+    return 'none'
+  }
+  return strict.status === 'approved' ? 'positive' : 'negative'
 }
 
 /**

@@ -74,14 +74,19 @@ export interface GeminiRouterOptions {
   /** REST API で使うモデル */
   apiModel?: string
   /**
-   * 応答が **formal verdict を構成するか**の判定。
+   * 応答の formal verdict 分類（`none` / `positive` / `negative`）。
    *
    * これを渡すと、provider attempt の成功条件が「text が返った」から
-   * 「valid な formal verdict が成立した」へ変わる。不成立は `transient` として
-   * 既存の bounded retry → 次 stage → 次 provider の順に流れる。
+   * **「valid な formal verdict が成立し、かつ process 状態と整合する」**へ変わる。
+   *
+   * process 正常なら positive / negative のどちらでも成功。
+   * **process 異常（非0 exit / timeout / spawn error）なら negative だけを採用する** —
+   * positive を process failure ごと通すと Gate を green にしてしまい、
+   * negative を捨てると Review Shopping になるため（CEO 指示 2026-09-17）。
+   *
    * 未指定なら従来どおり「text が返れば成功」（既存呼び出し元の挙動を変えない）。
    */
-  validateResponse?: (raw: string) => boolean
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative'
   /** 機能名（ログ・通知用） */
   featureName?: string
   /**
@@ -339,7 +344,7 @@ function callCliOnce(
   stage: string,
   jsonSchema?: Record<string, unknown>,
   cliEffort?: 'low' | 'medium' | 'high',
-  validateResponse?: (raw: string) => boolean,
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative',
 ): CliOutcome {
   if (!isAgyAvailable()) {
     return {
@@ -386,17 +391,27 @@ function callCliOnce(
     const timedOut = result.signal !== null && result.signal !== undefined
     const rawText = [stderr, stdout, result.error?.message ?? ''].filter(Boolean).join(' ') || '(no output)'
 
-    // **成立した verdict を exit code だけで捨てない。**
+    // **process 状態と verdict の非対称ルール**（CEO 指示 2026-09-17）。
     //
-    // 独立レビュー指摘（2026-09-17）: 非0 exit でも stdout に完全な BLOCKED /
-    // CHANGES_REQUESTED が出ていることがあり、それを失敗として捨てると
-    // 次段・次 provider が APPROVED を返し得る = review shopping になる。
-    // 先に verdict の有無を見る。
-    if (validateResponse !== undefined && stdout.trim() && validateResponse(stdout)) {
+    // process 異常（非0 exit / timeout / spawn error）のとき:
+    //   - negative（BLOCKED / CHANGES_REQUESTED）は**保持する**。捨てて次 provider へ進むと
+    //     APPROVED を引き当てられてしまう = Review Shopping / Safety weakening
+    //   - positive（APPROVED）は**採用しない**。Gate を green にするには
+    //     verdict が正しいだけでなく attempt 自体が正常終了している必要がある
+    // process 正常なら positive / negative のどちらでも採用する。
+    const processFailed = result.status !== 0 || timedOut || result.error !== undefined
+    const verdictClass = classifyVerdict !== undefined && stdout.trim()
+      ? classifyVerdict(stdout)
+      : 'none'
+
+    if (verdictClass === 'negative') {
+      return { ok: true, text: stdout, unavailable: false }
+    }
+    if (verdictClass === 'positive' && !processFailed) {
       return { ok: true, text: stdout, unavailable: false }
     }
 
-    if (result.status !== 0 || !stdout.trim()) {
+    if (processFailed || !stdout.trim()) {
       const failureClass = classifyFailure({ text: rawText, exitCode: result.status, timedOut })
       return {
         ok: false,
@@ -413,7 +428,7 @@ function callCliOnce(
     if (jsonSchema !== undefined) {
       const extracted = extractStructuredOutput(stdout)
       if (extracted !== undefined) {
-        if (validateResponse !== undefined && !validateResponse(extracted)) {
+        if (classifyVerdict !== undefined && classifyVerdict(extracted) === 'none') {
           return { ok: false, text: null, unavailable: false, diagnostics: noFormalVerdictDiagnostics(provider, stage, extracted) }
         }
         return { ok: true, text: extracted, unavailable: false }
@@ -423,7 +438,7 @@ function callCliOnce(
       // （fail-open ではなく、既存の多段パースにそのまま委ねるだけ）。
     }
 
-    if (validateResponse !== undefined && !validateResponse(stdout)) {
+    if (classifyVerdict !== undefined && classifyVerdict(stdout) === 'none') {
       return { ok: false, text: null, unavailable: false, diagnostics: noFormalVerdictDiagnostics(provider, stage, stdout) }
     }
 
@@ -453,9 +468,9 @@ function callCliDetailed(
   sleepImpl: (ms: number) => void,
   jsonSchema?: Record<string, unknown>,
   cliEffort?: 'low' | 'medium' | 'high',
-  validateResponse?: (raw: string) => boolean,
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative',
 ): CliOutcome {
-  let outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort, validateResponse)
+  let outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort, classifyVerdict)
   for (
     let attempt = 1;
     retryTransient &&
@@ -465,7 +480,7 @@ function callCliDetailed(
     sleepImpl(TRANSIENT_RETRY_DELAYS_MS[attempt - 1])
     // **retry でも validator を落とさない。** 落とすと 2 回目以降が
     // 「text が返れば成功」へ戻り、malformed を受理してしまう（独立レビュー指摘 2026-09-17 R2）。
-    outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort, validateResponse)
+    outcome = callCliOnce(prompt, cliModel, provider, stage, jsonSchema, cliEffort, classifyVerdict)
   }
   return outcome
 }
@@ -504,11 +519,13 @@ async function callApiOnce(
   prompt: string,
   stage: string,
   apiModel?: string,
-  validateResponse?: (raw: string) => boolean,
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative',
 ): Promise<ApiOutcome> {
   try {
+    // REST API は throw か text かのどちらかなので、text が返った時点で process は正常。
+    // したがってここでは none だけを不成立にする。
     const text = await callGeminiForReview(prompt, apiModel)
-    if (validateResponse !== undefined && !validateResponse(text)) {
+    if (classifyVerdict !== undefined && classifyVerdict(text) === 'none') {
       return { ok: false, text: null, diagnostics: noFormalVerdictDiagnostics('gemini_api', stage, text) }
     }
     return { ok: true, text }
@@ -541,9 +558,9 @@ async function callApiDetailed(
   retryTransient: boolean,
   sleepImpl: (ms: number) => void,
   apiModel?: string,
-  validateResponse?: (raw: string) => boolean,
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative',
 ): Promise<ApiOutcome> {
-  let outcome = await callApiOnce(prompt, stage, apiModel, validateResponse)
+  let outcome = await callApiOnce(prompt, stage, apiModel, classifyVerdict)
   for (
     let attempt = 1;
     retryTransient &&
@@ -551,7 +568,7 @@ async function callApiDetailed(
     attempt++
   ) {
     sleepImpl(TRANSIENT_RETRY_DELAYS_MS[attempt - 1])
-    outcome = await callApiOnce(prompt, stage, apiModel, validateResponse)
+    outcome = await callApiOnce(prompt, stage, apiModel, classifyVerdict)
   }
   return outcome
 }
@@ -711,7 +728,7 @@ export async function callGeminiWithFallback(
     cliJsonSchema,
     retryTransient = false,
     sleepImpl = defaultSleepSync,
-    validateResponse,
+    classifyVerdict,
   } = options ?? {}
 
   let cliOutcome: CliOutcome
@@ -719,14 +736,14 @@ export async function callGeminiWithFallback(
 
   if (preferCli) {
     // CLI → API
-    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort, validateResponse)
+    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort, classifyVerdict)
     if (cliOutcome.ok) {
       logMetaReviewAttempt(featureName, prompt.length, 'gemini_cli', cliModel, cliOutcome.text as string)
       return cliOutcome.text as string
     }
     logStageFallback(featureName, prompt.length, cliOutcome)
 
-    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel, validateResponse)
+    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel, classifyVerdict)
     if (apiOutcome.ok) {
       logMetaReviewAttempt(featureName, prompt.length, 'gemini_api', apiModel, apiOutcome.text as string)
       return apiOutcome.text as string
@@ -734,14 +751,14 @@ export async function callGeminiWithFallback(
     logStageFallback(featureName, prompt.length, apiOutcome)
   } else {
     // API → CLI
-    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel, validateResponse)
+    apiOutcome = await callApiDetailed(prompt, featureName, retryTransient, sleepImpl, apiModel, classifyVerdict)
     if (apiOutcome.ok) {
       logMetaReviewAttempt(featureName, prompt.length, 'gemini_api', apiModel, apiOutcome.text as string)
       return apiOutcome.text as string
     }
     logStageFallback(featureName, prompt.length, apiOutcome)
 
-    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort, validateResponse)
+    cliOutcome = callCliDetailed(prompt, cliModel, 'gemini_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, cliEffort, classifyVerdict)
     if (cliOutcome.ok) {
       logMetaReviewAttempt(featureName, prompt.length, 'gemini_cli', cliModel, cliOutcome.text as string)
       return cliOutcome.text as string
@@ -755,7 +772,7 @@ export async function callGeminiWithFallback(
   let claudeOutcome: CliOutcome | undefined
   if (geminiBothQuota) {
     claudeOutcome = callCliDetailed(
-      prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, 'antigravity_claude_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, undefined, validateResponse,
+      prompt, ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, 'antigravity_claude_cli', featureName, retryTransient, sleepImpl, cliJsonSchema, undefined, classifyVerdict,
     )
     if (claudeOutcome.ok) {
       logMetaReviewAttempt(featureName, prompt.length, 'antigravity_claude_cli', ANTIGRAVITY_CLAUDE_FALLBACK_MODEL, claudeOutcome.text as string)

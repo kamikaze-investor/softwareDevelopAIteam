@@ -91,7 +91,7 @@ export interface CopilotFallbackOptions {
    * 成立した BLOCKED を exit code だけで捨てて retry すると、後の attempt が
    * APPROVED を返し得る = review shopping になる（独立レビュー指摘 2026-09-17）。
    */
-  hasVerdict?: (raw: string) => boolean
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative'
   /** テストでの差し替え用。既定はAtomics.waitによる同期sleep。 */
   sleepImpl?: (ms: number) => void
 }
@@ -124,7 +124,7 @@ function attemptCopilotCall(
   model: string,
   usage: string,
   timeout: number,
-  hasVerdict?: (raw: string) => boolean,
+  classifyVerdict?: (raw: string) => 'none' | 'positive' | 'negative',
 ): CopilotAttemptFailure | CopilotAttemptSuccess {
   // 呼び出しごとの使い捨て隔離ディレクトリ（bare tmpdir() は他ステップと共有されるため使わない）
   const isolatedCwd = mkdtempSync(path.join(tmpdir(), 'copilot-meta-review-'))
@@ -148,7 +148,14 @@ function attemptCopilotCall(
     const stderr = result.stderr ?? ''
 
     // **成立した verdict を exit code だけで捨てない**（独立レビュー指摘 2026-09-17）。
-    if (hasVerdict !== undefined && stdout.trim() && hasVerdict(stdout)) {
+    // process 異常でも negative は保持する（捨てると Review Shopping になる）。
+    // positive は process が正常終了したときだけ採用する（CEO 指示 2026-09-17）。
+    const processFailed = result.status !== 0 || result.error !== undefined
+    const verdictClass = classifyVerdict !== undefined && stdout.trim()
+      ? classifyVerdict(stdout)
+      : 'none'
+
+    if (verdictClass === 'negative' || (verdictClass === 'positive' && !processFailed)) {
       return { ok: true, stdout }
     }
 
@@ -160,6 +167,13 @@ function attemptCopilotCall(
     }
     if (!stdout.trim()) {
       return { ok: false, errorMessage: `[copilotRouter] Copilot CLI の応答が空でした（usage=${usage}）` }
+    }
+
+    // exit 0 でも formal verdict が成立していなければ失敗として扱い、bounded retry を使う。
+    // ここで成功を返すと retry を素通りし、外側の判定まで不成立が持ち越される
+    // （独立レビュー指摘 2026-09-17）。
+    if (classifyVerdict !== undefined && verdictClass === 'none') {
+      return { ok: false, errorMessage: `[copilotRouter] Copilot CLI の応答から formal verdict を解釈できませんでした（usage=${usage}）` }
     }
 
     return { ok: true, stdout }
@@ -191,7 +205,7 @@ export function callCopilotForMetaReview(
 
   let lastErrorMessage = ''
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const outcome = attemptCopilotCall(prompt, model, usage, timeout, options?.hasVerdict)
+    const outcome = attemptCopilotCall(prompt, model, usage, timeout, options?.classifyVerdict)
     if (outcome.ok) return outcome.stdout
 
     lastErrorMessage = outcome.errorMessage
