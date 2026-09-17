@@ -145,6 +145,9 @@ function proposalDiagnosticKey(projectId: string): string {
  * 失敗のたびに際限なく膨らませない。**切り詰めたことは記録に残す。**
  */
 export const PROPOSAL_DIAGNOSTIC_RAW_LIMIT = 4000
+
+/** `proposer` の上限。呼び出し元から渡る自由文字列はここで止める。 */
+export const PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT = 120
 export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
 export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
 export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
@@ -289,8 +292,11 @@ function recordProposalDiagnostic(
 ): void {
   const truncated = diagnostic.raw.length > PROPOSAL_DIAGNOSTIC_RAW_LIMIT
   const payload = {
+    // `reason` は固定文字列・既知のキー名・位置の数値だけなので上限は要らない。
+    // `proposer` は呼び出し元から渡る唯一の自由文字列なので、ここで短く切る
+    // （production では定数2種だが、上限の無い欄を1つも残さない）。
     reason: diagnostic.reason,
-    proposer: diagnostic.proposer,
+    proposer: diagnostic.proposer.slice(0, PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT),
     promptVersion: diagnostic.promptVersion,
     candidateCount: diagnostic.candidateCount,
     followUpCandidateCount: diagnostic.followUpCandidateCount,

@@ -22,6 +22,7 @@ import {
   adoptionPromptVersion,
   findProposalDiagnostics,
   parseAdoptionProposal,
+  PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT,
   PROPOSAL_DIAGNOSTIC_RAW_LIMIT,
   readAdoptionCandidates,
   selectAdoptionCandidates,
@@ -492,6 +493,19 @@ describe('proposal_unusable — 観測して忘れない', () => {
     // raw 側は上限で切れているので、断片はそもそも入っていない。
     expect(diagnostic?.raw).not.toContain(secretish)
     expect(diagnostic?.rawTruncated).toBe(true)
+  })
+
+  it('payload に上限の無い欄を残さない', async () => {
+    const { storage, projectId } = seedAdoptable()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => 'not json',
+      proposerId: 'x'.repeat(5000),
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.proposer).toHaveLength(PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT)
   })
 
   it('記録に失敗しても採用の結果は変えない（観測が挙動を動かさない）', async () => {
