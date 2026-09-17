@@ -370,10 +370,15 @@ describe('abortTask — 観測の検証は baseline 一致だけではない', (
 
 describe('abortTask — blocked Job を1本残さない', () => {
   /** resume は新しい Job 行を作り、古い blocked 行を履歴として残す。2本並ぶのは異常ではない。 */
-  function addSecondBlockedJob(fx: Fixture, workingDir = '/workspace/target'): string {
+  function addSecondBlockedJob(
+    fx: Fixture,
+    overrides: { workingDir?: string; workspaceBaseline?: JobWorkspaceBaseline | undefined } = {},
+  ): string {
+    const { workingDir = '/workspace/target' } = overrides
     return fx.storage.jobs.create({
       taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
-      safeCommand: { kind: 'test', workingDir }, dryRun: false, workspaceBaseline: BASELINE,
+      safeCommand: { kind: 'test', workingDir }, dryRun: false,
+      workspaceBaseline: 'workspaceBaseline' in overrides ? overrides.workspaceBaseline : BASELINE,
     } as Parameters<IStorage['jobs']['create']>[0]).id
   }
 
@@ -399,9 +404,43 @@ describe('abortTask — blocked Job を1本残さない', () => {
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
   })
 
+  it('baseline が一致しない blocked Job が残っていれば park しない', () => {
+    const fx = seed()
+    // 一致しないということは、その Job が記録した時点から workspace が説明できない形で
+    // 変わっているということ。clean に見えることは、その説明にはならない。
+    const stale = addSecondBlockedJob(fx, {
+      workspaceBaseline: { mode: 'clean', startCommitHash: 'aaaaaaa1' },
+    })
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+
+    expect(fx.storage.jobs.findById(stale)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
+  it('baseline を持たない blocked Job が残っていれば park しない', () => {
+    const fx = seed()
+    const legacy = addSecondBlockedJob(fx, { workspaceBaseline: undefined })
+    abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+
+    expect(fx.storage.jobs.findById(legacy)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+  })
+
   it('別 workspace の blocked Job が残っていれば park しない（検証したのは1つだけ）', () => {
     const fx = seed()
-    const elsewhere = addSecondBlockedJob(fx, '/workspace/other')
+    const elsewhere = addSecondBlockedJob(fx, { workingDir: '/workspace/other' })
     abortTask(fx.storage, {
       taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
     })

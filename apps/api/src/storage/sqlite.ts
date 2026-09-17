@@ -2396,18 +2396,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // ——このPRが防ぐはずの状態そのものである（独立レビュー round 3 Finding 1）。
           const blockedSiblings = jobs.findByTaskId(task.id).filter((sibling) => sibling.status === 'blocked')
 
-          // 検証できたのは**報告された Job の workingDir 1つ**だけである。
-          // 別の workingDir を持つ blocked Job の workspace は未検証なので、
-          // その所有権は解放しない（「未検証の workspace で所有権を解放してはならない」）。
+          // **解放する Job は1本ずつ証明を要求する。**
+          //
+          // 「worktree も index も clean だから、もう守るべき未コミットの作業は無い」という
+          // 論法で兄弟をまとめて解放しない。baseline が一致しないということは、
+          // その Job が記録した時点から workspace が**説明できない形で変わっている**という
+          // ことであり、状態モデルが間違っているまま先へ進む場面そのものである。
+          // 所有権は「安全だと分かったから解放する」ものであって、
+          // 「危険だと言い切れないから解放する」ものではない（独立レビュー round 5 Finding 1）。
           const workingDir = job.safeCommand?.workingDir
-          const elsewhere = blockedSiblings.find((sibling) => sibling.safeCommand?.workingDir !== workingDir)
-          if (elsewhere) {
+          const unproven = blockedSiblings.find((sibling) => (
+            sibling.safeCommand?.workingDir !== workingDir
+            || !sibling.workspaceBaseline
+            || !baselineEqualsObservation(sibling.workspaceBaseline, input.observation)
+          ))
+          if (unproven) {
             return {
               ok: false as const,
               code: 'VERIFICATION_FAILED' as const,
               reason:
-                `task ${task.id} also holds blocked job ${elsewhere.id} in a different workspace `
-                + `(${elsewhere.safeCommand?.workingDir}); that workspace was not verified`,
+                `task ${task.id} also holds blocked job ${unproven.id} `
+                + (unproven.safeCommand?.workingDir !== workingDir
+                  ? `in a different workspace (${unproven.safeCommand?.workingDir})`
+                  : unproven.workspaceBaseline
+                    ? 'whose baseline does not match the observed workspace'
+                    : 'with no persisted workspace baseline')
+                + '; its ownership cannot be released on this observation (fail-closed)',
             }
           }
           const quarantinedSibling = blockedSiblings.find(
