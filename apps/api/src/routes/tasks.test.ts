@@ -218,6 +218,47 @@ describe('buildResumeAiCliPrompt', () => {
 })
 
 describe('Task API', () => {
+  // in_progress と blocked は roadmapActive に関係なく project を占有する。park した Task を
+  // ここで動かせると park は事実上取り消され、resume は park を理由に拒否するので
+  // 誰も解消できない状態になる。
+  it('PATCH /api/tasks/:id refuses to move a parked Task into an occupying status', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'T', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as never)
+
+      const request = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+        targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+        changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
+        status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      const { abortTask } = await import('../pl/abortTask.js')
+      expect(abortTask(storage, {
+        taskId: task.id, approvalRequestId: request.id, reason: 'parked',
+      })).toMatchObject({ ok: true, status: 'parked' })
+
+      for (const status of ['blocked', 'in_progress']) {
+        const response = await app.inject({
+          method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status },
+        })
+        expect(response.statusCode).toBe(409)
+      }
+      expect(storage.tasks.findById(task.id)?.status).toBe('pending')
+
+      // park と無関係な更新は通る（park は Task を凍結する操作ではない）。
+      const renamed = await app.inject({
+        method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { title: 'renamed' },
+      })
+      expect(renamed.statusCode).toBe(200)
+    })
+  })
+
   it('GET /api/tasks returns 400 without projectId', async () => {
     await withApp(async (app) => {
       const res = await app.inject({ method: 'GET', url: '/api/tasks' })

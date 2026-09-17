@@ -1618,6 +1618,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           task.projectId !== source.projectId ||
           task.status === 'blocked' ||
           task.status === 'done' ||
+          // park された Task の失敗を自動 retry しない。retry は queued Job を作る経路であり、
+          // Worker は Task の状態を見ずにそれを拾うため、park が黙って取り消される。
+          // 遅れて届いた報告（Outbox resend）が park の後に着く順序は実際に起こりうる。
+          isParkedTaskId(source.taskId) ||
           !project ||
           project.status !== 'running'
         ) {

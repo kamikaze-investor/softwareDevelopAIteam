@@ -583,6 +583,22 @@ export async function taskRoutes(
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
+    // **park された Task を、この汎用経路から占有状態へ戻さない。**
+    //
+    // `in_progress` と `blocked` は `occupiesProject()` が `roadmapActive` に関係なく
+    // 占有と数える status である。park した Task をここで動かすと park は事実上取り消され、
+    // しかも `resumeBlockedTask()` は park を理由に拒否するので誰も解消できなくなる。
+    // park の解除は CEO の判断であり、汎用 PATCH の副作用として起きてよいものではない。
+    if (
+      (result.data.status === 'in_progress' || result.data.status === 'blocked')
+      && storage.tasks.isParked(req.params.id)
+    ) {
+      return reply.status(409).send({
+        error: 'Task was parked by abort_task; it cannot be moved back into an occupying status',
+        code: 'TASK_PARKED',
+      })
+    }
+
     const updated = storage.tasks.update(req.params.id, result.data)
     if (!updated) {
       return reply.status(404).send({ error: 'Task not found' })

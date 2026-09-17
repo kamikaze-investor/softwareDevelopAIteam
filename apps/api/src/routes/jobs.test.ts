@@ -1964,6 +1964,87 @@ describe('Job API', () => {
     },
   )
 
+  // 遅れて届いた report（Outbox resend）が park の後に着く順序は実際に起こりうる。
+  // retry は queued Job を作る経路であり、Worker は Task の状態を見ずにそれを拾うため、
+  // ここで作ると park が黙って取り消される。
+  it('does not retry a Task that abort_task has parked', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { roadmapActive: true } as Partial<Task>)
+      const prompt = 'Implement parked case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'running')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+
+      // abort_task と同じ経路で park する（DB を直接書き換えない）。
+      const request = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+        targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+        changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
+        status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      storage.jobs.update(source.id, { status: 'failed' } as never)
+      const { abortTask } = await import('../pl/abortTask.js')
+      expect(abortTask(storage, {
+        taskId: task.id, approvalRequestId: request.id, reason: 'parked',
+      })).toMatchObject({ ok: true, status: 'parked' })
+
+      // park の後に、running だった頃の provider timeout 報告が遅れて届く。
+      storage.jobs.update(source.id, { status: 'running' } as never)
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: providerTimeoutFailure(),
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(storage.jobs.findByTaskId(task.id).some(
+        (job) => job.workflowStepKey?.startsWith('retry:') === true,
+      )).toBe(false)
+      expect(storage.jobs.findByTaskId(task.id).filter((job) => job.status === 'queued')).toHaveLength(0)
+      expect(storage.tasks.findById(task.id)?.roadmapActive).toBe(false)
+    })
+  })
+
+  // park は Job を failed へ解放する。canApplyJobResultStatus は terminal からの requeue を
+  // 許すため、この汎用経路を塞がないと park した Task の Job をそのまま動かし直せる。
+  it('refuses to make a parked Task\'s job live again', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { roadmapActive: true } as Partial<Task>)
+      // 実際の implement Job は Design Review evidence を持つ。持たない Job で試すと、
+      // requeue は evidence 不足で別の 409 になり、park の guard を通らないまま通過する。
+      const prompt = 'Implement parked requeue case.'
+      await createDesignReviewEvidence(app, task, prompt)
+      const source = await createStoredImplementJob(task, prompt, 'failed')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+
+      const request = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+        targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+        changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
+        status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      const { abortTask } = await import('../pl/abortTask.js')
+      expect(abortTask(storage, {
+        taskId: task.id, approvalRequestId: request.id, reason: 'parked',
+      })).toMatchObject({ ok: true, status: 'parked' })
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${source.id}`,
+        payload: { status: 'queued' },
+      })
+
+      expect(response.statusCode).toBe(409)
+      expect(storage.jobs.findById(source.id)?.status).toBe('failed')
+    })
+  })
+
   it('does not retry while a newer blocked Job represents a Permission or Safety wait', async () => {
     await withApp(async (app) => {
       const project = await createProject(app, { status: 'running' })

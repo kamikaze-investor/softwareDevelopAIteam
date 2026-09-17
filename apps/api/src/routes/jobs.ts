@@ -3,7 +3,7 @@ import { completeAbortCleanup } from '../pl/abortTask'
 import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
-import { canonicalizeJobUpdate, type Job, type ReviewResult } from '@ai-team/shared'
+import { canonicalizeJobUpdate, isLiveJob, type Job, type ReviewResult } from '@ai-team/shared'
 import {
   buildDesignContract,
   loadEngineeringPrinciples,
@@ -574,6 +574,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const existing = storage.jobs.findById(req.params.id)
     if (!existing) {
       return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    // **park された Task の Job を live な status へ戻さない。**
+    //
+    // `canApplyJobResultStatus()` は terminal からの requeue を許すため、park で
+    // `failed` へ解放した Job をこの汎用経路から `queued` へ戻せてしまう。Worker は
+    // Task の状態を見ずに queued Job を拾うので、park が黙って取り消される。
+    // これは遅れて届いた報告ではなく「park された Task をもう一度動かせ」という要求なので、
+    // stale 遷移として黙って落とすのではなく、理由を返して拒否する。
+    if (
+      jobUpdate.status !== undefined
+      && isLiveJob({ status: jobUpdate.status })
+      && storage.tasks.isParked(existing.taskId)
+    ) {
+      return reply.status(409).send({
+        error: 'Task was parked by abort_task; its jobs cannot be made live again',
+        code: 'TASK_PARKED',
+      })
     }
 
     // Result State Application Policy。
