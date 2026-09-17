@@ -30,6 +30,7 @@ import {
 } from './jobRunner.js'
 import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
 import { getCommitHash } from './jobRunner.js'
+import { observeWorkspace } from './workspaceVerification.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildWorktreeManifest } from './guards/changeManifest.js'
@@ -950,6 +951,15 @@ export async function pollJobs(): Promise<never> {
       } else {
         pendingOutboxStreak = 0
         pendingOutboxAlertSent = false
+        // **abort_task の cleanup 要求を先に処理する。**
+        // 対象 Job は所有権を保持しているので、どのみち `fetchQueuedJob()` は何も返さない。
+        // 先に観測を報告して所有権を解放できるようにしておく。
+        const reported = await reportAbortCleanupObservations()
+        if (reported) {
+          await sleep(POLL_INTERVAL_MS)
+          continue
+        }
+
         const work = await fetchQueuedJob()
         if (work) {
           const { job } = work
@@ -964,6 +974,85 @@ export async function pollJobs(): Promise<never> {
 
     await sleep(POLL_INTERVAL_MS)
   }
+}
+
+/**
+ * abort_task が cleanup を要求した Job について、**workspace を観測して報告するだけ**の一歩。
+ *
+ * ## Worker がここで行わないこと
+ *
+ * blocked → failed の遷移 / `roadmapActive` の変更 / Task status の変更 / 所有権の強制解放 /
+ * revert の推測 / caller が指定した任意 Job の処理。**状態を変えるのは API だけ**である。
+ * Worker は「いま workspace がどう見えるか」を既存の観測形式で返すのみで、
+ * 一致判定も解放も park も API が `releaseBlockedJobAndParkTask()` の transaction 内で行う。
+ *
+ * ## 対象は API が決める
+ *
+ * 対象 Job は `failureMetadata.abortCleanupRequestedAt` が付いた行だけである。この印は
+ * abort_task が有効な CEO Approval を確認したうえで**サーバ側で**付ける。Worker は探すだけで、
+ * 自分で対象を選ばない。
+ *
+ * ## TOCTOU
+ *
+ * 観測から解放までの間に別 Job が同じ workspace を書き換えないことは、**既存の所有権規則**が
+ * 担保する。対象 Job は `blocked` のまま所有権を保持しており、
+ * `findWorkspaceOwningTaskId()` がその Task を所有者と判定するため、
+ * `fetchQueuedJob()` は他 Task の Job を claim しない。**新しい lock は足していない。**
+ * 解放後は所有者が居なくなるので、次の poll から通常どおり claim が再開する。
+ */
+async function reportAbortCleanupObservations(): Promise<boolean> {
+  const projects = await fetchJson<Project[]>('/api/projects')
+  if (!projects) return false
+
+  for (const project of projects) {
+    if (project.status !== 'running') continue
+
+    const tasks = await fetchJson<Task[]>(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)
+    if (!tasks) continue
+
+    for (const task of tasks) {
+      const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
+      if (!jobs) continue
+
+      const requested = jobs.find((job) => (
+        job.status === 'blocked' && job.failureMetadata?.abortCleanupRequestedAt !== undefined
+      ))
+      if (!requested) continue
+
+      const observed = observeWorkspace(requested.safeCommand.workingDir)
+      if (!observed.observation) {
+        // 観測できないなら報告しない。API は baseline 一致を確認できず、park は成立しない。
+        // `observeWorkspace()` は throw せず、観測不能を knownGood の false で表す。
+        console.warn(
+          `[Worker] Job ${requested.id} の workspace を観測できませんでした（park は成立しません）`,
+        )
+        return true
+      }
+
+      console.log(`[Worker] Job ${requested.id} の workspace を観測し、abort cleanup 結果を報告します`)
+      try {
+        const response = await fetch(
+          `${API_BASE}/api/jobs/${encodeURIComponent(requested.id)}/abort-cleanup-result`,
+          {
+            method: 'POST',
+            headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ observation: observed.observation }),
+          },
+        )
+        if (!response.ok) {
+          // 不一致なら API が fail-closed で拒否する。所有権は保持されたままで、これは正常な結果。
+          console.warn(
+            `[Worker] Job ${requested.id} の abort cleanup は成立しませんでした: HTTP ${response.status}`,
+          )
+        }
+      } catch (err: unknown) {
+        console.warn(`[Worker] abort cleanup 報告エラー: ${formatUnknownError(err)}`)
+      }
+      return true
+    }
+  }
+
+  return false
 }
 
 /**
