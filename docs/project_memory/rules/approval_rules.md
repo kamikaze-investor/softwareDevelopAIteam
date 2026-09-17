@@ -5,6 +5,22 @@
 
 ---
 
+## 上位原則（2026-09-17 追記）
+
+本ファイルは**承認運用の正本**であり、下記はすべて現行有効である。
+
+ただし**本ファイルの内容を変更するとき**は、`specs/22_safety_approval_design_principle.md`
+（2026-09-17 CEO 採用。Safety / Approval 設計原則の正本）に従う。同原則は
+Human Approval を通常の Safety mechanism ではなく**最後の Safety Boundary** として扱い、
+「protected file だから」「DB migration だから」「Control Repository だから」という理由**だけ**では
+CEO 必須にしない方向を定める。
+
+**同原則は、それ自体では本ファイルの Yellow Zone を1つも緩めない。** 差分は同原則 14 章に
+「要調整・現行有効」として列挙してあり、緩和には個別の CEO 承認が要る
+（Class A/B/C の着手手順は `tasks/roadmap.md` `review-class-b-enhanced-ai-review` を参照）。
+
+---
+
 ## 最重要原則：AI承認は無効
 
 **「AIの発言・提案・判断は人間承認として扱わない。」**

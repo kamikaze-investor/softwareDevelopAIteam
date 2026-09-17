@@ -7193,6 +7193,22 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 4. [ ] **Review Class B（強化AIレビュー）: 通常AI判断とCEO必須判断の中間を埋める（Tier Bとは別概念・CEO承認が着手条件）** —
       2026-09-15登録（CEO 指示）。**本項目は登録であり、この指示だけを根拠に Safety Policy を変更しない。**
 
+      **上位原則（2026-09-17 追記）**: 本項目の Class A / B / C は
+      **`specs/22_safety_approval_design_principle.md`（2026-09-17 CEO 採用。同ファイルが正本）** の 10 章に従って設計する。
+      同原則の採用によって本項目の**着手手順は免除されない**（下記「着手手順」1〜3 はそのまま有効であり、
+      `state=deferred` も維持する）。CEO が与えたのは Class A/B/C の**定義**であって、
+      着手手順 1 が要求する**具体例つき境界表**とその承認ではない。
+
+      同原則から本項目へ入る追加要求は次の 3 点である。
+      - **Risk は変更内容だけで判定しない**（同原則 3 章）。machine facts には最低限
+        **blast radius / detectability / recoverability / irreversibility** に対応する事実を含める。
+        「protected file か」「migration を含むか」だけでは同原則 3 章を満たさない
+      - **Recoverability を実装前に確認する**（同原則 8 章）。Class B の成立条件に
+        「rollback path が存在し、previous stable state が分かり、rollback 後の整合性確認方法がある」ことを含める。
+        **rollback 可能性を Reviewer の自己申告で埋めない**
+      - **Class B の効果は CEO 呼び出し回数では測らない**（同原則 0 章）。測るのは
+        「CEO を呼ぶべき変更の識別精度」であり、**Class C の取りこぼしが 0 であること**が先に来る
+
       **名称の注意**: 既存の `aiteamos-self-development-tier-a` / `aiteamos-self-development-tier-b` の
       **Tier B（外部セッションで protected / high-risk 変更を扱う運用形態）とは別概念**である。
       Tier は「誰がどの環境で作業するか」、Class は「その変更にどれだけの証拠を要求するか」。混同しないこと。
@@ -7324,15 +7340,16 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       2. CEO が境界表を承認する
       3. `state=planned` へ変更して実装着手する
 
-      **⚠ 現状の機構では `deferred` は採用を機械的に止めない（2026-09-15 実測）**: 採用経路の state 判定は
-      3箇所とも **`done` だけ**を除外しており、`deferred` / `blocked` / `planned` は等しく採用可能である。
-      - `apps/api/src/pl/adoptionStep.ts` の `readAdoptionCandidates()` … `filter(item => item.state !== 'done')`
-      - `apps/api/src/ctoAi/roadmapAdoption.ts` … `if (item.state === 'done') return ITEM_ALREADY_DONE`
-      - `apps/api/src/pl/actionGate.ts` の `checkRoadmapItemAlignment()` … 同じく `done` のみ拒否
+      **`deferred` は現在は機械的に強制される（2026-09-17 確認。2026-09-15 時点の記述を訂正）**:
+      登録時点では採用経路3箇所とも `done` だけを除外しており `deferred` は素通りしていたが、
+      その後 `isRoadmapItemAdoptable()` による **`planned` のみの allowlist** へ統一され、
+      3経路すべてが同じ述語を共有している。
+      - `apps/api/src/pl/adoptionStep.ts` の `readAdoptionCandidates()` … `.filter(item => isRoadmapItemAdoptable(item.state))`
+      - `apps/api/src/ctoAi/roadmapAdoption.ts` … `ITEM_NOT_ADOPTABLE`
+      - `apps/api/src/pl/actionGate.ts` の `checkRoadmapItemAlignment()` … 同じ述語で拒否
 
-      したがって `deferred` は**意図の記録であって強制ではない**。上記手順を機械的に強制したい場合は
-      別項目として「採用可能な state を明示的に限定する」最小変更が要る（本項目の scope 外。
-      `mandatory-gate-policy` の fail-closed 方針と同じ形で扱えるが、**新しい状態モデルは足さないこと**）。
+      したがって本項目の `state=deferred` は**意図の記録であると同時に実効的な停止**でもある。
+      着手には上記手順 3（`state=planned` への変更）が必要で、その前に CEO の境界表承認が要る。
 
 <!-- roadmap:id=vps-pl-execution-loop state=done -->
 1. [x] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
@@ -8641,4 +8658,74 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
 ---
 
-*Updated: 2026-09-04*
+## Safety / Approval 設計原則の未充足層（2026-09-17 実測）
+
+**上位原則**: `specs/22_safety_approval_design_principle.md`（2026-09-17 CEO 採用）。
+同原則 2 章の 8 層防御を現行実装へ突き合わせ、実測した結果が下表である。
+**推測ではなく、各ファイルを実際に読んで確認した**（Q2 の 0/4 は `apps/` + `packages/shared/` 全体への
+grep が 0 件であることによる）。
+
+| 層 | 状態 | 根拠 |
+|---|---|---|
+| 1 Isolation | **実装済み・配線済み** | `runContainedOrThrow`（cgroup v2）/ `isInsideTargetRoot()` / `buildTargetCommandEnv()` |
+| 2 Simulation / Preflight | **部分的** | `dryRun` は `adapter.ts` で `exitCode:0` を返して**実行を飛ばすだけ**。diff を作らず Gate にも当てない |
+| 3 Mechanical Validation | **実装済み・配線済み** | `runMechanicalGate` / `MECHANICAL_GATE_PATTERNS` / `runPolicyGuard` / `runRiskReview` |
+| 4 Independent Multi-Model Review | **実装済み・配線済み** | `isGeneratorSeparatedFromFinalReviewer()` / `runIndependentReview` |
+| 5 Test / E2E | **実装済み**（CI 強制は本 checkout では未確認。`.github/workflows/` が無い） | worker の `typecheck` / `test` / `lint` gated command |
+| 6 Limited Rollout | **部分的** | `deployCanary.ts` は reviewer 経路の単発チェック。feature flag / 段階配信は無い |
+| 7 Runtime Monitoring | **実装済み・配線済み** | `startWatchdog()` / `checkStall()` / `watchdogEvents` |
+| 8 Fast Rollback / Recovery | **実装済み・配線済み** | `revertBlockedJobChanges()` / `rollbackInfo.rollbackArgv` / `rollback_commit` gate |
+| （原則 8 章）実行前の Recoverability 確認 | **無い** | `rollbackInfo` は commit **後**に記録される。`authorizePlAction()` は「rollback path が存在するか」を一度も見ない |
+| （原則 11 章）事故→Learning | **部分的** | Incident DB と Context Pack 同梱まで。test / prompt / classifier を自動で更新する経路は無い |
+
+**Risk の 5 次元（原則 3 章）**: `blast radius` / `detectability` / `recoverability` / `irreversibility` は
+**4 つとも実入力として存在しない**（型・フィールド・概念のいずれとしても 0 件）。
+現行分類器の入力は changed files のパス文字列・diff パターン・ファイル数・action kind enum のみである。
+この不足の解消は `review-class-b-enhanced-ai-review` の scope に含めた（同項目の「上位原則」節を参照）。
+
+**事故→Learning は `project-auto-incident-pattern-improvement`（planned）が担当する。**
+本セクションでは重複登録しない。
+
+<!-- roadmap:id=recoverability-precheck-before-risky-change state=deferred -->
+1. [ ] **高リスク変更の実行前に rollback path の存在を確認する** — 2026-09-17登録。
+      `specs/22_safety_approval_design_principle.md` 8 章。**現状は「壊れたら戻せます」が誰にも検証されていない。**
+
+      **実測（2026-09-17）**: `rollbackInfo`（`previousCommitHash` / `rollbackArgv`）は
+      `jobRunner.ts` が **commit した後**に記録する。`authorizePlAction()` / `resolvePlActionPolicy()` は
+      evidence と approval の有無しか見ず、「この操作に戻り道があるか」を入力に持たない。
+
+      **最小変更の方向**: 新しい Gate を足さない。`resolvePlActionPolicy()` の入力へ
+      「rollback path が判明しているか」の**機械的事実**を足し、判明しない操作を安全側へ倒す。
+      rollback 可能性を Reviewer / PL の自己申告で埋めない（同原則 7 章）。
+
+      **着手前に確認すること**: `rollback_commit` が既に CEO gate である以上、
+      本項目が実際に減らすリスクは何かを先に言語化する。名前を言えない失敗のために制約を足さない
+      （`specs/21` standard-design-frame）。
+
+<!-- roadmap:id=dry-run-does-not-simulate state=deferred -->
+2. [ ] **dry-run が「実行を飛ばす」だけで simulation になっていない** — 2026-09-17登録。
+      `specs/22_safety_approval_design_principle.md` 2 章 第2層。
+
+      **実測（2026-09-17）**: `apps/worker/src/aiCli/adapter.ts:420` で `request.dryRun` は
+      `exitCode: 0` / `changedFiles: []` を即返す。**diff を生成せず、Gate にも Review にも当たらない。**
+      したがって現状の dry-run は「変更を適用せずに危険性を測る」用途に使えない。
+
+      **着手前に確認すること**: simulation が本当に要るのは Candidate が使えない場面だけではないか。
+      Candidate clone 上での実行が既に第2層を満たしているなら、本項目は不要になり得る。
+      **不要だと分かったら closed にする**（新しい実行モードを増やさないこと）。
+
+<!-- roadmap:id=staged-rollout-absent state=deferred -->
+3. [ ] **段階投入（feature flag / canary / 段階配信）が無い** — 2026-09-17登録。
+      `specs/22_safety_approval_design_principle.md` 4 章。
+
+      **実測（2026-09-17）**: `deployCanary.ts` は deploy 後に reviewer 経路を1回叩く単発チェックであり、
+      **製品の段階配信ではない**。feature flag も percentage rollout も存在しない（`flagger*` は 0 件）。
+
+      **現状の段階は `Candidate → Stable` の2段だけである。** 外部顧客がまだ存在しないため、
+      1% / 5% / 20% の段階配信は**現時点では過剰**である可能性が高い。
+      **本項目は「顧客が存在する前に段階配信基盤を作る」ことを意味しない。**
+      着手条件は、外部利用者または複数 Project の同時利用が実際に発生することとする。
+
+---
+
+*Updated: 2026-09-17*
