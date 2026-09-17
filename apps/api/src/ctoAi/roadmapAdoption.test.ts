@@ -298,6 +298,36 @@ describe('adoptRoadmapItem — 独立レビュー指摘に対する回帰固定�
     expect(result.reason).toContain('no executed prior task')
   })
 
+  it('parked Task（pending かつ roadmapActive=false）は follow-up を塞がない', async () => {
+    // abort_task は今後この形で Task を park する。単純な status !== 'done' で active 扱いすると、
+    // park した瞬間に follow-up が永久に起動しなくなる（CEO 指摘・2026-09-17）。
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: 'API 側の配線' }, deps(),
+    )
+    if (!first.ok) throw new Error('setup failed')
+    storage.jobs.create({
+      taskId: first.taskId, projectId, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(first.taskId, { status: 'done' })
+
+    // park された Task: 未完了だがどの実行経路からも選ばれない。
+    const parked = storage.tasks.create({
+      projectId, title: 'parked', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(parked.id, { roadmapActive: false })
+
+    const result = await adoptRoadmapItem(
+      storage,
+      { projectId, roadmapId: 'first-item', ...SPEC, implementationScope: 'Worker 側の配線', followUp: true },
+      deps(),
+    )
+
+    expect(result.ok).toBe(true)
+  })
+
   it('Finding 5: 無関係な active Task が Project に残っていれば follow-up しない', async () => {
     const { storage, projectId } = makeStorage()
     const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
@@ -309,10 +339,13 @@ describe('adoptRoadmapItem — 独立レビュー指摘に対する回帰固定�
     storage.tasks.update(first.taskId, { status: 'done' })
 
     // 別項目の Task がまだ動いている。Project は idle ではない。
-    storage.tasks.create({
+    // **occupying であるために in_progress にする。** 手動作成 Task の既定は
+    // roadmapActive=false で、それは parked（占有しない）である。
+    const unrelated = storage.tasks.create({
       projectId, title: 'unrelated', description: '', status: 'pending',
       assignee: 'developer_ai', dependencies: [],
     } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(unrelated.id, { status: 'in_progress' })
 
     const result = await adoptRoadmapItem(
       storage,

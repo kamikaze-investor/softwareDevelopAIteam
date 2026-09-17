@@ -33,6 +33,7 @@ import {
   getBaseRoadmapId,
   isFollowUpTaskKey,
   MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
+  occupiesProject,
 } from '@ai-team/shared'
 import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
 import type { IStorage } from '../storage/interface'
@@ -107,7 +108,8 @@ export function classifyAdoptionCandidates(
   // **採用 seam と同じ条件で見る。** seam は Project 全体の active Task を見て follow-up を拒否するので、
   // ここで Project が busy なのに候補として出すと、PL が選んだ末に FOLLOW_UP_NOT_ELIGIBLE で落ち、
   // 採用 attempt 予算だけを焼く（2026-09-15 の事故と同じ形）。検出と強制を一致させる。
-  const projectHasActiveTask = projectTasks.some((task) => task.status !== 'done')
+  // 既存 `currentTask` と同じ意味。parked Task（pending かつ roadmapActive=false）は占有しない。
+  const projectHasActiveTask = projectTasks.some((task) => occupiesProject(task))
 
   return open.map((candidate) => {
     const siblings = projectTasks.filter(
@@ -127,7 +129,7 @@ export function classifyAdoptionCandidates(
       (task) => storage.jobs.findByTaskId(task.id).some((job) => job.status !== 'queued'),
     ).length
     const executed = executedCount > 0
-    const active = siblings.some((task) => task.status !== 'done')
+    const active = siblings.some((task) => occupiesProject(task))
 
     // **まだ一度も Job が走っていない Task は従来どおり `fresh` 扱いである。**
     // 採用し直すと `syncRoadmapTasks()` の isUnstarted 分岐が spec を更新するだけで、

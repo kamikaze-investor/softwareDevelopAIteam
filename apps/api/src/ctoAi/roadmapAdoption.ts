@@ -40,6 +40,7 @@ import {
   getBaseRoadmapId,
   isFollowUpTaskKey,
   MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
+  occupiesProject,
 } from '@ai-team/shared'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapSyncPhaseInput } from '../storage/interface'
 import { validateRoadmapTasks, validateRoadmapPhases } from '../storage/roadmapTaskValidation'
@@ -218,7 +219,11 @@ function checkFollowUpEligibility(
   //    CEO 確定の成立条件は「active Task なし」であって「この項目に active Task なし」ではない。
   //    PL tick は手前で Project の idle を確かめるが、採用 seam は直接も叩かれるため
   //    ここが権威ある判定でなければならない。
-  const active = projectTasks.find((task) => task.status !== 'done')
+  //
+  //    判定は既存 `currentTask` と同じ意味（`occupiesProject()`）を使う。
+  //    `status !== 'done'` にすると、`pending` かつ `roadmapActive=false` の **parked Task**
+  //    まで active に数え、follow-up を永久に塞ぐ（CEO 指摘・2026-09-17）。
+  const active = projectTasks.find((task) => occupiesProject(task))
   if (active) {
     return fail(
       'FOLLOW_UP_NOT_ELIGIBLE',

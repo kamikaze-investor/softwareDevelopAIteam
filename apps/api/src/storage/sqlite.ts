@@ -6,6 +6,7 @@
  * → IStorage インターフェースを実装した別クラスに切り替えるだけでよい
  */
 
+import { OCCUPIES_PROJECT_SQL } from '@ai-team/shared'
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
@@ -861,8 +862,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
         // 呼び出し側の snapshot 判定と挿入の間に状態が変わっていないかを、ここで再確認する。
         if (requireNoActiveTasks) {
+          // `occupiesProject()` と同じ意味。parked Task は占有として数えない。
           const active = db.prepare(
-            "SELECT id, status FROM tasks WHERE project_id = ? AND status != 'done' LIMIT 1",
+            `SELECT id, status FROM tasks WHERE project_id = ? AND ${OCCUPIES_PROJECT_SQL} LIMIT 1`,
           ).get(projectId) as { id: string; status: string } | undefined
           if (active) {
             throw new Error(

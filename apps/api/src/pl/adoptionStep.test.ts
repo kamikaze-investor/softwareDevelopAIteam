@@ -251,10 +251,12 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     // 採用 seam は Project 全体の active Task を見て拒否する。検出側が甘いと、PL が選んだ末に
     // FOLLOW_UP_NOT_ELIGIBLE で落ちて採用 attempt 予算だけを焼く。
     const { storage, projectId } = projectWithExecutedItem()
-    storage.tasks.create({
+    // occupying な Task にする（手動 Task の既定 roadmapActive=false は parked で占有しない）。
+    const unrelated = storage.tasks.create({
       projectId, title: 'unrelated', description: '', status: 'pending',
       assignee: 'developer_ai', dependencies: [],
     } as Parameters<IStorage['tasks']['create']>[0])
+    storage.tasks.update(unrelated.id, { status: 'in_progress' })
 
     const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
 
