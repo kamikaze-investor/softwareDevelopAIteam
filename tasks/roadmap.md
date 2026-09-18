@@ -8061,6 +8061,61 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 取り下げた Task が後から再開されうるか。されるなら履歴をどう残すか
       - 効果検証可能性（Design Philosophy 8）: 取り下げ件数とその理由を後から数えられること
 
+<!-- roadmap:id=job-raw-output-persisted-and-shown state=planned -->
+8. [ ] **Job の raw stdout/stderr がそのまま永続化・表示され、credential 断片 / prompt / model 出力を含みうる** —
+      2026-09-18登録（production 実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: AI CLI の出力は加工されずに `jobs.stdout` / `jobs.stderr` へ保存され、
+      Mobile の Job 詳細（`apps/mobile/app/tasks/[id].tsx`）がそのまま表示する。
+      中身は provider 次第で、**credential 断片・prompt 抜粋・モデル出力本文**を含みうる。
+
+      **実測（2026-09-18）**: `claude_code` の `--output-format json` envelope には
+      `result` フィールドがあり、成功時は**モデル本文そのもの**が入る
+      （`reviewerAdapter.ts`: 「`result` は**文字列**で、その中に reviewer JSON が入る」）。
+      API エラー時は API のエラー文が入り、`401` なら
+      `invalid Authorization: Bearer sk-...` の形が入りうる。
+      この envelope が丸ごと `jobs.stdout` に残る。
+
+      **PR #258 との境界（CEO 判断・2026-09-18）**: #258 が保証したのは
+      **operator-facing failure reason / `stopReason` / attention / CEO notification に
+      provider の生文字列を流さない**ことだけである（固定語彙のみ: `credit exhausted` /
+      `authentication failed` / `access forbidden` / `rate limited` / `API error`）。
+      **Job 詳細の raw stdout/stderr は #258 では変更していない。安全であるとも述べない。**
+      雑に sanitize すると既存の診断証拠を失うため、横断的な責務として本項目へ分離した。
+
+      **既出だが open item が無かった**（重複確認済み・2026-09-18）:
+      - `project-auto-worker-trust-boundary`（done）が 2026-08-12 に
+        「現HEADには stdout/stderr に対する中央 redaction/sanitization 処理は**存在しない**」と
+        記録し、「将来中央 redaction が必要と判断された場合も…別途 CEO 承認のもと
+        本項目または関連項目で扱う」と**明示的に見送って**いる
+      - `roadmap-parser-metadata-and-checkbox-tolerance`（done）も
+        「stdout/stderr 中央 redaction の要否は `project-auto-worker-trust-boundary` で既出
+        （**未実装・見送り済み**）」と書き、対象を「Job 実行時の AI CLI 出力」と特定している
+      どちらも **`done` item の中の記述**であり、`PROJECT_CURRENT_STATE.md` の
+      「未完了・保留項目」には現れない。**開いた追跡項目が無かったのが本項目の登録理由**である
+      （`project-completion-badge-wording-correction` と同じ構造的な漏れ）。
+
+      **着手時に調査すること（実装方針を先に決めない。新しい sanitize subsystem を先に作らない）**:
+      1. **全 provider の stdout/stderr に何が入り得るか**を実測する。claude_code だけの話ではない
+      2. **どこへ永続化・表示されるか**を洗い出す: `jobs` 表 / `stdout_path`・`stderr_path` の
+         ログファイル / audit / Outbox payload / Mobile Job 詳細 / `/api/state`
+      3. **raw evidence を保持する診断上の価値**。2026-09-18 の `Credit balance is too low` は
+         raw stdout を読めたから特定できた。**消すと原因究明能力を失う**
+      4. **operator 向け表示だけを sanitized view として分離できるか**。
+         raw は残し、見せる側だけ安全にする形が第一候補
+      5. raw evidence を保存し続けるなら、**access と retention をどう扱うか**
+      6. 既存 `sanitizeMessage()`（`geminiRouter.ts`、export 済み。env 値と secret の
+         「形」を redact）を**補助として**使えるか
+      7. **denylist redaction だけで安全とみなさない。** 知らない形は必ず抜ける。
+         #258 が採った「echo せず固定語彙へ分類する」allowlist 方式のほうが強い
+      8. structured / allowlisted diagnostics へ置き換えられる箇所はどこか
+
+      **理想形**: `raw diagnostic evidence` と `operator-facing safe view` を分離すること。
+      ただし**新しい DB schema も権限システムも先に追加しない**（CEO 指示・2026-09-18）。
+
+      **着手前に CEO 判断へ上げる条件**: 実装が Safety 方針または data-retention 方針の
+      変更を伴うと判明した場合（保存期間の短縮・既存ログの破棄・アクセス制御の新設など）。
+
 <!-- roadmap:id=task-design-review-conflict-has-no-recovery-route state=deferred -->
 8. [ ] **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い** —
       2026-09-18登録（production 実測）。**本項目は Finding であり、まだ実装しない。**
