@@ -1713,25 +1713,24 @@ function claudeCliFailureStderr(
  * **何も立証していない**（独立レビュー指摘）。語の出現で判定すると、
  * 権限エラーや API 障害を課金切れとして operator へ出してしまう。
  *
- * そこで**枯渇を述べている言い回しそのもの**を列挙する。ここに載らない文は
- * generic の `API error` へ落ちる。**外し方向へ倒すのは意図的**で、
+ * **語の出現ではなく、本文が冒頭でそう名乗っているか**で判定する。API のエラー本文は
+ * 原因を先頭で述べるので、文中に同じ語が現れるだけの文
+ * （条件文 "if your credit balance is too low, add funds" / 否定 "not out of credits" /
+ * 無関係な "insufficient credit card details" / prompt 抜粋の巻き込み）は
+ * 原因を**何も立証していない**（独立レビュー指摘）。先頭に限ればこれらは全て外れる。
+ *
+ * **VPS production 実測（2026-09-18、5件すべて同一）**: `api_error_status: 400` のとき
+ * `result` は長さ 25 の文字列 `"Credit balance is too low"` ちょうどで、JSON でも
+ * 長文でもない。接尾辞が付く将来形にも耐えるよう前方一致にしてある。
+ *
+ * ここに載らない文は generic の `API error` へ落ちる。**外し方向へ倒すのは意図的**で、
  * 取りこぼしても「分からない」と出るだけだが、緩めると嘘のラベルが出る。
  */
 function saysBalanceIsGone(result: unknown): boolean {
   if (typeof result !== 'string') return false
-  const text = result.toLowerCase()
 
-  return [
-    // 2026-09-18 の production 実測はこの形
-    /credit balance is too low/,
-    /credit balance too low/,
-    /credit balance (is )?(exhausted|depleted|empty)/,
-    // `insufficient` は credit に**直接**かかっているときだけ採る。
-    // "insufficient permission to access credit balance" を拾わないため、
-    // 間に語を挟むことを許さない。
-    /insufficient credit/,
-    /out of credits?\b/,
-  ].some((pattern) => pattern.test(text))
+  return /^(your |the )?credit balance is (too low|exhausted|depleted|empty)\b/
+    .test(result.trim().toLowerCase())
 }
 
 /**
@@ -1828,28 +1827,40 @@ function classifyClaudeImplementFailure(
     return undefined
   }
 
-  const deniedTools = extractDeniedToolNames(parsed)
-  if (deniedTools.length > 0) {
-    return `Claude Code tool permission denied (tools: ${deniedTools.join(', ')})`
+  // **tool_name を operator 向けの文字列へ入れない。**
+  // `tool_name` は provider が返す自由文字列であり、こちらが形を決められない。
+  // ここへ echo すると、credential 断片や prompt 抜粋がそのまま先頭行に載り、
+  // `stopReason()` → attention → CEO notification まで届く（独立レビュー指摘）。
+  // 本 PR が他の経路で採ったのと同じ方針（echo せず、確かな事実だけ出す）に揃える。
+  //
+  // 件数は provider の文字列ではなく**こちらが数えた事実**なので出してよい。
+  // どの tool だったかは Job の raw stdout に残っており、診断はそこで行う
+  // （Job 詳細の扱いは Roadmap `job-raw-output-persisted-and-shown` の責務）。
+  const deniedToolCount = countDeniedTools(parsed)
+  if (deniedToolCount > 0) {
+    return `Claude Code tool permission denied (${deniedToolCount} tool call(s))`
   }
   return 'implementation produced no file changes'
 }
 
 /**
- * Claude Code CLI JSON の permission_denials から tool_name だけを安全に取り出す。
- * tool_input・ファイル内容・token等は一切ログへ含めない。
+ * Claude Code CLI JSON の permission_denials のうち、**tool_name を持つ要素の件数**を返す。
+ *
+ * 名前そのものは返さない。provider の自由文字列を operator 向けの経路へ持ち出さないため、
+ * 呼び出し側が誤って echo できないよう**関数の戻り値の段階で落としている**。
  */
-function extractDeniedToolNames(parsed: Record<string, unknown>): string[] {
+function countDeniedTools(parsed: Record<string, unknown>): number {
   const denials = parsed.permission_denials
-  if (!Array.isArray(denials)) return []
-  const names: string[] = []
+  if (!Array.isArray(denials)) return 0
+
+  let count = 0
   for (const denial of denials) {
     if (denial !== null && typeof denial === 'object' && 'tool_name' in denial) {
       const toolName = (denial as { tool_name: unknown }).tool_name
-      if (typeof toolName === 'string') names.push(toolName)
+      if (typeof toolName === 'string') count += 1
     }
   }
-  return names
+  return count
 }
 
 interface AiFailureInspectionInput {

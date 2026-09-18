@@ -2304,10 +2304,45 @@ describe('task-022: AI CLI 実行ブロック', () => {
     }), createPolicy())
 
     expect(result.status).toBe('failed')
-    expect(result.stderr).toContain('Claude Code tool permission denied (tools: Edit)')
+    expect(result.stderr).toContain('Claude Code tool permission denied (1 tool call(s))')
+    // tool_name は provider の自由文字列なので、名前そのものを operator 向けに出さない。
+    expect(result.stderr).not.toContain('tools: Edit')
     expect(result.stderr).not.toContain('secret-before')
     expect(result.stderr).not.toContain('secret-after')
     expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  // **tool_name に何が入っていても operator 向けには出さない。**
+  // provider が返す自由文字列なので、credential 断片や prompt 抜粋が入りうる
+  // （独立レビュー指摘）。件数だけを出し、名前は raw stdout 側に残す。
+  it('permission_denials の tool_name に credential 断片があっても先頭行へ出さない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({
+          is_error: false,
+          permission_denials: [
+            { tool_name: 'Edit sk-ant-SECRET-EXAMPLE prompt excerpt: src/x.ts' },
+            { tool_name: 'Write' },
+          ],
+        }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    // `stopReason()` はこの先頭行を採る。
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('Claude Code tool permission denied (2 tool call(s))')
+    expect(firstLine).not.toContain('sk-ant')
+    expect(firstLine).not.toContain('prompt excerpt')
+    expect(firstLine).not.toContain('src/x.ts')
   })
 
   it('Claude implement で変更0件かつpermission_denialsなし → no file changesでfailedになる', async () => {
@@ -2620,7 +2655,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
         changedFiles: [],
-        stdout: JSON.stringify({ is_error: true, api_error_status: 402, result: "out of credit" }),
+        stdout: JSON.stringify({ is_error: true, api_error_status: 402, result: "Credit balance is exhausted" }),
       })),
     }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
@@ -2715,6 +2750,107 @@ describe('task-022: AI CLI 実行ブロック', () => {
 
     expect(result.stderr).toContain("API error")
     expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  // **同じ語が文中に現れるだけでは原因の証明にならない。** 条件文・否定・無関係な用法・
+  // prompt 抜粋の巻き込みは、いずれも残高が尽きたことを立証していない（独立レビュー指摘）。
+  // 判定を本文の先頭に限ることで、以下はすべて generic へ落ちる。
+  it('条件文 (if ...) の中の残高文言を credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "Request failed. If your credit balance is too low, add funds and retry." }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  it('否定文の残高文言を credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "You are not out of credits; the model name is invalid." }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  it('credit card の不備を credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 402, result: "insufficient credit card details on file" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  // prompt がエラー本文へ echo されるケース。**本文の先頭は prompt であって原因ではない。**
+  it('prompt 抜粋に残高文言が混ざっても credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "invalid_request_error: prompt was: \"fix the billing page where credit balance is too low is shown\"" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  // **VPS production 実測（2026-09-18）そのままの値。**
+  // 締めた結果、本来名乗るべきこのケースまで潰していないことを固定する。
+  // `result` は長さ 25 の `'Credit balance is too low'` ちょうどだった。
+  it('実測どおりの本文は従来どおり credit exhausted と出す', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "Credit balance is too low" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("credit exhausted")
   })
 
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
