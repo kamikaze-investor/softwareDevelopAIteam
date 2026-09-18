@@ -19,6 +19,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { IStorage } from '../storage/interface'
 import { createSQLiteStorage } from '../storage/sqlite'
+import { buildSystemState } from '../state/systemState'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import { PL_ACTION_KINDS } from '@ai-team/shared'
@@ -38,9 +39,11 @@ interface Seeded {
 
 function seed(options: {
   taskStatus?: 'pending' | 'blocked' | 'done'
-  projectStatus?: 'running' | 'archived'
+  projectStatus?: 'running' | 'archived' | 'paused'
   roadmapTaskKey?: string
   withJob?: boolean
+  /** 自律ループから到達できない Task（`roadmapActive=false`）を作る。 */
+  unreachable?: boolean
 } = {}): Seeded {
   const storage = createSQLiteStorage(':memory:')
   const project = storage.projects.create({
@@ -58,9 +61,10 @@ function seed(options: {
     dependencies: [],
     allowedPaths: ['apps/api/src'],
     acceptanceCriteria: ['c'],
-    ...(options.roadmapTaskKey !== undefined
-      ? { roadmapTaskKey: options.roadmapTaskKey, phase: 1, roadmapActive: true }
-      : {}),
+    // 既定は「自律ループから到達できる」形にする。再投入が意味を持つのはこの形だけで、
+    // そうでない Task は `TASK_NOT_REACHABLE` で断られる（下のテスト参照）。
+    roadmapActive: options.unreachable !== true,
+    ...(options.roadmapTaskKey !== undefined ? { roadmapTaskKey: options.roadmapTaskKey, phase: 1 } : {}),
   } as Parameters<IStorage['tasks']['create']>[0])
 
   if (options.withJob === true) {
@@ -147,6 +151,21 @@ describe('recoverBlockedTask — 入口条件', () => {
       .toMatchObject({ ok: false, code: 'PROJECT_UNAVAILABLE' })
   })
 
+  it('**自律ループから到達できない Task は断る。** 再投入で attention を消さない', () => {
+    // `task_blocked_without_job` は roadmapActive を条件にしないが、遷移先で立つはずの
+    // `task_ready_without_job` は要求する。素通しにすると、いま出ている警告が消えて
+    // 代わりが1つも立たない（＝可視化のための変更で可視性を失う）。
+    const { storage, taskId } = seed({ unreachable: true })
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: false, code: 'TASK_NOT_REACHABLE' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    // 断られた以上、attention は出たままである。
+    expect(buildSystemState(storage).attention.map((i) => i.kind))
+      .toContain('task_blocked_without_job')
+  })
+
   it('park された Task は断る（復旧の副作用で park を取り消さない）', () => {
     const { storage, taskId } = seed()
     storage.auditLog.record({
@@ -186,23 +205,39 @@ describe('recoverBlockedTask — audit と有界性', () => {
     expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
   })
 
-  it('**生涯上限を持たない。** 連打を止めるのは入口条件であって回数ではない', () => {
+  it('続けて2回は叩けない（入口条件が idempotency guard になっている）', () => {
     const { storage, taskId } = seed()
 
-    // 続けて2回叩いても、2回目は「もう blocked ではない」で断られる。
     expect(recoverBlockedTask(storage, { taskId, reason: '1' })).toMatchObject({ ok: true, attempt: 1 })
     expect(recoverBlockedTask(storage, { taskId, reason: '2' }))
       .toMatchObject({ ok: false, code: 'TASK_NOT_BLOCKED' })
+  })
 
-    // もう一度受理されるのは、システムが**独立に** dead state へ再突入したときだけ。
+  it('**同じ design text では2度目を受理しない**（判定の揺れで CONFLICT を洗浄させない）', () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    completeReviewAsConflict(storage, taskId)
+
+    expect(recoverBlockedTask(storage, { taskId, reason: '1回目' }).ok).toBe(true)
+
+    // 変えずに、また同じ状態へ落ちた。同じテキストを再審査させない。
     storage.tasks.update(taskId, { status: 'blocked' })
-    expect(recoverBlockedTask(storage, { taskId, reason: '3' })).toMatchObject({ ok: true, attempt: 2 })
+    const repeat = recoverBlockedTask(storage, { taskId, reason: '変えずにもう一度' })
+    expect(repeat).toMatchObject({ ok: false, code: 'SPEC_ALREADY_RETRIED' })
+    expect(repeat.ok === false && repeat.reason).toContain('implementationScope')
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+  })
 
-    // 何度目でも、条件さえ満たせば受理され続ける（「N 回で二度と不能」にしない）。
-    for (let i = 0; i < 5; i += 1) {
-      storage.tasks.update(taskId, { status: 'blocked' })
-      expect(recoverBlockedTask(storage, { taskId, reason: `loop ${i}` }).ok).toBe(true)
-    }
+  it('**訂正して世代が変われば、また受理する**（二度と復旧不能にはしない）', () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    completeReviewAsConflict(storage, taskId)
+    expect(recoverBlockedTask(storage, { taskId, reason: '1回目' }).ok).toBe(true)
+
+    // 訂正して採用し直した結果、別の design text が審査された（= 別世代）。
+    storage.tasks.update(taskId, { status: 'blocked', description: '訂正後の説明' })
+    completeReviewAsConflict(storage, taskId)
+
+    expect(recoverBlockedTask(storage, { taskId, reason: '訂正したので再投入' }))
+      .toMatchObject({ ok: true, attempt: 2 })
   })
 
   it('自動ループの予算を消費もリセットもしない', () => {
@@ -283,6 +318,31 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
 
     expect(result).toMatchObject({ ok: true, nextDriver: 'attention_only' })
+  })
+
+  it('**running でない Project では remediation を約束しない**', () => {
+    // paused では attention も Job 生成も動かない。`pl_independent_remediation` と返すと嘘になる。
+    const { storage, taskId } = seed({ projectStatus: 'paused', roadmapTaskKey: 'some-item' })
+    completeReviewAsConflict(storage, taskId)
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: true, nextDriver: 'attention_only' })
+  })
+})
+
+describe('遷移と audit は分割できない', () => {
+  it('audit の書き込みが失敗したら status も戻らない（記録の無い復旧を作らない）', () => {
+    const { storage, taskId } = seed()
+    const original = storage.auditLog.record
+    // 同一 transaction であることを、audit 側を失敗させて確かめる。
+    storage.auditLog.record = () => { throw new Error('disk full') }
+
+    expect(() => recoverBlockedTask(storage, { taskId, reason: 'r' })).toThrow(/disk full/)
+
+    storage.auditLog.record = original
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
   })
 })
 

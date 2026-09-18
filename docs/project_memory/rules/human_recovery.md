@@ -29,11 +29,20 @@
 「新しい承認サイクルを始めるために既存の承認が要る」循環を作らないためである
 （`packages/shared/src/plActionPolicy.ts` の `resume_task` 節を参照）。
 
-**AI/PL はこの経路を使えない。** 3重に閉じている:
+**AI/PL はこの経路を使えない。** 層ごとに保証の強さが違うので分けて書く:
 
-1. `PL_ACTION_KINDS` に対応する語彙が無い → `resolvePlActionPolicy()` が未知値として `forbidden`
-2. `executeAction()` / `allowedActionsFor()` に配線していない → in-process の PL から到達経路が無い
-3. `WORKER_ALLOWLIST` に載せていない → WORKER credential からは Default Deny で 403
+1. `PL_ACTION_KINDS` に対応する語彙が無い → `resolvePlActionPolicy()` が未知値として `forbidden`。
+   **auth mode に依存しない**
+2. `executeAction()` / `allowedActionsFor()` に配線していない → PL は in-process で動き自分へ
+   HTTP を打たないので到達経路が存在しない。**auth mode に依存しない**
+3. `WORKER_ALLOWLIST` に載せていない → WORKER credential からは Default Deny で 403。
+   ただし**これが効くのは split credential mode だけ**である。legacy mode（`ADMIN_TOKEN_SHA256` /
+   `WORKER_TOKEN_SHA256` 両方未設定）は単一 `API_TOKEN` が全 route を許すため allowlist を評価しない。
+   これは本経路固有の穴ではなく legacy mode の性質で、`POST /api/pl/tick` や
+   `POST /api/tasks/:id/abort` など既存の admin 専用 route すべてに等しく当てはまる。
+   **production は split credential mode で運用する。**
+
+自律呼び出しを無条件に塞いでいるのは 1 と 2 である。3 は split mode における多層防御。
 
 ---
 
@@ -105,10 +114,19 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 | `TASK_HAS_JOBS` | Job があるので既存 `/resume` の担当。こちらでは受けない |
 | `TASK_NOT_BLOCKED` | 既に再投入済みか、そもそも止まっていない |
 | `TASK_PARKED` | `abort_task` で park 済み。復旧の副作用で park を取り消さない |
+| `TASK_NOT_REACHABLE` | `roadmapActive=false` 等で自律ループから到達できない。戻しても何も動かず、いま出ている警告だけが消える。採用し直すか park する |
+| `SPEC_ALREADY_RETRIED` | **同じ design text で既に1度再投入済み**。変えずに押し直すと同じ Review を引き直すだけ。**手順 2 へ戻って訂正する** |
 
-**生涯上限は無い。** 連打を止めているのは入口条件そのもので、もう一度受理されるには
-システムが**独立に** dead state へ再突入している必要がある（再突入経路は
-`failContinuation()` だけで、それは producer が実際に動いたことを意味する）。
+**生涯上限は無い。かわりに「却下済みテキストの世代」単位で1回に限る。**
+連打を止めているのは入口条件（`blocked` かつ Job 0 件）と `SPEC_ALREADY_RETRIED` の2つで、
+**変えずに押し直すことだけ**ができない。訂正すれば design text hash が変わり、次の世代として
+また1回受理される —— 「N 回で二度と復旧不能」にはならない。
+
+これが要るのは、`pending` へ戻すと採用のやり直しが可能になり、その経路には
+`isMateriallyDifferentSpec()` 相当の検査が無いためである。放置すると、この repo で実測されている
+判定の揺れ（ledger: `independent-review-verdict-instability`）を使って
+CONFLICT を洗浄できてしまう。
+
 この操作は Job も Review も作らないので、`PL_MAX_REMEDIATION_ATTEMPTS` /
 `PL_MAX_ATTEMPTS_PER_TARGET` / `DESIGN_REVIEW_MAX_ATTEMPTS` のどれも消費・リセットしない。
 

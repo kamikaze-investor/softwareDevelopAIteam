@@ -17,6 +17,7 @@
 
 import { occupiesProject } from '@ai-team/shared'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
+import { countHumanRecoveryAttempts } from '../humanRecovery/recoveryAudit'
 import type { IStorage } from '../storage/interface'
 import type { Job, Task, Project } from '@ai-team/shared'
 
@@ -461,6 +462,12 @@ export function buildSystemState(
           projectId: project.id,
           projectName: project.name,
           taskId: task.id,
+          // **エピソード単位の identity を持たせる。**
+          // `targetKeyOf()` は referenceId を優先し、`hasEscalated()` はそのキーで
+          // 生涯にわたり重複通知を抑止する。taskId だけだと、再投入して**もう一度**この
+          // dead state に落ちたとき CEO へ二度と通知されない（独立レビュー指摘・2026-09-18）。
+          // 復旧回数はエピソード内で不変、次のエピソードで必ず増えるので識別子に適する。
+          referenceId: `${task.id}:r${countHumanRecoveryAttempts(storage, task.id)}`,
           detail:
             'task is blocked but has no job at all; no resume, retry or remediation path can reach it '
             + 'without an explicit human recovery',

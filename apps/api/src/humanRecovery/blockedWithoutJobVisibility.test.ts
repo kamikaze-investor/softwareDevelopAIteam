@@ -17,6 +17,7 @@ import type { IStorage } from '../storage/interface'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { buildSystemState } from '../state/systemState'
 import { runPlTick, type PlLoopDeps } from '../pl/executionLoop'
+import { recoverBlockedTask } from './recoverBlockedTask'
 
 function seedBlockedWithoutJob(options: {
   projectStatus?: 'running' | 'paused'
@@ -139,5 +140,28 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
 
     expect(sends).toBe(1)
     expect(second.status).toBe('idle')
+  })
+
+  it('**再投入して再び同じ状態に落ちたら、もう一度通知する**', async () => {
+    // `hasEscalated()` は生涯キーで重複通知を抑止する。attention の identity を Task だけに
+    // すると、2回目のエピソードが永久に通知されない（独立レビュー指摘・2026-09-18）。
+    const { storage, taskId } = seedBlockedWithoutJob()
+    let sends = 0
+    const d = deps({ escalate: async () => { sends += 1 } })
+
+    await runPlTick(storage, d)
+    expect(sends).toBe(1)
+
+    // CEO が再投入し、その後システムが独立に同じ dead state へ戻った。
+    // （attention は roadmapActive を条件にしないが、再投入は自律ループから到達できる
+    //   Task にしか認められない —— `TASK_NOT_REACHABLE` を参照）
+    storage.tasks.update(taskId, { roadmapActive: true })
+    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const second = await runPlTick(storage, d)
+
+    expect(second.status).toBe('escalated')
+    expect(sends).toBe(2)
   })
 })

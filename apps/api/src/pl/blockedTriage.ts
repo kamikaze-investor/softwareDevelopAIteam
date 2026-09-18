@@ -507,11 +507,15 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 解けるのは CEO の明示操作（Human Recovery）だけなので `ceo_escalation` で終端する。
   if (item.kind === 'task_blocked_without_job') {
     const stalled = facts.review
+    // **`CONFLICT` だけを CONFLICT と呼ぶ。** `UNCERTAIN` / `REVIEW_UNAVAILABLE` は
+    // `recomputeDecision()` の構造検証による fail-closed であり、設計への異議ではない。
+    // ここを「ALIGNED 以外」で括ると、#255 が対象にしない判定まで
+    // `design_review_conflict` として high confidence で報告することになる
+    // （独立レビュー指摘・2026-09-18）。#255 の `findRemediationSubject()` と同じ粒度に合わせる。
     const reviewIsConflict =
       stalled !== undefined
       && stalled.status === 'succeeded'
-      && stalled.decision !== undefined
-      && stalled.decision !== 'ALIGNED'
+      && stalled.decision === 'CONFLICT'
 
     return {
       ...result,
