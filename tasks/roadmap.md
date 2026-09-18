@@ -6607,6 +6607,31 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    **情報は既に手元にある**: `sendAlert` は `SendResult[]` を返しており、成功チャネルの有無は判定できる。
    捨てているだけである。
 
+   **【2026-09-18 訂正: PR #249 を受けて前提を作り直した。旧本文のままでは実装できない】**
+
+   #249（採用エスカレーションの incident 単位 dedup）以降、**「通知せずに `escalated` を記録する」のは
+   正式挙動になった**。同じ対象で同じ failure class が続く間、CEO への通知は最初の1回だけにし、
+   audit と PL state には毎回残す —— そうしないと「通知を止める」が「障害を消す」になるためである。
+
+   したがって旧本文の「**未配達なのに escalated が記録されること自体が不具合**」という前提は、
+   そのままでは**広すぎる**。区別すべきは4つある:
+
+   | | 意味 | 現状（2026-09-18 master 実測） |
+   |---|---|---|
+   | **A** | PL が escalation を判断した | ✅ `record(..., 'escalated', ...)` で残る |
+   | **B** | CEO へ実際に delivery された | ❌ **残らない**（`defaultEscalate` が `SendResult[]` を捨てる） |
+   | **C** | duplicate として意図的に抑制した | ⚠️ 採用経路のみ（`notify:false` + `pl_adoption_escalation_notified`） |
+   | **D** | 新規 incident なのに delivery が失敗した | ❌ **区別されない**（`sendAlert` は全失敗でも正常 resolve。console の `🚨 UNDELIVERED` だけ） |
+
+   **本項目が直すのは B と D である。** A は既に正しく、C は #249 が入れた。
+
+   **`escalated` と `notification delivered` を同義にしない。**
+   - **「`sendAlert` が成功したときだけ `escalated` を記録する」仕様にしてはならない。**
+     #249 の duplicate suppression では送信そのものを行わないため、この仕様は
+     「抑制した incident を escalation として記録できない」ことになり、
+     retry window（escalation を境界に切り替わる）まで壊れる
+   - 逆に **「`escalated` なら届いている」とも扱わない。** それが今の不具合である
+
    **`hasEscalated` の抑制自体は正しい**（CEO 判断待ちの間 tick ごとに Diagnose で
    provider CLI を回すのを避けるため、理由がコードに明記されている）。
    **直すべきは抑制ではなく「届いていないのに escalated と記録する」点**である。
@@ -6620,11 +6645,16 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    本項目は**配達結果と記録の整合**だけを扱う。
 
    **着手時に確認すること（実装方針を先に決めない）**:
-   - `escalateTo` が `SendResult[]` を見て、**1チャネル以上成功した時のみ** `escalated` を記録できるか
-   - 失敗時の result 名をどうするか（**再試行を抑止しない**別値にする）
+   - `defaultEscalate` が捨てている `SendResult[]` を、**`escalated` の記録を止めずに**
+     どこへ残すか。判定材料は既にあり、捨てているだけである
+   - **D（新規 incident で delivery 失敗）をどう表すか。** A の記録は残したまま、
+     「誰にも届いていない」ことが後から分かる形にする。
+     再試行や復旧を抑止する状態にはしない
+   - C（意図的な抑制）と D（届かなかった）を**取り違えない**こと。
+     どちらも「送っていない / 届いていない」だが、前者は正常で後者は障害である
    - 配達結果を後から数えられるようにするか。`IStorage` に notifications store は無い。
      **新しいテーブルを作る前に、既存 `audit_log` の detail へ載せて足りるかを先に見る**
-   - **新しい通知基盤を作らない。**
+   - **新しい通知基盤を作らない。** `sendAlert` 自体の挙動も変えない
 
    ---
 
@@ -6647,6 +6677,20 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
    つまり除外は「復旧」側にしか効かず、「採用」側には効かない。結果として
    **直せない対象が1つあるだけで、無関係な Roadmap 項目の採用まで恒久的に止まる。**
+
+   **【2026-09-18 訂正: 出口はできた。ただし自動では解けない】**
+
+   下の「外から解く手段が現状ない」は **PR #235（`abort_task`）で解消済み**である。
+   `POST /api/tasks/:id/abort` が CEO Approval を要件に Task を park する
+   （`done` にせず `roadmapActive=false`、Job 履歴は残す）。2026-09-18 に production で2回使用し、
+   いずれも attention が解除されて PL が再開した。
+
+   **ただし「1件の解けない対象が採用まで止める」構造そのものは残っている。**
+   `maybeAdoptNext()` は今も除外前の `state.attention.length > 0` を見ており
+   （`apps/api/src/pl/executionLoop.ts`）、`runPlTick()` 側の `hasEscalated()` 除外は
+   採用側に効かない。出口が CEO の手動操作しかない点も変わっていない。
+
+   以下は 2026-09-17 時点の記録として残す（`abort_task` の項だけ上記のとおり古い）。
 
    **この状態を外から解く手段が現状ない**（2026-09-17 read-only 確認）:
    - `job_blocked` attention の条件は `task.status !== 'done'`。消すには Task を `done` にするしかない
