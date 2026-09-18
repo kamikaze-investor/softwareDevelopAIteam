@@ -322,7 +322,8 @@ export interface IJobStorage {
   findByTaskId(taskId: string): Job[]
   findById(id: string): Job | undefined
   /**
-   * 直近の AI CLI Job を**新しい順**で返す（読み取り専用）。
+   * 直近の AI CLI Job を**結果が出た順**（completed → started → created の順に評価）で返す。
+   * 読み取り専用。
    *
    * timeout 再評価センサーが「直近 N 件」を数えるためだけに足したもので、
    * 新しい集計基盤ではない。materialize するのは既存 `jobs` 行そのものである。

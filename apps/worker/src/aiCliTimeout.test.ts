@@ -36,9 +36,10 @@ describe('aiCliTimeoutMs', () => {
     expect(aiCliTimeoutMs('claude_code', 'review')).toBeUndefined()
   })
 
-  it('claude_code の他 mode にも渡さない', () => {
-    const otherModes: AiCliMode[] = (['analyze', 'plan', 'explain'] as unknown as AiCliMode[])
-      .filter((mode) => mode !== 'implement' && mode !== 'review')
+  // **実在する mode で確かめる。** 以前ここは存在しない mode 名を cast しており、
+  // 'qa' が 900_000 を返すようになっても素通りしていた（独立レビュー指摘）。
+  it('claude_code の他 mode にも渡さない（実在する mode で確認）', () => {
+    const otherModes: AiCliMode[] = ['qa', 'summarize']
     for (const mode of otherModes) {
       expect(aiCliTimeoutMs('claude_code', mode)).toBeUndefined()
     }

@@ -216,6 +216,56 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     expect(afterChange.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(true)
   })
 
+  // **「直近 N 件」は作成順ではなく結果が出た順。**
+  // production には 7〜20 日 queued のままの Job が実在するので、作成順で窓を切ると、
+  // 「長く積まれてから今日走って落ちた Job」が窓の外に落ちて A が発火しない（独立レビュー指摘）。
+  it('古く作られて今日終わった Job も窓に入る', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const taskId = seed(storage)
+
+    // 先に「今日終わった、ずっと前に作られた」Job を 1 件作る。
+    const old = storage.jobs.create({
+      taskId,
+      projectId: storage.tasks.findById(taskId)!.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+      aiCliProvider: 'claude_code',
+      aiCliMode: 'implement',
+    } as never)
+    storage.jobs.update(old.id, {
+      status: 'failed',
+      startedAt: new Date(BASE).toISOString(),
+      completedAt: new Date(BASE + 900 * 1000).toISOString(),
+      changedFiles: ['apps/api/src/pl/executionLoop.ts'],
+      failureMetadata: { kind: 'provider_timeout' },
+    } as never)
+
+    // そのあとに WINDOW 件ぶん、**より新しく作られた**が
+    // **より前に終わった** Job を積む。作成順なら古い方が押し出される。
+    for (let i = 0; i < IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW; i++) {
+      const newer = storage.jobs.create({
+        taskId,
+        projectId: storage.tasks.findById(taskId)!.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'implement',
+      } as never)
+      storage.jobs.update(newer.id, {
+        status: 'success',
+        startedAt: new Date(BASE - 86_400_000).toISOString(),
+        completedAt: new Date(BASE - 86_400_000 + 60_000).toISOString(),
+      } as never)
+    }
+
+    const fired = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
+    expect(fired.some((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')).toBe(true)
+  })
+
   it('entity id は sensorId と scope だけで決まる', () => {
     expect(implementTimeoutSensorEntityId({
       sensorId: 'implement-timeout-rate-too-high', scope: '900000',
