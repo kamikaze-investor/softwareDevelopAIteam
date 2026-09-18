@@ -6958,8 +6958,29 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    量が多いため、AI へ注入される 4 件（`multi_ai_step_review_flow.md` / `design_philosophy.md` /
    `AGENTS.md` §4 / Review Level 1）を先に片付けること。
 
-<!-- roadmap:id=project-completion-badge-wording-correction state=planned -->
-0. [ ] **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない** — 2026-09-15 監査（Confirmed / P2。2026-09-15 master で 3 件とも未実施を再確認）。
+<!-- roadmap:id=project-completion-badge-wording-correction state=done -->
+0. [x] **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
+   — **完了（2026-09-18, Candidate `ea3141c`）**。VPS PL による Tier A 自己開発。
+
+   **完了の根拠（acceptance criteria と実成果を照合した）**:
+   1. `apps/mobile/app/index.tsx:425` のバッジが `ロードマップ消化済み`。`完了` ラベルは無い
+   2. `packages/shared/src/types/project.ts:51-63` に doc コメント。
+      「Goal 達成ではなく Roadmap 消化状態」「`isComplete` を Project 終了の根拠に使わない」を明記
+   3. `specs/00_constitution.md:118`（3.10 Goal Driven）へ Project Model 原則を統合。
+      **新規 spec は作っていない**（commit の specs/ 差分は `M` のみ）
+   - Review Job `03a232c2` = `approved`。QA AI 自身が「3 件すべて実施、受入条件 4 件を満たす」と要約
+   - File Change Guard 通過、変更は上記 3 ファイルのみ（`allowedPaths` 内）
+   - `git_commit` は CEO 承認（`approval-20260918-037d5430`, CONSUMED）を経て成立
+
+   **この `done` は未検証完了ではない。** 上記 evidence と受入条件を照合したうえでの完了記録である。
+
+   **本件から出た設計上の学び**は `executed-item-remaining-work-has-no-continuation` と
+   `adoption-does-not-check-implementation-feasibility` へ記録した（重複記載しない）。
+
+   ---
+   以下は登録時の記録。
+
+   2026-09-15 監査（Confirmed / P2。2026-09-15 master で 3 件とも未実施を再確認）。
 
    **事実**: `project-auto-completion-detection`（`state=done`）の `[x]` item の**後ろ**に
    2026-09-13 の訂正が追記され、3 つの最小修正を指示し
@@ -7996,6 +8017,49 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 取り下げた Task が後から再開されうるか。されるなら履歴をどう残すか
       - 効果検証可能性（Design Philosophy 8）: 取り下げ件数とその理由を後から数えられること
 
+<!-- roadmap:id=task-design-review-conflict-has-no-recovery-route state=deferred -->
+8. [ ] **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い** —
+      2026-09-18登録（production 実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: PL が `project-completion-badge-wording-correction` を自律採用した直後、
+      task-kind Design Review が `finalDecision: CONFLICT`（`scope_simplicity: CONFLICT`。
+      「提案の scope 要約が3つの対象訂正のうち2つを誤記しており、範囲が曖昧で対象外のロジックまで
+      変更しかねない」）を返した。evidence が登録されないため Job は作られず、Task は
+      `pending` / `roadmapActive=1` / Job 0 件のまま **16.5 時間放置された**。
+
+      **3経路すべてが塞がっていた（実測）**:
+      - **PL**: `task_ready_without_job` は `NOTIFY_ONLY_ATTENTION_KINDS`。
+        「Job 生成は Design Review evidence が要り、その判定を PL が覆すことは許されない」という
+        **正しい設計**であり、PL は通知して停止する
+      - **人間**: `resumeBlockedTask()` は blocked Job を要求する。この Task は Job が1件も無いため
+        `No jobs exist for this task` で使えない。Mobile の resume 導線も同じ経路を使う
+      - **AI 自動**: `design-review-conflict-recovery`（done）は **roadmap-kind** の
+        Whole-Roadmap Review を project 初期化時に再生成する経路であり、task-kind は対象外
+
+      さらに attention が1件でも立つと `maybeAdoptNext()` は採用を見送るため、
+      **この Task 1件で PL 全体の自律採用が止まる**。
+
+      **今回の復旧は手順化されていない経路で行った**: CEO 承認のもと、既存
+      `POST /api/projects/:id/roadmap-adoptions` を訂正済み `implementationScope` /
+      `allowedPaths` で叩き直した（Task は Job を持たないため `syncRoadmapTasks` が可変として
+      更新し、fresh Design Review が走って ALIGNED になった）。**再現手順として文書化されていない。**
+
+      **既存項目との違い（重複実装しないこと）**:
+      - `adoption-does-not-check-implementation-feasibility`: allowedPaths と実装対象の不一致。
+        **検出の話**であり、本項目は**その後の復旧の話**
+      - `adopted-item-blocked-by-stale-deferral-text`（done）: 原因が古い ledger 本文だった事例。
+        同項目自身が「原因が別のものは分ける」と明記している
+      - `design-review-conflict-recovery`（done）: roadmap-kind 専用
+
+      **着手時の前提（CEO 指示・2026-09-18）**: 解決策として **元 PL 自身に remediation を戻さない**。
+      別セッションで進行中の **Independent Remediation 設計との統合**を前提とすること。
+      CONFLICT を出した当人に訂正させると、Review 判定を迂回する圧力がそのまま残る。
+
+      **やらないこと（non-goals）**: 新しい AttentionKind / TaskStatus / Roadmap state の追加 /
+      `task_ready_without_job` を PL が実行可能な attention に変えること /
+      Design Review evidence 無しで Job を作れるようにすること /
+      本 Finding を根拠に Safety・Approval 境界を動かすこと。
+
 <!-- roadmap:id=adoption-does-not-check-implementation-feasibility state=planned -->
 8. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
       2026-09-15登録（production 実測）。CEO 指示により**既存 adoption / Design Review /
@@ -8032,6 +8096,21 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       なお、このとき stderr には Tier B（PR #216）で入れた診断がそのまま出ており、
       **原因の特定に追加調査を要さなかった**:
       `File Change Guard blocked. Why: … — Not in task.allowedPaths: … allowedPaths scope …`
+
+      **3例目（2026-09-18、production 実測。follow-up Task で発生）**: PL が
+      `project-completion-badge-wording-correction#2`（follow-up）を採用し、
+      `allowedPaths: ["tasks/roadmap.md"]` を宣言した。実装 AI は `specs/00_constitution.md` を
+      編集しようとして **File Change Guard が blocked**（`fileChangeAllowed: false`、Job `3e95c82b`）。
+
+      1・2 例目と違い、**宣言した範囲は存在するディレクトリだった**。ずれたのは
+      「その Task で何を実装するか」の認識である。follow-up は「ledger の state を更新する」
+      つもりで `tasks/roadmap.md` を宣言したが、Task description には元 item の本文
+      （= 既に実装済みの3件）がそのまま載っており、実装 AI はそちらを実装しようとした。
+      **宣言範囲と description が別のことを指していると、Guard で初めて露見する。**
+
+      follow-up をそもそも作るべきでなかった点は
+      `executed-item-remaining-work-has-no-continuation` の A/B/C 判定で扱う（重複記載しない）。
+      ここで扱うのは **allowedPaths と実装対象の突き合わせ**である。
 
       **3例目（2026-09-16、実測。#227 適用後）**: PL が
       `allowed-paths-empty-disables-file-change-guard` を自律採用し、
@@ -8250,6 +8329,36 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         DB migration / destructive・不可逆 / Reviewer 間の重要な不一致が未解消、は Class C
       - 検出は B+ 方式。**candidate limit / priority / rotation より前**に open 全件へ機械判定を当て、
         skip は `audit_log` へ記録し、3 回連続 skip で**順序だけ**繰り上げる（Gate・Class 判定は弱めない）
+
+      **【2026-09-18 production 実測で追加した原則。ここが本 Finding の中心である】**
+
+      **Roadmap item が open であることだけを、remaining implementation scope の証拠にしてはならない。**
+
+      実測: `project-completion-badge-wording-correction` を PL が自律実装し、Review approved・
+      CEO 承認・commit（Candidate `ea3141c`）まで到達した。ところが ledger の `state` は
+      `planned` のままだった（**ledger を書く経路がシステム内に無い**。`tasks/roadmap.md` は
+      `roadmapAdoption.ts` も `roadmapWriter.ts` も書かず、`pnpm roadmap:update` + PR という
+      人手経路でしか更新されない）。follow-up 検出は「item が open」を残作業の証拠として扱い、
+      `...#2` を作成。その follow-up は `allowedPaths: ["tasks/roadmap.md"]` — すなわち
+      **「ledger の state を更新すること」を製品実装スコープとして採用していた**。
+
+      **follow-up 候補化の前に、次の3つから状態を区別すること**:
+      - Roadmap item 全体の acceptance criteria
+      - 過去 Task が**実際に完了した内容**（changedFiles / commit）
+      - Review / commit evidence
+
+      | 判定 | 意味 | すること |
+      |---|---|---|
+      | **A** | 実質的に完了済み | **follow-up Task を作らない。** Roadmap completion reconcile の対象 |
+      | **B** | 明確な remaining implementation scope がある | その具体的な `implementationScope` だけを follow-up へ |
+      | **C** | 判断不能 | 勝手に follow-up を作らず Review / Escalation へ回す |
+
+      **`tasks/roadmap.md` の state 更新そのものを follow-up の実装スコープにしない。**
+      それは製品実装ではなく completion reconcile であり、実装 Task の形にすると
+      「ledger を直すための Task」が延々と生まれる。
+
+      **新しい workflow / TaskStatus / Roadmap state を先に追加しないこと**（CEO 指示・2026-09-18）。
+      まず上の A/B/C 判定を既存の検出経路のどこへ置けるかを決める。
 
       **（履歴）当初 `state=deferred` とした理由（CEO 判断・2026-09-17）**: 本 Finding の最終的な解決は
       `ALREADY_EXECUTED` に対する**限定的な例外**、すなわち既存の adoption authority を
