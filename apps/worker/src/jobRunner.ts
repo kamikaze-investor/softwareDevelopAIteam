@@ -1705,6 +1705,36 @@ function claudeCliFailureStderr(
 }
 
 /**
+ * エラー本文が**「残高が尽きている」と言い切っている**かどうかだけを見る。
+ *
+ * `credit` や `credit balance` という語の**出現**では足りない。残高に言及しているだけの
+ * 文（"cannot access credit balance" / "credit balance endpoint unavailable" /
+ * "insufficient permission to access credit balance"）は、残高が尽きたことを
+ * **何も立証していない**（独立レビュー指摘）。語の出現で判定すると、
+ * 権限エラーや API 障害を課金切れとして operator へ出してしまう。
+ *
+ * そこで**枯渇を述べている言い回しそのもの**を列挙する。ここに載らない文は
+ * generic の `API error` へ落ちる。**外し方向へ倒すのは意図的**で、
+ * 取りこぼしても「分からない」と出るだけだが、緩めると嘘のラベルが出る。
+ */
+function saysBalanceIsGone(result: unknown): boolean {
+  if (typeof result !== 'string') return false
+  const text = result.toLowerCase()
+
+  return [
+    // 2026-09-18 の production 実測はこの形
+    /credit balance is too low/,
+    /credit balance too low/,
+    /credit balance (is )?(exhausted|depleted|empty)/,
+    // `insufficient` は credit に**直接**かかっているときだけ採る。
+    // "insufficient permission to access credit balance" を拾わないため、
+    // 間に語を挟むことを許さない。
+    /insufficient credit/,
+    /out of credits?\b/,
+  ].some((pattern) => pattern.test(text))
+}
+
+/**
  * API 層のエラーを**固定語彙**へ落とす。
  *
  * 入力（provider の文字列）は判定に使うだけで、**戻り値には一切含めない**。
@@ -1719,6 +1749,7 @@ function claudeCliFailureStderr(
  * Roadmap `job-raw-output-persisted-and-shown` で扱う。ここで雑に消すと
  * 障害診断の証拠を失う（CEO 判断・2026-09-18）。
  */
+
 function classifyApiError(status: number, result: unknown): string {
   // **status が定義として意味を持つものを先に返す。** 文言判定を先に置くと、
   // status 側の確かな意味を文言側の推測が上書きしてしまう（独立レビュー指摘）。
@@ -1742,14 +1773,9 @@ function classifyApiError(status: number, result: unknown): string {
   // 402 Payment Required は定義上まさにこれだが、それでも文言を要求する
   // （status 単独では名乗らせない）。
   //
-  // 文言は「残高が足りない」と明示しているものだけ。`billing` 単独は入れない。
-  // "billing address invalid" のように**残高と無関係な** billing エラーまで
-  // credit 枯渇と断定してしまう（独立レビュー指摘）。
+  // 文言は `saysBalanceIsGone()` のとおり「残高が尽きている」と言い切っているものだけ。
   // 2026-09-18 実測: `400` + "Credit balance is too low"。
-  if (status === 400 || status === 402) {
-    const text = typeof result === 'string' ? result.toLowerCase() : ''
-    if (/credit balance|insufficient.*credit|out of credit/.test(text)) return 'credit exhausted'
-  }
+  if ((status === 400 || status === 402) && saysBalanceIsGone(result)) return 'credit exhausted'
 
   // 文言からの推測でラベルを具体化しない。分からないものは分からないと出す。
   return 'API error'

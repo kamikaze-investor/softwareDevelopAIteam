@@ -2655,6 +2655,68 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(result.stderr).not.toContain("credit exhausted")
   })
 
+  // **残高に「言及している」だけでは枯渇の証明にならない。** status gate を通った 400 でも、
+  // 文言が枯渇を言い切っていなければ generic へ落とす（独立レビュー指摘）。
+  // 以下3件はいずれも credit balance に触れるが、残高が尽きたとは述べていない。
+  it('credit balance へアクセスできないだけの 400 を credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "cannot access credit balance" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  it('credit balance endpoint の障害を credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "credit balance endpoint unavailable" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  // これは 403 のときは status gate が止めていたケースである。400 で来ても
+  // **文言 gate 単独で**止まることを固定する（status gate 頼みにしない）。
+  it('insufficient が credit に直接かかっていない 400 を credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "insufficient permission to access credit balance" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
   // redact ではなく「echo しない」ことで、取りこぼしの余地を無くしている。
   it('API エラー文に credential 断片があっても operator 向けには出さない', async () => {
