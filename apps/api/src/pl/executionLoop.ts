@@ -51,6 +51,13 @@ import {
   type PlAdoptionDeps,
   type PlAdoptionResult,
 } from './adoptionStep'
+import {
+  countRemediationAttempts,
+  findRemediationSubject,
+  PL_MAX_REMEDIATION_ATTEMPTS,
+  runRemediationStep,
+  type PlRemediationDeps,
+} from './remediationStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import {
@@ -221,6 +228,17 @@ export interface PlLoopDeps {
   adopt?: PlAdoptionDeps['adopt']
   /** resume に添える指示文（テスト差し替え用）。既定は DEFAULT_RESUME_INSTRUCTION。 */
   resumeInstruction?: string
+  /**
+   * Design Review CONFLICT の Independent Remediation（テスト差し替え用）。
+   * 既定は `runRemediationStep()`。
+   *
+   * **model 選択はここでは行わない。** flagship / vendor 分離の判定は
+   * `independentRemediationPolicy`（将来 `role-model-registry` へ吸収）の責務であり、
+   * ここに別の選択機構を作らない。
+   */
+  remediate?: typeof runRemediationStep
+  /** Remediation runner の起動設定（テスト差し替え用）。 */
+  remediationDeps?: PlRemediationDeps
   coordinatorDeps?: CoordinatorDeps
   now?: () => string
 }
@@ -310,6 +328,86 @@ function notifyOnlyReason(storage: IStorage, item: AttentionItem): string {
     summary ? `理由: ${String(summary)}` : undefined,
     'この判定は Binding Review です。PL は妥当性を評価できますが、BLOCK を覆せません。',
   ].filter((line) => line !== undefined).join('\n')
+}
+
+/**
+ * その attention が Independent Remediation の対象か。
+ *
+ * 判定は `findRemediationSubject()`（永続レコードだけを見る read-only の導出）へ一本化する。
+ * ここに条件を書き足さない —— **2箇所に書くと必ずずれる**。
+ */
+function isRemediableConflict(storage: IStorage, item: AttentionItem): boolean {
+  if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) return false
+  if (findRemediationSubject(storage, item.taskId) === undefined) return false
+  return countRemediationAttempts(storage, item.taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+}
+
+/**
+ * CONFLICT で止まった採用を1回 Remediation する。
+ *
+ * 成功（implement Job ができた）なら `acted` を返す。それ以外は `undefined` を返し、
+ * **呼び出し側の既存 Escalation 経路へ落とす** —— ただし Remediation の診断を通知本文へ添える。
+ * CEO には「止まっている」だけでなく「独立した AI がどう読んだか」まで届く。
+ */
+async function remediateConflict(
+  storage: IStorage,
+  deps: PlLoopDeps,
+  key: string,
+  item: AttentionItem,
+): Promise<Omit<PlTickResult, 'target'> | undefined> {
+  if (item.taskId === undefined) return undefined
+
+  const run = deps.remediate ?? runRemediationStep
+  let result: Awaited<ReturnType<typeof runRemediationStep>>
+  try {
+    result = await run(storage, item.taskId, {
+      ...(deps.remediationDeps !== undefined ? deps.remediationDeps : {}),
+    })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    record(storage, key, 'diagnosis_failed', `remediation=error ${message}`)
+    return { status: 'diagnosis_failed', reason: message, attempt: 1 }
+  }
+
+  const provenance = result.provider !== undefined ? ` provider=${result.provider} model=${result.model}` : ''
+  record(
+    storage,
+    key,
+    result.status === 'remediated' ? 'acted' : 'blocked',
+    `remediation=${result.status} code=${result.failureCode ?? '-'}${provenance} ${result.reason ?? ''}`,
+  )
+
+  if (result.status === 'remediated') {
+    return {
+      status: 'acted',
+      proposedKind: 'adopt_roadmap_item',
+      reason: `independent remediation passed a fresh design review (task ${result.taskId})`,
+      attempt: 1,
+    }
+  }
+
+  // 解決しなかった。**既存の Escalation で人へ渡す。** Remediation の診断を添える。
+  if (hasEscalated(storage, key) && result.status === 'attempts_exhausted') {
+    // 既に知らせてあり、予算も尽きている。鳴らし直さない。
+    return { status: 'idle', reason: 'remediation exhausted and already escalated', attempt: 1 }
+  }
+
+  await escalateTo(
+    storage,
+    deps,
+    key,
+    item,
+    [
+      notifyOnlyReason(storage, item),
+      '',
+      `Independent Remediation の結果: ${result.status}`,
+      result.reason !== undefined ? `理由: ${result.reason}` : undefined,
+      result.proposal !== undefined ? `独立 AI の診断: ${result.proposal.diagnosis}` : undefined,
+      result.proposal !== undefined ? `提案された解決: ${result.proposal.resolution}` : undefined,
+    ].filter((line) => line !== undefined).join('\n'),
+    { subject: 'Design Review CONFLICT' },
+  )
+  return { status: 'escalated', reason: `remediation did not resolve it (${result.status})`, attempt: 1 }
 }
 
 function selectTarget(attention: readonly AttentionItem[]): AttentionItem | undefined {
@@ -849,7 +947,13 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     const actionable = before.attention.filter(
       (item) =>
         ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
-        && !hasEscalated(storage, targetKeyOf(item))
+        // **Independent Remediation は Escalation 済みでも対象にする。**
+        // `hasEscalated()` は Task の生涯にわたる記録で、キー（`task_ready_without_job:<taskId>`）は
+        // 変わらない。CONFLICT はまず notify-only で1回 Escalate されるため、ここを素通しに
+        // しないと **Remediation が構造的に一度も走れない**（既に止まっている本番 Task も含む）。
+        // 予算は `countRemediationAttempts()` が却下テキスト単位で別に持つので、
+        // 通知が鳴り続けることはない。
+        && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
         && hasStalledLongEnough(item),
     )
     const item = selectTarget(actionable)
@@ -878,10 +982,24 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
       ...(item.jobId !== undefined ? { jobId: item.jobId } : {}),
     }
+    // ── Design Review CONFLICT で止まった採用は Independent Remediation へ回す ─────
+    //
+    // **PL 自身には直せない。** Job 生成は Design Review evidence を要し、その判定を PL が
+    // 覆すことは許されない（それは従来から変わらない）。直すのではなく、**独立した flagship AI に
+    // 提案を作り直させ、まっさらな Review へ掛ける**。判定は依然 API 側が再計算する。
+    if (item.kind === 'task_ready_without_job' && isRemediableConflict(storage, item)) {
+      const outcome = await remediateConflict(storage, deps, key, item)
+      if (outcome) return { ...outcome, target }
+    }
+
     // ── 人へ伝えるだけの attention は、診断も Gate も経ずに1回通知して終わる ──────
     // `escalate_to_ceo` 相当の行為であり Gate を要しない（Policy 上も無 Gate）。
-    // 既に通知済みの対象は選択段階で外れているので、ここへは来ない。
+    // 既に通知済みの対象は選択段階で外れているので、ここへは来ない
+    // （唯一の例外は上の Remediation 経路で、そこで終端していなければここへ落ちる）。
     if (NOTIFY_ONLY_ATTENTION_KINDS.includes(item.kind)) {
+      if (hasEscalated(storage, key)) {
+        return { status: 'idle', target, reason: 'already escalated; not repeating', attempt: 1 }
+      }
       await escalateTo(storage, deps, key, item, notifyOnlyReason(storage, item))
       return { status: 'escalated', target, reason: 'human decision required', attempt: 1 }
     }

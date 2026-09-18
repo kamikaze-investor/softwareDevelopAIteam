@@ -61,6 +61,19 @@ export {
   ProviderSeparationError,
   resolveReviewVendor,
 } from './reviewSeparation'
+export {
+  FLAGSHIP_REMEDIATION_CANDIDATES,
+  extractDesignReviewFindings,
+  parseRemediationProposal,
+  selectRemediationModel,
+} from './independentRemediationPolicy'
+export type {
+  DesignReviewFinding,
+  RemediationCandidate,
+  RemediationModelInput,
+  RemediationModelSelection,
+  RemediationProposal,
+} from './independentRemediationPolicy'
 export * from './roadmapTaskIdentity'
 export * from './taskOccupancy'
 export * from './roadmapTopology'
