@@ -9699,10 +9699,25 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       （自己承認の防止）。**実装者 `task.provider` は author に含めない** —— まだ 1 度も実行されておらず
       却下されたテキストを書いていないため、含めると critical load で候補が尽きて構造的不能になる。
 
-      **残存する限界（主張しない）**: PL の提案は `cheapAiClient`（`provider: 'opencode-go'`）が書いており、
-      この識別子は `reviewSeparation.ts` に意図的に未登録である（harness で underlying vendor を特定できない）。
-      したがって **PL 自身との vendor 分離は「確認済み」と主張できない**。`unverified_separation=` として
-      audit へ記録する。確認できないものを分離済みと言わないための扱いである。
+      **独立性について、強制できる部分と確認できない部分を分ける（Independent Review 指摘への回答）**:
+      - **model 単位の分離は常に強制する。** `authorModels` に PL の model
+        （`CHEAP_AI_CONFIG.model`。識別子を複製せず設定を直接参照する）を渡すので、候補が
+        それと同一なら選ばれない。「元の設計者へ解決案生成を戻さない」という要求の核はこれであり、
+        vendor 解決の成否に依存しない。2回目以降は前回の Remediation 著者も audit の provenance から
+        復元して除外する（Codex が自分の却下案を書き直す構成にならない）
+      - **judge との vendor 分離も常に強制する。** critical load では Codex independent review が
+        必須なので、そのとき Remediation は Anthropic 側へ切り替わる（自己承認の防止）
+      - **PL 自身との vendor 分離だけは確認できない。** `opencode-go` は harness であり
+        `reviewSeparation.ts` に**意図的に未登録**である。同モジュールは「識別子ではなく実際の
+        underlying model/vendor を渡せる設計にしてから分離判定へ参加させること」と明記しているため、
+        **識別子を vendor 表へ登録して分離を主張してはならない**。`unverified_separation=` として
+        audit へ記録するだけにする
+
+      **fail-closed（vendor 未解決なら Remediation しない）を選ばなかった理由**: PL の provider が
+      harness である限りこの vendor は恒久的に解決しないため、fail-closed は「機構を作らない」のと
+      同じ結果になり、CONFLICT の行き止まりが現状のまま残る。**構造的に充足不能な要求を Gate にしない**
+      （`adopt_roadmap_item` から up-front の `design_review` を外したのと同じ判断）。
+      PL の model を flagship 側へ上げる判断をした場合は、上記の model 単位の除外が自動で効く。
 
       **既存機構の再利用（新しい仕組みを作っていない）**:
 

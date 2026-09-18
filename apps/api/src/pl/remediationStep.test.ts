@@ -7,6 +7,7 @@ import {
   CODEX_REVIEWER_MODEL,
 } from '@ai-team/worker/src/approvalLevel/reviewerAdapter.js'
 import { FLAGSHIP_REMEDIATION_CANDIDATES, selectRemediationModel } from '@ai-team/shared'
+import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -350,6 +351,26 @@ describe('却下済みテキストの再審査を拒否する', () => {
 })
 
 describe('著者の独立性 — 自分の却下案を自分で書き直させない', () => {
+  it('PL の model 識別子は `cheapAiClient` の設定をそのまま使う（複製しない）', () => {
+    // 複製すると PL の model を替えたときに、ここだけ古い値で「分離した」と言い続ける。
+    // この値が flagship 候補と一致すれば、その候補は選ばれなくなる。
+    expect(CHEAP_AI_CONFIG.model).toBe('mimo-v2.5')
+    expect(FLAGSHIP_REMEDIATION_CANDIDATES.map((c) => c.model)).not.toContain(CHEAP_AI_CONFIG.model)
+  })
+
+  it('PL の model が flagship と同一になったら、その候補は選ばれない', () => {
+    // 将来 PL の model が flagship へ上がった場合に、自動で自己修正へ倒れないこと。
+    const selection = selectRemediationModel({
+      authorProviders: [CHEAP_AI_CONFIG.provider],
+      authorModels: ['gpt-5.6-sol'],
+      judgeProviders: ['gemini'],
+    })
+
+    expect(selection.ok).toBe(true)
+    if (!selection.ok) return
+    expect(selection.candidate.model).toBe('claude-opus-5')
+  })
+
   it('2回目は前回の Remediation 著者と別 vendor へ回す', () => {
     // 1回目に Codex が書いて却下されたら、2回目も Codex が書き直すのでは
     // 「元設計者へ解決案生成を戻さない」という前提が崩れる。

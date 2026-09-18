@@ -114,6 +114,31 @@ describe('selectRemediationModel', () => {
     expect(selection.candidate.provider).toBe('claude_code')
   })
 
+  it('**vendor が解決できなくても、model 単位の分離は必ず効く**', () => {
+    // round 1 の著者（PL）は harness なので vendor を解決できない。それでも
+    // 「元の設計者と同一 model へ戻さない」ことは常に強制できる —— 要求の核はそこであり、
+    // vendor 解決の成否に依存させてはならない。
+    const selection = selectRemediationModel({
+      authorProviders: ['opencode-go'],
+      authorModels: ['gpt-5.6-sol'],
+      judgeProviders: ['gemini'],
+    })
+
+    expect(selection.ok).toBe(true)
+    if (!selection.ok) return
+    expect(selection.candidate.model).toBe('claude-opus-5')
+  })
+
+  it('候補が全部 author model と同一なら ok:false（別 model へ勝手に広げない）', () => {
+    const selection = selectRemediationModel({
+      authorProviders: ['opencode-go'],
+      authorModels: ['gpt-5.6-sol', 'claude-opus-5'],
+      judgeProviders: ['gemini'],
+    })
+
+    expect(selection.ok).toBe(false)
+  })
+
   it('vendor を解決できない著者は「分離済み」と主張せず unresolvedAuthors に残す', () => {
     // PL の提案は opencode-go（harness）が書いており、underlying vendor を特定できない。
     // 除外に使えないので、**確認できていないことを記録として残す**。

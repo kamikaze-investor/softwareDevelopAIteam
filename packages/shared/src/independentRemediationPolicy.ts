@@ -55,10 +55,24 @@ export interface RemediationModelInput {
    * 却下された提案を**書いた側**の provider 識別子。
    *
    * 自分の案を自分で修正させないための除外集合である。解決できない識別子
-   * （`opencode-go` 等）は除外に使えないので `unresolvedAuthors` として返し、
-   * **「分離済み」と主張しない**。
+   * （`opencode-go` 等）は vendor 単位の除外には使えないので `unresolvedAuthors` として返す。
+   * **その場合、vendor 分離は「確認済み」と主張しない。**
    */
   authorProviders: readonly string[]
+  /**
+   * 却下された提案を書いた側の **model 識別子**。
+   *
+   * **vendor が解決できなくても、これは常に照合できる。** 「元の設計者へ解決案生成を戻さない」
+   * という要求の核はモデル同一性の否定であり（同一 weight が自分の推論を弁護するのが避けたい事象）、
+   * それはここで機械的に強制できる。
+   *
+   * vendor 単位の除外（相関した盲点の回避）は、vendor が解決できる相手に対してだけ成立する。
+   * **解決できない相手について「分離した」と言わない代わりに、model 単位では必ず分離する。**
+   * 未知の識別子を vendor 表へ登録して分離を主張するのは `reviewSeparation.ts` が
+   * 明示的に禁じている（識別子ではなく実際の underlying model/vendor を渡せる設計にしてから、
+   * という条件付き）。
+   */
+  authorModels?: readonly string[]
   /**
    * この提案を**判定することになる** Review の provider 識別子。
    *
@@ -78,7 +92,13 @@ export type RemediationModelSelection =
       vendor: ReviewVendor
       /** 除外した vendor（記録用）。 */
       excludedVendors: readonly ReviewVendor[]
-      /** vendor を解決できなかった author 識別子。**分離を主張できない相手**である。 */
+      /**
+       * vendor を解決できなかった author 識別子。
+       *
+       * **これは provenance であって、保証の一部ではない。** この相手について主張できるのは
+       * 「model が同一でないこと」だけで、vendor 分離は確認していない。呼び出し側は
+       * この値を記録し、**分離済みと書かない**。
+       */
       unresolvedAuthors: readonly string[]
     }
   | {
@@ -120,9 +140,14 @@ export function selectRemediationModel(input: RemediationModelInput): Remediatio
   }
 
   const exhausted = new Set(input.exhaustedProviders ?? [])
+  // **model 単位の除外は vendor が解決できるかに依存しない。** ここが round 1 の
+  // （vendor 未解決な）著者に対して実際に強制できる唯一の独立性である。
+  const authorModels = new Set(input.authorModels ?? [])
 
   for (const candidate of FLAGSHIP_REMEDIATION_CANDIDATES) {
     if (exhausted.has(candidate.provider)) continue
+    // 元の設計者と同一 model には絶対に戻さない（vendor 解決の成否に関わらず）。
+    if (authorModels.has(candidate.model)) continue
     const vendor = resolveReviewVendor(candidate.provider)
     // 候補表の provider は `PROVIDER_VENDOR` に載っているものだけにしてあるが、
     // 解決できない値が紛れ込んだ場合は採用しない（fail-closed）。

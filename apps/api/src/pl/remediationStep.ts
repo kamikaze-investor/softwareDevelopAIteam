@@ -78,6 +78,7 @@ import {
   type RawStrategicResult,
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
+import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import {
@@ -104,19 +105,33 @@ const AUDIT_ENTITY_TYPE = 'pl_remediation'
 const AUDIT_OPERATION = 'pl_independent_remediation'
 
 /**
- * 却下された提案を書いた側の provider 識別子。
+ * 却下された提案を書いた側（PL）の provider / model。
  *
- * PL の採用提案は `cheapAiClient`（`provider: 'opencode-go'`）が書いている。この識別子は
- * `reviewSeparation.ts` の `PROVIDER_VENDOR` に**意図的に載っていない**（harness であり
- * underlying vendor を特定できない）。したがって **PL との vendor 分離は「確認済み」と
- * 主張できない** —— `selectRemediationModel()` は `unresolvedAuthors` として返し、
- * 呼び出し側はそれを記録する。分離を確認できないものを分離済みと言わないための扱いである。
+ * **識別子を複製せず `cheapAiClient` の設定をそのまま参照する。** 複製すると PL の model を
+ * 替えたときに、ここだけ古い値で「分離した」と言い続けることになる。
+ *
+ * ## 何を強制でき、何を強制できないか（正直に分ける）
+ *
+ * - **model 単位の分離は強制できる。** `authorModels` に PL の model を渡すので、
+ *   候補がそれと同一なら採用されない。「元の設計者へ解決案生成を戻さない」という要求の核は
+ *   これであり、vendor 解決の成否に依存しない
+ * - **vendor 単位の分離は PL については確認できない。** `opencode-go` は harness であり、
+ *   `reviewSeparation.ts` の `PROVIDER_VENDOR` に**意図的に載っていない**。
+ *   同モジュールは「識別子ではなく実際の underlying model/vendor を渡せる設計にしてから
+ *   分離判定へ参加させること」と明記しているため、**ここで識別子を vendor 表へ登録して
+ *   分離を主張してはならない**。よって `unverified_separation=` として記録するだけにする
+ *
+ * fail-closed（vendor 未解決なら Remediation しない）を選ばない理由: PL の provider が
+ * harness である限り恒久的に解決しないため、それは「機構を作らない」のと同じ結果になり、
+ * CONFLICT の行き止まりが現状のまま残る。**構造的に充足不能な要求を Gate にしない**
+ * （`adopt_roadmap_item` の up-front `design_review` を外したのと同じ判断）。
  *
  * **実装者（`task.provider`）は author に含めない。** その provider はまだ1度も実行されて
  * おらず、却下された設計テキストを書いていない。含めると critical load のときに
  * 「実装者 vendor と judge vendor の両方を除外して候補が尽きる」構造的不能に陥る。
  */
-const PL_PROPOSAL_AUTHOR_PROVIDER = 'opencode-go'
+const PL_PROPOSAL_AUTHOR_PROVIDER = CHEAP_AI_CONFIG.provider
+const PL_PROPOSAL_AUTHOR_MODEL = CHEAP_AI_CONFIG.model
 
 /**
  * これまでに Remediation を書いた provider。**2回目以降の自己修正を防ぐ。**
@@ -527,6 +542,8 @@ export async function runRemediationStep(
   const selection = selectRemediationModel({
     // 1回目は PL（vendor 未解決）、2回目以降は前回の Remediation 著者も除外対象になる。
     authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorProviders],
+    // **vendor が解決できない相手にも、model 単位の分離は必ず効かせる。**
+    authorModels: [PL_PROPOSAL_AUTHOR_MODEL],
     // 初回 implement Job の Design Review は常に `changedFiles: []` で走る
     // （`createInitialImplementWorkflow()`）。値を固定せず既存分類器から導く。
     judgeProviders: resolveJudgeProviders([]),
