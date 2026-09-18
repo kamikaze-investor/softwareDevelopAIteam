@@ -380,6 +380,80 @@ function adoptionEntriesInCurrentWindow(storage: IStorage, targetKey: string): A
   return boundary === -1 ? entries : entries.slice(0, boundary)
 }
 
+/**
+ * 採用エスカレーションを **CEO へ通知したこと** の記録。
+ *
+ * **retry window とは別の概念である。** 窓は「また試してよいか」を決め、
+ * こちらは「もう知らせたか」を決める。両者を同じ記録で兼ねていたため、
+ * escalation が窓の境界（＝窓から除外される行）になり、
+ * 「窓の中に escalation があるか」という重複判定が**原理的に成立しなかった**
+ * （2026-09-17 production 実測: 63分で同一内容の LINE が18通）。
+ *
+ * entity_id は採用サイクルのキーと**別にする**。`rotationOffset`（adoptionStep）が
+ * `adopt:<projectId>` の**行数**を読んでいるため、ここへ足すと記録しただけで
+ * PL に提示される候補が変わってしまう。
+ */
+const AUDIT_ADOPTION_NOTIFIED = 'pl_adoption_escalation_notified'
+
+function adoptionNotificationKey(projectId: string): string {
+  return `adopt-notified:${projectId}`
+}
+
+/**
+ * いま起きている採用失敗の **failure class**。自由文ではなく既存の構造化された事実から作る。
+ *
+ * 材料は窓内の各試行の `audit_log.result` と、detail 先頭の `adoption=<status>`
+ * （`PlAdoptionStatus` の列挙値をそのまま書いたもので、散文ではない）。
+ * 同じ原因が続く限り同じ文字列になり、原因の種類が変われば変わる。
+ */
+export function adoptionFailureFingerprint(windowEntries: readonly AuditLogEntry[]): string {
+  const classes = new Set<string>()
+  for (const entry of windowEntries) {
+    if (!ATTEMPT_RESULTS.includes(entry.result)) continue
+    const status = /^adoption=([a-z_]+)/.exec(entry.detail ?? '')?.[1]
+    classes.add(status ?? entry.result)
+  }
+  return [...classes].sort().join(',')
+}
+
+/**
+ * この失敗をまだ CEO へ知らせていないか。
+ *
+ * 「知らせた」は **直近の採用成功（`acted`）より後**のものだけを数える。
+ * 一度採用が成功したあとに同じ失敗が再発したら、それは新しい incident である。
+ */
+function shouldNotifyAdoptionEscalation(
+  storage: IStorage,
+  projectId: string,
+  fingerprint: string,
+): boolean {
+  const adoptionEntries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, `adopt:${projectId}`)
+  const lastAdoptedAt = adoptionEntries.find((entry) => entry.result === 'acted')?.createdAt
+
+  return !storage.auditLog
+    .findByEntity(AUDIT_ENTITY_TYPE, adoptionNotificationKey(projectId))
+    .some((entry) => (
+      entry.operation === AUDIT_ADOPTION_NOTIFIED
+      && entry.detail === fingerprint
+      && (lastAdoptedAt === undefined || entry.createdAt > lastAdoptedAt)
+    ))
+}
+
+function recordAdoptionNotification(
+  storage: IStorage,
+  projectId: string,
+  fingerprint: string,
+): void {
+  storage.auditLog.record({
+    actor: 'api',
+    operation: AUDIT_ADOPTION_NOTIFIED,
+    entityType: AUDIT_ENTITY_TYPE,
+    entityId: adoptionNotificationKey(projectId),
+    result: 'success',
+    detail: fingerprint,
+  })
+}
+
 function record(
   storage: IStorage,
   targetKey: string,
@@ -998,8 +1072,14 @@ async function maybeAdoptNext(
   const currentWindow = adoptionEntriesInCurrentWindow(storage, key)
   const attempt = currentWindow.filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length + 1
   if (attempt > PL_MAX_ADOPTION_ATTEMPTS) {
-    // 窓の内側で既に通知済みなら黙る（鳴り続けない）。窓は Escalation で切り替わる。
-    if (currentWindow.some((entry) => entry.result === 'escalated')) return undefined
+    // **再試行の窓と、CEO への通知は別に決める。**
+    //
+    // 窓は escalation を境界にして切り替わる（原因を直したあと採用を再開できるようにするため。
+    // 2026-09-15 の実測でこれが無いと予算が永久に枯れた）。その挙動は変えない。
+    // 一方で通知は incident 単位にする —— 同じ対象で同じ失敗が続く限り、窓が何周しても1通だけ。
+    const fingerprint = adoptionFailureFingerprint(currentWindow)
+    const notify = shouldNotifyAdoptionEscalation(storage, project.id, fingerprint)
+
     await escalateTo(
       storage,
       deps,
@@ -1008,10 +1088,13 @@ async function maybeAdoptNext(
         kind: 'task_ready_without_job',
         projectId: project.id,
         projectName: project.name,
-        detail: 'PL could not adopt the next roadmap item',
+        detail: `PL could not adopt the next roadmap item (${fingerprint})`,
       },
       `PL は ${PL_MAX_ADOPTION_ATTEMPTS} 回試しましたが、次の Roadmap 項目を採用できませんでした。`,
+      { subject: 'Roadmap adoption failure', notify },
     )
+    if (notify) recordAdoptionNotification(storage, project.id, fingerprint)
+
     return { status: 'escalated', reason: 'adoption attempt budget exhausted', attempt }
   }
 
@@ -1053,16 +1136,38 @@ async function escalateTo(
   key: string,
   item: AttentionItem,
   reason: string,
+  options: {
+    /**
+     * CEO へ見せる件名。省略時は attention の kind をそのまま使う（既存の全経路がこれ）。
+     *
+     * 採用エスカレーションだけは、`escalateTo()` を再利用するために
+     * `task_ready_without_job` の attention を**その場で組み立てている**。
+     * 実在しない attention の kind をそのまま件名にすると、CEO には
+     * 「着手できる Task が放置されている」と読めてしまう —— 実際には
+     * そんな Task は1件も無い（2026-09-17 実測: pending かつ roadmapActive は 0 件）。
+     * **内部都合のダミー kind を、人向けの事実として出さない。**
+     */
+    subject?: string
+    /**
+     * 通知を送るか。`false` でも `escalated` の記録は残す。
+     *
+     * 「知らせない」と「無かったことにする」は違う。audit と PL state には残り、
+     * Mobile からも現在進行形の失敗として見え続ける。
+     */
+    notify?: boolean
+  } = {},
 ): Promise<void> {
-  const escalate = deps.escalate ?? defaultEscalate
-  const body = [
-    `何が起きているか: ${item.detail}`,
-    `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
-    `PL の判断: ${reason}`,
-    'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
-  ].join('\n')
+  if (options.notify !== false) {
+    const escalate = deps.escalate ?? defaultEscalate
+    const body = [
+      `何が起きているか: ${item.detail}`,
+      `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
+      `PL の判断: ${reason}`,
+      'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
+    ].join('\n')
 
-  await escalate({ title: `[PL] ${item.kind} が解消していません`, body })
+    await escalate({ title: `[PL] ${options.subject ?? item.kind} が解消していません`, body })
+  }
   record(storage, key, 'escalated', reason)
 }
 
