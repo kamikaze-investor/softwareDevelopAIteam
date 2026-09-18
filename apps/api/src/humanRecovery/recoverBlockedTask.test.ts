@@ -412,6 +412,34 @@ describe('Human Recovery は AI/PL から到達できない（CEO 決定・2026-
     expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
   })
 
+  it('**本当に recover 可能な Task でも、PL tick は復旧させない**', async () => {
+    // 上のテストは Job を持つ Task を使うので、仮に PL が `recoverBlockedTask()` を直接
+    // 呼んでいても `TASK_HAS_JOBS` で落ちて素通りしてしまう（独立レビュー指摘）。
+    // **recover の入口条件を満たす Task**（blocked / Job 0 件 / roadmapActive）で、
+    // PL ループを回しても状態が動かないことを確かめる。
+    const { storage, taskId } = seed()
+    // 前提: この Task は人が呼べば実際に復旧できる。
+    expect(recoverBlockedTask(storage, { taskId, reason: 'precondition check' }).ok).toBe(true)
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const result = await runPlTick(storage, {
+      escalate: async () => {},
+      readLedger: () => '',
+      diagnose: async () => JSON.stringify({
+        actionKind: 'recover_task', rationale: '再投入したい', riskLevel: 'LOW',
+      }),
+      proposeAdoption: async () => { throw new Error('attention が残るうちは採用しない') },
+    })
+
+    // notify-only なので診断すら回らず、PL は通知して終わる。
+    expect(result.status).toBe('escalated')
+    // **PL は状態を1ビットも動かしていない。**
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
+    // 人が呼んだ1回ぶんだけが記録されており、PL の分は増えていない。
+    expect(countHumanRecoveryAttempts(storage, taskId)).toBe(1)
+  })
+
   it('**Human Recovery 自体は後段 Approval の証拠にならない。** ApprovalRequest を作らない', () => {
     const { storage, taskId } = seed()
 

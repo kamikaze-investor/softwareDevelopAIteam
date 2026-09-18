@@ -90,8 +90,18 @@ function hasRejectedDesignReview(storage: IStorage, task: Task): boolean {
   if (run?.status !== 'succeeded' || run.resultJson === undefined) return false
 
   // ALIGNED evidence が同じテキストに対して登録済みなら、それは却下ではない。
+  //
+  // **ただし evidence が run より古いなら、それはこの run の結果ではない。**
+  // 同一テキストへの判定は実行ごとに反転しうる（`independent-review-verdict-instability`）ので、
+  // 「昔 ALIGNED だった」ことを根拠に**後から出た CONFLICT を無かったことにしてはならない**
+  // （独立レビュー指摘・2026-09-18）。時刻で新しい方を採る。
   const evidence = storage.designReviewEvidence.findLatestByTaskId(task.id)
-  if (evidence?.designTextHash === run.designTextHash) return false
+  if (evidence?.designTextHash === run.designTextHash) {
+    const evidenceAt = Date.parse(evidence.createdAt)
+    const runAt = Date.parse(run.completedAt ?? run.createdAt)
+    // 時刻が読めないときは「却下ではない」と決めつけず、下の再計算に判断を委ねる。
+    if (Number.isFinite(evidenceAt) && Number.isFinite(runAt) && evidenceAt >= runAt) return false
+  }
 
   try {
     const raw = JSON.parse(run.resultJson) as RawStrategicResult
@@ -502,6 +512,10 @@ export async function adoptRoadmapItem(
     }
   }
 
+  // 置き換えられる却下済み案のキー。**sync 成功後にだけ**履歴へ書く（下記）。
+  let supersededRejectedKey: string | undefined
+  let supersededTaskId: string | undefined
+
   // ── 却下済みテキストの再審査を拒否する（Review laundering 対策）──────────────
   //
   // **この経路が fresh Design Review を起こす入口である。** 採用すると
@@ -545,18 +559,20 @@ export async function adoptRoadmapItem(
     // **A → B → A の巡回で A を再提出できてしまう**（#255 が同じ理由で残している）。
     // 書き込み先も形式も #255 と同一で、`collectRejectedSpecKeys()` がそのまま読む。
     //
-    // `stage=adoption` を必ず付ける。`stageEntries()` は `stage=` の無い行を
-    // remediation として数えるため、省くと **Remediation の予算を削ってしまう**。
-    // この行はどの attempt budget にも算入されない。
-    recordRemediationFailure(
-      storage,
-      existingTask.id,
-      `stage=adoption outcome=superseded_rejected_spec `
-      + `rejected_fspec=${shortSpecKey({
-        implementationScope: extractImplementationScope(existingTask.description) ?? '',
-        allowedPaths: existingTask.allowedPaths ?? [],
-      })} fspec=${proposedKey}`,
-    )
+    // **記録するのは `rejected_fspec`（いま置き換えられる却下済みの案）だけである。**
+    // 提案側（`fspec`）は書かない —— `collectRejectedSpecKeys()` は `fspec` も却下として
+    // 読むため、ここで書くと **まだ一度も formal review に落とされていない案を却下済みにしてしまう**
+    // （validation や sync で失敗した場合、あるいは review が UNAVAILABLE だった場合に、
+    // 同じ案を出し直せなくなる。独立レビュー指摘・2026-09-18）。
+    // 提案が実際に却下されたときは、それが Task の現在 spec になっているので
+    // `collectRejectedSpecKeys()` が Task 側から拾う。A → B → A はそれで止まる。
+    //
+    // 書き込みは **sync が成功してから**行う（下の `syncRoadmapTasks()` の後）。
+    supersededRejectedKey = shortSpecKey({
+      implementationScope: extractImplementationScope(existingTask.description) ?? '',
+      allowedPaths: existingTask.allowedPaths ?? [],
+    })
+    supersededTaskId = existingTask.id
   }
 
   const taskInput: RoadmapSyncTaskInput = {
@@ -616,6 +632,20 @@ export async function adoptRoadmapItem(
       reason: syncResult.failureReason ?? 'Roadmap sync failed',
       details: { conflicts: syncResult.conflicts, phaseConflicts: syncResult.phaseConflicts },
     }
+  }
+
+  // spec の置き換えが確定した。**ここで初めて**、置き換えられた却下済み案を履歴へ残す。
+  // 失敗した採用では書かない（書くと、通らなかった世代まで却下扱いになる）。
+  //
+  // `stage=adoption` を必ず付ける。`stageEntries()` は `stage=` の無い行を remediation として
+  // 数えるため、省くと **Remediation の予算を削ってしまう**。この行はどの attempt budget にも
+  // 算入されず、`countRemediationAttempts()` / `selectConflictStage()` の結果を変えない。
+  if (supersededRejectedKey !== undefined && supersededTaskId !== undefined) {
+    recordRemediationFailure(
+      storage,
+      supersededTaskId,
+      `stage=adoption outcome=superseded_rejected_spec rejected_fspec=${supersededRejectedKey}`,
+    )
   }
 
   const adopted = storage.tasks

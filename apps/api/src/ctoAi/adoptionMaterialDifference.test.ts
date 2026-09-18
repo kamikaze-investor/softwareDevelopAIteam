@@ -238,6 +238,62 @@ describe('却下済み spec の再提出は、Design Review を起こす前に�
   })
 })
 
+describe('却下されていない案を、却下済みとして扱わない', () => {
+  it('**採用が失敗した提案は却下履歴に残らない**（後でそのまま出し直せる）', async () => {
+    const { storage, projectId } = seedProject()
+    const first = await adoptOriginal(storage, projectId)
+    rejectCurrentSpec(storage, first.ok ? first.taskId : '')
+
+    // B を出すが、AC が空で validation に落ちる。
+    const invalid = await adoptRoadmapItem(storage, {
+      projectId, roadmapId: 'conflicted-item',
+      allowedPaths: ['apps/api/src/storage'],
+      acceptanceCriteria: [],
+      implementationScope: '別案 B',
+    }, silentDeps())
+    expect(invalid.ok).toBe(false)
+
+    // AC を直して同じ B を出し直す。**B は一度も formal review に落とされていない。**
+    const retried = await adoptRoadmapItem(storage, {
+      projectId, roadmapId: 'conflicted-item',
+      allowedPaths: ['apps/api/src/storage'],
+      acceptanceCriteria: ['直した受入条件'],
+      implementationScope: '別案 B',
+    }, silentDeps())
+
+    expect(retried.ok).toBe(true)
+  })
+
+  it('**後から出た CONFLICT を、古い ALIGNED evidence で無かったことにしない**', async () => {
+    const { storage, projectId } = seedProject()
+    const first = await adoptOriginal(storage, projectId)
+    const taskId = first.ok ? first.taskId : ''
+    const task = storage.tasks.findById(taskId)!
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const hash = computeDesignTextHash(designText)
+
+    // 同じテキストに対して、まず ALIGNED evidence が付いた。
+    const alignedRun = storage.designReviewRuns.create({
+      taskId, taskTitle: task.title, designText, designTextHash: hash, changedFiles: [],
+    })
+    const alignedClaim = storage.designReviewRuns.claim(alignedRun.id, 3)
+    storage.designReviewRuns.completeWithEvidence(
+      alignedRun.id, alignedClaim.claimToken as string, ALIGNED_STDOUT,
+      {
+        taskId, subjectId: taskId, reviewKind: 'task', decision: 'ALIGNED',
+        reviewLoad: 'medium', independentReviewRequired: false, designTextHash: hash,
+      } as never,
+    )
+
+    // その**後**、同じテキストの再実行が CONFLICT を返した（判定の揺れ）。
+    rejectCurrentSpec(storage, taskId)
+
+    const again = await adoptOriginal(storage, projectId)
+
+    expect(again).toMatchObject({ ok: false, code: 'SPEC_NOT_MATERIALLY_DIFFERENT' })
+  })
+})
+
 describe('本当に違う提案は通り、fresh Design Review が走る', () => {
   it('scope と allowedPaths を訂正した提案は採用され、ALIGNED なら Job が作られる', async () => {
     const { storage, projectId } = seedProject()
