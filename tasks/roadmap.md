@@ -4791,6 +4791,24 @@ worktree と別 repository は採らない。
       最小案も同じ: **既存の `ensureInitialWorkflowsForActiveTasks()` を呼び直せる経路を1つ用意する**
       （resume 分岐に加え、requeue 後の再評価も同じ経路に載せる）。新しい queue / daemon は作らない。
 
+      **【2026-09-18 production 実測: 同じ形が再発し、17 時間止まった。新しい事実は「サービス再起動で解ける」こと】**
+      `project-completion-badge-wording-correction` の採用（2026-09-17 08:55:53Z）で
+      design review run は `succeeded` になったが **evidence 行が 1 件も残らず、初回 Job も作られなかった**。
+      以後 `task_ready_without_job` のまま **約 17 時間**放置され、PL は 18:01 JST に
+      `human decision required` で Escalate したあと `idle` を返し続けた。
+      **この間 API / Worker は落ちていない**（`systemd` の Stopped/Started は 2026-09-17 17:41 の次が
+      2026-09-18 10:29）。つまり **プロセスが生きている限り自力では復帰しない**。
+      2026-09-18 10:29 のサービス再起動後、2 回目の design review run（01:49:32Z）が `ALIGNED` evidence を
+      残し、初回 Job → review → git-commit まで通って Task は `done` になった。
+      **CEO 判断で Job を手動生成した訳ではなく、既存の正規経路がそのまま通った。**
+
+      示唆が 2 つある。
+      - **再拾い上げ経路が事実上「再起動」になっている。** 上の最小案（`ensureInitialWorkflowsForActiveTasks()`
+        を呼び直せる経路）が無いままだと、復帰手段が運用者のプロセス再起動しかない
+      - **止まっている間、PL の採用が止まる。** `maybeAdoptNext()` は `attention` が 1 件でもあれば
+        採用しないため、無関係な Roadmap 項目の自律採用も同時に止まる（今回まさにそれが起きた）。
+        この項目の優先度は「1 Task が遅れる」ではなく「自律開発ループ全体が止まる」で見るべきである
+
       **(2) paused / draft の Project へ採用しても初回 Job が作られない** —
       `createInitialImplementWorkflow()` は `project.status !== 'running'` を `retryable` で skip し、
       `PATCH /api/projects/:id` の resume 分岐は `retryPendingContinuationsForProject()` しか呼ばず
