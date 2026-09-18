@@ -103,6 +103,20 @@ describe('evaluateImplementTimeoutSensors', () => {
     expect(b[0].evidence).toMatchObject({ windowSize: 50, timeoutCount: 2 })
   })
 
+  // **B の分子も現在の budget に限る。** ここを素の provider_timeout にしていると、
+  // deploy 直後に窓へ残っている旧 300s 時代の timeout だけで発火し、
+  // しかも重複排除キーが budget 値なので、**本物の 900s 時代の証拠が出ても黙る**
+  // （独立レビュー指摘）。
+  it('B: 旧 300s 時代の timeout だけでは発火しない', () => {
+    // 50 件中 2 件が ~304s の timeout = 率だけ見れば 4% で閾値超え。
+    const jobs = [
+      killedWhileWorking(304), killedWhileWorking(304),
+      ...Array.from({ length: 48 }, () => job({ seconds: 60 })),
+    ]
+    expect(evaluateImplementTimeoutSensors(jobs, T)
+      .filter((f) => f.sensorId === 'implement-timeout-rate-too-high')).toHaveLength(0)
+  })
+
   it('B: timeout 率が 3% 未満なら発火しない', () => {
     // 50 件中 1 件 = 2%
     const jobs = [
@@ -201,7 +215,10 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     expect(second.filter((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')).toHaveLength(0)
   })
 
-  it('timeout 値を変えると B はもう一度だけ発火する', () => {
+  // **B は budget ごとに 1 度だけ。** そして budget を変えたら、
+  // **その budget を使い切った Job が出てきたときに**もう一度だけ出る。
+  // 同じ Job が両方の budget を満たすことは（判定が budget 相対なので）起きない。
+  it('B は budget ごとに 1 度だけ発火し、budget を変えれば新しい証拠で再発火する', () => {
     const storage = createSQLiteStorage(':memory:')
     const taskId = seed(storage)
     createTimedOutJob(storage, taskId, 900)
@@ -209,11 +226,19 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     const first = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
     expect(first.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(true)
 
+    // 同じ budget では何度回しても出ない。
     const again = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
     expect(again.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(false)
 
-    const afterChange = evaluateAndPersistImplementTimeoutSensors(storage, 1_200_000)
-    expect(afterChange.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(true)
+    // budget を広げた直後は、**既存の 900s の証拠では出ない**（新しい budget を
+    // 使い切っていないため）。ここで出てしまうと、古い証拠で新しいキーを潰すことになる。
+    const widened = evaluateAndPersistImplementTimeoutSensors(storage, 1_200_000)
+    expect(widened.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(false)
+
+    // 新しい budget を使い切った Job が出て初めて、もう一度だけ出る。
+    createTimedOutJob(storage, taskId, 1_200)
+    const afterNewEvidence = evaluateAndPersistImplementTimeoutSensors(storage, 1_200_000)
+    expect(afterNewEvidence.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(true)
   })
 
   // **「直近 N 件」は作成順ではなく結果が出た順。**

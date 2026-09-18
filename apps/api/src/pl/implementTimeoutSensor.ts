@@ -32,9 +32,18 @@ const PROVIDER: AiCliProvider = 'claude_code'
 const MODE: AiCliMode = 'implement'
 
 /**
- * 閾値（CEO 指示・2026-09-18）。**実測から置いた値であり、推測ではない。**
+ * 閾値（CEO 指示・2026-09-18）。**これらは暫定の policy 値である。**
  *
- * 変更前の実測: implement n=96 / provider_timeout 7 件 = 7.3% / 成功 p95 201s / 成功 max 230s。
+ * 実測が establish しているのは**変更前の分布だけ**である:
+ * implement n=96 / provider_timeout 7 件 = 7.3% / 成功 p95 201s / 成功 max 230s。
+ *
+ * **下の 5 つの数字は、その分布から導出されたものでも検証されたものでもない。**
+ * 「7.3% の半分以下まで下がってほしい」「budget の 6 割まで来たら近い」といった
+ * 判断で置いた値であり、正しさの裏付けは無い。この PR 自体が
+ * 「打ち切られた裾が見えていない」という前提の上に立っているので、
+ * **閾値だけが確かであるかのように書かない**（独立レビュー指摘）。
+ *
+ * これらが妥当だったかは、900s 運用下のデータが貯まってから同じ集計で見直す。
  */
 export const IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS = {
   /** 直近何件の implement Job を母集団にするか。 */
@@ -104,12 +113,24 @@ export function evaluateImplementTimeoutSensors(
 
   const timeoutSeconds = timeoutMs / 1000
 
+  /**
+   * **現在の budget を使い切って落ちたか。** A と B の両方がこれを通る。
+   *
+   * Job 行には「そのとき何秒の budget だったか」が残っていないので、所要時間で近似する。
+   * これを B にも掛けないと、旧 300s 時代の timeout が新しい budget の証拠として
+   * 数えられてしまう（独立レビュー指摘）。
+   */
+  const killedInsideCurrentBudget = (job: Job): boolean => {
+    if (!isProviderTimeout(job)) return false
+    const seconds = durationSeconds(job)
+    return seconds !== undefined && seconds >= timeoutSeconds * t.CURRENT_BUDGET_RATIO
+  }
+
   // ── A. 現在の budget を使い切ってなお作業中だった Job ──────────────────
   // 「1 件でも再発したら再評価」なので Job ごとに 1 度だけ出す。
   for (const job of window) {
-    if (!isProviderTimeout(job) || !hasChangedFiles(job)) continue
-    const seconds = durationSeconds(job)
-    if (seconds === undefined || seconds < timeoutSeconds * t.CURRENT_BUDGET_RATIO) continue
+    if (!killedInsideCurrentBudget(job) || !hasChangedFiles(job)) continue
+    const seconds = durationSeconds(job)!
     findings.push({
       sensorId: 'implement-timeout-still-kills-working-jobs',
       scope: job.id,
@@ -128,7 +149,17 @@ export function evaluateImplementTimeoutSensors(
   }
 
   // ── B. timeout 率 ────────────────────────────────────────────────
-  const timedOut = window.filter(isProviderTimeout)
+  //
+  // **分子は「現在の budget を使い切った timeout」だけである。**
+  // ここを素の `isProviderTimeout` にしていると、deploy 直後の窓に残っている
+  // 旧 300s 時代の timeout だけで閾値を超えてしまう。しかも B の重複排除キーは
+  // budget 値なので、**一度そうやって発火すると同じ budget では二度と出ない** ——
+  // つまり後から本物の 900s 時代の証拠が揃っても黙る。
+  // 古い証拠で先に発火して、拾うべき将来の証拠を潰す形だった（独立レビュー指摘）。
+  //
+  // 分母は窓全体（直近の implement Job すべて）のままにする。移行期は分母に旧 Job が
+  // 混じるぶん率が薄まるが、**薄まる方向＝発火しにくい方向**なので安全側である。
+  const timedOut = window.filter(killedInsideCurrentBudget)
   const rate = timedOut.length / window.length
   if (rate >= t.TIMEOUT_RATE) {
     findings.push({
