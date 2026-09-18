@@ -59,6 +59,10 @@ import {
   runRemediationStep,
   type PlRemediationDeps,
 } from './remediationStep'
+import {
+  runConflictResolutionRound,
+  type ConflictResolutionDeps,
+} from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import {
@@ -229,17 +233,17 @@ export interface PlLoopDeps {
   adopt?: PlAdoptionDeps['adopt']
   /** resume に添える指示文（テスト差し替え用）。既定は DEFAULT_RESUME_INSTRUCTION。 */
   resumeInstruction?: string
-  /**
-   * Design Review CONFLICT の Independent Remediation（テスト差し替え用）。
-   * 既定は `runRemediationStep()`。
-   *
-   * **model 選択はここでは行わない。** flagship / vendor 分離の判定は
-   * `independentRemediationPolicy`（将来 `role-model-registry` へ吸収）の責務であり、
-   * ここに別の選択機構を作らない。
-   */
-  remediate?: typeof runRemediationStep
   /** Remediation runner の起動設定（テスト差し替え用）。 */
   remediationDeps?: PlRemediationDeps
+  /**
+   * CONFLICT 解決の1 Round（テスト差し替え用）。既定は `runConflictResolutionRound()`。
+   *
+   * **stage を選ぶのはここではない。** どの stage を実行するかは
+   * `selectConflictStage()` が既存 review state と audit から決める。
+   */
+  resolveConflict?: typeof runConflictResolutionRound
+  /** Critic / PL revision / Challenge の依存（テスト差し替え用）。 */
+  conflictDeps?: ConflictResolutionDeps
   coordinatorDeps?: CoordinatorDeps
   now?: () => string
 }
@@ -358,13 +362,18 @@ async function remediateConflict(
 ): Promise<Omit<PlTickResult, 'target'> | undefined> {
   if (item.taskId === undefined) return undefined
 
-  const run = deps.remediate ?? runRemediationStep
+  // **Remediation を直接は呼ばない。** CONFLICT の一次対応は Critic-assisted な PL revision で、
+  // Independent Remediation はそれで解決しなかった場合の最後の救済である。
+  // どの stage を実行するかは `selectConflictStage()`（既存 review state と audit の observer）が
+  // 決める。ここは stage を選ばない。
+  const run = deps.resolveConflict ?? runConflictResolutionRound
   // 呼び出し前の試行数。例外時に**二重計上しない**ための基準にする。
   const attemptsBefore = countRemediationAttempts(storage, item.taskId)
-  let result: Awaited<ReturnType<typeof runRemediationStep>>
+  let round: Awaited<ReturnType<typeof runConflictResolutionRound>>
   try {
-    result = await run(storage, item.taskId, {
-      ...(deps.remediationDeps !== undefined ? deps.remediationDeps : {}),
+    round = await run(storage, item.taskId, {
+      ...(deps.remediationDeps !== undefined ? { remediationDeps: deps.remediationDeps } : {}),
+      ...(deps.conflictDeps !== undefined ? deps.conflictDeps : {}),
     })
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
@@ -378,23 +387,37 @@ async function remediateConflict(
     if (countRemediationAttempts(storage, item.taskId) === attemptsBefore) {
       recordRemediationFailure(storage, item.taskId, 'outcome=exception')
     }
-    record(storage, key, 'diagnosis_failed', `remediation=error ${message}`)
+    record(storage, key, 'diagnosis_failed', `conflict_resolution=error ${message}`)
     return { status: 'diagnosis_failed', reason: message, attempt: 1 }
   }
 
-  const provenance = result.provider !== undefined ? ` provider=${result.provider} model=${result.model}` : ''
+  // Stage 3 に入った場合は、その中身（Remediation の結果）を展開して扱う。
+  const result = round.remediation
+  const status = result?.status ?? round.status
+  const failureCode = result?.failureCode ?? round.failureCode
+  const reason = result?.reason ?? round.reason
+  const provider = result?.provider ?? round.criticProvider
+  const model = result?.model ?? round.criticModel
+
+  /** 設計が既存 Review Pipeline を通って実装へ進める状態になったか。 */
+  const resolved = status === 'remediated'
+    || status === 'revised_and_aligned'
+    || status === 'challenge_aligned'
+
+  const provenance = provider !== undefined ? ` provider=${provider} model=${model}` : ''
   record(
     storage,
     key,
-    result.status === 'remediated' ? 'acted' : 'blocked',
-    `remediation=${result.status} code=${result.failureCode ?? '-'}${provenance} ${result.reason ?? ''}`,
+    resolved ? 'acted' : 'blocked',
+    `stage=${round.stage} outcome=${status} code=${failureCode ?? '-'}${provenance} ${reason ?? ''}`,
   )
 
-  if (result.status === 'remediated') {
+  if (resolved) {
     return {
       status: 'acted',
       proposedKind: 'adopt_roadmap_item',
-      reason: `independent remediation passed a fresh design review (task ${result.taskId})`,
+      reason: `${round.stage} produced a design that passed the existing review pipeline`
+        + ` (task ${result?.taskId ?? round.taskId})`,
       attempt: 1,
     }
   }
@@ -407,8 +430,9 @@ async function remediateConflict(
   // そのまま通知ループになるため、**ループ防止はこの分岐自身が持つ**。
   // `notify: false` でも `escalated` の記録は残り、Mobile からは進行中の失敗として見え続ける。
   const alreadyTold = hasEscalated(storage, key)
-  if (alreadyTold && result.status === 'attempts_exhausted') {
-    return { status: 'idle', reason: 'remediation exhausted and already escalated', attempt: 1 }
+  const exhausted = status === 'attempts_exhausted' || status === 'terminal'
+  if (alreadyTold && exhausted) {
+    return { status: 'idle', reason: 'conflict resolution exhausted and already escalated', attempt: 1 }
   }
 
   await escalateTo(
@@ -419,14 +443,27 @@ async function remediateConflict(
     [
       notifyOnlyReason(storage, item),
       '',
-      `Independent Remediation の結果: ${result.status}`,
-      result.reason !== undefined ? `理由: ${result.reason}` : undefined,
-      result.proposal !== undefined ? `独立 AI の診断: ${result.proposal.diagnosis}` : undefined,
-      result.proposal !== undefined ? `提案された解決: ${result.proposal.resolution}` : undefined,
+      `解決の試み: stage=${round.stage} / 結果=${status}`,
+      reason !== undefined ? `理由: ${reason}` : undefined,
+      round.critique !== undefined
+        ? `Critic が挙げた根本原因: ${round.critique.coreProblems.join(' / ')}`
+        : undefined,
+      round.critique !== undefined
+        ? `Critic の改善方向: ${round.critique.improvementDirections.join(' / ')}`
+        : undefined,
+      // **Binding Safety の争点は Challenge では解除されない。** 人へ明示して渡す
+      // （既存方針: Second Independent Review → Meta Review → 未解決なら CEO）。
+      round.bindingDisputes !== undefined && round.bindingDisputes.length > 0
+        ? 'Critic は Binding Safety / Authority の Finding にも疑義を述べています'
+          + `（${round.bindingDisputes.map((d) => d.source).join(', ')}）。`
+          + 'これは Challenge では解除されません。Second Independent Review / Meta Review の対象です。'
+        : undefined,
+      result?.proposal !== undefined ? `Remediation の診断: ${result.proposal.diagnosis}` : undefined,
+      result?.proposal !== undefined ? `提案された解決: ${result.proposal.resolution}` : undefined,
     ].filter((line) => line !== undefined).join('\n'),
     { subject: 'Design Review CONFLICT', notify: !alreadyTold },
   )
-  return { status: 'escalated', reason: `remediation did not resolve it (${result.status})`, attempt: 1 }
+  return { status: 'escalated', reason: `conflict not resolved (stage=${round.stage}, ${status})`, attempt: 1 }
 }
 
 function selectTarget(attention: readonly AttentionItem[]): AttentionItem | undefined {
