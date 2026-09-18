@@ -1744,8 +1744,20 @@ function claudeCliFailureNote(cliResult: AiCliResult): string {
   const apiErrorReason = parsed === undefined ? undefined : claudeApiErrorReason(parsed)
   if (apiErrorReason !== undefined) return apiErrorReason
 
-  if (cliResult.blocked === true) return 'Claude Code CLI was blocked before producing a result'
-  return `Claude Code CLI exited ${cliResult.exitCode ?? 'abnormally'} before producing a result envelope`
+  // **`blocked` は「出力が無かった」という意味ではない。** adapter の唯一の代入箇所
+  // （`adapter.ts`: `if (parsedOutput === undefined) blocked = true`）が示すとおり、
+  // これは **expectJson の Job で、retry 後も期待した JSON をパースできなかった**状態である。
+  // 出力自体は存在する。「blocked before producing a result」と書くと、
+  // 起きていないこと（出力が出る前に止められた）を operator へ伝えてしまう（独立レビュー指摘）。
+  if (cliResult.blocked === true) return 'Claude Code CLI output could not be parsed as the expected JSON'
+
+  // **envelope の有無は exitCode からは分からない。** 実際に parse できたかどうかで言い分を変える。
+  // 解釈できる envelope があるのに「envelope 以前に落ちた」と書けば、それも起きていないことになる
+  // （独立レビュー指摘）。ここは API エラーを報告していない envelope が残るケース。
+  const exited = `Claude Code CLI exited ${cliResult.exitCode ?? 'abnormally'}`
+  return parsed === undefined
+    ? `${exited} before producing a result envelope`
+    : `${exited} after producing a result envelope that reported no API error`
 }
 
 function claudeCliFailureStderr(

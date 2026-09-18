@@ -2950,6 +2950,61 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(firstLine).not.toContain('sk-ant')
   })
 
+  // **解釈できる envelope があるなら「envelope 以前に落ちた」とは書かない。**
+  // API エラーを報告していない envelope でも、envelope は存在している（独立レビュー指摘）。
+  it('非 0 終了で envelope はあるが API エラーではない場合、envelope 以前とは述べない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: false, result: 'partial work, then the process died' }),
+        stderr: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('after producing a result envelope')
+    expect(firstLine).not.toContain('before producing a result envelope')
+    // envelope 本文（モデル出力）は operator 向けに出さない。
+    expect(firstLine).not.toContain('partial work')
+    expect(firstLine).not.toContain('sk-ant')
+  })
+
+  // **`blocked` は「出力が出る前に止められた」ではなく「期待した JSON にならなかった」。**
+  // adapter の唯一の代入箇所がそう定義している（独立レビュー指摘）。
+  it('blocked は JSON をパースできなかった事実として述べ、出力が無かったとは述べない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 0,
+        blocked: true,
+        changedFiles: [],
+        stdout: 'ここは JSON ではないモデル出力です',
+        stderr: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('could not be parsed as the expected JSON')
+    expect(firstLine).not.toContain('blocked before producing a result')
+    // パースできなかった本文そのものは operator 向けに出さない。
+    expect(firstLine).not.toContain('ここは JSON ではない')
+    expect(firstLine).not.toContain('sk-ant')
+  })
+
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
   // redact ではなく「echo しない」ことで、取りこぼしの余地を無くしている。
   it('API エラー文に credential 断片があっても operator 向けには出さない', async () => {
@@ -3131,6 +3186,9 @@ describe('task-022: AI CLI 実行ブロック', () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
         exitCode: 1,
+        // envelope を出す前に落ちた形。fixture の既定 stdout は解釈可能な envelope なので、
+        // ここを明示しないと「envelope 前」を検証していないことになる。
+        stdout: 'Error: connect ECONNREFUSED',
         stderr: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE / prompt excerpt: src/x.ts',
       })),
     }
