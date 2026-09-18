@@ -2707,6 +2707,50 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
+  // 認証失敗の最もありふれた形は「CLI が非 0 で落ちて stderr にエラーを書く」であり、
+  // envelope を出す前なので classifyClaudeImplementFailure は動かない。この経路でも
+  // operator が最初に見る一行は固定語彙でなければならない。
+  it('claude_code が envelope 前に非 0 で落ちても、先頭行は固定語彙になる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        stderr: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE / prompt excerpt: src/x.ts',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    // `stopReason()` はこの先頭行を採る。
+    expect(firstLine).toContain('[jobRunner]')
+    expect(firstLine).toContain('before producing a result envelope')
+    expect(firstLine).not.toContain('sk-ant')
+    expect(firstLine).not.toContain('prompt excerpt')
+  })
+
+  // 他 provider の非 0 終了は raw のまま残す。test 失敗や build エラーの出力自体が診断材料で、
+  // ここを潰すと原因が分からなくなる（既存挙動を変えない）。
+  it('claude_code 以外の非 0 終了は raw stderr をそのまま残す', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'FAIL src/x.test.ts > expected 1 to be 2' })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'gemini',
+      aiCliPrompt: 'バグを修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toBe('FAIL src/x.test.ts > expected 1 to be 2')
+  })
+
   it('AI CLI が exitCode !== 0 → status: failed で早期リターン（SafeCommand は実行されない）', async () => {
     const mockAdapter = { run: vi.fn().mockResolvedValue(makeCliResult({ exitCode: 1, stderr: 'compile error' })) }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)

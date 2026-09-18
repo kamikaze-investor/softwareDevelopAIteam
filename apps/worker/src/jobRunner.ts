@@ -812,7 +812,19 @@ export async function runJob(
         approvalLevelResult,
         exitCode: cliResult.exitCode,
         stdout: cliResult.stdout,
-        stderr: cliResult.stderr,
+        // **CLI が envelope を出す前に落ちた場合も、先頭は固定語彙にする。**
+        //
+        // `classifyClaudeImplementFailure()` は exit 0 かつ解釈できる JSON があって初めて動く。
+        // ところが認証失敗の最もありふれた形は **CLI が非 0 で落ちて stderr にエラーを書く**
+        // ことで、その経路では raw stderr が `stopReason()` → `attention.detail` まで届く
+        // （独立レビュー指摘）。API key を渡さなくなった以降、subscription 失効がまさに
+        // この形で出るため、本 PR が塞ぐべき穴そのものである。
+        //
+        // raw stderr は Job に残す（診断の証拠。Job 詳細の扱いは
+        // Roadmap `job-raw-output-persisted-and-shown` の責務）。
+        // ここで変えるのは **operator が最初に見る一行**だけである。
+        // 他 provider は従来どおり raw をそのまま出す（テスト失敗の出力等が診断に要るため）。
+        stderr: claudeCliFailureStderr(job.aiCliProvider, cliResult),
         stdoutPath: cliResult.stdoutPath,
         stderrPath: cliResult.stderrPath,
         providerFailureKind: cliResult.providerFailureKind,
@@ -1669,6 +1681,27 @@ function withSensitiveChanges(
   const sensitiveChanges = diffSensitiveBaseline(baseline, current)
   if (sensitiveChanges.length === 0) return manifest
   return mergeManifests(manifest, manifestFromChanges(sensitiveChanges))
+}
+
+/**
+ * Claude Code CLI が envelope を出す前に非 0 で落ちたときの stderr を組み立てる。
+ *
+ * 先頭へ固定語彙の一行を置き、raw はその後ろに残す。`stopReason()` は先頭が
+ * `[jobRunner] ` で始まればそれを採るので、attention / notification には固定語彙だけが出る。
+ *
+ * **claude_code 以外は素通しする。** 他 provider の非 0 終了は test 失敗や build エラーで、
+ * その raw 出力自体が診断材料である（既存の挙動を変えない）。
+ */
+function claudeCliFailureStderr(
+  provider: AiCliProvider,
+  cliResult: AiCliResult,
+): string | undefined {
+  if (provider !== 'claude_code') return cliResult.stderr
+
+  const note = cliResult.blocked === true
+    ? 'Claude Code CLI was blocked before producing a result'
+    : `Claude Code CLI exited ${cliResult.exitCode ?? "abnormally"} before producing a result envelope`
+  return withLeadingNote(cliResult.stderr ?? '', note)
 }
 
 /**
