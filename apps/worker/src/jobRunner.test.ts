@@ -2416,6 +2416,29 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(result.stderr).toContain('Credit balance is too low')
   })
 
+  // `result` は成功時にモデル本文が入る欄なので、API 層のエラーでない is_error では載せない。
+  it('API エラーでない is_error では result（モデル本文が入りうる）を出さない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({
+          is_error: true,
+          result: 'ファイルを調べましたが、この変更は適用できないと判断しました',
+        }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain('Claude Code CLI reported an error result')
+    expect(result.stderr).not.toContain('ファイルを調べましたが')
+  })
+
   it('理由が無い is_error では従来どおりの一文だけを出す', async () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: [], stdout: '{"is_error":true}' })),

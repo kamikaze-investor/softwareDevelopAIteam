@@ -1698,10 +1698,20 @@ function classifyClaudeImplementFailure(
     // stdout の JSON を人手で開くまで分からなかった。
     // API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
     // 出すのは CLI 自身の短い説明文と HTTP status だけで、prompt も出力本文も載せない。
-    const status = typeof parsed.api_error_status === 'number'
-      ? ` (HTTP ${parsed.api_error_status})`
-      : ''
-    const detail = typeof parsed.result === 'string' && parsed.result.trim() !== ''
+    //
+    // **`result` は成功時にはモデル本文が入る欄である**
+    // （`reviewerAdapter.ts`: `result: '<モデル本文>'`）。したがって `is_error` だけを根拠に
+    // 載せてはいけない。載せるのは `api_error_status` がある場合 —— API 層のエラーで、
+    // `result` が API 自身の短いエラー文になっている場合（実測: "Credit balance is too low"）
+    // ——だけに限る。それ以外の `is_error`（tool エラー、打ち切り等）では、
+    // `result` にモデルの説明文が入りうるので従来どおり一文だけにする。
+    const apiErrorStatus = typeof parsed.api_error_status === 'number'
+      ? parsed.api_error_status
+      : undefined
+    const status = apiErrorStatus === undefined ? '' : ` (HTTP ${apiErrorStatus})`
+    const detail = apiErrorStatus !== undefined
+      && typeof parsed.result === 'string'
+      && parsed.result.trim() !== ''
       ? `${parsed.result.trim().slice(0, CLI_ERROR_DETAIL_LIMIT)}`
       : ''
     return `Claude Code CLI reported an error result${status}${detail ? `: ${detail}` : ''}`
