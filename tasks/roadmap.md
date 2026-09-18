@@ -9299,6 +9299,7 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       - **実装順は Task B → Task A。** 先に Task B（100 件 threshold review sensor）を閉じ、
         そのあとで Task A（Registry coverage 拡張）へ進む。
+        **Task B は 2026-09-18 に着地済みなので、残っているのは Task A だけである。**
         理由は、production に既に 38 件の application があり、**coverage を広げると
         application の増加速度が上がり得る**ため。観測範囲を広げる前に
         「100 件到達時に必ず再評価へ戻る」閉ループを先に完成させる
@@ -9323,13 +9324,21 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         Registry coverage / prompt への影響 / `principle_applications` 記録 /
         Independent Review / merge SHA / 本 Roadmap item を done にしたか
 
+      **現在の実装状態（2026-09-18 時点。着手前に必ずここを読むこと）**:
+      - **Task B（100 件 threshold review sensor）は実装済み・merge 済み。** 再実装しない
+      - **Task A（Principle Registry coverage 拡張）が残作業。** 本項目を採用したら Task A から始める
+      - **`state` は `planned` のまま置いてある。** Task A が残っているので PL に採用させたいが、
+        採用候補の allowlist は `planned` だけである（`isRoadmapItemAdoptable()`）。
+        `in_progress` へ変えると**採用できなくなり Task A が止まる**ので、
+        「半分終わったから」という理由で state を動かさないこと
+
       **作らないもの（先に読むこと）**:
       - 新しい Principle 管理 system
       - 原則本文の第二の正本（全文を別ファイルへコピーする等）
       - 新しい scheduler / monitoring backend
       - 新しい persistent state（下記「事前確認」で不要と確定済み）
 
-      **Task A — Principle Registry coverage 拡張**
+      **Task A — Principle Registry coverage 拡張（残作業。ここから着手する）**
 
       対象候補: `specs/00` 3.14〜3.18 / `specs/20` / `specs/22` / Design Philosophy /
       `constitutionPrinciples.ts` の章全文 prompt 注入。
@@ -9354,7 +9363,50 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         `governance-and-spec-docs-current-truth-sweep` が owner。
         **同じ行を二重に直さない**ので、着手前にそちらの状態を確認すること
 
-      **Task B — 100 件到達で閾値を再評価する sensor**
+      **Task B — 100 件到達で閾値を再評価する sensor（2026-09-18 実装済み・完了）**
+
+      **実装済みなので再実装しないこと。** 入っているものは以下である。
+
+      - `PrincipleSensorId` に `threshold-policy-needs-real-data-review` を追加。
+        発火条件は「現在の版の適用が `THRESHOLD_REVIEW_MIN_APPLICATIONS`(=100) 件以上」だけで、
+        **50 / 200 センサーと違い「一度も CONFLICT していない」を条件にしない**
+        （見たいのは閾値が実態に合っているかであって、判定が割れたかどうかではない）
+      - `PRINCIPLE_SENSOR_THRESHOLDS` に `THRESHOLD_REVIEW_MIN_APPLICATIONS: 100` を追加
+      - `thresholdPolicyVersion()` — 閾値の**値**から導出する 16 桁 hash。
+        版へ入るのは `THRESHOLD_POLICY_SLOTS`（`Record<keyof typeof PRINCIPLE_SENSOR_THRESHOLDS, string>`）
+        の**固定 slot 名**であって TypeScript の property 名ではないので、
+        **定数を改名しても版は動かない**（改名すると型が合わずコンパイルで気づく）。
+        `Record` なので閾値を足したら slot 名を必ず決めることになり、表からの取りこぼしが起きない。
+        どれか 1 つでも**値**を変えれば別 policy になる
+      - `sensorEntityId()` が `policyVersion` を持つ finding にだけ版を足す
+        （`<sensorId>:<principleId|all>:<policyVersion>`）。持たないセンサーの id は従来のままなので、
+        **既存の発火記録は無効化されない**
+      - `PrincipleThresholdReviewInput` — 再評価 Review が見る実測値（適用数 / ALIGNED・CONFLICT・
+        UNCERTAIN 率 / disagreement 率と分母 / 現在の閾値 / 50 件・200 件センサーの発火状況 /
+        原則ごとの適用数と割合 / 偏りの要約）。`audit_log.detail` へ**発火時点のスナップショット**として入る
+      - `IPrincipleApplicationStorage.countStageComparisons()` — disagreement 率の分子と分母を
+        1 箇所から返す。`findDisagreements()` と同じ grouping を共有するので率がずれない
+      - 回帰テスト `apps/api/src/principles/thresholdReviewSensor.test.ts`（8 本）
+
+      **新しい table / scheduler / persistent state は増やしていない。** 重複発火防止は
+      既存 `audit_log` の `(entity_type='principle_sensor', entity_id)` だけで成立している。
+      評価は従来どおり `recordPrincipleApplications()` の記録直後に走る。
+
+      **受容した制約（2026-09-18 独立レビューで再指摘。直していない）**:
+      重複排除は check-then-insert で `audit_log` に unique 制約が無い。ただし
+      `evaluateAndPersistSensors()` も呼び出し元も `async` を含まず better-sqlite3 は同期なので、
+      **1 プロセス内では検査と挿入の間に割り込めない**。破れるのは API を複数プロセスにしたときだけで、
+      これは 3 センサー共通の前提であり、`principle-registry-and-compliance-ledger` で既に
+      受容済みの制約である。ここだけ直すと全監査利用者が共有する `audit_log` へ制約を足すことになるため、
+      **複数プロセス化を決めるときに audit_log 側で一度に扱う。**
+
+      **閾値 policy 版は固定テストで守ってある。** `thresholdPolicyVersion()` の現在値
+      （`14ed9fe6c13a805e`）をテストで pin してあるので、閾値以外の変更で版が動けば
+      必ずテスト失敗として見える（版が動くと、既に 100 件超の環境では再評価がもう一度発火するため）。
+      **意図して閾値を変えるときは、期待値の更新と同時に「どの実測を見てそう決めたか」を
+      `PRINCIPLE_SENSOR_THRESHOLDS` の doc comment へ書くこと。**
+
+      以下は実装時の設計根拠として残す。
 
       2026-09-18 時点の production の `principle_applications` は **38 件**。
       既存方針にある「100 件程度蓄積したら 50 / 200 の暫定閾値を実データで再評価する」を

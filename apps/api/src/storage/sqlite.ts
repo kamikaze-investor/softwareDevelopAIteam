@@ -4120,102 +4120,154 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
 
     findDisagreements(query) {
-      const conditions: string[] = []
-      const params: string[] = []
-      if (query?.projectId !== undefined) {
-        conditions.push('project_id = ?')
-        params.push(query.projectId)
-      }
-      if (query?.reviewStage !== undefined) {
-        conditions.push('review_stage = ?')
-        params.push(query.reviewStage)
-      }
-      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-
-      // subject は task_id を第一候補にし、無ければ roadmap_item_id、さらに無ければ project_id。
-      // 「どの単位について判定が割れたか」を 1 列で表現する。
-      const rows = db.prepare(`
-        SELECT
-          principle_id AS principleId,
-          principle_version_hash AS principleVersionHash,
-          review_run_id AS reviewRunId,
-          project_id AS projectId,
-          COALESCE(task_id, roadmap_item_id, project_id) AS subjectId,
-          CASE
-            WHEN task_id IS NOT NULL THEN 'task'
-            WHEN roadmap_item_id IS NOT NULL THEN 'roadmap_item'
-            ELSE 'project'
-          END AS subjectKind,
-          review_stage AS reviewStage,
-          verdict AS verdict
-        FROM principle_applications
-        ${where}
-        ORDER BY principleId ASC, subjectId ASC, reviewStage ASC
-      `).all(...params) as any[]
-
-      const grouped = new Map<string, {
-        principleId: string
-        subjectKind: PrincipleDisagreementRow['subjectKind']
-        subjectId: string
-        reviewRunId: string | null
-        verdicts: PrincipleDisagreementRow['verdicts']
-      }>()
-
-      for (const row of rows) {
-        // **同一 review run の中でだけ突き合わせる。**
-        //
-        // run を key に入れないと、別々の Review で出た判定が「不一致」に見える。
-        // 実際には時間が違うだけで、2人の reviewer が同じものを見て割れたわけではない
-        // （独立レビュー指摘 2026-09-17 第2回）。run を跨がないので principle 版も自動的に揃う。
-        // run が無い行は突き合わせようがないので、後段で落とす。
-        // 版まで key に入れる。同一 run でも focused と independent は registry を別々に読むため、
-        // run の途中で spec が書き換わると**違う本文について**の判定を突き合わせ得る
-        // （独立レビュー指摘 2026-09-17 第4回）。同じ版を見た判定だけを比べる。
-        const key = `${row.principleId}\u0000${row.principleVersionHash}\u0000${row.reviewRunId}\u0000${row.subjectKind}\u0000${row.projectId}\u0000${row.subjectId}`
-        const existing = grouped.get(key)
-        const verdictEntry = {
-          reviewStage: row.reviewStage as PrincipleReviewStage,
-          verdict: row.verdict as StrategicDecision,
-        }
-        if (existing) {
-          existing.verdicts.push(verdictEntry)
-          continue
-        }
-        grouped.set(key, {
-          principleId: String(row.principleId),
-          subjectKind: row.subjectKind as PrincipleDisagreementRow['subjectKind'],
-          subjectId: String(row.subjectId),
-          reviewRunId: row.reviewRunId === null ? null : String(row.reviewRunId),
-          verdicts: [verdictEntry],
-        })
-      }
-
-      // **Reviewer disagreement は「別々の Review 工程が違う判定を出した」ことである。**
-      //
-      // 判定の種類が割れているだけでは足りない。同じ design stage の 2 回の run が
-      // ALIGNED と CONFLICT を出した場合、それは時間差であって reviewer 間の不一致ではない
-      // （独立レビュー指摘 2026-09-17）。stage が 2 種類以上あることを条件に加える。
-      return [...grouped.values()]
-        // run に紐づかない行は「同じ Review を見た」と言えないので突き合わせ対象にしない。
-        .filter((entry) => entry.reviewRunId !== null)
-        .filter((entry) => {
-          // **stage ごとに1つの判定へ畳んでから比べる。**
-          // verdict 種類と stage 種類を独立に数えると、design が 2 行（別 run）あるだけで
-          // 「stage も verdict も割れている」と誤検出する。
-          const byStage = new Map<string, Set<string>>()
-          for (const item of entry.verdicts) {
-            const bucket = byStage.get(item.reviewStage) ?? new Set<string>()
-            bucket.add(item.verdict)
-            byStage.set(item.reviewStage, bucket)
-          }
-          if (byStage.size < 2) {
-            return false
-          }
-          const representative = [...byStage.values()].map((verdicts) => [...verdicts].sort().join('|'))
-          return new Set(representative).size > 1
-        })
-        .map(({ reviewRunId: _runId, ...entry }) => entry)
+      return stageComparisonGroups(query)
+        .filter((entry) => entry.disagrees)
+        .map(({
+          disagrees: _disagrees,
+          reviewRunId: _runId,
+          principleVersionHash: _versionHash,
+          ...entry
+        }) => entry)
     },
+
+    countStageComparisons(query, currentVersions) {
+      const groups = stageComparisonGroups(query).filter((entry) => (
+        currentVersions === undefined
+        || currentVersions[entry.principleId] === entry.principleVersionHash
+      ))
+      return {
+        comparisons: groups.length,
+        disagreements: groups.filter((entry) => entry.disagrees).length,
+      }
+    },
+  }
+
+  /**
+   * stage 間で突き合わせ可能な組を作る。**不一致件数と、その分母を 1 箇所から出す。**
+   *
+   * `findDisagreements()`（不一致だけ）と `countStageComparisons()`（率の分母）が
+   * 別々に grouping を書くと、条件が片方だけ変わったときに率が静かにずれる。
+   * 同じ関数の返り値を絞るだけにして、定義が 2 つに割れないようにする。
+   */
+  function stageComparisonGroups(query?: PrincipleAggregateQuery): Array<{
+    principleId: string
+    principleVersionHash: string
+    subjectKind: PrincipleDisagreementRow['subjectKind']
+    subjectId: string
+    reviewRunId: string | null
+    verdicts: PrincipleDisagreementRow['verdicts']
+    disagrees: boolean
+  }> {
+    const conditions: string[] = []
+    const params: string[] = []
+    if (query?.projectId !== undefined) {
+      conditions.push('project_id = ?')
+      params.push(query.projectId)
+    }
+    if (query?.reviewStage !== undefined) {
+      conditions.push('review_stage = ?')
+      params.push(query.reviewStage)
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+
+    // subject は task_id を第一候補にし、無ければ roadmap_item_id、さらに無ければ project_id。
+    // 「どの単位について判定が割れたか」を 1 列で表現する。
+    const rows = db.prepare(`
+      SELECT
+        principle_id AS principleId,
+        principle_version_hash AS principleVersionHash,
+        review_run_id AS reviewRunId,
+        project_id AS projectId,
+        COALESCE(task_id, roadmap_item_id, project_id) AS subjectId,
+        CASE
+          WHEN task_id IS NOT NULL THEN 'task'
+          WHEN roadmap_item_id IS NOT NULL THEN 'roadmap_item'
+          ELSE 'project'
+        END AS subjectKind,
+        review_stage AS reviewStage,
+        verdict AS verdict
+      FROM principle_applications
+      ${where}
+      ORDER BY principleId ASC, subjectId ASC, reviewStage ASC
+    `).all(...params) as any[]
+
+    const grouped = new Map<string, {
+      principleId: string
+      principleVersionHash: string
+      subjectKind: PrincipleDisagreementRow['subjectKind']
+      subjectId: string
+      reviewRunId: string | null
+      verdicts: PrincipleDisagreementRow['verdicts']
+    }>()
+
+    for (const row of rows) {
+      // **同一 review run の中でだけ突き合わせる。**
+      //
+      // run を key に入れないと、別々の Review で出た判定が「不一致」に見える。
+      // 実際には時間が違うだけで、2人の reviewer が同じものを見て割れたわけではない
+      // （独立レビュー指摘 2026-09-17 第2回）。run を跨がないので principle 版も自動的に揃う。
+      // run が無い行は突き合わせようがないので、後段で落とす。
+      // 版まで key に入れる。同一 run でも focused と independent は registry を別々に読むため、
+      // run の途中で spec が書き換わると**違う本文について**の判定を突き合わせ得る
+      // （独立レビュー指摘 2026-09-17 第4回）。同じ版を見た判定だけを比べる。
+      // 区切りは JSON 文字列化に任せる（各要素が独立に quote/escape されるので、
+      // 値の中にどんな文字が来ても key が衝突しない）。
+      const key = JSON.stringify([
+        row.principleId,
+        row.principleVersionHash,
+        row.reviewRunId,
+        row.subjectKind,
+        row.projectId,
+        row.subjectId,
+      ])
+      const existing = grouped.get(key)
+      const verdictEntry = {
+        reviewStage: row.reviewStage as PrincipleReviewStage,
+        verdict: row.verdict as StrategicDecision,
+      }
+      if (existing) {
+        existing.verdicts.push(verdictEntry)
+        continue
+      }
+      grouped.set(key, {
+        principleId: String(row.principleId),
+        principleVersionHash: String(row.principleVersionHash),
+        subjectKind: row.subjectKind as PrincipleDisagreementRow['subjectKind'],
+        subjectId: String(row.subjectId),
+        reviewRunId: row.reviewRunId === null ? null : String(row.reviewRunId),
+        verdicts: [verdictEntry],
+      })
+    }
+
+    return [...grouped.values()]
+      // run に紐づかない行は「同じ Review を見た」と言えないので突き合わせ対象にしない。
+      .filter((entry) => entry.reviewRunId !== null)
+      .map((entry) => {
+        // **stage ごとに1つの判定へ畳んでから比べる。**
+        // verdict 種類と stage 種類を独立に数えると、design が 2 行（別 run）あるだけで
+        // 「stage も verdict も割れている」と誤検出する。
+        const byStage = new Map<string, Set<string>>()
+        for (const item of entry.verdicts) {
+          const bucket = byStage.get(item.reviewStage) ?? new Set<string>()
+          bucket.add(item.verdict)
+          byStage.set(item.reviewStage, bucket)
+        }
+        const representative = [...byStage.values()].map((verdicts) => [...verdicts].sort().join('|'))
+        return {
+          ...entry,
+          // **Reviewer disagreement は「別々の Review 工程が違う判定を出した」ことである。**
+          //
+          // 判定の種類が割れているだけでは足りない。同じ design stage の 2 回の run が
+          // ALIGNED と CONFLICT を出した場合、それは時間差であって reviewer 間の不一致ではない
+          // （独立レビュー指摘 2026-09-17）。stage が 2 種類以上あることを条件に加える。
+          comparable: byStage.size >= 2,
+          disagrees: byStage.size >= 2 && new Set(representative).size > 1,
+        }
+      })
+      // **分母は「2 stage 以上が判定した組」だけ。**
+      // 片側の stage しか判定していない組を分母へ入れると、不一致率が実態より低く出る。
+      .filter((entry) => entry.comparable)
+      .map(({ comparable: _comparable, ...entry }) => entry)
   }
 
   function generateKGNodeId(): string {

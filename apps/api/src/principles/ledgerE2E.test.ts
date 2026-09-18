@@ -282,7 +282,15 @@ describe('Principle ledger E2E: selection -> review -> verdict -> DB -> aggregat
       )
     }
 
-    expect(buildPrincipleStats(storage).sensors).toHaveLength(0)
+    // **ここで見ているのは降格センサーだけである。**
+    // 1 run が core 原則をまとめて記録するので、適用総数は 49 run の時点で既に 100 を超えており、
+    // 閾値再評価センサー（`threshold-policy-needs-real-data-review`）は先に発火している。
+    // それは別の観測点なので、ここで「センサーが 0 件」を要求すると
+    // 観測を足すたびにこのテストが壊れる。
+    expect(
+      buildPrincipleStats(storage).sensors
+        .filter((finding) => finding.sensorId === 'core-principle-never-conflicts'),
+    ).toHaveLength(0)
 
     // 閾値ちょうどで発火する。
     const lastIndex = PRINCIPLE_SENSOR_THRESHOLDS.CORE_DEMOTION_MIN_APPLICATIONS - 1
