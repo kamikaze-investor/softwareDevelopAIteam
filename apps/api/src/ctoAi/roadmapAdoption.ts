@@ -48,6 +48,8 @@ import type { Task } from '@ai-team/shared'
 // #255 の判定器をそのまま使う。**material-difference の定義を複製しない。**
 import { collectRejectedSpecKeys, recordRemediationFailure, shortSpecKey } from '../pl/remediationStep'
 import { recomputeDecision, type RawStrategicResult } from '../designReview/designReviewCoordinator'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapSyncPhaseInput } from '../storage/interface'
 import { validateRoadmapTasks, validateRoadmapPhases } from '../storage/roadmapTaskValidation'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
@@ -65,51 +67,69 @@ const ADOPTED_PHASE_NAME = '採用中のRoadmap項目'
 const ADOPTED_PHASE_GOAL = 'tasks/roadmap.md から採用した実装対象を実行する'
 
 /**
- * その Task には **formal Design Review に却下された spec が既にある**か。
+ * その Task の **現在の spec** を、直近の formal Design Review が却下したか。
  *
- * material-difference guard を**この条件のときだけ**効かせるための引き金である。
- * 常時効かせてはならない —— 却下歴の無い Task を同一内容で採用し直すのは
- * 初回採用のやり直しや resume 経路で正常に起きるため、そこを塞ぐと
- * 「新規 item の初回採用」「follow-up 採用」「ALIGNED 済み Task の Job 再生成」が壊れる。
+ * 判定は `findRemediationSubject()`（#255）と同じ `recomputeDecision()` を通す。
+ * runner の自己申告（`finalDecision`）は採用しない —— #255 が書く CONFLICT は
+ * その欄を持たないため、生値で比べると本番で最も多い形が漏れる。
  *
- * 判定材料は2つで、どちらも既存レコードである:
- *   1. 直近の Design Review run が**終端していて CONFLICT へ再計算される**
- *      （`findRemediationSubject()` と同じく `recomputeDecision()` を通す。
- *      runner の自己申告は採用しない）
- *   2. 却下世代が audit に残っている —— `collectRejectedSpecKeys()` が現在 spec 以外の
- *      キーを返すのは、過去世代が却下されたときだけである
- *
- * `UNCERTAIN` / `REVIEW_UNAVAILABLE` は含めない。あれは設計への異議ではなく
+ * `UNCERTAIN` / `REVIEW_UNAVAILABLE` は却下に数えない。あれは設計への異議ではなく
  * `recomputeDecision()` の構造検証による fail-closed であり、同じテキストの再実行が
  * 正当な復旧になりうる（#255 が Remediation 対象から外しているのと同じ理由）。
  */
-function hasRejectedDesignReview(storage: IStorage, task: Task): boolean {
-  if (collectRejectedSpecKeys(storage, task).length > 1) return true
-
+function latestReviewRejectedCurrentSpec(storage: IStorage, task: Task): boolean {
   const run = storage.designReviewRuns.findLatestByTaskId(task.id)
   if (run?.status !== 'succeeded' || run.resultJson === undefined) return false
 
-  // ALIGNED evidence が同じテキストに対して登録済みなら、それは却下ではない。
-  //
-  // **ただし evidence が run より古いなら、それはこの run の結果ではない。**
-  // 同一テキストへの判定は実行ごとに反転しうる（`independent-review-verdict-instability`）ので、
-  // 「昔 ALIGNED だった」ことを根拠に**後から出た CONFLICT を無かったことにしてはならない**
-  // （独立レビュー指摘・2026-09-18）。時刻で新しい方を採る。
-  const evidence = storage.designReviewEvidence.findLatestByTaskId(task.id)
-  if (evidence?.designTextHash === run.designTextHash) {
-    const evidenceAt = Date.parse(evidence.createdAt)
-    const runAt = Date.parse(run.completedAt ?? run.createdAt)
-    // 時刻が読めないときは「却下ではない」と決めつけず、下の再計算に判断を委ねる。
-    if (Number.isFinite(evidenceAt) && Number.isFinite(runAt) && evidenceAt >= runAt) return false
+  // **その run が「今の spec」を見ていたのでなければ、今の spec の却下ではない。**
+  // 採用は Task の spec を置き換えるが Design Review run はそのまま残るので、
+  // A を却下 → B を採用した直後は「最新 run = A の CONFLICT / Task = B」になる。
+  // ここで束縛しないと **B がまだ一度も却下されていないのに却下済みとして扱われ**、
+  // B の review が流れたときに B を出し直せなくなる（独立レビュー指摘・2026-09-18）。
+  if (run.designTextHash !== computeDesignTextHash(buildInitialImplementAiCliPrompt(task))) {
+    return false
   }
 
+  // **最新の終端 run だけを見る。** 古い ALIGNED evidence は考慮しない ——
+  // 同一テキストへの判定は実行ごとに反転しうる（`independent-review-verdict-instability`）ので、
+  // 「昔 ALIGNED だった」ことで**後から出た CONFLICT を無かったことにしてはならない**。
+  // 逆に最新が ALIGNED なら、その spec はいま却下されていない。
+  // （時刻比較はしない。ms 解像度では同着しうるうえ、clock 調整で逆転もする。
+  //   独立レビュー指摘・2026-09-18）
   try {
     const raw = JSON.parse(run.resultJson) as RawStrategicResult
     return recomputeDecision(raw, 'task', run.changedFiles).decision === 'CONFLICT'
   } catch {
-    // 読めない結果を「却下された」と決めつけない。
+    // 読めない結果を「却下された」と決めつけない（fail-open ではなく、判定材料が無い）。
     return false
   }
+}
+
+/**
+ * この Task について、**formal Design Review が実際に却下した** spec のキー全件。
+ *
+ * `collectRejectedSpecKeys()`（#255）をそのまま使う。ただし1点だけ文脈が違う ——
+ * あちらは `findRemediationSubject()` が「現在 spec はいま却下されたもの」と確定させた後に
+ * 呼ばれるため、**現在 spec を無条件に却下済みとして含める**。
+ * 採用経路にはその前提が無い（却下されていない Task も採用し直される）ので、
+ * **「直近 review がこの spec を却下した」と言えるときだけ現在 spec を残す**。
+ * その判定には run と現在テキストの束縛が要る（`latestReviewRejectedCurrentSpec()`）——
+ * A を却下 → B を採用した直後は「最新 run = A の CONFLICT / Task = B」になるので、
+ * 束縛しないと **B がまだ一度も却下されていないのに却下済み扱いになり、B の review が
+ * `REVIEW_UNAVAILABLE` 等で流れたときに B を出し直せなくなる**（独立レビュー指摘・2026-09-18）。
+ *
+ * 集合が空なら guard は何もしない。初回採用・follow-up・却下歴の無い Task・ALIGNED 済み Task が
+ * 自動的に対象外になるのはこのためである（専用の trigger 判定を別に持たない）。
+ */
+function rejectedSpecKeysForAdoption(storage: IStorage, task: Task): string[] {
+  const keys = collectRejectedSpecKeys(storage, task)
+  if (latestReviewRejectedCurrentSpec(storage, task)) return keys
+
+  const currentKey = shortSpecKey({
+    implementationScope: extractImplementationScope(task.description) ?? '',
+    allowedPaths: task.allowedPaths ?? [],
+  })
+  return keys.filter((key) => key !== currentKey)
 }
 
 export type AdoptRoadmapItemFailure =
@@ -532,15 +552,16 @@ export async function adoptRoadmapItem(
   //
   // AC はキーに入らない（レビュー対象テキストに1文字も入らないため）。
   // AC だけ書き換えた提案は「作り直した」ことにならない —— これも #255 と同じ定義である。
-  if (existingTask !== undefined && hasRejectedDesignReview(storage, existingTask)) {
+  if (existingTask !== undefined) {
     // scope 未指定は「空の scope」として比較する（`collectRejectedSpecKeys()` が
     // `extractImplementationScope(...) ?? ''` で作る側と同じ扱いにする）。
     const proposedKey = shortSpecKey({
       implementationScope: input.implementationScope ?? '',
       allowedPaths,
     })
-    const rejectedKeys = collectRejectedSpecKeys(storage, existingTask)
-    if (!isMateriallyDifferentSpec(rejectedKeys, proposedKey)) {
+    // **却下が実際に在るものだけを集める。** 空なら guard は何もしない。
+    const rejectedKeys = rejectedSpecKeysForAdoption(storage, existingTask)
+    if (rejectedKeys.length > 0 && !isMateriallyDifferentSpec(rejectedKeys, proposedKey)) {
       return {
         ok: false,
         code: 'SPEC_NOT_MATERIALLY_DIFFERENT',
@@ -565,14 +586,24 @@ export async function adoptRoadmapItem(
     // （validation や sync で失敗した場合、あるいは review が UNAVAILABLE だった場合に、
     // 同じ案を出し直せなくなる。独立レビュー指摘・2026-09-18）。
     // 提案が実際に却下されたときは、それが Task の現在 spec になっているので
-    // `collectRejectedSpecKeys()` が Task 側から拾う。A → B → A はそれで止まる。
+    // `rejectedSpecKeysForAdoption()` が Task 側から拾う。A → B → A はそれで止まる。
     //
-    // 書き込みは **sync が成功してから**行う（下の `syncRoadmapTasks()` の後）。
-    supersededRejectedKey = shortSpecKey({
-      implementationScope: extractImplementationScope(existingTask.description) ?? '',
-      allowedPaths: existingTask.allowedPaths ?? [],
-    })
-    supersededTaskId = existingTask.id
+    // **書き込む事実は sync の成否に依存しない。** 「この spec は却下された」は
+    // ここへ来た時点で既に確定しており（`rejectedKeys` に入っているのがその証拠）、
+    // 採用が後で失敗しても真のままである。だから sync の前に書いてよく、
+    // **書けたか書けなかったかで状態が食い違う窓を作らない**（独立レビュー指摘・2026-09-18）。
+    // 同じ事実を重ねて書いても `collectRejectedSpecKeys()` は Set で畳む。
+    if (rejectedKeys.length > 0) {
+      recordRemediationFailure(
+        storage,
+        existingTask.id,
+        `stage=adoption outcome=superseded_rejected_spec `
+        + `rejected_fspec=${shortSpecKey({
+          implementationScope: extractImplementationScope(existingTask.description) ?? '',
+          allowedPaths: existingTask.allowedPaths ?? [],
+        })}`,
+      )
+    }
   }
 
   const taskInput: RoadmapSyncTaskInput = {
@@ -632,20 +663,6 @@ export async function adoptRoadmapItem(
       reason: syncResult.failureReason ?? 'Roadmap sync failed',
       details: { conflicts: syncResult.conflicts, phaseConflicts: syncResult.phaseConflicts },
     }
-  }
-
-  // spec の置き換えが確定した。**ここで初めて**、置き換えられた却下済み案を履歴へ残す。
-  // 失敗した採用では書かない（書くと、通らなかった世代まで却下扱いになる）。
-  //
-  // `stage=adoption` を必ず付ける。`stageEntries()` は `stage=` の無い行を remediation として
-  // 数えるため、省くと **Remediation の予算を削ってしまう**。この行はどの attempt budget にも
-  // 算入されず、`countRemediationAttempts()` / `selectConflictStage()` の結果を変えない。
-  if (supersededRejectedKey !== undefined && supersededTaskId !== undefined) {
-    recordRemediationFailure(
-      storage,
-      supersededTaskId,
-      `stage=adoption outcome=superseded_rejected_spec rejected_fspec=${supersededRejectedKey}`,
-    )
   }
 
   const adopted = storage.tasks
