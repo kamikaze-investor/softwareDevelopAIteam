@@ -382,7 +382,25 @@ function remediationKey(taskId: string): string {
   return `remediate:${taskId}`
 }
 
+/**
+ * Independent Remediation の試行回数。
+ *
+ * **`stage=remediation` の行だけを数える。** Critic / Challenge は同じ audit entity へ載るので、
+ * 全行を数えると **Critic Round が Remediation の予算を食い潰す** —— 実際にそうなっていて、
+ * Critic を2 Round 行った時点で Remediation へ到達できなくなっていた（テストで検出）。
+ * stage ごとに予算が独立していることが、段階フローの前提である。
+ */
 export function countRemediationAttempts(storage: IStorage, taskId: string): number {
+  return stageEntries(storage, taskId, 'remediation').length
+}
+
+/**
+ * stage を問わない解決試行の総数。
+ *
+ * 用途は1つだけで、**呼び出し側が「この呼び出しで step が既に何か記録したか」を判定する**ため。
+ * 予算の判定には使わない（予算は stage ごとに別である）。
+ */
+export function countConflictAttempts(storage: IStorage, taskId: string): number {
   return storage.auditLog
     .findByEntity(AUDIT_ENTITY_TYPE, remediationKey(taskId))
     .filter((entry) => entry.operation === AUDIT_OPERATION)

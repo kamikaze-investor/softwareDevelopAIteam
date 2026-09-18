@@ -52,6 +52,7 @@ import {
   type PlAdoptionResult,
 } from './adoptionStep'
 import {
+  countConflictAttempts,
   countRemediationAttempts,
   findRemediationSubject,
   PL_MAX_REMEDIATION_ATTEMPTS,
@@ -368,7 +369,7 @@ async function remediateConflict(
   // 決める。ここは stage を選ばない。
   const run = deps.resolveConflict ?? runConflictResolutionRound
   // 呼び出し前の試行数。例外時に**二重計上しない**ための基準にする。
-  const attemptsBefore = countRemediationAttempts(storage, item.taskId)
+  const attemptsBefore = countConflictAttempts(storage, item.taskId)
   let round: Awaited<ReturnType<typeof runConflictResolutionRound>>
   try {
     round = await run(storage, item.taskId, {
@@ -384,7 +385,7 @@ async function remediateConflict(
     // ただし **step 側が既にこの試行を計上していたら足さない。** step は採用を await する前に
     // `outcome=adopting` を記録するので、採用が throw すると1回の論理試行で2行になり、
     // **上限2に対して transient な例外1回で予算が尽きる**（独立レビュー指摘）。
-    if (countRemediationAttempts(storage, item.taskId) === attemptsBefore) {
+    if (countConflictAttempts(storage, item.taskId) === attemptsBefore) {
       recordRemediationFailure(storage, item.taskId, 'outcome=exception')
     }
     record(storage, key, 'diagnosis_failed', `conflict_resolution=error ${message}`)
