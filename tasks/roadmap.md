@@ -8143,31 +8143,40 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **【2026-09-18 追記: 3経路すべてに実装が入った】**
       本 Finding が挙げた3経路のうち **PL 経路**は
       `independent-remediation-design-review-conflict`（PR #255）で埋まった。
-      `task_ready_without_job` は CONFLICT のときに限り notify-only を外れ、
-      `Independent Critic → PL revision → 既存 formal review`、
-      Critic が Finding 自体を根拠付きで dispute した場合のみ frozen spec への
-      once-per-(spec,finding) な再評価、それでも解決しなければ Independent Remediation、
-      という段階経路を通る。
-
       残っていた **人手経路と手順書**は `human-recovery-zero-job-blocked-task` で埋めた:
       - **人手経路**: `POST /api/tasks/:id/recover`（Human Recovery）。Job 0 件の blocked Task を
         `blocked` → `pending` へ戻すだけで、**Job も Review も Approval も作らない**。
         up-front の CEO Approval Gate は課さない（CEO 決定・2026-09-18）が、fresh Design Review と
         既存下流 Gate はすべて維持される。AI/PL は「語彙が無い」「配線が無い」
         「worker allowlist に無い」の3重で到達できない
-      - **手順書**: `docs/project_memory/rules/human_recovery.md`。症状別の使い分け、
-        CONFLICT の原因が提案側か ledger 側かの切り分け、訂正済み `implementationScope` /
-        `allowedPaths` で採用 API を叩き直す手順、`audit_log` からの効果検証まで記載した
+      - **手順書**: `docs/project_memory/rules/human_recovery.md`
 
-      **同時に、本 Finding が書けていなかった穴を1つ塞いだ。** `failContinuation()` 経由の
-      CONFLICT は Task を `blocked` にするため `findRemediationSubject()`（`pending` を要求）から
-      外れ、**PR #255 の新経路にも届かない**。しかも attention は全9箇所が「Job があること」か
+      **順序は #255 → #259 → 人手の順で固定した。** `remediateConflict()` は従来どおり Triage の
+      **手前**で走り、Human Recovery はどちらも迂回しない。Triage には復旧の実行責務を持たせず、
+      分類だけを行わせている。
+
+      **本 Finding が書けていなかった穴を1つ塞いだ。** `failContinuation()` 経由の CONFLICT は
+      Task を `blocked` にするため `findRemediationSubject()`（`pending` を要求）から外れ、
+      **PR #255 の新経路にも届かない**。しかも attention は全9箇所が「Job があること」か
       「`status='pending'` であること」を条件にしているため **1件も立たず**、
       `occupiesProject()` が blocked を roadmapActive に関係なく占有と数えることと合わさって、
       **誰にも見えないまま Project の枠を保持し続ける**。2026-09-18 に `:memory:` storage へ
       同じ状態を作って実測した（`attention = []` /
       `resumeBlockedTask() = "No jobs exist for this task"`）。
-      notify-only の `task_blocked_without_job` attention を足して可視化した。
+
+      **non-goal「新しい AttentionKind を追加しない」から意図的に外れた。根拠を残す。**
+      この状態を既存 `task_ready_without_job` へ押し込む案を先に検討し、次の理由で採らなかった:
+      - **名前と意味が合わない**（`ready` ではなく `blocked`）
+      - **#255 固有ロジックと混線する**。`isRemediableConflict()` は kind で分岐した先で
+        `findRemediationSubject()`（`pending` 要求）に落ちるため、押し込むと「Remediation を
+        試したが解決しなかった」と読める CEO 報告になる。実際には一度も実行されていない
+      - **pending と blocked の責務境界が崩れる**。`hasStalledLongEnough()` は
+        `task_ready_without_job` を5分の停滞閾値で抑える（採用直後に必ず立つため）。
+        blocked かつ Job 0 件は過渡状態を持たず即座に異常なので、同じ閾値を共有できない
+      追加したのは **AttentionKind 1個だけ**で、`rootCauseClass` も lane も TaskStatus も
+      Roadmap state も増やしていない。AttentionKind は永続 state ではなく
+      **実レコードから毎回導出される observation vocabulary** であり、
+      state 空間を広げない。既存 kind への押し込みより最小かつ自然と判断した。
 
       **`state` は merge と Production E2E 確認まで `deferred` のまま維持する。** 実装は入ったが、
       自然な CONFLICT が出たときの観測はまだ取れていない（PR #255 と同じ扱い）。
@@ -8201,6 +8210,39 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       Triage が受け持つのはその対象外（`roadmapTaskKey` 無し・予算枯渇など）だけで、
       その場合は構造化報告を添えて CEO へ渡す。
 
+
+<!-- roadmap:id=continuation-conflict-blocks-task-out-of-recovery state=deferred -->
+8. [ ] **continuation 経由の Design Review CONFLICT が Task を `blocked` にし、自動復旧の射程外へ出す** —
+      2026-09-18登録。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: `createInitialImplementWorkflow()` は Design Review が非 ALIGNED のとき
+      `retryable: false` で skip し、`failContinuation()` がその Task を `blocked` にする
+      （`apps/api/src/ctoAi/taskContinuation.ts`）。Job は1件も作られない。
+
+      **結果として、同じ CONFLICT でも入口によって扱いが変わる**:
+      - **採用経由**（`adoptRoadmapItem`）… Task は `pending` のまま →
+        `task_ready_without_job` → #255 の staged recovery が引き取る
+      - **continuation 経由** … Task は `blocked` →
+        `findRemediationSubject()` が `pending` を要求するため **#255 が一度も走らない**
+
+      `human-recovery-zero-job-blocked-task` は**この状態を可視化し人手で戻す経路**を作ったが、
+      **なぜ `blocked` にするのかという設計自体は触っていない**。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - Design Review 非 ALIGNED のとき、Task を `pending` のまま残せないか。
+        残せるなら人手を介さず #255 が引き取れる（**新しい仕組みを増やさずに済む**）
+      - ただし `pending` のままだと「止まっている」ことが status から読めなくなる。
+        attention で足りるのか、`blocked` の意味を保つべきか
+      - 他の非 retryable skip（`gate.reason` / project unavailable）は同じ扱いでよいか。
+        **理由ごとに分けるべきかもしれない**
+      - 効果検証可能性（Design Philosophy 8）: 入口別の CONFLICT 件数と、
+        そのうち自動で解決した割合を後から数えられること
+
+      **既存項目との違い（重複実装しないこと）**:
+      - `human-recovery-zero-job-blocked-task`: 既に `blocked` になったものを**戻す**話。
+        本項目は**そもそも `blocked` にするのが正しいか**の話
+      - `task-design-review-conflict-has-no-recovery-route`: 復旧経路が無いこと。
+        本項目はその一因である**状態遷移の設計**
 
 <!-- roadmap:id=blocked-resolution-triage state=done -->
 8. [x] **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す** —

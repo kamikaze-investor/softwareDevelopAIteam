@@ -105,13 +105,28 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 | `TASK_HAS_JOBS` | Job があるので既存 `/resume` の担当。こちらでは受けない |
 | `TASK_NOT_BLOCKED` | 既に再投入済みか、そもそも止まっていない |
 | `TASK_PARKED` | `abort_task` で park 済み。復旧の副作用で park を取り消さない |
-| `RECOVERY_BUDGET_EXHAUSTED` | 3回再投入しても通らなかった。**同じものを押し直さず 4 へ** |
 
-### 4. 訂正して採用し直す（再投入で通らないとき）
+**生涯上限は無い。** 連打を止めているのは入口条件そのもので、もう一度受理されるには
+システムが**独立に** dead state へ再突入している必要がある（再突入経路は
+`failContinuation()` だけで、それは producer が実際に動いたことを意味する）。
+この操作は Job も Review も作らないので、`PL_MAX_REMEDIATION_ATTEMPTS` /
+`PL_MAX_ATTEMPTS_PER_TARGET` / `DESIGN_REVIEW_MAX_ATTEMPTS` のどれも消費・リセットしない。
 
-`RECOVERY_BUDGET_EXHAUSTED` になった場合や、提案側の scope が明らかに誤っている場合は、
+**再投入の直後は5分間何も起きないことがある。** `task_ready_without_job` は既存の停滞閾値
+（`DEFAULT_STALL_HINT_MS` = 5分）を過ぎたものだけを PL の対象にする。止まっている Task は
+`createdAt` が十分古いので通常は次の tick で動くが、採用直後の Task を再投入した場合は待つ。
+
+### 4. 訂正して採用し直す（scope / ledger 本文が原因のとき）
+
+提案側の scope が誤っている、または ledger 本文が陳腐化している場合は、
 **既存の採用 API を訂正済みの内容で叩き直す**。これが 2026-09-18 に production で実際に使われた
 （が文書化されていなかった）手順である。
+
+> **順序が重要。必ず先に手順 3 で `pending` へ戻すこと。**
+> `syncRoadmapTasks()` が spec を更新できる条件は
+> `jobs.length === 0 && status === 'pending'` である。**`blocked` のまま採用し直すと
+> `SYNC_FAILED`（`spec conflicts detected for started/completed tasks`）で失敗し、
+> 訂正版の spec は1文字も入らない。**
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
@@ -136,6 +151,25 @@ File Change Guard が最初の implement Job を止める）。
 - ledger 本文の訂正で解ける見込みがあるなら 2 へ戻る
 - この Task をいま進めないと決めるなら `POST /api/tasks/:id/abort`（CEO Approval が要る）で park する。
   Roadmap 項目の残作業は消えず、後から follow-up 採用で別 Task identity として再開できる
+
+---
+
+## この経路と PL 自動経路の順序
+
+Human Recovery は**自動経路の代わりではなく、自動経路が構造的に届かない範囲だけ**を埋める。
+順序は次のとおりで、前段を飛ばさない:
+
+```text
+Design Review CONFLICT
+  → #255 staged recovery（Critic → PL revision → formal review → Challenge → Independent Remediation）
+  → 解決しなかったものだけ #259 Blocked Triage が分類
+  → CEO escalation / Human Recovery 待ち
+```
+
+`blocked` かつ Job 0 件の Task は `findRemediationSubject()`（`pending` を要求）から外れるため、
+**#255 は一度も走らない**。Triage はこれを `ceo_escalation` へ倒し、CEO 通知には
+「試したが駄目だった」ではなく「**一度も実行できていない**」と書く。
+Human Recovery で `pending` へ戻すと、以降は上の順序がそのまま適用される。
 
 ---
 
