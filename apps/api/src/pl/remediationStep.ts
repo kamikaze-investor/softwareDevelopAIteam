@@ -47,7 +47,7 @@
  * この repo では同一入力に対する Review 判定が実行ごとに反転することが実測されている
  * （ledger: `independent-review-verdict-instability`。critical な Authority 指摘が再実行で消えた）。
  * したがって却下済みテキストをそのまま再提出できる設計は、**判定の揺れを使って CONFLICT を
- * 洗浄する経路**になる。そこで `rejectedDesignTextHashes` と一致する提案は
+ * 洗浄する経路**になる。そこで**却下済みのどの案ともレビュー対象が同じ提案**は
  * **Review を走らせる前に拒否する**（`repairPolicy` の `requireDifferentApproach` と同じ趣旨）。
  */
 
@@ -66,6 +66,7 @@ import {
   type DesignReviewFinding,
   type RemediationProposal,
   isMateriallyDifferentSpec,
+  reviewVisibleSpecKey,
   type RemediationSpec,
 } from '@ai-team/shared'
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
@@ -212,8 +213,8 @@ export interface RemediationSubject {
   roadmapId: string
   /** 却下された Design Review の Finding。 */
   findings: readonly DesignReviewFinding[]
-  /** 却下された設計テキストの hash（複数世代ぶん）。 */
-  rejectedDesignTextHashes: readonly string[]
+  /** 却下された提案の review-visible key（全世代ぶん）。 */
+  rejectedSpecKeys: readonly string[]
 }
 
 /**
@@ -269,21 +270,50 @@ export function findRemediationSubject(
   }
   if (recomputeDecision(raw, 'task', run.changedFiles).decision !== 'CONFLICT') return undefined
 
-  const rejected = new Set<string>([run.designTextHash])
-  // 過去の世代で却下された hash も避ける。`design_review_runs` は Task ごとに最新1件しか
-  // 引けないため、自前の audit 行から復元する（新しいテーブルは作らない）。
-  for (const entry of storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, remediationKey(task.id))) {
-    for (const match of (entry.detail ?? '').matchAll(/\b(?:rejected|proposed)=([0-9a-f]{6,64})\b/g)) {
-      if (match[1]) rejected.add(match[1])
-    }
-  }
-
   return {
     task,
     roadmapId: task.roadmapTaskKey,
     findings: extractDesignReviewFindings(run.resultJson),
-    rejectedDesignTextHashes: [...rejected],
+    rejectedSpecKeys: collectRejectedSpecKeys(storage, task),
   }
+}
+
+/**
+ * これまでに却下された提案の **review-visible key** を全件集める。
+ *
+ * **1世代前だけでは足りない。** A → B → A の巡回で A を再提出できてしまうため、
+ * 却下済み全件と比べる（独立レビュー指摘）。
+ *
+ * 材料は2つで、どちらも既存レコードである:
+ *   1. 現在の Task の spec … 直前に却下された案そのもの（初回は PL の案）
+ *   2. 自前の audit 行に記録した `fspec=` … 過去世代の提案
+ *
+ * `design_review_runs` は Task ごとに最新1件しか引けないので、世代の履歴は 2 で復元する。
+ * **新しいテーブルは作らない。**
+ */
+function collectRejectedSpecKeys(storage: IStorage, task: Task): string[] {
+  const keys = new Set<string>([
+    shortSpecKey({
+      implementationScope: extractImplementationScope(task.description) ?? '',
+      allowedPaths: task.allowedPaths ?? [],
+    }),
+  ])
+  for (const entry of storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, remediationKey(task.id))) {
+    const match = /\bfspec=(\S+)/.exec(entry.detail ?? '')
+    if (match?.[1] !== undefined) keys.add(match[1])
+  }
+  return [...keys]
+}
+
+/**
+ * audit へ載せるための短縮キー。
+ *
+ * `reviewVisibleSpecKey()` の生値は長く、`audit_log.detail` の 500 字上限に収まらない。
+ * 照合に使うのは同一性だけなので hash で足りる。**判定ロジックは共有の pure 関数側に置き、
+ * ここでは短縮だけを行う**（2箇所に判定を書かない）。
+ */
+function shortSpecKey(spec: { implementationScope: string; allowedPaths: readonly string[] }): string {
+  return computeDesignTextHash(reviewVisibleSpecKey(spec)).slice(0, 16)
 }
 
 function remediationKey(taskId: string): string {
@@ -568,7 +598,7 @@ export async function runRemediationStep(
     + ` excluded=${selection.excludedVendors.join('+') || '-'}`
     // 分離を確認できなかった相手を黙って落とさない。
     + ` unverified_separation=${selection.unresolvedAuthors.join('+') || '-'}`
-    + ` rejected=${subject.rejectedDesignTextHashes[0] ?? '-'}`
+    + ` rejected_specs=${subject.rejectedSpecKeys.length}`
 
   // ── 実行（read-only sandbox。提案しか出てこない）────────────────
   const runnerDeps = deps.runnerDeps ?? buildDefaultRemediationDeps()
@@ -650,22 +680,23 @@ export async function runRemediationStep(
 
   // ── 却下済み提案の再審査を拒否する（Review を走らせる前に）───────
   //
-  // 判定材料は Task に保存される3欄（scope / allowedPaths / acceptanceCriteria）である。
-  // **submit される prompt の hash では判定できない** —— 判断記録が追記されるため中身が
-  // 同一でも hash は必ず変わり、「違う」ことを1つも保証しない（独立レビュー指摘）。
+  // 比較するのは **Review が実際に見る部分**（scope + allowedPaths）であって Task の3欄ではない。
+  // `acceptanceCriteria` はレビュー対象 prompt に1文字も入らないため、AC だけを書き換えた提案は
+  // **byte 単位で同一のテキストへの再抽選**になる（独立レビュー指摘）。
+  // また **却下済み全件**と比べる —— 直前だけと比べると A → B → A の巡回で A を再提出できる。
   const submittedScope = buildRemediatedScope(proposal)
   const proposedHash = computeProposedDesignTextHash({
     ledgerBody,
     implementationScope: submittedScope,
     allowedPaths: proposal.allowedPaths,
   })
-  const rejectedSpec: RemediationSpec = {
-    implementationScope: extractImplementationScope(subject.task.description) ?? '',
-    allowedPaths: subject.task.allowedPaths ?? [],
-    acceptanceCriteria: subject.task.acceptanceCriteria ?? [],
-  }
-  if (!isMateriallyDifferentSpec(rejectedSpec, proposal)) {
-    recordRemediation(storage, taskId, `${provenance} proposed=${proposedHash} outcome=not_different`)
+  const proposedSpecKey = shortSpecKey(proposal)
+  if (!isMateriallyDifferentSpec(subject.rejectedSpecKeys, proposedSpecKey)) {
+    recordRemediation(
+      storage,
+      taskId,
+      `${provenance} proposed=${proposedHash} fspec=${proposedSpecKey} outcome=not_different`,
+    )
     return {
       status: 'proposal_not_materially_different',
       taskId,
@@ -674,8 +705,9 @@ export async function runRemediationStep(
       model: candidate.model,
       failureCode: 'identical_to_rejected',
       reason:
-        'the proposal restates the scope, paths and acceptance criteria the review already'
-        + ' rejected; re-reviewing it would only re-roll the verdict',
+        'the proposal leaves the review-visible design (implementationScope and allowedPaths)'
+        + ' identical to one the review already rejected; re-reviewing it would only re-roll'
+        + ' the verdict on the same text',
       proposal,
     }
   }
@@ -702,7 +734,11 @@ export async function runRemediationStep(
     }
   }
 
-  recordRemediation(storage, taskId, `${provenance} proposed=${proposedHash} outcome=adopting`)
+  recordRemediation(
+    storage,
+    taskId,
+    `${provenance} proposed=${proposedHash} fspec=${proposedSpecKey} outcome=adopting`,
+  )
 
   // ── Execute（既存の採用経路。内側で fresh Design Review が必ず走る）───
   const adopt = deps.adopt ?? adoptRoadmapItem

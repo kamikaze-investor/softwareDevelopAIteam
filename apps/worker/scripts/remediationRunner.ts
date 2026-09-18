@@ -85,20 +85,28 @@ export async function runRemediation(input: RemediationRunnerInput): Promise<str
     )
   }
 
-  // `expectJson` により codexAdapter は `--output-last-message` で最終回答を素の JSON として
-  // 取得する。取得できた場合はそれが権威（stdout の narration を再 parse しない）。
-  if (result.parsedOutput !== undefined) {
-    return JSON.stringify(result.parsedOutput)
-  }
-
-  // Claude Code CLI は `--output-format json` の envelope で返す。既存の抽出器を使う
-  // （reviewer と同じ二段階 parse。取り出せなければ fail-closed）。
+  // **Claude の envelope 展開を `parsedOutput` より先に行う。順序が逆だと機能しない。**
+  //
+  // `claudeCodeAdapter` は `--output-format json` を**常に**付けるので stdout は CLI envelope
+  // （`{type:'result', result:'<モデル本文>', ...}`）である。`expectJson` 経路の
+  // `tryParseJson(stdout)` はその envelope を正常な JSON として parse してしまうため、
+  // `parsedOutput` には**envelope そのもの**が入る。先に `parsedOutput` を返すと
+  // `parseRemediationProposal()` が envelope を見て必ず失敗し、**Anthropic 側の
+  // Remediation が構造的に一度も成立しない**（critical load では judge 除外により
+  // Anthropic が選ばれるので、最も危険なケースで必ず失敗することになる）。
+  // `ClaudeReviewerAdapter` も同じ理由で `parsedOutput` を使わず stdout から二段階 parse する。
   if (input.provider === 'claude_code') {
     const innerText = extractClaudeCliResultText(result.stdout)
     if (innerText === undefined) {
       throw new Error('[remediationRunner] Claude CLI の envelope から本文を取り出せませんでした')
     }
     return innerText
+  }
+
+  // `expectJson` により codexAdapter は `--output-last-message` で最終回答を素の JSON として
+  // 取得する。取得できた場合はそれが権威（stdout の narration を再 parse しない）。
+  if (result.parsedOutput !== undefined) {
+    return JSON.stringify(result.parsedOutput)
   }
 
   return result.stdout

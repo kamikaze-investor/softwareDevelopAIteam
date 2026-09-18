@@ -324,33 +324,55 @@ export interface RemediationSpec {
   acceptanceCriteria: readonly string[]
 }
 
-/** 空白の揺れ・大小・順序だけの違いを「別の作業」と誤認しないための正規化。 */
-function canonicalizeSpec(spec: RemediationSpec): string {
+/**
+ * **Review が実際に見る部分だけ**から作る正規化キー。
+ *
+ * 判定の基準は「Review の入力が変わったか」であって「Task の行が変わったか」ではない。
+ * `buildInitialImplementAiCliPrompt()` が組むレビュー対象は
+ * `task.description`（= ledger 本文 + `implementationScope`）と `allowedPaths` 由来の
+ * Design Contract だけで、**`acceptanceCriteria` は1文字も入らない**。
+ *
+ * したがって AC だけを書き換えた提案は、**レビュー対象テキストが byte 単位で同一**になる。
+ * それを「実質的に違う」と扱うと、AC を1行いじるだけで却下済みテキストへの再抽選を
+ * 引けることになる（独立レビュー指摘。この repo では同一入力への判定が実行ごとに
+ * 反転する実測がある → ledger: `independent-review-verdict-instability`）。
+ * **だから AC はキーに含めない。** AC の改善自体は禁止しないが、それだけでは
+ * 「作り直した」ことにならない。
+ *
+ * 空白・大小・宣言順の揺れは正規化する（`allowedPaths` は File Change Guard が集合として
+ * 使うので順序に意味が無い）。
+ */
+export function reviewVisibleSpecKey(
+  spec: Pick<RemediationSpec, 'implementationScope' | 'allowedPaths'>,
+): string {
   const text = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase()
   return JSON.stringify({
     scope: text(spec.implementationScope),
-    // 宣言の順序は意味を持たない（File Change Guard は集合として使う）。
     paths: [...spec.allowedPaths].map(text).sort(),
-    criteria: [...spec.acceptanceCriteria].map(text).sort(),
   })
 }
 
 /**
- * 提案が却下された spec と**実質的に違う**か。
+ * 提案が、**これまでに却下されたどの案とも**レビュー対象として違うか。
  *
  * **prompt の hash では判定できない。** 採用時の `implementationScope` には Remediation の
- * 判断記録が追記されるため、中身が同一でも prompt テキストは必ず変わる。つまり
- * 「submit されるテキストの hash が違う」ことは材料的な違いを1つも保証しない
- * （独立レビュー指摘）。判定材料は Task に保存される3欄そのものにする。
+ * 判断記録が追記されるため、中身が同一でも submit されるテキストの hash は必ず変わる。つまり
+ * 「hash が違う」ことは材料的な違いを1つも保証しない（独立レビュー指摘）。
+ *
+ * **1世代前だけと比べても足りない。** 却下済み集合の全件と比べないと
+ * A → B → A の巡回で A を再提出でき、同じ再抽選になる（同指摘）。
  *
  * これは `repairPolicy` の `requireDifferentApproach` と同じ趣旨だが、あちらは
  * 「同じ失敗が繰り返されたか」を見る。こちらは「提案が変わっていないか」を見る。
+ *
+ * 引数は `reviewVisibleSpecKey()` から導いたキーで受ける。呼び出し側は長さの都合で
+ * その hash を使ってよいが、**キーの作り方（何を見て何を見ないか）は上の関数が正本**である。
  */
 export function isMateriallyDifferentSpec(
-  rejected: RemediationSpec,
-  proposed: RemediationSpec,
+  rejectedKeys: readonly string[],
+  proposedKey: string,
 ): boolean {
-  return canonicalizeSpec(rejected) !== canonicalizeSpec(proposed)
+  return !rejectedKeys.includes(proposedKey)
 }
 
 function stringArray(value: unknown): string[] | undefined {

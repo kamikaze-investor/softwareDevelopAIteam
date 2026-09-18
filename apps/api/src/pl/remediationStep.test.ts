@@ -176,7 +176,7 @@ describe('findRemediationSubject — 対象の判定', () => {
 
     expect(subject?.roadmapId).toBe('conflicted-item')
     expect(subject?.findings[0]?.source).toBe('scope_simplicity')
-    expect(subject?.rejectedDesignTextHashes).toHaveLength(1)
+    expect(subject?.rejectedSpecKeys).toHaveLength(1)
   })
 
   it('Job が1件でもあれば対象外（実行済みの変更と新しい指示を混ぜない）', () => {
@@ -332,21 +332,49 @@ describe('却下済みテキストの再審査を拒否する', () => {
     }))
   })
 
-  it('過去世代で却下された hash も避ける（audit から復元する）', () => {
+  it('AC だけを書き換えた提案は拒否する（Review はそこを見ないため同一テキストになる）', async () => {
+    // `buildInitialImplementAiCliPrompt()` のレビュー対象は description + allowedPaths 由来の
+    // Design Contract だけで、acceptanceCriteria は1文字も入らない。AC 変更を「作り直した」と
+    // 認めると、**byte 単位で同一のテキスト**へ再抽選を引けてしまう。
     const { storage, taskId } = seedConflictedTask()
-    const olderHash = 'a'.repeat(64)
+    const task = storage.tasks.findById(taskId)
+    const acOnly = {
+      ...PROPOSAL,
+      implementationScope: '当初の広い scope',
+      allowedPaths: task?.allowedPaths as string[],
+      acceptanceCriteria: ['まったく別の受入条件を並べる'],
+    }
+    let adopted = false
+
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: true, stdout: JSON.stringify(acOnly), timedOut: false }),
+      },
+      adopt: async () => { adopted = true; throw new Error('must not be reached') },
+    }))
+
+    expect(result.status).toBe('proposal_not_materially_different')
+    expect(adopted).toBe(false)
+  })
+
+  it('過去世代で却下された提案も避ける（audit の fspec= から復元して A→B→A を止める）', () => {
+    const { storage, taskId } = seedConflictedTask()
+    const olderKey = 'deadbeefdeadbeef'
     storage.auditLog.record({
       actor: 'api',
       operation: 'pl_independent_remediation',
       entityType: 'pl_remediation',
       entityId: `remediate:${taskId}`,
       result: 'success',
-      detail: `provider=codex model=gpt-5.6-sol proposed=${olderHash} outcome=adopting`,
+      detail: `provider=codex model=gpt-5.6-sol fspec=${olderKey} outcome=adopting`,
     })
 
     const subject = findRemediationSubject(storage, taskId)
 
-    expect(subject?.rejectedDesignTextHashes).toContain(olderHash)
+    // 現在の Task の spec と、過去世代の fspec の**両方**が却下済み集合に入る。
+    expect(subject?.rejectedSpecKeys).toContain(olderKey)
+    expect(subject?.rejectedSpecKeys).toHaveLength(2)
   })
 })
 

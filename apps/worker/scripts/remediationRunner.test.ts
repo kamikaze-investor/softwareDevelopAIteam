@@ -84,26 +84,38 @@ describe('runRemediation', () => {
     await expect(runRemediation(input())).rejects.toThrow(/block/)
   })
 
-  it('Claude 経路は CLI envelope から本文を取り出す', async () => {
-    adapterReturning({
-      stdout: JSON.stringify({ type: 'result', is_error: false, result: '{"diagnosis":"d"}' }),
-    })
+  /**
+   * **本物の adapter を再現する。** `claudeCodeAdapter` は `--output-format json` を常に付けるので
+   * stdout は CLI envelope であり、`expectJson` 経路の `tryParseJson(stdout)` がその envelope を
+   * 正常な JSON として parse して `parsedOutput` に入れる。
+   *
+   * 以前ここは `parsedOutput` を省いた mock だったため、**production では成立しない経路を
+   * green にしていた**（独立レビュー指摘）。envelope と parsedOutput の両方を返す。
+   */
+  function claudeAdapterReturning(innerText: string, isError = false): void {
+    const envelope = { type: 'result', is_error: isError, result: innerText }
+    adapterReturning({ stdout: JSON.stringify(envelope), parsedOutput: envelope })
+  }
+
+  it('Claude 経路は parsedOutput（= envelope）ではなく envelope 内の本文を返す', async () => {
+    // 順序が逆だと envelope がそのまま提案として扱われ、Anthropic 側の Remediation は
+    // 構造的に一度も成立しない。critical load では judge 除外で Anthropic が選ばれるため、
+    // **最も危険なケースで必ず失敗する**ことになる。
+    claudeAdapterReturning('{"diagnosis":"d"}')
 
     await expect(runRemediation(input({ provider: 'claude_code', model: 'claude-opus-5' })))
       .resolves.toBe('{"diagnosis":"d"}')
   })
 
   it('Claude の envelope が壊れていたら throw する（二段階 parse の両段で fail-closed）', async () => {
-    adapterReturning({ stdout: 'not an envelope' })
+    adapterReturning({ stdout: 'not an envelope', parsedOutput: undefined })
 
     await expect(runRemediation(input({ provider: 'claude_code', model: 'claude-opus-5' })))
       .rejects.toThrow(/envelope/)
   })
 
   it('Claude CLI が自分でエラーを申告していたら本文を採用しない', async () => {
-    adapterReturning({
-      stdout: JSON.stringify({ type: 'result', is_error: true, result: '{"diagnosis":"d"}' }),
-    })
+    claudeAdapterReturning('{"diagnosis":"d"}', true)
 
     await expect(runRemediation(input({ provider: 'claude_code', model: 'claude-opus-5' })))
       .rejects.toThrow(/envelope/)

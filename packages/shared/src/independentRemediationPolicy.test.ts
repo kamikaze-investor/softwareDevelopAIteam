@@ -3,6 +3,7 @@ import {
   FLAGSHIP_REMEDIATION_CANDIDATES,
   extractDesignReviewFindings,
   isMateriallyDifferentSpec,
+  reviewVisibleSpecKey,
   parseRemediationProposal,
   selectRemediationModel,
 } from './independentRemediationPolicy'
@@ -155,37 +156,62 @@ describe('selectRemediationModel', () => {
   })
 })
 
-describe('isMateriallyDifferentSpec', () => {
+describe('reviewVisibleSpecKey', () => {
   const REJECTED = {
     implementationScope: '広い scope',
     allowedPaths: ['apps/api/src', 'packages/shared/src'],
-    acceptanceCriteria: ['typecheck が通る', 'test が通る'],
   }
 
-  it('同一の spec は「違う」と言わない', () => {
-    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED })).toBe(false)
-  })
-
-  it('空白・大小・宣言順の違いだけでは「違う」と言わない', () => {
-    // **ここが hash 比較では守れない部分。** 表現だけ変えた実質無変更の提案を、
-    // 判定の揺れを狙った再提出として拒否できなければならない。
-    expect(isMateriallyDifferentSpec(REJECTED, {
+  it('空白・大小・宣言順の違いは同じキーになる', () => {
+    // 表現だけ変えた実質無変更の提案を、判定の揺れを狙った再提出として拒否するため。
+    expect(reviewVisibleSpecKey({
       implementationScope: '  広い   SCOPE ',
       allowedPaths: ['packages/shared/src', 'APPS/API/SRC'],
-      acceptanceCriteria: ['test が通る', 'typecheck が通る'],
-    })).toBe(false)
+    })).toBe(reviewVisibleSpecKey(REJECTED))
   })
 
-  it('scope / allowedPaths / acceptanceCriteria のどれかが変われば「違う」', () => {
-    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED, implementationScope: '狭い scope' })).toBe(true)
-    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED, allowedPaths: ['apps/api/src/storage'] })).toBe(true)
-    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED, acceptanceCriteria: ['別の条件'] })).toBe(true)
+  it('**acceptanceCriteria はキーに入らない**（Review が見ないため）', () => {
+    // `buildInitialImplementAiCliPrompt()` のレビュー対象は description + allowedPaths 由来の
+    // Design Contract だけで、AC は1文字も入らない。AC だけ変えた提案を「違う」と扱うと、
+    // **byte 単位で同一のテキストへの再抽選**を引けてしまう。
+    const withCriteria = { ...REJECTED, acceptanceCriteria: ['まったく別の受入条件'] }
+
+    expect(reviewVisibleSpecKey(withCriteria)).toBe(reviewVisibleSpecKey(REJECTED))
   })
 
-  it('scope 未指定だった Task からの変更も検出できる', () => {
-    const noScope = { ...REJECTED, implementationScope: '' }
+  it('scope / allowedPaths が変われば別のキーになる', () => {
+    expect(reviewVisibleSpecKey({ ...REJECTED, implementationScope: '狭い scope' }))
+      .not.toBe(reviewVisibleSpecKey(REJECTED))
+    expect(reviewVisibleSpecKey({ ...REJECTED, allowedPaths: ['apps/api/src/storage'] }))
+      .not.toBe(reviewVisibleSpecKey(REJECTED))
+  })
 
-    expect(isMateriallyDifferentSpec(noScope, { ...REJECTED, implementationScope: '明示した scope' })).toBe(true)
+  it('scope 未指定だった Task からの変更も別のキーになる', () => {
+    expect(reviewVisibleSpecKey({ ...REJECTED, implementationScope: '' }))
+      .not.toBe(reviewVisibleSpecKey(REJECTED))
+  })
+})
+
+describe('isMateriallyDifferentSpec', () => {
+  const A = reviewVisibleSpecKey({ implementationScope: 'A', allowedPaths: ['apps/api/src'] })
+  const B = reviewVisibleSpecKey({ implementationScope: 'B', allowedPaths: ['apps/api/src'] })
+  const C = reviewVisibleSpecKey({ implementationScope: 'C', allowedPaths: ['apps/api/src'] })
+
+  it('却下済みのどれとも違えば true', () => {
+    expect(isMateriallyDifferentSpec([A, B], C)).toBe(true)
+  })
+
+  it('直前の却下案と同じなら false', () => {
+    expect(isMateriallyDifferentSpec([A], A)).toBe(false)
+  })
+
+  it('**A → B → A の巡回を止める**（全件と比べる。直前だけでは足りない）', () => {
+    // 直前（B）とだけ比べていると A を再提出でき、同じ再抽選になる。
+    expect(isMateriallyDifferentSpec([A, B], A)).toBe(false)
+  })
+
+  it('却下履歴が空なら常に true（初回）', () => {
+    expect(isMateriallyDifferentSpec([], A)).toBe(true)
   })
 })
 

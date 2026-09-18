@@ -359,6 +359,8 @@ async function remediateConflict(
   if (item.taskId === undefined) return undefined
 
   const run = deps.remediate ?? runRemediationStep
+  // 呼び出し前の試行数。例外時に**二重計上しない**ための基準にする。
+  const attemptsBefore = countRemediationAttempts(storage, item.taskId)
   let result: Awaited<ReturnType<typeof runRemediationStep>>
   try {
     result = await run(storage, item.taskId, {
@@ -368,8 +370,14 @@ async function remediateConflict(
     const message = error instanceof Error ? error.message : String(error)
     // **例外も Remediation の試行として数える。** PL target 側だけに記録すると
     // `countRemediationAttempts()` が 0 のままで対象から外れず、再現する例外
-    // （runner の spawn 失敗等）を毎 tick 繰り返す（独立レビュー指摘）。
-    recordRemediationFailure(storage, item.taskId, 'outcome=exception')
+    // （runner の spawn 失敗等）を毎 tick 繰り返す。
+    //
+    // ただし **step 側が既にこの試行を計上していたら足さない。** step は採用を await する前に
+    // `outcome=adopting` を記録するので、採用が throw すると1回の論理試行で2行になり、
+    // **上限2に対して transient な例外1回で予算が尽きる**（独立レビュー指摘）。
+    if (countRemediationAttempts(storage, item.taskId) === attemptsBefore) {
+      recordRemediationFailure(storage, item.taskId, 'outcome=exception')
+    }
     record(storage, key, 'diagnosis_failed', `remediation=error ${message}`)
     return { status: 'diagnosis_failed', reason: message, attempt: 1 }
   }

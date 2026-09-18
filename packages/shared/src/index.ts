@@ -65,6 +65,7 @@ export {
   FLAGSHIP_REMEDIATION_CANDIDATES,
   extractDesignReviewFindings,
   isMateriallyDifferentSpec,
+  reviewVisibleSpecKey,
   parseRemediationProposal,
   selectRemediationModel,
 } from './independentRemediationPolicy'

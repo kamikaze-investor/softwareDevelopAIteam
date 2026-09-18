@@ -7,7 +7,11 @@ import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import { resetPlLoopInFlightForTest, runPlTick, type PlLoopDeps } from './executionLoop'
-import { PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import {
+  countRemediationAttempts,
+  PL_MAX_REMEDIATION_ATTEMPTS,
+  recordRemediationFailure,
+} from './remediationStep'
 
 /**
  * PL ループ側の配線だけを固定する。Remediation の中身は `remediationStep.test.ts`。
@@ -246,5 +250,24 @@ describe('PL tick — Design Review CONFLICT の配線', () => {
         .findByEntity('pl_loop_target', `task_ready_without_job:${taskId}`)
         .some((entry) => entry.result === 'diagnosis_failed'),
     ).toBe(true)
+    // 予算は1消費される（再現する例外を毎 tick 繰り返さないため）。
+    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+  })
+
+  it('**step が既に計上した試行を二重計上しない**（1例外で予算を使い切らせない）', async () => {
+    // step は採用を await する前に `outcome=adopting` を記録する。採用が throw すると
+    // 1回の論理試行で2行になり、上限2に対して transient な例外1回で予算が尽きる。
+    const { storage, taskId } = seedConflicted()
+
+    const result = await runPlTick(storage, deps({
+      remediate: async (s, id) => {
+        // step 側が試行を記録したうえで throw する状況を再現する。
+        recordRemediationFailure(s, id, 'outcome=adopting')
+        throw new Error('adoption threw after the attempt was recorded')
+      },
+    }))
+
+    expect(result.status).toBe('diagnosis_failed')
+    expect(countRemediationAttempts(storage, taskId)).toBe(1)
   })
 })
