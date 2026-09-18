@@ -930,6 +930,23 @@ export interface IPrincipleApplicationStorage {
    * reviewer / provider はここへ保存していないので、必要なら review_run_id から引く。
    */
   findDisagreements(query?: PrincipleAggregateQuery): PrincipleDisagreementRow[]
+  /**
+   * Reviewer disagreement 率の**分子と分母を一緒に**返す（2026-09-18 追加）。
+   *
+   * `comparisons` は「同一 run・同一 subject・同一原則・同一版を 2 stage 以上が判定した」組の数、
+   * `disagreements` はそのうち判定が割れた数で、`findDisagreements()` の件数と必ず一致する。
+   * 分母を適用総数にすると、片側の stage しか判定していない行まで数えて率が実態より低く出るため、
+   * 呼び出し側が分母を組み立て直せないようにここで返す。
+   */
+  countStageComparisons(
+    query?: PrincipleAggregateQuery,
+    /**
+     * 指定すると、**この原則 id → 版 hash に一致する組だけ**を数える。
+     * センサーは現在の版の行だけで閾値を判断するので、率の母集団もそこへ揃える必要がある
+     * （揃えないと「100 件の内訳」と「不一致率」が別の集合を指す。独立レビュー指摘 2026-09-18）。
+     */
+    currentVersions?: Readonly<Record<string, string>>,
+  ): { comparisons: number; disagreements: number }
 }
 
 export interface IWatchdogEventStorage {
