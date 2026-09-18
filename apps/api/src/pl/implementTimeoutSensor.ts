@@ -65,7 +65,7 @@ export const IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS = {
 } as const
 
 export interface ImplementTimeoutFinding {
-  sensorId: 'implement-timeout-still-kills-working-jobs'
+  sensorId: 'implement-timeout-discards-produced-work'
     | 'implement-timeout-rate-too-high'
     | 'implement-p95-approaching-timeout'
   /** 重複排除の鍵に混ぜる識別子（job id か、判定時点の timeout 値）。 */
@@ -132,7 +132,7 @@ export function evaluateImplementTimeoutSensors(
     if (!killedInsideCurrentBudget(job) || !hasChangedFiles(job)) continue
     const seconds = durationSeconds(job)!
     findings.push({
-      sensorId: 'implement-timeout-still-kills-working-jobs',
+      sensorId: 'implement-timeout-discards-produced-work',
       scope: job.id,
       // **言えることだけを書く。** `changedFiles` は「変更を作っていた」ことを示すが、
       // 打ち切られた瞬間も進んでいたかどうかは、この行からは分からない（独立レビュー指摘）。

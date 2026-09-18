@@ -66,7 +66,7 @@ describe('evaluateImplementTimeoutSensors', () => {
   // ── A ────────────────────────────────────────────────────────
   it('A: 現在の budget を使い切って作業中だった Job は 1 件でも発火する', () => {
     const findings = evaluateImplementTimeoutSensors([killedWhileWorking(900)], T)
-    const a = findings.filter((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')
+    const a = findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')
     expect(a).toHaveLength(1)
     expect(a[0].evidence).toMatchObject({ durationSeconds: 900, timeoutSeconds: 900 })
   })
@@ -75,7 +75,7 @@ describe('evaluateImplementTimeoutSensors', () => {
   // 新しい値の評価ではなく歴史の再掲になってしまう。
   it('A: 旧 300s 時代の timeout 記録では発火しない', () => {
     const findings = evaluateImplementTimeoutSensors([killedWhileWorking(304)], T)
-    expect(findings.filter((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs'))
+    expect(findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work'))
       .toHaveLength(0)
   })
 
@@ -87,7 +87,7 @@ describe('evaluateImplementTimeoutSensors', () => {
       failureMetadata: { kind: 'provider_timeout' },
     } as Partial<Job>)
     expect(evaluateImplementTimeoutSensors([noWork], T)
-      .filter((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')).toHaveLength(0)
+      .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 
   // ── B ────────────────────────────────────────────────────────
@@ -156,7 +156,7 @@ describe('evaluateImplementTimeoutSensors', () => {
       killedWhileWorking(900),  // WINDOW の外
     ]
     expect(evaluateImplementTimeoutSensors(jobs, T)
-      .filter((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')).toHaveLength(0)
+      .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 })
 
@@ -208,11 +208,11 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     createTimedOutJob(storage, taskId, 900)
 
     const first = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
-    expect(first.filter((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')).toHaveLength(1)
+    expect(first.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(1)
 
     // 同じ tick が何度回っても、同じ候補を作り直さない。
     const second = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
-    expect(second.filter((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')).toHaveLength(0)
+    expect(second.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 
   // **B は budget ごとに 1 度だけ。** そして budget を変えたら、
@@ -288,7 +288,36 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     }
 
     const fired = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
-    expect(fired.some((f) => f.sensorId === 'implement-timeout-still-kills-working-jobs')).toBe(true)
+    expect(fired.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(true)
+  })
+
+  // **未完了の Job に窓を食い潰させない。**
+  // queued 行は並べ替えの基準に created_at しか持たないので、新しく作られた queued が
+  // 大量にあると LIMIT の内側を占め、今日落ちた本物の timeout を押し出してしまう
+  // （production には 7〜20 日 queued のままの Job が 3 件実在する）。独立レビュー指摘。
+  it('新しく作られた queued Job は、完了済みの timeout 証拠を窓から押し出さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const taskId = seed(storage)
+
+    // 今日 900s で落ちた本物の証拠を 1 件。
+    createTimedOutJob(storage, taskId, 900)
+
+    // そのあとに、WINDOW を超える数の queued を作る（完了していない）。
+    for (let i = 0; i < IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW + 5; i++) {
+      storage.jobs.create({
+        taskId,
+        projectId: storage.tasks.findById(taskId)!.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'implement',
+      } as never)
+    }
+
+    const fired = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
+    expect(fired.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(true)
   })
 
   it('entity id は sensorId と scope だけで決まる', () => {

@@ -1349,13 +1349,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return rows.map(deserializeJob)
     },
     findRecentAiCliJobs({ provider, mode, limit }) {
-      // **「直近」は作成順ではなく結果が出た順である。** timeout 率や p95 は
-      // 「最近終わった Job」に対する指標であり、作成順で切ると、
-      // 長く queued に積まれてから今日走って落ちた Job が窓から外れてしまう
-      // （production には 7〜20 日 queued のままの Job が実在する）。独立レビュー指摘。
+      // **窓は「完了した Job」だけで作る。** timeout 率も p95 も終わった Job に対する指標で、
+      // まだ終わっていない Job は分子にも分母にも入れようがない。
+      //
+      // ここで `completed_at IS NOT NULL` を要求しないと、**未完了の行が窓を食い潰す**:
+      // 完了していない行は並べ替えの基準に created_at しか持たないので、新しく作られた
+      // queued が大量にあると LIMIT の内側を占め、今日落ちた本物の timeout が
+      // 窓の外へ押し出されて A/B が発火しない（独立レビュー指摘）。
+      // production には 7〜20 日 queued のままの Job が実在するため、机上の話ではない。
       const rows = db.prepare(
         'SELECT * FROM jobs WHERE ai_cli_provider = ? AND ai_cli_mode = ? '
-        + 'ORDER BY COALESCE(completed_at, started_at, created_at) DESC, rowid DESC LIMIT ?',
+        + 'AND completed_at IS NOT NULL '
+        + 'ORDER BY completed_at DESC, rowid DESC LIMIT ?',
       ).all(provider, mode, Math.max(1, Math.min(500, Math.trunc(limit)))) as any[]
       return rows.map(deserializeJob)
     },
