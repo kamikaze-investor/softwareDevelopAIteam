@@ -54,6 +54,11 @@ async function seedBlockedTaskWithoutJob(app: FastifyInstance): Promise<string> 
   })
   const taskId = (JSON.parse(task.body) as { id: string }).id
 
+  // `roadmapActive` は公開 API から設定できない（ロードマップ同期の専管）。
+  // 再投入が意味を持つのは自律ループから到達できる Task だけなので、採用済みの形にしておく。
+  const { getStorage } = await import('../storage/index.js')
+  getStorage().tasks.update(taskId, { roadmapActive: true })
+
   // pending -> blocked は従来どおり通る（閉じたのは blocked から**出る**方向だけ）。
   const blocked = await app.inject({
     method: 'PATCH',

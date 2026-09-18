@@ -271,6 +271,17 @@ export interface ITaskStorage {
    * 場所ごとに別の park 判定を作ると、片方だけが park を尊重する状態になる。
    */
   isParked(taskId: string): boolean
+  /**
+   * Human Recovery の確定操作。**`blocked` → `pending` と audit 行を1 transaction で書く。**
+   *
+   * 2つに分けてはならない。update だけが成功して audit が落ちると、**記録の無い復旧**が
+   * 残る —— それはこの機能が塞ぐと言っている穴そのものである（独立レビュー指摘・2026-09-18）。
+   *
+   * 政策判定（Job 0 件か / park 済みか / 同一 design text の再投入か 等）は呼び出し側
+   * `recoverBlockedTask()` が持つ。ここは**確定の瞬間にもう一度 `blocked` であることだけ**を
+   * 再確認する（判定から確定までの間に状態が変わっていないことの保証）。
+   */
+  recoverFromBlocked(input: { taskId: string; detail: string }): { ok: true; task: Task } | { ok: false; reason: string }
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   /**
