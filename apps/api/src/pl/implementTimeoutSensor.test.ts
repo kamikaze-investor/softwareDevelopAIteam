@@ -307,6 +307,47 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
   })
 
   // budget を元へ戻した場合、epoch 行がもう 1 行積まれて新しい起点になる。
+  // **壊れた epoch で無言停止しない。** 未来日付の epoch を信じると
+  // `startedAt >= epoch` がどの Job でも偽になり、A/B が黙る。
+  // センサーが黙ることは「異常が無い」と区別が付かないので、張り直す。
+  it('未来日付の epoch は信用せず、張り直して以後の証拠を拾えるようにする', () => {
+    const storage = createSQLiteStorage(':memory:')
+
+    // 壊れた（未来の）epoch 行を直接置く。
+    storage.auditLog.record({
+      actor: 'api',
+      operation: 'implement_timeout_policy_epoch_started',
+      entityType: 'implement_timeout_policy_epoch',
+      entityId: 'current',
+      result: 'started',
+      detail: JSON.stringify({
+        timeoutMs: CLAUDE_IMPLEMENT_TIMEOUT_MS,
+        effectiveFrom: '9999-01-01T00:00:00.000Z',
+      }),
+    })
+
+    const epoch = ensureImplementTimeoutPolicyEpoch(
+      storage, CLAUDE_IMPLEMENT_TIMEOUT_MS, () => EPOCH,
+    )
+    expect(epoch).not.toBe('9999-01-01T00:00:00.000Z')
+    expect(epoch).toBe(EPOCH)
+  })
+
+  it('解釈できない effectiveFrom も張り直す', () => {
+    const storage = createSQLiteStorage(':memory:')
+    storage.auditLog.record({
+      actor: 'api',
+      operation: 'implement_timeout_policy_epoch_started',
+      entityType: 'implement_timeout_policy_epoch',
+      entityId: 'current',
+      result: 'started',
+      detail: JSON.stringify({ timeoutMs: CLAUDE_IMPLEMENT_TIMEOUT_MS, effectiveFrom: 'not a date' }),
+    })
+
+    expect(ensureImplementTimeoutPolicyEpoch(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS, () => EPOCH))
+      .toBe(EPOCH)
+  })
+
   it('budget を戻したときは新しい epoch が始まる', () => {
     const storage = createSQLiteStorage(':memory:')
     const first = ensureImplementTimeoutPolicyEpoch(storage, 900_000, () => EPOCH)

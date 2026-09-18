@@ -104,14 +104,34 @@ function hasChangedFiles(job: Job): boolean {
  *
  * ## 代わりに何を根拠にするか
  *
- * **「その budget が有効になった時刻」を記録し、それ以降に完了した Job だけを見る。**
+ * **「その budget が有効になった時刻」を記録し、それ以降に開始した Job だけを見る。**
  * 新しい表は作らず、既存 `audit_log` に 1 行だけ置く。値が変わったときにだけ追記するので、
  * 900 -> 1000 -> 900 と戻した場合も 3 行目が入り、最後の行が現在の epoch になる。
  *
- * **限界**: 初回はこの関数が呼ばれた瞬間が epoch になるので、**それ以前の Job は
+ * **限界 1**: 初回はこの関数が呼ばれた瞬間が epoch になるので、**それ以前の Job は
  * どの budget で走ったか分からないまま除外される**。過去を遡って regime を復元はしない
  * （Job 行に budget が残っていない以上、復元する根拠が無い）。
+ *
+ * **限界 2**: 「どれが最新の epoch 行か」は `audit_log` の `created_at` 順に依存する。
+ * **システム時計が巻き戻ると壊れる**: 新しい行が古い行より前に並び、毎 tick 新しい
+ * epoch 行を追記し続けて `effectiveFrom` が前へ動き、時計が追いつくまで A/B の証拠を
+ * 取りこぼす（独立レビュー指摘）。**時計の単調性は前提であって、ここで保証はしていない。**
+ * 巻き戻りを検知・補正する仕組みは作っていない（それ自体が別の機構になるため）。
+ * 症状は「epoch 行が毎 tick 増える」ことなので、audit を見れば気付ける。
  */
+/**
+ * 記録済みの epoch を使ってよいか。使えないなら undefined。
+ *
+ * 弾くのは 2 つだけで、**内容の良し悪しは判断しない**:
+ * - `Date` として解釈できない文字列
+ * - **未来の時刻**。未来の epoch は「どの Job も対象外」を意味し、センサーを無言で止める
+ */
+function usableEpoch(candidate: string, now: () => string): string | undefined {
+  const parsed = Date.parse(candidate)
+  if (Number.isNaN(parsed)) return undefined
+  return parsed > Date.parse(now()) ? undefined : candidate
+}
+
 export function ensureImplementTimeoutPolicyEpoch(
   storage: IStorage,
   timeoutMs: number,
@@ -136,9 +156,13 @@ export function ensureImplementTimeoutPolicyEpoch(
     if (previousTimeoutMs === timeoutMs) {
       // **起点は detail の `effectiveFrom` を正とする。** 監査行の `createdAt` は
       // 行が書かれた時刻であって「その budget がいつから有効か」ではない。
-      // 同じ値を記録し直さない以上、両者は実質同じだが、
-      // 起点をデータとして持っておく方が読み手にも試験にも曖昧さが無い。
-      return previousEffectiveFrom ?? latest.createdAt
+      //
+      // ただし**壊れた値を黙って信じない**。未来日付や解釈できない文字列をそのまま返すと、
+      // `startedAt >= epoch` がどの Job に対しても偽になり、**A/B が無言で止まる**
+      // （独立レビュー指摘）。センサーが黙ることは、異常が無いことと区別が付かない。
+      // 読めない・信じられないときは epoch を張り直して、以後の証拠を拾えるようにする。
+      const usable = usableEpoch(previousEffectiveFrom ?? latest.createdAt, now)
+      if (usable !== undefined) return usable
     }
   }
 
@@ -168,7 +192,7 @@ export function percentile(values: readonly number[], p: number): number | undef
 /**
  * 判定本体（純関数）。`jobs` は完了が新しい順で渡す。
  *
- * `policyEpochStart` 以降に**完了した** Job だけが、現在の budget 下で走ったと確定できる。
+ * `policyEpochStart` 以降に**開始した** Job だけが、現在の budget 下で走ったと確定できる。
  * `undefined` を渡した場合は epoch で絞らない（テスト用）。
  */
 export function evaluateImplementTimeoutSensors(
@@ -233,7 +257,7 @@ export function evaluateImplementTimeoutSensors(
       },
       thresholdNote:
         `provider_timeout（= 渡した timeoutMs のタイマーが発火して kill された）かつ`
-        + ` changedFiles あり、かつ現在の budget が有効になった後に完了した Job。`
+        + ` changedFiles あり、かつ現在の budget が有効になった後に**開始**した Job。`
         + ` 1 件でも再評価対象（CEO 指示・2026-09-18）。`,
     })
   }
@@ -281,16 +305,20 @@ export function evaluateImplementTimeoutSensors(
   //
   // - 旧 policy 下の成功 Job も**そのまま残して数える**。成功した Job の所要時間は
   //   budget に打ち切られていない実測値なので、どの policy 下でも有効な標本である
-  // - 今回の 300s -> 900s のような**拡大**の局面では、旧成功（すべて 300s 未満）を
-  //   含めても p95 が**上がることはない**。つまり発火を早める方向には働かず、
-  //   移行期は保守的側に倒れる
-  //   （**「必ず下がる」ではない。** 分位点は順序統計量なので、下位に標本が増えても
-  //   選ばれる値が変わらないことがある。25 件の 600s に 200s を 1 件足しても p95 は 600s
-  //   のままである —— 独立レビュー指摘。正しい主張は「非増加」であって「必ず低下」ではない）
-  // - **ただしこれは「経過時間から policy regime を正確に特定できる」という主張ではない。**
-  //   C が安全なのは「拡大の局面では混入が発火を遅らせるだけ」という**方向の議論**であって、
-  //   任意の policy 変更（とくに budget を縮める変更）に対して regime を言い当てられる
-  //   わけではない。budget を縮めるときは、ここの前提が反転することを確認すること
+  // - **旧成功を混ぜても p95 が上がらない、とは言えない。** 分位点は順序統計量なので、
+  //   下位に標本が増えると選ばれる位置がずれて**上がることがある**:
+  //   現在の成功 25 件が 100s、旧成功 25 件が 230s なら、p95 は 100s から 230s へ上がる
+  //   （独立レビュー指摘。この例は実際に計算して確かめた）。
+  //   ここまでに「必ず下がる」「非増加」と 2 度書いたが、**どちらも誤り**である
+  // - 言えるのは**もっと狭いこと**だけである: **発火閾値（budget の 60%）を下回る標本を
+  //   足しても、p95 が閾値を跨いで上へ抜けることはない。**
+  //   下に k 件足すと分位点の添字は約 0.95k しか進まないのに、閾値以上の塊はちょうど k だけ
+  //   後ろへ押し出されるので、選択位置は塊から**さらに離れる**。
+  //   旧 budget 300s 下の成功はすべて 300s 未満 = 540s 未満なので、この条件に当てはまる
+  // - **これは「経過時間から policy regime を特定できる」という主張ではない。**
+  //   上の議論は「閾値より下の標本を足す」という**今回の拡大に固有の条件**に依存している。
+  //   budget を縮める変更では旧成功が閾値を上回りうるので、前提ごと崩れる。
+  //   **そのときは C にも epoch を掛けるかどうかを測り直すこと**
   const successSeconds = window
     .filter((job) => job.status === 'success')
     .map(durationSeconds)
