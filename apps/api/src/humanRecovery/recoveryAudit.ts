@@ -15,11 +15,21 @@ import type { IStorage } from '../storage/interface'
 export const HUMAN_RECOVERY_AUDIT_OPERATION = 'task_human_recovered'
 export const HUMAN_RECOVERY_AUDIT_ENTITY_TYPE = 'task'
 
-/** その Task に対して成功した Human Recovery の件数。 */
-export function countHumanRecoveryAttempts(storage: IStorage, taskId: string): number {
+/**
+ * 直近に成功した Human Recovery の audit 行 id。まだ無ければ `undefined`。
+ *
+ * **回数を数えない。** CEO 決定（2026-09-18）は Human Recovery について
+ * 「新しい attempt counter / table / 数字を追加しない」と定めている。
+ * エピソードの識別に必要なのは「前回の再投入を指す安定した値」だけで、通し番号ではない ——
+ * 既存 audit 行の id がちょうどそれである（再投入のたびに新しい行が1つ増え、
+ * 次の再投入まで変わらない）。
+ *
+ * `findByEntity()` は `created_at DESC, rowid DESC` で返すので先頭が最新である。
+ */
+export function latestHumanRecoveryId(storage: IStorage, taskId: string): string | undefined {
   return storage.auditLog
     .findByEntity(HUMAN_RECOVERY_AUDIT_ENTITY_TYPE, taskId)
-    .filter((entry) =>
+    .find((entry) =>
       entry.operation === HUMAN_RECOVERY_AUDIT_OPERATION && entry.result === 'success')
-    .length
+    ?.id
 }

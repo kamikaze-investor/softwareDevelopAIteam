@@ -67,10 +67,10 @@
  */
 
 import type { IStorage } from '../storage/interface'
-import { countHumanRecoveryAttempts } from './recoveryAudit'
+import { latestHumanRecoveryId } from './recoveryAudit'
 import type { Task } from '@ai-team/shared'
 
-export { countHumanRecoveryAttempts } from './recoveryAudit'
+export { latestHumanRecoveryId } from './recoveryAudit'
 import {
   countRemediationAttempts,
   findRemediationSubject,
@@ -130,7 +130,10 @@ import {
  * ここに生涯上限を置くと、上限に達した Task は**訂正版の spec を適用する経路ごと失われる**。
  * 「N 回を超えたら二度と復旧不能」にすることは目的ではない。
  *
- * 回数は**数えて返すが、門にはしない**（`attempt`）。連打の有無は audit から後で数えられる。
+ * **回数は数えない。** CEO 決定は「新しい attempt counter / table / 数字を追加しない」ことも
+ * 求めている。エピソードの識別に要るのは通し番号ではなく「前回の再投入を指す安定した値」で、
+ * 既存 audit 行の id がそれを満たす（`latestHumanRecoveryId()`）。連打の有無を後から数えたい
+ * ときは audit 行を数えればよく、実装が番号を持つ必要は無い。
  */
 
 
@@ -158,8 +161,6 @@ export type RecoverBlockedTaskResult =
     ok: true
     taskId: string
     task: Task
-    /** 今回が何回目の Human Recovery か（1 起算）。 */
-    attempt: number
     nextDriver: HumanRecoveryNextDriver
   }
   | {
@@ -308,15 +309,11 @@ export function recoverBlockedTask(
   //   `design-review-rejections-are-not-durably-recorded`
   const generation = currentDesignGeneration(storage, task.id)
 
-  // 回数は記録と報告のためだけに数える。**門にはしない**（上の「試行の有界性」参照）。
-  const priorAttempts = countHumanRecoveryAttempts(storage, task.id)
-
   // ── ここから状態を変える（遷移と audit は1 transaction）───────────────
   const committed = storage.tasks.recoverFromBlocked({
     taskId: task.id,
     detail:
-      `blocked -> pending by human recovery (attempt ${priorAttempts + 1}, `
-      + `${generationTag(generation)}): ${input.reason}`,
+      `blocked -> pending by human recovery (${generationTag(generation)}): ${input.reason}`,
   })
   if (!committed.ok) {
     return { ok: false, code: 'RECOVERY_FAILED', reason: committed.reason }
@@ -326,7 +323,6 @@ export function recoverBlockedTask(
     ok: true,
     taskId: task.id,
     task: committed.task,
-    attempt: priorAttempts + 1,
     // 遷移**後**の状態で判定する（`findRemediationSubject()` は `pending` を要求する）。
     nextDriver: resolveNextDriver(storage, task.id, project.status === 'running'),
   }

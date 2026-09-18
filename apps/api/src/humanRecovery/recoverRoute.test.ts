@@ -90,8 +90,10 @@ describe('POST /api/tasks/:id/recover', () => {
       })
 
       expect(res.statusCode).toBe(200)
-      const body = JSON.parse(res.body) as { ok: boolean; attempt: number; nextDriver: string; task: Task }
-      expect(body).toMatchObject({ ok: true, attempt: 1, nextDriver: 'attention_only' })
+      const body = JSON.parse(res.body) as { ok: boolean; nextDriver: string; task: Task }
+      expect(body).toMatchObject({ ok: true, nextDriver: 'attention_only' })
+      // **通し番号は返さない**（CEO 決定: 新しい attempt counter / 数字を作らない）。
+      expect(body).not.toHaveProperty('attempt')
       expect(body.task.status).toBe('pending')
     })
   })

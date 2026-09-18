@@ -28,7 +28,7 @@ import {
   PL_MAX_REMEDIATION_ATTEMPTS,
   recordRemediationFailure,
 } from '../pl/remediationStep'
-import { countHumanRecoveryAttempts, recoverBlockedTask } from './recoverBlockedTask'
+import { latestHumanRecoveryId, recoverBlockedTask } from './recoverBlockedTask'
 
 interface Seeded {
   storage: IStorage
@@ -216,13 +216,13 @@ describe('recoverBlockedTask — audit と有界性', () => {
 
     recoverBlockedTask(storage, { taskId, reason: 'r' })
 
-    expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
   })
 
   it('続けて2回は叩けない（入口条件が idempotency guard になっている）', () => {
     const { storage, taskId } = seed()
 
-    expect(recoverBlockedTask(storage, { taskId, reason: '1' })).toMatchObject({ ok: true, attempt: 1 })
+    expect(recoverBlockedTask(storage, { taskId, reason: '1' })).toMatchObject({ ok: true })
     expect(recoverBlockedTask(storage, { taskId, reason: '2' }))
       .toMatchObject({ ok: false, code: 'TASK_NOT_BLOCKED' })
   })
@@ -243,7 +243,7 @@ describe('recoverBlockedTask — audit と有界性', () => {
     storage.tasks.update(taskId, { status: 'blocked' })
 
     const again = recoverBlockedTask(storage, { taskId, reason: '2回目' })
-    expect(again).toMatchObject({ ok: true, attempt: 2 })
+    expect(again).toMatchObject({ ok: true })
     expect(storage.tasks.findById(taskId)?.status).toBe('pending')
   })
 
@@ -361,7 +361,7 @@ describe('遷移と audit は分割できない', () => {
 
     storage.auditLog.record = original
     expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
-    expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
   })
 })
 
@@ -409,7 +409,7 @@ describe('Human Recovery は AI/PL から到達できない（CEO 決定・2026-
     // **状態遷移が起きていない。**
     expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
     // **human recovery の audit も書かれていない。**
-    expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
   })
 
   it('**本当に recover 可能な Task でも、PL tick は復旧させない**', async () => {
@@ -437,7 +437,7 @@ describe('Human Recovery は AI/PL から到達できない（CEO 決定・2026-
     expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
     expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
     // 人が呼んだ1回ぶんだけが記録されており、PL の分は増えていない。
-    expect(countHumanRecoveryAttempts(storage, taskId)).toBe(1)
+    expect(latestHumanRecoveryId(storage, taskId)).toBeDefined()
   })
 
   it('**Human Recovery 自体は後段 Approval の証拠にならない。** ApprovalRequest を作らない', () => {

@@ -17,7 +17,7 @@
 
 import { occupiesProject } from '@ai-team/shared'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
-import { countHumanRecoveryAttempts } from '../humanRecovery/recoveryAudit'
+import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import type { IStorage } from '../storage/interface'
 import type { Job, Task, Project } from '@ai-team/shared'
 
@@ -466,8 +466,10 @@ export function buildSystemState(
           // `targetKeyOf()` は referenceId を優先し、`hasEscalated()` はそのキーで
           // 生涯にわたり重複通知を抑止する。taskId だけだと、再投入して**もう一度**この
           // dead state に落ちたとき CEO へ二度と通知されない（独立レビュー指摘・2026-09-18）。
-          // 復旧回数はエピソード内で不変、次のエピソードで必ず増えるので識別子に適する。
-          referenceId: `${task.id}:r${countHumanRecoveryAttempts(storage, task.id)}`,
+          // 直近の再投入 audit 行の id を使う。**通し番号は作らない**（CEO 決定）——
+          // 必要なのは「前回の再投入を指す安定した値」だけで、エピソード内で不変、
+          // 次の再投入で必ず変わるという性質は既存の行 id がそのまま満たす。
+          referenceId: `${task.id}:${latestHumanRecoveryId(storage, task.id) ?? 'first'}`,
           detail:
             'task is blocked but has no job at all; no resume, retry or remediation path can reach it '
             + 'without an explicit human recovery',
