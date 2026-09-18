@@ -8176,40 +8176,35 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       その場合は構造化報告を添えて CEO へ渡す。
 
 
-<!-- roadmap:id=adoption-path-has-no-material-difference-check state=deferred -->
-8. [ ] **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる** —
-      2026-09-18登録（独立レビュー round 2 指摘）。**本項目は Finding であり、まだ実装しない。**
+<!-- roadmap:id=adoption-path-has-no-material-difference-check state=done -->
+8. [x] **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる** —
+      2026-09-18 登録・同日修正（`human-recovery-zero-job-blocked-task` の一部として実装）。
 
       **事象**: `POST /api/projects/:id/roadmap-adoptions` は、対象 Task が `pending` かつ Job 0 件で
       あれば spec を更新し、`ensureInitialWorkflowsForActiveTasks()` 経由で **fresh Design Review を
-      起こす**。このとき `isMateriallyDifferentSpec()` 相当の検査は**通らない**。
-      CONFLICT でも Task は `pending` のまま残り、採用 API は成功を返す。
+      起こす**。このとき `isMateriallyDifferentSpec()` 相当の検査は**通らなかった**。
+      同一の implementationScope / allowedPaths を繰り返し採用し直すだけで、同じ design text に
+      対する Review を何度でも引けたため、判定の揺れ
+      （`independent-review-verdict-instability`）で CONFLICT を洗浄しうる経路だった。
 
-      したがって **同一の implementationScope / allowedPaths を繰り返し採用し直すだけで、
-      同じ design text に対する Design Review を何度でも引き直せる**。この repo では同一入力に
-      対する判定が実行ごとに反転することが実測されている
-      （`independent-review-verdict-instability`）ため、これは
-      **判定の揺れを使って CONFLICT を洗浄する経路**になりうる。
+      **修正**: 採用時、対象 Task に**却下済みの spec が既に在る場合に限り**、提案が却下済みの
+      どれとも review-visible に違うことを **Design Review を起こす前に**要求する
+      （`SPEC_NOT_MATERIALLY_DIFFERENT`）。
 
-      **#255 の Remediation 経路には検査がある。** `isMateriallyDifferentSpec()` /
-      `reviewVisibleSpecKey()` が却下済みのどの案とも同じ提案を Review 前に拒否する。
-      **穴があるのは素の採用経路だけ**である。
+      **新しい material-difference engine は作っていない。** #255 の既存 export をそのまま呼ぶ:
+      `collectRejectedSpecKeys()` / `shortSpecKey()` / `isMateriallyDifferentSpec()`。
+      したがって定義も #255 と同一で、**AC は比較に入らない**（reviewer が見ないため、
+      AC だけ書き換えても「作り直した」ことにならない）。
 
-      **`human-recovery-zero-job-blocked-task` はこれを直していない（直せない）。**
-      同項目で一度 Human Recovery 側へ「同一 designTextHash では1回だけ」を入れたが、
-      **deadlock になったため撤回した**: design text は description + allowedPaths 由来なので
-      訂正しなければ hash は変わらず、訂正には `syncRoadmapTasks()`（= `pending` 必須）が要り、
-      `pending` にするには Human Recovery が要る。**再審査を起こしているのは採用経路であり、
-      そこで塞ぐのが正しい。**
+      **A → B → A を止めるため、却下された世代を履歴へ残す。** 採用は Task の spec を置き換える
+      ので、記録しないと1世代前の却下案が消える。書き込み先・形式は #255 と同じ audit
+      （`remediate:<taskId>` の `rejected_fspec=` / `fspec=`）で、**新しいテーブルは作らない**。
+      `stage=adoption` を付けるため、`stageEntries()` が remediation として数えることはなく、
+      **どの attempt budget も消費しない**。
 
-      **着手時に確認すること（実装方針を先に決めない）**:
-      - 既存 `isMateriallyDifferentSpec()` / `reviewVisibleSpecKey()` をそのまま採用経路へ
-        適用できるか（**新しい判定器を作らない**）
-      - 却下履歴をどこから引くか。#255 は `audit_log` の `remediate:<taskId>` に持っている
-      - **CEO 自身の採用やり直しまで塞いでよいのか**。人が訂正したつもりで実質同じ、という
-        ケースをどう扱うか（拒否か、警告して通すか）は権限の問題
-      - 効果検証可能性（Design Philosophy 8）: 同一 spec の再採用が何回起きていたかを
-        後から数えられること（Human Recovery の audit には `dth=` が既に入っている）
+      **既存の採用を壊していない。** guard は「却下済み spec が在る Task」にだけ効く。
+      新規 item の初回採用 / follow-up 採用 / 却下歴の無い Task の採用し直し /
+      ALIGNED evidence 済み Task の Job 再生成は、いずれも従来どおり通る（テストで固定）。
 
       **既存項目との違い（重複実装しないこと）**:
       - `human-recovery-zero-job-blocked-task`: blocked を pending へ戻す話。**再審査は起こさない**

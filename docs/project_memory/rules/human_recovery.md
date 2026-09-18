@@ -35,14 +35,21 @@
    **auth mode に依存しない**
 2. `executeAction()` / `allowedActionsFor()` に配線していない → PL は in-process で動き自分へ
    HTTP を打たないので到達経路が存在しない。**auth mode に依存しない**
-3. `WORKER_ALLOWLIST` に載せていない → WORKER credential からは Default Deny で 403。
-   ただし**これが効くのは split credential mode だけ**である。legacy mode（`ADMIN_TOKEN_SHA256` /
-   `WORKER_TOKEN_SHA256` 両方未設定）は単一 `API_TOKEN` が全 route を許すため allowlist を評価しない。
-   これは本経路固有の穴ではなく legacy mode の性質で、`POST /api/pl/tick` や
-   `POST /api/tasks/:id/abort` など既存の admin 専用 route すべてに等しく当てはまる。
-   **production は split credential mode で運用する。**
+3. `WORKER_ALLOWLIST` に載せていない → split credential mode では WORKER credential から 403
+4. **legacy mode では Human Recovery 自体を拒否する**（`HUMAN_ONLY_ROUTES`）。legacy mode は
+   単一 `API_TOKEN` が全 route を許すため、HTTP caller が人か Worker かを区別できない。
+   区別できない以上、**通さない**のが唯一 fail-closed な扱いである
 
-自律呼び出しを無条件に塞いでいるのは 1 と 2 である。3 は split mode における多層防御。
+| mode | credential | 結果 |
+|---|---|---|
+| split | ADMIN | 実行できる |
+| split | WORKER | 403（allowlist の Default Deny） |
+| legacy（`API_TOKEN` 設定） | 単一 token | **403（`HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS`）** |
+| 認証なし（`API_TOKEN` 未設定） | — | 通す（ローカル開発。production 構成ではない） |
+| 片側だけ設定 | — | 既存どおり 503 |
+
+**legacy auth 全体は変えていない。** 拒否されるのは `HUMAN_ONLY_ROUTES` に載る route だけで、
+他の legacy route の挙動は従来どおりである。
 
 ---
 
@@ -121,12 +128,14 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 この操作は Job も Review も作らないので、`PL_MAX_REMEDIATION_ATTEMPTS` /
 `PL_MAX_ATTEMPTS_PER_TARGET` / `DESIGN_REVIEW_MAX_ATTEMPTS` のどれも消費・リセットしない。
 
-> **既知の穴（この経路では塞げない）**: `pending` に戻ると採用のやり直しが可能になり、
-> その経路には「却下済みと実質同じ提案か」の検査が無い。同じ spec を繰り返し採用し直せば
-> Design Review を何度でも引き直せてしまう。**これは master に既に在る穴**で、
-> `pending` な採用済み Task すべてに当てはまる。Human Recovery 側へ「同一 design text では
-> 1回だけ」を入れると、訂正には `pending` が必要なので **deadlock になる**（実装して撤回した）。
-> 正しい修正箇所は採用経路であり、`adoption-path-has-no-material-difference-check` として登録済み。
+> **却下済み spec の再審査は採用側で塞いである。** `pending` に戻ると採用のやり直しが
+> 可能になるが、その経路は「却下済みのどれとも review-visible に違うこと」を
+> **Design Review を起こす前に**要求する（`SPEC_NOT_MATERIALLY_DIFFERENT`）。
+> したがって Human Recovery で戻しても、**同じ spec を再審査させることはできない**。
+> 判定は #255 と同一定義で、**AC だけ変えても「違う提案」にならない**（reviewer は AC を見ない）。
+>
+> guard を Human Recovery 側へ置いてはならない。訂正には `pending` が必要で、`pending` にするには
+> Human Recovery が必要なので **deadlock になる**（実装して撤回した経緯がテストに固定してある）。
 
 **再投入の直後は5分間何も起きないことがある。** `task_ready_without_job` は既存の停滞閾値
 （`DEFAULT_STALL_HINT_MS` = 5分）を過ぎたものだけを PL の対象にする。止まっている Task は
