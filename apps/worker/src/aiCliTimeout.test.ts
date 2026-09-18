@@ -8,7 +8,9 @@ import { aiCliTimeoutMs, type AiCliMode, type AiCliProvider } from '@ai-team/sha
  * ## 何を守るテストか
  *
  * production 実測では `claude_code` の implement だけが既定 300s を超え、
- * **provider_timeout 7 件すべてが `changedFiles` を持っていた**（＝作業中に殺されていた）。
+ * **provider_timeout 7 件すべてが `changedFiles` を持っていた**
+ * （＝生成済みの変更が毎回失われていた。**打ち切り時点で進んでいたかは別の話**で、
+ * それが確かめられたのは transcript の残っている 1 件だけである）。
  * 一方 review は 53 件で timeout 0 件・成功 max 131s だった。
  *
  * よってここで固定したいのは 2 つである。

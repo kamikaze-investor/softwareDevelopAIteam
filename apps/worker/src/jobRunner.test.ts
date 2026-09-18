@@ -3128,7 +3128,8 @@ describe('task-022: AI CLI 実行ブロック', () => {
   // **純関数が正しくても、call site で渡し忘れれば本番では効かない。**
   // `aiCliTimeoutMs()` 自体の網羅は `aiCliTimeout.test.ts` にあり、ここで見るのは
   // 「runJob が実際に adapter.run() へその値を載せているか」だけである。
-  // production 実測: implement は provider_timeout 7 件すべてが作業中だった。
+  // production 実測: implement の provider_timeout 7 件はすべて changedFiles を持っており、
+  // 生成済みの変更が毎回失われていた（打ち切り時点でも進んでいたかは別の話）。
   it('implement の adapter.run() へ timeoutMs=900000 が渡る', async () => {
     const run = vi.fn().mockResolvedValue(makeCliResult({}))
     createAiCliAdapterMock.mockReturnValue({ run } as any)

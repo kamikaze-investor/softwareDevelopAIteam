@@ -134,7 +134,9 @@ export function evaluateImplementTimeoutSensors(
     findings.push({
       sensorId: 'implement-timeout-still-kills-working-jobs',
       scope: job.id,
-      summary: '現在の timeout でも、作業中の implement Job が打ち切られた',
+      // **言えることだけを書く。** `changedFiles` は「変更を作っていた」ことを示すが、
+      // 打ち切られた瞬間も進んでいたかどうかは、この行からは分からない（独立レビュー指摘）。
+      summary: '現在の timeout でも、変更を生成済みの implement Job が打ち切られた（生成分は失われた）',
       evidence: {
         jobId: job.id,
         taskId: job.taskId,
