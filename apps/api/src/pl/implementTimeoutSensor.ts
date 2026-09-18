@@ -190,14 +190,27 @@ export function evaluateImplementTimeoutSensors(
    * 1. `provider_timeout` —— これは「こちらが渡した `timeoutMs` のタイマーが発火して
    *    kill した」ことだけを意味する。設定箇所は `adapter.ts` の 1 箇所で、その元になる
    *    `contained.timedOut` も `setTimeout(..., options.timeoutMs)` のコールバック 1 箇所だけ
-   * 2. `completedAt >= policyEpochStart` —— その budget が有効になった後に終わった
+   * 2. `startedAt >= policyEpochStart` —— その budget が有効になった後に**開始**した
+   *
+   * ## なぜ `completedAt` ではなく `startedAt` か
+   *
+   * **`completedAt` は後から別経路に書き換えられる。** `releaseBlockedJobAndParkTask()` は
+   * blocked のまま残っていた兄弟 Job を `failed` にするとき `completedAt` を**その時刻で
+   * 上書きする**（`sqlite.ts`）。つまり旧 budget 下で timeout した Job が、後日 park された
+   * だけで「今日終わった」ことになり、新しい epoch の証拠として数えられてしまう
+   * （独立レビュー指摘。production には実際に 22 時間後に `completed_at` が書かれた行がある）。
+   *
+   * `startedAt` は Worker が Job を claim して `running` にする瞬間に 1 度だけ書かれ
+   * （`apps/worker/src/index.ts`）、park も abort もこれを書き換えない。
+   * 意味の上でも **timeout は spawn 時点の budget で決まる**ので、開始時刻で見るのが正しい。
    *
    * 経過時間は使わない（`ensureImplementTimeoutPolicyEpoch()` の説明を参照）。
    */
   const killedByCurrentBudget = (job: Job): boolean => {
     if (!isProviderTimeout(job)) return false
     if (policyEpochStart === undefined) return true
-    return job.completedAt !== undefined && job.completedAt >= policyEpochStart
+    // 開始していない Job は provider_timeout になり得ないが、型の上では undefined を取る。
+    return job.startedAt !== undefined && job.startedAt >= policyEpochStart
   }
 
   // ── A. 現在の budget を使い切って落ち、生成済みの変更を失った Job ──────
@@ -269,8 +282,11 @@ export function evaluateImplementTimeoutSensors(
   // - 旧 policy 下の成功 Job も**そのまま残して数える**。成功した Job の所要時間は
   //   budget に打ち切られていない実測値なので、どの policy 下でも有効な標本である
   // - 今回の 300s -> 900s のような**拡大**の局面では、旧成功（すべて 300s 未満）を
-  //   含めると p95 は必ず下がる。つまり**発火が遅くなる方向**にしか働かず、
-  //   移行期は保守的になる
+  //   含めても p95 が**上がることはない**。つまり発火を早める方向には働かず、
+  //   移行期は保守的側に倒れる
+  //   （**「必ず下がる」ではない。** 分位点は順序統計量なので、下位に標本が増えても
+  //   選ばれる値が変わらないことがある。25 件の 600s に 200s を 1 件足しても p95 は 600s
+  //   のままである —— 独立レビュー指摘。正しい主張は「非増加」であって「必ず低下」ではない）
   // - **ただしこれは「経過時間から policy regime を正確に特定できる」という主張ではない。**
   //   C が安全なのは「拡大の局面では混入が発火を遅らせるだけ」という**方向の議論**であって、
   //   任意の policy 変更（とくに budget を縮める変更）に対して regime を言い当てられる

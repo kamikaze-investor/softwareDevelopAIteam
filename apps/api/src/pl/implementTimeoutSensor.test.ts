@@ -111,6 +111,27 @@ describe('evaluateImplementTimeoutSensors', () => {
       .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 
+  // **`completedAt` は後から書き換えられるので regime の根拠にできない。**
+  // `releaseBlockedJobAndParkTask()` は blocked のまま残っていた兄弟 Job を failed にするとき
+  // `completedAt` をその時刻で上書きする。旧 budget 下で timeout した Job が、後日 park された
+  // だけで「今日終わった」ことになり、新しい epoch の証拠として数えられてしまう
+  // （独立レビュー指摘。production には 22 時間後に completed_at が書かれた行が実在する）。
+  it('epoch より前に開始した timeout は、completedAt が epoch 後に書き換えられても発火しない', () => {
+    const reStamped = job({
+      // 開始は epoch より前。ここが regime を決める。
+      startedAt: beforeEpoch(1_800),
+      // park されたときに書き直された completedAt は epoch より後。
+      completedAt: afterEpoch(3_600),
+      status: 'failed',
+      changedFiles: ['apps/api/src/pl/executionLoop.ts'],
+      failureMetadata: { kind: 'provider_timeout' },
+    } as Partial<Job>)
+
+    const findings = evaluateImplementTimeoutSensors([reStamped], T, EPOCH)
+    expect(findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
+    expect(findings.filter((f) => f.sensorId === 'implement-timeout-rate-too-high')).toHaveLength(0)
+  })
+
   // ── B ────────────────────────────────────────────────────────
   it('B: timeout 率が 3% 以上なら発火する', () => {
     const jobs = [
