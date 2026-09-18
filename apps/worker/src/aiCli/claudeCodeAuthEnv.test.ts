@@ -52,7 +52,12 @@ describe('claude_code の認証 env', () => {
   })
 
   it('ANTHROPIC_API_KEY を渡さない（渡すと subscription より優先される）', async () => {
+    // **両方 stub する。** `CLAUDE_API_KEY` だけだと、
+    // `ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY` という形の再発を
+    // CI（その変数が未設定）では取り逃がす（独立レビュー指摘）。
     vi.stubEnv('CLAUDE_API_KEY', 'test-key-must-not-be-forwarded')
+    vi.stubEnv('ANTHROPIC_API_KEY', 'direct-api-key-must-not-be-forwarded')
+    vi.stubEnv('ANTHROPIC_AUTH_TOKEN', 'token-must-not-be-forwarded')
 
     await createAiCliAdapter({ provider: 'claude_code' }).run(requestFor('claude_code'))
 

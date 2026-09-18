@@ -773,9 +773,18 @@ function buildSafeEnv(provider: AiCliProvider): NodeJS.ProcessEnv {
       // `claude --print ... --output-format json` を1回実行）: `is_error: false` / exit 0 /
       // `provider: firstParty` で応答した。
       //
-      // **`CLAUDE_API_KEY` 自体は env から消していない。** `apps/api/src/ctoAi/specAnalyzer.ts` が
-      // Anthropic API を直接叩く別経路で使っており、そちらは本変更の対象外である。
-      // ここで渡さない、というだけの違いである。
+      // **`CLAUDE_API_KEY` 自体は env から消していない**（env ファイルは触らない）。
+      // ただし用途は無くなる: 実測（2026-09-18）では Worker process にあるのは
+      // `CLAUDE_API_KEY`、API process にあるのは `ANTHROPIC_API_KEY` と**別々の変数**で、
+      // 直接 Anthropic API を叩く `apps/api/src/ctoAi/specAnalyzer.ts` は後者を読む。
+      // つまり本変更後、`CLAUDE_API_KEY` を読む本番経路は Worker に残らない
+      // （`geminiRouter.ts` の同名は redact 対象リストであって利用箇所ではない）。
+      // 変数の撤去は env ファイルの管理者判断なので、ここでは渡さないことだけを行う。
+      //
+      // 同じ方針は既に `apps/api/src/designReview/designReviewCoordinator.ts` の
+      // `buildRunnerEnv()` が採っている（「OAuth credential（HOME配下）で認証する。
+      // PAT/token類は一切渡さない」）。Design Review / reviewer / roadmap generator は
+      // 以前からその形で、**implement 経路だけが API key を渡す例外**になっていた。
       return { ...base }
     case 'gemini':
       return {

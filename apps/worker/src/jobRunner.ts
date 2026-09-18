@@ -1669,6 +1669,9 @@ function withSensitiveChanges(
   return mergeManifests(manifest, manifestFromChanges(sensitiveChanges))
 }
 
+/** CLI のエラー説明文を載せる上限。原因分類に足り、ログを膨らませない長さ。 */
+const CLI_ERROR_DETAIL_LIMIT = 200
+
 /**
  * implement モードでAI CLIが成功終了したが、実際にはファイル変更が0件だった場合の
  * 失敗理由を判定する。undefined を返せば通常どおり後続処理へ進む。
@@ -1688,7 +1691,20 @@ function classifyClaudeImplementFailure(
     return 'Claude Code CLI output could not be parsed as JSON'
   }
   if (parsed.is_error === true) {
-    return 'Claude Code CLI reported an error result'
+    // **CLI が返した理由をそのまま出す。**
+    //
+    // ここを generic な1文で潰していたため、2026-09-18 に API credit が尽きたとき
+    // 運用側に見えたのは「error result」だけで、真因（400 Credit balance is too low）は
+    // stdout の JSON を人手で開くまで分からなかった。
+    // API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
+    // 出すのは CLI 自身の短い説明文と HTTP status だけで、prompt も出力本文も載せない。
+    const status = typeof parsed.api_error_status === 'number'
+      ? ` (HTTP ${parsed.api_error_status})`
+      : ''
+    const detail = typeof parsed.result === 'string' && parsed.result.trim() !== ''
+      ? `${parsed.result.trim().slice(0, CLI_ERROR_DETAIL_LIMIT)}`
+      : ''
+    return `Claude Code CLI reported an error result${status}${detail ? `: ${detail}` : ''}`
   }
 
   if (cliResult.changedFiles.length > 0) {

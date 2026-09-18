@@ -2389,6 +2389,50 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
+  // 2026-09-18: API credit が尽きたとき、運用側に見えたのは「error result」だけで、
+  // 真因（400 Credit balance is too low）は stdout の JSON を人手で開くまで分からなかった。
+  // API key を渡すのをやめた以降、subscription 失効も同じ形で届く。
+  it('is_error のとき CLI が返した理由と HTTP status を stderr に出す', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({
+          is_error: true,
+          api_error_status: 400,
+          result: 'Credit balance is too low',
+        }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('HTTP 400')
+    expect(result.stderr).toContain('Credit balance is too low')
+  })
+
+  it('理由が無い is_error では従来どおりの一文だけを出す', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({ changedFiles: [], stdout: '{"is_error":true}' })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain('Claude Code CLI reported an error result')
+    // 余計な区切りを足さない（`: ` が空で終わらない）。
+    expect(result.stderr).not.toMatch(/error result:\s*$/m)
+  })
+
   it('implement でもdryRunなら変更0件チェックの対象外になる', async () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
