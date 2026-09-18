@@ -13,12 +13,13 @@ import {
   type BlockedDiagnosis,
 } from './blockedTriage'
 import {
-  buildRemediationRequest,
   PL_MAX_ATTEMPTS_PER_TARGET,
   resetPlLoopInFlightForTest,
   runPlTick,
   type PlLoopDeps,
 } from './executionLoop'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 
 /**
  * ここで固定しているのは次の2つである。
@@ -120,6 +121,47 @@ function completedReview(storage: IStorage, taskId: string, decision: string): v
     }),
     undefined,
   )
+}
+
+/**
+ * `findRemediationSubject()` の条件をすべて満たす CONFLICT。**配線済みの解決経路の対象**である。
+ * （`roadmapTaskKey` があり、pending・Job 0件、task-kind run が succeeded で CONFLICT）
+ */
+function seedRemediableConflict(): { storage: IStorage; taskId: string } {
+  const storage = createSQLiteStorage(':memory:')
+  const project = storage.projects.create({
+    name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+  })
+  const task = storage.tasks.create({
+    projectId: project.id,
+    title: 'CONFLICT した項目',
+    description: 'body',
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+    allowedPaths: ['apps/api/src'],
+    acceptanceCriteria: ['c'],
+    roadmapTaskKey: 'conflicted-item',
+    phase: 1,
+    roadmapActive: true,
+  } as Parameters<IStorage['tasks']['create']>[0])
+
+  const designText = buildInitialImplementAiCliPrompt(task)
+  const run = storage.designReviewRuns.create({
+    taskId: task.id,
+    taskTitle: task.title,
+    designText,
+    designTextHash: computeDesignTextHash(designText),
+    changedFiles: [],
+  })
+  const claimed = storage.designReviewRuns.claim(run.id, 3)
+  storage.designReviewRuns.complete(
+    run.id,
+    claimed.claimToken as string,
+    'succeeded',
+    JSON.stringify({ focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }] }),
+  )
+  return { storage, taskId: task.id }
 }
 
 /** その Project の attention から、指定 kind の1件を取る。**手で AttentionItem を作らない。** */
@@ -600,32 +642,41 @@ describe('Independent Remediation への引き渡し', () => {
     expect(JSON.parse(run?.resultJson as string).finalDecision).toBe('CONFLICT')
   })
 
-  it('12b. 引き渡す要求は観測事実だけで、scope の書き換え案を含めない', () => {
-    const { storage, taskId, projectId } = seed()
-    blockedByGuard(storage, taskId, projectId, ['docs/a.md'])
-    const item = attentionOf(storage, 'job_blocked')
+  it('12b. **配線済みの Remediation を Triage が握り潰さない**（実行が分類より先に来る）', async () => {
+    // #255 が Design Review CONFLICT に実際の解決経路を配線した。Triage は同じケースを
+    // `lane=independent_remediation` と分類するが、**分類は実行ではない**。
+    // ここが逆順になると、実装済みの復旧が Triage の Escalation に置き換わって静かに失われる。
+    const { storage, taskId } = seedRemediableConflict()
+    let resolved: string | undefined
 
-    const request = buildRemediationRequest(item, triageBlocked(storage, item))
+    const result = await runPlTick(storage, deps({
+      now: () => new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      // Triage 経路へ落ちたらここが呼ばれないので、呼ばれたこと自体が順序の証明になる。
+      resolveConflict: async (_s, id) => {
+        resolved = id
+        return { status: 'revised_and_aligned', stage: 'pl_revision', taskId: id }
+      },
+      diagnose: async () => { throw new Error('diagnose must not run for a remediable CONFLICT') },
+    }))
 
-    // **欄はこれで全部である。** 訂正案（allowedPaths / implementationScope の書き換え）を
-    // 載せる口がそもそも無い ——「どう直すか」は remediation 側の責務だからである。
-    expect(Object.keys(request).sort())
-      .toEqual(['evidence', 'jobId', 'projectId', 'rootCauseClass', 'summary', 'taskId'])
-    // evidence は診断が作った機械的事実がそのまま入るだけ（ここで加工しない）
-    expect(request.evidence).toEqual(triageBlocked(storage, item).evidence)
+    expect(resolved).toBe(taskId)
+    expect(result.status).toBe('acted')
+    expect(result.proposedKind).toBe('adopt_roadmap_item')
+    // Triage は分類すらしていない（この対象は Triage の担当ではない）
+    expect(result.triage).toBeUndefined()
   })
 
   it('remediation を起動する無 Gate の受け口を持たない（配線は Gate を通る操作でしかできない）', () => {
-    // 独立レビュー（2026-09-18）の指摘への回帰テスト。注入可能な callback を置くと、
-    // 配線した瞬間に `authorizePlAction()` の外側で状態が変わる。
-    const injected = { dispatchRemediation: async () => ({ accepted: true }) }
-    expect(Object.keys(injected)[0]! in ({} as PlLoopDeps)).toBe(false)
-    // 型の上でも `PlLoopDeps` に dispatch 系の口は無い。
+    // 独立レビュー（2026-09-18）の指摘への回帰テスト。Triage 側に注入可能な dispatch callback を
+    // 置くと、配線した瞬間に `authorizePlAction()` の外側で状態が変わる。
+    // #255 の `resolveConflict` は Triage の受け口ではなく、既存 Remediation 経路のテスト差し替え点である。
     const depKeys = Object.keys(deps()) as (keyof PlLoopDeps)[]
-    expect(depKeys.some((k) => String(k).toLowerCase().includes('remediation'))).toBe(false)
+    expect(depKeys.some((k) => String(k).toLowerCase().includes('dispatch'))).toBe(false)
   })
 
-  it('本体未実装の現状では CEO Escalation へ倒れる', async () => {
+  it('Remediation の対象外な CONFLICT は CEO Escalation へ倒れる', async () => {
+    // roadmapTaskKey を持たない Task は `findRemediationSubject()` の対象外。
+    // 解決経路が無いので、構造化報告を添えて人へ渡すのが正しい。
     const { storage, taskId } = seed()
     completedReview(storage, taskId, 'CONFLICT')
     const later = new Date(Date.parse(storage.tasks.findById(taskId)?.createdAt as string) + 10 * 60_000).toISOString()
@@ -638,7 +689,10 @@ describe('Independent Remediation への引き渡し', () => {
 
     expect(result.status).toBe('escalated')
     expect(result.triage?.lane).toBe('independent_remediation')
-    expect(escalations[0]).toContain('Independent Remediation はまだ配線されていない')
+    expect(result.triage?.rootCauseClass).toBe('design_review_conflict')
+    // 「試したが解決しなかった」と読める本文にする（「配線されていない」と書かない）
+    expect(escalations[0]).toContain('Independent Remediation')
+    expect(escalations[0]).not.toContain('まだ配線されていません')
   })
 })
 

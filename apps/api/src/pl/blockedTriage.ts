@@ -26,18 +26,18 @@
  * | lane | 意味 | 今日この lane が実際に到達する先 |
  * |---|---|---|
  * | `auto_recovery` | 既存の bounded recovery で解決しうる | 既存 PL Diagnose → Gate → 既存操作 |
- * | `independent_remediation` | 設計・scope の問題。別設計なら解決しうる | 未実装 → CEO Escalation（remediation 依頼を添える）|
+ * | `independent_remediation` | 設計・scope の問題。別設計なら解決しうる | **Design Review CONFLICT のみ配線済み**（`remediateConflict()`）。それ以外は CEO Escalation |
  * | `maintenance_lane` | 通常 Executor では触れない protected 領域 | 未実装（Maintenance Lane v0 = Tier B は `planned`）→ Tier B handoff を添えた CEO Escalation |
  * | `ceo_escalation` | AI だけで決めてはいけない | CEO Escalation |
  *
- * ## 未実装レーンの扱い（重要な安全性質）
+ * ## レーンと実行の分離（重要な安全性質）
  *
- * `independent_remediation` と `maintenance_lane` の本体はまだ存在しない。
- * したがって**今日この2つはどちらも CEO Escalation で終端する**。違うのは
- * 「記録される lane」と「CEO へ出る本文」だけである。
+ * **分類はレーンの選択であって実行ではない。** 配線済みの復旧経路がある対象は、この分類より
+ * **先に**その経路が扱う（`runPlTick()` は `remediateConflict()` を Triage の手前に置く）。
+ * Triage が受け持つのは「渡す先がまだ無いもの」だけで、それらは**すべて CEO Escalation で終端する**。
  *
  * この性質のおかげで、**レーン分類を誤っても CEO を迂回することが原理的に起きない**:
- * B / C / D はすべて人へ届き、A だけが既存 Gate 経由で自動実行へ進む。
+ * B / C / D で未配線のものはすべて人へ届き、A だけが既存 Gate 経由で自動実行へ進む。
  * そして A は「既存の bounded recovery が実在する」機械的事実が立ったときにしか選ばれない。
  *
  * ## 効果検証可能性（Design Philosophy 8）
@@ -728,14 +728,26 @@ function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string;
     }
   }
   if (diagnosis.recommendedLane === 'independent_remediation') {
-    return {
-      decision: '設計・scope の訂正を、元の設計者ではなく独立した Remediation 経路へ回してよいか。',
-      options: [
-        'Independent Remediation へ回し、訂正後に fresh Design Review を通す',
-        '対象項目の実装範囲を CEO が直接指定し直す',
-        'この Task を park する（`abort_task`）',
-      ],
-    }
+    // Design Review CONFLICT はここへ来た時点で Remediation を**既に試して**解決しなかった
+    // （配線済みの経路が Triage の手前で走るため）。同じ手をもう一度勧めない。
+    return diagnosis.rootCauseClass === 'design_review_conflict'
+      ? {
+        decision:
+          'Independent Remediation では解決しませんでした。この設計をどう扱うか。',
+        options: [
+          '対象項目の実装範囲を CEO が直接指定し直す',
+          'Design Review の指摘そのものを見直す（Second Independent Review / Meta Review）',
+          'この Task を park する（`abort_task`）',
+        ],
+      }
+      : {
+        decision: '設計・scope の訂正を、元の設計者ではなく独立した経路へ回してよいか。',
+        options: [
+          '対象項目の allowedPaths と実装範囲を CEO が指定し直す',
+          'この原因にも Remediation を配線するかを別項目として判断する',
+          'この Task を park する（`abort_task`）',
+        ],
+      }
   }
 
   switch (diagnosis.rootCauseClass) {

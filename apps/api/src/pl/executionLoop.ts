@@ -77,6 +77,20 @@ import {
   type PlAdoptionDeps,
   type PlAdoptionResult,
 } from './adoptionStep'
+import {
+  countConflictAttempts,
+  countRemediationAttempts,
+  findRemediationSubject,
+  PL_MAX_REMEDIATION_ATTEMPTS,
+  recordRemediationFailure,
+  runRemediationStep,
+  type PlRemediationDeps,
+} from './remediationStep'
+import {
+  runConflictResolutionRound,
+  selectConflictStage,
+  type ConflictResolutionDeps,
+} from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import {
@@ -227,51 +241,6 @@ export interface PlTickResult {
   }
 }
 
-/**
- * Independent Remediation への引き渡し要求。**Triage は remediation を実装しない。**
- *
- * これは**データ形だけの接続点**である。ここには executor も dispatch 経路も無い。
- * 実際に remediation を起動する経路を足すときは、それ自体が
- * `authorizePlAction()`（Mandatory Gate）を通る操作でなければならない。
- *
- * 一度 `dispatchRemediation` という注入可能な callback を置いたが、独立レビュー（2026-09-18）で
- * **Gate を通らない状態変更経路になる**と指摘されて外した。「本体が未実装だから素通しでよい」は
- * 成立しない —— 無 Gate の受け口を先に用意すると、配線した瞬間に Gate の外側で動く。
- *
- * 渡すのは「何が・なぜ止まったか」という観測事実だけで、`implementationScope` や
- * `allowedPaths` の書き換え案は**含めない**。訂正内容を決めるのは Remediation 側の責務であり、
- * 訂正後の設計は**改めて fresh Design Review と既存 Gate を通る**。
- */
-export interface RemediationRequest {
-  projectId: string
-  taskId?: string
-  jobId?: string
-  rootCauseClass: BlockedRootCauseClass
-  /** 機械的事実だけ。PL の推測は載せない。 */
-  evidence: BlockedDiagnosis['evidence']
-  summary: string
-}
-
-/**
- * 引き渡し要求を観測事実だけから組み立てる。**副作用を持たない純粋関数である。**
- *
- * Independent Remediation が入ったとき「こちらが渡す内容」をこの1関数に固定しておくための形で、
- * 入力は attention と診断だけにしてある（呼び出し側が scope の書き換え案を混ぜられない）。
- */
-export function buildRemediationRequest(
-  item: AttentionItem,
-  diagnosis: BlockedDiagnosis,
-): RemediationRequest {
-  return {
-    projectId: item.projectId,
-    ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
-    ...(item.jobId !== undefined ? { jobId: item.jobId } : {}),
-    rootCauseClass: diagnosis.rootCauseClass,
-    evidence: diagnosis.evidence,
-    summary: diagnosis.summary,
-  }
-}
-
 export interface PlDiagnosisInput {
   attention: AttentionItem
   /** 対象に関係する部分だけを抜いた状態。全状態を丸ごと渡さない。 */
@@ -304,6 +273,17 @@ export interface PlLoopDeps {
   adopt?: PlAdoptionDeps['adopt']
   /** resume に添える指示文（テスト差し替え用）。既定は DEFAULT_RESUME_INSTRUCTION。 */
   resumeInstruction?: string
+  /** Remediation runner の起動設定（テスト差し替え用）。 */
+  remediationDeps?: PlRemediationDeps
+  /**
+   * CONFLICT 解決の1 Round（テスト差し替え用）。既定は `runConflictResolutionRound()`。
+   *
+   * **stage を選ぶのはここではない。** どの stage を実行するかは
+   * `selectConflictStage()` が既存 review state と audit から決める。
+   */
+  resolveConflict?: typeof runConflictResolutionRound
+  /** Critic / PL revision / Challenge の依存（テスト差し替え用）。 */
+  conflictDeps?: ConflictResolutionDeps
   coordinatorDeps?: CoordinatorDeps
   now?: () => string
 }
@@ -360,6 +340,36 @@ function hasStalledLongEnough(item: AttentionItem): boolean {
 }
 
 /**
+ * 通知だけで終える attention に添える理由。
+ *
+ * `task_ready_without_job` は「Job が作られない」という**結果**しか持たない。原因はたいてい
+ * Design Review の判定であり、それを添えないと CEO は何を判断すればよいか分からない。
+ * 判定は**システムが記録した実レコード**から引く（PL の推測は載せない）。
+ *
+ * **Independent Remediation（`remediateConflict()`）の Escalation 本文が使う。**
+ * Triage 経路の本文は `buildTriageEscalationBody()` が組み立てるが、CONFLICT の解決経路は
+ * Critic の指摘や Remediation の診断を独自に積み上げるため、その土台としてこちらを使う。
+ * 実レコードの読み取りは `readLatestDesignReview()` に一本化してある（二重にパースしない）。
+ */
+function notifyOnlyReason(storage: IStorage, item: AttentionItem): string {
+  if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) {
+    return 'CEO の判断待ちで進行が止まっています。'
+  }
+
+  const latest = readLatestDesignReview(storage, item.taskId)
+  if (latest?.decision === undefined) {
+    return '採用した Task に実装 Job が作られないまま止まっています。'
+  }
+
+  return [
+    '採用した Task に実装 Job が作られないまま止まっています。',
+    `直近の Design Review の判定: ${latest.decision}`,
+    latest.summary !== undefined ? `理由: ${latest.summary}` : undefined,
+    'この判定は Binding Review です。PL は妥当性を評価できますが、BLOCK を覆せません。',
+  ].filter((line) => line !== undefined).join('\n')
+}
+
+/**
  * なぜいま AI 側で解決できないのか。**Triage のレーンから導く。**
  *
  * 「Blocked です」だけでは CEO は何を判断すればよいか分からない。ここが埋めるのは
@@ -371,11 +381,20 @@ function selfResolutionBlockedReason(diagnosis: BlockedDiagnosis): string {
     case 'auto_recovery':
       return 'PL は既存の bounded recovery を試しましたが、状態が正常化しませんでした。'
     case 'independent_remediation':
-      return (
-        '設計・scope の訂正が必要ですが、Independent Remediation はまだ配線されていないため '
-        + 'PL 側に進められる正式な経路がありません。CONFLICT を出した当人へ差し戻すことは '
-        + '禁じられています（Review 判定を迂回する圧力が残るため）。'
-      )
+      // **Design Review CONFLICT だけは配線済みである**（`remediateConflict()`）。
+      // ここへ落ちてきたということは、その経路が既に試されて解決しなかったか、
+      // 予算を使い切ったか、そもそも対象外だったかのいずれかである。
+      // 「まだ配線されていない」と一律に書くと、実際には試した事実が CEO に伝わらない。
+      return diagnosis.rootCauseClass === 'design_review_conflict'
+        ? (
+          '設計・scope の訂正が必要です。Independent Remediation（独立した flagship AI による '
+          + '提案の作り直し）は配線されていますが、この対象では解決に至りませんでした。'
+          + 'CONFLICT を出した当人へ差し戻すことは禁じられています（Review 判定を迂回する圧力が残るため）。'
+        )
+        : (
+          '設計・scope の訂正が必要ですが、この原因（allowedPaths と実装対象の不一致）に対する '
+          + 'Remediation はまだ配線されていません。現在配線されているのは Design Review CONFLICT だけです。'
+        )
     case 'maintenance_lane':
       return (
         'protected 領域への変更が必要ですが、Maintenance Lane v0（Tier B）はまだ実装されていないため '
@@ -411,6 +430,141 @@ function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
       const fields = (entry.detail ?? '').match(STRUCTURED_AUDIT_FIELDS) ?? []
       return `${entry.createdAt} ${entry.result}${fields.length > 0 ? ` (${fields.join(' ')})` : ''}`
     })
+}
+
+/**
+ * その attention が Independent Remediation の対象か。
+ *
+ * 判定は `findRemediationSubject()`（永続レコードだけを見る read-only の導出）へ一本化する。
+ * ここに条件を書き足さない —— **2箇所に書くと必ずずれる**。
+ */
+function isRemediableConflict(storage: IStorage, item: AttentionItem): boolean {
+  if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) return false
+  if (findRemediationSubject(storage, item.taskId) === undefined) return false
+  return countRemediationAttempts(storage, item.taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+}
+
+/**
+ * CONFLICT で止まった採用を1回 Remediation する。
+ *
+ * 成功（implement Job ができた）なら `acted` を返す。それ以外は `undefined` を返し、
+ * **呼び出し側の既存 Escalation 経路へ落とす** —— ただし Remediation の診断を通知本文へ添える。
+ * CEO には「止まっている」だけでなく「独立した AI がどう読んだか」まで届く。
+ */
+async function remediateConflict(
+  storage: IStorage,
+  deps: PlLoopDeps,
+  key: string,
+  item: AttentionItem,
+): Promise<Omit<PlTickResult, 'target'> | undefined> {
+  if (item.taskId === undefined) return undefined
+
+  // **Remediation を直接は呼ばない。** CONFLICT の一次対応は Critic-assisted な PL revision で、
+  // Independent Remediation はそれで解決しなかった場合の最後の救済である。
+  // どの stage を実行するかは `selectConflictStage()`（既存 review state と audit の observer）が
+  // 決める。ここは stage を選ばない。
+  const run = deps.resolveConflict ?? runConflictResolutionRound
+  // 呼び出し前の試行数。例外時に**二重計上しない**ための基準にする。
+  const attemptsBefore = countConflictAttempts(storage, item.taskId)
+  let round: Awaited<ReturnType<typeof runConflictResolutionRound>>
+  try {
+    round = await run(storage, item.taskId, {
+      ...(deps.remediationDeps !== undefined ? { remediationDeps: deps.remediationDeps } : {}),
+      ...(deps.conflictDeps !== undefined ? deps.conflictDeps : {}),
+    })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    // **例外も Remediation の試行として数える。** PL target 側だけに記録すると
+    // `countRemediationAttempts()` が 0 のままで対象から外れず、再現する例外
+    // （runner の spawn 失敗等）を毎 tick 繰り返す。
+    //
+    // ただし **step 側が既にこの試行を計上していたら足さない。** step は採用を await する前に
+    // `outcome=adopting` を記録するので、採用が throw すると1回の論理試行で2行になり、
+    // **上限2に対して transient な例外1回で予算が尽きる**（独立レビュー指摘）。
+    if (countConflictAttempts(storage, item.taskId) === attemptsBefore) {
+      // **どの stage の例外かを明示する。** `stage=` を省くと remediation として分類され、
+      // Critic 段階の例外が Remediation の予算を食う（独立レビュー指摘）。
+      // 状態は変わっていないので selector は落ちた stage をそのまま返す。
+      const failedStage = selectConflictStage(storage, item.taskId).stage
+      recordRemediationFailure(storage, item.taskId, `stage=${failedStage} outcome=exception`)
+    }
+    record(storage, key, 'diagnosis_failed', `conflict_resolution=error ${message}`)
+    return { status: 'diagnosis_failed', reason: message, attempt: 1 }
+  }
+
+  // Stage 3 に入った場合は、その中身（Remediation の結果）を展開して扱う。
+  const result = round.remediation
+  const status = result?.status ?? round.status
+  const failureCode = result?.failureCode ?? round.failureCode
+  const reason = result?.reason ?? round.reason
+  const provider = result?.provider ?? round.criticProvider
+  const model = result?.model ?? round.criticModel
+
+  /** 設計が既存 Review Pipeline を通って実装へ進める状態になったか。 */
+  const resolved = status === 'remediated'
+    || status === 'revised_and_aligned'
+    || status === 'challenge_aligned'
+
+  const provenance = provider !== undefined ? ` provider=${provider} model=${model}` : ''
+  record(
+    storage,
+    key,
+    resolved ? 'acted' : 'blocked',
+    `stage=${round.stage} outcome=${status} code=${failureCode ?? '-'}${provenance} ${reason ?? ''}`,
+  )
+
+  if (resolved) {
+    return {
+      status: 'acted',
+      proposedKind: 'adopt_roadmap_item',
+      reason: `${round.stage} produced a design that passed the existing review pipeline`
+        + ` (task ${result?.taskId ?? round.taskId})`,
+      attempt: 1,
+    }
+  }
+
+  // 解決しなかった。**既存の Escalation で人へ渡す。** Remediation の診断を添える。
+  //
+  // **通知は1つの停止につき1回だけ。** 予算が尽きるまで毎 tick 鳴らすと、
+  // 2026-09-17 に実測された「63分で同一内容の LINE が18通」と同じ状態になる。
+  // ここを Remediation 側の記録に依存させない —— 記録し忘れた経路が1つあれば
+  // そのまま通知ループになるため、**ループ防止はこの分岐自身が持つ**。
+  // `notify: false` でも `escalated` の記録は残り、Mobile からは進行中の失敗として見え続ける。
+  const alreadyTold = hasEscalated(storage, key)
+  const exhausted = status === 'attempts_exhausted' || status === 'terminal'
+  if (alreadyTold && exhausted) {
+    return { status: 'idle', reason: 'conflict resolution exhausted and already escalated', attempt: 1 }
+  }
+
+  await escalateTo(
+    storage,
+    deps,
+    key,
+    item,
+    [
+      notifyOnlyReason(storage, item),
+      '',
+      `解決の試み: stage=${round.stage} / 結果=${status}`,
+      reason !== undefined ? `理由: ${reason}` : undefined,
+      round.critique !== undefined
+        ? `Critic が挙げた根本原因: ${round.critique.coreProblems.join(' / ')}`
+        : undefined,
+      round.critique !== undefined
+        ? `Critic の改善方向: ${round.critique.improvementDirections.join(' / ')}`
+        : undefined,
+      // **Binding Safety の争点は Challenge では解除されない。** 人へ明示して渡す
+      // （既存方針: Second Independent Review → Meta Review → 未解決なら CEO）。
+      round.bindingDisputes !== undefined && round.bindingDisputes.length > 0
+        ? 'Critic は Binding Safety / Authority の Finding にも疑義を述べています'
+          + `（${round.bindingDisputes.map((d) => d.source).join(', ')}）。`
+          + 'これは Challenge では解除されません。Second Independent Review / Meta Review の対象です。'
+        : undefined,
+      result?.proposal !== undefined ? `Remediation の診断: ${result.proposal.diagnosis}` : undefined,
+      result?.proposal !== undefined ? `提案された解決: ${result.proposal.resolution}` : undefined,
+    ].filter((line) => line !== undefined).join('\n'),
+    { subject: 'Design Review CONFLICT', notify: !alreadyTold },
+  )
+  return { status: 'escalated', reason: `conflict not resolved (stage=${round.stage}, ${status})`, attempt: 1 }
 }
 
 function selectTarget(attention: readonly AttentionItem[]): AttentionItem | undefined {
@@ -955,7 +1109,13 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     const actionable = before.attention.filter(
       (item) =>
         ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
-        && !hasEscalated(storage, targetKeyOf(item))
+        // **Independent Remediation は Escalation 済みでも対象にする。**
+        // `hasEscalated()` は Task の生涯にわたる記録で、キー（`task_ready_without_job:<taskId>`）は
+        // 変わらない。CONFLICT はまず notify-only で1回 Escalate されるため、ここを素通しに
+        // しないと **Remediation が構造的に一度も走れない**（既に止まっている本番 Task も含む）。
+        // 予算は `countRemediationAttempts()` が却下テキスト単位で別に持つので、
+        // 通知が鳴り続けることはない。
+        && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
         && hasStalledLongEnough(item),
     )
     const item = selectTarget(actionable)
@@ -984,6 +1144,22 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
       ...(item.jobId !== undefined ? { jobId: item.jobId } : {}),
     }
+    // ── Design Review CONFLICT で止まった採用は Independent Remediation へ回す ─────
+    //
+    // **PL 自身には直せない。** Job 生成は Design Review evidence を要し、その判定を PL が
+    // 覆すことは許されない（それは従来から変わらない）。直すのではなく、**独立した flagship AI に
+    // 提案を作り直させ、まっさらな Review へ掛ける**。判定は依然 API 側が再計算する。
+    //
+    // **Blocked Resolution Triage より前に置く。** Triage はこのケースを
+    // `lane=independent_remediation` と分類するが、**分類はレーンの選択であって実行ではない**。
+    // 配線済みの実行経路がある以上、そちらが先に走らなければ Triage が実装済みの復旧を
+    // 握り潰すことになる（Triage 側は「渡す先が無い」ものだけを扱う）。
+    // ここで終端しなかったものだけが下の Triage へ落ちる。
+    if (item.kind === 'task_ready_without_job' && isRemediableConflict(storage, item)) {
+      const outcome = await remediateConflict(storage, deps, key, item)
+      if (outcome) return { ...outcome, target }
+    }
+
     // ── Triage（Diagnose の前段。機械的事実だけで原因とレーンを決める）──────────
     // ここは **PL の自由文を一切受け取らない**。入力は attention と storage の実レコードだけで、
     // 出力は「推奨レーン」であって permission ではない。
@@ -996,8 +1172,10 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
 
     // ── 人へ伝えるだけの attention は、診断も Gate も経ずに1回通知して終わる ──────
     // `escalate_to_ceo` 相当の行為であり Gate を要しない（Policy 上も無 Gate）。
-    // 既に通知済みの対象は選択段階で外れているので、ここへは来ない。
-    // **本文だけを Triage 由来の構造化報告へ差し替えた。** 判定経路は従来どおりである。
+    // 既に通知済みの対象は選択段階で外れているので、ここへは来ない
+    // （唯一の例外は上の Remediation 経路で、そこで終端していなければここへ落ちる）。
+    // **本文は Triage 由来の構造化報告に差し替えてある。** 判定経路は従来どおりで、
+    // 重複通知の抑止（`hasEscalated()`）は `handOffOrEscalate()` の中で同じように効く。
     if (NOTIFY_ONLY_ATTENTION_KINDS.includes(item.kind)) {
       const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
       return { status: handled.status, target, triage, reason: handled.reason, attempt: 1 }
@@ -1358,14 +1536,18 @@ async function escalateTo(
 }
 
 /**
- * Triage が選んだレーンへ渡す。
+ * Triage が選んだレーンへ渡す。**ここへ来たものはすべて CEO Escalation で終端する。**
  *
- * **今日、auto_recovery 以外の3レーンはすべて CEO Escalation で終端する。**
- * Independent Remediation も Maintenance Lane v0（Tier B）も本体が未実装であり、
- * **ここで代わりに実装しない**（どちらも別項目の責務である）。違うのは記録される lane と
- * CEO へ出る本文だけで、この性質のおかげでレーン分類を誤っても CEO を迂回できない。
+ * 配線済みの復旧経路を持つケースはここへ来ない —— Design Review CONFLICT は手前の
+ * `remediateConflict()`（#255）が扱い、`auto_recovery` は Gate 経由の実行へ進む。
+ * ここが受け持つのは「**渡す先がまだ無いもの**」だけである:
+ *   - `independent_remediation` のうち allowedPaths 不一致（Remediation 未配線）
+ *   - `independent_remediation` のうち CONFLICT だが予算を使い切ったもの
+ *   - `maintenance_lane`（Maintenance Lane v0 = Tier B は未実装）
+ *   - `ceo_escalation`
  *
- * 受け口を無 Gate の callback として先に用意することは**しない**。Gate を通らない
+ * **ここで代わりの executor を作らない**（どれも別項目の責務である）。
+ * 受け口を無 Gate の callback として先に用意することもしない —— Gate を通らない
  * 状態変更経路になるためで、実際に接続するときはその操作自体が `authorizePlAction()` を
  * 通らなければならない（独立レビュー指摘・2026-09-18）。
  */

@@ -61,6 +61,24 @@ export {
   ProviderSeparationError,
   resolveReviewVendor,
 } from './reviewSeparation'
+export {
+  FLAGSHIP_REMEDIATION_CANDIDATES,
+  extractDesignReviewFindings,
+  isMateriallyDifferentSpec,
+  selectCriticModel,
+  reviewVisibleSpecKey,
+  parseRemediationProposal,
+  selectRemediationModel,
+} from './independentRemediationPolicy'
+export type {
+  DesignReviewFinding,
+  RemediationCandidate,
+  RemediationModelInput,
+  RemediationModelSelection,
+  RemediationProposal,
+  RemediationSpec,
+  CriticModelSelection,
+} from './independentRemediationPolicy'
 export * from './roadmapTaskIdentity'
 export * from './taskOccupancy'
 export * from './roadmapTopology'
@@ -79,3 +97,20 @@ export type {
   RequiredGate,
 } from './plActionPolicy'
 export type { ReviewVendor } from './reviewSeparation'
+export {
+  DISPUTE_GROUNDS,
+  FINDING_ASSESSMENT_STATUSES,
+  bindingDisputes,
+  challengeableDisputes,
+  disputedFindings,
+  isBindingSafetySource,
+  parseCritique,
+  challengeTarget,
+  shouldChallengeFinding,
+} from './independentCriticPolicy'
+export type {
+  Critique,
+  DisputeGround,
+  FindingAssessment,
+  FindingAssessmentStatus,
+} from './independentCriticPolicy'
