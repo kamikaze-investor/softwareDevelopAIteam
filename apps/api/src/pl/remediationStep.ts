@@ -171,7 +171,7 @@ export function priorCriticModels(storage: IStorage, taskId: string): string[] {
   return models
 }
 
-function stageEntries(
+export function stageEntries(
   storage: IStorage,
   taskId: string,
   stage: 'critic' | 'remediation' | 'challenge',
@@ -342,7 +342,7 @@ export function findRemediationSubject(
  * `design_review_runs` は Task ごとに最新1件しか引けないので、世代の履歴は audit で復元する。
  * **新しいテーブルは作らない。**
  */
-function collectRejectedSpecKeys(storage: IStorage, task: Task): string[] {
+export function collectRejectedSpecKeys(storage: IStorage, task: Task): string[] {
   const keys = new Set<string>([
     shortSpecKey({
       implementationScope: extractImplementationScope(task.description) ?? '',
@@ -364,7 +364,7 @@ function collectRejectedSpecKeys(storage: IStorage, task: Task): string[] {
  * 照合に使うのは同一性だけなので hash で足りる。**判定ロジックは共有の pure 関数側に置き、
  * ここでは短縮だけを行う**（2箇所に判定を書かない）。
  */
-function shortSpecKey(spec: { implementationScope: string; allowedPaths: readonly string[] }): string {
+export function shortSpecKey(spec: { implementationScope: string; allowedPaths: readonly string[] }): string {
   return computeDesignTextHash(reviewVisibleSpecKey(spec)).slice(0, 16)
 }
 
@@ -741,125 +741,189 @@ export async function runRemediationStep(
     }
   }
 
-  // ── 却下済み提案の再審査を拒否する（Review を走らせる前に）───────
+  // ── 修正版 spec を適用する（guard → Gate → 採用 → fresh Review の共有経路）──
   //
-  // 比較するのは **Review が実際に見る部分**（scope + allowedPaths）であって Task の3欄ではない。
-  // `acceptanceCriteria` はレビュー対象 prompt に1文字も入らないため、AC だけを書き換えた提案は
-  // **byte 単位で同一のテキストへの再抽選**になる（独立レビュー指摘）。
-  // また **却下済み全件**と比べる —— 直前だけと比べると A → B → A の巡回で A を再提出できる。
-  const submittedScope = buildRemediatedScope(proposal)
-  const proposedHash = computeProposedDesignTextHash({
+  // **PL revision と同じ関数を通す。** 誰が spec を書いたかで関門が変わってはならない。
+  const outcome = await applyRevisedSpec(storage, {
+    subject,
     ledgerBody,
-    implementationScope: submittedScope,
-    allowedPaths: proposal.allowedPaths,
-  })
-  const proposedSpecKey = shortSpecKey(proposal)
-  if (!isMateriallyDifferentSpec(subject.rejectedSpecKeys, proposedSpecKey)) {
-    recordRemediation(
-      storage,
-      taskId,
-      `${provenance} proposed=${proposedHash} fspec=${proposedSpecKey} outcome=not_different`,
-    )
-    return {
-      status: 'proposal_not_materially_different',
-      taskId,
-      roadmapId: subject.roadmapId,
-      provider: candidate.provider,
-      model: candidate.model,
-      failureCode: 'identical_to_rejected',
-      reason:
-        'the proposal leaves the review-visible design (implementationScope and allowedPaths)'
-        + ' identical to one the review already rejected; re-reviewing it would only re-roll'
-        + ' the verdict on the same text',
-      proposal,
-    }
-  }
-
-  // ── Mandatory Gate（唯一の許可経路。採用と同じ関数）──────────────
-  const gate = authorizeAdoptionScope(storage, {
-    projectId: subject.task.projectId,
-    roadmapId: subject.roadmapId,
-    allowedPaths: proposal.allowedPaths,
-    riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
-    rationale: proposal.resolution,
-  })
-  if (!gate.ok) {
-    recordRemediation(storage, taskId, `${provenance} proposed=${proposedHash} outcome=${gate.failureCode}`)
-    return {
-      status: 'blocked',
-      taskId,
-      roadmapId: subject.roadmapId,
-      provider: candidate.provider,
-      model: candidate.model,
-      failureCode: gate.failureCode,
-      reason: gate.reason,
-      proposal,
-    }
-  }
-
-  recordRemediation(
-    storage,
-    taskId,
-    `${provenance} proposed=${proposedHash} fspec=${proposedSpecKey} outcome=adopting`,
-  )
-
-  // ── Execute（既存の採用経路。内側で fresh Design Review が必ず走る）───
-  const adopt = deps.adopt ?? adoptRoadmapItem
-  const result = await adopt(storage, {
-    projectId: subject.task.projectId,
-    roadmapId: subject.roadmapId,
+    submittedScope: buildRemediatedScope(proposal),
+    rawScope: proposal.implementationScope,
     allowedPaths: proposal.allowedPaths,
     acceptanceCriteria: proposal.acceptanceCriteria,
-    // 判断の記録を spec 本体へ残す。**新しい Task field を作らない。**
-    implementationScope: submittedScope,
-    // Job は0件なので follow-up ではない（通常の採用し直し）。
+    riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
+    rationale: proposal.resolution,
+    provenance: provenance,
+    ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
   })
 
-  if (!result.ok) {
-    return {
-      status: 'adoption_rejected',
-      taskId,
-      roadmapId: subject.roadmapId,
-      provider: candidate.provider,
-      model: candidate.model,
-      failureCode: result.code,
-      reason: result.reason,
-      proposal,
-    }
-  }
-
-  // ── Verify（採用経路の戻り値だけで成功としない）───────────────────
-  //
-  // `adoptRoadmapItem()` は `ensureInitialWorkflows()` の結果を捨てるため、CONFLICT のままでも
-  // `ok: true` を返す。よって Job の実在を確かめる。ただし**「Job が1件でもある」では足りない**
-  // —— 別の試行が作った Job を自分の成果として報告してしまう（独立レビュー指摘）。
-  // **この提案の prompt から作られた Job であること**を hash で確かめる。
-  // 比較する値は Job Gate が計算するのと同一（`computeDesignTextHash(job.aiCliPrompt)`）である。
-  const jobs = storage.jobs.findByTaskId(result.taskId).filter(
-    (job) => job.aiCliPrompt !== undefined
-      && computeDesignTextHash(job.aiCliPrompt) === proposedHash,
-  )
-  if (jobs.length === 0) {
-    return {
-      status: 'still_not_aligned',
-      taskId: result.taskId,
-      roadmapId: subject.roadmapId,
-      provider: candidate.provider,
-      model: candidate.model,
-      failureCode: 'fresh_review_not_aligned',
-      reason: 'the remediated proposal did not pass a fresh design review; no implement job was created',
-      proposal,
-    }
-  }
-
-  return {
-    status: 'remediated',
-    taskId: result.taskId,
+  const common = {
+    taskId,
     roadmapId: subject.roadmapId,
     provider: candidate.provider,
     model: candidate.model,
     proposal,
   }
+
+  if (outcome.status === 'applied') {
+    return { ...common, status: 'remediated', taskId: outcome.taskId }
+  }
+  if (outcome.status === 'not_materially_different') {
+    return {
+      ...common,
+      status: 'proposal_not_materially_different',
+      failureCode: outcome.failureCode,
+      reason: outcome.reason,
+    }
+  }
+  return {
+    ...common,
+    status: outcome.status === 'blocked'
+      ? 'blocked'
+      : outcome.status === 'adoption_rejected' ? 'adoption_rejected' : 'still_not_aligned',
+    failureCode: outcome.failureCode,
+    reason: outcome.reason,
+  }
+}
+
+/** 修正版 spec を適用した結果。Remediation と PL revision が共有する。 */
+export type ApplyRevisedSpecOutcome =
+  | { status: 'applied'; taskId: string; proposedHash: string; specKey: string }
+  | {
+      status: 'not_materially_different' | 'blocked' | 'adoption_rejected' | 'still_not_aligned'
+      failureCode: string
+      reason: string
+      proposedHash: string
+      specKey: string
+    }
+
+/**
+ * 修正版 Task Spec を**既存の採用経路へ適用する**。
+ *
+ * **Remediation（Stage 3）と PL revision（Stage 1/2）が共有する唯一の適用経路**である。
+ * 別々に書くと、片方だけ material-difference guard や Gate を欠いた経路ができる。
+ * 誰が spec を書いたかによって通す関門が変わってはならない。
+ *
+ * ここが必ず行うこと:
+ *   1. **却下済みと Review 対象が同一なら適用しない**（judgment の再抽選を作らない）
+ *   2. `authorizeAdoptionScope()` —— 既存 Gate。新しい action kind も承認経路も作らない
+ *   3. `adoptRoadmapItem()` —— 内側で **fresh Design Review が必ず走る**。旧 evidence は
+ *      hash 束縛で流用できない
+ *   4. **この spec の prompt から作られた Job の実在だけ**を成功の根拠にする
+ */
+export async function applyRevisedSpec(
+  storage: IStorage,
+  input: {
+    subject: RemediationSubject
+    ledgerBody: string
+    /** 採用へ渡す scope（判断記録を折り込んだ最終形）。 */
+    submittedScope: string
+    /**
+     * 却下済みとの比較に使う **raw scope**（著者が書いた生の文）。
+     *
+     * `submittedScope` は判断記録を追記するので**毎回必ず変わる**。それをキーにすると
+     * 「違う」ことを1つも保証せず、`collectRejectedSpecKeys()` が集めた過去世代のキーとも
+     * 照合できない。比較の基礎は raw scope である。
+     * 呼び出し側へ明示させるのは、取り違えても型では気付けないためである。
+     */
+    rawScope: string
+    allowedPaths: string[]
+    acceptanceCriteria: string[]
+    /** Gate へ記録する risk 見解ラベルと理由。判定には使われない。 */
+    riskOpinionLevel: string
+    rationale: string
+    /** audit へ残す provenance 前置き（`stage=` を含む）。 */
+    provenance: string
+    adopt?: typeof adoptRoadmapItem
+  },
+): Promise<ApplyRevisedSpecOutcome> {
+  const { subject, ledgerBody } = input
+  const taskId = subject.task.id
+  // **2つの hash は基礎が違う。取り違えると guard か Job 照合のどちらかが壊れる。**
+  //   - `proposedHash` … **実際に submit される** prompt の hash。Job Gate が計算する値と
+  //     一致させる必要があるので `submittedScope`（判断記録を含む最終形）から作る
+  //   - `specKey` … 却下済みとの比較キー。判断記録は毎回変わるので **raw scope** から作る
+  const proposedHash = computeProposedDesignTextHash({
+    ledgerBody,
+    implementationScope: input.submittedScope,
+    allowedPaths: input.allowedPaths,
+  })
+  const specKey = shortSpecKey({
+    implementationScope: input.rawScope,
+    allowedPaths: input.allowedPaths,
+  })
+  const tail = `proposed=${proposedHash} fspec=${specKey}`
+
+  if (!isMateriallyDifferentSpec(subject.rejectedSpecKeys, specKey)) {
+    recordRemediation(storage, taskId, `${input.provenance} ${tail} outcome=not_different`)
+    return {
+      status: 'not_materially_different',
+      failureCode: 'identical_to_rejected',
+      reason:
+        'the revision leaves the review-visible design (implementationScope and allowedPaths)'
+        + ' identical to one the review already rejected; re-reviewing it would only re-roll'
+        + ' the verdict on the same text',
+      proposedHash,
+      specKey,
+    }
+  }
+
+  const gate = authorizeAdoptionScope(storage, {
+    projectId: subject.task.projectId,
+    roadmapId: subject.roadmapId,
+    allowedPaths: input.allowedPaths,
+    riskOpinionLevel: input.riskOpinionLevel,
+    rationale: input.rationale,
+  })
+  if (!gate.ok) {
+    recordRemediation(storage, taskId, `${input.provenance} ${tail} outcome=${gate.failureCode}`)
+    return {
+      status: 'blocked',
+      failureCode: gate.failureCode,
+      reason: gate.reason,
+      proposedHash,
+      specKey,
+    }
+  }
+
+  recordRemediation(storage, taskId, `${input.provenance} ${tail} outcome=adopting`)
+
+  const adopt = input.adopt ?? adoptRoadmapItem
+  const result = await adopt(storage, {
+    projectId: subject.task.projectId,
+    roadmapId: subject.roadmapId,
+    allowedPaths: input.allowedPaths,
+    acceptanceCriteria: input.acceptanceCriteria,
+    implementationScope: input.rawScope,
+  })
+
+  if (!result.ok) {
+    return {
+      status: 'adoption_rejected',
+      failureCode: result.code,
+      reason: result.reason,
+      proposedHash,
+      specKey,
+    }
+  }
+
+  // `adoptRoadmapItem()` は `ensureInitialWorkflows()` の結果を捨てるため、CONFLICT のままでも
+  // `ok: true` を返す。**この spec の prompt から作られた Job だけ**を成功の根拠にする
+  // （別の試行が作った Job を自分の成果として報告しない）。
+  const applied = storage.jobs.findByTaskId(result.taskId).some(
+    (job) => job.aiCliPrompt !== undefined && computeDesignTextHash(job.aiCliPrompt) === proposedHash,
+  )
+  if (!applied) {
+    return {
+      status: 'still_not_aligned',
+      failureCode: 'fresh_review_not_aligned',
+      reason: 'the revised design did not pass a fresh design review; no implement job was created',
+      proposedHash,
+      specKey,
+    }
+  }
+
+  return { status: 'applied', taskId: result.taskId, proposedHash, specKey }
 }
 
 /**
