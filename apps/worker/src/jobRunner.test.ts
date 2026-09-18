@@ -3125,6 +3125,56 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(firstLine).not.toContain('credit exhausted')
   })
 
+  // **純関数が正しくても、call site で渡し忘れれば本番では効かない。**
+  // `aiCliTimeoutMs()` 自体の網羅は `aiCliTimeout.test.ts` にあり、ここで見るのは
+  // 「runJob が実際に adapter.run() へその値を載せているか」だけである。
+  // production 実測: implement の provider_timeout 7 件はすべて changedFiles を持っており、
+  // 生成済みの変更が毎回失われていた（打ち切り時点でも進んでいたかは別の話）。
+  it('implement の adapter.run() へ timeoutMs=900000 が渡る', async () => {
+    const run = vi.fn().mockResolvedValue(makeCliResult({}))
+    createAiCliAdapterMock.mockReturnValue({ run } as any)
+
+    await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(run).toHaveBeenCalled()
+    expect(run.mock.calls[0][0]).toMatchObject({ timeoutMs: 900_000 })
+  })
+
+  // review は 53 件で timeout 0 件・max 131s。ここへ渡すと global default を
+  // 伸ばしたのと同じ影響になり、ハング検知が鈍る。
+  it('review の adapter.run() には timeoutMs を渡さない（既定 300000 のまま）', async () => {
+    const run = vi.fn().mockResolvedValue(makeCliResult({}))
+    createAiCliAdapterMock.mockReturnValue({ run } as any)
+
+    await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'review',
+    }), createPolicy(), createStructuredReviewContext())
+
+    expect(run).toHaveBeenCalled()
+    expect(run.mock.calls[0][0].timeoutMs).toBeUndefined()
+  })
+
+  // 実測が claude_code のものしかないため、測っていない provider へ広げない。
+  it('他 provider の implement には timeoutMs を渡さない', async () => {
+    const run = vi.fn().mockResolvedValue(makeCliResult({}))
+    createAiCliAdapterMock.mockReturnValue({ run } as any)
+
+    await runJob(createJob({
+      aiCliProvider: 'gemini',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(run).toHaveBeenCalled()
+    expect(run.mock.calls[0][0].timeoutMs).toBeUndefined()
+  })
+
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
   // redact ではなく「echo しない」ことで、取りこぼしの余地を無くしている。
   it('API エラー文に credential 断片があっても operator 向けには出さない', async () => {

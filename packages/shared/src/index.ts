@@ -79,6 +79,7 @@ export type {
   RemediationSpec,
   CriticModelSelection,
 } from './independentRemediationPolicy'
+export * from './aiCliTimeout'
 export * from './roadmapTaskIdentity'
 export * from './taskOccupancy'
 export * from './roadmapTopology'

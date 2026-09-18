@@ -7276,6 +7276,41 @@ PL Console 4項目の state・優先度は変更していない。
       `containment-success-path-observability` と `review-substage-progress-reporting` は
       本項目に**包含される**（重複実装しない。両項目は本項目の受入条件へ畳む）。
 
+      **production evidence（2026-09-18 実測。新規 Finding は作らず本項目へ統合・CEO 指示）**:
+
+      実行中の Job の**進捗が外から一切分からない**ことが、実際の誤判断につながった。
+      Job `2dc04370` は 09:46:52Z に始まり 09:51:56Z に終わっていた（304 秒）が、
+      CEO 側からは「50 分以上動き続けている」ように見えていた。
+      直接の原因は調査側のツールだったが、**AIteamOS 側にも区別する材料が無い**:
+
+      1. **`jobs` に進捗を表す列が無い。** あるのは `started_at` / `completed_at` / `created_at`
+         だけで、`lastActivity` に当たる列も「いま何をしているか」も保存していない。
+         したがって「動いているが遅い」と「止まっている」を **DB からは原理的に区別できない**。
+         State API も Mobile も、この区別を持たない情報を表示している
+      2. **既に timestamp を持つ材料が手元にある。** Claude Code CLI の session transcript
+         （`~/.claude/projects/<workspace>/<session>.jsonl`）には 1 イベントごとに `timestamp` があり、
+         今回はそこから毎分のイベント数（23/12/12/14/**34**）を復元して
+         「終了 15 秒前まで作業していた」と確定できた。
+         **新しい telemetry 基盤を作らなくても lastActivity 相当は取れる**可能性が高い。
+         ただし中身は provider 由来の untrusted data なので、読むのは timestamp と件数に留め、
+         本文は `job-raw-output-persisted-and-shown` の責務とする
+      3. **timeout で強制終了された今回、stdout/stderr は 0 バイトだった。** `stdout.txt` /
+         `stderr.txt` は終了時刻で作られて中身が無く、envelope ごと診断材料を失った。
+         **最も診断が要る失敗のときに、最も情報が少なくなる**。
+         なお「強制終了なら必ず 0 バイト」と一般化はできない。プロセスが落ちる前に
+         flush していれば途中まで残りうる。**観測しているのはこの 1 件である**
+      4. **7〜20 日 `queued` のまま残っている Job が 3 件ある**
+         （`e73c7e5e` 2026-08-28 / `538826cd`・`b71b4c3e` 2026-09-11）。
+         どの attention にも現れず、誰も気づいていなかった。
+         「実行中に見えるが進んでいない」だけでなく「待機のまま忘れられる」経路もある
+
+      **本項目の受入条件へ畳む**: 横断状態として読み出せるべきなのは「実行中か」ではなく
+      **「最後に進捗したのはいつか」**である。今回はそこが無いために、
+      5 分で終わっていた Job を 50 分動いていると誤認した。
+
+      **ここでは実装しない**（CEO 指示・2026-09-18）。timeout 側の対応（`claude_code` implement を
+      900s の暫定 budget へ）は別途実施済みで、**そちらは進捗可視化の代わりにはならない**。
+
 **目的:**
 - CEOがPC/スマホからPL（Project Lead Role）へ指示を出す画面を、特定ベンダーUI
   （Claude Desktop等）に依存しない構成にする

@@ -11,6 +11,7 @@
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import type {
+  AiCliMode,
   AiCliProvider,
   AiCliResult,
   Job,
@@ -23,7 +24,7 @@ import type {
   ReviewResult,
   Task,
 } from '@ai-team/shared'
-import { runRiskReview } from '@ai-team/shared'
+import { aiCliTimeoutMs, runRiskReview } from '@ai-team/shared'
 import { z } from 'zod'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
@@ -80,6 +81,7 @@ import {
 } from './execution/runContainedCommand.js'
 
 const JOB_TIMEOUT_MS = 120_000
+
 
 /** recovery git 操作の実行上限（P1 Phase 2）。従来は timeout が無かった */
 const RECOVERY_GIT_TIMEOUT_MS = 10_000
@@ -769,6 +771,9 @@ export async function runJob(
         mode: job.aiCliMode,
         dryRun: job.dryRun,
         expectJson: job.aiCliMode === 'review',
+        // **implement だけ既定の5分では足りない（実測）。** undefined を渡した場合は
+        // adapter の `defaultTimeoutMs` がそのまま効くので、他 mode / 他 provider は無変更。
+        timeoutMs: aiCliTimeoutMs(job.aiCliProvider, job.aiCliMode),
       })
     } catch (err: unknown) {
       // adapter.run() は containment 失敗をそのまま再 throw する。ここで通常の
