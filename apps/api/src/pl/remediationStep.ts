@@ -260,6 +260,14 @@ export interface RemediationSubject {
   findings: readonly DesignReviewFinding[]
   /** 却下された提案の review-visible key（全世代ぶん）。 */
   rejectedSpecKeys: readonly string[]
+  /**
+   * CONFLICT を受けた**そのままの design text** と hash。
+   *
+   * `stage=challenge` は spec を変更せず、この text を **byte-identical** で再評価に掛ける。
+   * 保持しているのは、Task の description から再構成すると採用後の変更で揺れるためである。
+   */
+  reviewedDesignText: string
+  reviewedDesignTextHash: string
 }
 
 /**
@@ -319,6 +327,8 @@ export function findRemediationSubject(
     task,
     roadmapId: task.roadmapTaskKey,
     findings: extractDesignReviewFindings(run.resultJson),
+    reviewedDesignText: run.designText,
+    reviewedDesignTextHash: run.designTextHash,
     rejectedSpecKeys: collectRejectedSpecKeys(storage, task),
   }
 }
