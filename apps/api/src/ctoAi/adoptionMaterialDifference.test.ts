@@ -219,7 +219,7 @@ describe('却下済み spec の再提出は、Design Review を起こす前に�
       projectId, roadmapId: 'conflicted-item',
       // 許可範囲は同一。重複しているうえ、空白の揺れで初めて等しくなる形も混ぜる。
       // 大小違いも含める（`reviewVisibleSpecKey()` の契約どおり cosmetic 扱い）。
-      allowedPaths: [...ORIGINAL_PATHS, ...ORIGINAL_PATHS.map((path) => ` ${path.toUpperCase()} `)],
+      allowedPaths: [...ORIGINAL_PATHS, ...ORIGINAL_PATHS.map((path) => ` ${path.toUpperCase()}/ `)],
       acceptanceCriteria: ['当初の受入条件'],
       implementationScope: ORIGINAL_SCOPE,
     }, silentDeps())
