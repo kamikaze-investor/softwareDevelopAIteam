@@ -117,7 +117,11 @@ const REJECTED_REVIEW_KEY_TAG = /\brejected_rvk=(\S+)/g
  * **acceptanceCriteria は含まれない**（reviewer が見ないため）。
  */
 function reviewVisibleKeyOf(description: string, allowedPaths: readonly string[]): string {
-  return shortSpecKey({ implementationScope: description, allowedPaths: [...allowedPaths] })
+  // **重複を畳んでから鍵にする。** `reviewVisibleSpecKey()` は正規化と整列はするが
+  // 重複除去はしないため、`['a']` と `['a','a']` が別の鍵になる。File Change Guard から見た
+  // 許可範囲は同じなので、これを別物として扱うと **同じ内容を重複付きで出し直すだけで
+  // guard を迂回できる**（独立レビュー指摘・2026-09-18）。
+  return shortSpecKey({ implementationScope: description, allowedPaths: [...new Set(allowedPaths)] })
 }
 
 /**
@@ -150,8 +154,16 @@ function reviewVisibleKeyOf(description: string, allowedPaths: readonly string[]
  * `design_review_runs` は `findLatestByTaskId()` しか無く、Task の run 履歴を辿れない。
  * したがって却下と分かるのは **最新の終端 run** と **採用時に audit へ書けた分**だけである。
  * CONFLICT の後に同一テキストへ別の run（Challenge の `UNCERTAIN` 等）が乗り、その間に採用が
- * 起きなかった場合、その CONFLICT は記録に残らない。恒久対応は「却下を review 完了時点で
- * 記録する」ことで、Design Review pipeline 側の変更になるため別 Finding
+ * 起きなかった場合、その CONFLICT は記録に残らない。
+ *
+ * **#255 の `rejected_fspec=` はここでは読まない。鍵の空間が違うためである。**
+ * あちらは scope + allowedPaths だけの鍵で（remediation 世代では ledger 本文が動かない）、
+ * こちらは description 全体を含む。2つは比較できないので、Remediation 経路で却下された案を
+ * 採用経路から再提出しても検出できない。**狭い方の鍵を併用する案は採らない** ——
+ * ledger 本文だけを訂正した再投入が scope 鍵の一致で拒否され、手順書の正規経路をまた塞ぐ。
+ *
+ * どちらも恒久対応は「却下を review 完了時点で1つの鍵空間で記録する」ことで、
+ * Design Review pipeline 側の変更になるため別 Finding
  * （`design-review-rejections-are-not-durably-recorded`）として登録した。
  */
 function rejectedReviewVisibleKeys(
