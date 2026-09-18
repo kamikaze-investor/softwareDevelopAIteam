@@ -213,31 +213,36 @@ describe('recoverBlockedTask — audit と有界性', () => {
       .toMatchObject({ ok: false, code: 'TASK_NOT_BLOCKED' })
   })
 
-  it('**同じ design text では2度目を受理しない**（判定の揺れで CONFLICT を洗浄させない）', () => {
+  it('**訂正されずに blocked へ戻っても、再投入を拒否して deadlock にしない**', () => {
+    // 独立レビュー round 1 を受けて「同一 designTextHash では1回だけ」を入れたが、
+    // round 2 で deadlock が判明して撤回した経緯を固定する:
+    //   design text は description + allowedPaths 由来 → **訂正しなければ hash は同じ**
+    //   訂正には `syncRoadmapTasks()` が要る → それは `pending` を要求する
+    //   `pending` にするにはこの関数が要る
+    // よって同一 hash で拒否すると、訂正する手段ごと失われる。
     const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
     completeReviewAsConflict(storage, taskId)
 
     expect(recoverBlockedTask(storage, { taskId, reason: '1回目' }).ok).toBe(true)
 
-    // 変えずに、また同じ状態へ落ちた。同じテキストを再審査させない。
+    // 何も変わらないまま、また同じ状態へ落ちた（最も普通のケース）。
     storage.tasks.update(taskId, { status: 'blocked' })
-    const repeat = recoverBlockedTask(storage, { taskId, reason: '変えずにもう一度' })
-    expect(repeat).toMatchObject({ ok: false, code: 'SPEC_ALREADY_RETRIED' })
-    expect(repeat.ok === false && repeat.reason).toContain('implementationScope')
-    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+
+    const again = recoverBlockedTask(storage, { taskId, reason: '2回目' })
+    expect(again).toMatchObject({ ok: true, attempt: 2 })
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
   })
 
-  it('**訂正して世代が変われば、また受理する**（二度と復旧不能にはしない）', () => {
+  it('再投入のたびに、対象だった design text を audit へ残す（後から数えるため）', () => {
     const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
     completeReviewAsConflict(storage, taskId)
-    expect(recoverBlockedTask(storage, { taskId, reason: '1回目' }).ok).toBe(true)
 
-    // 訂正して採用し直した結果、別の design text が審査された（= 別世代）。
-    storage.tasks.update(taskId, { status: 'blocked', description: '訂正後の説明' })
-    completeReviewAsConflict(storage, taskId)
+    recoverBlockedTask(storage, { taskId, reason: 'r' })
 
-    expect(recoverBlockedTask(storage, { taskId, reason: '訂正したので再投入' }))
-      .toMatchObject({ ok: true, attempt: 2 })
+    const entry = storage.auditLog.findByEntity('task', taskId)
+      .find((e) => e.operation === 'task_human_recovered')
+    // 門にはしないが、同じテキストのまま何度戻したかは後から数えられる。
+    expect(entry?.detail).toMatch(/dth=[0-9a-f]{16}/)
   })
 
   it('自動ループの予算を消費もリセットもしない', () => {
