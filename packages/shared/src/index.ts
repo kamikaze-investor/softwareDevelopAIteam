@@ -97,3 +97,16 @@ export type {
   RequiredGate,
 } from './plActionPolicy'
 export type { ReviewVendor } from './reviewSeparation'
+export {
+  DISPUTE_GROUNDS,
+  FINDING_ASSESSMENT_STATUSES,
+  disputedFindings,
+  parseCritique,
+  shouldChallengeFinding,
+} from './independentCriticPolicy'
+export type {
+  Critique,
+  DisputeGround,
+  FindingAssessment,
+  FindingAssessmentStatus,
+} from './independentCriticPolicy'
