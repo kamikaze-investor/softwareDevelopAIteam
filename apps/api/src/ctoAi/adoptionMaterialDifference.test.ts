@@ -338,6 +338,29 @@ describe('却下されていない案を、却下済みとして扱わない', (
   })
 })
 
+describe('ledger 本文の訂正は「違う提案」として通す（手順書の正規経路）', () => {
+  it('**scope / allowedPaths が同じでも、ledger 本文を訂正したなら再レビューできる**', async () => {
+    const { storage, projectId } = seedProject()
+    const first = await adoptOriginal(storage, projectId)
+    rejectCurrentSpec(storage, first.ok ? first.taskId : '')
+
+    // CONFLICT の原因が ledger 本文の陳腐化だったので、本文だけを訂正する
+    // （手順書 `human_recovery.md` 手順 2 の「Source of Truth 側の問題」）。
+    writeFileSync(join(ledgerRoot, 'tasks', 'roadmap.md'), [
+      '# Roadmap',
+      '',
+      '<!-- roadmap:id=conflicted-item state=planned -->',
+      '1. [ ] **CONFLICT した項目** — 実仕様に合わせて本文を訂正した',
+      '   訂正後の本文。reviewer が読む内容が変わっている。',
+    ].join(LF), 'utf-8')
+
+    // scope も allowedPaths も当初のまま。**それでも通らなければならない。**
+    const corrected = await adoptOriginal(storage, projectId)
+
+    expect(corrected.ok).toBe(true)
+  })
+})
+
 describe('本当に違う提案は通り、fresh Design Review が走る', () => {
   it('scope と allowedPaths を訂正した提案は採用され、ALIGNED なら Job が作られる', async () => {
     const { storage, projectId } = seedProject()

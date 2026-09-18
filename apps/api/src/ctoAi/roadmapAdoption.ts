@@ -45,8 +45,8 @@ import {
   occupiesProject,
 } from '@ai-team/shared'
 import type { Task } from '@ai-team/shared'
-// #255 の判定器をそのまま使う。**material-difference の定義を複製しない。**
-import { collectRejectedSpecKeys, recordRemediationFailure, shortSpecKey } from '../pl/remediationStep'
+// #255 の判定器（`isMateriallyDifferentSpec`）をそのまま使う。判定の定義は複製しない。
+import { recordRemediationFailure, shortSpecKey } from '../pl/remediationStep'
 import { recomputeDecision, type RawStrategicResult } from '../designReview/designReviewCoordinator'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow'
@@ -105,35 +105,68 @@ function latestReviewRejectedCurrentSpec(storage: IStorage, task: Task): boolean
   }
 }
 
+/** audit の `rejected_rvk=` に残っている、過去に却下された review-visible key。 */
+const REJECTED_REVIEW_KEY_TAG = /\brejected_rvk=(\S+)/g
+
 /**
- * この Task について、**formal Design Review が実際に却下した** spec のキー全件。
+ * レビュー対象入力の正規化キー。**#255 の `reviewVisibleSpecKey()` をそのまま使う。**
  *
- * `collectRejectedSpecKeys()`（#255）をそのまま使う。ただし1点だけ文脈が違う ——
- * あちらは `findRemediationSubject()` が「現在 spec はいま却下されたもの」と確定させた後に
- * 呼ばれるため、**現在 spec を無条件に却下済みとして含める**。
- * 採用経路にはその前提が無い（却下されていない Task も採用し直される）ので、
- * **「直近 review がこの spec を却下した」と言えるときだけ現在 spec を残す**。
- * その判定には run と現在テキストの束縛が要る（`latestReviewRejectedCurrentSpec()`）——
- * A を却下 → B を採用した直後は「最新 run = A の CONFLICT / Task = B」になるので、
- * 束縛しないと **B がまだ一度も却下されていないのに却下済み扱いになり、B の review が
- * `REVIEW_UNAVAILABLE` 等で流れたときに B を出し直せなくなる**（独立レビュー指摘・2026-09-18）。
- *
- * 集合が空なら guard は何もしない。初回採用・follow-up・却下歴の無い Task・ALIGNED 済み Task が
- * 自動的に対象外になるのはこのためである（専用の trigger 判定を別に持たない）。
+ * 渡すのは `description` 全体（= ledger 本文 + implementationScope）と `allowedPaths` で、
+ * これは `buildInitialImplementAiCliPrompt()` が reviewer へ見せるものと一致する。
+ * `shortSpecKey()` 経由なので、#255 と同じく空白・大小・`allowedPaths` の順序は正規化され、
+ * **acceptanceCriteria は含まれない**（reviewer が見ないため）。
  */
-function rejectedSpecKeysForAdoption(
+function reviewVisibleKeyOf(description: string, allowedPaths: readonly string[]): string {
+  return shortSpecKey({ implementationScope: description, allowedPaths: [...allowedPaths] })
+}
+
+/**
+ * この Task について、**formal Design Review が実際に却下した review-visible key** の全件。
+ *
+ * ## なぜ scope + allowedPaths だけでは足りないのか
+ *
+ * #255 の `reviewVisibleSpecKey()` を **`description` 全体**へ適用する。
+ * あの経路（Remediation 世代の比較）では ledger 本文が世代間で変わらず、動くのは scope と
+ * allowedPaths だけなので scope を渡せば十分だった。**採用経路では ledger 本文も変わる。**
+ * レビュー対象は `description`（= ledger 本文 + implementationScope）と allowedPaths 由来の
+ * Design Contract であり（`buildInitialImplementAiCliPrompt()`）、ledger 本文はその一部である。
+ *
+ * scope + allowedPaths だけで比べると、**「CONFLICT の原因が ledger 本文の陳腐化なので
+ * 本文を訂正してから再投入する」という手順書の経路が塞がる**（本文を直しても鍵が変わらない。
+ * 独立レビュー指摘・2026-09-18）。これは手順書に明記された正規の復旧手順なので塞いではならない。
+ *
+ * `description` 全体を渡すことで、鍵は reviewer が見るものと一致する:
+ *   - ledger 本文を訂正した → 鍵が変わる → 通す（手順書どおり）
+ *   - scope / allowedPaths を訂正した → 鍵が変わる → 通す
+ *   - **AC だけ変えた → 鍵は同じ → 拒否**（AC はレビュー対象に1文字も入らない）
+ *   - 空白・大小・`allowedPaths` の順序だけの違い → 正規化されるので同じ → 拒否
+ *
+ * 判定そのものは #255 の `isMateriallyDifferentSpec()`、正規化も #255 の
+ * `reviewVisibleSpecKey()`（`shortSpecKey()` 経由）をそのまま使う。
+ * **判定器も正規化も複製していない。** 変えたのは「何を鍵の材料にするか」だけである。
+ *
+ * ## 限界（塞げていない範囲）
+ *
+ * `design_review_runs` は `findLatestByTaskId()` しか無く、Task の run 履歴を辿れない。
+ * したがって却下と分かるのは **最新の終端 run** と **採用時に audit へ書けた分**だけである。
+ * CONFLICT の後に同一テキストへ別の run（Challenge の `UNCERTAIN` 等）が乗り、その間に採用が
+ * 起きなかった場合、その CONFLICT は記録に残らない。恒久対応は「却下を review 完了時点で
+ * 記録する」ことで、Design Review pipeline 側の変更になるため別 Finding
+ * （`design-review-rejections-are-not-durably-recorded`）として登録した。
+ */
+function rejectedReviewVisibleKeys(
   storage: IStorage,
   task: Task,
   currentSpecRejected: boolean,
 ): string[] {
-  const keys = collectRejectedSpecKeys(storage, task)
-  if (currentSpecRejected) return keys
-
-  const currentKey = shortSpecKey({
-    implementationScope: extractImplementationScope(task.description) ?? '',
-    allowedPaths: task.allowedPaths ?? [],
-  })
-  return keys.filter((key) => key !== currentKey)
+  const hashes = new Set<string>()
+  for (const entry of storage.auditLog.findByEntity('pl_remediation', `remediate:${task.id}`)) {
+    for (const match of (entry.detail ?? '').matchAll(REJECTED_REVIEW_KEY_TAG)) {
+      if (match[1] !== undefined && match[1] !== '-') hashes.add(match[1])
+    }
+  }
+  if (currentSpecRejected) hashes.add(reviewVisibleKeyOf(task.description, task.allowedPaths ?? []))
+  return [...hashes]
 }
 
 export type AdoptRoadmapItemFailure =
@@ -540,84 +573,6 @@ export async function adoptRoadmapItem(
   let supersededRejectedKey: string | undefined
   let supersededTaskId: string | undefined
 
-  // ── 却下済みテキストの再審査を拒否する（Review laundering 対策）──────────────
-  //
-  // **この経路が fresh Design Review を起こす入口である。** 採用すると
-  // `ensureInitialWorkflowsForActiveTasks()` → `createInitialImplementWorkflow()` →
-  // `createAndExecuteDesignReview()` と進むので、**同じ spec を採用し直すだけで
-  // 同じテキストへの Review を何度でも引ける**。この repo では同一入力に対する判定が実行ごとに
-  // 反転することが実測されている（ledger: `independent-review-verdict-instability`）ため、
-  // これは「CONFLICT を偶然の ALIGNED で洗浄する」経路になる。
-  //
-  // #255 の Remediation 経路には既に同じ検査がある（`applyRevisedSpec()`）。
-  // **穴は素の採用経路だけ**だったので、同じ判定器をそのまま呼ぶ。
-  // `reviewVisibleSpecKey()` / `isMateriallyDifferentSpec()` / `collectRejectedSpecKeys()` は
-  // すべて #255 の既存 export であり、**新しい material-difference engine は作っていない。**
-  //
-  // AC はキーに入らない（レビュー対象テキストに1文字も入らないため）。
-  // AC だけ書き換えた提案は「作り直した」ことにならない —— これも #255 と同じ定義である。
-  if (existingTask !== undefined) {
-    // scope 未指定は「空の scope」として比較する（`collectRejectedSpecKeys()` が
-    // `extractImplementationScope(...) ?? ''` で作る側と同じ扱いにする）。
-    const proposedKey = shortSpecKey({
-      implementationScope: input.implementationScope ?? '',
-      allowedPaths,
-    })
-    // **却下が実際に在るものだけを集める。** 空なら guard は何もしない。
-    const currentSpecRejected = latestReviewRejectedCurrentSpec(storage, existingTask)
-    const rejectedKeys = rejectedSpecKeysForAdoption(storage, existingTask, currentSpecRejected)
-    if (rejectedKeys.length > 0 && !isMateriallyDifferentSpec(rejectedKeys, proposedKey)) {
-      return {
-        ok: false,
-        code: 'SPEC_NOT_MATERIALLY_DIFFERENT',
-        reason:
-          `the proposed implementationScope / allowedPaths are the same as a spec that a formal `
-          + `Design Review already rejected for task "${taskKey}". `
-          + 'Re-submitting it unchanged would only re-roll the same review. '
-          + 'Change the implementation scope or the allowed paths (changing only the acceptance '
-          + 'criteria does not count: the reviewer never sees them)',
-        details: { proposedKey, rejectedKeys },
-      }
-    }
-
-    // **却下された世代を履歴へ残す。** 採用は Task の spec を提案内容で置き換えるので、
-    // ここで記録しないと「いま却下された案」は次の世代から見えなくなり、
-    // **A → B → A の巡回で A を再提出できてしまう**（#255 が同じ理由で残している）。
-    // 書き込み先も形式も #255 と同一で、`collectRejectedSpecKeys()` がそのまま読む。
-    //
-    // **記録するのは `rejected_fspec`（いま置き換えられる却下済みの案）だけである。**
-    // 提案側（`fspec`）は書かない —— `collectRejectedSpecKeys()` は `fspec` も却下として
-    // 読むため、ここで書くと **まだ一度も formal review に落とされていない案を却下済みにしてしまう**
-    // （validation や sync で失敗した場合、あるいは review が UNAVAILABLE だった場合に、
-    // 同じ案を出し直せなくなる。独立レビュー指摘・2026-09-18）。
-    // 提案が実際に却下されたときは、それが Task の現在 spec になっているので
-    // `rejectedSpecKeysForAdoption()` が Task 側から拾う。A → B → A はそれで止まる。
-    //
-    // **書き込む事実は sync の成否に依存しない。** 「この spec は却下された」は
-    // ここへ来た時点で既に確定しており（`rejectedKeys` に入っているのがその証拠）、
-    // 採用が後で失敗しても真のままである。だから sync の前に書いてよく、
-    // **書けたか書けなかったかで状態が食い違う窓を作らない**（独立レビュー指摘・2026-09-18）。
-    // 同じ事実を重ねて書いても `collectRejectedSpecKeys()` は Set で畳む。
-    //
-    // **条件は `currentSpecRejected` であって `rejectedKeys.length > 0` ではない。**
-    // 後者は「どれかが却下された」しか意味せず、それで記録すると
-    // A 却下 → 未レビューの B を採用 → C を採用、の3手目で **B を却下済みとして書いてしまう**
-    // （B は一度も formal review に落とされていない）。その後 B へ戻れなくなる
-    // ——「却下が在るか」と「**今の** spec が却下されたか」の取り違えで、
-    // guard 側で一度直したのと同じ誤りである（独立レビュー round 3 指摘）。
-    if (currentSpecRejected) {
-      recordRemediationFailure(
-        storage,
-        existingTask.id,
-        `stage=adoption outcome=superseded_rejected_spec `
-        + `rejected_fspec=${shortSpecKey({
-          implementationScope: extractImplementationScope(existingTask.description) ?? '',
-          allowedPaths: existingTask.allowedPaths ?? [],
-        })}`,
-      )
-    }
-  }
-
   const taskInput: RoadmapSyncTaskInput = {
     roadmapTaskKey: taskKey,
     title: item.title,
@@ -637,6 +592,62 @@ export async function adoptRoadmapItem(
     allowedPaths,
   }
 
+  // ── 却下済みテキストの再審査を拒否する（Review laundering 対策）──────────────
+  //
+  // **この経路が fresh Design Review を起こす入口である。** 採用すると
+  // `ensureInitialWorkflowsForActiveTasks()` → `createInitialImplementWorkflow()` →
+  // `createAndExecuteDesignReview()` と進むので、**同じテキストを採用し直すだけで
+  // Review を何度でも引ける**。この repo では同一入力に対する判定が実行ごとに反転することが
+  // 実測されている（ledger: `independent-review-verdict-instability`）ため、
+  // これは「CONFLICT を偶然の ALIGNED で洗浄する」経路になる。
+  //
+  // #255 の Remediation 経路には既に同じ検査がある（`applyRevisedSpec()`）。**穴は素の採用経路**
+  // だったので、判定器（`isMateriallyDifferentSpec()`）はそのまま再利用する。
+  // 鍵だけは **レビュー対象テキストの hash** にする —— 採用経路では ledger 本文も変わるため
+  // （理由は `rejectedReviewVisibleKeys()` の解説を参照）。
+  //
+  // **ここは Design Review より前である。** 拒否されたものは review を1回も消費しない。
+  if (existingTask !== undefined) {
+    const currentSpecRejected = latestReviewRejectedCurrentSpec(storage, existingTask)
+    const rejectedKeys = rejectedReviewVisibleKeys(storage, existingTask, currentSpecRejected)
+    // 提案が実際にレビューされる入力（description + allowedPaths）から鍵を作る。
+    const proposedKey = reviewVisibleKeyOf(taskInput.description, taskInput.allowedPaths)
+
+    if (rejectedKeys.length > 0 && !isMateriallyDifferentSpec(rejectedKeys, proposedKey)) {
+      return {
+        ok: false,
+        code: 'SPEC_NOT_MATERIALLY_DIFFERENT',
+        reason:
+          `the proposed task specification is byte-for-byte the same review input that a formal `
+          + `Design Review already rejected for task "${taskKey}". `
+          + 'Re-submitting it unchanged would only re-roll the same review. '
+          + 'Change the implementation scope, the allowed paths, or the roadmap item text itself '
+          + '(changing only the acceptance criteria does not count: the reviewer never sees them)',
+        details: { proposedKey, rejectedKeys },
+      }
+    }
+
+    // **却下されたテキストを履歴へ残す。** 採用は Task の spec を置き換えるので、
+    // ここで記録しないと「いま却下された案」は次の世代から見えなくなり、
+    // **A → B → A の巡回で A を再提出できてしまう**（#255 が同じ理由で残している）。
+    //
+    // 条件は `currentSpecRejected` である。「どれかが却下された」で書くと、
+    // A 却下 → 未レビューの B を採用 → C を採用、の3手目で **B を却下済みとして書いてしまう**
+    // （独立レビュー round 3 指摘）。
+    //
+    // 書くのは sync の前でよい。「このテキストは却下された」はこの時点で既に確定しており、
+    // 採用が後で失敗しても真のままなので、**書けた/書けないで状態が食い違う窓を作らない**。
+    // `stage=adoption` を必ず付ける（`stageEntries()` は `stage=` 無しを remediation として
+    // 数えるため、省くと Remediation の予算を削る）。この行はどの attempt budget にも算入されない。
+    if (currentSpecRejected) {
+      recordRemediationFailure(
+        storage,
+        existingTask.id,
+        `stage=adoption outcome=superseded_rejected_spec `
+        + `rejected_rvk=${reviewVisibleKeyOf(existingTask.description, existingTask.allowedPaths ?? [])}`,
+      )
+    }
+  }
   const phaseInput: RoadmapSyncPhaseInput = {
     phaseNumber: ADOPTED_PHASE_NUMBER,
     name: ADOPTED_PHASE_NAME,
