@@ -254,6 +254,17 @@ export interface PlAdoptionResult {
   roadmapId?: string
   taskId?: string
   reason?: string
+  /**
+   * 失敗の**下位分類**。`reason` は人が読む散文なので、機械判定に使ってはいけない。
+   *
+   * 同じ `status` でも原因が違うことがある（例: `proposal_unusable` は
+   * 「提案を組み立てられなかった」と「提示していない id を選んだ」の両方を含む）。
+   * CEO への通知が incident 単位で重複排除されるようになったため、この粒度が無いと
+   * **別の障害が既報として黙殺される**（独立レビュー指摘）。
+   *
+   * 値は既に構造化されているものだけを使う（`adoptRoadmapItem()` の code 等）。
+   */
+  failureCode?: string
 }
 
 /** ledger の所在。採用 API と同じ既定を使い、別経路を作らない。 */
@@ -561,7 +572,11 @@ export async function runAdoptionStep(
   )
   const proposal = parseAdoptionProposal(raw)
   if (!proposal) {
-    return { status: 'proposal_unusable', reason: 'PL did not produce a complete adoption proposal' }
+    return {
+      status: 'proposal_unusable',
+      failureCode: 'unparsable_proposal',
+      reason: 'PL did not produce a complete adoption proposal',
+    }
   }
 
   // 提示していない id を選んだ場合は、ここで落とす前に Gate でも落ちる（ledger 照合）。
@@ -579,6 +594,7 @@ export async function runAdoptionStep(
   if (!chosen) {
     return {
       status: 'proposal_unusable',
+      failureCode: 'unoffered_candidate',
       roadmapId: proposal.roadmapId,
       reason: `PL chose "${proposal.roadmapId}", which was not among the offered candidates`,
     }
@@ -600,7 +616,13 @@ export async function runAdoptionStep(
     assertAdoptionScopeIsBounded(authorization.decision, proposal.allowedPaths)
   } catch (error: unknown) {
     if (error instanceof PlActionBlockedError) {
-      return { status: 'blocked', roadmapId: proposal.roadmapId, reason: error.message }
+      return {
+        status: 'blocked',
+        // 足りない Gate の名前は列挙値であって散文ではない。原因が変われば分類も変わる。
+        failureCode: `gate_blocked:${[...error.missingGates].sort().join('+') || 'unknown'}`,
+        roadmapId: proposal.roadmapId,
+        reason: error.message,
+      }
     }
     throw error
   }
@@ -619,7 +641,13 @@ export async function runAdoptionStep(
   })
 
   if (!result.ok) {
-    return { status: 'adoption_rejected', roadmapId: proposal.roadmapId, reason: result.reason }
+    // `code` は `adoptRoadmapItem()` の列挙値（ALREADY_EXECUTED 等）。そのまま分類に使える。
+    return {
+      status: 'adoption_rejected',
+      failureCode: result.code,
+      roadmapId: proposal.roadmapId,
+      reason: result.reason,
+    }
   }
 
   // **採用できたら連続 skip を切る**（独立レビュー Finding 6）。

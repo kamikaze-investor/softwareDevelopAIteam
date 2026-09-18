@@ -573,6 +573,253 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(escalations).toHaveLength(1)
   })
 
+  // 2026-09-17 production 実測: park 後に採用が失敗し続け、**63分で同一内容の LINE が18通**
+  // 送られた。retry window は escalation を境界にして切り替わるのに、重複判定が
+  // 「窓の中に escalation があるか」だったため、判定が原理的に成立していなかった。
+  describe('CEO 通知の重複（retry window とは別の概念）', () => {
+    /** 予算を使い切って1回 escalate させる。1周分。 */
+    async function runOneEscalationCycle(storage: IStorage, d: PlLoopDeps): Promise<void> {
+      for (let i = 0; i < PL_MAX_ADOPTION_ATTEMPTS; i += 1) {
+        resetPlLoopInFlightForTest()
+        await runPlTick(storage, d)
+      }
+      resetPlLoopInFlightForTest()
+      const escalated = await runPlTick(storage, d)
+      expect(escalated.status).toBe('escalated')
+    }
+
+    function brokenAdoption(escalations: string[], over: Partial<PlLoopDeps> = {}): PlLoopDeps {
+      return deps({
+        readLedger: () => LEDGER,
+        proposeAdoption: async () => 'これは JSON ではない',
+        escalate: async (p) => { escalations.push(p.title) },
+        ...over,
+      })
+    }
+
+    it('同じ target・同じ失敗なら、窓が何周しても通知は最初の1回だけ', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const d = brokenAdoption(escalations)
+
+      for (let cycle = 0; cycle < 4; cycle += 1) await runOneEscalationCycle(storage, d)
+
+      expect(escalations).toHaveLength(1)
+    })
+
+    it('通知を止めても再試行は続く（窓は従来どおり escalation で切り替わる）', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const d = brokenAdoption(escalations)
+
+      await runOneEscalationCycle(storage, d)
+      await runOneEscalationCycle(storage, d)
+
+      // 2周目も **実際に採用を試みている**（黙っただけで止まっていない）。
+      const projectId = storage.projects.findAll()[0]!.id
+      const attempts = storage.auditLog
+        .findByEntity('pl_loop_target', `adopt:${projectId}`)
+        .filter((entry) => entry.result === 'blocked')
+      expect(attempts.length).toBe(PL_MAX_ADOPTION_ATTEMPTS * 2)
+    })
+
+    it('通知を止めても障害は audit / state から見える（隠さない）', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const d = brokenAdoption(escalations)
+
+      await runOneEscalationCycle(storage, d)
+      await runOneEscalationCycle(storage, d)
+
+      const projectId = storage.projects.findAll()[0]!.id
+      const entries = storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)
+      // **escalation の記録は毎回残る。** 通知を送らなかっただけ。
+      expect(entries.filter((entry) => entry.result === 'escalated')).toHaveLength(2)
+      expect(escalations).toHaveLength(1)
+    })
+
+    it('一度採用に成功したあと再発したら、新しい incident として通知する', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      let broken = true
+      const d = deps({
+        readLedger: () => LEDGER,
+        proposeAdoption: async () => (broken ? 'これは JSON ではない' : PROPOSAL),
+        adopt: async (_s, input) => ({
+          ok: true as const, taskId: 'task-1', roadmapTaskKey: input.roadmapId, title: 't',
+        }),
+        escalate: async (p) => { escalations.push(p.title) },
+      })
+
+      await runOneEscalationCycle(storage, d)
+      expect(escalations).toHaveLength(1)
+
+      // 採用が成功する
+      broken = false
+      resetPlLoopInFlightForTest()
+      expect((await runPlTick(storage, d)).status).toBe('acted')
+
+      // また同じ失敗が起きる —— これは前回と地続きではなく、新しい incident。
+      broken = true
+      await runOneEscalationCycle(storage, d)
+
+      expect(escalations).toHaveLength(2)
+    })
+
+    it('failure class が変われば通知する', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      let mode: 'unparsable' | 'throws' = 'unparsable'
+      const d = deps({
+        readLedger: () => LEDGER,
+        proposeAdoption: async () => {
+          if (mode === 'throws') throw new Error('provider timed out')
+          return 'これは JSON ではない'
+        },
+        escalate: async (p) => { escalations.push(p.title) },
+      })
+
+      await runOneEscalationCycle(storage, d)
+      expect(escalations).toHaveLength(1)
+
+      // 原因の種類が変わった（提案が壊れている → provider が落ちている）。
+      mode = 'throws'
+      await runOneEscalationCycle(storage, d)
+
+      expect(escalations).toHaveLength(2)
+    })
+
+    // 同じ status でも原因が違えば別の障害である。ここを status だけで判定すると、
+    // 「提案を組み立てられない」で1通出したあと「提示していない id を選んだ」が
+    // **既報として黙殺される**（独立レビュー指摘。成功が一度も無い Project で顕著）。
+    it('同じ status でも下位分類が違えば通知する', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      let mode: 'unparsable' | 'unoffered' = 'unparsable'
+      const d = deps({
+        readLedger: () => LEDGER,
+        proposeAdoption: async () => (mode === 'unparsable'
+          ? 'これは JSON ではない'
+          : JSON.stringify({
+            roadmapId: 'not-offered-at-all',
+            implementationScope: 'x',
+            allowedPaths: ['apps/api/src/ctoAi'],
+            acceptanceCriteria: ['y'],
+          })),
+        escalate: async (p) => { escalations.push(p.title) },
+      })
+
+      await runOneEscalationCycle(storage, d)
+      expect(escalations).toHaveLength(1)
+
+      // どちらも status は proposal_unusable だが、原因は別物。
+      mode = 'unoffered'
+      await runOneEscalationCycle(storage, d)
+
+      expect(escalations).toHaveLength(2)
+    })
+
+    // audit の並びは created_at DESC, rowid DESC。同一ミリ秒の行は時刻比較では順序づかないので、
+    // 「前回の成功より後に通知したか」を時刻で判定してはいけない。
+    it('同一ミリ秒に記録が並んでも重複通知しない', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const fixedNow = '2026-09-18T00:00:00.000Z'
+      const d = brokenAdoption(escalations, { now: () => fixedNow })
+
+      for (let cycle = 0; cycle < 3; cycle += 1) await runOneEscalationCycle(storage, d)
+
+      expect(escalations).toHaveLength(1)
+    })
+
+    it('別 Project なら独立して通知される', async () => {
+      const a = idleProject()
+      const b = idleProject()
+      const escalations: string[] = []
+      const d = brokenAdoption(escalations)
+
+      await runOneEscalationCycle(a, d)
+      await runOneEscalationCycle(b, d)
+
+      expect(escalations).toHaveLength(2)
+    })
+
+    it('CEO への件名に、実在しない attention kind を出さない', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+
+      await runOneEscalationCycle(storage, brokenAdoption(escalations))
+
+      // `task_ready_without_job` は escalateTo を再利用するための内部都合であって、
+      // 実際にそういう Task があるわけではない（production 実測で0件）。
+      expect(escalations[0]).not.toContain('task_ready_without_job')
+      expect(escalations[0]).toContain('Roadmap adoption failure')
+    })
+
+    // 通知を止めても「いま失敗が続いている」ことは state から見えなければならない。
+    // 見えないと、running なのに currentTask も attention も無い**静かな Project**に見える。
+    it('通知を止めても、失敗が続いていることが PL state から見える', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const d = brokenAdoption(escalations)
+
+      await runOneEscalationCycle(storage, d)
+      await runOneEscalationCycle(storage, d)
+      expect(escalations).toHaveLength(1)
+
+      const projectId = storage.projects.findAll()[0]!.id
+      const state = buildSystemState(storage)
+      const project = state.projects.find((candidate) => candidate.id === projectId)
+
+      expect(project?.adoptionFailure?.escalations).toBe(2)
+      expect(project?.adoptionFailure?.failureClass).toContain('proposal_unusable')
+      expect(project?.adoptionFailure?.since).toBeDefined()
+      expect(project?.adoptionFailure?.lastAt).toBeDefined()
+
+      // **attention には出さない。** 出すと maybeAdoptNext() が採用を見送るため、
+      // 通知を直すために採用機能そのものを止めることになる。
+      expect(state.attention).toHaveLength(0)
+    })
+
+    it('採用に成功したら state の表示も消える', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      let broken = true
+      const d = deps({
+        readLedger: () => LEDGER,
+        proposeAdoption: async () => (broken ? 'これは JSON ではない' : PROPOSAL),
+        adopt: async (_s, input) => ({
+          ok: true as const, taskId: 'task-1', roadmapTaskKey: input.roadmapId, title: 't',
+        }),
+        escalate: async (p) => { escalations.push(p.title) },
+      })
+
+      await runOneEscalationCycle(storage, d)
+      const projectId = storage.projects.findAll()[0]!.id
+      expect(buildSystemState(storage).projects.find((p) => p.id === projectId)?.adoptionFailure)
+        .toBeDefined()
+
+      broken = false
+      resetPlLoopInFlightForTest()
+      expect((await runPlTick(storage, d)).status).toBe('acted')
+
+      expect(buildSystemState(storage).projects.find((p) => p.id === projectId)?.adoptionFailure)
+        .toBeUndefined()
+    })
+
+    it('診断の記録は採用サイクルの予算と候補の回転位置を動かさない', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      await runOneEscalationCycle(storage, brokenAdoption(escalations))
+
+      const projectId = storage.projects.findAll()[0]!.id
+      // 通知の記録は別 entity に置く。ここへ混ぜると rotationOffset が行数を読むため、
+      // 「記録しただけで PL に提示される候補が変わる」ことになる。
+      const cycleRows = storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)
+      expect(cycleRows.every((entry) => entry.operation === 'pl_loop')).toBe(true)
+    })
+  })
+
   it('採用に成功したら予算は仕切り直す（2件目で打ち止めにならない）', async () => {
     // 2026-09-15 production 実測: 1件目の採用に2回（proposal_unusable → adopted）使った結果、
     // 次のサイクルは 1 tick 目で「PL は 2 回試しましたが採用できませんでした」になり、

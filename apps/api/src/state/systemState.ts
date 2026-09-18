@@ -16,6 +16,7 @@
  */
 
 import { occupiesProject } from '@ai-team/shared'
+import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import type { IStorage } from '../storage/interface'
 import type { Job, Task, Project } from '@ai-team/shared'
 
@@ -104,6 +105,27 @@ export interface ProjectStateSummary {
   }
   approvalsWaiting: number
   continuationsPending: number
+  /**
+   * 採用が繰り返し失敗している状態。**通知を抑えても障害自体は見えていなければならない。**
+   *
+   * CEO への LINE は incident 単位で1回だけになったので、これが無いと
+   * 「running だが currentTask も attention も無い、静かな Project」に見えてしまい、
+   * 現在進行形の失敗が Mobile から消える（独立レビュー指摘）。
+   *
+   * **attention には出さない。** `maybeAdoptNext()` は attention が1件でもあると採用を
+   * 見送るため、ここを attention にすると採用が永久に止まる（通知を直すために
+   * 機能を殺すことになる）。見せるだけの事実として Project 側に置く。
+   */
+  adoptionFailure?: {
+    /** 直近の失敗分類（`adoption=<status> code=<code>` から作った構造化された値）。 */
+    failureClass: string
+    /** 連続して失敗している escalation の回数。 */
+    escalations: number
+    /** 最初に失敗し始めた時刻。 */
+    since: string
+    /** 最後に失敗した時刻。 */
+    lastAt: string
+  }
   designReview?: {
     status: DesignReviewSnapshot['status']
     attemptCount: number
@@ -197,6 +219,23 @@ function isReadyTaskWithoutJob(task: Task, jobs: readonly Job[]): boolean {
     task.status === 'pending' &&
     task.assignee === 'developer_ai' &&
     jobs.length === 0
+  )
+}
+
+/**
+ * いま採用が繰り返し失敗しているか。**既存 `audit_log` から導くだけで、新しい state は持たない。**
+ *
+ * 直近の成功（`acted`）より後の escalation を数える。成功すれば消える。
+ * CEO への通知は incident 単位で1回に絞られたので、**ここが唯一の「まだ続いている」表示**になる。
+ */
+function adoptionFailureOf(
+  storage: IStorage,
+  projectId: string,
+): ProjectStateSummary['adoptionFailure'] {
+  // 判定の実体は `pl/adoptionFailure.ts` 1箇所にある。CEO への通知と同じ定義を使うので、
+  // 「通知された障害」と「画面に出ている障害」がずれない。
+  return summarizeAdoptionFailure(
+    storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`),
   )
 }
 
@@ -460,6 +499,7 @@ export function buildSystemState(
       },
       approvalsWaiting: waitingForProject,
       continuationsPending,
+      adoptionFailure: adoptionFailureOf(storage, project.id),
       designReview,
     })
   }
