@@ -218,6 +218,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **正式 Roadmap の1項目を実行可能な Task として採用する最小経路
 - **Tier A: 自己開発の最初の安全な切替点
 - **cleanup だけが失敗した containment が Job を quarantine させる
+- **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
@@ -274,7 +275,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる**（state: planned）
 - **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める**（state: planned）
 - **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）**（state: planned）
-- **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**（state: planned）
 - **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）**（state: planned）
 - **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: in_progress）
 - **Mandatory Gate Policy（state: in_progress）
@@ -283,6 +283,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
 - **external completion reconcile の根拠2つが、まだ機械照合になっていない**（state: planned）
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
+- **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い**（state: deferred）
 - **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
 - **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: in_progress）
 - **blocked になった Job の変更を、後から安全に取り消す材料が残っていない**（state: deferred）
