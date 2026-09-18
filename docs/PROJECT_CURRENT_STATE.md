@@ -222,7 +222,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
-- **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる**
 - **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
@@ -287,6 +286,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い**（state: deferred）
 - **Design Review の却下が durable に記録されず、却下履歴を後から辿れない**（state: deferred）
+- **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる**（state: deferred）
 - **continuation 経由の Design Review CONFLICT が Task を `blocked` にし、自動復旧の射程外へ出す**（state: deferred）
 - **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
 - **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: in_progress）

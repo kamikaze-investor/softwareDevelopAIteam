@@ -8224,29 +8224,26 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       同じテキストを採用し直せてしまう（`adoption-path-has-no-material-difference-check` で
       入れた guard は、最新 run と採用時に書けた audit しか材料にできない）。
 
-      **いまの緩和**: 採用時に、置き換えられる却下済みテキストの review-visible key を
-      `rejected_rvk=` として audit へ残している。採用を経由した世代は追える。
-      **経由しなかった却下は追えない。**
+      **緩和は無い（2026-09-18 現在）。** PR #261 で採用側 guard を一度実装したが、CEO 判断で
+      撤回した（`adoption-path-has-no-material-difference-check` 参照）。したがって却下は
+      **最新の終端 run にしか現れない**。
 
-      **もう1つの症状: #255 と採用側で鍵の空間が違う（2026-09-18 追記）。**
-      #255 は `rejected_fspec=` に **scope + allowedPaths** だけの鍵を書く（あの経路では
-      ledger 本文が世代間で動かないため、それで足りる）。採用側の鍵は **description 全体
-      （ledger 本文込み）+ allowedPaths** である（本文の訂正を「違う提案」として通すために
-      必要。`adoption-path-has-no-material-difference-check` 参照）。
-      **2つの鍵は比較できない**ので、Remediation 経路で却下された案を採用経路から再提出しても
-      検出できない。
+      **鍵空間が分かれている問題も同じ根に由来する。** #255 は `rejected_fspec=` に
+      **scope + allowedPaths** だけの鍵を書く（あの経路では ledger 本文が世代間で動かない）。
+      一方 adoption の入力は ledger 本文も reviewer に見える。両者を別々の鍵で扱う限り、
+      片方が認識した却下をもう片方が認識できない。**adoption 側で description / scope から
+      後付けで推測してはならない** —— 推測を足すたびに equivalence class が増えるだけである
+      （PR #261 の独立レビュー rounds 6–8 が path の大小 → 重複 → 末尾 `/` と連続で示した）。
 
-      **さらに狭い残件（2026-09-18 追記）**: `reviewVisibleSpecKey()` は allowedPaths の大小を
-      cosmetic として潰す（#255 の契約。テストで固定済み）。重複の畳み込みを足したことで、
-      `['src/API','src/api']` を `['src/api']` へ**絞り込むだけの訂正**が「同じ提案」と
-      判定される。case だけ違う path を両方並べていた場合に限る非常に狭い範囲であり、
-      #255 の契約を本 PR で変えるほうがリスクが大きいので触っていない。
-      鍵空間を統一するとき（本項目の本題）に、path の大小をどう扱うかも併せて決めること。
-      **狭い方の鍵を採用側でも併用する案は採らない。** それをすると、ledger 本文だけを
-      訂正した再投入が scope 鍵の一致で拒否され、**手順書の正規経路をまた塞ぐ**。
-      正しい解き方は本項目の本題と同じで、**却下を review 完了時点で1つの鍵空間で記録する**
-      ことである。鍵の統一もそのときに行う。
+      **恒久対応の方向（確定）**:
+      **Formal Design Review が非 ALIGNED / CONFLICT を確定した時点で、reviewer が実際に見た
+      入力の canonical rejection identity を durable に記録し、adoption と #255 remediation が
+      同じ identity space を参照する。** adoption 側で後から description / scope から別々に
+      推測しない。
 
+      **新テーブルが必要とはまだ決めない。** まず既存 `audit_log` / review run persistence の
+      拡張で合理的に成立するかを調査すること（`design_review_runs` に `findByTaskId()` を
+      足すだけで足りるか、非 ALIGNED 側に `completeWithEvidence()` と対称な記録を置けるか）。
       **着手時に確認すること（実装方針を先に決めない）**:
       - 却下を **review 完了時点**で記録できないか（`completeWithEvidence()` は ALIGNED のときに
         evidence を作る。非 ALIGNED 側に対称な記録が無いのが根本原因）
@@ -8256,40 +8253,52 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: 同一テキストが何回審査されたかを後から数えられること
 
       **既存項目との違い（重複実装しないこと）**:
-      - `adoption-path-has-no-material-difference-check`(done): 採用時の検査。**本項目は
+      - `adoption-path-has-no-material-difference-check`(deferred): 採用時の検査。**本項目は
         その検査が使う記録そのものが足りていない話**
       - `independent-review-verdict-instability`: 判定が揺れること自体。本項目は**揺れた履歴を
         残せていない**こと
 
-<!-- roadmap:id=adoption-path-has-no-material-difference-check state=done -->
-8. [x] **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる** —
-      2026-09-18 登録・同日修正（`human-recovery-zero-job-blocked-task` の一部として実装）。
+<!-- roadmap:id=adoption-path-has-no-material-difference-check state=deferred -->
+8. [ ] **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる** —
+      2026-09-18登録。**本項目は Finding であり、まだ実装しない。**
 
       **事象**: `POST /api/projects/:id/roadmap-adoptions` は、対象 Task が `pending` かつ Job 0 件で
       あれば spec を更新し、`ensureInitialWorkflowsForActiveTasks()` 経由で **fresh Design Review を
-      起こす**。このとき `isMateriallyDifferentSpec()` 相当の検査は**通らなかった**。
-      同一の implementationScope / allowedPaths を繰り返し採用し直すだけで、同じ design text に
-      対する Review を何度でも引けたため、判定の揺れ
-      （`independent-review-verdict-instability`）で CONFLICT を洗浄しうる経路だった。
+      起こす**。このとき `isMateriallyDifferentSpec()` 相当の検査は**通らない**。
+      CONFLICT でも Task は `pending` のまま残り、採用 API は成功を返す。
 
-      **修正**: 採用時、対象 Task に**却下済みの spec が既に在る場合に限り**、提案が却下済みの
-      どれとも review-visible に違うことを **Design Review を起こす前に**要求する
-      （`SPEC_NOT_MATERIALLY_DIFFERENT`）。
+      したがって **同一の implementationScope / allowedPaths を繰り返し採用し直すだけで、
+      同じ design text に対する Design Review を何度でも引き直せる**。この repo では同一入力に
+      対する判定が実行ごとに反転することが実測されている
+      （`independent-review-verdict-instability`）ため、これは
+      **判定の揺れを使って CONFLICT を洗浄する経路**になりうる。
 
-      **新しい material-difference engine は作っていない。** #255 の既存 export をそのまま呼ぶ:
-      `collectRejectedSpecKeys()` / `shortSpecKey()` / `isMateriallyDifferentSpec()`。
-      したがって定義も #255 と同一で、**AC は比較に入らない**（reviewer が見ないため、
-      AC だけ書き換えても「作り直した」ことにならない）。
+      **#255 の Remediation 経路には検査がある。** `isMateriallyDifferentSpec()` /
+      `reviewVisibleSpecKey()` が却下済みのどの案とも同じ提案を Review 前に拒否する。
+      **穴があるのは raw / 手動の採用経路だけ**である。
 
-      **A → B → A を止めるため、却下された世代を履歴へ残す。** 採用は Task の spec を置き換える
-      ので、記録しないと1世代前の却下案が消える。書き込み先・形式は #255 と同じ audit
-      （`remediate:<taskId>` の `rejected_fspec=` / `fspec=`）で、**新しいテーブルは作らない**。
-      `stage=adoption` を付けるため、`stageEntries()` が remediation として数えることはなく、
-      **どの attempt budget も消費しない**。
+      **【2026-09-18: PR #261 で一度実装し、CEO 判断で撤回した】**
+      `human-recovery-zero-job-blocked-task` の一部として採用側 guard を実装したが、
+      独立レビューが normalization variant（path の大小 → 重複 → 末尾 `/`）を次々に指摘し、
+      **個別 variant を潰しても equivalence class は閉じない**ことが実証された。
+      さらに鍵の材料を scope+allowedPaths に限ると「ledger 本文を訂正して再レビュー」という
+      手順書の正規経路を塞いでしまい、逆に description 全体を含めると #255 の鍵空間と
+      比較不能になる（同じ却下を双方が認識できない）。
 
-      **既存の採用を壊していない。** guard は「却下済み spec が在る Task」にだけ効く。
-      新規 item の初回採用 / follow-up 採用 / 却下歴の無い Task の採用し直し /
-      ALIGNED evidence 済み Task の Job 再生成は、いずれも従来どおり通る（テストで固定）。
+      → **恒久解決は下記 `design-review-rejections-are-not-durably-recorded` と同じ**であり、
+      Design Review pipeline 側の変更になる。Human Recovery の責務を超えるため PR #261 からは
+      外し、本項目は**未解決のまま残す**（CEO 判断）。
+
+      **運用上の緩和（機械強制ではない）**: `docs/project_memory/rules/human_recovery.md` の
+      手動 runbook に「却下済みと実質同一の spec を再提出して Review を再抽選しない」
+      「AC だけ変えても変えたことにならない」を明記してある。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - 鍵空間を1つに統一すること。**adoption 側で description / scope から別々に推測しない**
+      - 既存 `isMateriallyDifferentSpec()` をそのまま使えるか（**新しい判定器を作らない**）
+      - **CEO 自身の採用やり直しまで塞いでよいのか**。人が訂正したつもりで実質同じ、という
+        ケースを拒否するか警告して通すかは権限の問題
+      - 効果検証可能性（Design Philosophy 8）: 同一 spec の再採用が何回起きていたかを数えられること
 
       **既存項目との違い（重複実装しないこと）**:
       - `human-recovery-zero-job-blocked-task`: blocked を pending へ戻す話。**再審査は起こさない**

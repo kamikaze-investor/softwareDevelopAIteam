@@ -128,11 +128,18 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 この操作は Job も Review も作らないので、`PL_MAX_REMEDIATION_ATTEMPTS` /
 `PL_MAX_ATTEMPTS_PER_TARGET` / `DESIGN_REVIEW_MAX_ATTEMPTS` のどれも消費・リセットしない。
 
-> **却下済み spec の再審査は採用側で塞いである。** `pending` に戻ると採用のやり直しが
-> 可能になるが、その経路は「却下済みのどれとも review-visible に違うこと」を
-> **Design Review を起こす前に**要求する（`SPEC_NOT_MATERIALLY_DIFFERENT`）。
-> したがって Human Recovery で戻しても、**同じ spec を再審査させることはできない**。
-> 判定は #255 と同一定義で、**AC だけ変えても「違う提案」にならない**（reviewer は AC を見ない）。
+> **Review laundering について（正確に）**
+>
+> - **Human Recovery 自体は Job も Design Review も作らない。** 再投入は審査を1回も起こさない
+> - **通常の自動経路には既存の保護がそのまま効く。** 再投入後は `task_ready_without_job` →
+>   #255 staged recovery へ戻り、そこでは `isMateriallyDifferentSpec()` が
+>   却下済みテキストの再提出を拒否する（従来どおり。本 PR で変更していない）
+> - **raw / 手動の `POST /api/projects/:id/roadmap-adoptions` には、その検査が無い。**
+>   却下済みと実質同一の spec を出し直せば fresh Design Review を引ける。
+>   **これは master に元から在る既知 Finding**で、`pending` な採用済み Task すべてに
+>   当てはまる（Human Recovery が作った穴ではない）。
+>   → `adoption-path-has-no-material-difference-check` /
+>     `design-review-rejections-are-not-durably-recorded`
 >
 > guard を Human Recovery 側へ置いてはならない。訂正には `pending` が必要で、`pending` にするには
 > Human Recovery が必要なので **deadlock になる**（実装して撤回した経緯がテストに固定してある）。
@@ -152,6 +159,18 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 > `jobs.length === 0 && status === 'pending'` である。**`blocked` のまま採用し直すと
 > `SYNC_FAILED`（`spec conflicts detected for started/completed tasks`）で失敗し、
 > 訂正版の spec は1文字も入らない。**
+
+> ⚠ **運用上の注意: 却下済みと実質同一の spec を再提出しないこと。**
+>
+> この API は **却下済みかどうかを検査しない**ため、同じ `implementationScope` /
+> `allowedPaths` をそのまま出し直すと Design Review を**引き直せてしまう**。この repo では
+> 同一入力への判定が実行ごとに反転することが実測されており
+> （ledger: `independent-review-verdict-instability`）、それは
+> **偶然の ALIGNED を待つ再抽選**になる。必ず **CONFLICT の指摘に応じて中身を変えてから**出すこと。
+>
+> **この制約は現在まだ機械的に強制されていない。**（`adoption-path-has-no-material-difference-check`）
+> AC だけを書き換えても「変えた」ことにならない —— reviewer は acceptanceCriteria を見ない。
+> 変えるべきは `implementationScope` / `allowedPaths`、または ledger 本文そのものである。
 
 ```bash
 curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \

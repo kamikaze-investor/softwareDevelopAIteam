@@ -252,26 +252,7 @@ describe('Human Recovery は pending で止まらず、実装 Job まで到達�
     expect(storage.tasks.findById(taskId)?.allowedPaths).toEqual(PL_REVISION.allowedPaths)
   })
 
-  it('**再投入しても却下済み spec は再審査できない**（laundering を閉じたまま）', async () => {
-    const { storage, taskId } = seedBlockedAfterConflict()
-    const task = storage.tasks.findById(taskId)!
-    const projectId = task.projectId
-
-    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
-
-    // 却下されたのと同じ scope / allowedPaths を、そのまま採用し直そうとする。
-    const relitigate = await adoptRoadmapItem(storage, {
-      projectId,
-      roadmapId: 'conflicted-item',
-      allowedPaths: ['apps/api/src', 'packages/shared/src'],
-      acceptanceCriteria: ['当初の受入条件'],
-      implementationScope: '当初の広い scope',
-    }, { ensureInitialWorkflows: async () => { throw new Error('Review を起こしてはならない') } })
-
-    expect(relitigate).toMatchObject({ ok: false, code: 'SPEC_NOT_MATERIALLY_DIFFERENT' })
-  })
-
-  it('E2E: recover → 訂正版 re-adoption → material difference PASS → fresh Review → Job', async () => {
+  it('E2E: recover → 訂正版 re-adoption → fresh Review → Job', async () => {
     const { storage, taskId } = seedBlockedAfterConflict()
     const projectId = storage.tasks.findById(taskId)!.projectId
 
@@ -279,7 +260,7 @@ describe('Human Recovery は pending で止まらず、実装 Job まで到達�
     expect(recoverBlockedTask(storage, { taskId, reason: 'CONFLICT を確認した' }).ok).toBe(true)
     expect(storage.tasks.findById(taskId)?.status).toBe('pending')
 
-    // 2. 訂正版 spec で採用し直す（material difference を満たす）
+    // 2. 訂正版 spec で採用し直す（blocked のままでは syncRoadmapTasks が spec を更新できない）
     const corrected = await adoptRoadmapItem(storage, {
       projectId,
       roadmapId: 'conflicted-item',

@@ -98,15 +98,26 @@ import {
  * **3. 却下済み spec の履歴を消さない。** #255 の `isMateriallyDifferentSpec()` が参照する
  * 却下履歴は `audit_log` の `remediate:<taskId>` 行にあり、この関数は読みも書きもしない。
  *
- * **4. laundering は採用側で塞いである。ここではない。**
- * `pending` へ戻すと採用のやり直しが可能になるが、`adoptRoadmapItem()` が
- * 「却下済みのどれとも review-visible に違うこと」を **Design Review を起こす前に**要求する
- * （`SPEC_NOT_MATERIALLY_DIFFERENT`）。再投入しても同じ spec は再審査できない。
+ * **4. Review laundering はここでは塞がない。塞げてもいない（既知 Finding）。**
+ * `pending` へ戻すと **raw / 手動の `roadmap-adoptions`** で採用をやり直せるようになり、
+ * その経路には「却下済みと実質同じ提案か」の検査が無い。**これは master に元から在る穴**で
+ * （`pending` な採用済み Task すべてに当てはまる）、本変更が作ったものではない。
  *
  * **guard をここへ置いてはならない。** 一度「同一 `designTextHash` では1回だけ」を実装したが、
  * design text は description + allowedPaths 由来なので**訂正しなければ hash が変わらず**、
  * 訂正には `pending`（= この関数）が要るため **deadlock になった**ので撤回した
- * （独立レビュー round 2）。再審査を起こしているのは採用経路であり、塞ぐ場所もそこである。
+ * （独立レビュー round 2）。
+ *
+ * **採用側へ guard を置く案も PR #261 では採らない**（CEO 判断・2026-09-18）。
+ * 恒久解決には「reviewer が実際に見た入力の canonical rejection identity を、非 ALIGNED が
+ * 確定した時点で durable に記録し、adoption と #255 remediation が同じ identity space を
+ * 参照する」ことが要り、Design Review pipeline 側の変更になる。Human Recovery の責務を超える。
+ * → `design-review-rejections-are-not-durably-recorded` /
+ *   `adoption-path-has-no-material-difference-check`
+ *
+ * **自動経路には既存の保護がそのまま効いている。** Human Recovery の後、通常は
+ * `task_ready_without_job` → #255 staged recovery へ戻り、そこでは
+ * `isMateriallyDifferentSpec()` が却下済みテキストの再提出を拒否する（従来どおり）。
  *
  * ## 生涯上限を**置いてはならない**理由（実測・2026-09-18）
  *
@@ -288,11 +299,13 @@ export function recoverBlockedTask(
   // 「N 回を超えたら二度と復旧不能」そのものである。
   //
   // **laundering はここで塞ぐ問題ではない。** 実際の再審査は `/recover` ではなく
-  // `POST /api/projects/:id/roadmap-adoptions` が起こしており、その経路には
+  // raw / 手動の `POST /api/projects/:id/roadmap-adoptions` が起こしており、その経路には
   // `isMateriallyDifferentSpec()` 相当の検査が無い —— これは master に既に在る穴で、
   // `pending` な採用済み Task すべてに当てはまる（本変更が作ったものではない）。
-  // 正しい修正箇所は採用側であり、別 Finding
-  // （`adoption-path-has-no-material-difference-check`）として登録した。
+  // **採用側へ guard を置く恒久対応も PR #261 では行わない**（CEO 判断・2026-09-18。
+  // 正しい解決は rejection identity の durable 化であり Design Review pipeline 側の変更になる）。
+  // → `adoption-path-has-no-material-difference-check` /
+  //   `design-review-rejections-are-not-durably-recorded`
   const generation = currentDesignGeneration(storage, task.id)
 
   // 回数は記録と報告のためだけに数える。**門にはしない**（上の「試行の有界性」参照）。
