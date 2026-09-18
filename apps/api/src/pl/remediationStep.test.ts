@@ -419,6 +419,28 @@ describe('有界性と記録', () => {
     expect(beyond.status).toBe('attempts_exhausted')
   })
 
+  it('ledger が読めない場合も試行として記録する（通知ループを作らない）', async () => {
+    // 記録しないと対象から外れず、ledger が壊れている間ずっと毎 tick 同じ Escalation が出る。
+    // 2026-09-17 に「63分で同一内容の LINE が18通」として実測された形と同じになる。
+    const { storage, taskId } = seedConflictedTask()
+
+    const result = await runRemediationStep(storage, taskId, deps({
+      readLedger: () => { throw new Error('ENOENT') },
+    }))
+
+    expect(result.failureCode).toBe('ledger_unreadable')
+    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+  })
+
+  it('ledger から項目が消えている場合も試行として記録する', async () => {
+    const { storage, taskId } = seedConflictedTask({ roadmapTaskKey: 'ghost-item' })
+
+    const result = await runRemediationStep(storage, taskId, deps())
+
+    expect(result.failureCode).toBe('item_not_in_ledger')
+    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+  })
+
   it('provenance（provider / model / 未確認の分離相手）を audit へ残す', async () => {
     const { storage, taskId } = seedConflictedTask()
 

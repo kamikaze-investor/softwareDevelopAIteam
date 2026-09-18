@@ -200,6 +200,27 @@ describe('PL tick — Design Review CONFLICT の配線', () => {
     expect(bodies[0]).toContain('提案された解決: 既存 validation へ寄せる')
   })
 
+  it('解決しない CONFLICT でも通知は予算の回数までで止まる（鳴り続けない）', async () => {
+    // 2026-09-17 の実測（63分で同一内容の LINE が18通）と同じ形を作らないための回帰テスト。
+    const { storage } = seedConflicted()
+    let notifications = 0
+    const failing = deps({
+      escalate: async () => { notifications += 1 },
+      remediate: async (_storage, id) => ({
+        status: 'remediation_failed', taskId: id, failureCode: 'runner_failed', reason: 'boom',
+      }),
+    })
+
+    // **Remediation 側の記録に依存させない。** ここでは予算を消費しない stub を注入しており、
+    // それでも 2 通目以降が出ないこと（ループ防止が分岐自身にあること）を固定する。
+    for (let i = 0; i < 5; i += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, failing)
+    }
+
+    expect(notifications).toBe(1)
+  })
+
   it('Review がまだ走っている（queued）Task は Remediation へ回さない', async () => {
     // 採用直後は必ずこの状態を通る。ここで誤射すると進行中の復旧を潰す。
     const { storage } = seedConflicted({ runStatus: 'queued' })

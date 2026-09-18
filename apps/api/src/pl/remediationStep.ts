@@ -440,6 +440,8 @@ export async function runRemediationStep(
     const markdown = (deps.readLedger ?? (() => readFileSync(resolveLedgerPath(), 'utf-8')))()
     const item = getValidRoadmapItems(markdown).find((candidate) => candidate.id === subject.roadmapId)
     if (!item) {
+      // ledger が直るまで結果は変わらない。記録して有界にする（下の catch と同じ理由）。
+      recordRemediation(storage, taskId, 'outcome=item_not_in_ledger')
       return {
         status: 'not_applicable',
         taskId,
@@ -450,6 +452,11 @@ export async function runRemediationStep(
     }
     ledgerBody = extractItemDescription(markdown, item)
   } catch (error: unknown) {
+    // **model を呼ぶ前の失敗でも試行として記録する。**
+    // 記録しないと `countRemediationAttempts()` が 0 のままで対象から外れず、
+    // ledger が読めない間ずっと毎 tick 同じ Escalation を出し続ける
+    // （2026-09-17 に「63分で同一内容の LINE が18通」として実測された形と同じ）。
+    recordRemediation(storage, taskId, 'outcome=ledger_unreadable')
     return {
       status: 'not_applicable',
       taskId,
@@ -467,6 +474,8 @@ export async function runRemediationStep(
     judgeProviders: resolveJudgeProviders([]),
   })
   if (!selection.ok) {
+    // provider 構成が変わるまで結果は変わらないので、ここも試行として記録して有界にする。
+    recordRemediation(storage, taskId, 'outcome=no_independent_flagship')
     return {
       status: 'no_independent_model',
       taskId,

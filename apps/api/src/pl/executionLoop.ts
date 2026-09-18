@@ -387,8 +387,14 @@ async function remediateConflict(
   }
 
   // 解決しなかった。**既存の Escalation で人へ渡す。** Remediation の診断を添える。
-  if (hasEscalated(storage, key) && result.status === 'attempts_exhausted') {
-    // 既に知らせてあり、予算も尽きている。鳴らし直さない。
+  //
+  // **通知は1つの停止につき1回だけ。** 予算が尽きるまで毎 tick 鳴らすと、
+  // 2026-09-17 に実測された「63分で同一内容の LINE が18通」と同じ状態になる。
+  // ここを Remediation 側の記録に依存させない —— 記録し忘れた経路が1つあれば
+  // そのまま通知ループになるため、**ループ防止はこの分岐自身が持つ**。
+  // `notify: false` でも `escalated` の記録は残り、Mobile からは進行中の失敗として見え続ける。
+  const alreadyTold = hasEscalated(storage, key)
+  if (alreadyTold && result.status === 'attempts_exhausted') {
     return { status: 'idle', reason: 'remediation exhausted and already escalated', attempt: 1 }
   }
 
@@ -405,7 +411,7 @@ async function remediateConflict(
       result.proposal !== undefined ? `独立 AI の診断: ${result.proposal.diagnosis}` : undefined,
       result.proposal !== undefined ? `提案された解決: ${result.proposal.resolution}` : undefined,
     ].filter((line) => line !== undefined).join('\n'),
-    { subject: 'Design Review CONFLICT' },
+    { subject: 'Design Review CONFLICT', notify: !alreadyTold },
   )
   return { status: 'escalated', reason: `remediation did not resolve it (${result.status})`, attempt: 1 }
 }
