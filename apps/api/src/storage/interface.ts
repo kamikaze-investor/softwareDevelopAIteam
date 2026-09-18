@@ -9,6 +9,7 @@
 
 import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
+import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -320,6 +321,13 @@ export interface ITaskStorage {
 export interface IJobStorage {
   findByTaskId(taskId: string): Job[]
   findById(id: string): Job | undefined
+  /**
+   * 直近の AI CLI Job を**新しい順**で返す（読み取り専用）。
+   *
+   * timeout 再評価センサーが「直近 N 件」を数えるためだけに足したもので、
+   * 新しい集計基盤ではない。materialize するのは既存 `jobs` 行そのものである。
+   */
+  findRecentAiCliJobs(input: { provider: AiCliProvider, mode: AiCliMode, limit: number }): Job[]
   findFailureExplanation(jobId: string): PersistedTaskFailureExplanationV1 | undefined
   saveFailureExplanation(jobId: string, envelope: PersistedTaskFailureExplanationV1): void
   create(job: Omit<Job, 'id' | 'createdAt'>): Job

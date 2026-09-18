@@ -1348,6 +1348,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
       return rows.map(deserializeJob)
     },
+    findRecentAiCliJobs({ provider, mode, limit }) {
+      const rows = db.prepare(
+        'SELECT * FROM jobs WHERE ai_cli_provider = ? AND ai_cli_mode = ? '
+        + 'ORDER BY created_at DESC, rowid DESC LIMIT ?',
+      ).all(provider, mode, Math.max(1, Math.min(500, Math.trunc(limit)))) as any[]
+      return rows.map(deserializeJob)
+    },
     findById(id) {
       const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as any
       return row ? deserializeJob(row) : undefined
