@@ -1677,6 +1677,14 @@ function withSensitiveChanges(
  * 入力（provider の文字列）は判定に使うだけで、**戻り値には一切含めない**。
  * これにより credential 断片・prompt 抜粋・モデル本文が operator 向けメッセージへ出る経路が
  * 構造的に存在しなくなる（redact の取りこぼしに依存しない）。
+ *
+ * **保証の範囲はここまでである。** 守られるのは failure reason / `stopReason` /
+ * attention / CEO notification の4経路で、いずれも上の固定語彙しか載らない。
+ * **Job 詳細に保存・表示される raw stdout/stderr は対象外であり、安全とは言えない**
+ * （provider 次第で credential 断片・prompt・モデル本文を含みうる）。
+ * そちらは全 provider・永続化先・診断価値・retention に跨る別責務として
+ * Roadmap `job-raw-output-persisted-and-shown` で扱う。ここで雑に消すと
+ * 障害診断の証拠を失う（CEO 判断・2026-09-18）。
  */
 function classifyApiError(status: number, result: unknown): string {
   const text = typeof result === 'string' ? result.toLowerCase() : ''
