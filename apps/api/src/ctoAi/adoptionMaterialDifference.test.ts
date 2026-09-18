@@ -210,6 +210,22 @@ describe('却下済み spec の再提出は、Design Review を起こす前に�
     expect(again).toMatchObject({ ok: false, code: 'SPEC_NOT_MATERIALLY_DIFFERENT' })
   })
 
+  it('allowedPaths を重複させただけの再提出も「同じ」と見る', async () => {
+    const { storage, projectId } = seedProject()
+    const first = await adoptOriginal(storage, projectId)
+    rejectCurrentSpec(storage, first.ok ? first.taskId : '')
+
+    const again = await adoptRoadmapItem(storage, {
+      projectId, roadmapId: 'conflicted-item',
+      // 許可範囲は同一。重複しているだけ。
+      allowedPaths: [...ORIGINAL_PATHS, ...ORIGINAL_PATHS],
+      acceptanceCriteria: ['当初の受入条件'],
+      implementationScope: ORIGINAL_SCOPE,
+    }, silentDeps())
+
+    expect(again).toMatchObject({ ok: false, code: 'SPEC_NOT_MATERIALLY_DIFFERENT' })
+  })
+
   it('**A → B → A の巡回も止める**（却下済み全件と比べる）', async () => {
     const { storage, projectId } = seedProject()
     const first = await adoptOriginal(storage, projectId)
