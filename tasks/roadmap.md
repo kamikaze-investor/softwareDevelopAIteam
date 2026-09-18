@@ -8141,6 +8141,90 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       Design Review evidence 無しで Job を作れるようにすること /
       本 Finding を根拠に Safety・Approval 境界を動かすこと。
 
+      **【2026-09-18: Triage 側を実装し、復旧経路は #255 が入れた】**
+      `blocked-resolution-triage`（done）が、この CONFLICT を機械的事実から
+      `rootCauseClass=design_review_conflict` / `lane=independent_remediation` として分類する。
+      **実際の復旧は #255（`independent-remediation-for-design-review-conflict`）が配線した。**
+      PL ループでは復旧経路（`remediateConflict()`）が Triage より**先**に走り、
+      Triage が受け持つのはその対象外（`roadmapTaskKey` 無し・予算枯渇など）だけで、
+      その場合は構造化報告を添えて CEO へ渡す。
+
+
+<!-- roadmap:id=blocked-resolution-triage state=done -->
+8. [x] **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す** —
+      2026-09-18 完了（CEO 指示・同日着手）。**新しい Incident Management system は作っていない。**
+      既存 VPS PL loop（Observe → Diagnose → Decide → Mandatory Gate → Execute → Verify / Escalate）の
+      **Diagnose の手前に純粋関数を1つ足しただけ**である（`apps/api/src/pl/blockedTriage.ts`）。
+
+      **責務**: Blocked を直接解除することではなく、
+      「なぜ止まったか」を機械的事実から分類し、**既存の正しいレーンへ渡す**ところまで。
+
+      | lane | 条件（すべて機械的事実） | 今日の到達先 |
+      |---|---|---|
+      | `auto_recovery` | 既存の bounded recovery が実在する（provider timeout + workspace 未変更 / 未使用 attempt が残る Design Review / resume 可能な blocked Job）| 既存 Diagnose → Gate → 既存操作 |
+      | `independent_remediation` | task-kind Design Review が ALIGNED 以外 / allowedPaths と実装対象の不一致 | **CONFLICT は #255 が配線済み**（Triage より先に実行）。それ以外は CEO Escalation |
+      | `maintenance_lane` | protected だが runtime / infrastructure（allowlist 4件）| 未実装のため Tier B handoff を添えた CEO Escalation |
+      | `ceo_escalation` | Safety / Authority 中核・secret・quarantine・承認待ち・attempt 枯渇・原因不明 | CEO Escalation |
+
+      **Safety 上の中心的性質**:
+      - **Triage は permission を作らない。** `triageAllowedActions()` は必ず既存候補との積を返すので、
+        ここから action が増えることが構造的に起こらない。可否は従来どおり `authorizePlAction()` だけが決める
+      - **PL の自己申告は分類の入力に存在しない。** `triageBlocked(storage, item)` は
+        attention と実レコードしか受け取らない（`riskLevel` / rationale を渡す口が無い）
+      - **protected path は allowlist 方式**。`ALWAYS_FORBIDDEN_PATTERNS` が増えても、
+        Maintenance allowlist に足さない限り新しい protected path は既定で CEO へ倒れる
+      - **未実装の2レーンはどちらも CEO Escalation で終端する**ので、レーン分類を誤っても
+        CEO を迂回することが起きない
+      - **証拠不足（`confidence: 'low'`）では状態を変えない。** 候補が read-only の応答だけに絞られ、
+        「よく分からないけど retry」が成立しない
+      - 無限ループ防止は**既存 `PL_MAX_ATTEMPTS_PER_TARGET` をそのまま使う**（新しい閾値を作らない）
+
+      **CEO 通知は既存 `sendAlert` のまま**で、本文だけを構造化した（何が止まったか / 原因 / 証拠 /
+      AI が試したこと / なぜ自己解決できないか / 必要な CEO 判断 / **複数の**安全な選択肢）。
+      選択肢を1つに決め打ちしない。重複通知の抑止は既存 `hasEscalated()` のままである。
+
+      **効果検証可能性（Design Philosophy 8）**: 既存 `audit_log.detail` の先頭へ
+      `lane=` / `cause=` / `layer=` / `conf=` を載せ、`summarizeBlockedTriage()` が
+      総数・原因別・route 別・AUTO_RECOVERY 成功率・CEO escalation 率・UNKNOWN 率・同一原因の再発数を導く。
+      `GET /api/pl/triage-summary` が read-only で返す。**新しい metrics backend も新しい表も作っていない。**
+
+      **Operational E2E（2026-09-18、production スナップショットの実レコード）**:
+      危険な障害を故意に作らず、**自然に発生した過去の Blocked 3件**で検証した
+      （production DB を `scp` で取得し、その使い捨て複製に対して実行。production は read-only）。
+      - Job `d913fa9d`（`apps/worker/src/guards/fileChangeGuard.ts` 違反）→
+        `safety_or_authority_boundary` / `ceo_escalation`。**2026-09-16 に PL が
+        「mismatched allowed paths … configuration issue」と誤分類した当の事象**で、
+        新しい本文は「どんな allowedPaths でも通らない」と明記した
+      - Job `3e95c82b`（`specs/00_constitution.md`）・Job `8664cddc`（`docs/project_memory/rules/approval_rules.md`）→
+        `allowed_paths_mismatch` / `independent_remediation`
+      - Blocked → 構造化診断 → lane → Gate → Escalation → 状態再取得 → audit → 集計まで追跡できた。
+        **provider 診断の呼び出しは 0 回**（escalate しか選べない対象にモデル枠を使わない）。
+        2 incident で通知 2 通、以降の tick は idle（spam しない）
+      - 再現は `apps/api/scripts/blockedTriageReplay.ts`（read-only）
+
+      **この項目で実装していないもの（重複を作らないため）**:
+      - **Independent Remediation 本体**。#255 が先に master へ入ったため、Triage 側に置いていた
+        引き渡し用のデータ形（`buildRemediationRequest()`）は**重複になったので削除した**。
+        PL ループでは #255 の `remediateConflict()` が Triage より**先**に走る ——
+        **分類はレーンの選択であって実行ではない**ので、配線済みの復旧がある対象を
+        Triage が横取りしてはならない（この順序は `blockedTriage.test.ts` 12b で固定した）。
+        Triage 側に注入可能な dispatch callback は**置いていない** ——
+        独立レビュー（2026-09-18）で「Gate を通らない状態変更経路になる」と指摘されたため。
+      - **Review Class B**（`review-class-b-enhanced-ai-review` は `deferred`・CEO 承認が着手条件）。
+        Class B policy をここで代替実装していない。接続点は `BlockedDiagnosis` が既に持つ machine facts
+        （`requiresSafetyBoundaryChange` / `requiresAuthorityChange` / `irreversible` / `evidence`）で、
+        Class B が入ったら `safety_or_authority_boundary` を降格してよいかを決めるのはそちらの責務である
+      - **Maintenance Lane v0 = Tier B**（`aiteamos-self-development-tier-b` は `planned`）。
+        レーンの**ラベルと handoff 本文**だけを用意し、実行経路は作っていない
+      - 新しい AttentionKind / TaskStatus / JobStatus / Roadmap state / Gate / approval system /
+        notification system / metrics backend / DB table —— **いずれも追加していない**
+
+      **残っている観測ポイント（CEO escalation をさらに減らせるか）**:
+      1. `unknownRate` —— 高ければ分類材料が足りない。どの事実が欠けているかを audit から特定できる
+      2. `byRootCause` の `allowed_paths_mismatch` 件数 —— Independent Remediation が入れば
+        そのまま自動化候補になる母集団である
+      3. `byRootCause` の `protected_path` 件数 —— Maintenance Lane v0 の投資対効果の実測値
+      4. `recurringRootCauses` —— 同じ原因が繰り返すなら、レーンではなく上流（採用時の scope 検証）の問題
 <!-- roadmap:id=adoption-does-not-check-implementation-feasibility state=planned -->
 8. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
       2026-09-15登録（production 実測）。CEO 指示により**既存 adoption / Design Review /
