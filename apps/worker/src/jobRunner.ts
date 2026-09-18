@@ -835,9 +835,11 @@ export async function runJob(
           approvalLevelResult,
           exitCode: cliResult.exitCode,
           stdout: cliResult.stdout,
-          stderr: cliResult.stderr
-            ? `${cliResult.stderr}\n[jobRunner] ${implementFailureReason}`
-            : `[jobRunner] ${implementFailureReason}`,
+          // **固定語彙の理由を先頭へ置く。** 末尾へ足していたため、
+          // `stopReason()`（先頭が `[jobRunner] ` ならそれを優先、でなければ末尾を取る）が
+          // raw stderr 側を拾いうる状態だった（独立レビュー指摘）。
+          // Guard 経路が使っている `withLeadingNote()` と同じ形に揃える。
+          stderr: withLeadingNote(cliResult.stderr ?? '', implementFailureReason),
           stdoutPath: cliResult.stdoutPath,
           stderrPath: cliResult.stderrPath,
           providerFailureKind: cliResult.providerFailureKind,
@@ -1683,7 +1685,10 @@ function classifyApiError(status: number, result: unknown): string {
   // 判定材料は「残高が足りない」と明示している文言だけに限る
   // （2026-09-18 実測: `400` + "Credit balance is too low"）。
   // 文言が無い 400 は下の generic へ落ちる。
-  if (/credit balance|insufficient.*credit|billing/.test(text)) return 'credit exhausted'
+  //
+  // `billing` 単独は入れない。"billing address invalid" のように**残高と無関係な**
+  // billing エラーまで credit 枯渇と断定してしまう（独立レビュー指摘）。
+  if (/credit balance|insufficient.*credit|out of credit/.test(text)) return 'credit exhausted'
 
   // **ここから先は HTTP status の定義だけを根拠にする。** 推測で具体化しない。
   //

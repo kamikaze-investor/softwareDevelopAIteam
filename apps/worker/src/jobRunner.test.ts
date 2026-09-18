@@ -2487,6 +2487,52 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(result.stderr).not.toContain('request-id')
   })
 
+  // CLI が stderr にも credential 断片を書く場合がある。理由を末尾へ足していたため、
+  // `stopReason()` が raw 側を拾いうる状態だった。先頭に置いて決定的にする。
+  it('CLI の raw stderr があっても、先頭は固定語彙の理由になる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stderr: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE',
+        stdout: JSON.stringify({ is_error: true, api_error_status: 401, result: 'unauthorized' }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    // 先頭行が固定語彙の理由であること（`stopReason()` はこれを優先する）。
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('[jobRunner]')
+    expect(firstLine).toContain('HTTP 401')
+    expect(firstLine).toContain('authentication failed')
+    expect(firstLine).not.toContain('sk-ant')
+  })
+
+  // `billing` 単独では credit 枯渇と断定しない（残高と無関係な billing エラーがある）。
+  it('billing address invalid を credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: 'billing address invalid' }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain('API error')
+    expect(result.stderr).not.toContain('credit exhausted')
+  })
+
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
   // redact ではなく「echo しない」ことで、取りこぼしの余地を無くしている。
   it('API エラー文に credential 断片があっても operator 向けには出さない', async () => {
