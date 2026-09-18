@@ -126,7 +126,7 @@ export function evaluateImplementTimeoutSensors(
     return seconds !== undefined && seconds >= timeoutSeconds * t.CURRENT_BUDGET_RATIO
   }
 
-  // ── A. 現在の budget を使い切ってなお作業中だった Job ──────────────────
+  // ── A. 現在の budget を使い切って落ち、生成済みの変更を失った Job ──────
   // 「1 件でも再発したら再評価」なので Job ごとに 1 度だけ出す。
   for (const job of window) {
     if (!killedInsideCurrentBudget(job) || !hasChangedFiles(job)) continue
@@ -168,16 +168,22 @@ export function evaluateImplementTimeoutSensors(
       sensorId: 'implement-timeout-rate-too-high',
       // 値ごとに 1 度だけ。timeout を変えたらもう一度だけ出る。
       scope: String(timeoutMs),
-      summary: `直近 ${window.length} 件の implement で provider_timeout 率が閾値を超えた`,
+      // **数えているものの名前で書く。** 分子は「現在の budget を使い切った timeout」であって
+      // provider_timeout 全体ではない。`provider_timeout 率` と書くと、この行を読んだ人が
+      // 同じ名前で DB を数え直したときに**違う数字が出る**（独立レビュー指摘）。
+      summary: `直近 ${window.length} 件の完了 implement で、budget を使い切った timeout の率が閾値を超えた`,
       evidence: {
         windowSize: window.length,
-        timeoutCount: timedOut.length,
+        budgetExhaustedTimeoutCount: timedOut.length,
         rate: Number(rate.toFixed(4)),
         timeoutSeconds,
       },
       thresholdNote:
-        `rate >= ${t.TIMEOUT_RATE}。変更前の実測は 7/96 = 7.3% だった。`
-        + ' これを下回らないなら、広げた値がまだ足りていない。',
+        `rate >= ${t.TIMEOUT_RATE}。`
+        // 7.3% は**旧 budget 下の provider_timeout 全体**の率で、ここの分子とは母数の取り方が違う。
+        // 直接比較できる数字ではないので、参考値としてだけ置く。
+        + ' 参考: 変更前の実測は provider_timeout 全体で 7/96 = 7.3% だった'
+        + '（分子の定義が異なるため直接比較はできない）。',
     })
   }
 

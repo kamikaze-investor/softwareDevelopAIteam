@@ -46,8 +46,8 @@ function job(overrides: Partial<Job> & { seconds?: number }): Job {
   } as Job
 }
 
-/** 現在の budget を使い切ったうえで作業中だった Job（= A の対象）。 */
-function killedWhileWorking(seconds: number): Job {
+/** 現在の budget を使い切って落ち、生成済みの変更を失った Job（= A の対象）。 */
+function killedWithProducedWork(seconds: number): Job {
   return job({
     seconds,
     status: 'failed',
@@ -64,8 +64,8 @@ describe('evaluateImplementTimeoutSensors', () => {
   })
 
   // ── A ────────────────────────────────────────────────────────
-  it('A: 現在の budget を使い切って作業中だった Job は 1 件でも発火する', () => {
-    const findings = evaluateImplementTimeoutSensors([killedWhileWorking(900)], T)
+  it('A: 現在の budget を使い切って落ち、変更を生成済みだった Job は 1 件でも発火する', () => {
+    const findings = evaluateImplementTimeoutSensors([killedWithProducedWork(900)], T)
     const a = findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')
     expect(a).toHaveLength(1)
     expect(a[0].evidence).toMatchObject({ durationSeconds: 900, timeoutSeconds: 900 })
@@ -74,12 +74,12 @@ describe('evaluateImplementTimeoutSensors', () => {
   // **これが一番効くテスト。** 過去の 300s 時代の記録で発火すると、
   // 新しい値の評価ではなく歴史の再掲になってしまう。
   it('A: 旧 300s 時代の timeout 記録では発火しない', () => {
-    const findings = evaluateImplementTimeoutSensors([killedWhileWorking(304)], T)
+    const findings = evaluateImplementTimeoutSensors([killedWithProducedWork(304)], T)
     expect(findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work'))
       .toHaveLength(0)
   })
 
-  it('A: timeout でも changedFiles が無ければ発火しない（作業中ではない）', () => {
+  it('A: timeout でも changedFiles が無ければ発火しない（失われた生成物が無い）', () => {
     const noWork = job({
       seconds: 900,
       status: 'failed',
@@ -94,13 +94,13 @@ describe('evaluateImplementTimeoutSensors', () => {
   it('B: timeout 率が 3% 以上なら発火する', () => {
     // 50 件中 2 件 = 4%
     const jobs = [
-      killedWhileWorking(900), killedWhileWorking(900),
+      killedWithProducedWork(900), killedWithProducedWork(900),
       ...Array.from({ length: 48 }, () => job({ seconds: 60 })),
     ]
     const b = evaluateImplementTimeoutSensors(jobs, T)
       .filter((f) => f.sensorId === 'implement-timeout-rate-too-high')
     expect(b).toHaveLength(1)
-    expect(b[0].evidence).toMatchObject({ windowSize: 50, timeoutCount: 2 })
+    expect(b[0].evidence).toMatchObject({ windowSize: 50, budgetExhaustedTimeoutCount: 2 })
   })
 
   // **B の分子も現在の budget に限る。** ここを素の provider_timeout にしていると、
@@ -110,7 +110,7 @@ describe('evaluateImplementTimeoutSensors', () => {
   it('B: 旧 300s 時代の timeout だけでは発火しない', () => {
     // 50 件中 2 件が ~304s の timeout = 率だけ見れば 4% で閾値超え。
     const jobs = [
-      killedWhileWorking(304), killedWhileWorking(304),
+      killedWithProducedWork(304), killedWithProducedWork(304),
       ...Array.from({ length: 48 }, () => job({ seconds: 60 })),
     ]
     expect(evaluateImplementTimeoutSensors(jobs, T)
@@ -120,7 +120,7 @@ describe('evaluateImplementTimeoutSensors', () => {
   it('B: timeout 率が 3% 未満なら発火しない', () => {
     // 50 件中 1 件 = 2%
     const jobs = [
-      killedWhileWorking(900),
+      killedWithProducedWork(900),
       ...Array.from({ length: 49 }, () => job({ seconds: 60 })),
     ]
     expect(evaluateImplementTimeoutSensors(jobs, T)
@@ -153,7 +153,7 @@ describe('evaluateImplementTimeoutSensors', () => {
   it('直近 WINDOW 件だけを母集団にする', () => {
     const jobs = [
       ...Array.from({ length: IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW }, () => job({ seconds: 60 })),
-      killedWhileWorking(900),  // WINDOW の外
+      killedWithProducedWork(900),  // WINDOW の外
     ]
     expect(evaluateImplementTimeoutSensors(jobs, T)
       .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
