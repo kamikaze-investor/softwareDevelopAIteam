@@ -8176,6 +8176,37 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       その場合は構造化報告を添えて CEO へ渡す。
 
 
+<!-- roadmap:id=design-review-rejections-are-not-durably-recorded state=deferred -->
+8. [ ] **Design Review の却下が durable に記録されず、却下履歴を後から辿れない** —
+      2026-09-18登録（独立レビュー指摘）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: `design_review_runs` に対する read は `findLatestByTaskId()` しか無く、
+      Task の run 履歴を辿れない。「このテキストは却下された」という事実がどこにも durable に
+      残らないため、**最新 run が別の判定で上書きされると、過去の CONFLICT が観測不能になる**。
+
+      **具体例**: CONFLICT の後、同一テキストへ Challenge の再評価が乗って `UNCERTAIN` を返すと、
+      最新 run は `UNCERTAIN` になる。この間に採用が起きなければ CONFLICT はどこにも残らず、
+      同じテキストを採用し直せてしまう（`adoption-path-has-no-material-difference-check` で
+      入れた guard は、最新 run と採用時に書けた audit しか材料にできない）。
+
+      **いまの緩和**: 採用時に、置き換えられる却下済みテキストの review-visible key を
+      `rejected_rvk=` として audit へ残している。採用を経由した世代は追える。
+      **経由しなかった却下は追えない。**
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - 却下を **review 完了時点**で記録できないか（`completeWithEvidence()` は ALIGNED のときに
+        evidence を作る。非 ALIGNED 側に対称な記録が無いのが根本原因）
+      - `design_review_runs` に `findByTaskId()` を足すだけで足りないか。**新しいテーブルを
+        作る前に、既存表の read を1つ増やす案を先に検討する**
+      - 記録するのは判定そのものか、review-visible key か。後者なら #255 / 採用側と同じ鍵に揃える
+      - 効果検証可能性（Design Philosophy 8）: 同一テキストが何回審査されたかを後から数えられること
+
+      **既存項目との違い（重複実装しないこと）**:
+      - `adoption-path-has-no-material-difference-check`(done): 採用時の検査。**本項目は
+        その検査が使う記録そのものが足りていない話**
+      - `independent-review-verdict-instability`: 判定が揺れること自体。本項目は**揺れた履歴を
+        残せていない**こと
+
 <!-- roadmap:id=adoption-path-has-no-material-difference-check state=done -->
 8. [x] **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる** —
       2026-09-18 登録・同日修正（`human-recovery-zero-job-blocked-task` の一部として実装）。
