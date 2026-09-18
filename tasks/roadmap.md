@@ -9664,9 +9664,69 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       判定を覆す**ことに等しい」と明記しており、着手時確認事項に
       「採用時の `implementationScope` をより軽い案へ絞れば通るのか」を挙げていた。**本項目がそこを埋める。**
 
-      **経路**: 元 PL → CONFLICT → Independent Remediation AI → 修正版 proposal → Mechanical Gate →
-      fresh Design Review → 必要な Independent Review → PASS → PL へ戻る → 通常実装。
-      **元 PL / 元設計 AI が自分の案を修正して再提出する経路を標準にしない。**
+      **経路（2026-09-18 CEO 指示で段階化。Independent Remediation は最初の手段ではない）**:
+
+      ```
+      PL Task Design → 既存 Design Review → CONFLICT
+        → Independent Critic（read-only。Spec も verdict も持たない）
+        → PL revision / redesign（PL が Task Design の Owner）
+        → 既存 Design Review
+        → 再 CONFLICT → 次 Round の Critic → PL revision → 既存 Design Review
+        → 解決しなければ Independent Remediation（flagship が Spec を直接再設計）
+        → 既存 adoption seam → 既存 Design Review
+        → それでも解決しなければ terminal
+      ```
+
+      **Critic が Review Finding 自体を具体的根拠付きで dispute した場合だけ**、
+      frozen spec に対する `stage=challenge` へ**条件分岐**する（固定 stage ではない）。
+
+      **stage machine は selector であって Review Pipeline を所有しない。**
+      `selectConflictStage()` は既存 review state（`design_review_runs` /
+      `design_review_evidence`）と既存 audit を観測して次の stage を返すだけで、
+      Review 自体は既存経路が実行する。したがって `original_review` / `fresh_review` は
+      stage ではなく**入力状態**である。実行する stage は
+      `critic` / `pl_revision` / `challenge` / `remediation` / `terminal` の5つ。
+
+      **Challenge の呼称を厳密にする。** これは
+      **different-vendor independent re-review ではない**。`DesignReviewRun` に provider 欄が無く
+      `strategicReview` が `providerUsed` を捨てているため、元 Design Reviewer の provider / model は
+      **取得できず**、再評価側が別 vendor / model である保証も無い。よって
+      「reviewer diversity 確認済み」「独立 reviewer による再審査」とは表現しない。
+      audit には `orig_provider=unavailable` / `orig_model=unavailable` と明示する。
+      不足している provenance の owner は `review-provider-exhausted-alternate-rereview` である
+      （本項目では取り込まない）。**保証するのは「Critic の具体的な異議に基づく、同一 frozen
+      Task Spec への once-per-(spec, finding) な fresh formal re-evaluation」まで。**
+
+      **Challenge の安全条件（PASS reroll にしない）**:
+      - 具体的根拠付きの dispute のみ発火。`grounds`（4種の列挙値）と `evidence` の両方が必須で、
+        欠けていれば `insufficient_evidence` へ落として発火させない。単なる uncertainty や
+        「別解もあり得る」では起こさない
+      - **Binding Safety / Authority finding は Challenge 不可**。`safety_recovery` /
+        `auth_permission` / `data_state_integrity` / `independent` / 未知 source は binding 側で、
+        既存方針（Second Independent Review → Meta Review → 未解決なら CEO）へ渡す
+      - Task Spec は変更せず **byte-identical** で再評価する
+      - same spec + same finding につき **1回だけ**。消費は再評価の**前**に記録するので、
+        途中で落ちても再抽選できない
+      - 元の CONFLICT run / history は削除・上書きしない
+      - `CONFLICT` / `UNCERTAIN` / `REVIEW_UNAVAILABLE` では release しない。
+        ALIGNED evidence が出た場合のみ**既存 Job Gate** に従って進む（新しい override action は無い）
+
+      **model diversity は Preference、authority separation は Safety Constraint**
+      （CEO 指示 2026-09-18）:
+      - Critic … 別 model → 別 vendor を優先するが、無ければ**同一 model を再利用してよい**。
+        `selectCriticModel()` は**失敗を型として持たない**。Critic は Spec mutation authority も
+        formal verdict authority も持たないので、diversity 不足を fail-closed 条件にしない
+      - Remediation … flagship 固定。順位は 1) chain 未使用 → 2) その他 → 3) Critic 使用済み。
+        **Critic と Remediator が同一 model でも許可する**（Critic は Spec を書かないので
+        Task Design author ではない）。hard なのは author model / author vendor / judge vendor の
+        分離だけで、`ok: false` はそれを満たす候補が1つも無いときにしか返らない
+
+      **stage ごとに予算を分ける。** Critic Round は `PL_MAX_CRITIC_ROUNDS`、Remediation は
+      `PL_MAX_REMEDIATION_ATTEMPTS`、Challenge は (spec, finding) ごとに1回。
+      **`countRemediationAttempts()` が全行を数えていたため Critic Round が Remediation の予算を
+      食い潰し、Remediation へ到達できなくなっていた**（integration test で検出・修正）。
+      loop 側の二重計上防止は「この呼び出しで step が何か記録したか」という別の問いなので、
+      stage を問わない `countConflictAttempts()` を使う。
 
       **権限（拡大していない）**:
       - **新しい PL action kind を作らない。** 使うのは既存 `adopt_roadmap_item`
@@ -9759,10 +9819,34 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         実装不能だった場合。CONFLICT ではない。将来 Remediation を応答手段として使える可能性はあるが、
         本項目の範囲外
 
-      **実装済み**: `packages/shared/src/independentRemediationPolicy.ts`（pure）/
-      `apps/worker/scripts/remediationRunner.ts`（read-only sandbox の one-shot runner）/
-      `apps/api/src/pl/remediationStep.ts` / `executionLoop.ts` の分岐 /
-      `adoptionStep.ts` の `authorizeAdoptionScope()` 抽出。
+      **実装済み**:
+      - `packages/shared/src/independentRemediationPolicy.ts`（pure）… flagship 候補表、
+        `selectRemediationModel()`（Safety Constraint と Preference を分離）、
+        `selectCriticModel()`（**失敗を型に持たない** Preference のみ）、
+        `reviewVisibleSpecKey()` / `isMateriallyDifferentSpec()`
+      - `packages/shared/src/independentCriticPolicy.ts`（pure）… Critique schema（**Spec 欄も
+        verdict 欄も持たない**）、`FINDING_ASSESSMENT_STATUSES`、`DISPUTE_GROUNDS`、
+        Binding / advisory の exhaustive 分類、`shouldChallengeFinding()`
+      - `apps/worker/scripts/remediationRunner.ts` … read-only sandbox の one-shot flagship runner。
+        **Critic と Remediation が共有する**（名前は Remediation 由来のまま。命名上の負債として記録）
+      - `apps/api/src/pl/remediationStep.ts` … Stage 3（既存実装を維持）。
+        `applyRevisedSpec()` を PL revision と共有し、authorization + adoption 経路を二重に持たない
+      - `apps/api/src/pl/conflictResolutionStep.ts` … `selectConflictStage()`（selector）、
+        Critic Round、条件分岐の Challenge、PL revision
+      - `apps/api/src/pl/executionLoop.ts` … 解決 Round への配線。
+        **旧 direct-remediation 経路は残していない**（`remediate` hook も削除した）
+      - `apps/api/src/pl/adoptionStep.ts` … `authorizeAdoptionScope()` 抽出
+      - `apps/api/src/aiExplain/cheapAiClient.ts` … `CHEAP_AI_CONFIG` を export
+        （PL の model 識別子を複製しないため）
+
+      **`applyRevisedSpec()` の4つの値を混同しない**（独立レビューで2回間違えた箇所）:
+      | 値 | 基礎 | 用途 |
+      |---|---|---|
+      | `rawScope` | 著者が書いた生の scope | 却下済みとの比較キーの材料 |
+      | `submittedScope` | 判断記録を折り込んだ最終形 | 実際に採用・review される text |
+      | `proposedHash` | `submittedScope` | Job Gate が計算する値と一致させ、Job identity を確認 |
+      | `specKey` | `rawScope` | material difference の照合（記録追記で毎回変わる値は使えない） |
+      `rawScope` は required input なので、取り違えは missing-field エラーになる。
 
       **Acceptance Criteria**:
       - CONFLICT で終端した run + Job 0 件 + pending の Task だけが対象になる

@@ -7,6 +7,7 @@ import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import { buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
+import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
   PL_MAX_REMEDIATION_ATTEMPTS,
   countRemediationAttempts,
@@ -15,6 +16,7 @@ import {
 } from './remediationStep'
 import {
   PL_MAX_CRITIC_ROUNDS,
+  buildPlRevisedScope,
   parsePlRevision,
   runConflictResolutionRound,
   selectConflictStage,
@@ -472,6 +474,52 @@ describe('有界性', () => {
     // Critic の失敗は **Critic Round の予算**を消費する（Remediation の予算とは別勘定）。
     expect(stageEntries(storage, taskId, 'critic').length).toBe(1)
     expect(countRemediationAttempts(storage, taskId)).toBe(0)
+  })
+})
+
+describe('PL revision 後に stale な Design Review evidence を再利用できない', () => {
+  it('旧 spec の ALIGNED evidence では、PL が修正した spec の Job を通せない', () => {
+    // 既存テストは Gate 単体（`reviewedPromptIdentity.test.ts`: 1文字変えた prompt は拒否）を
+    // 固定しているが、**PL revision 経路が実際に別 prompt を作ること**は固定していなかった。
+    // ここでは revision 経路が組む prompt をそのまま Gate へ当て、hash 不一致になることを示す。
+    const { storage, taskId } = seed()
+    const task = storage.tasks.findById(taskId)!
+    const oldPrompt = buildInitialImplementAiCliPrompt(task)
+
+    // 1. 旧 spec に対して ALIGNED evidence が存在する状態を作る。
+    storage.designReviewEvidence.create({
+      reviewKind: 'task',
+      subjectId: taskId,
+      taskId,
+      designTextHash: computeDesignTextHash(oldPrompt),
+      reviewLoad: 'medium',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+    } as never)
+    // 旧 prompt ならその evidence で通る（前提の確認）。
+    expect(checkImplementJobDesignReviewEvidence(
+      { taskId, aiCliMode: 'implement', aiCliPrompt: oldPrompt },
+      storage.designReviewEvidence,
+    ).ok).toBe(true)
+
+    // 2. PL revision が組む spec（判断記録を折り込んだ最終形）から prompt を作る。
+    const revisedPrompt = buildInitialImplementAiCliPrompt({
+      description: buildAdoptedDescription(
+        LEDGER_BODY,
+        buildPlRevisedScope(PL_REVISION, SUPPORTED_CRITIQUE as never),
+      ),
+      allowedPaths: PL_REVISION.allowedPaths,
+    })
+
+    // 3. 旧 evidence では通らない。**fresh formal review が必要になる。**
+    const gate = checkImplementJobDesignReviewEvidence(
+      { taskId, aiCliMode: 'implement', aiCliPrompt: revisedPrompt },
+      storage.designReviewEvidence,
+    )
+
+    expect(gate.ok).toBe(false)
+    if (gate.ok) return
+    expect(gate.code).toBe('DESIGN_REVIEW_HASH_MISMATCH')
   })
 })
 
