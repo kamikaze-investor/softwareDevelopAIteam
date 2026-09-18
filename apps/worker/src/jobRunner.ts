@@ -1669,8 +1669,30 @@ function withSensitiveChanges(
   return mergeManifests(manifest, manifestFromChanges(sensitiveChanges))
 }
 
-/** CLI のエラー説明文を載せる上限。原因分類に足り、ログを膨らませない長さ。 */
-const CLI_ERROR_DETAIL_LIMIT = 200
+/**
+ * API 層のエラーを**固定語彙**へ落とす。
+ *
+ * 入力（provider の文字列）は判定に使うだけで、**戻り値には一切含めない**。
+ * これにより credential 断片・prompt 抜粋・モデル本文が operator 向けメッセージへ出る経路が
+ * 構造的に存在しなくなる（redact の取りこぼしに依存しない）。
+ */
+function classifyApiError(status: number, result: unknown): string {
+  const text = typeof result === 'string' ? result.toLowerCase() : ''
+
+  // 2026-09-18 実測: `400` + "Credit balance is too low"。従量課金の残高切れ。
+  if (/credit balance|insufficient.*credit|billing/.test(text)) return 'credit exhausted'
+
+  // subscription ログインの失効もここへ来る。API key を渡さなくなったため、
+  // 認証が切れたときに運用側が最初に見るのがこのラベルになる。
+  if (status === 401 || status === 403
+    || /unauthorized|unauthenticated|authentication|invalid.*(api.?key|token)|expired/.test(text)) {
+    return 'authentication failed (the Claude Code login may have expired)'
+  }
+
+  if (status === 429 || /rate.?limit|too many requests|quota/.test(text)) return 'rate limited'
+
+  return 'API error'
+}
 
 /**
  * implement モードでAI CLIが成功終了したが、実際にはファイル変更が0件だった場合の
@@ -1697,24 +1719,20 @@ function classifyClaudeImplementFailure(
     // 運用側に見えたのは「error result」だけで、真因（400 Credit balance is too low）は
     // stdout の JSON を人手で開くまで分からなかった。
     // API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
-    // 出すのは CLI 自身の短い説明文と HTTP status だけで、prompt も出力本文も載せない。
+    // 出すのは **HTTP status と、固定語彙の原因ラベルだけ**である。
     //
-    // **`result` は成功時にはモデル本文が入る欄である**
-    // （`reviewerAdapter.ts`: `result: '<モデル本文>'`）。したがって `is_error` だけを根拠に
-    // 載せてはいけない。載せるのは `api_error_status` がある場合 —— API 層のエラーで、
-    // `result` が API 自身の短いエラー文になっている場合（実測: "Credit balance is too low"）
-    // ——だけに限る。それ以外の `is_error`（tool エラー、打ち切り等）では、
-    // `result` にモデルの説明文が入りうるので従来どおり一文だけにする。
+    // provider の文字列をそのまま載せない。`result` は成功時にはモデル本文が入る欄であり
+    // （`reviewerAdapter.ts`: `result: '<モデル本文>'`）、API エラー時でも中身は信用できない
+    // —— 実際に `401 invalid Authorization: Bearer sk-...` のように credential 断片や
+    // prompt 抜粋を含みうる（独立レビュー指摘）。redact（denylist）では取りこぼす形が残る。
+    //
+    // そこで **echo せず分類する**。出力は下の固定語彙のいずれかで、入力文字列は外へ出ない。
+    // 2026-09-18 の実例（API credit 枯渇）は `credit exhausted` として十分に伝わる。
     const apiErrorStatus = typeof parsed.api_error_status === 'number'
       ? parsed.api_error_status
       : undefined
-    const status = apiErrorStatus === undefined ? '' : ` (HTTP ${apiErrorStatus})`
-    const detail = apiErrorStatus !== undefined
-      && typeof parsed.result === 'string'
-      && parsed.result.trim() !== ''
-      ? `${parsed.result.trim().slice(0, CLI_ERROR_DETAIL_LIMIT)}`
-      : ''
-    return `Claude Code CLI reported an error result${status}${detail ? `: ${detail}` : ''}`
+    if (apiErrorStatus === undefined) return 'Claude Code CLI reported an error result'
+    return `Claude Code CLI reported an error result (HTTP ${apiErrorStatus}): ${classifyApiError(apiErrorStatus, parsed.result)}`
   }
 
   if (cliResult.changedFiles.length > 0) {

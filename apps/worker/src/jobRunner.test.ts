@@ -2392,7 +2392,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
   // 2026-09-18: API credit が尽きたとき、運用側に見えたのは「error result」だけで、
   // 真因（400 Credit balance is too low）は stdout の JSON を人手で開くまで分からなかった。
   // API key を渡すのをやめた以降、subscription 失効も同じ形で届く。
-  it('is_error のとき CLI が返した理由と HTTP status を stderr に出す', async () => {
+  it('API エラーは HTTP status と固定語彙の原因ラベルで出す', async () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
         changedFiles: [],
@@ -2413,7 +2413,37 @@ describe('task-022: AI CLI 実行ブロック', () => {
 
     expect(result.status).toBe('failed')
     expect(result.stderr).toContain('HTTP 400')
-    expect(result.stderr).toContain('Credit balance is too low')
+    expect(result.stderr).toContain('credit exhausted')
+    // **provider の文字列は echo しない。** 判定に使うだけで外へ出さない。
+    expect(result.stderr).not.toContain('Credit balance is too low')
+  })
+
+  // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
+  // redact ではなく「echo しない」ことで、取りこぼしの余地を無くしている。
+  it('API エラー文に credential 断片があっても operator 向けには出さない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({
+          is_error: true,
+          api_error_status: 401,
+          result: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE / prompt excerpt: src/x.ts',
+        }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain('HTTP 401')
+    expect(result.stderr).toContain('authentication failed')
+    expect(result.stderr).not.toContain('sk-ant')
+    expect(result.stderr).not.toContain('Bearer')
+    expect(result.stderr).not.toContain('prompt excerpt')
   })
 
   // `result` は成功時にモデル本文が入る欄なので、API 層のエラーでない is_error では載せない。
