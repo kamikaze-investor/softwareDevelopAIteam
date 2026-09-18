@@ -285,7 +285,7 @@ export class GeminiReviewerAdapter implements IReviewerAdapter {
  * 利用不能な場合は CLI が非0で終了し、既存の exitCode 判定で blocking に倒れる
  * （別モデルへの自動fallbackは行わない）。
  */
-const CODEX_REVIEWER_MODEL = 'gpt-5.6-sol'
+export const CODEX_REVIEWER_MODEL = 'gpt-5.6-sol'
 
 export class CodexReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {

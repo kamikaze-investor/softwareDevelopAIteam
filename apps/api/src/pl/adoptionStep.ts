@@ -44,6 +44,59 @@ import {
   PlActionBlockedError,
 } from './actionGate'
 
+export type AdoptionScopeAuthorization =
+  | { ok: true }
+  | { ok: false; failureCode: string; reason: string }
+
+/**
+ * 採用（および採用し直し）の**唯一の許可経路**。
+ *
+ * `runAdoptionStep()`（次項目の選択）と `runRemediationStep()`（CONFLICT 後の作り直し）が
+ * 共有する。**別々に書くと片方だけ Gate が緩む**ので、ここ1箇所に閉じる。
+ *
+ * 見るのは2つだけで、どちらも既存機構である:
+ *   1. `authorizePlAction()` … `adopt_roadmap_item` の必要 Gate（`strategic_alignment_review` =
+ *      CEO 承認済み ledger に未完了で実在すること）。PL の自己申告では減らない
+ *   2. `assertAdoptionScopeIsBounded()` … `allowedPaths` の形。広すぎる宣言は Guard を
+ *      形だけにするので、Gate 通過後にも必ず見る
+ */
+export function authorizeAdoptionScope(
+  storage: IStorage,
+  input: {
+    projectId: string
+    roadmapId: string
+    allowedPaths: readonly string[]
+    /** 記録用の risk 見解ラベル。**`requiredGates` の算出には使われない**（Policy 側の不変条件）。 */
+    riskOpinionLevel: string
+    rationale?: string
+  },
+): AdoptionScopeAuthorization {
+  try {
+    const authorization = authorizePlAction(storage, {
+      proposal: {
+        kind: 'adopt_roadmap_item',
+        ...(input.rationale !== undefined
+          ? { plRiskOpinion: { level: input.riskOpinionLevel, rationale: input.rationale } }
+          : {}),
+      },
+      target: { kind: 'project', projectId: input.projectId },
+      evidence: [{ gate: 'strategic_alignment_review', roadmapItemId: input.roadmapId }],
+    })
+    assertAdoptionScopeIsBounded(authorization.decision, [...input.allowedPaths])
+    return { ok: true }
+  } catch (error: unknown) {
+    if (error instanceof PlActionBlockedError) {
+      return {
+        ok: false,
+        // 足りない Gate の名前は列挙値であって散文ではない。原因が変われば分類も変わる。
+        failureCode: `gate_blocked:${[...error.missingGates].sort().join('+') || 'unknown'}`,
+        reason: error.message,
+      }
+    }
+    throw error
+  }
+}
+
 /** 1つの Project に対して採用を試せる回数。超えたら再試行せず CEO へ上げる。 */
 export const PL_MAX_ADOPTION_ATTEMPTS = 2
 
@@ -419,7 +472,7 @@ export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefin
  * prompt へ入れない**（Design Philosophy: Context 重視 / 必要な情報だけ渡す）。
  * 個々の Task の詳細は、実装時に現物を確認する側の責務とする。
  */
-const ADOPTION_REPOSITORY_MAP = [
+export const ADOPTION_REPOSITORY_MAP = [
   'Where things actually live (verify against the repository before you decide):',
   '- Approval / development rules -> docs/project_memory/rules/',
   '- Decision history, operational E2E records, lessons -> docs/project_memory/decisions/',
@@ -601,30 +654,20 @@ export async function runAdoptionStep(
   }
 
   // ── Mandatory Gate（唯一の許可経路）──────────────────────────
-  try {
-    const authorization = authorizePlAction(storage, {
-      proposal: {
-        kind: 'adopt_roadmap_item',
-        ...(proposal.rationale !== undefined
-          ? { plRiskOpinion: { level: 'PL_SELECTION', rationale: proposal.rationale } }
-          : {}),
-      },
-      target: { kind: 'project', projectId },
-      evidence: [{ gate: 'strategic_alignment_review', roadmapItemId: proposal.roadmapId }],
-    })
-    // 宣言されたスコープが広すぎないかは Gate 通過後にも必ず見る。
-    assertAdoptionScopeIsBounded(authorization.decision, proposal.allowedPaths)
-  } catch (error: unknown) {
-    if (error instanceof PlActionBlockedError) {
-      return {
-        status: 'blocked',
-        // 足りない Gate の名前は列挙値であって散文ではない。原因が変われば分類も変わる。
-        failureCode: `gate_blocked:${[...error.missingGates].sort().join('+') || 'unknown'}`,
-        roadmapId: proposal.roadmapId,
-        reason: error.message,
-      }
+  const gate = authorizeAdoptionScope(storage, {
+    projectId,
+    roadmapId: proposal.roadmapId,
+    allowedPaths: proposal.allowedPaths,
+    riskOpinionLevel: 'PL_SELECTION',
+    ...(proposal.rationale !== undefined ? { rationale: proposal.rationale } : {}),
+  })
+  if (!gate.ok) {
+    return {
+      status: 'blocked',
+      failureCode: gate.failureCode,
+      roadmapId: proposal.roadmapId,
+      reason: gate.reason,
     }
-    throw error
   }
 
   // ── Execute（既存の採用経路をそのまま呼ぶ）────────────────────

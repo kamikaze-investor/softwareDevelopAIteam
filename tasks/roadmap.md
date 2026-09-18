@@ -8104,6 +8104,27 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       → **CONFLICT の原因が ledger 本文の陳腐化であることがある。** 復旧経路を設計するときは、
       「PL の提案を直す」だけでなく「Source of Truth を訂正して再レビューする」形も要る。
 
+
+      **【2026-09-18 追記: PL 側の経路は実装された。人手経路と手順書は未了】**
+      本 Finding が挙げた3経路のうち、**PL 経路だけ**が
+      `independent-remediation-design-review-conflict`（PR #255）で埋まった。
+      `task_ready_without_job` は CONFLICT のときに限り notify-only を外れ、
+      `Independent Critic → PL revision → 既存 formal review`、
+      Critic が Finding 自体を根拠付きで dispute した場合のみ frozen spec への
+      once-per-(spec,finding) な再評価、それでも解決しなければ Independent Remediation、
+      という段階経路を通る。**本項目の残りは未了である**:
+      - **人手経路**: `resumeBlockedTask()` が blocked Job を要求する問題はそのまま。
+        Job 0 件の Task を人が再開する導線は無い
+      - **手順書**: 訂正済み `implementationScope` / `allowedPaths` で採用 API を叩き直す復旧手順は
+        依然として文書化されていない
+
+      したがって `state=deferred` は維持する（PR #255 は本項目を close しない）。
+
+      **2件目の内訳は新経路の想定ケースそのものである。** `scope_simplicity = ALIGNED` /
+      `integration = CONFLICT` で reviewer 同士が要件を逆に読み、原因は PL の出力ではなく
+      **ledger 本文が実仕様に追いついていなかったこと**だった。これは Critic が
+      `grounds=contradicts_code_or_spec` で dispute し、frozen spec の再評価へ分岐する型の
+      ケースである。**自然な CONFLICT が出たときの観測対象**として扱う。
       **既存項目との違い（重複実装しないこと）**:
       - `adoption-does-not-check-implementation-feasibility`: allowedPaths と実装対象の不一致。
         **検出の話**であり、本項目は**その後の復旧の話**
@@ -9649,6 +9670,260 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **CEO へ戻す条件**: Safety / Authority の**意味**変更が必要になった場合、
       または新しい persistent state が必要になった場合**のみ**。
       それ以外は通常 Roadmap 開発として進めてよい（CEO 指示 2026-09-18）。
+
+<!-- roadmap:id=independent-remediation-design-review-conflict state=in_progress -->
+4. [~] **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**
+      — 2026-09-18登録・実装中（CEO 指示）。まず **task-kind Design Review = CONFLICT に限定する。
+      全 Review 種別へ一気に広げない。**
+
+      **事象（production 実測）**: `adopted-item-blocked-by-stale-deferral-text`（done）が記録した
+      2026-09-15 の停止がこれである。PL が `task-allowed-paths-not-normalized` を自律採用した直後、
+      task-kind Design Review が `CONFLICT` を返し、implement Job が 0 件のまま連続自律開発が
+      2 件目で止まった。CONFLICT の根拠は 2 つあり、(1) 古い ledger 本文は PR #211 が解消したが、
+      **(2) `scope_simplicity`「より軽い代替がある」は独立に残る**。
+      同項目は「ledger 本文を書き換えて CONFLICT を消すのは **Binding Review の入力を外から操作して
+      判定を覆す**ことに等しい」と明記しており、着手時確認事項に
+      「採用時の `implementationScope` をより軽い案へ絞れば通るのか」を挙げていた。**本項目がそこを埋める。**
+
+      **経路（2026-09-18 CEO 指示で段階化。Independent Remediation は最初の手段ではない）**:
+
+      ```
+      PL Task Design → 既存 Design Review → CONFLICT
+        → Independent Critic（read-only。Spec も verdict も持たない）
+        → PL revision / redesign（PL が Task Design の Owner）
+        → 既存 Design Review
+        → 再 CONFLICT → 次 Round の Critic → PL revision → 既存 Design Review
+        → 解決しなければ Independent Remediation（flagship が Spec を直接再設計）
+        → 既存 adoption seam → 既存 Design Review
+        → それでも解決しなければ terminal
+      ```
+
+      **Critic が Review Finding 自体を具体的根拠付きで dispute した場合だけ**、
+      frozen spec に対する `stage=challenge` へ**条件分岐**する（固定 stage ではない）。
+
+      **stage machine は selector であって Review Pipeline を所有しない。**
+      `selectConflictStage()` は既存 review state（`design_review_runs` /
+      `design_review_evidence`）と既存 audit を観測して次の stage を返すだけで、
+      Review 自体は既存経路が実行する。したがって `original_review` / `fresh_review` は
+      stage ではなく**入力状態**である。実行する stage は
+      `critic` / `pl_revision` / `challenge` / `remediation` / `terminal` の5つ。
+
+      **Challenge の呼称を厳密にする。** これは
+      **different-vendor independent re-review ではない**。`DesignReviewRun` に provider 欄が無く
+      `strategicReview` が `providerUsed` を捨てているため、元 Design Reviewer の provider / model は
+      **取得できず**、再評価側が別 vendor / model である保証も無い。よって
+      「reviewer diversity 確認済み」「独立 reviewer による再審査」とは表現しない。
+      audit には `orig_provider=unavailable` / `orig_model=unavailable` と明示する。
+      不足している provenance の owner は `review-provider-exhausted-alternate-rereview` である
+      （本項目では取り込まない）。**保証するのは「Critic の具体的な異議に基づく、同一 frozen
+      Task Spec への once-per-(spec, finding) な fresh formal re-evaluation」まで。**
+
+      **Challenge の安全条件（PASS reroll にしない）**:
+      - 具体的根拠付きの dispute のみ発火。`grounds`（4種の列挙値）と `evidence` の両方が必須で、
+        欠けていれば `insufficient_evidence` へ落として発火させない。単なる uncertainty や
+        「別解もあり得る」では起こさない
+      - **Binding Safety / Authority finding は Challenge 不可**。`safety_recovery` /
+        `auth_permission` / `data_state_integrity` / `independent` / 未知 source は binding 側で、
+        既存方針（Second Independent Review → Meta Review → 未解決なら CEO）へ渡す
+      - Task Spec は変更せず **byte-identical** で再評価する
+      - same spec + same finding につき **1回だけ**。消費は再評価の**前**に記録するので、
+        途中で落ちても再抽選できない
+      - 元の CONFLICT run / history は削除・上書きしない
+      - `CONFLICT` / `UNCERTAIN` / `REVIEW_UNAVAILABLE` では release しない。
+        ALIGNED evidence が出た場合のみ**既存 Job Gate** に従って進む（新しい override action は無い）
+
+      **model diversity は Preference、authority separation は Safety Constraint**
+      （CEO 指示 2026-09-18）:
+      - Critic … 別 model → 別 vendor を優先するが、無ければ**同一 model を再利用してよい**。
+        `selectCriticModel()` は**失敗を型として持たない**。Critic は Spec mutation authority も
+        formal verdict authority も持たないので、diversity 不足を fail-closed 条件にしない
+      - Remediation … flagship 固定。順位は 1) chain 未使用 → 2) その他 → 3) Critic 使用済み。
+        **Critic と Remediator が同一 model でも許可する**（Critic は Spec を書かないので
+        Task Design author ではない）。hard なのは author model / author vendor / judge vendor の
+        分離だけで、`ok: false` はそれを満たす候補が1つも無いときにしか返らない
+
+      **stage ごとに予算を分ける。** Critic Round は `PL_MAX_CRITIC_ROUNDS`、Remediation は
+      `PL_MAX_REMEDIATION_ATTEMPTS`、Challenge は (spec, finding) ごとに1回。
+      **`countRemediationAttempts()` が全行を数えていたため Critic Round が Remediation の予算を
+      食い潰し、Remediation へ到達できなくなっていた**（integration test で検出・修正）。
+      loop 側の二重計上防止は「この呼び出しで step が何か記録したか」という別の問いなので、
+      stage を問わない `countConflictAttempts()` を使う。
+
+      **権限（拡大していない）**:
+      - **新しい PL action kind を作らない。** 使うのは既存 `adopt_roadmap_item`
+        （必要 Gate は `strategic_alignment_review` のみ。既に許可済み）
+      - **Remediation AI は Review 結果を解除・承認できない。** 提案を作るだけで、判定は従来どおり
+        API 側 `recomputeDecision()` が再計算する
+      - **PL は Binding Safety Review を override できないまま。** `PL_BLOCKED_RESPONSES` に override は
+        無く、本項目も追加しない。行っているのは `fix` / `propose_alternative` を独立 AI に代行させること
+      - ledger は CEO の正本なので AI が書き換えない。`abandon` 結論のときは採用せず既存 Escalation へ渡す
+        （「実装しないで閉じる」state は作らない → `no-status-for-closing-a-task-without-implementing`）
+      - `assertAdoptionScopeIsBounded()` / `ALWAYS_FORBIDDEN_PATTERNS` / ledger の `planned` allowlist は
+        従来どおり効く。**Class C 項目は `deferred` なので本経路に乗らない**
+
+      **却下済みテキストの再審査を拒否する（独立 Design Challenge が見つけた穴。対処済み）**:
+      `checkImplementJobDesignReviewEvidence()` は `design_review_runs` を見ない。CONFLICT の run は
+      evidence 行を作らないので Gate は `MISSING_DESIGN_REVIEW_EVIDENCE` で落ちる —— つまり
+      **「prompt が変わったから fresh Review になる」のではない**。hash 束縛が防ぐのは
+      「Review 後に prompt を書き換えて実行すること」であって、**同一テキストの再審査は防げない**。
+      この repo では同一入力への判定が実行ごとに反転する実測があるため
+      （`independent-review-verdict-instability`）、却下済みテキストをそのまま再提出できる設計は
+      **判定の揺れで CONFLICT を洗浄する経路**になる。よって提案が作る implement prompt の hash が
+      却下済み hash と一致したら **Review を走らせる前に拒否する**
+      （`repairPolicy` の `requireDifferentApproach` と同じ趣旨）。
+
+      **暫定 Model Policy**: `independentRemediationPolicy.ts` に flagship 候補表を 1 枚だけ置く
+      （`gpt-5.6-sol` / `claude-opus-5`。どちらも 2026-09-07 production 実測済み）。
+      **軽量モデルを候補に持たない**ので、品質未満へ自動 fallback する経路が構造的に存在しない。
+      除外するのは (a) 提案を書いた側の vendor と (b) **この提案を判定することになる** Review の vendor。
+      (b) により critical load では Codex independent review と衝突するので Anthropic 側へ切り替わる
+      （自己承認の防止）。**実装者 `task.provider` は author に含めない** —— まだ 1 度も実行されておらず
+      却下されたテキストを書いていないため、含めると critical load で候補が尽きて構造的不能になる。
+
+      **独立性について、強制できる部分と確認できない部分を分ける（Independent Review 指摘への回答）**:
+      - **model 単位の分離は常に強制する。** `authorModels` に PL の model
+        （`CHEAP_AI_CONFIG.model`。識別子を複製せず設定を直接参照する）を渡すので、候補が
+        それと同一なら選ばれない。「元の設計者へ解決案生成を戻さない」という要求の核はこれであり、
+        vendor 解決の成否に依存しない。2回目以降は前回の Remediation 著者も audit の provenance から
+        復元して除外する（Codex が自分の却下案を書き直す構成にならない）
+      - **judge との vendor 分離も常に強制する。** critical load では Codex independent review が
+        必須なので、そのとき Remediation は Anthropic 側へ切り替わる（自己承認の防止）
+      - **PL 自身との vendor 分離だけは確認できない。** `opencode-go` は harness であり
+        `reviewSeparation.ts` に**意図的に未登録**である。同モジュールは「識別子ではなく実際の
+        underlying model/vendor を渡せる設計にしてから分離判定へ参加させること」と明記しているため、
+        **識別子を vendor 表へ登録して分離を主張してはならない**。`unverified_separation=` として
+        audit へ記録するだけにする
+
+      **fail-closed（vendor 未解決なら Remediation しない）を選ばなかった理由**: PL の provider が
+      harness である限りこの vendor は恒久的に解決しないため、fail-closed は「機構を作らない」のと
+      同じ結果になり、CONFLICT の行き止まりが現状のまま残る。**構造的に充足不能な要求を Gate にしない**
+      （`adopt_roadmap_item` から up-front の `design_review` を外したのと同じ判断）。
+      PL の model を flagship 側へ上げる判断をした場合は、上記の model 単位の除外が自動で効く。
+
+      **既存機構の再利用（新しい仕組みを作っていない）**:
+
+      | 必要なもの | 再利用した既存機構 |
+      |---|---|
+      | 許可 | `authorizeAdoptionScope()`（`authorizePlAction('adopt_roadmap_item')` + `assertAdoptionScopeIsBounded()`）。採用と**同じ関数**へ寄せた |
+      | Task 更新 | `adoptRoadmapItem()`。Job 0 件かつ pending は `syncRoadmapTasks()` の isUnstarted 分岐で spec が更新される（既存挙動） |
+      | fresh Review | `ensureInitialWorkflowsForActiveTasks()` → `createInitialImplementWorkflow()` → `createAndExecuteDesignReview()` |
+      | model 実行 | 既存 `createAiCliAdapter()`（`remediationRunner.ts` 経由）と既存 `executeRunner()` spawn |
+      | vendor 分離 | `reviewSeparation.ts` の `resolveReviewVendor()` |
+      | Finding 読み出し | `design_review_runs.result_json` |
+      | 有界性・記録 | 既存 `audit_log` |
+
+      **作っていないもの**: 新しい Review engine / Gate / TaskStatus / Roadmap state / provider stack /
+      recovery subsystem / retry framework / テーブル。
+
+      **重複しない境界（明記）**:
+      - `design-review-conflict-recovery`（done）… **roadmap-kind 限定**の bounded 再生成
+        （`ROADMAP_CONFLICT_RECOVERY_MAX_ATTEMPTS`）。task-kind には効かない。本項目が task-kind を担う
+      - `review-provider-exhausted-alternate-rereview`（planned/high）… **Review が実行できなかった**
+        場合（attempt 枯渇・provider 障害）に**別 provider へ同じ提案の再審査**を頼む。本項目は
+        **Review が実行され CONFLICT と判定した**場合に**同じ topology へ別の提案**を出す。層が違う。
+        本項目は run が `failed` の Task を対象にしない（そちらの担当である）
+      - `roadmap-adoption-followups` (2) … `retryable` skip の再拾い上げ経路が無い問題。
+        **本項目は直さない**（CONFLICT 以外は対象外）。run が `queued` / `running` の間は待つ。
+        **2026-09-18 に production で 17 時間の停止として再発した**（同項目へ追記済み。#254）。
+        症状は本項目とまったく同じ `task_ready_without_job` だが、**原因が違う** ——
+        あちらは同じ design text が 2 回目の run で `ALIGNED` になっており、実質は transient な
+        非 ALIGNED である。本項目の述語は `recomputeDecision()` を再計算して
+        **`CONFLICT` だけ**を対象にするので、あのケースでは発火しない（発火させてはいけない ——
+        提案は正しく、Review をもう一度回せば通るものだった）。
+        **症状が同じなので取り違えやすい。どちらの経路が必要かは run の decision で判断する。**
+      - `review-class-b-enhanced-ai-review`（deferred）… Class 判定は別軸。**依存させない。**
+        本項目は Class 境界を 1 つも動かさない
+      - `role-model-registry`（planned）… 候補表の最終的な owner。完成したら hardcode を廃止し
+        `role = independent_remediation` / `minimum capability = flagship` /
+        `vendor independence = required` を Router へ渡す形へ移行する。**候補表を二重に持たない**
+      - `adoption-does-not-check-implementation-feasibility`（planned）… 採用も Review も通ったのに
+        実装不能だった場合。CONFLICT ではない。将来 Remediation を応答手段として使える可能性はあるが、
+        本項目の範囲外
+
+      **実装済み**:
+      - `packages/shared/src/independentRemediationPolicy.ts`（pure）… flagship 候補表、
+        `selectRemediationModel()`（Safety Constraint と Preference を分離）、
+        `selectCriticModel()`（**失敗を型に持たない** Preference のみ）、
+        `reviewVisibleSpecKey()` / `isMateriallyDifferentSpec()`
+      - `packages/shared/src/independentCriticPolicy.ts`（pure）… Critique schema（**Spec 欄も
+        verdict 欄も持たない**）、`FINDING_ASSESSMENT_STATUSES`、`DISPUTE_GROUNDS`、
+        Binding / advisory の exhaustive 分類、`shouldChallengeFinding()`
+      - `apps/worker/scripts/remediationRunner.ts` … read-only sandbox の one-shot flagship runner。
+        **Critic と Remediation が共有する**（名前は Remediation 由来のまま。命名上の負債として記録）
+      - `apps/api/src/pl/remediationStep.ts` … Stage 3（既存実装を維持）。
+        `applyRevisedSpec()` を PL revision と共有し、authorization + adoption 経路を二重に持たない
+      - `apps/api/src/pl/conflictResolutionStep.ts` … `selectConflictStage()`（selector）、
+        Critic Round、条件分岐の Challenge、PL revision
+      - `apps/api/src/pl/executionLoop.ts` … 解決 Round への配線。
+        **旧 direct-remediation 経路は残していない**（`remediate` hook も削除した）
+      - `apps/api/src/pl/adoptionStep.ts` … `authorizeAdoptionScope()` 抽出
+      - `apps/api/src/aiExplain/cheapAiClient.ts` … `CHEAP_AI_CONFIG` を export
+        （PL の model 識別子を複製しないため）
+
+      **`applyRevisedSpec()` の4つの値を混同しない**（独立レビューで2回間違えた箇所）:
+      | 値 | 基礎 | 用途 |
+      |---|---|---|
+      | `rawScope` | 著者が書いた生の scope | 却下済みとの比較キーの材料 |
+      | `submittedScope` | 判断記録を折り込んだ最終形 | 実際に採用・review される text |
+      | `proposedHash` | `submittedScope` | Job Gate が計算する値と一致させ、Job identity を確認 |
+      | `specKey` | `rawScope` | material difference の照合（記録追記で毎回変わる値は使えない） |
+      `rawScope` は required input なので、取り違えは missing-field エラーになる。
+
+      **Acceptance Criteria**:
+      - CONFLICT で終端した run + Job 0 件 + pending の Task だけが対象になる
+      - run が `queued` / `running` / `failed` の Task は対象にならない
+      - 却下済みテキストと同一の提案は Review を走らせる前に拒否される
+      - 広すぎる `allowedPaths` / ledger に無い項目 / `deferred` 項目は既存 Gate が弾く
+      - 採用経路の `ok: true` を成功にせず、**Job の実在**だけを成功の根拠にする
+      - `PL_MAX_REMEDIATION_ATTEMPTS` で有界。runner 失敗も試行として記録される
+      - 既に CEO へ Escalate 済みの Task でも Remediation が走る（生涯キーで永久に塞がない）
+      - provider / model / 除外 vendor / 未確認の分離相手 / hash が `audit_log` へ残る
+      - `typecheck` / `tests` が PASS
+
+      **効果検証可能性（Design Philosophy 8）**: `audit_log` の `pl_remediation` /
+      `remediate:<taskId>` から「CONFLICT で止まった採用が何件あり、うち何件が Remediation で
+      ALIGNED になり、何件が Escalation へ落ちたか」を後から数えられる。
+
+      **Operational E2E**: production Task は既に手動復旧済みなので**同じ事故を再現しない**。
+      fixture / isolated 環境で上記 Acceptance Criteria を固定し、**自然な CONFLICT が出た時に
+      production E2E へ進む**。
+
+<!-- roadmap:id=remediation-attempt-admission-not-atomic state=planned -->
+5. [ ] **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）** —
+      2026-09-18登録（`independent-remediation-design-review-conflict` の Independent Review 指摘）。
+      **本項目は Finding であり、いま実装しない。**
+
+      **指摘（Codex independent review, changes_requested の項目5）**: Remediation の試行受付は
+      `countRemediationAttempts()` で数えてから走らせる **count-then-run** であり、記録は
+      長い model 呼び出しの**後**に行う。並行性の防御は `executionLoop.ts` の module スコープ変数
+      `inFlight` だけで、これは**プロセスローカル**である。したがって API プロセスが2つ以上あれば
+      上限を超えて同時に走り、同じ pending Task を上書きしうる。
+
+      **現状で問題にならない理由（放置の根拠。実装を省いた言い訳ではない）**:
+      - `executionLoop.ts` は「API は単一プロセス・単一スレッドなのでこれで足りる」と明記しており、
+        既存の PL tick 全体（採用・診断・再kick）が同じ前提に乗っている。
+        **本項目だけ別の前提で強化しても、隣の採用経路が同じ形のまま残る**
+      - 二重採用そのものは既存機構が弾く: `syncRoadmapTasks()` は単一 transaction で
+        `RoadmapTaskConflictError` を出し、Job は `ux_jobs_workflow_step_key` の全体一意 index で
+        重複生成できない
+      - 成果の誤報は**対処済み**。「Job が1件でもある」ではなく
+        **この提案の prompt hash から作られた Job** だけを成功の根拠にした
+        （別の試行が作った Job を自分の成果として報告しない）
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - **単一プロセス前提をやめるかどうかが先。** やめないなら本項目は不要であり、
+        やめるなら PL tick 全体（採用・診断・Remediation）を同時に扱う。本項目単独で
+        claim table を1つ足すのは、**状態空間を増やして防御が1箇所だけ強い**という最悪の形になる
+      - 強化するなら**既存 `claim_token` fencing の設計を踏襲する**
+        （`design_review_runs` / `supervised_runs` が既に持っている）。**新しい fencing 方式を作らない**
+      - `audit_log` は append-only で、admission の CAS には使えない。
+        どこに claim を置くかは上記の判断の後で決める
+      - 効果検証可能性（Design Philosophy 8）: 「上限を超えて Remediation が走った」件数を
+        後から数えられること。数えられないなら強化の効果も判定できない
+
+      **重複しない境界**: `project-workspace-isolation`（planned）は複数 Project の同時実行を扱う。
+      本項目は**同一 Task に対する同一 role の同時実行**であり別物。ただし単一プロセス前提を
+      やめる判断は共通なので、**着手する場合は同時に扱う**。
 
 ---
 

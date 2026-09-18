@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
-const CHEAP_AI_CONFIG = {
+export const CHEAP_AI_CONFIG = {
   role: 'cheap_explainer',
   provider: 'opencode-go',
   model: 'mimo-v2.5',
