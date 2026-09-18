@@ -8095,6 +8095,20 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       「未完了・保留項目」には現れない。**開いた追跡項目が無かったのが本項目の登録理由**である
       （`project-completion-badge-wording-correction` と同じ構造的な漏れ）。
 
+      **【最初に採用されるスコープは read-only の調査だけである（CEO 指示・2026-09-18）】**
+
+      VPS PL がこの項目を自律採用した場合、**いきなり sanitize の実装へ進ませない**。
+      1 回目の `implementationScope` は下の調査と設計比較に限定し、**コード変更を伴わない**。
+      成果物は調査結果と選択肢の比較であって、redaction の実装ではない。
+
+      理由: 何が漏れうるかを provider 横断で測る前に消し方を決めると、
+      (a) 知らない形を取りこぼす denylist を作り、(b) 障害診断に要る証拠を同時に失う。
+      2026-09-18 の `Credit balance is too low` は raw stdout を読めたから特定できた。
+
+      **調査中に Safety / data-retention / access policy の変更が必要だと分かった時点で、
+      実装せず CEO 判断へ上げること。** 保存期間の短縮・既存ログの破棄・アクセス制御の新設は
+      いずれもこれに当たる。
+
       **着手時に調査すること（実装方針を先に決めない。新しい sanitize subsystem を先に作らない）**:
       1. **全 provider の stdout/stderr に何が入り得るか**を実測する。claude_code だけの話ではない
       2. **どこへ永続化・表示されるか**を洗い出す: `jobs` 表 / `stdout_path`・`stderr_path` の
