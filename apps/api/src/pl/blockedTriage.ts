@@ -248,6 +248,15 @@ export interface LatestDesignReviewVerdict {
   runId: string
   status: DesignReviewRun['status']
   attemptCount: number
+  /**
+   * 結果 JSON が存在したか。**`decision` の有無とは別である。**
+   *
+   * run が結果を持っていても `finalDecision` を持たない形はある（例:
+   * `{"focusedReviewResults":[{"focus":"scope_simplicity","decision":"CONFLICT"}]}` —— これは
+   * #255 が実際に書く CONFLICT の形である）。「結果が無い」と「判定欄が読めない」を
+   * 同じ扱いにすると、**結果はあるのに『結果なし』の短い文面**を人へ出すことになる。
+   */
+  hasResult: boolean
   /** `finalDecision`（ALIGNED / CONFLICT / UNCERTAIN / REVIEW_UNAVAILABLE）。読めなければ undefined。 */
   decision?: string
   /** Integration Review の要約。**人向けの説明にだけ使う。** */
@@ -272,6 +281,7 @@ export function readLatestDesignReview(
     runId: run.id,
     status: run.status,
     attemptCount: run.attemptCount,
+    hasResult: run.resultJson !== undefined,
     ...(run.error !== undefined ? { error: run.error } : {}),
   }
   if (run.resultJson === undefined) return base
@@ -287,6 +297,7 @@ export function readLatestDesignReview(
     }
   } catch {
     // 壊れた resultJson は「判定が読めなかった」として扱う。ここで投げると Triage 全体が止まる。
+    // **`hasResult` は true のまま**である（結果は存在した。読めなかっただけである）。
     return base
   }
 }

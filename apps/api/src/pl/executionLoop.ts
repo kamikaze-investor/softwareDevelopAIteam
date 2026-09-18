@@ -357,13 +357,17 @@ function notifyOnlyReason(storage: IStorage, item: AttentionItem): string {
   }
 
   const latest = readLatestDesignReview(storage, item.taskId)
-  if (latest?.decision === undefined) {
+  // **分岐は「結果があったか」で行う。「判定欄を読めたか」ではない。**
+  // #255 が書く CONFLICT は `{"focusedReviewResults":[...]}` で top-level `finalDecision` を
+  // 持たない。ここを `decision === undefined` で切ると、**その形の CONFLICT すべてで
+  // Binding Review の警告文が本文から消える**（独立レビュー指摘・2026-09-18 round 3）。
+  if (latest === undefined || !latest.hasResult) {
     return '採用した Task に実装 Job が作られないまま止まっています。'
   }
 
   return [
     '採用した Task に実装 Job が作られないまま止まっています。',
-    `直近の Design Review の判定: ${latest.decision}`,
+    `直近の Design Review の判定: ${latest.decision ?? 'unknown'}`,
     latest.summary !== undefined ? `理由: ${latest.summary}` : undefined,
     'この判定は Binding Review です。PL は妥当性を評価できますが、BLOCK を覆せません。',
   ].filter((line) => line !== undefined).join('\n')

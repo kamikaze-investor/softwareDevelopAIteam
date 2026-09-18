@@ -7,6 +7,7 @@ import {
   formatTriageAuditDetail,
   needsProviderDiagnosis,
   parseTriageAuditDetail,
+  readLatestDesignReview,
   summarizeBlockedTriage,
   triageAllowedActions,
   triageBlocked,
@@ -664,6 +665,32 @@ describe('Independent Remediation への引き渡し', () => {
     expect(result.proposedKind).toBe('adopt_roadmap_item')
     // Triage は分類すらしていない（この対象は Triage の担当ではない）
     expect(result.triage).toBeUndefined()
+  })
+
+  it('12c. `finalDecision` を持たない CONFLICT 記録でも Binding Review の警告を落とさない', async () => {
+    // 独立レビュー round 3 の指摘への回帰テスト。#255 が実際に書く CONFLICT は
+    // `{"focusedReviewResults":[...]}` で **top-level `finalDecision` を持たない**。
+    // 「結果が無い」と「判定欄が読めない」を同一視すると、その形の CONFLICT すべてで
+    // Binding Review の警告文が CEO 本文から静かに消える。
+    const { storage, taskId } = seedRemediableConflict()
+    const escalations: string[] = []
+
+    // 解決に失敗させ、#255 の Escalation 本文（`notifyOnlyReason()` が土台）を観測する。
+    await runPlTick(storage, deps({
+      now: () => new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      escalate: async (p) => { escalations.push(p.body) },
+      resolveConflict: async (_s, id) => ({
+        status: 'terminal', stage: 'pl_revision', taskId: id,
+      }),
+    }))
+
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)
+    // 前提の確認: この記録に top-level finalDecision は無い
+    expect(JSON.parse(run?.resultJson as string).finalDecision).toBeUndefined()
+    // それでも「結果はあった」ので、判定行と Binding Review の警告は本文に残る
+    expect(readLatestDesignReview(storage, taskId)?.hasResult).toBe(true)
+    expect(escalations[0]).toContain('Binding Review')
+    expect(escalations[0]).toContain('直近の Design Review の判定')
   })
 
   it('remediation を起動する無 Gate の受け口を持たない（配線は Gate を通る操作でしかできない）', () => {
