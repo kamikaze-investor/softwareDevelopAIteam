@@ -129,6 +129,9 @@ export function summarizeAdoptionFailure(
     // （escalation が1件も無い場合は上で undefined を返している）。
     escalations: currentEscalations.length,
     since: (current[current.length - 1] ?? since[since.length - 1])!.createdAt,
-    lastAt: (currentEscalations[0] ?? escalations[0])!.createdAt,
+    // **この分類の最新の行**を使う。まだ escalate していない分類のとき、
+    // 別分類の escalation へ落ちると `lastAt` が `since` より古くなり、
+    // 画面上で辻褄の合わない障害になる（独立レビュー指摘）。
+    lastAt: (currentEscalations[0] ?? current[0] ?? since[0])!.createdAt,
   }
 }

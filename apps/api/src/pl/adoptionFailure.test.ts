@@ -132,6 +132,28 @@ describe('summarizeAdoptionFailure — 画面に出す「いつから / 何回�
     expect(summary?.since).toBe('2026-09-18T00:09:00.000Z')
   })
 
+  // まだ escalate していない分類が最新のとき、`lastAt` が別分類の古い escalation に
+  // ならないこと。なると lastAt < since という辻褄の合わない表示になる。
+  it('新しい分類がまだ escalate していなくても、時刻の辻褄が合う', () => {
+    const entries = [
+      entry({ result: 'diagnosis_failed', detail: 'CLI timed out', createdAt: '2026-09-18T00:09:00.000Z' }),
+      entry({ result: 'escalated', detail: '通知', createdAt: '2026-09-18T00:05:00.000Z' }),
+      entry({
+        result: 'blocked',
+        detail: 'adoption=proposal_unusable code=unparsable_proposal target=- ',
+        createdAt: '2026-09-18T00:04:00.000Z',
+      }),
+    ]
+
+    const summary = summarizeAdoptionFailure(entries)
+
+    expect(summary?.failureClass).toBe('diagnosis_failed')
+    expect(summary?.escalations).toBe(0)
+    expect(summary?.since).toBe('2026-09-18T00:09:00.000Z')
+    expect(summary?.lastAt).toBe('2026-09-18T00:09:00.000Z')
+    expect(summary!.lastAt >= summary!.since).toBe(true)
+  })
+
   it('採用に成功していれば障害は出ない', () => {
     expect(summarizeAdoptionFailure([
       entry({ result: 'acted', detail: 'adoption=adopted code=- target=item ' }),
