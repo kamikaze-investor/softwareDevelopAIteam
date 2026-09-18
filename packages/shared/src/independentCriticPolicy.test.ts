@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest'
 import {
   DISPUTE_GROUNDS,
   FINDING_ASSESSMENT_STATUSES,
+  bindingDisputes,
+  challengeableDisputes,
   disputedFindings,
+  isBindingSafetySource,
   parseCritique,
   shouldChallengeFinding,
 } from './independentCriticPolicy'
@@ -207,6 +210,72 @@ describe('Review validity challenge の発火条件', () => {
 
     expect(critique?.coreProblems).toHaveLength(1)
     expect(critique?.improvementDirections).toHaveLength(1)
+  })
+})
+
+describe('Binding Safety / Authority は Challenge では解除されない', () => {
+  const disputeOn = (source: string) => parseCritique(JSON.stringify({
+    ...COMPLETE,
+    findingAssessments: [{
+      source,
+      status: 'disputed',
+      rationale: 'この Finding は成立しない',
+      grounds: 'contradicts_code_or_spec',
+      evidence: '該当コードは既にその条件を満たしている',
+    }],
+  }))
+
+  it('safety_recovery / auth_permission / data_state_integrity は Challenge しない', () => {
+    // Safety Boundary / Authority / 不可逆性の争いは、1回の Challenge では解除しない。
+    // 既存方針（Second Independent Review → Meta Review → CEO）へ渡す。
+    for (const source of ['safety_recovery', 'auth_permission', 'data_state_integrity']) {
+      const critique = disputeOn(source)
+
+      expect(isBindingSafetySource(source)).toBe(true)
+      expect(shouldChallengeFinding(critique!)).toBe(false)
+      expect(bindingDisputes(critique!)).toHaveLength(1)
+    }
+  })
+
+  it('independent（critical の Binding Safety Review）も Challenge しない', () => {
+    const critique = disputeOn('independent')
+
+    expect(shouldChallengeFinding(critique!)).toBe(false)
+    expect(bindingDisputes(critique!)).toHaveLength(1)
+  })
+
+  it('advisory な設計論点は Challenge できる', () => {
+    for (const source of ['scope_simplicity', 'architecture_responsibility', 'operations']) {
+      const critique = disputeOn(source)
+
+      expect(isBindingSafetySource(source)).toBe(false)
+      expect(shouldChallengeFinding(critique!)).toBe(true)
+    }
+  })
+
+  it('**未知の source は binding 扱い**（fail-closed）', () => {
+    // 知らない指摘を「advisory だから1回で覆せる」側へ倒してはならない。
+    expect(isBindingSafetySource('some_future_focus')).toBe(true)
+    expect(shouldChallengeFinding(disputeOn('some_future_focus')!)).toBe(false)
+  })
+
+  it('binding と advisory が混在するとき、advisory だけが challengeable', () => {
+    const critique = parseCritique(JSON.stringify({
+      ...COMPLETE,
+      findingAssessments: [
+        {
+          source: 'safety_recovery', status: 'disputed', rationale: 'r',
+          grounds: 'wrong_premise', evidence: 'e',
+        },
+        {
+          source: 'scope_simplicity', status: 'disputed', rationale: 'r',
+          grounds: 'wrong_premise', evidence: 'e',
+        },
+      ],
+    }))
+
+    expect(challengeableDisputes(critique!).map((a) => a.source)).toEqual(['scope_simplicity'])
+    expect(bindingDisputes(critique!).map((a) => a.source)).toEqual(['safety_recovery'])
   })
 })
 

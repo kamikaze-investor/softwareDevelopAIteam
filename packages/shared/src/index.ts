@@ -100,7 +100,10 @@ export type { ReviewVendor } from './reviewSeparation'
 export {
   DISPUTE_GROUNDS,
   FINDING_ASSESSMENT_STATUSES,
+  bindingDisputes,
+  challengeableDisputes,
   disputedFindings,
+  isBindingSafetySource,
   parseCritique,
   shouldChallengeFinding,
 } from './independentCriticPolicy'

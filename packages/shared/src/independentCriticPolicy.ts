@@ -21,6 +21,8 @@
  * 評価対象に含める（`FindingAssessment`）。
  */
 
+import type { MetaReviewFocus } from './types/meta_review'
+
 /**
  * Review Finding に対する Critic の評価。
  *
@@ -221,6 +223,68 @@ export function parseCritique(raw: string): Critique | undefined {
 }
 
 /**
+ * その Finding は **Binding Safety / Authority** のものか。
+ *
+ * ## なぜ新しい分類が要るのか（既存機構で足りない理由）
+ *
+ * `FOCUS_PRIORITY`（`focusSelector.ts`）は focus の**選択順序**であって、
+ * 「その指摘が Binding か advisory か」を表していない。`reviewLoadClassifier` は
+ * 変更ファイルから負荷を出すもので、やはり Finding の性質を分類しない。
+ * したがってこの対応表が最小の不足分である。
+ *
+ * ## 何のために使うか
+ *
+ * **Challenge 1回で Binding Safety BLOCK を解除できる設計にしない**（CEO 指示 2026-09-18）。
+ * Safety Boundary / Authority / protected / irreversibility / Binding Safety Review に
+ * 争いがある場合は、従来どおり
+ * `Second Independent Review → 必要なら Meta Review → 未解決なら CEO` へ渡す。
+ * Challenge が扱うのは **task-kind Design Review の advisory な設計衝突**である。
+ *
+ * ## drift しない形にしてある
+ *
+ * `Record<MetaReviewFocus, boolean>` なので、focus が増えたら**コンパイルエラーになる**。
+ * 「知らない focus は challenge 可」へ黙って倒れることがない。
+ */
+const BINDING_BY_FOCUS: Record<MetaReviewFocus, boolean> = {
+  // Safety Boundary そのもの。
+  safety_recovery: true,
+  // Authority / permission model。
+  auth_permission: true,
+  // データの意味・所有権・不可逆性。
+  data_state_integrity: true,
+  // 以下は advisory な設計論点。Critic が証拠付きで争point を示せるのはこちら。
+  strategic_alignment: false,
+  architecture_responsibility: false,
+  operations: false,
+  product_ceo_experience: false,
+  scope_simplicity: false,
+}
+
+/**
+ * focus 以外の Finding source。`extractDesignReviewFindings()` が付ける値に対応する。
+ *
+ * `independent` は **critical load の Binding Safety Review** そのものなので binding である
+ * （`applyIndependentReviewOverride()` が blocking を CONFLICT へ倒す経路）。
+ */
+const BINDING_BY_OTHER_SOURCE: Readonly<Record<string, boolean>> = {
+  independent: true,
+  integration: false,
+  focused_review: false,
+}
+
+export function isBindingSafetySource(source: string): boolean {
+  if (Object.prototype.hasOwnProperty.call(BINDING_BY_FOCUS, source)) {
+    return BINDING_BY_FOCUS[source as MetaReviewFocus]
+  }
+  if (Object.prototype.hasOwnProperty.call(BINDING_BY_OTHER_SOURCE, source)) {
+    return BINDING_BY_OTHER_SOURCE[source] as boolean
+  }
+  // **未知の source は binding 扱い（fail-closed）。** 知らない指摘を
+  // 「advisory だから1回の Challenge で覆せる」側へ倒してはならない。
+  return true
+}
+
+/**
  * この Critique は **Review validity challenge を起こすか**。
  *
  * challenge は固定 Stage ではなく**条件分岐**である（CEO 指示 2026-09-18）。
@@ -242,7 +306,29 @@ export function disputedFindings(critique: Critique): FindingAssessment[] {
   )
 }
 
-/** Review validity challenge を起こすべきか。 */
+/**
+ * Challenge を起こせる（= advisory な）dispute だけを返す。
+ *
+ * Binding Safety / Authority の dispute は**ここで落とす**。落とされた dispute は
+ * 消えるのではなく、呼び出し側が既存の
+ * `Second Independent Review → Meta Review → CEO` 経路へ渡すための情報として残す
+ * （`bindingDisputes()`）。
+ */
+export function challengeableDisputes(critique: Critique): FindingAssessment[] {
+  return disputedFindings(critique).filter((assessment) => !isBindingSafetySource(assessment.source))
+}
+
+/** Binding Safety / Authority についての dispute。**Challenge では解決しない。** */
+export function bindingDisputes(critique: Critique): FindingAssessment[] {
+  return disputedFindings(critique).filter((assessment) => isBindingSafetySource(assessment.source))
+}
+
+/**
+ * Review validity challenge を起こすべきか。
+ *
+ * **Binding Safety findings はこの経路では解除されない。** advisory な設計論点について
+ * 証拠付きの dispute があるときだけ true を返す。
+ */
 export function shouldChallengeFinding(critique: Critique): boolean {
-  return disputedFindings(critique).length > 0
+  return challengeableDisputes(critique).length > 0
 }
