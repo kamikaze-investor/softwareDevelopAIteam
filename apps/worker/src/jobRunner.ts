@@ -1720,18 +1720,10 @@ function claudeCliFailureStderr(
  * 障害診断の証拠を失う（CEO 判断・2026-09-18）。
  */
 function classifyApiError(status: number, result: unknown): string {
-  const text = typeof result === 'string' ? result.toLowerCase() : ''
-
-  // **status だけで credit 不足と決めない。** 400 は入力不正からレート制御まで何でも来る。
-  // 判定材料は「残高が足りない」と明示している文言だけに限る
-  // （2026-09-18 実測: `400` + "Credit balance is too low"）。
-  // 文言が無い 400 は下の generic へ落ちる。
-  //
-  // `billing` 単独は入れない。"billing address invalid" のように**残高と無関係な**
-  // billing エラーまで credit 枯渇と断定してしまう（独立レビュー指摘）。
-  if (/credit balance|insufficient.*credit|out of credit/.test(text)) return 'credit exhausted'
-
-  // **ここから先は HTTP status の定義だけを根拠にする。** 推測で具体化しない。
+  // **status が定義として意味を持つものを先に返す。** 文言判定を先に置くと、
+  // status 側の確かな意味を文言側の推測が上書きしてしまう（独立レビュー指摘）。
+  // 例: `403` + "insufficient permission to access credit balance" は
+  // **権限の問題**であって残高の問題ではないのに、`credit exhausted` と出てしまっていた。
   //
   // 401 は「認証されていない」が定義そのものなので断定してよい。API key を渡さなくなった今、
   // subscription ログインの失効が最初にここへ出る。
@@ -1741,6 +1733,23 @@ function classifyApiError(status: number, result: unknown): string {
   if (status === 403) return 'access forbidden'
 
   if (status === 429) return 'rate limited'
+
+  // **credit 枯渇は「status が別の意味を持たない」ときだけ、明示文言を根拠に名乗る。**
+  // status だけでは決めない（400 は入力不正からレート制御まで何でも来る）し、
+  // 文言だけでも決めない（上の 401/403/429 を上書きしてしまう）。**両方**を要求する。
+  //
+  // 対象 status を 400/402 に限るのは、この2つが credit 枯渇と矛盾しないためである。
+  // 402 Payment Required は定義上まさにこれだが、それでも文言を要求する
+  // （status 単独では名乗らせない）。
+  //
+  // 文言は「残高が足りない」と明示しているものだけ。`billing` 単独は入れない。
+  // "billing address invalid" のように**残高と無関係な** billing エラーまで
+  // credit 枯渇と断定してしまう（独立レビュー指摘）。
+  // 2026-09-18 実測: `400` + "Credit balance is too low"。
+  if (status === 400 || status === 402) {
+    const text = typeof result === 'string' ? result.toLowerCase() : ''
+    if (/credit balance|insufficient.*credit|out of credit/.test(text)) return 'credit exhausted'
+  }
 
   // 文言からの推測でラベルを具体化しない。分からないものは分からないと出す。
   return 'API error'
