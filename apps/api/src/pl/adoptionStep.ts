@@ -23,6 +23,7 @@
  * ledger への新しい metadata / PL 専用の状態表。
  */
 
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
@@ -118,6 +119,48 @@ export const FOLLOW_UP_SKIPS_BEFORE_BOOST = 3
 
 /** audit_log の語彙。**新しいテーブルも metrics backend も作らない。** */
 const AUDIT_ENTITY_TYPE = 'roadmap_item'
+
+/**
+ * 採用提案が解釈できなかったときの診断記録。
+ *
+ * **`proposal_unusable` のためだけにある。** 成功時の出力は保存しない。
+ *
+ * 置き場所は既存 `audit_log` で、新しい table も metrics backend も作っていない。
+ * ただし entity_id は採用サイクルのキー（`adopt:<projectId>`）と**別にする**:
+ * attempt 予算（`adoptionEntriesInCurrentWindow()`）と候補の回転位置
+ * （`rotationOffset`、同 entity の**行数**を読む）が同じキーを数えているため、
+ * ここに足すと観測しただけで PL の挙動が変わってしまう。
+ */
+export const AUDIT_PROPOSAL_UNPARSED = 'adoption_proposal_unparsed'
+const PL_TARGET_ENTITY_TYPE = 'pl_loop_target'
+
+function proposalDiagnosticKey(projectId: string): string {
+  return `adopt-diagnostic:${projectId}`
+}
+
+/**
+ * 保存する raw 出力の上限。
+ *
+ * 原因分類（JSON が無い / 途中で切れた / フィールド欠落 / 契約外の散文）には十分で、
+ * 失敗のたびに際限なく膨らませない。**切り詰めたことは記録に残す。**
+ */
+export const PROPOSAL_DIAGNOSTIC_RAW_LIMIT = 4000
+
+/** `proposer` の上限。呼び出し元から渡る自由文字列はここで止める。 */
+export const PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT = 120
+
+/**
+ * 同じ prompt 版について、1 Project あたり保存する診断の上限。
+ *
+ * **1件あたりの上限だけでは総量が抑えられない。** provider が非 JSON を返し続けると、
+ * PL は escalate したあと採用ウィンドウを切り直してまた試すため（`adoptionEntriesInCurrentWindow()`
+ * は escalate を区切りにする）、失敗が続く限り診断が延々と増える。
+ * 60 秒 tick なら 3 分ごとに 2 件、止まらない（独立レビュー指摘）。
+ *
+ * 同じ失敗を何百件集めても分類は進まないので、**先頭の数件だけ**を残す。
+ * prompt を直したら版が変わり、新しい予算が開く —— 直した後の挙動は改めて観測できる。
+ */
+export const PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION = 20
 export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
 export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
 export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
@@ -219,6 +262,113 @@ export function classifyAdoptionCandidates(
  * `(entity_type, entity_id, created_at DESC)` の既存 index で後から集計できる形にしてある:
  * 検出 → 初回で採用 / skip 1・2・3 → boost → boost 後に採用 / 取り残し、までを1本の系列で追える。
  */
+/**
+ * 採用 prompt / 出力契約の版。**内容そのものは保存せず、一致判定だけできるようにする。**
+ *
+ * 「あのとき出ていた prompt と今のものが同じか」を後から言えないと、
+ * prompt を直した後でこの診断を読み違える。
+ */
+export function adoptionPromptVersion(): string {
+  return createHash('sha256').update(ADOPTION_SYSTEM_PROMPT).digest('hex').slice(0, 12)
+}
+
+/** 記録するときに渡す材料。 */
+export interface ProposalDiagnostic {
+  reason: string
+  proposer: string
+  promptVersion: string
+  candidateCount: number
+  followUpCandidateCount: number
+  raw: string
+}
+
+/**
+ * 実際に保存された形。`raw` は上限で切られていることがあるので、
+ * **元の長さと切ったかどうか**を併せて持つ（切れた出力と短い出力を取り違えないため）。
+ */
+export interface PersistedProposalDiagnostic extends ProposalDiagnostic {
+  rawLength: number
+  rawTruncated: boolean
+}
+
+/**
+ * parse 失敗の診断を1件だけ残す。**成功時は何も残さない。**
+ *
+ * timestamp と projectId は audit 行そのもの（`created_at` / `entity_id`）が持つので重複させない。
+ * 保存するのは model の出力とその周辺の数値だけで、prompt 本文も credential も入れない
+ * （prompt には ledger 本文が丸ごと入るため、意図的に載せていない）。
+ */
+function recordProposalDiagnostic(
+  storage: IStorage,
+  projectId: string,
+  diagnostic: ProposalDiagnostic,
+): void {
+  const truncated = diagnostic.raw.length > PROPOSAL_DIAGNOSTIC_RAW_LIMIT
+  const payload = {
+    // `reason` は固定文字列・既知のキー名・位置の数値だけなので上限は要らない。
+    // `proposer` は呼び出し元から渡る唯一の自由文字列なので、ここで短く切る
+    // （production では定数2種だが、上限の無い欄を1つも残さない）。
+    reason: diagnostic.reason,
+    proposer: diagnostic.proposer.slice(0, PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT),
+    promptVersion: diagnostic.promptVersion,
+    candidateCount: diagnostic.candidateCount,
+    followUpCandidateCount: diagnostic.followUpCandidateCount,
+    rawLength: diagnostic.raw.length,
+    rawTruncated: truncated,
+    raw: truncated ? diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT) : diagnostic.raw,
+  }
+
+  // 同じ prompt 版の診断が十分に溜まっていたら、もう足さない。
+  // 分類に必要なのは最初の数件であって、同じ失敗の山ではない。
+  const existing = findProposalDiagnostics(storage, projectId)
+    .filter((entry) => entry.promptVersion === diagnostic.promptVersion)
+  if (existing.length >= PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION) {
+    console.warn(
+      `[adoptionStep] proposal diagnostics for project ${projectId} already at `
+      + `${PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION} for prompt ${diagnostic.promptVersion}; `
+      + 'not recording more until the prompt changes',
+    )
+    return
+  }
+
+  // **記録に失敗しても採用の結果は変えない。**
+  // ここで throw すると `maybeAdoptNext()` の catch が拾い、`proposal_unusable` が
+  // `diagnosis_failed` に化ける —— 観測したせいで PL の挙動が変わることになる。
+  // 記録できなかったこと自体は log へ出す（黙って落とさない）。
+  try {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: AUDIT_PROPOSAL_UNPARSED,
+      entityType: PL_TARGET_ENTITY_TYPE,
+      entityId: proposalDiagnosticKey(projectId),
+      result: 'failure',
+      detail: JSON.stringify(payload),
+    })
+  } catch (error: unknown) {
+    console.error(
+      `[adoptionStep] proposal diagnostic could not be recorded for project ${projectId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+/** 診断を読み出す。運用時に `audit_log` を直接読まずに済ませるための入口。 */
+export function findProposalDiagnostics(
+  storage: IStorage,
+  projectId: string,
+): PersistedProposalDiagnostic[] {
+  return storage.auditLog
+    .findByEntity(PL_TARGET_ENTITY_TYPE, proposalDiagnosticKey(projectId))
+    .filter((entry) => entry.operation === AUDIT_PROPOSAL_UNPARSED)
+    .flatMap((entry) => {
+      try {
+        return [JSON.parse(entry.detail ?? '{}') as PersistedProposalDiagnostic]
+      } catch {
+        return []
+      }
+    })
+}
+
 function recordFollowUpAudit(
   storage: IStorage,
   projectId: string,
@@ -422,17 +572,78 @@ export function selectAdoptionCandidates<T extends RoadmapCandidate & { boosted?
  * **補正も推測もしない。** 足りない・型が違う場合は採用しない（fail-closed）。
  * ここで緩めると「PL が書いた文字列」と「実際に採用された範囲」がズレる。
  */
+/**
+ * `JSON.parse` の失敗を、**入力内容を一切含まない**分類名へ落とす。
+ *
+ * メッセージ本文は保存しない。ここで返る文字列は固定語と数字だけである。
+ */
+function classifyJsonParseError(error: unknown): string {
+  if (!(error instanceof Error)) return 'json_parse_error'
+
+  // 出力が途中で終わっている。max tokens 切れの典型で、prompt 起因か provider 起因かの分岐点。
+  if (error.message.includes('Unexpected end of JSON input')) {
+    return 'json_parse_error: unexpected_end_of_input'
+  }
+
+  const position = /at position (\d+)/.exec(error.message)?.[1]
+  if (position !== undefined) return `json_parse_error_at_position: ${position}`
+
+  // 残りは入力断片を含む形なので、種別だけにとどめる。内容は raw 側を上限付きで見る。
+  return 'json_parse_error'
+}
+
 export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefined {
+  const result = parseAdoptionProposalDetailed(raw)
+  return result.ok ? result.proposal : undefined
+}
+
+/**
+ * 上と同じ判定に、**なぜ通らなかったのか**を付けたもの。実装はここ1本だけである。
+ *
+ * 理由を持たない `undefined` だけでは、production で `proposal_unusable` が出たときに
+ * 「JSON が無い」のか「フィールドが欠けている」のかすら後から分からない
+ * （2026-09-17 の Operational E2E で実際に分からなかった）。
+ *
+ * **理由は分類のためだけに使い、採用可否は一切変えない。** 補正も推測もしない fail-closed は
+ * そのままである。
+ */
+export type AdoptionProposalParseResult =
+  | { ok: true; proposal: PlAdoptionProposal }
+  | { ok: false; reason: string }
+
+export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalParseResult {
   const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return undefined
+  if (!match) {
+    // **「散文で答えた」と「途中で切れた」を分ける。**
+    //
+    // 抽出の正規表現は閉じ括弧を要求するので、出力が max tokens で切れた場合は
+    // `JSON.parse` まで届かず、ここで落ちる（実測）。つまり
+    // `Unexpected end of JSON input` はこの経路では出ない。両者を同じ理由にすると、
+    // prompt 起因（契約を無視して散文）と provider 起因（長さ切れ）を分けられない。
+    // 判定材料は「開き括弧があるか」だけで、内容は一切見ない。
+    return {
+      ok: false,
+      reason: raw.includes('{') ? 'no_json_object_found: unterminated' : 'no_json_object_found',
+    }
+  }
 
   let parsed: unknown
   try {
     parsed = JSON.parse(match[1] ?? match[0])
-  } catch {
-    return undefined
+  } catch (error: unknown) {
+    // **`JSON.parse` のメッセージをそのまま載せない。**
+    //
+    // Node 22 のメッセージは3形ある（実測）:
+    //   1. `... in JSON at position 7 (line 1 column 8)`   … 位置あり・内容なし
+    //   2. `Unexpected end of JSON input`                   … 内容なし。**出力が途中で切れた**印
+    //   3. `Unexpected token 's', ..."   sk-SECRET-"... is not valid JSON` … **入力断片を含む**
+    //
+    // 3をそのまま保存すると、値を載せない約束が崩れるだけでなく、raw の上限より後ろにある
+    // 断片が上限を迂回して混入する。そこで**内容を含まない形へ分類してから**保存する。
+    // 2 を潰さないのは、これが「max tokens で切れた」という最も知りたい区別だからである。
+    return { ok: false, reason: classifyJsonParseError(error) }
   }
-  if (typeof parsed !== 'object' || parsed === null) return undefined
+  if (typeof parsed !== 'object' || parsed === null) return { ok: false, reason: 'not_an_object' }
 
   const obj = parsed as Record<string, unknown>
   const strings = (value: unknown): string[] | undefined => (
@@ -446,16 +657,28 @@ export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefin
   const allowedPaths = strings(obj.allowedPaths)
   const acceptanceCriteria = strings(obj.acceptanceCriteria)
 
-  if (roadmapId === '' || implementationScope === '' || !allowedPaths || !acceptanceCriteria) {
-    return undefined
+  // **どのフィールドで落ちたか**が分からないと A（prompt 起因）と B（parser が正当な出力を
+  // 拒否）を切り分けられない。キー名だけを並べ、値は載せない。
+  const missing = [
+    roadmapId === '' ? 'roadmapId' : undefined,
+    implementationScope === '' ? 'implementationScope' : undefined,
+    !allowedPaths ? 'allowedPaths' : undefined,
+    !acceptanceCriteria ? 'acceptanceCriteria' : undefined,
+  ].filter((key): key is string => key !== undefined)
+
+  if (missing.length > 0) {
+    return { ok: false, reason: `missing_or_invalid_fields: ${missing.join(', ')}` }
   }
 
   return {
-    roadmapId,
-    implementationScope,
-    allowedPaths,
-    acceptanceCriteria,
-    ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    ok: true,
+    proposal: {
+      roadmapId,
+      implementationScope,
+      allowedPaths: allowedPaths as string[],
+      acceptanceCriteria: acceptanceCriteria as string[],
+      ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    },
   }
 }
 
@@ -563,6 +786,13 @@ export function buildAdoptionPrompt(
 export interface PlAdoptionDeps {
   /** 選択と具体化。既定は PL ループと同じ provider CLI 経路。 */
   propose: (system: string, user: string) => Promise<string>
+  /**
+   * `propose` が誰なのか（`provider/model`）。診断にだけ使う。
+   *
+   * 出力元が分からない診断では「provider が契約外の出力を返した」のか
+   * 「prompt が原因」なのかを切り分けられない。既定の経路を使う呼び出し元が渡す。
+   */
+  proposerId?: string
   readLedger?: () => string
   adopt?: typeof adoptRoadmapItem
 }
@@ -623,14 +853,27 @@ export async function runAdoptionStep(
     ADOPTION_SYSTEM_PROMPT,
     buildAdoptionPrompt(candidates, projectGoal),
   )
-  const proposal = parseAdoptionProposal(raw)
-  if (!proposal) {
+  const parsed = parseAdoptionProposalDetailed(raw)
+  if (!parsed.ok) {
+    // **観測して忘れない。** ここで残さないと、production で起きた1回を後から分類できない
+    // （2026-09-17 の Operational E2E で実際に分類できなかった）。
+    recordProposalDiagnostic(storage, projectId, {
+      reason: parsed.reason,
+      proposer: deps.proposerId ?? 'unknown',
+      promptVersion: adoptionPromptVersion(),
+      candidateCount: candidates.length,
+      followUpCandidateCount: candidates.filter((candidate) => candidate.kind === 'follow_up').length,
+      raw,
+    })
+    // `failureCode` は master 側で追加されたもので、**落とさない**。
+    // 診断を足したこの変更が、既存の失敗分類を消してしまってはいけない。
     return {
       status: 'proposal_unusable',
       failureCode: 'unparsable_proposal',
       reason: 'PL did not produce a complete adoption proposal',
     }
   }
+  const proposal = parsed.proposal
 
   // 提示していない id を選んだ場合は、ここで落とす前に Gate でも落ちる（ledger 照合）。
   // ただし理由を分かりやすくするため先に見る。
