@@ -1736,7 +1736,9 @@ function claudeApiErrorReason(parsed: Record<string, unknown>): string | undefin
  * 本 PR が拾おうとしていた当の事象が、この分岐で取りこぼされていた。
  *
  * そこで stdout を先に読む。API エラーを報告していれば exit 0 のときと**同じ固定語彙**を返し、
- * 読めなかったときだけ「envelope 以前に落ちた」と述べる。
+ * 読めなかったときだけ「使える envelope が無いまま終了した」と述べる。
+ * **「envelope 以前に落ちた」とは書かない。** truncate された envelope を、出力前に落ちた場合と
+ * 区別できないためである。
  */
 /**
  * stdout **全体**が Claude Code CLI の result envelope であるときだけ返す。
@@ -1788,12 +1790,15 @@ function claudeCliFailureNote(cliResult: AiCliResult): string {
   // 起きていないこと（出力が出る前に止められた）を operator へ伝えてしまう（独立レビュー指摘）。
   if (cliResult.blocked === true) return 'Claude Code CLI output could not be parsed as the expected JSON'
 
-  // **envelope の有無は exitCode からは分からない。** 実際に parse できたかどうかで言い分を変える。
-  // 解釈できる envelope があるのに「envelope 以前に落ちた」と書けば、それも起きていないことになる
-  // （独立レビュー指摘）。ここは API エラーを報告していない envelope が残るケース。
+  // **envelope の有無は exitCode からは分からない。** 実際に読めたかどうかで言い分を変える。
+  //
+  // 読めなかった側を「envelope 以前に落ちた」とは書かない。途中で切れた envelope
+  // （`{"is_error":true,"api_error_status":400,"result":"Credit balance` のような truncate）は、
+  // **出力してから切れた**のか**出力前に落ちた**のかを区別できない。立証できているのは
+  // 「使える envelope が無い」ことだけである（独立レビュー指摘）。
   const exited = `Claude Code CLI exited ${cliResult.exitCode ?? 'abnormally'}`
   return envelope === undefined
-    ? `${exited} before producing a result envelope`
+    ? `${exited} without a usable result envelope`
     : `${exited} after producing a result envelope that reported no API error`
 }
 
@@ -1904,7 +1909,11 @@ function classifyClaudeImplementFailure(
   // 断片を信じるとモデルが書いた JSON で「拒否された tool がある」と名乗れてしまう。
   const parsed = claudeResultEnvelope(cliResult.stdout)
   if (parsed === undefined) {
-    return 'Claude Code CLI output could not be parsed as JSON'
+    // **「JSON ではなかった」と断定しない。** `claudeResultEnvelope()` は
+    // `{"type":"result","result":"..."}` のような**正しい JSON でも** boolean の `is_error` が
+    // 無ければ弾く。立証できているのは「使える result envelope ではなかった」ことだけである
+    // （独立レビュー指摘）。
+    return 'Claude Code CLI output was not a usable result envelope'
   }
   const apiErrorReason = claudeApiErrorReason(parsed)
   if (apiErrorReason !== undefined) return apiErrorReason

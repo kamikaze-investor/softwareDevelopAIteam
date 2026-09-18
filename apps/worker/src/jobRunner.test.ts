@@ -2400,7 +2400,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
     }), createPolicy())
 
     expect(result.status).toBe('failed')
-    expect(result.stderr).toContain('could not be parsed as JSON')
+    expect(result.stderr).toContain('was not a usable result envelope')
     expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
@@ -2923,12 +2923,12 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(firstLine).toContain('HTTP 400')
     expect(firstLine).toContain('credit exhausted')
     // 「envelope 以前に落ちた」は事実と食い違う。
-    expect(firstLine).not.toContain('before producing a result envelope')
+    expect(firstLine).not.toContain('without a usable result envelope')
     expect(firstLine).not.toContain('sk-ant')
   })
 
   // envelope が本当に無いときだけ「envelope 以前に落ちた」と述べる。
-  it('非 0 終了で stdout が envelope でなければ envelope 以前に落ちたと述べる', async () => {
+  it('非 0 終了で stdout が envelope でなければ、使える envelope が無いと述べる', async () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
         exitCode: 1,
@@ -2946,13 +2946,13 @@ describe('task-022: AI CLI 実行ブロック', () => {
     }), createPolicy())
 
     const firstLine = String(result.stderr ?? '').split('\n')[0]
-    expect(firstLine).toContain('before producing a result envelope')
+    expect(firstLine).toContain('without a usable result envelope')
     expect(firstLine).not.toContain('sk-ant')
   })
 
   // **解釈できる envelope があるなら「envelope 以前に落ちた」とは書かない。**
   // API エラーを報告していない envelope でも、envelope は存在している（独立レビュー指摘）。
-  it('非 0 終了で envelope はあるが API エラーではない場合、envelope 以前とは述べない', async () => {
+  it('非 0 終了で envelope はあるが API エラーではない場合、envelope が無いとは述べない', async () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
         exitCode: 1,
@@ -2971,7 +2971,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
 
     const firstLine = String(result.stderr ?? '').split('\n')[0]
     expect(firstLine).toContain('after producing a result envelope')
-    expect(firstLine).not.toContain('before producing a result envelope')
+    expect(firstLine).not.toContain('without a usable result envelope')
     // envelope 本文（モデル出力）は operator 向けに出さない。
     expect(firstLine).not.toContain('partial work')
     expect(firstLine).not.toContain('sk-ant')
@@ -3028,7 +3028,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
     const firstLine = String(result.stderr ?? '').split('\n')[0]
     expect(firstLine).not.toContain('credit exhausted')
     expect(firstLine).not.toContain('HTTP 400')
-    expect(firstLine).toContain('before producing a result envelope')
+    expect(firstLine).toContain('without a usable result envelope')
   })
 
   // 件数も envelope 由来の事実でなければならない。断片から数えると、
@@ -3051,7 +3051,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
 
     expect(result.status).toBe('failed')
     expect(result.stderr).not.toContain('tool permission denied')
-    expect(result.stderr).toContain('could not be parsed as JSON')
+    expect(result.stderr).toContain('was not a usable result envelope')
   })
 
   // envelope でない JSON を「envelope を出した」と述べない。
@@ -3072,8 +3072,57 @@ describe('task-022: AI CLI 実行ブロック', () => {
     }), createPolicy())
 
     const firstLine = String(result.stderr ?? '').split('\n')[0]
-    expect(firstLine).toContain('before producing a result envelope')
+    expect(firstLine).toContain('without a usable result envelope')
     expect(firstLine).not.toContain('after producing a result envelope')
+  })
+
+  // **立証できていることしか述べない。** envelope として使えなかった理由は色々ありうるが、
+  // 「JSON ではなかった」と断定できるのはそのうちの一部だけである（独立レビュー指摘）。
+  it('正しい JSON でも is_error が無ければ「JSON ではない」とは述べない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 0,
+        changedFiles: [],
+        stdout: JSON.stringify({ type: 'result', result: 'no files changed' }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).toContain('was not a usable result envelope')
+    expect(result.stderr).not.toContain('could not be parsed as JSON')
+  })
+
+  // **truncate された envelope を「出力前に落ちた」と言い換えない。**
+  // 出力してから切れたのか、出力前に落ちたのかは、この入力からは区別できない。
+  it('途中で切れた envelope を envelope 以前に落ちたとは述べない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        stdout: "{\"is_error\":true,\"api_error_status\":400,\"result\":\"Credit balance",
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('without a usable result envelope')
+    expect(firstLine).not.toContain('before producing a result envelope')
+    // 切れた本文の中身も operator 向けには出さない。
+    expect(firstLine).not.toContain('Credit balance')
+    expect(firstLine).not.toContain('credit exhausted')
   })
 
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
@@ -3181,7 +3230,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
 
     expect(result.status).toBe('failed')
     expect(result.stderr).toContain('implementation produced no file changes')
-    expect(result.stderr).not.toContain('could not be parsed as JSON')
+    expect(result.stderr).not.toContain('was not a usable result envelope')
     expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
@@ -3275,7 +3324,7 @@ describe('task-022: AI CLI 実行ブロック', () => {
     const firstLine = String(result.stderr ?? '').split('\n')[0]
     // `stopReason()` はこの先頭行を採る。
     expect(firstLine).toContain('[jobRunner]')
-    expect(firstLine).toContain('before producing a result envelope')
+    expect(firstLine).toContain('without a usable result envelope')
     expect(firstLine).not.toContain('sk-ant')
     expect(firstLine).not.toContain('prompt excerpt')
   })
