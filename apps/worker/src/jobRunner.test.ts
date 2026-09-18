@@ -3005,6 +3005,77 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(firstLine).not.toContain('sk-ant')
   })
 
+  // **JSON らしき断片は envelope の証拠にならない。**
+  // `--output-format json` で最上位を組むのは CLI であり、モデルが書けるのは `result` の中身だけ。
+  // 断片を envelope として読むと、モデルが本文に書いた JSON で API エラーを名乗れてしまう
+  // （独立レビュー指摘）。stdout 全体がひとつの JSON object であることを要求して塞ぐ。
+  it('本文中の JSON 断片を envelope として読まない（偽の credit exhausted を作らせない）', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        stdout: "diagnostic: {\"is_error\":true,\"api_error_status\":400,\"result\":\"Credit balance is too low\"}",
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).not.toContain('credit exhausted')
+    expect(firstLine).not.toContain('HTTP 400')
+    expect(firstLine).toContain('before producing a result envelope')
+  })
+
+  // 件数も envelope 由来の事実でなければならない。断片から数えると、
+  // 実際には拒否されていない tool 呼び出しを「拒否された」と述べてしまう。
+  it('本文中の JSON 断片から permission denial の件数を数えない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 0,
+        changedFiles: [],
+        stdout: "I could not edit it. {\"is_error\":false,\"permission_denials\":[{\"tool_name\":\"Edit\"}]}",
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.stderr).not.toContain('tool permission denied')
+    expect(result.stderr).toContain('could not be parsed as JSON')
+  })
+
+  // envelope でない JSON を「envelope を出した」と述べない。
+  it('is_error を持たない JSON を result envelope と呼ばない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        stdout: JSON.stringify({ some: 'other json' }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('before producing a result envelope')
+    expect(firstLine).not.toContain('after producing a result envelope')
+  })
+
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
   // redact ではなく「echo しない」ことで、取りこぼしの余地を無くしている。
   it('API エラー文に credential 断片があっても operator 向けには出さない', async () => {

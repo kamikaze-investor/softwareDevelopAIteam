@@ -25,7 +25,6 @@ import type {
 } from '@ai-team/shared'
 import { runRiskReview } from '@ai-team/shared'
 import { z } from 'zod'
-import { tryParseJson } from './aiCli/adapter.js'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
@@ -1739,9 +1738,47 @@ function claudeApiErrorReason(parsed: Record<string, unknown>): string | undefin
  * そこで stdout を先に読む。API エラーを報告していれば exit 0 のときと**同じ固定語彙**を返し、
  * 読めなかったときだけ「envelope 以前に落ちた」と述べる。
  */
+/**
+ * stdout **全体**が Claude Code CLI の result envelope であるときだけ返す。
+ *
+ * `tryParseJson()` は stdout の中から**最初の `{ ... }`** を拾う実装なので、
+ * 出力のどこかに JSON らしき断片があれば envelope として扱ってしまう。
+ * つまりモデルが本文中に
+ * `diagnostic: {"is_error":true,"api_error_status":400,"result":"Credit balance is too low"}`
+ * と書いただけで `credit exhausted` を名乗れてしまう（独立レビュー指摘）。
+ * **断片は envelope の証拠にならない。**
+ *
+ * `--output-format json` では CLI が最上位を組み立て、モデルが書けるのは `result` の**中身**
+ * だけである。したがって「stdout 全体がひとつの JSON object」を要求すれば、
+ * モデルが最上位を騙る経路は塞がる。
+ *
+ * **VPS production 実測（2026-09-18、解釈できた 6/6）**: stdout は `{` で始まる単一 JSON で、
+ * `type: "result"` と boolean の `is_error` を必ず持っていた。
+ * ここで要求するのは **`is_error` が boolean であること**まで —— 実際に読む欄がそれだからである。
+ * `type` も毎回付いていたが要求しない。ある CLI 版が落としただけで API エラーの分類を
+ * 失うほうの害が大きく、断片対策としては上の「全体が JSON」で既に足りている。
+ */
+function claudeResultEnvelope(stdout: string | undefined): Record<string, unknown> | undefined {
+  if (typeof stdout !== 'string') return undefined
+
+  const trimmed = stdout.trim()
+  if (!trimmed.startsWith('{')) return undefined
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+
+  const envelope = parsed as Record<string, unknown>
+  return typeof envelope.is_error === 'boolean' ? envelope : undefined
+}
+
 function claudeCliFailureNote(cliResult: AiCliResult): string {
-  const parsed = tryParseJson(cliResult.stdout)
-  const apiErrorReason = parsed === undefined ? undefined : claudeApiErrorReason(parsed)
+  const envelope = claudeResultEnvelope(cliResult.stdout)
+  const apiErrorReason = envelope === undefined ? undefined : claudeApiErrorReason(envelope)
   if (apiErrorReason !== undefined) return apiErrorReason
 
   // **`blocked` は「出力が無かった」という意味ではない。** adapter の唯一の代入箇所
@@ -1755,7 +1792,7 @@ function claudeCliFailureNote(cliResult: AiCliResult): string {
   // 解釈できる envelope があるのに「envelope 以前に落ちた」と書けば、それも起きていないことになる
   // （独立レビュー指摘）。ここは API エラーを報告していない envelope が残るケース。
   const exited = `Claude Code CLI exited ${cliResult.exitCode ?? 'abnormally'}`
-  return parsed === undefined
+  return envelope === undefined
     ? `${exited} before producing a result envelope`
     : `${exited} after producing a result envelope that reported no API error`
 }
@@ -1863,7 +1900,9 @@ function classifyClaudeImplementFailure(
     return cliResult.changedFiles.length === 0 ? 'implementation produced no file changes' : undefined
   }
 
-  const parsed = tryParseJson(cliResult.stdout)
+  // **ここも断片ではなく envelope を要求する。** `permission_denials` の件数も envelope 由来で、
+  // 断片を信じるとモデルが書いた JSON で「拒否された tool がある」と名乗れてしまう。
+  const parsed = claudeResultEnvelope(cliResult.stdout)
   if (parsed === undefined) {
     return 'Claude Code CLI output could not be parsed as JSON'
   }
