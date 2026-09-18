@@ -204,7 +204,7 @@ describe('却下済み spec の再提出は、Design Review を起こす前に�
       roadmapId: 'conflicted-item',
       allowedPaths: [...ORIGINAL_PATHS].reverse(),
       acceptanceCriteria: ['当初の受入条件'],
-      implementationScope: `  ${ORIGINAL_SCOPE.toUpperCase()}  `,
+      implementationScope: `  ${ORIGINAL_SCOPE.toUpperCase()}  `, // scope は大小を潰す（#255 と同じ）
     }, silentDeps())
 
     expect(again).toMatchObject({ ok: false, code: 'SPEC_NOT_MATERIALLY_DIFFERENT' })
@@ -217,11 +217,9 @@ describe('却下済み spec の再提出は、Design Review を起こす前に�
 
     const again = await adoptRoadmapItem(storage, {
       projectId, roadmapId: 'conflicted-item',
-      // 許可範囲は同一。重複しているうえ、正規化して初めて等しくなる形も混ぜる。
-      allowedPaths: [
-        ...ORIGINAL_PATHS,
-        ...ORIGINAL_PATHS.map((path) => ` ${path.toUpperCase()} `),
-      ],
+      // 許可範囲は同一。重複しているうえ、空白の揺れで初めて等しくなる形も混ぜる。
+      // 大小違いも含める（`reviewVisibleSpecKey()` の契約どおり cosmetic 扱い）。
+      allowedPaths: [...ORIGINAL_PATHS, ...ORIGINAL_PATHS.map((path) => ` ${path.toUpperCase()} `)],
       acceptanceCriteria: ['当初の受入条件'],
       implementationScope: ORIGINAL_SCOPE,
     }, silentDeps())
