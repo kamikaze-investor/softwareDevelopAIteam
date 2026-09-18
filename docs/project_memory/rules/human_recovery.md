@@ -115,20 +115,17 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 | `TASK_NOT_BLOCKED` | 既に再投入済みか、そもそも止まっていない |
 | `TASK_PARKED` | `abort_task` で park 済み。復旧の副作用で park を取り消さない |
 | `TASK_NOT_REACHABLE` | `roadmapActive=false` 等で自律ループから到達できない。戻しても何も動かず、いま出ている警告だけが消える。採用し直すか park する |
-| `SPEC_ALREADY_RETRIED` | **同じ design text で既に1度再投入済み**。変えずに押し直すと同じ Review を引き直すだけ。**手順 2 へ戻って訂正する** |
-
-**生涯上限は無い。かわりに「却下済みテキストの世代」単位で1回に限る。**
-連打を止めているのは入口条件（`blocked` かつ Job 0 件）と `SPEC_ALREADY_RETRIED` の2つで、
-**変えずに押し直すことだけ**ができない。訂正すれば design text hash が変わり、次の世代として
-また1回受理される —— 「N 回で二度と復旧不能」にはならない。
-
-これが要るのは、`pending` へ戻すと採用のやり直しが可能になり、その経路には
-`isMateriallyDifferentSpec()` 相当の検査が無いためである。放置すると、この repo で実測されている
-判定の揺れ（ledger: `independent-review-verdict-instability`）を使って
-CONFLICT を洗浄できてしまう。
-
+**生涯上限は無い。** 連打を止めているのは入口条件（`blocked` かつ Job 0 件）そのもので、
+もう一度受理されるにはシステムが**独立に** dead state へ再突入している必要がある。
 この操作は Job も Review も作らないので、`PL_MAX_REMEDIATION_ATTEMPTS` /
 `PL_MAX_ATTEMPTS_PER_TARGET` / `DESIGN_REVIEW_MAX_ATTEMPTS` のどれも消費・リセットしない。
+
+> **既知の穴（この経路では塞げない）**: `pending` に戻ると採用のやり直しが可能になり、
+> その経路には「却下済みと実質同じ提案か」の検査が無い。同じ spec を繰り返し採用し直せば
+> Design Review を何度でも引き直せてしまう。**これは master に既に在る穴**で、
+> `pending` な採用済み Task すべてに当てはまる。Human Recovery 側へ「同一 design text では
+> 1回だけ」を入れると、訂正には `pending` が必要なので **deadlock になる**（実装して撤回した）。
+> 正しい修正箇所は採用経路であり、`adoption-path-has-no-material-difference-check` として登録済み。
 
 **再投入の直後は5分間何も起きないことがある。** `task_ready_without_job` は既存の停滞閾値
 （`DEFAULT_STALL_HINT_MS` = 5分）を過ぎたものだけを PL の対象にする。止まっている Task は

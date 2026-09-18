@@ -102,15 +102,13 @@ import {
  * **3. 却下済み spec の履歴を消さない。** #255 の `isMateriallyDifferentSpec()` が参照する
  * 却下履歴は `audit_log` の `remediate:<taskId>` 行にあり、この関数は読みも書きもしない。
  *
- * **4. 同じ design text での再投入は1回だけ（`SPEC_ALREADY_RETRIED`）。**
- * 1〜3 だけでは足りない —— `pending` へ戻すと**採用のやり直し**が可能になり、その経路には
- * `isMateriallyDifferentSpec()` 相当の検査が無い。したがって「変えずに再投入 → 同じ採用 →
- * fresh Review」を繰り返せば、この repo で実測されている判定の揺れ
- * （ledger: `independent-review-verdict-instability`）を使って CONFLICT を洗浄できてしまう
- * （独立レビュー指摘・2026-09-18）。そこで**却下済みテキストの世代**
- * （直近 Design Review run の `designTextHash`）単位で再投入を1回に限る。
- * 訂正して採用し直せば hash が変わるので次の世代として1回許され、
- * **「二度と復旧不能」にはならず、変えずに押し直すことだけができなくなる。**
+ * **4. ただし laundering をここで塞ぐことはできない（独立レビュー round 2）。**
+ * `pending` へ戻すと採用のやり直しが可能になり、その経路には `isMateriallyDifferentSpec()`
+ * 相当の検査が無いため、同じ spec を何度でも再審査させられる。**これは master に既に在る穴**で
+ * （`pending` な採用済み Task すべてに当てはまる）、本変更が作ったものではない。
+ * 一度ここへ「同一 hash では1回だけ」を入れたが、訂正には `pending` が要り、`pending` には
+ * この関数が要るため **deadlock になった**ので撤回した。正しい修正箇所は採用側であり、
+ * 別 Finding（`adoption-path-has-no-material-difference-check`）として登録した。
  *
  * ## 生涯上限を**置いてはならない**理由（実測・2026-09-18）
  *
@@ -164,16 +162,17 @@ export type RecoverBlockedTaskResult =
       | 'TASK_HAS_JOBS'
       | 'TASK_PARKED'
       | 'TASK_NOT_REACHABLE'
-      | 'SPEC_ALREADY_RETRIED'
       | 'RECOVERY_FAILED'
     reason: string
   }
 
 /**
- * 今回の再投入が対象にしている design text の識別子。
+ * 今回の再投入が対象にしていた design text の識別子。**audit へ残すためだけに使う。**
  *
- * **再投入を「却下済みテキスト世代」単位で有界にするための鍵**である（下記 `SPEC_ALREADY_RETRIED`）。
- * Design Review run がまだ無い Task は `-` とし、「1度も審査されていない世代」を1つとして数える。
+ * これを**門にはしない**（上の「4.」参照。訂正には `pending` が要るので deadlock になる）。
+ * 残す理由は forensics で、「同じテキストのまま何度再投入されたか」を後から数えられるようにする
+ * ——`adoption-path-has-no-material-difference-check` を実装するときの実データになる。
+ * Design Review run がまだ無い Task は `-`。
  */
 function currentDesignGeneration(storage: IStorage, taskId: string): string {
   const run = storage.designReviewRuns.findLatestByTaskId(taskId)
@@ -278,36 +277,25 @@ export function recoverBlockedTask(
     }
   }
 
-  // **同じ design text で2度目の再投入をしない。**
+  // **却下済みテキスト世代での上限は置かない（独立レビュー round 2 で撤回した）。**
   //
-  // 再投入そのものは Review を起こさないが、`pending` に戻ると採用のやり直しが可能になり、
-  // その経路には `isMateriallyDifferentSpec()` 相当の検査が無い。したがって
-  // 「変えずに再投入 → 同じ採用 → fresh Review」を繰り返せば、この repo で実測されている
-  // **判定の揺れ（`independent-review-verdict-instability`）を使って CONFLICT を洗浄できる**
-  // （独立レビュー指摘・2026-09-18）。
+  // round 1 の laundering 指摘を受けて「同じ `designTextHash` では1回だけ」を入れたが、
+  // round 2 で**それが deadlock を作る**ことが分かった:
+  //   - design text は `task.description` + allowedPaths 由来の contract である
+  //     （`buildInitialImplementAiCliPrompt()`）。**訂正しなければ再実行しても hash は同じ**
+  //   - 訂正するには `syncRoadmapTasks()` が要り、それは `status === 'pending'` を要求する
+  //   - `pending` にするにはこの関数が要る
+  // よって「訂正されずに blocked へ戻る」という**最も普通のケース**で、
+  // 次の世代を作る手段が無いまま再投入が永久に拒否される —— CEO が明示的に禁じた
+  // 「N 回を超えたら二度と復旧不能」そのものである。
   //
-  // そこで**却下済みテキストの世代単位**で有界にする。訂正して採用し直せば design text hash が
-  // 変わるので次の世代として1回許される —— 「二度と復旧不能」にはならず、
-  // **変えずに押し直すことだけ**ができなくなる。
+  // **laundering はここで塞ぐ問題ではない。** 実際の再審査は `/recover` ではなく
+  // `POST /api/projects/:id/roadmap-adoptions` が起こしており、その経路には
+  // `isMateriallyDifferentSpec()` 相当の検査が無い —— これは master に既に在る穴で、
+  // `pending` な採用済み Task すべてに当てはまる（本変更が作ったものではない）。
+  // 正しい修正箇所は採用側であり、別 Finding
+  // （`adoption-path-has-no-material-difference-check`）として登録した。
   const generation = currentDesignGeneration(storage, task.id)
-  const priorForGeneration = storage.auditLog
-    .findByEntity(HUMAN_RECOVERY_AUDIT_ENTITY_TYPE, task.id)
-    .filter((entry) =>
-      entry.operation === HUMAN_RECOVERY_AUDIT_OPERATION
-      && entry.result === 'success'
-      && (entry.detail ?? '').includes(generationTag(generation)))
-  if (priorForGeneration.length > 0) {
-    return {
-      ok: false,
-      code: 'SPEC_ALREADY_RETRIED',
-      reason:
-        `Task ${input.taskId} has already been re-admitted once for this exact reviewed design `
-        + `(${generationTag(generation)}), and it came back blocked unchanged. `
-        + 'Re-admitting it again would only re-roll the same review. '
-        + 'Correct the implementationScope / allowedPaths (or the ledger text the review reads) '
-        + 'and adopt the roadmap item again, or park the task with abort_task',
-    }
-  }
 
   // 回数は記録と報告のためだけに数える。**門にはしない**（上の「試行の有界性」参照）。
   const priorAttempts = countHumanRecoveryAttempts(storage, task.id)

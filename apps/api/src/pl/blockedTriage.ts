@@ -852,8 +852,13 @@ function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string;
         options: [
           'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻し、'
           + 'Independent Remediation に fresh Design Review を起こさせる',
-          '訂正した implementationScope / allowedPaths で Roadmap 項目を採用し直す'
-          + '（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）',
+          // **順序を書かないと実行できない選択肢になる。** `syncRoadmapTasks()` は
+          // `status === 'pending'` の Task しか可変として扱わないので、blocked のまま
+          // 採用し直すと `SYNC_FAILED` で弾かれる（独立レビュー round 2 指摘）。
+          'まず Human Recovery で `pending` へ戻し、**そのうえで**訂正した '
+          + 'implementationScope / allowedPaths で Roadmap 項目を採用し直す'
+          + '（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）。'
+          + '**blocked のまま採用し直すと `SYNC_FAILED` になる**',
           'この Task を park する（`abort_task`）',
         ],
       }
