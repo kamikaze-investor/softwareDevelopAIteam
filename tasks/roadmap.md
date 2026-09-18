@@ -9217,7 +9217,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **意図的に scope 外とした点（本項目の完了を妨げない）**:
       - **`specs/00` 3.14〜3.18 / `specs/20` / `specs/22` / Design Philosophy は未移設。**
         意図的に `specs/21` の 11 件だけで通した。記録が実際に取れることを確かめてから範囲を広げる
-        （`constitutionPrinciples.ts` は今も章まるごと本文を貼っている）
+        （`constitutionPrinciples.ts` は今も章まるごと本文を貼っている）。
+        **2026-09-18 に `principle-registry-coverage-and-threshold-review` が owner として引き取った**
       - **`riskLevel` は Review 経路から渡していない。** Review 側が持つのは
         `reviewLoad`（レビューの認知負荷）であって `MetaRiskLevel`（変更のリスク）ではなく、
         **両者は別物なので読み替えなかった**。`selection_source='risk'` は
@@ -9278,10 +9279,108 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **完了を妨げない既知の制約**:
       - **実データでの閾値見直しは未実施。** 50 / 200 は実データ 0 件の状態で決めた暫定値である。
         判定が 100 件以上溜まってから分布を見る。溜まる前に閾値を精密化しない。
-        **暫定値であること自体は完了を妨げない**（CEO 指示 2026-09-17）
+        **暫定値であること自体は完了を妨げない**（CEO 指示 2026-09-17）。
+        **2026-09-18 に `principle-registry-coverage-and-threshold-review` が owner として引き取った**
+        （100 件到達で再評価 Review を発火させる sensor をそちらで実装する）
       - **production でセンサーが実際に発火した実績はまだ無い。** 確認したのは、
         閾値に達したら発火する経路が production に存在することである。
         **「実際に 50 件溜まるまで待つ」ことを Acceptance Criteria にしない**（同上）
+
+<!-- roadmap:id=principle-registry-coverage-and-threshold-review state=planned -->
+3. [ ] **Principle Registry の適用範囲拡張と、実データによる閾値の自己再評価** — 2026-09-18登録（CEO 指示）。
+      `principle-registry-and-compliance-ledger` / `principle-quality-sensor-to-review` の後続項目。
+      目的は「**本番稼働した Principle Management を、Principle Registry の適用範囲拡張と
+      実データによる自己再評価まで閉じる**」こと。
+      上記 2 項目が `done` になったことで **owner の無くなった残件 2 件をここへ引き取る**
+      （`done` 項目の本文にしか書かれていない TODO を残さない — `observation-closes-loop`）。
+
+      **作らないもの（先に読むこと）**:
+      - 新しい Principle 管理 system
+      - 原則本文の第二の正本（全文を別ファイルへコピーする等）
+      - 新しい scheduler / monitoring backend
+      - 新しい persistent state（下記「事前確認」で不要と確定済み）
+
+      **Task A — Principle Registry coverage 拡張**
+
+      対象候補: `specs/00` 3.14〜3.18 / `specs/20` / `specs/22` / Design Philosophy /
+      `constitutionPrinciples.ts` の章全文 prompt 注入。
+
+      目的は**既存 Principle の意味変更ではない**。
+      「既存 Principle を現在の Registry 方式で**選択・Review・履歴保存・集計可能にする**」ことである。
+      既存の Principle Registry / contextual selection / `principle_applications` を再利用する。
+
+      - **本文と metadata の二重正本を作らない。** `specs/21` と同じく metadata marker を
+        **本文と同じ marker block へ置く**方式を一般化できるなら、それを優先する
+      - **`constitutionPrinciples.ts`**: 章全文を毎回 prompt へ貼る方式を、
+        現在の Registry から Task に必要な Principle だけ選択する方式へ
+        **置き換えられるかを優先して検討する**。全文を別ファイルへコピーして逃げない
+      - **Safety / Authority Principle は特別扱いする。** metadata 付与・参照方式変更を超えて
+        **意味・権限境界・Safety Policy を変更する必要が出たら CEO へ戻す**（CEO 指示 2026-09-18）。
+        `specs/22` と `CLAUDE.md` 4 章の Zone 区分がここに含まれる
+      - **`principle-tier` の付与は慎重に決める。** `corePrincipleSlugs()` は
+        `principle-tier: core` marker から core を導出し、**core は全 prompt へ入る**。
+        移設対象を安易に core にすると prompt が膨らみ、CEO が問題視した「毎回全文を貼る」へ戻る
+      - **文書の Current Truth 修正とは別作業である。** `docs/project_memory/design_philosophy.md`
+        の Design Philosophy #8 欠落と `specs/00` の章範囲表記の不一致は
+        `governance-and-spec-docs-current-truth-sweep` が owner。
+        **同じ行を二重に直さない**ので、着手前にそちらの状態を確認すること
+
+      **Task B — 100 件到達で閾値を再評価する sensor**
+
+      2026-09-18 時点の production の `principle_applications` は **38 件**。
+      既存方針にある「100 件程度蓄積したら 50 / 200 の暫定閾値を実データで再評価する」を
+      **文章だけの TODO にしない**。
+
+      発火条件は `principle_applications >= 100` **かつ**
+      「この threshold policy version について再評価 review が未実施」。
+      発火先は既存経路のみ: `principle_sensor` → `audit_log` →
+      `project-auto-incident-pattern-improvement` の Improvement Planner
+      （受け取り側には既に「`principle_sensor` を入力に含める」と明記済み）。
+
+      **閾値を自動変更してはならない**（CEO 指示）。発火するのは
+      「閾値変更を検討する Review」だけである。再評価に載せるデータは最低限:
+      Principle 別 application 数 / ALIGNED 率 / CONFLICT 率 / UNCERTAIN 率 /
+      reviewer disagreement 率 / 50 件 sensor の発火状況 / 200 件 sensor の発火状況 /
+      Principle ごとの適用偏り。
+
+      **事前確認（2026-09-18 に read-only で実施済み。実装時に再調査しなくてよい）**:
+      **既存の audit / sensor 記録だけで重複発火を防げる。新しい persistent state は要らない。**
+      - `evaluateAndPersistSensors()`（`apps/api/src/principles/ledger.ts`）は
+        `auditLog.findByEntity('principle_sensor', entityId)` に行があれば **skip する**。
+        よって 101 件目・102 件目・103 件目で同じ Review は出ない
+      - `entityId` は `sensorEntityId()` が `${sensorId}:${principleId ?? 'all'}` で作っている。
+        ここへ **threshold policy version の片**を足せば、
+        「この policy version については review 済み」を既存 index（`ix_audit_log_entity`）だけで判定できる。
+        version は `PRINCIPLE_SENSOR_THRESHOLDS` の値から導出する（手書きの版番号を持たせない。
+        `principleVersionHash` と同じ方針）。閾値を Git で変えたら別 id になり、再び 1 回だけ発火する
+      - 評価は既に**記録直後**に走る（`recordPrincipleApplications()` 内）。**新しい scheduler は要らない**
+      - `PrincipleSensorId` の union へ id を 1 つ足すのは型の変更であって persistent state ではない
+
+      **既存 38 件をそのまま 100 件カウントへ使うための制約（見落としやすい）**:
+      `currentVersionSensorInput()` は**現在の版 hash の行だけ**を数える。
+      `principleVersionHash` は one-liner・本文全体・tier を入力に含むので、
+      **`specs/21` の既存原則の本文や tier へ手を入れると、その原則の実績はゼロから数え直しになる**。
+      Task A は既存 Principle の意味を変えない前提なので通常は問題にならないが、
+      marker block を触るときはここを確認すること。
+      やむを得ず数え直しになる場合は、**なぜリセットしたかを記録する**（黙って数字が戻らない状態を作らない）。
+
+      **Acceptance Criteria**:
+      - `specs/00` / `specs/20` / `specs/22` / Design Philosophy を棚卸しした
+      - Registry へ統合可能な Principle を構造化した
+      - **Principle 本文の意味変更が無い**（diff で示せる）
+      - 不要な章全文 prompt 貼付を削減した
+      - contextual selection から必要な Principle だけ取得できる
+      - `principle_applications` へ履歴が保存される
+      - 既存 38 件がそのまま 100 件カウントへ使われている
+      - 100 件到達を機械的に検出する
+      - 同一 episode で sensor が重複発火しない
+      - 閾値を自動変更しない
+      - Improvement Planner へ**既存経路で**戻る
+      - `typecheck` / `tests` / `roadmap:check` が PASS
+
+      **CEO へ戻す条件**: Safety / Authority の**意味**変更が必要になった場合、
+      または新しい persistent state が必要になった場合**のみ**。
+      それ以外は通常 Roadmap 開発として進めてよい（CEO 指示 2026-09-18）。
 
 ---
 
