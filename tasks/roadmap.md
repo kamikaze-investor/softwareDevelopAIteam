@@ -8088,6 +8088,22 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `allowedPaths` で叩き直した（Task は Job を持たないため `syncRoadmapTasks` が可変として
       更新し、fresh Design Review が走って ALIGNED になった）。**再現手順として文書化されていない。**
 
+      **2件目（2026-09-18、同日中に別 item で再発）**: PL が
+      `pl-escalation-recorded-without-delivery` を自律採用（Task `c3849205`）。
+      task-kind Design Review が `finalDecision: CONFLICT` を返し、evidence 0 件・Job 0 件のまま
+      `task_ready_without_job` が立ち、**採用が全面停止**した。本 Finding を登録した当日である。
+      **単発の事故ではなく再発する構造**であることの実証。
+
+      この2件目は内訳も示唆的で、`scope_simplicity = ALIGNED` / `integration = CONFLICT` と
+      **reviewer 同士が要件を逆に読んでいた**。item 本文は「未配達でも escalated と記録するのが不具合」と
+      書き、PL は「配達成功を確認してから記録する」と提案したが、integration review は
+      「未配達でも escalated と記録するのが要件」と読んだ。原因は PL の出力ではなく
+      **Source of Truth（ledger 本文）が PR #249 後の実仕様に追いついていなかったこと**である
+      （item 側は同日 docs-only で訂正した）。
+
+      → **CONFLICT の原因が ledger 本文の陳腐化であることがある。** 復旧経路を設計するときは、
+      「PL の提案を直す」だけでなく「Source of Truth を訂正して再レビューする」形も要る。
+
       **既存項目との違い（重複実装しないこと）**:
       - `adoption-does-not-check-implementation-feasibility`: allowedPaths と実装対象の不一致。
         **検出の話**であり、本項目は**その後の復旧の話**
