@@ -67,11 +67,7 @@
  */
 
 import type { IStorage } from '../storage/interface'
-import {
-  countHumanRecoveryAttempts,
-  HUMAN_RECOVERY_AUDIT_ENTITY_TYPE,
-  HUMAN_RECOVERY_AUDIT_OPERATION,
-} from './recoveryAudit'
+import { countHumanRecoveryAttempts } from './recoveryAudit'
 import type { Task } from '@ai-team/shared'
 
 export { countHumanRecoveryAttempts } from './recoveryAudit'
