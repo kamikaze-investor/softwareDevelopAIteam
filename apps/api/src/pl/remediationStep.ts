@@ -284,11 +284,17 @@ export function findRemediationSubject(
  * **1世代前だけでは足りない。** A → B → A の巡回で A を再提出できてしまうため、
  * 却下済み全件と比べる（独立レビュー指摘）。
  *
- * 材料は2つで、どちらも既存レコードである:
- *   1. 現在の Task の spec … 直前に却下された案そのもの（初回は PL の案）
- *   2. 自前の audit 行に記録した `fspec=` … 過去世代の提案
+ * 材料は3つで、いずれも既存レコードである:
+ *   1. 現在の Task の spec … 直前に却下された案（初回は PL の案）
+ *   2. audit の `fspec=` … 過去世代で**提案した**案
+ *   3. audit の `rejected_fspec=` … 過去世代で**却下されていた**案
  *
- * `design_review_runs` は Task ごとに最新1件しか引けないので、世代の履歴は 2 で復元する。
+ * **3 が無いと A → B → A を止められない。** 採用は Task の scope を提案内容へ
+ * 置き換えるため、世代1で却下されていた A は、世代2の時点では Task 上にもう存在しない。
+ * 2 だけでは集合が {B, B+記録} になり A が抜けるので、B → A を通してしまう（独立レビュー指摘）。
+ * そこで**却下された側のキーも試行ごとに残す**。
+ *
+ * `design_review_runs` は Task ごとに最新1件しか引けないので、世代の履歴は audit で復元する。
  * **新しいテーブルは作らない。**
  */
 function collectRejectedSpecKeys(storage: IStorage, task: Task): string[] {
@@ -299,8 +305,9 @@ function collectRejectedSpecKeys(storage: IStorage, task: Task): string[] {
     }),
   ])
   for (const entry of storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, remediationKey(task.id))) {
-    const match = /\bfspec=(\S+)/.exec(entry.detail ?? '')
-    if (match?.[1] !== undefined) keys.add(match[1])
+    for (const match of (entry.detail ?? '').matchAll(/\b(?:fspec|rejected_fspec)=(\S+)/g)) {
+      if (match[1] !== undefined && match[1] !== '-') keys.add(match[1])
+    }
   }
   return [...keys]
 }
@@ -599,6 +606,9 @@ export async function runRemediationStep(
     // 分離を確認できなかった相手を黙って落とさない。
     + ` unverified_separation=${selection.unresolvedAuthors.join('+') || '-'}`
     + ` rejected_specs=${subject.rejectedSpecKeys.length}`
+    // **却下された側のキーも残す。** 採用で Task の scope が置き換わると、この世代で
+    // 却下されていた案は Task 上から消える。残さないと次の世代で再提出できてしまう。
+    + ` rejected_fspec=${subject.rejectedSpecKeys[0] ?? '-'}`
 
   // ── 実行（read-only sandbox。提案しか出てこない）────────────────
   const runnerDeps = deps.runnerDeps ?? buildDefaultRemediationDeps()

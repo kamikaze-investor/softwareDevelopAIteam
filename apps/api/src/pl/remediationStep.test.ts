@@ -358,6 +358,48 @@ describe('却下済みテキストの再審査を拒否する', () => {
     expect(adopted).toBe(false)
   })
 
+  it('**A → B → A を止める**（採用で Task の spec が置き換わる実際の遷移を再現する）', async () => {
+    // 独立レビュー指摘: 提案側のキーだけを残していると、世代1で却下されていた A は
+    // 採用で Task から消えるため、世代2の却下済み集合に A が入らず B → A が通ってしまう。
+    // ここでは **adopt が実際に Task の scope を書き換える**ところまで再現する。
+    const { storage, taskId } = seedConflictedTask()
+    const originalScope = '当初の広い scope'
+    const originalPaths = storage.tasks.findById(taskId)?.allowedPaths as string[]
+    const B = { ...PROPOSAL, implementationScope: 'B の狭い scope', allowedPaths: ['apps/api/src/storage'] }
+    // 世代2で A（= 当初案）をそのまま出し直す提案。
+    const backToA = { ...PROPOSAL, implementationScope: originalScope, allowedPaths: originalPaths }
+
+    const gen1 = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: true, stdout: JSON.stringify(B), timedOut: false }),
+      },
+      // 本物の採用と同じく Task の spec を提案内容へ置き換える。
+      adopt: async (_s, input) => {
+        storage.tasks.update(taskId, {
+          description: buildAdoptedDescription(LEDGER_BODY, input.implementationScope as string),
+          allowedPaths: input.allowedPaths,
+          acceptanceCriteria: input.acceptanceCriteria,
+        })
+        return { ok: true as const, taskId, roadmapTaskKey: 'conflicted-item', title: 't' }
+      },
+    }))
+    // 世代1は採用まで進む（fresh Review が通らないので still_not_aligned で返る）。
+    expect(gen1.status).toBe('still_not_aligned')
+
+    let adoptedAgain = false
+    const gen2 = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: true, stdout: JSON.stringify(backToA), timedOut: false }),
+      },
+      adopt: async () => { adoptedAgain = true; throw new Error('must not be reached') },
+    }))
+
+    expect(gen2.status).toBe('proposal_not_materially_different')
+    expect(adoptedAgain).toBe(false)
+  })
+
   it('過去世代で却下された提案も避ける（audit の fspec= から復元して A→B→A を止める）', () => {
     const { storage, taskId } = seedConflictedTask()
     const olderKey = 'deadbeefdeadbeef'
