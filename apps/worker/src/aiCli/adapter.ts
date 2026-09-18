@@ -762,7 +762,21 @@ function buildSafeEnv(provider: AiCliProvider): NodeJS.ProcessEnv {
   // プロバイダー固有の認証情報のみ追加
   switch (provider) {
     case 'claude_code':
-      return { ...base, ANTHROPIC_API_KEY: process.env.CLAUDE_API_KEY }
+      // **API key を渡さない。** Claude Code CLI は `ANTHROPIC_API_KEY` が設定されていると
+      // それを claude.ai ログインより**優先**する（CLI 自身が
+      // 「takes precedence over your claude.ai login」と警告する）。渡していたため、
+      // subscription が使えるのに従量課金の API credit を消費し続け、
+      // 2026-09-18 に残高切れで全 implement Job が `400 Credit balance is too low` で落ちた。
+      //
+      // `HOME` は下の base に入っているので、CLI は `~/.claude/` の subscription 認証情報へ
+      // 到達できる。実測（2026-09-18、Worker と同じ HOME / PATH、API credential を一切渡さずに
+      // `claude --print ... --output-format json` を1回実行）: `is_error: false` / exit 0 /
+      // `provider: firstParty` で応答した。
+      //
+      // **`CLAUDE_API_KEY` 自体は env から消していない。** `apps/api/src/ctoAi/specAnalyzer.ts` が
+      // Anthropic API を直接叩く別経路で使っており、そちらは本変更の対象外である。
+      // ここで渡さない、というだけの違いである。
+      return { ...base }
     case 'gemini':
       return {
         ...base,
