@@ -1692,16 +1692,69 @@ function withSensitiveChanges(
  * **claude_code 以外は素通しする。** 他 provider の非 0 終了は test 失敗や build エラーで、
  * その raw 出力自体が診断材料である（既存の挙動を変えない）。
  */
+/**
+ * envelope が API エラーを報告しているなら、その**固定語彙**の理由を返す。
+ * エラーでなければ undefined。
+ *
+ * **CLI が返した理由をそのまま出す。**
+ * 
+ * ここを generic な1文で潰していたため、2026-09-18 に API credit が尽きたとき
+ * 運用側に見えたのは「error result」だけで、真因（400 Credit balance is too low）は
+ * stdout の JSON を人手で開くまで分からなかった。
+ * API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
+ * 出すのは **HTTP status と、固定語彙の原因ラベルだけ**である。
+ * 
+ * provider の文字列をそのまま載せない。`result` は成功時にはモデル本文が入る欄であり
+ * （`reviewerAdapter.ts`: `result: '<モデル本文>'`）、API エラー時でも中身は信用できない
+ * —— 実際に `401 invalid Authorization: Bearer sk-...` のように credential 断片や
+ * prompt 抜粋を含みうる（独立レビュー指摘）。redact（denylist）では取りこぼす形が残る。
+ * 
+ * そこで **echo せず分類する**。出力は下の固定語彙のいずれかで、入力文字列は外へ出ない。
+ * 2026-09-18 の実例（API credit 枯渇）は `credit exhausted` として十分に伝わる。
+    const apiErrorStatus = typeof parsed.api_error_status === 'number'
+      ? parsed.api_error_status
+ */
+function claudeApiErrorReason(parsed: Record<string, unknown>): string | undefined {
+  if (parsed.is_error !== true) return undefined
+
+  const apiErrorStatus = typeof parsed.api_error_status === 'number'
+    ? parsed.api_error_status
+    : undefined
+  if (apiErrorStatus === undefined) return 'Claude Code CLI reported an error result'
+  return `Claude Code CLI reported an error result (HTTP ${apiErrorStatus}): ${classifyApiError(apiErrorStatus, parsed.result)}`
+}
+
+/**
+ * 非 0 終了時の先頭行。**「envelope が無かった」と決めつけない。**
+ *
+ * `runJob()` は `exitCode !== 0` を見た時点で早期 return するので、この経路の Job は
+ * `classifyClaudeImplementFailure()` へ到達しない。ところが **Claude Code CLI は envelope を
+ * 書いたうえで非 0 で終了する**。VPS production 実測（2026-09-18）では credit 枯渇の5件が
+ * いずれも `exit_code=1` かつ `api_error_status: 400` の解釈可能な JSON を stdout に出していた。
+ *
+ * つまり exitCode だけで「envelope 以前に落ちた」と書くと、**実際に起きたことと食い違う文言**を
+ * operator へ出したうえ、HTTP status と原因ラベルまで捨ててしまう（独立レビュー指摘）。
+ * 本 PR が拾おうとしていた当の事象が、この分岐で取りこぼされていた。
+ *
+ * そこで stdout を先に読む。API エラーを報告していれば exit 0 のときと**同じ固定語彙**を返し、
+ * 読めなかったときだけ「envelope 以前に落ちた」と述べる。
+ */
+function claudeCliFailureNote(cliResult: AiCliResult): string {
+  const parsed = tryParseJson(cliResult.stdout)
+  const apiErrorReason = parsed === undefined ? undefined : claudeApiErrorReason(parsed)
+  if (apiErrorReason !== undefined) return apiErrorReason
+
+  if (cliResult.blocked === true) return 'Claude Code CLI was blocked before producing a result'
+  return `Claude Code CLI exited ${cliResult.exitCode ?? 'abnormally'} before producing a result envelope`
+}
+
 function claudeCliFailureStderr(
   provider: AiCliProvider,
   cliResult: AiCliResult,
 ): string | undefined {
   if (provider !== 'claude_code') return cliResult.stderr
 
-  const note = cliResult.blocked === true
-    ? 'Claude Code CLI was blocked before producing a result'
-    : `Claude Code CLI exited ${cliResult.exitCode ?? "abnormally"} before producing a result envelope`
-  return withLeadingNote(cliResult.stderr ?? '', note)
+  return withLeadingNote(cliResult.stderr ?? '', claudeCliFailureNote(cliResult))
 }
 
 /**
@@ -1713,23 +1766,27 @@ function claudeCliFailureStderr(
  * **何も立証していない**（独立レビュー指摘）。語の出現で判定すると、
  * 権限エラーや API 障害を課金切れとして operator へ出してしまう。
  *
- * **語の出現ではなく、本文が冒頭でそう名乗っているか**で判定する。API のエラー本文は
- * 原因を先頭で述べるので、文中に同じ語が現れるだけの文
- * （条件文 "if your credit balance is too low, add funds" / 否定 "not out of credits" /
- * 無関係な "insufficient credit card details" / prompt 抜粋の巻き込み）は
- * 原因を**何も立証していない**（独立レビュー指摘）。先頭に限ればこれらは全て外れる。
+ * **本文そのものが残高切れの宣言であるときだけ true。** 語の出現でも、先頭一致でもない。
  *
- * **VPS production 実測（2026-09-18、5件すべて同一）**: `api_error_status: 400` のとき
- * `result` は長さ 25 の文字列 `"Credit balance is too low"` ちょうどで、JSON でも
- * 長文でもない。接尾辞が付く将来形にも耐えるよう前方一致にしてある。
+ * **VPS production 実測（2026-09-18、credit 枯渇 5件すべて同一）**: `api_error_status: 400`
+ * のとき `result` は長さ 25 の文字列 `"Credit balance is too low"` **ちょうど**であり、
+ * JSON でも長文でもなかった。つまり本文全体が原因文そのものである。
  *
- * ここに載らない文は generic の `API error` へ落ちる。**外し方向へ倒すのは意図的**で、
- * 取りこぼしても「分からない」と出るだけだが、緩めると嘘のラベルが出る。
+ * 前方一致では足りない。冒頭に同じ語が来る別の文
+ * （`"Credit balance is too low? No; the request body is invalid"` /
+ * `"Credit balance is too low is the rejected field value"`）を拾ってしまう
+ * （独立レビュー指摘）。文中一致だと条件文・否定・prompt 抜粋まで拾う。
+ * **自由文から意味を読み取ろうとする限り際限がない**ので、
+ * **実測した本文と一致するか**だけを見る。
+ *
+ * 将来 CLI が接尾辞を付けた本文を返すようになれば、ここは外れて generic の `API error`
+ * になる。**それでよい**。外れれば「分からない」と出るだけだが、緩めれば嘘のラベルが出る。
+ * その時は再び実測して、観測した形を足す。
  */
 function saysBalanceIsGone(result: unknown): boolean {
   if (typeof result !== 'string') return false
 
-  return /^(your |the )?credit balance is (too low|exhausted|depleted|empty)\b/
+  return /^(your |the )?credit balance is (too low|exhausted|depleted|empty)\.?$/
     .test(result.trim().toLowerCase())
 }
 
@@ -1798,28 +1855,8 @@ function classifyClaudeImplementFailure(
   if (parsed === undefined) {
     return 'Claude Code CLI output could not be parsed as JSON'
   }
-  if (parsed.is_error === true) {
-    // **CLI が返した理由をそのまま出す。**
-    //
-    // ここを generic な1文で潰していたため、2026-09-18 に API credit が尽きたとき
-    // 運用側に見えたのは「error result」だけで、真因（400 Credit balance is too low）は
-    // stdout の JSON を人手で開くまで分からなかった。
-    // API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
-    // 出すのは **HTTP status と、固定語彙の原因ラベルだけ**である。
-    //
-    // provider の文字列をそのまま載せない。`result` は成功時にはモデル本文が入る欄であり
-    // （`reviewerAdapter.ts`: `result: '<モデル本文>'`）、API エラー時でも中身は信用できない
-    // —— 実際に `401 invalid Authorization: Bearer sk-...` のように credential 断片や
-    // prompt 抜粋を含みうる（独立レビュー指摘）。redact（denylist）では取りこぼす形が残る。
-    //
-    // そこで **echo せず分類する**。出力は下の固定語彙のいずれかで、入力文字列は外へ出ない。
-    // 2026-09-18 の実例（API credit 枯渇）は `credit exhausted` として十分に伝わる。
-    const apiErrorStatus = typeof parsed.api_error_status === 'number'
-      ? parsed.api_error_status
-      : undefined
-    if (apiErrorStatus === undefined) return 'Claude Code CLI reported an error result'
-    return `Claude Code CLI reported an error result (HTTP ${apiErrorStatus}): ${classifyApiError(apiErrorStatus, parsed.result)}`
-  }
+  const apiErrorReason = claudeApiErrorReason(parsed)
+  if (apiErrorReason !== undefined) return apiErrorReason
 
   if (cliResult.changedFiles.length > 0) {
     // 変更が実際に存在する場合、permission_denials があっても失敗にしない

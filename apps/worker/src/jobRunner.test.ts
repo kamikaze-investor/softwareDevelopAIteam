@@ -2630,9 +2630,11 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(result.stderr).not.toContain("credit exhausted")
   })
 
-  // status gate を足したことで、**本来名乗るべきケースまで潰していない**ことを固定する。
-  // 2026-09-18 の production 実測はこの形だった。
-  it('400 + 残高文言は従来どおり credit exhausted と出す', async () => {
+  // **接尾辞が付いた本文は generic へ落ちる。これは意図した取りこぼしである。**
+  // 実測された本文は `"Credit balance is too low"` ちょうどで、これは私が作った仮の形だった。
+  // 自由文から意味を読み取ろうとすると際限が無いため、実測した形だけを採る。
+  // 将来 CLI がこの形を返すようになったら、**実測してから**足す。
+  it('接尾辞の付いた残高文言は credit exhausted と断定せず generic にする', async () => {
     const mockAdapter = {
       run: vi.fn().mockResolvedValue(makeCliResult({
         changedFiles: [],
@@ -2647,7 +2649,8 @@ describe('task-022: AI CLI 実行ブロック', () => {
       aiCliMode: 'implement',
     }), createPolicy())
 
-    expect(result.stderr).toContain("credit exhausted")
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
   })
 
   // 402 Payment Required は credit 枯渇と矛盾しない status。
@@ -2851,6 +2854,100 @@ describe('task-022: AI CLI 実行ブロック', () => {
     }), createPolicy())
 
     expect(result.stderr).toContain("credit exhausted")
+  })
+
+  // **先頭一致でも足りない。** 冒頭に同じ語が来る別の文を拾ってしまう（独立レビュー指摘）。
+  it('冒頭が残高文言でも、続きが別の話なら credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "Credit balance is too low? No; the request body is invalid" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+  it('残高文言が拒否された値として引用されている場合も credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: "Credit balance is too low is the rejected field value" }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain("API error")
+    expect(result.stderr).not.toContain("credit exhausted")
+  })
+
+
+  // **CLI は envelope を書いたうえで非 0 終了する。** 2026-09-18 の production 実測では
+  // credit 枯渇 5件すべてが `exit_code=1` かつ `api_error_status: 400` の JSON を出していた。
+  // `runJob()` は非 0 を見て早期 return するので、この経路が classifier を通らないと
+  // **本 PR が拾おうとした当の事象を取りこぼす**（独立レビュー指摘）。
+  it('非 0 終了でも envelope があれば exit 0 と同じ固定語彙で分類する', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 400, result: 'Credit balance is too low' }),
+        stderr: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    // `stopReason()` はこの先頭行を採る。
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('HTTP 400')
+    expect(firstLine).toContain('credit exhausted')
+    // 「envelope 以前に落ちた」は事実と食い違う。
+    expect(firstLine).not.toContain('before producing a result envelope')
+    expect(firstLine).not.toContain('sk-ant')
+  })
+
+  // envelope が本当に無いときだけ「envelope 以前に落ちた」と述べる。
+  it('非 0 終了で stdout が envelope でなければ envelope 以前に落ちたと述べる', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        exitCode: 1,
+        changedFiles: [],
+        stdout: 'command not found: claude',
+        stderr: 'invalid Authorization: Bearer sk-ant-SECRET-EXAMPLE',
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    const firstLine = String(result.stderr ?? '').split('\n')[0]
+    expect(firstLine).toContain('before producing a result envelope')
+    expect(firstLine).not.toContain('sk-ant')
   })
 
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
