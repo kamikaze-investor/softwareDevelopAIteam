@@ -719,6 +719,19 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       expect(escalations).toHaveLength(2)
     })
 
+    // audit の並びは created_at DESC, rowid DESC。同一ミリ秒の行は時刻比較では順序づかないので、
+    // 「前回の成功より後に通知したか」を時刻で判定してはいけない。
+    it('同一ミリ秒に記録が並んでも重複通知しない', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const fixedNow = '2026-09-18T00:00:00.000Z'
+      const d = brokenAdoption(escalations, { now: () => fixedNow })
+
+      for (let cycle = 0; cycle < 3; cycle += 1) await runOneEscalationCycle(storage, d)
+
+      expect(escalations).toHaveLength(1)
+    })
+
     it('別 Project なら独立して通知される', async () => {
       const a = idleProject()
       const b = idleProject()
@@ -761,6 +774,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       expect(project?.adoptionFailure?.escalations).toBe(2)
       expect(project?.adoptionFailure?.failureClass).toContain('proposal_unusable')
       expect(project?.adoptionFailure?.since).toBeDefined()
+      expect(project?.adoptionFailure?.lastAt).toBeDefined()
 
       // **attention には出さない。** 出すと maybeAdoptNext() が採用を見送るため、
       // 通知を直すために採用機能そのものを止めることになる。

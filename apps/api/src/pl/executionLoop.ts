@@ -327,12 +327,11 @@ function selectTarget(attention: readonly AttentionItem[]): AttentionItem | unde
  * 数えるのは「実際に何かをした / 止められた試行」だけで、`idle` や in-flight skip は数えない。
  */
 /** 「試行した」と数える結果。`idle` と in-flight skip は数えない。 */
-const ATTEMPT_RESULTS: readonly string[] = [
-  'acted',
-  'blocked',
-  'diagnosis_unusable',
-  'diagnosis_failed',
-]
+import {
+  ATTEMPT_RESULTS,
+  adoptionFailureFingerprint,
+  entriesSinceLastAdoption,
+} from './adoptionFailure'
 
 export function countPriorAttempts(storage: IStorage, targetKey: string): number {
   return storage.auditLog
@@ -400,50 +399,28 @@ function adoptionNotificationKey(projectId: string): string {
 }
 
 /**
- * いま起きている採用失敗の **failure class**。自由文ではなく既存の構造化された事実から作る。
+ * いまの失敗の指紋を、この Project の audit 行から作る。
  *
- * 材料は窓内の各試行の `audit_log.result` と、detail 先頭の `adoption=<status>`
- * （`PlAdoptionStatus` の列挙値をそのまま書いたもので、散文ではない）。
- * 同じ原因が続く限り同じ文字列になり、原因の種類が変われば変わる。
+ * 採用成功の回数を先頭に含めるので、**時刻の比較をしない**。
+ * audit の並びは `created_at DESC, rowid DESC` で、同一ミリ秒の行は時刻では
+ * 正しく順序づけられない（独立レビュー指摘）。成功するたび指紋が変わり、
+ * 再発は自動的に新しい incident になる。
  */
-export function adoptionFailureFingerprint(windowEntries: readonly AuditLogEntry[]): string {
-  const classes = new Set<string>()
-  for (const entry of windowEntries) {
-    if (!ATTEMPT_RESULTS.includes(entry.result)) continue
-    const detail = entry.detail ?? ''
-    const status = /^adoption=([a-z_]+)/.exec(detail)?.[1]
-    if (status === undefined) {
-      classes.add(entry.result)
-      continue
-    }
-    // 下位分類まで含める。`status` だけだと、同じ status の別原因が既報として黙殺される。
-    const code = /\bcode=([^\s]+)/.exec(detail)?.[1]
-    classes.add(code === undefined || code === '-' ? status : `${status}/${code}`)
-  }
-  return [...classes].sort().join(',')
+function currentAdoptionFingerprint(storage: IStorage, projectId: string): string {
+  const entries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, `adopt:${projectId}`)
+  const successes = entries.filter((entry) => entry.result === 'acted').length
+  return adoptionFailureFingerprint(successes, entriesSinceLastAdoption(entries))
 }
 
-/**
- * この失敗をまだ CEO へ知らせていないか。
- *
- * 「知らせた」は **直近の採用成功（`acted`）より後**のものだけを数える。
- * 一度採用が成功したあとに同じ失敗が再発したら、それは新しい incident である。
- */
+/** この指紋の失敗をまだ CEO へ知らせていないか。 */
 function shouldNotifyAdoptionEscalation(
   storage: IStorage,
   projectId: string,
   fingerprint: string,
 ): boolean {
-  const adoptionEntries = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, `adopt:${projectId}`)
-  const lastAdoptedAt = adoptionEntries.find((entry) => entry.result === 'acted')?.createdAt
-
   return !storage.auditLog
     .findByEntity(AUDIT_ENTITY_TYPE, adoptionNotificationKey(projectId))
-    .some((entry) => (
-      entry.operation === AUDIT_ADOPTION_NOTIFIED
-      && entry.detail === fingerprint
-      && (lastAdoptedAt === undefined || entry.createdAt > lastAdoptedAt)
-    ))
+    .some((entry) => entry.operation === AUDIT_ADOPTION_NOTIFIED && entry.detail === fingerprint)
 }
 
 function recordAdoptionNotification(
@@ -1084,7 +1061,7 @@ async function maybeAdoptNext(
     // 窓は escalation を境界にして切り替わる（原因を直したあと採用を再開できるようにするため。
     // 2026-09-15 の実測でこれが無いと予算が永久に枯れた）。その挙動は変えない。
     // 一方で通知は incident 単位にする —— 同じ対象で同じ失敗が続く限り、窓が何周しても1通だけ。
-    const fingerprint = adoptionFailureFingerprint(currentWindow)
+    const fingerprint = currentAdoptionFingerprint(storage, project.id)
     const notify = shouldNotifyAdoptionEscalation(storage, project.id, fingerprint)
 
     await escalateTo(
@@ -1127,11 +1104,14 @@ async function maybeAdoptNext(
   }
 
   // `code=` は機械判定用の構造化された下位分類で、後ろの散文とは役割が違う。
+  // `code=` / `target=` は機械判定用の構造化された欄で、後ろの散文とは役割が違う。
+  // 同じ原因コードでも対象の項目が変われば別の障害なので、target も分類に要る。
   record(
     storage,
     key,
     result.status === 'adopted' ? 'acted' : 'blocked',
-    `adoption=${result.status} code=${result.failureCode ?? '-'} ${result.reason ?? result.roadmapId ?? ''}`,
+    `adoption=${result.status} code=${result.failureCode ?? '-'} target=${result.roadmapId ?? '-'} `
+    + `${result.reason ?? ''}`,
   )
 
   return {

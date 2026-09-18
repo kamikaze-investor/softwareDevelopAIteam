@@ -16,6 +16,7 @@
  */
 
 import { occupiesProject } from '@ai-team/shared'
+import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import type { IStorage } from '../storage/interface'
 import type { Job, Task, Project } from '@ai-team/shared'
 
@@ -227,37 +228,15 @@ function isReadyTaskWithoutJob(task: Task, jobs: readonly Job[]): boolean {
  * 直近の成功（`acted`）より後の escalation を数える。成功すれば消える。
  * CEO への通知は incident 単位で1回に絞られたので、**ここが唯一の「まだ続いている」表示**になる。
  */
-function summarizeAdoptionFailure(
+function adoptionFailureOf(
   storage: IStorage,
   projectId: string,
 ): ProjectStateSummary['adoptionFailure'] {
-  // `findByEntity()` は新しい順に返す。
-  const entries = storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)
-  const sinceLastSuccess: typeof entries = []
-  for (const entry of entries) {
-    if (entry.result === 'acted') break
-    sinceLastSuccess.push(entry)
-  }
-
-  const escalations = sinceLastSuccess.filter((entry) => entry.result === 'escalated')
-  if (escalations.length === 0) return undefined
-
-  const failures = sinceLastSuccess.filter((entry) => entry.result === 'blocked' || entry.result === 'diagnosis_failed')
-  const latest = failures[0] ?? escalations[0]
-  const detail = latest?.detail ?? ''
-  const status = /^adoption=([a-z_]+)/.exec(detail)?.[1]
-  const code = /\bcode=([^\s]+)/.exec(detail)?.[1]
-  const failureClass = status === undefined
-    ? (latest?.result ?? 'unknown')
-    : (code === undefined || code === '-' ? status : `${status}/${code}`)
-
-  const oldest = sinceLastSuccess[sinceLastSuccess.length - 1]
-  return {
-    failureClass,
-    escalations: escalations.length,
-    since: oldest?.createdAt ?? escalations[escalations.length - 1]!.createdAt,
-    lastAt: escalations[0]!.createdAt,
-  }
+  // 判定の実体は `pl/adoptionFailure.ts` 1箇所にある。CEO への通知と同じ定義を使うので、
+  // 「通知された障害」と「画面に出ている障害」がずれない。
+  return summarizeAdoptionFailure(
+    storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`),
+  )
 }
 
 export function buildSystemState(
@@ -520,7 +499,7 @@ export function buildSystemState(
       },
       approvalsWaiting: waitingForProject,
       continuationsPending,
-      adoptionFailure: summarizeAdoptionFailure(storage, project.id),
+      adoptionFailure: adoptionFailureOf(storage, project.id),
       designReview,
     })
   }
