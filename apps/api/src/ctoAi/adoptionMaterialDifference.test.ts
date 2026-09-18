@@ -285,6 +285,29 @@ describe('却下されていない案を、却下済みとして扱わない', (
     expect(retryB.ok).toBe(true)
   })
 
+  it('**未レビューの spec を、次の採用が却下済みとして記録しない**（A → B → C → B）', async () => {
+    const { storage, projectId } = seedProject()
+    const first = await adoptOriginal(storage, projectId)
+    rejectCurrentSpec(storage, first.ok ? first.taskId : '')
+
+    const b = {
+      projectId, roadmapId: 'conflicted-item',
+      allowedPaths: ['apps/api/src/storage'], acceptanceCriteria: ['c'],
+      implementationScope: '別案 B',
+    }
+    // A（却下済み）→ B。B の review は走らなかった。
+    expect((await adoptRoadmapItem(storage, b, silentDeps())).ok).toBe(true)
+    // B（未レビュー）→ C。ここで B を却下済みとして書いてはならない。
+    expect((await adoptRoadmapItem(storage, {
+      projectId, roadmapId: 'conflicted-item',
+      allowedPaths: ['packages/shared/src'], acceptanceCriteria: ['c'],
+      implementationScope: '別案 C',
+    }, silentDeps())).ok).toBe(true)
+
+    // B は一度も formal review に落とされていないので、戻れなければならない。
+    expect((await adoptRoadmapItem(storage, b, silentDeps())).ok).toBe(true)
+  })
+
   it('**後から出た CONFLICT を、古い ALIGNED evidence で無かったことにしない**', async () => {
     const { storage, projectId } = seedProject()
     const first = await adoptOriginal(storage, projectId)
