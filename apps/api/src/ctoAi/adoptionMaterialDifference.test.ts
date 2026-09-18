@@ -264,6 +264,27 @@ describe('却下されていない案を、却下済みとして扱わない', (
     expect(retried.ok).toBe(true)
   })
 
+  it('**A を置き換えた直後の B は、まだ却下されていない**（review が流れても出し直せる）', async () => {
+    const { storage, projectId } = seedProject()
+    const first = await adoptOriginal(storage, projectId)
+    rejectCurrentSpec(storage, first.ok ? first.taskId : '')
+
+    // A → B。この時点で audit には A が、Task には B が入る。
+    const b = {
+      projectId, roadmapId: 'conflicted-item',
+      allowedPaths: ['apps/api/src/storage'],
+      acceptanceCriteria: ['c'],
+      implementationScope: '別案 B',
+    }
+    expect((await adoptRoadmapItem(storage, b, silentDeps())).ok).toBe(true)
+
+    // B の review は走らなかった（UNAVAILABLE / 例外などで Job も作られていない）。
+    // **B は一度も却下されていないので、そのまま出し直せなければならない。**
+    const retryB = await adoptRoadmapItem(storage, b, silentDeps())
+
+    expect(retryB.ok).toBe(true)
+  })
+
   it('**後から出た CONFLICT を、古い ALIGNED evidence で無かったことにしない**', async () => {
     const { storage, projectId } = seedProject()
     const first = await adoptOriginal(storage, projectId)
