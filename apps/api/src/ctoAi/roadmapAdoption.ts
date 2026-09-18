@@ -117,11 +117,9 @@ const REJECTED_REVIEW_KEY_TAG = /\brejected_rvk=(\S+)/g
  * **acceptanceCriteria は含まれない**（reviewer が見ないため）。
  */
 function reviewVisibleKeyOf(description: string, allowedPaths: readonly string[]): string {
-  // **重複を畳んでから鍵にする。** `reviewVisibleSpecKey()` は正規化と整列はするが
-  // 重複除去はしないため、`['a']` と `['a','a']` が別の鍵になる。File Change Guard から見た
-  // 許可範囲は同じなので、これを別物として扱うと **同じ内容を重複付きで出し直すだけで
-  // guard を迂回できる**（独立レビュー指摘・2026-09-18）。
-  return shortSpecKey({ implementationScope: description, allowedPaths: [...new Set(allowedPaths)] })
+  // 重複の畳み込みは `reviewVisibleSpecKey()` 側で**正規化の後に**行う
+  // （ここで畳むと `['a', ' A ']` のような正規化後に等しくなる重複が残る）。
+  return shortSpecKey({ implementationScope: description, allowedPaths: [...allowedPaths] })
 }
 
 /**

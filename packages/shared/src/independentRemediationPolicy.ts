@@ -471,7 +471,11 @@ export function reviewVisibleSpecKey(
   const text = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase()
   return JSON.stringify({
     scope: text(spec.implementationScope),
-    paths: [...spec.allowedPaths].map(text).sort(),
+    // **正規化した「後」に重複を畳む。** 順序を揃えるだけでは足りない ——
+    // `['a']` と `['a', ' A ']` は正規化後どちらも許可範囲が同じなのに、畳まないと
+    // 配列長が違って別の鍵になる。**同じ内容を重複付きで出し直すだけで
+    // 「実質的に違う提案」を名乗れてしまう**（独立レビュー指摘・2026-09-18）。
+    paths: [...new Set([...spec.allowedPaths].map(text))].sort(),
   })
 }
 

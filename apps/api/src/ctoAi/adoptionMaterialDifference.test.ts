@@ -217,8 +217,11 @@ describe('却下済み spec の再提出は、Design Review を起こす前に�
 
     const again = await adoptRoadmapItem(storage, {
       projectId, roadmapId: 'conflicted-item',
-      // 許可範囲は同一。重複しているだけ。
-      allowedPaths: [...ORIGINAL_PATHS, ...ORIGINAL_PATHS],
+      // 許可範囲は同一。重複しているうえ、正規化して初めて等しくなる形も混ぜる。
+      allowedPaths: [
+        ...ORIGINAL_PATHS,
+        ...ORIGINAL_PATHS.map((path) => ` ${path.toUpperCase()} `),
+      ],
       acceptanceCriteria: ['当初の受入条件'],
       implementationScope: ORIGINAL_SCOPE,
     }, silentDeps())
