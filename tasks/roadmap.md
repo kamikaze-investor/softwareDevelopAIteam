@@ -8140,20 +8140,37 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       「PL の提案を直す」だけでなく「Source of Truth を訂正して再レビューする」形も要る。
 
 
-      **【2026-09-18 追記: PL 側の経路は実装された。人手経路と手順書は未了】**
-      本 Finding が挙げた3経路のうち、**PL 経路だけ**が
+      **【2026-09-18 追記: 3経路すべてに実装が入った】**
+      本 Finding が挙げた3経路のうち **PL 経路**は
       `independent-remediation-design-review-conflict`（PR #255）で埋まった。
       `task_ready_without_job` は CONFLICT のときに限り notify-only を外れ、
       `Independent Critic → PL revision → 既存 formal review`、
       Critic が Finding 自体を根拠付きで dispute した場合のみ frozen spec への
       once-per-(spec,finding) な再評価、それでも解決しなければ Independent Remediation、
-      という段階経路を通る。**本項目の残りは未了である**:
-      - **人手経路**: `resumeBlockedTask()` が blocked Job を要求する問題はそのまま。
-        Job 0 件の Task を人が再開する導線は無い
-      - **手順書**: 訂正済み `implementationScope` / `allowedPaths` で採用 API を叩き直す復旧手順は
-        依然として文書化されていない
+      という段階経路を通る。
 
-      したがって `state=deferred` は維持する（PR #255 は本項目を close しない）。
+      残っていた **人手経路と手順書**は `human-recovery-zero-job-blocked-task` で埋めた:
+      - **人手経路**: `POST /api/tasks/:id/recover`（Human Recovery）。Job 0 件の blocked Task を
+        `blocked` → `pending` へ戻すだけで、**Job も Review も Approval も作らない**。
+        up-front の CEO Approval Gate は課さない（CEO 決定・2026-09-18）が、fresh Design Review と
+        既存下流 Gate はすべて維持される。AI/PL は「語彙が無い」「配線が無い」
+        「worker allowlist に無い」の3重で到達できない
+      - **手順書**: `docs/project_memory/rules/human_recovery.md`。症状別の使い分け、
+        CONFLICT の原因が提案側か ledger 側かの切り分け、訂正済み `implementationScope` /
+        `allowedPaths` で採用 API を叩き直す手順、`audit_log` からの効果検証まで記載した
+
+      **同時に、本 Finding が書けていなかった穴を1つ塞いだ。** `failContinuation()` 経由の
+      CONFLICT は Task を `blocked` にするため `findRemediationSubject()`（`pending` を要求）から
+      外れ、**PR #255 の新経路にも届かない**。しかも attention は全9箇所が「Job があること」か
+      「`status='pending'` であること」を条件にしているため **1件も立たず**、
+      `occupiesProject()` が blocked を roadmapActive に関係なく占有と数えることと合わさって、
+      **誰にも見えないまま Project の枠を保持し続ける**。2026-09-18 に `:memory:` storage へ
+      同じ状態を作って実測した（`attention = []` /
+      `resumeBlockedTask() = "No jobs exist for this task"`）。
+      notify-only の `task_blocked_without_job` attention を足して可視化した。
+
+      **`state` は merge と Production E2E 確認まで `deferred` のまま維持する。** 実装は入ったが、
+      自然な CONFLICT が出たときの観測はまだ取れていない（PR #255 と同じ扱い）。
 
       **2件目の内訳は新経路の想定ケースそのものである。** `scope_simplicity = ALIGNED` /
       `integration = CONFLICT` で reviewer 同士が要件を逆に読み、原因は PL の出力ではなく
