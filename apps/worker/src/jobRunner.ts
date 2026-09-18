@@ -25,7 +25,6 @@ import type {
 } from '@ai-team/shared'
 import { runRiskReview } from '@ai-team/shared'
 import { z } from 'zod'
-import { tryParseJson } from './aiCli/adapter.js'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
@@ -812,7 +811,19 @@ export async function runJob(
         approvalLevelResult,
         exitCode: cliResult.exitCode,
         stdout: cliResult.stdout,
-        stderr: cliResult.stderr,
+        // **CLI が envelope を出す前に落ちた場合も、先頭は固定語彙にする。**
+        //
+        // `classifyClaudeImplementFailure()` は exit 0 かつ解釈できる JSON があって初めて動く。
+        // ところが認証失敗の最もありふれた形は **CLI が非 0 で落ちて stderr にエラーを書く**
+        // ことで、その経路では raw stderr が `stopReason()` → `attention.detail` まで届く
+        // （独立レビュー指摘）。API key を渡さなくなった以降、subscription 失効がまさに
+        // この形で出るため、本 PR が塞ぐべき穴そのものである。
+        //
+        // raw stderr は Job に残す（診断の証拠。Job 詳細の扱いは
+        // Roadmap `job-raw-output-persisted-and-shown` の責務）。
+        // ここで変えるのは **operator が最初に見る一行**だけである。
+        // 他 provider は従来どおり raw をそのまま出す（テスト失敗の出力等が診断に要るため）。
+        stderr: claudeCliFailureStderr(job.aiCliProvider, cliResult),
         stdoutPath: cliResult.stdoutPath,
         stderrPath: cliResult.stderrPath,
         providerFailureKind: cliResult.providerFailureKind,
@@ -835,9 +846,11 @@ export async function runJob(
           approvalLevelResult,
           exitCode: cliResult.exitCode,
           stdout: cliResult.stdout,
-          stderr: cliResult.stderr
-            ? `${cliResult.stderr}\n[jobRunner] ${implementFailureReason}`
-            : `[jobRunner] ${implementFailureReason}`,
+          // **固定語彙の理由を先頭へ置く。** 末尾へ足していたため、
+          // `stopReason()`（先頭が `[jobRunner] ` ならそれを優先、でなければ末尾を取る）が
+          // raw stderr 側を拾いうる状態だった（独立レビュー指摘）。
+          // Guard 経路が使っている `withLeadingNote()` と同じ形に揃える。
+          stderr: withLeadingNote(cliResult.stderr ?? '', implementFailureReason),
           stdoutPath: cliResult.stdoutPath,
           stderrPath: cliResult.stderrPath,
           providerFailureKind: cliResult.providerFailureKind,
@@ -1670,6 +1683,215 @@ function withSensitiveChanges(
 }
 
 /**
+ * Claude Code CLI が envelope を出す前に非 0 で落ちたときの stderr を組み立てる。
+ *
+ * 先頭へ固定語彙の一行を置き、raw はその後ろに残す。`stopReason()` は先頭が
+ * `[jobRunner] ` で始まればそれを採るので、attention / notification には固定語彙だけが出る。
+ *
+ * **claude_code 以外は素通しする。** 他 provider の非 0 終了は test 失敗や build エラーで、
+ * その raw 出力自体が診断材料である（既存の挙動を変えない）。
+ */
+/**
+ * envelope が API エラーを報告しているなら、その**固定語彙**の理由を返す。
+ * エラーでなければ undefined。
+ *
+ * **CLI が返した理由をそのまま出す。**
+ * 
+ * ここを generic な1文で潰していたため、2026-09-18 に API credit が尽きたとき
+ * 運用側に見えたのは「error result」だけで、真因（400 Credit balance is too low）は
+ * stdout の JSON を人手で開くまで分からなかった。
+ * API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
+ * 出すのは **HTTP status と、固定語彙の原因ラベルだけ**である。
+ * 
+ * provider の文字列をそのまま載せない。`result` は成功時にはモデル本文が入る欄であり
+ * （`reviewerAdapter.ts`: `result: '<モデル本文>'`）、API エラー時でも中身は信用できない
+ * —— 実際に `401 invalid Authorization: Bearer sk-...` のように credential 断片や
+ * prompt 抜粋を含みうる（独立レビュー指摘）。redact（denylist）では取りこぼす形が残る。
+ * 
+ * そこで **echo せず分類する**。出力は下の固定語彙のいずれかで、入力文字列は外へ出ない。
+ * 2026-09-18 の実例（API credit 枯渇）は `credit exhausted` として十分に伝わる。
+    const apiErrorStatus = typeof parsed.api_error_status === 'number'
+      ? parsed.api_error_status
+ */
+function claudeApiErrorReason(parsed: Record<string, unknown>): string | undefined {
+  if (parsed.is_error !== true) return undefined
+
+  const apiErrorStatus = typeof parsed.api_error_status === 'number'
+    ? parsed.api_error_status
+    : undefined
+  if (apiErrorStatus === undefined) return 'Claude Code CLI reported an error result'
+  return `Claude Code CLI reported an error result (HTTP ${apiErrorStatus}): ${classifyApiError(apiErrorStatus, parsed.result)}`
+}
+
+/**
+ * 非 0 終了時の先頭行。**「envelope が無かった」と決めつけない。**
+ *
+ * `runJob()` は `exitCode !== 0` を見た時点で早期 return するので、この経路の Job は
+ * `classifyClaudeImplementFailure()` へ到達しない。ところが **Claude Code CLI は envelope を
+ * 書いたうえで非 0 で終了する**。VPS production 実測（2026-09-18）では credit 枯渇の5件が
+ * いずれも `exit_code=1` かつ `api_error_status: 400` の解釈可能な JSON を stdout に出していた。
+ *
+ * つまり exitCode だけで「envelope 以前に落ちた」と書くと、**実際に起きたことと食い違う文言**を
+ * operator へ出したうえ、HTTP status と原因ラベルまで捨ててしまう（独立レビュー指摘）。
+ * 本 PR が拾おうとしていた当の事象が、この分岐で取りこぼされていた。
+ *
+ * そこで stdout を先に読む。API エラーを報告していれば exit 0 のときと**同じ固定語彙**を返し、
+ * 読めなかったときだけ「使える envelope が無いまま終了した」と述べる。
+ * **「envelope 以前に落ちた」とは書かない。** truncate された envelope を、出力前に落ちた場合と
+ * 区別できないためである。
+ */
+/**
+ * stdout **全体**が Claude Code CLI の result envelope であるときだけ返す。
+ *
+ * `tryParseJson()` は stdout の中から**最初の `{ ... }`** を拾う実装なので、
+ * 出力のどこかに JSON らしき断片があれば envelope として扱ってしまう。
+ * つまりモデルが本文中に
+ * `diagnostic: {"is_error":true,"api_error_status":400,"result":"Credit balance is too low"}`
+ * と書いただけで `credit exhausted` を名乗れてしまう（独立レビュー指摘）。
+ * **断片は envelope の証拠にならない。**
+ *
+ * `--output-format json` では CLI が最上位を組み立て、モデルが書けるのは `result` の**中身**
+ * だけである。したがって「stdout 全体がひとつの JSON object」を要求すれば、
+ * モデルが最上位を騙る経路は塞がる。
+ *
+ * **VPS production 実測（2026-09-18、解釈できた 6/6）**: stdout は `{` で始まる単一 JSON で、
+ * `type: "result"` と boolean の `is_error` を必ず持っていた。
+ * ここで要求するのは **`is_error` が boolean であること**まで —— 実際に読む欄がそれだからである。
+ * `type` も毎回付いていたが要求しない。ある CLI 版が落としただけで API エラーの分類を
+ * 失うほうの害が大きく、断片対策としては上の「全体が JSON」で既に足りている。
+ */
+function claudeResultEnvelope(stdout: string | undefined): Record<string, unknown> | undefined {
+  if (typeof stdout !== 'string') return undefined
+
+  const trimmed = stdout.trim()
+  if (!trimmed.startsWith('{')) return undefined
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return undefined
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+
+  const envelope = parsed as Record<string, unknown>
+  return typeof envelope.is_error === 'boolean' ? envelope : undefined
+}
+
+function claudeCliFailureNote(cliResult: AiCliResult): string {
+  const envelope = claudeResultEnvelope(cliResult.stdout)
+  const apiErrorReason = envelope === undefined ? undefined : claudeApiErrorReason(envelope)
+  if (apiErrorReason !== undefined) return apiErrorReason
+
+  // **`blocked` は「出力が無かった」という意味ではない。** adapter の唯一の代入箇所
+  // （`adapter.ts`: `if (parsedOutput === undefined) blocked = true`）が示すとおり、
+  // これは **expectJson の Job で、retry 後も期待した JSON をパースできなかった**状態である。
+  // 出力自体は存在する。「blocked before producing a result」と書くと、
+  // 起きていないこと（出力が出る前に止められた）を operator へ伝えてしまう（独立レビュー指摘）。
+  if (cliResult.blocked === true) return 'Claude Code CLI output could not be parsed as the expected JSON'
+
+  // **envelope の有無は exitCode からは分からない。** 実際に読めたかどうかで言い分を変える。
+  //
+  // 読めなかった側を「envelope 以前に落ちた」とは書かない。途中で切れた envelope
+  // （`{"is_error":true,"api_error_status":400,"result":"Credit balance` のような truncate）は、
+  // **出力してから切れた**のか**出力前に落ちた**のかを区別できない。立証できているのは
+  // 「使える envelope が無い」ことだけである（独立レビュー指摘）。
+  const exited = `Claude Code CLI exited ${cliResult.exitCode ?? 'abnormally'}`
+  return envelope === undefined
+    ? `${exited} without a usable result envelope`
+    : `${exited} after producing a result envelope that reported no API error`
+}
+
+function claudeCliFailureStderr(
+  provider: AiCliProvider,
+  cliResult: AiCliResult,
+): string | undefined {
+  if (provider !== 'claude_code') return cliResult.stderr
+
+  return withLeadingNote(cliResult.stderr ?? '', claudeCliFailureNote(cliResult))
+}
+
+/**
+ * エラー本文が**「残高が尽きている」と言い切っている**かどうかだけを見る。
+ *
+ * `credit` や `credit balance` という語の**出現**では足りない。残高に言及しているだけの
+ * 文（"cannot access credit balance" / "credit balance endpoint unavailable" /
+ * "insufficient permission to access credit balance"）は、残高が尽きたことを
+ * **何も立証していない**（独立レビュー指摘）。語の出現で判定すると、
+ * 権限エラーや API 障害を課金切れとして operator へ出してしまう。
+ *
+ * **本文そのものが残高切れの宣言であるときだけ true。** 語の出現でも、先頭一致でもない。
+ *
+ * **VPS production 実測（2026-09-18、credit 枯渇 5件すべて同一）**: `api_error_status: 400`
+ * のとき `result` は長さ 25 の文字列 `"Credit balance is too low"` **ちょうど**であり、
+ * JSON でも長文でもなかった。つまり本文全体が原因文そのものである。
+ *
+ * 前方一致では足りない。冒頭に同じ語が来る別の文
+ * （`"Credit balance is too low? No; the request body is invalid"` /
+ * `"Credit balance is too low is the rejected field value"`）を拾ってしまう
+ * （独立レビュー指摘）。文中一致だと条件文・否定・prompt 抜粋まで拾う。
+ * **自由文から意味を読み取ろうとする限り際限がない**ので、
+ * **実測した本文と一致するか**だけを見る。
+ *
+ * 将来 CLI が接尾辞を付けた本文を返すようになれば、ここは外れて generic の `API error`
+ * になる。**それでよい**。外れれば「分からない」と出るだけだが、緩めれば嘘のラベルが出る。
+ * その時は再び実測して、観測した形を足す。
+ */
+function saysBalanceIsGone(result: unknown): boolean {
+  if (typeof result !== 'string') return false
+
+  return /^(your |the )?credit balance is (too low|exhausted|depleted|empty)\.?$/
+    .test(result.trim().toLowerCase())
+}
+
+/**
+ * API 層のエラーを**固定語彙**へ落とす。
+ *
+ * 入力（provider の文字列）は判定に使うだけで、**戻り値には一切含めない**。
+ * これにより credential 断片・prompt 抜粋・モデル本文が operator 向けメッセージへ出る経路が
+ * 構造的に存在しなくなる（redact の取りこぼしに依存しない）。
+ *
+ * **保証の範囲はここまでである。** 守られるのは failure reason / `stopReason` /
+ * attention / CEO notification の4経路で、いずれも上の固定語彙しか載らない。
+ * **Job 詳細に保存・表示される raw stdout/stderr は対象外であり、安全とは言えない**
+ * （provider 次第で credential 断片・prompt・モデル本文を含みうる）。
+ * そちらは全 provider・永続化先・診断価値・retention に跨る別責務として
+ * Roadmap `job-raw-output-persisted-and-shown` で扱う。ここで雑に消すと
+ * 障害診断の証拠を失う（CEO 判断・2026-09-18）。
+ */
+
+function classifyApiError(status: number, result: unknown): string {
+  // **status が定義として意味を持つものを先に返す。** 文言判定を先に置くと、
+  // status 側の確かな意味を文言側の推測が上書きしてしまう（独立レビュー指摘）。
+  // 例: `403` + "insufficient permission to access credit balance" は
+  // **権限の問題**であって残高の問題ではないのに、`credit exhausted` と出てしまっていた。
+  //
+  // 401 は「認証されていない」が定義そのものなので断定してよい。API key を渡さなくなった今、
+  // subscription ログインの失効が最初にここへ出る。
+  if (status === 401) return 'authentication failed (the Claude Code login may have expired)'
+
+  // 403 は「認証は通ったが許可されていない」場合も含む。認証失効と**断定しない**。
+  if (status === 403) return 'access forbidden'
+
+  if (status === 429) return 'rate limited'
+
+  // **credit 枯渇は「status が別の意味を持たない」ときだけ、明示文言を根拠に名乗る。**
+  // status だけでは決めない（400 は入力不正からレート制御まで何でも来る）し、
+  // 文言だけでも決めない（上の 401/403/429 を上書きしてしまう）。**両方**を要求する。
+  //
+  // 対象 status を 400/402 に限るのは、この2つが credit 枯渇と矛盾しないためである。
+  // 402 Payment Required は定義上まさにこれだが、それでも文言を要求する
+  // （status 単独では名乗らせない）。
+  //
+  // 文言は `saysBalanceIsGone()` のとおり「残高が尽きている」と言い切っているものだけ。
+  // 2026-09-18 実測: `400` + "Credit balance is too low"。
+  if ((status === 400 || status === 402) && saysBalanceIsGone(result)) return 'credit exhausted'
+
+  // 文言からの推測でラベルを具体化しない。分からないものは分からないと出す。
+  return 'API error'
+}
+
+/**
  * implement モードでAI CLIが成功終了したが、実際にはファイル変更が0件だった場合の
  * 失敗理由を判定する。undefined を返せば通常どおり後続処理へ進む。
  */
@@ -1683,13 +1905,18 @@ function classifyClaudeImplementFailure(
     return cliResult.changedFiles.length === 0 ? 'implementation produced no file changes' : undefined
   }
 
-  const parsed = tryParseJson(cliResult.stdout)
+  // **ここも断片ではなく envelope を要求する。** `permission_denials` の件数も envelope 由来で、
+  // 断片を信じるとモデルが書いた JSON で「拒否された tool がある」と名乗れてしまう。
+  const parsed = claudeResultEnvelope(cliResult.stdout)
   if (parsed === undefined) {
-    return 'Claude Code CLI output could not be parsed as JSON'
+    // **「JSON ではなかった」と断定しない。** `claudeResultEnvelope()` は
+    // `{"type":"result","result":"..."}` のような**正しい JSON でも** boolean の `is_error` が
+    // 無ければ弾く。立証できているのは「使える result envelope ではなかった」ことだけである
+    // （独立レビュー指摘）。
+    return 'Claude Code CLI output was not a usable result envelope'
   }
-  if (parsed.is_error === true) {
-    return 'Claude Code CLI reported an error result'
-  }
+  const apiErrorReason = claudeApiErrorReason(parsed)
+  if (apiErrorReason !== undefined) return apiErrorReason
 
   if (cliResult.changedFiles.length > 0) {
     // 変更が実際に存在する場合、permission_denials があっても失敗にしない
@@ -1697,28 +1924,40 @@ function classifyClaudeImplementFailure(
     return undefined
   }
 
-  const deniedTools = extractDeniedToolNames(parsed)
-  if (deniedTools.length > 0) {
-    return `Claude Code tool permission denied (tools: ${deniedTools.join(', ')})`
+  // **tool_name を operator 向けの文字列へ入れない。**
+  // `tool_name` は provider が返す自由文字列であり、こちらが形を決められない。
+  // ここへ echo すると、credential 断片や prompt 抜粋がそのまま先頭行に載り、
+  // `stopReason()` → attention → CEO notification まで届く（独立レビュー指摘）。
+  // 本 PR が他の経路で採ったのと同じ方針（echo せず、確かな事実だけ出す）に揃える。
+  //
+  // 件数は provider の文字列ではなく**こちらが数えた事実**なので出してよい。
+  // どの tool だったかは Job の raw stdout に残っており、診断はそこで行う
+  // （Job 詳細の扱いは Roadmap `job-raw-output-persisted-and-shown` の責務）。
+  const deniedToolCount = countDeniedTools(parsed)
+  if (deniedToolCount > 0) {
+    return `Claude Code tool permission denied (${deniedToolCount} tool call(s))`
   }
   return 'implementation produced no file changes'
 }
 
 /**
- * Claude Code CLI JSON の permission_denials から tool_name だけを安全に取り出す。
- * tool_input・ファイル内容・token等は一切ログへ含めない。
+ * Claude Code CLI JSON の permission_denials のうち、**tool_name を持つ要素の件数**を返す。
+ *
+ * 名前そのものは返さない。provider の自由文字列を operator 向けの経路へ持ち出さないため、
+ * 呼び出し側が誤って echo できないよう**関数の戻り値の段階で落としている**。
  */
-function extractDeniedToolNames(parsed: Record<string, unknown>): string[] {
+function countDeniedTools(parsed: Record<string, unknown>): number {
   const denials = parsed.permission_denials
-  if (!Array.isArray(denials)) return []
-  const names: string[] = []
+  if (!Array.isArray(denials)) return 0
+
+  let count = 0
   for (const denial of denials) {
     if (denial !== null && typeof denial === 'object' && 'tool_name' in denial) {
       const toolName = (denial as { tool_name: unknown }).tool_name
-      if (typeof toolName === 'string') names.push(toolName)
+      if (typeof toolName === 'string') count += 1
     }
   }
-  return names
+  return count
 }
 
 interface AiFailureInspectionInput {
