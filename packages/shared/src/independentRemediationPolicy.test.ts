@@ -3,6 +3,7 @@ import {
   FLAGSHIP_REMEDIATION_CANDIDATES,
   extractDesignReviewFindings,
   isMateriallyDifferentSpec,
+  selectCriticModel,
   reviewVisibleSpecKey,
   parseRemediationProposal,
   selectRemediationModel,
@@ -103,16 +104,86 @@ describe('selectRemediationModel', () => {
     expect(selection.excludedVendors).toEqual(['anthropic', 'openai'])
   })
 
-  it('既に失敗した provider は再試行せず、別 flagship vendor へ回す', () => {
+  it('chain で使用済みの provider は順位を下げる（別 flagship を優先する）', () => {
     const selection = selectRemediationModel({
       authorProviders: ['opencode-go'],
       judgeProviders: ['gemini'],
-      exhaustedProviders: ['codex'],
+      usedProviders: ['codex'],
     })
 
     expect(selection.ok).toBe(true)
     if (!selection.ok) return
     expect(selection.candidate.provider).toBe('claude_code')
+    expect(selection.reusedProvider).toBe(false)
+  })
+
+  it('**使用済みしか残らなくても BLOCKED にしない**（diversity は Preference）', () => {
+    // 以前はここを hard skip にしていたため、候補不足がそのまま PL loop の停止だった。
+    // Safety Constraint を満たす候補があるなら、使い回してでも進める（CEO 指示 2026-09-18）。
+    const selection = selectRemediationModel({
+      authorProviders: ['opencode-go'],
+      judgeProviders: ['gemini'],
+      usedProviders: ['codex', 'claude_code'],
+    })
+
+    expect(selection.ok).toBe(true)
+    if (!selection.ok) return
+    expect(selection.reusedProvider).toBe(true)
+  })
+
+  it('Critic 使用済みの flagship は最下位だが、除外しない', () => {
+    // Critic は Task Spec を書かないので Task Design author ではない。
+    // Critic と Remediator が同一 model になること自体は許可される。
+    const preferOther = selectRemediationModel({
+      authorProviders: ['opencode-go'],
+      judgeProviders: ['gemini'],
+      criticProviders: ['codex'],
+    })
+
+    expect(preferOther.ok).toBe(true)
+    if (!preferOther.ok) return
+    expect(preferOther.candidate.provider).toBe('claude_code')
+
+    // 両方 Critic 済みなら、それでも選ぶ（BLOCKED にしない）。
+    const bothUsed = selectRemediationModel({
+      authorProviders: ['opencode-go'],
+      judgeProviders: ['gemini'],
+      criticProviders: ['codex', 'claude_code'],
+    })
+
+    expect(bothUsed.ok).toBe(true)
+    if (!bothUsed.ok) return
+    expect(bothUsed.reusedProvider).toBe(true)
+  })
+
+  it('優先順は 1) chain 未使用 → 2) その他 → 3) Critic 使用済み', () => {
+    // codex は chain 使用済み、claude_code は Critic 使用済み。
+    // CEO 指示の順では「Critic 使用済み」が最下位なので codex が選ばれる。
+    const selection = selectRemediationModel({
+      authorProviders: ['opencode-go'],
+      judgeProviders: ['gemini'],
+      usedProviders: ['codex'],
+      criticProviders: ['claude_code'],
+    })
+
+    expect(selection.ok).toBe(true)
+    if (!selection.ok) return
+    expect(selection.candidate.provider).toBe('codex')
+  })
+
+  it('**Safety Constraint を満たす候補が無いときだけ** ok:false', () => {
+    // author model と judge vendor で両候補が落ちる場合のみ停止する。
+    const selection = selectRemediationModel({
+      authorProviders: ['claude_code'],
+      authorModels: ['gpt-5.6-sol'],
+      judgeProviders: ['gemini'],
+      usedProviders: ['codex', 'claude_code'],
+      criticProviders: ['codex', 'claude_code'],
+    })
+
+    expect(selection.ok).toBe(false)
+    if (selection.ok) return
+    expect(selection.reason).toContain('authority-separation')
   })
 
   it('**vendor が解決できなくても、model 単位の分離は必ず効く**', () => {
@@ -153,6 +224,60 @@ describe('selectRemediationModel', () => {
     expect(selection.unresolvedAuthors).toEqual(['opencode-go', 'copilot'])
     // 未知の著者は除外集合へ入らない（入れられない）。
     expect(selection.excludedVendors).toEqual(['google'])
+  })
+})
+
+describe('selectCriticModel — diversity は Preference、失敗しない', () => {
+  it('初回はそのまま先頭の flagship を選ぶ', () => {
+    const selection = selectCriticModel({})
+
+    expect(selection.candidate.provider).toBe('codex')
+    expect(selection.reusedModel).toBe(false)
+  })
+
+  it('前回と別 model を優先する', () => {
+    const selection = selectCriticModel({
+      previousProviders: ['codex'],
+      previousModels: ['gpt-5.6-sol'],
+    })
+
+    expect(selection.candidate.model).toBe('claude-opus-5')
+    expect(selection.reusedModel).toBe(false)
+    expect(selection.reusedVendor).toBe(false)
+  })
+
+  it('**候補が尽きたら同一 model を再利用する。BLOCKED にしない**', () => {
+    // Critic は Task Spec mutation authority も formal verdict authority も持たないため、
+    // model diversity の不足を fail-closed 条件にしない（CEO 指示 2026-09-18）。
+    // 次 Round には新しい Task Spec・最新 Finding・過去 Critique・PL の変更が渡るので、
+    // 同一 model でも入力が違えば別の批判になりうる。
+    const selection = selectCriticModel({
+      previousProviders: ['codex', 'claude_code'],
+      previousModels: ['gpt-5.6-sol', 'claude-opus-5'],
+    })
+
+    // **undefined を返さない。** 型として失敗を表現していないことが要点である。
+    expect(selection.candidate).toBeDefined()
+    expect(selection.reusedModel).toBe(true)
+  })
+
+  it('同一 model を再利用したことは記録として残る（可否には影響しない）', () => {
+    const selection = selectCriticModel({
+      previousProviders: ['codex', 'claude_code'],
+      previousModels: ['gpt-5.6-sol', 'claude-opus-5'],
+    })
+
+    expect(selection.reusedModel).toBe(true)
+    expect(selection.reusedVendor).toBe(true)
+  })
+
+  it('Critic も軽量 model へは落ちない（候補は flagship のみ）', () => {
+    const selection = selectCriticModel({
+      previousProviders: ['codex', 'claude_code'],
+      previousModels: ['gpt-5.6-sol', 'claude-opus-5'],
+    })
+
+    expect(FLAGSHIP_REMEDIATION_CANDIDATES.map((c) => c.model)).toContain(selection.candidate.model)
   })
 })
 

@@ -145,8 +145,53 @@ const PL_PROPOSAL_AUTHOR_MODEL = CHEAP_AI_CONFIG.model
  * 材料は自前の audit 行の provenance だけである（新しいテーブルは作らない）。
  */
 function priorRemediationProviders(storage: IStorage, taskId: string): string[] {
+  return priorProvidersForStage(storage, taskId, 'remediation')
+}
+
+/**
+ * Critic として使った provider / model。
+ *
+ * **Critic 行と Remediation 行を混同してはならない。** どちらも同じ audit entity
+ * （`pl_remediation` / `remediate:<taskId>`）へ載るので、`stage=` で区別する。
+ * 混同すると Critic 経験者が「Task Design author」として **hard 除外**されてしまい、
+ * CEO が Preference と決めたものが Safety Constraint に化ける（2026-09-18）。
+ *
+ * Critic は Task Spec を書かないので、Critic 経験は author 独立性を侵さない。
+ */
+export function priorCriticProviders(storage: IStorage, taskId: string): string[] {
+  return priorProvidersForStage(storage, taskId, 'critic')
+}
+
+export function priorCriticModels(storage: IStorage, taskId: string): string[] {
+  const models: string[] = []
+  for (const entry of stageEntries(storage, taskId, 'critic')) {
+    const model = /\bmodel=([\w.-]+)/.exec(entry.detail ?? '')?.[1]
+    if (model !== undefined && !models.includes(model)) models.push(model)
+  }
+  return models
+}
+
+function stageEntries(
+  storage: IStorage,
+  taskId: string,
+  stage: 'critic' | 'remediation' | 'challenge',
+): { detail?: string }[] {
+  return storage.auditLog
+    .findByEntity(AUDIT_ENTITY_TYPE, remediationKey(taskId))
+    .filter((entry) => {
+      const recorded = /\bstage=(\w+)/.exec(entry.detail ?? '')?.[1]
+      // `stage=` の無い行は Remediation として扱う（staging 導入前に書かれた形）。
+      return recorded === undefined ? stage === 'remediation' : recorded === stage
+    })
+}
+
+function priorProvidersForStage(
+  storage: IStorage,
+  taskId: string,
+  stage: 'critic' | 'remediation' | 'challenge',
+): string[] {
   const providers: string[] = []
-  for (const entry of storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, remediationKey(taskId))) {
+  for (const entry of stageEntries(storage, taskId, stage)) {
     const provider = /\bprovider=([\w-]+)/.exec(entry.detail ?? '')?.[1]
     if (provider !== undefined && !providers.includes(provider)) providers.push(provider)
   }
@@ -575,17 +620,25 @@ export async function runRemediationStep(
   }
 
   // ── 独立した flagship を選ぶ（弱い model へは落ちない）──────────
+  //
+  // **Safety Constraint と Preference を分ける**（CEO 指示 2026-09-18）。
+  // hard なのは author / judge との分離だけで、chain 使用済み・Critic 使用済みは
+  // 順位付けにしか使わない。**diversity 不足で PL loop を止めない。**
   const priorProviders = priorRemediationProviders(storage, taskId)
   const selection = selectRemediationModel({
     // 1回目は PL（vendor 未解決）、2回目以降は前回の Remediation 著者も除外対象になる。
+    // **Remediation 著者は Task Design を書いた側**なので、ここは hard 側で正しい。
     authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorProviders],
     // **vendor が解決できない相手にも、model 単位の分離は必ず効かせる。**
     authorModels: [PL_PROPOSAL_AUTHOR_MODEL],
     // 初回 implement Job の Design Review は常に `changedFiles: []` で走る
     // （`createInitialImplementWorkflow()`）。値を固定せず既存分類器から導く。
     judgeProviders: resolveJudgeProviders([]),
-    // 実行して失敗した provider も再試行しない。
-    exhaustedProviders: priorProviders,
+    // Preference: この chain で既に使った provider は順位を下げるだけ。
+    usedProviders: priorProviders,
+    // Preference: Critic 経験者は最下位。ただし **Critic は Task Spec を書かない**ので
+    // 除外はしない（Critic と Remediator が同一 model でも許可される）。
+    criticProviders: priorCriticProviders(storage, taskId),
   })
   if (!selection.ok) {
     // provider 構成が変わるまで結果は変わらないので、ここも試行として記録して有界にする。
@@ -605,7 +658,7 @@ export async function runRemediationStep(
     + ` excluded=${selection.excludedVendors.join('+') || '-'}`
     // 分離を確認できなかった相手を黙って落とさない。
     + ` unverified_separation=${selection.unresolvedAuthors.join('+') || '-'}`
-    + ` rejected_specs=${subject.rejectedSpecKeys.length}`
+    + ` stage=remediation rejected_specs=${subject.rejectedSpecKeys.length}`
     // **却下された側のキーも残す。** 採用で Task の scope が置き換わると、この世代で
     // 却下されていた案は Task 上から消える。残さないと次の世代で再提出できてしまう。
     + ` rejected_fspec=${subject.rejectedSpecKeys[0] ?? '-'}`

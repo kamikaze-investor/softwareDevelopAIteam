@@ -447,7 +447,7 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
     const selection = selectRemediationModel({
       authorProviders: ['opencode-go', 'codex'],
       judgeProviders: ['gemini'],
-      exhaustedProviders: ['codex'],
+      usedProviders: ['codex'],
     })
 
     expect(selection.ok).toBe(true)

@@ -81,8 +81,24 @@ export interface RemediationModelInput {
    * 自己承認になる）。**vendor 分離の本体はこちら側である。**
    */
   judgeProviders: readonly string[]
-  /** 既に実行して失敗した候補の provider。同じものを再試行しないために渡す。 */
-  exhaustedProviders?: readonly string[]
+  /**
+   * 既にこの repair chain で使った provider。**Preference であって Safety Constraint ではない。**
+   *
+   * 優先度を下げるだけで、除外はしない。以前はここを hard skip にしていたが、それは
+   * 「候補が尽きたから BLOCKED」を作る —— **model diversity の不足で PL loop を止めない**
+   * （CEO 指示 2026-09-18）。Safety に効くのは author / judge 側の分離であって、
+   * chain の新しさではない。
+   */
+  usedProviders?: readonly string[]
+  /**
+   * Critic として使った provider。**Preference。最下位に置くが除外はしない。**
+   *
+   * Critic は formal verdict authority も Task Spec mutation authority も持たないため、
+   * **Critic が書いたものは Task Design ではない**。よって Critic 経験は
+   * 「Task Design author との独立性」を侵さない。同一 model が Critic と Remediator を
+   * 兼ねること自体は許可される（CEO 指示 2026-09-18）。
+   */
+  criticProviders?: readonly string[]
 }
 
 export type RemediationModelSelection =
@@ -100,6 +116,13 @@ export type RemediationModelSelection =
        * この値を記録し、**分離済みと書かない**。
        */
       unresolvedAuthors: readonly string[]
+      /**
+       * Preference を満たせず、chain / Critic で使用済みの provider を再利用したか。
+       *
+       * **記録のためだけの値で、可否には一切影響しない。** diversity は Preference なので、
+       * 満たせなかったことは停止理由にならない（CEO 指示 2026-09-18）。
+       */
+      reusedProvider: boolean
     }
   | {
       ok: false
@@ -125,10 +148,23 @@ function resolveVendors(providers: readonly string[]): {
 /**
  * Remediation を任せる model を決める。
  *
- * 選び方は「除外して残った先頭」であって、能力の比較はしない
- * （候補表が既に flagship だけなので、順序が優先度そのものになる）。
- * 残らなければ `ok: false` を返す。**弱い候補へ降格しない** —— 呼び出し側は
- * 別 flagship vendor が尽きた時点で既存の CEO Escalation 経路へ進む。
+ * ## Safety Constraint と Preference を混ぜない（CEO 指示 2026-09-18）
+ *
+ * **Safety Constraint（満たせなければ選ばない）**:
+ *   - Task Design author と同一 model でない（`authorModels`）
+ *   - Task Design author と同一 vendor でない（解決できる範囲。`authorProviders`）
+ *   - この提案を判定する reviewer と同一 vendor でない（`judgeProviders`）
+ *
+ * **Preference（順位付けだけ。除外しない）**:
+ *   1. この repair chain でまだ使っていない flagship
+ *   2. その他の利用可能な flagship
+ *   3. Critic として使用済みの flagship
+ *
+ * **model diversity が足りないことを理由に BLOCKED を作らない。** 以前は chain 使用済みを
+ * hard skip していたため、候補不足がそのまま PL loop の停止になっていた。止めてよいのは
+ * Safety Constraint を満たす候補が1つも無いときだけである。
+ *
+ * どの tier でも**弱い候補へは降格しない**（候補表が flagship だけなので構造的に不可能）。
  */
 export function selectRemediationModel(input: RemediationModelInput): RemediationModelSelection {
   const authors = resolveVendors(input.authorProviders)
@@ -139,37 +175,124 @@ export function selectRemediationModel(input: RemediationModelInput): Remediatio
     if (!excludedVendors.includes(vendor)) excludedVendors.push(vendor)
   }
 
-  const exhausted = new Set(input.exhaustedProviders ?? [])
   // **model 単位の除外は vendor が解決できるかに依存しない。** ここが round 1 の
   // （vendor 未解決な）著者に対して実際に強制できる唯一の独立性である。
   const authorModels = new Set(input.authorModels ?? [])
+  const used = new Set(input.usedProviders ?? [])
+  const criticUsed = new Set(input.criticProviders ?? [])
 
-  for (const candidate of FLAGSHIP_REMEDIATION_CANDIDATES) {
-    if (exhausted.has(candidate.provider)) continue
+  // ── Safety Constraint を満たす候補だけを残す（ここだけが hard）──────
+  const eligible = FLAGSHIP_REMEDIATION_CANDIDATES.filter((candidate) => {
     // 元の設計者と同一 model には絶対に戻さない（vendor 解決の成否に関わらず）。
-    if (authorModels.has(candidate.model)) continue
+    if (authorModels.has(candidate.model)) return false
     const vendor = resolveReviewVendor(candidate.provider)
     // 候補表の provider は `PROVIDER_VENDOR` に載っているものだけにしてあるが、
     // 解決できない値が紛れ込んだ場合は採用しない（fail-closed）。
-    if (vendor === undefined) continue
-    if (excludedVendors.includes(vendor)) continue
+    if (vendor === undefined) return false
+    return !excludedVendors.includes(vendor)
+  })
+
+  if (eligible.length > 0) {
+    // ── Preference で並べる。**同点なら候補表の順序**（安定選択）────────
+    // Critic 経験を chain 使用より重く見るのは CEO 指示の優先順（1→2→3）に合わせるため。
+    const rank = (candidate: RemediationCandidate): number =>
+      (criticUsed.has(candidate.provider) ? 2 : 0) + (used.has(candidate.provider) ? 1 : 0)
+    const best = eligible.reduce((left, right) => (rank(right) < rank(left) ? right : left))
+    const vendor = resolveReviewVendor(best.provider) as ReviewVendor
+
     return {
       ok: true,
-      candidate,
+      candidate: best,
       vendor,
       excludedVendors,
       unresolvedAuthors: authors.unresolved,
+      /** Preference を満たせなかった場合の記録。BLOCKED の理由にはしない。 */
+      reusedProvider: used.has(best.provider) || criticUsed.has(best.provider),
     }
   }
 
   return {
     ok: false,
     reason:
-      'no flagship model is independent of the parties involved'
+      'no flagship model satisfies the authority-separation constraints'
       + ` (excluded vendors: ${excludedVendors.join(', ') || 'none'};`
-      + ` already tried: ${[...exhausted].join(', ') || 'none'})`,
+      + ` excluded models: ${[...authorModels].join(', ') || 'none'})`,
     excludedVendors,
     unresolvedAuthors: authors.unresolved,
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// Independent Critic の model 選択
+// ────────────────────────────────────────────────────────────
+
+export interface CriticModelSelection {
+  candidate: RemediationCandidate
+  vendor: ReviewVendor
+  /** 前回と同じ model を再利用したか（Preference を満たせなかった記録）。 */
+  reusedModel: boolean
+  /** 前回と同じ vendor になったか（Preference を満たせなかった記録）。 */
+  reusedVendor: boolean
+}
+
+/**
+ * Independent Critic に使う model を決める。
+ *
+ * ## **これは Preference だけで構成され、失敗しない**（CEO 指示 2026-09-18）
+ *
+ * Critic は
+ *   - Task Spec mutation authority を持たない（提案は書くが適用しない）
+ *   - formal verdict authority を持たない（PASS / CONFLICT を決めない）
+ * ため、**model diversity の不足を fail-closed 条件にしない**。
+ *
+ * 優先順:
+ *   1. 前回と別 model かつ別 vendor
+ *   2. 前回と別 model（vendor は同じでもよい）
+ *   3. **前回と同じ model**（fallback。これを許可することが本関数の要点）
+ *
+ * 「前回と同じ Critic model であること」だけを理由に BLOCKED にしてはならない。
+ * 次 Round には新しい Task Spec・最新 Finding・過去 Critique・PL の変更が渡るので、
+ * 同一 model でも入力が違えば別の批判になりうる。
+ *
+ * `selectRemediationModel()` とは**意図的に別関数**である。あちらは Safety Constraint を
+ * 持つので `ok: false` を返しうるが、こちらは返さない。同じ関数へ flag で押し込むと
+ * 「どちらが hard か」が呼び出し側から見えなくなる。
+ */
+export function selectCriticModel(input: {
+  /** 直前の Round で Critic に使った provider（あれば）。 */
+  previousProviders?: readonly string[]
+  /** 直前の Round で Critic に使った model（あれば）。 */
+  previousModels?: readonly string[]
+}): CriticModelSelection {
+  const previousProviders = new Set(input.previousProviders ?? [])
+  const previousModels = new Set(input.previousModels ?? [])
+  const previousVendors = new Set(
+    [...previousProviders]
+      .map((provider) => resolveReviewVendor(provider))
+      .filter((vendor): vendor is ReviewVendor => vendor !== undefined),
+  )
+
+  // 候補表は flagship のみ。**Critic も軽量 model へは落とさない**
+  // （根本原因の分析と Finding の妥当性評価は推論能力を要する作業である）。
+  const rank = (candidate: RemediationCandidate): number => {
+    const sameModel = previousModels.has(candidate.model)
+    const vendor = resolveReviewVendor(candidate.provider)
+    const sameVendor = vendor !== undefined && previousVendors.has(vendor)
+    // 同一 model は最も避けたい。次に同一 vendor。
+    return (sameModel ? 2 : 0) + (sameVendor ? 1 : 0)
+  }
+
+  const best = FLAGSHIP_REMEDIATION_CANDIDATES.reduce(
+    (left, right) => (rank(right) < rank(left) ? right : left),
+  )
+  const vendor = resolveReviewVendor(best.provider)
+
+  return {
+    candidate: best,
+    // 候補表の provider は必ず解決できる（`FLAGSHIP_REMEDIATION_CANDIDATES` の不変条件）。
+    vendor: vendor as ReviewVendor,
+    reusedModel: previousModels.has(best.model),
+    reusedVendor: vendor !== undefined && previousVendors.has(vendor),
   }
 }
 
