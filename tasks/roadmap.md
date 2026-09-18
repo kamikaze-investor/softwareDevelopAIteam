@@ -9742,7 +9742,14 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         **Review が実行され CONFLICT と判定した**場合に**同じ topology へ別の提案**を出す。層が違う。
         本項目は run が `failed` の Task を対象にしない（そちらの担当である）
       - `roadmap-adoption-followups` (2) … `retryable` skip の再拾い上げ経路が無い問題。
-        **本項目は直さない**（CONFLICT 以外は対象外）。run が `queued` / `running` の間は待つ
+        **本項目は直さない**（CONFLICT 以外は対象外）。run が `queued` / `running` の間は待つ。
+        **2026-09-18 に production で 17 時間の停止として再発した**（同項目へ追記済み。#254）。
+        症状は本項目とまったく同じ `task_ready_without_job` だが、**原因が違う** ——
+        あちらは同じ design text が 2 回目の run で `ALIGNED` になっており、実質は transient な
+        非 ALIGNED である。本項目の述語は `recomputeDecision()` を再計算して
+        **`CONFLICT` だけ**を対象にするので、あのケースでは発火しない（発火させてはいけない ——
+        提案は正しく、Review をもう一度回せば通るものだった）。
+        **症状が同じなので取り違えやすい。どちらの経路が必要かは run の decision で判断する。**
       - `review-class-b-enhanced-ai-review`（deferred）… Class 判定は別軸。**依存させない。**
         本項目は Class 境界を 1 つも動かさない
       - `role-model-registry`（planned）… 候補表の最終的な owner。完成したら hardcode を廃止し
