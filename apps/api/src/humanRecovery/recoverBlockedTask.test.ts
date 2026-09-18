@@ -15,14 +15,13 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import type { IStorage } from '../storage/interface'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { buildSystemState } from '../state/systemState'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { PL_ACTION_KINDS } from '@ai-team/shared'
+import { PL_ACTION_KINDS, resolvePlActionPolicy } from '@ai-team/shared'
+import { runPlTick } from '../pl/executionLoop'
 import { WORKER_ALLOWLIST } from '../auth/workerAllowlist'
 import {
   countRemediationAttempts,
@@ -42,6 +41,8 @@ function seed(options: {
   projectStatus?: 'running' | 'archived' | 'paused'
   roadmapTaskKey?: string
   withJob?: boolean
+  /** 診断まで進む `job_blocked` attention を作る（Job があるので recover 自体は対象外）。 */
+  withBlockedJob?: boolean
   /** 自律ループから到達できない Task（`roadmapActive=false`）を作る。 */
   unreachable?: boolean
 } = {}): Seeded {
@@ -75,6 +76,19 @@ function seed(options: {
       status: 'queued',
       safeCommand: { kind: 'noop' },
     } as never)
+  }
+  if (options.withBlockedJob === true) {
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'p',
+    } as never)
+    storage.jobs.update(job.id, { status: 'blocked', stderr: 'guard violation' } as never)
   }
 
   storage.tasks.update(task.id, { status: options.taskStatus ?? 'blocked' })
@@ -362,16 +376,40 @@ describe('Human Recovery は AI/PL から到達できない（CEO 決定・2026-
     expect(WORKER_ALLOWLIST.some((entry) => entry.url.includes('/recover'))).toBe(false)
   })
 
-  it('PL ループの executor に Human Recovery の分岐が無い', () => {
-    // `executeAction()` / `allowedActionsFor()` に配線していないことを、実ファイルで固定する。
-    // in-process の PL は自分へ HTTP を打たないので、配線が無ければ到達経路が存在しない。
-    const loopPath = resolve(process.cwd(), 'apps/api/src/pl/executionLoop.ts')
-    // 読めなかったことを「配線が無い」と誤認しない（cwd が変わったら落とす）。
-    expect(existsSync(loopPath)).toBe(true)
+  it('Human Recovery 相当の action は Policy が forbidden にする', () => {
+    // 語彙に無い値は素通しではなく `forbidden` へ倒れる（fail-closed）。
+    for (const kind of ['recover_task', 'human_recovery', 'recover_blocked_task']) {
+      const decision = resolvePlActionPolicy({ kind })
+      expect(decision.disposition).toBe('forbidden')
+      // BLOCK されたとき PL が取れる行動に override は無い。
+      expect(decision.allowedResponsesWhenBlocked).not.toContain('override_gate_block')
+    }
+  })
 
-    const loop = readFileSync(loopPath, 'utf-8')
-    expect(loop).not.toContain('recoverBlockedTask')
-    expect(loop).not.toContain('humanRecovery')
+  it('**PL が Human Recovery 相当を提案しても、状態は動かない**（公開 behavior で確認）', async () => {
+    // ファイルの中身ではなく、**PL ループを実際に回して**到達不能であることを見る。
+    // blocked Job の attention は診断まで進むので、そこで未知 action を提案させる。
+    const { storage, taskId } = seed({ withBlockedJob: true })
+
+    const result = await runPlTick(storage, {
+      escalate: async () => {},
+      readLedger: () => '',
+      // PL が「Human Recovery したい」と言い出した状況を作る。
+      diagnose: async () => JSON.stringify({
+        actionKind: 'recover_task',
+        rationale: 'blocked かつ Job 0 件なので再投入したい',
+        riskLevel: 'LOW',
+      }),
+      proposeAdoption: async () => { throw new Error('attention が残るうちは採用しない') },
+    })
+
+    // Gate で止まる。実行段階（`executeAction()`）へ到達しない。
+    expect(result.status).toBe('blocked')
+    expect(result.proposedKind).toBe('recover_task')
+    // **状態遷移が起きていない。**
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    // **human recovery の audit も書かれていない。**
+    expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
   })
 
   it('**Human Recovery 自体は後段 Approval の証拠にならない。** ApprovalRequest を作らない', () => {

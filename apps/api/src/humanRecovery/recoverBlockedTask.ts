@@ -98,13 +98,15 @@ import {
  * **3. 却下済み spec の履歴を消さない。** #255 の `isMateriallyDifferentSpec()` が参照する
  * 却下履歴は `audit_log` の `remediate:<taskId>` 行にあり、この関数は読みも書きもしない。
  *
- * **4. ただし laundering をここで塞ぐことはできない（独立レビュー round 2）。**
- * `pending` へ戻すと採用のやり直しが可能になり、その経路には `isMateriallyDifferentSpec()`
- * 相当の検査が無いため、同じ spec を何度でも再審査させられる。**これは master に既に在る穴**で
- * （`pending` な採用済み Task すべてに当てはまる）、本変更が作ったものではない。
- * 一度ここへ「同一 hash では1回だけ」を入れたが、訂正には `pending` が要り、`pending` には
- * この関数が要るため **deadlock になった**ので撤回した。正しい修正箇所は採用側であり、
- * 別 Finding（`adoption-path-has-no-material-difference-check`）として登録した。
+ * **4. laundering は採用側で塞いである。ここではない。**
+ * `pending` へ戻すと採用のやり直しが可能になるが、`adoptRoadmapItem()` が
+ * 「却下済みのどれとも review-visible に違うこと」を **Design Review を起こす前に**要求する
+ * （`SPEC_NOT_MATERIALLY_DIFFERENT`）。再投入しても同じ spec は再審査できない。
+ *
+ * **guard をここへ置いてはならない。** 一度「同一 `designTextHash` では1回だけ」を実装したが、
+ * design text は description + allowedPaths 由来なので**訂正しなければ hash が変わらず**、
+ * 訂正には `pending`（= この関数）が要るため **deadlock になった**ので撤回した
+ * （独立レビュー round 2）。再審査を起こしているのは採用経路であり、塞ぐ場所もそこである。
  *
  * ## 生涯上限を**置いてはならない**理由（実測・2026-09-18）
  *
