@@ -222,6 +222,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
+- **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**

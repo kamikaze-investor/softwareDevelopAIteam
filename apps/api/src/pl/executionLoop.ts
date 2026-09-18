@@ -28,6 +28,21 @@
  * 同じ対象に対する PL の試行回数は `audit_log` から数えて `PL_MAX_ATTEMPTS_PER_TARGET` で
  * 打ち切る。打ち切った先は CEO Escalation であり、再試行ではない。個々の操作の retry 上限
  * （`DESIGN_REVIEW_MAX_ATTEMPTS` 等）は既存機構が持っており、ここでは緩めない。
+ *
+ * ## Blocked Resolution Triage（Diagnose の前段）
+ *
+ * Diagnose の手前に `triageBlocked()`（`./blockedTriage`）を置く。**新しい workflow engine では
+ * なく、既存 Observe → Diagnose の間に入る純粋関数1つ**である。役割は次の2点だけ:
+ *
+ * 1. 機械的事実（Job / guardResult / Design Review run / approval / audit）から原因を分類し、
+ *    4つのレーン（auto_recovery / independent_remediation / maintenance_lane / ceo_escalation）
+ *    のどれへ渡すかを**提案**する
+ * 2. その提案で **PL に提案させてよい action を絞る**（`triageAllowedActions()`）
+ *
+ * **Triage は permission を作らない。** 絞り込みは必ず既存候補との積であり、
+ * 可否は従来どおり `authorizePlAction()` だけが決める。auto_recovery 以外のレーンは
+ * provider 診断を回さずに CEO Escalation（または Remediation seam）へ直行する —— 実行できる
+ * action が `escalate_to_ceo` しか無い対象に診断を走らせても、モデル枠を焼くだけだからである。
  */
 
 import {
@@ -37,8 +52,19 @@ import {
   type CoordinatorDeps,
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
-import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
 import { requestText } from '../aiExplain/cheapAiClient'
+import {
+  buildTriageEscalationBody,
+  formatTriageAuditDetail,
+  needsProviderDiagnosis,
+  protectedViolations,
+  readLatestDesignReview,
+  triageAllowedActions,
+  triageBlocked,
+  type BlockedDiagnosis,
+  type BlockedLane,
+  type BlockedRootCauseClass,
+} from './blockedTriage'
 import {
   buildSystemState,
   DEFAULT_STALL_HINT_MS,
@@ -66,6 +92,9 @@ export const PL_MAX_ATTEMPTS_PER_TARGET = 2
 
 /** 診断に使える時間。既存 cheap client の timeout と同じ桁に収める。 */
 export const PL_DIAGNOSIS_MAX_TOKENS = 700
+
+/** CEO 報告に載せる「AI が試したこと」の行数上限。通知へ長大な payload を流さない。 */
+const PL_ESCALATION_HISTORY_LINES = 5
 
 /** 採用提案は scope と受入条件を書くぶん少し長い。 */
 export const PL_ADOPTION_MAX_TOKENS = 900
@@ -187,6 +216,60 @@ export interface PlTickResult {
   /** 人間向けの短い理由。 */
   reason?: string
   attempt?: number
+  /**
+   * Blocked Resolution Triage の判定。**実行可否ではなく分類の記録**である。
+   * ここに `auto_recovery` が出ていても、実行できたかどうかは `status` が表す。
+   */
+  triage?: {
+    lane: BlockedLane
+    rootCauseClass: BlockedRootCauseClass
+    confidence: 'high' | 'low'
+  }
+}
+
+/**
+ * Independent Remediation への引き渡し要求。**Triage は remediation を実装しない。**
+ *
+ * これは**データ形だけの接続点**である。ここには executor も dispatch 経路も無い。
+ * 実際に remediation を起動する経路を足すときは、それ自体が
+ * `authorizePlAction()`（Mandatory Gate）を通る操作でなければならない。
+ *
+ * 一度 `dispatchRemediation` という注入可能な callback を置いたが、独立レビュー（2026-09-18）で
+ * **Gate を通らない状態変更経路になる**と指摘されて外した。「本体が未実装だから素通しでよい」は
+ * 成立しない —— 無 Gate の受け口を先に用意すると、配線した瞬間に Gate の外側で動く。
+ *
+ * 渡すのは「何が・なぜ止まったか」という観測事実だけで、`implementationScope` や
+ * `allowedPaths` の書き換え案は**含めない**。訂正内容を決めるのは Remediation 側の責務であり、
+ * 訂正後の設計は**改めて fresh Design Review と既存 Gate を通る**。
+ */
+export interface RemediationRequest {
+  projectId: string
+  taskId?: string
+  jobId?: string
+  rootCauseClass: BlockedRootCauseClass
+  /** 機械的事実だけ。PL の推測は載せない。 */
+  evidence: BlockedDiagnosis['evidence']
+  summary: string
+}
+
+/**
+ * 引き渡し要求を観測事実だけから組み立てる。**副作用を持たない純粋関数である。**
+ *
+ * Independent Remediation が入ったとき「こちらが渡す内容」をこの1関数に固定しておくための形で、
+ * 入力は attention と診断だけにしてある（呼び出し側が scope の書き換え案を混ぜられない）。
+ */
+export function buildRemediationRequest(
+  item: AttentionItem,
+  diagnosis: BlockedDiagnosis,
+): RemediationRequest {
+  return {
+    projectId: item.projectId,
+    ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
+    ...(item.jobId !== undefined ? { jobId: item.jobId } : {}),
+    rootCauseClass: diagnosis.rootCauseClass,
+    evidence: diagnosis.evidence,
+    summary: diagnosis.summary,
+  }
 }
 
 export interface PlDiagnosisInput {
@@ -277,39 +360,57 @@ function hasStalledLongEnough(item: AttentionItem): boolean {
 }
 
 /**
- * 通知だけで終える attention に添える理由。
+ * なぜいま AI 側で解決できないのか。**Triage のレーンから導く。**
  *
- * `task_ready_without_job` は「Job が作られない」という**結果**しか持たない。原因はたいてい
- * Design Review の判定であり、それを添えないと CEO は何を判断すればよいか分からない。
- * 判定は**システムが記録した実レコード**から引く（PL の推測は載せない）。
+ * 「Blocked です」だけでは CEO は何を判断すればよいか分からない。ここが埋めるのは
+ * 構造化報告の「なぜ自己解決できないか」の欄で、**未実装のレーンはそう書く**
+ * （「できるはずなのにやらなかった」と読まれないようにする）。
  */
-function notifyOnlyReason(storage: IStorage, item: AttentionItem): string {
-  if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) {
-    return 'CEO の判断待ちで進行が止まっています。'
+function selfResolutionBlockedReason(diagnosis: BlockedDiagnosis): string {
+  switch (diagnosis.recommendedLane) {
+    case 'auto_recovery':
+      return 'PL は既存の bounded recovery を試しましたが、状態が正常化しませんでした。'
+    case 'independent_remediation':
+      return (
+        '設計・scope の訂正が必要ですが、Independent Remediation はまだ配線されていないため '
+        + 'PL 側に進められる正式な経路がありません。CONFLICT を出した当人へ差し戻すことは '
+        + '禁じられています（Review 判定を迂回する圧力が残るため）。'
+      )
+    case 'maintenance_lane':
+      return (
+        'protected 領域への変更が必要ですが、Maintenance Lane v0（Tier B）はまだ実装されていないため '
+        + 'PL 側に実行経路がありません。PL は自分の権限を広げず、Guard も迂回しません。'
+      )
+    case 'ceo_escalation':
+      return diagnosis.confidence === 'low'
+        ? '原因を機械的事実から特定できませんでした。証拠不足のまま状態を変える操作は行いません。'
+        : 'この分類は既存 Policy 上 CEO の判断を要するもので、PL には降格させる権限がありません。'
   }
+}
 
-  // 終端した run も返す既存の導出を使う（`findActiveByTaskId()` では failed / succeeded が見えない）。
-  const latest = storage.designReviewRuns.findLatestByTaskId(item.taskId)
-  if (!latest?.resultJson) {
-    return '採用した Task に実装 Job が作られないまま止まっています。'
-  }
+/**
+ * この対象に対して PL がこれまでに実際にやったこと。**audit の実記録から作る。**
+ *
+ * CEO 報告の「AI が試したこと」の欄に入る。推測は載せない。新しい順で返る `findByEntity()` を
+ * 古い順に直し、直近の数件だけを載せる。
+ *
+ * **自由文の尾は通知へ流さない。** audit の detail には `diagnosis_failed` の provider
+ * エラー本文のような外部由来の文字列が入りうる（独立レビュー指摘・2026-09-18）。
+ * ここで取り出すのは自分たちが書いた構造化欄（`lane=` / `cause=` / `kind=`）だけにして、
+ * 残りは落とす。CEO が判断に使うのはこの3つで足り、原文は audit に残っている。
+ */
+const STRUCTURED_AUDIT_FIELDS = /\b(?:lane|cause|layer|conf|kind|adoption|code)=[^\s]+/g
 
-  let decision: unknown
-  let summary: unknown
-  try {
-    const parsed = JSON.parse(latest.resultJson) as Record<string, unknown>
-    decision = parsed.finalDecision
-    summary = (parsed.integrationReviewResult as Record<string, unknown> | undefined)?.summary
-  } catch {
-    return '採用した Task に実装 Job が作られないまま止まっています（Design Review の結果を読めませんでした）。'
-  }
-
-  return [
-    '採用した Task に実装 Job が作られないまま止まっています。',
-    `直近の Design Review の判定: ${String(decision ?? 'unknown')}`,
-    summary ? `理由: ${String(summary)}` : undefined,
-    'この判定は Binding Review です。PL は妥当性を評価できますが、BLOCK を覆せません。',
-  ].filter((line) => line !== undefined).join('\n')
+function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
+  return storage.auditLog
+    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+    .filter((entry) => ATTEMPT_RESULTS.includes(entry.result))
+    .slice(0, PL_ESCALATION_HISTORY_LINES)
+    .reverse()
+    .map((entry) => {
+      const fields = (entry.detail ?? '').match(STRUCTURED_AUDIT_FIELDS) ?? []
+      return `${entry.createdAt} ${entry.result}${fields.length > 0 ? ` (${fields.join(' ')})` : ''}`
+    })
 }
 
 function selectTarget(attention: readonly AttentionItem[]): AttentionItem | undefined {
@@ -438,12 +539,22 @@ function recordAdoptionNotification(
   })
 }
 
+/**
+ * 1 tick の結果を既存 `audit_log` へ残す。**新しい表は作らない。**
+ *
+ * `diagnosis` を渡すと `lane=` / `cause=` / `layer=` / `conf=` が detail の**先頭**に付く。
+ * これが `summarizeBlockedTriage()` の唯一の入力であり、後ろの散文とは役割が違う
+ * （散文は人が読むためのもので、集計では読まない）。
+ */
 function record(
   storage: IStorage,
   targetKey: string,
   result: PlTickStatus,
   detail: string,
+  diagnosis?: BlockedDiagnosis,
 ): void {
+  const prefixed =
+    diagnosis !== undefined ? `${formatTriageAuditDetail(diagnosis)} ${detail}` : detail
   storage.auditLog.record({
     actor: 'api',
     operation: AUDIT_OPERATION,
@@ -451,7 +562,7 @@ function record(
     entityId: targetKey,
     result,
     // 秘密情報・長大な payload を載せない。診断本文はここへ入れない。
-    detail: detail.slice(0, 500),
+    detail: prefixed.slice(0, 500),
   })
 }
 
@@ -508,22 +619,6 @@ function collectSystemEvidence(
   return evidence
 }
 
-/**
- * 違反ファイルのうち、**allowedPaths を直しても絶対に書けない**もの。
- *
- * 2026-09-16 production 実測: PL は `fileChangeGuard.ts` を変更しようとして止まった Job を
- * 「mismatched allowed paths … this configuration issue」と診断した。**正しく Escalate したが
- * 分類を外した** — allowedPaths を広げれば通る、と読める表現になっている。実際には
- * `ALWAYS_FORBIDDEN_PATTERNS` に載っているため**どんな allowedPaths でも通らない**。
- *
- * 判定は Guard 本体の export をそのまま使う。**一覧を複製しない**（複製すると必ずずれる）。
- */
-function protectedViolations(fileViolations: readonly string[] | undefined): string[] {
-  return (fileViolations ?? []).filter(
-    (file: string) => ALWAYS_FORBIDDEN_PATTERNS.some((pattern) => pattern.test(file)),
-  )
-}
-
 /** 止まっている Job の「なぜ止まったか」。PL はこれを読んで判断する。 */
 function describeStuckJob(storage: IStorage, jobId: string): unknown {
   const job = storage.jobs.findById(jobId)
@@ -572,7 +667,7 @@ function tailText(value: string | undefined, max: number): string | undefined {
  * 載せるのは「PL に考えさせる選択肢」であり、Gate に落ちれば実行されない。
  * 一覧に無い値を PL が出した場合は Policy が未知値として forbidden にする。
  */
-function allowedActionsFor(kind: AttentionItem['kind']): readonly string[] {
+export function allowedActionsFor(kind: AttentionItem['kind']): readonly string[] {
   switch (kind) {
     case 'design_review_idle':
     case 'design_review_failed':
@@ -637,12 +732,23 @@ function resolvePlActionTarget(kind: string, item: AttentionItem): PlActionTarge
 }
 
 /** 対象の周辺状態だけを抜く。全 Project の状態を PL へ丸ごと渡さない（Context 重視）。 */
-function buildContext(storage: IStorage, state: SystemStateSnapshot, item: AttentionItem): unknown {
+function buildContext(
+  storage: IStorage,
+  state: SystemStateSnapshot,
+  item: AttentionItem,
+  diagnosis: BlockedDiagnosis,
+): unknown {
   const project = state.projects.find((p) => p.id === item.projectId)
   return {
+    // **機械的事実から作った分類**。PL の判断材料であって、PL が書き換えられる値ではない
+    // （提案として戻ってきても routing には使わない。lane を決めるのは `triageBlocked()` である）。
+    triage: diagnosis,
     // blocked / failed は「なぜ止まったか」を読まないと判断できない。該当時だけ載せる。
     ...(item.jobId !== undefined ? { blockedJob: describeStuckJob(storage, item.jobId) } : {}),
     ...(item.taskId !== undefined ? { latestApproval: describeLatestApproval(storage, item.taskId) } : {}),
+    ...(item.taskId !== undefined
+      ? { latestDesignReview: readLatestDesignReview(storage, item.taskId) }
+      : {}),
     generatedAt: state.generatedAt,
     attention: item,
     project: project
@@ -878,23 +984,51 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       ...(item.taskId !== undefined ? { taskId: item.taskId } : {}),
       ...(item.jobId !== undefined ? { jobId: item.jobId } : {}),
     }
+    // ── Triage（Diagnose の前段。機械的事実だけで原因とレーンを決める）──────────
+    // ここは **PL の自由文を一切受け取らない**。入力は attention と storage の実レコードだけで、
+    // 出力は「推奨レーン」であって permission ではない。
+    const diagnosis = triageBlocked(storage, item)
+    const triage = {
+      lane: diagnosis.recommendedLane,
+      rootCauseClass: diagnosis.rootCauseClass,
+      confidence: diagnosis.confidence,
+    }
+
     // ── 人へ伝えるだけの attention は、診断も Gate も経ずに1回通知して終わる ──────
     // `escalate_to_ceo` 相当の行為であり Gate を要しない（Policy 上も無 Gate）。
     // 既に通知済みの対象は選択段階で外れているので、ここへは来ない。
+    // **本文だけを Triage 由来の構造化報告へ差し替えた。** 判定経路は従来どおりである。
     if (NOTIFY_ONLY_ATTENTION_KINDS.includes(item.kind)) {
-      await escalateTo(storage, deps, key, item, notifyOnlyReason(storage, item))
-      return { status: 'escalated', target, reason: 'human decision required', attempt: 1 }
+      const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
+      return { status: handled.status, target, triage, reason: handled.reason, attempt: 1 }
     }
 
     const attempt = countPriorAttempts(storage, key) + 1
 
     // ── 試行上限。ここを超えたら再試行ではなく Escalation ──────────
+    // **同じ blocker に対する retry → fail → retry を止める唯一の境界**であり、
+    // Triage が `auto_recovery` と言っていても超えたら実行しない（新しい閾値は作らない）。
     if (attempt > PL_MAX_ATTEMPTS_PER_TARGET) {
       if (hasEscalated(storage, key)) {
-        return { status: 'idle', target, reason: 'already escalated; not repeating', attempt }
+        return { status: 'idle', target, triage, reason: 'already escalated; not repeating', attempt }
       }
-      await escalateTo(storage, deps, key, item, `PL は ${PL_MAX_ATTEMPTS_PER_TARGET} 回試しましたが解消しませんでした。`)
-      return { status: 'escalated', target, reason: 'attempt budget exhausted', attempt }
+      await escalateTo(
+        storage,
+        deps,
+        key,
+        item,
+        `PL は ${PL_MAX_ATTEMPTS_PER_TARGET} 回試しましたが解消しませんでした。`,
+        { triage: diagnosis },
+      )
+      return { status: 'escalated', target, triage, reason: 'attempt budget exhausted', attempt }
+    }
+
+    // ── Decide lane（auto_recovery 以外は provider 診断を回さず所定のレーンへ渡す）──────
+    // `triageAllowedActions()` は**必ず既存候補との積**なので、ここで権限が増えることはない。
+    const allowedActions = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
+    if (!needsProviderDiagnosis(allowedActions)) {
+      const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
+      return { status: handled.status, target, triage, reason: handled.reason, attempt }
     }
 
     // ── Diagnose ─────────────────────────────────────────────
@@ -903,22 +1037,30 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     try {
       raw = await diagnose({
         attention: item,
-        context: buildContext(storage, before, item),
-        allowedActionKinds: allowedActionsFor(item.kind),
+        context: buildContext(storage, before, item, diagnosis),
+        // **Triage で絞った候補だけを見せる。** 元の候補集合との積なので増えることはない。
+        allowedActionKinds: allowedActions,
       })
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
-      record(storage, key, 'diagnosis_failed', message)
-      return { status: 'diagnosis_failed', target, reason: message, attempt }
+      record(storage, key, 'diagnosis_failed', message, diagnosis)
+      return { status: 'diagnosis_failed', target, triage, reason: message, attempt }
     }
 
     // ── Decide（PL の自然言語を実行コマンドとして信用しない）──────────
     const proposal = extractProposedKind(raw)
     if (proposal.kind === undefined) {
-      record(storage, key, 'diagnosis_unusable', 'diagnosis did not contain a structured actionKind')
+      record(
+        storage,
+        key,
+        'diagnosis_unusable',
+        'diagnosis did not contain a structured actionKind',
+        diagnosis,
+      )
       return {
         status: 'diagnosis_unusable',
         target,
+        triage,
         reason: 'diagnosis did not contain a structured actionKind',
         attempt,
       }
@@ -928,8 +1070,23 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     const plActionTarget = resolvePlActionTarget(proposal.kind, item)
     if (plActionTarget === undefined) {
       const reason = `action ${proposal.kind} cannot be addressed at this attention item's scope`
-      record(storage, key, 'blocked', `kind=${proposal.kind} ${reason}`)
-      return { status: 'blocked', target, proposedKind: proposal.kind, reason, attempt }
+      record(storage, key, 'blocked', `kind=${proposal.kind} ${reason}`, diagnosis)
+      return { status: 'blocked', target, triage, proposedKind: proposal.kind, reason, attempt }
+    }
+
+    // **絞り込んだ候補の外を提案してきたら実行しない。**
+    //
+    // これが無いと `triageAllowedActions()` は prompt 上の助言でしかなくなる。証拠不足
+    // （`confidence: 'low'`）のときに PL が `resume_task` を出し、たまたま ALIGNED evidence が
+    // あれば Gate を通ってしまう —— つまり**「よく分からないけど復旧してみる」が成立する**。
+    // ここで止めるのは Gate の代わりではなく、Gate の**手前で範囲を狭める**ためである
+    // （狭める方向にしか働かず、Gate を1つも緩めない）。
+    if (!allowedActions.includes(proposal.kind)) {
+      const reason =
+        `action ${proposal.kind} is outside the actions this triage allows `
+        + `(${allowedActions.join(', ')})`
+      record(storage, key, 'blocked', `kind=${proposal.kind} ${reason}`, diagnosis)
+      return { status: 'blocked', target, triage, proposedKind: proposal.kind, reason, attempt }
     }
 
     try {
@@ -947,10 +1104,11 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       })
     } catch (error: unknown) {
       if (error instanceof PlActionBlockedError) {
-        record(storage, key, 'blocked', `kind=${proposal.kind} ${error.message}`)
+        record(storage, key, 'blocked', `kind=${proposal.kind} ${error.message}`, diagnosis)
         return {
           status: 'blocked',
           target,
+          triage,
           proposedKind: proposal.kind,
           reason: error.message,
           attempt,
@@ -962,10 +1120,24 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     // ── Execute（既存の正式操作だけ）──────────────────────────────
     if (proposal.kind === 'escalate_to_ceo') {
       if (hasEscalated(storage, key)) {
-        return { status: 'idle', target, proposedKind: proposal.kind, reason: 'already escalated', attempt }
+        return {
+          status: 'idle',
+          target,
+          triage,
+          proposedKind: proposal.kind,
+          reason: 'already escalated',
+          attempt,
+        }
       }
-      await escalateTo(storage, deps, key, item, proposal.rationale ?? 'PL が CEO 判断を求めています。')
-      return { status: 'escalated', target, proposedKind: proposal.kind, attempt }
+      await escalateTo(
+        storage,
+        deps,
+        key,
+        item,
+        proposal.rationale ?? 'PL が CEO 判断を求めています。',
+        { triage: diagnosis },
+      )
+      return { status: 'escalated', target, triage, proposedKind: proposal.kind, attempt }
     }
 
     const execution = await executeAction(storage, proposal.kind, item, {
@@ -988,6 +1160,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       key,
       'acted',
       `kind=${proposal.kind} exec_ok=${execution.ok} verify=${verification} ${execution.summary}`,
+      diagnosis,
     )
 
     // ── Continue / Escalate ────────────────────────────────────
@@ -1005,10 +1178,12 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
         key,
         item,
         `PL は ${proposal.kind} を実行しましたが状態は ${verification} でした（${execution.summary}）。`,
+        { triage: diagnosis },
       )
       return {
         status: 'escalated',
         target,
+        triage,
         proposedKind: proposal.kind,
         executionSummary: execution.summary,
         verification,
@@ -1019,6 +1194,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     return {
       status: 'acted',
       target,
+      triage,
       proposedKind: proposal.kind,
       executionSummary: execution.summary,
       verification,
@@ -1148,20 +1324,65 @@ async function escalateTo(
      * Mobile からも現在進行形の失敗として見え続ける。
      */
     notify?: boolean
+    /**
+     * Blocked Resolution Triage の判定。渡すと本文が構造化報告（何が止まったか / 原因 /
+     * 証拠 / AI が試したこと / なぜ自己解決できないか / 必要な CEO 判断 / 安全な選択肢）になり、
+     * audit の detail に `lane=` / `cause=` が載る。
+     *
+     * 採用エスカレーション（`maybeAdoptNext()`）は attention をその場で組み立てているため
+     * Triage の対象ではなく、ここを渡さない。その場合は従来の本文のままである。
+     */
+    triage?: BlockedDiagnosis
   } = {},
 ): Promise<void> {
   if (options.notify !== false) {
     const escalate = deps.escalate ?? defaultEscalate
-    const body = [
-      `何が起きているか: ${item.detail}`,
-      `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
-      `PL の判断: ${reason}`,
-      'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
-    ].join('\n')
+    const body =
+      options.triage !== undefined
+        ? buildTriageEscalationBody({
+          diagnosis: options.triage,
+          item,
+          attemptHistory: attemptHistoryFor(storage, key),
+          blockedReason: reason,
+        })
+        : [
+          `何が起きているか: ${item.detail}`,
+          `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
+          `PL の判断: ${reason}`,
+          'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
+        ].join('\n')
 
     await escalate({ title: `[PL] ${options.subject ?? item.kind} が解消していません`, body })
   }
-  record(storage, key, 'escalated', reason)
+  record(storage, key, 'escalated', reason, options.triage)
+}
+
+/**
+ * Triage が選んだレーンへ渡す。
+ *
+ * **今日、auto_recovery 以外の3レーンはすべて CEO Escalation で終端する。**
+ * Independent Remediation も Maintenance Lane v0（Tier B）も本体が未実装であり、
+ * **ここで代わりに実装しない**（どちらも別項目の責務である）。違うのは記録される lane と
+ * CEO へ出る本文だけで、この性質のおかげでレーン分類を誤っても CEO を迂回できない。
+ *
+ * 受け口を無 Gate の callback として先に用意することは**しない**。Gate を通らない
+ * 状態変更経路になるためで、実際に接続するときはその操作自体が `authorizePlAction()` を
+ * 通らなければならない（独立レビュー指摘・2026-09-18）。
+ */
+async function handOffOrEscalate(
+  storage: IStorage,
+  deps: PlLoopDeps,
+  key: string,
+  item: AttentionItem,
+  diagnosis: BlockedDiagnosis,
+): Promise<{ status: PlTickStatus; reason: string }> {
+  if (hasEscalated(storage, key)) {
+    return { status: 'idle', reason: 'already escalated; not repeating' }
+  }
+  await escalateTo(storage, deps, key, item, selfResolutionBlockedReason(diagnosis), {
+    triage: diagnosis,
+  })
+  return { status: 'escalated', reason: `routed to ${diagnosis.recommendedLane}` }
 }
 
 /** テスト用。モジュールスコープの単一実行ガードを戻す。 */

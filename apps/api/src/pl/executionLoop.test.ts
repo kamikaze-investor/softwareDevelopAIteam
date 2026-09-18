@@ -288,7 +288,12 @@ describe('runPlTick — Execute / Verify', () => {
     expect(taskId).not.toBe(otherTask.id)
   })
 
-  it('attempt を使い切った run は盲目的に再kickせず、実行しない', async () => {
+  it('attempt を使い切った run は盲目的に再kickせず、CEO へ上げる', async () => {
+    // Blocked Resolution Triage 導入前は「PL が rekick を提案 → `executeAction()` が
+    // `already used 3/3 attempts` で拒否」という経路だった。いまは Triage が
+    // `design_review_exhausted` を機械的に判定するため、**provider 診断を1回も回さずに**
+    // Escalation へ倒れる。守っている性質（使い切った run を再kickしない）は同じで、
+    // 到達がより早く、理由が構造化されている。`executeAction()` 側の拒否は多層防御として残る。
     const { storage, runId } = seedIdleDesignReview()
     // 3 attempt すべて消費した状態にする
     for (let i = 0; i < 3; i += 1) {
@@ -296,14 +301,25 @@ describe('runPlTick — Execute / Verify', () => {
       if (claim.claimToken) storage.designReviewRuns.requeue(runId, claim.claimToken, 'timeout')
     }
     let rekicked = 0
+    let diagnosed = 0
+    const escalations: string[] = []
 
     const result = await runPlTick(
       storage,
-      deps({ rekickDesignReview: async () => { rekicked += 1; return { status: 'evidence_registered' } } }),
+      deps({
+        diagnose: async () => { diagnosed += 1; return '{}' },
+        rekickDesignReview: async () => { rekicked += 1; return { status: 'evidence_registered' } },
+        escalate: async (p) => { escalations.push(p.body) },
+      }),
     )
 
     expect(rekicked).toBe(0)
-    expect(result.executionSummary).toContain('attempts')
+    expect(diagnosed).toBe(0)
+    expect(result.status).toBe('escalated')
+    expect(result.triage?.rootCauseClass).toBe('design_review_exhausted')
+    expect(result.triage?.lane).toBe('ceo_escalation')
+    // 「使い切った」という事実そのものが CEO の本文に載る
+    expect(escalations[0]).toContain('3/3')
   })
 })
 
@@ -1050,10 +1066,13 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(seen?.allowedActionKinds).toContain('escalate_to_ceo')
   })
 
-  it('protected file の違反は allowedPaths の問題と区別して診断へ渡す', async () => {
+  it('protected file の違反は allowedPaths の問題と区別し、PL の診断に委ねず CEO へ倒す', async () => {
     // 2026-09-16 production 実測: PL は fileChangeGuard.ts を触ろうとして止まった Job を
     // 「mismatched allowed paths … configuration issue」と診断した。**正しく Escalate したが
     // 分類を外した** — allowedPaths を広げれば通る、と読める。実際には絶対に通らない。
+    //
+    // Blocked Resolution Triage 導入後は、この分類を **provider の自由文に委ねない**。
+    // `ALWAYS_FORBIDDEN_PATTERNS` に載っているという機械的事実だけで決まる。
     const { storage, taskId, projectId } = seed()
     const job = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
@@ -1067,24 +1086,28 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       },
     } as Parameters<IStorage['jobs']['update']>[1])
     storage.tasks.update(taskId, { status: 'blocked' })
-    let seen: PlDiagnosisInput | undefined
+    let diagnosed = 0
+    const escalations: string[] = []
 
-    await runPlTick(storage, deps({
-      diagnose: async (input) => {
-        seen = input
-        return JSON.stringify({ actionKind: 'observe_state', rationale: 'wait', riskLevel: 'LOW' })
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => {
+        diagnosed += 1
+        return JSON.stringify({ actionKind: 'retry_job', rationale: 'just a config issue', riskLevel: 'LOW' })
       },
+      escalate: async (p) => { escalations.push(p.body) },
     }))
 
-    const ctx = JSON.stringify(seen?.context)
-    // 恒久的に書けないものだけが挙がる。scope の問題（docs/notes.md）と混ぜない
-    expect(ctx).toContain('protectedViolations')
-    expect(ctx).toContain('apps/worker/src/guards/fileChangeGuard.ts')
-    const parsed = JSON.parse(ctx) as { blockedJob?: { protectedViolations?: string[] } }
-    expect(parsed.blockedJob?.protectedViolations).toEqual(['apps/worker/src/guards/fileChangeGuard.ts'])
+    // provider 診断は回さない（結論が escalate しかない対象にモデル枠を使わない）
+    expect(diagnosed).toBe(0)
+    expect(result.status).toBe('escalated')
+    expect(result.triage?.rootCauseClass).toBe('safety_or_authority_boundary')
+    expect(result.triage?.lane).toBe('ceo_escalation')
+    // 恒久的に書けないものが名指しされる。scope の問題（docs/notes.md）と混ぜない
+    expect(escalations[0]).toContain('apps/worker/src/guards/fileChangeGuard.ts')
+    expect(escalations[0]).toContain('どんな allowedPaths でも通らない')
   })
 
-  it('scope だけの違反なら protectedViolations は空（誤って protected 扱いしない）', async () => {
+  it('scope だけの違反は protected 扱いせず、Independent Remediation へ回す', async () => {
     const { storage, taskId, projectId } = seed()
     const job = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
@@ -1094,17 +1117,12 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       guardResult: { permissionAllowed: true, fileChangeAllowed: false, fileViolations: ['docs/a.md'] },
     } as Parameters<IStorage['jobs']['update']>[1])
     storage.tasks.update(taskId, { status: 'blocked' })
-    let seen: PlDiagnosisInput | undefined
 
-    await runPlTick(storage, deps({
-      diagnose: async (input) => {
-        seen = input
-        return JSON.stringify({ actionKind: 'observe_state', rationale: 'wait', riskLevel: 'LOW' })
-      },
-    }))
+    const result = await runPlTick(storage, deps())
 
-    const parsed = JSON.parse(JSON.stringify(seen?.context)) as { blockedJob?: { protectedViolations?: string[] } }
-    expect(parsed.blockedJob?.protectedViolations).toEqual([])
+    // protected ではないので Safety / Authority 扱いしない
+    expect(result.triage?.rootCauseClass).toBe('allowed_paths_mismatch')
+    expect(result.triage?.lane).toBe('independent_remediation')
   })
 
   it('診断 prompt が「protected は allowedPaths では解決しない」と明示する', () => {
