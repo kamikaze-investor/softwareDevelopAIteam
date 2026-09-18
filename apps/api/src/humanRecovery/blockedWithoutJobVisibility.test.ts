@@ -169,6 +169,11 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
     expect(sent[0].body).toContain('/recover')
     // 「証拠不足」で終わらせない。
     expect(sent[0].body).not.toContain('原因を機械的事実から特定できませんでした')
+    // **分類と本文・証拠が同じ値を指すこと。** 分類だけ再計算して本文へ生値を出すと、
+    // この形では「Design Review は undefined」と書かれた報告になる（round 4 指摘）。
+    expect(sent[0].body).toContain('Design Review は CONFLICT')
+    expect(sent[0].body).not.toContain('undefined')
+    expect(sent[0].body).not.toContain('finalDecision = unknown')
   })
 
   it('**再投入して再び同じ状態に落ちたら、もう一度通知する**', async () => {

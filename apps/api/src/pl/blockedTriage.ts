@@ -541,8 +541,12 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     //
     // よって `findRemediationSubject()` と**同一の** `recomputeDecision()` を通す。
     // 2つの経路が同じ入力を違う判定にすることが無くなる。
-    const reviewIsConflict = stalled?.status === 'succeeded'
-      && recomputedDecisionOf(storage, item.taskId) === 'CONFLICT'
+    // **判定は1度だけ再計算し、分類・証拠・本文の全部で同じ値を使う。**
+    // 分類を再計算値で行いながら本文へ生値を出すと、#255 形では
+    // 「Design Review は undefined」と書かれた high-confidence な CONFLICT 報告になる
+    // （独立レビュー round 4 指摘）。
+    const recomputed = recomputedDecisionOf(storage, item.taskId)
+    const reviewIsConflict = stalled?.status === 'succeeded' && recomputed === 'CONFLICT'
 
     return {
       ...result,
@@ -557,7 +561,8 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           ? [{
             fact: 'design_review_run.finalDecision',
             id: stalled.runId,
-            value: `${stalled.decision ?? 'unknown'} (status=${stalled.status})`,
+            // 生値ではなく再計算値。分類と食い違う証拠を CEO へ出さない。
+            value: `${recomputed ?? stalled.decision ?? 'unknown'} (status=${stalled.status})`,
           }]
           : []),
       ],
@@ -570,7 +575,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
         + '構造的にどれも到達できない（Independent Remediation は pending を、'
         + 'resume は既存 Job を要求する）。'
         + (reviewIsConflict
-          ? `直近の task-kind Design Review は ${stalled?.decision} で、evidence が登録されていない。`
+          ? `直近の task-kind Design Review は ${recomputed} で、evidence が登録されていない。`
           : '')
         + ' CEO が Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻すか、'
         + '訂正した implementationScope / allowedPaths で採用し直す必要がある。',
