@@ -689,6 +689,36 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       expect(escalations).toHaveLength(2)
     })
 
+    // 同じ status でも原因が違えば別の障害である。ここを status だけで判定すると、
+    // 「提案を組み立てられない」で1通出したあと「提示していない id を選んだ」が
+    // **既報として黙殺される**（独立レビュー指摘。成功が一度も無い Project で顕著）。
+    it('同じ status でも下位分類が違えば通知する', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      let mode: 'unparsable' | 'unoffered' = 'unparsable'
+      const d = deps({
+        readLedger: () => LEDGER,
+        proposeAdoption: async () => (mode === 'unparsable'
+          ? 'これは JSON ではない'
+          : JSON.stringify({
+            roadmapId: 'not-offered-at-all',
+            implementationScope: 'x',
+            allowedPaths: ['apps/api/src/ctoAi'],
+            acceptanceCriteria: ['y'],
+          })),
+        escalate: async (p) => { escalations.push(p.title) },
+      })
+
+      await runOneEscalationCycle(storage, d)
+      expect(escalations).toHaveLength(1)
+
+      // どちらも status は proposal_unusable だが、原因は別物。
+      mode = 'unoffered'
+      await runOneEscalationCycle(storage, d)
+
+      expect(escalations).toHaveLength(2)
+    })
+
     it('別 Project なら独立して通知される', async () => {
       const a = idleProject()
       const b = idleProject()
@@ -711,6 +741,56 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       // 実際にそういう Task があるわけではない（production 実測で0件）。
       expect(escalations[0]).not.toContain('task_ready_without_job')
       expect(escalations[0]).toContain('Roadmap adoption failure')
+    })
+
+    // 通知を止めても「いま失敗が続いている」ことは state から見えなければならない。
+    // 見えないと、running なのに currentTask も attention も無い**静かな Project**に見える。
+    it('通知を止めても、失敗が続いていることが PL state から見える', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const d = brokenAdoption(escalations)
+
+      await runOneEscalationCycle(storage, d)
+      await runOneEscalationCycle(storage, d)
+      expect(escalations).toHaveLength(1)
+
+      const projectId = storage.projects.findAll()[0]!.id
+      const state = buildSystemState(storage)
+      const project = state.projects.find((candidate) => candidate.id === projectId)
+
+      expect(project?.adoptionFailure?.escalations).toBe(2)
+      expect(project?.adoptionFailure?.failureClass).toContain('proposal_unusable')
+      expect(project?.adoptionFailure?.since).toBeDefined()
+
+      // **attention には出さない。** 出すと maybeAdoptNext() が採用を見送るため、
+      // 通知を直すために採用機能そのものを止めることになる。
+      expect(state.attention).toHaveLength(0)
+    })
+
+    it('採用に成功したら state の表示も消える', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      let broken = true
+      const d = deps({
+        readLedger: () => LEDGER,
+        proposeAdoption: async () => (broken ? 'これは JSON ではない' : PROPOSAL),
+        adopt: async (_s, input) => ({
+          ok: true as const, taskId: 'task-1', roadmapTaskKey: input.roadmapId, title: 't',
+        }),
+        escalate: async (p) => { escalations.push(p.title) },
+      })
+
+      await runOneEscalationCycle(storage, d)
+      const projectId = storage.projects.findAll()[0]!.id
+      expect(buildSystemState(storage).projects.find((p) => p.id === projectId)?.adoptionFailure)
+        .toBeDefined()
+
+      broken = false
+      resetPlLoopInFlightForTest()
+      expect((await runPlTick(storage, d)).status).toBe('acted')
+
+      expect(buildSystemState(storage).projects.find((p) => p.id === projectId)?.adoptionFailure)
+        .toBeUndefined()
     })
 
     it('診断の記録は採用サイクルの予算と候補の回転位置を動かさない', async () => {

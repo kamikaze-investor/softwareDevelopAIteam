@@ -410,8 +410,15 @@ export function adoptionFailureFingerprint(windowEntries: readonly AuditLogEntry
   const classes = new Set<string>()
   for (const entry of windowEntries) {
     if (!ATTEMPT_RESULTS.includes(entry.result)) continue
-    const status = /^adoption=([a-z_]+)/.exec(entry.detail ?? '')?.[1]
-    classes.add(status ?? entry.result)
+    const detail = entry.detail ?? ''
+    const status = /^adoption=([a-z_]+)/.exec(detail)?.[1]
+    if (status === undefined) {
+      classes.add(entry.result)
+      continue
+    }
+    // 下位分類まで含める。`status` だけだと、同じ status の別原因が既報として黙殺される。
+    const code = /\bcode=([^\s]+)/.exec(detail)?.[1]
+    classes.add(code === undefined || code === '-' ? status : `${status}/${code}`)
   }
   return [...classes].sort().join(',')
 }
@@ -1119,7 +1126,13 @@ async function maybeAdoptNext(
     return undefined
   }
 
-  record(storage, key, result.status === 'adopted' ? 'acted' : 'blocked', `adoption=${result.status} ${result.reason ?? result.roadmapId ?? ''}`)
+  // `code=` は機械判定用の構造化された下位分類で、後ろの散文とは役割が違う。
+  record(
+    storage,
+    key,
+    result.status === 'adopted' ? 'acted' : 'blocked',
+    `adoption=${result.status} code=${result.failureCode ?? '-'} ${result.reason ?? result.roadmapId ?? ''}`,
+  )
 
   return {
     status: result.status === 'adopted' ? 'acted' : 'blocked',

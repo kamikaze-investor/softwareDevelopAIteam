@@ -104,6 +104,27 @@ export interface ProjectStateSummary {
   }
   approvalsWaiting: number
   continuationsPending: number
+  /**
+   * 採用が繰り返し失敗している状態。**通知を抑えても障害自体は見えていなければならない。**
+   *
+   * CEO への LINE は incident 単位で1回だけになったので、これが無いと
+   * 「running だが currentTask も attention も無い、静かな Project」に見えてしまい、
+   * 現在進行形の失敗が Mobile から消える（独立レビュー指摘）。
+   *
+   * **attention には出さない。** `maybeAdoptNext()` は attention が1件でもあると採用を
+   * 見送るため、ここを attention にすると採用が永久に止まる（通知を直すために
+   * 機能を殺すことになる）。見せるだけの事実として Project 側に置く。
+   */
+  adoptionFailure?: {
+    /** 直近の失敗分類（`adoption=<status> code=<code>` から作った構造化された値）。 */
+    failureClass: string
+    /** 連続して失敗している escalation の回数。 */
+    escalations: number
+    /** 最初に失敗し始めた時刻。 */
+    since: string
+    /** 最後に失敗した時刻。 */
+    lastAt: string
+  }
   designReview?: {
     status: DesignReviewSnapshot['status']
     attemptCount: number
@@ -198,6 +219,45 @@ function isReadyTaskWithoutJob(task: Task, jobs: readonly Job[]): boolean {
     task.assignee === 'developer_ai' &&
     jobs.length === 0
   )
+}
+
+/**
+ * いま採用が繰り返し失敗しているか。**既存 `audit_log` から導くだけで、新しい state は持たない。**
+ *
+ * 直近の成功（`acted`）より後の escalation を数える。成功すれば消える。
+ * CEO への通知は incident 単位で1回に絞られたので、**ここが唯一の「まだ続いている」表示**になる。
+ */
+function summarizeAdoptionFailure(
+  storage: IStorage,
+  projectId: string,
+): ProjectStateSummary['adoptionFailure'] {
+  // `findByEntity()` は新しい順に返す。
+  const entries = storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)
+  const sinceLastSuccess: typeof entries = []
+  for (const entry of entries) {
+    if (entry.result === 'acted') break
+    sinceLastSuccess.push(entry)
+  }
+
+  const escalations = sinceLastSuccess.filter((entry) => entry.result === 'escalated')
+  if (escalations.length === 0) return undefined
+
+  const failures = sinceLastSuccess.filter((entry) => entry.result === 'blocked' || entry.result === 'diagnosis_failed')
+  const latest = failures[0] ?? escalations[0]
+  const detail = latest?.detail ?? ''
+  const status = /^adoption=([a-z_]+)/.exec(detail)?.[1]
+  const code = /\bcode=([^\s]+)/.exec(detail)?.[1]
+  const failureClass = status === undefined
+    ? (latest?.result ?? 'unknown')
+    : (code === undefined || code === '-' ? status : `${status}/${code}`)
+
+  const oldest = sinceLastSuccess[sinceLastSuccess.length - 1]
+  return {
+    failureClass,
+    escalations: escalations.length,
+    since: oldest?.createdAt ?? escalations[escalations.length - 1]!.createdAt,
+    lastAt: escalations[0]!.createdAt,
+  }
 }
 
 export function buildSystemState(
@@ -460,6 +520,7 @@ export function buildSystemState(
       },
       approvalsWaiting: waitingForProject,
       continuationsPending,
+      adoptionFailure: summarizeAdoptionFailure(storage, project.id),
       designReview,
     })
   }
