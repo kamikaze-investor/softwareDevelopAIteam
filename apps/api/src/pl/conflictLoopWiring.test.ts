@@ -11,6 +11,7 @@ import {
   countRemediationAttempts,
   PL_MAX_REMEDIATION_ATTEMPTS,
   recordRemediationFailure,
+  stageEntries,
 } from './remediationStep'
 import type { ConflictRoundResult } from './conflictResolutionStep'
 
@@ -297,7 +298,9 @@ describe('PL tick — CONFLICT 解決の配線', () => {
     }))
 
     expect(result.status).toBe('diagnosis_failed')
-    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+    // 例外は**落ちた stage の予算**を消費する（Critic 段階の失敗が Remediation 予算を食わない）。
+    expect(stageEntries(storage, taskId, 'critic').length).toBe(1)
+    expect(countRemediationAttempts(storage, taskId)).toBe(0)
   })
 
   it('**step が既に計上した試行を二重計上しない**（1例外で予算を使い切らせない）', async () => {

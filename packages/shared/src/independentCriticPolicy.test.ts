@@ -3,6 +3,7 @@ import {
   DISPUTE_GROUNDS,
   FINDING_ASSESSMENT_STATUSES,
   bindingDisputes,
+  challengeTarget,
   challengeableDisputes,
   disputedFindings,
   isBindingSafetySource,
@@ -150,7 +151,7 @@ describe('Review validity challenge の発火条件', () => {
     })
 
     expect(critique).toBeDefined()
-    expect(shouldChallengeFinding(critique!)).toBe(true)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(true)
     expect(disputedFindings(critique!)).toHaveLength(1)
   })
 
@@ -158,7 +159,7 @@ describe('Review validity challenge の発火条件', () => {
     for (const grounds of DISPUTE_GROUNDS) {
       const critique = disputeWith({ grounds, evidence: '具体的な裏付け' })
 
-      expect(shouldChallengeFinding(critique!)).toBe(true)
+      expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(true)
     }
   })
 
@@ -170,7 +171,7 @@ describe('Review validity challenge の発火条件', () => {
       ],
     }))
 
-    expect(shouldChallengeFinding(critique!)).toBe(false)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
   })
 
   it('**「別の考え方もある」だけでは challenge しない**（grounds 無しの dispute）', () => {
@@ -180,27 +181,27 @@ describe('Review validity challenge の発火条件', () => {
     const critique = disputeWith({ evidence: '別の考え方もあると思う' })
 
     expect(critique?.findingAssessments[0]?.status).toBe('insufficient_evidence')
-    expect(shouldChallengeFinding(critique!)).toBe(false)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
   })
 
   it('evidence の無い dispute では challenge しない', () => {
     const critique = disputeWith({ grounds: 'wrong_premise' })
 
     expect(critique?.findingAssessments[0]?.status).toBe('insufficient_evidence')
-    expect(shouldChallengeFinding(critique!)).toBe(false)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
   })
 
   it('未知の grounds 値では challenge しない', () => {
     const critique = disputeWith({ grounds: 'i_just_disagree', evidence: 'e' })
 
     expect(critique?.findingAssessments[0]?.status).toBe('insufficient_evidence')
-    expect(shouldChallengeFinding(critique!)).toBe(false)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
   })
 
   it('supported だけの Critique では challenge しない（通常の PL revision へ進む）', () => {
     const critique = parseCritique(JSON.stringify(COMPLETE))
 
-    expect(shouldChallengeFinding(critique!)).toBe(false)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
   })
 
   it('根拠の無い dispute でも Critique 全体は使える（PL への助言は残す）', () => {
@@ -232,7 +233,7 @@ describe('Binding Safety / Authority は Challenge では解除されない', ()
       const critique = disputeOn(source)
 
       expect(isBindingSafetySource(source)).toBe(true)
-      expect(shouldChallengeFinding(critique!)).toBe(false)
+      expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
       expect(bindingDisputes(critique!)).toHaveLength(1)
     }
   })
@@ -240,7 +241,7 @@ describe('Binding Safety / Authority は Challenge では解除されない', ()
   it('independent（critical の Binding Safety Review）も Challenge しない', () => {
     const critique = disputeOn('independent')
 
-    expect(shouldChallengeFinding(critique!)).toBe(false)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
     expect(bindingDisputes(critique!)).toHaveLength(1)
   })
 
@@ -249,14 +250,65 @@ describe('Binding Safety / Authority は Challenge では解除されない', ()
       const critique = disputeOn(source)
 
       expect(isBindingSafetySource(source)).toBe(false)
-      expect(shouldChallengeFinding(critique!)).toBe(true)
+      expect(shouldChallengeFinding(critique!, [source])).toBe(true)
     }
+  })
+
+  it('**元 Finding に binding が1件でもあれば Challenge しない**（再評価は spec 全体を引き直す）', () => {
+    // 再評価は disputed な Finding だけでなく **同じ design text 全体**に対して走る。
+    // よって ALIGNED が返れば、その時立っていた Binding Finding も一緒に解ける。
+    // advisory を1件 dispute するだけで Binding を再抽選できる経路を塞ぐ。
+    const critique = parseCritique(JSON.stringify({
+      ...COMPLETE,
+      findingAssessments: [{
+        source: 'scope_simplicity',
+        status: 'disputed',
+        rationale: 'r',
+        grounds: 'wrong_premise',
+        evidence: 'e',
+      }],
+    }))
+
+    // advisory だけの CONFLICT なら challenge できる。
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(true)
+    // 元 Finding に binding が混ざっていれば、Critic が触れていなくても challenge しない。
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity', 'safety_recovery'])).toBe(false)
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity', 'independent'])).toBe(false)
+  })
+
+  it('**存在しない Finding を dispute しても Challenge できない**', () => {
+    // 元 Review が挙げていない source を dispute して再評価を引けないようにする。
+    const critique = parseCritique(JSON.stringify({
+      ...COMPLETE,
+      findingAssessments: [{
+        source: 'operations',
+        status: 'disputed',
+        rationale: 'r',
+        grounds: 'wrong_premise',
+        evidence: 'e',
+      }],
+    }))
+
+    expect(shouldChallengeFinding(critique!, ['scope_simplicity'])).toBe(false)
+    expect(challengeTarget(critique!, ['scope_simplicity'])).toBeUndefined()
+  })
+
+  it('challengeTarget は実際の Finding に対応する dispute を返す', () => {
+    const critique = parseCritique(JSON.stringify({
+      ...COMPLETE,
+      findingAssessments: [
+        { source: 'operations', status: 'disputed', rationale: 'r', grounds: 'wrong_premise', evidence: 'e' },
+        { source: 'scope_simplicity', status: 'disputed', rationale: 'r', grounds: 'wrong_premise', evidence: 'e' },
+      ],
+    }))
+
+    expect(challengeTarget(critique!, ['scope_simplicity'])?.source).toBe('scope_simplicity')
   })
 
   it('**未知の source は binding 扱い**（fail-closed）', () => {
     // 知らない指摘を「advisory だから1回で覆せる」側へ倒してはならない。
     expect(isBindingSafetySource('some_future_focus')).toBe(true)
-    expect(shouldChallengeFinding(disputeOn('some_future_focus')!)).toBe(false)
+    expect(shouldChallengeFinding(disputeOn('some_future_focus')!, ['some_future_focus'])).toBe(false)
   })
 
   it('binding と advisory が混在するとき、advisory だけが challengeable', () => {

@@ -17,7 +17,9 @@ import {
   buildRemediatedScope,
   computeProposedDesignTextHash,
   countRemediationAttempts,
+  applyRevisedSpec,
   findRemediationSubject,
+  stageEntries,
   PL_MAX_REMEDIATION_ATTEMPTS,
   REMEDIATION_SYSTEM_PROMPT,
   buildRemediationPrompt,
@@ -739,5 +741,72 @@ describe('buildRemediatedScope', () => {
     expect(scope).toContain('却下の診断: scope が広すぎた')
     expect(scope).toContain('Safety / Authority への影響')
     expect(scope).toContain('未解決の懸念: migration の順序')
+  })
+})
+
+describe('applyRevisedSpec — rawScope と submittedScope を取り違えない', () => {
+  const REVISED = {
+    allowedPaths: ['apps/api/src/storage'],
+    acceptanceCriteria: ['c'],
+    riskOpinionLevel: 'PL_REVISION',
+    rationale: 'r',
+    provenance: 'stage=pl_revision',
+  }
+
+  it('**採用には submittedScope（判断記録つき）を渡す**', async () => {
+    // raw を渡すと判断記録が Task から消え、かつ Job の prompt が `proposedHash` と
+    // 一致しなくなるため、**成功した fresh review まで still_not_aligned と報告される**。
+    const { storage, taskId } = seedConflictedTask()
+    const subject = findRemediationSubject(storage, taskId)!
+    let adopted: string | undefined
+
+    await applyRevisedSpec(storage, {
+      subject,
+      ledgerBody: LEDGER_BODY,
+      rawScope: '狭くした scope',
+      submittedScope: '狭くした scope\n\n### 記録\n- 理由: ...',
+      ...REVISED,
+      adopt: async (_s, input) => {
+        adopted = input.implementationScope
+        return { ok: false as const, code: 'SYNC_FAILED' as const, reason: 'x' }
+      },
+    })
+
+    expect(adopted).toContain('### 記録')
+  })
+
+  it('**入れ替えて渡すと例外になる**（黙って通さない）', async () => {
+    // 型では区別できず、名前が似ていて隣接行に並ぶため、一括置換で実際に入れ替わった。
+    // 「submitted は raw を含む」という関係を実行時に確かめる。
+    const { storage, taskId } = seedConflictedTask()
+    const subject = findRemediationSubject(storage, taskId)!
+
+    await expect(applyRevisedSpec(storage, {
+      subject,
+      ledgerBody: LEDGER_BODY,
+      // 逆に渡す。
+      rawScope: '狭くした scope\n\n### 記録\n- 理由: ...',
+      submittedScope: '狭くした scope',
+      ...REVISED,
+      adopt: async () => ({ ok: false as const, code: 'SYNC_FAILED' as const, reason: 'x' }),
+    })).rejects.toThrow(/swapped/)
+  })
+
+  it('PL revision 経路でも却下キーが残る（A→B→A を止める材料）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    const subject = findRemediationSubject(storage, taskId)!
+
+    await applyRevisedSpec(storage, {
+      subject,
+      ledgerBody: LEDGER_BODY,
+      rawScope: '狭くした scope',
+      submittedScope: '狭くした scope\n\n### 記録',
+      ...REVISED,
+      adopt: async () => ({ ok: false as const, code: 'SYNC_FAILED' as const, reason: 'x' }),
+    })
+    const details = stageEntries(storage, taskId, 'pl_revision').map((e) => e.detail ?? '').join(' ')
+
+    expect(details).toContain('rejected_fspec=')
+    expect(details).not.toContain('rejected_fspec=-')
   })
 })

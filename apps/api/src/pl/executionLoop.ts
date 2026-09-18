@@ -62,6 +62,7 @@ import {
 } from './remediationStep'
 import {
   runConflictResolutionRound,
+  selectConflictStage,
   type ConflictResolutionDeps,
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
@@ -386,7 +387,11 @@ async function remediateConflict(
     // `outcome=adopting` を記録するので、採用が throw すると1回の論理試行で2行になり、
     // **上限2に対して transient な例外1回で予算が尽きる**（独立レビュー指摘）。
     if (countConflictAttempts(storage, item.taskId) === attemptsBefore) {
-      recordRemediationFailure(storage, item.taskId, 'outcome=exception')
+      // **どの stage の例外かを明示する。** `stage=` を省くと remediation として分類され、
+      // Critic 段階の例外が Remediation の予算を食う（独立レビュー指摘）。
+      // 状態は変わっていないので selector は落ちた stage をそのまま返す。
+      const failedStage = selectConflictStage(storage, item.taskId).stage
+      recordRemediationFailure(storage, item.taskId, `stage=${failedStage} outcome=exception`)
     }
     record(storage, key, 'diagnosis_failed', `conflict_resolution=error ${message}`)
     return { status: 'diagnosis_failed', reason: message, attempt: 1 }

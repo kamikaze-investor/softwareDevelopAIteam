@@ -105,6 +105,7 @@ export {
   disputedFindings,
   isBindingSafetySource,
   parseCritique,
+  challengeTarget,
   shouldChallengeFinding,
 } from './independentCriticPolicy'
 export type {

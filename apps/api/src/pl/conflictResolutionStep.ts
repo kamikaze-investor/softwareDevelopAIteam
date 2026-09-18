@@ -36,7 +36,7 @@ import {
   challengeableDisputes,
   parseCritique,
   selectCriticModel,
-  shouldChallengeFinding,
+  challengeTarget,
   type Critique,
   type DesignReviewFinding,
   type FindingAssessment,
@@ -482,7 +482,9 @@ async function runChallenge(
       taskTitle: subject.task.title,
       // **byte-identical。** spec は変更しない。
       designText: subject.reviewedDesignText,
-      changedFiles: [],
+      // **元 run と同じ changedFiles。** `[]` に落とすと reviewLoad が下がり、
+      // critical で必須の Independent Review が省かれてしまう。
+      changedFiles: [...subject.reviewedChangedFiles],
     },
     deps.coordinatorDeps ?? buildDefaultCoordinatorDeps(),
   )
@@ -633,8 +635,9 @@ async function runCriticRound(
   // ── 条件分岐: 具体的根拠付きの advisory dispute があるか ──────────
   //
   // **challenge は固定 stage ではない。** ここだけが入口である。
-  if (shouldChallengeFinding(critique)) {
-    const dispute = challengeableDisputes(critique)[0] as FindingAssessment
+  const target = challengeTarget(critique, subject.findings.map((f) => f.source))
+  if (target !== undefined) {
+    const dispute = target
     const challenge = await runChallenge(storage, subject, dispute, deps)
     if (challenge.status !== 'challenge_cap_reached') {
       return { ...challenge, ...withCritic }
@@ -727,7 +730,10 @@ async function runPlRevision(
     acceptanceCriteria: revision.acceptanceCriteria,
     riskOpinionLevel: 'PL_REVISION',
     rationale: revision.rationale,
-    provenance: 'stage=critic sub=pl_revision',
+    // ** にする。**  のままだと、1 Round で Critic 行と
+    // 適用行の2行が critic として数えられ、**1 Round で2 Round 分の予算を消費**する
+    // （独立レビュー指摘。実際に Critic は1 Round しか回らなかった）。
+    provenance: 'stage=pl_revision',
     ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
   })
 

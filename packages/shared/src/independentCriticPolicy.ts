@@ -326,9 +326,44 @@ export function bindingDisputes(critique: Critique): FindingAssessment[] {
 /**
  * Review validity challenge を起こすべきか。
  *
- * **Binding Safety findings はこの経路では解除されない。** advisory な設計論点について
- * 証拠付きの dispute があるときだけ true を返す。
+ * ## Challenge は **spec 全体**を再評価することを忘れない（独立レビュー指摘）
+ *
+ * 再評価は disputed な Finding だけを見るのではなく、同じ design text 全体に対して走る。
+ * したがって ALIGNED が返れば、**その時に立っていた Binding Finding も一緒に解ける**。
+ * 「advisory を1件 dispute すれば Binding も再抽選できる」経路を塞ぐため、次を要求する:
+ *
+ *   1. 具体的根拠付きの **advisory** dispute が1件以上ある
+ *   2. **Binding Safety / Authority の dispute が1件も無い**
+ *   3. **元の Review Finding に Binding source が1件も無い**
+ *      —— これが本体である。Critic が触れていなくても、再評価は元の Binding Finding ごと
+ *      引き直してしまう
+ *   4. dispute した source が**実際の Finding に存在する**
+ *      —— 存在しない source を dispute して challenge を起こせないようにする
+ *
+ * つまり Challenge が使えるのは「元の CONFLICT が advisory だけで構成されている」場合に限る。
+ * Binding が絡む争いは既存方針（Second Independent Review → Meta Review → CEO）へ渡す。
+ *
+ * @param originalFindingSources 元の Design Review が挙げた Finding の source 一覧。
  */
-export function shouldChallengeFinding(critique: Critique): boolean {
-  return challengeableDisputes(critique).length > 0
+export function shouldChallengeFinding(
+  critique: Critique,
+  originalFindingSources: readonly string[],
+): boolean {
+  // 2: Binding の dispute が1件でもあれば起こさない。
+  if (bindingDisputes(critique).length > 0) return false
+  // 3: 元 Finding に Binding が含まれるなら、再評価はそれごと引き直すので起こさない。
+  if (originalFindingSources.some((source) => isBindingSafetySource(source))) return false
+  // 1 + 4
+  return challengeableDisputes(critique)
+    .some((assessment) => originalFindingSources.includes(assessment.source))
+}
+
+/** 実際の Finding に対応する、challenge 可能な dispute。 */
+export function challengeTarget(
+  critique: Critique,
+  originalFindingSources: readonly string[],
+): FindingAssessment | undefined {
+  if (!shouldChallengeFinding(critique, originalFindingSources)) return undefined
+  return challengeableDisputes(critique)
+    .find((assessment) => originalFindingSources.includes(assessment.source))
 }

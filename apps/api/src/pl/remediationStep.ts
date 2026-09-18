@@ -174,7 +174,7 @@ export function priorCriticModels(storage: IStorage, taskId: string): string[] {
 export function stageEntries(
   storage: IStorage,
   taskId: string,
-  stage: 'critic' | 'remediation' | 'challenge',
+  stage: 'critic' | 'remediation' | 'challenge' | 'pl_revision',
 ): { detail?: string }[] {
   return storage.auditLog
     .findByEntity(AUDIT_ENTITY_TYPE, remediationKey(taskId))
@@ -188,7 +188,7 @@ export function stageEntries(
 function priorProvidersForStage(
   storage: IStorage,
   taskId: string,
-  stage: 'critic' | 'remediation' | 'challenge',
+  stage: 'critic' | 'remediation' | 'challenge' | 'pl_revision',
 ): string[] {
   const providers: string[] = []
   for (const entry of stageEntries(storage, taskId, stage)) {
@@ -268,6 +268,14 @@ export interface RemediationSubject {
    */
   reviewedDesignText: string
   reviewedDesignTextHash: string
+  /**
+   * 元 run の `changedFiles`。**再評価でも同じものを渡す。**
+   *
+   * ここを `[]` に固定すると `classifyReviewLoad()` が critical から medium へ下がり、
+   * **必須だった Independent Review が省かれる**（独立レビュー指摘）。再評価は
+   * 「同じ入力での判定」でなければならず、レビュー負荷も同じでなければならない。
+   */
+  reviewedChangedFiles: readonly string[]
 }
 
 /**
@@ -329,6 +337,7 @@ export function findRemediationSubject(
     findings: extractDesignReviewFindings(run.resultJson),
     reviewedDesignText: run.designText,
     reviewedDesignTextHash: run.designTextHash,
+    reviewedChangedFiles: run.changedFiles,
     rejectedSpecKeys: collectRejectedSpecKeys(storage, task),
   }
 }
@@ -687,9 +696,6 @@ export async function runRemediationStep(
     // 分離を確認できなかった相手を黙って落とさない。
     + ` unverified_separation=${selection.unresolvedAuthors.join('+') || '-'}`
     + ` stage=remediation rejected_specs=${subject.rejectedSpecKeys.length}`
-    // **却下された側のキーも残す。** 採用で Task の scope が置き換わると、この世代で
-    // 却下されていた案は Task 上から消える。残さないと次の世代で再提出できてしまう。
-    + ` rejected_fspec=${subject.rejectedSpecKeys[0] ?? '-'}`
 
   // ── 実行（read-only sandbox。提案しか出てこない）────────────────
   const runnerDeps = deps.runnerDeps ?? buildDefaultRemediationDeps()
@@ -867,6 +873,19 @@ export async function applyRevisedSpec(
 ): Promise<ApplyRevisedSpecOutcome> {
   const { subject, ledgerBody } = input
   const taskId = subject.task.id
+
+  // **raw と submitted の取り違えを黙って通さない。**
+  //
+  // この2つは「片方が他方を含む」関係にある（submitted = raw + 判断記録）。名前が似ていて
+  // 隣接行に並ぶため、実際に一括置換で入れ替わり、**成功した review が
+  // `still_not_aligned` として報告される**状態になっていた（独立レビュー指摘。4回目の混同）。
+  // 型では区別できないので、関係そのものを実行時に確かめる。
+  if (!input.submittedScope.includes(input.rawScope.trim())) {
+    throw new Error(
+      '[applyRevisedSpec] submittedScope must contain rawScope'
+      + ' (submittedScope = rawScope + the decision record); the two look swapped',
+    )
+  }
   // **2つの hash は基礎が違う。取り違えると guard か Job 照合のどちらかが壊れる。**
   //   - `proposedHash` … **実際に submit される** prompt の hash。Job Gate が計算する値と
   //     一致させる必要があるので `submittedScope`（判断記録を含む最終形）から作る
@@ -880,7 +899,16 @@ export async function applyRevisedSpec(
     implementationScope: input.rawScope,
     allowedPaths: input.allowedPaths,
   })
-  const tail = `proposed=${proposedHash} fspec=${specKey}`
+  // **却下された側のキーもここで残す。**
+  //
+  // 採用は Task の scope を提案内容へ置き換えるので、この世代で却下されていた案は
+  // Task 上から消える。残さないと次の世代で再提出でき、A → B → A が通る。
+  // 以前は Remediation 側の provenance にだけ載せていたため、**PL revision 経由だと
+  // 却下キーが1件も残らなかった**（独立レビュー指摘）。適用する全経路で必要なので、
+  // 呼び出し側の provenance ではなく**共有経路のここ**で付ける。
+  const tail =
+    `proposed=${proposedHash} fspec=${specKey}`
+    + ` rejected_fspec=${subject.rejectedSpecKeys[0] ?? '-'}`
 
   if (!isMateriallyDifferentSpec(subject.rejectedSpecKeys, specKey)) {
     recordRemediation(storage, taskId, `${input.provenance} ${tail} outcome=not_different`)
@@ -922,7 +950,10 @@ export async function applyRevisedSpec(
     roadmapId: subject.roadmapId,
     allowedPaths: input.allowedPaths,
     acceptanceCriteria: input.acceptanceCriteria,
-    implementationScope: input.rawScope,
+    // **submitted 側を渡す。** raw を渡すと判断記録が Task から消え、かつ Job の prompt が
+    // `proposedHash` と一致しなくなるので、**成功した fresh review まで
+    // `still_not_aligned` として報告される**（独立レビュー指摘。実際にそうなっていた）。
+    implementationScope: input.submittedScope,
   })
 
   if (!result.ok) {
