@@ -8104,6 +8104,27 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       → **CONFLICT の原因が ledger 本文の陳腐化であることがある。** 復旧経路を設計するときは、
       「PL の提案を直す」だけでなく「Source of Truth を訂正して再レビューする」形も要る。
 
+
+      **【2026-09-18 追記: PL 側の経路は実装された。人手経路と手順書は未了】**
+      本 Finding が挙げた3経路のうち、**PL 経路だけ**が
+      `independent-remediation-design-review-conflict`（PR #255）で埋まった。
+      `task_ready_without_job` は CONFLICT のときに限り notify-only を外れ、
+      `Independent Critic → PL revision → 既存 formal review`、
+      Critic が Finding 自体を根拠付きで dispute した場合のみ frozen spec への
+      once-per-(spec,finding) な再評価、それでも解決しなければ Independent Remediation、
+      という段階経路を通る。**本項目の残りは未了である**:
+      - **人手経路**: `resumeBlockedTask()` が blocked Job を要求する問題はそのまま。
+        Job 0 件の Task を人が再開する導線は無い
+      - **手順書**: 訂正済み `implementationScope` / `allowedPaths` で採用 API を叩き直す復旧手順は
+        依然として文書化されていない
+
+      したがって `state=deferred` は維持する（PR #255 は本項目を close しない）。
+
+      **2件目の内訳は新経路の想定ケースそのものである。** `scope_simplicity = ALIGNED` /
+      `integration = CONFLICT` で reviewer 同士が要件を逆に読み、原因は PL の出力ではなく
+      **ledger 本文が実仕様に追いついていなかったこと**だった。これは Critic が
+      `grounds=contradicts_code_or_spec` で dispute し、frozen spec の再評価へ分岐する型の
+      ケースである。**自然な CONFLICT が出たときの観測対象**として扱う。
       **既存項目との違い（重複実装しないこと）**:
       - `adoption-does-not-check-implementation-feasibility`: allowedPaths と実装対象の不一致。
         **検出の話**であり、本項目は**その後の復旧の話**
