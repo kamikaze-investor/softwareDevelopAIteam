@@ -55,6 +55,7 @@ import {
   countRemediationAttempts,
   findRemediationSubject,
   PL_MAX_REMEDIATION_ATTEMPTS,
+  recordRemediationFailure,
   runRemediationStep,
   type PlRemediationDeps,
 } from './remediationStep'
@@ -365,6 +366,10 @@ async function remediateConflict(
     })
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
+    // **例外も Remediation の試行として数える。** PL target 側だけに記録すると
+    // `countRemediationAttempts()` が 0 のままで対象から外れず、再現する例外
+    // （runner の spawn 失敗等）を毎 tick 繰り返す（独立レビュー指摘）。
+    recordRemediationFailure(storage, item.taskId, 'outcome=exception')
     record(storage, key, 'diagnosis_failed', `remediation=error ${message}`)
     return { status: 'diagnosis_failed', reason: message, attempt: 1 }
   }

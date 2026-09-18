@@ -64,6 +64,7 @@ export {
 export {
   FLAGSHIP_REMEDIATION_CANDIDATES,
   extractDesignReviewFindings,
+  isMateriallyDifferentSpec,
   parseRemediationProposal,
   selectRemediationModel,
 } from './independentRemediationPolicy'
@@ -73,6 +74,7 @@ export type {
   RemediationModelInput,
   RemediationModelSelection,
   RemediationProposal,
+  RemediationSpec,
 } from './independentRemediationPolicy'
 export * from './roadmapTaskIdentity'
 export * from './taskOccupancy'

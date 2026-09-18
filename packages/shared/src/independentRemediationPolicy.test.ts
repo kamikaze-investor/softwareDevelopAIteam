@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   FLAGSHIP_REMEDIATION_CANDIDATES,
   extractDesignReviewFindings,
+  isMateriallyDifferentSpec,
   parseRemediationProposal,
   selectRemediationModel,
 } from './independentRemediationPolicy'
@@ -126,6 +127,40 @@ describe('selectRemediationModel', () => {
     expect(selection.unresolvedAuthors).toEqual(['opencode-go', 'copilot'])
     // 未知の著者は除外集合へ入らない（入れられない）。
     expect(selection.excludedVendors).toEqual(['google'])
+  })
+})
+
+describe('isMateriallyDifferentSpec', () => {
+  const REJECTED = {
+    implementationScope: '広い scope',
+    allowedPaths: ['apps/api/src', 'packages/shared/src'],
+    acceptanceCriteria: ['typecheck が通る', 'test が通る'],
+  }
+
+  it('同一の spec は「違う」と言わない', () => {
+    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED })).toBe(false)
+  })
+
+  it('空白・大小・宣言順の違いだけでは「違う」と言わない', () => {
+    // **ここが hash 比較では守れない部分。** 表現だけ変えた実質無変更の提案を、
+    // 判定の揺れを狙った再提出として拒否できなければならない。
+    expect(isMateriallyDifferentSpec(REJECTED, {
+      implementationScope: '  広い   SCOPE ',
+      allowedPaths: ['packages/shared/src', 'APPS/API/SRC'],
+      acceptanceCriteria: ['test が通る', 'typecheck が通る'],
+    })).toBe(false)
+  })
+
+  it('scope / allowedPaths / acceptanceCriteria のどれかが変われば「違う」', () => {
+    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED, implementationScope: '狭い scope' })).toBe(true)
+    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED, allowedPaths: ['apps/api/src/storage'] })).toBe(true)
+    expect(isMateriallyDifferentSpec(REJECTED, { ...REJECTED, acceptanceCriteria: ['別の条件'] })).toBe(true)
+  })
+
+  it('scope 未指定だった Task からの変更も検出できる', () => {
+    const noScope = { ...REJECTED, implementationScope: '' }
+
+    expect(isMateriallyDifferentSpec(noScope, { ...REJECTED, implementationScope: '明示した scope' })).toBe(true)
   })
 })
 

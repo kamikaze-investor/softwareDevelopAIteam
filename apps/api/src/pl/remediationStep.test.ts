@@ -6,7 +6,7 @@ import {
   CLAUDE_REVIEWER_MODEL,
   CODEX_REVIEWER_MODEL,
 } from '@ai-team/worker/src/approvalLevel/reviewerAdapter.js'
-import { FLAGSHIP_REMEDIATION_CANDIDATES } from '@ai-team/shared'
+import { FLAGSHIP_REMEDIATION_CANDIDATES, selectRemediationModel } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -210,6 +210,41 @@ describe('findRemediationSubject — 対象の判定', () => {
     expect(findRemediationSubject(storage, taskId)).toBeUndefined()
   })
 
+  it('**UNCERTAIN は対象外**（fail-closed な不確実性を書き直しへ流さない）', () => {
+    // `executeDesignReviewRun()` は CONFLICT / UNCERTAIN / REVIEW_UNAVAILABLE を
+    // すべて `status='succeeded'` として保存するので、status だけでは区別できない。
+    // focus 集合の不一致は `recomputeDecision()` が UNCERTAIN へ倒す構造検証であり、
+    // 設計への異議ではない。提案を書き直しても答えようがない。
+    const { storage, taskId } = seedConflictedTask({
+      resultJson: JSON.stringify({
+        // medium load で期待される focus 集合と一致しない → 構造検証で UNCERTAIN。
+        focusedReviewResults: [{ focus: 'not_a_real_focus', decision: 'CONFLICT' }],
+        finalDecision: 'CONFLICT',
+      }),
+    })
+
+    expect(findRemediationSubject(storage, taskId)).toBeUndefined()
+  })
+
+  it('runner の自己申告 finalDecision は採用せず、API と同じ再計算を通す', () => {
+    // `finalDecision: 'ALIGNED'` と自己申告していても、focused が CONFLICT なら
+    // 再計算は CONFLICT になる（安全側集約）。逆に構造が壊れていれば CONFLICT にしない。
+    const { storage, taskId } = seedConflictedTask({
+      resultJson: JSON.stringify({
+        focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }],
+        finalDecision: 'ALIGNED',
+      }),
+    })
+
+    expect(findRemediationSubject(storage, taskId)).toBeDefined()
+  })
+
+  it('result_json が壊れていれば CONFLICT と決めつけない', () => {
+    const { storage, taskId } = seedConflictedTask({ resultJson: 'not json' })
+
+    expect(findRemediationSubject(storage, taskId)).toBeUndefined()
+  })
+
   it('Roadmap 由来でない Task は対象外', () => {
     const storage = createSQLiteStorage(':memory:')
     const project = storage.projects.create({
@@ -251,9 +286,11 @@ describe('却下済みテキストの再審査を拒否する', () => {
     const task = storage.tasks.findById(taskId)
     const vacuous = {
       ...PROPOSAL,
-      // 却下された Task と同じ scope / allowedPaths を返す「実質無変更」の提案。
-      implementationScope: '当初の広い scope',
-      allowedPaths: task?.allowedPaths as string[],
+      // 却下された Task の3欄をそのまま言い直しただけの「実質無変更」の提案。
+      // **表現は変えてある**（空白・大小・順序）。それでも拒否されなければならない。
+      implementationScope: '  当初の広い   SCOPE ',
+      allowedPaths: [...(task?.allowedPaths as string[])].reverse(),
+      acceptanceCriteria: task?.acceptanceCriteria as string[],
     }
     let adopted = false
 
@@ -270,20 +307,28 @@ describe('却下済みテキストの再審査を拒否する', () => {
     expect(adopted).toBe(false)
   })
 
-  it('hash は Job Gate が計算するのと同じ値で比較する', () => {
-    // 提案 JSON の hash ではなく「その提案が作る implement prompt」の hash を使う。
-    // ここがずれると、表現だけ変えて同一テキストへ落ちる提案を見逃す。
+  it('記録する hash は、**実際に submit される** prompt のものである', () => {
+    // 生の `implementationScope` から計算すると、採用時に submit されるテキスト
+    // （`buildRemediatedScope()` を通したもの）と別の値になり、記録した hash が
+    // 後の世代で1つも照合できなくなる。Job Gate が計算する値と一致させる。
+    const submittedScope = buildRemediatedScope(PROPOSAL)
     const proposedHash = computeProposedDesignTextHash({
       ledgerBody: LEDGER_BODY,
-      implementationScope: '当初の広い scope',
-      allowedPaths: ['apps/api/src', 'packages/shared/src'],
+      implementationScope: submittedScope,
+      allowedPaths: PROPOSAL.allowedPaths,
     })
     const gateHash = computeDesignTextHash(buildInitialImplementAiCliPrompt({
-      description: buildAdoptedDescription(LEDGER_BODY, '当初の広い scope'),
-      allowedPaths: ['apps/api/src', 'packages/shared/src'],
+      description: buildAdoptedDescription(LEDGER_BODY, submittedScope),
+      allowedPaths: PROPOSAL.allowedPaths,
     }))
 
     expect(proposedHash).toBe(gateHash)
+    // 生の scope から計算した値とは**一致しない**（判定には使えない、という根拠）。
+    expect(proposedHash).not.toBe(computeProposedDesignTextHash({
+      ledgerBody: LEDGER_BODY,
+      implementationScope: PROPOSAL.implementationScope,
+      allowedPaths: PROPOSAL.allowedPaths,
+    }))
   })
 
   it('過去世代で却下された hash も避ける（audit から復元する）', () => {
@@ -301,6 +346,58 @@ describe('却下済みテキストの再審査を拒否する', () => {
     const subject = findRemediationSubject(storage, taskId)
 
     expect(subject?.rejectedDesignTextHashes).toContain(olderHash)
+  })
+})
+
+describe('著者の独立性 — 自分の却下案を自分で書き直させない', () => {
+  it('2回目は前回の Remediation 著者と別 vendor へ回す', () => {
+    // 1回目に Codex が書いて却下されたら、2回目も Codex が書き直すのでは
+    // 「元設計者へ解決案生成を戻さない」という前提が崩れる。
+    const selection = selectRemediationModel({
+      authorProviders: ['opencode-go', 'codex'],
+      judgeProviders: ['gemini'],
+      exhaustedProviders: ['codex'],
+    })
+
+    expect(selection.ok).toBe(true)
+    if (!selection.ok) return
+    expect(selection.candidate.provider).toBe('claude_code')
+  })
+
+  it('実際に2回目の Remediation は Claude 側で走る', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    const used: string[] = []
+    const capturing = deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          used.push((JSON.parse(raw) as { provider: string }).provider)
+          return { ok: false, stdout: '', error: 'boom', timedOut: false }
+        },
+      },
+    })
+
+    await runRemediationStep(storage, taskId, capturing)
+    await runRemediationStep(storage, taskId, capturing)
+
+    expect(used).toEqual(['codex', 'claude_code'])
+  })
+
+  it('両 flagship を使い切ったら no_independent_model で止まる（弱い model へ落ちない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    // provenance だけを2件置き、両 provider が既に使われた状態を作る。
+    for (const provider of ['codex', 'claude_code']) {
+      storage.auditLog.record({
+        actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+        entityId: `remediate:${taskId}`, result: 'success',
+        detail: `provider=${provider} model=m outcome=runner_failed`,
+      })
+    }
+
+    // 予算も尽きているので、まず attempts_exhausted で止まることを確かめる。
+    const result = await runRemediationStep(storage, taskId, deps())
+
+    expect(result.status).toBe('attempts_exhausted')
   })
 })
 
@@ -363,7 +460,9 @@ describe('成功判定 — 採用経路の ok:true を成功にしない', () =>
     expect(result.failureCode).toBe('fresh_review_not_aligned')
   })
 
-  it('Job が作られていれば remediated（provenance も返す）', async () => {
+  it('この提案の prompt から作られた Job だけを成功の根拠にする', async () => {
+    // 別の試行が作った Job を自分の成果として報告しない。判定は Job Gate が計算するのと
+    // 同じ hash（`computeDesignTextHash(job.aiCliPrompt)`）で行う。
     const { storage, projectId, taskId } = seedConflictedTask()
 
     const result = await runRemediationStep(storage, taskId, deps({
@@ -371,6 +470,32 @@ describe('成功判定 — 採用経路の ok:true を成功にしない', () =>
         storage.jobs.create({
           taskId, projectId, agentRole: 'developer_ai', status: 'queued',
           safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          aiCliMode: 'implement',
+          // 別の提案から作られた Job。
+          aiCliPrompt: 'a job from some other attempt',
+        } as never)
+        return { ok: true as const, taskId, roadmapTaskKey: 'conflicted-item', title: 't' }
+      },
+    }))
+
+    expect(result.status).toBe('still_not_aligned')
+  })
+
+  it('Job が作られていれば remediated（provenance も返す）', async () => {
+    const { storage, projectId, taskId } = seedConflictedTask()
+    // 採用時に submit される prompt は `buildRemediatedScope()` を通した scope から作られる。
+    const submittedPrompt = buildInitialImplementAiCliPrompt({
+      description: buildAdoptedDescription(LEDGER_BODY, buildRemediatedScope(PROPOSAL)),
+      allowedPaths: PROPOSAL.allowedPaths,
+    })
+
+    const result = await runRemediationStep(storage, taskId, deps({
+      adopt: async () => {
+        storage.jobs.create({
+          taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          aiCliMode: 'implement',
+          aiCliPrompt: submittedPrompt,
         } as never)
         return { ok: true as const, taskId, roadmapTaskKey: 'conflicted-item', title: 't' }
       },

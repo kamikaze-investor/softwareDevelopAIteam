@@ -292,6 +292,42 @@ export interface RemediationProposal {
   abandon: boolean
 }
 
+/** 実装 spec の同一性。Task に保存される3つの欄だけで決まる。 */
+export interface RemediationSpec {
+  implementationScope: string
+  allowedPaths: readonly string[]
+  acceptanceCriteria: readonly string[]
+}
+
+/** 空白の揺れ・大小・順序だけの違いを「別の作業」と誤認しないための正規化。 */
+function canonicalizeSpec(spec: RemediationSpec): string {
+  const text = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase()
+  return JSON.stringify({
+    scope: text(spec.implementationScope),
+    // 宣言の順序は意味を持たない（File Change Guard は集合として使う）。
+    paths: [...spec.allowedPaths].map(text).sort(),
+    criteria: [...spec.acceptanceCriteria].map(text).sort(),
+  })
+}
+
+/**
+ * 提案が却下された spec と**実質的に違う**か。
+ *
+ * **prompt の hash では判定できない。** 採用時の `implementationScope` には Remediation の
+ * 判断記録が追記されるため、中身が同一でも prompt テキストは必ず変わる。つまり
+ * 「submit されるテキストの hash が違う」ことは材料的な違いを1つも保証しない
+ * （独立レビュー指摘）。判定材料は Task に保存される3欄そのものにする。
+ *
+ * これは `repairPolicy` の `requireDifferentApproach` と同じ趣旨だが、あちらは
+ * 「同じ失敗が繰り返されたか」を見る。こちらは「提案が変わっていないか」を見る。
+ */
+export function isMateriallyDifferentSpec(
+  rejected: RemediationSpec,
+  proposed: RemediationSpec,
+): boolean {
+  return canonicalizeSpec(rejected) !== canonicalizeSpec(proposed)
+}
+
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined
   const items = value.filter((item): item is string => typeof item === 'string' && item.trim() !== '')

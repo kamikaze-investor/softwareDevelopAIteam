@@ -65,13 +65,17 @@ import {
   selectRemediationModel,
   type DesignReviewFinding,
   type RemediationProposal,
+  isMateriallyDifferentSpec,
+  type RemediationSpec,
 } from '@ai-team/shared'
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
 import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import {
   executeRunner,
+  recomputeDecision,
   type CoordinatorDeps,
+  type RawStrategicResult,
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -113,6 +117,25 @@ const AUDIT_OPERATION = 'pl_independent_remediation'
  * 「実装者 vendor と judge vendor の両方を除外して候補が尽きる」構造的不能に陥る。
  */
 const PL_PROPOSAL_AUTHOR_PROVIDER = 'opencode-go'
+
+/**
+ * これまでに Remediation を書いた provider。**2回目以降の自己修正を防ぐ。**
+ *
+ * 1回目の著者（PL）は vendor を解決できないが、**2回目の著者は必ず解決できる**
+ * （候補表の provider は `PROVIDER_VENDOR` に載っているものだけ）。ここを author へ含めないと、
+ * 1回目に Codex が書いて却下された提案を **2回目も Codex が書き直す**ことになり、
+ * 「元設計者へ解決案生成を戻さない」という本経路の前提そのものが崩れる（独立レビュー指摘）。
+ *
+ * 材料は自前の audit 行の provenance だけである（新しいテーブルは作らない）。
+ */
+function priorRemediationProviders(storage: IStorage, taskId: string): string[] {
+  const providers: string[] = []
+  for (const entry of storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, remediationKey(taskId))) {
+    const provider = /\bprovider=([\w-]+)/.exec(entry.detail ?? '')?.[1]
+    if (provider !== undefined && !providers.includes(provider)) providers.push(provider)
+  }
+  return providers
+}
 
 /**
  * fresh Design Review でこの提案を**判定することになる** provider。
@@ -188,9 +211,17 @@ export interface RemediationSubject {
  *   4. 最新の Design Review run が**終端していて**、判定が CONFLICT である
  *
  * 4 で run の status を見るのが重要である。`queued` / `running` は Review がまだ動いている
- * だけなので待つ（採用直後は必ずこの状態を通る）。`failed` は provider 障害側の問題で、
+ * だけなので待つ（採用直後に必ず通る状態）。`failed` は provider 障害側の問題で、
  * 既存 `design_review_failed` attention と `review-provider-exhausted-alternate-rereview` の
  * 担当であり、**Remediation の対象ではない**（提案を作り直しても直らない）。
+ *
+ * **`CONFLICT` だけを対象にする。`UNCERTAIN` / `REVIEW_UNAVAILABLE` は対象にしない。**
+ * `executeDesignReviewRun()` は非 ALIGNED の判定をすべて `status='succeeded'` として保存するため、
+ * 「succeeded かつ evidence 無し」だけでは3者を区別できない（独立レビュー指摘）。
+ * `UNCERTAIN` は `recomputeDecision()` の**構造検証による fail-closed** でも出る
+ * （focus 集合の不一致・未知の decision 値・critical なのに independent review が無い等）。
+ * それは設計への異議ではなく契約違反・インフラ側の問題であり、提案を書き直しても答えようがない。
+ * fail-closed な不確実性を提案の書き直しへ流し込まない。
  */
 export function findRemediationSubject(
   storage: IStorage,
@@ -206,11 +237,22 @@ export function findRemediationSubject(
   // 走っている途中・回収待ちは対象にしない（採用直後に必ず通る状態）。
   if (run.status !== 'succeeded') return undefined
 
-  // `succeeded` かつ evidence が無いことが「判定が出たうえで ALIGNED ではなかった」ことを表す。
-  // decision そのものは `result_json` の `finalDecision` にあるが、**それは runner の自己申告**
-  // なので可否の根拠にはしない。根拠は「API が evidence を登録しなかったこと」である。
+  // evidence が登録されていれば ALIGNED である（非 ALIGNED は evidence を作らない）。
   const evidence = storage.designReviewEvidence.findLatestByTaskId(task.id)
   if (evidence?.designTextHash === run.designTextHash) return undefined
+
+  // **判定は runner の自己申告（`finalDecision`）を採用せず、API と同じ関数で再計算する。**
+  // Job Gate / evidence 登録が使っているのと同一の `recomputeDecision()` を通すので、
+  // ここが独自の判定ロジックを持つことはない。
+  if (run.resultJson === undefined) return undefined
+  let raw: RawStrategicResult
+  try {
+    raw = JSON.parse(run.resultJson) as RawStrategicResult
+  } catch {
+    // 判定を再計算できないものを CONFLICT と決めつけない（fail-closed）。
+    return undefined
+  }
+  if (recomputeDecision(raw, 'task', run.changedFiles).decision !== 'CONFLICT') return undefined
 
   const rejected = new Set<string>([run.designTextHash])
   // 過去の世代で却下された hash も避ける。`design_review_runs` は Task ごとに最新1件しか
@@ -238,6 +280,16 @@ export function countRemediationAttempts(storage: IStorage, taskId: string): num
     .findByEntity(AUDIT_ENTITY_TYPE, remediationKey(taskId))
     .filter((entry) => entry.operation === AUDIT_OPERATION)
     .length
+}
+
+/**
+ * 呼び出し側（PL ループ）が、Remediation の手前で落ちた試行を数えさせるための入口。
+ *
+ * **記録の場所を2つに分けない。** 予算は `countRemediationAttempts()` が1箇所で数えるので、
+ * 外から数えさせたい失敗もこの entity へ書く。
+ */
+export function recordRemediationFailure(storage: IStorage, taskId: string, detail: string): void {
+  recordRemediation(storage, taskId, detail)
 }
 
 function recordRemediation(storage: IStorage, taskId: string, detail: string): void {
@@ -389,11 +441,15 @@ export function buildDefaultRemediationDeps(): CoordinatorDeps {
 }
 
 /**
- * 提案が却下済みテキストと実質同一かを、**Review を走らせる前に**判定する。
+ * **実際に submit される** implement prompt の hash。
  *
- * 比較するのは「その提案が作る implement prompt」の hash であって、提案 JSON の hash ではない。
- * Job Gate が実際に計算するのと同じ値（`computeDesignTextHash(job.aiCliPrompt)`）を使わないと、
- * 表現だけ変えて同一テキストへ落ちる提案を見逃す。
+ * Job Gate が計算するのと同じ値（`computeDesignTextHash(job.aiCliPrompt)`）になるよう、
+ * `buildRemediatedScope()` を通した scope から計算する。ここを生の
+ * `proposal.implementationScope` から計算すると、**採用時に submit されるテキストと
+ * 別の値**になり、記録した hash が後の世代で1つも照合できなくなる（独立レビュー指摘）。
+ *
+ * この hash は provenance と世代間の蓄積に使う。**「提案が変わったか」の判定には使わない** ——
+ * 判断記録の追記で必ず変わるので、判定には使えない（`isMateriallyDifferentSpec()` を使う）。
  */
 export function computeProposedDesignTextHash(input: {
   ledgerBody: string
@@ -467,11 +523,15 @@ export async function runRemediationStep(
   }
 
   // ── 独立した flagship を選ぶ（弱い model へは落ちない）──────────
+  const priorProviders = priorRemediationProviders(storage, taskId)
   const selection = selectRemediationModel({
-    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER],
+    // 1回目は PL（vendor 未解決）、2回目以降は前回の Remediation 著者も除外対象になる。
+    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorProviders],
     // 初回 implement Job の Design Review は常に `changedFiles: []` で走る
     // （`createInitialImplementWorkflow()`）。値を固定せず既存分類器から導く。
     judgeProviders: resolveJudgeProviders([]),
+    // 実行して失敗した provider も再試行しない。
+    exhaustedProviders: priorProviders,
   })
   if (!selection.ok) {
     // provider 構成が変わるまで結果は変わらないので、ここも試行として記録して有界にする。
@@ -571,13 +631,23 @@ export async function runRemediationStep(
     }
   }
 
-  // ── 却下済みテキストの再審査を拒否する（Review を走らせる前に）─────
+  // ── 却下済み提案の再審査を拒否する（Review を走らせる前に）───────
+  //
+  // 判定材料は Task に保存される3欄（scope / allowedPaths / acceptanceCriteria）である。
+  // **submit される prompt の hash では判定できない** —— 判断記録が追記されるため中身が
+  // 同一でも hash は必ず変わり、「違う」ことを1つも保証しない（独立レビュー指摘）。
+  const submittedScope = buildRemediatedScope(proposal)
   const proposedHash = computeProposedDesignTextHash({
     ledgerBody,
-    implementationScope: proposal.implementationScope,
+    implementationScope: submittedScope,
     allowedPaths: proposal.allowedPaths,
   })
-  if (subject.rejectedDesignTextHashes.includes(proposedHash)) {
+  const rejectedSpec: RemediationSpec = {
+    implementationScope: extractImplementationScope(subject.task.description) ?? '',
+    allowedPaths: subject.task.allowedPaths ?? [],
+    acceptanceCriteria: subject.task.acceptanceCriteria ?? [],
+  }
+  if (!isMateriallyDifferentSpec(rejectedSpec, proposal)) {
     recordRemediation(storage, taskId, `${provenance} proposed=${proposedHash} outcome=not_different`)
     return {
       status: 'proposal_not_materially_different',
@@ -587,8 +657,8 @@ export async function runRemediationStep(
       model: candidate.model,
       failureCode: 'identical_to_rejected',
       reason:
-        'the proposal produces the exact design text the review already rejected;'
-        + ' re-reviewing it would only re-roll the verdict',
+        'the proposal restates the scope, paths and acceptance criteria the review already'
+        + ' rejected; re-reviewing it would only re-roll the verdict',
       proposal,
     }
   }
@@ -625,7 +695,7 @@ export async function runRemediationStep(
     allowedPaths: proposal.allowedPaths,
     acceptanceCriteria: proposal.acceptanceCriteria,
     // 判断の記録を spec 本体へ残す。**新しい Task field を作らない。**
-    implementationScope: buildRemediatedScope(proposal),
+    implementationScope: submittedScope,
     // Job は0件なので follow-up ではない（通常の採用し直し）。
   })
 
@@ -643,9 +713,16 @@ export async function runRemediationStep(
   }
 
   // ── Verify（採用経路の戻り値だけで成功としない）───────────────────
+  //
   // `adoptRoadmapItem()` は `ensureInitialWorkflows()` の結果を捨てるため、CONFLICT のままでも
-  // `ok: true` を返す。**Job が実在することだけを成功の根拠にする。**
-  const jobs = storage.jobs.findByTaskId(result.taskId)
+  // `ok: true` を返す。よって Job の実在を確かめる。ただし**「Job が1件でもある」では足りない**
+  // —— 別の試行が作った Job を自分の成果として報告してしまう（独立レビュー指摘）。
+  // **この提案の prompt から作られた Job であること**を hash で確かめる。
+  // 比較する値は Job Gate が計算するのと同一（`computeDesignTextHash(job.aiCliPrompt)`）である。
+  const jobs = storage.jobs.findByTaskId(result.taskId).filter(
+    (job) => job.aiCliPrompt !== undefined
+      && computeDesignTextHash(job.aiCliPrompt) === proposedHash,
+  )
   if (jobs.length === 0) {
     return {
       status: 'still_not_aligned',

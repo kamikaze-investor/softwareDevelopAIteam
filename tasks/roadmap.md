@@ -9761,6 +9761,43 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       fixture / isolated 環境で上記 Acceptance Criteria を固定し、**自然な CONFLICT が出た時に
       production E2E へ進む**。
 
+<!-- roadmap:id=remediation-attempt-admission-not-atomic state=planned -->
+5. [ ] **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）** —
+      2026-09-18登録（`independent-remediation-design-review-conflict` の Independent Review 指摘）。
+      **本項目は Finding であり、いま実装しない。**
+
+      **指摘（Codex independent review, changes_requested の項目5）**: Remediation の試行受付は
+      `countRemediationAttempts()` で数えてから走らせる **count-then-run** であり、記録は
+      長い model 呼び出しの**後**に行う。並行性の防御は `executionLoop.ts` の module スコープ変数
+      `inFlight` だけで、これは**プロセスローカル**である。したがって API プロセスが2つ以上あれば
+      上限を超えて同時に走り、同じ pending Task を上書きしうる。
+
+      **現状で問題にならない理由（放置の根拠。実装を省いた言い訳ではない）**:
+      - `executionLoop.ts` は「API は単一プロセス・単一スレッドなのでこれで足りる」と明記しており、
+        既存の PL tick 全体（採用・診断・再kick）が同じ前提に乗っている。
+        **本項目だけ別の前提で強化しても、隣の採用経路が同じ形のまま残る**
+      - 二重採用そのものは既存機構が弾く: `syncRoadmapTasks()` は単一 transaction で
+        `RoadmapTaskConflictError` を出し、Job は `ux_jobs_workflow_step_key` の全体一意 index で
+        重複生成できない
+      - 成果の誤報は**対処済み**。「Job が1件でもある」ではなく
+        **この提案の prompt hash から作られた Job** だけを成功の根拠にした
+        （別の試行が作った Job を自分の成果として報告しない）
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - **単一プロセス前提をやめるかどうかが先。** やめないなら本項目は不要であり、
+        やめるなら PL tick 全体（採用・診断・Remediation）を同時に扱う。本項目単独で
+        claim table を1つ足すのは、**状態空間を増やして防御が1箇所だけ強い**という最悪の形になる
+      - 強化するなら**既存 `claim_token` fencing の設計を踏襲する**
+        （`design_review_runs` / `supervised_runs` が既に持っている）。**新しい fencing 方式を作らない**
+      - `audit_log` は append-only で、admission の CAS には使えない。
+        どこに claim を置くかは上記の判断の後で決める
+      - 効果検証可能性（Design Philosophy 8）: 「上限を超えて Remediation が走った」件数を
+        後から数えられること。数えられないなら強化の効果も判定できない
+
+      **重複しない境界**: `project-workspace-isolation`（planned）は複数 Project の同時実行を扱う。
+      本項目は**同一 Task に対する同一 role の同時実行**であり別物。ただし単一プロセス前提を
+      やめる判断は共通なので、**着手する場合は同時に扱う**。
+
 ---
 
 *Updated: 2026-09-17*
