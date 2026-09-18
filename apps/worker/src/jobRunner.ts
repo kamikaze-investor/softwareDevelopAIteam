@@ -1679,18 +1679,24 @@ function withSensitiveChanges(
 function classifyApiError(status: number, result: unknown): string {
   const text = typeof result === 'string' ? result.toLowerCase() : ''
 
-  // 2026-09-18 実測: `400` + "Credit balance is too low"。従量課金の残高切れ。
+  // **status だけで credit 不足と決めない。** 400 は入力不正からレート制御まで何でも来る。
+  // 判定材料は「残高が足りない」と明示している文言だけに限る
+  // （2026-09-18 実測: `400` + "Credit balance is too low"）。
+  // 文言が無い 400 は下の generic へ落ちる。
   if (/credit balance|insufficient.*credit|billing/.test(text)) return 'credit exhausted'
 
-  // subscription ログインの失効もここへ来る。API key を渡さなくなったため、
-  // 認証が切れたときに運用側が最初に見るのがこのラベルになる。
-  if (status === 401 || status === 403
-    || /unauthorized|unauthenticated|authentication|invalid.*(api.?key|token)|expired/.test(text)) {
-    return 'authentication failed (the Claude Code login may have expired)'
-  }
+  // **ここから先は HTTP status の定義だけを根拠にする。** 推測で具体化しない。
+  //
+  // 401 は「認証されていない」が定義そのものなので断定してよい。API key を渡さなくなった今、
+  // subscription ログインの失効が最初にここへ出る。
+  if (status === 401) return 'authentication failed (the Claude Code login may have expired)'
 
-  if (status === 429 || /rate.?limit|too many requests|quota/.test(text)) return 'rate limited'
+  // 403 は「認証は通ったが許可されていない」場合も含む。認証失効と**断定しない**。
+  if (status === 403) return 'access forbidden'
 
+  if (status === 429) return 'rate limited'
+
+  // 文言からの推測でラベルを具体化しない。分からないものは分からないと出す。
   return 'API error'
 }
 

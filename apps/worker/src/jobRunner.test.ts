@@ -2418,6 +2418,75 @@ describe('task-022: AI CLI 実行ブロック', () => {
     expect(result.stderr).not.toContain('Credit balance is too low')
   })
 
+  // **400 を無条件に credit 不足と決めない。** 400 は入力不正から何まで来るので、
+  // 残高不足と明示する文言が無ければ generic へ落とす。
+  it('credit の文言が無い 400 は credit exhausted にしない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({
+          is_error: true,
+          api_error_status: 400,
+          result: 'messages.0.content: field required',
+        }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain('HTTP 400')
+    expect(result.stderr).toContain('API error')
+    expect(result.stderr).not.toContain('credit exhausted')
+    // raw text も出さない。
+    expect(result.stderr).not.toContain('field required')
+  })
+
+  // 403 は「認証は通ったが許可されていない」場合を含むので、認証失効と断定しない。
+  it('403 を認証失効と断定しない', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 403, result: 'forbidden' }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain('HTTP 403')
+    expect(result.stderr).toContain('access forbidden')
+    expect(result.stderr).not.toContain('login may have expired')
+  })
+
+  it('分類できない status は generic なままにする', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockResolvedValue(makeCliResult({
+        changedFiles: [],
+        stdout: JSON.stringify({ is_error: true, api_error_status: 500, result: 'internal error, request-id abc' }),
+      })),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'src/x.ts を修正してください',
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.stderr).toContain('HTTP 500')
+    expect(result.stderr).toContain('API error')
+    expect(result.stderr).not.toContain('request-id')
+  })
+
   // provider のエラー文には credential 断片や prompt 抜粋が入りうる。
   // redact ではなく「echo しない」ことで、取りこぼしの余地を無くしている。
   it('API エラー文に credential 断片があっても operator 向けには出さない', async () => {
