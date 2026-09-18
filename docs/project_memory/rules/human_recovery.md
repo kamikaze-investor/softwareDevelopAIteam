@@ -115,6 +115,7 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 | `TASK_NOT_BLOCKED` | 既に再投入済みか、そもそも止まっていない |
 | `TASK_PARKED` | `abort_task` で park 済み。復旧の副作用で park を取り消さない |
 | `TASK_NOT_REACHABLE` | `roadmapActive=false` 等で自律ループから到達できない。戻しても何も動かず、いま出ている警告だけが消える。採用し直すか park する |
+
 **生涯上限は無い。** 連打を止めているのは入口条件（`blocked` かつ Job 0 件）そのもので、
 もう一度受理されるにはシステムが**独立に** dead state へ再突入している必要がある。
 この操作は Job も Review も作らないので、`PL_MAX_REMEDIATION_ATTEMPTS` /
@@ -204,7 +205,10 @@ ORDER BY created_at DESC;
 
 1. **件数が減っているか** — 減らないなら、CONFLICT の作り込み側（提案 or ledger）が直っていない
 2. **再投入が効いたか** — `task_human_recovered` の後にその Task の Job が作られたか
-3. **同じ Task を何度も押していないか** — `RECOVERY_BUDGET_EXHAUSTED` が出るなら手順 4 へ進むべきだった
+3. **同じ Task を、訂正せずに何度も押していないか** — audit の `dth=<hash>` が同じ行が並ぶなら、
+   同じ design text のまま再投入を繰り返している。手順 2 へ戻って原因（提案側か ledger 側か）を
+   切り分けること。**この重複は API では止めていない**（止めると訂正経路ごと塞がるため。
+   上の「既知の穴」を参照）
 
 ---
 

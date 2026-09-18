@@ -50,7 +50,11 @@
  */
 
 import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
-import { DESIGN_REVIEW_MAX_ATTEMPTS } from '../designReview/designReviewCoordinator'
+import {
+  DESIGN_REVIEW_MAX_ATTEMPTS,
+  recomputeDecision,
+  type RawStrategicResult,
+} from '../designReview/designReviewCoordinator'
 import { DEFAULT_STALL_HINT_MS, type AttentionItem } from '../state/systemState'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
@@ -383,6 +387,26 @@ function hasLiveJob(facts: Facts): boolean {
  * **`AttentionItem` と storage しか受け取らない。** PL の自然言語・riskLevel 申告は
  * 引数に存在しないので、**自己申告で分類を動かすことが構造的にできない**。
  */
+/**
+ * 直近 Design Review run の判定を、**API 側の再計算で**求める。
+ *
+ * `findRemediationSubject()`（#255）が Remediation 対象を決めるのに使っているのと同じ
+ * `recomputeDecision()` を通す。**判定ロジックをここに書き写さない** —— 2箇所に書くと、
+ * 同じ run に対して Triage と Remediation が違う結論を出す。
+ * 読めない・再計算できないものは `undefined`（＝ CONFLICT と決めつけない。fail-closed）。
+ */
+function recomputedDecisionOf(storage: IStorage, taskId: string | undefined): string | undefined {
+  if (taskId === undefined) return undefined
+  const run = storage.designReviewRuns.findLatestByTaskId(taskId)
+  if (!run?.resultJson) return undefined
+  try {
+    const raw = JSON.parse(run.resultJson) as RawStrategicResult
+    return recomputeDecision(raw, 'task', run.changedFiles).decision
+  } catch {
+    return undefined
+  }
+}
+
 export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDiagnosis {
   const facts = gatherFacts(storage, item)
   const result = base(item)
@@ -507,15 +531,18 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 解けるのは CEO の明示操作（Human Recovery）だけなので `ceo_escalation` で終端する。
   if (item.kind === 'task_blocked_without_job') {
     const stalled = facts.review
-    // **`CONFLICT` だけを CONFLICT と呼ぶ。** `UNCERTAIN` / `REVIEW_UNAVAILABLE` は
-    // `recomputeDecision()` の構造検証による fail-closed であり、設計への異議ではない。
-    // ここを「ALIGNED 以外」で括ると、#255 が対象にしない判定まで
-    // `design_review_conflict` として high confidence で報告することになる
-    // （独立レビュー指摘・2026-09-18）。#255 の `findRemediationSubject()` と同じ粒度に合わせる。
-    const reviewIsConflict =
-      stalled !== undefined
-      && stalled.status === 'succeeded'
-      && stalled.decision === 'CONFLICT'
+    // **判定は runner の自己申告ではなく API 側の再計算で決める。**
+    //
+    // `readLatestDesignReview()` が返す `decision` は top-level `finalDecision` の生値である。
+    // #255 が書く CONFLICT は `{"focusedReviewResults":[...]}` だけで **`finalDecision` を持たない**
+    // ので、生値で `=== 'CONFLICT'` と比べると**本番で最も多い形が丸ごと漏れる**
+    // （独立レビュー round 3 指摘。round 2 で「ALIGNED 以外」を絞った際に入れた退行）。
+    // 逆に、壊れた出力が `finalDecision: 'CONFLICT'` と自己申告していても信用してはならない。
+    //
+    // よって `findRemediationSubject()` と**同一の** `recomputeDecision()` を通す。
+    // 2つの経路が同じ入力を違う判定にすることが無くなる。
+    const reviewIsConflict = stalled?.status === 'succeeded'
+      && recomputedDecisionOf(storage, item.taskId) === 'CONFLICT'
 
     return {
       ...result,

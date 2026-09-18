@@ -18,6 +18,8 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import { buildSystemState } from '../state/systemState'
 import { runPlTick, type PlLoopDeps } from '../pl/executionLoop'
 import { recoverBlockedTask } from './recoverBlockedTask'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 
 function seedBlockedWithoutJob(options: {
   projectStatus?: 'running' | 'paused'
@@ -140,6 +142,33 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
 
     expect(sends).toBe(1)
     expect(second.status).toBe('idle')
+  })
+
+  it('**#255 形の CONFLICT（top-level finalDecision 無し）でも Human Recovery を案内する**', async () => {
+    // `readLatestDesignReview()` の `decision` は top-level `finalDecision` の生値である。
+    // #255 が書く CONFLICT はこの欄を持たないので、生値で比較すると**本番で最も多い形が漏れる**。
+    // 判定は `recomputeDecision()` を通すこと（独立レビュー round 3）。
+    const { storage, taskId } = seedBlockedWithoutJob()
+    const task = storage.tasks.findById(taskId)!
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const run = storage.designReviewRuns.create({
+      taskId, taskTitle: task.title, designText,
+      designTextHash: computeDesignTextHash(designText), changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(
+      run.id, claimed.claimToken as string, 'succeeded',
+      // **top-level finalDecision を意図的に持たせない。**
+      JSON.stringify({ focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }] }),
+    )
+    const sent: Array<{ title: string; body: string }> = []
+
+    await runPlTick(storage, deps({ escalate: async (p) => { sent.push(p) } }))
+
+    expect(sent[0].body).toContain('design_review_conflict')
+    expect(sent[0].body).toContain('/recover')
+    // 「証拠不足」で終わらせない。
+    expect(sent[0].body).not.toContain('原因を機械的事実から特定できませんでした')
   })
 
   it('**再投入して再び同じ状態に落ちたら、もう一度通知する**', async () => {
