@@ -131,6 +131,10 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // PL に新しい権限は与えない。2026-09-15 production 実測で、ここに無かったために
   // 自律採用の直後にチェーンが**誰にも気付かれず停止**した。
   'task_ready_without_job',
+  // blocked かつ Job 0 件。**通知だけ**する（下の NOTIFY_ONLY 参照）。復旧は人の明示操作に限る
+  // （CEO 決定・2026-09-18）ので PL に実行させない。ここに載せるのは「CEO へ届ける」ためだけで、
+  // 外すと `GET /api/state` には出るが誰も知らせないまま止まり続ける。
+  'task_blocked_without_job',
   // blocked は notify-only にしない。blocked reason を読んで sanctioned な復旧を選ばせる
   // （CEO 指示・2026-09-15）。executor が無い・判断不能なら fail-closed で Escalation へ倒れる。
   'job_blocked',
@@ -153,6 +157,9 @@ const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   'approval_waiting',
   // 採用したのに動き出さない Task も、人を待たせている点では同じ。
   'task_ready_without_job',
+  // blocked かつ Job 0 件は、他のどの経路からも解消できない（人の明示操作だけが解く）ため
+  // 早く人へ届ける。**ここに無いと `selectTarget()` が走査せず永久に選ばれない。**
+  'task_blocked_without_job',
   // blocked は workflow を止めているので早く見る。
   // **`ACTIONABLE_ATTENTION_KINDS` に入れてもここに無ければ永久に選ばれない**（selectTarget が
   // この順序を走査するため）。両方に入れること。
@@ -306,6 +313,11 @@ const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // 採用した Task に Job が作られない。PL には直せない（Job 生成は Design Review evidence が要り、
   // その判定を PL が覆すことは許されない）。**だから通知だけする。**
   'task_ready_without_job',
+  // blocked かつ Job 0 件。**PL には直せない**（CEO 決定・2026-09-18 により、再投入は
+  // 認証済み CEO の明示操作だけに認められた例外であり、AI/PL には適用しない）。
+  // `PL_ACTION_KINDS` に対応する語彙が無いため、仮にここから外しても PL は
+  // `forbidden` にしか到達できない。二重に閉じている。
+  'task_blocked_without_job',
 ]
 
 /**
@@ -405,6 +417,18 @@ function selfResolutionBlockedReason(diagnosis: BlockedDiagnosis): string {
         + 'PL 側に実行経路がありません。PL は自分の権限を広げず、Guard も迂回しません。'
       )
     case 'ceo_escalation':
+      // **「試したが駄目だった」と「そもそも届かない」を区別する。**
+      // blocked かつ Job 0 件の CONFLICT は Independent Remediation が一度も走っていない
+      // （`findRemediationSubject()` が pending を要求するため）。ここを一般文で流すと、
+      // CEO には「Remediation 済みで解決しなかった」と読める報告が届く。
+      if (diagnosis.rootCauseClass === 'design_review_conflict') {
+        return (
+          'この Task は blocked かつ Job 0 件で、配線済みの復旧経路が構造的にどれも到達できません'
+          + '（Independent Remediation は pending の Task を、resume は既存 Job を要求します）。'
+          + 'Remediation を試して失敗したのではなく、**一度も実行できていません**。'
+          + '再投入は CEO の明示操作にのみ認められています。'
+        )
+      }
       return diagnosis.confidence === 'low'
         ? '原因を機械的事実から特定できませんでした。証拠不足のまま状態を変える操作は行いません。'
         : 'この分類は既存 Policy 上 CEO の判断を要するもので、PL には降格させる権限がありません。'

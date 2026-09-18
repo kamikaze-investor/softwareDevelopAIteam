@@ -797,6 +797,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     isParked(taskId) {
       return isParkedTaskId(taskId)
     },
+    recoverFromBlocked(input) {
+      // **状態遷移と audit を1 transaction にする。** 片方だけ成功する経路を残さない。
+      const tx = db.transaction((taskId: string, detail: string) => {
+        const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as any
+        if (!row) return { ok: false as const, reason: 'Task not found' }
+
+        // 判定から確定までの間に誰かが動かしていないか、最後にもう一度確かめる。
+        const current = deserializeTask(row)
+        if (current.status !== 'blocked') {
+          return { ok: false as const, reason: `Task is ${current.status}, not blocked` }
+        }
+
+        const updated = tasks.update(taskId, { status: 'pending' })
+        if (!updated) return { ok: false as const, reason: 'Task could not be updated' }
+
+        auditLog.record({
+          actor: 'api',
+          operation: 'task_human_recovered',
+          entityType: 'task',
+          entityId: taskId,
+          result: 'success',
+          detail,
+        })
+        return { ok: true as const, task: updated }
+      })
+
+      return tx(input.taskId, input.detail)
+    },
     findByProjectId(projectId) {
       const rows = db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as any[]
       return rows.map(deserializeTask)

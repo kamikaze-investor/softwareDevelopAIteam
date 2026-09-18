@@ -50,7 +50,11 @@
  */
 
 import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
-import { DESIGN_REVIEW_MAX_ATTEMPTS } from '../designReview/designReviewCoordinator'
+import {
+  DESIGN_REVIEW_MAX_ATTEMPTS,
+  recomputeDecision,
+  type RawStrategicResult,
+} from '../designReview/designReviewCoordinator'
 import { DEFAULT_STALL_HINT_MS, type AttentionItem } from '../state/systemState'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
@@ -383,6 +387,26 @@ function hasLiveJob(facts: Facts): boolean {
  * **`AttentionItem` と storage しか受け取らない。** PL の自然言語・riskLevel 申告は
  * 引数に存在しないので、**自己申告で分類を動かすことが構造的にできない**。
  */
+/**
+ * 直近 Design Review run の判定を、**API 側の再計算で**求める。
+ *
+ * `findRemediationSubject()`（#255）が Remediation 対象を決めるのに使っているのと同じ
+ * `recomputeDecision()` を通す。**判定ロジックをここに書き写さない** —— 2箇所に書くと、
+ * 同じ run に対して Triage と Remediation が違う結論を出す。
+ * 読めない・再計算できないものは `undefined`（＝ CONFLICT と決めつけない。fail-closed）。
+ */
+function recomputedDecisionOf(storage: IStorage, taskId: string | undefined): string | undefined {
+  if (taskId === undefined) return undefined
+  const run = storage.designReviewRuns.findLatestByTaskId(taskId)
+  if (!run?.resultJson) return undefined
+  try {
+    const raw = JSON.parse(run.resultJson) as RawStrategicResult
+    return recomputeDecision(raw, 'task', run.changedFiles).decision
+  } catch {
+    return undefined
+  }
+}
+
 export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDiagnosis {
   const facts = gatherFacts(storage, item)
   const result = base(item)
@@ -490,6 +514,71 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       confidence: 'high',
       recommendedLane: 'ceo_escalation',
       summary: 'CEO の承認待ちで止まっている。AI 側にできることは無い。',
+    }
+  }
+
+  // ── 4.5 blocked かつ Job 0 件。**配線済みの復旧経路がどれも構造的に届かない** ──────
+  //
+  // `remediateConflict()`（#255）は `findRemediationSubject()` が `status === 'pending'` を
+  // 要求するため、この Task を**一度も試さない**。`resumeBlockedTask()` は latestJob から
+  // 新 Job を組み立てるので Job 0 件では必ず失敗する。つまり下の 5 と同じ CONFLICT でも、
+  // この状態にあるものは Remediation レーンへ渡してはならない ——
+  // 渡すと CEO には「Remediation を試したが解決しなかった」と読める報告が届く（実際は未実行）。
+  //
+  // **判定を書き直さない。** 「blocked かつ Job 0 件」の判定は `systemState.ts` が
+  // `task_blocked_without_job` として既に行っており、ここはその結論を使うだけである。
+  //
+  // 解けるのは CEO の明示操作（Human Recovery）だけなので `ceo_escalation` で終端する。
+  if (item.kind === 'task_blocked_without_job') {
+    const stalled = facts.review
+    // **判定は runner の自己申告ではなく API 側の再計算で決める。**
+    //
+    // `readLatestDesignReview()` が返す `decision` は top-level `finalDecision` の生値である。
+    // #255 が書く CONFLICT は `{"focusedReviewResults":[...]}` だけで **`finalDecision` を持たない**
+    // ので、生値で `=== 'CONFLICT'` と比べると**本番で最も多い形が丸ごと漏れる**
+    // （独立レビュー round 3 指摘。round 2 で「ALIGNED 以外」を絞った際に入れた退行）。
+    // 逆に、壊れた出力が `finalDecision: 'CONFLICT'` と自己申告していても信用してはならない。
+    //
+    // よって `findRemediationSubject()` と**同一の** `recomputeDecision()` を通す。
+    // 2つの経路が同じ入力を違う判定にすることが無くなる。
+    // **判定は1度だけ再計算し、分類・証拠・本文の全部で同じ値を使う。**
+    // 分類を再計算値で行いながら本文へ生値を出すと、#255 形では
+    // 「Design Review は undefined」と書かれた high-confidence な CONFLICT 報告になる
+    // （独立レビュー round 4 指摘）。
+    const recomputed = recomputedDecisionOf(storage, item.taskId)
+    const reviewIsConflict = stalled?.status === 'succeeded' && recomputed === 'CONFLICT'
+
+    return {
+      ...result,
+      // 原因の語彙は増やさない。CONFLICT で止まったならそれが原因であり、
+      // この分岐が変えるのは**レーン**（到達可能性）だけである。
+      rootCauseClass: reviewIsConflict ? 'design_review_conflict' : 'unknown',
+      blockingLayer: reviewIsConflict ? 'design_review' : 'job_creation',
+      evidence: [
+        { fact: 'task.status', ...(item.taskId !== undefined ? { id: item.taskId } : {}), value: 'blocked' },
+        { fact: 'jobs.count', value: '0' },
+        ...(stalled !== undefined
+          ? [{
+            fact: 'design_review_run.finalDecision',
+            id: stalled.runId,
+            // 生値ではなく再計算値。分類と食い違う証拠を CEO へ出さない。
+            value: `${recomputed ?? stalled.decision ?? 'unknown'} (status=${stalled.status})`,
+          }]
+          : []),
+      ],
+      recoverable: true,
+      // CONFLICT が読めているときだけ原因を断定できる。読めないなら状態しか分かっていない。
+      confidence: reviewIsConflict ? 'high' : 'low',
+      recommendedLane: 'ceo_escalation',
+      summary:
+        'Task が blocked のまま Job を1件も持っておらず、配線済みの自動復旧経路が'
+        + '構造的にどれも到達できない（Independent Remediation は pending を、'
+        + 'resume は既存 Job を要求する）。'
+        + (reviewIsConflict
+          ? `直近の task-kind Design Review は ${recomputed} で、evidence が登録されていない。`
+          : '')
+        + ' CEO が Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻すか、'
+        + '訂正した implementationScope / allowedPaths で採用し直す必要がある。',
     }
   }
 
@@ -784,6 +873,26 @@ function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string;
       return {
         decision: '待っている承認そのもの。',
         options: ['Mobile から承認する', '却下して別の設計へ回す'],
+      }
+    // `independent_remediation` レーンは上で早期 return するので、ここへ来る CONFLICT は
+    // **Remediation が構造的に届かないもの**（blocked かつ Job 0 件）だけである。
+    // したがって「もう一度 Remediation へ」は選択肢にならない。まず再投入が要る。
+    case 'design_review_conflict':
+      return {
+        decision:
+          'CONFLICT で止まった Task が、自動復旧経路から外れた状態にある。どう戻すか。',
+        options: [
+          'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻し、'
+          + 'Independent Remediation に fresh Design Review を起こさせる',
+          // **順序を書かないと実行できない選択肢になる。** `syncRoadmapTasks()` は
+          // `status === 'pending'` の Task しか可変として扱わないので、blocked のまま
+          // 採用し直すと `SYNC_FAILED` で弾かれる（独立レビュー round 2 指摘）。
+          'まず Human Recovery で `pending` へ戻し、**そのうえで**訂正した '
+          + 'implementationScope / allowedPaths で Roadmap 項目を採用し直す'
+          + '（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）。'
+          + '**blocked のまま採用し直すと `SYNC_FAILED` になる**',
+          'この Task を park する（`abort_task`）',
+        ],
       }
     case 'design_review_exhausted':
       return {

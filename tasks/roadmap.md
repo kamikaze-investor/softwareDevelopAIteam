@@ -8105,20 +8105,46 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       「PL の提案を直す」だけでなく「Source of Truth を訂正して再レビューする」形も要る。
 
 
-      **【2026-09-18 追記: PL 側の経路は実装された。人手経路と手順書は未了】**
-      本 Finding が挙げた3経路のうち、**PL 経路だけ**が
+      **【2026-09-18 追記: 3経路すべてに実装が入った】**
+      本 Finding が挙げた3経路のうち **PL 経路**は
       `independent-remediation-design-review-conflict`（PR #255）で埋まった。
-      `task_ready_without_job` は CONFLICT のときに限り notify-only を外れ、
-      `Independent Critic → PL revision → 既存 formal review`、
-      Critic が Finding 自体を根拠付きで dispute した場合のみ frozen spec への
-      once-per-(spec,finding) な再評価、それでも解決しなければ Independent Remediation、
-      という段階経路を通る。**本項目の残りは未了である**:
-      - **人手経路**: `resumeBlockedTask()` が blocked Job を要求する問題はそのまま。
-        Job 0 件の Task を人が再開する導線は無い
-      - **手順書**: 訂正済み `implementationScope` / `allowedPaths` で採用 API を叩き直す復旧手順は
-        依然として文書化されていない
+      残っていた **人手経路と手順書**は `human-recovery-zero-job-blocked-task` で埋めた:
+      - **人手経路**: `POST /api/tasks/:id/recover`（Human Recovery）。Job 0 件の blocked Task を
+        `blocked` → `pending` へ戻すだけで、**Job も Review も Approval も作らない**。
+        up-front の CEO Approval Gate は課さない（CEO 決定・2026-09-18）が、fresh Design Review と
+        既存下流 Gate はすべて維持される。AI/PL は「語彙が無い」「配線が無い」
+        「worker allowlist に無い」の3重で到達できない
+      - **手順書**: `docs/project_memory/rules/human_recovery.md`
 
-      したがって `state=deferred` は維持する（PR #255 は本項目を close しない）。
+      **順序は #255 → #259 → 人手の順で固定した。** `remediateConflict()` は従来どおり Triage の
+      **手前**で走り、Human Recovery はどちらも迂回しない。Triage には復旧の実行責務を持たせず、
+      分類だけを行わせている。
+
+      **本 Finding が書けていなかった穴を1つ塞いだ。** `failContinuation()` 経由の CONFLICT は
+      Task を `blocked` にするため `findRemediationSubject()`（`pending` を要求）から外れ、
+      **PR #255 の新経路にも届かない**。しかも attention は全9箇所が「Job があること」か
+      「`status='pending'` であること」を条件にしているため **1件も立たず**、
+      `occupiesProject()` が blocked を roadmapActive に関係なく占有と数えることと合わさって、
+      **誰にも見えないまま Project の枠を保持し続ける**。2026-09-18 に `:memory:` storage へ
+      同じ状態を作って実測した（`attention = []` /
+      `resumeBlockedTask() = "No jobs exist for this task"`）。
+
+      **non-goal「新しい AttentionKind を追加しない」から意図的に外れた。根拠を残す。**
+      この状態を既存 `task_ready_without_job` へ押し込む案を先に検討し、次の理由で採らなかった:
+      - **名前と意味が合わない**（`ready` ではなく `blocked`）
+      - **#255 固有ロジックと混線する**。`isRemediableConflict()` は kind で分岐した先で
+        `findRemediationSubject()`（`pending` 要求）に落ちるため、押し込むと「Remediation を
+        試したが解決しなかった」と読める CEO 報告になる。実際には一度も実行されていない
+      - **pending と blocked の責務境界が崩れる**。`hasStalledLongEnough()` は
+        `task_ready_without_job` を5分の停滞閾値で抑える（採用直後に必ず立つため）。
+        blocked かつ Job 0 件は過渡状態を持たず即座に異常なので、同じ閾値を共有できない
+      追加したのは **AttentionKind 1個だけ**で、`rootCauseClass` も lane も TaskStatus も
+      Roadmap state も増やしていない。AttentionKind は永続 state ではなく
+      **実レコードから毎回導出される observation vocabulary** であり、
+      state 空間を広げない。既存 kind への押し込みより最小かつ自然と判断した。
+
+      **`state` は merge と Production E2E 確認まで `deferred` のまま維持する。** 実装は入ったが、
+      自然な CONFLICT が出たときの観測はまだ取れていない（PR #255 と同じ扱い）。
 
       **2件目の内訳は新経路の想定ケースそのものである。** `scope_simplicity = ALIGNED` /
       `integration = CONFLICT` で reviewer 同士が要件を逆に読み、原因は PL の出力ではなく
@@ -8149,6 +8175,123 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       Triage が受け持つのはその対象外（`roadmapTaskKey` 無し・予算枯渇など）だけで、
       その場合は構造化報告を添えて CEO へ渡す。
 
+
+<!-- roadmap:id=design-review-rejections-are-not-durably-recorded state=deferred -->
+8. [ ] **Design Review の却下が durable に記録されず、却下履歴を後から辿れない** —
+      2026-09-18登録（独立レビュー指摘）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: `design_review_runs` に対する read は `findLatestByTaskId()` しか無く、
+      Task の run 履歴を辿れない。「このテキストは却下された」という事実がどこにも durable に
+      残らないため、**最新 run が別の判定で上書きされると、過去の CONFLICT が観測不能になる**。
+
+      **具体例**: CONFLICT の後、同一テキストへ Challenge の再評価が乗って `UNCERTAIN` を返すと、
+      最新 run は `UNCERTAIN` になる。この間に採用が起きなければ CONFLICT はどこにも残らず、
+      同じテキストを採用し直せてしまう（`adoption-path-has-no-material-difference-check` で
+      入れた guard は、最新 run と採用時に書けた audit しか材料にできない）。
+
+      **いまの緩和**: 採用時に、置き換えられる却下済みテキストの review-visible key を
+      `rejected_rvk=` として audit へ残している。採用を経由した世代は追える。
+      **経由しなかった却下は追えない。**
+
+      **もう1つの症状: #255 と採用側で鍵の空間が違う（2026-09-18 追記）。**
+      #255 は `rejected_fspec=` に **scope + allowedPaths** だけの鍵を書く（あの経路では
+      ledger 本文が世代間で動かないため、それで足りる）。採用側の鍵は **description 全体
+      （ledger 本文込み）+ allowedPaths** である（本文の訂正を「違う提案」として通すために
+      必要。`adoption-path-has-no-material-difference-check` 参照）。
+      **2つの鍵は比較できない**ので、Remediation 経路で却下された案を採用経路から再提出しても
+      検出できない。
+
+      **さらに狭い残件（2026-09-18 追記）**: `reviewVisibleSpecKey()` は allowedPaths の大小を
+      cosmetic として潰す（#255 の契約。テストで固定済み）。重複の畳み込みを足したことで、
+      `['src/API','src/api']` を `['src/api']` へ**絞り込むだけの訂正**が「同じ提案」と
+      判定される。case だけ違う path を両方並べていた場合に限る非常に狭い範囲であり、
+      #255 の契約を本 PR で変えるほうがリスクが大きいので触っていない。
+      鍵空間を統一するとき（本項目の本題）に、path の大小をどう扱うかも併せて決めること。
+      **狭い方の鍵を採用側でも併用する案は採らない。** それをすると、ledger 本文だけを
+      訂正した再投入が scope 鍵の一致で拒否され、**手順書の正規経路をまた塞ぐ**。
+      正しい解き方は本項目の本題と同じで、**却下を review 完了時点で1つの鍵空間で記録する**
+      ことである。鍵の統一もそのときに行う。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - 却下を **review 完了時点**で記録できないか（`completeWithEvidence()` は ALIGNED のときに
+        evidence を作る。非 ALIGNED 側に対称な記録が無いのが根本原因）
+      - `design_review_runs` に `findByTaskId()` を足すだけで足りないか。**新しいテーブルを
+        作る前に、既存表の read を1つ増やす案を先に検討する**
+      - 記録するのは判定そのものか、review-visible key か。後者なら #255 / 採用側と同じ鍵に揃える
+      - 効果検証可能性（Design Philosophy 8）: 同一テキストが何回審査されたかを後から数えられること
+
+      **既存項目との違い（重複実装しないこと）**:
+      - `adoption-path-has-no-material-difference-check`(done): 採用時の検査。**本項目は
+        その検査が使う記録そのものが足りていない話**
+      - `independent-review-verdict-instability`: 判定が揺れること自体。本項目は**揺れた履歴を
+        残せていない**こと
+
+<!-- roadmap:id=adoption-path-has-no-material-difference-check state=done -->
+8. [x] **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる** —
+      2026-09-18 登録・同日修正（`human-recovery-zero-job-blocked-task` の一部として実装）。
+
+      **事象**: `POST /api/projects/:id/roadmap-adoptions` は、対象 Task が `pending` かつ Job 0 件で
+      あれば spec を更新し、`ensureInitialWorkflowsForActiveTasks()` 経由で **fresh Design Review を
+      起こす**。このとき `isMateriallyDifferentSpec()` 相当の検査は**通らなかった**。
+      同一の implementationScope / allowedPaths を繰り返し採用し直すだけで、同じ design text に
+      対する Review を何度でも引けたため、判定の揺れ
+      （`independent-review-verdict-instability`）で CONFLICT を洗浄しうる経路だった。
+
+      **修正**: 採用時、対象 Task に**却下済みの spec が既に在る場合に限り**、提案が却下済みの
+      どれとも review-visible に違うことを **Design Review を起こす前に**要求する
+      （`SPEC_NOT_MATERIALLY_DIFFERENT`）。
+
+      **新しい material-difference engine は作っていない。** #255 の既存 export をそのまま呼ぶ:
+      `collectRejectedSpecKeys()` / `shortSpecKey()` / `isMateriallyDifferentSpec()`。
+      したがって定義も #255 と同一で、**AC は比較に入らない**（reviewer が見ないため、
+      AC だけ書き換えても「作り直した」ことにならない）。
+
+      **A → B → A を止めるため、却下された世代を履歴へ残す。** 採用は Task の spec を置き換える
+      ので、記録しないと1世代前の却下案が消える。書き込み先・形式は #255 と同じ audit
+      （`remediate:<taskId>` の `rejected_fspec=` / `fspec=`）で、**新しいテーブルは作らない**。
+      `stage=adoption` を付けるため、`stageEntries()` が remediation として数えることはなく、
+      **どの attempt budget も消費しない**。
+
+      **既存の採用を壊していない。** guard は「却下済み spec が在る Task」にだけ効く。
+      新規 item の初回採用 / follow-up 採用 / 却下歴の無い Task の採用し直し /
+      ALIGNED evidence 済み Task の Job 再生成は、いずれも従来どおり通る（テストで固定）。
+
+      **既存項目との違い（重複実装しないこと）**:
+      - `human-recovery-zero-job-blocked-task`: blocked を pending へ戻す話。**再審査は起こさない**
+      - `independent-remediation-design-review-conflict`(#255): Remediation 経路には検査が**在る**
+
+<!-- roadmap:id=continuation-conflict-blocks-task-out-of-recovery state=deferred -->
+8. [ ] **continuation 経由の Design Review CONFLICT が Task を `blocked` にし、自動復旧の射程外へ出す** —
+      2026-09-18登録。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: `createInitialImplementWorkflow()` は Design Review が非 ALIGNED のとき
+      `retryable: false` で skip し、`failContinuation()` がその Task を `blocked` にする
+      （`apps/api/src/ctoAi/taskContinuation.ts`）。Job は1件も作られない。
+
+      **結果として、同じ CONFLICT でも入口によって扱いが変わる**:
+      - **採用経由**（`adoptRoadmapItem`）… Task は `pending` のまま →
+        `task_ready_without_job` → #255 の staged recovery が引き取る
+      - **continuation 経由** … Task は `blocked` →
+        `findRemediationSubject()` が `pending` を要求するため **#255 が一度も走らない**
+
+      `human-recovery-zero-job-blocked-task` は**この状態を可視化し人手で戻す経路**を作ったが、
+      **なぜ `blocked` にするのかという設計自体は触っていない**。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+      - Design Review 非 ALIGNED のとき、Task を `pending` のまま残せないか。
+        残せるなら人手を介さず #255 が引き取れる（**新しい仕組みを増やさずに済む**）
+      - ただし `pending` のままだと「止まっている」ことが status から読めなくなる。
+        attention で足りるのか、`blocked` の意味を保つべきか
+      - 他の非 retryable skip（`gate.reason` / project unavailable）は同じ扱いでよいか。
+        **理由ごとに分けるべきかもしれない**
+      - 効果検証可能性（Design Philosophy 8）: 入口別の CONFLICT 件数と、
+        そのうち自動で解決した割合を後から数えられること
+
+      **既存項目との違い（重複実装しないこと）**:
+      - `human-recovery-zero-job-blocked-task`: 既に `blocked` になったものを**戻す**話。
+        本項目は**そもそも `blocked` にするのが正しいか**の話
+      - `task-design-review-conflict-has-no-recovery-route`: 復旧経路が無いこと。
+        本項目はその一因である**状態遷移の設計**
 
 <!-- roadmap:id=blocked-resolution-triage state=done -->
 8. [x] **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す** —

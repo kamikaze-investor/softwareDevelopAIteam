@@ -17,6 +17,7 @@
 
 import { occupiesProject } from '@ai-team/shared'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
+import { countHumanRecoveryAttempts } from '../humanRecovery/recoveryAudit'
 import type { IStorage } from '../storage/interface'
 import type { Job, Task, Project } from '@ai-team/shared'
 
@@ -50,6 +51,17 @@ export type AttentionKind =
   | 'design_review_idle'
   | 'continuation_pending'
   | 'task_ready_without_job'
+  /**
+   * Task が `blocked` なのに Job が1件も無い。**誰も動かせない状態**である。
+   *
+   * `failContinuation()` が非 retryable な skip（Design Review 非 ALIGNED 等）で Task を
+   * blocked にすると、Job は1件も作られない。これを出さないと、他の attention が
+   * すべて「Job があること」か「`status='pending'` であること」を条件にしているため、
+   * **attention が1件も立たないまま Project の枠を占有し続ける**（2026-09-18 実測）。
+   *
+   * PL はこれを解消できない（復旧は人の明示操作＝ Human Recovery に限る）ので notify-only。
+   */
+  | 'task_blocked_without_job'
   | 'job_running_long'
 
 export interface AttentionItem {
@@ -425,6 +437,42 @@ export function buildSystemState(
             })
           }
         }
+      }
+
+      // **blocked なのに Job が1件も無い Task。**
+      //
+      // 上の分岐はすべて Job を前提にしており（`job_failed` は `stallingFailure` を、
+      // `job_blocked` / `workspace_quarantined` は Job 本体を要求する）、下の
+      // `isReadyTaskWithoutJob()` は `status === 'pending'` を要求する。よってこの状態は
+      // **どの attention にも該当せず、完全に見えないまま Project を占有する**
+      // （`occupiesProject()` は blocked を roadmapActive に関係なく占有と数える）。
+      //
+      // `roadmapActive` は条件にしない。`failContinuation()` は roadmapActive を見ずに
+      // blocked へ上げるため、ここで要求すると同じ静かな停止を作り直すことになる。
+      // park 済みの Task は除く（解消できる者がいないものを鳴らし続けない。上の
+      // `parentIsParked` と同じ判断）。
+      if (
+        project.status === 'running'
+        && task.status === 'blocked'
+        && jobs.length === 0
+        && !storage.tasks.isParked(task.id)
+      ) {
+        attention.push({
+          kind: 'task_blocked_without_job',
+          projectId: project.id,
+          projectName: project.name,
+          taskId: task.id,
+          // **エピソード単位の identity を持たせる。**
+          // `targetKeyOf()` は referenceId を優先し、`hasEscalated()` はそのキーで
+          // 生涯にわたり重複通知を抑止する。taskId だけだと、再投入して**もう一度**この
+          // dead state に落ちたとき CEO へ二度と通知されない（独立レビュー指摘・2026-09-18）。
+          // 復旧回数はエピソード内で不変、次のエピソードで必ず増えるので識別子に適する。
+          referenceId: `${task.id}:r${countHumanRecoveryAttempts(storage, task.id)}`,
+          detail:
+            'task is blocked but has no job at all; no resume, retry or remediation path can reach it '
+            + 'without an explicit human recovery',
+          stuckForMs: elapsedMs(task.updatedAt, nowMs),
+        })
       }
 
       if (project.status === 'running' && isReadyTaskWithoutJob(task, jobs)) {

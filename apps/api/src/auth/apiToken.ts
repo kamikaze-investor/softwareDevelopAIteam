@@ -2,6 +2,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { isWorkerRouteAllowed } from './workerAllowlist'
 import { isActionsReadonlyRouteAllowed } from './actionsReadonlyAllowlist'
+import { isHumanOnlyRoute } from './humanOnlyRoutes'
 
 const BEARER_PREFIX = 'Bearer '
 
@@ -120,7 +121,18 @@ export async function apiTokenAuth(
   reply.status(401).send({ error: 'Invalid token' })
 }
 
-/** ADMIN/WORKERいずれも未設定のときの既存挙動（変更なし）。 */
+/**
+ * ADMIN/WORKERいずれも未設定のときの挙動。
+ *
+ * **既存の legacy 認証そのものは変えていない。** 足したのは最後の1点だけで、
+ * `HUMAN_ONLY_ROUTES` に載る route を **legacy mode では fail-closed にする**。
+ * この mode は単一 `API_TOKEN` を全 route へ許すため、caller が人か Worker かを
+ * 区別する材料が無い（`./humanOnlyRoutes` の解説を参照）。
+ *
+ * `API_TOKEN` 未設定（= 認証を行わないローカル開発）は従来どおり素通しにする。
+ * そこは「主体を区別できない」のではなく「そもそも認証していない」状態であり、
+ * production の構成ではない。既存のローカル用途と test を壊さないことを優先する。
+ */
 async function legacySingleTokenAuth(
   req: FastifyRequest,
   reply: FastifyReply,
@@ -137,5 +149,21 @@ async function legacySingleTokenAuth(
   const token = authHeader.slice(BEARER_PREFIX.length).trim()
   if (token !== expectedToken) {
     reply.status(401).send({ error: 'Invalid token' })
+    return
+  }
+
+  // **token は正しい。それでも human-only route は legacy mode では通さない。**
+  // 401（token が違う）ではなく 403（この構成では実行できない）である。
+  // 判定を token 検証の**後**に置くのは、無効な token に 403 を返して
+  // 「route は在るが権限が無い」と誤って教えないためである。
+  if (isHumanOnlyRoute(req.routeOptions.method, req.routeOptions.url)) {
+    reply.status(403).send({
+      error:
+        'Forbidden: this operation is restricted to an authenticated human (CEO) and cannot be '
+        + 'distinguished from automation under the single-token legacy auth mode. '
+        + 'Configure ADMIN_TOKEN_SHA256 / WORKER_TOKEN_SHA256 (split credential mode) and retry '
+        + 'with the ADMIN credential',
+      code: 'HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS',
+    })
   }
 }

@@ -469,9 +469,28 @@ export function reviewVisibleSpecKey(
   spec: Pick<RemediationSpec, 'implementationScope' | 'allowedPaths'>,
 ): string {
   const text = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase()
+  // path の**書き方の揺れ**を潰してから比較する。`apps/api/src` と `./apps/api/src/` と
+  // `apps/api//src` は同じ許可範囲なので、これらを別物として扱うと
+  // **末尾に `/` を足すだけで再審査を引ける**（独立レビュー指摘・2026-09-18）。
+  //
+  // **best-effort である。** File Change Guard は allowedPaths 用の正規化関数を export して
+  // おらず、「実効的な許可範囲」を1箇所で定義する術が今は無い。ここで潰せるのは
+  // 書き方の揺れだけで、この鍵を最後の防壁にしてはならない（本質的な対処は
+  // `design-review-rejections-are-not-durably-recorded` を参照）。
+  const pathText = (value: string): string =>
+    text(value).replace(/\/+/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
   return JSON.stringify({
     scope: text(spec.implementationScope),
-    paths: [...spec.allowedPaths].map(text).sort(),
+    // **正規化した「後」に重複を畳む。** 順序を揃えるだけでは足りない ——
+    // `['a']` と `['a', ' A ']` は正規化後どちらも同じ1件なのに、畳まないと配列長が違って
+    // 別の鍵になる。**同じ内容を重複付きで出し直すだけで「実質的に違う提案」を
+    // 名乗れてしまう**（独立レビュー指摘・2026-09-18）。
+    //
+    // 大小を潰す既存の扱いはそのまま維持する（本関数の契約であり、テストで固定されている）。
+    // その結果、`['src/API','src/api']` → `['src/api']` という**絞り込みだけの訂正**は
+    // 「同じ提案」と判定される。case だけが違う allowedPaths を両方並べていた場合に限る
+    // 非常に狭い範囲で、`design-review-rejections-are-not-durably-recorded` に記録してある。
+    paths: [...new Set([...spec.allowedPaths].map(pathText))].sort(),
   })
 }
 
