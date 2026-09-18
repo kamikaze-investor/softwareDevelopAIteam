@@ -9286,13 +9286,42 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         閾値に達したら発火する経路が production に存在することである。
         **「実際に 50 件溜まるまで待つ」ことを Acceptance Criteria にしない**（同上）
 
-<!-- roadmap:id=principle-registry-coverage-and-threshold-review state=planned -->
+<!-- roadmap:id=principle-registry-coverage-and-threshold-review state=planned priority=high -->
 3. [ ] **Principle Registry の適用範囲拡張と、実データによる閾値の自己再評価** — 2026-09-18登録（CEO 指示）。
       `principle-registry-and-compliance-ledger` / `principle-quality-sensor-to-review` の後続項目。
       目的は「**本番稼働した Principle Management を、Principle Registry の適用範囲拡張と
       実データによる自己再評価まで閉じる**」こと。
       上記 2 項目が `done` になったことで **owner の無くなった残件 2 件をここへ引き取る**
       （`done` 項目の本文にしか書かれていない TODO を残さない — `observation-closes-loop`）。
+
+      **CEO 追加指示（2026-09-18。本項目を VPS PL の自律開発へ回すにあたって）**:
+      **本文と下記 Acceptance Criteria が Source of Truth である。** 会話ログではなくここを読むこと。
+
+      - **実装順は Task B → Task A。** 先に Task B（100 件 threshold review sensor）を閉じ、
+        そのあとで Task A（Registry coverage 拡張）へ進む。
+        理由は、production に既に 38 件の application があり、**coverage を広げると
+        application の増加速度が上がり得る**ため。観測範囲を広げる前に
+        「100 件到達時に必ず再評価へ戻る」閉ループを先に完成させる
+      - **既存機構を優先する。** `principle_applications` / `principle_sensor` / `audit_log` /
+        `evaluateAndPersistSensors()` / `project-auto-incident-pattern-improvement` /
+        既存 Principle Registry / contextual selection を再利用する。
+        **新しい scheduler / monitoring backend / persistent state table / Principle system は作らない**
+      - **100 件到達時に 50 / 200 を自動変更しない。** 実データを添えた再Review を発火するだけにする
+      - **同じ threshold policy version では 1 回だけ発火させる。** policy を変更したときは再評価可能にする
+      - **Principle を安易に core 化しない。** Task に応じて選択できるものは contextual を優先し、
+        全 prompt への原則全文貼付を増やさない
+      - **既存 `specs/21` の本文・tier を coverage 拡張のためだけに変更しない。**
+        production で既に蓄積している 38 件の version-based 実績を不要にリセットしない
+      - **Escalate 条件は 1 つだけ。** Safety / Authority Principle について、
+        metadata・参照方法・prompt 投入方法の変更を**超えて**、原則の意味 /
+        Safety Boundary / Authority / Gate policy を変更する必要が出た場合のみ CEO へ戻す。
+        それ以外（大きな設計矛盾が無い限り）は、実装 → tests → Independent Review → merge まで
+        **通常 Roadmap 開発として自律的に進めてよい**
+      - **production で 100 件に実到達することは完了条件ではない。**
+        sensor を fixture / E2E で検証できていればよい
+      - **完了後に報告する項目**: Task B 結果 / Task A 結果 / sensor E2E /
+        Registry coverage / prompt への影響 / `principle_applications` 記録 /
+        Independent Review / merge SHA / 本 Roadmap item を done にしたか
 
       **作らないもの（先に読むこと）**:
       - 新しい Principle 管理 system
