@@ -64,18 +64,40 @@ import {
 } from '../pl/remediationStep'
 
 /**
- * 1つの Task を Human Recovery できる回数。
+ * ## 試行の有界性について（**新しい上限値を作らない**）
  *
- * **新しいテーブルを作らず既存 `audit_log` から数える**（`isParkedTaskId()` が
- * `task_aborted` 行を読んで park を判定しているのと同じ形）。
+ * CEO 決定は「試行回数を有界化する」と要求している。これを**新しいマジックナンバーでは
+ * 実現しない**。有界性は次の3つで既に成立しており、独自の上限はむしろ害になる。
  *
- * 実質的には Task の生涯で1回しか効かない上限である: 一度 recover して implement Job が
- * 作られると、以後この関数は `TASK_HAS_JOBS` で断り既存 `resumeBlockedTask()` 経路へ回すため、
- * 「Job 0 件の blocked」という入口条件が二度と成立しなくなる。上限が意味を持つのは
- * **recover しても Review が通らず、また Job 0 件で blocked へ戻る**場合であり、
- * そこで無制限に押し直せないようにするのがこの値の役割である。
+ * **1. 入口条件そのものが idempotency guard である。** 受理するのは
+ * 「`blocked` かつ Job 0 件」だけで、成功すると Task は `pending` になる。もう一度
+ * 呼ぶには、システムが**独立に**この dead state へ再突入していなければならない。
+ * 再突入経路は `failContinuation()` だけで、それは producer が動いた
+ * （= Design Review なり Gate 判定なりが実際に走った）ことを意味する。
+ * つまり「同じ instruction の連打」は構造的に成立しない。
+ *
+ * **2. 自動ループ側の予算には一切触れない。** この関数は Job も Review も作らないので、
+ * `PL_MAX_REMEDIATION_ATTEMPTS` / `PL_MAX_ATTEMPTS_PER_TARGET` /
+ * `DESIGN_REVIEW_MAX_ATTEMPTS` のどれも消費せず、リセットもしない。
+ * 再投入しても自動ループが無限化しないのはこのためである。
+ *
+ * **3. 却下済み spec の履歴を消さない。** #255 の `isMateriallyDifferentSpec()` が参照する
+ * 却下履歴は `audit_log` の `remediate:<taskId>` 行にあり、この関数は読みも書きもしない。
+ * 再投入は「却下された案をもう一度通す」経路にならない。
+ *
+ * ## 生涯上限を**置いてはならない**理由（実測・2026-09-18）
+ *
+ * `syncRoadmapTasks()` の spec 更新条件は
+ * `isUnstarted = taskJobs.length === 0 && existingTask.status === 'pending'` である。
+ * **`blocked` の Task を採用し直すと、「着手済み Task の spec 変更」と判定されて
+ * `SYNC_FAILED` で失敗する**（`Roadmap task spec conflicts detected for started/completed tasks`）。
+ * したがって「訂正した implementationScope / allowedPaths で採用し直す」復旧は、
+ * **先に Human Recovery で `pending` へ戻さなければ成立しない**。
+ * ここに生涯上限を置くと、上限に達した Task は**訂正版の spec を適用する経路ごと失われる**。
+ * 「N 回を超えたら二度と復旧不能」にすることは目的ではない。
+ *
+ * 回数は**数えて返すが、門にはしない**（`attempt`）。連打の有無は audit から後で数えられる。
  */
-export const MAX_HUMAN_RECOVERY_ATTEMPTS = 3
 
 /** audit_log の語彙。**新しいテーブルも metrics backend も作らない。** */
 export const HUMAN_RECOVERY_AUDIT_OPERATION = 'task_human_recovered'
@@ -116,7 +138,6 @@ export type RecoverBlockedTaskResult =
       | 'TASK_NOT_BLOCKED'
       | 'TASK_HAS_JOBS'
       | 'TASK_PARKED'
-      | 'RECOVERY_BUDGET_EXHAUSTED'
       | 'RECOVERY_FAILED'
     reason: string
   }
@@ -195,18 +216,8 @@ export function recoverBlockedTask(
     }
   }
 
+  // 回数は記録と報告のためだけに数える。**門にはしない**（上の「試行の有界性」参照）。
   const priorAttempts = countHumanRecoveryAttempts(storage, task.id)
-  if (priorAttempts >= MAX_HUMAN_RECOVERY_ATTEMPTS) {
-    return {
-      ok: false,
-      code: 'RECOVERY_BUDGET_EXHAUSTED',
-      reason:
-        `Task ${input.taskId} has already been recovered ${priorAttempts} time(s) `
-        + `(limit ${MAX_HUMAN_RECOVERY_ATTEMPTS}) and keeps coming back blocked without a job. `
-        + 'Re-adopt the roadmap item with a corrected implementationScope / allowedPaths, '
-        + 'or correct the ledger text the review is reading, instead of re-admitting it unchanged',
-    }
-  }
 
   // ── ここから状態を変える ───────────────────────────────────
   const updated = storage.tasks.update(task.id, { status: 'pending' })

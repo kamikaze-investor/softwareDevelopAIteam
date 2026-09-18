@@ -6,13 +6,17 @@
  *      既存 `resumeBlockedTask()` の責務であり、ここで二重の復旧経路を作らない
  *   2. **やることは1つだけ** — `blocked` → `pending` と audit 記録のみ。Job も Review も
  *      Approval も作らない（CEO 決定・2026-09-18「Implementation Job を直接生成せず」）
- *   3. **有界** — audit_log から数えた試行回数が上限に達したら断る
+ *   3. **有界。ただし生涯上限ではない** — 連打を止めるのは入口条件（`blocked` かつ Job 0 件）で、
+ *      再受理にはシステムが独立に dead state へ再突入している必要がある。自動ループの予算
+ *      （`PL_MAX_REMEDIATION_ATTEMPTS` 等）は消費もリセットもしない
  *   4. **park を黙って取り消さない**
  *   5. **再投入後に何が動くかを正直に返す**（`nextDriver`）
- *   6. **PL から到達できない** — 語彙も配線も存在しない
+ *   6. **PL から到達できない** — 語彙も配線も存在せず、後段 Approval の証拠にもならない
  */
 
 import { describe, expect, it } from 'vitest'
+import { existsSync, readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type { IStorage } from '../storage/interface'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -20,10 +24,11 @@ import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkf
 import { PL_ACTION_KINDS } from '@ai-team/shared'
 import { WORKER_ALLOWLIST } from '../auth/workerAllowlist'
 import {
-  countHumanRecoveryAttempts,
-  MAX_HUMAN_RECOVERY_ATTEMPTS,
-  recoverBlockedTask,
-} from './recoverBlockedTask'
+  countRemediationAttempts,
+  PL_MAX_REMEDIATION_ATTEMPTS,
+  recordRemediationFailure,
+} from '../pl/remediationStep'
+import { countHumanRecoveryAttempts, recoverBlockedTask } from './recoverBlockedTask'
 
 interface Seeded {
   storage: IStorage
@@ -181,21 +186,84 @@ describe('recoverBlockedTask — audit と有界性', () => {
     expect(countHumanRecoveryAttempts(storage, taskId)).toBe(0)
   })
 
-  it(`${MAX_HUMAN_RECOVERY_ATTEMPTS} 回を超えたら断り、別の手段を案内する`, () => {
+  it('**生涯上限を持たない。** 連打を止めるのは入口条件であって回数ではない', () => {
     const { storage, taskId } = seed()
 
-    for (let i = 0; i < MAX_HUMAN_RECOVERY_ATTEMPTS; i += 1) {
-      const attempt = recoverBlockedTask(storage, { taskId, reason: `try ${i}` })
-      expect(attempt).toMatchObject({ ok: true, attempt: i + 1 })
-      // 次の試行のために、また Job 0 件の blocked へ戻す（Review が通らなかった状況の再現）。
+    // 続けて2回叩いても、2回目は「もう blocked ではない」で断られる。
+    expect(recoverBlockedTask(storage, { taskId, reason: '1' })).toMatchObject({ ok: true, attempt: 1 })
+    expect(recoverBlockedTask(storage, { taskId, reason: '2' }))
+      .toMatchObject({ ok: false, code: 'TASK_NOT_BLOCKED' })
+
+    // もう一度受理されるのは、システムが**独立に** dead state へ再突入したときだけ。
+    storage.tasks.update(taskId, { status: 'blocked' })
+    expect(recoverBlockedTask(storage, { taskId, reason: '3' })).toMatchObject({ ok: true, attempt: 2 })
+
+    // 何度目でも、条件さえ満たせば受理され続ける（「N 回で二度と不能」にしない）。
+    for (let i = 0; i < 5; i += 1) {
       storage.tasks.update(taskId, { status: 'blocked' })
+      expect(recoverBlockedTask(storage, { taskId, reason: `loop ${i}` }).ok).toBe(true)
+    }
+  })
+
+  it('自動ループの予算を消費もリセットもしない', () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    // #255 の Remediation 予算を使い切った状態を作る。
+    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+      recordRemediationFailure(storage, taskId, `stage=remediation rejected ${i}`)
+    }
+    const before = countRemediationAttempts(storage, taskId)
+
+    recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    // 再投入しても Remediation 予算は元のまま。再投入で自動ループが延命しない。
+    expect(countRemediationAttempts(storage, taskId)).toBe(before)
+    expect(before).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
+  })
+
+  it('却下済み spec の履歴を消さない（Review laundering の経路にしない）', () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    recordRemediationFailure(storage, taskId, 'stage=remediation spec=deadbeefdeadbeef rejected')
+    const historyBefore = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`)
+
+    recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    const historyAfter = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`)
+    expect(historyAfter).toHaveLength(historyBefore.length)
+    expect(historyAfter.map((e) => e.detail)).toEqual(historyBefore.map((e) => e.detail))
+  })
+
+  it('**blocked のままでは採用し直しが SYNC_FAILED になる** —— 生涯上限を置けない理由', () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    const before = storage.tasks.findById(taskId)!
+    const correctedSpec = {
+      projectId: before.projectId,
+      tasks: [{
+        roadmapTaskKey: 'some-item',
+        title: '訂正後のタイトル',
+        description: '訂正後の説明',
+        phase: 1,
+        assignee: 'developer_ai',
+        category: 'implementation',
+        dependencies: [],
+        acceptanceCriteria: ['c'],
+        allowedPaths: ['apps/api/src/humanRecovery'],
+      }],
     }
 
-    const exhausted = recoverBlockedTask(storage, { taskId, reason: 'もう一度' })
-    expect(exhausted).toMatchObject({ ok: false, code: 'RECOVERY_BUDGET_EXHAUSTED' })
-    expect(exhausted.ok === false && exhausted.reason).toContain('implementationScope')
-    // 断られた以上、状態は動いていない。
-    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    // `syncRoadmapTasks()` の可変条件は `jobs.length === 0 && status === 'pending'`。
+    // blocked の Task は isUnstarted を満たさず、「着手済み Task の spec 変更」として**失敗する**。
+    const refused = storage.tasks.syncRoadmapTasks(correctedSpec as never)
+    expect(refused.ok).toBe(false)
+    expect(refused.failureReason).toContain('started/completed tasks')
+    expect(storage.tasks.findById(taskId)?.title).toBe(before.title)
+
+    // Human Recovery で pending へ戻して初めて、訂正版 spec が適用できる。
+    // **つまり再投入は訂正経路の前提条件であり、ここに生涯上限を置くと
+    //   訂正版 spec を適用する手段ごと失われる。**
+    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
+    const applied = storage.tasks.syncRoadmapTasks(correctedSpec as never)
+    expect(applied.ok).toBe(true)
+    expect(storage.tasks.findById(taskId)?.title).toBe('訂正後のタイトル')
   })
 })
 
@@ -220,11 +288,38 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
 
 describe('Human Recovery は AI/PL から到達できない（CEO 決定・2026-09-18）', () => {
   it('PL の action 語彙に Human Recovery が存在しない', () => {
+    // 語彙に無い kind は `resolvePlActionPolicy()` が未知値として forbidden にする。
     expect(PL_ACTION_KINDS.some((kind) => kind.includes('human'))).toBe(false)
-    expect(PL_ACTION_KINDS).not.toContain('recover_task')
+    expect(PL_ACTION_KINDS.some((kind) => kind.includes('recover'))).toBe(false)
   })
 
   it('WORKER credential から recover route を呼べない（Default Deny のまま）', () => {
     expect(WORKER_ALLOWLIST.some((entry) => entry.url.includes('/recover'))).toBe(false)
+  })
+
+  it('PL ループの executor に Human Recovery の分岐が無い', () => {
+    // `executeAction()` / `allowedActionsFor()` に配線していないことを、実ファイルで固定する。
+    // in-process の PL は自分へ HTTP を打たないので、配線が無ければ到達経路が存在しない。
+    const loopPath = resolve(process.cwd(), 'apps/api/src/pl/executionLoop.ts')
+    // 読めなかったことを「配線が無い」と誤認しない（cwd が変わったら落とす）。
+    expect(existsSync(loopPath)).toBe(true)
+
+    const loop = readFileSync(loopPath, 'utf-8')
+    expect(loop).not.toContain('recoverBlockedTask')
+    expect(loop).not.toContain('humanRecovery')
+  })
+
+  it('**Human Recovery 自体は後段 Approval の証拠にならない。** ApprovalRequest を作らない', () => {
+    const { storage, taskId } = seed()
+
+    recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    // `checkApprovalGate()` は `approvalRequests.findById()` を根拠にする。
+    // 行が1件も作られない以上、この操作を証拠として束縛する方法が無い。
+    expect(storage.approvalRequests.findByTaskId(taskId)).toHaveLength(0)
+    expect(storage.approvalRequests.findActiveByTaskId(taskId)).toBeUndefined()
+    // audit 行は残るが、それは `approval_gate` の語彙ではない。
+    const audit = storage.auditLog.findByEntity('task', taskId)
+    expect(audit.every((entry) => entry.operation !== 'approval_granted')).toBe(true)
   })
 })
