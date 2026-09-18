@@ -28,6 +28,11 @@ const AUDIT_OPERATION = 'implement_timeout_sensor_fired'
 const AUDIT_ENTITY_TYPE = 'implement_timeout_sensor'
 const AUDIT_RESULT = 'fired'
 
+const EPOCH_ENTITY_TYPE = 'implement_timeout_policy_epoch'
+const EPOCH_ENTITY_ID = 'current'
+const EPOCH_OPERATION = 'implement_timeout_policy_epoch_started'
+const EPOCH_RESULT = 'started'
+
 const PROVIDER: AiCliProvider = 'claude_code'
 const MODE: AiCliMode = 'implement'
 
@@ -54,14 +59,6 @@ export const IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS = {
   P95_RATIO_OF_TIMEOUT: 0.6,
   /** C: p95 を口にするために最低限必要な成功サンプル数。 */
   P95_MIN_SAMPLES: 20,
-  /**
-   * A: 「現在の budget を使い切った」とみなす下限（timeout 値に対する割合）。
-   *
-   * **これが古い 300s 時代の timeout を巻き込まないための鍵である。** 900s 運用下では
-   * 810s 以上走った Job だけが A の対象になり、過去の ~300s の記録は入ってこない。
-   * Job 行に「そのとき何秒の budget だったか」は残っていないので、所要時間から判定する。
-   */
-  CURRENT_BUDGET_RATIO: 0.9,
 } as const
 
 export interface ImplementTimeoutFinding {
@@ -90,6 +87,77 @@ function hasChangedFiles(job: Job): boolean {
   return Array.isArray(job.changedFiles) && job.changedFiles.length > 0
 }
 
+/**
+ * **現在の budget がいつから有効かを返す。** 必要なら epoch 行を 1 行追記する。
+ *
+ * ## なぜ経過時間では駄目だったか
+ *
+ * 以前は「所要時間が budget の 90% 以上なら現在の budget 下の kill」と見なしていた。
+ * 300s -> 900s では 90% = 810s が旧 kill の ~304s を上回るので**たまたま**通っていたが、
+ * 隣接する値では破綻する: 900s -> 1000s にすると、旧 900s policy で落ちた Job は
+ * 900 秒走っているので新 budget の 90%（900s）を満たし、**旧 policy の Job が新 policy の
+ * 証拠として数えられ、`...:1000000` の重複排除キーまで使い切ってしまう**
+ * （CEO 指示・2026-09-18 の境界ケース。テストで固定した）。
+ *
+ * `completed_at` が後から別経路で書かれる場合もある（実際に abort cleanup が 22 時間後に
+ * 書いた行が production にある）ので、経過時間は regime の根拠として二重に弱い。
+ *
+ * ## 代わりに何を根拠にするか
+ *
+ * **「その budget が有効になった時刻」を記録し、それ以降に完了した Job だけを見る。**
+ * 新しい表は作らず、既存 `audit_log` に 1 行だけ置く。値が変わったときにだけ追記するので、
+ * 900 -> 1000 -> 900 と戻した場合も 3 行目が入り、最後の行が現在の epoch になる。
+ *
+ * **限界**: 初回はこの関数が呼ばれた瞬間が epoch になるので、**それ以前の Job は
+ * どの budget で走ったか分からないまま除外される**。過去を遡って regime を復元はしない
+ * （Job 行に budget が残っていない以上、復元する根拠が無い）。
+ */
+export function ensureImplementTimeoutPolicyEpoch(
+  storage: IStorage,
+  timeoutMs: number,
+  now: () => string = () => new Date().toISOString(),
+): string {
+  // findByEntity は created_at DESC 順なので先頭が最新。
+  const latest = storage.auditLog.findByEntity(EPOCH_ENTITY_TYPE, EPOCH_ENTITY_ID)[0]
+
+  let previousTimeoutMs: number | undefined
+  let previousEffectiveFrom: string | undefined
+  if (latest !== undefined) {
+    try {
+      const parsed = JSON.parse(latest.detail ?? '{}') as {
+        timeoutMs?: unknown,
+        effectiveFrom?: unknown,
+      } | null
+      if (typeof parsed?.timeoutMs === 'number') previousTimeoutMs = parsed.timeoutMs
+      if (typeof parsed?.effectiveFrom === 'string') previousEffectiveFrom = parsed.effectiveFrom
+    } catch {
+      // 壊れた行は「前の値が読めない」として扱い、新しい epoch を開く。
+    }
+    if (previousTimeoutMs === timeoutMs) {
+      // **起点は detail の `effectiveFrom` を正とする。** 監査行の `createdAt` は
+      // 行が書かれた時刻であって「その budget がいつから有効か」ではない。
+      // 同じ値を記録し直さない以上、両者は実質同じだが、
+      // 起点をデータとして持っておく方が読み手にも試験にも曖昧さが無い。
+      return previousEffectiveFrom ?? latest.createdAt
+    }
+  }
+
+  const effectiveFrom = now()
+  storage.auditLog.record({
+    actor: 'api',
+    operation: EPOCH_OPERATION,
+    entityType: EPOCH_ENTITY_TYPE,
+    entityId: EPOCH_ENTITY_ID,
+    result: EPOCH_RESULT,
+    detail: JSON.stringify({
+      timeoutMs,
+      effectiveFrom,
+      ...(previousTimeoutMs === undefined ? {} : { previousTimeoutMs }),
+    }),
+  })
+  return effectiveFrom
+}
+
 /** 昇順ソートした配列の分位点。サンプルが無ければ undefined。 */
 export function percentile(values: readonly number[], p: number): number | undefined {
   if (values.length === 0) return undefined
@@ -98,13 +166,15 @@ export function percentile(values: readonly number[], p: number): number | undef
 }
 
 /**
- * 判定本体（純関数）。`jobs` は新しい順で渡す。
+ * 判定本体（純関数）。`jobs` は完了が新しい順で渡す。
  *
- * `timeoutMs` は**判定時点で implement に与えている値**で、A と C の基準に使う。
+ * `policyEpochStart` 以降に**完了した** Job だけが、現在の budget 下で走ったと確定できる。
+ * `undefined` を渡した場合は epoch で絞らない（テスト用）。
  */
 export function evaluateImplementTimeoutSensors(
   jobs: readonly Job[],
   timeoutMs: number,
+  policyEpochStart?: string,
 ): ImplementTimeoutFinding[] {
   const t = IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS
   const window = jobs.slice(0, t.WINDOW)
@@ -114,22 +184,26 @@ export function evaluateImplementTimeoutSensors(
   const timeoutSeconds = timeoutMs / 1000
 
   /**
-   * **現在の budget を使い切って落ちたか。** A と B の両方がこれを通る。
+   * **現在の budget の下で、その budget に殺されたか。** A と B の両方がこれを通る。
    *
-   * Job 行には「そのとき何秒の budget だったか」が残っていないので、所要時間で近似する。
-   * これを B にも掛けないと、旧 300s 時代の timeout が新しい budget の証拠として
-   * 数えられてしまう（独立レビュー指摘）。
+   * 2 つの条件の積であり、**どちらも経過時間ではない**:
+   * 1. `provider_timeout` —— これは「こちらが渡した `timeoutMs` のタイマーが発火して
+   *    kill した」ことだけを意味する。設定箇所は `adapter.ts` の 1 箇所で、その元になる
+   *    `contained.timedOut` も `setTimeout(..., options.timeoutMs)` のコールバック 1 箇所だけ
+   * 2. `completedAt >= policyEpochStart` —— その budget が有効になった後に終わった
+   *
+   * 経過時間は使わない（`ensureImplementTimeoutPolicyEpoch()` の説明を参照）。
    */
-  const killedInsideCurrentBudget = (job: Job): boolean => {
+  const killedByCurrentBudget = (job: Job): boolean => {
     if (!isProviderTimeout(job)) return false
-    const seconds = durationSeconds(job)
-    return seconds !== undefined && seconds >= timeoutSeconds * t.CURRENT_BUDGET_RATIO
+    if (policyEpochStart === undefined) return true
+    return job.completedAt !== undefined && job.completedAt >= policyEpochStart
   }
 
   // ── A. 現在の budget を使い切って落ち、生成済みの変更を失った Job ──────
   // 「1 件でも再発したら再評価」なので Job ごとに 1 度だけ出す。
   for (const job of window) {
-    if (!killedInsideCurrentBudget(job) || !hasChangedFiles(job)) continue
+    if (!killedByCurrentBudget(job) || !hasChangedFiles(job)) continue
     const seconds = durationSeconds(job)!
     findings.push({
       sensorId: 'implement-timeout-discards-produced-work',
@@ -145,23 +219,24 @@ export function evaluateImplementTimeoutSensors(
         changedFileCount: job.changedFiles?.length ?? 0,
       },
       thresholdNote:
-        `provider_timeout かつ changedFiles ありで、所要時間が現在の budget の`
-        + ` ${t.CURRENT_BUDGET_RATIO * 100}% 以上。1 件でも再評価対象（CEO 指示・2026-09-18）。`,
+        `provider_timeout（= 渡した timeoutMs のタイマーが発火して kill された）かつ`
+        + ` changedFiles あり、かつ現在の budget が有効になった後に完了した Job。`
+        + ` 1 件でも再評価対象（CEO 指示・2026-09-18）。`,
     })
   }
 
   // ── B. timeout 率 ────────────────────────────────────────────────
   //
-  // **分子は「現在の budget を使い切った timeout」だけである。**
-  // ここを素の `isProviderTimeout` にしていると、deploy 直後の窓に残っている
-  // 旧 300s 時代の timeout だけで閾値を超えてしまう。しかも B の重複排除キーは
-  // budget 値なので、**一度そうやって発火すると同じ budget では二度と出ない** ——
-  // つまり後から本物の 900s 時代の証拠が揃っても黙る。
-  // 古い証拠で先に発火して、拾うべき将来の証拠を潰す形だった（独立レビュー指摘）。
+  // **分子は「現在の budget が有効になった後に、その budget で殺された Job」だけである。**
+  // ここを素の `isProviderTimeout` にしていると、deploy 直後の窓に残っている旧 policy の
+  // timeout だけで閾値を超えてしまう。しかも B の重複排除キーは budget 値なので、
+  // **一度そうやって発火すると同じ budget では二度と出ない** —— つまり後から本物の
+  // 証拠が揃っても黙る。古い証拠が、拾うべき将来の証拠を潰す形だった（独立レビュー指摘）。
   //
-  // 分母は窓全体（直近の implement Job すべて）のままにする。移行期は分母に旧 Job が
-  // 混じるぶん率が薄まるが、**薄まる方向＝発火しにくい方向**なので安全側である。
-  const timedOut = window.filter(killedInsideCurrentBudget)
+  // 分母は窓全体（直近に完了した implement Job すべて）のままにする。移行期は分母に
+  // 旧 policy の Job が混じるぶん率が薄まるが、**薄まる方向＝発火しにくい方向**なので
+  // 安全側であり、新しい閾値を増やさずに済む。
+  const timedOut = window.filter(killedByCurrentBudget)
   const rate = timedOut.length / window.length
   if (rate >= t.TIMEOUT_RATE) {
     findings.push({
@@ -188,6 +263,18 @@ export function evaluateImplementTimeoutSensors(
   }
 
   // ── C. 成功 Job の p95 が timeout へ接近 ──────────────────────────
+  //
+  // **C だけは epoch で絞らない。これは意図的である（CEO 判断・2026-09-18）。**
+  //
+  // - 旧 policy 下の成功 Job も**そのまま残して数える**。成功した Job の所要時間は
+  //   budget に打ち切られていない実測値なので、どの policy 下でも有効な標本である
+  // - 今回の 300s -> 900s のような**拡大**の局面では、旧成功（すべて 300s 未満）を
+  //   含めると p95 は必ず下がる。つまり**発火が遅くなる方向**にしか働かず、
+  //   移行期は保守的になる
+  // - **ただしこれは「経過時間から policy regime を正確に特定できる」という主張ではない。**
+  //   C が安全なのは「拡大の局面では混入が発火を遅らせるだけ」という**方向の議論**であって、
+  //   任意の policy 変更（とくに budget を縮める変更）に対して regime を言い当てられる
+  //   わけではない。budget を縮めるときは、ここの前提が反転することを確認すること
   const successSeconds = window
     .filter((job) => job.status === 'success')
     .map(durationSeconds)
@@ -231,13 +318,18 @@ export function implementTimeoutSensorEntityId(
 export function evaluateAndPersistImplementTimeoutSensors(
   storage: IStorage,
   timeoutMs: number,
+  now: () => string = () => new Date().toISOString(),
 ): ImplementTimeoutFinding[] {
+  // **判定より先に epoch を確定させる。** 初回はここが epoch の起点になるので、
+  // それ以前の Job（どの budget で走ったか分からない）は最初から対象外になる。
+  const policyEpochStart = ensureImplementTimeoutPolicyEpoch(storage, timeoutMs, now)
+
   const jobs = storage.jobs.findRecentAiCliJobs({
     provider: PROVIDER,
     mode: MODE,
     limit: IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW,
   })
-  const findings = evaluateImplementTimeoutSensors(jobs, timeoutMs)
+  const findings = evaluateImplementTimeoutSensors(jobs, timeoutMs, policyEpochStart)
 
   const newlyFired: ImplementTimeoutFinding[] = []
   for (const finding of findings) {

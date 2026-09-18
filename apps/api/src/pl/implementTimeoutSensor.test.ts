@@ -5,6 +5,7 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import {
   IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS,
+  ensureImplementTimeoutPolicyEpoch,
   evaluateAndPersistImplementTimeoutSensors,
   evaluateImplementTimeoutSensors,
   implementTimeoutSensorEntityId,
@@ -14,20 +15,27 @@ import {
 /**
  * 暫定 timeout（900s）を実データで再評価するためのセンサー（CEO 指示・2026-09-18）。
  *
- * ここで固定したいのは 5 点である。
+ * ここで固定したいのは 6 点である。
  * 1. A/B/C の 3 条件がそれぞれ正しく発火する
- * 2. **旧 300s 時代の timeout 記録で A が発火しない**（新しい値の評価にならないため）
- * 3. 同じ理由で **2 度目は発火しない**（毎 tick 同じ候補を出さない）
- * 4. timeout 値を変えたら B/C は**もう一度だけ**発火する
- * 5. センサーは timeout 値も Job も**書き換えない**
+ * 2. **policy epoch より前に完了した Job では A/B が発火しない**
+ * 3. **隣接する budget（900s -> 1000s）でも旧 policy の Job が新 policy を発火させない**
+ *    —— 経過時間ベースの判定はここで壊れていた
+ * 4. 同じ budget で 2 度目は発火しない（毎 tick 同じ候補を出さない）
+ * 5. 未完了（queued）の Job が窓を食い潰さない
+ * 6. センサーは timeout 値も Job も書き換えない
  */
 
-const BASE = new Date('2026-09-18T00:00:00.000Z').getTime()
+const EPOCH = '2026-09-18T00:00:00.000Z'
+/** epoch から `seconds` 秒後の時刻。テストの時刻をすべて epoch 基準で決める。 */
+const afterEpoch = (seconds: number): string =>
+  new Date(new Date(EPOCH).getTime() + seconds * 1000).toISOString()
+/** epoch より前の時刻。 */
+const beforeEpoch = (seconds: number): string =>
+  new Date(new Date(EPOCH).getTime() - seconds * 1000).toISOString()
 
-function job(overrides: Partial<Job> & { seconds?: number }): Job {
-  const { seconds = 60, ...rest } = overrides
-  const started = new Date(BASE).toISOString()
-  const completed = new Date(BASE + seconds * 1000).toISOString()
+function job(overrides: Partial<Job> & { seconds?: number, completedAt?: string }): Job {
+  const { seconds = 60, completedAt = afterEpoch(3600), ...rest } = overrides
+  const started = new Date(new Date(completedAt).getTime() - seconds * 1000).toISOString()
   return {
     id: `job-${Math.random().toString(36).slice(2, 10)}`,
     taskId: 'task-1',
@@ -38,7 +46,7 @@ function job(overrides: Partial<Job> & { seconds?: number }): Job {
     dryRun: false,
     createdAt: started,
     startedAt: started,
-    completedAt: completed,
+    completedAt,
     aiCliProvider: 'claude_code',
     aiCliMode: 'implement',
     changedFiles: [],
@@ -46,10 +54,11 @@ function job(overrides: Partial<Job> & { seconds?: number }): Job {
   } as Job
 }
 
-/** 現在の budget を使い切って落ち、生成済みの変更を失った Job（= A の対象）。 */
-function killedWithProducedWork(seconds: number): Job {
+/** budget に殺され、生成済みの変更を失った Job（= A の対象）。 */
+function killedWithProducedWork(seconds: number, completedAt = afterEpoch(3600)): Job {
   return job({
     seconds,
+    completedAt,
     status: 'failed',
     changedFiles: ['apps/api/src/pl/executionLoop.ts'],
     failureMetadata: { kind: 'provider_timeout' },
@@ -60,23 +69,22 @@ describe('evaluateImplementTimeoutSensors', () => {
   const T = CLAUDE_IMPLEMENT_TIMEOUT_MS
 
   it('サンプルが無ければ何も出さない', () => {
-    expect(evaluateImplementTimeoutSensors([], T)).toEqual([])
+    expect(evaluateImplementTimeoutSensors([], T, EPOCH)).toEqual([])
   })
 
   // ── A ────────────────────────────────────────────────────────
-  it('A: 現在の budget を使い切って落ち、変更を生成済みだった Job は 1 件でも発火する', () => {
-    const findings = evaluateImplementTimeoutSensors([killedWithProducedWork(900)], T)
+  it('A: budget に殺され、変更を生成済みだった Job は 1 件でも発火する', () => {
+    const findings = evaluateImplementTimeoutSensors([killedWithProducedWork(900)], T, EPOCH)
     const a = findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')
     expect(a).toHaveLength(1)
     expect(a[0].evidence).toMatchObject({ durationSeconds: 900, timeoutSeconds: 900 })
   })
 
-  // **これが一番効くテスト。** 過去の 300s 時代の記録で発火すると、
-  // 新しい値の評価ではなく歴史の再掲になってしまう。
-  it('A: 旧 300s 時代の timeout 記録では発火しない', () => {
-    const findings = evaluateImplementTimeoutSensors([killedWithProducedWork(304)], T)
-    expect(findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work'))
-      .toHaveLength(0)
+  // **epoch より前に完了した Job は、どの budget で走ったか分からないので対象外。**
+  it('A: policy epoch より前に完了した timeout では発火しない', () => {
+    const old = killedWithProducedWork(900, beforeEpoch(60))
+    expect(evaluateImplementTimeoutSensors([old], T, EPOCH)
+      .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 
   it('A: timeout でも changedFiles が無ければ発火しない（失われた生成物が無い）', () => {
@@ -86,67 +94,82 @@ describe('evaluateImplementTimeoutSensors', () => {
       changedFiles: [],
       failureMetadata: { kind: 'provider_timeout' },
     } as Partial<Job>)
-    expect(evaluateImplementTimeoutSensors([noWork], T)
+    expect(evaluateImplementTimeoutSensors([noWork], T, EPOCH)
+      .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
+  })
+
+  // **経過時間では判定しない。** `provider_timeout` は「渡した timeoutMs のタイマーが
+  // 発火して kill された」ことだけを意味し、長く走ったこととは別である。
+  it('A: provider_timeout でなければ、どれだけ長く走っていても発火しない', () => {
+    const slowButFinished = job({
+      seconds: 900,
+      status: 'failed',
+      changedFiles: ['apps/api/src/pl/executionLoop.ts'],
+      failureMetadata: { kind: 'other_failure' },
+    } as Partial<Job>)
+    expect(evaluateImplementTimeoutSensors([slowButFinished], T, EPOCH)
       .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 
   // ── B ────────────────────────────────────────────────────────
   it('B: timeout 率が 3% 以上なら発火する', () => {
-    // 50 件中 2 件 = 4%
     const jobs = [
       killedWithProducedWork(900), killedWithProducedWork(900),
       ...Array.from({ length: 48 }, () => job({ seconds: 60 })),
     ]
-    const b = evaluateImplementTimeoutSensors(jobs, T)
+    const b = evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === 'implement-timeout-rate-too-high')
     expect(b).toHaveLength(1)
     expect(b[0].evidence).toMatchObject({ windowSize: 50, budgetExhaustedTimeoutCount: 2 })
   })
 
-  // **B の分子も現在の budget に限る。** ここを素の provider_timeout にしていると、
-  // deploy 直後に窓へ残っている旧 300s 時代の timeout だけで発火し、
-  // しかも重複排除キーが budget 値なので、**本物の 900s 時代の証拠が出ても黙る**
-  // （独立レビュー指摘）。
-  it('B: 旧 300s 時代の timeout だけでは発火しない', () => {
-    // 50 件中 2 件が ~304s の timeout = 率だけ見れば 4% で閾値超え。
+  // B の分子にも epoch を掛けないと、旧 policy の timeout だけで発火し、
+  // budget 値を鍵にした重複排除キーを使い切ってしまう。
+  it('B: policy epoch より前の timeout だけでは発火しない', () => {
     const jobs = [
-      killedWithProducedWork(304), killedWithProducedWork(304),
+      killedWithProducedWork(900, beforeEpoch(120)),
+      killedWithProducedWork(900, beforeEpoch(60)),
       ...Array.from({ length: 48 }, () => job({ seconds: 60 })),
     ]
-    expect(evaluateImplementTimeoutSensors(jobs, T)
+    expect(evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === 'implement-timeout-rate-too-high')).toHaveLength(0)
   })
 
   it('B: timeout 率が 3% 未満なら発火しない', () => {
-    // 50 件中 1 件 = 2%
     const jobs = [
       killedWithProducedWork(900),
       ...Array.from({ length: 49 }, () => job({ seconds: 60 })),
     ]
-    expect(evaluateImplementTimeoutSensors(jobs, T)
+    expect(evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === 'implement-timeout-rate-too-high')).toHaveLength(0)
   })
 
   // ── C ────────────────────────────────────────────────────────
   it('C: 成功 p95 が timeout の 60% 以上なら発火する', () => {
-    // 25 件すべて 600s（= 900s の 66%）
     const jobs = Array.from({ length: 25 }, () => job({ seconds: 600 }))
-    const c = evaluateImplementTimeoutSensors(jobs, T)
+    const c = evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === 'implement-p95-approaching-timeout')
     expect(c).toHaveLength(1)
     expect(c[0].evidence).toMatchObject({ successSamples: 25, p95Seconds: 600 })
   })
 
-  // **サンプル不足で p95 を口にしない。** 数字を作らないための条件（CEO 指示）。
+  // **C は epoch で絞らない（意図的）。** 成功 Job の所要時間は打ち切られていない実測値なので、
+  // どの policy 下のものでも標本として有効である。
+  it('C: epoch より前の成功 Job も標本に含める', () => {
+    const jobs = Array.from({ length: 25 }, () => job({ seconds: 600, completedAt: beforeEpoch(60) }))
+    expect(evaluateImplementTimeoutSensors(jobs, T, EPOCH)
+      .filter((f) => f.sensorId === 'implement-p95-approaching-timeout')).toHaveLength(1)
+  })
+
   it('C: 成功サンプルが 20 件未満なら p95 を判定しない', () => {
     const jobs = Array.from({ length: 19 }, () => job({ seconds: 600 }))
-    expect(evaluateImplementTimeoutSensors(jobs, T)
+    expect(evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === 'implement-p95-approaching-timeout')).toHaveLength(0)
   })
 
   it('C: p95 が 60% 未満なら発火しない', () => {
     const jobs = Array.from({ length: 25 }, () => job({ seconds: 200 }))
-    expect(evaluateImplementTimeoutSensors(jobs, T)
+    expect(evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === 'implement-p95-approaching-timeout')).toHaveLength(0)
   })
 
@@ -155,7 +178,7 @@ describe('evaluateImplementTimeoutSensors', () => {
       ...Array.from({ length: IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW }, () => job({ seconds: 60 })),
       killedWithProducedWork(900),  // WINDOW の外
     ]
-    expect(evaluateImplementTimeoutSensors(jobs, T)
+    expect(evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 })
@@ -181,7 +204,13 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     return task.id
   }
 
-  function createTimedOutJob(storage: IStorage, taskId: string, seconds: number): void {
+  /** `completedAt` を明示して Job を作る。epoch との前後関係をテストが決められるようにする。 */
+  function createTimedOutJob(
+    storage: IStorage,
+    taskId: string,
+    seconds: number,
+    completedAt: string,
+  ): void {
     const created = storage.jobs.create({
       taskId,
       projectId: storage.tasks.findById(taskId)!.projectId,
@@ -192,20 +221,26 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
       aiCliProvider: 'claude_code',
       aiCliMode: 'implement',
     } as never)
-    const started = new Date(BASE).toISOString()
     storage.jobs.update(created.id, {
       status: 'failed',
-      startedAt: started,
-      completedAt: new Date(BASE + seconds * 1000).toISOString(),
+      startedAt: new Date(new Date(completedAt).getTime() - seconds * 1000).toISOString(),
+      completedAt,
       changedFiles: ['apps/api/src/pl/executionLoop.ts'],
       failureMetadata: { kind: 'provider_timeout' },
     } as never)
   }
 
+  /** ある時刻の `seconds` 秒後。 */
+  const after = (iso: string, seconds: number): string =>
+    new Date(new Date(iso).getTime() + seconds * 1000).toISOString()
+
   it('発火を audit_log へ残し、2 度目は残さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const taskId = seed(storage)
-    createTimedOutJob(storage, taskId, 900)
+
+    // epoch を先に確定させ、その後に完了した Job を置く。
+    const epoch = ensureImplementTimeoutPolicyEpoch(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS, () => EPOCH)
+    createTimedOutJob(storage, taskId, 900, after(epoch, 900))
 
     const first = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
     expect(first.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(1)
@@ -215,94 +250,64 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     expect(second.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
   })
 
-  // **B は budget ごとに 1 度だけ。** そして budget を変えたら、
-  // **その budget を使い切った Job が出てきたときに**もう一度だけ出る。
-  // 同じ Job が両方の budget を満たすことは（判定が budget 相対なので）起きない。
-  it('B は budget ごとに 1 度だけ発火し、budget を変えれば新しい証拠で再発火する', () => {
+  // **policy regime の判定は経過時間では代用できない。**
+  // 旧 budget 900s で落ちた Job は 900 秒走っているので、「新 budget 1000s の 90% = 900 秒以上」
+  // という経過時間の条件を満たしてしまう。そのため旧 policy の Job が新 policy の証拠として
+  // 数えられ、`...:1000000` の重複排除キーまで使い切っていた（CEO 指示・2026-09-18 の境界ケース）。
+  // 300s -> 900s では 90% = 810 > 304 なので偶然通っていただけだった。
+  it('隣接する budget へ変えても、旧 policy の Job は新 policy を発火させない', () => {
     const storage = createSQLiteStorage(':memory:')
     const taskId = seed(storage)
-    createTimedOutJob(storage, taskId, 900)
 
-    const first = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
-    expect(first.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(true)
+    // 時刻を明示して進める。epoch の前後関係が 1 ミリ秒差に左右されないようにする。
+    const T0 = EPOCH
+    const T1 = after(T0, 3_600)   // 旧 policy の Job が終わった時刻
+    const T2 = after(T0, 7_200)   // budget を広げた時刻
+    const T3 = after(T0, 10_800)  // 新 policy の Job が終わった時刻
 
-    // 同じ budget では何度回しても出ない。
-    const again = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
-    expect(again.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(false)
+    // 旧 policy（900s）の下で 900 秒走って落ちた Job。
+    ensureImplementTimeoutPolicyEpoch(storage, 900_000, () => T0)
+    createTimedOutJob(storage, taskId, 900, T1)
+    const underOldPolicy = evaluateAndPersistImplementTimeoutSensors(storage, 900_000, () => T1)
+    expect(underOldPolicy.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(true)
 
-    // budget を広げた直後は、**既存の 900s の証拠では出ない**（新しい budget を
-    // 使い切っていないため）。ここで出てしまうと、古い証拠で新しいキーを潰すことになる。
-    const widened = evaluateAndPersistImplementTimeoutSensors(storage, 1_200_000)
-    expect(widened.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(false)
+    // budget を 1000s へ広げる。**新しい証拠はまだ 1 件も無い。**
+    // 旧 Job は 900 秒走っているので、経過時間だけを見ると新 budget の 90% を満たしてしまう。
+    const underNewPolicy = evaluateAndPersistImplementTimeoutSensors(storage, 1_000_000, () => T2)
+    expect(underNewPolicy.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(false)
+    expect(underNewPolicy.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(false)
 
-    // 新しい budget を使い切った Job が出て初めて、もう一度だけ出る。
-    createTimedOutJob(storage, taskId, 1_200)
-    const afterNewEvidence = evaluateAndPersistImplementTimeoutSensors(storage, 1_200_000)
-    expect(afterNewEvidence.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(true)
+    // `...:1000000` の重複排除キーが消費されていないこと。
+    // 消費されていると、本物の 1000s 時代の証拠が出ても二度と発火しない。
+    createTimedOutJob(storage, taskId, 1_000, T3)
+    const withRealEvidence = evaluateAndPersistImplementTimeoutSensors(storage, 1_000_000, () => T3)
+    expect(withRealEvidence.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(true)
+    expect(withRealEvidence.some((f) => f.sensorId === 'implement-timeout-rate-too-high')).toBe(true)
   })
 
-  // **「直近 N 件」は作成順ではなく結果が出た順。**
-  // production には 7〜20 日 queued のままの Job が実在するので、作成順で窓を切ると、
-  // 「長く積まれてから今日走って落ちた Job」が窓の外に落ちて A が発火しない（独立レビュー指摘）。
-  it('古く作られて今日終わった Job も窓に入る', () => {
+  // budget を元へ戻した場合、epoch 行がもう 1 行積まれて新しい起点になる。
+  it('budget を戻したときは新しい epoch が始まる', () => {
     const storage = createSQLiteStorage(':memory:')
-    const taskId = seed(storage)
-
-    // 先に「今日終わった、ずっと前に作られた」Job を 1 件作る。
-    const old = storage.jobs.create({
-      taskId,
-      projectId: storage.tasks.findById(taskId)!.projectId,
-      agentRole: 'developer_ai',
-      status: 'queued',
-      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
-      dryRun: false,
-      aiCliProvider: 'claude_code',
-      aiCliMode: 'implement',
-    } as never)
-    storage.jobs.update(old.id, {
-      status: 'failed',
-      startedAt: new Date(BASE).toISOString(),
-      completedAt: new Date(BASE + 900 * 1000).toISOString(),
-      changedFiles: ['apps/api/src/pl/executionLoop.ts'],
-      failureMetadata: { kind: 'provider_timeout' },
-    } as never)
-
-    // そのあとに WINDOW 件ぶん、**より新しく作られた**が
-    // **より前に終わった** Job を積む。作成順なら古い方が押し出される。
-    for (let i = 0; i < IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW; i++) {
-      const newer = storage.jobs.create({
-        taskId,
-        projectId: storage.tasks.findById(taskId)!.projectId,
-        agentRole: 'developer_ai',
-        status: 'queued',
-        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
-        dryRun: false,
-        aiCliProvider: 'claude_code',
-        aiCliMode: 'implement',
-      } as never)
-      storage.jobs.update(newer.id, {
-        status: 'success',
-        startedAt: new Date(BASE - 86_400_000).toISOString(),
-        completedAt: new Date(BASE - 86_400_000 + 60_000).toISOString(),
-      } as never)
-    }
-
-    const fired = evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
-    expect(fired.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(true)
+    const first = ensureImplementTimeoutPolicyEpoch(storage, 900_000, () => EPOCH)
+    ensureImplementTimeoutPolicyEpoch(storage, 1_000_000, () => after(EPOCH, 60))
+    const back = ensureImplementTimeoutPolicyEpoch(storage, 900_000, () => after(EPOCH, 120))
+    expect(back).not.toBe(first)
+    expect(back).toBe(after(EPOCH, 120))
+    // 同じ値を続けて聞いても epoch は動かない。
+    expect(ensureImplementTimeoutPolicyEpoch(storage, 900_000, () => after(EPOCH, 180))).toBe(back)
   })
 
   // **未完了の Job に窓を食い潰させない。**
   // queued 行は並べ替えの基準に created_at しか持たないので、新しく作られた queued が
   // 大量にあると LIMIT の内側を占め、今日落ちた本物の timeout を押し出してしまう
-  // （production には 7〜20 日 queued のままの Job が 3 件実在する）。独立レビュー指摘。
+  // （production には 7〜20 日 queued のままの Job が 3 件実在する）。
   it('新しく作られた queued Job は、完了済みの timeout 証拠を窓から押し出さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const taskId = seed(storage)
 
-    // 今日 900s で落ちた本物の証拠を 1 件。
-    createTimedOutJob(storage, taskId, 900)
+    const epoch = ensureImplementTimeoutPolicyEpoch(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS, () => EPOCH)
+    createTimedOutJob(storage, taskId, 900, after(epoch, 900))
 
-    // そのあとに、WINDOW を超える数の queued を作る（完了していない）。
     for (let i = 0; i < IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW + 5; i++) {
       storage.jobs.create({
         taskId,
@@ -330,7 +335,8 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
   it('Job を書き換えない', () => {
     const storage = createSQLiteStorage(':memory:')
     const taskId = seed(storage)
-    createTimedOutJob(storage, taskId, 900)
+    const epoch = ensureImplementTimeoutPolicyEpoch(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS, () => EPOCH)
+    createTimedOutJob(storage, taskId, 900, after(epoch, 900))
     const before = storage.jobs.findByTaskId(taskId).map((j) => ({ ...j }))
 
     evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
