@@ -121,9 +121,13 @@ function latestReviewRejectedCurrentSpec(storage: IStorage, task: Task): boolean
  * 集合が空なら guard は何もしない。初回採用・follow-up・却下歴の無い Task・ALIGNED 済み Task が
  * 自動的に対象外になるのはこのためである（専用の trigger 判定を別に持たない）。
  */
-function rejectedSpecKeysForAdoption(storage: IStorage, task: Task): string[] {
+function rejectedSpecKeysForAdoption(
+  storage: IStorage,
+  task: Task,
+  currentSpecRejected: boolean,
+): string[] {
   const keys = collectRejectedSpecKeys(storage, task)
-  if (latestReviewRejectedCurrentSpec(storage, task)) return keys
+  if (currentSpecRejected) return keys
 
   const currentKey = shortSpecKey({
     implementationScope: extractImplementationScope(task.description) ?? '',
@@ -560,7 +564,8 @@ export async function adoptRoadmapItem(
       allowedPaths,
     })
     // **却下が実際に在るものだけを集める。** 空なら guard は何もしない。
-    const rejectedKeys = rejectedSpecKeysForAdoption(storage, existingTask)
+    const currentSpecRejected = latestReviewRejectedCurrentSpec(storage, existingTask)
+    const rejectedKeys = rejectedSpecKeysForAdoption(storage, existingTask, currentSpecRejected)
     if (rejectedKeys.length > 0 && !isMateriallyDifferentSpec(rejectedKeys, proposedKey)) {
       return {
         ok: false,
@@ -593,7 +598,14 @@ export async function adoptRoadmapItem(
     // 採用が後で失敗しても真のままである。だから sync の前に書いてよく、
     // **書けたか書けなかったかで状態が食い違う窓を作らない**（独立レビュー指摘・2026-09-18）。
     // 同じ事実を重ねて書いても `collectRejectedSpecKeys()` は Set で畳む。
-    if (rejectedKeys.length > 0) {
+    //
+    // **条件は `currentSpecRejected` であって `rejectedKeys.length > 0` ではない。**
+    // 後者は「どれかが却下された」しか意味せず、それで記録すると
+    // A 却下 → 未レビューの B を採用 → C を採用、の3手目で **B を却下済みとして書いてしまう**
+    // （B は一度も formal review に落とされていない）。その後 B へ戻れなくなる
+    // ——「却下が在るか」と「**今の** spec が却下されたか」の取り違えで、
+    // guard 側で一度直したのと同じ誤りである（独立レビュー round 3 指摘）。
+    if (currentSpecRejected) {
       recordRemediationFailure(
         storage,
         existingTask.id,
