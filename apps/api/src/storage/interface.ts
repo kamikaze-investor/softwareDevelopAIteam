@@ -327,6 +327,9 @@ export interface IJobStorage {
    * 未完了（queued / running）の行は含めない。終わっていない Job は timeout 率にも
    * p95 にも寄与しようが無く、含めると窓を食い潰して本物の証拠を押し出す。
    *
+   * 判定は `status` を主とする。`completed_at` は requeue の部分更新で前回の値が
+   * 残ることがあり、それだけでは「完了済み」の証明にならない。
+   *
    * timeout 再評価センサーが「直近 N 件」を数えるためだけに足したもので、
    * 新しい集計基盤ではない。materialize するのは既存 `jobs` 行そのものである。
    */

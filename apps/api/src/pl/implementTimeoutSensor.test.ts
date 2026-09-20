@@ -427,6 +427,44 @@ describe('evaluateAndPersistImplementTimeoutSensors', () => {
     expect(fired.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(true)
   })
 
+  // **requeue された行は `completed_at` が前回のまま残る。**
+  // `jobs.update()` は `{ ...existing, ...data }` なので、`PATCH { status: queued }` では
+  // `completed_at` が消えない（独立レビュー指摘）。`completed_at IS NOT NULL` だけで窓を
+  // 作ると、requeue 済みの行が「完了済み」として窓を食い潰し、
+  // 本物の timeout を押し出すという元の問題が再発する。
+  it('requeue されて completed_at が残っている行は窓に入らない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const taskId = seed(storage)
+
+    const epoch = ensureImplementTimeoutPolicyEpoch(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS, () => EPOCH)
+    createTimedOutJob(storage, taskId, 900, after(epoch, 900))
+
+    // 一度終わってから requeue された行を WINDOW 件ぶん作る。
+    // `status` は queued だが `completed_at` は**より新しい値のまま残っている**。
+    for (let i = 0; i < IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS.WINDOW + 5; i++) {
+      const created = storage.jobs.create({
+        taskId,
+        projectId: storage.tasks.findById(taskId)!.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'implement',
+      } as never)
+      // 前回の実行の痕跡だけが残り、status は queued へ戻っている状態。
+      storage.jobs.update(created.id, {
+        status: 'queued',
+        completedAt: after(epoch, 5_000 + i),
+      } as never)
+    }
+
+    const fired = evaluateAndPersistImplementTimeoutSensors(
+      storage, CLAUDE_IMPLEMENT_TIMEOUT_MS, () => EPOCH,
+    )
+    expect(fired.some((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toBe(true)
+  })
+
   it('entity id は sensorId と scope だけで決まる', () => {
     expect(implementTimeoutSensorEntityId({
       sensorId: 'implement-timeout-rate-too-high', scope: '900000',
