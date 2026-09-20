@@ -132,6 +132,26 @@ describe('evaluateImplementTimeoutSensors', () => {
     expect(findings.filter((f) => f.sensorId === 'implement-timeout-rate-too-high')).toHaveLength(0)
   })
 
+  // **時刻は文字列ではなく時刻として比べる。** ISO 表記は 1 つではないので、
+  // 辞書順で比べると同じ瞬間でも前後を取り違える（独立レビュー指摘）。
+  it('epoch が別表記（+09:00）でも、時刻として正しく前後を判定する', () => {
+    // `2026-09-18T09:00:00+09:00` は EPOCH と同じ瞬間だが、文字列としては大きい。
+    const sameInstantOtherNotation = '2026-09-18T09:00:00+09:00'
+    const startedJustAfter = killedWithProducedWork(900, afterEpoch(3_600))
+    // 開始は epoch の 1 秒後。
+    const afterByOneSecond = {
+      ...startedJustAfter,
+      startedAt: afterEpoch(1),
+      completedAt: afterEpoch(901),
+    } as Job
+
+    const findings = evaluateImplementTimeoutSensors(
+      [afterByOneSecond], T, sameInstantOtherNotation,
+    )
+    expect(findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work'))
+      .toHaveLength(1)
+  })
+
   // ── B ────────────────────────────────────────────────────────
   it('B: timeout 率が 3% 以上なら発火する', () => {
     const jobs = [

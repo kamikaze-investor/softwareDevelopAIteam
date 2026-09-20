@@ -129,7 +129,10 @@ function hasChangedFiles(job: Job): boolean {
 function usableEpoch(candidate: string, now: () => string): string | undefined {
   const parsed = Date.parse(candidate)
   if (Number.isNaN(parsed)) return undefined
-  return parsed > Date.parse(now()) ? undefined : candidate
+  if (parsed > Date.parse(now())) return undefined
+  // **正規化して返す。** `Date.parse()` は `2026-09-18T09:00:00+09:00` のような
+  // 別表記も受け付けるので、そのまま持ち回ると文字列比較が壊れる（独立レビュー指摘）。
+  return new Date(parsed).toISOString()
 }
 
 export function ensureImplementTimeoutPolicyEpoch(
@@ -224,17 +227,26 @@ export function evaluateImplementTimeoutSensors(
    * だけで「今日終わった」ことになり、新しい epoch の証拠として数えられてしまう
    * （独立レビュー指摘。production には実際に 22 時間後に `completed_at` が書かれた行がある）。
    *
-   * `startedAt` は Worker が Job を claim して `running` にする瞬間に 1 度だけ書かれ
-   * （`apps/worker/src/index.ts`）、park も abort もこれを書き換えない。
-   * 意味の上でも **timeout は spawn 時点の budget で決まる**ので、開始時刻で見るのが正しい。
+   * `startedAt` は Worker が Job を claim して `running` にする瞬間に書かれる
+   * （`apps/worker/src/index.ts`）。**不変ではない**: 承認待ちからの resume / requeue で
+   * `started_at = NULL` に戻され（`sqlite.ts`）、次に claim されたときに書き直される。
+   * つまりこれは「この Job 行が最後に**走り出した**時刻」である（独立レビュー指摘）。
+   *
+   * **その意味でちょうど良い。** 殺したのは最後の実行で、その実行に適用された budget は
+   * 走り出した時点のものだからである。park や abort が書き換える `completedAt` と違い、
+   * 書き換わるのは「実際にもう一度走ったとき」だけで、そのときは regime も本当に変わる。
    *
    * 経過時間は使わない（`ensureImplementTimeoutPolicyEpoch()` の説明を参照）。
    */
+  const epochStartedAt = policyEpochStart === undefined ? undefined : Date.parse(policyEpochStart)
   const killedByCurrentBudget = (job: Job): boolean => {
     if (!isProviderTimeout(job)) return false
-    if (policyEpochStart === undefined) return true
-    // 開始していない Job は provider_timeout になり得ないが、型の上では undefined を取る。
-    return job.startedAt !== undefined && job.startedAt >= policyEpochStart
+    if (epochStartedAt === undefined || Number.isNaN(epochStartedAt)) return true
+    if (job.startedAt === undefined) return false
+    // **文字列ではなく時刻として比べる。** ISO 表記は 1 つではないので、
+    // 辞書順比較は同じ瞬間でも前後を取り違える（独立レビュー指摘）。
+    const started = Date.parse(job.startedAt)
+    return !Number.isNaN(started) && started >= epochStartedAt
   }
 
   // ── A. 現在の budget を使い切って落ち、生成済みの変更を失った Job ──────
