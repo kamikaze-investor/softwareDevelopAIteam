@@ -152,6 +152,26 @@ describe('evaluateImplementTimeoutSensors', () => {
       .toHaveLength(1)
   })
 
+  // **再実行して成功した行に、古い timeout の印が残る。**
+  // requeue の UPDATE は `failure_metadata` を消さず、`PATCH /api/jobs/:id` も部分更新なので、
+  // 明示的に上書きしない限り前回の `provider_timeout` がそのまま残る（独立レビュー指摘）。
+  // これを数えると**成功した Job で A が発火**し、B の率まで押し上げてしまう。
+  it('再実行して成功した Job に古い provider_timeout が残っていても発火しない', () => {
+    const succeededAfterRetry = job({
+      seconds: 120,
+      startedAt: afterEpoch(1_000),
+      completedAt: afterEpoch(1_120),
+      status: 'success',
+      changedFiles: ['apps/api/src/pl/executionLoop.ts'],
+      // 前回の実行で付いた印が残っている。
+      failureMetadata: { kind: 'provider_timeout' },
+    } as Partial<Job>)
+
+    const findings = evaluateImplementTimeoutSensors([succeededAfterRetry], T, EPOCH)
+    expect(findings.filter((f) => f.sensorId === 'implement-timeout-discards-produced-work')).toHaveLength(0)
+    expect(findings.filter((f) => f.sensorId === 'implement-timeout-rate-too-high')).toHaveLength(0)
+  })
+
   // ── B ────────────────────────────────────────────────────────
   it('B: timeout 率が 3% 以上なら発火する', () => {
     const jobs = [

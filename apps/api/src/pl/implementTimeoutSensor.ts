@@ -53,7 +53,12 @@ const MODE: AiCliMode = 'implement'
 export const IMPLEMENT_TIMEOUT_SENSOR_THRESHOLDS = {
   /** 直近何件の implement Job を母集団にするか。 */
   WINDOW: 50,
-  /** B: provider_timeout 率がこれ以上なら再評価（変更前は 7.3%）。 */
+  /**
+   * B: **現在の budget に殺された** Job の率がこれ以上なら再評価。
+   *
+   * `provider_timeout` 全体の率ではない。epoch より前に開始した timeout は分子に入らない。
+   * 変更前の実測 7.3% は provider_timeout 全体の率なので、**同じ量ではない**。
+   */
   TIMEOUT_RATE: 0.03,
   /** C: 成功 Job の p95 が timeout 値のこの割合へ達したら再評価。 */
   P95_RATIO_OF_TIMEOUT: 0.6,
@@ -79,8 +84,21 @@ function durationSeconds(job: Job): number | undefined {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined
 }
 
-function isProviderTimeout(job: Job): boolean {
-  return job.failureMetadata?.kind === 'provider_timeout'
+/**
+ * **その Job の現在の状態が「budget に殺された失敗」であるか。**
+ *
+ * `failureMetadata` だけでは足りない。requeue の UPDATE は `status` / `started_at` /
+ * `completed_at` などを戻すが **`failure_metadata` は消さない**（`sqlite.ts`）。
+ * `PATCH /api/jobs/:id` も部分更新で、`JSON.stringify` が `undefined` を落とすため、
+ * 明示的に上書きしない限り古い値が残る。つまり **timeout した Job を再実行して成功しても、
+ * 行には `provider_timeout` が残りうる**（独立レビュー指摘）。
+ *
+ * そのまま数えると、**成功した Job で A が発火し**、B の率を押し上げて
+ * budget ごとの重複排除キーを本物の証拠が出る前に使い切ってしまう。
+ * `status === 'failed'` を併せて要求すれば、再実行して成功した行は外れる。
+ */
+function killedByBudget(job: Job): boolean {
+  return job.status === 'failed' && job.failureMetadata?.kind === 'provider_timeout'
 }
 
 function hasChangedFiles(job: Job): boolean {
@@ -214,9 +232,11 @@ export function evaluateImplementTimeoutSensors(
    * **現在の budget の下で、その budget に殺されたか。** A と B の両方がこれを通る。
    *
    * 2 つの条件の積であり、**どちらも経過時間ではない**:
-   * 1. `provider_timeout` —— これは「こちらが渡した `timeoutMs` のタイマーが発火して
-   *    kill した」ことだけを意味する。設定箇所は `adapter.ts` の 1 箇所で、その元になる
-   *    `contained.timedOut` も `setTimeout(..., options.timeoutMs)` のコールバック 1 箇所だけ
+   * 1. `status === 'failed'` かつ `provider_timeout` —— 後者は「こちらが渡した `timeoutMs` の
+   *    タイマーが発火して kill した」ことだけを意味する。設定箇所は `adapter.ts` の 1 箇所で、
+   *    その元になる `contained.timedOut` も `setTimeout(..., options.timeoutMs)` の
+   *    コールバック 1 箇所だけ。`status` も見るのは、requeue が `failure_metadata` を
+   *    消さないため、**再実行して成功した行に古い印が残る**から（`killedByBudget()` 参照）
    * 2. `startedAt >= policyEpochStart` —— その budget が有効になった後に**開始**した
    *
    * ## なぜ `completedAt` ではなく `startedAt` か
@@ -240,7 +260,7 @@ export function evaluateImplementTimeoutSensors(
    */
   const epochStartedAt = policyEpochStart === undefined ? undefined : Date.parse(policyEpochStart)
   const killedByCurrentBudget = (job: Job): boolean => {
-    if (!isProviderTimeout(job)) return false
+    if (!killedByBudget(job)) return false
     if (epochStartedAt === undefined || Number.isNaN(epochStartedAt)) return true
     if (job.startedAt === undefined) return false
     // **文字列ではなく時刻として比べる。** ISO 表記は 1 つではないので、
@@ -277,7 +297,7 @@ export function evaluateImplementTimeoutSensors(
   // ── B. timeout 率 ────────────────────────────────────────────────
   //
   // **分子は「現在の budget が有効になった後に、その budget で殺された Job」だけである。**
-  // ここを素の `isProviderTimeout` にしていると、deploy 直後の窓に残っている旧 policy の
+  // ここを素の `killedByBudget` にしていると、deploy 直後の窓に残っている旧 policy の
   // timeout だけで閾値を超えてしまう。しかも B の重複排除キーは budget 値なので、
   // **一度そうやって発火すると同じ budget では二度と出ない** —— つまり後から本物の
   // 証拠が揃っても黙る。古い証拠が、拾うべき将来の証拠を潰す形だった（独立レビュー指摘）。
