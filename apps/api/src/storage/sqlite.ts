@@ -823,7 +823,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         return { ok: true as const, task: updated }
       })
 
-      return tx(input.taskId, input.detail)
+      // **IMMEDIATE で開始する。** この transaction は「`blocked` であること」を読んでから
+      // 書くので、deferred のままだと最初の書き込みまで write lock を取らず、
+      // **判定と書き込みの間に別 connection が status を動かせる**。
+      // それでは transaction 内で status を読み直している意味が無い。
+      // `jobs.update()` の claim が同じ理由で IMMEDIATE にしてあるのと同じ扱いである。
+      return tx.immediate(input.taskId, input.detail)
     },
     findByProjectId(projectId) {
       const rows = db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as any[]
