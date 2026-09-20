@@ -56,6 +56,7 @@ import {
   type RawStrategicResult,
 } from '../designReview/designReviewCoordinator'
 import { DEFAULT_STALL_HINT_MS, type AttentionItem } from '../state/systemState'
+import { isReachableByAutonomousLoop } from '../humanRecovery/recoveryAudit'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 
@@ -548,6 +549,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     const recomputed = recomputedDecisionOf(storage, item.taskId)
     const reviewIsConflict = stalled?.status === 'succeeded' && recomputed === 'CONFLICT'
 
+    // **Human Recovery が実際に受理する形かを、ここでも同じ述語で判定する。**
+    // 揃えないと「`/recover` を使え」と案内しておきながら endpoint が
+    // `TASK_NOT_REACHABLE` で断る、という実行不能な選択肢を CEO へ出すことになる
+    // （独立レビュー指摘・2026-09-21）。
+    const recoverableByHuman = item.taskId !== undefined
+      && (() => {
+        const task = storage.tasks.findById(item.taskId as string)
+        return task !== undefined && isReachableByAutonomousLoop(task)
+      })()
+
     return {
       ...result,
       // 原因の語彙は増やさない。CONFLICT で止まったならそれが原因であり、
@@ -566,7 +577,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           }]
           : []),
       ],
-      recoverable: true,
+      recoverable: recoverableByHuman,
       // CONFLICT が読めているときだけ原因を断定できる。読めないなら状態しか分かっていない。
       confidence: reviewIsConflict ? 'high' : 'low',
       recommendedLane: 'ceo_escalation',
@@ -577,8 +588,14 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
         + (reviewIsConflict
           ? `直近の task-kind Design Review は ${recomputed} で、evidence が登録されていない。`
           : '')
-        + ' CEO が Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻すか、'
-        + '訂正した implementationScope / allowedPaths で採用し直す必要がある。',
+        + (recoverableByHuman
+          ? ' CEO が Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻すか、'
+            + '訂正した implementationScope / allowedPaths で採用し直す必要がある。'
+          // 到達不能な形（roadmapActive=false 等）は再投入しても誰も拾わないので、
+          // `/recover` は `TASK_NOT_REACHABLE` で断る。案内してはならない。
+          : ' さらにこの Task は自律ループから到達できない形（roadmapActive=false /'
+            + ' assignee が developer_ai でない）なので、**Human Recovery でも戻せない**。'
+            + '採用し直すか park する必要がある。'),
     }
   }
 
@@ -878,22 +895,38 @@ function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string;
     // **Remediation が構造的に届かないもの**（blocked かつ Job 0 件）だけである。
     // したがって「もう一度 Remediation へ」は選択肢にならない。まず再投入が要る。
     case 'design_review_conflict':
-      return {
-        decision:
-          'CONFLICT で止まった Task が、自動復旧経路から外れた状態にある。どう戻すか。',
-        options: [
-          'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻し、'
-          + 'Independent Remediation に fresh Design Review を起こさせる',
-          // **順序を書かないと実行できない選択肢になる。** `syncRoadmapTasks()` は
-          // `status === 'pending'` の Task しか可変として扱わないので、blocked のまま
-          // 採用し直すと `SYNC_FAILED` で弾かれる（独立レビュー round 2 指摘）。
-          'まず Human Recovery で `pending` へ戻し、**そのうえで**訂正した '
-          + 'implementationScope / allowedPaths で Roadmap 項目を採用し直す'
-          + '（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）。'
-          + '**blocked のまま採用し直すと `SYNC_FAILED` になる**',
-          'この Task を park する（`abort_task`）',
-        ],
-      }
+      // **`recoverable` は「Human Recovery が実際に受理する形か」を表す。**
+      // false の Task へ `/recover` を勧めると endpoint が `TASK_NOT_REACHABLE` で断り、
+      // CEO は実行できない選択肢を渡されることになる（独立レビュー指摘・2026-09-21）。
+      return diagnosis.recoverable
+        ? {
+          decision:
+            'CONFLICT で止まった Task が、自動復旧経路から外れた状態にある。どう戻すか。',
+          options: [
+            'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻し、'
+            + 'Independent Remediation に fresh Design Review を起こさせる',
+            // **順序を書かないと実行できない選択肢になる。** `syncRoadmapTasks()` は
+            // `status === 'pending'` の Task しか可変として扱わないので、blocked のまま
+            // 採用し直すと `SYNC_FAILED` で弾かれる（独立レビュー round 2 指摘）。
+            'まず Human Recovery で `pending` へ戻し、**そのうえで**訂正した '
+            + 'implementationScope / allowedPaths で Roadmap 項目を採用し直す'
+            + '（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）。'
+            + '**blocked のまま採用し直すと `SYNC_FAILED` になる**',
+            'この Task を park する（`abort_task`）',
+          ],
+        }
+        : {
+          decision:
+            'CONFLICT で止まった Task が、自律ループから到達できない形（roadmapActive=false / '
+            + 'assignee が developer_ai でない）で残っている。Human Recovery では戻せない。',
+          options: [
+            'Roadmap 項目を採用し直して、自律ループが拾える Task を作る'
+            + '（CONFLICT の原因が ledger 本文なら先に本文を訂正する）',
+            'この Task を park する（`abort_task`）',
+            '意図的に現役から外してある Task なら、そのまま放置してよい'
+            + '（attention は残るが、進めるべき作業ではない）',
+          ],
+        }
     case 'design_review_exhausted':
       return {
         decision: 'bounded retry を使い切った Design Review をどう扱うか。',

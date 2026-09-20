@@ -67,7 +67,7 @@
  */
 
 import type { IStorage } from '../storage/interface'
-import { latestHumanRecoveryId } from './recoveryAudit'
+import { isReachableByAutonomousLoop, latestHumanRecoveryId } from './recoveryAudit'
 import type { Task } from '@ai-team/shared'
 
 export { latestHumanRecoveryId } from './recoveryAudit'
@@ -275,7 +275,7 @@ export function recoverBlockedTask(
   // （`isReadyTaskWithoutJob()`）。条件を満たさない Task を pending にすると、
   // **いま出ている attention が消え、代わりが1つも立たない** —— 可視化のために入れた変更で
   // 可視性を失わせることになる（独立レビュー指摘・2026-09-18）。
-  if (task.roadmapActive !== true || task.assignee !== 'developer_ai') {
+  if (!isReachableByAutonomousLoop(task)) {
     return {
       ok: false,
       code: 'TASK_NOT_REACHABLE',

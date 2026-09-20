@@ -25,6 +25,8 @@ function seedBlockedWithoutJob(options: {
   projectStatus?: 'running' | 'paused'
   withJob?: boolean
   parked?: boolean
+  /** 自律ループから到達できる形か（`roadmapActive`）。既定は到達できる。 */
+  reachable?: boolean
 } = {}): { storage: IStorage; taskId: string } {
   const storage = createSQLiteStorage(':memory:')
   const project = storage.projects.create({
@@ -40,6 +42,7 @@ function seedBlockedWithoutJob(options: {
     status: 'pending',
     assignee: 'developer_ai',
     dependencies: [],
+    roadmapActive: options.reachable !== false,
   } as Parameters<IStorage['tasks']['create']>[0])
 
   if (options.withJob === true) {
@@ -176,6 +179,37 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
     expect(sent[0].body).not.toContain('finalDecision = unknown')
   })
 
+  it('**到達できない Task へ `/recover` を案内しない**（endpoint が断る選択肢を出さない）', async () => {
+    // `roadmapActive=false` の Task は `recoverBlockedTask()` が `TASK_NOT_REACHABLE` で断る。
+    // それを CEO へ「Human Recovery を使え」と案内すると、実行できない選択肢を渡すことになる
+    // （独立レビュー指摘・2026-09-21）。attention 自体は従来どおり出る。
+    const { storage, taskId } = seedBlockedWithoutJob({ reachable: false })
+    // CONFLICT で止まった形にする（到達可能なら `/recover` を案内する分岐に当たる）。
+    const task = storage.tasks.findById(taskId)!
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const run = storage.designReviewRuns.create({
+      taskId, taskTitle: task.title, designText,
+      designTextHash: computeDesignTextHash(designText), changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(
+      run.id, claimed.claimToken as string, 'succeeded',
+      JSON.stringify({ focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }] }),
+    )
+    const sent: Array<{ title: string; body: string }> = []
+
+    await runPlTick(storage, deps({ escalate: async (p) => { sent.push(p) } }))
+
+    // 案内は出ない。
+    expect(sent[0].body).not.toContain('/recover')
+    // かわりに実行できる道が書いてある。
+    expect(sent[0].body).toContain('採用し直')
+    expect(sent[0].body).toContain('abort_task')
+    // endpoint 側と判定が一致している。
+    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }))
+      .toMatchObject({ ok: false, code: 'TASK_NOT_REACHABLE' })
+  })
+
   it('**再投入して再び同じ状態に落ちたら、もう一度通知する**', async () => {
     // `hasEscalated()` は生涯キーで重複通知を抑止する。attention の identity を Task だけに
     // すると、2回目のエピソードが永久に通知されない（独立レビュー指摘・2026-09-18）。
@@ -187,9 +221,6 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
     expect(sends).toBe(1)
 
     // CEO が再投入し、その後システムが独立に同じ dead state へ戻った。
-    // （attention は roadmapActive を条件にしないが、再投入は自律ループから到達できる
-    //   Task にしか認められない —— `TASK_NOT_REACHABLE` を参照）
-    storage.tasks.update(taskId, { roadmapActive: true })
     expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
     storage.tasks.update(taskId, { status: 'blocked' })
 

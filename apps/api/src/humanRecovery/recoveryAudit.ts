@@ -10,7 +10,27 @@
  * いるのと同じ形で、再投入の履歴も `audit_log` にだけ存在する。
  */
 
+import type { Task } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
+
+/**
+ * 再投入したとき、その Task を**自律ループが実際に拾えるか**。
+ *
+ * `blocked` の可視化（`task_blocked_without_job`）は `roadmapActive` を条件にしないが、
+ * 遷移先で立つはずの `task_ready_without_job` は
+ * `roadmapActive && assignee === 'developer_ai'` を要求する（`isReadyTaskWithoutJob()`）。
+ * 満たさない Task を `pending` にすると、**いま出ている attention が消えて代わりが立たない**。
+ *
+ * **定義はここ1箇所だけに置く。** `recoverBlockedTask()`（受理の可否）と
+ * `triageBlocked()`（CEO へ出す選択肢）が同じ述語を使わないと、
+ * **「Human Recovery を使え」と案内しておきながら endpoint が 409 で断る**という
+ * 食い違いが起きる（独立レビュー指摘・2026-09-21）。
+ */
+export function isReachableByAutonomousLoop(
+  task: Pick<Task, 'roadmapActive' | 'assignee'>,
+): boolean {
+  return task.roadmapActive === true && task.assignee === 'developer_ai'
+}
 
 export const HUMAN_RECOVERY_AUDIT_OPERATION = 'task_human_recovered'
 export const HUMAN_RECOVERY_AUDIT_ENTITY_TYPE = 'task'
