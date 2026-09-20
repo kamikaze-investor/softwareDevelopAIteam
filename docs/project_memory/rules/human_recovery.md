@@ -110,7 +110,13 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 - `pl_independent_remediation` … PR #255 の Independent Remediation が提案を作り直し、
   **まっさらな Design Review** へ掛ける。CEO は待つだけでよい
 - `attention_only` … 自動で進める経路が無い。`task_ready_without_job` が立ち、
-  PL は通知するだけ。roadmap 由来でない Task や、Remediation 予算を使い切った Task がこれ
+  PL は通知するだけ。Remediation 対象の Design Review が無い Task や、Remediation 予算を
+  使い切った Task、Project が `running` でない場合がこれ
+- `none` … **何も拾わない。** `roadmapActive=false` / `assignee≠developer_ai` で自律ループから
+  到達できず、遷移先の `task_ready_without_job` も立たない。それでも受理するのは、
+  `blocked` のままだと `occupiesProject()` が Project の枠を無条件に占有し続け、
+  park（`abort_task`）も採用し直し（`syncRoadmapTasks()`）も `pending` を要求するため、
+  **戻すこと自体が唯一の出口**だからである
 
 **Job は作られない。** 実装 Job は fresh Design Review が ALIGNED になって初めて作られる。
 
@@ -121,7 +127,6 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 | `TASK_HAS_JOBS` | Job があるので既存 `/resume` の担当。こちらでは受けない |
 | `TASK_NOT_BLOCKED` | 既に再投入済みか、そもそも止まっていない |
 | `TASK_PARKED` | `abort_task` で park 済み。復旧の副作用で park を取り消さない |
-| `TASK_NOT_REACHABLE` | `roadmapActive=false` 等で自律ループから到達できない。戻しても何も動かず、いま出ている警告だけが消える。採用し直すか park する |
 
 **生涯上限は無い。** 連打を止めているのは入口条件（`blocked` かつ Job 0 件）そのもので、
 もう一度受理されるにはシステムが**独立に** dead state へ再突入している必要がある。

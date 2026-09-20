@@ -179,12 +179,12 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
     expect(sent[0].body).not.toContain('finalDecision = unknown')
   })
 
-  it('**到達できない Task へ `/recover` を案内しない**（endpoint が断る選択肢を出さない）', async () => {
-    // `roadmapActive=false` の Task は `recoverBlockedTask()` が `TASK_NOT_REACHABLE` で断る。
-    // それを CEO へ「Human Recovery を使え」と案内すると、実行できない選択肢を渡すことになる
-    // （独立レビュー指摘・2026-09-21）。attention 自体は従来どおり出る。
+  it('**到達できない Task にも、実行できる出口を案内する**', async () => {
+    // 一度「到達不能なら `/recover` を案内しない」にしたが、それは dead-end を作った:
+    // park も採用し直しも `pending` を要求するので、案内を消すと**どれも実行できなく**なる
+    // （独立レビュー指摘・2026-09-21）。再投入は到達不能でも Project の枠を解放するため、
+    // まず戻す、が正しい案内である。
     const { storage, taskId } = seedBlockedWithoutJob({ reachable: false })
-    // CONFLICT で止まった形にする（到達可能なら `/recover` を案内する分岐に当たる）。
     const task = storage.tasks.findById(taskId)!
     const designText = buildInitialImplementAiCliPrompt(task)
     const run = storage.designReviewRuns.create({
@@ -200,14 +200,13 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
 
     await runPlTick(storage, deps({ escalate: async (p) => { sent.push(p) } }))
 
-    // 案内は出ない。
-    expect(sent[0].body).not.toContain('/recover')
-    // かわりに実行できる道が書いてある。
-    expect(sent[0].body).toContain('採用し直')
-    expect(sent[0].body).toContain('abort_task')
-    // endpoint 側と判定が一致している。
-    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }))
-      .toMatchObject({ ok: false, code: 'TASK_NOT_REACHABLE' })
+    // 先に戻すこと、戻せば枠が解放されることが書いてある。
+    expect(sent[0].body).toContain('/recover')
+    expect(sent[0].body).toContain('枠は解放される')
+    // park も採用し直しも `pending` が前提であることを明示している。
+    expect(sent[0].body).toContain('TASK_NOT_PARKABLE')
+    // 案内どおり叩けば実際に通る（案内と endpoint が食い違わない）。
+    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
   })
 
   it('**再投入して再び同じ状態に落ちたら、もう一度通知する**', async () => {

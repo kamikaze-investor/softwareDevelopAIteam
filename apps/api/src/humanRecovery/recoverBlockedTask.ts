@@ -155,6 +155,15 @@ export type HumanRecoveryNextDriver =
   | 'pl_independent_remediation'
   /** 自動で進める経路は無い。attention が立ち、PL は CEO へ通知するだけ。 */
   | 'attention_only'
+  /**
+   * 誰も拾わない。`roadmapActive=false` 等で自律ループの対象外だから attention すら立たない。
+   *
+   * **それでも再投入は無駄ではない。** `occupiesProject()` は `blocked` を無条件に占有と数え、
+   * `pending` は `roadmapActive` のときだけ占有と数える。したがってこの遷移は
+   * **単一 running Project の枠を解放する**（塞いだまま放置されるのを解く）。
+   * 進めたいなら Roadmap 項目を採用し直すこと。
+   */
+  | 'none'
 
 export type RecoverBlockedTaskResult =
   | {
@@ -171,7 +180,6 @@ export type RecoverBlockedTaskResult =
       | 'TASK_NOT_BLOCKED'
       | 'TASK_HAS_JOBS'
       | 'TASK_PARKED'
-      | 'TASK_NOT_REACHABLE'
       | 'RECOVERY_FAILED'
     reason: string
   }
@@ -202,12 +210,15 @@ function generationTag(generation: string): string {
  */
 function resolveNextDriver(
   storage: IStorage,
-  taskId: string,
+  task: Task,
   projectIsRunning: boolean,
 ): HumanRecoveryNextDriver {
+  const taskId = task.id
   // **running でない Project では PL 自体が動かない。**
   // `buildSystemState()` の attention も `createInitialImplementWorkflow()` も
   // running を要求するので、ここで remediation を約束すると嘘になる（独立レビュー指摘）。
+  // 自律ループの対象外なら attention すら立たない。**そう正直に返す。**
+  if (!isReachableByAutonomousLoop(task)) return 'none'
   if (!projectIsRunning) return 'attention_only'
   if (findRemediationSubject(storage, taskId) === undefined) return 'attention_only'
   if (countRemediationAttempts(storage, taskId) >= PL_MAX_REMEDIATION_ATTEMPTS) return 'attention_only'
@@ -268,25 +279,6 @@ export function recoverBlockedTask(
     }
   }
 
-  // **再投入しても誰にも見えなくなる Task を、黙って見えなくしない。**
-  //
-  // `task_blocked_without_job` は `roadmapActive` を条件にしないが、遷移先で立つはずの
-  // `task_ready_without_job` は `roadmapActive && assignee === 'developer_ai'` を要求する
-  // （`isReadyTaskWithoutJob()`）。条件を満たさない Task を pending にすると、
-  // **いま出ている attention が消え、代わりが1つも立たない** —— 可視化のために入れた変更で
-  // 可視性を失わせることになる（独立レビュー指摘・2026-09-18）。
-  if (!isReachableByAutonomousLoop(task)) {
-    return {
-      ok: false,
-      code: 'TASK_NOT_REACHABLE',
-      reason:
-        `Task ${input.taskId} is not reachable by the autonomous loop `
-        + `(roadmapActive=${task.roadmapActive === true}, assignee=${task.assignee}); `
-        + 'recovering it would only hide the current alert without starting anything. '
-        + 'Adopt the roadmap item again, or park the task with abort_task',
-    }
-  }
-
   // **却下済みテキスト世代での上限は置かない（独立レビュー round 2 で撤回した）。**
   //
   // round 1 の laundering 指摘を受けて「同じ `designTextHash` では1回だけ」を入れたが、
@@ -324,6 +316,6 @@ export function recoverBlockedTask(
     taskId: task.id,
     task: committed.task,
     // 遷移**後**の状態で判定する（`findRemediationSubject()` は `pending` を要求する）。
-    nextDriver: resolveNextDriver(storage, task.id, project.status === 'running'),
+    nextDriver: resolveNextDriver(storage, committed.task, project.status === 'running'),
   }
 }

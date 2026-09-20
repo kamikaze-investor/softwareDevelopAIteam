@@ -18,6 +18,7 @@ import { describe, expect, it } from 'vitest'
 import type { IStorage } from '../storage/interface'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { buildSystemState } from '../state/systemState'
+import { occupiesProject } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import { PL_ACTION_KINDS, resolvePlActionPolicy } from '@ai-team/shared'
@@ -62,8 +63,8 @@ function seed(options: {
     dependencies: [],
     allowedPaths: ['apps/api/src'],
     acceptanceCriteria: ['c'],
-    // 既定は「自律ループから到達できる」形にする。再投入が意味を持つのはこの形だけで、
-    // そうでない Task は `TASK_NOT_REACHABLE` で断られる（下のテスト参照）。
+    // 既定は「自律ループから到達できる」形にする。到達できない Task も受理するが（断ると
+    // 出口が無くなる）、そちらは nextDriver: 'none' になる。下のテスト参照。
     roadmapActive: options.unreachable !== true,
     ...(options.roadmapTaskKey !== undefined ? { roadmapTaskKey: options.roadmapTaskKey, phase: 1 } : {}),
   } as Parameters<IStorage['tasks']['create']>[0])
@@ -165,19 +166,31 @@ describe('recoverBlockedTask — 入口条件', () => {
       .toMatchObject({ ok: false, code: 'PROJECT_UNAVAILABLE' })
   })
 
-  it('**自律ループから到達できない Task は断る。** 再投入で attention を消さない', () => {
-    // `task_blocked_without_job` は roadmapActive を条件にしないが、遷移先で立つはずの
-    // `task_ready_without_job` は要求する。素通しにすると、いま出ている警告が消えて
-    // 代わりが1つも立たない（＝可視化のための変更で可視性を失う）。
+  it('**自律ループから到達できない Task も受理する。** 断ると出口が無くなる', () => {
+    // 一度 `TASK_NOT_REACHABLE` で断る実装にしたが、それは dead-end を作った:
+    // `abort_task`（park）も採用し直し（`syncRoadmapTasks`）も `pending` を要求するため、
+    // 断ると **`/recover` も park も採用し直しもできない Task** が残る
+    // （独立レビュー指摘・2026-09-21）。
     const { storage, taskId } = seed({ unreachable: true })
 
     const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
 
-    expect(result).toMatchObject({ ok: false, code: 'TASK_NOT_REACHABLE' })
-    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
-    // 断られた以上、attention は出たままである。
-    expect(buildSystemState(storage).attention.map((i) => i.kind))
-      .toContain('task_blocked_without_job')
+    expect(result.ok).toBe(true)
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+    // **何も拾わないことを正直に返す。** `attention_only` と言うと嘘になる
+    // （`isReadyTaskWithoutJob()` は roadmapActive を要求するので attention も立たない）。
+    expect(result).toMatchObject({ nextDriver: 'none' })
+  })
+
+  it('**到達できない Task でも、再投入すれば Project の枠は解放される**', () => {
+    // `occupiesProject()` は `blocked` を無条件に占有と数え、`pending` は roadmapActive の
+    // ときだけ占有と数える。だから到達不能でも再投入には意味がある。
+    const { storage, taskId } = seed({ unreachable: true })
+    expect(occupiesProject(storage.tasks.findById(taskId)!)).toBe(true)
+
+    recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(occupiesProject(storage.tasks.findById(taskId)!)).toBe(false)
   })
 
   it('park された Task は断る（復旧の副作用で park を取り消さない）', () => {
