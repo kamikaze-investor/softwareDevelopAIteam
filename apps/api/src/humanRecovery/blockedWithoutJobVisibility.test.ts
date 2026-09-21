@@ -209,6 +209,49 @@ describe('PL は task_blocked_without_job を通知するだけで、自分で�
     expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
   })
 
+  it('**CONFLICT と断定できないときも、park より先に戻せと案内する**', async () => {
+    // 原因を CONFLICT と特定できないと `rootCauseClass='unknown'` になる。汎用の選択肢へ
+    // 落とすと **park を勧めておきながら `TASK_NOT_PARKABLE` で弾かれる**
+    // （独立レビュー round 5 指摘）。分岐の鍵は原因ではなく attention の kind である。
+    const { storage, taskId } = seedBlockedWithoutJob()   // Design Review run を作らない
+    const sent: Array<{ title: string; body: string }> = []
+
+    await runPlTick(storage, deps({ escalate: async (p) => { sent.push(p) } }))
+
+    expect(sent[0].body).toContain('/recover')
+    expect(sent[0].body).toContain('TASK_NOT_PARKABLE')
+    // 案内どおり叩けば実際に通る。
+    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
+  })
+
+  it('**Remediation の対象条件を満たさない CONFLICT で、Remediation を約束しない**', async () => {
+    // 到達可能で予算も残っているが `roadmapTaskKey` が無いので
+    // `findRemediationSubject()` は undefined を返す。「到達可能 かつ 予算あり」だけで
+    // 判定していたときは、ここで Remediation を約束して endpoint と食い違っていた
+    // （独立レビュー round 5 指摘）。
+    const { storage, taskId } = seedBlockedWithoutJob()
+    const task = storage.tasks.findById(taskId)!
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const run = storage.designReviewRuns.create({
+      taskId, taskTitle: task.title, designText,
+      designTextHash: computeDesignTextHash(designText), changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(
+      run.id, claimed.claimToken as string, 'succeeded',
+      JSON.stringify({ focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }] }),
+    )
+    const sent: Array<{ title: string; body: string }> = []
+
+    await runPlTick(storage, deps({ escalate: async (p) => { sent.push(p) } }))
+
+    // 案内と endpoint が同じ値を指している。
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+    expect(result).toMatchObject({ ok: true, nextDriver: 'attention_only' })
+    expect(sent[0].body).not.toContain('Independent Remediation が fresh Design Review を起こす')
+    expect(sent[0].body).toContain('戻しても自動では進まない')
+  })
+
   it('**再投入して再び同じ状態に落ちたら、もう一度通知する**', async () => {
     // `hasEscalated()` は生涯キーで重複通知を抑止する。attention の identity を Task だけに
     // すると、2回目のエピソードが永久に通知されない（独立レビュー指摘・2026-09-18）。

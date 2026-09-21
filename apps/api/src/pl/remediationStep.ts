@@ -303,10 +303,11 @@ export interface RemediationSubject {
 export function findRemediationSubject(
   storage: IStorage,
   taskId: string,
+  options: FindRemediationSubjectOptions = {},
 ): RemediationSubject | undefined {
   const task = storage.tasks.findById(taskId)
   if (!task || task.roadmapTaskKey === undefined) return undefined
-  if (task.status !== 'pending') return undefined
+  if (!hasEligibleStatus(task.status, options)) return undefined
   if (storage.jobs.findByTaskId(task.id).length > 0) return undefined
 
   const run = storage.designReviewRuns.findLatestByTaskId(task.id)
@@ -414,6 +415,30 @@ export function countRemediationAttempts(storage: IStorage, taskId: string): num
  */
 export function hasRemediationBudgetLeft(storage: IStorage, taskId: string): boolean {
   return countRemediationAttempts(storage, taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+}
+
+/**
+ * `findRemediationSubject()` を **`blocked` の Task にも**評価させるための option。
+ *
+ * **既定の挙動は1ビットも変わらない**（`pending` だけが対象）。これが要るのは
+ * Human Recovery だけで、「いま `blocked` のこの Task を `pending` へ戻したら
+ * Remediation の対象になるか」を**再投入する前に**答える必要があるためである。
+ *
+ * 呼ばずに条件を書き写すと必ずずれる —— 実際、`triageBlocked()` が
+ * 「到達可能 かつ 予算あり」だけで Remediation を約束し、
+ * `findRemediationSubject()` の残りの条件（roadmapTaskKey / run の種別・終端・
+ * evidence 未登録・再計算 CONFLICT）を落としていた（独立レビュー round 5 指摘）。
+ *
+ * `blocked` を許しても Job 0 件の条件は残るので、Human Recovery の入口条件と矛盾しない。
+ */
+export interface FindRemediationSubjectOptions {
+  /** `blocked` を `pending` と同じ扱いにする（Human Recovery の事前予測用）。 */
+  treatBlockedAsPending?: boolean
+}
+
+function hasEligibleStatus(status: string, options: FindRemediationSubjectOptions): boolean {
+  if (status === 'pending') return true
+  return options.treatBlockedAsPending === true && status === 'blocked'
 }
 
 /**

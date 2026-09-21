@@ -50,15 +50,18 @@
  *   2. **`executeAction()` / `allowedActionsFor()` に配線しない。** PL は in-process で動き、
  *      自分自身へ HTTP を打たない。よって PL からこの関数へ到達する経路が存在しない。
  *      **auth mode に依存しない**
- *   3. **`WORKER_ALLOWLIST` に載せない。** ただしこれが効くのは **split credential mode だけ**で、
- *      legacy mode（`ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` の両方が未設定）は単一
- *      `API_TOKEN` で全 route を許すため、allowlist 自体が評価されない。
- *      **これは本 route 固有の穴ではなく legacy mode の性質**であり、`POST /api/pl/tick` や
- *      `POST /api/tasks/:id/abort` を含む既存の admin 専用 route すべてに等しく当てはまる。
- *      production は split credential mode を前提とする（`.env.example`）。
+ *   3. **`WORKER_ALLOWLIST` に載せない。** split credential mode の WORKER credential は
+ *      Default Deny で 403 になる
+ *   4. **`HUMAN_ONLY_ROUTES` に載せる。** この route は **split credential mode の ADMIN
+ *      でのみ通り**、legacy mode（単一 `API_TOKEN`）でも認証なし構成でも 403
+ *      （`HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS`）。どちらも呼び出し主体が
+ *      人か自動かを区別できないためで、**この操作の authorization は主体そのもの**である。
+ *      初版は認証なし構成を素通しにしていたが、それは論拠と逆だった（独立レビュー round 4）
  *
  * 1 と 2 が**自律呼び出しを無条件に塞ぐ層**であり、CEO 決定が要求しているのはそこである。
- * 3 は split mode における多層防御であって、単独で頼るものではない。
+ * 3 と 4 は HTTP 面の多層防御で、4 によって **auth mode に依存する穴は無くなった** ——
+ * 以前ここには「legacy mode では allowlist が評価されない」と書いてあったが、
+ * いまは human-only 判定がその前に立つ。
  *
  * したがってこの関数は `authorizePlAction()` を通さない。**迂回ではない** ——
  * Mandatory Gate Policy は「PL の操作案に必要 Gate を決める入口」であり、
@@ -148,11 +151,25 @@ export interface RecoverBlockedTaskInput {
  *
  * **この関数は Job を作らない**ので、呼び出し側（Mobile / 運用者）に「次に何が起きるか」を
  * 正直に返す必要がある。推測ではなく、PR #255 の導出関数をそのまま呼んで判定する。
+ *
+ * **判定は `predictHumanRecoveryDriver()` の1箇所だけ。** `triageBlocked()` が
+ * CEO へ書く「戻したら何が動くか」も同じ関数を呼ぶ —— 別々に条件を並べた結果、
+ * 案内が endpoint の返す値と食い違っていた（独立レビュー round 5 指摘）。
  */
 export type HumanRecoveryNextDriver =
   /** PL の Independent Remediation が提案を作り直し、fresh Design Review へ掛ける。 */
   | 'pl_independent_remediation'
-  /** 自動で進める経路は無い。attention が立ち、PL は CEO へ通知するだけ。 */
+  /**
+   * 自動で進める経路は無い。`task_ready_without_job` が **attention に出る**
+   * （Mobile から見える）。
+   *
+   * **「必ず通知が飛ぶ」とは言えない。** PL の重複排除キー
+   * `task_ready_without_job:<taskId>` は Task の生涯で変わらないので、その Task が過去に
+   * 一度でも同じ kind で Escalate されていれば、`runPlTick()` は
+   * 「already escalated and waiting on the CEO」として **通知を出さない**
+   * （実測・独立レビュー round 5 指摘）。attention は残るので見落としはしないが、
+   * **push を当てにしないこと**。
+   */
   | 'attention_only'
   /**
    * **Project が `running` でないので、何も動かないし通知も出ない。**
@@ -216,7 +233,7 @@ function generationTag(generation: string): string {
  * 判定は PR #255 の導出をそのまま呼ぶ。**ここに条件を書き写さない** ——
  * 2箇所に書くと必ずずれる（`remediationStep.ts` 側にも同じ注意が書かれている）。
  */
-function resolveNextDriver(
+export function predictHumanRecoveryDriver(
   storage: IStorage,
   task: Task,
   projectIsRunning: boolean,
@@ -229,7 +246,11 @@ function resolveNextDriver(
   if (!projectIsRunning) return 'project_not_running'
   // 自律ループの対象外なら attention すら立たない。**そう正直に返す。**
   if (!isReachableByAutonomousLoop(task)) return 'none'
-  if (findRemediationSubject(storage, taskId) === undefined) return 'attention_only'
+  // **`blocked` のまま呼ばれることがある。** `triageBlocked()` は再投入する**前**に
+  // 「戻したら何が動くか」を CEO へ書くのでこの関数をそこでも呼ぶ。option を付けて
+  // 遷移後の形で評価させる（endpoint 側は既に `pending` なので無害）。
+  const subject = findRemediationSubject(storage, taskId, { treatBlockedAsPending: true })
+  if (subject === undefined) return 'attention_only'
   if (!hasRemediationBudgetLeft(storage, taskId)) return 'attention_only'
   return 'pl_independent_remediation'
 }
@@ -325,6 +346,6 @@ export function recoverBlockedTask(
     taskId: task.id,
     task: committed.task,
     // 遷移**後**の状態で判定する（`findRemediationSubject()` は `pending` を要求する）。
-    nextDriver: resolveNextDriver(storage, committed.task, project.status === 'running'),
+    nextDriver: predictHumanRecoveryDriver(storage, committed.task, project.status === 'running'),
   }
 }

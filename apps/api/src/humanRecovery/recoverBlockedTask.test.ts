@@ -381,6 +381,25 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     expect(countRemediationAttempts(storage, taskId)).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
   })
 
+  it('**attention_only は「通知が必ず飛ぶ」ことまでは意味しない**', () => {
+    // `hasEscalated()` のキー `task_ready_without_job:<taskId>` は Task の生涯で変わらない。
+    // 過去に一度でも同じ kind で Escalate されていれば、再投入しても `runPlTick()` は
+    // 「already escalated and waiting on the CEO」で通知を出さない（実測・round 5 指摘）。
+    // attention は残るので見落としはしないが、型と docs はそう書かねばならない。
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    storage.auditLog.record({
+      actor: 'pl', operation: 'pl_target', entityType: 'pl_loop_target',
+      entityId: `task_ready_without_job:${taskId}`, result: 'escalated', detail: 'episode 1',
+    } as never)
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: true, nextDriver: 'attention_only' })
+    // **attention 自体は立っている**（見えなくなるわけではない）。
+    expect(buildSystemState(storage).attention.map((a) => a.kind))
+      .toContain('task_ready_without_job')
+  })
+
   it('**到達できても roadmapActive のままなら、枠が空くとは言わない**', () => {
     // `occupiesProject()` は `roadmapActive` だけを見る。assignee が違うだけの Task は
     // 自律ループから到達できないのに、`pending` でも枠を占有し続ける（round 4 指摘）。

@@ -124,9 +124,15 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 
 - `pl_independent_remediation` … PR #255 の Independent Remediation が提案を作り直し、
   **まっさらな Design Review** へ掛ける。CEO は待つだけでよい
-- `attention_only` … 自動で進める経路が無い。`task_ready_without_job` が立ち、
-  PL は通知するだけ。Remediation 対象の Design Review が無い Task や、
+- `attention_only` … 自動で進める経路が無い。`task_ready_without_job` が **attention に出る**
+  （Mobile から見える）。Remediation 対象の Design Review が無い Task や、
   **Remediation 予算（`PL_MAX_REMEDIATION_ATTEMPTS`）を使い切った** Task がこれ
+
+  > **push が必ず飛ぶとは限らない。** PL の重複排除キー `task_ready_without_job:<taskId>` は
+  > Task の生涯で変わらないので、その Task が過去に一度でも同じ kind で Escalate されていると、
+  > `runPlTick()` は「already escalated and waiting on the CEO」として **通知を出さない**
+  > （実測・独立レビュー round 5 指摘）。attention は残るため見落としはしないが、
+  > **通知を待たずに attention を見に行くこと**。
 - `project_not_running` … **Project が `running` でないので、何も動かず通知も出ない。**
   attention 導出は `project.status === 'running'` を要求するため、ここを `attention_only` と
   返すと「通知は出る」という出ない約束になる（独立レビュー round 4 指摘）。

@@ -60,7 +60,11 @@ import {
   isReachableByAutonomousLoop,
   recoveryReleasesProjectSlot,
 } from '../humanRecovery/recoveryAudit'
-import { countRemediationAttempts, hasRemediationBudgetLeft, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import { countRemediationAttempts, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import {
+  predictHumanRecoveryDriver,
+  type HumanRecoveryNextDriver,
+} from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 
@@ -565,8 +569,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     // `roadmapActive=true` かつ assignee が違う Task は「到達できないのに枠も空かない」。
     // 両者を1つの真偽値で語ると嘘の案内になる（独立レビュー round 4 指摘）。
     const releasesSlot = subject !== undefined && recoveryReleasesProjectSlot(subject)
-    // 予算判定は `remediationStep` の1関数に委ねる。ここで `>= PL_MAX_...` を書き写さない。
-    const budgetLeft = item.taskId !== undefined && hasRemediationBudgetLeft(storage, item.taskId)
+    // **「戻したら何が動くか」は endpoint と同じ関数に答えさせる。**
+    // ここで条件を並べ直すと必ずずれる —— 実際 round 5 で、到達可能かつ予算ありだけを見て
+    // Remediation を約束し、`findRemediationSubject()` の残りの条件
+    // （roadmapTaskKey / run の種別・終端・evidence 未登録・再計算 CONFLICT）を落としていた。
+    // attention は running な Project にしか出ないが、**それを前提にしない**。
+    // 前提を書き込むと、attention の条件が変わったときに黙って嘘になる。
+    const projectIsRunning = storage.projects.findById(item.projectId)?.status === 'running'
+    const driver = subject !== undefined
+      ? predictHumanRecoveryDriver(storage, subject, projectIsRunning)
+      : undefined
 
     return {
       ...result,
@@ -607,17 +619,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           ? `直近の task-kind Design Review は ${recomputed} で、evidence が登録されていない。`
           : '')
         + ' CEO が Human Recovery（`POST /api/tasks/:id/recover`）で `pending` へ戻す必要がある。'
-        + (reachable
-          ? (budgetLeft
-            ? '戻せば既存ループが引き取り、Independent Remediation が fresh Design Review を起こす。'
-            : '**ただし Remediation 予算を使い切っている**ので、戻しても attention が立つだけで'
-              + '自動では進まない。訂正した spec で Roadmap 項目を採用し直すこと。')
-          : 'この Task は自律ループの対象外（roadmapActive=false / assignee が developer_ai でない）'
-            + 'なので戻しても自動では進まない。'
-            + (releasesSlot
-              ? 'ただし戻せば**Project の枠は解放される**。'
-              : 'また roadmapActive=true のままなので、戻しても**Project の枠は解放されない**。')
-            + '進めたいなら戻したうえで Roadmap 項目を採用し直すこと。'),
+        + recoveryOutlook(driver, { reachable, releasesSlot }),
     }
   }
 
@@ -852,7 +854,65 @@ export function needsProviderDiagnosis(allowed: readonly string[]): boolean {
 // ────────────────────────────────────────────────────────────
 
 /** その診断で CEO に求める判断と、**複数の**安全な選択肢。1つに決め打ちしない。 */
-function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string; options: string[] } {
+/**
+ * 「戻したら何が起きるか」を1文で書く。**`nextDriver` の値をそのまま言い換えるだけ**にする。
+ *
+ * ここで条件を再構成しないこと —— endpoint が返す値と案内が食い違う原因は毎回それだった。
+ */
+function recoveryOutlook(
+  driver: HumanRecoveryNextDriver | undefined,
+  context: { reachable: boolean; releasesSlot: boolean },
+): string {
+  const slotNote = context.releasesSlot
+    ? 'なお戻せば**Project の枠は解放される**。'
+    : '戻しても roadmapActive のままなので**Project の枠は解放されない**。'
+
+  switch (driver) {
+    case 'pl_independent_remediation':
+      return '戻せば既存ループが引き取り、Independent Remediation が fresh Design Review を起こす。'
+    case 'attention_only':
+      return '戻しても自動では進まない（Remediation の対象条件を満たさないか、予算を使い切っている）。'
+        + '`task_ready_without_job` として attention には出るが、'
+        + '**その Task が過去に同じ kind で通知済みなら通知は繰り返されない**。'
+        + '進めたいなら訂正した spec で Roadmap 項目を採用し直すこと。'
+    case 'project_not_running':
+      return '**ただし Project が running でないので、戻しても何も動かず通知も出ない。**'
+        + '先に Project を再開すること。'
+    case 'none':
+      return 'この Task は自律ループの対象外（roadmapActive=false / assignee が developer_ai でない）'
+        + 'なので戻しても自動では進まない。' + slotNote
+        + '進めたいなら戻したうえで Roadmap 項目を採用し直すこと。'
+    default:
+      // Task を特定できていない場合。断定しない。
+      return '戻した後に何が動くかは応答の `nextDriver` が返す。'
+  }
+}
+
+function ceoDecisionAndOptions(
+  diagnosis: BlockedDiagnosis,
+  item: AttentionItem,
+): { decision: string; options: string[] } {
+  // **Job 0 件の blocked は、どの原因であってもまず `pending` へ戻すのが先。**
+  // `abortTask()` も `syncRoadmapTasks()` も `status === 'pending'` を要求するので、
+  // 原因が CONFLICT と特定できなかった（`rootCauseClass='unknown'`）場合に汎用の選択肢へ
+  // 落ちると、**park を勧めておきながら `TASK_NOT_PARKABLE` で弾かれる**
+  // （独立レビュー round 5 指摘）。分岐の鍵は原因ではなく**どの attention か**である。
+  if (item.kind === 'task_blocked_without_job' && diagnosis.rootCauseClass !== 'design_review_conflict') {
+    return {
+      decision:
+        'blocked のまま Job を1件も持たない Task が、自動復旧経路から外れた状態にある。'
+        + '原因は機械的事実からは CONFLICT と断定できていない。'
+        + 'どの対処も先に Human Recovery で `pending` へ戻す必要がある。',
+      options: [
+        'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻し、'
+        + '応答の `nextDriver` が示す経路に従う',
+        '戻したうえで、訂正した implementationScope / allowedPaths で Roadmap 項目を採用し直す',
+        '戻したうえで park する（`abort_task`）。'
+        + '**blocked のままでは `TASK_NOT_PARKABLE` で park できない**',
+      ],
+    }
+  }
+
   if (diagnosis.recommendedLane === 'maintenance_lane') {
     return {
       decision:
@@ -927,10 +987,11 @@ function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string;
           'CONFLICT で止まった Task が、自動復旧経路から外れた状態にある。'
           + 'どの対処も先に Human Recovery で `pending` へ戻す必要がある。',
         options: [
+          // **ここで結果を約束しない。** 何が動くかは上の「原因の説明」が
+          // `nextDriver` から導いて書いている。選択肢側で言い直すと、予算だけ見て
+          // Remediation を約束する—— という round 5 の指摘を作り直すことになる。
           'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻す'
-          + '（Independent Remediation が fresh Design Review を起こすのは'
-          + '**証拠欄の `remediation.attempts` に予算が残っているときだけ**。'
-          + '使い切っていれば attention が立つだけで、自動では進まない）',
+          + '（**戻した後に何が動くかは上の「原因の説明」と応答の `nextDriver` が示す**）',
           '戻したうえで、訂正した implementationScope / allowedPaths で Roadmap 項目を'
           + '採用し直す（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）',
           '戻したうえで park する（`abort_task`）。'
@@ -992,7 +1053,7 @@ export interface TriageEscalationInput {
  */
 export function buildTriageEscalationBody(input: TriageEscalationInput): string {
   const { diagnosis, item } = input
-  const { decision, options } = ceoDecisionAndOptions(diagnosis)
+  const { decision, options } = ceoDecisionAndOptions(diagnosis, item)
 
   const lines: string[] = [
     `何が止まったか: ${item.kind} — ${item.detail}`,
