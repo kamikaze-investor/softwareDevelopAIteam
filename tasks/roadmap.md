@@ -9999,6 +9999,20 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         の Design Philosophy #8 欠落と `specs/00` の章範囲表記の不一致は
         `governance-and-spec-docs-current-truth-sweep` が owner。
         **同じ行を二重に直さない**ので、着手前にそちらの状態を確認すること
+      - **構造的に選択され得ない Principle が無いかを確認する（2026-09-21 実測で1件判明）。**
+        `review-integration` は production で適用 **0 件**だが、「まだ観測されていない」のではなく
+        **現行配線では選択され得ない**: tier は `contextual`（core ではない）、
+        `FOCUS_PRINCIPLE_SLUGS` のどの focus にも `RISK_PRINCIPLE_SLUGS` のどの risk にも mapping が無く、
+        残る `explicitSlugs` 経路を production の呼び出し2箇所
+        （`strategicReview.ts` / `reviewerAdapter.ts` の `selectReviewPrinciples()`）は渡さない。
+        着手時に **Registry 全体で同種の Principle が他に無いか**を確認し、`review-integration` については
+        「**どの signal で選択されるべきか**」「**explicit-only が意図された状態なのか**」を
+        既存の設計原則から判断すること。
+        **使用率を上げることだけを目的に core 化しない／無理な focus mapping を足さない**
+        （core は全 prompt へ入るため、上記 `principle-tier` の注意がそのまま当てはまる）。
+        なお `riskLevel` が Review 経路へ未配線である点は
+        `principle_management_design_2026_09_17.md` 13章の**意図された状態**であり、
+        Class B / Risk 設計との境界を維持するため**本項目では変更しない**
 
       **Task B — 100 件到達で閾値を再評価する sensor（2026-09-18 実装済み・完了）**
 
@@ -10402,24 +10416,35 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **Track 再評価（2026-09-21・production read-only 実測。CEO 指示による sensor 実測での見直し）**:
       `principle_applications` = **92 件 / 全件現行 version hash**、
       verdict は **ALIGNED 82・UNCERTAIN 7・CONFLICT 3**（非 ALIGNED 10.9%）、
-      stage は **design 76・independent 16・meta 0（未配線）**、
+      stage は **design 76・independent 16・meta 0**（`meta` は**意図された schema 予約**。
+      `docs/project_memory/decisions/principle_management_design_2026_09_17.md` 13章）、
       選択元は core 56・contextual 36、**`review-integration` は適用 0 件**。
       sensor 状態は、core 降格(50) が最大 14 件で未到達、
       機構再Review(200 かつ CONFLICT+UNCERTAIN=0) は **CONFLICT/UNCERTAIN が実在するため現行版では発火し得ない**
       （＝機構は識別力を持っている）、閾値再評価(100) が **残り 8 件**。
 
       - **Track 1（Question category の一般化）は引き続き見送り。** Library を広げる前に、
-        既存 Library 側に「**一度も選択されない Question**」（`review-integration` = 0 件）と
-        「**未配線の stage**」（`meta`）が実在する。この2つを残したまま category を増やすと
-        never-selected Question が増えるだけで、どの Question が効いているかの判定はむしろ遅れる
+        既存 Library 側に「**一度も選択されない Question**」（`review-integration` = 適用 0 件。
+        **現行配線では構造的に選択され得ない**。owner と確認事項は
+        `principle-registry-coverage-and-threshold-review` Task A）が実在する。
+        これを残したまま category を増やすと never-selected Question が増えるだけで、
+        どの Question が効いているかの判定はむしろ遅れる
       - **Track 2（外部 Decision Engine）は価値未実証。CEO Proposal を出す段階ではない。**
         現行 engine は既存 Review の出力契約へ相乗りしているので **追加 AI 呼び出しコストが 0** である。
         外部 engine は review ごとに従量課金呼び出しを足す一方、
         「現行 engine の判定が不十分」という実測根拠がまだ無い（非 ALIGNED が 10.9% 出ており degenerate ではない）。
-        **判断を変える実測は2つ**: (a) stage 間 disagreement 率が高く、その原因が
-        同一入力に対する不安定性だと切り分けられた場合（`independent-review-verdict-instability` と同じ現象）
-        (b) `meta` stage 配線後も 3 stage の一致率が低い場合。
-        いずれかが観測されたら、`specs/23` 4章の CEO 承認手順（目的・実測上の改善余地・比較対象 Question・
+        **現時点で実効的な再検討 trigger は主に (a) である。**
+        **(a)** stage 間 disagreement 率が高く、その原因が**同一入力に対する Reviewer の不安定性**だと
+        切り分けられた場合（`independent-review-verdict-instability` と同じ現象）。
+        **(b)** `meta` stage を配線する設計判断が**将来別途行われた場合に限り**、3 stage 間の一致率を
+        Track 2 再評価の追加根拠として利用する。**`meta` stage 配線自体を System One / Jev 導入のために
+        要求しない** — `meta` は現行設計では**意図された schema 予約**であり、CI 経路（`autoReview.ts`）へ
+        DB 依存を新設しないための非目標である
+        （`docs/project_memory/decisions/principle_management_design_2026_09_17.md` 13章）。
+        **(a)(b) を閉じた条件集合にしない。** `specs/23` 12章が定める Evolution trigger
+        （escaped incident / repeated formal finding / engine drift / `UNCERTAIN` 率上昇 等）から
+        外部 Decision Engine の価値が実証された場合も、**同じ CEO Proposal 経路で再評価してよい**。
+        いずれの場合も `specs/23` 4章の CEO 承認手順（導入目的・実測上の改善余地・比較対象 Question・
         想定費用・credential handling・fallback・停止条件）を添えた **CEO Proposal** を出す
 
       **作らないもの（`specs/23` 15章）**: 並走型 shadow runner（「formal decision へ影響させない」は
