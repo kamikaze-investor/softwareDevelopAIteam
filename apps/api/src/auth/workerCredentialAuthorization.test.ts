@@ -274,6 +274,11 @@ describe('Worker↔API authority separation — WORKER credential: allowlist 12�
   // `req.routeOptions.url` と一致しなければ production では 403 になる ——
   // cutover 事前監査（2026-09-21）で欠落が見つかった route なので、
   // 一致していることをここで固定する。
+  //
+  // **200 を直接見る。** `not.toBe(401)` / `not.toBe(403)` では、route registration や
+  // prefix 合成が壊れて **404 になっても pass してしまう** —— この test が証明したいのは
+  // まさにその経路なので、それでは目的を果たさない（独立レビュー指摘・2026-09-21）。
+  // この route の正常契約は 200 であり、200 なら認証通過も route 到達も同時に示せる。
   it('POST /api/supervised-runs/reconcile が通る', async () => {
     await withApp(async (app) => {
       const res = await app.inject({
@@ -281,8 +286,7 @@ describe('Worker↔API authority separation — WORKER credential: allowlist 12�
         url: '/api/supervised-runs/reconcile',
         headers: workerAuthHeader(),
       })
-      expect(res.statusCode).not.toBe(401)
-      expect(res.statusCode).not.toBe(403)
+      expect(res.statusCode).toBe(200)
     })
   })
 })
