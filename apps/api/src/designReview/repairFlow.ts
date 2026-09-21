@@ -33,6 +33,7 @@ import {
   type CoordinatorDeps,
 } from './designReviewCoordinator'
 import { buildRepairPrompt } from './repairPromptBuilder'
+import { recomputeDecision, type RawStrategicResult } from './designReviewCoordinator'
 import {
   REPAIR_STEP_PREFIX,
   decideRepairAction,
@@ -248,6 +249,27 @@ export async function runRepairFlow(
  * design_review_run を queued として永続化する。これによりcrashしても
  * 「Jobはfailed / runは無い」というlost-trigger windowが生じない。
  */
+/**
+ * 保存済み run から **計算し直した** design review 判定。読めなければ undefined。
+ *
+ * `resultJson` は runner の raw 出力なので、そこに書かれた `finalDecision` は自己申告である。
+ * 既存 `recomputeDecision()` は focus 判定から本来の結論を組み直すためのもので、
+ * `blockedTriage` が使っているのと同じ関数である。ここでも同じものを使う。
+ */
+function safeRecomputedDecision(run: DesignReviewRun): string | undefined {
+  if (run.resultJson === undefined) return undefined
+  try {
+    const raw = JSON.parse(run.resultJson) as RawStrategicResult
+    const outcome = recomputeDecision(raw, run.reviewKind, run.changedFiles)
+    // 形が壊れていれば rejectedReason が付き decision は UNCERTAIN になる。
+    // UNCERTAIN も ALIGNED ではないので、呼び出し側でそのまま skip される。
+    return outcome.decision
+  } catch {
+    // 壊れた結果は「読めなかった」として扱う。呼び出し側は fail-closed で skip する。
+    return undefined
+  }
+}
+
 /** `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。 */
 type BlockedAdmission = { ok: true } | { ok: false, reason: string }
 
@@ -270,22 +292,20 @@ function repairableBlockedReviewRequest(
   storage: IStorage,
   task: Task,
   implementJob: Job,
-  review: ReviewResult | undefined,
 ): BlockedAdmission {
-  // 1. Independent Review が修正を要求していること。
-  if (review === undefined) return { ok: false, reason: 'no review result' }
-  if (review.status !== 'changes_requested') {
-    return { ok: false, reason: `review status is ${review.status}` }
-  }
+  // 1. **この implement Job に対する review Job を、保存済み Job から引く。**
+  //    引数の `review` は使わない。呼び出し元が作った object は「保存された事実」ではなく、
+  //    status も findings も自由に書けるためである（独立レビュー指摘）。
+  const reviewJob = storage.jobs.findByTaskId(task.id)
+    .find((job) => job.workflowStepKey === `implement:${implementJob.id}:review`)
+  if (!reviewJob) return { ok: false, reason: 'no review job for this implementation' }
 
-  // 2. その review が **この implement Job に紐づく** review Job のものであること。
-  //    review.jobId は review Job を指す。その Job の workflowStepKey が
-  //    `implement:<この Job>:review` でなければ、別の実行に対する review である。
-  if (review.taskId !== task.id) return { ok: false, reason: 'review belongs to another task' }
-  const reviewJob = storage.jobs.findById(review.jobId)
-  if (!reviewJob) return { ok: false, reason: 'review job not found' }
-  if (reviewJob.workflowStepKey !== `implement:${implementJob.id}:review`) {
-    return { ok: false, reason: 'review is not associated with this implementation job' }
+  // 2. **その review Job に対して保存された verdict** を引く。無ければ通さない。
+  const stored = storage.reviewResults.findByTaskId(task.id)
+    .find((result) => result.jobId === reviewJob.id)
+  if (!stored) return { ok: false, reason: 'no stored review result for this implementation' }
+  if (stored.status !== 'changes_requested') {
+    return { ok: false, reason: `review status is ${stored.status}` }
   }
 
   // 3. その実装が**成功している**こと。失敗した実装の修正要求はここでは扱わない。
@@ -304,7 +324,7 @@ function repairableBlockedReviewRequest(
   //    範囲外のファイルを指す指摘が 1 件でもあれば、repair は scope を越える。
   const allowed = task.allowedPaths ?? []
   if (allowed.length === 0) return { ok: false, reason: 'task has no allowedPaths' }
-  const outside = review.findings
+  const outside = stored.findings
     .map((finding) => finding.file)
     .filter((file): file is string => typeof file === 'string' && file.length > 0)
     .filter((file) => !allowed.some((prefix) => file === prefix || file.startsWith(`${prefix}/`)))
@@ -314,19 +334,36 @@ function repairableBlockedReviewRequest(
 
   // 6. **通常 repair で扱ってはいけない指摘が混じっていない**こと。
   //    `critical` は Safety / Authority 相当の判断を求めうるので、既存の escalation へ残す。
-  if (review.findings.some((finding) => finding.severity === 'critical')) {
+  if (stored.findings.some((finding) => finding.severity === 'critical')) {
     return { ok: false, reason: 'review contains a critical finding' }
   }
 
   // 7. **Design Review が CONFLICT / BLOCK で止まっていない**こと。
   //    その場合の復旧は別責務（`task-design-review-conflict-has-no-recovery-route`）で、
   //    ここで repair を積むと本来の経路を踏み潰す。
+  //
+  //    **判定は既存の reader に委ねる。** ここで `resultJson` を自前に解釈していたが、
+  //    実際に保存されるのは runner の raw stdout で、判定は `finalDecision` /
+  //    `focusedReviewResults` / `integrationReviewResult` の形で入る。
+  //    自前パーサは `decision` という存在しない欄を読んでおり、**本物の CONFLICT を
+  //    取りこぼしていた**（独立レビュー指摘）。
+  //
+  //    **読めなかったときは通さない。** 以前は `undefined` がそのまま通過していたが、
+  //    「判定が読めない」は「CONFLICT ではない」の証明にならない。
+  //
+  //    **runner の自己申告（`finalDecision`）も信じない。** focus 判定が CONFLICT でも
+  //    `finalDecision: ALIGNED` と書いて返せることが既存テストで示されている
+  //    （`designReviewCoordinator.test.ts`「runner が finalDecision=ALIGNED と自己申告しても…」）。
+  //    既存の `recomputeDecision()` で計算し直した結果だけを使う。
   const latestRun = storage.designReviewRuns.findLatestByTaskId(task.id)
-  const latestDecision = latestRun?.resultJson === undefined
-    ? undefined
-    : safeDesignReviewDecision(latestRun.resultJson)
-  if (latestDecision === 'CONFLICT' || latestDecision === 'BLOCK') {
-    return { ok: false, reason: `latest design review is ${latestDecision}` }
+  if (latestRun?.resultJson !== undefined) {
+    const recomputed = safeRecomputedDecision(latestRun)
+    if (recomputed === undefined) {
+      return { ok: false, reason: 'latest design review decision could not be recomputed' }
+    }
+    if (recomputed !== 'ALIGNED') {
+      return { ok: false, reason: `latest design review is ${recomputed}` }
+    }
   }
 
   // 8. **競合する live Job が無い**こと。動いている Job の上へ repair を積まない。
@@ -339,15 +376,6 @@ function repairableBlockedReviewRequest(
   return { ok: true }
 }
 
-/** `resultJson` から decision を読む。壊れていれば undefined（判断に使わない）。 */
-function safeDesignReviewDecision(resultJson: string): string | undefined {
-  try {
-    const parsed = JSON.parse(resultJson) as { decision?: unknown } | null
-    return typeof parsed?.decision === 'string' ? parsed.decision : undefined
-  } catch {
-    return undefined
-  }
-}
 
 export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): RepairPreparation {
   const { failedJob, review } = input
@@ -370,7 +398,7 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   // **「blocked なら repair してよい」には広げない。** 下の `repairableBlockedReviewRequest()`
   // が既存レコードだけで全条件を機械照合し、1 つでも欠ければ従来どおり skip する。
   if (task.status === 'blocked') {
-    const admitted = repairableBlockedReviewRequest(storage, task, failedJob, review)
+    const admitted = repairableBlockedReviewRequest(storage, task, failedJob)
     if (!admitted.ok) return { action: 'skip', reason: `task is blocked (${admitted.reason})` }
   }
 

@@ -84,11 +84,21 @@ function createReviewJob(
   return storage.jobs.update(job.id, { status: 'failed', exitCode: 0 } as never)!
 }
 
-function reviewResult(overrides: Partial<ReviewResult> = {}): ReviewResult {
-  return {
-    id: 'review-1',
-    taskId: 'task-1',
-    jobId: 'job-1',
+/**
+ * **verdict を保存する。** 以前はここで in-memory の object を作って渡していたが、
+ * それでは「保存済みレコードだけで判断している」ことの証明にならない
+ * （呼び出し元が status も findings も自由に書けてしまう。独立レビュー指摘）。
+ * 判定は保存された行だけを見るので、テストも保存する。
+ */
+function storeReview(
+  storage: IStorage,
+  ids: { taskId: string },
+  reviewJobId: string,
+  overrides: Partial<ReviewResult> = {},
+): ReviewResult {
+  return storage.reviewResults.create({
+    taskId: ids.taskId,
+    jobId: reviewJobId,
     reviewer: 'qa_ai',
     status: 'changes_requested',
     summary: 'fix the two points',
@@ -96,9 +106,16 @@ function reviewResult(overrides: Partial<ReviewResult> = {}): ReviewResult {
       { severity: 'medium', file: 'apps/api/src/pl/executionLoop.ts', line: 1290, message: 'state transition widened' },
       { severity: 'medium', message: 'no verification evidence' },
     ],
-    createdAt: new Date().toISOString(),
     ...overrides,
-  } as ReviewResult
+  } as never)
+}
+
+/** Task + resume 成功 implement + review Job まで。verdict はまだ保存しない。 */
+function shapeWithoutVerdict(storage: IStorage, taskOverrides: Record<string, unknown> = {}) {
+  const ids = seed(storage, taskOverrides)
+  const implementJob = createResumedImplementJob(storage, ids)
+  const reviewJob = createReviewJob(storage, ids, implementJob.id)
+  return { ids, implementJob, reviewJob }
 }
 
 /** production で起きた形をそのまま組む。 */
@@ -106,7 +123,7 @@ function productionShape(storage: IStorage, taskOverrides: Record<string, unknow
   const ids = seed(storage, taskOverrides)
   const implementJob = createResumedImplementJob(storage, ids)
   const reviewJob = createReviewJob(storage, ids, implementJob.id)
-  const review = reviewResult({ taskId: ids.taskId, jobId: reviewJob.id })
+  const review = storeReview(storage, ids, reviewJob.id)
   return { ids, implementJob, reviewJob, review }
 }
 
@@ -133,10 +150,44 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     return result.action === 'skip' ? result.reason ?? '' : ''
   }
 
+  // review Job も verdict も無い、ふつうの blocked Task。
   it('ふつうの blocked Task（review 無し）は従来どおり skip', () => {
     const storage = createSQLiteStorage(':memory:')
-    const { implementJob } = productionShape(storage)
-    expect(skipped(storage, implementJob, undefined)).toContain('no review result')
+    const ids = seed(storage)
+    const implementJob = createResumedImplementJob(storage, ids)
+    expect(skipped(storage, implementJob, undefined)).toContain('no review job')
+  })
+
+  // **保存された verdict が無いなら、引数で渡されても通さない。**
+  // ここが「保存済みレコードだけで判断する」ことの本体である。
+  it('引数の review が changes_requested でも、保存が無ければ通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    const implementJob = createResumedImplementJob(storage, ids)
+    createReviewJob(storage, ids, implementJob.id)
+    const fabricated = {
+      id: 'fabricated', taskId: ids.taskId, jobId: 'whatever', reviewer: 'qa_ai',
+      status: 'changes_requested', summary: 's',
+      findings: [{ severity: 'medium', file: 'apps/api/src/pl/executionLoop.ts', message: 'm' }],
+      createdAt: new Date().toISOString(),
+    } as ReviewResult
+    expect(skipped(storage, implementJob, fabricated)).toContain('no stored review result')
+  })
+
+  // **保存が approved なら、引数が changes_requested でも通さない。**
+  it('保存済み verdict が approved なら、引数の changes_requested を信じない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    const implementJob = createResumedImplementJob(storage, ids)
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    storeReview(storage, ids, reviewJob.id, { status: 'approved' } as Partial<ReviewResult>)
+    const fabricated = {
+      id: 'fabricated', taskId: ids.taskId, jobId: reviewJob.id, reviewer: 'qa_ai',
+      status: 'changes_requested', summary: 's',
+      findings: [{ severity: 'medium', file: 'apps/api/src/pl/executionLoop.ts', message: 'm' }],
+      createdAt: new Date().toISOString(),
+    } as ReviewResult
+    expect(skipped(storage, implementJob, fabricated)).toContain('review status is approved')
   })
 
   it('done な Task は無条件 skip のまま', () => {
@@ -150,18 +201,18 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     const ids = seed(storage)
     const implementJob = createResumedImplementJob(storage, ids, { status: 'failed', exitCode: 1 })
     const reviewJob = createReviewJob(storage, ids, implementJob.id)
-    const review = reviewResult({ taskId: ids.taskId, jobId: reviewJob.id })
+    const review = storeReview(storage, ids, reviewJob.id)
     expect(skipped(storage, implementJob, review)).toContain('implementation job is failed')
   })
 
+  // review Job の stepKey が別の実装を指すなら、この実装に対する review は存在しない。
   it('review と実装の association が食い違う場合は通さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const ids = seed(storage)
     const implementJob = createResumedImplementJob(storage, ids)
-    // 別の Job を指す stepKey を持つ review Job。
     const reviewJob = createReviewJob(storage, ids, implementJob.id, 'implement:someone-else:review')
-    const review = reviewResult({ taskId: ids.taskId, jobId: reviewJob.id })
-    expect(skipped(storage, implementJob, review)).toContain('not associated with this implementation job')
+    const review = storeReview(storage, ids, reviewJob.id)
+    expect(skipped(storage, implementJob, review)).toContain('no review job for this implementation')
   })
 
   it('canonical resume successor でない実装は通さない', () => {
@@ -171,16 +222,14 @@ describe('blocked Task への repair — 通してはいけないケース', () 
       workflowStepKey: 'task:abc:initial-implement',
     })
     const reviewJob = createReviewJob(storage, ids, implementJob.id)
-    const review = reviewResult({ taskId: ids.taskId, jobId: reviewJob.id })
+    const review = storeReview(storage, ids, reviewJob.id)
     expect(skipped(storage, implementJob, review)).toContain('not a canonical resume successor')
   })
 
   it('allowedPaths 外を指す finding があれば通さない', () => {
     const storage = createSQLiteStorage(':memory:')
-    const { ids, implementJob, reviewJob } = productionShape(storage)
-    const review = reviewResult({
-      taskId: ids.taskId,
-      jobId: reviewJob.id,
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage)
+    const review = storeReview(storage, ids, reviewJob.id, {
       findings: [{ severity: 'medium', file: 'apps/worker/src/index.ts', message: 'outside' }],
     } as Partial<ReviewResult>)
     expect(skipped(storage, implementJob, review)).toContain('outside allowedPaths')
@@ -188,16 +237,17 @@ describe('blocked Task への repair — 通してはいけないケース', () 
 
   it('critical finding は通常 repair で扱わない', () => {
     const storage = createSQLiteStorage(':memory:')
-    const { ids, implementJob, reviewJob } = productionShape(storage)
-    const review = reviewResult({
-      taskId: ids.taskId,
-      jobId: reviewJob.id,
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage)
+    const review = storeReview(storage, ids, reviewJob.id, {
       findings: [{ severity: 'critical', file: 'apps/api/src/pl/executionLoop.ts', message: 'authority' }],
     } as Partial<ReviewResult>)
     expect(skipped(storage, implementJob, review)).toContain('critical finding')
   })
 
-  it('Design Review が CONFLICT なら別経路へ残す', () => {
+  // **自己申告の `finalDecision` は使わない。** runner は focus 判定が CONFLICT でも
+  // `finalDecision: ALIGNED` と書いて返せる（designReviewCoordinator.test.ts に既存の証明がある）。
+  // 判定は `recomputeDecision()` で計算し直し、**ALIGNED 以外はすべて通さない**。
+  it('再計算した Design Review 判定が ALIGNED でなければ通さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, implementJob, review } = productionShape(storage)
     const run = storage.designReviewRuns.create({
@@ -213,7 +263,9 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     storage.designReviewRuns.complete(
       run.id, claimed.claimToken!, 'succeeded', JSON.stringify({ decision: 'CONFLICT' }),
     )
-    expect(skipped(storage, implementJob, review)).toContain('CONFLICT')
+    // `{"decision":"CONFLICT"}` は runner の生出力として不正な形なので、
+    // 再計算は UNCERTAIN になる。いずれにせよ ALIGNED ではないので通らない。
+    expect(skipped(storage, implementJob, review)).toContain('latest design review is')
   })
 
   it('live な Job があれば通さない', () => {
@@ -231,8 +283,8 @@ describe('blocked Task への repair — 通してはいけないケース', () 
 
   it('changes_requested 以外の verdict は通さない', () => {
     const storage = createSQLiteStorage(':memory:')
-    const { ids, implementJob, reviewJob } = productionShape(storage)
-    const review = reviewResult({ taskId: ids.taskId, jobId: reviewJob.id, status: 'approved' } as Partial<ReviewResult>)
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage)
+    const review = storeReview(storage, ids, reviewJob.id, { status: 'approved' } as Partial<ReviewResult>)
     expect(skipped(storage, implementJob, review)).toContain('review status is approved')
   })
 })
