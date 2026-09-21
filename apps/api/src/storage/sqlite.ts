@@ -1348,6 +1348,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
       return rows.map(deserializeJob)
     },
+    findRecentAiCliJobs({ provider, mode, limit }) {
+      // **窓は「いま終わっている Job」だけで作る。** timeout 率も p95 も終わった Job に対する
+      // 指標で、まだ終わっていない Job は分子にも分母にも入れようがない。
+      //
+      // 絞り込まないと**未完了の行が窓を食い潰す**: 新しく作られた queued が大量にあると
+      // LIMIT の内側を占め、今日落ちた本物の timeout が窓の外へ押し出される
+      // （独立レビュー指摘）。production には 7〜20 日 queued のままの Job が実在する。
+      //
+      // **`completed_at IS NOT NULL` だけでは足りない。** requeue は `PATCH { status: queued }`
+      // のような部分更新で行われ、`jobs.update()` は `{ ...existing, ...data }` で
+      // 既存行へ重ねるため、**`completed_at` が前回の実行のまま残る**（独立レビュー指摘）。
+      // 一度落ちて requeue された行が「完了済み」として窓に入り、同じ問題が再発する。
+      // `status` は requeue で必ず書き換わるので、そちらを主たる条件にする。
+      const rows = db.prepare(
+        'SELECT * FROM jobs WHERE ai_cli_provider = ? AND ai_cli_mode = ? '
+        + "AND status IN ('success', 'failed') AND completed_at IS NOT NULL "
+        + 'ORDER BY completed_at DESC, rowid DESC LIMIT ?',
+      ).all(provider, mode, Math.max(1, Math.min(500, Math.trunc(limit)))) as any[]
+      return rows.map(deserializeJob)
+    },
     findById(id) {
       const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as any
       return row ? deserializeJob(row) : undefined

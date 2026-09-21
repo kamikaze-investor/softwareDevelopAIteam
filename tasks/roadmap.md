@@ -7276,6 +7276,41 @@ PL Console 4項目の state・優先度は変更していない。
       `containment-success-path-observability` と `review-substage-progress-reporting` は
       本項目に**包含される**（重複実装しない。両項目は本項目の受入条件へ畳む）。
 
+      **production evidence（2026-09-18 実測。新規 Finding は作らず本項目へ統合・CEO 指示）**:
+
+      実行中の Job の**進捗が外から一切分からない**ことが、実際の誤判断につながった。
+      Job `2dc04370` は 09:46:52Z に始まり 09:51:56Z に終わっていた（304 秒）が、
+      CEO 側からは「50 分以上動き続けている」ように見えていた。
+      直接の原因は調査側のツールだったが、**AIteamOS 側にも区別する材料が無い**:
+
+      1. **`jobs` に進捗を表す列が無い。** あるのは `started_at` / `completed_at` / `created_at`
+         だけで、`lastActivity` に当たる列も「いま何をしているか」も保存していない。
+         したがって「動いているが遅い」と「止まっている」を **DB からは原理的に区別できない**。
+         State API も Mobile も、この区別を持たない情報を表示している
+      2. **既に timestamp を持つ材料が手元にある。** Claude Code CLI の session transcript
+         （`~/.claude/projects/<workspace>/<session>.jsonl`）には 1 イベントごとに `timestamp` があり、
+         今回はそこから毎分のイベント数（23/12/12/14/**34**）を復元して
+         「終了 15 秒前まで作業していた」と確定できた。
+         **新しい telemetry 基盤を作らなくても lastActivity 相当は取れる**可能性が高い。
+         ただし中身は provider 由来の untrusted data なので、読むのは timestamp と件数に留め、
+         本文は `job-raw-output-persisted-and-shown` の責務とする
+      3. **timeout で強制終了された今回、stdout/stderr は 0 バイトだった。** `stdout.txt` /
+         `stderr.txt` は終了時刻で作られて中身が無く、envelope ごと診断材料を失った。
+         **最も診断が要る失敗のときに、最も情報が少なくなる**。
+         なお「強制終了なら必ず 0 バイト」と一般化はできない。プロセスが落ちる前に
+         flush していれば途中まで残りうる。**観測しているのはこの 1 件である**
+      4. **7〜20 日 `queued` のまま残っている Job が 3 件ある**
+         （`e73c7e5e` 2026-08-28 / `538826cd`・`b71b4c3e` 2026-09-11）。
+         どの attention にも現れず、誰も気づいていなかった。
+         「実行中に見えるが進んでいない」だけでなく「待機のまま忘れられる」経路もある
+
+      **本項目の受入条件へ畳む**: 横断状態として読み出せるべきなのは「実行中か」ではなく
+      **「最後に進捗したのはいつか」**である。今回はそこが無いために、
+      5 分で終わっていた Job を 50 分動いていると誤認した。
+
+      **ここでは実装しない**（CEO 指示・2026-09-18）。timeout 側の対応（`claude_code` implement を
+      900s の暫定 budget へ）は別途実施済みで、**そちらは進捗可視化の代わりにはならない**。
+
 **目的:**
 - CEOがPC/スマホからPL（Project Lead Role）へ指示を出す画面を、特定ベンダーUI
   （Claude Desktop等）に依存しない構成にする
@@ -8756,6 +8791,80 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **追加制約**: 上記はいずれも**記述側の修正で足り、新しい Guard・Gate・Review は不要**である
       （CODEOWNERS の対象追加のみ CEO 承認事項）。
       **AI 側が自分の権限を広げる形で解決してはならない**という既存の制約を全項目へ適用する。
+
+<!-- roadmap:id=job-failure-metadata-outlives-its-run state=planned -->
+9. [ ] **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる** —
+      2026-09-21登録（独立レビュー指摘 + コード実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: 同じ Job 行を再実行したとき、前回の `failure_metadata` が消えない。
+
+      1. Worker の terminal update は、provider 由来でない失敗のとき
+         `failureMetadata: undefined` を送る（`apps/worker/src/index.ts`）
+      2. HTTP を通る際に `JSON.stringify` が `undefined` のキーを落とす
+      3. `jobs.update()` は `{ ...existing, ...data }` で既存行へ重ねる
+         （`apps/api/src/storage/sqlite.ts`）
+
+      結果、**「timeout した → requeue → 別の理由で失敗」した行は、
+      `status=failed` かつ `kind=provider_timeout` に見える**。
+
+      **実測（2026-09-21・コード確認）**:
+      - **一般の terminal update / requeue 経路は `failure_metadata` を消さない。**
+        承認待ちからの requeue（`sqlite.ts` の `UPDATE jobs SET status='queued', started_at=NULL, ...`）は
+        `started_at` / `completed_at` / `exit_code` / `stdout` 等を戻すが、
+        `failure_metadata` は SET 句に含まれていない
+      - **訂正（2026-09-21・独立レビュー指摘）**: 初出時に「消す経路は 1 つも存在しない」と
+        書いたが**誤り**。`failAndPrepareRepair()` は `failure_metadata = ?` へ `null` を渡して
+        消す（`sqlite.ts`）。当時の grep が `failure_metadata = NULL` という**字面**しか
+        探しておらず、placeholder 経由の null を見落としていた。
+        **狭い grep から絶対的な主張を書いていた。** 着手時はこの点を再確認すること
+      - `jobs` 表に**実行を identify できる列が無い**。試行回数も run id も無く、
+        `failure_metadata` 自体に時刻も付かない。したがって
+        **「この印がどの実行のものか」を既存データから機械的に確定できない**
+
+      **影響範囲（sensor だけの問題ではない）**:
+      - `apps/api/src/pl/blockedTriage.ts` は `failureMetadata?.kind === 'provider_timeout'` で
+        lane を選ぶ。古い印が残っていると、**timeout していない失敗を provider timeout として
+        triage しうる**
+      - `apps/api/src/designReview/repairFlow.ts` は 3 箇所で `failureKind` を読む
+      - `implement-timeout-sensor`（PR #262）は、この不確かさのため
+        **A/B 条件を fail-closed で止めている**。信じると timeout していない失敗で誤発火し、
+        budget ごとの重複排除キーを本物の証拠より先に使い切って、
+        **センサー自身の再評価能力を壊す**ため
+
+      **なぜ #262 で直さなかったか（CEO 判断・2026-09-21）**: 直し方は
+      「terminal update が失敗のたびに `failureMetadata` を明示的に書く（無いなら消す）」で、
+      これは `blockedTriage` / `repairFlow` も読む**共有 Job terminal-update semantics の変更**である。
+      timeout 値の PR に混ぜると影響範囲が不自然に広がる。
+
+      **着手時に調査すること（実装方針を先に決めない）**:
+      1. terminal job update が前回の `failureMetadata` を残す条件を、経路ごとに洗い出す
+         （Worker terminal update / `PATCH /api/jobs/:id` / 各 requeue / abort / quarantine）
+      2. **retry / rerun 時の意味論**を決める。同じ行を再利用する経路と新しい行を作る経路
+         （`resume:` / `repair:` は新規行）で、何が引き継がれるべきかは同じではない
+      3. `blockedTriage` への影響。古い印による lane 誤選択が production で起きていないか実測する
+      4. `repairFlow` への影響
+      5. sensor への影響（A/B を戻せるか）
+      6. **terminal success / failure ごとに `failureMetadata` を明示的に clear / write すべきか。**
+         `undefined` が「変更しない」を意味する現在の部分更新 semantics と、
+         「この実行には provider 由来の失敗が無い」を区別できるか
+      7. **同じ根本で、`failureMetadata` 以外の列も書き換わる。**
+         `PATCH /api/jobs/:id` は stale / 適用不可の `status` だけを落として
+         （`routes/jobs.ts` の `delete jobUpdate.status`）、payload の残り —— `completedAt` 等 ——
+         はそのまま永続化する。遅れて届いた重複 result により、
+         **`success` のまま所要時間だけが書き換わった行**が残りうる（独立レビュー指摘）。
+         implement-timeout-sensor の C は一時この汚染を避けようと「budget を超える成功」を
+         標本から外したが、**それは誤りだったので取り下げた**（2026-09-21）:
+         `timeoutMs` が掛かるのは AI CLI の子プロセスだけで、Job 全体は検査と SafeCommand の
+         ぶん budget を超えうる。落ちるのは **C が拾うべき near-budget の成功そのもの**だった。
+         塞げるだけ狭い上限は本物の標本を捨てるため、**センサー側では塞がない**。
+         **status 以外の列に対する stale result の扱いも本項目の対象とする**
+
+      **新しい metadata subsystem は作らない**（CEO 指示・2026-09-21）。
+      既存の Job update 機構を正す方向を優先する。
+
+      **関連**: `pl-escalation-blames-the-wrong-cause` は `failureMetadata` を診断の手がかりとして
+      **使う**側の項目で、本項目（印の寿命そのもの）とは別。ただし本項目が解決すると、
+      あちらが前提にできる材料の確からしさが上がる。
 
 <!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
 11. [ ] **CEO / PL に届く停止理由が、実際の原因を指していない** —

@@ -53,6 +53,8 @@ import {
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
 import { requestText } from '../aiExplain/cheapAiClient'
+import { evaluateAndPersistImplementTimeoutSensors } from './implementTimeoutSensor'
+import { CLAUDE_IMPLEMENT_TIMEOUT_MS } from '@ai-team/shared'
 import {
   buildTriageEscalationBody,
   formatTriageAuditDetail,
@@ -1102,6 +1104,22 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
   inFlight = true
 
   try {
+    // ── 暫定 timeout の再評価センサー ────────────────────────
+    //
+    // implement の AI CLI timeout（900s）は**暫定値**であり、打ち切られていた裾を
+    // 測り直すための budget である。ここで機械的に見ておかないと、
+    // 「後でもう一度集計する」が実行されないまま恒久値になる。
+    //
+    // **PL の判断より前に置くが、PL の判断は変えない。** このセンサーが返すのは
+    // audit の候補行だけで、attention にも actionable にも入らない。
+    // 失敗しても tick を壊さないよう best-effort にしてある
+    // （診断の記録失敗が PL の結論を書き換えた事故が 2026-09-18 に別経路で起きている）。
+    try {
+      evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
+    } catch {
+      // 記録できないことは PL が止まる理由にならない。次の tick で再評価される。
+    }
+
     // ── Observe ───────────────────────────────────────────────
     const before = buildSystemState(storage, deps.now ? { now: deps.now } : {})
     // **Escalation 済みの対象は選択段階で外す。**
