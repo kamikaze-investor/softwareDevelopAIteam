@@ -268,21 +268,37 @@ export async function runRepairFlow(
  * ここで落としておくことで、下の `isInsideAllowedPaths()` が受け取る prefix は
  * 常に相対・`..` 無しになり、正規化の有無で範囲が変わる余地そのものが無くなる。
  */
+function scopePrefixForMatch(prefix: string): string {
+  return prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
+}
+
 function isUsableScopePrefix(prefix: string): boolean {
-  const candidate = prefix.split('\\').join('/').replace(/\/+$/, '')
-  if (candidate !== candidate.trim()) return false
-  if (candidate.startsWith('/')) return false
-  if (/^[A-Za-z]:/.test(candidate)) return false
-  // **正規化で形が変わる prefix は通さない。** `..` だけでなく `.` や連続スラッシュも同じで、
-  // `apps/api/src/./pl` を残したまま正規化済みの file と比べると、**範囲内の指摘を範囲外と
-  // 誤判定する**（独立レビュー指摘）。「正規化しても変わらない形」だけを通すことで、
-  // 下の比較で prefix を正規化するかどうかが結果に影響しなくなる。
-  if (candidate !== posix.normalize(candidate)) return false
-  // 空文字はここで落ちる（`posix.normalize('')` は `.` を返すので形が変わる）。
-  // `..` と `.` は正規化しても残る（`..` / `../a` / `.`）。これらは File Change Guard の
-  // 前方一致にどの変更ファイルも一致させないので、範囲として使えない。
-  const segments = candidate.split('/')
+  // **保存された文字列そのものを見る。書き換えてから判定しない。**
+  //
+  // 以前はここで backslash を `/` に直し、末尾スラッシュを全部剥がしてから判定していた。
+  // だが Worker 側の guard は **2 つあり、扱いが違う**:
+  //   - `safetyVerifier.ts` は `/+$` を全部剥がし、backslash も `/` に直す
+  //   - `fileChangeGuard.ts` は末尾スラッシュを **1 つだけ** 剥がし、backslash は直さない
+  // つまり「Worker の guard はこう扱う」と一意に言える形ではない。書き換えてから
+  // 「使える」と判断すると、書き換えた形でしか成り立たない結論になる（独立レビュー指摘）。
+  //
+  // そこで **2 つの guard が同じ prefix を導く形だけ**を通す —— 素直な相対 posix path、
+  // 末尾スラッシュは付いていても 1 つまで。そこから外れるものは、repair を作っても
+  // どちらの guard で止まるか読めないので、範囲として使えないものとして扱う。
+  if (prefix !== prefix.trim()) return false
+  if (prefix.includes('\\')) return false
+  if (prefix.startsWith('/')) return false
+  if (/^[A-Za-z]:/.test(prefix)) return false
+  // 空文字・`//`・解決される `..` はここで落ちる（`posix.normalize('')` は `.`、
+  // `a//b` は `a/b`、`a/../b` は `b` になり、いずれも元と形が変わる）。
+  // 末尾スラッシュ 1 つは正規化で残るので、下の照合形で扱う。
+  if (prefix !== posix.normalize(prefix)) return false
+  // `.` と `..` は正規化しても残る（`.` / `..` / `../a`）。どの変更ファイルにも一致しない。
+  const segments = scopePrefixForMatch(prefix).split('/')
   if (segments.includes('..') || segments.includes('.')) return false
+  // 照合形が空になる入力はここまで来ない（空文字は正規化検査、`/` は絶対パス検査で落ちる）。
+  // 「念のため」の長さ検査を置いていたが mutation で生き残った —— 結果を変えない検査は
+  // 検査ではないので置かない。
   return true
 }
 
@@ -294,11 +310,10 @@ function isInsideAllowedPaths(file: string, allowed: readonly string[]): boolean
     // **file 側だけ正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
     // 範囲内に見えるが、解決すると外を指す。
     //
-    // prefix 側は `isUsableScopePrefix()` が **正規化しても変わらない形**だけに限ってある
-    // ので、ここで正規化してもしなくても結果は同じである。**「正規化しないから安全」では
-    // なく、「正規化で変わる prefix を先に落としてあるから安全」である**（独立レビュー指摘）。
-    // 末尾スラッシュだけは落とす。落とさないと範囲内の finding を取りこぼす。
-    const candidate = prefix.split('\\').join('/').replace(/\/+$/, '')
+    // prefix は `isUsableScopePrefix()` を通ったものだけなので、ここでの照合形は
+    // **末尾スラッシュ 1 つを落とすだけ** —— Worker の 2 つの guard が導くのと同じ形である。
+    // prefix をこれ以上書き換えない。書き換えれば、また Worker と食い違う。
+    const candidate = scopePrefixForMatch(prefix)
     return normalized === candidate || normalized.startsWith(`${candidate}/`)
   })
 }

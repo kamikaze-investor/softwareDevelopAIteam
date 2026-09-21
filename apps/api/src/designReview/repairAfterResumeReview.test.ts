@@ -444,6 +444,11 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     ['カレント', '.'],
     ['親のみ', '..'],
     ['親から始まる', '../apps/api/src/pl'],
+    // **Worker の guard 2 つで解釈が割れる形。** `fileChangeGuard` は末尾スラッシュを
+    // 1 つだけ剥がし backslash を直さない。`safetyVerifier` は全部剥がし backslash を直す。
+    // どちらで止まるか読めないものは範囲として使わない。
+    ['backslash 区切り', 'apps\\api\\src\\pl'],
+    ['末尾スラッシュ 2 つ', 'apps/api/src/pl//'],
   ] as const) {
     it(`allowedPaths が ${label} なら、file の無い finding だけでも通さない`, () => {
       const storage = createSQLiteStorage(':memory:')
