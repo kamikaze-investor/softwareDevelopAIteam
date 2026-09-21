@@ -11,6 +11,22 @@ import type { IStorage } from '../storage/interface'
  * `CLAUDE_IMPLEMENT_TIMEOUT_MS` のコメントに根拠がある）。
  * 「後でもう一度 SQL を叩く」に頼ると、そのまま恒久値になって忘れられる。
  *
+ * ## いま実際に動いている条件は C だけである（CEO 判断・2026-09-21）
+ *
+ * A（budget に殺されて生成物を失った Job）と B（その率）は **fail-closed で止めてある**。
+ * 根拠が `failureMetadata.kind === 'provider_timeout'` なのに、**その印がいま見ている実行の
+ * ものだと `jobs` 行から確認できない**（`failureMetadataBoundToCurrentRun()` に調査結果）。
+ * 信じると timeout していない失敗で誤発火し、budget ごとの重複排除キーを本物の証拠より
+ * 先に使い切って、**センサー自身の再評価能力を壊す**。
+ *
+ * C（成功 Job の p95 が budget へ接近）は `status` と所要時間だけを見るので影響を受けない。
+ * **つまり現時点の再評価能力は「成功が遅くなってきたら気付く」までで、
+ * 「広げた budget でもまだ殺されている」は検知できない。** 前者だけでも
+ * 暫定値が忘れられるのは防げるが、**A/B の代わりにはならない。**
+ *
+ * 根本原因は Roadmap `job-failure-metadata-outlives-its-run` で扱う。それが解決したら
+ * `failureMetadataBoundToCurrentRun()` を実装して A/B を戻す。
+ *
  * ## このセンサーがしないこと
  *
  * - **timeout 値を書き換えない。** 出すのは再 Review 候補までである（CEO 指示・2026-09-18）
@@ -85,6 +101,37 @@ function durationSeconds(job: Job): number | undefined {
 }
 
 /**
+ * **この `failureMetadata` が「いま見ている実行」で書かれたものだと確認できるか。**
+ *
+ * ## 今日は確認できない。だから常に false を返す（CEO 指示・2026-09-21）
+ *
+ * `jobs` 行を調べた結果、**実行を identify できる列が 1 つも無い**:
+ * 試行回数も run id も無く、`failure_metadata` 自体に時刻も付いていない。
+ * そして **`failure_metadata` を消す経路が 1 つも存在しない**（全経路を grep して確認）。
+ *
+ * 一方で Worker の terminal update は、provider 由来でない失敗のとき
+ * `failureMetadata: undefined` を送る。`JSON.stringify` が `undefined` を落とし、
+ * `jobs.update()` は `{ ...existing, ...data }` で重ねるので、**前の実行の印が残る**。
+ * つまり「timeout した → requeue → 別の理由で失敗」した行は、
+ * `status=failed` かつ `provider_timeout` に見える（独立レビュー指摘）。
+ *
+ * これを信じると、**non-timeout の失敗で A/B が誤発火し、budget ごとの重複排除キーを
+ * 本物の証拠より先に使い切って、以後の再評価を黙らせる**。センサーが自分の目的を壊す。
+ *
+ * ## 何が揃えば true にできるか
+ *
+ * terminal update が失敗のたびに `failureMetadata` を**明示的に書く（無いなら消す）**
+ * ようになれば、`status=failed` と印の組は同じ実行のものだと言える。
+ * それは `blockedTriage` / `repairFlow` も読む共有 semantics の変更なので、
+ * **Roadmap `job-failure-metadata-outlives-its-run` で別途扱う**（CEO 判断・2026-09-21）。
+ * ここを埋めるのはその後で、**推測（caller の意図 / 最新値だから / 経過時間）で
+ * fresh と見なしてはいけない**。
+ */
+function failureMetadataBoundToCurrentRun(_job: Job): boolean {
+  return false
+}
+
+/**
  * **その Job の現在の状態が「budget に殺された失敗」であるか。**
  *
  * `failureMetadata` だけでは足りない。requeue の UPDATE は `status` / `started_at` /
@@ -98,7 +145,10 @@ function durationSeconds(job: Job): number | undefined {
  * `status === 'failed'` を併せて要求すれば、再実行して成功した行は外れる。
  */
 function killedByBudget(job: Job): boolean {
-  return job.status === 'failed' && job.failureMetadata?.kind === 'provider_timeout'
+  if (job.status !== 'failed') return false
+  if (job.failureMetadata?.kind !== 'provider_timeout') return false
+  // **印が今回の実行のものだと言えないなら数えない（fail-closed）。**
+  return failureMetadataBoundToCurrentRun(job)
 }
 
 function hasChangedFiles(job: Job): boolean {
@@ -203,6 +253,21 @@ export function ensureImplementTimeoutPolicyEpoch(
   return effectiveFrom
 }
 
+/**
+ * `a` が `b` と同時か、それより後か。**文字列ではなく時刻として比べる。**
+ *
+ * ISO 表記は 1 つではない（`2026-09-18T09:00:00+09:00` と `2026-09-18T00:00:00.000Z` は
+ * 同じ瞬間）。辞書順で比べると同じ瞬間でも前後を取り違える（独立レビュー指摘）。
+ * どちらかが解釈できなければ false（fail-closed）。
+ */
+export function isAtOrAfter(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined || b === undefined) return false
+  const left = Date.parse(a)
+  const right = Date.parse(b)
+  if (Number.isNaN(left) || Number.isNaN(right)) return false
+  return left >= right
+}
+
 /** 昇順ソートした配列の分位点。サンプルが無ければ undefined。 */
 export function percentile(values: readonly number[], p: number): number | undefined {
   if (values.length === 0) return undefined
@@ -258,15 +323,10 @@ export function evaluateImplementTimeoutSensors(
    *
    * 経過時間は使わない（`ensureImplementTimeoutPolicyEpoch()` の説明を参照）。
    */
-  const epochStartedAt = policyEpochStart === undefined ? undefined : Date.parse(policyEpochStart)
   const killedByCurrentBudget = (job: Job): boolean => {
     if (!killedByBudget(job)) return false
-    if (epochStartedAt === undefined || Number.isNaN(epochStartedAt)) return true
-    if (job.startedAt === undefined) return false
-    // **文字列ではなく時刻として比べる。** ISO 表記は 1 つではないので、
-    // 辞書順比較は同じ瞬間でも前後を取り違える（独立レビュー指摘）。
-    const started = Date.parse(job.startedAt)
-    return !Number.isNaN(started) && started >= epochStartedAt
+    if (policyEpochStart === undefined) return true
+    return isAtOrAfter(job.startedAt, policyEpochStart)
   }
 
   // ── A. 現在の budget を使い切って落ち、生成済みの変更を失った Job ──────
@@ -290,7 +350,8 @@ export function evaluateImplementTimeoutSensors(
       thresholdNote:
         `provider_timeout（= 渡した timeoutMs のタイマーが発火して kill された）かつ`
         + ` changedFiles あり、かつ現在の budget が有効になった後に**開始**した Job。`
-        + ` 1 件でも再評価対象（CEO 指示・2026-09-18）。`,
+        + ` 1 件でも再評価対象（CEO 指示・2026-09-18）。`
+        + ' なお 2026-09-21 時点でこの条件は fail-closed で止まっており、この行は出ない。',
     })
   }
 

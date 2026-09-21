@@ -290,6 +290,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **blocked になった Job の変更を、後から安全に取り消す材料が残っていない**（state: deferred）
 - **`approval_gate` evidence は action へ束縛されず、Gate 経路では使い切られない**（state: deferred）
 - **`⚠️ CONTROL REPOSITORY（state: planned）
+- **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる**（state: planned）
 - **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）

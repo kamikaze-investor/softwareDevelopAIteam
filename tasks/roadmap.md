@@ -8792,6 +8792,64 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       （CODEOWNERS の対象追加のみ CEO 承認事項）。
       **AI 側が自分の権限を広げる形で解決してはならない**という既存の制約を全項目へ適用する。
 
+<!-- roadmap:id=job-failure-metadata-outlives-its-run state=planned -->
+9. [ ] **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる** —
+      2026-09-21登録（独立レビュー指摘 + コード実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **事象**: 同じ Job 行を再実行したとき、前回の `failure_metadata` が消えない。
+
+      1. Worker の terminal update は、provider 由来でない失敗のとき
+         `failureMetadata: undefined` を送る（`apps/worker/src/index.ts`）
+      2. HTTP を通る際に `JSON.stringify` が `undefined` のキーを落とす
+      3. `jobs.update()` は `{ ...existing, ...data }` で既存行へ重ねる
+         （`apps/api/src/storage/sqlite.ts`）
+
+      結果、**「timeout した → requeue → 別の理由で失敗」した行は、
+      `status=failed` かつ `kind=provider_timeout` に見える**。
+
+      **実測（2026-09-21・コード確認）**:
+      - `failure_metadata` を**消す経路は 1 つも存在しない**（全経路 grep 済み）。
+        承認待ちからの requeue（`sqlite.ts` の `UPDATE jobs SET status='queued', started_at=NULL, ...`）は
+        `started_at` / `completed_at` / `exit_code` / `stdout` 等を戻すが、
+        `failure_metadata` は SET 句に含まれていない
+      - `jobs` 表に**実行を identify できる列が無い**。試行回数も run id も無く、
+        `failure_metadata` 自体に時刻も付かない。したがって
+        **「この印がどの実行のものか」を既存データから機械的に確定できない**
+
+      **影響範囲（sensor だけの問題ではない）**:
+      - `apps/api/src/pl/blockedTriage.ts` は `failureMetadata?.kind === 'provider_timeout'` で
+        lane を選ぶ。古い印が残っていると、**timeout していない失敗を provider timeout として
+        triage しうる**
+      - `apps/api/src/designReview/repairFlow.ts` は 3 箇所で `failureKind` を読む
+      - `implement-timeout-sensor`（PR #262）は、この不確かさのため
+        **A/B 条件を fail-closed で止めている**。信じると timeout していない失敗で誤発火し、
+        budget ごとの重複排除キーを本物の証拠より先に使い切って、
+        **センサー自身の再評価能力を壊す**ため
+
+      **なぜ #262 で直さなかったか（CEO 判断・2026-09-21）**: 直し方は
+      「terminal update が失敗のたびに `failureMetadata` を明示的に書く（無いなら消す）」で、
+      これは `blockedTriage` / `repairFlow` も読む**共有 Job terminal-update semantics の変更**である。
+      timeout 値の PR に混ぜると影響範囲が不自然に広がる。
+
+      **着手時に調査すること（実装方針を先に決めない）**:
+      1. terminal job update が前回の `failureMetadata` を残す条件を、経路ごとに洗い出す
+         （Worker terminal update / `PATCH /api/jobs/:id` / 各 requeue / abort / quarantine）
+      2. **retry / rerun 時の意味論**を決める。同じ行を再利用する経路と新しい行を作る経路
+         （`resume:` / `repair:` は新規行）で、何が引き継がれるべきかは同じではない
+      3. `blockedTriage` への影響。古い印による lane 誤選択が production で起きていないか実測する
+      4. `repairFlow` への影響
+      5. sensor への影響（A/B を戻せるか）
+      6. **terminal success / failure ごとに `failureMetadata` を明示的に clear / write すべきか。**
+         `undefined` が「変更しない」を意味する現在の部分更新 semantics と、
+         「この実行には provider 由来の失敗が無い」を区別できるか
+
+      **新しい metadata subsystem は作らない**（CEO 指示・2026-09-21）。
+      既存の Job update 機構を正す方向を優先する。
+
+      **関連**: `pl-escalation-blames-the-wrong-cause` は `failureMetadata` を診断の手がかりとして
+      **使う**側の項目で、本項目（印の寿命そのもの）とは別。ただし本項目が解決すると、
+      あちらが前提にできる材料の確からしさが上がる。
+
 <!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
 11. [ ] **CEO / PL に届く停止理由が、実際の原因を指していない** —
       2026-09-15登録（production 実測）。**機構ではなく、届く情報の品質の問題。**
