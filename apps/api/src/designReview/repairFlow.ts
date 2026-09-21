@@ -33,6 +33,7 @@ import {
   type CoordinatorDeps,
 } from './designReviewCoordinator'
 import { buildRepairPrompt } from './repairPromptBuilder'
+import { posix } from 'node:path'
 import { recomputeDecision, type RawStrategicResult } from './designReviewCoordinator'
 import {
   REPAIR_STEP_PREFIX,
@@ -250,6 +251,24 @@ export async function runRepairFlow(
  * 「Jobはfailed / runは無い」というlost-trigger windowが生じない。
  */
 /**
+ * `file` が `allowed` のいずれかの内側に**解決される**か。
+ *
+ * 文字列の前方一致だけでは足りない。`apps/api/src/pl/../routes/jobs.ts` は
+ * `apps/api/src/pl/` で始まるのに、解決先は範囲外である。絶対パスや `..` で始まる形も
+ * ここで落とす。判定できない形は**内側と見なさない**（fail-closed）。
+ */
+function isInsideAllowedPaths(file: string, allowed: readonly string[]): boolean {
+  const normalized = posix.normalize(file.split('\\').join('/'))
+  if (normalized.startsWith('/') || normalized.startsWith('..')) return false
+
+  return allowed.some((prefix) => {
+    const normalizedPrefix = posix.normalize(prefix.split('\\').join('/')).replace(/\/+$/, '')
+    if (normalizedPrefix.length === 0) return false
+    return normalized === normalizedPrefix || normalized.startsWith(`${normalizedPrefix}/`)
+  })
+}
+
+/**
  * 保存済み run から **計算し直した** design review 判定。読めなければ undefined。
  *
  * `resultJson` は runner の raw 出力なので、そこに書かれた `finalDecision` は自己申告である。
@@ -324,10 +343,12 @@ function repairableBlockedReviewRequest(
   //    範囲外のファイルを指す指摘が 1 件でもあれば、repair は scope を越える。
   const allowed = task.allowedPaths ?? []
   if (allowed.length === 0) return { ok: false, reason: 'task has no allowedPaths' }
+  // **前方一致の前に正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
+  // `apps/api/src/pl/` で始まるが、解決すると範囲外を指す（独立レビュー指摘）。
   const outside = stored.findings
     .map((finding) => finding.file)
     .filter((file): file is string => typeof file === 'string' && file.length > 0)
-    .filter((file) => !allowed.some((prefix) => file === prefix || file.startsWith(`${prefix}/`)))
+    .filter((file) => !isInsideAllowedPaths(file, allowed))
   if (outside.length > 0) {
     return { ok: false, reason: `review findings point outside allowedPaths (${outside[0]})` }
   }
@@ -355,8 +376,12 @@ function repairableBlockedReviewRequest(
   //    `finalDecision: ALIGNED` と書いて返せることが既存テストで示されている
   //    （`designReviewCoordinator.test.ts`「runner が finalDecision=ALIGNED と自己申告しても…」）。
   //    既存の `recomputeDecision()` で計算し直した結果だけを使う。
+  //    **run があるのに結果が無い場合も通さない。** 失敗した run や attempt 上限に達した run は
+  //    `resultJson` が NULL のまま残る。そこを `!== undefined` で素通りさせていたため、
+  //    **判定が存在しない Design Review が「問題なし」として扱われていた**（独立レビュー指摘）。
+  //    run が 1 つも無いときだけが「まだ Design Review をしていない」であり、それは通してよい。
   const latestRun = storage.designReviewRuns.findLatestByTaskId(task.id)
-  if (latestRun?.resultJson !== undefined) {
+  if (latestRun !== undefined) {
     const recomputed = safeRecomputedDecision(latestRun)
     if (recomputed === undefined) {
       return { ok: false, reason: 'latest design review decision could not be recomputed' }

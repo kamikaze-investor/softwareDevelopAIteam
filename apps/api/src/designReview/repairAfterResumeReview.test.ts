@@ -257,15 +257,55 @@ describe('blocked Task への repair — 通してはいけないケース', () 
       designTextHash: 'h',
       changedFiles: [],
     } as never)
-    // claim -> complete が正規の終端経路。claim_token 一致時のみ結果を書ける。
+    // **runner が ALIGNED と自己申告し、focus 判定が CONFLICT** という形。
+    // `finalDecision` をそのまま読む実装ならこれを通してしまう。
+    // `{"decision":"CONFLICT"}` のような作り物では、`finalDecision` を読む実装でも
+    // undefined になって偶然 skip するため、**バグを捕まえられない**（独立レビュー指摘）。
+    const selfDeclaredAligned = {
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'CONFLICT' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      ],
+      integrationReviewResult: { decision: 'ALIGNED' },
+      independentReviewResult: { verdict: 'approved' },
+      finalDecision: 'ALIGNED',
+    }
     const claimed = storage.designReviewRuns.claim(run.id, 3)
     expect(claimed.claimToken).toBeDefined()
     storage.designReviewRuns.complete(
-      run.id, claimed.claimToken!, 'succeeded', JSON.stringify({ decision: 'CONFLICT' }),
+      run.id, claimed.claimToken!, 'succeeded', JSON.stringify(selfDeclaredAligned),
     )
-    // `{"decision":"CONFLICT"}` は runner の生出力として不正な形なので、
-    // 再計算は UNCERTAIN になる。いずれにせよ ALIGNED ではないので通らない。
+    // 再計算すれば ALIGNED にならない。自己申告を読む実装だけが通してしまう。
     expect(skipped(storage, implementJob, review)).toContain('latest design review is')
+  })
+
+  // **結果の無い run も通さない。** 失敗した run / attempt 上限に達した run は
+  // `resultJson` が NULL のまま残る。判定が存在しないことは「問題なし」ではない。
+  it('Design Review run はあるが結果が無い場合も通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, review } = productionShape(storage)
+    storage.designReviewRuns.create({
+      taskId: ids.taskId,
+      taskTitle: 'T',
+      designText: 'd',
+      designTextHash: 'h',
+      changedFiles: [],
+    } as never)
+    expect(skipped(storage, implementJob, review)).toContain('could not be recomputed')
+  })
+
+  // **パスは解決してから比べる。** 文字列の前方一致だけだと範囲外を指せる。
+  it('.. を含む finding path は allowedPaths 内と見なさない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage)
+    const review = storeReview(storage, ids, reviewJob.id, {
+      findings: [{
+        severity: 'medium',
+        file: 'apps/api/src/pl/../routes/jobs.ts',
+        message: 'escapes the scope',
+      }],
+    } as Partial<ReviewResult>)
+    expect(skipped(storage, implementJob, review)).toContain('outside allowedPaths')
   })
 
   it('live な Job があれば通さない', () => {
