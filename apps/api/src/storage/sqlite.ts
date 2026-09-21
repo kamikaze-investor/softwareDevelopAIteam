@@ -804,9 +804,31 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         if (!row) return { ok: false as const, reason: 'Task not found' }
 
         // 判定から確定までの間に誰かが動かしていないか、最後にもう一度確かめる。
+        //
+        // **入口条件は3つとも確かめ直す。** 以前は `status` だけを読み直していたが、
+        // 「Job 0 件」と「park されていない」は transaction の外で見たきりだった。
+        // 別 connection が precheck と `tx.immediate()` の間に Job を1件入れると、
+        // **Job を持つ Task が `pending` になり成功 audit まで残る** ——
+        // それはこの操作の定義そのもの（Job があるものは `/resume` の担当）を破る
+        // （独立レビュー round 6 指摘）。読み直す条件が判定に使った条件より少ない限り、
+        // IMMEDIATE で lock を取っても意味が無い。
         const current = deserializeTask(row)
         if (current.status !== 'blocked') {
           return { ok: false as const, reason: `Task is ${current.status}, not blocked` }
+        }
+
+        const jobCount = (db.prepare(
+          'SELECT COUNT(*) AS n FROM jobs WHERE task_id = ?',
+        ).get(taskId) as { n: number }).n
+        if (jobCount > 0) {
+          return {
+            ok: false as const,
+            reason: `Task acquired ${jobCount} job(s) concurrently; use /resume instead`,
+          }
+        }
+
+        if (isParkedTaskId(taskId)) {
+          return { ok: false as const, reason: 'Task was parked concurrently' }
         }
 
         const updated = tasks.update(taskId, { status: 'pending' })

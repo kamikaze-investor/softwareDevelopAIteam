@@ -136,7 +136,9 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 - `project_not_running` … **Project が `running` でないので、何も動かず通知も出ない。**
   attention 導出は `project.status === 'running'` を要求するため、ここを `attention_only` と
   返すと「通知は出る」という出ない約束になる（独立レビュー round 4 指摘）。
-  先に Project を再開すること
+  先に Project を再開すること。
+  **この値は「再開すれば動く」ことまで含意する**ので、自律ループから到達できない Task には
+  返さない（再開しても何も起きないため `none` になる。独立レビュー round 6 指摘）
 - `none` … **何も拾わない。** `roadmapActive=false` / `assignee≠developer_ai` で自律ループから
   到達できず、遷移先の `task_ready_without_job` も立たない。それでも受理するのは、
   `blocked` のままだと `occupiesProject()` が Project の枠を無条件に占有し続け、
@@ -151,6 +153,10 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 > `triageBlocked()` の CEO 本文もその値で文面を変える（独立レビュー round 4 指摘）。
 
 **Job は作られない。** 実装 Job は fresh Design Review が ALIGNED になって初めて作られる。
+
+**入口条件（`blocked` / Job 0 件 / park されていない）は transaction の中でも確かめ直す。**
+precheck と確定の間に別 connection が Job を入れたり park したりしても、
+`TASK_HAS_JOBS` 相当の理由で commit されない（独立レビュー round 6 指摘）。
 
 主な拒否理由:
 

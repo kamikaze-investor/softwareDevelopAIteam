@@ -178,6 +178,9 @@ export type HumanRecoveryNextDriver =
    * `task_ready_without_job` も `project.status === 'running'` を要求する。
    * ここで `attention_only` と返すと「通知が出る」と約束したことになるが、
    * 実際には何も出ない（独立レビュー round 4 指摘）。**先に Project を再開する**必要がある。
+   *
+   * **この値は「Project を再開すれば動く」ことまで含意する。** 自律ループから到達できない
+   * Task には返さない —— 再開しても何も起きないので、`none` が正しい（round 6 指摘）。
    */
   | 'project_not_running'
   /**
@@ -239,13 +242,19 @@ export function predictHumanRecoveryDriver(
   projectIsRunning: boolean,
 ): HumanRecoveryNextDriver {
   const taskId = task.id
-  // **running でない Project では何ひとつ動かない。** PL tick も attention 導出も
-  // `project.status === 'running'` を要求する。だからこれを**最初に**見る ——
-  // 後ろに置くと、到達可能な Task について `attention_only` と答えてしまい、
-  // 「通知は出る」という出ない約束になる（独立レビュー round 4 指摘）。
-  if (!projectIsRunning) return 'project_not_running'
-  // 自律ループの対象外なら attention すら立たない。**そう正直に返す。**
+  // **順序に意味がある。** 2つの独立した阻害要因があり、1つの値では両方を表せない:
+  //
+  //   - 到達可能性（`roadmapActive` / `assignee`）は Project 状態と無関係に決まり、
+  //     **Project を再開しても解けない**
+  //   - Project が running でないことは、再開すれば解ける
+  //
+  // 到達不能を先に見る。逆にすると、paused かつ到達不能な Task へ
+  // `project_not_running` と答えることになり、docs どおり Project を再開した CEO は
+  // **何も起きない**のを見ることになる（独立レビュー round 6 指摘）。
+  // 到達可能なら、次に Project 状態を見る。ここを `attention_only` にすると
+  // 「通知は出る」という出ない約束になる（同 round 4 指摘）。
   if (!isReachableByAutonomousLoop(task)) return 'none'
+  if (!projectIsRunning) return 'project_not_running'
   // **`blocked` のまま呼ばれることがある。** `triageBlocked()` は再投入する**前**に
   // 「戻したら何が動くか」を CEO へ書くのでこの関数をそこでも呼ぶ。option を付けて
   // 遷移後の形で評価させる（endpoint 側は既に `pending` なので無害）。

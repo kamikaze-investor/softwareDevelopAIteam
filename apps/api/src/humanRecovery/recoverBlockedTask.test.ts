@@ -381,6 +381,25 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     expect(countRemediationAttempts(storage, taskId)).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
   })
 
+  it('**paused かつ到達不能なら、Project 再開を勧めない**', () => {
+    // `project_not_running` は「再開すれば動く」ことまで含意する。到達不能な Task に
+    // それを返すと、docs どおり再開した CEO は**何も起きない**のを見る
+    // （独立レビュー round 6 指摘）。解けない方の阻害要因を先に返すのが正しい。
+    const { storage, taskId } = seed({ projectStatus: 'paused', unreachable: true })
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: true, nextDriver: 'none' })
+  })
+
+  it('**paused でも到達可能なら、Project 再開が出口だと返す**', () => {
+    const { storage, taskId } = seed({ projectStatus: 'paused' })
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: true, nextDriver: 'project_not_running' })
+  })
+
   it('**attention_only は「通知が必ず飛ぶ」ことまでは意味しない**', () => {
     // `hasEscalated()` のキー `task_ready_without_job:<taskId>` は Task の生涯で変わらない。
     // 過去に一度でも同じ kind で Escalate されていれば、再投入しても `runPlTick()` は
@@ -412,6 +431,44 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     // 戻しても枠は空かない。「戻せば枠が解放される」と言ってはならない場合である。
     expect(recoveryReleasesProjectSlot(storage.tasks.findById(taskId)!)).toBe(false)
     expect(occupiesProject(storage.tasks.findById(taskId)!)).toBe(true)
+  })
+})
+
+describe('入口条件は transaction の中でも確かめ直す', () => {
+  // precheck と `tx.immediate()` の間に別 connection が動く余地を塞ぐ。
+  // transaction 内で読み直す条件が判定に使った条件より少ないと、IMMEDIATE で
+  // lock を取っても**入口条件を破った状態で commit できる**（独立レビュー round 6 指摘）。
+
+  it('**確定の直前に Job が入っていたら commit しない**', () => {
+    // `recoverBlockedTask()` の precheck は通さず、storage 層を直接叩く ——
+    // precheck を通過した**後**に Job が入った状態と、transaction から見た姿は同じである。
+    const { storage, taskId, projectId } = seed()
+    storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'noop' },
+    } as never)
+
+    const committed = storage.tasks.recoverFromBlocked({ taskId, detail: 'racing' })
+
+    expect(committed.ok).toBe(false)
+    expect(committed.ok === false && committed.reason).toContain('/resume')
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    // 成功 audit も残っていない。
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
+  })
+
+  it('**確定の直前に park されていたら commit しない**', () => {
+    const { storage, taskId } = seed()
+    storage.auditLog.record({
+      actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: taskId,
+      result: 'success', detail: 'parked mid-flight',
+    })
+
+    const committed = storage.tasks.recoverFromBlocked({ taskId, detail: 'racing' })
+
+    expect(committed.ok).toBe(false)
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
   })
 })
 
