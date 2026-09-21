@@ -36,20 +36,35 @@
 2. `executeAction()` / `allowedActionsFor()` に配線していない → PL は in-process で動き自分へ
    HTTP を打たないので到達経路が存在しない。**auth mode に依存しない**
 3. `WORKER_ALLOWLIST` に載せていない → split credential mode では WORKER credential から 403
-4. **legacy mode では Human Recovery 自体を拒否する**（`HUMAN_ONLY_ROUTES`）。legacy mode は
-   単一 `API_TOKEN` が全 route を許すため、HTTP caller が人か Worker かを区別できない。
-   区別できない以上、**通さない**のが唯一 fail-closed な扱いである
+4. **split credential mode の ADMIN 以外では route 自体を拒否する**（`HUMAN_ONLY_ROUTES`）。
+   この操作の authorization は「呼び出し主体が認証済みの人であること」そのものなので、
+   主体を区別できない構成では実行させない
 
 | mode | credential | 結果 |
 |---|---|---|
 | split | ADMIN | 実行できる |
 | split | WORKER | 403（allowlist の Default Deny） |
 | legacy（`API_TOKEN` 設定） | 単一 token | **403（`HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS`）** |
-| 認証なし（`API_TOKEN` 未設定） | — | 通す（ローカル開発。production 構成ではない） |
+| 認証なし（`API_TOKEN` 未設定） | — | **403（同じ code）** |
 | 片側だけ設定 | — | 既存どおり 503 |
 
+つまり規則は1本である: **human-only route は split credential mode の ADMIN でのみ通る。**
+
+**認証なしの構成も通さない。** 初版はここを「production 構成ではないから」と素通しにしていたが、
+それは legacy mode を塞ぐ論拠と逆だった —— 区別できないから塞ぐのなら、
+**主体がそもそも分からない構成はより強く塞がる側**である。しかもローカル開発環境は
+AI agent（OpenCode / Codex）が localhost の API へ到達できる場所そのもので、
+CEO 決定が除外した相手が実際に居る（独立レビュー round 4・blocking 指摘）。
+
+したがって**ローカルで Human Recovery を試すときも split credential を設定する**こと:
+
+```bash
+export ADMIN_TOKEN_SHA256=$(printf %s "$ADMIN_TOKEN" | sha256sum | cut -d' ' -f1)
+export WORKER_TOKEN_SHA256=$(printf %s "$WORKER_TOKEN" | sha256sum | cut -d' ' -f1)
+```
+
 **legacy auth 全体は変えていない。** 拒否されるのは `HUMAN_ONLY_ROUTES` に載る route だけで、
-他の legacy route の挙動は従来どおりである。
+他の route は認証なし構成でも従来どおり素通しである。
 
 ---
 
@@ -110,13 +125,24 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 - `pl_independent_remediation` … PR #255 の Independent Remediation が提案を作り直し、
   **まっさらな Design Review** へ掛ける。CEO は待つだけでよい
 - `attention_only` … 自動で進める経路が無い。`task_ready_without_job` が立ち、
-  PL は通知するだけ。Remediation 対象の Design Review が無い Task や、Remediation 予算を
-  使い切った Task、Project が `running` でない場合がこれ
+  PL は通知するだけ。Remediation 対象の Design Review が無い Task や、
+  **Remediation 予算（`PL_MAX_REMEDIATION_ATTEMPTS`）を使い切った** Task がこれ
+- `project_not_running` … **Project が `running` でないので、何も動かず通知も出ない。**
+  attention 導出は `project.status === 'running'` を要求するため、ここを `attention_only` と
+  返すと「通知は出る」という出ない約束になる（独立レビュー round 4 指摘）。
+  先に Project を再開すること
 - `none` … **何も拾わない。** `roadmapActive=false` / `assignee≠developer_ai` で自律ループから
   到達できず、遷移先の `task_ready_without_job` も立たない。それでも受理するのは、
   `blocked` のままだと `occupiesProject()` が Project の枠を無条件に占有し続け、
   park（`abort_task`）も採用し直し（`syncRoadmapTasks()`）も `pending` を要求するため、
   **戻すこと自体が唯一の出口**だからである
+
+> **「戻せば枠が空く」は `none` の全部には当てはまらない。**
+> `occupiesProject()` が見るのは `roadmapActive` だけである。したがって
+> `roadmapActive=true` かつ `assignee` が `developer_ai` でない Task は、
+> **自律ループから到達できないのに `pending` でも枠を占有し続ける**。
+> 枠が空くかどうかは `recoveryReleasesProjectSlot()` が判定し、
+> `triageBlocked()` の CEO 本文もその値で文面を変える（独立レビュー round 4 指摘）。
 
 **Job は作られない。** 実装 Job は fresh Design Review が ALIGNED になって初めて作られる。
 

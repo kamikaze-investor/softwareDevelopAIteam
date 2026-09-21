@@ -56,7 +56,11 @@ import {
   type RawStrategicResult,
 } from '../designReview/designReviewCoordinator'
 import { DEFAULT_STALL_HINT_MS, type AttentionItem } from '../state/systemState'
-import { isReachableByAutonomousLoop } from '../humanRecovery/recoveryAudit'
+import {
+  isReachableByAutonomousLoop,
+  recoveryReleasesProjectSlot,
+} from '../humanRecovery/recoveryAudit'
+import { countRemediationAttempts, hasRemediationBudgetLeft, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 
@@ -553,11 +557,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     // Human Recovery は到達可否に関わらず受理する —— 断ると、`abort_task` も採用し直しも
     // `pending` を要求するため、**どこからも動かせない Task ができてしまう**
     // （独立レビュー指摘・2026-09-21）。ここではそれを**報告文へ反映するためだけ**に使う。
-    const reachable = item.taskId !== undefined
-      && (() => {
-        const task = storage.tasks.findById(item.taskId as string)
-        return task !== undefined && isReachableByAutonomousLoop(task)
-      })()
+    const subject = item.taskId !== undefined
+      ? storage.tasks.findById(item.taskId)
+      : undefined
+    const reachable = subject !== undefined && isReachableByAutonomousLoop(subject)
+    // **到達可否とは別の問い。** `occupiesProject()` は `roadmapActive` だけを見るので、
+    // `roadmapActive=true` かつ assignee が違う Task は「到達できないのに枠も空かない」。
+    // 両者を1つの真偽値で語ると嘘の案内になる（独立レビュー round 4 指摘）。
+    const releasesSlot = subject !== undefined && recoveryReleasesProjectSlot(subject)
+    // 予算判定は `remediationStep` の1関数に委ねる。ここで `>= PL_MAX_...` を書き写さない。
+    const budgetLeft = item.taskId !== undefined && hasRemediationBudgetLeft(storage, item.taskId)
 
     return {
       ...result,
@@ -576,6 +585,15 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
             value: `${recomputed ?? stalled.decision ?? 'unknown'} (status=${stalled.status})`,
           }]
           : []),
+        // **予算を数字で出す。** 「戻せば Remediation が動く」かどうかはこれで決まるので、
+        // 案内の根拠を CEO が自分で確かめられるようにする。
+        ...(item.taskId !== undefined
+          ? [{
+            fact: 'remediation.attempts',
+            id: item.taskId,
+            value: `${countRemediationAttempts(storage, item.taskId)}/${PL_MAX_REMEDIATION_ATTEMPTS}`,
+          }]
+          : []),
       ],
       recoverable: true,
       // CONFLICT が読めているときだけ原因を断定できる。読めないなら状態しか分かっていない。
@@ -590,9 +608,15 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           : '')
         + ' CEO が Human Recovery（`POST /api/tasks/:id/recover`）で `pending` へ戻す必要がある。'
         + (reachable
-          ? '戻せば既存ループが引き取る。'
+          ? (budgetLeft
+            ? '戻せば既存ループが引き取り、Independent Remediation が fresh Design Review を起こす。'
+            : '**ただし Remediation 予算を使い切っている**ので、戻しても attention が立つだけで'
+              + '自動では進まない。訂正した spec で Roadmap 項目を採用し直すこと。')
           : 'この Task は自律ループの対象外（roadmapActive=false / assignee が developer_ai でない）'
-            + 'なので戻しても自動では進まないが、**Project の枠は解放される**。'
+            + 'なので戻しても自動では進まない。'
+            + (releasesSlot
+              ? 'ただし戻せば**Project の枠は解放される**。'
+              : 'また roadmapActive=true のままなので、戻しても**Project の枠は解放されない**。')
             + '進めたいなら戻したうえで Roadmap 項目を採用し直すこと。'),
     }
   }
@@ -903,8 +927,10 @@ function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string;
           'CONFLICT で止まった Task が、自動復旧経路から外れた状態にある。'
           + 'どの対処も先に Human Recovery で `pending` へ戻す必要がある。',
         options: [
-          'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻し、'
-          + 'Independent Remediation に fresh Design Review を起こさせる',
+          'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻す'
+          + '（Independent Remediation が fresh Design Review を起こすのは'
+          + '**証拠欄の `remediation.attempts` に予算が残っているときだけ**。'
+          + '使い切っていれば attention が立つだけで、自動では進まない）',
           '戻したうえで、訂正した implementationScope / allowedPaths で Roadmap 項目を'
           + '採用し直す（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）',
           '戻したうえで park する（`abort_task`）。'

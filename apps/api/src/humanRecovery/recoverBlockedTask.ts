@@ -72,9 +72,8 @@ import type { Task } from '@ai-team/shared'
 
 export { latestHumanRecoveryId } from './recoveryAudit'
 import {
-  countRemediationAttempts,
   findRemediationSubject,
-  PL_MAX_REMEDIATION_ATTEMPTS,
+  hasRemediationBudgetLeft,
 } from '../pl/remediationStep'
 
 /**
@@ -156,12 +155,21 @@ export type HumanRecoveryNextDriver =
   /** 自動で進める経路は無い。attention が立ち、PL は CEO へ通知するだけ。 */
   | 'attention_only'
   /**
-   * 誰も拾わない。`roadmapActive=false` 等で自律ループの対象外だから attention すら立たない。
+   * **Project が `running` でないので、何も動かないし通知も出ない。**
    *
-   * **それでも再投入は無駄ではない。** `occupiesProject()` は `blocked` を無条件に占有と数え、
-   * `pending` は `roadmapActive` のときだけ占有と数える。したがってこの遷移は
-   * **単一 running Project の枠を解放する**（塞いだまま放置されるのを解く）。
-   * 進めたいなら Roadmap 項目を採用し直すこと。
+   * `buildSystemState()` の attention は `task_blocked_without_job` も
+   * `task_ready_without_job` も `project.status === 'running'` を要求する。
+   * ここで `attention_only` と返すと「通知が出る」と約束したことになるが、
+   * 実際には何も出ない（独立レビュー round 4 指摘）。**先に Project を再開する**必要がある。
+   */
+  | 'project_not_running'
+  /**
+   * 誰も拾わない。`roadmapActive=false` / `assignee≠developer_ai` で自律ループの対象外なので、
+   * attention すら立たない。進めたいなら Roadmap 項目を採用し直すこと。
+   *
+   * **枠が空くかどうかは別問題である。** `roadmapActive=false` なら再投入で
+   * Project の枠は解放されるが、`roadmapActive=true` かつ assignee が違うだけの Task は
+   * `pending` でも占有したままである（`recoveryReleasesProjectSlot()` を見ること）。
    */
   | 'none'
 
@@ -214,14 +222,15 @@ function resolveNextDriver(
   projectIsRunning: boolean,
 ): HumanRecoveryNextDriver {
   const taskId = task.id
-  // **running でない Project では PL 自体が動かない。**
-  // `buildSystemState()` の attention も `createInitialImplementWorkflow()` も
-  // running を要求するので、ここで remediation を約束すると嘘になる（独立レビュー指摘）。
+  // **running でない Project では何ひとつ動かない。** PL tick も attention 導出も
+  // `project.status === 'running'` を要求する。だからこれを**最初に**見る ——
+  // 後ろに置くと、到達可能な Task について `attention_only` と答えてしまい、
+  // 「通知は出る」という出ない約束になる（独立レビュー round 4 指摘）。
+  if (!projectIsRunning) return 'project_not_running'
   // 自律ループの対象外なら attention すら立たない。**そう正直に返す。**
   if (!isReachableByAutonomousLoop(task)) return 'none'
-  if (!projectIsRunning) return 'attention_only'
   if (findRemediationSubject(storage, taskId) === undefined) return 'attention_only'
-  if (countRemediationAttempts(storage, taskId) >= PL_MAX_REMEDIATION_ATTEMPTS) return 'attention_only'
+  if (!hasRemediationBudgetLeft(storage, taskId)) return 'attention_only'
   return 'pl_independent_remediation'
 }
 

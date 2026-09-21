@@ -404,6 +404,19 @@ export function countRemediationAttempts(storage: IStorage, taskId: string): num
 }
 
 /**
+ * Independent Remediation の予算が残っているか。
+ *
+ * **判定はここ1箇所だけに置く。** 予算を見る側が増えるたびに
+ * `count... >= PL_MAX_...` を書き写すと、片方だけ直したときに
+ * **「戻せば Remediation が動く」と案内しておきながら endpoint は動かない**という
+ * 食い違いが起きる（独立レビュー round 4 指摘）。
+ * いまの呼び出し元は Human Recovery の `nextDriver` 判定と `triageBlocked()` の CEO 案内。
+ */
+export function hasRemediationBudgetLeft(storage: IStorage, taskId: string): boolean {
+  return countRemediationAttempts(storage, taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+}
+
+/**
  * stage を問わない解決試行の総数。
  *
  * 用途は1つだけで、**呼び出し側が「この呼び出しで step が既に何か記録したか」を判定する**ため。

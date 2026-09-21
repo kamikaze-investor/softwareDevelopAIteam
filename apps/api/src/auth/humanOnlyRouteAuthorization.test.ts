@@ -9,8 +9,10 @@
  * | split | ADMIN | 通す |
  * | split | WORKER | 403（allowlist の Default Deny） |
  * | legacy（`API_TOKEN` 設定） | 単一 token | **403（主体を区別できないので fail-closed）** |
- * | 認証なし（`API_TOKEN` 未設定） | — | 従来どおり通す（production 構成ではない） |
+ * | 認証なし（`API_TOKEN` 未設定） | — | **403（主体がそもそも分からない）** |
  * | 片側だけ設定 | — | 既存の 503 を維持 |
+ *
+ * つまり規則は1本である: **human-only route は split credential mode の ADMIN でのみ通る。**
  *
  * **legacy auth 全体は変えていない。** 影響を受けるのは `HUMAN_ONLY_ROUTES` の route だけで、
  * 他の legacy route の挙動が変わっていないことも併せて固定する。
@@ -189,7 +191,11 @@ describe('legacy mode では Human Recovery を fail-closed にする', () => {
     })
   })
 
-  it('認証なしのローカル開発（API_TOKEN 未設定）は従来どおり通す', async () => {
+  it('**認証なしのローカル開発（API_TOKEN 未設定）でも 403**', async () => {
+    // 一度はここを素通しにした。だが legacy mode を塞ぐ理由が「人か自動かを区別できない」
+    // ことなら、認証が無い構成は**主体がそもそも分からない**のでより強く塞がる側である。
+    // しかもローカルは AI agent が localhost の API を叩ける場所そのもので、
+    // CEO 決定が除外した相手が実際に居る（独立レビュー round 4・blocking 指摘）。
     await withApp({ kind: 'legacy' }, async (app) => {
       const taskId = await seedRecoverableTask(app, {})
 
@@ -197,7 +203,22 @@ describe('legacy mode では Human Recovery を fail-closed にする', () => {
         method: 'POST', url: `/api/tasks/${taskId}/recover`, payload: { reason: 'r' },
       })
 
-      expect(res.statusCode).toBe(200)
+      expect(res.statusCode).toBe(403)
+      expect(res.json()).toMatchObject({ code: 'HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS' })
+      // 状態は動いていない。
+      const after = await app.inject({ method: 'GET', url: `/api/tasks/${taskId}` })
+      expect(after.json().status).toBe('blocked')
+    })
+  })
+
+  it('**認証なしでも human-only 以外の route は素通しのまま**（ローカル開発を壊さない）', async () => {
+    await withApp({ kind: 'legacy' }, async (app) => {
+      const taskId = await seedRecoverableTask(app, {})
+
+      expect((await app.inject({ method: 'GET', url: '/api/tasks/summary' })).statusCode).toBe(200)
+      expect((await app.inject({
+        method: 'PATCH', url: `/api/tasks/${taskId}`, payload: { title: 'renamed' },
+      })).statusCode).toBe(200)
     })
   })
 })

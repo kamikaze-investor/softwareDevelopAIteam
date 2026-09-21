@@ -30,6 +30,7 @@ import {
   recordRemediationFailure,
 } from '../pl/remediationStep'
 import { latestHumanRecoveryId, recoverBlockedTask } from './recoverBlockedTask'
+import { recoveryReleasesProjectSlot } from './recoveryAudit'
 
 interface Seeded {
   storage: IStorage
@@ -352,14 +353,46 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     expect(result).toMatchObject({ ok: true, nextDriver: 'attention_only' })
   })
 
-  it('**running でない Project では remediation を約束しない**', () => {
-    // paused では attention も Job 生成も動かない。`pl_independent_remediation` と返すと嘘になる。
+  it('**running でない Project では、通知が出るとすら言わない**', () => {
+    // paused では PL tick も attention 導出も動かない。`pl_independent_remediation` は
+    // もちろん嘘だが、`attention_only` も嘘である —— attention 導出は
+    // `project.status === 'running'` を要求するので、通知は1件も出ない
+    // （独立レビュー round 4 指摘）。
     const { storage, taskId } = seed({ projectStatus: 'paused', roadmapTaskKey: 'some-item' })
     completeReviewAsConflict(storage, taskId)
 
     const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
 
+    expect(result).toMatchObject({ ok: true, nextDriver: 'project_not_running' })
+    // 実測で裏を取る: 再投入後も attention は1件も立たない。
+    expect(buildSystemState(storage).attention).toHaveLength(0)
+  })
+
+  it('**Remediation 予算を使い切っていたら remediation を約束しない**', () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    completeReviewAsConflict(storage, taskId)
+    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+      recordRemediationFailure(storage, taskId, `attempt ${i}`)
+    }
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
     expect(result).toMatchObject({ ok: true, nextDriver: 'attention_only' })
+    expect(countRemediationAttempts(storage, taskId)).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
+  })
+
+  it('**到達できても roadmapActive のままなら、枠が空くとは言わない**', () => {
+    // `occupiesProject()` は `roadmapActive` だけを見る。assignee が違うだけの Task は
+    // 自律ループから到達できないのに、`pending` でも枠を占有し続ける（round 4 指摘）。
+    const { storage, taskId } = seed()
+    storage.tasks.update(taskId, { assignee: 'cto_ai' } as never)
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: true, nextDriver: 'none' })
+    // 戻しても枠は空かない。「戻せば枠が解放される」と言ってはならない場合である。
+    expect(recoveryReleasesProjectSlot(storage.tasks.findById(taskId)!)).toBe(false)
+    expect(occupiesProject(storage.tasks.findById(taskId)!)).toBe(true)
   })
 })
 

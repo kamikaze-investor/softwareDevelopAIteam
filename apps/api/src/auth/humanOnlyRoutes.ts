@@ -9,6 +9,9 @@
  * split credential mode では、ADMIN は全 route、WORKER は allowlist（Default Deny）なので、
  * 「WORKER allowlist に載せない」だけで Human-only 境界が成立する。
  *
+ * **裏を返すと、境界が成立するのは split credential mode だけである。** そこで規則は1本になる:
+ * ここに載る route は **split credential mode の ADMIN でのみ通る**。他のどの mode でも 403。
+ *
  * **legacy mode では成立しない。** `ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` の両方が
  * 未設定のとき、認証は単一の `API_TOKEN` だけで行われ、**Worker も同じ値を持つ**
  * （`.env.example`: WORKER runtime の `API_TOKEN` に WORKER token 平文を入れるのは split mode の話で、
@@ -21,10 +24,12 @@
  *
  * ## 何を変えていないか
  *
- * - **legacy auth 全体は変えていない。** ここに載せた route だけが legacy mode で拒否される
- * - **認証が無効なローカル開発（`API_TOKEN` 未設定）は従来どおり**。誰も区別できないのではなく
- *   「そもそも認証していない」状態であり、production の構成ではない。既存のローカル用途・
- *   test を壊さないことを優先する
+ * - **legacy auth 全体は変えていない。** ここに載せた route だけが拒否される
+ * - **認証が無効なローカル開発（`API_TOKEN` 未設定）でも拒否する。** 一度は
+ *   「production の構成ではないから」と素通しにしたが、それは上の論拠と逆だった ——
+ *   区別できないから塞ぐのなら、**主体がそもそも分からない構成はより強く塞がる側**である。
+ *   しかもローカルは AI agent が localhost の API へ到達できる場所そのもので、
+ *   CEO 決定が除外した相手が実際に居る（独立レビュー round 4・blocking 指摘）
  * - split credential mode の挙動は1ビットも変わらない（ADMIN は通り、WORKER は allowlist で 403）
  *
  * ## 増やすときの注意
