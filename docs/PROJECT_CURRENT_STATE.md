@@ -312,6 +312,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Principle Registry の適用範囲拡張と、実データによる閾値の自己再評価**（state: planned）
 - **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**（state: in_progress）
 - **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: planned）
+- **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）**（state: deferred）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
