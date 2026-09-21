@@ -93,10 +93,22 @@ export interface ImplementTimeoutFinding {
   thresholdNote: string
 }
 
+/**
+ * Job が**走っていた**時間。測れなければ undefined（fail-closed）。
+ *
+ * **`createdAt` へ fallback しない。** `createdAt` は行が作られた時刻なので、
+ * `createdAt` → `completedAt` には**待ち行列にいた時間が丸ごと入る**。
+ * production には 7〜20 日 queued のままの implement Job が実在するので、
+ * そういう行が `startedAt` 無しで `success` になると「数日かかった成功」として数えられ、
+ * C の p95 を閾値の上へ押し上げて `...:900000` の重複排除キーを使い切る
+ * —— 本物の near-budget 証拠が出ても、以後黙る（独立レビュー指摘）。
+ *
+ * `startedAt` が無い行は「走った時間が分からない」のであって「0 から測れる」のではない。
+ * 分からないものは標本にしない。
+ */
 function durationSeconds(job: Job): number | undefined {
-  const started = job.startedAt ?? job.createdAt
-  if (!started || !job.completedAt) return undefined
-  const seconds = (new Date(job.completedAt).getTime() - new Date(started).getTime()) / 1000
+  if (!job.startedAt || !job.completedAt) return undefined
+  const seconds = (new Date(job.completedAt).getTime() - new Date(job.startedAt).getTime()) / 1000
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined
 }
 

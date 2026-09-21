@@ -161,6 +161,27 @@ describe('C（stale metadata に依存しない条件）', () => {
     expect(c[0].evidence).toMatchObject({ successSamples: 25 })
   })
 
+  // **`startedAt` が無い行は標本にしない。**
+  // `createdAt` へ fallback すると待ち行列の時間が所要時間に混ざる。
+  // production には 7〜20 日 queued のままの implement Job が実在するので、
+  // そんな行が success になると「数日かかった成功」として p95 を押し上げ、
+  // C の重複排除キーを本物の証拠より先に使い切る（独立レビュー指摘）。
+  it('startedAt が無い成功は標本に入れない（queue 待ちを所要時間に混ぜない）', () => {
+    const queuedForDays = {
+      ...job({ seconds: 60, status: 'success' } as Partial<Job>),
+      startedAt: undefined,
+      // 行が作られたのは 10 日前、完了は epoch のあと。
+      createdAt: new Date(new Date(EPOCH).getTime() - 10 * 86_400_000).toISOString(),
+      completedAt: afterEpoch(60),
+    } as Job
+    const normal = Array.from({ length: 18 }, () => job({ seconds: 60 }))
+
+    // fallback があると 20 件になり、上位 2 件が数日なので p95 は閾値を大きく越えて発火する。
+    // 落とせば 18 件となり、p95 の最低サンプル数（20）に届かず判定そのものが走らない。
+    expect(evaluateImplementTimeoutSensors([queuedForDays, { ...queuedForDays, id: 'job-second' } as Job, ...normal], T, EPOCH)
+      .filter((f) => f.sensorId === C_SENSOR)).toHaveLength(0)
+  })
+
   it('直近 WINDOW 件だけを母集団にする', () => {
     // WINDOW 件の速い成功で埋めたあとに、遅い成功を窓の外へ置く。
     const jobs = [
