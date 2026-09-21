@@ -203,6 +203,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）
 - **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
 - **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
+- **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**
 - **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**
 - **既に quarantine 済みで dirty な Task を汎用的に復旧する手段が無い
 - **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける**
@@ -245,7 +246,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。（state: planned）
 - **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**（state: planned）
 - **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**（state: planned）
-- **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**（state: planned）
 - **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: planned）
 - **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
 - **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）

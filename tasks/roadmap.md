@@ -3346,8 +3346,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    HEAD 移動時の skip + CRITICAL 通知、manifest 無しでは掃除しない、PATCH 失敗時は掃除しない、
    二重実行耐性を固定。API 側は `apps/api/src/routes/workspaceCleanupSignal.test.ts`（4件）。
 
-<!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=planned -->
-0. [ ] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**
+<!-- roadmap:id=supervised-runs-reconcile-worker-allowlist state=done -->
+0. [x] **`POST /api/supervised-runs/reconcile` が WORKER_ALLOWLIST に無い（credential split有効化時に403になる潜在欠陥）**
+   — **完了（2026-09-21）。下記「解決」参照。**
    （2026-09-10登録。PR #136 のIndependent Reviewで同型の欠陥が指摘され、
    既存経路にも同じ漏れがあることが判明した。**PR #136 には混ぜない**）。
 
@@ -3386,6 +3387,24 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    PR #136 では自分が追加したrouteについて、実route登録＋auth hookを通す統合テストを
    `workerCredentialAuthorization.test.ts` へ足した。同型のテストを既存の
    Worker呼び出し経路すべてに用意するか、経路一覧とallowlistの整合を確認する手段を持つか決める。
+
+   **解決（2026-09-21）**: split credential cutover の事前監査で本項目が cutover の
+   blocker として再確認され、最小修正した。
+
+   - **原因**: Worker の実呼び出し（`apps/worker/src/index.ts` `reconcileSupervisedRuns()`）と
+     `WORKER_ALLOWLIST` の不一致。route 本体・Worker の poll logic・reconcile 実装は
+     いずれも正しく、**allowlist だけが1件欠けていた**
+   - **修正**: `{ method: 'POST', url: '/api/supervised-runs/reconcile' }` を1件追加。
+     Default Deny も credential class も auth architecture も変更していない。
+     広げたのはこの exact な method + route 1組だけ
+   - **regression test**: `workerAllowlist.test.ts` に許可の明示 test と、
+     method 違い・前方一致で広がっていないことの test を追加。
+     さらに `workerCredentialAuthorization.test.ts` へ**実 route 登録を通す統合 test**を
+     追加した —— 上の「再発防止」が指摘したとおり、allowlist を反復する unit test は
+     追加後に自動で pass してしまい、prefix 合成と `req.routeOptions.url` の
+     不一致を検出できないため
+   - 監査時点の Production は legacy auth（`ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` とも
+     未設定）で、顕在化していなかったことを再確認済み
 
 <!-- roadmap:id=task-allowed-paths-not-normalized state=done -->
 0. [x] **task の allowedPaths が正規化・検証されず、絶対パスだと必ず File Change Guard で落ちる**

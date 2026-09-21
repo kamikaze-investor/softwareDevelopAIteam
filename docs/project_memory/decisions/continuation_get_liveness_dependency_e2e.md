@@ -119,6 +119,7 @@ Production endpoint 自体も、実 credential で
   本文中の「approve + resume」という記述はすべてこの訂正に従って読むこと。
 - `POST /api/supervised-runs/reconcile` が `WORKER_ALLOWLIST` に無い（**潜在**欠陥。
   本番は credential split 未有効のため現時点では 403 にならない）
+  — **2026-09-21 resolved: WORKER_ALLOWLIST へ正式 route を追加**
 - continuation reconcile の NON-BLOCKING 指摘 2 件（full-table 走査 / エラーの握り潰し）
 - task の `allowedPaths` が正規化・検証されず、絶対パスだと必ず Guard で落ちる
   （Production E2E test 4 で実際に 1 サイクル失った。原因は仕様書側の絶対パス表記）
