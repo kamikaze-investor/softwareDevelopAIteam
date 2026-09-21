@@ -1795,6 +1795,38 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **本項目の Improvement Planner → CEO Proposal 経路を再利用する**。
       `principle-quality-sensor-to-review` 側に別の改善エンジンを作らないこと。
       入力元だけが違い（`principle_applications` table）、改善提案の作り方・出し方は同じである
+
+      **2026-09-21 追記（ingestion は backfill 可能でなければならない。CEO 指示）**:
+      `principle_sensor` の取り込みを、**consumer 実装後に発生した新規 event だけを対象にしてはならない。**
+      起動・導入時および通常処理時に、`audit_log`（`entity_type='principle_sensor'`）に既に存在し
+      **まだ Improvement Proposal / Review へ接続されていない finding** を確認し、
+      過去に発火済みのものも同じ経路で処理すること。
+
+      **なぜ必須か**: `threshold-policy-needs-real-data-review` は
+      **同一 threshold policy version につき1回しか発火しない**
+      （`sensorEntityId()` が版を entity id へ入れ、`evaluateAndPersistSensors()` が
+      同じ id の既存行があれば発火を抑止する）。consumer 実装前に 100 件へ到達すると、
+      その1行が `audit_log` に残るだけで**二度と発火せず、再評価が永久に起きない**。
+      逆に言えば、その durable audit record から**必ず再評価を開始できなければならない**。
+      記録側は既にその形になっている — `detail` に `summary` / `evidence` / `thresholdNote` /
+      `policyVersion` / `reviewInput` が入っており、**受け取った側が再集計しなくても
+      発火根拠がそのまま復元できる**（`evaluateAndPersistSensors()` の doc comment が
+      「Improvement Planner はこの行しか見ない」と明記している）。
+
+      **実測（2026-09-21・production read-only）**: `principle_applications` は **92 件**
+      （2026-09-17T08:42Z〜2026-09-21T02:12Z、**全件が現行 version hash**）。
+      よって sensor の `totalApplications` は 92 で、**100 件まで残り 8 件**である。
+      一方 `principle_sensor` 行を読む consumer は**現時点で 0 件**
+      （`audit_log` への書き込みと重複判定以外に参照が無い）。
+      **consumer 実装より先に発火が来る可能性が高く、本追記はその取りこぼしを防ぐためのものである。**
+
+      **本項目実装時の Acceptance Criteria（追加）**:
+      - 起動・導入時と通常処理時の**両方**で、未処理の既存 `principle_sensor` finding を拾える
+      - consumer 不在の期間に発火した finding も処理対象になる（新規 event 限定にしない）
+      - 同じ finding を二重に Improvement Proposal 化しない
+      - **処理済みかどうかの表現場所は着手時に決める。** 既存 `audit_log` の行で表現できるかを
+        先に確認し、**新しい state table / 新しい scheduler を先に作らない**
+      - 取りこぼしが起きていないことを後から数えられる（未処理 finding 件数が観測できる）
       - この機能自身が大量token・大量LLMレビューを消費しない（全Jobへの追加LLMレビュー・
         全Taskの常時LLM再分析は行わない。既存ログ・既存レビュー結果の再利用を基本とする）
       - CEOへの通常Improvement Proposalは週1〜2件、Criticalのみ件数制限なし
@@ -10342,6 +10374,29 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       **`deferred` は機械的に強制される**: 採用経路3箇所が `isRoadmapItemAdoptable()`
       （`planned` のみの allowlist）を共有するため、PL は本項目を自律採用できない。
+
+      **Track 再評価（2026-09-21・production read-only 実測。CEO 指示による sensor 実測での見直し）**:
+      `principle_applications` = **92 件 / 全件現行 version hash**、
+      verdict は **ALIGNED 82・UNCERTAIN 7・CONFLICT 3**（非 ALIGNED 10.9%）、
+      stage は **design 76・independent 16・meta 0（未配線）**、
+      選択元は core 56・contextual 36、**`review-integration` は適用 0 件**。
+      sensor 状態は、core 降格(50) が最大 14 件で未到達、
+      機構再Review(200 かつ CONFLICT+UNCERTAIN=0) は **CONFLICT/UNCERTAIN が実在するため現行版では発火し得ない**
+      （＝機構は識別力を持っている）、閾値再評価(100) が **残り 8 件**。
+
+      - **Track 1（Question category の一般化）は引き続き見送り。** Library を広げる前に、
+        既存 Library 側に「**一度も選択されない Question**」（`review-integration` = 0 件）と
+        「**未配線の stage**」（`meta`）が実在する。この2つを残したまま category を増やすと
+        never-selected Question が増えるだけで、どの Question が効いているかの判定はむしろ遅れる
+      - **Track 2（外部 Decision Engine）は価値未実証。CEO Proposal を出す段階ではない。**
+        現行 engine は既存 Review の出力契約へ相乗りしているので **追加 AI 呼び出しコストが 0** である。
+        外部 engine は review ごとに従量課金呼び出しを足す一方、
+        「現行 engine の判定が不十分」という実測根拠がまだ無い（非 ALIGNED が 10.9% 出ており degenerate ではない）。
+        **判断を変える実測は2つ**: (a) stage 間 disagreement 率が高く、その原因が
+        同一入力に対する不安定性だと切り分けられた場合（`independent-review-verdict-instability` と同じ現象）
+        (b) `meta` stage 配線後も 3 stage の一致率が低い場合。
+        いずれかが観測されたら、`specs/23` 4章の CEO 承認手順（目的・実測上の改善余地・比較対象 Question・
+        想定費用・credential handling・fallback・停止条件）を添えた **CEO Proposal** を出す
 
       **作らないもの（`specs/23` 15章）**: 並走型 shadow runner（「formal decision へ影響させない」は
       別プロセスで並走させることではなく、判定を required schema から外す・記録を Gate にしない・

@@ -351,6 +351,17 @@ Experiment = 実行 / 5b-5 Distill = Knowledge 更新 / 5b-10 Problem-driven Lea
 **これらはいずれも未実装の将来構想である**（2026-09-21 実測: 対応する実装ファイルは無い）。
 接続先が無い段階で代替実装を作らない。
 
+**sensor finding は durable な入力であり、event stream ではない。**
+発火は `audit_log` の1行として永続化され、**同じ id では二度と発火しない**
+（重複発火防止が唯一の鍵であり、意図された設計である）。したがって consumer は
+**「実装後に発生した新規 event だけ」を処理してはならない。** 起動・導入時および通常処理時に、
+まだ改善提案・Review へ接続されていない finding を durable record から拾い直すこと。
+consumer 不在の期間に発火した finding を取りこぼす実装は、
+**一度しか来ない再評価機会を恒久的に失わせる**（とくに policy 版ごとに1回だけ発火する閾値再評価）。
+finding は**再集計なしで再評価を開始できる形**で保存されている。
+この要求の owner は `project-auto-incident-pattern-improvement`（Improvement Planner 側）であり、
+**System One 側に第二の consumer を作らない。**
+
 Evolution trigger: stage 間 disagreement / escaped incident / repeated formal finding /
 `UNCERTAIN` 率上昇 / non-discriminating question / redundant question / engine drift /
 閾値が実態と合っていない疑い。
