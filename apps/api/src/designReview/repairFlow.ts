@@ -33,6 +33,8 @@ import {
   type CoordinatorDeps,
 } from './designReviewCoordinator'
 import { buildRepairPrompt } from './repairPromptBuilder'
+import { posix } from 'node:path'
+import { recomputeDecision, type RawStrategicResult } from './designReviewCoordinator'
 import {
   REPAIR_STEP_PREFIX,
   decideRepairAction,
@@ -248,13 +250,279 @@ export async function runRepairFlow(
  * design_review_run を queued として永続化する。これによりcrashしても
  * 「Jobはfailed / runは無い」というlost-trigger windowが生じない。
  */
+/**
+ * `file` が `allowed` のいずれかの内側に**解決される**か。
+ *
+ * 文字列の前方一致だけでは足りない。`apps/api/src/pl/../routes/jobs.ts` は
+ * `apps/api/src/pl/` で始まるのに、解決先は範囲外である。絶対パスや `..` で始まる形も
+ * ここで落とす。判定できない形は**内側と見なさない**（fail-closed）。
+ */
+/**
+ * その prefix が **修正範囲として実際に使えるか**。
+ *
+ * `allowedPaths` は task route では `z.array(z.string())` としか検証されないため、
+ * `''` / `'   '` / `/srv/app` / `C:/repo` / `a/../b` が保存されうる。Worker の
+ * File Change Guard は正規化せず前方一致で比べるので、これらは**どの変更ファイルにも
+ * 一致しない**。そのまま repair を作れば guard で必ず止まる無駄な Job になる。
+ *
+ * ここで落としておくことで、下の `isInsideAllowedPaths()` が受け取る prefix は
+ * 常に相対・`..` 無しになり、正規化の有無で範囲が変わる余地そのものが無くなる。
+ */
+function scopePrefixForMatch(prefix: string): string {
+  return prefix.endsWith('/') ? prefix.slice(0, -1) : prefix
+}
+
+function isUsableScopePrefix(prefix: string): boolean {
+  // **保存された文字列そのものを見る。書き換えてから判定しない。**
+  //
+  // 以前はここで backslash を `/` に直し、末尾スラッシュを全部剥がしてから判定していた。
+  // だが Worker 側の guard は **2 つあり、扱いが違う**:
+  //   - `safetyVerifier.ts` は `/+$` を全部剥がし、backslash も `/` に直す
+  //   - `fileChangeGuard.ts` は末尾スラッシュを **1 つだけ** 剥がし、backslash は直さない
+  // つまり「Worker の guard はこう扱う」と一意に言える形ではない。書き換えてから
+  // 「使える」と判断すると、書き換えた形でしか成り立たない結論になる（独立レビュー指摘）。
+  //
+  // そこで **2 つの guard が同じ prefix を導く形だけ**を通す —— 素直な相対 posix path、
+  // 末尾スラッシュは付いていても 1 つまで。そこから外れるものは、repair を作っても
+  // どちらの guard で止まるか読めないので、範囲として使えないものとして扱う。
+  if (prefix !== prefix.trim()) return false
+  if (prefix.includes('\\')) return false
+  if (prefix.startsWith('/')) return false
+  if (/^[A-Za-z]:/.test(prefix)) return false
+  // 空文字・`//`・解決される `..` はここで落ちる（`posix.normalize('')` は `.`、
+  // `a//b` は `a/b`、`a/../b` は `b` になり、いずれも元と形が変わる）。
+  // 末尾スラッシュ 1 つは正規化で残るので、下の照合形で扱う。
+  if (prefix !== posix.normalize(prefix)) return false
+  // `.` と `..` は正規化しても残る（`.` / `..` / `../a`）。どの変更ファイルにも一致しない。
+  const segments = scopePrefixForMatch(prefix).split('/')
+  if (segments.includes('..') || segments.includes('.')) return false
+  // 照合形が空になる入力はここまで来ない（空文字は正規化検査、`/` は絶対パス検査で落ちる）。
+  // 「念のため」の長さ検査を置いていたが mutation で生き残った —— 結果を変えない検査は
+  // 検査ではないので置かない。
+  return true
+}
+
+function isInsideAllowedPaths(file: string, allowed: readonly string[]): boolean {
+  const normalized = posix.normalize(file.split('\\').join('/'))
+  if (normalized.startsWith('/') || normalized.startsWith('..')) return false
+
+  return allowed.some((prefix) => {
+    // **file 側だけ正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
+    // 範囲内に見えるが、解決すると外を指す。
+    //
+    // prefix は `isUsableScopePrefix()` を通ったものだけなので、ここでの照合形は
+    // **末尾スラッシュ 1 つを落とすだけ** —— Worker の 2 つの guard が導くのと同じ形である。
+    // prefix をこれ以上書き換えない。書き換えれば、また Worker と食い違う。
+    const candidate = scopePrefixForMatch(prefix)
+    return normalized === candidate || normalized.startsWith(`${candidate}/`)
+  })
+}
+
+/**
+ * 保存済み run から **計算し直した** design review 判定。読めなければ undefined。
+ *
+ * `resultJson` は runner の raw 出力なので、そこに書かれた `finalDecision` は自己申告である。
+ * 既存 `recomputeDecision()` は focus 判定から本来の結論を組み直すためのもので、
+ * `blockedTriage` が使っているのと同じ関数である。ここでも同じものを使う。
+ */
+function safeRecomputedDecision(run: DesignReviewRun): string | undefined {
+  if (run.resultJson === undefined) return undefined
+  try {
+    const raw = JSON.parse(run.resultJson) as RawStrategicResult
+    const outcome = recomputeDecision(raw, run.reviewKind, run.changedFiles)
+    // 形が壊れていれば rejectedReason が付き decision は UNCERTAIN になる。
+    // UNCERTAIN も ALIGNED ではないので、呼び出し側でそのまま skip される。
+    return outcome.decision
+  } catch {
+    // 壊れた結果は「読めなかった」として扱う。呼び出し側は fail-closed で skip する。
+    return undefined
+  }
+}
+
+/**
+ * `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。
+ *
+ * 認めるときは **照合に使った保存済みレコードそのもの**を返す。呼び出し元は repair を
+ * この 2 件から組む。認めた根拠と repair の材料が別物だと、片方しか検証していないことになる。
+ */
+type BlockedAdmission =
+  | { ok: true, implementJob: Job, review: ReviewResult }
+  | { ok: false, reason: string }
+
+/**
+ * **blocked な Task に repair を作ってよい唯一のケース**かを、既存レコードだけで照合する。
+ *
+ * ## なぜ必要か
+ *
+ * `resumeBlockedTask()` は Job を 1 件作るだけで Task status を変えない。よって resume で
+ * 再開した実装が成功し、Independent Review が修正を要求しても、Task は `blocked` のままである。
+ * 従来の無条件 skip では、その修正要求が **repair にも escalate にもならず消えていた**。
+ *
+ * ## 何を根拠にするか
+ *
+ * **呼び出し元の申告を信じない。** 「これは resume 由来だ」「repair できるはずだ」といった
+ * caller / PL の主張は一切使わず、すべて保存済みレコードから機械的に確かめる。
+ * 1 つでも確かめられなければ従来どおり skip する（fail-closed）。
+ */
+function repairableBlockedReviewRequest(
+  storage: IStorage,
+  task: Task,
+  candidate: Job,
+): BlockedAdmission {
+  // 0. **Job を id で読み直す。** 引数の object は呼び出し元が組んだもので、`status` も
+  //    `workflowStepKey` も自由に書ける（実際 `routes/jobs.ts` の失敗経路は
+  //    `{ ...existing, ...jobUpdate }` という合成 object を渡している）。id 以外を
+  //    引数から読むと、下の条件 3・4 は**自己申告の検査**にしかならない（独立レビュー指摘）。
+  //    以降はすべて保存された行だけを見る。別 Task の Job を指していれば当然通さない。
+  const implementJob = storage.jobs.findById(candidate.id)
+  if (!implementJob) return { ok: false, reason: 'implementation job is not a stored job' }
+  if (implementJob.taskId !== task.id) {
+    return { ok: false, reason: 'implementation job belongs to another task' }
+  }
+
+  // 1. **この implement Job に対する review Job を、保存済み Job から引く。**
+  //    引数の `review` は使わない。呼び出し元が作った object は「保存された事実」ではなく、
+  //    status も findings も自由に書けるためである（独立レビュー指摘）。
+  const reviewJob = storage.jobs.findByTaskId(task.id)
+    .find((job) => job.workflowStepKey === `implement:${implementJob.id}:review`)
+  if (!reviewJob) return { ok: false, reason: 'no review job for this implementation' }
+
+  // 2. **その review Job に対して保存された verdict** を引く。無ければ通さない。
+  const stored = storage.reviewResults.findByTaskId(task.id)
+    .find((result) => result.jobId === reviewJob.id)
+  if (!stored) return { ok: false, reason: 'no stored review result for this implementation' }
+  if (stored.status !== 'changes_requested') {
+    return { ok: false, reason: `review status is ${stored.status}` }
+  }
+
+  // 3. その実装が**成功している**こと。失敗した実装の修正要求はここでは扱わない。
+  if (implementJob.status !== 'success') {
+    return { ok: false, reason: `implementation job is ${implementJob.status}` }
+  }
+
+  // 4. その実装が **canonical な resume successor** であること。
+  //    `resume:<元Job>:<n>` は `resumeBlockedTask()` だけが付ける規約で、
+  //    これが blocked のまま成功しうる唯一の正規経路である。
+  if (!/^resume:[^:]+:\d+$/.test(implementJob.workflowStepKey ?? '')) {
+    return { ok: false, reason: 'implementation job is not a canonical resume successor' }
+  }
+
+  // 5. 指摘が **この Task の allowedPaths 内**で直せること。
+  //    範囲外のファイルを指す指摘が 1 件でもあれば、repair は scope を越える。
+  //
+  //    **まず範囲そのものが使えるかを見る。** task route の `allowedPaths` は
+  //    `z.array(z.string())` としか検証されないので、`''` / `'   '` / 絶対パスが保存されうる
+  //    （roadmap adoption 経路だけが `.min(1)` を課している）。Worker の File Change Guard は
+  //    `file === prefix || file.startsWith(prefix + '/')` で比べ、trim もしないので、
+  //    そうした prefix は**どの変更ファイルにも一致しない** —— repair を作っても必ず guard で
+  //    止まる。「範囲が壊れている」は「どこでも直してよい」ではないので落とす（独立レビュー指摘）。
+  const allowed = task.allowedPaths ?? []
+  if (allowed.length === 0) return { ok: false, reason: 'task has no allowedPaths' }
+  if (!allowed.every(isUsableScopePrefix)) {
+    return { ok: false, reason: 'task allowedPaths contains an unusable scope' }
+  }
+  // **前方一致の前に正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
+  // `apps/api/src/pl/` で始まるが、解決すると範囲外を指す（独立レビュー指摘）。
+  const outside = stored.findings
+    .map((finding) => finding.file)
+    .filter((file): file is string => typeof file === 'string' && file.length > 0)
+    .filter((file) => !isInsideAllowedPaths(file, allowed))
+  if (outside.length > 0) {
+    return { ok: false, reason: `review findings point outside allowedPaths (${outside[0]})` }
+  }
+
+  // 6. **通常 repair で扱ってはいけない指摘が混じっていない**こと。
+  //    `critical` は Safety / Authority 相当の判断を求めうるので、既存の escalation へ残す。
+  if (stored.findings.some((finding) => finding.severity === 'critical')) {
+    return { ok: false, reason: 'review contains a critical finding' }
+  }
+
+  // 7. **Design Review が CONFLICT / BLOCK で止まっていない**こと。
+  //    その場合の復旧は別責務（`task-design-review-conflict-has-no-recovery-route`）で、
+  //    ここで repair を積むと本来の経路を踏み潰す。
+  //
+  //    **判定は既存の reader に委ねる。** ここで `resultJson` を自前に解釈していたが、
+  //    実際に保存されるのは runner の raw stdout で、判定は `finalDecision` /
+  //    `focusedReviewResults` / `integrationReviewResult` の形で入る。
+  //    自前パーサは `decision` という存在しない欄を読んでおり、**本物の CONFLICT を
+  //    取りこぼしていた**（独立レビュー指摘）。
+  //
+  //    **読めなかったときは通さない。** 以前は `undefined` がそのまま通過していたが、
+  //    「判定が読めない」は「CONFLICT ではない」の証明にならない。
+  //
+  //    **runner の自己申告（`finalDecision`）も信じない。** focus 判定が CONFLICT でも
+  //    `finalDecision: ALIGNED` と書いて返せることが既存テストで示されている
+  //    （`designReviewCoordinator.test.ts`「runner が finalDecision=ALIGNED と自己申告しても…」）。
+  //    既存の `recomputeDecision()` で計算し直した結果だけを使う。
+  //    **run があるのに結果が無い場合も通さない。** 失敗した run や attempt 上限に達した run は
+  //    `resultJson` が NULL のまま残る。そこを `!== undefined` で素通りさせていたため、
+  //    **判定が存在しない Design Review が「問題なし」として扱われていた**（独立レビュー指摘）。
+  //    run が 1 つも無いときだけが「まだ Design Review をしていない」であり、それは通してよい。
+  const latestRun = storage.designReviewRuns.findLatestByTaskId(task.id)
+  if (latestRun !== undefined) {
+    const recomputed = safeRecomputedDecision(latestRun)
+    if (recomputed === undefined) {
+      return { ok: false, reason: 'latest design review decision could not be recomputed' }
+    }
+    if (recomputed !== 'ALIGNED') {
+      return { ok: false, reason: `latest design review is ${recomputed}` }
+    }
+  }
+
+  // 8. **競合する live Job が無い**こと。動いている Job の上へ repair を積まない。
+  //
+  //    ただし **この resume の元 Job が `blocked` のまま残っている場合だけ**は除く。
+  //    `resumeBlockedTask()` は latest Job が `blocked` のときも受理し、**元の行を blocked の
+  //    まま残して** `resume:<元Job>:1` を作る（`sqlite.ts`）。除外しないと、その正規経路で
+  //    再開した成果が必ずここで弾かれる —— 直そうとしている閉じ込めを別の形で作り直すことになる。
+  //
+  //    **除外は `blocked` に限る。** 元 Job は後から `queued` へ戻りうる
+  //    （`jobResultApplicationPolicy.ts` の `blocked: ['queued']`、`routes/jobs.ts` の
+  //    implement requeue 経路）。stepKey が名指しているというだけで状態を問わず外すと、
+  //    **本当に動いている Job の上へ repair を積む**（独立レビュー指摘）。
+  //    resume が残した `blocked` という状態そのものが除外の根拠であって、名前ではない。
+  const resumeSourceJobId = implementJob.workflowStepKey?.match(/^resume:([^:]+):\d+$/)?.[1]
+  const live = storage.jobs.findByTaskId(task.id)
+    .filter((job) => job.id !== implementJob.id)
+    .filter((job) => !(job.id === resumeSourceJobId && job.status === 'blocked'))
+    .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
+  if (live.length > 0) {
+    return { ok: false, reason: `a live job exists for this task (${live[0].status})` }
+  }
+
+  return { ok: true, implementJob, review: stored }
+}
+
+
 export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): RepairPreparation {
-  const { failedJob, review } = input
+  // blocked の例外を認めた場合、この 2 つは**保存済みレコードへ差し替える**（下記）。
+  let { failedJob, review } = input
 
   const task = storage.tasks.findById(failedJob.taskId)
   if (!task) return { action: 'skip', reason: 'task not found' }
-  if (task.status === 'blocked' || task.status === 'done') {
-    return { action: 'skip', reason: `task is ${task.status}` }
+
+  // **`done` は従来どおり無条件 skip。** 完了した Task へ repair を作らない。
+  if (task.status === 'done') return { action: 'skip', reason: 'task is done' }
+
+  // **`blocked` は原則 skip のまま。例外は 1 つだけである。**
+  //
+  // 2026-09-21 production: blocked な Task を既存 resume route で再開し、implement が成功し、
+  // その成果へ Independent Review が `changes_requested` を返した。ところがここが
+  // `task.status === 'blocked'` で降りるため、**repair も escalate も作られず**、
+  // 修正要求が誰にも渡らないまま停止した（`c3849205` / review `026fe5a3`）。
+  // `resumeBlockedTask()` は Job を作るだけで Task status を変えない仕様なので、
+  // resume 経由の成果は**必ず**この形になる。つまり repair route が自分で閉じていた。
+  //
+  // **「blocked なら repair してよい」には広げない。** 下の `repairableBlockedReviewRequest()`
+  // が既存レコードだけで全条件を機械照合し、1 つでも欠ければ従来どおり skip する。
+  if (task.status === 'blocked') {
+    const admitted = repairableBlockedReviewRequest(storage, task, failedJob)
+    if (!admitted.ok) return { action: 'skip', reason: `task is blocked (${admitted.reason})` }
+    // **認めた根拠と repair の材料を同じ行に揃える。** ここで引数の object を使い続けると、
+    // 「保存された無害な verdict で通し、引数の細工された verdict で prompt を組む」が
+    // 成立する。照合した 2 件だけを以降の材料にする（独立レビュー指摘）。
+    failedJob = admitted.implementJob
+    review = admitted.review
   }
 
   const priorJobs = storage.jobs.findByTaskId(task.id)
