@@ -35,6 +35,12 @@ export const WORKER_ALLOWLIST: readonly WorkerAllowlistEntry[] = [
   // これが無いと production（credential split 有効）では 403 になり、
   // continuation が Mobile の GET 副作用でしか進まない状態へ戻る。
   { method: 'POST', url: '/api/task-continuations/reconcile' },
+  // supervised run の reconcile も起動契機は Worker の既存 poll cycle だけである。
+  // これが無いと credential split 有効時に 403 になり、**呼び出し側は warn して poll を
+  // 続けるので Worker は健康に見えたまま** reconcile だけが止まる
+  // （runDir → durable state 反映 / 死んだ supervisor の検出 / terminal 後の
+  // continuation 起動が進まなくなる）。
+  { method: 'POST', url: '/api/supervised-runs/reconcile' },
 ]
 
 export function isWorkerRouteAllowed(method: string | undefined, url: string | undefined): boolean {

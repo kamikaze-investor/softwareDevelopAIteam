@@ -41,6 +41,7 @@ async function buildApp(): Promise<FastifyInstance> {
     { approvalRoutes },
     { knowledgeGraphRoutes },
     { taskContinuationRoutes },
+    { supervisedRunRoutes },
     { resetStorage },
   ] = await Promise.all([
     import('../routes/projects.js'),
@@ -52,6 +53,7 @@ async function buildApp(): Promise<FastifyInstance> {
     import('../routes/approvals.js'),
     import('../routes/knowledgeGraph.js'),
     import('../routes/taskContinuations.js'),
+    import('../routes/supervisedRuns.js'),
     import('../storage/index.js'),
   ])
 
@@ -71,6 +73,7 @@ async function buildApp(): Promise<FastifyInstance> {
   app.register(approvalRoutes, { prefix: '/api' })
   app.register(knowledgeGraphRoutes, { prefix: '/api' })
   app.register(taskContinuationRoutes, { prefix: '/api' })
+  app.register(supervisedRunRoutes, { prefix: '/api' })
   await app.ready()
   return app
 }
@@ -259,6 +262,23 @@ describe('Worker↔API authority separation — WORKER credential: allowlist 12�
       const res = await app.inject({
         method: 'POST',
         url: '/api/task-continuations/reconcile',
+        headers: workerAuthHeader(),
+      })
+      expect(res.statusCode).not.toBe(401)
+      expect(res.statusCode).not.toBe(403)
+    })
+  })
+
+  // **実 route 登録を通して確かめる。** allowlist の文字列比較が合っていても、
+  // prefix の合成（`'/api'` + `'/supervised-runs/reconcile'`）が
+  // `req.routeOptions.url` と一致しなければ production では 403 になる ——
+  // cutover 事前監査（2026-09-21）で欠落が見つかった route なので、
+  // 一致していることをここで固定する。
+  it('POST /api/supervised-runs/reconcile が通る', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/supervised-runs/reconcile',
         headers: workerAuthHeader(),
       })
       expect(res.statusCode).not.toBe(401)

@@ -35,4 +35,22 @@ describe('isWorkerRouteAllowed', () => {
   it('abort cleanup の観測報告を許可する', () => {
     expect(isWorkerRouteAllowed('POST', '/api/jobs/:id/abort-cleanup-result')).toBe(true)
   })
+
+  // cutover 事前監査（2026-09-21）で見つかった欠落。Worker は poll cycle ごとに
+  // 実際にこの route を叩いているが、allowlist にだけ無かった。
+  it('supervised run reconcile を許可する（Worker poll cycle が既存の起動契機）', () => {
+    expect(isWorkerRouteAllowed('POST', '/api/supervised-runs/reconcile')).toBe(true)
+  })
+
+  // **広げたのは1 entry だけ**であることを固定する。method 違いまで通る実装にしない。
+  it('同じ path でも POST 以外は許可しない', () => {
+    expect(isWorkerRouteAllowed('GET', '/api/supervised-runs/reconcile')).toBe(false)
+    expect(isWorkerRouteAllowed('PATCH', '/api/supervised-runs/reconcile')).toBe(false)
+  })
+
+  // 前方一致・部分一致で広がっていないこと。
+  it('supervised-runs の他の path は許可しない', () => {
+    expect(isWorkerRouteAllowed('POST', '/api/supervised-runs')).toBe(false)
+    expect(isWorkerRouteAllowed('POST', '/api/supervised-runs/reconcile/extra')).toBe(false)
+  })
 })
