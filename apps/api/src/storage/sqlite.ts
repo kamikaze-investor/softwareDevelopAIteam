@@ -31,6 +31,9 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
+// 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
+// 型以外に storage へ依存しないモジュールなので循環しない。
+import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -829,6 +832,20 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
         if (isParkedTaskId(taskId)) {
           return { ok: false as const, reason: 'Task was parked concurrently' }
+        }
+
+        // **有効な承認待ちも同じ transaction の中で確かめ直す。** precheck だけだと、
+        // 別 connection が precheck 後・commit 前に Approval Request を作れてしまい、
+        // 「人の判断待ちと Recovery が同時進行しない」という条件を破ったまま commit される。
+        // 判定は precheck と同じ `hasActiveApprovalWaiting()` —— 条件をここへ書き写さない。
+        const latestApprovalRow = db.prepare(
+          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
+        ).get(taskId) as any
+        if (hasActiveApprovalWaiting(
+          latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined,
+          now(),
+        )) {
+          return { ok: false as const, reason: APPROVAL_WAITING_REASON }
         }
 
         const updated = tasks.update(taskId, { status: 'pending' })

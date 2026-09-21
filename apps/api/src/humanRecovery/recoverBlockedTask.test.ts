@@ -438,6 +438,86 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
   })
 })
 
+/** その Task に承認待ち行を1件作る。`expiresAt` で有効/期限切れを作り分ける。 */
+function seedApproval(
+  storage: IStorage,
+  taskId: string,
+  options: { status?: 'WAITING_FOR_USER' | 'APPROVED'; expiresInMs?: number } = {},
+): void {
+  storage.approvalRequests.create({
+    taskId,
+    requestedAction: 'git_commit',
+    riskLevel: 'HIGH',
+    targetBranch: 'ai/x',
+    targetCommit: 'c',
+    targetDiffHash: 'd',
+    changedFiles: [],
+    triggeredRules: [],
+    invalidIf: ['commit changes'],
+    status: options.status ?? 'WAITING_FOR_USER',
+    expiresAt: new Date(Date.now() + (options.expiresInMs ?? 3_600_000)).toISOString(),
+  } as Parameters<IStorage['approvalRequests']['create']>[0])
+}
+
+describe('人の判断が既に待っているなら、2本目の駆動を始めない', () => {
+  // **新しい Approval Gate ではない。** Human Recovery が承認を要求するようになったのでは
+  // なく、`approval_waiting` と `task_ready_without_job` が同時に立って
+  // `nextDriver` と実際の停止要因が食い違うのを防ぐ整合性条件である
+  // （独立レビュー指摘・2026-09-21）。条件は既存 `resumeBlockedTask()` と同じ。
+
+  it('**未期限の WAITING_FOR_USER があるあいだは断る**', () => {
+    const { storage, taskId } = seed()
+    seedApproval(storage, taskId)
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: false, code: 'APPROVAL_WAITING' })
+    // 状態も audit も動いていない。
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
+  })
+
+  it('**期限切れ WAITING_FOR_USER では断らない**（復旧不能な Task を作らない）', () => {
+    // 行を `EXPIRED` へ進める actor が居ないため、期限切れを承認待ちとして扱うと
+    // Task はどこからも復旧できなくなる（2026-09-12 に Production で発生）。
+    // 既存 resume の扱いと同じにする。
+    const { storage, taskId } = seed()
+    seedApproval(storage, taskId, { expiresInMs: -60_000 })
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    expect(result.ok).toBe(true)
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+  })
+
+  it('**APPROVED では断らない**（resume の現契約を広げない）', () => {
+    const { storage, taskId } = seed()
+    seedApproval(storage, taskId, { status: 'APPROVED' })
+
+    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
+  })
+
+  it('承認要求が無ければ従来どおり成功する', () => {
+    const { storage, taskId } = seed()
+
+    expect(recoverBlockedTask(storage, { taskId, reason: 'r' }).ok).toBe(true)
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+  })
+
+  it('**確定の直前に承認待ちが作られていたら commit しない**', () => {
+    // precheck を通さず storage 層を直接叩く —— precheck 通過**後**に Approval が
+    // 作られた状態と、transaction から見た姿は同じである。
+    const { storage, taskId } = seed()
+    seedApproval(storage, taskId)
+
+    const committed = storage.tasks.recoverFromBlocked({ taskId, detail: 'racing' })
+
+    expect(committed.ok).toBe(false)
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
+  })
+})
+
 describe('reason は短い監査理由であり、切らずにそのまま残す', () => {
   // **`reason` の長さを判断するのは route schema と `HUMAN_RECOVERY_REASON_MAX_LENGTH` の
   // 1組だけ。** service / storage には `slice()` を置かない —— route が長い本文を受理して

@@ -133,6 +133,36 @@ describe('POST /api/tasks/:id/recover', () => {
     })
   })
 
+  it('**未期限の承認待ちがあれば 409 + APPROVAL_WAITING**', async () => {
+    await withApp(async (app) => {
+      const taskId = await seedBlockedTaskWithoutJob(app)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.approvalRequests.create({
+        taskId,
+        requestedAction: 'git_commit',
+        riskLevel: 'HIGH',
+        targetBranch: 'ai/x',
+        targetCommit: 'c',
+        targetDiffHash: 'd',
+        changedFiles: [],
+        triggeredRules: [],
+        invalidIf: ['commit changes'],
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      } as never)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${taskId}/recover`,
+        payload: { reason: 'r' },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(JSON.parse(res.body)).toMatchObject({ code: 'APPROVAL_WAITING' })
+    })
+  })
+
   it('reason が無ければ 400', async () => {
     await withApp(async (app) => {
       const taskId = await seedBlockedTaskWithoutJob(app)

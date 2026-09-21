@@ -158,9 +158,9 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
 
 **Job は作られない。** 実装 Job は fresh Design Review が ALIGNED になって初めて作られる。
 
-**入口条件（`blocked` / Job 0 件 / park されていない）は transaction の中でも確かめ直す。**
-precheck と確定の間に別 connection が Job を入れたり park したりしても、
-`TASK_HAS_JOBS` 相当の理由で commit されない（独立レビュー round 6 指摘）。
+**入口条件（`blocked` / Job 0 件 / park されていない / 有効な承認待ちが無い）は
+transaction の中でも確かめ直す。** precheck と確定の間に別 connection が Job を入れたり
+park したり承認要求を作ったりしても、commit されない（独立レビュー round 6・7 指摘）。
 
 主な拒否理由:
 
@@ -169,6 +169,15 @@ precheck と確定の間に別 connection が Job を入れたり park したり
 | `TASK_HAS_JOBS` | Job があるので既存 `/resume` の担当。こちらでは受けない |
 | `TASK_NOT_BLOCKED` | 既に再投入済みか、そもそも止まっていない |
 | `TASK_PARKED` | `abort_task` で park 済み。復旧の副作用で park を取り消さない |
+| `APPROVAL_WAITING` | 未期限の `WAITING_FOR_USER` 承認要求が残っている。先にそれを処理する |
+
+> **`APPROVAL_WAITING` は新しい Approval Gate ではない。** Human Recovery が承認を
+> 要求するようになったのではなく、**人の判断が既に1件待っているときに2本目の駆動を
+> 始めない**という整合性条件である。条件は既存 `resumeBlockedTask()` と同じ ——
+> **最新の1行**が `WAITING_FOR_USER` **かつ未期限**のときだけ断る。
+> `APPROVED` では断らず、**期限切れ `WAITING_FOR_USER` でも断らない**
+> （行を `EXPIRED` へ進める actor が居ないので、断ると復旧不能な Task ができる。
+> 2026-09-12 に Production で発生）。入口条件と同じく **transaction 内でも確かめ直す**。
 
 **生涯上限は無い。** 連打を止めているのは入口条件（`blocked` かつ Job 0 件）そのもので、
 もう一度受理されるにはシステムが**独立に** dead state へ再突入している必要がある。

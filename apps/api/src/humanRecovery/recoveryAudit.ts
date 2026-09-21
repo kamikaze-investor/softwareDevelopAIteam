@@ -10,7 +10,7 @@
  * いるのと同じ形で、再投入の履歴も `audit_log` にだけ存在する。
  */
 
-import { occupiesProject, type Task } from '@ai-team/shared'
+import { occupiesProject, type ApprovalRequest, type Task } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 
 /**
@@ -55,6 +55,39 @@ export function isReachableByAutonomousLoop(
 export function recoveryReleasesProjectSlot(task: Pick<Task, 'roadmapActive'>): boolean {
   return !occupiesProject({ status: 'pending', roadmapActive: task.roadmapActive })
 }
+
+/**
+ * その Task に**有効な承認待ちがあるか**。あるなら別の復旧を同時に始めない。
+ *
+ * **既存 `resumeBlockedTask()` の不変条件をそのまま借りる。** 意味を広げも狭めもしない:
+ *
+ *   - 見るのは **`created_at` が最新の1行だけ**（`ORDER BY created_at DESC LIMIT 1`）
+ *   - 拒否するのは `WAITING_FOR_USER` **かつ未期限**のときだけ
+ *   - **`APPROVED` では拒否しない。** resume の現契約がそうであり、ここで拡張しない
+ *   - **期限切れ `WAITING_FOR_USER` でも拒否しない。** 行を `EXPIRED` へ進める actor が
+ *     居ないため、期限切れを承認待ちとして扱うと Task がどこからも復旧できなくなる
+ *     （2026-09-12 に Production で実際に起きた。`sqlite.ts` の resume 側の注記を参照）
+ *
+ * これは**新しい Approval Gate ではない**。Human Recovery が承認を要求するようになった
+ * わけではなく、**人の判断がすでに1件待っているときに2本目の駆動を始めない**という
+ * 整合性条件である。放置すると `approval_waiting` と `task_ready_without_job` が同時に立ち、
+ * PL は `approval_waiting` を先に処理するため、`/recover` が返した `nextDriver` と
+ * 実際に進行を止めるものが食い違う（独立レビュー指摘・2026-09-21）。
+ *
+ * **純関数にしてあるのは、precheck と transaction 内の再確認が同じ判定を使うためである。**
+ * 条件を2箇所へ書き写すと、片方だけ直したときに precheck と commit が食い違う。
+ */
+export function hasActiveApprovalWaiting(
+  latestApproval: Pick<ApprovalRequest, 'status' | 'expiresAt'> | undefined,
+  nowIso: string,
+): boolean {
+  if (latestApproval?.status !== 'WAITING_FOR_USER') return false
+  return new Date(latestApproval.expiresAt) > new Date(nowIso)
+}
+
+/** 承認待ちで Human Recovery を断るときの理由文。precheck と transaction で同じ文を使う。 */
+export const APPROVAL_WAITING_REASON =
+  'An active approval request is waiting for human review; resolve it before recovering'
 
 export const HUMAN_RECOVERY_AUDIT_OPERATION = 'task_human_recovered'
 export const HUMAN_RECOVERY_AUDIT_ENTITY_TYPE = 'task'

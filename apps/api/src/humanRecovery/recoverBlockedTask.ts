@@ -70,7 +70,12 @@
  */
 
 import type { IStorage } from '../storage/interface'
-import { isReachableByAutonomousLoop, latestHumanRecoveryId } from './recoveryAudit'
+import {
+  APPROVAL_WAITING_REASON,
+  hasActiveApprovalWaiting,
+  isReachableByAutonomousLoop,
+  latestHumanRecoveryId,
+} from './recoveryAudit'
 import type { Task } from '@ai-team/shared'
 
 export { latestHumanRecoveryId } from './recoveryAudit'
@@ -227,6 +232,7 @@ export type RecoverBlockedTaskResult =
       | 'TASK_NOT_BLOCKED'
       | 'TASK_HAS_JOBS'
       | 'TASK_PARKED'
+      | 'APPROVAL_WAITING'
       | 'RECOVERY_FAILED'
     reason: string
   }
@@ -335,6 +341,22 @@ export function recoverBlockedTask(
         `Task ${input.taskId} was parked by abort_task; re-admitting it here would silently undo the park. `
         + 'Adopt the roadmap item again as a follow-up instead',
     }
+  }
+
+  // **人の判断が既に1件待っているなら、2本目の駆動を始めない。**
+  // 既存 `resumeBlockedTask()` が持つ不変条件をそのまま借りる（条件は
+  // `hasActiveApprovalWaiting()` の1箇所にある）。新しい Approval Gate ではない ——
+  // Human Recovery が承認を要求するようになったのではなく、**同時進行を避ける**だけである。
+  // 放置すると `approval_waiting` と `task_ready_without_job` が同時に立ち、PL は前者を
+  // 先に処理するので、`nextDriver` と実際に進行を止めるものが食い違う。
+  //
+  // `findByTaskId()` は `created_at DESC` で返すので `[0]` が最新 —— resume 側の
+  // `ORDER BY created_at DESC LIMIT 1` と同じ行を見ている。
+  if (hasActiveApprovalWaiting(
+    storage.approvalRequests.findByTaskId(task.id)[0],
+    new Date().toISOString(),
+  )) {
+    return { ok: false, code: 'APPROVAL_WAITING', reason: APPROVAL_WAITING_REASON }
   }
 
   // **却下済みテキスト世代での上限は置かない（独立レビュー round 2 で撤回した）。**
