@@ -1645,6 +1645,11 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         LLM ではなく機械的ルールで先に拾い、LLM の判定に依存させない）
       - 既存の `reviewLoadClassifier` / `runMechanicalGate` が同じ役割を果たせないか
         （**新しい分類器を作る前に既存の再利用を確認する**）
+      - **判定の揺れを測る面は既に存在する**（2026-09-21 audit）。`principle_applications` の
+        stage 間 disagreement（`findDisagreements()` / `countStageComparisons()`）が、同一 subject・
+        同一原則に対する `design` と `independent` の判定差を返す。
+        **新しい比較記録を作る前に、これで足りるかを先に見る**
+        （設計正本: `specs/23_system_one_decision_layer.md` 9章）
 
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
@@ -7630,6 +7635,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - `meta-review-structured-output-robustness`（planned）— parse 失敗による **false BLOCKED**。向きが逆
       - `project-auto-incident-pattern-improvement`（planned）— 過剰安全策・過剰レビューを Incident 候補として扱う。
         Class B の効果（CEO 呼び出し回数の変化と取りこぼしの有無）はここで測る
+      - `specs/23_system_one_decision_layer.md`（System One Decision Layer）— machine facts /
+        意味判断 / 深い推論の3層分離の設計正本。**本項目の「2名の semantic verdict」をどれだけ
+        信用できるか**の根拠データは、既存 `principle_applications` の stage 間 disagreement から取る。
+        同 spec は Gate / Approval Class 判定へ踏み込まず、**本項目の CEO 承認手順を迂回しない**
 
       **non-goals**:
       - 新しい Review system / 新しい Reviewer 種別 / 新しい Gate 本体 / 新しい承認経路 / 新しいテーブル
@@ -10035,6 +10044,13 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       または新しい persistent state が必要になった場合**のみ**。
       それ以外は通常 Roadmap 開発として進めてよい（CEO 指示 2026-09-18）。
 
+      **設計正本の追加（2026-09-21・CEO 指示による System One audit の結果）**: 本項目の coverage 拡張は、
+      `specs/23_system_one_decision_layer.md` が定める System One Decision Layer の
+      **Phase 4（Question Library の適用範囲拡張）にあたる**。着手時は同 spec の 5章（Question の設計規則）と
+      14-1章（既存の統合点。**並走型 shadow runner を作らない**）を確認すること。
+      **本項目の scope は変わらない** — 残作業は Task A のままであり、
+      Principle 以外の Question category 新設は `system-one-decision-layer-generalization`（deferred）が扱う。
+
 <!-- roadmap:id=independent-remediation-design-review-conflict state=in_progress -->
 4. [~] **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**
       — 2026-09-18登録・実装中（CEO 指示）。まず **task-kind Design Review = CONFLICT に限定する。
@@ -10288,6 +10304,50 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **重複しない境界**: `project-workspace-isolation`（planned）は複数 Project の同時実行を扱う。
       本項目は**同一 Task に対する同一 role の同時実行**であり別物。ただし単一プロセス前提を
       やめる判断は共通なので、**着手する場合は同時に扱う**。
+
+<!-- roadmap:id=system-one-decision-layer-generalization state=deferred -->
+6. [ ] **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）** —
+      2026-09-21登録（CEO 指示。Phase 0 read-only audit 実施済み）。
+      **設計正本は `specs/23_system_one_decision_layer.md`。** 本項目は実装順序だけを持ち、
+      設計思想・Authority 境界・Question の設計規則を重複記述しない。
+
+      **本項目は「新しい判断基盤を作る」項目ではない。** audit の結論は、System One の Phase 1〜2
+      （最初の Question category を既存 Review の出力契約へ載せ、判定を記録し stage 間 disagreement を
+      比較する）が **上記1・2で既に本番稼働している**ことである。Phase 3 の閉ループ（50 / 100 / 200 件の
+      sensor）も実装済みで、**実データの蓄積待ち**である。よって本項目が扱うのは残る2本だけである。
+
+      **Track 1 — Question category を Principle 以外へ広げる**
+      （SCOPE / AUTHORITY / DATA_STATE / RECOVERY / REVIEW / COMPLETION 等。`specs/23` 5章）
+
+      **Track 2 — 外部 Decision Engine（Jev 等）の評価**（`specs/23` 4章）
+
+      **なぜ `deferred` か（2本は別の理由で止まっている）**:
+      - **Track 1 は Phase 3 の実データ待ち。** sensor が実データで再評価を発火する前に Question を
+        増やすと適用数の増加速度が上がり、「どの Question が効いているか」の判定がかえって遅れる
+        （上記3が「coverage を広げる前に閉ループを先に完成させる」と決めたのと同じ理由）。
+        加えて適用範囲拡張そのものは**上記3 Task A が owner**であり、同じ作業を二重に持たない
+      - **Track 2 は Yellow Zone。** 外部サービス追加・課金は `CLAUDE.md` 4章で CEO 承認事項であり、
+        本ファイルの「横断制約: 従量課金APIを新しい標準経路にしない」（CEO 指示 2026-09-14）にも触れる。
+        さらに交換可能性は「交換しても資産が残る」ことで示すものなので、Question Library の
+        実績が薄い段階で engine を増やしても評価にならない
+
+      **着手手順（この順序を飛ばさない）**:
+      1. 上記3 Task A（Registry coverage 拡張）を閉じる
+      2. 100 件 threshold review の**実データ**を見る（Question 別の適用数・CONFLICT / UNCERTAIN 率・
+         stage 間 disagreement 率）
+      3. そのデータで Track 1 / Track 2 のどちらに価値があるかを判断し、**必要な方だけ** item 化して
+         `state=planned` へ変更する（両方同時に開かない）
+      4. Track 2 はさらに CEO へ目的・想定費用・credential の非伝播方法・fallback・停止条件・
+         比較対象 Question を提示し、承認を得る
+
+      **`deferred` は機械的に強制される**: 採用経路3箇所が `isRoadmapItemAdoptable()`
+      （`planned` のみの allowlist）を共有するため、PL は本項目を自律採用できない。
+
+      **作らないもの（`specs/23` 15章）**: 並走型 shadow runner（「formal decision へ影響させない」は
+      別プロセスで並走させることではなく、判定を required schema から外す・記録を Gate にしない・
+      例外を握る、の3点で既に成立している）/ System One 独立 service・daemon・scheduler・queue /
+      専用 table / 第二の Principle Registry / Provider abstraction / 新しい従量課金 API 経路 /
+      Question 本文・tier・閾値の自動書き換え。
 
 ---
 
