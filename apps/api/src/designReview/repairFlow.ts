@@ -295,8 +295,15 @@ function safeRecomputedDecision(run: DesignReviewRun): string | undefined {
   }
 }
 
-/** `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。 */
-type BlockedAdmission = { ok: true } | { ok: false, reason: string }
+/**
+ * `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。
+ *
+ * 認めるときは **照合に使った保存済みレコードそのもの**を返す。呼び出し元は repair を
+ * この 2 件から組む。認めた根拠と repair の材料が別物だと、片方しか検証していないことになる。
+ */
+type BlockedAdmission =
+  | { ok: true, implementJob: Job, review: ReviewResult }
+  | { ok: false, reason: string }
 
 /**
  * **blocked な Task に repair を作ってよい唯一のケース**かを、既存レコードだけで照合する。
@@ -316,8 +323,19 @@ type BlockedAdmission = { ok: true } | { ok: false, reason: string }
 function repairableBlockedReviewRequest(
   storage: IStorage,
   task: Task,
-  implementJob: Job,
+  candidate: Job,
 ): BlockedAdmission {
+  // 0. **Job を id で読み直す。** 引数の object は呼び出し元が組んだもので、`status` も
+  //    `workflowStepKey` も自由に書ける（実際 `routes/jobs.ts` の失敗経路は
+  //    `{ ...existing, ...jobUpdate }` という合成 object を渡している）。id 以外を
+  //    引数から読むと、下の条件 3・4 は**自己申告の検査**にしかならない（独立レビュー指摘）。
+  //    以降はすべて保存された行だけを見る。別 Task の Job を指していれば当然通さない。
+  const implementJob = storage.jobs.findById(candidate.id)
+  if (!implementJob) return { ok: false, reason: 'implementation job is not a stored job' }
+  if (implementJob.taskId !== task.id) {
+    return { ok: false, reason: 'implementation job belongs to another task' }
+  }
+
   // 1. **この implement Job に対する review Job を、保存済み Job から引く。**
   //    引数の `review` は使わない。呼び出し元が作った object は「保存された事実」ではなく、
   //    status も findings も自由に書けるためである（独立レビュー指摘）。
@@ -412,12 +430,13 @@ function repairableBlockedReviewRequest(
     return { ok: false, reason: `a live job exists for this task (${live[0].status})` }
   }
 
-  return { ok: true }
+  return { ok: true, implementJob, review: stored }
 }
 
 
 export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): RepairPreparation {
-  const { failedJob, review } = input
+  // blocked の例外を認めた場合、この 2 つは**保存済みレコードへ差し替える**（下記）。
+  let { failedJob, review } = input
 
   const task = storage.tasks.findById(failedJob.taskId)
   if (!task) return { action: 'skip', reason: 'task not found' }
@@ -439,6 +458,11 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   if (task.status === 'blocked') {
     const admitted = repairableBlockedReviewRequest(storage, task, failedJob)
     if (!admitted.ok) return { action: 'skip', reason: `task is blocked (${admitted.reason})` }
+    // **認めた根拠と repair の材料を同じ行に揃える。** ここで引数の object を使い続けると、
+    // 「保存された無害な verdict で通し、引数の細工された verdict で prompt を組む」が
+    // 成立する。照合した 2 件だけを以降の材料にする（独立レビュー指摘）。
+    failedJob = admitted.implementJob
+    review = admitted.review
   }
 
   const priorJobs = storage.jobs.findByTaskId(task.id)

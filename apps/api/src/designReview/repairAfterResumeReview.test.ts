@@ -386,4 +386,89 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     const review = storeReview(storage, ids, reviewJob.id, { status: 'approved' } as Partial<ReviewResult>)
     expect(skipped(storage, implementJob, review)).toContain('review status is approved')
   })
+
+  // **implement Job も id で読み直す。** 引数の object は呼び出し元が組んだもので、
+  // `status` も `workflowStepKey` も自由に書ける（`routes/jobs.ts` の失敗経路は実際に
+  // `{ ...existing, ...jobUpdate }` という合成 object を渡す）。引数から読むかぎり
+  // 条件 3・4 は**自己申告の検査**でしかない（独立レビュー指摘）。
+  it('保存された stepKey が resume 由来でなければ、引数がそう名乗っても通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    // 保存されている実体は **初回 implement**（resume successor ではない）。
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `task:${ids.taskId}:initial-implement`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    // 呼び出し元が canonical な resume successor を名乗る。
+    const claimed = { ...implementJob, workflowStepKey: 'resume:11111111-1111-1111-1111-111111111111:1' } as Job
+    expect(skipped(storage, claimed, review)).toContain('not a canonical resume successor')
+  })
+
+  it('保存された status が success でなければ、引数がそう名乗っても通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    const implementJob = createResumedImplementJob(storage, ids)
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+    const stored = storage.jobs.update(implementJob.id, { status: 'failed' } as never)!
+
+    const claimed = { ...stored, status: 'success' } as Job
+    expect(skipped(storage, claimed, review)).toContain('implementation job is failed')
+  })
+
+  // 引数の `taskId` だけは宛先として使うので、**読み直した行が本当にその Task のものか**を
+  // 確かめる。別 Task の Job id を、この Task の宛先で渡しても通らない。
+  it('読み直した Job が別 Task のものなら通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const target = productionShape(storage)
+
+    // 同じ Project の別 Task（running Project は 1 つまでという既存 interlock のため）。
+    const otherTask = storage.tasks.create({
+      projectId: target.ids.projectId,
+      title: 'T2', description: 'd', status: 'blocked', assignee: 'developer_ai',
+      dependencies: [], allowedPaths: ['apps/api/src/pl'],
+    } as never)
+    // workflow_step_key は全体で一意なので、別のものを付ける。
+    const otherJob = createResumedImplementJob(storage, {
+      taskId: otherTask.id, projectId: target.ids.projectId,
+    }, { workflowStepKey: `resume:22222222-2222-2222-2222-222222222222:1` })
+
+    const claimed = { ...otherJob, taskId: target.ids.taskId } as Job
+    expect(skipped(storage, claimed, target.review)).toContain('belongs to another task')
+  })
+})
+
+// **認めた根拠と repair の材料は同じ行でなければならない。**
+// 保存された無害な verdict で通し、引数の細工された verdict で prompt を組む、が
+// 成立してはいけない（独立レビュー指摘）。
+describe('repair の材料は保存済み verdict', () => {
+  it('引数の review ではなく保存された review から prompt を組む', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage)
+    // 保存: 範囲内・medium・無害。
+    storeReview(storage, ids, reviewJob.id, {
+      summary: 'STORED-SUMMARY-MARKER',
+      findings: [{ severity: 'medium', file: 'apps/api/src/pl/executionLoop.ts', message: 'STORED-FINDING-MARKER' }],
+    } as Partial<ReviewResult>)
+
+    // 引数: 範囲外・critical・別内容。admission を通ったあとに混入させる形。
+    const crafted = {
+      id: 'crafted', taskId: ids.taskId, jobId: reviewJob.id, reviewer: 'qa_ai',
+      status: 'changes_requested',
+      summary: 'CRAFTED-SUMMARY-MARKER',
+      findings: [{ severity: 'critical', file: 'apps/api/src/routes/jobs.ts', message: 'CRAFTED-FINDING-MARKER' }],
+      createdAt: new Date().toISOString(),
+    } as unknown as ReviewResult
+
+    const result = prepareRepairFlow(storage, { failedJob: implementJob, review: crafted })
+
+    expect(result.action).toBe('queue')
+    if (result.action !== 'queue') return
+    expect(result.run.designText).toContain('STORED-SUMMARY-MARKER')
+    expect(result.run.designText).toContain('STORED-FINDING-MARKER')
+    expect(result.run.designText).not.toContain('CRAFTED-SUMMARY-MARKER')
+    expect(result.run.designText).not.toContain('CRAFTED-FINDING-MARKER')
+  })
 })
