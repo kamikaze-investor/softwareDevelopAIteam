@@ -128,6 +128,37 @@ function productionShape(storage: IStorage, taskOverrides: Record<string, unknow
 }
 
 describe('blocked Task への repair — 通るケース', () => {
+  // **`resumeBlockedTask()` は元 Job が `blocked` のときも受理し、その行を blocked のまま残す。**
+  // stepKey が名指しする元 Job を live 判定から外さないと、その正規経路で再開した成果が
+  // 必ず弾かれる —— 直そうとしている閉じ込めを別の形で作り直すことになる（独立レビュー指摘）。
+  // 元の resume 元が実際に blocked で残っている形を、production と同じように組む。
+  it('元 Job が blocked のまま残っていても repair を作る', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    // 元 Job（blocked のまま残る）。
+    const sourceJob = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+    } as never)
+    storage.jobs.update(sourceJob.id, { status: 'blocked' } as never)
+
+    // その Job を元にした resume successor。
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `resume:${sourceJob.id}:1`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    const result = prepareRepairFlow(storage, { failedJob: implementJob, review })
+    expect(result.action).toBe('queue')
+  })
+
   it('resume で成功した実装への changes_requested は repair を作る', () => {
     const storage = createSQLiteStorage(':memory:')
     const { implementJob, review } = productionShape(storage)
@@ -304,6 +335,34 @@ describe('blocked Task への repair — 通してはいけないケース', () 
         file: 'apps/api/src/pl/../routes/jobs.ts',
         message: 'escapes the scope',
       }],
+    } as Partial<ReviewResult>)
+    expect(skipped(storage, implementJob, review)).toContain('outside allowedPaths')
+  })
+
+  // 元 Job を外すのは **stepKey が名指しする 1 件だけ**。無関係な blocked は従来どおり拒む。
+  it('resume の元ではない blocked Job は従来どおり通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, review } = productionShape(storage)
+    const unrelated = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+    } as never)
+    storage.jobs.update(unrelated.id, { status: 'blocked' } as never)
+    expect(skipped(storage, implementJob, review)).toContain('live job exists')
+  })
+
+  // **allowedPaths の prefix を正規化して広げない。**
+  // `apps/api/src/pl/..` を `apps/api/src` へ解決すると、保存値より緩い範囲を許してしまう。
+  it('allowedPaths に .. が含まれていても範囲を広げない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage, {
+      allowedPaths: ['apps/api/src/pl/..'],
+    })
+    const review = storeReview(storage, ids, reviewJob.id, {
+      findings: [{ severity: 'medium', file: 'apps/api/src/routes/jobs.ts', message: 'outside' }],
     } as Partial<ReviewResult>)
     expect(skipped(storage, implementJob, review)).toContain('outside allowedPaths')
   })
