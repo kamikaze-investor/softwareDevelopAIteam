@@ -69,6 +69,33 @@ pnpm --filter @ai-team/worker audit:gate
   現在の結論へ更新する。各項目冒頭へ「現在の結論サマリー」を機械的に追加する運用は、
   本文との二重Truthを生むため採用しない
 
+## 調査前チェック: checkout が Current Truth か（CEO 指示・2026-09-21）
+
+**「この機能は存在しない」と結論する前に、作業ツリーが最新かを確認する。**
+
+```bash
+git fetch origin && git rev-list --count HEAD..origin/master
+```
+
+- 0 でなければ、判断の根拠を作業ツリーから取らず **`origin/master` から取る**
+  （`git show origin/master:<path>` / `git ls-tree -r --name-only origin/master`）
+- **「無い」と結論する前に未 merge の実装も見る**: `git log --all --grep=<topic> -i` と
+  `git show --stat <commit>`。実装が別 branch にあるだけのことがある
+- 遅れを解消するとき、`master` が他 worktree に checkout されていると main checkout では
+  `master` を checkout できない（`git worktree list` で確認）。その場合は現 branch を
+  `git merge --ff-only origin/master` で進めるだけにし、
+  **他 worktree の branch を奪ったり worktree を削除したりしない**
+- 未保存変更・local-only commit・stash がある場合は**破棄せず停止**して報告する
+
+**実測（2026-09-21）**: main checkout が `origin/master` より **118 commit 遅れ**、branch は
+merge 済みの feature branch のままだった。その状態で System One の設計 audit を行い
+「`principle_applications` は存在しない / Principle 単位の verdict 記録は無い」と誤結論した。
+実際には 2026-09-17 に実装・merge され production で稼働しており、**CEO 側の前提が正しかった**。
+訂正の経緯は `specs/23_system_one_decision_layer.md` 0-1章。
+
+本ルールは上記「Document Rot防止ルール」の Current Truth 原則を**コード側へ適用**したものであり、
+新しい仕組み・新しい Roadmap item を追加するものではない。
+
 ## Secret の確認結果の出し方（CEO 指示・2026-09-15）
 
 credential が設定されているかを確認したとき、AI が出力してよいのは
