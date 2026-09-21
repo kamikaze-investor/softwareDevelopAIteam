@@ -11,6 +11,13 @@ import type { AiCliMode, AiCliProvider } from './types/ai_cli'
  * | claude_code / review | 53 | **0 件** | 33s | 70s | 131s |
  *
  * 既定 300s に対し、成功した implement の max は 230s —— **余裕は 1.3 倍しかない**。
+ *
+ * **この数字は Job 全体の所要時間である（`started_at` → `completed_at`）。**
+ * `timeoutMs` が掛かるのは AI CLI の子プロセスだけで、Job はそのあと検査と SafeCommand を
+ * 実行してから完了する。したがって上の値は **CLI 実行時間の上界**であり、
+ * 実際の CLI はこれより短い（独立レビュー指摘・2026-09-21）。
+ * 上界で見てなお 230s / 300s なのだから「余裕が薄い」という結論は変わらないが、
+ * **230s を CLI の所要時間そのものとして読んではいけない。**
  * しかも **timeout 7 件はすべて `changedFiles` があった**。
  *
  * **ここから言えるのは「7 件すべてで、生成済みの変更が失われた」までである。**

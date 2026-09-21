@@ -8852,9 +8852,12 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
          （`routes/jobs.ts` の `delete jobUpdate.status`）、payload の残り —— `completedAt` 等 ——
          はそのまま永続化する。遅れて届いた重複 result により、
          **`success` のまま所要時間だけが書き換わった行**が残りうる（独立レビュー指摘）。
-         implement-timeout-sensor の C はこのため「budget を超える成功」を標本から外しているが、
-         書き換え後の値が budget 内なら区別できない。**status 以外の列に対する
-         stale result の扱いも本項目の対象とする**
+         implement-timeout-sensor の C は一時この汚染を避けようと「budget を超える成功」を
+         標本から外したが、**それは誤りだったので取り下げた**（2026-09-21）:
+         `timeoutMs` が掛かるのは AI CLI の子プロセスだけで、Job 全体は検査と SafeCommand の
+         ぶん budget を超えうる。落ちるのは **C が拾うべき near-budget の成功そのもの**だった。
+         塞げるだけ狭い上限は本物の標本を捨てるため、**センサー側では塞がない**。
+         **status 以外の列に対する stale result の扱いも本項目の対象とする**
 
       **新しい metadata subsystem は作らない**（CEO 指示・2026-09-21）。
       既存の Job update 機構を正す方向を優先する。

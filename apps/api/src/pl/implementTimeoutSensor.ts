@@ -420,26 +420,33 @@ export function evaluateImplementTimeoutSensors(
   //   上の議論は「閾値より下の標本を足す」という**今回の拡大に固有の条件**に依存している。
   //   budget を縮める変更では旧成功が閾値を上回りうるので、前提ごと崩れる。
   //   **そのときは C にも epoch を掛けるかどうかを測り直すこと**
-  // **現在の budget より長い「成功」は、その budget の下では起こり得ない。**
+  // **ここで測っているのは Job 全体の所要時間であって、budget の対象ではない。**
   //
-  // 遅れて届いた重複 result が標本を汚しうる: `PATCH /api/jobs/:id` は stale な `status` だけを
-  // 落として payload の残り（`completedAt` 等）はそのまま永続化するので、`success` のまま
-  // 所要時間だけが書き換わった行が残りうる（独立レビュー指摘）。
-  // p95 が偽って閾値を越えると、C の重複排除キーを本物の証拠より先に使い切ってしまう。
+  // `timeoutMs` が掛かるのは **AI CLI の子プロセスだけ**である。`jobRunner` は CLI のあと
+  // 検査を行い、SafeCommand（`git_commit` 等）を実行してから `completedAt` を書く。
+  // したがって `startedAt` → `completedAt` は **CLI 実行時間の上界**でしかない:
+  // CLI が 895s で正常終了し、SafeCommand に 20s かかれば、Job は 915s の成功になる
+  // （独立レビュー指摘）。
   //
-  // budget を超える成功を落とせば、**少なくとも「あり得ない値で閾値を越える」ことは防げる**。
-  // **完全には塞がらない**: 書き換え後の値が budget 内なら区別できない。残るずれの根本は
-  // Roadmap `job-failure-metadata-outlives-its-run`（stale result が status 以外の列を
-  // 書き換える件も含む）で扱う。
+  // **この差は発火を早める方向にだけ働く。** 上界で測っている以上、C は
+  // 「CLI が budget へ近づいている」より早く鳴る。再評価の合図としては安全側だが、
+  // **p95 の数値そのものを CLI の所要時間として読んではいけない。**
   //
-  // 今回の 300s -> 900s のような**拡大**では、旧 policy の成功（すべて 300s 未満）は
-  // この条件で落ちない。budget を**縮める**変更では正当な旧標本も落ちるが、
-  // それは標本が減る方向＝発火しにくい方向である。
+  // ## budget 超えの標本を落とす実装は取り下げた（2026-09-21）
+  //
+  // 「成功が budget より長いのはあり得ない」として除外していたが**誤り**だった。
+  // 上のとおり Job 全体は budget を超えうるし、しかも落ちるのは
+  // **C が拾うべき「budget へ最も近い成功」そのもの**である。
+  // 25 件の near-budget 成功が全部消えて C が黙る —— 目的を裏返していた。
+  //
+  // 書き換えられた `completedAt` による汚染（`PATCH /api/jobs/:id` は stale な `status` だけ
+  // 落として残りを永続化する）は**ここでは塞がない**。塞げるだけ狭い上限は、
+  // 同時に本物の near-budget 標本を捨てる。根本は Roadmap
+  // `job-failure-metadata-outlives-its-run` で扱う。
   const successSeconds = window
     .filter((job) => job.status === 'success')
     .map(durationSeconds)
     .filter((seconds): seconds is number => seconds !== undefined)
-    .filter((seconds) => seconds <= timeoutSeconds)
   if (successSeconds.length >= t.P95_MIN_SAMPLES) {
     const p95 = percentile(successSeconds, 0.95)
     if (p95 !== undefined && p95 >= timeoutSeconds * t.P95_RATIO_OF_TIMEOUT) {

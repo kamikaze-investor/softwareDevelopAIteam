@@ -145,23 +145,20 @@ describe('C（stale metadata に依存しない条件）', () => {
     expect(of(marked)).toBe(of(clean))
   })
 
-  // **budget より長い「成功」は、その budget の下では起こり得ない。**
-  // 遅れて届いた重複 result は stale な status だけ落として `completedAt` を書き換えるため、
-  // success のまま所要時間だけ壊れた行が残りうる（独立レビュー指摘）。
-  // それで p95 が偽って閾値を越えると、C の重複排除キーを先に使い切ってしまう。
-  it('budget を超える所要時間の成功は標本に入れない', () => {
-    // 25 件すべて budget 超え（900s 超）。これだけなら標本が 0 件になり判定しない。
-    const impossible = Array.from({ length: 25 }, () => job({ seconds: 1_200 }))
-    expect(evaluateImplementTimeoutSensors(impossible, T, EPOCH)
-      .filter((f) => f.sensorId === C_SENSOR)).toHaveLength(0)
-  })
-
-  it('壊れた 1 件が混ざっても、残りの標本で正しく判定する', () => {
-    const sane = Array.from({ length: 25 }, () => job({ seconds: 200 }))
-    const corrupted = job({ seconds: 100_000 })
-    // 200s は閾値（540s）未満なので、壊れた 1 件を落とせば発火しない。
-    expect(evaluateImplementTimeoutSensors([...sane, corrupted], T, EPOCH)
-      .filter((f) => f.sensorId === C_SENSOR)).toHaveLength(0)
+  // **budget を超える Job 所要時間は「あり得ない」ではない。**
+  // `timeoutMs` が掛かるのは AI CLI の子プロセスだけで、Job はそのあと検査と
+  // SafeCommand を実行してから完了する。CLI が 895s で正常終了し SafeCommand に 20s
+  // かかれば、Job は 915s の成功になる（独立レビュー指摘）。
+  //
+  // 以前ここで budget 超えを除外していたが、**落ちるのは C が拾うべき
+  // 「budget へ最も近い成功」そのもの**だった。目的を裏返す実装だったので取り下げた。
+  it('budget をわずかに超える成功も標本に含める（CLI ではなく Job 全体の時間だから）', () => {
+    // CLI が budget 直前まで使い、SafeCommand の分だけ超えた形。
+    const nearBudget = Array.from({ length: 25 }, () => job({ seconds: 915 }))
+    const c = evaluateImplementTimeoutSensors(nearBudget, T, EPOCH)
+      .filter((f) => f.sensorId === C_SENSOR)
+    expect(c).toHaveLength(1)
+    expect(c[0].evidence).toMatchObject({ successSamples: 25 })
   })
 
   it('直近 WINDOW 件だけを母集団にする', () => {
