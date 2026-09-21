@@ -8808,10 +8808,15 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `status=failed` かつ `kind=provider_timeout` に見える**。
 
       **実測（2026-09-21・コード確認）**:
-      - `failure_metadata` を**消す経路は 1 つも存在しない**（全経路 grep 済み）。
+      - **一般の terminal update / requeue 経路は `failure_metadata` を消さない。**
         承認待ちからの requeue（`sqlite.ts` の `UPDATE jobs SET status='queued', started_at=NULL, ...`）は
         `started_at` / `completed_at` / `exit_code` / `stdout` 等を戻すが、
         `failure_metadata` は SET 句に含まれていない
+      - **訂正（2026-09-21・独立レビュー指摘）**: 初出時に「消す経路は 1 つも存在しない」と
+        書いたが**誤り**。`failAndPrepareRepair()` は `failure_metadata = ?` へ `null` を渡して
+        消す（`sqlite.ts`）。当時の grep が `failure_metadata = NULL` という**字面**しか
+        探しておらず、placeholder 経由の null を見落としていた。
+        **狭い grep から絶対的な主張を書いていた。** 着手時はこの点を再確認すること
       - `jobs` 表に**実行を identify できる列が無い**。試行回数も run id も無く、
         `failure_metadata` 自体に時刻も付かない。したがって
         **「この印がどの実行のものか」を既存データから機械的に確定できない**
@@ -8842,6 +8847,14 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       6. **terminal success / failure ごとに `failureMetadata` を明示的に clear / write すべきか。**
          `undefined` が「変更しない」を意味する現在の部分更新 semantics と、
          「この実行には provider 由来の失敗が無い」を区別できるか
+      7. **同じ根本で、`failureMetadata` 以外の列も書き換わる。**
+         `PATCH /api/jobs/:id` は stale / 適用不可の `status` だけを落として
+         （`routes/jobs.ts` の `delete jobUpdate.status`）、payload の残り —— `completedAt` 等 ——
+         はそのまま永続化する。遅れて届いた重複 result により、
+         **`success` のまま所要時間だけが書き換わった行**が残りうる（独立レビュー指摘）。
+         implement-timeout-sensor の C はこのため「budget を超える成功」を標本から外しているが、
+         書き換え後の値が budget 内なら区別できない。**status 以外の列に対する
+         stale result の扱いも本項目の対象とする**
 
       **新しい metadata subsystem は作らない**（CEO 指示・2026-09-21）。
       既存の Job update 機構を正す方向を優先する。

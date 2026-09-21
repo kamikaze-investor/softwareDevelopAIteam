@@ -107,7 +107,15 @@ function durationSeconds(job: Job): number | undefined {
  *
  * `jobs` 行を調べた結果、**実行を identify できる列が 1 つも無い**:
  * 試行回数も run id も無く、`failure_metadata` 自体に時刻も付いていない。
- * そして **`failure_metadata` を消す経路が 1 つも存在しない**（全経路を grep して確認）。
+ *
+ * **訂正（2026-09-21・独立レビュー指摘）**: 以前ここに「消す経路は 1 つも存在しない」と
+ * 書いたが**誤り**だった。`failAndPrepareRepair()` は `failure_metadata = ?` へ `null` を
+ * 渡して消す（`sqlite.ts`）。当時の grep が `failure_metadata = NULL` という**字面**しか
+ * 探しておらず、placeholder 経由の null を見落としていた。
+ * **絶対的な主張を狭い grep から書いていた**。
+ *
+ * 正しくは: **消す経路は存在するが、一般の terminal update / requeue 経路は消さない。**
+ * したがって「印が今回の実行のものだ」と言えない状態は依然として起こりうる。
  *
  * 一方で Worker の terminal update は、provider 由来でない失敗のとき
  * `failureMetadata: undefined` を送る。`JSON.stringify` が `undefined` を落とし、
@@ -412,10 +420,26 @@ export function evaluateImplementTimeoutSensors(
   //   上の議論は「閾値より下の標本を足す」という**今回の拡大に固有の条件**に依存している。
   //   budget を縮める変更では旧成功が閾値を上回りうるので、前提ごと崩れる。
   //   **そのときは C にも epoch を掛けるかどうかを測り直すこと**
+  // **現在の budget より長い「成功」は、その budget の下では起こり得ない。**
+  //
+  // 遅れて届いた重複 result が標本を汚しうる: `PATCH /api/jobs/:id` は stale な `status` だけを
+  // 落として payload の残り（`completedAt` 等）はそのまま永続化するので、`success` のまま
+  // 所要時間だけが書き換わった行が残りうる（独立レビュー指摘）。
+  // p95 が偽って閾値を越えると、C の重複排除キーを本物の証拠より先に使い切ってしまう。
+  //
+  // budget を超える成功を落とせば、**少なくとも「あり得ない値で閾値を越える」ことは防げる**。
+  // **完全には塞がらない**: 書き換え後の値が budget 内なら区別できない。残るずれの根本は
+  // Roadmap `job-failure-metadata-outlives-its-run`（stale result が status 以外の列を
+  // 書き換える件も含む）で扱う。
+  //
+  // 今回の 300s -> 900s のような**拡大**では、旧 policy の成功（すべて 300s 未満）は
+  // この条件で落ちない。budget を**縮める**変更では正当な旧標本も落ちるが、
+  // それは標本が減る方向＝発火しにくい方向である。
   const successSeconds = window
     .filter((job) => job.status === 'success')
     .map(durationSeconds)
     .filter((seconds): seconds is number => seconds !== undefined)
+    .filter((seconds) => seconds <= timeoutSeconds)
   if (successSeconds.length >= t.P95_MIN_SAMPLES) {
     const p95 = percentile(successSeconds, 0.95)
     if (p95 !== undefined && p95 >= timeoutSeconds * t.P95_RATIO_OF_TIMEOUT) {

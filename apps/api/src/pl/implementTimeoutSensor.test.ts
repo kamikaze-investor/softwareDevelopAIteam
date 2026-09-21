@@ -21,7 +21,8 @@ import {
  * A（budget に殺されて生成物を失った Job）と B（その率）は **fail-closed で止めてある**。
  * どちらも `failureMetadata.kind === 'provider_timeout'` を根拠にするが、その印が
  * **いま見ている実行のものだと `jobs` 行からは確認できない**ためである
- * （`failure_metadata` を消す経路が存在せず、実行を identify できる列も無い）。
+ * （実行を identify できる列が無く、一般の terminal update / requeue 経路は
+ * `failure_metadata` を消さない。消す経路自体は `failAndPrepareRepair()` に存在する）。
  *
  * 信じてしまうと、timeout していない失敗で A/B が誤発火し、budget ごとの重複排除キーを
  * 本物の証拠より先に使い切って、**センサー自身の再評価能力を壊す**。
@@ -142,6 +143,25 @@ describe('C（stale metadata に依存しない条件）', () => {
     const of = (jobs: Job[]) => evaluateImplementTimeoutSensors(jobs, T, EPOCH)
       .filter((f) => f.sensorId === C_SENSOR).length
     expect(of(marked)).toBe(of(clean))
+  })
+
+  // **budget より長い「成功」は、その budget の下では起こり得ない。**
+  // 遅れて届いた重複 result は stale な status だけ落として `completedAt` を書き換えるため、
+  // success のまま所要時間だけ壊れた行が残りうる（独立レビュー指摘）。
+  // それで p95 が偽って閾値を越えると、C の重複排除キーを先に使い切ってしまう。
+  it('budget を超える所要時間の成功は標本に入れない', () => {
+    // 25 件すべて budget 超え（900s 超）。これだけなら標本が 0 件になり判定しない。
+    const impossible = Array.from({ length: 25 }, () => job({ seconds: 1_200 }))
+    expect(evaluateImplementTimeoutSensors(impossible, T, EPOCH)
+      .filter((f) => f.sensorId === C_SENSOR)).toHaveLength(0)
+  })
+
+  it('壊れた 1 件が混ざっても、残りの標本で正しく判定する', () => {
+    const sane = Array.from({ length: 25 }, () => job({ seconds: 200 }))
+    const corrupted = job({ seconds: 100_000 })
+    // 200s は閾値（540s）未満なので、壊れた 1 件を落とせば発火しない。
+    expect(evaluateImplementTimeoutSensors([...sane, corrupted], T, EPOCH)
+      .filter((f) => f.sensorId === C_SENSOR)).toHaveLength(0)
   })
 
   it('直近 WINDOW 件だけを母集団にする', () => {
