@@ -415,9 +415,10 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     expect(skipped(storage, implementJob, review)).toContain('live job exists')
   })
 
-  // **allowedPaths の prefix を正規化して広げない。**
-  // `apps/api/src/pl/..` を `apps/api/src` へ解決すると、保存値より緩い範囲を許してしまう。
-  it('allowedPaths に .. が含まれていても範囲を広げない', () => {
+  // **使えない範囲はその時点で落とす。** `..` を含む prefix は File Change Guard の
+  // 前方一致にどのファイルも一致させないので、repair を作っても必ず止まる。
+  // 範囲判定まで持ち越さず、範囲そのものを不成立として扱う。
+  it('allowedPaths に .. が含まれていれば範囲として使わない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage, {
       allowedPaths: ['apps/api/src/pl/..'],
@@ -425,7 +426,41 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     const review = storeReview(storage, ids, reviewJob.id, {
       findings: [{ severity: 'medium', file: 'apps/api/src/routes/jobs.ts', message: 'outside' }],
     } as Partial<ReviewResult>)
-    expect(skipped(storage, implementJob, review)).toContain('outside allowedPaths')
+    expect(skipped(storage, implementJob, review)).toContain('unusable scope')
+  })
+
+  // **中身が空・空白・絶対パスの範囲も同じ。** task route は `z.array(z.string())` としか
+  // 検証しないので保存されうる。`file` を持たない finding だけだと範囲判定が何も弾かず、
+  // ここが無いと「範囲が無い Task」に repair を作ってしまう（独立レビュー指摘）。
+  for (const [label, scope] of [
+    ['空文字', ''],
+    ['空白のみ', '   '],
+    ['前後に空白', ' apps/api/src/pl '],
+    ['posix 絶対パス', '/srv/ai-team/apps/api/src/pl'],
+    ['Windows 絶対パス', 'C:/repo/apps/api/src/pl'],
+  ] as const) {
+    it(`allowedPaths が ${label} なら、file の無い finding だけでも通さない`, () => {
+      const storage = createSQLiteStorage(':memory:')
+      const ids = seed(storage, { allowedPaths: [scope] })
+      const implementJob = createResumedImplementJob(storage, ids)
+      const reviewJob = createReviewJob(storage, ids, implementJob.id)
+      const review = storeReview(storage, ids, reviewJob.id, {
+        findings: [{ severity: 'medium', message: 'no file attached' }],
+      } as Partial<ReviewResult>)
+      expect(skipped(storage, implementJob, review)).toContain('unusable scope')
+    })
+  }
+
+  // 使える範囲が 1 つでも欠けていれば通さない（一部だけ拾って進めない）。
+  it('使える範囲と使えない範囲が混ざっていれば通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage, {
+      allowedPaths: ['apps/api/src/pl', '/srv/elsewhere'],
+    })
+    const review = storeReview(storage, ids, reviewJob.id, {
+      findings: [{ severity: 'medium', file: 'apps/api/src/pl/executionLoop.ts', message: 'in scope' }],
+    } as Partial<ReviewResult>)
+    expect(skipped(storage, implementJob, review)).toContain('unusable scope')
   })
 
   it('live な Job があれば通さない', () => {

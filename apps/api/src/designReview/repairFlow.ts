@@ -257,20 +257,38 @@ export async function runRepairFlow(
  * `apps/api/src/pl/` で始まるのに、解決先は範囲外である。絶対パスや `..` で始まる形も
  * ここで落とす。判定できない形は**内側と見なさない**（fail-closed）。
  */
+/**
+ * その prefix が **修正範囲として実際に使えるか**。
+ *
+ * `allowedPaths` は task route では `z.array(z.string())` としか検証されないため、
+ * `''` / `'   '` / `/srv/app` / `C:/repo` / `a/../b` が保存されうる。Worker の
+ * File Change Guard は正規化せず前方一致で比べるので、これらは**どの変更ファイルにも
+ * 一致しない**。そのまま repair を作れば guard で必ず止まる無駄な Job になる。
+ *
+ * ここで落としておくことで、下の `isInsideAllowedPaths()` が受け取る prefix は
+ * 常に相対・`..` 無しになり、正規化の有無で範囲が変わる余地そのものが無くなる。
+ */
+function isUsableScopePrefix(prefix: string): boolean {
+  const candidate = prefix.split('\\').join('/').replace(/\/+$/, '')
+  if (candidate.length === 0) return false
+  if (candidate !== candidate.trim()) return false
+  if (candidate.startsWith('/')) return false
+  if (/^[A-Za-z]:/.test(candidate)) return false
+  if (candidate.split('/').includes('..')) return false
+  return true
+}
+
 function isInsideAllowedPaths(file: string, allowed: readonly string[]): boolean {
   const normalized = posix.normalize(file.split('\\').join('/'))
   if (normalized.startsWith('/') || normalized.startsWith('..')) return false
 
   return allowed.some((prefix) => {
-    // **prefix は正規化しない。** 正規化すると `apps/api/src/pl/..` が `apps/api/src` へ
-    // **広がり**、保存された allowedPaths より緩い範囲を許してしまう（独立レビュー指摘）。
-    // File Change Guard は保存値をほぼそのまま比べるので、ここもそれより緩くしない。
+    // **file 側だけ正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
+    // 範囲内に見えるが、解決すると外を指す。
     //
-    // `..` や絶対パスを含む prefix を別途弾く必要はない。file 側は既に正規化済みで、
-    // 先頭が `/` や `..` のものはこの関数の入口で落としてある。正規化された path は
-    // 途中に `..` を持たないので、そうした prefix はそもそも前方一致しえない。
-    // **以前はここに 3 つの検査を置いていたが、どれも結果を変えない死んだコードで、
-    // 「fail-closed にしている」というコメントだけが実態を越えていた**（mutation で判明）。
+    // prefix 側は `isUsableScopePrefix()` で相対・`..` 無しに限ってあるので、
+    // ここで正規化しても結果は変わらない。**「正規化しないから安全」ではなく、
+    // 「使えない prefix を先に落としてあるから安全」である**（独立レビュー指摘）。
     // 末尾スラッシュだけは落とす。落とさないと範囲内の finding を取りこぼす。
     const candidate = prefix.split('\\').join('/').replace(/\/+$/, '')
     return normalized === candidate || normalized.startsWith(`${candidate}/`)
@@ -368,8 +386,18 @@ function repairableBlockedReviewRequest(
 
   // 5. 指摘が **この Task の allowedPaths 内**で直せること。
   //    範囲外のファイルを指す指摘が 1 件でもあれば、repair は scope を越える。
+  //
+  //    **まず範囲そのものが使えるかを見る。** task route の `allowedPaths` は
+  //    `z.array(z.string())` としか検証されないので、`''` / `'   '` / 絶対パスが保存されうる
+  //    （roadmap adoption 経路だけが `.min(1)` を課している）。Worker の File Change Guard は
+  //    `file === prefix || file.startsWith(prefix + '/')` で比べ、trim もしないので、
+  //    そうした prefix は**どの変更ファイルにも一致しない** —— repair を作っても必ず guard で
+  //    止まる。「範囲が壊れている」は「どこでも直してよい」ではないので落とす（独立レビュー指摘）。
   const allowed = task.allowedPaths ?? []
   if (allowed.length === 0) return { ok: false, reason: 'task has no allowedPaths' }
+  if (!allowed.every(isUsableScopePrefix)) {
+    return { ok: false, reason: 'task allowedPaths contains an unusable scope' }
+  }
   // **前方一致の前に正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
   // `apps/api/src/pl/` で始まるが、解決すると範囲外を指す（独立レビュー指摘）。
   const outside = stored.findings
