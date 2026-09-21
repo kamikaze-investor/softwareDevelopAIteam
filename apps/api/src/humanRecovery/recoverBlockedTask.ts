@@ -388,7 +388,11 @@ export function recoverBlockedTask(
       `blocked -> pending by human recovery (${generationTag(generation)}): ${input.reason}`,
   })
   if (!committed.ok) {
-    return { ok: false, code: 'RECOVERY_FAILED', reason: committed.reason }
+    // **storage が分類済みなら、その code をそのまま上げる。**
+    // transaction 内でしか気付けなかった承認待ちを `RECOVERY_FAILED` へ潰すと、
+    // 同じ原因なのに race の有無で API の code が変わる（独立レビュー round 7 指摘）。
+    // `reason` 文字列を突き合わせて分類し直さない —— 文面を変えた瞬間に壊れる。
+    return { ok: false, code: committed.code ?? 'RECOVERY_FAILED', reason: committed.reason }
   }
 
   return {

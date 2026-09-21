@@ -504,7 +504,7 @@ describe('人の判断が既に待っているなら、2本目の駆動を始め
     expect(storage.tasks.findById(taskId)?.status).toBe('pending')
   })
 
-  it('**確定の直前に承認待ちが作られていたら commit しない**', () => {
+  it('**確定の直前に承認待ちが作られていたら commit せず、typed code を返す**', () => {
     // precheck を通さず storage 層を直接叩く —— precheck 通過**後**に Approval が
     // 作られた状態と、transaction から見た姿は同じである。
     const { storage, taskId } = seed()
@@ -512,9 +512,40 @@ describe('人の判断が既に待っているなら、2本目の駆動を始め
 
     const committed = storage.tasks.recoverFromBlocked({ taskId, detail: 'racing' })
 
-    expect(committed.ok).toBe(false)
+    expect(committed).toMatchObject({ ok: false, code: 'APPROVAL_WAITING' })
     expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
     expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
+  })
+
+  it('**race で気付いても code は precheck と同じ。RECOVERY_FAILED へ潰さない**', () => {
+    // precheck は「承認待ちなし」と見て通り、transaction 内で初めて気付く ——
+    // まさに race の形を作る。`findByTaskId` だけを空に見せて precheck を通し、
+    // 行そのものは DB に在るので transaction 側は見つける。
+    const { storage, taskId } = seed()
+    seedApproval(storage, taskId)
+    const realFindByTaskId = storage.approvalRequests.findByTaskId.bind(storage.approvalRequests)
+    storage.approvalRequests.findByTaskId = (() => []) as typeof storage.approvalRequests.findByTaskId
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    storage.approvalRequests.findByTaskId = realFindByTaskId
+    // **同じ原因なので同じ code。** race の有無で API の意味が変わってはならない。
+    expect(result).toMatchObject({ ok: false, code: 'APPROVAL_WAITING' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    expect(latestHumanRecoveryId(storage, taskId)).toBeUndefined()
+  })
+
+  it('承認待ち以外の storage 失敗は従来どおり RECOVERY_FAILED のまま', () => {
+    // 新しい code を増やしたのは承認待ちだけ。他を巻き込んで分類し直していない。
+    const { storage, taskId } = seed()
+    const original = storage.tasks.recoverFromBlocked.bind(storage.tasks)
+    storage.tasks.recoverFromBlocked = (() =>
+      ({ ok: false, reason: 'Task could not be updated' })) as typeof storage.tasks.recoverFromBlocked
+
+    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+
+    storage.tasks.recoverFromBlocked = original
+    expect(result).toMatchObject({ ok: false, code: 'RECOVERY_FAILED' })
   })
 })
 

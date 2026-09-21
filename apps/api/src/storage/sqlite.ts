@@ -845,7 +845,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined,
           now(),
         )) {
-          return { ok: false as const, reason: APPROVAL_WAITING_REASON }
+          // **precheck と同じ code を返す。** ここでしか気付けなかった（= race だった）
+          // というだけで machine-readable code が変わってはならない
+          // （独立レビュー round 7 指摘）。
+          return {
+            ok: false as const,
+            code: 'APPROVAL_WAITING' as const,
+            reason: APPROVAL_WAITING_REASON,
+          }
         }
 
         const updated = tasks.update(taskId, { status: 'pending' })
