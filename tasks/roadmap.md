@@ -8406,6 +8406,30 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **責務**: Blocked を直接解除することではなく、
       「なぜ止まったか」を機械的事実から分類し、**既存の正しいレーンへ渡す**ところまで。
 
+      **production evidence（2026-09-21・本項目の未網羅ケース。state は `done` のまま）**:
+
+      Task `c3849205` で、Independent Review が `changes_requested` を返した Job
+      （`026fe5a3`）を triage が `cause=unknown / layer=unknown / confidence=low`
+      「no recoverable actions」と分類し、CEO escalation で終端した。
+      **`blockedTriage` は `readLatestDesignReview()`（= `design_review_runs`）しか読まず、
+      `reviewResults`（Independent Review の verdict）を参照しない**ため、
+      「レビューが修正を要求した」という事実が入力に存在しなかった。
+
+      **ただしこれは当時の停止の原因ではなかった。** 真の原因は canonical path 側にあり、
+      `prepareRepairFlow()` が `task.status === 'blocked'` で無条件 skip していたため、
+      review PATCH の Stage 2 分岐が repair も escalate も作らずに降りていた。
+      そちらを直した（`repair-after-resume-review`）結果、
+      **review = `changes_requested` はその場で repair を queue するようになり、**
+      PL triage を経由せずに復旧が進む。PL 側の escalation は audit 行を足すだけで、
+      queue 済みの design review run を取り消さない（コードで確認済み）。
+
+      したがって **triage への `reviewResults` 追加は、この復旧には不要**であり、
+      当該 PR には混ぜていない（CEO 指示・2026-09-21）。
+      残っているのは「正常なレビュー結果が `unknown` と分類される」という**分類精度の問題**だけで、
+      復旧を妨げないため本項目の state は `done` のままにしてある。
+      精度を上げる必要が出たときは、**新しいレーンを作らず**既存 `auto_recovery` /
+      repair レーンへ接続すること。
+
       | lane | 条件（すべて機械的事実） | 今日の到達先 |
       |---|---|---|
       | `auto_recovery` | 既存の bounded recovery が実在する（provider timeout + workspace 未変更 / 未使用 attempt が残る Design Review / resume 可能な blocked Job）| 既存 Diagnose → Gate → 既存操作 |

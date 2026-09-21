@@ -248,13 +248,130 @@ export async function runRepairFlow(
  * design_review_run を queued として永続化する。これによりcrashしても
  * 「Jobはfailed / runは無い」というlost-trigger windowが生じない。
  */
+/** `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。 */
+type BlockedAdmission = { ok: true } | { ok: false, reason: string }
+
+/**
+ * **blocked な Task に repair を作ってよい唯一のケース**かを、既存レコードだけで照合する。
+ *
+ * ## なぜ必要か
+ *
+ * `resumeBlockedTask()` は Job を 1 件作るだけで Task status を変えない。よって resume で
+ * 再開した実装が成功し、Independent Review が修正を要求しても、Task は `blocked` のままである。
+ * 従来の無条件 skip では、その修正要求が **repair にも escalate にもならず消えていた**。
+ *
+ * ## 何を根拠にするか
+ *
+ * **呼び出し元の申告を信じない。** 「これは resume 由来だ」「repair できるはずだ」といった
+ * caller / PL の主張は一切使わず、すべて保存済みレコードから機械的に確かめる。
+ * 1 つでも確かめられなければ従来どおり skip する（fail-closed）。
+ */
+function repairableBlockedReviewRequest(
+  storage: IStorage,
+  task: Task,
+  implementJob: Job,
+  review: ReviewResult | undefined,
+): BlockedAdmission {
+  // 1. Independent Review が修正を要求していること。
+  if (review === undefined) return { ok: false, reason: 'no review result' }
+  if (review.status !== 'changes_requested') {
+    return { ok: false, reason: `review status is ${review.status}` }
+  }
+
+  // 2. その review が **この implement Job に紐づく** review Job のものであること。
+  //    review.jobId は review Job を指す。その Job の workflowStepKey が
+  //    `implement:<この Job>:review` でなければ、別の実行に対する review である。
+  if (review.taskId !== task.id) return { ok: false, reason: 'review belongs to another task' }
+  const reviewJob = storage.jobs.findById(review.jobId)
+  if (!reviewJob) return { ok: false, reason: 'review job not found' }
+  if (reviewJob.workflowStepKey !== `implement:${implementJob.id}:review`) {
+    return { ok: false, reason: 'review is not associated with this implementation job' }
+  }
+
+  // 3. その実装が**成功している**こと。失敗した実装の修正要求はここでは扱わない。
+  if (implementJob.status !== 'success') {
+    return { ok: false, reason: `implementation job is ${implementJob.status}` }
+  }
+
+  // 4. その実装が **canonical な resume successor** であること。
+  //    `resume:<元Job>:<n>` は `resumeBlockedTask()` だけが付ける規約で、
+  //    これが blocked のまま成功しうる唯一の正規経路である。
+  if (!/^resume:[^:]+:\d+$/.test(implementJob.workflowStepKey ?? '')) {
+    return { ok: false, reason: 'implementation job is not a canonical resume successor' }
+  }
+
+  // 5. 指摘が **この Task の allowedPaths 内**で直せること。
+  //    範囲外のファイルを指す指摘が 1 件でもあれば、repair は scope を越える。
+  const allowed = task.allowedPaths ?? []
+  if (allowed.length === 0) return { ok: false, reason: 'task has no allowedPaths' }
+  const outside = review.findings
+    .map((finding) => finding.file)
+    .filter((file): file is string => typeof file === 'string' && file.length > 0)
+    .filter((file) => !allowed.some((prefix) => file === prefix || file.startsWith(`${prefix}/`)))
+  if (outside.length > 0) {
+    return { ok: false, reason: `review findings point outside allowedPaths (${outside[0]})` }
+  }
+
+  // 6. **通常 repair で扱ってはいけない指摘が混じっていない**こと。
+  //    `critical` は Safety / Authority 相当の判断を求めうるので、既存の escalation へ残す。
+  if (review.findings.some((finding) => finding.severity === 'critical')) {
+    return { ok: false, reason: 'review contains a critical finding' }
+  }
+
+  // 7. **Design Review が CONFLICT / BLOCK で止まっていない**こと。
+  //    その場合の復旧は別責務（`task-design-review-conflict-has-no-recovery-route`）で、
+  //    ここで repair を積むと本来の経路を踏み潰す。
+  const latestRun = storage.designReviewRuns.findLatestByTaskId(task.id)
+  const latestDecision = latestRun?.resultJson === undefined
+    ? undefined
+    : safeDesignReviewDecision(latestRun.resultJson)
+  if (latestDecision === 'CONFLICT' || latestDecision === 'BLOCK') {
+    return { ok: false, reason: `latest design review is ${latestDecision}` }
+  }
+
+  // 8. **競合する live Job が無い**こと。動いている Job の上へ repair を積まない。
+  const live = storage.jobs.findByTaskId(task.id)
+    .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
+  if (live.length > 0) {
+    return { ok: false, reason: `a live job exists for this task (${live[0].status})` }
+  }
+
+  return { ok: true }
+}
+
+/** `resultJson` から decision を読む。壊れていれば undefined（判断に使わない）。 */
+function safeDesignReviewDecision(resultJson: string): string | undefined {
+  try {
+    const parsed = JSON.parse(resultJson) as { decision?: unknown } | null
+    return typeof parsed?.decision === 'string' ? parsed.decision : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): RepairPreparation {
   const { failedJob, review } = input
 
   const task = storage.tasks.findById(failedJob.taskId)
   if (!task) return { action: 'skip', reason: 'task not found' }
-  if (task.status === 'blocked' || task.status === 'done') {
-    return { action: 'skip', reason: `task is ${task.status}` }
+
+  // **`done` は従来どおり無条件 skip。** 完了した Task へ repair を作らない。
+  if (task.status === 'done') return { action: 'skip', reason: 'task is done' }
+
+  // **`blocked` は原則 skip のまま。例外は 1 つだけである。**
+  //
+  // 2026-09-21 production: blocked な Task を既存 resume route で再開し、implement が成功し、
+  // その成果へ Independent Review が `changes_requested` を返した。ところがここが
+  // `task.status === 'blocked'` で降りるため、**repair も escalate も作られず**、
+  // 修正要求が誰にも渡らないまま停止した（`c3849205` / review `026fe5a3`）。
+  // `resumeBlockedTask()` は Job を作るだけで Task status を変えない仕様なので、
+  // resume 経由の成果は**必ず**この形になる。つまり repair route が自分で閉じていた。
+  //
+  // **「blocked なら repair してよい」には広げない。** 下の `repairableBlockedReviewRequest()`
+  // が既存レコードだけで全条件を機械照合し、1 つでも欠ければ従来どおり skip する。
+  if (task.status === 'blocked') {
+    const admitted = repairableBlockedReviewRequest(storage, task, failedJob, review)
+    if (!admitted.ok) return { action: 'skip', reason: `task is blocked (${admitted.reason})` }
   }
 
   const priorJobs = storage.jobs.findByTaskId(task.id)
