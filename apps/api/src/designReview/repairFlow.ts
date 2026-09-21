@@ -265,11 +265,14 @@ function isInsideAllowedPaths(file: string, allowed: readonly string[]): boolean
     // **prefix は正規化しない。** 正規化すると `apps/api/src/pl/..` が `apps/api/src` へ
     // **広がり**、保存された allowedPaths より緩い範囲を許してしまう（独立レビュー指摘）。
     // File Change Guard は保存値をほぼそのまま比べるので、ここもそれより緩くしない。
-    // `..` や絶対パスを含む prefix は**何にも一致させない**（fail-closed）。
+    //
+    // `..` や絶対パスを含む prefix を別途弾く必要はない。file 側は既に正規化済みで、
+    // 先頭が `/` や `..` のものはこの関数の入口で落としてある。正規化された path は
+    // 途中に `..` を持たないので、そうした prefix はそもそも前方一致しえない。
+    // **以前はここに 3 つの検査を置いていたが、どれも結果を変えない死んだコードで、
+    // 「fail-closed にしている」というコメントだけが実態を越えていた**（mutation で判明）。
+    // 末尾スラッシュだけは落とす。落とさないと範囲内の finding を取りこぼす。
     const candidate = prefix.split('\\').join('/').replace(/\/+$/, '')
-    if (candidate.length === 0) return false
-    if (candidate.startsWith('/')) return false
-    if (candidate.split('/').includes('..')) return false
     return normalized === candidate || normalized.startsWith(`${candidate}/`)
   })
 }
@@ -417,14 +420,20 @@ function repairableBlockedReviewRequest(
 
   // 8. **競合する live Job が無い**こと。動いている Job の上へ repair を積まない。
   //
-  //    ただし **この resume の元 Job は除く。** `resumeBlockedTask()` は latest Job が
-  //    `blocked` のときも受理し、**元の行を blocked のまま残して** `resume:<元Job>:1` を作る
-  //    （`sqlite.ts`）。除外しないと、その正規経路で再開した成果が必ずここで弾かれる
-  //    —— 直そうとしている閉じ込めを別の形で作り直すことになる（独立レビュー指摘）。
-  //    除外するのは stepKey が名指しする **1 件だけ**で、他の live Job は従来どおり拒否する。
+  //    ただし **この resume の元 Job が `blocked` のまま残っている場合だけ**は除く。
+  //    `resumeBlockedTask()` は latest Job が `blocked` のときも受理し、**元の行を blocked の
+  //    まま残して** `resume:<元Job>:1` を作る（`sqlite.ts`）。除外しないと、その正規経路で
+  //    再開した成果が必ずここで弾かれる —— 直そうとしている閉じ込めを別の形で作り直すことになる。
+  //
+  //    **除外は `blocked` に限る。** 元 Job は後から `queued` へ戻りうる
+  //    （`jobResultApplicationPolicy.ts` の `blocked: ['queued']`、`routes/jobs.ts` の
+  //    implement requeue 経路）。stepKey が名指しているというだけで状態を問わず外すと、
+  //    **本当に動いている Job の上へ repair を積む**（独立レビュー指摘）。
+  //    resume が残した `blocked` という状態そのものが除外の根拠であって、名前ではない。
   const resumeSourceJobId = implementJob.workflowStepKey?.match(/^resume:([^:]+):\d+$/)?.[1]
   const live = storage.jobs.findByTaskId(task.id)
-    .filter((job) => job.id !== implementJob.id && job.id !== resumeSourceJobId)
+    .filter((job) => job.id !== implementJob.id)
+    .filter((job) => !(job.id === resumeSourceJobId && job.status === 'blocked'))
     .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
   if (live.length > 0) {
     return { ok: false, reason: `a live job exists for this task (${live[0].status})` }

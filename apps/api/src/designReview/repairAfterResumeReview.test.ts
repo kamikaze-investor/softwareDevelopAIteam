@@ -159,6 +159,21 @@ describe('blocked Task への repair — 通るケース', () => {
     expect(result.action).toBe('queue')
   })
 
+  // 末尾スラッシュを落とさないと `apps/api/src/pl/` が `apps/api/src/pl//` としか
+  // 一致せず、**範囲内の finding を範囲外と誤判定する**。
+  it('allowedPaths の末尾スラッシュがあっても範囲内と見なす', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage, {
+      allowedPaths: ['apps/api/src/pl/'],
+    })
+    const review = storeReview(storage, ids, reviewJob.id, {
+      findings: [{ severity: 'medium', file: 'apps/api/src/pl/executionLoop.ts', message: 'in scope' }],
+    } as Partial<ReviewResult>)
+
+    const result = prepareRepairFlow(storage, { failedJob: implementJob, review })
+    expect(result.action).toBe('queue')
+  })
+
   it('resume で成功した実装への changes_requested は repair を作る', () => {
     const storage = createSQLiteStorage(':memory:')
     const { implementJob, review } = productionShape(storage)
@@ -257,6 +272,20 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     expect(skipped(storage, implementJob, review)).toContain('not a canonical resume successor')
   })
 
+  // **`allowedPaths` が空なら通さない。** 範囲外を指す finding が 1 件も無くても同じで、
+  // 「直してよい範囲が無い」は「どこでも直してよい」ではない。
+  // `file` を持たない finding だけの場合、範囲判定は何も弾かないのでここだけが効く。
+  it('allowedPaths が空なら、file の無い finding だけでも通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage, { allowedPaths: [] })
+    const implementJob = createResumedImplementJob(storage, ids)
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id, {
+      findings: [{ severity: 'medium', message: 'no file attached' }],
+    } as Partial<ReviewResult>)
+    expect(skipped(storage, implementJob, review)).toContain('no allowedPaths')
+  })
+
   it('allowedPaths 外を指す finding があれば通さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage)
@@ -338,6 +367,38 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     } as Partial<ReviewResult>)
     expect(skipped(storage, implementJob, review)).toContain('outside allowedPaths')
   })
+
+  // **元 Job を外す根拠は `blocked` という状態であって、名前ではない。**
+  // 元 Job は後から `queued` / `running` へ戻りうる（`blocked: ['queued']` の遷移が許され、
+  // implement requeue 経路が実在する）。そのとき除外を続けると、本当に動いている Job の上へ
+  // repair を積んでしまう（独立レビュー指摘）。
+  for (const liveStatus of ['queued', 'running'] as const) {
+    it(`resume の元 Job が ${liveStatus} へ戻っていれば通さない`, () => {
+      const storage = createSQLiteStorage(':memory:')
+      const ids = seed(storage)
+      const sourceJob = storage.jobs.create({
+        taskId: ids.taskId,
+        projectId: ids.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'noop' },
+        aiCliMode: 'implement',
+        aiCliProvider: 'claude_code',
+      } as never)
+      storage.jobs.update(sourceJob.id, { status: 'blocked' } as never)
+
+      const implementJob = createResumedImplementJob(storage, ids, {
+        workflowStepKey: `resume:${sourceJob.id}:1`,
+      })
+      const reviewJob = createReviewJob(storage, ids, implementJob.id)
+      const review = storeReview(storage, ids, reviewJob.id)
+
+      // 元 Job が live へ戻る。
+      storage.jobs.update(sourceJob.id, { status: liveStatus } as never)
+
+      expect(skipped(storage, implementJob, review)).toContain('live job exists')
+    })
+  }
 
   // 元 Job を外すのは **stepKey が名指しする 1 件だけ**。無関係な blocked は従来どおり拒む。
   it('resume の元ではない blocked Job は従来どおり通さない', () => {
