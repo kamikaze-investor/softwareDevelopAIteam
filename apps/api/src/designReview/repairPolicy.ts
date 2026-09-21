@@ -38,6 +38,11 @@ export interface RepairFailureFacts {
 }
 
 export interface PriorRepairJob {
+  /**
+   * Job id。**lineage を辿るために必要**である。`repair:<sourceJobId>:1` の
+   * sourceJobId から親 Job を引くので、id 無しでは chain を再構成できない。
+   */
+  id: string
   workflowStepKey?: string
   status: string
   facts: RepairFailureFacts
@@ -56,7 +61,20 @@ export type RepairDecision =
        */
       requireDifferentApproach: boolean
     }
-  | { action: 'escalate'; reason: string; signature: string }
+  | {
+      action: 'escalate'
+      reason: string
+      signature: string
+      /**
+       * escalate の理由を**構造化して**持つ。呼び出し側が reason 文字列を
+       * 部分一致で判定すると、文言を変えた瞬間に黙って壊れるためである。
+       *
+       * - `attempt_limit`: この chain の repair 段数が上限に達した
+       * - `lineage_undeterminable`: chain を辿れなかった（fail-closed）
+       * - `no_actionable_information`: 同じ失敗の繰り返しで手がかりが無い
+       */
+      code: 'attempt_limit' | 'lineage_undeterminable' | 'no_actionable_information'
+    }
 
 /**
  * 失敗の同一性を判定するための署名。
@@ -98,6 +116,106 @@ function isRepairJob(job: PriorRepairJob): boolean {
   return job.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true
 }
 
+/** `repair:<sourceJobId>:1`。末尾は常に `:1`（`decideRepairAction` が付ける規約）。 */
+const REPAIR_EDGE = /^repair:([^:]+):1$/
+/** `resume:<sourceJobId>:<n>`（`resumeBlockedTask()` の規約）。 */
+const RESUME_EDGE = /^resume:([^:]+):\d+$/
+
+/**
+ * lineage を辿る上限。実データの chain は高々 `MAX_REPAIR_ATTEMPTS` 段だが、
+ * 壊れたデータで無限に歩かないための保険であり、**上限に達したら fail-closed** にする。
+ */
+const MAX_LINEAGE_WALK = 64
+
+export type RepairLineage =
+  | { ok: true, depth: number, chainJobIds: readonly string[] }
+  | { ok: false, reason: string }
+
+/**
+ * **repair budget を「Task 全体の repair 数」ではなく「この chain の repair 段数」で数える。**
+ *
+ * ## なぜ変えるか（production 実測・2026-09-21）
+ *
+ * Task `c3849205` は初回 implement からの chain で repair を3回使い切ったあと、
+ * 別の implementation が成功した。その成果へのレビュー指摘を repair へ渡そうとすると、
+ * **すでに使い切った Task 全体のカウント**に当たって必ず escalate していた。
+ * 数えるべきは「いま直そうとしている実装が、何段目の repair か」である。
+ *
+ * ## chain の境界
+ *
+ * 境界は **recovery epoch だけ**である。`resume:` は境界にしない ——
+ * `resume_task` は PL が in-process で実行できる（`executionLoop.ts`）ので、
+ * `resume:` を境界にすると **PL が repair budget を自力で更新できてしまう**
+ * （repair 上限 → blocked → resume → budget reset の無限ループ）。
+ * よって `resume:` は**跨いで辿り、repair 段数には数えない**。
+ *
+ * epoch は `epochCoveredJobIds` として呼び出し側が渡す。その実体は
+ * **consume 済みの ApprovalRequest**（`repairRecoveryEpoch.ts`）であり、
+ * PL の in-process 経路からは作れない。
+ *
+ * ## 確定できないときは escalate
+ *
+ * source Job が見つからない / 別 Task / stepKey が壊れている / 循環している /
+ * 深すぎる、のいずれでも**段数を推測しない**。`ok: false` を返し、呼び出し側は escalate する。
+ */
+export function computeRepairLineage(
+  startJobId: string,
+  priorJobs: readonly PriorRepairJob[],
+  epochCoveredJobIds: ReadonlySet<string>,
+): RepairLineage {
+  const byId = new Map(priorJobs.map((job) => [job.id, job]))
+  const chainJobIds: string[] = []
+  const seen = new Set<string>()
+  let currentId = startJobId
+
+  for (let hop = 0; hop < MAX_LINEAGE_WALK; hop++) {
+    // **epoch は先に見る。** epoch に覆われた Job はそこが chain の根である。
+    if (epochCoveredJobIds.has(currentId)) {
+      return { ok: true, depth: chainJobIds.filter((id) => isRepairEdge(byId.get(id))).length, chainJobIds }
+    }
+    if (seen.has(currentId)) {
+      return { ok: false, reason: `cyclic repair lineage at ${currentId}` }
+    }
+    seen.add(currentId)
+
+    const job = byId.get(currentId)
+    if (!job) {
+      // priorJobs はこの Task の Job 全件なので、居ない = 存在しないか別 Task。
+      return { ok: false, reason: `lineage source job ${currentId} is not a job of this task` }
+    }
+    chainJobIds.push(currentId)
+
+    const key = job.workflowStepKey
+    if (key === undefined || key.length === 0) {
+      return { ok: true, depth: countRepairEdges(chainJobIds, byId), chainJobIds }
+    }
+
+    const parentId = REPAIR_EDGE.exec(key)?.[1] ?? RESUME_EDGE.exec(key)?.[1]
+    if (parentId === undefined) {
+      // `repair:` / `resume:` を名乗りながら規約に合わない形は、辿れないので推測しない。
+      if (key.startsWith('repair:') || key.startsWith('resume:')) {
+        return { ok: false, reason: `malformed lineage step key: ${key}` }
+      }
+      // それ以外（`task:<id>:initial-implement` 等）は chain の根。
+      return { ok: true, depth: countRepairEdges(chainJobIds, byId), chainJobIds }
+    }
+    currentId = parentId
+  }
+
+  return { ok: false, reason: `repair lineage is deeper than ${MAX_LINEAGE_WALK}` }
+}
+
+function isRepairEdge(job: PriorRepairJob | undefined): boolean {
+  return REPAIR_EDGE.test(job?.workflowStepKey ?? '')
+}
+
+function countRepairEdges(
+  chainJobIds: readonly string[],
+  byId: ReadonlyMap<string, PriorRepairJob>,
+): number {
+  return chainJobIds.filter((id) => isRepairEdge(byId.get(id))).length
+}
+
 /**
  * 次に取るべき行動を決める。
  *
@@ -111,17 +229,38 @@ export function decideRepairAction(
   sourceJobId: string,
   priorJobs: readonly PriorRepairJob[],
   newFacts: RepairFailureFacts,
+  /**
+   * recovery epoch に覆われた Job id。ここが chain の根になる。
+   * 既定は空集合で、**渡さなければ従来どおり chain の実体だけで数える**。
+   */
+  epochCoveredJobIds: ReadonlySet<string> = new Set<string>(),
 ): RepairDecision {
   const signature = computeFailureSignature(newFacts)
-  const repairJobs = priorJobs.filter(isRepairJob)
 
-  if (repairJobs.length >= MAX_REPAIR_ATTEMPTS) {
+  // **budget は Task 全体ではなく、この chain の段数で数える。**
+  // 辿れなければ段数を推測せず escalate する（fail-closed）。
+  const lineage = computeRepairLineage(sourceJobId, priorJobs, epochCoveredJobIds)
+  if (!lineage.ok) {
+    return {
+      action: 'escalate',
+      reason: `repair lineage could not be determined: ${lineage.reason}`,
+      signature,
+      code: 'lineage_undeterminable',
+    }
+  }
+
+  if (lineage.depth >= MAX_REPAIR_ATTEMPTS) {
     return {
       action: 'escalate',
       reason: `repair attempts reached the limit (${MAX_REPAIR_ATTEMPTS})`,
       signature,
+      code: 'attempt_limit',
     }
   }
+
+  // 「同じ失敗の繰り返し」も **同じ chain の中**で見る。別 chain の失敗は別の話である。
+  const chainIds = new Set(lineage.chainJobIds)
+  const repairJobs = priorJobs.filter((job) => isRepairJob(job) && chainIds.has(job.id))
 
   // 同じ失敗が残っていること自体は「別の合理的な修正アプローチが無い」ことを意味しない。
   // よって即escalateはせず、別アプローチを要求したうえで継続する。
@@ -141,10 +280,11 @@ export function decideRepairAction(
       action: 'escalate',
       reason: 'the same failure repeated and there is no actionable information to try a different approach',
       signature,
+      code: 'no_actionable_information',
     }
   }
 
-  const attempt = repairJobs.length + 1
+  const attempt = lineage.depth + 1
   return {
     action: 'repair',
     attempt,

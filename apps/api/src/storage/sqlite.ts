@@ -756,6 +756,22 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     taskId: string,
     approvalRequestId: string,
   ): { ok: true } | { ok: false; reason: string } {
+    return verifyAndConsumeTaskApproval(taskId, approvalRequestId, 'abort_task')
+  }
+
+  /**
+   * 同じ契約を **action 名を引数に取る形**で一般化したもの。abort 専用実装を
+   * 複製しないために、上の関数はこれへ委譲している。
+   *
+   * 検証するのは毎回同じ4点である: **この Task のものか / この action のものか /
+   * APPROVED か / 失効していないか**。最後に既存の一回限り契約（APPROVED → CONSUMED）を
+   * CAS で使い切る。新しい承認種別も新しい遷移も足していない。
+   */
+  function verifyAndConsumeTaskApproval(
+    taskId: string,
+    approvalRequestId: string,
+    expectedAction: string,
+  ): { ok: true } | { ok: false; reason: string } {
     const row = db.prepare('SELECT * FROM approval_requests WHERE id = ?').get(approvalRequestId) as any
     if (!row) {
       return { ok: false, reason: `approval request ${approvalRequestId} does not exist` }
@@ -768,11 +784,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           `approval request ${approvalRequestId} is bound to task ${request.taskId}, not ${taskId}`,
       }
     }
-    if (request.requestedAction !== 'abort_task') {
+    if (request.requestedAction !== expectedAction) {
       return {
         ok: false,
         reason:
-          `approval request ${approvalRequestId} approved "${request.requestedAction}", not "abort_task"`,
+          `approval request ${approvalRequestId} approved "${request.requestedAction}", not "${expectedAction}"`,
       }
     }
     if (request.status !== 'APPROVED') {
@@ -3055,6 +3071,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   const approvalRequests: IApprovalRequestStorage = {
+    verifyAndConsumeForTaskAction(input) {
+      return verifyAndConsumeTaskApproval(input.taskId, input.approvalRequestId, input.expectedAction)
+    },
     findByTaskId(taskId) {
       const rows = db.prepare(
         'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC'

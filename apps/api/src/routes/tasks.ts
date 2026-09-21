@@ -21,6 +21,7 @@ import {
 import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
 import { verifyExternalCompletion } from '../reconcile/externalCompletion'
+import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
@@ -159,6 +160,11 @@ const AbortTaskBody = z.object({
   approvalRequestId: z.string().min(1),
   reason: z.string().trim().min(1).max(2000),
 }).strict()
+
+const RepairFromStoredReviewBody = z.object({
+  /** selector only. authorization ではない。 */
+  reviewJobId: z.string().min(1),
+})
 
 const ResumeTaskBody = z.object({
   instruction: z.string().trim().min(1).max(2000),
@@ -506,6 +512,39 @@ export async function taskRoutes(
     }
 
     return reply.status(200).send(result)
+  })
+
+  /**
+   * **保存済みレビューを canonical repair 経路へ戻す。**
+   *
+   * body は `reviewJobId` だけで、これは **selector** である。verdict / findings /
+   * provider / status / allowedPaths / attempt 数は受け取らない —— すべて server 側で
+   * 保存済み行から組み直す。authorization は consume 済み ApprovalRequest であって、
+   * この route を呼べたことではない。
+   *
+   * `WORKER_ALLOWLIST` には載せない（split credential mode では Default Deny）。
+   * `HUMAN_ONLY_ROUTES` にも載せない —— この操作の authorization は承認の consume であり、
+   * route に到達できること自体ではないためである。`POST /:id/resume` と同じ扱いになる。
+   */
+  app.post<{ Params: { id: string } }>('/:id/repair-from-stored-review', async (req, reply) => {
+    const body = RepairFromStoredReviewBody.safeParse(req.body)
+    if (!body.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: body.error.format() })
+    }
+
+    const outcome = repairFromStoredReview(storage, {
+      taskId: req.params.id,
+      reviewJobId: body.data.reviewJobId,
+    })
+
+    if (outcome.status === 'rejected') {
+      const status = outcome.code === 'TASK_NOT_FOUND' ? 404 : 409
+      return reply.status(status).send({ error: outcome.reason, code: outcome.code })
+    }
+    if (outcome.status === 'awaiting_approval') {
+      return reply.status(202).send(outcome)
+    }
+    return reply.send(outcome)
   })
 
   app.post<{ Params: { id: string } }>('/:id/resume', async (req, reply) => {

@@ -72,10 +72,26 @@ function deps(stdout: string = ALIGNED_STDOUT) {
   }
 }
 
-function exhaustAttempts(storage: IStorage, ids: { taskId: string; projectId: string }): void {
+/**
+ * repair budget を使い切った**本物の chain** を組み、その末端（次の repair の source に
+ * なる失敗 Job）を返す。
+ *
+ * 以前ここは `repair:<taskId>:<i>` という production に存在しない形の Job を並べていた。
+ * budget を chain の段数で数えるようになったため、その形では chain にならず
+ * 段数 0 と判定される。production の規約は `repair:<sourceJobId>:1` である。
+ */
+function exhaustAttempts(storage: IStorage, ids: { taskId: string; projectId: string }): Job {
+  let parent = createFailedJob(storage, ids, {
+    workflowStepKey: `task:${ids.taskId}:initial-implement`,
+    exitCode: 1,
+  })
   for (let i = 1; i <= MAX_REPAIR_ATTEMPTS; i += 1) {
-    createFailedJob(storage, ids, { workflowStepKey: 'repair:' + ids.taskId + ':' + i, exitCode: i })
+    parent = createFailedJob(storage, ids, {
+      workflowStepKey: `repair:${parent.id}:1`,
+      exitCode: i,
+    })
   }
+  return parent
 }
 
 describe('park された Task は repair chain へ入らない', () => {
@@ -113,8 +129,7 @@ describe('park された Task は repair chain へ入らない', () => {
   })
 
   it('park された Task を blocked へ escalate しない（park の取り消しになるため）', async () => {
-    exhaustAttempts(storage, ids)
-    const failed = createFailedJob(storage, ids, { exitCode: 99 })
+    const failed = exhaustAttempts(storage, ids)
     park(ids.taskId)
 
     await runRepairFlow(storage, { failedJob: failed }, deps())
@@ -151,8 +166,7 @@ describe('invariant 1: Human escalationの実在性', () => {
   })
 
   it('MAX_REPAIR_ATTEMPTS到達でTaskが既存blockedへ入る', async () => {
-    exhaustAttempts(storage, ids)
-    const failed = createFailedJob(storage, ids, { exitCode: 99 })
+    const failed = exhaustAttempts(storage, ids)
 
     const outcome = await runRepairFlow(storage, { failedJob: failed }, deps())
 
@@ -161,8 +175,7 @@ describe('invariant 1: Human escalationの実在性', () => {
   })
 
   it('blocked後はrepair Jobを作らず自律repairが止まる', async () => {
-    exhaustAttempts(storage, ids)
-    const failed = createFailedJob(storage, ids, { exitCode: 99 })
+    const failed = exhaustAttempts(storage, ids)
     await runRepairFlow(storage, { failedJob: failed }, deps())
 
     const before = storage.jobs.findByTaskId(ids.taskId).length
@@ -173,16 +186,14 @@ describe('invariant 1: Human escalationの実在性', () => {
   })
 
   it('blocked TaskはCEO側のAction Required集計（既存dashboard条件）に載る', async () => {
-    exhaustAttempts(storage, ids)
-    await runRepairFlow(storage, { failedJob: createFailedJob(storage, ids, { exitCode: 99 }) }, deps())
+    await runRepairFlow(storage, { failedJob: exhaustAttempts(storage, ids) }, deps())
 
     const blocked = storage.tasks.findByProjectId(ids.projectId).filter((t) => t.status === 'blocked')
     expect(blocked.map((t) => t.id)).toContain(ids.taskId)
   })
 
   it('blocked Taskは既存 resumeBlockedTask 経路へ到達できる', async () => {
-    exhaustAttempts(storage, ids)
-    await runRepairFlow(storage, { failedJob: createFailedJob(storage, ids, { exitCode: 99 }) }, deps())
+    await runRepairFlow(storage, { failedJob: exhaustAttempts(storage, ids) }, deps())
     expect(storage.tasks.findById(ids.taskId)!.status).toBe('blocked')
 
     const resumed = storage.jobs.resumeBlockedTask({

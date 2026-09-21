@@ -10453,6 +10453,52 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       専用 table / 第二の Principle Registry / Provider abstraction / 新しい従量課金 API 経路 /
       Question 本文・tier・閾値の自動書き換え。
 
+<!-- roadmap:id=stored-review-recovery-and-repair-chain-budget state=in_progress -->
+7. [ ] **消費済み review を履歴を変えずに canonical repair へ戻す（repair budget を chain 単位にする）** —
+      2026-09-22登録（CEO 指示）。**この2つは1つの目的なので分割しない**:
+      「保存済みの `changes_requested` を、履歴を改変せず、正しい repair-chain budget で
+      canonical repair flow へ戻せること」。
+
+      **production 実測（`c3849205`）**: 実装 `eec46736` は成功し、Independent Review `026fe5a3` は
+      `changes_requested` を保存したが、その review の PATCH イベントは #266 の修正前に一度
+      消費されていた。Stage 2 は review の PATCH でしか起動しないため、**イベントが過去に
+      消費済みであることだけを理由に**誰も repair を作れない状態になった。同じ review Job へ
+      2つ目の verdict は付けられない（`implement:<id>:review` は `ux_jobs_workflow_step_key` で
+      全体一意）。さらに budget は Task 内の `repair:` Job 総数で数えていたため、
+      **別 chain で使い切った3回**が、成功した実装への修正要求を永久に塞いでいた。
+
+      **入れたもの**:
+      - `decideRepairAction()` の budget を **execution lineage 単位**にした。
+        `repair:<sourceJobId>:1` を辿って段数を数え、`MAX_REPAIR_ATTEMPTS = 3` は据え置き。
+        **`resume:` は chain 境界にしない** —— `resume_task` は PL が in-process で実行でき
+        （`pl/executionLoop.ts`）、境界にすると PL が自力で budget を更新できてしまうため、
+        跨いで辿り段数には数えない。source 欠落 / 別 Task / 規約外 stepKey / 循環 / 深すぎは
+        すべて **fail-closed（escalate）**で、段数を推測しない
+      - chain の根になる recovery epoch は **consume 済み ApprovalRequest** だけ。
+        `APPROVED` を書けるのは `recordDecision()` のみで、その呼び出し元は
+        `PATCH /api/approval-requests/:id/status` の1箇所しかなく **in-process の呼び出し元が
+        存在しない**ため、autonomous PL loop からは作れない。束縛は既存 `requestedAction` に
+        `repair_from_stored_review:<reviewJobId>` を載せる形で、**新しい承認種別も schema も
+        足していない**（`abort_task` が `requestedAction` を束縛材料に使うのと同じ形）
+      - `POST /api/tasks/:id/repair-from-stored-review`。body は `reviewJobId` という
+        **selector だけ**で、verdict / findings / provider / status / allowedPaths / attempt 数は
+        受け取らない。1回目は `WAITING_FOR_USER` を1件作って 202、承認後の2回目で検証 →
+        既存 CAS で consume → 同じ `prepareRepairFlow()` へ渡す。admission で落ちるものには
+        **承認を要求しない**（consume してから不適格が分かる構造にしない）
+
+      **この保証の正確な範囲**: 言えるのは「autonomous PL loop では作れない外部 approval 経路を
+      通った」までで、**「human identity が暗号的に証明された」ではない**。legacy single-token 認証の
+      現 production では `API_TOKEN` を持つ主体なら HTTP でこの route を呼べる。
+      credential split 後は ADMIN credential によって operator 認可としてさらに強く束縛される。
+      依存先は既存 `legacy API_TOKEN → ADMIN / WORKER split credential migration`。
+
+      **残り**: `c3849205` に対してこの経路を実際に使う（承認 → consume → repair）。
+      コードではなく運用手順であり、実施をもって本項目を `done` にする。
+
+      **作らなかったもの**: 汎用 event replay subsystem / event bus / 新しい status・Gate・workflow /
+      新しい `PlActionKind` / 新しい dedup 機構 / `MAX_REPAIR_ATTEMPTS` の変更 /
+      「repair が成功したら budget を reset」（repair のたびに budget が戻り無限 loop になるため）。
+
 ---
 
-*Updated: 2026-09-17*
+*Updated: 2026-09-22*

@@ -97,7 +97,14 @@ async function createInitialImplementJob(task: Task): Promise<Job> {
 /** 既存のrepair生成経路（repairPolicy.decideRepairAction）が払い出すkeyでrepair Jobを直接用意する。 */
 async function createRepairJob(sourceJob: Job, task: Task): Promise<Job> {
   const { getStorage } = await import('../storage/index.js')
-  const decision = decideRepairAction(sourceJob.id, [], {
+  // lineage を辿るため、source Job 自身を priors に含める。
+  // production の `toPriorRepairJobs()` は Task の全 Job を渡すので必ず含まれる。
+  const decision = decideRepairAction(sourceJob.id, [{
+    id: sourceJob.id,
+    workflowStepKey: sourceJob.workflowStepKey,
+    status: 'failed',
+    facts: { exitCode: 1, stderr: 'review requested changes' },
+  }], {
     exitCode: 1,
     stderr: 'review requested changes',
   })
@@ -288,8 +295,8 @@ describe('repair success reconnects to the existing review-creation flow', () =>
     // repairPolicy自身のattempt上限（MAX_REPAIR_ATTEMPTS）とdedupの範囲内で、
     // 失敗したrepair Job自身をsourceJobIdとした次のrepairが既存キー規約どおりに払い出されることを確認する。
     const nextDecision = decideRepairAction(firstRepair.id, [
-      { workflowStepKey: initial.workflowStepKey, status: initial.status, facts: {} },
-      { workflowStepKey: firstRepair.workflowStepKey, status: firstRepair.status, facts: { exitCode: 1, stderr: 'still failing, different reason this time' } },
+      { id: initial.id, workflowStepKey: initial.workflowStepKey, status: initial.status, facts: {} },
+      { id: firstRepair.id, workflowStepKey: firstRepair.workflowStepKey, status: firstRepair.status, facts: { exitCode: 1, stderr: 'still failing, different reason this time' } },
     ], { exitCode: 1, stderr: 'a genuinely different failure reason' })
 
     expect(nextDecision.action).toBe('repair')

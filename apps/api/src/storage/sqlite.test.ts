@@ -1696,7 +1696,7 @@ describe('SQLiteStorage', () => {
     )
 
     describe('failAndPrepareRepair', () => {
-      function createRunningJob() {
+      function createRunningJob(workflowStepKey?: string) {
         return storage.jobs.create({
           taskId,
           projectId,
@@ -1706,6 +1706,7 @@ describe('SQLiteStorage', () => {
           aiCliProvider: 'codex',
           aiCliPrompt: 'Implement the fix',
           aiCliMode: 'implement',
+          ...(workflowStepKey === undefined ? {} : { workflowStepKey }),
         })
       }
 
@@ -1749,18 +1750,30 @@ describe('SQLiteStorage', () => {
       )
 
       it('verified-safe with exhausted repair attempts escalates Job->failed and Task->blocked atomically', () => {
-        const source = createRunningJob()
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          storage.jobs.create({
+        // repair budget は **この chain の段数**で数えるので、本物の lineage を組む。
+        // 以前は `repair:<source>:<n>` を3件並べていたが、それは production の規約
+        // （`repair:<sourceJobId>:1`）ではなく、chain にもなっていなかった。
+        let parent = storage.jobs.create({
+          taskId,
+          projectId,
+          workflowStepKey: `task:${taskId}:initial-implement`,
+          agentRole: 'developer_ai',
+          status: 'failed',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        })
+        for (let attempt = 1; attempt < 3; attempt++) {
+          parent = storage.jobs.create({
             taskId,
             projectId,
-            workflowStepKey: `repair:${source.id}:${attempt}`,
+            workflowStepKey: `repair:${parent.id}:1`,
             agentRole: 'developer_ai',
             status: 'failed',
             safeCommand: { kind: 'test', workingDir: '/workspace/target' },
             stderr: `attempt ${attempt} failed`,
           })
         }
+        // 3段目が今まさに失敗する Job である。
+        const source = createRunningJob(`repair:${parent.id}:1`)
 
         const result = storage.jobs.failAndPrepareRepair({
           jobId: source.id,

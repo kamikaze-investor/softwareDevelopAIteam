@@ -34,6 +34,7 @@ import {
 } from './designReviewCoordinator'
 import { buildRepairPrompt } from './repairPromptBuilder'
 import { posix } from 'node:path'
+import { epochCoveredImplementationJobIds } from './repairRecoveryEpoch'
 import { recomputeDecision, type RawStrategicResult } from './designReviewCoordinator'
 import {
   REPAIR_STEP_PREFIX,
@@ -63,7 +64,12 @@ export type RepairPreparation =
       stepKey: string
       attempt: number
     }
-  | { action: 'escalate'; reason: string }
+  | {
+      action: 'escalate'
+      reason: string
+      /** `decideRepairAction` の構造化理由。admission で落ちた場合は undefined。 */
+      code?: 'attempt_limit' | 'lineage_undeterminable' | 'no_actionable_information'
+    }
   | { action: 'skip'; reason: string }
 
 export type RepairFlowOutcome =
@@ -96,8 +102,9 @@ function toPriorRepairJobs(
 ): PriorRepairJob[] {
   return jobs.map((job) => (
     job.id === current.jobId
-      ? { workflowStepKey: job.workflowStepKey, status: current.status, facts: current.facts }
+      ? { id: job.id, workflowStepKey: job.workflowStepKey, status: current.status, facts: current.facts }
       : {
+          id: job.id,
           workflowStepKey: job.workflowStepKey,
           status: job.status,
           facts: extractFailureFacts(job, reviews.find((review) => review.jobId === job.id)),
@@ -157,6 +164,9 @@ export async function runRepairFlow(
       facts,
     }),
     facts,
+    // repair budget は chain 単位で数える。chain の根は consume 済み recovery approval だけで、
+    // `resume:` は根にしない（PL が自分で作れてしまうため）。
+    epochCoveredImplementationJobIds(storage, task.id),
   )
   if (decision.action === 'escalate') {
     return escalateToHuman(storage, task, decision.reason)
@@ -537,8 +547,13 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
       facts,
     }),
     facts,
+    // repair budget は chain 単位で数える。chain の根は consume 済み recovery approval だけで、
+    // `resume:` は根にしない（PL が自分で作れてしまうため）。
+    epochCoveredImplementationJobIds(storage, task.id),
   )
-  if (decision.action === 'escalate') return { action: 'escalate', reason: decision.reason }
+  if (decision.action === 'escalate') {
+    return { action: 'escalate', reason: decision.reason, code: decision.code }
+  }
 
   if (priorJobs.some((job) => job.workflowStepKey === decision.stepKey)) {
     return { action: 'skip', reason: 'repair job already exists for this failure' }

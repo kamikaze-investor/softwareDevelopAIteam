@@ -18,8 +18,35 @@ const FACTS_B: RepairFailureFacts = {
   failureKind: 'ai_cli_failed',
 }
 
-function repairJob(status: string, facts: RepairFailureFacts = FACTS_A, attempt = 1): PriorRepairJob {
-  return { workflowStepKey: `repair:${attempt}`, status, facts }
+/**
+ * **本物の lineage を組む。** budget は「Task 内の repair 数」ではなく
+ * 「この chain の repair 段数」で数えるので、親を持たない repair Job を並べても
+ * 試行回数にはならない。`leafId` が「いま直そうとしている Job」である。
+ *
+ * 以前の fixture は `repair:1` のような親の無い key を並べ、`decideRepairAction` へ
+ * priors に含まれない `"job-1"` を source として渡していた。production では
+ * `toPriorRepairJobs()` が Task の全 Job を渡すので source は必ず含まれる ——
+ * 含まれない形は lineage を辿れないため、いまは fail-closed になる。
+ */
+function chain(
+  repairs: readonly { status: string, facts?: RepairFailureFacts }[],
+  rootKey = 'task:t1:initial-implement',
+): { jobs: PriorRepairJob[], leafId: string } {
+  const jobs: PriorRepairJob[] = [
+    { id: 'root', workflowStepKey: rootKey, status: 'failed', facts: {} },
+  ]
+  let parentId = 'root'
+  repairs.forEach((repair, index) => {
+    const id = `r${index + 1}`
+    jobs.push({
+      id,
+      workflowStepKey: `repair:${parentId}:1`,
+      status: repair.status,
+      facts: repair.facts ?? FACTS_A,
+    })
+    parentId = id
+  })
+  return { jobs, leafId: parentId }
 }
 
 describe('computeFailureSignature — ノイズは正規化する', () => {
@@ -81,17 +108,19 @@ describe('computeFailureSignature — 意味のある数値は潰さない', () 
 
 describe('decideRepairAction', () => {
   it('初回の失敗ではrepairを行う', () => {
-    const decision = decideRepairAction("job-1", [], FACTS_A)
+    const { jobs, leafId } = chain([])
+    const decision = decideRepairAction(leafId, jobs, FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') {
       expect(decision.attempt).toBe(1)
-      expect(decision.stepKey).toBe('repair:job-1:1')
+      expect(decision.stepKey).toBe(`repair:${leafId}:1`)
       expect(decision.requireDifferentApproach).toBe(false)
     }
   })
 
   it('異なる失敗が続く間はrepairを継続する', () => {
-    const decision = decideRepairAction("job-1", [repairJob('failed', FACTS_A, 1)], FACTS_B)
+    const { jobs, leafId } = chain([{ status: 'failed', facts: FACTS_A }])
+    const decision = decideRepairAction(leafId, jobs, FACTS_B)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') {
       expect(decision.attempt).toBe(2)
@@ -100,7 +129,8 @@ describe('decideRepairAction', () => {
   })
 
   it('同じ失敗が残っていても即escalateせず、別アプローチを要求して継続する', () => {
-    const decision = decideRepairAction("job-1", [repairJob('failed', FACTS_A, 1)], FACTS_A)
+    const { jobs, leafId } = chain([{ status: 'failed', facts: FACTS_A }])
+    const decision = decideRepairAction(leafId, jobs, FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') {
       expect(decision.attempt).toBe(2)
@@ -109,8 +139,11 @@ describe('decideRepairAction', () => {
   })
 
   it('同じ失敗が2回続いてもhard bound内なら継続する', () => {
-    const priors = [repairJob('failed', FACTS_A, 1), repairJob('failed', FACTS_A, 2)]
-    const decision = decideRepairAction("job-1", priors, FACTS_A)
+    const { jobs, leafId } = chain([
+      { status: 'failed', facts: FACTS_A },
+      { status: 'failed', facts: FACTS_A },
+    ])
+    const decision = decideRepairAction(leafId, jobs, FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') {
       expect(decision.attempt).toBe(3)
@@ -119,18 +152,20 @@ describe('decideRepairAction', () => {
   })
 
   it('hard boundを使い切ったらescalateする（無限repairを作らない）', () => {
-    const priors: PriorRepairJob[] = []
-    for (let i = 1; i <= MAX_REPAIR_ATTEMPTS; i += 1) {
-      priors.push(repairJob('failed', { exitCode: i, stderr: `distinct failure ${i}` }, i))
-    }
-
-    const decision = decideRepairAction("job-1", priors, { exitCode: 99, stderr: 'yet another distinct failure' })
+    const { jobs, leafId } = chain(
+      Array.from({ length: MAX_REPAIR_ATTEMPTS }, (_, i) => ({
+        status: 'failed',
+        facts: { exitCode: i + 1, stderr: `distinct failure ${i + 1}` },
+      })),
+    )
+    const decision = decideRepairAction(leafId, jobs, { exitCode: 99, stderr: 'yet another distinct failure' })
     expect(decision.action).toBe('escalate')
     if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
   })
 
   it('同じ失敗かつ手がかりが無い場合のみescalateする', () => {
-    const decision = decideRepairAction("job-1", [repairJob('failed', {}, 1)], {})
+    const { jobs, leafId } = chain([{ status: 'failed', facts: {} }])
+    const decision = decideRepairAction(leafId, jobs, {})
     expect(decision.action).toBe('escalate')
     if (decision.action === 'escalate') {
       expect(decision.reason).toContain('no actionable information')
@@ -138,24 +173,27 @@ describe('decideRepairAction', () => {
   })
 
   it('repair以外の既存Jobは試行回数に数えない', () => {
-    const priors: PriorRepairJob[] = [
-      { workflowStepKey: 'implement:1', status: 'failed', facts: FACTS_B },
-      { workflowStepKey: undefined, status: 'success', facts: {} },
+    const jobs: PriorRepairJob[] = [
+      { id: 'leaf', workflowStepKey: 'implement:1', status: 'failed', facts: FACTS_B },
+      { id: 'other', workflowStepKey: undefined, status: 'success', facts: {} },
     ]
-    const decision = decideRepairAction("job-1", priors, FACTS_A)
+    const decision = decideRepairAction('leaf', jobs, FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') expect(decision.attempt).toBe(1)
   })
 
   it('Stage 1のretry Jobはrepair試行に数えない', () => {
-    const priors: PriorRepairJob[] = [{ workflowStepKey: 'retry:abc', status: 'failed', facts: FACTS_B }]
-    const decision = decideRepairAction("job-1", priors, FACTS_A)
+    const jobs: PriorRepairJob[] = [
+      { id: 'leaf', workflowStepKey: 'retry:abc', status: 'failed', facts: FACTS_B },
+    ]
+    const decision = decideRepairAction('leaf', jobs, FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') expect(decision.attempt).toBe(1)
   })
 
   it('成功したrepairと同じ署名でも、失敗していなければ別アプローチ要求にしない', () => {
-    const decision = decideRepairAction("job-1", [repairJob('success', FACTS_A, 1)], FACTS_A)
+    const { jobs, leafId } = chain([{ status: 'success', facts: FACTS_A }])
+    const decision = decideRepairAction(leafId, jobs, FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') expect(decision.requireDifferentApproach).toBe(false)
   })

@@ -39,11 +39,31 @@ function seed(storage: IStorage, taskOverrides: Record<string, unknown> = {}) {
 }
 
 /** canonical resume successor として成功した implement Job。 */
+/**
+ * **resume 元は実在させる。** repair budget を chain 単位で数えるようになったため、
+ * `resume:<存在しない id>:1` は lineage を辿れず fail-closed になる。production の
+ * `resumeBlockedTask()` は必ず同じ Task の実在 Job を名指すので、fixture もそう組む。
+ */
 function createResumedImplementJob(
   storage: IStorage,
   ids: { taskId: string, projectId: string },
   overrides: Record<string, unknown> = {},
 ): Job {
+  const hasOwnStepKey = 'workflowStepKey' in overrides
+  const parentId = hasOwnStepKey ? undefined : storage.jobs.create({
+    taskId: ids.taskId,
+    projectId: ids.projectId,
+    agentRole: 'developer_ai',
+    status: 'queued',
+    safeCommand: { kind: 'noop' },
+    aiCliMode: 'implement',
+    aiCliProvider: 'claude_code',
+    workflowStepKey: `task:${ids.taskId}:initial-implement`,
+  } as never).id
+  // 親は終端させる。queued のままだと live Job 判定で弾かれる（resume 元の除外は
+  // blocked のときだけ）。production でも resume 元は必ず終端している。
+  if (parentId !== undefined) storage.jobs.update(parentId, { status: 'failed', exitCode: 1 } as never)
+
   const job = storage.jobs.create({
     taskId: ids.taskId,
     projectId: ids.projectId,
@@ -53,7 +73,7 @@ function createResumedImplementJob(
     aiCliMode: 'implement',
     aiCliProvider: 'claude_code',
     aiCliPrompt: 'resume prompt',
-    workflowStepKey: 'resume:11111111-1111-1111-1111-111111111111:1',
+    workflowStepKey: `resume:${parentId}:1`,
     ...overrides,
   } as never)
   return storage.jobs.update(job.id, {
