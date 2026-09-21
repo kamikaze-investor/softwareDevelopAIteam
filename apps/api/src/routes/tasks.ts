@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto'
 import { abortTask } from '../pl/abortTask'
+import {
+  HUMAN_RECOVERY_REASON_MAX_LENGTH,
+  recoverBlockedTask,
+} from '../humanRecovery/recoverBlockedTask'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import {
@@ -158,6 +162,13 @@ const AbortTaskBody = z.object({
 
 const ResumeTaskBody = z.object({
   instruction: z.string().trim().min(1).max(2000),
+}).strict()
+
+const RecoverTaskBody = z.object({
+  // **数字をここへ書かない。** 上限は Human Recovery 側の正本を参照する
+  // （`HUMAN_RECOVERY_REASON_MAX_LENGTH`）。reason は短い監査理由であって
+  // 実装指示ではないので、長い本文は 400 で**受理せず断る**（後から切らない）。
+  reason: z.string().trim().min(1).max(HUMAN_RECOVERY_REASON_MAX_LENGTH),
 }).strict()
 
 const TaskFailureQuestionBody = z.object({
@@ -462,6 +473,41 @@ export async function taskRoutes(
     return reply.status(200).send(result)
   })
 
+  /**
+   * POST /:id/recover
+   *
+   * **Human Recovery** — Job を1件も持たないまま `blocked` で止まった Task を、
+   * 人の明示操作で既存の実行ループへ戻す。`blocked` → `pending` の遷移と audit 記録だけを行い、
+   * **Job も Review も Approval も作らない**。
+   *
+   * up-front の Approval Gate は課さない（CEO 決定・2026-09-18）。認証済み CEO の明示操作
+   * そのものが human authorization であり、その先の fresh Design Review と既存下流 Gate は
+   * すべて維持される。**AI/PL はこの経路を使えない**（`PL_ACTION_KINDS` に語彙が無く、
+   * `WORKER_ALLOWLIST` にも載せておらず、`HUMAN_ONLY_ROUTES` により
+   * **split credential mode の ADMIN でしか通らない**）。
+   * 詳細は `humanRecovery/recoverBlockedTask.ts`。
+   *
+   * Job を持つ Task は対象外で、既存 `POST /:id/resume` が担当する。
+   */
+  app.post<{ Params: { id: string } }>('/:id/recover', async (req, reply) => {
+    const parsed = RecoverTaskBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    }
+
+    const result = recoverBlockedTask(storage, {
+      taskId: req.params.id,
+      reason: parsed.data.reason,
+    })
+
+    if (!result.ok) {
+      const status = result.code === 'TASK_NOT_FOUND' ? 404 : 409
+      return reply.status(status).send({ error: result.reason, code: result.code })
+    }
+
+    return reply.status(200).send(result)
+  })
+
   app.post<{ Params: { id: string } }>('/:id/resume', async (req, reply) => {
     const result = ResumeTaskBody.safeParse(req.body)
     if (!result.success) {
@@ -598,6 +644,35 @@ export async function taskRoutes(
         error: 'Task was parked by abort_task; it cannot be moved back into an occupying status',
         code: 'TASK_PARKED',
       })
+    }
+
+    // **blocked からの復帰をこの汎用経路で行わせない。**
+    //
+    // `blocked` → `pending` は「止まった Task を自律ループへ戻す」意味を持つ遷移である。
+    // ここを素通しにすると、同じ遷移が **audit を1行も残さずに**できてしまう
+    // （`tasks.update()` は audit_log を書かない）。だから復旧は
+    // `POST /api/tasks/:id/recover` に集約する。あちらは
+    //
+    //   - 人が書いた理由を audit へ残す
+    //   - 自動側の既存 bounded budget（`PL_MAX_REMEDIATION_ATTEMPTS` 等）を reset しない
+    //   - 戻した後に何が動くかを `nextDriver` で返す
+    //
+    // **Human Recovery 自体の試行回数を bound するからではない。** そのような lifetime
+    // 上限・ordinal・counter は存在しない（CEO 決定・2026-09-18。エピソードの識別には
+    // 既存 audit 行の id を使う）。Job を持つ Task は従来どおり `/resume` の担当である。
+    //
+    // 制限するのは blocked から**出る**方向だけで、他の status 遷移は従来どおりである。
+    if (result.data.status !== undefined && result.data.status !== 'blocked') {
+      const current = storage.tasks.findById(req.params.id)
+      if (current?.status === 'blocked') {
+        return reply.status(409).send({
+          error:
+            'A blocked task cannot be moved out of blocked through this generic route. '
+            + 'Use POST /api/tasks/:id/recover (no job) or POST /api/tasks/:id/resume (has jobs), '
+            + 'which audit the human reason and report what will drive the task next',
+          code: 'TASK_BLOCKED_USE_RECOVERY_ROUTE',
+        })
+      }
     }
 
     const updated = storage.tasks.update(req.params.id, result.data)

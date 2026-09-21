@@ -31,6 +31,9 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
+// 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
+// 型以外に storage へ依存しないモジュールなので循環しない。
+import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -796,6 +799,82 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   const tasks: ITaskStorage = {
     isParked(taskId) {
       return isParkedTaskId(taskId)
+    },
+    recoverFromBlocked(input) {
+      // **状態遷移と audit を1 transaction にする。** 片方だけ成功する経路を残さない。
+      const tx = db.transaction((taskId: string, detail: string) => {
+        const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as any
+        if (!row) return { ok: false as const, reason: 'Task not found' }
+
+        // 判定から確定までの間に誰かが動かしていないか、最後にもう一度確かめる。
+        //
+        // **入口条件は3つとも確かめ直す。** 以前は `status` だけを読み直していたが、
+        // 「Job 0 件」と「park されていない」は transaction の外で見たきりだった。
+        // 別 connection が precheck と `tx.immediate()` の間に Job を1件入れると、
+        // **Job を持つ Task が `pending` になり成功 audit まで残る** ——
+        // それはこの操作の定義そのもの（Job があるものは `/resume` の担当）を破る
+        // （独立レビュー round 6 指摘）。読み直す条件が判定に使った条件より少ない限り、
+        // IMMEDIATE で lock を取っても意味が無い。
+        const current = deserializeTask(row)
+        if (current.status !== 'blocked') {
+          return { ok: false as const, reason: `Task is ${current.status}, not blocked` }
+        }
+
+        const jobCount = (db.prepare(
+          'SELECT COUNT(*) AS n FROM jobs WHERE task_id = ?',
+        ).get(taskId) as { n: number }).n
+        if (jobCount > 0) {
+          return {
+            ok: false as const,
+            reason: `Task acquired ${jobCount} job(s) concurrently; use /resume instead`,
+          }
+        }
+
+        if (isParkedTaskId(taskId)) {
+          return { ok: false as const, reason: 'Task was parked concurrently' }
+        }
+
+        // **有効な承認待ちも同じ transaction の中で確かめ直す。** precheck だけだと、
+        // 別 connection が precheck 後・commit 前に Approval Request を作れてしまい、
+        // 「人の判断待ちと Recovery が同時進行しない」という条件を破ったまま commit される。
+        // 判定は precheck と同じ `hasActiveApprovalWaiting()` —— 条件をここへ書き写さない。
+        const latestApprovalRow = db.prepare(
+          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
+        ).get(taskId) as any
+        if (hasActiveApprovalWaiting(
+          latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined,
+          now(),
+        )) {
+          // **precheck と同じ code を返す。** ここでしか気付けなかった（= race だった）
+          // というだけで machine-readable code が変わってはならない
+          // （独立レビュー round 7 指摘）。
+          return {
+            ok: false as const,
+            code: 'APPROVAL_WAITING' as const,
+            reason: APPROVAL_WAITING_REASON,
+          }
+        }
+
+        const updated = tasks.update(taskId, { status: 'pending' })
+        if (!updated) return { ok: false as const, reason: 'Task could not be updated' }
+
+        auditLog.record({
+          actor: 'api',
+          operation: 'task_human_recovered',
+          entityType: 'task',
+          entityId: taskId,
+          result: 'success',
+          detail,
+        })
+        return { ok: true as const, task: updated }
+      })
+
+      // **IMMEDIATE で開始する。** この transaction は「`blocked` であること」を読んでから
+      // 書くので、deferred のままだと最初の書き込みまで write lock を取らず、
+      // **判定と書き込みの間に別 connection が status を動かせる**。
+      // それでは transaction 内で status を読み直している意味が無い。
+      // `jobs.update()` の claim が同じ理由で IMMEDIATE にしてあるのと同じ扱いである。
+      return tx.immediate(input.taskId, input.detail)
     },
     findByProjectId(projectId) {
       const rows = db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as any[]

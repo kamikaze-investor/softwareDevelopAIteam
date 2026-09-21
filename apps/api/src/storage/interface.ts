@@ -261,6 +261,19 @@ export interface IProjectStorage {
   findInterruptedStarts(): Project[]
 }
 
+/**
+ * `ITaskStorage.recoverFromBlocked()` の結果。
+ *
+ * `code` は**任意**である。付くのは、precheck 側が同じ原因に対して machine-readable code を
+ * 返すもの —— いまは承認待ちだけ。race で transaction 側が先に気付いたときに
+ * `RECOVERY_FAILED` へ潰れてしまうと、**同じ原因なのに race の有無で code が変わる**
+ * （独立レビュー round 7 指摘）。呼び出し側はこの値をそのまま上へ伝播すればよく、
+ * `reason` 文字列を突き合わせて分類し直してはならない。
+ */
+export type RecoverFromBlockedResult =
+  | { ok: true; task: Task }
+  | { ok: false; code?: 'APPROVAL_WAITING'; reason: string }
+
 export interface ITaskStorage {
   findByProjectId(projectId: string): Task[]
   /**
@@ -271,6 +284,35 @@ export interface ITaskStorage {
    * 場所ごとに別の park 判定を作ると、片方だけが park を尊重する状態になる。
    */
   isParked(taskId: string): boolean
+  /**
+   * Human Recovery の確定操作。**`blocked` → `pending` と audit 行を1 transaction で書く。**
+   *
+   * 2つに分けてはならない。update だけが成功して audit が落ちると、**記録の無い復旧**が
+   * 残る —— それはこの機能が塞ぐと言っている穴そのものである（独立レビュー指摘・2026-09-18）。
+   *
+   * **入口条件は transaction の中で4つとも再確認する。** 呼び出し側
+   * `recoverBlockedTask()` にも同じ precheck があるが、それだけでは足りない ——
+   * precheck と `tx.immediate()` の間に別 connection が Job を入れたり park したり
+   * 承認要求を作ったりできるためで、**読み直す条件が判定に使った条件より少ない限り
+   * IMMEDIATE で lock を取っても意味が無い**（独立レビュー round 6 指摘）。
+   * ここで確かめ直すのは:
+   *
+   *   1. `status === 'blocked'`
+   *   2. Job が0件
+   *   3. park されていない
+   *   4. 有効な承認待ちが無い（未期限の `WAITING_FOR_USER`。判定は
+   *      `humanRecovery/recoveryAudit` の `hasActiveApprovalWaiting()` で precheck と共有）
+   *
+   * 呼び出し側が持つのは**ここに無い政策判定だけ**（Project が archived か、
+   * 自律ループから到達できるか、`nextDriver` は何か 等）。
+   *
+   * **`code` は race のときも precheck と同じ値を返すために在る。** 同じ原因なのに
+   * 「precheck で気付いたか transaction で気付いたか」で machine-readable code が
+   * 変わってはならない（独立レビュー round 7 指摘）。理由文字列を比較して code へ
+   * 戻すような実装はしないこと。いま分類しているのは承認待ちだけで、
+   * 他の precondition failure を網羅的に code 化する必要は無い。
+   */
+  recoverFromBlocked(input: { taskId: string; detail: string }): RecoverFromBlockedResult
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   /**

@@ -1,0 +1,304 @@
+# Human Recovery — 止まった Task を人が安全に再開する手順
+
+**Importance Level: 1**
+**Status: active**
+
+---
+
+## この文書の範囲
+
+**AI/自動経路がどれも届かなくなった Task を、CEO が明示操作で既存ループへ戻す手順**である。
+
+`tasks/roadmap.md` の `task-design-review-conflict-has-no-recovery-route` が
+「復旧手順が文書化されていない」として残していた未了分がこれに当たる。
+
+**Human Recovery は実装をしない。** Job を作らず、Review を承認せず、Gate を1つも緩めない。
+やるのは「止まっている Task を、既存の自動経路が再び見える位置へ戻す」ことだけである。
+
+---
+
+## 権限（CEO 決定・2026-09-18）
+
+> Human Recovery には up-front CEO Approval Gate を課さない。
+> 認証済み CEO による明示的な Recovery 操作そのものを human authorization とする。
+> Human Recovery は Job 0 件の blocked Task を既存ループへ再投入するだけに限定し、
+> Implementation Job を直接生成せず、fresh Design Review および既存の全下流 Gate を必須とする。
+> AI/PL による自律呼び出しにはこの例外を適用しない。操作は audit 記録し、試行回数を有界化する。
+
+`abort_task` と違い**事前の ApprovalRequest を要求しない**。理由は `resume_task` と同じで、
+「新しい承認サイクルを始めるために既存の承認が要る」循環を作らないためである
+（`packages/shared/src/plActionPolicy.ts` の `resume_task` 節を参照）。
+
+**AI/PL はこの経路を使えない。** 層ごとに保証の強さが違うので分けて書く:
+
+1. `PL_ACTION_KINDS` に対応する語彙が無い → `resolvePlActionPolicy()` が未知値として `forbidden`。
+   **auth mode に依存しない**
+2. `executeAction()` / `allowedActionsFor()` に配線していない → PL は in-process で動き自分へ
+   HTTP を打たないので到達経路が存在しない。**auth mode に依存しない**
+3. `WORKER_ALLOWLIST` に載せていない → split credential mode では WORKER credential から 403
+4. **split credential mode の ADMIN 以外では route 自体を拒否する**（`HUMAN_ONLY_ROUTES`）。
+   この操作の authorization は「呼び出し主体が認証済みの人であること」そのものなので、
+   主体を区別できない構成では実行させない
+
+| mode | credential | 結果 |
+|---|---|---|
+| split | ADMIN | 実行できる |
+| split | WORKER | 403（allowlist の Default Deny） |
+| legacy（`API_TOKEN` 設定） | 単一 token | **403（`HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS`）** |
+| 認証なし（`API_TOKEN` 未設定） | — | **403（同じ code）** |
+| 片側だけ設定 | — | 既存どおり 503 |
+
+つまり規則は1本である: **human-only route は split credential mode の ADMIN でのみ通る。**
+
+**認証なしの構成も通さない。** 初版はここを「production 構成ではないから」と素通しにしていたが、
+それは legacy mode を塞ぐ論拠と逆だった —— 区別できないから塞ぐのなら、
+**主体がそもそも分からない構成はより強く塞がる側**である。しかもローカル開発環境は
+AI agent（OpenCode / Codex）が localhost の API へ到達できる場所そのもので、
+CEO 決定が除外した相手が実際に居る（独立レビュー round 4・blocking 指摘）。
+
+したがって**ローカルで Human Recovery を試すときも split credential を設定する**こと:
+
+```bash
+export ADMIN_TOKEN_SHA256=$(printf %s "$ADMIN_TOKEN" | sha256sum | cut -d' ' -f1)
+export WORKER_TOKEN_SHA256=$(printf %s "$WORKER_TOKEN" | sha256sum | cut -d' ' -f1)
+```
+
+**legacy auth 全体は変えていない。** 拒否されるのは `HUMAN_ONLY_ROUTES` に載る route だけで、
+他の route は認証なし構成でも従来どおり素通しである。
+
+---
+
+## どの症状のときに使うか
+
+| 症状 | 使うもの |
+|---|---|
+| Task が `blocked`、**Job が1件も無い** | **本手順**（`POST /api/tasks/:id/recover`） |
+| Task が `blocked`、Job があり最新が `blocked` / `failed` | 既存 `POST /api/tasks/:id/resume` |
+| workspace が quarantine | 既存 clear-quarantine 経路（resume では解けない） |
+| 承認待ちで止まっている | Mobile の承認画面（`GET /api/approval-requests/waiting`） |
+| Task 自体を取り下げたい | `POST /api/tasks/:id/abort`（CEO Approval が要る） |
+
+「Job が1件も無い blocked」は `attention` の **`task_blocked_without_job`** として出る。
+PL はこれを notify-only で1回だけ CEO へ通知し、自分では触らない。
+
+### この状態が生まれる経路
+
+`ctoAi/taskContinuation.ts` の `failContinuation()` が、continuation の producer
+（`createInitialImplementWorkflow()`）が非 retryable に skip したときに Task を `blocked` にする。
+**最も多いのは Design Review が非 ALIGNED（CONFLICT 等）を返した場合**で、このとき Job は作られない。
+
+---
+
+## 手順
+
+### 1. 状態を確認する
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" "$API/api/state" | jq '.attention'
+```
+
+`task_blocked_without_job` があれば `taskId` を控える。PL が送った通知本文には
+直近の Design Review の判定（CONFLICT / 理由）も入っている。
+
+### 2. まず「なぜ止まったか」を読む
+
+**ここを飛ばさない。** 再投入しても原因が残っていれば同じ判定でまた止まる。
+
+CONFLICT の原因は経験上2種類ある（`task-design-review-conflict-has-no-recovery-route` の実測）:
+
+- **提案側の問題** — scope 要約の誤記、範囲が曖昧で対象外まで変更しかねない、等
+  → 訂正した `implementationScope` / `allowedPaths` で採用し直す（下の 4 へ）
+- **Source of Truth 側の問題** — ledger 本文が実仕様に追いついておらず、reviewer 同士が
+  要件を逆に読んだ（2026-09-18 の2件目が実例）
+  → **先に `tasks/roadmap.md` の当該 item を docs-only で訂正**してから再投入する
+
+### 3. 再投入する（Job 0 件の blocked のとき）
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"reason":"ledger 本文を実仕様へ訂正したので再レビューさせる"}' \
+  "$API/api/tasks/$TASK_ID/recover"
+```
+
+**`reason` は短い監査理由（最大 400 文字 = `HUMAN_RECOVERY_REASON_MAX_LENGTH`）。**
+超えると 400 で断られる —— **切り詰めて受理はしない**（audit に「記録した」と書いて中身が違う
+状態を作らないため）。実装指示の本文をここへ入れない。
+
+成功すると `blocked` → `pending` に戻り、`nextDriver` が返る:
+
+- `pl_independent_remediation` … PR #255 の Independent Remediation が提案を作り直し、
+  **まっさらな Design Review** へ掛ける。CEO は待つだけでよい
+- `attention_only` … 自動で進める経路が無い。`task_ready_without_job` が **attention に出る**
+  （Mobile から見える）。Remediation 対象の Design Review が無い Task や、
+  **Remediation 予算（`PL_MAX_REMEDIATION_ATTEMPTS`）を使い切った** Task がこれ
+
+  > **push が必ず飛ぶとは限らない。** PL の重複排除キー `task_ready_without_job:<taskId>` は
+  > Task の生涯で変わらないので、その Task が過去に一度でも同じ kind で Escalate されていると、
+  > `runPlTick()` は「already escalated and waiting on the CEO」として **通知を出さない**
+  > （実測・独立レビュー round 5 指摘）。attention は残るため見落としはしないが、
+  > **通知を待たずに attention を見に行くこと**。
+- `project_not_running` … **Project が `running` でないので、何も動かず通知も出ない。**
+  attention 導出は `project.status === 'running'` を要求するため、ここを `attention_only` と
+  返すと「通知は出る」という出ない約束になる（独立レビュー round 4 指摘）。
+  先に Project を再開すること。
+  **この値は「再開すれば動く」ことまで含意する**ので、自律ループから到達できない Task には
+  返さない（再開しても何も起きないため `none` になる。独立レビュー round 6 指摘）
+- `none` … **何も拾わない。** `roadmapActive=false` / `assignee≠developer_ai` で自律ループから
+  到達できず、遷移先の `task_ready_without_job` も立たない。それでも受理するのは、
+  `blocked` のままだと `occupiesProject()` が Project の枠を無条件に占有し続け、
+  park（`abort_task`）も採用し直し（`syncRoadmapTasks()`）も `pending` を要求するため、
+  **戻すこと自体が唯一の出口**だからである
+
+> **「戻せば枠が空く」は `none` の全部には当てはまらない。**
+> `occupiesProject()` が見るのは `roadmapActive` だけである。したがって
+> `roadmapActive=true` かつ `assignee` が `developer_ai` でない Task は、
+> **自律ループから到達できないのに `pending` でも枠を占有し続ける**。
+> 枠が空くかどうかは `recoveryReleasesProjectSlot()` が判定し、
+> `triageBlocked()` の CEO 本文もその値で文面を変える（独立レビュー round 4 指摘）。
+
+**Job は作られない。** 実装 Job は fresh Design Review が ALIGNED になって初めて作られる。
+
+**入口条件（`blocked` / Job 0 件 / park されていない / 有効な承認待ちが無い）は
+transaction の中でも確かめ直す。** precheck と確定の間に別 connection が Job を入れたり
+park したり承認要求を作ったりしても、commit されない（独立レビュー round 6・7 指摘）。
+
+主な拒否理由:
+
+| code | 意味 |
+|---|---|
+| `TASK_HAS_JOBS` | Job があるので既存 `/resume` の担当。こちらでは受けない |
+| `TASK_NOT_BLOCKED` | 既に再投入済みか、そもそも止まっていない |
+| `TASK_PARKED` | `abort_task` で park 済み。復旧の副作用で park を取り消さない |
+| `APPROVAL_WAITING` | 未期限の `WAITING_FOR_USER` 承認要求が残っている。先にそれを処理する |
+
+> **`APPROVAL_WAITING` は新しい Approval Gate ではない。** Human Recovery が承認を
+> 要求するようになったのではなく、**人の判断が既に1件待っているときに2本目の駆動を
+> 始めない**という整合性条件である。条件は既存 `resumeBlockedTask()` と同じ ——
+> **最新の1行**が `WAITING_FOR_USER` **かつ未期限**のときだけ断る。
+> `APPROVED` では断らず、**期限切れ `WAITING_FOR_USER` でも断らない**
+> （行を `EXPIRED` へ進める actor が居ないので、断ると復旧不能な Task ができる。
+> 2026-09-12 に Production で発生）。入口条件と同じく **transaction 内でも確かめ直す**。
+
+**生涯上限は無い。** 連打を止めているのは入口条件（`blocked` かつ Job 0 件）そのもので、
+もう一度受理されるにはシステムが**独立に** dead state へ再突入している必要がある。
+この操作は Job も Review も作らないので、`PL_MAX_REMEDIATION_ATTEMPTS` /
+`PL_MAX_ATTEMPTS_PER_TARGET` / `DESIGN_REVIEW_MAX_ATTEMPTS` のどれも消費・リセットしない。
+
+> **Review laundering について（正確に）**
+>
+> - **Human Recovery 自体は Job も Design Review も作らない。** 再投入は審査を1回も起こさない
+> - **通常の自動経路には既存の保護がそのまま効く。** 再投入後は `task_ready_without_job` →
+>   #255 staged recovery へ戻り、そこでは `isMateriallyDifferentSpec()` が
+>   却下済みテキストの再提出を拒否する（従来どおり。本 PR で変更していない）
+> - **raw / 手動の `POST /api/projects/:id/roadmap-adoptions` には、その検査が無い。**
+>   却下済みと実質同一の spec を出し直せば fresh Design Review を引ける。
+>   **これは master に元から在る既知 Finding**で、`pending` な採用済み Task すべてに
+>   当てはまる（Human Recovery が作った穴ではない）。
+>   → `adoption-path-has-no-material-difference-check` /
+>     `design-review-rejections-are-not-durably-recorded`
+>
+> guard を Human Recovery 側へ置いてはならない。訂正には `pending` が必要で、`pending` にするには
+> Human Recovery が必要なので **deadlock になる**（実装して撤回した経緯がテストに固定してある）。
+
+**再投入の直後は5分間何も起きないことがある。** `task_ready_without_job` は既存の停滞閾値
+（`DEFAULT_STALL_HINT_MS` = 5分）を過ぎたものだけを PL の対象にする。止まっている Task は
+`createdAt` が十分古いので通常は次の tick で動くが、採用直後の Task を再投入した場合は待つ。
+
+### 4. 訂正して採用し直す（scope / ledger 本文が原因のとき）
+
+提案側の scope が誤っている、または ledger 本文が陳腐化している場合は、
+**既存の採用 API を訂正済みの内容で叩き直す**。これが 2026-09-18 に production で実際に使われた
+（が文書化されていなかった）手順である。
+
+> **順序が重要。必ず先に手順 3 で `pending` へ戻すこと。**
+> `syncRoadmapTasks()` が spec を更新できる条件は
+> `jobs.length === 0 && status === 'pending'` である。**`blocked` のまま採用し直すと
+> `SYNC_FAILED`（`spec conflicts detected for started/completed tasks`）で失敗し、
+> 訂正版の spec は1文字も入らない。**
+
+> ⚠ **運用上の注意: 却下済みと実質同一の spec を再提出しないこと。**
+>
+> この API は **却下済みかどうかを検査しない**ため、同じ `implementationScope` /
+> `allowedPaths` をそのまま出し直すと Design Review を**引き直せてしまう**。この repo では
+> 同一入力への判定が実行ごとに反転することが実測されており
+> （ledger: `independent-review-verdict-instability`）、それは
+> **偶然の ALIGNED を待つ再抽選**になる。必ず **CONFLICT の指摘に応じて中身を変えてから**出すこと。
+>
+> **この制約は現在まだ機械的に強制されていない。**（`adoption-path-has-no-material-difference-check`）
+> AC だけを書き換えても「変えた」ことにならない —— reviewer は acceptanceCriteria を見ない。
+> 変えるべきは `implementationScope` / `allowedPaths`、または ledger 本文そのものである。
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{
+        "roadmapId": "<ledger の item id>",
+        "implementationScope": "<訂正した実装範囲>",
+        "allowedPaths": ["apps/api/src/..."],
+        "acceptanceCriteria": ["..."]
+      }' \
+  "$API/api/projects/$PROJECT_ID/roadmap-adoptions"
+```
+
+**成立条件**: 対象 Task が **Job を1件も持たない**こと。`syncRoadmapTasks()` は Job を持たない
+Task を可変として扱うため spec が更新され、**fresh Design Review が走る**。
+Job を持つ Task は `ALREADY_EXECUTED` で拒否される（既存の二重実行防御。これは正しい挙動）。
+
+`allowedPaths` は repository-relative でなければならない（絶対パスは
+File Change Guard が最初の implement Job を止める）。
+
+### 5. それでも解決しないとき
+
+- ledger 本文の訂正で解ける見込みがあるなら 2 へ戻る
+- この Task をいま進めないと決めるなら `POST /api/tasks/:id/abort`（CEO Approval が要る）で park する。
+  Roadmap 項目の残作業は消えず、後から follow-up 採用で別 Task identity として再開できる
+
+---
+
+## この経路と PL 自動経路の順序
+
+Human Recovery は**自動経路の代わりではなく、自動経路が構造的に届かない範囲だけ**を埋める。
+順序は次のとおりで、前段を飛ばさない:
+
+```text
+Design Review CONFLICT
+  → #255 staged recovery（Critic → PL revision → formal review → Challenge → Independent Remediation）
+  → 解決しなかったものだけ #259 Blocked Triage が分類
+  → CEO escalation / Human Recovery 待ち
+```
+
+`blocked` かつ Job 0 件の Task は `findRemediationSubject()`（`pending` を要求）から外れるため、
+**#255 は一度も走らない**。Triage はこれを `ceo_escalation` へ倒し、CEO 通知には
+「試したが駄目だった」ではなく「**一度も実行できていない**」と書く。
+Human Recovery で `pending` へ戻すと、以降は上の順序がそのまま適用される。
+
+---
+
+## 効果検証（Design Philosophy 8）
+
+新しいテーブルを足していないので、集計は既存 `audit_log` から取る。
+
+```sql
+-- Human Recovery の実施件数と理由
+SELECT entity_id, detail, created_at
+FROM audit_log
+WHERE entity_type = 'task' AND operation = 'task_human_recovered'
+ORDER BY created_at DESC;
+```
+
+後から見たいのは次の3つである:
+
+1. **件数が減っているか** — 減らないなら、CONFLICT の作り込み側（提案 or ledger）が直っていない
+2. **再投入が効いたか** — `task_human_recovered` の後にその Task の Job が作られたか
+3. **同じ Task を、訂正せずに何度も押していないか** — audit の `dth=<hash>` が同じ行が並ぶなら、
+   同じ design text のまま再投入を繰り返している。手順 2 へ戻って原因（提案側か ledger 側か）を
+   切り分けること。**この重複は API では止めていない**（止めると訂正経路ごと塞がるため。
+   上の「既知の穴」を参照）
+
+---
+
+## 関連
+
+- `tasks/roadmap.md` … `task-design-review-conflict-has-no-recovery-route`
+- `apps/api/src/humanRecovery/recoverBlockedTask.ts` … 実装と、境界の根拠
+- `docs/project_memory/rules/approval_rules.md` … 「resume は Gate を代替しない」章
+- `specs/22_safety_approval_design_principle.md` … Human Approval を最後の Safety Boundary として扱う原則

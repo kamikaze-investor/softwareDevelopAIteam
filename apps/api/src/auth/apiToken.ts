@@ -2,6 +2,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { isWorkerRouteAllowed } from './workerAllowlist'
 import { isActionsReadonlyRouteAllowed } from './actionsReadonlyAllowlist'
+import { isHumanOnlyRoute } from './humanOnlyRoutes'
 
 const BEARER_PREFIX = 'Bearer '
 
@@ -120,13 +121,39 @@ export async function apiTokenAuth(
   reply.status(401).send({ error: 'Invalid token' })
 }
 
-/** ADMIN/WORKERいずれも未設定のときの既存挙動（変更なし）。 */
+/**
+ * ADMIN/WORKERいずれも未設定のときの挙動。
+ *
+ * **既存の legacy 認証そのものは変えていない。** 足したのは最後の1点だけで、
+ * `HUMAN_ONLY_ROUTES` に載る route を **legacy mode では fail-closed にする**。
+ * この mode は単一 `API_TOKEN` を全 route へ許すため、caller が人か Worker かを
+ * 区別する材料が無い（`./humanOnlyRoutes` の解説を参照）。
+ *
+ * **`API_TOKEN` 未設定（= 認証を一切行わない構成）でも human-only route は通さない。**
+ * 一度はここを素通しにしたが、それは自分の論拠と逆だった —— legacy mode を塞ぐ理由が
+ * 「人か自動かを区別できない」ことなら、**認証が無い構成では主体がそもそも分からない**ので、
+ * より強く塞がる側である。弱い方を拒否して強い方を通すのは筋が通らない
+ * （独立レビュー round 4・blocking 指摘）。
+ *
+ * これは机上の話ではない。ローカル開発環境は **AI agent（OpenCode / Codex）が
+ * localhost の API へ HTTP で到達できる場所そのもの**であり、CEO 決定（2026-09-18）が
+ * 「AI/PL の自律呼び出しには適用しない」と定めた相手が実際に居る。
+ *
+ * 結果として規則は1本になる: **human-only route は split credential mode の ADMIN でのみ通る。**
+ */
 async function legacySingleTokenAuth(
   req: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> {
   const expectedToken = process.env.API_TOKEN
-  if (!expectedToken) return
+  if (!expectedToken) {
+    // 認証を行わない構成。route の存在を隠す相手も居ない（API 全体が開いている）ので、
+    // ここは token 検証を待たずに即 403 でよい。
+    if (isHumanOnlyRoute(req.routeOptions.method, req.routeOptions.url)) {
+      rejectHumanOnlyRoute(reply)
+    }
+    return
+  }
 
   const authHeader = req.headers.authorization
   if (!authHeader || !authHeader.startsWith(BEARER_PREFIX)) {
@@ -137,5 +164,30 @@ async function legacySingleTokenAuth(
   const token = authHeader.slice(BEARER_PREFIX.length).trim()
   if (token !== expectedToken) {
     reply.status(401).send({ error: 'Invalid token' })
+    return
   }
+
+  // **token は正しい。それでも human-only route は legacy mode では通さない。**
+  // 判定を token 検証の**後**に置くのは、無効な token に 403 を返して
+  // 「route は在るが権限が無い」と誤って教えないためである。
+  if (isHumanOnlyRoute(req.routeOptions.method, req.routeOptions.url)) {
+    rejectHumanOnlyRoute(reply)
+  }
+}
+
+/**
+ * human-only route を「この構成では実行できない」として断る。
+ *
+ * 401（token が違う）ではなく 403 である。**構成の問題**であって credential の問題ではない、
+ * と呼び出し側へ伝えるためで、文面もその直し方（split credential mode）を名指しする。
+ */
+function rejectHumanOnlyRoute(reply: FastifyReply): void {
+  reply.status(403).send({
+    error:
+      'Forbidden: this operation is restricted to an authenticated human (CEO), and the current '
+      + 'auth configuration cannot distinguish a human caller from automation. '
+      + 'Configure ADMIN_TOKEN_SHA256 / WORKER_TOKEN_SHA256 (split credential mode) and retry '
+      + 'with the ADMIN credential',
+    code: 'HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS',
+  })
 }

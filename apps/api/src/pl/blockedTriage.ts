@@ -50,8 +50,21 @@
  */
 
 import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
-import { DESIGN_REVIEW_MAX_ATTEMPTS } from '../designReview/designReviewCoordinator'
+import {
+  DESIGN_REVIEW_MAX_ATTEMPTS,
+  recomputeDecision,
+  type RawStrategicResult,
+} from '../designReview/designReviewCoordinator'
 import { DEFAULT_STALL_HINT_MS, type AttentionItem } from '../state/systemState'
+import {
+  isReachableByAutonomousLoop,
+  recoveryReleasesProjectSlot,
+} from '../humanRecovery/recoveryAudit'
+import { countRemediationAttempts, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import {
+  predictHumanRecoveryDriver,
+  type HumanRecoveryNextDriver,
+} from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 
@@ -383,6 +396,26 @@ function hasLiveJob(facts: Facts): boolean {
  * **`AttentionItem` と storage しか受け取らない。** PL の自然言語・riskLevel 申告は
  * 引数に存在しないので、**自己申告で分類を動かすことが構造的にできない**。
  */
+/**
+ * 直近 Design Review run の判定を、**API 側の再計算で**求める。
+ *
+ * `findRemediationSubject()`（#255）が Remediation 対象を決めるのに使っているのと同じ
+ * `recomputeDecision()` を通す。**判定ロジックをここに書き写さない** —— 2箇所に書くと、
+ * 同じ run に対して Triage と Remediation が違う結論を出す。
+ * 読めない・再計算できないものは `undefined`（＝ CONFLICT と決めつけない。fail-closed）。
+ */
+function recomputedDecisionOf(storage: IStorage, taskId: string | undefined): string | undefined {
+  if (taskId === undefined) return undefined
+  const run = storage.designReviewRuns.findLatestByTaskId(taskId)
+  if (!run?.resultJson) return undefined
+  try {
+    const raw = JSON.parse(run.resultJson) as RawStrategicResult
+    return recomputeDecision(raw, 'task', run.changedFiles).decision
+  } catch {
+    return undefined
+  }
+}
+
 export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDiagnosis {
   const facts = gatherFacts(storage, item)
   const result = base(item)
@@ -490,6 +523,103 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       confidence: 'high',
       recommendedLane: 'ceo_escalation',
       summary: 'CEO の承認待ちで止まっている。AI 側にできることは無い。',
+    }
+  }
+
+  // ── 4.5 blocked かつ Job 0 件。**配線済みの復旧経路がどれも構造的に届かない** ──────
+  //
+  // `remediateConflict()`（#255）は `findRemediationSubject()` が `status === 'pending'` を
+  // 要求するため、この Task を**一度も試さない**。`resumeBlockedTask()` は latestJob から
+  // 新 Job を組み立てるので Job 0 件では必ず失敗する。つまり下の 5 と同じ CONFLICT でも、
+  // この状態にあるものは Remediation レーンへ渡してはならない ——
+  // 渡すと CEO には「Remediation を試したが解決しなかった」と読める報告が届く（実際は未実行）。
+  //
+  // **判定を書き直さない。** 「blocked かつ Job 0 件」の判定は `systemState.ts` が
+  // `task_blocked_without_job` として既に行っており、ここはその結論を使うだけである。
+  //
+  // 解けるのは CEO の明示操作（Human Recovery）だけなので `ceo_escalation` で終端する。
+  if (item.kind === 'task_blocked_without_job') {
+    const stalled = facts.review
+    // **判定は runner の自己申告ではなく API 側の再計算で決める。**
+    //
+    // `readLatestDesignReview()` が返す `decision` は top-level `finalDecision` の生値である。
+    // #255 が書く CONFLICT は `{"focusedReviewResults":[...]}` だけで **`finalDecision` を持たない**
+    // ので、生値で `=== 'CONFLICT'` と比べると**本番で最も多い形が丸ごと漏れる**
+    // （独立レビュー round 3 指摘。round 2 で「ALIGNED 以外」を絞った際に入れた退行）。
+    // 逆に、壊れた出力が `finalDecision: 'CONFLICT'` と自己申告していても信用してはならない。
+    //
+    // よって `findRemediationSubject()` と**同一の** `recomputeDecision()` を通す。
+    // 2つの経路が同じ入力を違う判定にすることが無くなる。
+    // **判定は1度だけ再計算し、分類・証拠・本文の全部で同じ値を使う。**
+    // 分類を再計算値で行いながら本文へ生値を出すと、#255 形では
+    // 「Design Review は undefined」と書かれた high-confidence な CONFLICT 報告になる
+    // （独立レビュー round 4 指摘）。
+    const recomputed = recomputedDecisionOf(storage, item.taskId)
+    const reviewIsConflict = stalled?.status === 'succeeded' && recomputed === 'CONFLICT'
+
+    // **自律ループから到達できる形か**（`roadmapActive` 等）。
+    // Human Recovery は到達可否に関わらず受理する —— 断ると、`abort_task` も採用し直しも
+    // `pending` を要求するため、**どこからも動かせない Task ができてしまう**
+    // （独立レビュー指摘・2026-09-21）。ここではそれを**報告文へ反映するためだけ**に使う。
+    const subject = item.taskId !== undefined
+      ? storage.tasks.findById(item.taskId)
+      : undefined
+    const reachable = subject !== undefined && isReachableByAutonomousLoop(subject)
+    // **到達可否とは別の問い。** `occupiesProject()` は `roadmapActive` だけを見るので、
+    // `roadmapActive=true` かつ assignee が違う Task は「到達できないのに枠も空かない」。
+    // 両者を1つの真偽値で語ると嘘の案内になる（独立レビュー round 4 指摘）。
+    const releasesSlot = subject !== undefined && recoveryReleasesProjectSlot(subject)
+    // **「戻したら何が動くか」は endpoint と同じ関数に答えさせる。**
+    // ここで条件を並べ直すと必ずずれる —— 実際 round 5 で、到達可能かつ予算ありだけを見て
+    // Remediation を約束し、`findRemediationSubject()` の残りの条件
+    // （roadmapTaskKey / run の種別・終端・evidence 未登録・再計算 CONFLICT）を落としていた。
+    // attention は running な Project にしか出ないが、**それを前提にしない**。
+    // 前提を書き込むと、attention の条件が変わったときに黙って嘘になる。
+    const projectIsRunning = storage.projects.findById(item.projectId)?.status === 'running'
+    const driver = subject !== undefined
+      ? predictHumanRecoveryDriver(storage, subject, projectIsRunning)
+      : undefined
+
+    return {
+      ...result,
+      // 原因の語彙は増やさない。CONFLICT で止まったならそれが原因であり、
+      // この分岐が変えるのは**レーン**（到達可能性）だけである。
+      rootCauseClass: reviewIsConflict ? 'design_review_conflict' : 'unknown',
+      blockingLayer: reviewIsConflict ? 'design_review' : 'job_creation',
+      evidence: [
+        { fact: 'task.status', ...(item.taskId !== undefined ? { id: item.taskId } : {}), value: 'blocked' },
+        { fact: 'jobs.count', value: '0' },
+        ...(stalled !== undefined
+          ? [{
+            fact: 'design_review_run.finalDecision',
+            id: stalled.runId,
+            // 生値ではなく再計算値。分類と食い違う証拠を CEO へ出さない。
+            value: `${recomputed ?? stalled.decision ?? 'unknown'} (status=${stalled.status})`,
+          }]
+          : []),
+        // **予算を数字で出す。** 「戻せば Remediation が動く」かどうかはこれで決まるので、
+        // 案内の根拠を CEO が自分で確かめられるようにする。
+        ...(item.taskId !== undefined
+          ? [{
+            fact: 'remediation.attempts',
+            id: item.taskId,
+            value: `${countRemediationAttempts(storage, item.taskId)}/${PL_MAX_REMEDIATION_ATTEMPTS}`,
+          }]
+          : []),
+      ],
+      recoverable: true,
+      // CONFLICT が読めているときだけ原因を断定できる。読めないなら状態しか分かっていない。
+      confidence: reviewIsConflict ? 'high' : 'low',
+      recommendedLane: 'ceo_escalation',
+      summary:
+        'Task が blocked のまま Job を1件も持っておらず、配線済みの自動復旧経路が'
+        + '構造的にどれも到達できない（Independent Remediation は pending を、'
+        + 'resume は既存 Job を要求する）。'
+        + (reviewIsConflict
+          ? `直近の task-kind Design Review は ${recomputed} で、evidence が登録されていない。`
+          : '')
+        + ' CEO が Human Recovery（`POST /api/tasks/:id/recover`）で `pending` へ戻す必要がある。'
+        + recoveryOutlook(driver, { reachable, releasesSlot }),
     }
   }
 
@@ -724,7 +854,65 @@ export function needsProviderDiagnosis(allowed: readonly string[]): boolean {
 // ────────────────────────────────────────────────────────────
 
 /** その診断で CEO に求める判断と、**複数の**安全な選択肢。1つに決め打ちしない。 */
-function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string; options: string[] } {
+/**
+ * 「戻したら何が起きるか」を1文で書く。**`nextDriver` の値をそのまま言い換えるだけ**にする。
+ *
+ * ここで条件を再構成しないこと —— endpoint が返す値と案内が食い違う原因は毎回それだった。
+ */
+function recoveryOutlook(
+  driver: HumanRecoveryNextDriver | undefined,
+  context: { reachable: boolean; releasesSlot: boolean },
+): string {
+  const slotNote = context.releasesSlot
+    ? 'なお戻せば**Project の枠は解放される**。'
+    : '戻しても roadmapActive のままなので**Project の枠は解放されない**。'
+
+  switch (driver) {
+    case 'pl_independent_remediation':
+      return '戻せば既存ループが引き取り、Independent Remediation が fresh Design Review を起こす。'
+    case 'attention_only':
+      return '戻しても自動では進まない（Remediation の対象条件を満たさないか、予算を使い切っている）。'
+        + '`task_ready_without_job` として attention には出るが、'
+        + '**その Task が過去に同じ kind で通知済みなら通知は繰り返されない**。'
+        + '進めたいなら訂正した spec で Roadmap 項目を採用し直すこと。'
+    case 'project_not_running':
+      return '**ただし Project が running でないので、戻しても何も動かず通知も出ない。**'
+        + '先に Project を再開すること。'
+    case 'none':
+      return 'この Task は自律ループの対象外（roadmapActive=false / assignee が developer_ai でない）'
+        + 'なので戻しても自動では進まない。' + slotNote
+        + '進めたいなら戻したうえで Roadmap 項目を採用し直すこと。'
+    default:
+      // Task を特定できていない場合。断定しない。
+      return '戻した後に何が動くかは応答の `nextDriver` が返す。'
+  }
+}
+
+function ceoDecisionAndOptions(
+  diagnosis: BlockedDiagnosis,
+  item: AttentionItem,
+): { decision: string; options: string[] } {
+  // **Job 0 件の blocked は、どの原因であってもまず `pending` へ戻すのが先。**
+  // `abortTask()` も `syncRoadmapTasks()` も `status === 'pending'` を要求するので、
+  // 原因が CONFLICT と特定できなかった（`rootCauseClass='unknown'`）場合に汎用の選択肢へ
+  // 落ちると、**park を勧めておきながら `TASK_NOT_PARKABLE` で弾かれる**
+  // （独立レビュー round 5 指摘）。分岐の鍵は原因ではなく**どの attention か**である。
+  if (item.kind === 'task_blocked_without_job' && diagnosis.rootCauseClass !== 'design_review_conflict') {
+    return {
+      decision:
+        'blocked のまま Job を1件も持たない Task が、自動復旧経路から外れた状態にある。'
+        + '原因は機械的事実からは CONFLICT と断定できていない。'
+        + 'どの対処も先に Human Recovery で `pending` へ戻す必要がある。',
+      options: [
+        'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻し、'
+        + '応答の `nextDriver` が示す経路に従う',
+        '戻したうえで、訂正した implementationScope / allowedPaths で Roadmap 項目を採用し直す',
+        '戻したうえで park する（`abort_task`）。'
+        + '**blocked のままでは `TASK_NOT_PARKABLE` で park できない**',
+      ],
+    }
+  }
+
   if (diagnosis.recommendedLane === 'maintenance_lane') {
     return {
       decision:
@@ -785,6 +973,31 @@ function ceoDecisionAndOptions(diagnosis: BlockedDiagnosis): { decision: string;
         decision: '待っている承認そのもの。',
         options: ['Mobile から承認する', '却下して別の設計へ回す'],
       }
+    // `independent_remediation` レーンは上で早期 return するので、ここへ来る CONFLICT は
+    // **Remediation が構造的に届かないもの**（blocked かつ Job 0 件）だけである。
+    // したがって「もう一度 Remediation へ」は選択肢にならない。まず再投入が要る。
+    case 'design_review_conflict':
+      // **どの選択肢も、まず `pending` へ戻すことが前提になる。**
+      // `syncRoadmapTasks()`（採用し直し）も `abortTask()`（park）も `status === 'pending'` を
+      // 要求するため、blocked のままではそれぞれ `SYNC_FAILED` / `TASK_NOT_PARKABLE` で弾かれる。
+      // 順序を書かないと**どれも実行できない選択肢**を CEO へ渡すことになる
+      // （独立レビュー指摘・2026-09-21）。
+      return {
+        decision:
+          'CONFLICT で止まった Task が、自動復旧経路から外れた状態にある。'
+          + 'どの対処も先に Human Recovery で `pending` へ戻す必要がある。',
+        options: [
+          // **ここで結果を約束しない。** 何が動くかは上の「原因の説明」が
+          // `nextDriver` から導いて書いている。選択肢側で言い直すと、予算だけ見て
+          // Remediation を約束する—— という round 5 の指摘を作り直すことになる。
+          'Human Recovery（`POST /api/tasks/:id/recover`）で既存ループへ戻す'
+          + '（**戻した後に何が動くかは上の「原因の説明」と応答の `nextDriver` が示す**）',
+          '戻したうえで、訂正した implementationScope / allowedPaths で Roadmap 項目を'
+          + '採用し直す（CONFLICT の原因が ledger 本文の陳腐化なら、先に本文を訂正する）',
+          '戻したうえで park する（`abort_task`）。'
+          + '**blocked のままでは `TASK_NOT_PARKABLE` で park できない**',
+        ],
+      }
     case 'design_review_exhausted':
       return {
         decision: 'bounded retry を使い切った Design Review をどう扱うか。',
@@ -840,7 +1053,7 @@ export interface TriageEscalationInput {
  */
 export function buildTriageEscalationBody(input: TriageEscalationInput): string {
   const { diagnosis, item } = input
-  const { decision, options } = ceoDecisionAndOptions(diagnosis)
+  const { decision, options } = ceoDecisionAndOptions(diagnosis, item)
 
   const lines: string[] = [
     `何が止まったか: ${item.kind} — ${item.detail}`,
