@@ -29,7 +29,11 @@ import {
   PL_MAX_REMEDIATION_ATTEMPTS,
   recordRemediationFailure,
 } from '../pl/remediationStep'
-import { latestHumanRecoveryId, recoverBlockedTask } from './recoverBlockedTask'
+import {
+  HUMAN_RECOVERY_REASON_MAX_LENGTH,
+  latestHumanRecoveryId,
+  recoverBlockedTask,
+} from './recoverBlockedTask'
 import { recoveryReleasesProjectSlot } from './recoveryAudit'
 
 interface Seeded {
@@ -431,6 +435,54 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     // 戻しても枠は空かない。「戻せば枠が解放される」と言ってはならない場合である。
     expect(recoveryReleasesProjectSlot(storage.tasks.findById(taskId)!)).toBe(false)
     expect(occupiesProject(storage.tasks.findById(taskId)!)).toBe(true)
+  })
+})
+
+describe('reason は短い監査理由であり、切らずにそのまま残す', () => {
+  // **`reason` の長さを判断するのは route schema と `HUMAN_RECOVERY_REASON_MAX_LENGTH` の
+  // 1組だけ。** service / storage には `slice()` を置かない —— route が長い本文を受理して
+  // audit で切る、という二重基準を作らないためである。
+
+  it('**短い reason は audit へ全文そのまま入る**', () => {
+    const { storage, taskId } = seed()
+    const reason = 'ledger 本文を実仕様へ訂正したので再レビューさせる'
+
+    recoverBlockedTask(storage, { taskId, reason })
+
+    const entry = storage.auditLog.findByEntity('task', taskId)
+      .find((e) => e.operation === 'task_human_recovered')
+    // `toContain` ではなく完全一致で確かめる。部分一致だと truncation を見逃す。
+    expect(entry?.detail?.endsWith(`: ${reason}`)).toBe(true)
+  })
+
+  it('**上限いっぱいの reason でも1文字も落ちない**', () => {
+    const { storage, taskId } = seed()
+    const reason = 'x'.repeat(HUMAN_RECOVERY_REASON_MAX_LENGTH)
+
+    recoverBlockedTask(storage, { taskId, reason })
+
+    const entry = storage.auditLog.findByEntity('task', taskId)
+      .find((e) => e.operation === 'task_human_recovered')
+    expect(entry?.detail?.endsWith(`: ${reason}`)).toBe(true)
+  })
+
+  it('**固定 prefix を足しても audit detail は 500 文字に収まる**', () => {
+    // 既存 audit 運用のおおよその長さ。`HUMAN_RECOVERY_REASON_MAX_LENGTH` を上げるなら
+    // ここが先に落ちる —— それが上限を選び直す合図である。
+    const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
+    completeReviewAsConflict(storage, taskId)   // dth= に実際の hash が入る形にする
+
+    recoverBlockedTask(storage, {
+      taskId,
+      reason: 'x'.repeat(HUMAN_RECOVERY_REASON_MAX_LENGTH),
+    })
+
+    const entry = storage.auditLog.findByEntity('task', taskId)
+      .find((e) => e.operation === 'task_human_recovered')
+    expect(entry?.detail).toBeDefined()
+    expect((entry?.detail as string).length).toBeLessThanOrEqual(500)
+    // prefix が消えていないことも確かめる（長さだけ見ると欠落に気づけない）。
+    expect(entry?.detail).toMatch(/^blocked -> pending by human recovery \(dth=[0-9a-f]{16}\): /)
   })
 })
 

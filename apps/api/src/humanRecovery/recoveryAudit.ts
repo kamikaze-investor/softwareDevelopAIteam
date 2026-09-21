@@ -21,10 +21,18 @@ import type { IStorage } from '../storage/interface'
  * `roadmapActive && assignee === 'developer_ai'` を要求する（`isReadyTaskWithoutJob()`）。
  * 満たさない Task を `pending` にすると、**いま出ている attention が消えて代わりが立たない**。
  *
- * **定義はここ1箇所だけに置く。** `recoverBlockedTask()`（受理の可否）と
- * `triageBlocked()`（CEO へ出す選択肢）が同じ述語を使わないと、
- * **「Human Recovery を使え」と案内しておきながら endpoint が 409 で断る**という
- * 食い違いが起きる（独立レビュー指摘・2026-09-21）。
+ * **これは受理の可否を決める述語ではない。** 到達できない Task でも Human Recovery は
+ * 受理する（`nextDriver = 'none'` を返す）—— 断ると `abort_task` も採用し直しも
+ * `pending` を要求するため、**どこからも動かせない Task** が残るからである。
+ * 旧 `TASK_NOT_REACHABLE` 設計の名残りをここに書き戻さないこと。
+ *
+ * **定義はここ1箇所だけに置く。** いま共有しているのは次の2つで、どちらも
+ * 「戻した**後**に何が起きるか」の説明である:
+ *
+ *   1. `predictHumanRecoveryDriver()` —— 再投入後の `nextDriver` の判定
+ *   2. `triageBlocked()` —— CEO へ出す「戻した後に何が動くか」の本文
+ *
+ * 2つが別々に条件を組み立てると、**案内が endpoint の返す値と食い違う**。
  */
 export function isReachableByAutonomousLoop(
   task: Pick<Task, 'roadmapActive' | 'assignee'>,

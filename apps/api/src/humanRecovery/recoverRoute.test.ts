@@ -12,6 +12,7 @@ import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { describe, expect, it } from 'vitest'
 import type { Task } from '@ai-team/shared'
+import { HUMAN_RECOVERY_REASON_MAX_LENGTH } from './recoverBlockedTask'
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { taskRoutes }, { resetStorage }] = await Promise.all([
@@ -95,6 +96,40 @@ describe('POST /api/tasks/:id/recover', () => {
       // **通し番号は返さない**（CEO 決定: 新しい attempt counter / 数字を作らない）。
       expect(body).not.toHaveProperty('attempt')
       expect(body.task.status).toBe('pending')
+    })
+  })
+
+  it('**上限ちょうどの reason は受理する**', async () => {
+    await withApp(async (app) => {
+      const taskId = await seedBlockedTaskWithoutJob(app)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${taskId}/recover`,
+        payload: { reason: 'あ'.repeat(HUMAN_RECOVERY_REASON_MAX_LENGTH) },
+      })
+
+      expect(res.statusCode).toBe(200)
+    })
+  })
+
+  it('**上限を1文字でも超えたら 400。切り詰めて受理しない**', async () => {
+    // silent truncation は監査記録として最悪の形 ——「記録した」と言いながら中身が違う。
+    // 入口で断り、`reason` は短い監査理由だという責務を保つ。
+    await withApp(async (app) => {
+      const taskId = await seedBlockedTaskWithoutJob(app)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${taskId}/recover`,
+        payload: { reason: 'あ'.repeat(HUMAN_RECOVERY_REASON_MAX_LENGTH + 1) },
+      })
+
+      expect(res.statusCode).toBe(400)
+      expect(JSON.parse(res.body)).toMatchObject({ error: 'Validation failed' })
+      // 状態も動いていない。
+      const after = await app.inject({ method: 'GET', url: `/api/tasks/${taskId}` })
+      expect(JSON.parse(after.body).status).toBe('blocked')
     })
   })
 

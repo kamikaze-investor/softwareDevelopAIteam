@@ -140,9 +140,28 @@ import {
 
 
 
+/**
+ * `reason` の上限。**Human Recovery の正本はここ1箇所だけ。**
+ *
+ * `reason` は「なぜ CEO がこの Task を再投入したのか」を残す**短い監査理由**であって、
+ * 実装指示の本文ではない。400 文字を超える内容が必要なら、それは `reason` の責務ではない。
+ *
+ * **入口で断る。後から詰めない。** route が長い本文を受理しておいて audit で切る、という
+ * 二重基準を作らないための定数である。silent truncation は監査記録として最悪の形で、
+ * 「記録した」と言いながら中身が違う。`slice()` を route / service / storage へ
+ * 重ね書きしないこと —— 長さの判断はこの定数と route schema の1組だけが持つ。
+ *
+ * 固定 prefix（`blocked -> pending by human recovery (dth=...): `）を足しても
+ * 既存 audit 運用のおおよそ 500 文字に収まる値にしてある（test で固定）。
+ */
+export const HUMAN_RECOVERY_REASON_MAX_LENGTH = 400
+
 export interface RecoverBlockedTaskInput {
   taskId: string
-  /** なぜ再投入するのか。audit に残す。 */
+  /**
+   * なぜ再投入するのか。**audit へ全文そのまま残す**（切らない）。
+   * 長さは route schema が `HUMAN_RECOVERY_REASON_MAX_LENGTH` で受理時に検証する。
+   */
   reason: string
 }
 

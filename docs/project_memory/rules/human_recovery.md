@@ -120,6 +120,10 @@ curl -s -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applic
   "$API/api/tasks/$TASK_ID/recover"
 ```
 
+**`reason` は短い監査理由（最大 400 文字 = `HUMAN_RECOVERY_REASON_MAX_LENGTH`）。**
+超えると 400 で断られる —— **切り詰めて受理はしない**（audit に「記録した」と書いて中身が違う
+状態を作らないため）。実装指示の本文をここへ入れない。
+
 成功すると `blocked` → `pending` に戻り、`nextDriver` が返る:
 
 - `pl_independent_remediation` … PR #255 の Independent Remediation が提案を作り直し、
