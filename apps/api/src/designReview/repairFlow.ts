@@ -270,11 +270,19 @@ export async function runRepairFlow(
  */
 function isUsableScopePrefix(prefix: string): boolean {
   const candidate = prefix.split('\\').join('/').replace(/\/+$/, '')
-  if (candidate.length === 0) return false
   if (candidate !== candidate.trim()) return false
   if (candidate.startsWith('/')) return false
   if (/^[A-Za-z]:/.test(candidate)) return false
-  if (candidate.split('/').includes('..')) return false
+  // **正規化で形が変わる prefix は通さない。** `..` だけでなく `.` や連続スラッシュも同じで、
+  // `apps/api/src/./pl` を残したまま正規化済みの file と比べると、**範囲内の指摘を範囲外と
+  // 誤判定する**（独立レビュー指摘）。「正規化しても変わらない形」だけを通すことで、
+  // 下の比較で prefix を正規化するかどうかが結果に影響しなくなる。
+  if (candidate !== posix.normalize(candidate)) return false
+  // 空文字はここで落ちる（`posix.normalize('')` は `.` を返すので形が変わる）。
+  // `..` と `.` は正規化しても残る（`..` / `../a` / `.`）。これらは File Change Guard の
+  // 前方一致にどの変更ファイルも一致させないので、範囲として使えない。
+  const segments = candidate.split('/')
+  if (segments.includes('..') || segments.includes('.')) return false
   return true
 }
 
@@ -286,9 +294,9 @@ function isInsideAllowedPaths(file: string, allowed: readonly string[]): boolean
     // **file 側だけ正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
     // 範囲内に見えるが、解決すると外を指す。
     //
-    // prefix 側は `isUsableScopePrefix()` で相対・`..` 無しに限ってあるので、
-    // ここで正規化しても結果は変わらない。**「正規化しないから安全」ではなく、
-    // 「使えない prefix を先に落としてあるから安全」である**（独立レビュー指摘）。
+    // prefix 側は `isUsableScopePrefix()` が **正規化しても変わらない形**だけに限ってある
+    // ので、ここで正規化してもしなくても結果は同じである。**「正規化しないから安全」では
+    // なく、「正規化で変わる prefix を先に落としてあるから安全」である**（独立レビュー指摘）。
     // 末尾スラッシュだけは落とす。落とさないと範囲内の finding を取りこぼす。
     const candidate = prefix.split('\\').join('/').replace(/\/+$/, '')
     return normalized === candidate || normalized.startsWith(`${candidate}/`)

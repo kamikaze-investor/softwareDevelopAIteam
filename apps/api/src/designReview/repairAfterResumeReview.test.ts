@@ -438,6 +438,12 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     ['前後に空白', ' apps/api/src/pl '],
     ['posix 絶対パス', '/srv/ai-team/apps/api/src/pl'],
     ['Windows 絶対パス', 'C:/repo/apps/api/src/pl'],
+    // 正規化で消える成分。残したまま正規化済みの file と比べると食い違う。
+    ['. を含む', 'apps/api/src/./pl'],
+    ['連続スラッシュ', 'apps/api/src//pl'],
+    ['カレント', '.'],
+    ['親のみ', '..'],
+    ['親から始まる', '../apps/api/src/pl'],
   ] as const) {
     it(`allowedPaths が ${label} なら、file の無い finding だけでも通さない`, () => {
       const storage = createSQLiteStorage(':memory:')
@@ -450,6 +456,21 @@ describe('blocked Task への repair — 通してはいけないケース', () 
       expect(skipped(storage, implementJob, review)).toContain('unusable scope')
     })
   }
+
+  // 逆側も固定する。**正規化しても変わらない普通の相対 prefix は通る。**
+  // 上の検査を「相対パスを全部弾く」方向へ強めすぎれば、ここが落ちる。
+  it('正規化しても変わらない相対 prefix は範囲として使える', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, reviewJob } = shapeWithoutVerdict(storage, {
+      allowedPaths: ['apps/api/src/pl', 'packages/shared/src'],
+    })
+    const review = storeReview(storage, ids, reviewJob.id, {
+      findings: [{ severity: 'medium', file: 'packages/shared/src/aiCliTimeout.ts', message: 'in scope' }],
+    } as Partial<ReviewResult>)
+
+    const result = prepareRepairFlow(storage, { failedJob: implementJob, review })
+    expect(result.action).toBe('queue')
+  })
 
   // 使える範囲が 1 つでも欠けていれば通さない（一部だけ拾って進めない）。
   it('使える範囲と使えない範囲が混ざっていれば通さない', () => {
