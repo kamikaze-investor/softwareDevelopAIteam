@@ -100,13 +100,36 @@ export function repairFromStoredReview(
     return { status: 'rejected', code: 'TASK_NOT_FOUND', reason: `Task ${input.taskId} does not exist` }
   }
 
-  // 1. selector から trusted chain を組み直す。ここが繋がらなければ何も作らない。
+  // 1. **この経路は `blocked` な Task 専用である。**
+  //
+  //    `prepareRepairFlow()` の admission（実装が成功しているか / canonical な resume
+  //    successor か / review と実装の対応 / allowedPaths が使えるか・範囲内か /
+  //    critical finding / Design Review が ALIGNED か / live Job 競合）は
+  //    **`task.status === 'blocked'` の枝の中にしかない**。他の状態の Task はそこを
+  //    通らずに `decideRepairAction()` へ進むので、この経路が blocked 以外も受け付けると、
+  //    それら全部を迂回できてしまう（独立レビュー指摘・round 3。round 2 で verdict だけを
+  //    塞いだが、同じ形の穴が他の条件にも残っていた）。
+  //
+  //    admission を別実装で呼び直すと**同じ規則が2箇所**になるので、そうはしない。
+  //    admission が実際に走る状態だけを受け付ける。復旧が要るのは止まった Task であり、
+  //    それは定義上 `blocked` である（production `c3849205` もそうだった）。
+  if (task.status !== 'blocked') {
+    return {
+      status: 'rejected',
+      code: 'TASK_NOT_BLOCKED',
+      reason:
+        `Task ${input.taskId} is ${task.status}, not blocked; the stored-review recovery path`
+        + ' only runs where the full repair admission runs',
+    }
+  }
+
+  // 2. selector から trusted chain を組み直す。ここが繋がらなければ何も作らない。
   const chain = resolveStoredReviewChain(storage, task.id, input.reviewJobId)
   if (!chain.ok) {
     return { status: 'rejected', code: 'INVALID_REVIEW_SELECTOR', reason: chain.reason }
   }
 
-  // 2. **approval を作る前に下見する。** 同じ `prepareRepairFlow()` を使うので、
+  // 3. **approval を作る前に下見する。** 同じ `prepareRepairFlow()` を使うので、
   //    ここに簡易判定は無い。epoch があっても変わらない不適格は、この時点で返す。
   const dryRun = prepareRepairFlow(storage, {
     failedJob: chain.implementJob,
@@ -120,7 +143,7 @@ export function repairFromStoredReview(
     return { status: 'escalated', reason: dryRun.reason }
   }
 
-  // 3. **epoch が既に成立しているなら、承認をもう一度要求しない。**
+  // 4. **epoch が既に成立しているなら、承認をもう一度要求しない。**
   //
   //    consume と repair Job の実体化は同じ瞬間ではない（run を作り、その run が
   //    ALIGNED を出してはじめて repair Job ができる）。その間にプロセスが落ちると、
@@ -134,7 +157,7 @@ export function repairFromStoredReview(
     return evaluateAndAct(storage, task.id, chain, deps)
   }
 
-  // 4. この exact review に束縛された承認を探す。
+  // 5. この exact review に束縛された承認を探す。
   const existing = storage.approvalRequests
     .findByTaskId(task.id)
     .filter((request) => request.requestedAction === chain.expectedAction)
@@ -178,7 +201,7 @@ export function repairFromStoredReview(
     }
   }
 
-  // 4. **最後の authorization step として使い切る。** Task 束縛・action 一致・APPROVED・
+  // 6. **最後の authorization step として使い切る。** Task 束縛・action 一致・APPROVED・
   //    未失効を既存実装が再確認し、CAS で一度だけ CONSUMED にする。
   const consumed = storage.approvalRequests.verifyAndConsumeForTaskAction({
     taskId: task.id,
@@ -189,7 +212,7 @@ export function repairFromStoredReview(
     return { status: 'rejected', code: 'APPROVAL_NOT_CONSUMABLE', reason: consumed.reason }
   }
 
-  // 6. epoch が成立した状態で**もう一度**同じ判定を通す。こちらが正本である。
+  // 7. epoch が成立した状態で**もう一度**同じ判定を通す。こちらが正本である。
   //    下見の結果は使わない（consume の前後で storage が変わっているため）。
   return evaluateAndAct(storage, task.id, chain, deps)
 }

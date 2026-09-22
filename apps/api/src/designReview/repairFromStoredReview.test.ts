@@ -387,25 +387,16 @@ describe('recovery action — admission で落ちるものに承認を要求し�
   // `prepareRepairFlow()` の verdict 検査は blocked Task の admission の中にしかないので、
   // Task が blocked でなければそこを通らない。入口で確かめないと、approved な
   // レビューから repair と epoch を作れてしまう（独立レビュー指摘）。
-  it.each(['blocked', 'pending'] as const)('%s Task でも approved な verdict は通さない', (taskStatus) => {
+  it.each(['approved', 'pending'] as const)('verdict が %s なら通さない', (verdict) => {
     const storage = createSQLiteStorage(':memory:')
-    const ids = seed(storage, { status: taskStatus })
+    const ids = seed(storage)
     const { current } = exhaustedChainThenResume(storage, ids)
     const reviewJob = createReviewJob(storage, ids, current.id)
-    storeReview(storage, ids, reviewJob.id, { status: 'approved' } as Partial<ReviewResult>)
+    storeReview(storage, ids, reviewJob.id, { status: verdict } as Partial<ReviewResult>)
 
     const outcome = withoutApproval(storage, ids.taskId, reviewJob.id)
     expect(outcome.status).toBe('rejected')
     if (outcome.status === 'rejected') expect(outcome.reason).toContain('not changes_requested')
-  })
-
-  it.each(['approved', 'pending'] as const)('verdict が %s でも通さない', (verdict) => {
-    const storage = createSQLiteStorage(':memory:')
-    const ids = seed(storage, { status: 'pending' })
-    const { current } = exhaustedChainThenResume(storage, ids)
-    const reviewJob = createReviewJob(storage, ids, current.id)
-    storeReview(storage, ids, reviewJob.id, { status: verdict } as Partial<ReviewResult>)
-    expect(withoutApproval(storage, ids.taskId, reviewJob.id).status).toBe('rejected')
   })
 
   it('実装が成功していなければ通さない', () => {
@@ -415,11 +406,50 @@ describe('recovery action — admission で落ちるものに承認を要求し�
     expect(withoutApproval(storage, ids.taskId, reviewJob.id).status).toBe('skipped')
   })
 
-  it('done な Task は通さない', () => {
+  // **blocked 以外は入口で落とす。** admission が走らない状態だからである。
+  it.each(['done', 'pending', 'in_progress'] as const)('%s な Task は通さない', (taskStatus) => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, reviewJob } = productionShape(storage)
-    storage.tasks.update(ids.taskId, { status: 'done' } as never)
-    expect(withoutApproval(storage, ids.taskId, reviewJob.id).status).toBe('skipped')
+    storage.tasks.update(ids.taskId, { status: taskStatus } as never)
+
+    const outcome = withoutApproval(storage, ids.taskId, reviewJob.id)
+    expect(outcome.status).toBe('rejected')
+    if (outcome.status === 'rejected') expect(outcome.code).toBe('TASK_NOT_BLOCKED')
+  })
+
+  // **round 3 で見つかった穴の本体。** blocked の admission にしか無い条件を、
+  // blocked 以外の Task からこの経路で迂回できてはいけない。
+  it.each([
+    ['critical finding', { findings: [{ severity: 'critical', file: IN_SCOPE, message: 'safety' }] }],
+    ['範囲外の finding', { findings: [{ severity: 'medium', file: 'apps/api/src/routes/jobs.ts', message: 'outside' }] }],
+  ] as const)('pending Task の %s でも repair を作らない', (_label, overrides) => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage, { status: 'pending' })
+    const { current } = exhaustedChainThenResume(storage, ids)
+    const reviewJob = createReviewJob(storage, ids, current.id)
+    storeReview(storage, ids, reviewJob.id, overrides as unknown as Partial<ReviewResult>)
+
+    const outcome = withoutApproval(storage, ids.taskId, reviewJob.id)
+    expect(outcome.status).toBe('rejected')
+    expect(storage.designReviewRuns.findLatestByTaskId(ids.taskId)).toBeUndefined()
+  })
+
+  it('pending Task に live Job があっても repair を作らない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage, { status: 'pending' })
+    const { current } = exhaustedChainThenResume(storage, ids)
+    const reviewJob = createReviewJob(storage, ids, current.id)
+    storeReview(storage, ids, reviewJob.id)
+    storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+    } as never)
+
+    expect(withoutApproval(storage, ids.taskId, reviewJob.id).status).toBe('rejected')
+    expect(storage.designReviewRuns.findLatestByTaskId(ids.taskId)).toBeUndefined()
   })
 
   it('critical finding があれば通さない', () => {
