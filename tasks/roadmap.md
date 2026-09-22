@@ -2715,6 +2715,18 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    本ケースが示す固有の論点は、external operationには**自前のchild processが存在しない**ため
    `PID alive`ベースの監視が原理的に使えず、external probe（C-2a）が唯一の手段になる、という点である。
 
+   **再発（2026-09-22、PR #270）。新項目は作らない —— 本項目の定義に既に含まれるため。**
+   PR 作成後に CI / Meta Review が pending の状態で turn を終え、GitHub 側で両方 success に
+   なっても control loop は再開しなかった。CEO の指摘で発覚。ケース3との違いは
+   **watcher を 1 つも arm していなかった**点だけで、欠けている contract（C-13 automatic
+   continuation）は同じである。read-only 調査では hang も残留 process も無く、
+   completion state はいつでも取得できた —— 取りに行く主体が居なかっただけである。
+   **暫定運用（CEO 指示 2026-09-22）**: CI / Meta Review / required checks の完了後も作業を
+   続ける必要があるなら、turn を終える前に既存の PR monitor（`ccd_pr set_monitor`）を
+   自分で arm する。arm しない場合は「ここで turn が終了するため自動継続は無い」と明記する。
+   `auto_merge` は有効化しない。**この暫定運用は session harness 側の話であり、
+   AIteamOS 側の実装項目は作らない**（完全自動化の可否は別途 read-only 調査）。
+
    ### Background Task Supervision Contract（共通化するのは実装ではなく契約）
 
    #### 対象の定義（scopeの正本。個別task列挙にしない）
@@ -9239,6 +9251,91 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       テストも別々に固定してある（`lineage walk — 意味側` / `lineage walk — 停止側`）。
 
 
+<!-- roadmap:id=auth-empty-token-hash-accepted state=planned priority=high -->
+0. [ ] **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する** —
+      2026-09-22 登録（read-only 確認）。**concrete な authority boundary の欠陥であり、
+      `split-credential-migration` の cutover 前 blocker である。**
+
+      **確認した事実（コードと手順書を読んだだけ。production の設定値は読んでいない）**:
+
+      - 手順書の生成式は `printf %s "$ADMIN_TOKEN" | sha256sum`
+        （`docs/project_memory/rules/human_recovery.md`）。変数が未設定なら**空文字を hash する**
+      - 空文字の SHA-256 は `e3b0c442…b855` という **64 桁の正しい形**になる
+      - `apiTokenAuth()` は `process.env.X || undefined` で**空文字だけ**を未設定と見るので、
+        この値は「設定済み」として split credential mode を成立させる
+      - `Authorization: Bearer `（token 部が空）は `trim()` 後に空文字となり、同じ hash に一致する。
+        つまり**空 token でその credential class が取れる**
+      - 既存の防御は「片側だけ設定 → 503」「ADMIN と WORKER が同値 → 503」「ACTIONS が同値 → 503」。
+        **片側だけが空 token 由来**だと同値にならず、どの 503 にも落ちない
+      - 空 token 由来の hash を弾く検査・既知値の否認は `apps/api/src/auth/apiToken.ts` に**存在しない**
+
+      **なぜ Safety 欠陥か**: ADMIN 側がこの状態なら、空 token で ADMIN が取れる。ADMIN は
+      `HUMAN_ONLY_ROUTES`（`/api/tasks/:id/recover`）を通せる唯一の class であり、
+      `repair-budget-counted-per-task-not-per-chain` では **human resume の唯一の証明**でもある。
+      authority boundary がまとめて落ちる。
+
+      **production が現にこの状態かは未確認**（値を読まずには判定できない）。ただし
+      **確認自体は安全に行える** —— 設定値が `e3b0c442…b855` と一致するかだけを比べればよく、
+      secret は一切開示されない。この確認は `split-credential-migration` 側の作業に含める。
+
+      **着手時に確認すること（実装方針を先に決めない）**:
+
+      - `apiTokenAuth()` の既存の設定ミス検査（both-or-neither / 同値 / ACTIONS 同値）と
+        **同じ形**で、空 token 由来 hash を 503 で拒否できるか。**新しい検査層は作らない。**
+        既存の fail-closed 分岐へ 1 本足す形で足りるか
+      - `ACTIONS_READONLY_TOKEN_SHA256` も同じ扱いにするか
+      - 手順書（`human_recovery.md`）の生成式へ `set -u` 等を足すのは**副次**である。
+        機構側で塞ぐのが正本（`specs/22_safety_approval_design_principle.md` の Mechanical Validation）
+      - regression test: 空 token 由来 hash を設定したら 503、`Bearer `（空 token）では認証されない
+
+      **触る範囲**: `apps/api/src/auth/apiToken.ts` / `apps/api/src/auth/*.test.ts` /
+      `docs/project_memory/rules/human_recovery.md`
+
+      **重複しない境界**: `split-credential-migration`（deferred）は production cutover の owner で、
+      CEO / Operator 判断と計画停止を伴う。本項目は**コード側の検査**だけで、production 操作を
+      一切伴わないので**独立して着手できる**。両方を 1 項目にすると、コードで塞げる欠陥が
+      CEO 判断待ちに巻き込まれて永久に着手できなくなる。
+
+
+<!-- roadmap:id=split-credential-migration state=deferred -->
+0. [ ] **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）** —
+      2026-09-22 登録。**deferred は低優先の意味ではない。** production cutover（計画停止を伴う）と
+      production env の操作を含むため、PL が自律採用してよい範囲に無い、という意味である。
+
+      **なぜ今 owner を作るか**: 本 ledger は「legacy `API_TOKEN` → ADMIN / WORKER split credential
+      migration は ledger に id が無いまま open と宣言されている」と既に記録しており、
+      `repair-budget-counted-per-task-not-per-chain` もこの id を依存先として参照している。
+      **参照先が実在しない状態**だったので、責務をここに置く。
+
+      **現状の記録が食い違っている。推測で解消しない**:
+
+      | 出所 | 内容 |
+      |---|---|
+      | 本 ledger の監査記録（2026-09-21） | production は legacy（`ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` とも未設定） |
+      | 別セッションの記録（2026-09-22） | cutover 済み |
+      | 外部からの read-only probe（2026-09-22） | `/health` 200、無認証 `GET /api/projects` → 401 |
+
+      probe で確定するのは「**503 になる誤設定状態ではない**」ことだけである（片側のみ設定・
+      ADMIN と WORKER が同値・ACTIONS 衝突はいずれも token 比較の前に 503 を返す）。
+      legacy と正常な split は、**credential 無しの外部 probe では区別できない**。
+
+      **最初にやること（実装ではない）**: VPS 権限を持つ側が read-only で effective auth mode を
+      確認し、ここへ記録する。**secret 値は読まない・表示しない。** 併せて
+      `auth-empty-token-hash-accepted` の確認（設定値が空 token 由来 hash `e3b0c442…b855` と
+      一致しないか）も同時に行う —— 一致していれば cutover 以前に authority が漏れている。
+
+      **cutover 手順の正本は本ファイル Phase 1 の既存節**（Phase 1 = code deploy のみ /
+      Phase 2 = credential cutover を計画停止として実施 / running Job 0・pending outbox 0 の確認 /
+      成功判定を `/health` だけで行わない）。**ここで新しい手順は作らない。**
+
+      **依存関係**: human-only route（`/api/tasks/:id/recover`）と human resume 判定
+      （`repair-budget-counted-per-task-not-per-chain`）は、split が有効になって初めて
+      production で成立する。**legacy のままでも壊れない** —— 前者は 403、後者は全 resume が
+      `unknown` 扱いで repair budget を再発行しない、という安全側に閉じたまま動く。
+
+      **blocker**: `auth-empty-token-hash-accepted`（planned / high）。
+
+
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
 12. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、
@@ -9418,6 +9515,59 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - PL action の配線そのものは `vps-pl-execution-loop` の受け皿に載せる
       - `provider-outage-burns-attempt-budget` … **同じ provider のまま attempt 予算の数え方を直す**。
         本項目は予算を使い切って終端した後の話であり、別の層を担当する
+
+
+<!-- roadmap:id=termination-guarantee-audit state=planned -->
+0. [ ] **traversal / loop に termination guarantee があるかの横断監査（read-only）** —
+      2026-09-22 登録。**意味側のガードが壊れても止まるか**を確かめる。
+      **本項目は監査であり、見つけた欠陥をここで直さない。**
+
+      **観測済みの defect class（実測）**: `walkRepairGeneration()` で semantic cycle guard
+      （`seen`）を潰す mutation を当てたところ、固定 step bound を外した直後だったため
+      **停止保証がゼロ**になり、vitest worker が 1 コアを 100% 使ったまま RSS 約 1GB まで伸び、
+      **82 分止まらなかった**。`repair-budget-counted-per-task-not-per-chain` で
+      データ由来の bound（対象集合のサイズ）を入れて解消済み。
+      **同じ形が他の経路にもあるかは未確認**であり、それを確かめるのが本項目である。
+
+      **監査対象（read-only。実行はしない）**:
+
+      - bounded traversal / recursive walk
+      - parent / source / dependency traversal
+      - retry / recovery / resume loop
+      - continuation chain
+      - polling / reconcile loop
+
+      **監査観点**:
+
+      1. semantic guard（環検出・重複検出・終端条件）が壊れても**有限時間で終了**するか
+      2. データ由来の自然な bound（集合サイズ・行数など）があるか。**無いなら、なぜ無くてよいのか**
+      3. 恣意的な固定 threshold / timeout **だけ**に依存していないか
+         （固定値は正当な入力を誤って弾く側の欠陥にもなる。今回それで一度 round を戻した）
+      4. 止まらない場合に API / Worker / PL 全体を hang させうるか（責務の広さ）
+
+      **完了の定義（AC）**: 対象経路の一覧と、各経路の「停止保証の根拠」を本 ledger へ記録するまで。
+      **見つかった concrete defect は 1 件ずつ別項目として登録する**（ここで直さない）。
+      監査と修正を混ぜると、残作業が本文に溜まったまま Task だけ done になり、
+      `executed-item-remaining-work-has-no-continuation` と同じ dead-end に入る。
+
+      **作らないもの**: 新しい監査 framework / 新しい lint rule / 新しい runtime guard 層。
+      既存の read-only 調査と、既存 mutation guard（`scripts/repairLineageMutationGuard.mjs` と同型の
+      「意味側のガードを壊して、hang ではなく通常の test failure になるか」を見る当て方）で
+      足りるかを先に確かめる。
+
+      **触る範囲（調査）**: `apps/api/src` / `apps/worker/src`。記録先は `tasks/roadmap.md`。
+
+      **重複しない境界**:
+
+      - `pl-review-process-supervision`（planned / high）は**別 process の task を監視する契約**
+        （無期限 RUNNING の禁止・completion predicate・automatic continuation）である。
+        本項目は**同一 process 内のループが終わるか**であり、supervisor を足しても解決しない
+        （監視側も同じ process なら一緒に止まる）
+      - `monitoring-tiering-watchdog-monitor-pl`（planned）は VPS PL 完成後の監視段階分離で、
+        着手条件そのものが異なる
+      - `provider-outage-burns-attempt-budget`（planned）は transient 障害が attempt 予算を
+        食い潰す話で、予算の数え方であって停止保証ではない
+
 
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。

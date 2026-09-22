@@ -296,9 +296,12 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる**（state: planned）
 - **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
+- **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する**（state: planned）
+- **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）**（state: deferred）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
+- **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
 - **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
 - **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: planned）
 - **Mobile 内の運用指示窓口（Operator Chat）**（state: planned）
