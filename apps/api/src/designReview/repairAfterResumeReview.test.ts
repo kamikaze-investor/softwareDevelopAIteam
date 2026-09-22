@@ -44,6 +44,26 @@ function createResumedImplementJob(
   ids: { taskId: string, projectId: string },
   overrides: Record<string, unknown> = {},
 ): Job {
+  // resume Job の source は**必ず同じ Task の実在 Job**である
+  // （`resumeBlockedTask()` は latestJob から作る）。repair の深さは lineage から
+  // 数えるので、架空の id を指す resume を置くと数え切れず fail-closed になる。
+  // stepKey を呼び出し元が指定する場合は、その側で前身を用意している。
+  let defaultStepKey = 'resume:11111111-1111-1111-1111-111111111111:1'
+  if (overrides.workflowStepKey === undefined) {
+    const predecessor = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'original prompt',
+    } as never)
+    storage.jobs.update(predecessor.id, { status: 'failed' } as never)
+    defaultStepKey = `resume:${predecessor.id}:1`
+  }
+
   const job = storage.jobs.create({
     taskId: ids.taskId,
     projectId: ids.projectId,
@@ -53,7 +73,7 @@ function createResumedImplementJob(
     aiCliMode: 'implement',
     aiCliProvider: 'claude_code',
     aiCliPrompt: 'resume prompt',
-    workflowStepKey: 'resume:11111111-1111-1111-1111-111111111111:1',
+    workflowStepKey: defaultStepKey,
     ...overrides,
   } as never)
   return storage.jobs.update(job.id, {

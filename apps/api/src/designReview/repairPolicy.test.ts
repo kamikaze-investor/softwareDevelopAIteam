@@ -3,8 +3,10 @@ import {
   MAX_REPAIR_ATTEMPTS,
   computeFailureSignature,
   decideRepairAction,
+  walkRepairGeneration,
   type PriorRepairJob,
   type RepairFailureFacts,
+  type ResumeActorClass,
 } from './repairPolicy'
 
 const FACTS_A: RepairFailureFacts = {
@@ -18,8 +20,52 @@ const FACTS_B: RepairFailureFacts = {
   failureKind: 'ai_cli_failed',
 }
 
-function repairJob(status: string, facts: RepairFailureFacts = FACTS_A, attempt = 1): PriorRepairJob {
-  return { workflowStepKey: `repair:${attempt}`, status, facts }
+const ORIGIN_ID = 'job-origin'
+
+/** repair でも resume でもない通常の Job。generation の根になる。 */
+function originJob(
+  id: string = ORIGIN_ID,
+  facts: RepairFailureFacts = FACTS_B,
+  status = 'failed',
+): PriorRepairJob {
+  return { id, workflowStepKey: `task:${id}:initial-implement`, status, facts }
+}
+
+/** `source` を直接の親に持つ repair Job。 */
+function repairOf(
+  source: string,
+  id: string,
+  status = 'failed',
+  facts: RepairFailureFacts = FACTS_A,
+): PriorRepairJob {
+  return { id, workflowStepKey: `repair:${source}:1`, status, facts }
+}
+
+/** `source` を直接の親に持つ resume Job。actor class は省略可（= 記録が無い）。 */
+function resumeOf(
+  source: string,
+  id: string,
+  resumeActorClass?: ResumeActorClass,
+  status = 'failed',
+  facts: RepairFailureFacts = FACTS_B,
+): PriorRepairJob {
+  return { id, workflowStepKey: `resume:${source}:1`, status, facts, resumeActorClass }
+}
+
+/** origin から深さ depth の直列 repair chain を作る。tip の id は repair-<depth>。 */
+function chain(
+  depth: number,
+  factsFor: (i: number) => RepairFailureFacts = () => FACTS_A,
+  status = 'failed',
+): { jobs: PriorRepairJob[]; tip: string } {
+  const jobs: PriorRepairJob[] = [originJob()]
+  let parent = ORIGIN_ID
+  for (let i = 1; i <= depth; i += 1) {
+    const id = `repair-${i}`
+    jobs.push(repairOf(parent, id, status, factsFor(i)))
+    parent = id
+  }
+  return { jobs, tip: parent }
 }
 
 describe('computeFailureSignature — ノイズは正規化する', () => {
@@ -79,84 +125,594 @@ describe('computeFailureSignature — 意味のある数値は潰さない', () 
   })
 })
 
-describe('decideRepairAction', () => {
-  it('初回の失敗ではrepairを行う', () => {
-    const decision = decideRepairAction("job-1", [], FACTS_A)
+// ---------------------------------------------------------------------------
+// 1〜3: 既存挙動。chain 単位で数えるようにしても、1 本の chain の見え方は変わらない。
+// ---------------------------------------------------------------------------
+
+describe('decideRepairAction — 既存挙動', () => {
+  it('[1] 初回の失敗では attempt 1 の repair を作る', () => {
+    const decision = decideRepairAction(ORIGIN_ID, [originJob()], FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') {
       expect(decision.attempt).toBe(1)
-      expect(decision.stepKey).toBe('repair:job-1:1')
+      expect(decision.stepKey).toBe(`repair:${ORIGIN_ID}:1`)
       expect(decision.requireDifferentApproach).toBe(false)
+      expect(decision.generation.rootJobId).toBe(ORIGIN_ID)
+      expect(decision.generation.rootKind).toBe('origin')
+      expect(decision.generation.budgetReset).toBe(false)
     }
   })
 
-  it('異なる失敗が続く間はrepairを継続する', () => {
-    const decision = decideRepairAction("job-1", [repairJob('failed', FACTS_A, 1)], FACTS_B)
-    expect(decision.action).toBe('repair')
-    if (decision.action === 'repair') {
-      expect(decision.attempt).toBe(2)
-      expect(decision.requireDifferentApproach).toBe(false)
-    }
-  })
-
-  it('同じ失敗が残っていても即escalateせず、別アプローチを要求して継続する', () => {
-    const decision = decideRepairAction("job-1", [repairJob('failed', FACTS_A, 1)], FACTS_A)
-    expect(decision.action).toBe('repair')
-    if (decision.action === 'repair') {
-      expect(decision.attempt).toBe(2)
-      expect(decision.requireDifferentApproach).toBe(true)
-    }
-  })
-
-  it('同じ失敗が2回続いてもhard bound内なら継続する', () => {
-    const priors = [repairJob('failed', FACTS_A, 1), repairJob('failed', FACTS_A, 2)]
-    const decision = decideRepairAction("job-1", priors, FACTS_A)
-    expect(decision.action).toBe('repair')
-    if (decision.action === 'repair') {
-      expect(decision.attempt).toBe(3)
-      expect(decision.requireDifferentApproach).toBe(true)
-    }
-  })
-
-  it('hard boundを使い切ったらescalateする（無限repairを作らない）', () => {
-    const priors: PriorRepairJob[] = []
-    for (let i = 1; i <= MAX_REPAIR_ATTEMPTS; i += 1) {
-      priors.push(repairJob('failed', { exitCode: i, stderr: `distinct failure ${i}` }, i))
-    }
-
-    const decision = decideRepairAction("job-1", priors, { exitCode: 99, stderr: 'yet another distinct failure' })
+  it('[2] 1 本の chain は MAX_REPAIR_ATTEMPTS で必ず止まる', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS, (i) => ({ exitCode: i, stderr: `distinct failure ${i}` }))
+    const decision = decideRepairAction(built.tip, built.jobs, { exitCode: 99, stderr: 'yet another' })
     expect(decision.action).toBe('escalate')
     if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
   })
 
-  it('同じ失敗かつ手がかりが無い場合のみescalateする', () => {
-    const decision = decideRepairAction("job-1", [repairJob('failed', {}, 1)], {})
-    expect(decision.action).toBe('escalate')
-    if (decision.action === 'escalate') {
-      expect(decision.reason).toContain('no actionable information')
+  it('[2] hard bound の手前までは継続する', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS - 1, (i) => ({ exitCode: i, stderr: `distinct failure ${i}` }))
+    const decision = decideRepairAction(built.tip, built.jobs, { exitCode: 99, stderr: 'yet another' })
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.attempt).toBe(MAX_REPAIR_ATTEMPTS)
+  })
+
+  it('[3] 異なる失敗が続く間は repair を継続する', () => {
+    const built = chain(1)
+    const decision = decideRepairAction(built.tip, built.jobs, FACTS_B)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(2)
+      expect(decision.requireDifferentApproach).toBe(false)
     }
   })
 
-  it('repair以外の既存Jobは試行回数に数えない', () => {
-    const priors: PriorRepairJob[] = [
-      { workflowStepKey: 'implement:1', status: 'failed', facts: FACTS_B },
-      { workflowStepKey: undefined, status: 'success', facts: {} },
-    ]
-    const decision = decideRepairAction("job-1", priors, FACTS_A)
+  it('[3] 同じ失敗が残っていても即 escalate せず、別アプローチを要求して継続する', () => {
+    const built = chain(1)
+    const decision = decideRepairAction(built.tip, built.jobs, FACTS_A)
     expect(decision.action).toBe('repair')
-    if (decision.action === 'repair') expect(decision.attempt).toBe(1)
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(2)
+      expect(decision.requireDifferentApproach).toBe(true)
+    }
   })
 
-  it('Stage 1のretry Jobはrepair試行に数えない', () => {
-    const priors: PriorRepairJob[] = [{ workflowStepKey: 'retry:abc', status: 'failed', facts: FACTS_B }]
-    const decision = decideRepairAction("job-1", priors, FACTS_A)
-    expect(decision.action).toBe('repair')
-    if (decision.action === 'repair') expect(decision.attempt).toBe(1)
+  it('[3] 同じ失敗かつ手がかりが無い場合のみ escalate する', () => {
+    const built = chain(1, () => ({}))
+    const decision = decideRepairAction(built.tip, built.jobs, {})
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('no actionable information')
   })
 
-  it('成功したrepairと同じ署名でも、失敗していなければ別アプローチ要求にしない', () => {
-    const decision = decideRepairAction("job-1", [repairJob('success', FACTS_A, 1)], FACTS_A)
+  it('[3] 成功した repair と同じ署名でも、失敗していなければ別アプローチ要求にしない', () => {
+    const built = chain(1, () => FACTS_A, 'success')
+    const decision = decideRepairAction(built.tip, built.jobs, FACTS_A)
     expect(decision.action).toBe('repair')
     if (decision.action === 'repair') expect(decision.requireDifferentApproach).toBe(false)
+  })
+
+  it('[3] repair 以外の既存 Job は試行回数に数えない', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      { id: 'other', workflowStepKey: 'implement:1', status: 'failed', facts: FACTS_B },
+      { id: 'nokey', workflowStepKey: undefined, status: 'success', facts: {} },
+    ]
+    const decision = decideRepairAction(ORIGIN_ID, priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.attempt).toBe(1)
+  })
+
+  it('[3] Stage 1 の retry Job は repair 試行に数えない', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      { id: 'retry-1', workflowStepKey: `retry:${ORIGIN_ID}:1`, status: 'failed', facts: FACTS_B },
+    ]
+    const decision = decideRepairAction('retry-1', priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.attempt).toBe(1)
+  })
+
+  it('[3] 無関係な別 chain の repair は予算を食わない（Task 全体件数では数えない）', () => {
+    // 3 本の独立した chain がそれぞれ 1 回ずつ直っている。旧実装ではここで Task 全体の
+    // repair 件数が MAX に達し、4 本目の最初の失敗がいきなり escalate していた（実測）。
+    const priors: PriorRepairJob[] = []
+    for (const n of [1, 2, 3]) {
+      priors.push(originJob(`origin-${n}`))
+      priors.push(repairOf(`origin-${n}`, `repair-${n}`, 'success'))
+    }
+    priors.push(originJob('origin-4'))
+
+    const decision = decideRepairAction('origin-4', priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.attempt).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 4〜7: Human resume は新しい generation の根になる。
+// ---------------------------------------------------------------------------
+
+describe('decideRepairAction — Human resume', () => {
+  it('[4] human resume は新しい generation の根になり、depth 0 から数え直す', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-human', 'human')]
+
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(1)
+      expect(decision.generation.rootJobId).toBe('resume-human')
+      expect(decision.generation.rootKind).toBe('human_resume')
+      expect(decision.generation.depth).toBe(0)
+      expect(decision.generation.budgetReset).toBe(true)
+      expect(decision.generation.previousGenerationRoot).toBe(built.tip)
+      expect(decision.generation.resetReason).toBe('human_resume_started_new_generation')
+    }
+  })
+
+  it('[5] 使い切った chain でも human resume 後は自動修復できる', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    expect(decideRepairAction(built.tip, built.jobs, FACTS_B).action).toBe('escalate')
+
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-human', 'human')]
+    expect(decideRepairAction('resume-human', priors, FACTS_B).action).toBe('repair')
+  })
+
+  it('[6] human resume の後でも、その generation の中の深さは正しく数える', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [
+      ...built.jobs,
+      resumeOf(built.tip, 'resume-human', 'human'),
+      repairOf('resume-human', 'gen2-repair-1'),
+    ]
+    const decision = decideRepairAction('gen2-repair-1', priors, FACTS_B)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(2)
+      expect(decision.generation.rootJobId).toBe('resume-human')
+    }
+  })
+
+  it('[7] human resume で始まった generation も MAX_REPAIR_ATTEMPTS で止まる（無制限にはならない）', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-human', 'human')]
+    let parent = 'resume-human'
+    for (let i = 1; i <= MAX_REPAIR_ATTEMPTS; i += 1) {
+      const id = `gen2-repair-${i}`
+      priors.push(repairOf(parent, id, 'failed', { exitCode: i, stderr: `gen2 distinct ${i}` }))
+      parent = id
+    }
+
+    const decision = decideRepairAction(parent, priors, { exitCode: 99, stderr: 'gen2 yet another' })
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 8〜11: AI resume は generation を跨がない。
+// 「AI が自分の repair 予算を作り直せない」という保証はここで固定している。
+// ---------------------------------------------------------------------------
+
+describe('decideRepairAction — AI resume', () => {
+  it('[8] AI resume は予算を再発行しない（使い切った chain は使い切ったまま）', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-ai', 'ai')]
+
+    const decision = decideRepairAction('resume-ai', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+
+  it('[9] AI resume は前 generation の深さをそのまま引き継ぐ', () => {
+    const built = chain(1)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-ai', 'ai')]
+
+    const decision = decideRepairAction('resume-ai', priors, FACTS_B)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(2)
+      expect(decision.generation.rootJobId).toBe(ORIGIN_ID)
+      expect(decision.generation.rootKind).toBe('origin')
+      expect(decision.generation.crossedAiResume).toBe(true)
+      expect(decision.generation.budgetReset).toBe(false)
+      expect(decision.generation.resetReason).toBe('ai_or_unknown_resume_continues_generation')
+    }
+  })
+
+  it('[10] AI resume を何回挟んでも予算は増えない', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs]
+    let parent = built.tip
+    for (let i = 1; i <= 5; i += 1) {
+      const id = `resume-ai-${i}`
+      priors.push(resumeOf(parent, id, 'ai'))
+      parent = id
+    }
+
+    const decision = decideRepairAction(parent, priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+
+  it('[11] AI resume と repair を交互に積んでも上限は 1 generation 分のまま', () => {
+    const priors: PriorRepairJob[] = [originJob()]
+    let parent = ORIGIN_ID
+    for (let i = 1; i <= MAX_REPAIR_ATTEMPTS; i += 1) {
+      const resumeId = `resume-ai-${i}`
+      priors.push(resumeOf(parent, resumeId, 'ai'))
+      const repairId = `repair-${i}`
+      priors.push(repairOf(resumeId, repairId, 'failed', { exitCode: i, stderr: `distinct ${i}` }))
+      parent = repairId
+    }
+
+    const decision = decideRepairAction(parent, priors, { exitCode: 99, stderr: 'yet another' })
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 12〜13: actor が判らないときは human 側へ倒さない。
+// ---------------------------------------------------------------------------
+
+describe('decideRepairAction — actor 不明の resume', () => {
+  it('[12] actor の記録が無い resume は予算を再発行しない', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-norecord', undefined)]
+
+    const decision = decideRepairAction('resume-norecord', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+
+  it('[13] actor が unknown と記録された resume も予算を再発行しない', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-unknown', 'unknown')]
+
+    const decision = decideRepairAction('resume-unknown', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+
+  it('[13] unknown resume は ai resume と完全に同じ扱いになる', () => {
+    const built = chain(1)
+    const unknownWalk = walkRepairGeneration('resume-x', [...built.jobs, resumeOf(built.tip, 'resume-x', 'unknown')])
+    const aiWalk = walkRepairGeneration('resume-x', [...built.jobs, resumeOf(built.tip, 'resume-x', 'ai')])
+    expect(unknownWalk).toEqual(aiWalk)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 14〜19: lineage を数え切れないときは必ず fail-closed（depth 0 にしない）。
+// ---------------------------------------------------------------------------
+
+describe('walkRepairGeneration — 数え切れないときは fail-closed', () => {
+  it('[14] repair の stepKey が壊れていたら escalate する', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      { id: 'broken', workflowStepKey: 'repair:', status: 'failed', facts: FACTS_A },
+    ]
+    const decision = decideRepairAction('broken', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('malformed repair step key')
+  })
+
+  it('[15] resume の stepKey が壊れていたら escalate する', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      { id: 'broken', workflowStepKey: 'resume::1', status: 'failed', facts: FACTS_A },
+    ]
+    const decision = decideRepairAction('broken', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('malformed resume step key')
+  })
+
+  it('[16] source Job そのものが Job 一覧に無ければ escalate する', () => {
+    const decision = decideRepairAction('missing-job', [originJob()], FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a job of this task')
+  })
+
+  it('[17] 親が別 Task の Job（この Task に無い id）なら escalate する', () => {
+    const priors: PriorRepairJob[] = [repairOf('job-of-another-task', 'repair-1')]
+    const decision = decideRepairAction('repair-1', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a job of this task')
+  })
+
+  it('[18] lineage が環を作っていたら escalate する', () => {
+    const priors: PriorRepairJob[] = [repairOf('b', 'a'), repairOf('a', 'b')]
+    const decision = decideRepairAction('a', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('[18] 自己参照も環として止める', () => {
+    const decision = decideRepairAction('a', [repairOf('a', 'a')], FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('[19] 長い lineage でも walk は必ず止まる（歩数の閾値は置かない）', () => {
+    // 200 段の repair chain。予算判定で止まるのであって、歩数で止まるのではない。
+    const built = chain(200, (i) => ({ exitCode: i, stderr: `distinct ${i}` }))
+    const decision = decideRepairAction(built.tip, built.jobs, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+
+  it('[19] resume が何段積まれていても、予算を使っていなければ escalate しない', () => {
+    // 歩数の閾値を置くと、ここが「数え切れなかった」として誤って escalate する。
+    // 予算は `MAX_REPAIR_ATTEMPTS` だけで決まる（新しい閾値を足さない。独立レビュー指摘）。
+    const priors: PriorRepairJob[] = [originJob()]
+    let parent = ORIGIN_ID
+    for (let i = 1; i <= 200; i += 1) {
+      const id = `resume-ai-${i}`
+      priors.push(resumeOf(parent, id, 'ai'))
+      parent = id
+    }
+
+    const decision = decideRepairAction(parent, priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(1)
+      expect(decision.generation.rootJobId).toBe(ORIGIN_ID)
+    }
+  })
+
+  it('[19] 同じ id の Job が 2 件ある入力は曖昧として escalate する', () => {
+    const priors: PriorRepairJob[] = [originJob(), originJob()]
+    const decision = decideRepairAction(ORIGIN_ID, priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('ambiguous lineage')
+  })
+
+  it('[19] 壊れた lineage は例外なく escalate であり、depth 0 の repair にはならない', () => {
+    const broken: PriorRepairJob[][] = [
+      [originJob(), { id: 'x', workflowStepKey: 'repair:', status: 'failed', facts: FACTS_A }],
+      [originJob(), { id: 'x', workflowStepKey: 'resume::1', status: 'failed', facts: FACTS_A }],
+      [repairOf('b', 'a'), repairOf('a', 'b')],
+      [originJob(), originJob()],
+    ]
+    for (const priors of broken) {
+      const sourceId = priors[priors.length - 1].id
+      const decision = decideRepairAction(sourceId, priors, FACTS_A)
+      expect(decision.action).toBe('escalate')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// human と記録されていても、lineage の矛盾までは跨がない（独立レビュー指摘）。
+// 根より**上**の破損は跨いでよいが、「この resume がこの Task の Job から作られた」
+// ことは確かめる。`resumeBlockedTask()` は必ず同一 Task の latestJob を親にする。
+// ---------------------------------------------------------------------------
+
+describe('walkRepairGeneration — human resume の上流も well-formed でなければならない', () => {
+  it('親が Job 一覧に無い human resume は escalate する（depth 0 の予算を配らない）', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      resumeOf('job-that-does-not-exist', 'resume-human', 'human'),
+    ]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a job of this task')
+  })
+
+  it('自分自身を親にした human resume は escalate する', () => {
+    const decision = decideRepairAction('resume-human', [resumeOf('resume-human', 'resume-human', 'human')], FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('既に辿った Job を親にした human resume は escalate する（環）', () => {
+    const priors: PriorRepairJob[] = [
+      repairOf('resume-human', 'repair-1'),
+      resumeOf('repair-1', 'resume-human', 'human'),
+    ]
+    const decision = decideRepairAction('repair-1', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('human resume の**上流**に環があっても escalate する（数え終わりで walk を止めない）', () => {
+    // h -> b -> h。h は human なので深さは 0 で確定するが、
+    // h 自身がどこから来たのか判らない形なので通さない（独立レビュー指摘の再現）。
+    const priors: PriorRepairJob[] = [
+      resumeOf('b', 'h', 'human'),
+      resumeOf('h', 'b', 'ai'),
+    ]
+    const decision = decideRepairAction('h', priors, { stderr: 'new failure' })
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('human resume の上流が別 Task の Job でも escalate する', () => {
+    const priors: PriorRepairJob[] = [
+      resumeOf('origin-here', 'resume-human', 'human'),
+      repairOf('job-of-another-task', 'origin-here'),
+    ]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a job of this task')
+  })
+
+  it('上流が健全なら、深さは human resume で 0 に戻る（上流の長さは深さに入らない）', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-human', 'human')]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.generation.depth).toBe(0)
+      expect(decision.generation.rootKind).toBe('human_resume')
+      expect(decision.generation.previousGenerationRoot).toBe(built.tip)
+    }
+  })
+
+  it('親が実在する human resume は従来どおり新しい generation の根になる', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-human', 'human')]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.generation.rootKind).toBe('human_resume')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 「同じ失敗が繰り返されている」も generation の中だけで数える（独立レビュー指摘）。
+// Task 全体で数えると、前の generation の失敗が human の与えた予算を食い止める。
+// ---------------------------------------------------------------------------
+
+describe('sameFailureRepeated は generation の中だけで数える', () => {
+  it('前 generation の「手がかり無し」失敗は、human resume 後の 1 回目を止めない', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('origin-old', {}),
+      repairOf('origin-old', 'old-repair', 'failed', {}),
+      resumeOf('old-repair', 'resume-human', 'human'),
+    ]
+
+    const decision = decideRepairAction('resume-human', priors, {})
+
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(1)
+      expect(decision.generation.rootKind).toBe('human_resume')
+      expect(decision.requireDifferentApproach).toBe(false)
+    }
+  })
+
+  it('前 generation の同一署名の失敗では、別アプローチ要求も立てない', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('origin-old'),
+      repairOf('origin-old', 'old-repair', 'failed', FACTS_A),
+      resumeOf('old-repair', 'resume-human', 'human'),
+    ]
+
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.requireDifferentApproach).toBe(false)
+  })
+
+  it('同じ generation の中なら、従来どおり別アプローチを要求する', () => {
+    const built = chain(1)
+    const decision = decideRepairAction(built.tip, built.jobs, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.requireDifferentApproach).toBe(true)
+  })
+
+  it('AI resume を跨いだ前方の失敗は同じ generation なので数える', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      repairOf(ORIGIN_ID, 'repair-1', 'failed', FACTS_A),
+      resumeOf('repair-1', 'resume-ai', 'ai'),
+    ]
+
+    const decision = decideRepairAction('resume-ai', priors, FACTS_A)
+
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(2)
+      expect(decision.requireDifferentApproach).toBe(true)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// **停止保証と cycle 検出を別々に固定する。**
+//
+// 2026-09-22: cycle guard を潰す mutation を当てたところ、walk が止まらず vitest worker が
+// 1 コアを 82 分専有した（固定の歩数上限を消した直後だったため停止保証がゼロだった）。
+// 「環を検出できる」ことと「何が壊れても有限時間で終わる」ことは別の責務なので、別々に pin する。
+// ---------------------------------------------------------------------------
+
+describe('lineage walk — 意味側（cycle 検出）', () => {
+  it('環は cycle として名指しで fail-closed になる', () => {
+    const decision = decideRepairAction('a', [repairOf('b', 'a'), repairOf('a', 'b')], FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('大きな環でも即座に cycle として返る（歩数に比例して遅くならない）', () => {
+    const priors: PriorRepairJob[] = []
+    for (let i = 0; i < 500; i += 1) {
+      priors.push(repairOf(`node-${(i + 1) % 500}`, `node-${i}`))
+    }
+    const startedAt = Date.now()
+    const decision = decideRepairAction('node-0', priors, FACTS_A)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+})
+
+describe('lineage walk — 停止側（データ由来の bound）', () => {
+  it('正当で長い lineage は bound では落ちない（恣意的な閾値を持たない）', () => {
+    // 500 段の resume。Job 件数由来の bound なので、何段でも正当なら通る。
+    const priors: PriorRepairJob[] = [originJob()]
+    let parent = ORIGIN_ID
+    for (let i = 1; i <= 500; i += 1) {
+      const id = `resume-ai-${i}`
+      priors.push(resumeOf(parent, id, 'ai'))
+      parent = id
+    }
+
+    const walk = walkRepairGeneration(parent, priors)
+    expect(walk.ok).toBe(true)
+    if (walk.ok) {
+      expect(walk.depth).toBe(0)
+      expect(walk.rootJobId).toBe(ORIGIN_ID)
+    }
+  })
+
+  it('Job 件数ちょうどの直列 lineage も通る（境界で 1 段ずれない）', () => {
+    for (const depth of [1, 2, 3]) {
+      const built = chain(depth, (i) => ({ exitCode: i, stderr: `distinct ${i}` }))
+      const walk = walkRepairGeneration(built.tip, built.jobs)
+      expect(walk.ok).toBe(true)
+      if (walk.ok) expect(walk.depth).toBe(depth)
+    }
+  })
+
+  it('walk は必ず有限時間で終わる（どの壊れ方でも返り値が返る）', () => {
+    const broken: { source: string; priors: PriorRepairJob[] }[] = [
+      { source: 'a', priors: [repairOf('a', 'a')] },
+      { source: 'a', priors: [repairOf('b', 'a'), repairOf('a', 'b')] },
+      { source: 'a', priors: [repairOf('missing', 'a')] },
+      { source: 'a', priors: [{ id: 'a', workflowStepKey: 'repair:', status: 'failed', facts: {} }] },
+      { source: 'a', priors: [{ id: 'a', workflowStepKey: 'resume::1', status: 'failed', facts: {} }] },
+      { source: 'missing', priors: [originJob()] },
+      { source: ORIGIN_ID, priors: [originJob(), originJob()] },
+    ]
+    const startedAt = Date.now()
+    for (const { source, priors } of broken) {
+      const walk = walkRepairGeneration(source, priors)
+      expect(walk.ok).toBe(false)
+    }
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+})
+
+describe('hard bound の値そのものを固定する', () => {
+  // **symbol だけで書いたテストは値の変更を検出できない。**
+  // `chain(MAX_REPAIR_ATTEMPTS)` は上限を 99 にしても 99 段の chain を作って通ってしまう。
+  // 安全側の定数なので、値そのものと、literal の深さでの挙動を別々に固定する。
+  it('MAX_REPAIR_ATTEMPTS は 3 である', () => {
+    expect(MAX_REPAIR_ATTEMPTS).toBe(3)
+  })
+
+  it('深さ 2 の chain には次の repair を作り、深さ 3 では作らない', () => {
+    const distinct = (i: number) => ({ exitCode: i, stderr: `distinct ${i}` })
+
+    const two = chain(2, distinct)
+    const afterTwo = decideRepairAction(two.tip, two.jobs, { exitCode: 90, stderr: 'another' })
+    expect(afterTwo.action).toBe('repair')
+    if (afterTwo.action === 'repair') expect(afterTwo.attempt).toBe(3)
+
+    const three = chain(3, distinct)
+    const afterThree = decideRepairAction(three.tip, three.jobs, { exitCode: 91, stderr: 'another' })
+    expect(afterThree.action).toBe('escalate')
+    if (afterThree.action === 'escalate') expect(afterThree.reason).toContain('limit')
   })
 })

@@ -38,9 +38,13 @@ import { recomputeDecision, type RawStrategicResult } from './designReviewCoordi
 import {
   REPAIR_STEP_PREFIX,
   decideRepairAction,
+  parseRepairSource,
+  walkRepairGeneration,
   type PriorRepairJob,
   type RepairFailureFacts,
+  type ResumeActorClass,
 } from './repairPolicy'
+import { readResumeActorClasses, recordRepairGeneration } from './resumeActor'
 
 /**
  * Stage 2起動の**同期フェーズ**の結果。
@@ -92,17 +96,89 @@ export function extractFailureFacts(job: Job, review?: ReviewResult): RepairFail
 function toPriorRepairJobs(
   jobs: readonly Job[],
   reviews: readonly ReviewResult[],
-  current: { jobId: string; status: string; facts: RepairFailureFacts },
+  resumeActorClasses: ReadonlyMap<string, ResumeActorClass>,
+  current?: { jobId: string; status: string; facts: RepairFailureFacts },
 ): PriorRepairJob[] {
-  return jobs.map((job) => (
-    job.id === current.jobId
-      ? { workflowStepKey: job.workflowStepKey, status: current.status, facts: current.facts }
+  return jobs.map((job) => ({
+    id: job.id,
+    workflowStepKey: job.workflowStepKey,
+    // resume Job 以外では使われない。引けなければ渡さない（policy 側の既定は `unknown`）。
+    resumeActorClass: resumeActorClasses.get(job.id),
+    ...(job.id === current?.jobId
+      ? { status: current.status, facts: current.facts }
       : {
-          workflowStepKey: job.workflowStepKey,
           status: job.status,
           facts: extractFailureFacts(job, reviews.find((review) => review.jobId === job.id)),
-        }
-  ))
+        }),
+  }))
+}
+
+/**
+ * `ux_jobs_workflow_step_key` の重複エラーか。
+ *
+ * repair 作成の手前には既に dedup がある（同じ stepKey の Job / active な design review run）。
+ * ただし判定と作成の間に **Design Review の await** が挟まるため、同じ failure event を
+ * 2 本同時に処理すると後発が一意制約で落ちる。それは「壊れた」のではなく
+ * **既に始まっている**ことの証明なので、`already_started` として扱う。
+ * 500 にすると、正しく重複排除できた側が障害に見える。
+ */
+export function isWorkflowStepKeyConflict(error: unknown): boolean {
+  if (error === null || error === undefined) return false
+  const candidate = error as { code?: unknown; message?: unknown }
+  const message = typeof candidate.message === 'string' ? candidate.message : String(error)
+  if (candidate.code !== 'SQLITE_CONSTRAINT_UNIQUE' && !/SQLITE_CONSTRAINT_UNIQUE/.test(message)) {
+    return false
+  }
+  return /workflow_step_key/.test(message)
+}
+
+/**
+ * 作られた repair Job の generation を、**同じ lineage から derive し直して**既存 audit へ残す。
+ *
+ * 決定時の値を持ち回らずに derive し直すのは、記録が「実際に存在する Job の系譜」と
+ * 必ず一致するようにするためである（決定と生成の間に別 Job が挟まっても、記録は実態を指す）。
+ * 判定へは一切戻さない。**ここが失敗しても repair は止めないし、budget も動かない。**
+ */
+function recordGenerationForCreatedRepairJob(storage: IStorage, repairJob: Job): void {
+  try {
+    deriveAndRecordRepairGeneration(storage, repairJob)
+  } catch (error: unknown) {
+    // repair Job は既に作られている。記録のための読み書きで caller を失敗させない
+    // （独立レビュー指摘）。落ちた場合の意味は決まっている: 後から generation を知る
+    // 手がかりが 1 件減るだけで、判定も予算も変わらない。
+    console.warn(
+      `[repairFlow] failed to record the repair generation of job ${repairJob.id}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+function deriveAndRecordRepairGeneration(storage: IStorage, repairJob: Job): void {
+  const stepKey = repairJob.workflowStepKey
+  const sourceJobId = stepKey === undefined ? undefined : parseRepairSource(stepKey)
+  if (sourceJobId === undefined) return
+
+  const jobs = storage.jobs.findByTaskId(repairJob.taskId)
+  const reviews = storage.reviewResults.findByTaskId(repairJob.taskId)
+  const walk = walkRepairGeneration(
+    sourceJobId,
+    toPriorRepairJobs(jobs, reviews, readResumeActorClasses(storage, jobs)),
+  )
+  if (!walk.ok) return
+
+  recordRepairGeneration(storage, {
+    jobId: repairJob.id,
+    taskId: repairJob.taskId,
+    generationRoot: walk.rootJobId,
+    ancestryDepth: walk.depth,
+    previousGenerationRoot: walk.previousGenerationRoot,
+    budgetReset: walk.rootKind === 'human_resume',
+    resetReason:
+      walk.rootKind === 'human_resume'
+        ? 'human_resume_started_new_generation'
+        : walk.crossedAiResume
+          ? 'ai_or_unknown_resume_continues_generation'
+          : 'same_generation',
+  })
 }
 
 /**
@@ -151,7 +227,7 @@ export async function runRepairFlow(
 
   const decision = decideRepairAction(
     failedJob.id,
-    toPriorRepairJobs(priorJobs, priorReviews, {
+    toPriorRepairJobs(priorJobs, priorReviews, readResumeActorClasses(storage, priorJobs), {
       jobId: failedJob.id,
       status: 'failed',
       facts,
@@ -223,17 +299,41 @@ export async function runRepairFlow(
   }
 
   // review済みpromptをそのままaiCliPromptにする（追記・変更しない）。
-  const repairJob = storage.jobs.create({
-    taskId: task.id,
-    projectId: failedJob.projectId,
-    agentRole: failedJob.agentRole,
-    status: 'queued',
-    workflowStepKey: decision.stepKey,
-    safeCommand: failedJob.safeCommand,
-    aiCliMode: 'implement',
-    aiCliProvider: failedJob.aiCliProvider,
-    aiCliPrompt: repairPrompt,
-  } as never)
+  let repairJob: Job
+  try {
+    repairJob = storage.jobs.create({
+      taskId: task.id,
+      projectId: failedJob.projectId,
+      agentRole: failedJob.agentRole,
+      status: 'queued',
+      workflowStepKey: decision.stepKey,
+      safeCommand: failedJob.safeCommand,
+      aiCliMode: 'implement',
+      aiCliProvider: failedJob.aiCliProvider,
+      aiCliPrompt: repairPrompt,
+    } as never)
+  } catch (error: unknown) {
+    if (isWorkflowStepKeyConflict(error)) {
+      // **`ux_jobs_workflow_step_key` は全体一意で、手前の dedup は同一 Task しか見ていない。**
+      // 同じ Task が先に作ったのなら「既に進行中」でよい。だが別 Task がこの key を
+      // 持っているなら lineage が壊れている（key は**この Task の**失敗 Job を名指す）ので、
+      // 黙って進行中扱いにせず人へ渡す（独立レビュー指摘）。
+      const ownedByThisTask = storage.jobs
+        .findByTaskId(task.id)
+        .some((job) => job.workflowStepKey === decision.stepKey)
+      if (ownedByThisTask) {
+        return { status: 'already_started', stepKey: decision.stepKey }
+      }
+      return escalateToHuman(
+        storage,
+        task,
+        `repair step key ${decision.stepKey} is already used outside this task`,
+      )
+    }
+    throw error
+  }
+
+  recordGenerationForCreatedRepairJob(storage, repairJob)
 
   return {
     status: 'repair_job_created',
@@ -531,7 +631,7 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
 
   const decision = decideRepairAction(
     failedJob.id,
-    toPriorRepairJobs(priorJobs, priorReviews, {
+    toPriorRepairJobs(priorJobs, priorReviews, readResumeActorClasses(storage, priorJobs), {
       jobId: failedJob.id,
       status: 'failed',
       facts,
@@ -643,13 +743,27 @@ export async function executeQueuedRepair(
     }
   }
 
-  const sourceJobId = stepKey.slice(REPAIR_STEP_PREFIX.length).split(':')[0]
+  // stepKey は `decideRepairAction()` が払い出した規約形（`repair:<sourceJobId>:1`）でしか
+  // 受けない。**緩い分解（`split(':')[0]`）だと `repair:<id>:2` のような規約外の形を
+  // 黙って受理し、`walkRepairGeneration()` が後で数えられない key の Job を作ってしまう。**
+  const sourceJobId = parseRepairSource(stepKey)
+  if (sourceJobId === undefined) {
+    escalateTaskToHuman(storage, taskId)
+    return { status: 'escalated', reason: `malformed repair step key: ${stepKey}` }
+  }
+
   const sourceJob = storage.jobs.findById(sourceJobId)
   // source Jobが引けないとprojectId / safeCommand / providerを復元できない。
   // 部分的に埋めた不完全なJobを作るより、人へ渡すほうが安全side。
   if (!sourceJob) {
     escalateTaskToHuman(storage, taskId)
     return { status: 'escalated', reason: 'source job for the repair chain is missing' }
+  }
+  // **別 Task の Job を source にした repair を作らない。** 作ると lineage が Task を
+  // またぎ、`walkRepairGeneration()` から見て「この Task に無い親」になる（数え切れない）。
+  if (sourceJob.taskId !== taskId) {
+    escalateTaskToHuman(storage, taskId)
+    return { status: 'escalated', reason: 'source job for the repair chain belongs to another task' }
   }
 
   const outcome = await executeDesignReviewRun(storage, run, deps)
@@ -696,12 +810,18 @@ export async function executeQueuedRepair(
   })
 
   if (!repairJob.ok) {
+    // ここへ stepKey の重複で来ることは無い。直前の dedup 判定から
+    // `createRepairJobWithHandoff()` までの間に await が無く、API は単一 process で
+    // 動くため、両者の間に別経路が割り込めない（割り込める `runRepairFlow` 側では
+    // `isWorkflowStepKeyConflict()` で `already_started` へ倒している）。
     // 後続の実体化に失敗した。transaction は rollback され、source Job は `blocked` の
     // まま所有権を保持する。ここで workspace を放置せず、Human escalation（Task blocked）
     // へ渡して後の介入を可能にする。
     escalateTaskToHuman(storage, taskId)
     return { status: 'escalated', reason: repairJob.reason }
   }
+
+  recordGenerationForCreatedRepairJob(storage, repairJob.repairJob)
 
   return {
     status: 'repair_job_created',

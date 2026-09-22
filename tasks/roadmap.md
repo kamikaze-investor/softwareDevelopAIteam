@@ -9144,6 +9144,101 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - **新しい診断機構は作らない。** 渡す context の作り方（`buildContext()`）の改善で足りるか
       - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
 
+<!-- roadmap:id=repair-budget-counted-per-task-not-per-chain state=done -->
+0. [x] **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった** —
+      2026-09-22 実装。**Human resume と AI resume を同じ意味として扱わないことが本項目の主境界である。**
+
+      **実測（変更前）**: `decideRepairAction()` は同一 Task の `repair:` prefix を持つ Job を
+      **単純に件数で**数えていた。その結果:
+      - 互いに無関係な 3 つの失敗がそれぞれ 1 回ずつ直っただけで、4 本目の**最初の**失敗が
+        いきなり `escalate` になる（予算はもう残っていないと判定される）
+      - 逆に、予算を使い切ったあと人間が `POST /api/tasks/:id/resume` で再開しても
+        **予算は戻らない**。人の判断が入っても自動修復は 1 回も走れない
+
+      **直し方（既存機構だけで復元。新 table / 新 column / 新 status は作っていない）**:
+      - 深さは `workflowStepKey`（`repair:<sourceJobId>:1` / `resume:<sourceJobId>:<n>`）を
+        **親リンクとして辿って**数える（`walkRepairGeneration()`）。lineage 用の column も
+        `parent_id` も `repair_chain_id` も追加していない
+      - **generation の根は lineage ではなく authority で決める。** 根になるのは
+        (a) repair でも resume でもない Job、または (b) **human と証明された resume Job** だけ。
+        AI / unknown の resume は根にならず、前 generation の深さをそのまま引き継ぐ
+      - 上限は既存の `MAX_REPAIR_ATTEMPTS`（3）のまま。新しい閾値も config も足していない
+
+      **human / AI の判定は server 側の検証可能な事実だけで行う（caller の自己申告は使わない）**:
+      - `apiTokenAuth()` が認証時に既に決めている credential 種別を request に載せ
+        （`apps/api/src/auth/credentialClass.ts`）、route はそれだけを読む。
+        body は見ない（`ResumeTaskBody` は `.strict()` なので `{"human": true}` /
+        `{"resetRepairBudget": true}` は 400 で弾かれ、Job も作られない）
+      - **`admin` credential だけが `human`。** split mode の WORKER token は
+        `WORKER_ALLOWLIST` の Default Deny により `POST /api/tasks/:id/resume` へ到達できない。
+        「ADMIN = 人の操作系」は `HUMAN_ONLY_ROUTES`（`/api/tasks/:id/recover`）が既に依拠している
+        境界であり、**新しい authority model は作っていない**
+      - PL の `resume_task` は in-process 呼び出しで HTTP credential を持たない。
+        そこは経路そのものが根拠になるので `ai` と記録する
+      - 記録先は既存 `audit_log`（`operation=resume_actor` / `repair_generation`）。
+        新 table は作らず、token / hash / 長さのような秘密は一切書かない
+
+      **fail-safe の向き**: 記録が無い・矛盾する・lineage が壊れている（malformed key / 環 /
+      別 Task の親 / 同一 id 重複 / 歩数上限超過）はすべて **human ではない・数え切れていない**側へ倒れ、
+      `escalate` になる。**depth 0（＝予算満額）へは決して倒れない。**
+
+      **Production への効き方（2026-09-21 実測の再確認）**: 本番は legacy 単一 `API_TOKEN` mode で、
+      `ADMIN_TOKEN_SHA256` / `WORKER_TOKEN_SHA256` はいずれも未設定である。
+      legacy は `unknown` にしかならないため、**split credential cutover が済むまで
+      human resume は本番では 1 件も成立しない**（= 予算はどの resume でも再発行されない）。
+      chain 単位で数える側の修正は cutover を待たずに効く。cutover 自体は
+      `split-credential-migration` の CEO 判断待ちであり、本項目はそれを前倒ししていない。
+
+      **`provider-outage-burns-attempt-budget`（planned）と重複しない**: あちらは
+      Design Review **run** の attempt 予算を transient な provider 障害が食い潰す話である。
+      本項目は repair **Job** の chain 予算をどう数えるかであり、層が違う。
+      `pl-resume-task-design-review-evidence-mismatch`（planned）とも別で、
+      あちらは resume prompt の hash が evidence と一致しない問題であり、本項目は触っていない。
+
+      **検証**: `repairPolicy.test.ts` / `resumeActor.test.ts` /
+      `resumeActorAuthorization.test.ts` / `repairFlow.test.ts` / `executionLoop.test.ts`。
+      guard 除去の耐性は `scripts/repairLineageMutationGuard.mjs`（survived 0 / skipped 0。
+      SKIPPED も失敗として扱う —— 測れなかったことを「問題なし」と読み替えないため）。
+
+      **Independent Review（Codex, 6 round）で出た bucket A はすべて実コードで再現してから直した**:
+      human と記録された resume の親リンク未検証 / `executeQueuedRepair()` の緩い stepKey 分解 /
+      `sameFailureRepeated` が Task 全体だったこと / `human` 行を根拠の種別なしで信じていたこと /
+      別 Task に取られた stepKey を `already_started` にしていたこと / 数え終わりで walk を止めて
+      上流の環を見逃していたこと / 監査の読み書き失敗が呼び出し側を落としていたこと /
+      歩数の固定閾値が**新しい閾値**になっていたこと。
+
+      **検証中に起こした 82 分の hang（2026-09-22 実測。因果を正確に残す）**
+
+      1. round 6 の指摘に従い、固定の歩数上限 `MAX_ANCESTRY_STEPS = 64` を削除した
+      2. その結果、`walkRepairGeneration()` の停止保証は**意味側の `seen` チェックだけ**になった
+      3. mutation `G7-cycle-detection-removed` はまさにその `seen` を潰す。
+         環を含むテスト入力で walk が終わらなくなった
+      4. vitest worker 1 本が 1 コアを 100% 使い続け、`generationRepairJobIds` の push で
+         RSS が約 1GB まで伸びた
+      5. mutation harness には per-mutation timeout が無く、親は `spawnSync` で**永久に待った**
+      6. さらに、**mutated な source がディスクに残っている間に別枠で `vitest run src` を起動した**ため、
+         2 本目も同じ無限ループを踏み、合計 2 本・2 コア・約 2GB を 82 分専有した
+
+      出力ファイルが 0 バイトだったのは Node が file 出力時に stdout をバッファするためで、
+      進捗の証拠ではない（当初これを「baseline で停止」と読み違えた）。
+
+      **対応は最小 3 点に限る。新しい workflow system も job runner も作らない。**
+
+      - **データ由来の停止保証**: 歩数の上限を `byId.size`（この Task の Job 件数）にした。
+        整形式の lineage は同じ Job を 2 度訪れないので正当な系譜を弾かず、
+        意味側のガードが将来壊れても有限時間で必ず終わる。使い切ったら fail-closed
+        （depth 0 にも success にも倒さない）。**恣意的な固定閾値は復活させていない**
+      - **harness の per-mutation timeout**: `spawnSync` に上限を入れ、結果を
+        `KILLED` / `SURVIVED` / `SKIPPED` / `TIMEOUT` / `INCONCLUSIVE` に分けた。
+        **`KILLED` 以外はすべて失敗**である（timeout を KILLED と呼ぶと、harness が
+        壊れているのに緑に見える）。vitest の集計行が取れない実行も信用しない
+      - **直列実行**: harness 実行中に同じ source を読む test / typecheck を走らせない。
+        手順として script 冒頭へ明記した
+
+      「環を検出できる」ことと「何が壊れても walk 自体は有限時間で終わる」ことは別責務なので、
+      テストも別々に固定してある（`lineage walk — 意味側` / `lineage walk — 停止側`）。
+
+
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
 12. [ ] **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る** —
       2026-09-15登録（production 実測）。**`design-review-runner-production-timeout` の後続**であり、

@@ -1749,18 +1749,33 @@ describe('SQLiteStorage', () => {
       )
 
       it('verified-safe with exhausted repair attempts escalates Job->failed and Task->blocked atomically', () => {
-        const source = createRunningJob()
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          storage.jobs.create({
+        // 予算は chain（generation）単位で数えるので、**繋がった** repair を積む。
+        // 同じ元 Job を指す兄弟を並べても 1 本の chain にはならない。
+        const origin = createRunningJob()
+        let parentId = origin.id
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          parentId = storage.jobs.create({
             taskId,
             projectId,
-            workflowStepKey: `repair:${source.id}:${attempt}`,
+            workflowStepKey: `repair:${parentId}:1`,
             agentRole: 'developer_ai',
             status: 'failed',
             safeCommand: { kind: 'test', workingDir: '/workspace/target' },
             stderr: `attempt ${attempt} failed`,
-          })
+          }).id
         }
+        // 予算を使い切る 3 本目は、いま失敗する Job 自身である。
+        const source = storage.jobs.create({
+          taskId,
+          projectId,
+          workflowStepKey: `repair:${parentId}:1`,
+          agentRole: 'developer_ai',
+          status: 'running',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'Implement the fix',
+          aiCliMode: 'implement',
+        })
 
         const result = storage.jobs.failAndPrepareRepair({
           jobId: source.id,
