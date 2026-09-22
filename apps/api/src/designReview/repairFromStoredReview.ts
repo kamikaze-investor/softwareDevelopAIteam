@@ -20,9 +20,19 @@
  * provider も status も allowedPaths も attempt 数も受け取らない。判定材料はすべて
  * `resolveStoredReviewChain()` が保存済み行から組み直す。
  *
- * repair budget の chain 根（recovery epoch）になるのは **consume 済み ApprovalRequest** で、
- * これは `PATCH /api/approval-requests/:id/status` からしか作れず in-process の呼び出し元が
- * 無いので、**autonomous PL loop からは作れない**（`repairRecoveryEpoch.ts` に詳細）。
+ * repair budget の chain 根（recovery epoch）になるのは **consume 済み ApprovalRequest** である。
+ *
+ * **権限の出どころは `APPROVED` であって `CONSUMED` ではない。** `APPROVED` を書く実装は
+ * どれも `PATCH /api/approval-requests/:id/status` の先にしかなく、in-process の呼び出し元が
+ * 無い。よって **autonomous PL loop は承認そのものを作れない**（`repairRecoveryEpoch.ts` に詳細）。
+ *
+ * 一方 `CONSUMED` への遷移は、ここ（`verifyAndConsumeForTaskAction()`）と既存の汎用 consume
+ * route の両方が書く。**consume は承認を使い切る操作であって、承認を生む操作ではない**ので、
+ * 書き手が複数あっても epoch の根拠は弱まらない —— どの経路で使い切られても、その前に
+ * `APPROVED` があったことは変わらないためである。
+ * 以前ここには「consume 済み ApprovalRequest は PATCH からしか作れない」と書いていたが、
+ * それは `APPROVED` の話を `CONSUMED` へ広げた誤りだった（独立レビュー指摘）。
+ *
  * ここで言えるのはそこまでで、「human identity が暗号的に証明された」ではない。
  *
  * ## consume は最後に置く
