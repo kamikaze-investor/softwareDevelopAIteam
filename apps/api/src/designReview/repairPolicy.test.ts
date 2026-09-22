@@ -504,3 +504,63 @@ describe('walkRepairGeneration — human resume の親リンクも検証する',
     if (decision.action === 'repair') expect(decision.generation.rootKind).toBe('human_resume')
   })
 })
+
+// ---------------------------------------------------------------------------
+// 「同じ失敗が繰り返されている」も generation の中だけで数える（独立レビュー指摘）。
+// Task 全体で数えると、前の generation の失敗が human の与えた予算を食い止める。
+// ---------------------------------------------------------------------------
+
+describe('sameFailureRepeated は generation の中だけで数える', () => {
+  it('前 generation の「手がかり無し」失敗は、human resume 後の 1 回目を止めない', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('origin-old', {}),
+      repairOf('origin-old', 'old-repair', 'failed', {}),
+      resumeOf('old-repair', 'resume-human', 'human'),
+    ]
+
+    const decision = decideRepairAction('resume-human', priors, {})
+
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(1)
+      expect(decision.generation.rootKind).toBe('human_resume')
+      expect(decision.requireDifferentApproach).toBe(false)
+    }
+  })
+
+  it('前 generation の同一署名の失敗では、別アプローチ要求も立てない', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('origin-old'),
+      repairOf('origin-old', 'old-repair', 'failed', FACTS_A),
+      resumeOf('old-repair', 'resume-human', 'human'),
+    ]
+
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.requireDifferentApproach).toBe(false)
+  })
+
+  it('同じ generation の中なら、従来どおり別アプローチを要求する', () => {
+    const built = chain(1)
+    const decision = decideRepairAction(built.tip, built.jobs, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.requireDifferentApproach).toBe(true)
+  })
+
+  it('AI resume を跨いだ前方の失敗は同じ generation なので数える', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      repairOf(ORIGIN_ID, 'repair-1', 'failed', FACTS_A),
+      resumeOf('repair-1', 'resume-ai', 'ai'),
+    ]
+
+    const decision = decideRepairAction('resume-ai', priors, FACTS_A)
+
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(2)
+      expect(decision.requireDifferentApproach).toBe(true)
+    }
+  })
+})

@@ -145,6 +145,14 @@ const MUTATIONS = [
     tests: POLICY_TESTS,
   },
   {
+    id: 'G22-same-failure-counted-task-wide',
+    guard: '「同じ失敗の繰り返し」も generation の中だけで数える',
+    file: POLICY,
+    from: '      generationRepairJobIds.has(job.id) &&\n',
+    to: '      job.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true &&\n',
+    tests: POLICY_TESTS,
+  },
+  {
     id: 'G19-human-resume-parent-unchecked',
     guard: 'human と記録されていても、親リンクが使えない resume は根にしない',
     file: POLICY,

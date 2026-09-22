@@ -145,10 +145,6 @@ export function computeFailureSignature(facts: RepairFailureFacts): string {
   return createHash('sha256').update(parts.join('\n'), 'utf-8').digest('hex')
 }
 
-function isRepairJob(job: PriorRepairJob): boolean {
-  return job.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true
-}
-
 /**
  * ancestry を辿る歩数の上限。
  *
@@ -192,6 +188,11 @@ export type GenerationWalk =
       /** `rootKind === 'human_resume'` のときだけ入る。前 generation 側の Job id。 */
       previousGenerationRoot?: string
       crossedAiResume: boolean
+      /**
+       * **この generation に属する repair Job の id**（根から辿った経路上のものだけ）。
+       * 「同じ失敗が繰り返されているか」を前の generation まで含めて数えないための境界である。
+       */
+      generationRepairJobIds: string[]
     }
   | { ok: false; reason: string }
 
@@ -222,6 +223,7 @@ export function walkRepairGeneration(
   }
 
   const seen = new Set<string>()
+  const generationRepairJobIds: string[] = []
   let cursor = sourceJobId
   let depth = 0
   let crossedAiResume = false
@@ -241,7 +243,7 @@ export function walkRepairGeneration(
 
     const stepKey = job.workflowStepKey
     if (stepKey === undefined || stepKey.trim() === '') {
-      return { ok: true, depth, rootJobId: cursor, rootKind: 'origin', crossedAiResume }
+      return { ok: true, depth, rootJobId: cursor, rootKind: 'origin', crossedAiResume, generationRepairJobIds }
     }
 
     if (stepKey.startsWith(REPAIR_STEP_PREFIX)) {
@@ -250,6 +252,7 @@ export function walkRepairGeneration(
         return { ok: false, reason: `malformed repair step key on job ${cursor}` }
       }
       depth += 1
+      generationRepairJobIds.push(cursor)
       cursor = parent
       continue
     }
@@ -279,6 +282,7 @@ export function walkRepairGeneration(
           rootKind: 'human_resume',
           previousGenerationRoot: parent,
           crossedAiResume,
+          generationRepairJobIds,
         }
       }
       crossedAiResume = true
@@ -287,7 +291,7 @@ export function walkRepairGeneration(
     }
 
     // repair でも resume でもない Job（implement / retry 等）が generation の根。
-    return { ok: true, depth, rootJobId: cursor, rootKind: 'origin', crossedAiResume }
+    return { ok: true, depth, rootJobId: cursor, rootKind: 'origin', crossedAiResume, generationRepairJobIds }
   }
 
   return { ok: false, reason: `lineage is longer than the bounded walk (${MAX_ANCESTRY_STEPS} steps)` }
@@ -308,7 +312,6 @@ export function decideRepairAction(
   newFacts: RepairFailureFacts,
 ): RepairDecision {
   const signature = computeFailureSignature(newFacts)
-  const repairJobs = priorJobs.filter(isRepairJob)
 
   // **予算は「この repair chain（generation）で何回直したか」で数える。**
   // 以前は Task 全体の repair Job 件数だった。そのため、互いに無関係な 3 つの失敗が
@@ -335,8 +338,17 @@ export function decideRepairAction(
 
   // 同じ失敗が残っていること自体は「別の合理的な修正アプローチが無い」ことを意味しない。
   // よって即escalateはせず、別アプローチを要求したうえで継続する。
-  const sameFailureRepeated = repairJobs.some(
-    (job) => job.status === 'failed' && computeFailureSignature(job.facts) === signature,
+  //
+  // **数える範囲はこの generation の中だけ。** Task 全体で数えると、human が resume して
+  // 新しい generation を始めても、**前の generation の失敗**が `sameFailureRepeated` を
+  // 立て続ける。手がかりの無い失敗と重なると、人が与えたはずの予算が 1 回も使われないまま
+  // escalate に戻る（独立レビュー指摘。人の判断を無効化する向きの誤りなので直した）。
+  const generationRepairJobIds = new Set(walk.generationRepairJobIds)
+  const sameFailureRepeated = priorJobs.some(
+    (job) =>
+      generationRepairJobIds.has(job.id) &&
+      job.status === 'failed' &&
+      computeFailureSignature(job.facts) === signature,
   )
 
   // ただし失敗事実が何も無い場合は、別アプローチを組み立てる手がかりが無い。
