@@ -13,10 +13,18 @@
  * つまり `resume:` を根にすると、repair 上限 → blocked → resume → budget 更新、を
  * PL が自分で回せてしまう。
  *
- * `approval_requests` はそうならない。`APPROVED` を書けるのは `recordDecision()` だけで、
- * その呼び出し元は `PATCH /api/approval-requests/:id/status`（`routes/approvalGate.ts`）
- * **1 箇所しかなく、in-process の呼び出し元が存在しない**。PL は自分へ HTTP を打たないので、
- * PL からこの事実を作る経路が無い。
+ * `approval_requests` はそうならない。`APPROVED` を書く実装は2つある:
+ * `recordDecision()` と、git_commit 専用の `approveAndResumeJob()` である。
+ * **どちらも呼び出し元は `PATCH /api/approval-requests/:id/status`
+ * （`routes/approvalGate.ts`）1 箇所だけで、in-process の呼び出し元が存在しない。**
+ * PL は自分へ HTTP を打たないので、PL からこの事実を作る経路が無い。
+ *
+ * さらに `approveAndResumeJob()` は `job.safeCommand.kind === 'git_commit'` と
+ * `requestedAction === job.safeCommand.kind` を要求するので、recovery の承認
+ * （`repair_from_stored_review:<reviewJobId>`）には**そもそも到達しない**。
+ * 以前ここには「`APPROVED` を書けるのは `recordDecision()` だけ」と書いていたが、
+ * それは事実として誤りだった（独立レビュー指摘）。結論は変わらないが、根拠は
+ * 「writer が1つ」ではなく「**writer がどれも同じ HTTP route の先にしかない**」である。
  *
  * ## この保証の正確な範囲
  *

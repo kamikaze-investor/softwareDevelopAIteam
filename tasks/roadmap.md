@@ -10475,9 +10475,12 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         跨いで辿り段数には数えない。source 欠落 / 別 Task / 規約外 stepKey / 循環 / 深すぎは
         すべて **fail-closed（escalate）**で、段数を推測しない
       - chain の根になる recovery epoch は **consume 済み ApprovalRequest** だけ。
-        `APPROVED` を書けるのは `recordDecision()` のみで、その呼び出し元は
-        `PATCH /api/approval-requests/:id/status` の1箇所しかなく **in-process の呼び出し元が
-        存在しない**ため、autonomous PL loop からは作れない。束縛は既存 `requestedAction` に
+        `APPROVED` を書く実装は `recordDecision()` と git_commit 専用の
+        `approveAndResumeJob()` の2つだが、**どちらも呼び出し元は
+        `PATCH /api/approval-requests/:id/status` の1箇所だけで in-process の呼び出し元が
+        存在しない**ため、autonomous PL loop からは作れない（後者は requestedAction が
+        `git_commit` であることを要求するので recovery の承認には到達しない）。
+        束縛は既存 `requestedAction` に
         `repair_from_stored_review:<reviewJobId>` を載せる形で、**新しい承認種別も schema も
         足していない**（`abort_task` が `requestedAction` を束縛材料に使うのと同じ形）
       - `POST /api/tasks/:id/repair-from-stored-review`。body は `reviewJobId` という
