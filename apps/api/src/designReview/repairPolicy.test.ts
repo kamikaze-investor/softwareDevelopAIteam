@@ -462,3 +462,45 @@ describe('walkRepairGeneration — 数え切れないときは fail-closed', () 
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// human と記録されていても、lineage の矛盾までは跨がない（独立レビュー指摘）。
+// 根より**上**の破損は跨いでよいが、「この resume がこの Task の Job から作られた」
+// ことは確かめる。`resumeBlockedTask()` は必ず同一 Task の latestJob を親にする。
+// ---------------------------------------------------------------------------
+
+describe('walkRepairGeneration — human resume の親リンクも検証する', () => {
+  it('親が Job 一覧に無い human resume は escalate する（depth 0 の予算を配らない）', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(),
+      resumeOf('job-that-does-not-exist', 'resume-human', 'human'),
+    ]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a usable parent job of this task')
+  })
+
+  it('自分自身を親にした human resume は escalate する', () => {
+    const decision = decideRepairAction('resume-human', [resumeOf('resume-human', 'resume-human', 'human')], FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a usable parent job of this task')
+  })
+
+  it('既に辿った Job を親にした human resume は escalate する（環）', () => {
+    const priors: PriorRepairJob[] = [
+      repairOf('resume-human', 'repair-1'),
+      resumeOf('repair-1', 'resume-human', 'human'),
+    ]
+    const decision = decideRepairAction('repair-1', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a usable parent job of this task')
+  })
+
+  it('親が実在する human resume は従来どおり新しい generation の根になる', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-human', 'human')]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.generation.rootKind).toBe('human_resume')
+  })
+})

@@ -717,13 +717,27 @@ export async function executeQueuedRepair(
     }
   }
 
-  const sourceJobId = stepKey.slice(REPAIR_STEP_PREFIX.length).split(':')[0]
+  // stepKey は `decideRepairAction()` が払い出した規約形（`repair:<sourceJobId>:1`）でしか
+  // 受けない。**緩い分解（`split(':')[0]`）だと `repair:<id>:2` のような規約外の形を
+  // 黙って受理し、`walkRepairGeneration()` が後で数えられない key の Job を作ってしまう。**
+  const sourceJobId = parseRepairSource(stepKey)
+  if (sourceJobId === undefined) {
+    escalateTaskToHuman(storage, taskId)
+    return { status: 'escalated', reason: `malformed repair step key: ${stepKey}` }
+  }
+
   const sourceJob = storage.jobs.findById(sourceJobId)
   // source Jobが引けないとprojectId / safeCommand / providerを復元できない。
   // 部分的に埋めた不完全なJobを作るより、人へ渡すほうが安全side。
   if (!sourceJob) {
     escalateTaskToHuman(storage, taskId)
     return { status: 'escalated', reason: 'source job for the repair chain is missing' }
+  }
+  // **別 Task の Job を source にした repair を作らない。** 作ると lineage が Task を
+  // またぎ、`walkRepairGeneration()` から見て「この Task に無い親」になる（数え切れない）。
+  if (sourceJob.taskId !== taskId) {
+    escalateTaskToHuman(storage, taskId)
+    return { status: 'escalated', reason: 'source job for the repair chain belongs to another task' }
   }
 
   const outcome = await executeDesignReviewRun(storage, run, deps)

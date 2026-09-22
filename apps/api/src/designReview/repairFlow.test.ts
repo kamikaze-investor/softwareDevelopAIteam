@@ -481,3 +481,46 @@ describe('repair generation を既存 audit へ残す', () => {
     expect(rows[0].detail).toContain('ancestry_depth=1')
   })
 })
+
+describe('executeQueuedRepair は規約外の stepKey を受理しない', () => {
+  async function queuedRunFor(storage: IStorage, ids: { taskId: string; projectId: string }, failed: Job) {
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    if (preparation.action !== 'queue') throw new Error('fixture expected a queue preparation')
+    storage.designReviewRuns.create(preparation.run)
+    return { run: storage.designReviewRuns.findQueued()[0], stepKey: preparation.stepKey }
+  }
+
+  it('`repair:<id>:2` のような規約外の key は escalate する（数えられない Job を作らない）', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    storage.jobs.update(failed.id, { status: 'blocked' } as never)
+    const { run } = await queuedRunFor(storage, ids, failed)
+
+    const outcome = await executeQueuedRepair(storage, run, 'repair:' + failed.id + ':2', deps())
+
+    expect(outcome.status).toBe('escalated')
+    if (outcome.status === 'escalated') expect(outcome.reason).toContain('malformed repair step key')
+    expect(storage.jobs.findByTaskId(ids.taskId).some((job) => job.workflowStepKey?.startsWith('repair:'))).toBe(false)
+  })
+
+  it('別 Task の Job を source にした key は escalate する', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    storage.jobs.update(failed.id, { status: 'blocked' } as never)
+    const { run } = await queuedRunFor(storage, ids, failed)
+
+    const otherTask = storage.tasks.create({
+      projectId: ids.projectId, title: 'T2', description: 'd',
+      status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+    } as never)
+    const foreign = createFailedJob(storage, { taskId: otherTask.id, projectId: ids.projectId })
+
+    const outcome = await executeQueuedRepair(storage, run, 'repair:' + foreign.id + ':1', deps())
+
+    expect(outcome.status).toBe('escalated')
+    if (outcome.status === 'escalated') expect(outcome.reason).toContain('belongs to another task')
+    expect(storage.jobs.findByTaskId(ids.taskId).some((job) => job.workflowStepKey?.startsWith('repair:'))).toBe(false)
+  })
+})

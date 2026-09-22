@@ -261,6 +261,17 @@ export function walkRepairGeneration(
       }
       // **human と証明された resume だけが新しい generation の根になる。**
       if (job.resumeActorClass === 'human') {
+        // 根より**上**の壊れた lineage は跨いでよい —— 人はまさにそれを跨ぐために再開する。
+        // ただし「この resume が本当にこの Task の Job から作られたか」は確かめる。
+        // `resumeBlockedTask()` は必ず同一 Task の latestJob を親にするので、親が引けない
+        // ／自分自身や既に辿った Job を指す形は lineage の矛盾であり、
+        // **数え直せていない**側（fail-closed）である。human の記録があっても通さない。
+        if (parent === cursor || seen.has(parent) || !byId.has(parent)) {
+          return {
+            ok: false,
+            reason: `human resume ${cursor} points at ${parent}, which is not a usable parent job of this task`,
+          }
+        }
         return {
           ok: true,
           depth,
