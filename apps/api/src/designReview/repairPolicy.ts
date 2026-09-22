@@ -199,15 +199,20 @@ export type GenerationWalk =
 /**
  * いまの **repair generation** における repair の深さを、lineage から復元する。
  *
- * generation の根は次のいずれか:
- *   - repair でも resume でもない Job（通常の implement 等）
- *   - **human と証明された resume Job**（人の判断そのものが新しい generation の境界）
+ * 規則は 2 つに分かれている。混ぜると必ずどちらかが壊れる:
  *
- * AI / unknown の resume は **根にしない**。`resume:` の source へ walk を続け、
- * 前の generation の深さを引き継ぐ。これをしないと
- * 「repair 使い切り → AI resume → 予算復活」を AI 自身が繰り返せる。
+ *   1. **lineage は全体が well-formed でなければならない。** 根より上も含めて、
+ *      この Task の中で有限・非環の 1 本道であること。どこかが壊れていたら
+ *      「復元できていない」ので **`ok: false`**（depth 0 ＝ 予算満額へは倒さない）。
+ *   2. **深さを数える範囲だけが generation で切れる。** 数え終わりは
+ *      repair でも resume でもない Job か、**human と証明された resume Job** である。
  *
- * **数えられなかったときは必ず `ok: false`。** depth 0（＝予算満額）へ倒さない。
+ * AI / unknown の resume は数え終わりにしない。前の generation の深さを引き継ぐ。
+ * これをしないと「repair 使い切り → AI resume → 予算復活」を AI 自身が繰り返せる。
+ *
+ * 1 と 2 を分けているのは、human resume の意味が「**上流の履歴を跨いで**やり直す」だから
+ * である。深さは 0 に戻るが、だからといって上流が環でも別 Task でもよいことにはならない
+ * —— それは「この resume 自身がどこから来たのか判らない」ことを意味する（独立レビュー指摘）。
  */
 export function walkRepairGeneration(
   sourceJobId: string,
@@ -228,6 +233,26 @@ export function walkRepairGeneration(
   let depth = 0
   let crossedAiResume = false
 
+  /**
+   * 数え終わりが決まったら確定する。**以降も walk は続く**（上流の健全性を確かめるため）。
+   * ここに値が入った後は depth も crossedAiResume も動かさない。
+   */
+  let countedRoot: { rootJobId: string; previousGenerationRoot: string } | undefined
+
+  const finish = (originJobId: string): GenerationWalk => (
+    countedRoot === undefined
+      ? { ok: true, depth, rootJobId: originJobId, rootKind: 'origin', crossedAiResume, generationRepairJobIds }
+      : {
+          ok: true,
+          depth,
+          rootJobId: countedRoot.rootJobId,
+          rootKind: 'human_resume',
+          previousGenerationRoot: countedRoot.previousGenerationRoot,
+          crossedAiResume,
+          generationRepairJobIds,
+        }
+  )
+
   for (let step = 0; step <= MAX_ANCESTRY_STEPS; step += 1) {
     if (seen.has(cursor)) {
       return { ok: false, reason: `lineage forms a cycle at job ${cursor}` }
@@ -243,7 +268,7 @@ export function walkRepairGeneration(
 
     const stepKey = job.workflowStepKey
     if (stepKey === undefined || stepKey.trim() === '') {
-      return { ok: true, depth, rootJobId: cursor, rootKind: 'origin', crossedAiResume, generationRepairJobIds }
+      return finish(cursor)
     }
 
     if (stepKey.startsWith(REPAIR_STEP_PREFIX)) {
@@ -251,8 +276,10 @@ export function walkRepairGeneration(
       if (parent === undefined) {
         return { ok: false, reason: `malformed repair step key on job ${cursor}` }
       }
-      depth += 1
-      generationRepairJobIds.push(cursor)
+      if (countedRoot === undefined) {
+        depth += 1
+        generationRepairJobIds.push(cursor)
+      }
       cursor = parent
       continue
     }
@@ -262,36 +289,19 @@ export function walkRepairGeneration(
       if (parent === undefined) {
         return { ok: false, reason: `malformed resume step key on job ${cursor}` }
       }
-      // **human と証明された resume だけが新しい generation の根になる。**
-      if (job.resumeActorClass === 'human') {
-        // 根より**上**の壊れた lineage は跨いでよい —— 人はまさにそれを跨ぐために再開する。
-        // ただし「この resume が本当にこの Task の Job から作られたか」は確かめる。
-        // `resumeBlockedTask()` は必ず同一 Task の latestJob を親にするので、親が引けない
-        // ／自分自身や既に辿った Job を指す形は lineage の矛盾であり、
-        // **数え直せていない**側（fail-closed）である。human の記録があっても通さない。
-        if (parent === cursor || seen.has(parent) || !byId.has(parent)) {
-          return {
-            ok: false,
-            reason: `human resume ${cursor} points at ${parent}, which is not a usable parent job of this task`,
-          }
-        }
-        return {
-          ok: true,
-          depth,
-          rootJobId: cursor,
-          rootKind: 'human_resume',
-          previousGenerationRoot: parent,
-          crossedAiResume,
-          generationRepairJobIds,
-        }
+      // **human と証明された resume が数え終わり。** ただしここで walk は止めない。
+      // 止めると、この resume 自身が環の一部でも別 Task から来ていても素通りしてしまう。
+      if (countedRoot === undefined && job.resumeActorClass === 'human') {
+        countedRoot = { rootJobId: cursor, previousGenerationRoot: parent }
+      } else if (countedRoot === undefined) {
+        crossedAiResume = true
       }
-      crossedAiResume = true
       cursor = parent
       continue
     }
 
-    // repair でも resume でもない Job（implement / retry 等）が generation の根。
-    return { ok: true, depth, rootJobId: cursor, rootKind: 'origin', crossedAiResume, generationRepairJobIds }
+    // repair でも resume でもない Job（implement / retry 等）が lineage の端。
+    return finish(cursor)
   }
 
   return { ok: false, reason: `lineage is longer than the bounded walk (${MAX_ANCESTRY_STEPS} steps)` }

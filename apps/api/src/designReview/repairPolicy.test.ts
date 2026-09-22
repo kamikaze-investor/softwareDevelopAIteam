@@ -469,7 +469,7 @@ describe('walkRepairGeneration — 数え切れないときは fail-closed', () 
 // ことは確かめる。`resumeBlockedTask()` は必ず同一 Task の latestJob を親にする。
 // ---------------------------------------------------------------------------
 
-describe('walkRepairGeneration — human resume の親リンクも検証する', () => {
+describe('walkRepairGeneration — human resume の上流も well-formed でなければならない', () => {
   it('親が Job 一覧に無い human resume は escalate する（depth 0 の予算を配らない）', () => {
     const priors: PriorRepairJob[] = [
       originJob(),
@@ -477,13 +477,13 @@ describe('walkRepairGeneration — human resume の親リンクも検証する',
     ]
     const decision = decideRepairAction('resume-human', priors, FACTS_A)
     expect(decision.action).toBe('escalate')
-    if (decision.action === 'escalate') expect(decision.reason).toContain('not a usable parent job of this task')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a job of this task')
   })
 
   it('自分自身を親にした human resume は escalate する', () => {
     const decision = decideRepairAction('resume-human', [resumeOf('resume-human', 'resume-human', 'human')], FACTS_A)
     expect(decision.action).toBe('escalate')
-    if (decision.action === 'escalate') expect(decision.reason).toContain('not a usable parent job of this task')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
   })
 
   it('既に辿った Job を親にした human resume は escalate する（環）', () => {
@@ -493,7 +493,41 @@ describe('walkRepairGeneration — human resume の親リンクも検証する',
     ]
     const decision = decideRepairAction('repair-1', priors, FACTS_A)
     expect(decision.action).toBe('escalate')
-    if (decision.action === 'escalate') expect(decision.reason).toContain('not a usable parent job of this task')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('human resume の**上流**に環があっても escalate する（数え終わりで walk を止めない）', () => {
+    // h -> b -> h。h は human なので深さは 0 で確定するが、
+    // h 自身がどこから来たのか判らない形なので通さない（独立レビュー指摘の再現）。
+    const priors: PriorRepairJob[] = [
+      resumeOf('b', 'h', 'human'),
+      resumeOf('h', 'b', 'ai'),
+    ]
+    const decision = decideRepairAction('h', priors, { stderr: 'new failure' })
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('human resume の上流が別 Task の Job でも escalate する', () => {
+    const priors: PriorRepairJob[] = [
+      resumeOf('origin-here', 'resume-human', 'human'),
+      repairOf('job-of-another-task', 'origin-here'),
+    ]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('not a job of this task')
+  })
+
+  it('上流が健全なら、深さは human resume で 0 に戻る（上流の長さは深さに入らない）', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-human', 'human')]
+    const decision = decideRepairAction('resume-human', priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.generation.depth).toBe(0)
+      expect(decision.generation.rootKind).toBe('human_resume')
+      expect(decision.generation.previousGenerationRoot).toBe(built.tip)
+    }
   })
 
   it('親が実在する human resume は従来どおり新しい generation の根になる', () => {
