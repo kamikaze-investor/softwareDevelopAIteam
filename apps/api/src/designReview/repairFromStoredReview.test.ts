@@ -383,13 +383,29 @@ describe('recovery action — admission で落ちるものに承認を要求し�
     return outcome
   }
 
-  it('verdict が approved なら通さない', () => {
+  // **修正を要求していないレビューは再駆動しない。**
+  // `prepareRepairFlow()` の verdict 検査は blocked Task の admission の中にしかないので、
+  // Task が blocked でなければそこを通らない。入口で確かめないと、approved な
+  // レビューから repair と epoch を作れてしまう（独立レビュー指摘）。
+  it.each(['blocked', 'pending'] as const)('%s Task でも approved な verdict は通さない', (taskStatus) => {
     const storage = createSQLiteStorage(':memory:')
-    const ids = seed(storage)
+    const ids = seed(storage, { status: taskStatus })
     const { current } = exhaustedChainThenResume(storage, ids)
     const reviewJob = createReviewJob(storage, ids, current.id)
     storeReview(storage, ids, reviewJob.id, { status: 'approved' } as Partial<ReviewResult>)
-    expect(withoutApproval(storage, ids.taskId, reviewJob.id).status).toBe('skipped')
+
+    const outcome = withoutApproval(storage, ids.taskId, reviewJob.id)
+    expect(outcome.status).toBe('rejected')
+    if (outcome.status === 'rejected') expect(outcome.reason).toContain('not changes_requested')
+  })
+
+  it.each(['approved', 'pending'] as const)('verdict が %s でも通さない', (verdict) => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage, { status: 'pending' })
+    const { current } = exhaustedChainThenResume(storage, ids)
+    const reviewJob = createReviewJob(storage, ids, current.id)
+    storeReview(storage, ids, reviewJob.id, { status: verdict } as Partial<ReviewResult>)
+    expect(withoutApproval(storage, ids.taskId, reviewJob.id).status).toBe('rejected')
   })
 
   it('実装が成功していなければ通さない', () => {

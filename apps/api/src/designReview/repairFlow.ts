@@ -19,7 +19,7 @@
  *
  * Idempotency: 同一failure eventからStage 2 chainは1本しか作られない。
  *   - design_review_runs は (task_id) WHERE status IN ('queued','running') の partial unique index
- *   - repair Job は `workflow_step_key = repair:<taskId>:<attempt>` と既存の全体一意index
+ *   - repair Job は `workflow_step_key = repair:<sourceJobId>:1` と既存の全体一意index
  * いずれも既存機構であり、新しい仕組みは追加していない。
  */
 

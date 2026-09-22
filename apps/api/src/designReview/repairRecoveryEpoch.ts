@@ -96,6 +96,21 @@ export function resolveStoredReviewChain(
     return { ok: false, reason: `no stored review result for review job ${reviewJobId}` }
   }
 
+  // **修正を要求したレビューだけを再駆動する。**
+  //
+  // `prepareRepairFlow()` の verdict 検査は blocked Task の admission の中にしかない。
+  // Task が `pending` 等なら、そこは通らずに `decideRepairAction()` へ進む。つまり
+  // この経路が自分で確かめないと、**何も要求していない approved なレビューから
+  // repair と recovery epoch を作れてしまう**（独立レビュー指摘）。
+  // review PATCH 側の Stage 2 分岐が `!approved` を条件にしているのと同じ制約を、
+  // ここでも入口で課す。
+  if (review.status !== 'changes_requested') {
+    return {
+      ok: false,
+      reason: `stored review for ${reviewJobId} is ${review.status}, not changes_requested`,
+    }
+  }
+
   return {
     ok: true,
     reviewJob,
