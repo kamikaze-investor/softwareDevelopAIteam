@@ -524,3 +524,53 @@ describe('executeQueuedRepair は規約外の stepKey を受理しない', () =>
     expect(storage.jobs.findByTaskId(ids.taskId).some((job) => job.workflowStepKey?.startsWith('repair:'))).toBe(false)
   })
 })
+
+describe('stepKey が別 Task に取られていたら already_started にしない（独立レビュー指摘）', () => {
+  it('別 Task が同じ key を持っている場合は escalate する', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+
+    const otherTask = storage.tasks.create({
+      projectId: ids.projectId, title: 'T2', description: 'd',
+      status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+    } as never)
+
+    // Design Review 中に、**別 Task の** Job がこの key を取ってしまう。
+    // 手前の dedup は同一 Task しか見ないので通り抜け、一意制約で落ちる。
+    const racingDeps = {
+      ...deps(),
+      execute: async () => {
+        storage.jobs.create({
+          taskId: otherTask.id,
+          projectId: ids.projectId,
+          agentRole: 'developer_ai',
+          status: 'queued',
+          workflowStepKey: 'repair:' + failed.id + ':1',
+          safeCommand: { kind: 'noop' },
+          aiCliMode: 'implement',
+          aiCliProvider: 'claude_code',
+          aiCliPrompt: 'foreign prompt',
+        } as never)
+        return { ok: true as const, stdout: ALIGNED_STDOUT, timedOut: false }
+      },
+    }
+
+    const outcome = await runRepairFlow(storage, { failedJob: failed }, racingDeps)
+
+    expect(outcome.status).toBe('escalated')
+    if (outcome.status === 'escalated') expect(outcome.reason).toContain('already used outside this task')
+    expect(storage.tasks.findById(ids.taskId)!.status).toBe('blocked')
+  })
+
+  it('監査記録が落ちても repair の生成そのものは失敗しない', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    storage.auditLog.record = () => { throw new Error('audit storage is unavailable') }
+
+    const outcome = await runRepairFlow(storage, { failedJob: failed }, deps())
+
+    expect(outcome.status).toBe('repair_job_created')
+  })
+})

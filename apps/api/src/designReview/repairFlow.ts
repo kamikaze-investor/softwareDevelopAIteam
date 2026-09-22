@@ -300,9 +300,22 @@ export async function runRepairFlow(
       aiCliPrompt: repairPrompt,
     } as never)
   } catch (error: unknown) {
-    // 並行して同じ failure を処理した側が先に作った。既存 dedup と同じ結果へ倒す。
     if (isWorkflowStepKeyConflict(error)) {
-      return { status: 'already_started', stepKey: decision.stepKey }
+      // **`ux_jobs_workflow_step_key` は全体一意で、手前の dedup は同一 Task しか見ていない。**
+      // 同じ Task が先に作ったのなら「既に進行中」でよい。だが別 Task がこの key を
+      // 持っているなら lineage が壊れている（key は**この Task の**失敗 Job を名指す）ので、
+      // 黙って進行中扱いにせず人へ渡す（独立レビュー指摘）。
+      const ownedByThisTask = storage.jobs
+        .findByTaskId(task.id)
+        .some((job) => job.workflowStepKey === decision.stepKey)
+      if (ownedByThisTask) {
+        return { status: 'already_started', stepKey: decision.stepKey }
+      }
+      return escalateToHuman(
+        storage,
+        task,
+        `repair step key ${decision.stepKey} is already used outside this task`,
+      )
     }
     throw error
   }

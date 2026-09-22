@@ -111,7 +111,25 @@ export function classifyResumeActorFromRequest(req: FastifyRequest): {
 }
 
 /**
- * resume actor を既存 audit へ記録する。**best-effort ではなく resume の一部**として呼ぶ。
+ * 記録の失敗で**呼び出し側の操作を失敗させない**ための薄い包み。
+ *
+ * resume Job / repair Job は既に作られている。ここで例外を投げ返すと、
+ * 「Job は在るのに caller は失敗を受け取る」状態になり、人が retry しても
+ * 「queued/running が既にある」で断られて詰む（独立レビュー指摘）。
+ *
+ * 落ちた場合の意味は決めてある: 読み側が `unknown` を返し、generation は跨がらない。
+ * **記録の失敗は budget を増やす方向へは倒れない。**
+ */
+function recordWithoutFailingCaller(operation: string, write: () => void): void {
+  try {
+    write()
+  } catch (error: unknown) {
+    console.warn(`[resumeActor] failed to record ${operation}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/**
+ * resume actor を既存 audit へ記録する。
  *
  * 記録が落ちた場合に何が起きるかは決めてある: 読み側が `unknown` を返し、
  * generation は跨がらない。つまり**記録の失敗は budget を増やす方向へ倒れない**。
@@ -125,13 +143,15 @@ export function recordResumeActor(
     evidence: ResumeAuthorizationEvidence
   },
 ): void {
-  storage.auditLog.record({
-    actor: 'api',
-    operation: RESUME_ACTOR_OPERATION,
-    entityType: 'job',
-    entityId: input.jobId,
-    result: input.actorClass,
-    detail: `task_id=${input.taskId} resume_actor=${input.actorClass} authorization_evidence=${input.evidence}`,
+  recordWithoutFailingCaller(RESUME_ACTOR_OPERATION, () => {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: RESUME_ACTOR_OPERATION,
+      entityType: 'job',
+      entityId: input.jobId,
+      result: input.actorClass,
+      detail: `task_id=${input.taskId} resume_actor=${input.actorClass} authorization_evidence=${input.evidence}`,
+    })
   })
 }
 
@@ -159,32 +179,42 @@ export function recordRepairGeneration(
     `budget_reset=${input.budgetReset ? 'yes' : 'no'}`,
     `reset_reason=${input.resetReason}`,
   ]
-  storage.auditLog.record({
-    actor: 'api',
-    operation: REPAIR_GENERATION_OPERATION,
-    entityType: 'job',
-    entityId: input.jobId,
-    result: input.budgetReset ? 'reset' : 'continued',
-    detail: parts.join(' '),
+  recordWithoutFailingCaller(REPAIR_GENERATION_OPERATION, () => {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: REPAIR_GENERATION_OPERATION,
+      entityType: 'job',
+      entityId: input.jobId,
+      result: input.budgetReset ? 'reset' : 'continued',
+      detail: parts.join(' '),
+    })
   })
 }
+
+/**
+ * `human` を認める唯一の根拠。行の `result` だけでなく、**同じ行に書かれた根拠の種別**も見る。
+ * 前後を境界で縛るのは `admin_credential_x` のような別の値に引っかからないため。
+ */
+const ADMIN_EVIDENCE_PATTERN = /(^| )authorization_evidence=admin_credential( |$)/
 
 /**
  * audit 行から actor class を読む。
  *
  * **0 件なら `unknown`**（記録が無いことを human と解釈しない）。
  * **矛盾する記録が複数あっても `unknown`**（human は「単一の明示的な記録」でしか成立しない）。
+ * **`human` と書いてあるだけでは足りない** —— 同じ行が
+ * `authorization_evidence=admin_credential` を持たなければ `unknown` にする。
+ * 「誰が」と「何を根拠に」が食い違う行は、根拠の無い主張と同じだからである（独立レビュー指摘）。
  */
 export function resumeActorClassFromAudit(entries: readonly AuditLogEntry[]): ResumeActorClass {
-  const seen = new Set<string>()
-  for (const entry of entries) {
-    if (entry.operation !== RESUME_ACTOR_OPERATION) continue
-    seen.add(entry.result)
-  }
+  const rows = entries.filter((entry) => entry.operation === RESUME_ACTOR_OPERATION)
+  const seen = new Set(rows.map((row) => row.result))
   if (seen.size !== 1) return 'unknown'
+
   const only = [...seen][0]
-  if (only === 'human' || only === 'ai') return only
-  return 'unknown'
+  if (only === 'ai') return 'ai'
+  if (only !== 'human') return 'unknown'
+  return rows.every((row) => ADMIN_EVIDENCE_PATTERN.test(row.detail ?? '')) ? 'human' : 'unknown'
 }
 
 /**
