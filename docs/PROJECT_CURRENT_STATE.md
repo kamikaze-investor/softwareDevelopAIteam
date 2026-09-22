@@ -225,6 +225,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
 - **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
+- **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
 - **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**

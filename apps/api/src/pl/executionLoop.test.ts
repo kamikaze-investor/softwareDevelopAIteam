@@ -18,6 +18,7 @@ import {
   type PlLoopDeps,
 } from './executionLoop'
 import { PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
+import { readResumeActorClasses } from '../designReview/resumeActor'
 
 /**
  * ここで固定しているのは「PL が自分の権限で動かない」ことと「操作したら必ず確かめる」ことである。
@@ -1144,6 +1145,30 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(result.executionSummary).toContain('resume queued job')
     // 既存経路が作る resume Job（新しい workflowStepKey）
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey?.startsWith('resume:'))).toBe(true)
+  })
+
+  it('[10] PL の resume は ai として記録される（human resume と同じ意味にならない）', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    alignedEvidence(storage, taskId)
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: '新しい承認サイクルへ', riskLevel: 'LOW' }),
+    }))
+    expect(result.status).toBe('acted')
+
+    const resumeJob = storage.jobs.findByTaskId(taskId).find((j) => j.workflowStepKey?.startsWith('resume:'))
+    expect(resumeJob).toBeDefined()
+
+    const recorded = storage.auditLog
+      .findByEntity('job', resumeJob!.id)
+      .filter((entry) => entry.operation === 'resume_actor')
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0].result).toBe('ai')
+    expect(recorded[0].detail).toContain('authorization_evidence=in_process_pl')
+
+    // 読み戻しても ai のまま。**AI resume は generation を跨がない。**
+    expect(readResumeActorClasses(storage, storage.jobs.findByTaskId(taskId)).get(resumeJob!.id)).toBe('ai')
   })
 
   it('evidence が複数あっても最新だけを Gate へ出す（古いものへ遡らない）', async () => {

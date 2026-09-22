@@ -1,6 +1,7 @@
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { isWorkerRouteAllowed } from './workerAllowlist'
+import { setCredentialClass } from './credentialClass.js'
 import { isActionsReadonlyRouteAllowed } from './actionsReadonlyAllowlist'
 import { isHumanOnlyRoute } from './humanOnlyRoutes'
 
@@ -98,11 +99,13 @@ export async function apiTokenAuth(
   const tokenHash = sha256Hex(authHeader.slice(BEARER_PREFIX.length).trim())
 
   if (timingSafeStringEqual(tokenHash, adminTokenHash)) {
+    setCredentialClass(req, 'admin')
     return
   }
 
   if (timingSafeStringEqual(tokenHash, workerTokenHash)) {
     if (isWorkerRouteAllowed(req.routeOptions.method, req.routeOptions.url)) {
+      setCredentialClass(req, 'worker')
       return
     }
     reply.status(403).send({ error: 'Forbidden: route not allowed for WORKER credential' })
@@ -112,6 +115,7 @@ export async function apiTokenAuth(
   // ACTIONS_READONLY: GETのexact verification routeのみ。ADMIN/WORKERへはfallbackしない。
   if (actionsTokenHash !== undefined && timingSafeStringEqual(tokenHash, actionsTokenHash)) {
     if (isActionsReadonlyRouteAllowed(req.routeOptions.method, req.routeOptions.url)) {
+      setCredentialClass(req, 'actions_readonly')
       return
     }
     reply.status(403).send({ error: 'Forbidden: route not allowed for ACTIONS_READONLY credential' })
@@ -166,6 +170,11 @@ async function legacySingleTokenAuth(
     reply.status(401).send({ error: 'Invalid token' })
     return
   }
+
+  // token は正しい。ただし legacy mode では人も Worker も**同じ token** を使うため、
+  // ここで判るのは「legacy 構成で認証された」ことだけである。human とは扱わない
+  // （`./credentialClass` と `resumeActorClassFor()` を参照）。
+  setCredentialClass(req, 'legacy')
 
   // **token は正しい。それでも human-only route は legacy mode では通さない。**
   // 判定を token 検証の**後**に置くのは、無効な token に 403 を返して

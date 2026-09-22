@@ -95,6 +95,7 @@ import {
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
+import { recordResumeActor } from '../designReview/resumeActor'
 import {
   authorizePlAction,
   PlActionBlockedError,
@@ -1111,6 +1112,15 @@ async function executeAction(
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }
+    // **この経路は定義上 AI である。** PL は in-process で動き HTTP credential を持たない
+    // ので、route 側の認証では区別できない。ここで `ai` と記録しておくことで、
+    // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
+    recordResumeActor(storage, {
+      jobId: resumed.job.id,
+      taskId: item.taskId,
+      actorClass: 'ai',
+      evidence: 'in_process_pl',
+    })
     return { ok: true, summary: `resume queued job ${resumed.job.id}` }
   }
 

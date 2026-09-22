@@ -35,6 +35,7 @@ import {
   createAndExecuteDesignReview,
   type CoordinatorDeps,
 } from '../designReview/designReviewCoordinator'
+import { classifyResumeActorFromRequest, recordResumeActor } from '../designReview/resumeActor'
 
 export const TASK_FAILURE_EXPLANATION_INPUT_VERSION = 1 as const
 
@@ -548,6 +549,19 @@ export async function taskRoutes(
       }
       return reply.status(400).send({ error: resumed.reason })
     }
+
+    // **誰が再開したかを、この request の credential だけから決めて残す。**
+    //
+    // body は見ない。`{"human": true}` や `{"resetRepairBudget": true}` を送られても
+    // `ResumeTaskBody` が落とすうえ、ここは request の認証結果しか読まない。
+    // repair budget の generation 境界はこの記録だけを根拠にする（`../designReview/resumeActor`）。
+    const actor = classifyResumeActorFromRequest(req)
+    recordResumeActor(storage, {
+      jobId: resumed.job.id,
+      taskId: task.id,
+      actorClass: actor.actorClass,
+      evidence: actor.evidence,
+    })
 
     return reply.status(201).send(resumed.job)
   })
