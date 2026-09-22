@@ -230,7 +230,26 @@ export function readResumeActorClasses(
   const classes = new Map<string, ResumeActorClass>()
   for (const job of jobs) {
     if (!job.workflowStepKey?.startsWith(RESUME_STEP_PREFIX)) continue
-    classes.set(job.id, resumeActorClassFromAudit(storage.auditLog.findByEntity('job', job.id)))
+    classes.set(job.id, readOneResumeActorClass(storage, job.id))
   }
   return classes
+}
+
+/**
+ * 1 件分の読み取り。**読めなかったら `unknown`。**
+ *
+ * 読み取りの失敗で repair 判定そのものを落とさない。落とすと、監査 storage の不調が
+ * そのまま「Job は在るのに caller は失敗を受け取る」状態になる（独立レビュー指摘）。
+ * 読めなかった場合の意味は「human と**証明できていない**」であり、予算は再発行されない。
+ * つまり**読み取りの失敗も予算を増やす方向へは倒れない**。
+ */
+function readOneResumeActorClass(storage: IStorage, jobId: string): ResumeActorClass {
+  try {
+    return resumeActorClassFromAudit(storage.auditLog.findByEntity('job', jobId))
+  } catch (error: unknown) {
+    console.warn(
+      `[resumeActor] failed to read the resume actor of job ${jobId}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return 'unknown'
+  }
 }

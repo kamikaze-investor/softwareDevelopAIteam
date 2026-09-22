@@ -9197,7 +9197,46 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **検証**: `repairPolicy.test.ts` / `resumeActor.test.ts` /
       `resumeActorAuthorization.test.ts` / `repairFlow.test.ts` / `executionLoop.test.ts`。
-      guard 除去の耐性は `scripts/repairLineageMutationGuard.mjs`（18 mutation / survived 0 / skipped 0）。
+      guard 除去の耐性は `scripts/repairLineageMutationGuard.mjs`（survived 0 / skipped 0。
+      SKIPPED も失敗として扱う —— 測れなかったことを「問題なし」と読み替えないため）。
+
+      **Independent Review（Codex, 6 round）で出た bucket A はすべて実コードで再現してから直した**:
+      human と記録された resume の親リンク未検証 / `executeQueuedRepair()` の緩い stepKey 分解 /
+      `sameFailureRepeated` が Task 全体だったこと / `human` 行を根拠の種別なしで信じていたこと /
+      別 Task に取られた stepKey を `already_started` にしていたこと / 数え終わりで walk を止めて
+      上流の環を見逃していたこと / 監査の読み書き失敗が呼び出し側を落としていたこと /
+      歩数の固定閾値が**新しい閾値**になっていたこと。
+
+      **検証中に起こした 82 分の hang（2026-09-22 実測。因果を正確に残す）**
+
+      1. round 6 の指摘に従い、固定の歩数上限 `MAX_ANCESTRY_STEPS = 64` を削除した
+      2. その結果、`walkRepairGeneration()` の停止保証は**意味側の `seen` チェックだけ**になった
+      3. mutation `G7-cycle-detection-removed` はまさにその `seen` を潰す。
+         環を含むテスト入力で walk が終わらなくなった
+      4. vitest worker 1 本が 1 コアを 100% 使い続け、`generationRepairJobIds` の push で
+         RSS が約 1GB まで伸びた
+      5. mutation harness には per-mutation timeout が無く、親は `spawnSync` で**永久に待った**
+      6. さらに、**mutated な source がディスクに残っている間に別枠で `vitest run src` を起動した**ため、
+         2 本目も同じ無限ループを踏み、合計 2 本・2 コア・約 2GB を 82 分専有した
+
+      出力ファイルが 0 バイトだったのは Node が file 出力時に stdout をバッファするためで、
+      進捗の証拠ではない（当初これを「baseline で停止」と読み違えた）。
+
+      **対応は最小 3 点に限る。新しい workflow system も job runner も作らない。**
+
+      - **データ由来の停止保証**: 歩数の上限を `byId.size`（この Task の Job 件数）にした。
+        整形式の lineage は同じ Job を 2 度訪れないので正当な系譜を弾かず、
+        意味側のガードが将来壊れても有限時間で必ず終わる。使い切ったら fail-closed
+        （depth 0 にも success にも倒さない）。**恣意的な固定閾値は復活させていない**
+      - **harness の per-mutation timeout**: `spawnSync` に上限を入れ、結果を
+        `KILLED` / `SURVIVED` / `SKIPPED` / `TIMEOUT` / `INCONCLUSIVE` に分けた。
+        **`KILLED` 以外はすべて失敗**である（timeout を KILLED と呼ぶと、harness が
+        壊れているのに緑に見える）。vitest の集計行が取れない実行も信用しない
+      - **直列実行**: harness 実行中に同じ source を読む test / typecheck を走らせない。
+        手順として script 冒頭へ明記した
+
+      「環を検出できる」ことと「何が壊れても walk 自体は有限時間で終わる」ことは別責務なので、
+      テストも別々に固定してある（`lineage walk — 意味側` / `lineage walk — 停止側`）。
 
 
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->

@@ -4,17 +4,37 @@
  * ガードを壊してみて確かめる harness。
  *
  * 各 mutation は「その 1 行を無効化したら、どのテストも落ちなくなるか」を測る。
- *   - KILLED   : mutation を当てたらテストが落ちた（= その保証は固定されている）
- *   - SURVIVED : mutation を当ててもテストが通った（= 保証が固定されていない → 失敗）
- *   - SKIPPED  : anchor が見つからず mutation を当てられなかった（= 測れていない → 失敗）
+ *   - KILLED       : mutation が当たり、テストが**走り切って**落ちた（= 保証は固定されている）
+ *   - SURVIVED     : mutation が当たったのにテストが green（= 保証が固定されていない）
+ *   - SKIPPED      : anchor 不一致などで mutation が**当たらなかった**（= 測れていない）
+ *   - TIMEOUT      : テストが時間内に終わらなかった（= 測れていない）
+ *   - INCONCLUSIVE : 終了はしたが vitest の集計が取れない（= 測れていない）
  *
- * **SKIPPED も失敗として扱う。** 測れなかったことを「問題なし」と読み替えない。
+ * **KILLED 以外はすべて失敗である。** 測れなかったことを「問題なし」と読み替えない。
+ *
+ * ## 実行時の約束（2026-09-22 の事故を受けて明文化）
+ *
+ * **この harness は単独で実行すること。** 実行中は対象 source を書き換えて元に戻すので、
+ * その間に別の vitest / typecheck / 解析を走らせてはならない。**mutated な source を
+ * 読んでしまい、無関係なはずの実行が壊れる。**
+ *
+ * 実際に起きたこと: cycle guard を潰す mutation（`G7`）を当てた状態のまま、別枠で
+ * `vitest run src` を起動した。その 2 本目も同じ無限ループを踏み、2 本まとめて
+ * 82 分 hang した（当時 walk には停止保証が無かった）。
+ *
+ * 推奨する順番:
+ *   1. source が clean であることを確認
+ *   2. 通常の targeted / full test
+ *   3. 通常 test の完了を確認
+ *   4. **この harness を単独実行**
+ *   5. 終了後、source が元に戻っていることを diff で確認
+ *   6. 必要なら最後にもう一度 clean な通常 test
  *
  * 使い方: node scripts/repairLineageMutationGuard.mjs
  */
 
 import { spawnSync } from 'node:child_process'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -90,7 +110,10 @@ const MUTATIONS = [
   },
   {
     id: 'G7-cycle-detection-removed',
-    guard: '環を検出して止める',
+    // **この 1 件は停止保証も一緒に見ている。** 意味側（seen）を潰しても、データ由来の
+    // bound があるので walk は終わり、テストは「cycle と報告しない」ことで落ちる。
+    // ここが TIMEOUT になったら停止保証が消えている合図である（2026-09-22 に実際そうなった）。
+    guard: '環を検出して止める（かつ、潰しても hang せず通常の test failure になる）',
     file: POLICY,
     from: '    if (seen.has(cursor)) {\n      return { ok: false, reason: `lineage forms a cycle at job ${cursor}` }\n    }',
     to: '    if (false) {\n      return { ok: false, reason: `lineage forms a cycle at job ${cursor}` }\n    }',
@@ -137,12 +160,42 @@ const MUTATIONS = [
     tests: POLICY_TESTS,
   },
   {
-    id: 'G13-bounded-walk-removed',
-    guard: '歩数の上限を超えたら止める',
+    id: 'G13-fixed-step-threshold-reintroduced',
+    guard: '停止保証はデータ由来（Job 件数）であって、恣意的な固定閾値ではない',
     file: POLICY,
-    from: 'const MAX_ANCESTRY_STEPS = 64',
-    to: 'const MAX_ANCESTRY_STEPS = 100_000',
+    from: '  for (let step = 0; step <= byId.size; step += 1) {',
+    to: '  for (let step = 0; step <= 64; step += 1) {',
     tests: POLICY_TESTS,
+  },
+  {
+    id: 'G27-actor-read-failure-breaks-repair',
+    guard: '監査の読み取り失敗は unknown へ倒す（判定ごと落とさない）',
+    file: ACTOR,
+    from: [
+      "    return resumeActorClassFromAudit(storage.auditLog.findByEntity('job', jobId))",
+      '  } catch (error: unknown) {',
+    ].join('\n'),
+    to: [
+      "    return resumeActorClassFromAudit(storage.auditLog.findByEntity('job', jobId))",
+      '  } catch (error: unknown) {',
+      '    throw error',
+    ].join('\n'),
+    tests: FLOW_TESTS,
+  },
+  {
+    id: 'G28-generation-record-breaks-repair',
+    guard: 'generation 記録の失敗が repair 生成を落とさない',
+    file: REPAIR_FLOW,
+    from: [
+      '    deriveAndRecordRepairGeneration(storage, repairJob)',
+      '  } catch (error: unknown) {',
+    ].join('\n'),
+    to: [
+      '    deriveAndRecordRepairGeneration(storage, repairJob)',
+      '  } catch (error: unknown) {',
+      '    throw error',
+    ].join('\n'),
+    tests: FLOW_TESTS,
   },
   {
     id: 'G23-human-row-without-admin-evidence',
@@ -256,13 +309,57 @@ const MUTATIONS = [
   },
 ]
 
+/**
+ * 1 回の test 実行あたりの上限（ms）。**production の policy ではなく harness の暴走防止**である。
+ *
+ * 実測: 単体の test file は 2〜5 秒、baseline（5 file 同時）でも 10 秒台で終わる。
+ * 180 秒はその 15 倍以上あり、負荷が高い環境でも正常実行を誤って kill しない。
+ * これを短くしすぎると「遅い」を「壊れている」と誤判定するので、余裕側に倒している。
+ */
+const TEST_TIMEOUT_MS = 180_000
+
+/**
+ * test を 1 回走らせて**結果の種別**を返す。
+ *
+ * 種別を分けるのは、`exit code !== 0` に「mutation を検出した」と
+ * 「そもそも走り切っていない」が混ざるからである。後者を KILLED と呼ぶと、
+ * **harness が壊れているのに緑に見える**。
+ *
+ *   - `passed`      : 走り切って green
+ *   - `failed`      : 走り切って red（mutation が検出された）
+ *   - `timeout`     : 時間内に終わらなかった（= 測れていない）
+ *   - `no_summary`  : 終了はしたが vitest の集計行が取れない（= 測れていない）
+ */
 function runTests(testPaths) {
   const result = spawnSync(process.execPath, [vitestBin, 'run', ...testPaths], {
     cwd: apiDir,
     encoding: 'utf-8',
     env: { ...process.env, CI: 'true' },
+    timeout: TEST_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
   })
-  return result.status === 0
+
+  const timedOut =
+    result.error?.code === 'ETIMEDOUT' || (result.status === null && result.signal !== null)
+  if (timedOut) {
+    return { kind: 'timeout', detail: `no result within ${TEST_TIMEOUT_MS} ms` }
+  }
+  if (result.error) {
+    return { kind: 'no_summary', detail: `runner failed to start: ${result.error.message}` }
+  }
+
+  // **集計行が無い実行は信用しない。** crash や収集エラーでも exit code が付くことがあり、
+  // そのとき「テストが落ちたから mutation を検出できた」とは言えない。
+  //
+  // vitest は集計行に色を付けるので、**ANSI を落としてから**照合する
+  // （落とさないと `Test Files <ESC>[2m…99 passed` に一致せず、正常な実行を
+  // `no_summary` と誤判定する。最初の実装がまさにそれで baseline を止めた）。
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.replace(/\[[0-9;]*m/g, '')
+  if (!/Test Files\s+\d/.test(output) && !/Tests\s+\d/.test(output)) {
+    return { kind: 'no_summary', detail: `exit=${result.status} without a vitest summary` }
+  }
+
+  return { kind: result.status === 0 ? 'passed' : 'failed' }
 }
 
 function main() {
@@ -274,14 +371,30 @@ function main() {
     baselineFiles.set(file, { raw, normalized: raw.replace(/\r\n/g, '\n') })
   }
 
-  process.stdout.write('baseline: ')
-  const baselineGreen = runTests([...new Set(MUTATIONS.flatMap((m) => m.tests))])
-  if (!baselineGreen) {
-    process.stdout.write('FAILED\n')
-    process.stdout.write('変異を当てる前からテストが落ちている。mutation の結果は読めない。\n')
+  // stdout を file へ redirect すると Node はバッファするので、途中経過が一切見えない。
+  // 2026-09-22 の hang では「出力 0 バイト」を「baseline で止まっている」と読み違えた。
+  // `MUTATION_GUARD_LOG` が指定されていれば、同じ行を**都度 flush して**書き足す。
+  const logPath = process.env.MUTATION_GUARD_LOG
+  const say = (line) => {
+    process.stdout.write(`${line}\n`)
+    if (logPath) {
+      try {
+        appendFileSync(logPath, `${new Date().toISOString()} ${line}\n`)
+      } catch {
+        // 進捗ログが書けないことで mutation の測定を止めない。
+      }
+    }
+  }
+
+  say('baseline: running')
+  const baseline = runTests([...new Set(MUTATIONS.flatMap((m) => m.tests))])
+  if (baseline.kind !== 'passed') {
+    say(`baseline: FAILED (${baseline.kind}${baseline.detail ? `: ${baseline.detail}` : ''})`)
+    say('変異を当てる前からテストが走り切って green になっていない。mutation の結果は読めない。')
     process.exit(1)
   }
-  process.stdout.write('green\n\n')
+  say('baseline: green')
+  say('')
 
   const results = []
   for (const mutation of MUTATIONS) {
@@ -291,37 +404,66 @@ function main() {
     const occurrences = normalized.split(mutation.from).length - 1
     if (occurrences !== 1) {
       results.push({ ...mutation, outcome: 'SKIPPED', note: `anchor occurs ${occurrences} times` })
-      process.stdout.write(`${mutation.id}: SKIPPED (anchor occurs ${occurrences} times)\n`)
+      say(`${mutation.id}: SKIPPED (anchor occurs ${occurrences} times)`)
       continue
     }
 
-    writeFileSync(absolute, normalized.replace(mutation.from, mutation.to))
-    let green
-    try {
-      green = runTests(mutation.tests)
-    } finally {
-      writeFileSync(absolute, raw)
+    const mutated = normalized.replace(mutation.from, mutation.to)
+    if (mutated === normalized) {
+      results.push({ ...mutation, outcome: 'SKIPPED', note: 'replacement did not change the file' })
+      say(`${mutation.id}: SKIPPED (replacement did not change the file)`)
+      continue
     }
 
-    const outcome = green ? 'SURVIVED' : 'KILLED'
-    results.push({ ...mutation, outcome })
-    process.stdout.write(`${mutation.id}: ${outcome}  — ${mutation.guard}\n`)
+    let run
+    try {
+      writeFileSync(absolute, mutated)
+      // **当たったことを読み戻して確かめる。** 書けたつもりで当たっていないと、
+      // 「元のコードで green」を「mutation が生き残った」と読み違える。
+      if (readFileSync(absolute, 'utf-8') !== mutated) {
+        results.push({ ...mutation, outcome: 'SKIPPED', note: 'mutation was not applied on disk' })
+        say(`${mutation.id}: SKIPPED (mutation was not applied on disk)`)
+        continue
+      }
+      run = runTests(mutation.tests)
+    } finally {
+      writeFileSync(absolute, raw)
+      // **戻せたことも読み戻して確かめる。** ここが崩れると以降の mutation も
+      // その後の通常実行も、全部意味が変わる。戻せないなら即止める。
+      if (readFileSync(absolute, 'utf-8') !== raw) {
+        say(`${mutation.id}: FATAL — could not restore ${mutation.file}`)
+        process.exit(2)
+      }
+    }
+
+    const outcome =
+      run.kind === 'failed' ? 'KILLED'
+        : run.kind === 'passed' ? 'SURVIVED'
+          : run.kind === 'timeout' ? 'TIMEOUT'
+            : 'INCONCLUSIVE'
+    results.push({ ...mutation, outcome, note: run.detail })
+    say(`${mutation.id}: ${outcome}  — ${mutation.guard}${run.detail ? ` (${run.detail})` : ''}`)
   }
 
-  const survived = results.filter((r) => r.outcome === 'SURVIVED')
-  const skipped = results.filter((r) => r.outcome === 'SKIPPED')
+  const killed = results.filter((r) => r.outcome === 'KILLED')
+  // **KILLED 以外はすべて失敗である。** 「生き残った」も「当てられなかった」も
+  // 「時間内に終わらなかった」も「集計が取れなかった」も、**保証を測れていない**点で同じ。
+  const notKilled = results.filter((r) => r.outcome !== 'KILLED')
+  const count = (outcome) => results.filter((r) => r.outcome === outcome).length
 
-  process.stdout.write(
-    `\nkilled=${results.length - survived.length - skipped.length} survived=${survived.length} skipped=${skipped.length}\n`,
+  say('')
+  say(
+    `killed=${killed.length} survived=${count('SURVIVED')} skipped=${count('SKIPPED')} ` +
+    `timeout=${count('TIMEOUT')} inconclusive=${count('INCONCLUSIVE')}`,
   )
 
-  if (survived.length > 0 || skipped.length > 0) {
-    for (const r of [...survived, ...skipped]) {
-      process.stdout.write(`  ${r.outcome}: ${r.id} — ${r.guard}${r.note ? ` (${r.note})` : ''}\n`)
+  if (notKilled.length > 0) {
+    for (const r of notKilled) {
+      say(`  ${r.outcome}: ${r.id} — ${r.guard}${r.note ? ` (${r.note})` : ''}`)
     }
     process.exit(1)
   }
-  process.stdout.write('すべての mutation が落ちた。ガードはテストで固定されている。\n')
+  say('すべての mutation が落ちた。ガードはテストで固定されている。')
 }
 
 main()

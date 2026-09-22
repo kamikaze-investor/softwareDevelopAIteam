@@ -574,3 +574,71 @@ describe('stepKey が別 Task に取られていたら already_started にしな
     expect(outcome.status).toBe('repair_job_created')
   })
 })
+
+describe('監査 storage の不調は repair 判定も生成も落とさない（独立レビュー指摘）', () => {
+  it('auditLog.findByEntity が投げても repair は作られ、resume は unknown 扱いになる', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const origin = createFailedJob(storage, ids, {
+      workflowStepKey: 'task:' + ids.taskId + ':initial-implement',
+    })
+    const resumed = createFailedJob(storage, ids, {
+      workflowStepKey: 'resume:' + origin.id + ':1',
+      exitCode: 7,
+      stderr: 'resumed work failed',
+    })
+    storage.auditLog.findByEntity = () => { throw new Error('audit storage is unavailable') }
+
+    const outcome = await runRepairFlow(storage, { failedJob: resumed }, deps())
+
+    // 読めなかった actor は unknown = generation を跨がない。origin から数えて attempt 1。
+    expect(outcome.status).toBe('repair_job_created')
+    if (outcome.status === 'repair_job_created') expect(outcome.attempt).toBe(1)
+  })
+
+  it('読めない resume は human 扱いにならない（使い切った予算は戻らない）', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    let tip = createFailedJob(storage, ids, {
+      workflowStepKey: 'task:' + ids.taskId + ':initial-implement',
+      exitCode: 42,
+    })
+    for (let i = 1; i <= MAX_REPAIR_ATTEMPTS; i += 1) {
+      tip = createFailedJob(storage, ids, { workflowStepKey: 'repair:' + tip.id + ':1', exitCode: i })
+    }
+    const resumed = createFailedJob(storage, ids, {
+      workflowStepKey: 'resume:' + tip.id + ':1',
+      exitCode: 77,
+      stderr: 'resumed work failed',
+    })
+    storage.auditLog.findByEntity = () => { throw new Error('audit storage is unavailable') }
+
+    const outcome = await runRepairFlow(storage, { failedJob: resumed }, deps())
+
+    expect(outcome.status).toBe('escalated')
+    if (outcome.status === 'escalated') expect(outcome.reason).toContain('limit')
+  })
+})
+
+describe('generation の導出そのものが失敗しても repair は止めない', () => {
+  it('derive 中の storage read が投げても repair Job は作られる', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+
+    // 判定は済ませてから壊す。Design Review の実行中に差し込むことで、
+    // 「Job 生成の後に走る generation 導出」だけが例外に当たる状態を作る。
+    const breakingDeps = {
+      ...deps(),
+      execute: async () => {
+        storage.reviewResults.findByTaskId = () => { throw new Error('review storage is unavailable') }
+        return { ok: true as const, stdout: ALIGNED_STDOUT, timedOut: false }
+      },
+    }
+
+    const outcome = await runRepairFlow(storage, { failedJob: failed }, breakingDeps)
+
+    expect(outcome.status).toBe('repair_job_created')
+    expect(storage.tasks.findById(ids.taskId)!.status).not.toBe('blocked')
+  })
+})

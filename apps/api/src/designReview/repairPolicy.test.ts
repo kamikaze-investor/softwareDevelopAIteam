@@ -434,11 +434,31 @@ describe('walkRepairGeneration — 数え切れないときは fail-closed', () 
     if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
   })
 
-  it('[19] 歩数の上限を超える lineage は escalate する', () => {
+  it('[19] 長い lineage でも walk は必ず止まる（歩数の閾値は置かない）', () => {
+    // 200 段の repair chain。予算判定で止まるのであって、歩数で止まるのではない。
     const built = chain(200, (i) => ({ exitCode: i, stderr: `distinct ${i}` }))
     const decision = decideRepairAction(built.tip, built.jobs, FACTS_A)
     expect(decision.action).toBe('escalate')
-    if (decision.action === 'escalate') expect(decision.reason).toContain('bounded walk')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
+  })
+
+  it('[19] resume が何段積まれていても、予算を使っていなければ escalate しない', () => {
+    // 歩数の閾値を置くと、ここが「数え切れなかった」として誤って escalate する。
+    // 予算は `MAX_REPAIR_ATTEMPTS` だけで決まる（新しい閾値を足さない。独立レビュー指摘）。
+    const priors: PriorRepairJob[] = [originJob()]
+    let parent = ORIGIN_ID
+    for (let i = 1; i <= 200; i += 1) {
+      const id = `resume-ai-${i}`
+      priors.push(resumeOf(parent, id, 'ai'))
+      parent = id
+    }
+
+    const decision = decideRepairAction(parent, priors, FACTS_A)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') {
+      expect(decision.attempt).toBe(1)
+      expect(decision.generation.rootJobId).toBe(ORIGIN_ID)
+    }
   })
 
   it('[19] 同じ id の Job が 2 件ある入力は曖昧として escalate する', () => {
@@ -596,5 +616,103 @@ describe('sameFailureRepeated は generation の中だけで数える', () => {
       expect(decision.attempt).toBe(2)
       expect(decision.requireDifferentApproach).toBe(true)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// **停止保証と cycle 検出を別々に固定する。**
+//
+// 2026-09-22: cycle guard を潰す mutation を当てたところ、walk が止まらず vitest worker が
+// 1 コアを 82 分専有した（固定の歩数上限を消した直後だったため停止保証がゼロだった）。
+// 「環を検出できる」ことと「何が壊れても有限時間で終わる」ことは別の責務なので、別々に pin する。
+// ---------------------------------------------------------------------------
+
+describe('lineage walk — 意味側（cycle 検出）', () => {
+  it('環は cycle として名指しで fail-closed になる', () => {
+    const decision = decideRepairAction('a', [repairOf('b', 'a'), repairOf('a', 'b')], FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+
+  it('大きな環でも即座に cycle として返る（歩数に比例して遅くならない）', () => {
+    const priors: PriorRepairJob[] = []
+    for (let i = 0; i < 500; i += 1) {
+      priors.push(repairOf(`node-${(i + 1) % 500}`, `node-${i}`))
+    }
+    const startedAt = Date.now()
+    const decision = decideRepairAction('node-0', priors, FACTS_A)
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.reason).toContain('cycle')
+  })
+})
+
+describe('lineage walk — 停止側（データ由来の bound）', () => {
+  it('正当で長い lineage は bound では落ちない（恣意的な閾値を持たない）', () => {
+    // 500 段の resume。Job 件数由来の bound なので、何段でも正当なら通る。
+    const priors: PriorRepairJob[] = [originJob()]
+    let parent = ORIGIN_ID
+    for (let i = 1; i <= 500; i += 1) {
+      const id = `resume-ai-${i}`
+      priors.push(resumeOf(parent, id, 'ai'))
+      parent = id
+    }
+
+    const walk = walkRepairGeneration(parent, priors)
+    expect(walk.ok).toBe(true)
+    if (walk.ok) {
+      expect(walk.depth).toBe(0)
+      expect(walk.rootJobId).toBe(ORIGIN_ID)
+    }
+  })
+
+  it('Job 件数ちょうどの直列 lineage も通る（境界で 1 段ずれない）', () => {
+    for (const depth of [1, 2, 3]) {
+      const built = chain(depth, (i) => ({ exitCode: i, stderr: `distinct ${i}` }))
+      const walk = walkRepairGeneration(built.tip, built.jobs)
+      expect(walk.ok).toBe(true)
+      if (walk.ok) expect(walk.depth).toBe(depth)
+    }
+  })
+
+  it('walk は必ず有限時間で終わる（どの壊れ方でも返り値が返る）', () => {
+    const broken: { source: string; priors: PriorRepairJob[] }[] = [
+      { source: 'a', priors: [repairOf('a', 'a')] },
+      { source: 'a', priors: [repairOf('b', 'a'), repairOf('a', 'b')] },
+      { source: 'a', priors: [repairOf('missing', 'a')] },
+      { source: 'a', priors: [{ id: 'a', workflowStepKey: 'repair:', status: 'failed', facts: {} }] },
+      { source: 'a', priors: [{ id: 'a', workflowStepKey: 'resume::1', status: 'failed', facts: {} }] },
+      { source: 'missing', priors: [originJob()] },
+      { source: ORIGIN_ID, priors: [originJob(), originJob()] },
+    ]
+    const startedAt = Date.now()
+    for (const { source, priors } of broken) {
+      const walk = walkRepairGeneration(source, priors)
+      expect(walk.ok).toBe(false)
+    }
+    expect(Date.now() - startedAt).toBeLessThan(2_000)
+  })
+})
+
+describe('hard bound の値そのものを固定する', () => {
+  // **symbol だけで書いたテストは値の変更を検出できない。**
+  // `chain(MAX_REPAIR_ATTEMPTS)` は上限を 99 にしても 99 段の chain を作って通ってしまう。
+  // 安全側の定数なので、値そのものと、literal の深さでの挙動を別々に固定する。
+  it('MAX_REPAIR_ATTEMPTS は 3 である', () => {
+    expect(MAX_REPAIR_ATTEMPTS).toBe(3)
+  })
+
+  it('深さ 2 の chain には次の repair を作り、深さ 3 では作らない', () => {
+    const distinct = (i: number) => ({ exitCode: i, stderr: `distinct ${i}` })
+
+    const two = chain(2, distinct)
+    const afterTwo = decideRepairAction(two.tip, two.jobs, { exitCode: 90, stderr: 'another' })
+    expect(afterTwo.action).toBe('repair')
+    if (afterTwo.action === 'repair') expect(afterTwo.attempt).toBe(3)
+
+    const three = chain(3, distinct)
+    const afterThree = decideRepairAction(three.tip, three.jobs, { exitCode: 91, stderr: 'another' })
+    expect(afterThree.action).toBe('escalate')
+    if (afterThree.action === 'escalate') expect(afterThree.reason).toContain('limit')
   })
 })

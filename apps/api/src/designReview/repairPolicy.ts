@@ -146,15 +146,6 @@ export function computeFailureSignature(facts: RepairFailureFacts): string {
 }
 
 /**
- * ancestry を辿る歩数の上限。
- *
- * 壊れた lineage（自己参照でない長い環・作為的に積まれた鎖）で無限に歩かないための bound。
- * `MAX_REPAIR_ATTEMPTS` とは別の意味なので、その値を流用しない。
- * 超えたら「数え切れなかった」ので **fail-closed**（depth 0 ではない）。
- */
-const MAX_ANCESTRY_STEPS = 64
-
-/**
  * `repair:<sourceJobId>:1` から source Job id を取り出す。
  * 形が違えば `undefined`。**呼び出し側は必ず fail-closed 側へ倒すこと。**
  */
@@ -253,7 +244,20 @@ export function walkRepairGeneration(
         }
   )
 
-  for (let step = 0; step <= MAX_ANCESTRY_STEPS; step += 1) {
+  // **停止保証と cycle 検出は別の責務である。両方持つ。**
+  //
+  //   - `seen`（下）は**意味側**のガード: 同じ Job を 2 度訪れたら lineage は環である。
+  //     何が起きたかを名前で報告できるのはこちらだけ。
+  //   - 歩数の上限（ここ）は**停止側**のガード: 意味側が将来壊れても、process を
+  //     無限ループさせない。実際に壊した状態で計測したら worker が 1 コアを
+  //     82 分専有して止まらなかったので、後から足した。
+  //
+  // 上限は**固定値ではなく、この Task の Job 件数**である。整形式の lineage は
+  // 同じ Job を 2 度訪れないので `byId.size` 歩を超えることはあり得ない。
+  // よって正当な lineage を誤って弾かず、かつ必ず有限時間で終わる。
+  // 固定の歩数（以前の `MAX_ANCESTRY_STEPS = 64`）は、それ自体が**新しい閾値**になり、
+  // 長く生き延びた Task の正当な lineage を「数え切れなかった」と誤判定していた。
+  for (let step = 0; step <= byId.size; step += 1) {
     if (seen.has(cursor)) {
       return { ok: false, reason: `lineage forms a cycle at job ${cursor}` }
     }
@@ -304,7 +308,13 @@ export function walkRepairGeneration(
     return finish(cursor)
   }
 
-  return { ok: false, reason: `lineage is longer than the bounded walk (${MAX_ANCESTRY_STEPS} steps)` }
+  // **整形式の lineage ではここへ来ない。** 来たのは意味側のガードが働いていない
+  // ということなので、「数え切れていない」として fail-closed にする。
+  // depth 0（＝予算満額）へも success へも倒さない。
+  return {
+    ok: false,
+    reason: `lineage walk did not terminate within the ${byId.size} jobs of this task`,
+  }
 }
 
 /**

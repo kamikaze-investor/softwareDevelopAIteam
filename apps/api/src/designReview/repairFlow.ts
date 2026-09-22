@@ -140,6 +140,19 @@ export function isWorkflowStepKeyConflict(error: unknown): boolean {
  * 判定へは一切戻さない。**ここが失敗しても repair は止めないし、budget も動かない。**
  */
 function recordGenerationForCreatedRepairJob(storage: IStorage, repairJob: Job): void {
+  try {
+    deriveAndRecordRepairGeneration(storage, repairJob)
+  } catch (error: unknown) {
+    // repair Job は既に作られている。記録のための読み書きで caller を失敗させない
+    // （独立レビュー指摘）。落ちた場合の意味は決まっている: 後から generation を知る
+    // 手がかりが 1 件減るだけで、判定も予算も変わらない。
+    console.warn(
+      `[repairFlow] failed to record the repair generation of job ${repairJob.id}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+function deriveAndRecordRepairGeneration(storage: IStorage, repairJob: Job): void {
   const stepKey = repairJob.workflowStepKey
   const sourceJobId = stepKey === undefined ? undefined : parseRepairSource(stepKey)
   if (sourceJobId === undefined) return
