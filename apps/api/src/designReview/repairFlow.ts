@@ -38,6 +38,7 @@ import { recomputeDecision, type RawStrategicResult } from './designReviewCoordi
 import {
   REPAIR_STEP_PREFIX,
   decideRepairAction,
+  generationResetFacts,
   parseRepairSource,
   walkRepairGeneration,
   type PriorRepairJob,
@@ -185,13 +186,9 @@ function deriveAndRecordRepairGeneration(storage: IStorage, repairJob: Job): voi
     generationRoot: walk.rootJobId,
     ancestryDepth: walk.depth,
     previousGenerationRoot: walk.previousGenerationRoot,
-    budgetReset: walk.rootKind === 'human_resume',
-    resetReason:
-      walk.rootKind === 'human_resume'
-        ? 'human_resume_started_new_generation'
-        : walk.crossedAiResume
-          ? 'ai_or_unknown_resume_continues_generation'
-          : 'same_generation',
+    // **判定と同じ導出を使う。** ここに三項式を書き直すと、root 種別が増えたときに
+    // 片側だけ更新され、監査が reset を「reset していない」と記録する（独立レビュー指摘）。
+    ...generationResetFacts(walk),
   })
 }
 

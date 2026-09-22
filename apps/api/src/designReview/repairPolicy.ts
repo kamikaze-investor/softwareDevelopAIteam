@@ -385,6 +385,35 @@ export function walkRepairGeneration(
  * @param priorJobs 同一Taskの既存Job（順序は問わない）
  * @param newFacts  今回の失敗事実
  */
+/**
+ * generation の walk 結果から **予算 reset の事実**を1か所で導く。
+ *
+ * 判定（`decideRepairAction`）と監査（`repairFlow.deriveAndRecordRepairGeneration`）の
+ * 両方がこれを使う。**同じ規則を2か所に書かない。** 以前は両者が別々に同じ三項式を
+ * 持っていたため、`human_recovery` を足したとき判定側だけが更新され、**監査側が
+ * reset を `same_generation` と記録していた**（独立レビュー指摘）。
+ * 監査が事実と食い違うと、後から「誰の権限でこの generation が始まったか」を
+ * 追えなくなる —— それは `human_resume` と `human_recovery` を混同させないという
+ * 設計の目的そのものを壊す。
+ */
+export function generationResetFacts(walk: {
+  rootKind: GenerationRootKind
+  crossedAiResume: boolean
+}): { budgetReset: boolean, resetReason: string } {
+  if (walk.rootKind === 'human_resume') {
+    return { budgetReset: true, resetReason: 'human_resume_started_new_generation' }
+  }
+  if (walk.rootKind === 'human_recovery') {
+    return { budgetReset: true, resetReason: 'human_recovery_epoch_started_new_generation' }
+  }
+  return {
+    budgetReset: false,
+    resetReason: walk.crossedAiResume
+      ? 'ai_or_unknown_resume_continues_generation'
+      : 'same_generation',
+  }
+}
+
 export function decideRepairAction(
   sourceJobId: string,
   priorJobs: readonly PriorRepairJob[],
@@ -458,17 +487,9 @@ export function decideRepairAction(
       depth: walk.depth,
       previousGenerationRoot: walk.previousGenerationRoot,
       crossedAiResume: walk.crossedAiResume,
-      budgetReset: walk.rootKind === 'human_resume' || walk.rootKind === 'human_recovery',
-      // **理由は2つを区別して残す。** 監査上、過去の resume が human だったのか、
-      // いま recovery を承認されたのかは別の事実である。
-      resetReason:
-        walk.rootKind === 'human_resume'
-          ? 'human_resume_started_new_generation'
-          : walk.rootKind === 'human_recovery'
-            ? 'human_recovery_epoch_started_new_generation'
-            : walk.crossedAiResume
-              ? 'ai_or_unknown_resume_continues_generation'
-              : 'same_generation',
+      // **理由は2つを区別して残す。** 過去の resume が human だったのか、
+      // いま recovery を承認されたのかは別の事実である。導出は1か所（下の helper）。
+      ...generationResetFacts(walk),
     },
     // 末尾は常に :1 で固定する。attempt番号を入れると同一failureの再送で別keyになり、
     // chainが二重化する。一意性はsourceJobId側が担保する（Stage 1の retry:<jobId>:1 と同じ）。

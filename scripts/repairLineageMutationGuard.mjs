@@ -72,6 +72,14 @@ const MUTATIONS = [
   // 加算した**部分である。守るのは「現在の authority が根になる」「根が決まっても
   // lineage 検査を弱めない」「同じ epoch で予算を繰り返し再発行しない」の 3 点。
   {
+    id: 'N11-recovery-reset-not-recorded',
+    guard: 'human_recovery の reset を判定にも監査にも同じ導出で残す',
+    file: POLICY,
+    from: "    return { budgetReset: true, resetReason: 'human_recovery_epoch_started_new_generation' }",
+    to: "    return { budgetReset: false, resetReason: 'same_generation' }",
+    tests: [...GENERATION_TESTS, ...FLOW_TESTS],
+  },
+  {
     id: 'N1-recovery-epoch-ignored',
     guard: 'consume 済み recovery epoch をその実装の generation 根として扱う',
     file: POLICY,
@@ -99,14 +107,6 @@ const MUTATIONS = [
       '    if (countedRoot === undefined && job.humanRecoveryEpoch === true) {',
       '      return finish(cursor); countedRoot = {',
     ].join('\n'),
-    tests: GENERATION_TESTS,
-  },
-  {
-    id: 'N4-recovery-epoch-does-not-reset-budget',
-    guard: 'human_recovery も予算 reset として扱う（理由は human_resume と区別する）',
-    file: POLICY,
-    from: "      budgetReset: walk.rootKind === 'human_resume' || walk.rootKind === 'human_recovery',",
-    to: "      budgetReset: walk.rootKind === 'human_resume',",
     tests: GENERATION_TESTS,
   },
   {
