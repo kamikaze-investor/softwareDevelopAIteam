@@ -10698,6 +10698,65 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       専用 table / 第二の Principle Registry / Provider abstraction / 新しい従量課金 API 経路 /
       Question 本文・tier・閾値の自動書き換え。
 
+<!-- roadmap:id=consumed-stored-review-has-no-recovery-route state=in_progress -->
+7. [ ] **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない** —
+      2026-09-22登録（CEO 指示）。
+
+      **責務境界（重要）**: repair 予算・lineage・generation の意味論は
+      `repair-budget-counted-per-task-not-per-chain`（#270・`done`）が正本である。
+      **本項目はそこへ別の予算アルゴリズムを足さない。** ここが扱うのは、
+      #270 にまだ無い「**保存済みレビューを再駆動する経路**」だけである。
+
+      **実測（production `c3849205`）**: 実装 `eec46736` は成功し、Independent Review
+      `026fe5a3` は `changes_requested` を保存したが、その review の PATCH イベントは
+      #266 の修正前に一度消費されていた。Stage 2 は review の PATCH でしか起動しないため、
+      **イベントが過去に消費済みであることだけを理由に**誰も repair を作れない。
+      同じ review Job へ2つ目の verdict は付けられない（`implement:<id>:review` は
+      `ux_jobs_workflow_step_key` で全体一意）。
+
+      さらに #270 の実装で同 Task を再計算すると `rootKind=origin` / `depth=3` /
+      `budgetReset` 無しとなり `escalate` になる（master の walker で実測）。
+      過去の resume には `resume_actor` audit が1件も無く（DB 全体で 0 件）、
+      **後から human へ書き換えることは禁止**されているため、#270 単独では復旧できない。
+
+      **入れたもの**:
+      - `POST /api/tasks/:id/repair-from-stored-review`。body は `reviewJobId` という
+        **selector だけ**で、verdict / findings / provider / status / allowedPaths /
+        attempt 数 / actor class は受け取らない。Task / review Job / 実装 Job /
+        保存済み verdict をすべて server 側で引き直し、`blocked` な Task に限って
+        既存 `prepareRepairFlow()` へ渡す（admission が走る状態だけを受け付ける）
+      - 権限は既存 ApprovalRequest の再利用。`requestedAction` を
+        `repair_from_stored_review:<reviewJobId>` として **exact Task + exact review** に束縛し、
+        APPROVED → CONSUMED を既存 CAS で一度だけ使い切る。新しい承認種別も table も Gate も
+        status も足していない
+      - #270 の generation 抽象へ `human_recovery` を**加算的に1つ**足した。
+        walker / `MAX_REPAIR_ATTEMPTS` / 予算計算 / audit は #270 のものをそのまま使う
+
+      **`human_resume` と `human_recovery` を混同しない**: 前者は「再開した時点で human と
+      証明された」という *resume の provenance*、後者は「いまここから新しい repair generation を
+      始めてよい」という *現時点の authority* である。後者は過去の resume を human だったことに
+      しない。監査上も `resetReason` を別値で残す。
+
+      **不変条件**: 最も近い authority が根になる（上流の `human_resume` は現在の epoch を
+      上書きしない）/ 根が決まっても lineage の健全性検査は上流まで継続する /
+      expiry は CONSUMED への遷移時に見る（正当に consume された epoch は、その後
+      `expiresAt` を過ぎても crash 再試行で無効にならない）/ **同じ epoch を何度 re-drive しても
+      generation は1つで、3 段使い切れば再び escalate する** / caller の自己申告では reset できない /
+      `resume:` 単独では reset できない / PL だけではこの epoch を作れない。
+
+      **この保証の正確な範囲**: 言えるのは「autonomous PL loop では作れない外部 approval 経路を
+      通った」までで、「human identity が暗号的に証明された」ではない。なお **#270 を deploy しても、
+      legacy single-token mode の間は resume actor を human と証明できないため `human_resume` による
+      予算 reset は発生しない**。依存先は既存
+      `legacy API_TOKEN → ADMIN / WORKER split credential migration`。
+
+      **残り**: `c3849205` に対してこの経路を実際に使う（承認 → consume → repair）。
+      コードではなく運用手順であり、実施をもって `done` にする。
+
+      **作らなかったもの**: 汎用 event replay subsystem / event bus / 新 status・Gate・workflow /
+      新しい `PlActionKind` / 新しい dedup 機構 / 別の repair budget アルゴリズム /
+      route 独自の budget override / `MAX_REPAIR_ATTEMPTS` の変更。
+
 ---
 
-*Updated: 2026-09-17*
+*Updated: 2026-09-22*

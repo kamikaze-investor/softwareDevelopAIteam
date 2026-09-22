@@ -70,6 +70,14 @@ export interface PriorRepairJob {
    * 記録が無いことを「human だった」と解釈しない（fail-safe）。
    */
   resumeActorClass?: ResumeActorClass
+  /**
+   * この Job を根として **human recovery generation** が始まっているか。
+   *
+   * 根拠は consume 済み ApprovalRequest であり、読み取りは flow 層が行う
+   * （`repairRecoveryEpoch.ts`。`resumeActorClass` と同じ境界の置き方）。
+   * **省略時は false**。記録が無いことを authority と解釈しない（fail-safe）。
+   */
+  humanRecoveryEpoch?: boolean
 }
 
 export type RepairDecision =
@@ -90,7 +98,20 @@ export type RepairDecision =
        */
       generation: RepairGeneration
     }
-  | { action: 'escalate'; reason: string; signature: string }
+  | {
+      action: 'escalate'
+      reason: string
+      signature: string
+      /**
+       * escalate の理由を**構造化して**持つ。呼び出し側が reason 文字列を部分一致で
+       * 判定すると、文言を変えた瞬間に黙って壊れる。
+       *
+       * - `attempt_limit`: この generation の repair 段数が上限に達した
+       * - `lineage_unreconstructable`: chain を辿れなかった（fail-closed）
+       * - `no_actionable_information`: 同じ失敗の繰り返しで手がかりが無い
+       */
+      code: 'attempt_limit' | 'lineage_unreconstructable' | 'no_actionable_information'
+    }
 
 /** repair 1 件が属する generation の確定事実。 */
 export interface RepairGeneration {
@@ -166,9 +187,16 @@ function parseResumeSource(stepKey: string): string | undefined {
  * generation の根がどちら側の事実で決まったか。
  *
  * `origin` は lineage の端（通常の implement 等）。
- * `human_resume` は **human と証明された resume**。後者だけが予算の再発行を意味する。
+ * `human_resume` は **human と証明された resume**。
+ * `human_recovery` は **その実装に対する human recovery epoch**（consume 済みの
+ * ApprovalRequest）。後ろ2つだけが予算の再発行を意味する。
+ *
+ * **この2つを混同しない。** `human_resume` は「再開した時点で human と証明された」
+ * という *resume の provenance* であり、`human_recovery` は「いまここから新しい
+ * repair generation を始めてよい」という *現時点の authority* である。
+ * 後者は過去の resume を human だったことにはしない。
  */
-export type GenerationRootKind = 'origin' | 'human_resume'
+export type GenerationRootKind = 'origin' | 'human_resume' | 'human_recovery'
 
 export type GenerationWalk =
   | {
@@ -228,7 +256,11 @@ export function walkRepairGeneration(
    * 数え終わりが決まったら確定する。**以降も walk は続く**（上流の健全性を確かめるため）。
    * ここに値が入った後は depth も crossedAiResume も動かさない。
    */
-  let countedRoot: { rootJobId: string; previousGenerationRoot: string } | undefined
+  let countedRoot: {
+    rootJobId: string
+    previousGenerationRoot?: string
+    kind: 'human_resume' | 'human_recovery'
+  } | undefined
 
   const finish = (originJobId: string): GenerationWalk => (
     countedRoot === undefined
@@ -237,12 +269,20 @@ export function walkRepairGeneration(
           ok: true,
           depth,
           rootJobId: countedRoot.rootJobId,
-          rootKind: 'human_resume',
+          rootKind: countedRoot.kind,
           previousGenerationRoot: countedRoot.previousGenerationRoot,
           crossedAiResume,
           generationRepairJobIds,
         }
   )
+
+  /** `repair:` / `resume:` いずれの規約でも親を返す。それ以外は端なので undefined。 */
+  const lineageParentOf = (stepKey: string | undefined): string | undefined => {
+    if (stepKey === undefined) return undefined
+    if (stepKey.startsWith(REPAIR_STEP_PREFIX)) return parseRepairSource(stepKey)
+    if (stepKey.startsWith(RESUME_STEP_PREFIX)) return parseResumeSource(stepKey)
+    return undefined
+  }
 
   // **停止保証と cycle 検出は別の責務である。両方持つ。**
   //
@@ -271,6 +311,25 @@ export function walkRepairGeneration(
     }
 
     const stepKey = job.workflowStepKey
+
+    // **human recovery epoch は、その Job の stepKey 種別に依らず数え終わりになる。**
+    //
+    // epoch が張られるのは「レビューされた実装 Job」であり、それ自体が `resume:` の
+    // こともある（production `c3849205` の `eec46736` がまさにそれ）。よって
+    // stepKey 分岐より**手前**で見る。
+    //
+    // **最も近い authority が勝つ。** `countedRoot === undefined` のときだけ確定するので、
+    // 上流にさらに `human_resume` があっても現在の根を上書きしない。
+    // そして `human_resume` と同じく **ここで walk を止めない** —— 止めると、この Job
+    // 自身が環の一部でも別 Task から来ていても素通りしてしまう。
+    if (countedRoot === undefined && job.humanRecoveryEpoch === true) {
+      countedRoot = {
+        rootJobId: cursor,
+        previousGenerationRoot: lineageParentOf(stepKey),
+        kind: 'human_recovery',
+      }
+    }
+
     if (stepKey === undefined || stepKey.trim() === '') {
       return finish(cursor)
     }
@@ -296,7 +355,7 @@ export function walkRepairGeneration(
       // **human と証明された resume が数え終わり。** ただしここで walk は止めない。
       // 止めると、この resume 自身が環の一部でも別 Task から来ていても素通りしてしまう。
       if (countedRoot === undefined && job.resumeActorClass === 'human') {
-        countedRoot = { rootJobId: cursor, previousGenerationRoot: parent }
+        countedRoot = { rootJobId: cursor, previousGenerationRoot: parent, kind: 'human_resume' }
       } else if (countedRoot === undefined) {
         crossedAiResume = true
       }
@@ -345,6 +404,7 @@ export function decideRepairAction(
       action: 'escalate',
       reason: `repair lineage could not be reconstructed: ${walk.reason}`,
       signature,
+      code: 'lineage_unreconstructable',
     }
   }
 
@@ -353,6 +413,7 @@ export function decideRepairAction(
       action: 'escalate',
       reason: `repair attempts reached the limit (${MAX_REPAIR_ATTEMPTS})`,
       signature,
+      code: 'attempt_limit',
     }
   }
 
@@ -383,6 +444,7 @@ export function decideRepairAction(
       action: 'escalate',
       reason: 'the same failure repeated and there is no actionable information to try a different approach',
       signature,
+      code: 'no_actionable_information',
     }
   }
 
@@ -396,13 +458,17 @@ export function decideRepairAction(
       depth: walk.depth,
       previousGenerationRoot: walk.previousGenerationRoot,
       crossedAiResume: walk.crossedAiResume,
-      budgetReset: walk.rootKind === 'human_resume',
+      budgetReset: walk.rootKind === 'human_resume' || walk.rootKind === 'human_recovery',
+      // **理由は2つを区別して残す。** 監査上、過去の resume が human だったのか、
+      // いま recovery を承認されたのかは別の事実である。
       resetReason:
         walk.rootKind === 'human_resume'
           ? 'human_resume_started_new_generation'
-          : walk.crossedAiResume
-            ? 'ai_or_unknown_resume_continues_generation'
-            : 'same_generation',
+          : walk.rootKind === 'human_recovery'
+            ? 'human_recovery_epoch_started_new_generation'
+            : walk.crossedAiResume
+              ? 'ai_or_unknown_resume_continues_generation'
+              : 'same_generation',
     },
     // 末尾は常に :1 で固定する。attempt番号を入れると同一failureの再送で別keyになり、
     // chainが二重化する。一意性はsourceJobId側が担保する（Stage 1の retry:<jobId>:1 と同じ）。

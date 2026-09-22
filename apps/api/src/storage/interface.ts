@@ -592,6 +592,15 @@ export interface IPermissionGrantStorage {
 }
 
 export interface IApprovalRequestStorage {
+  /**
+   * Task / action 束縛を確かめたうえで、既存の一回限り契約で approval を使い切る。
+   * `abort_task` の consume と同じ実装を共有する（規則を2箇所へ複製しない）。
+   */
+  verifyAndConsumeForTaskAction(input: {
+    taskId: string
+    approvalRequestId: string
+    expectedAction: string
+  }): { ok: true } | { ok: false; reason: string }
   findByTaskId(taskId: string): ApprovalRequest[]
   findById(id: string): ApprovalRequest | undefined
   /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す（CONSUMED は除外） */

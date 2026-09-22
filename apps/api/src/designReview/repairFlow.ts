@@ -44,6 +44,7 @@ import {
   type RepairFailureFacts,
   type ResumeActorClass,
 } from './repairPolicy'
+import { epochCoveredImplementationJobIds } from './repairRecoveryEpoch'
 import { readResumeActorClasses, recordRepairGeneration } from './resumeActor'
 
 /**
@@ -67,7 +68,12 @@ export type RepairPreparation =
       stepKey: string
       attempt: number
     }
-  | { action: 'escalate'; reason: string }
+  | {
+      action: 'escalate'
+      reason: string
+      /** `decideRepairAction` の構造化理由。admission で落ちた場合は undefined。 */
+      code?: 'attempt_limit' | 'lineage_unreconstructable' | 'no_actionable_information'
+    }
   | { action: 'skip'; reason: string }
 
 export type RepairFlowOutcome =
@@ -97,6 +103,7 @@ function toPriorRepairJobs(
   jobs: readonly Job[],
   reviews: readonly ReviewResult[],
   resumeActorClasses: ReadonlyMap<string, ResumeActorClass>,
+  humanRecoveryEpochJobIds: ReadonlySet<string>,
   current?: { jobId: string; status: string; facts: RepairFailureFacts },
 ): PriorRepairJob[] {
   return jobs.map((job) => ({
@@ -104,6 +111,8 @@ function toPriorRepairJobs(
     workflowStepKey: job.workflowStepKey,
     // resume Job 以外では使われない。引けなければ渡さない（policy 側の既定は `unknown`）。
     resumeActorClass: resumeActorClasses.get(job.id),
+    // consume 済み recovery approval がこの実装を根にしているか。既定は false。
+    humanRecoveryEpoch: humanRecoveryEpochJobIds.has(job.id),
     ...(job.id === current?.jobId
       ? { status: current.status, facts: current.facts }
       : {
@@ -161,7 +170,12 @@ function deriveAndRecordRepairGeneration(storage: IStorage, repairJob: Job): voi
   const reviews = storage.reviewResults.findByTaskId(repairJob.taskId)
   const walk = walkRepairGeneration(
     sourceJobId,
-    toPriorRepairJobs(jobs, reviews, readResumeActorClasses(storage, jobs)),
+    toPriorRepairJobs(
+      jobs,
+      reviews,
+      readResumeActorClasses(storage, jobs),
+      epochCoveredImplementationJobIds(storage, repairJob.taskId),
+    ),
   )
   if (!walk.ok) return
 
@@ -227,7 +241,12 @@ export async function runRepairFlow(
 
   const decision = decideRepairAction(
     failedJob.id,
-    toPriorRepairJobs(priorJobs, priorReviews, readResumeActorClasses(storage, priorJobs), {
+    toPriorRepairJobs(
+      priorJobs,
+      priorReviews,
+      readResumeActorClasses(storage, priorJobs),
+      epochCoveredImplementationJobIds(storage, task.id),
+      {
       jobId: failedJob.id,
       status: 'failed',
       facts,
@@ -631,14 +650,21 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
 
   const decision = decideRepairAction(
     failedJob.id,
-    toPriorRepairJobs(priorJobs, priorReviews, readResumeActorClasses(storage, priorJobs), {
+    toPriorRepairJobs(
+      priorJobs,
+      priorReviews,
+      readResumeActorClasses(storage, priorJobs),
+      epochCoveredImplementationJobIds(storage, task.id),
+      {
       jobId: failedJob.id,
       status: 'failed',
       facts,
     }),
     facts,
   )
-  if (decision.action === 'escalate') return { action: 'escalate', reason: decision.reason }
+  if (decision.action === 'escalate') {
+    return { action: 'escalate', reason: decision.reason, code: decision.code }
+  }
 
   if (priorJobs.some((job) => job.workflowStepKey === decision.stepKey)) {
     return { action: 'skip', reason: 'repair job already exists for this failure' }
