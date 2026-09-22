@@ -59,7 +59,104 @@ const ROUTE_TESTS = ['src/designReview/resumeActorAuthorization.test.ts']
 const PL_TESTS = ['src/pl/executionLoop.test.ts']
 const FLOW_TESTS = ['src/designReview/repairFlow.test.ts']
 
+/** stored-review recovery（`human_recovery` generation root）側。 */
+const EPOCH = 'apps/api/src/designReview/repairRecoveryEpoch.ts'
+const RECOVERY = 'apps/api/src/designReview/repairFromStoredReview.ts'
+const RECOVERY_TESTS = ['src/designReview/repairFromStoredReview.test.ts']
+const GENERATION_TESTS = ['src/designReview/repairHumanRecoveryGeneration.test.ts']
+
 const MUTATIONS = [
+  // ── stored-review recovery / human_recovery generation root ──────────────
+  //
+  // ここは #270 の予算アルゴリズムを増やしたのではなく、**generation の根を 1 つ
+  // 加算した**部分である。守るのは「現在の authority が根になる」「根が決まっても
+  // lineage 検査を弱めない」「同じ epoch で予算を繰り返し再発行しない」の 3 点。
+  {
+    id: 'N11-recovery-reset-not-recorded',
+    guard: 'human_recovery の reset を判定にも監査にも同じ導出で残す',
+    file: POLICY,
+    from: "    return { budgetReset: true, resetReason: 'human_recovery_epoch_started_new_generation' }",
+    to: "    return { budgetReset: false, resetReason: 'same_generation' }",
+    tests: [...GENERATION_TESTS, ...FLOW_TESTS],
+  },
+  {
+    id: 'N1-recovery-epoch-ignored',
+    guard: 'consume 済み recovery epoch をその実装の generation 根として扱う',
+    file: POLICY,
+    from: '    if (countedRoot === undefined && job.humanRecoveryEpoch === true) {',
+    to: '    if (false) {',
+    tests: GENERATION_TESTS,
+  },
+  {
+    id: 'N2-recovery-epoch-overrides-nearer-authority',
+    guard: '最も近い authority が根（手前で決まった根を上書きしない）',
+    file: POLICY,
+    from: '    if (countedRoot === undefined && job.humanRecoveryEpoch === true) {',
+    to: '    if (job.humanRecoveryEpoch === true) {',
+    tests: GENERATION_TESTS,
+  },
+  {
+    id: 'N3-recovery-epoch-stops-the-walk',
+    guard: 'epoch が根でも walk は止めない（上流の健全性を確かめる）',
+    file: POLICY,
+    from: [
+      '    if (countedRoot === undefined && job.humanRecoveryEpoch === true) {',
+      '      countedRoot = {',
+    ].join('\n'),
+    to: [
+      '    if (countedRoot === undefined && job.humanRecoveryEpoch === true) {',
+      '      return finish(cursor); countedRoot = {',
+    ].join('\n'),
+    tests: GENERATION_TESTS,
+  },
+  {
+    id: 'N5-recovery-epoch-not-wired-into-policy-input',
+    guard: 'flow 層が epoch 集合を policy へ渡す（渡さなければ根は生まれない）',
+    file: REPAIR_FLOW,
+    from: '    humanRecoveryEpoch: humanRecoveryEpochJobIds.has(job.id),',
+    to: '    humanRecoveryEpoch: false,',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N6-approved-alone-opens-the-epoch',
+    guard: 'epoch は CONSUMED でのみ開く（APPROVED だけでは開かない）',
+    file: EPOCH,
+    from: "    if (request.status !== 'CONSUMED') continue",
+    to: "    if (request.status !== 'CONSUMED' && request.status !== 'APPROVED') continue",
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N7-consumed-epoch-expires-later',
+    guard: 'consume 済み epoch は expiresAt を過ぎても有効（expiry は consume 時に見る）',
+    file: EPOCH,
+    from: '    covered.add(chain.implementJob.id)',
+    to: '    if (new Date(request.expiresAt).getTime() > Date.now()) covered.add(chain.implementJob.id)',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N8-recovery-route-runs-outside-blocked',
+    guard: 'recovery route は admission が走る blocked Task でのみ動く',
+    file: RECOVERY,
+    from: "  if (task.status !== 'blocked') {",
+    to: '  if (false) {',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N9-recovery-accepts-any-verdict',
+    guard: 'changes_requested の verdict だけを再駆動する',
+    file: EPOCH,
+    from: "  if (review.status !== 'changes_requested') {",
+    to: '  if (false) {',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N10-recovery-epoch-demands-a-fresh-approval',
+    guard: 'epoch 成立後は承認を焼き直さない（crash 再試行で authorization を失わない）',
+    file: RECOVERY,
+    from: '  if (epochAlreadyOpen) {',
+    to: '  if (false) {',
+    tests: RECOVERY_TESTS,
+  },
   {
     id: 'G1-ai-resume-resets-budget',
     guard: 'AI / unknown の resume は generation を跨がない',
@@ -235,7 +332,7 @@ const MUTATIONS = [
     file: POLICY,
     from: [
       "      if (countedRoot === undefined && job.resumeActorClass === 'human') {",
-      '        countedRoot = { rootJobId: cursor, previousGenerationRoot: parent }',
+      `        countedRoot = { rootJobId: cursor, previousGenerationRoot: parent, kind: 'human_resume' }`,
     ].join('\n'),
     to: [
       "      if (countedRoot === undefined && job.resumeActorClass === 'human') {",

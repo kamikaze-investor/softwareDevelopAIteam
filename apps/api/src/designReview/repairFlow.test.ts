@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
+import { repairRecoveryActionFor } from './repairRecoveryEpoch'
 import type { IStorage } from '../storage/interface'
 import type { Job } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -455,6 +456,63 @@ describe('repair generation を既存 audit へ残す', () => {
     expect(rows[0].detail).toContain('budget_reset=no')
     expect(rows[0].detail).toContain('previous_generation_root=none')
     expect(rows[0].detail).toContain('reset_reason=same_generation')
+  })
+
+  // **audit は判定と同じ事実を書く。** 以前ここには reset 導出の写しがあり、
+  // `human_recovery` を足したとき判定側だけが更新され、監査は reset を
+  // `same_generation` と記録していた（独立レビュー指摘）。導出は1か所に寄せてある。
+  it('human_recovery で始まった generation は audit でも reset として残る', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids, {
+      workflowStepKey: 'task:' + ids.taskId + ':initial-implement',
+    })
+
+    // この実装に対する review Job と、consume 済みの recovery 承認を用意する。
+    const reviewJob = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'reviewer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'review',
+      workflowStepKey: `implement:${failed.id}:review`,
+    } as never)
+    storage.reviewResults.create({
+      taskId: ids.taskId,
+      jobId: reviewJob.id,
+      reviewer: 'qa_ai',
+      status: 'changes_requested',
+      summary: 's',
+      findings: [],
+    } as never)
+    const approval = storage.approvalRequests.create({
+      taskId: ids.taskId,
+      targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
+      riskLevel: 'HIGH',
+      requestedAction: repairRecoveryActionFor(reviewJob.id),
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      invalidIf: [],
+    } as never)
+    storage.approvalRequests.recordDecision(approval.id, 'APPROVED')
+    expect(storage.approvalRequests.verifyAndConsumeForTaskAction({
+      taskId: ids.taskId,
+      approvalRequestId: approval.id,
+      expectedAction: repairRecoveryActionFor(reviewJob.id),
+    }).ok).toBe(true)
+
+    const outcome = await runRepairFlow(storage, { failedJob: failed }, deps())
+    expect(outcome.status).toBe('repair_job_created')
+    if (outcome.status !== 'repair_job_created') return
+
+    const rows = storage.auditLog
+      .findByEntity('job', outcome.jobId)
+      .filter((entry) => entry.operation === 'repair_generation')
+    expect(rows).toHaveLength(1)
+    expect(rows[0].detail).toContain('budget_reset=yes')
+    expect(rows[0].detail).toContain('reset_reason=human_recovery_epoch_started_new_generation')
+    expect(rows[0].result).toBe('reset')
   })
 
   it('2 本目の repair では深さが 1 として記録される', async () => {

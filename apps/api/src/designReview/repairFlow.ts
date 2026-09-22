@@ -38,12 +38,14 @@ import { recomputeDecision, type RawStrategicResult } from './designReviewCoordi
 import {
   REPAIR_STEP_PREFIX,
   decideRepairAction,
+  generationResetFacts,
   parseRepairSource,
   walkRepairGeneration,
   type PriorRepairJob,
   type RepairFailureFacts,
   type ResumeActorClass,
 } from './repairPolicy'
+import { epochCoveredImplementationJobIds } from './repairRecoveryEpoch'
 import { readResumeActorClasses, recordRepairGeneration } from './resumeActor'
 
 /**
@@ -67,7 +69,12 @@ export type RepairPreparation =
       stepKey: string
       attempt: number
     }
-  | { action: 'escalate'; reason: string }
+  | {
+      action: 'escalate'
+      reason: string
+      /** `decideRepairAction` の構造化理由。admission で落ちた場合は undefined。 */
+      code?: 'attempt_limit' | 'lineage_unreconstructable' | 'no_actionable_information'
+    }
   | { action: 'skip'; reason: string }
 
 export type RepairFlowOutcome =
@@ -97,6 +104,7 @@ function toPriorRepairJobs(
   jobs: readonly Job[],
   reviews: readonly ReviewResult[],
   resumeActorClasses: ReadonlyMap<string, ResumeActorClass>,
+  humanRecoveryEpochJobIds: ReadonlySet<string>,
   current?: { jobId: string; status: string; facts: RepairFailureFacts },
 ): PriorRepairJob[] {
   return jobs.map((job) => ({
@@ -104,6 +112,8 @@ function toPriorRepairJobs(
     workflowStepKey: job.workflowStepKey,
     // resume Job 以外では使われない。引けなければ渡さない（policy 側の既定は `unknown`）。
     resumeActorClass: resumeActorClasses.get(job.id),
+    // consume 済み recovery approval がこの実装を根にしているか。既定は false。
+    humanRecoveryEpoch: humanRecoveryEpochJobIds.has(job.id),
     ...(job.id === current?.jobId
       ? { status: current.status, facts: current.facts }
       : {
@@ -161,7 +171,12 @@ function deriveAndRecordRepairGeneration(storage: IStorage, repairJob: Job): voi
   const reviews = storage.reviewResults.findByTaskId(repairJob.taskId)
   const walk = walkRepairGeneration(
     sourceJobId,
-    toPriorRepairJobs(jobs, reviews, readResumeActorClasses(storage, jobs)),
+    toPriorRepairJobs(
+      jobs,
+      reviews,
+      readResumeActorClasses(storage, jobs),
+      epochCoveredImplementationJobIds(storage, repairJob.taskId),
+    ),
   )
   if (!walk.ok) return
 
@@ -171,13 +186,9 @@ function deriveAndRecordRepairGeneration(storage: IStorage, repairJob: Job): voi
     generationRoot: walk.rootJobId,
     ancestryDepth: walk.depth,
     previousGenerationRoot: walk.previousGenerationRoot,
-    budgetReset: walk.rootKind === 'human_resume',
-    resetReason:
-      walk.rootKind === 'human_resume'
-        ? 'human_resume_started_new_generation'
-        : walk.crossedAiResume
-          ? 'ai_or_unknown_resume_continues_generation'
-          : 'same_generation',
+    // **判定と同じ導出を使う。** ここに三項式を書き直すと、root 種別が増えたときに
+    // 片側だけ更新され、監査が reset を「reset していない」と記録する（独立レビュー指摘）。
+    ...generationResetFacts(walk),
   })
 }
 
@@ -227,7 +238,12 @@ export async function runRepairFlow(
 
   const decision = decideRepairAction(
     failedJob.id,
-    toPriorRepairJobs(priorJobs, priorReviews, readResumeActorClasses(storage, priorJobs), {
+    toPriorRepairJobs(
+      priorJobs,
+      priorReviews,
+      readResumeActorClasses(storage, priorJobs),
+      epochCoveredImplementationJobIds(storage, task.id),
+      {
       jobId: failedJob.id,
       status: 'failed',
       facts,
@@ -631,14 +647,21 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
 
   const decision = decideRepairAction(
     failedJob.id,
-    toPriorRepairJobs(priorJobs, priorReviews, readResumeActorClasses(storage, priorJobs), {
+    toPriorRepairJobs(
+      priorJobs,
+      priorReviews,
+      readResumeActorClasses(storage, priorJobs),
+      epochCoveredImplementationJobIds(storage, task.id),
+      {
       jobId: failedJob.id,
       status: 'failed',
       facts,
     }),
     facts,
   )
-  if (decision.action === 'escalate') return { action: 'escalate', reason: decision.reason }
+  if (decision.action === 'escalate') {
+    return { action: 'escalate', reason: decision.reason, code: decision.code }
+  }
 
   if (priorJobs.some((job) => job.workflowStepKey === decision.stepKey)) {
     return { action: 'skip', reason: 'repair job already exists for this failure' }
