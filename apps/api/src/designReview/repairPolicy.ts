@@ -187,6 +187,19 @@ export function computeRepairLineage(
 
     const key = job.workflowStepKey
     if (key === undefined || key.length === 0) {
+      // **key の無い Job は chain の根である。**
+      //
+      // 独立レビューは「edge を辿った先が key 無しなら、key を失った repair 行かもしれず、
+      // 段数を少なく数える」と指摘した。**repair 行に限ってはそれが起こらない**:
+      // repair Job を作る経路は `executeQueuedRepair()` の 1 箇所だけで
+      // （`createRepairJobWithHandoff`）、そこは必ず `repair:<sourceJobId>:1` を書く。
+      // したがって key の無い Job は repair ではなく、根として数えるのが正しい。
+      //
+      // ここを fail-closed にすると、**key を持たない Job から resume した正規の復旧**
+      // （`resumeBlockedTask()` は latest Job を source にするので、手動作成 Job が
+      // source になりうる）が必ず escalate になる。実在する経路を塞ぐ代償のほうが大きい。
+      // DB を直接書き換える相手は想定していない —— その相手は repair 行そのものを
+      // 消せるので、どんな数え方でも成立しない。
       return { ok: true, depth: countRepairEdges(chainJobIds, byId), chainJobIds }
     }
 

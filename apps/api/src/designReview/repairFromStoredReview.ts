@@ -35,8 +35,9 @@
 import { createHash } from 'node:crypto'
 import type { IStorage } from '../storage/interface'
 import type { DesignReviewRun } from '../storage/interface'
+import type { Job, ReviewResult } from '@ai-team/shared'
 import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from './repairFlow'
-import { resolveStoredReviewChain } from './repairRecoveryEpoch'
+import { epochCoveredImplementationJobIds, resolveStoredReviewChain } from './repairRecoveryEpoch'
 
 /** 承認の有効期限。既存 `APPROVAL_REQUEST_TTL_MINUTES` と同じ考え方で、新しい値を作らない。 */
 const APPROVAL_TTL_MINUTES = 60
@@ -119,7 +120,21 @@ export function repairFromStoredReview(
     return { status: 'escalated', reason: dryRun.reason }
   }
 
-  // 3. この exact review に束縛された承認を探す。
+  // 3. **epoch が既に成立しているなら、承認をもう一度要求しない。**
+  //
+  //    consume と repair Job の実体化は同じ瞬間ではない（run を作り、その run が
+  //    ALIGNED を出してはじめて repair Job ができる）。その間にプロセスが落ちると、
+  //    以前の実装は「APPROVED が無い」と判断して**新しい承認を要求し、使い切った
+  //    authorization だけが失われた**（独立レビュー指摘）。epoch は CONSUMED 行として
+  //    durable に残っているので、同じ review への再試行はそれを根拠に続行してよい。
+  const epochAlreadyOpen = epochCoveredImplementationJobIds(storage, task.id)
+    .has(chain.implementJob.id)
+
+  if (epochAlreadyOpen) {
+    return evaluateAndAct(storage, task.id, chain, deps)
+  }
+
+  // 4. この exact review に束縛された承認を探す。
   const existing = storage.approvalRequests
     .findByTaskId(task.id)
     .filter((request) => request.requestedAction === chain.expectedAction)
@@ -174,15 +189,29 @@ export function repairFromStoredReview(
     return { status: 'rejected', code: 'APPROVAL_NOT_CONSUMABLE', reason: consumed.reason }
   }
 
-  // 5. epoch が成立した状態で**もう一度**同じ判定を通す。こちらが正本である。
+  // 6. epoch が成立した状態で**もう一度**同じ判定を通す。こちらが正本である。
   //    下見の結果は使わない（consume の前後で storage が変わっているため）。
+  return evaluateAndAct(storage, task.id, chain, deps)
+}
+
+/**
+ * epoch が開いている前提で、**同じ `prepareRepairFlow()`** を通して結果を適用する。
+ *
+ * consume 直後と、consume 済みの再試行と、両方からここを通る。判定を2箇所に書かない。
+ */
+function evaluateAndAct(
+  storage: IStorage,
+  taskId: string,
+  chain: { implementJob: Job, review: ReviewResult },
+  deps: RepairFromStoredReviewDeps,
+): RepairFromStoredReviewOutcome {
   const preparation = prepareRepairFlow(storage, {
     failedJob: chain.implementJob,
     review: chain.review,
   })
 
   if (preparation.action === 'escalate') {
-    escalateTaskToHuman(storage, task.id)
+    escalateTaskToHuman(storage, taskId)
     return { status: 'escalated', reason: preparation.reason }
   }
   if (preparation.action === 'skip') {
@@ -191,7 +220,6 @@ export function repairFromStoredReview(
 
   // `create()` 自身が partial unique index と同じ条件を transaction 内で先に見て、
   // **二重起票せず既存 run を返す**（`storage/sqlite.ts`）。ここで例外を待ち受ける必要は無い。
-  // 以前この呼び出しを try/catch で囲っていたが、throw されないので死んだコードだった。
   const run = storage.designReviewRuns.create(preparation.run)
   ;(deps.kick ?? defaultKick)(storage, run, preparation.stepKey)
   return { status: 'queued', stepKey: preparation.stepKey, runId: run.id }

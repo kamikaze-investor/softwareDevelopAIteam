@@ -233,6 +233,56 @@ describe('epoch は consume ではじめて開く', () => {
   })
 })
 
+describe('epoch 成立後は承認を焼き直さない', () => {
+  /** consume 済みだが run がまだ無い状態（consume 直後に落ちた形）を作る。 */
+  function consumeWithoutRun(storage: IStorage, ids: { taskId: string }, reviewJobId: string) {
+    const request = storage.approvalRequests.create({
+      taskId: ids.taskId,
+      targetBranch: 'x', targetCommit: 'y', targetDiffHash: 'z',
+      riskLevel: 'HIGH',
+      requestedAction: repairRecoveryActionFor(reviewJobId),
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      invalidIf: [],
+    } as never)
+    approve(storage, request.id)
+    const consumed = storage.approvalRequests.verifyAndConsumeForTaskAction({
+      taskId: ids.taskId,
+      approvalRequestId: request.id,
+      expectedAction: repairRecoveryActionFor(reviewJobId),
+    })
+    expect(consumed.ok).toBe(true)
+    return request
+  }
+
+  // **consume と repair Job の実体化は同じ瞬間ではない。** その間に落ちても、
+  // 使い切った authorization だけが失われる形にはしない。
+  it('consume 済みで run が無ければ、新しい承認を要求せず続行する', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, implementJob, reviewJob } = productionShape(storage)
+    const request = consumeWithoutRun(storage, ids, reviewJob.id)
+
+    const outcome = call(storage, ids.taskId, reviewJob.id)
+
+    expect(outcome.status).toBe('queued')
+    if (outcome.status === 'queued') expect(outcome.stepKey).toBe(`repair:${implementJob.id}:1`)
+    // 承認は増えていない（焼き直していない）。
+    expect(storage.approvalRequests.findByTaskId(ids.taskId).length).toBe(1)
+    expect(storage.approvalRequests.findById(request.id)?.status).toBe('CONSUMED')
+  })
+
+  it('consume 済みで run がある場合も、新しい承認を要求しない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, reviewJob } = productionShape(storage)
+    consumeWithoutRun(storage, ids, reviewJob.id)
+    expect(call(storage, ids.taskId, reviewJob.id).status).toBe('queued')
+
+    const again = call(storage, ids.taskId, reviewJob.id)
+    expect(again.status).toBe('skipped')
+    expect(storage.approvalRequests.findByTaskId(ids.taskId).length).toBe(1)
+  })
+})
+
 describe('承認の束縛は storage 側でも効く', () => {
   // route 側の絞り込みとは**別に**、consume 実装自身が action 一致を要求する。
   // ここを route の filter だけに頼ると、別経路から呼ばれたときに束縛が消える。

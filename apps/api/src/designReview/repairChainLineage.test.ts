@@ -126,6 +126,33 @@ describe('computeRepairLineage — 辿れない形は推測しない', () => {
     expect(computeRepairLineage('r1', jobs, NO_EPOCH).ok).toBe(false)
   })
 
+  // **key の無い Job は chain の根である。** repair Job を作る経路は
+  // `executeQueuedRepair()` の1箇所だけで、そこは必ず `repair:<sourceJobId>:1` を書く。
+  // よって key の無い Job は repair ではありえず、根として数えるのが正しい。
+  // ここを fail-closed にすると、key を持たない Job から resume した正規の復旧が
+  // 必ず escalate になる（独立レビュー指摘を検証した結果、指摘の前提が成立しなかった）。
+  it('起点の Job に stepKey が無いのは根として扱う', () => {
+    const lineage = computeRepairLineage('solo', [job('solo', undefined)], NO_EPOCH)
+    expect(lineage).toMatchObject({ ok: true, depth: 0 })
+  })
+
+  it('stepKey の無い Job から resume した chain も辿れる', () => {
+    const jobs = [
+      job('manual', undefined),
+      job('resumed', 'resume:manual:1'),
+    ]
+    expect(computeRepairLineage('resumed', jobs, NO_EPOCH)).toMatchObject({ ok: true, depth: 0 })
+  })
+
+  it('stepKey の無い Job を根とする repair は段数を正しく数える', () => {
+    const jobs = [
+      job('manual', undefined),
+      job('r1', 'repair:manual:1'),
+      job('r2', 'repair:r1:1'),
+    ]
+    expect(computeRepairLineage('r2', jobs, NO_EPOCH)).toMatchObject({ ok: true, depth: 2 })
+  })
+
   it('循環していれば fail-closed', () => {
     const jobs = [job('a', 'repair:b:1'), job('b', 'repair:a:1')]
     const lineage = computeRepairLineage('a', jobs, NO_EPOCH)
