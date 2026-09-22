@@ -304,3 +304,44 @@ describe('[8][12][22] 記録された actor が repair 予算へつながる', (
     }
   })
 })
+
+describe('設定が曖昧な split mode では human にならない（独立レビュー指摘の再現確認）', () => {
+  it('ADMIN と WORKER の hash が同値なら、そもそも resume が 503 で通らない', async () => {
+    // 指摘: 「同値なら WORKER token が ADMIN 分岐に先に当たり human と記録される」。
+    // 実際には `apiTokenAuth()` が token 比較の**前**に設定ミスとして 503 で落とすため、
+    // `setCredentialClass()` に到達しない。ここでそれを固定する。
+    process.env.DB_PATH = ':memory:'
+    delete process.env.API_TOKEN
+    process.env.ADMIN_TOKEN_SHA256 = sha256Hex(ADMIN_TOKEN)
+    process.env.WORKER_TOKEN_SHA256 = sha256Hex(ADMIN_TOKEN)
+
+    const [{ taskRoutes }, { resetStorage }] = await Promise.all([
+      import('../routes/tasks.js'),
+      import('../storage/index.js'),
+    ])
+    resetStorage()
+
+    const app = Fastify()
+    app.addHook('preHandler', async (req, reply): Promise<void> => {
+      await apiTokenAuth(req, reply)
+    })
+    app.register(taskRoutes, { prefix: '/api/tasks' })
+    await app.ready()
+
+    try {
+      const { task } = await seedResumableTask()
+      const response = await resumeAs(app, task.id, ADMIN_TOKEN)
+      expect(response.statusCode).toBe(503)
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      expect(storage.jobs.findByTaskId(task.id).filter((job) => job.workflowStepKey?.startsWith('resume:'))).toHaveLength(0)
+      const humanRows = storage.auditLog
+        .findAll()
+        .filter((entry) => entry.operation === RESUME_ACTOR_OPERATION && entry.result === 'human')
+      expect(humanRows).toHaveLength(0)
+    } finally {
+      await app.close()
+    }
+  })
+})
