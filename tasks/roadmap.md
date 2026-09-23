@@ -10750,8 +10750,29 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       予算 reset は発生しない**。依存先は既存
       `legacy API_TOKEN → ADMIN / WORKER split credential migration`。
 
-      **残り**: `c3849205` に対してこの経路を実際に使う（承認 → consume → repair）。
-      コードではなく運用手順であり、実施をもって `done` にする。
+      **production 実測（2026-09-23）と追加修正**: 承認 → consume → `human_recovery`
+      generation 成立 → Stage 2 → repair attempt 1（`9db22450`）まで通り、repair は成功した。
+      ところがその成果へのレビューが `changes_requested` を返したところで再び停止した。
+      blocked admission が **resume successor しか受け付けていなかった**ためで、
+      recovery が作った `repair:<impl>:1` は「canonical resume successor ではない」として
+      落ち、repair も escalate も作られず PL が `unknown` で CEO escalation した。
+      **stored review / findings / partial work はすべて durable で、Lost Completion ではない。**
+
+      修正は2点:
+      - blocked admission が **resume successor と repair successor の両方**を受ける。
+        `repair:` で始まる、では許さず、規約形であることに加えて既存 `walkRepairGeneration`
+        で **lineage が再構築できる**（source 実在 / 同一 Task / 非環）ことまで確かめる。
+        新しい lineage parser は作っていない
+      - stored-review recovery の「既に human authorized か」の判定を、実装 Job 自身が
+        epoch 集合に含まれるかではなく **canonical repair 判定が返す `generation.rootKind`**
+        で行う。これが無いと repair descendant を認識できず、**同じ generation に2枚目の
+        承認を要求し、消費すれば depth が 0 に戻って予算が作り直される**
+
+      `MAX_REPAIR_ATTEMPTS` は 3 のまま。descendant は新しい根にならず、
+      `eec46736` の generation の中で depth 1 → 2 → 3 と進み、使い切れば再び escalate する。
+
+      **残り**: `c3849205` に対して repair attempt 2 以降が canonical に進むことを production で
+      確認する。コードではなく運用手順であり、実施をもって `done` にする。
 
       **作らなかったもの**: 汎用 event replay subsystem / event bus / 新 status・Gate・workflow /
       新しい `PlActionKind` / 新しい dedup 機構 / 別の repair budget アルゴリズム /
