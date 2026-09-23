@@ -352,14 +352,30 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
   // **linked Approval 基準**（`resumeBlockedTask()` と同じ判定）。
   // Task 最新行ではなく、その Job の `approvalId` が指す行だけを根拠にする。
   const linkedRejection = (() => {
-    if (!job?.approvalId) return undefined
-    if (job.safeCommand.kind !== 'git_commit') return undefined
-    const approval = storage.approvalRequests.findById(job.approvalId)
-    if (!approval) return undefined
-    if (approval.id !== job.approvalId) return undefined
-    if (approval.taskId !== job.taskId) return undefined
-    if (approval.requestedAction !== 'git_commit') return undefined
-    return approval.status === 'REJECTED' ? approval : undefined
+    if (!job || job.safeCommand.kind !== 'git_commit') return undefined
+
+    const rejectionOf = (owner: Job, approvalId: string) => {
+      const approval = storage.approvalRequests.findById(approvalId)
+      if (!approval) return undefined
+      if (approval.id !== approvalId) return undefined
+      if (approval.taskId !== owner.taskId) return undefined
+      if (approval.requestedAction !== 'git_commit') return undefined
+      return approval.status === 'REJECTED' ? approval : undefined
+    }
+
+    if (job.approvalId) return rejectionOf(job, job.approvalId)
+
+    // **link が無い Job も1ホップだけ辿る。** Gate が既存 REJECTED を再利用して弾いた Job には
+    // `approvalId` が付かない（`ux_jobs_approval_id` が UNIQUE なので結び直しもできない）。
+    // 放置すると「却下されていない」と読んで `auto_recovery` を返し、PL が同じ内容を
+    // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1ホップに揃える。
+    const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
+    if (!resumed) return undefined
+    const source = storage.jobs.findById(resumed[1] as string)
+    if (!source || !source.approvalId) return undefined
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return undefined
+    if (source.safeCommand.kind !== 'git_commit') return undefined
+    return rejectionOf(source, source.approvalId)
   })()
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =

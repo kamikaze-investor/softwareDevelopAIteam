@@ -469,6 +469,42 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(allowed).toEqual(['escalate_to_ceo'])
   })
 
+  // H6. Gate が既存 REJECTED を再利用して弾いた **再生成 Job** は `approvalId` を持たない。
+  //     （`ux_jobs_approval_id` が UNIQUE なので既存の却下行を結び直すこともできない。）
+  //     ここを見落とすと triage が `auto_recovery` を返し、PL が却下済みの内容を
+  //     自動 resume し続ける。`resume:` を1ホップだけ辿って元 Job の link を見る。
+  it('H6. a regenerated git_commit job with no linked approval is still CEO_ESCALATION', () => {
+    const storage = seedBlockedGitCommitWithApproval('REJECTED')
+    const rejectedJob = storage.jobs.findByTaskId(
+      storage.tasks.findByProjectId(storage.projects.findAll()[0].id)[0].id,
+    ).find((j) => j.safeCommand.kind === 'git_commit')!
+    // resume が作る再生成 Job（link 無し・`resume:<元Job>:1`）。
+    const regenerated = storage.jobs.create({
+      taskId: rejectedJob.taskId,
+      projectId: rejectedJob.projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' },
+      dryRun: false,
+      workflowStepKey: `resume:${rejectedJob.id}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    expect(regenerated.approvalId).toBeUndefined()
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked',
+      projectId: regenerated.projectId,
+      taskId: regenerated.taskId,
+      jobId: regenerated.id,
+      detail: 'blocked',
+      stuckForMs: 0,
+    } as AttentionItem)
+
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+    expect(diagnosis.recoverable).toBe(false)
+    const allowed = triageAllowedActions(diagnosis, ['resume_task', 'retry_job', 'escalate_to_ceo'])
+    expect(allowed).toEqual(['escalate_to_ceo'])
+  })
+
   it('G. EXPIRED は従来どおり AUTO_RECOVERY のまま（resume_task を残す）', () => {
     const storage = seedBlockedGitCommitWithApproval('EXPIRED')
 

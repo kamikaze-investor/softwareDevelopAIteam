@@ -1472,13 +1472,35 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * よって `approvalId` を起点に、**その行が本当にこの Job の git_commit 却下か**を確かめる。
    * ここは `blockedTriage` が見るのと同じ事実であり、案内と endpoint が食い違わないように
    * 判定の材料を揃えてある。
+   *
+   * **link が無い Job も1ホップだけ辿る。** Gate が既存の REJECTED を再利用して弾いたとき、
+   * 新しい Approval は作られないので **その Job に `approvalId` は付かない**
+   * （`ux_jobs_approval_id` が UNIQUE なので、既存の却下行を2つ目の Job へ結び直すこともできない）。
+   * 何もしないと「却下されていない Job」に見え、PL が同じ内容を自動 resume し続ける
+   * （独立レビュー指摘）。そこで `resume:<sourceJobId>:1` を **1回だけ**辿り、
+   * 元の Job の linked Approval を見る。**provenance と同じ規約・同じ1ホップ**であり、
+   * 探索でも候補選択でもない。
    */
   function isLinkedGitCommitRejection(job: Job): boolean {
-    if (!job.approvalId) return false
     if (job.safeCommand.kind !== 'git_commit') return false
-    const approval = approvalRequests.findById(job.approvalId)
+
+    // link のある Job はそれだけで判定する。
+    if (job.approvalId) return isGitCommitRejectionOf(job, job.approvalId)
+
+    // link が無い Job は、`resume:` を **1回だけ** 辿って元の Job の link を見る。
+    const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
+    if (!resumed) return false
+    const source = jobs.findById(resumed[1] as string)
+    if (!source || !source.approvalId) return false
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return false
+    if (source.safeCommand.kind !== 'git_commit') return false
+    return isGitCommitRejectionOf(source, source.approvalId)
+  }
+
+  function isGitCommitRejectionOf(job: Job, approvalId: string): boolean {
+    const approval = approvalRequests.findById(approvalId)
     if (!approval) return false
-    if (approval.id !== job.approvalId) return false
+    if (approval.id !== approvalId) return false
     if (approval.taskId !== job.taskId) return false
     if (approval.requestedAction !== 'git_commit') return false
     return approval.status === 'REJECTED'
