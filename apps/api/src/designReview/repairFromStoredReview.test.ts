@@ -5,6 +5,7 @@ import type { Job, ReviewResult } from '@ai-team/shared'
 import { prepareRepairFlow } from './repairFlow'
 import { repairFromStoredReview } from './repairFromStoredReview'
 import { epochCoveredImplementationJobIds, repairRecoveryActionFor } from './repairRecoveryEpoch'
+import { recordResumeActor } from './resumeActor'
 
 /**
  * **保存済み review を canonical repair へ戻す recovery action**の回帰テスト
@@ -878,5 +879,146 @@ describe('元 Job が blocked のまま残る human_recovery generation', () => 
     expect(result.action).toBe('skip')
     if (result.action !== 'skip') return
     expect(result.reason ?? '').toContain('a live job exists')
+  })
+})
+
+/**
+ * **除外してよい live Job は「この chain で最も近い resume の元」ちょうど 1 件**
+ * （独立レビュー指摘・2026-09-23 第2ラウンドの HIGH 2件）。
+ *
+ * 1件目: human_resume generation を使い切ったあと、その repair leaf へ recovery epoch を
+ * 張ると、根自身のキーが `repair:` になる。根のキーからしか resume 元を導いていなかったので
+ * 元の blocked 行が live 扱いのままになり、**承認を CONSUMED にしたうえで `skipped` で
+ * 行き止まりになった**。人の承認を焼いて何も進まない。
+ *
+ * 2件目: 「直近の resume 元」と「generation の根の resume 元」を別々に 2 件外していたので、
+ * AI resume を挟むだけで前の generation の blocked 行まで一緒に消え、**直接 resume 経路の
+ * admission が広がっていた**（修正前は live 衝突として正しく落ちていた）。
+ *
+ * どちらも「何件外すか」がぶれたことが原因なので、規則を 1 本にしてある。
+ */
+describe('除外するのは最も近い resume 元 1 件だけ', () => {
+  /** admin credential による human resume。generation の根になる。 */
+  function humanResume(storage: IStorage, ids: { taskId: string, projectId: string }, sourceId: string): Job {
+    const job = makeJob(storage, ids, `resume:${sourceId}:1`, 'success')
+    recordResumeActor(storage, {
+      jobId: job.id, taskId: ids.taskId, actorClass: 'human', evidence: 'admin_credential',
+    })
+    return job
+  }
+
+  /** recovery epoch をその実装 Job の review へ張って consume する。 */
+  function consumeEpochOn(storage: IStorage, ids: { taskId: string, projectId: string }, implementJobId: string) {
+    const reviewJob = createReviewJob(storage, ids, implementJobId)
+    const review = storeReview(storage, ids, reviewJob.id)
+    const request = storage.approvalRequests.create({
+      taskId: ids.taskId,
+      targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
+      riskLevel: 'HIGH',
+      requestedAction: repairRecoveryActionFor(reviewJob.id),
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      invalidIf: [],
+    } as never)
+    approve(storage, request.id)
+    expect(storage.approvalRequests.verifyAndConsumeForTaskAction({
+      taskId: ids.taskId,
+      approvalRequestId: request.id,
+      expectedAction: repairRecoveryActionFor(reviewJob.id),
+    }).ok).toBe(true)
+    expect(epochCoveredImplementationJobIds(storage, ids.taskId)).toContain(implementJobId)
+    return { reviewJob, review }
+  }
+
+  // **1件目の回帰。** 根のキーが `repair:` でも、元の blocked 行へ辿り着けること。
+  it('human_resume を使い切って repair leaf へ epoch を張っても行き止まりにならない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    const blockedSource = makeJob(storage, ids, `task:${ids.taskId}:initial-implement`, 'blocked')
+    expect(storage.jobs.findById(blockedSource.id)?.status).toBe('blocked')
+    const resumed = humanResume(storage, ids, blockedSource.id)
+
+    // その generation の予算を 3 段使い切る。
+    let leaf = resumed
+    for (let i = 1; i <= 3; i += 1) {
+      leaf = makeJob(storage, ids, `repair:${leaf.id}:1`, 'success')
+    }
+
+    // 使い切った leaf へ recovery epoch を張る = 根のキーが `repair:` になる。
+    const { review } = consumeEpochOn(storage, ids, leaf.id)
+
+    const preparation = prepareRepairFlow(storage, { failedJob: leaf, review })
+
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+    expect(preparation.generation.rootJobId).toBe(leaf.id)
+    expect(preparation.generation.rootKind).toBe('human_recovery')
+    expect(preparation.generation.depth).toBe(0)
+    expect(preparation.attempt).toBe(1)
+  })
+
+  // 承認を焼いたまま止まらないことを route 経由でも固定する。
+  it('その形で承認しても CONSUMED のまま行き止まりにならない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    const blockedSource = makeJob(storage, ids, `task:${ids.taskId}:initial-implement`, 'blocked')
+    const resumed = humanResume(storage, ids, blockedSource.id)
+    let leaf = resumed
+    for (let i = 1; i <= 3; i += 1) {
+      leaf = makeJob(storage, ids, `repair:${leaf.id}:1`, 'success')
+    }
+    const reviewJob = createReviewJob(storage, ids, leaf.id)
+    storeReview(storage, ids, reviewJob.id)
+
+    const first = call(storage, ids.taskId, reviewJob.id)
+    expect(first.status).toBe('awaiting_approval')
+    if (first.status !== 'awaiting_approval') return
+    approve(storage, first.approvalRequestId)
+
+    const second = call(storage, ids.taskId, reviewJob.id)
+    expect(second.status).toBe('queued')
+    expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('CONSUMED')
+  })
+
+  // **2件目の回帰。** 前の generation の blocked 行まで一緒に外さないこと。
+  it('AI resume を挟んでも前の generation の blocked 行は live のまま', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    const first = makeJob(storage, ids, `task:${ids.taskId}:initial-implement`, 'blocked')
+    const humanResumed = humanResume(storage, ids, first.id)
+    const blockedRepair = makeJob(storage, ids, `repair:${humanResumed.id}:1`, 'blocked')
+    const aiResumed = makeJob(storage, ids, `resume:${blockedRepair.id}:1`, 'success')
+
+    const reviewJob = createReviewJob(storage, ids, aiResumed.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    const result = prepareRepairFlow(storage, { failedJob: aiResumed, review })
+
+    expect(result.action).toBe('skip')
+    if (result.action !== 'skip') return
+    expect(result.reason ?? '').toContain('a live job exists')
+  })
+
+  // 外すのは**最も近い**もの。上流の resume 元ではない。
+  it('上流にも resume があるとき、外すのは直近の resume 元のほう', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    // 上流の元は blocked ではない（＝ live ではない）。
+    const first = makeJob(storage, ids, `task:${ids.taskId}:initial-implement`, 'failed')
+    const humanResumed = humanResume(storage, ids, first.id)
+    const blockedRepair = makeJob(storage, ids, `repair:${humanResumed.id}:1`, 'blocked')
+    const aiResumed = makeJob(storage, ids, `resume:${blockedRepair.id}:1`, 'success')
+
+    const reviewJob = createReviewJob(storage, ids, aiResumed.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    const result = prepareRepairFlow(storage, { failedJob: aiResumed, review })
+
+    // 直近の元 `blockedRepair` が外れるので通る。上流の元を外していたら落ちる。
+    expect(result.action).toBe('queue')
   })
 })

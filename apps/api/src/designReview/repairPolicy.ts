@@ -186,7 +186,7 @@ export function parseRepairSource(stepKey: string): string | undefined {
 }
 
 /** `resume:<sourceJobId>:<n>` から source Job id を取り出す。 */
-export function parseResumeSource(stepKey: string): string | undefined {
+function parseResumeSource(stepKey: string): string | undefined {
   const match = /^resume:(.+):\d+$/.exec(stepKey)
   const source = match?.[1]
   return source !== undefined && source.length > 0 ? source : undefined
@@ -221,6 +221,16 @@ export type GenerationWalk =
        * 「同じ失敗が繰り返されているか」を前の generation まで含めて数えないための境界である。
        */
       generationRepairJobIds: string[]
+      /**
+       * **この lineage で最も近い `resume:` の元 Job id**（`sourceJobId` から上へ辿って
+       * 最初に出会うもの）。generation の境界とは無関係に、chain のどこから来たかを
+       * 1 件だけ指す。
+       *
+       * `resumeBlockedTask()` は元の行を `blocked` のまま残すので、admission の live Job
+       * 判定はこの 1 件だけを除外する。**同じ一度の walk で決める**のは、repairFlow 側で
+       * lineage を second-guess する二本目の走査を作らないためである。
+       */
+      nearestResumeSourceJobId?: string
     }
   | { ok: false; reason: string }
 
@@ -262,6 +272,13 @@ export function walkRepairGeneration(
   let crossedAiResume = false
 
   /**
+   * 最も近い `resume:` の元。**最初に出会った 1 件だけ**を持ち、上流に別の resume が
+   * あっても上書きしない。generation の根より上に出ても構わない —— 「この chain は
+   * どの Job から再開されたか」は generation の境界とは別の事実である。
+   */
+  let nearestResumeSourceJobId: string | undefined
+
+  /**
    * 数え終わりが決まったら確定する。**以降も walk は続く**（上流の健全性を確かめるため）。
    * ここに値が入った後は depth も crossedAiResume も動かさない。
    */
@@ -273,7 +290,15 @@ export function walkRepairGeneration(
 
   const finish = (originJobId: string): GenerationWalk => (
     countedRoot === undefined
-      ? { ok: true, depth, rootJobId: originJobId, rootKind: 'origin', crossedAiResume, generationRepairJobIds }
+      ? {
+          ok: true,
+          depth,
+          rootJobId: originJobId,
+          rootKind: 'origin',
+          crossedAiResume,
+          generationRepairJobIds,
+          nearestResumeSourceJobId,
+        }
       : {
           ok: true,
           depth,
@@ -282,6 +307,7 @@ export function walkRepairGeneration(
           previousGenerationRoot: countedRoot.previousGenerationRoot,
           crossedAiResume,
           generationRepairJobIds,
+          nearestResumeSourceJobId,
         }
   )
 
@@ -361,6 +387,8 @@ export function walkRepairGeneration(
       if (parent === undefined) {
         return { ok: false, reason: `malformed resume step key on job ${cursor}` }
       }
+      if (nearestResumeSourceJobId === undefined) nearestResumeSourceJobId = parent
+
       // **human と証明された resume が数え終わり。** ただしここで walk は止めない。
       // 止めると、この resume 自身が環の一部でも別 Task から来ていても素通りしてしまう。
       if (countedRoot === undefined && job.resumeActorClass === 'human') {

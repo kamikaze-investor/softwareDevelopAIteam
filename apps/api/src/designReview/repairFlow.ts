@@ -40,7 +40,6 @@ import {
   decideRepairAction,
   generationResetFacts,
   parseRepairSource,
-  parseResumeSource,
   walkRepairGeneration,
   type PriorRepairJob,
   type RepairGeneration,
@@ -655,30 +654,27 @@ function repairableBlockedReviewRequest(
   //    implement requeue 経路）。stepKey が名指しているというだけで状態を問わず外すと、
   //    **本当に動いている Job の上へ repair を積む**（独立レビュー指摘）。
   //    resume が残した `blocked` という状態そのものが除外の根拠であって、名前ではない。
-  const resumeSourceJobId = implementJob.workflowStepKey?.match(/^resume:([^:]+):\d+$/)?.[1]
-  //    **repair descendant では、除外の根拠を lineage から導く。**
   //
-  //    `repair:<R>:1` の stepKey が名指すのは直前の実装であって、generation を開いた
-  //    resume ではない。よって上の 1 行だけでは、`blocked B → resume R → repair:R:1`
-  //    という **人が承認した chain** が attempt 2 で必ずここに弾かれる —— 開けたはずの
-  //    経路が 1 手先で閉じる（独立レビュー指摘・2026-09-23 に in-memory で再現）。
+  //    **外すのは「この chain で最も近い resume の元」ちょうど 1 件である。**
   //
-  //    導出は canonical な walk 結果の根からのみ行い、**その resume 元ちょうど 1 件**を
-  //    外す。generation 内の blocked Job をまとめて無視するのではない。根が resume 規約で
-  //    なければ（`origin` の implement 等）外す対象は無い。
+  //    実装自身の `resume:` キーだけを見ていた頃は、attempt 2 以降（キーが `repair:` に
+  //    なる）で元を辿れず、人が承認した chain が 1 手先で必ず止まった。かといって
+  //    「直近の resume 元」と「generation の根の resume 元」を**別々に 2 件**外すと、
+  //    今度は AI resume を挟むだけで前の generation の blocked 行まで一緒に消え、
+  //    直接 resume 経路の admission が広がってしまう（独立レビュー指摘・2026-09-23 に
+  //    両方 in-memory で再現）。**どちらの欠陥も「何件外すか」がぶれたことが原因**なので、
+  //    規則を 1 本にする。
   //
-  //    **`blocked` という状態そのものが根拠**なのは上と同じ。`queued` / `running` へ戻った
-  //    source は、lineage から導けたとしても外さない —— 本当に動いている Job の上へ
-  //    repair を積むことになる。
-  const generationRootJob = taskJobs.find((job) => job.id === lineage.rootJobId)
-  const generationResumeSourceId = generationRootJob?.workflowStepKey === undefined
-    ? undefined
-    : parseResumeSource(generationRootJob.workflowStepKey)
+  //    値は canonical な walk が**同じ一度の走査で**確定させた `nearestResumeSourceJobId`
+  //    を使う。ここで lineage を second-guess する二本目の走査は作らない。
+  //      - 実装自身が `resume:<B>:n`   → B（従来と同じ）
+  //      - 実装が repair descendant     → 上へ辿って最初に出会う resume の元
+  //      - resume がどこにも無い chain → 外す対象は無い
+  const nearestResumeSourceJobId = lineage.nearestResumeSourceJobId
 
   const live = storage.jobs.findByTaskId(task.id)
     .filter((job) => job.id !== implementJob.id)
-    .filter((job) => !(job.id === resumeSourceJobId && job.status === 'blocked'))
-    .filter((job) => !(job.id === generationResumeSourceId && job.status === 'blocked'))
+    .filter((job) => !(job.id === nearestResumeSourceJobId && job.status === 'blocked'))
     .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
   if (live.length > 0) {
     return { ok: false, reason: `a live job exists for this task (${live[0].status})` }

@@ -10803,15 +10803,33 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       - **liveness 側**: `resumeBlockedTask()` は元の行を `blocked` のまま残すのに、live Job の
         除外は implementJob 自身の `resume:` キーだけを見ていた。attempt 2 以降の実装は
         `repair:` 規約なので自分の stepKey からは元の resume 元を辿れず、**人が承認した chain が
-        attempt 1 の次で必ず止まっていた**。canonical な walk 結果の根から resume 元を導き、
-        **その 1 件が `blocked` のときだけ**外す。`queued` / `running` へ戻った source は外さない
-        —— 本当に動いている Job の上へ repair を積むことになる。generation 内の blocked Job を
-        一括で無視する拡張はしていない
+        attempt 1 の次で必ず止まっていた**
 
-      既存 184 test は**両方の欠陥に素通りしていた**（祖先が全部 `failed` の fixture しか
-      無かった）。production `c3849205` と同じ「元 Job が blocked のまま残る」形で
-      depth 1 → 2 → 3 → `attempt_limit` escalate までを固定し、mutation guard は 41 → 46 へ
-      拡張した（緩める側と締めすぎる側の両方向を測る）。
+      **第2ラウンドの独立レビューが、その liveness 側の修正そのものに HIGH を 2 件見つけた**
+      （2026-09-23・同じく本項目へ統合）。元の 2 件は CLOSED と確認されたうえで、
+      **修正が「何件外すか」をぶれさせていた**:
+
+      - 根の stepKey だけから resume 元を導いていたので、human_resume generation を使い切って
+        その repair leaf へ recovery epoch を張ると、根自身のキーが `repair:` になり元の
+        blocked 行へ辿り着けない。**承認を CONSUMED にしたうえで `skipped` で行き止まり**になり、
+        人の承認を焼いて何も進まなかった
+      - 「直近の resume 元」と「generation の根の resume 元」を**別々に 2 件**外していたので、
+        AI resume を挟むだけで前の generation の blocked 行まで一緒に消え、**直接 resume 経路の
+        admission が広がっていた**（修正前は live 衝突として正しく落ちていた）。
+        「ちょうど 1 件外す」と書いていたが、事実ではなかった
+
+      原因が同じなので、規則を 1 本にした: **外すのは canonical な walk が同じ一度の走査で
+      確定させる「この chain で最も近い `resume:` の元」ちょうど 1 件、しかも `blocked` の
+      ときだけ**。実装自身が `resume:` ならその元（従来どおり）、repair descendant なら上へ
+      辿って最初に出会う resume の元、resume がどこにも無ければ外す対象は無い。
+      `queued` / `running` へ戻った source は外さない。repairFlow 側に lineage を
+      second-guess する二本目の走査は作っていない
+
+      既存 test は**どの欠陥にも素通りしていた**（descendant fixture の祖先が全部 `failed`
+      だったため）。production `c3849205` と同じ「元 Job が blocked のまま残る」形で
+      depth 1 → 2 → 3 → `attempt_limit` escalate までを固定し、human_resume → human_recovery
+      の移行と AI resume を挟んだ形も足した。mutation guard は 41 → 47 へ拡張し、
+      緩める側・締めすぎる側・外しすぎる側の三方向を測っている。
       **残り**: `c3849205` に対して repair attempt 2 以降が canonical に進むことを production で
       確認する。コードではなく運用手順であり、実施をもって `done` にする。
 
