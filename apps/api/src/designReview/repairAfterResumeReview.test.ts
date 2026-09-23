@@ -509,6 +509,39 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     expect(skipped(storage, implementJob, review)).toContain('unusable scope')
   })
 
+  // **規約形＋lineage 再構築可能、でもまだ足りない（独立レビュー指摘・2026-09-23）。**
+  // その両方を満たす `repair:` chain には **人の権限がどこにも無い `origin` 根のもの**が
+  // 含まれる。通常の repair が走っている最中に Task が別の理由で blocked になっても、
+  // その chain は blocked を跨いで自律継続してしまっていた。
+  it('origin 根の repair successor は通さない（人の権限が chain のどこにも無い）', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    // 通常の implement から始まる chain。resume も recovery epoch も無い。
+    const origin = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      workflowStepKey: `task:${ids.taskId}:initial-implement`,
+    } as never)
+    storage.jobs.update(origin.id, { status: 'failed' } as never)
+
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `repair:${origin.id}:1`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    // lineage 自体は再構築できている（＝別の理由で落ちたのではない）ことも示す。
+    const reason = skipped(storage, implementJob, review)
+    expect(reason).toContain('not inside a human-authorized generation')
+    expect(reason).not.toContain('lineage could not be reconstructed')
+  })
+
   // **`repair:` で始まる、だけでは許さない。** 規約形であり、かつ lineage が
   // 実際に再構築できることまで確かめる（source 実在 / 同一 Task / 非環）。
   it('規約形でない repair stepKey は通さない', () => {

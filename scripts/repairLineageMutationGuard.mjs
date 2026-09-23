@@ -104,6 +104,52 @@ const MUTATIONS = [
     to: '  const attempt = 1',
     tests: [...RECOVERY_TESTS, ...POLICY_TESTS],
   },
+  // ── blocked 例外の authority と、除外してよい live Job ────────────────────
+  //
+  // どちらも 2026-09-23 の独立レビューが再現させた欠陥である。守るのは 2 つ:
+  //   - repair successor を通すのは **human authority の generation の中だけ**
+  //   - live 判定から外すのは **lineage から導いた resume 元ちょうど 1 件、blocked のときだけ**
+  // 両方向に振って測る。緩める側だけ測ると、締めすぎ（正規経路を止める）を見逃す。
+  {
+    id: 'N16-origin-rooted-repair-admitted',
+    guard: 'repair successor は human authority の generation の中だけ通す',
+    file: REPAIR_FLOW,
+    from: "  if (isRepairSuccessor && lineage.rootKind === 'origin') {",
+    to: '  if (false) {',
+    tests: ADMISSION_TESTS,
+  },
+  {
+    id: 'N17-human-rooted-repair-rejected',
+    guard: 'human_resume / human_recovery generation の descendant は通す（締めすぎない）',
+    file: REPAIR_FLOW,
+    from: "  if (isRepairSuccessor && lineage.rootKind === 'origin') {",
+    to: '  if (isRepairSuccessor) {',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N18-generation-resume-source-not-excluded',
+    guard: 'generation の resume 元が blocked なら live 判定から外す',
+    file: REPAIR_FLOW,
+    from: "    .filter((job) => !(job.id === generationResumeSourceId && job.status === 'blocked'))",
+    to: '    .filter(() => true)',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N19-any-blocked-job-excluded',
+    guard: '外すのは導いた resume 元だけ（generation 内の blocked を一括で無視しない）',
+    file: REPAIR_FLOW,
+    from: "    .filter((job) => !(job.id === generationResumeSourceId && job.status === 'blocked'))",
+    to: "    .filter((job) => job.status !== 'blocked')",
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N20-live-source-excluded-regardless-of-status',
+    guard: '除外の根拠は blocked という状態そのもの（queued / running へ戻った source は外さない）',
+    file: REPAIR_FLOW,
+    from: "    .filter((job) => !(job.id === generationResumeSourceId && job.status === 'blocked'))",
+    to: '    .filter((job) => job.id !== generationResumeSourceId)',
+    tests: RECOVERY_TESTS,
+  },
   {
     id: 'N11-recovery-reset-not-recorded',
     guard: 'human_recovery の reset を判定にも監査にも同じ導出で残す',

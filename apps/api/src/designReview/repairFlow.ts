@@ -40,6 +40,7 @@ import {
   decideRepairAction,
   generationResetFacts,
   parseRepairSource,
+  parseResumeSource,
   walkRepairGeneration,
   type PriorRepairJob,
   type RepairGeneration,
@@ -564,6 +565,22 @@ function repairableBlockedReviewRequest(
     return { ok: false, reason: `repair lineage could not be reconstructed: ${lineage.reason}` }
   }
 
+  //    **repair successor は human authority の generation の中にいなければならない。**
+  //
+  //    規約形であること＋lineage が再構築できること、では足りない。それを両方満たす
+  //    `repair:` chain には **人の権限がどこにも無い `origin` 根のもの**が含まれる ——
+  //    通常の repair が走っている最中に Task が別の理由で blocked になれば、その chain は
+  //    blocked を跨いで自律継続してしまう。blocked は「人が動くまで自律実行を止める」
+  //    状態なので、それは閉じ込めの解除ではなく **安全境界の後退**である
+  //    （独立レビュー指摘・2026-09-23 に in-memory で再現）。
+  //
+  //    判定は既存 walker の `rootKind` をそのまま使う。新しい authority flag も parser も
+  //    table も status も作らない。通すのは `human_resume` / `human_recovery` generation の
+  //    descendant だけである。**resume successor 側の条件はここで変えない。**
+  if (isRepairSuccessor && lineage.rootKind === 'origin') {
+    return { ok: false, reason: 'repair successor is not inside a human-authorized generation' }
+  }
+
   // 5. 指摘が **この Task の allowedPaths 内**で直せること。
   //    範囲外のファイルを指す指摘が 1 件でもあれば、repair は scope を越える。
   //
@@ -639,9 +656,29 @@ function repairableBlockedReviewRequest(
   //    **本当に動いている Job の上へ repair を積む**（独立レビュー指摘）。
   //    resume が残した `blocked` という状態そのものが除外の根拠であって、名前ではない。
   const resumeSourceJobId = implementJob.workflowStepKey?.match(/^resume:([^:]+):\d+$/)?.[1]
+  //    **repair descendant では、除外の根拠を lineage から導く。**
+  //
+  //    `repair:<R>:1` の stepKey が名指すのは直前の実装であって、generation を開いた
+  //    resume ではない。よって上の 1 行だけでは、`blocked B → resume R → repair:R:1`
+  //    という **人が承認した chain** が attempt 2 で必ずここに弾かれる —— 開けたはずの
+  //    経路が 1 手先で閉じる（独立レビュー指摘・2026-09-23 に in-memory で再現）。
+  //
+  //    導出は canonical な walk 結果の根からのみ行い、**その resume 元ちょうど 1 件**を
+  //    外す。generation 内の blocked Job をまとめて無視するのではない。根が resume 規約で
+  //    なければ（`origin` の implement 等）外す対象は無い。
+  //
+  //    **`blocked` という状態そのものが根拠**なのは上と同じ。`queued` / `running` へ戻った
+  //    source は、lineage から導けたとしても外さない —— 本当に動いている Job の上へ
+  //    repair を積むことになる。
+  const generationRootJob = taskJobs.find((job) => job.id === lineage.rootJobId)
+  const generationResumeSourceId = generationRootJob?.workflowStepKey === undefined
+    ? undefined
+    : parseResumeSource(generationRootJob.workflowStepKey)
+
   const live = storage.jobs.findByTaskId(task.id)
     .filter((job) => job.id !== implementJob.id)
     .filter((job) => !(job.id === resumeSourceJobId && job.status === 'blocked'))
+    .filter((job) => !(job.id === generationResumeSourceId && job.status === 'blocked'))
     .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
   if (live.length > 0) {
     return { ok: false, reason: `a live job exists for this task (${live[0].status})` }

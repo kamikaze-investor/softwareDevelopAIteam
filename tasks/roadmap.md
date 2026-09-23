@@ -10790,6 +10790,28 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       `MAX_REPAIR_ATTEMPTS` は 3 のまま。descendant は新しい根にならず、
       `eec46736` の generation の中で depth 1 → 2 → 3 と進み、使い切れば再び escalate する。
 
+      **独立レビューが見つけた 2 件（2026-09-23・本項目へ統合。新規 item は作らない）**:
+      上の admission 緩和それ自体に欠陥があり、どちらも in-memory で再現した。
+
+      - **安全側**: 規約形かつ lineage 再構築可能、だけでは足りなかった。それを両方満たす
+        `repair:` chain には **人の権限がどこにも無い `origin` 根のもの**が含まれ、通常の
+        repair が走っている最中に Task が別の理由で blocked になっても、その chain は
+        blocked を跨いで自律継続した。blocked は「人が動くまで自律実行を止める」状態なので、
+        これは閉じ込めの解除ではなく**安全境界の後退**である。既存 walker の `rootKind` を
+        そのまま条件に使い、`human_resume` / `human_recovery` generation の descendant だけを
+        通す。新しい authority flag / parser / table / status は足していない
+      - **liveness 側**: `resumeBlockedTask()` は元の行を `blocked` のまま残すのに、live Job の
+        除外は implementJob 自身の `resume:` キーだけを見ていた。attempt 2 以降の実装は
+        `repair:` 規約なので自分の stepKey からは元の resume 元を辿れず、**人が承認した chain が
+        attempt 1 の次で必ず止まっていた**。canonical な walk 結果の根から resume 元を導き、
+        **その 1 件が `blocked` のときだけ**外す。`queued` / `running` へ戻った source は外さない
+        —— 本当に動いている Job の上へ repair を積むことになる。generation 内の blocked Job を
+        一括で無視する拡張はしていない
+
+      既存 184 test は**両方の欠陥に素通りしていた**（祖先が全部 `failed` の fixture しか
+      無かった）。production `c3849205` と同じ「元 Job が blocked のまま残る」形で
+      depth 1 → 2 → 3 → `attempt_limit` escalate までを固定し、mutation guard は 41 → 46 へ
+      拡張した（緩める側と締めすぎる側の両方向を測る）。
       **残り**: `c3849205` に対して repair attempt 2 以降が canonical に進むことを production で
       確認する。コードではなく運用手順であり、実施をもって `done` にする。
 

@@ -186,7 +186,7 @@ export function parseRepairSource(stepKey: string): string | undefined {
 }
 
 /** `resume:<sourceJobId>:<n>` から source Job id を取り出す。 */
-function parseResumeSource(stepKey: string): string | undefined {
+export function parseResumeSource(stepKey: string): string | undefined {
   const match = /^resume:(.+):\d+$/.exec(stepKey)
   const source = match?.[1]
   return source !== undefined && source.length > 0 ? source : undefined
