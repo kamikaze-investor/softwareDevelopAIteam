@@ -92,6 +92,48 @@ describe('classifyFailure', () => {
     expect(classifyFailure({ text: 'rate limited, try again later' })).toBe('quota')
   })
 
+  // 2026-09-23 production: Gemini API が 402 + `prepayment credits are depleted` を返し、
+  // どの pattern にも当たらず `unknown` になった。`metaReviewFallbackRouter` の Copilot 段は
+  // `{quota, transient}` だけを対象にするため発火せず、**subscription 側の代替レビュアーが
+  // 在るのに Meta Review が blocked で止まった**。前払い credit の枯渇は「使い切った」状態
+  // なので quota と同じ扱いにする。
+  it('前払い credit の枯渇を示す文言 → quota（Copilot フォールバック対象）', () => {
+    expect(classifyFailure({
+      text: '[GoogleGenerativeAI Error]: Error fetching from https://generativelanguage.googleapis.com/'
+        + 'v1beta/models/gemini-2.5-flash:generateContent: [402 Payment Required] Your prepayment'
+        + ' credits are depleted. Please go to AI Studio to manage your project and billing.',
+      httpStatus: 402,
+    })).toBe('quota')
+    expect(classifyFailure({ text: 'Your credits are depleted' })).toBe('quota')
+    expect(classifyFailure({ text: 'You are out of credits' })).toBe('quota')
+    expect(classifyFailure({ text: 'insufficient credits for this request' })).toBe('quota')
+    expect(classifyFailure({ text: 'Your credit balance is too low to run this request' })).toBe('quota')
+  })
+
+  // **status code だけでは分類しない。** 402 は与信失敗・支払い方法未設定など、枯渇では
+  // ない payment error も表す。意味が特定できないものは `unknown` のまま fail-closed。
+  it('bare 402 / 枯渇を示さない payment error は quota にしない', () => {
+    expect(classifyFailure({ text: 'Payment Required', httpStatus: 402 })).toBe('unknown')
+    expect(classifyFailure({ text: '', httpStatus: 402 })).toBe('unknown')
+    expect(classifyFailure({
+      text: '[402 Payment Required] Your card was declined. Update your payment method.',
+      httpStatus: 402,
+    })).toBe('unknown')
+    expect(classifyFailure({
+      text: '[402 Payment Required] No billing account is linked to this project.',
+      httpStatus: 402,
+    })).toBe('unknown')
+  })
+
+  // 既存分類は動かさない。
+  it('401 / 429 / 5xx の既存分類は変わらない', () => {
+    expect(classifyFailure({ text: 'Unauthorized', httpStatus: 401 })).toBe('auth_or_config')
+    expect(classifyFailure({ text: 'Forbidden', httpStatus: 403 })).toBe('auth_or_config')
+    expect(classifyFailure({ text: 'unrelated', httpStatus: 429 })).toBe('quota')
+    expect(classifyFailure({ text: 'Service Unavailable', httpStatus: 503 })).toBe('transient')
+    expect(classifyFailure({ text: 'Internal Server Error', httpStatus: 500 })).toBe('transient')
+  })
+
   it('quota という単語を含んでいても exhaustion/rate-limit の形でなければ quota 扱いにしない（独立レビュー指摘: 誤って Copilot フォールバックへ倒れるのを防ぐ）', () => {
     expect(classifyFailure({ text: 'quota project not configured for this API' })).not.toBe('quota')
     expect(classifyFailure({ text: 'invalid quota project id' })).not.toBe('quota')
