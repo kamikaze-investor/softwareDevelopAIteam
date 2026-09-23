@@ -47,7 +47,7 @@ import type { IStorage } from '../storage/interface'
 import type { DesignReviewRun } from '../storage/interface'
 import type { Job, ReviewResult } from '@ai-team/shared'
 import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from './repairFlow'
-import { epochCoveredImplementationJobIds, resolveStoredReviewChain } from './repairRecoveryEpoch'
+import { resolveStoredReviewChain } from './repairRecoveryEpoch'
 
 /** 承認の有効期限。既存 `APPROVAL_REQUEST_TTL_MINUTES` と同じ考え方で、新しい値を作らない。 */
 const APPROVAL_TTL_MINUTES = 60
@@ -153,17 +153,22 @@ export function repairFromStoredReview(
     return { status: 'escalated', reason: dryRun.reason }
   }
 
-  // 4. **epoch が既に成立しているなら、承認をもう一度要求しない。**
+  // 4. **この generation が既に human authorized なら、承認をもう一度要求しない。**
   //
-  //    consume と repair Job の実体化は同じ瞬間ではない（run を作り、その run が
-  //    ALIGNED を出してはじめて repair Job ができる）。その間にプロセスが落ちると、
-  //    以前の実装は「APPROVED が無い」と判断して**新しい承認を要求し、使い切った
-  //    authorization だけが失われた**（独立レビュー指摘）。epoch は CONSUMED 行として
-  //    durable に残っているので、同じ review への再試行はそれを根拠に続行してよい。
-  const epochAlreadyOpen = epochCoveredImplementationJobIds(storage, task.id)
-    .has(chain.implementJob.id)
-
-  if (epochAlreadyOpen) {
+  //    判断材料は canonical な repair 判定が出した `generation` そのものである。
+  //    **route 側で ancestry を数え直さない。**
+  //
+  //    以前ここは「この実装 Job 自身が consume 済み epoch に含まれるか」だけを見ていた。
+  //    それだと repair descendant を認識できない —— production `c3849205` では
+  //    `eec46736` の human_recovery generation に属する `repair:eec46736:1` が
+  //    「未 authorized」と判定され、**同じ generation に対して2枚目の承認を要求し、
+  //    それを消費すれば depth が 0 に戻って予算が作り直されるところだった**
+  //    （CEO 指示・2026-09-23）。
+  //
+    //  `escalate` でも同じ判定を使う。上限に達した human generation に対して
+    //  さらに承認を要求すると、承認のたびに予算が作り直せてしまう。その場合は
+    //  `evaluateAndAct()` がそのまま escalate を返す（新しい承認は作らない）。
+  if (dryRun.generation?.rootKind === 'human_recovery') {
     return evaluateAndAct(storage, task.id, chain, deps)
   }
 

@@ -64,6 +64,7 @@ const EPOCH = 'apps/api/src/designReview/repairRecoveryEpoch.ts'
 const RECOVERY = 'apps/api/src/designReview/repairFromStoredReview.ts'
 const RECOVERY_TESTS = ['src/designReview/repairFromStoredReview.test.ts']
 const GENERATION_TESTS = ['src/designReview/repairHumanRecoveryGeneration.test.ts']
+const ADMISSION_TESTS = ['src/designReview/repairAfterResumeReview.test.ts']
 
 const MUTATIONS = [
   // ── stored-review recovery / human_recovery generation root ──────────────
@@ -71,6 +72,92 @@ const MUTATIONS = [
   // ここは #270 の予算アルゴリズムを増やしたのではなく、**generation の根を 1 つ
   // 加算した**部分である。守るのは「現在の authority が根になる」「根が決まっても
   // lineage 検査を弱めない」「同じ epoch で予算を繰り返し再発行しない」の 3 点。
+  {
+    id: 'N12-repair-successor-rejected-again',
+    guard: 'blocked Task では resume successor と repair successor の両方を受ける',
+    file: REPAIR_FLOW,
+    from: '  if (!isResumeSuccessor && !isRepairSuccessor) {',
+    to: '  if (!isResumeSuccessor) {',
+    tests: [...RECOVERY_TESTS, ...ADMISSION_TESTS],
+  },
+  {
+    id: 'N13-arbitrary-repair-successor-allowed',
+    guard: 'repair successor は lineage が再構築できるものだけ（prefix 一致では許さない）',
+    file: REPAIR_FLOW,
+    from: '  if (!lineage.ok) {',
+    to: '  if (false) {',
+    tests: ADMISSION_TESTS,
+  },
+  {
+    id: 'N14-descendant-human-recovery-not-recognised',
+    guard: 'descendant が既に human_recovery generation 内なら新しい承認を要求しない',
+    file: RECOVERY,
+    from: "  if (dryRun.generation?.rootKind === 'human_recovery') {",
+    to: '  if (false) {',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N15-attempt-ignores-generation-depth',
+    guard: 'attempt は generation の深さ + 1（descendant でも 1 へ戻さない）',
+    file: POLICY,
+    from: '  const attempt = walk.depth + 1',
+    to: '  const attempt = 1',
+    tests: [...RECOVERY_TESTS, ...POLICY_TESTS],
+  },
+  // ── blocked 例外の authority と、除外してよい live Job ────────────────────
+  //
+  // どちらも 2026-09-23 の独立レビューが再現させた欠陥である。守るのは 2 つ:
+  //   - repair successor を通すのは **human authority の generation の中だけ**
+  //   - live 判定から外すのは **lineage から導いた resume 元ちょうど 1 件、blocked のときだけ**
+  // 両方向に振って測る。緩める側だけ測ると、締めすぎ（正規経路を止める）を見逃す。
+  {
+    id: 'N16-origin-rooted-repair-admitted',
+    guard: 'repair successor は human authority の generation の中だけ通す',
+    file: REPAIR_FLOW,
+    from: "  if (isRepairSuccessor && lineage.rootKind === 'origin') {",
+    to: '  if (false) {',
+    tests: ADMISSION_TESTS,
+  },
+  {
+    id: 'N17-human-rooted-repair-rejected',
+    guard: 'human_resume / human_recovery generation の descendant は通す（締めすぎない）',
+    file: REPAIR_FLOW,
+    from: "  if (isRepairSuccessor && lineage.rootKind === 'origin') {",
+    to: '  if (isRepairSuccessor) {',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N18-nearest-resume-source-not-excluded',
+    guard: '最も近い resume 元が blocked なら live 判定から外す',
+    file: REPAIR_FLOW,
+    from: "    .filter((job) => !(job.id === nearestResumeSourceJobId && job.status === 'blocked'))",
+    to: '    .filter(() => true)',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N19-any-blocked-job-excluded',
+    guard: '外すのは導いた resume 元だけ（blocked Job を一括で無視しない）',
+    file: REPAIR_FLOW,
+    from: "    .filter((job) => !(job.id === nearestResumeSourceJobId && job.status === 'blocked'))",
+    to: "    .filter((job) => job.status !== 'blocked')",
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N20-live-source-excluded-regardless-of-status',
+    guard: '除外の根拠は blocked という状態そのもの（queued / running へ戻った source は外さない）',
+    file: REPAIR_FLOW,
+    from: "    .filter((job) => !(job.id === nearestResumeSourceJobId && job.status === 'blocked'))",
+    to: '    .filter((job) => job.id !== nearestResumeSourceJobId)',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N21-farthest-resume-source-used',
+    guard: '外すのは chain で最も近い resume 元（上流の resume 元で上書きしない）',
+    file: POLICY,
+    from: '      if (nearestResumeSourceJobId === undefined) nearestResumeSourceJobId = parent',
+    to: '      nearestResumeSourceJobId = parent',
+    tests: RECOVERY_TESTS,
+  },
   {
     id: 'N11-recovery-reset-not-recorded',
     guard: 'human_recovery の reset を判定にも監査にも同じ導出で残す',
@@ -146,14 +233,6 @@ const MUTATIONS = [
     guard: 'changes_requested の verdict だけを再駆動する',
     file: EPOCH,
     from: "  if (review.status !== 'changes_requested') {",
-    to: '  if (false) {',
-    tests: RECOVERY_TESTS,
-  },
-  {
-    id: 'N10-recovery-epoch-demands-a-fresh-approval',
-    guard: 'epoch 成立後は承認を焼き直さない（crash 再試行で authorization を失わない）',
-    file: RECOVERY,
-    from: '  if (epochAlreadyOpen) {',
     to: '  if (false) {',
     tests: RECOVERY_TESTS,
   },

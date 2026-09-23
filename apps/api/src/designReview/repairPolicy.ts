@@ -111,6 +111,15 @@ export type RepairDecision =
        * - `no_actionable_information`: 同じ失敗の繰り返しで手がかりが無い
        */
       code: 'attempt_limit' | 'lineage_unreconstructable' | 'no_actionable_information'
+      /**
+       * lineage を辿れたときだけ入る（`lineage_unreconstructable` では undefined）。
+       *
+       * **escalate でも generation は事実として確定している。** 呼び出し側が
+       * 「この実装は既に human authorized な generation の中か」を知るのに要る。
+       * これが無いと、上限に達した generation に対して呼び出し側が新しい authority を
+       * 要求し、**承認するたびに予算が作り直される**（CEO 指示・2026-09-23）。
+       */
+      generation?: RepairGeneration
     }
 
 /** repair 1 件が属する generation の確定事実。 */
@@ -212,6 +221,16 @@ export type GenerationWalk =
        * 「同じ失敗が繰り返されているか」を前の generation まで含めて数えないための境界である。
        */
       generationRepairJobIds: string[]
+      /**
+       * **この lineage で最も近い `resume:` の元 Job id**（`sourceJobId` から上へ辿って
+       * 最初に出会うもの）。generation の境界とは無関係に、chain のどこから来たかを
+       * 1 件だけ指す。
+       *
+       * `resumeBlockedTask()` は元の行を `blocked` のまま残すので、admission の live Job
+       * 判定はこの 1 件だけを除外する。**同じ一度の walk で決める**のは、repairFlow 側で
+       * lineage を second-guess する二本目の走査を作らないためである。
+       */
+      nearestResumeSourceJobId?: string
     }
   | { ok: false; reason: string }
 
@@ -253,6 +272,13 @@ export function walkRepairGeneration(
   let crossedAiResume = false
 
   /**
+   * 最も近い `resume:` の元。**最初に出会った 1 件だけ**を持ち、上流に別の resume が
+   * あっても上書きしない。generation の根より上に出ても構わない —— 「この chain は
+   * どの Job から再開されたか」は generation の境界とは別の事実である。
+   */
+  let nearestResumeSourceJobId: string | undefined
+
+  /**
    * 数え終わりが決まったら確定する。**以降も walk は続く**（上流の健全性を確かめるため）。
    * ここに値が入った後は depth も crossedAiResume も動かさない。
    */
@@ -264,7 +290,15 @@ export function walkRepairGeneration(
 
   const finish = (originJobId: string): GenerationWalk => (
     countedRoot === undefined
-      ? { ok: true, depth, rootJobId: originJobId, rootKind: 'origin', crossedAiResume, generationRepairJobIds }
+      ? {
+          ok: true,
+          depth,
+          rootJobId: originJobId,
+          rootKind: 'origin',
+          crossedAiResume,
+          generationRepairJobIds,
+          nearestResumeSourceJobId,
+        }
       : {
           ok: true,
           depth,
@@ -273,6 +307,7 @@ export function walkRepairGeneration(
           previousGenerationRoot: countedRoot.previousGenerationRoot,
           crossedAiResume,
           generationRepairJobIds,
+          nearestResumeSourceJobId,
         }
   )
 
@@ -352,6 +387,8 @@ export function walkRepairGeneration(
       if (parent === undefined) {
         return { ok: false, reason: `malformed resume step key on job ${cursor}` }
       }
+      if (nearestResumeSourceJobId === undefined) nearestResumeSourceJobId = parent
+
       // **human と証明された resume が数え終わり。** ただしここで walk は止めない。
       // 止めると、この resume 自身が環の一部でも別 Task から来ていても素通りしてしまう。
       if (countedRoot === undefined && job.resumeActorClass === 'human') {
@@ -396,6 +433,21 @@ export function walkRepairGeneration(
  * 追えなくなる —— それは `human_resume` と `human_recovery` を混同させないという
  * 設計の目的そのものを壊す。
  */
+/**
+ * walk の成功結果から `RepairGeneration` を組む。**組み立ても1か所**にする。
+ * repair 決定側と escalate 側で別々に書くと、片方だけが新しい欄を持つ。
+ */
+export function toRepairGeneration(walk: Extract<GenerationWalk, { ok: true }>): RepairGeneration {
+  return {
+    rootJobId: walk.rootJobId,
+    rootKind: walk.rootKind,
+    depth: walk.depth,
+    previousGenerationRoot: walk.previousGenerationRoot,
+    crossedAiResume: walk.crossedAiResume,
+    ...generationResetFacts(walk),
+  }
+}
+
 export function generationResetFacts(walk: {
   rootKind: GenerationRootKind
   crossedAiResume: boolean
@@ -443,6 +495,7 @@ export function decideRepairAction(
       reason: `repair attempts reached the limit (${MAX_REPAIR_ATTEMPTS})`,
       signature,
       code: 'attempt_limit',
+      generation: toRepairGeneration(walk),
     }
   }
 
@@ -474,6 +527,7 @@ export function decideRepairAction(
       reason: 'the same failure repeated and there is no actionable information to try a different approach',
       signature,
       code: 'no_actionable_information',
+      generation: toRepairGeneration(walk),
     }
   }
 
@@ -481,16 +535,8 @@ export function decideRepairAction(
   return {
     action: 'repair',
     attempt,
-    generation: {
-      rootJobId: walk.rootJobId,
-      rootKind: walk.rootKind,
-      depth: walk.depth,
-      previousGenerationRoot: walk.previousGenerationRoot,
-      crossedAiResume: walk.crossedAiResume,
-      // **理由は2つを区別して残す。** 過去の resume が human だったのか、
-      // いま recovery を承認されたのかは別の事実である。導出は1か所（下の helper）。
-      ...generationResetFacts(walk),
-    },
+    // 理由の導出も組み立ても helper に寄せてある（下の `toRepairGeneration`）。
+    generation: toRepairGeneration(walk),
     // 末尾は常に :1 で固定する。attempt番号を入れると同一failureの再送で別keyになり、
     // chainが二重化する。一意性はsourceJobId側が担保する（Stage 1の retry:<jobId>:1 と同じ）。
     stepKey: `${REPAIR_STEP_PREFIX}${sourceJobId}:1`,

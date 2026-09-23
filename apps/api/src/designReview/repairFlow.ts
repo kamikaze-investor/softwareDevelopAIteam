@@ -19,7 +19,7 @@
  *
  * Idempotency: 同一failure eventからStage 2 chainは1本しか作られない。
  *   - design_review_runs は (task_id) WHERE status IN ('queued','running') の partial unique index
- *   - repair Job は `workflow_step_key = repair:<taskId>:<attempt>` と既存の全体一意index
+ *   - repair Job は `workflow_step_key = repair:<sourceJobId>:1` と既存の全体一意index
  * いずれも既存機構であり、新しい仕組みは追加していない。
  */
 
@@ -42,6 +42,7 @@ import {
   parseRepairSource,
   walkRepairGeneration,
   type PriorRepairJob,
+  type RepairGeneration,
   type RepairFailureFacts,
   type ResumeActorClass,
 } from './repairPolicy'
@@ -68,12 +69,21 @@ export type RepairPreparation =
       }
       stepKey: string
       attempt: number
+      /** この repair が属する generation の確定事実（`decideRepairAction` の出力）。 */
+      generation: RepairGeneration
     }
   | {
       action: 'escalate'
       reason: string
       /** `decideRepairAction` の構造化理由。admission で落ちた場合は undefined。 */
       code?: 'attempt_limit' | 'lineage_unreconstructable' | 'no_actionable_information'
+      /**
+       * lineage を辿れた escalate でだけ入る。
+       * **上限に達した generation でも、それが誰の権限で始まったかは確定している。**
+       * 呼び出し側がこれを読めないと、既に human authorized な generation に対して
+       * さらに authority を要求してしまう（= 承認のたびに予算が作り直される）。
+       */
+      generation?: RepairGeneration
     }
   | { action: 'skip'; reason: string }
 
@@ -516,11 +526,58 @@ function repairableBlockedReviewRequest(
     return { ok: false, reason: `implementation job is ${implementJob.status}` }
   }
 
-  // 4. その実装が **canonical な resume successor** であること。
-  //    `resume:<元Job>:<n>` は `resumeBlockedTask()` だけが付ける規約で、
-  //    これが blocked のまま成功しうる唯一の正規経路である。
-  if (!/^resume:[^:]+:\d+$/.test(implementJob.workflowStepKey ?? '')) {
-    return { ok: false, reason: 'implementation job is not a canonical resume successor' }
+  // 4. その実装が **blocked のまま正当に成功しうる successor** であること。
+  //
+  //    2 種類ある。どちらも「Task を blocked のままにしたまま実装が進む」正規経路である:
+  //      - `resume:<元Job>:<n>` —— `resumeBlockedTask()` が付ける規約
+  //      - `repair:<元Job>:1`   —— Stage 2 が付ける規約
+  //
+  //    **以前は resume だけを許していた。** そのため production `c3849205` では、
+  //    recovery で作られた repair（`repair:eec46736:1`）が成功し、そのレビューが
+  //    `changes_requested` を返したのに、ここで「resume successor ではない」として
+  //    落ち、repair も escalate も作られず PL が `unknown` で CEO escalation した
+  //    （2026-09-23 production 実測）。元のコメントは resume を「唯一の正規経路」と
+  //    書いていたが、それは事実として誤りだった。
+  //
+  //    **`repair:` で始まる、では許さない。** 規約形であることに加えて、
+  //    **lineage が実際に再構築できる**ことを既存 walker で確かめる —— source Job の実在 /
+  //    同一 Task / 非環 / 一意性はすべてそちらの責務である。ここに別の parser は作らない。
+  const stepKey = implementJob.workflowStepKey ?? ''
+  const isResumeSuccessor = /^resume:[^:]+:\d+$/.test(stepKey)
+  const isRepairSuccessor = parseRepairSource(stepKey) !== undefined
+  if (!isResumeSuccessor && !isRepairSuccessor) {
+    return { ok: false, reason: 'implementation job is not a canonical resume or repair successor' }
+  }
+
+  //    lineage が辿れない実装は、段数も根も確定できない。**推測せず落とす。**
+  const taskJobs = storage.jobs.findByTaskId(task.id)
+  const lineage = walkRepairGeneration(
+    implementJob.id,
+    toPriorRepairJobs(
+      taskJobs,
+      storage.reviewResults.findByTaskId(task.id),
+      readResumeActorClasses(storage, taskJobs),
+      epochCoveredImplementationJobIds(storage, task.id),
+    ),
+  )
+  if (!lineage.ok) {
+    return { ok: false, reason: `repair lineage could not be reconstructed: ${lineage.reason}` }
+  }
+
+  //    **repair successor は human authority の generation の中にいなければならない。**
+  //
+  //    規約形であること＋lineage が再構築できること、では足りない。それを両方満たす
+  //    `repair:` chain には **人の権限がどこにも無い `origin` 根のもの**が含まれる ——
+  //    通常の repair が走っている最中に Task が別の理由で blocked になれば、その chain は
+  //    blocked を跨いで自律継続してしまう。blocked は「人が動くまで自律実行を止める」
+  //    状態なので、それは閉じ込めの解除ではなく **安全境界の後退**である
+  //    （独立レビュー指摘・2026-09-23 に in-memory で再現）。
+  //
+  //    判定は既存 walker の `rootKind` をそのまま使う。新しい authority flag も parser も
+  //    table も status も作らない。通すのは `human_resume` / `human_recovery` generation の
+  //    descendant だけである。**resume successor 側の条件はここで変えない。**
+  if (isRepairSuccessor && lineage.rootKind === 'origin') {
+    return { ok: false, reason: 'repair successor is not inside a human-authorized generation' }
   }
 
   // 5. 指摘が **この Task の allowedPaths 内**で直せること。
@@ -597,10 +654,27 @@ function repairableBlockedReviewRequest(
   //    implement requeue 経路）。stepKey が名指しているというだけで状態を問わず外すと、
   //    **本当に動いている Job の上へ repair を積む**（独立レビュー指摘）。
   //    resume が残した `blocked` という状態そのものが除外の根拠であって、名前ではない。
-  const resumeSourceJobId = implementJob.workflowStepKey?.match(/^resume:([^:]+):\d+$/)?.[1]
+  //
+  //    **外すのは「この chain で最も近い resume の元」ちょうど 1 件である。**
+  //
+  //    実装自身の `resume:` キーだけを見ていた頃は、attempt 2 以降（キーが `repair:` に
+  //    なる）で元を辿れず、人が承認した chain が 1 手先で必ず止まった。かといって
+  //    「直近の resume 元」と「generation の根の resume 元」を**別々に 2 件**外すと、
+  //    今度は AI resume を挟むだけで前の generation の blocked 行まで一緒に消え、
+  //    直接 resume 経路の admission が広がってしまう（独立レビュー指摘・2026-09-23 に
+  //    両方 in-memory で再現）。**どちらの欠陥も「何件外すか」がぶれたことが原因**なので、
+  //    規則を 1 本にする。
+  //
+  //    値は canonical な walk が**同じ一度の走査で**確定させた `nearestResumeSourceJobId`
+  //    を使う。ここで lineage を second-guess する二本目の走査は作らない。
+  //      - 実装自身が `resume:<B>:n`   → B（従来と同じ）
+  //      - 実装が repair descendant     → 上へ辿って最初に出会う resume の元
+  //      - resume がどこにも無い chain → 外す対象は無い
+  const nearestResumeSourceJobId = lineage.nearestResumeSourceJobId
+
   const live = storage.jobs.findByTaskId(task.id)
     .filter((job) => job.id !== implementJob.id)
-    .filter((job) => !(job.id === resumeSourceJobId && job.status === 'blocked'))
+    .filter((job) => !(job.id === nearestResumeSourceJobId && job.status === 'blocked'))
     .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
   if (live.length > 0) {
     return { ok: false, reason: `a live job exists for this task (${live[0].status})` }
@@ -660,7 +734,12 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
     facts,
   )
   if (decision.action === 'escalate') {
-    return { action: 'escalate', reason: decision.reason, code: decision.code }
+    return {
+      action: 'escalate',
+      reason: decision.reason,
+      code: decision.code,
+      generation: decision.generation,
+    }
   }
 
   if (priorJobs.some((job) => job.workflowStepKey === decision.stepKey)) {
@@ -700,6 +779,7 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
       changedFiles: failedJob.changedFiles ?? [],
     },
     stepKey: decision.stepKey,
+    generation: decision.generation,
     attempt: decision.attempt,
   }
 }

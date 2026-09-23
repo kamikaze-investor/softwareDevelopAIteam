@@ -289,7 +289,7 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     })
     const reviewJob = createReviewJob(storage, ids, implementJob.id)
     const review = storeReview(storage, ids, reviewJob.id)
-    expect(skipped(storage, implementJob, review)).toContain('not a canonical resume successor')
+    expect(skipped(storage, implementJob, review)).toContain('not a canonical resume or repair successor')
   })
 
   // **`allowedPaths` が空なら通さない。** 範囲外を指す finding が 1 件も無くても同じで、
@@ -509,6 +509,84 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     expect(skipped(storage, implementJob, review)).toContain('unusable scope')
   })
 
+  // **規約形＋lineage 再構築可能、でもまだ足りない（独立レビュー指摘・2026-09-23）。**
+  // その両方を満たす `repair:` chain には **人の権限がどこにも無い `origin` 根のもの**が
+  // 含まれる。通常の repair が走っている最中に Task が別の理由で blocked になっても、
+  // その chain は blocked を跨いで自律継続してしまっていた。
+  it('origin 根の repair successor は通さない（人の権限が chain のどこにも無い）', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    // 通常の implement から始まる chain。resume も recovery epoch も無い。
+    const origin = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      workflowStepKey: `task:${ids.taskId}:initial-implement`,
+    } as never)
+    storage.jobs.update(origin.id, { status: 'failed' } as never)
+
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `repair:${origin.id}:1`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    // lineage 自体は再構築できている（＝別の理由で落ちたのではない）ことも示す。
+    const reason = skipped(storage, implementJob, review)
+    expect(reason).toContain('not inside a human-authorized generation')
+    expect(reason).not.toContain('lineage could not be reconstructed')
+  })
+
+  // **`repair:` で始まる、だけでは許さない。** 規約形であり、かつ lineage が
+  // 実際に再構築できることまで確かめる（source 実在 / 同一 Task / 非環）。
+  it('規約形でない repair stepKey は通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    const implementJob = createResumedImplementJob(storage, ids, { workflowStepKey: 'repair:parent' })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+    expect(skipped(storage, implementJob, review)).toContain('not a canonical resume or repair successor')
+  })
+
+  it('source Job が存在しない repair successor は通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: 'repair:11111111-1111-1111-1111-111111111111:1',
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+    expect(skipped(storage, implementJob, review)).toContain('lineage could not be reconstructed')
+  })
+
+  it('別 Task の Job を source にした repair successor は通さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    const otherTask = storage.tasks.create({
+      projectId: ids.projectId,
+      title: 'T2', description: 'd', status: 'blocked', assignee: 'developer_ai',
+      dependencies: [], allowedPaths: ['apps/api/src/pl'],
+    } as never)
+    const foreign = storage.jobs.create({
+      taskId: otherTask.id,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+    } as never)
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `repair:${foreign.id}:1`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+    expect(skipped(storage, implementJob, review)).toContain('lineage could not be reconstructed')
+  })
+
   it('live な Job があれば通さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, implementJob, review } = productionShape(storage)
@@ -545,7 +623,7 @@ describe('blocked Task への repair — 通してはいけないケース', () 
 
     // 呼び出し元が canonical な resume successor を名乗る。
     const claimed = { ...implementJob, workflowStepKey: 'resume:11111111-1111-1111-1111-111111111111:1' } as Job
-    expect(skipped(storage, claimed, review)).toContain('not a canonical resume successor')
+    expect(skipped(storage, claimed, review)).toContain('not a canonical resume or repair successor')
   })
 
   it('保存された status が success でなければ、引数がそう名乗っても通さない', () => {
