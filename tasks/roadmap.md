@@ -1718,14 +1718,128 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         そもそも**この Task は1度も commit していない**（全 Job で `commit_hash = null`）ので
         「commit を捨てる」対象は存在しない。**dirty worktree が実装を保持しているだけ**
 
-      → **新しい route / status / workflow は要らない。** 必要なのは既存経路の最小修正2点:
-      1. `resumeBlockedTask()` の `git_commit` 分岐で、**修正指示が与えられている（または
-         直近承認が `REJECTED`）ときは、同じ commit を作り直さず implement Job を作る**。
-         dirty worktree はそのまま残っているので、implement Job がその場で実装を直せる
-         ＝これが「commit を捨て、実装修正へ戻る」の実体である。
-         下流 Gate（design review evidence / `/gate/check` / 承認）は現状のまま効かせる
-      2. **`REJECTED` 承認と同一 `target_diff_hash` の `git_commit` Job 生成を fail-closed で拒否**する。
-         既存列をそのまま使い、新テーブルは作らない
+      → **新しい route / status / workflow / table / Gate は要らない。**
+      既存機構の修正3点（+ triage 1点）で足りる。**CEO 設計・2026-09-23。**
+
+      **【条件の訂正】** 初版は「修正指示が与えられている（または直近承認が `REJECTED`）とき」
+      と書いたが、**これは広すぎるので撤回する**。実測のとおり `instructionPrompt` は
+      **常に非空**である:
+      - `POST /tasks/:id/resume` … `ResumeTaskBody` が `instruction` を必須（`min(1)`）とし、
+        `buildResumeAiCliPrompt()` を通して必ず渡す
+      - PL の自動 resume … `instructionPrompt: deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION`
+
+      よって「instruction がある」を条件にすると **EXPIRED / STALE の既存正常経路まで変わる**。
+      正しい条件は **「直近の relevant approval が `REJECTED` の `git_commit` recovery に限る」**。
+      **EXPIRED / STALE / 承認行なしは既存挙動を維持する。**
+
+      **1. `resumeBlockedTask()`（`apps/api/src/storage/sqlite.ts`）——
+      `REJECTED` の `git_commit` だけ実装修正へ戻す**
+
+      latest Job が `git_commit` **かつ** relevant approval が `REJECTED` のときは、
+      同一 `git_commit` Job を clone せず、**その `git_commit` を生んだ workflow chain を
+      既存 `workflowStepKey` から機械的に逆引き**して source implement Job を特定する:
+
+      ```
+      git_commit Job   workflowStepKey = review:<reviewJobId>:git-commit
+        → review Job   workflowStepKey = implement:<implementJobId>:review
+        → source implement Job
+      ```
+
+      **「最新の implement Job」を推測で選ばない。** 次のいずれかなら **fail-closed**:
+      parse 不能 / review Job が無い / review Job の Task 不一致 / implement Job が無い /
+      implement Job の Task 不一致 / source が `aiCliMode !== 'implement'` /
+      provider 等の再実行情報が無い。**新しい fallback 探索は作らない。**
+
+      新 Job は source implement Job から `projectId` / `agentRole` / `safeCommand` /
+      `dryRun` / `aiCliProvider` / `aiCliMode = implement` を再利用し、
+      `aiCliPrompt` だけを `instructionPrompt` へ置換する。`workingDir` は既存
+      `TARGET_WORKING_DIR`、`workflowStepKey` は既存規約 `resume:<blockedGitCommitJobId>:1` を維持し、
+      既存 `isResumeImplementJob`（`routes/jobs.ts`: `startsWith('resume:') && aiCliMode === 'implement'`）に
+      乗せる。これで `resume implement → post-implement review → git_commit → Gate → Approval` の
+      既存 chain へ戻る。
+
+      > **必ず決めること（実装前に CEO 判断が要る）**: 上記の期待 chain は
+      > `review:<reviewJobId>:git-commit` から始まるが、**c3849205 の現在の latest Job は
+      > `5472d0c1` で `workflowStepKey = resume:7061400a-...:1` である**
+      > （初回の Human Resume が既に1段作ってしまったため）。
+      > 期待 chain を厳密に実装すると **本件の当該 Task では fail-closed になり復旧できない**。
+      > 解決には `resume:<gitCommitJobId>:1` を1ホップ辿ってから上記 chain に入る必要がある。
+      > これは推測ではなく**同じ `workflowStepKey` 規約を明示的に辿るだけ**なので
+      > 「新しい fallback 探索」には当たらないと考えるが、CEO の指定 chain の拡張にあたるため
+      > **独断で広げず、ここに明記して判断を仰ぐ**。
+
+      **2. Design Review gate は既存経路をそのまま使う**
+
+      `REJECTED` からの implement 復帰でも `checkImplementJobDesignReviewEvidence()` を**迂回しない**。
+      初回は必要に応じて
+      `DESIGN_REVIEW_PRECONDITION_FAILED` → `POST /resume` route の既存
+      `createAndExecuteDesignReview()` → evidence 登録 → `resumeBlockedTask()` 再試行 →
+      implement Job 生成、という**既存の流れ**をそのまま通す。**新しい Design Review 経路は作らない。**
+
+      **3. Approval Gate（`apps/api/src/routes/approvalGate.ts`）——
+      `git_commit` でも同一 `REJECTED` diff を再承認させない**
+
+      既存 Gate には **すでに** `findRelevantRejectedRequest()`（`targetCommit` + `targetDiffHash` 一致で
+      過去 `REJECTED` を拾う）と、`decideGateOutcome()` の `REJECTED` 分岐がある。
+      **新しい Gate も別 Guard も作らない。** 穴は呼び出し条件1行だけである:
+
+      ```ts
+      if (!existingReq && !requiresApprovalByPolicy) {   // ← requiresApprovalByPolicy = (requestedAction === 'git_commit')
+        existingReq = findRelevantRejectedRequest(...)
+      }
+      ```
+
+      **`git_commit` のときだけこの探索が丸ごと skip される**ため、linked approval が無ければ
+      Task の過去 `REJECTED` を見ずに新しい ApprovalRequest を発行できてしまう。
+      ここを補完し、`git_commit` でも `status === 'REJECTED'` かつ
+      `requestedAction === 'git_commit'` かつ `targetDiffHash` 一致の過去 Approval を
+      rejection evidence として既存 `decideGateOutcome()` へ渡す
+      （`requestedAction` 不一致の誤再利用は既存 `existingReqForOutcome` が引き続き弾く）。
+
+      **`jobs.ts` へ新しい diff hash 判定を重複実装しない。diff identity の正本は Gate にある。**
+      許容される結末はこうなる:
+
+      ```
+      implement が実質無変更 → review approved → git_commit Job 生成 → /gate/check
+        → 過去 REJECTED と targetDiffHash 一致 → REJECTED
+        → 新しい ApprovalRequest を作らない → commit 実行不可（fail-closed）
+      ```
+
+      **4. `blockedTriage` —— `REJECTED` だけ auto recovery から外す**
+
+      rule 7 は現在 STALE / EXPIRED / `REJECTED` を一律に
+      `approval_not_actionable` + `recommendedLane: 'auto_recovery'` + `recoverable: true` とする。
+      **`rootCauseClass` は増やさない。** `approval_not_actionable` のまま、`REJECTED` のときだけ
+      `recommendedLane = 'ceo_escalation'` / `existingRecoveryAvailable = true` /
+      `recoverable = false` とし、既存 schema 内で
+      「**既存 Human Resume は存在するが、AI が自動実行してよい復旧ではない**」を表現する。
+      summary は「CEO が明示的に却下したため、同一内容を自動再開してはならない。
+      実装修正指示を伴う Human Resume が必要」の意味を出す。
+      STALE / EXPIRED / 承認行なしは**従来どおり** `auto_recovery` を維持する。
+
+      **5. 既存の誤仕様テストを更新**
+
+      `apps/api/src/routes/resumeExpiredApproval.test.ts` の
+      `7b. a REJECTED approval still allows resume exactly as before`（399行）は
+      **今回の production 事故を固定している旧仕様**なので、そのまま残さない。
+      **EXPIRED / STALE / APPROVED の既存期待値は不用意に変更せず、`REJECTED` だけ新しい意味へ更新する。**
+
+      **必須 regression tests**:
+      - **A**: `REJECTED` git_commit + 修正指示 → **新 git_commit は生成されない** /
+        resume implement Job が生成される / `aiCliPrompt` に修正指示が入る
+      - **B**: chain 逆引き（git_commit → review → implement）が正しい。壊れた chain は fail-closed
+      - **C**: EXPIRED は既存挙動維持（同じ git_commit 再承認 cycle を開始できる）
+      - **D**: STALE は既存挙動維持
+      - **E**: 過去 `REJECTED`（`targetDiffHash = X` / `git_commit`）があるとき、新 git_commit Job が
+        `/gate/check` へ同じ X を出しても **outcome = REJECTED / 新 ApprovalRequest = 0 / commit 不可**
+      - **F**: diff が変わって `targetDiffHash != X` なら、既存 policy どおり新 ApprovalRequest を作れる
+      - **G**: triage が EXPIRED → `auto_recovery` / STALE → `auto_recovery` / `REJECTED` → `ceo_escalation`、
+        かつ **PL が `DEFAULT_RESUME_INSTRUCTION` で `REJECTED` を自動 resume しない**
+
+      **今回のスコープ外（追加も変更もしない）**: Human Recovery `/recover` / `abort_task` /
+      repair subsystem / 新 Approval status / 新 Task・Job status / 新 route / 新 workflow engine /
+      新 DB table / approval identity の全面再設計 / Independent Review 非決定性そのものの解決。
+      **本件の責務は「CEO の明示 REJECT を、対象を変えずに resume・retry するだけで消せないようにする」ことだけ。**
 
       **本項目へ統合した理由**: 守るべき不変条件が同じ —— **一度下された否定的判定を、
       対象を変えずに再実行するだけで消してはならない**。本項目は review verdict 側の、
