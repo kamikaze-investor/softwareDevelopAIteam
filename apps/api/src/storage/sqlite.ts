@@ -1462,6 +1462,28 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * これは**探索ではなく正規化**である。辿るのは常に「そのキーが名指ししている1件」だけで、
    * 候補集合を作らない。
    */
+  /**
+   * **その git_commit Job 自身が CEO に却下されたか**を、linked Approval で判定する。
+   *
+   * Task の「最新の Approval 行」では駄目である:
+   * - 別 action（`test` 等）の REJECTED を根拠に誤発火しうる
+   * - linked が REJECTED でも、後から別 action の Approval が作られると**見失う**
+   *
+   * よって `approvalId` を起点に、**その行が本当にこの Job の git_commit 却下か**を確かめる。
+   * ここは `blockedTriage` が見るのと同じ事実であり、案内と endpoint が食い違わないように
+   * 判定の材料を揃えてある。
+   */
+  function isLinkedGitCommitRejection(job: Job): boolean {
+    if (!job.approvalId) return false
+    if (job.safeCommand.kind !== 'git_commit') return false
+    const approval = approvalRequests.findById(job.approvalId)
+    if (!approval) return false
+    if (approval.id !== job.approvalId) return false
+    if (approval.taskId !== job.taskId) return false
+    if (approval.requestedAction !== 'git_commit') return false
+    return approval.status === 'REJECTED'
+  }
+
   function resolveSourceImplementJobForRejectedGitCommit(
     latestJob: Job,
   ): { ok: true; job: Job } | { ok: false; reason: string } {
@@ -1501,6 +1523,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     if (!sameOwner(reviewJob)) {
       return { ok: false, reason: 'review job belongs to a different task or project' }
     }
+    // キーが review を指していても、実体が review Job でなければ provenance は成立しない。
+    if (reviewJob.aiCliMode !== 'review') {
+      return {
+        ok: false,
+        reason: `review job aiCliMode is ${reviewJob.aiCliMode ?? 'none'}, not review`,
+      }
+    }
 
     // 5. `implement:<implementJobId>:review`
     const implementRef = /^implement:([^:]+):review$/.exec(reviewJob.workflowStepKey ?? '')
@@ -1527,6 +1556,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     // 7. 再実行に必要な情報が揃っていること。
     if (!implementJob.aiCliProvider) {
       return { ok: false, reason: 'source implement job is missing aiCliProvider' }
+    }
+
+    // **`safeCommand.kind` も揃っていないと workflow が止まる。**
+    // `routes/jobs.ts` の `shouldCreateReview` は resume implement の成功時に
+    // `safeCommand.kind === 'test'` を要求する。別 kind を再利用すると
+    // 「implement は成功したのに post-implement review が作られず、そこで止まる」
+    // という**静かな停止**になるので、ここで fail-closed にする。
+    if (implementJob.safeCommand.kind !== 'test') {
+      return {
+        ok: false,
+        reason: `source implement job safeCommand is ${implementJob.safeCommand.kind}, not test`,
+      }
     }
 
     return { ok: true, job: implementJob }
@@ -2413,7 +2454,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 一度も下っていない」状態で、同じ diff で新しい承認サイクルを始めるのが正しい。
         // 条件を `instructionPrompt` の有無にしないのは、route も PL も**常に非空**を
         // 渡すためで、そうすると既存の正常経路まで変わってしまう。
-        if (latestJob.safeCommand.kind === 'git_commit' && latestApproval?.status === 'REJECTED') {
+        if (isLinkedGitCommitRejection(latestJob)) {
           const source = resolveSourceImplementJobForRejectedGitCommit(latestJob)
           if (!source.ok) {
             return { ok: false, code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED', reason: source.reason }

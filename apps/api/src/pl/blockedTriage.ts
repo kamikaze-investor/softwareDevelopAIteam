@@ -326,14 +326,20 @@ interface Facts {
   approvalStatus?: string
   approvalId?: string
   /**
-   * **最新の承認行**の status（status を問わず `created_at` 最新の1件）。
+   * **その blocked git_commit Job 自身が CEO に却下されたか。**
    *
    * `approvalStatus` は `findActiveByTaskId()` 由来で `WAITING_FOR_USER` / `APPROVED` しか
-   * 返さないため、**`REJECTED` が見えない**。却下されたかどうかを判定するにはこちらを使う。
-   * これは `resumeBlockedTask()` が見ている行と同じ定義であり、**triage の案内と
-   * endpoint の挙動を同じ事実に基づかせる**ためにわざと揃えてある。
+   * 返さないため **`REJECTED` が見えない**。かといって「Task の最新 Approval 行」でも駄目で、
+   * 別 action の REJECTED で誤発火し、逆に linked が REJECTED でも後から別 action の
+   * Approval が作られると見失う。
+   *
+   * よって `job.approvalId` を起点に linked Approval を検証する。
+   * **`resumeBlockedTask()` の `isLinkedGitCommitRejection()` と同じ事実**であり、
+   * triage の案内と endpoint の挙動を同じ根拠に基づかせるために揃えてある。
    */
-  latestApprovalStatus?: string
+  ceoRejectedGitCommit?: boolean
+  /** 却下判定の根拠に使った Approval 行 id（証拠欄に出す）。 */
+  rejectedApprovalId?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -343,9 +349,18 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
   const taskJobs = item.taskId !== undefined ? storage.jobs.findByTaskId(item.taskId) : []
   const approval =
     item.taskId !== undefined ? storage.approvalRequests.findActiveByTaskId(item.taskId) : undefined
-  // `findByTaskId()` は created_at DESC なので [0] が最新。`resumeBlockedTask()` と同じ行を見る。
-  const latestApproval =
-    item.taskId !== undefined ? storage.approvalRequests.findByTaskId(item.taskId)[0] : undefined
+  // **linked Approval 基準**（`resumeBlockedTask()` と同じ判定）。
+  // Task 最新行ではなく、その Job の `approvalId` が指す行だけを根拠にする。
+  const linkedRejection = (() => {
+    if (!job?.approvalId) return undefined
+    if (job.safeCommand.kind !== 'git_commit') return undefined
+    const approval = storage.approvalRequests.findById(job.approvalId)
+    if (!approval) return undefined
+    if (approval.id !== job.approvalId) return undefined
+    if (approval.taskId !== job.taskId) return undefined
+    if (approval.requestedAction !== 'git_commit') return undefined
+    return approval.status === 'REJECTED' ? approval : undefined
+  })()
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -357,7 +372,9 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     ...(job !== undefined ? { job } : {}),
     taskJobs,
     ...(approval !== undefined ? { approvalStatus: approval.status, approvalId: approval.id } : {}),
-    ...(latestApproval !== undefined ? { latestApprovalStatus: latestApproval.status } : {}),
+    ...(linkedRejection !== undefined
+      ? { ceoRejectedGitCommit: true, rejectedApprovalId: linkedRejection.id }
+      : {}),
     ...(review !== undefined ? { review } : {}),
     ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
       ? { alignedEvidenceId: evidence.id }
@@ -785,7 +802,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // `rootCauseClass` は増やさず、既存 schema の値だけで
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
   if (facts.job?.status === 'blocked' && !hasLiveJob(facts)) {
-    const ceoRejected = facts.latestApprovalStatus === 'REJECTED'
+    const ceoRejected = facts.ceoRejectedGitCommit === true
     return {
       ...result,
       rootCauseClass: 'approval_not_actionable',
@@ -793,8 +810,10 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       evidence: [
         {
           fact: 'approval_request.status',
-          ...(facts.approvalId !== undefined ? { id: facts.approvalId } : {}),
-          value: facts.latestApprovalStatus ?? facts.approvalStatus ?? 'none',
+          ...(facts.rejectedApprovalId !== undefined
+            ? { id: facts.rejectedApprovalId }
+            : facts.approvalId !== undefined ? { id: facts.approvalId } : {}),
+          value: ceoRejected ? 'REJECTED' : facts.approvalStatus ?? 'none',
         },
         { fact: 'job.status', id: facts.job.id, value: 'blocked' },
       ],
@@ -809,7 +828,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
         ? 'CEO が明示的に却下したため、同一内容を自動再開してはならない。'
           + '実装修正指示を伴う Human Resume が必要（それは却下された commit を作り直さず、'
           + '修正指示を載せた implement Job へ戻す）。'
-        : `承認が ${facts.latestApprovalStatus ?? facts.approvalStatus ?? '未発行'} で、その行では誰も進められない。`
+        : `承認が ${facts.approvalStatus ?? '未発行'} で、その行では誰も進められない。`
           + '既存 resume は新しい承認サイクルを開始する（古い承認を再利用しない）。',
     }
   }

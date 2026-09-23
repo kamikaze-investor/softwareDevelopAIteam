@@ -101,8 +101,15 @@ const HOUR = 60 * 60 * 1000
  */
 async function createRejectedGitCommitChain(
   task: Task,
-  options: { withResumeHop?: boolean; alignedEvidenceFor?: string } = {},
-): Promise<{ implementJob: Job; gitCommitJob: Job; latestJob: Job; approval: ApprovalRequest }> {
+  options: {
+    withResumeHop?: boolean
+    alignedEvidenceFor?: string
+    /** review Job の実体を review でなくする（H4）。 */
+    breakReviewMode?: boolean
+    /** source implement の safeCommand を test でなくする（H5）。 */
+    breakImplementCommand?: boolean
+  } = {},
+): Promise<{ implementJob: Job; reviewJob: Job; gitCommitJob: Job; latestJob: Job; approval: ApprovalRequest }> {
   const { getStorage } = await import('../storage/index.js')
   const storage = getStorage()
   const base = { taskId: task.id, projectId: task.projectId, agentRole: 'developer_ai' as const }
@@ -111,7 +118,9 @@ async function createRejectedGitCommitChain(
   const implementJob = storage.jobs.create({
     ...base,
     status: 'success',
-    safeCommand: { kind: 'test', workingDir: '/workspace/target', params: {} },
+    safeCommand: options.breakImplementCommand === true
+      ? { kind: 'git_status', workingDir: '/workspace/target', params: {} }
+      : { kind: 'test', workingDir: '/workspace/target', params: {} },
     aiCliProvider: 'claude_code',
     aiCliMode: 'implement',
     aiCliPrompt: 'original implementation prompt',
@@ -124,7 +133,7 @@ async function createRejectedGitCommitChain(
     status: 'success',
     safeCommand: { kind: 'git_status', workingDir: '/workspace/target', params: {} },
     aiCliProvider: 'claude_code',
-    aiCliMode: 'review',
+    aiCliMode: options.breakReviewMode === true ? 'implement' : 'review',
     workflowStepKey: `implement:${implementJob.id}:review`,
   } as never)
   await tick()
@@ -187,7 +196,7 @@ async function createRejectedGitCommitChain(
   }
   const approval = storage.approvalRequests.findById(created.approvalRequest.id) as ApprovalRequest
 
-  return { implementJob, gitCommitJob, latestJob, approval }
+  return { implementJob, reviewJob, gitCommitJob, latestJob, approval }
 }
 
 async function createBlockedGitCommitJobWithWaitingApproval(
@@ -575,7 +584,119 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
     })
   })
 
-  // B'. 2段以上の resume: traversal は許さない
+  // H1. 無関係な REJECTED で誤発火しない。
+  //     linked は EXPIRED、あとから別 action の REJECTED が作られただけ。
+  it('H1. an unrelated newer REJECTED does not trigger rejected-commit recovery', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      // linked approval は EXPIRED（= 人は却下していない）。
+      const { approval } = await createBlockedGitCommitJobWithWaitingApproval(task, -1 * HOUR)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      // 別 action の REJECTED を、より新しい行として足す。
+      await new Promise((r) => setTimeout(r, 5))
+      const other = storage.approvalRequests.create({
+        taskId: task.id,
+        targetBranch: 'master',
+        targetCommit: 'commit-other',
+        targetDiffHash: 'diff-other',
+        riskLevel: 'HIGH',
+        requestedAction: 'test',
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        changedFiles: [],
+        triggeredRules: [],
+        invalidIf: [],
+      } as never)
+      storage.approvalRequests.updateStatus(other.id, 'REJECTED', undefined, true)
+      expect(approval.status).toBe('WAITING_FOR_USER')
+
+      const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
+
+      // **従来の EXPIRED recovery のまま** = 同じ git_commit で新しい承認サイクルを始める。
+      expect(statusCode).toBe(201)
+      expect((body as Job).safeCommand.kind).toBe('git_commit')
+      expect((body as Job).aiCliMode).toBeUndefined()
+    })
+  })
+
+  // H2. linked が REJECTED なら、より新しい別 action の Approval があっても見失わない。
+  it('H2. a newer unrelated approval does not hide the linked rejection', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { implementJob } = await createRejectedGitCommitChain(task, { alignedEvidenceFor: '修正指示' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      // より新しい別 action の Approval（却下ではない）を足す。
+      // Task 最新行だけを見ていると、ここで REJECTED を見失っていた。
+      await new Promise((r) => setTimeout(r, 5))
+      storage.approvalRequests.create({
+        taskId: task.id,
+        targetBranch: 'master',
+        targetCommit: 'commit-other',
+        targetDiffHash: 'diff-other',
+        riskLevel: 'HIGH',
+        requestedAction: 'test',
+        status: 'APPROVED',
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        changedFiles: [],
+        triggeredRules: [],
+        invalidIf: [],
+      } as never)
+
+      const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
+
+      expect(statusCode).toBe(201)
+      const created = body as Job
+      expect(created.safeCommand.kind).not.toBe('git_commit')
+      expect(created.aiCliMode).toBe('implement')
+      expect(created.aiCliProvider).toBe(implementJob.aiCliProvider)
+    })
+  })
+
+  // H4. workflowStepKey 上は review を指すが、実体が review Job でない → fail-closed
+  it('H4. a source whose review job is not a review fails closed', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      await createRejectedGitCommitChain(task, { alignedEvidenceFor: '修正指示', breakReviewMode: true })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const before = storage.jobs.findByTaskId(task.id).length
+
+      const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
+
+      expect(statusCode).toBe(409)
+      expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
+    })
+  })
+
+  // H5. source implement の safeCommand.kind が test でない → fail-closed。
+  //     ここを通すと resume implement 成功後に post-implement review が作られず止まる。
+  it('H5. a source implement whose safeCommand is not test fails closed', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      await createRejectedGitCommitChain(task, { alignedEvidenceFor: '修正指示', breakImplementCommand: true })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const before = storage.jobs.findByTaskId(task.id).length
+
+      const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
+
+      expect(statusCode).toBe(409)
+      expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
+    })
+  })
+
+  // B'. 2段以上の resume: traversal は許さない。
+  //
+  // 3段目にも **自分の REJECTED git_commit 承認を紐づける** ——  そうしないと
+  // linked Approval が無いので REJECTED recovery 分岐自体に入らず、この性質を試せない。
   it('7b-iii. a second resume: hop is not traversed', async () => {
     await withApp(async (app) => {
       const project = await createProject()
@@ -585,7 +706,7 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       const storage = getStorage()
       // もう1段積む（`resume: → resume: → ...`）。
       await new Promise((r) => setTimeout(r, 5))
-      storage.jobs.create({
+      const secondHop = storage.jobs.create({
         taskId: task.id,
         projectId: task.projectId,
         agentRole: 'developer_ai',
@@ -597,11 +718,27 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
         },
         workflowStepKey: `resume:${latestJob.id}:1`,
       } as never)
+      const secondApproval = storage.approvalRequests.createForJob({
+        taskId: task.id,
+        targetBranch: 'master',
+        targetCommit: 'commit-rejected',
+        targetDiffHash: 'diff-rejected',
+        riskLevel: 'LOW',
+        requestedAction: 'git_commit',
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        invalidIf: [],
+      } as never, secondHop.id)
+      if (!secondApproval.ok) throw new Error('failed to seed second approval')
+      storage.approvalRequests.updateStatus(secondApproval.approvalRequest.id, 'REJECTED', undefined, true)
+      const before = storage.jobs.findByTaskId(task.id).length
 
       const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
 
+      // 1ホップ正規化した先が `resume:` なので `review:<id>:git-commit` に一致せず fail-closed。
       expect(statusCode).toBe(409)
       expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
     })
   })
 

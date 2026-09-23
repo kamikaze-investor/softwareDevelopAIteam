@@ -106,12 +106,25 @@ interface GateCheckResponse {
   approvalRequest?:   ApprovalRequest
 }
 
+/**
+ * 同一 commit / diff の却下済み Approval を探す。
+ *
+ * `requestedAction` を渡すと**先に action で絞る**。渡さないときは従来どおり action を見ない。
+ *
+ * **git_commit では必ず絞ること。** 絞らないと、同じ commit/diff に対して
+ * 「新しい REJECTED(action=test)」と「古い REJECTED(action=git_commit)」が並んだとき、
+ * 先に test 側を拾い、後段の `existingReqForOutcome` が action 不一致で捨てた結果
+ * **git_commit の却下を再探索しないまま新しい Approval を作れてしまう**。
+ */
 function findRelevantRejectedRequest(
   requests: ApprovalRequest[],
   currentCommit: string,
   currentDiffHash: string,
+  requestedAction?: string,
 ): ApprovalRequest | undefined {
-  const rejectedRequests = requests.filter(request => request.status === 'REJECTED')
+  const rejectedRequests = requests.filter(request =>
+    request.status === 'REJECTED'
+    && (requestedAction === undefined || request.requestedAction === requestedAction))
   return rejectedRequests.find(request =>
     request.targetCommit === currentCommit && request.targetDiffHash === currentDiffHash
   ) ?? rejectedRequests[0]
@@ -519,6 +532,9 @@ export async function approvalGateRoutes(
         storage.approvalRequests.findByTaskId(taskId),
         targetCommit,
         targetDiffHash,
+        // policy 起因（git_commit）のときだけ action で絞る。
+        // HIGH/CRITICAL の既存パスは従来どおり action を見ない（対象外）。
+        requiresApprovalByPolicy ? requestedAction : undefined,
       )
     }
 

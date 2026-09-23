@@ -429,6 +429,21 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     } as never, job.id)
     if (!created.ok) throw new Error('failed to seed approval')
     storage.approvalRequests.updateStatus(created.approvalRequest.id, status, undefined, true)
+    // **linked Approval 基準**なので、Task 最新行に別 action を足しても判定は揺れない。
+    // 旧実装（Task 最新行を見る）はここで誤判定していた。
+    storage.approvalRequests.create({
+      taskId,
+      targetBranch: 'master',
+      targetCommit: 'other',
+      targetDiffHash: 'other',
+      riskLevel: 'HIGH',
+      requestedAction: 'test',
+      status: 'APPROVED',
+      expiresAt: new Date(Date.now() + 1800_000).toISOString(),
+      changedFiles: [],
+      triggeredRules: [],
+      invalidIf: [],
+    } as never)
     storage.tasks.update(taskId, { status: 'blocked' })
     return storage
   }

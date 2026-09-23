@@ -1211,6 +1211,66 @@ describe('POST /api/gate/check — a rejected git_commit diff is not re-approved
     })
   })
 
+  // H3. 同じ commit/diff に「新しい REJECTED(action=test)」と
+  //     「古い REJECTED(action=git_commit)」が並んでも、git_commit の却下を見失わない。
+  //     action で先に絞らないと test 側を拾って捨て、再探索せず新規 Approval を作れてしまう。
+  it('H3. a newer rejection for another action does not mask the git_commit rejection', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-rejected-other-action'
+      const { approvalRequest } = await startGitCommitApproval(app, taskId)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.approvalRequests.updateStatus(approvalRequest.id, 'REJECTED', undefined, true)
+      const realTaskId = approvalRequest.taskId
+
+      // **より新しい** 別 action の REJECTED を、同じ commit/diff で足す。
+      await new Promise((r) => setTimeout(r, 5))
+      const other = storage.approvalRequests.create({
+        taskId: realTaskId,
+        targetBranch: approvalRequest.targetBranch,
+        targetCommit: approvalRequest.targetCommit,
+        targetDiffHash: approvalRequest.targetDiffHash,
+        riskLevel: 'HIGH',
+        requestedAction: 'test',
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        changedFiles: [],
+        triggeredRules: [],
+        invalidIf: [],
+      } as never)
+      storage.approvalRequests.updateStatus(other.id, 'REJECTED', undefined, true)
+      const before = storage.approvalRequests.findByTaskId(realTaskId).length
+
+      const freshCommitJob = storage.jobs.create({
+        taskId: realTaskId,
+        projectId: 'gate-project-001',
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: {
+          kind: 'git_commit',
+          workingDir: '/workspace/target',
+          params: { commitMessage: 'same work again' },
+        },
+      } as never)
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...REJECTED_PAYLOAD,
+        taskId: realTaskId,
+        jobId: freshCommitJob.id,
+        targetCommit: approvalRequest.targetCommit,
+        targetDiffHash: approvalRequest.targetDiffHash,
+      })
+
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('REJECTED')
+      expect(storage.approvalRequests.findByTaskId(realTaskId)).toHaveLength(before)
+      expect(
+        storage.approvalRequests.findByTaskId(realTaskId)
+          .filter((r) => r.status === 'WAITING_FOR_USER'),
+      ).toHaveLength(0)
+    })
+  })
+
   // F. diff が変われば従来どおり新しい承認依頼を作れる（実装を直せば前へ進める）
   it('F. a changed diff is allowed to create a new approval request', async () => {
     await withApp(async (app) => {
