@@ -1758,15 +1758,37 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       乗せる。これで `resume implement → post-implement review → git_commit → Gate → Approval` の
       既存 chain へ戻る。
 
-      > **必ず決めること（実装前に CEO 判断が要る）**: 上記の期待 chain は
-      > `review:<reviewJobId>:git-commit` から始まるが、**c3849205 の現在の latest Job は
-      > `5472d0c1` で `workflowStepKey = resume:7061400a-...:1` である**
-      > （初回の Human Resume が既に1段作ってしまったため）。
-      > 期待 chain を厳密に実装すると **本件の当該 Task では fail-closed になり復旧できない**。
-      > 解決には `resume:<gitCommitJobId>:1` を1ホップ辿ってから上記 chain に入る必要がある。
-      > これは推測ではなく**同じ `workflowStepKey` 規約を明示的に辿るだけ**なので
-      > 「新しい fallback 探索」には当たらないと考えるが、CEO の指定 chain の拡張にあたるため
-      > **独断で広げず、ここに明記して判断を仰ぐ**。
+      **【`resume:` 1ホップの正規化 —— CEO 承認済み・2026-09-23】**
+
+      上記の期待 chain は `review:<reviewJobId>:git-commit` から始まるが、**c3849205 の現在の
+      latest Job は `5472d0c1` で `workflowStepKey = resume:7061400a-...:1` である**
+      （初回の Human Resume が既に1段作ってしまったため）。期待 chain を厳密に実装すると
+      **当該 Task では fail-closed になり復旧できない**。
+
+      そこで `resume:` を **1段だけ正規化する**ことを CEO が承認した。
+      **これは fallback 探索ではなく、既存 `workflowStepKey` の1段正規化である。**
+      **許可される形は次の7条件をすべて満たす場合のみ**:
+
+      1. latest Job が `git_commit`
+      2. `workflowStepKey = resume:<sourceJobId>:1` なら `sourceJobId` を **1回だけ**辿る
+      3. source Job が**同一 Task / Project** の `git_commit`
+      4. source Job の `workflowStepKey` が `review:<reviewJobId>:git-commit`
+      5. review Job が**同一 Task / Project** で、`workflowStepKey` が `implement:<implementJobId>:review`
+      6. implement Job が**同一 Task / Project** かつ `aiCliMode = implement`
+      7. provider 等、再実行に必要な既存情報が揃っている
+
+      **どこか1つでも不成立なら fail-closed。**
+
+      **禁止（実装してはならない）**:
+      - **2段以上の `resume:` traversal**
+      - **recursive ancestry resolver**
+      - **「最新 implement Job」の推測**
+      - **複数候補からの選択**
+      - **`workflowStepKey` 以外を使った fallback 探索**
+
+      なお latest Job が最初から `review:<reviewJobId>:git-commit` の場合は、
+      条件2 を飛ばして 4 以降をそのまま適用する（`resume:` 正規化は**任意の1段**であり、
+      必須の前置きではない）。
 
       **2. Design Review gate は既存経路をそのまま使う**
 
