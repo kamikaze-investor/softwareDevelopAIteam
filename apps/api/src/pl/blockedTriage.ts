@@ -325,6 +325,15 @@ interface Facts {
   taskJobs: readonly Job[]
   approvalStatus?: string
   approvalId?: string
+  /**
+   * **最新の承認行**の status（status を問わず `created_at` 最新の1件）。
+   *
+   * `approvalStatus` は `findActiveByTaskId()` 由来で `WAITING_FOR_USER` / `APPROVED` しか
+   * 返さないため、**`REJECTED` が見えない**。却下されたかどうかを判定するにはこちらを使う。
+   * これは `resumeBlockedTask()` が見ている行と同じ定義であり、**triage の案内と
+   * endpoint の挙動を同じ事実に基づかせる**ためにわざと揃えてある。
+   */
+  latestApprovalStatus?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -334,6 +343,9 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
   const taskJobs = item.taskId !== undefined ? storage.jobs.findByTaskId(item.taskId) : []
   const approval =
     item.taskId !== undefined ? storage.approvalRequests.findActiveByTaskId(item.taskId) : undefined
+  // `findByTaskId()` は created_at DESC なので [0] が最新。`resumeBlockedTask()` と同じ行を見る。
+  const latestApproval =
+    item.taskId !== undefined ? storage.approvalRequests.findByTaskId(item.taskId)[0] : undefined
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -345,6 +357,7 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     ...(job !== undefined ? { job } : {}),
     taskJobs,
     ...(approval !== undefined ? { approvalStatus: approval.status, approvalId: approval.id } : {}),
+    ...(latestApproval !== undefined ? { latestApprovalStatus: latestApproval.status } : {}),
     ...(review !== undefined ? { review } : {}),
     ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
       ? { alignedEvidenceId: evidence.id }
@@ -763,7 +776,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   //
   // 「承認行が存在すること」を条件にしない。実測（2026-09-15 production）で復旧不能になったのは
   // まさに承認行が実質使えない状態であり、そこを条件にすると復旧対象そのものを外す。
+  //
+  // **ただし `REJECTED` だけは AI に自動実行させない。** STALE / EXPIRED / 未発行は
+  // 「人の判断が一度も下っていない」状態なので同じ diff で新サイクルを始めてよいが、
+  // `REJECTED` は **CEO が明示的に却下した**状態である。そこを自動 resume の対象にすると、
+  // PL が `DEFAULT_RESUME_INSTRUCTION` で却下済みの内容を再開しようとする
+  // （2026-09-23 production で、人の REJECT が同一 diff の承認待ちへ戻った）。
+  // `rootCauseClass` は増やさず、既存 schema の値だけで
+  // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
   if (facts.job?.status === 'blocked' && !hasLiveJob(facts)) {
+    const ceoRejected = facts.latestApprovalStatus === 'REJECTED'
     return {
       ...result,
       rootCauseClass: 'approval_not_actionable',
@@ -772,17 +794,23 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
         {
           fact: 'approval_request.status',
           ...(facts.approvalId !== undefined ? { id: facts.approvalId } : {}),
-          value: facts.approvalStatus ?? 'none',
+          value: facts.latestApprovalStatus ?? facts.approvalStatus ?? 'none',
         },
         { fact: 'job.status', id: facts.job.id, value: 'blocked' },
       ],
-      recoverable: true,
+      // **却下は「復旧できない」ではなく「AI が勝手に復旧してはいけない」。**
+      // 経路自体は存在するので `existingRecoveryAvailable` は true のままにし、
+      // `recoverable` を false にして自動レーンから外す。
+      recoverable: !ceoRejected,
       existingRecoveryAvailable: true,
       confidence: 'high',
-      recommendedLane: 'auto_recovery',
-      summary:
-        `承認が ${facts.approvalStatus ?? '未発行'} で、その行では誰も進められない。`
-        + '既存 resume は新しい承認サイクルを開始する（古い承認を再利用しない）。',
+      recommendedLane: ceoRejected ? 'ceo_escalation' : 'auto_recovery',
+      summary: ceoRejected
+        ? 'CEO が明示的に却下したため、同一内容を自動再開してはならない。'
+          + '実装修正指示を伴う Human Resume が必要（それは却下された commit を作り直さず、'
+          + '修正指示を載せた implement Job へ戻す）。'
+        : `承認が ${facts.latestApprovalStatus ?? facts.approvalStatus ?? '未発行'} で、その行では誰も進められない。`
+          + '既存 resume は新しい承認サイクルを開始する（古い承認を再利用しない）。',
     }
   }
 

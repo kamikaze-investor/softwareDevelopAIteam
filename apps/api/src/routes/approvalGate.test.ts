@@ -1160,6 +1160,97 @@ describe('POST /api/gate/check', () => {
 //   continuationPolicy/nextAction文言で表現する）
 // ────────────────────────────────────────────────────────────
 
+// ────────────────────────────────────────────────────────────
+// REJECT された diff を、同じ内容のまま新しい ApprovalRequest へ置き換えない
+// （2026-09-23 production: CEO の REJECT が3分後に同一 target_commit /
+//  target_diff_hash / changed_files の WAITING_FOR_USER として戻ってきた）。
+//
+// 穴は `findRelevantRejectedRequest()` の呼び出し条件が
+// `!requiresApprovalByPolicy` だったこと ——  requiresApprovalByPolicy は
+// `requestedAction === 'git_commit'` そのものなので、**git_commit のときだけ**
+// 過去 REJECTED の探索が丸ごと skip されていた。
+// ────────────────────────────────────────────────────────────
+describe('POST /api/gate/check — a rejected git_commit diff is not re-approved', () => {
+  const REJECTED_PAYLOAD = {
+    ...BASE_GATE_PAYLOAD,
+    requestedAction: 'git_commit',
+    changedFiles: ['docs/README.md'],
+  }
+
+  // E. 同一 diff → outcome=REJECTED / 新 ApprovalRequest 0 件 / commit 不可
+  it('E. the same diff is rejected and no new approval request is created', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-rejected-same-diff'
+      const { approvalRequest } = await startGitCommitApproval(app, taskId)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.approvalRequests.updateStatus(approvalRequest.id, 'REJECTED', undefined, true)
+      const realTaskId = approvalRequest.taskId
+      const before = storage.approvalRequests.findByTaskId(realTaskId).length
+
+      // 新しい git_commit Job が、**同じ commit / diff** で Gate を叩く。
+      const { statusCode, body } = await gateCheck(app, {
+        ...REJECTED_PAYLOAD,
+        taskId,
+        targetCommit: approvalRequest.targetCommit,
+        targetDiffHash: approvalRequest.targetDiffHash,
+      })
+
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe('REJECTED')
+      // **新しい承認依頼を作っていない** = CEO の却下が洗浄されない。
+      // （応答は既存の REJECTED 行をそのまま返すので undefined にはならない。
+      //   守るべきなのは「承認待ちが増えないこと」である。）
+      expect(storage.approvalRequests.findByTaskId(realTaskId)).toHaveLength(before)
+      expect(
+        storage.approvalRequests.findByTaskId(realTaskId)
+          .filter((r) => r.status === 'WAITING_FOR_USER'),
+      ).toHaveLength(0)
+      // commit へ進む指示にならない。
+      expect(body.nextAction.action).not.toBe('continue')
+    })
+  })
+
+  // F. diff が変われば従来どおり新しい承認依頼を作れる（実装を直せば前へ進める）
+  it('F. a changed diff is allowed to create a new approval request', async () => {
+    await withApp(async (app) => {
+      const taskId = 'gate-rejected-changed-diff'
+      const { approvalRequest } = await startGitCommitApproval(app, taskId)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.approvalRequests.updateStatus(approvalRequest.id, 'REJECTED', undefined, true)
+      const realTaskId = approvalRequest.taskId
+      const before = storage.approvalRequests.findByTaskId(realTaskId).length
+
+      // 実装を直すと **新しい git_commit Job** が作られる（同じ Job の再 check ではない）。
+      const freshCommitJob = storage.jobs.create({
+        taskId: realTaskId,
+        projectId: 'gate-project-001',
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: {
+          kind: 'git_commit',
+          workingDir: '/workspace/target',
+          params: { commitMessage: 'after fix' },
+        },
+      } as never)
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...REJECTED_PAYLOAD,
+        taskId: realTaskId,
+        jobId: freshCommitJob.id,
+        targetCommit: 'commit-after-fix',
+        targetDiffHash: 'diff-after-fix',
+      })
+
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).not.toBe('REJECTED')
+      expect(body.approvalRequest).toBeDefined()
+      expect(storage.approvalRequests.findByTaskId(realTaskId).length).toBeGreaterThan(before)
+    })
+  })
+})
+
 describe('POST /api/gate/check — git_commit requiresApprovalByPolicy', () => {
   const GIT_COMMIT_PAYLOAD = {
     ...BASE_GATE_PAYLOAD,

@@ -1,5 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import { describe, expect, it, vi } from 'vitest'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildResumeAiCliPrompt } from './tasks'
 import type { ApprovalRequest, Job, Project, Task } from '@ai-team/shared'
 
 /**
@@ -87,6 +89,107 @@ const HOUR = 60 * 60 * 1000
  * route (`POST /api/gate/check`) は `computeExpiresAt()` でサーバー計算するため過去日時を
  * 作れない。ここは storage の `createForJob` を直接呼び、`expiresAt` を与えて再現する。
  */
+/**
+ * `implement → review → git_commit` の完全な workflow chain を作る。
+ *
+ * `resumeBlockedTask()` は REJECTED の git_commit から source implement Job を
+ * **`workflowStepKey` だけ**で逆引きするので、chain が無い fixture では
+ * 意図的に fail-closed になる。A / B の differentiator はここである。
+ *
+ * `withResumeHop` は、初回 Human Resume が既に1段作ってしまった production の形
+ * （c3849205 の `resume:<gitCommitJobId>:1`）を再現する。
+ */
+async function createRejectedGitCommitChain(
+  task: Task,
+  options: { withResumeHop?: boolean; alignedEvidenceFor?: string } = {},
+): Promise<{ implementJob: Job; gitCommitJob: Job; latestJob: Job; approval: ApprovalRequest }> {
+  const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
+  const base = { taskId: task.id, projectId: task.projectId, agentRole: 'developer_ai' as const }
+  const tick = async (): Promise<void> => { await new Promise((r) => setTimeout(r, 5)) }
+
+  const implementJob = storage.jobs.create({
+    ...base,
+    status: 'success',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target', params: {} },
+    aiCliProvider: 'claude_code',
+    aiCliMode: 'implement',
+    aiCliPrompt: 'original implementation prompt',
+    workflowStepKey: `task:${task.id}:initial-implement`,
+  } as never)
+  await tick()
+
+  const reviewJob = storage.jobs.create({
+    ...base,
+    status: 'success',
+    safeCommand: { kind: 'git_status', workingDir: '/workspace/target', params: {} },
+    aiCliProvider: 'claude_code',
+    aiCliMode: 'review',
+    workflowStepKey: `implement:${implementJob.id}:review`,
+  } as never)
+  await tick()
+
+  const gitCommitJob = storage.jobs.create({
+    ...base,
+    status: 'blocked',
+    safeCommand: {
+      kind: 'git_commit',
+      workingDir: '/workspace/target',
+      params: { commitMessage: 'rejected work' },
+    },
+    workflowStepKey: `review:${reviewJob.id}:git-commit`,
+  } as never)
+  await tick()
+
+  // 初回 Human Resume が作ってしまう1段（production の c3849205 と同じ形）。
+  const latestJob = options.withResumeHop === true
+    ? storage.jobs.create({
+      ...base,
+      status: 'blocked',
+      safeCommand: {
+        kind: 'git_commit',
+        workingDir: '/workspace/target',
+        params: { commitMessage: 'rejected work' },
+      },
+      workflowStepKey: `resume:${gitCommitJob.id}:1`,
+    } as never)
+    : gitCommitJob
+
+  const created = storage.approvalRequests.createForJob(
+    {
+      taskId: task.id,
+      targetBranch: 'master',
+      targetCommit: 'commit-rejected',
+      targetDiffHash: 'diff-rejected',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      invalidIf: [],
+    },
+    latestJob.id,
+  )
+  if (!created.ok) throw new Error(`failed to seed approval: ${created.reason}`)
+  storage.approvalRequests.updateStatus(created.approvalRequest.id, 'REJECTED', undefined, true)
+
+  // **Design Review gate は迂回しない**（要件2）。実運用では route の
+  // `DESIGN_REVIEW_PRECONDITION_FAILED` → `createAndExecuteDesignReview()` → 再試行 が
+  // これを埋める。ここではその成立後の状態を作る（gate 自体を無効化していない —— 
+  // seed しない場合に 409 で止まることは別テストで固定してある）。
+  if (options.alignedEvidenceFor !== undefined) {
+    storage.designReviewEvidence.create({
+      taskId: task.id,
+      designTextHash: computeDesignTextHash(buildResumeAiCliPrompt(task, options.alignedEvidenceFor)),
+      reviewLoad: 'medium',
+      decision: 'ALIGNED',
+      independentReviewRequired: false,
+    })
+  }
+  const approval = storage.approvalRequests.findById(created.approvalRequest.id) as ApprovalRequest
+
+  return { implementJob, gitCommitJob, latestJob, approval }
+}
+
 async function createBlockedGitCommitJobWithWaitingApproval(
   task: Task,
   expiresInMs: number,
@@ -173,11 +276,15 @@ async function createBlockedAiCliJobWithWaitingApproval(
   return { job, approval }
 }
 
-async function resumeTask(app: FastifyInstance, taskId: string): Promise<{ statusCode: number; body: unknown }> {
+async function resumeTask(
+  app: FastifyInstance,
+  taskId: string,
+  instruction = '期限切れ承認により blocked のままの git_commit Job を復旧する',
+): Promise<{ statusCode: number; body: unknown }> {
   const res = await app.inject({
     method: 'POST',
     url: `/api/tasks/${taskId}/resume`,
-    payload: { instruction: '期限切れ承認により blocked のままの git_commit Job を復旧する' },
+    payload: { instruction },
   })
   return { statusCode: res.statusCode, body: parseBody(res.body) }
 }
@@ -396,17 +503,105 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
     })
   })
 
-  it('7b. a REJECTED approval still allows resume exactly as before', async () => {
+  // **旧 7b は「REJECTED でも従来どおり resume できる」を固定していた。**
+  // それは 2026-09-23 の production 事故そのもの —— CEO が却下した diff が、3分後に同一
+  // `target_commit` / `target_diff_hash` / `changed_files` の新規 WAITING_FOR_USER として
+  // 戻ってきた —— なので REJECTED だけ意味を更新する。
+  // **EXPIRED / STALE / APPROVED の期待値（7 / 7c / 8 等）は変更していない。**
+
+  // A. REJECTED git_commit + 修正指示 → 新 git_commit を作らず implement へ戻す
+  it('7b. a REJECTED git_commit returns to implement instead of recreating the commit', async () => {
     await withApp(async (app) => {
       const project = await createProject()
       const task = await createTask(project.id)
-      const { approval } = await createBlockedGitCommitJobWithWaitingApproval(task, 30 * 60 * 1000)
-
+      const instruction = 'findings 1-5 を直してから再提出すること'
+      const { implementJob, gitCommitJob } = await createRejectedGitCommitChain(task, { alignedEvidenceFor: instruction })
       const { getStorage } = await import('../storage/index.js')
-      getStorage().approvalRequests.updateStatus(approval.id, 'REJECTED', undefined, true)
+      const storage = getStorage()
+      const before = storage.jobs.findByTaskId(task.id).length
 
-      const { statusCode } = await resumeTask(app, task.id)
+      const { statusCode, body } = await resumeTask(app, task.id, instruction)
+
       expect(statusCode).toBe(201)
+      const created = body as Job
+      // **新しい git_commit を作っていない。**
+      expect(created.safeCommand.kind).not.toBe('git_commit')
+      expect(created.aiCliMode).toBe('implement')
+      // 修正指示が実際に prompt へ載っている。
+      expect(created.aiCliPrompt).toContain('findings 1-5 を直してから再提出すること')
+      // source implement Job の実行情報を再利用している。
+      expect(created.aiCliProvider).toBe(implementJob.aiCliProvider)
+      // 既存 resume 規約に乗っている（post-implement review が自動生成される条件）。
+      expect(created.workflowStepKey).toBe(`resume:${gitCommitJob.id}:1`)
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before + 1)
+    })
+  })
+
+  // A'. production と同じ形（初回 Human Resume が `resume:` を1段作った後）でも戻せる
+  it('7b-i. one resume: hop is normalized, so the production shape still recovers', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { implementJob, latestJob } = await createRejectedGitCommitChain(task, { withResumeHop: true, alignedEvidenceFor: '修正指示' })
+
+      const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
+
+      expect(statusCode).toBe(201)
+      const created = body as Job
+      expect(created.aiCliMode).toBe('implement')
+      expect(created.aiCliProvider).toBe(implementJob.aiCliProvider)
+      expect(created.workflowStepKey).toBe(`resume:${latestJob.id}:1`)
+    })
+  })
+
+  // B. chain が壊れていれば fail-closed（推測で implement Job を選ばない）
+  it('7b-ii. a broken provenance chain fails closed instead of guessing', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      // chain の無い git_commit（`workflowStepKey` 自体が無い）。
+      const { approval } = await createBlockedGitCommitJobWithWaitingApproval(task, 30 * 60 * 1000)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.approvalRequests.updateStatus(approval.id, 'REJECTED', undefined, true)
+      const before = storage.jobs.findByTaskId(task.id).length
+
+      const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
+
+      expect(statusCode).toBe(409)
+      expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
+      // **Job を1件も作っていない。**
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
+    })
+  })
+
+  // B'. 2段以上の resume: traversal は許さない
+  it('7b-iii. a second resume: hop is not traversed', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { latestJob } = await createRejectedGitCommitChain(task, { withResumeHop: true })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      // もう1段積む（`resume: → resume: → ...`）。
+      await new Promise((r) => setTimeout(r, 5))
+      storage.jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: {
+          kind: 'git_commit',
+          workingDir: '/workspace/target',
+          params: { commitMessage: 'rejected work' },
+        },
+        workflowStepKey: `resume:${latestJob.id}:1`,
+      } as never)
+
+      const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
+
+      expect(statusCode).toBe(409)
+      expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
     })
   })
 

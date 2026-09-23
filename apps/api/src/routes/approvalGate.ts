@@ -500,7 +500,21 @@ export async function approvalGateRoutes(
       }
     }
 
-    if (!existingReq && !requiresApprovalByPolicy) {
+    // **却下済み判定の探索は git_commit でも行う。**
+    //
+    // 以前はここが `!requiresApprovalByPolicy` 条件付きで、`requiresApprovalByPolicy` は
+    // `requestedAction === 'git_commit'` そのものだった —— つまり
+    // **git_commit のときだけこの探索が丸ごと skip され**、linked approval が無ければ
+    // Task の過去 REJECTED を見ずに新しい ApprovalRequest を発行できた。
+    // 2026-09-23 production: CEO が却下した diff が、3分後に同一
+    // `target_commit` / `target_diff_hash` / `changed_files` の新規 WAITING_FOR_USER として
+    // 戻ってきた。守るべき不変条件は
+    // **「CEO が REJECT したのと同一 diff を、そのまま新しい ApprovalRequest に置き換えない」**。
+    //
+    // `requestedAction` 違いの誤再利用は下の `existingReqForOutcome` が従来どおり弾くので、
+    // ここは探索を通すだけでよい。**`jobs.ts` 側へ diff hash 判定を重複実装しない** ——
+    // diff identity の正本はこの Gate にある。
+    if (!existingReq) {
       existingReq = findRelevantRejectedRequest(
         storage.approvalRequests.findByTaskId(taskId),
         targetCommit,

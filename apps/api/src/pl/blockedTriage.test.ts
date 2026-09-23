@@ -402,6 +402,69 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(diagnosis.recommendedLane).toBe('auto_recovery')
     expect(diagnosis.existingRecoveryAvailable).toBe(true)
   })
+
+  // G. CEO が明示的に却下したものは、AI の自動復旧レーンから外す。
+  //
+  // STALE / EXPIRED / 未発行 は「人の判断が一度も下っていない」ので同じ diff で
+  // 新しい承認サイクルを始めてよい。`REJECTED` は**人が拒否した**のだから、
+  // PL が `DEFAULT_RESUME_INSTRUCTION` で自動再開してはならない
+  // （2026-09-23 production: 人の REJECT が同一 diff の承認待ちへ戻った）。
+  const seedBlockedGitCommitWithApproval = (status: 'REJECTED' | 'EXPIRED'): IStorage => {
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { stderr: 'blocked: approval required' } as Parameters<IStorage['jobs']['update']>[1])
+    const created = storage.approvalRequests.createForJob({
+      taskId,
+      targetBranch: 'master',
+      targetCommit: 'c',
+      targetDiffHash: 'd',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 1800_000).toISOString(),
+      invalidIf: [],
+    } as never, job.id)
+    if (!created.ok) throw new Error('failed to seed approval')
+    storage.approvalRequests.updateStatus(created.approvalRequest.id, status, undefined, true)
+    storage.tasks.update(taskId, { status: 'blocked' })
+    return storage
+  }
+
+  it('G. CEO が REJECT した blocked Job は CEO_ESCALATION（自動 resume の対象にしない）', () => {
+    const storage = seedBlockedGitCommitWithApproval('REJECTED')
+
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'job_blocked'))
+
+    // rootCauseClass は増やさず、既存 schema の値だけで意味を表す。
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+    expect(diagnosis.recoverable).toBe(false)
+    // 経路自体は存在する（人が指示を添えれば resume できる）。
+    expect(diagnosis.existingRecoveryAvailable).toBe(true)
+    expect(diagnosis.summary).toContain('却下')
+
+    // **PL は resume_task を提案できない。** 既存 `triageAllowedActions()` が
+    // auto_recovery 以外を escalate_to_ceo だけに絞るので、新しい Gate は要らない。
+    const allowed = triageAllowedActions(diagnosis, ['resume_task', 'retry_job', 'escalate_to_ceo'])
+    expect(allowed).not.toContain('resume_task')
+    expect(allowed).not.toContain('retry_job')
+    expect(allowed).toEqual(['escalate_to_ceo'])
+  })
+
+  it('G. EXPIRED は従来どおり AUTO_RECOVERY のまま（resume_task を残す）', () => {
+    const storage = seedBlockedGitCommitWithApproval('EXPIRED')
+
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'job_blocked'))
+
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+    expect(diagnosis.recoverable).toBe(true)
+    const allowed = triageAllowedActions(diagnosis, ['resume_task', 'retry_job', 'escalate_to_ceo'])
+    expect(allowed).toContain('resume_task')
+  })
 })
 
 // ────────────────────────────────────────────────────────────
