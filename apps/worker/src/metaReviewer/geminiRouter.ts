@@ -209,6 +209,29 @@ const PROVIDER_USAGE_LIMIT_PATTERN = new RegExp(
   'i',
 )
 
+/**
+ * **前払い credit の枯渇**を示す文言。`quota` と同じ「使い切った」状態である。
+ *
+ * 2026-09-23 実測: Gemini API が
+ * `[402 Payment Required] Your prepayment credits are depleted.` を返したとき、
+ * `QUOTA_PATTERN`（429 / RESOURCE_EXHAUSTED / quota exceeded / rate limit）にも
+ * `PROVIDER_USAGE_LIMIT_PATTERN` にも当たらず `unknown` になった。その結果
+ * `metaReviewFallbackRouter` の Copilot 段（`{quota, transient}` のみ対象）が発火せず、
+ * **subscription 側の代替レビュアーが在るのに Meta Review が blocked で止まった**。
+ *
+ * **status code だけでは分類しない。** 402 は与信失敗・支払い方法未設定など別の
+ * payment error も表すので、bare 402 は `unknown` のまま fail-closed にする。
+ * ここで拾うのは provider が**明示的に枯渇と言っている**文言だけである。
+ */
+const CREDIT_EXHAUSTION_PATTERN = new RegExp(
+  [
+    String.raw`credits?\s+(?:are|is|have been|has been)\s+(?:depleted|exhausted)`,
+    String.raw`(?:out of|insufficient|no remaining)\s+credits?`,
+    String.raw`credit balance is too low`,
+  ].join('|'),
+  'i',
+)
+
 /** 4分類の判定。quota → transient → auth_or_config → unknown の優先順で確定させる。 */
 export function classifyFailure(opts: {
   text: string
@@ -217,7 +240,15 @@ export function classifyFailure(opts: {
   timedOut?: boolean
 }): FailureClass {
   const { text, httpStatus, exitCode, timedOut } = opts
-  if (httpStatus === 429 || QUOTA_PATTERN.test(text) || PROVIDER_USAGE_LIMIT_PATTERN.test(text)) return 'quota'
+  if (
+    httpStatus === 429 ||
+    QUOTA_PATTERN.test(text) ||
+    PROVIDER_USAGE_LIMIT_PATTERN.test(text) ||
+    // 前払い credit 枯渇も「使い切った」なので quota と同じ扱いにする（文言一致のみ）。
+    CREDIT_EXHAUSTION_PATTERN.test(text)
+  ) {
+    return 'quota'
+  }
   if (
     timedOut === true ||
     (httpStatus !== undefined && [500, 502, 503, 504].includes(httpStatus)) ||

@@ -9368,6 +9368,25 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - PL に「transient 起因なら再kickしてよい」と判断させる場合、**PL の自己申告ではなく
         記録された `failureClass` を根拠にする**こと
 
+      **分類精度の実測（2026-09-23・本項目へ統合。新規 item は作らない）**: 同じ
+      `failureClass` 機構で、**枯渇なのに `unknown` と分類される穴**が見つかった。
+      Gemini API が `[402 Payment Required] Your prepayment credits are depleted.` を返したとき、
+      `QUOTA_PATTERN`（429 / RESOURCE_EXHAUSTED / quota exceeded / rate limit）にも
+      `PROVIDER_USAGE_LIMIT_PATTERN` にも当たらず `unknown` になり、
+      `metaReviewFallbackRouter` の Copilot 段（`{quota, transient}` のみ対象）が発火しなかった。
+      **subscription 側の代替レビュアーが在るのに Meta Review が blocked で止まった**
+      （PR #274 の Meta Reviewer check が red になった直接原因）。
+
+      修正は分類のみ: 明示的に枯渇を示す文言（`credits are depleted` 等）を `quota` として
+      扱い、既存 Copilot 段へ繋ぐ。**status code だけでは分類しない** —— 402 は与信失敗や
+      支払い方法未設定も表すので、bare 402 と枯渇を示さない payment error は `unknown` のまま
+      fail-closed にする。`COPILOT_ELIGIBLE_FAILURE_CLASSES` も新しい failure class も
+      新しい fallback 段も追加していない。
+
+      なお CI runner に `agy` は**元から入っていない**（`meta-review.yml` が install するのは
+      `pnpm` と `@github/copilot` だけ）。`agy is not available on PATH` は CI では
+      設計どおりの skip であって drift ではない —— `agy` は VPS 側の CLI である。
+
 <!-- roadmap:id=design-review-runner-production-timeout state=planned -->
 2. [ ] **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）** — 2026-09-14登録。
       **盲目的に re-kick しないこと**（CEO 指示）。
