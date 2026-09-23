@@ -1662,9 +1662,78 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **止まった場所**: commit は発生していない（この Task の全 Job で `commit_hash = null`）。
       Approval Gate が git_commit Job を `blocked` のまま保持した。
       **CEO 判断（2026-09-23）: この `git_commit` ApprovalRequest は REJECT する。**
-      先行 negative を後続 approved で上書きしないためであり、復旧は旧 negative の 5 findings を
-      修正指示として使う既存 Human Resume で行う（それは新しい `human_resume` generation であり、
-      旧 `human_recovery` generation の attempt 3 ではない）。
+      先行 negative を後続 approved で上書きしないためである。
+      ~~復旧は旧 negative の 5 findings を修正指示として使う既存 Human Resume で行う~~
+      —— **この復旧計画は成立しないことが実測で判明した（下記「REJECT が Human Resume で
+      洗浄される」参照）。** 修正指示は `resumeBlockedTask()` に届かない。
+
+      **【2026-09-23 追記: REJECT が Human Resume で洗浄される（production 実測）】**
+
+      REJECT 後に既存 Human Resume を使ったところ、**CEO の REJECT が3分で
+      バイト単位に同一の新規承認待ちへ差し替わった**。production DB で実測:
+
+      | approval | created | target_commit | target_diff_hash | changed_files |
+      |---|---|---|---|---|
+      | **REJECTED**（CEO 判断 06:57:51） | 05:35:54 | `00ac82b96f` | `b3c9b6b9d48932f7` | 2 |
+      | **WAITING_FOR_USER**（新規） | 07:00:41 | `00ac82b96f` | `b3c9b6b9d48932f7` | 2 |
+
+      **target_commit / target_diff_hash / changed_files がすべて一致**する。
+      REJECT（06:57:51）以降に作られた Job は `5472d0c1`（`kind=git_commit`、07:00:37）**1件だけ**で、
+      **implement Job は1件も無い＝実装は1行も変わっていない**。
+
+      **機構上の原因**（`apps/api/src/storage/sqlite.ts` `resumeBlockedTask()`）:
+
+      1. 承認ガードは **未期限 `WAITING_FOR_USER` しか拒否しない**。
+         `REJECTED` は素通りする（`latestApproval?.status === 'WAITING_FOR_USER' && 未期限`）
+      2. その直後の `if (latestJob.safeCommand.kind === 'git_commit')` 分岐が
+         **AI CLI 経路より手前で return する**
+      3. この分岐は `instructionPrompt` を**一度も読まない**。
+         `safeCommand: { ...latestJob.safeCommand }` で**同じ commit をそのまま再生成**する
+      4. 新 Job の `/gate/check` が、同一 diff に対して**新しい ApprovalRequest を発行**する
+
+      つまり `POST /api/tasks/:id/resume` に修正指示を渡しても、
+      **指示は黙って捨てられ、REJECT された差分がそのまま承認待ちへ戻る**。
+      CEO が再度 REJECT しても同じことが起きるので、**出口の無い洗浄ループ**になる。
+
+      **これは EXPIRED / STALE 向けの設計が `REJECTED` にも当てはまると仮定していた誤り**である。
+      `expired-approval-blocks-resume` が根拠にしたのは「期限切れ行を `EXPIRED` へ進める actor が
+      居ない」ことで、**人の判断は一度も下っていない**ケースだった。そこでは
+      「同じ差分で新しい承認サイクルを始める」のは正しい。`REJECTED` は
+      **人が明示的に拒否した**のだから、同じ差分の再提出は起きてはならない。
+
+      **`triageBlocked()` の前提とも矛盾する。**
+      `apps/api/src/pl/blockedTriage.ts` の rule 7 は
+      「承認行が STALE / EXPIRED / **REJECTED** でも…進め方は同じ1つ —— 既存 resume が
+      新しい承認サイクルを始める」として `approval_not_actionable` に分類する。
+      機構としては正しいが、**`REJECTED` については CEO をこの洗浄経路へ案内してしまう**。
+      加えて triage は「先に実装を直せ」を表現できない —— resume が指示を捨てるため。
+
+      **既存機構だけで正しい経路を作れるか（調査結果・実装はまだしない）**:
+      - `/recover`（Human Recovery）: `TASK_HAS_JOBS` で拒否（Job 13 件）。現在は
+        `APPROVAL_WAITING` にも該当。**使えない**
+      - `abort_task`（park）: `status === 'pending'` を要求。Task は `blocked` なので
+        `TASK_NOT_PARKABLE`。**使えない**
+      - repair flow: Job の失敗が起点であり、**承認の却下は起点にならない**
+      - `revertBlockedJobChanges()`: Worker 側の guard 違反時の掃除で API route が無い。
+        そもそも**この Task は1度も commit していない**（全 Job で `commit_hash = null`）ので
+        「commit を捨てる」対象は存在しない。**dirty worktree が実装を保持しているだけ**
+
+      → **新しい route / status / workflow は要らない。** 必要なのは既存経路の最小修正2点:
+      1. `resumeBlockedTask()` の `git_commit` 分岐で、**修正指示が与えられている（または
+         直近承認が `REJECTED`）ときは、同じ commit を作り直さず implement Job を作る**。
+         dirty worktree はそのまま残っているので、implement Job がその場で実装を直せる
+         ＝これが「commit を捨て、実装修正へ戻る」の実体である。
+         下流 Gate（design review evidence / `/gate/check` / 承認）は現状のまま効かせる
+      2. **`REJECTED` 承認と同一 `target_diff_hash` の `git_commit` Job 生成を fail-closed で拒否**する。
+         既存列をそのまま使い、新テーブルは作らない
+
+      **本項目へ統合した理由**: 守るべき不変条件が同じ —— **一度下された否定的判定を、
+      対象を変えずに再実行するだけで消してはならない**。本項目は review verdict 側の、
+      この追記は approval 側の、同じ穴である。
+
+      **運用上の注意（未修正のあいだ）**: c3849205 には現在
+      **REJECT 済み差分と同一の `WAITING_FOR_USER` 承認が生きている。承認してはならない。**
+      再 REJECT してもまた同じものが生成される。修正が入るまで resume を使わない。
 
       **併せて記録すべき脆さ**: requeue は同じ Job 行を再実行するため、DB の `stdout` も
       task-scoped / job-scoped 両方のログも上書きされた。**先行 negative の証拠が残ったのは
