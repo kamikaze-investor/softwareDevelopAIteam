@@ -2196,8 +2196,77 @@ describe('structured review contract', () => {
     ['missing summary', { status: 'approved', findings: [] }],
     ['extra top-level field', { ...approved, verdict: 'approved' }],
     ['extra finding field', { ...approved, findings: [{ severity: 'low', message: 'note', extra: true }] }],
+    // **optional field の `null` は「値なし」だが、型違いは従来どおり弾く。**
+    ['rule of the wrong type', { ...approved, findings: [{ severity: 'low', message: 'note', rule: 123 }] }],
+    ['file of the wrong type', { ...approved, findings: [{ severity: 'low', message: 'note', file: {} }] }],
+    ['line as a string', { ...approved, findings: [{ severity: 'low', message: 'note', line: '12' }] }],
+    // **required field の `null` は緩めない。** 正規化は optional field だけである。
+    ['null severity', { ...approved, findings: [{ severity: null, message: 'note' }] }],
+    ['null message', { ...approved, findings: [{ severity: 'low', message: null }] }],
+    ['empty message', { ...approved, findings: [{ severity: 'low', message: '' }] }],
+    ['null status', { ...approved, status: null }],
+    ['null summary', { ...approved, summary: null }],
+    ['null findings', { ...approved, findings: null }],
   ])('rejects %s', (_label, value) => {
     expect(parseStructuredReviewOutput(JSON.stringify(value))).toBeUndefined()
+  })
+
+  // **production 実測形（2026-09-23・Task `c3849205` / review Job `65eefbd1`）。**
+  // reviewer が finding に `"rule": null` を出力し、`z.string().optional()` が弾いて
+  // `Structured review output failed strict schema validation (fail-closed)` で exit 1、
+  // **verdict が1行も保存されないまま**止まった。省略と `null` は契約上どちらも「値が無い」。
+  it('treats a null rule as absent, through the real Claude Code envelope', () => {
+    const production = {
+      status: 'changes_requested',
+      summary: 'parseEscalationDelivery() の往復に注意点がある',
+      findings: [{
+        severity: 'low',
+        file: 'apps/api/src/pl/executionLoop.ts',
+        line: 545,
+        message: 'sentinel と実チャネル名を同じ欄で表現している',
+        rule: null,
+      }],
+    }
+    const stdout = JSON.stringify({
+      type: 'result', subtype: 'success', result: JSON.stringify(production),
+    })
+
+    const parsed = parseStructuredReviewOutput(stdout)
+
+    expect(parsed).toBeDefined()
+    expect(parsed?.status).toBe('changes_requested')
+    expect(parsed?.findings).toHaveLength(1)
+    // `null` ではなく「値なし」として入る。
+    expect(parsed?.findings[0].rule).toBeUndefined()
+    // 残りの field は素通りする。
+    expect(parsed?.findings[0].file).toBe('apps/api/src/pl/executionLoop.ts')
+    expect(parsed?.findings[0].line).toBe(545)
+    // **この形のまま API へ PATCH できること。** 向こう（`apps/api/src/routes/jobs.ts`）は
+    // 同形の strict schema で `rule: z.string().optional()` なので、serialize した時点で
+    // key ごと落ちていなければ今度はそちらで弾かれる。
+    expect(JSON.parse(JSON.stringify(parsed)).findings[0]).toEqual({
+      severity: 'low',
+      file: 'apps/api/src/pl/executionLoop.ts',
+      line: 545,
+      message: 'sentinel と実チャネル名を同じ欄で表現している',
+    })
+  })
+
+  it.each([
+    ['file', { severity: 'low', message: 'note', file: null }],
+    ['line', { severity: 'low', message: 'note', line: null }],
+    ['rule', { severity: 'low', message: 'note', rule: null }],
+  ])('a null %s means the same as omitting it', (_label, finding) => {
+    const verdict = { status: 'approved', summary: 's', findings: [finding] }
+
+    const parsed = parseStructuredReviewOutput(JSON.stringify(verdict))
+
+    expect(parsed).toBeDefined()
+    // serialize して比べる —— `toEqual` は undefined の欄を無視するので、
+    // それだけでは「key が落ちている」ことの証拠にならない。
+    expect(JSON.parse(JSON.stringify(parsed)).findings[0]).toEqual({
+      severity: 'low', message: 'note',
+    })
   })
 
   it('rejects non-JSON even when it contains a JSON substring', () => {

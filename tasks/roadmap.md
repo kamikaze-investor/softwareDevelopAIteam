@@ -3935,6 +3935,46 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    いずれも既存スキーマの調整で足り、新しい仕組みは不要。
 
+   ### production 再発と修正（2026-09-23・本項目へ統合。新規 item は作らない）
+
+   **`c3849205` の repair-generation E2E がこれで止まった。** repair attempt 2（`ee6c00a0`）は
+   exit 0 で成功したのに、その review Job `65eefbd1` が
+   `Structured review output failed strict schema validation (fail-closed)` で exit 1 になり、
+   **`review_results` が1行も書かれなかった**。Stage 2 は保存済み verdict で駆動されるので、
+   judgement の手前で chain が止まる。Task は元から `blocked` なので状態は変わらず、
+   既存の review-failure escalation の挙動どおりである（そちらは変更していない）。
+
+   **上の「`rule: string` を必須にしている（`approvalLevel.ts:52`）」は誤りだった。**
+   実測で否定された。その行は `ClassifierReason.rule`（承認レベル分類器）で、review finding とは
+   別の型である。実際の finding 型 `packages/shared/src/types/review.ts` も、実際に弾いた
+   `StructuredReviewVerdictSchema`（`apps/worker/src/jobRunner.ts`）も、**`rule` は既に optional**
+   だった。欠けていたのは「optional」と「`null`」の区別で、`z.string().optional()` は
+   `undefined` を許すが `null` を許さない。計測: `rule: "x"` → ACCEPTED、`rule` 省略 → ACCEPTED、
+   `rule: null` → REJECTED（`invalid_type at findings.0.rule`）。
+
+   **修正**: `StructuredReviewVerdictSchema` の optional field（`file` / `line` / `rule`）だけを
+   `nullMeansAbsent()` で包み、`null` を「値なし」へ正規化する。serialize すると key ごと落ちるので、
+   API 側の同形 strict schema（`apps/api/src/routes/jobs.ts`）もそのまま通る。
+
+   **緩めていないもの**: `status` / `summary` / `findings` / `severity` / `message` の必須性、
+   optional field の型違い（`rule: 123` / `file: {}` / `line: "12"`）、未知の enum 値、余分な key、
+   壊れた JSON、`.strict()` の意味。**schema 全体で `null` を許す一般化はしていない。**
+   review prompt も変えていない —— モデル側の出力制御を安全性の根拠にしないため、
+   parser 側だけで閉じている。
+
+   **測定**: 既存 `describe('structured review contract')` を拡張（新しい describe は作らない）。
+   production 実測 payload を envelope ごと固定し、negative を 9 件足した。discrimination は
+   一度きりの計測として実施（`repairLineageMutationGuard.mjs` は repair lineage 専用なので
+   混ぜない。新しい mutation subsystem も作らない）: 正規化の除去 / helper を何でも受けるよう
+   拡張 / 必須 field へ正規化を広げる、の3方向すべてで対応テストが落ちることを確認した。
+
+   **残り**: production で同じ implement Job に対する canonical な再 review が parse されること。
+   確認をもって `done` にする。
+
+   **観測（修正対象外）**: 同一の verdict schema が `apps/worker/src/jobRunner.ts` と
+   `apps/api/src/routes/jobs.ts` に**2つ別々に定義されている**。今回は worker 側が正規化してから
+   送るので API 側は素通りするが、契約が2箇所にある以上ずれうる。統合するかは別途判断が要る。
+
 <!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
 0. [ ] **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**
    （2026-09-10登録。PR #136 のIndependent Reviewで指摘。

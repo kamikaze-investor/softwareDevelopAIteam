@@ -170,15 +170,36 @@ export interface StructuredReviewContext {
   implementJob: Job
 }
 
+/**
+ * **optional field に来た `null` だけを「値なし」として受ける。**
+ *
+ * 2026-09-23 production 実測: reviewer が finding に `"rule": null` を出力した。
+ * `z.string().optional()` は `undefined` は許すが `null` は許さないので strict validation が
+ * 弾き、`parseStructuredReviewOutput()` が `undefined` を返し、Job は
+ * `Structured review output failed strict schema validation (fail-closed)` で exit 1 になった。
+ * **verdict が1行も保存されないまま**止まるため、Stage 2 は判断材料を持てない
+ * （Task `c3849205` / review Job `65eefbd1`）。
+ *
+ * **fail-closed そのものは正しい。** 誤っていたのは「key を省略する」と「`null` を入れる」を
+ * 別物として扱っていたことのほうで、契約上どちらも「値が無い」である。
+ *
+ * **`null` を受けるのはここで包んだ field だけである。** schema 全体を緩めるものではない:
+ * required field（`status` / `summary` / `findings` / `severity` / `message`）、型違い、
+ * 未知の enum 値、余分な key、壊れた JSON は従来どおり弾く。**モデルの出力を信用する
+ * 方向へは一切動かしていない。**
+ */
+const nullMeansAbsent = <T extends z.ZodTypeAny>(inner: T) =>
+  inner.nullish().transform((value) => value ?? undefined)
+
 const StructuredReviewVerdictSchema = z.object({
   status: z.enum(['approved', 'changes_requested', 'rejected']),
   summary: z.string(),
   findings: z.array(z.object({
     severity: z.enum(['low', 'medium', 'high', 'critical']),
-    file: z.string().optional(),
-    line: z.number().optional(),
+    file: nullMeansAbsent(z.string()),
+    line: nullMeansAbsent(z.number()),
     message: z.string().min(1),
-    rule: z.string().optional(),
+    rule: nullMeansAbsent(z.string()),
   }).strict()),
 }).strict()
 
