@@ -1637,6 +1637,40 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **CEO 判断としてその場で確定**した。したがって本 Finding を理由に #181 を無期限に止めない。
       Safety / Authority 変更に対する判定安定性の改善が必要かは**別途評価する**。
 
+      **production 実測（2026-09-23・本項目へ統合。新規 item は作らない）**: PR 上ではなく
+      **production の Independent Review Job そのもの**で同じ反転が起きた。
+
+      Task `c3849205` / 実装 `ee6c00a0`（repair attempt 2）に対する review Job `65eefbd1`:
+
+      | run | 終了 | verdict | findings |
+      |---|---|---|---|
+      | 1回目 04:21 | exit 1・schema failure で **verdict 未保存** | `changes_requested` | 5 |
+      | 2回目 05:34（同一 Job 行を requeue） | exit 0・保存成功 | **`approved`** | 4 |
+
+      **1回目の stdout には substantive な negative verdict が完全な形で既に存在していた。**
+      唯一の schema 違反は `findings[4].rule = null` で、`review-structured-output-schema-strictness`
+      の修正を deploy した後の parser へ原本を入力すると `status="changes_requested"` /
+      findings 5 件として**正式に成立する**ことを実測済みである。したがって
+      「判定が無かった」のではなく「解析できなかっただけ」であり、**先行 negative は有効**。
+
+      それにもかかわらず同じ実装への再実行は `approved` を返し、後続の
+      `review:65eefbd1:git-commit` Job と `git_commit` ApprovalRequest まで生成された。
+      本項目が警戒している経路 ——「否定的判定を受けた側が再実行するだけで肯定的判定を得られる」
+      —— の **production 実例**である。今回は requeue を提案した側（実装 AI）が、
+      再実行が verdict の差し替えになりうるという risk を事前に挙げていなかった。
+
+      **止まった場所**: commit は発生していない（この Task の全 Job で `commit_hash = null`）。
+      Approval Gate が git_commit Job を `blocked` のまま保持した。
+      **CEO 判断（2026-09-23）: この `git_commit` ApprovalRequest は REJECT する。**
+      先行 negative を後続 approved で上書きしないためであり、復旧は旧 negative の 5 findings を
+      修正指示として使う既存 Human Resume で行う（それは新しい `human_resume` generation であり、
+      旧 `human_recovery` generation の attempt 3 ではない）。
+
+      **併せて記録すべき脆さ**: requeue は同じ Job 行を再実行するため、DB の `stdout` も
+      task-scoped / job-scoped 両方のログも上書きされた。**先行 negative の証拠が残ったのは
+      定期 DB backup が 17 分前にあったからで、無ければ失っていた。** 再実行で verdict が
+      反転しうる以上、前の verdict の原本が消える設計は本項目の危険度を上げる。
+
       **着手時に確認すること（実装方針を先に決めない）**:
       - 判定のブレが provider の非決定性（temperature / model 版）か、prompt 側の入力差
         （`.env.example` 追加で diff 構成が変わったこと）か、どちらに由来するか
@@ -3912,8 +3946,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    continuation 起因の 503 滞留を「想定内」として区別できるか、あるいは閾値を
    design review の所要時間より長くするか。
 
-<!-- roadmap:id=review-structured-output-schema-strictness state=planned -->
-0. [ ] **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**
+<!-- roadmap:id=review-structured-output-schema-strictness state=done -->
+0. [x] **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**
    （2026-09-11登録、**中優先度**。Production E2E test 8 で観測。test 9 では再発せず）。
 
    **内容**: review 結果のスキーマは `rule: string` を必須にしている
@@ -3968,8 +4002,25 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    混ぜない。新しい mutation subsystem も作らない）: 正規化の除去 / helper を何でも受けるよう
    拡張 / 必須 field へ正規化を広げる、の3方向すべてで対応テストが落ちることを確認した。
 
-   **残り**: production で同じ implement Job に対する canonical な再 review が parse されること。
-   確認をもって `done` にする。
+   **production proof（2026-09-23・本項目はこれで `done`）**: deploy 時に取られた DB backup
+   （`backup-2026-09-23T05-17-40.292Z`。失敗実行 04:23 の後、requeue 05:34 の前）から、
+   **実際に fail-closed した原本 stdout** を復元し、deploy 済みの parser へそのまま入力した。
+
+       deployed parser on the ORIGINAL stdout:
+         parsed           = true
+         status           = "changes_requested"
+         findings         = 5
+         findings[4].rule = undefined   （serialize でも key ごと落ちる）
+
+   原本の schema 違反は `findings[4].rule = null` **ただ1つ**で、必須 field の null も
+   余分な key も無かった。つまりこの payload は本来 **negative formal verdict として成立する**
+   ものであり、`rule: null` だけで verdict ごと失われていた。修正後の parser は同じ入力を
+   `changes_requested` / findings 5 件として復元する。**テストや合成 payload ではなく、
+   production で実際に壊れた入力そのもので確認している。**
+
+   **証拠の扱いで分かったこと（記録）**: 同じ Job 行を requeue すると、DB の `stdout` も
+   **task-scoped / job-scoped 両方のログファイル**も上書きされる。原本が残っていたのは
+   17 分前の定期 backup が偶然あったからで、無ければ先行 verdict の証拠を失っていた。
 
    **観測（修正対象外）**: 同一の verdict schema が `apps/worker/src/jobRunner.ts` と
    `apps/api/src/routes/jobs.ts` に**2つ別々に定義されている**。今回は worker 側が正規化してから
@@ -10757,8 +10808,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       専用 table / 第二の Principle Registry / Provider abstraction / 新しい従量課金 API 経路 /
       Question 本文・tier・閾値の自動書き換え。
 
-<!-- roadmap:id=consumed-stored-review-has-no-recovery-route state=in_progress -->
-7. [ ] **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない** —
+<!-- roadmap:id=consumed-stored-review-has-no-recovery-route state=done -->
+7. [x] **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない** —
       2026-09-22登録（CEO 指示）。
 
       **責務境界（重要）**: repair 予算・lineage・generation の意味論は
@@ -10870,8 +10921,28 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       depth 1 → 2 → 3 → `attempt_limit` escalate までを固定し、human_resume → human_recovery
       の移行と AI resume を挟んだ形も足した。mutation guard は 41 → 47 へ拡張し、
       緩める側・締めすぎる側・外しすぎる側の三方向を測っている。
-      **残り**: `c3849205` に対して repair attempt 2 以降が canonical に進むことを production で
-      確認する。コードではなく運用手順であり、実施をもって `done` にする。
+      **production proof（2026-09-23・本項目はこれで `done`）**: `c3849205` で
+      承認 → consume → `human_recovery` generation → Stage 2 → repair attempt 2 までが
+      canonical に進むことを実測した。
+
+      | 確認項目 | 実測 |
+      |---|---|
+      | 既存 CONSUMED epoch の再利用 | `approval-20260923-1269527c`（00:26:37 作成）のみ。route 呼び出しは 04:13 |
+      | 新しい ApprovalRequest（repair/recovery 系） | **0件** |
+      | `generation.rootKind` | `human_recovery` |
+      | `generation.rootJobId` | `eec46736` |
+      | `generation.depth` | 0（00:33:50 の audit）→ **1**（04:14:17 の audit）。0 へ戻っていない |
+      | repair attempt 2 | `ee6c00a0` = `repair:9db22450:1` を生成 |
+      | Worker claim | 04:14:20 に claim → running |
+      | attempt 2 の結果 | 04:21:13 に **success / exit 0** |
+      | 重複 repair stepKey | なし |
+
+      **attempt 3 へは到達していない。原因は repair-generation ではなく後段である。**
+      attempt 2 の成果に対する Independent Review が structured output の schema failure で
+      verdict を保存できず（`review-structured-output-schema-strictness`）、その後の requeue で
+      verdict が `approved` へ反転した（`independent-review-verdict-instability`）。
+      **どちらも本項目の責務外なので、別問題を理由に本項目を開いたままにしない**
+      （CEO 判断・2026-09-23）。
 
       **作らなかったもの**: 汎用 event replay subsystem / event bus / 新 status・Gate・workflow /
       新しい `PlActionKind` / 新しい dedup 機構 / 別の repair budget アルゴリズム /

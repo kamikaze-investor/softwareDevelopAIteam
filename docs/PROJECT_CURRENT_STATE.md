@@ -209,6 +209,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける**
 - **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
 - **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
+- **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**
 - **Task ContinuationのGET依存解消（高優先度）
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
@@ -230,6 +231,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
 - **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**
 - **原則自体の再Review候補を、適用記録から機械的に起こす**
+- **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
@@ -251,7 +253,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
 - **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）
 - **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**（state: planned）
-- **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**（state: planned）
 - **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: planned）
 - **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
@@ -317,7 +318,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**（state: in_progress）
 - **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: planned）
 - **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）**（state: deferred）
-- **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない**（state: in_progress）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
