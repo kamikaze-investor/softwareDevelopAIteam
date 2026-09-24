@@ -242,7 +242,7 @@ commitGateが要求する3つの成果物（`safetyVerificationResult`/`preRevie
 |---|---|---|
 | `postReviewResult` | `diffText`・`changedFiles`・`purposeSummary`・`implementerProvider` | ある（Risk Scan/Step Reviewと同じpost-diffデータ。`purposeSummary`はStep Reviewと同様`job.aiCliPrompt`等で代用可） |
 | `safetyVerificationResult`（12項目中8項目） | `changedFiles`・`diffText`・`approvalLevelResult`・`repoRoot` | ある |
-| `safetyVerificationResult`（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`） | 実際のtypecheck/test実行結果（`CommandExecutionResult`） | **ない。**jobRunnerは1Job=1SafeCommandのため、同一Job実行内でtypecheck/testを別途実行する仕組みが存在しない。未接続の場合、`buildCommandResultCheck()`の実装により`passed:false, blocking:true, detail:"〜が未実行"`と**fail-closedで返る**（バグではなく、この関数の意図した既存挙動） |
+| `safetyVerificationResult`（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`） | 実際のtypecheck/test実行結果（`CommandExecutionResult`） | **testは「ある」／typecheckは「ない」（2026-09-24 Production実測で訂正）。** implement Jobの SafeCommand は `kind: 'test'` であり、Workerが AI CLI 終了後に `pnpm test` を実際に実行している（Job `569cd4ae` 実測: 合計2,961 tests全通過・exitCode 0）。`FULL_TESTS` が埋まらないのは仕組みが無いからではなく**順序**の問題で、`runSafetyVerification()` の呼び出しが SafeCommand 実行より前にあるため、判定時点で結果がまだ存在しない。`TYPECHECK` は 1Job=1SafeCommand のため implement Job では本当に実行されない（`pnpm test` に typecheck は含まれない）。未接続の場合、`buildCommandResultCheck()`の実装により`passed:false, blocking:true, detail:"〜が未実行"`と**fail-closedで返る**（バグではなく、この関数の意図した既存挙動） |
 | `safetyVerificationResult`（`PURPOSE_DIFF_ALIGNMENT`） | `postReviewResult.alignmentVerdict` | **ない（postReviewerが先に接続されて初めて得られる）**。未接続の場合`checkPurposeDiffAlignment()`が`passed:false, blocking:true, detail:"Post-Review未実施または判定不能"`とfail-closedで返る（同様に意図した既存挙動） |
 | `preReviewResult` | `planText`（実装前の変更計画テキスト）・`purposeSummary`・`targetFiles`・`implementerProvider` | **ない。**jobRunnerは実装（AI CLI実行）前に「計画テキスト」を保持する仕組みを持たない。加えてpreReviewはpolicy=`full_pre_post_review`（Level2相当）のみ対象という前提があるが、Step6-B0の結論により`approvalLevelResult`（control repo基準）はtarget_project向けJobのreviewPolicy判定として信頼できないため、「このJobがfull_pre_post_review対象か」を安全に判定する手段自体が別途必要 |
 
@@ -250,7 +250,7 @@ commitGateが要求する3つの成果物（`safetyVerificationResult`/`preRevie
 
 理由:
 - postReviewerは既存のRisk Scan/Step Reviewと全く同じタイミング・同じ入力（post-diffデータ）で呼べるため、追加の設計課題がない。最も接続しやすい。
-- safetyVerifierは12項目中8項目が既存情報だけで評価可能。残る4項目（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`のcommand実行結果系3項目・`PURPOSE_DIFF_ALIGNMENT`1項目）は接続後もfail-closedのまま観察するに留め、無理に埋めようとしない（typecheck/test実行結果の受け渡しは1Job=1SafeCommandというjobRunnerの設計と衝突するため、安易に拡張しない）。
+- safetyVerifierは12項目中8項目が既存情報だけで評価可能。残る4項目（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`のcommand実行結果系3項目・`PURPOSE_DIFF_ALIGNMENT`1項目）は接続後もfail-closedのまま観察するに留め、無理に埋めようとしない（2026-09-24訂正: testの実行結果は SafeCommand として既に存在しており、衝突ではなく呼び出し順序の問題である。詳細は上表の該当行と `tasks/roadmap.md` の `review-gate-layers-implemented-but-unwired` を参照。typecheckについては未実行のまま）。
 - preReviewerは（a）実装前という異なるタイミングへの接続が必要、（b）対象policy判定自体が未解決、という2つの未解決設計課題があるため、無理に今回の順序に含めず、独立した設計課題として先送りする。
 
 **R4実装の分割案:**

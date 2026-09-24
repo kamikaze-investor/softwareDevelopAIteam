@@ -163,18 +163,34 @@ vi.mock('./guards/gitOperationState.js', () => ({
   detectGitOperationState: vi.fn(() => []),
 }))
 
-vi.mock('./jobLogger.js', () => ({
-  saveJobLogs: vi.fn((jobId: string, stdout: string, stderr: string) => ({
-    stdoutPath: `/logs/${jobId}/stdout.txt`,
-    stderrPath: `/logs/${jobId}/stderr.txt`,
-    stdoutPreview: stdout.slice(0, 4000),
-    stderrPreview: stderr.slice(0, 4000),
-  })),
-  buildLogPreviews: vi.fn((stdout: string, stderr: string) => ({
-    stdoutPreview: stdout.slice(0, 4000),
-    stderrPreview: stderr.slice(0, 4000),
-  })),
-}))
+// 部分モック。`PREVIEW_LENGTH` / `safeCommandSectionHeader` のような定数・純関数まで
+// 差し替えると、export が増えるたびにこの suite が壊れる（実際に壊れた）。
+vi.mock('./jobLogger.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./jobLogger.js')>()
+  return {
+    ...actual,
+    // 既定は「証跡を取得できなかった」。full log 経路の実挙動は
+    // reviewVerificationEvidence.test.ts が **本物の jobLogger と実ファイル** で固定する。
+    readSafeCommandEvidence: vi.fn(() => ({
+      source: 'unavailable' as const,
+      separated: false,
+      excerpt: '',
+      omittedChars: 0,
+      summaryLines: [],
+      note: 'verification evidence unavailable (test stub)',
+    })),
+    saveJobLogs: vi.fn((jobId: string, stdout: string, stderr: string) => ({
+      stdoutPath: `/logs/${jobId}/stdout.txt`,
+      stderrPath: `/logs/${jobId}/stderr.txt`,
+      stdoutPreview: stdout.slice(0, 4000),
+      stderrPreview: stderr.slice(0, 4000),
+    })),
+    buildLogPreviews: vi.fn((stdout: string, stderr: string) => ({
+      stdoutPreview: stdout.slice(0, 4000),
+      stderrPreview: stderr.slice(0, 4000),
+    })),
+  }
+})
 
 vi.mock('./guards/gateClient.js', () => ({
   callGateCheck: vi.fn(),
@@ -706,7 +722,9 @@ describe('runJob', () => {
     expect(result.stdoutPath).toBe('/logs/job-1/stdout.txt')
     expect(result.stderrPath).toBe('/logs/job-1/stderr.txt')
     expect(result.changedFiles).toEqual(['src/index.ts'])
-    expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'M src/index.ts\n', '')
+    // 第4引数は SafeCommand 単体の stdout。専用ログへ書き分けておくことで、後続 review が
+    // AI CLI の出力と混ぜずに読める（文字列探索で分離しない）。
+    expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'M src/index.ts\n', '', 'M src/index.ts\n')
   })
 
   describe('SafeCommand 実行の env allowlist（secrets boundary）', () => {
@@ -811,7 +829,7 @@ describe('runJob', () => {
     expect(result.stdout).toBe('partial output')
     expect(result.stderr).toBe('fatal error')
     expect(result.changedFiles).toEqual([])
-    expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'partial output', 'fatal error')
+    expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'partial output', 'fatal error', 'partial output')
   })
 
   it('Guard で止めたら stderr に理由と allowedPaths を出す（原因の誤読を防ぐ）', async () => {
@@ -3405,17 +3423,26 @@ describe('task-022: AI CLI 実行ブロック', () => {
       })),
     }
     createAiCliAdapterMock.mockReturnValue(mockAdapter as any)
+    // review prompt の構築でも `resolveCommand` を呼ぶ（implement Job の kind が実際には
+    // どのコマンドなのかを reviewer へ示すため）ので、「resolveCommand が呼ばれていない」は
+    // もう SafeCommand 未実行の証明にならない。実際に走らせる経路そのものを見る。
+    const containedRun = vi.fn()
+    setContainedCommandOverride(containedRun)
 
-    const result = await runJob(createJob({
-      workflowStepKey: 'implement:implement-job-1:review',
-      aiCliProvider: 'claude_code',
-      aiCliMode: 'review',
-    }), createPolicy(), createStructuredReviewContext())
+    try {
+      const result = await runJob(createJob({
+        workflowStepKey: 'implement:implement-job-1:review',
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'review',
+      }), createPolicy(), createStructuredReviewContext())
 
-    expect(result.status).toBe('failed')
-    expect(result.reviewResult).toBeUndefined()
-    expect(result.stderr).toContain('strict schema validation')
-    expect(resolveCommandMock).not.toHaveBeenCalled()
+      expect(result.status).toBe('failed')
+      expect(result.reviewResult).toBeUndefined()
+      expect(result.stderr).toContain('strict schema validation')
+      expect(containedRun).not.toHaveBeenCalled()
+    } finally {
+      clearContainedCommandOverride()
+    }
   })
 
   // 認証失敗の最もありふれた形は「CLI が非 0 で落ちて stderr にエラーを書く」であり、

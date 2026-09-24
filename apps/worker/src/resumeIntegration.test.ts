@@ -79,14 +79,20 @@ vi.mock('./guards/gitOperationState.js', () => ({
   GitOperationStateError: class GitOperationStateError extends Error {},
 }))
 
-vi.mock('./jobLogger.js', () => ({
-  saveJobLogs: vi.fn((jobId: string, stdout: string, stderr: string) => ({
-    stdoutPath: `/logs/${jobId}/stdout.txt`,
-    stderrPath: `/logs/${jobId}/stderr.txt`,
-    stdoutPreview: stdout.slice(0, 1000),
-    stderrPreview: stderr.slice(0, 1000),
-  })),
-}))
+// 部分モック。書き込みだけ差し替え、定数・純関数は本物を使う
+// （export が増えるたびに suite が壊れないようにするため）。
+vi.mock('./jobLogger.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./jobLogger.js')>()
+  return {
+    ...actual,
+    saveJobLogs: vi.fn((jobId: string, stdout: string, stderr: string) => ({
+      stdoutPath: `/logs/${jobId}/stdout.txt`,
+      stderrPath: `/logs/${jobId}/stderr.txt`,
+      stdoutPreview: stdout.slice(0, 1000),
+      stderrPreview: stderr.slice(0, 1000),
+    })),
+  }
+})
 
 vi.mock('./guards/gateClient.js', () => ({
   callGateCheck: vi.fn(),
