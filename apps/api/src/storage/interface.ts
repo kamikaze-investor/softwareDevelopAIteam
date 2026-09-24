@@ -19,7 +19,19 @@ export type ResumeBlockedTaskResult =
   | { ok: true; job: Job }
   | {
       ok: false
-      code?: 'DESIGN_REVIEW_PRECONDITION_FAILED' | 'WORKSPACE_QUARANTINED'
+      code?:
+        | 'DESIGN_REVIEW_PRECONDITION_FAILED'
+        | 'WORKSPACE_QUARANTINED'
+        /**
+         * REJECTED された `git_commit` から、実装修正へ戻すための source implement Job を
+         * **既存 `workflowStepKey` だけでは特定できなかった**。
+         *
+         * **これは fail-closed であって、探索を広げる合図ではない。** 推測で
+         * 「最新の implement Job」を選んだり候補から選択したりしないと決めてある
+         * （CEO 判断・2026-09-23）。同一 diff を再承認へ回さないことのほうが、
+         * 自動復旧できることより優先される。
+         */
+        | 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
       reason: string
     }
 

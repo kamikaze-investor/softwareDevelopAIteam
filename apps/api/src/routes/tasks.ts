@@ -586,6 +586,13 @@ export async function taskRoutes(
       if (resumed.code === 'WORKSPACE_QUARANTINED') {
         return reply.status(409).send({ error: resumed.reason })
       }
+      // **却下済み commit の出所を特定できなかったのは request の不備ではなく状態の問題**なので
+      // 400 ではなく 409 を返す。code を添えるのは、呼び出し側が
+      // 「retry すれば直る」と誤解しないようにするためである（fail-closed であり、
+      // 探索を広げて自動復旧させることは意図的にしていない）。
+      if (resumed.code === 'REJECTED_COMMIT_SOURCE_UNRESOLVED') {
+        return reply.status(409).send({ error: resumed.reason, code: resumed.code })
+      }
       return reply.status(400).send({ error: resumed.reason })
     }
 

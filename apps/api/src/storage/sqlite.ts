@@ -1438,6 +1438,163 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
   }
 
+  /**
+   * REJECTED された `git_commit` を生んだ **source implement Job** を、
+   * **既存 `workflowStepKey` だけ**で逆引きする。
+   *
+   * ```
+   * [任意] resume:<sourceJobId>:1        … 1段だけ正規化する
+   *   → git_commit  review:<reviewJobId>:git-commit
+   *   → review      implement:<implementJobId>:review
+   *   → implement   (aiCliMode = 'implement')
+   * ```
+   *
+   * **7条件をすべて満たすときだけ返す。1つでも欠ければ fail-closed**（CEO 判断・2026-09-23）。
+   * 同一 diff を再承認へ回さないことのほうが、自動復旧できることより優先される。
+   *
+   * **やってはいけないこと（意図的に実装していない）**:
+   * - 2段以上の `resume:` traversal（1ホップ正規化した先は `review:...:git-commit` しか許さない）
+   * - recursive ancestry resolver
+   * - 「最新 implement Job」の推測
+   * - 複数候補からの選択
+   * - `workflowStepKey` 以外を使った fallback 探索
+   *
+   * これは**探索ではなく正規化**である。辿るのは常に「そのキーが名指ししている1件」だけで、
+   * 候補集合を作らない。
+   */
+  /**
+   * **その git_commit Job 自身が CEO に却下されたか**を、linked Approval で判定する。
+   *
+   * Task の「最新の Approval 行」では駄目である:
+   * - 別 action（`test` 等）の REJECTED を根拠に誤発火しうる
+   * - linked が REJECTED でも、後から別 action の Approval が作られると**見失う**
+   *
+   * よって `approvalId` を起点に、**その行が本当にこの Job の git_commit 却下か**を確かめる。
+   * ここは `blockedTriage` が見るのと同じ事実であり、案内と endpoint が食い違わないように
+   * 判定の材料を揃えてある。
+   *
+   * **link が無い Job も1ホップだけ辿る。** Gate が既存の REJECTED を再利用して弾いたとき、
+   * 新しい Approval は作られないので **その Job に `approvalId` は付かない**
+   * （`ux_jobs_approval_id` が UNIQUE なので、既存の却下行を2つ目の Job へ結び直すこともできない）。
+   * 何もしないと「却下されていない Job」に見え、PL が同じ内容を自動 resume し続ける
+   * （独立レビュー指摘）。そこで `resume:<sourceJobId>:1` を **1回だけ**辿り、
+   * 元の Job の linked Approval を見る。**provenance と同じ規約・同じ1ホップ**であり、
+   * 探索でも候補選択でもない。
+   */
+  function isLinkedGitCommitRejection(job: Job): boolean {
+    if (job.safeCommand.kind !== 'git_commit') return false
+
+    // link のある Job はそれだけで判定する。
+    if (job.approvalId) return isGitCommitRejectionOf(job, job.approvalId)
+
+    // link が無い Job は、`resume:` を **1回だけ** 辿って元の Job の link を見る。
+    const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
+    if (!resumed) return false
+    const source = jobs.findById(resumed[1] as string)
+    if (!source || !source.approvalId) return false
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return false
+    if (source.safeCommand.kind !== 'git_commit') return false
+    return isGitCommitRejectionOf(source, source.approvalId)
+  }
+
+  function isGitCommitRejectionOf(job: Job, approvalId: string): boolean {
+    const approval = approvalRequests.findById(approvalId)
+    if (!approval) return false
+    if (approval.id !== approvalId) return false
+    if (approval.taskId !== job.taskId) return false
+    if (approval.requestedAction !== 'git_commit') return false
+    return approval.status === 'REJECTED'
+  }
+
+  function resolveSourceImplementJobForRejectedGitCommit(
+    latestJob: Job,
+  ): { ok: true; job: Job } | { ok: false; reason: string } {
+    const sameOwner = (job: Job): boolean =>
+      job.taskId === latestJob.taskId && job.projectId === latestJob.projectId
+
+    // 2. `resume:<sourceJobId>:1` は **1回だけ** 辿る。
+    //    latest が最初から `review:...:git-commit` ならここは素通りする。
+    let gitCommitJob = latestJob
+    const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
+    if (resumed) {
+      const source = jobs.findById(resumed[1] as string)
+      if (!source) {
+        return { ok: false, reason: `resume source job ${resumed[1]} not found` }
+      }
+      // 3. 同一 Task / Project の git_commit であること。
+      if (!sameOwner(source)) {
+        return { ok: false, reason: 'resume source job belongs to a different task or project' }
+      }
+      if (source.safeCommand.kind !== 'git_commit') {
+        return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
+      }
+      gitCommitJob = source
+    }
+
+    // 4. `review:<reviewJobId>:git-commit`。
+    //    ここで2段目の `resume:` は一致しないので、**多段 traversal は構造的に起きない**。
+    const reviewRef = /^review:([^:]+):git-commit$/.exec(gitCommitJob.workflowStepKey ?? '')
+    if (!reviewRef) {
+      return {
+        ok: false,
+        reason: `git_commit job workflowStepKey is not review:<id>:git-commit (got ${gitCommitJob.workflowStepKey ?? 'none'})`,
+      }
+    }
+    const reviewJob = jobs.findById(reviewRef[1] as string)
+    if (!reviewJob) return { ok: false, reason: `review job ${reviewRef[1]} not found` }
+    if (!sameOwner(reviewJob)) {
+      return { ok: false, reason: 'review job belongs to a different task or project' }
+    }
+    // キーが review を指していても、実体が review Job でなければ provenance は成立しない。
+    if (reviewJob.aiCliMode !== 'review') {
+      return {
+        ok: false,
+        reason: `review job aiCliMode is ${reviewJob.aiCliMode ?? 'none'}, not review`,
+      }
+    }
+
+    // 5. `implement:<implementJobId>:review`
+    const implementRef = /^implement:([^:]+):review$/.exec(reviewJob.workflowStepKey ?? '')
+    if (!implementRef) {
+      return {
+        ok: false,
+        reason: `review job workflowStepKey is not implement:<id>:review (got ${reviewJob.workflowStepKey ?? 'none'})`,
+      }
+    }
+    const implementJob = jobs.findById(implementRef[1] as string)
+    if (!implementJob) return { ok: false, reason: `implement job ${implementRef[1]} not found` }
+    if (!sameOwner(implementJob)) {
+      return { ok: false, reason: 'implement job belongs to a different task or project' }
+    }
+
+    // 6. `aiCliMode = 'implement'`
+    if (implementJob.aiCliMode !== 'implement') {
+      return {
+        ok: false,
+        reason: `source job aiCliMode is ${implementJob.aiCliMode ?? 'none'}, not implement`,
+      }
+    }
+
+    // 7. 再実行に必要な情報が揃っていること。
+    if (!implementJob.aiCliProvider) {
+      return { ok: false, reason: 'source implement job is missing aiCliProvider' }
+    }
+
+    // **`safeCommand.kind` も揃っていないと workflow が止まる。**
+    // `routes/jobs.ts` の `shouldCreateReview` は resume implement の成功時に
+    // `safeCommand.kind === 'test'` を要求する。別 kind を再利用すると
+    // 「implement は成功したのに post-implement review が作られず、そこで止まる」
+    // という**静かな停止**になるので、ここで fail-closed にする。
+    if (implementJob.safeCommand.kind !== 'test') {
+      return {
+        ok: false,
+        reason: `source implement job safeCommand is ${implementJob.safeCommand.kind}, not test`,
+      }
+    }
+
+    return { ok: true, job: implementJob }
+  }
+
   const jobs: IJobStorage = {
     findByTaskId(taskId) {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
@@ -2305,6 +2462,59 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 発行し、CEO が Mobile からそれを承認する、という正規経路へ戻すだけである。
         if (latestApproval?.status === 'WAITING_FOR_USER' && new Date(latestApproval.expiresAt) > new Date(now())) {
           return { ok: false, reason: 'The latest approval request is waiting for user review' }
+        }
+
+        // **CEO が REJECT した git_commit は、同じ commit を作り直さない。**
+        //
+        // ここを素通しにすると、resume が `instructionPrompt` を捨てて同一 SafeCommand を
+        // clone し、`/gate/check` が同一 diff へ新しい ApprovalRequest を発行する ——
+        // **人の却下が、対象を1行も変えないまま承認待ちへ戻る**。2026-09-23 に production で
+        // 実際に起きた（REJECT の3分後に `target_commit` / `target_diff_hash` /
+        // `changed_files` がすべて一致する新規 WAITING_FOR_USER が生成された）。
+        //
+        // **EXPIRED / STALE / 承認行なしはこの分岐に入らない。** それらは「人の判断が
+        // 一度も下っていない」状態で、同じ diff で新しい承認サイクルを始めるのが正しい。
+        // 条件を `instructionPrompt` の有無にしないのは、route も PL も**常に非空**を
+        // 渡すためで、そうすると既存の正常経路まで変わってしまう。
+        if (isLinkedGitCommitRejection(latestJob)) {
+          const source = resolveSourceImplementJobForRejectedGitCommit(latestJob)
+          if (!source.ok) {
+            return { ok: false, code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED', reason: source.reason }
+          }
+
+          // **Design Review evidence の門は迂回しない。** 迂回すると、却下された実装を
+          // 未審査のまま作り直せてしまう。route 側の既存フロー
+          // （DESIGN_REVIEW_PRECONDITION_FAILED → createAndExecuteDesignReview → 再試行）
+          // がそのまま効く。
+          const rejectedDesignReviewCheck = checkImplementJobDesignReviewEvidence({
+            taskId,
+            aiCliMode: 'implement',
+            aiCliPrompt: instructionPrompt,
+          }, designReviewEvidence)
+          if (!rejectedDesignReviewCheck.ok) {
+            return {
+              ok: false,
+              code: 'DESIGN_REVIEW_PRECONDITION_FAILED',
+              reason: rejectedDesignReviewCheck.reason,
+            }
+          }
+
+          // source implement Job の実行情報を再利用し、**prompt だけ修正指示へ差し替える**。
+          // `workflowStepKey` は既存規約のまま（`routes/jobs.ts` の `isResumeImplementJob` が
+          // これを見て post-implement review を自動生成する）。
+          const job = jobs.create({
+            taskId,
+            projectId: source.job.projectId,
+            agentRole: source.job.agentRole,
+            status: 'queued',
+            safeCommand: { ...source.job.safeCommand, workingDir: TARGET_WORKING_DIR },
+            dryRun: source.job.dryRun,
+            aiCliProvider: source.job.aiCliProvider,
+            aiCliPrompt: instructionPrompt,
+            aiCliMode: 'implement',
+            workflowStepKey: `resume:${latestJob.id}:1`,
+          })
+          return { ok: true, job }
         }
 
         // git_commit SafeCommand Job（AI CLIを介さない）の resume。

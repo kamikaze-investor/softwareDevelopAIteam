@@ -106,12 +106,25 @@ interface GateCheckResponse {
   approvalRequest?:   ApprovalRequest
 }
 
+/**
+ * 同一 commit / diff の却下済み Approval を探す。
+ *
+ * `requestedAction` を渡すと**先に action で絞る**。渡さないときは従来どおり action を見ない。
+ *
+ * **git_commit では必ず絞ること。** 絞らないと、同じ commit/diff に対して
+ * 「新しい REJECTED(action=test)」と「古い REJECTED(action=git_commit)」が並んだとき、
+ * 先に test 側を拾い、後段の `existingReqForOutcome` が action 不一致で捨てた結果
+ * **git_commit の却下を再探索しないまま新しい Approval を作れてしまう**。
+ */
 function findRelevantRejectedRequest(
   requests: ApprovalRequest[],
   currentCommit: string,
   currentDiffHash: string,
+  requestedAction?: string,
 ): ApprovalRequest | undefined {
-  const rejectedRequests = requests.filter(request => request.status === 'REJECTED')
+  const rejectedRequests = requests.filter(request =>
+    request.status === 'REJECTED'
+    && (requestedAction === undefined || request.requestedAction === requestedAction))
   return rejectedRequests.find(request =>
     request.targetCommit === currentCommit && request.targetDiffHash === currentDiffHash
   ) ?? rejectedRequests[0]
@@ -500,11 +513,28 @@ export async function approvalGateRoutes(
       }
     }
 
-    if (!existingReq && !requiresApprovalByPolicy) {
+    // **却下済み判定の探索は git_commit でも行う。**
+    //
+    // 以前はここが `!requiresApprovalByPolicy` 条件付きで、`requiresApprovalByPolicy` は
+    // `requestedAction === 'git_commit'` そのものだった —— つまり
+    // **git_commit のときだけこの探索が丸ごと skip され**、linked approval が無ければ
+    // Task の過去 REJECTED を見ずに新しい ApprovalRequest を発行できた。
+    // 2026-09-23 production: CEO が却下した diff が、3分後に同一
+    // `target_commit` / `target_diff_hash` / `changed_files` の新規 WAITING_FOR_USER として
+    // 戻ってきた。守るべき不変条件は
+    // **「CEO が REJECT したのと同一 diff を、そのまま新しい ApprovalRequest に置き換えない」**。
+    //
+    // `requestedAction` 違いの誤再利用は下の `existingReqForOutcome` が従来どおり弾くので、
+    // ここは探索を通すだけでよい。**`jobs.ts` 側へ diff hash 判定を重複実装しない** ——
+    // diff identity の正本はこの Gate にある。
+    if (!existingReq) {
       existingReq = findRelevantRejectedRequest(
         storage.approvalRequests.findByTaskId(taskId),
         targetCommit,
         targetDiffHash,
+        // policy 起因（git_commit）のときだけ action で絞る。
+        // HIGH/CRITICAL の既存パスは従来どおり action を見ない（対象外）。
+        requiresApprovalByPolicy ? requestedAction : undefined,
       )
     }
 
