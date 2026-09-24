@@ -11143,10 +11143,14 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         admission が広がっていた**（修正前は live 衝突として正しく落ちていた）。
         「ちょうど 1 件外す」と書いていたが、事実ではなかった
 
-      原因が同じなので、規則を 1 本にした: **外すのは canonical な walk が同じ一度の走査で
-      確定させる「この chain で最も近い `resume:` の元」ちょうど 1 件、しかも `blocked` の
-      ときだけ**。実装自身が `resume:` ならその元（従来どおり）、repair descendant なら上へ
-      辿って最初に出会う resume の元、resume がどこにも無ければ外す対象は無い。
+      原因が同じなので、規則を 1 本にした（**2026-09-24 に下記のとおり更新**）: 外すのは
+      canonical な walk が同じ一度の走査で確定させる ancestor のうち、**最初に現れた `blocked` から
+      連続している区間だけ**である。先頭側の非 `blocked`（現 generation の成功した repair 段）は
+      読み飛ばし、`blocked` が始まった後に非 `blocked` へ当たったら打ち切る。件数は固定しない。
+      加えて、**現在の実装と人の権限の根との間に AI / unknown の resume が挟まっている場合は、
+      その根より上を見ない**（根そのものは含める）。挟まっていなければ人がこの chain を直接
+      進めたということなので、その上の REJECT 列も外してよい。判定には walk が同じ走査で
+      確定させた `crossedAiResume` をそのまま使う。
       `queued` / `running` へ戻った source は外さない。repairFlow 側に lineage を
       second-guess する二本目の走査は作っていない
 

@@ -655,26 +655,75 @@ function repairableBlockedReviewRequest(
   //    **本当に動いている Job の上へ repair を積む**（独立レビュー指摘）。
   //    resume が残した `blocked` という状態そのものが除外の根拠であって、名前ではない。
   //
-  //    **外すのは「この chain で最も近い resume の元」ちょうど 1 件である。**
+  //    **外すのは「実装のすぐ上に連続して並ぶ blocked な ancestor」である。**
   //
-  //    実装自身の `resume:` キーだけを見ていた頃は、attempt 2 以降（キーが `repair:` に
-  //    なる）で元を辿れず、人が承認した chain が 1 手先で必ず止まった。かといって
-  //    「直近の resume 元」と「generation の根の resume 元」を**別々に 2 件**外すと、
-  //    今度は AI resume を挟むだけで前の generation の blocked 行まで一緒に消え、
-  //    直接 resume 経路の admission が広がってしまう（独立レビュー指摘・2026-09-23 に
-  //    両方 in-memory で再現）。**どちらの欠陥も「何件外すか」がぶれたことが原因**なので、
-  //    規則を 1 本にする。
+  //    件数は固定しない。CEO の REJECT → Human Resume は何度でも起こり得て、そのたびに
+  //    元の行は `blocked` のまま残るので、**直上に blocked が積み上がる**。
+  //    「ちょうど 1 件」にしていた頃は、2 回目の REJECT を経た正規 lineage が必ず弾かれた
+  //    （2026-09-24 production 実測: `c3849205` は `7061400a` → `5472d0c1` → 実装 と
+  //    blocked が 2 件連続し、canonical repair が admission だけで止まっていた）。
   //
-  //    値は canonical な walk が**同じ一度の走査で**確定させた `nearestResumeSourceJobId`
-  //    を使う。ここで lineage を second-guess する二本目の走査は作らない。
-  //      - 実装自身が `resume:<B>:n`   → B（従来と同じ）
-  //      - 実装が repair descendant     → 上へ辿って最初に出会う resume の元
-  //      - resume がどこにも無い chain → 外す対象は無い
-  const nearestResumeSourceJobId = lineage.nearestResumeSourceJobId
+  //    **ただし「経路上の blocked を全部」ではない。** それでは AI resume を 1 本挟むだけで、
+  //    前の generation に残っている blocked 行まで一緒に外れる（`repairFromStoredReview.test.ts`
+  //    の回帰。2026-09-23 に in-memory で再現済み）。前の generation の blocked は
+  //    「人が動くまで自律実行を止める」という境界そのもので、そこを跨ぐのは安全境界の後退である。
+  //
+  //    外すのは **最初に現れた blocked から、連続している間だけ** である。
+  //      - 先頭側の非 blocked（現 generation の成功した repair 段）は読み飛ばす。
+  //        飛ばしても安全側は緩まない: それらが `queued` / `running` なら下の live 判定が拾う。
+  //      - いったん blocked が始まったら、非 blocked に当たった時点で打ち切る。
+  //        そこから上は別のエピソードで、この実装が抜け出してきた REJECT の並びではない。
+  //
+  //    この 1 本で 3 つの形が同時に成立する:
+  //      - REJECT が 1 回 : 成功 repair 段を飛ばし、その上の blocked 元を外す（従来どおり）
+  //      - REJECT が n 回 : 直上に blocked が n 件連続するので最後まで外れる（本件の修正）
+  //      - AI resume 経由 : blocked の上が成功 Job なので打ち切られ、前 generation は外れない
+  //
+  //    順序は canonical な walk が**同じ一度の走査で**確定させた `lineageAncestorJobIds`
+  //    （近い順）をそのまま使う。ここで lineage を second-guess する二本目の走査も、
+  //    二つ目の parser も作らない。`lineage.ok === false`（cycle / malformed / 別 Task 参照 /
+  //    非停止）は上で既に fail-closed 済みなので、復元できていない lineage は届かない。
+  //
+  //    **打ち切る条件が `blocked` 以外であることが要点。** ancestor は後から `queued` へ戻りうる
+  //    （`jobResultApplicationPolicy.ts` の `blocked: ['queued']`、`routes/jobs.ts` の
+  //    implement requeue 経路）。そうなったら連続はそこで切れ、その Job も、その上も外れない。
+  //    **さらに、AI resume を跨いだ先の human root より上は見ない。** 連続を status だけで
+  //    決めると、`B0(blocked) → H1(resume:B0, human, blocked) → A2(resume:H1, ai)` の形で
+  //    A2 の ancestor が `[H1, B0]` となり両方 blocked なので、**AI resume 1 本で human root を
+  //    跨いで前 generation の `B0` まで外せてしまう**（独立レビュー指摘）。
+  //
+  //    境界を張る条件は `crossedAiResume`、すなわち **現在の実装と人の権限の根との間に
+  //    AI / unknown の resume が挟まっているか**である。値は walk が同じ一度の走査で
+  //    確定させたもの（根が決まる前だけ立つ）で、ここで導出し直していない。
+  //      - 挟まっていない: 人がこの chain を直接進めた。その上の REJECT 列は人が
+  //        「この状況から続ける」と判断した対象そのものなので外してよい
+  //        （production `c3849205`、および human root 下の repair chain）
+  //      - 挟まっている  : AI が人の境界へ手を伸ばしている。根は含めるが、その上は 1 件も見ない
+  //
+  //    `origin` には守るべき人の境界が無い。`human_recovery` は「いまここから新しい
+  //    generation を始めてよい」という**現時点の** authority で、その上に残る blocked 元は
+  //    epoch が解消する対象そのものなので、ここで切ると承認を CONSUMED にしたまま
+  //    行き止まりになる（`repairFromStoredReview.test.ts` が固定している既知の事故）。
+  const ancestors = lineage.lineageAncestorJobIds
+  const crossesHumanAuthority = lineage.rootKind === 'human_resume' && lineage.crossedAiResume
+  const authorityBoundary = crossesHumanAuthority ? ancestors.indexOf(lineage.rootJobId) : -1
+  const consideredAncestors = authorityBoundary >= 0 ? ancestors.slice(0, authorityBoundary + 1) : ancestors
 
-  const live = storage.jobs.findByTaskId(task.id)
+  const jobsById = new Map(taskJobs.map((job) => [job.id, job]))
+  const supersededBlockedAncestors = new Set<string>()
+  let blockedRunStarted = false
+  for (const ancestorId of consideredAncestors) {
+    if (jobsById.get(ancestorId)?.status === 'blocked') {
+      blockedRunStarted = true
+      supersededBlockedAncestors.add(ancestorId)
+      continue
+    }
+    if (blockedRunStarted) break
+  }
+
+  const live = taskJobs
     .filter((job) => job.id !== implementJob.id)
-    .filter((job) => !(job.id === nearestResumeSourceJobId && job.status === 'blocked'))
+    .filter((job) => !supersededBlockedAncestors.has(job.id))
     .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
   if (live.length > 0) {
     return { ok: false, reason: `a live job exists for this task (${live[0].status})` }

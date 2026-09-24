@@ -856,9 +856,9 @@ describe('元 Job が blocked のまま残る human_recovery generation', () => 
     expect(result.reason ?? '').toContain('a live job exists')
   })
 
-  // **外すのは lineage から導いた resume 元ちょうど 1 件だけ。**
-  // 「generation 内の blocked Job を全部無視」にはしない。
-  it('lineage から導いた resume 元以外の blocked Job は外さない', () => {
+  // **外すのは、実装のすぐ上に連続して並ぶ blocked な ancestor だけ。**
+  // 「generation 内の blocked Job を全部無視」にはしないし、連続の外へも広げない。
+  it('連続区間の外にある blocked Job は外さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, leaf, review } = blockedPredecessorChain(storage, 1)
 
@@ -883,7 +883,7 @@ describe('元 Job が blocked のまま残る human_recovery generation', () => 
 })
 
 /**
- * **除外してよい live Job は「この chain で最も近い resume の元」ちょうど 1 件**
+ * **除外してよい live Job は「実装のすぐ上に連続して並ぶ blocked な ancestor」だけ**
  * （独立レビュー指摘・2026-09-23 第2ラウンドの HIGH 2件）。
  *
  * 1件目: human_resume generation を使い切ったあと、その repair leaf へ recovery epoch を
@@ -895,9 +895,11 @@ describe('元 Job が blocked のまま残る human_recovery generation', () => 
  * AI resume を挟むだけで前の generation の blocked 行まで一緒に消え、**直接 resume 経路の
  * admission が広がっていた**（修正前は live 衝突として正しく落ちていた）。
  *
- * どちらも「何件外すか」がぶれたことが原因なので、規則を 1 本にしてある。
+ * どちらも「どこまで外すか」の根拠が chain 上に無かったことが原因なので、規則を 1 本にしてある。
+ * いまの規則は件数を固定せず、**最初に現れた blocked から連続している間だけ**外す。
+ * REJECT が n 回続いた chain は最後まで外れ、連続が切れた先（別のエピソード）は 1 件も外れない。
  */
-describe('除外するのは最も近い resume 元 1 件だけ', () => {
+describe('除外するのは最初の blocked から連続している区間だけ', () => {
   /** admin credential による human resume。generation の根になる。 */
   function humanResume(storage: IStorage, ids: { taskId: string, projectId: string }, sourceId: string): Job {
     const job = makeJob(storage, ids, `resume:${sourceId}:1`, 'success')
@@ -983,6 +985,7 @@ describe('除外するのは最も近い resume 元 1 件だけ', () => {
   })
 
   // **2件目の回帰。** 前の generation の blocked 行まで一緒に外さないこと。
+  // 連続が success（humanResumed）で切れるので、その上の blocked はそのまま live に残る。
   it('AI resume を挟んでも前の generation の blocked 行は live のまま', () => {
     const storage = createSQLiteStorage(':memory:')
     const ids = seed(storage)
@@ -1002,7 +1005,78 @@ describe('除外するのは最も近い resume 元 1 件だけ', () => {
     expect(result.reason ?? '').toContain('a live job exists')
   })
 
-  // 外すのは**最も近い**もの。上流の resume 元ではない。
+  // **AI resume は human authority の根を跨げない。**
+  // 根が blocked のままでも同じ。status の連続だけで決めると、
+  // `B0(blocked) → H1(human resume, blocked) → A2(ai resume)` で ancestor が両方 blocked に
+  // なるため、AI resume 1 本で前 generation の `B0` まで外れてしまう（独立レビュー指摘）。
+  it('blocked な human root の上を AI resume が跨いで前 generation を外さない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    // 前 generation に残る blocked 行。
+    const previousGeneration = makeJob(storage, ids, `task:${ids.taskId}:initial-implement`, 'blocked')
+    // 人が再開したが、その Job 自身も blocked のまま残っている。
+    const humanRoot = makeJob(storage, ids, `resume:${previousGeneration.id}:1`, 'blocked')
+    recordResumeActor(storage, {
+      jobId: humanRoot.id, taskId: ids.taskId, actorClass: 'human', evidence: 'admin_credential',
+    })
+    // その上を AI が resume した実装。
+    const aiResumed = makeJob(storage, ids, `resume:${humanRoot.id}:1`, 'success')
+
+    const reviewJob = createReviewJob(storage, ids, aiResumed.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    const result = prepareRepairFlow(storage, { failedJob: aiResumed, review })
+
+    // `humanRoot` は外れるが、その上の `previousGeneration` は live のまま残る。
+    expect(result.action).toBe('skip')
+    if (result.action !== 'skip') return
+    expect(result.reason ?? '').toContain('a live job exists')
+  })
+
+  // **境界は根を含む。** AI resume を跨いでいても、根そのものは外してよい。
+  // ここまで締めると、AI resume の直上にある blocked な human root が live 扱いのまま残り、
+  // 正規経路が止まる（締めすぎ側の回帰）。
+  it('AI resume を跨いでいても、human root 自身は外れる', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    // 前 generation 側は blocked ではない = live ではないので、判定を分けられる。
+    const previousGeneration = makeJob(storage, ids, `task:${ids.taskId}:initial-implement`, 'failed')
+    const humanRoot = makeJob(storage, ids, `resume:${previousGeneration.id}:1`, 'blocked')
+    recordResumeActor(storage, {
+      jobId: humanRoot.id, taskId: ids.taskId, actorClass: 'human', evidence: 'admin_credential',
+    })
+    const aiResumed = makeJob(storage, ids, `resume:${humanRoot.id}:1`, 'success')
+
+    const reviewJob = createReviewJob(storage, ids, aiResumed.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    // 根 `humanRoot` が外れるので通る。境界を根の手前で切っていたら live 衝突で落ちる。
+    expect(prepareRepairFlow(storage, { failedJob: aiResumed, review }).action).toBe('queue')
+  })
+
+  // 対になる正の側。**人が現在の実装そのものを resume した**なら、その実装が抜け出してきた
+  // REJECT 列は人が見たうえで「続ける」と判断した対象なので、連続している間は外してよい
+  // （production `c3849205` の形）。
+  it('人が現在の実装を resume したなら、その上の連続した blocked は外れる', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    const firstRejected = makeJob(storage, ids, `task:${ids.taskId}:initial-implement`, 'blocked')
+    const secondRejected = makeJob(storage, ids, `resume:${firstRejected.id}:1`, 'blocked')
+    const humanResumedImplement = makeJob(storage, ids, `resume:${secondRejected.id}:1`, 'success')
+    recordResumeActor(storage, {
+      jobId: humanResumedImplement.id, taskId: ids.taskId, actorClass: 'human', evidence: 'admin_credential',
+    })
+
+    const reviewJob = createReviewJob(storage, ids, humanResumedImplement.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    expect(prepareRepairFlow(storage, { failedJob: humanResumedImplement, review }).action).toBe('queue')
+  })
+
+  // 連続が切れた先は外さない。上流の元まで一緒に外れないこと。
   it('上流にも resume があるとき、外すのは直近の resume 元のほう', () => {
     const storage = createSQLiteStorage(':memory:')
     const ids = seed(storage)
@@ -1018,7 +1092,7 @@ describe('除外するのは最も近い resume 元 1 件だけ', () => {
 
     const result = prepareRepairFlow(storage, { failedJob: aiResumed, review })
 
-    // 直近の元 `blockedRepair` が外れるので通る。上流の元を外していたら落ちる。
+    // 直近の元 `blockedRepair` が外れるので通る。連続を跨いで上流まで外していたら落ちる。
     expect(result.action).toBe('queue')
   })
 })

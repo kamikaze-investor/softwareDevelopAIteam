@@ -387,6 +387,86 @@ describe('decideRepairAction — actor 不明の resume', () => {
 // 14〜19: lineage を数え切れないときは必ず fail-closed（depth 0 にしない）。
 // ---------------------------------------------------------------------------
 
+describe('walkRepairGeneration — lineage ancestor の記録', () => {
+  // admission の live Job 判定は、この 1 度の walk が辿った経路だけを根拠に除外する。
+  // 経路外を混ぜたり、起点を含めたり、足りなかったりすると、そのまま admission がずれる。
+  it('辿った ancestor を近い順に、起点を含めずに返す', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('origin'),
+      resumeOf('origin', 'resume-1', 'human'),
+      repairOf('resume-1', 'repair-1'),
+    ]
+    const walk = walkRepairGeneration('repair-1', priors)
+
+    expect(walk.ok).toBe(true)
+    if (!walk.ok) return
+    expect(walk.lineageAncestorJobIds).toEqual(['resume-1', 'origin'])
+    expect(walk.lineageAncestorJobIds).not.toContain('repair-1')
+  })
+
+  it('経路外の Job は ancestor に含めない', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('origin'),
+      resumeOf('origin', 'resume-1', 'human'),
+      // 同じ Task にあるが、この chain のどこからも辿られない Job。
+      originJob('unrelated'),
+    ]
+    const walk = walkRepairGeneration('resume-1', priors)
+
+    expect(walk.ok).toBe(true)
+    if (!walk.ok) return
+    expect(walk.lineageAncestorJobIds).toEqual(['origin'])
+    expect(walk.lineageAncestorJobIds).not.toContain('unrelated')
+  })
+
+  it('ancestor が無い chain では空になる', () => {
+    const walk = walkRepairGeneration('origin', [originJob('origin')])
+
+    expect(walk.ok).toBe(true)
+    if (!walk.ok) return
+    expect(walk.lineageAncestorJobIds).toEqual([])
+  })
+
+  it('generation の根より上の ancestor も含む（予算の境界とは別の事実）', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('origin'),
+      resumeOf('origin', 'resume-old', 'ai'),
+      resumeOf('resume-old', 'resume-human', 'human'),
+      repairOf('resume-human', 'repair-1'),
+    ]
+    const walk = walkRepairGeneration('repair-1', priors)
+
+    expect(walk.ok).toBe(true)
+    if (!walk.ok) return
+    expect(walk.rootKind).toBe('human_resume')
+    expect(walk.rootJobId).toBe('resume-human')
+    // 根が決まっても walk は上流の健全性を確かめ続けるので、ancestor はそこで切れない。
+    expect(walk.lineageAncestorJobIds).toEqual(['resume-human', 'resume-old', 'origin'])
+  })
+
+  // 復元できていない lineage の ancestor が admission の除外に使われないことを、
+  // 「欄が無い」ところまで固定する。ok:false だけを見ていると、欄が漏れる退行を通す。
+  //
+  // **失敗の型ごとに reason も確かめる。** 同じ `ok: false` でも原因は別で、まとめて
+  // 1 ケースにすると「別の理由で落ちていた」ことに気づけない（独立レビュー指摘）。
+  // 歩数上限の fallback はここでは到達できない —— 環は `seen` が先に検出し、
+  // 整形式の lineage は同じ Job を 2 度訪れないためで、それは defensive backstop である
+  // （潰したときに hang せず失敗することは mutation guard の `G7` / `G13` が測っている）。
+  it.each([
+    ['cycle', () => walkRepairGeneration('a', [repairOf('b', 'a'), repairOf('a', 'b')]), 'cycle'],
+    ['別 Task 参照', () => walkRepairGeneration('repair-1', [repairOf('job-of-another-task', 'repair-1')]), 'not a job of this task'],
+    ['親が欠損', () => walkRepairGeneration('a', [repairOf('b', 'a')]), 'not a job of this task'],
+    ['malformed repair key', () => walkRepairGeneration('a', [{ id: 'a', workflowStepKey: 'repair:', status: 'failed', facts: FACTS_A }]), 'malformed repair step key'],
+    ['id 重複', () => walkRepairGeneration('a', [originJob('a'), originJob('a')]), 'duplicate job id'],
+  ])('%s では ok:false になり、ancestor 欄そのものを返さない', (_label, run, expectedReason) => {
+    const walk = run()
+    expect(walk.ok).toBe(false)
+    if (walk.ok) return
+    expect(walk.reason).toContain(expectedReason)
+    expect(walk).not.toHaveProperty('lineageAncestorJobIds')
+  })
+})
+
 describe('walkRepairGeneration — 数え切れないときは fail-closed', () => {
   it('[14] repair の stepKey が壊れていたら escalate する', () => {
     const priors: PriorRepairJob[] = [
