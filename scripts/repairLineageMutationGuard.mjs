@@ -62,6 +62,7 @@ const FLOW_TESTS = ['src/designReview/repairFlow.test.ts']
 /** stored-review recovery（`human_recovery` generation root）側。 */
 const EPOCH = 'apps/api/src/designReview/repairRecoveryEpoch.ts'
 const RECOVERY = 'apps/api/src/designReview/repairFromStoredReview.ts'
+const PROMPT_BUILDER = 'apps/api/src/designReview/repairPromptBuilder.ts'
 const RECOVERY_TESTS = ['src/designReview/repairFromStoredReview.test.ts']
 const GENERATION_TESTS = ['src/designReview/repairHumanRecoveryGeneration.test.ts']
 const ADMISSION_TESTS = ['src/designReview/repairAfterResumeReview.test.ts']
@@ -87,6 +88,30 @@ const MUTATIONS = [
     from: '  if (!lineage.ok) {',
     to: '  if (false) {',
     tests: ADMISSION_TESTS,
+  },
+  {
+    id: 'N29-stored-review-recovery-drops-qa',
+    guard: 'stored-review recovery も保存済み QA 結果を canonical prompt へ渡す',
+    file: RECOVERY,
+    from: '    qaResults: storage.qaResults.findByTaskId(taskId),',
+    to: '    qaResults: undefined,',
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N30-qa-heading-limited-to-failures',
+    guard: 'QA 見出しは結果で限定しない（passed を「失敗したQA」の下に置かない）',
+    file: PROMPT_BUILDER,
+    from: "  const lines: string[] = ['## QA結果']",
+    to: "  const lines: string[] = ['## 失敗したQA']",
+    tests: RECOVERY_TESTS,
+  },
+  {
+    id: 'N31-qa-status-normalised',
+    guard: 'QA の status は既存値のまま出す（解釈・変換しない）',
+    file: PROMPT_BUILDER,
+    from: '    lines.push(`- type=${sanitizeUntrusted(qa.type, 50)} status=${sanitizeUntrusted(qa.status, 50)}: ${sanitizeUntrusted(qa.summary, 1_000)}`)',
+    to: "    lines.push(`- type=${sanitizeUntrusted(qa.type, 50)} status=failed: ${sanitizeUntrusted(qa.summary, 1_000)}`)",
+    tests: RECOVERY_TESTS,
   },
   {
     id: 'N14-descendant-human-recovery-not-recognised',
