@@ -6858,6 +6858,35 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    `SAFETY_VERIFICATION_RESULT` を外した**。恒久的に赤いチェックを迂回するために gate を弱めた形であり、
    `overallPassed` は情報量ゼロの信号になっている。
 
+   **(3) の前提を訂正する — 2026-09-24 Production 実測（Job `569cd4ae` / Task `c3849205`）**:
+   `FULL_TESTS` は「1 Job = 1 SafeCommand なので取得できない」のではない。**implement Job の
+   SafeCommand はそもそも `kind: 'test'` であり、`pnpm test` を実際に実行している**
+   （API 1534 / Worker 1382 / Mobile 45、合計 2,961 tests 全通過、exitCode 0）。
+   取得できていない理由は2つで、どちらも順序と受け渡しの問題である:
+   - `runSafetyVerification()` の呼び出しが **SafeCommand 実行より前**にある
+     （`jobRunner.ts`。安全検証ブロック → … → `resolveCommand` / 実行）。
+     結果が存在する時点より前に判定しているので、渡しようがない。
+   - post-implement review へは `implementJob.stdout`（DB の先頭 4000 字プレビュー）が渡っていた。
+     combinedStdout は `=== AI CLI (...) ===` が先頭に来るため、**SafeCommand セクションは
+     プレビューに構造的に入らない**（実測では char 5,308 以降）。reviewer は実測 2,961 tests 通過を
+     一度も見ず、implement AI の自己申告「typecheck/test 未実施」だけを読んで
+     `changes_requested` を返した。**実害として1回発生済み**。
+   後者は **PR #280 で修正済み**（Worker が SafeCommand の出力を専用ログへ書き分け、
+   `readSafeCommandEvidence()` がそれを bounded に読む。分離できない場合は証跡欄を空にし、
+   取得不能を `verification evidence unavailable` として「未実行」と区別する）。
+   前者（safetyVerifier への受け渡し）は本 item に残る。
+   `docs/multi_ai_step_review_flow.md` 4章の「同一 Job 実行内で typecheck/test を別途実行する
+   仕組みが存在しない」という記述は **test については誤り**であり、同ファイルで訂正済み。
+
+   **`TYPECHECK` は本当に未実行**（同実測。full log 64.8 万字に `tsc` / `--noEmit` が 0 件）。
+   `pnpm test` は `pnpm --parallel --filter './apps/*' test` で、root の `typecheck` は別スクリプト。
+   1 Job = 1 SafeCommand なので implement Job はどちらか一方しか実行できない。
+   **post-implement review Job の SafeCommand を `git_status` → `typecheck` に替えるだけでは
+   reviewer には届かない**: `runJob()` は review Job でも AI CLI → verdict 生成 → SafeCommand の順で、
+   reviewer の判断時点で typecheck 結果はまだ存在しない（2026-09-24 にコードで再確認）。
+   それでも review Job の `status` は `exitCode` を含むため `git_commit` Job の生成は
+   fail-closed にできる（reviewer への証跡提示とは別の効果）。着手時に両者を混同しないこと。
+
    **(4) Shadow Commit Gate が観測記録を残さない**: `jobRunner.ts` は
    「判定結果はconsole.logのみ。停止・通知・永続化は行わない（Job結果にも載せない）」。
    直後の `appendObservationLog` に commit-gate フィールドが無い。

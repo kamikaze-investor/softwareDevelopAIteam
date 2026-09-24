@@ -66,7 +66,13 @@ import {
 } from './guards/changeManifest.js'
 import type { ApprovedFileState, ChangeManifest, ReflogBaseline, SensitiveBaseline } from './guards/changeManifest.js'
 import { detectGitOperationState } from './guards/gitOperationState.js'
-import { buildLogPreviews, saveJobLogs } from './jobLogger.js'
+import {
+  PREVIEW_LENGTH,
+  buildLogPreviews,
+  readSafeCommandEvidence,
+  safeCommandSectionHeader,
+  saveJobLogs,
+} from './jobLogger.js'
 import { permissionGuard, permissionGuardWithGrants } from './guards/permissionGuard.js'
 import { callGateCheck, callConsume, GateClientError } from './guards/gateClient.js'
 import type { GateCheckResponse } from './guards/gateClient.js'
@@ -229,6 +235,12 @@ export function parseStructuredReviewOutput(stdout: string): StructuredReviewVer
   return parsed.success ? parsed.data : undefined
 }
 
+/**
+ * implement Job の SafeCommand が「実行された」と機械的に言えるか。
+ * `unknown` は**未実行ではなく**「この証跡からは断定できない」である。
+ */
+type SafeCommandExecutionState = 'executed' | 'skipped_dry_run' | 'unknown'
+
 export function buildStructuredReviewPrompt(input: {
   context: StructuredReviewContext
   baselineHead: string
@@ -236,6 +248,23 @@ export function buildStructuredReviewPrompt(input: {
   diffText: string
 }): string {
   const { task, implementJob } = input.context
+  // reviewer へ渡す検証証跡は **DB プレビューではなく全文ログから** 取る。
+  // プレビューは AI CLI セクションで尽きるため、SafeCommand の出力は構造的に載らない。
+  const evidence = readSafeCommandEvidence({
+    kind: implementJob.safeCommand.kind,
+    stdoutPath: implementJob.stdoutPath,
+    aiCliUsed: Boolean(implementJob.aiCliProvider && implementJob.aiCliMode),
+  })
+  const execution: SafeCommandExecutionState = implementJob.dryRun === true
+    ? 'skipped_dry_run'
+    : evidence.separated ? 'executed' : 'unknown'
+  let resolvedCommand: string | undefined
+  try {
+    resolvedCommand = resolveCommand(implementJob.safeCommand).description
+  } catch {
+    resolvedCommand = undefined
+  }
+
   return `以下に渡された実装結果だけを独立レビューしてください。Git/Bashその他のツールを実行せず、追加のファイル探索も行わないでください。
 
 出力は次のJSON objectだけにしてください。フィールド追加やenum値の変更は禁止です。
@@ -266,15 +295,50 @@ ${JSON.stringify(input.changedFiles, null, 2)}
 [diffText]
 ${input.diffText}
 
-[SafeCommand結果]
+[検証証跡の読み方 — [SafeCommand結果] より先に読むこと]
+- **implement AI の自己申告と、Worker の機械検証は別物である。** implement AI は Read/Glob/Grep/Edit/Write
+  しか持たずコマンドを実行できない。AI が「typecheck / test 未実施」等と書いていても、それは
+  **AI 自身が実行していない**という意味であって、Worker が実行したかどうかとは無関係である。
+- SafeCommand は AI CLI の終了後に **Worker が別途実行する**。Job の exitCode は
+  その SafeCommand の終了コードであり、AI CLI の起動可否ではない。
+- kind に対応する実コマンドは commandResolver が決める（下の resolvedCommand 欄）。
+- [implement Job結果].stdoutPreview は DB 上のプレビュー（先頭${PREVIEW_LENGTH}字）で全文ではない。
+  検証出力は [SafeCommand出力] を見ること。
+- **evidence.separated が false のとき、および抜粋に探している文字列が無いときは、
+  「証跡を取得できなかった／抜粋に入らなかった」であって「検証が実行されなかった」ではない。**
+  未実行を根拠にした指摘を書いてはならない。証跡不足として書くこと。
+  separated が false の場合、下の2つの欄は**空にしてある**（分離できない内容を証跡として出さないため）。
+- [SafeCommand出力] は先頭と末尾を残した bounded 抜粋で、中間は落ちている（omittedChars 参照）。
+  落ちた中間を補うため、集計行だけを位置に依存せず拾ったものが [SafeCommand集計行] である。
+  **どちらも網羅ではなく、真正性も保証されない。** 走らせるコード自体を書いたのは implement AI なので、
+  集計らしい行は偽造でき、上限まで埋めて本物を押し出すこともできる。
+  ある workspace の集計が見当たらないことは、それが走らなかった証拠ではない。
+  **実行の成否について機械的に確定しているのは exitCode だけである。**
+- [implement Job結果].stdoutPreview は implement AI 自身の出力であり、**検証証跡ではない**。
+  そこに何が書いてあっても、Worker が実行したかどうかの根拠にしてはならない。
+
+[SafeCommand結果 — Worker による機械検証]
 ${JSON.stringify({
     kind: implementJob.safeCommand.kind,
-    status: implementJob.status,
+    resolvedCommand,
+    execution,
     exitCode: implementJob.exitCode,
-    stdout: implementJob.stdout,
+    status: implementJob.status,
     stderr: implementJob.stderr,
     guardResult: implementJob.guardResult,
+    evidence: {
+      source: evidence.source,
+      separated: evidence.separated,
+      omittedChars: evidence.omittedChars,
+      note: evidence.note,
+    },
   }, null, 2)}
+
+[SafeCommand集計行（位置に依存しない抽出。網羅でも真正性の保証でもない）]
+${evidence.summaryLines.length > 0 ? evidence.summaryLines.join('\n') : '(集計行として拾えた行は無い。未実行の証拠ではない)'}
+
+[SafeCommand出力（bounded 抜粋。全文ではない）]
+${evidence.excerpt}
 
 [implement Job結果]
 ${JSON.stringify({
@@ -284,6 +348,7 @@ ${JSON.stringify({
     completedAt: implementJob.completedAt,
     aiCliProvider: implementJob.aiCliProvider,
     aiCliMode: implementJob.aiCliMode,
+    stdoutPreview: implementJob.stdout,
   }, null, 2)}`
 }
 
@@ -1250,7 +1315,7 @@ export async function runJob(
       const evidence = `[commit-evidence] commitHash=${createdCommitHash}`
       try {
         // commit作成直後、後続の最終検査より前にJob個別ログへ同期保存する。
-        saveJobLogs(job.id, `${evidence}\n${stdout}`, stderr)
+        saveJobLogs(job.id, `${evidence}\n${stdout}`, stderr, stdout)
       } catch (err: unknown) {
         // ログ保存失敗は非致命的（実行結果には影響しない）。commit は既に
         // 作成済みで覆せないため、Job を failed 化せず注記のみ残して続行する。
@@ -1329,13 +1394,16 @@ export async function runJob(
     ? `[commit-evidence] commitHash=${createdCommitHash}\n`
     : ''
   const combinedStdout = commitEvidenceSection + (aiCliStdoutSection
-    ? `${aiCliStdoutSection}\n=== SafeCommand (${job.safeCommand.kind}) ===\n${stdout}`
+    ? `${aiCliStdoutSection}\n${safeCommandSectionHeader(job.safeCommand.kind)}\n${stdout}`
     : stdout)
   let logPaths: ReturnType<typeof saveJobLogs> | undefined
   let stdoutPath: string | undefined
   let stderrPath: string | undefined
   try {
-    logPaths = saveJobLogs(job.id, combinedStdout, stderr)
+    // 第4引数: SafeCommand 単体の stdout を専用ファイルへも保存する。後続の review が
+    // AI CLI の出力と混ぜずに読めるようにするため（文字列探索で分離しない）。
+    // dryRun では SafeCommand を実行していないので渡さない。
+    logPaths = saveJobLogs(job.id, combinedStdout, stderr, job.dryRun === true ? undefined : stdout)
     stdoutPath = logPaths.stdoutPath
     stderrPath = logPaths.stderrPath
   } catch (err: unknown) {
