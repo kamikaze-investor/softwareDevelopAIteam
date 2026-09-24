@@ -66,7 +66,12 @@ export interface RepairPromptInput {
   job?: RepairJobFacts
   /** changes_requested のReviewResult。 */
   review?: RepairReviewFacts
-  /** 失敗したQA（テスト等）。 */
+  /**
+   * QA結果（テスト・typecheck 等）。**失敗したものに限らない。**
+   * `passed` / `skipped` も含めてそのまま提示する —— 後から確認された「通っている」という
+   * 事実も、保存済みの negative review と同じく repair AI が扱うべき事実だからである。
+   * ここで status を解釈・変換しない（`UNTRUSTED_FAILURE_DATA` 内のデータのまま）。
+   */
   qa?: RepairQaFacts[]
   /** 何回目のrepairか（1始まり）。 */
   attempt?: number
@@ -144,7 +149,9 @@ function formatReviewFacts(review: RepairReviewFacts): string[] {
 }
 
 function formatQaFacts(qaResults: RepairQaFacts[]): string[] {
-  const lines: string[] = ['## 失敗したQA']
+  // **見出しは結果で限定しない。** `passed` の QA を「失敗したQA」の下へ置くと、
+  // 提示している事実と逆の意味になる。status は既存値をそのまま出す。
+  const lines: string[] = ['## QA結果']
   for (const qa of qaResults) {
     lines.push(`- type=${sanitizeUntrusted(qa.type, 50)} status=${sanitizeUntrusted(qa.status, 50)}: ${sanitizeUntrusted(qa.summary, 1_000)}`)
     if (qa.details) lines.push(`  details: ${sanitizeUntrusted(qa.details, 2_000)}`)

@@ -243,9 +243,25 @@ function evaluateAndAct(
   chain: { implementJob: Job, review: ReviewResult },
   deps: RepairFromStoredReviewDeps,
 ): RepairFromStoredReviewOutcome {
+  // **保存済み QA 結果も canonical prompt へ載せる。**
+  //
+  // 通常の review 経路（`routes/jobs.ts`）は既に `qaResults` を `prepareRepairFlow()` へ
+  // 渡しており、そこから `buildRepairPrompt()` の `qa` 欄になる。stored-review recovery だけが
+  // その配線を持っていなかったので、**同じ責務をここでも使うだけ**である（新しい入力経路は無い）。
+  //
+  // これが要るのは、保存済み verdict が「その時点で reviewer が見られた証拠」でしかないためで、
+  // 後から機械的に確認された事実（例: テストは実際に通っていた）を併せて提示しないと、
+  // repair AI は誤った前提のまま修正しに行く。**negative review は消さない。** 両方を
+  // 事実として並べ、矛盾は repair AI が扱う。
+  //
+  // `qaResults` は `prepareRepairFlow()` の中で `buildRepairPrompt()` へ渡るだけで、
+  // admission / authority(`rootKind`) / generation budget のどの判定にも入らない。
+  // そのため上の dry-run へは配線しない —— 判定が変わらないところで同じ読み取りを
+  // 二重に走らせても、承認要否は 1 文字も変わらないためである。
   const preparation = prepareRepairFlow(storage, {
     failedJob: chain.implementJob,
     review: chain.review,
+    qaResults: storage.qaResults.findByTaskId(taskId),
   })
 
   if (preparation.action === 'escalate') {
