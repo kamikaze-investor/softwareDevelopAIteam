@@ -206,6 +206,79 @@ describe('blocked Task への repair — 通るケース', () => {
       expect(result.run.taskId).toBe(implementJob.taskId)
     }
   })
+
+  // **CEO の REJECT が 2 回続いた lineage**（2026-09-24 production 実測・Task `c3849205`）。
+  //
+  //   7061400a (git_commit, REJECT → blocked)
+  //     → resume  5472d0c1 (git_commit, REJECT → blocked)
+  //       → human resume  569cd4ae (implement, success)
+  //         → review changes_requested
+  //
+  // `resumeBlockedTask()` は元の行を blocked のまま残すので、REJECT のたびに blocked な
+  // ancestor が 1 件ずつ増える。除外を「最も近い resume 元 1 件」に固定していた頃は、
+  // ここで `7061400a` が live 判定になり、canonical repair が admission だけで止まっていた。
+  it('REJECT が 2 回続いて blocked ancestor が 2 件あっても repair を作る', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    const blockedAncestor = (stepKey?: string): Job => {
+      const job = storage.jobs.create({
+        taskId: ids.taskId,
+        projectId: ids.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'noop' },
+        ...(stepKey === undefined ? {} : { workflowStepKey: stepKey }),
+      } as never)
+      return storage.jobs.update(job.id, { status: 'blocked' } as never)!
+    }
+
+    // 1回目の REJECT で blocked のまま残った git_commit Job。
+    const firstRejected = blockedAncestor()
+    // その resume successor も REJECT され、やはり blocked のまま残る。
+    const secondRejected = blockedAncestor(`resume:${firstRejected.id}:1`)
+    // 2 度目の Human Resume で作られた実装が成功する。
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `resume:${secondRejected.id}:1`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    // 前提の再現: blocked な ancestor がちょうど 2 件ある。
+    expect(storage.jobs.findByTaskId(ids.taskId).filter((j) => j.status === 'blocked')).toHaveLength(2)
+
+    const result = prepareRepairFlow(storage, { failedJob: implementJob, review })
+
+    expect(result.action).toBe('queue')
+  })
+
+  // 3 件でも同じ。**件数を固定しない**ことがこの規則の要点である。
+  it('blocked ancestor が 3 件でも repair を作る（件数に依存しない）', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    let previous: Job | undefined
+    for (let i = 0; i < 3; i += 1) {
+      const job = storage.jobs.create({
+        taskId: ids.taskId,
+        projectId: ids.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'noop' },
+        ...(previous === undefined ? {} : { workflowStepKey: `resume:${previous.id}:1` }),
+      } as never)
+      previous = storage.jobs.update(job.id, { status: 'blocked' } as never)!
+    }
+
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `resume:${previous!.id}:1`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    expect(storage.jobs.findByTaskId(ids.taskId).filter((j) => j.status === 'blocked')).toHaveLength(3)
+    expect(prepareRepairFlow(storage, { failedJob: implementJob, review }).action).toBe('queue')
+  })
 })
 
 describe('blocked Task への repair — 通してはいけないケース', () => {
@@ -420,7 +493,79 @@ describe('blocked Task への repair — 通してはいけないケース', () 
     })
   }
 
-  // 元 Job を外すのは **stepKey が名指しする 1 件だけ**。無関係な blocked は従来どおり拒む。
+  // **深い ancestor でも根拠は `blocked` という状態そのものである。**
+  // 上の 2 件は「最も近い ancestor」を live へ戻す形だったので、**2 段上**でも同じことを固定する。
+  // 経路上にいるというだけで状態を問わず外すと、本当に動いている Job の上へ repair を積む。
+  for (const liveStatus of ['queued', 'running'] as const) {
+    it(`2 段上の ancestor が ${liveStatus} なら通さない`, () => {
+      const storage = createSQLiteStorage(':memory:')
+      const ids = seed(storage)
+
+      const first = storage.jobs.create({
+        taskId: ids.taskId,
+        projectId: ids.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'noop' },
+      } as never)
+      storage.jobs.update(first.id, { status: 'blocked' } as never)
+      const second = storage.jobs.create({
+        taskId: ids.taskId,
+        projectId: ids.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'noop' },
+        workflowStepKey: `resume:${first.id}:1`,
+      } as never)
+      storage.jobs.update(second.id, { status: 'blocked' } as never)
+
+      const implementJob = createResumedImplementJob(storage, ids, {
+        workflowStepKey: `resume:${second.id}:1`,
+      })
+      const reviewJob = createReviewJob(storage, ids, implementJob.id)
+      const review = storeReview(storage, ids, reviewJob.id)
+
+      // 2 段上（最も近い ancestor ではないほう）が live へ戻る。
+      storage.jobs.update(first.id, { status: liveStatus } as never)
+
+      expect(skipped(storage, implementJob, review)).toContain('live job exists')
+    })
+  }
+
+  // **打ち切る条件は「blocked でない」ことであって「success」ではない。**
+  // 途中に `failed` が挟まれば、そこで連続は切れる。success だけで打ち切る実装に
+  // 退行すると、`failed` を跨いで上流の blocked まで外れてしまう（独立レビュー指摘）。
+  it('連続が failed で切れていれば、その上の blocked は live のまま', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+
+    const make = (status: string, stepKey?: string): Job => {
+      const job = storage.jobs.create({
+        taskId: ids.taskId,
+        projectId: ids.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        safeCommand: { kind: 'noop' },
+        ...(stepKey === undefined ? {} : { workflowStepKey: stepKey }),
+      } as never)
+      return storage.jobs.update(job.id, { status } as never)!
+    }
+
+    // blockedUpstream ← failedMid ← blockedNearest ← implement
+    const blockedUpstream = make('blocked')
+    const failedMid = make('failed', `resume:${blockedUpstream.id}:1`)
+    const blockedNearest = make('blocked', `resume:${failedMid.id}:1`)
+    const implementJob = createResumedImplementJob(storage, ids, {
+      workflowStepKey: `resume:${blockedNearest.id}:1`,
+    })
+    const reviewJob = createReviewJob(storage, ids, implementJob.id)
+    const review = storeReview(storage, ids, reviewJob.id)
+
+    // `blockedNearest` は外れるが、`failed` で連続が切れるので `blockedUpstream` は残る。
+    expect(skipped(storage, implementJob, review)).toContain('live job exists')
+  })
+
+  // 外すのは **walk が実際に辿った経路上の Job だけ**。無関係な blocked は従来どおり拒む。
   it('resume の元ではない blocked Job は従来どおり通さない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, implementJob, review } = productionShape(storage)
