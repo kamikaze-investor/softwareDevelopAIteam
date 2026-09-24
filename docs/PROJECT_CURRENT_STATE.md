@@ -286,6 +286,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
 - **external completion reconcile の根拠2つが、まだ機械照合になっていない**（state: planned）
 - **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
+- **AI / provider 由来の untrusted diagnostic data が、operator 向けの経路へそのまま届く**（state: planned）
 - **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い**（state: deferred）
 - **Design Review の却下が durable に記録されず、却下履歴を後から辿れない**（state: deferred）
 - **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる**（state: deferred）

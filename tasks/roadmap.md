@@ -8493,6 +8493,126 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 取り下げた Task が後から再開されうるか。されるなら履歴をどう残すか
       - 効果検証可能性（Design Philosophy 8）: 取り下げ件数とその理由を後から数えられること
 
+<!-- roadmap:id=job-raw-output-persisted-and-shown state=planned -->
+8. [ ] **AI / provider 由来の untrusted diagnostic data が、operator 向けの経路へそのまま届く** —
+      2026-09-18登録（production 実測）。**本項目は Finding であり、まだ実装しない。**
+
+      **本項目の責務（CEO 判断・2026-09-18 に拡張）**: 当初は「Job の raw stdout/stderr」だけを
+      対象にしていたが、同じ構造の事実が別経路でも見つかったため、根本責務を
+      **「AI / provider 由来の untrusted diagnostic data」と「operator-facing safe view」の分離**
+      として扱う。raw stdout/stderr はその一例にすぎない。
+      新しい Finding を分けず本項目へ統合するのは、**消し方ではなく「どこに何が届くか」の
+      棚卸しが先**という点で調査対象が同一であり、分けると同じ調査を二重に行うためである。
+
+      **事象 (a) raw stdout/stderr**: AI CLI の出力は加工されずに `jobs.stdout` / `jobs.stderr`
+      へ保存され、Mobile の Job 詳細（`apps/mobile/app/tasks/[id].tsx`）がそのまま表示する。
+      中身は provider 次第で、**credential 断片・prompt 抜粋・モデル出力本文**を含みうる。
+
+      **事象 (b) blocked file path**（2026-09-18 追加・独立レビュー指摘）:
+      `formatGuardBlockNote()`（`apps/worker/src/jobRunner.ts`）は File Change Guard が
+      止めた**ファイルパスを先頭行へ出す**。このパスは **AI / モデルが選んだ文字列**であり、
+      `withLeadingNote()` → `stopReason()`（`apps/api/src/state/systemState.ts`）→ attention →
+      `executionLoop.ts` の CEO escalation まで到達する。
+      **つまり #258 が固定語彙にした4経路に、別の untrusted 文字列が別ルートで載っている。**
+
+      一方で **path 自体は捨てられない**。`allowedPaths` を広げるべきか / protected path を
+      触ろうとしたのか / scope mismatch なのかは、**どのパスが止められたか**を見ないと判断できない。
+      **単純に抑制すると診断能力が落ちる**（CEO 判断・2026-09-18）。これは claude_code の認証
+      固有の問題ではなく、**全 provider 共通の operator-facing trust boundary** の問題であり、
+      だからこそ #258 の責務外として本項目へ寄せた。
+
+      **実測（2026-09-18）**: `claude_code` の `--output-format json` envelope には
+      `result` フィールドがあり、成功時は**モデル本文そのもの**が入る
+      （`reviewerAdapter.ts`: 「`result` は**文字列**で、その中に reviewer JSON が入る」）。
+      API エラー時は API のエラー文が入り、`401` なら
+      `invalid Authorization: Bearer sk-...` の形が入りうる。
+      この envelope が丸ごと `jobs.stdout` に残る。
+
+      **PR #258 が閉じた範囲と、残した範囲（CEO 判断・2026-09-18）**:
+
+      #258 は **claude_code の AI CLI 実行経路について**、operator-facing failure reason /
+      `stopReason` / attention / CEO notification の4経路に provider 文字列を流さないようにした。
+      具体的には (i) API エラー本文を echo せず固定語彙へ分類（`credit exhausted` /
+      `authentication failed` / `access forbidden` / `rate limited` / `API error`）、
+      (ii) `permission_denials[].tool_name` を**件数へ置き換え**、
+      (iii) envelope を stdout 全体に限定して、モデルが書いた JSON 断片で偽の分類を
+      作れないようにした。
+
+      **#258 が閉じていないもの**（本項目の対象）:
+      - Job 詳細に保存・表示される raw stdout/stderr。**変更しておらず、安全とも述べない**
+      - `formatGuardBlockNote()` の blocked file path（上の事象 (b)）。**同じ4経路に届く**
+      - claude_code 以外の provider の失敗出力（非 0 終了時は raw をそのまま出している。
+        テスト失敗や build エラーの出力自体が診断材料なので、#258 では意図的に変えていない）
+
+      雑に sanitize すると既存の診断証拠を失うため、横断的な責務として本項目へ分離した。
+
+      **既出だが open item が無かった**（重複確認済み・2026-09-18）:
+      - `project-auto-worker-trust-boundary`（done）が 2026-08-12 に
+        「現HEADには stdout/stderr に対する中央 redaction/sanitization 処理は**存在しない**」と
+        記録し、「将来中央 redaction が必要と判断された場合も…別途 CEO 承認のもと
+        本項目または関連項目で扱う」と**明示的に見送って**いる
+      - `roadmap-parser-metadata-and-checkbox-tolerance`（done）も
+        「stdout/stderr 中央 redaction の要否は `project-auto-worker-trust-boundary` で既出
+        （**未実装・見送り済み**）」と書き、対象を「Job 実行時の AI CLI 出力」と特定している
+      どちらも **`done` item の中の記述**であり、`PROJECT_CURRENT_STATE.md` の
+      「未完了・保留項目」には現れない。**開いた追跡項目が無かったのが本項目の登録理由**である
+      （`project-completion-badge-wording-correction` と同じ構造的な漏れ）。
+
+      **【最初に採用されるスコープは read-only の調査だけである（CEO 指示・2026-09-18）】**
+
+      VPS PL がこの項目を自律採用した場合、**いきなり sanitize の実装へ進ませない**。
+      1 回目の `implementationScope` は下の調査と設計比較に限定し、**コード変更を伴わない**。
+      成果物は調査結果と選択肢の比較であって、redaction の実装ではない。
+
+      理由: 何が漏れうるかを provider 横断で測る前に消し方を決めると、
+      (a) 知らない形を取りこぼす denylist を作り、(b) 障害診断に要る証拠を同時に失う。
+      2026-09-18 の `Credit balance is too low` は raw stdout を読めたから特定できた。
+
+      **調査中に Safety / data-retention / access policy の変更が必要だと分かった時点で、
+      実装せず CEO 判断へ上げること。** 保存期間の短縮・既存ログの破棄・アクセス制御の新設は
+      いずれもこれに当たる。
+
+      **着手時に調査すること（実装方針を先に決めない。新しい sanitize subsystem を先に作らない）**:
+      0. **棚卸しを最初に行う。** operator 向け経路（failure reason / `stopReason` / attention /
+         CEO notification / Mobile Job 詳細 / `/api/state`）へ届く
+         **AI / provider 由来の文字列を全部並べる**。少なくとも以下を含める:
+         - raw stdout / stderr
+         - blocked file path（`formatGuardBlockNote()`）
+         - tool name（`permission_denials[].tool_name`。#258 で件数化済み。**他に同種が無いか**）
+         - provider error text（#258 で分類済み。**他 provider 経路が残っていないか**）
+         - model-selected identifiers（branch 名 / commit message / task 名 / ファイル名など、
+           **モデルが決めた文字列が識別子として operator へ出ていないか**）
+         経路ごとに「どの部分文字列が AI 由来か」「その表示が何を立証しているか」を書く。
+         **この棚卸しの前に、消し方・隠し方を決めない。**
+      1. **全 provider の stdout/stderr に何が入り得るか**を実測する。claude_code だけの話ではない
+      2. **どこへ永続化・表示されるか**を洗い出す: `jobs` 表 / `stdout_path`・`stderr_path` の
+         ログファイル / audit / Outbox payload / Mobile Job 詳細 / `/api/state`
+      3. **raw evidence を保持する診断上の価値**。2026-09-18 の `Credit balance is too low` は
+         raw stdout を読めたから特定できた。**消すと原因究明能力を失う**
+      4. **operator 向け表示だけを sanitized view として分離できるか**。
+         raw は残し、見せる側だけ安全にする形が第一候補
+      5. raw evidence を保存し続けるなら、**access と retention をどう扱うか**
+      6. 既存 `sanitizeMessage()`（`geminiRouter.ts`、export 済み。env 値と secret の
+         「形」を redact）を**補助として**使えるか
+      7. **denylist redaction だけで安全とみなさない。** 知らない形は必ず抜ける。
+         #258 が採った「echo せず固定語彙へ分類する」allowlist 方式のほうが強い
+      8. structured / allowlisted diagnostics へ置き換えられる箇所はどこか
+
+      9. **安全に「見せる」方法を比較する（調査前に1つへ決めない。CEO 指示・2026-09-18）**。
+         path のように**捨てられない情報**をどう出すかは、少なくとも以下を並べて比較する:
+         - repo-relative path のみ許可する（絶対パス・`..` を出さない）
+         - control character を除去する
+         - path normalization を通す
+         - **許可された workspace 内に収まっていることを再検証**し、外なら出さずに分類名だけ出す
+         - **raw value と safe display value を別の値として持つ**（raw は残し、表示だけ安全にする）
+         どれが最善かは棚卸しの結果次第であり、**先に決めない**。
+
+      **理想形**: `raw diagnostic evidence` と `operator-facing safe view` を分離すること。
+      ただし**新しい DB schema も権限システムも先に追加しない**（CEO 指示・2026-09-18）。
+
+      **着手前に CEO 判断へ上げる条件**: 実装が Safety 方針または data-retention 方針の
+      変更を伴うと判明した場合（保存期間の短縮・既存ログの破棄・アクセス制御の新設など）。
+
 <!-- roadmap:id=task-design-review-conflict-has-no-recovery-route state=deferred -->
 8. [ ] **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い** —
       2026-09-18登録（production 実測）。**本項目は Finding であり、まだ実装しない。**
