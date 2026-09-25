@@ -3,7 +3,7 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import type { Job } from '@ai-team/shared'
 import { prepareRepairFlow, executeQueuedRepair } from './repairFlow'
-import { recoverAndRekickAtStartup } from './designReviewCoordinator'
+import { recoverAndRekickAtStartup } from './queuedRunDispatch'
 
 /**
  * Durable Stage 2 Initiation。

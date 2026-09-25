@@ -5,7 +5,7 @@ import type { Job } from '@ai-team/shared'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { executeQueuedRepair, prepareRepairFlow } from './repairFlow'
 import { MAX_REPAIR_ATTEMPTS } from './repairPolicy'
-import { recoverAndRekickAtStartup } from './designReviewCoordinator'
+import { recoverAndRekickAtStartup } from './queuedRunDispatch'
 
 /**
  * Stage 2 E2E。
