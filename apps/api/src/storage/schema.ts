@@ -197,6 +197,17 @@ export const CREATE_TABLES = `
     created_at TEXT NOT NULL,
     started_at TEXT,
     completed_at TEXT,
+    -- successor intent: この run が終わったら何を起動すべきか。
+    -- repair 目的の run でだけ入り、それ以外は NULL。
+    --
+    -- 値は repair chain の source implementation Job id で、stepKey は
+    -- repairStepKeyFor() で決定的に導出する。stepKey 文字列そのものは保存しない
+    -- (保存すると同じ事実が2箇所に増え、片方だけ古くなる)。
+    --
+    -- これが無いと、run 作成後 dispatch 前に落ちたとき「この run は何のためのものか」が
+    -- durable state から復元できない (review_kind は対象の種別、subject_id は task_id で、
+    -- どちらも successor を表さない)。
+    repair_source_job_id TEXT,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
 
@@ -445,6 +456,10 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   { table: 'gate_evaluations', column: 'resulting_commit', definition: 'TEXT' },
   { table: 'design_review_runs', column: 'task_title', definition: "TEXT NOT NULL DEFAULT ''" },
   { table: 'design_review_runs', column: 'changed_files', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  // successor intent（U1）。**nullable かつ default 無し**で、既存行は NULL のまま残す。
+  // 既存の queued repair run から source Job を推論して backfill しない —— 推論で
+  // durable な lineage を書くことは、この列が防ごうとしている害そのものである。
+  { table: 'design_review_runs', column: 'repair_source_job_id', definition: 'TEXT' },
   { table: 'jobs', column: 'agent_role', definition: "TEXT NOT NULL DEFAULT 'developer_ai'" },
   { table: 'jobs', column: 'workflow_step_key', definition: 'TEXT' },
   { table: 'jobs', column: 'safe_command', definition: 'TEXT' },

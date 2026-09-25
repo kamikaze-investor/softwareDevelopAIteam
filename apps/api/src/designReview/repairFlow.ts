@@ -66,6 +66,15 @@ export type RepairPreparation =
         designText: string
         designTextHash: string
         changedFiles: string[]
+        /**
+         * successor intent。**この run が終わったら誰を repair するのか**を run 自身へ載せる。
+         *
+         * `stepKey` は同じ `sourceJobId` から導出される派生値であり、プロセスのスタック上に
+         * しか存在しない。dispatch 前に落ちるとそれが失われるため、durable 側へはこちらを持たせる。
+         * 全 create 経路が `preparation.run` をそのまま `create()` へ渡すので、
+         * ここに載せるだけで4経路すべてが永続化する（呼び出し側の個別処理は作らない）。
+         */
+        repairSourceJobId: string
       }
       stepKey: string
       attempt: number
@@ -298,6 +307,12 @@ export async function runRepairFlow(
     requireDifferentApproach: decision.requireDifferentApproach,
   })
 
+  // **この経路は run へ successor intent（`repairSourceJobId`）を載せていない。**
+  // `runRepairFlow()` は review の作成と実行を同一 await の中で完結させる同期的な経路で、
+  // 現在 production から呼ばれていない（参照は本 module の test だけ）。dispatch 前に
+  // intent を失う窓がそもそも無いため U1 の対象外とした。
+  // **再配線するなら、ここでも intent を渡すこと** —— さもないと queued のまま落ちた run が
+  // 「何のための review か」を持たない状態に戻る。
   const reviewOutcome = await createAndExecuteDesignReview(
     storage,
     {
@@ -826,6 +841,10 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
       designText,
       designTextHash: computeDesignTextHash(designText),
       changedFiles: failedJob.changedFiles ?? [],
+      // `decision.stepKey` と**同じ1つの値**から来ている（`decideRepairAction()`）。
+      // ここで `failedJob.id` を書き直すと、将来 anchor の決め方が変わったときに
+      // 永続値と stepKey が静かに食い違う。
+      repairSourceJobId: decision.sourceJobId,
     },
     stepKey: decision.stepKey,
     generation: decision.generation,
