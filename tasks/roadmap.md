@@ -5647,6 +5647,12 @@ deploy canary は全 PASS だった。
          legacy 同士の root 共有という受容事項が、解除後も破られないようにするため
       **上記が全て満たされるまで interlock は維持する（CEO 指示）。**
 
+      **2026-09-25 追記（下流依存の明記。本項目の受入条件・順序は変えない）**: AIcompanyOS 方向の
+      `company-state-foundation` → `organizational-learning` → `cross-project-compounding` →
+      `organizational-self-evolution`（いずれも `deferred`）は、本項目の S4 と
+      `SingleRunningProjectError` 解除（上記受入条件 1〜7）を前提とする。複数 Project を同時に安全運用できる前に
+      Company-wide learning を実装しない。**本項目を前倒し・拡張する理由にはしない。**
+
 <!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
 1. [ ] **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）** —
       High-priority Recovery修正が一段落した後、
@@ -6265,12 +6271,12 @@ deploy canary は全 PASS だった。
       Investigate、Experiment、Evolutionの責務を維持したまま、共通Experience、Prediction vs Actual、
       Lesson Candidate、Evidence/Confidence、Policy Proposal、Namespace、Versioning、Rollback、
       `development` / `oss_sourcing` Learning Profileを統合する。Operationalizeは既存Proposal Lifecycleと
-      CEO明示承認を毎回必要とし、低リスクを含めPolicyの自動適用は行わない。
+      CEO明示承認を毎回必要とし、低リスクを含めPolicyの自動適用は行わない。（**2026-09-25**: 追跡 owner を分割。Learning 側は `organizational-learning`、Evolution 側（Policy Proposal / Versioning / Rollback）は `organizational-self-evolution`。上の「5c」は `specs/13` に存在しない dangling 参照で、該当内容は 5b-5 / 5b-5-1 にある）
 - [ ] Team別 Learning Profile展開
       Learning / Evolution Core完成後にEvaluation、Security、Marketing等へProfileを追加する。Team固有の
       Metrics、Evidence threshold、Critical condition、Feedback timing、Policy targetをProfileとして定義し、
       独自Learning Engineを増やさない。Team LessonのCompany Lesson昇格はCross-domain validationを要し、
-      自動全社適用をしない。
+      自動全社適用をしない。（2026-09-25: Company Lesson 昇格の owner は `cross-project-compounding`）
 - [ ] Development TeamのTeam Extension化（現状はClaude Code/Codex/Geminiが`apps/worker`に直接組み込まれた
       単一構成。将来的にTeam概念として抽象化するかは要検討）
 - [ ] Team Health（Team単位の状態可視化。現状のProject単位health-scoreとは別軸。actor・
@@ -6279,10 +6285,152 @@ deploy canary は全 PASS だった。
 - [ ] Self Diagnosis Framework（観測のみ・変更なし。Token-Efficient Intelligence Policy準拠必須）
 - [ ] Improvement Planner（改善提案作成のみ・本番反映なし）
 - [ ] Problem-Driven Research（外部調査。具体的課題がある場合のみ開始）
-- [ ] Experiment（Replay/Shadow/Canary。本番反映前の段階的検証）
-- [ ] Personal Evolution / Profile Evolution / Core Evolution（CEO承認付き昇格フロー）
+- [ ] Experiment（Replay/Shadow/Canary。本番反映前の段階的検証）（2026-09-25: Organization 変更の評価としての owner は `organizational-self-evolution`。実行系は `dry-run-does-not-simulate` / `staged-rollout-absent`）
+- [ ] Personal Evolution / Profile Evolution / Core Evolution（CEO承認付き昇格フロー）（2026-09-25: owner は `organizational-self-evolution`）
 - [ ] `docs/AI_TEAM_OS_DESIGN.md`「第3弾」（AI Reliability/KPI/Conflict Management/Learning Control/Rollback/
       AI Runtime State）との重複整理（要整理・将来統合検討。今回は削除・置換しない）
+
+### AIcompanyOS への長期発展（Company State / Organizational Learning / Cross-Project Compounding / Organizational Self-Evolution。2026-09-25登録・全項目 deferred）
+
+**設計参照（なぜ本節があるか・外部調査・OSS 候補・未決事項）**:
+`docs/project_memory/decisions/aicompanyos_evolution_reference_2026_09_25.md`。
+本節は実装順序と着手条件だけを持ち、設計原則を重複記述しない。
+
+**位置づけ**: 最終像は、交換可能な AI Worker を使いながら会社自身が正本・判断・結果・学習を所有し、
+`Build → Launch → Operate → Observe → Decide → Experiment → Measure → Learn → Improve → Expand / Kill`
+を回し続けることである。本節はその能力を**4 項目だけ**で追跡する。概念ごとに項目を作らない。
+
+**既存項目へ統合したもの（新規にしなかったもの）**:
+- Event / Trace の Project addressing → `cross-project-state-api`（`audit_log.project_id`）
+- 実行系 simulation / 段階投入 / rollback 事前確認 → `dry-run-does-not-simulate` / `staged-rollout-absent` /
+  `recoverability-precheck-before-risky-change`
+- AIteamOS 内部の反復インシデントからの改善提案 → `project-auto-incident-pattern-improvement`（そのまま進める）
+- 反復判断の記録と sensor による再 Review 候補 → `specs/23` と `principle-registry-coverage-and-threshold-review`
+- Role / Model 割当の設定表 → `role-model-registry`
+- 自己開発の Candidate → Promotion 経路 → `aiteamos-self-development-tier-a` / `aiteamos-self-development-tier-b`
+- 上の「将来アーキテクチャ移行」節の未追跡チェックボックス（Learning / Evolution Core・Team別 Learning Profile・
+  Experiment・Evolution）と「組織学習の不足分」（Knowledge Lifecycle / Conflict・指標と評価の分離・
+  Problem-driven Learning）は、削除せず下記 4 項目を owner として注記した
+- Scenario / What-if（Secondary）→ 独立項目にせず `company-state-foundation` の後段設計課題
+
+**4 項目に分けた理由（1 項目へまとめなかった理由）**: 着手可否は `state=` が機械的に決める。
+4 つは着手条件がそれぞれ違う（Company State は複数 Project の同時運用、Learning は Company State の lineage、
+Compounding は実際に並走する第2 Project の実データ、Self-Evolution は Validated Learning と Organization Version）。
+1 項目にまとめると前段だけを `planned` にできず、採用時に後段まで実装対象と解釈される
+（`roadmap-adoption-followups` が扱う既知の欠陥と同じ形）。
+
+**依存順（Roadmap の critical path に割り込ませない）**:
+`project-workspace-isolation`（S1〜S4）→ `SingleRunningProjectError` 解除 → `cross-project-state-api` 残作業 →
+**[CEO 判断] Company State の置き場所** → `company-state-foundation` → `organizational-learning` →
+`cross-project-compounding` → `organizational-self-evolution`。
+`project-auto-multi-worker` は前提にしない。4 項目とも `deferred` のため PL の自律採用対象外であり
+（`isRoadmapItemAdoptable()` は `planned` のみ）、現在の 24h 自律稼働・Multi-Project 化・既存 critical path の
+順位を変えない。
+
+**全項目共通の制約**:
+- **非交渉原則**（参照文書 1-2 章）: Company State はモデル / vendor の外に置く / Memory is not State・
+  History is not Truth / Proposal ≠ Promotion / Root Policy は自己進化の対象外 /
+  Specialist は可・Single Point of Failure は不可
+- **第二の Governance / Policy system を作らない**。既存の Review / Independent Review / Approval Gate /
+  Mandatory Gate / protected boundary / Stable・Candidate 昇格経路を再利用する
+- **特定 OSS・外部サービスを Roadmap で固定しない**。着手時に「既存機能 → standard / OSS →
+  managed service → 自作」の順で再調査する（外部サービス追加・課金は Yellow Zone）
+- **Goal / Design Philosophy を変更しない**。`design_philosophy.md` 12「AIcompanyOS の Business Management
+  責務を先回りして AIteamOS へ取り込まない」は現行有効である
+
+<!-- roadmap:id=company-state-foundation state=deferred -->
+1. [ ] **Company State Foundation** — 会社そのものが現在状態を保持する — 2026-09-25登録。
+      **解く問題**: 長期運用で「Agent A は方針 A、Agent B は過去 Memory から B、古い document は C」という
+      認識分裂が起き、Agent / model を交換するたびに組織 context の再構築が要る。
+      **将来扱う概念**（一度に巨大 Ontology として作らない。既存 DB の自然な拡張を優先する）:
+      Company / Portfolio / Project / Goal / Policy・Design Philosophy / Metric / Capability /
+      Observation / Decision / Action / Experiment / Result・Outcome / Learning。
+      **含める能力**:
+      - Canonical State / History / Memory・Learning / Raw Evidence の区別。「新しい記録ほど正しい」
+        「頻出する記録ほど正しい」としない（既存の同型: Project レコードが正本で `goal.md` は View、
+        Roadmap の可否は `state=` が正本）
+      - `Observation → Hypothesis → Decision → Action → Result` lineage と、可能なら Evidence provenance
+      - Company-level ID（`company_id` / `project_id` / `task_id` / `decision_id` / `experiment_id` /
+        `organization_version`）から Agent trace へ辿れる構造。**Agent 内部ログ全体を Company DB へ複製しない**
+      - Handoff 境界（Input / Goal / Authority / Canonical State / Evidence / Output / Decision / Result）の
+        標準化。Agent 内部の思考方法は標準化しない（Specialist は可・SPOF は不可）
+      - **設計課題（状態機械は今回も着手時も先に変えない）**: 完成後 lifecycle（Build → Launch → Operate →
+        Observe → Improve → Learn → Expand / Kill）。現行の Project 完了判定
+        （`project-auto-completion-detection`: 状態を増やさず計算値にする決着）と Milestone の意味は変えない。
+        Operate の既存足場は `VPS App Runtime Standard v1`
+      - **後段設計課題（Secondary）**: Scenario / What-if。Canonical State を直接変えず isolated state で
+        比較する。最初から DB 切替（Dolt 等）をしない
+      **着手条件**: (1) `project-workspace-isolation` 完了と `SingleRunningProjectError` 解除、
+      (2) `cross-project-state-api` の `audit_log.project_id` 完了、
+      (3) **CEO 判断**: Company / Portfolio / Business Metric の正本を AIteamOS の DB 拡張として持つか、
+      AIteamOS 外側の AIcompanyOS 層として持つか（`design_philosophy.md` 12 に関わるため AI が決めない）。
+      **作らないもの**: Company Ontology engine、Palantir 互換実装、Postgres への即時移行、Graph DB、
+      固定の Business schema。
+
+<!-- roadmap:id=organizational-learning state=deferred -->
+2. [ ] **Organizational Learning** — 実行履歴を会社の検証済み知識へ変換する — 2026-09-25登録。
+      **解く問題**: 100 回改善しても「何が効いたか」が会社に残らず、データは大量にあるのに学習しない。
+      **Lifecycle**: `Observation → Experience → Candidate Learning → Validation → Validated Learning`。
+      **AI が「こう学んだ」と言っただけでは Validated にしない。**
+      **含める能力**:
+      - Business Outcome feedback: `Task / Deployment / Action → Business Metric change → Outcome` を接続できる
+        モデル。Task 完了や test PASS だけを成功指標にしない。Metric は Project 種類ごとに違うため
+        固定 schema を作りすぎない
+      - 既存設計の実装 owner: `specs/13` 5b-5-1 Knowledge Lifecycle（`applicable_conditions` / `confidence` /
+        `causal_confidence` / Internal・External）/ Knowledge Conflict / 5b-6-1 指標体系の分離 /
+        5b-6-2 評価概念の分離 / 5b-10 Problem-driven Learning / `docs/AI_TEAM_OS_DESIGN.md` 12 Learning Control
+      - Operationalize（Rule / Prompt / Workflow 等への反映）は `specs/13` 5b-5 の CEO 明示承認を維持する。
+        本項目は Learning の検証までを持ち、組織設定の変更は `organizational-self-evolution` が持つ
+      **既存項目との関係**: `project-auto-incident-pattern-improvement` は AIteamOS 内部の反復インシデントを
+      改善提案へつなぐ**狭い実例**であり、本項目を待たずにそのまま進める。本項目はその記録形式を再利用し、
+      第二の Incident / Lesson system を作らない。
+      **着手条件**: `company-state-foundation`（lineage と Outcome を置く場所が要る）。
+
+<!-- roadmap:id=cross-project-compounding state=deferred -->
+3. [ ] **Cross-Project Compounding** — Project の Validated Learning を会社全体で再利用する — 2026-09-25登録。
+      **解く問題**: これが無いと「1万 Project = 1 Project を1万回やる」だけになる。成立すると Project を
+      実行するたびに次の Project の初期能力が上がる（AIcompanyOS の長期 moat 候補）。
+      **Lifecycle**: `Project-local Validated Learning → Transfer Candidate → Target Project Re-validation →
+      Applicable Learning →`（必要十分な Evidence が蓄積した場合のみ）`Company Knowledge`。
+      **Project A で成功した ≠ Project B でも正しい。** 転用先で再検証する。
+      **Negative transfer 防止**: Learning に applicable conditions / source projects / evidence / confidence /
+      known counterexamples / version・validity を関連付け、市場・顧客・価格帯・技術条件の違う対象へ誤って
+      一般化しない。上の「Team別 Learning Profile展開」の「Company Lesson 昇格は Cross-domain validation を要し、
+      自動全社適用をしない」を本項目が引き継ぐ。
+      **検索は SQL first**。vector / graph（sqlite-vec / pgvector / Graphiti 等）は必要が実測されてから再調査する。
+      **着手条件**: `organizational-learning` と、**実際に並走する 2 つ以上の Project の実運用データ**。
+      Multi-Project が成立する前に Company-wide learning を active にしない。
+
+<!-- roadmap:id=organizational-self-evolution state=deferred -->
+4. [ ] **Organizational Self-Evolution** — AI 組織自身の仕事の仕方を Evidence で安全に改善する — 2026-09-25登録。
+      **解く問題**: これが無いと、AIcompanyOS が何百 Project を運営できても、AIcompanyOS 自身を改善する
+      担当は永遠に CEO / 人間のままになる。
+      **Candidate 対象**: Prompt / Skill / Workflow / Tool selection / Routing / Role assignment /
+      Model selection / Reviewer 構成 / Evaluation strategy / Agent configuration。
+      **流れ**: `Current Organization vN → 実行データ分析 → improvement candidate → Candidate Organization vN+1 →
+      replay / dataset / holdout / E2E 評価 → regression check → Independent Review → Promotion Gate → vN+1`。
+      失敗時は vN へ戻せること。
+      **Organization Version / Manifest**: agent・model 割当 / prompts / skills / tools / routing / policies /
+      evaluators / permissions / 関連設定を 1 まとまりで追跡する（LOGOS の Agent Pack を設計参考とする）。
+      **Git を正本とし、独自 version-control system を作らない**。Role / Model 割当は `role-model-registry` の
+      表を含める。
+      **Promotion は既存経路だけを使う**: Stable / Candidate（PR → CI → verified SHA → `--ff-only` deploy）、
+      Approval Gate、Mandatory Gate、Independent Review。Candidate generator（DSPy / GEPA / AFlow 等を含む）に
+      **promotion authority を与えない**。
+      **Root Policy は通常の自己改善の対象外**: Company Goal・Purpose / CEO 所有の Design Philosophy /
+      Approval boundary / permission escalation rule / protected resources（`ALWAYS_FORBIDDEN_PATTERNS` を含む）/
+      self-evolution evaluator そのもの / promotion authority / irreversible external action boundary /
+      audit requirement。変更が要る場合は既存の Human / CEO decision path を通す
+      （`specs/22` 7章「AI 自身に Safety Level を下げさせない」）。
+      **現行ルールの明記**: `specs/13` 5b-5 により、Rule / Prompt / Workflow 等の Operationalize は現在すべて
+      CEO 明示承認が要る。Root Policy 以外の Candidate の昇格権限をこれより緩める場合は、それ自体が
+      CEO 判断である（`specs/22` 14章の「要調整・現行有効」と同じ扱い）。本項目の登録はこれを緩めない。
+      **既存の狭い実例（本項目を待たず稼働・継続する）**: Principle sensor の閉ループ（`specs/23` 12章。
+      原則本文を自動で書き換えず再 Review 候補で止まる）、`project-auto-incident-pattern-improvement`。
+      本項目はこれらを一般化するものであり、並行する別の自己改善 framework を作らない。
+      **着手条件**: `organizational-learning`（Candidate の根拠となる Validated Learning）、
+      `dry-run-does-not-simulate` / `staged-rollout-absent`（replay と段階投入の足場）、
+      `aiteamos-self-development-tier-b`（protected file に届く変更の Promotion 経路）。
 
 ### Architecture Debt: Organization Core切り出しの阻害要因（2026-08-09調査で確定・MVP中は修正しない）
 
@@ -6352,16 +6500,16 @@ Knowledge Consult・Investigate・Distill・Loop Metrics）、`specs/20_token_ef
 - [ ] Knowledge Lifecycle State（External Claim / Observation / Hypothesis / Evidence /
       Validated Knowledge / Operationalized Knowledge / Revalidation）と属性
       （`applicable_conditions` / `confidence` / `causal_confidence` / Internal・External区別）。
-      現行5b-3のKnowledge種別（内容カテゴリ）と直交する軸として追加する。仕様: 5b-5-1
+      現行5b-3のKnowledge種別（内容カテゴリ）と直交する軸として追加する。仕様: 5b-5-1（2026-09-25: owner は `organizational-learning`）
 - [ ] Knowledge Conflict（外部主張と自社実績の不一致をエラーとせず`CONFLICT`として記録し、
-      原因候補を保持する。Conflict自体を価値ある知識として扱う。仕様: 5b-5-1）
+      原因候補を保持する。Conflict自体を価値ある知識として扱う。仕様: 5b-5-1）（2026-09-25: owner は `organizational-learning`）
 - [ ] 指標体系の分離（Execution/Loop Metrics ／ Business Outcome ／ Objective Progress を別軸として扱う。
-      **Loop Metricsへ事業指標を統合しない**。仕様: 5b-6-1）
+      **Loop Metricsへ事業指標を統合しない**。仕様: 5b-6-1）（2026-09-25: owner は `organizational-learning`）
 - [ ] 評価概念の分離（Worker/Execution Quality ／ Strategy/Playbook Performance ／ Business Outcome を
-      混同しない。仕様: 5b-6-2）
+      混同しない。仕様: 5b-6-2）（2026-09-25: owner は `organizational-learning`）
 - [ ] Problem-driven Learningの順序原則の実装
       （Objective/Gap/Opportunity → 原因・仮説 → Internal Knowledge → 不足時のみExternal Knowledge →
-      Experiment → Outcome → Knowledge更新。外部ノウハウを改善活動の起点にしない。仕様: 5b-10）
+      Experiment → Outcome → Knowledge更新。外部ノウハウを改善活動の起点にしない。仕様: 5b-10）（2026-09-25: owner は `organizational-learning`）
 - [ ] Quality Stabilizer（Worker間の品質ばらつきを吸収し最終成果物品質を一定範囲へ収束させる層。
       必要なレベルまでしかescalationしない。仕様: 5b-7-9）
 
@@ -7664,6 +7812,12 @@ PL Console 4項目の state・優先度は変更していない。
       「後から全 Project を大改修せずに済む最小情報構造」とする。
       **Business Goal / Success Metrics / Target Customer 等の Business Management 項目は
       AIteamOS へ持ち込まない**（AIteamOS と AIcompanyOS の責務境界を維持する）。
+
+      **2026-09-25 追記（範囲を広げない）**: AIcompanyOS 方向の Company State（Company / Portfolio /
+      Decision / Experiment / Outcome の正本、`Decision → Action → Result` lineage、
+      `organization_version` 等の Company-level ID）の owner は `company-state-foundation`（deferred）である。
+      **本項目の完了条件へ追加しない。** 本項目の `audit_log.project_id` は、その最初の addressing として
+      再利用される前提で、上記「最小範囲」のまま完了させる。
 
       **依存**: `project-workspace-isolation`（Project が実際に並行しないと横断の意味が薄い）。
       `containment-success-path-observability` と `review-substage-progress-reporting` は
