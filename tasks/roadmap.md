@@ -6166,14 +6166,18 @@ deploy canary は全 PASS だった。
       （`spawn({ timeout })` が 60s で子を終了させていない実測。#122 に記録）は
       **別責務**。本項目は「いつ生成するか」、あちらは「1回の生成の時間契約」。
 
-<!-- roadmap:id=worker-jobs-401-anomaly state=planned -->
-6. [ ] **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）** —
+<!-- roadmap:id=worker-jobs-401-anomaly state=done -->
+6. [x] **過去セッションの孤児 bash 観測ループが旧 legacy token で `GET /api/jobs` を poll し続け、401 を継続発生させていた**
+      — **解決（2026-09-22）。原因特定と停止を Production 実測で確定。下記「解決」参照。**
       2026-09-08、Phase 1/2 operational E2E の観測中に発見。E2E は阻害していないため
       **記録と原因特定まで**とし、P1 regression 修正を優先した。
 
-      **実測できたこと**:
-      - **発生元は Worker プロセス自身**。`ss -tnp` で `:3000` へ接続しているのは
-        Worker(pid) と API(pid) のみ。外部クライアントは存在しない
+      **当初の実測（一部は誤りだった。下記「解決」で訂正）**:
+      - ~~**発生元は Worker プロセス自身**~~。`ss -tnp` で `:3000` へ接続しているのは
+        Worker(pid) と API(pid) のみ、と観測した —— **これが誤診の起点だった**。
+        真犯人の `curl` は1回あたり数十 ms で終わる短命プロセスなので、
+        **`ss` の点観測ではほぼ捕まらない**。「スナップショットに写らなかった」ことを
+        「存在しない」と読んでしまった
       - **401 になるのは `GET /api/jobs?taskId=...` だけ**。同一 Worker からの
         `/api/projects`・`/api/tasks`・他の `/api/jobs` 呼び出しは 200 を返している
         （観測窓: 200 が 7,291 件に対し 401 が 627 件、直近2分でも 961:81）
@@ -6213,6 +6217,50 @@ deploy canary は全 PASS だった。
       **今回実装しないもの（明記）**: 認証まわりの変更 / Watchdog の再設計 /
       新しい retry・auth framework。本項目は記録と原因特定まで。
       P1 regression（`implement:<jobId>:review` の dirty 継承）や Phase 3 とは混ぜない。
+
+      ---
+
+      **解決（2026-09-22）**
+
+      **原因**: 過去セッションが残した**使い捨ての観測用 bash 待機ループ**が孤児化し、
+      旧 legacy `API_TOKEN` を握ったまま `GET /api/jobs?taskId=...` を poll し続けていた。
+      いずれも `until [ "$(curl ... /api/jobs?taskId=<id> ...)" = "..." ]; do sleep 10; done`
+      という形で、Job が特定 status へ到達するのを待つためだけに書かれたもの。
+
+      **確定した事実**（split credential cutover 後の read-only 調査 + 実測）:
+      - 孤児 **5本**。すべて `ppid=1`、`comm=bash`、既に消えた `session-*.scope` cgroup に所属。
+        起動は **2026-08-24〜08-28**（約1か月放置されていた）
+      - 各ループは `/srv/ai-team/env/api.env` の `API_TOKEN` を読む。cutover でこれが
+        失効したため 401 になった（**legacy 時代から同レートで 401 だった**ので、
+        cutover が原因ではない）
+      - **401 に現れる taskId 集合（5個）と、孤児ループが poll する taskId 集合が 1:1 で一致**
+      - **正式 Worker は原因ではなかった。** 正式 Worker は WORKER credential で 200 を返し続けており、
+        **Worker サービス停止中も 401 は同レートで継続**していた
+      - **Mobile / browser でもなかった。** Mobile は `:80` の reverse proxy（Docker 内、Basic 認証）
+        経由で入るが、当該 401 は **localhost から `:3000` へ直接**で proxy を通っていない
+      - 上記「未特定」1〜3（poll loop と非 running Project の矛盾、同一 PID 内の 200/401 混在）は
+        **前提が誤りだったので消滅する**。混在して見えたのは別プロセスの通信だった
+      - 上記「未特定」5（Watchdog の stall 検出が壊れている可能性）も**否定**された
+
+      **対処**: 検証済みの孤児 5 プロセスを **SIGTERM のみ**で停止（`kill -9` は不要だった）。
+      コード・設定・credential・allowlist・polling interval は**一切変更していない**。
+
+      **因果の確定（Production 実測）**: 停止直前まで **約 46 req/min** で継続していた 401 が、
+      停止後の観測窓で **新規 0 件**。同じ窓で正式 Worker の 200 は 838 req/min を維持し、
+      status は 200 と 202 のみ、Worker log の 401/403/reconcile 失敗は 0、API の
+      error-level ログも 0。**止めたら消えた**ことで因果を確定した。
+
+      **運用上の教訓（再発防止。新しい仕組みは作らない）**:
+      **一時的な待機 poll を、無期限の `until ... sleep` なバックグラウンド bash として残さない。**
+      観測用ループには **bounded timeout** を持たせ、**セッション終了時に終了を確認する**。
+      親シェルが死ぬと `ppid=1` で孤児化し、**失効した credential を握ったまま数週間走り続ける**。
+      監視 daemon や自動 cleanup subsystem は追加しない —— 同種の事故が再発し、
+      必要性が実地で確認されてから検討する。
+
+      **診断上の教訓**: 短命プロセスの通信を `ss` / `ps` の**点観測で否定しない**。
+      `ps -eo args` は端末幅で切り詰めるため長いコマンドラインを取り逃す。
+      プロセス同定は `/proc/<pid>/cmdline` と `pgrep -a` で行い、
+      `ppid` と cgroup で孤児性を確かめること。
 
       **2026-09-11 再実測（記録のみ・調査範囲は広げない）**: 本 Finding は**未解決のまま
       継続中**である。production API ログ（`ai-team-api.service`、2026-09-11 09:00:01〜
