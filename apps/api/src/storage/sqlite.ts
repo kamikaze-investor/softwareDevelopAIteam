@@ -4083,7 +4083,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           "SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND status IN ('queued','running') LIMIT 1"
         ).get(subject.reviewKind, subject.subjectId) as any
         if (existing) {
-          return deserializeDesignReviewRun(existing)
+          return reuseActiveRun(existing, data.repairSourceJobId)
         }
 
         const run: DesignReviewRun = {
@@ -4098,16 +4098,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           status: 'queued',
           attemptCount: 0,
           createdAt: now(),
+          repairSourceJobId: data.repairSourceJobId,
         }
         try {
           db.prepare(`
             INSERT INTO design_review_runs
               (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title, changed_files, status,
-               attempt_count, claim_token, result_json, error, created_at, started_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL)
+               attempt_count, claim_token, result_json, error, created_at, started_at, completed_at,
+               repair_source_job_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?)
           `).run(
             run.id, run.reviewKind, run.subjectId, run.taskId ?? null, run.designText, run.designTextHash, run.taskTitle,
             JSON.stringify(run.changedFiles), run.status, run.attemptCount, run.createdAt,
+            run.repairSourceJobId ?? null,
           )
         } catch (err) {
           // partial unique index (ux_design_review_runs_subject_active) 違反は「別経路が先に
@@ -4118,7 +4121,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (!existingAfterConflict) {
             throw err
           }
-          return deserializeDesignReviewRun(existingAfterConflict)
+          return reuseActiveRun(existingAfterConflict, data.repairSourceJobId)
         }
         return run
       })
@@ -5365,7 +5368,38 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
     createdAt: row.created_at,
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
+    repairSourceJobId: row.repair_source_job_id ?? undefined,
   }
+}
+
+/**
+ * **active run を再利用してよいのは、successor intent が一致するときだけである。**
+ *
+ * `create()` は二重起票を避けるため、同一 (review_kind, subject_id) に active run があれば
+ * 例外にせずその run を返す。ここで intent を見ないと、**別の目的の run を黙って掴む**:
+ *   - repair 目的の要求が、非 repair の active run を受け取る（NULL / non-NULL）
+ *   - 非 repair の要求が、repair 目的の active run を受け取って実行する（non-NULL / NULL）——
+ *     `createAndExecuteDesignReview()` は active-run guard を持たないため、この向きが実在する
+ *   - 別の source Job を根にした repair 同士（異なる non-NULL）
+ *
+ * 一致（両方 undefined を含む）のときだけ再利用し、それ以外は **fail closed** で throw する。
+ * 新しい status も Gate も作らない —— 等値比較1つで足りる。
+ *
+ * repair → repair の異なる intent は現行 production 経路では到達不能である
+ * （4経路とも `findActiveByTaskId` guard と `create()` の間に await が無く、API は単一 process。
+ * `repairFlow.ts` の `createRepairJobWithHandoff` 周辺が依拠しているのと同じ不変条件）。
+ * ここはその不変条件が将来崩れたときに**黙って壊れない**ための保険である。
+ */
+function reuseActiveRun(existingRow: any, requestedRepairSourceJobId: string | undefined): DesignReviewRun {
+  const existing = deserializeDesignReviewRun(existingRow)
+  if (existing.repairSourceJobId !== requestedRepairSourceJobId) {
+    throw new Error(
+      'design review run intent mismatch: an active run for this subject has repairSourceJobId='
+      + `${existing.repairSourceJobId ?? 'null'} but ${requestedRepairSourceJobId ?? 'null'} was requested`
+      + ` (runId=${existing.id})`,
+    )
+  }
+  return existing
 }
 
 function deserializeTaskContinuation(row: any): TaskContinuation {
@@ -5579,17 +5613,21 @@ function runDesignReviewSubjectMigration(db: Database.Database): void {
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
+        -- successor intent (U1)。この rebuild は runMigrations() の後に走るため、
+        -- 列をここに書かないと直前に追加された列がこの入れ替えで消え、同一起動中の
+        -- create() が no such column で落ちる。legacy 行に intent は無いので値は NULL。
+        repair_source_job_id TEXT,
         FOREIGN KEY (task_id) REFERENCES tasks(id)
       );
 
       INSERT INTO design_review_runs_new
         (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title,
          changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-         started_at, completed_at)
+         started_at, completed_at, repair_source_job_id)
       SELECT
         id, 'task', task_id, task_id, design_text, design_text_hash, task_title,
         changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-        started_at, completed_at
+        started_at, completed_at, NULL
       FROM design_review_runs;
 
       DROP TABLE design_review_runs;
