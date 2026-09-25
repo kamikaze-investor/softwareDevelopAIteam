@@ -2172,14 +2172,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
         // 2) source Job を所有権保持状態（`blocked` 等）から `failed` へ解放する。
         //    `failed` は所有権を持たない（Job status からの所有権導出: running | blocked
-        //    | non-initial queued のみが所有）。既に failed なら no-op になる。
+        //    | non-initial queued のみが所有）。
         const source = jobs.findById(input.sourceJobId)
         if (!source) {
           // 所有権を保持し続けてよい repair Job が既に作られた後では rollback する
           // （throw で transaction を abort し、repair Job の作成も巻き戻す）。
           throw new Error(`source job ${input.sourceJobId} not found for repair handoff`)
         }
-        jobs.update(source.id, { status: 'failed' })
+        // **既に終端した結果は上書きしない。**
+        //
+        // この更新の目的は所有権の解放であって、実行結果の書き換えではない。
+        // `success` / `failed` はどちらも所有権を持たないので、ここで触っても
+        // 解放には一切寄与しない —— にもかかわらず、以前は無条件に `failed` を
+        // 書いていた。
+        //
+        // その結果、review が `changes_requested` を返した通常の Stage 2
+        // （`routes/jobs.ts` の review 経路）と Human Recovery の stored review 経路
+        // では、**成功した implement Job が `status=failed` かつ `exitCode=0` かつ
+        // stderr 無し**という自己矛盾した行に書き換えられていた（2026-09-25 実測）。
+        // 成功記録が消えるだけでなく、`isTaskFailureJob()` がそれを失敗として拾い、
+        // `repairableBlockedReviewRequest()` が admission 条件に使っている
+        // 「実装が成功していること」という前提を handoff 自身が壊していた。
+        //
+        // **`running` / non-initial `queued` の扱いは変えない。** そこへ到達しうるかは
+        // 未実測であり、ここで fail-closed を足すと現在動いている経路を escalation へ
+        // 倒しかねない。到達可能性は別 Finding として扱う。
+        if (source.status !== 'success' && source.status !== 'failed') {
+          jobs.update(source.id, { status: 'failed' })
+        }
 
         // 3) この handoff に属する Task / recovery 状態更新を適用する。
         if (input.taskUpdate) {

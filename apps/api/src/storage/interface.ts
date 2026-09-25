@@ -461,7 +461,9 @@ export interface IJobStorage {
    *
    * 順序（原子性・所有権の連続性のため）:
    *   1. repair Job（`queued`、non-initial `workflowStepKey` → 所有権を保持）を作成
-   *   2. source Job を所有権保持状態（`blocked`）から `failed` へ解放
+   *   2. source Job が所有権を保持している状態（`blocked`）なら `failed` へ解放する。
+   *      **`success` / `failed` は所有権を持たないので触らない** —— 解放に寄与しないうえ、
+   *      成功した実装の結果を書き換えてしまうため（2026-09-25 修正）。
    *   3. この handoff に属する Task / recovery 状態更新（あれば）を適用
    * いずれかが失敗したら transaction 全体が rollback し、source Job は `blocked` のまま。
    */
