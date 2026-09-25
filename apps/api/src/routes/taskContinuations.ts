@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import { getStorage } from '../storage'
 import { reconcileTaskContinuations } from '../ctoAi/taskContinuation'
+import { recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 
 /**
  * Task continuation reconcileの起動口。
@@ -45,6 +46,24 @@ export async function taskContinuationRoutes(app: FastifyInstance): Promise<void
         // POLL_INTERVAL_MS(5s)ごとにログを埋めるため、**実際に状態が動いた時だけ**残す。
         if (summary.recovered > 0 || summary.failed > 0) {
           app.log.info({ ...summary, driver: 'worker_poll' }, '[taskContinuations] reconcile settled pending continuations')
+        }
+      })
+      // **U7**: adopt 済みなのに初回 Job だけ無い Task を、同じ poll で復旧する。
+      //
+      // 責務は continuation とは別物なので `reconcileTaskContinuations()` の内側へは混ぜず、
+      // sweep 本体は `projectInitialization.ts` に置いて**ここで並べて**呼ぶ。
+      // 新しい endpoint も timer も作らないのは、Worker の poll が既にこの route を
+      // 叩いており、それが唯一必要な driver だからである。
+      // 上の `sweepInFlight` guard がそのまま両方を覆う（二重起動の抑止を作り直さない）。
+      // continuation を先に流してから走らせる —— continuation が作った Task にも
+      // 同じ cycle 内で初回 Job が付く。
+      .then(() => recoverReadyTasksWithoutJob(storage))
+      .then((recovery) => {
+        if (recovery.recovered > 0) {
+          app.log.info(
+            { ...recovery, driver: 'worker_poll' },
+            '[taskContinuations] recovered adopted tasks that had no initial job',
+          )
         }
       })
       .catch((err: unknown) => {
