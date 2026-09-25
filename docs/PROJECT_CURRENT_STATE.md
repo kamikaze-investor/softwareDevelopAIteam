@@ -267,6 +267,10 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Containment success path の可観測性（低優先 hardening）**（state: planned）
 - **Failure Explanation の事前生成と CEO 向け構造化（次段改善）（state: planned）
 - **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）
+- **Company State Foundation**（state: deferred）
+- **Organizational Learning**（state: deferred）
+- **Cross-Project Compounding**（state: deferred）
+- **Organizational Self-Evolution**（state: deferred）
 - **Role / Provider / Model Registry（役割別ルーティング設定表）**（state: planned）
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
 - **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
