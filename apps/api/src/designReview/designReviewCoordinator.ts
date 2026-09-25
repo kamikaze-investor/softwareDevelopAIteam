@@ -778,24 +778,13 @@ export function buildDefaultCoordinatorDeps(): CoordinatorDeps {
 }
 
 /**
- * API process crash後の起動時回収。runningのまま残ったrunをqueuedへ戻し、そのまま再kickする。
- * 新しいscheduler/cronは導入せず、起動時の一度だけ実行する。
+ * **起動時回収は `queuedRunDispatch.ts` へ移した（U4）。**
+ *
+ * queued run には repair 目的のものが混じる。ここで `executeDesignReviewRun()` を直接呼ぶと
+ * repair continuation が失われるため、dispatch は run の successor intent を読める1箇所へ
+ * 集約した。この module から `repairFlow` を import すると既存の依存方向
+ * （`repairFlow → designReviewCoordinator`）が逆転して循環するので、回収関数ごと移設している。
  */
-export async function recoverAndRekickAtStartup(
-  storage: IStorage,
-  deps: CoordinatorDeps = buildDefaultCoordinatorDeps(),
-  processStartedAt: string = new Date().toISOString(),
-): Promise<ExecuteDesignReviewResult[]> {
-  // processStartedAt より後に開始したrunは現プロセスのものとして除外されるため、
-  // 稼働中に誤って呼ばれても実行中attemptをrequeueしてしまうことはない。
-  storage.designReviewRuns.recoverStaleRunningAtStartup(DESIGN_REVIEW_MAX_ATTEMPTS, processStartedAt)
-
-  const results: ExecuteDesignReviewResult[] = []
-  for (const queued of storage.designReviewRuns.findQueued()) {
-    results.push(await executeDesignReviewRun(storage, queued, deps))
-  }
-  return results
-}
 
 /**
  * 失敗をその場で確定させる。attemptが残っていればrequeue、超過ならfailed終端。

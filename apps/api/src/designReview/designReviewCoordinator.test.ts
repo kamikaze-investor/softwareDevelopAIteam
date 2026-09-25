@@ -16,9 +16,9 @@ import {
   executeDesignReviewRun,
   executeRunner,
   recomputeDecision,
-  recoverAndRekickAtStartup,
 } from './designReviewCoordinator'
 import type { CoordinatorDeps } from './designReviewCoordinator'
+import { recoverAndRekickAtStartup } from './queuedRunDispatch'
 
 /**
  * Design Review executor の検証。

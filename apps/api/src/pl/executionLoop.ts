@@ -48,10 +48,10 @@
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
   buildDefaultCoordinatorDeps,
-  executeDesignReviewRun,
   type CoordinatorDeps,
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
+import { executeQueuedRun, toExecuteDesignReviewResult } from '../designReview/queuedRunDispatch'
 import { requestText } from '../aiExplain/cheapAiClient'
 import { evaluateAndPersistImplementTimeoutSensors } from './implementTimeoutSensor'
 import { CLAUDE_IMPLEMENT_TIMEOUT_MS } from '@ai-team/shared'
@@ -1381,7 +1381,13 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
         (async (s, runId) => {
           const run = s.designReviewRuns.findById(runId)
           if (!run) return { status: 'stale' }
-          return await executeDesignReviewRun(s, run, deps.coordinatorDeps ?? buildDefaultCoordinatorDeps())
+          // **汎用 executor を直接呼ばない。** queued run には repair 目的のものが混じり、
+          // それを `executeDesignReviewRun()` へ送ると review だけ走って terminal 化し、
+          // repair Job を作る機会が消える（U4）。production はここへ deps を注入しないので、
+          // この既定がそのまま本番経路である。判定は dispatcher 1箇所に集約してある。
+          return toExecuteDesignReviewResult(
+            await executeQueuedRun(s, run, deps.coordinatorDeps ?? buildDefaultCoordinatorDeps()),
+          )
         }),
     })
 

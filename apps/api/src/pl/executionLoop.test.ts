@@ -240,6 +240,68 @@ describe('runPlTick — Execute / Verify', () => {
     expect(after.attention.some((a) => a.kind === 'task_ready_without_job')).toBe(true)
   })
 
+  it('repair 目的の idle run は、注入なしの既定経路で repair executor へ行く（U4）', async () => {
+    // **production の PL は deps を注入しない**（`runPlTick(storage)`）。したがって
+    // `rekickDesignReview` の inline default が本番経路そのものである。ここを直接通さないと、
+    // U4 が本当に本番へ効いているかは確かめられない。よって `rekickDesignReview` は
+    // **渡さず**、Design Review runner だけ差し替える。
+    const { storage, taskId } = seed()
+    const sourceJob = storage.jobs.create({
+      taskId,
+      projectId: storage.tasks.findById(taskId)!.projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'original prompt',
+    } as never)
+    const run = storage.designReviewRuns.create({
+      taskId,
+      taskTitle: 'design',
+      designText: 'design text',
+      designTextHash: 'hash-1',
+      changedFiles: ['docs/notes.md'],
+      // U1 の durable successor intent。これがあると repair 目的である。
+      repairSourceJobId: sourceJob.id,
+    })
+
+    let spawns = 0
+    const result = await runPlTick(storage, {
+      ...deps(),
+      // 既定を生かすため、明示的に外す。
+      rekickDesignReview: undefined,
+      coordinatorDeps: {
+        runnerCommand: 'node',
+        runnerArgs: [],
+        homeDirectory: '/tmp',
+        workingDir: '/tmp',
+        execute: async () => {
+          spawns += 1
+          return {
+            ok: true,
+            timedOut: false,
+            stdout: JSON.stringify({
+              focusedReviewResults: [],
+              integrationReviewResult: { decision: 'ALIGNED' },
+              finalDecision: 'ALIGNED',
+            }),
+          }
+        },
+      } as never,
+    })
+
+    expect(result.proposedKind).toBe('rekick_design_review')
+    // review は1回だけ走る。
+    expect(spawns).toBe(1)
+    // **これが U4 の本体**: 汎用 executor だけなら repair Job は作られない。
+    const repairJobs = storage.jobs
+      .findByTaskId(taskId)
+      .filter((job) => job.workflowStepKey === `repair:${sourceJob.id}:1`)
+    expect(repairJobs).toHaveLength(1)
+    expect(storage.designReviewRuns.findById(run.id)?.status).toBe('succeeded')
+  })
+
   it('操作しても状態が変わらなければ normalized にしない', async () => {
     const { storage } = seedIdleDesignReview()
 
