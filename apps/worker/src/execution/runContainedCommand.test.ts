@@ -89,6 +89,79 @@ describe('isContainmentSafe', () => {
   })
 })
 
+/**
+ * D / E: 真の placement 失敗を安全側へ格上げしないことの不変条件。
+ *
+ * `containment-placement-ack-race` の修正は **kill の順序だけ**を変え、分類は一切変えていない。
+ * ところが「ACK が本当に無い実行」を実機で作るには placement program か cgroup 権限への
+ * 注入口が要り、それは `PLACEMENT_PROGRAM` を組み立てないという既存の安全方針
+ * （インジェクション防止）を壊す。そこで、実行時に再現する代わりに
+ * **分類が ACK protocol だけを正本にしている**ことをソース不変条件として固定する。
+ *
+ * ここが崩れるのは「deadline や SIGKILL を placement 成功の証拠に使い始めた」ときであり、
+ * それこそがこの修正で最も避けたい退行である。
+ */
+describe('placement 判定は ACK protocol だけを正本にする（fail-closed 不変条件）', () => {
+  // vitest の cwd は package root（apps/worker）。リポジトリ root から実行された場合も拾う。
+  const candidates = [
+    path.join(process.cwd(), 'src/execution/runContainedCommand.ts'),
+    path.join(process.cwd(), 'apps/worker/src/execution/runContainedCommand.ts'),
+  ]
+  const sourcePath = candidates.find((candidate) => existsSync(candidate))
+  const source = sourcePath === undefined ? '' : readFileSync(sourcePath, 'utf-8')
+
+  it('実装ソースを読めている（この describe の前提）', () => {
+    expect(sourcePath).toBeDefined()
+    expect(source.length).toBeGreaterThan(1_000)
+  })
+
+  it('D. placement_failed は ACK の不在からのみ導かれる', () => {
+    // 分類の唯一の導出元。ここに別の条件が OR で足されたら落ちる。
+    expect(source).toContain('const placementFailed = !placementAcked')
+    expect(source.match(/const placementFailed = /g)).toHaveLength(1)
+
+    // `placementAcked` を true にする箇所は 1 つだけで、fd 3 の ACK バイト観測に限る。
+    const ackAssignments = source.match(/placementAcked = true/g) ?? []
+    expect(ackAssignments).toHaveLength(1)
+    const guard = source.slice(
+      source.indexOf("ackStream.on('data'"),
+      source.indexOf('placementAcked = true'),
+    )
+    expect(guard).toContain('PLACEMENT_ACK')
+
+    // placement_failed を立てる箇所も 1 つだけ。
+    expect(source.match(/outcome: 'placement_failed'/g)).toHaveLength(1)
+  })
+
+  it('E. handshake deadline も SIGKILL も placement 成功の証拠にしない', () => {
+    // `placed` へ遷移させるのは ACK 観測の 1 箇所だけ。
+    const placedTransitions = source.match(/settlePlacement\('placed'\)/g) ?? []
+    expect(placedTransitions).toHaveLength(1)
+    const beforePlaced = source.slice(0, source.indexOf("settlePlacement('placed')"))
+    expect(beforePlaced.lastIndexOf("ackStream.on('data'")).toBeGreaterThan(
+      beforePlaced.lastIndexOf("ackStream.on('end'"),
+    )
+
+    // deadline は kill を解放するだけで、placement の状態には触れない。
+    expect(source).toContain('placementTimer = setTimeout(proceed, PLACEMENT_HANDSHAKE_DEADLINE_MS)')
+    const deadlineUses = source.match(/PLACEMENT_HANDSHAKE_DEADLINE_MS/g) ?? []
+    // 定義・コメント内の言及・setTimeout の 3 箇所以内。placed への昇格には使われない。
+    expect(source).not.toMatch(/PLACEMENT_HANDSHAKE_DEADLINE_MS[\s\S]{0,200}?placementAcked = true/)
+    expect(deadlineUses.length).toBeGreaterThanOrEqual(2)
+
+    // signal / SIGKILL を placement の証拠に使っていない。
+    expect(source).not.toMatch(/SIGKILL[\s\S]{0,120}?placementAcked/)
+    expect(source).not.toMatch(/placementAcked[\s\S]{0,120}?SIGKILL/)
+
+    // 安全判定そのものは不変。
+    expect(source).toContain(
+      "const SAFE_OUTCOMES: ReadonlySet<ContainmentOutcome> = new Set<ContainmentOutcome>(['clean', 'killed'])",
+    )
+    // 直接の子全体の close 待ちへは戻していない（生存子孫に引きずられないため）。
+    expect(source).not.toContain("child.on('close'")
+  })
+})
+
 describe('buildCgroupName', () => {
   it('jobId と attemptId の両方を含める（同一 Job の再実行で再利用しない）', () => {
     const first = buildCgroupName('11111111-2222-3333-4444-555555555555', 'a1')
@@ -361,6 +434,109 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
     expect(result.killedDescendants).toBe(true)
     expect(isContainmentSafe(result.outcome)).toBe(true)
   }, 30_000)
+
+  /**
+   * A. `containment-placement-ack-race` の回帰。
+   *
+   * pre-aborted signal では `cgroup.kill` が `spawn()` 直後に撃たれる。修正前は、ラッパが
+   * `cgroup.procs` へ参加した直後・`echo ok >&3` の**前**に、その参加によって届いた SIGKILL で
+   * 死ぬ経路があり、**placement は成功しているのに ACK が 1 バイトも出ない**まま
+   * `placement_failed` へ誤分類された（本番 VPS の delegated cgroup 環境で 38 回中 10 回 = 26%。
+   * 10 件すべて「fd3 は end まで到達・raw bytes 0・child は SIGKILL」で、late ACK は 0 件）。
+   *
+   * 1 回では見えないので連続実行する。ここで守るのは
+   * 「placement が成功した実行を `placement_failed` にしない」であって、
+   * 真の placement 失敗を安全扱いすることではない。
+   */
+  it('pre-aborted signal を連続で受けても placement_failed の false positive が出ない', async () => {
+    const ITERATIONS = 30
+    const outcomes: string[] = []
+    for (let i = 0; i < ITERATIONS; i += 1) {
+      const controller = new AbortController()
+      controller.abort()
+
+      const startedAt = Date.now()
+      const result = await runContainedCommand({
+        jobId: 'job-pre-abort-loop',
+        attemptId: `${Date.now()}-${i}`,
+        argv: ['/bin/sh', '-c', 'sleep 60'],
+        cwd: process.cwd(),
+        env: process.env,
+        signal: controller.signal,
+        // timeoutMs は敢えて渡さない: abort だけが唯一の停止契機になる
+      })
+      const elapsedMs = Date.now() - startedAt
+      outcomes.push(result.outcome)
+
+      // 封じ込めが成立していること（safety assertion は緩めない）
+      expect(isContainmentSafe(result.outcome)).toBe(true)
+      expect(result.killedDescendants).toBe(true)
+      // 子孫が回収され cgroup も消えていること
+      expect(result.cgroupPath).toBeDefined()
+      if (result.cgroupPath !== undefined) createdCgroupPaths.add(result.cgroupPath)
+      expect(existsSync(result.cgroupPath!)).toBe(false)
+      // bounded settle: placement 待ちは有限で、drain 上限（10s）より十分小さい
+      expect(elapsedMs).toBeLessThan(5_000)
+    }
+    expect(outcomes).toHaveLength(ITERATIONS)
+    expect(outcomes.filter((outcome) => outcome === 'placement_failed')).toEqual([])
+  }, 180_000)
+
+  /**
+   * B. placement 完了後に来る通常の abort。
+   * placement 待ちを入れたことで、こちらが遅くなったり分類が変わったりしていないこと。
+   */
+  it('placement 完了後の abort は従来どおり即座に kill され placement_failed にならない', async () => {
+    const controller = new AbortController()
+    // 300ms 後 = handshake は確実に決着済み（実測 0〜17ms）
+    setTimeout(() => controller.abort(), 300)
+
+    const startedAt = Date.now()
+    const result = await runContainedCommand({
+      jobId: 'job-abort-after-placement',
+      attemptId: String(Date.now()),
+      argv: ['/bin/sh', '-c', 'sleep 60'],
+      cwd: process.cwd(),
+      env: process.env,
+      signal: controller.signal,
+    })
+    const elapsedMs = Date.now() - startedAt
+
+    expect(result.outcome).toBe('killed')
+    expect(result.outcome).not.toBe('placement_failed')
+    expect(result.killedDescendants).toBe(true)
+    // placement は既に決着しているので、deadline 分の待ちは一切入らない
+    expect(elapsedMs).toBeLessThan(3_000)
+    if (result.cgroupPath !== undefined) createdCgroupPaths.add(result.cgroupPath)
+    expect(existsSync(result.cgroupPath!)).toBe(false)
+  }, 30_000)
+
+  /**
+   * C. timeout 経路にも同じ ordering race が無いこと。
+   * `timeoutMs: 1` は abort と同じく handshake 進行中に kill 要求を出す。
+   */
+  it('handshake 中に発火する極小 timeout でも placement_failed にならない', async () => {
+    const ITERATIONS = 15
+    const outcomes: string[] = []
+    for (let i = 0; i < ITERATIONS; i += 1) {
+      const result = await runContainedCommand({
+        jobId: 'job-tiny-timeout',
+        attemptId: `${Date.now()}-${i}`,
+        argv: ['/bin/sh', '-c', 'sleep 60'],
+        cwd: process.cwd(),
+        env: process.env,
+        timeoutMs: 1,
+      })
+      outcomes.push(result.outcome)
+
+      expect(result.timedOut).toBe(true)
+      expect(isContainmentSafe(result.outcome)).toBe(true)
+      expect(result.killedDescendants).toBe(true)
+      if (result.cgroupPath !== undefined) createdCgroupPaths.add(result.cgroupPath)
+      expect(existsSync(result.cgroupPath!)).toBe(false)
+    }
+    expect(outcomes.filter((outcome) => outcome === 'placement_failed')).toEqual([])
+  }, 120_000)
 })
 
 describe('removeCgroupWithRetry — 一過性 EBUSY を短い再試行で解消する', () => {

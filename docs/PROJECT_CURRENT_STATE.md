@@ -264,6 +264,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）**（state: planned）
 - **Containment adversarial escape（cgroup migration / git external helper）（state: planned）
 - **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）**（state: planned）
+- **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される（state: planned）
 - **Containment success path の可観測性（低優先 hardening）**（state: planned）
 - **Failure Explanation の事前生成と CEO 向け構造化（次段改善）（state: planned）
 - **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）
