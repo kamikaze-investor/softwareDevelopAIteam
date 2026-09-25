@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState } from './systemState'
+import { triageBlocked } from '../pl/blockedTriage'
 
 const NOW = '2026-09-14T10:00:00.000Z'
 const now = () => NOW
@@ -441,5 +442,110 @@ describe('buildSystemState — 終端した Design Review も観測できる（p
     expect(state.attention.some((a) => a.kind === 'design_review_failed')).toBe(false)
     expect(state.attention.some((a) => a.kind === 'design_review_idle')).toBe(false)
     expect(state.projects[0].designReview?.status).toBe('succeeded')
+  })
+})
+
+/**
+ * **D7 — 期限切れ `WAITING_FOR_USER` が「人の判断待ち」として残り続ける。**
+ *
+ * `expires_at` は参照時の遅延判定で、行を `EXPIRED` へ進める actor が居ない。
+ * `findActiveByTaskId()` も expiry を見ないため、status だけで `approval_waiting` を
+ * 立てると誰も待っていない承認が永久に attention に残る。帰結は2つ:
+ *   1. `maybeAdoptNext()` は attention **全件**で判定するため Project の採用が止まる
+ *   2. `blockedTriage` が「生きている承認待ち」として `ceo_escalation` を選び、
+ *      「AI 側にできることは無い」と誤って報告する
+ *
+ * ここで固定するのは **attention を立てないこと**だけで、行そのものは書き換えない
+ * （lazy expiry と既存 resume / approve / reject semantics は変えない）。
+ */
+describe('D7: 期限切れ承認は live な承認待ちとして扱わない', () => {
+  /** git_commit で blocked な Job と、そこへ紐づく WAITING_FOR_USER 承認を作る。 */
+  function seedBlockedWithWaitingApproval(expiresAt: string) {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const job = storage.jobs.create({
+      taskId: task.id,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+    const created = storage.approvalRequests.createForJob({
+      taskId: task.id,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: 'af60412',
+      targetDiffHash: 'hash',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt,
+      invalidIf: [],
+      changedFiles: ['apps/worker/src/metaReviewer/autoReview.ts'],
+      triggeredRules: ['git_commit requires CEO approval (policy)'],
+    } as Parameters<IStorage['approvalRequests']['createForJob']>[0], job.id)
+    expect(created.ok).toBe(true)
+    return { storage, projectId, taskId: task.id, jobId: job.id }
+  }
+
+  // NOW = 2026-09-14T10:00:00Z
+  const LIVE = '2026-09-15T10:00:00.000Z'
+  const EXPIRED = '2026-09-13T10:00:00.000Z'
+
+  it('AC1: 未期限の WAITING_FOR_USER は従来どおり approval_waiting を出す', () => {
+    const { storage } = seedBlockedWithWaitingApproval(LIVE)
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'approval_waiting')).toBe(true)
+    // 二重計上しない既存挙動も維持する。
+    expect(state.attention.some((a) => a.kind === 'job_blocked')).toBe(false)
+  })
+
+  it('AC2: 期限切れの WAITING_FOR_USER は approval_waiting を出さない', () => {
+    const { storage } = seedBlockedWithWaitingApproval(EXPIRED)
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.attention.some((a) => a.kind === 'approval_waiting')).toBe(false)
+    // 復旧経路を殺していないこと: 本物の停滞として job_blocked 側に現れる。
+    expect(state.attention.some((a) => a.kind === 'job_blocked')).toBe(true)
+  })
+
+  it('AC3: 期限切れを理由に triage が「生きている承認待ち」→ ceo_escalation を選ばない', () => {
+    const { storage } = seedBlockedWithWaitingApproval(EXPIRED)
+
+    const state = buildSystemState(storage, { now })
+    // `approval_waiting` が生成されないので、triage の当該分岐へ到達しない。
+    expect(state.attention.some((a) => a.kind === 'approval_waiting')).toBe(false)
+
+    const blocked = state.attention.find((a) => a.kind === 'job_blocked')
+    expect(blocked).toBeDefined()
+    const diagnosis = triageBlocked(storage, blocked!)
+    expect(diagnosis.rootCauseClass).not.toBe('approval_waiting')
+    expect(diagnosis.summary).not.toContain('AI 側にできることは無い')
+  })
+
+  it('AC4/AC7: live な承認では従来どおり approval_waiting → ceo_escalation のままにする', () => {
+    const { storage } = seedBlockedWithWaitingApproval(LIVE)
+
+    const state = buildSystemState(storage, { now })
+    const waiting = state.attention.find((a) => a.kind === 'approval_waiting')
+    expect(waiting).toBeDefined()
+
+    const diagnosis = triageBlocked(storage, waiting!)
+    expect(diagnosis.rootCauseClass).toBe('approval_waiting')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
+  it('AC4: 判定しただけで durable row は書き換えない（lazy expiry を壊さない）', () => {
+    const { storage, taskId } = seedBlockedWithWaitingApproval(EXPIRED)
+
+    buildSystemState(storage, { now })
+    buildSystemState(storage, { now })
+
+    const row = storage.approvalRequests.findActiveByTaskId(taskId)
+    expect(row?.status).toBe('WAITING_FOR_USER')
+    expect(row?.expiresAt).toBe(EXPIRED)
   })
 })
