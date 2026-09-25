@@ -85,6 +85,14 @@ export type RepairDecision =
       action: 'repair'
       attempt: number
       stepKey: string
+      /**
+       * `stepKey` を組むのに使った source implementation Job id。
+       *
+       * **`stepKey` と同じ1つの値から出ている**ので、両者が食い違う状態を作れない。
+       * 呼び出し側はこれを run の successor intent としてそのまま永続化する
+       * （`stepKey` 文字列のほうは保存しない）。
+       */
+      sourceJobId: string
       signature: string
       /**
        * 前回と同じ失敗が残っている場合にtrue。repair promptへ「前回と実質的に異なる
@@ -173,6 +181,17 @@ export function computeFailureSignature(facts: RepairFailureFacts): string {
   ]
 
   return createHash('sha256').update(parts.join('\n'), 'utf-8').digest('hex')
+}
+
+/**
+ * `repair:<sourceJobId>:1` を組み立てる。**stepKey の形を作る唯一の場所。**
+ *
+ * `parseRepairSource()` の逆であり、両者を隣に置いて形式が1箇所でしか決まらないようにする。
+ * durable state には stepKey ではなく `sourceJobId` だけを保存し、必要なときにこれで導出する
+ * （派生値を二重管理しない）。
+ */
+export function repairStepKeyFor(sourceJobId: string): string {
+  return `${REPAIR_STEP_PREFIX}${sourceJobId}:1`
 }
 
 /**
@@ -542,7 +561,9 @@ export function decideRepairAction(
     generation: toRepairGeneration(walk),
     // 末尾は常に :1 で固定する。attempt番号を入れると同一failureの再送で別keyになり、
     // chainが二重化する。一意性はsourceJobId側が担保する（Stage 1の retry:<jobId>:1 と同じ）。
-    stepKey: `${REPAIR_STEP_PREFIX}${sourceJobId}:1`,
+    stepKey: repairStepKeyFor(sourceJobId),
+    // 永続化されるのはこちら。stepKey は上で同じ値から導出しているので両者は必ず一致する。
+    sourceJobId,
     signature,
     requireDifferentApproach: sameFailureRepeated,
   }

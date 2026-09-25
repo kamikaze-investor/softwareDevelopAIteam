@@ -678,6 +678,17 @@ export interface DesignReviewRun {
   createdAt: string
   startedAt?: string
   completedAt?: string
+  /**
+   * **この run の successor intent。** repair 目的の run でだけ入り、それ以外は undefined。
+   *
+   * 値は repair chain の source implementation Job id。stepKey は保存せず
+   * `repairStepKeyFor()` で導出する（派生値を二重管理しない）。
+   *
+   * **`walkRepairGeneration()` の `generationRoot` とは別の事実である。** あちらは
+   * 「この chain がどの authority で始まったか」、こちらは「この run 直近の source 実装 Job」。
+   * repair 予算の計算へは一切関与しない。
+   */
+  repairSourceJobId?: string
 }
 
 /** claim結果。claimできなかった場合は run=undefined。 */
@@ -693,6 +704,8 @@ export interface QueuedDesignReviewRunInput {
   designText: string
   designTextHash: string
   changedFiles: string[]
+  /** successor intent。`DesignReviewRun.repairSourceJobId` と同じ意味。 */
+  repairSourceJobId?: string
 }
 
 export type DesignReviewRunCreateInput =

@@ -2770,6 +2770,42 @@ describe('SQLiteStorage', () => {
       })
     })
 
+    it('keeps repair_source_job_id through the legacy table rebuild, with existing rows NULL (U1)', () => {
+      // `runMigrations()` は rebuild の**手前**で走るため、rebuild 側の列リストに
+      // `repair_source_job_id` が無いと、足したばかりの列が入れ替えで消えて
+      // 同一起動中の `create()` が "no such column" で落ちる。
+      const dbPath = path.join(os.tmpdir(), `ai-team-u1-legacy-rebuild-${randomUUID()}.db`)
+      createLegacyDesignReviewDatabase(dbPath)
+
+      const upgraded = createSQLiteStorage(dbPath)
+
+      const columns = readDatabase(dbPath, (db) =>
+        (db.pragma('table_info(design_review_runs)') as Array<{ name: string }>).map((c) => c.name),
+      )
+      expect(columns).toContain('repair_source_job_id')
+
+      // legacy 行には successor intent が無い。推論で埋めない（backfill しない）。
+      const legacyIntents = readDatabase(dbPath, (db) =>
+        (db.prepare('SELECT repair_source_job_id FROM design_review_runs').all() as Array<{
+          repair_source_job_id: string | null
+        }>).map((r) => r.repair_source_job_id),
+      )
+      expect(legacyIntents.every((value) => value === null)).toBe(true)
+
+      // rebuild 直後の同一起動で書けること（列が消えていないこと）を確認する。
+      const written = upgraded.designReviewRuns.create({
+        taskId: 'task-legacy-3',
+        taskTitle: 'Legacy post-upgrade write target',
+        designText: 'Design: post-rebuild intent write.',
+        designTextHash: computeDesignTextHash('Design: post-rebuild intent write.'),
+        changedFiles: [],
+        repairSourceJobId: 'job-legacy-source',
+      })
+      expect(written.repairSourceJobId).toBe('job-legacy-source')
+      expect(createSQLiteStorage(dbPath).designReviewRuns.findById(written.id)?.repairSourceJobId)
+        .toBe('job-legacy-source')
+    })
+
     it('is idempotent on repeat startup after the rebuild has run once', () => {
       const dbPath = path.join(os.tmpdir(), `ai-team-design-review-subject-idempotent-${randomUUID()}.db`)
       createLegacyDesignReviewDatabase(dbPath)
