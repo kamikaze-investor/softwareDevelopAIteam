@@ -138,3 +138,38 @@ export async function createInitialImplementWorkflow(
 function isInitialWorkflowTarget(task: Task): boolean {
   return task.roadmapActive && task.status === 'pending' && task.assignee === 'developer_ai'
 }
+
+/**
+ * **その Task は Design Review を再実行せずに初回 Job を作れるか（U7 recovery の admission）。**
+ *
+ * adoption は Task 行を同期 transaction で commit したあと、初回 Job の生成を
+ * `await` で HTTP request のプロセス内に持つ。その間に API が落ちると
+ * 「この Task はまだ Job を要する」という事実がどこにも durable に残らない
+ * （`task_ready_without_job` は立つが、PL には直せないので通知だけで終わる）。
+ *
+ * **ここが守る唯一の本質は「Design Review を再実行しないこと」である。**
+ * evidence が無い Task（Design Review が CONFLICT で終わった等）まで拾うと、
+ * poll のたびに Review を起動する loop になり、`independent-remediation-design-review-conflict`
+ * が持つ CONFLICT 復旧の責務とも衝突する。よって **Job Gate が既に成立していること**を
+ * 入場条件にする。
+ *
+ * 判定は `createInitialImplementWorkflow()` が内部で使うのと**同一の**
+ * `checkImplementJobDesignReviewEvidence()` をそのまま通す。prompt hash 不一致・
+ * 非 ALIGNED・critical の independent verdict 未承認は、すべてその関数が既に見ている。
+ * **同じ Gate semantics をここで書き直さない。**
+ */
+export function canRecoverInitialImplementJobWithoutReview(storage: IStorage, task: Task): boolean {
+  if (!isInitialWorkflowTarget(task)) return false
+  // `isReadyTaskWithoutJob()`（systemState）と同じ「Job が1件も無い」を条件にする。
+  // Job がある Task は、たとえ initial stepKey が無くても recovery の対象ではない。
+  if (storage.jobs.findByTaskId(task.id).length > 0) return false
+
+  return checkImplementJobDesignReviewEvidence(
+    {
+      taskId: task.id,
+      aiCliMode: 'implement',
+      aiCliPrompt: buildInitialImplementAiCliPrompt(task),
+    },
+    storage.designReviewEvidence,
+  ).ok
+}

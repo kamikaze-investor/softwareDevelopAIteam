@@ -16,7 +16,10 @@ import {
   type RoadmapSyncTaskInput,
 } from '../storage/roadmapTaskValidation.js'
 import { writeProjectMemory } from './projectMemoryWriter.js'
-import { createInitialImplementWorkflow } from './initialImplementWorkflow.js'
+import {
+  canRecoverInitialImplementJobWithoutReview,
+  createInitialImplementWorkflow,
+} from './initialImplementWorkflow.js'
 import { collectTechnicalUncertainties, generateRoadmap, RoadmapContentError, type Roadmap, type RoadmapGeneratorOptions, type TechnicalUncertainty } from './roadmapGenerator.js'
 import { buildSpecTextFromProjectDefinition } from './projectDefinitionAnalysis.js'
 import { composeRoadmapReviewMaterial } from './roadmapReviewMaterial.js'
@@ -172,6 +175,67 @@ export async function ensureInitialWorkflowsForActiveTasks(
       deps ? createInitialImplementWorkflow(storage, taskId, deps) : createInitialImplementWorkflow(storage, taskId)
     )),
   )
+}
+
+/** U7 recovery sweep の結果。効果検証のためだけの集計で、durable state は持たない。 */
+export interface ReadyTaskWithoutJobRecoverySummary {
+  /** admission を満たし、recovery executor を起動した Task 数。 */
+  scanned: number
+  /** 実際に初回 Job が作られた Task 数。 */
+  recovered: number
+  /** executor が skip した Task 数（既存 Job / park / dependencies 未達など）。 */
+  skipped: number
+}
+
+/**
+ * **adopt 済みなのに初回 Job だけ無い Task を、既存 executor で復旧する（U7）。**
+ *
+ * `adoptRoadmapItem()` は Task 行を同期 transaction で commit したあと、初回 Job の生成を
+ * `await ensureInitialWorkflowsForActiveTasks(...)` で **HTTP request のプロセス内**に持つ。
+ * その Design Review は最大 300s かかるため窓は分単位で開いており、この間に API が落ちると
+ * 残る durable state（pending / roadmapActive / Job 0 件 / ALIGNED evidence）は
+ * **それ自体は完全に正しい**のに、それを見て動く actor が1つも存在しない。
+ * `task_ready_without_job` は立つが notify-only で、1度通知したあと
+ * `hasEscalated()` が actionable から恒久的に外す。結果 `maybeAdoptNext()` が
+ * attention 全件で採用を止め続ける（2026-09-23 監査 U7）。
+ *
+ * **`ensureInitialWorkflowsForActiveTasks()` をそのまま毎 poll 回さない。** あちらは
+ * roadmapActive な Task 全件を executor へ渡すため、evidence が無い Task に対して
+ * **周期ごとに Design Review を起動**してしまう。CONFLICT で止まった Task の復旧は
+ * `independent-remediation-design-review-conflict` の責務であり、ここが横取りしてはならない。
+ * よって入場条件を `canRecoverInitialImplementJobWithoutReview()` に絞る。
+ *
+ * **新しい workflow / queue / daemon / status / Gate は作らない。** 実行契機は
+ * Worker の既存 poll（`POST /api/task-continuations/reconcile`）、Job 生成は既存
+ * `createInitialImplementWorkflow()`、冪等性は同関数の `workflowStepKey` 一意制約に委ねる。
+ */
+export async function recoverReadyTasksWithoutJob(
+  storage: IStorage,
+  deps?: CoordinatorDeps,
+): Promise<ReadyTaskWithoutJobRecoverySummary> {
+  const summary: ReadyTaskWithoutJobRecoverySummary = { scanned: 0, recovered: 0, skipped: 0 }
+
+  for (const project of storage.projects.findAll()) {
+    // paused / draft / archived は「CEO がまだ進めると決めていない」状態であり sweep で突破しない。
+    // `reconcileTaskContinuations()` と同じ判断。
+    if (project.status !== 'running') continue
+
+    for (const task of storage.tasks.findByProjectId(project.id)) {
+      if (!canRecoverInitialImplementJobWithoutReview(storage, task)) continue
+      summary.scanned += 1
+
+      // **復旧は既存 executor の呼び出しだけ。** U7 専用の Job 生成経路は作らない。
+      // Gate も park 判定も dependencies も executor の内側にある既存のものがそのまま効く。
+      const result = deps
+        ? await createInitialImplementWorkflow(storage, task.id, deps)
+        : await createInitialImplementWorkflow(storage, task.id)
+
+      if (result.status === 'created') summary.recovered += 1
+      else summary.skipped += 1
+    }
+  }
+
+  return summary
 }
 
 export interface ProjectInitializationOptions extends RoadmapGeneratorOptions {
