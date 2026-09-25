@@ -1,4 +1,12 @@
-import type { ApprovalRequest, Job, Task, TaskSummary, WatchdogEvent } from '@ai-team/shared'
+import type {
+  ApprovalRequest,
+  Job,
+  QAResult,
+  ReviewResult,
+  Task,
+  TaskSummary,
+  WatchdogEvent,
+} from '@ai-team/shared'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -16,6 +24,14 @@ import {
   manualWorkflowIsLocked,
   PROJECT_EXECUTION_HEALTH_LABEL,
   quarantineGuidanceText,
+  deriveSafeCommandQaEvidence,
+  findStoredReviewRecoveryCandidate,
+  qaEvidenceToRegister,
+  invalidateQaEvidence,
+  storedReviewApprovalState,
+  storedReviewRecoveryActionLabel,
+  storedReviewRecoveryNotice,
+  storedReviewRecoveryView,
 } from './taskWorkflow'
 
 function makeJob(overrides: Partial<Job>): Job {
@@ -513,5 +529,388 @@ describe('MOB-001: action eligibility と完了表示', () => {
     const notDone = [{ taskId: 't1', taskStatus: 'pending', latestJob: { jobId: 'j', status: 'blocked' } }] as never
     expect(allRoadmapTasksDone(done)).toBe(true)
     expect(allRoadmapTasksDone(notDone)).toBe(false)
+  })
+})
+
+
+// ── stored-review recovery（保存済み verdict の再投入）─────────────────────────
+
+function makeReview(overrides: Partial<ReviewResult>): ReviewResult {
+  return {
+    createdAt: '2026-09-24T00:00:00.000Z',
+    findings: [],
+    id: 'review-result-1',
+    jobId: 'review-job-1',
+    reviewer: 'qa_ai',
+    status: 'changes_requested',
+    summary: 'fix it',
+    taskId: 'task-1',
+    ...overrides,
+  } as ReviewResult
+}
+
+function makeQa(overrides: Partial<QAResult>): QAResult {
+  return {
+    createdAt: '2026-09-24T00:00:00.000Z',
+    id: 'qa-1',
+    jobId: 'implement-1',
+    status: 'passed',
+    summary: 's',
+    taskId: 'task-1',
+    type: 'unit_test',
+    ...overrides,
+  } as QAResult
+}
+
+/** production c3849205 と同じ形: 成功した implement と、その canonical review の changes_requested。 */
+function storedReviewShape(overrides: { taskStatus?: Task['status'], implement?: Partial<Job> } = {}) {
+  const task = makeTask({ status: overrides.taskStatus ?? 'blocked' })
+  const implementJob = makeJob({
+    aiCliMode: 'implement',
+    exitCode: 0,
+    id: 'implement-1',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' } as Job['safeCommand'],
+    status: 'success',
+    stdoutPath: '/logs/implement-1/stdout.txt',
+    workflowStepKey: 'resume:prev-1:1',
+    ...overrides.implement,
+  })
+  const reviewJob = makeJob({
+    aiCliMode: 'review',
+    id: 'review-job-1',
+    status: 'failed',
+    workflowStepKey: 'implement:implement-1:review',
+  })
+  const review = makeReview({ jobId: reviewJob.id })
+  return { implementJob, review, reviewJob, task }
+}
+
+describe('findStoredReviewRecoveryCandidate — 表示条件（判定の正本は backend）', () => {
+  it('blocked + canonical review + changes_requested なら候補になる', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const found = findStoredReviewRecoveryCandidate(task, [implementJob, reviewJob], [review])
+    expect(found?.reviewJob.id).toBe('review-job-1')
+    expect(found?.implementJob.id).toBe('implement-1')
+  })
+
+  it('Task が blocked でなければ出さない', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape({ taskStatus: 'in_progress' })
+    expect(findStoredReviewRecoveryCandidate(task, [implementJob, reviewJob], [review])).toBeUndefined()
+  })
+
+  it('保存済み verdict が approved なら出さない', () => {
+    const { task, implementJob, reviewJob } = storedReviewShape()
+    const approved = makeReview({ jobId: reviewJob.id, status: 'approved' })
+    expect(findStoredReviewRecoveryCandidate(task, [implementJob, reviewJob], [approved])).toBeUndefined()
+  })
+
+  it('verdict が保存されていなければ出さない', () => {
+    const { task, implementJob, reviewJob } = storedReviewShape()
+    expect(findStoredReviewRecoveryCandidate(task, [implementJob, reviewJob], [])).toBeUndefined()
+  })
+
+  it('canonical review Job が無ければ出さない', () => {
+    const { task, implementJob, review } = storedReviewShape()
+    const nonCanonical = makeJob({ id: 'review-job-1', workflowStepKey: 'resume:review-job-0:1' })
+    expect(findStoredReviewRecoveryCandidate(task, [implementJob, nonCanonical], [review])).toBeUndefined()
+  })
+
+  it('実装 Job が success でなければ出さない', () => {
+    const { task, reviewJob, review } = storedReviewShape()
+    const failedImplement = makeJob({
+      id: 'implement-1',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' } as Job['safeCommand'],
+      status: 'failed',
+    })
+    expect(findStoredReviewRecoveryCandidate(task, [failedImplement, reviewJob], [review])).toBeUndefined()
+  })
+
+  it('queued / running の Job があれば出さない', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const busy = makeJob({ id: 'busy', status: 'queued' })
+    expect(findStoredReviewRecoveryCandidate(task, [implementJob, reviewJob, busy], [review])).toBeUndefined()
+  })
+})
+
+describe('deriveSafeCommandQaEvidence — QA 事実は Job レコードから導く', () => {
+  it('kind=test / exitCode=0 なら unit_test=passed と typecheck=skipped を導く', () => {
+    const { implementJob } = storedReviewShape()
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+
+    expect(derived.map((q) => `${q.type}:${q.status}`)).toEqual([
+      'unit_test:passed',
+      'typecheck:skipped',
+    ])
+    expect(derived.every((q) => q.jobId === 'implement-1')).toBe(true)
+  })
+
+  it('passed と skipped を取り違えない（typecheck を passed にしない）', () => {
+    const { implementJob } = storedReviewShape()
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+    const typecheck = derived.find((q) => q.type === 'typecheck')
+
+    expect(typecheck?.status).toBe('skipped')
+    expect(typecheck?.status).not.toBe('passed')
+    expect(typecheck?.summary).toContain('No typecheck SafeCommand')
+    expect(typecheck?.details).toContain('選ばれた検証は上記1つだけ')
+  })
+
+  // **観測できない形からは QA を作らない。** `failed` な Job は AI CLI 段で早期失敗して
+  // SafeCommand が走っていない場合もあり、Job レコードからは区別がつかない。
+  it('SafeCommand が失敗していれば QA を作らない（実行の有無を断定しない）', () => {
+    const { implementJob } = storedReviewShape({ implement: { exitCode: 1, status: 'failed' } })
+    expect(deriveSafeCommandQaEvidence(implementJob)).toEqual([])
+  })
+
+  // `exitCode` は任意項目。未記録を `failed` へ倒すと、観測していないことを断定してしまう。
+  it('exitCode が記録されていなければ QA を作らない', () => {
+    const { implementJob } = storedReviewShape({ implement: { exitCode: undefined } })
+    expect(deriveSafeCommandQaEvidence(implementJob)).toEqual([])
+  })
+
+  it('kind=test 以外の Job からは QA を導かない', () => {
+    const gitStatus = makeJob({
+      id: 'implement-1',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' } as Job['safeCommand'],
+      status: 'success',
+    })
+    expect(deriveSafeCommandQaEvidence(gitStatus)).toEqual([])
+  })
+
+  it('dryRun の Job からは QA を導かない（実行していない）', () => {
+    const { implementJob } = storedReviewShape({ implement: { dryRun: true } })
+    expect(deriveSafeCommandQaEvidence(implementJob)).toEqual([])
+  })
+
+  it('特定 Task 向けの固定値を持たない（Job の実値だけから組む）', () => {
+    const { implementJob } = storedReviewShape({ implement: { id: 'another-job' } })
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+
+    expect(JSON.stringify(derived)).not.toContain('c3849205')
+    expect(JSON.stringify(derived)).not.toContain('569cd4ae')
+    expect(JSON.stringify(derived)).not.toContain('2,961')
+    expect(derived.every((q) => q.jobId === 'another-job')).toBe(true)
+    expect(derived[0]?.details).toContain('another-job')
+  })
+})
+
+describe('qaEvidenceToRegister — 重複は登録しない', () => {
+  it('同じ (jobId, type) が既にあれば除く', () => {
+    const { implementJob } = storedReviewShape()
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+    const existing = [makeQa({ jobId: 'implement-1', type: 'unit_test' })]
+
+    const toRegister = qaEvidenceToRegister(derived, existing)
+    expect(toRegister.map((q) => q.type)).toEqual(['typecheck'])
+  })
+
+  it('2件とも登録済みなら空になる（再登録しない）', () => {
+    const { implementJob } = storedReviewShape()
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+    const existing = [
+      makeQa({ jobId: 'implement-1', type: 'unit_test' }),
+      makeQa({ id: 'qa-2', jobId: 'implement-1', type: 'typecheck' }),
+    ]
+
+    expect(qaEvidenceToRegister(derived, existing)).toEqual([])
+  })
+
+  it('別 Job の同種 QA は重複扱いにしない', () => {
+    const { implementJob } = storedReviewShape()
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+    const existing = [makeQa({ jobId: 'other-job', type: 'unit_test' })]
+
+    expect(qaEvidenceToRegister(derived, existing).map((q) => q.type))
+      .toEqual(['unit_test', 'typecheck'])
+  })
+
+  it('QA が 1 件も無ければ 2 件とも登録対象になる', () => {
+    const { implementJob } = storedReviewShape()
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+
+    const toRegister = qaEvidenceToRegister(derived, [])
+    expect(toRegister.map((q) => `${q.type}:${q.status}`)).toEqual([
+      'unit_test:passed',
+      'typecheck:skipped',
+    ])
+  })
+})
+
+describe('storedReviewRecoveryView — 画面が出す3状態', () => {
+  it('候補が無ければ hidden', () => {
+    const { task, implementJob, reviewJob } = storedReviewShape()
+    expect(storedReviewRecoveryView(task, [implementJob, reviewJob], [], []).kind).toBe('hidden')
+  })
+
+  it('QA を取得できていない（null）なら操作を出さない', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const view = storedReviewRecoveryView(task, [implementJob, reviewJob], [review], null)
+    expect(view.kind).toBe('evidence_unavailable')
+  })
+
+  it('QA が 0 件なら ready になり、2件とも登録対象になる', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const view = storedReviewRecoveryView(task, [implementJob, reviewJob], [review], [])
+    expect(view.kind).toBe('ready')
+    if (view.kind !== 'ready') return
+    expect(view.toRegister.map((q) => q.type)).toEqual(['unit_test', 'typecheck'])
+    expect(view.candidate.reviewJob.id).toBe('review-job-1')
+  })
+
+  it('登録済みなら登録対象から外れる（表示は残る）', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const existing = [makeQa({ jobId: 'implement-1', type: 'unit_test' })]
+    const view = storedReviewRecoveryView(task, [implementJob, reviewJob], [review], existing)
+    expect(view.kind).toBe('ready')
+    if (view.kind !== 'ready') return
+    expect(view.derived).toHaveLength(2)
+    expect(view.toRegister.map((q) => q.type)).toEqual(['typecheck'])
+  })
+})
+
+describe('invalidateQaEvidence — 送信後は読み直すまで不明にする', () => {
+  it('qaResults を null にする（再取得が失敗しても操作を出さないため）', () => {
+    const before = { jobs: [], qaResults: [makeQa({})] }
+    expect(invalidateQaEvidence(before)).toEqual({ jobs: [], qaResults: null })
+  })
+
+  it('data が無ければそのまま', () => {
+    expect(invalidateQaEvidence(null)).toBeNull()
+  })
+
+  it('無効化した状態は evidence_unavailable になる（2つを繋いだ不変条件）', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const data = invalidateQaEvidence({ qaResults: [] as QAResult[] })
+    const view = storedReviewRecoveryView(task, [implementJob, reviewJob], [review], data!.qaResults)
+    expect(view.kind).toBe('evidence_unavailable')
+  })
+})
+
+describe('storedReviewRecoveryNotice — backend の事実を言い換えない', () => {
+  it('awaiting_approval は承認が必要だと伝える', () => {
+    const notice = storedReviewRecoveryNotice({ ok: true, status: 'awaiting_approval' })
+    expect(notice.title).toContain('承認が必要')
+    expect(notice.message).toContain('承認画面')
+  })
+
+  it('queued は正常系として伝える（失敗と誤解させない）', () => {
+    const notice = storedReviewRecoveryNotice({ detail: '', ok: true, status: 'queued' })
+    expect(notice.title).toBe('修正を開始しました')
+    expect(notice.title).not.toContain('開始されませんでした')
+  })
+
+  it.each(['skipped', 'escalated'] as const)('%s は未開始として、理由をそのまま出す', (status) => {
+    const notice = storedReviewRecoveryNotice({ detail: 'a live job exists', ok: true, status })
+    expect(notice.title).toBe('修正は開始されませんでした')
+    expect(notice.message).toContain(status)
+    expect(notice.message).toContain('a live job exists')
+  })
+
+  it('失敗はそのまま失敗として出す', () => {
+    const notice = storedReviewRecoveryNotice({ message: 'HTTP 409', ok: false })
+    expect(notice.title).toBe('起票失敗')
+    expect(notice.message).toBe('HTTP 409')
+  })
+})
+
+describe('承認状態と操作文言 — 「承認すれば勝手に始まる」とは言わない', () => {
+  const action = (status: string, expiresAt = '2999-01-01T00:00:00.000Z') => ({
+    createdAt: '2026-09-25T00:00:00.000Z',
+    expiresAt,
+    id: 'approval-1',
+    requestedAction: 'repair_from_stored_review:review-job-1',
+    status,
+    taskId: 'task-1',
+  }) as unknown as ApprovalRequest
+
+  it('該当する承認が無ければ none', () => {
+    expect(storedReviewApprovalState('review-job-1', [])).toBe('none')
+  })
+
+  it('別 review Job 向けの承認は数えない', () => {
+    const other = { ...action('APPROVED'), requestedAction: 'repair_from_stored_review:other' } as ApprovalRequest
+    expect(storedReviewApprovalState('review-job-1', [other])).toBe('none')
+  })
+
+  it('WAITING_FOR_USER は waiting、APPROVED は approved', () => {
+    expect(storedReviewApprovalState('review-job-1', [action('WAITING_FOR_USER')])).toBe('waiting')
+    expect(storedReviewApprovalState('review-job-1', [action('APPROVED')])).toBe('approved')
+  })
+
+  it('view が承認状態を持つ', () => {
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const view = storedReviewRecoveryView(task, [implementJob, reviewJob], [review], [], [action('APPROVED')])
+    expect(view.kind).toBe('ready')
+    if (view.kind !== 'ready') return
+    expect(view.approval).toBe('approved')
+  })
+
+  it('未申請の案内は「承認後にもう一度押す」ことを明示する', () => {
+    const { note } = storedReviewRecoveryActionLabel('none', false)
+    expect(note).toContain('もう一度押す')
+  })
+
+  it('承認待ちの案内は「承認だけでは始まらない」ことを明示する', () => {
+    const { label, note } = storedReviewRecoveryActionLabel('waiting', false)
+    expect(label).toContain('承認待ち')
+    expect(note).toContain('承認だけでは修正は始まりません')
+  })
+
+  it('承認済みならもう一度押せば始まると伝える', () => {
+    const { label, note } = storedReviewRecoveryActionLabel('approved', false)
+    expect(label).toContain('承認済み')
+    expect(note).toContain('もう一度押すと修正が始まります')
+  })
+
+  it('送信中は文言を差し替える', () => {
+    expect(storedReviewRecoveryActionLabel('none', true).label).toBe('送信中...')
+  })
+
+  it('awaiting_approval の通知も「承認だけでは始まらない」と伝える', () => {
+    const notice = storedReviewRecoveryNotice({ ok: true, status: 'awaiting_approval' })
+    expect(notice.message).toContain('もう一度')
+    expect(notice.message).toContain('承認だけでは修正は始まりません')
+  })
+})
+
+describe('typecheck の QA は観測できる事実だけを書く', () => {
+  it('「typecheck を実行していない」とは言い切らない', () => {
+    const { implementJob } = storedReviewShape()
+    const typecheck = deriveSafeCommandQaEvidence(implementJob).find((q) => q.type === 'typecheck')
+
+    expect(typecheck?.status).toBe('skipped')
+    expect(typecheck?.summary).toBe('No typecheck SafeCommand was selected for this Job')
+    // test script が内部で typecheck を呼ぶ可能性を否定しない
+    expect(typecheck?.details).toContain('Job レコードからは判定できない')
+    expect(typecheck?.details).not.toContain('typecheck は未検証のままである')
+  })
+})
+
+describe('承認の期限 — 期限切れを「承認済み」と出さない', () => {
+  const approval = (status: string, expiresAt: string) => ({
+    createdAt: '2026-09-25T00:00:00.000Z',
+    expiresAt,
+    id: 'approval-1',
+    requestedAction: 'repair_from_stored_review:review-job-1',
+    status,
+    taskId: 'task-1',
+  }) as unknown as ApprovalRequest
+
+  const NOW = new Date('2026-09-25T12:00:00.000Z')
+
+  it('期限切れの APPROVED は none 扱い', () => {
+    expect(storedReviewApprovalState('review-job-1', [approval('APPROVED', '2026-09-25T11:00:00.000Z')], NOW)).toBe('none')
+  })
+
+  it('期限切れの WAITING_FOR_USER も none 扱い', () => {
+    expect(storedReviewApprovalState('review-job-1', [approval('WAITING_FOR_USER', '2026-09-25T11:00:00.000Z')], NOW)).toBe('none')
+  })
+
+  it('未失効なら従来どおり反映する', () => {
+    expect(storedReviewApprovalState('review-job-1', [approval('APPROVED', '2026-09-25T13:00:00.000Z')], NOW)).toBe('approved')
+  })
+
+  it('expiresAt が壊れていれば使わない（fail-closed）', () => {
+    expect(storedReviewApprovalState('review-job-1', [approval('APPROVED', 'not-a-date')], NOW)).toBe('none')
   })
 })

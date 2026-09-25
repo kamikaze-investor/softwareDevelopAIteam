@@ -11,6 +11,8 @@
 import type {
   ApprovalRequest,
   Job,
+  QAResult,
+  ReviewResult,
   Task,
   TaskFailureClassification,
   TaskSummary,
@@ -452,4 +454,271 @@ export function blockerNeedsHumanDecision(
 export function allRoadmapTasksDone(summaries: TaskSummary[]): boolean {
   if (summaries.length === 0) return false
   return summaries.every((summary) => summary.taskStatus === 'done')
+}
+
+// ── stored-review recovery（保存済み changes_requested の再投入）──────────────
+//
+// **ここは表示制御だけである。** 実際に通すかどうかは backend の
+// `repairFromStoredReview()` / `prepareRepairFlow()` の admission が正本で、
+// ここで通しても backend が拒否すればそれが結果になる。Mobile 側の判定で
+// backend Gate を代替しない（AGENTS.md Q3 の「Mobile は表示専用」と同じ立場）。
+
+const CANONICAL_REVIEW_STEP_KEY = /^implement:(.+):review$/
+
+/** 再投入の対象となりうる、保存済み verdict とその実装/レビュー Job の組。 */
+export interface StoredReviewRecoveryCandidate {
+  implementJob: Job
+  reviewJob: Job
+  review: ReviewResult
+}
+
+/**
+ * 保存済み `changes_requested` を canonical repair へ戻せる候補を、既存の読み取りデータだけから導く。
+ *
+ * 条件（いずれも backend の admission が改めて検査する）:
+ *   - Task が `blocked`
+ *   - canonical な review Job（`implement:<id>:review`）が存在する
+ *   - その実装 Job が `success`
+ *   - その review Job に保存された verdict が `changes_requested`
+ *   - queued / running の Job が無い（動いている最中に操作させない）
+ *
+ * **reviewJobId は人が書き換えられない。** ここで選んだ実データの id をそのまま使う。
+ */
+export function findStoredReviewRecoveryCandidate(
+  task: Task,
+  jobs: Job[],
+  reviews: ReviewResult[],
+): StoredReviewRecoveryCandidate | undefined {
+  if (task.status !== 'blocked') return undefined
+  if (isJobBusy(jobs)) return undefined
+
+  for (const reviewJob of sortJobsByNewestFirst(jobs)) {
+    const matched = CANONICAL_REVIEW_STEP_KEY.exec(reviewJob.workflowStepKey ?? '')
+    if (!matched) continue
+
+    const implementJob = jobs.find((job) => job.id === matched[1])
+    if (!implementJob || implementJob.status !== 'success') continue
+
+    const review = reviews.find((result) => result.jobId === reviewJob.id)
+    if (!review || review.status !== 'changes_requested') continue
+
+    return { implementJob, reviewJob, review }
+  }
+  return undefined
+}
+
+/**
+ * repair へ渡す QA 事実。**人が書く欄ではなく、Job レコードから導く。**
+ * 自由入力にすると「機械検証」の欄へ人の作文が入り、証跡の意味が壊れる。
+ */
+export interface DerivedQaEvidence {
+  jobId: string
+  type: 'unit_test' | 'typecheck'
+  status: 'passed' | 'failed' | 'skipped'
+  summary: string
+  details: string
+}
+
+/**
+ * implement Job の **SafeCommand 実行結果**から QA 事実を導く。
+ *
+ * Worker は AI CLI 終了後に SafeCommand を別途実行し、その終了コードが Job の `exitCode` である
+ * （実装 AI の自己申告ではない）。1 Job = 1 SafeCommand なので、`kind=test` の Job では
+ * **typecheck の SafeCommand は選ばれていない** —— Job レコードから確定するのはここまでである。
+ * 「typecheck が一度も走っていない」とまでは言えない（test script が内部で呼ぶ構成があり得る）。
+ *
+ * **特定 Task 向けの定数は持たない。** 値はすべて渡された Job から組み立てる。
+ */
+export function deriveSafeCommandQaEvidence(implementJob: Job): DerivedQaEvidence[] {
+  const kind = implementJob.safeCommand?.kind
+  if (kind !== 'test') return []
+  if (implementJob.dryRun === true) return []
+
+  // **「実行されて、こう終わった」と証明できる形だけから作る。**
+  //   - `exitCode` は任意項目なので、記録が無ければ成否を主張しない
+  //     （未記録を `failed` へ倒すと、観測していないことを断定してしまう）
+  //   - `failed` な Job は AI CLI 段で早期失敗して SafeCommand が走っていない場合もあり、
+  //     Job レコードからはその区別がつかない
+  // どちらも「分からない」ので、QA 事実そのものを作らない（独立レビュー指摘）。
+  if (implementJob.status !== 'success' || implementJob.exitCode !== 0) return []
+
+  const evidence = `Job ${implementJob.id}: SafeCommand kind=${kind} status=${implementJob.status}`
+    + ` exitCode=${implementJob.exitCode}.`
+    + ' Worker が AI CLI 終了後に別途実行した結果であり、実装 AI の自己申告ではない。'
+    + (implementJob.stdoutPath ? ` 完全なログ: ${implementJob.stdoutPath}` : '')
+
+  return [
+    {
+      jobId: implementJob.id,
+      type: 'unit_test',
+      status: 'passed',
+      summary: `Worker SafeCommand (kind=${kind}) passed`,
+      details: evidence,
+    },
+    {
+      jobId: implementJob.id,
+      type: 'typecheck',
+      status: 'skipped',
+      // **Job レコードから観測できることだけを書く。** 「typecheck は実行されていない」とは
+      // 言い切れない —— `pnpm test` が pretest 等で typecheck を子プロセスとして走らせる
+      // 構成もあり得るからで、それは Job レコードには現れない（独立レビュー指摘）。
+      // ここで確定しているのは「typecheck の SafeCommand は選ばれていない」ことだけである。
+      summary: 'No typecheck SafeCommand was selected for this Job',
+      details: `Job ${implementJob.id}: safeCommand.kind=${kind}.`
+        + ' 1 Job = 1 SafeCommand なので、この Job で選ばれた検証は上記1つだけである。'
+        + ' test script 自身が typecheck を内部で呼ぶかどうかは Job レコードからは判定できない。',
+    },
+  ]
+}
+
+/**
+ * 既に同じ事実が登録済みなら再登録しない。**同一性は (jobId, type) で見る。**
+ * status や文言で見ると、同じ検証について相反する行を積み増してしまう。
+ */
+export function qaEvidenceToRegister(
+  derived: DerivedQaEvidence[],
+  existing: QAResult[],
+): DerivedQaEvidence[] {
+  return derived.filter((candidate) => !existing.some(
+    (qa) => qa.jobId === candidate.jobId && qa.type === candidate.type,
+  ))
+}
+
+/** この再投入に対する承認の状態。**backend の action 文字列そのもので突き合わせる。** */
+export type StoredReviewApprovalState = 'none' | 'waiting' | 'approved'
+
+export function storedReviewApprovalState(
+  reviewJobId: string,
+  approvalRequests: ApprovalRequest[],
+  now: Date = new Date(),
+): StoredReviewApprovalState {
+  const action = `repair_from_stored_review:${reviewJobId}`
+  // **期限切れは数えない。** backend は未失効のものしか使わないので、期限切れの APPROVED を
+  // 「承認済み」と出すと、押しても新しい承認待ちになって案内と食い違う（独立レビュー指摘）。
+  const unexpired = (request: ApprovalRequest): boolean => {
+    const expiresAt = Date.parse(request.expiresAt)
+    return Number.isNaN(expiresAt) ? false : expiresAt > now.getTime()
+  }
+  const related = approvalRequests.filter(
+    (request) => request.requestedAction === action && unexpired(request),
+  )
+  if (related.some((request) => request.status === 'APPROVED')) return 'approved'
+  if (related.some((request) => request.status === 'WAITING_FOR_USER')) return 'waiting'
+  return 'none'
+}
+
+/** 画面が出す3状態。分岐そのものをテストできるよう、描画から切り離す。 */
+export type StoredReviewRecoveryView =
+  | { kind: 'hidden' }
+  /** 登録済み QA が分からない。重複登録を避けられないので操作を出さない */
+  | { kind: 'evidence_unavailable' }
+  | {
+      kind: 'ready'
+      candidate: StoredReviewRecoveryCandidate
+      derived: DerivedQaEvidence[]
+      toRegister: DerivedQaEvidence[]
+      approval: StoredReviewApprovalState
+    }
+
+/**
+ * 再投入セクションが出すべき状態。
+ *
+ * **`qaResults === null`（取得できなかった）を「0件」と同じに扱わない。** 同じに扱うと、
+ * 既に登録済みの事実をもう一度送って重複行を作る。分からないときは操作を出さない。
+ *
+ * `approval` は「承認したのに何も起きない」を防ぐために出す。backend は承認そのものでは
+ * 動かず、**承認後にもう一度この操作を呼んで初めて** APPROVED を consume して queued にする。
+ */
+export function storedReviewRecoveryView(
+  task: Task,
+  jobs: Job[],
+  reviews: ReviewResult[],
+  qaResults: QAResult[] | null,
+  approvalRequests: ApprovalRequest[] = [],
+): StoredReviewRecoveryView {
+  const candidate = findStoredReviewRecoveryCandidate(task, jobs, reviews)
+  if (!candidate) return { kind: 'hidden' }
+  if (qaResults === null) return { kind: 'evidence_unavailable' }
+
+  const derived = deriveSafeCommandQaEvidence(candidate.implementJob)
+  return {
+    approval: storedReviewApprovalState(candidate.reviewJob.id, approvalRequests),
+    candidate,
+    derived,
+    kind: 'ready',
+    toRegister: qaEvidenceToRegister(derived, qaResults),
+  }
+}
+
+/** 承認状態に応じたボタン文言と補足。**「承認すれば勝手に始まる」とは言わない。** */
+export function storedReviewRecoveryActionLabel(
+  approval: StoredReviewApprovalState,
+  isSubmitting: boolean,
+): { label: string; note: string } {
+  if (isSubmitting) return { label: '送信中...', note: '' }
+  if (approval === 'approved') {
+    return {
+      label: '承認済み — 修正を開始する',
+      note: 'この操作の承認は下りています。もう一度押すと修正が始まります。',
+    }
+  }
+  if (approval === 'waiting') {
+    return {
+      label: '承認待ち — もう一度申請する',
+      note: '承認画面で承認したあと、この画面に戻ってもう一度押してください。承認だけでは修正は始まりません。',
+    }
+  }
+  return {
+    label: '修正を開始する（承認が必要）',
+    note: '押すと承認待ちになります。承認画面で承認したあと、この画面に戻ってもう一度押すと修正が始まります。',
+  }
+}
+
+/**
+ * 送信直後は登録済み QA の状態が変わっている。**読み直すまで「不明」にする。**
+ *
+ * 再取得そのものが失敗して古い値が残ったときでも、セクションが
+ * `evidence_unavailable` 側へ倒れるようにするための一手である（独立レビュー指摘）。
+ */
+export function invalidateQaEvidence<T extends { qaResults: QAResult[] | null }>(
+  data: T | null,
+): T | null {
+  return data === null ? data : { ...data, qaResults: null }
+}
+
+/** 再投入の結果を CEO へどう伝えるか。**backend の事実を言い換えない。** */
+export interface StoredReviewRecoveryNotice {
+  title: string
+  message: string
+}
+
+export function storedReviewRecoveryNotice(
+  result:
+    | { ok: true; status: 'awaiting_approval' }
+    | { ok: true; status: 'queued' | 'escalated' | 'skipped'; detail: string }
+    | { ok: false; message: string },
+): StoredReviewRecoveryNotice {
+  if (!result.ok) return { message: result.message, title: '起票失敗' }
+  if (result.status === 'awaiting_approval') {
+    // **承認だけでは始まらない。** backend は承認後にこの操作をもう一度受けて、
+    // そこで APPROVED を consume して初めて queued にする（独立レビュー指摘）。
+    return {
+      message: '修正の開始を申請しました。承認画面で承認したあと、この画面に戻って'
+        + 'もう一度「修正を開始する」を押してください。承認だけでは修正は始まりません。',
+      title: '修正開始の承認が必要です',
+    }
+  }
+  if (result.status === 'queued') {
+    // **承認後の2回目はこれが正常系である。** 「開始されなかった」と出すと、
+    // CEO が失敗と誤解して不要な再試行をする。
+    return {
+      message: '修正作業の準備を開始しました。進行は作業履歴で確認できます。',
+      title: '修正を開始しました',
+    }
+  }
+  // skipped / escalated。**自動で再試行しない。** 事実をそのまま出す。
+  return {
+    message: `状態: ${result.status}${result.detail ? `\n${result.detail}` : ''}`,
+    title: '修正は開始されませんでした',
+  }
 }

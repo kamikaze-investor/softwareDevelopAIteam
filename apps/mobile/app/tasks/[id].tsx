@@ -9,6 +9,8 @@ import type {
   ApprovalRequest,
   Job,
   JobStatus,
+  QAResult,
+  ReviewResult,
   RiskLevel,
   Task,
   TaskFailureClassification,
@@ -33,12 +35,15 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../../lib/api'
+import type { DerivedQaEvidence } from '../../lib/taskWorkflow'
+import { submitStoredReviewRecovery } from '../../lib/storedReviewRecovery'
 import {
   canReflectChanges,
   canRunReview,
   allowsProgressActions,
   visibleTaskActions,
   canShowResumeUI,
+  invalidateQaEvidence,
   deriveJobDisplayState,
   isImplementJob,
   isQuarantined,
@@ -48,6 +53,9 @@ import {
   parseDateTime,
   quarantineGuidanceText,
   sortJobsByNewestFirst,
+  storedReviewRecoveryActionLabel,
+  storedReviewRecoveryNotice,
+  storedReviewRecoveryView,
 } from '../../lib/taskWorkflow'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
@@ -199,6 +207,10 @@ interface TaskDetailData {
   approvalRequests: ApprovalRequest[]
   /** MOB-001: stall を「検出しただけ」と「確認済み」に分けて表示するため */
   watchdogEvents: WatchdogEvent[]
+  /** 保存済み verdict を再投入できるかの表示判定に使う（判定の正本は backend） */
+  reviews: ReviewResult[]
+  /** 既に登録済みの QA 事実。重複登録を避けるために読む。null は「取得できなかった」 */
+  qaResults: QAResult[] | null
 }
 
 async function fetchTask(taskId: string): Promise<Task | null> {
@@ -256,6 +268,38 @@ async function fetchWatchdogEvents(taskId: string): Promise<WatchdogEvent[]> {
   if (!response.ok) return []
   const all = (await response.json()) as WatchdogEvent[]
   return all.filter((event) => event.taskId === taskId)
+}
+
+/**
+ * 保存済み verdict の再投入を出してよいかの判定材料。既存の読み取り API をそのまま読むだけで、
+ * 新しい backend route は使わない。取得失敗は致命的でない（導線が出ないだけ）。
+ */
+async function fetchReviewResults(taskId: string): Promise<ReviewResult[]> {
+  const response = await apiFetch(
+    `/api/reviews?taskId=${encodeURIComponent(taskId)}`,
+  )
+  if (!response.ok) return []
+  return (await response.json()) as ReviewResult[]
+}
+
+/**
+ * 既に登録済みの QA 事実。重複登録を避けるためだけに読む。
+ *
+ * **取得失敗を「0件」と混同しない。** 空配列にすると「まだ何も登録されていない」と読めてしまい、
+ * 既に保存済みの QA をもう一度送る。qa_results には (jobId, type) の一意制約が無いので、
+ * それはそのまま重複行になり、repair prompt に相反する証跡が並ぶ。
+ * 分からないときは null を返し、再投入の導線自体を出さない（独立レビュー指摘）。
+ */
+async function fetchQaResults(taskId: string): Promise<QAResult[] | null> {
+  try {
+    const response = await apiFetch(
+      `/api/qa?taskId=${encodeURIComponent(taskId)}`,
+    )
+    if (!response.ok) return null
+    return (await response.json()) as QAResult[]
+  } catch {
+    return null
+  }
 }
 
 async function fetchTaskFailureExplanation(
@@ -886,6 +930,92 @@ function TaskFailureExplanationSection({
   )
 }
 
+interface StoredReviewRecoverySectionProps {
+  approvalRequests: ApprovalRequest[]
+  isSubmitting: boolean
+  jobs: Job[]
+  onSubmit: (reviewJobId: string, evidence: DerivedQaEvidence[]) => void
+  /** null = 取得できなかった。重複登録を避けられないので操作を出さない */
+  qaResults: QAResult[] | null
+  reviews: ReviewResult[]
+  task: Task
+}
+
+/**
+ * **保存済みの「修正が必要」を、正規の修正フローへ戻す導線。**
+ *
+ * 出す条件も渡す値も backend データから導く。人が reviewJobId を書き換えたり、
+ * 検証事実を自由入力したりはできない（機械検証の欄に人の作文を入れないため）。
+ * 通してよいかの最終判断は backend の admission が正本で、ここは表示制御だけである。
+ */
+function StoredReviewRecoverySection({
+  approvalRequests,
+  isSubmitting,
+  jobs,
+  onSubmit,
+  qaResults,
+  reviews,
+  task,
+}: StoredReviewRecoverySectionProps): ReactElement | null {
+  const view = storedReviewRecoveryView(task, jobs, reviews, qaResults, approvalRequests)
+  if (view.kind === 'hidden') return null
+
+  // 登録済み QA が分からないまま送ると、同じ事実を二重に登録する。操作は出さない。
+  if (view.kind === 'evidence_unavailable') {
+    return (
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>保存済みレビューから修正を始める</Text>
+        <Text style={styles.storedRecoveryHelpText}>
+          {'登録済みの検証事実を取得できなかったため、この操作は一時的に利用できません。'
+            + '画面を更新してから再度お試しください。'}
+        </Text>
+      </View>
+    )
+  }
+
+  const { approval, candidate, derived, toRegister } = view
+  const action = storedReviewRecoveryActionLabel(approval, isSubmitting)
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>保存済みレビューから修正を始める</Text>
+      <Text style={styles.storedRecoveryHelpText}>
+        {'このTaskには「修正が必要」と判定されたレビュー結果が残っています。'
+          + '実装のやり直しではなく、その指摘に対する修正作業として正規の流れへ戻します。'
+          + 'レビュー結果は消さずに残したまま進みます。'}
+      </Text>
+
+      <Text style={styles.storedRecoveryFactsTitle}>一緒に渡す検証事実</Text>
+      {derived.length === 0 ? (
+        <Text style={styles.storedRecoveryFact}>
+          この実装Jobからは機械的な検証事実を導けませんでした
+        </Text>
+      ) : (
+        derived.map((qa) => (
+          <Text key={`${qa.jobId}:${qa.type}`} style={styles.storedRecoveryFact}>
+            {`・${qa.type} = ${qa.status}`}
+            {toRegister.some((item) => item.type === qa.type) ? '' : '（登録済み）'}
+          </Text>
+        ))
+      )}
+
+      <TouchableOpacity
+        disabled={isSubmitting}
+        onPress={() => { onSubmit(candidate.reviewJob.id, toRegister) }}
+        style={[
+          styles.storedRecoveryButton,
+          isSubmitting && styles.storedRecoveryButtonDisabled,
+        ]}
+      >
+        <Text style={styles.storedRecoveryButtonText}>{action.label}</Text>
+      </TouchableOpacity>
+      {action.note.length > 0 ? (
+        <Text style={styles.storedRecoveryNote}>{action.note}</Text>
+      ) : null}
+    </View>
+  )
+}
+
 interface ResumeInstructionSectionProps {
   approvalRequests: ApprovalRequest[]
   instruction: string
@@ -1282,6 +1412,7 @@ export default function TaskDetailScreen(): ReactElement {
   const params = useLocalSearchParams()
   const taskId = normalizeTaskId(params.id)
   const [data, setData] = useState<TaskDetailData | null>(null)
+  const [isSubmittingStoredReviewRecovery, setIsSubmittingStoredReviewRecovery] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [notFound, setNotFound] = useState(false)
@@ -1303,12 +1434,14 @@ export default function TaskDetailScreen(): ReactElement {
 
       // ApprovalRequestはtaskId単位の関連履歴であり、現状Jobとの厳密な1対1対応は追跡していない。
       // 詳細画面では3APIを並列に各1回だけ取得し、Job単位の追加fetchは行わない。
-      const [taskResult, jobsResult, approvalRequestsResult, watchdogResult] =
+      const [taskResult, jobsResult, approvalRequestsResult, watchdogResult, reviewsResult, qaResult] =
         await Promise.allSettled([
           fetchTask(taskId),
           fetchJobs(taskId),
           fetchApprovalRequests(taskId),
           fetchWatchdogEvents(taskId),
+          fetchReviewResults(taskId),
+          fetchQaResults(taskId),
         ])
 
       if (taskResult.status === 'rejected') {
@@ -1333,6 +1466,9 @@ export default function TaskDetailScreen(): ReactElement {
         approvalRequests: approvalRequestsResult.value,
         jobs: jobsResult.value,
         task: taskResult.value,
+        // 取得失敗は致命的でない: 再投入の導線が出ないだけに留める。
+        reviews: reviewsResult.status === 'fulfilled' ? reviewsResult.value : [],
+        qaResults: qaResult.status === 'fulfilled' ? qaResult.value : null,
         // 取得失敗は致命的でない: stall 表示が出ないだけで、他の状態表示は保つ。
         watchdogEvents: watchdogResult.status === 'fulfilled' ? watchdogResult.value : [],
       })
@@ -1386,6 +1522,45 @@ export default function TaskDetailScreen(): ReactElement {
       }
     },
     [loadTaskDetail, taskId],
+  )
+
+  const submitStoredReviewRecoveryAction = useCallback(
+    async (reviewJobId: string, evidence: DerivedQaEvidence[]): Promise<void> => {
+      if (taskId === null || taskId.length === 0) return
+      setIsSubmittingStoredReviewRecovery(true)
+      try {
+        const result = await submitStoredReviewRecovery(taskId, reviewJobId, evidence)
+        // 文言の決定は純粋関数側にある（分岐そのものをテストできるようにするため）。
+        const notice = storedReviewRecoveryNotice(result)
+        Alert.alert(notice.title, notice.message)
+      } finally {
+        // **送信後は登録済み QA の状態が変わっている。** 読み直すまでは「不明」として扱う。
+        // こうしておけば、直後の `loadTaskDetail()` 自体が失敗して古い `data` が残っても、
+        // セクションは操作を出さない（古い一覧のまま再試行して同じ事実を二重登録しない）。
+        setData(invalidateQaEvidence)
+        await loadTaskDetail()
+        setIsSubmittingStoredReviewRecovery(false)
+      }
+    },
+    [loadTaskDetail, taskId],
+  )
+
+  const handleStoredReviewRecovery = useCallback(
+    (reviewJobId: string, evidence: DerivedQaEvidence[]): void => {
+      if (isSubmittingStoredReviewRecovery) return
+      Alert.alert(
+        '修正を開始する',
+        '保存済みのレビュー結果と検証事実をもとに、修正作業の開始を申請しますか？（承認が必要です）',
+        [
+          { style: 'cancel', text: 'キャンセル' },
+          {
+            onPress: () => { void submitStoredReviewRecoveryAction(reviewJobId, evidence) },
+            text: '申請',
+          },
+        ],
+      )
+    },
+    [isSubmittingStoredReviewRecovery, submitStoredReviewRecoveryAction],
   )
 
   const handleSubmitResumeInstruction = useCallback((): void => {
@@ -1474,6 +1649,15 @@ export default function TaskDetailScreen(): ReactElement {
             onChangeInstruction={setResumeInstruction}
             onOpen={() => setIsResumeEditorOpen(true)}
             onSubmit={handleSubmitResumeInstruction}
+            task={data.task}
+          />
+          <StoredReviewRecoverySection
+            approvalRequests={data.approvalRequests}
+            isSubmitting={isSubmittingStoredReviewRecovery}
+            jobs={data.jobs}
+            onSubmit={handleStoredReviewRecovery}
+            qaResults={data.qaResults}
+            reviews={data.reviews}
             task={data.task}
           />
           <JobHistorySection jobs={data.jobs} />
@@ -1804,6 +1988,44 @@ const styles = StyleSheet.create({
   },
   questionTurnUser: {
     backgroundColor: '#262626',
+  },
+  storedRecoveryHelpText: {
+    color: '#d4d4d4',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 12,
+  },
+  storedRecoveryFactsTitle: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  storedRecoveryFact: {
+    color: '#d4d4d4',
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  storedRecoveryButton: {
+    alignItems: 'center',
+    backgroundColor: '#3b82f6',
+    borderRadius: 8,
+    marginTop: 12,
+    paddingVertical: 12,
+  },
+  storedRecoveryButtonDisabled: {
+    backgroundColor: '#93c5fd',
+  },
+  storedRecoveryButtonText: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  storedRecoveryNote: {
+    color: '#a3a3a3',
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 8,
   },
   resumeBox: {
     backgroundColor: '#141414',
