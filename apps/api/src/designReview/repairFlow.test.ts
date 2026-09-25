@@ -820,3 +820,129 @@ describe('repair handoff は source Job の終端結果を保持する', () => {
     expect(after.stderr).toBe('TypeError: boom')
   })
 })
+
+/**
+ * **handoff の workflowStepKey 競合 semantics は queued / terminal で 1 つである。**
+ *
+ * `ux_jobs_workflow_step_key` は全体一意で、手前の dedup は同一 Task しか見ない。よって
+ * dedup を通り抜けて一意制約で落ちる形が原理的に存在する。`completeRepairHandoff()` は
+ * それを `runRepairFlow` と同じ 2 分岐で扱う（CEO 判断・2026-09-25）:
+ *
+ *   同一 Task が既に持っている → `already_started`（良性。人へ渡さない）
+ *   別 Task が持っている       → escalate（lineage 破損。黙って進行中扱いにしない）
+ *
+ * ここで固定するのは「通常経路に regression が無い」ことと「良性の重複が false human
+ * escalation にならない」ことの両方である。
+ */
+describe('handoff の stepKey 競合は queued path でも同じ 2 分岐で収束する', () => {
+  it('通常の handoff は従来どおり repair Job を作り、Task を blocked にしない', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+    const run = storage.designReviewRuns.create(preparation.run)
+
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    expect(outcome.status).toBe('repair_job_created')
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+    expect(storage.tasks.findById(ids.taskId)!.status).not.toBe('blocked')
+  })
+
+  it('同一 Task が dedup 通過後に同じ key を取っても already_started で、Task を blocked にしない', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    if (preparation.action !== 'queue') throw new Error('fixture failed')
+    const run = storage.designReviewRuns.create(preparation.run)
+
+    // 良性の重複そのもの: 同一 Task の successor が既に実体化している。
+    storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      workflowStepKey: preparation.stepKey,
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'the successor that already exists',
+    } as never)
+
+    // **dedup だけを盲目にして、一意制約まで到達させる。**
+    // `findByTaskId` は 1 回の handoff で quarantine 判定 → dedup → 失敗後の読み直し の
+    // 順に呼ばれる。2 番目（dedup）だけ key を隠すと、create が一意制約で落ち、
+    // 3 番目の読み直しが「この Task が持っている」と正しく答える経路を通る。
+    let calls = 0
+    const racingStorage: IStorage = {
+      ...storage,
+      jobs: {
+        ...storage.jobs,
+        findByTaskId: (taskId: string) => {
+          calls += 1
+          const rows = storage.jobs.findByTaskId(taskId)
+          if (calls === 2) return rows.filter((job) => job.workflowStepKey !== preparation.stepKey)
+          return rows
+        },
+      },
+    }
+
+    const outcome = await executeQueuedRepair(racingStorage, run, preparation.stepKey, deps())
+
+    // **false human escalation にしない。**
+    expect(outcome.status).toBe('already_started')
+    expect(storage.tasks.findById(ids.taskId)!.status).not.toBe('blocked')
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+  })
+
+  it('別 Task が同じ key を持っている場合は従来どおり escalate する（lineage 破損）', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    if (preparation.action !== 'queue') throw new Error('fixture failed')
+    const run = storage.designReviewRuns.create(preparation.run)
+
+    const otherTask = storage.tasks.create({
+      projectId: ids.projectId, title: 'T2', description: 'd',
+      status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+    } as never)
+
+    // Design Review 中に、**別 Task の** Job がこの key を取ってしまう。
+    // 手前の dedup は同一 Task しか見ないので通り抜け、一意制約で落ちる。
+    const racingDeps = {
+      ...deps(),
+      execute: async () => {
+        storage.jobs.create({
+          taskId: otherTask.id,
+          projectId: ids.projectId,
+          agentRole: 'developer_ai',
+          status: 'queued',
+          workflowStepKey: preparation.stepKey,
+          safeCommand: { kind: 'noop' },
+          aiCliMode: 'implement',
+          aiCliProvider: 'claude_code',
+          aiCliPrompt: 'foreign prompt',
+        } as never)
+        return { ok: true as const, stdout: ALIGNED_STDOUT, timedOut: false }
+      },
+    }
+
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, racingDeps)
+
+    // lineage 破損は黙って進行中扱いにしない。人へ渡す。
+    expect(outcome.status).toBe('escalated')
+    expect(storage.tasks.findById(ids.taskId)!.status).toBe('blocked')
+    // この Task 側に repair Job は作られていない（transaction rollback）。
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(0)
+  })
+})

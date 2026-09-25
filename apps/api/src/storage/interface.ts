@@ -878,6 +878,31 @@ export interface IDesignReviewRunStorage {
   create(input: DesignReviewRunCreateInput): DesignReviewRun
   /** startup recovery後に再kick対象となるqueued run一覧。 */
   findQueued(): DesignReviewRun[]
+  /**
+   * repair 目的で **ALIGNED 終端した** run（U2: successor 回収の候補）。
+   *
+   * `findQueued()` は `queued` しか返さないため、ALIGNED evidence を残した直後に
+   * handoff の手前で落ちた repair run は、既存のどの read にも二度と現れない
+   * （`findLatestByTaskId()` は Task 単位・最新 1 件だけ）。repair Job を作る機会が
+   * 消えるのはそこである。
+   *
+   * **`error IS NULL` は安い prefilter であって ALIGNED の同値条件ではない。**
+   * `failed` 終端と roadmap kind の却下（`rejectedReason` が入る）はこれで落ちるが、
+   * `recomputeDecision()` が `rejectedReason` を埋めるのは **`reviewKind === 'roadmap'` の
+   * ときだけ**なので、repair が使う `task` kind では**非 ALIGNED でも `error` が NULL になる**
+   * （`complete()` は `error ?? null` で保存する。2026-09-25 独立レビュー指摘）。
+   * したがって ALIGNED の判定は呼び出し側が run 自身の `resultJson` から計算し直す
+   * （`safeRecomputedDecision()`）。ここでその判定を代用してはならない。
+   *
+   * `repair_source_job_id IS NOT NULL` だけが repair 目的の判定で、**NULL の
+   * 旧行を推測で repair 目的として扱わない。**
+   *
+   * `review_kind` は**あえて絞らない**。絞ると規約外の行が静かに候補から消える。
+   * 呼び出し側の既存 fail-closed（`resolveRepairHandoffTarget()`）へ渡す。
+   *
+   * repair Job が既に在るかはこの表の事実ではないので、ここでは判定しない。
+   */
+  findAlignedRepairPurposeTerminal(): DesignReviewRun[]
   /** queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。 */
   claim(id: string, maxAttempts: number): ClaimDesignReviewRunResult
   /** claim_token一致時のみ終端へ遷移する。不一致（stale）ならfalseを返し、呼び出し側は結果を破棄する。 */

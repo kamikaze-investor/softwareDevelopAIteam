@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { getStorage } from '../storage'
 import { reconcileTaskContinuations } from '../ctoAi/taskContinuation'
 import { recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
+import { recoverTerminalRepairSuccessors } from '../designReview/terminalRepairSuccessorRecovery'
 
 /**
  * Task continuation reconcileの起動口。
@@ -54,7 +55,7 @@ export async function taskContinuationRoutes(app: FastifyInstance): Promise<void
       // sweep 本体は `projectInitialization.ts` に置いて**ここで並べて**呼ぶ。
       // 新しい endpoint も timer も作らないのは、Worker の poll が既にこの route を
       // 叩いており、それが唯一必要な driver だからである。
-      // 上の `sweepInFlight` guard がそのまま両方を覆う（二重起動の抑止を作り直さない）。
+      // 上の `sweepInFlight` guard がそのまま全部を覆う（二重起動の抑止を作り直さない）。
       // continuation を先に流してから走らせる —— continuation が作った Task にも
       // 同じ cycle 内で初回 Job が付く。
       .then(() => recoverReadyTasksWithoutJob(storage))
@@ -63,6 +64,25 @@ export async function taskContinuationRoutes(app: FastifyInstance): Promise<void
           app.log.info(
             { ...recovery, driver: 'worker_poll' },
             '[taskContinuations] recovered adopted tasks that had no initial job',
+          )
+        }
+      })
+      // **U2**: ALIGNED evidence を残した直後に落ちた repair run の successor を、同じ poll で
+      // 回収する。review は再実行しない（module が `CoordinatorDeps` を持たない）。
+      //
+      // U7 と同じ形で**ここに並べる**理由も同じで、Worker の poll が既にこの route を叩いており、
+      // それが唯一必要な driver だからである。上の `sweepInFlight` guard が 3 つ全部を覆う。
+      // **chain の最後に置く。** U2 の候補は既に DB に在る terminal run で、前段がそれを
+      // 生むことはない。先に置いても得が無く、後に置けば既存 2 つの latency を変えない。
+      .then(() => recoverTerminalRepairSuccessors(storage))
+      .then((recovery) => {
+        // **failed も必ず出す。** 全候補が例外で落ちた sweep は正常終了扱いで外側の
+        // `.catch` にも入らないため、これを条件に入れないと**繰り返す欠陥が無音になる**
+        // （独立レビュー指摘・2026-09-25）。`recovered=0` を毎 cycle 出さない方針は維持する。
+        if (recovery.recovered > 0 || recovery.escalated > 0 || recovery.failed > 0) {
+          app.log.info(
+            { ...recovery, driver: 'worker_poll' },
+            '[taskContinuations] recovered repair successors for terminal aligned reviews',
           )
         }
       })
