@@ -2342,6 +2342,78 @@ describe('SQLiteStorage', () => {
           ).toHaveLength(1)
         })
 
+        /**
+         * 所有権を持たない終端 Job。**この 2 つは handoff が触ってはならない。**
+         * 所有権を持つのは running | blocked | non-initial queued だけである。
+         */
+        function createTerminalSourceJob(status: 'success' | 'failed'): Job {
+          const source = storage.jobs.create({
+            taskId,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'queued',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliProvider: 'codex',
+            aiCliPrompt: 'original prompt',
+            aiCliMode: 'implement',
+          })
+          return storage.jobs.update(source.id, status === 'success'
+            ? {
+                status: 'success',
+                exitCode: 0,
+                stdout: 'implementation finished',
+                changedFiles: ['apps/api/src/pl/executionLoop.ts'],
+              }
+            : {
+                status: 'failed',
+                exitCode: 1,
+                stderr: 'TypeError: boom',
+                changedFiles: ['apps/api/src/pl/executionLoop.ts'],
+              })!
+        }
+
+        /**
+         * **成功した source Job の結果を handoff が書き換えない。**
+         *
+         * review が `changes_requested` を返した Stage 2（`routes/jobs.ts` の review 経路）と
+         * Human Recovery の stored review 経路では、source は **成功した implement Job** である。
+         * 以前はここで無条件に `failed` を書いていたため、`status=failed` / `exitCode=0` /
+         * stderr 無し、という自己矛盾した行が残っていた（2026-09-25 実測）。
+         *
+         * `success` は所有権を持たないので、この更新は解放に一切寄与しない。
+         */
+        it('leaves a successful source Job untouched: the repair successor is created, the success record survives', () => {
+          const source = createTerminalSourceJob('success')
+
+          const result = storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id))
+
+          expect(result.ok).toBe(true)
+          if (!result.ok) return
+          // 後続 repair Job は従来どおり実体化する。
+          expect(storage.jobs.findById(result.repairJob.id)?.status).toBe('queued')
+          expect(storage.jobs.findById(result.repairJob.id)?.workflowStepKey).toBe(`repair:${source.id}:1`)
+          // **成功記録がそのまま残る。**
+          const after = storage.jobs.findById(source.id)!
+          expect(after.status).toBe('success')
+          expect(after.exitCode).toBe(0)
+          expect(after.stdout).toBe('implementation finished')
+          expect(after.changedFiles).toEqual(['apps/api/src/pl/executionLoop.ts'])
+        })
+
+        it('leaves an already failed source Job untouched and still creates the repair successor', () => {
+          const source = createTerminalSourceJob('failed')
+
+          const result = storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id))
+
+          expect(result.ok).toBe(true)
+          if (!result.ok) return
+          expect(storage.jobs.findById(result.repairJob.id)?.status).toBe('queued')
+          const after = storage.jobs.findById(source.id)!
+          expect(after.status).toBe('failed')
+          expect(after.exitCode).toBe(1)
+          expect(after.stderr).toBe('TypeError: boom')
+        })
+
         it('applies the task/recovery state update that belongs with the handoff', () => {
           const { id: sourceJobId } = createBlockedSourceJob()
 

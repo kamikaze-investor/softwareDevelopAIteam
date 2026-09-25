@@ -11214,6 +11214,53 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       新しい `PlActionKind` / 新しい dedup 機構 / 別の repair budget アルゴリズム /
       route 独自の budget override / `MAX_REPAIR_ATTEMPTS` の変更。
 
+<!-- roadmap:id=repair-handoff-overwrites-terminal-result state=done -->
+8. [x] **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた** —
+      2026-09-25登録・同日完了（No Lost Completion Checkpoint 2 後の read-only 調査）。
+
+      **責務は 1 つだけ。** `createRepairJobWithHandoff()` の source Job status 遷移である。
+      repair 予算・lineage・generation は `repair-budget-counted-per-task-not-per-chain`（done）、
+      stored review の再駆動は `consumed-stored-review-has-no-recovery-route`（done）が正本で、
+      本項目はそのどちらにも触れない。新しい workflow / Gate / review 工程も作らない。
+
+      **事象**: helper は同一 transaction で ①repair Job 作成 ②source Job を**無条件に**
+      `failed` ③任意の Task 更新、を行っていた。②の目的は workspace 所有権の解放だが、
+      所有権を持つのは `running` / `blocked` / non-initial `queued` だけで、
+      `success` / `failed` は持たない。したがって `success` に対する②は解放に一切寄与せず、
+      成功記録だけを壊していた。
+
+      **実測（2026-09-25・in-memory、`routes/jobs.ts` の review 経路と同じ呼び方）**:
+
+      | | source Job |
+      |---|---|
+      | BEFORE handoff | `status=success` / `exitCode=0` |
+      | AFTER handoff | `status=failed` / `exitCode=0` / stderr 無し |
+
+      **`success` の source が到達する production 経路**は 2 本あり、どちらも repair の主要な入口である
+      （helper を実行しうる dispatch 経路そのものはこれより多い）:
+      `routes/jobs.ts` の review が `changes_requested` を返す通常の Stage 2 と、
+      `repairFromStoredReview.ts` の Human Recovery。後者の admission
+      （`repairableBlockedReviewRequest()`）は「実装が成功していること」を条件にしており、
+      **handoff が自分の前提条件を壊していた**。`routes/tasks.ts` の `isTaskFailureJob()` も
+      成功した Job を失敗として拾っていた。
+
+      **入れたもの**: ②を条件付きにしただけである。
+
+      ```ts
+      if (source.status !== 'success' && source.status !== 'failed') {
+        jobs.update(source.id, { status: 'failed' })
+      }
+      ```
+
+      transaction 境界・rollback・stepKey dedup・冪等性は変えていない。
+      `blocked → failed` の所有権解放も従来どおりである。
+
+      **今回は変えなかったもの（別 Finding 候補）**: `running` / non-initial `queued` の
+      source から handoff が呼ばれうるかは未実測である。ここで fail-closed を足すと
+      現在動いている経路を escalation へ倒しかねないため、現状挙動を維持した。
+      到達可能性の調査が必要になった時点で別項目として登録する。
+      `input.taskUpdate` が production から一度も渡されていない点も同様に別扱いとする。
+
 ---
 
-*Updated: 2026-09-22*
+*Updated: 2026-09-25*

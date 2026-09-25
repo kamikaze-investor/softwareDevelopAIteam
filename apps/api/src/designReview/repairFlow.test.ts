@@ -700,3 +700,123 @@ describe('generation の導出そのものが失敗しても repair は止めな
     expect(storage.tasks.findById(ids.taskId)!.status).not.toBe('blocked')
   })
 })
+
+/**
+ * **repair handoff は source Job の終端結果を上書きしない。**
+ *
+ * production の repair は 2 種類の source から始まる:
+ *   - 実装が失敗した（`failed`）/ 所有権を保持したまま止めた（`blocked`）
+ *   - **実装は成功したが review が `changes_requested` を返した（`success`）**
+ *
+ * 後者は `routes/jobs.ts` の review 経路と Human Recovery の stored review 経路で、
+ * repair の主要な入口である。以前は `createRepairJobWithHandoff()` が source を
+ * 無条件に `failed` へ落としていたため、成功記録が消えていた（2026-09-25 実測）。
+ * ここは storage 単体ではなく **実際の repair 経路を通して**それを固定する。
+ */
+describe('repair handoff は source Job の終端結果を保持する', () => {
+  /** review 対象になった、成功した implement Job。 */
+  function createSucceededImplementJob(
+    storage: IStorage,
+    ids: { taskId: string; projectId: string },
+  ): Job {
+    const job = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'original prompt',
+    } as never)
+    return storage.jobs.update(job.id, {
+      status: 'success',
+      exitCode: 0,
+      stdout: 'implementation finished',
+      // focus 集合は changedFiles から決まる（selectFocuses）。deps() の ALIGNED stdout は
+      // focus を 1 件も報告しないので、focus が選ばれない changedFiles に揃える。
+      changedFiles: ['docs/readme.md'],
+    } as never)!
+  }
+
+  /** その implement Job に対する review Job と、保存済みの `changes_requested` verdict。 */
+  function storeChangesRequestedReview(
+    storage: IStorage,
+    ids: { taskId: string; projectId: string },
+    implementJobId: string,
+  ): void {
+    const reviewJob = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'reviewer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'review',
+      aiCliProvider: 'claude_code',
+      workflowStepKey: `implement:${implementJobId}:review`,
+    } as never)
+    storage.jobs.update(reviewJob.id, { status: 'success', exitCode: 0 } as never)
+    storage.reviewResults.create({
+      taskId: ids.taskId,
+      jobId: reviewJob.id,
+      reviewer: 'qa_ai',
+      status: 'changes_requested',
+      summary: 'fix the reported points',
+      findings: [{ severity: 'medium', file: 'docs/readme.md', message: 'in scope' }],
+    } as never)
+  }
+
+  it('review が却下した成功実装から repair を作っても、成功記録は残る', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const implementJob = createSucceededImplementJob(storage, ids)
+    storeChangesRequestedReview(storage, ids, implementJob.id)
+    const review = storage.reviewResults.findByTaskId(ids.taskId)[0]
+
+    // `routes/jobs.ts` の review 経路と同じ呼び方。
+    const preparation = prepareRepairFlow(storage, { failedJob: implementJob, review })
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+    expect(preparation.run.repairSourceJobId).toBe(implementJob.id)
+
+    const run = storage.designReviewRuns.create(preparation.run)
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    expect(outcome.status).toBe('repair_job_created')
+    // successor は従来どおり作られる。
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+    // **source の成功記録は壊れない。**
+    const after = storage.jobs.findById(implementJob.id)!
+    expect(after.status).toBe('success')
+    expect(after.exitCode).toBe(0)
+    expect(after.stdout).toBe('implementation finished')
+  })
+
+  // **`runRepairFlow()` では確かめられない。** あちらは `storage.jobs.create()` を直接呼び、
+  // `createRepairJobWithHandoff()` を通らない（`repairFlow.ts` の `runRepairFlow`）ため、
+  // handoff の source 更新を 1 行も実行しない（独立レビュー指摘・2026-09-25）。
+  // 失敗側も success 側と同じ `prepareRepairFlow()` + `executeQueuedRepair()` で確かめる。
+  it('失敗した実装からの repair では、従来どおり source は failed のまま', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+
+    const run = storage.designReviewRuns.create(preparation.run)
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    expect(outcome.status).toBe('repair_job_created')
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+    const after = storage.jobs.findById(failed.id)!
+    expect(after.status).toBe('failed')
+    expect(after.exitCode).toBe(1)
+    expect(after.stderr).toBe('TypeError: boom')
+  })
+})

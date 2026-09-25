@@ -232,6 +232,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**
 - **原則自体の再Review候補を、適用記録から機械的に起こす**
 - **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない**
+- **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
