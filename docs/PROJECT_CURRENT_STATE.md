@@ -220,6 +220,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **正式 Roadmap の1項目を実行可能な Task として採用する最小経路
 - **Tier A: 自己開発の最初の安全な切替点
 - **cleanup だけが失敗した containment が Job を quarantine させる
+- **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される
 - **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
@@ -265,7 +266,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）**（state: planned）
 - **Containment adversarial escape（cgroup migration / git external helper）（state: planned）
 - **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）**（state: planned）
-- **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される（state: planned）
 - **Containment success path の可観測性（低優先 hardening）**（state: planned）
 - **Failure Explanation の事前生成と CEO 向け構造化（次段改善）（state: planned）
 - **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）
