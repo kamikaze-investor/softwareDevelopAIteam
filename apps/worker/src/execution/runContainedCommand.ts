@@ -49,6 +49,38 @@ const PLACEMENT_PROGRAM =
 const PLACEMENT_ACK = 'ok'
 
 /**
+ * placement handshake の決着を待つ上限。
+ *
+ * **なぜ必要か（production 実測・2026-09-25）**: pre-aborted な `AbortSignal` を渡すと
+ * `cgroup.kill` が `spawn()` の直後（≒0ms）に撃たれる。ラッパは
+ * `echo $$ > cgroup.procs`（= cgroup へ参加）までは完了するが、次行の `echo ok >&3` に
+ * 到達する前に、自分が参加したことで届いた SIGKILL で死ぬ。結果、**placement は成功して
+ * いるのに ACK が 1 バイトも出ない**。本番 VPS の delegated cgroup 環境で 38 回中 10 回
+ * (26%) 再現し、10 件すべてが「fd3 は `end` まで到達、raw bytes 0、child は SIGKILL」で
+ * あることを確認した（late ACK = 0 件）。`placement_failed` は safety boundary なので、
+ * 自分で撃った kill が自分の観測手段を壊すこの経路は塞がねばならない。
+ *
+ * **値の根拠**: 同実測で fd3 が terminal（`end`/`close`）に達するまでの時間は
+ * ワークロードの生存時間と無関係に **全 38 回で 0〜17ms**（ラッパが `exec 3>&-` で
+ * workload exec 前に閉じるため）。1 秒は実測最大の約 59 倍で、負荷変動に対する余裕がある。
+ * 同時に `DEFAULT_DRAIN_MS`（10 秒）の 1/10 であり、cancel 応答性を不必要に損なわない。
+ * **この deadline は placement の成功を意味しない。** 到達した場合は kill したうえで、
+ * ACK が無いという事実に従って従来どおり `placement_failed`（fail-closed）に分類する。
+ */
+const PLACEMENT_HANDSHAKE_DEADLINE_MS = 1_000
+
+/**
+ * placement handshake の観測状態。
+ * - `pending`: ACK も失敗も未観測。**この間に `cgroup.kill` を撃ってはならない**
+ * - `placed`: fd 3 に ACK を確認した
+ * - `failed`: ACK 無しで fd 3 が terminal になった／ACK 前に child が exit・error した
+ *
+ * この状態は **kill の順序制御にのみ**使う。最終的な分類は従来どおり `placementAcked`
+ * （fd 3 の ACK protocol）だけを正本とする。
+ */
+type PlacementHandshakeState = 'pending' | 'placed' | 'failed'
+
+/**
  * containment の結果種別。
  * `clean` / `killed` 以外はすべて containment インフラ側の失敗であり、
  * 呼び出し元は ownership を保持したまま quarantine しなければならない。
@@ -332,6 +364,17 @@ async function runInsideCgroup(
   let killFailure: string | undefined
   let directChildUnreaped = false
 
+  // placement handshake の決着。`abort` / `timeout` が handshake の途中で来たときに
+  // kill を遅らせるためだけに使う（分類には使わない）。
+  let placementState: PlacementHandshakeState = 'pending'
+  const placementWaiters: Array<() => void> = []
+  const settlePlacement = (next: 'placed' | 'failed'): void => {
+    if (placementState !== 'pending') return
+    placementState = next
+    // 待機者は一度だけ起こす。splice しておかないと、後続の決着で二重に呼ばれる。
+    for (const wake of placementWaiters.splice(0)) wake()
+  }
+
   // 出力はバイト数で数える。UTF-8 デコード後の文字数では execFileSync の maxBuffer を再現できない。
   const collect = (which: 'out' | 'err') => (chunk: Buffer): void => {
     const current = which === 'out' ? stdoutBytes : stderrBytes
@@ -357,9 +400,24 @@ async function runInsideCgroup(
   const ackStream = child.stdio[3]
   if (ackStream && 'on' in ackStream) {
     ackStream.on('data', (chunk: Buffer) => {
-      if (chunk.toString('utf-8').includes(PLACEMENT_ACK)) placementAcked = true
+      if (chunk.toString('utf-8').includes(PLACEMENT_ACK)) {
+        placementAcked = true
+        settlePlacement('placed')
+      }
     })
-    ackStream.on('error', () => { /* ack パイプの異常は placementAcked=false として現れる */ })
+    // ACK を観測しないまま fd 3 が閉じたら、この実行の placement はもう証明できない。
+    // ラッパは workload を exec する前に fd 3 を閉じるため、この terminal は
+    // **workload の生存時間とは独立**に届く（本番実測: 全 38 回で 0〜17ms）。
+    ackStream.on('end', () => { settlePlacement('failed') })
+    ackStream.on('close', () => { settlePlacement('failed') })
+    ackStream.on('error', () => {
+      /* ack パイプの異常は placementAcked=false として現れる */
+      settlePlacement('failed')
+    })
+  } else {
+    // fd 3 が取れない環境では handshake を待てない。待つと無限待ちになるため、
+    // 直ちに `failed` として扱う（分類は従来どおり placementAcked=false 由来）。
+    settlePlacement('failed')
   }
 
   // stdin: エラーリスナを「書く前に」張る。EPIPE のみ許容する（子が読まずに終了した場合）。
@@ -376,11 +434,13 @@ async function runInsideCgroup(
   const exited = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     let settled = false
     let graceTimer: NodeJS.Timeout | undefined
+    let placementTimer: NodeJS.Timeout | undefined
     const settle = (value: { code: number | null; signal: NodeJS.Signals | null }): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       clearTimeout(graceTimer)
+      clearTimeout(placementTimer)
       options.signal?.removeEventListener('abort', onAbort)
       resolve(value)
     }
@@ -393,9 +453,8 @@ async function runInsideCgroup(
      * Phase 2 が無くそうとしている状態そのものになる。
      */
     let killIssued = false
-    const killThenBoundedWait = (): void => {
-      if (killIssued || settled) return
-      killIssued = true
+    const issueKill = (): void => {
+      if (settled) return
       const killError = writeCgroupKill(cgroupPath)
       if (killError !== undefined) {
         // kill できない cgroup を待っても意味がない。ただちに諦めて
@@ -410,6 +469,38 @@ async function runInsideCgroup(
         directChildUnreaped = true
         settle({ code: null, signal: null })
       }, drainLimitMs)
+    }
+
+    /**
+     * **placement handshake の途中では kill しない。**
+     *
+     * ラッパが `cgroup.procs` へ自分の PID を書いた直後に `cgroup.kill` が届くと、
+     * ラッパは次行の `echo ok >&3` に到達できずに死ぬ。placement は成功しているのに
+     * ACK が存在しなくなり、安全だった実行が `placement_failed` へ誤分類される
+     * （本番実測 26%）。よって handshake が決着するまでだけ kill を遅らせる。
+     *
+     * 遅延は必ず bounded で、決着契機は既存の観測点だけ:
+     * ACK / fd 3 terminal / child exit・error / `PLACEMENT_HANDSHAKE_DEADLINE_MS`。
+     * **child 全体の `close` は待たない**（生存する子孫に引きずられるため）。
+     * deadline に到達しても placement 成功とは扱わず、kill したうえで
+     * ACK の有無に従って従来どおり分類する（= fail-closed のまま）。
+     */
+    const killThenBoundedWait = (): void => {
+      if (killIssued || settled) return
+      killIssued = true
+      if (placementState !== 'pending') {
+        issueKill()
+        return
+      }
+      let proceeded = false
+      const proceed = (): void => {
+        if (proceeded) return
+        proceeded = true
+        clearTimeout(placementTimer)
+        issueKill()
+      }
+      placementWaiters.push(proceed)
+      placementTimer = setTimeout(proceed, PLACEMENT_HANDSHAKE_DEADLINE_MS)
     }
 
     const timer: NodeJS.Timeout | undefined = options.timeoutMs === undefined
@@ -432,8 +523,14 @@ async function runInsideCgroup(
 
     // `close` ではなく `exit` を待つ。stdio を共有した別プロセスが生きていると
     // `close` は遅れる（まさに封じ込めたい状況で待たされる）。
-    child.on('exit', (code, signal) => settle({ code, signal }))
+    // child が終わった時点で ACK を観測していないなら、handshake はもう決着しない。
+    // 待機中の kill をここで解放する（`placed` 済みなら no-op）。
+    child.on('exit', (code, signal) => {
+      settlePlacement('failed')
+      settle({ code, signal })
+    })
     child.on('error', (err) => {
+      settlePlacement('failed')
       spawnError = describeError(err)
       settle({ code: null, signal: null })
     })

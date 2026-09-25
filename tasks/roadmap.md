@@ -5901,6 +5901,34 @@ deploy canary は全 PASS だった。
       **関連**: `quarantined-dirty-task-generic-recovery`（この quarantine から**出られない**理由。
       同じ復旧クラスタだが根本原因と責務が異なるため、**1つの実装 / PR にまとめない**）。
 
+<!-- roadmap:id=containment-placement-ack-race state=planned -->
+4. [ ] **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される — correctness bug（2026-09-25 本番実測）**
+
+      **責務**: cgroup placement 自体が成功している実行を、ACK / abort / timeout / kill ordering の
+      race によって `placement_failed` と誤分類しない。**ただし真の placement failure は引き続き
+      fail-closed にする。** この2つ以外はこの項目に含めない
+      （general flaky-test 対策 / delegation contract / adversarial escape / observability 一般 /
+      `createRepairJobWithHandoff()` の Job history finding / 新しい retry・Gate・workflow・status・daemon）。
+
+      **実測（本番 VPS・delegated cgroup・2026-09-25）**: pre-aborted な `AbortSignal` を渡すと
+      `cgroup.kill` が `spawn()` の直後（≒0ms）に撃たれる。ラッパは
+      `echo $$ > cgroup.procs`（= cgroup へ参加）までは完了するが、次行の `echo ok >&3` に
+      到達する前に、自分が参加したことで届いた SIGKILL で死ぬ。結果 **placement は成功して
+      いるのに ACK が 1 バイトも出ず**、安全だった実行が `placement_failed`（= `isContainmentSafe`
+      false）になる。38 回中 10 回（26%）再現。10 件すべてで fd3 は `end` まで到達し raw bytes 0、
+      child は SIGKILL、`killedDescendants` は true。**late ACK（Node stream の配送遅れ）は 0 件**で、
+      「exit 後に既存 ACK を回収する」修正では 1 件も救えないことを確認済み。
+
+      **影響**: 誤りの向きは fail-closed（危険を安全と報告する経路ではない）。しかし正常な Job を
+      不定期に停止させる。2026-09-25 に Task `c3849205` の repair Job を実際に一度止めた。
+
+      **着手時の制約**: `SAFE_OUTCOMES` / `isContainmentSafe()` / `placement_failed` の意味 /
+      真の placement failure の fail-closed は変更しない。SIGKILL されたこと自体を placement 成功の
+      証拠に使わない。既存 fd3 ACK protocol を正本として維持する。child 全体の `close` 待ちへは
+      戻さない（生存子孫に引きずられるため）。placement 待ちに `DEFAULT_DRAIN_MS`（10s）を流用せず、
+      cancel 応答性を損なわない短い bounded deadline を使う。deadline 到達は placement 成功では
+      ないので、到達後は kill したうえで従来どおり fail-closed に分類する。
+
 <!-- roadmap:id=containment-success-path-observability state=planned -->
 4. [ ] **Containment success path の可観測性（低優先 hardening）** — 2026-09-08、P1 Phase 1/2
       Operational E2E の完走後に記録。**Phase 1/2 を reopen する必要は無い。動作は正常。**
