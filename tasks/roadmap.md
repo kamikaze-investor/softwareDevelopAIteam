@@ -5648,8 +5648,8 @@ deploy canary は全 PASS だった。
       **上記が全て満たされるまで interlock は維持する（CEO 指示）。**
 
       **2026-09-25 追記（下流依存の明記。本項目の受入条件・順序は変えない）**: AIcompanyOS 方向の
-      `company-state-foundation` → `organizational-learning` → `cross-project-compounding` →
-      `organizational-self-evolution`（いずれも `deferred`）は、本項目の S4 と
+      `company-state-foundation` → `organizational-learning` → { `cross-project-compounding` /
+      `organizational-self-evolution` }（いずれも `deferred`）は、本項目の S4 と
       `SingleRunningProjectError` 解除（上記受入条件 1〜7）を前提とする。複数 Project を同時に安全運用できる前に
       Company-wide learning を実装しない。**本項目を前倒し・拡張する理由にはしない。**
 
@@ -6321,8 +6321,12 @@ Compounding は実際に並走する第2 Project の実データ、Self-Evolutio
 
 **依存順（Roadmap の critical path に割り込ませない）**:
 `project-workspace-isolation`（S1〜S4）→ `SingleRunningProjectError` 解除 → `cross-project-state-api` 残作業 →
-**[CEO 判断] Company State の置き場所** → `company-state-foundation` → `organizational-learning` →
-`cross-project-compounding` → `organizational-self-evolution`。
+`company-state-foundation` → `organizational-learning` → 分岐して
+{ `cross-project-compounding` / `organizational-self-evolution` }。
+**2 つの後段は互いに依存しない。** `cross-project-compounding` は実際の複数 Project 運用データを要するが、
+`organizational-self-evolution` は単一 Project や AIteamOS 自身の execution history からでも
+Prompt / Skill / Workflow / Tool selection / Routing / Role・Model assignment の Candidate を生成・評価できるため、
+`cross-project-compounding` の完了を前提にしない。
 `project-auto-multi-worker` は前提にしない。4 項目とも `deferred` のため PL の自律採用対象外であり
 （`isRoadmapItemAdoptable()` は `planned` のみ）、現在の 24h 自律稼働・Multi-Project 化・既存 critical path の
 順位を変えない。
@@ -6337,6 +6341,13 @@ Compounding は実際に並走する第2 Project の実データ、Self-Evolutio
   managed service → 自作」の順で再調査する（外部サービス追加・課金は Yellow Zone）
 - **Goal / Design Philosophy を変更しない**。`design_philosophy.md` 12「AIcompanyOS の Business Management
   責務を先回りして AIteamOS へ取り込まない」は現行有効である
+- **CEO 判断（2026-09-25）: Canonical Company State の論理的な正本所有者は AIcompanyOS とする。**
+  Company / Portfolio / Business Metric / Decision / Experiment / Learning 等は AIcompanyOS-owned state であり、
+  AIteamOS は引き続き Execution / Governance 層を担当して Business Management そのものを責務へ取り込まない
+  （`design_philosophy.md` 12 は変更しない）。**物理的な別 DB・別 service・別 repository は現時点で要求しない。**
+  最小変更を優先し初期実装では既存 DB を共有してよいが、schema / API / authority 上で
+  AIcompanyOS-owned state と AIteamOS execution state の責務境界を維持し、将来必要になれば
+  storage / service を分離できる設計とする。
 
 <!-- roadmap:id=company-state-foundation state=deferred -->
 1. [ ] **Company State Foundation** — 会社そのものが現在状態を保持する — 2026-09-25登録。
@@ -6362,8 +6373,11 @@ Compounding は実際に並走する第2 Project の実データ、Self-Evolutio
         比較する。最初から DB 切替（Dolt 等）をしない
       **着手条件**: (1) `project-workspace-isolation` 完了と `SingleRunningProjectError` 解除、
       (2) `cross-project-state-api` の `audit_log.project_id` 完了、
-      (3) **CEO 判断**: Company / Portfolio / Business Metric の正本を AIteamOS の DB 拡張として持つか、
-      AIteamOS 外側の AIcompanyOS 層として持つか（`design_philosophy.md` 12 に関わるため AI が決めない）。
+      (3) 正本の所有者は **CEO 判断（2026-09-25）で決着済み**（上の「全項目共通の制約」）:
+      論理的な正本は AIcompanyOS、AIteamOS は Execution / Governance 層。既存 DB の共有は可だが、
+      schema / API / authority 上で AIcompanyOS-owned state と AIteamOS execution state を分け、
+      将来 storage / service を分離できる形にする。**CEO 判断待ちは解消したが、本項目は (1)(2) が満たされるまで
+      `deferred` のままとし、Multi-Project 成立前に着手可能にしない。**
       **作らないもの**: Company Ontology engine、Palantir 互換実装、Postgres への即時移行、Graph DB、
       固定の Business schema。
 
@@ -6431,6 +6445,8 @@ Compounding は実際に並走する第2 Project の実データ、Self-Evolutio
       **着手条件**: `organizational-learning`（Candidate の根拠となる Validated Learning）、
       `dry-run-does-not-simulate` / `staged-rollout-absent`（replay と段階投入の足場）、
       `aiteamos-self-development-tier-b`（protected file に届く変更の Promotion 経路）。
+      **`cross-project-compounding` は前提にしない**（単一 Project / AIteamOS 自身の execution history で
+      Candidate の生成・評価が成立する。Compounding と本項目は `organizational-learning` から分岐する並列の後段）。
 
 ### Architecture Debt: Organization Core切り出しの阻害要因（2026-08-09調査で確定・MVP中は修正しない）
 

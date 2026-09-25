@@ -138,12 +138,20 @@ Phase 番号は本書だけの説明用であり、Roadmap の分類（`state=` 
 | Cross-Project Compounding | 「Team Lesson の Company Lesson 昇格は Cross-domain validation を要する」（Roadmap「将来アーキテクチャ移行」）、`applicable_conditions`（5b-5-1） | 転用時の target-project 再検証、negative transfer 防止、実際に並走する第2 Project |
 | Self-Evolution | Principle sensor の閉ループ最小形（`specs/23` 12章。原則本文は自動で書き換えず再 Review 候補を出して止まる）、Stable / Candidate 自己開発（Tier A 稼働、Tier B planned）、`role-model-registry`（planned） | Organization Version / Manifest、replay / holdout による Candidate 評価、`dry-run-does-not-simulate` / `staged-rollout-absent`（deferred） |
 
-**責務境界上の未決事項（CEO 判断事項）**: `design_philosophy.md` 12 は
+**責務境界（CEO 判断で決着・2026-09-25）**: `design_philosophy.md` 12 は
 「AIteamOS は AIcompanyOS そのものにはならない」「AIcompanyOS の Business Management 責務を
-先回りして AIteamOS へ取り込まない」と定める。したがって Company / Portfolio / Business Metric の
-正本を**AIteamOS の DB 拡張として持つのか、AIteamOS の外側の AIcompanyOS 層として持つのか**は
-Design Philosophy に関わる判断であり、`company-state-foundation` 着手前に CEO が決める。
-本書はこの判断を先取りしない。
+先回りして AIteamOS へ取り込まない」と定める（変更しない）。その上で次を確定した。
+
+- Company / Portfolio / Business Metric / Decision / Experiment / Learning 等の
+  **Canonical Company State の論理的な正本所有者は AIcompanyOS** とする
+- AIteamOS は引き続き **Execution / Governance 層**を担当し、Business Management そのものを責務へ取り込まない
+- これは現時点で**物理的な別 DB・別 service・別 repository を要求しない**。最小変更を優先し、
+  初期実装では既存 DB を共有してよい
+- ただし **schema / API / authority 上で AIcompanyOS-owned state と AIteamOS execution state の
+  責務境界を維持**し、将来必要になった場合に storage / service を分離できる設計とする
+
+これにより `company-state-foundation` の CEO 判断待ちの着手条件は解消した。項目は引き続き `deferred` で、
+Multi-Project 成立前には着手しない。
 
 ---
 
@@ -211,12 +219,16 @@ Cross-Project Compounding / Safe Organizational Evolution に置く。
 project-workspace-isolation（S1〜S4。planned）
   → SingleRunningProjectError 解除（同項目の受入条件 1〜7 を満たした後続変更）
   → cross-project-state-api の残作業（audit_log.project_id。in_progress）
-  → [CEO 判断] Company State の置き場所（AIteamOS 拡張か AIcompanyOS 層か。design_philosophy 12）
-  → company-state-foundation（deferred）
+  → company-state-foundation（deferred。正本所有者は CEO 判断 2026-09-25 で AIcompanyOS に決着済み）
   → organizational-learning（deferred）
-  → cross-project-compounding（deferred。実際に並走する第2 Project の実運用データが要る）
-  → organizational-self-evolution（deferred）
+  → 分岐（互いに依存しない）
+       ├─ cross-project-compounding（deferred。実際に並走する第2 Project の実運用データが要る）
+       └─ organizational-self-evolution（deferred。単一 Project / AIteamOS 自身の execution history で成立する）
 ```
+
+- `organizational-self-evolution` は `cross-project-compounding` の完了を前提にしない。
+  Prompt / Skill / Workflow / Tool selection / Routing / Role・Model assignment の改善 Candidate は、
+  単一 Project や AIteamOS 自身の execution history からでも生成・評価できるため
 
 - `project-auto-multi-worker`（複数 Worker）は**前提にしない**。複数 Project の同時運用は単一 Worker でも成立する
 - 既に稼働している狭い自己改善（Principle sensor、`project-auto-incident-pattern-improvement`）は
