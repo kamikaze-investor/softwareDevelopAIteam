@@ -5901,8 +5901,16 @@ deploy canary は全 PASS だった。
       **関連**: `quarantined-dirty-task-generic-recovery`（この quarantine から**出られない**理由。
       同じ復旧クラスタだが根本原因と責務が異なるため、**1つの実装 / PR にまとめない**）。
 
-<!-- roadmap:id=containment-placement-ack-race state=planned -->
-4. [ ] **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される — correctness bug（2026-09-25 本番実測）**
+<!-- roadmap:id=containment-placement-ack-race state=done -->
+4. [x] **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される — correctness bug（2026-09-25 本番実測）— 完了（2026-09-25, PR #289）**
+
+      **【2026-09-25 完了】** merge commit `a23732928ca5eacec297f956697d9ebf8f6ffe28`。
+      abort / timeout 時に placement handshake が pending なら、ACK / fd3 terminal / child exit・error /
+      bounded deadline の最初の決着まで待ってから `cgroup.kill` を撃つようにした。成功判定は引き続き
+      fd3 ACK protocol のみで、`SAFE_OUTCOMES` / `isContainmentSafe()` / `placement_failed` の分類 /
+      true placement failure の fail-closed はいずれも不変（byte-identical）。
+      検証: delegated cgroup で pre-abort 90 回の `placement_failed` 0 件（修正前は 38 回中 10 回）、
+      同環境で worker 69 files / 1,388 tests pass、Independent Review approved / findings 0。
 
       **責務**: cgroup placement 自体が成功している実行を、ACK / abort / timeout / kill ordering の
       race によって `placement_failed` と誤分類しない。**ただし真の placement failure は引き続き
