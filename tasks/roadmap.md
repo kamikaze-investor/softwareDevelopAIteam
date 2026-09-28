@@ -9571,6 +9571,27 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       が正本）、medium 以上で unavailable の理由が rejectedReason に残らない既存挙動、Task `9fdee5a3` の再開
       （Production deploy 後に別途）。
 
+<!-- roadmap:id=approved-resumed-review-creates-no-git-commit state=done -->
+16. [x] **approved になった Human Resume review から git_commit が作られず、Task が行き止まりになる（D4）** —
+      2026-09-28 監査（Task `9fdee5a3` の再開前確認）で登録し、同日修正。
+
+      **責務は 1 つ**: Human Resume で再実行された review が approved なら、通常の review と同じ git_commit successor へ繋ぎ、
+      その git_commit を CEO が REJECT した後も元の実装まで provenance を復元できること。**新しい status / Gate / workflow は作らない。**
+
+      **実測（コード）**: `routes/jobs.ts` の `isAutomaticReviewJob` は `implement:<id>:review` の形だけを見ていた。
+      `resume:<review>:1` の review が approved でも git_commit は作られず、Task は blocked のまま latest Job = success になり、
+      `resumeBlockedTask()`（latest が blocked / failed のときだけ）も `/recover`（Job がある Task は対象外）も使えない。
+      さらに REJECT 後の provenance（`resolveSourceImplementJobForRejectedGitCommit`）も review → implement を
+      `implement:<id>:review` の parse だけで辿っていたので、git_commit だけ作ると REJECT 後に別の行き止まりができる。
+
+      **修正**: review → implement の traversal を `repairPolicy.ts` の `resolveReviewedImplementationFrom()` 1 本へ寄せ
+      （D1 の walker を移動。Job の `findById` / `findByTaskId` だけを受け取るので storage 層が flow 層へ依存しない）、
+      D1 / D3 の入口・approved continuation・REJECT 後の provenance がすべてそれを使う。approved な resumed review は
+      辿れたときだけ `review:<今回の review>:git-commit` を作る（辿れなければ従来どおり作らない）。
+      **git_commit 側の resume 正規化は従来どおり最大 1 ホップ**で、その先の review → implement の区間だけを walker が担う。
+
+      **この項目に含めないもの**: `repairFromStoredReview` の resume 対応（既知 Finding）、Worker の review context 推測（W1）。
+
 <!-- roadmap:id=resumed-review-changes-requested-reaches-no-repair state=done -->
 13. [x] **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）** —
       2026-09-28 production 実測（Task `9fdee5a3`、review `12c5287f`）で登録し、同日修正。
