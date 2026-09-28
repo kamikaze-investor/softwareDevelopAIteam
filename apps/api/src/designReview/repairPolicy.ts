@@ -439,6 +439,33 @@ export function walkRepairGeneration(
 }
 
 /**
+ * **Human Resume で後継が作られた Job の id 集合**（superseded）。
+ *
+ * `resumeBlockedTask()` は元の Job を `blocked` / `failed` のまま残して
+ * `resume:<元Job>:<n>` を作る。元の行は durable history であって、もう Task を止めている
+ * 原因ではない —— 人が「ここから続ける」と明示的に答えたからである。
+ *
+ * Job X を superseded とするのは、次をすべて満たす Job S があるときだけ:
+ *   - S の stepKey が `resume:<X>:<n>`（既存 `parseResumeSource()`。形が違えば対象外）
+ *   - S の actor が `human`（`unknown` / `ai` は対象外。記録が無いことを human と解釈しない）
+ *   - S から辿る lineage 全体が well-formed（既存 `walkRepairGeneration()` が ok。
+ *     X の実在・同一 Task・非環はそちらの責務）
+ *
+ * 元の行は書き換えない。ここは「いま誰かが対応すべき停止か」を読むときの**解釈**だけである。
+ */
+export function jobsSupersededByHumanResume(priorJobs: readonly PriorRepairJob[]): Set<string> {
+  const superseded = new Set<string>()
+  for (const job of priorJobs) {
+    if (job.resumeActorClass !== 'human') continue
+    const source = parseResumeSource(job.workflowStepKey ?? '')
+    if (source === undefined) continue
+    if (!walkRepairGeneration(job.id, priorJobs).ok) continue
+    superseded.add(source)
+  }
+  return superseded
+}
+
+/**
  * 次に取るべき行動を決める。
  *
  * @param sourceJobId 失敗した元Job。stepKeyのanchorにする。attempt番号をanchorにすると
