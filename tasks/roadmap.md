@@ -5378,6 +5378,10 @@ quarantine / retry / recovery / Review / Approval / runtime progress / cost を1
 **write 側**: 既存の `POST /api/tasks/:id/resume`・`PATCH /api/jobs/:id/clear-quarantine`・
 `PATCH /api/approval-requests/:id/status` 等をそのまま使う。**新しい Control subsystem を作らない。**
 
+**【2026-09-28 CEO 方針で更新】** ChatGPT（MCP）側は上記 write API を**直接呼ばない**。
+ChatGPT に許すのは safe read と Operator Request（`ask_pl` 相当）の作成・結果取得だけで、
+実際の操作は PL が既存 Gate を通して行う。詳細は `chatgpt-mcp-inspect` を参照。
+
 ### 横断制約: 従量課金APIを新しい標準経路にしない（CEO 追加指示・2026-09-14）
 
 Operator Chat・MCP・Explainer のいずれについても、OpenAI API / Anthropic API 等の**従量課金 API を
@@ -10092,13 +10096,44 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       quarantine、retry / resume 状況、Review / Approval、Recovery / Watchdog、runtime progress、
       Finding / audit 情報を ChatGPT から読める状態にする。
 
-      **Phase 2（既存 Gate で安全に実行可能な範囲のみ）**: resume / retry / recovery request。
-      **既存 API をそのまま使う**（`POST /api/tasks/:id/resume`・
-      `PATCH /api/jobs/:id/clear-quarantine` 等）。MCP 専用の resume / recovery 経路は作らない。
-      Approval Gate・Permission Guard・quarantine の fail-closed は**一切迂回しない**。
+      **Phase 2（廃止・2026-09-28 CEO 方針）**: ~~ChatGPT から `POST /api/tasks/:id/resume`・
+      `PATCH /api/jobs/:id/clear-quarantine` 等の write API を直接呼ぶ~~ 設計は**廃止**した。
+      **ChatGPT に operational write capability は一切与えない。**
 
-      **今回実装しないもの**: 自由な write API / Gate を迂回する操作 / MCP 専用の state store /
-      credential の MCP 側保持。
+      **【2026-09-28 CEO 方針で確定した権限境界】**
+      ChatGPT に許すのは次の3つだけ:
+      (1) 安全に projection された read / (2) Operator Request の作成（`ask_pl` 相当）/
+      (3) Operator Request の結果取得。
+      Task / Job mutation・resume・approve・`ceo_approval` 作成・Design Review evidence 作成・
+      quarantine 解除・commit・PL tick・context-pack 等、operational state を直接変える操作は
+      **すべて許可しない**。Operator Request の作成は request record の保存だけで、
+      operational state を変えない。実際の操作が要る場合は、PL が既存の
+      `authorizePlAction()` と既存 Gate を通して行う（Operator Request は PL の権限を拡張しない。
+      PL に無い approve / Human Recovery / `ceo_approval` は追加しない。実行できない要求は
+      response で断るか既存の escalation 経路へ回す）。
+
+      **共通 Operator Interface を先に作る**: `operator-chat-mobile` と共有する
+      `operator_request` ベースの interface を先に実装し、MCP はその薄い adapter とする
+      （state・独自 Gate を持たない）。
+
+      **credential**: 専用 class `operator_gateway`（default-deny allowlist: safe read と
+      Operator Request の POST / GET のみ）。ADMIN / WORKER / legacy / ACTIONS_READONLY の流用は禁止。
+      ChatGPT → MCP の外部認証と MCP → AIteamOS の内部 credential は分離し、
+      **AIteamOS の credential を ChatGPT クライアントへ渡さない**。外部認証は現行の OpenAI MCP
+      authentication requirements を確認してから設計する（推測で実装しない）。
+
+      **実装順**: D0 認証前提確認 + `auth-empty-token-hash-accepted` 修正 →
+      D1 Operator Request storage / route / types → D2 PL が Operator Request を診断し response を保存 →
+      D3 safe read projection と `operator_gateway` credential / allowlist → D4 薄い MCP adapter →
+      D5 ChatGPT との接続テスト。
+
+      **Production 有効化の blocking prerequisite（CEO 判断）**: production が split credential mode
+      であることの確認 / `auth-empty-token-hash-accepted` の deploy / `POST /api/context-pack` の
+      任意ファイル読み取り問題の修正（**本項目へ混ぜず別の security fix として行う**）/ D5 の結果。
+      これらが揃うまで ChatGPT から Production への外部接続は有効化しない。
+
+      **今回実装しないもの**: 自由な write API / Gate を迂回する操作 / ChatGPT からの直接 write /
+      MCP 専用の state store / credential の MCP 側保持（ChatGPT クライアント側への配布）。
 
       **関連**: `operator-chat-mobile`（同じ interface を Mobile 側から使う）。
       **両者で別々の操作システムを作らない**（CEO 指示・2026-09-14）。
@@ -10127,6 +10162,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **再利用するもの（新規に作らない）**: 既存の Task / Job state、`resume`、Recovery、
       Approval、Watchdog、`audit_log`。**Chat 専用の Resume / Recovery 機構は作らない。**
+
+      **【2026-09-28 CEO 方針】** 本項目は `chatgpt-mcp-inspect` と同じ **Operator Request
+      （`operator_request`）interface** を再利用する。Mobile 用に別の command / message backend は
+      新設しない。Operator Request interface 自体は `chatgpt-mcp-inspect` の D1/D2 として先に作る。
 
       **PL Console（下記 deferred 4件）との関係**: 別物である。PL Console は「ベンダー非依存の
       PL 指示 UI」（LibreChat 等の評価・Gateway・Provider Adapter を含む重量級）で、本項目は
