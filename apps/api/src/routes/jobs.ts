@@ -17,7 +17,13 @@ import {
   canApplyJobResultStatus,
   describeApplicableJobStatuses,
 } from '../jobResultApplicationPolicy'
-import { escalateTaskToHuman, executeQueuedRepair, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
+import {
+  escalateTaskToHuman,
+  executeQueuedRepair,
+  isWorkspaceQuarantined,
+  prepareRepairFlow,
+  resolveReviewedImplementation,
+} from '../designReview/repairFlow'
 import { REPAIR_STEP_PREFIX } from '../designReview/repairPolicy'
 import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
 import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
@@ -705,15 +711,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       // 対象は review 対象の implement Job であって review Job 自身ではない。
       // review結果の永続化は既に完了しているため、ここでのqueue失敗はStage 2を失うだけで
       // review結果は失われない。失敗はlogに残し、PATCH応答は妨げない。
+      //
+      // **対象の implement Job は保存済み lineage から引く。** Human Resume で再実行された
+      // review は `resume:<元review>:1` になり、以前の `implement:<id>:review` 一致だけでは
+      // repair も escalation も作られずに終わっていた（2026-09-28 production・Task `9fdee5a3`）。
       if (!approved && !persisted.deduplicated) {
-        const implementJobId = existing.workflowStepKey?.match(/^implement:(.+):review$/)?.[1]
-        const implementJob = implementJobId ? storage.jobs.findById(implementJobId) : undefined
+        const reviewed = resolveReviewedImplementation(storage, existing.id)
+        if (!reviewed.ok && existing.workflowStepKey !== undefined) {
+          // workflow 上の review なのに実装へ辿れない。黙って終わらせず理由を残す（fail-closed）。
+          req.log.warn({ jobId: existing.id, reason: reviewed.reason }, 'review requested changes but its implementation could not be resolved; stage 2 not started')
+        }
+        const implementJob = reviewed.ok ? reviewed.implementJob : undefined
         if (implementJob) {
           try {
             const reviewPreparation = prepareRepairFlow(storage, {
               failedJob: implementJob,
               review: persisted.reviewResult,
               qaResults: storage.qaResults.findByTaskId(existing.taskId),
+              reviewJobId: existing.id,
             })
             if (reviewPreparation.action === 'escalate') {
               escalateTaskToHuman(storage, existing.taskId)

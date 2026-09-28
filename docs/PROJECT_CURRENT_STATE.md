@@ -228,6 +228,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
 - **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた**
+- **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）**
 - **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**

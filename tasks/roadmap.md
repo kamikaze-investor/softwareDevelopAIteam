@@ -9548,6 +9548,32 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       が正本）、medium 以上で unavailable の理由が rejectedReason に残らない既存挙動、Task `9fdee5a3` の再開
       （Production deploy 後に別途）。
 
+<!-- roadmap:id=resumed-review-changes-requested-reaches-no-repair state=done -->
+13. [x] **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）** —
+      2026-09-28 production 実測（Task `9fdee5a3`、review `12c5287f`）で登録し、同日修正。
+
+      **責務は 1 つ**: Human Resume で再実行された review が `changes_requested` を返したとき、保存済み
+      lineage から元の実装を復元して、既存 repair flow（admission / budget / allowedPaths / authority）へ戻すこと。
+      **新しい status / Gate / workflow は作らない。**
+
+      **実測**: `resumeBlockedTask()` は最新 Job を複製するので、最新 Job が失敗した review なら resume Job も
+      review（`resume:<review>:1`）になる。`routes/jobs.ts` の Stage 2 は `implement:<id>:review` の形しか
+      受け付けず、その review の修正要求は **repair run も repair Job も escalation もログも無く**消えていた。
+
+      **修正**: `resolveReviewedImplementation()` が `resume:<review>:1` を、キーが名指す 1 件ずつ遡って
+      `implement:<id>:review` の review と実装へ辿る。各段は同じ Task / Project の review Job でなければならず、
+      循環・再訪・存在しない元・別 Task・review 以外の段はすべて不成立（fail-closed）。Human Resume のたびに
+      1 段増えるので段数は固定しない（git_commit 却下の provenance の「1 ホップだけ」とは対象が違う）。
+      blocked admission は引き金の review Job を selector として受け取り、**その review Job 自身に保存された
+      verdict** だけを使う。予算と権限は実装の lineage を既存 `walkRepairGeneration()` が決める（不変）。
+
+      **この項目に含めないもの**（別責務）:
+      - 古い blocked Job が Attention を占有して新しい失敗が PL に見えない件（D2）
+      - admission の「最新 Design Review が ALIGNED」条件。production `9fdee5a3` は最新 run が
+        実行できなかった repair review（`d0af140a`、REVIEW_UNAVAILABLE）なので、D1 後もここで skip する
+      - 承認された resume review から git_commit が作られない件（`isAutomaticReviewJob` が `implement:*:review` 限定）
+      - `repairFromStoredReview` の `resolveStoredReviewChain()` が resume review を受け付けない件
+
 <!-- roadmap:id=repair-budget-counted-per-task-not-per-chain state=done -->
 0. [x] **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった** —
       2026-09-22 実装。**Human resume と AI resume を同じ意味として扱わないことが本項目の主境界である。**

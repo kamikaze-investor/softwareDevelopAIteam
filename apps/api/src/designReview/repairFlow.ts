@@ -40,6 +40,7 @@ import {
   decideRepairAction,
   generationResetFacts,
   parseRepairSource,
+  parseResumeSource,
   walkRepairGeneration,
   type PriorRepairJob,
   type RepairGeneration,
@@ -225,6 +226,15 @@ export interface RepairFlowInput {
   failedJob: Job
   review?: ReviewResult
   qaResults?: QAResult[]
+  /**
+   * この repair の引き金になった **保存済み review Job の id**（selector のみ）。
+   *
+   * blocked な Task の admission は、ここから `resolveReviewedImplementation()` で
+   * 保存済み行だけを辿り直し、その review Job に保存された verdict を使う。
+   * 渡されなければ従来どおり `implement:<id>:review` の review Job を引く。
+   * **verdict も findings もここからは受け取らない。**
+   */
+  reviewJobId?: string
 }
 
 /**
@@ -480,6 +490,91 @@ export function safeRecomputedDecision(run: DesignReviewRun): string | undefined
   }
 }
 
+export type ReviewedImplementation =
+  | { ok: true, reviewJob: Job, implementJob: Job }
+  | { ok: false, reason: string }
+
+/**
+ * **review Job から、それがレビューした implement Job を保存済み行だけで引く。**
+ *
+ * ```
+ * [0..n 段] resume:<reviewJobId>:1   … Human Resume が review を再実行した形
+ *   → review      implement:<implementJobId>:review
+ *   → implement   (aiCliMode = 'implement')
+ * ```
+ *
+ * ## なぜ resume を辿るのか（2026-09-28 production 実測）
+ *
+ * `resumeBlockedTask()` は **最新 Job をそのまま複製する**。最新 Job が失敗した review なら
+ * resume Job も review（`resume:<元review>:1`）になる。Stage 2 はこれまで
+ * `implement:<id>:review` の形しか受け付けなかったため、その review が `changes_requested`
+ * を返しても **repair も escalation もログも無く**終わっていた（Task `9fdee5a3`、
+ * review `12c5287f`）。Human Resume のたびに 1 段増えるので、段数は固定しない。
+ *
+ * ## 何をしないか
+ *
+ * - **探索しない。** 各段でキーが名指ししている 1 件だけを読む。候補集合も「最新 Job」も使わない
+ * - **prompt や本文から元 Job を推測しない**
+ * - **review 以外の段を跨がない。** resume の各段は同じ Task / Project の review Job でなければ
+ *   ならず、途中で implement / git_commit 等に当たったら不成立（fail-closed）
+ * - 循環・同じ Job の再訪・Task の Job 数を超える段数は不成立
+ *
+ * authority（Human / AI の resume か）はここでは判定しない。repair の予算と権限は、
+ * 返した implement Job の lineage を既存 `walkRepairGeneration()` が決める（変更しない）。
+ * review の再実行は verdict を作り直すだけで、repair generation を作らないためである。
+ */
+export function resolveReviewedImplementation(
+  storage: IStorage,
+  reviewJobId: string,
+): ReviewedImplementation {
+  const reviewJob = storage.jobs.findById(reviewJobId)
+  if (!reviewJob) return { ok: false, reason: `review job ${reviewJobId} is not a stored job` }
+  if (reviewJob.aiCliMode !== 'review') {
+    return { ok: false, reason: `job ${reviewJob.id} is ${reviewJob.aiCliMode ?? 'not an AI CLI job'}, not review` }
+  }
+  const sameOwner = (job: Job): boolean =>
+    job.taskId === reviewJob.taskId && job.projectId === reviewJob.projectId
+
+  // resume の段を、キーが名指す 1 件ずつ遡る。上限は同じ Task の Job 数（それ以上は必ず再訪）。
+  const maxHops = storage.jobs.findByTaskId(reviewJob.taskId).length
+  const visited = new Set<string>([reviewJob.id])
+  let anchor = reviewJob
+  for (;;) {
+    const sourceId = parseResumeSource(anchor.workflowStepKey ?? '')
+    if (sourceId === undefined) break
+    if (visited.has(sourceId) || visited.size > maxHops) {
+      return { ok: false, reason: `resume lineage of review ${reviewJob.id} does not terminate` }
+    }
+    const source = storage.jobs.findById(sourceId)
+    if (!source) return { ok: false, reason: `resume source job ${sourceId} not found` }
+    if (!sameOwner(source)) {
+      return { ok: false, reason: `resume source job ${sourceId} belongs to a different task or project` }
+    }
+    if (source.aiCliMode !== 'review') {
+      return { ok: false, reason: `resume source job ${sourceId} is ${source.aiCliMode ?? 'not an AI CLI job'}, not review` }
+    }
+    visited.add(sourceId)
+    anchor = source
+  }
+
+  const implementRef = /^implement:([^:]+):review$/.exec(anchor.workflowStepKey ?? '')
+  if (!implementRef) {
+    return {
+      ok: false,
+      reason: `review job ${anchor.id} workflowStepKey is not implement:<id>:review (got ${anchor.workflowStepKey ?? 'none'})`,
+    }
+  }
+  const implementJob = storage.jobs.findById(implementRef[1] as string)
+  if (!implementJob) return { ok: false, reason: `implement job ${implementRef[1]} not found` }
+  if (!sameOwner(implementJob)) {
+    return { ok: false, reason: 'implement job belongs to a different task or project' }
+  }
+  if (implementJob.aiCliMode !== 'implement') {
+    return { ok: false, reason: `job ${implementJob.id} is ${implementJob.aiCliMode ?? 'not an AI CLI job'}, not implement` }
+  }
+  return { ok: true, reviewJob, implementJob }
+}
+
 /**
  * `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。
  *
@@ -509,6 +604,7 @@ function repairableBlockedReviewRequest(
   storage: IStorage,
   task: Task,
   candidate: Job,
+  reviewJobId?: string,
 ): BlockedAdmission {
   // 0. **Job を id で読み直す。** 引数の object は呼び出し元が組んだもので、`status` も
   //    `workflowStepKey` も自由に書ける（実際 `routes/jobs.ts` の失敗経路は
@@ -524,9 +620,26 @@ function repairableBlockedReviewRequest(
   // 1. **この implement Job に対する review Job を、保存済み Job から引く。**
   //    引数の `review` は使わない。呼び出し元が作った object は「保存された事実」ではなく、
   //    status も findings も自由に書けるためである（独立レビュー指摘）。
-  const reviewJob = storage.jobs.findByTaskId(task.id)
-    .find((job) => job.workflowStepKey === `implement:${implementJob.id}:review`)
+  //
+  //    引き金の review Job が名指しされていれば、**それがこの実装をレビューしたものか**を
+  //    保存済み lineage で確かめてから使う（Human Resume で再実行された review を含む）。
+  //    verdict は下の 2. で、その review Job 自身に保存されたものだけを読む。
+  let reviewJob: Job | undefined
+  if (reviewJobId !== undefined) {
+    const reviewed = resolveReviewedImplementation(storage, reviewJobId)
+    if (!reviewed.ok) return { ok: false, reason: `review lineage: ${reviewed.reason}` }
+    if (reviewed.implementJob.id !== implementJob.id) {
+      return { ok: false, reason: 'review job did not review this implementation' }
+    }
+    reviewJob = reviewed.reviewJob
+  } else {
+    reviewJob = storage.jobs.findByTaskId(task.id)
+      .find((job) => job.workflowStepKey === `implement:${implementJob.id}:review`)
+  }
   if (!reviewJob) return { ok: false, reason: 'no review job for this implementation' }
+  if (reviewJob.taskId !== task.id) {
+    return { ok: false, reason: 'review job belongs to another task' }
+  }
 
   // 2. **その review Job に対して保存された verdict** を引く。無ければ通さない。
   const stored = storage.reviewResults.findByTaskId(task.id)
@@ -770,7 +883,7 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   // **「blocked なら repair してよい」には広げない。** 下の `repairableBlockedReviewRequest()`
   // が既存レコードだけで全条件を機械照合し、1 つでも欠ければ従来どおり skip する。
   if (task.status === 'blocked') {
-    const admitted = repairableBlockedReviewRequest(storage, task, failedJob)
+    const admitted = repairableBlockedReviewRequest(storage, task, failedJob, input.reviewJobId)
     if (!admitted.ok) return { action: 'skip', reason: `task is blocked (${admitted.reason})` }
     // **認めた根拠と repair の材料を同じ行に揃える。** ここで引数の object を使い続けると、
     // 「保存された無害な verdict で通し、引数の細工された verdict で prompt を組む」が
