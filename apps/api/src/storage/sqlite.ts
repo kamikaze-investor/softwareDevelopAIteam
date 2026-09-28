@@ -4093,13 +4093,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
-    findAlignedRepairPurposeTerminal() {
+    findTerminalRepairPurposeRuns() {
       // 既存 ix_design_review_runs_status_started_at(status, started_at) の先頭列と
-      // 等値条件が一致する。残り 2 条件は residual filter で足りるため、新しい index は
-      // 作らない（件数は Task あたりの review 回数オーダーで、poll は 5s に 1 query）。
+      // 等値条件が一致する。residual filter 1 つで足りるため新しい index は作らない
+      // （件数は Task あたりの review 回数オーダーで、poll は 5s に 1 query）。
+      //
+      // **ALIGNED / 非 ALIGNED の判定はしない。** consumer が run 自身の resultJson から
+      // 計算し直す。`status='failed'` を含めないのは、既存 design_review_failed attention と
+      // escalation が二重になるためである。
       const rows = db.prepare(
         "SELECT * FROM design_review_runs "
-        + "WHERE status = 'succeeded' AND error IS NULL AND repair_source_job_id IS NOT NULL "
+        + "WHERE status = 'succeeded' AND repair_source_job_id IS NOT NULL "
         + 'ORDER BY created_at ASC, rowid ASC'
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)

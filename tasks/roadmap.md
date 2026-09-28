@@ -11269,9 +11269,10 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       到達可能性の調査が必要になった時点で別項目として登録する。
       `input.taskUpdate` が production から一度も渡されていない点も同様に別扱いとする。
 
-<!-- roadmap:id=repair-chain-successor-durability state=in_progress -->
-9. [~] **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）** —
-      2026-09-22 監査で検出、2026-09-25 登録。**U3 が残っているため item 全体はまだ `done` にしない。**
+<!-- roadmap:id=repair-chain-successor-durability state=done -->
+9. [x] **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）** —
+      2026-09-22 監査で検出、2026-09-25 登録、**2026-09-28 に U3 を land して完了**。
+      表の 5 件すべてが land 済みで、残件はゼロである。
 
       **責務は 1 つ**: repair chain の各段が「durable な結果」を残したとき、その successor が
       必ず実行されるか、さもなくば人へ収束すること。予算・lineage・generation の意味論は
@@ -11286,8 +11287,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       | U1 | repair-purpose run の successor intent が durable でない（stepKey が process stack 上にしか無い） | **land 済み** #283 |
       | U4 | queued な repair-purpose run が汎用 executor へ誤 dispatch され、repair Job を作る機会が消える | **land 済み** #287 |
       | #290 | handoff が成功した source Job の結果を `failed` へ書き換える | **land 済み** #290（専用項目 `repair-handoff-overwrites-terminal-result` に詳細） |
-      | U2 | **ALIGNED evidence を残した直後に落ちた terminal run の successor が回収されない** | **今回** |
-      | U3 | 非 ALIGNED で終端した run の escalation successor が成立しない | **残件（未着手）** |
+      | U2 | ALIGNED evidence を残した直後に落ちた terminal run の repair Job successor が回収されない | **land 済み** #292 |
+      | U3 | **非 ALIGNED で終端した run の Human escalation successor が成立しない** | **本 PR で完了** |
 
       **U2 の failure window（今回の対象）**: `executeQueuedRepair()` は
       review → `completeWithEvidence()` → `createRepairJobWithHandoff()` と続くが、
@@ -11340,10 +11341,44 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       の先頭列と等値条件が一致し、残り 2 条件は residual filter で足りる。件数は Task あたりの
       review 回数オーダーで、poll は 5s に 1 query。**先回りの最適化はしない。**
 
-      **U3 に着手するときの制約**: 今回の read を U3 都合で一般化していない
-      （`error IS NULL` を条件に含めた専用 read のままにした）。U3 では read を 1 本足すか
-      条件を緩めるかを、その時点で改めて判断する。
+      **U3 の failure window（本 PR で完了）**: 非 ALIGNED の終端も同じ形で successor を失う。
+      `executeDesignReviewRun()` が `complete(run,'succeeded',stdout,rejectedReason)` で却下を
+      durable 化して戻り、**その後**呼び出し側が `escalateTaskToHuman()` を呼ぶ。2 文の間に
+      transaction は無く、ここで落ちると run は terminal・evidence は無し・**Task は blocked に
+      ならない**。しかも `succeeded` な run は attention producer（`idle` と `failed` しか見ない）
+      にも現れないため、却下が誰にも渡らないまま停止する。
+
+      **U3 で入れたもの**:
+      - shared read への中立化 —— `findAlignedRepairPurposeTerminal()` を
+        **`findTerminalRepairPurposeRuns()`** へ改名し、`error IS NULL` を条件から外した。
+        `error` は「非 ALIGNED のうちどちらの形か」しか表さない（正常な CONFLICT は task kind
+        では `rejectedReason` が undefined なので NULL、形が壊れた `reject()` 経路では値が入る）。
+        **storage は ALIGNED / 非 ALIGNED を判定しない。** U2 / U3 が同じ母集団を見て、
+        それぞれ自分の authority（`safeRecomputedDecision()`）で判定する。read は 1 本のまま。
+      - `recoverTerminalRepairEscalations()` —— 既存 reconcile chain の 4 本目。action は
+        既存 `escalateTaskToHuman()` の再利用 1 回だけ。**新しい status / Approval 種別 / Gate /
+        audit 機構 / Human Recovery route は作っていない。**
+
+      **`status='failed'` は shared read に含めない。** 既存 `design_review_failed` attention が
+      観測しているので、含めると同じ停止に 2 つの escalation ができる。read が `succeeded` しか
+      返さないことで機械的に保証している。
+
+      **ALIGNED は絶対に escalate しない**（U2 の領分）。逆に、読めない `resultJson` は人へ渡す
+      —— U2 は「読めないなら repair Job を作らない」が fail-closed だが、U3 の action は自律実行を
+      止めて人へ渡すこと自体なので、放置するほうが危険側になる。なお production で `succeeded`
+      かつ読めない `resultJson` は作れない（unparsable な出力は `finalizeFailure()` が `failed`）。
+
+      **冪等性**: escalate 成功 → Task `blocked` → 次 poll で候補から外れる。既に blocked / done /
+      successor 既存は no-op。park 済みは skip し park を維持する（park は durable なので毎 poll
+      安い skip を繰り返す。それを消すためだけの state は作らない —— CEO 判断・2026-09-28）。
+      processed 列は追加していない。
+
+      **別 Finding 候補（本 PR では実装しない）**: `claim()` が attempt 上限超過で run を `failed`
+      へ落とすと、`executeDesignReviewRun()` は `not_claimable`、`executeQueuedRepair()` は
+      **`already_started`** を返す —— escalate せずに。既存 `design_review_failed` attention には
+      出るので Lost Completion ではないが、「予算切れで終わった」ことが repair 側の戻り値からは
+      「既に始まっている」に見える。ここへ混ぜず、別項目として起票するかを別途判断する。
 
 ---
 
-*Updated: 2026-09-25*
+*Updated: 2026-09-28*

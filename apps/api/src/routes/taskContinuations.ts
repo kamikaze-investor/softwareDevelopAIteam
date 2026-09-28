@@ -3,6 +3,7 @@ import { getStorage } from '../storage'
 import { reconcileTaskContinuations } from '../ctoAi/taskContinuation'
 import { recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import { recoverTerminalRepairSuccessors } from '../designReview/terminalRepairSuccessorRecovery'
+import { recoverTerminalRepairEscalations } from '../designReview/terminalRepairEscalationRecovery'
 
 /**
  * Task continuation reconcileの起動口。
@@ -83,6 +84,21 @@ export async function taskContinuationRoutes(app: FastifyInstance): Promise<void
           app.log.info(
             { ...recovery, driver: 'worker_poll' },
             '[taskContinuations] recovered repair successors for terminal aligned reviews',
+          )
+        }
+      })
+      // **U3**: 却下で終端したのに Human escalation が着地していない repair run を、同じ poll で
+      // 人へ渡す。U2 と責務は分かれている —— U2 は ALIGNED に repair Job を、U3 は非 ALIGNED に
+      // escalation を作る。共有しているのは storage read と poll 間隔までで、action は混ぜない。
+      // review は再実行しない（module が `CoordinatorDeps` を持たない）。
+      .then(() => recoverTerminalRepairEscalations(storage))
+      .then((recovery) => {
+        // failed も必ず出す（U2 と同じ理由。全候補が例外で落ちた sweep は外側の catch にも
+        // 入らないため、条件に入れないと繰り返す欠陥が無音になる）。
+        if (recovery.escalated > 0 || recovery.failed > 0) {
+          app.log.info(
+            { ...recovery, driver: 'worker_poll' },
+            '[taskContinuations] escalated terminal repair reviews whose rejection reached nobody',
           )
         }
       })
