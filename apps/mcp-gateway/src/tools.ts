@@ -7,7 +7,8 @@ import { AiteamosApiError, type AiteamosClient } from './aiteamosClient.js'
  *
  * - safe read（projection 済み）: get_system_state / get_project / list_tasks / get_task /
  *   get_pl_triage_summary
- * - PL への依頼: ask_pl（Operator Request の作成。保存するだけで何も実行しない）
+ * - PL への依頼: ask_pl（Operator Request の作成。gateway は保存を依頼するだけ。実行の可否は
+ *   AIteamOS 側で PL の通常判断と既存 Gate が決める）
  * - 依頼の結果: get_operator_request / list_operator_requests
  *
  * resume / approve / retry / quarantine 解除 / commit / PL tick 等の tool は**作らない**。
@@ -91,10 +92,12 @@ export function buildMcpServer(client: AiteamosClient): McpServer {
   server.registerTool('ask_pl', {
     title: 'Ask the PL',
     description:
-      'Send a natural-language request or question to the AIteamOS Project Lead (PL). This only records the ' +
-      'request; it does not execute anything. The PL answers on its next cycle using only its existing, gated ' +
-      'authority; requests it cannot fulfil are declined or escalated to the CEO. Poll get_operator_request ' +
-      'with the returned id for the answer.',
+      'Send a natural-language request or question to the AIteamOS Project Lead (PL). Calling this only records ' +
+      'the request. On its next cycle the PL answers it; if the request asks for an action on a stalled item, ' +
+      'the PL runs its normal decision for that item, and only an existing action that the mandatory gates allow ' +
+      'is executed. The request text is never used as authorization, and nothing outside the PL\'s existing ' +
+      'authority (approvals, CEO approvals, quarantine release, commits, deploys) can happen. Poll ' +
+      'get_operator_request with the returned id for the answer and the recorded outcome (plAction).',
     inputSchema: {
       message: z.string().min(1).max(2000),
       projectId: id.optional(),

@@ -10087,10 +10087,15 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       |---|---|---|
       | D0 | コード修正済み | `auth-empty-token-hash-accepted`（本 ledger 同項目）。production の auth mode 確認は**未実施**（VPS 権限が要る） |
       | D1 | 済 | `operator_requests` table / `POST・GET /api/operator-requests`（`routes/operatorRequests.ts`）。保存するだけで operational state を変えない（全 table hash で固定） |
-      | D2 | 済 | `pl/operatorRequestStep.ts`。PL tick が最古の pending を 1 件処理し `answered / declined / escalated` を保存。**何も実行しない**（依頼から action を起動する経路は作っていない。復旧は従来どおり自律ループが `authorizePlAction()` 経由で行う）。本文は回答 prompt の引用データ欄にだけ入る。escalation は既存 notifier・1時間3件まで |
-      | D3 | 済 | credential class `operator_gateway`（`OPERATOR_GATEWAY_TOKEN_SHA256`・split mode のみ）。allowlist は `/api/operator/*` の safe read 5本 + Operator Request 3本。safe read は `operator/projection.ts` の field allowlist（stdout / stderr / prompt / パス / QA details / CEO メモを出さない）。登録全 route を列挙して allowlist 外 403 を固定 |
+      | D2 | 済（2026-09-28 改訂） | `pl/operatorRequestStep.ts`。PL tick が最古の pending を 1 件処理する。質問なら回答を保存（`answered / declined / escalated`）。**操作の依頼なら**対象 attention を1つ特定し、自律ループと**同じ** `handleTarget()`（Triage → 試行上限 → 診断 → `authorizePlAction()` → 既存 executor → Verify）を走らせ、結果を `plAction` と `acted / declined / escalated` に保存する。依頼本文は untrusted intent（目的・対象の理解）にだけ使い、Gate の根拠・選択条件（`isActionableNow()`）・action set・自律診断・Job / Task / audit には入らない（DB 全体検査で固定）。escalation は既存 notifier・1時間3件まで |
+      | D3 | 済 | credential class `operator_gateway`（`OPERATOR_GATEWAY_TOKEN_SHA256`・split mode のみ）。allowlist は `/api/operator/*` の safe read 5本 + Operator Request 3本。safe read は `operator/projection.ts` の field allowlist（stdout / stderr / prompt / パス / QA details / CEO メモを出さない。`job_blocked` / `job_failed` の attention.detail は `[jobRunner]` 構造化行のときだけ出す —— 既存 `/api/state` はそれ以外で stderr 末尾を detail に入れるため）。登録全 route を列挙して allowlist 外 403 を固定 |
       | D4 | 済 | `apps/mcp-gateway`（stateless Streamable HTTP）。tool は safe read 5 / `ask_pl` / 結果取得 2 のみ。内部 credential は gateway 側だけに置き、外部の bearer は API へ転送しない |
       | D5 | ローカルのみ | MCP client → gateway → 実 API 境界 → PL 回答 → 結果取得の E2E（`localConnection.e2e.test.ts`）と、実 process を loopback で起動した curl 確認。**ChatGPT 本体とは未接続** |
+
+      **Control Repository 変更の承認記録**: `apps/api/src/index.ts`（AI編集禁止）への変更は
+      Operator Interface route 登録の最小変更のみ CEO 承認済み（2026-09-28）。実差分は
+      `app.register(operatorRequestRoutes, ...)` の1行と、それに必要な import 1行の計2行。この承認で他の refactor・
+      責務変更は行わない（read route は既存 operator plugin の中で登録している）。
 
       **外部認証（ChatGPT → gateway）の現状**: ChatGPT の remote MCP connector が受け付けるのは
       OAuth 2.1（MCP authorization spec: Protected Resource Metadata / DCR または CIMD / PKCE）・

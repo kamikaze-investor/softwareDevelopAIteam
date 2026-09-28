@@ -4375,9 +4375,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const answeredAt = now()
       const info = result.status === 'answered'
         ? db.prepare(`
-            UPDATE operator_requests SET status = 'answered', disposition = ?, response = ?, answered_at = ?
+            UPDATE operator_requests SET status = 'answered', disposition = ?, response = ?, pl_action = ?, answered_at = ?
             WHERE id = ? AND status = 'pending'
-          `).run(result.disposition, result.response, answeredAt, id)
+          `).run(
+            result.disposition,
+            result.response,
+            result.plAction !== undefined ? JSON.stringify(result.plAction) : null,
+            answeredAt,
+            id,
+          )
         : db.prepare(`
             UPDATE operator_requests SET status = 'failed', error = ?, answered_at = ?
             WHERE id = ? AND status = 'pending'
@@ -5526,6 +5532,7 @@ function deserializeOperatorRequest(row: any): OperatorRequest {
     status: row.status as OperatorRequest['status'],
     disposition: row.disposition ?? undefined,
     response: row.response ?? undefined,
+    plAction: row.pl_action ? JSON.parse(row.pl_action) : undefined,
     error: row.error ?? undefined,
     createdAt: row.created_at,
     answeredAt: row.answered_at ?? undefined,

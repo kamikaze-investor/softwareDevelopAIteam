@@ -8,8 +8,10 @@
 // `message` は **untrusted input** である。保存するだけで、Task description / resume instruction /
 // implementation prompt / aiCliPrompt へは決して流さない。作成しても AIteamOS の operational state
 // （Task / Job / Approval / Design Review 等）は一切変わらない。
-// PL はこれを読んで状態を調べ、`response` を返すだけである。実際の操作は従来どおり
-// PL の自律ループが `authorizePlAction()` と既存 Gate を通して行う。
+// PL はこれを「依頼の目的・調査対象」を知るための untrusted intent として読み、状態を調べて
+// `response` を返す。依頼が操作を求めていて、対象が自律ループの選択条件を満たすときだけ、
+// **自律ループと同じ判断経路**（Triage → 診断 → `authorizePlAction()` → 既存 executor）を
+// その対象に対して1回走らせる。依頼本文はその判断経路にも Gate の根拠にも入らない。
 
 /**
  * 依頼の処理状態。
@@ -20,12 +22,30 @@
 export type OperatorRequestStatus = 'pending' | 'answered' | 'failed'
 
 /**
- * PL の回答の種類。**実行結果ではない**（Operator Request は操作を実行しない）。
- * - answered … 状態を調べて答えた
+ * PL の回答の種類。
+ * - answered … 状態を調べて答えた（操作はしていない）
+ * - acted … 既存の PL action を既存 Gate の許可の下で実行した（`plAction` を参照）
  * - escalated … CEO 判断が要るため既存の escalation 経路（通知）へ回した
- * - declined … 現在の PL 権限では実行できない・扱えない要求なので、その旨を返した
+ * - declined … 現在の PL 権限・既存 Gate では実行できない要求なので、実行せず理由を返した
  */
-export type OperatorRequestDisposition = 'answered' | 'escalated' | 'declined'
+export type OperatorRequestDisposition = 'answered' | 'acted' | 'escalated' | 'declined'
+
+/**
+ * 依頼を受けて PL が自律ループの判断経路を走らせた結果。**システムが記録した事実**であり、
+ * PL の回答文とは別物（回答文が「実行した」と書いても、ここが正）。
+ */
+export interface OperatorRequestPlAction {
+  /** 対象にした attention（`<kind>:<subject>`）。 */
+  targetKey: string
+  /** 判断経路を実際に走らせたか。false なら対象が選択条件を満たさず、何もしていない。 */
+  attempted: boolean
+  /** 走らせた場合は PL tick の status（acted / blocked / escalated / diagnosis_* / idle）。 */
+  status: string
+  proposedKind?: string
+  reason?: string
+  verification?: string
+  executionSummary?: string
+}
 
 /**
  * 依頼を作った credential の種別。**caller の自己申告ではなく**認証結果から決める。
@@ -46,6 +66,8 @@ export interface OperatorRequest {
   disposition?: OperatorRequestDisposition
   /** PL の回答。 */
   response?: string
+  /** PL が判断経路を走らせた結果（走らせていなければ無い）。 */
+  plAction?: OperatorRequestPlAction
   error?: string
   createdAt: string
   answeredAt?: string
