@@ -60,6 +60,9 @@ importers:
         specifier: ^3.23.0
         version: 3.25.76
     devDependencies:
+      '@ai-team/api':
+        specifier: workspace:*
+        version: link:../api
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.41
