@@ -874,6 +874,11 @@ export interface IDesignReviewRunStorage {
    * （ledger: `cross-project-state-api` の production 検証で欠落が判明）。
    */
   findLatestByTaskId(taskId: string): DesignReviewRun | undefined
+  /**
+   * その Task の run を**新しい順**に全件返す（順序は `findLatestByTaskId()` と同じ）。
+   * repair admission が「Human Resume で回答済みの run」を根拠から外すための read-only 導出。
+   */
+  findByTaskId(taskId: string): DesignReviewRun[]
   /** 同一Taskにqueued/running中のrunがある場合は作成せず既存を返す（partial unique index準拠）。 */
   create(input: DesignReviewRunCreateInput): DesignReviewRun
   /** startup recovery後に再kick対象となるqueued run一覧。 */

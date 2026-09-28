@@ -738,7 +738,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
               qaResults: storage.qaResults.findByTaskId(existing.taskId),
               reviewJobId: existing.id,
             })
-            if (reviewPreparation.action === 'escalate') {
+            if (reviewPreparation.action === 'skip') {
+              // **修正要求が repair へ渡らなかったことを黙らせない。** skip は Task を動かさないので、
+              // 理由と対象（どの実装・どの review・どの run に止められたか）を残す。
+              req.log.warn({
+                reason: reviewPreparation.reason,
+                sourceJobId: implementJob.id,
+                reviewJobId: existing.id,
+                runId: reviewPreparation.runId,
+              }, 'review requested changes but repair was not admitted; stage 2 skipped')
+            } else if (reviewPreparation.action === 'escalate') {
               escalateTaskToHuman(storage, existing.taskId)
             } else if (reviewPreparation.action === 'queue') {
               const run = storage.designReviewRuns.create(reviewPreparation.run)

@@ -216,7 +216,17 @@ export function parseResumeSource(stepKey: string): string | undefined {
 }
 
 export type ReviewedImplementation =
-  | { ok: true, reviewJob: Job, implementJob: Job }
+  | {
+      ok: true
+      reviewJob: Job
+      implementJob: Job
+      /**
+       * 実際に辿った `resume:` の段（`reviewJob` 側から近い順）。各要素は **resume key を持つ review Job**。
+       * 通常の `implement:<id>:review` を直接渡したときは空。authority はここでは判定しない
+       * （repair admission が「Human Resume で回答済みの run」を判定する材料。D3）。
+       */
+      resumeHops: Job[]
+    }
   | { ok: false, reason: string }
 
 /**
@@ -275,6 +285,7 @@ export function resolveReviewedImplementationFrom(
   // resume の段を、キーが名指す 1 件ずつ遡る。上限は同じ Task の Job 数（それ以上は必ず再訪）。
   const maxHops = jobs.findByTaskId(reviewJob.taskId).length
   const visited = new Set<string>([reviewJob.id])
+  const resumeHops: Job[] = []
   let anchor = reviewJob
   for (;;) {
     const sourceId = parseResumeSource(anchor.workflowStepKey ?? '')
@@ -291,6 +302,7 @@ export function resolveReviewedImplementationFrom(
       return { ok: false, reason: `resume source job ${sourceId} is ${source.aiCliMode ?? 'not an AI CLI job'}, not review` }
     }
     visited.add(sourceId)
+    resumeHops.push(anchor)
     anchor = source
   }
 
@@ -309,7 +321,7 @@ export function resolveReviewedImplementationFrom(
   if (implementJob.aiCliMode !== 'implement') {
     return { ok: false, reason: `job ${implementJob.id} is ${implementJob.aiCliMode ?? 'not an AI CLI job'}, not implement` }
   }
-  return { ok: true, reviewJob, implementJob }
+  return { ok: true, reviewJob, implementJob, resumeHops }
 }
 
 /**
