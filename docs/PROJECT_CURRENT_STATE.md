@@ -227,6 +227,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
 - **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
+- **Human Resume 後も古い blocked Job が Attention を占有し、後継の新しい失敗が PL に見えない（D2）**
 - **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた**
 - **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）**
 - **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった**

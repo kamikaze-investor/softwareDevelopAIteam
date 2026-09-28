@@ -36,7 +36,7 @@ import type { FastifyRequest } from 'fastify'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import { getCredentialClass, type CredentialClass } from '../auth/credentialClass'
 import type { IStorage } from '../storage/interface'
-import { RESUME_STEP_PREFIX, type ResumeActorClass } from './repairPolicy'
+import { RESUME_STEP_PREFIX, jobsSupersededByHumanResume, type ResumeActorClass } from './repairPolicy'
 
 /** resume actor を記録する audit operation 名。新 table は作らない。 */
 export const RESUME_ACTOR_OPERATION = 'resume_actor'
@@ -233,6 +233,27 @@ export function readResumeActorClasses(
     classes.set(job.id, readOneResumeActorClass(storage, job.id))
   }
   return classes
+}
+
+/**
+ * Task の Job 群のうち、**Human Resume で後継が作られた Job の id**（`jobsSupersededByHumanResume()`）。
+ *
+ * resume Job が 1 件も無ければ audit を読まない。actor が読めなければ `unknown` なので、
+ * 読み取りの失敗は superseded を**増やす方向へは倒れない**（Attention が消えない側）。
+ */
+export function readJobsSupersededByHumanResume(
+  storage: IStorage,
+  jobs: readonly Job[],
+): Set<string> {
+  if (!jobs.some((job) => job.workflowStepKey?.startsWith(RESUME_STEP_PREFIX))) return new Set()
+  const classes = readResumeActorClasses(storage, jobs)
+  return jobsSupersededByHumanResume(jobs.map((job) => ({
+    id: job.id,
+    workflowStepKey: job.workflowStepKey,
+    status: job.status,
+    facts: {},
+    resumeActorClass: classes.get(job.id),
+  })))
 }
 
 /**

@@ -9517,6 +9517,29 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - **新しい診断機構は作らない。** 渡す context の作り方（`buildContext()`）の改善で足りるか
       - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
 
+<!-- roadmap:id=human-resume-superseded-job-hides-new-failure state=done -->
+14. [x] **Human Resume 後も古い blocked Job が Attention を占有し、後継の新しい失敗が PL に見えない（D2）** —
+      2026-09-28 production 実測（Task `9fdee5a3`）で登録し、同日修正。
+
+      **責務は 1 つ**: Human Resume で後継が作られた古い blocked / failed Job を、「いま Task を止めている Job」
+      として数えないこと。**新しい永続状態 / status / Gate / PL の責務は作らない。** 元の行は書き換えない。
+
+      **実測**: `resumeBlockedTask()` は元の Job を `blocked` のまま残して `resume:<元Job>:1` を作る。
+      `systemState.ts` の `hasMovableJob` は blocked を「動かせる Job」と数えるため、残った元 Job が
+      以後の `job_failed` をすべて抑止した。古い `job_blocked:<元Job>` は PL が escalate 済みで、
+      `hasEscalated()` が生涯 dedup するので、Human Resume した review の失敗は**誰にも見えないまま止まった**。
+
+      **修正**: superseded を保存済みの事実だけから導く（`jobsSupersededByHumanResume()` /
+      `readJobsSupersededByHumanResume()`）。Job X が superseded なのは、`resume:<X>:<n>` の Job S があり、
+      S の `resume_actor` が `human`（admin_credential 根拠）で、S からの lineage が既存 `walkRepairGeneration()` で
+      well-formed なときだけ。`hasMovableJob` / `job_blocked` / `stallingFailure` の 3 箇所で superseded を除外する。
+      後継の失敗は新しい key（`job_failed:<後継>`）で出るので、dedup も episode 単位になる。
+      AI / unknown / malformed / 別 Task を指す resume は superseded にしない。`workspace_quarantined` は従来どおり出す。
+
+      **この項目に含めないもの**（別責務）:
+      - AI resume で同じ形に陥る停止（Human authority の境界を AI resume で動かさないため、意図的に対象外）
+      - repair admission の Design Review 根拠（D3）、approved な resumed review の git_commit（D4）
+
 <!-- roadmap:id=low-load-design-review-unreachable-on-vps state=done -->
 12. [x] **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた** —
       2026-09-28 production 実測（Task `9fdee5a3` の docs-only repair、design review run `d0af140a`）で登録し、同日修正。
