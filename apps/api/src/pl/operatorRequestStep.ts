@@ -29,7 +29,7 @@ import type { IStorage } from '../storage/interface'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { requestText } from '../aiExplain/cheapAiClient'
 import { triageBlocked, readLatestDesignReview } from './blockedTriage'
-import { capText, projectAttention, projectProjectState } from '../operator/projection'
+import { capText, projectAttention, projectLatestDesignReview, projectProjectState } from '../operator/projection'
 
 /** 回答の token 枠。PL 診断（700）より少し長い（説明文を書くため）。 */
 export const OPERATOR_ANSWER_MAX_TOKENS = 900
@@ -108,19 +108,6 @@ export const OPERATOR_ANSWER_SYSTEM = [
   'Answer with a single JSON object and nothing else:',
   '{"disposition": "answered|declined|escalated", "response": "<your answer>"}',
 ].join('\n')
-
-function projectLatestDesignReview(
-  review: ReturnType<typeof readLatestDesignReview>,
-): Record<string, unknown> | undefined {
-  if (!review) return undefined
-  return Object.fromEntries(Object.entries({
-    status: review.status,
-    attemptCount: review.attemptCount,
-    decision: review.decision,
-    summary: capText(review.summary),
-    error: capText(review.error),
-  }).filter(([, v]) => v !== undefined))
-}
 
 function buildOperatorContext(
   storage: IStorage,

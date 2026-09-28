@@ -31,7 +31,7 @@ const UpdateProjectBody = z.object({
   gapAnswers: z.record(z.string(), z.string()).optional(),
 }).strict()
 
-function getRoadmapCompletion(tasks: Task[]): ProjectRoadmapCompletion {
+export function getRoadmapCompletion(tasks: Task[]): ProjectRoadmapCompletion {
   const activeTasks = tasks.filter((task) => task.roadmapActive)
   const completedTaskCount = activeTasks.filter((task) => task.status === 'done').length
 

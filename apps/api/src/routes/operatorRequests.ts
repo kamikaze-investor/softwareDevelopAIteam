@@ -8,6 +8,7 @@ import {
 import { getStorage } from '../storage'
 import type { IStorage } from '../storage/interface'
 import { getCredentialClass } from '../auth/credentialClass.js'
+import { operatorReadRoutes } from './operatorRead'
 
 /**
  * 共通 Operator Interface — 外部（ChatGPT MCP / Mobile Operator Chat）から PL への依頼口。
@@ -20,6 +21,7 @@ import { getCredentialClass } from '../auth/credentialClass.js'
  *   Design Review 等の operational state は一切変えない。PL の起動（tick）もしない
  * - `GET /api/operator-requests/:id` … 依頼と PL の回答を読む
  * - `GET /api/operator-requests` … 依頼の一覧（新しい順）
+ * - `GET /api/operator/*` … projection 済みの safe read（`./operatorRead.ts`）
  *
  * 依頼本文は untrusted input であり、PL は次の tick でこれを**データとして**読んで回答する
  * （`pl/operatorRequestStep.ts`）。本文が実装 prompt・resume instruction・Task description へ
@@ -46,6 +48,7 @@ const ListQuery = z.object({
 function requesterClassOf(req: FastifyRequest): OperatorRequestRequesterClass | undefined {
   const credentialClass = getCredentialClass(req)
   switch (credentialClass) {
+    case 'operator_gateway':
     case 'admin':
     case 'legacy':
       return credentialClass
@@ -59,6 +62,10 @@ function requesterClassOf(req: FastifyRequest): OperatorRequestRequesterClass | 
 
 export async function operatorRequestRoutes(app: FastifyInstance): Promise<void> {
   const storage: IStorage = (app as unknown as { storageOverride?: IStorage }).storageOverride ?? getStorage()
+
+  // Operator 向け safe read（`/api/operator/*`）も同じ Operator Interface の一部としてここで登録する。
+  // 共通 interface を1つの plugin にまとめ、`index.ts`（Control Repository）の変更を増やさない。
+  await app.register(operatorReadRoutes)
 
   app.post('/operator-requests', async (req, reply) => {
     const requesterClass = requesterClassOf(req)

@@ -3,6 +3,7 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import { isWorkerRouteAllowed } from './workerAllowlist'
 import { setCredentialClass } from './credentialClass.js'
 import { isActionsReadonlyRouteAllowed } from './actionsReadonlyAllowlist'
+import { isOperatorGatewayRouteAllowed } from './operatorGatewayAllowlist'
 import { isHumanOnlyRoute } from './humanOnlyRoutes'
 
 const BEARER_PREFIX = 'Bearer '
@@ -52,6 +53,12 @@ function timingSafeStringEqual(a: string, b: string): boolean {
  * 許可しそれ以外はDefault Deny（403）。未設定ならこのcredential classは存在しない扱いで、
  * ADMIN/WORKERの挙動は一切変わらない。ADMIN/WORKERへのfallbackも行わない。
  *
+ * 同じく任意で第4のcredential class `OPERATOR_GATEWAY`（`OPERATOR_GATEWAY_TOKEN_SHA256`）を追加できる。
+ * 外部 Operator（ChatGPT MCP adapter 等）の唯一の credential で、`./operatorGatewayAllowlist` の
+ * safe read（projection 済み）と Operator Request の作成・取得だけを許可し、それ以外は Default Deny（403）。
+ * operational state を直接変える route は1つも含まない。ADMIN/WORKER/ACTIONS_READONLY とは別の値でなければ
+ * 503。legacy mode では存在しない扱い（split mode 前提）。
+ *
  * split credential modeでは旧`API_TOKEN`は（値がenvに残っていても）認証に使えない。
  * legacyとsplitの共存・段階的移行は成立しないため、Production cutoverは計画停止を伴う。
  */
@@ -64,6 +71,7 @@ export async function apiTokenAuth(
   const adminTokenHash = process.env.ADMIN_TOKEN_SHA256 || undefined
   const workerTokenHash = process.env.WORKER_TOKEN_SHA256 || undefined
   const actionsTokenHash = process.env.ACTIONS_READONLY_TOKEN_SHA256 || undefined
+  const operatorGatewayTokenHash = process.env.OPERATOR_GATEWAY_TOKEN_SHA256 || undefined
 
   if (adminTokenHash === undefined && workerTokenHash === undefined) {
     await legacySingleTokenAuth(req, reply)
@@ -91,7 +99,7 @@ export async function apiTokenAuth(
 
   // 空 token 由来の hash（未設定変数を hash した値）は、どの class でも設定ミスとして
   // fail closedで拒否する。受理すると空 token でその credential class が取れてしまう。
-  if ([adminTokenHash, workerTokenHash, actionsTokenHash].some(isEmptyTokenHash)) {
+  if ([adminTokenHash, workerTokenHash, actionsTokenHash, operatorGatewayTokenHash].some(isEmptyTokenHash)) {
     reply.status(503).send({
       error: 'Server auth configuration is invalid: a credential hash was derived from an empty token',
     })
@@ -107,6 +115,20 @@ export async function apiTokenAuth(
   ) {
     reply.status(503).send({
       error: 'Server auth configuration is invalid: ACTIONS_READONLY_TOKEN_SHA256 must differ from ADMIN_TOKEN_SHA256 and WORKER_TOKEN_SHA256',
+    })
+    return
+  }
+
+  // OPERATOR_GATEWAYが設定されている場合も、他のどのclassとも異なる値でなければならない
+  // （同値だと外部 Operator の credential が ADMIN 等の権限を得てしまう）。
+  if (
+    operatorGatewayTokenHash !== undefined &&
+    [adminTokenHash, workerTokenHash, actionsTokenHash].some(
+      (other) => other !== undefined && timingSafeStringEqual(operatorGatewayTokenHash, other),
+    )
+  ) {
+    reply.status(503).send({
+      error: 'Server auth configuration is invalid: OPERATOR_GATEWAY_TOKEN_SHA256 must differ from every other credential hash',
     })
     return
   }
@@ -147,6 +169,16 @@ export async function apiTokenAuth(
       return
     }
     reply.status(403).send({ error: 'Forbidden: route not allowed for ACTIONS_READONLY credential' })
+    return
+  }
+
+  // OPERATOR_GATEWAY: safe read と Operator Request のみ。ADMIN/WORKERへはfallbackしない。
+  if (operatorGatewayTokenHash !== undefined && timingSafeStringEqual(tokenHash, operatorGatewayTokenHash)) {
+    if (isOperatorGatewayRouteAllowed(req.routeOptions.method, req.routeOptions.url)) {
+      setCredentialClass(req, 'operator_gateway')
+      return
+    }
+    reply.status(403).send({ error: 'Forbidden: route not allowed for OPERATOR_GATEWAY credential' })
     return
   }
 
