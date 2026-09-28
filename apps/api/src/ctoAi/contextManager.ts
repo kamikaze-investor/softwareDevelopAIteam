@@ -14,7 +14,7 @@
  *   - 実行時の制約（変更禁止パスなど）
  */
 
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { Task } from '@ai-team/shared'
@@ -106,37 +106,60 @@ const MAX_FILES_PER_PATH = 20
 const IGNORED_DIRS = new Set(['node_modules', '.git', 'dist', '.astro', 'coverage', '.next'])
 const IGNORED_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.woff', '.woff2', '.ttf', '.eot', '.db', '.db-shm', '.db-wal'])
 
+/** File Change Guard の一覧に無いが、秘密情報を含みうる拡張子・ファイル名。 */
+const EXTRA_WITHHELD_PATTERNS = [/\.p12$/i, /\.pfx$/i, /\.keystore$/i, /\.jks$/i, /(^|\/)credentials\.json$/i]
+
+/** collectFiles の再帰の深さ上限（symlink の循環がなくても深すぎる木を辿らない）。 */
+const MAX_DIRECTORY_DEPTH = 12
+
 /**
  * root からの相対パスとして**返してはいけない**ファイルか。
  *
  * - dotfile / dot ディレクトリ配下（`.env`・`.secrets/`・`.ssh/` 等）
  * - 既存の File Change Guard が常に禁止しているパターン（`ALWAYS_FORBIDDEN_PATTERNS`: `.env*`・
  *   `*.pem`・`*.key`・`id_rsa` 等）。**一覧を複製せず Guard 本体の export を使う**
+ * - 上記に無い証明書・keystore 類（`EXTRA_WITHHELD_PATTERNS`）
  */
 function isWithheldPath(relativePath: string): boolean {
   const normalized = relativePath.replace(/\\/g, '/')
   if (normalized.split('/').some((segment) => segment.startsWith('.') && segment !== '.')) return true
   return ALWAYS_FORBIDDEN_PATTERNS.some((pattern) => pattern.test(normalized))
+    || EXTRA_WITHHELD_PATTERNS.some((pattern) => pattern.test(normalized))
 }
 
 /**
- * ファイル 1 件を読んで追加する。**realpath が root の内側で、秘密ファイルでない**ときだけ読む。
- * symlink は realpath で行き先を判定するため、root の外を指すものは読まない。
+ * root 内の 1 ファイルを**安全に**読む。関連ファイルと Project Memory の両方がここを通る。
+ *
+ * 1. realpath が root の内側（symlink で外へ出ない）で、秘密ファイルでない
+ * 2. `O_NOFOLLOW | O_NONBLOCK` で開き、**開いた handle を** `fstat` して通常ファイル・サイズ上限・
+ *    hardlink でないこと（`nlink === 1`）を確かめてから、その handle から読む。
+ *    path で確かめてから path で読む間に差し替えられる隙（TOCTOU）を作らず、FIFO で止まらない
+ *
+ * 条件を満たさなければ undefined（読まない）。
  */
-function pushFileIfSafe(realRoot: string, candidate: string, result: FileContent[]): void {
+function readContainedFile(realRoot: string, candidate: string): { relativePath: string; content: string } | undefined {
   const real = containedRealPath(realRoot, candidate)
-  if (real === undefined) return
+  if (real === undefined) return undefined
   const relativePath = path.relative(realRoot, real).replace(/\\/g, '/')
-  if (isWithheldPath(relativePath)) return
-  const ext = path.extname(real).toLowerCase()
-  if (IGNORED_EXTS.has(ext)) return
+  if (isWithheldPath(relativePath)) return undefined
+
+  let fd: number | undefined
   try {
-    const stat = statSync(real)
-    if (!stat.isFile() || stat.size > MAX_FILE_SIZE_BYTES) return
-    result.push({ relativePath, content: readFileSync(real, 'utf-8'), isNew: false })
+    fd = openSync(real, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0))
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || stat.size > MAX_FILE_SIZE_BYTES || stat.nlink > 1) return undefined
+    return { relativePath, content: readFileSync(fd, 'utf-8') }
   } catch {
-    // 読めないファイルはスキップ
+    return undefined
+  } finally {
+    if (fd !== undefined) closeSync(fd)
   }
+}
+
+function pushFileIfSafe(realRoot: string, candidate: string, result: FileContent[]): void {
+  if (IGNORED_EXTS.has(path.extname(candidate).toLowerCase())) return
+  const file = readContainedFile(realRoot, candidate)
+  if (file) result.push({ ...file, isNew: false })
 }
 
 function collectFiles(
@@ -144,16 +167,21 @@ function collectFiles(
   realRoot: string,
   result: FileContent[],
   limit: number,
+  visited: Set<string> = new Set(),
+  depth = 0,
 ): void {
-  if (result.length >= limit) return
+  if (result.length >= limit || depth > MAX_DIRECTORY_DEPTH) return
   // ディレクトリ自体も realpath で root の内側を確かめる（symlink のディレクトリで外へ出ない）。
   const realDir = containedRealPath(realRoot, dir)
   if (realDir === undefined) return
+  // 一度辿った実ディレクトリは二度辿らない（`self -> .` / `up -> ..` の循環で重複・暴走しない）。
+  if (visited.has(realDir)) return
+  visited.add(realDir)
   if (isWithheldPath(path.relative(realRoot, realDir))) return
 
   let entries: string[]
   try {
-    entries = readdirSync(realDir)
+    entries = readdirSync(realDir).sort()
   } catch {
     return
   }
@@ -171,8 +199,8 @@ function collectFiles(
       continue
     }
     if (stat.isDirectory()) {
-      collectFiles(real, realRoot, result, limit)
-    } else {
+      collectFiles(real, realRoot, result, limit, visited, depth + 1)
+    } else if (stat.isFile()) {
       pushFileIfSafe(realRoot, real, result)
     }
   }
@@ -209,7 +237,7 @@ function gatherRelevantFiles(
     }
     if (stat.isDirectory()) {
       collectFiles(real, realRoot, files, MAX_FILES_PER_PATH)
-    } else {
+    } else if (stat.isFile()) {
       pushFileIfSafe(realRoot, real, files)
     }
   }
@@ -221,10 +249,12 @@ function gatherRelevantFiles(
 // Project Memory 読み込み
 // ────────────────────────────────────────────────────────────
 
-/** Project Memory の 1 ファイルを読む。realpath が root の内側のときだけ（symlink で外へ出ない）。 */
+/**
+ * Project Memory の 1 ファイルを読む。**関連ファイルと同じ `readContainedFile()` を通す**
+ * （root 内の `.env` への symlink・FIFO・巨大ファイル・hardlink を読まない。独立レビュー指摘）。
+ */
 function readMemoryFile(realRoot: string, filePath: string): string | undefined {
-  const real = containedRealPath(realRoot, filePath)
-  return real === undefined ? undefined : readFileSync(real, 'utf-8')
+  return readContainedFile(realRoot, filePath)?.content
 }
 
 function readProjectMemory(realRoot: string): ProjectMemorySummary {

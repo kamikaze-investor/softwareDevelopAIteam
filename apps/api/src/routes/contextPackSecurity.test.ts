@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import Fastify, { type FastifyInstance } from 'fastify'
 import os from 'node:os'
 import path from 'node:path'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { contextPackRoutes } from './contextPack.js'
 
 /**
@@ -157,6 +158,53 @@ describe('POST /api/context-pack — 読み取り範囲の制限', () => {
 
     const res = await post(workspace, ['src'])
     expect(res.body).not.toContain(OUTSIDE_SECRET)
+  })
+
+  it('Project Memory を root 内の .env への symlink にしても秘密は返さない（独立レビュー指摘）', async () => {
+    writeFileSync(path.join(workspace, '.env'), `API_KEY=${ENV_SECRET}`)
+    mkdirSync(path.join(workspace, 'docs', 'project_memory'), { recursive: true })
+    symlinkSync('../../.env', path.join(workspace, 'docs', 'project_memory', 'goal.md'))
+    symlinkSync('../../.env', path.join(workspace, 'docs', 'project_memory', 'design_philosophy.md'))
+
+    const res = await post(workspace, ['src'])
+    expect(res.status).toBe(201)
+    expect(res.body).not.toContain(ENV_SECRET)
+  })
+
+  it('FIFO は読まない（API を止めない）', async () => {
+    mkdirSync(path.join(workspace, 'docs', 'project_memory'), { recursive: true })
+    execFileSync('mkfifo', [path.join(workspace, 'docs', 'project_memory', 'goal.md')])
+    execFileSync('mkfifo', [path.join(workspace, 'src', 'pipe.ts')])
+
+    const res = await post(workspace, ['src', 'src/pipe.ts'])
+    expect(res.status).toBe(201)
+    expect(JSON.parse(res.body).pack.relevantFiles.map((f: { relativePath: string }) => f.relativePath)).toEqual(['src/ok.ts'])
+  }, 5000)
+
+  it('symlink の循環でも同じファイルを重複して返さず、有限時間で終わる', async () => {
+    symlinkSync('.', path.join(workspace, 'src', 'self'))
+    symlinkSync('..', path.join(workspace, 'src', 'up'))
+
+    const res = await post(workspace, ['src'])
+    expect(res.status).toBe(201)
+    const paths = JSON.parse(res.body).pack.relevantFiles.map((f: { relativePath: string }) => f.relativePath)
+    expect(paths).toEqual(['src/ok.ts'])
+  })
+
+  it('root 内の秘密ファイルへの hardlink も返さない', async () => {
+    writeFileSync(path.join(workspace, '.env'), `HARD=${ENV_SECRET}`)
+    linkSync(path.join(workspace, '.env'), path.join(workspace, 'src', 'notes.txt'))
+
+    const res = await post(workspace, ['src', 'src/notes.txt'])
+    expect(res.body).not.toContain(ENV_SECRET)
+  })
+
+  it('証明書・keystore・credentials.json も返さない', async () => {
+    for (const name of ['cert.p12', 'cert.pfx', 'app.keystore', 'credentials.json']) {
+      writeFileSync(path.join(workspace, 'src', name), ENV_SECRET)
+    }
+    const res = await post(workspace, ['src'])
+    expect(res.body).not.toContain(ENV_SECRET)
   })
 
   it('不正入力（NUL・空白だけ・相対 root）は fail closed', async () => {

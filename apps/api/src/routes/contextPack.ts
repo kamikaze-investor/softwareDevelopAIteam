@@ -63,8 +63,9 @@ export async function contextPackRoutes(app: FastifyInstance): Promise<void> {
         pack,
         message: `Context Pack 生成完了（ファイル数: ${pack.relevantFiles.length}）`,
       })
-    } catch {
-      // 内部エラー文（パス等を含みうる）は返さない。
+    } catch (err: unknown) {
+      // 内部エラー文（パス等を含みうる）は返さない。サーバ側のログにだけ残す。
+      req.log.error({ err }, 'context pack generation failed')
       return reply.status(500).send({ error: 'Context Pack の生成に失敗しました' })
     }
   })
