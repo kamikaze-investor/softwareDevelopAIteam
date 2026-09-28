@@ -7,6 +7,16 @@ import { isHumanOnlyRoute } from './humanOnlyRoutes'
 
 const BEARER_PREFIX = 'Bearer '
 
+/**
+ * 空文字の SHA-256。未設定の変数を `printf %s "$X" | sha256sum` した結果がこれになる。
+ * 64桁の正しい形なので「設定済み」に見えるが、`Authorization: Bearer `（空 token）と一致する。
+ */
+const EMPTY_TOKEN_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
+function isEmptyTokenHash(hash: string | undefined): boolean {
+  return hash !== undefined && hash.trim().toLowerCase() === EMPTY_TOKEN_SHA256
+}
+
 function sha256Hex(value: string): string {
   return createHash('sha256').update(value, 'utf-8').digest('hex')
 }
@@ -33,6 +43,8 @@ function timingSafeStringEqual(a: string, b: string): boolean {
  *   SHA-256ハッシュのみを保持する
  * - **片方だけ設定** → invalid configuration。設定ミスとして全requestを503で拒否する
  *   （fail closed。片側credentialだけ有効な中途半端な状態でProductionを動かさない）
+ * - **いずれかのhashが空token由来**（`e3b0c442…b855`）→ 同じく設定ミスとして503
+ *   （未設定変数をhashした値。受理すると`Bearer `（空token）でそのclassが取れる）
  *
  * split credential modeでは、任意で第3のcredential class `ACTIONS_READONLY`を
  * （`ACTIONS_READONLY_TOKEN_SHA256`）追加できる。GitHub Actionsがtrusted resulting_commitを
@@ -77,6 +89,15 @@ export async function apiTokenAuth(
     return
   }
 
+  // 空 token 由来の hash（未設定変数を hash した値）は、どの class でも設定ミスとして
+  // fail closedで拒否する。受理すると空 token でその credential class が取れてしまう。
+  if ([adminTokenHash, workerTokenHash, actionsTokenHash].some(isEmptyTokenHash)) {
+    reply.status(503).send({
+      error: 'Server auth configuration is invalid: a credential hash was derived from an empty token',
+    })
+    return
+  }
+
   // ACTIONS_READONLYが設定されている場合、ADMIN/WORKERのいずれとも異なる値でなければ
   // authority separationが無効化される。設定ミスとしてfail closedで拒否する。
   if (
@@ -96,7 +117,14 @@ export async function apiTokenAuth(
     return
   }
 
-  const tokenHash = sha256Hex(authHeader.slice(BEARER_PREFIX.length).trim())
+  // 空 token はどの class とも照合しない（上の設定検査と二重の防御）。
+  const presentedToken = authHeader.slice(BEARER_PREFIX.length).trim()
+  if (presentedToken === '') {
+    reply.status(401).send({ error: 'Invalid token' })
+    return
+  }
+
+  const tokenHash = sha256Hex(presentedToken)
 
   if (timingSafeStringEqual(tokenHash, adminTokenHash)) {
     setCredentialClass(req, 'admin')

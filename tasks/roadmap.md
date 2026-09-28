@@ -9643,10 +9643,19 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       テストも別々に固定してある（`lineage walk — 意味側` / `lineage walk — 停止側`）。
 
 
-<!-- roadmap:id=auth-empty-token-hash-accepted state=planned priority=high -->
-0. [ ] **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する** —
+<!-- roadmap:id=auth-empty-token-hash-accepted state=in_progress priority=high -->
+0. [~] **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する** —
       2026-09-22 登録（read-only 確認）。**concrete な authority boundary の欠陥であり、
       `split-credential-migration` の cutover 前 blocker である。**
+
+      **【2026-09-28 コード修正済み・merge 待ち】** 既存の fail-closed 分岐へ 1 本足す形で塞いだ
+      （新しい検査層は作っていない）。ADMIN / WORKER / ACTIONS_READONLY のいずれかの hash が
+      空 token 由来（大文字・前後空白も含む）なら 503、token 部が空の `Bearer ` は 401。
+      regression test: `apps/api/src/auth/emptyTokenHash.test.ts`（修正前に 4 件失敗することを確認済み）。
+      手順書 `human_recovery.md` の生成式は `${X:?}` で空値を止める形へ変更（副次）。
+      **production の設定値が空 token 由来 hash でないかの確認は未実施**（VPS 権限が必要。
+      `split-credential-migration` の「最初にやること」に含まれる）。merge・deploy 後に done とする。
+      本項目は `chatgpt-mcp-inspect` の D0（外部接続の前提）でもある。
 
       **確認した事実（コードと手順書を読んだだけ。production の設定値は読んでいない）**:
 
