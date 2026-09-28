@@ -96,7 +96,12 @@ export type RepairPreparation =
        */
       generation?: RepairGeneration
     }
-  | { action: 'skip'; reason: string }
+  | {
+      action: 'skip'
+      reason: string
+      /** admission を止めた Design Review run（あれば）。skip の追跡用で、判定には使わない。 */
+      runId?: string
+    }
 
 export type RepairFlowOutcome =
   | { status: 'repair_job_created'; jobId: string; stepKey: string; attempt: number }
@@ -508,6 +513,44 @@ export function resolveReviewedImplementation(
 }
 
 /**
+ * 引き金の review に至る resume 段のうち、**actor が human と証明された Job** だけを返す。
+ * AI / unknown（記録なし・矛盾・admin_credential の根拠なし）は含めない。
+ */
+function humanResumesOf(storage: IStorage, resumeHops: readonly Job[]): Job[] {
+  if (resumeHops.length === 0) return []
+  const actors = readResumeActorClasses(storage, resumeHops)
+  return resumeHops.filter((job) => actors.get(job.id) === 'human')
+}
+
+/**
+ * **その Design Review run に、人が Human Resume で後から明示的に答えたか。**
+ *
+ * すべて満たすときだけ true（1 つでも判らなければ false = 従来どおり gate として残す）:
+ *   - repair 目的の run で、`repairSourceJobId` がいま repair しようとしている実装と一致する
+ *     （= `decideRepairAction()` の `sourceJobId`。別 lineage の run は対象外）
+ *   - run が終端している（queued / running は答えようがない）
+ *   - 引き金の review の resume lineage 上に human の resume があり、その `createdAt` が
+ *     run の `completedAt` より後（run の結果を見る前に作られた resume は回答ではない）
+ *
+ * run の verdict は見ない。「失敗した verdict だから外す」のではなく「人が答えたから外す」。
+ * run は Task で絞った read から来るので、同じ Task であることは呼び出し側で成立している。
+ */
+function answeredByHumanResume(
+  run: DesignReviewRun,
+  repairSourceJobId: string,
+  humanResumes: readonly Job[],
+): boolean {
+  if (run.repairSourceJobId === undefined || run.repairSourceJobId !== repairSourceJobId) return false
+  if (run.status !== 'succeeded' && run.status !== 'failed') return false
+  const completedAt = run.completedAt === undefined ? Number.NaN : Date.parse(run.completedAt)
+  if (!Number.isFinite(completedAt)) return false
+  return humanResumes.some((job) => {
+    const createdAt = Date.parse(job.createdAt)
+    return Number.isFinite(createdAt) && createdAt > completedAt
+  })
+}
+
+/**
  * `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。
  *
  * 認めるときは **照合に使った保存済みレコードそのもの**を返す。呼び出し元は repair を
@@ -515,7 +558,7 @@ export function resolveReviewedImplementation(
  */
 type BlockedAdmission =
   | { ok: true, implementJob: Job, review: ReviewResult }
-  | { ok: false, reason: string }
+  | { ok: false, reason: string, runId?: string }
 
 /**
  * **blocked な Task に repair を作ってよい唯一のケース**かを、既存レコードだけで照合する。
@@ -557,6 +600,8 @@ function repairableBlockedReviewRequest(
   //    保存済み lineage で確かめてから使う（Human Resume で再実行された review を含む）。
   //    verdict は下の 2. で、その review Job 自身に保存されたものだけを読む。
   let reviewJob: Job | undefined
+  // 引き金の review に至る Human Resume の段（下の 7. で「回答済みの run」を判定する材料）。
+  let reviewResumeHops: Job[] = []
   if (reviewJobId !== undefined) {
     const reviewed = resolveReviewedImplementation(storage, reviewJobId)
     if (!reviewed.ok) return { ok: false, reason: `review lineage: ${reviewed.reason}` }
@@ -564,6 +609,7 @@ function repairableBlockedReviewRequest(
       return { ok: false, reason: 'review job did not review this implementation' }
     }
     reviewJob = reviewed.reviewJob
+    reviewResumeHops = reviewed.resumeHops
   } else {
     reviewJob = storage.jobs.findByTaskId(task.id)
       .find((job) => job.workflowStepKey === `implement:${implementJob.id}:review`)
@@ -691,14 +737,27 @@ function repairableBlockedReviewRequest(
   //    `resultJson` が NULL のまま残る。そこを `!== undefined` で素通りさせていたため、
   //    **判定が存在しない Design Review が「問題なし」として扱われていた**（独立レビュー指摘）。
   //    run が 1 つも無いときだけが「まだ Design Review をしていない」であり、それは通してよい。
-  const latestRun = storage.designReviewRuns.findLatestByTaskId(task.id)
-  if (latestRun !== undefined) {
-    const recomputed = safeRecomputedDecision(latestRun)
+  //
+  //    **ただし、Human Resume で回答済みの repair run は根拠から外す**（D3・2026-09-28 production
+  //    `9fdee5a3`）。repair run の非 ALIGNED は既に人へ渡っている（Task は blocked）。CEO がその後に
+  //    Human Resume で「ここから続ける」と答えたのに、その run が「最新だから」という理由だけで
+  //    新しい repair を止め続けていた（run `d0af140a`）。**verdict で特例にはしない。** 外すのは
+  //    `answeredByHumanResume()` の条件をすべて満たす run だけで、残りのうち最も新しい run に
+  //    従来の規則をそのまま当てる。Task 設計由来の run（`repairSourceJobId` 無し）は外さない。
+  const humanResumeAnswers = humanResumesOf(storage, reviewResumeHops)
+  const authorityRun = storage.designReviewRuns.findByTaskId(task.id)
+    .find((run) => !answeredByHumanResume(run, implementJob.id, humanResumeAnswers))
+  if (authorityRun !== undefined) {
+    const recomputed = safeRecomputedDecision(authorityRun)
     if (recomputed === undefined) {
-      return { ok: false, reason: 'latest design review decision could not be recomputed' }
+      return {
+        ok: false,
+        reason: 'latest design review decision could not be recomputed',
+        runId: authorityRun.id,
+      }
     }
     if (recomputed !== 'ALIGNED') {
-      return { ok: false, reason: `latest design review is ${recomputed}` }
+      return { ok: false, reason: `latest design review is ${recomputed}`, runId: authorityRun.id }
     }
   }
 
@@ -816,7 +875,9 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   // が既存レコードだけで全条件を機械照合し、1 つでも欠ければ従来どおり skip する。
   if (task.status === 'blocked') {
     const admitted = repairableBlockedReviewRequest(storage, task, failedJob, input.reviewJobId)
-    if (!admitted.ok) return { action: 'skip', reason: `task is blocked (${admitted.reason})` }
+    if (!admitted.ok) {
+      return { action: 'skip', reason: `task is blocked (${admitted.reason})`, runId: admitted.runId }
+    }
     // **認めた根拠と repair の材料を同じ行に揃える。** ここで引数の object を使い続けると、
     // 「保存された無害な verdict で通し、引数の細工された verdict で prompt を組む」が
     // 成立する。照合した 2 件だけを以降の材料にする（独立レビュー指摘）。

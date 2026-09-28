@@ -9618,6 +9618,26 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 承認された resume review から git_commit が作られない件（`isAutomaticReviewJob` が `implement:*:review` 限定）
       - `repairFromStoredReview` の `resolveStoredReviewChain()` が resume review を受け付けない件
 
+<!-- roadmap:id=answered-design-review-run-blocks-repair-admission state=done -->
+15. [x] **Human Resume で回答済みの repair Design Review run が「最新だから」という理由で repair admission を止め続ける（D3）** —
+      2026-09-28 production 実測（Task `9fdee5a3`、run `d0af140a`）で登録し、同日修正。
+
+      **責務は 1 つ**: blocked Task の repair admission（規則 7「最新 Design Review が ALIGNED」）が、
+      人が Human Resume で既に答えた repair run を根拠にしないこと。**新しい status / Gate / workflow は作らない。**
+
+      **実測**: R0 の修正要求から作られた repair run `d0af140a` は REVIEW_UNAVAILABLE で終わり、Task は blocked のまま
+      人へ渡った。CEO はその後 R0 を Human Resume し（R1）、R1 も修正を要求した。規則 7 は Task の最新 run を読むため、
+      D1 で R1 を元の実装へ戻しても `d0af140a` に止められ、しかも skip はログも残さなかった。
+
+      **修正**: run を新しい順に読み、**Human Resume で回答済みの run だけ**を外して、残りのうち最も新しい run に従来の規則を当てる。
+      回答済みとするのは、同じ Task・`repairSourceJobId === decision.sourceJobId`・run が終端・引き金の review の
+      resume lineage 上に `resume_actor = human`（admin_credential 根拠）の Job があり、その `createdAt > run.completedAt`
+      をすべて満たすときだけ。**verdict では特例にしない。** AI / unknown / malformed の resume、別 lineage、
+      別 `repairSourceJobId`、run 完了前の resume は回答にしない。`repairSourceJobId` 無しの Task 設計 run と active run の
+      既存 gate は不変。admission が skip したら `reason / sourceJobId / reviewJobId / runId` を warn log に残す。
+
+      **この項目に含めないもの**: approved な resumed review の git_commit（D4）、`repairFromStoredReview` の resume 対応（既知 Finding）。
+
 <!-- roadmap:id=repair-budget-counted-per-task-not-per-chain state=done -->
 0. [x] **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった** —
       2026-09-22 実装。**Human resume と AI resume を同じ意味として扱わないことが本項目の主境界である。**
