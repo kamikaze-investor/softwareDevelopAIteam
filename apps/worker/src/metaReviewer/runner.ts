@@ -32,27 +32,36 @@ import {
   loadEngineeringPrinciples,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
 
+/**
+ * 呼び出し側が control root を渡さないときの既定。**既存の挙動そのまま**である
+ * （container では `/workspace/control`、CI / ローカルでは `.env` の `CONTROL_ROOT`）。
+ *
+ * **Design Review の runner はこの既定に頼ってはならない。** VPS は container ではないので
+ * `/workspace/control` が存在せず、しかも runner は `buildRunnerEnv()` の最小 env で起動するため
+ * `CONTROL_ROOT` も届かない。2026-09-28 に production の low-load review がこれで毎回
+ * `ENOENT ... /workspace/control/docs/meta_reviewer/prompt.md` になっていた。
+ * そちらは coordinator が解決済みの `controlContextDir` を明示して渡す（`buildMetaReviewPrompt()`）。
+ */
 const CONTROL_ROOT = process.env.CONTROL_ROOT ?? '/workspace/control'
-const META_REVIEWER_PROMPT_PATH = path.join(
-  CONTROL_ROOT,
-  'docs/meta_reviewer/prompt.md'
-)
-const META_REVIEWER_CHECKLIST_PATH = path.join(
-  CONTROL_ROOT,
-  'docs/meta_reviewer/checklist.md'
-)
-const CHECKLISTS_DIR = path.join(CONTROL_ROOT, 'docs/meta_reviewer/checklists')
+
+function metaReviewerPaths(controlRoot: string): { prompt: string; checklist: string; checklistsDir: string } {
+  return {
+    prompt: path.join(controlRoot, 'docs/meta_reviewer/prompt.md'),
+    checklist: path.join(controlRoot, 'docs/meta_reviewer/checklist.md'),
+    checklistsDir: path.join(controlRoot, 'docs/meta_reviewer/checklists'),
+  }
+}
 
 /**
  * 変更ファイルに対応するファイル別チェックリストを全て返す
  * 複数のエリアにまたがる変更（例: api + worker）には複数のチェックリストを返す
  */
-function getFileChecklists(changedFiles: string[]): string[] {
+function getFileChecklists(changedFiles: string[], checklistsDir: string): string[] {
   const results: string[] = []
 
   const add = (filename: string) => {
     try {
-      const content = readFileSync(path.join(CHECKLISTS_DIR, filename), 'utf-8')
+      const content = readFileSync(path.join(checklistsDir, filename), 'utf-8')
       results.push(content)
     } catch {
       // チェックリストファイルが存在しない場合はスキップ
@@ -151,13 +160,18 @@ export function buildMetaReviewRequest(
 
 /**
  * Meta Reviewer AIに渡すプロンプトを構築する
+ *
+ * `controlRoot` を省略した呼び出し（CI の `autoReview.ts` 等）は従来どおり `CONTROL_ROOT` を使う。
+ * Design Review の low-load 経路は、coordinator が解決した `controlContextDir` を必ず渡す。
+ * focused 経路（`strategicReview.ts`）が既にそれを使って checklist を読んでいるのと同じ root である。
  */
-export function buildMetaReviewPrompt(request: MetaReviewRequest): string {
-  const systemPrompt = readFileSync(META_REVIEWER_PROMPT_PATH, 'utf-8')
+export function buildMetaReviewPrompt(request: MetaReviewRequest, controlRoot: string = CONTROL_ROOT): string {
+  const paths = metaReviewerPaths(controlRoot)
+  const systemPrompt = readFileSync(paths.prompt, 'utf-8')
   const engineeringPrinciples = loadEngineeringPrinciples()
   const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance(engineeringPrinciples)
-  const generalChecklist = readFileSync(META_REVIEWER_CHECKLIST_PATH, 'utf-8')
-  const fileChecklists = getFileChecklists(request.changedFiles)
+  const generalChecklist = readFileSync(paths.checklist, 'utf-8')
+  const fileChecklists = getFileChecklists(request.changedFiles, paths.checklistsDir)
 
   const fileChecklistSection = fileChecklists.length > 0
     ? [

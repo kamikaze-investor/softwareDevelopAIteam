@@ -406,7 +406,10 @@ async function runLowLoadLegacyReview(
       input.workingDir,
       input.gitDiff,
     )
-    const prompt = buildMetaReviewPrompt(request)
+    // **focused 経路と同じ root を使う。** 省略すると runner.ts の既定 `/workspace/control`
+    // （container 時代のパス）になり、VPS では prompt.md が見つからず毎回 ENOENT になる
+    // （2026-09-28 production 実測）。coordinator が解決した値を runner 入力経由で受け取っている。
+    const prompt = buildMetaReviewPrompt(request, resolveControlContextDir(input))
     const { raw: rawResponse } = await reviewWithProviderFallback(prompt, {
       preferCli: true,
       // agy CLI は model と effort を分離して受け取る（AGY_REVIEW_MODEL の定義コメント参照）。
@@ -431,6 +434,18 @@ async function runLowLoadLegacyReview(
       classification,
       selectedFocuses: [],
       focusedReviewResults: [],
+      // **low-load の判定を、API の recompute が読む形で載せる。**
+      //
+      // API の `recomputeDecision()` は `finalDecision`（自己申告）を読まず、
+      // focusedReviewResults と integrationReviewResult から判定を組み直す。low-load は focus を
+      // 1 件も選ばないので、ここを空のままにすると `resolveFinalDecision([], undefined)` が
+      // **成功した review でも常に UNCERTAIN** を返し、low-load の Design Review は一度も
+      // ALIGNED に届かなかった（2026-09-28 に実 recompute で実測）。
+      //
+      // legacy review は変更全体を 1 回で見る唯一の判定なので integration の枠に載せる。
+      // 値は `finalDecision` と同じ `mapMetaReviewStatusToStrategicDecision()` の結果で、
+      // approved だけが ALIGNED・それ以外は CONFLICT になる（未知値が ALIGNED へ化けない）。
+      integrationReviewResult: { decision: finalDecision, summary: legacyResult.summary },
       finalDecision,
       requiresCeoApprovalOverride,
     })
@@ -978,6 +993,7 @@ function buildStrategicResult(input: {
   independentReviewResult?: IndependentReviewOutcome
   finalDecision: StrategicDecision | 'REVIEW_UNAVAILABLE'
   requiresCeoApprovalOverride?: boolean
+  unavailableReason?: string
 }): StrategicMetaReviewResult {
   // **kind-aware**: roadmap kind は別建ての independent review を持たない（PR C）。
   // ここを reviewLoad だけで決めると、roadmap は常に critical なので
@@ -1007,6 +1023,7 @@ function buildStrategicResult(input: {
     finalDecision: input.finalDecision,
     independentReviewRequired,
     requiresCeoApproval,
+    ...(input.unavailableReason !== undefined ? { unavailableReason: input.unavailableReason } : {}),
     createdAt: new Date().toISOString(),
   }
 }
@@ -1034,19 +1051,24 @@ function buildUnavailableStrategicResult(
   integrationReviewResult: IntegrationReviewResult | undefined,
   reason: string,
 ): StrategicMetaReviewResult {
-  const nextFocusedReviewResults = focusedReviewResults.length > 0
-    ? focusedReviewResults
-    : [unavailableFocusedResult('strategic_alignment', reason, '')]
-
+  // **実行されなかった focus を作らない。**
+  //
+  // 以前は focusedReviewResults が空のとき `strategic_alignment` の結果を人工的に1件足していた。
+  // low-load は focus を選ばない（期待集合は `[]`）ので、API の集合一致検査がそれを
+  // `focus set mismatch: expected [] but runner reported [strategic_alignment]` として弾き、
+  // **「prompt が読めなかった」という本当の原因が review ロジックの不整合に見えていた**
+  // （2026-09-28 production・run `d0af140a`）。理由は `unavailableReason` で運び、
+  // 判定は `finalDecision: 'REVIEW_UNAVAILABLE'` のまま API へ渡す。
   return buildStrategicResult({
     reviewKind,
     subjectId,
     classification,
     selectedFocuses,
-    focusedReviewResults: nextFocusedReviewResults,
+    focusedReviewResults,
     integrationReviewResult,
     finalDecision: 'REVIEW_UNAVAILABLE',
     requiresCeoApprovalOverride: true,
+    unavailableReason: reason,
   })
 }
 

@@ -9517,6 +9517,37 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - **新しい診断機構は作らない。** 渡す context の作り方（`buildContext()`）の改善で足りるか
       - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
 
+<!-- roadmap:id=low-load-design-review-unreachable-on-vps state=done -->
+12. [x] **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた** —
+      2026-09-28 production 実測（Task `9fdee5a3` の docs-only repair、design review run `d0af140a`）で登録し、同日修正。
+
+      **責務は 1 つ**: docs / test / 非 policy markdown だけの変更（review load = low）の Design Review が
+      VPS で実行でき、判定が API まで届くこと。実行できなかった場合は `REVIEW_UNAVAILABLE` と本当の理由が
+      durable に残ること。**新しい Gate / provider / status / fallback workflow は作らない。**
+
+      **実測した欠陥（3 つが同時に起きていた）**:
+      - **prompt の root**: low-load 経路（legacy Meta Review）だけが `runner.ts` の既定
+        `/workspace/control`（container 時代のパス）から `docs/meta_reviewer/prompt.md` を読み、VPS では毎回
+        ENOENT。focused 経路（medium 以上）は coordinator が解決した `controlContextDir` を使っており無事だった。
+        VPS の API は cwd = repo root で、`resolveDefaultControlContextDir()` はそこへ解決する（read-only 実測）。
+      - **架空の focus**: 失敗結果に実行されていない `strategic_alignment` を 1 件足していたため、API の
+        集合一致検査が `focus set mismatch: expected [] but runner reported [strategic_alignment]` として弾き、
+        ENOENT が見えなくなっていた。
+      - **判定の欠落**: 成功しても low-load は判定を `finalDecision`（自己申告・API は読まない）にしか載せず、
+        API の recompute は `resolveFinalDecision([], undefined)` = **常に UNCERTAIN** だった。
+        low-load の Design Review は root を直しても ALIGNED に届かない状態だった。
+
+      **修正**: low-load も focused 経路と同じ `controlContextDir` から prompt を読む（新しい root 概念は
+      作らない。`runner.ts` の既定は CI 用に不変）。判定は API が読む `integrationReviewResult` へ載せる
+      （approved だけが ALIGNED）。unavailable は架空 focus を作らず `unavailableReason`（任意・後方互換）で
+      理由を運び、API は **期待 focus が空の task kind に限って** `REVIEW_UNAVAILABLE` をそのまま採用し
+      `rejectedReason` に理由を残す。medium 以上（CONFLICT と unavailable が混在し得る）と roadmap kind の
+      判定は不変。
+
+      **この項目に含めないもの**: PL escalation が LINE へ届かない件（`pl-escalation-recorded-without-delivery`
+      が正本）、medium 以上で unavailable の理由が rejectedReason に残らない既存挙動、Task `9fdee5a3` の再開
+      （Production deploy 後に別途）。
+
 <!-- roadmap:id=repair-budget-counted-per-task-not-per-chain state=done -->
 0. [x] **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった** —
       2026-09-22 実装。**Human resume と AI resume を同じ意味として扱わないことが本項目の主境界である。**
