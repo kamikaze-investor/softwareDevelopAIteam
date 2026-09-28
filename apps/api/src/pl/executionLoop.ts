@@ -96,6 +96,7 @@ import {
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { recordResumeActor } from '../designReview/resumeActor'
+import { runOperatorRequestStep, type OperatorRequestStepDeps, type OperatorRequestStepResult } from './operatorRequestStep'
 import {
   authorizePlAction,
   PlActionBlockedError,
@@ -192,6 +193,8 @@ export type PlTickStatus =
   | 'escalated'
   /** 診断そのものが失敗した（provider 障害等）。実行していない。 */
   | 'diagnosis_failed'
+  /** Operator Request に回答した（または回答に失敗した）。**何も実行していない。** */
+  | 'operator_request_handled'
 
 /** 操作後の状態再確認の結果。**「API が 200 を返した」は成功扱いにしない。** */
 export type PlVerificationVerdict =
@@ -249,6 +252,8 @@ export interface PlTickResult {
     rootCauseClass: BlockedRootCauseClass
     confidence: 'high' | 'low'
   }
+  /** この tick で扱った Operator Request（あれば）。 */
+  operatorRequest?: OperatorRequestStepResult
 }
 
 export interface PlDiagnosisInput {
@@ -295,6 +300,8 @@ export interface PlLoopDeps {
   /** Critic / PL revision / Challenge の依存（テスト差し替え用）。 */
   conflictDeps?: ConflictResolutionDeps
   coordinatorDeps?: CoordinatorDeps
+  /** Operator Request の回答生成（テスト差し替え用）。既定は既存 provider CLI 経路。 */
+  answerOperatorRequest?: OperatorRequestStepDeps['answer']
   now?: () => string
 }
 
@@ -618,6 +625,21 @@ import {
   adoptionFailureFingerprint,
   entriesSinceLastAdoption,
 } from './adoptionFailure'
+
+/**
+ * PL の自律ループがその attention をどう扱っているかの**読み取り専用**の要約。
+ * Operator Request への回答材料であり、ループの判断そのものには使わない。
+ */
+function describePlLoopStatus(storage: IStorage, item: AttentionItem) {
+  const key = targetKeyOf(item)
+  return {
+    handledByPlLoop: ACTIONABLE_ATTENTION_KINDS.includes(item.kind),
+    notifyOnly: NOTIFY_ONLY_ATTENTION_KINDS.includes(item.kind),
+    priorAttempts: countPriorAttempts(storage, key),
+    maxAttempts: PL_MAX_ATTEMPTS_PER_TARGET,
+    escalatedToCeo: hasEscalated(storage, key),
+  }
+}
 
 export function countPriorAttempts(storage: IStorage, targetKey: string): number {
   return storage.auditLog
@@ -1152,6 +1174,26 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       evaluateAndPersistImplementTimeoutSensors(storage, CLAUDE_IMPLEMENT_TIMEOUT_MS)
     } catch {
       // 記録できないことは PL が止まる理由にならない。次の tick で再評価される。
+    }
+
+    // ── Operator Request（外部からの依頼に答える。**何も実行しない**）──────────
+    //
+    // 1 tick 1 件の原則に従い、依頼を処理した tick はここで終える。pending は
+    // `OPERATOR_REQUEST_MAX_PENDING` 件に制限されているので、attention の処理が遅れるのは
+    // 最大でもその tick 数だけである。依頼は PL の権限を増やさず、下の自律処理の判断にも
+    // 一切入らない（本文は回答 prompt の引用データ欄にしか現れない）。
+    const operatorRequest = await runOperatorRequestStep(storage, {
+      ...(deps.answerOperatorRequest ? { answer: deps.answerOperatorRequest } : {}),
+      escalate: deps.escalate ?? defaultEscalate,
+      describePlLoopStatus: (target) => describePlLoopStatus(storage, target),
+      ...(deps.now ? { now: deps.now } : {}),
+    })
+    if (operatorRequest) {
+      return {
+        status: 'operator_request_handled',
+        operatorRequest,
+        ...(operatorRequest.reason !== undefined ? { reason: operatorRequest.reason } : {}),
+      }
     }
 
     // ── Observe ───────────────────────────────────────────────
