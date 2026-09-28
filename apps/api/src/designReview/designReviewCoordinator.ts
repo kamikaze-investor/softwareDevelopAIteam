@@ -115,6 +115,8 @@ export interface RawStrategicResult {
   integrationReviewResult?: unknown
   independentReviewResult?: unknown
   finalDecision?: unknown
+  /** runner が REVIEW_UNAVAILABLE を返したときの理由（任意）。 */
+  unavailableReason?: unknown
 }
 
 export type RecomputedDecision = 'ALIGNED' | 'CONFLICT' | 'UNCERTAIN' | 'REVIEW_UNAVAILABLE'
@@ -313,6 +315,36 @@ export function recomputeDecision(
     independentReviewRequired,
     rejectedReason,
   })
+
+  // **review が実行できなかったと runner が明示したら、その authority をそのまま返す。**
+  //
+  // finalDecision は自己申告なので、通常この関数は読まずに判定を組み直す。だが
+  // `REVIEW_UNAVAILABLE` は ALIGNED から**遠ざける向きにしか**働かない（fail-closed）ので、
+  // 受け取ってよい。受け取らずに下の集合一致検査へ流すと、実行されなかった review の
+  // focus 集合が期待と合わず `focus set mismatch` になり、**「実行できなかった」という本当の
+  // 原因が review ロジックの不整合に置き換わる**（2026-09-28 production・run `d0af140a`:
+  // prompt.md の ENOENT が focus set mismatch として escalation された）。
+  //
+  // **期待 focus が空（= low load）の task kind に限る。**
+  //
+  // - focus を選ぶ load（medium 以上）では runner が実在する focus の結果を必ず返すので、
+  //   従来どおり下で組み直す。runner は focus が1件落ちても残りを実行し続けるため、
+  //   「ある focus は CONFLICT・別の focus は unavailable」が起こり得る。ここで早期 return すると
+  //   組み直せば CONFLICT になるはずの結果が REVIEW_UNAVAILABLE に置き換わり、CONFLICT だけを
+  //   対象にする remediation が動かなくなる（medium / high の regression）。
+  // - roadmap kind は integration review の必須性と専用の rejectedReason を持っており、
+  //   本修正の対象外である（挙動を変えない）。
+  if (reviewKind === 'task' && expectedFocuses.length === 0 && raw.finalDecision === 'REVIEW_UNAVAILABLE') {
+    const reason = typeof raw.unavailableReason === 'string' && raw.unavailableReason.trim() !== ''
+      ? raw.unavailableReason.trim().slice(0, 500)
+      : 'runner reported REVIEW_UNAVAILABLE without a reason'
+    return {
+      decision: 'REVIEW_UNAVAILABLE',
+      reviewLoad,
+      independentReviewRequired,
+      rejectedReason: `review unavailable: ${reason}`,
+    }
+  }
 
   if (!isFocusResultArray(raw.focusedReviewResults)) {
     return reject('focusedReviewResults has invalid shape')
