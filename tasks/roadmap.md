@@ -10078,8 +10078,33 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       新しい通知基盤 / 新しいダッシュボード / Monitor 専用 DB。既存の改善で足りない場合のみ、
       その時点で不足を具体的に示してから検討する。
 
-<!-- roadmap:id=chatgpt-mcp-inspect state=planned -->
-1. [ ] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
+<!-- roadmap:id=chatgpt-mcp-inspect state=in_progress -->
+1. [~] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
+
+      **【2026-09-28 進捗: D0〜D4 実装済み・D5 はローカル検証まで。Production 外部接続は未有効化】**
+
+      | 段 | 状態 | 実体 |
+      |---|---|---|
+      | D0 | コード修正済み | `auth-empty-token-hash-accepted`（本 ledger 同項目）。production の auth mode 確認は**未実施**（VPS 権限が要る） |
+      | D1 | 済 | `operator_requests` table / `POST・GET /api/operator-requests`（`routes/operatorRequests.ts`）。保存するだけで operational state を変えない（全 table hash で固定） |
+      | D2 | 済 | `pl/operatorRequestStep.ts`。PL tick が最古の pending を 1 件処理し `answered / declined / escalated` を保存。**何も実行しない**（依頼から action を起動する経路は作っていない。復旧は従来どおり自律ループが `authorizePlAction()` 経由で行う）。本文は回答 prompt の引用データ欄にだけ入る。escalation は既存 notifier・1時間3件まで |
+      | D3 | 済 | credential class `operator_gateway`（`OPERATOR_GATEWAY_TOKEN_SHA256`・split mode のみ）。allowlist は `/api/operator/*` の safe read 5本 + Operator Request 3本。safe read は `operator/projection.ts` の field allowlist（stdout / stderr / prompt / パス / QA details / CEO メモを出さない）。登録全 route を列挙して allowlist 外 403 を固定 |
+      | D4 | 済 | `apps/mcp-gateway`（stateless Streamable HTTP）。tool は safe read 5 / `ask_pl` / 結果取得 2 のみ。内部 credential は gateway 側だけに置き、外部の bearer は API へ転送しない |
+      | D5 | ローカルのみ | MCP client → gateway → 実 API 境界 → PL 回答 → 結果取得の E2E（`localConnection.e2e.test.ts`）と、実 process を loopback で起動した curl 確認。**ChatGPT 本体とは未接続** |
+
+      **外部認証（ChatGPT → gateway）の現状**: ChatGPT の remote MCP connector が受け付けるのは
+      OAuth 2.1（MCP authorization spec: Protected Resource Metadata / DCR または CIMD / PKCE）・
+      No Authentication・Mixed で、固定 bearer は無い（2026-09-28 調査。一次資料
+      `developers.openai.com` はこの実行環境の egress で遮断され、検索結果の抜粋で確認した。
+      **着手前に一次資料で再確認すること**）。gateway の既定は `disabled`（全拒否）で、
+      他は loopback 限定の `local_static_bearer` だけ。**OAuth は未実装**（authorization server を
+      外部 IdP にするか自前にするかは外部サービス追加・セキュリティモデル変更のため CEO 判断）。
+
+      **Production 有効化までに残るもの（すべて CEO 判断 / VPS 作業）**:
+      (1) production の effective auth mode が split であることの確認（`split-credential-migration`）と、
+      設定値が空 token 由来 hash でないことの確認 / (2) 本修正の deploy /
+      (3) `POST /api/context-pack` 任意ファイル読み取りの別 security fix / (4) 外部認証方式の決定と実装 /
+      (5) gateway の公開方法（HTTPS・常駐 process）/ (6) ChatGPT 実機での接続テスト。
       **【制約: 従量課金APIを新しい標準経路にしない（CEO 指示・2026-09-14）】**
       AIteamOS 側が ChatGPT との接続のために **OpenAI API を呼ぶ構造を前提にしない**。
       MCP は `ChatGPT → MCP → AIteamOS Control / State Interface` の**接続口**に徹し、
@@ -10166,6 +10191,9 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **【2026-09-28 CEO 方針】** 本項目は `chatgpt-mcp-inspect` と同じ **Operator Request
       （`operator_request`）interface** を再利用する。Mobile 用に別の command / message backend は
       新設しない。Operator Request interface 自体は `chatgpt-mcp-inspect` の D1/D2 として先に作る。
+      **【2026-09-28 進捗】** 共通 interface は実装済み（`POST・GET /api/operator-requests` と
+      PL の回答経路）。Mobile は ADMIN credential でこの route をそのまま使える（`requesterClass=admin`）。
+      Mobile 側の UI は未着手。
 
       **PL Console（下記 deferred 4件）との関係**: 別物である。PL Console は「ベンダー非依存の
       PL 指示 UI」（LibreChat 等の評価・Gateway・Provider Adapter を含む重量級）で、本項目は
