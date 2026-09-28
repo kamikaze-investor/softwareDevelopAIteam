@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
@@ -1161,6 +1161,31 @@ export interface ITaskContinuationStorage {
   update(id: string, data: Partial<Pick<TaskContinuation, 'status' | 'error' | 'completedAt'>>): TaskContinuation | undefined
 }
 
+/**
+ * Operator Request（外部から PL への依頼）の保存。
+ *
+ * **ここにある write は operator_requests テーブルだけに閉じる。** Task / Job / Approval /
+ * Design Review 等の operational state には触れない。
+ */
+export interface IOperatorRequestStorage {
+  findById(id: string): OperatorRequest | undefined
+  /** 新しい順。`status` 指定時はその状態のみ。 */
+  list(filter: { status?: OperatorRequestStatus; limit: number }): OperatorRequest[]
+  countPending(): number
+  /** PL が次に処理する依頼（最古の pending）。 */
+  findOldestPending(): OperatorRequest | undefined
+  create(data: Pick<OperatorRequest, 'requesterClass' | 'message' | 'projectId' | 'taskId'>): OperatorRequest
+  /**
+   * pending の依頼を終端させる。**pending でなければ何もせず undefined**（二重回答しない）。
+   */
+  complete(
+    id: string,
+    result:
+      | { status: 'answered'; disposition: OperatorRequestDisposition; response: string }
+      | { status: 'failed'; error: string },
+  ): OperatorRequest | undefined
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -1178,6 +1203,7 @@ export interface IStorage {
   auditLog: IAuditLogStorage
   principleApplications: IPrincipleApplicationStorage
   taskContinuations: ITaskContinuationStorage
+  operatorRequests: IOperatorRequestStorage
   projectRoadmapPhases: IProjectRoadmapPhaseStorage
   knowledgeGraph: IKnowledgeGraphStorage
   decisionCache: IDecisionCacheStorage

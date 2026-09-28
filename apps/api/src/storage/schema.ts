@@ -389,6 +389,24 @@ export const CREATE_TABLES = `
     UNIQUE (completed_task_id)
   );
 
+  -- 外部（ChatGPT MCP / Mobile Operator Chat）から PL への依頼。共通 Operator Interface の唯一の記録。
+  -- message は untrusted input で、保存するだけ（operational state は変えない）。
+  CREATE TABLE IF NOT EXISTS operator_requests (
+    id TEXT PRIMARY KEY,
+    requester_class TEXT NOT NULL CHECK (requester_class IN ('operator_gateway', 'admin', 'legacy', 'unauthenticated')),
+    message TEXT NOT NULL,
+    project_id TEXT,
+    task_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'failed')),
+    disposition TEXT CHECK (disposition IS NULL OR disposition IN ('answered', 'escalated', 'declined')),
+    response TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    answered_at TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -527,4 +545,5 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at ON design_review_runs(status, started_at)',
   'CREATE INDEX IF NOT EXISTS ix_task_continuations_project ON task_continuations(project_id)',
   'CREATE INDEX IF NOT EXISTS ix_task_continuations_completed ON task_continuations(completed_task_id)',
+  'CREATE INDEX IF NOT EXISTS ix_operator_requests_status_created ON operator_requests(status, created_at)',
 ]

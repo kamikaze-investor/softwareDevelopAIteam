@@ -22,10 +22,11 @@ import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
   ITaskContinuationStorage,
+  IOperatorRequestStorage,
   PersistCommitSuccessWithContinuationResult,
   ReconcileExternalCompletionResult,
 } from './interface'
-import type { TaskContinuation } from '@ai-team/shared'
+import type { TaskContinuation, OperatorRequest } from '@ai-team/shared'
 import type { PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleApplication, PrincipleApplicationInput, PrincipleDisagreementRow, PrincipleReviewStage, StrategicDecision } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
@@ -4321,6 +4322,70 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
+  const operatorRequests: IOperatorRequestStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM operator_requests WHERE id = ?').get(id) as any
+      return row ? deserializeOperatorRequest(row) : undefined
+    },
+    list({ status, limit }) {
+      const rows = (status === undefined
+        ? db.prepare('SELECT * FROM operator_requests ORDER BY created_at DESC, rowid DESC LIMIT ?').all(limit)
+        : db.prepare(
+            'SELECT * FROM operator_requests WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ?'
+          ).all(status, limit)) as any[]
+      return rows.map(deserializeOperatorRequest)
+    },
+    countPending() {
+      const row = db.prepare(
+        "SELECT COUNT(*) AS c FROM operator_requests WHERE status = 'pending'"
+      ).get() as { c: number }
+      return row.c
+    },
+    findOldestPending() {
+      const row = db.prepare(
+        "SELECT * FROM operator_requests WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT 1"
+      ).get() as any
+      return row ? deserializeOperatorRequest(row) : undefined
+    },
+    create(data) {
+      const request: OperatorRequest = {
+        id: randomUUID(),
+        requesterClass: data.requesterClass,
+        message: data.message,
+        ...(data.projectId !== undefined ? { projectId: data.projectId } : {}),
+        ...(data.taskId !== undefined ? { taskId: data.taskId } : {}),
+        status: 'pending',
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO operator_requests
+          (id, requester_class, message, project_id, task_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+      `).run(
+        request.id,
+        request.requesterClass,
+        request.message,
+        request.projectId ?? null,
+        request.taskId ?? null,
+        request.createdAt,
+      )
+      return request
+    },
+    complete(id, result) {
+      const answeredAt = now()
+      const info = result.status === 'answered'
+        ? db.prepare(`
+            UPDATE operator_requests SET status = 'answered', disposition = ?, response = ?, answered_at = ?
+            WHERE id = ? AND status = 'pending'
+          `).run(result.disposition, result.response, answeredAt, id)
+        : db.prepare(`
+            UPDATE operator_requests SET status = 'failed', error = ?, answered_at = ?
+            WHERE id = ? AND status = 'pending'
+          `).run(result.error, answeredAt, id)
+      return info.changes === 1 ? operatorRequests.findById(id) : undefined
+    },
+  }
+
   const auditLog: IAuditLogStorage = {
     findByEntity(entityType, entityId) {
       const rows = db.prepare(
@@ -5123,7 +5188,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, supervisedRuns, gateEvaluations, auditLog, principleApplications, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, supervisedRuns, gateEvaluations, auditLog, principleApplications, taskContinuations, operatorRequests, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
   return storage
 }
 
@@ -5448,6 +5513,22 @@ function deserializeTaskContinuation(row: any): TaskContinuation {
     error: row.error ?? undefined,
     createdAt: row.created_at,
     completedAt: row.completed_at ?? undefined,
+  }
+}
+
+function deserializeOperatorRequest(row: any): OperatorRequest {
+  return {
+    id: row.id,
+    requesterClass: row.requester_class as OperatorRequest['requesterClass'],
+    message: row.message,
+    projectId: row.project_id ?? undefined,
+    taskId: row.task_id ?? undefined,
+    status: row.status as OperatorRequest['status'],
+    disposition: row.disposition ?? undefined,
+    response: row.response ?? undefined,
+    error: row.error ?? undefined,
+    createdAt: row.created_at,
+    answeredAt: row.answered_at ?? undefined,
   }
 }
 
