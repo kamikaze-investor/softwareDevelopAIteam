@@ -10200,6 +10200,12 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       設定値が空 token 由来 hash でないことの確認 / (2) 本修正の deploy /
       (3) `POST /api/context-pack` 任意ファイル読み取りの別 security fix / (4) 外部認証方式の決定と実装 /
       (5) gateway の公開方法（HTTPS・常駐 process）/ (6) ChatGPT 実機での接続テスト。
+
+      **(3) の進捗（2026-09-28）**: コード修正済み・PR（別 security fix）で review 中。
+      root は設定済み target root だけ（allowlist・realpath 一致）、読み取りはすべて realpath で root 内に閉じる
+      （symlink 脱出不可）、`.env` 等の秘密ファイルと dotfile は返さない（`ALWAYS_FORBIDDEN_PATTERNS` を再利用）。
+      regression test: `apps/api/src/routes/contextPackSecurity.test.ts`（修正前に 8 件失敗を確認）。
+      Production への deploy は未実施。**`validateTargetRoot()` を使う他 route（`summary/update` 等）は本修正の範囲外。**
       **【制約: 従量課金APIを新しい標準経路にしない（CEO 指示・2026-09-14）】**
       AIteamOS 側が ChatGPT との接続のために **OpenAI API を呼ぶ構造を前提にしない**。
       MCP は `ChatGPT → MCP → AIteamOS Control / State Interface` の**接続口**に徹し、

@@ -9,7 +9,7 @@
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { buildContextPack } from '../ctoAi/contextManager.js'
-import { validateTargetRoot, validateAllowedPaths } from '../utils/pathGuard.js'
+import { resolveContextPackRoot, validateContextPackAllowedPaths } from '../utils/pathGuard.js'
 
 const TaskSummarySchema = z.object({
   id: z.string().regex(/^task-\d+$/),
@@ -40,18 +40,20 @@ export async function contextPackRoutes(app: FastifyInstance): Promise<void> {
 
     const { task, targetProjectRoot } = parsed.data
 
-    // [codex-review P1] パス境界検証
-    const rootCheck = validateTargetRoot(targetProjectRoot)
+    // パス境界検証（security fix）: root は設定済み target root そのものだけ（allowlist）。
+    // 以前は拒否リスト方式で /srv・/home・/tmp 等を root にでき、`/srv/ai-team/env/*.env` まで読めた。
+    // 読み取り自体も buildContextPack() が realpath で root の内側に閉じる（symlink で外へ出ない）。
+    const rootCheck = resolveContextPackRoot(targetProjectRoot)
     if (!rootCheck.ok) {
       return reply.status(400).send({ error: 'パス検証エラー', detail: rootCheck.reason })
     }
-    const pathsCheck = validateAllowedPaths(task.allowedPaths, targetProjectRoot)
+    const pathsCheck = validateContextPackAllowedPaths(task.allowedPaths, rootCheck.realRoot)
     if (!pathsCheck.ok) {
       return reply.status(400).send({ error: 'allowedPaths 検証エラー', detail: pathsCheck.reason })
     }
 
     try {
-      const pack = buildContextPack(task as any, targetProjectRoot)
+      const pack = buildContextPack(task as any, rootCheck.realRoot)
 
       return reply.status(201).send({
         status: 'context_pack_ready',
@@ -61,11 +63,9 @@ export async function contextPackRoutes(app: FastifyInstance): Promise<void> {
         pack,
         message: `Context Pack 生成完了（ファイル数: ${pack.relevantFiles.length}）`,
       })
-    } catch (err: any) {
-      return reply.status(500).send({
-        error: 'Context Pack の生成に失敗しました',
-        detail: err.message,
-      })
+    } catch {
+      // 内部エラー文（パス等を含みうる）は返さない。
+      return reply.status(500).send({ error: 'Context Pack の生成に失敗しました' })
     }
   })
 }
