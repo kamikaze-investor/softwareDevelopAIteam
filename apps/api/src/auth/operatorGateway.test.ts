@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { apiTokenAuth } from './apiToken'
 import { OPERATOR_GATEWAY_ALLOWLIST, isOperatorGatewayRouteAllowed } from './operatorGatewayAllowlist'
 import { resetStorage, getStorage } from '../storage'
+import { buildSystemState } from '../state/systemState'
 import type { IStorage } from '../storage/interface'
 import { projectRoutes } from '../routes/projects'
 import { systemStateRoutes } from '../routes/systemState.js'
@@ -73,7 +74,11 @@ const ACTIONS_TOKEN = 'actions-token-value'
 const OPERATOR_TOKEN = 'operator-gateway-token-value'
 const sha = (v: string): string => createHash('sha256').update(v, 'utf-8').digest('hex')
 
-const SECRETS = ['STDOUT-SECRET-111', 'STDERR-SECRET-222', 'PROMPT-SECRET-333', '/home/ceo/.ssh', 'QA-DETAILS-SECRET']
+const SECRETS = [
+  'STDOUT-SECRET-111', 'STDERR-SECRET-222', 'PROMPT-SECRET-333', '/home/ceo/.ssh', 'QA-DETAILS-SECRET',
+  // 1行目が構造化行でない stderr は、`/api/state` の attention.detail に末尾がそのまま入る
+  'UNSTRUCTURED-STDERR-SECRET-444',
+]
 
 const ENV_KEYS = [
   'API_TOKEN', 'ADMIN_TOKEN_SHA256', 'WORKER_TOKEN_SHA256', 'ACTIONS_READONLY_TOKEN_SHA256',
@@ -153,6 +158,18 @@ describe('OPERATOR_GATEWAY authority boundary', () => {
     })
     // 前提: 生値が本当に保存されていること（ここが空だと下の「返さない」検査が空振りする）
     expect(storage.jobs.findById(job.id)).toMatchObject({ stdout: SECRETS[0], aiCliPrompt: SECRETS[2] })
+    // 別 Task: 1行目が `[jobRunner]` でない stderr で失敗した Job（attention.detail に生の末尾が入る）
+    const otherTaskId = storage.tasks.create({
+      projectId, title: 'T2', description: 'd', status: 'in_progress',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 1,
+    } as Parameters<IStorage['tasks']['create']>[0]).id
+    const failed = storage.jobs.create({
+      taskId: otherTaskId, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as never)
+    storage.jobs.update(failed.id, { stderr: `npm ERR! auth token=${SECRETS[5]}` })
+    // 前提: 既存の /api/state 実体では生の末尾が detail に入っている（ここが崩れたら検査が空振りする）
+    expect(JSON.stringify(buildSystemState(storage).attention)).toContain(SECRETS[5])
     storage.qaResults.create({
       taskId, jobId: job.id, type: 'unit_test', status: 'failed', summary: 's', details: SECRETS[4],
     } as never)

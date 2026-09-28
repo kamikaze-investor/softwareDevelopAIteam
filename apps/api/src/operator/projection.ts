@@ -34,6 +34,23 @@ function defined<T extends Record<string, unknown>>(obj: T): T {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as T
 }
 
+/** Job の出力から detail を作る attention。 */
+const JOB_OUTPUT_ATTENTION_KINDS: ReadonlySet<AttentionItem['kind']> = new Set(['job_blocked', 'job_failed'])
+
+/**
+ * attention の detail を外へ出してよい形にする。
+ *
+ * `job_blocked` / `job_failed` の detail は、Job の stderr 1行目が Worker の構造化行
+ * （`[jobRunner] ...`）ならその行、**そうでなければ stderr の末尾そのもの**である
+ * （`state/systemState.ts` の `stopReason()`）。後者は credential 断片を含みうるので出さない。
+ */
+export function safeAttentionDetail(item: AttentionItem): string | undefined {
+  if (JOB_OUTPUT_ATTENTION_KINDS.has(item.kind) && !item.detail.trimStart().startsWith('[jobRunner] ')) {
+    return 'job output withheld (not a structured [jobRunner] line); see the job status and failure kind'
+  }
+  return capText(item.detail)
+}
+
 export function projectAttention(item: AttentionItem): Record<string, unknown> {
   return defined({
     kind: item.kind,
@@ -42,7 +59,7 @@ export function projectAttention(item: AttentionItem): Record<string, unknown> {
     taskId: item.taskId,
     jobId: item.jobId,
     referenceId: item.referenceId,
-    detail: capText(item.detail),
+    detail: safeAttentionDetail(item),
     stuckForMs: item.stuckForMs,
   })
 }
