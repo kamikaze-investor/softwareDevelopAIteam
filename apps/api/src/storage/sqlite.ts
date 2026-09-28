@@ -4348,7 +4348,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     findOldestPending() {
       const row = db.prepare(
-        "SELECT * FROM operator_requests WHERE status = 'pending' ORDER BY created_at ASC, rowid ASC LIMIT 1"
+        // Mobile（CEO / admin・legacy）の依頼を外部 Operator の依頼より先に処理する。
+        // pending 上限は依頼元ごとなので、外部 Operator が枠を埋めても CEO の依頼が後回しにならない。
+        "SELECT * FROM operator_requests WHERE status = 'pending' "
+        + "ORDER BY CASE requester_class WHEN 'operator_gateway' THEN 1 ELSE 0 END, created_at ASC, rowid ASC LIMIT 1"
       ).get() as any
       return row ? deserializeOperatorRequest(row) : undefined
     },

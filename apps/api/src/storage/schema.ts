@@ -459,6 +459,11 @@ export const CREATE_TABLES = `
  * CREATE TABLE IF NOT EXISTS does not change already-created tables.
  */
 export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; definition: string }> = [
+  // Operator Request（2026-09-28）。初版の operator_requests を作った DB に後から足した列を補う。
+  // SQLite は NOT NULL の ADD COLUMN に既定値を要求する。初版の依頼はすべて質問扱い（実行しない側）。
+  { table: 'operator_requests', column: 'kind', definition: "TEXT NOT NULL DEFAULT 'question' CHECK (kind IN ('question', 'request'))" },
+  { table: 'operator_requests', column: 'target_key', definition: 'TEXT' },
+  { table: 'operator_requests', column: 'pl_action', definition: 'TEXT' },
   // Project開始workflowの永続stage。長時間の開始処理をHTTP requestのlifecycleから
   // 切り離し、Mobileがread-onlyで進捗を復元できるようにする（2026-09-07）。
   { table: 'projects', column: 'start_stage', definition: 'TEXT' },

@@ -507,7 +507,10 @@ async function handleRequest(
     storage,
     request.id,
     disposition,
-    `kind=request requester=${request.requesterClass} target=${plAction.targetKey} attempted=${plAction.attempted} status=${plAction.status}`,
+    // 検証に通らなかった targetKey は caller の文字列なので audit に載せない。
+    `kind=request requester=${request.requesterClass} target=${
+      plAction.status === 'invalid_target' ? '(invalid)' : plAction.targetKey
+    } attempted=${plAction.attempted} status=${plAction.status}`,
   )
   return { requestId: request.id, status: 'answered', disposition, plAction }
 }

@@ -232,3 +232,39 @@ describe('/api/operator-requests', () => {
     expect(storage.operatorRequests.findById(created.id)?.status).toBe('failed')
   })
 })
+
+describe('operator_requests storage', () => {
+  it('初版の operator_requests（kind / target_key / pl_action 無し）を持つ DB でも起動・作成できる', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'operator-requests-migrate-'))
+    const file = path.join(dir, 'db.sqlite')
+    try {
+      const legacy = new Database(file)
+      legacy.exec(`CREATE TABLE operator_requests (
+        id TEXT PRIMARY KEY, requester_class TEXT NOT NULL, message TEXT NOT NULL,
+        project_id TEXT, task_id TEXT, status TEXT NOT NULL, disposition TEXT,
+        response TEXT, error TEXT, created_at TEXT NOT NULL, answered_at TEXT)`)
+      legacy.prepare(
+        "INSERT INTO operator_requests (id, requester_class, message, status, created_at) VALUES ('old', 'admin', 'old q', 'pending', '2026-09-28T00:00:00.000Z')",
+      ).run()
+      legacy.close()
+
+      const migrated = createSQLiteStorage(file)
+      // 初版の依頼は質問扱い（実行しない側）になる
+      expect(migrated.operatorRequests.findById('old')).toMatchObject({ kind: 'question', status: 'pending' })
+      const created = migrated.operatorRequests.create({ requesterClass: 'admin', kind: 'request', message: 'new', targetKey: 'job_blocked:x' })
+      expect(migrated.operatorRequests.findById(created.id)).toMatchObject({ kind: 'request', targetKey: 'job_blocked:x' })
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }) } catch { /* sqlite handle */ }
+    }
+  })
+
+  it('処理順: Mobile（admin / legacy）の依頼を外部 Operator の依頼より先に取り出す', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const external = storage.operatorRequests.create({ requesterClass: 'operator_gateway', kind: 'request', message: 'a' })
+    const mobile = storage.operatorRequests.create({ requesterClass: 'admin', kind: 'question', message: 'b' })
+    expect(storage.operatorRequests.findOldestPending()?.id).toBe(mobile.id)
+    storage.operatorRequests.complete(mobile.id, { status: 'answered', disposition: 'answered', response: 'ok' })
+    expect(storage.operatorRequests.findOldestPending()?.id).toBe(external.id)
+  })
+})
+
