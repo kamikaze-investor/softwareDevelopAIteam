@@ -466,7 +466,7 @@ function isInsideAllowedPaths(file: string, allowed: readonly string[]): boolean
  * 既存 `recomputeDecision()` は focus 判定から本来の結論を組み直すためのもので、
  * `blockedTriage` が使っているのと同じ関数である。ここでも同じものを使う。
  */
-function safeRecomputedDecision(run: DesignReviewRun): string | undefined {
+export function safeRecomputedDecision(run: DesignReviewRun): string | undefined {
   if (run.resultJson === undefined) return undefined
   try {
     const raw = JSON.parse(run.resultJson) as RawStrategicResult
@@ -880,25 +880,32 @@ export function isWorkspaceQuarantined(jobs: readonly Job[]): boolean {
 }
 
 /**
- * durable にqueuedとなったrunを実行し、ALIGNEDならrepair Jobを作る。
+ * repair handoff の**前半**: run から handoff 対象（Task と source Job）を確定する。
  *
- * startup recovery からも、PATCH直後のkickからも同じ経路で呼ばれる。
- * claim_token fencing により、両方から同時に呼ばれても実行は1本に絞られる。
+ * `executeQueuedRepair()` が持っていた pre-review guard をそのまま切り出したものである
+ * （判定・順序・escalation・reason 文言は 1 つも変えていない）。切り出した理由は、
+ * **terminal run の successor 回収（U2）が同じ guard を必要とし、しかし間の
+ * Design Review だけは実行してはならない**ためである。コピーして第二実装を作ると、
+ * quarantine・lineage・Task 整合性の fail-closed が 2 箇所に分かれて必ず片方だけ腐る。
+ *
+ * 成功時は解決済みの材料を返し、失敗時は既存の `RepairFlowOutcome` をそのまま返す。
  */
-export async function executeQueuedRepair(
+export function resolveRepairHandoffTarget(
   storage: IStorage,
   run: DesignReviewRun,
   stepKey: string,
-  deps: CoordinatorDeps = buildDefaultCoordinatorDeps(),
-): Promise<RepairFlowOutcome> {
+): { ok: true; taskId: string; sourceJob: Job } | { ok: false; outcome: RepairFlowOutcome } {
   // Repairは「あるTaskの実装をやり直す」という概念そのものがTask固有であり、
   // review_kind='roadmap'（Whole-Roadmap Review、まだ存在しない）はここへは来ない設計。
   // taskId は型上optionalになった（DesignReviewRun.taskId?: string）ため、想定外に
   // roadmap kindのrunがここへ渡された場合はnon-null assertionで握り潰さずfail-closedにする。
   if (run.reviewKind !== 'task' || run.taskId === undefined) {
     return {
-      status: 'escalated',
-      reason: `executeQueuedRepair only supports reviewKind=task, got ${run.reviewKind}`,
+      ok: false,
+      outcome: {
+        status: 'escalated',
+        reason: `executeQueuedRepair only supports reviewKind=task, got ${run.reviewKind}`,
+      },
     }
   }
   const taskId = run.taskId
@@ -909,8 +916,11 @@ export async function executeQueuedRepair(
   if (isWorkspaceQuarantined(storage.jobs.findByTaskId(taskId))) {
     escalateTaskToHuman(storage, taskId)
     return {
-      status: 'escalated',
-      reason: 'workspace is quarantined; repair cannot run until the workspace is verified safe',
+      ok: false,
+      outcome: {
+        status: 'escalated',
+        reason: 'workspace is quarantined; repair cannot run until the workspace is verified safe',
+      },
     }
   }
 
@@ -920,7 +930,7 @@ export async function executeQueuedRepair(
   const sourceJobId = parseRepairSource(stepKey)
   if (sourceJobId === undefined) {
     escalateTaskToHuman(storage, taskId)
-    return { status: 'escalated', reason: `malformed repair step key: ${stepKey}` }
+    return { ok: false, outcome: { status: 'escalated', reason: `malformed repair step key: ${stepKey}` } }
   }
 
   const sourceJob = storage.jobs.findById(sourceJobId)
@@ -928,27 +938,38 @@ export async function executeQueuedRepair(
   // 部分的に埋めた不完全なJobを作るより、人へ渡すほうが安全side。
   if (!sourceJob) {
     escalateTaskToHuman(storage, taskId)
-    return { status: 'escalated', reason: 'source job for the repair chain is missing' }
+    return { ok: false, outcome: { status: 'escalated', reason: 'source job for the repair chain is missing' } }
   }
   // **別 Task の Job を source にした repair を作らない。** 作ると lineage が Task を
   // またぎ、`walkRepairGeneration()` から見て「この Task に無い親」になる（数え切れない）。
   if (sourceJob.taskId !== taskId) {
     escalateTaskToHuman(storage, taskId)
-    return { status: 'escalated', reason: 'source job for the repair chain belongs to another task' }
-  }
-
-  const outcome = await executeDesignReviewRun(storage, run, deps)
-  if (outcome.status === 'stale' || outcome.status === 'not_claimable') {
-    return { status: 'already_started', stepKey }
-  }
-  if (outcome.status !== 'evidence_registered') {
-    escalateTaskToHuman(storage, taskId)
     return {
-      status: 'escalated',
-      reason: `design review did not align (${outcome.status}${outcome.decision ? `: ${outcome.decision}` : ''})`,
+      ok: false,
+      outcome: { status: 'escalated', reason: 'source job for the repair chain belongs to another task' },
     }
   }
 
+  return { ok: true, taskId, sourceJob }
+}
+
+/**
+ * repair handoff の**後半**: ALIGNED 判定が既に成立している前提で repair Job を実体化する。
+ *
+ * `executeQueuedRepair()` の review 実行後の部分をそのまま切り出したものである。
+ * 呼び出し側は「ALIGNED である」ことを自分の方法で確かめてから入る:
+ *   - queued path は `executeDesignReviewRun()` が `evidence_registered` を返したこと
+ *   - terminal path（U2）は durable な ALIGNED evidence の identity が run と一致すること
+ *
+ * **ここは Design Review を実行しない。** `deps` を受け取らないのがその保証である。
+ */
+export function completeRepairHandoff(
+  storage: IStorage,
+  run: DesignReviewRun,
+  stepKey: string,
+  taskId: string,
+  sourceJob: Job,
+): RepairFlowOutcome {
   if (storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === stepKey)) {
     return { status: 'already_started', stepKey }
   }
@@ -966,7 +987,7 @@ export async function executeQueuedRepair(
   // workspace を守っていたが、後続 repair Job が実体化した時点で他の所有者がいない
   // 順序を作らないよう、後続を先に作ってから source を解放する。
   const repairJob = storage.jobs.createRepairJobWithHandoff({
-    sourceJobId,
+    sourceJobId: sourceJob.id,
     repairJob: {
       taskId,
       projectId: sourceJob.projectId,
@@ -981,10 +1002,30 @@ export async function executeQueuedRepair(
   })
 
   if (!repairJob.ok) {
-    // ここへ stepKey の重複で来ることは無い。直前の dedup 判定から
-    // `createRepairJobWithHandoff()` までの間に await が無く、API は単一 process で
-    // 動くため、両者の間に別経路が割り込めない（割り込める `runRepairFlow` 側では
-    // `isWorkflowStepKeyConflict()` で `already_started` へ倒している）。
+    // **良性の重複を human escalation へ送らない。**
+    //
+    // 直前の dedup から `createRepairJobWithHandoff()` までの間に await は無く、queued path
+    // では API が単一 process である限り別経路が割り込めない。だが `ux_jobs_workflow_step_key`
+    // は全体一意であり、terminal path（U2 の sweep）まで含めると「既に同じ successor が
+    // 存在する」という形の衝突は原理的に起こりうる。それは**壊れたのではなく既に在る**
+    // ことの証明なので human escalation へ送らない
+    // （CEO 判断・2026-09-25。handoff 共通の semantics とする）。
+    //
+    // **判定は error 文字列ではなく durable state の読み直しで行う。**
+    // `isWorkflowStepKeyConflict()` は `error.code === 'SQLITE_CONSTRAINT_UNIQUE'` か
+    // message 中の同文字列を見るが、`createRepairJobWithHandoff()` は例外を
+    // `err.message` へ平坦化して返すため、ここへ届く reason は
+    // `UNIQUE constraint failed: jobs.workflow_step_key` で **code が失われている**
+    // （2026-09-25 実測）。文字列の形に依存せず、「いまこの Task が同じ key を持っているか」
+    // を読み直せば良性かどうかは確定する。
+    //
+    // **分岐は 2 つある。** `runRepairFlow` が独立レビュー指摘で既に持っている規則と同じで、
+    // 同一 Task が持っているなら「既に在る」、そうでなければ従来どおり人へ渡す。
+    // 別 Task がこの key を持っている場合（key は*この Task の*失敗 Job を名指すので
+    // lineage 破損である）を `already_started` にしてはならない。
+    if (storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === stepKey)) {
+      return { status: 'already_started', stepKey }
+    }
     // 後続の実体化に失敗した。transaction は rollback され、source Job は `blocked` の
     // まま所有権を保持する。ここで workspace を放置せず、Human escalation（Task blocked）
     // へ渡して後の介入を可能にする。
@@ -1000,4 +1041,37 @@ export async function executeQueuedRepair(
     stepKey,
     attempt: run.attemptCount,
   }
+}
+
+/**
+ * durable にqueuedとなったrunを実行し、ALIGNEDならrepair Jobを作る。
+ *
+ * startup recovery からも、PATCH直後のkickからも同じ経路で呼ばれる。
+ * claim_token fencing により、両方から同時に呼ばれても実行は1本に絞られる。
+ *
+ * 中身は `resolveRepairHandoffTarget()` → Design Review → `completeRepairHandoff()` の
+ * 3 段になったが、判定・順序・戻り値は抽出前と同じである。
+ */
+export async function executeQueuedRepair(
+  storage: IStorage,
+  run: DesignReviewRun,
+  stepKey: string,
+  deps: CoordinatorDeps = buildDefaultCoordinatorDeps(),
+): Promise<RepairFlowOutcome> {
+  const target = resolveRepairHandoffTarget(storage, run, stepKey)
+  if (!target.ok) return target.outcome
+
+  const outcome = await executeDesignReviewRun(storage, run, deps)
+  if (outcome.status === 'stale' || outcome.status === 'not_claimable') {
+    return { status: 'already_started', stepKey }
+  }
+  if (outcome.status !== 'evidence_registered') {
+    escalateTaskToHuman(storage, target.taskId)
+    return {
+      status: 'escalated',
+      reason: `design review did not align (${outcome.status}${outcome.decision ? `: ${outcome.decision}` : ''})`,
+    }
+  }
+
+  return completeRepairHandoff(storage, run, stepKey, target.taskId, target.sourceJob)
 }

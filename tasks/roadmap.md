@@ -11269,6 +11269,81 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       到達可能性の調査が必要になった時点で別項目として登録する。
       `input.taskUpdate` が production から一度も渡されていない点も同様に別扱いとする。
 
+<!-- roadmap:id=repair-chain-successor-durability state=in_progress -->
+9. [~] **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）** —
+      2026-09-22 監査で検出、2026-09-25 登録。**U3 が残っているため item 全体はまだ `done` にしない。**
+
+      **責務は 1 つ**: repair chain の各段が「durable な結果」を残したとき、その successor が
+      必ず実行されるか、さもなくば人へ収束すること。予算・lineage・generation の意味論は
+      `repair-budget-counted-per-task-not-per-chain`（done）が正本で、ここでは触らない。
+      stored review の再駆動は `consumed-stored-review-has-no-recovery-route`（done）が正本である。
+      **新しい workflow / Gate / review 工程 / status / queue / daemon は作らない。**
+
+      横断監査は同じ根から 5 つの欠落を挙げた。**細切れ item にせず、ここで一括管理する。**
+
+      | | 欠落 | 状態 |
+      |---|---|---|
+      | U1 | repair-purpose run の successor intent が durable でない（stepKey が process stack 上にしか無い） | **land 済み** #283 |
+      | U4 | queued な repair-purpose run が汎用 executor へ誤 dispatch され、repair Job を作る機会が消える | **land 済み** #287 |
+      | #290 | handoff が成功した source Job の結果を `failed` へ書き換える | **land 済み** #290（専用項目 `repair-handoff-overwrites-terminal-result` に詳細） |
+      | U2 | **ALIGNED evidence を残した直後に落ちた terminal run の successor が回収されない** | **今回** |
+      | U3 | 非 ALIGNED で終端した run の escalation successor が成立しない | **残件（未着手）** |
+
+      **U2 の failure window（今回の対象）**: `executeQueuedRepair()` は
+      review → `completeWithEvidence()` → `createRepairJobWithHandoff()` と続くが、
+      **2 番目と 3 番目の間に transaction が無い。** ここで落ちると run は `succeeded`、
+      evidence は正しく残り、repair Job は 0 件になる。`findQueued()` は `queued` しか
+      返さず、U4 の dispatcher も `claim()` が `status='queued'` 以外を拒むため入れない。
+      つまり **evidence も run も正しいのに successor を作る機会だけが消える。**
+
+      **U2 で入れたもの**:
+      - `IDesignReviewRunStorage.findAlignedRepairPurposeTerminal()` —— read を 1 本だけ。
+        条件は `status='succeeded' AND error IS NULL AND repair_source_job_id IS NOT NULL`。
+        **この 3 条件は prefilter であって ALIGNED の同値条件ではない。**
+        初出時は「`error IS NULL` は ALIGNED と同値」と書いたが**誤りだった**（独立レビュー指摘）:
+        `recomputeDecision()` が `rejectedReason` を埋めるのは `reviewKind === 'roadmap'` の
+        ときだけで、repair が使う `task` kind では非 ALIGNED でも undefined になり、
+        `complete()` が `error ?? null` で保存するため **非 ALIGNED な task run も
+        `error IS NULL` で終端する**。ALIGNED の判定は呼び出し側が run 自身の `resultJson` から
+        既存 `safeRecomputedDecision()` で計算し直す（読めない / UNCERTAIN は回収しない）。
+        **新 table / processed 列 / generic ledger / queue / migration は無し。**
+      - `resolveRepairHandoffTarget()` / `completeRepairHandoff()` —— `executeQueuedRepair()` の
+        既存 guard を review の前後で 2 分割した。判定・順序・reason 文言は
+        **handoff 失敗時の 1 分岐を除いて**不変である（その 1 点は下記の競合 semantics）。
+        U2 はこの 2 つの間に「Design Review 実行」ではなく
+        「この run の判定が ALIGNED であること + durable な ALIGNED evidence の
+        `designTextHash` 一致」の確認を挟む。**第二実装を作らない。**
+      - `recoverTerminalRepairSuccessors()` —— 既存 `POST /api/task-continuations/reconcile` の
+        chain へ U7 と同じ形で 3 本目として並べた。既存 `sweepInFlight` guard がそのまま覆う。
+        **新しい timer / daemon / endpoint は無し。**
+
+      **Design Review を再実行しない。** module が `CoordinatorDeps` を受け取らないのが
+      その保証である（runner を起動する手段が無い）。admission と予算も再判定しない ——
+      どちらも元 run の生成時に決着し `repair_source_job_id` と stepKey へ durable 化されている。
+      回収時に再評価すると、実際に走って evidence を残した review と別の結論になりうる。
+
+      **sweep は候補ごとに隔離する。** 1 件の例外で後続が飢えないよう try/catch で受け、
+      `failed` を数えて **0 件でないときは必ず log へ出す** —— 全候補が落ちた sweep は正常終了
+      扱いで外側の catch にも入らないため、出さないと繰り返す欠陥が無音になる（独立レビュー指摘）。
+
+      **冪等性は既存機構だけで閉じている**: stepKey dedup（速い経路）と
+      `ux_jobs_workflow_step_key`（全体一意・最後の砦）の二重防御。**processed 列は無し。**
+      handoff の競合 semantics は `runRepairFlow` と 1 つに揃えた —— 同一 Task が既に
+      successor を持つなら `already_started`（良性。人へ渡さない）、**別 Task が同じ key を
+      持つなら従来どおり escalate**（key は*この Task の*失敗 Job を名指すので lineage 破損）。
+
+      **fail-closed（generic executor へ fallback しない）**: source Job 不在 / 別 Task /
+      規約外 stepKey / 非 task review kind / workspace quarantine は既存
+      `escalateTaskToHuman()` で Task `blocked` へ収束する。park 済み Task は park を維持する。
+
+      **index は追加していない。** 既存 `ix_design_review_runs_status_started_at(status, started_at)`
+      の先頭列と等値条件が一致し、残り 2 条件は residual filter で足りる。件数は Task あたりの
+      review 回数オーダーで、poll は 5s に 1 query。**先回りの最適化はしない。**
+
+      **U3 に着手するときの制約**: 今回の read を U3 都合で一般化していない
+      （`error IS NULL` を条件に含めた専用 read のままにした）。U3 では read を 1 本足すか
+      条件を緩めるかを、その時点で改めて判断する。
+
 ---
 
 *Updated: 2026-09-25*
