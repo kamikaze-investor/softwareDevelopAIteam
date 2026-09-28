@@ -59,9 +59,13 @@ CEO 決定が除外した相手が実際に居る（独立レビュー round 4�
 したがって**ローカルで Human Recovery を試すときも split credential を設定する**こと:
 
 ```bash
-export ADMIN_TOKEN_SHA256=$(printf %s "$ADMIN_TOKEN" | sha256sum | cut -d' ' -f1)
-export WORKER_TOKEN_SHA256=$(printf %s "$WORKER_TOKEN" | sha256sum | cut -d' ' -f1)
+# `:?` は変数が未設定・空なら停止する（空文字を hash しない）
+export ADMIN_TOKEN_SHA256=$(printf %s "${ADMIN_TOKEN:?ADMIN_TOKEN is empty}" | sha256sum | cut -d' ' -f1)
+export WORKER_TOKEN_SHA256=$(printf %s "${WORKER_TOKEN:?WORKER_TOKEN is empty}" | sha256sum | cut -d' ' -f1)
 ```
+
+空文字から作った hash（`e3b0c442…b855`）を設定してしまった場合、API は起動後すべての
+request を 503 で拒否する（`apiTokenAuth()` の fail-closed 検査。`auth-empty-token-hash-accepted`）。
 
 **legacy auth 全体は変えていない。** 拒否されるのは `HUMAN_ONLY_ROUTES` に載る route だけで、
 他の route は認証なし構成でも従来どおり素通しである。
