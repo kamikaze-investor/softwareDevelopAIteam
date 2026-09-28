@@ -207,6 +207,19 @@ describe('POST /api/context-pack — 読み取り範囲の制限', () => {
     expect(res.body).not.toContain(ENV_SECRET)
   })
 
+  it('allowedPaths は 50 件まで（同じ木を何度も辿らせない）', async () => {
+    expect((await post(workspace, Array.from({ length: 51 }, () => 'src'))).status).toBe(400)
+    expect((await post(workspace, Array.from({ length: 50 }, () => 'src'))).status).toBe(201)
+  })
+
+  it('上限ちょうどのファイルは読め、上限を超えるファイルは読まない', async () => {
+    writeFileSync(path.join(workspace, 'src', 'max.ts'), 'a'.repeat(50_000))
+    writeFileSync(path.join(workspace, 'src', 'over.ts'), 'b'.repeat(50_001))
+    const files = JSON.parse((await post(workspace, ['src'])).body).pack.relevantFiles
+    expect(files.map((f: { relativePath: string }) => f.relativePath)).toEqual(['src/max.ts', 'src/ok.ts'])
+    expect(files[0].content).toHaveLength(50_000)
+  })
+
   it('不正入力（NUL・空白だけ・相対 root）は fail closed', async () => {
     expect((await post(`${workspace}\0`, ['src'])).status).toBe(400)
     expect((await post('   ', ['src'])).status).toBe(400)

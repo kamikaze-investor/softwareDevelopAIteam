@@ -14,7 +14,7 @@
  *   - 実行時の制約（変更禁止パスなど）
  */
 
-import { closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readdirSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { Task } from '@ai-team/shared'
@@ -146,9 +146,23 @@ function readContainedFile(realRoot: string, candidate: string): { relativePath:
   let fd: number | undefined
   try {
     fd = openSync(real, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0))
+    // O_NOFOLLOW は最後の要素にしか効かない。確認後に途中のディレクトリを symlink へ差し替えられても
+    // 外を読まないよう、**実際に開いたもの**の場所を /proc/self/fd から確かめ直す。
+    // /proc が無い環境では確かめられないので読まない（fail closed）。
+    const opened = containedRealPath(realRoot, readlinkSync(`/proc/self/fd/${fd}`))
+    if (opened === undefined || opened !== real) return undefined
     const stat = fstatSync(fd)
     if (!stat.isFile() || stat.size > MAX_FILE_SIZE_BYTES || stat.nlink > 1) return undefined
-    return { relativePath, content: readFileSync(fd, 'utf-8') }
+    // 読み取り量も自分で上限を切る（読んでいる間に伸びたファイルで上限を超えない）。
+    const buffer = Buffer.alloc(MAX_FILE_SIZE_BYTES + 1)
+    let length = 0
+    while (length < buffer.length) {
+      const bytesRead = readSync(fd, buffer, length, buffer.length - length, null)
+      if (bytesRead === 0) break
+      length += bytesRead
+    }
+    if (length > MAX_FILE_SIZE_BYTES) return undefined
+    return { relativePath, content: buffer.subarray(0, length).toString('utf-8') }
   } catch {
     return undefined
   } finally {

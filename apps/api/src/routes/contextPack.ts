@@ -19,7 +19,8 @@ const TaskSummarySchema = z.object({
   assignee: z.enum(['cto_ai', 'context_manager', 'developer_ai', 'reviewer_ai', 'qa_ai']),
   dependencies: z.array(z.string()).default([]),
   acceptanceCriteria: z.array(z.string()).default([]),
-  allowedPaths: z.array(z.string()).default([]),
+  // 1 要求で同じ木を何度も辿らせない上限（context-pack security fix）。
+  allowedPaths: z.array(z.string()).max(50).default([]),
   estimatedComplexity: z.enum(['small', 'medium', 'large']),
 })
 
