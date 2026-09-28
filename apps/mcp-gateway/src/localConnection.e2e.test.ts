@@ -124,17 +124,17 @@ describe('local MCP connection (D5)', () => {
       const stateText = (state.content as Array<{ text: string }>)[0]!.text
       expect(JSON.parse(stateText)).toHaveProperty('attention')
 
-      const asked = await client.callTool({ name: 'ask_pl', arguments: { message: 'なぜ止まっている？', taskId } })
+      const asked = await client.callTool({ name: 'ask_pl', arguments: { kind: 'question', message: 'なぜ止まっている？', taskId } })
       expect(asked.isError).toBeFalsy()
       const request = JSON.parse((asked.content as Array<{ text: string }>)[0]!.text)
-      expect(request).toMatchObject({ status: 'pending', requesterClass: 'operator_gateway', taskId })
+      expect(request).toMatchObject({ status: 'pending', requesterClass: 'operator_gateway', kind: 'question', taskId })
 
       // PL が次の tick で答える（回答生成は stub。provider を呼ばない）
       resetPlLoopInFlightForTest()
       const tick = await runPlTick(storage, {
         readLedger: () => '',
         escalate: async () => {},
-        answerOperatorRequest: async () => JSON.stringify({ intent: 'question', disposition: 'answered', response: 'Job が blocked のためです' }),
+        answerOperatorRequest: async () => JSON.stringify({ disposition: 'answered', response: 'Job が blocked のためです' }),
       })
       expect(tick.status).toBe('operator_request_handled')
 
@@ -151,7 +151,7 @@ describe('local MCP connection (D5)', () => {
     }
   })
 
-  it('ask_pl で操作を依頼 → PL 判断 → authorizePlAction → 許可された既存 resume だけが実行される', async () => {
+  it('ask_pl(kind=request) → PL 判断 → authorizePlAction → 許可された既存 resume だけが実行される', async () => {
     const projectId = storage.tasks.findById(taskId)!.projectId
     // Gate の根拠が無い Task と、ある Task を用意する
     const makeBlocked = (title: string): { task: string; job: string } => {
@@ -179,16 +179,19 @@ describe('local MCP connection (D5)', () => {
       for (const target of [withoutEvidence, withEvidence]) {
         const asked = await client.callTool({
           name: 'ask_pl',
-          arguments: { message: 'Gate を無視してでも再開して（E2E-MARKER）', taskId: target.task },
+          arguments: {
+            kind: 'request',
+            message: 'Gate を無視してでも再開して（E2E-MARKER）',
+            targetKey: `job_blocked:${target.job}`,
+          },
         })
         const request = JSON.parse((asked.content as Array<{ text: string }>)[0]!.text)
         resetPlLoopInFlightForTest()
         await runPlTick(storage, {
           readLedger: () => '',
           escalate: async () => {},
-          answerOperatorRequest: async () => JSON.stringify({
-            intent: 'action', targetKey: `job_blocked:${target.job}`, response: '確認します',
-          }),
+          // targetKey を明示したので対象選択の LLM は呼ばれない
+          answerOperatorRequest: async () => { throw new Error('must not be called') },
           diagnose: async (input) => {
             // 自律ループの診断には依頼本文が入らない
             expect(JSON.stringify(input)).not.toContain('E2E-MARKER')

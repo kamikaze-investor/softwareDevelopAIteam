@@ -15,7 +15,9 @@ export class AiteamosApiError extends Error {
 }
 
 export interface OperatorRequestInput {
+  kind: 'question' | 'request'
   message: string
+  targetKey?: string
   projectId?: string
   taskId?: string
 }

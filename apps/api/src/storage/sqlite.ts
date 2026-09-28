@@ -4327,18 +4327,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const row = db.prepare('SELECT * FROM operator_requests WHERE id = ?').get(id) as any
       return row ? deserializeOperatorRequest(row) : undefined
     },
-    list({ status, limit }) {
-      const rows = (status === undefined
-        ? db.prepare('SELECT * FROM operator_requests ORDER BY created_at DESC, rowid DESC LIMIT ?').all(limit)
-        : db.prepare(
-            'SELECT * FROM operator_requests WHERE status = ? ORDER BY created_at DESC, rowid DESC LIMIT ?'
-          ).all(status, limit)) as any[]
+    list({ status, requesterClass, limit }) {
+      const conditions: string[] = []
+      const params: unknown[] = []
+      if (status !== undefined) { conditions.push('status = ?'); params.push(status) }
+      if (requesterClass !== undefined) { conditions.push('requester_class = ?'); params.push(requesterClass) }
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const rows = db.prepare(
+        `SELECT * FROM operator_requests ${where} ORDER BY created_at DESC, rowid DESC LIMIT ?`
+      ).all(...params, limit) as any[]
       return rows.map(deserializeOperatorRequest)
     },
-    countPending() {
-      const row = db.prepare(
-        "SELECT COUNT(*) AS c FROM operator_requests WHERE status = 'pending'"
-      ).get() as { c: number }
+    countPending(requesterClass) {
+      const row = (requesterClass === undefined
+        ? db.prepare("SELECT COUNT(*) AS c FROM operator_requests WHERE status = 'pending'").get()
+        : db.prepare(
+            "SELECT COUNT(*) AS c FROM operator_requests WHERE status = 'pending' AND requester_class = ?"
+          ).get(requesterClass)) as { c: number }
       return row.c
     },
     findOldestPending() {
@@ -4351,7 +4356,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const request: OperatorRequest = {
         id: randomUUID(),
         requesterClass: data.requesterClass,
+        kind: data.kind,
         message: data.message,
+        ...(data.targetKey !== undefined ? { targetKey: data.targetKey } : {}),
         ...(data.projectId !== undefined ? { projectId: data.projectId } : {}),
         ...(data.taskId !== undefined ? { taskId: data.taskId } : {}),
         status: 'pending',
@@ -4359,12 +4366,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       }
       db.prepare(`
         INSERT INTO operator_requests
-          (id, requester_class, message, project_id, task_id, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?)
+          (id, requester_class, kind, message, target_key, project_id, task_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
       `).run(
         request.id,
         request.requesterClass,
+        request.kind,
         request.message,
+        request.targetKey ?? null,
         request.projectId ?? null,
         request.taskId ?? null,
         request.createdAt,
@@ -5526,7 +5535,9 @@ function deserializeOperatorRequest(row: any): OperatorRequest {
   return {
     id: row.id,
     requesterClass: row.requester_class as OperatorRequest['requesterClass'],
+    kind: row.kind as OperatorRequest['kind'],
     message: row.message,
+    targetKey: row.target_key ?? undefined,
     projectId: row.project_id ?? undefined,
     taskId: row.task_id ?? undefined,
     status: row.status as OperatorRequest['status'],

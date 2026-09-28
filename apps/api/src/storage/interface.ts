@@ -7,7 +7,7 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, OperatorRequestPlAction, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, OperatorRequestPlAction, OperatorRequestRequesterClass, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
@@ -1170,11 +1170,12 @@ export interface ITaskContinuationStorage {
 export interface IOperatorRequestStorage {
   findById(id: string): OperatorRequest | undefined
   /** 新しい順。`status` 指定時はその状態のみ。 */
-  list(filter: { status?: OperatorRequestStatus; limit: number }): OperatorRequest[]
-  countPending(): number
+  list(filter: { status?: OperatorRequestStatus; requesterClass?: OperatorRequestRequesterClass; limit: number }): OperatorRequest[]
+  /** pending の件数。`requesterClass` 指定時はその依頼元の分だけ。 */
+  countPending(requesterClass?: OperatorRequestRequesterClass): number
   /** PL が次に処理する依頼（最古の pending）。 */
   findOldestPending(): OperatorRequest | undefined
-  create(data: Pick<OperatorRequest, 'requesterClass' | 'message' | 'projectId' | 'taskId'>): OperatorRequest
+  create(data: Pick<OperatorRequest, 'requesterClass' | 'kind' | 'message' | 'targetKey' | 'projectId' | 'taskId'>): OperatorRequest
   /**
    * pending の依頼を終端させる。**pending でなければ何もせず undefined**（二重回答しない）。
    */

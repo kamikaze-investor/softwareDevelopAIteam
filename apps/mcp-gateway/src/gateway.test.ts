@@ -83,9 +83,10 @@ describe('createAiteamosClient', () => {
 
   it('ask_pl は POST /api/operator-requests だけ', async () => {
     const { client, calls } = recordingClient(201)
-    await client.createOperatorRequest({ message: 'hi', taskId: 't' })
+    await client.createOperatorRequest({ kind: 'request', message: 'hi', taskId: 't' })
     expect(calls).toEqual([expect.objectContaining({
-      url: 'http://api.local/api/operator-requests', method: 'POST', body: JSON.stringify({ message: 'hi', taskId: 't' }),
+      url: 'http://api.local/api/operator-requests', method: 'POST',
+      body: JSON.stringify({ kind: 'request', message: 'hi', taskId: 't' }),
     })])
   })
 
@@ -111,6 +112,18 @@ describe('MCP tools', () => {
     const writable = tools.filter((t) => t.annotations?.readOnlyHint !== true).map((t) => t.name)
     expect(writable).toEqual(['ask_pl'])
     expect(tools.every((t) => t.annotations?.destructiveHint === false)).toBe(true)
+
+    // ask_pl: kind は必須（question / request のみ）。action の種類を渡す引数は無い
+    const askPl = tools.find((t) => t.name === 'ask_pl')!
+    expect(askPl.inputSchema.required).toEqual(expect.arrayContaining(['kind', 'message']))
+    expect(Object.keys(askPl.inputSchema.properties ?? {}).sort())
+      .toEqual(['kind', 'message', 'projectId', 'targetKey', 'taskId'])
+    const missingKind = await client.callTool({ name: 'ask_pl', arguments: { message: 'x' } })
+    expect(missingKind.isError).toBe(true)
+
+    // id は英数字・-・_ だけ（`..` で API の別 path を指させない）
+    const traversal = await client.callTool({ name: 'get_task', arguments: { taskId: '..' } })
+    expect(traversal.isError).toBe(true)
     await client.close()
   })
 })

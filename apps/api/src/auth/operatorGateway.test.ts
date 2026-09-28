@@ -78,6 +78,8 @@ const SECRETS = [
   'STDOUT-SECRET-111', 'STDERR-SECRET-222', 'PROMPT-SECRET-333', '/home/ceo/.ssh', 'QA-DETAILS-SECRET',
   // 1行目が構造化行でない stderr は、`/api/state` の attention.detail に末尾がそのまま入る
   'UNSTRUCTURED-STDERR-SECRET-444',
+  // Design Review runner の stderr は run.error に入り、state / attention / task 詳細へ流れる
+  'RUNNER-STDERR-SECRET-555',
 ]
 
 const ENV_KEYS = [
@@ -170,6 +172,17 @@ describe('OPERATOR_GATEWAY authority boundary', () => {
     storage.jobs.update(failed.id, { stderr: `npm ERR! auth token=${SECRETS[5]}` })
     // 前提: 既存の /api/state 実体では生の末尾が detail に入っている（ここが崩れたら検査が空振りする）
     expect(JSON.stringify(buildSystemState(storage).attention)).toContain(SECRETS[5])
+    // 現在 Task の Design Review が runner の stderr 付きで failed になった状態
+    const run = storage.designReviewRuns.create({
+      taskId, taskTitle: 'design', designText: 'd', designTextHash: 'h', changedFiles: ['docs/a.md'],
+    })
+    const claim = storage.designReviewRuns.claim(run.id, 3)
+    expect(claim.claimToken).toBeDefined()
+    storage.designReviewRuns.complete(
+      run.id, claim.claimToken!, 'failed', undefined,
+      `runner exited with code 1: proxy https://user:${SECRETS[6]}@proxy.local | runner stderr: ${SECRETS[6]}`,
+    )
+    expect(JSON.stringify(buildSystemState(storage))).toContain(SECRETS[6])
     storage.qaResults.create({
       taskId, jobId: job.id, type: 'unit_test', status: 'failed', summary: 's', details: SECRETS[4],
     } as never)
@@ -275,7 +288,7 @@ describe('OPERATOR_GATEWAY authority boundary', () => {
     setSplitEnv()
     const res = await app.inject({
       method: 'POST', url: '/api/operator-requests', headers: bearer(OPERATOR_TOKEN),
-      payload: { message: 'なぜ止まっている？', taskId },
+      payload: { kind: 'question', message: 'なぜ止まっている？', taskId },
     })
     expect(res.statusCode).toBe(201)
     expect(JSON.parse(res.body)).toMatchObject({ requesterClass: 'operator_gateway', status: 'pending' })

@@ -34,6 +34,19 @@ function defined<T extends Record<string, unknown>>(obj: T): T {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as T
 }
 
+/**
+ * Design Review run の error を外へ出してよい形にする。
+ *
+ * run の error は `runner exited with code N: <stderr>` や `... | runner stderr: <tail>` の形で
+ * **runner（provider CLI）の stderr をそのまま含む**（`designReviewCoordinator.ts`）。
+ * 先頭の分類部分（最初の `:` / ` | ` より前）だけを残す。例: `runner timed out after 120000ms`。
+ */
+export function safeRunError(error: string | undefined): string | undefined {
+  if (error === undefined) return undefined
+  const head = error.split(' | ')[0]!.split(':')[0]!.trim()
+  return head === '' ? undefined : capText(head, 120)
+}
+
 /** Job の出力から detail を作る attention。 */
 const JOB_OUTPUT_ATTENTION_KINDS: ReadonlySet<AttentionItem['kind']> = new Set(['job_blocked', 'job_failed'])
 
@@ -47,6 +60,16 @@ const JOB_OUTPUT_ATTENTION_KINDS: ReadonlySet<AttentionItem['kind']> = new Set([
 export function safeAttentionDetail(item: AttentionItem): string | undefined {
   if (JOB_OUTPUT_ATTENTION_KINDS.has(item.kind) && !item.detail.trimStart().startsWith('[jobRunner] ')) {
     return 'job output withheld (not a structured [jobRunner] line); see the job status and failure kind'
+  }
+  // Design Review の detail は run.error（runner stderr を含みうる）を埋め込むので、その部分だけ削る。
+  if (item.kind === 'design_review_failed') {
+    const [head, ...rest] = item.detail.split(': ')
+    const error = safeRunError(rest.join(': ') || undefined)
+    return capText(error !== undefined ? `${head}: ${error}` : head)
+  }
+  if (item.kind === 'design_review_idle') {
+    return capText(item.detail.replace(/last error: [\s\S]*\)$/, (match) =>
+      `last error: ${safeRunError(match.slice('last error: '.length, -1)) ?? 'withheld'})`))
   }
   return capText(item.detail)
 }
@@ -118,7 +141,7 @@ export function projectProjectState(project: ProjectStateSummary): Record<string
       ? defined({
           status: project.designReview.status,
           attemptCount: project.designReview.attemptCount,
-          error: capText(project.designReview.error),
+          error: safeRunError(project.designReview.error),
           idle: project.designReview.idle,
         })
       : undefined,
@@ -303,6 +326,6 @@ export function projectLatestDesignReview(
     attemptCount: review.attemptCount,
     decision: review.decision,
     summary: capText(review.summary),
-    error: capText(review.error),
+    error: safeRunError(review.error),
   })
 }

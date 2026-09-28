@@ -394,7 +394,9 @@ export const CREATE_TABLES = `
   CREATE TABLE IF NOT EXISTS operator_requests (
     id TEXT PRIMARY KEY,
     requester_class TEXT NOT NULL CHECK (requester_class IN ('operator_gateway', 'admin', 'legacy', 'unauthenticated')),
+    kind TEXT NOT NULL CHECK (kind IN ('question', 'request')),
     message TEXT NOT NULL,
+    target_key TEXT,
     project_id TEXT,
     task_id TEXT,
     status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'failed')),

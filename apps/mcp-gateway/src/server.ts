@@ -72,7 +72,10 @@ export function createGatewayServer(config: GatewayConfig, client: AiteamosClien
         enableJsonResponse: true,
         // loopback で動かすときは DNS rebinding を防ぐ（ブラウザ経由の localhost 攻撃）。
         ...(loopback
-          ? { enableDnsRebindingProtection: true, allowedHosts: [`127.0.0.1:${config.port}`, `localhost:${config.port}`] }
+          ? {
+              enableDnsRebindingProtection: true,
+              allowedHosts: [`127.0.0.1:${config.port}`, `localhost:${config.port}`, `[::1]:${config.port}`],
+            }
           : {}),
       })
       res.on('close', () => {

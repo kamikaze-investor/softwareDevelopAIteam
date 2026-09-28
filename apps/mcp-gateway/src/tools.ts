@@ -7,8 +7,9 @@ import { AiteamosApiError, type AiteamosClient } from './aiteamosClient.js'
  *
  * - safe read（projection 済み）: get_system_state / get_project / list_tasks / get_task /
  *   get_pl_triage_summary
- * - PL への依頼: ask_pl（Operator Request の作成。gateway は保存を依頼するだけ。実行の可否は
- *   AIteamOS 側で PL の通常判断と既存 Gate が決める）
+ * - PL への依頼: ask_pl（Operator Request の作成。`kind: question | request` を caller が明示する。
+ *   gateway は保存を依頼するだけで、実行の可否は AIteamOS 側で PL の通常判断と既存 Gate が決める。
+ *   action の種類を指定する引数は無い）
  * - 依頼の結果: get_operator_request / list_operator_requests
  *
  * resume / approve / retry / quarantine 解除 / commit / PL tick 等の tool は**作らない**。
@@ -43,7 +44,10 @@ async function run(action: () => Promise<unknown>): Promise<ToolResult> {
   }
 }
 
-const id = z.string().min(1).max(200)
+/** id は英数字・`-`・`_` だけ（`..` 等で API の別 path を指させない）。 */
+const id = z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/)
+/** attention の同一性キー（`<kind>:<subject>`）。形式だけ見る。実在の確認は AIteamOS 側が行う。 */
+const targetKey = z.string().min(3).max(200).regex(/^[a-z_]+:[A-Za-z0-9_:-]+$/)
 
 export function buildMcpServer(client: AiteamosClient): McpServer {
   const server = new McpServer({ name: 'aiteamos-operator-gateway', version: '0.1.0' })
@@ -90,16 +94,20 @@ export function buildMcpServer(client: AiteamosClient): McpServer {
   }, async () => run(() => client.getPlTriageSummary()))
 
   server.registerTool('ask_pl', {
-    title: 'Ask the PL',
+    title: 'Ask the PL (question or request)',
     description:
-      'Send a natural-language request or question to the AIteamOS Project Lead (PL). Calling this only records ' +
-      'the request. On its next cycle the PL answers it; if the request asks for an action on a stalled item, ' +
-      'the PL runs its normal decision for that item, and only an existing action that the mandatory gates allow ' +
-      'is executed. The request text is never used as authorization, and nothing outside the PL\'s existing ' +
-      'authority (approvals, CEO approvals, quarantine release, commits, deploys) can happen. Poll ' +
-      'get_operator_request with the returned id for the answer and the recorded outcome (plAction).',
+      'Send a question or a request to the AIteamOS Project Lead (PL). Set kind explicitly: ' +
+      '"question" = the PL investigates and answers; nothing is executed. ' +
+      '"request" = the PL may also act: it picks the target (use targetKey from get_system_state attention ' +
+      'items when you know it), makes its own normal decision about what to do, and only an existing action ' +
+      'that the mandatory gates allow is executed. You cannot choose the action, and the request text is never ' +
+      'used as authorization; approvals, CEO approvals, quarantine release, commits and deploys never happen ' +
+      'this way. Calling this only records the request. Poll get_operator_request with the returned id for the ' +
+      'answer and the recorded outcome (plAction).',
     inputSchema: {
+      kind: z.enum(['question', 'request']),
       message: z.string().min(1).max(2000),
+      targetKey: targetKey.optional(),
       projectId: id.optional(),
       taskId: id.optional(),
     },

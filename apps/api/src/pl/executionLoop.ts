@@ -316,6 +316,9 @@ export interface PlLoopDeps {
  */
 let inFlight = false
 
+/** 直前の tick が Operator Request を処理したか（自律ループとの交互実行に使う）。 */
+let lastTickHandledOperatorRequest = false
+
 /**
  * PL が「実行」ではなく「人へ伝える」だけを行う attention。
  *
@@ -1241,14 +1244,15 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
 
     // ── Operator Request（外部からの依頼）──────────────────────────
     //
-    // 1 tick 1 件の原則に従い、依頼を処理した tick はここで終える。pending は
-    // `OPERATOR_REQUEST_MAX_PENDING` 件に制限されているので、attention の処理が遅れるのは
-    // 最大でもその tick 数だけである。
+    // 1 tick 1 件の原則に従い、依頼を処理した tick はここで終える。
+    // **直前の tick が依頼を処理していたら、この tick は依頼を処理せず自律処理に回す。**
+    // 依頼が途切れなく届いても、自律ループ（attention 処理・採用）が少なくとも2 tick に1回は
+    // 走ることを保証する（外部入力で自律ループを止めさせない。独立レビュー指摘）。
     //
     // 依頼が操作を求めていれば、対象を1つ特定して**下の自律処理と同じ `handleTarget()`** を走らせる。
     // 選択条件（`isActionableNow()`）・Triage・試行上限・診断・`authorizePlAction()`・executor は
     // すべて自律 tick と同一で、依頼本文はそのどこにも入らない（渡るのは対象キーだけ）。
-    const operatorRequest = await runOperatorRequestStep(storage, {
+    const operatorRequest = lastTickHandledOperatorRequest ? undefined : await runOperatorRequestStep(storage, {
       ...(deps.answerOperatorRequest ? { answer: deps.answerOperatorRequest } : {}),
       escalate: deps.escalate ?? defaultEscalate,
       describePlLoopStatus: (target) => describePlLoopStatus(storage, target),
@@ -1256,6 +1260,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       actOnTarget: (targetKey) => actOnOperatorTarget(storage, deps, targetKey),
       ...(deps.now ? { now: deps.now } : {}),
     })
+    lastTickHandledOperatorRequest = operatorRequest !== undefined
     if (operatorRequest) {
       return {
         status: 'operator_request_handled',
@@ -1747,4 +1752,5 @@ async function handOffOrEscalate(
 /** テスト用。モジュールスコープの単一実行ガードを戻す。 */
 export function resetPlLoopInFlightForTest(): void {
   inFlight = false
+  lastTickHandledOperatorRequest = false
 }
