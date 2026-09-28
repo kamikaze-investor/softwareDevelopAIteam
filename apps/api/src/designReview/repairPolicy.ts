@@ -19,6 +19,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import type { Job } from '@ai-team/shared'
 
 /** 同一Taskで自動生成を許すrepair Jobの上限（hard bound）。 */
 export const MAX_REPAIR_ATTEMPTS = 3
@@ -212,6 +213,103 @@ export function parseResumeSource(stepKey: string): string | undefined {
   const match = /^resume:(.+):\d+$/.exec(stepKey)
   const source = match?.[1]
   return source !== undefined && source.length > 0 ? source : undefined
+}
+
+export type ReviewedImplementation =
+  | { ok: true, reviewJob: Job, implementJob: Job }
+  | { ok: false, reason: string }
+
+/**
+ * lineage walk が読むのは Job の 2 つの read だけ。policy を storage 実装へ依存させない境界。
+ * `IStorage['jobs']` はそのまま満たす。
+ */
+export interface ReviewLineageJobReader {
+  findById(id: string): Job | undefined
+  findByTaskId(taskId: string): readonly Job[]
+}
+
+/**
+ * **review Job から、それがレビューした implement Job を保存済み行だけで引く。**
+ *
+ * **review → implement の traversal はここが唯一の実装である。** Stage 2（D1）、repair admission（D3）、
+ * approved review の git_commit continuation と CEO REJECT 後の provenance（D4）が共用する。
+ *
+ * ```
+ * [0..n 段] resume:<reviewJobId>:1   … Human Resume が review を再実行した形
+ *   → review      implement:<implementJobId>:review
+ *   → implement   (aiCliMode = 'implement')
+ * ```
+ *
+ * ## なぜ resume を辿るのか（2026-09-28 production 実測）
+ *
+ * `resumeBlockedTask()` は **最新 Job をそのまま複製する**。最新 Job が失敗した review なら
+ * resume Job も review（`resume:<元review>:1`）になる。Stage 2 はこれまで
+ * `implement:<id>:review` の形しか受け付けなかったため、その review が `changes_requested`
+ * を返しても **repair も escalation もログも無く**終わっていた（Task `9fdee5a3`、
+ * review `12c5287f`）。Human Resume のたびに 1 段増えるので、段数は固定しない。
+ *
+ * ## 何をしないか
+ *
+ * - **探索しない。** 各段でキーが名指ししている 1 件だけを読む。候補集合も「最新 Job」も使わない
+ * - **prompt や本文から元 Job を推測しない**
+ * - **review 以外の段を跨がない。** resume の各段は同じ Task / Project の review Job でなければ
+ *   ならず、途中で implement / git_commit 等に当たったら不成立（fail-closed）
+ * - 循環・同じ Job の再訪・Task の Job 数を超える段数は不成立
+ *
+ * authority（Human / AI の resume か）はここでは判定しない。repair の予算と権限は、
+ * 返した implement Job の lineage を既存 `walkRepairGeneration()` が決める（変更しない）。
+ * review の再実行は verdict を作り直すだけで、repair generation を作らないためである。
+ */
+export function resolveReviewedImplementationFrom(
+  jobs: ReviewLineageJobReader,
+  reviewJobId: string,
+): ReviewedImplementation {
+  const reviewJob = jobs.findById(reviewJobId)
+  if (!reviewJob) return { ok: false, reason: `review job ${reviewJobId} is not a stored job` }
+  if (reviewJob.aiCliMode !== 'review') {
+    return { ok: false, reason: `job ${reviewJob.id} is ${reviewJob.aiCliMode ?? 'not an AI CLI job'}, not review` }
+  }
+  const sameOwner = (job: Job): boolean =>
+    job.taskId === reviewJob.taskId && job.projectId === reviewJob.projectId
+
+  // resume の段を、キーが名指す 1 件ずつ遡る。上限は同じ Task の Job 数（それ以上は必ず再訪）。
+  const maxHops = jobs.findByTaskId(reviewJob.taskId).length
+  const visited = new Set<string>([reviewJob.id])
+  let anchor = reviewJob
+  for (;;) {
+    const sourceId = parseResumeSource(anchor.workflowStepKey ?? '')
+    if (sourceId === undefined) break
+    if (visited.has(sourceId) || visited.size > maxHops) {
+      return { ok: false, reason: `resume lineage of review ${reviewJob.id} does not terminate` }
+    }
+    const source = jobs.findById(sourceId)
+    if (!source) return { ok: false, reason: `resume source job ${sourceId} not found` }
+    if (!sameOwner(source)) {
+      return { ok: false, reason: `resume source job ${sourceId} belongs to a different task or project` }
+    }
+    if (source.aiCliMode !== 'review') {
+      return { ok: false, reason: `resume source job ${sourceId} is ${source.aiCliMode ?? 'not an AI CLI job'}, not review` }
+    }
+    visited.add(sourceId)
+    anchor = source
+  }
+
+  const implementRef = /^implement:([^:]+):review$/.exec(anchor.workflowStepKey ?? '')
+  if (!implementRef) {
+    return {
+      ok: false,
+      reason: `review job ${anchor.id} workflowStepKey is not implement:<id>:review (got ${anchor.workflowStepKey ?? 'none'})`,
+    }
+  }
+  const implementJob = jobs.findById(implementRef[1] as string)
+  if (!implementJob) return { ok: false, reason: `implement job ${implementRef[1]} not found` }
+  if (!sameOwner(implementJob)) {
+    return { ok: false, reason: 'implement job belongs to a different task or project' }
+  }
+  if (implementJob.aiCliMode !== 'implement') {
+    return { ok: false, reason: `job ${implementJob.id} is ${implementJob.aiCliMode ?? 'not an AI CLI job'}, not implement` }
+  }
+  return { ok: true, reviewJob, implementJob }
 }
 
 /**

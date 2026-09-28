@@ -31,6 +31,7 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
+import { resolveReviewedImplementationFrom } from '../designReview/repairPolicy'
 // 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
 // 型以外に storage へ依存しないモジュールなので循環しない。
 import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
@@ -1445,6 +1446,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * ```
    * [任意] resume:<sourceJobId>:1        … 1段だけ正規化する
    *   → git_commit  review:<reviewJobId>:git-commit
+   *   → [0..n 段] review resume:<reviewJobId>:1   … Human Resume で再実行された review（D4）
    *   → review      implement:<implementJobId>:review
    *   → implement   (aiCliMode = 'implement')
    * ```
@@ -1452,8 +1454,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **7条件をすべて満たすときだけ返す。1つでも欠ければ fail-closed**（CEO 判断・2026-09-23）。
    * 同一 diff を再承認へ回さないことのほうが、自動復旧できることより優先される。
    *
+   * **2 つの区間を混ぜない。** git_commit 側（1.〜4.）は従来どおり `resume:` を最大 1 ホップだけ
+   * 正規化する。そこで得た review Job から implement までの区間だけ、D1 と共用の
+   * `resolveReviewedImplementationFrom()`（review Job だけを経由する bounded / cycle-safe な walk。
+   * CEO 承認・2026-09-28）を使う。下の禁止事項は git_commit 側についてのものである。
+   *
    * **やってはいけないこと（意図的に実装していない）**:
-   * - 2段以上の `resume:` traversal（1ホップ正規化した先は `review:...:git-commit` しか許さない）
+   * - git_commit 側の 2段以上の `resume:` traversal（1ホップ正規化した先は `review:...:git-commit` しか許さない）
    * - recursive ancestry resolver
    * - 「最新 implement Job」の推測
    * - 複数候補からの選択
@@ -1553,16 +1560,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       }
     }
 
-    // 5. `implement:<implementJobId>:review`
-    const implementRef = /^implement:([^:]+):review$/.exec(reviewJob.workflowStepKey ?? '')
-    if (!implementRef) {
-      return {
-        ok: false,
-        reason: `review job workflowStepKey is not implement:<id>:review (got ${reviewJob.workflowStepKey ?? 'none'})`,
-      }
-    }
-    const implementJob = jobs.findById(implementRef[1] as string)
-    if (!implementJob) return { ok: false, reason: `implement job ${implementRef[1]} not found` }
+    // 5. review → `implement:<implementJobId>:review` → implement。
+    //    Human Resume で再実行された review（D4 で approved なら git_commit を作るようになった）は
+    //    `resume:<review>:1` の段を review Job だけで遡る。walk は D1 / D3 と同じ唯一の実装で、
+    //    欠落・別 Task / Project・review 以外の段・循環はすべて不成立（fail-closed）。
+    //    ここで parser を複製すると、D4 の git_commit が REJECT された後だけ provenance が解けない
+    //    行き止まりになる。
+    const reviewed = resolveReviewedImplementationFrom(jobs, reviewJob.id)
+    if (!reviewed.ok) return { ok: false, reason: reviewed.reason }
+    const implementJob = reviewed.implementJob
     if (!sameOwner(implementJob)) {
       return { ok: false, reason: 'implement job belongs to a different task or project' }
     }

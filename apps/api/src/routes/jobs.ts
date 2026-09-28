@@ -667,10 +667,18 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       }
       return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
     }
+    // **Human Resume で再実行された review（`resume:<review>:1`）も同じ post-implement review である。**
+    // 以前は `implement:<id>:review` の形だけを見ていたため、approved でも git_commit が作られず、
+    // Task は blocked のまま latest Job = success になり、resume も recover もできない行き止まりになった
+    // （D4・2026-09-28 監査）。resume の形は保存済み lineage で元の実装まで辿れるときだけ認める
+    // （`resolveReviewedImplementation()`。辿れなければ従来どおり git_commit を作らない = fail-closed）。
     const isAutomaticReviewJob =
-      existing.workflowStepKey?.startsWith('implement:') === true &&
-      existing.workflowStepKey.endsWith(':review') &&
-      isReviewJob
+      isReviewJob && (
+        (existing.workflowStepKey?.startsWith('implement:') === true
+          && existing.workflowStepKey.endsWith(':review'))
+        || (existing.workflowStepKey?.startsWith('resume:') === true
+          && resolveReviewedImplementation(storage, existing.id).ok)
+      )
 
     if (reviewResult) {
       const approved = reviewResult.status === 'approved' && jobUpdate.status === 'success'
