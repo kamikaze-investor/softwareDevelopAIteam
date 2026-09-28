@@ -47,7 +47,7 @@ import { repairStepKeyFor } from './repairPolicy'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 
 export interface TerminalRepairSuccessorRecoverySummary {
-  /** 走査した候補 run の件数（`findAlignedRepairPurposeTerminal()` の返り値）。 */
+  /** 走査した候補 run の件数（`findTerminalRepairPurposeRuns()` の返り値）。 */
   scanned: number
   /** repair Job を新しく作れた件数。 */
   recovered: number
@@ -152,7 +152,7 @@ export function recoverTerminalRepairSuccessor(
 export function recoverTerminalRepairSuccessors(
   storage: IStorage,
 ): TerminalRepairSuccessorRecoverySummary {
-  const candidates = storage.designReviewRuns.findAlignedRepairPurposeTerminal()
+  const candidates = storage.designReviewRuns.findTerminalRepairPurposeRuns()
   const summary: TerminalRepairSuccessorRecoverySummary = {
     scanned: candidates.length,
     recovered: 0,

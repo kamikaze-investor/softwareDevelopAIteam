@@ -114,7 +114,7 @@ describe('U2: ALIGNED 終端した repair run の successor を回収する', ()
       // 前提: この時点で successor は無く、queued run としても拾えない。
       expect(repairJobsOf(storage, ids.taskId, stepKey)).toHaveLength(0)
       expect(storage.designReviewRuns.findQueued()).toHaveLength(0)
-      expect(storage.designReviewRuns.findAlignedRepairPurposeTerminal().map((r) => r.id)).toEqual([run.id])
+      expect(storage.designReviewRuns.findTerminalRepairPurposeRuns().map((r) => r.id)).toEqual([run.id])
 
       const summary = recoverTerminalRepairSuccessors(storage)
 
@@ -135,7 +135,7 @@ describe('U2: ALIGNED 終端した repair run の successor を回収する', ()
       const storage = createSQLiteStorage(':memory:')
       const { ids } = seedTerminalAlignedRepairRun(storage)
       const evidenceBefore = storage.designReviewEvidence.findByTaskId(ids.taskId).length
-      const runBefore = storage.designReviewRuns.findAlignedRepairPurposeTerminal()[0]!
+      const runBefore = storage.designReviewRuns.findTerminalRepairPurposeRuns()[0]!
 
       recoverTerminalRepairSuccessors(storage)
 
@@ -204,7 +204,7 @@ describe('U2: ALIGNED 終端した repair run の successor を回収する', ()
       )
 
       // **推測で repair 目的として扱わない。** query の段階で落ちる。
-      expect(storage.designReviewRuns.findAlignedRepairPurposeTerminal()).toHaveLength(0)
+      expect(storage.designReviewRuns.findTerminalRepairPurposeRuns()).toHaveLength(0)
       expect(recoverTerminalRepairSuccessors(storage))
         .toEqual({ scanned: 0, recovered: 0, skipped: 0, escalated: 0, failed: 0 })
       expect(storage.jobs.findByTaskId(ids.taskId)).toHaveLength(0)
@@ -305,8 +305,13 @@ describe('U2: ALIGNED 終端した repair run の successor を回収する', ()
       )).toBe(true)
       expect(storage.designReviewRuns.findById(created.id)?.error).toBe('not aligned')
 
-      expect(storage.designReviewRuns.findAlignedRepairPurposeTerminal()).toHaveLength(0)
-      expect(recoverTerminalRepairSuccessors(storage).scanned).toBe(0)
+      // **shared read には出る。** `error` の有無は「非 ALIGNED のうちどちらの形か」しか
+      // 表さないので、storage predicate では落とさない（2026-09-28 で `error IS NULL` を撤去）。
+      // U2 が回収しないのは、run 自身の判定が ALIGNED でないからである。
+      expect(storage.designReviewRuns.findTerminalRepairPurposeRuns().map((r) => r.id))
+        .toEqual([created.id])
+      const summary = recoverTerminalRepairSuccessors(storage)
+      expect(summary).toEqual({ scanned: 1, recovered: 0, skipped: 1, escalated: 0, failed: 0 })
       expect(repairJobsOf(storage, ids.taskId, preparation.stepKey)).toHaveLength(0)
     })
 
@@ -348,7 +353,7 @@ describe('U2: ALIGNED 終端した repair run の successor を回収する', ()
       expect(storage.designReviewEvidence.findByTaskId(ids.taskId)).toHaveLength(0)
 
       // query は **落とせない**（`error IS NULL` を満たしてしまう）。
-      expect(storage.designReviewRuns.findAlignedRepairPurposeTerminal().map((r) => r.id))
+      expect(storage.designReviewRuns.findTerminalRepairPurposeRuns().map((r) => r.id))
         .toEqual([run.id])
 
       // 回収されないのは run 自身の判定を計算し直しているからである。
