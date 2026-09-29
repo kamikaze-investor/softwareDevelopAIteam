@@ -1,7 +1,7 @@
 # Project Current State Map
 
 **作成日**: 2026-06-19
-**最終更新**: 2026-08-22
+**最終更新**: 2026-09-29
 **作成者**: Claude Code (CTO)
 **目的**: リポジトリの現状を一枚で把握するためのスナップショット
 
@@ -34,6 +34,33 @@ CEO（人間）
 AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間）はスマホから Web UI（未実装・将来候補）または Mobile app（`apps/mobile`, 実装済み）経由で操作する。ローカルPC起動は開発・検証用の一時形態であり、本番運用形態ではない。詳細な接続関係・後続タスクは正本を参照。
 
 ### Production Baseline（現在Productionで稼働しているcommit）
+
+**Production baseline SHA**: `fcfd732df6e83b2f52f34b5dd59a3ac1d757c42c`（2026-09-28 deploy）
+
+`d2aeaee` から2 commit（#297 `0ce7bff` 共通 Operator Interface・`operator_gateway` credential・
+MCP gateway のコード / #301 `fcfd732` context-pack の読み取り範囲制限）をverified SHA固定
+（`--ff-only`）で反映した。既存手順どおり preflight（running Job 0・in-flight review 0・
+API / Worker pending outbox 0）→ 既存 backup service で DB backup（`pre_deploy_*_d2aeaee.db` へ退避、
+sha 一致・`integrity_check: ok`）→ Worker → API の順で停止 → fast-forward → API 起動・検証 → Worker 起動。
+API / Worker / shared の `package.json` に変更が無いため `pnpm install` は行っていない
+（lockfile の差分は `apps/mcp-gateway` の依存だけで、gateway は Production で起動していない）。
+追加 migration は `operator_requests` table と index の新規作成のみ。**rollbackは不要だった**。
+
+**Production acceptance: PASS**: API / Worker とも active・起動 error 0、`/health` local / 外部とも 200、
+認証なしの `/api/projects`・`/api/state`・`/api/operator/state`・`/api/operator-requests` はすべて 401
+（503・auth 設定 error なし）、`operator_requests` table / index 作成・件数 0、projects / tasks / jobs 等の
+件数は deploy 前と同じで `quick_check: ok`、context-pack の新制約がコードに存在、Worker log の
+auth / 接続 error 0。**credential は変更していない**（split mode 維持、
+`ACTIONS_READONLY_TOKEN_SHA256` / `OPERATOR_GATEWAY_TOKEN_SHA256` は未設定＝外部 MCP 接続は無効）。
+rollback 先は `d2aeaee584abf473fe4783a3ce0c5c64fecf952e`。
+
+**未確認として残るもの（この deploy 分）**: Worker が deploy 後に実 Job を処理すること
+（deploy 時点で claim 可能な queued Job が無かったため。次の自然な Job で確認する。人工 Job は作らない）。
+
+**記録の欠落**: 下の `dff52cf`（2026-08-19）以降、`d2aeaee` までの Production deploy はこの節に
+記録されていない（運用記録は `docs/project_memory/decisions/` の各 E2E 記録に分散している）。
+
+### 以前のProduction Baseline（2026-08-19 deploy・履歴）
 
 **Production baseline SHA**: `dff52cffffc7cb9045e940b30bfa10e740906466`（2026-08-19 deploy）
 
