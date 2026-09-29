@@ -11,6 +11,33 @@ export const CHEAP_AI_CONFIG = {
   timeoutMs: 60_000,
 } as const
 
+/**
+ * timeout で止めた OpenCode が SIGTERM に応じないときに SIGKILL へ昇格させるまでの猶予。
+ * 猶予後は close を待たずに settle する（孫プロセスが stdout を掴んだままでも宙吊りにしない）。
+ * 値と止め方は Design Review runner（`designReviewCoordinator.ts` の `killTree`）と同じ。
+ */
+export const CHEAP_AI_KILL_GRACE_MS = 5_000
+
+/** bounded retry の2回目を始める前の待ち。固定値（判定ロジックは足さない）。 */
+export const CHEAP_AI_RETRY_BACKOFF_MS = 3_000
+
+/**
+ * **明らかな異常終了**だけを表す signal。AIteamOS が送っていないのにこれで終わったときだけ、
+ * `retryTransientOnce` の caller に限って1回だけ再試行する（OOM killer の SIGKILL・crash 等）。
+ *
+ * SIGTERM / SIGINT / SIGHUP / SIGQUIT は**意図的な停止**（systemd の stop は
+ * `KillMode=control-group` で子にも SIGTERM を送る）と区別できないので再試行しない。
+ * shutdown 中に新しい OpenCode を起動しないのはこの境界による。
+ */
+const ABNORMAL_TERMINATION_SIGNALS: ReadonlySet<string> = new Set([
+  'SIGKILL',
+  'SIGSEGV',
+  'SIGBUS',
+  'SIGILL',
+  'SIGFPE',
+  'SIGABRT',
+])
+
 // Previous raw transport endpoint, retained only as a rollback reference:
 // https://opencode.ai/zen/go/v1/chat/completions
 const OPENCODE_PROJECT_CONFIG = {
@@ -35,6 +62,25 @@ let isolationPromise: Promise<CheapAiIsolation> | undefined
 export interface CheapAiRequestOptions {
   apiKey?: string
   mockResponse?: string
+  /**
+   * PL の provider 推論（Operator Request の回答・対象選択、自律 PL の診断・採用・修正案）だけが
+   * true にする。1回目が **AIteamOS 自身の timeout** か **明らかな異常終了**で失敗したときに限り、
+   * 新しい OpenCode プロセスで1回だけ再試行する（3回目は無い）。
+   *
+   * 再試行するのは推論だけで、caller はどれも action 実行より前にこれを呼ぶ。
+   * 説明系（approvalAi / taskFailureAi）は HTTP の待ち時間を倍にしないため指定しない。
+   */
+  retryTransientOnce?: boolean
+}
+
+/** 1回の OpenCode 実行が失敗した種類。再試行してよいのは `timeout` と `abnormal_termination` だけ。 */
+export type CheapAiAttemptFailureKind = 'timeout' | 'abnormal_termination' | 'non_retryable'
+
+export class CheapAiAttemptError extends Error {
+  constructor(message: string, readonly kind: CheapAiAttemptFailureKind) {
+    super(message)
+    this.name = 'CheapAiAttemptError'
+  }
 }
 
 export function parseJsonObject(raw: string): unknown {
@@ -134,6 +180,18 @@ function parseOpenCodeOutput(stdout: string): string {
   return text
 }
 
+/**
+ * OpenCode を1回実行する。**timeout は spawn のオプションに任せず自前で持つ。**
+ *
+ * - AIteamOS が期限到達を観測して止めたことを `timedOutByUs` で保持する。signal 名だけでは
+ *   「自分で止めた」「外から止められた」「crash した」を区別できないため
+ *   （Worker adapter が containment の `timedOut` を唯一の真実にしているのと同じ考え方）。
+ * - 子を新しいプロセスグループのリーダーにして（`detached: true`）グループごと SIGTERM を送り、
+ *   猶予後も残っていれば SIGKILL へ昇格させ、close を待たずに settle する。
+ *   OpenCode は初回に大きな初期化を行うので、孫が生き残ると次の試行と同じ HOME を奪い合う。
+ * - 別グループにするので、**API 自体が落ちたときの子の回収は systemd の `KillMode=control-group` に依存する**
+ *   （Design Review runner と同じ前提。systemd 外で API だけを止めると子は残りうる）。
+ */
 async function runOpenCodeCli(
   system: string,
   userContent: string,
@@ -154,6 +212,7 @@ async function runOpenCodeCli(
     isolation.workingDirectory,
     prompt,
   ]
+  const timeoutMessage = `OpenCode CLI timed out after ${CHEAP_AI_CONFIG.timeoutMs}ms`
 
   return await new Promise<string>((resolvePromise, rejectPromise) => {
     const child = spawn(cliEntrypoint, args, {
@@ -161,11 +220,48 @@ async function runOpenCodeCli(
       env: buildSubprocessEnv(isolation.homeDirectory, apiKey),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: CHEAP_AI_CONFIG.timeoutMs,
+      detached: true,
       windowsHide: true,
     })
     let stdout = ''
     let stderr = ''
+    let timedOutByUs = false
+    let settled = false
+    let killTimer: NodeJS.Timeout | undefined
+
+    const killTree = (signal: NodeJS.Signals): void => {
+      const pid = child.pid
+      if (pid === undefined) return
+      try {
+        process.kill(-pid, signal)
+      } catch {
+        try {
+          child.kill(signal)
+        } catch {
+          // 既に終了している。
+        }
+      }
+    }
+
+    const settle = (outcome: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (killTimer) clearTimeout(killTimer)
+      outcome()
+    }
+    const fail = (message: string, kind: CheapAiAttemptFailureKind): void => {
+      settle(() => rejectPromise(new CheapAiAttemptError(message, kind)))
+    }
+
+    const timer = setTimeout(() => {
+      timedOutByUs = true
+      killTree('SIGTERM')
+      killTimer = setTimeout(() => {
+        killTree('SIGKILL')
+        fail(timeoutMessage, 'timeout')
+      }, CHEAP_AI_KILL_GRACE_MS)
+    }, CHEAP_AI_CONFIG.timeoutMs)
 
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
@@ -175,34 +271,58 @@ async function runOpenCodeCli(
     child.stderr.on('data', (chunk: string) => {
       stderr += chunk
     })
-    child.once('error', (error: Error) => {
+    // on（once ではない）: kill の fallback 等で2回目の error が来ても未処理にしない。settle が二重決着を防ぐ。
+    child.on('error', (error: Error) => {
       const detail = redactApiKey(error.message, apiKey)
-      rejectPromise(new Error(`OpenCode CLI failed to start: ${detail}`))
+      fail(`OpenCode CLI failed to start: ${detail}`, 'non_retryable')
     })
     child.once('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      // 自分で止めたものは、どう終わっても timeout として扱う（正常終了扱いにしない）。
+      // 先頭の子だけが SIGTERM で終わっても孫がグループに残りうるので、SIGKILL で掃いてから決着させる
+      // （残った孫が再試行と同じ隔離 HOME を奪い合わないように）。
+      if (timedOutByUs) {
+        killTree('SIGKILL')
+        fail(timeoutMessage, 'timeout')
+        return
+      }
       if (signal !== null) {
-        rejectPromise(new Error(`OpenCode CLI timed out after ${CHEAP_AI_CONFIG.timeoutMs}ms`))
+        if (ABNORMAL_TERMINATION_SIGNALS.has(signal)) {
+          killTree('SIGKILL')
+          fail(`OpenCode CLI terminated abnormally by signal ${signal}`, 'abnormal_termination')
+        } else {
+          fail(`OpenCode CLI was terminated by signal ${signal}`, 'non_retryable')
+        }
         return
       }
 
       const sanitizedStderr = redactApiKey(stderr.trim(), apiKey)
       if (code !== 0) {
         const detail = sanitizedStderr.length > 0 ? `: ${sanitizedStderr}` : ''
-        rejectPromise(new Error(`OpenCode CLI failed with exit code ${code ?? 'unknown'}${detail}`))
+        fail(`OpenCode CLI failed with exit code ${code ?? 'unknown'}${detail}`, 'non_retryable')
         return
       }
       if (sanitizedStderr.length > 0) {
-        rejectPromise(new Error(`OpenCode CLI wrote to stderr: ${sanitizedStderr}`))
+        fail(`OpenCode CLI wrote to stderr: ${sanitizedStderr}`, 'non_retryable')
         return
       }
 
       try {
-        resolvePromise(parseOpenCodeOutput(stdout))
+        const text = parseOpenCodeOutput(stdout)
+        settle(() => resolvePromise(text))
       } catch (error: unknown) {
-        rejectPromise(error)
+        const message = error instanceof Error ? error.message : String(error)
+        fail(message, 'non_retryable')
       }
     })
   })
+}
+
+function isRetryable(error: unknown): error is CheapAiAttemptError {
+  return error instanceof CheapAiAttemptError && error.kind !== 'non_retryable'
+}
+
+function attemptKindOf(error: unknown): CheapAiAttemptFailureKind {
+  return error instanceof CheapAiAttemptError ? error.kind : 'non_retryable'
 }
 
 export async function requestText(
@@ -220,5 +340,30 @@ export async function requestText(
     throw new Error('OPENCODE_GO_API_KEY is not configured')
   }
 
-  return await runOpenCodeCli(system, userContent, apiKey, maxTokens)
+  if (options.retryTransientOnce !== true) {
+    return await runOpenCodeCli(system, userContent, apiKey, maxTokens)
+  }
+
+  // bounded recovery: 最大2回。記録するのは試行番号と失敗の種類だけ
+  // （prompt・key・provider stderr はログにも audit にも新たに載せない）。
+  try {
+    return await runOpenCodeCli(system, userContent, apiKey, maxTokens)
+  } catch (firstError: unknown) {
+    if (!isRetryable(firstError)) throw firstError
+    console.warn(`[cheapAi] attempt 1/2 failed (${firstError.kind}); retrying once with a fresh OpenCode process`)
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, CHEAP_AI_RETRY_BACKOFF_MS))
+
+    try {
+      const text = await runOpenCodeCli(system, userContent, apiKey, maxTokens)
+      console.warn(`[cheapAi] attempt 2/2 succeeded (attempt 1: ${firstError.kind})`)
+      return text
+    } catch (secondError: unknown) {
+      console.warn(`[cheapAi] attempt 2/2 failed (${attemptKindOf(secondError)}; attempt 1: ${firstError.kind})`)
+      const message = secondError instanceof Error ? secondError.message : String(secondError)
+      throw new CheapAiAttemptError(
+        `${message} (attempt 2/2; attempt 1: ${firstError.kind})`,
+        attemptKindOf(secondError),
+      )
+    }
+  }
 }

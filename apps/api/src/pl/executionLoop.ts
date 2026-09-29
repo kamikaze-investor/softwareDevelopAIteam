@@ -1079,7 +1079,7 @@ async function defaultDiagnose(input: PlDiagnosisInput): Promise<string> {
     JSON.stringify(input.context, null, 2),
   ].join('\n')
 
-  return await requestText(DIAGNOSIS_SYSTEM, user, {}, PL_DIAGNOSIS_MAX_TOKENS)
+  return await requestText(DIAGNOSIS_SYSTEM, user, { retryTransientOnce: true }, PL_DIAGNOSIS_MAX_TOKENS)
 }
 
 async function defaultEscalate(payload: { title: string; body: string }): Promise<void> {
@@ -1619,7 +1619,7 @@ async function maybeAdoptNext(
   }
 
   const propose = deps.proposeAdoption
-    ?? ((system: string, user: string) => requestText(system, user, {}, PL_ADOPTION_MAX_TOKENS))
+    ?? ((system: string, user: string) => requestText(system, user, { retryTransientOnce: true }, PL_ADOPTION_MAX_TOKENS))
 
   let result: PlAdoptionResult
   try {

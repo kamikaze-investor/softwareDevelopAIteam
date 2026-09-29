@@ -10307,7 +10307,28 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       （CEO 判断・2026-09-29。Mobile から ADMIN を外す設計変更はしない）が、この画面が呼ぶのは
       `GET /api/operator/state` と `GET・POST /api/operator-requests` だけで、resume・approval 等の
       操作 API は呼ばない。前提の `PL_LOOP_ENABLED=true`（60s）は Production で read-only 確認済み。
-      **未実施**: EAS build と実端末への再インストール（master 着地後）、実機での質問・依頼の E2E。
+      **【2026-09-29 実機 E2E 完了・MVP 完成（CEO 判断）】** master `6102f6e` の preview build を実機へ
+      上書き install（既存 SecureStore の ADMIN token をそのまま使用）。Production（API `fcfd732`・
+      PL loop 60s）で question → PL 回答 → Mobile 表示、request → Gate 結果（disposition=declined・
+      plAction「実行: なし」）→ Mobile 表示の2経路が成立し、PL loop の処理を `audit_log` で確認した。
+      **ただし最初の question は `provider_failure`（`OpenCode CLI timed out after 60000ms`）**。API 再起動後の
+      最初の provider 呼び出しで、同じ API process の2回目以降（question 2件・request 3件）は成功した。
+      **timeout の調査（read-only・Production 14日分）**: provider timeout は16件（自律 PL の
+      `diagnosis_failed` 15件＋上記1件）。隔離 dir の作成時刻（= process ごとの初回呼び出し）と突き合わせると、
+      **cold start（初回の OpenCode 初期化。隔離 HOME へ約100〜160MB を書く）で説明できるのは1件だけ**で、
+      残り15件は同じ process の途中で束になって起きていた。**そのため cold start 専用の対策
+      （初回だけ timeout 延長・warm-up・隔離 HOME の永続化）は採らず、タイミングに依らない
+      bounded provider recovery を採用した**（CEO 判断 2026-09-29）: PL 系の provider 推論（Operator の回答・
+      対象選択、自律 PL の診断・採用・修正案）に限り、AIteamOS 自身の timeout か明らかな異常終了
+      （SIGKILL / SIGSEGV 等。SIGTERM / SIGINT 等の意図的停止は除く）のときだけ、新しい OpenCode process で
+      **1回だけ**再試行する（`apps/api/src/aiExplain/cheapAiClient.ts` の `retryTransientOnce`）。
+      あわせて timeout を spawn 任せにせず自前で持ち、プロセスグループへ SIGTERM → 猶予後 SIGKILL で必ず決着させる。
+      Gate・`authorizePlAction`・`PL_MAX_ATTEMPTS_PER_TARGET` は変えていない（再試行は1回の PL attempt の内部）。
+      説明系（approvalAi / taskFailureAi）は対象外。新しい常駐監視は作っていない。
+      代償として、PL 推論1回の最悪待ち時間は約133秒（60s + 猶予5s + 待ち3s + 60s + 猶予5s）に伸びる
+      （tick は既存の in-flight guard で重ならない。失敗時に Operator Request が `pending` のまま待つ時間も伸びる）。
+      **未確認**: 本修正の Production 反映と、反映後の自然な timeout に対する再試行の実観測
+      （API journal の `[cheapAi] attempt …` 行で確認できる）。
 
       **PL Console（下記 deferred 4件）との関係**: 別物である。PL Console は「ベンダー非依存の
       PL 指示 UI」（LibreChat 等の評価・Gateway・Provider Adapter を含む重量級）で、本項目は
