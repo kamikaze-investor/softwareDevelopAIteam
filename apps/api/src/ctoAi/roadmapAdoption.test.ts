@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow'
 import { adoptRoadmapItem, buildAdoptedDescription, extractItemDescription } from './roadmapAdoption'
 
 const LEDGER = [
@@ -40,6 +42,49 @@ function makeStorage(): { storage: IStorage; projectId: string } {
 const SPEC = {
   allowedPaths: ['apps/worker/scripts/roadmap'],
   acceptanceCriteria: ['roadmap:check が通る'],
+}
+
+const CONFLICT_RESULT_JSON = JSON.stringify({
+  focusedReviewResults: [
+    { focus: 'scope_simplicity', decision: 'CONFLICT', summary: 'scope conflict' },
+  ],
+  finalDecision: 'CONFLICT',
+})
+
+function createConflictedFollowUp(
+  storage: IStorage,
+  projectId: string,
+  input: { roadmapTaskKey: string; title?: string },
+): string {
+  const task = storage.tasks.create({
+    projectId,
+    title: input.title ?? 'CONFLICT した follow-up',
+    description: buildAdoptedDescription('ledger body', 'old scope'),
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+    allowedPaths: SPEC.allowedPaths,
+    acceptanceCriteria: SPEC.acceptanceCriteria,
+    roadmapTaskKey: input.roadmapTaskKey,
+    phase: 1,
+    roadmapActive: true,
+  } as Parameters<IStorage['tasks']['create']>[0])
+  const designText = buildInitialImplementAiCliPrompt(task)
+  const run = storage.designReviewRuns.create({
+    taskId: task.id,
+    taskTitle: task.title,
+    designText,
+    designTextHash: computeDesignTextHash(designText),
+    changedFiles: [],
+  })
+  const claimed = storage.designReviewRuns.claim(run.id, 3)
+  storage.designReviewRuns.complete(
+    run.id,
+    claimed.claimToken as string,
+    'succeeded',
+    CONFLICT_RESULT_JSON,
+  )
+  return task.id
 }
 
 function deps(ensure = vi.fn().mockResolvedValue([])) {
@@ -808,6 +853,68 @@ describe('adoptRoadmapItem — 重複実行の防止', () => {
     expect(storage.jobs.findByTaskId(first.taskId)).toHaveLength(1)
     // 新しく採用した1件が roadmapActive なので、再生成ゲートは引き続き閉じている。
     expect(storage.tasks.findByProjectId(projectId).some((t) => t.roadmapActive)).toBe(true)
+  })
+})
+
+describe('adoptRoadmapItem — CONFLICT follow-up の同一 identity 再採用', () => {
+  it('存在しない recovery Task id から新しい identity を作らない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SPEC,
+      implementationScope: 'revised scope',
+      recoveryTaskId: 'caller-chosen-new-identity',
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'SPEC_INVALID' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('同じ follow-up identity に Job があれば ALREADY_EXECUTED で拒否する', async () => {
+    const { storage, projectId } = makeStorage()
+    const taskId = createConflictedFollowUp(storage, projectId, { roadmapTaskKey: 'first-item#2' })
+    storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SPEC,
+      implementationScope: 'revised scope',
+      recoveryTaskId: taskId,
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ALREADY_EXECUTED' })
+    expect(storage.tasks.findById(taskId)?.roadmapTaskKey).toBe('first-item#2')
+  })
+
+  it('別 ledger item の Task id を指定しても、その identity を上書きしない', async () => {
+    const { storage, projectId } = makeStorage()
+    const otherTaskId = createConflictedFollowUp(storage, projectId, {
+      roadmapTaskKey: 'second-item#2',
+      title: '別項目の follow-up',
+    })
+    const before = storage.tasks.findById(otherTaskId)
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SPEC,
+      implementationScope: 'overwrite attempt',
+      recoveryTaskId: otherTaskId,
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'SPEC_INVALID' })
+    expect(storage.tasks.findById(otherTaskId)).toEqual(before)
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(1)
   })
 })
 

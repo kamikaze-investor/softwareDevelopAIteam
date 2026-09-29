@@ -44,6 +44,10 @@ import {
   occupiesProject,
 } from '@ai-team/shared'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapSyncPhaseInput } from '../storage/interface'
+import {
+  recomputeDecision,
+  type RawStrategicResult,
+} from '../designReview/designReviewCoordinator'
 import { validateRoadmapTasks, validateRoadmapPhases } from '../storage/roadmapTaskValidation'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
 
@@ -108,6 +112,14 @@ export interface AdoptRoadmapItemInput {
    * 「同一 Task identity の二重実行は禁止」への精緻化である。
    */
   followUp?: boolean
+  /**
+   * CONFLICT で止まった follow-up Task を、同じ identity のまま採用し直すときの Task id。
+   *
+   * caller は `roadmapTaskKey` を指定できない。サーバがこの id から既存 key を導出し、
+   * Project / base ledger id / Job 0件 / pending / 最新 CONFLICT をすべて検証する。
+   * 通常採用と新規 follow-up 採用では指定しないため、従来挙動には影響しない。
+   */
+  recoveryTaskId?: string
 }
 
 export interface AdoptRoadmapItemDeps {
@@ -389,23 +401,92 @@ export async function adoptRoadmapItem(
 
   // ── Task identity を決める ──────────────────────────────
   // 通常採用では taskKey === input.roadmapId であり、以降の判定は従来と完全に同一に働く。
-  // follow-up のときだけ別 identity を **サーバ側で** 発番する（caller は key を選べない）。
+  // 新規 follow-up は別 identity を **サーバ側で**発番し、CONFLICT recovery は検証済みの
+  // 既存 Task から identity を導出する。どちらも caller は key を選べない。
   const projectTasks = storage.tasks.findByProjectId(input.projectId)
+  const ledgerIds = new Set(items.map((candidate) => candidate.id))
 
   let taskKey = input.roadmapId
-  if (input.followUp === true) {
+  if (input.recoveryTaskId !== undefined) {
+    if (input.followUp === true) {
+      return {
+        ok: false,
+        code: 'SPEC_INVALID',
+        reason: 'recoveryTaskId and followUp cannot be requested together',
+      }
+    }
+
+    const recoveryTask = storage.tasks.findById(input.recoveryTaskId)
+    if (
+      !recoveryTask
+      || recoveryTask.projectId !== input.projectId
+      || !projectTasks.some((task) => task.id === recoveryTask.id)
+      || recoveryTask.roadmapTaskKey === undefined
+      || !isFollowUpTaskKey(recoveryTask.roadmapTaskKey, ledgerIds)
+      || getBaseRoadmapId(recoveryTask.roadmapTaskKey, ledgerIds) !== input.roadmapId
+    ) {
+      return {
+        ok: false,
+        code: 'SPEC_INVALID',
+        reason:
+          `Task ${input.recoveryTaskId} is not an existing follow-up Task for roadmap item`
+          + ` "${input.roadmapId}" in Project ${input.projectId}`,
+      }
+    }
+
+    // 同じ identity に Job 履歴があれば、修正版 spec と実行済み変更を混ぜない。
+    if (storage.jobs.findByTaskId(recoveryTask.id).length > 0) {
+      return {
+        ok: false,
+        code: 'ALREADY_EXECUTED',
+        reason: `task identity "${recoveryTask.roadmapTaskKey}" already has an executed Task (${recoveryTask.id})`,
+      }
+    }
+
+    const run = storage.designReviewRuns.findLatestByTaskId(recoveryTask.id)
+    const evidence = storage.designReviewEvidence.findLatestByTaskId(recoveryTask.id)
+    let recoveryDecision: string | undefined
+    try {
+      recoveryDecision = run?.resultJson === undefined
+        ? undefined
+        : recomputeDecision(
+          JSON.parse(run.resultJson) as RawStrategicResult,
+          'task',
+          run.changedFiles,
+        ).decision
+    } catch {
+      recoveryDecision = undefined
+    }
+    if (
+      recoveryTask.status !== 'pending'
+      || run?.reviewKind !== 'task'
+      || run.status !== 'succeeded'
+      || evidence?.designTextHash === run.designTextHash
+      || recoveryDecision !== 'CONFLICT'
+    ) {
+      return {
+        ok: false,
+        code: 'SPEC_INVALID',
+        reason:
+          `Task ${recoveryTask.id} is not the pending, unexecuted follow-up Task`
+          + ' currently stopped by a Design Review CONFLICT',
+      }
+    }
+
+    // identity は caller の入力ではなく、検証済みの既存 Task からだけ取得する。
+    taskKey = recoveryTask.roadmapTaskKey
+  } else if (input.followUp === true) {
     const eligibility = checkFollowUpEligibility(
       storage,
       input,
       projectTasks,
-      new Set(items.map((candidate) => candidate.id)),
+      ledgerIds,
       extractItemDescription(markdown, item),
     )
     if (!eligibility.ok) return eligibility.failure
 
     // 実在の ledger id 集合を渡し、`foo` と `foo#2` が両方 ledger に居るケースを取り違えない
     // （独立レビュー Finding 2）。
-    const ledgerIds = new Set(items.map((candidate) => candidate.id))
     const minted = createFollowUpTaskKey(
       input.roadmapId,
       projectTasks

@@ -104,7 +104,7 @@ afterAll(() => {
   rmSync(ledgerRoot, { recursive: true, force: true })
 })
 
-function seed(options: { resultJson?: string } = {}): {
+function seed(options: { resultJson?: string; roadmapTaskKey?: string } = {}): {
   storage: IStorage
   taskId: string
   designText: string
@@ -122,7 +122,7 @@ function seed(options: { resultJson?: string } = {}): {
     dependencies: [],
     allowedPaths: ['apps/api/src', 'packages/shared/src'],
     acceptanceCriteria: ['当初の受入条件'],
-    roadmapTaskKey: 'conflicted-item',
+    roadmapTaskKey: options.roadmapTaskKey ?? 'conflicted-item',
     phase: 1,
     roadmapActive: true,
   } as Parameters<IStorage['tasks']['create']>[0])
@@ -202,6 +202,25 @@ describe('selectConflictStage — 既存 state の observer', () => {
 })
 
 describe('Critic → 条件分岐', () => {
+  it('follow-up Task でも base ledger item の本文を Critic へ渡す', async () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'conflicted-item#2' })
+    let criticPrompt = ''
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          criticPrompt = (JSON.parse(raw) as { prompt: string }).prompt
+          return { ok: true, stdout: JSON.stringify(SUPPORTED_CRITIQUE), timedOut: false }
+        },
+      },
+    }) as never)
+
+    expect(result.failureCode).not.toBe('item_not_in_ledger')
+    expect(criticPrompt).toContain('Roadmap item (the CEO-approved source of truth): conflicted-item')
+    expect(criticPrompt).toContain('本文はここに続く。')
+  })
+
   it('dispute が無ければ Challenge せず PL revision へ進む', async () => {
     const { storage, taskId } = seed()
 

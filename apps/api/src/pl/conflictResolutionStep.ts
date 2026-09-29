@@ -34,6 +34,7 @@ import { readFileSync } from 'node:fs'
 import {
   bindingDisputes,
   challengeableDisputes,
+  getBaseRoadmapId,
   parseCritique,
   selectCriticModel,
   challengeTarget,
@@ -402,18 +403,23 @@ function challengeConsumed(storage: IStorage, taskId: string, key: string): bool
 function readLedgerBody(
   subject: RemediationSubject,
   readLedger: () => string,
-): { ok: true; body: string } | { ok: false; failureCode: string; reason: string } {
+): { ok: true; body: string; roadmapId: string } | { ok: false; failureCode: string; reason: string } {
   try {
     const markdown = readLedger()
-    const item = getValidRoadmapItems(markdown).find((c) => c.id === subject.roadmapId)
+    const items = getValidRoadmapItems(markdown)
+    const roadmapId = getBaseRoadmapId(
+      subject.roadmapTaskKey,
+      new Set(items.map((candidate) => candidate.id)),
+    )
+    const item = items.find((c) => c.id === roadmapId)
     if (!item) {
       return {
         ok: false,
         failureCode: 'item_not_in_ledger',
-        reason: `roadmap item "${subject.roadmapId}" is no longer in the ledger`,
+        reason: `roadmap item "${roadmapId}" is no longer in the ledger`,
       }
     }
-    return { ok: true, body: extractItemDescription(markdown, item) }
+    return { ok: true, body: extractItemDescription(markdown, item), roadmapId }
   } catch (error: unknown) {
     return {
       ok: false,
@@ -789,5 +795,5 @@ export async function runConflictResolutionRound(
     }
   }
 
-  return runCriticRound(storage, subject, ledger.body, deps)
+  return runCriticRound(storage, { ...subject, roadmapId: ledger.roadmapId }, ledger.body, deps)
 }
