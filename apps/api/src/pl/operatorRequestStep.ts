@@ -374,7 +374,7 @@ function stripSystemMarker(text: string): string {
 }
 
 function answerWith(deps: OperatorRequestStepDeps, maxTokens: number): (system: string, user: string) => Promise<string> {
-  return deps.answer ?? ((system, user) => requestText(system, user, {}, maxTokens))
+  return deps.answer ?? ((system, user) => requestText(system, user, { retryTransientOnce: true }, maxTokens))
 }
 
 // ── question: 調べて答えるだけ ────────────────────────────────

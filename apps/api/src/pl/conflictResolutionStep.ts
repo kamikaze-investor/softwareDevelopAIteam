@@ -676,7 +676,7 @@ async function runPlRevision(
   const base = { stage: 'pl_revision' as const, taskId }
 
   const revise = deps.revise
-    ?? ((system: string, user: string) => requestText(system, user, {}, PL_REVISION_MAX_TOKENS))
+    ?? ((system: string, user: string) => requestText(system, user, { retryTransientOnce: true }, PL_REVISION_MAX_TOKENS))
 
   let raw: string
   try {

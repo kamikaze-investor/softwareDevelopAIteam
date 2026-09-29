@@ -57,6 +57,13 @@ rollback 先は `d2aeaee584abf473fe4783a3ce0c5c64fecf952e`。
 **未確認として残るもの（この deploy 分）**: Worker が deploy 後に実 Job を処理すること
 （deploy 時点で claim 可能な queued Job が無かったため。次の自然な Job で確認する。人工 Job は作らない）。
 
+**この baseline 上の追加確認（2026-09-29）**: Mobile Operator Chat（master `6102f6e`、API 側の変更なし）の
+実機 E2E で question → PL 回答、request → Gate 結果（declined）の2経路が Production で成立した。
+API 再起動後の最初の PL provider 呼び出しは OpenCode の 60 秒 timeout で失敗し、同じ process の2回目以降は
+成功した。14日分の provider timeout 16件のうち cold start で説明できるのは1件だけだったため、
+対処は bounded provider recovery（PL 系だけ1回再試行）として別途 PR で行う（`tasks/roadmap.md`
+`operator-chat-mobile` の進捗を参照）。**Production への反映は未実施。**
+
 **記録の欠落**: 下の `dff52cf`（2026-08-19）以降、`d2aeaee` までの Production deploy はこの節に
 記録されていない（運用記録は `docs/project_memory/decisions/` の各 E2E 記録に分散している）。
 

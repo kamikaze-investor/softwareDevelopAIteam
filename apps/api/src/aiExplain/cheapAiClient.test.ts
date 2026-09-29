@@ -7,7 +7,14 @@ import { spawn } from 'node:child_process'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Task } from '@ai-team/shared'
 import { generateApprovalExplanation, type ApprovalAiContext } from '../approvalExplain/approvalAi'
-import { parseJsonObject, requestText } from './cheapAiClient'
+import {
+  CHEAP_AI_CONFIG,
+  CHEAP_AI_KILL_GRACE_MS,
+  CHEAP_AI_RETRY_BACKOFF_MS,
+  CheapAiAttemptError,
+  parseJsonObject,
+  requestText,
+} from './cheapAiClient'
 
 vi.mock('node:child_process', () => ({
   spawn: vi.fn(),
@@ -44,6 +51,60 @@ function arrangeCliResult({
     })
     return child
   })
+}
+
+interface ControlledChild {
+  pid: number
+  /** 子プロセスの終了を模す（stdout / stderr を書いてから close を出す）。 */
+  close: (code: number | null, signal: NodeJS.Signals | null, output?: { stdout?: string; stderr?: string }) => void
+}
+
+let nextPid = 40_000
+
+/** 自分からは終了しない子。テストが `close` を呼ぶか、process.kill の spy が止める。 */
+function arrangeControlledChild(): ControlledChild {
+  const pid = nextPid++
+  const stdoutStream = new PassThrough()
+  const stderrStream = new PassThrough()
+  const child = Object.assign(new EventEmitter(), {
+    pid,
+    stdin: new PassThrough(),
+    stdout: stdoutStream,
+    stderr: stderrStream,
+    kill: vi.fn(() => true),
+  }) as unknown as ChildProcessWithoutNullStreams
+  spawnMock.mockImplementationOnce(() => child)
+  return {
+    pid,
+    close: (code, signal, output = {}) => {
+      queueMicrotask(() => {
+        if (output.stdout) stdoutStream.write(output.stdout)
+        if (output.stderr) stderrStream.write(output.stderr)
+        child.emit('close', code, signal)
+      })
+    },
+  }
+}
+
+/**
+ * process.kill を差し替える（テストが本物のプロセスグループへ signal を送らないため）。
+ * `onSignal[pid]` があれば、`-pid` への signal でその子を反応させる。
+ */
+function spyOnProcessKill(onSignal: Record<number, (signal: NodeJS.Signals) => void> = {}) {
+  return vi.spyOn(process, 'kill').mockImplementation(((target: number, signal?: string | number) => {
+    const handler = onSignal[Math.abs(target)]
+    if (handler && typeof signal === 'string') handler(signal as NodeJS.Signals)
+    return true
+  }) as typeof process.kill)
+}
+
+const TEXT_OK = `${JSON.stringify({ type: 'text', part: { text: 'recovered answer' } })}\n`
+
+/** 隔離 dir の作成（実 I/O）を fake timer の前に済ませる。 */
+async function primeIsolation(): Promise<void> {
+  arrangeCliResult({ stdout: TEXT_OK })
+  await requestText('prime', 'prime', { apiKey: 'test-key' }, 10)
+  spawnMock.mockReset()
 }
 
 function getSpawnCall(): [string, string[], SpawnOptions] {
@@ -90,6 +151,8 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+  vi.useRealTimers()
 })
 
 describe('parseJsonObject', () => {
@@ -139,9 +202,11 @@ describe('OpenCode Go CLI client', () => {
     expect(args.join(' ')).not.toContain('test-key')
     expect(options).toMatchObject({
       shell: false,
-      timeout: 60_000,
+      detached: true,
       windowsHide: true,
     })
+    // timeout は spawn に任せず自前で持つ（AIteamOS が止めた事実を区別するため）
+    expect(options).not.toHaveProperty('timeout')
   })
 
   it('throws on a non-zero CLI exit without exposing the API key', async () => {
@@ -161,15 +226,24 @@ describe('OpenCode Go CLI client', () => {
     expect((error as Error).message).not.toContain('test-key')
   })
 
-  it('converts a CLI timeout into the existing non-destructive caller result', async () => {
-    arrangeCliResult({ code: null, signal: 'SIGTERM' })
-
-    await expect(
-      generateApprovalExplanation(createApprovalContext(), { apiKey: 'test-key' }),
-    ).resolves.toEqual({
-      ok: false,
-      error: 'OpenCode CLI timed out after 60000ms',
-    })
+  it('converts a CLI timeout into the existing non-destructive caller result (no retry for explainers)', async () => {
+    await primeIsolation()
+    const child = arrangeControlledChild()
+    const killSpy = spyOnProcessKill({ [child.pid]: (signal) => child.close(null, signal) })
+    vi.useFakeTimers()
+    try {
+      const pending = generateApprovalExplanation(createApprovalContext(), { apiKey: 'test-key' })
+      await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs)
+      await expect(pending).resolves.toEqual({
+        ok: false,
+        error: 'OpenCode CLI timed out after 60000ms',
+      })
+      await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS + CHEAP_AI_CONFIG.timeoutMs * 2)
+      expect(spawnMock).toHaveBeenCalledTimes(1)
+      expect(killSpy).toHaveBeenCalledWith(-child.pid, 'SIGTERM')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('passes only allowlisted environment variables to the subprocess', async () => {
@@ -267,6 +341,262 @@ describe('OpenCode Go CLI client', () => {
       )
     } finally {
       if (previous !== undefined) process.env.OPENCODE_GO_API_KEY = previous
+    }
+  })
+})
+
+describe('OpenCode supervisor and bounded recovery (retryTransientOnce)', () => {
+  const PL = { apiKey: 'test-key', retryTransientOnce: true } as const
+  let warnings: string[]
+
+  beforeEach(async () => {
+    await primeIsolation()
+    warnings = []
+    vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map(String).join(' '))
+    })
+    vi.useFakeTimers()
+  })
+
+  /** 1回目を AIteamOS 自身の timeout で止める（SIGTERM に応じて終了する子）。 */
+  function timingOutChild(): ControlledChild {
+    return arrangeControlledChild()
+  }
+
+  it('timeout → fresh process で1回だけ再試行し、成功すれば結果を返す（同じ隔離 HOME）', async () => {
+    const first = timingOutChild()
+    const second = arrangeControlledChild()
+    const killSpy = spyOnProcessKill({ [first.pid]: (signal) => first.close(null, signal) })
+
+    const pending = requestText('system', 'user prompt', PL, 100)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs)
+    expect(killSpy).toHaveBeenCalledWith(-first.pid, 'SIGTERM')
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS)
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+    second.close(0, null, { stdout: TEXT_OK })
+
+    await expect(pending).resolves.toBe('recovered answer')
+    const [firstCall, secondCall] = spawnMock.mock.calls as unknown as Array<[string, string[], SpawnOptions]>
+    expect(secondCall?.[2].cwd).toBe(firstCall?.[2].cwd)
+    expect(secondCall?.[2].env?.HOME).toBe(firstCall?.[2].env?.HOME)
+    expect(warnings).toEqual([
+      '[cheapAi] attempt 1/2 failed (timeout); retrying once with a fresh OpenCode process',
+      '[cheapAi] attempt 2/2 succeeded (attempt 1: timeout)',
+    ])
+  })
+
+  it('2回とも timeout なら従来どおり失敗し、3回目は起動しない', async () => {
+    const first = timingOutChild()
+    const second = timingOutChild()
+    spyOnProcessKill({
+      [first.pid]: (signal) => first.close(null, signal),
+      [second.pid]: (signal) => second.close(null, signal),
+    })
+
+    const pending = requestText('system', 'user', PL, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs + CHEAP_AI_RETRY_BACKOFF_MS + CHEAP_AI_CONFIG.timeoutMs)
+    const error = await pending
+    expect(error).toBeInstanceOf(CheapAiAttemptError)
+    expect((error as Error).message).toBe('OpenCode CLI timed out after 60000ms (attempt 2/2; attempt 1: timeout)')
+
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs * 5)
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+    expect(warnings.at(-1)).toBe('[cheapAi] attempt 2/2 failed (timeout; attempt 1: timeout)')
+  })
+
+  it('SIGTERM を無視する子も猶予後に SIGKILL し、close を待たずに必ず settle する', async () => {
+    const stubborn = arrangeControlledChild()
+    const killSpy = spyOnProcessKill()
+
+    const pending = requestText('system', 'user', { apiKey: 'test-key' }, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs)
+    expect(killSpy).toHaveBeenLastCalledWith(-stubborn.pid, 'SIGTERM')
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_KILL_GRACE_MS)
+    expect(killSpy).toHaveBeenLastCalledWith(-stubborn.pid, 'SIGKILL')
+    expect((await pending as Error).message).toBe('OpenCode CLI timed out after 60000ms')
+  })
+
+  it('先頭の子が SIGTERM で終わっても、再試行の前にグループの残り（孫）を SIGKILL で掃く', async () => {
+    const first = timingOutChild()
+    const second = arrangeControlledChild()
+    const killSpy = spyOnProcessKill({
+      [first.pid]: (signal) => { if (signal === 'SIGTERM') first.close(null, signal) },
+    })
+
+    const pending = requestText('system', 'user', PL, 100)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs)
+    expect(killSpy.mock.calls.filter(([target]) => target === -first.pid).map(([, signal]) => signal))
+      .toEqual(['SIGTERM', 'SIGKILL'])
+    expect(spawnMock).toHaveBeenCalledTimes(1)   // 掃いてから backoff、その後に2回目
+
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS)
+    second.close(0, null, { stdout: TEXT_OK })
+    await expect(pending).resolves.toBe('recovered answer')
+  })
+
+  it('外部からの異常終了でも、再試行の前にグループの残りを SIGKILL で掃く', async () => {
+    const first = arrangeControlledChild()
+    const second = arrangeControlledChild()
+    const killSpy = spyOnProcessKill()
+
+    const pending = requestText('system', 'user', PL, 100)
+    await vi.advanceTimersByTimeAsync(0)
+    first.close(null, 'SIGKILL')
+    await vi.advanceTimersByTimeAsync(0)
+    expect(killSpy).toHaveBeenCalledWith(-first.pid, 'SIGKILL')
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS)
+    second.close(0, null, { stdout: TEXT_OK })
+    await expect(pending).resolves.toBe('recovered answer')
+  })
+
+  it('意図的な停止（SIGTERM）ではグループへ signal を送らない（shutdown は systemd に任せる）', async () => {
+    const only = arrangeControlledChild()
+    const killSpy = spyOnProcessKill()
+
+    const pending = requestText('system', 'user', PL, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    only.close(null, 'SIGTERM')
+    await pending
+    expect(killSpy).not.toHaveBeenCalled()
+  })
+
+  it('AIteamOS が止めた子が exit 0 で終わっても timeout として扱う（正常終了にしない）', async () => {
+    const child = arrangeControlledChild()
+    spyOnProcessKill({ [child.pid]: () => child.close(0, null, { stdout: TEXT_OK }) })
+
+    const pending = requestText('system', 'user', { apiKey: 'test-key' }, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs)
+    expect((await pending as Error).message).toBe('OpenCode CLI timed out after 60000ms')
+  })
+
+  it.each(['SIGKILL', 'SIGSEGV'] as const)('外部からの異常終了（%s）は timeout と区別し、1回だけ再試行する', async (signal) => {
+    const first = arrangeControlledChild()
+    const second = arrangeControlledChild()
+    spyOnProcessKill()
+
+    const pending = requestText('system', 'user', PL, 100)
+    await vi.advanceTimersByTimeAsync(0)
+    first.close(null, signal)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS)
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+    second.close(0, null, { stdout: TEXT_OK })
+
+    await expect(pending).resolves.toBe('recovered answer')
+    expect(warnings[0]).toBe('[cheapAi] attempt 1/2 failed (abnormal_termination); retrying once with a fresh OpenCode process')
+  })
+
+  it('異常終了が2回続けば abnormal の文言で失敗し、timeout とは書かない', async () => {
+    const first = arrangeControlledChild()
+    const second = arrangeControlledChild()
+    spyOnProcessKill()
+
+    const pending = requestText('system', 'user', PL, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    first.close(null, 'SIGSEGV')
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS)
+    second.close(null, 'SIGSEGV')
+
+    expect((await pending as Error).message).toBe(
+      'OpenCode CLI terminated abnormally by signal SIGSEGV (attempt 2/2; attempt 1: abnormal_termination)',
+    )
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['SIGTERM', 'SIGINT', 'SIGHUP'] as const)(
+    '意図的な停止（%s。service shutdown と整合）では再試行せず、新しい OpenCode を起動しない',
+    async (signal) => {
+      const only = arrangeControlledChild()
+      spyOnProcessKill()
+
+      const pending = requestText('system', 'user', PL, 100).catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(0)
+      only.close(null, signal)
+
+      expect((await pending as Error).message).toBe(`OpenCode CLI was terminated by signal ${signal}`)
+      await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS + CHEAP_AI_CONFIG.timeoutMs * 3)
+      expect(spawnMock).toHaveBeenCalledTimes(1)
+      expect(warnings).toEqual([])
+    },
+  )
+
+  it.each([
+    ['exit code != 0（auth / quota / invalid model 等）', { code: 1, stderr: 'Error: invalid model / 401 / quota' }, 'OpenCode CLI failed with exit code 1'],
+    ['exit 0 でも stderr あり', { code: 0, stderr: 'warning: something' }, 'OpenCode CLI wrote to stderr'],
+    ['malformed output', { code: 0, stdout: 'not-json\n' }, 'OpenCode CLI response contained invalid JSON'],
+    ['text の無い出力', { code: 0, stdout: `${JSON.stringify({ type: 'step_start', part: {} })}\n` }, 'OpenCode CLI response did not contain text'],
+  ] as const)('%s は再試行しない', async (_label, result, expected) => {
+    const only = arrangeControlledChild()
+    spyOnProcessKill()
+
+    const pending = requestText('system', 'user', PL, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    only.close(result.code, null, result)
+
+    expect((await pending as Error).message).toContain(expected)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS + CHEAP_AI_CONFIG.timeoutMs * 3)
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('CLI 起動失敗は再試行しない', async () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(),
+    }) as unknown as ChildProcessWithoutNullStreams
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => child.emit('error', new Error('spawn opencode.exe ENOENT')))
+      return child
+    })
+
+    const pending = requestText('system', 'user', PL, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    expect((await pending as Error).message).toBe('OpenCode CLI failed to start: spawn opencode.exe ENOENT')
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS + CHEAP_AI_CONFIG.timeoutMs * 3)
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('key 未設定は OpenCode を起動せず、再試行もしない', async () => {
+    const previous = process.env.OPENCODE_GO_API_KEY
+    delete process.env.OPENCODE_GO_API_KEY
+    try {
+      await expect(requestText('system', 'user', { retryTransientOnce: true }, 100)).rejects.toThrow(
+        'OPENCODE_GO_API_KEY is not configured',
+      )
+      expect(spawnMock).not.toHaveBeenCalled()
+    } finally {
+      if (previous !== undefined) process.env.OPENCODE_GO_API_KEY = previous
+    }
+  })
+
+  it('retryTransientOnce を指定しない caller（説明系）は timeout でも再試行しない', async () => {
+    const only = timingOutChild()
+    spyOnProcessKill({ [only.pid]: (signal) => only.close(null, signal) })
+
+    const pending = requestText('system', 'user', { apiKey: 'test-key' }, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_CONFIG.timeoutMs + CHEAP_AI_RETRY_BACKOFF_MS + CHEAP_AI_CONFIG.timeoutMs)
+    expect((await pending as Error).message).toBe('OpenCode CLI timed out after 60000ms')
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+    expect(warnings).toEqual([])
+  })
+
+  it('再試行の記録には prompt・key・provider stderr を載せない（試行番号と種類だけ）', async () => {
+    const first = arrangeControlledChild()
+    const second = arrangeControlledChild()
+    spyOnProcessKill()
+
+    const pending = requestText('SYSTEM-SECRET-PROMPT', 'USER-SECRET-PROMPT', PL, 100).catch((error: unknown) => error)
+    await vi.advanceTimersByTimeAsync(0)
+    first.close(null, 'SIGKILL', { stderr: 'crash dump test-key STDERR-SECRET' })
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS)
+    second.close(2, null, { stderr: 'auth failed for test-key' })
+
+    const error = (await pending) as Error
+    expect(error.message).toBe(
+      'OpenCode CLI failed with exit code 2: auth failed for [REDACTED] (attempt 2/2; attempt 1: abnormal_termination)',
+    )
+    const logged = warnings.join('\n')
+    for (const secret of ['test-key', 'SECRET-PROMPT', 'STDERR-SECRET', 'crash dump']) {
+      expect(logged).not.toContain(secret)
     }
   })
 })
