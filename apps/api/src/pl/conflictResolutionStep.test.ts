@@ -6,7 +6,8 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
+import { ensureInitialWorkflowsForActiveTasks } from '../ctoAi/projectInitialization'
+import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
   PL_MAX_REMEDIATION_ATTEMPTS,
@@ -78,6 +79,14 @@ const DISPUTED_CRITIQUE = {
     evidence: 'validateRoadmapTasks が既に同じ検査をしている',
   }],
 }
+
+const ALIGNED_RESULT_JSON = JSON.stringify({
+  focusedReviewResults: [
+    { focus: 'scope_simplicity', decision: 'ALIGNED', summary: 'ok' },
+  ],
+  integrationReviewResult: { decision: 'ALIGNED', summary: 'ok' },
+  finalDecision: 'ALIGNED',
+})
 
 const PL_REVISION = {
   implementationScope: '既存 validateRoadmapTasks の検査を1件足すだけ',
@@ -219,6 +228,28 @@ describe('Critic → 条件分岐', () => {
     expect(result.failureCode).not.toBe('item_not_in_ledger')
     expect(criticPrompt).toContain('Roadmap item (the CEO-approved source of truth): conflicted-item')
     expect(criticPrompt).toContain('本文はここに続く。')
+  })
+
+  it('follow-up Task の PL revision は同じ Task identity を更新し、fresh Review 後に同じ Task の Job を作る', async () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'conflicted-item#2' })
+    const projectId = storage.tasks.findById(taskId)?.projectId as string
+    const taskCount = storage.tasks.findByProjectId(projectId).length
+    const originalRun = storage.designReviewRuns.findLatestByTaskId(taskId)
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      adopt: (s: IStorage, input: Parameters<typeof adoptRoadmapItem>[1]) => adoptRoadmapItem(s, input, {
+        ensureInitialWorkflows: (st, pid) => ensureInitialWorkflowsForActiveTasks(st, pid, {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async () => ({ ok: true, stdout: ALIGNED_RESULT_JSON, timedOut: false }),
+        }),
+      }),
+    }) as never)
+
+    expect(result).toMatchObject({ status: 'revised_and_aligned', taskId })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(taskCount)
+    expect(storage.tasks.findById(taskId)?.roadmapTaskKey).toBe('conflicted-item#2')
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.id).not.toBe(originalRun?.id)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
   })
 
   it('dispute が無ければ Challenge せず PL revision へ進む', async () => {
