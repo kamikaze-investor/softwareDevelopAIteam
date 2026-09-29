@@ -780,6 +780,14 @@ export default function Dashboard() {
 
         <TouchableOpacity
           accessibilityRole="button"
+          onPress={() => router.push('/operator')}
+          style={styles.taskButton}
+        >
+          <Text style={styles.taskText}>PL に質問・依頼する</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          accessibilityRole="button"
           onPress={load}
           style={styles.refreshButton}
         >
@@ -925,9 +933,9 @@ const styles = StyleSheet.create({
   },
   content: {
     padding: 16,
-    // 固定フッター（新規プロジェクト/承認待ち一覧/Refreshボタン）と重ならないよう、
-    // 一覧末尾に十分な余白を確保する。
-    paddingBottom: 240,
+    // 固定フッター（新規プロジェクト/承認待ち一覧/作業状況/PLへの質問・依頼/Refreshボタン）と
+    // 重ならないよう、一覧末尾に十分な余白を確保する。
+    paddingBottom: 300,
   },
   footer: {
     backgroundColor: '#0a0a0a',

@@ -10201,11 +10201,16 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       (3) `POST /api/context-pack` 任意ファイル読み取りの別 security fix / (4) 外部認証方式の決定と実装 /
       (5) gateway の公開方法（HTTPS・常駐 process）/ (6) ChatGPT 実機での接続テスト。
 
-      **(3) の進捗（2026-09-28）**: コード修正済み・PR（別 security fix）で review 中。
+      **(1)〜(3) の進捗（2026-09-28）**: (1) production は split credential mode（ADMIN / WORKER hash は
+      設定済みで異なる値・空 token 由来 hash なし、ACTIONS_READONLY / OPERATOR_GATEWAY は未設定）を
+      read-only で確認済み。(2) と (3) は **Production deploy済み（#297 / `0ce7bff`・#301 / `fcfd732`）**
+      （`d2aeaee` → `fcfd732` の fast-forward。記録は `docs/PROJECT_CURRENT_STATE.md`「Production Baseline」）。
+      `OPERATOR_GATEWAY_TOKEN_SHA256` は未設定のままで、外部接続は無効。
+      (3) の内容:
       root は設定済み target root だけ（allowlist・realpath 一致）、読み取りはすべて realpath で root 内に閉じる
       （symlink 脱出不可）、`.env` 等の秘密ファイルと dotfile は返さない（`ALWAYS_FORBIDDEN_PATTERNS` を再利用）。
       regression test: `apps/api/src/routes/contextPackSecurity.test.ts`（修正前に 8 件失敗を確認）。
-      Production への deploy は未実施。**`validateTargetRoot()` を使う他 route（`summary/update` 等）は本修正の範囲外。**
+      **`validateTargetRoot()` を使う他 route（`summary/update` 等）は本修正の範囲外。**
       **【制約: 従量課金APIを新しい標準経路にしない（CEO 指示・2026-09-14）】**
       AIteamOS 側が ChatGPT との接続のために **OpenAI API を呼ぶ構造を前提にしない**。
       MCP は `ChatGPT → MCP → AIteamOS Control / State Interface` の**接続口**に徹し、
@@ -10294,7 +10299,15 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       新設しない。Operator Request interface 自体は `chatgpt-mcp-inspect` の D1/D2 として先に作る。
       **【2026-09-28 進捗】** 共通 interface は実装済み（`POST・GET /api/operator-requests` と
       PL の回答経路）。Mobile は ADMIN credential でこの route をそのまま使える（`requesterClass=admin`）。
-      Mobile 側の UI は未着手。
+      **【2026-09-29 進捗】** Mobile の MVP 画面を実装（`apps/mobile/app/operator.tsx`・
+      `apps/mobile/lib/operatorChat.ts`、Dashboard から遷移）。現在状態・attention・attention 選択による
+      対象指定（`projectId` / `taskId`。targetKey は送らず PL が範囲内の候補から選ぶ）・「質問 / 依頼」の
+      明示選択（既定値なし）・送信・status / PL 回答 / `plAction` / 最近の依頼を表示し、回答待ちの間だけ
+      polling する。**API・route・認証の変更は無い。** 認証は既存 Mobile の ADMIN token をそのまま使う
+      （CEO 判断・2026-09-29。Mobile から ADMIN を外す設計変更はしない）が、この画面が呼ぶのは
+      `GET /api/operator/state` と `GET・POST /api/operator-requests` だけで、resume・approval 等の
+      操作 API は呼ばない。前提の `PL_LOOP_ENABLED=true`（60s）は Production で read-only 確認済み。
+      **未実施**: EAS build と実端末への再インストール（master 着地後）、実機での質問・依頼の E2E。
 
       **PL Console（下記 deferred 4件）との関係**: 別物である。PL Console は「ベンダー非依存の
       PL 指示 UI」（LibreChat 等の評価・Gateway・Provider Adapter を含む重量級）で、本項目は
