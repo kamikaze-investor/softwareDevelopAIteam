@@ -61,6 +61,7 @@ import {
 } from '@ai-team/shared/src/engineeringPrinciples.js'
 import {
   extractDesignReviewFindings,
+  getBaseRoadmapId,
   parseRemediationProposal,
   selectRemediationModel,
   type DesignReviewFinding,
@@ -255,7 +256,10 @@ export interface PlRemediationResult {
 /** CONFLICT で止まっていると判定するための材料。read-only。 */
 export interface RemediationSubject {
   task: Task
+  /** CEO-approved ledger item の id。ledger / Gate の参照にだけ使う。 */
   roadmapId: string
+  /** CONFLICT recovery が更新する既存 Task の identity。 */
+  roadmapTaskKey: string
   /** 却下された Design Review の Finding。 */
   findings: readonly DesignReviewFinding[]
   /** 却下された提案の review-visible key（全世代ぶん）。 */
@@ -334,7 +338,10 @@ export function findRemediationSubject(
 
   return {
     task,
-    roadmapId: task.roadmapTaskKey,
+    // ledger 全体をまだ読んでいない段階では suffix 規則で base を解決する。
+    // ledger を読む各実行経路は、実在 id 集合を渡して再解決する。
+    roadmapId: getBaseRoadmapId(task.roadmapTaskKey),
+    roadmapTaskKey: task.roadmapTaskKey,
     findings: extractDesignReviewFindings(run.resultJson),
     reviewedDesignText: run.designText,
     reviewedDesignTextHash: run.designTextHash,
@@ -646,8 +653,8 @@ export async function runRemediationStep(
   taskId: string,
   deps: PlRemediationDeps = {},
 ): Promise<PlRemediationResult> {
-  const subject = findRemediationSubject(storage, taskId)
-  if (!subject) {
+  const initialSubject = findRemediationSubject(storage, taskId)
+  if (!initialSubject) {
     return { status: 'not_applicable', taskId, reason: 'task is not stopped by a design review CONFLICT' }
   }
 
@@ -656,7 +663,7 @@ export async function runRemediationStep(
     return {
       status: 'attempts_exhausted',
       taskId,
-      roadmapId: subject.roadmapId,
+      roadmapId: initialSubject.roadmapId,
       failureCode: 'attempts_exhausted',
       reason: `independent remediation already ran ${attempts} time(s) for this task`,
     }
@@ -664,9 +671,14 @@ export async function runRemediationStep(
 
   // ── ledger 本文（Source of Truth）────────────────────────────
   let ledgerBody: string
+  let subject = initialSubject
   try {
     const markdown = (deps.readLedger ?? (() => readFileSync(resolveLedgerPath(), 'utf-8')))()
-    const item = getValidRoadmapItems(markdown).find((candidate) => candidate.id === subject.roadmapId)
+    const items = getValidRoadmapItems(markdown)
+    const ledgerIds = new Set(items.map((candidate) => candidate.id))
+    const roadmapId = getBaseRoadmapId(subject.roadmapTaskKey, ledgerIds)
+    subject = { ...subject, roadmapId }
+    const item = items.find((candidate) => candidate.id === roadmapId)
     if (!item) {
       // ledger が直るまで結果は変わらない。記録して有界にする（下の catch と同じ理由）。
       recordRemediation(storage, taskId, 'outcome=item_not_in_ledger')
@@ -992,6 +1004,9 @@ export async function applyRevisedSpec(
     // `proposedHash` と一致しなくなるので、**成功した fresh review まで
     // `still_not_aligned` として報告される**（独立レビュー指摘。実際にそうなっていた）。
     implementationScope: input.submittedScope,
+    // follow-up recovery だけは新しい identity を発番せず、CONFLICT で止まった既存 Task を
+    // 指定する。key 自体は渡さず、採用側が Task id から導出・検証する。
+    ...(subject.roadmapTaskKey !== subject.roadmapId ? { recoveryTaskId: subject.task.id } : {}),
   })
 
   if (!result.ok) {

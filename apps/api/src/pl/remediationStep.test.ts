@@ -12,7 +12,8 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
+import { ensureInitialWorkflowsForActiveTasks } from '../ctoAi/projectInitialization'
+import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import {
   buildRemediatedScope,
   computeProposedDesignTextHash,
@@ -78,6 +79,14 @@ const PROPOSAL = {
   abandon: false,
 }
 
+const ALIGNED_RESULT_JSON = JSON.stringify({
+  focusedReviewResults: [
+    { focus: 'scope_simplicity', decision: 'ALIGNED', summary: 'ok' },
+  ],
+  integrationReviewResult: { decision: 'ALIGNED', summary: 'ok' },
+  finalDecision: 'ALIGNED',
+})
+
 let ledgerRoot: string
 let previousTargetRoot: string | undefined
 
@@ -112,6 +121,29 @@ function seedConflictedTask(options: {
   const project = storage.projects.create({
     name: 'AIteamOS', goal: 'スマホだけでAI開発チームを運営できる世界を作る', designPhilosophy: [], status: 'running',
   })
+  if (options.roadmapTaskKey === 'conflicted-item#2') {
+    const baseTask = storage.tasks.create({
+      projectId: project.id,
+      title: '先行 Task',
+      description: buildAdoptedDescription(LEDGER_BODY, '先行 scope'),
+      status: 'done',
+      assignee: 'developer_ai',
+      dependencies: [],
+      allowedPaths: ['apps/api/src'],
+      acceptanceCriteria: ['先行 Task は完了した'],
+      roadmapTaskKey: 'conflicted-item',
+      phase: 1,
+      roadmapActive: false,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: baseTask.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+  }
   const task = storage.tasks.create({
     projectId: project.id,
     title: 'CONFLICT した項目',
@@ -179,6 +211,15 @@ describe('findRemediationSubject — 対象の判定', () => {
     expect(subject?.roadmapId).toBe('conflicted-item')
     expect(subject?.findings[0]?.source).toBe('scope_simplicity')
     expect(subject?.rejectedSpecKeys).toHaveLength(1)
+  })
+
+  it('follow-up は base ledger id と Task identity を別々に保持する', () => {
+    const { storage, taskId } = seedConflictedTask({ roadmapTaskKey: 'conflicted-item#2' })
+
+    const subject = findRemediationSubject(storage, taskId)
+
+    expect(subject?.roadmapId).toBe('conflicted-item')
+    expect(subject?.roadmapTaskKey).toBe('conflicted-item#2')
   })
 
   it('Job が1件でもあれば対象外（実行済みの変更と新しい指示を混ぜない）', () => {
@@ -540,6 +581,30 @@ describe('Gate — 既存の許可経路を迂回しない', () => {
 })
 
 describe('成功判定 — 採用経路の ok:true を成功にしない', () => {
+  it('follow-up remediation は同じ Task identity を更新し、fresh Review 後に同じ Task の Job を作る', async () => {
+    const { storage, projectId, taskId } = seedConflictedTask({ roadmapTaskKey: 'conflicted-item#2' })
+    const taskCount = storage.tasks.findByProjectId(projectId).length
+    const originalRun = storage.designReviewRuns.findLatestByTaskId(taskId)
+
+    const result = await runRemediationStep(storage, taskId, deps({
+      adopt: (s, input) => adoptRoadmapItem(s, input, {
+        ensureInitialWorkflows: (st, pid) => ensureInitialWorkflowsForActiveTasks(st, pid, {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async () => ({ ok: true, stdout: ALIGNED_RESULT_JSON, timedOut: false }),
+        }),
+      }),
+    }))
+
+    expect(result).toMatchObject({ status: 'remediated', taskId, roadmapId: 'conflicted-item' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(taskCount)
+    expect(storage.tasks.findById(taskId)?.roadmapTaskKey).toBe('conflicted-item#2')
+    expect(storage.tasks.findByProjectId(projectId).some((task) => task.roadmapTaskKey === 'conflicted-item#3')).toBe(false)
+    const freshRun = storage.designReviewRuns.findLatestByTaskId(taskId)
+    expect(freshRun?.id).not.toBe(originalRun?.id)
+    expect(storage.designReviewEvidence.findLatestByTaskId(taskId)?.decision).toBe('ALIGNED')
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+
   it('fresh Review が通らず Job が作られなければ still_not_aligned', async () => {
     // `adoptRoadmapItem()` は `ensureInitialWorkflows()` の結果を捨てるため、CONFLICT の
     // ままでも ok:true を返す。**Job の実在だけを成功の根拠にする。**
