@@ -8,6 +8,7 @@ import {
   selectPrincipleSlugs,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildSystemState } from '../state/systemState'
 import { buildResumeAiCliPrompt, type TaskRouteOptions } from './tasks'
 
 /**
@@ -969,7 +970,7 @@ describe('Task API', () => {
       })
     })
 
-    it('creates a queued job from the latest blocked job and keeps the blocked job unchanged', async () => {
+    it('creates a queued job, terminalizes its blocked source, and does not start a second recovery', async () => {
       await withApp(async (app) => {
         const project = await createProject(app)
         const task = await createTask(app, project.id, {
@@ -1016,10 +1017,54 @@ describe('Task API', () => {
         expect(jobs).toHaveLength(2)
         const original = jobs.find((job) => job.id === blockedJob.id)
         const created = jobs.find((job) => job.id === resumedJob.id)
-        expect(original?.status).toBe('blocked')
+        expect(original?.status).toBe('failed')
         expect(original?.aiCliPrompt).toBe(blockedJob.aiCliPrompt)
         expect(original?.aiCliPrompt).toContain('## Design Contract')
         expect(created?.status).toBe('queued')
+        expect(created?.workflowStepKey).toBe(`resume:${blockedJob.id}:1`)
+
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        expect(storage.jobs.findByTaskId(task.id).some((candidate) => (
+          candidate.workflowStepKey?.startsWith('repair:')
+        ))).toBe(false)
+        expect(storage.designReviewRuns.findByTaskId(task.id)).toEqual([])
+        expect(buildSystemState(storage).attention.some((item) => (
+          item.taskId === task.id && (item.kind === 'job_failed' || item.kind === 'job_blocked')
+        ))).toBe(false)
+      })
+    })
+
+    it('uses the queued resume successor as the source of the next resume, even at the same timestamp', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const blockedJob = await createBlockedAiCliJob(app, task, {
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'Original prompt',
+          aiCliMode: 'implement',
+        })
+        const instruction = 'Continue with the approved design.'
+        await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
+
+        const firstResponse = await app.inject({
+          method: 'POST', url: `/api/tasks/${task.id}/resume`, payload: { instruction },
+        })
+        expect(firstResponse.statusCode).toBe(201)
+        const first = parseBody<Job>(firstResponse.body)
+
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.jobs.update(first.id, { status: 'blocked' })
+
+        const secondResponse = await app.inject({
+          method: 'POST', url: `/api/tasks/${task.id}/resume`, payload: { instruction },
+        })
+        expect(secondResponse.statusCode).toBe(201)
+        const second = parseBody<Job>(secondResponse.body)
+        expect(second.workflowStepKey).toBe(`resume:${first.id}:1`)
+        expect(storage.jobs.findById(first.id)?.status).toBe('failed')
+        expect(storage.jobs.findById(blockedJob.id)?.status).toBe('failed')
       })
     })
 
@@ -1233,6 +1278,9 @@ describe('Task API', () => {
           const jobs = parseBody<Job[]>(jobsRes.body)
           expect(jobs).toHaveLength(2)
           expect(jobs.find((job) => job.id === failedJob.id)?.status).toBe('failed')
+          // source は既に failed で blocked からの handoff ではないので、終端化の audit は書かない。
+          expect(getStorage().auditLog.findByEntity('job', failedJob.id)
+            .filter((entry) => entry.operation === 'resume_source_terminalized')).toHaveLength(0)
         })
       })
 
@@ -1465,7 +1513,8 @@ describe('Task API', () => {
         const jobs = parseBody<Job[]>(jobsRes.body)
         expect(jobs).toHaveLength(2)
         expect(jobs.filter((job) => job.status === 'queued')).toHaveLength(1)
-        expect(jobs.filter((job) => job.status === 'blocked')).toHaveLength(1)
+        expect(jobs.filter((job) => job.status === 'blocked')).toHaveLength(0)
+        expect(jobs.filter((job) => job.status === 'failed')).toHaveLength(1)
       })
     })
   })

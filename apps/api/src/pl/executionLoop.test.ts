@@ -1196,7 +1196,7 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
 
   it('ALIGNED evidence があれば resume を Gate に通し、既存の正式操作で新 Job を作る', async () => {
     const { storage, taskId, projectId } = seed()
-    blockedCommitJob(storage, taskId, projectId)
+    const sourceJobId = blockedCommitJob(storage, taskId, projectId)
     alignedEvidence(storage, taskId)
 
     const result = await runPlTick(storage, deps({
@@ -1207,6 +1207,7 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(result.executionSummary).toContain('resume queued job')
     // 既存経路が作る resume Job（新しい workflowStepKey）
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey?.startsWith('resume:'))).toBe(true)
+    expect(storage.jobs.findById(sourceJobId)?.status).toBe('failed')
   })
 
   it('[10] PL の resume は ai として記録される（human resume と同じ意味にならない）', async () => {

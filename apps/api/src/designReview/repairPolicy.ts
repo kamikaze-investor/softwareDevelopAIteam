@@ -359,9 +359,9 @@ export type GenerationWalk =
        * generation の境界とも無関係で、根より上に出ても構わない —— 「この chain が
        * どの Job を経由して来たか」は予算の話ではないためである。
        *
-       * **なぜ必要か**: `resumeBlockedTask()` は元の行を `blocked` のまま残して successor を
-       * 作る。だから CEO の REJECT → Human Resume を繰り返した chain には、blocked のまま
-       * 残る ancestor が**複数**積み上がる。admission の live Job 判定がそのうち 1 件しか
+       * **なぜ必要か**: 旧 `resumeBlockedTask()` は元の行を `blocked` のまま残して successor を
+       * 作っていた。だから既存DBの CEO REJECT → Human Resume を繰り返した chain には、
+       * blocked のまま残る ancestor が**複数**積み上がる。admission の live Job 判定がそのうち 1 件しか
        * 外せないと、2 回目以降の REJECT を経た正規 lineage が必ず弾かれる
        * （2026-09-24 production 実測: Task `c3849205` は `7061400a` と `5472d0c1` の
        * 2 件が blocked で残り、canonical repair 経路が admission だけで止まっていた）。
@@ -551,8 +551,9 @@ export function walkRepairGeneration(
 /**
  * **Human Resume で後継が作られた Job の id 集合**（superseded）。
  *
- * `resumeBlockedTask()` は元の Job を `blocked` / `failed` のまま残して
- * `resume:<元Job>:<n>` を作る。元の行は durable history であって、もう Task を止めている
+ * `resumeBlockedTask()` は元の Job を `failed` へ終端化して
+ * `resume:<元Job>:<n>` を作る。旧DBに残る `blocked` source も含め、元の行は durable history
+ * であって、もう Task を止めている
  * 原因ではない —— 人が「ここから続ける」と明示的に答えたからである。
  *
  * Job X を superseded とするのは、次をすべて満たす Job S があるときだけ:
@@ -561,7 +562,8 @@ export function walkRepairGeneration(
  *   - S から辿る lineage 全体が well-formed（既存 `walkRepairGeneration()` が ok。
  *     X の実在・同一 Task・非環はそちらの責務）
  *
- * 元の行は書き換えない。ここは「いま誰かが対応すべき停止か」を読むときの**解釈**だけである。
+ * この純粋関数自身は行を書き換えない。ここは「いま誰かが対応すべき停止か」を読むときの
+ * compatibility 解釈だけである。
  */
 export function jobsSupersededByHumanResume(priorJobs: readonly PriorRepairJob[]): Set<string> {
   const superseded = new Set<string>()

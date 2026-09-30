@@ -393,12 +393,14 @@ export function buildSystemState(
 
       // **Human Resume で後継が作られた blocked / failed Job は、いま Task を止めている Job ではない。**
       //
-      // `resumeBlockedTask()` は元の行を残して `resume:<元Job>:1` を作る。元の blocked 行を
-      // 「動かせる Job」と数え続けると、後継が失敗しても `job_failed` が一切出ず、しかも古い
+      // 2026-09-30 以降の `resumeBlockedTask()` は元の行を failed へ終端化する。下の導出は、
+      // それ以前に作られた行や startup reconciliation が安全上触れない quarantine 行にも耐える
+      // compatibility rule として残す。元の blocked 行を「動かせる Job」と数え続けると、
+      // 後継が失敗しても `job_failed` が一切出ず、しかも古い
       // `job_blocked:<元Job>` は PL が escalate 済みで dedup されているので、**新しい失敗が
       // 誰にも見えないまま止まる**（2026-09-28 production・Task `9fdee5a3`）。
       // 判定は保存済みの resume lineage と `resume_actor` だけから導く（`readJobsSupersededByHumanResume`）。
-      // AI / unknown / malformed の resume は superseded にしない。行は書き換えない。
+      // AI / unknown / malformed の resume は superseded にしない。
       const superseded = task.status === 'done'
         ? new Set<string>()
         : readJobsSupersededByHumanResume(storage, jobs)
