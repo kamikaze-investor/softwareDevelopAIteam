@@ -584,6 +584,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   db.exec(CREATE_TABLES)
   runMigrations(db)
   reconcileResumedBlockedSourceJobs(db)
+  reconcileHistoricalOrphanBlockedJobs(db)
   runDesignReviewSubjectMigration(db)
   runIndexMigrations(db)
 
@@ -5805,6 +5806,124 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       ).run(source.id)
       if (terminalized.changes !== 1) continue
       recordResumeSourceTerminalized(db, source.id, successor.id, 'startup_reconciliation')
+    }
+  })
+
+  reconcile()
+}
+
+/**
+ * **一度限りの historical reconciliation（一般ルールではない）。** CEO 承認 2026-09-30。
+ *
+ * 対象は下表の2行だけである。どちらも `done` な Task の下に `blocked` のまま残り、
+ * 後継 Job の lineage（`reconcileResumedBlockedSourceJobs()` の proof）を持たないため、
+ * 0-Job Task の `abortTask()` / `parkTask()` を恒久的に塞いでいた。
+ *
+ * 所有権を既に失っていたことの証拠（行ごとに下の `laterForeignJobId`）:
+ *   - blocked になった**後に**、別 Task の Job が**同じ workingDir** で開始されている
+ *   - その時点の Production には、done Task の blocked 行を「worktree の clean を観測するまで」
+ *     所有者として扱う Worker（#158 `533735c`、VPS checkout は 2026-09-13 03:31 JST 以降この子孫）と、
+ *     dirty な worktree で Job を開始させない baseline 検査（#98 `1ad656a`）が deploy 済みだった
+ *   - よって別 Task の Job が開始できた時点で、Worker は worktree を clean と観測している
+ *
+ * **この証拠の形を他の行へ広げてはならない。** 「完了 Task の blocked 行を一般に終端化する」
+ * 規則は、dirty worktree が initial implement の失敗を経て repair に引き継がれる経路が
+ * 塞がるまで入れない（2026-09-30 の DESIGN_BLOCKER）。ここは id 固定のまま置く。
+ *
+ * 起動のたびに証拠を DB から**再検証**し、1つでも合わなければ触らない（fail-closed）。
+ * status の CAS と audit は同一 transaction で、2回目以降は `blocked` 条件により何もしない。
+ */
+const HISTORICAL_ORPHAN_BLOCKED_JOBS: ReadonlyArray<{ jobId: string; laterForeignJobId: string }> = [
+  // Task 76ea5ff3（2026-09-14 に汎用 PATCH で done）。唯一の Job。
+  { jobId: 'd5206ab3-0751-4302-bf64-fa1ccd0d42ae', laterForeignJobId: '71b9ed29-b083-40e4-a572-3071e82c26b7' },
+  // Task 7bd4a65a（2026-09-15 に reconcile_external_completion で done）。blocked の repair Job。
+  { jobId: 'e8f04766-c80b-4571-99a0-ecd065736f98', laterForeignJobId: '8664cddc-11bd-4560-897d-bb813ac74826' },
+]
+
+const HISTORICAL_ORPHAN_TERMINALIZED_OPERATION = 'historical_orphan_terminalized'
+
+function reconcileHistoricalOrphanBlockedJobs(db: Database.Database): void {
+  const reconcile = db.transaction((): void => {
+    const jobRow = db.prepare(`
+      SELECT id, task_id, project_id, status, safe_command, failure_metadata, approval_id,
+             started_at, completed_at
+      FROM jobs WHERE id = ?
+    `)
+    const taskStatus = db.prepare('SELECT status FROM tasks WHERE id = ?')
+    const approvalStatus = db.prepare('SELECT status FROM approval_requests WHERE id = ?')
+
+    type Row = {
+      id: string
+      task_id: string
+      project_id: string
+      status: string
+      safe_command: string | null
+      failure_metadata: string | null
+      approval_id: string | null
+      started_at: string | null
+      completed_at: string | null
+    }
+    const workingDirOf = (row: Row): string | undefined => {
+      if (row.safe_command === null) return undefined
+      try {
+        const dir = (JSON.parse(row.safe_command) as { workingDir?: unknown }).workingDir
+        return typeof dir === 'string' && dir !== '' ? dir : undefined
+      } catch {
+        return undefined
+      }
+    }
+
+    for (const entry of HISTORICAL_ORPHAN_BLOCKED_JOBS) {
+      const source = jobRow.get(entry.jobId) as Row | undefined
+      if (!source || source.status !== 'blocked') continue
+      if ((taskStatus.get(source.task_id) as { status: string } | undefined)?.status !== 'done') continue
+
+      // #306 の reconciliation と同じ fail-closed 条件（承認待ち / 承認行不明 / quarantine / 壊れた metadata）。
+      if (source.approval_id !== null) {
+        const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
+        if (approval === undefined || approval.status === 'WAITING_FOR_USER') continue
+      }
+      if (source.failure_metadata !== null) {
+        let metadata: unknown
+        try {
+          metadata = JSON.parse(source.failure_metadata)
+        } catch {
+          continue
+        }
+        if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) continue
+        if ((metadata as { quarantined?: unknown }).quarantined === true) continue
+      }
+
+      // 証拠: 別 Task の Job が、同じ Project・同じ workingDir で、source の終了後に開始されている。
+      const later = jobRow.get(entry.laterForeignJobId) as Row | undefined
+      const sourceDir = workingDirOf(source)
+      if (
+        !later
+        || later.task_id === source.task_id
+        || later.project_id !== source.project_id
+        || sourceDir === undefined
+        || workingDirOf(later) !== sourceDir
+        || source.completed_at === null
+        || later.started_at === null
+        || !(later.started_at > source.completed_at)
+      ) continue
+
+      const terminalized = db.prepare(
+        "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+      ).run(source.id)
+      if (terminalized.changes !== 1) continue
+      db.prepare(`
+        INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+        VALUES (?, 'api', ?, 'job', ?, 'success', ?, ?)
+      `).run(
+        randomUUID(),
+        HISTORICAL_ORPHAN_TERMINALIZED_OPERATION,
+        source.id,
+        `one_time=ceo_2026-09-30 later_foreign_job_id=${later.id} later_started_at=${later.started_at} `
+        + `source_completed_at=${source.completed_at} working_dir=${sourceDir} `
+        + 'source_status=blocked target_status=failed',
+        now(),
+      )
     }
   })
 
