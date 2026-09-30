@@ -583,6 +583,38 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Job not found' })
     }
 
+    // initial-implement が running を一度も獲得しないまま failed を報告できるのは、
+    // Worker の pre-start workspace baseline / ownership admission が拒否した場合だけである。
+    // この構造的事実（queued + canonical initial step + baseline/start時刻なし）で分類し、
+    // stderr 文言には依存しない。
+    //
+    // ここを通常の implement failure として保存すると、この後の repair admission が
+    // INTENTIONALLY-DIRTY な `repair:` Job を作り、foreign dirt を実装成果として継承し得る。
+    // `failed` のまま repair だけを除外しても、Human Resume の `resume:` が同じ dirt を
+    // 継承するため不十分である。既存 quarantine protocol に合流させれば、Worker が
+    // known-good clean workspace を再観測して clear-quarantine が成立するまで、repair / retry /
+    // resume / 新規 claim がすべて fail-closed になる。
+    //
+    // Outbox hash は Worker が実際に送った payload を先に検証済みであり、これはその後の
+    // server-side state-application policy である。replay は event hash により dedup される。
+    const isInitialImplementPreStartRefusal =
+      existing.status === 'queued' &&
+      existing.aiCliMode === 'implement' &&
+      existing.workflowStepKey === `task:${existing.taskId}:initial-implement` &&
+      existing.startedAt === undefined &&
+      existing.workspaceBaseline === undefined &&
+      jobUpdate.status === 'failed'
+    if (isInitialImplementPreStartRefusal) {
+      const reason = jobUpdate.stderr ?? 'initial implementation was refused before workspace ownership was established'
+      jobUpdate.status = 'blocked'
+      jobUpdate.failureMetadata = {
+        kind: 'workspace_baseline_failure',
+        workspaceState: 'unknown',
+        quarantined: true,
+        quarantineReason: reason,
+      }
+    }
+
     // **park された Task の Job を live な status へ戻さない。**
     //
     // `canApplyJobResultStatus()` は terminal からの requeue を許すため、park で
