@@ -10179,8 +10179,32 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       新しい通知基盤 / 新しいダッシュボード / Monitor 専用 DB。既存の改善で足りない場合のみ、
       その時点で不足を具体的に示してから検討する。
 
-<!-- roadmap:id=chatgpt-mcp-inspect state=in_progress -->
+<!-- roadmap:id=chatgpt-mcp-inspect state=deferred -->
 1. [~] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
+
+      **【2026-09-30 現状: Stage A 完了・Stage B は deferred（CEO 判断）】**
+      - **Stage A（Production・loopback のみ）完了**: `3ddbaa0` で `ai-team-mcp-gateway` を常駐（`127.0.0.1:3100`・
+        `local_static_bearer`）。API に `OPERATOR_GATEWAY_TOKEN_SHA256` を追加。受入 A1〜A8 全合格:
+        bearer なし・不正 bearer・内部 credential を外部 bearer に使う場合はいずれも 401 / initialize・tools/list（8 tools）・
+        `get_system_state` 成功 / `operator_gateway` で ADMIN・WORKER route は 403 / `ask_pl` は
+        `operator_requests` +1 のみ（Task・Job・Approval・Grant 不変、`requester_class=operator_gateway`）/
+        平文は journal に 0 件。**この構成を完成状態として維持する**（OpenAI 側とは未接続）。
+      - **Stage B（Secure MCP Tunnel・ChatGPT 接続）は deferred**: CEO の個人 ChatGPT workspace では
+        Developer mode / Tunnel の利用入口が UI 上に確認できなかった。調査結果（一次資料 `help.openai.com` /
+        `developers.openai.com` はこの実行環境から遮断され、検索抜粋で確認）: Tunnel は Platform organization に属し、
+        ChatGPT workspace ID を紐づけないと connector の tunnel picker に出ない（`openai/tunnel-client` docs で確認）。
+        個人（Pro）workspace から使うと `401 tunnel_active_organization_required` になるという未回答の公開 issue
+        （`openai/tunnel-client#60`）がある。tunnel-client に tool を絞る設定は無い。
+        **Tunnel・runtime key・tunnel-client は作成していない。**
+      - **read-only profile（ChatGPT に `ask_pl` を出さない 7 tools 構成）は実装しない**。方針のみ記録:
+        必要になったら gateway に `MCP_TOOL_PROFILE=read_only|full`（既定 `read_only`）を足し、read_only では
+        `ask_pl` を登録しない（tools/list に出ず、tools/call は SDK が `Tool ask_pl not found` を返し API を呼ばない）。
+        API の `operator_gateway` allowlist は変更しない。設定だけで隠す手段は gateway・tunnel-client の
+        どちらにも無い。
+      - **再開条件**: 個人 workspace で Tunnel が利用可能になった場合、または ChatGPT Business 導入を決めた場合。
+        再開時は Tunnel の可否を実 UI で確認してから、read-only profile の要否と Stage B を判断する。
+      - **当面の正式な PL 操作窓口は Mobile Operator Chat**（`operator-chat-mobile`）。write（Operator Request の作成）は
+        Mobile に集約する。
 
       **【2026-09-28 進捗: D0〜D4 実装済み・D5 はローカル検証まで。Production 外部接続は未有効化】**
 
