@@ -5776,9 +5776,11 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
     for (const source of sources) {
       // 承認待ちが結び付いたままの行は、その承認が approveAndResumeJob() で同じ行を動かしうる。
       // lineage があっても「もう誰も動かさない」とは言えないので触らない（fail-closed）。
+      // 結び付いた承認行が見つからない場合も、状態を確かめられないので同じく触らない
+      // （`jobs.approval_id` に外部キーは無い）。期限は見ない —— WAITING は期限切れでも行として残る。
       if (source.approval_id !== null) {
         const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
-        if (approval?.status === 'WAITING_FOR_USER') continue
+        if (approval === undefined || approval.status === 'WAITING_FOR_USER') continue
       }
 
       if (source.failure_metadata !== null) {

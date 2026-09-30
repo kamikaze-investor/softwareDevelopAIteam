@@ -267,4 +267,35 @@ describe('startup reconciliation — rows it must leave alone', () => {
     expect(storage.jobs.findById('source-waiting')?.status).toBe('blocked')
     expect(storage.auditLog.findByEntity('job', 'source-waiting')).toHaveLength(0)
   })
+  it('skips a source whose approval_id points to a missing approval row, and one bound to an expired WAITING row', () => {
+    const dbPath = databasePath()
+    seedDatabase(dbPath, (db) => {
+      for (const taskId of ['dangling', 'expired', 'rejected']) insertTask(db, taskId, 'done')
+      for (const taskId of ['dangling', 'expired', 'rejected']) {
+        insertJob(db, { id: `source-${taskId}`, taskId, status: 'blocked' })
+        insertJob(db, {
+          id: `successor-${taskId}`, taskId, status: 'success',
+          workflowStepKey: `resume:source-${taskId}:1`,
+        })
+      }
+      const insertApproval = db.prepare(`
+        INSERT INTO approval_requests (
+          id, task_id, target_branch, target_commit, target_diff_hash, risk_level,
+          requested_action, status, expires_at, created_at
+        ) VALUES (?, ?, 'b', 'c', 'd', 'HIGH', 'git_commit', ?, ?, ?)
+      `)
+      insertApproval.run('approval-expired', 'expired', 'WAITING_FOR_USER', '2026-01-01T00:00:00.000Z', CREATED_AT)
+      insertApproval.run('approval-rejected', 'rejected', 'REJECTED', '2026-01-01T00:00:00.000Z', CREATED_AT)
+      const bind = db.prepare('UPDATE jobs SET approval_id = ? WHERE id = ?')
+      bind.run('approval-missing', 'source-dangling')
+      bind.run('approval-expired', 'source-expired')
+      bind.run('approval-rejected', 'source-rejected')
+    })
+
+    const storage = createSQLiteStorage(dbPath)
+    expect(storage.jobs.findById('source-dangling')?.status).toBe('blocked')
+    expect(storage.jobs.findById('source-expired')?.status).toBe('blocked')
+    // 終わった承認（REJECTED）が結び付いているだけなら、lineage どおり終端化する。
+    expect(storage.jobs.findById('source-rejected')?.status).toBe('failed')
+  })
 })

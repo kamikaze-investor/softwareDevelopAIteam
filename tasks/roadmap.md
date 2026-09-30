@@ -9552,7 +9552,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       以後は元 Job の終端化によって `job_failed:<後継>` として見えるようになる（Human authority の境界は動かしていない）。
 
       **この項目に含めないもの**（別責務）:
-      - AI resume で同じ形に陥る停止（Human authority の境界を AI resume で動かさないため、意図的に対象外）
+      - AI resume で同じ形に陥る停止を、この superseded 導出で扱うこと（Human authority の境界を AI resume で動かさないため、意図的に対象外。2026-09-30 以降は上記の source 終端化で別途解消している）
       - repair admission の Design Review 根拠（D3）、approved な resumed review の git_commit（D4）
 
 <!-- roadmap:id=low-load-design-review-unreachable-on-vps state=done -->
