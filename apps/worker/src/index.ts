@@ -995,13 +995,12 @@ export async function pollJobs(): Promise<never> {
  *
  * ## TOCTOU
  *
- * 観測から解放までの間に別 Job が同じ workspace を書き換えないことは、**既存の所有権規則**が
- * 担保する。対象 Job は `blocked` のまま所有権を保持しており、
- * `findWorkspaceOwningTaskId()` がその Task を所有者と判定するため、
- * `fetchQueuedJob()` は他 Task の Job を claim しない。**新しい lock は足していない。**
- * 解放後は所有者が居なくなるので、次の poll から通常どおり claim が再開する。
+ * pending Task の従来形では対象 Job が `blocked` のまま所有権を保持する。blocked Task の
+ * terminal-Job 形では、この報告を同じ poll の queued Job fetch より先に直列実行し、API 側が
+ * transaction 内で project の live Job 不在を再確認する。**新しい lock は足していない。**
+ * 成功後は Task が pending / roadmapActive=false になるので、次の poll から通常どおり進める。
  */
-async function reportAbortCleanupObservations(): Promise<boolean> {
+export async function reportAbortCleanupObservations(): Promise<boolean> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return false
 
@@ -1015,9 +1014,11 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
 
-      const requested = jobs.find((job) => (
-        job.status === 'blocked' && job.failureMetadata?.abortCleanupRequestedAt !== undefined
-      ))
+      const requested = jobs.find((job) => {
+        if (job.failureMetadata?.abortCleanupRequestedAt === undefined) return false
+        if (task.status === 'pending') return job.status === 'blocked'
+        return task.status === 'blocked' && (job.status === 'failed' || job.status === 'success')
+      })
       if (!requested) continue
 
       const observed = observeWorkspace(requested.safeCommand.workingDir)

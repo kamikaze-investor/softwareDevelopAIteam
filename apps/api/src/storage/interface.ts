@@ -551,6 +551,25 @@ export interface IJobStorage {
     /** 承認の出所。transaction 内で束縛を再検証し、CONSUMED まで進める。 */
     approvalRequestId: string
   }): ReleaseBlockedJobAndParkTaskResult
+  /**
+   * 全 Job が既に terminal な blocked Task を abort_task で park する最終段。
+   * Job 行は変更せず、workspace の clean 観測と全 Job の start HEAD 一致を
+   * transaction 内で再検証してから Task 遷移・承認消費・audit を確定する。
+   */
+  parkBlockedTaskWithTerminalJobs(input: {
+    jobId: string
+    taskId: string
+    observation: JobWorkspaceBaseline
+    knownGood: {
+      gitOperationMarkers: string[]
+      worktreeClean: boolean
+      indexClean: boolean
+      headValid: boolean
+      blindSpotsAbsent: boolean
+    }
+    reason: string
+    approvalRequestId: string
+  }): ReleaseBlockedJobAndParkTaskResult
   clearWorkspaceQuarantine(input: {
     jobId: string
     /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */

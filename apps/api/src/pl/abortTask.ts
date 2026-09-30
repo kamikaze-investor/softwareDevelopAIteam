@@ -98,8 +98,10 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   }
 
   // `occupiesProject()` は in_progress / blocked を roadmapActive に関係なく占有と数える
-  // （#233 で独立レビューを経て固定した契約）。それらを park しても currentTask から外れない。
-  if (task.status !== 'pending') {
+  // （#233 で独立レビューを経て固定した契約）。blocked を受け入れるのは、全 Job terminal を
+  // 観測した後に pending / roadmapActive=false へ原子的に移す専用経路だけである。
+  const isTerminalBlockedTask = task.status === 'blocked'
+  if (task.status !== 'pending' && !isTerminalBlockedTask) {
     return {
       ok: false,
       code: 'TASK_NOT_PARKABLE',
@@ -118,6 +120,7 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
 
   // live Job があるうちは何もしない。Worker は roadmapActive を見ずに queued Job を拾う。
   const projectTasks = storage.tasks.findByProjectId(task.projectId)
+  const taskJobs = storage.jobs.findByTaskId(task.id)
   const liveJobs = projectTasks.flatMap((candidate) =>
     storage.jobs.findByTaskId(candidate.id).filter((job) => isLiveJob(job)))
   if (liveJobs.length > 0) {
@@ -128,6 +131,48 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
         `the project still has ${liveJobs.length} queued or running job(s) `
         + `(${liveJobs.map((job) => `${job.id}:${job.status}`).join(', ')}); `
         + 'let the existing job stop / fail handling finish first',
+    }
+  }
+
+  if (isTerminalBlockedTask) {
+    if (taskJobs.length === 0) {
+      return {
+        ok: false,
+        code: 'TASK_NOT_PARKABLE',
+        reason:
+          `Task ${task.id} is blocked but has no Job; use the existing /recover route before abort_task`,
+      }
+    }
+    const nonTerminal = taskJobs.find((job) => job.status !== 'failed' && job.status !== 'success')
+    if (nonTerminal) {
+      return {
+        ok: false,
+        code: 'TASK_NOT_PARKABLE',
+        reason:
+          `Task ${task.id} still has non-terminal job ${nonTerminal.id} (${nonTerminal.status}); `
+          + 'finish the existing blocked-job lifecycle before parking',
+      }
+    }
+    const quarantinedJob = taskJobs.find((job) => job.failureMetadata?.quarantined === true)
+    if (quarantinedJob) {
+      return {
+        ok: false,
+        code: 'JOB_QUARANTINED',
+        reason:
+          `job ${quarantinedJob.id} is quarantined; clear it through the existing clear-quarantine path `
+          + 'before parking (ownership is not released while the workspace is unproven)',
+      }
+    }
+    const workingDirs = new Set(taskJobs.map((job) => job.safeCommand?.workingDir))
+    const workingDir = taskJobs[0]?.safeCommand?.workingDir
+    if (workingDir === undefined || workingDir === '' || workingDirs.size !== 1) {
+      return {
+        ok: false,
+        code: 'TASK_NOT_PARKABLE',
+        reason:
+          `Task ${task.id}'s terminal Jobs do not share one non-empty workingDir; `
+          + 'one workspace observation cannot prove them all safe',
+      }
     }
   }
 
@@ -154,7 +199,10 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   //
   // 対象は**この Task の Job だけ**である。他 Task の blocked Job にこの Task の承認で
   // 印を付けると、その承認で別 Task が park できてしまう（独立レビュー Finding 2）。
-  const owning = storage.jobs.findByTaskId(task.id).filter((job) => holdsWorkspaceOwnership(task, job))
+  const owning = taskJobs.filter((job) => holdsWorkspaceOwnership(task, job))
+  // findByTaskId は created_at DESC, rowid DESC。terminal-blocked 形では最新 Job だけを
+  // 観測要求の carrier にし、全 Job の証明は storage transaction が行う。
+  const cleanupTargets = isTerminalBlockedTask ? [taskJobs[0]] : owning
 
   // 他 Task が workspace を所有したままなら park しても workspace は解放されない。
   const otherTasks = projectTasks.filter((candidate) => candidate.id !== task.id)
@@ -186,7 +234,7 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   const staleCandidates = otherTasks.flatMap((candidate) =>
     storage.jobs.findByTaskId(candidate.id).filter((job) => isStaleBlockedJobCandidate(candidate, job)))
 
-  const quarantined = owning.find((job) => job.failureMetadata?.quarantined === true)
+  const quarantined = cleanupTargets.find((job) => job.failureMetadata?.quarantined === true)
   if (quarantined) {
     return {
       ok: false,
@@ -197,7 +245,7 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     }
   }
 
-  if (owning.length === 0) {
+  if (cleanupTargets.length === 0) {
     if (staleCandidates.length > 0) {
       return {
         ok: false,
@@ -223,7 +271,7 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   // workingDir が読めない行は「同じ workspace だ」と言えないので証明の外側に置く
   // （`SafeCommand.workingDir` は型上必須だが、古い行から undefined で読めることがある）。
   const provenDirs = new Set(
-    owning.map((job) => job.safeCommand?.workingDir).filter((dir): dir is string => Boolean(dir)),
+    cleanupTargets.map((job) => job.safeCommand?.workingDir).filter((dir): dir is string => Boolean(dir)),
   )
   const outsideProof = staleCandidates.find((job) => {
     const dir = job.safeCommand?.workingDir
@@ -242,7 +290,7 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
 
   // cleanup を要求する。**実体の掃除・観測は Worker の既存経路が行う。**
   const requestedAt = new Date().toISOString()
-  for (const job of owning) {
+  for (const job of cleanupTargets) {
     storage.jobs.update(job.id, {
       failureMetadata: {
         ...(job.failureMetadata ?? {}),
@@ -253,7 +301,12 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     })
   }
 
-  return { ok: true, status: 'cleanup_requested', taskId: task.id, jobIds: owning.map((job) => job.id) }
+  return {
+    ok: true,
+    status: 'cleanup_requested',
+    taskId: task.id,
+    jobIds: cleanupTargets.map((job) => job.id),
+  }
 }
 
 export type CompleteAbortCleanupResult =
@@ -295,8 +348,12 @@ export function completeAbortCleanup(
   }
 
   // taskId は Job から導くが、**承認がその Task に束縛されているか**は
-  // `releaseBlockedJobAndParkTask()` が transaction 内で検証する。ここでは決めない。
-  const released = storage.jobs.releaseBlockedJobAndParkTask({
+  // storage の status 別 release transaction が検証する。ここでは承認の正当性を決めない。
+  const task = storage.tasks.findById(job.taskId)
+  const release = task?.status === 'blocked'
+    ? storage.jobs.parkBlockedTaskWithTerminalJobs
+    : storage.jobs.releaseBlockedJobAndParkTask
+  const released = release({
     jobId: job.id,
     taskId: job.taskId,
     observation: input.observation,
