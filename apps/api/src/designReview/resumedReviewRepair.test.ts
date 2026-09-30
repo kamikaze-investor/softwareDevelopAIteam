@@ -61,7 +61,7 @@ function storeVerdict(storage: IStorage, taskId: string, reviewJobId: string, ov
 
 /**
  * production の形をそのまま組む:
- * B0 initial implement（blocked のまま残る）→ I1 resume:B0:1 implement 成功（human）
+ * B0 initial implement（legacy DB では blocked のまま残る）→ I1 resume:B0:1 implement 成功（human）
  * → R0 implement:I1:review（changes_requested）→ R1 resume:R0:1 review（human）。
  */
 function productionChain(

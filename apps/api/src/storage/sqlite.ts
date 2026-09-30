@@ -76,6 +76,26 @@ export class RoadmapTaskConflictError extends Error {
 
 const now = () => new Date().toISOString()
 
+const RESUME_SOURCE_TERMINALIZED_OPERATION = 'resume_source_terminalized'
+
+function recordResumeSourceTerminalized(
+  db: Database.Database,
+  sourceJobId: string,
+  successorJobId: string,
+  mode: 'resume' | 'startup_reconciliation',
+): void {
+  db.prepare(`
+    INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+    VALUES (?, 'api', ?, 'job', ?, 'success', ?, ?)
+  `).run(
+    randomUUID(),
+    RESUME_SOURCE_TERMINALIZED_OPERATION,
+    sourceJobId,
+    `successor_job_id=${successorJobId} mode=${mode} source_status=blocked target_status=failed`,
+    now(),
+  )
+}
+
 function selectNextContinuableTask(tasks: Task[]): Task | undefined {
   const byId = new Map(tasks.map((task) => [task.id, task]))
   return tasks
@@ -563,6 +583,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   db.pragma('journal_mode = WAL')
   db.exec(CREATE_TABLES)
   runMigrations(db)
+  reconcileResumedBlockedSourceJobs(db)
   runDesignReviewSubjectMigration(db)
   runIndexMigrations(db)
 
@@ -2411,7 +2432,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
 
         const jobRows = db.prepare(
-          'SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC'
+          'SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
         ).all(taskId) as any[]
         const taskJobs = jobRows.map(deserializeJob)
         const latestJob = taskJobs[0]
@@ -2462,6 +2483,22 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1'
         ).get(taskId) as any
         const latestApproval = latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined
+
+        // 後継を先に queued で作り、その後で source を failed へ終端化する。両方ともこの
+        // transaction 内なので、workspace ownership がどちらにも属さない window は無い。
+        // source 行は削除せず、successor の resume:<source>:<n> と audit で lineage を保つ。
+        const completeResumeHandoff = (successor: Job): ResumeBlockedTaskResult => {
+          if (isJobDirectlyBlocked) {
+            const terminalized = db.prepare(
+              "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+            ).run(latestJob.id)
+            if (terminalized.changes !== 1) {
+              throw new Error(`Failed to atomically terminalize resumed source Job ${latestJob.id}`)
+            }
+            recordResumeSourceTerminalized(db, latestJob.id, successor.id, 'resume')
+          }
+          return { ok: true, job: successor }
+        }
 
         // 有効な承認待ちがあるうちは resume しない（承認と resume の二重駆動を避ける）。
         //
@@ -2541,7 +2578,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             aiCliMode: 'implement',
             workflowStepKey: `resume:${latestJob.id}:1`,
           })
-          return { ok: true, job }
+          return completeResumeHandoff(job)
         }
 
         // git_commit SafeCommand Job（AI CLIを介さない）の resume。
@@ -2558,7 +2595,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             safeCommand: { ...latestJob.safeCommand, workingDir: TARGET_WORKING_DIR },
             dryRun: latestJob.dryRun,
           })
-          return { ok: true, job }
+          return completeResumeHandoff(job)
         }
 
         if (!latestJob.aiCliProvider || !latestJob.aiCliMode) {
@@ -2598,7 +2635,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           workflowStepKey: `resume:${latestJob.id}:1`,
         })
 
-        return { ok: true, job }
+        return completeResumeHandoff(job)
       })
 
       return resumeTransaction(input.taskId, input.instructionPrompt)
@@ -5709,6 +5746,62 @@ function runMigrations(db: Database.Database): void {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
     }
   }
+}
+
+/**
+ * `resumeBlockedTask()` が正式な後継を作成済みなのに source が `blocked` のまま残った既存行を、
+ * 現行の handoff invariant へ揃える。推測はせず、同一 Task に canonical な
+ * `resume:<sourceJobId>:<n>` が保存されている場合だけを proof とする。
+ *
+ * malformed な failure_metadata は「quarantine でない」と証明できないため触らない。
+ * status の CAS と audit は同一 transaction で、再起動時は `blocked` 条件により冪等である。
+ */
+function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
+  const reconcile = db.transaction((): void => {
+    const sources = db.prepare(`
+      SELECT id, task_id, failure_metadata
+      FROM jobs
+      WHERE status = 'blocked'
+      ORDER BY rowid ASC
+    `).all() as Array<{ id: string; task_id: string; failure_metadata: string | null }>
+
+    const successorsForTask = db.prepare(`
+      SELECT id, workflow_step_key
+      FROM jobs
+      WHERE task_id = ? AND workflow_step_key IS NOT NULL
+      ORDER BY rowid ASC
+    `)
+
+    for (const source of sources) {
+      if (source.failure_metadata !== null) {
+        let metadata: unknown
+        try {
+          metadata = JSON.parse(source.failure_metadata)
+        } catch {
+          continue
+        }
+        if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) continue
+        if ((metadata as { quarantined?: unknown }).quarantined === true) continue
+      }
+
+      const successor = (successorsForTask.all(source.task_id) as Array<{
+        id: string
+        workflow_step_key: string
+      }>).find((candidate) => {
+        const match = /^resume:([^:]+):(\d+)$/.exec(candidate.workflow_step_key)
+        return match?.[1] === source.id
+      })
+      if (!successor) continue
+
+      const terminalized = db.prepare(
+        "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+      ).run(source.id)
+      if (terminalized.changes !== 1) continue
+      recordResumeSourceTerminalized(db, source.id, successor.id, 'startup_reconciliation')
+    }
+  })
+
+  reconcile()
 }
 
 function runDesignReviewSubjectMigration(db: Database.Database): void {

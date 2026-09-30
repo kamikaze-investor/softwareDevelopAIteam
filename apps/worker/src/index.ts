@@ -150,10 +150,12 @@ export type WorkspaceOwnership =
 /**
  * この blocked 行は「終わった Task に取り残された行」の候補か。
  *
- * `resumeBlockedTask()` は新しい Job を**別行**として作り、旧 `blocked` 行を監査証跡として
- * 残す（`approveAndResumeJob()` は同一行を `blocked -> queued` へ UPDATE するので滞留しない）。
- * そのため resume 経路でだけ「終わった Task に blocked 行が残る」状態が生まれ、
- * その行が workspace 所有権を永久に握り続けていた。
+ * 現行の `resumeBlockedTask()` は新しい Job を別行で作り、同一 transaction で source を
+ * `blocked -> failed` にする。startup reconciliation も canonical な `resume:<source>:<n>` が
+ * 同一 Task にある既存行だけを同じ invariant へ揃える。
+ *
+ * ここで扱うのは、正式な successor proof が無いまま外部完了等で Task だけが終わった旧行である。
+ * その行は推測で書き換えないため、workspace 所有権の fail-closed fallback が引き続き必要になる。
  *
  * **ここは「候補」しか決めない。解放するかどうかは worktree の実観測で決める。**
  * durable な自己申告はどれも「もう dirty が無い」ことの証明にならないため:
@@ -179,8 +181,8 @@ function isStaleBlockedJobOfFinishedTask(task: Task, job: Job): boolean {
  * blocked Job も原則としてここに入るが、`isStaleBlockedJobOfFinishedTask()` に当たる行だけは
  * ここでは確定させず、`resolveWorkspaceOwnership()` が worktree を観測してから決める。
  *
- * 旧 blocked 行そのものには触れない。行を残すのは既存設計で
- * `resumeBlockedGitCommitJob.test.ts` が固定しているため、所有権の述語だけを直す。
+ * canonical resume lineage がある行の終端化は API startup reconciliation の責務であり、
+ * この Worker の述語は proof の無い stale 行そのものには触れない。
  */
 function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
   for (const { task, jobs } of perTask) {

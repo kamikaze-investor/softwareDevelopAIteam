@@ -3872,9 +3872,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    修正を Production で検証した直後に発覚。commit は成功したのに後続が進まなかった）。
 
    **内容**: `findWorkspaceOwningTaskId()`（`apps/worker/src/index.ts`）は Job の status だけで
-   所有者を決め、**Task の status を一切見ていなかった**。`resumeBlockedTask()` は新しい Job を
-   別行として作り、旧 `blocked` 行を監査証跡として残す（`approveAndResumeJob()` は同一行を
-   `blocked -> queued` へ UPDATE するので滞留しない）。そのため resume 経路でだけ
+   所有者を決め、**Task の status を一切見ていなかった**。当時の `resumeBlockedTask()` は新しい Job を
+   別行として作り、旧 `blocked` 行を監査証跡として残していた（`approveAndResumeJob()` は同一行を
+   `blocked -> queued` へ UPDATE するので滞留しない）。そのため当時は resume 経路でだけ
    「`done` Task に blocked 行が残る」状態が生まれ、所有権が永久に解放されなかった。
 
    **実害**: 期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が解放されず、
@@ -3892,6 +3892,10 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **workspace がまだ使用中の間だけ**所有者として振る舞う。手放してよい状態になれば自然に解放する。
    候補条件は (1) Task が `done` (2) その blocked Job が quarantine されていない の2つだけで、
    解放するか否かは worktree の実観測が決める。
+
+   **2026-09-30 更新**: 新しい resume handoff は successor 作成と同じ transaction で source を
+   `failed` へ終端化する。既存行も、同一 Task の canonical `resume:<source>:<n>` を proof にした
+   startup reconciliation だけが終端化する。proof の無い legacy 行には本項目の fallback が残る。
 
    **解放条件は admission の拒否条件すべてにそろえる（独立レビュー round 3・4・5 の指摘）**:
    `computeWorkspaceBaseline()` が clean を拒否する条件は3つあり、どれか1つでも成立していれば
@@ -9526,9 +9530,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       2026-09-28 production 実測（Task `9fdee5a3`）で登録し、同日修正。
 
       **責務は 1 つ**: Human Resume で後継が作られた古い blocked / failed Job を、「いま Task を止めている Job」
-      として数えないこと。**新しい永続状態 / status / Gate / PL の責務は作らない。** 元の行は書き換えない。
+      として数えないこと。**新しい永続状態 / status / Gate / PL の責務は作らない。**
+      当時は元の行を書き換えない設計だった。
 
-      **実測**: `resumeBlockedTask()` は元の Job を `blocked` のまま残して `resume:<元Job>:1` を作る。
+      **実測（当時）**: `resumeBlockedTask()` は元の Job を `blocked` のまま残して `resume:<元Job>:1` を作っていた。
       `systemState.ts` の `hasMovableJob` は blocked を「動かせる Job」と数えるため、残った元 Job が
       以後の `job_failed` をすべて抑止した。古い `job_blocked:<元Job>` は PL が escalate 済みで、
       `hasEscalated()` が生涯 dedup するので、Human Resume した review の失敗は**誰にも見えないまま止まった**。
@@ -9539,6 +9544,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       well-formed なときだけ。`hasMovableJob` / `job_blocked` / `stallingFailure` の 3 箇所で superseded を除外する。
       後継の失敗は新しい key（`job_failed:<後継>`）で出るので、dedup も episode 単位になる。
       AI / unknown / malformed / 別 Task を指す resume は superseded にしない。`workspace_quarantined` は従来どおり出す。
+
+      **2026-09-30 更新**: 現行 handoff は source を同一 transaction で `failed` へ終端化し、既存の
+      canonical lineage も startup reconciliation で揃える。この superseded 導出は、旧DBや安全上
+      reconciliation できない行に対する compatibility rule として残る。
 
       **この項目に含めないもの**（別責務）:
       - AI resume で同じ形に陥る停止（Human authority の境界を AI resume で動かさないため、意図的に対象外）
@@ -11403,7 +11412,7 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         これは閉じ込めの解除ではなく**安全境界の後退**である。既存 walker の `rootKind` を
         そのまま条件に使い、`human_resume` / `human_recovery` generation の descendant だけを
         通す。新しい authority flag / parser / table / status は足していない
-      - **liveness 側**: `resumeBlockedTask()` は元の行を `blocked` のまま残すのに、live Job の
+      - **liveness 側（当時）**: `resumeBlockedTask()` は元の行を `blocked` のまま残していたのに、live Job の
         除外は implementJob 自身の `resume:` キーだけを見ていた。attempt 2 以降の実装は
         `repair:` 規約なので自分の stepKey からは元の resume 元を辿れず、**人が承認した chain が
         attempt 1 の次で必ず止まっていた**
