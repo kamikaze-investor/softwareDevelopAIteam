@@ -1158,7 +1158,7 @@ export function buildTriageEscalationBody(input: TriageEscalationInput): string 
 // 観測（既存 audit_log に相乗りする）
 // ────────────────────────────────────────────────────────────
 
-/** `audit_log.detail` に置く構造化欄（`escalated` 行では配達欄 `delivery=` の後ろ）。後ろの散文とは役割が違う。読み手は `lane=` 等で位置に依らず読む。 */
+/** `audit_log.detail` に置く構造化欄（`escalated` 行では配達欄 `delivery=` の後ろ）。後ろの散文とは役割が違う。読み手は `\blane=` 等で位置に依らず読む。 */
 export function formatTriageAuditDetail(diagnosis: BlockedDiagnosis): string {
   return (
     `lane=${diagnosis.recommendedLane} cause=${diagnosis.rootCauseClass} `
