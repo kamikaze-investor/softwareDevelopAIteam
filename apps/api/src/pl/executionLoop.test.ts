@@ -535,45 +535,48 @@ describe('escalated の記録と配達結果を同義にしない', () => {
     })
   })
 
-  it('通知経路が例外で落ちても escalated と未配達を記録する', async () => {
+  it('通知経路が例外で落ちたら escalated を確定させず、次の tick でやり直せる', async () => {
+    // 一過性の通知失敗（notifier の dynamic import 失敗・LINE API 500 など）を undelivered として
+    // 記録すると、その対象は hasEscalated() で恒久的に PL の対象外になり、出口が CEO の
+    // abort_task だけになる。**それは本項目が直している不具合の最も重い形である。**
+    // 例外は呼び出し元へ抜け（interval は 'PL tick failed' を log、POST /api/pl/tick は 5xx）、
+    // incident は消費されない。
     const { storage } = seedIdleDesignReview()
     let calls = 0
     const d = escalatingDeps(async () => {
       calls += 1
-      throw new Error('LINE API 500')
+      if (calls === 1) throw new Error('LINE API 500')
+      return DELIVERED
     })
 
-    const result = await runPlTick(storage, d)
+    await expect(runPlTick(storage, d)).rejects.toThrow('LINE API 500')
+    expect(escalatedDetails(storage)).toHaveLength(0)
 
-    expect(result.status).toBe('escalated')
-    expect(calls).toBe(1)
-    expect(parseEscalationDelivery(escalatedDetails(storage)[0])).toEqual({
-      outcome: 'undelivered',
-      channels: ['unknown'],
-    })
+    // ここで固定するのは配達結果と記録の整合だけなので、ガードは同ファイルの他テストと同じく
+    // 手で戻す。例外時のガード解放は下の独立したテストで別に固定する
+    // （2つを1つのテストに混ぜると、落ちたときどちらが壊れたのか判らない）。
+    resetPlLoopInFlightForTest()
+    const retried = await runPlTick(storage, d)
+
+    // 同じ対象がそのまま選ばれ、今度は届いたことまで残る
+    expect(retried.status).toBe('escalated')
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])?.outcome).toBe('delivered')
   })
 
-  it('通知例外を記録した後は既存の重複抑制が働く', async () => {
+  it('通知が例外で落ちた後も次の tick は走る（単一実行ガードを握ったままにしない）', async () => {
+    // 上の「次の tick でやり直せる」が production で成立する前提を、それ単体で固定する。
+    // `runPlTick()` は `inFlight` を finally で戻している（`executionLoop.ts` の try/finally）。
+    // 戻していなければ、1回の通知例外以降 PL は `skipped_in_flight` を返し続けて全作業が止まり、
+    // 本項目が直している不具合より重い状態になる。**ここでは reset を呼ばない。**
     const { storage } = seedIdleDesignReview()
-    let calls = 0
     const d = escalatingDeps(async () => { throw new Error('LINE API 500') })
 
-    const first = await runPlTick(storage, {
-      ...d,
-      escalate: async () => {
-        calls += 1
-        throw new Error('LINE API 500')
-      },
-    })
-    const second = await runPlTick(storage, d)
-
-    expect(first.status).toBe('escalated')
-    expect(second.status).toBe('idle')
-    expect(second.reason).toContain('already escalated')
-    expect(calls).toBe(1)
-    expect(escalatedDetails(storage)).toHaveLength(1)
+    await expect(runPlTick(storage, d)).rejects.toThrow('LINE API 500')
+    // ガードを握ったままなら、この再 tick は例外ではなく skipped_in_flight を返して resolve する。
+    await expect(runPlTick(storage, d)).rejects.toThrow('LINE API 500')
+    // 例外で終わった tick は escalated を記録しない（対象は actionable のまま残る）。
+    expect(escalatedDetails(storage)).toHaveLength(0)
   })
-
   it('配達結果を報告しない escalate でも escalated は残り、届いた扱いにはしない', async () => {
     // 既存の `Promise<void>` 形の注入をそのまま受けられることと、その場合の倒し方を固定する。
     // 報告が無いのは「届いた証拠が無い」ことであり、`delivered` へ倒すのは本項目の不具合である。

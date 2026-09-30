@@ -43,7 +43,7 @@
  * ## 効果検証可能性（Design Philosophy 8）
  *
  * `formatTriageAuditDetail()` が `lane=` / `cause=` / `layer=` / `conf=` を既存
- * `audit_log.detail` の**先頭**へ構造化して載せ、`summarizeBlockedTriage()` が
+ * `audit_log.detail` の先頭側へ構造化して載せ（`escalated` 行では配達欄 `delivery=` の後ろに続く）、`summarizeBlockedTriage()` が
  * そこから件数・route 別内訳・AUTO_RECOVERY 成功率・CEO escalation 率・UNKNOWN 率・
  * 同一原因の再発数を導く。**新しい metrics backend は作らない**
  * （`adoptionFailure.ts` と同じ形である）。
@@ -1158,7 +1158,7 @@ export function buildTriageEscalationBody(input: TriageEscalationInput): string 
 // 観測（既存 audit_log に相乗りする）
 // ────────────────────────────────────────────────────────────
 
-/** `audit_log.detail` の先頭に置く構造化欄。後ろの散文とは役割が違う。 */
+/** `audit_log.detail` に置く構造化欄（`escalated` 行では配達欄 `delivery=` の後ろ）。後ろの散文とは役割が違う。読み手は `lane=` 等で位置に依らず読む。 */
 export function formatTriageAuditDetail(diagnosis: BlockedDiagnosis): string {
   return (
     `lane=${diagnosis.recommendedLane} cause=${diagnosis.rootCauseClass} `

@@ -112,7 +112,7 @@ PL の CEO Escalation は Worker 経由ではない。`apps/api/src/pl/execution
 ### 2-3. 届いたかどうかの確認点
 
 `audit_log` の `pl_loop / escalated` 行の detail **先頭**に配達結果が載る
-（`apps/api/src/pl/executionLoop.ts:946-959,971-988,1926-1967`）:
+（`apps/api/src/pl/executionLoop.ts:917-942,946-959,1926-1971`）:
 
 - `delivery=delivered via=line` — 1本以上のチャネルが受け取った
 - `delivery=undelivered tried=none` — **障害**。チャネル未設定（= 2-2 の手順漏れ）。
@@ -121,7 +121,8 @@ PL の CEO Escalation は Worker 経由ではない。`apps/api/src/pl/execution
 
 `suppressed` と `undelivered` はどちらも「届いていない」が、取り違えてはならない。
 なお `deliverEscalation()` は**記録するだけで再送しない**。通知の仕組み自体が壊れて `escalate` が
-throw した場合も `delivery=undelivered tried=unknown` として `escalated` を必ず記録する。
+throw した場合は**記録しない**（その tick は失敗し、interval 経路は `PL tick failed` を error log する）。
+対象は actionable のまま残り、次の tick でやり直される。一過性の通知障害で incident を使い切らないためである。
 
 **注意:** この配達欄は本リポジトリのコードの現状である。production に当該版が deploy 済みかは
 本ファイルでは確認していない。配達欄の無い古い `escalated` 行は「判らない」であって

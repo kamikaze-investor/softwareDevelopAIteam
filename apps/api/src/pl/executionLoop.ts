@@ -1920,8 +1920,8 @@ async function handOffOrEscalate(
  * **再送も抑止も状態追加もしない**（届かなかったことを見えるようにするのが目的であり、
  * 復旧を妨げる新しい状態を作らない）。
  *
- * `escalate` が throw した場合も `undelivered tried=unknown` へ倒す。
- * 通知経路の例外で「PL が escalation を判断した」という audit まで失わないためである。
+ * `escalate` が throw した場合は**そのまま呼び出し元へ抜ける**（`escalated` を記録しない）。
+ * 一過性の通知障害で incident を使い切らず、次の tick でやり直すためである（本体のコメント参照）。
  */
 async function deliverEscalation(
   storage: IStorage,
@@ -1935,37 +1935,40 @@ async function deliverEscalation(
     return formatEscalationDelivery('suppressed', [])
   }
 
-  try {
-    const escalate = deps.escalate ?? defaultEscalate
-    const body =
-      options.triage !== undefined
-        ? buildTriageEscalationBody({
-          diagnosis: options.triage,
-          item,
-          attemptHistory: attemptHistoryFor(storage, key),
-          blockedReason: reason,
-        })
-        : [
-          `何が起きているか: ${item.detail}`,
-          `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
-          `PL の判断: ${reason}`,
-          'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
-        ].join('\n')
+  // **例外は握り潰さない。** `escalate`（や本文の組み立て）が throw したらこの tick はここで終わり、
+  // `escalated` は記録されない（promotion 元 1833181 と master の従来挙動）。
+  //
+  // 防いでいる失敗: 一過性の通知失敗（notifier の dynamic import 失敗・LINE API 500 など）を
+  // `undelivered` として記録すると、その対象は `hasEscalated()` により**恒久的に** PL の対象外になり、
+  // 1回の一過性エラーで incident を使い切る。例外は呼び出し元で見える（interval 経路は
+  // `PL tick failed` を error log、`POST /api/pl/tick` は 5xx）。対象は actionable のまま残り、次の tick で
+  // やり直せる。`sendAlert()` はチャネル未設定・全チャネル失敗でも正常 resolve するので、配達失敗（D）は
+  // 下の `results` 側で `undelivered` になる。
+  const escalate = deps.escalate ?? defaultEscalate
+  const body =
+    options.triage !== undefined
+      ? buildTriageEscalationBody({
+        diagnosis: options.triage,
+        item,
+        attemptHistory: attemptHistoryFor(storage, key),
+        blockedReason: reason,
+      })
+      : [
+        `何が起きているか: ${item.detail}`,
+        `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
+        `PL の判断: ${reason}`,
+        'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
+      ].join('\n')
 
-    const reported = await escalate({ title: `[PL] ${options.subject ?? item.kind} が解消していません`, body })
-    // 報告が無い実装は空配列と同じ扱い（= `undelivered`）。`toChannelResults` のコメント参照。
-    const results = toChannelResults(reported)
-    const delivered = results.filter((result) => result.success).map((result) => result.channel)
-    return delivered.length > 0
-      ? formatEscalationDelivery('delivered', delivered)
-      // 1本も成功していない＝誰にも届いていない。チャネル未設定（`results` が空）も同じ扱いで、
-      // `tried=none` としてそれが判る。
-      : formatEscalationDelivery('undelivered', results.map((result) => result.channel))
-  } catch {
-    // dynamic import や通知チャネルの例外も audit から消さない。個別チャネルを特定できないため
-    // `unknown` として残し、「未配達だった」という確実な事実だけを記録する。
-    return formatEscalationDelivery('undelivered', ['unknown'])
-  }
+  const reported = await escalate({ title: `[PL] ${options.subject ?? item.kind} が解消していません`, body })
+  // 報告が無い実装は空配列と同じ扱い（= `undelivered`）。`toChannelResults` のコメント参照。
+  const results = toChannelResults(reported)
+  const delivered = results.filter((result) => result.success).map((result) => result.channel)
+  return delivered.length > 0
+    ? formatEscalationDelivery('delivered', delivered)
+    // 1本も成功していない＝誰にも届いていない。チャネル未設定（`results` が空）も同じ扱いで、
+    // `tried=none` としてそれが判る。
+    : formatEscalationDelivery('undelivered', results.map((result) => result.channel))
 }
 
 /** テスト用。モジュールスコープの単一実行ガードを戻す。 */
