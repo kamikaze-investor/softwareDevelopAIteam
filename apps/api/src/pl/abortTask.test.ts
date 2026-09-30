@@ -26,7 +26,11 @@ interface Fixture {
 }
 
 /** production の `6f8b41ef` と同じ形: roadmapActive な pending Task + blocked Job 1本。 */
-function seed(): Fixture {
+function seed(
+  safeCommand: Parameters<IStorage['jobs']['create']>[0]['safeCommand'] = {
+    kind: 'test', workingDir: '/workspace/target',
+  },
+): Fixture {
   const storage = createSQLiteStorage(':memory:')
   const project = storage.projects.create({
     name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
@@ -38,7 +42,7 @@ function seed(): Fixture {
   } as Parameters<IStorage['tasks']['create']>[0])
   const job = storage.jobs.create({
     taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
-    safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    safeCommand, dryRun: false,
     workspaceBaseline: BASELINE,
   } as Parameters<IStorage['jobs']['create']>[0])
   return { storage, projectId: project.id, taskId: task.id, jobId: job.id }
@@ -63,6 +67,14 @@ function seedTerminalBlocked(): TerminalBlockedFixture {
     workspaceBaseline: BASELINE,
   } as Parameters<IStorage['jobs']['create']>[0])
   return { ...fx, latestJobId: latest.id }
+}
+
+/** resumeBlockedTask() がそのまま後継 Job を作れる terminal-blocked 形。 */
+function seedResumableTerminalBlocked(): Fixture {
+  const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
+  fx.storage.tasks.update(fx.taskId, { status: 'blocked' })
+  fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+  return fx
 }
 
 function approve(storage: IStorage, taskId: string, action = 'abort_task'): string {
@@ -954,9 +966,12 @@ describe('abortTask — terminal blocked Task の storage release', () => {
     mismatch.storage.jobs.update(mismatch.jobId, {
       workspaceBaseline: { mode: 'clean', startCommitHash: 'different-head' },
     })
-    expect(completeAbortCleanup(mismatch.storage, {
+    const mismatchResult = completeAbortCleanup(mismatch.storage, {
       jobId: mismatch.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
-    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    })
+    expect(mismatchResult).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    if (mismatchResult.ok) throw new Error('expected HEAD mismatch refusal')
+    expect(mismatchResult.reason).toContain('terminal Jobs do not share one start HEAD')
     expectStillBlocked(mismatch, mismatchApproval)
 
     const missing = seedTerminalBlocked()
@@ -1032,6 +1047,66 @@ describe('abortTask — terminal blocked Task の storage release', () => {
     expect(completeAbortCleanup(fx.storage, {
       jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
     })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expectStillBlocked(fx, approvalRequestId)
+  })
+
+  it.each(['failed', 'success'] as const)(
+    'refuses an old marked Job after resume creates a newer %s Job without consuming approval',
+    (successorStatus) => {
+      const fx = seedResumableTerminalBlocked()
+      const approvalRequestId = approve(fx.storage, fx.taskId)
+      expect(abortTask(fx.storage, {
+        taskId: fx.taskId,
+        approvalRequestId,
+        reason: 'obsolete before resume',
+      })).toMatchObject({
+        ok: true,
+        status: 'cleanup_requested',
+        jobIds: [fx.jobId],
+      })
+
+      const resumed = fx.storage.jobs.resumeBlockedTask({
+        taskId: fx.taskId,
+        instructionPrompt: 'resume after cleanup observation was refused',
+      })
+      if (!resumed.ok) throw new Error(resumed.reason)
+      expect(resumed.ok).toBe(true)
+      fx.storage.jobs.update(resumed.job.id, { status: successorStatus })
+
+      const result = completeAbortCleanup(fx.storage, {
+        jobId: fx.jobId,
+        observation: BASELINE,
+        knownGood: KNOWN_GOOD,
+      })
+
+      expect(result).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+      if (result.ok) throw new Error('expected stale cleanup refusal')
+      expect(result.reason).toContain(`is not task ${fx.taskId}'s latest job (${resumed.job.id})`)
+      expectStillBlocked({ ...fx, latestJobId: resumed.job.id }, approvalRequestId)
+    },
+  )
+
+  it('refuses when the cleanup mark predates the latest Job creation time', () => {
+    const fx = seedTerminalBlocked()
+    const approvalRequestId = requestTerminalBlocked(fx)
+    const latest = fx.storage.jobs.findById(fx.latestJobId)
+    if (!latest) throw new Error('latest job missing')
+    fx.storage.jobs.update(latest.id, {
+      failureMetadata: {
+        ...(latest.failureMetadata ?? {}),
+        abortCleanupRequestedAt: new Date(Date.parse(latest.createdAt) - 1).toISOString(),
+      },
+    })
+
+    const result = completeAbortCleanup(fx.storage, {
+      jobId: latest.id,
+      observation: BASELINE,
+      knownGood: KNOWN_GOOD,
+    })
+
+    expect(result).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    if (result.ok) throw new Error('expected cleanup mark time refusal')
+    expect(result.reason).toContain('predates')
     expectStillBlocked(fx, approvalRequestId)
   })
 

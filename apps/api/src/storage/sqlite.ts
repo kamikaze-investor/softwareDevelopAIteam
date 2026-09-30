@@ -3010,6 +3010,39 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `task ${task.id} has no jobs; use the existing recovery path before parking`,
             }
           }
+          const latestJob = taskJobs[0]
+          if (!latestJob) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} has no latest job; refusing to park`,
+            }
+          }
+          if (latestJob.id !== job.id) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `job ${job.id} is not task ${task.id}'s latest job (${latestJob.id}); `
+                + 'a later execution superseded this abort cleanup request',
+            }
+          }
+          const cleanupRequestedAt = job.failureMetadata.abortCleanupRequestedAt
+          const cleanupRequestedAtMs = Date.parse(cleanupRequestedAt)
+          const latestJobCreatedAtMs = Date.parse(latestJob.createdAt)
+          if (
+            !Number.isFinite(cleanupRequestedAtMs)
+            || !Number.isFinite(latestJobCreatedAtMs)
+            || cleanupRequestedAtMs < latestJobCreatedAtMs
+          ) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `abort cleanup request ${cleanupRequestedAt} predates task ${task.id}'s latest job `
+                + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`,
+            }
+          }
           const nonTerminal = taskJobs.find(
             (candidate) => candidate.status !== 'failed' && candidate.status !== 'success',
           )
@@ -3063,28 +3096,50 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
 
           const workingDir = job.safeCommand?.workingDir
-          const unprovenJob = taskJobs.find((candidate) => (
+          const differentWorkspaceJob = taskJobs.find((candidate) => (
             workingDir === undefined
             || workingDir === ''
             || candidate.safeCommand?.workingDir !== workingDir
-            || !candidate.workspaceBaseline
-            || candidate.workspaceBaseline.startCommitHash !== input.observation.startCommitHash
           ))
-          if (unprovenJob) {
-            const baseline = unprovenJob.workspaceBaseline
+          if (differentWorkspaceJob) {
             return {
               ok: false as const,
               code: 'VERIFICATION_FAILED' as const,
               reason:
-                `task ${task.id} job ${unprovenJob.id} is not proven by the clean observation `
+                `task ${task.id} job ${differentWorkspaceJob.id} is not proven by the clean observation `
                 + (workingDir === undefined || workingDir === ''
                   ? '(the observed job has no workingDir)'
-                  : unprovenJob.safeCommand?.workingDir !== workingDir
-                    ? `(workingDir ${unprovenJob.safeCommand?.workingDir} differs from ${workingDir})`
-                    : !baseline
-                      ? '(workspace baseline is missing)'
-                      : `(start HEAD ${baseline.startCommitHash} differs from observed HEAD `
-                        + `${input.observation.startCommitHash})`),
+                  : `(workingDir ${differentWorkspaceJob.safeCommand?.workingDir} differs from ${workingDir})`),
+            }
+          }
+          const missingBaselineJob = taskJobs.find((candidate) => !candidate.workspaceBaseline)
+          if (missingBaselineJob) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason: `task ${task.id} job ${missingBaselineJob.id} has no workspace baseline`,
+            }
+          }
+          const startHeads = new Set(
+            taskJobs.map((candidate) => candidate.workspaceBaseline?.startCommitHash),
+          )
+          if (startHeads.size !== 1) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id}'s terminal Jobs do not share one start HEAD `
+                + `(${Array.from(startHeads).join(', ')})`,
+            }
+          }
+          const sharedStartHead = latestJob.workspaceBaseline?.startCommitHash
+          if (sharedStartHead !== input.observation.startCommitHash) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id}'s shared start HEAD ${sharedStartHead} differs from observed HEAD `
+                + input.observation.startCommitHash,
             }
           }
 

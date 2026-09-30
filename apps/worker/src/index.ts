@@ -1014,11 +1014,20 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
 
-      const requested = jobs.find((job) => {
-        if (job.failureMetadata?.abortCleanupRequestedAt === undefined) return false
-        if (task.status === 'pending') return job.status === 'blocked'
-        return task.status === 'blocked' && (job.status === 'failed' || job.status === 'success')
-      })
+      // `/api/jobs` は storage と同じ created_at DESC, rowid DESC。terminal-blocked 形では
+      // 最新 Job だけを候補にし、resume 後の古い mark を報告しない。
+      const latestJob = jobs[0]
+      const requested = task.status === 'blocked'
+        ? latestJob
+          && (latestJob.status === 'failed' || latestJob.status === 'success')
+          && latestJob.failureMetadata?.abortCleanupRequestedAt !== undefined
+          ? latestJob
+          : undefined
+        : jobs.find((job) => (
+          task.status === 'pending'
+          && job.status === 'blocked'
+          && job.failureMetadata?.abortCleanupRequestedAt !== undefined
+        ))
       if (!requested) continue
 
       const observed = observeWorkspace(requested.safeCommand.workingDir)
@@ -1056,7 +1065,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
           )
           // 成立しなかった poll では intake を飛ばさない。403（allowlist 漏れ等）や
           // 恒久的な不一致が続いても、Worker 全体は止まらない。
-          return false
+          continue
         }
       } catch (err: unknown) {
         console.warn(`[Worker] abort cleanup 報告エラー: ${formatUnknownError(err)}`)

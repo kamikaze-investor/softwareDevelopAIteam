@@ -956,7 +956,7 @@ function ceoDecisionAndOptions(
   item: AttentionItem,
 ): { decision: string; options: string[] } {
   // **Job 0 件の blocked は、どの原因であってもまず `pending` へ戻すのが先。**
-  // `abortTask()` も `syncRoadmapTasks()` も `status === 'pending'` を要求するので、
+  // この Job 0 件形では `abortTask()` も `syncRoadmapTasks()` も `status === 'pending'` を要求するので、
   // 原因が CONFLICT と特定できなかった（`rootCauseClass='unknown'`）場合に汎用の選択肢へ
   // 落ちると、**park を勧めておきながら `TASK_NOT_PARKABLE` で弾かれる**
   // （独立レビュー round 5 指摘）。分岐の鍵は原因ではなく**どの attention か**である。
@@ -1041,8 +1041,9 @@ function ceoDecisionAndOptions(
     // したがって「もう一度 Remediation へ」は選択肢にならない。まず再投入が要る。
     case 'design_review_conflict':
       // **どの選択肢も、まず `pending` へ戻すことが前提になる。**
-      // `syncRoadmapTasks()`（採用し直し）も `abortTask()`（park）も `status === 'pending'` を
-      // 要求するため、blocked のままではそれぞれ `SYNC_FAILED` / `TASK_NOT_PARKABLE` で弾かれる。
+      // この Job 0 件形では `syncRoadmapTasks()`（採用し直し）も `abortTask()`（park）も
+      // `status === 'pending'` を要求するため、blocked のままではそれぞれ
+      // `SYNC_FAILED` / `TASK_NOT_PARKABLE` で弾かれる。
       // 順序を書かないと**どれも実行できない選択肢**を CEO へ渡すことになる
       // （独立レビュー指摘・2026-09-21）。
       return {

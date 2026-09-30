@@ -222,6 +222,91 @@ describe('abort cleanup observation reporting', () => {
 
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(true)
   })
+
+  it('does not report an old marked terminal Job after a newer Job exists', async () => {
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const newerJob: Job = { ...job, id: 'job-newer', status: 'failed' }
+    const oldMarkedJob: Job = {
+      ...job,
+      id: 'job-old-marked',
+      status: 'failed',
+      failureMetadata: {
+        abortCleanupRequestedAt: NOW,
+        abortApprovalRequestId: 'approval-1',
+      },
+    }
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) {
+        return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=')) {
+        return new Response(JSON.stringify([newerJob, oldMarkedJob]), { status: 200 })
+      }
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(workspaceVerificationMocks.observeWorkspace).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(false)
+  })
+
+  it('continues to later cleanup candidates when an earlier report is refused', async () => {
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const tasks: Task[] = [
+      { ...task, id: 'task-refused', status: 'pending' },
+      { ...task, id: 'task-accepted', status: 'pending' },
+    ]
+    const markedJob = (id: string, taskId: string): Job => ({
+      ...job,
+      id,
+      taskId,
+      status: 'blocked',
+      failureMetadata: {
+        abortCleanupRequestedAt: NOW,
+        abortApprovalRequestId: `approval-${id}`,
+      },
+    })
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify(tasks), { status: 200 })
+      if (value.includes('/api/jobs?taskId=task-refused')) {
+        return new Response(JSON.stringify([markedJob('job-refused', 'task-refused')]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=task-accepted')) {
+        return new Response(JSON.stringify([markedJob('job-accepted', 'task-accepted')]), { status: 200 })
+      }
+      if (value.includes('/api/jobs/job-refused/abort-cleanup-result')) {
+        return new Response(JSON.stringify({ error: 'refused' }), { status: 409 })
+      }
+      if (value.includes('/api/jobs/job-accepted/abort-cleanup-result')) {
+        return new Response(null, { status: 200 })
+      }
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+    const reports = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/abort-cleanup-result'))
+    expect(reports).toEqual([
+      expect.stringContaining('/api/jobs/job-refused/abort-cleanup-result'),
+      expect.stringContaining('/api/jobs/job-accepted/abort-cleanup-result'),
+    ])
+  })
 })
 
 describe('terminal result persistence', () => {

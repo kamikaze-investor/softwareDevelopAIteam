@@ -21,11 +21,13 @@
  * 1. 前提条件 + CEO Approval を検証
  * 2. 所有権を保持する blocked Job があれば cleanup を要求（サーバ側が対象を決める）
  * 3. Worker が既存の観測経路で workspace を観測して報告
- * 4. API が観測を再検証し、一致したときだけ blocked -> failed で所有権解放
- * 5. 同一 transaction で Task を park し、audit を残す
+ * 4. API が観測を再検証し、一致したときだけ、pending Task の blocked Job は failed へ解放する
+ *    （全 Job terminal の blocked Task では Job status を変えない）
+ * 5. 同一 transaction で Task を pending / roadmapActive=false へ park し、audit を残す
  * ```
  *
- * 検証に失敗したら **park しない**。Job は blocked のまま所有権を保持する（fail-closed）。
+ * 検証に失敗したら **park しない**。blocked Job の所有権または blocked Task の状態を
+ * そのまま保持する（fail-closed）。
  *
  * ## 作っていないもの
  *
@@ -317,8 +319,8 @@ export type CompleteAbortCleanupResult =
  * Worker が観測を報告したときの最終段。
  *
  * **観測はここで再検証する。** Worker が「安全でした」と言うだけでは所有権を解放しない
- * （`clearWorkspaceQuarantine()` と同じ形）。検証・解放・park・audit は
- * `releaseBlockedJobAndParkTask()` が単一 transaction で行う。
+ * （`clearWorkspaceQuarantine()` と同じ形）。検証・必要な所有権解放・park・audit は、Task の
+ * status に応じた storage transaction が単一 transaction で行う。
  */
 export function completeAbortCleanup(
   storage: IStorage,
@@ -350,17 +352,17 @@ export function completeAbortCleanup(
   // taskId は Job から導くが、**承認がその Task に束縛されているか**は
   // storage の status 別 release transaction が検証する。ここでは承認の正当性を決めない。
   const task = storage.tasks.findById(job.taskId)
-  const release = task?.status === 'blocked'
-    ? storage.jobs.parkBlockedTaskWithTerminalJobs
-    : storage.jobs.releaseBlockedJobAndParkTask
-  const released = release({
+  const releaseInput = {
     jobId: job.id,
     taskId: job.taskId,
     observation: input.observation,
     knownGood: input.knownGood,
     reason: metadata.abortReason ?? 'abort_task',
     approvalRequestId: metadata.abortApprovalRequestId,
-  })
+  }
+  const released = task?.status === 'blocked'
+    ? storage.jobs.parkBlockedTaskWithTerminalJobs(releaseInput)
+    : storage.jobs.releaseBlockedJobAndParkTask(releaseInput)
   if (!released.ok) {
     return {
       ok: false,

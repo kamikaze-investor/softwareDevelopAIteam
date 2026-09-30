@@ -553,8 +553,9 @@ export interface IJobStorage {
   }): ReleaseBlockedJobAndParkTaskResult
   /**
    * 全 Job が既に terminal な blocked Task を abort_task で park する最終段。
-   * Job 行は変更せず、workspace の clean 観測と全 Job の start HEAD 一致を
-   * transaction 内で再検証してから Task 遷移・承認消費・audit を確定する。
+   * Job 行は変更せず、観測対象が Task の最新 Job であること、cleanup request より後の
+   * Job が無いこと、workspace の clean 観測と全 Job の start HEAD 一致を transaction 内で
+   * 再検証してから Task 遷移・承認消費・audit を確定する。
    */
   parkBlockedTaskWithTerminalJobs(input: {
     jobId: string
