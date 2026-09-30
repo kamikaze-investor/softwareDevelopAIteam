@@ -995,13 +995,12 @@ export async function pollJobs(): Promise<never> {
  *
  * ## TOCTOU
  *
- * 観測から解放までの間に別 Job が同じ workspace を書き換えないことは、**既存の所有権規則**が
- * 担保する。対象 Job は `blocked` のまま所有権を保持しており、
- * `findWorkspaceOwningTaskId()` がその Task を所有者と判定するため、
- * `fetchQueuedJob()` は他 Task の Job を claim しない。**新しい lock は足していない。**
- * 解放後は所有者が居なくなるので、次の poll から通常どおり claim が再開する。
+ * pending Task の従来形では対象 Job が `blocked` のまま所有権を保持する。blocked Task の
+ * terminal-Job 形では、この報告を同じ poll の queued Job fetch より先に直列実行し、API 側が
+ * transaction 内で project の live Job 不在を再確認する。**新しい lock は足していない。**
+ * 成功後は Task が pending / roadmapActive=false になるので、次の poll から通常どおり進める。
  */
-async function reportAbortCleanupObservations(): Promise<boolean> {
+export async function reportAbortCleanupObservations(): Promise<boolean> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return false
 
@@ -1015,9 +1014,20 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
 
-      const requested = jobs.find((job) => (
-        job.status === 'blocked' && job.failureMetadata?.abortCleanupRequestedAt !== undefined
-      ))
+      // `/api/jobs` は storage と同じ created_at DESC, rowid DESC。terminal-blocked 形では
+      // 最新 Job だけを候補にし、resume 後の古い mark を報告しない。
+      const latestJob = jobs[0]
+      const requested = task.status === 'blocked'
+        ? latestJob
+          && (latestJob.status === 'failed' || latestJob.status === 'success')
+          && latestJob.failureMetadata?.abortCleanupRequestedAt !== undefined
+          ? latestJob
+          : undefined
+        : jobs.find((job) => (
+          task.status === 'pending'
+          && job.status === 'blocked'
+          && job.failureMetadata?.abortCleanupRequestedAt !== undefined
+        ))
       if (!requested) continue
 
       const observed = observeWorkspace(requested.safeCommand.workingDir)
@@ -1055,7 +1065,7 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
           )
           // 成立しなかった poll では intake を飛ばさない。403（allowlist 漏れ等）や
           // 恒久的な不一致が続いても、Worker 全体は止まらない。
-          return false
+          continue
         }
       } catch (err: unknown) {
         console.warn(`[Worker] abort cleanup 報告エラー: ${formatUnknownError(err)}`)

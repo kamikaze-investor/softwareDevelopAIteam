@@ -2964,6 +2964,231 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
       }
     },
+    parkBlockedTaskWithTerminalJobs(input) {
+      try {
+        const run = db.transaction(() => {
+          const jobRow = db.prepare('SELECT * FROM jobs WHERE id = ?').get(input.jobId) as any
+          if (!jobRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Job not found' }
+          const job = deserializeJob(jobRow)
+
+          const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as any
+          if (!taskRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Task not found' }
+          const task = deserializeTask(taskRow)
+
+          if (job.taskId !== task.id) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} does not belong to task ${task.id}`,
+            }
+          }
+          if (
+            !job.failureMetadata?.abortCleanupRequestedAt
+            || job.failureMetadata.abortApprovalRequestId !== input.approvalRequestId
+          ) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} does not carry this abort cleanup request`,
+            }
+          }
+          if (task.status !== 'blocked' || task.roadmapActive !== true) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; `
+                + 'terminal-job parking requires a blocked, roadmap-active task',
+            }
+          }
+
+          const taskJobs = jobs.findByTaskId(task.id)
+          if (taskJobs.length === 0) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} has no jobs; use the existing recovery path before parking`,
+            }
+          }
+          const latestJob = taskJobs[0]
+          if (!latestJob) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} has no latest job; refusing to park`,
+            }
+          }
+          if (latestJob.id !== job.id) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `job ${job.id} is not task ${task.id}'s latest job (${latestJob.id}); `
+                + 'a later execution superseded this abort cleanup request',
+            }
+          }
+          const cleanupRequestedAt = job.failureMetadata.abortCleanupRequestedAt
+          const cleanupRequestedAtMs = Date.parse(cleanupRequestedAt)
+          const latestJobCreatedAtMs = Date.parse(latestJob.createdAt)
+          if (
+            !Number.isFinite(cleanupRequestedAtMs)
+            || !Number.isFinite(latestJobCreatedAtMs)
+            || cleanupRequestedAtMs < latestJobCreatedAtMs
+          ) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `abort cleanup request ${cleanupRequestedAt} predates task ${task.id}'s latest job `
+                + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`,
+            }
+          }
+          const nonTerminal = taskJobs.find(
+            (candidate) => candidate.status !== 'failed' && candidate.status !== 'success',
+          )
+          if (nonTerminal) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} still has non-terminal job ${nonTerminal.id} (${nonTerminal.status})`,
+            }
+          }
+          const quarantined = taskJobs.find((candidate) => candidate.failureMetadata?.quarantined === true)
+          if (quarantined) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${quarantined.id} is quarantined; clear it through the existing path first`,
+            }
+          }
+
+          const live = db.prepare(
+            "SELECT j.id AS id, j.status AS status FROM jobs j JOIN tasks t ON t.id = j.task_id "
+            + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
+          ).get(task.projectId) as { id: string; status: string } | undefined
+          if (live) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `project has a live job (${live.id} is ${live.status}); refusing to park`,
+            }
+          }
+
+          const knownGood = input.knownGood
+          if (
+            input.observation.mode !== 'clean'
+            || knownGood.gitOperationMarkers.length > 0
+            || !knownGood.worktreeClean
+            || !knownGood.indexClean
+            || !knownGood.headValid
+            || !knownGood.blindSpotsAbsent
+          ) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `job ${job.id}'s workspace is not provably clean and known-good `
+                + `(observation=${input.observation.mode}, git operations: `
+                + `${knownGood.gitOperationMarkers.join(', ') || 'none'}, `
+                + `worktreeClean=${knownGood.worktreeClean}, indexClean=${knownGood.indexClean}, `
+                + `headValid=${knownGood.headValid}, blindSpotsAbsent=${knownGood.blindSpotsAbsent})`,
+            }
+          }
+
+          const workingDir = job.safeCommand?.workingDir
+          const differentWorkspaceJob = taskJobs.find((candidate) => (
+            workingDir === undefined
+            || workingDir === ''
+            || candidate.safeCommand?.workingDir !== workingDir
+          ))
+          if (differentWorkspaceJob) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id} job ${differentWorkspaceJob.id} is not proven by the clean observation `
+                + (workingDir === undefined || workingDir === ''
+                  ? '(the observed job has no workingDir)'
+                  : `(workingDir ${differentWorkspaceJob.safeCommand?.workingDir} differs from ${workingDir})`),
+            }
+          }
+          const missingBaselineJob = taskJobs.find((candidate) => !candidate.workspaceBaseline)
+          if (missingBaselineJob) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason: `task ${task.id} job ${missingBaselineJob.id} has no workspace baseline`,
+            }
+          }
+          const startHeads = new Set(
+            taskJobs.map((candidate) => candidate.workspaceBaseline?.startCommitHash),
+          )
+          if (startHeads.size !== 1) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id}'s terminal Jobs do not share one start HEAD `
+                + `(${Array.from(startHeads).join(', ')})`,
+            }
+          }
+          const sharedStartHead = latestJob.workspaceBaseline?.startCommitHash
+          if (sharedStartHead !== input.observation.startCommitHash) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id}'s shared start HEAD ${sharedStartHead} differs from observed HEAD `
+                + input.observation.startCommitHash,
+            }
+          }
+
+          const foreign = findBlockedOwnerInProject(task.projectId, {
+            excludeTaskId: task.id,
+            provenWorkingDir: workingDir,
+          })
+          if (foreign) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `task ${foreign.task.id} holds the workspace through blocked job ${foreign.job.id}; `
+                + 'refusing to park',
+            }
+          }
+
+          const approval = verifyAndConsumeAbortApproval(task.id, input.approvalRequestId)
+          if (!approval.ok) {
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
+          }
+
+          tasks.update(task.id, { status: 'pending', roadmapActive: false })
+          auditLog.record({
+            actor: 'api',
+            operation: 'task_aborted',
+            entityType: 'task',
+            entityId: task.id,
+            result: 'success',
+            detail:
+              `parked blocked -> pending (approval ${input.approvalRequestId}, `
+              + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}): `
+              + input.reason.slice(0, 300),
+          })
+
+          const updatedTask = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
+          return { ok: true as const, job, task: updatedTask }
+        })
+        // live Job / foreign owner の確認から approval consume・park まで write lock を保持する。
+        // 別 connection の claim が検証直後に割り込む余地を作らない。
+        return run.immediate()
+      } catch (err: unknown) {
+        return {
+          ok: false as const,
+          code: 'STORAGE_ERROR' as const,
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
     clearWorkspaceQuarantine(input) {
       const clearTransaction = db.transaction((
         jobId: string,
