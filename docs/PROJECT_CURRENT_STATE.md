@@ -229,6 +229,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Task→Job自動生成と連続実行**
 - Project全体の完了判定
 - **Meta Review MVP Hardening
+- **Meta Reviewer structured-output robustness / false-BLOCKED の解消**
 - **Interactive Project Definition / Readiness
 - **Design Review CONFLICT Recovery
 - **Project Pause / Continuation-Control Gap
@@ -245,6 +246,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
 - **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**
 - **Task ContinuationのGET依存解消（高優先度）
+- 2種類の承認の役割整理とMobile導線設計
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
 - 追加開発指示（追加Task作成）画面（Mobile）
@@ -255,6 +257,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Tier A: 自己開発の最初の安全な切替点
 - **cleanup だけが失敗した containment が Job を quarantine させる
 - **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される
+- **PL Escalation の配達結果が記録されず、配達済み・未配達・意図的抑制を区別できない**
 - **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
@@ -278,7 +281,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
-- **Meta Reviewer structured-output robustness / false-BLOCKED の解消**（state: planned）
 - **Safety / Authority 変更に対する Independent Review の判定が安定しない**（state: planned）
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
@@ -298,7 +300,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: planned）
 - **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
-- 2種類の承認の役割整理とMobile導線設計（state: planned）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
 - **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Maintenance Lane v0 = Tier B: 自分では触れない変更を、正本を手放さずに管理する**（state: planned）
@@ -314,7 +315,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
 - **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった**（state: planned）
 - **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる**（state: planned）
-- **PL Escalation が未配達でも `escalated` と記録し、以後 PL の全作業が永久に止まる**（state: planned）
+- **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**（state: planned）
 - **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**（state: planned）
 - **cheap AI（説明・質問経路）の latency と timeout 契約**（state: planned）
 - **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる**（state: planned）

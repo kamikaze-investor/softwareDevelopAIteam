@@ -285,7 +285,11 @@ function ProjectCard({
   onStarted: () => void
   /** MOB-001: 既存状態から導出した実行状態。lifecycle status とは別物。 */
   health?: JobDisplayState
-  /** MOB-001: 全 roadmap Task 完了。running のままでも作業中に見せないため。 */
+  /**
+   * MOB-001: 現在の roadmap Task を全件消化した状態。running のままでも作業中に見せないため。
+   * Project Goal の達成ではない（`ProjectRoadmapCompletion.isComplete` と同じ意味。
+   * 算出は `allRoadmapTasksDone`）。
+   */
   allTasksDone?: boolean
 }) {
   const [tasks, setTasks] = useState<Task[]>([])
@@ -408,14 +412,17 @@ function ProjectCard({
           {project.name}
         </Text>
         <View style={styles.badgeGroup}>
-          {/* MOB-001: 「完了」を出すのは lifecycle が running のときだけ。
+          {/* MOB-001: このバッジは「現在のロードマップを消化し切った」ことだけを示す。
+              Project は Goal 達成まで継続するため、ここで「完了」と出すと Roadmap 途中の
+              Project が終わったように見える（2026-09-13 CEO 訂正）。
+              出すのは lifecycle が running のときだけ。
               running だけが「作業中」と誤読される状態であり、paused / archived / draft は
-              lifecycle バッジ自体が既に意味を伝えている。そこへ「完了」を重ねると、
+              lifecycle バッジ自体が既に意味を伝えている。そこへこのバッジを重ねると、
               CEO 自身が行った終了・一時停止の操作を上書きされたように見える。 */}
           {allTasksDone === true && project.status === 'running'
             && (health === undefined || health === 'other') && (
             <View style={[styles.badge, { backgroundColor: '#22c55e' }]}>
-              <Text style={styles.badgeText}>完了</Text>
+              <Text style={styles.badgeText}>ロードマップ消化済み</Text>
             </View>
           )}
           {health !== undefined && health !== 'other' && (
@@ -424,8 +431,9 @@ function ProjectCard({
             </View>
           )}
           {/* lifecycle status は二次情報として残す（running でも止まっていることがある）。
-              ただし「完了」を出しているときは running を並べない。作業が終わっているのに
-              running が見えると、CEO には「まだ動いているのか終わったのか」が判断できない。 */}
+              ただし「ロードマップ消化済み」を出しているときは running を並べない。手持ちの
+              作業が尽きているのに running が見えると、CEO には「まだ動いているのか
+              待ちなのか」が判断できない。 */}
           {!(allTasksDone === true && project.status === 'running') && (
             <View style={[styles.lifecycleBadge, { borderColor: statusColor }]}>
               <Text style={[styles.lifecycleBadgeText, { color: statusColor }]}>{project.status}</Text>
@@ -644,7 +652,8 @@ export default function Dashboard() {
   const [pendingApprovalCount, setPendingApprovalCount] = useState<number | null>(null)
   const [healthByProject, setHealthByProject] = useState<Record<string, JobDisplayState>>({})
   // MOB-001: Project lifecycle に completed は存在せず、明示終了まで running のまま。
-  // そのため「全Task完了」を別途導出しないと、終わった Project が作業中に見える。
+  // そのため「現在の roadmap を消化し切ったか」を別途導出しないと、手持ちの作業が尽きた
+  // Project が作業中に見える。Project 自体の完了（Goal 達成）とは別物。
   const [doneByProject, setDoneByProject] = useState<Record<string, boolean>>({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)

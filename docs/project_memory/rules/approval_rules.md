@@ -33,6 +33,113 @@ CEO 必須にしない方向を定める。
 
 ---
 
+## 2種類の承認 — 役割と使い分け
+
+**承認機構は2つあり、統合せず併存させる。** 両者は名前が似ているが、**束縛している対象が違う**ため
+代替関係にない。片方を通しても、もう片方の要件は消えない。
+
+### A. Project単位承認（UI表記「方針承認」）
+
+| 項目 | 内容 |
+| --- | --- |
+| 型 | `Approval`（`packages/shared/src/types/project.ts`） |
+| 状態 | `pending` / `approved` / `rejected` / `expired` |
+| 対象 | Project全体の方針（`type`: `goal_change` / `philosophy_change` / `external_service` / `billing` / `deployment` / `security` / `dependency_add`） |
+| 一覧 | `GET /api/approvals/pending`（全Project横断・`projectName` 付き） / `GET /api/projects/:projectId/approvals` |
+| 作成 | `POST /api/projects/:projectId/approvals` |
+| 決定 | `PATCH /api/approvals/:id`（`status` + `reviewNote`、`reviewedAt` はサーバー付与） |
+| commit / diff 束縛 | **無い** |
+| TTL / 消費 | **無い**（一度 `approved` にすると、明示的に更新するまで有効。自動失効しない） |
+| PL Gate名 | `ceo_approval` |
+
+`ceo_approval` は「その操作のために出された承認か」を `REQUIRED_CEO_APPROVAL_TYPE`
+（`apps/api/src/pl/actionGate.ts`）で `type` 照合する。`rollback_commit` / `restart_service` /
+`deploy_production` → `deployment`、`switch_provider` → `external_service`。
+
+### B. Task/Job単位 Approval Gate（UI表記「危険操作の承認」）
+
+| 項目 | 内容 |
+| --- | --- |
+| 型 | `ApprovalRequest`（`packages/shared/src/types/approval_gate.ts`） |
+| 状態 | `WAITING_FOR_USER` / `APPROVED` / `REJECTED` / `EXPIRED` / `SUPERSEDED` / `STALE` / `CONSUMED` |
+| 対象 | **特定のTaskの、特定の変更集合**（`targetBranch` + `targetCommit` + `targetDiffHash`） |
+| 一覧 | `GET /api/approval-requests/waiting` |
+| 作成 | `POST /api/gate/check` が `BLOCKED` 判定時に発行。`POST /api/approval-requests` もあるが `requestedAction: 'git_commit'` は 400 で拒否され、**git_commit は必ず `/gate/check` 経由**になる |
+| 決定 | `PATCH /api/approval-requests/:id/status`（`APPROVED` / `REJECTED` のみ。他の状態は内部遷移専用。`WAITING_FOR_USER` 以外への操作は 409） |
+| commit / diff 束縛 | **有る**（変わると `SUPERSEDED` / `STALE`） |
+| TTL / 消費 | TTL 24時間（`APPROVAL_REQUEST_TTL_MINUTES`＠`packages/shared/src/approvalGateLogic.ts` が正本。RiskLevel別の分岐は持たない）。`POST /:id/consume` で **一回限り** |
+| PL Gate名 | `approval_gate` |
+
+### 使い分けの判断
+
+- 「**この変更（commit/diff）を適用してよいか**」→ B（Approval Gate）
+- 「**この方針・課金・外部サービス・公開・権限を認めるか**」→ A（Project単位承認）
+- **両方必要な操作がある。** 例: `rollback_commit` は `safety_review` + `approval_gate` + `ceo_approval`、
+  `deploy_production` は `independent_review` + `ceo_approval`（`packages/shared/src/plActionPolicy.ts`）。
+  A を取ったから B を省く、という運用はしない。
+
+### なぜ統合しないか
+
+統合すると、次のどちらかを選ぶことになる。
+
+1. **全承認に commit/diff 束縛とTTL/consumeを持たせる** → 方針承認（課金・Goal変更など）が、
+   無関係な diff の変化で `STALE` になり使えなくなる
+2. **Approval Gate 側の無効化条件を緩める** → 2026-09-15 の事故で実際に機能した STALE 保護
+   （下記「Candidate Freeze」章）を失う
+
+どちらも安全性か実用性を落とす。したがって Constitution 3.16 に従い、**複雑な統合状態を作らず
+2機構のまま併存させ、集約はUI（1画面2セクション）だけで行う**。
+
+---
+
+## Mobile導線（実装済み — `apps/mobile/app/approvals.tsx`）
+
+**CEOの操作入口は1画面に統一されている。** 2種類の承認は同じ画面の別セクションとして並ぶ。
+
+- **入口**: ホーム（`apps/mobile/app/index.tsx`）の固定フッター「承認待ち一覧」ボタン → `/approvals`。
+  バッジ件数は **A の pending 件数 + B の `WAITING_FOR_USER` 件数の合計**（`fetchPendingApprovalCount()`）。
+  ホームは取得結果を `setCachedApprovals()` / `setCachedApprovalRequests()` でキャッシュへ入れるので、
+  承認画面は遷移直後から描画できる
+- **画面**: `apps/mobile/app/approvals.tsx`（「承認待ち」）
+  - `⚠️ 危険操作の承認` セクション = B（Approval Gate）
+  - `📋 方針承認（Project全体の経営判断）` セクション = A（Project単位承認）
+- **取得**: `apps/mobile/lib/approvalsCache.ts` の `fetchWaitingApprovalRequests()` /
+  `fetchPendingApprovals()` を `Promise.all` で並行実行し、`usePolling` で定期更新する。
+  モジュールキャッシュを持つので再入時は即描画される（Project数分のfetchは発生しない）
+- **共通**: 却下は理由必須（`RejectReasonModal`、両セクション共有）。承認は `Alert` 確認のみ
+- **Bのみ持つ導線**: カードタップで展開 →
+  - AI説明（`POST /api/approval-requests/:id/explanation`）
+  - AIへ質問（`POST /api/approval-requests/:id/ask`。履歴は画面を閉じるまでのクライアント保持）
+  - 技術詳細（`triggeredRules` の日本語化、対象ファイル、review findings、verification）
+  - exact diff は `diffStatus === 'exact'` のときだけ表示し、`stale` / `unavailable` では
+    **diffを出さずに理由を表示する**
+- **Aに無いもの**: AI説明・diff表示は無い。**束縛する diff が存在しないため**で、欠落ではない。
+  表示は `type` / `title` / `reason` / `projectName` のみ
+- **承認後**: B の承認は Worker 反映待ちになり得る（UIもそう通知する）。`git_commit` の `APPROVED` は
+  `approveAndResumeJob()` が Job 再開まで行う
+- **Project詳細（`apps/mobile/app/projects/[id].tsx`）は表示専用で、承認操作の入口ではない。**
+  B（`/api/approval-requests/waiting`）だけを取得し、`deriveProjectExecutionHealth()`
+  （`apps/mobile/lib/taskWorkflow.ts`）で Job に紐付く B を `approval_waiting` 表示へ反映する。
+  A は取得しない
+
+---
+
+## 既知の制約（いずれも非ブロッキング。スマホ操作サイクルは上記で完結する）
+
+1. **`ceo_approval` は Project scope を照合できない。** `Approval` 型に `projectId` が無く、
+   `approvals.findById()` も返さないため、現状は `type` 照合までである
+   （`/api/approvals/pending` は storage の行を cast して `projectName` を付けている）。
+2. **方針承認に自動失効が無い。** `expired` は `PATCH` で設定できるが、時間経過で自動遷移しない。
+3. **方針承認には自動作成経路が無い。** `storage.approvals.create()` を呼ぶのは
+   `POST /api/projects/:projectId/approvals` だけで、Yellow Zone 該当事項を検知して自動で
+   起票する仕組みは無い。**誰かが明示的にPOSTしない限り、この一覧には出ない。**
+   Yellow Zone の通知責務（下記「CEOの承認が必要」章）は、この一覧に依存していない。
+4. **Project詳細の状態表示は方針承認を反映しない。** A が pending でも、その Project の
+   execution health は `approval_waiting` にならない（A は Job に紐付かないため）。
+   A の見落としはホームのバッジ件数と承認画面で防いでおり、Project詳細は A の入口として扱わない。
+
+---
+
 ## Candidate Freeze — Approval が pending の間は Candidate を動かさない（2026-09-15 運用不変条件）
 
 **Approval Request は Candidate の HEAD（`target_commit`）と diff hash に紐付く。**
@@ -154,3 +261,5 @@ Rollback可否:
 ---
 
 *Created: 2026-05-28*
+*Updated: 2026-09-16 — 「2種類の承認 — 役割と使い分け」「Mobile導線」「既知の制約」章を追加（Roadmap「2種類の承認の役割整理とMobile導線設計」の文書化分）*
+*Updated: 2026-09-30 — Mobile導線にホーム入口（バッジ件数・キャッシュ先読み）とProject詳細（B のみ・表示専用）を追記。既知の制約4を追加*

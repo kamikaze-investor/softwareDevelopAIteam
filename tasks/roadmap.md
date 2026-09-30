@@ -1500,8 +1500,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
 **将来項目（Step 2系の完了後に個別判断。今回は着手しない）**
 
-<!-- roadmap:id=meta-review-structured-output-robustness state=planned -->
-12. [ ] **Meta Reviewer structured-output robustness / false-BLOCKED の解消** — 2026-09-07、PR #98 / #99
+<!-- roadmap:id=meta-review-structured-output-robustness state=done -->
+12. [x] **Meta Reviewer structured-output robustness / false-BLOCKED の解消** — 2026-09-07、PR #98 / #99
       の実測により登録。`project-auto-meta-review-hardening`（上記11、done）の後続で、**同じ既存
       Meta Review経路の改善**である。新しいReviewer・新しいReview基盤・新しいGateは追加しない。
 
@@ -4427,11 +4427,12 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    別 liveness 依存である `approval-resume-liveness-dependency`（M2）が残るため、
    その完了をもって初めて M3 で通しの実測を行う。
 
-<!-- roadmap:id=mobile-approval-role-docs state=planned -->
-1. [ ] 2種類の承認の役割整理とMobile導線設計 — **Mobile導線は実装完了・文書整理のみ未完**。
+<!-- roadmap:id=mobile-approval-role-docs state=done -->
+1. [x] 2種類の承認の役割整理とMobile導線設計 — **完了（2026-09-30 promotion）**。
+   Mobile導線の実装に加え、両承認の役割と使い分けを `docs/project_memory/rules/approval_rules.md` へ記録した。
    Project単位承認（`/api/approvals/pending`）とTask/Job単位Approval Gate
    （`/api/approval-requests/waiting`）は、統合せず併存させる形で`approvals.tsx`に実装済み
-   （一覧取得・承認/却下操作とも動作）。**未完了なのは両者の役割・使い分けの文書化のみ**で、
+   （一覧取得・承認/却下操作とも動作）。登録時に未完了だったのは両者の役割・使い分けの文書化のみで、
    これはMVP必須ではなく非ブロッキング（スマホ操作サイクルは現状の併存実装で完結するため、
    **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    項目4の後またはMVP後に実施してよい）
@@ -7030,8 +7031,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
 ### 優先度 2: Escalation / recovery / resume
 
-<!-- roadmap:id=pl-escalation-recorded-without-delivery state=planned priority=high -->
-0. [ ] **PL Escalation が未配達でも `escalated` と記録し、以後 PL の全作業が永久に止まる** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
+<!-- roadmap:id=pl-escalation-recorded-without-delivery state=done priority=high -->
+0. [x] **PL Escalation の配達結果が記録されず、配達済み・未配達・意図的抑制を区別できない** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
 
    **事実**: `apps/api/src/pl/executionLoop.ts` の `escalateTo()` は
    `await escalate({...})` の直後に**無条件で** `record(storage, key, 'escalated', reason)` する。
@@ -7152,6 +7153,20 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - 既存 `no-status-for-closing-a-task-without-implementing` と同じ出口の問題である。
      **新しい TaskStatus を足す前に**そちらの検討結果と突き合わせる
 
+   **完了（2026-09-30 promotion）**: 本項目の固有責務である B / D の可視化を実装した。
+   `defaultEscalate()` の配達結果を捨てず、`delivery=delivered|undelivered|suppressed` を
+   `escalated` audit に残す。配達成否や通知例外に関係なく `escalated` 自体は必ず記録する。
+   上記の採用停止は別の未達責務であり、直後の item へ分割した。
+
+<!-- roadmap:id=pl-adoption-stalled-by-escalated-attention state=planned priority=high -->
+0. [ ] **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**
+   — `pl-escalation-recorded-without-delivery` に混在していた未達責務の split（新機能ではない）。
+   `runPlTick()` は `apps/api/src/pl/executionLoop.ts:1441-1447` で `hasEscalated()` 済みの対象を
+   `actionable` から外す一方、`maybeAdoptNext()` は同ファイル `1738-1743` で除外前の
+   `state.attention.length > 0` を見て即 return する。そのため CEO 判断待ちの1件が、関係のない
+   Project の採用まで止める。未 escalate の停滞中に新しい仕事を増やさない既存意図は維持し、
+   新しい recovery subsystem や TaskStatus を作らず、採用判定へ同じ除外を適用できるか確認する。
+
 <!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=planned -->
 0. [ ] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。
 
@@ -7266,6 +7281,12 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
    **着手時の制約**: **(1)〜(6) はすべて記述・設定側の修正で足りる。新しい仕組みを作らない。**
    production への操作（再起動・env 変更）は本項目の範囲外で、別途 CEO 承認のうえ既存 deploy 手順で行う。
+
+   **進捗（2026-09-30 promotion）**: Current Truth 文書
+   `docs/project_memory/decisions/vps-operations.md` は master へ到達した。残るのは **(1)〜(6) すべて**:
+   (1) canonical allowlist と runtime spec の同期、(2) 完了済み運用項目の整理、(3) pre-push hook 修正、
+   (4) DB 復元手順、(5) Meta Review model の整合、(6) `.env.example` と保持日数の文書化。
+   本進捗は根拠文書を追加した段階であり、これらの既存 surface はまだ更新していない。
 
 <!-- roadmap:id=current-truth-dual-record-prevention state=planned priority=high -->
 0. [ ] **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める** — 2026-09-15 監査（Confirmed / P1）。監査 92 Finding の**共通根本原因**。
@@ -7454,6 +7475,7 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - `git_commit` は CEO 承認（`approval-20260918-037d5430`, CONSUMED）を経て成立
 
    **この `done` は未検証完了ではない。** 上記 evidence と受入条件を照合したうえでの完了記録である。
+   Candidate-only だった実内容は 2026-09-30 の promotion change を通じて master へ到達した。
 
    **本件から出た設計上の学び**は `executed-item-remaining-work-has-no-continuation` と
    `adoption-does-not-check-implementation-feasibility` へ記録した（重複記載しない）。

@@ -283,8 +283,24 @@ export interface PlLoopDeps {
     storage: IStorage,
     runId: string,
   ) => Promise<ExecuteDesignReviewResult>
-  /** CEO Escalation。既定は既存 notifier（`sendAlert`）。新しい通知基盤は作らない。 */
-  escalate?: (payload: { title: string; body: string }) => Promise<void>
+  /**
+   * CEO Escalation。既定は既存 notifier（`sendAlert`）。新しい通知基盤は作らない。
+   *
+   * **配達結果を返せる形にしてある。** 既定実装が `sendAlert()` の `SendResult[]` を
+   * 捨てていたため、「CEO に届いた」のか「誰にも届いていない」のかが audit から判らなかった
+   * （2026-09-18 master 実測）。判定材料は既にあり、捨てていただけである。
+   *
+   * - チャネル未設定なら空配列、全チャネル失敗なら `success: false` の結果を返す
+   *   （どちらも誰にも届いていない）
+   * - **戻り値は必須にしない。** 既存の `Promise<void>` 実装をそのまま代入できる形を保つ
+   *   （型を必須へ変えると、この差分の変更範囲では直せない注入箇所まで壊しうる）。
+   *   報告しない実装は「届いた証拠が無い」として `undelivered` 側へ倒す。
+   *   届いた側へ倒すのは、本項目が直している不具合そのものである
+   * - throw した場合も `undelivered` として `escalated` を記録する（audit を欠落させない）
+   */
+  escalate?: (
+    payload: { title: string; body: string },
+  ) => Promise<readonly PlEscalationChannelResult[] | void>
   /** 次項目の選択と具体化。既定は診断と同じ provider CLI 経路。 */
   proposeAdoption?: PlAdoptionDeps['propose']
   /** ledger の読み取り（テスト差し替え用）。 */
@@ -813,9 +829,142 @@ function recordAdoptionNotification(
 }
 
 /**
+ * 通知チャネル1本ぶんの配達結果。`notifier` の `SendResult` を構造的に受けられる最小形。
+ *
+ * **`notifier` を import しない**（`sendAlert` 自体は変更対象外で、依存も増やさない）。
+ */
+export interface PlEscalationChannelResult {
+  channel: string
+  success: boolean
+}
+
+/**
+ * CEO 通知が実際にどうなったか。**`escalated` の記録とは別の軸である。**
+ *
+ * `escalated`（= PL が escalation を判断した）と `delivered`（= CEO へ届いた）を同義にしない。
+ * - `escalated` を配達成功時だけ記録すると、#249 の重複抑制で**送らなかった** incident が
+ *   escalation として残らなくなり、escalation を境界にする retry window まで壊れる
+ * - 逆に `escalated` を「届いた」と読むのが、いま直している不具合である
+ *
+ * - `delivered` … 1つ以上のチャネルが受け取った
+ * - `undelivered` … 送ろうとしたが誰にも届いていない（チャネル未設定を含む）。**障害である**
+ * - `suppressed` … 重複として意図的に送らなかった（#249）。**正常である**
+ *
+ * `suppressed` と `undelivered` はどちらも「届いていない」が、取り違えてはならない。
+ */
+export type PlEscalationDeliveryOutcome = 'delivered' | 'undelivered' | 'suppressed'
+
+export interface PlEscalationDelivery {
+  outcome: PlEscalationDeliveryOutcome
+  /** `delivered` なら届いたチャネル、`undelivered` なら試して失敗したチャネル。 */
+  channels: string[]
+}
+
+/**
+ * チャネル名を audit の1フィールドに載せられる形にする。
+ *
+ * 空白だけでなく区切り文字（`,`）も潰す。現行チャネルは line / slack / email しか無いが、
+ * チャネル名の中身で `parseEscalationDelivery()` の読みが静かに壊れる形にしない。
+ *
+ * **`none` は「チャネルが1本も無い」ことを表す sentinel である。** 実チャネル名とは名前空間を
+ * 共有しており、将来 `none` という名前のチャネルができると `parseEscalationDelivery()` は
+ * それを「チャネルなし」として読む（`tried=none` が衝突する）。
+ * ずれるのは channels の欄だけで、`delivered` / `undelivered` / `suppressed` の判定は変わらない
+ * （成否は `success` から決まり、チャネル名を見ない）。**いま逃がすための別 sentinel は足さない** —
+ * 起きていない衝突のために書式を増やすほうが、読み口を複雑にする。
+ */
+function channelField(channels: readonly string[]): string {
+  if (channels.length === 0) return 'none'
+  return channels.map((channel) => channel.replace(/[^\w.-]+/g, '_')).join(',')
+}
+
+/**
+ * `escalate` が報告した配達結果を正規化する。
+ *
+ * 戻り値を型で必須にしない代わりに、報告が無い実装（`Promise<void>` 形）を
+ * ここで空配列へ倒す。空配列は「誰にも届いていない」= `undelivered` になる。
+ * **判らないものを `delivered` へ倒さない。** それが本項目の不具合である。
+ *
+ * 型が保証しない値（注入実装・将来の `sendAlert` 変更）が来ても、要素を1つずつ整えてから返す。
+ * 防いでいる失敗: `channel` が文字列でないと `channelField()` の `replace` が throw し、
+ * **`escalated` の記録ごと落ちる** —— 通知結果の異常値1つで対象が audit から消え、
+ * 「届いていないのに（記録すら無いまま）先へ進む」という本項目の不具合の最も重い形になる。
+ */
+function toChannelResults(reported: unknown): readonly PlEscalationChannelResult[] {
+  if (!Array.isArray(reported)) return []
+  return reported.map((entry: unknown) => {
+    const result = (entry ?? {}) as { channel?: unknown; success?: unknown }
+    return {
+      // チャネル名は後から読むための表示用でしかない。文字列でなければ捨てずに `unknown` にする
+      // （落とすと「試したチャネル」の本数まで実態とずれる）。
+      channel: typeof result.channel === 'string' ? result.channel : 'unknown',
+      // **配達の成否だけは推測しない。** boolean 以外は「届いた証拠が無い」として false へ倒す。
+      success: result.success === true,
+    }
+  })
+}
+
+/**
+ * 配達結果を `escalated` 行の detail **先頭**に載せる形にする。
+ *
+ * 先頭に置くのは、`record()` が detail を 500 文字で切るためである。人が書く理由文の
+ * 後ろに置くと、長い理由のときだけ機械判定用の欄が消える。
+ *
+ * **新しいテーブルは作らない。** 既存 `audit_log` の detail で足りる
+ * （`adoptionFailureClasses()` が detail を読むのは `ATTEMPT_RESULTS` の行だけで、
+ * `escalated` 行は読まない。採用サイクルの指紋・予算・候補の回転位置は動かない）。
+ */
+function formatEscalationDelivery(
+  outcome: PlEscalationDeliveryOutcome,
+  channels: readonly string[],
+): string {
+  switch (outcome) {
+    case 'delivered':
+      return `delivery=delivered via=${channelField(channels)}`
+    case 'undelivered':
+      return `delivery=undelivered tried=${channelField(channels)}`
+    case 'suppressed':
+      // 送っていないのでチャネルの欄を持たない。`tried=none` と書くと
+      // 「試して届かなかった」（= 障害）と読めてしまう。
+      return 'delivery=suppressed'
+  }
+}
+
+/**
+ * `escalated` 行の detail から配達結果を読む。**後から数えるための唯一の読み口**。
+ *
+ * 書式を知っているのをここ1箇所に閉じる（同じ正規表現を各所へ複製しない）。
+ * 配達結果が載る前の古い行は `undefined` を返す —— 判らないものを
+ * `delivered` にも `undelivered` にも倒さない。
+ *
+ * **残る曖昧さ（独立レビュー指摘・受容）:** 判定は detail 先頭の完全一致なので、この変更より前の行の
+ * 理由文が偶然 `delivery=delivered ...` で始まっていれば delivered として読む。理由文は PL
+ * （provider CLI）が書く日本語の散文で、機械欄と同じ名前空間を共有している。
+ * **起きていない衝突のために marker を前置しない**（書式が増えるほど読み口が複雑になる）。
+ * 配達結果を集計・監視に使うときは、対象行を本変更以降の `createdAt` に限ること。
+ */
+export function parseEscalationDelivery(detail: string | undefined): PlEscalationDelivery | undefined {
+  const match = /^delivery=(delivered|undelivered|suppressed)(?:\s+(via|tried)=(\S+))?/.exec(detail ?? '')
+  if (!match) return undefined
+
+  const outcome = match[1] as PlEscalationDeliveryOutcome
+  // 欄名は outcome ごとに決まっている（`formatEscalationDelivery()` と対）。対応しない欄は
+  // 配達結果ではなく理由文の一部なので読まない —— PL（provider CLI）が書く理由文が
+  // 偶然 `via=` / `tried=` で始まっても channels を取り違えない。
+  const expected = outcome === 'delivered' ? 'via' : outcome === 'undelivered' ? 'tried' : undefined
+  const field = expected !== undefined && match[2] === expected ? match[3] : undefined
+  return {
+    outcome,
+    channels: field === undefined || field === 'none' ? [] : field.split(','),
+  }
+}
+
+/**
  * 1 tick の結果を既存 `audit_log` へ残す。**新しい表は作らない。**
  *
- * `diagnosis` を渡すと `lane=` / `cause=` / `layer=` / `conf=` が detail の**先頭**に付く。
+ * `diagnosis` を渡すと `lane=` / `cause=` / `layer=` / `conf=` が detail に付く。
+ * `escalated` 行だけは、その前に配達結果の `delivery=` 欄を置く（500文字切り詰めから守るため）。
+ * Triage の読み口は `\blane=` を探すので、この順序でも既存の集計を維持する。
  * これが `summarizeBlockedTriage()` の唯一の入力であり、後ろの散文とは役割が違う
  * （散文は人が読むためのもので、集計では読まない）。
  */
@@ -825,9 +974,11 @@ function record(
   result: PlTickStatus,
   detail: string,
   diagnosis?: BlockedDiagnosis,
+  delivery?: string,
 ): void {
-  const prefixed =
+  const withTriage =
     diagnosis !== undefined ? `${formatTriageAuditDetail(diagnosis)} ${detail}` : detail
+  const prefixed = delivery !== undefined ? `${delivery} ${withTriage}` : withTriage
   storage.auditLog.record({
     actor: 'api',
     operation: AUDIT_OPERATION,
@@ -1082,10 +1233,20 @@ async function defaultDiagnose(input: PlDiagnosisInput): Promise<string> {
   return await requestText(DIAGNOSIS_SYSTEM, user, { retryTransientOnce: true }, PL_DIAGNOSIS_MAX_TOKENS)
 }
 
-async function defaultEscalate(payload: { title: string; body: string }): Promise<void> {
+async function defaultEscalate(
+  payload: { title: string; body: string },
+): Promise<readonly PlEscalationChannelResult[]> {
   // 既存 notifier をそのまま使う。通知チャネル未設定時はコンソールへ落ちる（notifier 側の既存挙動）。
+  //
+  // **戻り値を返す。** `sendAlert()` はチャネル未設定でも全チャネル失敗でも正常 resolve するので、
+  // ここで `SendResult[]` を捨てると「届いた」と「誰にも届いていない」が区別できなくなる
+  // （チャネル未設定は仮定の話ではない: 文書化された API 起動 env allowlist は
+  // `LINE_CHANNEL_ACCESS_TOKEN` / `LINE_USER_ID` / `SLACK_WEBHOOK_URL` を含まない）。
+  //
+  // `SendResult`（`channel: NotificationChannel` / `success` / `error?` / `attempts`）は
+  // `PlEscalationChannelResult` の上位互換なので、変換せずそのまま返す。
   const { sendAlert } = await import('@ai-team/worker/src/notifier/notifier.js')
-  await sendAlert({ severity: 'warning', title: payload.title, body: payload.body })
+  return await sendAlert({ severity: 'warning', title: payload.title, body: payload.body })
 }
 
 /**
@@ -1682,6 +1843,9 @@ async function escalateTo(
      *
      * 「知らせない」と「無かったことにする」は違う。audit と PL state には残り、
      * Mobile からも現在進行形の失敗として見え続ける。
+     *
+     * `false` の記録は `delivery=suppressed`（意図的・正常）であり、
+     * 送って届かなかった `delivery=undelivered`（障害）とは別物である。
      */
     notify?: boolean
     /**
@@ -1695,26 +1859,25 @@ async function escalateTo(
     triage?: BlockedDiagnosis
   } = {},
 ): Promise<void> {
-  if (options.notify !== false) {
-    const escalate = deps.escalate ?? defaultEscalate
-    const body =
-      options.triage !== undefined
-        ? buildTriageEscalationBody({
-          diagnosis: options.triage,
-          item,
-          attemptHistory: attemptHistoryFor(storage, key),
-          blockedReason: reason,
-        })
-        : [
-          `何が起きているか: ${item.detail}`,
-          `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
-          `PL の判断: ${reason}`,
-          'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
-        ].join('\n')
-
-    await escalate({ title: `[PL] ${options.subject ?? item.kind} が解消していません`, body })
-  }
-  record(storage, key, 'escalated', reason, options.triage)
+  // **`escalated` の記録は配達結果に関わらず必ず残す。** ここで止めると、重複抑制で
+  // 送らなかった incident が escalation として残らなくなり、retry window が壊れる。
+  // 記録するのは「PL が escalation を判断した」ことで、「CEO が受け取った」ことではない。
+  // 後者は detail 先頭の `delivery=` で区別する。
+  //
+  // detail 先頭へ機械欄を足しても既存の読み手は変わらない（2026-09-23 repo-wide 確認）。
+  // `escalated` 行の detail を読む consumer は、この変更で足した `parseEscalationDelivery()` 以外に無い:
+  // - 失敗クラス判定: `adoptionFailureClasses()` が detail を読むのは `ATTEMPT_RESULTS`
+  //   （acted / blocked / diagnosis_unusable / diagnosis_failed）の行だけで、`escalated` は含まれない
+  // - retry window / 抑制 / 試行回数: `adoptionEntriesInCurrentWindow()` `hasEscalated()`
+  //   `countPriorAttempts()` と `adoptionStep` の rotationOffset はいずれも `result` か行数しか見ない
+  // - 重複通知の指紋: `pl_adoption_escalation_notified` という別 operation の行を完全一致で見る
+  // - PL state（`GET /api/state`）: `summarizeAdoptionFailure()` は `result` と `createdAt` だけ
+  // - UI 表示: audit 行を返す route は無く、mobile も audit を読まない
+  //
+  // 500 文字の切り詰めが効くのは reason の末尾だけである（機械欄ぶん短くなる）。CEO へ送る本文は
+  // `deliverEscalation()` が別に組み立てており、そちらは切り詰めていない。
+  const delivery = await deliverEscalation(storage, deps, key, item, reason, options)
+  record(storage, key, 'escalated', reason, options.triage, delivery)
 }
 
 /**
@@ -1747,6 +1910,62 @@ async function handOffOrEscalate(
     triage: diagnosis,
   })
   return { status: 'escalated', reason: `routed to ${diagnosis.recommendedLane}` }
+}
+
+/**
+ * CEO へ通知し、**その配達結果を audit へ載せる形で**返す。
+ *
+ * 判定材料（`SendResult[]`）は既に `sendAlert()` が返している。ここはそれを捨てずに
+ * 3値（`delivered` / `undelivered` / `suppressed`）へ畳むだけで、
+ * **再送も抑止も状態追加もしない**（届かなかったことを見えるようにするのが目的であり、
+ * 復旧を妨げる新しい状態を作らない）。
+ *
+ * `escalate` が throw した場合も `undelivered tried=unknown` へ倒す。
+ * 通知経路の例外で「PL が escalation を判断した」という audit まで失わないためである。
+ */
+async function deliverEscalation(
+  storage: IStorage,
+  deps: PlLoopDeps,
+  key: string,
+  item: AttentionItem,
+  reason: string,
+  options: { subject?: string; notify?: boolean; triage?: BlockedDiagnosis },
+): Promise<string> {
+  if (options.notify === false) {
+    return formatEscalationDelivery('suppressed', [])
+  }
+
+  try {
+    const escalate = deps.escalate ?? defaultEscalate
+    const body =
+      options.triage !== undefined
+        ? buildTriageEscalationBody({
+          diagnosis: options.triage,
+          item,
+          attemptHistory: attemptHistoryFor(storage, key),
+          blockedReason: reason,
+        })
+        : [
+          `何が起きているか: ${item.detail}`,
+          `対象: Project ${item.projectName}${item.taskId ? ` / Task ${item.taskId}` : ''}`,
+          `PL の判断: ${reason}`,
+          'PL ができること: 修正 / 再レビュー / 代替案の提示 / このエスカレーション（BLOCK の無視はできません）。',
+        ].join('\n')
+
+    const reported = await escalate({ title: `[PL] ${options.subject ?? item.kind} が解消していません`, body })
+    // 報告が無い実装は空配列と同じ扱い（= `undelivered`）。`toChannelResults` のコメント参照。
+    const results = toChannelResults(reported)
+    const delivered = results.filter((result) => result.success).map((result) => result.channel)
+    return delivered.length > 0
+      ? formatEscalationDelivery('delivered', delivered)
+      // 1本も成功していない＝誰にも届いていない。チャネル未設定（`results` が空）も同じ扱いで、
+      // `tried=none` としてそれが判る。
+      : formatEscalationDelivery('undelivered', results.map((result) => result.channel))
+  } catch {
+    // dynamic import や通知チャネルの例外も audit から消さない。個別チャネルを特定できないため
+    // `unknown` として残し、「未配達だった」という確実な事実だけを記録する。
+    return formatEscalationDelivery('undelivered', ['unknown'])
+  }
 }
 
 /** テスト用。モジュールスコープの単一実行ガードを戻す。 */
