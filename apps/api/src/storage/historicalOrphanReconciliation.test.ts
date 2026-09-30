@@ -193,6 +193,12 @@ describe('one-time historical orphan reconciliation (CEO 2026-09-30)', () => {
     ['the orphan metadata cannot be parsed', (db: Database.Database) => {
       db.prepare("UPDATE jobs SET failure_metadata = '{bad' WHERE id = ?").run(D5206)
     }],
+    ['the orphan metadata is missing', (db: Database.Database) => {
+      db.prepare('UPDATE jobs SET failure_metadata = NULL WHERE id = ?').run(D5206)
+    }],
+    ['a timestamp is not canonical UTC', (db: Database.Database) => {
+      db.prepare("UPDATE jobs SET started_at = '2026-09-14 17:29:06' WHERE id = ?").run(LATER_71B9)
+    }],
     ['the orphan is bound to a missing approval row', (db: Database.Database) => {
       db.prepare("UPDATE jobs SET approval_id = 'approval-missing' WHERE id = ?").run(D5206)
     }],

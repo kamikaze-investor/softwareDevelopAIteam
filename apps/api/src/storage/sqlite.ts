@@ -5883,18 +5883,22 @@ function reconcileHistoricalOrphanBlockedJobs(db: Database.Database): void {
         const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
         if (approval === undefined || approval.status === 'WAITING_FOR_USER') continue
       }
-      if (source.failure_metadata !== null) {
-        let metadata: unknown
-        try {
-          metadata = JSON.parse(source.failure_metadata)
-        } catch {
-          continue
-        }
-        if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) continue
-        if ((metadata as { quarantined?: unknown }).quarantined === true) continue
+      // 承認時に確認した metadata（provider_timeout の記録）が残っていることも証拠の一部。
+      // 欠けていれば「quarantine でない」と言えないので触らない。
+      if (source.failure_metadata === null) continue
+      let metadata: unknown
+      try {
+        metadata = JSON.parse(source.failure_metadata)
+      } catch {
+        continue
       }
+      if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) continue
+      if ((metadata as { quarantined?: unknown }).quarantined === true) continue
 
       // 証拠: 別 Task の Job が、同じ Project・同じ workingDir で、source の終了後に開始されている。
+      // 時刻は正規形の UTC ISO 文字列だけを比較に使う（形が崩れていれば順序を証明できない）。
+      const isCanonicalUtc = (value: string | null): value is string =>
+        value !== null && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
       const later = jobRow.get(entry.laterForeignJobId) as Row | undefined
       const sourceDir = workingDirOf(source)
       if (
@@ -5903,8 +5907,8 @@ function reconcileHistoricalOrphanBlockedJobs(db: Database.Database): void {
         || later.project_id !== source.project_id
         || sourceDir === undefined
         || workingDirOf(later) !== sourceDir
-        || source.completed_at === null
-        || later.started_at === null
+        || !isCanonicalUtc(source.completed_at)
+        || !isCanonicalUtc(later.started_at)
         || !(later.started_at > source.completed_at)
       ) continue
 
