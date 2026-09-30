@@ -199,6 +199,9 @@ describe('one-time historical orphan reconciliation (CEO 2026-09-30)', () => {
     ['a timestamp is not canonical UTC', (db: Database.Database) => {
       db.prepare("UPDATE jobs SET started_at = '2026-09-14 17:29:06' WHERE id = ?").run(LATER_71B9)
     }],
+    ['a timestamp has canonical shape but is not a real instant', (db: Database.Database) => {
+      db.prepare("UPDATE jobs SET started_at = '2026-99-99T00:00:00.000Z' WHERE id = ?").run(LATER_71B9)
+    }],
     ['the orphan is bound to a missing approval row', (db: Database.Database) => {
       db.prepare("UPDATE jobs SET approval_id = 'approval-missing' WHERE id = ?").run(D5206)
     }],

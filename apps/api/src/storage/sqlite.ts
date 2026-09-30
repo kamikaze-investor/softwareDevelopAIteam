@@ -5897,8 +5897,11 @@ function reconcileHistoricalOrphanBlockedJobs(db: Database.Database): void {
 
       // 証拠: 別 Task の Job が、同じ Project・同じ workingDir で、source の終了後に開始されている。
       // 時刻は正規形の UTC ISO 文字列だけを比較に使う（形が崩れていれば順序を証明できない）。
-      const isCanonicalUtc = (value: string | null): value is string =>
-        value !== null && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+      const isCanonicalUtc = (value: string | null): value is string => {
+        if (value === null || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false
+        const parsed = new Date(value)
+        return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value
+      }
       const later = jobRow.get(entry.laterForeignJobId) as Row | undefined
       const sourceDir = workingDirOf(source)
       if (
