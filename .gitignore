@@ -71,3 +71,5 @@ data/.tmp_approval/
 
 # PL作業で生成する一時QR画像（リポジトリへ入れない）
 expo-qr*.svg
+# Real gateway / tunnel-client EnvironmentFiles must never be committed (templates are *.env.example)
+apps/mcp-gateway/ops/systemd/*.env

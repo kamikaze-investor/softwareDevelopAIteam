@@ -1,0 +1,21 @@
+[Unit]
+Description=OpenAI Secure MCP Tunnel client for AIteamOS (outbound only; forwards to the loopback MCP gateway)
+After=ai-team-mcp-gateway.service
+
+[Service]
+Type=simple
+# Secrets (runtime API key, local gateway bearer) are never written in this unit.
+# They come only from the EnvironmentFile (mode 0600). See tunnel-client.env.example.
+EnvironmentFile=/absolute/path/to/env/tunnel-client.env
+# The only MCP target is the loopback gateway; health / readiness / local UI stay on loopback.
+# Do not set these two in the EnvironmentFile: values there override these lines.
+Environment=MCP_SERVER_URL=http://127.0.0.1:3100/mcp
+Environment=HEALTH_LISTEN_ADDR=127.0.0.1:3180
+# Verified `runtime` flavor binary `tunnel-client-runtime` (no bundled cloudflared; it exposes only
+# `run`, `--help` and `--version`). Run exactly one instance per tunnel id.
+ExecStart=/absolute/path/to/tunnel-client-runtime run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
