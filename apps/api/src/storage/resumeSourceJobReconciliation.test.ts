@@ -221,3 +221,50 @@ describe('startup reconciliation of resumed blocked source Jobs', () => {
     expect(storage.jobs.findByTaskId(done.id)[0]?.status).toBe('blocked')
   })
 })
+
+describe('startup reconciliation — rows it must leave alone', () => {
+  it('skips a source whose failure_metadata cannot be parsed (quarantine cannot be ruled out)', () => {
+    const dbPath = databasePath()
+    seedDatabase(dbPath, (db) => {
+      insertTask(db, 'malformed', 'done')
+      insertJob(db, { id: 'source-malformed', taskId: 'malformed', status: 'blocked', failureMetadata: '{not json' })
+      insertJob(db, {
+        id: 'successor-malformed', taskId: 'malformed', status: 'success',
+        workflowStepKey: 'resume:source-malformed:1',
+      })
+    })
+
+    const storage = createSQLiteStorage(dbPath)
+    // 壊れた metadata は storage の deserialize が読めないので、行そのものを直接見る。
+    const raw = new Database(dbPath, { readonly: true })
+    try {
+      expect((raw.prepare("SELECT status FROM jobs WHERE id = 'source-malformed'").get() as { status: string }).status).toBe('blocked')
+    } finally {
+      raw.close()
+    }
+    expect(storage.auditLog.findByEntity('job', 'source-malformed')).toHaveLength(0)
+  })
+
+  it('skips a source still bound to a WAITING_FOR_USER approval, even with resume lineage', () => {
+    const dbPath = databasePath()
+    seedDatabase(dbPath, (db) => {
+      insertTask(db, 'waiting', 'done')
+      insertJob(db, { id: 'source-waiting', taskId: 'waiting', status: 'blocked' })
+      insertJob(db, {
+        id: 'successor-waiting', taskId: 'waiting', status: 'success',
+        workflowStepKey: 'resume:source-waiting:1',
+      })
+      db.prepare(`
+        INSERT INTO approval_requests (
+          id, task_id, target_branch, target_commit, target_diff_hash, risk_level,
+          requested_action, status, expires_at, created_at
+        ) VALUES ('approval-waiting', 'waiting', 'b', 'c', 'd', 'HIGH', 'git_commit', 'WAITING_FOR_USER', ?, ?)
+      `).run(new Date(Date.now() + 60_000).toISOString(), CREATED_AT)
+      db.prepare("UPDATE jobs SET approval_id = 'approval-waiting' WHERE id = 'source-waiting'").run()
+    })
+
+    const storage = createSQLiteStorage(dbPath)
+    expect(storage.jobs.findById('source-waiting')?.status).toBe('blocked')
+    expect(storage.auditLog.findByEntity('job', 'source-waiting')).toHaveLength(0)
+  })
+})

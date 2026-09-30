@@ -32,7 +32,7 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
-import { resolveReviewedImplementationFrom } from '../designReview/repairPolicy'
+import { parseResumeSource, resolveReviewedImplementationFrom } from '../designReview/repairPolicy'
 // 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
 // 型以外に storage へ依存しないモジュールなので循環しない。
 import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
@@ -5759,11 +5759,11 @@ function runMigrations(db: Database.Database): void {
 function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
   const reconcile = db.transaction((): void => {
     const sources = db.prepare(`
-      SELECT id, task_id, failure_metadata
+      SELECT id, task_id, failure_metadata, approval_id
       FROM jobs
       WHERE status = 'blocked'
       ORDER BY rowid ASC
-    `).all() as Array<{ id: string; task_id: string; failure_metadata: string | null }>
+    `).all() as Array<{ id: string; task_id: string; failure_metadata: string | null; approval_id: string | null }>
 
     const successorsForTask = db.prepare(`
       SELECT id, workflow_step_key
@@ -5771,8 +5771,16 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       WHERE task_id = ? AND workflow_step_key IS NOT NULL
       ORDER BY rowid ASC
     `)
+    const approvalStatus = db.prepare('SELECT status FROM approval_requests WHERE id = ?')
 
     for (const source of sources) {
+      // 承認待ちが結び付いたままの行は、その承認が approveAndResumeJob() で同じ行を動かしうる。
+      // lineage があっても「もう誰も動かさない」とは言えないので触らない（fail-closed）。
+      if (source.approval_id !== null) {
+        const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
+        if (approval?.status === 'WAITING_FOR_USER') continue
+      }
+
       if (source.failure_metadata !== null) {
         let metadata: unknown
         try {
@@ -5787,10 +5795,7 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       const successor = (successorsForTask.all(source.task_id) as Array<{
         id: string
         workflow_step_key: string
-      }>).find((candidate) => {
-        const match = /^resume:([^:]+):(\d+)$/.exec(candidate.workflow_step_key)
-        return match?.[1] === source.id
-      })
+      }>).find((candidate) => parseResumeSource(candidate.workflow_step_key) === source.id)
       if (!successor) continue
 
       const terminalized = db.prepare(

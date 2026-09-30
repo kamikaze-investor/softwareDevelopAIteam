@@ -9548,6 +9548,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **2026-09-30 更新**: 現行 handoff は source を同一 transaction で `failed` へ終端化し、既存の
       canonical lineage も startup reconciliation で揃える。この superseded 導出は、旧DBや安全上
       reconciliation できない行に対する compatibility rule として残る。
+      AI resume（PL `resume_task`）も同じ handoff を通るため、下の「含めないもの」にある AI resume の停止も
+      以後は元 Job の終端化によって `job_failed:<後継>` として見えるようになる（Human authority の境界は動かしていない）。
 
       **この項目に含めないもの**（別責務）:
       - AI resume で同じ形に陥る停止（Human authority の境界を AI resume で動かさないため、意図的に対象外）

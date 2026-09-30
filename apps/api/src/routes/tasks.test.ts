@@ -1278,6 +1278,9 @@ describe('Task API', () => {
           const jobs = parseBody<Job[]>(jobsRes.body)
           expect(jobs).toHaveLength(2)
           expect(jobs.find((job) => job.id === failedJob.id)?.status).toBe('failed')
+          // source は既に failed で blocked からの handoff ではないので、終端化の audit は書かない。
+          expect(getStorage().auditLog.findByEntity('job', failedJob.id)
+            .filter((entry) => entry.operation === 'resume_source_terminalized')).toHaveLength(0)
         })
       })
 
