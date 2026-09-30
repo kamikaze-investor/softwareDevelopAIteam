@@ -115,6 +115,15 @@ AI Team / Plannerが担当する。Goalが曖昧な場合、Plannerは必要最�
 
 （外部のAgent Loop的な設計思想における「Goal」概念を吸収したもの。新規コンポーネントは追加しない）
 
+**Project Model**: ProjectはGoal達成まで継続する。MVP / Phase / Release / Roadmap消化は、いずれも
+Project完了を意味しない。現在のRoadmapを消化し切った状態は「その時点で積まれた作業が尽きた」ことを
+示すに過ぎず、Goalが未達なら次のRoadmapが積まれて作業は続く（2026-09-13 CEO訂正）。
+
+この区別はUI・型・生成物の文言にも適用する。Roadmap消化状態を「完了」と表示・記録してはならず、
+「ロードマップ消化済み」相当の、Goal達成と混同しない表現を使う。放置すると、AI Team OS自身が
+Roadmap途中のProjectを「完了」と表示する（該当箇所: `ProjectRoadmapCompletion`、Mobile Project
+一覧のバッジ）。
+
 ## 3.11 Rubric Driven
 
 AIが「どうなれば完成か」を明確に理解できるよう、成果物の評価基準（Rubric）に基づいて作業を評価する。

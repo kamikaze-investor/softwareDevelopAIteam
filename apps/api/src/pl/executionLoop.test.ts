@@ -13,11 +13,14 @@ import {
   resetPlLoopInFlightForTest,
   DIAGNOSIS_SYSTEM_FOR_TEST,
   runPlTick,
+  parseEscalationDelivery,
   verifyOutcome,
   type PlDiagnosisInput,
+  type PlEscalationChannelResult,
   type PlLoopDeps,
 } from './executionLoop'
 import { PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
+import { parseTriageAuditDetail } from './blockedTriage'
 import { readResumeActorClasses } from '../designReview/resumeActor'
 
 /**
@@ -26,6 +29,15 @@ import { readResumeActorClasses } from '../designReview/resumeActor'
  */
 
 const NOW = '2026-09-14T10:00:00.000Z'
+
+/**
+ * 通知が1本届いた、という配達結果。
+ *
+ * 既定実装が `sendAlert()` の戻り値を捨てていたのが、ここで直している不具合そのものである。
+ * 注入する `escalate` は配達結果を返せるが、**返さない実装も受け付ける**（既存の
+ * `Promise<void>` 形を壊さないため）。返さない場合の扱いは下の「報告しない実装」テストで固定する。
+ */
+const DELIVERED: readonly PlEscalationChannelResult[] = [{ channel: 'line', success: true }]
 
 function seed(): { storage: IStorage; projectId: string; taskId: string } {
   const storage = createSQLiteStorage(':memory:')
@@ -66,7 +78,7 @@ function deps(over: Partial<PlLoopDeps> = {}): PlLoopDeps {
     now: () => NOW,
     diagnose: async () => JSON.stringify({ actionKind: 'rekick_design_review', rationale: 'queued run is idle', riskLevel: 'LOW' }),
     rekickDesignReview: async () => ({ status: 'evidence_registered' }),
-    escalate: async () => {},
+    escalate: async () => DELIVERED,
     // 既定では採用候補を空にする。採用経路を検証するテストだけが ledger を渡す。
     readLedger: () => '',
     ...over,
@@ -96,7 +108,7 @@ describe('runPlTick — Observe', () => {
     const { storage } = seed()
     let escalated = 0
 
-    const result = await runPlTick(storage, deps({ escalate: async () => { escalated += 1 } }))
+    const result = await runPlTick(storage, deps({ escalate: async () => { escalated += 1; return DELIVERED } }))
 
     expect(result.status).toBe('idle')
     expect(escalated).toBe(0)
@@ -119,7 +131,7 @@ describe('runPlTick — 停止した failed Job', () => {
     const escalations: string[] = []
     const d = deps({
       diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: '再開したい', riskLevel: 'LOW' }),
-      escalate: async (p) => { escalations.push(p.title) },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
     })
 
     // 1〜2回目: Gate が根拠不足で止める（workspace を書き換える操作なので当然）
@@ -392,7 +404,7 @@ describe('runPlTick — 無限ループを作らない', () => {
     const escalations: string[] = []
     const d = deps({
       rekickDesignReview: async () => ({ status: 'evidence_registered' }),
-      escalate: async (payload) => { escalations.push(payload.title) },
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
     })
 
     for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {
@@ -446,6 +458,209 @@ describe('runPlTick — 無限ループを作らない', () => {
 
     expect(keys.length).toBeGreaterThan(0)
     expect(countPriorAttempts(storage, keys[0]!)).toBe(1)
+  })
+})
+
+describe('escalated の記録と配達結果を同義にしない', () => {
+  // 2026-09-18 master 実測: `defaultEscalate` が `sendAlert()` の `SendResult[]` を捨てていたため、
+  // 「CEO に届いた」と「誰にも届いていない」が audit から区別できなかった。
+  // 文書化された API 起動 env allowlist は通知チャネルの env を含まないので、
+  // 「1本も設定されていない」は仮定ではなく既定の状態である。
+
+  /** `escalated` として残った行の detail を新しい順で返す。 */
+  function escalatedDetails(storage: IStorage): string[] {
+    return storage.auditLog
+      .findAll()
+      .filter((entry) => entry.operation === 'pl_loop' && entry.result === 'escalated')
+      .map((entry) => entry.detail ?? '')
+  }
+
+  /** PL が escalate_to_ceo を選ぶ 1 tick。配達結果だけを差し替える。 */
+  function escalatingDeps(
+    escalate: NonNullable<PlLoopDeps['escalate']>,
+    rationale = 'CEO 判断が要る',
+  ): PlLoopDeps {
+    return deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'escalate_to_ceo', rationale, riskLevel: 'HIGH' }),
+      escalate,
+    })
+  }
+
+  it('届いたときは、どのチャネルが受け取ったかまで残る', async () => {
+    const { storage } = seedIdleDesignReview()
+
+    const result = await runPlTick(storage, escalatingDeps(async () => [
+      { channel: 'line', success: true },
+      { channel: 'slack', success: false },
+    ]))
+
+    expect(result.status).toBe('escalated')
+    // 実際に受け取ったチャネルだけが載る（送ろうとしたチャネル一覧ではない）
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])).toEqual({
+      outcome: 'delivered',
+      channels: ['line'],
+    })
+  })
+
+  it('1本も届かなくても escalated は残り、未配達だと後から分かる', async () => {
+    const { storage } = seedIdleDesignReview()
+
+    const result = await runPlTick(storage, escalatingDeps(async () => [
+      { channel: 'line', success: false },
+      { channel: 'slack', success: false },
+    ]))
+
+    // A（PL が escalation を判断した）の記録は配達結果に関わらず残す。
+    // ここを止めると、#249 の重複抑制で送らなかった incident まで残らなくなり、
+    // escalation を境界にする retry window が壊れる。
+    expect(result.status).toBe('escalated')
+    expect(escalatedDetails(storage)).toHaveLength(1)
+    // D: 送るべきだったのに誰にも届いていない。**障害である。**
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])).toEqual({
+      outcome: 'undelivered',
+      channels: ['line', 'slack'],
+    })
+  })
+
+  it('通知チャネルが1本も設定されていなければ undelivered として残る', async () => {
+    // `sendAlert()` はチャネル未設定でも正常 resolve し、空配列を返す。
+    // 「送信先が無かった」も「誰にも届いていない」ことに変わりはない。
+    const { storage } = seedIdleDesignReview()
+
+    await runPlTick(storage, escalatingDeps(async () => []))
+
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])).toEqual({
+      outcome: 'undelivered',
+      channels: [],
+    })
+  })
+
+  it('通知経路が例外で落ちたら escalated を確定させず、次の tick でやり直せる', async () => {
+    // 一過性の通知失敗（notifier の dynamic import 失敗・LINE API 500 など）を undelivered として
+    // 記録すると、その対象は hasEscalated() で恒久的に PL の対象外になり、出口が CEO の
+    // abort_task だけになる。**それは本項目が直している不具合の最も重い形である。**
+    // 例外は呼び出し元へ抜け（interval は 'PL tick failed' を log、POST /api/pl/tick は 5xx）、
+    // incident は消費されない。
+    const { storage } = seedIdleDesignReview()
+    let calls = 0
+    const d = escalatingDeps(async () => {
+      calls += 1
+      if (calls === 1) throw new Error('LINE API 500')
+      return DELIVERED
+    })
+
+    await expect(runPlTick(storage, d)).rejects.toThrow('LINE API 500')
+    expect(escalatedDetails(storage)).toHaveLength(0)
+
+    // ここで固定するのは配達結果と記録の整合だけなので、ガードは同ファイルの他テストと同じく
+    // 手で戻す。例外時のガード解放は下の独立したテストで別に固定する
+    // （2つを1つのテストに混ぜると、落ちたときどちらが壊れたのか判らない）。
+    resetPlLoopInFlightForTest()
+    const retried = await runPlTick(storage, d)
+
+    // 同じ対象がそのまま選ばれ、今度は届いたことまで残る
+    expect(retried.status).toBe('escalated')
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])?.outcome).toBe('delivered')
+  })
+
+  it('通知が例外で落ちた後も次の tick は走る（単一実行ガードを握ったままにしない）', async () => {
+    // 上の「次の tick でやり直せる」が production で成立する前提を、それ単体で固定する。
+    // `runPlTick()` は `inFlight` を finally で戻している（`executionLoop.ts` の try/finally）。
+    // 戻していなければ、1回の通知例外以降 PL は `skipped_in_flight` を返し続けて全作業が止まり、
+    // 本項目が直している不具合より重い状態になる。**ここでは reset を呼ばない。**
+    const { storage } = seedIdleDesignReview()
+    const d = escalatingDeps(async () => { throw new Error('LINE API 500') })
+
+    await expect(runPlTick(storage, d)).rejects.toThrow('LINE API 500')
+    // ガードを握ったままなら、この再 tick は例外ではなく skipped_in_flight を返して resolve する。
+    await expect(runPlTick(storage, d)).rejects.toThrow('LINE API 500')
+    // 例外で終わった tick は escalated を記録しない（対象は actionable のまま残る）。
+    expect(escalatedDetails(storage)).toHaveLength(0)
+  })
+  it('配達結果を報告しない escalate でも escalated は残り、届いた扱いにはしない', async () => {
+    // 既存の `Promise<void>` 形の注入をそのまま受けられることと、その場合の倒し方を固定する。
+    // 報告が無いのは「届いた証拠が無い」ことであり、`delivered` へ倒すのは本項目の不具合である。
+    const { storage } = seedIdleDesignReview()
+    let calls = 0
+
+    const result = await runPlTick(storage, escalatingDeps(async () => { calls += 1 }))
+
+    expect(calls).toBe(1)
+    expect(result.status).toBe('escalated')
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])).toEqual({
+      outcome: 'undelivered',
+      channels: [],
+    })
+  })
+
+  it('配達結果の要素が壊れていても escalated の記録は落とさない', async () => {
+    // 型が保証するのは既定実装だけで、注入実装や将来の sendAlert 変更までは保証しない。
+    // 異常値で記録ごと落ちるのが一番重い壊れ方である（対象が audit から消えたまま先へ進む）。
+    // 成否は推測せず undelivered へ倒し、名前の判らないチャネルは `unknown` として残す。
+    const { storage } = seedIdleDesignReview()
+
+    const result = await runPlTick(storage, escalatingDeps(async () =>
+      ([{ channel: 7, success: 'yes' }, null] as unknown as PlEscalationChannelResult[])))
+
+    expect(result.status).toBe('escalated')
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])).toEqual({
+      outcome: 'undelivered',
+      channels: ['unknown', 'unknown'],
+    })
+  })
+
+  it('未配達でも新しい抑止状態を作らない（従来の経路のまま進む）', async () => {
+    // 「届かなかったこと」を見えるようにするのが目的であり、復旧をさらに止める状態は足さない。
+    const { storage } = seedIdleDesignReview()
+    let diagnoseCalls = 0
+    const d = deps({
+      diagnose: async () => {
+        diagnoseCalls += 1
+        return JSON.stringify({ actionKind: 'escalate_to_ceo', rationale: 'x', riskLevel: 'HIGH' })
+      },
+      escalate: async () => [],
+    })
+
+    expect((await runPlTick(storage, d)).status).toBe('escalated')
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    // 配達に失敗しても、2回目以降の扱いは届いた場合とまったく同じ
+    expect(second.status).toBe('idle')
+    expect(second.reason).toContain('already escalated')
+    expect(diagnoseCalls).toBe(1)
+  })
+
+  it('PL が長い理由を書いても配達結果は切り落とされない', async () => {
+    // detail は 500 文字で切られる。理由文は PL（provider CLI）由来で長さを制御できないので、
+    // 機械判定用の欄を後ろに置くと、長い理由のときだけ配達結果が消える。
+    const { storage } = seedIdleDesignReview()
+
+    await runPlTick(storage, escalatingDeps(async () => [{ channel: 'line', success: true }], 'あ'.repeat(2000)))
+
+    expect(parseEscalationDelivery(escalatedDetails(storage)[0])?.outcome).toBe('delivered')
+  })
+
+  it('配達結果が載っていない古い行は delivered にも undelivered にも倒さない', () => {
+    expect(parseEscalationDelivery('PL は 2 回試しましたが解消しませんでした。')).toBeUndefined()
+    expect(parseEscalationDelivery(undefined)).toBeUndefined()
+  })
+
+  it('理由文が欄名で始まっても channels を取り違えない', () => {
+    // 理由文は PL（provider CLI）由来で中身を制御できない。欄名は outcome ごとに決まっており、
+    // 対応しない欄は理由文として読み飛ばす。
+    expect(parseEscalationDelivery('delivery=suppressed tried=line が落ちていました')).toEqual({
+      outcome: 'suppressed',
+      channels: [],
+    })
+    expect(parseEscalationDelivery('delivery=undelivered tried=line,slack ほか')).toEqual({
+      outcome: 'undelivered',
+      channels: ['line', 'slack'],
+    })
+    expect(parseEscalationDelivery('delivery=delivered via=line 理由')).toEqual({
+      outcome: 'delivered',
+      channels: ['line'],
+    })
   })
 })
 
@@ -509,7 +724,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
         if (claim.claimToken) s.designReviewRuns.complete(id, claim.claimToken, 'succeeded', '{}', undefined)
         return { status: 'evidence_registered' }
       },
-      escalate: async (p) => { escalations.push(p.title) },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
     })
 
     const result = await runPlTick(storage, d)
@@ -526,7 +741,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
     const d = deps({
       // 「成功した」と言うだけで何もしない実行 → 対象は消えない
       rekickDesignReview: async () => ({ status: 'evidence_registered' }),
-      escalate: async (p) => { escalations.push(p.title) },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
     })
 
     for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {
@@ -629,7 +844,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         adopted.push(input.roadmapId)
         return { ok: true as const, taskId: `task-${adopted.length}`, roadmapTaskKey: input.roadmapId, title: 't' }
       },
-      escalate: async (p) => { escalations.push(p.title) },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
     })
 
     // 予算を使い切って Escalation させる
@@ -671,7 +886,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       return deps({
         readLedger: () => LEDGER,
         proposeAdoption: async () => 'これは JSON ではない',
-        escalate: async (p) => { escalations.push(p.title) },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
         ...over,
       })
     }
@@ -717,6 +932,65 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       expect(escalations).toHaveLength(1)
     })
 
+    // C（意図的に送らなかった）と D（送るべきだったのに届かなかった）は、どちらも
+    // 「届いていない」が前者は正常・後者は障害である。取り違えてはならない。
+    it('重複として抑制した escalation は、未配達と区別して記録する', async () => {
+      const storage = idleProject()
+      const escalations: string[] = []
+      const d = brokenAdoption(escalations)
+
+      await runOneEscalationCycle(storage, d)
+      await runOneEscalationCycle(storage, d)
+
+      const projectId = storage.projects.findAll()[0]!.id
+      // `findByEntity()` は新しい順に返す。
+      const rows = storage.auditLog
+        .findByEntity('pl_loop_target', `adopt:${projectId}`)
+        .filter((entry) => entry.result === 'escalated')
+
+      expect(rows).toHaveLength(2)
+      expect(parseEscalationDelivery(rows[1]?.detail)?.outcome).toBe('delivered')
+      expect(parseEscalationDelivery(rows[0]?.detail)?.outcome).toBe('suppressed')
+      // 抑制（正常）を未配達（障害）として数えない
+      expect(rows.filter((entry) => parseEscalationDelivery(entry.detail)?.outcome === 'undelivered'))
+        .toHaveLength(0)
+      // 送っていないのでチャネルの欄を持たない。`tried=none` と書くと
+      // 「試して届かなかった」（= 障害）と読めてしまう。
+      expect(rows[0]?.detail?.startsWith('delivery=suppressed ')).toBe(true)
+      expect(parseEscalationDelivery(rows[0]?.detail)?.channels).toEqual([])
+      expect(escalations).toHaveLength(1)
+    })
+
+    it('配達に失敗しても通知の重複判定は変わらない（窓も incident 単位のままである）', async () => {
+      // **この incident は undelivered のまま dedup される。** 1回目は送って誰にも届かず、
+      // 2周目は同じ incident なので送信自体を行わない —— つまり CEO には最後まで届かない。
+      // それでも再送の合図にはしない。再送を足すと、チャネルが落ちている間じゅう
+      // 同じ incident を鳴らし続けることになる（それが #249 で止めた失敗そのもの）。
+      // 届いていないことは audit の `delivery=undelivered` から後で判る。それが本項目の目的である。
+      const storage = idleProject()
+      const attempts: string[] = []
+      const d = brokenAdoption([], { escalate: async (p) => { attempts.push(p.title); return [] } })
+
+      await runOneEscalationCycle(storage, d)
+      await runOneEscalationCycle(storage, d)
+
+      const projectId = storage.projects.findAll()[0]!.id
+      const rows = storage.auditLog
+        .findByEntity('pl_loop_target', `adopt:${projectId}`)
+        .filter((entry) => entry.result === 'escalated')
+
+      // 送信を試みたのは最初の incident の1回だけ。2周目は今までどおり抑制される。
+      expect(attempts).toHaveLength(1)
+      expect(parseEscalationDelivery(rows[1]?.detail)?.outcome).toBe('undelivered')
+      expect(parseEscalationDelivery(rows[0]?.detail)?.outcome).toBe('suppressed')
+      // 再試行は従来どおり続く（未配達が採用を止めない）
+      expect(
+        storage.auditLog
+          .findByEntity('pl_loop_target', `adopt:${projectId}`)
+          .filter((entry) => entry.result === 'blocked').length,
+      ).toBe(PL_MAX_ADOPTION_ATTEMPTS * 2)
+    })
+
     it('一度採用に成功したあと再発したら、新しい incident として通知する', async () => {
       const storage = idleProject()
       const escalations: string[] = []
@@ -727,7 +1001,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         adopt: async (_s, input) => ({
           ok: true as const, taskId: 'task-1', roadmapTaskKey: input.roadmapId, title: 't',
         }),
-        escalate: async (p) => { escalations.push(p.title) },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
       })
 
       await runOneEscalationCycle(storage, d)
@@ -755,7 +1029,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
           if (mode === 'throws') throw new Error('provider timed out')
           return 'これは JSON ではない'
         },
-        escalate: async (p) => { escalations.push(p.title) },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
       })
 
       await runOneEscalationCycle(storage, d)
@@ -785,7 +1059,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
             allowedPaths: ['apps/api/src/ctoAi'],
             acceptanceCriteria: ['y'],
           })),
-        escalate: async (p) => { escalations.push(p.title) },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
       })
 
       await runOneEscalationCycle(storage, d)
@@ -870,7 +1144,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         adopt: async (_s, input) => ({
           ok: true as const, taskId: 'task-1', roadmapTaskKey: input.roadmapId, title: 't',
         }),
-        escalate: async (p) => { escalations.push(p.title) },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
       })
 
       await runOneEscalationCycle(storage, d)
@@ -916,7 +1190,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         adopted.push(input.roadmapId)
         return { ok: true as const, taskId: `task-${adopted.length}`, roadmapTaskKey: input.roadmapId, title: 't' }
       },
-      escalate: async (p) => { escalations.push(p.title) },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
     })
 
     // 1サイクル目: 失敗 → 成功（合計2 attempt。従来はここで生涯予算を使い切っていた）
@@ -941,7 +1215,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     const d = deps({
       readLedger: () => LEDGER,
       proposeAdoption: async () => 'これは JSON ではない',
-      escalate: async (p) => { escalations.push(p.title) },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
     })
 
     for (let i = 0; i < PL_MAX_ADOPTION_ATTEMPTS; i += 1) {
@@ -984,7 +1258,7 @@ describe('runPlTick — CEO 判断待ちは黙って放置しない', () => {
 
     const result = await runPlTick(storage, deps({
       diagnose: async () => { diagnosed += 1; return '{}' },
-      escalate: async (p) => { escalations.push(p.body) },
+      escalate: async (p) => { escalations.push(p.body); return DELIVERED },
     }))
 
     expect(result.status).toBe('escalated')
@@ -999,7 +1273,7 @@ describe('runPlTick — CEO 判断待ちは黙って放置しない', () => {
     const { storage, taskId } = seed()
     seedApproval(storage, taskId)
     const escalations: string[] = []
-    const d = deps({ escalate: async (p) => { escalations.push(p.body) } })
+    const d = deps({ escalate: async (p) => { escalations.push(p.body); return DELIVERED } })
 
     await runPlTick(storage, d)
     resetPlLoopInFlightForTest()
@@ -1049,7 +1323,7 @@ describe('runPlTick — 採用したのに動き出さない Task を黙って�
 
     const result = await runPlTick(storage, deps({
       now: () => soon,
-      escalate: async (p) => { escalations.push(p.body) },
+      escalate: async (p) => { escalations.push(p.body); return DELIVERED },
     }))
 
     // まだ Design Review 中でありうる時間。ここで鳴らすと採用のたびに誤報になる
@@ -1062,7 +1336,7 @@ describe('runPlTick — 採用したのに動き出さない Task を黙って�
     const escalations: string[] = []
     // 閾値（5分）を超えた時刻から観測する
     const later = atMinutesAfterTaskCreated(storage, taskId, 10)
-    const d = deps({ now: () => later, escalate: async (p) => { escalations.push(p.body) } })
+    const d = deps({ now: () => later, escalate: async (p) => { escalations.push(p.body); return DELIVERED } })
 
     const first = await runPlTick(storage, d)
 
@@ -1168,6 +1442,49 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     // 恒久的に書けないものが名指しされる。scope の問題（docs/notes.md）と混ぜない
     expect(escalations[0]).toContain('apps/worker/src/guards/fileChangeGuard.ts')
     expect(escalations[0]).toContain('どんな allowedPaths でも通らない')
+  })
+
+  it.each([
+    {
+      expectedDelivery: { outcome: 'delivered' as const, channels: ['line'] },
+      reported: [{ channel: 'line', success: true }],
+    },
+    {
+      expectedDelivery: { outcome: 'undelivered' as const, channels: ['line'] },
+      reported: [{ channel: 'line', success: false }],
+    },
+  ])('triage 行は $expectedDelivery.outcome の配達欄が先頭でも両方の parser で読める', async ({
+    expectedDelivery,
+    reported,
+  }) => {
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      guardResult: {
+        permissionAllowed: true,
+        fileChangeAllowed: false,
+        fileViolations: ['apps/worker/src/guards/fileChangeGuard.ts'],
+      },
+    } as Parameters<IStorage['jobs']['update']>[1])
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const result = await runPlTick(storage, deps({ escalate: async () => reported }))
+    const detail = storage.auditLog
+      .findAll()
+      .find((entry) => entry.operation === 'pl_loop' && entry.result === 'escalated')
+      ?.detail
+
+    expect(result.status).toBe('escalated')
+    expect(detail?.startsWith(`delivery=${expectedDelivery.outcome} `)).toBe(true)
+    expect(parseEscalationDelivery(detail)).toEqual(expectedDelivery)
+    expect(parseTriageAuditDetail(detail)).toEqual({
+      lane: 'ceo_escalation',
+      cause: 'safety_or_authority_boundary',
+      confidence: 'high',
+    })
   })
 
   it('scope だけの違反は protected 扱いせず、Independent Remediation へ回す', async () => {
@@ -1304,7 +1621,7 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     const d = deps({
       // clear_workspace_quarantine は safety_review を要するため Gate で止まる（fail-closed）
       diagnose: async () => JSON.stringify({ actionKind: 'clear_workspace_quarantine', rationale: 'x', riskLevel: 'LOW' }),
-      escalate: async (p) => { escalations.push(p.title) },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
     })
 
     for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {

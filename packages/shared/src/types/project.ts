@@ -49,12 +49,24 @@ export interface Project {
 }
 
 /**
- * 現行ロードマップTaskから導出するProject完了状況。
+ * 現行ロードマップTaskから導出する**Roadmap消化状態**。
  * ProjectStatusを増やさず、roadmapActiveなTaskだけを対象にする。
+ *
+ * **これはProject Goalの達成を意味しない**（`specs/00_constitution.md` 3.10 Goal Driven）。
+ * ProjectはGoal達成まで継続し、MVP / Phase / Release / Roadmap消化はいずれもProject完了では
+ * ない。ここで表すのは「現在のroadmapに積まれた作業を消化し切ったか」だけであり、Goalが
+ * 未達ならRoadmapが追加されて作業は続く。
+ *
+ * したがって`isComplete === true`を、Project終了・Goal達成・以後作業なしの根拠に使わない。
+ * 表示する場合も「完了」ではなく「ロードマップ消化済み」相当の文言にする
+ * （2026-09-13 CEO訂正。`apps/mobile/app/index.tsx`のバッジがこの契約に従う）。
  */
 export interface ProjectRoadmapCompletion {
+  /** roadmapActiveなTaskのうちdoneの件数。 */
   completedTaskCount: number
+  /** 対象Taskが1件以上あり、その全件がdoneか。Goal達成ではなくRoadmap消化を表す。 */
   isComplete: boolean
+  /** 対象となるroadmapActiveなTaskの総数。0件のときはisCompleteをtrueにしない。 */
   totalTaskCount: number
 }
 

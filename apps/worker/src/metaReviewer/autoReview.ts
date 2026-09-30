@@ -18,15 +18,22 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 
-// .env ロード（runner.ts の動的 import より前に CONTROL_ROOT を設定する）
-//
-// runner.ts は module-level で CONTROL_ROOT を確定する。ESM では静的 import は
-// モジュール本体より先に評価されるため、静的 import のままでは .env ロードが間に
-// 合わない。そのため runner.ts / geminiRouter.ts は main() 内で動的 import する。
-//
-// __dirname = apps/worker/src/metaReviewer/
-// ../../../../.env = リポジトリルートの .env
-{
+/**
+ * .env をプロセス内へロードする（runner.ts の動的 import より前に CONTROL_ROOT を設定する）。
+ *
+ * runner.ts は module-level で CONTROL_ROOT を確定する。ESM では静的 import は
+ * モジュール本体より先に評価されるため、静的 import のままでは .env ロードが間に
+ * 合わない。そのため runner.ts / geminiRouter.ts は main() 内で動的 import する。
+ *
+ * 呼び出しは main() の先頭のみ（module-level では呼ばない）。module-level に置くと、
+ * buildDiffRangeArgs() を import するだけのテストでも実 .env が process.env へ
+ * 流れ込むため。runner.ts の動的 import より前に呼ばれる限り、ADR 0002 が要求する
+ * 「プロセス内ロード → その後に CONTROL_ROOT 依存モジュールを評価」の順序は変わらない。
+ *
+ * __dirname = apps/worker/src/metaReviewer/
+ * ../../../../.env = リポジトリルートの .env
+ */
+function loadEnvFile(): void {
   const envPath = resolve(__dirname, '../../../../.env')
   if (existsSync(envPath)) {
     for (const line of readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
@@ -43,7 +50,43 @@ import { dirname, resolve } from 'node:path'
   }
 }
 
+/**
+ * review 対象 diff を取得する git 引数を組み立てる。
+ *
+ * BASE_SHA / HEAD_SHA が揃う場合（GitHub Actions）は **三点間 diff**
+ * （`baseSha...headSha` = merge-base 起点）を使う。
+ *
+ * 二点間（`git diff baseSha headSha`）を使うと、head が base tip より古い場合に
+ * 「base 側にだけ存在する commit」が head 側の削除として現れ、Meta Review が
+ * 実在しない削除（phantom deletion）を critical と判定して false BLOCKED になる。
+ * 実例: PR #99 は tasks/roadmap.md のみ追加する docs PR だったが、base に含まれる
+ * PR #97 を分岐点に持たなかったため「Project開始ワークフロー全体が削除された」と
+ * 判定された。BASE_SHA には常に **現在の** base tip が渡される
+ * （.github/workflows/meta-review.yml の github.event.pull_request.base.sha）ため、
+ * base を最新化しても解消しない。diff の取り方自体を三点間にするのが対処である。
+ * 逆向き（base が分岐後に削除したファイルが head 側の「追加」として現れる）も同じ原因で
+ * 起きるため、三点間化で両方が解消する。head 自身が行った実際の削除は従来どおり現れる。
+ *
+ * ローカル実行（base/head 未指定）は直前コミットとの差分のままとする。HEAD~1 は
+ * 常に HEAD の祖先であり、二点間と三点間は一致するため phantom deletion は起きない。
+ */
+export function buildDiffRangeArgs(
+  baseSha: string | undefined,
+  headSha: string | undefined,
+): { diffArgs: string[]; nameOnlyArgs: string[] } {
+  const range = baseSha && headSha
+    ? [`${baseSha}...${headSha}`]   // GHA: PR の全差分（merge-base 起点の三点間）
+    : ['HEAD~1', 'HEAD']            // ローカル: 直前コミットとの差分
+
+  return {
+    diffArgs: ['diff', ...range],
+    nameOnlyArgs: ['diff', '--name-only', ...range],
+  }
+}
+
 async function main(): Promise<void> {
+  loadEnvFile()
+
   // .env ロード後に runner.ts / geminiRouter.ts / metaReviewFallbackRouter.ts を評価させるため動的 import する
   const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult, classifyFormalVerdict } =
     await import('./runner.js')
@@ -71,13 +114,7 @@ async function main(): Promise<void> {
   let changedFiles: string[]
 
   try {
-    const diffArgs = baseSha && headSha
-      ? ['diff', baseSha, headSha]          // GHA: PRの全差分
-      : ['diff', 'HEAD~1', 'HEAD']           // ローカル: 直前コミットとの差分
-
-    const nameOnlyArgs = baseSha && headSha
-      ? ['diff', '--name-only', baseSha, headSha]
-      : ['diff', '--name-only', 'HEAD~1', 'HEAD']
+    const { diffArgs, nameOnlyArgs } = buildDiffRangeArgs(baseSha, headSha)
 
     gitDiff = execFileSync('git', diffArgs, {
       cwd: workingDir,
@@ -291,7 +328,15 @@ function printResult(result: MetaReviewResultLike): void {
 }
 
 // 実行
-main().catch(err => {
-  console.error('❌ Meta Review の実行中に予期しないエラーが発生しました:', err)
-  process.exit(2)
-})
+//
+// テストが buildDiffRangeArgs() を import したときだけ main() を走らせない。
+// 判定は「vitest 配下かどうか」で行い、**判定できない場合は実行する**側に倒す。
+// 逆向き（entrypoint と確認できた時だけ実行する）にすると、実行形態が変わった際に
+// Meta Review が黙って何もせず exit 0 する = 必須チェックが fail-open するため。
+// vitest 配下で誤って実行しても、失敗はテストとして即座に可視化される。
+if (process.env.VITEST === undefined) {
+  main().catch(err => {
+    console.error('❌ Meta Review の実行中に予期しないエラーが発生しました:', err)
+    process.exit(2)
+  })
+}

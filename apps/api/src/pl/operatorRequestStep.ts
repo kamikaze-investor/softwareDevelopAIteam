@@ -76,7 +76,7 @@ export interface OperatorRequestStepDeps {
   /** 回答の生成。既定は既存 provider CLI 経路（`requestText`）。従量課金 API を足さない。 */
   answer?: (system: string, user: string) => Promise<string>
   /** CEO への escalation。PL ループと同じ既存 notifier を渡す。 */
-  escalate: (payload: { title: string; body: string }) => Promise<void>
+  escalate: (payload: { title: string; body: string }) => Promise<unknown>
   describePlLoopStatus: (item: AttentionItem) => PlLoopTargetStatus
   /** attention の同一性キー（自律ループの `targetKeyOf`）。 */
   targetKeyOf: (item: AttentionItem) => string
