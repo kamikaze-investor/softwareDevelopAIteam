@@ -10,15 +10,20 @@
  *
  * ## 外部認証のモード
  *
- * - `disabled`（既定）… すべての MCP request を拒否する。**本番接続の認証方式は未決定**なので、
- *   設定しないまま公開しても何も通らない（fail closed）
- * - `local_static_bearer` … ローカル検証専用（D5 接続テスト・MCP Inspector）。固定 token の
- *   SHA-256 と照合する。**loopback に bind するときしか起動できない**
+ * - `disabled`（既定）… すべての MCP request を拒否する。設定しないまま起動しても何も通らない
+ *   （fail closed）
+ * - `local_static_bearer` … 固定 token の SHA-256 と照合する。**loopback に bind するときしか
+ *   起動できない**。D5 接続テスト・MCP Inspector に加え、**OpenAI Secure MCP Tunnel 経由の本番接続**に使う
+ *   （CEO 判断・2026-09-30）: 同じ host の tunnel-client が `127.0.0.1` へ転送するときに付ける固定 header
+ *   （`MCP_EXTRA_HEADERS`）を照合し、他のローカルプロセスを loopback gateway から締め出す。
  *
- * ChatGPT の remote MCP connector が受け付ける認証は OAuth 2.1（MCP authorization spec）/
- * No Authentication / Mixed であり、固定 bearer は無い。本番用の OAuth は
- * authorization server（外部 IdP か自前か）の選定が CEO 判断のため、**まだ実装していない**。
- * No Authentication は本番では使わない。
+ * ## 誰が ChatGPT から届けるか（外部の認証境界）
+ *
+ * Tunnel 経路では、ChatGPT から gateway へ届く主体を決めるのは **OpenAI 側の Tunnel ACL**
+ * （tunnel を紐づけた organization / ChatGPT workspace と Tunnels **Use** 権限）であり、この bearer ではない。
+ * そのため公開 MCP endpoint・inbound port・独自 OAuth server は作らない。ChatGPT の remote MCP connector を
+ * 公開 endpoint へ直接つなぐ構成（OAuth 2.1 / No Authentication / Mixed。固定 bearer は無い）は採らない。
+ * 運用手順・rollback は `ops/systemd/README.md` を参照。
  */
 
 export type ExternalAuthMode = 'disabled' | 'local_static_bearer'

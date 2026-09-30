@@ -10187,19 +10187,45 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `app.register(operatorRequestRoutes, ...)` の1行と、それに必要な import 1行の計2行。この承認で他の refactor・
       責務変更は行わない（read route は既存 operator plugin の中で登録している）。
 
-      **外部認証（ChatGPT → gateway）の現状**: ChatGPT の remote MCP connector が受け付けるのは
+      **外部認証（ChatGPT → gateway）の経緯**: ChatGPT の remote MCP connector が受け付けるのは
       OAuth 2.1（MCP authorization spec: Protected Resource Metadata / DCR または CIMD / PKCE）・
       No Authentication・Mixed で、固定 bearer は無い（2026-09-28 調査。一次資料
-      `developers.openai.com` はこの実行環境の egress で遮断され、検索結果の抜粋で確認した。
-      **着手前に一次資料で再確認すること**）。gateway の既定は `disabled`（全拒否）で、
-      他は loopback 限定の `local_static_bearer` だけ。**OAuth は未実装**（authorization server を
-      外部 IdP にするか自前にするかは外部サービス追加・セキュリティモデル変更のため CEO 判断）。
+      `developers.openai.com` はこの実行環境の egress で遮断され、検索結果の抜粋で確認した）。
+      gateway の既定は `disabled`（全拒否）で、他は loopback 限定の `local_static_bearer` だけ。
+
+      **【2026-09-30 CEO 判断】接続方式は OpenAI Secure MCP Tunnel を採用する。** 公開 MCP hostname・
+      inbound port・Cloudflare route・reverse proxy・独自 OAuth server は作らない（既存機能で成立しないと
+      確認された場合だけ再検討する）。構成は ChatGPT → OpenAI Tunnel → VPS の tunnel-client（外向き HTTPS のみ）
+      → `127.0.0.1:3100` の MCP Gateway（`local_static_bearer`）→ `operator_gateway` credential → API。
+      ChatGPT から届く主体を決めるのは OpenAI 側の Tunnel ACL（tunnel の organization / workspace と
+      Tunnels Use 権限）で、local bearer は同じ host の他プロセスを締め出すためのもの。**gateway の runtime
+      コードは変更不要**（`fcfd732`→`06616d9` で gateway・auth・operator route に差分なしを確認）。
+      根拠は OpenAI 公式 `openai/tunnel-client` の docs（2026-09-28 取得分と 2026-09-30 再取得分が一致）。
+      運用定義（unit 雛形・env 名・手順・rollback）は `apps/mcp-gateway/ops/systemd/`。
+      **Stage A（loopback のみ・OpenAI 未接続）**: lockfile からの依存 install（Worker 停止中）、
+      `operator_gateway` credential と local bearer の生成、API への hash 追加と API のみ再起動、
+      gateway unit の配置。受入: gateway は `127.0.0.1` のみ／bearer 無し・不正 bearer は 401／正しい bearer で
+      initialize・tools/list・operator read が成功／`operator_gateway` で ADMIN route は 403／`ask_pl` は
+      Operator Request だけを作る／平文が journal に出ない。
+      **Stage B（Stage A 確認後。A と同時に入れない）**: CEO が UI で Tunnel 作成（org と ChatGPT workspace に
+      紐づけ）・Restricted runtime key（Tunnels Read + Use）・ChatGPT の Connection: Tunnel（**認証なし**。
+      OAuth / Mixed だと connector の Authorization が local bearer を上書きして全呼び出しが 401 になる）を行い、
+      PL は tunnel-client（`runtime` flavor の `tunnel-client-runtime`、`SHA256SUMS.txt` 照合）と unit を配置する
+      （health は `127.0.0.1:3180`）。
+      受入: 新しい外向きの待ち受けが無い／ChatGPT に tool が出て read と `ask_pl` が既存 Gate どおり動く／
+      tunnel-client 停止で ChatGPT から届かなくなる。**緊急遮断**は `systemctl --user disable --now ai-team-tunnel-client`（決定的な遮断は runtime key の revoke /
+      tunnel の削除）、
+      credential の無効化は API から `OPERATOR_GATEWAY_TOKEN_SHA256` を外して API 再起動。
+      **未確認（CEO が UI で確認）**: この account / workspace で Tunnel と developer mode が使えるか、write tool
+      （`ask_pl`）が使えるか、Tunnel の課金。ChatGPT が送る MCP protocol version に SDK 1.30.1 の stateless 実装が
+      応じられるかは Stage B で実測する。
 
       **Production 有効化までに残るもの（すべて CEO 判断 / VPS 作業）**:
       (1) production の effective auth mode が split であることの確認（`split-credential-migration`）と、
       設定値が空 token 由来 hash でないことの確認 / (2) 本修正の deploy /
       (3) `POST /api/context-pack` 任意ファイル読み取りの別 security fix / (4) 外部認証方式の決定と実装 /
       (5) gateway の公開方法（HTTPS・常駐 process）/ (6) ChatGPT 実機での接続テスト。
+      （(4)(5) は 2026-09-30 に Secure MCP Tunnel 採用で方針確定。実施は上記 Stage A → Stage B。）
 
       **(1)〜(3) の進捗（2026-09-28）**: (1) production は split credential mode（ADMIN / WORKER hash は
       設定済みで異なる値・空 token 由来 hash なし、ACTIONS_READONLY / OPERATOR_GATEWAY は未設定）を
