@@ -71,6 +71,11 @@ describe('loadEngineeringPrinciples', () => {
 
     const grandfather = result.bySlug.get('existing-code-grandfather')
     expect(grandfather?.tier).toBe('contextual')
+
+    const staging = result.bySlug.get('unknown-driven-staging')
+    expect(staging?.tier).toBe('contextual')
+    expect(staging?.category).toBe('scope-control')
+    expect(staging?.fullText).toContain('Iteration tax')
   })
 
   it('derives a version hash that ignores line-ending differences', () => {
@@ -214,6 +219,25 @@ describe('selectPrinciples', () => {
     expect(boundary?.reason).toBe('focus=safety_recovery')
   })
 
+  it('compiles the staging rule only for tasks where staging is a scope concern', () => {
+    const principles = loadForTest()
+
+    // 全 Task へ無条件に注入しない（contextual）。
+    expect(selectPrincipleSlugs(undefined, principles)).not.toContain('unknown-driven-staging')
+    expect(selectPrincipleSlugs({ predictedFocuses: ['safety_recovery'] }, principles))
+      .not.toContain('unknown-driven-staging')
+
+    // Roadmap review は常に scope_simplicity を走らせるので、Milestone / Task 分割もここで判定される。
+    const scope = selectPrinciples({ predictedFocuses: ['scope_simplicity'] }, principles)
+    const staging = scope.find((item) => item.slug === 'unknown-driven-staging')
+    expect(staging?.source).toBe('contextual')
+    expect(staging?.reason).toBe('focus=scope_simplicity')
+
+    const contract = buildDesignContract({ slugs: scope.map((item) => item.slug), principles })
+    expect(contract).toContain('Stage by unknown, not by size')
+    expect(contract).toContain('never stage only by shrinking volume, cardinality')
+  })
+
   it('records risk-derived selections separately from focus-derived ones', () => {
     const principles = loadForTest()
     const selection = selectPrinciples({ riskLevel: 'high' }, principles)
@@ -267,6 +291,8 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     expect(guidance).toContain('- implementation_coupling: Prefer public APIs and stable contracts over incidental internals.')
     expect(guidance).toContain('- over_constraint: Name the failure a constraint prevents before adding it.')
     expect(guidance).toContain('- unverifiable_assumption: Report unverifiable claims honestly instead of turning guesses into PASS.')
+    // unnecessary_staging は独立 category ではなく over_constraint の一種として報告させる。
+    expect(guidance).toContain('- over_constraint (unnecessary_staging; report it as over_constraint): Stage by unknown, not by size')
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {

@@ -25,6 +25,7 @@ export type PrincipleSlug =
   | 'scale-to-risk'
   | 'existing-code-grandfather'
   | 'observation-closes-loop'
+  | 'unknown-driven-staging'
 
 /** core = signal によらず毎回適用される。contextual = signal から選ばれたときだけ適用される。 */
 export type PrincipleTier = 'core' | 'contextual'
@@ -83,6 +84,7 @@ const ALL_PRINCIPLE_SLUGS: readonly PrincipleSlug[] = [
   'scale-to-risk',
   'existing-code-grandfather',
   'observation-closes-loop',
+  'unknown-driven-staging',
 ] as const
 
 const SLUG_SET = new Set<string>(ALL_PRINCIPLE_SLUGS)
@@ -108,9 +110,12 @@ const FOCUS_PRINCIPLE_SLUGS: Partial<Record<MetaReviewFocus, readonly PrincipleS
     'stable-contract-first',
     'scale-to-risk',
   ],
+  // Roadmap review always runs scope_simplicity, so milestone / task-decomposition staging is
+  // judged there without adding a focus or a review path.
   scope_simplicity: [
     'scale-to-risk',
     'existing-code-grandfather',
+    'unknown-driven-staging',
   ],
 } as const
 
@@ -318,11 +323,14 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
   const stableContract = principles.bySlug.get('stable-contract-first')
   const standardDesignFrame = principles.bySlug.get('standard-design-frame')
   const honestUnverifiable = principles.bySlug.get('honest-unverifiable')
+  const unknownDrivenStaging = principles.bySlug.get('unknown-driven-staging')
 
   return [
     '## Engineering Principle Review Guidance',
     `- implementation_coupling: ${stableContract?.oneLiner ?? 'Principle stable-contract-first was not available; do not treat it as applied.'}`,
     `- over_constraint: ${standardDesignFrame?.oneLiner ?? 'Principle standard-design-frame was not available; do not treat it as applied.'}`,
+    // unnecessary_staging は over_constraint の一種として報告させる（新しい category を作らない）。
+    `- over_constraint (unnecessary_staging; report it as over_constraint): ${unknownDrivenStaging?.oneLiner ?? 'Principle unknown-driven-staging was not available; do not treat it as applied.'}`,
     `- unverifiable_assumption: ${honestUnverifiable?.oneLiner ?? 'Principle honest-unverifiable was not available; do not treat it as applied.'}`,
   ].join('\n')
 }
