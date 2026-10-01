@@ -4961,7 +4961,7 @@ state / checkbox を `roadmap:update` で更新する（元の責務が完了し
 人間が継続するなら元 ID は `in_progress`、PL が自動採用する独立した残作業は新しい ID を `planned` で
 登録する。Promotion 済み Tier A を `planned` のまま残すと awaiting-promotion audit で fail-closed）、
 (3) `roadmap:sync` で `PROJECT_CURRENT_STATE` を同期する、(4) `roadmap:check` を PASS させる。
-merge 後は Candidate clone を canonical master へ同期してから次の自己開発を開始する。
+merge 後は Candidate clone を canonical master へ同期してから次の自己開発を開始する。同期で `pnpm-lock.yaml`（または package.json）が変化した場合は、Candidate clone で `pnpm install --frozen-lockfile` を実行して dependency を同期し、実行前後で HEAD・tracked files・lockfile・未 commit 差分が変化していないことを確認する（2026-10-01、dependency 未同期で Task `7458ea33` の全 Job が SafeCommand test で失敗した事例）。
 
 **Candidate 検証の2種別（区別する）**:
 1. **Synthetic / Destructive Test** — テスト専用の Project / Roadmap / DB を使い、
