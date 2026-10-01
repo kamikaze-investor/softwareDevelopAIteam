@@ -36,7 +36,10 @@ import {
   isLiveJob,
   occupiesProject,
 } from '@ai-team/shared'
-import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
+import {
+  adoptRoadmapItem,
+  checkRoadmapCompletionAwaitingPromotion,
+} from '../ctoAi/roadmapAdoption'
 import type { IStorage } from '../storage/interface'
 import {
   assertAdoptionScopeIsBounded,
@@ -134,6 +137,8 @@ export type AdoptionKind = 'fresh' | 'follow_up' | 'not_available'
 
 export interface ClassifiedCandidate extends RoadmapCandidate {
   kind: AdoptionKind
+  /** `not_available` のうち、機械的に識別できる fail-closed 理由。 */
+  notAvailableReason?: 'awaiting_promotion'
   /** `follow_up` のとき、これまでに作られた follow-up の数。 */
   followUpCount: number
   /** この項目で**実際に実行された** Task の数。prompt はこちらを使う。 */
@@ -188,6 +193,25 @@ export function classifyAdoptionCandidates(
     ).length
     const executed = executedCount > 0
     const active = siblings.some((task) => occupiesProject(task))
+
+    // Candidate の completion と ledger 更新の間は follow-up を作らない。後続の parked / failed sibling が
+    // あっても、過去の qualifying completion を共有 predicate が見つければ fail-closed にする。
+    const awaitingPromotion = checkRoadmapCompletionAwaitingPromotion(
+      storage,
+      projectId,
+      candidate.id,
+      ledgerIds,
+    )
+    if (awaitingPromotion.length > 0) {
+      return {
+        ...candidate,
+        kind: 'not_available' as const,
+        notAvailableReason: 'awaiting_promotion' as const,
+        followUpCount,
+        executedTaskCount: executedCount,
+        boosted: false,
+      }
+    }
 
     // **まだ一度も Job が走っていない Task は従来どおり `fresh` 扱いである。**
     // 採用し直すと `syncRoadmapTasks()` の isUnstarted 分岐が spec を更新するだけで、
@@ -597,7 +621,14 @@ export async function runAdoptionStep(
   const available = applyFollowUpBoost(storage, projectId, classified)
     .filter((candidate) => candidate.kind !== 'not_available')
   if (available.length === 0) {
-    return { status: 'no_candidate', reason: 'no open roadmap item in the ledger' }
+    const allAwaitingPromotion = classified.length > 0
+      && classified.every((candidate) => candidate.notAvailableReason === 'awaiting_promotion')
+    return {
+      status: 'no_candidate',
+      reason: allAwaitingPromotion
+        ? 'all open roadmap items are awaiting Tier A Candidate promotion'
+        : 'no open roadmap item in the ledger',
+    }
   }
 
   // 検出できたことを残す。選ばれたかどうかは下で別途記録する。
