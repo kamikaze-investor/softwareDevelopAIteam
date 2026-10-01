@@ -258,6 +258,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **cleanup だけが失敗した containment が Job を quarantine させる
 - **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される
 - **PL Escalation の配達結果が記録されず、配達済み・未配達・意図的抑制を区別できない**
+- **VPS 運用手順の Current Truth 文書を canonical にする**
 - **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
@@ -318,7 +319,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**（state: planned）
 - **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**（state: planned）
 - **cheap AI（説明・質問経路）の latency と timeout 契約**（state: planned）
-- **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる**（state: planned）
+- **VPS runtime / env の文書と tooling を Current Truth に整合させる**（state: planned）
 - **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める**（state: planned）
 - **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）**（state: planned）
 - **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）**（state: planned）
