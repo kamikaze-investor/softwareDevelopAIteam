@@ -127,6 +127,50 @@ done or effective, and state it in the same change. This clause is the mechanize
 effect-verifiability requirement (Design Philosophy #8, `docs/multi_ai_step_review_flow.md` 2-3);
 it does not replace it. It applies to any system, team, or business, not only to this one.
 
+<!-- principle-id: unknown-driven-staging -->
+<!-- principle-oneliner: Stage by unknown, not by size: build the Target Capability directly unless a stage isolates a concrete unknown, risk, scale-dependent failure mode, or attribution benefit; never stage only by shrinking volume, cardinality, data, entity count, or scope. -->
+<!-- principle-category: scope-control -->
+<!-- principle-scope: universal -->
+<!-- principle-tier: contextual -->
+<!-- principle-tags: staging, mvp, spike, decomposition, iteration-tax -->
+■ Unknown-Driven Staging / Direct-to-Target Capability. This is the staging form of
+`standard-design-frame`: an intermediate stage is a constraint on the path, so it must name what it
+prevents. It applies to milestones, task decomposition and implementation plans alike. An unjustified
+stage is reported as `over_constraint` (sub-kind `unnecessary_staging`); it is not a separate review.
+Default: if the Target Capability is known and the intermediate stage does not isolate a materially
+different unknown or failure mode, implement the Target Capability directly. This is a default, not
+"always run at Target Scale first".
+A stage (MVP / Spike / phase / "first 1, then a few, then N") is justified only when it concretely
+names at least one of: (1) an independent technical or external unknown; (2) a Safety / Security /
+Data Integrity / Approval / Money boundary; (3) an irreversible or expensive failure; (4) a material
+improvement in failure attribution; (5) a new scale-dependent failure mode; (6) evidence / contract /
+fixture / adapter / benchmark the Target Capability itself reuses. "Smaller feels safer", "MVP",
+"start with one as usual" or "phased seems safer" alone justify nothing.
+Size is not an unknown: 1 -> N, one EA / Symbol / File / Account / Strategy -> many, small -> large
+dataset, narrow -> broad scope do not by themselves justify a stage when the contract is unchanged
+(e.g. 1 EA x 1 Symbol -> 1 EA x N Symbols -> N EA x N Symbols is one stage). Scale that introduces a
+new failure mode, contract or resource boundary IS a capability / risk change and may be its own
+stage: concurrency / races, queue / resume / retry, rate limits, memory / storage limits, timeouts,
+ordering guarantees, partial failure, distributed coordination, transaction boundaries,
+backpressure, cost explosion, scheduler contention, DB locking, observability boundaries (e.g. N EA x
+N Symbols -> persistent job queue with resume / retry).
+Iteration tax: a stage costs far more than code generation - task decomposition, delegation and
+prompts, human confirmation, file delivery / patch application, review, regression test, deploy,
+command execution, evidence / log collection, state synchronization, context switching. Remove a
+stage whose risk benefit cannot be stated concretely against that tax.
+Scale-down is primarily a diagnosis tool: when the Target Capability fails, shrinking toward a
+minimal reproduction to isolate root cause is expected. A pre-emptive small-scale run is still
+reasonable when it cheaply settles a specific scale-dependent unknown.
+A Spike exists to turn a specific unknown into evidence at minimum cost, not to build a small
+finished version; state its unknown, required evidence, pass / fail condition and effect on the
+Target Capability. Do not stack further stages on an unknown that is already resolved.
+Review questions: which unknown / risk does this stage resolve; what concrete failure risk rises if
+it is dropped and the Target Capability is built directly; is it only a volume / cardinality /
+scope reduction; does scale really add a failure mode; does it create a temporary contract / state
+model / implementation that will be thrown away; is its output reused by the Target Capability;
+would direct-to-target plus scale-down diagnosis on failure cost less in total; is its iteration tax
+justified.
+
 <!-- principle-id: home-and-criteria -->
 This file is the authoritative home for the Outcome-Oriented Generalization Principle. Completion
 criteria are satisfied when prompts and reviews select compact principle guidance by stable marker ID
