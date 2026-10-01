@@ -1229,6 +1229,9 @@ export function summarizeBlockedTriage(entries: readonly AuditLogEntry[]): Block
   let recurringRootCauses = 0
 
   for (const entry of entries) {
+    // executionLoop.record() is the only persisted triage writer. Other audit details may
+    // contain echoed roadmap text with the same lane/cause/conf tokens.
+    if (entry.operation !== 'pl_loop' || entry.entityType !== 'pl_loop_target') continue
     const parsed = parseTriageAuditDetail(entry.detail)
     if (parsed === undefined) continue
 

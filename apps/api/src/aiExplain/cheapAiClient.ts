@@ -11,6 +11,9 @@ export const CHEAP_AI_CONFIG = {
   timeoutMs: 60_000,
 } as const
 
+/** この経路の provider/model id。診断表示専用で、routing には使わない。 */
+export const CHEAP_AI_PROPOSER_ID = `${CHEAP_AI_CONFIG.provider}/${CHEAP_AI_CONFIG.model}`
+
 /**
  * timeout で止めた OpenCode が SIGTERM に応じないときに SIGKILL へ昇格させるまでの猶予。
  * 猶予後は close を待たずに settle する（孫プロセスが stdout を掴んだままでも宙吊りにしない）。

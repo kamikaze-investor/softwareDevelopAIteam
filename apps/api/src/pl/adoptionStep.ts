@@ -23,6 +23,7 @@
  * ledger への新しい metadata / PL 専用の状態表。
  */
 
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
@@ -121,6 +122,11 @@ export const FOLLOW_UP_SKIPS_BEFORE_BOOST = 3
 
 /** audit_log の語彙。**新しいテーブルも metrics backend も作らない。** */
 const AUDIT_ENTITY_TYPE = 'roadmap_item'
+export const AUDIT_PROPOSAL_UNPARSED = 'adoption_proposal_unparsed'
+const PL_TARGET_ENTITY_TYPE = 'pl_loop_target'
+export const PROPOSAL_DIAGNOSTIC_RAW_LIMIT = 4000
+export const PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT = 120
+export const PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION = 20
 export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
 export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
 export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
@@ -319,6 +325,245 @@ export interface PlAdoptionProposal {
   rationale?: string
 }
 
+export type AdoptionProposalParseResult =
+  | { ok: true; proposal: PlAdoptionProposal }
+  | { ok: false; reason: string }
+
+export interface ProposalDiagnostic {
+  reason: string
+  proposer: string
+  promptVersion: string
+  candidateCount: number
+  followUpCandidateCount: number
+  raw: string
+}
+
+export interface PersistedProposalDiagnostic extends ProposalDiagnostic {
+  /** Length of the original, unredacted model output. */
+  rawLength: number
+  /** Whether the stored, redacted raw text was truncated. */
+  rawTruncated: boolean
+  redactions: number
+}
+
+export interface RedactedDiagnosticText {
+  text: string
+  redactions: number
+}
+
+const SECRET_KEY_NAME = /api[_-]?key|client[_-]?secret|private[_-]?key|access[_-]?key|secret|token|password|passwd|credential|refresh|session|cookie/i
+const SECRET_KEY_IDENTIFIER = '[A-Za-z0-9_-]{1,160}'
+const SINGLE_LINE_SECRET_VALUE = `("(?:\\\\[^\\r\\n]|[^"\\\\\\r\\n])*"|'(?:\\\\[^\\r\\n]|[^'\\\\\\r\\n])*'|[^\\s,;'"]+)`
+
+const BARE_COLON_SECRET_KEYS = new Set([
+  'password',
+  'passwd',
+  'secret',
+  'credential',
+  'api_key',
+  'apikey',
+  'private_key',
+  'client_secret',
+  'access_token',
+  'refresh_token',
+])
+
+const COLON_SECRET_KEY_SEGMENTS = new Set([
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'credential',
+  'cookie',
+])
+
+function isStructuredSecretKey(key: string): boolean {
+  return SECRET_KEY_NAME.test(key) || key.toLowerCase().split(/[_-]/).includes('auth')
+}
+
+function isBareColonSecretKey(key: string): boolean {
+  const normalized = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/-/g, '_')
+    .toLowerCase()
+  if (BARE_COLON_SECRET_KEYS.has(normalized)) {
+    return true
+  }
+
+  const segments = normalized.split('_')
+  const hasQualifiedSecretSegment = segments.length > 1
+    && segments.some((segment) => COLON_SECRET_KEY_SEGMENTS.has(segment))
+
+  return hasQualifiedSecretSegment
+    || normalized.endsWith('api_key')
+    || normalized.endsWith('private_key')
+    || normalized.endsWith('access_key')
+    || normalized.endsWith('apikey')
+}
+
+/**
+ * Best-effort sanitization for untrusted model output stored in diagnostics.
+ * This deliberately preserves surrounding syntax so parse failures remain diagnosable.
+ */
+export function redactDiagnosticSecrets(raw: string): RedactedDiagnosticText {
+  try {
+    let text = raw
+    let redactions = 0
+    const replace = (
+      pattern: RegExp,
+      replacement: string | ((...args: string[]) => string),
+    ): void => {
+      text = text.replace(pattern, (...args: string[]) => {
+        redactions += 1
+        return typeof replacement === 'string' ? replacement : replacement(...args)
+      })
+    }
+
+    replace(
+      /-----BEGIN (?:(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?(?:-----END (?:(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----|$)/g,
+      '[REDACTED:PEM_PRIVATE_KEY]',
+    )
+
+    const jsonSecret = new RegExp(
+      `("(${SECRET_KEY_IDENTIFIER})"[ \\t]*:[ \\t]*)"(?:\\\\[^\\r\\n]|[^"\\\\\\r\\n])*"`,
+      'gi',
+    )
+    replace(jsonSecret, (match: string, prefix: string, key: string) => {
+      if (!isStructuredSecretKey(key)) {
+        redactions -= 1
+        return match
+      }
+      return `${prefix}"[REDACTED:SECRET_VALUE]"`
+    })
+
+    const equalsSecret = new RegExp(
+      `((?<![A-Za-z0-9"])(?!Authorization(?![A-Za-z0-9_-]))(${SECRET_KEY_IDENTIFIER})(?![A-Za-z0-9])[ \\t]*=[ \\t]*)${SINGLE_LINE_SECRET_VALUE}`,
+      'gi',
+    )
+    replace(equalsSecret, (match: string, prefix: string, key: string, value: string) => {
+      if (!isStructuredSecretKey(key)) {
+        redactions -= 1
+        return match
+      }
+      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : ''
+      return `${prefix}${quote}[REDACTED:SECRET_VALUE]${quote}`
+    })
+
+    const structuredColonSecret = new RegExp(
+      `((?<![A-Za-z0-9"])(?!Authorization(?![A-Za-z0-9_-]))(${SECRET_KEY_IDENTIFIER})(?![A-Za-z0-9])[ \\t]*:[ \\t]*)${SINGLE_LINE_SECRET_VALUE}`,
+      'gi',
+    )
+    replace(structuredColonSecret, (match: string, prefix: string, key: string, value: string) => {
+      if (!isBareColonSecretKey(key)) {
+        redactions -= 1
+        return match
+      }
+      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : ''
+      return `${prefix}${quote}[REDACTED:SECRET_VALUE]${quote}`
+    })
+
+    replace(
+      /\b((?:Authorization[ \t]*:[ \t]*)?Bearer[ \t]+)([A-Za-z0-9._~+/=-]+)/gi,
+      (_match: string, prefix: string) => `${prefix}[REDACTED:BEARER_TOKEN]`,
+    )
+    replace(
+      /\beyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\b/g,
+      '[REDACTED:JWT]',
+    )
+    replace(
+      /\b(?:sk-ant-|sk-|gh[oprsu]_|github_pat_|xox[abeprs]-)[A-Za-z0-9_-]{8,}\b/g,
+      '[REDACTED:TOKEN_PREFIX]',
+    )
+    replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED:AWS_ACCESS_KEY]')
+    replace(/\bAIza[A-Za-z0-9_-]{10,}\b/g, '[REDACTED:GOOGLE_API_KEY]')
+
+    replace(/[A-Za-z0-9+/_=-]{40,}/g, (candidate: string) => {
+      if (candidate.includes('/')
+        || !/[a-z]/.test(candidate)
+        || !/[A-Z]/.test(candidate)
+        || !/[0-9]/.test(candidate)) {
+        redactions -= 1
+        return candidate
+      }
+      return '[REDACTED:HIGH_ENTROPY]'
+    })
+
+    return { text, redactions }
+  } catch {
+    // Never persist unredacted content if sanitization itself unexpectedly fails.
+    return { text: '[REDACTED:SANITIZATION_FAILURE]', redactions: 1 }
+  }
+}
+
+function proposalDiagnosticKey(projectId: string): string {
+  return `adopt-diagnostic:${projectId}`
+}
+
+/** Prompt 本文を保存せず、同じ版の診断だけを集計するための短い fingerprint。 */
+export function adoptionPromptVersion(): string {
+  return createHash('sha256').update(ADOPTION_SYSTEM_PROMPT).digest('hex').slice(0, 12)
+}
+
+/** 運用時に audit_log の detail を直接解釈せず診断を読める入口。 */
+export function findProposalDiagnostics(
+  storage: IStorage,
+  projectId: string,
+): PersistedProposalDiagnostic[] {
+  return storage.auditLog
+    .findByEntity(PL_TARGET_ENTITY_TYPE, proposalDiagnosticKey(projectId))
+    .filter((entry) => entry.operation === AUDIT_PROPOSAL_UNPARSED)
+    .flatMap((entry) => {
+      try {
+        return [JSON.parse(entry.detail ?? '{}') as PersistedProposalDiagnostic]
+      } catch {
+        return []
+      }
+    })
+}
+
+/**
+ * 解釈不能な提案を既存 audit_log へ best effort で記録する。
+ * 診断用 entity は採用 attempt と分離し、観測で予算・候補回転を変えない。
+ */
+function recordProposalDiagnostic(
+  storage: IStorage,
+  projectId: string,
+  diagnostic: ProposalDiagnostic,
+): void {
+  try {
+    const existingForVersion = findProposalDiagnostics(storage, projectId)
+      .filter((entry) => entry.promptVersion === diagnostic.promptVersion)
+    if (existingForVersion.length >= PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION) return
+
+    const rawLength = diagnostic.raw.length
+    const redactionInput = diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT * 16)
+    const redacted = redactDiagnosticSecrets(redactionInput)
+    const rawTruncated = rawLength > redactionInput.length
+      || redacted.text.length > PROPOSAL_DIAGNOSTIC_RAW_LIMIT
+    const payload: PersistedProposalDiagnostic = {
+      ...diagnostic,
+      proposer: diagnostic.proposer.slice(0, PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT),
+      rawLength,
+      rawTruncated,
+      redactions: redacted.redactions,
+      raw: redacted.text.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT),
+    }
+    storage.auditLog.record({
+      actor: 'api',
+      operation: AUDIT_PROPOSAL_UNPARSED,
+      entityType: PL_TARGET_ENTITY_TYPE,
+      entityId: proposalDiagnosticKey(projectId),
+      result: 'failure',
+      detail: JSON.stringify(payload),
+    })
+  } catch (error: unknown) {
+    console.error(
+      `[adoptionStep] proposal diagnostic could not be recorded for project ${projectId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
 export type PlAdoptionStatus =
   | 'no_candidate'
   | 'proposal_unusable'
@@ -446,17 +691,44 @@ export function selectAdoptionCandidates<T extends RoadmapCandidate & { boosted?
  * **補正も推測もしない。** 足りない・型が違う場合は採用しない（fail-closed）。
  * ここで緩めると「PL が書いた文字列」と「実際に採用された範囲」がズレる。
  */
+function classifyJsonParseError(error: unknown): string {
+  if (!(error instanceof Error)) return 'json_parse_error'
+  if (error.message.includes('Unexpected end of JSON input')) {
+    return 'json_parse_error: unexpected_end_of_input'
+  }
+  const position = /at position (\d+)/.exec(error.message)?.[1]
+  return position === undefined ? 'json_parse_error' : `json_parse_error_at_position: ${position}`
+}
+
+/** 従来どおり proposal/undefined だけを返す互換 wrapper。採用可否は detailed 版と同一。 */
 export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefined {
+  const result = parseAdoptionProposalDetailed(raw)
+  return result.ok ? result.proposal : undefined
+}
+
+/** 採用可否を変えず、拒否理由だけを固定語彙で返す。 */
+export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalParseResult {
   const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return undefined
+  if (!match) {
+    const openingBrace = raw.indexOf('{')
+    const hasClosingBraceAfterOpening = openingBrace >= 0 && raw.indexOf('}', openingBrace + 1) >= 0
+    return {
+      ok: false,
+      reason: openingBrace >= 0 && !hasClosingBraceAfterOpening
+        ? 'no_json_object_found: unterminated'
+        : 'no_json_object_found',
+    }
+  }
 
   let parsed: unknown
   try {
     parsed = JSON.parse(match[1] ?? match[0])
-  } catch {
-    return undefined
+  } catch (error: unknown) {
+    return { ok: false, reason: classifyJsonParseError(error) }
   }
-  if (typeof parsed !== 'object' || parsed === null) return undefined
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: 'not_an_object' }
+  }
 
   const obj = parsed as Record<string, unknown>
   const strings = (value: unknown): string[] | undefined => (
@@ -470,16 +742,26 @@ export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefin
   const allowedPaths = strings(obj.allowedPaths)
   const acceptanceCriteria = strings(obj.acceptanceCriteria)
 
-  if (roadmapId === '' || implementationScope === '' || !allowedPaths || !acceptanceCriteria) {
-    return undefined
+  const missing = [
+    roadmapId === '' ? 'roadmapId' : undefined,
+    implementationScope === '' ? 'implementationScope' : undefined,
+    !allowedPaths ? 'allowedPaths' : undefined,
+    !acceptanceCriteria ? 'acceptanceCriteria' : undefined,
+  ].filter((key): key is string => key !== undefined)
+
+  if (missing.length > 0) {
+    return { ok: false, reason: `missing_or_invalid_fields: ${missing.join(', ')}` }
   }
 
   return {
-    roadmapId,
-    implementationScope,
-    allowedPaths,
-    acceptanceCriteria,
-    ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    ok: true,
+    proposal: {
+      roadmapId,
+      implementationScope,
+      allowedPaths: allowedPaths as string[],
+      acceptanceCriteria: acceptanceCriteria as string[],
+      ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    },
   }
 }
 
@@ -587,6 +869,8 @@ export function buildAdoptionPrompt(
 export interface PlAdoptionDeps {
   /** 選択と具体化。既定は PL ループと同じ provider CLI 経路。 */
   propose: (system: string, user: string) => Promise<string>
+  /** 診断にだけ保存する provider/model id。採用判断には使わない。 */
+  proposerId?: string
   readLedger?: () => string
   adopt?: typeof adoptRoadmapItem
 }
@@ -654,14 +938,23 @@ export async function runAdoptionStep(
     ADOPTION_SYSTEM_PROMPT,
     buildAdoptionPrompt(candidates, projectGoal),
   )
-  const proposal = parseAdoptionProposal(raw)
-  if (!proposal) {
+  const parsed = parseAdoptionProposalDetailed(raw)
+  if (!parsed.ok) {
+    recordProposalDiagnostic(storage, projectId, {
+      reason: parsed.reason,
+      proposer: deps.proposerId ?? 'unknown',
+      promptVersion: adoptionPromptVersion(),
+      candidateCount: candidates.length,
+      followUpCandidateCount: candidates.filter((candidate) => candidate.kind === 'follow_up').length,
+      raw,
+    })
     return {
       status: 'proposal_unusable',
       failureCode: 'unparsable_proposal',
       reason: 'PL did not produce a complete adoption proposal',
     }
   }
+  const proposal = parsed.proposal
 
   // 提示していない id を選んだ場合は、ここで落とす前に Gate でも落ちる（ledger 照合）。
   // ただし理由を分かりやすくするため先に見る。
