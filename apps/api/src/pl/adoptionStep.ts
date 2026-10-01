@@ -555,9 +555,13 @@ export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefin
 export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalParseResult {
   const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
   if (!match) {
+    const openingBrace = raw.indexOf('{')
+    const hasClosingBraceAfterOpening = openingBrace >= 0 && raw.indexOf('}', openingBrace + 1) >= 0
     return {
       ok: false,
-      reason: raw.includes('{') ? 'no_json_object_found: unterminated' : 'no_json_object_found',
+      reason: openingBrace >= 0 && !hasClosingBraceAfterOpening
+        ? 'no_json_object_found: unterminated'
+        : 'no_json_object_found',
     }
   }
 

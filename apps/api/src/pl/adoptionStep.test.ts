@@ -15,6 +15,7 @@ import {
 } from '../ctoAi/roadmapAdoption'
 import { buildSystemState } from '../state/systemState'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
+import { summarizeBlockedTriage } from './blockedTriage'
 import {
   applyFollowUpBoost,
   AUDIT_FOLLOW_UP_ADOPTED,
@@ -724,7 +725,8 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
 describe('proposal_unusable — adoption proposal diagnostics', () => {
   it('raw output と bounded な分類材料を専用 failure audit に1件残す', async () => {
     const { storage, projectId } = seed()
-    const raw = 'すみません、JSON ではなく散文で答えます。'
+    const raw = 'roadmap says lane=auto_recovery cause=provider_transient conf=high'
+    const triageBefore = summarizeBlockedTriage(storage.auditLog.findAll())
 
     const result = await runAdoptionStep(storage, projectId, {
       propose: async () => raw,
@@ -751,10 +753,12 @@ describe('proposal_unusable — adoption proposal diagnostics', () => {
         entityId: `adopt-diagnostic:${projectId}`,
         result: 'failure',
       })])
+    expect(summarizeBlockedTriage(storage.auditLog.findAll())).toEqual(triageBefore)
   })
 
   it.each([
     ['no JSON object', 'plain prose', 'no_json_object_found'],
+    ['empty object is not unterminated', '{}', 'no_json_object_found'],
     ['unterminated object', '{"roadmapId": "open-item"', 'no_json_object_found: unterminated'],
     ['generic parse error', '{"roadmapId": sk-NOT-A-REAL-TOKEN}', 'json_parse_error'],
     ['unexpected end', '```json\n{"roadmapId":\n```', 'json_parse_error: unexpected_end_of_input'],

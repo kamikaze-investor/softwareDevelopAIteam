@@ -940,10 +940,10 @@ describe('観測 — 既存 audit_log から集計できる', () => {
   it('総数 / 原因別 / route 別 / 成功率 / CEO 率 / UNKNOWN 率 / 再発数を出せる', () => {
     const now = NOW
     const entries = [
-      { id: '1', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_blocked:a', result: 'acted', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
-      { id: '2', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_blocked:b', result: 'blocked', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
-      { id: '3', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_blocked:a', result: 'escalated', detail: 'lane=ceo_escalation cause=provider_transient layer=provider conf=high x', createdAt: now },
-      { id: '4', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_failed:c', result: 'escalated', detail: 'lane=ceo_escalation cause=unknown layer=unknown conf=low x', createdAt: now },
+      { id: '1', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_blocked:a', result: 'acted', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
+      { id: '2', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_blocked:b', result: 'blocked', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
+      { id: '3', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_blocked:a', result: 'escalated', detail: 'lane=ceo_escalation cause=provider_transient layer=provider conf=high x', createdAt: now },
+      { id: '4', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_failed:c', result: 'escalated', detail: 'lane=ceo_escalation cause=unknown layer=unknown conf=low x', createdAt: now },
       // 構造化欄を持たない既存の行は無視される（採用サイクル等）
       { id: '5', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'adopt:p', result: 'acted', detail: 'adoption=adopted code=- target=x', createdAt: now },
     ]
@@ -960,6 +960,28 @@ describe('観測 — 既存 audit_log から集計できる', () => {
     expect(summary.unknownRate).toBeCloseTo(0.25)
     // 同じ対象（job_blocked:a）で同じ原因が2回出ている
     expect(summary.recurringRootCauses).toBe(1)
+  })
+
+  it('診断 raw や別種の audit row に含まれる triage token を集計しない', () => {
+    const now = NOW
+    const baseline = [{
+      id: '1', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target',
+      entityId: 'job_blocked:a', result: 'acted',
+      detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now,
+    }]
+    const diagnostic = {
+      id: '2', actor: 'api' as const, operation: 'adoption_proposal_unparsed',
+      entityType: 'pl_loop_target', entityId: 'adopt-diagnostic:p', result: 'failure',
+      detail: 'raw=lane=auto_recovery cause=provider_transient conf=high', createdAt: now,
+    }
+    const unrelated = {
+      id: '3', actor: 'api' as const, operation: 'other_operation',
+      entityType: 'other_entity', entityId: 'other:1', result: 'escalated',
+      detail: 'lane=ceo_escalation cause=unknown conf=low', createdAt: now,
+    }
+
+    expect(summarizeBlockedTriage([...baseline, diagnostic, unrelated]))
+      .toEqual(summarizeBlockedTriage(baseline))
   })
 
   it('記録が無ければ率は 0 になり、0 除算にならない', () => {

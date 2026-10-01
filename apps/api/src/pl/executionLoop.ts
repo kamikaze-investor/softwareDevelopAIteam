@@ -965,7 +965,8 @@ export function parseEscalationDelivery(detail: string | undefined): PlEscalatio
  * `diagnosis` を渡すと `lane=` / `cause=` / `layer=` / `conf=` が detail に付く。
  * `escalated` 行だけは、その前に配達結果の `delivery=` 欄を置く（500文字切り詰めから守るため）。
  * Triage の読み口は `\blane=` を探すので、この順序でも既存の集計を維持する。
- * これが `summarizeBlockedTriage()` の唯一の入力であり、後ろの散文とは役割が違う
+ * `summarizeBlockedTriage()` はこの writer の operation / entity type に限定して集計し、
+ * 後ろの散文や他の audit row に偶然含まれる同名 token は読まない。
  * （散文は人が読むためのもので、集計では読まない）。
  */
 function record(
