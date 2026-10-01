@@ -28,13 +28,13 @@ PL の採用候補は `planned` だけである（`deferred` は候補に入ら�
 これは Review 結果の override ではなく、**Source of Truth の時点整合修正**である。
 経緯: `docs/project_memory/decisions/multi_task_continuous_autonomous_development_evidence.md`。
 
-**Promotion 済み Tier A 項目の ID 運用**: canonical master へ到達して完了した項目を、PL に
-再採用させる目的で同じ `roadmap:id` の `state` を `planned` へ戻してはならない。同じ責務の残作業が
-後から判明して既存 ID を継続する場合は `in_progress` へ戻してよい（2026-08-14 の既存運用）が、
-PL の自動採用対象にはしない。PL が自動採用する独立した新規 scope は新しい ID にする。誤って
-`planned` へ戻した場合、awaiting-promotion check は follow-up 採用を fail-closed で停止し、既存
-`audit_log` に `roadmap_completion_awaiting_promotion` を記録する。この規則は roadmap CLI の
-一般的な state 遷移能力を制限しない。
+**Promotion 済み Tier A 項目の ID 運用**: Promotion が元の責務を完了したら、元の `roadmap:id` は
+`done` にする。同じ責務を人間が継続するなら元 ID を `in_progress` に戻してよい（2026-08-14 の
+既存運用）が、PL の自動採用対象にはしない。PL が自動採用する独立した残作業は、新しい ID を
+`planned` で登録する。Promotion 済み Tier A 項目を `planned` のまま残すと、awaiting-promotion check が
+follow-up 採用を fail-closed で停止し、既存 `audit_log` に
+`roadmap_completion_awaiting_promotion` を記録する。この規則は roadmap CLI の一般的な state 遷移能力を
+制限しない。
 
 ---
 
@@ -4956,11 +4956,12 @@ worktree と別 repository は採らない。
   Candidate はその兄弟 clone になる
 
 **Promotion の完了条件**: Candidate の成果を canonical master へ到達させるだけでは完了としない。
-同じ promotion PR で、(1) 成果を canonical master へ入れる、(2) 実際の受入結果に従って対応する
-Roadmap 項目の state / checkbox を `roadmap:update` で更新する（部分的な promotion は残作業を反映した
-真の state を維持し、一律に `done` にしない）、(3) `roadmap:sync` で `PROJECT_CURRENT_STATE` を同期する、
-(4) `roadmap:check` を PASS させる。merge 後は Candidate clone を canonical master へ同期してから
-次の自己開発を開始する。
+同じ promotion PR で、(1) 成果を canonical master へ入れる、(2) 実際の受入結果に従って Roadmap の
+state / checkbox を `roadmap:update` で更新する（元の責務が完了したら元 ID は `done`、同じ責務を
+人間が継続するなら元 ID は `in_progress`、PL が自動採用する独立した残作業は新しい ID を `planned` で
+登録する。Promotion 済み Tier A を `planned` のまま残すと awaiting-promotion audit で fail-closed）、
+(3) `roadmap:sync` で `PROJECT_CURRENT_STATE` を同期する、(4) `roadmap:check` を PASS させる。
+merge 後は Candidate clone を canonical master へ同期してから次の自己開発を開始する。
 
 **Candidate 検証の2種別（区別する）**:
 1. **Synthetic / Destructive Test** — テスト専用の Project / Roadmap / DB を使い、
@@ -7234,8 +7235,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
 ### 優先度 3: AI へ注入される Current Truth の誤情報
 
-<!-- roadmap:id=vps-operation-docs-current-truth state=planned priority=high -->
-0. [ ] **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる** — 2026-09-15 監査（Confirmed / P1）。「VPS常駐運用化」節をまとめて現在の実態へ更新する。
+<!-- roadmap:id=vps-operation-docs-current-truth state=done priority=high -->
+0. [x] **VPS 運用手順の Current Truth 文書を canonical にする** — 2026-09-15 監査（Confirmed / P1）。現在の実態を `docs/project_memory/decisions/vps-operations.md` に集約する。
 
    **(1) 起動 env allowlist が API の実際の読み取りを欠いている（最も実害が大きい）**:
    本ファイル「VPS常駐運用化」節の「**正式Production起動方式の確定**」は `set -a; . .env` を禁止したうえで
@@ -7297,11 +7298,25 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    **着手時の制約**: **(1)〜(6) はすべて記述・設定側の修正で足りる。新しい仕組みを作らない。**
    production への操作（再起動・env 変更）は本項目の範囲外で、別途 CEO 承認のうえ既存 deploy 手順で行う。
 
-   **進捗（2026-09-30 promotion）**: Current Truth 文書
-   `docs/project_memory/decisions/vps-operations.md` は master へ到達した。残るのは **(1)〜(6) すべて**:
-   (1) canonical allowlist と runtime spec の同期、(2) 完了済み運用項目の整理、(3) pre-push hook 修正、
-   (4) DB 復元手順、(5) Meta Review model の整合、(6) `.env.example` と保持日数の文書化。
-   本進捗は根拠文書を追加した段階であり、これらの既存 surface はまだ更新していない。
+   **完了（2026-09-30 promotion）**: 本 ID の責務である Current Truth 文書
+   `docs/project_memory/decisions/vps-operations.md` は master へ到達した。上記 (1)〜(6) の既存
+   runtime / env 文書・tooling への反映は、独立した残作業
+   `vps-runtime-env-docs-tooling-alignment` が引き継ぐ。
+
+<!-- roadmap:id=vps-runtime-env-docs-tooling-alignment state=planned priority=high -->
+0. [ ] **VPS runtime / env の文書と tooling を Current Truth に整合させる** —
+   `vps-operation-docs-current-truth` が確定した Current Truth を、残る既存 surface へ一体で反映する。
+   相互依存する同一の整合責務なので、次の (1)〜(6) を分割せず扱う:
+   (1) canonical production 起動 env allowlist と runtime spec を同期し、Actions 認証と CEO 通知の
+   必須変数を欠かさない、(2) 完了済み VPS 運用項目を roadmap / runtime spec で整理し、真に open な
+   Docker 化と log 保存・rotation を明確にする、(3) `sandbox/hooks/pre-push` の `tsx` 起動方法と
+   `set -e` による到達不能分岐を修正する、(4) DB 復元手順・wrapper・実復元テストの接続を文書化する、
+   (5) CI と production の Meta Review model を整合させる、(6) `.env.example` を実際の読取変数へ
+   揃え、`BACKUP_KEEP_COUNT = 28` の保持期間を文書化する。
+
+   **制約**: 記述・設定側の修正に限定し、新しい仕組みを作らない。production の再起動・env 変更は
+   範囲外で、別途 CEO 承認と既存 deploy 手順を要する。VPS 上だけにある systemd unit を version 管理へ
+   入れるかは、production 設定の扱いとして CEO 判断を維持する。
 
 <!-- roadmap:id=current-truth-dual-record-prevention state=planned priority=high -->
 0. [ ] **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める** — 2026-09-15 監査（Confirmed / P1）。監査 92 Finding の**共通根本原因**。

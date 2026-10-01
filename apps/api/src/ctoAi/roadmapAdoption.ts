@@ -131,6 +131,7 @@ export interface AdoptRoadmapItemDeps {
 
 export const AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION = 'roadmap_completion_awaiting_promotion'
 const ROADMAP_ITEM_AUDIT_ENTITY_TYPE = 'roadmap_item'
+const TIER_A_CANDIDATE_BRANCH = 'candidate/self-dev'
 
 export interface AwaitingPromotionCompletion {
   taskId: string
@@ -153,6 +154,12 @@ export function awaitingPromotionAuditKey(
  * `commitHash` は Worker / generic PATCH から書ける情報なので根拠にしない。Task completion が作った
  * continuation の source Job 自体が、同じ Task に属する成功済み `git_commit` であることを要求する。
  * Tier B の正式な external completion は既存 audit で除外する。
+ *
+ * branch は security boundary ではなく、trusted Worker が gate check 時に
+ * `git rev-parse --abbrev-ref HEAD` で記録する operational signal である。`/consume` が再検証するのは
+ * commit + diff であって branch ではない。それでも exact branch は現在の Tier A Candidate operation を
+ * 識別できる。approval が無い、`unknown`、または不整合なら従来どおり follow-up を許す側へ戻す。
+ * Candidate branch の運用を変える場合は、この predicate も同時に更新しなければならない。
  *
  * 検出した source completion は既存 audit_log へ一度だけ記録する。分類器と authoritative seam の
  * どちらから呼ばれても、同じ entity id で重複しない。
@@ -180,6 +187,17 @@ export function checkRoadmapCompletionAwaitingPromotion(
       || sourceJob.projectId !== projectId
       || sourceJob.status !== 'success'
       || sourceJob.safeCommand.kind !== 'git_commit'
+    ) return []
+
+    const approval = sourceJob.approvalId === undefined
+      ? undefined
+      : storage.approvalRequests.findById(sourceJob.approvalId)
+    if (
+      !approval
+      || approval.taskId !== task.id
+      || approval.requestedAction !== 'git_commit'
+      || approval.status !== 'CONSUMED'
+      || approval.targetBranch !== TIER_A_CANDIDATE_BRANCH
     ) return []
 
     const externallyReconciled = storage.auditLog
@@ -296,7 +314,7 @@ function checkFollowUpEligibility(
   if (awaitingPromotion.length > 0) {
     return fail(
       'FOLLOW_UP_NOT_ELIGIBLE',
-      `roadmap item "${input.roadmapId}" has a Candidate completion awaiting promotion; `
+      `roadmap item "${input.roadmapId}" has a Tier A Candidate completion awaiting promotion; `
         + 'promote and reconcile the roadmap ledger before considering follow-up work',
     )
   }
@@ -533,6 +551,23 @@ export async function adoptRoadmapItem(
         reason:
           `Task ${input.recoveryTaskId} is not an existing follow-up Task for roadmap item`
           + ` "${input.roadmapId}" in Project ${input.projectId}`,
+      }
+    }
+
+    // recoveryTaskId は通常の follow-up seam を通らないため、ここを final authoritative check とする。
+    // classifier 後に直接この経路を呼んでも、Tier A completion を同じ #N identity で再採用させない。
+    const awaitingPromotion = checkRoadmapCompletionAwaitingPromotion(
+      storage,
+      input.projectId,
+      input.roadmapId,
+      ledgerIds,
+    )
+    if (awaitingPromotion.length > 0) {
+      return {
+        ok: false,
+        code: 'FOLLOW_UP_NOT_ELIGIBLE',
+        reason: `roadmap item "${input.roadmapId}" has a Tier A Candidate completion awaiting promotion; `
+          + 'promote and reconcile the roadmap ledger before recovering follow-up work',
       }
     }
 

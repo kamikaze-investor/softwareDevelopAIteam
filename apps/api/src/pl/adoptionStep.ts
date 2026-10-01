@@ -621,7 +621,14 @@ export async function runAdoptionStep(
   const available = applyFollowUpBoost(storage, projectId, classified)
     .filter((candidate) => candidate.kind !== 'not_available')
   if (available.length === 0) {
-    return { status: 'no_candidate', reason: 'no open roadmap item in the ledger' }
+    const allAwaitingPromotion = classified.length > 0
+      && classified.every((candidate) => candidate.notAvailableReason === 'awaiting_promotion')
+    return {
+      status: 'no_candidate',
+      reason: allAwaitingPromotion
+        ? 'all open roadmap items are awaiting Tier A Candidate promotion'
+        : 'no open roadmap item in the ledger',
+    }
   }
 
   // 検出できたことを残す。選ばれたかどうかは下で別途記録する。

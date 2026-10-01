@@ -75,9 +75,17 @@ Candidate は同一 canonical repository の**独立 clone**（worktree でも�
 push → PR → CI → verified-SHA `--ff-only` deploy をそのまま再利用できる。
 
 **以後の Promotion 完了条件**: 同じ promotion PR で、Candidate 成果の canonical master への反映、
-実際の受入結果に沿った対応 Roadmap 項目の state / checkbox 更新（`roadmap:update`。部分完了を一律
-`done` にしない）、`PROJECT_CURRENT_STATE` の同期（`roadmap:sync`）、`roadmap:check` PASS を揃える。
+実際の受入結果に沿った Roadmap 更新（`roadmap:update`。元の責務が完了したら元 ID は `done`、同じ
+責務を人間が継続するなら元 ID は `in_progress`、PL が自動採用する独立した残作業は新しい ID を
+`planned` で登録する）、`PROJECT_CURRENT_STATE` の同期（`roadmap:sync`）、`roadmap:check` PASS を
+揃える。Promotion 済み Tier A を `planned` のまま残すと awaiting-promotion audit が fail-closed する。
 merge 後は Candidate clone を canonical master へ同期してから次の自己開発を始める。
+
+awaiting-promotion の branch 判定は security boundary ではない。trusted Worker が gate check 時に
+`git rev-parse --abbrev-ref HEAD` で記録する operational signal（`/consume` は commit + diff を検証し、
+branch は再検証しない）で、現在の Tier A Candidate operation `candidate/self-dev` を識別する。証拠が
+無い・`unknown`・不整合なら従来の follow-up 挙動へ戻し、Candidate branch の運用変更時は predicate も
+同時に更新する。
 
 **物理強制は新規機構ゼロ**。既存の `isInsideTargetRoot()` が `/workspace/target` 外への書き込みを
 拒否し、`buildTargetCommandEnv()` の allowlist が `DB_PATH` / `API_TOKEN` / provider key / `HOME` を

@@ -168,7 +168,10 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
     return { storage, projectId, taskId: first.taskId }
   }
 
-  async function withCandidateCompletion(options: { externallyReconciled?: boolean } = {}): Promise<{
+  async function withCandidateCompletion(options: {
+    externallyReconciled?: boolean
+    targetBranch?: string
+  } = {}): Promise<{
     storage: IStorage
     projectId: string
     taskId: string
@@ -188,6 +191,20 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
       dryRun: false,
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(sourceJob.id, { commitHash: 'candidate-commit' })
+    const approval = storage.approvalRequests.createForJob({
+      taskId: first.taskId,
+      targetBranch: options.targetBranch ?? 'candidate/self-dev',
+      targetCommit: 'candidate-parent',
+      targetDiffHash: 'candidate-diff',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      changedFiles: ['apps/api/src/ctoAi/roadmapAdoption.ts'],
+      triggeredRules: [],
+      status: 'CONSUMED',
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      invalidIf: ['commit changes', 'diff changes'],
+    }, sourceJob.id)
+    if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     storage.tasks.update(first.taskId, { status: 'done' })
     storage.taskContinuations.create({
       sourceJobId: sourceJob.id,
@@ -227,6 +244,34 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
 
   it('Tier B reconcile completion は seam で awaiting promotion として拒否しない', async () => {
     const { storage, projectId } = await withCandidateCompletion({ externallyReconciled: true })
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: true, roadmapTaskKey: 'first-item#2' })
+  })
+
+  it('Tier A completion は recoveryTaskId の final authoritative check でも再採用を拒否する', async () => {
+    const { storage, projectId } = await withCandidateCompletion()
+    const recoveryTaskId = createConflictedFollowUp(storage, projectId, { roadmapTaskKey: 'first-item#2' })
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SCOPE_B,
+      recoveryTaskId,
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    expect(storage.tasks.findById(recoveryTaskId)?.roadmapTaskKey).toBe('first-item#2')
+    expect(storage.tasks.findByProjectId(projectId).some(
+      (task) => task.roadmapTaskKey === 'first-item#3',
+    )).toBe(false)
+  })
+
+  it('master 上の ordinary git_commit completion は従来どおり follow-up できる', async () => {
+    const { storage, projectId } = await withCandidateCompletion({ targetBranch: 'master' })
 
     const result = await adoptRoadmapItem(
       storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
