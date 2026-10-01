@@ -23,6 +23,7 @@
  * ledger への新しい metadata / PL 専用の状態表。
  */
 
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import {
@@ -121,6 +122,11 @@ export const FOLLOW_UP_SKIPS_BEFORE_BOOST = 3
 
 /** audit_log の語彙。**新しいテーブルも metrics backend も作らない。** */
 const AUDIT_ENTITY_TYPE = 'roadmap_item'
+export const AUDIT_PROPOSAL_UNPARSED = 'adoption_proposal_unparsed'
+const PL_TARGET_ENTITY_TYPE = 'pl_loop_target'
+export const PROPOSAL_DIAGNOSTIC_RAW_LIMIT = 4000
+export const PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT = 120
+export const PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION = 20
 export const AUDIT_FOLLOW_UP_DETECTED = 'follow_up_candidate_detected'
 export const AUDIT_FOLLOW_UP_SKIPPED = 'follow_up_candidate_skipped'
 export const AUDIT_FOLLOW_UP_BOOSTED = 'follow_up_candidate_boosted'
@@ -319,6 +325,90 @@ export interface PlAdoptionProposal {
   rationale?: string
 }
 
+export type AdoptionProposalParseResult =
+  | { ok: true; proposal: PlAdoptionProposal }
+  | { ok: false; reason: string }
+
+export interface ProposalDiagnostic {
+  reason: string
+  proposer: string
+  promptVersion: string
+  candidateCount: number
+  followUpCandidateCount: number
+  raw: string
+}
+
+export interface PersistedProposalDiagnostic extends ProposalDiagnostic {
+  rawLength: number
+  rawTruncated: boolean
+}
+
+function proposalDiagnosticKey(projectId: string): string {
+  return `adopt-diagnostic:${projectId}`
+}
+
+/** Prompt 本文を保存せず、同じ版の診断だけを集計するための短い fingerprint。 */
+export function adoptionPromptVersion(): string {
+  return createHash('sha256').update(ADOPTION_SYSTEM_PROMPT).digest('hex').slice(0, 12)
+}
+
+/** 運用時に audit_log の detail を直接解釈せず診断を読める入口。 */
+export function findProposalDiagnostics(
+  storage: IStorage,
+  projectId: string,
+): PersistedProposalDiagnostic[] {
+  return storage.auditLog
+    .findByEntity(PL_TARGET_ENTITY_TYPE, proposalDiagnosticKey(projectId))
+    .filter((entry) => entry.operation === AUDIT_PROPOSAL_UNPARSED)
+    .flatMap((entry) => {
+      try {
+        return [JSON.parse(entry.detail ?? '{}') as PersistedProposalDiagnostic]
+      } catch {
+        return []
+      }
+    })
+}
+
+/**
+ * 解釈不能な提案を既存 audit_log へ best effort で記録する。
+ * 診断用 entity は採用 attempt と分離し、観測で予算・候補回転を変えない。
+ */
+function recordProposalDiagnostic(
+  storage: IStorage,
+  projectId: string,
+  diagnostic: ProposalDiagnostic,
+): void {
+  try {
+    const existingForVersion = findProposalDiagnostics(storage, projectId)
+      .filter((entry) => entry.promptVersion === diagnostic.promptVersion)
+    if (existingForVersion.length >= PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION) return
+
+    const rawTruncated = diagnostic.raw.length > PROPOSAL_DIAGNOSTIC_RAW_LIMIT
+    const payload: PersistedProposalDiagnostic = {
+      ...diagnostic,
+      proposer: diagnostic.proposer.slice(0, PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT),
+      rawLength: diagnostic.raw.length,
+      rawTruncated,
+      raw: rawTruncated
+        ? diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+        : diagnostic.raw,
+    }
+    storage.auditLog.record({
+      actor: 'api',
+      operation: AUDIT_PROPOSAL_UNPARSED,
+      entityType: PL_TARGET_ENTITY_TYPE,
+      entityId: proposalDiagnosticKey(projectId),
+      result: 'failure',
+      detail: JSON.stringify(payload),
+    })
+  } catch (error: unknown) {
+    console.error(
+      `[adoptionStep] proposal diagnostic could not be recorded for project ${projectId}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
 export type PlAdoptionStatus =
   | 'no_candidate'
   | 'proposal_unusable'
@@ -446,17 +536,40 @@ export function selectAdoptionCandidates<T extends RoadmapCandidate & { boosted?
  * **補正も推測もしない。** 足りない・型が違う場合は採用しない（fail-closed）。
  * ここで緩めると「PL が書いた文字列」と「実際に採用された範囲」がズレる。
  */
+function classifyJsonParseError(error: unknown): string {
+  if (!(error instanceof Error)) return 'json_parse_error'
+  if (error.message.includes('Unexpected end of JSON input')) {
+    return 'json_parse_error: unexpected_end_of_input'
+  }
+  const position = /at position (\d+)/.exec(error.message)?.[1]
+  return position === undefined ? 'json_parse_error' : `json_parse_error_at_position: ${position}`
+}
+
+/** 従来どおり proposal/undefined だけを返す互換 wrapper。採用可否は detailed 版と同一。 */
 export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefined {
+  const result = parseAdoptionProposalDetailed(raw)
+  return result.ok ? result.proposal : undefined
+}
+
+/** 採用可否を変えず、拒否理由だけを固定語彙で返す。 */
+export function parseAdoptionProposalDetailed(raw: string): AdoptionProposalParseResult {
   const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return undefined
+  if (!match) {
+    return {
+      ok: false,
+      reason: raw.includes('{') ? 'no_json_object_found: unterminated' : 'no_json_object_found',
+    }
+  }
 
   let parsed: unknown
   try {
     parsed = JSON.parse(match[1] ?? match[0])
-  } catch {
-    return undefined
+  } catch (error: unknown) {
+    return { ok: false, reason: classifyJsonParseError(error) }
   }
-  if (typeof parsed !== 'object' || parsed === null) return undefined
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, reason: 'not_an_object' }
+  }
 
   const obj = parsed as Record<string, unknown>
   const strings = (value: unknown): string[] | undefined => (
@@ -470,16 +583,26 @@ export function parseAdoptionProposal(raw: string): PlAdoptionProposal | undefin
   const allowedPaths = strings(obj.allowedPaths)
   const acceptanceCriteria = strings(obj.acceptanceCriteria)
 
-  if (roadmapId === '' || implementationScope === '' || !allowedPaths || !acceptanceCriteria) {
-    return undefined
+  const missing = [
+    roadmapId === '' ? 'roadmapId' : undefined,
+    implementationScope === '' ? 'implementationScope' : undefined,
+    !allowedPaths ? 'allowedPaths' : undefined,
+    !acceptanceCriteria ? 'acceptanceCriteria' : undefined,
+  ].filter((key): key is string => key !== undefined)
+
+  if (missing.length > 0) {
+    return { ok: false, reason: `missing_or_invalid_fields: ${missing.join(', ')}` }
   }
 
   return {
-    roadmapId,
-    implementationScope,
-    allowedPaths,
-    acceptanceCriteria,
-    ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    ok: true,
+    proposal: {
+      roadmapId,
+      implementationScope,
+      allowedPaths: allowedPaths as string[],
+      acceptanceCriteria: acceptanceCriteria as string[],
+      ...(typeof obj.rationale === 'string' ? { rationale: obj.rationale } : {}),
+    },
   }
 }
 
@@ -587,6 +710,8 @@ export function buildAdoptionPrompt(
 export interface PlAdoptionDeps {
   /** 選択と具体化。既定は PL ループと同じ provider CLI 経路。 */
   propose: (system: string, user: string) => Promise<string>
+  /** 診断にだけ保存する provider/model id。採用判断には使わない。 */
+  proposerId?: string
   readLedger?: () => string
   adopt?: typeof adoptRoadmapItem
 }
@@ -654,14 +779,23 @@ export async function runAdoptionStep(
     ADOPTION_SYSTEM_PROMPT,
     buildAdoptionPrompt(candidates, projectGoal),
   )
-  const proposal = parseAdoptionProposal(raw)
-  if (!proposal) {
+  const parsed = parseAdoptionProposalDetailed(raw)
+  if (!parsed.ok) {
+    recordProposalDiagnostic(storage, projectId, {
+      reason: parsed.reason,
+      proposer: deps.proposerId ?? 'unknown',
+      promptVersion: adoptionPromptVersion(),
+      candidateCount: candidates.length,
+      followUpCandidateCount: candidates.filter((candidate) => candidate.kind === 'follow_up').length,
+      raw,
+    })
     return {
       status: 'proposal_unusable',
       failureCode: 'unparsable_proposal',
       reason: 'PL did not produce a complete adoption proposal',
     }
   }
+  const proposal = parsed.proposal
 
   // 提示していない id を選んだ場合は、ここで落とす前に Gate でも落ちる（ledger 照合）。
   // ただし理由を分かりやすくするため先に見る。

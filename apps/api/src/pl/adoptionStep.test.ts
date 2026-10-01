@@ -24,7 +24,12 @@ import {
   classifyAdoptionCandidates,
   countConsecutiveSkips,
   FOLLOW_UP_SKIPS_BEFORE_BOOST,
+  adoptionPromptVersion,
+  findProposalDiagnostics,
   parseAdoptionProposal,
+  PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION,
+  PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT,
+  PROPOSAL_DIAGNOSTIC_RAW_LIMIT,
   readAdoptionCandidates,
   selectAdoptionCandidates,
   buildAdoptionPrompt,
@@ -652,6 +657,215 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
       reason: 'all open roadmap items are awaiting Tier A Candidate promotion',
     })
     expect(propose).not.toHaveBeenCalled()
+  })
+
+  it('awaiting-promotion と診断が共存しても audit dedup・rotation・attention を変えない', async () => {
+    const { storage, projectId, sourceJobId } = projectWithCompletion({
+      sourceCommitHash: 'candidate-abc123',
+    })
+    const mixedLedger = [
+      LEDGER,
+      '',
+      '<!-- roadmap:id=fresh-item state=planned -->',
+      '6. [ ] **別の未着手項目** — 診断経路を通す候補',
+    ].join('\n')
+    const attentionBefore = buildSystemState(storage).attention
+
+    const result = await runAdoptionStep(storage, projectId, {
+      propose: async () => 'not json',
+      proposerId: 'test/provider',
+      readLedger: () => mixedLedger,
+    })
+    // 再分類しても awaiting-promotion audit は source completion ごとに1件のまま。
+    classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => mixedLedger))
+
+    expect(result).toMatchObject({ status: 'proposal_unusable', failureCode: 'unparsable_proposal' })
+    expect(findProposalDiagnostics(storage, projectId)).toHaveLength(1)
+    expect(storage.auditLog
+      .findByEntity('roadmap_item', awaitingPromotionAuditKey(projectId, 'open-item', sourceJobId))
+      .filter((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)).toHaveLength(1)
+    // attempt budget と rotationOffset はこの entity の行数だけを見る。
+    expect(storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)).toHaveLength(0)
+    expect(buildSystemState(storage).attention).toEqual(attentionBefore)
+  })
+
+  it('診断行は follow-up の skip/boost count と attention を変えない', async () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    for (let round = 0; round < FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
+      storage.auditLog.record({
+        actor: 'api', operation: AUDIT_FOLLOW_UP_SKIPPED, entityType: 'roadmap_item',
+        entityId: followUpAuditKey(projectId, 'open-item'), result: 'success', detail: 'test',
+      })
+    }
+    const attentionBefore = buildSystemState(storage).attention
+    const before = applyFollowUpBoost(
+      storage,
+      projectId,
+      classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER)),
+    )
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => 'not json',
+      readLedger: () => LEDGER,
+    })
+
+    const after = applyFollowUpBoost(
+      storage,
+      projectId,
+      classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER)),
+    )
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(FOLLOW_UP_SKIPS_BEFORE_BOOST)
+    expect(after.find((candidate) => candidate.id === 'open-item')?.boosted)
+      .toBe(before.find((candidate) => candidate.id === 'open-item')?.boosted)
+    expect(buildSystemState(storage).attention).toEqual(attentionBefore)
+  })
+})
+
+describe('proposal_unusable — adoption proposal diagnostics', () => {
+  it('raw output と bounded な分類材料を専用 failure audit に1件残す', async () => {
+    const { storage, projectId } = seed()
+    const raw = 'すみません、JSON ではなく散文で答えます。'
+
+    const result = await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      proposerId: 'opencode-go/mimo-v2.5',
+      readLedger: () => LEDGER,
+    })
+
+    expect(result).toMatchObject({ status: 'proposal_unusable', failureCode: 'unparsable_proposal' })
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic).toEqual({
+      reason: 'no_json_object_found',
+      proposer: 'opencode-go/mimo-v2.5',
+      promptVersion: adoptionPromptVersion(),
+      candidateCount: 1,
+      followUpCandidateCount: 0,
+      rawLength: raw.length,
+      rawTruncated: false,
+      raw,
+    })
+    expect(diagnostic?.promptVersion).toMatch(/^[0-9a-f]{12}$/)
+    expect(storage.auditLog.findAll().filter((entry) => entry.operation === 'adoption_proposal_unparsed'))
+      .toEqual([expect.objectContaining({
+        entityType: 'pl_loop_target',
+        entityId: `adopt-diagnostic:${projectId}`,
+        result: 'failure',
+      })])
+  })
+
+  it.each([
+    ['no JSON object', 'plain prose', 'no_json_object_found'],
+    ['unterminated object', '{"roadmapId": "open-item"', 'no_json_object_found: unterminated'],
+    ['generic parse error', '{"roadmapId": sk-NOT-A-REAL-TOKEN}', 'json_parse_error'],
+    ['unexpected end', '```json\n{"roadmapId":\n```', 'json_parse_error: unexpected_end_of_input'],
+    ['non-object JSON', '```json\n[]\n```', 'not_an_object'],
+    [
+      'missing fields',
+      JSON.stringify({ roadmapId: 'open-item', implementationScope: 'x' }),
+      'missing_or_invalid_fields: allowedPaths, acceptanceCriteria',
+    ],
+  ])('reason code: %s', async (_label, raw, expected) => {
+    const { storage, projectId } = seed()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    expect(findProposalDiagnostics(storage, projectId)[0]?.reason).toBe(expected)
+  })
+
+  it('位置が分かる parse error は固定の数値形式で残す', async () => {
+    const { storage, projectId } = seed()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => '{"roadmapId":1,}',
+      readLedger: () => LEDGER,
+    })
+
+    expect(findProposalDiagnostics(storage, projectId)[0]?.reason)
+      .toMatch(/^json_parse_error_at_position: \d+$/)
+  })
+
+  it('raw と proposer を上限で切り、元の長さと切り詰めを残す', async () => {
+    const { storage, projectId } = seed()
+    const raw = 'x'.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 5000)
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      proposerId: 'p'.repeat(PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT + 50),
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.raw).toHaveLength(PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+    expect(diagnostic?.rawTruncated).toBe(true)
+    expect(diagnostic?.proposer).toHaveLength(PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT)
+  })
+
+  it('JSON.parse の入力断片入り message を reason に保存しない', async () => {
+    const { storage, projectId } = seed()
+    const secretish = 'sk-NOT-A-REAL-TOKEN-0123456789'
+    const raw = `{ "roadmapId": ${' '.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 100)}${secretish} }`
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.reason).toBe('json_parse_error')
+    expect(diagnostic?.reason).not.toContain(secretish)
+    expect(diagnostic?.reason).not.toContain('sk-')
+    expect(diagnostic?.raw).not.toContain(secretish)
+  })
+
+  it('同じ project・promptVersion は20件で打ち止める', async () => {
+    const { storage, projectId } = seed()
+
+    for (let index = 0; index < PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION + 10; index += 1) {
+      await runAdoptionStep(storage, projectId, {
+        propose: async () => `not json #${index}`,
+        readLedger: () => LEDGER,
+      })
+    }
+
+    expect(findProposalDiagnostics(storage, projectId))
+      .toHaveLength(PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION)
+  })
+
+  it('audit write failure はログだけに留め proposal_unusable を維持する', async () => {
+    const { storage, projectId } = seed()
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const broken = {
+      ...storage,
+      auditLog: {
+        ...storage.auditLog,
+        record: () => { throw new Error('audit storage unavailable') },
+      },
+    } as unknown as IStorage
+
+    const result = await runAdoptionStep(broken, projectId, {
+      propose: async () => 'not json',
+      readLedger: () => LEDGER,
+    })
+
+    expect(result).toMatchObject({ status: 'proposal_unusable', failureCode: 'unparsable_proposal' })
+    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('audit storage unavailable'))
+    errorLog.mockRestore()
+  })
+
+  it('成功 path と parse 後の unoffered candidate は診断を書かない', async () => {
+    const success = seed()
+    await runAdoptionStep(success.storage, success.projectId, deps())
+    expect(findProposalDiagnostics(success.storage, success.projectId)).toHaveLength(0)
+
+    const unoffered = seed()
+    await runAdoptionStep(unoffered.storage, unoffered.projectId, deps({
+      propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'not-offered' }),
+    }))
+    expect(findProposalDiagnostics(unoffered.storage, unoffered.projectId)).toHaveLength(0)
   })
 })
 

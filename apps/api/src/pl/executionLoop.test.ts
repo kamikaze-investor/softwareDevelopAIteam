@@ -19,7 +19,7 @@ import {
   type PlEscalationChannelResult,
   type PlLoopDeps,
 } from './executionLoop'
-import { PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
+import { findProposalDiagnostics, PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
 import { parseTriageAuditDetail } from './blockedTriage'
 import { readResumeActorClasses } from '../designReview/resumeActor'
 
@@ -814,6 +814,26 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(result.status).toBe('acted')
     expect(result.proposedKind).toBe('adopt_roadmap_item')
     expect(storage.auditLog.findAll().some((e) => e.entityId === `adopt:${storage.projects.findAll()[0]!.id}`)).toBe(true)
+  })
+
+  it('注入 proposer の診断は injected と記録し、attempt budget と attention を増やさない', async () => {
+    const storage = idleProject()
+    const projectId = storage.projects.findAll()[0]!.id
+    const d = deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => 'not json',
+    })
+
+    const first = await runPlTick(storage, d)
+    const second = await runPlTick(storage, d)
+
+    expect(first).toMatchObject({ status: 'blocked', attempt: 1 })
+    expect(second).toMatchObject({ status: 'blocked', attempt: 2 })
+    expect(findProposalDiagnostics(storage, projectId).map((entry) => entry.proposer))
+      .toEqual(['injected', 'injected'])
+    // 診断2件は専用 entity にあり、採用 window には通常の2 attempt だけが残る。
+    expect(storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)).toHaveLength(2)
+    expect(buildSystemState(storage).attention).toHaveLength(0)
   })
 
   it('attention が1件でもあるうちは採用しない（止まっているものを放置して仕事を増やさない）', async () => {
