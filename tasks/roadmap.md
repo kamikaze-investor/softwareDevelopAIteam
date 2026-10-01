@@ -28,6 +28,14 @@ PL の採用候補は `planned` だけである（`deferred` は候補に入ら�
 これは Review 結果の override ではなく、**Source of Truth の時点整合修正**である。
 経緯: `docs/project_memory/decisions/multi_task_continuous_autonomous_development_evidence.md`。
 
+**Promotion 済み Tier A 項目の ID 運用**: canonical master へ到達して完了した項目を、PL に
+再採用させる目的で同じ `roadmap:id` の `state` を `planned` へ戻してはならない。同じ責務の残作業が
+後から判明して既存 ID を継続する場合は `in_progress` へ戻してよい（2026-08-14 の既存運用）が、
+PL の自動採用対象にはしない。PL が自動採用する独立した新規 scope は新しい ID にする。誤って
+`planned` へ戻した場合、awaiting-promotion check は follow-up 採用を fail-closed で停止し、既存
+`audit_log` に `roadmap_completion_awaiting_promotion` を記録する。この規則は roadmap CLI の
+一般的な state 遷移能力を制限しない。
+
 ---
 
 ## Phase 1: 基盤構築（現在）
@@ -4946,6 +4954,13 @@ worktree と別 repository は採らない。
   **Promotion は既存の push → PR → GitHub Actions CI → verified-SHA `--ff-only` deploy を
   そのまま再利用**でき、新規機構がゼロ。Stable の deploy ディレクトリ自体も同 repo の clone であり、
   Candidate はその兄弟 clone になる
+
+**Promotion の完了条件**: Candidate の成果を canonical master へ到達させるだけでは完了としない。
+同じ promotion PR で、(1) 成果を canonical master へ入れる、(2) 実際の受入結果に従って対応する
+Roadmap 項目の state / checkbox を `roadmap:update` で更新する（部分的な promotion は残作業を反映した
+真の state を維持し、一律に `done` にしない）、(3) `roadmap:sync` で `PROJECT_CURRENT_STATE` を同期する、
+(4) `roadmap:check` を PASS させる。merge 後は Candidate clone を canonical master へ同期してから
+次の自己開発を開始する。
 
 **Candidate 検証の2種別（区別する）**:
 1. **Synthetic / Destructive Test** — テスト専用の Project / Roadmap / DB を使い、

@@ -129,6 +129,94 @@ export interface AdoptRoadmapItemDeps {
   ensureInitialWorkflows?: typeof ensureInitialWorkflowsForActiveTasks
 }
 
+export const AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION = 'roadmap_completion_awaiting_promotion'
+const ROADMAP_ITEM_AUDIT_ENTITY_TYPE = 'roadmap_item'
+
+export interface AwaitingPromotionCompletion {
+  taskId: string
+  sourceJobId: string
+  candidateCommitHash?: string
+}
+
+/** `roadmap_completion_awaiting_promotion` audit の source completion 単位の identity。 */
+export function awaitingPromotionAuditKey(
+  projectId: string,
+  roadmapId: string,
+  sourceJobId: string,
+): string {
+  return `${projectId}/${roadmapId}/${sourceJobId}`
+}
+
+/**
+ * Candidate の完了が canonical master への Promotion を待っているかを判定する共有 predicate。
+ *
+ * `commitHash` は Worker / generic PATCH から書ける情報なので根拠にしない。Task completion が作った
+ * continuation の source Job 自体が、同じ Task に属する成功済み `git_commit` であることを要求する。
+ * Tier B の正式な external completion は既存 audit で除外する。
+ *
+ * 検出した source completion は既存 audit_log へ一度だけ記録する。分類器と authoritative seam の
+ * どちらから呼ばれても、同じ entity id で重複しない。
+ */
+export function checkRoadmapCompletionAwaitingPromotion(
+  storage: IStorage,
+  projectId: string,
+  roadmapId: string,
+  knownLedgerIds: ReadonlySet<string>,
+): AwaitingPromotionCompletion[] {
+  const completions = storage.tasks.findByProjectId(projectId).flatMap((task) => {
+    if (
+      task.status !== 'done'
+      || task.roadmapTaskKey === undefined
+      || getBaseRoadmapId(task.roadmapTaskKey, knownLedgerIds) !== roadmapId
+    ) return []
+
+    const continuation = storage.taskContinuations.findByCompletedTaskId(task.id)
+    if (!continuation || continuation.projectId !== projectId) return []
+
+    const sourceJob = storage.jobs.findById(continuation.sourceJobId)
+    if (
+      !sourceJob
+      || sourceJob.taskId !== task.id
+      || sourceJob.projectId !== projectId
+      || sourceJob.status !== 'success'
+      || sourceJob.safeCommand.kind !== 'git_commit'
+    ) return []
+
+    const externallyReconciled = storage.auditLog
+      .findByEntity('task', task.id)
+      .some((entry) => entry.operation === 'reconcile_external_completion')
+    if (externallyReconciled) return []
+
+    return [{
+      taskId: task.id,
+      sourceJobId: sourceJob.id,
+      ...(sourceJob.commitHash !== undefined ? { candidateCommitHash: sourceJob.commitHash } : {}),
+    }]
+  })
+
+  for (const completion of completions) {
+    const entityId = awaitingPromotionAuditKey(projectId, roadmapId, completion.sourceJobId)
+    const alreadyRecorded = storage.auditLog
+      .findByEntity(ROADMAP_ITEM_AUDIT_ENTITY_TYPE, entityId)
+      .some((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)
+    if (alreadyRecorded) continue
+
+    storage.auditLog.record({
+      actor: 'api',
+      operation: AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+      entityType: ROADMAP_ITEM_AUDIT_ENTITY_TYPE,
+      entityId,
+      result: 'success',
+      detail: JSON.stringify({
+        taskId: completion.taskId,
+        candidateCommitHash: completion.candidateCommitHash ?? null,
+      }),
+    })
+  }
+
+  return completions
+}
+
 function resolveTargetRoot(): string {
   return process.env.TARGET_ROOT ?? '/workspace/target'
 }
@@ -198,6 +286,20 @@ function checkFollowUpEligibility(
     ok: false,
     failure: { ok: false, code, reason },
   })
+
+  const awaitingPromotion = checkRoadmapCompletionAwaitingPromotion(
+    storage,
+    input.projectId,
+    input.roadmapId,
+    knownLedgerIds,
+  )
+  if (awaitingPromotion.length > 0) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      `roadmap item "${input.roadmapId}" has a Candidate completion awaiting promotion; `
+        + 'promote and reconcile the roadmap ledger before considering follow-up work',
+    )
+  }
 
   const siblings = projectTasks.filter(
     (task) => task.roadmapTaskKey !== undefined

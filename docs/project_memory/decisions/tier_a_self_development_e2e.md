@@ -74,6 +74,11 @@ Candidate は同一 canonical repository の**独立 clone**（worktree でも�
 `.git` が独立するので破棄・再作成が自由で、remote は同一なので Promotion に既存の
 push → PR → CI → verified-SHA `--ff-only` deploy をそのまま再利用できる。
 
+**以後の Promotion 完了条件**: 同じ promotion PR で、Candidate 成果の canonical master への反映、
+実際の受入結果に沿った対応 Roadmap 項目の state / checkbox 更新（`roadmap:update`。部分完了を一律
+`done` にしない）、`PROJECT_CURRENT_STATE` の同期（`roadmap:sync`）、`roadmap:check` PASS を揃える。
+merge 後は Candidate clone を canonical master へ同期してから次の自己開発を始める。
+
 **物理強制は新規機構ゼロ**。既存の `isInsideTargetRoot()` が `/workspace/target` 外への書き込みを
 拒否し、`buildTargetCommandEnv()` の allowlist が `DB_PATH` / `API_TOKEN` / provider key / `HOME` を
 子プロセスへ渡さない。2026-09-13 に Candidate 上で全 package の typecheck と test を実行し、

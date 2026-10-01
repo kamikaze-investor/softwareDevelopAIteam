@@ -8,7 +8,11 @@ import {
 } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
+import {
+  adoptRoadmapItem,
+  AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+  awaitingPromotionAuditKey,
+} from '../ctoAi/roadmapAdoption'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import {
   applyFollowUpBoost,
@@ -228,12 +232,160 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     return { storage, projectId: project.id }
   }
 
+  function projectWithCompletion(options: {
+    sourceKind?: 'git_commit' | 'test'
+    sourceStatus?: 'success' | 'failed'
+    sourceCommitHash?: string
+    taskCommitHash?: string
+    externallyReconciled?: boolean
+  } = {}): { storage: IStorage; projectId: string; taskId: string; sourceJobId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'Candidate completion', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item',
+      ...(options.taskCommitHash !== undefined ? { commitHash: options.taskCommitHash } : {}),
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const sourceKind = options.sourceKind ?? 'git_commit'
+    const sourceJob = storage.jobs.create({
+      taskId: task.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: options.sourceStatus ?? 'success',
+      safeCommand: sourceKind === 'git_commit'
+        ? { kind: 'git_commit', workingDir: '/workspace/target', message: 'candidate result' }
+        : { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+      ...(options.sourceCommitHash !== undefined ? { commitHash: options.sourceCommitHash } : {}),
+    } as Parameters<IStorage['jobs']['create']>[0])
+    if (options.sourceCommitHash !== undefined) {
+      storage.jobs.update(sourceJob.id, { commitHash: options.sourceCommitHash })
+    }
+    storage.taskContinuations.create({
+      sourceJobId: sourceJob.id,
+      projectId: project.id,
+      completedTaskId: task.id,
+      status: 'completed',
+    })
+    if (options.externallyReconciled === true) {
+      storage.auditLog.record({
+        actor: 'api', operation: 'reconcile_external_completion', entityType: 'task',
+        entityId: task.id, result: 'done', detail: 'Tier B completion',
+      })
+    }
+    return { storage, projectId: project.id, taskId: task.id, sourceJobId: sourceJob.id }
+  }
+
   it('実行済み・active なし・continuation なしを follow_up として分類する', () => {
     const { storage, projectId } = projectWithExecutedItem()
 
     const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
 
     expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('follow_up')
+  })
+
+  it('Candidate completion awaiting promotion は follow-up にせず、tick を繰り返しても audit は1件', () => {
+    const { storage, projectId, taskId, sourceJobId } = projectWithCompletion({
+      sourceCommitHash: 'candidate-abc123',
+    })
+
+    const first = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+    const second = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(first.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+    expect(second.find((candidate) => candidate.id === 'open-item')?.kind).toBe('not_available')
+    const audits = storage.auditLog
+      .findByEntity('roadmap_item', awaitingPromotionAuditKey(projectId, 'open-item', sourceJobId))
+      .filter((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)
+    expect(audits).toHaveLength(1)
+    expect(JSON.parse(audits[0]?.detail ?? '{}')).toEqual({
+      taskId,
+      candidateCommitHash: 'candidate-abc123',
+    })
+  })
+
+  it('promoted completion を誤って planned に戻しても fail-closed で audit を残す', () => {
+    // canonical master 包含はこの DB に保存しない。ledger が誤って planned のままなら、
+    // Candidate completion と同じ証拠形を安全側へ倒し、PL に再採用させない。
+    const { storage, projectId, sourceJobId } = projectWithCompletion()
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+    expect(storage.auditLog.findByEntity(
+      'roadmap_item', awaitingPromotionAuditKey(projectId, 'open-item', sourceJobId),
+    ).some((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)).toBe(true)
+  })
+
+  it('後続の parked/failed #2 があっても、先行 completion は awaiting promotion のまま', () => {
+    const { storage, projectId } = projectWithCompletion()
+    const parked = storage.tasks.create({
+      projectId, title: 'parked follow-up', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item#2', roadmapActive: false,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: parked.id, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+  })
+
+  it('Tier B reconcile audit がある completion は awaiting promotion と扱わない', () => {
+    const { storage, projectId } = projectWithCompletion({ externallyReconciled: true })
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')?.kind).toBe('follow_up')
+    expect(storage.auditLog.findAll().some(
+      (entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+    )).toBe(false)
+  })
+
+  it.each([
+    ['non-git_commit Job の commitHash', { sourceKind: 'test' as const, sourceCommitHash: 'misleading' }],
+    ['failed git_commit Job の commitHash', { sourceStatus: 'failed' as const, sourceCommitHash: 'failed-sha' }],
+    ['Task row だけの commitHash', { sourceKind: 'test' as const, taskCommitHash: 'task-only-sha' }],
+  ])('%s だけでは awaiting promotion にしない', (_label, options) => {
+    const { storage, projectId } = projectWithCompletion(options)
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')?.kind).toBe('follow_up')
+    expect(storage.auditLog.findAll().some(
+      (entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+    )).toBe(false)
+  })
+
+  it('qualifying source Job は commitHash が無くても awaiting promotion と扱う', () => {
+    const { storage, projectId } = projectWithCompletion()
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+  })
+
+  it('done から in_progress に戻した ledger item は既存 planned-only filter で採用候補にならない', () => {
+    const ledger = LEDGER.replace('roadmap:id=open-item state=planned', 'roadmap:id=open-item state=in_progress')
+      .replace('1. [ ] **未着手の項目**', '1. [~] **未着手の項目**')
+
+    expect(readAdoptionCandidates(() => ledger).some((candidate) => candidate.id === 'open-item')).toBe(false)
   })
 
   it('一度も採用されていない項目は従来どおり fresh', () => {
