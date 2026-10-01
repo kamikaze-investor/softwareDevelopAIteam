@@ -339,8 +339,160 @@ export interface ProposalDiagnostic {
 }
 
 export interface PersistedProposalDiagnostic extends ProposalDiagnostic {
+  /** Length of the original, unredacted model output. */
   rawLength: number
+  /** Whether the stored, redacted raw text was truncated. */
   rawTruncated: boolean
+  redactions: number
+}
+
+export interface RedactedDiagnosticText {
+  text: string
+  redactions: number
+}
+
+const SECRET_KEY_NAME = /api[_-]?key|client[_-]?secret|private[_-]?key|access[_-]?key|secret|token|password|passwd|credential|refresh|session|cookie/i
+const SECRET_KEY_IDENTIFIER = '[A-Za-z0-9_-]{1,160}'
+const SINGLE_LINE_SECRET_VALUE = `("(?:\\\\[^\\r\\n]|[^"\\\\\\r\\n])*"|'(?:\\\\[^\\r\\n]|[^'\\\\\\r\\n])*'|[^\\s,;'"]+)`
+
+const BARE_COLON_SECRET_KEYS = new Set([
+  'password',
+  'passwd',
+  'secret',
+  'credential',
+  'api_key',
+  'apikey',
+  'private_key',
+  'client_secret',
+  'access_token',
+  'refresh_token',
+])
+
+const COLON_SECRET_KEY_SEGMENTS = new Set([
+  'password',
+  'passwd',
+  'secret',
+  'token',
+  'credential',
+  'cookie',
+])
+
+function isStructuredSecretKey(key: string): boolean {
+  return SECRET_KEY_NAME.test(key) || key.toLowerCase().split(/[_-]/).includes('auth')
+}
+
+function isBareColonSecretKey(key: string): boolean {
+  const normalized = key
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/-/g, '_')
+    .toLowerCase()
+  if (BARE_COLON_SECRET_KEYS.has(normalized)) {
+    return true
+  }
+
+  const segments = normalized.split('_')
+  const hasQualifiedSecretSegment = segments.length > 1
+    && segments.some((segment) => COLON_SECRET_KEY_SEGMENTS.has(segment))
+
+  return hasQualifiedSecretSegment
+    || normalized.endsWith('api_key')
+    || normalized.endsWith('private_key')
+    || normalized.endsWith('access_key')
+    || normalized.endsWith('apikey')
+}
+
+/**
+ * Best-effort sanitization for untrusted model output stored in diagnostics.
+ * This deliberately preserves surrounding syntax so parse failures remain diagnosable.
+ */
+export function redactDiagnosticSecrets(raw: string): RedactedDiagnosticText {
+  try {
+    let text = raw
+    let redactions = 0
+    const replace = (
+      pattern: RegExp,
+      replacement: string | ((...args: string[]) => string),
+    ): void => {
+      text = text.replace(pattern, (...args: string[]) => {
+        redactions += 1
+        return typeof replacement === 'string' ? replacement : replacement(...args)
+      })
+    }
+
+    replace(
+      /-----BEGIN (?:(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----[\s\S]*?(?:-----END (?:(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----|$)/g,
+      '[REDACTED:PEM_PRIVATE_KEY]',
+    )
+
+    const jsonSecret = new RegExp(
+      `("(${SECRET_KEY_IDENTIFIER})"[ \\t]*:[ \\t]*)"(?:\\\\[^\\r\\n]|[^"\\\\\\r\\n])*"`,
+      'gi',
+    )
+    replace(jsonSecret, (match: string, prefix: string, key: string) => {
+      if (!isStructuredSecretKey(key)) {
+        redactions -= 1
+        return match
+      }
+      return `${prefix}"[REDACTED:SECRET_VALUE]"`
+    })
+
+    const equalsSecret = new RegExp(
+      `((?<![A-Za-z0-9"])(?!Authorization(?![A-Za-z0-9_-]))(${SECRET_KEY_IDENTIFIER})(?![A-Za-z0-9])[ \\t]*=[ \\t]*)${SINGLE_LINE_SECRET_VALUE}`,
+      'gi',
+    )
+    replace(equalsSecret, (match: string, prefix: string, key: string, value: string) => {
+      if (!isStructuredSecretKey(key)) {
+        redactions -= 1
+        return match
+      }
+      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : ''
+      return `${prefix}${quote}[REDACTED:SECRET_VALUE]${quote}`
+    })
+
+    const structuredColonSecret = new RegExp(
+      `((?<![A-Za-z0-9"])(?!Authorization(?![A-Za-z0-9_-]))(${SECRET_KEY_IDENTIFIER})(?![A-Za-z0-9])[ \\t]*:[ \\t]*)${SINGLE_LINE_SECRET_VALUE}`,
+      'gi',
+    )
+    replace(structuredColonSecret, (match: string, prefix: string, key: string, value: string) => {
+      if (!isBareColonSecretKey(key)) {
+        redactions -= 1
+        return match
+      }
+      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : ''
+      return `${prefix}${quote}[REDACTED:SECRET_VALUE]${quote}`
+    })
+
+    replace(
+      /\b((?:Authorization[ \t]*:[ \t]*)?Bearer[ \t]+)([A-Za-z0-9._~+/=-]+)/gi,
+      (_match: string, prefix: string) => `${prefix}[REDACTED:BEARER_TOKEN]`,
+    )
+    replace(
+      /\beyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\b/g,
+      '[REDACTED:JWT]',
+    )
+    replace(
+      /\b(?:sk-ant-|sk-|gh[oprsu]_|github_pat_|xox[abeprs]-)[A-Za-z0-9_-]{8,}\b/g,
+      '[REDACTED:TOKEN_PREFIX]',
+    )
+    replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED:AWS_ACCESS_KEY]')
+    replace(/\bAIza[A-Za-z0-9_-]{10,}\b/g, '[REDACTED:GOOGLE_API_KEY]')
+
+    replace(/[A-Za-z0-9+/_=-]{40,}/g, (candidate: string) => {
+      if (candidate.includes('/')
+        || !/[a-z]/.test(candidate)
+        || !/[A-Z]/.test(candidate)
+        || !/[0-9]/.test(candidate)) {
+        redactions -= 1
+        return candidate
+      }
+      return '[REDACTED:HIGH_ENTROPY]'
+    })
+
+    return { text, redactions }
+  } catch {
+    // Never persist unredacted content if sanitization itself unexpectedly fails.
+    return { text: '[REDACTED:SANITIZATION_FAILURE]', redactions: 1 }
+  }
 }
 
 function proposalDiagnosticKey(projectId: string): string {
@@ -383,15 +535,18 @@ function recordProposalDiagnostic(
       .filter((entry) => entry.promptVersion === diagnostic.promptVersion)
     if (existingForVersion.length >= PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION) return
 
-    const rawTruncated = diagnostic.raw.length > PROPOSAL_DIAGNOSTIC_RAW_LIMIT
+    const rawLength = diagnostic.raw.length
+    const redactionInput = diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT * 16)
+    const redacted = redactDiagnosticSecrets(redactionInput)
+    const rawTruncated = rawLength > redactionInput.length
+      || redacted.text.length > PROPOSAL_DIAGNOSTIC_RAW_LIMIT
     const payload: PersistedProposalDiagnostic = {
       ...diagnostic,
       proposer: diagnostic.proposer.slice(0, PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT),
-      rawLength: diagnostic.raw.length,
+      rawLength,
       rawTruncated,
-      raw: rawTruncated
-        ? diagnostic.raw.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
-        : diagnostic.raw,
+      redactions: redacted.redactions,
+      raw: redacted.text.slice(0, PROPOSAL_DIAGNOSTIC_RAW_LIMIT),
     }
     storage.auditLog.record({
       actor: 'api',

@@ -18,6 +18,7 @@ import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { summarizeBlockedTriage } from './blockedTriage'
 import {
   applyFollowUpBoost,
+  AUDIT_PROPOSAL_UNPARSED,
   AUDIT_FOLLOW_UP_ADOPTED,
   AUDIT_FOLLOW_UP_BOOSTED,
   AUDIT_FOLLOW_UP_SKIPPED,
@@ -32,6 +33,7 @@ import {
   PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT,
   PROPOSAL_DIAGNOSTIC_RAW_LIMIT,
   readAdoptionCandidates,
+  redactDiagnosticSecrets,
   selectAdoptionCandidates,
   buildAdoptionPrompt,
   ADOPTION_SYSTEM_PROMPT,
@@ -111,6 +113,10 @@ function deps(over: Partial<Parameters<typeof runAdoptionStep>[2]> = {}) {
     ...over,
   }
 }
+
+// Token-shaped fixtures are assembled at runtime so no secret-like literal appears in the source
+// (keeps GitHub push protection quiet; these are not real credentials).
+const fake = (...parts: string[]): string => parts.join('')
 
 describe('readAdoptionCandidates', () => {
   it('候補は planned だけ（現在の可否は state が正本）', () => {
@@ -744,6 +750,7 @@ describe('proposal_unusable — adoption proposal diagnostics', () => {
       followUpCandidateCount: 0,
       rawLength: raw.length,
       rawTruncated: false,
+      redactions: 0,
       raw,
     })
     expect(diagnostic?.promptVersion).toMatch(/^[0-9a-f]{12}$/)
@@ -806,6 +813,209 @@ describe('proposal_unusable — adoption proposal diagnostics', () => {
     expect(diagnostic?.rawLength).toBe(raw.length)
     expect(diagnostic?.rawTruncated).toBe(true)
     expect(diagnostic?.proposer).toHaveLength(PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT)
+  })
+
+  it.each([
+    ['complete PEM', 'before -----BEGIN PRIVATE KEY-----\nvery-secret\n-----END PRIVATE KEY----- after', 'very-secret'],
+    ['unterminated PEM', 'before -----BEGIN OPENSSH PRIVATE KEY-----\nvery-secret', 'very-secret'],
+    ['authorization bearer', 'Authorization: Bearer bearer-secret-123', 'bearer-secret-123'],
+    ['standalone bearer', 'Bearer standalone-secret-123', 'standalone-secret-123'],
+    ['JWT', fake('eyJh', 'bGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature123'), fake('eyJh', 'bGciOiJIUzI1NiJ9')],
+    ['OpenAI prefix', fake('sk-a', 'bcdefghijklmnopqrstuvwxyz'), fake('sk-a', 'bcdefghijklmnopqrstuvwxyz')],
+    ['Anthropic prefix', fake('sk-a', 'nt-abcdefghijklmnopqrstuvwxyz'), fake('sk-a', 'nt-abcdefghijklmnopqrstuvwxyz')],
+    ['GitHub prefix', fake('gith', 'ub_pat_abcdefghijklmnopqrstuvwxyz'), fake('gith', 'ub_pat_abcdefghijklmnopqrstuvwxyz')],
+    ['Slack prefix', fake('xoxb', '-abcdefghijklmnopqrstuvwxyz'), fake('xoxb', '-abcdefghijklmnopqrstuvwxyz')],
+    ['AWS access key', fake('AKIA', 'ABCDEFGHIJKLMNOP'), fake('AKIA', 'ABCDEFGHIJKLMNOP')],
+    ['Google API key', fake('AIza', 'SyAbCdEfGhIjKlMnOpQrStUvWxYz'), fake('AIza', 'SyAbCdEfGhIjKlMnOpQrStUvWxYz')],
+    ['env assignment', 'API_KEY=assignment-secret-value', 'assignment-secret-value'],
+    ['JSON secret value', '{"password": "json-secret-value"}', 'json-secret-value'],
+    ['high entropy', fake('aB3d', 'E5fG7hI9jK1mN3pQ5rS7tU9vW1xY3zA5bC7d'), fake('aB3d', 'E5fG7hI9jK1mN3pQ5rS7tU9vW1xY3zA5bC7d')],
+  ])('redacts %s in persisted diagnostic raw text', async (_label, raw, secret) => {
+    const { storage, projectId } = seed()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    const storedDetail = storage.auditLog.findAll()
+      .find((entry) => entry.operation === AUDIT_PROPOSAL_UNPARSED)?.detail
+    expect(diagnostic?.raw).not.toContain(secret)
+    expect(storedDetail).not.toContain(secret)
+    expect(diagnostic?.raw).toContain('[REDACTED:')
+    expect(diagnostic?.redactions).toBeGreaterThan(0)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+  })
+
+  it('preserves non-secret JSON/prose structure and reports the replacement count', () => {
+    const safe = '{"roadmapId": "foo", "allowedPaths": ["apps/api"]} prose remains'
+    expect(redactDiagnosticSecrets(safe)).toEqual({ text: safe, redactions: 0 })
+
+    const result = redactDiagnosticSecrets('token=first-secret Authorization: Bearer second-secret')
+    expect(result.text).toBe(
+      'token=[REDACTED:SECRET_VALUE] Authorization: Bearer [REDACTED:BEARER_TOKEN]',
+    )
+    expect(result.redactions).toBe(2)
+  })
+
+  it.each([
+    'Author: kamikaze',
+    'tokenizer: fast',
+    'auth-middleware: update the handler',
+    'auth_middleware: update the handler',
+    'session: expires after 1h',
+    'authentication: required',
+    'token: abc',
+    'session_id: abc123',
+    'auth-service: abc',
+    'AUTH: abc',
+    'https://example.com/auth:8080/x',
+  ])('does not redact ordinary prose or URL text: %s', (safe) => {
+    expect(redactDiagnosticSecrets(safe)).toEqual({ text: safe, redactions: 0 })
+  })
+
+  it.each([
+    ['snake-case colon key', 'access_token: abc123', 'abc123'],
+    ['kebab-case colon key', 'client-secret: abc123', 'abc123'],
+    ['camelCase colon key', 'clientSecret: abc123', 'abc123'],
+    ['bare-word colon key', 'password: hunter2', 'hunter2'],
+    ['passwd colon key', 'passwd: abc123', 'abc123'],
+    ['bare secret colon key', 'secret: abc123', 'abc123'],
+    ['credential colon key', 'credential: abc123', 'abc123'],
+    ['compact API key colon key', 'apikey: abc123', 'abc123'],
+    ['kebab API key colon key', 'api-key: abc123', 'abc123'],
+    ['snake private key colon key', 'private_key: abc123', 'abc123'],
+    ['kebab private key colon key', 'private-key: abc123', 'abc123'],
+    ['refresh token colon key', 'refresh_token: abc123', 'abc123'],
+    ['qualified password colon key', 'DB_PASSWORD: hunter2', 'hunter2'],
+    ['qualified token colon key', 'GITHUB_TOKEN: abc', 'abc'],
+    ['qualified API key colon key', 'OPENCODE_GO_API_KEY: abc', 'abc'],
+    ['qualified access key colon key', 'aws_secret_access_key: abc', 'abc'],
+    ['camelCase token colon key', 'secretToken: abc', 'abc'],
+    ['snake client secret colon key', 'client_secret: abc', 'abc'],
+    ['bare-word equals key', 'password=abc123', 'abc123'],
+    ['auth equals key', 'auth=abc123', 'abc123'],
+    ['segmented auth equals key', 'service_auth_middleware=abc123', 'abc123'],
+    ['segmented auth JSON key', '{"auth-middleware": "abc123"}', 'abc123'],
+  ])('redacts supported assignment form: %s', (_label, raw, secret) => {
+    const result = redactDiagnosticSecrets(raw)
+
+    expect(result.text).not.toContain(secret)
+    expect(result.text).toContain('[REDACTED:SECRET_VALUE]')
+    expect(result.redactions).toBe(1)
+  })
+
+  it.each([
+    'access_token:\nnext-line-value',
+    '{"password":\n"next-line-value"}',
+    'clientSecret: "first-line\nnext-line-value"',
+  ])('does not redact assignment values across line boundaries', (raw) => {
+    expect(redactDiagnosticSecrets(raw)).toEqual({ text: raw, redactions: 0 })
+  })
+
+  it.each([
+    ['OPENCODE_GO_API_KEY=hunter2secret', 'hunter2secret'],
+    ['DB_PASSWORD=hunter2', 'hunter2'],
+    ['GITHUB_TOKEN=abc123', 'abc123'],
+    ['{"access_token": "abc"}', 'abc'],
+    ['{"client_secret": "abc"}', 'abc'],
+    ['{"OPENCODE_GO_API_KEY": "abc"}', 'abc'],
+  ])('redacts identifier-qualified secret key values: %s', (raw, secret) => {
+    const result = redactDiagnosticSecrets(raw)
+
+    expect(result.text).not.toContain(secret)
+    expect(result.text).toContain('[REDACTED:SECRET_VALUE]')
+    expect(result.redactions).toBe(1)
+  })
+
+  it('preserves ordinary proposal fields, long paths, roadmap ids, and git SHAs', () => {
+    const safe = JSON.stringify({
+      roadmapId: 'adoption-proposal-parse-diagnostics-follow-up-item',
+      implementationScope: 'apps/mobile/src/components/ProjectSettingsScreen.tsx',
+      allowedPaths: ['docs/project_memory/decisions/tier_a_self_development_e2e.md'],
+      acceptanceCriteria: ['preserve diagnostics'],
+      rationale: 'respond safely',
+      respondsTo: '0123456789abcdef0123456789abcdef01234567',
+    })
+
+    expect(redactDiagnosticSecrets(safe)).toEqual({ text: safe, redactions: 0 })
+  })
+
+  it('redacts before applying the persisted raw-text cap', async () => {
+    const { storage, projectId } = seed()
+    const secret = `sk-${'a'.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 100)}`
+    const raw = `${secret}\n${'z'.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 100)}`
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.raw.length).toBeLessThanOrEqual(PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+    expect(diagnostic?.raw).not.toContain(secret)
+    expect(diagnostic?.raw).toMatch(/^\[REDACTED:TOKEN_PREFIX\]/)
+    expect(diagnostic?.redactions).toBe(1)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+    expect(diagnostic?.rawTruncated).toBe(true)
+  })
+
+  it('redacts a JWT pulled into the stored cap by a large PEM replacement', async () => {
+    const { storage, projectId } = seed()
+    const pemHeader = '-----BEGIN PRIVATE KEY-----\n'
+    const pemFooter = '\n-----END PRIVATE KEY-----'
+    const pem = `${pemHeader}${'A'.repeat(4500 - pemHeader.length - pemFooter.length)}${pemFooter}`
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123'
+    const raw = `${pem}${'x'.repeat(7989 - pem.length)}\n${jwt}`
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(raw.indexOf(jwt)).toBe(7990)
+    expect(diagnostic?.raw).toContain('[REDACTED:PEM_PRIVATE_KEY]')
+    expect(diagnostic?.raw).toContain('[REDACTED:JWT]')
+    expect(diagnostic?.raw).not.toContain('eyJhbGciOiJIUzI1NiJ9')
+    expect(diagnostic?.raw).not.toContain('eyJzdWIiOiIxMjM0NTY3ODkwIn0')
+    expect(diagnostic?.redactions).toBe(2)
+  })
+
+  it.each([
+    ['alternating identifier characters', 'a_'.repeat(50_000)],
+    ['identifier punctuation', '_'.repeat(100_000)],
+  ])('bounds redaction work and stored raw for %s', async (_label, raw) => {
+    const { storage, projectId } = seed()
+    const directlyRedacted = redactDiagnosticSecrets(raw)
+
+    // 絶対時間ではなく入力長に対する伸び方で判定する（並列実行中の CI でも安定させるため）。
+    // 線形なら 4 倍の入力で約 4 倍、二乗なら約 16 倍になる。最小値を取ってノイズを抑える。
+    const fastest = (input: string): number => {
+      let best = Number.POSITIVE_INFINITY
+      for (let i = 0; i < 3; i += 1) {
+        const startedAt = performance.now()
+        redactDiagnosticSecrets(input)
+        best = Math.min(best, performance.now() - startedAt)
+      }
+      return Math.max(best, 0.5)
+    }
+    const unit = raw.slice(0, 2)
+    const small = fastest(unit.repeat(8_000))
+    const large = fastest(unit.repeat(32_000))
+    expect(large / small).toBeLessThan(10)
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(directlyRedacted).toEqual({ text: raw, redactions: 0 })
+    expect(diagnostic?.raw).toHaveLength(PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+    expect(diagnostic?.rawTruncated).toBe(true)
   })
 
   it('JSON.parse の入力断片入り message を reason に保存しない', async () => {
