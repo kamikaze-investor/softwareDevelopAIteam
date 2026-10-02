@@ -76,6 +76,17 @@ describe('loadEngineeringPrinciples', () => {
     expect(staging?.tier).toBe('contextual')
     expect(staging?.category).toBe('scope-control')
     expect(staging?.fullText).toContain('Iteration tax')
+
+    const meaning = result.bySlug.get('canonical-domain-meaning')
+    expect(meaning?.tier).toBe('contextual')
+    expect(meaning?.category).toBe('coupling')
+    expect(meaning?.scope).toBe('universal')
+    expect(meaning?.fullText).toContain('contractual representation')
+    expect(meaning?.fullText).toContain('review it as contractual until it is shown to be incidental')
+    expect(meaning?.fullText).toContain('never means silent fallback, silent stall, invisible hang or retry loop')
+    expect(meaning?.fullText).toContain('similar representation with different meaning gives a different result')
+    // 一般原則である。発見の契機になった個別 incident の表現を本文へ持ち込まない。
+    expect(meaning?.fullText.toLowerCase()).not.toContain('resume')
   })
 
   it('derives a version hash that ignores line-ending differences', () => {
@@ -238,6 +249,31 @@ describe('selectPrinciples', () => {
     expect(contract).toContain('never stage only by shrinking volume, cardinality')
   })
 
+  it('selects canonical-domain-meaning only through the focuses where domain ownership is judged', () => {
+    const principles = loadForTest()
+
+    // 新しい focus を作らず、責務境界・状態遷移・recovery・authority の既存 focus で選ぶ。
+    for (const focus of ['architecture_responsibility', 'data_state_integrity', 'safety_recovery', 'auth_permission'] as const) {
+      const selection = selectPrinciples({ predictedFocuses: [focus] }, principles)
+      const meaning = selection.find((item) => item.slug === 'canonical-domain-meaning')
+      expect(meaning?.source).toBe('contextual')
+      expect(meaning?.reason).toBe(`focus=${focus}`)
+    }
+
+    // 全 Task へ無条件に注入しない（contextual）。Risk Level だけでも選ばない。
+    expect(selectPrincipleSlugs(undefined, principles)).not.toContain('canonical-domain-meaning')
+    for (const focus of ['scope_simplicity', 'operations', 'product_ceo_experience', 'strategic_alignment'] as const) {
+      expect(selectPrincipleSlugs({ predictedFocuses: [focus] }, principles)).not.toContain('canonical-domain-meaning')
+    }
+    for (const riskLevel of ['low', 'medium', 'high', 'critical'] as const) {
+      expect(selectPrincipleSlugs({ riskLevel }, principles)).not.toContain('canonical-domain-meaning')
+    }
+
+    const selection = selectPrinciples({ predictedFocuses: ['data_state_integrity'] }, principles)
+    const contract = buildDesignContract({ slugs: selection.map((item) => item.slug), principles })
+    expect(contract).toContain('Decide domain facts through their canonical owner')
+  })
+
   it('records risk-derived selections separately from focus-derived ones', () => {
     const principles = loadForTest()
     const selection = selectPrinciples({ riskLevel: 'high' }, principles)
@@ -293,6 +329,8 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     expect(guidance).toContain('- unverifiable_assumption: Report unverifiable claims honestly instead of turning guesses into PASS.')
     // unnecessary_staging は独立 category ではなく over_constraint の一種として報告させる。
     expect(guidance).toContain('- over_constraint (unnecessary_staging; report it as over_constraint): Stage by unknown, not by size')
+    // semantic_reinference も独立 category ではなく implementation_coupling の一種として報告させる。
+    expect(guidance).toContain('- implementation_coupling (semantic_reinference; report it as implementation_coupling): Decide domain facts through their canonical owner')
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {
