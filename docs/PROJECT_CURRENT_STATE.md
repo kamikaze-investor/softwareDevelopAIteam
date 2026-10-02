@@ -342,6 +342,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる**（state: planned）
 - **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
+- **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**（state: planned）
 - **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する**（state: in_progress）
 - **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）**（state: deferred）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
