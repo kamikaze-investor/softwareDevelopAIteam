@@ -9036,6 +9036,35 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: 「採用したが allowedPaths 内で実装不能だった」
         件数を後から数えられること
 
+<!-- roadmap:id=implement-prompt-omits-allowed-paths-and-acceptance state=planned priority=high -->
+0. [ ] **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**
+      — 2026-10-02 登録（production 実測、CEO 指示）。`adoption-does-not-check-implementation-feasibility`
+      （採用時に宣言する範囲の誤り）とは別の層で、**範囲は正しいのに実装 AI へ伝わっていない**問題である。
+
+      **事実（2026-10-02 master で確認）**: `buildInitialImplementAiCliPrompt()`
+      （`apps/api/src/ctoAi/initialImplementWorkflow.ts:25-35`）は `task.description` と Design Contract
+      だけを返す。`allowedPaths` は Design Contract の principle 選択にしか使われず、本文には出ない。
+      `acceptanceCriteria` は使われていない。`claudeCodeAdapter.ts` の implement 接頭辞は
+      「allowedPaths 外を編集するな」と言うが、**値を示していない**。一方 Reviewer は
+      `jobRunner.ts` で `acceptanceCriteria` / `allowedPaths` / `forbiddenPaths` を受け取っている。
+
+      **再現事例**: Task `f7c4ff37`（`cheap-ai-latency-and-timeout-contract`）の Job `9af619ee`。
+      allowedPaths は `apps/api/src/aiExplain`、AC 5 は「`apps/api/src/aiExplain` 外を変更しない」。
+      実装 AI（prompt 2113字。`allowedPaths` も AC も0件）は timeout reason を HTTP route・shared types まで
+      伝播させ、範囲外8ファイルを変更して stage A で blocked になった。実装 AI 自身が結果報告で
+      「Task didn't list allowed paths explicitly」と述べている。
+
+      **第一候補（最小変更）**: 既存 `buildInitialImplementAiCliPrompt()` の構築を改善し、Task に既に
+      保存されている `allowedPaths` / `acceptanceCriteria`（Design Review も同じ Task を見ている）を
+      implementer へ明示する。Reviewer へ渡している情報の再利用を優先する。
+      **新しい Guard / workflow / Remediation は作らない。**
+
+      **着手時に確認すること**:
+      - prompt を変えると Design Review evidence の `designTextHash` が変わる。既存 evidence との整合
+        （`checkImplementJobDesignReviewEvidence`）を壊さない置き場所を選ぶ
+      - resume prompt（`buildResumeAiCliPrompt()`）にも同じ欠落があるか
+      - 効果検証可能性: 「範囲外変更による stage A blocked」件数を変更前後で数えられること
+
 <!-- roadmap:id=adopted-item-blocked-by-stale-deferral-text state=done -->
 9. [x] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
       — **完了（2026-09-15, PR #211）**。CEO 判断により、ledger 全体の時点整合を取って解消した。
