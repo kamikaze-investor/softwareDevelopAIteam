@@ -12,6 +12,7 @@ import {
   type CoordinatorDeps,
 } from '../designReview/designReviewCoordinator'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import { buildTaskContract } from '../implementPrompt'
 import type { IStorage } from '../storage/interface'
 
 export type InitialImplementWorkflowResult =
@@ -22,7 +23,10 @@ function initialWorkflowStepKey(taskId: string): string {
   return `task:${taskId}:initial-implement`
 }
 
-export function buildInitialImplementAiCliPrompt(task: Pick<Task, 'description' | 'allowedPaths'>): string {
+export function buildInitialImplementAiCliPrompt(task: Pick<
+  Task,
+  'description' | 'acceptanceCriteria' | 'expectedOutputs' | 'allowedPaths' | 'forbiddenPaths'
+>): string {
   const principles = loadEngineeringPrinciples()
   const designContract = buildDesignContract({
     slugs: selectPrincipleSlugs({
@@ -31,12 +35,12 @@ export function buildInitialImplementAiCliPrompt(task: Pick<Task, 'description' 
     principles,
   })
 
-  return `${task.description}\n\n${designContract}`
+  return `${task.description}\n\n${buildTaskContract(task)}\n\n${designContract}`
 }
 
 /**
  * DB Task同期とroadmap Markdown保存の成功後にだけ呼ぶ初回workflow producer。
- * promptはTask.descriptionにDesign Contractを付与したcanonical文字列を使用する。
+ * promptはTask.descriptionにTask ContractとDesign Contractを付与したcanonical文字列を使用する。
  */
 export async function createInitialImplementWorkflow(
   storage: IStorage,

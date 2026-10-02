@@ -634,11 +634,17 @@ export function computeProposedDesignTextHash(input: {
   ledgerBody: string
   implementationScope: string
   allowedPaths: string[]
+  acceptanceCriteria: string[]
+  expectedOutputs?: string[]
+  forbiddenPaths?: string[]
 }): string {
   return computeDesignTextHash(
     buildInitialImplementAiCliPrompt({
       description: buildAdoptedDescription(input.ledgerBody, input.implementationScope),
       allowedPaths: input.allowedPaths,
+      acceptanceCriteria: input.acceptanceCriteria,
+      expectedOutputs: input.expectedOutputs,
+      forbiddenPaths: input.forbiddenPaths,
     }),
   )
 }
@@ -944,6 +950,11 @@ export async function applyRevisedSpec(
     ledgerBody,
     implementationScope: input.submittedScope,
     allowedPaths: input.allowedPaths,
+    acceptanceCriteria: input.acceptanceCriteria,
+    // adoption updates scope / allowedPaths / AC but preserves these existing Task fields.
+    // They are part of the canonical Task Contract, so provenance must include them too.
+    expectedOutputs: subject.task.expectedOutputs,
+    forbiddenPaths: subject.task.forbiddenPaths,
   })
   const specKey = shortSpecKey({
     implementationScope: input.rawScope,
