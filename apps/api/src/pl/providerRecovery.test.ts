@@ -6,9 +6,16 @@ import { PassThrough } from 'node:stream'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { spawn } from 'node:child_process'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { CHEAP_AI_CONFIG, CHEAP_AI_RETRY_BACKOFF_MS, requestText } from '../aiExplain/cheapAiClient'
+import {
+  CHEAP_AI_CONFIG,
+  CHEAP_AI_PROPOSER_ID,
+  CHEAP_AI_RETRY_BACKOFF_MS,
+  PL_ADOPTION_PROPOSAL_AGENT,
+  requestText,
+} from '../aiExplain/cheapAiClient'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
+import { findProposalDiagnostics } from './adoptionStep'
 import { resetPlLoopInFlightForTest, runPlTick, type PlLoopDeps } from './executionLoop'
 
 /**
@@ -101,9 +108,9 @@ describe('PL provider inference: bounded recovery on the default provider path',
     try { rmSync(sandbox, { recursive: true, force: true }) } catch { /* sqlite handle */ }
   })
 
-  function deps(): PlLoopDeps {
+  function deps(over: Partial<PlLoopDeps> = {}): PlLoopDeps {
     // answerOperatorRequest / diagnose は差し替えない（既定の requestText 経路を通す）
-    return { now: () => NOW, readLedger: () => '', escalate: async () => {} }
+    return { now: () => NOW, readLedger: () => '', escalate: async () => {}, ...over }
   }
 
   function operatorAudit(): Array<{ result: string; detail: string }> {
@@ -140,9 +147,43 @@ describe('PL provider inference: bounded recovery on the default provider path',
     const result = await tick
 
     expect(result.status).not.toBe('diagnosis_failed')
+    for (const call of spawnMock.mock.calls) {
+      const args = call[1] as string[]
+      expect(args).not.toContain('--agent')
+    }
     const plRows = storage.auditLog.findAll().filter((row) => row.operation === 'pl_loop')
     expect(plRows.some((row) => row.result === 'diagnosis_failed')).toBe(false)
     expect(plRows.length).toBeGreaterThan(0)
+  })
+
+  it('default adoption proposal selects the dedicated agent and keeps unparsable diagnostics', async () => {
+    storage.tasks.update(taskId, { status: 'done', roadmapActive: false })
+    const child = arrangeChild()
+    const ledger = [
+      '# Roadmap',
+      '',
+      '<!-- roadmap:id=next-item state=planned -->',
+      '1. [ ] **Next item** — candidate',
+    ].join('\n')
+
+    const tick = runPlTick(storage, deps({ readLedger: () => ledger }))
+    await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1))
+    const args = spawnMock.mock.calls[0]?.[1] as string[]
+    const agentFlagIndex = args.indexOf('--agent')
+    expect(args.slice(agentFlagIndex, agentFlagIndex + 2)).toEqual([
+      '--agent',
+      PL_ADOPTION_PROPOSAL_AGENT,
+    ])
+    child.close(0, null, '<tool_call><function=bash>ls</function></tool_call>')
+
+    await expect(tick).resolves.toMatchObject({ status: 'blocked', attempt: 1 })
+    expect(findProposalDiagnostics(storage, projectId)).toEqual([
+      expect.objectContaining({
+        reason: 'no_json_object_found',
+        proposer: CHEAP_AI_PROPOSER_ID,
+        raw: '<tool_call><function=bash>ls</function></tool_call>',
+      }),
+    ])
   })
 
   it('2回とも timeout なら従来どおり fail-closed（question は provider_failure、3回目は起動しない）', async () => {

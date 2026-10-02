@@ -52,7 +52,11 @@ import {
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
 import { executeQueuedRun, toExecuteDesignReviewResult } from '../designReview/queuedRunDispatch'
-import { CHEAP_AI_PROPOSER_ID, requestText } from '../aiExplain/cheapAiClient'
+import {
+  CHEAP_AI_PROPOSER_ID,
+  PL_ADOPTION_PROPOSAL_AGENT,
+  requestText,
+} from '../aiExplain/cheapAiClient'
 import { evaluateAndPersistImplementTimeoutSensors } from './implementTimeoutSensor'
 import { CLAUDE_IMPLEMENT_TIMEOUT_MS } from '@ai-team/shared'
 import {
@@ -1789,7 +1793,12 @@ async function maybeAdoptNext(
   }
 
   const propose = deps.proposeAdoption
-    ?? ((system: string, user: string) => requestText(system, user, { retryTransientOnce: true }, PL_ADOPTION_MAX_TOKENS))
+    ?? ((system: string, user: string) => requestText(
+      system,
+      user,
+      { retryTransientOnce: true, agent: PL_ADOPTION_PROPOSAL_AGENT },
+      PL_ADOPTION_MAX_TOKENS,
+    ))
   const proposerId = deps.proposeAdoption ? 'injected' : CHEAP_AI_PROPOSER_ID
 
   let result: PlAdoptionResult
