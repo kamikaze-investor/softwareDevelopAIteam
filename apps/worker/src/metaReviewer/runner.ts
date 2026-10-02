@@ -30,7 +30,10 @@ import type {
 import {
   buildEngineeringPrincipleReviewGuidance,
   loadEngineeringPrinciples,
+  selectPrinciples,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
+import { mapFileToFocuses } from '../approvalLevel/focusSelector.js'
+import { principleChecklistFiles } from './principleChecklists.js'
 
 /**
  * 呼び出し側が control root を渡さないときの既定。**既存の挙動そのまま**である
@@ -88,6 +91,16 @@ function getFileChecklists(changedFiles: string[], checklistsDir: string): strin
   }
   if (changedFiles.some(f => f.startsWith('.github/workflows/') || f === '.github/CODEOWNERS')) {
     add('workflows.md')
+  }
+
+  // 原則が持つ checklist は、Design Review と同じ原則 routing（focus → 原則）で選ぶ。
+  // ここで path から別に選ぶと routing が二重正本になる。
+  const principleSelection = selectPrinciples(
+    { predictedFocuses: changedFiles.flatMap(mapFileToFocuses) },
+    loadEngineeringPrinciples(),
+  )
+  for (const checklistFile of principleChecklistFiles(principleSelection)) {
+    add(checklistFile)
   }
 
   return results

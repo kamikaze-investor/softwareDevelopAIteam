@@ -37,6 +37,7 @@ import {
   parseMetaReviewResult,
 } from './runner.js'
 import { AGY_REVIEW_MODEL } from './geminiRouter.js'
+import { principleChecklistFiles } from './principleChecklists.js'
 import { reviewWithProviderFallback } from './metaReviewFallbackRouter.js'
 import {
   CLAUDE_REVIEWER_MODEL,
@@ -633,7 +634,7 @@ async function buildFocusedReviewPrompt(
     }
   }
 
-  const checklistContext = await buildChecklistContext(resolveControlContextDir(input), focus, input.changedFiles)
+  const checklistContext = await buildChecklistContext(resolveControlContextDir(input), focus, input.changedFiles, selection)
   if (checklistContext.unavailableReason) {
     return {
       prompt: '',
@@ -709,6 +710,7 @@ async function buildChecklistContext(
   controlContextDir: string,
   focus: Exclude<MetaReviewFocus, 'strategic_alignment'>,
   changedFiles: readonly string[],
+  selection: readonly PrincipleSelection[],
 ): Promise<{ text: string; unavailableReason?: string }> {
   const checklistFiles = selectChecklistFilesForFocus(focus, changedFiles)
   const sections: string[] = []
@@ -738,6 +740,17 @@ async function buildChecklistContext(
       text: '',
       unavailableReason: `Checklist context is missing for ${focus}. Expected ${expectedPaths.join(' or ')}.`,
     }
+  }
+
+  // この focus で選ばれた原則が持つ checklist を足す（選択は原則 routing が決める）。
+  // focus checklist の fail-closed 判定より後に足すので、原則 checklist だけで
+  // 「checklist がある」ことにはならない。欠けていれば黙って省かず、prompt 上で欠落を明示する。
+  for (const checklistFile of principleChecklistFiles(selection)) {
+    const relPath = `docs/meta_reviewer/checklists/${checklistFile}`
+    const content = await readOptionalFile(controlContextDir, relPath)
+    sections.push(content !== null
+      ? `## ${relPath}\n\n${content}`
+      : `## ${relPath}\n\n(unavailable: file not found. Apply only the principle one-liner; do not treat this checklist as applied.)`)
   }
 
   return { text: sections.join('\n\n---\n\n') }
