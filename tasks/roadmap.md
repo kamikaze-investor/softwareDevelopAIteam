@@ -7218,8 +7218,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - **新しい recovery 経路を作らない。** 既存の 2 経路を 1 本へ寄せる
    - 効果検証可能性: この理由で消費された attempt / escalation の件数が後から数えられること
 
-<!-- roadmap:id=cheap-ai-latency-and-timeout-contract state=planned -->
-0. [ ] **cheap AI（説明・質問経路）の latency と timeout 契約** — 2026-09-15 監査により**正式登録**（それ以前は本文中で open と宣言されながら `roadmap:id` を持たず、PL が構造的に採用できなかった）。
+<!-- roadmap:id=cheap-ai-latency-and-timeout-contract state=done -->
+0. [x] **cheap AI（説明・質問経路）の latency と timeout 契約** — 2026-09-15 監査により**正式登録**（それ以前は本文中で open と宣言されながら `roadmap:id` を持たず、PL が構造的に採用できなかった）。
 
    **登録経緯**: 本ファイルの「### P1 とは分離して open のまま維持する項目」で
    `cheap-ai-latency-and-timeout-contract` として open と宣言されていたが、
@@ -7235,6 +7235,17 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    **着手時に確認すること**: 実測 latency の分布 / timeout 値の根拠 / timeout 時に
    PL の attempt を消費してよいか（`provider-outage-burns-attempt-budget` と隣接）。
    **新しい timeout 機構を作らない。**
+
+   **完了（2026-10-02 promotion、Tier A Task `f7c4ff37` / Candidate `b71f2e08`）**: Task の AC 1〜5 を満たした。
+   `cheapAiClient.ts` に試行ごとの期限 `CHEAP_AI_ATTEMPT_TIMEOUT_MS` と caller 種別ごとの最悪待ち定数を置き、
+   timeout / retry / fallback の契約を code comment に明記した（kill は既に自前 timer + SIGTERM→SIGKILL で、
+   本文の `spawn({ timeout })` 依存は解消済みだった）。timeout は `requestTextResult()` が
+   `{ ok: false, reason }` の構造化結果として**提供**する。AC は提供までで、caller への配線は求めていない
+   （AC 5: `apps/api/src/aiExplain` 外を変更しない）。
+   **未決のまま残すもの**: (1) timeout 値は 60 秒の暫定値のまま。CEO 判断により、PL adoption proposal の
+   専用 agent 化を Production で観測した後に、独立した変更として決める。(2) timeout 時の PL attempt 消費は
+   `provider-outage-burns-attempt-budget` の責務。(3) `requestTextResult()` を実 caller へ配線するかは、
+   必要になった時点で別 item として扱う（現時点で未使用の公開 API である）。
 
 ---
 
