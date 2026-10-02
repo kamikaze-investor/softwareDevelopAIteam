@@ -184,7 +184,7 @@ export function buildRepairPrompt(input: RepairPromptInput): string {
     '## Task内容',
     sanitizeUntrusted(input.taskDescription, 4_000),
     '',
-    buildTaskContract(input),
+    sanitizeUntrusted(buildTaskContract(input), 8_000),
     '',
     '## 指示',
     '直前の実行は失敗した。下記の失敗事実を踏まえ、原因を取り除く修正を行うこと。',

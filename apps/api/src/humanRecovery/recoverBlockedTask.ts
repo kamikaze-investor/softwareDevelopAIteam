@@ -363,7 +363,8 @@ export function recoverBlockedTask(
   //
   // round 1 の laundering 指摘を受けて「同じ `designTextHash` では1回だけ」を入れたが、
   // round 2 で**それが deadlock を作る**ことが分かった:
-  //   - design text は `task.description` + allowedPaths 由来の contract である
+  //   - design text は Task description と Task Contract（acceptanceCriteria / expectedOutputs /
+  //     allowedPaths / forbiddenPaths）由来である
   //     （`buildInitialImplementAiCliPrompt()`）。**訂正しなければ再実行しても hash は同じ**
   //   - 訂正するには `syncRoadmapTasks()` が要り、それは `status === 'pending'` を要求する
   //   - `pending` にするにはこの関数が要る
