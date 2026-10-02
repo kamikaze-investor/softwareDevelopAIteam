@@ -1443,9 +1443,15 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     const item = selectTarget(actionable)
     if (!item) {
       // **手が空いたら次の Roadmap 項目を採用する。**
-      // attention が1つでもあるうちは採用しない（止まっているものを放置して新しい仕事を
-      // 増やさない）。採用可否そのものは `runAdoptionStep()` 内で Gate が決める。
-      const adoption = await maybeAdoptNext(storage, before, deps)
+      // 未 escalate の attention が1つでもあるうちは採用しない（止まっているものを放置して
+      // 新しい仕事を増やさない）。**Escalation 済み（CEO 判断待ち）の対象は、上で actionable から
+      // 外したのと同じ判定で採用の妨げからも外す。** 除外前の件数で判定していたため、判断待ちの
+      // 1件が無関係な Project の採用まで止めていた。判断待ちが止めるのはその対象の Project だけである。
+      // 採用可否そのものは `runAdoptionStep()` 内で Gate が決める。
+      const awaitingCeo = before.attention.filter((entry) => hasEscalated(storage, targetKeyOf(entry)))
+      const adoption = awaitingCeo.length === before.attention.length
+        ? await maybeAdoptNext(storage, before, new Set(awaitingCeo.map((entry) => entry.projectId)), deps)
+        : undefined
       if (adoption) return adoption
 
       return {
@@ -1730,8 +1736,9 @@ async function handleTarget(
 /**
  * 手が空いた Project に次の Roadmap 項目を採用する。**採用しなかったときは undefined を返す。**
  *
- * 採用してよい状況の判定はここだけに置く:
- *   - attention が1件も無い（止まっているものを放置して新しい仕事を増やさない）
+ * 呼び出し側（`runPlTick()`）は、未 escalate の attention が1件も無いときだけ呼ぶ
+ * （止まっているものを放置して新しい仕事を増やさない）。ここで判定するのは採用先の Project:
+ *   - CEO 判断待ち（`waitingProjectIds`）の Project ではない
  *   - running な Project である（Worker が実際に進められる）
  *   - 進行中の Task が無い＝手が空いている
  *   - 同じ Project への採用試行が上限未満（`audit_log` から数える。新しい表は持たない）
@@ -1739,12 +1746,13 @@ async function handleTarget(
 async function maybeAdoptNext(
   storage: IStorage,
   state: SystemStateSnapshot,
+  waitingProjectIds: ReadonlySet<string>,
   deps: PlLoopDeps,
 ): Promise<PlTickResult | undefined> {
-  if (state.attention.length > 0) return undefined
-
   const project = state.projects.find((candidate) => (
-    candidate.status === 'running' && candidate.currentTask === undefined
+    candidate.status === 'running'
+    && candidate.currentTask === undefined
+    && !waitingProjectIds.has(candidate.id)
   ))
   if (!project) return undefined
 

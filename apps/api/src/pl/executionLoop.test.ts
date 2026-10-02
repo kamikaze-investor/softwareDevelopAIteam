@@ -849,6 +849,131 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(adoptCalls).toBe(0)
   })
 
+  it('CEO 判断待ち（Escalation 済み）の attention は、無関係な Project の採用を止めない', async () => {
+    // 判断待ちの1件が、関係のない Project の採用まで止めていた（除外前の attention 件数で判定していた）。
+    // Escalation の記録は手で作らず、PL ループ自身に作らせる（記録の形に依存しない）。
+    const { storage, projectId: waitingProjectId, taskId } = seed()
+    // running な Project は1つだけ（既存制約）。判断待ちの Project は paused にし、採用先を Other にする。
+    // approval_waiting は Project の status に関係なく attention に出る。
+    storage.projects.update(waitingProjectId, { status: 'paused' })
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    storage.approvalRequests.create({
+      taskId,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: 'abc1234',
+      targetDiffHash: 'hash',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt: '2026-09-16T00:00:00.000Z',
+      invalidIf: [],
+      changedFiles: ['docs/notes.md'],
+      triggeredRules: ['git_commit requires CEO approval (policy)'],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    // 前提: attention は CEO 判断待ちの1件だけ（他の停滞が混ざると、それが採用を止めるのは正しい）
+    expect(buildSystemState(storage, { now: () => NOW }).attention.map((a) => a.kind)).toEqual(['approval_waiting'])
+    const other = storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'running' })
+    const adopted: string[] = []
+    const d = deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => PROPOSAL,
+      adopt: async (_s, input) => {
+        adopted.push(input.roadmapId)
+        return { ok: true as const, taskId: 'task-1', roadmapTaskKey: input.roadmapId, title: 't' }
+      },
+    })
+
+    // 1 tick 目: 承認待ちを CEO へ上げる（採用はしない）
+    const first = await runPlTick(storage, d)
+    expect(first.status).toBe('escalated')
+    expect(adopted).toEqual([])
+
+    // 2 tick 目: 判断待ちは残ったまま、無関係な Project へは採用が進む
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    expect(buildSystemState(storage, { now: () => NOW }).attention.map((a) => a.kind)).toEqual(['approval_waiting'])
+    expect(second.status).toBe('acted')
+    expect(second.proposedKind).toBe('adopt_roadmap_item')
+    expect(adopted).toEqual(['next-item'])
+    const entityIds = storage.auditLog.findAll().map((e) => e.entityId)
+    expect(entityIds).toContain(`adopt:${other.id}`)
+    // 判断待ちの Project 自体へは採用しない
+    expect(entityIds).not.toContain(`adopt:${waitingProjectId}`)
+  })
+
+  it('CEO 判断待ち（Escalation 済み）の Project 自体へは、手が空いていても採用しない', async () => {
+    // 判断待ちの対象が完了済み Task に残っているため currentTask は無く、Project は running のまま。
+    // 採用先の除外（waitingProjectIds）が無ければ、この Project 自身へ採用してしまう。
+    const { storage, projectId, taskId } = seed()
+    storage.tasks.update(taskId, { status: 'done' })
+    storage.approvalRequests.create({
+      taskId,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: 'abc1234',
+      targetDiffHash: 'hash',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt: '2026-09-16T00:00:00.000Z',
+      invalidIf: [],
+      changedFiles: ['docs/notes.md'],
+      triggeredRules: ['git_commit requires CEO approval (policy)'],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    // 前提: running で手が空いている（currentTask 無し）Project に、CEO 判断待ちの attention が1件だけ
+    const state = buildSystemState(storage, { now: () => NOW })
+    expect(state.attention.map((a) => a.kind)).toEqual(['approval_waiting'])
+    expect(state.projects.find((p) => p.id === projectId)).toMatchObject({ status: 'running', currentTask: undefined })
+    let adoptCalls = 0
+    const d = deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => PROPOSAL,
+      adopt: async () => { adoptCalls += 1; return { ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' } },
+    })
+
+    const first = await runPlTick(storage, d)
+    expect(first.status).toBe('escalated')
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    expect(second.status).toBe('idle')
+    expect(adoptCalls).toBe(0)
+    expect(storage.auditLog.findAll().map((e) => e.entityId)).not.toContain(`adopt:${projectId}`)
+  })
+
+  it('未 escalate の停滞は、別 Project の採用も従来どおり止める', async () => {
+    // 判断待ちの除外は Escalation 済みに限る。まだ誰にも上げていない停滞が残るうちは、
+    // どの Project にも新しい仕事を増やさない（既存の意図）。
+    const { storage, projectId, taskId } = seed()
+    // running な Project は1つだけ（既存制約）。停滞している Project は paused にし、採用先を Other にする。
+    // paused では task_ready_without_job が出ないため、status に関係なく出る workspace_quarantined を使う。
+    storage.projects.update(projectId, { status: 'paused' })
+    const job = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
+    })
+    // 前提: 未 escalate の workspace_quarantined が1件あり、PL は扱わない（actionable でない）
+    expect(buildSystemState(storage, { now: () => NOW }).attention.map((a) => a.kind)).toEqual(['workspace_quarantined'])
+    storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'running' })
+    let adoptCalls = 0
+
+    const result = await runPlTick(storage, deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => PROPOSAL,
+      adopt: async () => { adoptCalls += 1; return { ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' } },
+    }))
+
+    expect(result.status).toBe('idle')
+    expect(adoptCalls).toBe(0)
+  })
+
   it('Escalation 後も、原因が直れば採用を再開できる（永久に止まらない）', async () => {
     // 2026-09-15 production 実測: Candidate の ledger が master に遅れていたため PL が完了済み
     // 項目を選び、ALREADY_EXECUTED 却下を2回出して Escalation。**ledger を直した後も再開しなかった。**
