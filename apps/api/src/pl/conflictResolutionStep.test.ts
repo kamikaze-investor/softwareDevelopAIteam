@@ -326,7 +326,7 @@ describe('Critic → 条件分岐', () => {
   })
 
   it('**same spec + same finding への Challenge は1回だけ**（PASS reroll にしない）', async () => {
-    const { storage, taskId } = seed()
+    const { storage, taskId, designText } = seed()
     let evaluations = 0
     const challenging = deps(DISPUTED_CRITIQUE, {
       reEvaluate: async () => {
@@ -336,6 +336,19 @@ describe('Critic → 条件分岐', () => {
     })
 
     const first = await runConflictResolutionRound(storage, taskId, challenging as never)
+
+    // canonical prompt の書式だけが変わっても、同じ material spec の Challenge 予算は復活しない。
+    const reformatted = `${designText}\n\n[non-semantic prompt format revision]`
+    const run = storage.designReviewRuns.create({
+      taskId,
+      taskTitle: 'CONFLICT した項目',
+      designText: reformatted,
+      designTextHash: computeDesignTextHash(reformatted),
+      changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(run.id, claimed.claimToken as string, 'succeeded', CONFLICT_RESULT_JSON)
+
     const second = await runConflictResolutionRound(storage, taskId, challenging as never)
 
     expect(first.stage).toBe('challenge')
@@ -345,16 +358,14 @@ describe('Critic → 条件分岐', () => {
   })
 
   it('Challenge の上限に当たっても BLOCKED にせず PL revision を続ける', async () => {
-    const { storage, taskId } = seed()
+    const { storage, taskId, designText } = seed()
+    // Task Contract 導入前に永続化された audit は prompt hash key を持つ。
+    // seed が実際に Review へ保存した prompt を使い、legacy key の読み取り互換を固定する。
     recordRemediationFailure(
       storage,
       taskId,
-      `stage=challenge chal=${computeDesignTextHash(
-        buildInitialImplementAiCliPrompt({
-          description: buildAdoptedDescription(LEDGER_BODY, '当初の広い scope'),
-          allowedPaths: ['apps/api/src', 'packages/shared/src'],
-        }),
-      ).slice(0, 12)}:scope_simplicity outcome=starting`,
+      `stage=challenge chal=${computeDesignTextHash(designText).slice(0, 12)}`
+      + ':scope_simplicity outcome=starting',
     )
 
     const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE) as never)

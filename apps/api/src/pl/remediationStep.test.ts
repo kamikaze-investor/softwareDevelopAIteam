@@ -356,14 +356,22 @@ describe('却下済みテキストの再審査を拒否する', () => {
     // （`buildRemediatedScope()` を通したもの）と別の値になり、記録した hash が
     // 後の世代で1つも照合できなくなる。Job Gate が計算する値と一致させる。
     const submittedScope = buildRemediatedScope(PROPOSAL)
+    const expectedOutputs = ['apps/api/src/pl/remediationStep.ts']
+    const forbiddenPaths = ['apps/worker/src/guards']
     const proposedHash = computeProposedDesignTextHash({
       ledgerBody: LEDGER_BODY,
       implementationScope: submittedScope,
       allowedPaths: PROPOSAL.allowedPaths,
+      acceptanceCriteria: PROPOSAL.acceptanceCriteria,
+      expectedOutputs,
+      forbiddenPaths,
     })
     const gateHash = computeDesignTextHash(buildInitialImplementAiCliPrompt({
       description: buildAdoptedDescription(LEDGER_BODY, submittedScope),
       allowedPaths: PROPOSAL.allowedPaths,
+      acceptanceCriteria: PROPOSAL.acceptanceCriteria,
+      expectedOutputs,
+      forbiddenPaths,
     }))
 
     expect(proposedHash).toBe(gateHash)
@@ -372,13 +380,13 @@ describe('却下済みテキストの再審査を拒否する', () => {
       ledgerBody: LEDGER_BODY,
       implementationScope: PROPOSAL.implementationScope,
       allowedPaths: PROPOSAL.allowedPaths,
+      acceptanceCriteria: PROPOSAL.acceptanceCriteria,
     }))
   })
 
-  it('AC だけを書き換えた提案は拒否する（Review はそこを見ないため同一テキストになる）', async () => {
-    // `buildInitialImplementAiCliPrompt()` のレビュー対象は description + allowedPaths 由来の
-    // Design Contract だけで、acceptanceCriteria は1文字も入らない。AC 変更を「作り直した」と
-    // 認めると、**byte 単位で同一のテキスト**へ再抽選を引けてしまう。
+  it('AC だけを書き換えた提案は、既存 Remediation policy どおり非 material として拒否する', async () => {
+    // Implementer/Review へ AC は届くが、Remediation の material redesign 判定は既存どおり
+    // scope / allowedPaths の変更を要求する。AC の書き換えだけで再提出を許可しない。
     const { storage, taskId } = seedConflictedTask()
     const task = storage.tasks.findById(taskId)
     const acOnly = {
@@ -645,6 +653,7 @@ describe('成功判定 — 採用経路の ok:true を成功にしない', () =>
     const submittedPrompt = buildInitialImplementAiCliPrompt({
       description: buildAdoptedDescription(LEDGER_BODY, buildRemediatedScope(PROPOSAL)),
       allowedPaths: PROPOSAL.allowedPaths,
+      acceptanceCriteria: PROPOSAL.acceptanceCriteria,
     })
 
     const result = await runRemediationStep(storage, taskId, deps({

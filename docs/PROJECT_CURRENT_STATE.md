@@ -266,6 +266,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
 - **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
+- **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
 - **Human Resume 後も古い blocked Job が Attention を占有し、後継の新しい失敗が PL に見えない（D2）**
 - **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた**
@@ -335,7 +336,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる**（state: deferred）
 - **continuation 経由の Design Review CONFLICT が Task を `blocked` にし、自動復旧の射程外へ出す**（state: deferred）
 - **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる**（state: planned）
-- **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**（state: planned）
 - **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: in_progress）
 - **blocked になった Job の変更を、後から安全に取り消す材料が残っていない**（state: deferred）
 - **`approval_gate` evidence は action へ束縛されず、Gate 経路では使い切られない**（state: deferred）

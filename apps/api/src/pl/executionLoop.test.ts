@@ -7,6 +7,8 @@ import type { IStorage } from '../storage/interface'
 import { buildSystemState } from '../state/systemState'
 import {
   PL_MAX_ATTEMPTS_PER_TARGET,
+  DEFAULT_RESUME_INSTRUCTION,
+  buildPlResumeAiCliPrompt,
   countPriorAttempts,
   extractProposedKind,
   isRecoveryTargetResolved,
@@ -87,6 +89,25 @@ function deps(over: Partial<PlLoopDeps> = {}): PlLoopDeps {
 
 beforeEach(() => {
   resetPlLoopInFlightForTest()
+})
+
+describe('PL resume prompt', () => {
+  it('keeps the same Task Contract and adds the PL resume instruction', () => {
+    const prompt = buildPlResumeAiCliPrompt({
+      title: 'Resume API work',
+      description: 'Continue the reviewed implementation.',
+      allowedPaths: ['apps/api/src/aiExplain'],
+      forbiddenPaths: ['apps/worker/src/guards'],
+      acceptanceCriteria: ['No changes outside apps/api/src/aiExplain'],
+      expectedOutputs: ['apps/api/src/aiExplain/result.ts'],
+    })
+
+    expect(prompt).toContain('[Task Contract]')
+    expect(prompt).toContain('apps/api/src/aiExplain')
+    expect(prompt).toContain('No changes outside apps/api/src/aiExplain')
+    expect(prompt).toContain(DEFAULT_RESUME_INSTRUCTION)
+    expect(prompt.indexOf('[Task Contract]')).toBeLessThan(prompt.indexOf(DEFAULT_RESUME_INSTRUCTION))
+  })
 })
 
 describe('runPlTick — Observe', () => {

@@ -9,6 +9,10 @@ import { buildRepairPrompt, REPAIR_PROMPT_MAX_STDERR_CHARS } from './repairPromp
 const BASE = {
   taskTitle: 'READMEを更新する',
   taskDescription: 'READMEへ1行追記する。既存挙動は変更しない。',
+  allowedPaths: ['README.md'],
+  forbiddenPaths: ['apps/worker/src/guards'],
+  acceptanceCriteria: ['READMEに必要な説明がある', 'README.md以外を変更しない'],
+  expectedOutputs: ['README.md'],
 }
 
 describe('buildRepairPrompt', () => {
@@ -38,6 +42,16 @@ describe('buildRepairPrompt', () => {
     expect(contractPos).toBeGreaterThan(-1)
     expect(contractPos).toBeLessThan(fencePos)
     expect(prompt).toContain('current implementation is evidence, not specification')
+  })
+
+  it('Task Contractを保持し、repair指示をその上に追加する', () => {
+    const prompt = buildRepairPrompt({ ...BASE, job: { exitCode: 1, stderr: 'boom' } })
+
+    expect(prompt).toContain('[Task Contract]')
+    expect(prompt).toContain('"allowedPaths": [\n    "README.md"')
+    for (const criterion of BASE.acceptanceCriteria) expect(prompt).toContain(criterion)
+    expect(prompt.indexOf('[Task Contract]')).toBeLessThan(prompt.indexOf('## 指示'))
+    expect(prompt.indexOf('## 指示')).toBeLessThan(prompt.indexOf('<<<UNTRUSTED_FAILURE_DATA>>>'))
   })
 
   it('失敗事実を指示として解釈しないよう明示している', () => {

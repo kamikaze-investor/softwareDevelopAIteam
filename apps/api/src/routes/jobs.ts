@@ -4,13 +4,9 @@ import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { canonicalizeJobUpdate, isLiveJob, type Job, type ReviewResult } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
 import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
+import { appendImplementContracts } from '../implementPrompt'
 import type { DesignReviewRun, OutboxEventInput } from '../storage/interface'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
@@ -328,17 +324,6 @@ function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, ded
   }
 }
 
-function appendBaseDesignContract(prompt: string): string {
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(undefined, principles),
-    principles,
-  })
-
-  return `${prompt}\n\n${designContract}`
-}
-
-
 /**
  * durableにqueuedとなったDesign Review runのexecutorをkickする。
  *
@@ -428,7 +413,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       aiCliPrompt: result.data.agentRole === 'developer_ai'
         && result.data.aiCliMode === 'implement'
         && result.data.aiCliPrompt !== undefined
-        ? appendBaseDesignContract(result.data.aiCliPrompt)
+        ? appendImplementContracts(result.data.aiCliPrompt, task)
         : result.data.aiCliPrompt,
     }
     const designReviewCheck = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)

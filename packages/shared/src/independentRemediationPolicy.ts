@@ -448,19 +448,13 @@ export interface RemediationSpec {
 }
 
 /**
- * **Review が実際に見る部分だけ**から作る正規化キー。
+ * **Remediation policy が material redesign と認める部分だけ**から作る正規化キー。
  *
- * 判定の基準は「Review の入力が変わったか」であって「Task の行が変わったか」ではない。
- * `buildInitialImplementAiCliPrompt()` が組むレビュー対象は
- * `task.description`（= ledger 本文 + `implementationScope`）と `allowedPaths` 由来の
- * Design Contract だけで、**`acceptanceCriteria` は1文字も入らない**。
- *
- * したがって AC だけを書き換えた提案は、**レビュー対象テキストが byte 単位で同一**になる。
- * それを「実質的に違う」と扱うと、AC を1行いじるだけで却下済みテキストへの再抽選を
- * 引けることになる（独立レビュー指摘。この repo では同一入力への判定が実行ごとに
- * 反転する実測がある → ledger: `independent-review-verdict-instability`）。
- * **だから AC はキーに含めない。** AC の改善自体は禁止しないが、それだけでは
- * 「作り直した」ことにならない。
+ * 関数名は既存 API と audit の用語を保つが、Task Contract 導入後は literal な
+ * 「Reviewer に見える全 field」ではない。`acceptanceCriteria` も implement prompt と Review へ
+ * 届く一方、既存 policy は material redesign に scope / allowedPaths の変更を要求する。
+ * AC の改善自体は禁止しないが、AC だけの書き換えを「作り直した」として再提出することは
+ * 認めない。この境界を変えると、Task Contract の追加だけで既存の再提出 policy が緩む。
  *
  * 空白・大小・宣言順の揺れは正規化する（`allowedPaths` は File Change Guard が集合として
  * 使うので順序に意味が無い）。

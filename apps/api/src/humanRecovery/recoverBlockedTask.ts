@@ -111,7 +111,7 @@ import {
  * （`pending` な採用済み Task すべてに当てはまる）、本変更が作ったものではない。
  *
  * **guard をここへ置いてはならない。** 一度「同一 `designTextHash` では1回だけ」を実装したが、
- * design text は description + allowedPaths 由来なので**訂正しなければ hash が変わらず**、
+ * design text は Task の固定契約から作るので**訂正しなければ hash が変わらず**、
  * 訂正には `pending`（= この関数）が要るため **deadlock になった**ので撤回した
  * （独立レビュー round 2）。
  *

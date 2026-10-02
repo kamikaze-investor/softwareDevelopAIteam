@@ -65,6 +65,7 @@ import {
   priorCriticProviders,
   recordRemediationFailure,
   runRemediationStep,
+  shortSpecKey,
   stageEntries,
   type PlRemediationDeps,
   type RemediationSubject,
@@ -385,18 +386,28 @@ export interface ConflictResolutionDeps {
 const PL_REVISION_MAX_TOKENS = 900
 
 /**
- * 同一 (frozen spec, finding) に対する再評価キー。
+ * 同一 (material spec, finding) に対する再評価キー。
  *
- * **これが「1回だけ」の根拠である。** 新しい counter table は作らず、既存 audit 行に
- * このキーを書いておき、存在すれば消費済みとする。
+ * canonical prompt の書式変更だけで Challenge 予算を復活させないため、prompt hash ではなく
+ * Remediation と同じ material-spec identity（scope + allowedPaths）を使う。新しい counter table は
+ * 作らず、既存 audit 行にこのキーを書いておき、存在すれば消費済みとする。
  */
-function challengeKey(designTextHash: string, findingSource: string): string {
+function challengeKey(subject: RemediationSubject, findingSource: string): string {
+  const specKey = shortSpecKey({
+    implementationScope: extractImplementationScope(subject.task.description) ?? '',
+    allowedPaths: subject.task.allowedPaths ?? [],
+  })
+  return `${specKey.slice(0, 12)}:${findingSource}`
+}
+
+/** Task Contract 導入前の audit 行が使っていた prompt-hash key。読み取り互換にだけ使う。 */
+function legacyChallengeKey(designTextHash: string, findingSource: string): string {
   return `${designTextHash.slice(0, 12)}:${findingSource}`
 }
 
-function challengeConsumed(storage: IStorage, taskId: string, key: string): boolean {
+function challengeConsumed(storage: IStorage, taskId: string, keys: readonly string[]): boolean {
   return stageEntries(storage, taskId, 'challenge')
-    .some((entry) => (entry.detail ?? '').includes(`chal=${key}`))
+    .some((entry) => keys.some((key) => (entry.detail ?? '').includes(`chal=${key}`)))
 }
 
 /** ledger 本文を読む（既存 parser をそのまま使う）。 */
@@ -455,10 +466,11 @@ async function runChallenge(
   deps: ConflictResolutionDeps,
 ): Promise<ConflictRoundResult> {
   const taskId = subject.task.id
-  const key = challengeKey(subject.reviewedDesignTextHash, dispute.source)
+  const key = challengeKey(subject, dispute.source)
+  const legacyKey = legacyChallengeKey(subject.reviewedDesignTextHash, dispute.source)
   const base = { stage: 'challenge' as const, taskId }
 
-  if (challengeConsumed(storage, taskId, key)) {
+  if (challengeConsumed(storage, taskId, [key, legacyKey])) {
     return {
       ...base,
       status: 'challenge_cap_reached',

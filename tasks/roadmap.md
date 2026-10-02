@@ -9047,8 +9047,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: 「採用したが allowedPaths 内で実装不能だった」
         件数を後から数えられること
 
-<!-- roadmap:id=implement-prompt-omits-allowed-paths-and-acceptance state=planned priority=high -->
-0. [ ] **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**
+<!-- roadmap:id=implement-prompt-omits-allowed-paths-and-acceptance state=done priority=high -->
+0. [x] **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**
       — 2026-10-02 登録（production 実測、CEO 指示）。`adoption-does-not-check-implementation-feasibility`
       （採用時に宣言する範囲の誤り）とは別の層で、**範囲は正しいのに実装 AI へ伝わっていない**問題である。
 

@@ -54,7 +54,8 @@ import {
 import { executeQueuedRun, toExecuteDesignReviewResult } from '../designReview/queuedRunDispatch'
 import { CHEAP_AI_PROPOSER_ID, requestText } from '../aiExplain/cheapAiClient'
 import { evaluateAndPersistImplementTimeoutSensors } from './implementTimeoutSensor'
-import { CLAUDE_IMPLEMENT_TIMEOUT_MS } from '@ai-team/shared'
+import { CLAUDE_IMPLEMENT_TIMEOUT_MS, type Task } from '@ai-team/shared'
+import { buildResumeAiCliPrompt } from '../implementPrompt'
 import {
   buildTriageEscalationBody,
   formatTriageAuditDetail,
@@ -1001,6 +1002,16 @@ function record(
 export const DEFAULT_RESUME_INSTRUCTION =
   '前回の実行は完了前に停止した。作業中の変更は保持したまま、同じ受入条件・同じ allowedPaths の範囲で続きを行うこと。'
 
+export function buildPlResumeAiCliPrompt(
+  task: Pick<
+    Task,
+    'title' | 'description' | 'acceptanceCriteria' | 'expectedOutputs' | 'allowedPaths' | 'forbiddenPaths'
+  >,
+  instruction: string = DEFAULT_RESUME_INSTRUCTION,
+): string {
+  return buildResumeAiCliPrompt(task, instruction)
+}
+
 /**
  * Gate へ渡す根拠を**システム側の観測**から組み立てる。
  *
@@ -1350,6 +1361,10 @@ async function executeAction(
     if (item.taskId === undefined) {
       return { ok: false, summary: 'attention has no taskId; cannot resume' }
     }
+    const task = storage.tasks.findById(item.taskId)
+    if (!task) {
+      return { ok: false, summary: 'task not found; cannot resume' }
+    }
     // **既存の正式操作をそのまま呼ぶ。** 新しい Recovery 機構は作らない。
     // `resumeBlockedTask()` 自身が fail-closed の門を持つ（quarantine / 有効な承認待ち /
     // queued・running の重複 / AI CLI の Design Review evidence）。ここで緩めない。
@@ -1357,7 +1372,7 @@ async function executeAction(
     // Approval Request** を発行する（STALE な旧 approval は再利用されない）。
     const resumed = storage.jobs.resumeBlockedTask({
       taskId: item.taskId,
-      instructionPrompt: deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION,
+      instructionPrompt: buildPlResumeAiCliPrompt(task, deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION),
     })
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
