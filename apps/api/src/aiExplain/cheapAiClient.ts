@@ -9,13 +9,14 @@ import { join, resolve } from 'node:path'
  *
  * AI CLI 呼び出しは `runOpenCodeCli` の1種類だけで、caller の種類で試行回数だけが変わる。
  *
- * | caller | 試行 | 1試行の期限 | caller から見た最悪待ち |
+ * | caller | 試行 | 1試行の期限 | CLI 起動後の最悪待ち |
  * | --- | --- | --- | --- |
  * | 説明・質問（approvalAi / taskFailureAi） | 1回 | `CHEAP_AI_ATTEMPT_TIMEOUT_MS` | `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` |
  * | PL 推論（`retryTransientOnce: true`） | 最大2回 | 同上 | `CHEAP_AI_RETRYING_MAX_WAIT_MS` |
  *
  * - **timeout**: 期限到達で AIteamOS がプロセスグループへ SIGTERM、`CHEAP_AI_KILL_GRACE_MS` 後に SIGKILL して
- *   close を待たずに決着する。1試行が `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` を超えて caller を待たせることはない。
+ *   close を待たずに決着する。CLI 起動後の1試行が `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` を超えることはない。
+ *   上限は CLI 起動から数える。プロセスごとに初回だけ行う隔離 dir の作成（`getIsolation()`）は含まない。
  * - **retry**: `retryTransientOnce` の caller に限り、`timeout` / `abnormal_termination` のときだけ
  *   `CHEAP_AI_RETRY_BACKOFF_MS` 待って新しいプロセスで1回だけ再試行する。それ以外（exit code != 0・stderr・
  *   不正出力・起動失敗・key 未設定・意図的な停止 signal）は再試行しない。説明系は HTTP の待ちを倍にしないため再試行しない。
@@ -47,10 +48,10 @@ export const CHEAP_AI_KILL_GRACE_MS = 5_000
 /** bounded retry の2回目を始める前の待ち。固定値（判定ロジックは足さない）。 */
 export const CHEAP_AI_RETRY_BACKOFF_MS = 3_000
 
-/** 1試行（説明・質問経路）が caller を待たせる上限。期限 + SIGKILL 昇格までの猶予。 */
+/** CLI 起動後の1試行（説明・質問経路）の上限。期限 + SIGKILL 昇格までの猶予。初回の隔離 dir 作成は含まない。 */
 export const CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS = CHEAP_AI_ATTEMPT_TIMEOUT_MS + CHEAP_AI_KILL_GRACE_MS
 
-/** `retryTransientOnce` の caller（PL 推論）を待たせる上限。2試行 + backoff。 */
+/** `retryTransientOnce` の caller（PL 推論）の CLI 起動後の上限。2試行 + backoff。初回の隔離 dir 作成は含まない。 */
 export const CHEAP_AI_RETRYING_MAX_WAIT_MS =
   CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS * 2 + CHEAP_AI_RETRY_BACKOFF_MS
 

@@ -7237,7 +7237,7 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    **新しい timeout 機構を作らない。**
 
    **完了（2026-10-02 promotion、Tier A Task `f7c4ff37` / Candidate `b71f2e08`）**: Task の AC 1〜5 を満たした。
-   `cheapAiClient.ts` に試行ごとの期限 `CHEAP_AI_ATTEMPT_TIMEOUT_MS` と caller 種別ごとの最悪待ち定数を置き、
+   `cheapAiClient.ts` に試行ごとの期限 `CHEAP_AI_ATTEMPT_TIMEOUT_MS` と caller 種別ごとの CLI 起動後の最悪待ち定数を置き、
    timeout / retry / fallback の契約を code comment に明記した（kill は既に自前 timer + SIGTERM→SIGKILL で、
    本文の `spawn({ timeout })` 依存は解消済みだった）。timeout は `requestTextResult()` が
    `{ ok: false, reason }` の構造化結果として**提供**する。AC は提供までで、caller への配線は求めていない
