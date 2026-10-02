@@ -303,6 +303,10 @@ export async function runRepairFlow(
   const repairPrompt = buildRepairPrompt({
     taskTitle: task.title,
     taskDescription: task.description,
+    acceptanceCriteria: task.acceptanceCriteria,
+    expectedOutputs: task.expectedOutputs,
+    allowedPaths: task.allowedPaths,
+    forbiddenPaths: task.forbiddenPaths,
     job: {
       exitCode: failedJob.exitCode,
       stderr: failedJob.stderr,
@@ -922,6 +926,10 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   const designText = buildRepairPrompt({
     taskTitle: task.title,
     taskDescription: task.description,
+    acceptanceCriteria: task.acceptanceCriteria,
+    expectedOutputs: task.expectedOutputs,
+    allowedPaths: task.allowedPaths,
+    forbiddenPaths: task.forbiddenPaths,
     job: {
       exitCode: failedJob.exitCode,
       stderr: failedJob.stderr,

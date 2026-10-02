@@ -3,6 +3,7 @@ import {
   loadEngineeringPrinciples,
   selectPrincipleSlugs,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
+import { buildTaskContract, type TaskContractSource } from '../implementPrompt'
 
 /**
  * Failure-aware Repair Prompt の構築（pure / deterministic）。
@@ -59,7 +60,7 @@ export interface RepairQaFacts {
   details?: string
 }
 
-export interface RepairPromptInput {
+export interface RepairPromptInput extends TaskContractSource {
   taskTitle: string
   taskDescription: string
   /** 直前の失敗Jobの事実。存在しない場合もある（review起因のみのとき）。 */
@@ -182,6 +183,8 @@ export function buildRepairPrompt(input: RepairPromptInput): string {
     '',
     '## Task内容',
     sanitizeUntrusted(input.taskDescription, 4_000),
+    '',
+    sanitizeUntrusted(buildTaskContract(input), 8_000),
     '',
     '## 指示',
     '直前の実行は失敗した。下記の失敗事実を踏まえ、原因を取り除く修正を行うこと。',
