@@ -8,8 +8,8 @@ import { join, resolve } from 'node:path'
  * ## latency / timeout 契約（cheap AI = OpenCode CLI の1経路だけ）
  *
  * AI CLI 呼び出しは `runOpenCodeCli` の1種類だけで、caller の種類で試行回数だけが変わる。
- * PL adoption proposals may select the dedicated JSON-only agent; every other caller keeps the
- * default OpenCode agent and the existing argument list.
+ * PL adoption proposal だけは JSON だけを返す専用 agent（`PL_ADOPTION_PROPOSAL_AGENT`）を `--agent` で選ぶ。
+ * それ以外の caller は OpenCode の既定 agent と従来どおりの引数のまま。
  *
  * | caller | 試行 | 1試行の期限 | CLI 起動後の最悪待ち |
  * | --- | --- | --- | --- |
