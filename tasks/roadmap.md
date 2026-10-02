@@ -9730,6 +9730,33 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 承認された resume review から git_commit が作られない件（`isAutomaticReviewJob` が `implement:*:review` 限定）
       - `repairFromStoredReview` の `resolveStoredReviewChain()` が resume review を受け付けない件
 
+<!-- roadmap:id=review-preflight-refusal-reaches-no-reimplementation state=planned priority=high -->
+0. [ ] **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**
+      — 2026-10-02 production 実測で登録（CEO 指示: 24時間自律運転の阻害要因）。
+      `resumed-review-changes-requested-reaches-no-repair`（verdict が `changes_requested` の場合）の
+      **隣接ケース**で、verdict が出る前に adapter が拒否する場合である。
+
+      **実測**: Task `463563d0`（`task-codex-review-cannot-read-repo`）。implement Job `6b6fcb4e` は success。
+      実装 AI が書いた `apps/worker/src/approvalLevel/repoContext.test.ts` に、secret 省略ロジックを試すための
+      ダミー（`password` + `= "x"` の形）があり、review Job `9e11e2e4` の prompt が既存 Secret Scan
+      （`isPromptSafe`、`packages/shared/src/types/ai_cli.ts`）に一致して `AiCliAdapter` が送信を拒否した。
+      Human Resume は最新 Job（失敗した review）を複製するだけなので、resume review `98798dad` も同じ理由で失敗した。
+      既存 repair flow は review の **verdict** を起点にするため、ここへは届かない。結果として Task は blocked のまま
+      唯一の running Project を占有し、PL の採用も止まった（formal abort で park して解消）。
+
+      **Secret Scan の fail-closed 自体は正しい**（本物の secret でないことを機械的に区別できない）。
+      問題は「実装側の修正で解消できる拒否」を実装へ戻す経路が無いことである。
+
+      **第一候補（最小変更）**: review Job の送信前拒否のうち、**原因が実装差分の内容にあるもの**（Secret Scan 一致）を
+      既存 repair flow へ渡す。拒否理由は untrusted data として repair prompt に入れ（既存の fence と sanitizer を使う）、
+      repair の admission / budget / allowedPaths / authority はそのまま適用する。
+      **新しい status / Gate / workflow / Remediation 工程は作らない。Secret Scan を弱めない・迂回しない。**
+
+      **着手時に確認すること**:
+      - 送信前拒否の種類（workingDir 外 / Secret Scan / その他）のうち、実装差分で解消できるものだけを対象にする
+      - repair 後の review でも同じ fixture を作り直さないよう、repair prompt に拒否パターンの種類（値ではなく）を示す
+      - 効果検証可能性: 「review 送信前拒否で blocked」になった件数と、repair で解消した件数を数えられること
+
 <!-- roadmap:id=answered-design-review-run-blocks-repair-admission state=done -->
 15. [x] **Human Resume で回答済みの repair Design Review run が「最新だから」という理由で repair admission を止め続ける（D3）** —
       2026-09-28 production 実測（Task `9fdee5a3`、run `d0af140a`）で登録し、同日修正。
