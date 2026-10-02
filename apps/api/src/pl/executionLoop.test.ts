@@ -902,6 +902,45 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(entityIds).not.toContain(`adopt:${waitingProjectId}`)
   })
 
+  it('CEO 判断待ち（Escalation 済み）の Project 自体へは、手が空いていても採用しない', async () => {
+    // 判断待ちの対象が完了済み Task に残っているため currentTask は無く、Project は running のまま。
+    // 採用先の除外（waitingProjectIds）が無ければ、この Project 自身へ採用してしまう。
+    const { storage, projectId, taskId } = seed()
+    storage.tasks.update(taskId, { status: 'done' })
+    storage.approvalRequests.create({
+      taskId,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: 'abc1234',
+      targetDiffHash: 'hash',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      status: 'WAITING_FOR_USER',
+      expiresAt: '2026-09-16T00:00:00.000Z',
+      invalidIf: [],
+      changedFiles: ['docs/notes.md'],
+      triggeredRules: ['git_commit requires CEO approval (policy)'],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    // 前提: running で手が空いている（currentTask 無し）Project に、CEO 判断待ちの attention が1件だけ
+    const state = buildSystemState(storage, { now: () => NOW })
+    expect(state.attention.map((a) => a.kind)).toEqual(['approval_waiting'])
+    expect(state.projects.find((p) => p.id === projectId)).toMatchObject({ status: 'running', currentTask: undefined })
+    let adoptCalls = 0
+    const d = deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => PROPOSAL,
+      adopt: async () => { adoptCalls += 1; return { ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' } },
+    })
+
+    const first = await runPlTick(storage, d)
+    expect(first.status).toBe('escalated')
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    expect(second.status).toBe('idle')
+    expect(adoptCalls).toBe(0)
+    expect(storage.auditLog.findAll().map((e) => e.entityId)).not.toContain(`adopt:${projectId}`)
+  })
+
   it('未 escalate の停滞は、別 Project の採用も従来どおり止める', async () => {
     // 判断待ちの除外は Escalation 済みに限る。まだ誰にも上げていない停滞が残るうちは、
     // どの Project にも新しい仕事を増やさない（既存の意図）。
