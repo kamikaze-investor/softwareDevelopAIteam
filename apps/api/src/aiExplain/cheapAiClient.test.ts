@@ -8,12 +8,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Task } from '@ai-team/shared'
 import { generateApprovalExplanation, type ApprovalAiContext } from '../approvalExplain/approvalAi'
 import {
+  CHEAP_AI_ATTEMPT_TIMEOUT_MS,
   CHEAP_AI_CONFIG,
   CHEAP_AI_KILL_GRACE_MS,
+  CHEAP_AI_RETRYING_MAX_WAIT_MS,
   CHEAP_AI_RETRY_BACKOFF_MS,
+  CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS,
   CheapAiAttemptError,
   parseJsonObject,
   requestText,
+  requestTextResult,
 } from './cheapAiClient'
 
 vi.mock('node:child_process', () => ({
@@ -577,6 +581,108 @@ describe('OpenCode supervisor and bounded recovery (retryTransientOnce)', () => 
     expect((await pending as Error).message).toBe('OpenCode CLI timed out after 60000ms')
     expect(spawnMock).toHaveBeenCalledTimes(1)
     expect(warnings).toEqual([])
+  })
+
+  it('SIGTERM を無視する子でも、説明経路は単一試行の上限ちょうどで settle する', async () => {
+    arrangeControlledChild()
+    spyOnProcessKill()
+
+    let settled = false
+    const pending = requestText('system', 'user', { apiKey: 'test-key' }, 100)
+      .catch((error: unknown) => error)
+      .finally(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(settled).toBe(true)
+    await pending
+  })
+
+  it('SIGTERM を無視する子が2回続いても、PL 推論は再試行込みの上限ちょうどで settle する', async () => {
+    arrangeControlledChild()
+    arrangeControlledChild()
+    spyOnProcessKill()
+
+    let settled = false
+    const pending = requestText('system', 'user', PL, 100)
+      .catch((error: unknown) => error)
+      .finally(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRYING_MAX_WAIT_MS - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(settled).toBe(true)
+    expect((await pending as Error).message).toBe('OpenCode CLI timed out after 60000ms (attempt 2/2; attempt 1: timeout)')
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('requestTextResult は timeout を throw せず reason: timeout の構造化結果で返す', async () => {
+    const only = arrangeControlledChild()
+    spyOnProcessKill({ [only.pid]: (signal) => only.close(null, signal) })
+
+    const pending = requestTextResult('system', 'user', { apiKey: 'test-key' }, 100)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_ATTEMPT_TIMEOUT_MS)
+    await expect(pending).resolves.toEqual({
+      ok: false,
+      reason: 'timeout',
+      message: 'OpenCode CLI timed out after 60000ms',
+    })
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('requestTextResult は再試行後の timeout も reason: timeout で返す', async () => {
+    const first = arrangeControlledChild()
+    const second = arrangeControlledChild()
+    spyOnProcessKill({
+      [first.pid]: (signal) => first.close(null, signal),
+      [second.pid]: (signal) => second.close(null, signal),
+    })
+
+    const pending = requestTextResult('system', 'user', PL, 100)
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_ATTEMPT_TIMEOUT_MS * 2 + CHEAP_AI_RETRY_BACKOFF_MS)
+    await expect(pending).resolves.toEqual({
+      ok: false,
+      reason: 'timeout',
+      message: 'OpenCode CLI timed out after 60000ms (attempt 2/2; attempt 1: timeout)',
+    })
+  })
+
+  it('requestTextResult は timeout 以外の失敗を timeout と取り違えない', async () => {
+    const only = arrangeControlledChild()
+    spyOnProcessKill()
+
+    const pending = requestTextResult('system', 'user', PL, 100)
+    await vi.advanceTimersByTimeAsync(0)
+    only.close(1, null, { stderr: 'quota exceeded' })
+    await expect(pending).resolves.toEqual({
+      ok: false,
+      reason: 'non_retryable',
+      message: 'OpenCode CLI failed with exit code 1: quota exceeded',
+    })
+  })
+
+  it('requestTextResult は key 未設定（CheapAiAttemptError 以外）を non_retryable で返し、起動しない', async () => {
+    const previous = process.env.OPENCODE_GO_API_KEY
+    delete process.env.OPENCODE_GO_API_KEY
+    try {
+      await expect(requestTextResult('system', 'user', { retryTransientOnce: true }, 100)).resolves.toEqual({
+        ok: false,
+        reason: 'non_retryable',
+        message: 'OPENCODE_GO_API_KEY is not configured',
+      })
+      expect(spawnMock).not.toHaveBeenCalled()
+    } finally {
+      if (previous !== undefined) process.env.OPENCODE_GO_API_KEY = previous
+    }
+  })
+
+  it('requestTextResult は成功時に text を返す', async () => {
+    const only = arrangeControlledChild()
+    spyOnProcessKill()
+
+    const pending = requestTextResult('system', 'user', { apiKey: 'test-key' }, 100)
+    await vi.advanceTimersByTimeAsync(0)
+    only.close(0, null, { stdout: TEXT_OK })
+    await expect(pending).resolves.toEqual({ ok: true, text: 'recovered answer' })
   })
 
   it('再試行の記録には prompt・key・provider stderr を載せない（試行番号と種類だけ）', async () => {

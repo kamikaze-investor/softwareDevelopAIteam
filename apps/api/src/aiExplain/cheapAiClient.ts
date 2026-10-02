@@ -4,11 +4,34 @@ import { chmod, mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+/**
+ * ## latency / timeout 契約（cheap AI = OpenCode CLI の1経路だけ）
+ *
+ * AI CLI 呼び出しは `runOpenCodeCli` の1種類だけで、caller の種類で試行回数だけが変わる。
+ *
+ * | caller | 試行 | 1試行の期限 | caller から見た最悪待ち |
+ * | --- | --- | --- | --- |
+ * | 説明・質問（approvalAi / taskFailureAi） | 1回 | `CHEAP_AI_ATTEMPT_TIMEOUT_MS` | `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` |
+ * | PL 推論（`retryTransientOnce: true`） | 最大2回 | 同上 | `CHEAP_AI_RETRYING_MAX_WAIT_MS` |
+ *
+ * - **timeout**: 期限到達で AIteamOS がプロセスグループへ SIGTERM、`CHEAP_AI_KILL_GRACE_MS` 後に SIGKILL して
+ *   close を待たずに決着する。1試行が `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` を超えて caller を待たせることはない。
+ * - **retry**: `retryTransientOnce` の caller に限り、`timeout` / `abnormal_termination` のときだけ
+ *   `CHEAP_AI_RETRY_BACKOFF_MS` 待って新しいプロセスで1回だけ再試行する。それ以外（exit code != 0・stderr・
+ *   不正出力・起動失敗・key 未設定・意図的な停止 signal）は再試行しない。説明系は HTTP の待ちを倍にしないため再試行しない。
+ * - **fallback**: 別 provider / 別 model への切り替えはしない（provider 抽象は本 client の責務外）。
+ *   失敗は `CheapAiAttemptError`（`kind` で理由を区別）として throw し、`requestTextResult` を使う caller には
+ *   `{ ok: false, reason }` の構造化結果として返す。CLI が遅い・使えないときに部分的な回答や推測で埋めない。
+ * - 期限 60 秒は暫定値であり、記録済みの実 latency（66〜74 秒）の分布に基づいて決めたものではない。
+ *   値を変えるときは本定数だけを変える（caller・テストは定数を参照する）。
+ */
+export const CHEAP_AI_ATTEMPT_TIMEOUT_MS = 60_000
+
 export const CHEAP_AI_CONFIG = {
   role: 'cheap_explainer',
   provider: 'opencode-go',
   model: 'mimo-v2.5',
-  timeoutMs: 60_000,
+  timeoutMs: CHEAP_AI_ATTEMPT_TIMEOUT_MS,
 } as const
 
 /** この経路の provider/model id。診断表示専用で、routing には使わない。 */
@@ -23,6 +46,13 @@ export const CHEAP_AI_KILL_GRACE_MS = 5_000
 
 /** bounded retry の2回目を始める前の待ち。固定値（判定ロジックは足さない）。 */
 export const CHEAP_AI_RETRY_BACKOFF_MS = 3_000
+
+/** 1試行（説明・質問経路）が caller を待たせる上限。期限 + SIGKILL 昇格までの猶予。 */
+export const CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS = CHEAP_AI_ATTEMPT_TIMEOUT_MS + CHEAP_AI_KILL_GRACE_MS
+
+/** `retryTransientOnce` の caller（PL 推論）を待たせる上限。2試行 + backoff。 */
+export const CHEAP_AI_RETRYING_MAX_WAIT_MS =
+  CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS * 2 + CHEAP_AI_RETRY_BACKOFF_MS
 
 /**
  * **明らかな異常終了**だけを表す signal。AIteamOS が送っていないのにこれで終わったときだけ、
@@ -83,6 +113,23 @@ export class CheapAiAttemptError extends Error {
   constructor(message: string, readonly kind: CheapAiAttemptFailureKind) {
     super(message)
     this.name = 'CheapAiAttemptError'
+  }
+}
+
+/**
+ * `requestText` の失敗を throw せずに返す構造化結果。`reason` は `CheapAiAttemptError.kind` と同じ値で、
+ * `CheapAiAttemptError` 以外（key 未設定・隔離 dir の作成失敗など）は `non_retryable` に寄せる。
+ * 再試行後の失敗は2回目の種類を `reason` にする（`message` に1回目の種類も残る）。
+ */
+export type CheapAiTextResult =
+  | { ok: true; text: string }
+  | { ok: false; reason: CheapAiAttemptFailureKind; message: string }
+
+export function toCheapAiFailure(error: unknown): Extract<CheapAiTextResult, { ok: false }> {
+  return {
+    ok: false,
+    reason: error instanceof CheapAiAttemptError ? error.kind : 'non_retryable',
+    message: error instanceof Error ? error.message : String(error),
   }
 }
 
@@ -215,7 +262,7 @@ async function runOpenCodeCli(
     isolation.workingDirectory,
     prompt,
   ]
-  const timeoutMessage = `OpenCode CLI timed out after ${CHEAP_AI_CONFIG.timeoutMs}ms`
+  const timeoutMessage = `OpenCode CLI timed out after ${CHEAP_AI_ATTEMPT_TIMEOUT_MS}ms`
 
   return await new Promise<string>((resolvePromise, rejectPromise) => {
     const child = spawn(cliEntrypoint, args, {
@@ -264,7 +311,7 @@ async function runOpenCodeCli(
         killTree('SIGKILL')
         fail(timeoutMessage, 'timeout')
       }, CHEAP_AI_KILL_GRACE_MS)
-    }, CHEAP_AI_CONFIG.timeoutMs)
+    }, CHEAP_AI_ATTEMPT_TIMEOUT_MS)
 
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
@@ -325,7 +372,21 @@ function isRetryable(error: unknown): error is CheapAiAttemptError {
 }
 
 function attemptKindOf(error: unknown): CheapAiAttemptFailureKind {
-  return error instanceof CheapAiAttemptError ? error.kind : 'non_retryable'
+  return toCheapAiFailure(error).reason
+}
+
+/** `requestText` と同じ試行・timeout・再試行で実行し、失敗を throw せず `CheapAiTextResult` で返す。 */
+export async function requestTextResult(
+  system: string,
+  userContent: string,
+  options: CheapAiRequestOptions,
+  maxTokens: number,
+): Promise<CheapAiTextResult> {
+  try {
+    return { ok: true, text: await requestText(system, userContent, options, maxTokens) }
+  } catch (error: unknown) {
+    return toCheapAiFailure(error)
+  }
 }
 
 export async function requestText(
