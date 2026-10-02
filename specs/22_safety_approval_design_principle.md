@@ -143,6 +143,33 @@ AI が絶対に間違えないことを前提にしない。代わりに次を�
 - workspace 汚染が別 Task へ伝播しない
 - 1 Task / 1 Project の停止が会社全体を止めない
 - 復旧不能になる前に fail closed する
+
+## 1-8. Technical Admin Capability — ADMIN API であることと CEO Decision Authority を分ける（2026-10-02 CEO 指示）
+
+**「ADMIN 権限が必要な API だから CEO 操作」としない。** ADMIN credential は「誰が呼べるか」の技術的な区分であり、
+「誰の責務の判断か」（1-1・1-2）とは別物である。
+
+純粋な Technical Decision の管理 Action は、AIteamOS が必要な Safety Evidence を揃えた場合、
+**人間の ADMIN token 操作なしで**実行できる方向へ寄せる。ただし:
+
+- **Worker / PL / model へ汎用 ADMIN token を渡さない。**
+  「AI に ADMIN token を持たせる」のではなく、**AI が証拠付きで限定 Action を要求し、信頼された既存 Policy 層が実行可否を決める**
+- 第一候補は **Action-specific capability + evidence verification** である:
+  ```
+  AI / PL が管理 Action を要求
+  → 既存 Policy / Gate が Decision Authority を分類（事実から機械的に。PL の自己申告では決めない。7 章）
+  → その Action に必要な Safety Evidence を検証
+  → 条件を満たした Technical Action だけを限定的に実行
+  ```
+- Capability は可能な限り **action 限定 / Task・Project 限定 / commit・diff 限定 / expiry 付き / one-shot / audit 必須 / fail-closed** にする
+- **新しい汎用 ADMIN subsystem を第一案にしない。** 既存の Approval Gate・`plActionPolicy`・`authorizePlAction()`・
+  risk classification・Design Review・Independent Review・Task Contract・workspace ownership / knownGood・
+  File Change Guard・audit・Worker credential separation の再利用を先に確認する
+- **Evidence による実行は「AI による承認」ではない。** 「AI の発言は人間承認として扱わない」
+  （`approval_rules.md` 最重要原則）は維持する。Evidence を満たした Action は、人間承認を偽装せず、
+  **決定的なコードが事実を検証した結果**として、承認とは別種の記録で audit に残す
+
+**1-2 の CEO Decision Authority は Technical Admin へ移さない。** Safety Evidence が揃っても CEO 判断を維持する。
 ---
 
 # 2. Safety は多層防御で作る
