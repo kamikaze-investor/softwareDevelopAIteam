@@ -8,6 +8,8 @@ import { join, resolve } from 'node:path'
  * ## latency / timeout 契約（cheap AI = OpenCode CLI の1経路だけ）
  *
  * AI CLI 呼び出しは `runOpenCodeCli` の1種類だけで、caller の種類で試行回数だけが変わる。
+ * PL adoption proposal だけは JSON だけを返す専用 agent（`PL_ADOPTION_PROPOSAL_AGENT`）を `--agent` で選ぶ。
+ * それ以外の caller は OpenCode の既定 agent と従来どおりの引数のまま。
  *
  * | caller | 試行 | 1試行の期限 | CLI 起動後の最悪待ち |
  * | --- | --- | --- | --- |
@@ -37,6 +39,13 @@ export const CHEAP_AI_CONFIG = {
 
 /** この経路の provider/model id。診断表示専用で、routing には使わない。 */
 export const CHEAP_AI_PROPOSER_ID = `${CHEAP_AI_CONFIG.provider}/${CHEAP_AI_CONFIG.model}`
+
+export const PL_ADOPTION_PROPOSAL_AGENT = 'pl-adoption-proposal' as const
+export const PL_ADOPTION_PROPOSAL_AGENT_PROMPT = [
+  'You answer with exactly one JSON object, as the request specifies, and nothing else.',
+  'You have no tools, no shell and no file access. Do not call tools, do not write tool-call markup,',
+  'do not try to inspect files or directories. Decide from the text you are given.',
+].join('\n')
 
 /**
  * timeout で止めた OpenCode が SIGTERM に応じないときに SIGKILL へ昇格させるまでの猶予。
@@ -77,6 +86,14 @@ const ABNORMAL_TERMINATION_SIGNALS: ReadonlySet<string> = new Set([
 const OPENCODE_PROJECT_CONFIG = {
   $schema: 'https://opencode.ai/config.json',
   permission: 'deny',
+  agent: {
+    [PL_ADOPTION_PROPOSAL_AGENT]: {
+      mode: 'primary',
+      description: 'JSON-only adoption proposer',
+      prompt: PL_ADOPTION_PROPOSAL_AGENT_PROMPT,
+      permission: { '*': 'deny' },
+    },
+  },
 } as const
 
 interface CheapAiIsolation {
@@ -96,6 +113,7 @@ let isolationPromise: Promise<CheapAiIsolation> | undefined
 export interface CheapAiRequestOptions {
   apiKey?: string
   mockResponse?: string
+  agent?: typeof PL_ADOPTION_PROPOSAL_AGENT
   /**
    * PL の provider 推論（Operator Request の回答・対象選択、自律 PL の診断・採用・修正案）だけが
    * true にする。1回目が **AIteamOS 自身の timeout** か **明らかな異常終了**で失敗したときに限り、
@@ -248,6 +266,7 @@ async function runOpenCodeCli(
   userContent: string,
   apiKey: string,
   maxTokens: number,
+  agent?: typeof PL_ADOPTION_PROPOSAL_AGENT,
 ): Promise<string> {
   const isolation = await getIsolation()
   const cliEntrypoint = resolveOpenCodeCliEntrypoint()
@@ -261,6 +280,7 @@ async function runOpenCodeCli(
     'json',
     '--dir',
     isolation.workingDirectory,
+    ...(agent === undefined ? [] : ['--agent', agent]),
     prompt,
   ]
   const timeoutMessage = `OpenCode CLI timed out after ${CHEAP_AI_ATTEMPT_TIMEOUT_MS}ms`
@@ -406,20 +426,20 @@ export async function requestText(
   }
 
   if (options.retryTransientOnce !== true) {
-    return await runOpenCodeCli(system, userContent, apiKey, maxTokens)
+    return await runOpenCodeCli(system, userContent, apiKey, maxTokens, options.agent)
   }
 
   // bounded recovery: 最大2回。記録するのは試行番号と失敗の種類だけ
   // （prompt・key・provider stderr はログにも audit にも新たに載せない）。
   try {
-    return await runOpenCodeCli(system, userContent, apiKey, maxTokens)
+    return await runOpenCodeCli(system, userContent, apiKey, maxTokens, options.agent)
   } catch (firstError: unknown) {
     if (!isRetryable(firstError)) throw firstError
     console.warn(`[cheapAi] attempt 1/2 failed (${firstError.kind}); retrying once with a fresh OpenCode process`)
     await new Promise((resolveDelay) => setTimeout(resolveDelay, CHEAP_AI_RETRY_BACKOFF_MS))
 
     try {
-      const text = await runOpenCodeCli(system, userContent, apiKey, maxTokens)
+      const text = await runOpenCodeCli(system, userContent, apiKey, maxTokens, options.agent)
       console.warn(`[cheapAi] attempt 2/2 succeeded (attempt 1: ${firstError.kind})`)
       return text
     } catch (secondError: unknown) {
