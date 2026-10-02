@@ -7174,14 +7174,19 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    `escalated` audit に残す。配達成否や通知例外に関係なく `escalated` 自体は必ず記録する。
    上記の採用停止は別の未達責務であり、直後の item へ分割した。
 
-<!-- roadmap:id=pl-adoption-stalled-by-escalated-attention state=planned priority=high -->
-0. [ ] **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**
+<!-- roadmap:id=pl-adoption-stalled-by-escalated-attention state=done priority=high -->
+0. [x] **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**
    — `pl-escalation-recorded-without-delivery` に混在していた未達責務の split（新機能ではない）。
    `runPlTick()` は `apps/api/src/pl/executionLoop.ts:1441-1447` で `hasEscalated()` 済みの対象を
    `actionable` から外す一方、`maybeAdoptNext()` は同ファイル `1738-1743` で除外前の
    `state.attention.length > 0` を見て即 return する。そのため CEO 判断待ちの1件が、関係のない
    Project の採用まで止める。未 escalate の停滞中に新しい仕事を増やさない既存意図は維持し、
    新しい recovery subsystem や TaskStatus を作らず、採用判定へ同じ除外を適用できるか確認する。
+
+   **完了（2026-10-02 promotion、Tier A Task `7458ea33` / Candidate `3926b97`）**: `runPlTick()` が
+   `actionable` の除外に使う `hasEscalated()` 判定を採用判定にも適用した。attention がすべて
+   Escalation 済みのときだけ `maybeAdoptNext()` を呼び、判断待ちの Project 自体は採用先から外す。
+   未 escalate の attention が1件でもあれば従来どおり採用しない。新しい subsystem・TaskStatus は無し。
 
 <!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=planned -->
 0. [ ] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。
