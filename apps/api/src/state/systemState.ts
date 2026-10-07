@@ -104,6 +104,33 @@ export interface AttentionItem {
   stuckForMs?: number
 }
 
+function attentionAuditKey(item: AttentionItem): string {
+  const subject = item.referenceId ?? item.jobId ?? item.taskId ?? item.projectId
+  return `${item.kind}:${subject}`
+}
+
+/**
+ * 対象単位の technical recovery budget が尽きたことを、既存 audit から投影する。
+ * Task 単位の resume cap は他の recovery action を止めないため、ここでは対象全体が
+ * terminal になった記録だけを見る。
+ */
+export function isAttentionTechnicalRecoveryExhausted(
+  storage: IStorage,
+  item: AttentionItem,
+): boolean {
+  return storage.auditLog
+    .findByEntity('pl_loop_target', attentionAuditKey(item))
+    .some((entry) => entry.operation === 'pl_loop' && entry.result === 'technical_exhausted')
+}
+
+function projectAttention(storage: IStorage, item: AttentionItem): AttentionItem {
+  if (!isAttentionTechnicalRecoveryExhausted(storage, item)) return item
+  return {
+    ...item,
+    detail: `${item.detail}; PL technical recovery budget is exhausted and no CEO decision was requested`,
+  }
+}
+
 export interface ProjectStateSummary {
   id: string
   name: string
@@ -611,6 +638,6 @@ export function buildSystemState(
       activeSupervisedRuns: storage.supervisedRuns.findActiveRuns().length,
     },
     projects,
-    attention,
+    attention: attention.map((item) => projectAttention(storage, item)),
   }
 }

@@ -101,6 +101,8 @@ export const BLOCKED_ROOT_CAUSE_CLASSES = [
   'design_review_stalled',
   /** attempt を使い切った run。再kickしても claim できない。 */
   'design_review_exhausted',
+  /** successful implement に対する post-implementation review Job 自体が failed。 */
+  'review_execution_failed',
   /** File Change Guard 違反。ただし allowedPaths を直せば通りうる範囲。 */
   'allowed_paths_mismatch',
   /** protected file だが Safety / Authority policy 本体ではない（runtime engine 等）。 */
@@ -733,6 +735,53 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           `Design Review run が ${review.status} のまま進んでいない`
           + `（attempt ${review.attemptCount}/${DESIGN_REVIEW_MAX_ATTEMPTS}）。`
           + '既存の bounded rekick が残っている。',
+      }
+    }
+  }
+
+  // ── 5.5 successful implement に対する post-implementation review の実行失敗 ──────
+  // **lineage だけでは Technical Recovery と判定しない。** failed review には、修復予算を
+  // 使い切った changes_requested / rejected と、credential-like な secret scan refusal も含まれる。
+  // それらを fresh reviewer へ掛け直すのは Decision Authority の迂回になる。
+  // Worker が保存した value-free refusal が「implementation-owned な generic assignment」と
+  // 機械判定した場合だけ、既存 `resumeBlockedTask()` による bounded な review 再実行へ渡す。
+  if (
+    facts.job?.status === 'failed'
+    && facts.job.aiCliMode === 'review'
+    && item.taskId !== undefined
+    && storage.tasks.findById(item.taskId)?.status === 'blocked'
+    && !hasLiveJob(facts)
+  ) {
+    const refusal = facts.job.failureMetadata?.refusal
+    const hasStoredReviewResult = storage.reviewResults
+      .findByTaskId(item.taskId)
+      .some((review) => review.jobId === facts.job?.id)
+    const implementId = /^implement:([^:]+):review$/.exec(facts.job.workflowStepKey ?? '')?.[1]
+    const implementJob = implementId !== undefined ? storage.jobs.findById(implementId) : undefined
+    if (
+      refusal?.kind === 'secret_scan'
+      && refusal.repairEligible === true
+      && !hasStoredReviewResult
+      && implementJob?.status === 'success'
+      && implementJob.aiCliMode === 'implement'
+      && implementJob.taskId === facts.job.taskId
+      && implementJob.projectId === facts.job.projectId
+    ) {
+      return {
+        ...result,
+        rootCauseClass: 'review_execution_failed',
+        blockingLayer: 'provider',
+        evidence: [
+          { fact: 'review_job.status', id: facts.job.id, value: 'failed' },
+          { fact: 'review_job.workflowStepKey', id: facts.job.id, value: facts.job.workflowStepKey ?? 'none' },
+          { fact: 'implementation_job.status', id: implementJob.id, value: 'success' },
+        ],
+        recoverable: true,
+        existingRecoveryAvailable: true,
+        confidence: 'high',
+        recommendedLane: 'auto_recovery',
+        summary: 'successful implement の post-implementation review 実行が失敗した。'
+          + '既存 resume は同じ Task Contract のまま review を再実行できる。',
       }
     }
   }
