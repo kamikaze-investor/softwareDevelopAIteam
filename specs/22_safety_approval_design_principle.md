@@ -443,6 +443,57 @@ CEO に毎回「このコード変更を承認しますか？」と聞くシス�
 各段階は**既存機能の改善だけで達成できるかを最初に確認し**、不要な新機能・Gate・workflow を追加しない。
 authority scope を広げる credential の付与は 1-5 により Human Decision Authority のまま残る。
 
+## 14-3. Priority 2 境界表（2026-10-07 CEO 承認）
+
+**区分**: A = Human Decision Authority（1-2）/ B = Technical Safety Decision / C = Mechanical Operation。
+**ADMIN credential が要ることは A を意味しない**（1-8）。**Risk Level は必要な Safety Evidence の強度を決め、
+誰が判断するかは Decision Authority が決める。** `ceo_required` は DA trigger からのみ導出し、
+Risk Level・HIGH/CRITICAL・Approval Level 3 だけを理由に CEO へ上げない。
+
+**DA trigger**（機械検出。1 件でも当たれば A 候補として CEO へ）:
+(1) Goal・Product・Policy 文書の変更 /
+(2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。
+強化と弱体化を機械判定できない間は fail closed /
+(3) 新しい外部 service・有償依存・公開範囲・公開 route /
+(4) 個人データ・保持・削除方針の変更 /
+(5) 不可逆（diff 本文で判定する destructive migration・データ削除）/
+(6) diff 内の secret 検出 /
+(7) Review verdict の不一致が未解消。
+
+| Action | 区分 | 自動実行条件（Safety Evidence） | CEO へ上げる条件 |
+|---|---|---|---|
+| Human Resume | B（instruction が Goal・scope を変えるときだけ A） | 原因が技術的で、Task Contract 内の instruction、既存 budget 内。Design Review 再実施と `resume_actor` audit を残す | instruction が scope・Goal を変える / DA trigger |
+| Repair admission | B | 既存 admission・lineage・budget・allowedPaths・authority。secret-scan 拒否は implementation-owned・eligible のときだけ（#324/#326） | DA trigger |
+| git_commit Approval | B（DA trigger のときだけ A） | Design Review ALIGNED / File Change Guard / SafeCommand test / post-review approved / mechanical gate・secret scan / `evaluateCommitGate()` / commit・diff hash 束縛 / Candidate branch 限定。Risk が高いほど review・isolation・backup・rollback の Evidence を強める | DA trigger 1〜7 |
+| Abort / Park | B（Roadmap item 自体を捨てるときだけ A） | 技術原因の復旧 budget 枯渇。item は `planned` のまま残る。Worker 観測（clean・同一 HEAD・最新 Job）と `task_aborted` audit | item を捨てる / Goal・Product・business scope の変更 / authority boundary の変更 / Safety boundary を弱めないと進めない |
+| Promotion PR | B（state 判定）+ C（apply・sync・check・push・PR） | exact Candidate SHA / clean 3-way apply / AC / `roadmap:check` / awaiting-promotion predicate。push・PR credential の付与は A（1 回） | 受入可否が Product 判断に依存する / DA trigger |
+| Independent Review | B | vendor 分離 / exact SHA / 不一致は fail-closed | 不一致が未解消（DA 7） |
+| CI | C | required checks 2 本 | なし |
+| Merge | B（DA trigger のときだけ A）。merge authority の付与は A（1 回） | exact reviewed SHA で required checks green / 同 SHA で independent review approved / branch up-to-date / step 1 と同一 diff | DA trigger 1〜7 / 未解消の blocking finding |
+| Production Deploy | 既存の service・公開範囲・authority・データ方針・コスト・Product の範囲内なら B+C。新しい公開・市場・課金・データ方針・authority 拡大・不可逆なデータ損失の事業的許容は A | 既存 deploy script の薄い orchestration: preflight → backup → 必要なら Production snapshot での rehearsal → exact reviewed SHA → deploy → health・invariant 検証 → post-deploy 観測 → 失敗時の自動 rollback。Evidence は blast radius・reversibility・data risk に応じて選び、全 Task に一律に要求しない | DA trigger 3〜5 |
+| Candidate Sync | C（deploy 成功後に自動） | 未決 approval 無し / Candidate 占有 Task 無し / tree = master / #315 lockfile 確認 / workspace clean / `roadmap:check` | なし（満たさなければ待機して再試行し、理由を記録） |
+
+**停止回数は CEO escalation 条件にしない。** 同じ Roadmap item が何度止まっても、それは技術的 escalation と
+Safety Evidence 強化の trigger である。技術的に難しいだけなら、何回失敗しても CEO に技術判断を求めない。
+
+**実例（Technical Recovery 条件が揃っていたのに ADMIN Human Resume 待ちになった）**:
+- `463563d0`（2026-10-02）
+- `b6d4097a` 1 回目（10-02 → 10-07、約 4.5 日。唯一の running Project を占有し続け、自律採用が全停止）
+- `b6d4097a` 2 回目（#326 deploy 後）
+
+いずれも CEO の判断内容は無く、credential の設計だけが待機を生んだ。
+
+**実装順序（各段階で既存機能の改善だけで足りるかを先に確認する）**:
+1. **P2-1** Technical Resume。PL の既存 `resume_task` を直す（`pl-resume-task-design-review-evidence-mismatch`）
+2. **P2-2** Technical Abort/Park。既存の `abort_task`・cleanup・観測を使う
+3. **P2-3** git_commit。`evaluateCommitGate()` 中心で、最終設計を CEO へ報告してから実装する
+4. **P2-4** Promotion・Review・CI・Merge
+5. **P2-5** Deploy と Candidate Sync
+
+**評価基準**: CEO 介入回数 / Technical Admin 待ち時間 / 人の介入なしで Production まで完了した Task 数 /
+連続無人稼働時間。Finding の消化数は主要 KPI にしない。最初の目標は、1 Task を採用から Production 反映・
+Candidate Sync・次の Task 採用まで完全無人で通すこと。
+
 ---
 
 # 15. 関連ドキュメント
