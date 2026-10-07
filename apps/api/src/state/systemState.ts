@@ -19,6 +19,7 @@ import { occupiesProject } from '@ai-team/shared'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
 import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
 
@@ -104,11 +105,6 @@ export interface AttentionItem {
   stuckForMs?: number
 }
 
-function attentionAuditKey(item: AttentionItem): string {
-  const subject = item.referenceId ?? item.jobId ?? item.taskId ?? item.projectId
-  return `${item.kind}:${subject}`
-}
-
 /**
  * 対象単位の technical recovery budget が尽きたことを、既存 audit から投影する。
  * Task 単位の resume cap は他の recovery action を止めないため、ここでは対象全体が
@@ -118,9 +114,7 @@ export function isAttentionTechnicalRecoveryExhausted(
   storage: IStorage,
   item: AttentionItem,
 ): boolean {
-  return storage.auditLog
-    .findByEntity('pl_loop_target', attentionAuditKey(item))
-    .some((entry) => entry.operation === 'pl_loop' && entry.result === 'technical_exhausted')
+  return isTechnicalRecoveryTargetExhausted(storage, item)
 }
 
 function projectAttention(storage: IStorage, item: AttentionItem): AttentionItem {

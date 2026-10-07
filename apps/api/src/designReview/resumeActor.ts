@@ -36,10 +36,14 @@ import type { FastifyRequest } from 'fastify'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import { getCredentialClass, type CredentialClass } from '../auth/credentialClass'
 import type { IStorage } from '../storage/interface'
+import {
+  RESUME_ACTOR_AUDIT_OPERATION,
+  TECHNICAL_RESUME_AUDIT_TOKEN,
+} from '../pl/technicalResumePolicy'
 import { RESUME_STEP_PREFIX, jobsSupersededByHumanResume, type ResumeActorClass } from './repairPolicy'
 
 /** resume actor を記録する audit operation 名。新 table は作らない。 */
-export const RESUME_ACTOR_OPERATION = 'resume_actor'
+export const RESUME_ACTOR_OPERATION = RESUME_ACTOR_AUDIT_OPERATION
 
 /** repair generation の確定を記録する audit operation 名。 */
 export const REPAIR_GENERATION_OPERATION = 'repair_generation'
@@ -156,7 +160,7 @@ export function recordResumeActor(
         `task_id=${input.taskId}`,
         `resume_actor=${input.actorClass}`,
         `authorization_evidence=${input.evidence}`,
-        input.technicalResume === true ? 'technical_resume' : undefined,
+        input.technicalResume === true ? TECHNICAL_RESUME_AUDIT_TOKEN : undefined,
       ].filter((token) => token !== undefined).join(' '),
     })
   })

@@ -217,6 +217,17 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
   /**
    * blocked な Task の再開。
    *
+   * ## PL Technical Resume boundary（`specs/22_safety_approval_design_principle.md` §14-3）
+   *
+   * PL が Human Gate なしで `resume_task` を選べるのは、保存済みの Task Contract を維持し、
+   * instruction が technical recovery だけを指示し、Rule 5.5 の機械的な eligible refusal を満たし、
+   * human action から数える per-Task cap 内にある場合だけである。実行時は Design Review を再実施し、
+   * `resume_actor=pl` を audit に残す。これは Technical Safety Decision であり、人の承認を追加しない。
+   *
+   * scope / Goal / Task Contract の変更、Design Review の CONFLICT 回答、repair / resume budget の reset、
+   * unknown または low-confidence の事実はこの境界に含めない。これらは Decision Authority の既存
+   * handoff を維持し、`resume_task` によって迂回しない。回数上限への到達だけを CEO 判断へ変換しない。
+   *
    * **`approval_gate` を up-front 要件から外した。** resume 自体は commit しない。
    * 行うのは「queued な Job を1つ作る」ことだけで、その Job が
    *   - `git_commit` なら `/gate/check` が**現在の diff に対して新しい Approval Request を発行**し、
