@@ -69,6 +69,7 @@ jobs:
           BASE_SHA:  ${{ github.event.pull_request.base.sha }}
           HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
           PR_TITLE:  ${{ github.event.pull_request.title }}
+          PR_BODY:   ${{ github.event.pull_request.body }}
           TASK_ID:   "pr-${{ github.event.pull_request.number }}"
           META_REVIEW_RESULT_PATH: ${{ github.workspace }}/meta-review-result.json
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}

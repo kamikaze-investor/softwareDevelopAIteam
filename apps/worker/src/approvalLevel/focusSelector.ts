@@ -78,6 +78,40 @@ export function mapFileToFocuses(file: string): MetaReviewFocus[] {
   return ['scope_simplicity']
 }
 
+export function hasDecisionAuthorityReviewFocus(files: readonly string[]): boolean {
+  return files.some((file) => isDecisionAuthoritySurface(normalizePath(file).toLowerCase()))
+}
+
+function isDecisionAuthoritySurface(file: string): boolean {
+  const basename = file.split('/').at(-1) ?? ''
+  return file === 'claude.md'
+    || file === 'agents.md'
+    || file === 'specs/00_constitution.md'
+    || file === 'docs/project_memory/goal.md'
+    || file === 'docs/project_memory/design_philosophy.md'
+    || file === 'packages/shared/src/types/agent.ts'
+    || file === 'apps/api/src/routes/permissiongrants.ts'
+    || file === 'packages/shared/src/types/permission_grant.ts'
+    || file === 'specs/08_permissions.md'
+    || file.startsWith('docs/meta_reviewer/')
+    || file.startsWith('apps/worker/src/metareviewer/')
+    || basename === 'package.json'
+    || file === 'pnpm-lock.yaml'
+    || file.startsWith('apps/api/src/pl/')
+    || file.startsWith('apps/api/src/designreview/resume')
+    || file.startsWith('apps/worker/src/approvallevel/')
+    || file.includes('/guards/')
+    || file === 'packages/shared/src/plactionpolicy.ts'
+    || file === 'apps/api/src/routes/tasks.ts'
+    || file === 'specs/22_safety_approval_design_principle.md'
+    || file.endsWith('/approval_rules.md')
+    || basename.includes('approvalgate')
+    || basename.includes('commitgate')
+    || basename.includes('gateclient')
+    || basename.includes('gatepolicy')
+    || basename.includes('gateprocessor')
+}
+
 function hasDesignSignal(files: readonly string[]): boolean {
   return files.some((file) => {
     const lower = file.toLowerCase()
