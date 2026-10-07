@@ -7,8 +7,10 @@ import type { IStorage } from '../storage/interface'
 import { buildSystemState } from '../state/systemState'
 import {
   PL_MAX_ATTEMPTS_PER_TARGET,
+  PL_MAX_TECHNICAL_RESUMES_PER_TASK,
   DEFAULT_RESUME_INSTRUCTION,
   buildPlResumeAiCliPrompt,
+  countPlTechnicalResumes,
   countPriorAttempts,
   extractProposedKind,
   isRecoveryTargetResolved,
@@ -90,6 +92,19 @@ function deps(over: Partial<PlLoopDeps> = {}): PlLoopDeps {
   }
 }
 
+function recordTargetAttempts(storage: IStorage, targetKey: string, count: number): void {
+  for (let attempt = 0; attempt < count; attempt += 1) {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: 'pl_loop',
+      entityType: 'pl_loop_target',
+      entityId: targetKey,
+      result: 'blocked',
+      detail: `seeded_attempt=${attempt + 1}`,
+    })
+  }
+}
+
 beforeEach(() => {
   resetPlLoopInFlightForTest()
 })
@@ -158,7 +173,7 @@ describe('runPlTick — Observe', () => {
 })
 
 describe('runPlTick — 停止した failed Job', () => {
-  it('停止した failed Job の technical attempts を bounded に止め、回数だけで CEO へ上げない', async () => {
+  it('原因不明の failed Job は2回の low-confidence triage 後も黙って止めず CEO へ上げる', async () => {
     const { storage } = seed()
     const task = storage.tasks.findByProjectId(storage.projects.findAll()[0]!.id)[0]!
     storage.jobs.create({
@@ -183,12 +198,15 @@ describe('runPlTick — 停止した failed Job', () => {
       expect(r.target?.kind).toBe('job_failed')
     }
 
-    // 3回目: technical budget が尽きているので診断も実行もせず止まる。
+    // 3回目: unknown は technical exhaustion と見なさず、既存 CEO handoff へ渡す。
     resetPlLoopInFlightForTest()
     const exhausted = await runPlTick(storage, d)
 
-    expect(exhausted.status).toBe('idle')
-    expect(escalations).toEqual([])
+    expect(exhausted.status).toBe('escalated')
+    expect(exhausted.triage?.rootCauseClass).toBe('unknown')
+    expect(escalations).toHaveLength(1)
+    expect(storage.auditLog.findByEntity('pl_loop_target', `job_failed:${storage.jobs.findByTaskId(task.id)[0]!.id}`)
+      .some((entry) => entry.result === 'technical_exhausted')).toBe(false)
   })
 })
 
@@ -776,7 +794,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
   })
 
   it('対象が残った technical recovery は試行上限で止まるが CEO へ上げない', async () => {
-    const { storage } = seedIdleDesignReview()
+    const { storage, taskId } = seedIdleDesignReview()
     const escalations: string[] = []
     const d = deps({
       // 「成功した」と言うだけで何もしない実行 → 対象は消えない
@@ -792,6 +810,19 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
     resetPlLoopInFlightForTest()
     expect((await runPlTick(storage, d)).status).toBe('idle')
     expect(escalations).toEqual([])
+
+    const exhaustionAudits = storage.auditLog
+      .findByEntity('pl_loop_target', `design_review_idle:${taskId}`)
+      .filter((entry) => entry.result === 'technical_exhausted')
+    expect(exhaustionAudits).toHaveLength(1)
+    expect(exhaustionAudits[0]?.detail).toContain('scope=target')
+
+    // attention は残るが、同じ exhaustion を tick ごとに書かない。
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, d)
+    expect(storage.auditLog
+      .findByEntity('pl_loop_target', `design_review_idle:${taskId}`)
+      .filter((entry) => entry.result === 'technical_exhausted')).toHaveLength(1)
   })
 })
 
@@ -1610,6 +1641,46 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     }),
   }
 
+  function createEligibleFailedPostReview(
+    storage: IStorage,
+    taskId: string,
+    projectId: string,
+    suffix: string,
+  ): string {
+    const implementation = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      workflowStepKey: `task:${taskId}:implement-${suffix}`,
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      aiCliProvider: 'codex',
+      aiCliMode: 'implement',
+      aiCliPrompt: `Implement ${suffix}.`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const refusal: JobRefusalMetadata = {
+      kind: 'secret_scan',
+      patternKinds: ['secret assignment'],
+      repairEligible: true,
+      repairEligibilityReason: 'implementation_report_generic_assignment',
+    }
+    const review = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'reviewer_ai',
+      status: 'failed',
+      workflowStepKey: `implement:${implementation.id}:review`,
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      aiCliProvider: 'codex',
+      aiCliMode: 'review',
+      aiCliPrompt: `Review ${suffix}.`,
+      exitCode: 1,
+      failureMetadata: { workspaceState: 'unchanged', refusal },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(taskId, { status: 'blocked' })
+    return review.id
+  }
+
   it('blocked reason と approval 状態を診断へ渡す', async () => {
     const { storage, taskId, projectId } = seed()
     const jobId = blockedCommitJob(storage, taskId, projectId)
@@ -1651,6 +1722,7 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       },
     } as Parameters<IStorage['jobs']['update']>[1])
     storage.tasks.update(taskId, { status: 'blocked' })
+    recordTargetAttempts(storage, `job_blocked:${job.id}`, PL_MAX_ATTEMPTS_PER_TARGET)
     let diagnosed = 0
     const escalations: string[] = []
 
@@ -1839,7 +1911,7 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
   })
 
-  it('b6d4097a shape reaches existing refusal repair through a PL Technical Resume', async () => {
+  it('eligible refusal reaches existing refusal repair through a PL Technical Resume', async () => {
     const { storage, taskId, projectId } = seed()
     storage.tasks.update(taskId, {
       status: 'blocked',
@@ -1858,6 +1930,12 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       changedFiles: ['apps/api/src/pl/executionLoop.ts'],
     } as Parameters<IStorage['jobs']['create']>[0])
     const originalReviewPrompt = 'Review the initial implementation.'
+    const refusal: JobRefusalMetadata = {
+      kind: 'secret_scan',
+      patternKinds: ['secret assignment'],
+      repairEligible: true,
+      repairEligibilityReason: 'implementation_report_generic_assignment',
+    }
     const failedReview = storage.jobs.create({
       taskId,
       projectId,
@@ -1869,7 +1947,8 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       aiCliMode: 'review',
       aiCliPrompt: originalReviewPrompt,
       exitCode: 1,
-      stderr: 'legacy prompt refusal without structured metadata',
+      stderr: 'Prompt refused by the pre-send secret scan',
+      failureMetadata: { workspaceState: 'unchanged', refusal },
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.designReviewEvidence.create({
       taskId,
@@ -1895,12 +1974,6 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(storage.auditLog.findByEntity('job', resumedReview!.id)
       .some((entry) => entry.result === 'human')).toBe(false)
 
-    const refusal: JobRefusalMetadata = {
-      kind: 'secret_scan',
-      patternKinds: ['secret assignment'],
-      repairEligible: true,
-      repairEligibilityReason: 'implementation_report_generic_assignment',
-    }
     storage.jobs.update(resumedReview!.id, {
       status: 'failed',
       exitCode: 1,
@@ -1918,6 +1991,92 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       expect(preparation.run.repairSourceJobId).toBe(implementJob.id)
       expect(preparation.stepKey).toBe(`repair:${implementJob.id}:1`)
     }
+  })
+
+  it('stored changes_requested remains a Decision Authority escalation after target attempts are exhausted', async () => {
+    const { storage, taskId, projectId } = seed()
+    const failedReviewId = createEligibleFailedPostReview(storage, taskId, projectId, 'conflicted')
+    storage.reviewResults.create({
+      taskId,
+      jobId: failedReviewId,
+      reviewer: 'reviewer_ai',
+      status: 'changes_requested',
+      summary: 'the implementation still conflicts with the accepted contract',
+      findings: [],
+    })
+    recordTargetAttempts(storage, `job_failed:${failedReviewId}`, PL_MAX_ATTEMPTS_PER_TARGET)
+    const escalations: string[] = []
+    let diagnosed = 0
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => {
+        diagnosed += 1
+        return JSON.stringify({ actionKind: 'resume_task', rationale: 'retry review', riskLevel: 'LOW' })
+      },
+      escalate: async (payload) => { escalations.push(payload.body); return DELIVERED },
+    }))
+
+    expect(result.status).toBe('escalated')
+    expect(result.triage?.rootCauseClass).toBe('unknown')
+    expect(diagnosed).toBe(0)
+    expect(escalations).toHaveLength(1)
+    expect(storage.jobs.findByTaskId(taskId)
+      .some((job) => job.workflowStepKey === `resume:${failedReviewId}:1`)).toBe(false)
+  })
+
+  it('bounds PL Technical Resumes across successor review Jobs for the same Task', async () => {
+    const { storage, taskId, projectId } = seed()
+    alignedEvidence(storage, taskId)
+    const d = deps({
+      diagnose: async () => JSON.stringify({
+        actionKind: 'resume_task',
+        rationale: 're-run eligible refused review',
+        riskLevel: 'LOW',
+      }),
+      coordinatorDeps: alignedCoordinatorDeps,
+    })
+
+    for (let attempt = 1; attempt <= PL_MAX_TECHNICAL_RESUMES_PER_TASK; attempt += 1) {
+      const failedReviewId = createEligibleFailedPostReview(
+        storage,
+        taskId,
+        projectId,
+        `successor-${attempt}`,
+      )
+      resetPlLoopInFlightForTest()
+      const result = await runPlTick(storage, d)
+      expect(result.status, JSON.stringify(result)).toBe('acted')
+      const successor = storage.jobs.findByTaskId(taskId)
+        .find((job) => job.workflowStepKey === `resume:${failedReviewId}:1`)
+      expect(successor).toBeDefined()
+      storage.jobs.update(successor!.id, { status: 'success' })
+    }
+
+    expect(countPlTechnicalResumes(storage, taskId)).toBe(PL_MAX_TECHNICAL_RESUMES_PER_TASK)
+    const finalFailedReviewId = createEligibleFailedPostReview(
+      storage,
+      taskId,
+      projectId,
+      'successor-exhausted',
+    )
+
+    resetPlLoopInFlightForTest()
+    const exhausted = await runPlTick(storage, d)
+
+    expect(exhausted.status).toBe('idle')
+    expect(storage.jobs.findByTaskId(taskId)
+      .some((job) => job.workflowStepKey === `resume:${finalFailedReviewId}:1`)).toBe(false)
+    const taskExhaustion = storage.auditLog
+      .findByEntity('pl_loop_target', `technical_resume_task:${taskId}`)
+      .filter((entry) => entry.result === 'technical_exhausted')
+    expect(taskExhaustion).toHaveLength(1)
+    expect(taskExhaustion[0]?.detail).toContain('scope=task')
+
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, d)
+    expect(storage.auditLog
+      .findByEntity('pl_loop_target', `technical_resume_task:${taskId}`)
+      .filter((entry) => entry.result === 'technical_exhausted')).toHaveLength(1)
   })
 
   it('[10] PL の resume は pl として記録され、human と同様の budget reset はしない', async () => {

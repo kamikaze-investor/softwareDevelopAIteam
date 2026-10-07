@@ -21,6 +21,7 @@ import {
 } from './executionLoop'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import type { JobRefusalMetadata, ReviewStatus } from '@ai-team/shared'
 
 /**
  * ここで固定しているのは次の2つである。
@@ -100,6 +101,61 @@ function providerTimeoutJob(
   } as Parameters<IStorage['jobs']['update']>[1])
   storage.tasks.update(taskId, { status: 'blocked' })
   return job.id
+}
+
+function failedPostImplementationReview(
+  storage: IStorage,
+  taskId: string,
+  projectId: string,
+  options: {
+    refusal?: JobRefusalMetadata
+    storedReviewStatus?: ReviewStatus
+  } = {},
+): AttentionItem {
+  const implementation = storage.jobs.create({
+    taskId,
+    projectId,
+    agentRole: 'developer_ai',
+    status: 'success',
+    workflowStepKey: `task:${taskId}:initial-implement`,
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliMode: 'implement',
+    aiCliPrompt: 'Implement the Task Contract.',
+  } as Parameters<IStorage['jobs']['create']>[0])
+  const review = storage.jobs.create({
+    taskId,
+    projectId,
+    agentRole: 'reviewer_ai',
+    status: 'failed',
+    workflowStepKey: `implement:${implementation.id}:review`,
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliMode: 'review',
+    aiCliPrompt: 'Review the implementation.',
+    ...(options.refusal !== undefined
+      ? { failureMetadata: { workspaceState: 'unchanged' as const, refusal: options.refusal } }
+      : {}),
+  } as Parameters<IStorage['jobs']['create']>[0])
+  if (options.storedReviewStatus !== undefined) {
+    storage.reviewResults.create({
+      taskId,
+      jobId: review.id,
+      reviewer: 'reviewer_ai',
+      status: options.storedReviewStatus,
+      summary: 'review returned a decision',
+      findings: [],
+    })
+  }
+  storage.tasks.update(taskId, { status: 'blocked' })
+  return attentionOf(storage, 'job_failed')
+}
+
+const ELIGIBLE_SECRET_SCAN_REFUSAL: JobRefusalMetadata = {
+  kind: 'secret_scan',
+  patternKinds: ['secret assignment'],
+  repairEligible: true,
+  repairEligibilityReason: 'implementation_report_generic_assignment',
 }
 
 /** 終端した task-kind Design Review。`decision` がそのまま `finalDecision` になる。 */
@@ -221,6 +277,62 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(diagnosis.rootCauseClass).toBe('provider_failure_workspace_dirty')
     expect(diagnosis.recommendedLane).toBe('ceo_escalation')
     expect(diagnosis.existingRecoveryAvailable).toBe(false)
+  })
+
+  it('1c. eligible な structured secret-scan refusal だけを review Technical Resume へ渡す', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId, {
+        refusal: ELIGIBLE_SECRET_SCAN_REFUSAL,
+      }),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('review_execution_failed')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+  })
+
+  it('1d. stored changes_requested がある failed review は Technical Resume しない', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId, {
+        refusal: ELIGIBLE_SECRET_SCAN_REFUSAL,
+        storedReviewStatus: 'changes_requested',
+      }),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('unknown')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
+  it('1e. non-eligible secret-scan refusal は Technical Resume しない', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId, {
+        refusal: {
+          kind: 'secret_scan',
+          patternKinds: ['GITHUB_TOKEN assignment'],
+          repairEligible: false,
+          repairEligibilityReason: 'credential_like_assignment',
+        },
+      }),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('unknown')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
+  it('1f. refusal metadata が無い failed review は Technical Resume しない', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('unknown')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
   })
 
   it('2. task-kind Design Review の CONFLICT は INDEPENDENT_REMEDIATION', () => {

@@ -740,13 +740,11 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   }
 
   // ── 5.5 successful implement に対する post-implementation review の実行失敗 ──────
-  // structured refusal metadata が導入される前の行でも、保存済み lineage から次の事実は確定できる:
-  //   - blocked Task の最新 Job が failed review
-  //   - `implement:<id>:review` が同じ Task / Project の successful implement を指す
-  //   - 競合する live Job は無い
-  // この形は既存 `resumeBlockedTask()` が review を bounded に再実行できる Technical Recovery である。
-  // protected/secret Guard、quarantine、Design Review CONFLICT は上の規則が先に処理するため、
-  // この分類でそれらを迂回しない。
+  // **lineage だけでは Technical Recovery と判定しない。** failed review には、修復予算を
+  // 使い切った changes_requested / rejected と、credential-like な secret scan refusal も含まれる。
+  // それらを fresh reviewer へ掛け直すのは Decision Authority の迂回になる。
+  // Worker が保存した value-free refusal が「implementation-owned な generic assignment」と
+  // 機械判定した場合だけ、既存 `resumeBlockedTask()` による bounded な review 再実行へ渡す。
   if (
     facts.job?.status === 'failed'
     && facts.job.aiCliMode === 'review'
@@ -754,10 +752,17 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     && storage.tasks.findById(item.taskId)?.status === 'blocked'
     && !hasLiveJob(facts)
   ) {
+    const refusal = facts.job.failureMetadata?.refusal
+    const hasStoredReviewResult = storage.reviewResults
+      .findByTaskId(item.taskId)
+      .some((review) => review.jobId === facts.job?.id)
     const implementId = /^implement:([^:]+):review$/.exec(facts.job.workflowStepKey ?? '')?.[1]
     const implementJob = implementId !== undefined ? storage.jobs.findById(implementId) : undefined
     if (
-      implementJob?.status === 'success'
+      refusal?.kind === 'secret_scan'
+      && refusal.repairEligible === true
+      && !hasStoredReviewResult
+      && implementJob?.status === 'success'
       && implementJob.aiCliMode === 'implement'
       && implementJob.taskId === facts.job.taskId
       && implementJob.projectId === facts.job.projectId

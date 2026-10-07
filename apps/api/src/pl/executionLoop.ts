@@ -25,8 +25,8 @@
  *
  * ## 無限自己修復ループを作らない
  *
- * 同じ対象に対する PL の試行回数は `audit_log` から数えて `PL_MAX_ATTEMPTS_PER_TARGET` で
- * 打ち切る。技術的な失敗回数だけでは CEO 判断を要求せず、既存 Triage が Decision Authority /
+ * 同じ対象に対する試行と、同じ Task に対する PL Technical Resume は `audit_log` から数え、
+ * それぞれの上限で打ち切る。技術的な失敗回数だけでは CEO 判断を要求せず、既存 Triage が Decision Authority /
  * unresolved review conflict と判定した場合だけ既存 handoff を使う。個々の操作の retry 上限
  * （`DESIGN_REVIEW_MAX_ATTEMPTS` 等）は既存機構が持っており、ここでは緩めない。
  *
@@ -101,8 +101,9 @@ import {
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
-import { recordResumeActor } from '../designReview/resumeActor'
+import { recordResumeActor, RESUME_ACTOR_OPERATION } from '../designReview/resumeActor'
 import { resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
+import { HUMAN_RECOVERY_AUDIT_OPERATION } from '../humanRecovery/recoveryAudit'
 import {
   runOperatorRequestStep,
   type OperatorRequestStepDeps,
@@ -119,6 +120,9 @@ import {
 
 /** 1つの対象に対して PL が試せる回数。超えたら技術的な再試行を止める。 */
 export const PL_MAX_ATTEMPTS_PER_TARGET = 2
+
+/** 1つの Task で human action を挟まずに PL が作れる Technical Resume の上限。 */
+export const PL_MAX_TECHNICAL_RESUMES_PER_TASK = 2
 
 /** 診断に使える時間。既存 cheap client の timeout と同じ桁に収める。 */
 export const PL_DIAGNOSIS_MAX_TOKENS = 700
@@ -415,14 +419,136 @@ function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
 
 /**
  * 技術的 recovery は budget で停止するが、回数だけを CEO decision に変換しない。
- * 保存済み事実が後から authority / unresolved review conflict を示せば、provider 診断の候補が
- * 無くなるため false へ戻り、既存 handoff は引き続き actionable になる。
+ * 保存済み事実が authority / unresolved review conflict / unknown を示す場合は exhaustion とせず、
+ * 既存 handoff を引き続き actionable にする。
  */
-function hasExhaustedTechnicalRecovery(storage: IStorage, item: AttentionItem): boolean {
-  if (countPriorAttempts(storage, targetKeyOf(item)) < PL_MAX_ATTEMPTS_PER_TARGET) return false
+interface TechnicalRecoveryExhaustion {
+  scope: 'target' | 'task'
+  auditKey: string
+  attempts: number
+  limit: number
+  diagnosis: BlockedDiagnosis
+}
+
+function auditDetailHasToken(detail: string | undefined, token: string): boolean {
+  return detail?.split(/\s+/).includes(token) === true
+}
+
+/**
+ * Task 単位の PL resume budget window。新しい state は持たず、既存 audit を新しい順に読む。
+ * 明示的な Human Resume / Human Recovery、または Task completion より前の行は数えない。
+ */
+function technicalResumeWindow(storage: IStorage, taskId: string): AuditLogEntry[] {
+  const completedAt = storage.taskContinuations.findByCompletedTaskId(taskId)?.createdAt
+  const entries: AuditLogEntry[] = []
+
+  for (const entry of storage.auditLog.findAll()) {
+    // 別 table 間で同一 millisecond の順序は証明できない。等しい行は安全側で現 window に残す。
+    if (completedAt !== undefined && entry.createdAt < completedAt) break
+
+    const isHumanRecovery = entry.operation === HUMAN_RECOVERY_AUDIT_OPERATION
+      && entry.entityType === 'task'
+      && entry.entityId === taskId
+      && entry.result === 'success'
+    const isHumanResume = entry.operation === RESUME_ACTOR_OPERATION
+      && entry.result === 'human'
+      && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
+      && auditDetailHasToken(entry.detail, 'authorization_evidence=admin_credential')
+    if (isHumanRecovery || isHumanResume) break
+
+    entries.push(entry)
+  }
+
+  return entries
+}
+
+export function countPlTechnicalResumes(storage: IStorage, taskId: string): number {
+  return technicalResumeWindow(storage, taskId).filter((entry) =>
+    entry.operation === RESUME_ACTOR_OPERATION
+    && entry.result === 'pl'
+    && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
+    && auditDetailHasToken(entry.detail, 'authorization_evidence=in_process_pl'),
+  ).length
+}
+
+function taskTechnicalResumeAuditKey(taskId: string): string {
+  return `technical_resume_task:${taskId}`
+}
+
+/**
+ * Budget で黙って止めてよいのは、保存済み事実が high-confidence の technical lane を示す場合だけ。
+ * unknown / low-confidence / Decision Authority はここで吸収せず、既存 CEO handoff を維持する。
+ */
+function technicalRecoveryExhaustion(
+  storage: IStorage,
+  item: AttentionItem,
+): TechnicalRecoveryExhaustion | undefined {
   const diagnosis = triageBlocked(storage, item)
+  if (diagnosis.recommendedLane !== 'auto_recovery' || diagnosis.confidence !== 'high') {
+    return undefined
+  }
+
+  const targetAttempts = countPriorAttempts(storage, targetKeyOf(item))
+  if (targetAttempts >= PL_MAX_ATTEMPTS_PER_TARGET) {
+    return {
+      scope: 'target',
+      auditKey: targetKeyOf(item),
+      attempts: targetAttempts,
+      limit: PL_MAX_ATTEMPTS_PER_TARGET,
+      diagnosis,
+    }
+  }
+
+  if (item.taskId === undefined) return undefined
   const allowed = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
-  return needsProviderDiagnosis(allowed)
+  if (!allowed.includes('resume_task')) return undefined
+
+  const taskAttempts = countPlTechnicalResumes(storage, item.taskId)
+  return taskAttempts >= PL_MAX_TECHNICAL_RESUMES_PER_TASK
+    ? {
+        scope: 'task',
+        auditKey: taskTechnicalResumeAuditKey(item.taskId),
+        attempts: taskAttempts,
+        limit: PL_MAX_TECHNICAL_RESUMES_PER_TASK,
+        diagnosis,
+      }
+    : undefined
+}
+
+function hasExhaustedTechnicalRecovery(storage: IStorage, item: AttentionItem): boolean {
+  return technicalRecoveryExhaustion(storage, item) !== undefined
+}
+
+/** Budget 到達を1回だけ既存 pl_loop audit に残す。 */
+function recordTechnicalRecoveryExhaustion(
+  storage: IStorage,
+  item: AttentionItem,
+  exhaustion: TechnicalRecoveryExhaustion,
+): void {
+  const prior = exhaustion.scope === 'task' && item.taskId !== undefined
+    ? technicalResumeWindow(storage, item.taskId)
+    : storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, exhaustion.auditKey)
+  if (prior.some((entry) =>
+    entry.operation === AUDIT_OPERATION
+    && entry.entityType === AUDIT_ENTITY_TYPE
+    && entry.entityId === exhaustion.auditKey
+    && entry.result === 'technical_exhausted')) return
+
+  storage.auditLog.record({
+    actor: 'api',
+    operation: AUDIT_OPERATION,
+    entityType: AUDIT_ENTITY_TYPE,
+    entityId: exhaustion.auditKey,
+    result: 'technical_exhausted',
+    detail: `${formatTriageAuditDetail(exhaustion.diagnosis)} scope=${exhaustion.scope} `
+      + `attempts=${exhaustion.attempts} limit=${exhaustion.limit} target=${targetKeyOf(item)}`,
+  })
+}
+
+function observeTechnicalRecoveryExhaustion(storage: IStorage, item: AttentionItem): void {
+  if (!ACTIONABLE_ATTENTION_KINDS.includes(item.kind) || !hasStalledLongEnough(item)) return
+  const exhaustion = technicalRecoveryExhaustion(storage, item)
+  if (exhaustion !== undefined) recordTechnicalRecoveryExhaustion(storage, item, exhaustion)
 }
 
 /**
@@ -723,12 +849,15 @@ async function actOnOperatorTarget(
   if (!item) {
     return { attempted: false, status: 'not_found', reason: 'the target is no longer an attention item' }
   }
+  observeTechnicalRecoveryExhaustion(storage, item)
   if (!isActionableNow(storage, item)) {
     const reason = !ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
       ? `the PL has no executor for ${item.kind}; it is only observed`
       : hasEscalated(storage, targetKeyOf(item)) && !isRemediableConflict(storage, item)
         ? 'already escalated to the CEO; the PL waits for the CEO decision'
-        : 'not stalled long enough yet; the PL will look at it automatically'
+        : hasExhaustedTechnicalRecovery(storage, item)
+          ? 'technical recovery budget exhausted; the PL will not resume this target'
+          : 'not stalled long enough yet; the PL will look at it automatically'
     return { attempted: false, status: 'not_eligible', reason }
   }
 
@@ -1371,8 +1500,8 @@ async function executeAction(
 
   if (kind === 'observe_state') {
     // 「待つ」。既存の復旧が進行中だと PL が判断した場合。何も実行しない。
-    // 状態が変わらなければ verification が `unchanged` になり、試行上限で Escalation へ倒れる
-    // ので、待ち続けて放置されることはない。
+    // 状態が変わらなければ verification が `unchanged` になり、technical budget 到達を
+    // `technical_exhausted` audit に残して以後の自動試行を止める。
     return { ok: true, summary: 'waiting: PL judged that an existing recovery is already in progress' }
   }
 
@@ -1400,8 +1529,8 @@ async function executeAction(
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }
-    // **この経路は定義上 AI である。** PL は in-process で動き HTTP credential を持たない
-    // ので、route 側の認証では区別できない。ここで `ai` と記録しておくことで、
+    // **この経路は定義上 PL である。** PL は in-process で動き HTTP credential を持たない
+    // ので、route 側の認証では区別できない。ここで `pl` と記録しておくことで、
     // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
     recordResumeActor(storage, {
       jobId: resumed.job.id,
@@ -1471,6 +1600,10 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
 
     // ── Observe ───────────────────────────────────────────────
     const before = buildSystemState(storage, deps.now ? { now: deps.now } : {})
+    // Budget 到達は候補から外す前に明示的な audit へ残す。writer 自身が window 内で dedup する。
+    for (const attention of before.attention) {
+      observeTechnicalRecoveryExhaustion(storage, attention)
+    }
     // **Escalation 済みの対象は選択段階で外す。**
     // production の初回 tick（2026-09-14）で判明: escalation は attempt として数えないため、
     // 選択段階で外さないと、既に CEO へ上げた対象に対して tick ごとに Diagnose（provider CLI 実行、
@@ -1574,16 +1707,33 @@ async function handleTarget(
 
   // ── 試行上限。技術的 recovery は止めるが、回数だけで CEO 判断へ変換しない ──────
   // Triage 自体が authority / unresolved review conflict を根拠に handoff を要求する場合は、
-  // 下の既存 `handOffOrEscalate()` がその根拠で処理する。provider 診断がまだ選択肢にある
-  // technical/unknown recovery だけを bounded に停止する。
-  if (attempt > PL_MAX_ATTEMPTS_PER_TARGET && needsProviderDiagnosis(allowedActions)) {
+  // 下の既存 `handOffOrEscalate()` がその根拠で処理する。high-confidence の technical recovery
+  // だけを bounded に停止し、unknown / low-confidence は下の handoff へ残す。
+  const exhaustion = technicalRecoveryExhaustion(storage, item)
+  if (exhaustion !== undefined) {
+    recordTechnicalRecoveryExhaustion(storage, item, exhaustion)
     return {
       status: 'idle',
       target,
       triage,
-      reason: 'technical recovery attempt budget exhausted; CEO decision was not requested by count',
+      reason: `${exhaustion.scope} technical recovery budget exhausted; CEO decision was not requested by count`,
       attempt,
     }
+  }
+
+  // `unknown` / low-confidence は technical exhaustion ではない。従来どおり、bounded な診断試行を
+  // 使い切ったら保存済みの ceo_escalation lane に渡し、証拠不足を黙って飲み込まない。
+  if (
+    attempt > PL_MAX_ATTEMPTS_PER_TARGET
+    && needsProviderDiagnosis(allowedActions)
+    && (
+      diagnosis.rootCauseClass === 'unknown'
+      || diagnosis.confidence === 'low'
+      || diagnosis.recommendedLane === 'ceo_escalation'
+    )
+  ) {
+    const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
+    return { status: handled.status, target, triage, reason: handled.reason, attempt }
   }
 
   if (!needsProviderDiagnosis(allowedActions)) {

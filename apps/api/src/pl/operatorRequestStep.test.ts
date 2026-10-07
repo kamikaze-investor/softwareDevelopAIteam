@@ -209,11 +209,11 @@ describe('runPlTick — Operator Request', () => {
       targetKey: `job_blocked:${jobId}`, attempted: true, status: 'acted', proposedKind: 'resume_task',
       verification: expect.any(String),
     })
-    // [7] 記録は既存 executor の実結果（resume Job が実際にでき、actor は ai）
+    // [7] 記録は既存 executor の実結果（resume Job が実際にでき、actor は pl）
     expect(saved.plAction?.executionSummary).toContain('resume queued job')
     const resumeJob = storage.jobs.findByTaskId(taskId).find((j) => j.workflowStepKey?.startsWith('resume:'))
     expect(resumeJob).toBeDefined()
-    expect(readResumeActorClasses(storage, storage.jobs.findByTaskId(taskId)).get(resumeJob!.id)).toBe('ai')
+    expect(readResumeActorClasses(storage, storage.jobs.findByTaskId(taskId)).get(resumeJob!.id)).toBe('pl')
     // 回答はシステム記録だけから作る
     expect(saved.response).toMatch(/^【システム記録】/)
     // [8] 診断に本文は入らず、DB 全体で operator_requests 以外に本文は現れない
@@ -367,7 +367,7 @@ describe('runPlTick — Operator Request', () => {
     })
   })
 
-  it('Escalation 済みの対象は依頼があっても扱わない（選択条件を緩めない）', async () => {
+  it('technical budget が尽きた対象は依頼があっても扱わない（選択条件を緩めない）', async () => {
     const jobId = blockedCommitJob()
     for (let i = 0; i < 3; i++) {
       resetPlLoopInFlightForTest()
@@ -382,7 +382,7 @@ describe('runPlTick — Operator Request', () => {
     expect(diagnoses).toHaveLength(0)
     const saved = storage.operatorRequests.findById(request.id)!
     expect(saved).toMatchObject({ disposition: 'declined', plAction: { attempted: false, status: 'not_eligible' } })
-    expect(saved.plAction?.reason).toContain('already escalated')
+    expect(saved.plAction?.reason).toContain('technical recovery budget exhausted')
   })
 
   // ── 外部へ返る内容 ────────────────────────────────────────
