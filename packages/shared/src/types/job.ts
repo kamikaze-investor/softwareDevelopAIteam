@@ -17,9 +17,51 @@ export interface JobGuardResult {
   fileViolations?: string[]
 }
 
+/** Value-free labels for the fixed prompt secret-scan patterns. */
+export type SecretScanPatternKind =
+  | 'ANTHROPIC_API_KEY assignment'
+  | 'CLAUDE_API_KEY assignment'
+  | 'GEMINI_API_KEY assignment'
+  | 'GITHUB_TOKEN assignment'
+  | 'private key header'
+  | 'RSA private key header'
+  | 'password assignment'
+  | 'secret assignment'
+
+export type RefusalRepairEligibilityReason =
+  | 'implementation_added_generic_assignment'
+  | 'not_post_implementation_review'
+  | 'non_generic_assignment_kind'
+  | 'credential_like_assignment'
+  | 'match_not_owned_by_implementation'
+  | 'match_origin_unclear'
+
+interface JobRefusalFacts {
+  kind: 'secret_scan'
+  /** Pattern categories only. Matched prompt text must never be persisted. */
+  patternKinds: SecretScanPatternKind[]
+}
+
+export type JobRefusalMetadata = JobRefusalFacts & (
+  | {
+      /** Computed by the Worker at refusal time. The API may never upgrade this value. */
+      repairEligible: true
+      repairEligibilityReason: 'implementation_added_generic_assignment'
+    }
+  | {
+      repairEligible: false
+      /** Value-free explanation for the mechanical eligibility decision. */
+      repairEligibilityReason: Exclude<
+        RefusalRepairEligibilityReason,
+        'implementation_added_generic_assignment'
+      >
+    }
+)
+
 export interface JobFailureMetadata {
   kind?: string
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
+  refusal?: JobRefusalMetadata
   /**
    * PR-C: クラッシュ復旧時にこの Job が quarantine されたか。
    * uptime: 復旧処理が workspace を「クリーン」と確認できず、
