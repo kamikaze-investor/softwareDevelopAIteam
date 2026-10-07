@@ -30,6 +30,7 @@ export type SecretScanPatternKind =
 
 export type RefusalRepairEligibilityReason =
   | 'implementation_added_generic_assignment'
+  | 'implementation_report_generic_assignment'
   | 'not_post_implementation_review'
   | 'non_generic_assignment_kind'
   | 'credential_like_assignment'
@@ -46,14 +47,17 @@ export type JobRefusalMetadata = JobRefusalFacts & (
   | {
       /** Computed by the Worker at refusal time. The API may never upgrade this value. */
       repairEligible: true
-      repairEligibilityReason: 'implementation_added_generic_assignment'
+      repairEligibilityReason:
+        | 'implementation_added_generic_assignment'
+        | 'implementation_report_generic_assignment'
     }
   | {
       repairEligible: false
       /** Value-free explanation for the mechanical eligibility decision. */
       repairEligibilityReason: Exclude<
         RefusalRepairEligibilityReason,
-        'implementation_added_generic_assignment'
+        | 'implementation_added_generic_assignment'
+        | 'implementation_report_generic_assignment'
       >
     }
 )

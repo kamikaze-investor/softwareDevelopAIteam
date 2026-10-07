@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { isPromptSafe } from '@ai-team/shared'
 import { buildRepairPrompt, REPAIR_PROMPT_MAX_STDERR_CHARS } from './repairPromptBuilder'
 
 /**
@@ -117,6 +118,24 @@ describe('buildRepairPrompt', () => {
     expect(prompt).toContain('changes_requested')
     expect(prompt).toContain('app/ui/Foo.tsx:42')
     expect(prompt).toContain('no_business_logic_in_ui')
+  })
+
+  it('secret_scan refusalでは結果報告にsecret-shaped notationを書かないようvalue-freeに指示する', () => {
+    const prompt = buildRepairPrompt({
+      ...BASE,
+      reviewRefusal: {
+        kind: 'secret_scan',
+        patternKinds: ['secret assignment'],
+        repairEligible: true,
+        repairEligibilityReason: 'implementation_report_generic_assignment',
+      },
+    })
+
+    expect(prompt).toContain('"password" または "secret" というラベル')
+    expect(prompt).toContain('コロンや等号と値を続ける secret-shaped notation を書かないこと')
+    expect(isPromptSafe(prompt)).toBe(true)
+    expect(prompt.indexOf('secret-shaped notation'))
+      .toBeLessThan(prompt.indexOf('<<<UNTRUSTED_FAILURE_DATA>>>'))
   })
 
   it('QA失敗情報が含まれる', () => {
