@@ -61,6 +61,7 @@ import {
   recoveryReleasesProjectSlot,
 } from '../humanRecovery/recoveryAudit'
 import { countRemediationAttempts, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import { findTechnicalResumeImplementation } from './technicalResumePolicy'
 import {
   predictHumanRecoveryDriver,
   type HumanRecoveryNextDriver,
@@ -745,28 +746,9 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // それらを fresh reviewer へ掛け直すのは Decision Authority の迂回になる。
   // Worker が保存した value-free refusal が「implementation-owned な generic assignment」と
   // 機械判定した場合だけ、既存 `resumeBlockedTask()` による bounded な review 再実行へ渡す。
-  if (
-    facts.job?.status === 'failed'
-    && facts.job.aiCliMode === 'review'
-    && item.taskId !== undefined
-    && storage.tasks.findById(item.taskId)?.status === 'blocked'
-    && !hasLiveJob(facts)
-  ) {
-    const refusal = facts.job.failureMetadata?.refusal
-    const hasStoredReviewResult = storage.reviewResults
-      .findByTaskId(item.taskId)
-      .some((review) => review.jobId === facts.job?.id)
-    const implementId = /^implement:([^:]+):review$/.exec(facts.job.workflowStepKey ?? '')?.[1]
-    const implementJob = implementId !== undefined ? storage.jobs.findById(implementId) : undefined
-    if (
-      refusal?.kind === 'secret_scan'
-      && refusal.repairEligible === true
-      && !hasStoredReviewResult
-      && implementJob?.status === 'success'
-      && implementJob.aiCliMode === 'implement'
-      && implementJob.taskId === facts.job.taskId
-      && implementJob.projectId === facts.job.projectId
-    ) {
+  if (facts.job !== undefined && item.taskId !== undefined) {
+    const implementJob = findTechnicalResumeImplementation(storage, item.taskId, facts.job)
+    if (implementJob !== undefined) {
       return {
         ...result,
         rootCauseClass: 'review_execution_failed',

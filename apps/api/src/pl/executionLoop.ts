@@ -102,9 +102,15 @@ import {
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
-import { recordResumeActor, RESUME_ACTOR_OPERATION } from '../designReview/resumeActor'
+import { recordResumeActor } from '../designReview/resumeActor'
 import { resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
-import { HUMAN_RECOVERY_AUDIT_OPERATION } from '../humanRecovery/recoveryAudit'
+import {
+  countPlTechnicalResumes,
+  PL_MAX_TECHNICAL_RESUMES_PER_TASK,
+  taskTechnicalResumeAuditKey,
+  technicalRecoveryTargetKey,
+  technicalResumeBudget,
+} from './technicalResumePolicy'
 import {
   runOperatorRequestStep,
   type OperatorRequestStepDeps,
@@ -122,8 +128,7 @@ import {
 /** 1つの対象に対して PL が試せる回数。超えたら技術的な再試行を止める。 */
 export const PL_MAX_ATTEMPTS_PER_TARGET = 2
 
-/** 1つの Task で human action を挟まずに PL が作れる Rule 5.5 Technical Resume の上限。 */
-export const PL_MAX_TECHNICAL_RESUMES_PER_TASK = 2
+export { countPlTechnicalResumes, PL_MAX_TECHNICAL_RESUMES_PER_TASK } from './technicalResumePolicy'
 
 /** 診断に使える時間。既存 cheap client の timeout と同じ桁に収める。 */
 export const PL_DIAGNOSIS_MAX_TOKENS = 700
@@ -381,8 +386,7 @@ function targetKeyOf(item: AttentionItem): string {
   // 対象の同一性は「どの attention がどの実体に出ているか」で決まる。
   // `referenceId`（例: approval request id）があればそれを優先する。無いと
   // 「同じ Task の2回目の承認待ち」を1回目と同一視し、通知の重複排除が効きすぎる。
-  const subject = item.referenceId ?? item.jobId ?? item.taskId ?? item.projectId
-  return `${item.kind}:${subject}`
+  return technicalRecoveryTargetKey(item)
 }
 
 /**
@@ -431,57 +435,6 @@ interface TechnicalRecoveryExhaustion {
   diagnosis: BlockedDiagnosis
 }
 
-function auditDetailHasToken(detail: string | undefined, token: string): boolean {
-  return detail?.split(/\s+/).includes(token) === true
-}
-
-/**
- * Task 単位の PL resume budget window。新しい state は持たず、既存 audit を新しい順に読む。
- * 明示的な Human Resume / Human Recovery、または Task completion より前の行は数えない。
- */
-function technicalResumeWindow(storage: IStorage, taskId: string): AuditLogEntry[] {
-  const completedAt = storage.taskContinuations.findByCompletedTaskId(taskId)?.createdAt
-  const taskEntries = storage.auditLog.findByEntity('task', taskId)
-  const jobEntries = storage.jobs.findByTaskId(taskId)
-    .flatMap((job) => storage.auditLog.findByEntity('job', job.id))
-  const humanBoundary = [...taskEntries, ...jobEntries]
-    .filter((entry) => (
-      entry.operation === HUMAN_RECOVERY_AUDIT_OPERATION
-      && entry.result === 'success'
-    ) || (
-      entry.operation === RESUME_ACTOR_OPERATION
-      && entry.result === 'human'
-      && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
-      && auditDetailHasToken(entry.detail, 'authorization_evidence=admin_credential')
-    ))
-    .map((entry) => entry.createdAt)
-    .sort()
-    .pop()
-  const boundary = [completedAt, humanBoundary]
-    .filter((value): value is string => value !== undefined)
-    .sort()
-    .pop()
-
-  // 別 table 間で同一 millisecond の順序は証明できない。等しい行は安全側で現 window に残す。
-  return jobEntries
-    .filter((entry) => boundary === undefined || entry.createdAt >= boundary)
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-}
-
-export function countPlTechnicalResumes(storage: IStorage, taskId: string): number {
-  return technicalResumeWindow(storage, taskId).filter((entry) =>
-    entry.operation === RESUME_ACTOR_OPERATION
-    && entry.result === 'pl'
-    && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
-    && auditDetailHasToken(entry.detail, 'authorization_evidence=in_process_pl')
-    && auditDetailHasToken(entry.detail, 'technical_resume'),
-  ).length
-}
-
-function taskTechnicalResumeAuditKey(taskId: string): string {
-  return `technical_resume_task:${taskId}`
-}
-
 /**
  * Budget で黙って止めてよいのは、保存済み事実が high-confidence の technical lane を示す場合だけ。
  * unknown / low-confidence / Decision Authority はここで吸収せず、既存 CEO handoff を維持する。
@@ -510,13 +463,13 @@ function technicalRecoveryExhaustion(
   const allowed = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
   if (!allowed.includes('resume_task')) return undefined
 
-  const taskAttempts = countPlTechnicalResumes(storage, item.taskId)
-  return taskAttempts >= PL_MAX_TECHNICAL_RESUMES_PER_TASK
+  const taskBudget = technicalResumeBudget(storage, item.taskId)
+  return taskBudget.exhausted
     ? {
         scope: 'task',
         auditKey: taskTechnicalResumeAuditKey(item.taskId),
-        attempts: taskAttempts,
-        limit: PL_MAX_TECHNICAL_RESUMES_PER_TASK,
+        attempts: taskBudget.attempts,
+        limit: taskBudget.limit,
         diagnosis,
       }
     : undefined
