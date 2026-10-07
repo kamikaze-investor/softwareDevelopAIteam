@@ -145,6 +145,50 @@ describe('POST /api/gate/check — git_commit Safety Evidence（Stage 1）', () 
     }
   })
 
+  it('別 diff に対する過去の REJECTED は Evidence 成立を妨げず、応答にも載らない', async () => {
+    const dir = initRepoWithChange()
+    const { app, storage } = await buildApp(dir)
+    try {
+      const chain = seedChain(storage, dir, { designReview: true })
+      const earlier = storage.approvalRequests.create({
+        taskId: chain.taskId, targetBranch: 'main', targetCommit: chain.targetCommit,
+        targetDiffHash: 'an-earlier-diff', riskLevel: 'LOW', requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(), invalidIf: [],
+      } as Parameters<IStorage['approvalRequests']['create']>[0])
+      storage.approvalRequests.recordDecision(earlier.id, 'REJECTED', 'earlier diff')
+
+      const body = await gateCheck(app, chain)
+      expect(body.outcome.decision).toBe('ALLOW')
+      expect(body.nextAction.action).toBe('proceed')
+      expect(body.approvalRequest).toBeUndefined()
+      expect(storage.approvalRequests.findById(earlier.id)?.status).toBe('REJECTED')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('同じ diff に対する REJECTED があれば、Evidence では通さず REJECTED のまま返す', async () => {
+    const dir = initRepoWithChange()
+    const { app, storage } = await buildApp(dir)
+    try {
+      const chain = seedChain(storage, dir, { designReview: true })
+      const same = storage.approvalRequests.create({
+        taskId: chain.taskId, targetBranch: 'main', targetCommit: chain.targetCommit,
+        targetDiffHash: chain.targetDiffHash, riskLevel: 'LOW', requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 60_000).toISOString(), invalidIf: [],
+      } as Parameters<IStorage['approvalRequests']['create']>[0])
+      storage.approvalRequests.recordDecision(same.id, 'REJECTED', 'same diff')
+
+      const body = await gateCheck(app, chain)
+      expect(body.outcome.decision).toBe('REJECTED')
+      expect(body.approvalRequest?.id).toBe(same.id)
+      const audit = storage.auditLog.findByEntity('job', chain.gitCommitJob.id)
+      expect(audit.find((a) => a.operation === 'git_commit_safety_evidence')?.detail).toContain('same_diff_rejected')
+    } finally {
+      await app.close()
+    }
+  })
+
   it('Evidence が 1 つでも欠ければ、従来どおり Job に結び付いた人間承認へ fail closed する', async () => {
     const dir = initRepoWithChange()
     const { app, storage } = await buildApp(dir)

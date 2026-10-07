@@ -325,6 +325,11 @@ describe('runRiskReview — Safety policy の正本 docs と Gate 実装（既�
     'packages/shared/src/approvalLevelClassifier.ts',
     'apps/api/src/approvalExplain/diffReader.ts',
     'apps/api/src/approvalExplain/changeManifestReader.ts',
+    // Evidence が判定に使う lineage / Design Review / Candidate workspace（独立レビュー A-1）
+    'apps/api/src/designReview/repairFlow.ts',
+    'apps/api/src/designReview/repairPolicy.ts',
+    'apps/api/src/designReviewEvidencePolicy.ts',
+    'apps/api/src/config/targetWorkingDir.ts',
   ])('%s は HIGH になる', (path) => {
     expect(runRiskReview([path]).riskLevel).toBe('HIGH')
   })

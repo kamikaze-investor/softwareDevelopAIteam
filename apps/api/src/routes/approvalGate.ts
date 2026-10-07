@@ -648,7 +648,9 @@ export async function approvalGateRoutes(
     })
 
     // storage 副作用
-    let approvalRequest: ApprovalRequest | undefined = existingReq
+    // Evidence が成立した git_commit は ApprovalRequest を一切使わない。探索で拾った
+    // 別 diff の REJECTED 等を応答に載せると「ALLOW なのに REJECTED が付く」不整合になるので載せない。
+    let approvalRequest: ApprovalRequest | undefined = gitCommitEvidenceVerified ? undefined : existingReq
     let newRequestId: string | undefined
 
     // ApprovalRequest / gate_evaluations に残す git_commit の判定理由ラベル

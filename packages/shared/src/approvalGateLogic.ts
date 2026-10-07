@@ -36,7 +36,9 @@ export const RISK_RULES: RiskRule[] = [
   { label: 'CI/CD workflow change',      pattern: /\.github\//i,                              level: 'HIGH' },
   // 2026-10-02: git_commit の Safety Evidence 判定（Stage 1）と PL の authority 判定の実装も同じ扱い。
   // ここを LOW / MEDIUM に落とすと、Gate 自身を弱める変更を Evidence だけで commit できてしまう。
-  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)/i, level: 'HIGH' },
+  // git_commit Evidence が判定に使う lineage / Design Review / Candidate workspace の実装
+  // （repairFlow・repairPolicy・designReviewEvidencePolicy・targetWorkingDir）も含める（独立レビュー A-1）。
+  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir/i, level: 'HIGH' },
   // 2026-10-02: Decision Authority / Safety policy の正本 docs。docs/ 配下は SAFE_ONLY で LOW に
   // 落ちるため、下の SAFE_ONLY 早期リターンより先に評価する（NEVER_SAFE_ONLY_RULES）。
   { label: 'decision authority / safety policy doc', pattern: /(^|\/)specs\/(00_constitution|08_permissions|22_safety_approval_design_principle)\.md$|(^|\/)docs\/project_memory\/(goal|design_philosophy)\.md$|(^|\/)docs\/project_memory\/rules\/approval_rules\.md$|(^|\/)docs\/multi_ai_step_review_flow\.md$/i, level: 'HIGH' },
