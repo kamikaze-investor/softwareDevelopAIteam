@@ -51,10 +51,11 @@ export interface RepairFailureFacts {
  * 「誰が再開してよいと判断したか」は別の事実（authority fact）であり、
  * server 側で credential から導く。caller の自己申告は入力にしない。
  *
- * `unknown` は「human かもしれない」ではなく「human と証明できていない」である。
- * したがって `ai` と同じ扱い（generation を跨がない）にする。
+ * `pl` は既存 Policy と Design Review evidence を通った in-process Technical Resume である。
+ * Human Resume ではなく、repair generation を跨がない。`unknown` も「human かもしれない」
+ * ではなく「human と証明できていない」なので、`ai` / `pl` と同じく generation を跨がない。
  */
-export type ResumeActorClass = 'human' | 'ai' | 'unknown'
+export type ResumeActorClass = 'human' | 'pl' | 'ai' | 'unknown'
 
 export interface PriorRepairJob {
   /**
@@ -140,7 +141,7 @@ export interface RepairGeneration {
   depth: number
   /** `rootKind === 'human_resume'` のときだけ入る。 */
   previousGenerationRoot?: string
-  /** 途中で AI / unknown の resume を跨いだか。跨いでも予算は再発行されない。 */
+  /** 途中で PL / AI / unknown の resume を跨いだか。跨いでも予算は再発行されない。 */
   crossedAiResume: boolean
   /** 予算が再発行されたか（= 新しい generation が始まったか）。 */
   budgetReset: boolean
@@ -386,7 +387,7 @@ export type GenerationWalk =
  *   2. **深さを数える範囲だけが generation で切れる。** 数え終わりは
  *      repair でも resume でもない Job か、**human と証明された resume Job** である。
  *
- * AI / unknown の resume は数え終わりにしない。前の generation の深さを引き継ぐ。
+ * PL / AI / unknown の resume は数え終わりにしない。前の generation の深さを引き継ぐ。
  * これをしないと「repair 使い切り → AI resume → 予算復活」を AI 自身が繰り返せる。
  *
  * 1 と 2 を分けているのは、human resume の意味が「**上流の履歴を跨いで**やり直す」だから
@@ -558,7 +559,7 @@ export function walkRepairGeneration(
  *
  * Job X を superseded とするのは、次をすべて満たす Job S があるときだけ:
  *   - S の stepKey が `resume:<X>:<n>`（既存 `parseResumeSource()`。形が違えば対象外）
- *   - S の actor が `human`（`unknown` / `ai` は対象外。記録が無いことを human と解釈しない）
+ *   - S の actor が `human`（`unknown` / `pl` / `ai` は対象外。記録が無いことを human と解釈しない）
  *   - S から辿る lineage 全体が well-formed（既存 `walkRepairGeneration()` が ok。
  *     X の実在・同一 Task・非環はそちらの責務）
  *

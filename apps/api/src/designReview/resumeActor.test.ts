@@ -67,6 +67,17 @@ describe('[12][13] resumeActorClassFromAudit — 記録が無い / 矛盾する�
     expect(resumeActorClassFromAudit([auditEntry(RESUME_ACTOR_OPERATION, 'ai')])).toBe('ai')
   })
 
+  it('PL は in-process PL の根拠まで揃っている場合だけ pl と読む', () => {
+    expect(resumeActorClassFromAudit([{
+      ...auditEntry(RESUME_ACTOR_OPERATION, 'pl'),
+      detail: 'task_id=t1 resume_actor=pl authorization_evidence=in_process_pl',
+    }])).toBe('pl')
+    expect(resumeActorClassFromAudit([{
+      ...auditEntry(RESUME_ACTOR_OPERATION, 'pl'),
+      detail: 'task_id=t1 resume_actor=pl authorization_evidence=worker_credential',
+    }])).toBe('unknown')
+  })
+
   it('記録が 1 件も無ければ unknown', () => {
     expect(resumeActorClassFromAudit([])).toBe('unknown')
   })

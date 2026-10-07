@@ -525,12 +525,26 @@ export function resolveReviewedImplementation(
 
 /**
  * 引き金の review に至る resume 段のうち、**actor が human と証明された Job** だけを返す。
- * AI / unknown（記録なし・矛盾・admin_credential の根拠なし）は含めない。
+ * PL / AI / unknown（記録なし・矛盾・admin_credential の根拠なし）は含めない。
  */
 function humanResumesOf(storage: IStorage, resumeHops: readonly Job[]): Job[] {
   if (resumeHops.length === 0) return []
   const actors = readResumeActorClasses(storage, resumeHops)
   return resumeHops.filter((job) => actors.get(job.id) === 'human')
+}
+
+/**
+ * The initial-implement refusal exception accepts either an authenticated Human Resume or the
+ * existing PL Technical Resume. This helper is intentionally not used by conflict-answering or
+ * repair-generation logic: only a human resume may override an earlier review run or reset budget.
+ */
+function technicalRecoveryResumesOf(storage: IStorage, resumeHops: readonly Job[]): Job[] {
+  if (resumeHops.length === 0) return []
+  const actors = readResumeActorClasses(storage, resumeHops)
+  return resumeHops.filter((job) => {
+    const actor = actors.get(job.id)
+    return actor === 'human' || actor === 'pl'
+  })
 }
 
 /**
@@ -667,13 +681,14 @@ function repairableBlockedReviewRequest(
   const isRepairSuccessor = parseRepairSource(stepKey) !== undefined
   const taskJobs = storage.jobs.findByTaskId(task.id)
   const latestImplementJob = taskJobs.find((job) => job.aiCliMode === 'implement')
-  // initial-implement を source として認めるのは、実装由来の secret-scan 拒否で止まった review の
-  // Human Resume に限る（CEO 承認範囲）。通常の `changes_requested` の受け入れ範囲は広げない。
+  // initial-implement を source として認めるのは、実装由来の eligible refusal で止まった review の
+  // Human Resume または PL Technical Resume に限る。通常の `changes_requested`、CONFLICT 回答、
+  // repair generation reset の受け入れ範囲は広げない。
   const isCanonicalInitialImplement =
     reviewRefusal !== undefined
     && stepKey === `task:${task.id}:initial-implement`
     && latestImplementJob?.id === implementJob.id
-    && humanResumesOf(storage, reviewResumeHops).length > 0
+    && technicalRecoveryResumesOf(storage, reviewResumeHops).length > 0
   if (!isResumeSuccessor && !isRepairSuccessor && !isCanonicalInitialImplement) {
     return {
       ok: false,
@@ -837,7 +852,7 @@ function repairableBlockedReviewRequest(
   //    跨いで前 generation の `B0` まで外せてしまう**（独立レビュー指摘）。
   //
   //    境界を張る条件は `crossedAiResume`、すなわち **現在の実装と人の権限の根との間に
-  //    AI / unknown の resume が挟まっているか**である。値は walk が同じ一度の走査で
+  //    PL / AI / unknown の resume が挟まっているか**である。値は walk が同じ一度の走査で
   //    確定させたもの（根が決まる前だけ立つ）で、ここで導出し直していない。
   //      - 挟まっていない: 人がこの chain を直接進めた。その上の REJECT 列は人が
   //        「この状況から続ける」と判断した対象そのものなので外してよい

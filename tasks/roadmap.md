@@ -7188,8 +7188,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    Escalation 済みのときだけ `maybeAdoptNext()` を呼び、判断待ちの Project 自体は採用先から外す。
    未 escalate の attention が1件でもあれば従来どおり採用しない。新しい subsystem・TaskStatus は無し。
 
-<!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=planned -->
-0. [ ] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。
+<!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=done -->
+0. [x] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。
 
    **事実（2026-09-15 master で再確認）**: HTTP route 側（`apps/api/src/routes/tasks.ts`）は
    `resumeBlockedTask` を呼び、`DESIGN_REVIEW_PRECONDITION_FAILED` のときは

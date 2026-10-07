@@ -36,10 +36,14 @@ import type { FastifyRequest } from 'fastify'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import { getCredentialClass, type CredentialClass } from '../auth/credentialClass'
 import type { IStorage } from '../storage/interface'
+import {
+  RESUME_ACTOR_AUDIT_OPERATION,
+  TECHNICAL_RESUME_AUDIT_TOKEN,
+} from '../pl/technicalResumePolicy'
 import { RESUME_STEP_PREFIX, jobsSupersededByHumanResume, type ResumeActorClass } from './repairPolicy'
 
 /** resume actor を記録する audit operation 名。新 table は作らない。 */
-export const RESUME_ACTOR_OPERATION = 'resume_actor'
+export const RESUME_ACTOR_OPERATION = RESUME_ACTOR_AUDIT_OPERATION
 
 /** repair generation の確定を記録する audit operation 名。 */
 export const REPAIR_GENERATION_OPERATION = 'repair_generation'
@@ -141,6 +145,8 @@ export function recordResumeActor(
     taskId: string
     actorClass: ResumeActorClass
     evidence: ResumeAuthorizationEvidence
+    /** Rule 5.5 の review execution failure に対する PL Technical Resume。 */
+    technicalResume?: boolean
   },
 ): void {
   recordWithoutFailingCaller(RESUME_ACTOR_OPERATION, () => {
@@ -150,7 +156,12 @@ export function recordResumeActor(
       entityType: 'job',
       entityId: input.jobId,
       result: input.actorClass,
-      detail: `task_id=${input.taskId} resume_actor=${input.actorClass} authorization_evidence=${input.evidence}`,
+      detail: [
+        `task_id=${input.taskId}`,
+        `resume_actor=${input.actorClass}`,
+        `authorization_evidence=${input.evidence}`,
+        input.technicalResume === true ? TECHNICAL_RESUME_AUDIT_TOKEN : undefined,
+      ].filter((token) => token !== undefined).join(' '),
     })
   })
 }
@@ -196,6 +207,7 @@ export function recordRepairGeneration(
  * 前後を境界で縛るのは `admin_credential_x` のような別の値に引っかからないため。
  */
 const ADMIN_EVIDENCE_PATTERN = /(^| )authorization_evidence=admin_credential( |$)/
+const PL_EVIDENCE_PATTERN = /(^| )authorization_evidence=in_process_pl( |$)/
 
 /**
  * audit 行から actor class を読む。
@@ -213,6 +225,9 @@ export function resumeActorClassFromAudit(entries: readonly AuditLogEntry[]): Re
 
   const only = [...seen][0]
   if (only === 'ai') return 'ai'
+  if (only === 'pl') {
+    return rows.every((row) => PL_EVIDENCE_PATTERN.test(row.detail ?? '')) ? 'pl' : 'unknown'
+  }
   if (only !== 'human') return 'unknown'
   return rows.every((row) => ADMIN_EVIDENCE_PATTERN.test(row.detail ?? '')) ? 'human' : 'unknown'
 }

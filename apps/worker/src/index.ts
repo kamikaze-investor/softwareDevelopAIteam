@@ -29,6 +29,7 @@ import {
   revertBlockedJobChanges,
   WorkspaceReconciliationError,
 } from './jobRunner.js'
+import { resolveReviewedImplementJobId } from './reviewRefusalEligibility.js'
 import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
 import { getCommitHash } from './jobRunner.js'
 import { observeWorkspace } from './workspaceVerification.js'
@@ -1164,11 +1165,14 @@ function buildStructuredReviewContext(
 ): StructuredReviewContext | undefined {
   if (job.aiCliMode !== 'review') return undefined
 
-  const match = job.workflowStepKey
+  const reviewedImplementJobId = resolveReviewedImplementJobId(job, jobs)
+  const directMatch = job.workflowStepKey
     ? /^implement:(.+):review$/.exec(job.workflowStepKey)
     : null
-  const implementJob = match
-    ? jobs.find((candidate) => candidate.id === match[1])
-    : jobs.find((candidate) => candidate.aiCliMode === 'implement' && candidate.status === 'success')
-  return implementJob ? { task, implementJob } : undefined
+  const implementJob = reviewedImplementJobId !== undefined
+    ? jobs.find((candidate) => candidate.id === reviewedImplementJobId)
+    : directMatch
+      ? jobs.find((candidate) => candidate.id === directMatch[1])
+      : jobs.find((candidate) => candidate.aiCliMode === 'implement' && candidate.status === 'success')
+  return implementJob ? { task, implementJob, reviewJobs: jobs } : undefined
 }

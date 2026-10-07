@@ -29,7 +29,7 @@ import { aiCliTimeoutMs, runRiskReview } from '@ai-team/shared'
 import { z } from 'zod'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { AiCliPromptRefusalError } from './aiCli/adapter.js'
-import { classifyPromptRefusal } from './reviewRefusalEligibility.js'
+import { buildImplementJobReport, classifyPromptRefusal } from './reviewRefusalEligibility.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
 import type { TargetProjectRiskScanResult } from './approvalLevel/targetProjectRiskScan.js'
@@ -177,6 +177,7 @@ export type StructuredReviewVerdict = Pick<ReviewResult, 'status' | 'summary' | 
 export interface StructuredReviewContext {
   task: Task
   implementJob: Job
+  reviewJobs?: readonly Job[]
 }
 
 /**
@@ -343,16 +344,7 @@ ${evidence.summaryLines.length > 0 ? evidence.summaryLines.join('\n') : '(集計
 [SafeCommand出力（bounded 抜粋。全文ではない）]
 ${evidence.excerpt}
 
-[implement Job結果]
-${JSON.stringify({
-    id: implementJob.id,
-    status: implementJob.status,
-    changedFiles: implementJob.changedFiles ?? [],
-    completedAt: implementJob.completedAt,
-    aiCliProvider: implementJob.aiCliProvider,
-    aiCliMode: implementJob.aiCliMode,
-    stdoutPreview: implementJob.stdout,
-  }, null, 2)}`
+${buildImplementJobReport(implementJob)}`
 }
 
 export interface JobRunResult {
@@ -893,6 +885,9 @@ export async function runJob(
               mode: job.aiCliMode,
               prompt: effectiveAiCliPrompt,
               implementationDiff: preDiffText,
+              implementJob: structuredReviewContext?.implementJob,
+              reviewJob: job,
+              reviewJobs: structuredReviewContext?.reviewJobs,
             })
           : undefined,
       })
@@ -1801,18 +1796,18 @@ function withSensitiveChanges(
  * エラーでなければ undefined。
  *
  * **CLI が返した理由をそのまま出す。**
- * 
+ *
  * ここを generic な1文で潰していたため、2026-09-18 に API credit が尽きたとき
  * 運用側に見えたのは「error result」だけで、真因（400 Credit balance is too low）は
  * stdout の JSON を人手で開くまで分からなかった。
  * API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
  * 出すのは **HTTP status と、固定語彙の原因ラベルだけ**である。
- * 
+ *
  * provider の文字列をそのまま載せない。`result` は成功時にはモデル本文が入る欄であり
  * （`reviewerAdapter.ts`: `result: '<モデル本文>'`）、API エラー時でも中身は信用できない
  * —— 実際に `401 invalid Authorization: Bearer sk-...` のように credential 断片や
  * prompt 抜粋を含みうる（独立レビュー指摘）。redact（denylist）では取りこぼす形が残る。
- * 
+ *
  * そこで **echo せず分類する**。出力は下の固定語彙のいずれかで、入力文字列は外へ出ない。
  * 2026-09-18 の実例（API credit 枯渇）は `credit exhausted` として十分に伝わる。
     const apiErrorStatus = typeof parsed.api_error_status === 'number'

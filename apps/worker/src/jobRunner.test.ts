@@ -21,6 +21,7 @@ import {
   computeWorkspaceBaseline,
   parseStructuredReviewOutput,
   runJob,
+  type StructuredReviewContext,
 } from './jobRunner.js'
 import {
   FINGERPRINT_ABSENT,
@@ -400,7 +401,7 @@ function createPolicy(overrides: Record<string, unknown> = {}) {
   }) as never
 }
 
-function createStructuredReviewContext() {
+function createStructuredReviewContext(): StructuredReviewContext {
   const task: Task = {
     id: 'task-1',
     projectId: 'project-1',
@@ -2348,6 +2349,41 @@ describe('task-022: AI CLI 実行ブロック', () => {
     })
     expect(JSON.stringify(result.refusal)).not.toContain(matchedValue)
     expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('passes the reviewed implement Job to report-ownership classification', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockRejectedValue(new AiCliPromptRefusalError(
+        'Prompt refused by secret scan',
+        ['secret assignment'],
+      )),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as never)
+    const context = createStructuredReviewContext()
+    const reviewJob = createJob({
+      id: 'review-job-1',
+      workflowStepKey: 'implement:implement-job-1:review',
+      aiCliProvider: 'claude_code',
+      aiCliMode: 'review',
+    })
+    context.reviewJobs = [reviewJob, context.implementJob]
+
+    context.implementJob.stdout = [
+      '=== AI CLI (claude_code/implement) ===',
+      'Implementation summary mentions secret: string',
+      '=== SafeCommand (test) ===',
+      'tests passed',
+    ].join('\n')
+
+    const result = await runJob(reviewJob, createPolicy(), context)
+
+    expect(result.status).toBe('failed')
+    expect(result.refusal).toEqual({
+      kind: 'secret_scan',
+      patternKinds: ['secret assignment'],
+      repairEligible: true,
+      repairEligibilityReason: 'implementation_report_generic_assignment',
+    })
   })
 
   it('aiCliProvider なし → AI CLI をスキップして SafeCommand を実行する', async () => {

@@ -19,6 +19,7 @@ import { occupiesProject } from '@ai-team/shared'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
 import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
 
@@ -102,6 +103,26 @@ export interface AttentionItem {
   detail: string
   /** 判明していれば、その状態が続いている時間。 */
   stuckForMs?: number
+}
+
+/**
+ * 対象単位の technical recovery budget が尽きたことを、既存 audit から投影する。
+ * Task 単位の resume cap は他の recovery action を止めないため、ここでは対象全体が
+ * terminal になった記録だけを見る。
+ */
+export function isAttentionTechnicalRecoveryExhausted(
+  storage: IStorage,
+  item: AttentionItem,
+): boolean {
+  return isTechnicalRecoveryTargetExhausted(storage, item)
+}
+
+function projectAttention(storage: IStorage, item: AttentionItem): AttentionItem {
+  if (!isAttentionTechnicalRecoveryExhausted(storage, item)) return item
+  return {
+    ...item,
+    detail: `${item.detail}; PL technical recovery budget is exhausted and no CEO decision was requested`,
+  }
 }
 
 export interface ProjectStateSummary {
@@ -611,6 +632,6 @@ export function buildSystemState(
       activeSupervisedRuns: storage.supervisedRuns.findActiveRuns().length,
     },
     projects,
-    attention,
+    attention: attention.map((item) => projectAttention(storage, item)),
   }
 }
