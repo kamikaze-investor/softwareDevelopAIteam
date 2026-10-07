@@ -137,9 +137,9 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
             workspaceState: 'unchanged',
             refusal: {
               kind: 'secret_scan',
-              patternKinds: ['password assignment'],
+              patternKinds: ['password assignment', 'secret assignment'],
               repairEligible: true,
-              repairEligibilityReason: 'implementation_added_generic_assignment',
+              repairEligibilityReason: 'implementation_report_generic_assignment',
             },
           },
         },
@@ -151,6 +151,7 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
       expect(runs[0]!.repairSourceJobId).toBe(shape.i1.id)
       expect(runs[0]!.designText).toContain('kind: secret_scan')
       expect(runs[0]!.designText).toContain('password assignment')
+      expect(runs[0]!.designText).toContain('implementation_report_generic_assignment')
       expect(kick).toHaveBeenCalledTimes(1)
       expect(kick.mock.calls[0]![2]).toBe(`repair:${shape.i1.id}:1`)
     })

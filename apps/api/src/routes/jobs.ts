@@ -92,7 +92,10 @@ const RefusalMetadataSchema = z.discriminatedUnion('repairEligible', [
     kind: z.literal('secret_scan'),
     patternKinds: z.array(SecretScanPatternKindSchema).min(1),
     repairEligible: z.literal(true),
-    repairEligibilityReason: z.literal('implementation_added_generic_assignment'),
+    repairEligibilityReason: z.enum([
+      'implementation_added_generic_assignment',
+      'implementation_report_generic_assignment',
+    ]),
   }).strict(),
   z.object({
     kind: z.literal('secret_scan'),

@@ -207,6 +207,12 @@ export function buildRepairPrompt(input: RepairPromptInput): string {
     '直前の実行は失敗した。下記の失敗事実を踏まえ、原因を取り除く修正を行うこと。',
     '同じ内容の再実行ではなく、失敗原因に対する修正を行うこと。',
     'Taskの目的・設計方針・安全境界は変更しないこと。',
+    ...(input.reviewRefusal?.kind === 'secret_scan'
+      ? [
+          '自分の結果報告には、"password" または "secret" というラベルの直後に、',
+          'コロンや等号と値を続ける secret-shaped notation を書かないこと。',
+        ]
+      : []),
     ...(input.attempt !== undefined ? [`これは ${input.attempt} 回目の修正試行である。`] : []),
     ...(input.requireDifferentApproach
       ? [
