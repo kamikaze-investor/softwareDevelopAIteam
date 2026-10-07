@@ -208,6 +208,20 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toContain('- a.ts')
     expect(prompt).toContain('- b.ts')
   })
+
+  it('includes Decision Authority only for authority/recovery/approval target paths', () => {
+    const authorityPrompt = buildReviewPrompt(makeRequest({
+      targetFiles: ['apps/api/src/designReview/resumeBlockedTask.ts'],
+    }))
+    const unrelatedPrompt = buildReviewPrompt(makeRequest({
+      targetFiles: ['apps/mobile/src/screens/Home.tsx'],
+    }))
+
+    expect(authorityPrompt).toContain('## 1-2. Human Decision Authority')
+    expect(authorityPrompt).toContain('## 14-3. Priority 2 境界表')
+    expect(unrelatedPrompt).not.toContain('## 1-2. Human Decision Authority')
+    expect(unrelatedPrompt).not.toContain('## 14-3. Priority 2 境界表')
+  })
 })
 
 describe('parseReviewerResponse', () => {
@@ -235,6 +249,29 @@ describe('parseReviewerResponse', () => {
 
     expect(result.verdict).toBe('approved')
     expect(result.phase).toBe('post')
+  })
+
+  it('normalizes principle_conflict when the issue does not name a provided principle', () => {
+    const response = (description: string) => reviewerJson('changes_requested', {
+      issues: [{ severity: 'warning', category: 'principle_conflict', description }],
+    })
+    const accepted = parseReviewerResponse(
+      response('specs/22 §1-2 conflicts with the Constitution'),
+      'codex',
+      'post',
+      [],
+      ['specs/22 §1-2'],
+    )
+    const normalized = parseReviewerResponse(
+      response('unprovided-principle conflicts with the Constitution'),
+      'codex',
+      'post',
+      [],
+      ['specs/22 §1-2'],
+    )
+
+    expect(accepted.issues[0].category).toBe('principle_conflict')
+    expect(normalized.issues[0].category).toBe('spec_violation')
   })
 
   it('不正なJSON文字列は fail closed で blocking にする', () => {

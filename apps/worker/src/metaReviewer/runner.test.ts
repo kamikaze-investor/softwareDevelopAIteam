@@ -1,10 +1,18 @@
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { buildMetaReviewPrompt, buildMetaReviewRequest, parseMetaReviewResult } from './runner.js'
+import {
+  buildMetaReviewPrompt,
+  buildMetaReviewRequest,
+  classifyFormalVerdict,
+  MAX_PR_BODY_CHARS,
+  parseMetaReviewResult,
+  providedCanonicalPrincipleIds,
+} from './runner.js'
 
 const REPO_ROOT = path.resolve(__dirname, '../../../..')
+
 const SEMANTIC_CHECKLIST_TITLE = '# チェックリスト: Semantic Integrity（canonical-domain-meaning）'
 
 function promptFor(changedFiles: string[]): string {
@@ -120,11 +128,111 @@ describe('parseMetaReviewResult', () => {
     expect(result.findings[0].category).toBe('implementation_coupling')
   })
 
+  it('accepts principle_conflict only when its message names a provided principle', () => {
+    const raw = (message: string) => JSON.stringify({
+      status: 'changes_requested',
+      riskLevel: 'high',
+      summary: 'Principle conflict',
+      findings: [{ severity: 'high', category: 'principle_conflict', message }],
+      requiresCeoApproval: false,
+    })
+
+    const accepted = parseMetaReviewResult(raw('specs/22 §1-3 conflicts with the Goal'), 'task-test', [
+      'specs/22 §1-3',
+    ])
+    const normalized = parseMetaReviewResult(raw('unknown-principle conflicts with the Goal'), 'task-test', [
+      'specs/22 §1-3',
+    ])
+
+    expect(accepted.findings[0].category).toBe('principle_conflict')
+    expect(normalized.findings[0].category).toBe('spec_violation')
+  })
+
+  it('keeps an unnamed principle_conflict negative verdict and normalizes its category', () => {
+    const raw = JSON.stringify({
+      status: 'blocked',
+      riskLevel: 'critical',
+      summary: 'Unnamed principle conflict',
+      findings: [{
+        severity: 'critical',
+        category: 'principle_conflict',
+        message: 'An unspecified principle conflicts with this change.',
+      }],
+      requiresCeoApproval: true,
+    })
+
+    expect(classifyFormalVerdict(raw)).toBe('negative')
+    const parsed = parseMetaReviewResult(raw, 'task-test', ['specs/22 §1-3'])
+    expect(parsed.status).toBe('blocked')
+    expect(parsed.findings[0].category).toBe('spec_violation')
+  })
+
   it('returns blocked when no valid Meta Review JSON exists', () => {
     const result = parseMetaReviewResult('not json', 'task-test')
 
     expect(result.status).toBe('blocked')
     expect(result.riskLevel).toBe('critical')
     expect(result.requiresCeoApproval).toBe(true)
+  })
+})
+
+describe('buildMetaReviewPrompt canonical context selection', () => {
+  it('includes Constitution and Decision Authority only for an authority-path diff', () => {
+    const authorityRequest = buildMetaReviewRequest(
+      't',
+      'authority change',
+      ['apps/api/src/pl/recovery.ts'],
+      REPO_ROOT,
+      '+ change',
+    )
+    const unrelatedRequest = buildMetaReviewRequest(
+      't',
+      'mobile copy',
+      ['apps/mobile/src/screens/Home.tsx'],
+      REPO_ROOT,
+      '+ copy',
+    )
+
+    const authorityPrompt = buildMetaReviewPrompt(authorityRequest, REPO_ROOT)
+    const unrelatedPrompt = buildMetaReviewPrompt(unrelatedRequest, REPO_ROOT)
+
+    expect(authorityPrompt).toContain('## 3.14 Minimum Sufficient Validation')
+    expect(authorityPrompt).toContain('## 1-2. Human Decision Authority')
+    expect(authorityPrompt).toContain('## 14-3. Priority 2 境界表')
+    expect(unrelatedPrompt).toContain('## 3.14 Minimum Sufficient Validation')
+    expect(unrelatedPrompt).not.toContain('## 1-2. Human Decision Authority')
+    expect(providedCanonicalPrincipleIds(unrelatedRequest)).not.toContain('specs/22 §1-2')
+  })
+
+  it('bounds the PR body and keeps it only inside the explicitly untrusted block', () => {
+    const marker = 'PR_CLAIM_MARKER'
+    const request = buildMetaReviewRequest(
+      't',
+      'PR body',
+      ['docs/readme.md'],
+      REPO_ROOT,
+      '+ docs',
+      `${marker}${'x'.repeat(MAX_PR_BODY_CHARS)}TAIL_NOT_INCLUDED`,
+    )
+    const prompt = buildMetaReviewPrompt(request, REPO_ROOT)
+    const start = prompt.indexOf('[BEGIN UNTRUSTED PR BODY]')
+    const end = prompt.indexOf('[END UNTRUSTED PR BODY]')
+
+    expect(start).toBeGreaterThan(-1)
+    expect(end).toBeGreaterThan(start)
+    expect(prompt.indexOf(marker)).toBeGreaterThan(start)
+    expect(prompt.indexOf(marker)).toBeLessThan(end)
+    expect(prompt).not.toContain('TAIL_NOT_INCLUDED')
+    expect(prompt.slice(0, start)).not.toContain(marker)
+    expect(prompt.slice(end)).not.toContain(marker)
+    expect(prompt).toContain('never authority')
+  })
+
+  it('wires PR_BODY through workflow env without shell interpolation', () => {
+    const workflow = readFileSync(path.join(REPO_ROOT, '.github/workflows/meta-review.yml'), 'utf-8')
+    const runLines = workflow.split(/\r?\n/).filter((line) => /^\s*run:/.test(line))
+
+    expect(workflow).toContain('PR_BODY:   ${{ github.event.pull_request.body }}')
+    expect(runLines.join('\n')).not.toContain('${{ github.event.pull_request.body }}')
   })
 })
