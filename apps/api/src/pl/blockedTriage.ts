@@ -101,6 +101,8 @@ export const BLOCKED_ROOT_CAUSE_CLASSES = [
   'design_review_stalled',
   /** attempt を使い切った run。再kickしても claim できない。 */
   'design_review_exhausted',
+  /** successful implement に対する post-implementation review Job 自体が failed。 */
+  'review_execution_failed',
   /** File Change Guard 違反。ただし allowedPaths を直せば通りうる範囲。 */
   'allowed_paths_mismatch',
   /** protected file だが Safety / Authority policy 本体ではない（runtime engine 等）。 */
@@ -733,6 +735,48 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           `Design Review run が ${review.status} のまま進んでいない`
           + `（attempt ${review.attemptCount}/${DESIGN_REVIEW_MAX_ATTEMPTS}）。`
           + '既存の bounded rekick が残っている。',
+      }
+    }
+  }
+
+  // ── 5.5 successful implement に対する post-implementation review の実行失敗 ──────
+  // structured refusal metadata が導入される前の行でも、保存済み lineage から次の事実は確定できる:
+  //   - blocked Task の最新 Job が failed review
+  //   - `implement:<id>:review` が同じ Task / Project の successful implement を指す
+  //   - 競合する live Job は無い
+  // この形は既存 `resumeBlockedTask()` が review を bounded に再実行できる Technical Recovery である。
+  // protected/secret Guard、quarantine、Design Review CONFLICT は上の規則が先に処理するため、
+  // この分類でそれらを迂回しない。
+  if (
+    facts.job?.status === 'failed'
+    && facts.job.aiCliMode === 'review'
+    && item.taskId !== undefined
+    && storage.tasks.findById(item.taskId)?.status === 'blocked'
+    && !hasLiveJob(facts)
+  ) {
+    const implementId = /^implement:([^:]+):review$/.exec(facts.job.workflowStepKey ?? '')?.[1]
+    const implementJob = implementId !== undefined ? storage.jobs.findById(implementId) : undefined
+    if (
+      implementJob?.status === 'success'
+      && implementJob.aiCliMode === 'implement'
+      && implementJob.taskId === facts.job.taskId
+      && implementJob.projectId === facts.job.projectId
+    ) {
+      return {
+        ...result,
+        rootCauseClass: 'review_execution_failed',
+        blockingLayer: 'provider',
+        evidence: [
+          { fact: 'review_job.status', id: facts.job.id, value: 'failed' },
+          { fact: 'review_job.workflowStepKey', id: facts.job.id, value: facts.job.workflowStepKey ?? 'none' },
+          { fact: 'implementation_job.status', id: implementJob.id, value: 'success' },
+        ],
+        recoverable: true,
+        existingRecoveryAvailable: true,
+        confidence: 'high',
+        recommendedLane: 'auto_recovery',
+        summary: 'successful implement の post-implementation review 実行が失敗した。'
+          + '既存 resume は同じ Task Contract のまま review を再実行できる。',
       }
     }
   }

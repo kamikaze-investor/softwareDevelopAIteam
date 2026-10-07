@@ -668,7 +668,7 @@ describe('triageAllowedActions — 絞ることしかできない', () => {
 // ────────────────────────────────────────────────────────────
 
 describe('runPlTick — 同じ blocker を延々と retry しない', () => {
-  it('10. 同じ blocker は上限回数までしか試されず、その後は retry も診断もしない', async () => {
+  it('10. 同じ technical blocker は上限回数までしか試されず、回数だけで CEO へ上げない', async () => {
     const { storage, taskId, projectId } = seed()
     providerTimeoutJob(storage, taskId, projectId, 'unchanged')
     let diagnosed = 0
@@ -680,14 +680,14 @@ describe('runPlTick — 同じ blocker を延々と retry しない', () => {
       },
     })
 
-    // 上限ぶん回した時点で、Triage が auto_recovery と言っていても Escalation で終端する。
+    // 上限ぶんは既存 action を試すが、failure count を CEO decision へ変換しない。
     for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {
       resetPlLoopInFlightForTest()
       const tick = await runPlTick(storage, d)
       statuses.push(tick.status)
       expect(tick.triage?.lane).toBe('auto_recovery')
     }
-    expect(statuses).toContain('escalated')
+    expect(statuses).toEqual(Array(PL_MAX_ATTEMPTS_PER_TARGET).fill('acted'))
     // 試行は上限ちょうどで止まる（それ以上 provider を呼ばない）
     expect(diagnosed).toBe(PL_MAX_ATTEMPTS_PER_TARGET)
 

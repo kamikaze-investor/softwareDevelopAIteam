@@ -26,7 +26,8 @@
  * ## 無限自己修復ループを作らない
  *
  * 同じ対象に対する PL の試行回数は `audit_log` から数えて `PL_MAX_ATTEMPTS_PER_TARGET` で
- * 打ち切る。打ち切った先は CEO Escalation であり、再試行ではない。個々の操作の retry 上限
+ * 打ち切る。技術的な失敗回数だけでは CEO 判断を要求せず、既存 Triage が Decision Authority /
+ * unresolved review conflict と判定した場合だけ既存 handoff を使う。個々の操作の retry 上限
  * （`DESIGN_REVIEW_MAX_ATTEMPTS` 等）は既存機構が持っており、ここでは緩めない。
  *
  * ## Blocked Resolution Triage（Diagnose の前段）
@@ -101,6 +102,7 @@ import {
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { recordResumeActor } from '../designReview/resumeActor'
+import { resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
   runOperatorRequestStep,
   type OperatorRequestStepDeps,
@@ -115,7 +117,7 @@ import {
   type PlActionTarget,
 } from './actionGate'
 
-/** 1つの対象に対して PL が試せる回数。超えたら再試行せず Escalation へ倒す。 */
+/** 1つの対象に対して PL が試せる回数。超えたら技術的な再試行を止める。 */
 export const PL_MAX_ATTEMPTS_PER_TARGET = 2
 
 /** 診断に使える時間。既存 cheap client の timeout と同じ桁に収める。 */
@@ -155,8 +157,8 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   'design_review_idle',
   'design_review_failed',
   // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
-  // workspace を書き換えるため Gate の根拠が要り、そこで止まる。試行上限に達すると CEO へ Escalation
-  // される。**それが今の正しい振る舞い**である（止まったことを人へ確実に伝える）。
+  // workspace を書き換えるため Gate の根拠が要り、そこで止まる。技術的な試行上限は自動実行を
+  // bounded に止めるが、それだけを理由に CEO decision へ変換しない。
   // 「PL に何を実行させてよいか」は権限の問題であり、`pl-autonomous-roadmap-adoption` と同じく
   // 別途 CEO 判断で決める。ここで黙って実行可能にしない。
   'job_failed',
@@ -199,7 +201,7 @@ export type PlTickStatus =
   | 'blocked'
   /** 診断が構造化された既知 action にならなかった。実行していない。 */
   | 'diagnosis_unusable'
-  /** 試行上限に達した、または検証で正常化しなかったため CEO へ上げた。 */
+  /** 保存済み事実が Human Decision Authority / unresolved review conflict を示し、CEO へ上げた。 */
   | 'escalated'
   /** 診断そのものが失敗した（provider 障害等）。実行していない。 */
   | 'diagnosis_failed'
@@ -406,8 +408,21 @@ function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
     // 予算は `countRemediationAttempts()` が却下テキスト単位で別に持つので、
     // 通知が鳴り続けることはない。
     && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
+    && !hasExhaustedTechnicalRecovery(storage, item)
     && hasStalledLongEnough(item)
   )
+}
+
+/**
+ * 技術的 recovery は budget で停止するが、回数だけを CEO decision に変換しない。
+ * 保存済み事実が後から authority / unresolved review conflict を示せば、provider 診断の候補が
+ * 無くなるため false へ戻り、既存 handoff は引き続き actionable になる。
+ */
+function hasExhaustedTechnicalRecovery(storage: IStorage, item: AttentionItem): boolean {
+  if (countPriorAttempts(storage, targetKeyOf(item)) < PL_MAX_ATTEMPTS_PER_TARGET) return false
+  const diagnosis = triageBlocked(storage, item)
+  const allowed = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
+  return needsProviderDiagnosis(allowed)
 }
 
 /**
@@ -1013,7 +1028,7 @@ export function buildPlResumeAiCliPrompt(
   >,
   instruction: string = DEFAULT_RESUME_INSTRUCTION,
 ): string {
-  return buildResumeAiCliPrompt(task, instruction)
+  return buildResumeAiCliPrompt(task, instruction, 'pl')
 }
 
 /**
@@ -1374,9 +1389,13 @@ async function executeAction(
     // queued・running の重複 / AI CLI の Design Review evidence）。ここで緩めない。
     // git_commit の resume なら、新 Job が `/gate/check` で**現在の diff に対する新しい
     // Approval Request** を発行する（STALE な旧 approval は再利用されない）。
-    const resumed = storage.jobs.resumeBlockedTask({
-      taskId: item.taskId,
-      instructionPrompt: buildPlResumeAiCliPrompt(task, deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION),
+    const resumed = await resumeBlockedTaskWithDesignReview(storage, {
+      task,
+      instructionPrompt: buildPlResumeAiCliPrompt(
+        task,
+        deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION,
+      ),
+      ...(deps.coordinatorDeps !== undefined ? { coordinatorDeps: deps.coordinatorDeps } : {}),
     })
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
@@ -1387,7 +1406,7 @@ async function executeAction(
     recordResumeActor(storage, {
       jobId: resumed.job.id,
       taskId: item.taskId,
-      actorClass: 'ai',
+      actorClass: 'pl',
       evidence: 'in_process_pl',
     })
     return { ok: true, summary: `resume queued job ${resumed.job.id}` }
@@ -1549,27 +1568,24 @@ async function handleTarget(
 
   const attempt = countPriorAttempts(storage, key) + 1
 
-  // ── 試行上限。ここを超えたら再試行ではなく Escalation ──────────
-  // **同じ blocker に対する retry → fail → retry を止める唯一の境界**であり、
-  // Triage が `auto_recovery` と言っていても超えたら実行しない（新しい閾値は作らない）。
-  if (attempt > PL_MAX_ATTEMPTS_PER_TARGET) {
-    if (hasEscalated(storage, key)) {
-      return { status: 'idle', target, triage, reason: 'already escalated; not repeating', attempt }
-    }
-    await escalateTo(
-      storage,
-      deps,
-      key,
-      item,
-      `PL は ${PL_MAX_ATTEMPTS_PER_TARGET} 回試しましたが解消しませんでした。`,
-      { triage: diagnosis },
-    )
-    return { status: 'escalated', target, triage, reason: 'attempt budget exhausted', attempt }
-  }
-
   // ── Decide lane（auto_recovery 以外は provider 診断を回さず所定のレーンへ渡す）──────
   // `triageAllowedActions()` は**必ず既存候補との積**なので、ここで権限が増えることはない。
   const allowedActions = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
+
+  // ── 試行上限。技術的 recovery は止めるが、回数だけで CEO 判断へ変換しない ──────
+  // Triage 自体が authority / unresolved review conflict を根拠に handoff を要求する場合は、
+  // 下の既存 `handOffOrEscalate()` がその根拠で処理する。provider 診断がまだ選択肢にある
+  // technical/unknown recovery だけを bounded に停止する。
+  if (attempt > PL_MAX_ATTEMPTS_PER_TARGET && needsProviderDiagnosis(allowedActions)) {
+    return {
+      status: 'idle',
+      target,
+      triage,
+      reason: 'technical recovery attempt budget exhausted; CEO decision was not requested by count',
+      attempt,
+    }
+  }
+
   if (!needsProviderDiagnosis(allowedActions)) {
     const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
     return { status: handled.status, target, triage, reason: handled.reason, attempt }
@@ -1713,34 +1729,10 @@ async function handleTarget(
     diagnosis,
   )
 
-  // ── Continue / Escalate ────────────────────────────────────
-  // **復旧対象が解消していれば Escalation しない。** 直した結果として次の工程が現れるのは
-  // pipeline の正常な進み方であり、それは次の tick で独立した attention として扱われる
-  // （`isRecoveryTargetResolved()` 参照）。
-  if (
-    !isRecoveryTargetResolved(verification) &&
-    attempt >= PL_MAX_ATTEMPTS_PER_TARGET &&
-    !hasEscalated(storage, key)
-  ) {
-    await escalateTo(
-      storage,
-      deps,
-      key,
-      item,
-      `PL は ${proposal.kind} を実行しましたが状態は ${verification} でした（${execution.summary}）。`,
-      { triage: diagnosis },
-    )
-    return {
-      status: 'escalated',
-      target,
-      triage,
-      proposedKind: proposal.kind,
-      executionSummary: execution.summary,
-      verification,
-      attempt,
-    }
-  }
-
+  // ── Continue ───────────────────────────────────────────────
+  // 未解消でも failure count だけでは CEO decision に変換しない。budget 到達後は次 tick の
+  // `hasExhaustedTechnicalRecovery()` が同じ technical target を候補から外す。状態が authority / review
+  // conflict に変わった場合はその分類に基づく既存 handoff が引き続き動く。
   return {
     status: 'acted',
     target,
