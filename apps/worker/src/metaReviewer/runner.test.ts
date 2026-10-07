@@ -1,3 +1,5 @@
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { buildMetaReviewPrompt, buildMetaReviewRequest, parseMetaReviewResult } from './runner.js'
@@ -25,6 +27,24 @@ describe('buildMetaReviewPrompt principle checklists', () => {
   it('does not add it when no changed file selects the principle', () => {
     for (const file of ['apps/mobile/app/index.tsx', 'docs/project_memory/decisions/x.md', '.github/workflows/ci.yml']) {
       expect(promptFor([file])).not.toContain(SEMANTIC_CHECKLIST_TITLE)
+    }
+  })
+
+  it('states the checklist as unavailable instead of silently dropping it when the file is missing', () => {
+    // prompt.md / checklist.md はあるが checklists/ が無い control root
+    const controlRoot = mkdtempSync(path.join(tmpdir(), 'meta-review-control-'))
+    try {
+      mkdirSync(path.join(controlRoot, 'docs/meta_reviewer'), { recursive: true })
+      for (const file of ['prompt.md', 'checklist.md']) {
+        copyFileSync(path.join(REPO_ROOT, 'docs/meta_reviewer', file), path.join(controlRoot, 'docs/meta_reviewer', file))
+      }
+      const request = buildMetaReviewRequest('t', 'title', ['apps/api/src/storage/sqlite.ts'], controlRoot, 'diff')
+      const prompt = buildMetaReviewPrompt(request, controlRoot)
+      expect(prompt).not.toContain(SEMANTIC_CHECKLIST_TITLE)
+      expect(prompt).toContain('## docs/meta_reviewer/checklists/semantic_integrity.md\n\n(unavailable: file not found.')
+      expect(prompt).not.toContain('（このPRに対応する専用チェックリストなし。')
+    } finally {
+      rmSync(controlRoot, { recursive: true, force: true })
     }
   })
 })

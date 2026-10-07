@@ -99,8 +99,14 @@ function getFileChecklists(changedFiles: string[], checklistsDir: string): strin
     { predictedFocuses: changedFiles.flatMap(mapFileToFocuses) },
     loadEngineeringPrinciples(),
   )
+  // 選ばれた原則の checklist は add() のように黙って省かない。欠けていれば Design Review
+  // （strategicReview.ts の buildChecklistContext）と同じく、prompt 上で欠落を明示する。
   for (const checklistFile of principleChecklistFiles(principleSelection)) {
-    add(checklistFile)
+    try {
+      results.push(readFileSync(path.join(checklistsDir, checklistFile), 'utf-8'))
+    } catch {
+      results.push(`## docs/meta_reviewer/checklists/${checklistFile}\n\n(unavailable: file not found. Apply only the principle one-liner; do not treat this checklist as applied.)`)
+    }
   }
 
   return results
