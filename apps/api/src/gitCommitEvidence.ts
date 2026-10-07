@@ -52,6 +52,7 @@ export type GitCommitHumanGateReason = 'human_decision_authority' | 'insufficien
 /** 不成立だった Evidence の識別子。audit に載せる短いコード（秘密情報・diff 本文を含めない）。 */
 export type GitCommitEvidenceFailure =
   | 'human_approval_already_requested'
+  | 'not_candidate_workspace'
   | 'same_diff_rejected'
   | 'binding_not_authoritative'
   | 'manifest_unavailable'
@@ -185,6 +186,9 @@ export function evaluateGitCommitEvidence(
   // ── 既に人間承認の流れに入っている Job は、そのまま人間承認で終える ──
   // 待機中・承認済みの ApprovalRequest を Evidence で横から無効化しない。
   if (gitCommitJob.approvalId !== undefined) fail('human_approval_already_requested')
+  // Candidate 限定（spec 22 14-3）: commit する Job の作業場所が、API が Evidence を読んだ
+  // Candidate workspace そのものでなければ通さない。
+  if (gitCommitJob.safeCommand.workingDir !== input.workingDir) fail('not_candidate_workspace')
   if (isSameDiffRejected(input.taskApprovalRequests, targetCommit, targetDiffHash)) fail('same_diff_rejected')
 
   // ── commit しようとしている diff そのもの（API 自身の読み取り） ──

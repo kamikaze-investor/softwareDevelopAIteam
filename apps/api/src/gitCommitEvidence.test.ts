@@ -292,6 +292,12 @@ describe('evaluateGitCommitEvidence — 既存の人間承認との関係', () =
     expect(result).toEqual({ passed: true })
   })
 
+  it('Candidate workspace 以外を作業場所にする git_commit Job は通さない', () => {
+    const chain = seedChain()
+    const elsewhere = { ...chain.gitCommitJob, safeCommand: { kind: 'git_commit', workingDir: '/somewhere/else' } } as Job
+    expect(failuresOf(chain, { gitCommitJob: elsewhere })).toContain('not_candidate_workspace')
+  })
+
   it('既に人間承認の流れに入っている Job は Evidence で横から通さない', () => {
     const chain = seedChain()
     const linked = { ...chain.gitCommitJob, approvalId: 'approval-1' }
