@@ -7,6 +7,7 @@ import type {
   ApprovalRequest,
   ApprovalQuestionTurn,
   GateOutcome,
+  Job,
   RiskLevel,
   RiskReviewResult,
 } from '@ai-team/shared'
@@ -29,6 +30,7 @@ import { computeChangeManifestHash } from '../approvalExplain/changeManifestIden
 import { buildWorktreeChangeManifest } from '../approvalExplain/changeManifestReader'
 import type { GateEvaluationEvidence } from '../storage/interface'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
+import { evaluateGitCommitEvidence, type GitCommitEvidenceResult, type GitCommitHumanGateReason } from '../gitCommitEvidence'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
 import { gateEvaluationRoutes } from './gateEvaluations'
 
@@ -36,7 +38,9 @@ import { gateEvaluationRoutes } from './gateEvaluations'
  * Gate policyの版。RISK_RULESや判定ロジックを変えたら上げる。
  * evidenceから「どのpolicyで判断したか」を後から一意に特定するために持つ。
  */
-const GATE_POLICY_VERSION = 'gate-policy-v1'
+// v2（2026-10-02 Decision Authority Principle Stage 1）: git_commit の一律人間承認を、
+// Safety Evidence が全て成立する LOW / MEDIUM に限って外した（`gitCommitEvidence.ts`）。
+const GATE_POLICY_VERSION = 'gate-policy-v2'
 
 function computeDiffHash(diffText: string): string {
   return createHash('sha256').update(diffText, 'utf-8').digest('hex')
@@ -46,7 +50,17 @@ const SECRET_SUSPECTED_IN_DIFF_LABEL = 'secret suspected in diff'
 const OTHER_RISK_FACTOR_DETECTED_LABEL = 'other risk factor detected'
 /** MVP-A: git_commit は実際のriskLevelに関わらず常に承認必須というポリシー起因の理由ラベル */
 const GIT_COMMIT_POLICY_LABEL = 'git_commit requires CEO approval (policy)'
-const SAFE_RISK_RULE_LABELS = new Set(RISK_RULES.map(rule => rule.label))
+/** git_commit の Safety Evidence 判定結果（gate_evaluations / ApprovalRequest の triggeredRules に残す）。 */
+const GIT_COMMIT_EVIDENCE_VERIFIED_LABEL = 'git_commit: safety evidence verified'
+const GIT_COMMIT_HUMAN_GATE_LABELS: Record<GitCommitHumanGateReason, string> = {
+  human_decision_authority: 'git_commit human gate: human_decision_authority',
+  insufficient_safety_evidence: 'git_commit human gate: insufficient_safety_evidence',
+}
+const SAFE_RISK_RULE_LABELS = new Set([
+  ...RISK_RULES.map(rule => rule.label),
+  GIT_COMMIT_EVIDENCE_VERIFIED_LABEL,
+  ...Object.values(GIT_COMMIT_HUMAN_GATE_LABELS),
+])
 const DIFF_SECRET_LABEL_PATTERN = /^diff:secret\([^)]*\)$/
 
 function sanitizeTriggeredRulesForApprovalRequest(triggeredRules: string[]): string[] {
@@ -183,6 +197,7 @@ function computeNextAction(
   riskLevel: RiskLevel,
   requiresApprovalByPolicy: boolean,
   newRequestId?: string,
+  gitCommitEvidenceVerified = false,
 ): NextAction {
   switch (outcome.decision) {
     case 'ALLOW':
@@ -195,7 +210,9 @@ function computeNextAction(
       }
       return {
         action: 'proceed',
-        message: 'リスクレベルが低いため承認不要。処理を続けてください。',
+        message: gitCommitEvidenceVerified
+          ? 'git_commit の Safety Evidence がすべて成立したため、人間承認なしで続行します（承認ではなく Evidence 検証の結果）。'
+          : 'リスクレベルが低いため承認不要。処理を続けてください。',
       }
 
     case 'PENDING_APPROVAL':
@@ -221,7 +238,7 @@ function computeNextAction(
         action: 'wait_for_approval',
         requestId: newRequestId,
         message: requiresApprovalByPolicy
-          ? 'この操作はポリシー上CEO承認が必要です。承認リクエストを作成しました。'
+          ? 'この操作はポリシー上、Safety Evidence が成立しないため人間承認が必要です。承認リクエストを作成しました。'
           : riskLevel === 'CRITICAL'
             ? '【CRITICAL】承認リクエストを作成しました。危険な変更を含むため、承認まですべての作業を停止してください。'
             : '承認リクエストを作成しました。HIGH リスク変更のため人間承認が必要です。安全な作業は継続可能です。',
@@ -425,14 +442,16 @@ export async function approvalGateRoutes(
 
     const sideEffects: SideEffectEvent[] = []
 
-    // MVP-A: git_commit は実際のriskLevelに関わらず常にCEO承認を必須にする。
+    // git_commit は policy 上の対象 action。人間承認が要るかどうかは、下の Safety Evidence 照合
+    // （`gitCommitEvidence.ts`）が成立したかで決まる（2026-10-02 以前は MVP-A により常に人間承認）。
     // riskLevel自体は書き換えない（decideGateOutcome/継続方針/表示文言だけで扱う）。
-    const requiresApprovalByPolicy = requestedAction === 'git_commit'
+    const isGitCommitPolicyAction = requestedAction === 'git_commit'
 
     // Phase A: git_commit Gateだけは実行中Jobを必須にし、任意クライアントが
     // ApprovalとJobの関連を作れないようAPI側で実体と内容を検証する。
     let linkedGitCommitApproval: ApprovalRequest | undefined
-    if (requiresApprovalByPolicy) {
+    let gitCommitJob: Job | undefined
+    if (isGitCommitPolicyAction) {
       if (!jobId) {
         return reply.status(400).send({ error: 'jobId is required for git_commit gate checks' })
       }
@@ -440,6 +459,7 @@ export async function approvalGateRoutes(
       if (!job) {
         return reply.status(404).send({ error: 'Job not found' })
       }
+      gitCommitJob = job
       if (
         job.taskId !== taskId ||
         job.safeCommand.kind !== 'git_commit' ||
@@ -491,7 +511,7 @@ export async function approvalGateRoutes(
     // アクティブな承認リクエストを取得
     // 同一Taskには複数の正当なJobが存在し得る。git_commitはTask単位の最新Approvalではなく、
     // jobs.approval_idでこのJobに結び付いたApprovalだけを再利用する。
-    let existingReq = requiresApprovalByPolicy
+    let existingReq = isGitCommitPolicyAction
       ? linkedGitCommitApproval
       : storage.approvalRequests.findActiveByTaskId(taskId)
 
@@ -532,19 +552,93 @@ export async function approvalGateRoutes(
         storage.approvalRequests.findByTaskId(taskId),
         targetCommit,
         targetDiffHash,
-        // policy 起因（git_commit）のときだけ action で絞る。
+        // policy 対象（git_commit）のときだけ action で絞る。
         // HIGH/CRITICAL の既存パスは従来どおり action を見ない（対象外）。
-        requiresApprovalByPolicy ? requestedAction : undefined,
+        isGitCommitPolicyAction ? requestedAction : undefined,
       )
     }
 
-    // policy起因（git_commit）で承認必須にした場合、commit/diffHashが偶然一致しても
+    // targetCommit / targetDiffHash がどこまで検証済みかを判定する。
+    //
+    // callerの申告値をそのままtrusted bindingとして保存してはならない。
+    // 既存の readExactApprovalDiff は実worktreeのHEADとdiff hashの**両方**へ照合するので、
+    // 新しい検証機構を作らずこれを再利用する。照合できない場合は `unverified` として記録し、
+    // trustされているかのように見せない。
+    //
+    // git_commit の Safety Evidence はこの authoritative な読み取り結果を入力にするため、
+    // Gate 判定より前に行う（判定結果には依存しない）。
+    let bindingVerification: GateEvaluationEvidence['bindingVerification'] =
+      diffText !== undefined ? 'diff_text_hash' : 'unverified'
+    let authoritativeDiffText: string | undefined
+    try {
+      const authoritative = readExactApprovalDiff(targetWorkingDir, targetCommit, targetDiffHash)
+      if (!authoritative.stale) {
+        bindingVerification = 'authoritative'
+        authoritativeDiffText = authoritative.diffText
+      }
+    } catch (error: unknown) {
+      app.log.warn(
+        { taskId, error: error instanceof Error ? error.message : String(error) },
+        'gate evidence binding could not be verified against the worktree',
+      )
+    }
+
+    // canonical manifest（authoritative のときだけ）。approved_content_hash と
+    // git_commit の Safety Evidence の両方がこの 1 回の読み取りを使う。
+    let authoritativeManifest: ReturnType<typeof buildWorktreeChangeManifest> | undefined
+    if (bindingVerification === 'authoritative') {
+      try {
+        authoritativeManifest = buildWorktreeChangeManifest(targetWorkingDir)
+      } catch (error: unknown) {
+        app.log.warn(
+          { taskId, error: error instanceof Error ? error.message : String(error) },
+          'approved content manifest could not be computed',
+        )
+      }
+    }
+
+    // git_commit の Safety Evidence 照合（Decision Authority Principle Stage 1）。
+    // 成立したときだけ人間承認を外す。不成立・照合不能は既存の ApprovalRequest へ fail closed。
+    let gitCommitEvidence: GitCommitEvidenceResult | undefined
+    if (isGitCommitPolicyAction) {
+      const task = storage.tasks.findById(taskId)
+      if (!gitCommitJob || !task) {
+        gitCommitEvidence = {
+          passed: false,
+          reason: 'insufficient_safety_evidence',
+          failures: ['review_lineage_unresolved'],
+        }
+      } else {
+        gitCommitEvidence = evaluateGitCommitEvidence(storage, {
+          gitCommitJob,
+          task,
+          targetCommit,
+          targetDiffHash,
+          declaredChangedFiles: changedFiles,
+          riskReview,
+          authoritativeDiffText,
+          manifest: authoritativeManifest,
+          // secret scan は API 自身が読んだ diff 本文に対して行う（caller の diffText は使わない）
+          secretScanHitCount: authoritativeDiffText !== undefined
+            ? scanDiffForSecrets(authoritativeDiffText).hits.length
+            : undefined,
+          workingDir: targetWorkingDir,
+          taskApprovalRequests: storage.approvalRequests.findByTaskId(taskId),
+        })
+      }
+    }
+    const gitCommitEvidenceVerified = gitCommitEvidence?.passed === true
+
+    // git_commit で Safety Evidence が成立しなかったときだけ、人間承認を必須にする。
+    const requiresApprovalByPolicy = isGitCommitPolicyAction && !gitCommitEvidenceVerified
+
+    // policy対象（git_commit）では、commit/diffHashが偶然一致しても
     // 無関係なrequestedAction向けに発行された既存Approval Requestを再利用しない
     // （例: 'test' への承認が偶然同じcommit/diffHashの'git_commit'を通過させない）。
-    // 既存のHIGH/CRITICALパス（requiresApprovalByPolicy=false）はrequestedActionを
+    // 既存のHIGH/CRITICALパス（git_commit 以外）はrequestedActionを
     // 見ない従来どおりの挙動を維持する（対象外）。
     const existingReqForOutcome =
-      requiresApprovalByPolicy && existingReq && existingReq.requestedAction !== requestedAction
+      isGitCommitPolicyAction && existingReq && existingReq.requestedAction !== requestedAction
         ? undefined
         : existingReq
 
@@ -556,6 +650,13 @@ export async function approvalGateRoutes(
     // storage 副作用
     let approvalRequest: ApprovalRequest | undefined = existingReq
     let newRequestId: string | undefined
+
+    // ApprovalRequest / gate_evaluations に残す git_commit の判定理由ラベル
+    const gitCommitEvidenceLabels: string[] = gitCommitEvidence === undefined
+      ? []
+      : gitCommitEvidence.passed
+        ? [GIT_COMMIT_EVIDENCE_VERIFIED_LABEL]
+        : [GIT_COMMIT_HUMAN_GATE_LABELS[gitCommitEvidence.reason]]
 
     if (outcome.decision === 'STALE') {
       storage.approvalRequests.updateStatus(existingReq!.id, 'STALE', undefined, true)
@@ -569,12 +670,12 @@ export async function approvalGateRoutes(
       }
       const safeTriggeredRules = sanitizeTriggeredRulesForApprovalRequest(riskReview.triggeredRules)
       // policy起因（git_commit）でBLOCKEDになった場合、実riskLevelは変更せず
-      // triggeredRulesへ固定ラベルを追加して理由を残す（重複追加はしない）
-      const triggeredRulesWithPolicy = requiresApprovalByPolicy && !safeTriggeredRules.includes(GIT_COMMIT_POLICY_LABEL)
-        ? [...safeTriggeredRules, GIT_COMMIT_POLICY_LABEL]
+      // triggeredRulesへ固定ラベルと人間承認へ送った理由を追加する（重複追加はしない）
+      const triggeredRulesWithPolicy = requiresApprovalByPolicy
+        ? [...new Set([...safeTriggeredRules, GIT_COMMIT_POLICY_LABEL, ...gitCommitEvidenceLabels])]
         : safeTriggeredRules
       const approvalData = buildApprovalRequest(input, riskReview.riskLevel, triggeredRulesWithPolicy)
-      if (requiresApprovalByPolicy) {
+      if (isGitCommitPolicyAction) {
         const created = storage.approvalRequests.createForJob(approvalData, jobId!)
         if (!created.ok) {
           return reply.status(created.code === 'JOB_NOT_FOUND' ? 404 : 409).send({
@@ -589,41 +690,13 @@ export async function approvalGateRoutes(
       newRequestId = approvalRequest.id
     }
 
-    // targetCommit / targetDiffHash がどこまで検証済みかを判定する。
-    //
-    // callerの申告値をそのままtrusted bindingとして保存してはならない。
-    // 既存の readExactApprovalDiff は実worktreeのHEADとdiff hashの**両方**へ照合するので、
-    // 新しい検証機構を作らずこれを再利用する。照合できない場合は `unverified` として記録し、
-    // trustされているかのように見せない。
-    let bindingVerification: GateEvaluationEvidence['bindingVerification'] =
-      diffText !== undefined ? 'diff_text_hash' : 'unverified'
-    try {
-      const authoritative = readExactApprovalDiff(TARGET_WORKING_DIR, targetCommit, targetDiffHash)
-      if (!authoritative.stale) {
-        bindingVerification = 'authoritative'
-      }
-    } catch (error: unknown) {
-      app.log.warn(
-        { taskId, error: error instanceof Error ? error.message : String(error) },
-        'gate evidence binding could not be verified against the worktree',
-      )
-    }
-
     // approved_content_hash: ALLOWした変更集合のcanonical manifest hash。
     // commit後に「Bが本当にこの変更集合から作られたか」を独立検証するために使う。
     // binding_verificationがauthoritativeでないevidenceには付けない
     // （申告値ベースのevidenceをcommit後にauthoritativeへ昇格させないため）。
-    let approvedContentHash: string | undefined
-    if (bindingVerification === 'authoritative') {
-      try {
-        approvedContentHash = computeChangeManifestHash(buildWorktreeChangeManifest(TARGET_WORKING_DIR))
-      } catch (error: unknown) {
-        app.log.warn(
-          { taskId, error: error instanceof Error ? error.message : String(error) },
-          'approved content manifest could not be computed',
-        )
-      }
-    }
+    const approvedContentHash = authoritativeManifest !== undefined
+      ? computeChangeManifestHash(authoritativeManifest)
+      : undefined
 
     // Gate評価のdurable evidenceを残す。
     //
@@ -641,14 +714,38 @@ export async function approvalGateRoutes(
       targetDiffHash,
       decision: outcome.decision,
       riskLevel: riskReview.riskLevel,
-      triggeredRules: sanitizeTriggeredRulesForApprovalRequest(riskReview.triggeredRules),
+      triggeredRules: sanitizeTriggeredRulesForApprovalRequest([
+        ...riskReview.triggeredRules,
+        ...gitCommitEvidenceLabels,
+      ]),
       policyVersion: GATE_POLICY_VERSION,
       bindingVerification,
       approvedContentHash,
     })
 
+    // git_commit の判定根拠を audit に残す（承認ではなく Evidence 検証の記録）。
+    // 不成立の内訳は短いコードだけにし、diff 本文・path・秘密情報は含めない。
+    if (gitCommitEvidence !== undefined && jobId !== undefined) {
+      storage.auditLog.record({
+        actor: 'api',
+        operation: 'git_commit_safety_evidence',
+        entityType: 'job',
+        entityId: jobId,
+        result: gitCommitEvidence.passed ? 'verified' : gitCommitEvidence.reason,
+        detail: [
+          `policy=${GATE_POLICY_VERSION}`,
+          `decision=${outcome.decision}`,
+          `commit=${targetCommit}`,
+          `diffHash=${targetDiffHash}`,
+          ...(gitCommitEvidence.passed ? [] : [`failed=${gitCommitEvidence.failures.join(',')}`]),
+        ].join(' '),
+      })
+    }
+
     const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)
-    const nextAction = computeNextAction(outcome, riskReview.riskLevel, requiresApprovalByPolicy, newRequestId)
+    const nextAction = computeNextAction(
+      outcome, riskReview.riskLevel, requiresApprovalByPolicy, newRequestId, gitCommitEvidenceVerified,
+    )
 
     const response: GateCheckResponse = {
       outcome,
