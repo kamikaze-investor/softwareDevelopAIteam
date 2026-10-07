@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { MetaReviewFocus } from '@ai-team/shared'
-import { selectFocuses, selectRoadmapReviewFocuses } from './focusSelector.js'
+import {
+  hasDecisionAuthorityReviewFocus,
+  selectFocuses,
+  selectRoadmapReviewFocuses,
+} from './focusSelector.js'
 
 const VALID_FOCUSES: readonly MetaReviewFocus[] = [
   'strategic_alignment',
@@ -52,6 +56,14 @@ describe('selectFocuses', () => {
     expect(focuses).toContain('product_ceo_experience')
     expect(focuses).toContain('scope_simplicity')
     expect(focuses.every((focus) => VALID_FOCUSES.includes(focus))).toBe(true)
+  })
+
+  it('selects canonical authority context only for authority/recovery/approval surfaces', () => {
+    expect(hasDecisionAuthorityReviewFocus(['apps/api/src/pl/recovery.ts'])).toBe(true)
+    expect(hasDecisionAuthorityReviewFocus(['apps/api/src/routes/tasks.ts'])).toBe(true)
+    expect(hasDecisionAuthorityReviewFocus(['docs/project_memory/rules/approval_rules.md'])).toBe(true)
+    expect(hasDecisionAuthorityReviewFocus(['apps/api/src/routes/health.ts'])).toBe(false)
+    expect(hasDecisionAuthorityReviewFocus(['apps/mobile/src/screens/Home.tsx'])).toBe(false)
   })
 })
 

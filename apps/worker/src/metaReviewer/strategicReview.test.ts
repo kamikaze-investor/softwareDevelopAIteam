@@ -21,6 +21,7 @@ vi.mock('./runner.js', () => ({
     relatedSpecs: [],
   })),
   buildMetaReviewPrompt: vi.fn(() => 'legacy meta review prompt'),
+  providedCanonicalPrincipleIds: vi.fn(() => ['specs/00 §3.14']),
   parseMetaReviewResult: vi.fn(() => ({
     id: 'meta-review-task-test',
     taskId: 'task-test',
@@ -365,6 +366,36 @@ describe('runStrategicMetaReview', () => {
       expect(outcome.unavailable).toBe(false)
       expect(outcome.verdict).toBe('changes_requested')
       expect(outcome.summary).toBe('please address X')
+    })
+
+    it('uses the Task Contract as post-diff purpose context instead of only the title', async () => {
+      const run = vi.fn().mockResolvedValue({
+        blocked: false,
+        exitCode: 0,
+        stdout: 'review output',
+        stderr: '',
+        parsedOutput: { verdict: 'approved', summary: 'ok', issues: [], confidence: 0.9 },
+      })
+      mockCreateAiCliAdapter.mockReturnValue({ run } as unknown as ReturnType<typeof createAiCliAdapter>)
+
+      await runIndependentReview({
+        subjectId: 'task-contract',
+        taskTitle: 'Canonical delivery',
+        changedFiles: ['apps/api/src/pl/recovery.ts'],
+        gitDiff: '+ implementation',
+        workingDir: repoRoot,
+        materialKind: 'diff',
+        taskContract: {
+          acceptanceCriteria: ['Decision Authority reaches the reviewer'],
+          allowedPaths: ['apps/api/src/pl/'],
+        },
+      })
+
+      const prompt = (run.mock.calls[0]![0] as { prompt: string }).prompt
+      expect(prompt).toContain('[Task Contract]')
+      expect(prompt).toContain('Decision Authority reaches the reviewer')
+      expect(prompt).toContain('apps/api/src/pl/')
+      expect(prompt).toContain('## 1-2. Human Decision Authority')
     })
   })
 

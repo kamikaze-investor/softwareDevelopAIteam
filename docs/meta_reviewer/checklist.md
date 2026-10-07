@@ -45,6 +45,10 @@
 
 ## チェック3: 権限境界
 
+CEO へ上げるのは `specs/22_safety_approval_design_principle.md` §14-3 の DA trigger (1)〜(7) に該当する場合だけ。
+HIGH / CRITICAL、production、security、DB migration、recovery、または技術的に難しいという理由だけで CEO 承認を要求しない。
+Technical Safety Decision は、Risk に応じて Safety Evidence を強めて評価する。
+
 ### CLAUDE.md
 - [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない
 - [ ] Repository Boundary（ai-team-backend / target-project）が維持されている
@@ -107,7 +111,8 @@
 |---|---|---|
 | Cage弱体化 | 1件でも | `blocked` |
 | Sandbox制限解除 | 1件でも | `blocked` |
-| 権限境界変更 | 1件でも | `blocked` + CEO通知 |
+| DA trigger (1)〜(7) | 1件でも | `blocked` + CEO通知 |
+| 技術的な権限・復旧・approval 変更（DA trigger なし） | Risk に応じて | Safety Evidence を強化して AI が判定 |
 | 禁止コマンド追加 | 1件でも | `blocked` |
 | 仕様思想逸脱 | 軽微 | `changes_requested` |
 | MVPスコープ外 | あり | `changes_requested` |

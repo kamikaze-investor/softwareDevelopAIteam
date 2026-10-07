@@ -41,7 +41,11 @@ function normalizePath(file: string): string {
 }
 
 export function mapFileToFocuses(file: string): MetaReviewFocus[] {
-  const lower = file.toLowerCase()
+  const lower = normalizePath(file).toLowerCase()
+
+  if (isDecisionAuthoritySurface(lower)) {
+    return ['safety_recovery', 'auth_permission']
+  }
 
   if (lower.includes('/guards/') || lower.includes('guards/')) {
     return ['safety_recovery', 'auth_permission']
@@ -76,6 +80,27 @@ export function mapFileToFocuses(file: string): MetaReviewFocus[] {
   }
 
   return ['scope_simplicity']
+}
+
+export function hasDecisionAuthorityReviewFocus(files: readonly string[]): boolean {
+  return files.some((file) => isDecisionAuthoritySurface(normalizePath(file).toLowerCase()))
+}
+
+function isDecisionAuthoritySurface(file: string): boolean {
+  const basename = file.split('/').at(-1) ?? ''
+  return file.startsWith('apps/api/src/pl/')
+    || file.startsWith('apps/api/src/designreview/resume')
+    || file.startsWith('apps/worker/src/approvallevel/')
+    || file.includes('/guards/')
+    || file === 'packages/shared/src/plactionpolicy.ts'
+    || file === 'apps/api/src/routes/tasks.ts'
+    || file === 'specs/22_safety_approval_design_principle.md'
+    || file.endsWith('/approval_rules.md')
+    || basename.includes('approvalgate')
+    || basename.includes('commitgate')
+    || basename.includes('gateclient')
+    || basename.includes('gatepolicy')
+    || basename.includes('gateprocessor')
 }
 
 function hasDesignSignal(files: readonly string[]): boolean {

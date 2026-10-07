@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { buildFocusedOutputContract, parseFocusedReviewResponse, selectFocusPrinciples } from './strategicReview'
+import { resolve } from 'node:path'
+import {
+  buildFocusedOutputContract,
+  buildFocusedReviewPrompt,
+  parseFocusedReviewResponse,
+  selectFocusPrinciples,
+} from './strategicReview'
+
+const REPO_ROOT = resolve(__dirname, '../../../..')
 
 /**
  * Focused Review へ Principle Compliance を統合した部分の検証。
@@ -32,6 +40,36 @@ describe('focused review prompt carries the applicable principles', () => {
     expect(contract).toContain('Do not invent principle ids')
     // 原則の全文は載せない（原則数に対して prompt が線形に太らないことが完了条件）。
     expect(contract).not.toContain('an unfalsifiable TODO')
+  })
+
+  it('delivers Decision Authority only to safety_recovery and auth_permission focuses', async () => {
+    const input = {
+      subjectId: 'task-authority',
+      taskTitle: 'authority review',
+      changedFiles: ['apps/api/src/pl/recovery.ts'],
+      gitDiff: '+ change',
+      workingDir: REPO_ROOT,
+      controlContextDir: REPO_ROOT,
+    }
+    const safety = await buildFocusedReviewPrompt(
+      input,
+      'safety_recovery',
+      selectFocusPrinciples('safety_recovery'),
+    )
+    const auth = await buildFocusedReviewPrompt(
+      input,
+      'auth_permission',
+      selectFocusPrinciples('auth_permission'),
+    )
+    const architecture = await buildFocusedReviewPrompt(
+      input,
+      'architecture_responsibility',
+      selectFocusPrinciples('architecture_responsibility'),
+    )
+
+    expect(safety.prompt).toContain('## 1-2. Human Decision Authority')
+    expect(auth.prompt).toContain('## 14-3. Priority 2 境界表')
+    expect(architecture.prompt).not.toContain('## 1-2. Human Decision Authority')
   })
 })
 
@@ -100,6 +138,29 @@ describe('parseFocusedReviewResponse with principle verdicts', () => {
     )
 
     expect(outcome.result.appliedPrinciples?.some((item) => item.principleId === 'made-up-principle')).toBe(false)
+  })
+
+  it('accepts principle_conflict only when the finding names a provided principle', () => {
+    const safetySelection = selectFocusPrinciples('safety_recovery')
+    const review = (message: string) => JSON.stringify({
+      decision: 'CONFLICT',
+      summary: 's',
+      findings: [{ severity: 'high', category: 'principle_conflict', message }],
+    })
+
+    const accepted = parseFocusedReviewResponse(
+      review('specs/22 §14-3 conflicts with the Constitution'),
+      'safety_recovery',
+      safetySelection,
+    )
+    const normalized = parseFocusedReviewResponse(
+      review('unprovided-principle conflicts with the Constitution'),
+      'safety_recovery',
+      safetySelection,
+    )
+
+    expect(accepted.result.findings[0].category).toBe('principle_conflict')
+    expect(normalized.result.findings[0].category).toBe('spec_violation')
   })
 
   it('decision が壊れている場合の fail-closed は従来どおり', () => {

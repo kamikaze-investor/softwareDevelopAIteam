@@ -88,7 +88,13 @@ async function main(): Promise<void> {
   loadEnvFile()
 
   // .env ロード後に runner.ts / geminiRouter.ts / metaReviewFallbackRouter.ts を評価させるため動的 import する
-  const { buildMetaReviewRequest, buildMetaReviewPrompt, parseMetaReviewResult, classifyFormalVerdict } =
+  const {
+    buildMetaReviewRequest,
+    buildMetaReviewPrompt,
+    classifyFormalVerdict,
+    parseMetaReviewResult,
+    providedCanonicalPrincipleIds,
+  } =
     await import('./runner.js')
   const { reviewWithProviderFallback, MetaReviewProviderError, sanitizeMessage } = await import('./metaReviewFallbackRouter.js')
   const { AGY_REVIEW_MODEL } = await import('./geminiRouter.js')
@@ -97,6 +103,7 @@ async function main(): Promise<void> {
   const baseSha = process.env.BASE_SHA       // GitHub Actions: PR の base SHA
   const headSha = process.env.HEAD_SHA       // GitHub Actions: PR の head SHA
   const prTitle = process.env.PR_TITLE ?? 'Manual Meta Review'
+  const prBody = process.env.PR_BODY
   const taskId  = process.env.TASK_ID ?? `pr-${Date.now()}`
   const workingDir = process.cwd()
   const resultFilePath = process.env.META_REVIEW_RESULT_PATH
@@ -159,8 +166,10 @@ async function main(): Promise<void> {
     changedFiles,
     workingDir,
     gitDiff,
+    prBody,
   )
   const prompt = buildMetaReviewPrompt(request)
+  const providedPrincipleIds = providedCanonicalPrincipleIds(request)
 
   // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
   // GEMINI_MODEL は meta-review.yml が vars.GEMINI_MODEL（未設定時 gemini-2.5-flash）を渡す。
@@ -188,7 +197,7 @@ async function main(): Promise<void> {
       // text が返っただけでは成功とせず、valid な formal verdict が成立して初めて成功とする。
       // 不成立は transient として既存の bounded retry -> 次 stage -> Copilot へ流れる。
       // 判定の中身では分岐しないので、BLOCKED を別 provider で取り直す経路は生まれない。
-      classifyVerdict: classifyFormalVerdict,
+      classifyVerdict: (raw) => classifyFormalVerdict(raw, providedPrincipleIds),
     })
     rawResponse = reviewResult.raw
     providerUsed = reviewResult.providerUsed
@@ -238,7 +247,7 @@ async function main(): Promise<void> {
   // providerUsed は監査証跡用にファイル書き込み時のみ additive に付与する
   // （2026-08-26 独立レビュー指摘: 実際に応答したプロバイダーが記録されず、
   //   PRコメントが常に「Reviewed by Gemini」と表示されていた問題への対応）。
-  const parsedResult = parseMetaReviewResult(rawResponse, taskId)
+  const parsedResult = parseMetaReviewResult(rawResponse, taskId, providedPrincipleIds)
 
   // **成功経路の本文も sink へ出る前に通す。**
   // summary / findings は result ファイル・CI ログ・公開 PR コメントの3箇所へ出る。
