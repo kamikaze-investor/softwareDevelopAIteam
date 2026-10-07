@@ -38,7 +38,11 @@ import {
 import { applyIndependentReviewOverride, resolveFinalDecision } from '@ai-team/shared'
 export { applyIndependentReviewOverride, resolveFinalDecision }
 import { classifyReviewLoad, ROADMAP_REVIEW_LOAD_CLASSIFICATION } from '../approvalLevel/reviewLoadClassifier.js'
-import { selectFocuses, selectRoadmapReviewFocuses } from '../approvalLevel/focusSelector.js'
+import {
+  hasDecisionAuthorityReviewFocus,
+  selectFocuses,
+  selectRoadmapReviewFocuses,
+} from '../approvalLevel/focusSelector.js'
 import {
   buildMetaReviewPrompt,
   buildMetaReviewRequest,
@@ -630,9 +634,10 @@ export function selectFocusPrinciples(focus: MetaReviewFocus): PrincipleSelectio
 export function providedFocusedPrincipleIds(
   focus: MetaReviewFocus,
   selection: readonly PrincipleSelection[],
+  includeDecisionAuthority = focus === 'safety_recovery' || focus === 'auth_permission',
 ): string[] {
   const ids = selection.map((principle) => principle.slug)
-  return focus === 'safety_recovery' || focus === 'auth_permission'
+  return includeDecisionAuthority
     ? [...ids, ...DECISION_AUTHORITY_PRINCIPLE_IDS]
     : ids
 }
@@ -642,7 +647,31 @@ export async function buildFocusedReviewPrompt(
   focus: MetaReviewFocus,
   selection: readonly PrincipleSelection[],
 ): Promise<{ prompt: string; unavailableReason?: string }> {
-  const providedPrincipleIds = providedFocusedPrincipleIds(focus, selection)
+  const needsDecisionAuthority = focus === 'safety_recovery'
+    || focus === 'auth_permission'
+    || hasDecisionAuthorityReviewFocus(input.changedFiles)
+  const providedPrincipleIds = providedFocusedPrincipleIds(
+    focus,
+    selection,
+    needsDecisionAuthority,
+  )
+  const decisionAuthorityPrinciples = needsDecisionAuthority
+    ? loadDecisionAuthorityPrinciples([
+        decisionAuthorityPathForControlContextDir(resolveControlContextDir(input)),
+      ])
+    : undefined
+  const decisionAuthorityWarning = decisionAuthorityPrinciples === undefined
+    ? undefined
+    : formatDecisionAuthorityPrinciplesWarning(decisionAuthorityPrinciples)
+  if (decisionAuthorityWarning) console.warn(decisionAuthorityWarning)
+  const decisionAuthoritySection = decisionAuthorityPrinciples === undefined
+    ? ''
+    : [
+        '## Canonical Decision Authority Principle excerpt',
+        '',
+        buildDecisionAuthorityPrinciplesPrompt(decisionAuthorityPrinciples),
+      ].join('\n')
+
   if (focus === 'strategic_alignment') {
     const context = await buildStrategicAlignmentContext(input)
     if (context.missingRequiredPaths.length > 0) {
@@ -660,6 +689,7 @@ export async function buildFocusedReviewPrompt(
         `Focus description: ${FOCUS_DESCRIPTIONS[focus]}`,
         '',
         context.text,
+        ...(decisionAuthoritySection.length > 0 ? ['', decisionAuthoritySection] : []),
         '',
         buildReviewMaterialSection(input.gitDiff, input.materialKind ?? 'diff'),
         '',
@@ -675,24 +705,6 @@ export async function buildFocusedReviewPrompt(
       unavailableReason: checklistContext.unavailableReason,
     }
   }
-
-  const needsDecisionAuthority = focus === 'safety_recovery' || focus === 'auth_permission'
-  const decisionAuthorityPrinciples = needsDecisionAuthority
-    ? loadDecisionAuthorityPrinciples([
-        decisionAuthorityPathForControlContextDir(resolveControlContextDir(input)),
-      ])
-    : undefined
-  const decisionAuthorityWarning = decisionAuthorityPrinciples === undefined
-    ? undefined
-    : formatDecisionAuthorityPrinciplesWarning(decisionAuthorityPrinciples)
-  if (decisionAuthorityWarning) console.warn(decisionAuthorityWarning)
-  const decisionAuthoritySection = decisionAuthorityPrinciples === undefined
-    ? ''
-    : [
-        '## Canonical Decision Authority Principle excerpt',
-        '',
-        buildDecisionAuthorityPrinciplesPrompt(decisionAuthorityPrinciples),
-      ].join('\n')
 
   return {
     prompt: [

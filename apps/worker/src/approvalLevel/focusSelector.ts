@@ -41,11 +41,7 @@ function normalizePath(file: string): string {
 }
 
 export function mapFileToFocuses(file: string): MetaReviewFocus[] {
-  const lower = normalizePath(file).toLowerCase()
-
-  if (isDecisionAuthoritySurface(lower)) {
-    return ['safety_recovery', 'auth_permission']
-  }
+  const lower = file.toLowerCase()
 
   if (lower.includes('/guards/') || lower.includes('guards/')) {
     return ['safety_recovery', 'auth_permission']
@@ -99,7 +95,6 @@ function isDecisionAuthoritySurface(file: string): boolean {
     || file === 'specs/08_permissions.md'
     || file.startsWith('docs/meta_reviewer/')
     || file.startsWith('apps/worker/src/metareviewer/')
-    || file.includes('migration')
     || basename === 'package.json'
     || file === 'pnpm-lock.yaml'
     || file.startsWith('apps/api/src/pl/')

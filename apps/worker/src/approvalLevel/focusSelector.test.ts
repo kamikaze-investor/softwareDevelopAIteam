@@ -81,7 +81,6 @@ describe('selectFocuses', () => {
       'specs/08_permissions.md',
       'docs/meta_reviewer/prompt.md',
       'apps/worker/src/metaReviewer/runner.ts',
-      'apps/api/src/storage/migrations/004_add_column.ts',
       'package.json',
       'apps/worker/package.json',
       'pnpm-lock.yaml',
@@ -90,6 +89,10 @@ describe('selectFocuses', () => {
     for (const surface of authoritySurfaces) {
       expect(hasDecisionAuthorityReviewFocus([surface]), surface).toBe(true)
     }
+
+    expect(hasDecisionAuthorityReviewFocus([
+      'apps/api/src/storage/migrations/004_add_column.ts',
+    ])).toBe(false)
   })
 })
 

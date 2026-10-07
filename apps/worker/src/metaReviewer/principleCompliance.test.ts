@@ -42,7 +42,7 @@ describe('focused review prompt carries the applicable principles', () => {
     expect(contract).not.toContain('an unfalsifiable TODO')
   })
 
-  it('delivers Decision Authority only to safety_recovery and auth_permission focuses', async () => {
+  it('delivers Decision Authority for authority paths regardless of focus', async () => {
     const input = {
       subjectId: 'task-authority',
       taskTitle: 'authority review',
@@ -66,10 +66,22 @@ describe('focused review prompt carries the applicable principles', () => {
       'architecture_responsibility',
       selectFocusPrinciples('architecture_responsibility'),
     )
+    const strategic = await buildFocusedReviewPrompt(
+      input,
+      'strategic_alignment',
+      selectFocusPrinciples('strategic_alignment'),
+    )
+    const unrelatedArchitecture = await buildFocusedReviewPrompt(
+      { ...input, changedFiles: ['apps/mobile/src/screens/Home.tsx'] },
+      'architecture_responsibility',
+      selectFocusPrinciples('architecture_responsibility'),
+    )
 
     expect(safety.prompt).toContain('## 1-2. Human Decision Authority')
     expect(auth.prompt).toContain('## 14-3. Priority 2 境界表')
-    expect(architecture.prompt).not.toContain('## 1-2. Human Decision Authority')
+    expect(architecture.prompt).toContain('## 1-2. Human Decision Authority')
+    expect(strategic.prompt).toContain('## 1-2. Human Decision Authority')
+    expect(unrelatedArchitecture.prompt).not.toContain('## 1-2. Human Decision Authority')
   })
 })
 
