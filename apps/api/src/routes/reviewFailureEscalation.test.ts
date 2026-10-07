@@ -72,6 +72,7 @@ async function createTask(projectId: string): Promise<Task> {
   return storage.tasks.create({
     projectId, title: 'T', description: '', status: 'pending',
     assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 1,
+    allowedPaths: ['src'], forbiddenPaths: [],
   })
 }
 
@@ -103,6 +104,158 @@ beforeEach(() => {
 })
 
 describe('review-failure-escalation gap', () => {
+  it('secret-scan refusal is persisted and atomically admitted to the existing repair flow', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(project.id)
+      const { review } = await createImplementAndReview(task)
+      const storage = await getStorage()
+      const matchedValue = 'do-not-persist-this-value'
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${review.id}`,
+        payload: {
+          status: 'failed',
+          exitCode: 1,
+          stderr: 'Prompt refused by the pre-send secret scan',
+          failureMetadata: {
+            workspaceState: 'unchanged',
+            refusal: {
+              kind: 'secret_scan',
+              patternKinds: ['password assignment'],
+              repairEligible: true,
+              repairEligibilityReason: 'implementation_added_generic_assignment',
+            },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(storage.jobs.findById(review.id)?.failureMetadata?.refusal).toEqual({
+        kind: 'secret_scan',
+        patternKinds: ['password assignment'],
+        repairEligible: true,
+        repairEligibilityReason: 'implementation_added_generic_assignment',
+      })
+      const runs = storage.designReviewRuns.findByTaskId(task.id)
+      expect(runs).toHaveLength(1)
+      expect(runs[0]?.designText).toContain('[Task Contract]')
+      expect(runs[0]?.designText).toContain('<<<UNTRUSTED_FAILURE_DATA>>>')
+      expect(runs[0]?.designText).toContain('kind: secret_scan')
+      expect(runs[0]?.designText).toContain('password assignment')
+      expect(JSON.stringify({ run: runs[0], job: storage.jobs.findById(review.id) }))
+        .not.toContain(matchedValue)
+    })
+  })
+
+  it('escalates an eligible refusal when repair admission skips an existing repair Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(project.id)
+      const { implement, review } = await createImplementAndReview(task)
+      const storage = await getStorage()
+      storage.jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `repair:${implement.id}:1`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'implement',
+      })
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${review.id}`,
+        payload: {
+          status: 'failed',
+          exitCode: 1,
+          stderr: 'Prompt refused by the pre-send secret scan',
+          failureMetadata: {
+            workspaceState: 'unchanged',
+            refusal: {
+              kind: 'secret_scan',
+              patternKinds: ['password assignment'],
+              repairEligible: true,
+              repairEligibilityReason: 'implementation_added_generic_assignment',
+            },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(storage.jobs.findById(review.id)?.status).toBe('failed')
+      expect(storage.tasks.findById(task.id)?.status).toBe('blocked')
+      expect(storage.designReviewRuns.findByTaskId(task.id)).toHaveLength(0)
+    })
+  })
+
+  it('rejects matched secret text instead of persisting it in refusal metadata or audit', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(project.id)
+      const { review } = await createImplementAndReview(task)
+      const storage = await getStorage()
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${review.id}`,
+        payload: {
+          status: 'failed',
+          exitCode: 1,
+          failureMetadata: {
+            refusal: {
+              kind: 'secret_scan',
+              patternKinds: ['password assignment'],
+              repairEligible: true,
+              repairEligibilityReason: 'implementation_added_generic_assignment',
+              matchedText: 'password=never-persist-this-value',
+            },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(400)
+      expect(storage.jobs.findById(review.id)?.status).toBe('running')
+      expect(storage.designReviewRuns.findByTaskId(task.id)).toHaveLength(0)
+      expect(JSON.stringify(storage.jobs.findById(review.id))).not.toContain('never-persist-this-value')
+    })
+  })
+
+  it('does not upgrade a Worker-ineligible refusal and keeps the existing Human escalation', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(project.id)
+      const { review } = await createImplementAndReview(task)
+      const storage = await getStorage()
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${review.id}`,
+        payload: {
+          status: 'failed',
+          exitCode: 1,
+          stderr: 'Prompt refused by the pre-send secret scan',
+          failureMetadata: {
+            workspaceState: 'unchanged',
+            refusal: {
+              kind: 'secret_scan',
+              patternKinds: ['password assignment'],
+              repairEligible: false,
+              repairEligibilityReason: 'match_not_owned_by_implementation',
+            },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(storage.designReviewRuns.findByTaskId(task.id)).toHaveLength(0)
+      expect(storage.tasks.findById(task.id)?.status).toBe('blocked')
+      expect(storage.jobs.findById(review.id)?.failureMetadata?.refusal).toMatchObject({
+        repairEligible: false,
+        repairEligibilityReason: 'match_not_owned_by_implementation',
+      })
+    })
+  })
+
   it('structured result の無い review failure で Task が pending に残らず blocked へ escalate する', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

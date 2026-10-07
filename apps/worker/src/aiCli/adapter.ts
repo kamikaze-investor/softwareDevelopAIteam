@@ -25,8 +25,9 @@ import type {
   AiCliResult,
   AiCliAdapterConfig,
   AiCliProvider,
+  SecretScanPatternKind,
 } from '@ai-team/shared'
-import { isPromptSafe, shouldFallback } from '@ai-team/shared'
+import { CONTEXT_SECRET_PATTERNS, isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
 import { isInsideTargetRoot, TARGET_ROOT } from '../utils/pathUtils.js'
 import { buildTargetCommandEnv } from '../utils/safeEnv.js'
@@ -36,6 +37,18 @@ import {
   runContainedOrThrow,
 } from '../execution/runContainedCommand.js'
 import { saveJobLogs } from '../jobLogger.js'
+import { SECRET_SCAN_PATTERN_KINDS } from '../reviewRefusalEligibility.js'
+
+/** A pre-send refusal that exposes only which fixed pattern categories matched. */
+export class AiCliPromptRefusalError extends Error {
+  readonly patternKinds: SecretScanPatternKind[]
+
+  constructor(message: string, patternKinds: SecretScanPatternKind[]) {
+    super(message)
+    this.name = 'AiCliPromptRefusalError'
+    this.patternKinds = patternKinds
+  }
+}
 
 // ────────────────────────────────────────────────────────────
 // Windows .cmd / .bat ラップユーティリティ
@@ -397,9 +410,13 @@ export abstract class BaseCliAdapter implements IAiCliAdapter {
 
     // ── セキュリティチェック2: Secret Scan ─────────────────
     if (!isPromptSafe(request.prompt)) {
-      throw new Error(
+      const patternKinds = CONTEXT_SECRET_PATTERNS.flatMap((pattern, index) =>
+        pattern.test(request.prompt) ? [SECRET_SCAN_PATTERN_KINDS[index]!] : [],
+      )
+      throw new AiCliPromptRefusalError(
         `[AiCliAdapter] プロンプトに secret が検出されました（taskId: ${request.taskId}）\n` +
-        `ContextPackにAPIキー・秘密鍵・パスワードを含めてはいけません。`
+        `ContextPackにAPIキー・秘密鍵・パスワードを含めてはいけません。`,
+        patternKinds,
       )
     }
 
