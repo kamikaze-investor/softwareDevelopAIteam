@@ -15,6 +15,10 @@ import {
   CHEAP_AI_RETRY_BACKOFF_MS,
   CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS,
   CheapAiAttemptError,
+  PL_ADOPTION_PROPOSAL_AGENT,
+  PL_ADOPTION_PROPOSAL_AGENT_PROMPT,
+  PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS,
+  PL_ADOPTION_PROPOSAL_MAX_WAIT_MS,
   parseJsonObject,
   requestText,
   requestTextResult,
@@ -199,10 +203,12 @@ describe('OpenCode Go CLI client', () => {
       '--dir',
       options.cwd,
     ])
+    expect(args).toHaveLength(8)
     expect(args.at(-1)).toContain('Role: cheap_explainer')
     expect(args.at(-1)).toContain('System instructions:\nsystem prompt')
     expect(args.at(-1)).toContain('Keep the response within 321 tokens.')
     expect(args.at(-1)).toContain('User content:\nuser prompt')
+    expect(args).not.toContain('--agent')
     expect(args.join(' ')).not.toContain('test-key')
     expect(options).toMatchObject({
       shell: false,
@@ -211,6 +217,32 @@ describe('OpenCode Go CLI client', () => {
     })
     // timeout は spawn に任せず自前で持つ（AIteamOS が止めた事実を区別するため）
     expect(options).not.toHaveProperty('timeout')
+  })
+
+  it('selects the dedicated PL adoption proposal agent only when requested', async () => {
+    expect(PL_ADOPTION_PROPOSAL_AGENT_PROMPT).toBe(
+      'You answer with exactly one JSON object, as the request specifies, and nothing else.\n'
+        + 'You have no tools, no shell and no file access. Do not call tools, do not write tool-call markup,\n'
+        + 'do not try to inspect files or directories. Decide from the text you are given.',
+    )
+    arrangeCliResult({
+      stdout: `${JSON.stringify({ type: 'text', part: { text: '{}' } })}\n`,
+    })
+
+    await requestText(
+      'system',
+      'user',
+      { apiKey: 'test-key', agent: PL_ADOPTION_PROPOSAL_AGENT },
+      100,
+    )
+
+    const [, args] = getSpawnCall()
+    const agentFlagIndex = args.indexOf('--agent')
+    expect(args.slice(agentFlagIndex, agentFlagIndex + 2)).toEqual([
+      '--agent',
+      PL_ADOPTION_PROPOSAL_AGENT,
+    ])
+    expect(args.at(-1)).toContain('User content:\nuser')
   })
 
   it('throws on a non-zero CLI exit without exposing the API key', async () => {
@@ -314,6 +346,16 @@ describe('OpenCode Go CLI client', () => {
       `${JSON.stringify({
         $schema: 'https://opencode.ai/config.json',
         permission: 'deny',
+        agent: {
+          [PL_ADOPTION_PROPOSAL_AGENT]: {
+            mode: 'primary',
+            description: 'JSON-only adoption proposer',
+            prompt: 'You answer with exactly one JSON object, as the request specifies, and nothing else.\n'
+              + 'You have no tools, no shell and no file access. Do not call tools, do not write tool-call markup,\n'
+              + 'do not try to inspect files or directories. Decide from the text you are given.',
+            permission: { '*': 'deny' },
+          },
+        },
       }, null, 2)}\n`,
     )
   })
@@ -389,6 +431,69 @@ describe('OpenCode supervisor and bounded recovery (retryTransientOnce)', () => 
       '[cheapAi] attempt 1/2 failed (timeout); retrying once with a fresh OpenCode process',
       '[cheapAi] attempt 2/2 succeeded (attempt 1: timeout)',
     ])
+  })
+
+  it('dedicated agent を timeout 後の再試行にも引き継ぎ、2回だけ起動する', async () => {
+    const first = timingOutChild()
+    const second = arrangeControlledChild()
+    const killSpy = spyOnProcessKill({ [first.pid]: (signal) => first.close(null, signal) })
+
+    const pending = requestText(
+      'system',
+      'user',
+      { ...PL, agent: PL_ADOPTION_PROPOSAL_AGENT },
+      100,
+    )
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_ATTEMPT_TIMEOUT_MS)
+    expect(killSpy).not.toHaveBeenCalled()
+    expect(spawnMock).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(
+      PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS
+        - CHEAP_AI_ATTEMPT_TIMEOUT_MS
+        + CHEAP_AI_RETRY_BACKOFF_MS,
+    )
+    expect(killSpy).toHaveBeenCalledWith(-first.pid, 'SIGTERM')
+    second.close(0, null, { stdout: TEXT_OK })
+
+    await expect(pending).resolves.toBe('recovered answer')
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+    const calls = spawnMock.mock.calls as unknown as Array<[string, string[], SpawnOptions]>
+    for (const [, args] of calls) {
+      const agentFlagIndex = args.indexOf('--agent')
+      expect(args.slice(agentFlagIndex, agentFlagIndex + 2)).toEqual([
+        '--agent',
+        PL_ADOPTION_PROPOSAL_AGENT,
+      ])
+    }
+  })
+
+  it('dedicated agent を abnormal termination 後の再試行にも引き継ぐ', async () => {
+    const first = arrangeControlledChild()
+    const second = arrangeControlledChild()
+    spyOnProcessKill()
+
+    const pending = requestText(
+      'system',
+      'user',
+      { ...PL, agent: PL_ADOPTION_PROPOSAL_AGENT },
+      100,
+    )
+    await vi.advanceTimersByTimeAsync(0)
+    first.close(null, 'SIGKILL')
+    await vi.advanceTimersByTimeAsync(CHEAP_AI_RETRY_BACKOFF_MS)
+    second.close(0, null, { stdout: TEXT_OK })
+
+    await expect(pending).resolves.toBe('recovered answer')
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+    for (const call of spawnMock.mock.calls) {
+      const args = call[1] as string[]
+      const agentFlagIndex = args.indexOf('--agent')
+      expect(args.slice(agentFlagIndex, agentFlagIndex + 2)).toEqual([
+        '--agent',
+        PL_ADOPTION_PROPOSAL_AGENT,
+      ])
+    }
   })
 
   it('2回とも timeout なら従来どおり失敗し、3回目は起動しない', async () => {
@@ -613,6 +718,38 @@ describe('OpenCode supervisor and bounded recovery (retryTransientOnce)', () => 
     expect(settled).toBe(true)
     expect((await pending as Error).message).toBe('OpenCode CLI timed out after 60000ms (attempt 2/2; attempt 1: timeout)')
     expect(spawnMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('PL adoption proposal は専用の再試行込み上限ちょうどで settle する', async () => {
+    arrangeControlledChild()
+    arrangeControlledChild()
+    spyOnProcessKill()
+
+    let settled = false
+    const pending = requestText(
+      'system',
+      'user',
+      { ...PL, agent: PL_ADOPTION_PROPOSAL_AGENT },
+      100,
+    )
+      .catch((error: unknown) => error)
+      .finally(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(PL_ADOPTION_PROPOSAL_MAX_WAIT_MS - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(settled).toBe(true)
+    expect((await pending as Error).message).toBe(
+      'OpenCode CLI timed out after 120000ms (attempt 2/2; attempt 1: timeout)',
+    )
+    expect(spawnMock).toHaveBeenCalledTimes(2)
+    for (const call of spawnMock.mock.calls) {
+      const args = call[1] as string[]
+      const agentFlagIndex = args.indexOf('--agent')
+      expect(args.slice(agentFlagIndex, agentFlagIndex + 2)).toEqual([
+        '--agent',
+        PL_ADOPTION_PROPOSAL_AGENT,
+      ])
+    }
   })
 
   it('requestTextResult は timeout を throw せず reason: timeout の構造化結果で返す', async () => {

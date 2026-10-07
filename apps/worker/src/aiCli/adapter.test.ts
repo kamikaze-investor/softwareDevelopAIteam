@@ -16,6 +16,7 @@ import path from 'node:path'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isPromptSafe, shouldFallback } from '@ai-team/shared'
 import { createAiCliAdapter } from './factory.js'
+import { AiCliPromptRefusalError } from './adapter.js'
 
 
 vi.mock('../execution/runContainedCommand.js', async () => {
@@ -112,6 +113,27 @@ describe('isPromptSafe', () => {
 
 describe('BaseCliAdapter セキュリティチェック', () => {
   const adapter = createAiCliAdapter({ provider: 'claude_code' })
+
+  it('secret refusal exposes only value-free pattern categories', async () => {
+    const matchedValue = 'never-persist-this-password'
+    let refusal: unknown
+    try {
+      await adapter.run({
+        taskId: 'test-secret-reason',
+        provider: 'claude_code',
+        workingDir: '/workspace/target',
+        prompt: `password=${matchedValue}`,
+        contextFiles: [],
+        mode: 'review',
+      })
+    } catch (error: unknown) {
+      refusal = error
+    }
+
+    expect(refusal).toBeInstanceOf(AiCliPromptRefusalError)
+    expect((refusal as AiCliPromptRefusalError).patternKinds).toEqual(['password assignment'])
+    expect(JSON.stringify((refusal as AiCliPromptRefusalError).patternKinds)).not.toContain(matchedValue)
+  })
 
   it('TARGET_ROOT 外の workingDir はエラーになる', async () => {
     await expect(adapter.run({

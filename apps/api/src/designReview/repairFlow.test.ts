@@ -28,6 +28,8 @@ function seed(storage: IStorage): { taskId: string; projectId: string } {
   const task = storage.tasks.create({
     projectId: project.id, title: 'T', description: 'd',
     status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+    acceptanceCriteria: ['repair preserves the requested behavior'],
+    allowedPaths: ['apps/api/src/designReview'],
   })
   return { taskId: task.id, projectId: project.id }
 }
@@ -316,6 +318,8 @@ describe('review済みpromptがそのままrepair Jobへ渡る', () => {
       const repairJob = storage.jobs.findById(outcome.jobId)!
       const evidence = storage.designReviewEvidence.findLatestByTaskId(ids.taskId)!
       expect(computeDesignTextHash(repairJob.aiCliPrompt!)).toBe(evidence.designTextHash)
+      expect(repairJob.aiCliPrompt).toContain('repair preserves the requested behavior')
+      expect(repairJob.aiCliPrompt).toContain('apps/api/src/designReview')
     }
   })
 })
@@ -811,6 +815,7 @@ describe('repair handoff は source Job の終端結果を保持する', () => {
     const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
 
     expect(outcome.status).toBe('repair_job_created')
+    if (outcome.status !== 'repair_job_created') return
     expect(
       storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
     ).toHaveLength(1)
@@ -818,6 +823,9 @@ describe('repair handoff は source Job の終端結果を保持する', () => {
     expect(after.status).toBe('failed')
     expect(after.exitCode).toBe(1)
     expect(after.stderr).toBe('TypeError: boom')
+    const repairJob = storage.jobs.findById(outcome.jobId)!
+    expect(repairJob.aiCliPrompt).toContain('repair preserves the requested behavior')
+    expect(repairJob.aiCliPrompt).toContain('apps/api/src/designReview')
   })
 })
 

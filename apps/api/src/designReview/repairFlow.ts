@@ -23,7 +23,7 @@
  * いずれも既存機構であり、新しい仕組みは追加していない。
  */
 
-import type { Job, Task, ReviewResult, QAResult } from '@ai-team/shared'
+import type { Job, JobRefusalMetadata, Task, ReviewResult, QAResult } from '@ai-team/shared'
 import type { IStorage, DesignReviewRun } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import {
@@ -110,12 +110,17 @@ export type RepairFlowOutcome =
   | { status: 'skipped'; reason: string }
 
 /** 既存Jobから、署名計算に使う失敗事実を取り出す。 */
-export function extractFailureFacts(job: Job, review?: ReviewResult): RepairFailureFacts {
+export function extractFailureFacts(
+  job: Job,
+  review?: ReviewResult,
+  reviewRefusal?: JobRefusalMetadata,
+): RepairFailureFacts {
   return {
     exitCode: job.exitCode,
     stderr: job.stderr,
-    failureKind: job.failureMetadata?.kind,
-    reviewFindingRules: review?.findings.map((finding) => finding.rule ?? finding.message),
+    failureKind: reviewRefusal?.kind ?? job.failureMetadata?.kind,
+    reviewFindingRules: reviewRefusal?.patternKinds
+      ?? review?.findings.map((finding) => finding.rule ?? finding.message),
   }
 }
 
@@ -231,6 +236,7 @@ function escalateToHuman(storage: IStorage, task: Task, reason: string): RepairF
 export interface RepairFlowInput {
   failedJob: Job
   review?: ReviewResult
+  reviewRefusal?: JobRefusalMetadata
   qaResults?: QAResult[]
   /**
    * この repair の引き金になった **保存済み review Job の id**（selector のみ）。
@@ -252,7 +258,7 @@ export async function runRepairFlow(
   input: RepairFlowInput,
   deps: CoordinatorDeps = buildDefaultCoordinatorDeps(),
 ): Promise<RepairFlowOutcome> {
-  const { failedJob, review } = input
+  const { failedJob, review, reviewRefusal } = input
 
   const task = storage.tasks.findById(failedJob.taskId)
   if (!task) {
@@ -269,7 +275,7 @@ export async function runRepairFlow(
 
   const priorJobs = storage.jobs.findByTaskId(task.id)
   const priorReviews = storage.reviewResults.findByTaskId(task.id)
-  const facts = extractFailureFacts(failedJob, review)
+  const facts = extractFailureFacts(failedJob, review, reviewRefusal)
 
   const decision = decideRepairAction(
     failedJob.id,
@@ -303,6 +309,10 @@ export async function runRepairFlow(
   const repairPrompt = buildRepairPrompt({
     taskTitle: task.title,
     taskDescription: task.description,
+    acceptanceCriteria: task.acceptanceCriteria,
+    expectedOutputs: task.expectedOutputs,
+    allowedPaths: task.allowedPaths,
+    forbiddenPaths: task.forbiddenPaths,
     job: {
       exitCode: failedJob.exitCode,
       stderr: failedJob.stderr,
@@ -313,6 +323,7 @@ export async function runRepairFlow(
     review: review
       ? { status: review.status, summary: review.summary, findings: review.findings }
       : undefined,
+    reviewRefusal,
     qa: input.qaResults?.map((qa) => ({
       type: qa.type,
       status: qa.status,
@@ -557,7 +568,7 @@ function answeredByHumanResume(
  * この 2 件から組む。認めた根拠と repair の材料が別物だと、片方しか検証していないことになる。
  */
 type BlockedAdmission =
-  | { ok: true, implementJob: Job, review: ReviewResult }
+  | { ok: true, implementJob: Job, review?: ReviewResult, reviewRefusal?: JobRefusalMetadata }
   | { ok: false, reason: string, runId?: string }
 
 /**
@@ -580,6 +591,7 @@ function repairableBlockedReviewRequest(
   task: Task,
   candidate: Job,
   reviewJobId?: string,
+  reviewRefusal?: JobRefusalMetadata,
 ): BlockedAdmission {
   // 0. **Job を id で読み直す。** 引数の object は呼び出し元が組んだもので、`status` も
   //    `workflowStepKey` も自由に書ける（実際 `routes/jobs.ts` の失敗経路は
@@ -622,9 +634,11 @@ function repairableBlockedReviewRequest(
   // 2. **その review Job に対して保存された verdict** を引く。無ければ通さない。
   const stored = storage.reviewResults.findByTaskId(task.id)
     .find((result) => result.jobId === reviewJob.id)
-  if (!stored) return { ok: false, reason: 'no stored review result for this implementation' }
-  if (stored.status !== 'changes_requested') {
-    return { ok: false, reason: `review status is ${stored.status}` }
+  if (reviewRefusal === undefined) {
+    if (!stored) return { ok: false, reason: 'no stored review result for this implementation' }
+    if (stored.status !== 'changes_requested') {
+      return { ok: false, reason: `review status is ${stored.status}` }
+    }
   }
 
   // 3. その実装が**成功している**こと。失敗した実装の修正要求はここでは扱わない。
@@ -651,12 +665,23 @@ function repairableBlockedReviewRequest(
   const stepKey = implementJob.workflowStepKey ?? ''
   const isResumeSuccessor = /^resume:[^:]+:\d+$/.test(stepKey)
   const isRepairSuccessor = parseRepairSource(stepKey) !== undefined
-  if (!isResumeSuccessor && !isRepairSuccessor) {
-    return { ok: false, reason: 'implementation job is not a canonical resume or repair successor' }
+  const taskJobs = storage.jobs.findByTaskId(task.id)
+  const latestImplementJob = taskJobs.find((job) => job.aiCliMode === 'implement')
+  // initial-implement を source として認めるのは、実装由来の secret-scan 拒否で止まった review の
+  // Human Resume に限る（CEO 承認範囲）。通常の `changes_requested` の受け入れ範囲は広げない。
+  const isCanonicalInitialImplement =
+    reviewRefusal !== undefined
+    && stepKey === `task:${task.id}:initial-implement`
+    && latestImplementJob?.id === implementJob.id
+    && humanResumesOf(storage, reviewResumeHops).length > 0
+  if (!isResumeSuccessor && !isRepairSuccessor && !isCanonicalInitialImplement) {
+    return {
+      ok: false,
+      reason: 'implementation job is not a canonical resume or repair successor or eligible latest initial-implement source',
+    }
   }
 
   //    lineage が辿れない実装は、段数も根も確定できない。**推測せず落とす。**
-  const taskJobs = storage.jobs.findByTaskId(task.id)
   const lineage = walkRepairGeneration(
     implementJob.id,
     toPriorRepairJobs(
@@ -702,7 +727,7 @@ function repairableBlockedReviewRequest(
   }
   // **前方一致の前に正規化する。** `apps/api/src/pl/../routes/jobs.ts` は文字列としては
   // `apps/api/src/pl/` で始まるが、解決すると範囲外を指す（独立レビュー指摘）。
-  const outside = stored.findings
+  const outside = (stored?.findings ?? [])
     .map((finding) => finding.file)
     .filter((file): file is string => typeof file === 'string' && file.length > 0)
     .filter((file) => !isInsideAllowedPaths(file, allowed))
@@ -712,7 +737,7 @@ function repairableBlockedReviewRequest(
 
   // 6. **通常 repair で扱ってはいけない指摘が混じっていない**こと。
   //    `critical` は Safety / Authority 相当の判断を求めうるので、既存の escalation へ残す。
-  if (stored.findings.some((finding) => finding.severity === 'critical')) {
+  if (stored?.findings.some((finding) => finding.severity === 'critical')) {
     return { ok: false, reason: 'review contains a critical finding' }
   }
 
@@ -842,25 +867,47 @@ function repairableBlockedReviewRequest(
 
   const live = taskJobs
     .filter((job) => job.id !== implementJob.id)
+    // The refused review is the terminal event currently being persisted, not competing work.
+    .filter((job) => reviewRefusal === undefined || job.id !== reviewJob.id)
     .filter((job) => !supersededBlockedAncestors.has(job.id))
     .filter((job) => job.status === 'queued' || job.status === 'running' || job.status === 'blocked')
   if (live.length > 0) {
     return { ok: false, reason: `a live job exists for this task (${live[0].status})` }
   }
 
-  return { ok: true, implementJob, review: stored }
+  return { ok: true, implementJob, review: stored, reviewRefusal }
 }
 
 
 export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): RepairPreparation {
   // blocked の例外を認めた場合、この 2 つは**保存済みレコードへ差し替える**（下記）。
-  let { failedJob, review } = input
+  let { failedJob, review, reviewRefusal } = input
 
   const task = storage.tasks.findById(failedJob.taskId)
   if (!task) return { action: 'skip', reason: 'task not found' }
 
   // **`done` は従来どおり無条件 skip。** 完了した Task へ repair を作らない。
   if (task.status === 'done') return { action: 'skip', reason: 'task is done' }
+
+  if (reviewRefusal !== undefined) {
+    if (!reviewRefusal.repairEligible) {
+      return { action: 'skip', reason: `review refusal is not repair eligible (${reviewRefusal.repairEligibilityReason})` }
+    }
+    if (input.reviewJobId === undefined || reviewRefusal.patternKinds.length === 0) {
+      return { action: 'skip', reason: 'review refusal is missing its review lineage or pattern kind' }
+    }
+    const reviewed = resolveReviewedImplementation(storage, input.reviewJobId)
+    if (!reviewed.ok) {
+      return { action: 'skip', reason: `review refusal lineage: ${reviewed.reason}` }
+    }
+    if (reviewed.implementJob.id !== failedJob.id || reviewed.implementJob.taskId !== task.id) {
+      return { action: 'skip', reason: 'review refusal did not originate from this implementation' }
+    }
+    if (reviewed.implementJob.status !== 'success') {
+      return { action: 'skip', reason: `reviewed implementation job is ${reviewed.implementJob.status}` }
+    }
+    failedJob = reviewed.implementJob
+  }
 
   // **`blocked` は原則 skip のまま。例外は 1 つだけである。**
   //
@@ -874,7 +921,13 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   // **「blocked なら repair してよい」には広げない。** 下の `repairableBlockedReviewRequest()`
   // が既存レコードだけで全条件を機械照合し、1 つでも欠ければ従来どおり skip する。
   if (task.status === 'blocked') {
-    const admitted = repairableBlockedReviewRequest(storage, task, failedJob, input.reviewJobId)
+    const admitted = repairableBlockedReviewRequest(
+      storage,
+      task,
+      failedJob,
+      input.reviewJobId,
+      reviewRefusal,
+    )
     if (!admitted.ok) {
       return { action: 'skip', reason: `task is blocked (${admitted.reason})`, runId: admitted.runId }
     }
@@ -883,11 +936,12 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
     // 成立する。照合した 2 件だけを以降の材料にする（独立レビュー指摘）。
     failedJob = admitted.implementJob
     review = admitted.review
+    reviewRefusal = admitted.reviewRefusal
   }
 
   const priorJobs = storage.jobs.findByTaskId(task.id)
   const priorReviews = storage.reviewResults.findByTaskId(task.id)
-  const facts = extractFailureFacts(failedJob, review)
+  const facts = extractFailureFacts(failedJob, review, reviewRefusal)
 
   const decision = decideRepairAction(
     failedJob.id,
@@ -922,6 +976,10 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   const designText = buildRepairPrompt({
     taskTitle: task.title,
     taskDescription: task.description,
+    acceptanceCriteria: task.acceptanceCriteria,
+    expectedOutputs: task.expectedOutputs,
+    allowedPaths: task.allowedPaths,
+    forbiddenPaths: task.forbiddenPaths,
     job: {
       exitCode: failedJob.exitCode,
       stderr: failedJob.stderr,
@@ -932,6 +990,7 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
     review: review
       ? { status: review.status, summary: review.summary, findings: review.findings }
       : undefined,
+    reviewRefusal,
     qa: input.qaResults?.map((qa) => ({
       type: qa.type, status: qa.status, summary: qa.summary, details: qa.details,
     })),

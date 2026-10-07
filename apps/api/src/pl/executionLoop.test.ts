@@ -7,6 +7,8 @@ import type { IStorage } from '../storage/interface'
 import { buildSystemState } from '../state/systemState'
 import {
   PL_MAX_ATTEMPTS_PER_TARGET,
+  DEFAULT_RESUME_INSTRUCTION,
+  buildPlResumeAiCliPrompt,
   countPriorAttempts,
   extractProposedKind,
   isRecoveryTargetResolved,
@@ -87,6 +89,25 @@ function deps(over: Partial<PlLoopDeps> = {}): PlLoopDeps {
 
 beforeEach(() => {
   resetPlLoopInFlightForTest()
+})
+
+describe('PL resume prompt', () => {
+  it('keeps the same Task Contract and adds the PL resume instruction', () => {
+    const prompt = buildPlResumeAiCliPrompt({
+      title: 'Resume API work',
+      description: 'Continue the reviewed implementation.',
+      allowedPaths: ['apps/api/src/aiExplain'],
+      forbiddenPaths: ['apps/worker/src/guards'],
+      acceptanceCriteria: ['No changes outside apps/api/src/aiExplain'],
+      expectedOutputs: ['apps/api/src/aiExplain/result.ts'],
+    })
+
+    expect(prompt).toContain('[Task Contract]')
+    expect(prompt).toContain('apps/api/src/aiExplain')
+    expect(prompt).toContain('No changes outside apps/api/src/aiExplain')
+    expect(prompt).toContain(DEFAULT_RESUME_INSTRUCTION)
+    expect(prompt.indexOf('[Task Contract]')).toBeLessThan(prompt.indexOf(DEFAULT_RESUME_INSTRUCTION))
+  })
 })
 
 describe('runPlTick — Observe', () => {
@@ -1670,6 +1691,33 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     // 既存経路が作る resume Job（新しい workflowStepKey）
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey?.startsWith('resume:'))).toBe(true)
     expect(storage.jobs.findById(sourceJobId)?.status).toBe('failed')
+  })
+
+  it('PL resume action passes the Task Contract to resumeBlockedTask', async () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, {
+      acceptanceCriteria: ['resume keeps the reviewed behavior'],
+      allowedPaths: ['apps/api/src/pl'],
+    })
+    blockedCommitJob(storage, taskId, projectId)
+    alignedEvidence(storage, taskId)
+    const resumeBlockedTask = storage.jobs.resumeBlockedTask
+    let instructionPrompt: string | undefined
+    storage.jobs.resumeBlockedTask = (input) => {
+      instructionPrompt = input.instructionPrompt
+      return resumeBlockedTask(input)
+    }
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'continue', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.status).toBe('acted')
+    expect(instructionPrompt).toContain('[Task Contract]')
+    expect(instructionPrompt).toContain('resume keeps the reviewed behavior')
+    expect(instructionPrompt).toContain('apps/api/src/pl')
+    expect(instructionPrompt).toContain(DEFAULT_RESUME_INSTRUCTION)
+    expect(instructionPrompt).not.toBe(DEFAULT_RESUME_INSTRUCTION)
   })
 
   it('[10] PL の resume は ai として記録される（human resume と同じ意味にならない）', async () => {

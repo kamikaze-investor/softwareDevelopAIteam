@@ -2166,6 +2166,7 @@ vi.mock('./aiCli/factory.js', () => ({
 }))
 
 import { createAiCliAdapter } from './aiCli/factory.js'
+import { AiCliPromptRefusalError } from './aiCli/adapter.js'
 const createAiCliAdapterMock = vi.mocked(createAiCliAdapter)
 
 function makeCliResult(overrides: Partial<{
@@ -2321,6 +2322,32 @@ describe('task-022: AI CLI 実行ブロック', () => {
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
     execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
+  })
+
+  it('carries a typed pre-send secret refusal without changing the failed outcome', async () => {
+    const matchedValue = 'never-persist-this-value'
+    const mockAdapter = {
+      run: vi.fn().mockRejectedValue(new AiCliPromptRefusalError(
+        'Prompt refused by secret scan',
+        ['password assignment'],
+      )),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as never)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: `password=${matchedValue}`,
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.refusal).toEqual({
+      kind: 'secret_scan', patternKinds: ['password assignment'],
+      repairEligible: false,
+      repairEligibilityReason: 'not_post_implementation_review',
+    })
+    expect(JSON.stringify(result.refusal)).not.toContain(matchedValue)
+    expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 
   it('aiCliProvider なし → AI CLI をスキップして SafeCommand を実行する', async () => {

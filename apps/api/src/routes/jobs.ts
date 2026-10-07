@@ -4,13 +4,9 @@ import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { canonicalizeJobUpdate, isLiveJob, type Job, type ReviewResult } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
 import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
+import { appendImplementContracts } from '../implementPrompt'
 import type { DesignReviewRun, OutboxEventInput } from '../storage/interface'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
@@ -80,6 +76,37 @@ const SafeCommandInputSchema = z.object({
 // 対応時はこのSchemaと同時に更新すること（2026-08-26 独立レビュー指摘: 型とAPI契約の不整合）。
 const AiCliProviderSchema = z.enum(['claude_code', 'codex', 'gemini'])
 const AiCliModeSchema = z.enum(['implement', 'review', 'qa', 'summarize'])
+const SecretScanPatternKindSchema = z.enum([
+  'ANTHROPIC_API_KEY assignment',
+  'CLAUDE_API_KEY assignment',
+  'GEMINI_API_KEY assignment',
+  'GITHUB_TOKEN assignment',
+  'private key header',
+  'RSA private key header',
+  'password assignment',
+  'secret assignment',
+])
+// Worker 認証で受け取る判定を信頼する。API には送信前 prompt がなく、offset ownership を再計算できない。
+const RefusalMetadataSchema = z.discriminatedUnion('repairEligible', [
+  z.object({
+    kind: z.literal('secret_scan'),
+    patternKinds: z.array(SecretScanPatternKindSchema).min(1),
+    repairEligible: z.literal(true),
+    repairEligibilityReason: z.literal('implementation_added_generic_assignment'),
+  }).strict(),
+  z.object({
+    kind: z.literal('secret_scan'),
+    patternKinds: z.array(SecretScanPatternKindSchema).min(1),
+    repairEligible: z.literal(false),
+    repairEligibilityReason: z.enum([
+      'not_post_implementation_review',
+      'non_generic_assignment_kind',
+      'credential_like_assignment',
+      'match_not_owned_by_implementation',
+      'match_origin_unclear',
+    ]),
+  }).strict(),
+])
 const ReviewStatusSchema = z.enum(['approved', 'changes_requested', 'rejected'])
 const FindingSeveritySchema = z.enum(['low', 'medium', 'high', 'critical'])
 const StructuredReviewResultSchema = z.object({
@@ -142,6 +169,7 @@ const UpdateJobBody = z.object({
   failureMetadata: z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    refusal: RefusalMetadataSchema.optional(),
     // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
     // Worker が正当に送る quarantine payload を API が 400 で弾き、
     // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
@@ -190,6 +218,7 @@ const FailIfRunningJobBody = z.object({
   failureMetadata: z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    refusal: RefusalMetadataSchema.optional(),
     // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
     // Worker が正当に送る quarantine payload を API が 400 で弾き、
     // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
@@ -328,17 +357,6 @@ function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, ded
   }
 }
 
-function appendBaseDesignContract(prompt: string): string {
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(undefined, principles),
-    principles,
-  })
-
-  return `${prompt}\n\n${designContract}`
-}
-
-
 /**
  * durableにqueuedとなったDesign Review runのexecutorをkickする。
  *
@@ -428,7 +446,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       aiCliPrompt: result.data.agentRole === 'developer_ai'
         && result.data.aiCliMode === 'implement'
         && result.data.aiCliPrompt !== undefined
-        ? appendBaseDesignContract(result.data.aiCliPrompt)
+        ? appendImplementContracts(result.data.aiCliPrompt, task)
         : result.data.aiCliPrompt,
     }
     const designReviewCheck = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
@@ -822,6 +840,50 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         ...jobUpdate,
         status: 'failed',
         stderr: jobUpdate.stderr ?? 'Structured review result is missing (fail-closed)',
+      }
+
+      const reviewRefusal = jobUpdate.status === 'failed'
+        ? jobUpdate.failureMetadata?.refusal
+        : undefined
+      const reviewed = reviewRefusal === undefined
+        ? undefined
+        : resolveReviewedImplementation(storage, existing.id)
+      const refusalPreparation = reviewRefusal?.repairEligible === true
+        && reviewed?.ok === true
+        && reviewed.implementJob.status === 'success'
+        ? prepareRepairFlow(storage, {
+            failedJob: reviewed.implementJob,
+            reviewJobId: existing.id,
+            reviewRefusal,
+          })
+        : undefined
+
+      if (refusalPreparation?.action === 'skip') {
+        req.log.warn({
+          reason: refusalPreparation.reason,
+          sourceJobId: reviewed?.ok === true ? reviewed.implementJob.id : undefined,
+          reviewJobId: existing.id,
+          runId: refusalPreparation.runId,
+        }, 'review refusal repair was not admitted; falling back to Human escalation')
+      } else if (refusalPreparation !== undefined) {
+        const persisted = storage.jobs.updateWithOutboxEvent(
+          existing.id,
+          failedUpdate,
+          outboxEvent,
+          refusalPreparation.action === 'queue' ? refusalPreparation.run : undefined,
+        )
+        if (!persisted.ok) {
+          if (persisted.code === 'OUTBOX_HASH_MISMATCH') {
+            return reply.status(409).send({ error: persisted.reason })
+          }
+          return reply.status(persisted.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: persisted.reason })
+        }
+        if (refusalPreparation.action === 'escalate') {
+          escalateTaskToHuman(storage, existing.taskId)
+        } else if (persisted.queuedDesignReviewRun && refusalPreparation.action === 'queue') {
+          kickQueuedDesignReview(storage, req.log, persisted.queuedDesignReviewRun, refusalPreparation.stepKey)
+        }
+        return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
       }
 
       // escalate の判定は **Task の現在状態**で行う（deduplicated では判定しない）。
