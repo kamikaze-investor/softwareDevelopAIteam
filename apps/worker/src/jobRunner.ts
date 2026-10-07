@@ -15,6 +15,7 @@ import type {
   AiCliProvider,
   AiCliResult,
   Job,
+  JobFailureMetadata,
   JobGuardResult,
   JobWorkspaceBaseline,
   JobWorkspaceBaselineEntry,
@@ -27,6 +28,8 @@ import type {
 import { aiCliTimeoutMs, runRiskReview } from '@ai-team/shared'
 import { z } from 'zod'
 import { createAiCliAdapter } from './aiCli/factory.js'
+import { AiCliPromptRefusalError } from './aiCli/adapter.js'
+import { classifyPromptRefusal } from './reviewRefusalEligibility.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
 import type { TargetProjectRiskScanResult } from './approvalLevel/targetProjectRiskScan.js'
@@ -366,6 +369,7 @@ export interface JobRunResult {
   startedAt: string
   completedAt: string
   providerFailureKind?: AiCliResult['providerFailureKind']
+  refusal?: JobFailureMetadata['refusal']
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
   permissionBlockEvent?: PermissionBlockEvent
   rollbackInfo?: RollbackInfo
@@ -884,6 +888,13 @@ export async function runJob(
         exitCode: 1,
         stdout: '',
         stderr: message,
+        refusal: err instanceof AiCliPromptRefusalError
+          ? classifyPromptRefusal({
+              mode: job.aiCliMode,
+              prompt: effectiveAiCliPrompt,
+              implementationDiff: preDiffText,
+            })
+          : undefined,
       })
     }
 
@@ -2071,6 +2082,7 @@ interface AiFailureInspectionInput {
   stdoutPath?: string
   stderrPath?: string
   providerFailureKind?: AiCliResult['providerFailureKind']
+  refusal?: JobFailureMetadata['refusal']
 }
 
 /**
@@ -2127,6 +2139,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     return {
       ...failClosed(input.startedAt, formatChangeDetectionError(err), input.guardResult),
       ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
+      ...(input.refusal ? { refusal: input.refusal } : {}),
       workspaceState: 'unknown',
     }
   }
@@ -2162,6 +2175,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
       preChangedPaths: [...input.preChangedPaths],
     },
     ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
+    ...(input.refusal ? { refusal: input.refusal } : {}),
     workspaceState,
   }
 }
