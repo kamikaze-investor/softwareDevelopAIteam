@@ -1,11 +1,12 @@
 import { describe, expect, it, beforeEach } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import type { Job } from '@ai-team/shared'
+import type { Job, JobRefusalMetadata } from '@ai-team/shared'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { executeQueuedRepair, prepareRepairFlow } from './repairFlow'
 import { MAX_REPAIR_ATTEMPTS } from './repairPolicy'
 import { recoverAndRekickAtStartup } from './queuedRunDispatch'
+import { recordResumeActor } from './resumeActor'
 
 /**
  * Stage 2 E2E。
@@ -135,6 +136,79 @@ describe('Stage 2 E2E', () => {
     const fenceStart = repairJob.aiCliPrompt!.indexOf('<<<UNTRUSTED_FAILURE_DATA>>>')
     expect(repairJob.aiCliPrompt).toContain('TypeError: boom')
     expect(repairJob.aiCliPrompt!.indexOf('TypeError: boom')).toBeGreaterThan(fenceStart)
+  })
+
+  it('Human Resume of an unstructured initial-implement review refusal creates a repair Job', async () => {
+    storage.tasks.update(ids.taskId, { status: 'blocked' })
+    let implementJob = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      workflowStepKey: `task:${ids.taskId}:initial-implement`,
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      aiCliProvider: 'claude_code',
+      aiCliMode: 'implement',
+      changedFiles: CHANGED,
+    })
+    storage.jobs.update(implementJob.id, { changedFiles: CHANGED })
+    implementJob = storage.jobs.findById(implementJob.id)!
+    const oldReview = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'qa_ai',
+      status: 'failed',
+      workflowStepKey: `implement:${implementJob.id}:review`,
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      aiCliProvider: 'claude_code',
+      aiCliMode: 'review',
+    })
+    expect(storage.reviewResults.findByTaskId(ids.taskId)).toHaveLength(0)
+
+    const resumed = storage.jobs.resumeBlockedTask({
+      taskId: ids.taskId,
+      instructionPrompt: 'Re-run the independent review.',
+    })
+    if (!resumed.ok) throw new Error(`fixture: Human Resume failed: ${resumed.reason}`)
+    recordResumeActor(storage, {
+      jobId: resumed.job.id,
+      taskId: ids.taskId,
+      actorClass: 'human',
+      evidence: 'admin_credential',
+    })
+    expect(resumed.job.workflowStepKey).toBe(`resume:${oldReview.id}:1`)
+
+    const refusal: JobRefusalMetadata = {
+      kind: 'secret_scan',
+      patternKinds: ['password assignment'],
+      repairEligible: true,
+      repairEligibilityReason: 'implementation_added_generic_assignment',
+    }
+    storage.jobs.update(resumed.job.id, {
+      status: 'failed',
+      exitCode: 1,
+      stderr: 'Prompt refused by the pre-send secret scan',
+      failureMetadata: { refusal, workspaceState: 'unchanged' },
+    })
+
+    const preparation = prepareRepairFlow(storage, {
+      failedJob: implementJob,
+      reviewJobId: resumed.job.id,
+      reviewRefusal: refusal,
+    })
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+
+    const run = storage.designReviewRuns.create(preparation.run)
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    if (outcome.status !== 'repair_job_created') {
+      const reason = 'reason' in outcome ? `: ${outcome.reason}` : ''
+      throw new Error(`fixture: expected repair_job_created, got ${outcome.status}${reason}`)
+    }
+    const repairJob = storage.jobs.findById(outcome.jobId)
+    expect(repairJob?.workflowStepKey).toBe(`repair:${implementJob.id}:1`)
+    expect(repairJob?.status).toBe('queued')
   })
 
   it('One Job failure != Task failure — 失敗してもTaskは継続する', async () => {

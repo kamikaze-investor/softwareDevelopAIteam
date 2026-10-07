@@ -86,6 +86,7 @@ const SecretScanPatternKindSchema = z.enum([
   'password assignment',
   'secret assignment',
 ])
+// Worker 認証で受け取る判定を信頼する。API には送信前 prompt がなく、offset ownership を再計算できない。
 const RefusalMetadataSchema = z.discriminatedUnion('repairEligible', [
   z.object({
     kind: z.literal('secret_scan'),
@@ -857,7 +858,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           })
         : undefined
 
-      if (refusalPreparation !== undefined) {
+      if (refusalPreparation?.action === 'skip') {
+        req.log.warn({
+          reason: refusalPreparation.reason,
+          sourceJobId: reviewed?.ok === true ? reviewed.implementJob.id : undefined,
+          reviewJobId: existing.id,
+          runId: refusalPreparation.runId,
+        }, 'review refusal repair was not admitted; falling back to Human escalation')
+      } else if (refusalPreparation !== undefined) {
         const persisted = storage.jobs.updateWithOutboxEvent(
           existing.id,
           failedUpdate,

@@ -72,6 +72,53 @@ describe('review refusal repair eligibility', () => {
     expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
   })
 
+  it('rejects an outside match that added-line joining could falsely balance', () => {
+    const diffText = [
+      'diff --git a/fixture.txt b/fixture.txt',
+      '--- a/fixture.txt',
+      '+++ b/fixture.txt',
+      '@@ -1,2 +1,3 @@',
+      '+const x = password',
+      ' unchanged',
+      '+= 1',
+    ].join('\n')
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPrompt(diffText, 'Task description: use password: hunter2'),
+      implementationDiff: diffText,
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
+  })
+
+  it('rejects an outside match that added-line joining could balance across file boundaries', () => {
+    const diffText = [
+      'diff --git a/first.txt b/first.txt',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/first.txt',
+      '@@ -0,0 +1 @@',
+      '+const x = password',
+      'diff --git a/second.txt b/second.txt',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/second.txt',
+      '@@ -0,0 +1 @@',
+      '+= 1',
+    ].join('\n')
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPrompt(diffText, 'Task description: use password: hunter2'),
+      implementationDiff: diffText,
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
+  })
+
   it.each([
     'ANTHROPIC_API_KEY=fixture-only',
     'GITHUB_TOKEN=fixture-only',

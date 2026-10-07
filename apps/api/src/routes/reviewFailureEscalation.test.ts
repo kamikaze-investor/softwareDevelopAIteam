@@ -148,6 +148,48 @@ describe('review-failure-escalation gap', () => {
     })
   })
 
+  it('escalates an eligible refusal when repair admission skips an existing repair Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(project.id)
+      const { implement, review } = await createImplementAndReview(task)
+      const storage = await getStorage()
+      storage.jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `repair:${implement.id}:1`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        aiCliProvider: 'claude_code',
+        aiCliMode: 'implement',
+      })
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${review.id}`,
+        payload: {
+          status: 'failed',
+          exitCode: 1,
+          stderr: 'Prompt refused by the pre-send secret scan',
+          failureMetadata: {
+            workspaceState: 'unchanged',
+            refusal: {
+              kind: 'secret_scan',
+              patternKinds: ['password assignment'],
+              repairEligible: true,
+              repairEligibilityReason: 'implementation_added_generic_assignment',
+            },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(storage.jobs.findById(review.id)?.status).toBe('failed')
+      expect(storage.tasks.findById(task.id)?.status).toBe('blocked')
+      expect(storage.designReviewRuns.findByTaskId(task.id)).toHaveLength(0)
+    })
+  })
+
   it('rejects matched secret text instead of persisting it in refusal metadata or audit', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

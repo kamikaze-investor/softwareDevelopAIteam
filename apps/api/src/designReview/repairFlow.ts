@@ -665,12 +665,20 @@ function repairableBlockedReviewRequest(
   const stepKey = implementJob.workflowStepKey ?? ''
   const isResumeSuccessor = /^resume:[^:]+:\d+$/.test(stepKey)
   const isRepairSuccessor = parseRepairSource(stepKey) !== undefined
-  if (!isResumeSuccessor && !isRepairSuccessor) {
-    return { ok: false, reason: 'implementation job is not a canonical resume or repair successor' }
+  const taskJobs = storage.jobs.findByTaskId(task.id)
+  const latestImplementJob = taskJobs.find((job) => job.aiCliMode === 'implement')
+  const isCanonicalInitialImplement =
+    stepKey === `task:${task.id}:initial-implement`
+    && latestImplementJob?.id === implementJob.id
+    && humanResumesOf(storage, reviewResumeHops).length > 0
+  if (!isResumeSuccessor && !isRepairSuccessor && !isCanonicalInitialImplement) {
+    return {
+      ok: false,
+      reason: 'implementation job is not a canonical resume or repair successor or eligible latest initial-implement source',
+    }
   }
 
   //    lineage が辿れない実装は、段数も根も確定できない。**推測せず落とす。**
-  const taskJobs = storage.jobs.findByTaskId(task.id)
   const lineage = walkRepairGeneration(
     implementJob.id,
     toPriorRepairJobs(

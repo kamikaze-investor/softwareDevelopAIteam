@@ -23,6 +23,8 @@ const GENERIC_ASSIGNMENT_KINDS = new Set<SecretScanPatternKind>([
 
 interface SecretScanMatch {
   kind: SecretScanPatternKind
+  start: number
+  end: number
   /** Used only during this synchronous classification and never returned or persisted. */
   assignedValue?: string
 }
@@ -35,10 +37,13 @@ function scanMatches(text: string): SecretScanMatch[] {
     const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`
     const globalPattern = new RegExp(pattern.source, flags)
     for (const match of text.matchAll(globalPattern)) {
+      if (match.index === undefined) continue
       const matchedText = match[0]
       const separator = matchedText.search(/[:=]/)
       matches.push({
         kind,
+        start: match.index,
+        end: match.index + matchedText.length,
         ...(GENERIC_ASSIGNMENT_KINDS.has(kind) && separator >= 0
           ? { assignedValue: matchedText.slice(separator + 1).trim() }
           : {}),
@@ -48,29 +53,50 @@ function scanMatches(text: string): SecretScanMatch[] {
   return matches
 }
 
-function implementationAddedText(diffText: string): string {
-  return diffText
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
-    .map((line) => line.slice(1))
-    .join('\n')
+interface TextRange {
+  start: number
+  end: number
 }
 
-function countKinds(matches: readonly SecretScanMatch[]): Map<SecretScanPatternKind, number> {
-  const counts = new Map<SecretScanPatternKind, number>()
-  for (const match of matches) counts.set(match.kind, (counts.get(match.kind) ?? 0) + 1)
-  return counts
+function promptDiffRange(prompt: string, implementationDiff: string): TextRange | undefined {
+  const markers = [...prompt.matchAll(/^\[diffText\]\r?\n/gm)]
+  const marker = markers.at(-1)
+  if (marker?.index === undefined) return undefined
+  const start = marker.index + marker[0].length
+  const end = start + implementationDiff.length
+  if (prompt.slice(start, end) !== implementationDiff) return undefined
+  return { start, end }
 }
 
-function allMatchesOwnedByAddedText(
+function addedLineRanges(prompt: string, implementationDiff: string): TextRange[] {
+  const diffRange = promptDiffRange(prompt, implementationDiff)
+  if (diffRange === undefined) return []
+
+  const ranges: TextRange[] = []
+  let lineStart = 0
+  while (lineStart <= implementationDiff.length) {
+    const newline = implementationDiff.indexOf('\n', lineStart)
+    const rawLineEnd = newline === -1 ? implementationDiff.length : newline
+    const lineEnd = implementationDiff[rawLineEnd - 1] === '\r' ? rawLineEnd - 1 : rawLineEnd
+    const line = implementationDiff.slice(lineStart, lineEnd)
+    if (line.startsWith('+') && !line.startsWith('+++')) {
+      ranges.push({
+        start: diffRange.start + lineStart + 1,
+        end: diffRange.start + lineEnd,
+      })
+    }
+    if (newline === -1) break
+    lineStart = newline + 1
+  }
+  return ranges
+}
+
+function allMatchesOwnedByAddedLines(
   promptMatches: readonly SecretScanMatch[],
-  addedMatches: readonly SecretScanMatch[],
+  ranges: readonly TextRange[],
 ): boolean {
-  if (promptMatches.length !== addedMatches.length) return false
-  const promptCounts = countKinds(promptMatches)
-  const addedCounts = countKinds(addedMatches)
-  return SECRET_SCAN_PATTERN_KINDS.every(
-    (kind) => (promptCounts.get(kind) ?? 0) === (addedCounts.get(kind) ?? 0),
+  return promptMatches.every(
+    (match) => ranges.some((range) => match.start >= range.start && match.end <= range.end),
   )
 }
 
@@ -144,8 +170,8 @@ export function classifyPromptRefusal(input: {
     return ineligibleRefusal(patternKinds, 'non_generic_assignment_kind')
   }
 
-  const addedMatches = scanMatches(implementationAddedText(input.implementationDiff))
-  if (!allMatchesOwnedByAddedText(promptMatches, addedMatches)) {
+  const ownedRanges = addedLineRanges(input.prompt, input.implementationDiff)
+  if (!allMatchesOwnedByAddedLines(promptMatches, ownedRanges)) {
     return ineligibleRefusal(patternKinds, 'match_not_owned_by_implementation')
   }
   if (promptMatches.some((match) => looksCredentialLike(match.assignedValue ?? ''))) {
