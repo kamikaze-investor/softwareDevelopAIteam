@@ -1014,6 +1014,44 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(storage.auditLog.findAll().map((e) => e.entityId)).not.toContain(`adopt:${projectId}`)
   })
 
+  it('technical exhaustion は対象 Project だけを待たせ、別の idle Project の採用を止めない', async () => {
+    const { storage, taskId } = seedIdleDesignReview()
+    const exhaustedProjectId = storage.projects.findAll()[0]!.id
+    recordTargetAttempts(
+      storage,
+      `design_review_idle:${taskId}`,
+      PL_MAX_ATTEMPTS_PER_TARGET,
+    )
+    storage.projects.update(exhaustedProjectId, { status: 'paused' })
+    const other = storage.projects.create({
+      name: 'Other',
+      goal: 'g',
+      designPhilosophy: [],
+      status: 'running',
+    })
+    const adopted: string[] = []
+    const escalations: string[] = []
+
+    const result = await runPlTick(storage, deps({
+      readLedger: () => LEDGER,
+      proposeAdoption: async () => PROPOSAL,
+      adopt: async (_s, input) => {
+        adopted.push(input.roadmapId)
+        return { ok: true as const, taskId: 'task-other', roadmapTaskKey: input.roadmapId, title: 't' }
+      },
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    }))
+
+    expect(result).toMatchObject({ status: 'acted', proposedKind: 'adopt_roadmap_item' })
+    expect(adopted).toEqual(['next-item'])
+    expect(escalations).toEqual([])
+    const entityIds = storage.auditLog.findAll().map((entry) => entry.entityId)
+    expect(entityIds).toContain(`adopt:${other.id}`)
+    expect(entityIds).not.toContain(`adopt:${exhaustedProjectId}`)
+    expect(buildSystemState(storage).attention.find((item) => item.taskId === taskId)?.detail)
+      .toContain('technical recovery budget is exhausted')
+  })
+
   it('未 escalate の停滞は、別 Project の採用も従来どおり止める', async () => {
     // 判断待ちの除外は Escalation 済みに限る。まだ誰にも上げていない停滞が残るうちは、
     // どの Project にも新しい仕事を増やさない（既存の意図）。
@@ -2027,12 +2065,16 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
   it('bounds PL Technical Resumes across successor review Jobs for the same Task', async () => {
     const { storage, taskId, projectId } = seed()
     alignedEvidence(storage, taskId)
+    let lastAllowedActions: readonly string[] = []
     const d = deps({
-      diagnose: async () => JSON.stringify({
-        actionKind: 'resume_task',
-        rationale: 're-run eligible refused review',
-        riskLevel: 'LOW',
-      }),
+      diagnose: async (input) => {
+        lastAllowedActions = input.allowedActionKinds
+        return JSON.stringify({
+          actionKind: input.allowedActionKinds.includes('resume_task') ? 'resume_task' : 'observe_state',
+          rationale: 'use an action still inside the bounded recovery policy',
+          riskLevel: 'LOW',
+        })
+      },
       coordinatorDeps: alignedCoordinatorDeps,
     })
 
@@ -2063,7 +2105,11 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     resetPlLoopInFlightForTest()
     const exhausted = await runPlTick(storage, d)
 
-    expect(exhausted.status).toBe('idle')
+    expect(exhausted.status).toBe('acted')
+    expect(exhausted.proposedKind).toBe('observe_state')
+    expect(lastAllowedActions).not.toContain('resume_task')
+    expect(lastAllowedActions).toContain('retry_job')
+    expect(lastAllowedActions).toContain('observe_state')
     expect(storage.jobs.findByTaskId(taskId)
       .some((job) => job.workflowStepKey === `resume:${finalFailedReviewId}:1`)).toBe(false)
     const taskExhaustion = storage.auditLog
@@ -2077,6 +2123,52 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(storage.auditLog
       .findByEntity('pl_loop_target', `technical_resume_task:${taskId}`)
       .filter((entry) => entry.result === 'technical_exhausted')).toHaveLength(1)
+  })
+
+  it('routine PL git_commit resumes do not consume the Rule 5.5 cap or hide provider retry', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedCommitJob(storage, taskId, projectId)
+    alignedEvidence(storage, taskId)
+    const resume = deps({
+      diagnose: async () => JSON.stringify({
+        actionKind: 'resume_task',
+        rationale: 'start a fresh approval cycle',
+        riskLevel: 'LOW',
+      }),
+    })
+
+    expect((await runPlTick(storage, resume)).status).toBe('acted')
+    const firstResume = storage.jobs.findByTaskId(taskId)
+      .find((job) => job.workflowStepKey === `resume:${sourceJobId}:1`)!
+    storage.jobs.update(firstResume.id, { status: 'blocked', stderr: 'blocked: approval expired' })
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    resetPlLoopInFlightForTest()
+    expect((await runPlTick(storage, resume)).status).toBe('acted')
+    const secondResume = storage.jobs.findByTaskId(taskId)
+      .find((job) => job.workflowStepKey === `resume:${firstResume.id}:1`)!
+    expect(countPlTechnicalResumes(storage, taskId)).toBe(0)
+
+    storage.jobs.update(secondResume.id, {
+      status: 'failed',
+      stderr: 'provider timed out',
+      failureMetadata: { kind: 'provider_timeout', workspaceState: 'unchanged' },
+    })
+    storage.tasks.update(taskId, { status: 'blocked' })
+    let seen: PlDiagnosisInput | undefined
+
+    resetPlLoopInFlightForTest()
+    const retried = await runPlTick(storage, deps({
+      diagnose: async (input) => {
+        seen = input
+        return JSON.stringify({ actionKind: 'retry_job', rationale: 'transient timeout', riskLevel: 'LOW' })
+      },
+    }))
+
+    expect(seen?.allowedActionKinds).toContain('retry_job')
+    // retry は候補から失われず Gate まで届く。承認根拠が無いので既存 Gate が blocked にする。
+    expect(retried).toMatchObject({ status: 'blocked', proposedKind: 'retry_job' })
+    expect(retried.reason ?? '').not.toContain('technical recovery budget exhausted')
   })
 
   it('[10] PL の resume は pl として記録され、human と同様の budget reset はしない', async () => {

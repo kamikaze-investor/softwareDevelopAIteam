@@ -141,6 +141,8 @@ export function recordResumeActor(
     taskId: string
     actorClass: ResumeActorClass
     evidence: ResumeAuthorizationEvidence
+    /** Rule 5.5 の review execution failure に対する PL Technical Resume。 */
+    technicalResume?: boolean
   },
 ): void {
   recordWithoutFailingCaller(RESUME_ACTOR_OPERATION, () => {
@@ -150,7 +152,12 @@ export function recordResumeActor(
       entityType: 'job',
       entityId: input.jobId,
       result: input.actorClass,
-      detail: `task_id=${input.taskId} resume_actor=${input.actorClass} authorization_evidence=${input.evidence}`,
+      detail: [
+        `task_id=${input.taskId}`,
+        `resume_actor=${input.actorClass}`,
+        `authorization_evidence=${input.evidence}`,
+        input.technicalResume === true ? 'technical_resume' : undefined,
+      ].filter((token) => token !== undefined).join(' '),
     })
   })
 }

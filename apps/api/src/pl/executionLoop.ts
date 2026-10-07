@@ -76,6 +76,7 @@ import {
 import {
   buildSystemState,
   DEFAULT_STALL_HINT_MS,
+  isAttentionTechnicalRecoveryExhausted,
   type AttentionItem,
   type SystemStateSnapshot,
 } from '../state/systemState'
@@ -121,7 +122,7 @@ import {
 /** 1つの対象に対して PL が試せる回数。超えたら技術的な再試行を止める。 */
 export const PL_MAX_ATTEMPTS_PER_TARGET = 2
 
-/** 1つの Task で human action を挟まずに PL が作れる Technical Resume の上限。 */
+/** 1つの Task で human action を挟まずに PL が作れる Rule 5.5 Technical Resume の上限。 */
 export const PL_MAX_TECHNICAL_RESUMES_PER_TASK = 2
 
 /** 診断に使える時間。既存 cheap client の timeout と同じ桁に収める。 */
@@ -412,7 +413,7 @@ function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
     // 予算は `countRemediationAttempts()` が却下テキスト単位で別に持つので、
     // 通知が鳴り続けることはない。
     && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
-    && !hasExhaustedTechnicalRecovery(storage, item)
+    && !hasExhaustedTargetTechnicalRecovery(storage, item)
     && hasStalledLongEnough(item)
   )
 }
@@ -440,26 +441,31 @@ function auditDetailHasToken(detail: string | undefined, token: string): boolean
  */
 function technicalResumeWindow(storage: IStorage, taskId: string): AuditLogEntry[] {
   const completedAt = storage.taskContinuations.findByCompletedTaskId(taskId)?.createdAt
-  const entries: AuditLogEntry[] = []
-
-  for (const entry of storage.auditLog.findAll()) {
-    // 別 table 間で同一 millisecond の順序は証明できない。等しい行は安全側で現 window に残す。
-    if (completedAt !== undefined && entry.createdAt < completedAt) break
-
-    const isHumanRecovery = entry.operation === HUMAN_RECOVERY_AUDIT_OPERATION
-      && entry.entityType === 'task'
-      && entry.entityId === taskId
+  const taskEntries = storage.auditLog.findByEntity('task', taskId)
+  const jobEntries = storage.jobs.findByTaskId(taskId)
+    .flatMap((job) => storage.auditLog.findByEntity('job', job.id))
+  const humanBoundary = [...taskEntries, ...jobEntries]
+    .filter((entry) => (
+      entry.operation === HUMAN_RECOVERY_AUDIT_OPERATION
       && entry.result === 'success'
-    const isHumanResume = entry.operation === RESUME_ACTOR_OPERATION
+    ) || (
+      entry.operation === RESUME_ACTOR_OPERATION
       && entry.result === 'human'
       && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
       && auditDetailHasToken(entry.detail, 'authorization_evidence=admin_credential')
-    if (isHumanRecovery || isHumanResume) break
+    ))
+    .map((entry) => entry.createdAt)
+    .sort()
+    .pop()
+  const boundary = [completedAt, humanBoundary]
+    .filter((value): value is string => value !== undefined)
+    .sort()
+    .pop()
 
-    entries.push(entry)
-  }
-
-  return entries
+  // 別 table 間で同一 millisecond の順序は証明できない。等しい行は安全側で現 window に残す。
+  return jobEntries
+    .filter((entry) => boundary === undefined || entry.createdAt >= boundary)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 }
 
 export function countPlTechnicalResumes(storage: IStorage, taskId: string): number {
@@ -467,7 +473,8 @@ export function countPlTechnicalResumes(storage: IStorage, taskId: string): numb
     entry.operation === RESUME_ACTOR_OPERATION
     && entry.result === 'pl'
     && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
-    && auditDetailHasToken(entry.detail, 'authorization_evidence=in_process_pl'),
+    && auditDetailHasToken(entry.detail, 'authorization_evidence=in_process_pl')
+    && auditDetailHasToken(entry.detail, 'technical_resume'),
   ).length
 }
 
@@ -499,7 +506,7 @@ function technicalRecoveryExhaustion(
     }
   }
 
-  if (item.taskId === undefined) return undefined
+  if (item.taskId === undefined || diagnosis.rootCauseClass !== 'review_execution_failed') return undefined
   const allowed = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
   if (!allowed.includes('resume_task')) return undefined
 
@@ -515,8 +522,8 @@ function technicalRecoveryExhaustion(
     : undefined
 }
 
-function hasExhaustedTechnicalRecovery(storage: IStorage, item: AttentionItem): boolean {
-  return technicalRecoveryExhaustion(storage, item) !== undefined
+function hasExhaustedTargetTechnicalRecovery(storage: IStorage, item: AttentionItem): boolean {
+  return technicalRecoveryExhaustion(storage, item)?.scope === 'target'
 }
 
 /** Budget 到達を1回だけ既存 pl_loop audit に残す。 */
@@ -525,9 +532,7 @@ function recordTechnicalRecoveryExhaustion(
   item: AttentionItem,
   exhaustion: TechnicalRecoveryExhaustion,
 ): void {
-  const prior = exhaustion.scope === 'task' && item.taskId !== undefined
-    ? technicalResumeWindow(storage, item.taskId)
-    : storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, exhaustion.auditKey)
+  const prior = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, exhaustion.auditKey)
   if (prior.some((entry) =>
     entry.operation === AUDIT_OPERATION
     && entry.entityType === AUDIT_ENTITY_TYPE
@@ -855,7 +860,7 @@ async function actOnOperatorTarget(
       ? `the PL has no executor for ${item.kind}; it is only observed`
       : hasEscalated(storage, targetKeyOf(item)) && !isRemediableConflict(storage, item)
         ? 'already escalated to the CEO; the PL waits for the CEO decision'
-        : hasExhaustedTechnicalRecovery(storage, item)
+        : hasExhaustedTargetTechnicalRecovery(storage, item)
           ? 'technical recovery budget exhausted; the PL will not resume this target'
           : 'not stalled long enough yet; the PL will look at it automatically'
     return { attempted: false, status: 'not_eligible', reason }
@@ -1471,6 +1476,7 @@ async function executeAction(
   kind: string,
   item: AttentionItem,
   deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
+  technicalResume: boolean,
 ): Promise<{ ok: boolean; summary: string }> {
   if (kind === 'escalate_to_ceo') {
     // Escalation は「実行」ではなく報告である。ここでは成功扱いにせず、呼び出し側が escalated を返す。
@@ -1537,6 +1543,7 @@ async function executeAction(
       taskId: item.taskId,
       actorClass: 'pl',
       evidence: 'in_process_pl',
+      ...(technicalResume ? { technicalResume: true } : {}),
     })
     return { ok: true, summary: `resume queued job ${resumed.job.id}` }
   }
@@ -1614,14 +1621,22 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     const item = selectTarget(actionable)
     if (!item) {
       // **手が空いたら次の Roadmap 項目を採用する。**
-      // 未 escalate の attention が1つでもあるうちは採用しない（止まっているものを放置して
-      // 新しい仕事を増やさない）。**Escalation 済み（CEO 判断待ち）の対象は、上で actionable から
-      // 外したのと同じ判定で採用の妨げからも外す。** 除外前の件数で判定していたため、判断待ちの
-      // 1件が無関係な Project の採用まで止めていた。判断待ちが止めるのはその対象の Project だけである。
+      // 未対応の attention が1つでもあるうちは採用しない（止まっているものを放置して
+      // 新しい仕事を増やさない）。**Escalation 済み（CEO 判断待ち）または technical exhaustion の
+      // 対象は、上で actionable から外したのと同じ判定で採用の妨げからも外す。** どちらも止めるのは
+      // その対象の Project だけであり、無関係な Project の採用までは止めない。
       // 採用可否そのものは `runAdoptionStep()` 内で Gate が決める。
-      const awaitingCeo = before.attention.filter((entry) => hasEscalated(storage, targetKeyOf(entry)))
-      const adoption = awaitingCeo.length === before.attention.length
-        ? await maybeAdoptNext(storage, before, new Set(awaitingCeo.map((entry) => entry.projectId)), deps)
+      const waitingOrExhausted = before.attention.filter((entry) => (
+        hasEscalated(storage, targetKeyOf(entry))
+        || isAttentionTechnicalRecoveryExhausted(storage, entry)
+      ))
+      const adoption = waitingOrExhausted.length === before.attention.length
+        ? await maybeAdoptNext(
+            storage,
+            before,
+            new Set(waitingOrExhausted.map((entry) => entry.projectId)),
+            deps,
+          )
         : undefined
       if (adoption) return adoption
 
@@ -1703,14 +1718,14 @@ async function handleTarget(
 
   // ── Decide lane（auto_recovery 以外は provider 診断を回さず所定のレーンへ渡す）──────
   // `triageAllowedActions()` は**必ず既存候補との積**なので、ここで権限が増えることはない。
-  const allowedActions = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
+  let allowedActions = triageAllowedActions(diagnosis, allowedActionsFor(item.kind))
 
   // ── 試行上限。技術的 recovery は止めるが、回数だけで CEO 判断へ変換しない ──────
   // Triage 自体が authority / unresolved review conflict を根拠に handoff を要求する場合は、
   // 下の既存 `handOffOrEscalate()` がその根拠で処理する。high-confidence の technical recovery
   // だけを bounded に停止し、unknown / low-confidence は下の handoff へ残す。
   const exhaustion = technicalRecoveryExhaustion(storage, item)
-  if (exhaustion !== undefined) {
+  if (exhaustion?.scope === 'target') {
     recordTechnicalRecoveryExhaustion(storage, item, exhaustion)
     return {
       status: 'idle',
@@ -1719,6 +1734,11 @@ async function handleTarget(
       reason: `${exhaustion.scope} technical recovery budget exhausted; CEO decision was not requested by count`,
       attempt,
     }
+  }
+  if (exhaustion?.scope === 'task') {
+    // Task cap が止めるのは Rule 5.5 の Technical Resume だけ。retry / observe は残す。
+    recordTechnicalRecoveryExhaustion(storage, item, exhaustion)
+    allowedActions = allowedActions.filter((kind) => kind !== 'resume_task')
   }
 
   // `unknown` / low-confidence は technical exhaustion ではない。従来どおり、bounded な診断試行を
@@ -1865,7 +1885,7 @@ async function handleTarget(
           await executeQueuedRun(s, run, deps.coordinatorDeps ?? buildDefaultCoordinatorDeps()),
         )
       }),
-  })
+  }, diagnosis.rootCauseClass === 'review_execution_failed')
 
   // ── Verify（実行側の戻り値だけで成功としない）────────────────────
   const after = buildSystemState(storage, deps.now ? { now: deps.now } : {})
@@ -1881,7 +1901,7 @@ async function handleTarget(
 
   // ── Continue ───────────────────────────────────────────────
   // 未解消でも failure count だけでは CEO decision に変換しない。budget 到達後は次 tick の
-  // `hasExhaustedTechnicalRecovery()` が同じ technical target を候補から外す。状態が authority / review
+  // target budget の exhaustion は同じ technical target を候補から外す。状態が authority / review
   // conflict に変わった場合はその分類に基づく既存 handoff が引き続き動く。
   return {
     status: 'acted',
