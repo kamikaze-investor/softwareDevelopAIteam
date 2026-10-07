@@ -33,6 +33,7 @@ function seed(storage: IStorage): { taskId: string; projectId: string } {
   const task = storage.tasks.create({
     projectId: project.id, title: 'READMEを更新する', description: '1行追記する',
     status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+    allowedPaths: ['docs'], forbiddenPaths: [],
   })
   return { taskId: task.id, projectId: project.id }
 }
@@ -334,6 +335,89 @@ describe('Stage 2 完了判定: 4経路', () => {
       taskId: ids.taskId, instructionPrompt: 'human instruction',
     })
     expect(resumed).toBeDefined()
+  })
+
+  it('bounds repeated review secret-scan refusals with the existing repair budget', async () => {
+    let implementation = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      workflowStepKey: `task:${ids.taskId}:initial-implement`,
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'original prompt',
+      changedFiles: CHANGED,
+    } as never)
+    storage.jobs.update(implementation.id, { changedFiles: CHANGED })
+    implementation = storage.jobs.findById(implementation.id)!
+    const refusal = {
+      kind: 'secret_scan' as const,
+      patternKinds: ['password assignment' as const],
+      repairEligible: true as const,
+      repairEligibilityReason: 'implementation_added_generic_assignment' as const,
+    }
+
+    for (let attempt = 1; attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
+      const review = storage.jobs.create({
+        taskId: ids.taskId,
+        projectId: ids.projectId,
+        agentRole: 'qa_ai',
+        status: 'running',
+        workflowStepKey: `implement:${implementation.id}:review`,
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        aiCliMode: 'review',
+        aiCliProvider: 'claude_code',
+      } as never)
+      const preparation = prepareRepairFlow(storage, {
+        failedJob: implementation,
+        reviewJobId: review.id,
+        reviewRefusal: refusal,
+      })
+      expect(preparation.action).toBe('queue')
+      if (preparation.action !== 'queue') throw new Error('expected queue')
+      expect(preparation.attempt).toBe(attempt)
+      expect(preparation.run.designText).toContain('[Task Contract]')
+      expect(preparation.run.designText).toContain('<<<UNTRUSTED_FAILURE_DATA>>>')
+      expect(preparation.run.designText).toContain('kind: secret_scan')
+      expect(preparation.run.designText).toContain('password assignment')
+
+      storage.jobs.update(review.id, {
+        status: 'failed',
+        failureMetadata: { refusal, workspaceState: 'unchanged' },
+      })
+      const run = storage.designReviewRuns.create(preparation.run)
+      const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+      expect(outcome.status).toBe('repair_job_created')
+      const repairJob = storage.jobs.findByTaskId(ids.taskId)
+        .find((job) => job.workflowStepKey === preparation.stepKey)
+      expect(repairJob).toBeDefined()
+      storage.jobs.update(repairJob!.id, {
+        status: 'success',
+        exitCode: 0,
+        changedFiles: CHANGED,
+      })
+      implementation = storage.jobs.findById(repairJob!.id)!
+    }
+
+    const finalReview = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'qa_ai',
+      status: 'running',
+      workflowStepKey: `implement:${implementation.id}:review`,
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      aiCliMode: 'review',
+      aiCliProvider: 'claude_code',
+    } as never)
+    const exhausted = prepareRepairFlow(storage, {
+      failedJob: implementation,
+      reviewJobId: finalReview.id,
+      reviewRefusal: refusal,
+    })
+    expect(exhausted.action).toBe('escalate')
+    if (exhausted.action === 'escalate') expect(exhausted.code).toBe('attempt_limit')
   })
 
   it('Stage 2の入口はterminal failure / changes_requestedに限定される', () => {

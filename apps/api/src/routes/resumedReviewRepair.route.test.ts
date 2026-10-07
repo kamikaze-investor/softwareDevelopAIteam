@@ -119,6 +119,43 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
     kick.mockClear()
   })
 
+  it('a resumed review secret-scan refusal enters the same repair admission', async () => {
+    await withApp(async (app) => {
+      const shape = await blockedAfterFailedReview({ firstReviewTerminal: false })
+      const s = await storage()
+      s.jobs.update(shape.r0.id, { status: 'failed', exitCode: 1 } as never)
+      const resumed = await resume(app, shape.taskId)
+      expect(resumed.workflowStepKey).toBe(`resume:${shape.r0.id}:1`)
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${resumed.id}`,
+        payload: {
+          status: 'failed',
+          exitCode: 1,
+          stderr: 'Prompt refused by the pre-send secret scan',
+          failureMetadata: {
+            workspaceState: 'unchanged',
+            refusal: {
+              kind: 'secret_scan',
+              patternKinds: ['password assignment'],
+              repairEligible: true,
+              repairEligibilityReason: 'implementation_added_generic_assignment',
+            },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(200)
+      const runs = await repairRuns(shape.taskId)
+      expect(runs).toHaveLength(1)
+      expect(runs[0]!.repairSourceJobId).toBe(shape.i1.id)
+      expect(runs[0]!.designText).toContain('kind: secret_scan')
+      expect(runs[0]!.designText).toContain('password assignment')
+      expect(kick).toHaveBeenCalledTimes(1)
+      expect(kick.mock.calls[0]![2]).toBe(`repair:${shape.i1.id}:1`)
+    })
+  })
+
   it('2. resume された review の changes_requested が repair run を queue する', async () => {
     await withApp(async (app) => {
       const shape = await blockedAfterFailedReview()

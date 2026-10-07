@@ -481,10 +481,11 @@ export async function persistJobResult(
     commitHash: result.commitHash,
     completedAt: result.completedAt,
     guardResult: result.guardResult,
-    failureMetadata: result.providerFailureKind || result.workspaceState
+    failureMetadata: result.providerFailureKind || result.workspaceState || result.refusal
       ? {
           kind: result.providerFailureKind,
           workspaceState: result.workspaceState,
+          refusal: result.refusal,
         }
       : undefined,
     reviewResult: result.reviewResult,

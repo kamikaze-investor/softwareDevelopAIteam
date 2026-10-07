@@ -310,6 +310,32 @@ describe('abort cleanup observation reporting', () => {
 })
 
 describe('terminal result persistence', () => {
+  it('persists a value-free secret-scan refusal in failureMetadata', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const refusal = {
+      kind: 'secret_scan' as const,
+      patternKinds: ['password assignment' as const],
+      repairEligible: true as const,
+      repairEligibilityReason: 'implementation_added_generic_assignment' as const,
+    }
+    const refusedResult: JobRunResult = {
+      ...runResult,
+      status: 'failed',
+      exitCode: 1,
+      refusal,
+      workspaceState: 'unchanged',
+    }
+
+    await persistJobResult('review-refused', refusedResult, 'failed', { patchJob })
+
+    const failureMetadata = { refusal, workspaceState: 'unchanged' }
+    expect(patchJob).toHaveBeenCalledWith('review-refused', expect.objectContaining({ failureMetadata }))
+    expect(outboxMocks.recordPending).toHaveBeenCalledWith(
+      'review-refused',
+      expect.objectContaining({ failureMetadata }),
+    )
+  })
+
   it('provider failure metadataをterminal PATCHとOutboxへ同じ内容で渡す', async () => {
     const patchJob = vi.fn().mockResolvedValue(true)
     const timeoutResult: JobRunResult = {

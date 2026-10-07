@@ -3,6 +3,7 @@ import {
   loadEngineeringPrinciples,
   selectPrincipleSlugs,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
+import type { JobRefusalMetadata } from '@ai-team/shared'
 import { buildTaskContract, type TaskContractSource } from '../implementPrompt'
 
 /**
@@ -39,6 +40,8 @@ export interface RepairJobFacts {
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
 }
 
+export type RepairReviewRefusalFacts = JobRefusalMetadata
+
 export interface RepairReviewFinding {
   severity: string
   file?: string
@@ -67,6 +70,8 @@ export interface RepairPromptInput extends TaskContractSource {
   job?: RepairJobFacts
   /** changes_requested のReviewResult。 */
   review?: RepairReviewFacts
+  /** Value-free pre-send review refusal facts. */
+  reviewRefusal?: RepairReviewRefusalFacts
   /**
    * QA結果（テスト・typecheck 等）。**失敗したものに限らない。**
    * `passed` / `skipped` も含めてそのまま提示する —— 後から確認された「通っている」という
@@ -149,6 +154,17 @@ function formatReviewFacts(review: RepairReviewFacts): string[] {
   return lines
 }
 
+function formatReviewRefusalFacts(refusal: RepairReviewRefusalFacts): string[] {
+  return [
+    '## Review pre-send refusal',
+    `kind: ${sanitizeUntrusted(refusal.kind, 100)}`,
+    `repairEligible: ${String(refusal.repairEligible)}`,
+    `repairEligibilityReason: ${sanitizeUntrusted(refusal.repairEligibilityReason, 100)}`,
+    'patternKinds:',
+    ...refusal.patternKinds.map((kind) => `- ${sanitizeUntrusted(kind, 100)}`),
+  ]
+}
+
 function formatQaFacts(qaResults: RepairQaFacts[]): string[] {
   // **見出しは結果で限定しない。** `passed` の QA を「失敗したQA」の下へ置くと、
   // 提示している事実と逆の意味になる。status は既存値をそのまま出す。
@@ -174,6 +190,7 @@ export function buildRepairPrompt(input: RepairPromptInput): string {
 
   if (input.job) untrusted.push(...formatJobFacts(input.job), '')
   if (input.review) untrusted.push(...formatReviewFacts(input.review), '')
+  if (input.reviewRefusal) untrusted.push(...formatReviewRefusalFacts(input.reviewRefusal), '')
   if (input.qa && input.qa.length > 0) untrusted.push(...formatQaFacts(input.qa), '')
 
   return [
