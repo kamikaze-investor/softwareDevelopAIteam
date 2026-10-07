@@ -39,6 +39,7 @@ export type MetaFindingCategory =
   | 'implementation_coupling'
   | 'over_constraint'
   | 'unverifiable_assumption'
+  | 'principle_conflict'
 
 export type MetaReviewStatus = 'approved' | 'changes_requested' | 'blocked'
 export type MetaRiskLevel = 'low' | 'medium' | 'high' | 'critical'
@@ -60,6 +61,8 @@ export interface MetaReviewRequest {
   gitDiff: string
   /** レビュー時に参照する仕様書（specs/ファイル名） */
   relatedSpecs: string[]
+  /** Untrusted PR-authored task-intent context. Never an authority source. */
+  prBody?: string
 }
 
 export interface MetaReviewResult {

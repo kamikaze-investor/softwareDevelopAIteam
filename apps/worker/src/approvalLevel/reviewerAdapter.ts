@@ -5,9 +5,18 @@ import {
   selectPrinciples,
   type PrincipleSelection,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
-import type { AppliedPrinciple } from '@ai-team/shared'
-import { mapFileToFocuses } from './focusSelector'
-import { buildConstitutionPrinciplesPrompt, formatConstitutionPrinciplesWarning, loadConstitutionPrinciples } from '@ai-team/shared/src/constitutionPrinciples.js'
+import type { AppliedPrinciple, MetaFindingCategory } from '@ai-team/shared'
+import { hasDecisionAuthorityReviewFocus, mapFileToFocuses } from './focusSelector'
+import {
+  buildConstitutionPrinciplesPrompt,
+  buildDecisionAuthorityPrinciplesPrompt,
+  CONSTITUTION_PRINCIPLE_SECTION_LABELS,
+  DECISION_AUTHORITY_PRINCIPLE_IDS,
+  formatConstitutionPrinciplesWarning,
+  formatDecisionAuthorityPrinciplesWarning,
+  loadConstitutionPrinciples,
+  loadDecisionAuthorityPrinciples,
+} from '@ai-team/shared/src/constitutionPrinciples.js'
 import type { ApprovalLevelResult, DesignReviewKind } from '@ai-team/shared'
 import { createAiCliAdapter } from '../aiCli/factory.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
@@ -21,6 +30,7 @@ export type ReviewVerdict = 'approved' | 'changes_requested' | 'blocking'
 export interface ReviewIssue {
   severity: 'info' | 'warning' | 'critical'
   description: string
+  category?: MetaFindingCategory
 }
 
 export interface ReviewerRequest {
@@ -73,8 +83,28 @@ interface ParsedReviewerResponse {
   confidence?: unknown
 }
 
+interface ParsedReviewIssue {
+  severity: ReviewIssue['severity']
+  description: string
+  category?: unknown
+}
+
 const REVIEW_VERDICTS: ReviewVerdict[] = ['approved', 'changes_requested', 'blocking']
 const ISSUE_SEVERITIES: ReviewIssue['severity'][] = ['info', 'warning', 'critical']
+const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
+  'cage_violation',
+  'authority_change',
+  'repository_boundary',
+  'security_regression',
+  'architecture_drift',
+  'scope_creep',
+  'mvp_mismatch',
+  'spec_violation',
+  'implementation_coupling',
+  'over_constraint',
+  'unverifiable_assumption',
+  'principle_conflict',
+]
 
 function assertNever(value: never): never {
   throw new Error(`Unhandled implementer provider: ${value}`)
@@ -92,11 +122,13 @@ function isIssueSeverity(value: unknown): value is ReviewIssue['severity'] {
   return typeof value === 'string' && ISSUE_SEVERITIES.includes(value as ReviewIssue['severity'])
 }
 
-function isReviewIssue(value: unknown): value is ReviewIssue {
-  return isRecord(value) && isIssueSeverity(value.severity) && typeof value.description === 'string'
+function isReviewIssue(value: unknown): value is ParsedReviewIssue {
+  return isRecord(value)
+    && isIssueSeverity(value.severity)
+    && typeof value.description === 'string'
 }
 
-function normalizeIssues(value: unknown): ReviewIssue[] {
+function normalizeIssues(value: unknown, providedPrincipleIds: readonly string[]): ReviewIssue[] {
   if (!Array.isArray(value)) {
     return []
   }
@@ -106,7 +138,26 @@ function normalizeIssues(value: unknown): ReviewIssue[] {
     .map(issue => ({
       severity: issue.severity,
       description: issue.description,
+      ...(!isMetaFindingCategory(issue.category)
+        ? {}
+        : { category: normalizeIssueCategory(issue.category, issue.description, providedPrincipleIds) }),
     }))
+}
+
+function isMetaFindingCategory(value: unknown): value is MetaFindingCategory {
+  return typeof value === 'string' && META_FINDING_CATEGORIES.includes(value as MetaFindingCategory)
+}
+
+function normalizeIssueCategory(
+  category: MetaFindingCategory,
+  description: string,
+  providedPrincipleIds: readonly string[],
+): MetaFindingCategory {
+  if (category !== 'principle_conflict') return category
+  const message = description.toLowerCase()
+  return providedPrincipleIds.some((id) => message.includes(id.toLowerCase()))
+    ? category
+    : 'spec_violation'
 }
 
 function buildFailureResult(
@@ -132,6 +183,7 @@ function buildReviewerResultFromParsedOutput(
   phase: ReviewPhase,
   raw: string,
   principleSelection: readonly PrincipleSelection[] = [],
+  providedPrincipleIds: readonly string[] = [],
 ): ReviewerResult | undefined {
   if (!isReviewVerdict(parsed.verdict)) {
     return undefined
@@ -142,7 +194,7 @@ function buildReviewerResultFromParsedOutput(
     phase,
     verdict: parsed.verdict,
     summary: typeof parsed.summary === 'string' ? parsed.summary : '(summary not provided)',
-    issues: normalizeIssues(parsed.issues),
+    issues: normalizeIssues(parsed.issues, providedPrincipleIds),
     appliedPrinciples: normalizeAppliedPrinciples(parsed.appliedPrinciples, principleSelection),
     confidence: typeof parsed.confidence === 'number' && Number.isFinite(parsed.confidence)
       ? parsed.confidence
@@ -178,6 +230,19 @@ export function selectReviewPrinciples(req: ReviewerRequest): PrincipleSelection
   )
 }
 
+export function providedReviewerPrincipleIds(
+  req: ReviewerRequest,
+  principleSelection: readonly PrincipleSelection[],
+): string[] {
+  const ids = [
+    ...CONSTITUTION_PRINCIPLE_SECTION_LABELS.map((label) => `specs/00 §${label}`),
+    ...principleSelection.map((principle) => principle.slug),
+  ]
+  return hasDecisionAuthorityReviewFocus(req.targetFiles)
+    ? [...ids, ...DECISION_AUTHORITY_PRINCIPLE_IDS]
+    : ids
+}
+
 export function buildReviewPrompt(
   req: ReviewerRequest,
   principleSelection: readonly PrincipleSelection[] = selectReviewPrinciples(req),
@@ -186,6 +251,15 @@ export function buildReviewPrompt(
   const constitutionPrinciples = loadConstitutionPrinciples()
   const constitutionPrinciplesWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
   if (constitutionPrinciplesWarning) console.warn(constitutionPrinciplesWarning)
+  const includeDecisionAuthority = hasDecisionAuthorityReviewFocus(req.targetFiles)
+  const decisionAuthorityPrinciples = includeDecisionAuthority
+    ? loadDecisionAuthorityPrinciples()
+    : undefined
+  const decisionAuthorityWarning = decisionAuthorityPrinciples === undefined
+    ? undefined
+    : formatDecisionAuthorityPrinciplesWarning(decisionAuthorityPrinciples)
+  if (decisionAuthorityWarning) console.warn(decisionAuthorityWarning)
+  const providedPrincipleIds = providedReviewerPrincipleIds(req, principleSelection)
 
   const phaseSpecificContent = req.phase === 'pre'
     ? [
@@ -204,10 +278,18 @@ export function buildReviewPrompt(
   return [
     phaseSpecificContent,
     '',
-    'AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.15（最小検証・必要最小反証／CEO確認最小化・自律判断）を正本として適用し、明示的なSafety Ruleを常に優先してください。',
+    'AI Team OS共通行動原則は specs/00_constitution.md 3.14〜3.18 を正本として適用し、明示的なSafety Ruleを常に優先してください。',
     buildConstitutionPrinciplesPrompt(constitutionPrinciples),
+    ...(decisionAuthorityPrinciples === undefined
+      ? []
+      : ['', 'Decision Authority excerpt:', buildDecisionAuthorityPrinciplesPrompt(decisionAuthorityPrinciples)]),
     '',
     buildApplicablePrinciplesSection(principleSelection),
+    '',
+    'Review Contract: Evaluate against the canonical project principles provided above in preference to generic model priors.',
+    'If a provided canonical principle appears contradictory, unsafe, or in conflict with the Goal or Constitution, do not silently override it. Report an issue with category `principle_conflict` and name the principle.',
+    '`principle_conflict` is valid only when the description names one of these provided identifiers:',
+    ...providedPrincipleIds.map((id) => `- ${id}`),
     '',
     '実装目的・タスク説明:',
     req.purposeSummary,
@@ -220,7 +302,7 @@ export function buildReviewPrompt(
     '{',
     '  "verdict": "approved" | "changes_requested" | "blocking",',
     '  "summary": "レビューの要約（日本語1-2文）",',
-    '  "issues": [{ "severity": "info"|"warning"|"critical", "description": "..." }],',
+    '  "issues": [{ "severity": "info"|"warning"|"critical", "category": "optional MetaFindingCategory", "description": "..." }],',
     '  "confidence": 0.0から1.0の数値,',
     '  "appliedPrinciples": [{ "principleId": "上のApplicable Principlesのid", "verdict": "ALIGNED"|"CONFLICT"|"UNCERTAIN", "reason": "1文" }]',
     '}',
@@ -233,6 +315,7 @@ export function parseReviewerResponse(
   provider: ReviewerProvider,
   phase: ReviewPhase,
   principleSelection: readonly PrincipleSelection[] = [],
+  providedPrincipleIds: readonly string[] = [],
 ): ReviewerResult {
   const jsonBlockMatch = /```json\s*([\s\S]*?)\s*```/iu.exec(raw)
   const jsonText = jsonBlockMatch?.[1] ?? raw
@@ -244,7 +327,14 @@ export function parseReviewerResponse(
       return buildFailureResult(raw, provider, phase)
     }
 
-    return buildReviewerResultFromParsedOutput(parsed, provider, phase, raw, principleSelection)
+    return buildReviewerResultFromParsedOutput(
+      parsed,
+      provider,
+      phase,
+      raw,
+      principleSelection,
+      providedPrincipleIds,
+    )
       ?? buildFailureResult(raw, provider, phase)
   } catch {
     return buildFailureResult(raw, provider, phase)
@@ -254,6 +344,7 @@ export function parseReviewerResponse(
 export class GeminiReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {
     const principleSelection = selectReviewPrinciples(req)
+    const providedPrincipleIds = providedReviewerPrincipleIds(req, principleSelection)
     const prompt = buildReviewPrompt(req, principleSelection)
 
     try {
@@ -261,7 +352,7 @@ export class GeminiReviewerAdapter implements IReviewerAdapter {
         featureName: `approval-level-${req.phase}-review`,
       })
 
-      return parseReviewerResponse(raw, 'gemini', req.phase, principleSelection)
+      return parseReviewerResponse(raw, 'gemini', req.phase, principleSelection, providedPrincipleIds)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
 
@@ -290,6 +381,7 @@ export const CODEX_REVIEWER_MODEL = 'gpt-5.6-sol'
 export class CodexReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {
     const principleSelection = selectReviewPrinciples(req)
+    const providedPrincipleIds = providedReviewerPrincipleIds(req, principleSelection)
     const prompt = buildReviewPrompt(req, principleSelection)
     const adapter = createAiCliAdapter({ provider: 'codex' })
 
@@ -344,10 +436,17 @@ export class CodexReviewerAdapter implements IReviewerAdapter {
           req.phase,
           result.stdout,
           principleSelection,
+          providedPrincipleIds,
         ) ?? buildFailureResult(result.stdout, 'codex', req.phase)
       }
 
-      return parseReviewerResponse(result.stdout, 'codex', req.phase, principleSelection)
+      return parseReviewerResponse(
+        result.stdout,
+        'codex',
+        req.phase,
+        principleSelection,
+        providedPrincipleIds,
+      )
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
 
@@ -418,6 +517,7 @@ export function extractClaudeCliResultText(stdout: string): string | undefined {
 export class ClaudeReviewerAdapter implements IReviewerAdapter {
   async review(req: ReviewerRequest): Promise<ReviewerResult> {
     const principleSelection = selectReviewPrinciples(req)
+    const providedPrincipleIds = providedReviewerPrincipleIds(req, principleSelection)
     const prompt = buildReviewPrompt(req, principleSelection)
     const adapter = createAiCliAdapter({ provider: 'claude_code' })
 
@@ -462,7 +562,13 @@ export class ClaudeReviewerAdapter implements IReviewerAdapter {
         return buildFailureResult(result.stdout, 'claude', req.phase)
       }
 
-      return parseReviewerResponse(innerText, 'claude', req.phase, principleSelection)
+      return parseReviewerResponse(
+        innerText,
+        'claude',
+        req.phase,
+        principleSelection,
+        providedPrincipleIds,
+      )
     } catch (err) {
       // timeout（execFileSyncのETIMEDOUT等）もここに落ちる。
       const message = err instanceof Error ? err.message : String(err)

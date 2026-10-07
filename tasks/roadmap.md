@@ -11036,6 +11036,13 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       「既存 Principle を現在の Registry 方式で**選択・Review・履歴保存・集計可能にする**」ことである。
       既存の Principle Registry / contextual selection / `principle_applications` を再利用する。
 
+      **2026-10-07 canonical principle delivery 監査で確定した追加 scope**:
+      CI Meta Review と Independent / Design Review の既存 path・focus 選択を再利用し、
+      `specs/22` の Decision Authority 抜粋を必要な role にだけ配る。CI Meta Review には
+      PR body を上限付きの untrusted task-intent context として渡し、提供済み原則自体の問題は
+      `principle_conflict` で名指し報告できるようにする。監査では PR #329 の fallback Meta Review に
+      canonical Decision Authority Principle と PR body が届かず、技術判断を CEO authority と誤判定したことを確認した。
+
       - **本文と metadata の二重正本を作らない。** `specs/21` と同じく metadata marker を
         **本文と同じ marker block へ置く**方式を一般化できるなら、それを優先する
       - **`constitutionPrinciples.ts`**: 章全文を毎回 prompt へ貼る方式を、

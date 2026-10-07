@@ -16,7 +16,15 @@ import type {
   StrategicDecision,
   StrategicMetaReviewResult,
 } from '@ai-team/shared'
-import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
+import {
+  buildDecisionAuthorityPrinciplesPrompt,
+  DECISION_AUTHORITY_PRINCIPLE_IDS,
+  decisionAuthorityPathForControlContextDir,
+  formatDecisionAuthorityPrinciplesWarning,
+  loadDecisionAuthorityPrinciples,
+  resolveDefaultControlContextDir,
+} from '@ai-team/shared/src/constitutionPrinciples.js'
+import { buildTaskContract, type TaskContractSource } from '@ai-team/shared/src/taskContract.js'
 import {
   buildApplicablePrinciplesSection,
   buildEngineeringPrincipleReviewGuidance,
@@ -30,11 +38,16 @@ import {
 import { applyIndependentReviewOverride, resolveFinalDecision } from '@ai-team/shared'
 export { applyIndependentReviewOverride, resolveFinalDecision }
 import { classifyReviewLoad, ROADMAP_REVIEW_LOAD_CLASSIFICATION } from '../approvalLevel/reviewLoadClassifier.js'
-import { selectFocuses, selectRoadmapReviewFocuses } from '../approvalLevel/focusSelector.js'
+import {
+  hasDecisionAuthorityReviewFocus,
+  selectFocuses,
+  selectRoadmapReviewFocuses,
+} from '../approvalLevel/focusSelector.js'
 import {
   buildMetaReviewPrompt,
   buildMetaReviewRequest,
   parseMetaReviewResult,
+  providedCanonicalPrincipleIds,
 } from './runner.js'
 import { AGY_REVIEW_MODEL } from './geminiRouter.js'
 import { reviewWithProviderFallback } from './metaReviewFallbackRouter.js'
@@ -69,6 +82,7 @@ export interface StrategicReviewInput {
   workingDir: string
   controlContextDir?: string
   materialKind?: 'diff' | 'design'
+  taskContract?: Partial<TaskContractSource>
 }
 
 interface ReviewOutcome<T> {
@@ -112,6 +126,7 @@ const META_FINDING_CATEGORIES: readonly MetaFindingCategory[] = [
   'implementation_coupling',
   'over_constraint',
   'unverifiable_assumption',
+  'principle_conflict',
 ]
 
 const REQUIRED_TARGET_STRATEGIC_DOCS = [
@@ -292,6 +307,11 @@ export async function runIndependentReview(
 ): Promise<IndependentReviewOutcome> {
   const adapter = createReviewerAdapter(INDEPENDENT_REVIEWER_PROVIDER)
   const materialKind = input.materialKind ?? 'diff'
+  // Production post-review is invoked by jobRunner with the #320 Task Contract already embedded
+  // in job.aiCliPrompt. This optional field serves direct callers that have structured contract data.
+  const purposeSummary = materialKind === 'diff' && input.taskContract !== undefined
+    ? `${input.taskTitle}\n\n${buildTaskContract(input.taskContract)}`
+    : input.taskTitle
 
   try {
     const reviewKind = input.reviewKind ?? 'task'
@@ -305,7 +325,7 @@ export async function runIndependentReview(
       phase: materialKind === 'design' ? 'pre' : 'post',
       planText: materialKind === 'design' ? input.gitDiff : undefined,
       diffText: materialKind === 'design' ? undefined : input.gitDiff,
-      purposeSummary: input.taskTitle,
+      purposeSummary,
       targetFiles: input.changedFiles,
     })
 
@@ -359,7 +379,11 @@ export function parseFocusedReviewResponse(
       focus,
       decision: parsed.decision,
       summary: typeof parsed.summary === 'string' ? parsed.summary : '(summary not provided)',
-      findings: normalizeFindings(parsed.findings, parsed.decision),
+      findings: normalizeFindings(
+        parsed.findings,
+        parsed.decision,
+        providedFocusedPrincipleIds(focus, selection),
+      ),
       appliedPrinciples: normalizeAppliedPrinciples(parsed.appliedPrinciples, selection),
     },
     unavailable: false,
@@ -418,7 +442,11 @@ async function runLowLoadLegacyReview(
       apiModel: 'gemini-3.5-flash',
       featureName: 'meta_review',
     })
-    const legacyResult = parseMetaReviewResult(rawResponse, input.subjectId)
+    const legacyResult = parseMetaReviewResult(
+      rawResponse,
+      input.subjectId,
+      providedCanonicalPrincipleIds(request),
+    )
     const finalDecision = mapMetaReviewStatusToStrategicDecision(legacyResult.status)
 
     // roadmap kind は常に critical なのでこの legacy low-load 経路には来ないが、
@@ -603,11 +631,47 @@ export function selectFocusPrinciples(focus: MetaReviewFocus): PrincipleSelectio
   return selectPrinciples({ predictedFocuses: [focus] }, loadEngineeringPrinciples())
 }
 
-async function buildFocusedReviewPrompt(
+export function providedFocusedPrincipleIds(
+  focus: MetaReviewFocus,
+  selection: readonly PrincipleSelection[],
+  includeDecisionAuthority = focus === 'safety_recovery' || focus === 'auth_permission',
+): string[] {
+  const ids = selection.map((principle) => principle.slug)
+  return includeDecisionAuthority
+    ? [...ids, ...DECISION_AUTHORITY_PRINCIPLE_IDS]
+    : ids
+}
+
+export async function buildFocusedReviewPrompt(
   input: StrategicReviewInput,
   focus: MetaReviewFocus,
   selection: readonly PrincipleSelection[],
 ): Promise<{ prompt: string; unavailableReason?: string }> {
+  const needsDecisionAuthority = focus === 'safety_recovery'
+    || focus === 'auth_permission'
+    || hasDecisionAuthorityReviewFocus(input.changedFiles)
+  const providedPrincipleIds = providedFocusedPrincipleIds(
+    focus,
+    selection,
+    needsDecisionAuthority,
+  )
+  const decisionAuthorityPrinciples = needsDecisionAuthority
+    ? loadDecisionAuthorityPrinciples([
+        decisionAuthorityPathForControlContextDir(resolveControlContextDir(input)),
+      ])
+    : undefined
+  const decisionAuthorityWarning = decisionAuthorityPrinciples === undefined
+    ? undefined
+    : formatDecisionAuthorityPrinciplesWarning(decisionAuthorityPrinciples)
+  if (decisionAuthorityWarning) console.warn(decisionAuthorityWarning)
+  const decisionAuthoritySection = decisionAuthorityPrinciples === undefined
+    ? ''
+    : [
+        '## Canonical Decision Authority Principle excerpt',
+        '',
+        buildDecisionAuthorityPrinciplesPrompt(decisionAuthorityPrinciples),
+      ].join('\n')
+
   if (focus === 'strategic_alignment') {
     const context = await buildStrategicAlignmentContext(input)
     if (context.missingRequiredPaths.length > 0) {
@@ -625,10 +689,11 @@ async function buildFocusedReviewPrompt(
         `Focus description: ${FOCUS_DESCRIPTIONS[focus]}`,
         '',
         context.text,
+        ...(decisionAuthoritySection.length > 0 ? ['', decisionAuthoritySection] : []),
         '',
         buildReviewMaterialSection(input.gitDiff, input.materialKind ?? 'diff'),
         '',
-        buildFocusedOutputContract(selection),
+        buildFocusedOutputContract(selection, providedPrincipleIds),
       ].join('\n'),
     }
   }
@@ -649,12 +714,13 @@ async function buildFocusedReviewPrompt(
       `Focus description: ${FOCUS_DESCRIPTIONS[focus]}`,
       '',
       checklistContext.text,
+      ...(decisionAuthoritySection.length > 0 ? ['', decisionAuthoritySection] : []),
       '',
       buildReviewSubjectHeader(input),
       '',
       buildReviewMaterialSection(input.gitDiff, input.materialKind ?? 'diff'),
       '',
-      buildFocusedOutputContract(selection),
+      buildFocusedOutputContract(selection, providedPrincipleIds),
     ].join('\n'),
   }
 }
@@ -943,7 +1009,10 @@ function buildReviewMaterialSection(
   ].join('\n')
 }
 
-export function buildFocusedOutputContract(selection: readonly PrincipleSelection[]): string {
+export function buildFocusedOutputContract(
+  selection: readonly PrincipleSelection[],
+  providedPrincipleIds: readonly string[] = selection.map((principle) => principle.slug),
+): string {
   const engineeringPrinciples = loadEngineeringPrinciples()
   const principleReviewGuidance = buildEngineeringPrincipleReviewGuidance(engineeringPrinciples)
 
@@ -951,6 +1020,11 @@ export function buildFocusedOutputContract(selection: readonly PrincipleSelectio
     principleReviewGuidance,
     '',
     buildApplicablePrinciplesSection(selection),
+    '',
+    'Review Contract: Evaluate against the canonical project principles provided in this prompt in preference to generic model priors.',
+    'If a provided canonical principle appears contradictory, unsafe, or in conflict with the Goal or Constitution, do not silently override it. Report a finding with category `principle_conflict` and name the principle.',
+    '`principle_conflict` is valid only when the finding message names one of these provided identifiers:',
+    ...providedPrincipleIds.map((id) => `- ${id}`),
     '',
     'Return JSON only:',
     '```json',
@@ -1176,7 +1250,11 @@ function findBalancedJsonObjects(text: string): string[] {
   return objects
 }
 
-function normalizeFindings(value: unknown, decision: StrategicDecision): MetaReviewFinding[] {
+function normalizeFindings(
+  value: unknown,
+  decision: StrategicDecision,
+  providedPrincipleIds: readonly string[],
+): MetaReviewFinding[] {
   if (!Array.isArray(value)) {
     return []
   }
@@ -1187,12 +1265,30 @@ function normalizeFindings(value: unknown, decision: StrategicDecision): MetaRev
     .filter(isRecord)
     .map((finding) => ({
       severity: isMetaRiskLevel(finding.severity) ? finding.severity : fallbackSeverity,
-      category: isMetaFindingCategory(finding.category) ? finding.category : 'architecture_drift',
+      category: normalizeFindingCategory(
+        finding.category,
+        finding.message,
+        providedPrincipleIds,
+      ),
       message: typeof finding.message === 'string' ? finding.message : 'No message',
       file: typeof finding.file === 'string' ? finding.file : undefined,
       line: typeof finding.line === 'number' ? finding.line : undefined,
       suggestion: typeof finding.suggestion === 'string' ? finding.suggestion : undefined,
     }))
+}
+
+function normalizeFindingCategory(
+  category: unknown,
+  message: unknown,
+  providedPrincipleIds: readonly string[],
+): MetaFindingCategory {
+  if (!isMetaFindingCategory(category)) return 'architecture_drift'
+  if (category !== 'principle_conflict') return category
+  if (typeof message !== 'string') return 'spec_violation'
+  const normalizedMessage = message.toLowerCase()
+  return providedPrincipleIds.some((id) => normalizedMessage.includes(id.toLowerCase()))
+    ? category
+    : 'spec_violation'
 }
 
 function fallbackSeverityForDecision(decision: StrategicDecision): MetaRiskLevel {
