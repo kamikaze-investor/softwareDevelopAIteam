@@ -197,7 +197,7 @@ async function main(): Promise<void> {
       // text が返っただけでは成功とせず、valid な formal verdict が成立して初めて成功とする。
       // 不成立は transient として既存の bounded retry -> 次 stage -> Copilot へ流れる。
       // 判定の中身では分岐しないので、BLOCKED を別 provider で取り直す経路は生まれない。
-      classifyVerdict: (raw) => classifyFormalVerdict(raw, providedPrincipleIds),
+      classifyVerdict: classifyFormalVerdict,
     })
     rawResponse = reviewResult.raw
     providerUsed = reviewResult.providerUsed

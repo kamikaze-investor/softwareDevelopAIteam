@@ -303,8 +303,10 @@ export async function runIndependentReview(
 ): Promise<IndependentReviewOutcome> {
   const adapter = createReviewerAdapter(INDEPENDENT_REVIEWER_PROVIDER)
   const materialKind = input.materialKind ?? 'diff'
-  const purposeSummary = materialKind === 'diff'
-    ? `${input.taskTitle}\n\n${buildTaskContract(input.taskContract ?? {})}`
+  // Production post-review is invoked by jobRunner with the #320 Task Contract already embedded
+  // in job.aiCliPrompt. This optional field serves direct callers that have structured contract data.
+  const purposeSummary = materialKind === 'diff' && input.taskContract !== undefined
+    ? `${input.taskTitle}\n\n${buildTaskContract(input.taskContract)}`
     : input.taskTitle
 
   try {

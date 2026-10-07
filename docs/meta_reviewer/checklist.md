@@ -49,6 +49,16 @@ CEO へ上げるのは `specs/22_safety_approval_design_principle.md` §14-3 の
 HIGH / CRITICAL、production、security、DB migration、recovery、または技術的に難しいという理由だけで CEO 承認を要求しない。
 Technical Safety Decision は、Risk に応じて Safety Evidence を強めて評価する。
 
+DA trigger は以下の7項目である（正本: `specs/22_safety_approval_design_principle.md` §14-3）。
+
+- (1) Goal・Product・Policy 文書の変更
+- (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed
+- (3) 新しい外部 service・有償依存・公開範囲・公開 route
+- (4) 個人データ・保持・削除方針の変更
+- (5) 不可逆（diff 本文で判定する destructive migration・データ削除）
+- (6) diff 内の secret 検出
+- (7) Review verdict の不一致が未解消
+
 ### CLAUDE.md
 - [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない
 - [ ] Repository Boundary（ai-team-backend / target-project）が維持されている
@@ -112,7 +122,7 @@ Technical Safety Decision は、Risk に応じて Safety Evidence を強めて�
 | Cage弱体化 | 1件でも | `blocked` |
 | Sandbox制限解除 | 1件でも | `blocked` |
 | DA trigger (1)〜(7) | 1件でも | `blocked` + CEO通知 |
-| 技術的な権限・復旧・approval 変更（DA trigger なし） | Risk に応じて | Safety Evidence を強化して AI が判定 |
+| recovery / technical changes outside DA(2) | Risk に応じて | Safety Evidence を強化して AI が判定 |
 | 禁止コマンド追加 | 1件でも | `blocked` |
 | 仕様思想逸脱 | 軽微 | `changes_requested` |
 | MVPスコープ外 | あり | `changes_requested` |

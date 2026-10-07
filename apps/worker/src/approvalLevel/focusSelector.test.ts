@@ -65,6 +65,32 @@ describe('selectFocuses', () => {
     expect(hasDecisionAuthorityReviewFocus(['apps/api/src/routes/health.ts'])).toBe(false)
     expect(hasDecisionAuthorityReviewFocus(['apps/mobile/src/screens/Home.tsx'])).toBe(false)
   })
+
+  it('selects canonical authority context for DA trigger candidate surfaces', () => {
+    const authoritySurfaces = [
+      'CLAUDE.md',
+      'AGENTS.md',
+      'specs/00_constitution.md',
+      'docs/project_memory/goal.md',
+      'docs/project_memory/design_philosophy.md',
+      'specs/22_safety_approval_design_principle.md',
+      'docs/project_memory/rules/approval_rules.md',
+      'packages/shared/src/types/agent.ts',
+      'apps/api/src/routes/permissionGrants.ts',
+      'packages/shared/src/types/permission_grant.ts',
+      'specs/08_permissions.md',
+      'docs/meta_reviewer/prompt.md',
+      'apps/worker/src/metaReviewer/runner.ts',
+      'apps/api/src/storage/migrations/004_add_column.ts',
+      'package.json',
+      'apps/worker/package.json',
+      'pnpm-lock.yaml',
+    ]
+
+    for (const surface of authoritySurfaces) {
+      expect(hasDecisionAuthorityReviewFocus([surface]), surface).toBe(true)
+    }
+  })
 })
 
 describe('selectRoadmapReviewFocuses', () => {

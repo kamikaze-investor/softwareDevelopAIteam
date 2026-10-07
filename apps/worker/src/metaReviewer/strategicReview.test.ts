@@ -397,6 +397,30 @@ describe('runStrategicMetaReview', () => {
       expect(prompt).toContain('apps/api/src/pl/')
       expect(prompt).toContain('## 1-2. Human Decision Authority')
     })
+
+    it('keeps the previous purpose when no structured Task Contract is provided', async () => {
+      const run = vi.fn().mockResolvedValue({
+        blocked: false,
+        exitCode: 0,
+        stdout: 'review output',
+        stderr: '',
+        parsedOutput: { verdict: 'approved', summary: 'ok', issues: [], confidence: 0.9 },
+      })
+      mockCreateAiCliAdapter.mockReturnValue({ run } as unknown as ReturnType<typeof createAiCliAdapter>)
+
+      await runIndependentReview({
+        subjectId: 'task-without-contract',
+        taskTitle: 'Existing production purpose',
+        changedFiles: ['apps/worker/src/jobRunner.ts'],
+        gitDiff: '+ implementation',
+        workingDir: repoRoot,
+        materialKind: 'diff',
+      })
+
+      const prompt = (run.mock.calls[0]![0] as { prompt: string }).prompt
+      expect(prompt).toContain('Existing production purpose')
+      expect(prompt).not.toContain('[Task Contract]')
+    })
   })
 
   it('requires CEO approval for CRITICAL CONFLICT', async () => {

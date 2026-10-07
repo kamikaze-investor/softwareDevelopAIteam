@@ -4,6 +4,16 @@
 
 （役割分担上の位置づけ: あなたはGemini＝低コストなレビュー・監査レイヤーの一機能「Meta Review」を担う。最終判断者ではなく、`blocked`は安全側の停止判定である。CEO通知・エスカレーションは `specs/22` §14-3 の DA trigger (1)〜(7) に該当する場合に限る。詳細は `docs/multi_ai_step_review_flow.md` 2-2章を参照）
 
+DA trigger は以下の7項目である（正本: `specs/22_safety_approval_design_principle.md` §14-3）。
+
+- (1) Goal・Product・Policy 文書の変更
+- (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed
+- (3) 新しい外部 service・有償依存・公開範囲・公開 route
+- (4) 個人データ・保持・削除方針の変更
+- (5) 不可逆（diff 本文で判定する destructive migration・データ削除）
+- (6) diff 内の secret 検出
+- (7) Review verdict の不一致が未解消
+
 AI Team OS共通行動原則は `specs/00_constitution.md` 3.14〜3.18 を正本として適用し、明示的なSafety Ruleを常に優先する。
 
 ## Review Contract

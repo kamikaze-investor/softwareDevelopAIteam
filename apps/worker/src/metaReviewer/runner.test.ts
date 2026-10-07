@@ -4,6 +4,7 @@ import path from 'node:path'
 import {
   buildMetaReviewPrompt,
   buildMetaReviewRequest,
+  classifyFormalVerdict,
   MAX_PR_BODY_CHARS,
   parseMetaReviewResult,
   providedCanonicalPrincipleIds,
@@ -100,6 +101,25 @@ describe('parseMetaReviewResult', () => {
 
     expect(accepted.findings[0].category).toBe('principle_conflict')
     expect(normalized.findings[0].category).toBe('spec_violation')
+  })
+
+  it('keeps an unnamed principle_conflict negative verdict and normalizes its category', () => {
+    const raw = JSON.stringify({
+      status: 'blocked',
+      riskLevel: 'critical',
+      summary: 'Unnamed principle conflict',
+      findings: [{
+        severity: 'critical',
+        category: 'principle_conflict',
+        message: 'An unspecified principle conflicts with this change.',
+      }],
+      requiresCeoApproval: true,
+    })
+
+    expect(classifyFormalVerdict(raw)).toBe('negative')
+    const parsed = parseMetaReviewResult(raw, 'task-test', ['specs/22 §1-3'])
+    expect(parsed.status).toBe('blocked')
+    expect(parsed.findings[0].category).toBe('spec_violation')
   })
 
   it('returns blocked when no valid Meta Review JSON exists', () => {

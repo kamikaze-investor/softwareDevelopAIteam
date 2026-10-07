@@ -351,9 +351,8 @@ export function tryParseMetaReviewResult(
  */
 export function hasFormalVerdict(
   rawResponse: string,
-  providedPrincipleIds: readonly string[] = [],
 ): boolean {
-  return classifyFormalVerdict(rawResponse, providedPrincipleIds) !== 'none'
+  return classifyFormalVerdict(rawResponse) !== 'none'
 }
 
 /**
@@ -371,9 +370,8 @@ export function hasFormalVerdict(
  */
 export function classifyFormalVerdict(
   rawResponse: string,
-  providedPrincipleIds: readonly string[] = [],
 ): 'none' | 'positive' | 'negative' {
-  const strict = findStrictVerdictObject(rawResponse, providedPrincipleIds)
+  const strict = findStrictVerdictObject(rawResponse)
   if (strict === undefined) {
     return 'none'
   }
@@ -392,10 +390,7 @@ export function classifyFormalVerdict(
  * **厳しすぎる方向は安全側である** — 不成立と判定すれば retry / fallback へ進み、
  * 最終的に誰も verdict を出せなければ fail-closed BLOCK になるだけで、緩む方向には倒れない。
  */
-function findStrictVerdictObject(
-  rawResponse: string,
-  providedPrincipleIds: readonly string[],
-): Record<string, unknown> | undefined {
+function findStrictVerdictObject(rawResponse: string): Record<string, unknown> | undefined {
   for (const jsonStr of extractJsonCandidates(rawResponse)) {
     let parsed: unknown
     try {
@@ -424,7 +419,7 @@ function findStrictVerdictObject(
     // message だけを見ていたときは、severity / category が欠けた finding でも成立扱いになり、
     // normalizeFindings() が既定値で埋めて APPROVED だけが残った（独立レビュー指摘 R2 / R3）。
     // 切れた応答は途中の finding が不完全になりやすいので、ここは契約どおり要求する。
-    if (!parsed.findings.every((finding) => isStrictFinding(finding, providedPrincipleIds))) {
+    if (!parsed.findings.every(isStrictFinding)) {
       continue
     }
     if (typeof parsed.requiresCeoApproval !== 'boolean') {
@@ -452,7 +447,7 @@ export function parseMetaReviewResult(
   // `{"status":"approved"}` の後ろに完全な BLOCKED が続く応答で
   // **BLOCKED が捨てられ APPROVED が採用される**経路があった。
   // 厳密な候補があるなら必ずそれを採る。
-  const strict = findStrictVerdictObject(rawResponse, providedPrincipleIds)
+  const strict = findStrictVerdictObject(rawResponse)
   if (strict !== undefined) {
     return buildMetaReviewResult(strict, taskId, providedPrincipleIds)
   }
@@ -638,7 +633,7 @@ function normalizeFindings(
  * gate 述語が要求する finding の形。**normalizeFindings() の既定値埋めに頼らない。**
  * 省略可能な項目は「無い」か「正しい型」のどちらかであることまで見る。
  */
-function isStrictFinding(value: unknown, providedPrincipleIds: readonly string[]): boolean {
+function isStrictFinding(value: unknown): boolean {
   if (!isRecord(value)) {
     return false
   }
@@ -658,12 +653,6 @@ function isStrictFinding(value: unknown, providedPrincipleIds: readonly string[]
     return false
   }
   if (value.suggestion !== undefined && typeof value.suggestion !== 'string') {
-    return false
-  }
-  if (
-    value.category === 'principle_conflict'
-    && !mentionsProvidedPrinciple(value.message, providedPrincipleIds)
-  ) {
     return false
   }
   return true

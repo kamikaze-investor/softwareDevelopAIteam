@@ -88,7 +88,21 @@ export function hasDecisionAuthorityReviewFocus(files: readonly string[]): boole
 
 function isDecisionAuthoritySurface(file: string): boolean {
   const basename = file.split('/').at(-1) ?? ''
-  return file.startsWith('apps/api/src/pl/')
+  return file === 'claude.md'
+    || file === 'agents.md'
+    || file === 'specs/00_constitution.md'
+    || file === 'docs/project_memory/goal.md'
+    || file === 'docs/project_memory/design_philosophy.md'
+    || file === 'packages/shared/src/types/agent.ts'
+    || file === 'apps/api/src/routes/permissiongrants.ts'
+    || file === 'packages/shared/src/types/permission_grant.ts'
+    || file === 'specs/08_permissions.md'
+    || file.startsWith('docs/meta_reviewer/')
+    || file.startsWith('apps/worker/src/metareviewer/')
+    || file.includes('migration')
+    || basename === 'package.json'
+    || file === 'pnpm-lock.yaml'
+    || file.startsWith('apps/api/src/pl/')
     || file.startsWith('apps/api/src/designreview/resume')
     || file.startsWith('apps/worker/src/approvallevel/')
     || file.includes('/guards/')
