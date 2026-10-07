@@ -667,8 +667,11 @@ function repairableBlockedReviewRequest(
   const isRepairSuccessor = parseRepairSource(stepKey) !== undefined
   const taskJobs = storage.jobs.findByTaskId(task.id)
   const latestImplementJob = taskJobs.find((job) => job.aiCliMode === 'implement')
+  // initial-implement を source として認めるのは、実装由来の secret-scan 拒否で止まった review の
+  // Human Resume に限る（CEO 承認範囲）。通常の `changes_requested` の受け入れ範囲は広げない。
   const isCanonicalInitialImplement =
-    stepKey === `task:${task.id}:initial-implement`
+    reviewRefusal !== undefined
+    && stepKey === `task:${task.id}:initial-implement`
     && latestImplementJob?.id === implementJob.id
     && humanResumesOf(storage, reviewResumeHops).length > 0
   if (!isResumeSuccessor && !isRepairSuccessor && !isCanonicalInitialImplement) {
