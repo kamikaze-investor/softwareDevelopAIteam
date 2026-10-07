@@ -5,19 +5,19 @@
 
 ---
 
-## 上位原則（2026-09-17 追記）
+## 上位原則（2026-09-17 追記・2026-10-02 改訂）
 
-本ファイルは**承認運用の正本**であり、下記はすべて現行有効である。
+本ファイルは**承認運用の正本**である。承認の要否は `specs/22_safety_approval_design_principle.md`
+（Safety / Approval 設計原則の正本）1章 **Decision Authority Principle** に従う:
 
-ただし**本ファイルの内容を変更するとき**は、`specs/22_safety_approval_design_principle.md`
-（2026-09-17 CEO 採用。Safety / Approval 設計原則の正本）に従う。同原則は
-Human Approval を通常の Safety mechanism ではなく**最後の Safety Boundary** として扱い、
-「protected file だから」「DB migration だから」「Control Repository だから」という理由**だけ**では
-CEO 必須にしない方向を定める。
+- Human Gate の要否は **「その操作によって誰の責務に属する意思決定が発生するか」** で決める。
+  操作名・ファイル種別・Risk Level（HIGH / CRITICAL）・「Production だから」「Security 関連だから」だけでは CEO 必須にしない
+- 技術的に危険な変更は、CEO 承認ではなく **Safety Evidence を強くして**扱う（同 1-3）
+- CEO 承認を挟むこと自体を Safety Evidence として扱わない
 
-**同原則は、それ自体では本ファイルの Yellow Zone を1つも緩めない。** 差分は同原則 14 章に
-「要調整・現行有効」として列挙してあり、緩和には個別の CEO 承認が要る
-（Class A/B/C の着手手順は `tasks/roadmap.md` `review-class-b-enhanced-ai-review` を参照）。
+**コードが現在強制している Gate は、本ファイルの改訂だけでは外れない。** 下記「2種類の承認」の
+`plActionPolicy` 由来 `ceo_approval` や、`git_commit` の一律 Approval Gate は、`specs/22` 14-2 の段階で
+外すまで現行どおり効く（外すまではコードが優先する）。
 
 ---
 
@@ -212,7 +212,7 @@ PL が事実に照らして妥当性を評価し、**変更する / 変更しな
 - PL は内容の妥当性を**評価してよい**（事実として正しいか、影響範囲はどこか）
 - しかし **PL 自身が BLOCK を override してはならない**
 - **AI が自分の権限を広げる形で解決してはならない。** 「この制約は不要だから外す」は PL の判断範囲外である
-- Safety Boundary 変更に当たるなら **CEO へ Escalate する**
+- Safety Boundary を**弱める**、または AI の authority を**広げる**変更に当たるなら **CEO へ Escalate する**（強化・縮小は技術判断。強化か弱化かを機械判定できない場合は Escalate 側へ倒す）
 
 ### PL と Binding Reviewer の意見が割れた場合
 
@@ -224,16 +224,16 @@ PL が事実に照らして妥当性を評価し、**変更する / 変更しな
 
 ## CEOの承認が必要（Yellow Zone）
 
-以下の場合のみCEOに通知・承認を求める。
+以下の**意思決定が発生する**場合のみCEOに通知・承認を求める。各項目は操作名ではなく意味で判定する（`specs/22` 1-1・1-2）。
 
 - Goal変更
 - Design Philosophy変更
 - 外部サービス追加（GitHub以外）
 - 有料API / 課金発生
-- 本番公開 / ストア公開
-- セキュリティモデル変更
+- 本番公開 / ストア公開 — **新しい**外部ユーザー・地域・市場への公開を指す。既存サービスの既存公開範囲内での通常 deploy は含まない
+- セキュリティモデル変更 — AI authority の拡大・Safety boundary の弱化を指す。technical security hardening・credential の rotation / 縮小は含まない（`specs/22` 1-5）
 - 個人情報機能追加
-- リポジトリ外への操作
+- リポジトリ外への操作 — 新しい外部対象への操作、または既存 authority を超える操作を指す。既存の運用対象（Production VPS・既存 GitHub repository）への既存 authority 範囲内の通常運用は含まない
 
 ## 承認不要（Green Zone）
 
@@ -263,3 +263,4 @@ Rollback可否:
 *Created: 2026-05-28*
 *Updated: 2026-09-16 — 「2種類の承認 — 役割と使い分け」「Mobile導線」「既知の制約」章を追加（Roadmap「2種類の承認の役割整理とMobile導線設計」の文書化分）*
 *Updated: 2026-09-30 — Mobile導線にホーム入口（バッジ件数・キャッシュ先読み）とProject詳細（B のみ・表示専用）を追記。既知の制約4を追加*
+*Updated: 2026-10-02 — 上位原則を Decision Authority Principle（`specs/22` 1章）へ改訂。Yellow Zone の各項目に意味ベースの解釈を付記。Binding Review の Escalate 条件を「弱化・拡大」に限定*

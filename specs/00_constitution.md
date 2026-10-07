@@ -41,7 +41,7 @@ CEOの主な責務は以下とする。
 - 方針の決定
 - 優先順位の決定
 - 予算方針の決定
-- 高リスク事項の承認
+- 人間にしか決められない事項（Goal・Policy・Value・AI authority の拡大・不可逆な外部 commitment 等）の承認（`specs/22_safety_approval_design_principle.md` 1章）
 - 最終的な経営判断
 
 通常の実務、技術的判断、作業管理、検証、再実行はAI Teamが担当する。
@@ -144,7 +144,8 @@ Evidenceにはtest結果・typecheck結果・bundle結果・実機確認・ロ�
 ## 3.13 Risk-based Review
 
 すべての変更を同じ重さでレビューせず、リスクレベルに応じて確認深度を変える。リスクが高いほどEvidence要求を
-強くする。High RiskはApproval Gate対象とする。
+強くする。High RiskはApproval Gateの評価対象とするが、Gateを通す根拠はRisk Levelに見合うSafety Evidenceであり、
+Risk Levelの高さだけを理由にCEO承認対象にしない（Human Gateの要否は`specs/22` 1章 Decision Authority Principleで決める）。
 
 （既存の`docs/multi_ai_step_review_flow.md`「11. リスク分類」「11-1. Review Level」と同じ考え方であり、
 新しい分類軸を追加するものではない）
@@ -179,8 +180,8 @@ CEO確認は、原則として次の場合に限る。
 - 人間の価値判断・意思決定が必要
 - Goal / Design Philosophyを変更する
 - Constitution / Policyを変更する
-- Permission / Authority / Safety Boundaryを変更する
-- CEOのリスク許容判断を必要とする重大な新規リスクが発生する
+- Permission / Authorityを拡大する、またはSafety Boundaryを弱める（縮小・強化は技術判断。強化か弱化かを機械判定できない場合は確認側へ倒す）
+- CEOのリスク許容判断を必要とする重大な新規リスクが発生する（技術リスクの大きさそのものはこれに当たらない。技術リスクはSafety Evidenceを強くして扱う。`specs/22` 1-3）
 - 既存仕様・方針同士に重大な矛盾がある
 - 判断根拠が不足し、そのまま進めると安全性・品質を合理的に保証できない
 
@@ -243,8 +244,9 @@ Developer AI / Reviewer AI への適用は `packages/shared/src/engineeringPrinc
 - 実装は既存機構（Mandatory Gate / Review Load Classifier / Independent Review / Meta Review / Candidate・Stable /
   E2E / Watchdog / State API / Recovery / Rollback / audit log）の改善・統合を優先し、新しいSafety subsystemを先に作らない
 
-**本条および `specs/22` は、それ自体では既存のGate・Approval・Guard・Permissionを弱めない。** 本ドキュメント1章の
-適用範囲注意がそのまま適用され、現行の運用ルールとの差分は `specs/22` 14章に「要調整・現行有効」として列挙される。
+2026-10-02 CEO 指示により、`specs/22` 1章を **Decision Authority Principle**（Human Gateの要否は「誰の責務に属する意思決定か」で
+決め、Risk Levelの高さだけでは決めない）として改訂し、同14章の要調整点を解消した。**コードが現在強制しているGateは、
+文書の改訂だけでは外れない**（外すまではコードのGateが優先する。外す段階は `specs/22` 14-2）。
 3.6 Safety First・3.13 Risk-based Review・3.15 Autonomous Judgment を置き換えるものではなく、
 それらを**どの設計方向で強化するか**を定める。
 
