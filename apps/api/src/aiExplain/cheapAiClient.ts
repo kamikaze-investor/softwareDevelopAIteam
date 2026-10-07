@@ -7,17 +7,18 @@ import { join, resolve } from 'node:path'
 /**
  * ## latency / timeout 契約（cheap AI = OpenCode CLI の1経路だけ）
  *
- * AI CLI 呼び出しは `runOpenCodeCli` の1種類だけで、caller の種類で試行回数だけが変わる。
+ * AI CLI 呼び出しは `runOpenCodeCli` の1種類だけで、caller の種類に応じて試行回数と期限を選ぶ。
  * PL adoption proposal だけは JSON だけを返す専用 agent（`PL_ADOPTION_PROPOSAL_AGENT`）を `--agent` で選ぶ。
  * それ以外の caller は OpenCode の既定 agent と従来どおりの引数のまま。
  *
  * | caller | 試行 | 1試行の期限 | CLI 起動後の最悪待ち |
  * | --- | --- | --- | --- |
  * | 説明・質問（approvalAi / taskFailureAi） | 1回 | `CHEAP_AI_ATTEMPT_TIMEOUT_MS` | `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` |
- * | PL 推論（`retryTransientOnce: true`） | 最大2回 | 同上 | `CHEAP_AI_RETRYING_MAX_WAIT_MS` |
+ * | PL 推論（`retryTransientOnce: true`、adoption proposal 以外） | 最大2回 | `CHEAP_AI_ATTEMPT_TIMEOUT_MS` | `CHEAP_AI_RETRYING_MAX_WAIT_MS` |
+ * | PL adoption proposal（専用 agent + `retryTransientOnce: true`） | 最大2回 | `PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS` | `PL_ADOPTION_PROPOSAL_MAX_WAIT_MS` = 2 × (120秒 + grace) + backoff |
  *
  * - **timeout**: 期限到達で AIteamOS がプロセスグループへ SIGTERM、`CHEAP_AI_KILL_GRACE_MS` 後に SIGKILL して
- *   close を待たずに決着する。CLI 起動後の1試行が `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` を超えることはない。
+ *   close を待たずに決着する。CLI 起動後の待ちは上表の caller 別上限を超えない。
  *   上限は CLI 起動から数える。プロセスごとに初回だけ行う隔離 dir の作成（`getIsolation()`）は含まない。
  * - **retry**: `retryTransientOnce` の caller に限り、`timeout` / `abnormal_termination` のときだけ
  *   `CHEAP_AI_RETRY_BACKOFF_MS` 待って新しいプロセスで1回だけ再試行する。それ以外（exit code != 0・stderr・
@@ -25,8 +26,8 @@ import { join, resolve } from 'node:path'
  * - **fallback**: 別 provider / 別 model への切り替えはしない（provider 抽象は本 client の責務外）。
  *   失敗は `CheapAiAttemptError`（`kind` で理由を区別）として throw し、`requestTextResult` を使う caller には
  *   `{ ok: false, reason }` の構造化結果として返す。CLI が遅い・使えないときに部分的な回答や推測で埋めない。
- * - 期限 60 秒は暫定値であり、記録済みの実 latency（66〜74 秒）の分布に基づいて決めたものではない。
- *   値を変えるときは本定数だけを変える（caller・テストは定数を参照する）。
+ * - 既定期限 60 秒は維持し、PL adoption proposal だけは実測 latency（28〜107 秒）に合わせて
+ *   専用 agent 選択時に 120 秒とする。
  */
 export const CHEAP_AI_ATTEMPT_TIMEOUT_MS = 60_000
 
@@ -41,6 +42,7 @@ export const CHEAP_AI_CONFIG = {
 export const CHEAP_AI_PROPOSER_ID = `${CHEAP_AI_CONFIG.provider}/${CHEAP_AI_CONFIG.model}`
 
 export const PL_ADOPTION_PROPOSAL_AGENT = 'pl-adoption-proposal' as const
+export const PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS = 120_000
 export const PL_ADOPTION_PROPOSAL_AGENT_PROMPT = [
   'You answer with exactly one JSON object, as the request specifies, and nothing else.',
   'You have no tools, no shell and no file access. Do not call tools, do not write tool-call markup,',
@@ -63,6 +65,11 @@ export const CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS = CHEAP_AI_ATTEMPT_TIMEOUT_MS +
 /** `retryTransientOnce` の caller（PL 推論）の CLI 起動後の上限。2試行 + backoff。初回の隔離 dir 作成は含まない。 */
 export const CHEAP_AI_RETRYING_MAX_WAIT_MS =
   CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS * 2 + CHEAP_AI_RETRY_BACKOFF_MS
+
+/** PL adoption proposal の CLI 起動後の上限。2 × (専用期限 + kill grace) + backoff。 */
+export const PL_ADOPTION_PROPOSAL_MAX_WAIT_MS =
+  (PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS + CHEAP_AI_KILL_GRACE_MS) * 2
+  + CHEAP_AI_RETRY_BACKOFF_MS
 
 /**
  * **明らかな異常終了**だけを表す signal。AIteamOS が送っていないのにこれで終わったときだけ、
@@ -283,7 +290,10 @@ async function runOpenCodeCli(
     ...(agent === undefined ? [] : ['--agent', agent]),
     prompt,
   ]
-  const timeoutMessage = `OpenCode CLI timed out after ${CHEAP_AI_ATTEMPT_TIMEOUT_MS}ms`
+  const attemptTimeoutMs = agent === PL_ADOPTION_PROPOSAL_AGENT
+    ? PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS
+    : CHEAP_AI_ATTEMPT_TIMEOUT_MS
+  const timeoutMessage = `OpenCode CLI timed out after ${attemptTimeoutMs}ms`
 
   return await new Promise<string>((resolvePromise, rejectPromise) => {
     const child = spawn(cliEntrypoint, args, {
@@ -332,7 +342,7 @@ async function runOpenCodeCli(
         killTree('SIGKILL')
         fail(timeoutMessage, 'timeout')
       }, CHEAP_AI_KILL_GRACE_MS)
-    }, CHEAP_AI_ATTEMPT_TIMEOUT_MS)
+    }, attemptTimeoutMs)
 
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
