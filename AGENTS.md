@@ -119,8 +119,8 @@ required checks PASS ／ 独立レビュー PASS ／ 新しいCEO判断事項な
 required checksを迂回するadmin merge、Rulesetの無効化・bypass・force pushは引き続き**禁止**。
 既存ルールで判断できない設計・方針・Authority判断が必要な場合だけCEOへエスカレーションする。
 | **Gemini** | 低コストなレビュー・監査レイヤー（Risk Review・Alignment Review・Meta Review・preReview・postReview・Report Translation）。単一の「判断担当」ではない | なし（warning/uncertain/blockedはClaude Code/ChatGPT/Humanへエスカレーション） |
-| **ChatGPT** | 重要判断・コミット前判断・人間向け整理（Gemini判断が不確実な場合・高リスク変更・コミット可否判断が必要な場合に使う） | 高リスクはCEO承認を要求 |
-| **Human / CEO** | Goal/Design Philosophy・外部サービス・課金・本番環境・認証権限・破壊的変更の最終判断 | 最終承認者 |
+| **ChatGPT** | 重要判断・コミット前判断・人間向け整理（Gemini判断が不確実な場合・高リスク変更・コミット可否判断が必要な場合に使う） | 高リスクは Safety Evidence の強化を要求（CEO承認は `specs/22` 1-2 該当時のみ） |
+| **Human / CEO** | Goal/Design Philosophy・新しい外部サービス・課金・新しい外部公開・AI authority の拡大 / Safety boundary の弱化・不可逆な外部 commitment の最終判断（`specs/22` 1-2） | 最終承認者 |
 
 ### 3-2. Router導入前の暫定Role Policy（2026-08-18〜。Router実装まで）
 
@@ -354,14 +354,20 @@ gh pr view <PR番号> --comments
 
 ### 正常終了の条件
 
-以下の両方が揃ったら CEO に報告し、マージを待つ:
+以下の両方が揃ったら、3章の条件
+（required checks PASS／独立レビュー PASS／新しいCEO判断事項なし／
+Goal・Design Philosophy変更なし）を満たす限り、
+AI側の対話・外部セッションでmergeまで進めてよい:
 
 ```
 CI (Typecheck & Test)        → ✅ Pass
 Meta Reviewer AI (Gemini)    → ✅ approved
 ```
 
-マージは **CEO（人間）が行う**。AIはマージしない。
+Human Decision Authority（`specs/22` 1-2）を含む PR だけ CEO のマージを待つ。
+admin merge・Ruleset の無効化・bypass・force push は引き続き禁止。
+なお Worker / SafeCommand による push・merge の自動実行は Rule 010 により現時点では禁止されており、
+P2-4 で authority / credential scope を別途承認するまで変更しない。
 
 ### task-009実装後の自動フロー（本来の姿）
 
@@ -423,7 +429,9 @@ function process(data: TaskInput): Promise<TaskResult> { ... }
 ### Q4. スコープを勝手に拡張しない
 
 - タスクで指定されたファイル以外は触らない
-- 新規ライブラリの追加は Yellow Zone（CEO承認必要）
+- 新規ライブラリの追加は技術判断として既存の Risk / Review で扱う。
+  有償依存・新しい外部サービスの採用、または Human Decision Authority に該当する影響を伴う場合のみ
+  CEO承認（`specs/22` 1-2 / 14-3）。
 - 「ついでに○○も改善しました」は禁止。気づいた問題は報告するだけ
 
 ### Q5. テストなしで完了しない
@@ -553,7 +561,7 @@ BLOCKED [claude_code → codex task-xxx] 何が必要か (YYYY-MM-DD)
 | 010 | git push / PR approve / merge / branch protection / workflows / CODEOWNERS は自動実行禁止 | SafeCommand allowlist で除外 |
 | 011 | mock 実行を完了扱いにしない | status='mock' では task_graph を [x] にしない |
 | 012 | 呼び出しごとにログ保存（taskId/cliPath/workdir/promptPath/changedFiles/exitCode/stdout/stderr） | 未実装（`docs/codex_invocation_log/` への保存は設計のみで実装コードなし） |
-| 013 | guards/workflows/CODEOWNERS/security 関連ファイルの変更は Red Zone — 人間承認必須 | FileChangeGuard で検出 → blocked |
+| 013 | guards/workflows/CODEOWNERS/security 関連ファイルの変更は、強化か弱化かを機械判定できない間は fail closed で人間承認（`specs/22` 14-3 DA trigger 2） | FileChangeGuard で検出 → blocked |
 
 ### Codex Usage Saving Policy（詳細: `docs/project_memory/rules/003_codex_usage_saving_policy.md`）
 
