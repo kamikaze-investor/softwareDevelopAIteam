@@ -259,6 +259,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される
 - **PL Escalation の配達結果が記録されず、配達済み・未配達・意図的抑制を区別できない**
 - **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**
+- **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**
 - **cheap AI（説明・質問経路）の latency と timeout 契約**
 - **VPS 運用手順の Current Truth 文書を canonical にする**
 - **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
@@ -319,7 +320,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
 - **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった**（state: planned）
 - **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる**（state: planned）
-- **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**（state: planned）
 - **VPS runtime / env の文書と tooling を Current Truth に整合させる**（state: planned）
 - **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める**（state: planned）
 - **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）**（state: planned）

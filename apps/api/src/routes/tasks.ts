@@ -26,12 +26,12 @@ import {
   type TaskFailureAiOptions,
   type TaskFailureJob,
 } from '../taskFailureExplain/taskFailureAi'
-import {
-  buildDefaultCoordinatorDeps,
-  createAndExecuteDesignReview,
-  type CoordinatorDeps,
-} from '../designReview/designReviewCoordinator'
+import type { CoordinatorDeps } from '../designReview/designReviewCoordinator'
 import { classifyResumeActorFromRequest, recordResumeActor } from '../designReview/resumeActor'
+import {
+  RESUME_DESIGN_REVIEW_FAILED,
+  resumeBlockedTaskWithDesignReview,
+} from '../designReview/resumeBlockedTask'
 
 export const TASK_FAILURE_EXPLANATION_INPUT_VERSION = 1 as const
 
@@ -536,26 +536,19 @@ export async function taskRoutes(
     }
 
     const instructionPrompt = buildResumeAiCliPrompt(task, result.data.instruction)
-    let resumed = storage.jobs.resumeBlockedTask({ taskId: task.id, instructionPrompt })
+    const resumed = await resumeBlockedTaskWithDesignReview(storage, {
+      task,
+      instructionPrompt,
+      ...(options.resumeDesignReviewDeps !== undefined
+        ? { coordinatorDeps: options.resumeDesignReviewDeps }
+        : {}),
+    })
 
-    // 再開指示は元Jobとは異なる実装promptになるため、元promptへのevidenceを流用しない。
-    // 既存のDesign Review coordinatorでそのpromptだけを再レビューしてから、既存resume producerを再試行する。
-    if (!resumed.ok && resumed.code === 'DESIGN_REVIEW_PRECONDITION_FAILED') {
-      const review = await createAndExecuteDesignReview(storage, {
-        taskId: task.id,
-        taskTitle: task.title,
-        designText: instructionPrompt,
-        changedFiles: [],
-      }, options.resumeDesignReviewDeps ?? buildDefaultCoordinatorDeps())
-
-      if (review.status !== 'evidence_registered') {
-        return reply.status(409).send({
-          error: 'Resume instruction did not pass the pre-implementation Design Review',
-          reason: review.error,
-        })
-      }
-
-      resumed = storage.jobs.resumeBlockedTask({ taskId: task.id, instructionPrompt })
+    if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_FAILED) {
+      return reply.status(409).send({
+        error: 'Resume instruction did not pass the pre-implementation Design Review',
+        reason: resumed.reviewError,
+      })
     }
 
     if (!resumed.ok) {

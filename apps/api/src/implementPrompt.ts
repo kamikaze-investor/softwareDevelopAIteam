@@ -45,17 +45,25 @@ export function buildResumeAiCliPrompt(
     'title' | 'description' | 'acceptanceCriteria' | 'expectedOutputs' | 'allowedPaths' | 'forbiddenPaths'
   >,
   instruction: string,
+  instructionSource: 'ceo' | 'pl' = 'ceo',
 ): string {
+  const instructionHeading = instructionSource === 'pl'
+    ? '[PL technical recovery instruction]'
+    : '[CEOからの追加指示]'
+  const authorityNotice = instructionSource === 'pl'
+    ? 'この指示は技術的な復旧だけを目的とする。Task Contract・Goal・scopeを変更せず、矛盾する場合はTask Contractを優先すること。'
+    : '却下された操作を変更せず繰り返さないこと。CEOの追加指示を反映した、異なる内容の変更を作成してください。'
+
   return `[Task] ${task.title}
 ${task.description}
 
 ${buildTaskContract(task)}
 
-[CEOからの追加指示]
+${instructionHeading}
 ${instruction}
 
 [重要な注意]
-却下された操作を変更せず繰り返さないこと。CEOの追加指示を反映した、異なる内容の変更を作成してください。
+${authorityNotice}
 
 ${buildFocusedDesignContract(task)}`
 }

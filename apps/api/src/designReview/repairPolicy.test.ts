@@ -304,6 +304,15 @@ describe('decideRepairAction — AI resume', () => {
     if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
   })
 
+  it('PL Technical Resume も予算を再発行しない', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-pl', 'pl')]
+
+    const decision = decideRepairAction('resume-pl', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.code).toBe('attempt_limit')
+  })
+
   it('[9] AI resume は前 generation の深さをそのまま引き継ぐ', () => {
     const built = chain(1)
     const priors = [...built.jobs, resumeOf(built.tip, 'resume-ai', 'ai')]
