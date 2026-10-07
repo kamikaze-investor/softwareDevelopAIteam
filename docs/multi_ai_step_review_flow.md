@@ -20,7 +20,7 @@
 | **Mechanical Safety Checks** | 機械的な危険検出（diff・禁止ファイル・AV-001・typecheck・test・Risk Scan・secret漏洩等） | 判断ではなくfactsを出力 |
 | **Gemini（低コストなレビュー・監査レイヤー）** | 単一の「判断担当」ではなく、用途に応じて複数の監査機能を担う低コストレイヤー: Risk Review・Alignment Review・Meta Review・preReview・postReview・Report Translation（詳細は2-2章） | なし（安く早く危険なズレを検出するのみ。warning/uncertain/blockedはClaude/ChatGPT/人間へエスカレーション） |
 | **ChatGPT** | 重要判断・コミット前判断・人間向け整理担当。コミット直前の判断整理・次工程設計。全Stepの要約パケットを読み、コミット可否・CEO承認要否・次Stepを判断 | 高リスクはCEO承認を要求 |
-| **Human / CEO** | Goal/Design Philosophy変更・外部サービス・課金・本番影響・認証権限・破壊的変更・AIレビュー同士の判断が割れた場合の最終判断 | 最終承認者 |
+| **Human / CEO** | Goal/Design Philosophy変更・新しい外部サービス採用・課金・新しい外部公開・AI authority の拡大 / Safety boundary の弱化・不可逆な外部 commitment・AIレビュー同士の判断が割れて解消しない場合の最終判断（`specs/22` 1-2。本番影響・認証・破壊的変更であることだけでは対象にしない） | 最終承認者 |
 
 重要な原則:
 - Codexは通常実装のみを担当し、危険箇所・設計判断は自己判断で進めずClaudeへ上げる
@@ -371,7 +371,7 @@ Final Review PacketはSafety Gate層（Mechanical Safety Checks・Risk Scan・co
 |---|---|---|
 | **Low** | ドキュメント更新・テスト追加・小さな型修正・UI文言修正・既存仕様内の軽微な修正・禁止ファイルなし・AV-001なし・test/typecheck PASS・Risk Scan low or none | Gemini Flashレビューのみで次Step候補。コミット直前にChatGPTまとめレビュー。CEO承認不要 |
 | **Medium** | 複数ファイル変更・軽微なAPI追加・既存ロジック変更・テスト修正を伴う変更・Risk Scan medium・影響範囲が限定的だが判断が必要（AI役割分担・レビュー方針に関わるdocs変更もここに含む） | Gemini Flashでmedium判定。必要ならSonnet修正。コミット前にChatGPTレビュー。CEOへ事後報告でも可 |
-| **High** | AV-001変更・認証変更・DBスキーマ変更・外部公開endpoint・worker/jobRunner変更・commitGate変更・safetyVerification変更・自動停止条件・CEO通知条件・package.json/lockfile変更・secretや.envに関係する変更・リポジトリ外操作・Goal/Design Philosophyに関わるdocs変更 | Geminiがlowと言ってもChatGPTへエスカレーション。原則CEO承認必須。コミット直前だけでなく実装前レビューも必要 |
+| **High** | AV-001変更・認証変更・DBスキーマ変更・外部公開endpoint・worker/jobRunner変更・commitGate変更・safetyVerification変更・自動停止条件・CEO通知条件・package.json/lockfile変更・secretや.envに関係する変更・リポジトリ外操作・Goal/Design Philosophyに関わるdocs変更 | Geminiがlowと言ってもChatGPTへエスカレーション。コミット直前だけでなく実装前レビューも必要。Safety Evidence（Independent Review・rehearsal・backup・rollback 等、blast radius に応じて選択）を強くする。**High であることだけを理由に CEO 承認必須にしない**（CEO 承認は `specs/22` 1-2 の Human Decision Authority に該当する場合のみ） |
 
 ## 11. 人間向け報告フォーマット（Report Translation）
 
@@ -470,18 +470,24 @@ Gemini Flashの判定に関係なくChatGPTへエスカレーション:
 - SonnetとGeminiの判断が食い違った
 ```
 
-CEO承認必須:
+CEO承認必須（**その変更によって Human Decision Authority に属する意思決定が発生する場合のみ**。操作名ではなく意味で判定する。`specs/22_safety_approval_design_principle.md` 1-1・1-2）:
 ```
-- high risk変更
-- 方針変更
-- 外部公開endpoint
-- 認証変更
-- DBスキーマ変更
-- 自動停止条件
-- CEO通知条件
-- 予算・課金・外部API追加
-- リポジトリ外操作
+- Goal / Design Philosophy / Product・事業方針の変更
+- 新しい外部公開（新しい外部ユーザー・地域・市場へ公開する endpoint。既存公開範囲内の endpoint 変更は含まない）
+- AI authority の拡大・Safety boundary の弱化（認証・権限・自動停止条件・CEO通知条件を広げる / 弱める変更）
+- 予算・課金・新しい外部サービス / 外部API の契約・採用
+- 新しい不可逆な外部 commitment、データ消失等の不可逆な結果を事業として許容する判断
 ```
+
+CEO承認必須に**しない**もの（Safety Evidence を強くして AI 側で判断する。`specs/22` 1-3）:
+```
+- high risk であること自体
+- DBスキーマ変更・migration（backup・migration rehearsal・rollback で扱う）
+- 認証・権限・自動停止条件の強化、technical security hardening
+- 既存運用対象（Production VPS・既存 GitHub repository）への既存 authority 範囲内のリポジトリ外操作
+```
+強化か弱化かを機械判定できない場合は、CEO承認必須側へ倒す（fail closed）。
+コードが現在強制している Gate（`git_commit` の一律 Approval 等）は、`specs/22` 14-2 の段階で外すまで有効である。
 
 ## 14. コスト最適化方針
 
@@ -607,7 +613,7 @@ ChatGPTがコミット前レビュー
 | モード | 内容 |
 |---|---|
 | **handoff** | 人間がClaude / Gemini / ChatGPT間の受け渡しを行う。ChatGPT判断レビューは手動で利用する。AIチームOSは必要に応じてFinal Review Packet、貼り付け用プロンプト、次Stepプロンプトを生成する。APIコストを最小化できるため、初期推奨モードとする。 |
-| **api** | AIチームOSがGemini / ChatGPT APIへ自動送信する。低リスク・中リスクの効率化に使う。高リスクはCEO承認必須。 |
+| **api** | AIチームOSがGemini / ChatGPT APIへ自動送信する。低リスク・中リスクの効率化に使う。高リスクは api モードで済ませず Independent Review・ChatGPT 判断レビューを通す（CEO 承認は `specs/22` 1-2 に該当する場合のみ）。 |
 
 **初期推奨:** `handoff`
 **将来拡張:** `api`
