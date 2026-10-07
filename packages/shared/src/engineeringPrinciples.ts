@@ -335,13 +335,10 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
   const standardDesignFrame = principles.bySlug.get('standard-design-frame')
   const honestUnverifiable = principles.bySlug.get('honest-unverifiable')
   const unknownDrivenStaging = principles.bySlug.get('unknown-driven-staging')
-  const canonicalDomainMeaning = principles.bySlug.get('canonical-domain-meaning')
 
   return [
     '## Engineering Principle Review Guidance',
     `- implementation_coupling: ${stableContract?.oneLiner ?? 'Principle stable-contract-first was not available; do not treat it as applied.'}`,
-    // semantic_reinference は implementation_coupling の一種として報告させる（新しい category を作らない）。
-    `- implementation_coupling (semantic_reinference; report it as implementation_coupling): ${canonicalDomainMeaning?.oneLiner ?? 'Principle canonical-domain-meaning was not available; do not treat it as applied.'}`,
     `- over_constraint: ${standardDesignFrame?.oneLiner ?? 'Principle standard-design-frame was not available; do not treat it as applied.'}`,
     // unnecessary_staging は over_constraint の一種として報告させる（新しい category を作らない）。
     `- over_constraint (unnecessary_staging; report it as over_constraint): ${unknownDrivenStaging?.oneLiner ?? 'Principle unknown-driven-staging was not available; do not treat it as applied.'}`,

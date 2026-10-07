@@ -329,8 +329,8 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     expect(guidance).toContain('- unverifiable_assumption: Report unverifiable claims honestly instead of turning guesses into PASS.')
     // unnecessary_staging は独立 category ではなく over_constraint の一種として報告させる。
     expect(guidance).toContain('- over_constraint (unnecessary_staging; report it as over_constraint): Stage by unknown, not by size')
-    // semantic_reinference も独立 category ではなく implementation_coupling の一種として報告させる。
-    expect(guidance).toContain('- implementation_coupling (semantic_reinference; report it as implementation_coupling): Decide domain facts through their canonical owner')
+    // canonical-domain-meaning は contextual principle なので、選択結果を経ずに常時注入しない。
+    expect(guidance).not.toContain('semantic_reinference')
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {
