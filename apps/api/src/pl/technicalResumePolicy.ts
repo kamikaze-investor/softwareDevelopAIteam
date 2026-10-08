@@ -32,6 +32,25 @@ function auditDetailHasToken(detail: string | undefined, token: string): boolean
 }
 
 /**
+ * Whether the stored resume-actor rows prove one exact Rule 5.5 Technical Resume.
+ * Every resume-actor row must carry the same PL evidence and marker; missing or
+ * conflicting rows fail closed.
+ */
+export function isVerifiedPlTechnicalResumeAudit(
+  entries: readonly AuditLogEntry[],
+  taskId: string,
+): boolean {
+  const rows = entries.filter((entry) => entry.operation === RESUME_ACTOR_AUDIT_OPERATION)
+  return rows.length > 0 && rows.every((entry) =>
+    entry.result === 'pl'
+    && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
+    && auditDetailHasToken(entry.detail, 'resume_actor=pl')
+    && auditDetailHasToken(entry.detail, 'authorization_evidence=in_process_pl')
+    && auditDetailHasToken(entry.detail, TECHNICAL_RESUME_AUDIT_TOKEN),
+  )
+}
+
+/**
  * Return the successful implementation whose failed review is eligible for Rule 5.5.
  * Missing or ambiguous facts fail closed. In particular, stored review decisions, credential-like
  * refusals, non-initial lineage, live successors, and non-blocked Tasks are not eligible.
@@ -101,11 +120,7 @@ function technicalResumeWindow(storage: IStorage, taskId: string): AuditLogEntry
 
 export function countPlTechnicalResumes(storage: IStorage, taskId: string): number {
   return technicalResumeWindow(storage, taskId).filter((entry) =>
-    entry.operation === RESUME_ACTOR_AUDIT_OPERATION
-    && entry.result === 'pl'
-    && auditDetailHasToken(entry.detail, `task_id=${taskId}`)
-    && auditDetailHasToken(entry.detail, 'authorization_evidence=in_process_pl')
-    && auditDetailHasToken(entry.detail, TECHNICAL_RESUME_AUDIT_TOKEN),
+    isVerifiedPlTechnicalResumeAudit([entry], taskId),
   ).length
 }
 

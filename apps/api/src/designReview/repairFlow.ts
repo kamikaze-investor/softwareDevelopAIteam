@@ -50,6 +50,7 @@ import {
 } from './repairPolicy'
 import { epochCoveredImplementationJobIds } from './repairRecoveryEpoch'
 import { readResumeActorClasses, recordRepairGeneration } from './resumeActor'
+import { isVerifiedPlTechnicalResumeAudit } from '../pl/technicalResumePolicy'
 
 /**
  * Stage 2起動の**同期フェーズ**の結果。
@@ -543,7 +544,56 @@ function technicalRecoveryResumesOf(storage: IStorage, resumeHops: readonly Job[
   const actors = readResumeActorClasses(storage, resumeHops)
   return resumeHops.filter((job) => {
     const actor = actors.get(job.id)
-    return actor === 'human' || actor === 'pl'
+    if (actor === 'human') return true
+    if (actor !== 'pl') return false
+    try {
+      return isVerifiedPlTechnicalResumeAudit(
+        storage.auditLog.findByEntity('job', job.id),
+        job.taskId,
+      )
+    } catch {
+      return false
+    }
+  })
+}
+
+/**
+ * Whether every hop that reached a refused review carries recovery authority.
+ * A single AI, unknown, or routine PL resume makes the lineage ineligible.
+ */
+function isAuthorizedTechnicalRecoveryLineage(
+  storage: IStorage,
+  resumeHops: readonly Job[],
+): boolean {
+  return resumeHops.length > 0
+    && technicalRecoveryResumesOf(storage, resumeHops).length === resumeHops.length
+}
+
+/**
+ * Prove from stored facts that an origin-root generation began as an eligible
+ * secret-scan refusal recovery for this exact root implementation and Task.
+ */
+function originGenerationStartedByEligibleRefusalRecovery(
+  storage: IStorage,
+  task: Task,
+  rootImplementationJobId: string,
+  taskJobs: readonly Job[],
+): boolean {
+  return taskJobs.some((reviewJob) => {
+    const refusal = reviewJob.failureMetadata?.refusal
+    if (
+      reviewJob.status !== 'failed'
+      || refusal?.kind !== 'secret_scan'
+      || refusal.repairEligible !== true
+      || refusal.patternKinds.length === 0
+    ) return false
+
+    const reviewed = resolveReviewedImplementation(storage, reviewJob.id)
+    return reviewed.ok
+      && reviewed.reviewJob.taskId === task.id
+      && reviewed.implementJob.taskId === task.id
+      && reviewed.implementJob.id === rootImplementationJobId
+      && isAuthorizedTechnicalRecoveryLineage(storage, reviewed.resumeHops)
   })
 }
 
@@ -688,7 +738,7 @@ function repairableBlockedReviewRequest(
     reviewRefusal !== undefined
     && stepKey === `task:${task.id}:initial-implement`
     && latestImplementJob?.id === implementJob.id
-    && technicalRecoveryResumesOf(storage, reviewResumeHops).length > 0
+    && isAuthorizedTechnicalRecoveryLineage(storage, reviewResumeHops)
   if (!isResumeSuccessor && !isRepairSuccessor && !isCanonicalInitialImplement) {
     return {
       ok: false,
@@ -719,10 +769,19 @@ function repairableBlockedReviewRequest(
   //    状態なので、それは閉じ込めの解除ではなく **安全境界の後退**である
   //    （独立レビュー指摘・2026-09-23 に in-memory で再現）。
   //
-  //    判定は既存 walker の `rootKind` をそのまま使う。新しい authority flag も parser も
-  //    table も status も作らない。通すのは `human_resume` / `human_recovery` generation の
-  //    descendant だけである。**resume successor 側の条件はここで変えない。**
-  if (isRepairSuccessor && lineage.rootKind === 'origin') {
+  //    判定は既存 walker の `rootKind` と root id をそのまま使う。新しい authority flag も
+  //    parser も table も status も作らない。origin 根の唯一の例外は、その exact root に対する
+  //    eligible secret-scan refusal と、そこへ至る Human / PL Technical Resume が保存済み事実で
+  //    証明できる場合である。generation 自体は origin のままなので budget は reset されない。
+  const eligibleRefusalRecoveryOrigin = isRepairSuccessor
+    && lineage.rootKind === 'origin'
+    && originGenerationStartedByEligibleRefusalRecovery(
+      storage,
+      task,
+      lineage.rootJobId,
+      taskJobs,
+    )
+  if (isRepairSuccessor && lineage.rootKind === 'origin' && !eligibleRefusalRecoveryOrigin) {
     return { ok: false, reason: 'repair successor is not inside a human-authorized generation' }
   }
 
