@@ -22,6 +22,7 @@ import {
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import type { JobRefusalMetadata, ReviewStatus } from '@ai-team/shared'
+import { retryStepKeyFor } from '../designReview/repairPolicy'
 
 /**
  * ここで固定しているのは次の2つである。
@@ -823,38 +824,76 @@ describe('runPlTick — 同じ blocker を延々と retry しない', () => {
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.status === 'queued')).toBe(false)
   })
 
-  it('15. 既に自動 retry が走っている対象は「待つ」になり、再評価条件が明示される', async () => {
-    const { storage, taskId, projectId } = seed()
-    const failedId = providerTimeoutJob(storage, taskId, projectId, 'unchanged')
-    // API の既存経路が作る1回限りの retry Job（`persistProviderTimeoutFailure()` と同じ形）
-    storage.jobs.create({
-      taskId,
-      projectId,
-      agentRole: 'developer_ai',
-      status: 'queued',
-      workflowStepKey: `retry:${failedId}:1`,
-      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
-      dryRun: false,
-    } as Parameters<IStorage['jobs']['create']>[0])
+  it.each(['queued', 'running', 'blocked'] as const)(
+    '15. 既に自動 retry が %s の対象は「待つ」になり、再評価条件が明示される',
+    async (retryStatus) => {
+      const { storage, taskId, projectId } = seed()
+      const failedId = providerTimeoutJob(storage, taskId, projectId, 'unchanged')
+      // API の既存経路が作る1回限りの retry Job（`persistProviderTimeoutFailure()` と同じ形）
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: retryStatus,
+        workflowStepKey: retryStepKeyFor(failedId),
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
 
-    // queued Job があるので `job_failed` は立たない。分類関数そのものを直接確かめる。
-    const diagnosis = triageBlocked(storage, {
-      kind: 'job_failed',
-      projectId,
-      projectName: 'AIteamOS',
-      taskId,
-      jobId: failedId,
-      detail: 'provider timeout',
-    })
+      // queued Job があるので `job_failed` は立たない。分類関数そのものを直接確かめる。
+      const diagnosis = triageBlocked(storage, {
+        kind: 'job_failed',
+        projectId,
+        projectName: 'AIteamOS',
+        taskId,
+        jobId: failedId,
+        detail: 'provider timeout',
+      })
 
-    expect(diagnosis.recommendedLane).toBe('auto_recovery')
-    // **「様子を見る」で終わらせない。** 何を・いつ・どこまで待ち、次にどこへ行くかが埋まる
-    expect(diagnosis.observation).toBeDefined()
-    expect(diagnosis.observation?.watch).toContain(failedId)
-    expect(diagnosis.observation?.reevaluateOn).toBe('pl_tick')
-    expect(diagnosis.observation?.thresholdMs).toBeGreaterThan(0)
-    expect(diagnosis.observation?.nextLane).toBe('ceo_escalation')
-  })
+      expect(diagnosis.recommendedLane).toBe('auto_recovery')
+      // **「様子を見る」で終わらせない。** 何を・いつ・どこまで待ち、次にどこへ行くかが埋まる
+      expect(diagnosis.observation).toBeDefined()
+      expect(diagnosis.observation?.watch).toContain(failedId)
+      expect(diagnosis.observation?.reevaluateOn).toBe('pl_tick')
+      expect(diagnosis.observation?.thresholdMs).toBeGreaterThan(0)
+      expect(diagnosis.observation?.nextLane).toBe('ceo_escalation')
+      expect(diagnosis.evidence.some((entry) => entry.value.includes(`status=${retryStatus}`))).toBe(true)
+    },
+  )
+
+  it.each(['success', 'failed'] as const)(
+    '終了済み自動 retry（%s）は待機扱いにせず CEO escalation へ送る',
+    (retryStatus) => {
+      const { storage, taskId, projectId } = seed()
+      const failedId = providerTimeoutJob(storage, taskId, projectId, 'unchanged')
+      const retry = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: retryStatus,
+        workflowStepKey: retryStepKeyFor(failedId),
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      const diagnosis = triageBlocked(storage, {
+        kind: 'job_failed',
+        projectId,
+        projectName: 'AIteamOS',
+        taskId,
+        jobId: failedId,
+        detail: 'provider timeout',
+      })
+
+      expect(diagnosis.rootCauseClass).toBe('provider_transient')
+      expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+      expect(diagnosis.recoverable).toBe(false)
+      expect(diagnosis.existingRecoveryAvailable).toBe(false)
+      expect(diagnosis.observation).toBeUndefined()
+      expect(diagnosis.evidence).toContainEqual({ fact: 'jobs.status', id: retry.id, value: retryStatus })
+      expect(diagnosis.summary).toContain(`status=${retryStatus}`)
+    },
+  )
 })
 
 // ────────────────────────────────────────────────────────────

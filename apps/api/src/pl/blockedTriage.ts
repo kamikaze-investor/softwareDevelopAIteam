@@ -68,6 +68,8 @@ import {
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { retryStepKeyFor } from '../designReview/repairPolicy'
+import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
 
 // ────────────────────────────────────────────────────────────
 // 語彙
@@ -422,14 +424,15 @@ function base(item: AttentionItem): BlockedDiagnosis {
 }
 
 /**
- * 既存の provider timeout 自動 retry が**既に作られているか**。
+ * 既存の provider timeout 自動 retry Job。
  *
  * API は条件を満たす implement Job の timeout に対して `retry:<jobId>:1` を1回だけ作る
  * （`persistProviderTimeoutFailure()`）。それが既にある状態で PL がさらに retry を提案すると、
- * 同じ失敗を二重に押し進めることになる。ここが `true` なら「待つ」が正しい。
+ * 同じ失敗を二重に押し進めないため、状態まで含めて呼び出し側で判断する。
  */
-function hasAutomaticRetryJob(facts: Facts, jobId: string): boolean {
-  return facts.taskJobs.some((job) => job.workflowStepKey === `retry:${jobId}:1`)
+function findAutomaticRetryJob(facts: Facts, jobId: string): Job | undefined {
+  const stepKey = retryStepKeyFor(jobId)
+  return facts.taskJobs.find((job) => job.workflowStepKey === stepKey)
 }
 
 /** この Task に、いま動かせる Job があるか（あれば resume は要らないし通らない）。 */
@@ -791,27 +794,53 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       }
     }
 
-    // 既存の1回限り自動 retry が既に作られているなら、**待つ**のが正しい。
-    if (hasAutomaticRetryJob(facts, facts.job.id)) {
+    const automaticRetry = findAutomaticRetryJob(facts, facts.job.id)
+    // queued / running / blocked の retry があるなら、**待つ**のが正しい。
+    if (
+      automaticRetry !== undefined
+      && (automaticRetry.status === 'blocked' || !isTerminalJobStatus(automaticRetry.status))
+    ) {
       return {
         ...result,
         rootCauseClass: 'provider_transient',
         blockingLayer: 'provider',
         evidence: [
           ...providerEvidence,
-          { fact: 'jobs.workflowStepKey', value: `retry:${facts.job.id}:1 exists` },
+          {
+            fact: 'jobs.workflowStepKey',
+            id: automaticRetry.id,
+            value: `${retryStepKeyFor(facts.job.id)} status=${automaticRetry.status}`,
+          },
         ],
         recoverable: true,
         existingRecoveryAvailable: true,
         confidence: 'high',
         recommendedLane: 'auto_recovery',
         observation: {
-          watch: `job:${facts.job.id} -> retry:${facts.job.id}:1`,
+          watch: `job:${facts.job.id} -> ${retryStepKeyFor(facts.job.id)}`,
           reevaluateOn: 'pl_tick',
           thresholdMs: DEFAULT_STALL_HINT_MS,
           nextLane: 'ceo_escalation',
         },
         summary: '既存の1回限り自動 retry が既に作られている。二重に押し進めず、その結果を待つ。',
+      }
+    }
+
+    if (automaticRetry !== undefined && isTerminalJobStatus(automaticRetry.status)) {
+      return {
+        ...result,
+        rootCauseClass: 'provider_transient',
+        blockingLayer: 'provider',
+        evidence: [
+          ...providerEvidence,
+          { fact: 'jobs.status', id: automaticRetry.id, value: automaticRetry.status },
+        ],
+        recoverable: false,
+        existingRecoveryAvailable: false,
+        confidence: 'high',
+        recommendedLane: 'ceo_escalation',
+        summary: `自動 retry は既に終了している（status=${automaticRetry.status}）。`
+          + '待機中の処理はなく、元 Job を再 retry すると同じ処理を二重に進めるため、自動復旧は行わない。',
       }
     }
 
