@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { buildLogPreviews, PREVIEW_LENGTH } from './jobLogger.js'
 import {
   buildImplementJobReport,
   classifyPromptRefusal,
@@ -147,6 +148,122 @@ describe('review refusal repair eligibility', () => {
 
     expect(result.repairEligible).toBe(true)
     expect(result.repairEligibilityReason).toBe('implementation_report_generic_assignment')
+  })
+
+  it('admits a production-shaped match in a truncated AI CLI preview without a SafeCommand header', () => {
+    const diffText = newFileDiff('enabled=true')
+    const aiCliHeader = '=== AI CLI (codex/implement) ==='
+    const secretOffset = 3_172
+    const padding = 'x'.repeat(secretOffset - aiCliHeader.length - 2)
+    const fullStdout = [
+      aiCliHeader,
+      padding,
+      'secret: string',
+      'x'.repeat(PREVIEW_LENGTH),
+      '=== SafeCommand (test) ===',
+      'tests passed',
+    ].join('\n')
+    const stdoutPreview = buildLogPreviews(fullStdout, '').stdoutPreview
+    const job = implementJob('safe summary')
+    job.stdout = stdoutPreview
+
+    expect(stdoutPreview.indexOf('secret: string')).toBe(secretOffset)
+    expect(stdoutPreview).toHaveLength(4_023)
+    expect(stdoutPreview).not.toContain('=== SafeCommand (test) ===')
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPromptWithReport(diffText, job),
+      implementationDiff: diffText,
+      ...reportOwnership(job),
+    })
+
+    expect(result).toEqual({
+      kind: 'secret_scan',
+      patternKinds: ['secret assignment'],
+      repairEligible: true,
+      repairEligibilityReason: 'implementation_report_generic_assignment',
+    })
+  })
+
+  it('rejects a credential-like assignment whose value straddles the preview cut', () => {
+    const diffText = newFileDiff('enabled=true')
+    const aiCliHeader = '=== AI CLI (codex/implement) ==='
+    const visibleAssignment = 'secret: AB'
+    const padding = 'x'.repeat(
+      PREVIEW_LENGTH - aiCliHeader.length - 1 - visibleAssignment.length,
+    )
+    const fullStdout = `${aiCliHeader}\n${padding}${visibleAssignment}CDEFGHIJKLMNOPQRSTUVWXYZ0123456789`
+    const job = implementJob('safe summary')
+    job.stdout = buildLogPreviews(fullStdout, '').stdoutPreview
+
+    expect(job.stdout.slice(0, PREVIEW_LENGTH)).toContain(visibleAssignment)
+    expect(job.stdout.slice(0, PREVIEW_LENGTH)).not.toContain(`${visibleAssignment}C`)
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPromptWithReport(diffText, job),
+      implementationDiff: diffText,
+      ...reportOwnership(job),
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
+  })
+
+  it('rejects an assignment whose decoded match ends exactly at the preview cut', () => {
+    const diffText = newFileDiff('enabled=true')
+    const aiCliHeader = '=== AI CLI (codex/implement) ==='
+    const assignment = 'secret: string'
+    const padding = 'x'.repeat(PREVIEW_LENGTH - aiCliHeader.length - 1 - assignment.length)
+    const fullStdout = `${aiCliHeader}\n${padding}${assignment}\ncontinued`
+    const job = implementJob('safe summary')
+    job.stdout = buildLogPreviews(fullStdout, '').stdoutPreview
+
+    expect(job.stdout.slice(0, PREVIEW_LENGTH).endsWith(assignment)).toBe(true)
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPromptWithReport(diffText, job),
+      implementationDiff: diffText,
+      ...reportOwnership(job),
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
+  })
+
+  it('rejects a non-truncated AI CLI preview without a SafeCommand header', () => {
+    const diffText = newFileDiff('enabled=true')
+    const job = implementJob('safe summary')
+    job.stdout = '=== AI CLI (codex/implement) ===\nsecret: string'
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPromptWithReport(diffText, job),
+      implementationDiff: diffText,
+      ...reportOwnership(job),
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
+  })
+
+  it('rejects a truncated preview without an AI CLI header', () => {
+    const diffText = newFileDiff('enabled=true')
+    const fullStdout = `secret: string\n${'x'.repeat(PREVIEW_LENGTH)}`
+    const job = implementJob('safe summary')
+    job.stdout = buildLogPreviews(fullStdout, '').stdoutPreview
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPromptWithReport(diffText, job),
+      implementationDiff: diffText,
+      ...reportOwnership(job),
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
   })
 
   it('rejects report ownership when the review lineage points to a different implement Job', () => {

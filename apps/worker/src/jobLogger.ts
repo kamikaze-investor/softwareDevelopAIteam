@@ -70,6 +70,12 @@ export function buildLogPreviews(
   }
 }
 
+/** True only for the exact prefix-plus-notice shape emitted by buildPreview(). */
+export function isTruncatedLogPreview(preview: string): boolean {
+  return preview.length === PREVIEW_LENGTH + PREVIEW_TRUNCATION_NOTICE.length
+    && preview.endsWith(PREVIEW_TRUNCATION_NOTICE)
+}
+
 /**
  * SafeCommand 出力セクションの見出し。combinedStdout を組み立てる側（jobRunner）と、
  * 後から検証証跡を取り出す側（`readSafeCommandEvidence`）が**同じ1か所**を使う。
