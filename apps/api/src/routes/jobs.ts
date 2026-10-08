@@ -22,7 +22,12 @@ import {
   prepareRepairFlow,
   resolveReviewedImplementation,
 } from '../designReview/repairFlow'
-import { REPAIR_STEP_PREFIX } from '../designReview/repairPolicy'
+import {
+  parseRetrySource,
+  REPAIR_STEP_PREFIX,
+  RESUME_STEP_PREFIX,
+  RETRY_STEP_PREFIX,
+} from '../designReview/repairPolicy'
 import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
 import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
 
@@ -413,6 +418,41 @@ function kickQueuedDesignReview(
   void executeQueuedRepair(storage, run, stepKey)
     .catch((err) => log.error({ err, runId: run.id }, 'stage 2 repair execution failed'))
 }
+
+/**
+ * 成功した implement Job が post-implement review を必要とする workflow step か。
+ * **この問いはここだけで答える。**
+ *
+ * - initial implement / repair（`repair:<source>:1`）/ resume（`resume:<source>:1`。
+ *   `resumeBlockedTask()` が付ける）はいずれも workflow 上の実装 step であり、成功したら
+ *   review → git_commit → Task done → continuation へ戻る。これが無いと成功しても先へ進めない。
+ * - retry（`retry:<source>:1`）は provider timeout 後の**同一入力の再実行**であって、独立した
+ *   step ではない。よって答えは **source Job の答えをそのまま引き継ぐ**（key の形からは決めない）。
+ *   manual Job の retry は manual のまま review しない。source が辿れない・別 Task・retry の retry
+ *   （producer は作らない）は step とみなさない（fail-closed。呼び出し側が warn を残す）。
+ * - それ以外の key（未知の形を含む）は implement step とみなさない。
+ */
+function isPostImplementReviewStep(storage: ReturnType<typeof getStorage>, job: Job): boolean {
+  const isBaseImplementStep = (candidate: Job): boolean =>
+    candidate.aiCliMode === 'implement' && (
+      candidate.workflowStepKey === `task:${candidate.taskId}:initial-implement`
+      || candidate.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true
+      || candidate.workflowStepKey?.startsWith(RESUME_STEP_PREFIX) === true
+    )
+
+  const stepKey = job.workflowStepKey
+  const retrySourceId = stepKey === undefined ? undefined : parseRetrySource(stepKey)
+  if (retrySourceId === undefined) return isBaseImplementStep(job)
+
+  const source = storage.jobs.findById(retrySourceId)
+  return job.aiCliMode === 'implement'
+    && source !== undefined
+    && source.taskId === job.taskId
+    && source.projectId === job.projectId
+    && source.workflowStepKey?.startsWith(RETRY_STEP_PREFIX) !== true
+    && isBaseImplementStep(source)
+}
+
 export async function jobRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
 
@@ -996,33 +1036,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(failed)
     }
 
-    const isInitialImplementWorkflowJob =
-      existing.workflowStepKey === `task:${existing.taskId}:initial-implement` &&
-      existing.aiCliMode === 'implement'
-    // repair Job（workflowStepKey: `repair:<sourceJobId>:1`、既存 REPAIR_STEP_PREFIX を再利用）も
-    // implement Jobの一種であり、initial-implement Jobと同じ「成功したらreviewが必要」という
-    // 責務を持つ。repair success後にreviewが生成されず停止していたのを、既存のreview生成経路を
-    // そのまま再利用して解消する（新しいworkflow/Queue/state管理は追加しない）。
-    const isRepairImplementJob =
-      existing.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true &&
-      existing.aiCliMode === 'implement'
-    // resumeBlockedTask()（POST /api/tasks/:id/resume）が作るAI-CLI Jobも同様。
-    // workflowStepKey: `resume:<元Job>:1`（storage/sqlite.ts のresumeBlockedTask参照。
-    // 文字列はそちらと一致させること）。これが無いと、Design Review escalationからMobileの
-    // 追加指示で正常に再開できたJobが成功しても、その先のreview→git_commit→Task done→
-    // continuationへ自動的に戻れず、CEOが独立レビューを毎回手動で起票する必要があった。
-    const isResumeImplementJob =
-      existing.workflowStepKey?.startsWith('resume:') === true &&
-      existing.aiCliMode === 'implement'
-    const requiresPostImplementReview = isInitialImplementWorkflowJob || isRepairImplementJob || isResumeImplementJob
-    const shouldCreateReview =
-      requiresPostImplementReview &&
+    const requiresPostImplementReview = isPostImplementReviewStep(storage, existing)
+    const hasSuccessfulChangedImplementResult =
+      existing.aiCliMode === 'implement' &&
+      existing.workflowStepKey !== undefined &&
       existing.safeCommand.kind === 'test' &&
       jobUpdate.status === 'success' &&
       jobUpdate.exitCode === 0 &&
       (jobUpdate.changedFiles?.length ?? 0) > 0 &&
       jobUpdate.guardResult?.permissionAllowed === true &&
       jobUpdate.guardResult.fileChangeAllowed === true
+    const shouldCreateReview = requiresPostImplementReview && hasSuccessfulChangedImplementResult
+
+    if (hasSuccessfulChangedImplementResult && !requiresPostImplementReview) {
+      req.log.warn(
+        { jobId: existing.id, workflowStepKey: existing.workflowStepKey },
+        'Workflow implement Job succeeded with changes but no post-implement review was created',
+      )
+    }
 
     if (shouldCreateReview) {
       const transition = storage.jobs.updateAndCreateNextWorkflowJob({

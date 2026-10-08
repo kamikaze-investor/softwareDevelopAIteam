@@ -216,6 +216,45 @@ function providerTimeoutFailure(
   }
 }
 
+async function createProducedTimeoutRetry(
+  app: FastifyInstance,
+  task: Task,
+  prompt: string,
+  workflowStepKey?: string,
+): Promise<{ source: Job; retry: Job }> {
+  await createDesignReviewEvidence(app, task, prompt)
+  const { getStorage } = await import('../storage/index.js')
+  const source = getStorage().jobs.create({
+    taskId: task.id,
+    projectId: task.projectId,
+    ...(workflowStepKey === undefined ? {} : { workflowStepKey }),
+    agentRole: 'developer_ai',
+    status: 'running',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliPrompt: prompt,
+    aiCliMode: 'implement',
+  })
+
+  const timeout = await app.inject({
+    method: 'PATCH',
+    url: `/api/jobs/${source.id}`,
+    payload: providerTimeoutFailure(),
+  })
+  expect(timeout.statusCode).toBe(200)
+
+  const retry = getStorage().jobs.findByTaskId(task.id).find((job) => job.id !== source.id)
+  if (!retry) throw new Error('Provider timeout retry Job was not created')
+  return { source, retry }
+}
+
+const successfulChangedImplementResult = {
+  status: 'success' as const,
+  exitCode: 0,
+  changedFiles: ['src/retry-result.ts'],
+  guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+}
+
 async function createApprovalRequestWithStatus(
   task: Task,
   status: 'WAITING_FOR_USER' | 'REJECTED',
@@ -1860,6 +1899,136 @@ describe('Job API', () => {
         aiCliPrompt: source.aiCliPrompt,
         aiCliMode: source.aiCliMode,
       })
+    })
+  })
+
+  it('creates a review after a produced retry of initial implement succeeds with changes', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(
+        app,
+        task,
+        'Retry the initial implementation.',
+        `task:${task.id}:initial-implement`,
+      )
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      const jobs = getStorage().jobs.findByTaskId(task.id)
+      expect(getStorage().jobs.findById(retry.id)?.status).toBe('success')
+      expect(jobs.find((job) => job.workflowStepKey === `implement:${retry.id}:review`)).toMatchObject({
+        aiCliMode: 'review',
+        status: 'queued',
+      })
+      expect(jobs.some((job) => job.status === 'queued')).toBe(true)
+    })
+  })
+
+  it.each([
+    ['repair', 'repair:review-source:1'],
+    ['resume', 'resume:review-source:1'],
+  ])('creates a review after a produced retry of %s implement succeeds with changes', async (_kind, stepKey) => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(
+        app,
+        task,
+        `Retry the ${_kind} implementation.`,
+        stepKey,
+      )
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      const jobs = getStorage().jobs.findByTaskId(task.id)
+      expect(getStorage().jobs.findById(retry.id)?.status).toBe('success')
+      expect(jobs.find((job) => job.workflowStepKey === `implement:${retry.id}:review`)).toMatchObject({
+        aiCliMode: 'review',
+        status: 'queued',
+      })
+    })
+  })
+
+  it('does not create a review when a produced workflow retry succeeds without changed files', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(
+        app,
+        task,
+        'Retry without changes.',
+        `task:${task.id}:initial-implement`,
+      )
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: { ...successfulChangedImplementResult, changedFiles: [] },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id).filter((job) => job.aiCliMode === 'review')).toHaveLength(0)
+    })
+  })
+
+  it('does not create a review when a produced retry of a manual implement succeeds with changes', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(app, task, 'Retry a manual implementation.')
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id).filter((job) => job.aiCliMode === 'review')).toHaveLength(0)
+    })
+  })
+
+  it('fails closed without throwing when a retry source does not exist', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { getStorage } = await import('../storage/index.js')
+      const retry = getStorage().jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        workflowStepKey: 'retry:nonexistent:1',
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        aiCliProvider: 'codex',
+        aiCliPrompt: 'Do not resolve this retry source.',
+        aiCliMode: 'implement',
+      })
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(getStorage().jobs.findById(retry.id)?.status).toBe('success')
+      expect(getStorage().jobs.findByTaskId(task.id).filter((job) => job.aiCliMode === 'review')).toHaveLength(0)
     })
   })
 

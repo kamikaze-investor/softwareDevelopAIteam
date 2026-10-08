@@ -31,6 +31,9 @@ export const MAX_REPAIR_ATTEMPTS = 3
  */
 export const REPAIR_STEP_PREFIX = 'repair:'
 
+/** provider timeout の同一入力 retry Job を示す `workflowStepKey` の接頭辞。 */
+export const RETRY_STEP_PREFIX = 'retry:'
+
 /**
  * resume Job であることを示す `workflowStepKey` の接頭辞。
  * 実際のkeyは `resume:<sourceJobId>:<n>`（`resumeBlockedTask()` だけが付ける規約）。
@@ -202,6 +205,21 @@ export function repairStepKeyFor(sourceJobId: string): string {
  */
 export function parseRepairSource(stepKey: string): string | undefined {
   const match = /^repair:(.+):1$/.exec(stepKey)
+  const source = match?.[1]
+  return source !== undefined && source.length > 0 ? source : undefined
+}
+
+/** `retry:<sourceJobId>:1` を組み立てる。 */
+export function retryStepKeyFor(sourceJobId: string): string {
+  return `${RETRY_STEP_PREFIX}${sourceJobId}:1`
+}
+
+/**
+ * `retry:<sourceJobId>:1` から source Job id を取り出す。
+ * 形が違えば `undefined`。**呼び出し側は必ず fail-closed 側へ倒すこと。**
+ */
+export function parseRetrySource(stepKey: string): string | undefined {
+  const match = /^retry:(.+):1$/.exec(stepKey)
   const source = match?.[1]
   return source !== undefined && source.length > 0 ? source : undefined
 }
@@ -449,10 +467,11 @@ export function walkRepairGeneration(
         }
   }
 
-  /** `repair:` / `resume:` いずれの規約でも親を返す。それ以外は端なので undefined。 */
+  /** `repair:` / `retry:` / `resume:` いずれの規約でも親を返す。それ以外は端なので undefined。 */
   const lineageParentOf = (stepKey: string | undefined): string | undefined => {
     if (stepKey === undefined) return undefined
     if (stepKey.startsWith(REPAIR_STEP_PREFIX)) return parseRepairSource(stepKey)
+    if (stepKey.startsWith(RETRY_STEP_PREFIX)) return parseRetrySource(stepKey)
     if (stepKey.startsWith(RESUME_STEP_PREFIX)) return parseResumeSource(stepKey)
     return undefined
   }
@@ -520,6 +539,16 @@ export function walkRepairGeneration(
       continue
     }
 
+    if (stepKey.startsWith(RETRY_STEP_PREFIX)) {
+      const parent = parseRetrySource(stepKey)
+      if (parent === undefined) {
+        return { ok: false, reason: `malformed retry step key on job ${cursor}` }
+      }
+      // retry は同じ入力の再実行なので repair 段数を増やさず、source へ透過する。
+      cursor = parent
+      continue
+    }
+
     if (stepKey.startsWith(RESUME_STEP_PREFIX)) {
       const parent = parseResumeSource(stepKey)
       if (parent === undefined) {
@@ -536,7 +565,7 @@ export function walkRepairGeneration(
       continue
     }
 
-    // repair でも resume でもない Job（implement / retry 等）が lineage の端。
+    // repair / retry / resume のいずれでもない Job（initial implement 等）が lineage の端。
     return finish(cursor)
   }
 
