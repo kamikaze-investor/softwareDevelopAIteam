@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Job, JobRefusalMetadata, ReviewResult } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { createSQLiteStorage } from '../storage/sqlite'
@@ -12,6 +12,11 @@ const ELIGIBLE_REFUSAL: JobRefusalMetadata = {
   repairEligible: true,
   repairEligibilityReason: 'implementation_report_generic_assignment',
 }
+const ALIGNED_STDOUT = JSON.stringify({
+  focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+  integrationReviewResult: { decision: 'ALIGNED' },
+  finalDecision: 'ALIGNED',
+})
 
 type Ids = { taskId: string, projectId: string }
 type ResumeAuthority = 'human' | 'pl_technical' | 'pl_plain' | 'ai' | 'unknown'
@@ -137,6 +142,38 @@ function changesRequested(
   return { reviewJob: review, review: result }
 }
 
+function advanceTime(): void {
+  vi.advanceTimersByTime(1_000)
+}
+
+function createAdmissionRun(storage: IStorage, ids: Ids, root: Job): void {
+  advanceTime()
+  const run = storage.designReviewRuns.create({
+    taskId: ids.taskId,
+    taskTitle: 'T',
+    designText: 'repair refusal',
+    designTextHash: 'refusal-repair-hash',
+    changedFiles: [CHANGED_FILE],
+    repairSourceJobId: root.id,
+  })
+  advanceTime()
+  const claimed = storage.designReviewRuns.claim(run.id, 3)
+  expect(claimed.claimToken).toBeDefined()
+  advanceTime()
+  expect(storage.designReviewRuns.complete(
+    run.id,
+    claimed.claimToken!,
+    'succeeded',
+    ALIGNED_STDOUT,
+  )).toBe(true)
+}
+
+function firstRepairFromRefusalAdmission(storage: IStorage, ids: Ids, root: Job): Job {
+  createAdmissionRun(storage, ids, root)
+  advanceTime()
+  return implementation(storage, ids, `repair:${root.id}:1`)
+}
+
 function rejectionReason(storage: IStorage, candidate: Job, review: ReviewResult): string {
   const preparation = prepareRepairFlow(storage, { failedJob: candidate, review })
   expect(preparation.action).toBe('skip')
@@ -144,13 +181,22 @@ function rejectionReason(storage: IStorage, candidate: Job, review: ReviewResult
 }
 
 describe('eligible refusal recovery provenance for an origin-root repair generation', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-10-08T00:00:00.000Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it('multi-hop Human Resumes authorize the exact origin chain without resetting its budget', () => {
     const storage = createSQLiteStorage(':memory:')
     const ids = seed(storage)
     const root = implementation(storage, ids, `task:${ids.taskId}:initial-implement`)
     storedRefusalRecovery(storage, ids, root, 'human', ELIGIBLE_REFUSAL, 2)
 
-    let candidate = implementation(storage, ids, `repair:${root.id}:1`)
+    let candidate = firstRepairFromRefusalAdmission(storage, ids, root)
     for (let depth = 1; depth <= 2; depth += 1) {
       const { review } = changesRequested(storage, ids, candidate)
       const preparation = prepareRepairFlow(storage, { failedJob: candidate, review })
@@ -187,7 +233,7 @@ describe('eligible refusal recovery provenance for an origin-root repair generat
     const ids = seed(storage)
     const root = implementation(storage, ids, `task:${ids.taskId}:initial-implement`)
     storedRefusalRecovery(storage, ids, root, 'pl_technical')
-    const candidate = implementation(storage, ids, `repair:${root.id}:1`)
+    const candidate = firstRepairFromRefusalAdmission(storage, ids, root)
     const { review } = changesRequested(storage, ids, candidate)
 
     const preparation = prepareRepairFlow(storage, { failedJob: candidate, review })
@@ -209,6 +255,28 @@ describe('eligible refusal recovery provenance for an origin-root repair generat
     const root = implementation(storage, ids, `task:${ids.taskId}:initial-implement`)
     storedRefusalRecovery(storage, ids, root, authority)
     const candidate = implementation(storage, ids, `repair:${root.id}:1`)
+    const { review } = changesRequested(storage, ids, candidate)
+
+    expect(rejectionReason(storage, candidate, review))
+      .toContain('not inside a human-authorized generation')
+  })
+
+  it('a Human Resume followed by a plain PL resume on the same refused review chain is not admitted', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    const root = implementation(storage, ids, `task:${ids.taskId}:initial-implement`)
+    const originalReview = reviewJob(storage, ids, `implement:${root.id}:review`)
+    const humanResume = reviewJob(storage, ids, `resume:${originalReview.id}:1`)
+    recordAuthority(storage, humanResume, 'human')
+    const plainPlResume = reviewJob(storage, ids, `resume:${humanResume.id}:1`)
+    recordAuthority(storage, plainPlResume, 'pl_plain')
+    storage.jobs.update(plainPlResume.id, {
+      status: 'failed',
+      exitCode: 1,
+      stderr: 'Prompt refused by the pre-send secret scan',
+      failureMetadata: { refusal: ELIGIBLE_REFUSAL, workspaceState: 'unchanged' },
+    } as never)
+    const candidate = firstRepairFromRefusalAdmission(storage, ids, root)
     const { review } = changesRequested(storage, ids, candidate)
 
     expect(rejectionReason(storage, candidate, review))
@@ -261,6 +329,34 @@ describe('eligible refusal recovery provenance for an origin-root repair generat
     const unrelated = implementation(storage, ids, `task:${ids.taskId}:unrelated-implement`)
     storedRefusalRecovery(storage, ids, unrelated, 'human')
     const candidate = implementation(storage, ids, `repair:${root.id}:1`)
+    const { review } = changesRequested(storage, ids, candidate)
+
+    expect(rejectionReason(storage, candidate, review))
+      .toContain('not inside a human-authorized generation')
+  })
+
+  it('a later unrelated refusal cannot authorize a normal repair generation started while pending', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const ids = seed(storage)
+    storage.tasks.update(ids.taskId, { status: 'in_progress' })
+    const root = implementation(storage, ids, `task:${ids.taskId}:initial-implement`)
+    const normalReview = changesRequested(storage, ids, root)
+    createAdmissionRun(storage, ids, root)
+    advanceTime()
+    const candidate = implementation(storage, ids, `repair:${root.id}:1`)
+
+    storage.tasks.update(ids.taskId, { status: 'blocked' })
+    advanceTime()
+    // This separate review recovery concerns the same old root, but happened only after the
+    // ordinary generation had already started. It cannot retroactively authorize that generation.
+    const refusedResume = reviewJob(storage, ids, `resume:${normalReview.reviewJob.id}:1`)
+    recordAuthority(storage, refusedResume, 'human')
+    storage.jobs.update(refusedResume.id, {
+      status: 'failed',
+      exitCode: 1,
+      stderr: 'Prompt refused by the pre-send secret scan',
+      failureMetadata: { refusal: ELIGIBLE_REFUSAL, workspaceState: 'unchanged' },
+    } as never)
     const { review } = changesRequested(storage, ids, candidate)
 
     expect(rejectionReason(storage, candidate, review))

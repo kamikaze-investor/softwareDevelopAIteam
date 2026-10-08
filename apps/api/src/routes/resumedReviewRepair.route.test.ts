@@ -139,6 +139,26 @@ async function blockedAfterEligibleRefusalRepair() {
     },
   } as never)
 
+  await tick()
+  const designText = 'refusal repair admission'
+  const admissionRun = s.designReviewRuns.create({
+    taskId: task.id,
+    taskTitle: task.title,
+    designText,
+    designTextHash: createHash('sha256').update(designText).digest('hex'),
+    changedFiles: [DOC],
+    repairSourceJobId: root.id,
+  })
+  const claimed = s.designReviewRuns.claim(admissionRun.id, 3)
+  expect(claimed.claimToken).toBeDefined()
+  await tick()
+  expect(s.designReviewRuns.complete(admissionRun.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  }))).toBe(true)
+  await tick()
+
   const repair = s.jobs.create({
     ...base,
     agentRole: 'developer_ai',

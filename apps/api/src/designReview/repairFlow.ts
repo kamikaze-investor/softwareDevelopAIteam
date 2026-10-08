@@ -579,6 +579,13 @@ function originGenerationStartedByEligibleRefusalRecovery(
   rootImplementationJobId: string,
   taskJobs: readonly Job[],
 ): boolean {
+  const firstRepairJobs = taskJobs.filter(
+    (job) => job.workflowStepKey === `repair:${rootImplementationJobId}:1`,
+  )
+  if (firstRepairJobs.length !== 1) return false
+  const firstRepairCreatedAt = Date.parse(firstRepairJobs[0]!.createdAt)
+  if (!Number.isFinite(firstRepairCreatedAt)) return false
+
   return taskJobs.some((reviewJob) => {
     const refusal = reviewJob.failureMetadata?.refusal
     if (
@@ -589,11 +596,35 @@ function originGenerationStartedByEligibleRefusalRecovery(
     ) return false
 
     const reviewed = resolveReviewedImplementation(storage, reviewJob.id)
-    return reviewed.ok
-      && reviewed.reviewJob.taskId === task.id
-      && reviewed.implementJob.taskId === task.id
-      && reviewed.implementJob.id === rootImplementationJobId
-      && isAuthorizedTechnicalRecoveryLineage(storage, reviewed.resumeHops)
+    if (
+      !reviewed.ok
+      || reviewed.reviewJob.taskId !== task.id
+      || reviewed.implementJob.taskId !== task.id
+      || reviewed.implementJob.id !== rootImplementationJobId
+      || !isAuthorizedTechnicalRecoveryLineage(storage, reviewed.resumeHops)
+    ) return false
+
+    const refusalCreatedAt = Date.parse(reviewed.reviewJob.createdAt)
+    if (!Number.isFinite(refusalCreatedAt) || firstRepairCreatedAt <= refusalCreatedAt) return false
+
+    // A later refusal on the same root must not retroactively authorize an ordinary repair
+    // generation. The run that admitted the refusal must itself bind its successor intent to
+    // this root, and its durable timestamps must place it strictly between the refused review
+    // and the generation's first repair Job. Equal/invalid timestamps cannot prove ordering.
+    return storage.designReviewRuns.findByTaskId(task.id).some((run) => {
+      if (
+        run.repairSourceJobId !== rootImplementationJobId
+        || run.status !== 'succeeded'
+        || run.completedAt === undefined
+      ) return false
+      const runCreatedAt = Date.parse(run.createdAt)
+      const runCompletedAt = Date.parse(run.completedAt)
+      return Number.isFinite(runCreatedAt)
+        && Number.isFinite(runCompletedAt)
+        && runCreatedAt > refusalCreatedAt
+        && runCompletedAt > runCreatedAt
+        && firstRepairCreatedAt > runCompletedAt
+    })
   })
 }
 
