@@ -60,7 +60,6 @@ import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { protectedViolations, triageBlocked } from './blockedTriage'
 import { readAdoptionCandidates } from './adoptionStep'
-import { technicalRecoveryTargetKey } from './technicalResumePolicy'
 import {
   isEligibleTechnicalAbortDiagnosis,
   recordTechnicalAbortEvidence,
@@ -558,19 +557,31 @@ export function requestTechnicalAbort(
       reason: 'the current attention is not carried by the latest Task Job',
     }
   }
-  const existingEvidenceId = latestJob.failureMetadata?.abortTechnicalEvidenceId
-  if (latestJob.failureMetadata?.abortCleanupRequestedAt !== undefined && existingEvidenceId !== undefined) {
+  const existingMetadata = latestJob.failureMetadata
+  if (existingMetadata?.abortCleanupRequestedAt !== undefined) {
+    const currentFingerprint = technicalAbortStateFingerprint(task, taskJobs, current)
+    const requestStillCurrent = existingMetadata.abortTechnicalEvidenceId !== undefined
+      && existingMetadata.abortTechnicalStateFingerprint === currentFingerprint
+      && existingMetadata.abortTechnicalRootCauseClass === 'protected_path'
+      && existingMetadata.abortTechnicalAttentionKind === current.kind
+    if (requestStillCurrent) {
+      // Worker poll がまだ有効な request を回収していないだけ。再発行も quarantine もせず、
+      // 同じ request を残して handoff/escalation の retry を可能にする。
+      return { ok: true, status: 'cleanup_requested', taskId: task.id, jobIds: [latestJob.id] }
+    }
     recordTechnicalAbortRefusal(storage, {
       taskId: task.id,
-      evidenceId: existingEvidenceId,
-      code: 'CLEANUP_REQUEST_ALREADY_PRESENT',
+      ...(existingMetadata.abortTechnicalEvidenceId !== undefined
+        ? { evidenceId: existingMetadata.abortTechnicalEvidenceId }
+        : {}),
+      code: 'STALE_CLEANUP_REQUEST',
       stage: 'authorization',
     })
-    retireTechnicalAbortCleanup(storage, latestJob, 'CLEANUP_REQUEST_ALREADY_PRESENT')
+    retireTechnicalAbortCleanup(storage, latestJob, 'STALE_CLEANUP_REQUEST')
     return {
       ok: false,
       code: 'JOB_QUARANTINED',
-      reason: 'an existing Technical Abort cleanup request was retired and quarantined',
+      reason: 'the existing Technical Abort cleanup request no longer matches current state',
     }
   }
   if (!isWorkerServicedTechnicalAbortCarrier(task, latestJob)) {
@@ -598,9 +609,7 @@ export function requestTechnicalAbort(
       reason: `Task has an active ${activeApproval.status} approval`,
     }
   }
-  const targetKey = technicalRecoveryTargetKey(current)
-  const previouslyEscalated = storage.auditLog.findByEntity('pl_loop_target', targetKey)
-    .some((entry) => entry.operation === 'pl_loop' && entry.result === 'escalated')
+  const previouslyEscalated = hasTaskEscalation(storage, task.id, taskJobs)
   if (previouslyEscalated) {
     recordTechnicalAbortRefusal(storage, {
       taskId: task.id,
@@ -761,20 +770,35 @@ function technicalOwnershipFailure(
       reason: `another Task used ${workingDir} between this Task's clean baseline and cleanup carrier`,
     }
   }
-  if (latest.workspaceBaseline?.mode === 'dirty') {
-    const taskChangedPaths = new Set(
-      taskJobs.slice(0, cleanBaselineIndex + 1)
-        .flatMap((job) => job.changedFiles ?? [])
-        .map(normalizeProofPath),
-    )
-    const unexplainedPath = latest.workspaceBaseline.entries
-      .flatMap((entry) => [entry.path, ...(entry.oldPath === undefined ? [] : [entry.oldPath])])
-      .map(normalizeProofPath)
-      .find((entryPath) => !taskChangedPaths.has(entryPath))
-    if (unexplainedPath !== undefined) {
+  // findByTaskId は newest-first。clean baseline から carrier までを chronological に並べ、
+  // Job N の END と Job N+1 の START を一対ずつ照合する。carrier.changedFiles はもちろん、
+  // どの Job の cumulative changedFiles も ownership source にしない。
+  const lineage = [...taskJobs.slice(0, cleanBaselineIndex + 1)].reverse()
+  const legacyJob = lineage.find((job) => job.failureMetadata?.workspaceEndFingerprint === undefined)
+  if (legacyJob !== undefined) {
+    return {
+      code: 'END_FINGERPRINT_MISSING',
+      reason:
+        `Task Job ${legacyJob.id} has no persisted workspace end fingerprint (legacy row); `
+        + 'technical cleanup is refused and the existing handoff remains active',
+    }
+  }
+  for (let index = 0; index < lineage.length - 1; index += 1) {
+    const previous = lineage[index]
+    const next = lineage[index + 1]
+    if (
+      previous?.failureMetadata?.workspaceEndFingerprint === undefined
+      || next?.workspaceBaseline === undefined
+      || !workspaceContentFingerprintEquals(
+        previous.failureMetadata.workspaceEndFingerprint,
+        next.workspaceBaseline,
+      )
+    ) {
       return {
-        code: 'DIRTY_PATH_NOT_TASK_OWNED',
-        reason: 'dirty baseline contains a path absent from this Task lineage changedFiles',
+        code: 'JOB_CONTINUITY_BROKEN',
+        reason:
+          `workspace changed outside Task Jobs between ${previous?.id ?? 'unknown'} and ${next?.id ?? 'unknown'}; `
+          + 'technical cleanup is refused',
       }
     }
   }
@@ -835,4 +859,38 @@ function allJobs(storage: IStorage): Job[] {
 
 function normalizeProofPath(value: string): string {
   return value.replaceAll('\\', '/').replace(/^\.\//, '')
+}
+
+function workspaceContentFingerprintEquals(
+  left: JobWorkspaceBaseline,
+  right: JobWorkspaceBaseline,
+): boolean {
+  if (left.startCommitHash !== right.startCommitHash) return false
+  const contentEntries = (baseline: JobWorkspaceBaseline): string[] => (
+    baseline.mode === 'clean'
+      ? []
+      : baseline.entries.map((entry) => `${normalizeProofPath(entry.path)}\u0000${entry.worktreeHash}`).sort()
+  )
+  const leftEntries = contentEntries(left)
+  const rightEntries = contentEntries(right)
+  return leftEntries.length === rightEntries.length
+    && leftEntries.every((entry, index) => entry === rightEntries[index])
+}
+
+function hasTaskEscalation(storage: IStorage, taskId: string, taskJobs: readonly Job[]): boolean {
+  const subjects = new Set<string>([
+    taskId,
+    ...taskJobs.map((job) => job.id),
+    ...storage.approvalRequests.findByTaskId(taskId).map((approval) => approval.id),
+  ])
+  return storage.auditLog.findAll().some((entry) => {
+    if (
+      entry.entityType !== 'pl_loop_target'
+      || entry.operation !== 'pl_loop'
+      || entry.result !== 'escalated'
+    ) return false
+    const separator = entry.entityId.indexOf(':')
+    const subject = separator < 0 ? entry.entityId : entry.entityId.slice(separator + 1)
+    return subjects.has(subject) || subject.startsWith(`${taskId}:`)
+  })
 }

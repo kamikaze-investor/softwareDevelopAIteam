@@ -83,6 +83,12 @@ export interface JobFailureMetadata {
   /** quarantine が解除された理由（例: startup recovery で workspace が baseline と一致） */
   quarantineClearedReason?: string
   /**
+   * Job の子プロセスと後始末が終わった時点の workspace fingerprint。
+   * 内容そのものは保持せず、既存 baseline と同じ per-path hash 表現だけを使う。
+   * Technical Abort は consecutive Job の start/end が完全一致する場合だけ lineage を証明する。
+   */
+  workspaceEndFingerprint?: JobWorkspaceBaseline
+  /**
    * abort_task が「この Job の所有権を解放したい」と要求した時刻（ISO）。
    *
    * **サーバ側でしか付かない**（abort_task が有効な CEO Approval を確認したうえで、

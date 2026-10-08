@@ -862,12 +862,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     }
     if (
       preCleanupObservation === undefined
-      || carrier.workspaceBaseline === undefined
-      || !baselineEqualsObservation(carrier.workspaceBaseline, preCleanupObservation)
+      || metadata.workspaceEndFingerprint === undefined
+      || !baselineEqualsObservation(metadata.workspaceEndFingerprint, preCleanupObservation)
     ) {
       return {
         ok: false,
-        reason: 'pre-cleanup workspace does not exactly match the latest persisted baseline',
+        reason: 'pre-cleanup workspace does not exactly match the latest persisted end fingerprint',
       }
     }
     if (
@@ -3307,6 +3307,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               ok: false as const,
               code: 'VERIFICATION_FAILED' as const,
               reason: `task ${task.id} job ${missingBaselineJob.id} has no workspace baseline`,
+            }
+          }
+          if (input.authorization.kind === 'technical_evidence') {
+            const cleanBaselineIndex = taskJobs.findIndex(
+              (candidate) => candidate.workspaceBaseline?.mode === 'clean',
+            )
+            const missingEndFingerprintJob = taskJobs.slice(0, cleanBaselineIndex + 1).find(
+              (candidate) => candidate.failureMetadata?.workspaceEndFingerprint === undefined,
+            )
+            if (missingEndFingerprintJob) {
+              return {
+                ok: false as const,
+                code: 'VERIFICATION_FAILED' as const,
+                reason:
+                  `task ${task.id} job ${missingEndFingerprintJob.id} has no workspace end fingerprint; `
+                  + 'legacy lineage cannot be cleaned automatically',
+              }
             }
           }
           const startHeads = new Set(

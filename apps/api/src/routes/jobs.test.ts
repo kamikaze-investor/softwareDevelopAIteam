@@ -844,6 +844,31 @@ describe('Job API', () => {
     })
   })
 
+  it('PATCH /api/jobs/:id accepts and persists a value-free workspace END fingerprint', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      const workspaceEndFingerprint = {
+        mode: 'dirty' as const,
+        startCommitHash: '0805249b',
+        entries: [{
+          path: 'src/feature.ts', kind: 'modified' as const, worktreeHash: 'sha256:value-free',
+        }],
+      }
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: { failureMetadata: { workspaceEndFingerprint } },
+      })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<OutboxJobResponse>(res.body)
+      expect(body.failureMetadata?.workspaceEndFingerprint).toEqual(workspaceEndFingerprint)
+    })
+  })
+
   describe('PATCH /api/jobs/:id implement requeue Design Review evidence gate', () => {
     it('rejects requeue when no evidence exists', async () => {
       await withApp(async (app) => {

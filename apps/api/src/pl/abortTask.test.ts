@@ -90,11 +90,13 @@ function seedTechnicalAbort(options: { dependency?: boolean } = {}): Fixture & {
     taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
     safeCommand: { kind: 'test', workingDir: '/workspace/target' },
     workspaceBaseline: BASELINE,
+    failureMetadata: { workspaceEndFingerprint: BASELINE },
   } as Parameters<IStorage['jobs']['create']>[0])
   const latest = storage.jobs.create({
     taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
     safeCommand: { kind: 'test', workingDir: '/workspace/target' },
     workspaceBaseline: BASELINE,
+    failureMetadata: { workspaceEndFingerprint: BASELINE },
   } as Parameters<IStorage['jobs']['create']>[0])
   storage.jobs.update(latest.id, {
     guardResult: {
@@ -1113,6 +1115,12 @@ describe('P2-2 Automatic Technical Abort', () => {
     fx.storage.jobs.update(fx.latestJobId, {
       workspaceBaseline: dirty,
       changedFiles: ['apps/worker/src/index.ts'],
+      failureMetadata: { workspaceEndFingerprint: dirty },
+    })
+    const older = fx.storage.jobs.findByTaskId(fx.taskId)[1]
+    if (older === undefined) throw new Error('older job missing')
+    fx.storage.jobs.update(older.id, {
+      failureMetadata: { workspaceEndFingerprint: dirty },
     })
     requestTechnical(fx)
 
@@ -1218,6 +1226,29 @@ describe('P2-2 Automatic Technical Abort', () => {
       taskId: fx.taskId,
       attention,
       readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+  })
+
+  it.each([
+    ['an earlier Job target', (fx: ReturnType<typeof seedTechnicalAbort>): string => {
+      const earlier = fx.storage.jobs.findByTaskId(fx.taskId)[1]
+      if (earlier === undefined) throw new Error('earlier job missing')
+      return `job_blocked:${earlier.id}`
+    }],
+    ['task_blocked_without_job', (fx: ReturnType<typeof seedTechnicalAbort>): string => (
+      `task_blocked_without_job:${fx.taskId}:first`
+    )],
+  ])('refuses after a CEO escalation for %s of the same Task', (_label, targetKey) => {
+    const fx = seedTechnicalAbort()
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+    fx.storage.auditLog.record({
+      actor: 'api', operation: 'pl_loop', entityType: 'pl_loop_target',
+      entityId: targetKey(fx), result: 'escalated',
+    })
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId, attention, readLedger: () => TECHNICAL_LEDGER,
     })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
   })
 
@@ -1338,8 +1369,10 @@ describe('P2-2 Automatic Technical Abort', () => {
     }
   })
 
-  it('refuses a dirty baseline path not explained by this Task changedFiles', () => {
+  it('refuses a tracked-file content change between consecutive Task Jobs without touching the carrier', () => {
     const fx = seedTechnicalAbort()
+    const carrierBefore = fx.storage.jobs.findById(fx.latestJobId)
+    if (carrierBefore === undefined) throw new Error('carrier missing')
     fx.storage.jobs.update(fx.latestJobId, {
       workspaceBaseline: {
         mode: 'dirty',
@@ -1360,6 +1393,49 @@ describe('P2-2 Automatic Technical Abort', () => {
       attention,
       readLedger: () => TECHNICAL_LEDGER,
     })).toMatchObject({ ok: false, code: 'OWNERSHIP_UNPROVEN' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata)
+      .toEqual(carrierBefore.failureMetadata)
+  })
+
+  it('excludes the carrier changedFiles from ownership and accepts pairwise start/end continuity', () => {
+    const fx = seedTechnicalAbort()
+    const inherited: JobWorkspaceBaseline = {
+      mode: 'dirty',
+      startCommitHash: BASELINE.startCommitHash,
+      entries: [{
+        path: 'apps/worker/src/index.ts', kind: 'modified', worktreeHash: 'sha256:owned',
+      }],
+    }
+    const older = fx.storage.jobs.findByTaskId(fx.taskId)[1]
+    if (older === undefined) throw new Error('older job missing')
+    fx.storage.jobs.update(older.id, {
+      failureMetadata: { workspaceEndFingerprint: inherited },
+    })
+    fx.storage.jobs.update(fx.latestJobId, {
+      workspaceBaseline: inherited,
+      changedFiles: ['apps/external/not-an-ownership-source.ts'],
+      failureMetadata: { workspaceEndFingerprint: inherited },
+    })
+
+    requestTechnical(fx)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeDefined()
+  })
+
+  it('refuses legacy Task Jobs without a persisted end fingerprint and keeps the handoff', () => {
+    const fx = seedTechnicalAbort()
+    fx.storage.jobs.update(fx.latestJobId, { failureMetadata: {} })
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    const result = requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId, attention, readLedger: () => TECHNICAL_LEDGER,
+    })
+    expect(result).toMatchObject({ ok: false, code: 'OWNERSHIP_UNPROVEN' })
+    if (result.ok) throw new Error('expected legacy refusal')
+    expect(result.reason).toContain('legacy row')
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
   })
 
   it('does not let updatedAt alone invalidate the technical state fingerprint', () => {
@@ -1394,9 +1470,10 @@ describe('P2-2 Automatic Technical Abort', () => {
     )).toHaveLength(1)
   })
 
-  it('retires and quarantines an already-set Technical Abort marker instead of reporting success', () => {
+  it('leaves a current Technical Abort marker for the Worker instead of retiring it', () => {
     const fx = seedTechnicalAbort()
     requestTechnical(fx)
+    const marker = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
     const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
     if (attention === undefined) throw new Error('attention missing')
 
@@ -1404,6 +1481,19 @@ describe('P2-2 Automatic Technical Abort', () => {
       taskId: fx.taskId,
       attention,
       readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: true, status: 'cleanup_requested' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual(marker)
+  })
+
+  it('retires a Technical Abort marker only after its state fingerprint is provably stale', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    fx.storage.jobs.update(fx.latestJobId, { changedFiles: ['apps/worker/src/index.ts'] })
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId, attention, readLedger: () => TECHNICAL_LEDGER,
     })).toMatchObject({ ok: false, code: 'JOB_QUARANTINED' })
     expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toMatchObject({ quarantined: true })
     expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortTechnicalEvidenceId)

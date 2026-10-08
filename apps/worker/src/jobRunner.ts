@@ -363,6 +363,8 @@ export interface JobRunResult {
   providerFailureKind?: AiCliResult['providerFailureKind']
   refusal?: JobFailureMetadata['refusal']
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
+  /** 子プロセスと Job 固有 cleanup が終わった時点の value-free workspace fingerprint。 */
+  workspaceEndFingerprint?: JobWorkspaceBaseline
   permissionBlockEvent?: PermissionBlockEvent
   rollbackInfo?: RollbackInfo
   gatePolicy?: EffectivePolicy
@@ -1045,6 +1047,7 @@ export async function runJob(
       stageAManifest,
       preManifest.paths,
     )
+    const workspaceEndFingerprint = captureWorkspaceEndFingerprint(job.safeCommand.workingDir)
     // 既存契約に合わせ status は 'failed' を返す。
     // index.ts の resolveResultStatus() が guardResult.fileChangeAllowed=false を見て
     // 最終的に 'blocked' へ変換する（File Change Guard 由来の停止の既存表現）。
@@ -1067,6 +1070,7 @@ export async function runJob(
       completedAt: new Date().toISOString(),
       targetProjectRiskScanResult,
       finalChangeManifest: stageAManifest,
+      workspaceEndFingerprint,
     }
   }
 
@@ -1434,6 +1438,7 @@ export async function runJob(
   const previews = logPaths
     ? { stdoutPreview: logPaths.stdoutPreview, stderrPreview: logPaths.stderrPreview }
     : buildLogPreviews(combinedStdout, stderr)
+  const workspaceEndFingerprint = captureWorkspaceEndFingerprint(job.safeCommand.workingDir)
 
   return {
     status:
@@ -1461,6 +1466,7 @@ export async function runJob(
     postReviewResult,
     safetyVerificationResult,
     finalChangeManifest: finalManifest,
+    workspaceEndFingerprint,
     // AI CLI 失敗経路（inspectAfterAiFailure）と同じ後始末の材料。こちらは
     // AI CLI が exit 0 でも test/review/guard で failed になる経路を拾う。
     workspaceCleanup: {
@@ -2132,6 +2138,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
   let workspaceState: JobRunResult['workspaceState']
   let workspaceCleanupNote: string | undefined
   let guardBlockNote: string | undefined
+  let workspaceEndFingerprint: JobWorkspaceBaseline | undefined
   try {
     const inspection = buildFinalInspection(
       input.workingDir,
@@ -2165,6 +2172,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     riskScan = scanTargetProjectRisk({ changedFiles: manifest.paths, diffText: inspection.diffText })
     const summary = formatRiskScanSummary(riskScan)
     if (summary) console.warn(`[final][ai-failure] ${summary}`)
+    workspaceEndFingerprint = captureWorkspaceEndFingerprint(input.workingDir)
   } catch (err: unknown) {
     // この try は buildFinalInspection だけでなく revertBlockedJobChanges も覆っている。
     // containment 失敗をここで failed へ潰すと、生き残ったプロセスがいるかもしれない
@@ -2199,6 +2207,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     approvalLevelResult: input.approvalLevelResult,
     targetProjectRiskScanResult: riskScan,
     finalChangeManifest: manifest,
+    workspaceEndFingerprint,
     // escalate が確定した場合にだけ Worker 側で使う後始末の材料。
     // Guard 違反で既に取り消した場合も manifest は空にならないが、
     // `revertBlockedJobChanges()` は同じ path へ二度実行しても no-op（checkout/clean は
@@ -2292,6 +2301,31 @@ function inspectFinalState(
     manifest: mergeManifests(commitManifest, worktreeManifest),
     diffText: getCommitRangeDiffText(workingDir, startCommitHash, currentHead) + worktreeDiff,
     workspaceState: 'changed',
+  }
+}
+
+/**
+ * terminal result と同じ瞬間の worktree を、既存 baseline 表現へ正規化する。
+ * Job の変更内容は保存せず、path と content hash だけを durable metadata へ渡す。
+ */
+function captureWorkspaceEndFingerprint(workingDir: string): JobWorkspaceBaseline {
+  try {
+    const startCommitHash = requireCommitHash(workingDir)
+    const manifest = buildWorktreeManifest(workingDir)
+    if (manifest.paths.length === 0) return { mode: 'clean', startCommitHash }
+    const fingerprints = fingerprintWorktreeEntries(workingDir, manifest)
+    return {
+      mode: 'dirty',
+      startCommitHash,
+      entries: buildBaselineEntries(manifest, fingerprints),
+    }
+  } catch (err: unknown) {
+    if (err instanceof WorkspaceReconciliationError) throw err
+    if (isContainmentInfrastructureError(err)) throw err
+    throw new WorkspaceReconciliationError(
+      `workspace end fingerprint failed (${formatUnknownError(err)}); `
+      + 'cannot prove Job ownership continuity (fail-closed)',
+    )
   }
 }
 

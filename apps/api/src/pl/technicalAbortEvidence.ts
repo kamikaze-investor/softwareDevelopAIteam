@@ -118,6 +118,7 @@ export function technicalAbortStateFingerprint(
       status: job.status,
       workingDir: job.safeCommand?.workingDir,
       baseline: job.workspaceBaseline,
+      workspaceEndFingerprint: job.failureMetadata?.workspaceEndFingerprint,
       changedFiles: job.changedFiles,
       commitHash: job.commitHash,
       workflowStepKey: job.workflowStepKey,

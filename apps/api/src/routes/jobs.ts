@@ -181,6 +181,29 @@ const UpdateJobBody = z.object({
     quarantineReason: z.string().optional(),
     quarantineClearedAt: z.string().optional(),
     quarantineClearedReason: z.string().optional(),
+    workspaceEndFingerprint: z.discriminatedUnion('mode', [
+      z.object({
+        mode: z.literal('clean'),
+        startCommitHash: z.string(),
+      }).strict(),
+      z.object({
+        mode: z.literal('dirty'),
+        startCommitHash: z.string(),
+        entries: z.array(z.object({
+          path: z.string(),
+          oldPath: z.string().optional(),
+          kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+          xyStatus: z.string().optional(),
+          beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+          afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+          beforeMode: z.string().optional(),
+          afterMode: z.string().optional(),
+          headHash: z.string().optional(),
+          indexHash: z.string().optional(),
+          worktreeHash: z.string(),
+        })),
+      }).strict(),
+    ]).optional(),
   }).strict().optional(),
   workspaceBaseline: z.discriminatedUnion('mode', [
     z.object({

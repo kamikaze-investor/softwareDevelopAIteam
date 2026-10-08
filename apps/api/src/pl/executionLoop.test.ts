@@ -247,6 +247,9 @@ describe('runPlTick — Technical Abort maintenance handoff', () => {
       status: 'success',
       safeCommand: { kind: 'test', workingDir: '/workspace/target' },
       workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+      failureMetadata: {
+        workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+      },
     } as Parameters<IStorage['jobs']['create']>[0])
     const carrier = storage.jobs.create({
       taskId: task.id,
@@ -255,6 +258,9 @@ describe('runPlTick — Technical Abort maintenance handoff', () => {
       status: 'failed',
       safeCommand: { kind: 'test', workingDir: '/workspace/target' },
       workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+      failureMetadata: {
+        workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+      },
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(carrier.id, {
       guardResult: {
@@ -280,6 +286,26 @@ describe('runPlTick — Technical Abort maintenance handoff', () => {
     expect(escalations).toHaveLength(1)
     expect(fx.storage.jobs.findById(fx.carrierId)?.failureMetadata?.abortCleanupRequestedAt)
       .toBeDefined()
+  })
+
+  it('keeps a valid cleanup marker when handoff delivery throws, then retries the handoff next tick', async () => {
+    const fx = protectedPathFixture(true)
+    await expect(runPlTick(fx.storage, deps({
+      readLedger: () => ledger,
+      escalate: async () => { throw new Error('temporary delivery failure') },
+    }))).rejects.toThrow('temporary delivery failure')
+
+    const afterFailure = fx.storage.jobs.findById(fx.carrierId)?.failureMetadata
+    expect(afterFailure?.abortCleanupRequestedAt).toBeDefined()
+    expect(afterFailure?.quarantined).not.toBe(true)
+
+    const retried = await runPlTick(fx.storage, deps({
+      readLedger: () => ledger,
+      escalate: async () => DELIVERED,
+    }))
+    expect(retried.status).toBe('escalated')
+    expect(fx.storage.jobs.findById(fx.carrierId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBe(afterFailure?.abortCleanupRequestedAt)
   })
 
   it('falls through to the existing Tier B handoff when Technical Abort is refused', async () => {

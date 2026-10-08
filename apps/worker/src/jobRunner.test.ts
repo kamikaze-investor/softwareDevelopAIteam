@@ -489,6 +489,9 @@ beforeEach(() => {
       paths,
     }
   })
+  fingerprintWorktreeEntriesMock.mockImplementation((_workingDir, manifest) => new Map(
+    manifest.paths.map((manifestPath) => [manifestPath, `sha256:${manifestPath}`]),
+  ))
   buildApprovedStateMapMock.mockImplementation((_workingDir, manifest) => {
     const states = new Map()
     for (const change of manifest.changes) {

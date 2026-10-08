@@ -28,6 +28,8 @@ const jobRunnerMocks = vi.hoisted(() => ({
 
 const workspaceVerificationMocks = vi.hoisted(() => ({
   observeWorkspace: vi.fn(),
+  verifyWorkspaceAgainstBaseline: vi.fn(),
+  workspaceObservationMatchesBaseline: vi.fn(),
 }))
 
 vi.mock('./outbox/outboxStore.js', () => outboxMocks)
@@ -61,7 +63,7 @@ import {
 const NOW = '2026-08-08T01:02:03.000Z'
 const fetchMock = vi.fn<typeof fetch>()
 
-const CLEAN_BASELINE = { mode: 'clean', startCommitHash: 'abc123' }
+const CLEAN_BASELINE = { mode: 'clean', startCommitHash: 'abc123' } as const
 
 const job: Job = {
   id: 'job-1',
@@ -112,6 +114,8 @@ beforeEach(() => {
   notifierMocks.sendAlert.mockReset()
   jobRunnerMocks.computeWorkspaceBaseline.mockReset()
   workspaceVerificationMocks.observeWorkspace.mockReset()
+  workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReset()
+  workspaceVerificationMocks.workspaceObservationMatchesBaseline.mockReset()
   outboxMocks.recordPending.mockReturnValue({
     eventId: 'event-1',
     payloadHash: 'payload-hash-1',
@@ -131,6 +135,8 @@ beforeEach(() => {
       blindSpotsAbsent: true,
     },
   })
+  workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
+  workspaceVerificationMocks.workspaceObservationMatchesBaseline.mockReturnValue(true)
   vi.spyOn(console, 'log').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -319,9 +325,66 @@ describe('abort cleanup observation reporting', () => {
       expect.stringContaining('/api/jobs/job-accepted/abort-cleanup-result'),
     ])
   })
+
+  it('verifies Technical Abort cleanup against the persisted END fingerprint, not the START baseline', async () => {
+    const endFingerprint = { mode: 'clean' as const, startCommitHash: 'end-head' }
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const requestedJob: Job = {
+      ...job,
+      status: 'failed',
+      workspaceBaseline: CLEAN_BASELINE,
+      failureMetadata: {
+        workspaceEndFingerprint: endFingerprint,
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+      },
+    }
+    workspaceVerificationMocks.observeWorkspace.mockReturnValue({
+      observation: endFingerprint,
+      knownGood: {
+        gitOperationMarkers: [], worktreeClean: true, indexClean: true,
+        headValid: true, blindSpotsAbsent: true,
+      },
+    })
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=')) return new Response(JSON.stringify([requestedJob]), { status: 200 })
+      if (value.includes('/abort-cleanup-result')) return new Response(null, { status: 200 })
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+    expect(workspaceVerificationMocks.verifyWorkspaceAgainstBaseline)
+      .toHaveBeenCalledWith('/workspace/target', endFingerprint)
+  })
 })
 
 describe('terminal result persistence', () => {
+  it('persists the value-free workspace END fingerprint in existing failureMetadata JSON', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const workspaceEndFingerprint = {
+      mode: 'dirty' as const,
+      startCommitHash: 'abc123',
+      entries: [{ path: 'src/feature.ts', kind: 'modified' as const, worktreeHash: 'sha256:value-free' }],
+    }
+
+    await persistJobResult('job-end-fingerprint', {
+      ...runResult,
+      workspaceEndFingerprint,
+    }, 'success', { patchJob })
+
+    expect(patchJob).toHaveBeenCalledWith('job-end-fingerprint', expect.objectContaining({
+      failureMetadata: { workspaceEndFingerprint },
+    }))
+  })
+
   it('persists a value-free secret-scan refusal in failureMetadata', async () => {
     const patchJob = vi.fn().mockResolvedValue(true)
     const refusal = {

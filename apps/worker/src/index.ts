@@ -475,7 +475,12 @@ export async function persistJobResult(
   result: Awaited<ReturnType<typeof runJob>>,
   resultStatus: Job['status'],
   dependencies: JobPersistenceDependencies = {},
+  workspaceBaseline?: Job['workspaceBaseline'],
 ): Promise<void> {
+  // runJob が子プロセスを開始した経路では terminal 時点の fingerprint を返す。
+  // それ以前の fail-closed return（policy/context/検出失敗）は workspace を変更していないため、
+  // claim 時の durable baseline がそのまま end fingerprint になる。
+  const workspaceEndFingerprint = result.workspaceEndFingerprint ?? workspaceBaseline
   const resultUpdate: JobUpdate = {
     status: resultStatus,
     exitCode: result.exitCode,
@@ -487,11 +492,12 @@ export async function persistJobResult(
     commitHash: result.commitHash,
     completedAt: result.completedAt,
     guardResult: result.guardResult,
-    failureMetadata: result.providerFailureKind || result.workspaceState || result.refusal
+    failureMetadata: result.providerFailureKind || result.workspaceState || result.refusal || workspaceEndFingerprint
       ? {
           kind: result.providerFailureKind,
           workspaceState: result.workspaceState,
           refusal: result.refusal,
+          workspaceEndFingerprint,
         }
       : undefined,
     reviewResult: result.reviewResult,
@@ -715,7 +721,7 @@ export async function processQueuedWork(
   const resultStatus = resolveResultStatus(result)
 
   assertTransition('running', resultStatus)
-  await persistJobResult(job.id, result, resultStatus, dependencies)
+  await persistJobResult(job.id, result, resultStatus, dependencies, job.workspaceBaseline)
   return resultStatus
 }
 
@@ -1058,7 +1064,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
       } | undefined
       const technicalEvidenceId = requested.failureMetadata?.abortTechnicalEvidenceId
       if (technicalEvidenceId !== undefined) {
-        const baseline = requested.workspaceBaseline
+        const baseline = requested.failureMetadata?.workspaceEndFingerprint
         const verified = verifyWorkspaceAgainstBaseline(requested.safeCommand.workingDir, baseline)
         if (
           !verified.verified
