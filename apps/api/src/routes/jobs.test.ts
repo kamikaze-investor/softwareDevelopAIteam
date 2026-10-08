@@ -857,15 +857,103 @@ describe('Job API', () => {
         }],
       }
 
+      const running = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: { status: 'running' },
+      })
+      expect(running.statusCode).toBe(200)
+
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${created.id}`,
-        payload: { failureMetadata: { workspaceEndFingerprint } },
+        payload: { status: 'success', failureMetadata: { workspaceEndFingerprint } },
       })
 
       expect(res.statusCode).toBe(200)
       const body = parseBody<OutboxJobResponse>(res.body)
       expect(body.failureMetadata?.workspaceEndFingerprint).toEqual(workspaceEndFingerprint)
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects a workspace END fingerprint without a running-to-terminal transition', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          status: 'running',
+          failureMetadata: {
+            workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('running-to-terminal')
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects a workspace END fingerprint after the Job is terminal', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      await app.inject({
+        method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'running' },
+      })
+      await app.inject({
+        method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'success' },
+      })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          failureMetadata: {
+            workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('running-to-terminal')
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects rewriting an existing workspace END fingerprint', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.jobs.update(created.id, {
+        status: 'running',
+        failureMetadata: {
+          workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'original' },
+        },
+      })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          status: 'failed',
+          failureMetadata: {
+            workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'replacement' },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('write-once')
+      expect(storage.jobs.findById(created.id)?.failureMetadata?.workspaceEndFingerprint)
+        .toEqual({ mode: 'clean', startCommitHash: 'original' })
     })
   })
 

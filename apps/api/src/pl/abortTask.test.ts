@@ -1221,6 +1221,9 @@ describe('P2-2 Automatic Technical Abort', () => {
       entityId: `${attention.kind}:${attention.referenceId ?? attention.jobId ?? attention.taskId ?? attention.projectId}`,
       result: 'escalated',
     })
+    fx.storage.auditLog.findAll = () => {
+      throw new Error('hasTaskEscalation must not scan the full audit log')
+    }
 
     expect(requestTechnicalAbort(fx.storage, {
       taskId: fx.taskId,

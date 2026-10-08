@@ -13,6 +13,7 @@ import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePo
 import {
   canApplyJobResultStatus,
   describeApplicableJobStatuses,
+  isTerminalJobStatus,
 } from '../jobResultApplicationPolicy'
 import {
   escalateTaskToHuman,
@@ -656,6 +657,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const existing = storage.jobs.findById(req.params.id)
     if (!existing) {
       return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
+    if (workspaceEndFingerprint !== undefined) {
+      if (existing.failureMetadata?.workspaceEndFingerprint !== undefined) {
+        return reply.status(409).send({
+          error: 'workspaceEndFingerprint is write-once and has already been recorded',
+        })
+      }
+      if (
+        existing.status !== 'running'
+        || jobUpdate.status === undefined
+        || !isTerminalJobStatus(jobUpdate.status)
+      ) {
+        return reply.status(409).send({
+          error: 'workspaceEndFingerprint is only accepted on a running-to-terminal transition',
+        })
+      }
     }
 
     // initial-implement が running を一度も獲得しないまま failed を報告できるのは、

@@ -878,19 +878,35 @@ function workspaceContentFingerprintEquals(
 }
 
 function hasTaskEscalation(storage: IStorage, taskId: string, taskJobs: readonly Job[]): boolean {
-  const subjects = new Set<string>([
-    taskId,
-    ...taskJobs.map((job) => job.id),
-    ...storage.approvalRequests.findByTaskId(taskId).map((approval) => approval.id),
-  ])
-  return storage.auditLog.findAll().some((entry) => {
-    if (
-      entry.entityType !== 'pl_loop_target'
-      || entry.operation !== 'pl_loop'
-      || entry.result !== 'escalated'
-    ) return false
-    const separator = entry.entityId.indexOf(':')
-    const subject = separator < 0 ? entry.entityId : entry.entityId.slice(separator + 1)
-    return subjects.has(subject) || subject.startsWith(`${taskId}:`)
-  })
+  const taskTargetKinds = [
+    'design_review_failed',
+    'design_review_idle',
+    'task_ready_without_job',
+  ] as const
+  const jobTargetKinds = [
+    'job_blocked',
+    'job_failed',
+    'job_running_long',
+    'workspace_quarantined',
+  ] as const
+  const targetKeys = new Set<string>(taskTargetKinds.map((kind) => `${kind}:${taskId}`))
+  for (const job of taskJobs) {
+    for (const kind of jobTargetKinds) targetKeys.add(`${kind}:${job.id}`)
+  }
+  for (const approval of storage.approvalRequests.findByTaskId(taskId)) {
+    targetKeys.add(`approval_waiting:${approval.id}`)
+  }
+
+  const recoveryIds = storage.auditLog
+    .findByEntity('task', taskId)
+    .filter((entry) => entry.operation === 'task_human_recovered' && entry.result === 'success')
+    .map((entry) => entry.id)
+  targetKeys.add(`task_blocked_without_job:${taskId}:first`)
+  for (const recoveryId of recoveryIds) {
+    targetKeys.add(`task_blocked_without_job:${taskId}:${recoveryId}`)
+  }
+
+  return [...targetKeys].some((targetKey) => storage.auditLog
+    .findByEntity('pl_loop_target', targetKey)
+    .some((entry) => entry.operation === 'pl_loop' && entry.result === 'escalated'))
 }
