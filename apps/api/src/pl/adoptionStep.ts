@@ -47,6 +47,10 @@ import {
   authorizePlAction,
   PlActionBlockedError,
 } from './actionGate'
+import {
+  findLatestTechnicalAbortSnapshot,
+  technicalAbortFingerprintChanged,
+} from './technicalAbortEvidence'
 
 export type AdoptionScopeAuthorization =
   | { ok: true }
@@ -144,7 +148,7 @@ export type AdoptionKind = 'fresh' | 'follow_up' | 'not_available'
 export interface ClassifiedCandidate extends RoadmapCandidate {
   kind: AdoptionKind
   /** `not_available` のうち、機械的に識別できる fail-closed 理由。 */
-  notAvailableReason?: 'awaiting_promotion'
+  notAvailableReason?: 'awaiting_promotion' | 'technical_abort_unchanged'
   /** `follow_up` のとき、これまでに作られた follow-up の数。 */
   followUpCount: number
   /** この項目で**実際に実行された** Task の数。prompt はこちらを使う。 */
@@ -213,6 +217,28 @@ export function classifyAdoptionCandidates(
         ...candidate,
         kind: 'not_available' as const,
         notAvailableReason: 'awaiting_promotion' as const,
+        followUpCount,
+        executedTaskCount: executedCount,
+        boosted: false,
+      }
+    }
+
+    // Automatic Technical Abort は「Roadmap item を捨てる」操作ではない。一方、同じ
+    // Task Contract / ledger body / dependency state / known workspace progress のまま即座に
+    // follow-up 採用すると、決定論的な protected_path failure を無限に再生成する。
+    // park 時の snapshot は既存 audit_log にあり、新しい state/table は持たない。
+    const technicallyParked = siblings
+      .map((task) => ({ task, snapshot: findLatestTechnicalAbortSnapshot(storage, task.id) }))
+      .filter((item) => item.snapshot !== undefined)
+      .sort((left, right) => right.task.updatedAt.localeCompare(left.task.updatedAt))[0]
+    if (
+      technicallyParked?.snapshot !== undefined
+      && !technicalAbortFingerprintChanged(storage, technicallyParked.task, candidate, technicallyParked.snapshot)
+    ) {
+      return {
+        ...candidate,
+        kind: 'not_available' as const,
+        notAvailableReason: 'technical_abort_unchanged' as const,
         followUpCount,
         executedTaskCount: executedCount,
         boosted: false,
@@ -907,11 +933,15 @@ export async function runAdoptionStep(
   if (available.length === 0) {
     const allAwaitingPromotion = classified.length > 0
       && classified.every((candidate) => candidate.notAvailableReason === 'awaiting_promotion')
+    const allTechnicalAbortUnchanged = classified.length > 0
+      && classified.every((candidate) => candidate.notAvailableReason === 'technical_abort_unchanged')
     return {
       status: 'no_candidate',
       reason: allAwaitingPromotion
         ? 'all open roadmap items are awaiting Tier A Candidate promotion'
-        : 'no open roadmap item in the ledger',
+        : allTechnicalAbortUnchanged
+          ? 'all technically parked items are unchanged and remain visible as parked Tasks'
+          : 'no open roadmap item in the ledger',
     }
   }
 

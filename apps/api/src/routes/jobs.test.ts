@@ -277,6 +277,17 @@ beforeEach(() => {
 })
 
 describe('Job API', () => {
+  it('rejects value-bearing Technical Abort refusal text at the HTTP boundary', async () => {
+    await withApp(async (app) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/jobs/missing/abort-cleanup-result',
+        payload: { refusalCode: 'provider returned secret=value' },
+      })
+      expect(response.statusCode).toBe(400)
+    })
+  })
+
   it('GET /api/jobs returns 400 without taskId', async () => {
     await withApp(async (app) => {
       const res = await app.inject({ method: 'GET', url: '/api/jobs' })

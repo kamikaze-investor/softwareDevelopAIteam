@@ -8,6 +8,10 @@
  */
 
 import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, OperatorRequestPlAction, OperatorRequestRequesterClass, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
+import type {
+  AbortAuthorization,
+  TechnicalAbortCleanupSummary,
+} from '../pl/technicalAbortEvidence'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
@@ -526,7 +530,7 @@ export interface IJobStorage {
   parkTask(input: {
     taskId: string
     reason: string
-    approvalRequestId: string
+    authorization: Extract<AbortAuthorization, { kind: 'manual_approval' }>
   }): ReleaseBlockedJobAndParkTaskResult
   releaseBlockedJobAndParkTask(input: {
     jobId: string
@@ -548,8 +552,12 @@ export interface IJobStorage {
     }
     /** audit に残す park 理由。 */
     reason: string
-    /** 承認の出所。transaction 内で束縛を再検証し、CONSUMED まで進める。 */
-    approvalRequestId: string
+    /** manual approval または server-verified technical evidence。transaction 内で再検証する。 */
+    authorization: AbortAuthorization
+    /** technical cleanup の前状態。manual abort では不要。 */
+    preCleanupObservation?: JobWorkspaceBaseline
+    /** technical audit に残す counts-only summary。 */
+    cleanupSummary?: TechnicalAbortCleanupSummary
   }): ReleaseBlockedJobAndParkTaskResult
   /**
    * 全 Job が既に terminal な blocked Task を abort_task で park する最終段。
@@ -569,7 +577,9 @@ export interface IJobStorage {
       blindSpotsAbsent: boolean
     }
     reason: string
-    approvalRequestId: string
+    authorization: AbortAuthorization
+    preCleanupObservation?: JobWorkspaceBaseline
+    cleanupSummary?: TechnicalAbortCleanupSummary
   }): ReleaseBlockedJobAndParkTaskResult
   clearWorkspaceQuarantine(input: {
     jobId: string

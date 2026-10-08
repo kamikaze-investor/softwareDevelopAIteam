@@ -50,6 +50,26 @@ export interface ObserveWorkspaceResult {
   knownGood: KnownGoodFacts
 }
 
+/** Persisted baseline と1回の observation を content fingerprint 込みで完全比較する。 */
+export function workspaceObservationMatchesBaseline(
+  baseline: JobWorkspaceBaseline,
+  observation: JobWorkspaceBaseline,
+): boolean {
+  const normalizedBaseline = baseline.mode === 'dirty' && baseline.entries.length === 0
+    ? { mode: 'clean' as const, startCommitHash: baseline.startCommitHash }
+    : baseline
+  const normalizedObservation = observation.mode === 'dirty' && observation.entries.length === 0
+    ? { mode: 'clean' as const, startCommitHash: observation.startCommitHash }
+    : observation
+  if (
+    normalizedBaseline.mode !== normalizedObservation.mode
+    || normalizedBaseline.startCommitHash !== normalizedObservation.startCommitHash
+  ) return false
+  if (normalizedBaseline.mode === 'clean') return true
+  if (normalizedObservation.mode !== 'dirty') return false
+  return compareDirtyEntries(normalizedBaseline.entries, normalizedObservation.entries).verified
+}
+
 /**
  * PR-C final blocker (BLOCKER B): workspace を**観測**し、baseline 形式の observation と
  * known-good 事実を返す。

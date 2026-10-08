@@ -26,13 +26,18 @@ import type {
 import {
   runJob,
   computeWorkspaceBaseline,
+  buildCleanupManifestFromBaseline,
   revertBlockedJobChanges,
   WorkspaceReconciliationError,
 } from './jobRunner.js'
 import { resolveReviewedImplementJobId } from './reviewRefusalEligibility.js'
 import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
 import { getCommitHash } from './jobRunner.js'
-import { observeWorkspace } from './workspaceVerification.js'
+import {
+  observeWorkspace,
+  verifyWorkspaceAgainstBaseline,
+  workspaceObservationMatchesBaseline,
+} from './workspaceVerification.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildWorktreeManifest } from './guards/changeManifest.js'
@@ -1044,6 +1049,70 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
         return false
       }
 
+      let finalObservation = observed.observation
+      let finalKnownGood = observed.knownGood
+      let cleanupSummary: {
+        changedPathCount: number
+        restoredPathCount: number
+        removedPathCount: number
+      } | undefined
+      const technicalEvidenceId = requested.failureMetadata?.abortTechnicalEvidenceId
+      if (technicalEvidenceId !== undefined) {
+        const baseline = requested.workspaceBaseline
+        const verified = verifyWorkspaceAgainstBaseline(requested.safeCommand.workingDir, baseline)
+        if (
+          !verified.verified
+          || baseline === undefined
+          || !workspaceObservationMatchesBaseline(baseline, observed.observation)
+        ) {
+          await reportAbortCleanupRefusal(requested.id, 'PRE_CLEANUP_BASELINE_MISMATCH')
+          continue
+        }
+        if (baseline.mode === 'dirty') {
+          const cleanup = buildCleanupManifestFromBaseline(baseline)
+          cleanupSummary = {
+            changedPathCount: cleanup.changedPathCount,
+            restoredPathCount: cleanup.restoredPathCount,
+            removedPathCount: cleanup.removedPathCount,
+          }
+          let cleanupWarning: string | undefined
+          try {
+            cleanupWarning = await revertBlockedJobChanges(
+              requested.safeCommand.workingDir,
+              baseline.startCommitHash,
+              cleanup.manifest,
+              [],
+            )
+          } catch {
+            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_EXECUTION_FAILED')
+            continue
+          }
+          if (cleanupWarning !== undefined) {
+            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_INCOMPLETE')
+            continue
+          }
+        } else {
+          cleanupSummary = { changedPathCount: 0, restoredPathCount: 0, removedPathCount: 0 }
+        }
+
+        // cleanup 後の**別観測**。clean + 同一 HEAD + known-good が揃わなければ park を要求しない。
+        const afterCleanup = observeWorkspace(requested.safeCommand.workingDir)
+        if (
+          afterCleanup.observation?.mode !== 'clean'
+          || afterCleanup.observation.startCommitHash !== baseline.startCommitHash
+          || afterCleanup.knownGood.gitOperationMarkers.length > 0
+          || !afterCleanup.knownGood.worktreeClean
+          || !afterCleanup.knownGood.indexClean
+          || !afterCleanup.knownGood.headValid
+          || !afterCleanup.knownGood.blindSpotsAbsent
+        ) {
+          await reportAbortCleanupRefusal(requested.id, 'POST_CLEANUP_NOT_CLEAN_AT_HEAD')
+          continue
+        }
+        finalObservation = afterCleanup.observation
+        finalKnownGood = afterCleanup.knownGood
+      }
+
       console.log(`[Worker] Job ${requested.id} の workspace を観測し、abort cleanup 結果を報告します`)
       try {
         const response = await fetch(
@@ -1055,8 +1124,14 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
             // Worker 側で「安全だ」と判断して送る材料を絞ると、API は
             // 進行中の git 操作や観測に出ない変更を見られなくなる。
             body: JSON.stringify({
-              observation: observed.observation,
-              knownGood: observed.knownGood,
+              observation: finalObservation,
+              knownGood: finalKnownGood,
+              ...(technicalEvidenceId !== undefined
+                ? {
+                    preCleanupObservation: observed.observation,
+                    cleanupSummary,
+                  }
+                : {}),
             }),
           },
         )
@@ -1078,6 +1153,28 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
   }
 
   return false
+}
+
+type AbortCleanupRefusalCode =
+  | 'PRE_CLEANUP_BASELINE_MISMATCH'
+  | 'CLEANUP_EXECUTION_FAILED'
+  | 'CLEANUP_INCOMPLETE'
+  | 'POST_CLEANUP_NOT_CLEAN_AT_HEAD'
+
+async function reportAbortCleanupRefusal(
+  jobId: string,
+  refusalCode: AbortCleanupRefusalCode,
+): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/abort-cleanup-result`, {
+      method: 'POST',
+      headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refusalCode }),
+    })
+  } catch (err: unknown) {
+    // refusal の delivery 失敗は黙らせない。request marker は残るので次 poll でも再試行される。
+    console.warn(`[Worker] abort cleanup refusal 報告エラー: ${formatUnknownError(err)}`)
+  }
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
 import { completeAbortCleanup } from '../pl/abortTask'
+import { TECHNICAL_ABORT_WORKER_REFUSAL_CODES } from '../pl/technicalAbortEvidence'
 import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
@@ -297,10 +298,21 @@ const KnownGoodFactsSchema = z.object({
 
 // abort cleanup も quarantine 解除と**同じ材料**を同じ厳密さで要求する。
 // 所有権の解放は quarantine 解除より重く、緩い検証で通してよい理由がない。
-const AbortCleanupResultBody = z.object({
-  observation: WorkspaceObservationSchema,
-  knownGood: KnownGoodFactsSchema,
-}).strict()
+const AbortCleanupResultBody = z.union([
+  z.object({
+    observation: WorkspaceObservationSchema,
+    knownGood: KnownGoodFactsSchema,
+    preCleanupObservation: WorkspaceObservationSchema.optional(),
+    cleanupSummary: z.object({
+      changedPathCount: z.number().int().nonnegative(),
+      restoredPathCount: z.number().int().nonnegative(),
+      removedPathCount: z.number().int().nonnegative(),
+    }).strict().optional(),
+  }).strict(),
+  z.object({
+    refusalCode: z.enum(TECHNICAL_ABORT_WORKER_REFUSAL_CODES),
+  }).strict(),
+])
 
 const ClearQuarantineJobBody = z.object({
   observation: WorkspaceObservationSchema,
@@ -538,8 +550,27 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
 
     const result = completeAbortCleanup(storage, {
       jobId: req.params.id,
-      observation: parsed.data.observation as JobWorkspaceBaseline,
-      knownGood: parsed.data.knownGood,
+      ...('refusalCode' in parsed.data
+        ? {
+            refusalCode: parsed.data.refusalCode,
+            knownGood: {
+              gitOperationMarkers: [],
+              worktreeClean: false,
+              indexClean: false,
+              headValid: false,
+              blindSpotsAbsent: false,
+            },
+          }
+        : {
+            observation: parsed.data.observation as JobWorkspaceBaseline,
+            knownGood: parsed.data.knownGood,
+            ...(parsed.data.preCleanupObservation !== undefined
+              ? { preCleanupObservation: parsed.data.preCleanupObservation as JobWorkspaceBaseline }
+              : {}),
+            ...(parsed.data.cleanupSummary !== undefined
+              ? { cleanupSummary: parsed.data.cleanupSummary }
+              : {}),
+          }),
     })
     if (!result.ok) {
       const status = result.code === 'NOT_FOUND' ? 404 : 409

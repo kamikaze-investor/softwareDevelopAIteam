@@ -91,8 +91,19 @@ export interface JobFailureMetadata {
    * 新しい Job status も cancellation queue も持たないための、既存 metadata への最小の印である。
    */
   abortCleanupRequestedAt?: string
-  /** 上記要求の根拠となった ApprovalRequest。解放時の audit に載る。 */
+  /** manual ADMIN abort の根拠となった ApprovalRequest。technical abort では設定しない。 */
   abortApprovalRequestId?: string
+  /**
+   * PL の in-process Technical Abort がサーバ側で発行した evidence id。
+   * HTTP caller はこの値を指定できず、最終 transaction が audit と current state を再照合する。
+   */
+  abortTechnicalEvidenceId?: string
+  /** technical evidence 発行時の current Task / latest Job / triage 入力 fingerprint。 */
+  abortTechnicalStateFingerprint?: string
+  /** technical abort が許される既存 blockedTriage class。現在は protected_path のみ。 */
+  abortTechnicalRootCauseClass?: 'protected_path'
+  /** evidence 発行時に再確認した attention kind。 */
+  abortTechnicalAttentionKind?: string
   /** 上記要求の理由。解放時の audit に載る。 */
   abortReason?: string
 }

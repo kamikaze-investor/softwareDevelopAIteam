@@ -1570,6 +1570,45 @@ export async function revertBlockedJobChanges(
   return undefined
 }
 
+/**
+ * Persisted dirty baseline を既存 revert helper の ChangeManifest へ戻す。
+ * baseline の fingerprint 一致を先に証明した Technical Abort だけが使う。
+ */
+export function buildCleanupManifestFromBaseline(
+  baseline: Extract<JobWorkspaceBaseline, { mode: 'dirty' }>,
+): { manifest: ChangeManifest; changedPathCount: number; restoredPathCount: number; removedPathCount: number } {
+  const changes = baseline.entries
+    // rename 元は target entry の oldPath として同じ change に復元する。
+    .filter((entry) => entry.kind !== 'renamed' || entry.oldPath !== undefined)
+    .map((entry) => ({
+      path: entry.path,
+      ...(entry.oldPath !== undefined ? { oldPath: entry.oldPath } : {}),
+      kind: entry.kind,
+      ...(entry.xyStatus !== undefined ? { xyStatus: entry.xyStatus } : {}),
+      ...(entry.beforeType !== undefined ? { beforeType: entry.beforeType } : {}),
+      ...(entry.afterType !== undefined ? { afterType: entry.afterType } : {}),
+      ...(entry.beforeMode !== undefined ? { beforeMode: entry.beforeMode } : {}),
+      ...(entry.afterMode !== undefined ? { afterMode: entry.afterMode } : {}),
+      ...(entry.headHash !== undefined ? { headHash: entry.headHash } : {}),
+      ...(entry.indexHash !== undefined ? { indexHash: entry.indexHash } : {}),
+    }))
+  const paths = [...new Set(baseline.entries.map((entry) => entry.path))]
+  const restoredPathCount = changes.reduce(
+    (count, change) => count + (change.kind === 'modified' || change.kind === 'deleted' ? 1 : change.kind === 'renamed' ? 1 : 0),
+    0,
+  )
+  const removedPathCount = changes.reduce(
+    (count, change) => count + (change.kind === 'added' || change.kind === 'renamed' ? 1 : 0),
+    0,
+  )
+  return {
+    manifest: { changes, paths },
+    changedPathCount: paths.length,
+    restoredPathCount,
+    removedPathCount,
+  }
+}
+
 /** 後始末の結果（スキップ・部分失敗）を Job 結果のメッセージへ連結する */
 function withCleanupNote(base: string, note: string | undefined): string {
   return note === undefined ? base : `${base}\n[jobRunner] ${note}`
