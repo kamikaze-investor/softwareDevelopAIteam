@@ -5,6 +5,7 @@ import type {
   SecretScanPatternKind,
 } from '@ai-team/shared'
 import { CONTEXT_SECRET_PATTERNS } from '@ai-team/shared'
+import { isTruncatedLogPreview } from './jobLogger.js'
 
 export const SECRET_SCAN_PATTERN_KINDS: readonly SecretScanPatternKind[] = [
   'ANTHROPIC_API_KEY assignment',
@@ -151,6 +152,10 @@ function encodedStringContentLength(value: string): number {
   return JSON.stringify(value).length - 2
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 function implementReportAiCliRange(
   prompt: string,
   implementJob: ImplementJobReportSource | undefined,
@@ -165,13 +170,17 @@ function implementReportAiCliRange(
 
   const stdout = implementJob.stdout
   const aiCliHeader = `=== AI CLI (${implementJob.aiCliProvider}/${implementJob.aiCliMode}) ===`
-  const aiCliStart = stdout.indexOf(aiCliHeader)
-  if (aiCliStart < 0) return undefined
+  const aiCliHeaderPattern = new RegExp(`^${escapeRegExp(aiCliHeader)}\\r?$`, 'gm')
+  const aiCliHeaderMatch = aiCliHeaderPattern.exec(stdout)
+  if (aiCliHeaderMatch?.index === undefined) return undefined
+  const aiCliStart = aiCliHeaderMatch.index
 
   const safeCommandHeaderPattern = /^=== SafeCommand \([^\r\n]*\) ===\r?$/gm
-  safeCommandHeaderPattern.lastIndex = aiCliStart + aiCliHeader.length
+  safeCommandHeaderPattern.lastIndex = aiCliStart + aiCliHeaderMatch[0].length
   const safeCommandHeader = safeCommandHeaderPattern.exec(stdout)
-  if (safeCommandHeader?.index === undefined) return undefined
+  const aiCliEnd = safeCommandHeader?.index
+    ?? (isTruncatedLogPreview(stdout) ? stdout.length : undefined)
+  if (aiCliEnd === undefined) return undefined
 
   const report = buildImplementJobReport(implementJob)
   const reportRange = uniqueExactRange(prompt, report)
@@ -188,11 +197,11 @@ function implementReportAiCliRange(
 
   const promptOffset = (rawOffset: number): number =>
     valueStart + 1 + encodedStringContentLength(stdout.slice(0, rawOffset))
-  const ownedStdout = stdout.slice(aiCliStart, safeCommandHeader.index)
+  const ownedStdout = stdout.slice(aiCliStart, aiCliEnd)
   return {
     range: {
       start: promptOffset(aiCliStart),
-      end: promptOffset(safeCommandHeader.index),
+      end: promptOffset(aiCliEnd),
     },
     // Re-scan the decoded AI section so an escaped JSON newline cannot make `\S+`
     // consume the following SafeCommand header or output.
