@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { occupiesProject, type JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
@@ -8,6 +8,8 @@ import { abortTask, completeAbortCleanup, requestTechnicalAbort } from './abortT
 import { classifyAdoptionCandidates, readAdoptionCandidates } from './adoptionStep'
 import {
   isEligibleTechnicalAbortDiagnosis,
+  recordTechnicalAbortRefusal,
+  technicalAbortStateFingerprint,
 } from './technicalAbortEvidence'
 import type { BlockedDiagnosis, BlockedRootCauseClass } from './blockedTriage'
 
@@ -76,7 +78,7 @@ function seedTechnicalAbort(options: { dependency?: boolean } = {}): Fixture & {
     projectId: project.id,
     title: 'technical item',
     description: 'protected runtime work',
-    status: 'pending',
+    status: 'blocked',
     assignee: 'developer_ai',
     dependencies: dependency === undefined ? [] : [dependency.id],
     roadmapActive: true,
@@ -1096,7 +1098,7 @@ describe('P2-2 Automatic Technical Abort', () => {
       .toBeUndefined()
   })
 
-  it('cleanup が diff を変えたとき active git_commit approval を STALE にする', () => {
+  it('Task-owned dirty paths can be cleaned and parked without an active approval', () => {
     const fx = seedTechnicalAbort()
     const dirty: JobWorkspaceBaseline = {
       mode: 'dirty',
@@ -1108,21 +1110,16 @@ describe('P2-2 Automatic Technical Abort', () => {
         worktreeHash: 'sha256:task-owned',
       }],
     }
-    fx.storage.jobs.update(fx.latestJobId, { workspaceBaseline: dirty })
-    const approval = approvedRequest(fx.storage, fx.taskId, { action: 'git_commit' })
-    const waiting = fx.storage.approvalRequests.create({
-      taskId: fx.taskId, requestedAction: 'git_commit', riskLevel: 'HIGH',
-      targetBranch: 'ai/technical', targetCommit: 'c2', targetDiffHash: 'd2', changedFiles: [],
-      triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER', expiresAt: FUTURE,
-    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    fx.storage.jobs.update(fx.latestJobId, {
+      workspaceBaseline: dirty,
+      changedFiles: ['apps/worker/src/index.ts'],
+    })
     requestTechnical(fx)
 
     expect(finishTechnical(fx, {
       preCleanupObservation: dirty,
       cleanupSummary: { changedPathCount: 1, restoredPathCount: 1, removedPathCount: 0 },
     })).toMatchObject({ ok: true })
-    expect(fx.storage.approvalRequests.findById(approval)?.status).toBe('STALE')
-    expect(fx.storage.approvalRequests.findById(waiting.id)?.status).toBe('STALE')
   })
 
   it.each([
@@ -1138,13 +1135,17 @@ describe('P2-2 Automatic Technical Abort', () => {
     ['index not clean', { knownGood: { ...KNOWN_GOOD, indexClean: false } }],
     ['blind spot', { knownGood: { ...KNOWN_GOOD, blindSpotsAbsent: false } }],
     ['missing cleanup counts', { cleanupSummary: undefined }],
-  ])('%s refusal keeps ownership and does not park', (_label, override) => {
+    ['missing final observation', { observation: undefined }],
+  ])('%s refusal quarantines, retires the marker, and does not park', (_label, override) => {
     const fx = seedTechnicalAbort()
     requestTechnical(fx)
 
     expect(finishTechnical(fx, override)).toMatchObject({ ok: false })
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
     expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(2)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toMatchObject({ quarantined: true })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
     expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
       (entry) => entry.operation === 'technical_abort_refused',
     )).toBe(true)
@@ -1168,6 +1169,245 @@ describe('P2-2 Automatic Technical Abort', () => {
     expect(finishTechnical(fx)).toMatchObject({ ok: false })
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
     expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(2)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toMatchObject({ quarantined: true })
+  })
+
+  it.each(['WAITING_FOR_USER', 'APPROVED'] as const)(
+    'refuses Technical Abort while an active %s approval exists',
+    (status) => {
+      const fx = seedTechnicalAbort()
+      fx.storage.approvalRequests.create({
+        taskId: fx.taskId,
+        requestedAction: 'git_commit',
+        riskLevel: 'HIGH',
+        targetBranch: 'ai/technical',
+        targetCommit: 'c2',
+        targetDiffHash: 'd2',
+        changedFiles: [],
+        triggeredRules: [],
+        invalidIf: [],
+        status,
+        expiresAt: FUTURE,
+      } as Parameters<IStorage['approvalRequests']['create']>[0])
+      const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+      if (attention === undefined) throw new Error('attention missing')
+
+      expect(requestTechnicalAbort(fx.storage, {
+        taskId: fx.taskId,
+        attention,
+        readLedger: () => TECHNICAL_LEDGER,
+      })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+      expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
+        .toBeUndefined()
+    },
+  )
+
+  it('refuses a subject that already has a CEO escalation', () => {
+    const fx = seedTechnicalAbort()
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+    fx.storage.auditLog.record({
+      actor: 'api',
+      operation: 'pl_loop',
+      entityType: 'pl_loop_target',
+      entityId: `${attention.kind}:${attention.referenceId ?? attention.jobId ?? attention.taskId ?? attention.projectId}`,
+      result: 'escalated',
+    })
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+  })
+
+  it('requires the protected path in the Task Contract or the same violation on two Jobs', () => {
+    const uncorroborated = seedTechnicalAbort()
+    uncorroborated.storage.tasks.update(uncorroborated.taskId, {
+      allowedPaths: ['apps/api/src/pl'],
+      expectedOutputs: [],
+    })
+    const firstAttention = buildSystemState(uncorroborated.storage).attention
+      .find((item) => item.taskId === uncorroborated.taskId)
+    if (firstAttention === undefined) throw new Error('attention missing')
+    expect(requestTechnicalAbort(uncorroborated.storage, {
+      taskId: uncorroborated.taskId,
+      attention: firstAttention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+
+    const repeated = seedTechnicalAbort()
+    repeated.storage.tasks.update(repeated.taskId, {
+      allowedPaths: ['apps/api/src/pl'],
+      expectedOutputs: [],
+    })
+    const older = repeated.storage.jobs.findByTaskId(repeated.taskId)[1]
+    if (older === undefined) throw new Error('older job missing')
+    repeated.storage.jobs.update(older.id, {
+      guardResult: {
+        permissionAllowed: true,
+        fileChangeAllowed: false,
+        fileViolations: ['apps/worker/src/index.ts'],
+      },
+    })
+    requestTechnical(repeated)
+  })
+
+  it.each([
+    ['pending', 'blocked', true],
+    ['pending', 'failed', false],
+    ['pending', 'success', false],
+    ['blocked', 'blocked', false],
+    ['blocked', 'failed', true],
+    ['blocked', 'success', false],
+  ] as const)('accepts only Worker-serviced carrier shape %s + %s', (taskStatus, jobStatus, accepted) => {
+    const fx = seedTechnicalAbort()
+    fx.storage.tasks.update(fx.taskId, { status: taskStatus })
+    fx.storage.jobs.update(fx.latestJobId, { status: jobStatus })
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) {
+      expect(accepted).toBe(false)
+      return
+    }
+    const result = requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })
+    expect(result.ok).toBe(accepted)
+  })
+
+  it('refuses when another Task used the workingDir between the clean baseline and carrier', () => {
+    vi.useFakeTimers()
+    try {
+      const storage = createSQLiteStorage(':memory:')
+      const project = storage.projects.create({
+        name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      })
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'technical item', description: '', status: 'blocked',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+        roadmapTaskKey: 'technical-item', allowedPaths: ['apps/worker/src/index.ts'],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      vi.setSystemTime('2026-10-08T00:00:00.000Z')
+      storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const foreignTask = storage.tasks.create({
+        projectId: project.id, title: 'foreign', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+      } as Parameters<IStorage['tasks']['create']>[0])
+      vi.setSystemTime('2026-10-08T00:00:01.000Z')
+      storage.jobs.create({
+        taskId: foreignTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      vi.setSystemTime('2026-10-08T00:00:02.000Z')
+      const carrier = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        workspaceBaseline: {
+          mode: 'dirty',
+          startCommitHash: BASELINE.startCommitHash,
+          entries: [{
+            path: 'apps/foreign/uncommitted.ts',
+            kind: 'modified',
+            worktreeHash: 'sha256:foreign',
+          }],
+        },
+        changedFiles: ['apps/foreign/uncommitted.ts'],
+      } as Parameters<IStorage['jobs']['create']>[0])
+      storage.jobs.update(carrier.id, {
+        guardResult: {
+          permissionAllowed: true,
+          fileChangeAllowed: false,
+          fileViolations: ['apps/worker/src/index.ts'],
+        },
+      })
+      const attention = buildSystemState(storage).attention.find((item) => item.jobId === carrier.id)
+      if (attention === undefined) throw new Error('attention missing')
+
+      expect(requestTechnicalAbort(storage, {
+        taskId: task.id,
+        attention,
+        readLedger: () => TECHNICAL_LEDGER,
+      })).toMatchObject({ ok: false, code: 'OWNERSHIP_UNPROVEN' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('refuses a dirty baseline path not explained by this Task changedFiles', () => {
+    const fx = seedTechnicalAbort()
+    fx.storage.jobs.update(fx.latestJobId, {
+      workspaceBaseline: {
+        mode: 'dirty',
+        startCommitHash: BASELINE.startCommitHash,
+        entries: [{
+          path: 'apps/other-task/uncommitted.ts',
+          kind: 'modified',
+          worktreeHash: 'sha256:foreign',
+        }],
+      },
+      changedFiles: ['apps/worker/src/index.ts'],
+    })
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'OWNERSHIP_UNPROVEN' })
+  })
+
+  it('does not let updatedAt alone invalidate the technical state fingerprint', () => {
+    const fx = seedTechnicalAbort()
+    const task = fx.storage.tasks.findById(fx.taskId)
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (task === undefined || attention === undefined) throw new Error('fixture missing')
+    const jobs = fx.storage.jobs.findByTaskId(fx.taskId)
+    expect(technicalAbortStateFingerprint(
+      { ...task, updatedAt: '2026-10-08T01:00:00.000Z' },
+      jobs,
+      attention,
+    )).toBe(technicalAbortStateFingerprint(
+      { ...task, updatedAt: '2026-10-08T02:00:00.000Z' },
+      jobs,
+      attention,
+    ))
+  })
+
+  it('deduplicates refusal audit rows by Task, evidence, and refusal code', () => {
+    const fx = seedTechnicalAbort()
+    for (let index = 0; index < 3; index += 1) {
+      recordTechnicalAbortRefusal(fx.storage, {
+        taskId: fx.taskId,
+        evidenceId: 'evidence-1',
+        code: 'PRE_CLEANUP_BASELINE_MISMATCH',
+        stage: index === 0 ? 'worker_cleanup' : 'final_transaction',
+      })
+    }
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId).filter(
+      (entry) => entry.operation === 'technical_abort_refused',
+    )).toHaveLength(1)
+  })
+
+  it('retires and quarantines an already-set Technical Abort marker instead of reporting success', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'JOB_QUARANTINED' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toMatchObject({ quarantined: true })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortTechnicalEvidenceId)
+      .toBeUndefined()
   })
 
   it('manual ADMIN abort still requires APPROVED abort_task approval and consumes it', () => {

@@ -288,6 +288,53 @@ describe('Job API', () => {
     })
   })
 
+  it('retires and quarantines a refused Technical Abort cleanup marker exactly once', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { status: 'blocked', roadmapActive: true })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const job = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+        failureMetadata: {
+          abortCleanupRequestedAt: '2026-10-08T00:00:00.000Z',
+          abortTechnicalEvidenceId: 'evidence-1',
+          abortTechnicalStateFingerprint: 'fingerprint-1',
+          abortTechnicalRootCauseClass: 'protected_path',
+          abortTechnicalAttentionKind: 'job_failed',
+        },
+      } as Parameters<typeof storage.jobs.create>[0])
+
+      const first = await app.inject({
+        method: 'POST',
+        url: `/api/jobs/${job.id}/abort-cleanup-result`,
+        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED' },
+      })
+      expect(first.statusCode).toBe(409)
+      expect(storage.jobs.findById(job.id)?.failureMetadata).toMatchObject({
+        quarantined: true,
+        quarantineReason: 'technical abort cleanup refused (CLEANUP_EXECUTION_FAILED)',
+      })
+      expect(storage.jobs.findById(job.id)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+      expect(storage.jobs.findById(job.id)?.failureMetadata?.abortTechnicalEvidenceId).toBeUndefined()
+
+      const second = await app.inject({
+        method: 'POST',
+        url: `/api/jobs/${job.id}/abort-cleanup-result`,
+        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED' },
+      })
+      expect(second.statusCode).toBe(409)
+      expect(storage.auditLog.findByEntity('task', task.id).filter(
+        (entry) => entry.operation === 'technical_abort_refused',
+      )).toHaveLength(1)
+    })
+  })
+
   it('GET /api/jobs returns 400 without taskId', async () => {
     await withApp(async (app) => {
       const res = await app.inject({ method: 'GET', url: '/api/jobs' })

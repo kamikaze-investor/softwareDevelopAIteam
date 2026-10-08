@@ -371,6 +371,16 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(diagnosis.requiresSafetyBoundaryChange).toBe(false)
   })
 
+  it('4b. jobRunner.test.ts is not the protected jobRunner.ts maintenance file', () => {
+    const { storage, taskId, projectId } = seed()
+    blockedByGuard(storage, taskId, projectId, ['apps/worker/src/jobRunner.test.ts'])
+
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'job_blocked'))
+
+    expect(diagnosis.rootCauseClass).toBe('safety_or_authority_boundary')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
   it('5. 同じ protected でも Safety Boundary 中核なら CEO_ESCALATION（Maintenance へ降ろさない）', () => {
     const { storage, taskId, projectId } = seed()
     blockedByGuard(storage, taskId, projectId, ['apps/worker/src/guards/fileChangeGuard.ts'])

@@ -55,11 +55,12 @@ import {
   occupiesProject,
 } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
-import type { Job, JobWorkspaceBaseline } from '@ai-team/shared'
+import type { Job, JobWorkspaceBaseline, Task } from '@ai-team/shared'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
-import { triageBlocked } from './blockedTriage'
+import { protectedViolations, triageBlocked } from './blockedTriage'
 import { readAdoptionCandidates } from './adoptionStep'
+import { technicalRecoveryTargetKey } from './technicalResumePolicy'
 import {
   isEligibleTechnicalAbortDiagnosis,
   recordTechnicalAbortEvidence,
@@ -404,6 +405,7 @@ export function completeAbortCleanup(
         code: input.refusalCode,
         stage: 'worker_cleanup',
       })
+      retireTechnicalAbortCleanup(storage, job, input.refusalCode)
     }
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'Worker refused abort cleanup' }
   }
@@ -415,6 +417,7 @@ export function completeAbortCleanup(
         code: 'FINAL_OBSERVATION_MISSING',
         stage: 'worker_cleanup',
       })
+      retireTechnicalAbortCleanup(storage, job, 'FINAL_OBSERVATION_MISSING')
     }
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'final workspace observation is missing' }
   }
@@ -445,6 +448,7 @@ export function completeAbortCleanup(
         code: released.code,
         stage: 'final_transaction',
       })
+      retireTechnicalAbortCleanup(storage, job, released.code)
     }
     return {
       ok: false,
@@ -454,6 +458,23 @@ export function completeAbortCleanup(
   }
 
   return { ok: true, taskId: job.taskId, jobId: job.id }
+}
+
+function retireTechnicalAbortCleanup(storage: IStorage, job: Job, refusalCode: string): void {
+  const failureMetadata = { ...(job.failureMetadata ?? {}) }
+  delete failureMetadata.abortCleanupRequestedAt
+  delete failureMetadata.abortTechnicalEvidenceId
+  delete failureMetadata.abortTechnicalStateFingerprint
+  delete failureMetadata.abortTechnicalRootCauseClass
+  delete failureMetadata.abortTechnicalAttentionKind
+  delete failureMetadata.abortReason
+  storage.jobs.update(job.id, {
+    failureMetadata: {
+      ...failureMetadata,
+      quarantined: true,
+      quarantineReason: `technical abort cleanup refused (${refusalCode})`,
+    },
+  })
 }
 
 export interface TechnicalAbortRequestInput {
@@ -539,7 +560,70 @@ export function requestTechnicalAbort(
   }
   const existingEvidenceId = latestJob.failureMetadata?.abortTechnicalEvidenceId
   if (latestJob.failureMetadata?.abortCleanupRequestedAt !== undefined && existingEvidenceId !== undefined) {
-    return { ok: true, status: 'cleanup_requested', taskId: task.id, jobIds: [latestJob.id] }
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      evidenceId: existingEvidenceId,
+      code: 'CLEANUP_REQUEST_ALREADY_PRESENT',
+      stage: 'authorization',
+    })
+    retireTechnicalAbortCleanup(storage, latestJob, 'CLEANUP_REQUEST_ALREADY_PRESENT')
+    return {
+      ok: false,
+      code: 'JOB_QUARANTINED',
+      reason: 'an existing Technical Abort cleanup request was retired and quarantined',
+    }
+  }
+  if (!isWorkerServicedTechnicalAbortCarrier(task, latestJob)) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'UNSERVICEABLE_CARRIER',
+      stage: 'ownership',
+    })
+    return {
+      ok: false,
+      code: 'OWNERSHIP_UNPROVEN',
+      reason: `Worker does not service ${task.status} Task + ${latestJob.status} Job cleanup carriers`,
+    }
+  }
+  const activeApproval = storage.approvalRequests.findActiveByTaskId(task.id)
+  if (activeApproval !== undefined) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'ACTIVE_APPROVAL_PRESENT',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: `Task has an active ${activeApproval.status} approval`,
+    }
+  }
+  const targetKey = technicalRecoveryTargetKey(current)
+  const previouslyEscalated = storage.auditLog.findByEntity('pl_loop_target', targetKey)
+    .some((entry) => entry.operation === 'pl_loop' && entry.result === 'escalated')
+  if (previouslyEscalated) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'PRIOR_CEO_ESCALATION',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'the Technical Abort subject was already escalated to the CEO',
+    }
+  }
+  if (!hasProtectedPathCorroboration(task, taskJobs, latestJob)) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'PROTECTED_PATH_UNCORROBORATED',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'protected-path evidence is not corroborated by the Task Contract or a second Task Job',
+    }
   }
   const ownershipFailure = technicalOwnershipFailure(storage, task, taskJobs)
   if (ownershipFailure !== undefined) {
@@ -659,6 +743,41 @@ function technicalOwnershipFailure(
   if (!taskJobs.some((job) => job.workspaceBaseline?.mode === 'clean')) {
     return { code: 'CLEAN_BASELINE_MISSING', reason: 'Task lineage has no clean baseline at the shared HEAD' }
   }
+
+  const cleanBaselineIndex = taskJobs.findIndex((job) => job.workspaceBaseline?.mode === 'clean')
+  const cleanBaselineJob = taskJobs[cleanBaselineIndex]
+  if (cleanBaselineJob === undefined || latest === undefined) {
+    return { code: 'CLEAN_BASELINE_MISSING', reason: 'Task lineage has no clean baseline before its carrier' }
+  }
+  const historicalForeignJob = allJobs(storage).find((job) => (
+    job.taskId !== task.id
+    && job.safeCommand?.workingDir === workingDir
+    && job.createdAt >= cleanBaselineJob.createdAt
+    && job.createdAt <= latest.createdAt
+  ))
+  if (historicalForeignJob !== undefined) {
+    return {
+      code: 'FOREIGN_JOB_IN_OWNERSHIP_WINDOW',
+      reason: `another Task used ${workingDir} between this Task's clean baseline and cleanup carrier`,
+    }
+  }
+  if (latest.workspaceBaseline?.mode === 'dirty') {
+    const taskChangedPaths = new Set(
+      taskJobs.slice(0, cleanBaselineIndex + 1)
+        .flatMap((job) => job.changedFiles ?? [])
+        .map(normalizeProofPath),
+    )
+    const unexplainedPath = latest.workspaceBaseline.entries
+      .flatMap((entry) => [entry.path, ...(entry.oldPath === undefined ? [] : [entry.oldPath])])
+      .map(normalizeProofPath)
+      .find((entryPath) => !taskChangedPaths.has(entryPath))
+    if (unexplainedPath !== undefined) {
+      return {
+        code: 'DIRTY_PATH_NOT_TASK_OWNED',
+        reason: 'dirty baseline contains a path absent from this Task lineage changedFiles',
+      }
+    }
+  }
   if (taskJobs.some((job) => isLiveJob(job))) {
     return { code: 'LIVE_JOB_PRESENT', reason: 'Task still has a queued or running Job' }
   }
@@ -685,4 +804,35 @@ function technicalOwnershipFailure(
     }
   }
   return undefined
+}
+
+function isWorkerServicedTechnicalAbortCarrier(task: Task, carrier: Job): boolean {
+  return task.status === 'pending'
+    ? carrier.status === 'blocked'
+    : task.status === 'blocked'
+      && (carrier.status === 'failed' || carrier.status === 'success')
+}
+
+function hasProtectedPathCorroboration(task: Task, taskJobs: readonly Job[], carrier: Job): boolean {
+  const carrierViolations = protectedViolations(carrier.guardResult?.fileViolations).map(normalizeProofPath)
+  if (carrierViolations.length === 0) return false
+  const contractPaths = new Set(
+    [...(task.allowedPaths ?? []), ...(task.expectedOutputs ?? [])].map(normalizeProofPath),
+  )
+  if (carrierViolations.some((violation) => contractPaths.has(violation))) return true
+  return carrierViolations.some((violation) => taskJobs.filter((job) => (
+    protectedViolations(job.guardResult?.fileViolations)
+      .map(normalizeProofPath)
+      .includes(violation)
+  )).length >= 2)
+}
+
+function allJobs(storage: IStorage): Job[] {
+  return storage.projects.findAll().flatMap((project) => (
+    storage.tasks.findByProjectId(project.id).flatMap((task) => storage.jobs.findByTaskId(task.id))
+  ))
+}
+
+function normalizeProofPath(value: string): string {
+  return value.replaceAll('\\', '/').replace(/^\.\//, '')
 }

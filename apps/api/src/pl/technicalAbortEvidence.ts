@@ -92,9 +92,20 @@ export function technicalAbortStateFingerprint(
     task: {
       id: task.id,
       projectId: task.projectId,
+      title: task.title,
+      description: task.description,
       status: task.status,
+      assignee: task.assignee,
+      provider: task.provider,
+      dependencies: task.dependencies,
+      branchName: task.branchName,
+      allowedPaths: task.allowedPaths,
+      forbiddenPaths: task.forbiddenPaths,
+      acceptanceCriteria: task.acceptanceCriteria,
+      expectedOutputs: task.expectedOutputs,
+      roadmapTaskKey: task.roadmapTaskKey,
+      phase: task.phase,
       roadmapActive: task.roadmapActive,
-      updatedAt: task.updatedAt,
     },
     attention: {
       kind: attention.kind,
@@ -105,9 +116,11 @@ export function technicalAbortStateFingerprint(
     jobs: taskJobs.map((job) => ({
       id: job.id,
       status: job.status,
-      createdAt: job.createdAt,
       workingDir: job.safeCommand?.workingDir,
       baseline: job.workspaceBaseline,
+      changedFiles: job.changedFiles,
+      commitHash: job.commitHash,
+      workflowStepKey: job.workflowStepKey,
       quarantined: job.failureMetadata?.quarantined === true,
       guardResult: job.guardResult,
     })),
@@ -165,6 +178,14 @@ export function recordTechnicalAbortRefusal(
   storage: IStorage,
   input: { taskId: string; code: string; stage: string; evidenceId?: string },
 ): void {
+  const duplicate = storage.auditLog.findByEntity('task', input.taskId).some((entry) => {
+    if (entry.operation !== TECHNICAL_ABORT_REFUSAL_OPERATION || entry.result !== 'refused') return false
+    const detail = parseJsonRecord(entry.detail)
+    return detail?.code === input.code
+      && detail.evidenceId === input.evidenceId
+  })
+  if (duplicate) return
+
   storage.auditLog.record({
     actor: 'api',
     operation: TECHNICAL_ABORT_REFUSAL_OPERATION,

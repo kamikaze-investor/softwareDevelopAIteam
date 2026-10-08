@@ -206,14 +206,17 @@ describe('abort cleanup observation reporting', () => {
     },
   )
 
-  it('ignores the marked terminal Job after the Task becomes pending', async () => {
-    arrangeAbortCleanup('pending', 'failed')
+  it.each(['failed', 'success'] as const)(
+    'ignores a marked terminal %s Job after the Task becomes pending',
+    async (jobStatus) => {
+      arrangeAbortCleanup('pending', jobStatus)
 
-    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+      await expect(reportAbortCleanupObservations()).resolves.toBe(false)
 
-    expect(workspaceVerificationMocks.observeWorkspace).not.toHaveBeenCalled()
-    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(false)
-  })
+      expect(workspaceVerificationMocks.observeWorkspace).not.toHaveBeenCalled()
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(false)
+    },
+  )
 
   it('keeps the existing pending Task + blocked Job reporting behavior', async () => {
     arrangeAbortCleanup('pending', 'blocked')
@@ -221,6 +224,15 @@ describe('abort cleanup observation reporting', () => {
     await expect(reportAbortCleanupObservations()).resolves.toBe(true)
 
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(true)
+  })
+
+  it('ignores a marked blocked Job while the Task itself is blocked', async () => {
+    arrangeAbortCleanup('blocked', 'blocked')
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(workspaceVerificationMocks.observeWorkspace).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(false)
   })
 
   it('does not report an old marked terminal Job after a newer Job exists', async () => {

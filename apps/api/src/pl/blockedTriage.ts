@@ -220,7 +220,7 @@ export function protectedViolations(fileViolations: readonly string[] | undefine
  * Safety Policy・Gate・Approval・permission・認証・secret は**1つも含まない**。
  */
 const MAINTENANCE_ELIGIBLE_PROTECTED: readonly RegExp[] = Object.freeze([
-  /jobRunner/i,
+  /^apps\/worker\/src\/jobRunner\.ts$/i,
   /^apps\/worker\/src\/index\.ts$/i,
   /^apps\/worker\/src\/aiCli\/adapter\.ts$/i,
   /metaReviewer\/geminiClient/i,
@@ -241,10 +241,8 @@ const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
 /**
  * Maintenance Lane で扱ってよい protected file か。
  *
- * **secret は何があっても対象外にする。** allowlist の pattern は `/jobRunner/i` のように
- * 語単位で、パス全体を固定していない。そのため `apps/worker/src/jobRunner.key` のような
- * 名前は「maintenance 対象」と「secret」の両方に一致しうる —— secret を先に落とさないと、
- * **秘密ファイルが Maintenance Lane へ流れる**（独立レビュー指摘 2026-09-18）。
+ * **secret は何があっても対象外にする。** allowlist は protected file の正確な repository path
+ * だけを受け付ける。secret 判定も先に行い、Maintenance Lane へ降ろさない。
  */
 function isMaintenanceEligible(file: string): boolean {
   if (isSecret(file)) return false

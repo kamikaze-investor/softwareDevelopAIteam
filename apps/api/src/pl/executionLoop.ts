@@ -1668,24 +1668,26 @@ async function handleTarget(
       ...(deps.readLedger !== undefined ? { readLedger: deps.readLedger } : {}),
     })
     if (abort.ok) {
+      const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
       return {
-        status: 'acted',
+        status: handled.status,
         target,
         triage,
         proposedKind: 'abort_task',
         executionSummary: abort.status === 'cleanup_requested'
           ? `technical abort cleanup requested for ${abort.jobIds.length} job(s)`
           : 'technical abort parked task',
-        reason: 'server-verified protected_path evidence authorized Technical Abort without CEO approval',
+        reason: `${handled.reason}; server-verified protected_path evidence requested Technical Abort cleanup`,
         attempt: 1,
       }
     }
+    const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
     return {
-      status: 'idle',
+      status: handled.status,
       target,
       triage,
       proposedKind: 'abort_task',
-      reason: `Technical Abort refused fail-closed: ${abort.reason}`,
+      reason: `${handled.reason}; Technical Abort refused fail-closed: ${abort.reason}`,
       attempt: 1,
     }
   }
