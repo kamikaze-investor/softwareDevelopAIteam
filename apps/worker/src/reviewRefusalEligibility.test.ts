@@ -186,6 +186,53 @@ describe('review refusal repair eligibility', () => {
     })
   })
 
+  it('rejects a credential-like assignment whose value straddles the preview cut', () => {
+    const diffText = newFileDiff('enabled=true')
+    const aiCliHeader = '=== AI CLI (codex/implement) ==='
+    const visibleAssignment = 'secret: AB'
+    const padding = 'x'.repeat(
+      PREVIEW_LENGTH - aiCliHeader.length - 1 - visibleAssignment.length,
+    )
+    const fullStdout = `${aiCliHeader}\n${padding}${visibleAssignment}CDEFGHIJKLMNOPQRSTUVWXYZ0123456789`
+    const job = implementJob('safe summary')
+    job.stdout = buildLogPreviews(fullStdout, '').stdoutPreview
+
+    expect(job.stdout.slice(0, PREVIEW_LENGTH)).toContain(visibleAssignment)
+    expect(job.stdout.slice(0, PREVIEW_LENGTH)).not.toContain(`${visibleAssignment}C`)
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPromptWithReport(diffText, job),
+      implementationDiff: diffText,
+      ...reportOwnership(job),
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
+  })
+
+  it('rejects an assignment whose decoded match ends exactly at the preview cut', () => {
+    const diffText = newFileDiff('enabled=true')
+    const aiCliHeader = '=== AI CLI (codex/implement) ==='
+    const assignment = 'secret: string'
+    const padding = 'x'.repeat(PREVIEW_LENGTH - aiCliHeader.length - 1 - assignment.length)
+    const fullStdout = `${aiCliHeader}\n${padding}${assignment}\ncontinued`
+    const job = implementJob('safe summary')
+    job.stdout = buildLogPreviews(fullStdout, '').stdoutPreview
+
+    expect(job.stdout.slice(0, PREVIEW_LENGTH).endsWith(assignment)).toBe(true)
+
+    const result = classifyPromptRefusal({
+      mode: 'review',
+      prompt: reviewPromptWithReport(diffText, job),
+      implementationDiff: diffText,
+      ...reportOwnership(job),
+    })
+
+    expect(result.repairEligible).toBe(false)
+    expect(result.repairEligibilityReason).toBe('match_not_owned_by_implementation')
+  })
+
   it('rejects a non-truncated AI CLI preview without a SafeCommand header', () => {
     const diffText = newFileDiff('enabled=true')
     const job = implementJob('safe summary')

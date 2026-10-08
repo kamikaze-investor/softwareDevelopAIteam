@@ -5,7 +5,7 @@ import type {
   SecretScanPatternKind,
 } from '@ai-team/shared'
 import { CONTEXT_SECRET_PATTERNS } from '@ai-team/shared'
-import { isTruncatedLogPreview } from './jobLogger.js'
+import { isTruncatedLogPreview, PREVIEW_LENGTH } from './jobLogger.js'
 
 export const SECRET_SCAN_PATTERN_KINDS: readonly SecretScanPatternKind[] = [
   'ANTHROPIC_API_KEY assignment',
@@ -178,8 +178,8 @@ function implementReportAiCliRange(
   const safeCommandHeaderPattern = /^=== SafeCommand \([^\r\n]*\) ===\r?$/gm
   safeCommandHeaderPattern.lastIndex = aiCliStart + aiCliHeaderMatch[0].length
   const safeCommandHeader = safeCommandHeaderPattern.exec(stdout)
-  const aiCliEnd = safeCommandHeader?.index
-    ?? (isTruncatedLogPreview(stdout) ? stdout.length : undefined)
+  const previewCut = isTruncatedLogPreview(stdout) ? PREVIEW_LENGTH : undefined
+  const aiCliEnd = safeCommandHeader?.index ?? previewCut
   if (aiCliEnd === undefined) return undefined
 
   const report = buildImplementJobReport(implementJob)
@@ -205,11 +205,13 @@ function implementReportAiCliRange(
     },
     // Re-scan the decoded AI section so an escaped JSON newline cannot make `\S+`
     // consume the following SafeCommand header or output.
-    matches: scanMatches(ownedStdout).map((match) => ({
-      ...match,
-      start: promptOffset(aiCliStart + match.start),
-      end: promptOffset(aiCliStart + match.end),
-    })),
+    matches: scanMatches(ownedStdout)
+      .filter((match) => previewCut === undefined || aiCliStart + match.end < previewCut)
+      .map((match) => ({
+        ...match,
+        start: promptOffset(aiCliStart + match.start),
+        end: promptOffset(aiCliStart + match.end),
+      })),
   }
 }
 
