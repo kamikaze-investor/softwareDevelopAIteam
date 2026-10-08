@@ -26,6 +26,7 @@ export type PrincipleSlug =
   | 'existing-code-grandfather'
   | 'observation-closes-loop'
   | 'unknown-driven-staging'
+  | 'canonical-domain-meaning'
 
 /** core = signal によらず毎回適用される。contextual = signal から選ばれたときだけ適用される。 */
 export type PrincipleTier = 'core' | 'contextual'
@@ -85,16 +86,24 @@ const ALL_PRINCIPLE_SLUGS: readonly PrincipleSlug[] = [
   'existing-code-grandfather',
   'observation-closes-loop',
   'unknown-driven-staging',
+  'canonical-domain-meaning',
 ] as const
 
 const SLUG_SET = new Set<string>(ALL_PRINCIPLE_SLUGS)
 
+// canonical-domain-meaning は「ある domain fact を誰が所有し、誰が解釈しているか」を問う原則なので、
+// その判断が起きる focus（責務境界・状態遷移・recovery・authority）でだけ選ぶ。
+// 新しい focus は作らず、Risk Level へも足さない（Design Review は focus だけで原則を選ぶ）。
 const FOCUS_PRINCIPLE_SLUGS: Partial<Record<MetaReviewFocus, readonly PrincipleSlug[]>> = {
   safety_recovery: [
     'stable-contract-first',
     'deterministic-vs-heuristic',
     'honest-unverifiable',
     'boundary-strictness',
+    'canonical-domain-meaning',
+  ],
+  auth_permission: [
+    'canonical-domain-meaning',
   ],
   operations: [
     'stable-contract-first',
@@ -105,10 +114,12 @@ const FOCUS_PRINCIPLE_SLUGS: Partial<Record<MetaReviewFocus, readonly PrincipleS
   data_state_integrity: [
     'honest-unverifiable',
     'boundary-strictness',
+    'canonical-domain-meaning',
   ],
   architecture_responsibility: [
     'stable-contract-first',
     'scale-to-risk',
+    'canonical-domain-meaning',
   ],
   // Roadmap review always runs scope_simplicity, so milestone / task-decomposition staging is
   // judged there without adding a focus or a review path.

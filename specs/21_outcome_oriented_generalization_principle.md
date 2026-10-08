@@ -171,6 +171,32 @@ model / implementation that will be thrown away; is its output reused by the Tar
 would direct-to-target plus scale-down diagnosis on failure cost less in total; is its iteration tax
 justified.
 
+<!-- principle-id: canonical-domain-meaning -->
+<!-- principle-oneliner: Decide domain facts through their canonical owner; never re-infer them from incidental representation (string shape, prefix, ID format, ordering, timestamps, message text). -->
+<!-- principle-category: coupling -->
+<!-- principle-scope: universal -->
+<!-- principle-tier: contextual -->
+<!-- principle-tags: semantics, ssot, contract, lifecycle, authority, fail-closed, testing -->
+■ Canonical Domain Meaning. Each domain fact (authority, safety, lifecycle state, completion,
+current / superseded, lineage, entity relation, candidate selection, error meaning) has one canonical
+owner: the spec, policy, type or function already responsible for it. Consumers ask that owner instead
+of each re-deriving the fact from string shape, prefix / suffix, ID format, naming, ordering or
+"latest", timestamps, human-readable message text or fixture shape. Use the owner where it naturally
+lives; this principle alone never justifies a new resolver, abstraction, Gate, status or workflow.
+Distinguish contractual representation (persisted schema, external API, event format, stable
+identifier) from incidental representation; changing a contractual one requires a migration /
+compatibility strategy. When it is unclear which one a persisted or externally observable
+representation is, review it as contractual until it is shown to be incidental. Do not stand in
+ordering or timestamps for an explicit relation (current, superseded, parent) unless chronology is
+itself the domain rule. Program logic depends on typed state, typed errors or codes, never on
+human-readable messages.
+Unknown or ambiguous meaning fails closed (do not authorize, transition, complete, supersede or
+select) and is surfaced through an existing observable path (typed error, review finding, Attention,
+escalation); fail-closed never means silent fallback, silent stall, invisible hang or retry loop.
+Test semantic boundaries both ways: same meaning in different representations gives the same result,
+and similar representation with different meaning gives a different result. Report a violation as
+`implementation_coupling` (sub-kind `semantic_reinference`); it is not a separate review.
+
 <!-- principle-id: home-and-criteria -->
 This file is the authoritative home for the Outcome-Oriented Generalization Principle. Completion
 criteria are satisfied when prompts and reviews select compact principle guidance by stable marker ID

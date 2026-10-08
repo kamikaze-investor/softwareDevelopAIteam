@@ -502,6 +502,82 @@ describe('runStrategicMetaReview', () => {
     expect(prompt).not.toContain('## Git Diff or Design Text\n\n```diff\nDesign:')
   })
 
+  it('adds the Semantic Integrity checklist to a focus whose principles select canonical-domain-meaning', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
+
+    await runStrategicMetaReview(highStorageInput())
+
+    const prompts = mockReviewWithProviderFallback.mock.calls.map(([prompt]) => prompt)
+    const dataPrompt = prompts.find((prompt) => prompt.includes('Focus only on data_state_integrity'))
+    const strategicPrompt = prompts.find((prompt) => prompt.includes('Focus only on strategic_alignment'))
+
+    // 選択は原則 routing（focus → 原則）が決め、checklist はその原則の guidance として載る。
+    expect(dataPrompt).toContain('- canonical-domain-meaning: Decide domain facts through their canonical owner')
+    expect(dataPrompt).toContain('## docs/meta_reviewer/checklists/semantic_integrity.md')
+    expect(dataPrompt).toContain('[semantic_reinference]')
+    // focus 自身の checklist は従来どおり残る。
+    expect(dataPrompt).toContain('## docs/meta_reviewer/checklists/storage.md')
+    // 原則を選ばない focus には載せない。
+    expect(strategicPrompt).not.toContain('semantic_integrity.md')
+  })
+
+  it('names a missing principle checklist in the prompt instead of silently dropping it, without failing the focus', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: true,
+      controlHasChecklists: true,
+    })
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
+
+    try {
+      const result = await runStrategicMetaReview({
+        ...highStorageInput(),
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      const dataPrompt = mockReviewWithProviderFallback.mock.calls
+        .map(([prompt]) => prompt)
+        .find((prompt) => prompt.includes('Focus only on data_state_integrity'))
+      expect(dataPrompt).toContain('## docs/meta_reviewer/checklists/semantic_integrity.md\n\n(unavailable: file not found.')
+      expect(dataPrompt).toContain('# Storage checklist')
+      expect(result.finalDecision).toBe('ALIGNED')
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let a principle checklist stand in for a missing focus checklist', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: true,
+      controlHasChecklists: false,
+    })
+    await writeDeep(controlRoot, 'docs/meta_reviewer/checklists/semantic_integrity.md', '# Semantic Integrity checklist')
+
+    try {
+      const result = await runStrategicMetaReview({
+        ...highStorageInput(),
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      const focusResult = result.focusedReviewResults.find((f) => f.focus === 'data_state_integrity')
+      expect(focusResult?.summary).toContain('Checklist context is missing')
+      expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+
   it('fails closed without calling Gemini when non-strategic checklist context is missing', async () => {
     const tempRoot = await mkdtemp(join(tmpdir(), 'strategic-review-empty-'))
     const emptyControlRoot = await mkdtemp(join(tmpdir(), 'strategic-review-empty-control-'))

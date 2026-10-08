@@ -30,6 +30,7 @@ import type {
 import {
   buildEngineeringPrincipleReviewGuidance,
   loadEngineeringPrinciples,
+  selectPrinciples,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
 import {
   buildConstitutionPrinciplesPrompt,
@@ -41,7 +42,8 @@ import {
   loadConstitutionPrinciples,
   loadDecisionAuthorityPrinciples,
 } from '@ai-team/shared/src/constitutionPrinciples.js'
-import { hasDecisionAuthorityReviewFocus } from '../approvalLevel/focusSelector.js'
+import { hasDecisionAuthorityReviewFocus, mapFileToFocuses } from '../approvalLevel/focusSelector.js'
+import { principleChecklistFiles } from './principleChecklists.js'
 
 export const MAX_PR_BODY_CHARS = 8_000
 const META_REVIEW_ENGINEERING_PRINCIPLE_IDS = [
@@ -106,6 +108,22 @@ function getFileChecklists(changedFiles: string[], checklistsDir: string): strin
   }
   if (changedFiles.some(f => f.startsWith('.github/workflows/') || f === '.github/CODEOWNERS')) {
     add('workflows.md')
+  }
+
+  // 原則が持つ checklist は、Design Review と同じ原則 routing（focus → 原則）で選ぶ。
+  // ここで path から別に選ぶと routing が二重正本になる。
+  const principleSelection = selectPrinciples(
+    { predictedFocuses: changedFiles.flatMap(mapFileToFocuses) },
+    loadEngineeringPrinciples(),
+  )
+  // 選ばれた原則の checklist は add() のように黙って省かない。欠けていれば Design Review
+  // （strategicReview.ts の buildChecklistContext）と同じく、prompt 上で欠落を明示する。
+  for (const checklistFile of principleChecklistFiles(principleSelection)) {
+    try {
+      results.push(readFileSync(path.join(checklistsDir, checklistFile), 'utf-8'))
+    } catch {
+      results.push(`## docs/meta_reviewer/checklists/${checklistFile}\n\n(unavailable: file not found. Apply only the principle one-liner; do not treat this checklist as applied.)`)
+    }
   }
 
   return results
