@@ -34,7 +34,14 @@ export const RISK_RULES: RiskRule[] = [
   // Codex P1: docker-compose.yml / sandbox/config.yml も対象に拡張
   { label: 'docker / sandbox config',    pattern: /sandbox\/docker|Dockerfile|docker-compose|sandbox\//i, level: 'HIGH' },
   { label: 'CI/CD workflow change',      pattern: /\.github\//i,                              level: 'HIGH' },
-  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor/i, level: 'HIGH' },
+  // 2026-10-02: git_commit の Safety Evidence 判定（Stage 1）と PL の authority 判定の実装も同じ扱い。
+  // ここを LOW / MEDIUM に落とすと、Gate 自身を弱める変更を Evidence だけで commit できてしまう。
+  // git_commit Evidence が判定に使う lineage / Design Review / Candidate workspace の実装
+  // （repairFlow・repairPolicy・designReviewEvidencePolicy・targetWorkingDir）も含める（独立レビュー A-1）。
+  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir/i, level: 'HIGH' },
+  // 2026-10-02: Decision Authority / Safety policy の正本 docs。docs/ 配下は SAFE_ONLY で LOW に
+  // 落ちるため、下の SAFE_ONLY 早期リターンより先に評価する（NEVER_SAFE_ONLY_RULES）。
+  { label: 'decision authority / safety policy doc', pattern: /(^|\/)specs\/(00_constitution|08_permissions|22_safety_approval_design_principle)\.md$|(^|\/)docs\/project_memory\/(goal|design_philosophy)\.md$|(^|\/)docs\/project_memory\/rules\/approval_rules\.md$|(^|\/)docs\/multi_ai_step_review_flow\.md$/i, level: 'HIGH' },
   // Codex P1: AI 指示ファイル（AGENTS.md / CLAUDE.md）は CRITICAL
   { label: 'AI instruction file',        pattern: /AGENTS\.md$|CLAUDE\.md$/i,                 level: 'CRITICAL' },
 ]
@@ -52,18 +59,22 @@ export const SAFE_ONLY_PATTERNS: RegExp[] = [
 // Codex P1 review: docs/AGENTS.md など safe-only パス配下でも CRITICAL にするために先行チェック
 export const ALWAYS_CRITICAL_RULES: RiskRule[] = RISK_RULES.filter(r => r.level === 'CRITICAL')
 
+/** safe-only 早期リターンで素通りさせないルール（CRITICAL と、docs/ 配下にある Safety policy の正本 docs）。 */
+const NEVER_SAFE_ONLY_RULES: RiskRule[] = RISK_RULES.filter(r =>
+  r.level === 'CRITICAL' || r.label === 'decision authority / safety policy doc')
+
 /**
  * changedFiles からリスクレベルを算出する（純粋関数）
  */
 export function runRiskReview(changedFiles: string[]): RiskReviewResult {
   // CRITICAL ルールを先に評価して safe-only 早期リターンを防ぐ（bypass ガード）
   // Codex P3: ここでは早期リターンせず「CRITICAL ファイルが含まれるか」だけ判定する
-  const hasCriticalFile = changedFiles.some(f =>
-    ALWAYS_CRITICAL_RULES.some(r => r.pattern.test(f))
+  const hasNeverSafeOnlyFile = changedFiles.some(f =>
+    NEVER_SAFE_ONLY_RULES.some(r => r.pattern.test(f))
   )
 
   // CRITICAL ファイルがなければ safe-only 早期リターンを許可
-  if (!hasCriticalFile) {
+  if (!hasNeverSafeOnlyFile) {
     const allSafe = changedFiles.length > 0 &&
       changedFiles.every(f => SAFE_ONLY_PATTERNS.some(p => p.test(f)))
     if (allSafe) {
