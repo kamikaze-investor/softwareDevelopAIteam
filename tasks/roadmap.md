@@ -4444,6 +4444,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    これはMVP必須ではなく非ブロッキング（スマホ操作サイクルは現状の併存実装で完結するため、
    **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    項目4の後またはMVP後に実施してよい）
+   **2026-09-28 CEO 判断: 2 種の承認を別画面で「併存」させる前提は `mobile-ceo-action-inbox` で上書きされた。**
+   本項目の文書化は Inbox の設計が確定してから、その形に合わせて行う（併存を前提に書かない）。
 <!-- roadmap:id=mobile-task-job-detail-ui state=done -->
 2. [x] Task/Job一覧・詳細画面（Mobile） — 完了。Task一覧（`tasks.tsx`）・Task詳細（`tasks/[id].tsx`、
    Task情報・Job履歴・承認履歴を表示）を実装（コミット`0b91eac`, `a76a790`）
@@ -11812,6 +11814,70 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **`already_started`** を返す —— escalate せずに。既存 `design_review_failed` attention には
       出るので Lost Completion ではないが、「予算切れで終わった」ことが repair 側の戻り値からは
       「既に始まっている」に見える。ここへ混ぜず、別項目として起票するかを別途判断する。
+
+<!-- roadmap:id=mobile-dashboard-badge-counts-done-task-blocked-job state=planned -->
+10. [ ] **Mobile Dashboard の Project バッジが、完了済み Task に残った blocked Job で「停止中」を出し続ける** —
+      2026-09-28 登録（CEO 指示: AIteamOS 自身に拾わせる）。Class A（Mobile 表示のみ）。
+
+      **事実（Production 実測・2026-09-28）**: Dashboard の AIteamOS Project カードが「停止中」を
+      表示していたが、実際には Task `9fdee5a3` の最新 Job は `running` だった。バッジを「停止中」に
+      しているのは **done 済みの Task 2 件**（`7bd4a65a` / `76ea5ff3`）で、どちらも最新 Job が
+      `blocked` のまま残っている。AIteamOS の 11 Task はすべて `/api/tasks/summary` の既定 limit（50）
+      の内側にあり、判定に入っている。
+
+      **原因**: `apps/mobile/lib/taskWorkflow.ts` の `deriveSummaryDisplayState()` は Task の状態を
+      見ずに最新 Job だけで判定し、`deriveProjectSummaryState()` は Project 配下の全 Task を
+      `quarantined > running_stalled > approval_waiting > blocked > running_healthy` の優先順位で
+      1 つに畳む。API 側の attention（`apps/api/src/state/systemState.ts`）は
+      **done な Task の blocked Job を明示的に除外している**（そのコメントが挙げる 2026-09-15 の実例が
+      まさに `76ea5ff3` である）。Mobile には同じ除外が無い。
+
+      **影響**: この 2 件が残る限り、AIteamOS カードは実行中でも完了後でも**恒久的に「停止中」**になる。
+      2026-09-28 に CEO が実際に「止まっている」と誤認した。
+
+      **直し方の方向（実装時に確定する）**: Mobile が「対応が必要か」を独自に再導出するのをやめ、
+      API の attention と同じ判定（done / park / archived / 期限切れ approval を除外）に揃える。
+      最小なら `deriveSummaryDisplayState()` で done（と park 済み）の Task を除外する。
+      **`mobile-ceo-action-inbox` と判定の正本を共有すること** —— 同じ「要対応」を 2 通りに定義しない。
+
+      **Acceptance Criteria 案**: done Task の blocked Job だけでは Project バッジが「停止中」にならない /
+      実行中の Task があれば「実行中」を出す / 本当に止まっている Task（未完了・非 park の blocked）は
+      従来どおり「停止中」/ quarantine・stalled・承認待ちの優先表示を壊さない。
+      **allowedPaths 案**: `apps/mobile/lib/taskWorkflow.ts` とその test。
+      **release**: Mobile は OTA が無い（EAS preview APK）。build と配布は CEO 側の操作である。
+
+<!-- roadmap:id=mobile-ceo-action-inbox state=planned priority=high -->
+11. [ ] **人間の対応が必要なものを 1 画面に集約する（CEO Action Inbox）** — 2026-09-28 登録（CEO 要望）。
+
+      **CEO 要望（要旨）**: blocked で手動再開が必要な Task と、承認が必要なものが別々の画面に
+      分かれていて使いにくい。人間が対応すべきものだけのリスト画面が欲しい。対応が終わったものは
+      そこから消え、対応が必要なものがあれば一目で分かるようにしたい。
+
+      **現状**: 承認は `approvals.tsx`（Project 単位 `/api/approvals/pending` と Task/Job 単位
+      `/api/approval-requests/waiting` の併存）、停止中の Task は `tasks.tsx`（作業状況）に分かれ、
+      PL の CEO Escalation は Mobile に出ない。CEO は複数画面を巡回しないと「今やることがあるか」が
+      分からない。
+
+      **この要望は `mobile-approval-role-docs` の前提（2 種の承認を「統合せず併存」させる）を
+      上書きする**（CEO 判断・2026-09-28）。
+
+      **設計の制約（新しい仕組みを作らない）**:
+      - **「要対応」は既存の durable state から導出する。** 新しい status・table・dismiss フラグは
+        作らない。「対応が終わったら消える」は、元の状態が解消したら導出結果から外れることで満たす
+        （承認が決着した / 期限が切れた、Task が resume された、blocked が解消した、等）。
+      - 判定の正本は API の attention（`systemState.ts`）と承認一覧である。**Mobile で再実装しない。**
+        done / park / archived / 期限切れの除外は API 側に既にある（D7 等）。
+        `mobile-dashboard-badge-counts-done-task-blocked-job` と同じ判定を使う。
+      - 各行に「何をすればよいか」と、その操作への導線（resume / 承認・却下 / recover）を出す。
+      - Dashboard に件数付きの入口を置き、0 件なら「対応不要」と一目で分かるようにする。
+      - PL の CEO Escalation（`pl_loop` の escalated）を対象に含めるかは実装前設計で決める
+        （`pl-escalation-recorded-without-delivery` / `mobile-push-ceo-escalation` と重複しない範囲で）。
+
+      **関連（重複実装しない）**: `mobile-push-ceo-escalation`（通知チャネル。本画面はその deep link 先に
+      なる）/ `operator-chat-mobile`（対話窓口。本項目は一覧と導線だけを持つ）。
+      **Class**: Mobile UI と、必要なら既存 attention を返す read-only の read-model。Safety Boundary と
+      Authority は変えない。
+      **release**: Mobile は OTA が無い（EAS preview APK）。build と配布は CEO 側の操作である。
 
 ---
 
