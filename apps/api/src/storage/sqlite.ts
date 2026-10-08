@@ -33,7 +33,7 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
-import { parseResumeSource, resolveReviewedImplementationFrom } from '../designReview/repairPolicy'
+import { parseResumeSource, resolveReviewedImplementationFrom, retryStepKeyFor } from '../designReview/repairPolicy'
 import { technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
 import type {
   AbortAuthorization,
@@ -2022,7 +2022,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (!job) {
             return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
           }
-          const retryJob = findJobByWorkflowStepKey(db, `retry:${job.id}:1`)
+          const retryJob = findJobByWorkflowStepKey(db, retryStepKeyFor(job.id))
           return {
             ok: true,
             job,
@@ -2071,7 +2071,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return finishWithoutRetry()
         }
 
-        const retryWorkflowStepKey = `retry:${source.id}:1`
+        const retryWorkflowStepKey = retryStepKeyFor(source.id)
         const existingRetry = findJobByWorkflowStepKey(db, retryWorkflowStepKey)
         if (existingRetry) {
           recordOutboxEvent(db, source.id, input.outboxEvent)
