@@ -86,6 +86,96 @@ async function blockedAfterFailedReview(opts: { firstReviewTerminal?: boolean } 
   return { taskId: task.id, projectId: project.id, b0, i1, r0 }
 }
 
+/** 517d0af7-like shape: Human-resumed refusal started repair:root:1, whose review now requests changes. */
+async function blockedAfterEligibleRefusalRepair() {
+  const s = await storage()
+  const project = s.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+  const task = s.tasks.create({
+    projectId: project.id, title: 'Refusal recovery', description: 'd', status: 'blocked',
+    assignee: 'developer_ai', dependencies: [], allowedPaths: [DOC], roadmapActive: true,
+  } as never)
+  const base = {
+    taskId: task.id, projectId: project.id, status: 'queued',
+    safeCommand: { kind: 'git_status', workingDir: '/workspace/target' }, aiCliProvider: 'claude_code', aiCliPrompt: 'p',
+  }
+  const root = s.jobs.create({
+    ...base,
+    agentRole: 'developer_ai',
+    aiCliMode: 'implement',
+    workflowStepKey: `task:${task.id}:initial-implement`,
+  } as never)
+  s.jobs.update(root.id, { status: 'success', exitCode: 0, changedFiles: [DOC] } as never)
+
+  const originalReview = s.jobs.create({
+    ...base,
+    agentRole: 'qa_ai',
+    aiCliMode: 'review',
+    workflowStepKey: `implement:${root.id}:review`,
+  } as never)
+  s.jobs.update(originalReview.id, { status: 'failed', exitCode: 1 } as never)
+  const resumedReview = s.jobs.create({
+    ...base,
+    agentRole: 'qa_ai',
+    aiCliMode: 'review',
+    workflowStepKey: `resume:${originalReview.id}:1`,
+  } as never)
+  recordResumeActor(s, {
+    jobId: resumedReview.id,
+    taskId: task.id,
+    actorClass: 'human',
+    evidence: 'admin_credential',
+  })
+  s.jobs.update(resumedReview.id, {
+    status: 'failed',
+    exitCode: 1,
+    failureMetadata: {
+      workspaceState: 'unchanged',
+      refusal: {
+        kind: 'secret_scan',
+        patternKinds: ['secret assignment'],
+        repairEligible: true,
+        repairEligibilityReason: 'implementation_report_generic_assignment',
+      },
+    },
+  } as never)
+
+  await tick()
+  const designText = 'refusal repair admission'
+  const admissionRun = s.designReviewRuns.create({
+    taskId: task.id,
+    taskTitle: task.title,
+    designText,
+    designTextHash: createHash('sha256').update(designText).digest('hex'),
+    changedFiles: [DOC],
+    repairSourceJobId: root.id,
+  })
+  const claimed = s.designReviewRuns.claim(admissionRun.id, 3)
+  expect(claimed.claimToken).toBeDefined()
+  await tick()
+  expect(s.designReviewRuns.complete(admissionRun.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  }))).toBe(true)
+  await tick()
+
+  const repair = s.jobs.create({
+    ...base,
+    agentRole: 'developer_ai',
+    aiCliMode: 'implement',
+    workflowStepKey: `repair:${root.id}:1`,
+  } as never)
+  s.jobs.update(repair.id, { status: 'success', exitCode: 0, changedFiles: [DOC] } as never)
+  await tick()
+  const repairReview = s.jobs.create({
+    ...base,
+    agentRole: 'qa_ai',
+    aiCliMode: 'review',
+    workflowStepKey: `implement:${repair.id}:review`,
+  } as never)
+  return { taskId: task.id, repair, repairReview }
+}
+
 async function resume(app: FastifyInstance, taskId: string): Promise<Job> {
   const res = await app.inject({ method: 'POST', url: `/api/tasks/${taskId}/resume`, payload: { instruction: 'Address the review.' } })
   expect(res.statusCode).toBe(201)
@@ -249,6 +339,28 @@ describe('PATCH の review 分岐: 既存の implement:<id>:review（regression�
       expect(runs[0]!.repairSourceJobId).toBe(shape.i1.id)
       expect(kick).toHaveBeenCalledTimes(1)
       expect(kick.mock.calls[0]![2]).toBe(`repair:${shape.i1.id}:1`)
+    })
+  })
+
+  it('eligible refusal 由来の origin-root repair review PATCH が stage 2 を queue する', async () => {
+    await withApp(async (app) => {
+      const shape = await blockedAfterEligibleRefusalRepair()
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${shape.repairReview.id}`,
+        payload: reviewPatch('changes_requested', '517d0af7-like review'),
+      })
+
+      expect(res.statusCode).toBe(200)
+      const runs = await repairRuns(shape.taskId)
+      expect(runs).toHaveLength(1)
+      expect(runs[0]!.status).toBe('queued')
+      expect(runs[0]!.repairSourceJobId).toBe(shape.repair.id)
+      expect(runs[0]!.designText).toContain('517d0af7-like review')
+      expect(kick).toHaveBeenCalledTimes(1)
+      expect(kick.mock.calls[0]![2]).toBe(`repair:${shape.repair.id}:1`)
+      expect((await storage()).tasks.findById(shape.taskId)?.status).toBe('blocked')
     })
   })
 })
