@@ -45,10 +45,29 @@
  * dirty なまま残った blocked Job の revert は別責務（Finding）として分離する。
  */
 
-import { holdsWorkspaceWhenBlocked, isLiveJob, isStaleBlockedJobCandidate } from '@ai-team/shared'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import {
+  getBaseRoadmapId,
+  holdsWorkspaceWhenBlocked,
+  isLiveJob,
+  isStaleBlockedJobCandidate,
+  occupiesProject,
+} from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
-import type { Job, JobWorkspaceBaseline } from '@ai-team/shared'
+import type { Job, JobWorkspaceBaseline, Task } from '@ai-team/shared'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
+import { buildSystemState, type AttentionItem } from '../state/systemState'
+import { protectedViolations, triageBlocked } from './blockedTriage'
+import { readAdoptionCandidates } from './adoptionStep'
+import {
+  isEligibleTechnicalAbortDiagnosis,
+  recordTechnicalAbortEvidence,
+  recordTechnicalAbortRefusal,
+  technicalAbortStateFingerprint,
+  type AbortAuthorization,
+  type TechnicalAbortCleanupSummary,
+} from './technicalAbortEvidence'
 
 export interface AbortTaskInput {
   taskId: string
@@ -72,6 +91,8 @@ export type AbortTaskResult =
       | 'LIVE_JOB_PRESENT'
       | 'FOREIGN_BLOCKED_JOB'
       | 'JOB_QUARANTINED'
+      | 'OWNERSHIP_UNPROVEN'
+      | 'TECHNICAL_EVIDENCE_INELIGIBLE'
       | 'NOT_AUTHORIZED'
       | 'PARK_FAILED'
     reason: string
@@ -262,7 +283,7 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     const parked = storage.jobs.parkTask({
       taskId: task.id,
       reason: input.reason,
-      approvalRequestId: input.approvalRequestId,
+      authorization: { kind: 'manual_approval', approvalRequestId: input.approvalRequestId },
     })
     if (!parked.ok) return { ok: false, code: 'PARK_FAILED', reason: parked.reason }
     return { ok: true, status: 'parked', taskId: task.id }
@@ -326,7 +347,7 @@ export function completeAbortCleanup(
   storage: IStorage,
   input: {
     jobId: string
-    observation: JobWorkspaceBaseline
+    observation?: JobWorkspaceBaseline
     knownGood: {
       gitOperationMarkers: string[]
       worktreeClean: boolean
@@ -334,6 +355,11 @@ export function completeAbortCleanup(
       headValid: boolean
       blindSpotsAbsent: boolean
     }
+    /** technical cleanup が deletion 前に観測した exact dirty/clean baseline。 */
+    preCleanupObservation?: JobWorkspaceBaseline
+    cleanupSummary?: TechnicalAbortCleanupSummary
+    /** Worker が cleanup 前に拒否した場合。API は refusal audit だけを残し、状態を変えない。 */
+    refusalCode?: string
   },
 ): CompleteAbortCleanupResult {
   const job = storage.jobs.findById(input.jobId)
@@ -341,12 +367,58 @@ export function completeAbortCleanup(
 
   // **要求されていない Job の所有権は解放できない。** 任意 Job を指定して解放させないための関所。
   const metadata = job.failureMetadata
-  if (!metadata?.abortCleanupRequestedAt || !metadata.abortApprovalRequestId) {
+  if (!metadata?.abortCleanupRequestedAt) {
     return {
       ok: false,
       code: 'NOT_REQUESTED',
       reason: `job ${input.jobId} has no abort cleanup request; ownership is not releasable this way`,
     }
+  }
+
+  const authorization: AbortAuthorization | undefined = metadata.abortApprovalRequestId !== undefined
+    ? { kind: 'manual_approval', approvalRequestId: metadata.abortApprovalRequestId }
+    : metadata.abortTechnicalEvidenceId !== undefined
+      && metadata.abortTechnicalStateFingerprint !== undefined
+      && metadata.abortTechnicalRootCauseClass === 'protected_path'
+      && metadata.abortTechnicalAttentionKind !== undefined
+      ? {
+          kind: 'technical_evidence',
+          evidenceId: metadata.abortTechnicalEvidenceId,
+          stateFingerprint: metadata.abortTechnicalStateFingerprint,
+          rootCauseClass: metadata.abortTechnicalRootCauseClass,
+          attentionKind: metadata.abortTechnicalAttentionKind as AttentionItem['kind'],
+        }
+      : undefined
+  if (authorization === undefined) {
+    return {
+      ok: false,
+      code: 'NOT_REQUESTED',
+      reason: `job ${input.jobId}'s abort cleanup request has no verifiable authorization`,
+    }
+  }
+  if (input.refusalCode !== undefined) {
+    if (authorization.kind === 'technical_evidence') {
+      recordTechnicalAbortRefusal(storage, {
+        taskId: job.taskId,
+        evidenceId: authorization.evidenceId,
+        code: input.refusalCode,
+        stage: 'worker_cleanup',
+      })
+      retireTechnicalAbortCleanup(storage, job, input.refusalCode)
+    }
+    return { ok: false, code: 'VERIFICATION_FAILED', reason: 'Worker refused abort cleanup' }
+  }
+  if (input.observation === undefined) {
+    if (authorization.kind === 'technical_evidence') {
+      recordTechnicalAbortRefusal(storage, {
+        taskId: job.taskId,
+        evidenceId: authorization.evidenceId,
+        code: 'FINAL_OBSERVATION_MISSING',
+        stage: 'worker_cleanup',
+      })
+      retireTechnicalAbortCleanup(storage, job, 'FINAL_OBSERVATION_MISSING')
+    }
+    return { ok: false, code: 'VERIFICATION_FAILED', reason: 'final workspace observation is missing' }
   }
 
   // taskId は Job から導くが、**承認がその Task に束縛されているか**は
@@ -358,12 +430,25 @@ export function completeAbortCleanup(
     observation: input.observation,
     knownGood: input.knownGood,
     reason: metadata.abortReason ?? 'abort_task',
-    approvalRequestId: metadata.abortApprovalRequestId,
+    authorization,
+    ...(input.preCleanupObservation !== undefined
+      ? { preCleanupObservation: input.preCleanupObservation }
+      : {}),
+    ...(input.cleanupSummary !== undefined ? { cleanupSummary: input.cleanupSummary } : {}),
   }
   const released = task?.status === 'blocked'
     ? storage.jobs.parkBlockedTaskWithTerminalJobs(releaseInput)
     : storage.jobs.releaseBlockedJobAndParkTask(releaseInput)
   if (!released.ok) {
+    if (authorization.kind === 'technical_evidence') {
+      recordTechnicalAbortRefusal(storage, {
+        taskId: job.taskId,
+        evidenceId: authorization.evidenceId,
+        code: released.code,
+        stage: 'final_transaction',
+      })
+      retireTechnicalAbortCleanup(storage, job, released.code)
+    }
     return {
       ok: false,
       code: released.code === 'VERIFICATION_FAILED' ? 'VERIFICATION_FAILED' : 'PRECONDITION_FAILED',
@@ -372,4 +457,456 @@ export function completeAbortCleanup(
   }
 
   return { ok: true, taskId: job.taskId, jobId: job.id }
+}
+
+function retireTechnicalAbortCleanup(storage: IStorage, job: Job, refusalCode: string): void {
+  const failureMetadata = { ...(job.failureMetadata ?? {}) }
+  delete failureMetadata.abortCleanupRequestedAt
+  delete failureMetadata.abortTechnicalEvidenceId
+  delete failureMetadata.abortTechnicalStateFingerprint
+  delete failureMetadata.abortTechnicalRootCauseClass
+  delete failureMetadata.abortTechnicalAttentionKind
+  delete failureMetadata.abortReason
+  storage.jobs.update(job.id, {
+    failureMetadata: {
+      ...failureMetadata,
+      quarantined: true,
+      quarantineReason: `technical abort cleanup refused (${refusalCode})`,
+    },
+  })
+}
+
+export interface TechnicalAbortRequestInput {
+  taskId: string
+  /** executionLoop の current attention。関数内で fresh state と同一性を再照合する。 */
+  attention: AttentionItem
+  /** executionLoop と同じ ledger reader。省略時は target の tasks/roadmap.md を読む。 */
+  readLedger?: () => string
+}
+
+/**
+ * PL 専用の in-process Technical Abort entrypoint。
+ * caller が root cause / evidence / approval を渡す欄は無く、すべて current records から再計算する。
+ */
+export function requestTechnicalAbort(
+  storage: IStorage,
+  input: TechnicalAbortRequestInput,
+): AbortTaskResult {
+  const current = buildSystemState(storage).attention.find((candidate) => (
+    candidate.kind === input.attention.kind
+    && candidate.taskId === input.taskId
+    && candidate.jobId === input.attention.jobId
+    && candidate.referenceId === input.attention.referenceId
+  ))
+  if (current === undefined) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: input.taskId,
+      code: 'ATTENTION_CHANGED',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'the current attention no longer matches the Technical Abort subject',
+    }
+  }
+  const task = storage.tasks.findById(input.taskId)
+  if (task === undefined) {
+    return { ok: false, code: 'TASK_NOT_FOUND', reason: `Task ${input.taskId} does not exist` }
+  }
+  const diagnosis = triageBlocked(storage, current)
+  if (!isEligibleTechnicalAbortDiagnosis(diagnosis)) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: `INELIGIBLE_${diagnosis.rootCauseClass}`,
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: `root cause ${diagnosis.rootCauseClass} is not eligible for automatic Technical Abort`,
+    }
+  }
+  if (task.status === 'done') {
+    return { ok: false, code: 'TASK_ALREADY_DONE', reason: `Task ${task.id} is already done` }
+  }
+  if (task.roadmapActive !== true || (task.status !== 'pending' && task.status !== 'blocked')) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'TASK_NOT_ACTIVE_OR_PARKABLE',
+      stage: 'ownership',
+    })
+    return {
+      ok: false,
+      code: task.roadmapActive === true ? 'TASK_NOT_PARKABLE' : 'TASK_NOT_ACTIVE',
+      reason: `Task ${task.id} is not an active pending/blocked Technical Abort subject`,
+    }
+  }
+
+  const taskJobs = storage.jobs.findByTaskId(task.id)
+  const latestJob = taskJobs[0]
+  if (latestJob === undefined || latestJob.id !== current.jobId) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'LATEST_JOB_CHANGED',
+      stage: 'ownership',
+    })
+    return {
+      ok: false,
+      code: 'OWNERSHIP_UNPROVEN',
+      reason: 'the current attention is not carried by the latest Task Job',
+    }
+  }
+  const existingMetadata = latestJob.failureMetadata
+  if (existingMetadata?.abortCleanupRequestedAt !== undefined) {
+    const currentFingerprint = technicalAbortStateFingerprint(task, taskJobs, current)
+    const requestStillCurrent = existingMetadata.abortTechnicalEvidenceId !== undefined
+      && existingMetadata.abortTechnicalStateFingerprint === currentFingerprint
+      && existingMetadata.abortTechnicalRootCauseClass === 'protected_path'
+      && existingMetadata.abortTechnicalAttentionKind === current.kind
+    if (requestStillCurrent) {
+      // Worker poll がまだ有効な request を回収していないだけ。再発行も quarantine もせず、
+      // 同じ request を残して handoff/escalation の retry を可能にする。
+      return { ok: true, status: 'cleanup_requested', taskId: task.id, jobIds: [latestJob.id] }
+    }
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      ...(existingMetadata.abortTechnicalEvidenceId !== undefined
+        ? { evidenceId: existingMetadata.abortTechnicalEvidenceId }
+        : {}),
+      code: 'STALE_CLEANUP_REQUEST',
+      stage: 'authorization',
+    })
+    retireTechnicalAbortCleanup(storage, latestJob, 'STALE_CLEANUP_REQUEST')
+    return {
+      ok: false,
+      code: 'JOB_QUARANTINED',
+      reason: 'the existing Technical Abort cleanup request no longer matches current state',
+    }
+  }
+  if (!isWorkerServicedTechnicalAbortCarrier(task, latestJob)) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'UNSERVICEABLE_CARRIER',
+      stage: 'ownership',
+    })
+    return {
+      ok: false,
+      code: 'OWNERSHIP_UNPROVEN',
+      reason: `Worker does not service ${task.status} Task + ${latestJob.status} Job cleanup carriers`,
+    }
+  }
+  const activeApproval = storage.approvalRequests.findActiveByTaskId(task.id)
+  if (activeApproval !== undefined) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'ACTIVE_APPROVAL_PRESENT',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: `Task has an active ${activeApproval.status} approval`,
+    }
+  }
+  const previouslyEscalated = hasTaskEscalation(storage, task.id, taskJobs)
+  if (previouslyEscalated) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'PRIOR_CEO_ESCALATION',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'the Technical Abort subject was already escalated to the CEO',
+    }
+  }
+  if (!hasProtectedPathCorroboration(task, taskJobs, latestJob)) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'PROTECTED_PATH_UNCORROBORATED',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'protected-path evidence is not corroborated by the Task Contract or a second Task Job',
+    }
+  }
+  const ownershipFailure = technicalOwnershipFailure(storage, task, taskJobs)
+  if (ownershipFailure !== undefined) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: ownershipFailure.code,
+      stage: 'ownership',
+    })
+    return {
+      ok: false,
+      code: ownershipFailure.code === 'JOB_QUARANTINED' ? 'JOB_QUARANTINED' : 'OWNERSHIP_UNPROVEN',
+      reason: ownershipFailure.reason,
+    }
+  }
+
+  const roadmapTaskKey = task.roadmapTaskKey
+  const readLedger = input.readLedger ?? (() => readFileSync(
+    path.join(process.env.TARGET_ROOT ?? '/workspace/target', 'tasks', 'roadmap.md'),
+    'utf8',
+  ))
+  let candidates: ReturnType<typeof readAdoptionCandidates>
+  try {
+    candidates = readAdoptionCandidates(readLedger)
+  } catch {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'ROADMAP_UNREADABLE',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'the current Roadmap item could not be fingerprinted',
+    }
+  }
+  const ledgerIds = new Set(candidates.map((candidate) => candidate.id))
+  const roadmapId = roadmapTaskKey === undefined
+    ? undefined
+    : getBaseRoadmapId(roadmapTaskKey, ledgerIds)
+  const roadmap = candidates.find((candidate) => candidate.id === roadmapId)
+  if (roadmap === undefined) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      code: 'ROADMAP_ITEM_MISSING',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'the current Task is not bound to an open Roadmap item',
+    }
+  }
+
+  const authorization = recordTechnicalAbortEvidence(storage, {
+    task,
+    taskJobs,
+    attention: current,
+    diagnosis,
+    roadmap,
+  })
+  // Evidence writer と cleanup request の間の同期的な TOCTOU も閉じる。
+  const refreshedTask = storage.tasks.findById(task.id)
+  const refreshedJobs = storage.jobs.findByTaskId(task.id)
+  if (
+    refreshedTask === undefined
+    || refreshedJobs[0]?.id !== latestJob.id
+    || technicalAbortStateFingerprint(refreshedTask, refreshedJobs, current) !== authorization.stateFingerprint
+  ) {
+    recordTechnicalAbortRefusal(storage, {
+      taskId: task.id,
+      evidenceId: authorization.evidenceId,
+      code: 'STATE_CHANGED_AFTER_EVIDENCE',
+      stage: 'authorization',
+    })
+    return {
+      ok: false,
+      code: 'OWNERSHIP_UNPROVEN',
+      reason: 'Task state changed while Technical Abort evidence was being issued',
+    }
+  }
+
+  storage.jobs.update(latestJob.id, {
+    failureMetadata: {
+      ...(latestJob.failureMetadata ?? {}),
+      abortCleanupRequestedAt: new Date().toISOString(),
+      abortTechnicalEvidenceId: authorization.evidenceId,
+      abortTechnicalStateFingerprint: authorization.stateFingerprint,
+      abortTechnicalRootCauseClass: authorization.rootCauseClass,
+      abortTechnicalAttentionKind: authorization.attentionKind,
+      abortReason: 'technical_abort:protected_path',
+    },
+  })
+  return { ok: true, status: 'cleanup_requested', taskId: task.id, jobIds: [latestJob.id] }
+}
+
+function technicalOwnershipFailure(
+  storage: IStorage,
+  task: NonNullable<ReturnType<IStorage['tasks']['findById']>>,
+  taskJobs: readonly Job[],
+): { code: string; reason: string } | undefined {
+  if (taskJobs.length === 0) return { code: 'NO_JOB', reason: 'Technical Abort requires a latest Job' }
+  const latest = taskJobs[0]
+  const workingDir = latest?.safeCommand?.workingDir
+  if (workingDir === undefined || workingDir === '') {
+    return { code: 'WORKING_DIR_MISSING', reason: 'latest Job has no recorded workingDir' }
+  }
+  if (taskJobs.some((job) => job.safeCommand?.workingDir !== workingDir)) {
+    return { code: 'WORKING_DIR_MISMATCH', reason: 'Task Jobs do not share one workingDir' }
+  }
+  if (taskJobs.some((job) => job.workspaceBaseline === undefined)) {
+    return { code: 'BASELINE_MISSING', reason: 'a Task Job has no persisted workspace baseline' }
+  }
+  const heads = new Set(taskJobs.map((job) => job.workspaceBaseline?.startCommitHash))
+  if (heads.size !== 1) {
+    return { code: 'START_HEAD_MISMATCH', reason: 'Task Jobs do not share one start HEAD' }
+  }
+  if (!taskJobs.some((job) => job.workspaceBaseline?.mode === 'clean')) {
+    return { code: 'CLEAN_BASELINE_MISSING', reason: 'Task lineage has no clean baseline at the shared HEAD' }
+  }
+
+  const cleanBaselineIndex = taskJobs.findIndex((job) => job.workspaceBaseline?.mode === 'clean')
+  const cleanBaselineJob = taskJobs[cleanBaselineIndex]
+  if (cleanBaselineJob === undefined || latest === undefined) {
+    return { code: 'CLEAN_BASELINE_MISSING', reason: 'Task lineage has no clean baseline before its carrier' }
+  }
+  const historicalForeignJob = allJobs(storage).find((job) => (
+    job.taskId !== task.id
+    && job.safeCommand?.workingDir === workingDir
+    && job.createdAt >= cleanBaselineJob.createdAt
+    && job.createdAt <= latest.createdAt
+  ))
+  if (historicalForeignJob !== undefined) {
+    return {
+      code: 'FOREIGN_JOB_IN_OWNERSHIP_WINDOW',
+      reason: `another Task used ${workingDir} between this Task's clean baseline and cleanup carrier`,
+    }
+  }
+  // findByTaskId は newest-first。clean baseline から carrier までを chronological に並べ、
+  // Job N の END と Job N+1 の START を一対ずつ照合する。carrier.changedFiles はもちろん、
+  // どの Job の cumulative changedFiles も ownership source にしない。
+  const lineage = [...taskJobs.slice(0, cleanBaselineIndex + 1)].reverse()
+  const legacyJob = lineage.find((job) => job.failureMetadata?.workspaceEndFingerprint === undefined)
+  if (legacyJob !== undefined) {
+    return {
+      code: 'END_FINGERPRINT_MISSING',
+      reason:
+        `Task Job ${legacyJob.id} has no persisted workspace end fingerprint (legacy row); `
+        + 'technical cleanup is refused and the existing handoff remains active',
+    }
+  }
+  for (let index = 0; index < lineage.length - 1; index += 1) {
+    const previous = lineage[index]
+    const next = lineage[index + 1]
+    if (
+      previous?.failureMetadata?.workspaceEndFingerprint === undefined
+      || next?.workspaceBaseline === undefined
+      || !workspaceContentFingerprintEquals(
+        previous.failureMetadata.workspaceEndFingerprint,
+        next.workspaceBaseline,
+      )
+    ) {
+      return {
+        code: 'JOB_CONTINUITY_BROKEN',
+        reason:
+          `workspace changed outside Task Jobs between ${previous?.id ?? 'unknown'} and ${next?.id ?? 'unknown'}; `
+          + 'technical cleanup is refused',
+      }
+    }
+  }
+  if (taskJobs.some((job) => isLiveJob(job))) {
+    return { code: 'LIVE_JOB_PRESENT', reason: 'Task still has a queued or running Job' }
+  }
+  if (taskJobs.some((job) => job.failureMetadata?.quarantined === true)) {
+    return { code: 'JOB_QUARANTINED', reason: 'Task has a quarantined Job' }
+  }
+
+  for (const project of storage.projects.findAll()) {
+    for (const otherTask of storage.tasks.findByProjectId(project.id)) {
+      if (otherTask.id === task.id) continue
+      for (const job of storage.jobs.findByTaskId(otherTask.id)) {
+        if (job.safeCommand?.workingDir !== workingDir) continue
+        if (
+          isLiveJob(job)
+          || holdsWorkspaceOwnership(otherTask, job)
+          || occupiesProject(otherTask)
+        ) {
+          return {
+            code: 'CROSS_PROJECT_WORKSPACE_IN_USE',
+            reason: `another Task currently owns or uses ${workingDir}`,
+          }
+        }
+      }
+    }
+  }
+  return undefined
+}
+
+function isWorkerServicedTechnicalAbortCarrier(task: Task, carrier: Job): boolean {
+  return task.status === 'pending'
+    ? carrier.status === 'blocked'
+    : task.status === 'blocked'
+      && (carrier.status === 'failed' || carrier.status === 'success')
+}
+
+function hasProtectedPathCorroboration(task: Task, taskJobs: readonly Job[], carrier: Job): boolean {
+  const carrierViolations = protectedViolations(carrier.guardResult?.fileViolations).map(normalizeProofPath)
+  if (carrierViolations.length === 0) return false
+  const contractPaths = new Set(
+    [...(task.allowedPaths ?? []), ...(task.expectedOutputs ?? [])].map(normalizeProofPath),
+  )
+  if (carrierViolations.some((violation) => contractPaths.has(violation))) return true
+  return carrierViolations.some((violation) => taskJobs.filter((job) => (
+    protectedViolations(job.guardResult?.fileViolations)
+      .map(normalizeProofPath)
+      .includes(violation)
+  )).length >= 2)
+}
+
+function allJobs(storage: IStorage): Job[] {
+  return storage.projects.findAll().flatMap((project) => (
+    storage.tasks.findByProjectId(project.id).flatMap((task) => storage.jobs.findByTaskId(task.id))
+  ))
+}
+
+function normalizeProofPath(value: string): string {
+  return value.replaceAll('\\', '/').replace(/^\.\//, '')
+}
+
+function workspaceContentFingerprintEquals(
+  left: JobWorkspaceBaseline,
+  right: JobWorkspaceBaseline,
+): boolean {
+  if (left.startCommitHash !== right.startCommitHash) return false
+  const contentEntries = (baseline: JobWorkspaceBaseline): string[] => (
+    baseline.mode === 'clean'
+      ? []
+      : baseline.entries.map((entry) => `${normalizeProofPath(entry.path)}\u0000${entry.worktreeHash}`).sort()
+  )
+  const leftEntries = contentEntries(left)
+  const rightEntries = contentEntries(right)
+  return leftEntries.length === rightEntries.length
+    && leftEntries.every((entry, index) => entry === rightEntries[index])
+}
+
+function hasTaskEscalation(storage: IStorage, taskId: string, taskJobs: readonly Job[]): boolean {
+  const taskTargetKinds = [
+    'design_review_failed',
+    'design_review_idle',
+    'task_ready_without_job',
+  ] as const
+  const jobTargetKinds = [
+    'job_blocked',
+    'job_failed',
+    'job_running_long',
+    'workspace_quarantined',
+  ] as const
+  const targetKeys = new Set<string>(taskTargetKinds.map((kind) => `${kind}:${taskId}`))
+  for (const job of taskJobs) {
+    for (const kind of jobTargetKinds) targetKeys.add(`${kind}:${job.id}`)
+  }
+  for (const approval of storage.approvalRequests.findByTaskId(taskId)) {
+    targetKeys.add(`approval_waiting:${approval.id}`)
+  }
+
+  const recoveryIds = storage.auditLog
+    .findByEntity('task', taskId)
+    .filter((entry) => entry.operation === 'task_human_recovered' && entry.result === 'success')
+    .map((entry) => entry.id)
+  targetKeys.add(`task_blocked_without_job:${taskId}:first`)
+  for (const recoveryId of recoveryIds) {
+    targetKeys.add(`task_blocked_without_job:${taskId}:${recoveryId}`)
+  }
+
+  return [...targetKeys].some((targetKey) => storage.auditLog
+    .findByEntity('pl_loop_target', targetKey)
+    .some((entry) => entry.operation === 'pl_loop' && entry.result === 'escalated'))
 }

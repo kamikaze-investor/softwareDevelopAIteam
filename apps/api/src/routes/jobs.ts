@@ -1,5 +1,6 @@
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
 import { completeAbortCleanup } from '../pl/abortTask'
+import { TECHNICAL_ABORT_WORKER_REFUSAL_CODES } from '../pl/technicalAbortEvidence'
 import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
@@ -12,6 +13,7 @@ import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePo
 import {
   canApplyJobResultStatus,
   describeApplicableJobStatuses,
+  isTerminalJobStatus,
 } from '../jobResultApplicationPolicy'
 import {
   escalateTaskToHuman,
@@ -180,6 +182,29 @@ const UpdateJobBody = z.object({
     quarantineReason: z.string().optional(),
     quarantineClearedAt: z.string().optional(),
     quarantineClearedReason: z.string().optional(),
+    workspaceEndFingerprint: z.discriminatedUnion('mode', [
+      z.object({
+        mode: z.literal('clean'),
+        startCommitHash: z.string(),
+      }).strict(),
+      z.object({
+        mode: z.literal('dirty'),
+        startCommitHash: z.string(),
+        entries: z.array(z.object({
+          path: z.string(),
+          oldPath: z.string().optional(),
+          kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+          xyStatus: z.string().optional(),
+          beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+          afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+          beforeMode: z.string().optional(),
+          afterMode: z.string().optional(),
+          headHash: z.string().optional(),
+          indexHash: z.string().optional(),
+          worktreeHash: z.string(),
+        })),
+      }).strict(),
+    ]).optional(),
   }).strict().optional(),
   workspaceBaseline: z.discriminatedUnion('mode', [
     z.object({
@@ -297,10 +322,21 @@ const KnownGoodFactsSchema = z.object({
 
 // abort cleanup も quarantine 解除と**同じ材料**を同じ厳密さで要求する。
 // 所有権の解放は quarantine 解除より重く、緩い検証で通してよい理由がない。
-const AbortCleanupResultBody = z.object({
-  observation: WorkspaceObservationSchema,
-  knownGood: KnownGoodFactsSchema,
-}).strict()
+const AbortCleanupResultBody = z.union([
+  z.object({
+    observation: WorkspaceObservationSchema,
+    knownGood: KnownGoodFactsSchema,
+    preCleanupObservation: WorkspaceObservationSchema.optional(),
+    cleanupSummary: z.object({
+      changedPathCount: z.number().int().nonnegative(),
+      restoredPathCount: z.number().int().nonnegative(),
+      removedPathCount: z.number().int().nonnegative(),
+    }).strict().optional(),
+  }).strict(),
+  z.object({
+    refusalCode: z.enum(TECHNICAL_ABORT_WORKER_REFUSAL_CODES),
+  }).strict(),
+])
 
 const ClearQuarantineJobBody = z.object({
   observation: WorkspaceObservationSchema,
@@ -538,8 +574,27 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
 
     const result = completeAbortCleanup(storage, {
       jobId: req.params.id,
-      observation: parsed.data.observation as JobWorkspaceBaseline,
-      knownGood: parsed.data.knownGood,
+      ...('refusalCode' in parsed.data
+        ? {
+            refusalCode: parsed.data.refusalCode,
+            knownGood: {
+              gitOperationMarkers: [],
+              worktreeClean: false,
+              indexClean: false,
+              headValid: false,
+              blindSpotsAbsent: false,
+            },
+          }
+        : {
+            observation: parsed.data.observation as JobWorkspaceBaseline,
+            knownGood: parsed.data.knownGood,
+            ...(parsed.data.preCleanupObservation !== undefined
+              ? { preCleanupObservation: parsed.data.preCleanupObservation as JobWorkspaceBaseline }
+              : {}),
+            ...(parsed.data.cleanupSummary !== undefined
+              ? { cleanupSummary: parsed.data.cleanupSummary }
+              : {}),
+          }),
     })
     if (!result.ok) {
       const status = result.code === 'NOT_FOUND' ? 404 : 409
@@ -602,6 +657,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const existing = storage.jobs.findById(req.params.id)
     if (!existing) {
       return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
+    if (workspaceEndFingerprint !== undefined) {
+      if (existing.failureMetadata?.workspaceEndFingerprint !== undefined) {
+        return reply.status(409).send({
+          error: 'workspaceEndFingerprint is write-once and has already been recorded',
+        })
+      }
+      if (
+        existing.status !== 'running'
+        || jobUpdate.status === undefined
+        || !isTerminalJobStatus(jobUpdate.status)
+      ) {
+        return reply.status(409).send({
+          error: 'workspaceEndFingerprint is only accepted on a running-to-terminal transition',
+        })
+      }
     }
 
     // initial-implement が running を一度も獲得しないまま failed を報告できるのは、

@@ -86,6 +86,7 @@ import {
   type PlAdoptionDeps,
   type PlAdoptionResult,
 } from './adoptionStep'
+import { requestTechnicalAbort } from './abortTask'
 import {
   countConflictAttempts,
   countRemediationAttempts,
@@ -1654,6 +1655,41 @@ async function handleTarget(
     lane: diagnosis.recommendedLane,
     rootCauseClass: diagnosis.rootCauseClass,
     confidence: diagnosis.confidence,
+  }
+
+  // ── Automatic Technical Abort / Park ─────────────────────────────────────
+  // `protected_path` だけが、現 Task の通常 Executor では recovery が変えられない
+  // high-confidence / Task-caused / non-transient class。回数枯渇では発火しない。
+  // HTTP ADMIN /abort はこの経路を通らず、従来どおり APPROVED approval_gate を要求する。
+  if (diagnosis.rootCauseClass === 'protected_path' && item.taskId !== undefined) {
+    const abort = requestTechnicalAbort(storage, {
+      taskId: item.taskId,
+      attention: item,
+      ...(deps.readLedger !== undefined ? { readLedger: deps.readLedger } : {}),
+    })
+    if (abort.ok) {
+      const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
+      return {
+        status: handled.status,
+        target,
+        triage,
+        proposedKind: 'abort_task',
+        executionSummary: abort.status === 'cleanup_requested'
+          ? `technical abort cleanup requested for ${abort.jobIds.length} job(s)`
+          : 'technical abort parked task',
+        reason: `${handled.reason}; server-verified protected_path evidence requested Technical Abort cleanup`,
+        attempt: 1,
+      }
+    }
+    const handled = await handOffOrEscalate(storage, deps, key, item, diagnosis)
+    return {
+      status: handled.status,
+      target,
+      triage,
+      proposedKind: 'abort_task',
+      reason: `${handled.reason}; Technical Abort refused fail-closed: ${abort.reason}`,
+      attempt: 1,
+    }
   }
 
   // ── 人へ伝えるだけの attention は、診断も Gate も経ずに1回通知して終わる ──────

@@ -217,6 +217,50 @@ describe('buildResumeAiCliPrompt', () => {
 })
 
 describe('Task API', () => {
+  it('POST /api/tasks/:id/abort exposes only manual approval and consumes APPROVED abort_task approval', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'manual abort', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as never)
+      const request = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+        targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd', changedFiles: [],
+        triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+
+      const waiting = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { approvalRequestId: request.id, reason: 'manual admin decision' },
+      })
+      expect(waiting.statusCode).toBe(403)
+      expect(storage.tasks.findById(task.id)?.roadmapActive).toBe(true)
+
+      // technical evidence fields are not part of the strict HTTP schema.
+      const hiddenTechnicalPath = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { technicalEvidenceId: 'forged', reason: 'forged' },
+      })
+      expect(hiddenTechnicalPath.statusCode).toBe(400)
+
+      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      const approved = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { approvalRequestId: request.id, reason: 'manual admin decision' },
+      })
+      expect(approved.statusCode).toBe(200)
+      expect(storage.tasks.findById(task.id)?.roadmapActive).toBe(false)
+      expect(storage.approvalRequests.findById(request.id)?.status).toBe('CONSUMED')
+    })
+  })
+
   // in_progress と blocked は roadmapActive に関係なく project を占有する。park した Task を
   // ここで動かせると park は事実上取り消され、resume は park を理由に拒否するので
   // 誰も解消できない状態になる。

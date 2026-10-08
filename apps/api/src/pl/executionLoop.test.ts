@@ -210,6 +210,121 @@ describe('runPlTick — 停止した failed Job', () => {
   })
 })
 
+describe('runPlTick — Technical Abort maintenance handoff', () => {
+  const ledger = [
+    '# Roadmap',
+    '',
+    '<!-- roadmap:id=technical-item state=planned -->',
+    '1. [ ] **Technical item**',
+    '   Protected runtime work.',
+    '',
+  ].join('\n')
+
+  function protectedPathFixture(corroborated: boolean): {
+    storage: IStorage
+    taskId: string
+    carrierId: string
+  } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id,
+      title: 'Technical item',
+      description: '',
+      status: 'blocked',
+      assignee: 'developer_ai',
+      dependencies: [],
+      roadmapActive: true,
+      roadmapTaskKey: 'technical-item',
+      allowedPaths: corroborated ? ['apps/worker/src/index.ts'] : ['apps/api/src/pl'],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: task.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+      failureMetadata: {
+        workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+      },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const carrier = storage.jobs.create({
+      taskId: task.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+      failureMetadata: {
+        workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+      },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(carrier.id, {
+      guardResult: {
+        permissionAllowed: true,
+        fileChangeAllowed: false,
+        fileViolations: ['apps/worker/src/index.ts'],
+      },
+    })
+    return { storage, taskId: task.id, carrierId: carrier.id }
+  }
+
+  it('keeps the Tier B handoff signal after requesting a valid Technical Abort cleanup', async () => {
+    const fx = protectedPathFixture(true)
+    const escalations: string[] = []
+
+    const result = await runPlTick(fx.storage, deps({
+      readLedger: () => ledger,
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    }))
+
+    expect(result.status).toBe('escalated')
+    expect(result.triage?.lane).toBe('maintenance_lane')
+    expect(escalations).toHaveLength(1)
+    expect(fx.storage.jobs.findById(fx.carrierId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeDefined()
+  })
+
+  it('keeps a valid cleanup marker when handoff delivery throws, then retries the handoff next tick', async () => {
+    const fx = protectedPathFixture(true)
+    await expect(runPlTick(fx.storage, deps({
+      readLedger: () => ledger,
+      escalate: async () => { throw new Error('temporary delivery failure') },
+    }))).rejects.toThrow('temporary delivery failure')
+
+    const afterFailure = fx.storage.jobs.findById(fx.carrierId)?.failureMetadata
+    expect(afterFailure?.abortCleanupRequestedAt).toBeDefined()
+    expect(afterFailure?.quarantined).not.toBe(true)
+
+    const retried = await runPlTick(fx.storage, deps({
+      readLedger: () => ledger,
+      escalate: async () => DELIVERED,
+    }))
+    expect(retried.status).toBe('escalated')
+    expect(fx.storage.jobs.findById(fx.carrierId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBe(afterFailure?.abortCleanupRequestedAt)
+  })
+
+  it('falls through to the existing Tier B handoff when Technical Abort is refused', async () => {
+    const fx = protectedPathFixture(false)
+    const escalations: string[] = []
+
+    const result = await runPlTick(fx.storage, deps({
+      readLedger: () => ledger,
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    }))
+
+    expect(result.status).toBe('escalated')
+    expect(result.triage?.lane).toBe('maintenance_lane')
+    expect(escalations).toHaveLength(1)
+    expect(fx.storage.jobs.findById(fx.carrierId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
+  })
+})
+
 describe('runPlTick — Decide / Gate', () => {
   it('PL が未知の action を出しても実行せず blocked になる（自然言語を信用しない）', async () => {
     const { storage } = seedIdleDesignReview()

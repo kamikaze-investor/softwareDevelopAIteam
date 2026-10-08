@@ -17,6 +17,7 @@ import { saveJobLogs } from './jobLogger.js'
 import { persistJobResult } from './index.js'
 import {
   WorkspaceReconciliationError,
+  buildCleanupManifestFromBaseline,
   buildStructuredReviewPrompt,
   computeWorkspaceBaseline,
   parseStructuredReviewOutput,
@@ -63,6 +64,32 @@ import {
   clearContainedCommandOverride,
   setContainedCommandOverride,
 } from './execution/containedCommandTestBridge.js'
+
+describe('Technical Abort cleanup manifest', () => {
+  it('reconstructs only persisted Task-owned dirty entries and reports counts', () => {
+    const cleanup = buildCleanupManifestFromBaseline({
+      mode: 'dirty',
+      startCommitHash: 'head',
+      entries: [
+        { path: 'modified.ts', kind: 'modified', xyStatus: '.M', worktreeHash: 'm' },
+        { path: 'added.ts', kind: 'added', xyStatus: '?', worktreeHash: 'a' },
+        { path: 'old.ts', kind: 'renamed', xyStatus: 'R.', worktreeHash: ':absent:' },
+        {
+          path: 'new.ts', oldPath: 'old.ts', kind: 'renamed', xyStatus: 'R.',
+          worktreeHash: 'r',
+        },
+      ],
+    })
+
+    expect(cleanup.manifest.changes).toEqual([
+      expect.objectContaining({ path: 'modified.ts', kind: 'modified' }),
+      expect.objectContaining({ path: 'added.ts', kind: 'added' }),
+      expect.objectContaining({ path: 'new.ts', oldPath: 'old.ts', kind: 'renamed' }),
+    ])
+    expect(cleanup.manifest.paths).toEqual(['modified.ts', 'added.ts', 'old.ts', 'new.ts'])
+    expect(cleanup).toMatchObject({ changedPathCount: 4, restoredPathCount: 2, removedPathCount: 2 })
+  })
+})
 
 vi.mock('./commandResolver.js', () => ({
   resolveCommand: vi.fn(),
@@ -462,6 +489,9 @@ beforeEach(() => {
       paths,
     }
   })
+  fingerprintWorktreeEntriesMock.mockImplementation((_workingDir, manifest) => new Map(
+    manifest.paths.map((manifestPath) => [manifestPath, `sha256:${manifestPath}`]),
+  ))
   buildApprovedStateMapMock.mockImplementation((_workingDir, manifest) => {
     const states = new Map()
     for (const change of manifest.changes) {
