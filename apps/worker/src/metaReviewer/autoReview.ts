@@ -9,8 +9,12 @@
  * 3. Worker Job として実行（将来）
  *
  * 終了コード:
- *   0 = approved / changes_requested（マージ可）
- *   1 = blocked（マージ不可・CEO承認必要）
+ *   0 = approved / changes_requested（技術的にマージ可）。
+ *       requiresCeoApproval=true のときは Human Decision Authority が必要であり、
+ *       その確認は GitHub の CODEOWNERS review（Ruleset の code-owner review）が担う
+ *   1 = blocked（実装・Safety の欠陥 / 未解消の矛盾 / cage violation。
+ *       CEO 承認でも override しない）。requiresCeoApproval=true なのに
+ *       CODEOWNERS が Human Gate として効かない場合も blocked に倒す（fail closed）
  *   2 = 実行エラー（安全のため blocked 扱い）
  */
 
@@ -81,6 +85,149 @@ export function buildDiffRangeArgs(
   return {
     diffArgs: ['diff', ...range],
     nameOnlyArgs: ['diff', '--name-only', ...range],
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// Human Decision Authority → CODEOWNERS review への委譲（2026-10-08 CEO 決定）
+//
+// Meta Review が「Human Decision Authority が必要」と判定したこと自体は、技術的な
+// merge 不可ではない。人の判断は GitHub の CODEOWNERS review（Ruleset の
+// require_code_owner_review）が担う。ただしそれは、変更ファイルが CODEOWNERS の
+// 保護対象に入っているときだけ成立する。入っていなければ GitHub は人の review を
+// 要求しないので、Human Gate が存在しない —— その場合は blocked に倒す（fail closed）。
+//
+// CEO の承認で技術的な blocked を override する経路は作らない。blocked は従来どおり exit 1。
+// ────────────────────────────────────────────────────────────
+
+/** CODEOWNERS の1行。owner の無い行も保持する（後勝ちで所有を外せるため）。 */
+export interface CodeOwnersRule {
+  pattern: string
+  owners: string[]
+}
+
+/** literal な path / directory 以外（glob・escape）は扱わない。 */
+const UNSUPPORTED_CODEOWNERS_PATTERN = /[*?[\]!\\]/
+
+/**
+ * CODEOWNERS 本文を解析する。
+ *
+ * このリポジトリの CODEOWNERS は literal な file / directory pattern だけを使う（CEO 決定）。
+ * glob や escape を含む行があったら、照合の正しさを保証できないので **undefined を返す**。
+ * 呼び出し側はそれを「Human Gate を確認できない」として fail closed に扱う。
+ */
+export function parseCodeOwners(text: string): CodeOwnersRule[] | undefined {
+  const rules: CodeOwnersRule[] = []
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (line === '' || line.startsWith('#')) continue
+    const tokens = line.split(/\s+/)
+    const pattern = tokens[0] as string
+    if (UNSUPPORTED_CODEOWNERS_PATTERN.test(pattern)) return undefined
+    const owners: string[] = []
+    for (const token of tokens.slice(1)) {
+      if (token.startsWith('#')) break
+      owners.push(token)
+    }
+    rules.push({ pattern, owners })
+  }
+  return rules
+}
+
+/** gitignore / CODEOWNERS と同じ規則で、literal pattern が path に一致するか。 */
+function matchesLiteralPattern(file: string, pattern: string): boolean {
+  const isDirectory = pattern.endsWith('/')
+  const leadingAnchored = pattern.startsWith('/')
+  const body = pattern.replace(/^\/+/, '').replace(/\/+$/, '')
+  if (body === '') return false
+  // 途中に `/` を含む pattern、または先頭 `/` の pattern は repository root 起点
+  const anchored = leadingAnchored || body.includes('/')
+  if (anchored) {
+    return isDirectory
+      ? file.startsWith(`${body}/`)
+      : file === body || file.startsWith(`${body}/`)
+  }
+  // `/` を含まない pattern はどの階層の同名要素にも一致する
+  const segments = file.split('/')
+  const lastIndex = segments.length - 1
+  return segments.some((segment, index) =>
+    segment === body && (isDirectory ? index < lastIndex : true))
+}
+
+/** 後勝ち（最後に一致した行）で、その path に owner が居るか。 */
+export function isCodeOwned(file: string, rules: readonly CodeOwnersRule[]): boolean {
+  let owned = false
+  for (const rule of rules) {
+    if (matchesLiteralPattern(file, rule.pattern)) owned = rule.owners.length > 0
+  }
+  return owned
+}
+
+type GateableMetaReviewResult = {
+  status: 'approved' | 'changes_requested' | 'blocked'
+  summary: string
+  findings: Array<{ severity: string; category: string; message: string; suggestion?: string }>
+  requiresCeoApproval: boolean
+}
+
+/**
+ * Meta Review の結果から、required check としての最終結果と終了コードを決める。
+ *
+ * - `blocked` → そのまま exit 1（requiresCeoApproval の有無に関係なく。CEO 承認で override しない）
+ * - `requiresCeoApproval=true`（blocked 以外）→ 変更ファイルのどれかが CODEOWNERS の保護対象なら
+ *   exit 0（Human Decision は CODEOWNERS review が担う）。保護対象が無い・CODEOWNERS を確認できない
+ *   なら、既存 status の `blocked` へ倒して exit 1（Human Gate が存在しないため）
+ * - それ以外 → 従来どおり exit 0
+ */
+export function resolveMetaReviewOutcome<T extends GateableMetaReviewResult>(
+  result: T,
+  changedFiles: readonly string[],
+  codeOwners: readonly CodeOwnersRule[] | undefined,
+): { result: T; exitCode: 0 | 1 } {
+  if (result.status === 'blocked') return { result, exitCode: 1 }
+  if (!result.requiresCeoApproval) return { result, exitCode: 0 }
+
+  const guarded = codeOwners !== undefined && changedFiles.some((file) => isCodeOwned(file, codeOwners))
+  if (guarded) return { result, exitCode: 0 }
+
+  const reason = codeOwners === undefined
+    ? 'CODEOWNERS を読めない、または literal 以外の pattern を含むため、Human Decision の Gate を確認できない'
+    : '変更ファイルがどれも CODEOWNERS の保護対象ではないため、GitHub は人の review を要求しない'
+  return {
+    result: {
+      ...result,
+      status: 'blocked',
+      summary: `${result.summary}（Human Decision Authority が必要だが ${reason}。fail closed）`,
+      findings: [
+        ...result.findings,
+        {
+          severity: 'critical',
+          category: 'authority_change',
+          message: `Human Decision Authority が必要と判定されたが、${reason}。authority の判定と CODEOWNERS がずれている。`,
+          suggestion: 'authority を定義・実装するファイルなら CODEOWNERS へ追加する。そうでなければ authority 判定を見直す。',
+        },
+      ],
+    },
+    exitCode: 1,
+  }
+}
+
+/**
+ * base branch の CODEOWNERS を読む（GitHub は PR の base branch の CODEOWNERS で owner を決める）。
+ * 読めない・解析できない場合は undefined（呼び出し側で fail closed）。
+ */
+function readCodeOwnersRules(workingDir: string, baseSha: string | undefined): CodeOwnersRule[] | undefined {
+  try {
+    const text = baseSha
+      ? execFileSync('git', ['show', `${baseSha}:.github/CODEOWNERS`], {
+          cwd: workingDir,
+          encoding: 'utf-8',
+          shell: false,
+        })
+      : readFileSync(resolve(workingDir, '.github/CODEOWNERS'), 'utf-8')
+    return parseCodeOwners(text)
+  } catch {
+    return undefined
   }
 }
 
@@ -268,23 +415,32 @@ async function main(): Promise<void> {
     })),
   }
 
-  writeResultFile({ ...result, providerUsed }, resultFilePath)
-  printResult(result)
+  // --- Human Decision Authority → CODEOWNERS review への委譲 ---
+  // requiresCeoApproval=true でも、CODEOWNERS が Human Gate として効くときだけ check を通す。
+  const outcome = resolveMetaReviewOutcome(result, changedFiles, readCodeOwnersRules(workingDir, baseSha))
+  const finalResult = outcome.result
+
+  writeResultFile({ ...finalResult, providerUsed }, resultFilePath)
+  printResult(finalResult)
 
   // --- 終了コード ---
   //
-  // blocked = exit 1（CI 失敗）の設計について:
-  //   Meta Review が genuine なセキュリティ違反を検出した場合、CI を失敗させる。
-  //   ただし autoReview.ts 自体が CODEOWNERS の対象ではないため AI が改ざん可能。
-  //   本当の防護壁は CODEOWNERS によるセキュリティファイルへの人間承認必須。
-  //   詳細: .github/CODEOWNERS を参照。
+  // blocked = exit 1（CI 失敗）:
+  //   実装・Safety の欠陥 / 未解消の矛盾 / cage violation、または Human Decision が必要なのに
+  //   CODEOWNERS が Human Gate として効かない場合。CEO 承認でこれを override する経路は無い。
+  //   このファイル（apps/worker/src/metaReviewer/）自体も CODEOWNERS の保護対象であり、
+  //   Ruleset の code-owner review により変更には CEO の review が要る。
   //
-  if (result.status === 'blocked') {
-    console.error('\n🚫 BLOCKED: このPRはCEO承認なしにマージできません')
+  if (outcome.exitCode === 1) {
+    console.error('\n🚫 BLOCKED: 技術的にマージできません（CEO 承認では解除されません）')
     process.exit(1)
   }
 
-  if (result.status === 'changes_requested') {
+  if (finalResult.requiresCeoApproval) {
+    console.warn('\n🟡 Human Decision Authority: CODEOWNERS（CEO）の review が必要です。GitHub の Ruleset が強制します')
+  }
+
+  if (finalResult.status === 'changes_requested') {
     console.warn('\n⚠️  CHANGES REQUESTED: 修正後に再レビューが必要です')
     process.exit(0)
   }
