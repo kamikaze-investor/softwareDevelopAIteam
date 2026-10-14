@@ -22,3 +22,46 @@ sandbox/ @kamikaze-investor
 CLAUDE.md @kamikaze-investor
 docs/meta_reviewer/ @kamikaze-investor
 packages/shared/src/types/agent.ts @kamikaze-investor
+
+# Human Decision Authority / Cage の canonical surface（2026-10-08 CEO 決定）
+#
+# Meta Review は「Human Decision Authority が必要」という判定を、この CODEOWNERS と
+# Ruleset の code-owner review に委ねる。ここに載るのは authority / cage を定義・実装する
+# 正本だけで、security-adjacent というだけのファイルは載せない。
+# Meta Review が requiresCeoApproval=true を出したのに、変更ファイルがどれもここに
+# 該当しなければ、Meta Review 自身が fail closed する（autoReview.ts）。
+
+# Goal / Constitution / 権限・承認の正本 docs
+AGENTS.md @kamikaze-investor
+specs/00_constitution.md @kamikaze-investor
+specs/04_ai_organization.md @kamikaze-investor
+specs/07_dashboard.md @kamikaze-investor
+specs/08_permissions.md @kamikaze-investor
+specs/22_safety_approval_design_principle.md @kamikaze-investor
+docs/project_memory/goal.md @kamikaze-investor
+docs/project_memory/design_philosophy.md @kamikaze-investor
+docs/project_memory/rules/approval_rules.md @kamikaze-investor
+docs/multi_ai_step_review_flow.md @kamikaze-investor
+
+# Meta Review 自身（required check のコードと判定契約）
+apps/worker/src/metaReviewer/ @kamikaze-investor
+packages/shared/src/types/meta_review.ts @kamikaze-investor
+
+# Approval / Gate / PL authority policy の正本コード
+packages/shared/src/plActionPolicy.ts @kamikaze-investor
+packages/shared/src/approvalGateLogic.ts @kamikaze-investor
+apps/api/src/pl/actionGate.ts @kamikaze-investor
+apps/api/src/routes/approvalGate.ts @kamikaze-investor
+apps/api/src/gitCommitEvidence.ts @kamikaze-investor
+
+# credential class ごとの authority
+apps/api/src/auth/apiToken.ts @kamikaze-investor
+apps/api/src/auth/credentialClass.ts @kamikaze-investor
+apps/api/src/auth/humanOnlyRoutes.ts @kamikaze-investor
+apps/api/src/auth/workerAllowlist.ts @kamikaze-investor
+apps/api/src/auth/actionsReadonlyAllowlist.ts @kamikaze-investor
+apps/api/src/auth/operatorGatewayAllowlist.ts @kamikaze-investor
+
+# Permission grant
+apps/api/src/routes/permissionGrants.ts @kamikaze-investor
+packages/shared/src/types/permission_grant.ts @kamikaze-investor
