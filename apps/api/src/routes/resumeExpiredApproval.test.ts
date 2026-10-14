@@ -438,7 +438,7 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
     })
   })
 
-  it('5. the old expired approval is left untouched and does not interfere with the new one', async () => {
+  it('5. the old expired approval is neither approved nor deleted, leaves the actionable set, and does not interfere with the new one', async () => {
     await withApp(async (app) => {
       const project = await createProject()
       const task = await createTask(project.id)
@@ -452,10 +452,12 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
 
-      // 古い行は自動承認も force delete もされない。
+      // 古い行は自動承認も force delete もされない。ただし紐づく Job が resume で終端化されたので、
+      // actionable state（WAITING_FOR_USER / APPROVED）には残らず既存の SUPERSEDED になる
+      // （invariant: 紐づく Job が terminal なら request は actionable に残らない）。
       const still = storage.approvalRequests.findById(expired.id)
       expect(still).toBeDefined()
-      expect(still?.status).toBe('WAITING_FOR_USER')
+      expect(still?.status).toBe('SUPERSEDED')
       expect(still?.id).not.toBe(newApprovalId)
 
       // 新しい承認は古い行に妨げられず APPROVED まで進む。
@@ -467,14 +469,15 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       expect(approveRes.statusCode).toBe(200)
       expect(storage.approvalRequests.findById(newApprovalId)?.status).toBe('APPROVED')
 
-      // 期限切れの古い行は承認できない（EXPIRED として fail-closed）。自動承認されていない証拠。
+      // 古い行は承認できない（SUPERSEDED は WAITING_FOR_USER ではないので 409 で fail-closed）。
+      // 自動承認されておらず、承認操作で actionable に戻りもしない証拠。
       const approveOld = await app.inject({
         method: 'PATCH',
         url: `/api/approval-requests/${expired.id}/status`,
         payload: { status: 'APPROVED' },
       })
       expect(approveOld.statusCode).toBe(409)
-      expect(storage.approvalRequests.findById(expired.id)?.status).toBe('EXPIRED')
+      expect(storage.approvalRequests.findById(expired.id)?.status).toBe('SUPERSEDED')
     })
   })
 
