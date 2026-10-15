@@ -42,6 +42,7 @@ import {
   MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
   isLiveJob,
   occupiesProject,
+  type Job,
 } from '@ai-team/shared'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapSyncPhaseInput } from '../storage/interface'
 import {
@@ -149,6 +150,46 @@ export function awaitingPromotionAuditKey(
 }
 
 /**
+ * Safety Evidence path で Candidate commit を証明できる Gate 判定の policy version。
+ * #340（Stage 1）より前の Gate 評価は approval 無しの git_commit を ALLOW しないので対象外。
+ * policy を上げるときは、その policy でこの証明が同じ意味を持つかを確認して更新する。
+ */
+const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSION = 'gate-policy-v2'
+
+/** Human Approval path: source Job の linked approval が Candidate への CONSUMED な git_commit。 */
+function hasConsumedCandidateApproval(storage: IStorage, taskId: string, sourceJob: Job): boolean {
+  const approval = sourceJob.approvalId === undefined
+    ? undefined
+    : storage.approvalRequests.findById(sourceJob.approvalId)
+  return approval !== undefined
+    && approval.taskId === taskId
+    && approval.requestedAction === 'git_commit'
+    && approval.status === 'CONSUMED'
+    && approval.targetBranch === TIER_A_CANDIDATE_BRANCH
+}
+
+/**
+ * Safety Evidence path（#340 Stage 1）: approval が link されていない source Job 自身の Gate Evaluation Evidence に、
+ * `bindResultingCommitForJob()` が bind した `resultingCommit` があり、それが source Job の
+ * commit と exact に一致する。該当する evidence がちょうど 1 件のときだけ成立する。
+ */
+function hasBoundCandidateGateEvidence(storage: IStorage, taskId: string, sourceJob: Job): boolean {
+  // approval が link された Job は Human Approval path だけで判定する（CONSUMED 以外を evidence で補わない）。
+  if (sourceJob.approvalId !== undefined) return false
+  if (sourceJob.commitHash === undefined) return false
+  const bound = storage.gateEvaluations.findByJobId(sourceJob.id).filter((evidence) =>
+    evidence.jobId === sourceJob.id
+    && evidence.taskId === taskId
+    && evidence.decision === 'ALLOW'
+    && evidence.bindingVerification === 'authoritative'
+    && evidence.policyVersion === CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSION
+    && evidence.targetBranch === TIER_A_CANDIDATE_BRANCH
+    && evidence.resultingCommit !== undefined
+    && evidence.resultingCommit === sourceJob.commitHash)
+  return bound.length === 1
+}
+
+/**
  * Candidate の完了が canonical master への Promotion を待っているかを判定する共有 predicate。
  *
  * `commitHash` は Worker / generic PATCH から書ける情報なので根拠にしない。Task completion が作った
@@ -160,6 +201,14 @@ export function awaitingPromotionAuditKey(
  * commit + diff であって branch ではない。それでも exact branch は現在の Tier A Candidate operation を
  * 識別できる。approval が無い、`unknown`、または不整合なら従来どおり follow-up を許す側へ戻す。
  * Candidate branch の運用を変える場合は、この predicate も同時に更新しなければならない。
+ *
+ * Candidate commit の証明は次のどちらか（OR）。どちらも成立しなければ従来どおり検出しない:
+ * - Human Approval path: source Job の linked approval が CONSUMED（従来の経路）
+ * - Safety Evidence path（#340 Stage 1）: approval を経ずに commit された source Job 自身の
+ *   Gate Evaluation Evidence に、API が bind した `resultingCommit` がある
+ *
+ * Evidence path は `bindResultingCommitForJob()` が検証済みの事実（commit 実在・parent 一致・
+ * canonical manifest hash 一致）を `resultingCommit` の exact binding として使い、ここで再判定しない。
  *
  * 検出した source completion は既存 audit_log へ一度だけ記録する。分類器と authoritative seam の
  * どちらから呼ばれても、同じ entity id で重複しない。
@@ -189,15 +238,9 @@ export function checkRoadmapCompletionAwaitingPromotion(
       || sourceJob.safeCommand.kind !== 'git_commit'
     ) return []
 
-    const approval = sourceJob.approvalId === undefined
-      ? undefined
-      : storage.approvalRequests.findById(sourceJob.approvalId)
     if (
-      !approval
-      || approval.taskId !== task.id
-      || approval.requestedAction !== 'git_commit'
-      || approval.status !== 'CONSUMED'
-      || approval.targetBranch !== TIER_A_CANDIDATE_BRANCH
+      !hasConsumedCandidateApproval(storage, task.id, sourceJob)
+      && !hasBoundCandidateGateEvidence(storage, task.id, sourceJob)
     ) return []
 
     const externallyReconciled = storage.auditLog
