@@ -209,6 +209,22 @@ Task を park して Project を解放する経路は **既存の ADMIN manual a
   clean 観測と knownGood・abort 認可の種類（manual と technical を混在させない）を再確認し、
   Job の failed 化・park・Approval 消費・監査を atomic に行う。どれかが欠ければ何も変えない。
 
+## CEO が REJECT した git_commit から修正へ戻る経路（2026-10-15 CEO 承認）
+
+REJECT 後の Human Resume（修正指示つき）は、却下された git_commit を作り直さず、元の implement Job へ
+修正指示を載せて戻す。元の implement の特定は `workflowStepKey` の lineage だけで行う。
+
+- **git_commit 側の `resume:` は段数を固定せず遡る。** 2026-09-23 の「最大 1 ホップ」は、PL の daily resume
+  （期限切れ承認の再発行）で段が日数分伸びると REJECT 後に修正へ進めなくなるため改めた
+  （Task b6d4097a で 6 段を実測）。
+- 遡る各段は**同一 Task / Project の git_commit** に限る。キーが名指す 1 件だけを読み、候補探索をしない。
+  欠損・循環・Task の Job 数を超える段数・git_commit 以外の段は fail-closed（Job を作らない）。
+- git_commit の段と review の段を 1 つの walk で混ぜない。端は `review:<id>:git-commit` に限り、
+  review → implement の区間と Design Review evidence の門は従来どおり。
+- **REJECT を AI が自動再開しない**不変条件は変えない（PL triage は `ceo_escalation`）。Human Resume は
+  人の明示操作のまま。Candidate の差分は破棄しない（修正 implement がそのまま引き継ぐ）。
+- 上の「CEO が REJECT した git_commit の解放」（manual abort で park）とは別の経路であり、どちらを使うかは CEO が選ぶ。
+
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
 
 **「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を
