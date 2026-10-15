@@ -156,6 +156,77 @@ function seedTerminalBlocked(): TerminalBlockedFixture {
   return { ...fx, latestJobId: latest.id }
 }
 
+interface RejectedGitCommitFixture extends Fixture {
+  latestJobId: string
+  olderJobId: string
+  rejectedApprovalId: string
+}
+
+function seedRejectedGitCommit(options: {
+  approvalAction?: string
+  approvalStatus?: 'REJECTED' | 'APPROVED' | 'WAITING_FOR_USER'
+  approvalTask?: 'same' | 'foreign'
+  jobProject?: 'same' | 'foreign'
+  targetCommit?: string
+  baseline?: JobWorkspaceBaseline
+  workflowStepKey?: string
+} = {}): RejectedGitCommitFixture {
+  const storage = createSQLiteStorage(':memory:')
+  const project = storage.projects.create({
+    name: 'manual rejected commit', goal: 'g', designPhilosophy: [], status: 'running',
+  })
+  const foreignProject = storage.projects.create({
+    name: 'foreign project', goal: 'g', designPhilosophy: [], status: 'draft',
+  })
+  const task = storage.tasks.create({
+    projectId: project.id, title: 'rejected commit', description: '', status: 'blocked',
+    assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    roadmapTaskKey: 'manual-rejected-item',
+  } as Parameters<IStorage['tasks']['create']>[0])
+  const foreignTask = storage.tasks.create({
+    projectId: project.id, title: 'foreign approval owner', description: '', status: 'pending',
+    assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+  } as Parameters<IStorage['tasks']['create']>[0])
+  const older = storage.jobs.create({
+    taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+  } as Parameters<IStorage['jobs']['create']>[0])
+  const rejected = storage.approvalRequests.create({
+    taskId: options.approvalTask === 'foreign' ? foreignTask.id : task.id,
+    requestedAction: options.approvalAction ?? 'git_commit', riskLevel: 'HIGH',
+    targetBranch: 'ai/manual-abort', targetCommit: options.targetCommit ?? BASELINE.startCommitHash,
+    targetDiffHash: '404c5f2c', changedFiles: ['bounded.ts'], triggeredRules: [], invalidIf: [],
+    status: options.approvalStatus ?? 'REJECTED', expiresAt: FUTURE,
+  } as Parameters<IStorage['approvalRequests']['create']>[0])
+  const latest = storage.jobs.create({
+    taskId: task.id,
+    projectId: options.jobProject === 'foreign' ? foreignProject.id : project.id,
+    agentRole: 'developer_ai', status: 'blocked', approvalId: rejected.id,
+    safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+    ...(options.baseline !== undefined ? { workspaceBaseline: options.baseline } : options.baseline === undefined
+      && Object.prototype.hasOwnProperty.call(options, 'baseline') ? {} : { workspaceBaseline: BASELINE }),
+    workflowStepKey: options.workflowStepKey ?? 'review:any-depth-is-irrelevant:git-commit',
+  } as Parameters<IStorage['jobs']['create']>[0])
+  storage.jobs.update(latest.id, { approvalId: rejected.id })
+  return {
+    storage, projectId: project.id, taskId: task.id, jobId: latest.id,
+    latestJobId: latest.id, olderJobId: older.id, rejectedApprovalId: rejected.id,
+  }
+}
+
+function requestRejectedGitCommitAbort(fx: RejectedGitCommitFixture): string {
+  const abortApprovalId = approve(fx.storage, fx.taskId)
+  const requested = abortTask(fx.storage, {
+    taskId: fx.taskId,
+    approvalRequestId: abortApprovalId,
+    reason: 'operator backed up and restored the candidate',
+  })
+  if (!requested.ok || requested.status !== 'cleanup_requested') {
+    throw new Error(`expected cleanup_requested, got ${JSON.stringify(requested)}`)
+  }
+  return abortApprovalId
+}
+
 /** resumeBlockedTask() がそのまま後継 Job を作れる terminal-blocked 形。 */
 function seedResumableTerminalBlocked(): Fixture {
   const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
@@ -1853,5 +1924,310 @@ describe('abortTask — terminal blocked Task の storage release', () => {
     expect(occupiesProject(fx.storage.tasks.findById(fx.taskId)!)).toBe(false)
     expect(buildSystemState(fx.storage).projects
       .find((project) => project.id === fx.projectId)?.currentTask).toBeUndefined()
+  })
+})
+
+describe('abortTask — directly linked rejected git_commit observation-only release', () => {
+  function failedAudits(fx: RejectedGitCommitFixture): Array<Record<string, unknown>> {
+    return fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'task_aborted' && entry.result === 'failed')
+      .map((entry) => JSON.parse(entry.detail ?? '{}') as Record<string, unknown>)
+  }
+
+  function expectRejectedAbortStateUnchanged(
+    fx: RejectedGitCommitFixture,
+    abortApprovalId: string,
+  ): void {
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+    expect(fx.storage.jobs.findById(fx.latestJobId)).toMatchObject({ status: 'blocked' })
+    expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('APPROVED')
+    expect(fx.storage.approvalRequests.findById(fx.rejectedApprovalId)?.status).toBe('REJECTED')
+  }
+
+  it('direct linked REJECTED approval and clean matching HEAD succeeds atomically', () => {
+    const fx = seedRejectedGitCommit()
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true, taskId: fx.taskId, jobId: fx.latestJobId })
+
+    expect(fx.storage.jobs.findById(fx.latestJobId)).toMatchObject({
+      status: 'failed', stderr: 'manual_abort:rejected_git_commit',
+    })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).not.toMatchObject({
+      abortCleanupRequestedAt: expect.anything(),
+      abortApprovalRequestId: expect.anything(),
+      abortReason: expect.anything(),
+    })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+    expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('CONSUMED')
+    expect(fx.storage.approvalRequests.findById(fx.rejectedApprovalId)?.status).toBe('REJECTED')
+    const success = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'task_aborted' && entry.result === 'success')
+    expect(JSON.parse(success?.detail ?? '{}')).toEqual({
+      taskId: fx.taskId,
+      jobId: fx.latestJobId,
+      rejectedApprovalId: fx.rejectedApprovalId,
+      abortApprovalId,
+      observedHead: BASELINE.startCommitHash,
+      targetDiffHash: '404c5f2c',
+    })
+  })
+
+  it('ignores a seven-hop workflowStepKey because the latest Job link is direct', () => {
+    const fx = seedRejectedGitCommit({
+      workflowStepKey: 'resume:hop-1:resume:hop-2:resume:hop-3:resume:hop-4:resume:hop-5:resume:hop-6:resume:hop-7',
+    })
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('CONSUMED')
+  })
+
+  it('REJECT alone never marks, cleans, fails, or parks', () => {
+    const fx = seedRejectedGitCommit()
+
+    expect(fx.storage.jobs.findById(fx.latestJobId)).toMatchObject({
+      status: 'blocked', failureMetadata: undefined,
+    })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'task_aborted')).toHaveLength(0)
+  })
+
+  it('refuses inherited one-hop rejection without a direct latest-Job link', () => {
+    const fx = seedRejectedGitCommit()
+    fx.storage.jobs.update(fx.latestJobId, { status: 'failed' })
+    const inherited = fx.storage.jobs.create({
+      taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      workflowStepKey: `resume:${fx.latestJobId}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const abortApprovalId = approve(fx.storage, fx.taskId)
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: abortApprovalId, reason: 'must be direct',
+    })).toMatchObject({ ok: false, code: 'TASK_NOT_PARKABLE' })
+    expect(fx.storage.jobs.findById(inherited.id)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+    expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('APPROVED')
+  })
+
+  it.each([
+    ['wrong approval Task', { approvalTask: 'foreign' as const }],
+    ['wrong Job Project', { jobProject: 'foreign' as const }],
+    ['wrong approval action', { approvalAction: 'abort_task' }],
+    ['wrong approval status', { approvalStatus: 'APPROVED' as const }],
+    ['missing baseline', { baseline: undefined }],
+    ['target HEAD mismatch', { targetCommit: 'different-head' }],
+  ])('refuses %s before placing an observation marker', (_name, options) => {
+    const fx = seedRejectedGitCommit(options)
+    const abortApprovalId = approve(fx.storage, fx.taskId)
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: abortApprovalId, reason: 'refuse malformed binding',
+    })).toMatchObject({ ok: false, code: 'TASK_NOT_PARKABLE' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+    expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('APPROVED')
+  })
+
+  it.each([
+    ['dirty observation', { observation: { mode: 'dirty' as const, startCommitHash: BASELINE.startCommitHash, entries: [] } }],
+    ['target HEAD mismatch', { observation: { mode: 'clean' as const, startCommitHash: 'different-head' } }],
+    ['git marker', { knownGood: { ...KNOWN_GOOD, gitOperationMarkers: ['MERGE_HEAD'] } }],
+    ['dirty worktree flag', { knownGood: { ...KNOWN_GOOD, worktreeClean: false } }],
+    ['dirty index', { knownGood: { ...KNOWN_GOOD, indexClean: false } }],
+    ['invalid HEAD flag', { knownGood: { ...KNOWN_GOOD, headValid: false } }],
+    ['blind spot', { knownGood: { ...KNOWN_GOOD, blindSpotsAbsent: false } }],
+  ])('refuses %s, preserves operational state, and deduplicates value-free audit', (_name, override) => {
+    const fx = seedRejectedGitCommit()
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+    const input = {
+      jobId: fx.latestJobId,
+      observation: BASELINE,
+      knownGood: KNOWN_GOOD,
+      ...override,
+    }
+
+    expect(completeAbortCleanup(fx.storage, input)).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expect(completeAbortCleanup(fx.storage, input)).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expectRejectedAbortStateUnchanged(fx, abortApprovalId)
+    expect(failedAudits(fx)).toHaveLength(1)
+    expect(failedAudits(fx)[0]).toEqual({
+      refusalCode: 'VERIFICATION_FAILED',
+      cleanupRequestedAt: fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt,
+      taskId: fx.taskId,
+      jobId: fx.latestJobId,
+      rejectedApprovalId: fx.rejectedApprovalId,
+      abortApprovalId,
+    })
+  })
+
+  it.each([
+    ['quarantine', (fx: RejectedGitCommitFixture) => {
+      const latest = fx.storage.jobs.findById(fx.latestJobId)!
+      fx.storage.jobs.update(latest.id, {
+        failureMetadata: { ...(latest.failureMetadata ?? {}), quarantined: true },
+      })
+    }],
+    ['older blocked sibling', (fx: RejectedGitCommitFixture) => {
+      fx.storage.jobs.update(fx.olderJobId, { status: 'blocked' })
+    }],
+    ['latest Job changed', (fx: RejectedGitCommitFixture) => {
+      fx.storage.jobs.create({
+        taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    }],
+    ['live Job', (fx: RejectedGitCommitFixture) => {
+      const task = fx.storage.tasks.create({
+        projectId: fx.projectId, title: 'live', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as Parameters<IStorage['tasks']['create']>[0])
+      fx.storage.jobs.create({
+        taskId: task.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    }],
+    ['same-Project foreign blocked owner', (fx: RejectedGitCommitFixture) => {
+      const task = fx.storage.tasks.create({
+        projectId: fx.projectId, title: 'foreign owner', description: '', status: 'blocked',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as Parameters<IStorage['tasks']['create']>[0])
+      fx.storage.jobs.create({
+        taskId: task.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    }],
+    ['cross-Project same workingDir user', (fx: RejectedGitCommitFixture) => {
+      const project = fx.storage.projects.create({
+        name: 'cross-project user', goal: 'g', designPhilosophy: [], status: 'draft',
+      })
+      const task = fx.storage.tasks.create({
+        projectId: project.id, title: 'cross owner', description: '', status: 'in_progress',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as Parameters<IStorage['tasks']['create']>[0])
+      fx.storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    }],
+  ] as Array<[string, (fx: RejectedGitCommitFixture) => void]>) (
+    'transaction refuses %s after observation was requested',
+    (_name, mutate) => {
+      const fx = seedRejectedGitCommit()
+      const abortApprovalId = requestRejectedGitCommitAbort(fx)
+      mutate(fx)
+
+      expect(completeAbortCleanup(fx.storage, {
+        jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+      })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+      expectRejectedAbortStateUnchanged(fx, abortApprovalId)
+      expect(failedAudits(fx)).toHaveLength(1)
+    },
+  )
+
+  it.each(['REJECTED', 'CONSUMED'] as const)(
+    'refuses when abort approval changes to %s during observation',
+    (status) => {
+      const fx = seedRejectedGitCommit()
+      const abortApprovalId = requestRejectedGitCommitAbort(fx)
+      fx.storage.approvalRequests.updateStatus(abortApprovalId, status)
+
+      expect(completeAbortCleanup(fx.storage, {
+        jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+      })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+      expect(fx.storage.jobs.findById(fx.latestJobId)?.status).toBe('blocked')
+      expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+      expect(fx.storage.approvalRequests.findById(fx.rejectedApprovalId)?.status).toBe('REJECTED')
+      expect(failedAudits(fx)).toHaveLength(1)
+    },
+  )
+
+  it('refuses an abort approval that expires during observation', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date())
+    const fx = seedRejectedGitCommit()
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+    vi.setSystemTime(new Date(Date.parse(FUTURE) + 1))
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expectRejectedAbortStateUnchanged(fx, abortApprovalId)
+    expect(failedAudits(fx)).toHaveLength(1)
+    vi.useRealTimers()
+  })
+
+  it('refuses when the linked git_commit approval is no longer REJECTED during observation', () => {
+    const fx = seedRejectedGitCommit()
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+    fx.storage.approvalRequests.updateStatus(fx.rejectedApprovalId, 'APPROVED')
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+    expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('APPROVED')
+    expect(failedAudits(fx)).toHaveLength(1)
+  })
+
+  it('rolls back abort approval consumption when the Job write fails', () => {
+    const fx = seedRejectedGitCommit()
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+    const updateJob = fx.storage.jobs.update.bind(fx.storage.jobs)
+    vi.spyOn(fx.storage.jobs, 'update')
+      .mockImplementationOnce(() => {
+        throw new Error('simulated Job write failure')
+      })
+      .mockImplementation(updateJob)
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expectRejectedAbortStateUnchanged(fx, abortApprovalId)
+  })
+
+  it('rolls back Job, Task, and abort approval when success audit persistence fails', () => {
+    const fx = seedRejectedGitCommit()
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+    const recordAudit = fx.storage.auditLog.record.bind(fx.storage.auditLog)
+    vi.spyOn(fx.storage.auditLog, 'record')
+      .mockImplementationOnce(() => {
+        throw new Error('simulated audit write failure')
+      })
+      .mockImplementation(recordAudit)
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expectRejectedAbortStateUnchanged(fx, abortApprovalId)
+  })
+
+  it('manual park emits no technicalEvidenceId and does not activate technical adoption suppression', () => {
+    const fx = seedRejectedGitCommit()
+    requestRejectedGitCommitAbort(fx)
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    const success = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'task_aborted' && entry.result === 'success')
+    expect(success?.detail).not.toContain('technicalEvidenceId')
+
+    const ledger = [
+      '# Roadmap', '', '<!-- roadmap:id=manual-rejected-item state=planned -->',
+      '1. [ ] **Manual rejected item**', '   retry after operator recovery', '',
+    ].join('\n')
+    const candidate = classifyAdoptionCandidates(
+      fx.storage,
+      fx.projectId,
+      readAdoptionCandidates(() => ledger),
+    ).find((item) => item.id === 'manual-rejected-item')
+    expect(candidate).not.toMatchObject({
+      kind: 'not_available', notAvailableReason: 'technical_abort_unchanged',
+    })
   })
 })

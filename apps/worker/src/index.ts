@@ -1032,7 +1032,11 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
       const latestJob = jobs[0]
       const requested = task.status === 'blocked'
         ? latestJob
-          && (latestJob.status === 'failed' || latestJob.status === 'success')
+          && (
+            latestJob.status === 'failed'
+            || latestJob.status === 'success'
+            || (latestJob.status === 'blocked' && latestJob.safeCommand.kind === 'git_commit')
+          )
           && latestJob.failureMetadata?.abortCleanupRequestedAt !== undefined
           ? latestJob
           : undefined

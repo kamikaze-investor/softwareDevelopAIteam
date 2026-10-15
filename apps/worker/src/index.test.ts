@@ -149,7 +149,11 @@ afterEach(() => {
 })
 
 describe('abort cleanup observation reporting', () => {
-  function arrangeAbortCleanup(taskStatus: Task['status'], jobStatus: Job['status']): void {
+  function arrangeAbortCleanup(
+    taskStatus: Task['status'],
+    jobStatus: Job['status'],
+    marked = true,
+  ): void {
     const project = {
       id: 'project-1',
       name: 'AIteamOS',
@@ -167,10 +171,17 @@ describe('abort cleanup observation reporting', () => {
     const requestedJob: Job = {
       ...job,
       status: jobStatus,
-      failureMetadata: {
-        abortCleanupRequestedAt: NOW,
-        abortApprovalRequestId: 'approval-1',
-      },
+      safeCommand: taskStatus === 'blocked' && jobStatus === 'blocked'
+        ? { kind: 'git_commit', workingDir: '/workspace/target' }
+        : job.safeCommand,
+      ...(marked
+        ? {
+            failureMetadata: {
+              abortCleanupRequestedAt: NOW,
+              abortApprovalRequestId: 'approval-1',
+            },
+          }
+        : {}),
     }
     fetchMock.mockImplementation(async (url: string | URL | Request) => {
       const value = String(url)
@@ -232,8 +243,18 @@ describe('abort cleanup observation reporting', () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(true)
   })
 
-  it('ignores a marked blocked Job while the Task itself is blocked', async () => {
+  it('reports an API-marked latest blocked git_commit without modifying the workspace', async () => {
     arrangeAbortCleanup('blocked', 'blocked')
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+    expect(workspaceVerificationMocks.observeWorkspace).toHaveBeenCalledTimes(1)
+    expect(workspaceVerificationMocks.verifyWorkspaceAgainstBaseline).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(true)
+  })
+
+  it('REJECT alone has no cleanup marker and is not observed', async () => {
+    arrangeAbortCleanup('blocked', 'blocked', false)
 
     await expect(reportAbortCleanupObservations()).resolves.toBe(false)
 

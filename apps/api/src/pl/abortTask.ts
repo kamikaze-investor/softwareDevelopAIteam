@@ -60,6 +60,7 @@ import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { protectedViolations, triageBlocked } from './blockedTriage'
 import { readAdoptionCandidates } from './adoptionStep'
+import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 import {
   isEligibleTechnicalAbortDiagnosis,
   recordTechnicalAbortEvidence,
@@ -166,7 +167,19 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
           `Task ${task.id} is blocked but has no Job; use the existing /recover route before abort_task`,
       }
     }
-    const nonTerminal = taskJobs.find((job) => job.status !== 'failed' && job.status !== 'success')
+    const latestJob = taskJobs[0]
+    const linkedRejection = latestJob === undefined
+      ? undefined
+      : resolveLinkedGitCommitRejection(latestJob, {
+          findJobById: (id) => storage.jobs.findById(id),
+          findApprovalById: (id) => storage.approvalRequests.findById(id),
+        }, { directOnly: true })
+    const rejectedGitCommitException = latestJob?.status === 'blocked' && linkedRejection !== undefined
+    const nonTerminal = taskJobs.find((job, index) => (
+      job.status !== 'failed'
+      && job.status !== 'success'
+      && !(rejectedGitCommitException && index === 0 && job.status === 'blocked')
+    ))
     if (nonTerminal) {
       return {
         ok: false,
@@ -195,6 +208,24 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
         reason:
           `Task ${task.id}'s terminal Jobs do not share one non-empty workingDir; `
           + 'one workspace observation cannot prove them all safe',
+      }
+    }
+    if (rejectedGitCommitException) {
+      const missingBaseline = taskJobs.find((job) => job.workspaceBaseline === undefined)
+      const startHeads = new Set(taskJobs.map((job) => job.workspaceBaseline?.startCommitHash))
+      if (
+        latestJob.taskId !== task.id
+        || latestJob.projectId !== task.projectId
+        || linkedRejection.approval.taskId !== task.id
+        || missingBaseline !== undefined
+        || startHeads.size !== 1
+        || linkedRejection.approval.targetCommit !== latestJob.workspaceBaseline?.startCommitHash
+      ) {
+        return {
+          ok: false,
+          code: 'TASK_NOT_PARKABLE',
+          reason: `Task ${task.id}'s rejected git_commit is not bound to its shared workspace start HEAD`,
+        }
       }
     }
   }
@@ -336,6 +367,49 @@ export type CompleteAbortCleanupResult =
   | { ok: true; taskId: string; jobId: string }
   | { ok: false; code: 'NOT_REQUESTED' | 'NOT_FOUND' | 'VERIFICATION_FAILED' | 'PRECONDITION_FAILED'; reason: string }
 
+function recordManualRejectedGitCommitRefusal(
+  storage: IStorage,
+  job: Job,
+  refusalCode: string,
+): void {
+  const metadata = job.failureMetadata
+  if (
+    job.status !== 'blocked'
+    || job.safeCommand.kind !== 'git_commit'
+    || !job.approvalId
+    || !metadata?.abortCleanupRequestedAt
+    || !metadata.abortApprovalRequestId
+  ) return
+
+  const duplicate = storage.auditLog.findByEntity('task', job.taskId).some((entry) => {
+    if (entry.operation !== 'task_aborted' || entry.result !== 'failed') return false
+    try {
+      const detail = JSON.parse(entry.detail ?? '{}') as Record<string, unknown>
+      return detail.refusalCode === refusalCode
+        && detail.cleanupRequestedAt === metadata.abortCleanupRequestedAt
+    } catch {
+      return false
+    }
+  })
+  if (duplicate) return
+
+  storage.auditLog.record({
+    actor: 'api',
+    operation: 'task_aborted',
+    entityType: 'task',
+    entityId: job.taskId,
+    result: 'failed',
+    detail: JSON.stringify({
+      refusalCode,
+      cleanupRequestedAt: metadata.abortCleanupRequestedAt,
+      taskId: job.taskId,
+      jobId: job.id,
+      rejectedApprovalId: job.approvalId,
+      abortApprovalId: metadata.abortApprovalRequestId,
+    }),
+  })
+}
+
 /**
  * Worker が観測を報告したときの最終段。
  *
@@ -405,6 +479,8 @@ export function completeAbortCleanup(
         stage: 'worker_cleanup',
       })
       retireTechnicalAbortCleanup(storage, job, input.refusalCode)
+    } else {
+      recordManualRejectedGitCommitRefusal(storage, job, input.refusalCode)
     }
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'Worker refused abort cleanup' }
   }
@@ -417,6 +493,8 @@ export function completeAbortCleanup(
         stage: 'worker_cleanup',
       })
       retireTechnicalAbortCleanup(storage, job, 'FINAL_OBSERVATION_MISSING')
+    } else {
+      recordManualRejectedGitCommitRefusal(storage, job, 'FINAL_OBSERVATION_MISSING')
     }
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'final workspace observation is missing' }
   }
@@ -448,6 +526,8 @@ export function completeAbortCleanup(
         stage: 'final_transaction',
       })
       retireTechnicalAbortCleanup(storage, job, released.code)
+    } else {
+      recordManualRejectedGitCommitRefusal(storage, job, released.code)
     }
     return {
       ok: false,
