@@ -34,7 +34,7 @@ import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import { parseResumeSource, resolveReviewedImplementationFrom, retryStepKeyFor } from '../designReview/repairPolicy'
-import { technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
+import { hasTechnicalAbortMetadata, technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
 import type {
   AbortAuthorization,
   TechnicalAbortCleanupSummary,
@@ -48,6 +48,7 @@ import {
   parseGitCommitResumeStepKey,
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
+import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -2994,6 +2995,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `job ${job.id} does not carry this abort cleanup authorization`,
             }
           }
+          // manual と technical の metadata family は transaction 内でも排他（TOCTOU）。
+          if (job.failureMetadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(job.failureMetadata)) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id}'s abort cleanup request mixes manual and technical authorization`,
+            }
+          }
           // quarantine 中の行は「安全と証明できない限り解放しない」既存不変条件に従い触らない。
           if (job.failureMetadata?.quarantined === true) {
             return {
@@ -3286,6 +3295,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `job ${job.id} does not carry this abort cleanup request`,
             }
           }
+          // **manual と technical の metadata family は transaction 内でも排他。** 外側の確認後に
+          // 別接続が metadata を書き換えても、承認消費・park の前にここで止める（TOCTOU）。
+          if (job.failureMetadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(job.failureMetadata)) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id}'s abort cleanup request mixes manual and technical authorization`,
+            }
+          }
           if (task.status !== 'blocked' || task.roadmapActive !== true) {
             return {
               ok: false as const,
@@ -3321,6 +3339,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 + 'a later execution superseded this abort cleanup request',
             }
           }
+          if (latestJob.taskId !== task.id || latestJob.projectId !== task.projectId) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `latest job ${latestJob.id} is not bound to task ${task.id} and project ${task.projectId}`,
+            }
+          }
           const cleanupRequestedAt = job.failureMetadata.abortCleanupRequestedAt
           const cleanupRequestedAtMs = Date.parse(cleanupRequestedAt)
           const latestJobCreatedAtMs = Date.parse(latestJob.createdAt)
@@ -3337,9 +3362,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`,
             }
           }
-          const nonTerminal = taskJobs.find(
-            (candidate) => candidate.status !== 'failed' && candidate.status !== 'success',
-          )
+          const linkedRejection = resolveLinkedGitCommitRejection(latestJob, {
+            findApprovalById: (id) => approvalRequests.findById(id),
+          })
+          const rejectedGitCommitException = input.authorization.kind === 'manual_approval'
+            && latestJob.status === 'blocked'
+            && linkedRejection !== undefined
+          const nonTerminal = taskJobs.find((candidate, index) => (
+            candidate.status !== 'failed'
+            && candidate.status !== 'success'
+            && !(rejectedGitCommitException && index === 0 && candidate.status === 'blocked')
+          ))
           if (nonTerminal) {
             return {
               ok: false as const,
@@ -3454,6 +3487,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
           if (
+            rejectedGitCommitException
+            && linkedRejection.approval.targetCommit !== input.observation.startCommitHash
+          ) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `rejected approval ${linkedRejection.approval.id} targets HEAD `
+                + `${linkedRejection.approval.targetCommit}, not observed HEAD ${input.observation.startCommitHash}`,
+            }
+          }
+          if (
             input.authorization.kind === 'technical_evidence'
             && !taskJobs.some((candidate) => candidate.workspaceBaseline?.mode === 'clean')
           ) {
@@ -3477,7 +3522,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 + 'refusing to park',
             }
           }
-          if (input.authorization.kind === 'technical_evidence' && workingDir !== undefined) {
+          if (
+            (input.authorization.kind === 'technical_evidence' || rejectedGitCommitException)
+            && workingDir !== undefined
+          ) {
             const workspaceUser = findWorkspaceUserAnywhere(workingDir, task.id)
             if (workspaceUser) {
               return {
@@ -3502,6 +3550,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
+          if (rejectedGitCommitException) {
+            const failureMetadata = { ...(job.failureMetadata ?? {}) }
+            delete failureMetadata.abortCleanupRequestedAt
+            delete failureMetadata.abortApprovalRequestId
+            delete failureMetadata.abortReason
+            jobs.update(job.id, {
+              status: 'failed',
+              completedAt: now(),
+              stderr: 'manual_abort:rejected_git_commit',
+              failureMetadata,
+            })
+          }
           tasks.update(task.id, { status: 'pending', roadmapActive: false })
           const technical = input.authorization.kind === 'technical_evidence'
           const staleApprovalCount = technical && (input.cleanupSummary?.changedPathCount ?? 0) > 0
@@ -3525,13 +3585,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                   cleanupSummary: input.cleanupSummary as TechnicalAbortCleanupSummary,
                   staleApprovalCount,
                 })
-              : `parked blocked -> pending (approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}, `
-                + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}): `
-                + input.reason.slice(0, 300),
+              : rejectedGitCommitException
+                ? JSON.stringify({
+                    taskId: task.id,
+                    jobId: job.id,
+                    rejectedApprovalId: linkedRejection.approval.id,
+                    abortApprovalId: (input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId,
+                    observedHead: input.observation.startCommitHash,
+                    targetDiffHash: linkedRejection.approval.targetDiffHash,
+                  })
+                : `parked blocked -> pending (approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}, `
+                  + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}): `
+                  + input.reason.slice(0, 300),
           })
 
           const updatedTask = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
-          return { ok: true as const, job, task: updatedTask }
+          const updatedJob = deserializeJob(db.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id) as any)
+          return { ok: true as const, job: updatedJob, task: updatedTask }
         })
         // live Job / foreign owner の確認から approval consume・park まで write lock を保持する。
         // 別 connection の claim が検証直後に割り込む余地を作らない。

@@ -80,6 +80,17 @@ function jobsUsingWorkingDir(storage: IStorage, workingDir: string | undefined):
 }
 
 /**
+ * Technical Abort の metadata family を1つでも持つか。manual abort（`abortApprovalRequestId`）と
+ * 同じ Job に共存させない（共存すると observation-only の manual abort が destructive cleanup を継ぐ）。
+ */
+export function hasTechnicalAbortMetadata(metadata: Job['failureMetadata']): boolean {
+  return metadata?.abortTechnicalEvidenceId !== undefined
+    || metadata?.abortTechnicalStateFingerprint !== undefined
+    || metadata?.abortTechnicalRootCauseClass !== undefined
+    || metadata?.abortTechnicalAttentionKind !== undefined
+}
+
+/**
  * TOCTOU re-check 用 fingerprint。protected_path は triage の最優先規則なので、Task と全 Job、
  * latest Job の guard facts が同一なら root-cause 判定を変える入力も同一である。
  */

@@ -1032,7 +1032,11 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
       const latestJob = jobs[0]
       const requested = task.status === 'blocked'
         ? latestJob
-          && (latestJob.status === 'failed' || latestJob.status === 'success')
+          && (
+            latestJob.status === 'failed'
+            || latestJob.status === 'success'
+            || (latestJob.status === 'blocked' && latestJob.safeCommand.kind === 'git_commit')
+          )
           && latestJob.failureMetadata?.abortCleanupRequestedAt !== undefined
           ? latestJob
           : undefined
@@ -1063,7 +1067,9 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
         removedPathCount: number
       } | undefined
       const technicalEvidenceId = requested.failureMetadata?.abortTechnicalEvidenceId
-      if (technicalEvidenceId !== undefined) {
+      const manualApprovalRequestId = requested.failureMetadata?.abortApprovalRequestId
+      const technicalCleanup = technicalEvidenceId !== undefined && manualApprovalRequestId === undefined
+      if (technicalCleanup) {
         const baseline = requested.failureMetadata?.workspaceEndFingerprint
         const verified = verifyWorkspaceAgainstBaseline(requested.safeCommand.workingDir, baseline)
         if (
@@ -1132,7 +1138,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
             body: JSON.stringify({
               observation: finalObservation,
               knownGood: finalKnownGood,
-              ...(technicalEvidenceId !== undefined
+              ...(technicalCleanup
                 ? {
                     preCleanupObservation: observed.observation,
                     cleanupSummary,
