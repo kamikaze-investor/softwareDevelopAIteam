@@ -34,7 +34,7 @@ import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import { parseResumeSource, resolveReviewedImplementationFrom, retryStepKeyFor } from '../designReview/repairPolicy'
-import { technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
+import { hasTechnicalAbortMetadata, technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
 import type {
   AbortAuthorization,
   TechnicalAbortCleanupSummary,
@@ -2903,6 +2903,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `job ${job.id} does not carry this abort cleanup authorization`,
             }
           }
+          // manual と technical の metadata family は transaction 内でも排他（TOCTOU）。
+          if (job.failureMetadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(job.failureMetadata)) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id}'s abort cleanup request mixes manual and technical authorization`,
+            }
+          }
           // quarantine 中の行は「安全と証明できない限り解放しない」既存不変条件に従い触らない。
           if (job.failureMetadata?.quarantined === true) {
             return {
@@ -3193,6 +3201,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
               reason: `job ${job.id} does not carry this abort cleanup request`,
+            }
+          }
+          // **manual と technical の metadata family は transaction 内でも排他。** 外側の確認後に
+          // 別接続が metadata を書き換えても、承認消費・park の前にここで止める（TOCTOU）。
+          if (job.failureMetadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(job.failureMetadata)) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id}'s abort cleanup request mixes manual and technical authorization`,
             }
           }
           if (task.status !== 'blocked' || task.roadmapActive !== true) {

@@ -1683,6 +1683,41 @@ describe('P2-2 Automatic Technical Abort', () => {
       evidenceId: 'evidence-1',
     })
   })
+
+  it('the final transaction re-checks the metadata family when it changes after the outer read (TOCTOU)', () => {
+    const fx = seed()
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId, reason: 'manual finalization toctou',
+    })).toMatchObject({ ok: true, status: 'cleanup_requested' })
+    const outerView = fx.storage.jobs.findById(fx.jobId)
+    if (outerView?.failureMetadata === undefined) throw new Error('cleanup carrier missing metadata')
+    // 外側の読み取りは manual だけを見せ、DB には別接続が technical metadata を書き足した状態を作る。
+    fx.storage.jobs.update(outerView.id, {
+      failureMetadata: { ...outerView.failureMetadata, abortTechnicalEvidenceId: 'evidence-1' },
+    })
+    const jobs = new Proxy(fx.storage.jobs, {
+      get(target, property, receiver) {
+        if (property === 'findById') {
+          return (id: string) => (id === fx.jobId ? outerView : target.findById(id))
+        }
+        const value = Reflect.get(target, property, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const storage = new Proxy(fx.storage, {
+      get(target, property, receiver) {
+        return property === 'jobs' ? jobs : Reflect.get(target, property, receiver)
+      },
+    })
+
+    expect(completeAbortCleanup(storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: true })
+    expect(fx.storage.jobs.findById(fx.jobId)).toMatchObject({ status: 'blocked' })
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('APPROVED')
+  })
 })
 
 describe('P2-2 re-adoption suppression and re-enable signals', () => {
@@ -2062,6 +2097,35 @@ describe('abortTask — directly linked rejected git_commit observation-only rel
       observedHead: BASELINE.startCommitHash,
       targetDiffHash: '404c5f2c',
     })
+  })
+
+  it('the final transaction refuses technical metadata written after the outer read (TOCTOU)', () => {
+    const fx = seedRejectedGitCommit()
+    const abortApprovalId = requestRejectedGitCommitAbort(fx)
+    const outerView = fx.storage.jobs.findById(fx.latestJobId)
+    if (outerView?.failureMetadata === undefined) throw new Error('cleanup carrier missing metadata')
+    fx.storage.jobs.update(outerView.id, {
+      failureMetadata: { ...outerView.failureMetadata, abortTechnicalStateFingerprint: 'fingerprint-1' },
+    })
+    const jobs = new Proxy(fx.storage.jobs, {
+      get(target, property, receiver) {
+        if (property === 'findById') {
+          return (id: string) => (id === fx.latestJobId ? outerView : target.findById(id))
+        }
+        const value = Reflect.get(target, property, receiver)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+    const storage = new Proxy(fx.storage, {
+      get(target, property, receiver) {
+        return property === 'jobs' ? jobs : Reflect.get(target, property, receiver)
+      },
+    })
+
+    expect(completeAbortCleanup(storage, {
+      jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false })
+    expectRejectedAbortStateUnchanged(fx, abortApprovalId)
   })
 
   it('ignores a seven-hop workflowStepKey because the latest Job link is direct', () => {

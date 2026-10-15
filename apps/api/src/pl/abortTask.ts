@@ -62,6 +62,7 @@ import { protectedViolations, triageBlocked } from './blockedTriage'
 import { readAdoptionCandidates } from './adoptionStep'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 import {
+  hasTechnicalAbortMetadata,
   isEligibleTechnicalAbortDiagnosis,
   recordTechnicalAbortEvidence,
   recordTechnicalAbortRefusal,
@@ -110,13 +111,6 @@ export type AbortTaskResult =
  */
 function holdsWorkspaceOwnership(task: { status: string }, job: Job): boolean {
   return holdsWorkspaceWhenBlocked(task, job)
-}
-
-function hasTechnicalAbortMetadata(metadata: Job['failureMetadata']): boolean {
-  return metadata?.abortTechnicalEvidenceId !== undefined
-    || metadata?.abortTechnicalStateFingerprint !== undefined
-    || metadata?.abortTechnicalRootCauseClass !== undefined
-    || metadata?.abortTechnicalAttentionKind !== undefined
 }
 
 function recordAbortAuthorizationConflict(
