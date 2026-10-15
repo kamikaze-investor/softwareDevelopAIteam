@@ -42,6 +42,12 @@ import type {
 // 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
 // 型以外に storage へ依存しないモジュールなので循環しない。
 import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
+import {
+  classifyGitCommitResumeLineage,
+  exactGitCommitResumePredecessor,
+  parseGitCommitResumeStepKey,
+  type GitCommitResumeLineageClassification,
+} from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 
 export class SingleRunningProjectError extends Error {
@@ -1620,8 +1626,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **既存 `workflowStepKey` だけ**で逆引きする。
    *
    * ```
-   * [任意] resume:<sourceJobId>:1        … 1段だけ正規化する
-   *   → git_commit  review:<reviewJobId>:git-commit
+   * [任意] resume:<anchorGitCommitJobId>:<positive generation>
+   *   → canonical git_commit  review:<reviewJobId>:git-commit（exact id を1回だけ参照）
    *   → [0..n 段] review resume:<reviewJobId>:1   … Human Resume で再実行された review（D4）
    *   → review      implement:<implementJobId>:review
    *   → implement   (aiCliMode = 'implement')
@@ -1630,13 +1636,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **7条件をすべて満たすときだけ返す。1つでも欠ければ fail-closed**（CEO 判断・2026-09-23）。
    * 同一 diff を再承認へ回さないことのほうが、自動復旧できることより優先される。
    *
-   * **2 つの区間を混ぜない。** git_commit 側（1.〜4.）は従来どおり `resume:` を最大 1 ホップだけ
+   * **2 つの区間を混ぜない。** git_commit 側は fixed anchor を exact id で1回だけ
    * 正規化する。そこで得た review Job から implement までの区間だけ、D1 と共用の
    * `resolveReviewedImplementationFrom()`（review Job だけを経由する bounded / cycle-safe な walk。
    * CEO 承認・2026-09-28）を使う。下の禁止事項は git_commit 側についてのものである。
    *
    * **やってはいけないこと（意図的に実装していない）**:
-   * - git_commit 側の 2段以上の `resume:` traversal（1ホップ正規化した先は `review:...:git-commit` しか許さない）
+   * - git_commit generation 間の `resume:` traversal（anchor は `review:...:git-commit` しか許さない）
    * - recursive ancestry resolver
    * - 「最新 implement Job」の推測
    * - 複数候補からの選択
@@ -1660,44 +1666,90 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * 新しい Approval は作られないので **その Job に `approvalId` は付かない**
    * （`ux_jobs_approval_id` が UNIQUE なので、既存の却下行を2つ目の Job へ結び直すこともできない）。
    * 何もしないと「却下されていない Job」に見え、PL が同じ内容を自動 resume し続ける
-   * （独立レビュー指摘）。そこで `resume:<sourceJobId>:1` を **1回だけ**辿り、
-   * 元の Job の linked Approval を見る。**provenance と同じ規約・同じ1ホップ**であり、
+   * （独立レビュー指摘）。そこで `resume:<anchorJobId>:<generation>` の anchor を **1回だけ**参照し、
+   * canonical anchor Job の linked Approval を見る。**provenance と同じ規約・同じ1参照**であり、
    * 探索でも候補選択でもない。
    */
-  function isLinkedGitCommitRejection(job: Job): boolean {
-    return resolveLinkedGitCommitRejection(job, {
-      findJobById: (id) => jobs.findById(id),
-      findApprovalById: (id) => approvalRequests.findById(id),
-    }) !== undefined
+  function gitCommitResumeLineage(job: Job): GitCommitResumeLineageClassification {
+    const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
+    return classifyGitCommitResumeLineage({
+      currentJob: job,
+      referencedJob: parsed !== undefined ? jobs.findById(parsed.anchorJobId) : undefined,
+      taskJobs: jobs.findByTaskId(job.taskId),
+      requireCurrentIsLatestGeneration: true,
+    })
+  }
+
+  function isLinkedGitCommitRejection(
+    job: Job,
+    lineage: GitCommitResumeLineageClassification,
+  ): boolean {
+    if (job.safeCommand.kind !== 'git_commit') return false
+
+    // link のある Job はそれだけで判定する。
+    if (job.approvalId) return isGitCommitRejectionOf(job, job.approvalId)
+
+    if (lineage.kind === 'new_scheme') {
+      // link が無い generation は、事前に exact id で1回だけ検証した canonical anchor の
+      // link を見る。直前 generation や別候補を探索しない。
+      const anchorJob = lineage.lineage.anchorJob
+      return anchorJob.approvalId !== undefined
+        && isGitCommitRejectionOf(anchorJob, anchorJob.approvalId)
+    }
+
+    if (lineage.kind !== 'legacy') return false
+
+    // Legacy behaviour: `resume:<source>:1` is dereferenced exactly once, even
+    // when source is another resume Job. Deeper chains remain unresolved.
+    const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
+    if (!resumed) return false
+    const source = lineage.referencedJob
+    if (!source || !source.approvalId) return false
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return false
+    if (source.safeCommand.kind !== 'git_commit') return false
+    return isGitCommitRejectionOf(source, source.approvalId)
+  }
+
+  function isGitCommitRejectionOf(job: Job, approvalId: string): boolean {
+    const approval = approvalRequests.findById(approvalId)
+    if (!approval) return false
+    if (approval.id !== approvalId) return false
+    if (approval.taskId !== job.taskId) return false
+    if (approval.requestedAction !== 'git_commit') return false
+    return approval.status === 'REJECTED'
   }
 
   function resolveSourceImplementJobForRejectedGitCommit(
     latestJob: Job,
+    lineage: GitCommitResumeLineageClassification,
   ): { ok: true; job: Job } | { ok: false; reason: string } {
     const sameOwner = (job: Job): boolean =>
       job.taskId === latestJob.taskId && job.projectId === latestJob.projectId
 
-    // 2. `resume:<sourceJobId>:1` は **1回だけ** 辿る。
-    //    latest が最初から `review:...:git-commit` ならここは素通りする。
-    let gitCommitJob = latestJob
-    const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
-    if (resumed) {
-      const source = jobs.findById(resumed[1] as string)
-      if (!source) {
-        return { ok: false, reason: `resume source job ${resumed[1]} not found` }
+    // 2. New-scheme generations receive their validated canonical anchor.
+    //    Legacy rows retain the previous one-hop `resume:<source>:1` normalization.
+    let gitCommitJob = lineage.kind === 'new_scheme' ? lineage.lineage.anchorJob : latestJob
+    if (lineage.kind === 'legacy') {
+      const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
+      if (resumed) {
+        const source = lineage.referencedJob
+        if (!source) return { ok: false, reason: `resume source job ${resumed[1]} not found` }
+        if (!sameOwner(source)) {
+          return { ok: false, reason: 'resume source job belongs to a different task or project' }
+        }
+        if (source.safeCommand.kind !== 'git_commit') {
+          return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
+        }
+        gitCommitJob = source
       }
-      // 3. 同一 Task / Project の git_commit であること。
-      if (!sameOwner(source)) {
-        return { ok: false, reason: 'resume source job belongs to a different task or project' }
-      }
-      if (source.safeCommand.kind !== 'git_commit') {
-        return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
-      }
-      gitCommitJob = source
+    }
+
+    if (!sameOwner(gitCommitJob)) {
+      return { ok: false, reason: 'git_commit anchor belongs to a different task or project' }
     }
 
     // 4. `review:<reviewJobId>:git-commit`。
-    //    ここで2段目の `resume:` は一致しないので、**多段 traversal は構造的に起きない**。
+    //    Legacy nested resume sources do not match, preserving the old fail-closed result.
     const reviewRef = /^review:([^:]+):git-commit$/.exec(gitCommitJob.workflowStepKey ?? '')
     if (!reviewRef) {
       return {
@@ -2670,6 +2722,31 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, reason: 'The latest approval request is waiting for user review' }
         }
 
+        // Recognized git_commit anchors/generations use fixed anchor + generation.
+        // The referenced Job is read exactly once and generations are checked as a set.
+        // Legacy keyless/other-key/nested-:1 rows keep the previous nested resume writer;
+        // an invalid recognized lineage never falls back to that legacy path.
+        const gitCommitLineage = latestJob.safeCommand.kind === 'git_commit'
+          ? gitCommitResumeLineage(latestJob)
+          : undefined
+        if (gitCommitLineage?.kind === 'invalid_new_scheme') {
+          if (
+            latestJob.approvalId !== undefined
+            && isGitCommitRejectionOf(latestJob, latestJob.approvalId)
+          ) {
+            return {
+              ok: false,
+              code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED',
+              reason: gitCommitLineage.reason,
+            }
+          }
+          return {
+            ok: false,
+            code: 'GIT_COMMIT_RESUME_LINEAGE_INVALID',
+            reason: gitCommitLineage.reason,
+          }
+        }
+
         // **CEO が REJECT した git_commit は、同じ commit を作り直さない。**
         //
         // ここを素通しにすると、resume が `instructionPrompt` を捨てて同一 SafeCommand を
@@ -2682,8 +2759,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 一度も下っていない」状態で、同じ diff で新しい承認サイクルを始めるのが正しい。
         // 条件を `instructionPrompt` の有無にしないのは、route も PL も**常に非空**を
         // 渡すためで、そうすると既存の正常経路まで変わってしまう。
-        if (isLinkedGitCommitRejection(latestJob)) {
-          const source = resolveSourceImplementJobForRejectedGitCommit(latestJob)
+        if (
+          gitCommitLineage !== undefined
+          && isLinkedGitCommitRejection(latestJob, gitCommitLineage)
+        ) {
+          const source = resolveSourceImplementJobForRejectedGitCommit(
+            latestJob,
+            gitCommitLineage,
+          )
           if (!source.ok) {
             return { ok: false, code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED', reason: source.reason }
           }
@@ -2728,12 +2811,21 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 変えて作成するため approvalId を引き継がず、/gate/check が現在のdiffに対して
         // 新しいapprovalを発行する（既存の git_commit Job生成と同じ形、既存のGate/Queueのまま）。
         if (latestJob.safeCommand.kind === 'git_commit') {
+          if (gitCommitLineage === undefined) {
+            return {
+              ok: false,
+              code: 'GIT_COMMIT_RESUME_LINEAGE_INVALID',
+              reason: 'git_commit resume lineage was not validated',
+            }
+          }
           const job = jobs.create({
             taskId,
             projectId: latestJob.projectId,
             agentRole: latestJob.agentRole,
             status: 'queued',
-            workflowStepKey: `resume:${latestJob.id}:1`,
+            workflowStepKey: gitCommitLineage.kind === 'new_scheme'
+              ? gitCommitLineage.lineage.nextWorkflowStepKey
+              : `resume:${latestJob.id}:1`,
             safeCommand: { ...latestJob.safeCommand, workingDir: TARGET_WORKING_DIR },
             dryRun: latestJob.dryRun,
           })
@@ -3271,9 +3363,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
           const linkedRejection = resolveLinkedGitCommitRejection(latestJob, {
-            findJobById: (id) => jobs.findById(id),
             findApprovalById: (id) => approvalRequests.findById(id),
-          }, { directOnly: true })
+          })
           const rejectedGitCommitException = input.authorization.kind === 'manual_approval'
             && latestJob.status === 'blocked'
             && linkedRejection !== undefined
@@ -6311,7 +6402,8 @@ function runMigrations(db: Database.Database): void {
 /**
  * `resumeBlockedTask()` が正式な後継を作成済みなのに source が `blocked` のまま残った既存行を、
  * 現行の handoff invariant へ揃える。推測はせず、同一 Task に canonical な
- * `resume:<sourceJobId>:<n>` が保存されている場合だけを proof とする。
+ * resume predecessor（git_commit は fixed generation、それ以外は従来 source id）が
+ * exact に保存されている場合だけを proof とする。
  *
  * malformed な failure_metadata は「quarantine でない」と証明できないため触らない。
  * status の CAS と audit は同一 transaction で、再起動時は `blocked` 条件により冪等である。
@@ -6325,13 +6417,44 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       ORDER BY rowid ASC
     `).all() as Array<{ id: string; task_id: string; failure_metadata: string | null; approval_id: string | null }>
 
-    const successorsForTask = db.prepare(`
-      SELECT id, workflow_step_key
-      FROM jobs
-      WHERE task_id = ? AND workflow_step_key IS NOT NULL
-      ORDER BY rowid ASC
-    `)
+    const jobsForTask = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY rowid ASC')
+    const jobById = db.prepare('SELECT * FROM jobs WHERE id = ?')
     const approvalStatus = db.prepare('SELECT status FROM approval_requests WHERE id = ?')
+
+    const exactResumeSuccessors = (sourceJobId: string, taskId: string): Job[] => {
+      const taskJobs = (jobsForTask.all(taskId) as unknown[]).map(deserializeJob)
+      return taskJobs.filter((candidate) => {
+        if (candidate.workflowStepKey?.startsWith('resume:') !== true) return false
+
+        // Fixed-anchor git_commit generations name the anchor, not generation n-1.
+        // Legacy git_commit rows retain the old parseResumeSource exact match.
+        if (candidate.safeCommand.kind === 'git_commit') {
+          const parsed = parseGitCommitResumeStepKey(candidate.workflowStepKey)
+          const referencedRow = parsed === undefined
+            ? undefined
+            : jobById.get(parsed.anchorJobId) as unknown
+          const referencedJob = referencedRow === undefined ? undefined : deserializeJob(referencedRow)
+          const classification = classifyGitCommitResumeLineage({
+            currentJob: candidate,
+            referencedJob,
+            taskJobs,
+            requireCurrentIsLatestGeneration: false,
+          })
+          if (classification.kind === 'invalid_new_scheme') return false
+          if (classification.kind === 'legacy') {
+            return parseResumeSource(candidate.workflowStepKey) === sourceJobId
+          }
+          return exactGitCommitResumePredecessor({
+            successor: candidate,
+            lineage: classification.lineage,
+            taskJobs,
+          })?.id === sourceJobId
+        }
+
+        // Non-git_commit resume semantics are unchanged.
+        return parseResumeSource(candidate.workflowStepKey) === sourceJobId
+      })
+    }
 
     for (const source of sources) {
       // 承認待ちが結び付いたままの行は、その承認が approveAndResumeJob() で同じ行を動かしうる。
@@ -6354,10 +6477,7 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
         if ((metadata as { quarantined?: unknown }).quarantined === true) continue
       }
 
-      const successor = (successorsForTask.all(source.task_id) as Array<{
-        id: string
-        workflow_step_key: string
-      }>).find((candidate) => parseResumeSource(candidate.workflow_step_key) === source.id)
+      const successor = exactResumeSuccessors(source.id, source.task_id)[0]
       if (!successor) continue
 
       const terminalized = db.prepare(
@@ -6372,7 +6492,7 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
     // `completeResumeHandoff()` が source の request を supersede するようになる前に終端化された
     // 行（および上のループで今回終端化した行）を、同じ invariant へ揃える。
     // proof は「同一 Task・同一 Project・同じ SafeCommand kind で、canonical な
-    // `resume:<sourceJobId>:<n>`（`parseResumeSource()`）が source を exact に指す後継が **ちょうど1件**」。
+    // resume predecessor が source を exact に指す後継が **ちょうど1件**」。
     // 曖昧（0件 / 複数件 / kind 不明）なら触らない（fail-closed）。
     const terminalSourcesWithActiveApproval = db.prepare(`
       SELECT j.id, j.task_id, j.project_id, j.approval_id, j.safe_command
@@ -6381,12 +6501,6 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       WHERE j.status = 'failed' AND a.status IN ('WAITING_FOR_USER', 'APPROVED')
       ORDER BY j.rowid ASC
     `).all() as Array<{ id: string; task_id: string; project_id: string; approval_id: string; safe_command: string }>
-    const resumeLineageCandidates = db.prepare(`
-      SELECT id, project_id, workflow_step_key, safe_command
-      FROM jobs
-      WHERE task_id = ? AND workflow_step_key IS NOT NULL
-      ORDER BY rowid ASC
-    `)
     const commandKind = (safeCommand: string): string | undefined => {
       try {
         const kind = (JSON.parse(safeCommand) as { kind?: unknown }).kind
@@ -6399,15 +6513,9 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
     for (const source of terminalSourcesWithActiveApproval) {
       const sourceKind = commandKind(source.safe_command)
       if (sourceKind === undefined) continue
-      const successors = (resumeLineageCandidates.all(source.task_id) as Array<{
-        id: string
-        project_id: string
-        workflow_step_key: string
-        safe_command: string
-      }>).filter((candidate) =>
-        parseResumeSource(candidate.workflow_step_key) === source.id
-        && candidate.project_id === source.project_id
-        && commandKind(candidate.safe_command) === sourceKind)
+      const successors = exactResumeSuccessors(source.id, source.task_id).filter((candidate) =>
+        candidate.projectId === source.project_id
+        && candidate.safeCommand.kind === sourceKind)
       if (successors.length !== 1) continue
       if (!supersedeApprovalOfTerminalJob(db, source.approval_id, source.task_id)) continue
       db.prepare(`

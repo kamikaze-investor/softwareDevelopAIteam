@@ -209,6 +209,23 @@ Task を park して Project を解放する経路は **既存の ADMIN manual a
   clean 観測と knownGood・abort 認可の種類（manual と technical を混在させない）を再確認し、
   Job の failed 化・park・Approval 消費・監査を atomic に行う。どれかが欠ければ何も変えない。
 
+## 期限切れ git_commit の resume 系譜 — 固定 anchor + generation（2026-10-15 CEO 条件付き承認）
+
+承認期限切れで git_commit を resume するたびに `resume:<直前Job>:1` が入れ子になり、1ホップしか辿らない
+REJECT → 再実装の解決が届かなくなった。新しい resume は元の git_commit Job（`review:<id>:git-commit`）を
+anchor として `resume:<anchor>:<n>` を振る。条件は次のとおり。
+
+- **承認の意味は変えない。** 各 generation は新しい Approval と Gate 評価を受け、HEAD / diff が変われば
+  既存の規則どおり無効になる（承認待ちは SUPERSEDED、承認済みは STALE）。Stage 1 自動通過の対象外
+  （`resume:` は対象外のまま）。既存 Job の workflowStepKey は書き換えない（resume が直前 Job を
+  blocked → failed にする既存の handoff は従来どおり）。
+- anchor は同一 Task / Project の canonical git_commit Job に限る。参照は1回だけで、再帰・多段探索をしない。
+- **Job 自身に直接紐づく Approval を最初に見る。** 直結の REJECTED は常に CEO の却下として扱う。
+  anchor 経由で引き継いだ却下は triage には効くが、manual abort（直結のみ）の根拠にはならない。
+- 旧形式（key 無し・入れ子の `resume:<prev>:1`）は従来どおり扱う。自動移行しない。
+- 新方式の系譜が壊れている（重複・欠番・不正 anchor）場合は resume を 409 で拒否して何も作らない。
+  これは Decision Authority の問題ではないので CEO へ上げず、既存の technical budget で止める。
+
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
 
 **「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を
