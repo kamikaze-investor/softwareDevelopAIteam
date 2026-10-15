@@ -194,6 +194,21 @@ CEO はこの変更を承認したが、**承認要件そのものを省略す�
 この6点が崩れる変更は、`resume_task` の Gate 構成を戻すこと（= up-front `approval_gate` の復活）を
 検討する合図である。
 
+## CEO が REJECT した git_commit の解放（2026-10-15 CEO 承認）
+
+git_commit Approval を REJECT すると、その Job は `blocked` のまま残る。PL は CEO の却下を自動 resume しない。
+Task を park して Project を解放する経路は **既存の ADMIN manual abort だけ**で、条件は次のとおり。
+
+- **REJECT だけでは何も park しない。** 別の `abort_task` Approval が `APPROVED` であることを要し、解放時に
+  `CONSUMED` になる（既存の manual abort と同じ意味）。却下した git_commit Approval は `REJECTED` のまま。
+- 対象は「最新 Job が blocked git_commit で、**その Job 自身に直接紐づく** Approval が `REJECTED`」の Task だけ。
+  resume を辿って却下を推定しない。同一 Task / Project、Candidate HEAD = Approval の `targetCommit` を要する。
+- Worker は観測だけを行い、ファイルを削除しない。Candidate の差分は operator が **復元できることを確認した backup**
+  を取ってから戻す（手順: `decisions/p2_technical_recovery_production_e2e.md`）。
+- 最終 transaction 内で、最新 Job・直接の却下・HEAD・live Job 不在・他 Project を含む workspace 所有者不在・
+  clean 観測と knownGood・abort 認可の種類（manual と technical を混在させない）を再確認し、
+  Job の failed 化・park・Approval 消費・監査を atomic に行う。どれかが欠ければ何も変えない。
+
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
 
 **「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を
