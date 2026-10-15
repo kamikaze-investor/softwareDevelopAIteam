@@ -1898,6 +1898,18 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         **新しい比較記録を作る前に、これで足りるかを先に見る**
         （設計正本: `specs/23_system_one_decision_layer.md` 9章）
 
+      **追加実測（2026-10-08〜09・Task `b6d4097a`・post-implementation review）**: Meta Review ではなく
+      **post-implementation review** でも同じ反転が起きた。repair `9c5d22e9` の review `517d0af7` は
+      `changes_requested`（medium: secret-file 判定が requested name の `path.basename(file)` だけで、
+      `realpathSync` 後の実ファイルに掛からず、repository 内 symlink 経由で `.env` を読める）を返した。
+      repair を挟まず**同一 diff** を Human Resume で再実行した review `9dfffc41` は `approved` を返し、
+      同じ指摘を non-blocker へ格下げした。欠陥はコード上で未修正のまま（`reviewerAdapter.ts:199`）で、
+      git_commit Approval 待ちへ進んだ（CEO は承認していない）。
+      **含意**: 失敗した review の resume は**再抽選**として働き、未解決の blocking finding を消せる。
+      Decision Authority Principle 上、同一 diff への後続 review が先行 review の blocking finding と
+      矛盾する場合は「未解決の review 不一致」（§14-3 DA trigger 7）として fail-closed に扱うべきである。
+      記録: `docs/project_memory/decisions/p2_technical_recovery_production_e2e.md`。
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
@@ -9729,6 +9741,34 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         実行できなかった repair review（`d0af140a`、REVIEW_UNAVAILABLE）なので、D1 後もここで skip する
       - 承認された resume review から git_commit が作られない件（`isAutomaticReviewJob` が `implement:*:review` 限定）
       - `repairFromStoredReview` の `resolveStoredReviewChain()` が resume review を受け付けない件
+
+<!-- roadmap:id=git-commit-resume-chain-closes-rejected-reimplementation state=planned priority=high -->
+0. [ ] **期限切れ git_commit Approval の定常 resume が lineage を深くし、CEO REJECT 後の再実装経路を自ら閉じる**
+      — 2026-10-15 登録（production 実測・CEO 指示。24時間自律運転の復旧を直接妨げる構造的欠陥）。
+
+      **実測（Task `b6d4097a`）**: blocked git_commit の `WAITING_FOR_USER` Approval が期限切れになるたび、
+      PL が約24時間ごとに定常 resume（`resume_actor=pl`）し、新しい git_commit Job
+      （`workflowStepKey = resume:<直前の git_commit Job>:1`）と新しい Approval を作る（旧 Approval は #342 で
+      SUPERSEDED）。6日で git_commit 側は `review:<review>:git-commit` から **7段の `resume:`** になった。
+
+      **なぜ閉じるか**: CEO REJECT 後の再実装（`resolveSourceImplementJobForRejectedGitCommit`、
+      `apps/api/src/storage/sqlite.ts`）は、2026-09-23 の CEO 承認どおり git_commit 側の `resume:` を
+      **1段だけ**正規化し、2段以上の traversal / recursive resolver を禁止している（本ファイル
+      「`resume:` 1ホップの正規化」節）。定常の technical recovery がこの前提を自ら崩すため、REJECT すると
+      `REJECTED_COMMIT_SOURCE_UNRESOLVED` で fail-closed になり、Task は blocked のまま Project を占有し続ける。
+      加えて manual abort は blocked Task の全 Job terminal を要求するため、REJECTED の blocked git_commit が
+      残る形では park もできない（別途、既存 abort 経路の最小修正を設計中）。
+
+      **制約（CEO）**: 元の `workflowStepKey` を新 Job へ再利用する案は**未承認**。1ホップ規則を緩めない。
+      新しい Gate / status / workflow を作らない。
+
+      **着手時に確認すること**:
+      - `workflowStepKey` の意味と一意制約、`resume:<id>:<n>` / `review:<id>:git-commit` を解釈する箇所
+        （lineage walker・resume actor・repair generation・evidence / Approval provenance・#342 supersede・
+        gate_evaluations の binding）
+      - 同一 diff の再承認に新 Job が要るか（既存 blocked git_commit Job へ新しい承認サイクルを付けられるか）
+      - 1ホップ規則と履歴・Approval・Evidence の整合を保つ最小修正
+      - 効果検証可能性: git_commit 側 resume 段数の分布と、REJECT 後に再実装へ到達できた件数を数えられること
 
 <!-- roadmap:id=review-preflight-refusal-reaches-no-reimplementation state=planned priority=high -->
 0. [ ] **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**
