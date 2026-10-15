@@ -60,7 +60,9 @@ import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { protectedViolations, triageBlocked } from './blockedTriage'
 import { readAdoptionCandidates } from './adoptionStep'
+import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 import {
+  hasTechnicalAbortMetadata,
   isEligibleTechnicalAbortDiagnosis,
   recordTechnicalAbortEvidence,
   recordTechnicalAbortRefusal,
@@ -109,6 +111,21 @@ export type AbortTaskResult =
  */
 function holdsWorkspaceOwnership(task: { status: string }, job: Job): boolean {
   return holdsWorkspaceWhenBlocked(task, job)
+}
+
+function recordAbortAuthorizationConflict(
+  storage: IStorage,
+  job: Job,
+  stage: 'authorization' | 'finalization',
+): void {
+  recordTechnicalAbortRefusal(storage, {
+    taskId: job.taskId,
+    ...(job.failureMetadata?.abortTechnicalEvidenceId !== undefined
+      ? { evidenceId: job.failureMetadata.abortTechnicalEvidenceId }
+      : {}),
+    code: 'ABORT_AUTHORIZATION_FAMILY_CONFLICT',
+    stage,
+  })
 }
 
 export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskResult {
@@ -166,7 +183,19 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
           `Task ${task.id} is blocked but has no Job; use the existing /recover route before abort_task`,
       }
     }
-    const nonTerminal = taskJobs.find((job) => job.status !== 'failed' && job.status !== 'success')
+    const latestJob = taskJobs[0]
+    const linkedRejection = latestJob === undefined
+      ? undefined
+      : resolveLinkedGitCommitRejection(latestJob, {
+          findJobById: (id) => storage.jobs.findById(id),
+          findApprovalById: (id) => storage.approvalRequests.findById(id),
+        }, { directOnly: true })
+    const rejectedGitCommitException = latestJob?.status === 'blocked' && linkedRejection !== undefined
+    const nonTerminal = taskJobs.find((job, index) => (
+      job.status !== 'failed'
+      && job.status !== 'success'
+      && !(rejectedGitCommitException && index === 0 && job.status === 'blocked')
+    ))
     if (nonTerminal) {
       return {
         ok: false,
@@ -195,6 +224,24 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
         reason:
           `Task ${task.id}'s terminal Jobs do not share one non-empty workingDir; `
           + 'one workspace observation cannot prove them all safe',
+      }
+    }
+    if (rejectedGitCommitException) {
+      const missingBaseline = taskJobs.find((job) => job.workspaceBaseline === undefined)
+      const startHeads = new Set(taskJobs.map((job) => job.workspaceBaseline?.startCommitHash))
+      if (
+        latestJob.taskId !== task.id
+        || latestJob.projectId !== task.projectId
+        || linkedRejection.approval.taskId !== task.id
+        || missingBaseline !== undefined
+        || startHeads.size !== 1
+        || linkedRejection.approval.targetCommit !== latestJob.workspaceBaseline?.startCommitHash
+      ) {
+        return {
+          ok: false,
+          code: 'TASK_NOT_PARKABLE',
+          reason: `Task ${task.id}'s rejected git_commit is not bound to its shared workspace start HEAD`,
+        }
       }
     }
   }
@@ -312,6 +359,15 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   }
 
   // cleanup を要求する。**実体の掃除・観測は Worker の既存経路が行う。**
+  const technicalCarrier = cleanupTargets.find((job) => hasTechnicalAbortMetadata(job.failureMetadata))
+  if (technicalCarrier !== undefined) {
+    recordAbortAuthorizationConflict(storage, technicalCarrier, 'authorization')
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'manual abort cannot replace Technical Abort metadata on its cleanup carrier',
+    }
+  }
   const requestedAt = new Date().toISOString()
   for (const job of cleanupTargets) {
     storage.jobs.update(job.id, {
@@ -335,6 +391,49 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
 export type CompleteAbortCleanupResult =
   | { ok: true; taskId: string; jobId: string }
   | { ok: false; code: 'NOT_REQUESTED' | 'NOT_FOUND' | 'VERIFICATION_FAILED' | 'PRECONDITION_FAILED'; reason: string }
+
+function recordManualRejectedGitCommitRefusal(
+  storage: IStorage,
+  job: Job,
+  refusalCode: string,
+): void {
+  const metadata = job.failureMetadata
+  if (
+    job.status !== 'blocked'
+    || job.safeCommand.kind !== 'git_commit'
+    || !job.approvalId
+    || !metadata?.abortCleanupRequestedAt
+    || !metadata.abortApprovalRequestId
+  ) return
+
+  const duplicate = storage.auditLog.findByEntity('task', job.taskId).some((entry) => {
+    if (entry.operation !== 'task_aborted' || entry.result !== 'failed') return false
+    try {
+      const detail = JSON.parse(entry.detail ?? '{}') as Record<string, unknown>
+      return detail.refusalCode === refusalCode
+        && detail.cleanupRequestedAt === metadata.abortCleanupRequestedAt
+    } catch {
+      return false
+    }
+  })
+  if (duplicate) return
+
+  storage.auditLog.record({
+    actor: 'api',
+    operation: 'task_aborted',
+    entityType: 'task',
+    entityId: job.taskId,
+    result: 'failed',
+    detail: JSON.stringify({
+      refusalCode,
+      cleanupRequestedAt: metadata.abortCleanupRequestedAt,
+      taskId: job.taskId,
+      jobId: job.id,
+      rejectedApprovalId: job.approvalId,
+      abortApprovalId: metadata.abortApprovalRequestId,
+    }),
+  })
+}
 
 /**
  * Worker が観測を報告したときの最終段。
@@ -375,6 +474,15 @@ export function completeAbortCleanup(
     }
   }
 
+  if (metadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(metadata)) {
+    recordAbortAuthorizationConflict(storage, job, 'finalization')
+    return {
+      ok: false,
+      code: 'PRECONDITION_FAILED',
+      reason: `job ${input.jobId}'s abort cleanup request mixes manual and technical authorization`,
+    }
+  }
+
   const authorization: AbortAuthorization | undefined = metadata.abortApprovalRequestId !== undefined
     ? { kind: 'manual_approval', approvalRequestId: metadata.abortApprovalRequestId }
     : metadata.abortTechnicalEvidenceId !== undefined
@@ -405,6 +513,8 @@ export function completeAbortCleanup(
         stage: 'worker_cleanup',
       })
       retireTechnicalAbortCleanup(storage, job, input.refusalCode)
+    } else {
+      recordManualRejectedGitCommitRefusal(storage, job, input.refusalCode)
     }
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'Worker refused abort cleanup' }
   }
@@ -417,6 +527,8 @@ export function completeAbortCleanup(
         stage: 'worker_cleanup',
       })
       retireTechnicalAbortCleanup(storage, job, 'FINAL_OBSERVATION_MISSING')
+    } else {
+      recordManualRejectedGitCommitRefusal(storage, job, 'FINAL_OBSERVATION_MISSING')
     }
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'final workspace observation is missing' }
   }
@@ -448,6 +560,8 @@ export function completeAbortCleanup(
         stage: 'final_transaction',
       })
       retireTechnicalAbortCleanup(storage, job, released.code)
+    } else {
+      recordManualRejectedGitCommitRefusal(storage, job, released.code)
     }
     return {
       ok: false,
@@ -558,6 +672,14 @@ export function requestTechnicalAbort(
     }
   }
   const existingMetadata = latestJob.failureMetadata
+  if (existingMetadata?.abortApprovalRequestId !== undefined) {
+    recordAbortAuthorizationConflict(storage, latestJob, 'authorization')
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'Technical Abort cannot replace manual abort metadata on its cleanup carrier',
+    }
+  }
   if (existingMetadata?.abortCleanupRequestedAt !== undefined) {
     const currentFingerprint = technicalAbortStateFingerprint(task, taskJobs, current)
     const requestStillCurrent = existingMetadata.abortTechnicalEvidenceId !== undefined
@@ -711,6 +833,15 @@ export function requestTechnicalAbort(
       ok: false,
       code: 'OWNERSHIP_UNPROVEN',
       reason: 'Task state changed while Technical Abort evidence was being issued',
+    }
+  }
+  const refreshedCarrier = refreshedJobs[0]
+  if (refreshedCarrier.failureMetadata?.abortApprovalRequestId !== undefined) {
+    recordAbortAuthorizationConflict(storage, refreshedCarrier, 'authorization')
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'Technical Abort cannot replace manual abort metadata on its cleanup carrier',
     }
   }
 

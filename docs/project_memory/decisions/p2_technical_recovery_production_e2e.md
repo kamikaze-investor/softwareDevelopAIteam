@@ -40,3 +40,31 @@ Production record of Priority 2 (specs/22 §14-3) technical recovery on real dat
 ## Status at the time of writing
 
 The git_commit approval is waiting for the CEO. Recommendation recorded: do not approve (the defect is present).
+
+## Releasing the Project after a CEO REJECT (manual abort, restorable backup)
+
+A REJECTED git_commit leaves its Job `blocked`. The PL never auto-resumes a CEO rejection, and before this
+change the ADMIN abort refused a Task with a non-terminal Job, so the Task held the only running Project. The
+manual abort now accepts exactly this shape (latest Job = blocked git_commit whose **own** linked approval is
+REJECTED, same Task/Project, Candidate HEAD = the approval's target commit). Everything else is unchanged: the
+`abort_task` approval must be APPROVED and is consumed, the Worker only observes, and the final transaction
+re-checks every fact. REJECT alone never parks anything.
+
+The Worker does not delete files on this path, so the operator backs up and cleans the Candidate. The backup
+must be shown to **restore**, not only to exist, before anything is cleaned:
+
+1. Read-only checks: no live Job; Candidate HEAD equals the rejected approval's target commit; the changed
+   file list matches the approval's diff; no merge/rebase/lock state.
+2. Snapshot: copy the whole Candidate (working tree and `.git`) to a backup directory outside every workspace.
+   The original Candidate is not written to.
+3. In the snapshot, record the full working state as a tree with a temporary index
+   (`GIT_INDEX_FILE=<tmp> git read-tree HEAD; GIT_INDEX_FILE=<tmp> git add -A; GIT_INDEX_FILE=<tmp> git write-tree`)
+   and write `git diff --binary HEAD <tree>` as the patch (it includes untracked files).
+4. Restore proof: clone the snapshot at the same HEAD into a fresh directory, `git apply --binary` the patch,
+   compute the tree the same way, and require it to equal the tree from step 3. Stop on any mismatch.
+5. Only then clean the Candidate (`git checkout -- .` and `git clean -fd`, never `-x`), and confirm a clean
+   status at the unchanged HEAD.
+6. Run the existing ADMIN abort (create `abort_task` approval, approve, `POST /abort`). The Worker's clean
+   observation and `knownGood` let the API fail the Job, park the Task and consume the approval atomically.
+
+The snapshot, patch and tree hash are kept; the roadmap item stays `planned`.
