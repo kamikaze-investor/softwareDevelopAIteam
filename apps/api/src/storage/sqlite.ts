@@ -89,6 +89,7 @@ function recordResumeSourceTerminalized(
   sourceJobId: string,
   successorJobId: string,
   mode: 'resume' | 'startup_reconciliation',
+  supersededApprovalId?: string,
 ): void {
   db.prepare(`
     INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
@@ -97,9 +98,33 @@ function recordResumeSourceTerminalized(
     randomUUID(),
     RESUME_SOURCE_TERMINALIZED_OPERATION,
     sourceJobId,
-    `successor_job_id=${successorJobId} mode=${mode} source_status=blocked target_status=failed`,
+    `successor_job_id=${successorJobId} mode=${mode} source_status=blocked target_status=failed`
+      + (supersededApprovalId === undefined ? '' : ` superseded_approval_id=${supersededApprovalId}`),
     now(),
   )
+}
+
+/**
+ * **ApprovalRequest が紐づく Job が terminal になったら、その request を actionable state に残さない。**
+ *
+ * `WAITING_FOR_USER` / `APPROVED` だけを既存の `SUPERSEDED` へ CAS で進める。
+ * `approveAndResumeJob()` は紐づく Job が running / blocked であることを要求するので、
+ * terminal な Job に紐づいたままの request は誰も進められない（承認しても 409）のに、
+ * actionable に見え続ける（2026-10-09〜14 production: 同一 commit / diff の request が毎日1件ずつ残った）。
+ *
+ * `REJECTED`（CEO の却下の記録）/ `CONSUMED` / `STALE` / `EXPIRED` / `SUPERSEDED` は変えない。
+ * 人の判断を偽らないため `reason` / `reviewed_at` も書かない。
+ * 変えた場合だけ true（呼び出し側が audit に残す）。
+ */
+function supersedeApprovalOfTerminalJob(
+  db: Database.Database,
+  approvalId: string,
+  taskId: string,
+): boolean {
+  return db.prepare(`
+    UPDATE approval_requests SET status = 'SUPERSEDED'
+    WHERE id = ? AND task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+  `).run(approvalId, taskId).changes === 1
 }
 
 function selectNextContinuableTask(tasks: Task[]): Task | undefined {
@@ -2623,7 +2648,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             if (terminalized.changes !== 1) {
               throw new Error(`Failed to atomically terminalize resumed source Job ${latestJob.id}`)
             }
-            recordResumeSourceTerminalized(db, latestJob.id, successor.id, 'resume')
+            // 終端化した source に紐づく request を同じ transaction で actionable から外す。
+            // successor は approval_id を継承せず、`/gate/check` が現 diff に対して新しく発行する。
+            const supersededApprovalId = latestJob.approvalId !== undefined
+              && supersedeApprovalOfTerminalJob(db, latestJob.approvalId, latestJob.taskId)
+              ? latestJob.approvalId
+              : undefined
+            recordResumeSourceTerminalized(db, latestJob.id, successor.id, 'resume', supersededApprovalId)
           }
           return { ok: true, job: successor }
         }
@@ -6281,6 +6312,60 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       ).run(source.id)
       if (terminalized.changes !== 1) continue
       recordResumeSourceTerminalized(db, source.id, successor.id, 'startup_reconciliation')
+    }
+
+    // ── 終端化済み source に紐づいたまま残った request の回収（冪等） ──
+    //
+    // `completeResumeHandoff()` が source の request を supersede するようになる前に終端化された
+    // 行（および上のループで今回終端化した行）を、同じ invariant へ揃える。
+    // proof は「同一 Task・同一 Project・同じ SafeCommand kind で、canonical な
+    // `resume:<sourceJobId>:<n>`（`parseResumeSource()`）が source を exact に指す後継が **ちょうど1件**」。
+    // 曖昧（0件 / 複数件 / kind 不明）なら触らない（fail-closed）。
+    const terminalSourcesWithActiveApproval = db.prepare(`
+      SELECT j.id, j.task_id, j.project_id, j.approval_id, j.safe_command
+      FROM jobs j
+      JOIN approval_requests a ON a.id = j.approval_id AND a.task_id = j.task_id
+      WHERE j.status = 'failed' AND a.status IN ('WAITING_FOR_USER', 'APPROVED')
+      ORDER BY j.rowid ASC
+    `).all() as Array<{ id: string; task_id: string; project_id: string; approval_id: string; safe_command: string }>
+    const resumeLineageCandidates = db.prepare(`
+      SELECT id, project_id, workflow_step_key, safe_command
+      FROM jobs
+      WHERE task_id = ? AND workflow_step_key IS NOT NULL
+      ORDER BY rowid ASC
+    `)
+    const commandKind = (safeCommand: string): string | undefined => {
+      try {
+        const kind = (JSON.parse(safeCommand) as { kind?: unknown }).kind
+        return typeof kind === 'string' && kind.length > 0 ? kind : undefined
+      } catch {
+        return undefined
+      }
+    }
+
+    for (const source of terminalSourcesWithActiveApproval) {
+      const sourceKind = commandKind(source.safe_command)
+      if (sourceKind === undefined) continue
+      const successors = (resumeLineageCandidates.all(source.task_id) as Array<{
+        id: string
+        project_id: string
+        workflow_step_key: string
+        safe_command: string
+      }>).filter((candidate) =>
+        parseResumeSource(candidate.workflow_step_key) === source.id
+        && candidate.project_id === source.project_id
+        && commandKind(candidate.safe_command) === sourceKind)
+      if (successors.length !== 1) continue
+      if (!supersedeApprovalOfTerminalJob(db, source.approval_id, source.task_id)) continue
+      db.prepare(`
+        INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+        VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
+      `).run(
+        randomUUID(),
+        source.approval_id,
+        `reason=linked_job_terminal source_job_id=${source.id} successor_job_id=${successors[0]!.id} mode=startup_reconciliation`,
+        now(),
+      )
     }
   })
 

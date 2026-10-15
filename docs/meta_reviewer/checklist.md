@@ -59,8 +59,13 @@ DA trigger は以下の7項目である（正本: `specs/22_safety_approval_desi
 - (6) diff 内の secret 検出
 - (7) Review verdict の不一致が未解消
 
+DA trigger (1)〜(5) に当たっても、欠陥・弱体化・未解消の矛盾が無ければ `blocked` にしない。
+`requiresCeoApproval: true` を付け、人の判断は CODEOWNERS review に委ねる（`prompt.md`「Human Decision Authority のみ」）。
+canonical spec で承認済みの authority boundary を scope どおりに実装する変更は、人の承認を外す方向でも「Cage弱体化」に数えない。
+「Cage弱体化」として `blocked` にするのは、承認済み scope の逸脱・無断の authority 拡大・意図しない bypass / fail-open・実装欠陥がある場合だけ。
+
 ### CLAUDE.md
-- [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない
+- [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない（変更されていれば、欠陥が無い限り `requiresCeoApproval: true`）
 - [ ] Repository Boundary（ai-team-backend / target-project）が維持されている
 - [ ] 絶対禁止リストから項目が削除されていない
 
@@ -121,7 +126,9 @@ DA trigger は以下の7項目である（正本: `specs/22_safety_approval_desi
 |---|---|---|
 | Cage弱体化 | 1件でも | `blocked` |
 | Sandbox制限解除 | 1件でも | `blocked` |
-| DA trigger (1)〜(7) | 1件でも | `blocked` + CEO通知 |
+| DA trigger (1)〜(5)（欠陥・弱体化・未解消の矛盾なし） | 1件でも | 技術評価の status + `requiresCeoApproval: true`（CODEOWNERS review が Human Gate） |
+| DA trigger (6) secret / (7) 未解消の不一致 | 1件でも | `blocked` |
+| Human Decision と欠陥の両方 | — | `blocked` + `requiresCeoApproval: true` |
 | recovery / technical changes outside DA(2) | Risk に応じて | Safety Evidence を強化して AI が判定 |
 | 禁止コマンド追加 | 1件でも | `blocked` |
 | 仕様思想逸脱 | 軽微 | `changes_requested` |

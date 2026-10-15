@@ -10,11 +10,17 @@
  * buildDiffRangeArgs() が返す引数（三点間）ではそれが起きないことを実 git で検証する。
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { buildDiffRangeArgs } from './autoReview.js'
+import {
+  buildDiffRangeArgs,
+  isCodeOwned,
+  parseCodeOwners,
+  resolveMetaReviewOutcome,
+  type CodeOwnersRule,
+} from './autoReview.js'
 
 let repo: string
 /** head が branch を切った時点の base（merge-base） */
@@ -157,5 +163,145 @@ describe('buildDiffRangeArgs — ローカル実行（BASE_SHA / HEAD_SHA なし
   it('base / head の片方しか無い場合もローカル扱いにフォールバックする', () => {
     expect(buildDiffRangeArgs(baseTipSha, undefined).diffArgs).toEqual(['diff', 'HEAD~1', 'HEAD'])
     expect(buildDiffRangeArgs(undefined, headSha).diffArgs).toEqual(['diff', 'HEAD~1', 'HEAD'])
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// Human Decision Authority → CODEOWNERS review への委譲
+// ────────────────────────────────────────────────────────────
+
+const CODEOWNERS_TEXT = [
+  '# comment',
+  '.github/workflows/ @owner',
+  'CLAUDE.md @owner',
+  'sandbox/ @owner',
+  'apps/worker/src/metaReviewer/ @owner',
+  'packages/shared/src/plActionPolicy.ts @owner',
+  '',
+].join('\n')
+
+function rules(): CodeOwnersRule[] {
+  const parsed = parseCodeOwners(CODEOWNERS_TEXT)
+  if (parsed === undefined) throw new Error('fixture CODEOWNERS must parse')
+  return parsed
+}
+
+function review(
+  status: 'approved' | 'changes_requested' | 'blocked',
+  requiresCeoApproval: boolean,
+) {
+  return {
+    status,
+    requiresCeoApproval,
+    summary: 's',
+    findings: [] as Array<{ severity: string; category: string; message: string; suggestion?: string }>,
+  }
+}
+
+describe('resolveMetaReviewOutcome — 技術的 blocked と Human Decision の分離', () => {
+  it('通常の approved は従来どおり pass', () => {
+    const outcome = resolveMetaReviewOutcome(review('approved', false), ['apps/api/src/routes/jobs.ts'], rules())
+    expect(outcome.exitCode).toBe(0)
+    expect(outcome.result.status).toBe('approved')
+  })
+
+  it('authority-only（requiresCeoApproval=true・欠陥なし）は check を通し、requiresCeoApproval を残す', () => {
+    const outcome = resolveMetaReviewOutcome(review('approved', true), ['CLAUDE.md'], rules())
+    expect(outcome.exitCode).toBe(0)
+    expect(outcome.result.status).toBe('approved')
+    expect(outcome.result.requiresCeoApproval).toBe(true)
+  })
+
+  it('changes_requested + requiresCeoApproval でも CODEOWNERS 対象があれば pass 可能', () => {
+    const outcome = resolveMetaReviewOutcome(
+      review('changes_requested', true),
+      ['apps/api/src/routes/jobs.ts', 'packages/shared/src/plActionPolicy.ts'],
+      rules(),
+    )
+    expect(outcome.exitCode).toBe(0)
+    expect(outcome.result.status).toBe('changes_requested')
+  })
+
+  it('genuine defect（blocked）は exit 1', () => {
+    const outcome = resolveMetaReviewOutcome(review('blocked', false), ['apps/api/src/routes/jobs.ts'], rules())
+    expect(outcome.exitCode).toBe(1)
+  })
+
+  it('defect + Human Decision（blocked + requiresCeoApproval）は CODEOWNERS 対象でも exit 1（CEO 承認で override しない）', () => {
+    const outcome = resolveMetaReviewOutcome(review('blocked', true), ['CLAUDE.md'], rules())
+    expect(outcome.exitCode).toBe(1)
+    expect(outcome.result.status).toBe('blocked')
+  })
+
+  it('requiresCeoApproval=true なのに CODEOWNERS 対象が1つも無ければ fail closed（blocked / exit 1）', () => {
+    const outcome = resolveMetaReviewOutcome(review('approved', true), ['apps/api/src/routes/jobs.ts'], rules())
+    expect(outcome.exitCode).toBe(1)
+    expect(outcome.result.status).toBe('blocked')
+    expect(outcome.result.findings.at(-1)).toMatchObject({ severity: 'critical', category: 'authority_change' })
+  })
+
+  it('CODEOWNERS を確認できなければ（undefined）requiresCeoApproval=true は fail closed', () => {
+    const outcome = resolveMetaReviewOutcome(review('approved', true), ['CLAUDE.md'], undefined)
+    expect(outcome.exitCode).toBe(1)
+    expect(outcome.result.status).toBe('blocked')
+  })
+
+  it('CODEOWNERS を確認できなくても requiresCeoApproval=false の approved は従来どおり pass', () => {
+    expect(resolveMetaReviewOutcome(review('approved', false), ['x.ts'], undefined).exitCode).toBe(0)
+  })
+})
+
+describe('parseCodeOwners / isCodeOwned — literal pattern の照合', () => {
+  it('root 起点の directory / file pattern', () => {
+    expect(isCodeOwned('.github/workflows/meta-review.yml', rules())).toBe(true)
+    expect(isCodeOwned('apps/worker/src/metaReviewer/autoReview.ts', rules())).toBe(true)
+    expect(isCodeOwned('packages/shared/src/plActionPolicy.ts', rules())).toBe(true)
+    expect(isCodeOwned('packages/shared/src/plActionPolicy.test.ts', rules())).toBe(false)
+    expect(isCodeOwned('docs/.github/workflows/x.yml', rules())).toBe(false)
+  })
+
+  it('`/` を含まない pattern はどの階層にも一致する（gitignore と同じ）', () => {
+    expect(isCodeOwned('CLAUDE.md', rules())).toBe(true)
+    expect(isCodeOwned('apps/api/CLAUDE.md', rules())).toBe(true)
+    expect(isCodeOwned('sandbox/docker-compose.yml', rules())).toBe(true)
+    expect(isCodeOwned('infra/sandbox/config.yml', rules())).toBe(true)
+    expect(isCodeOwned('apps/sandbox', rules())).toBe(false)
+  })
+
+  it('後勝ち: owner の無い後続行は所有を外す', () => {
+    const parsed = parseCodeOwners('apps/ @owner\napps/api/\n')!
+    expect(isCodeOwned('apps/worker/x.ts', parsed)).toBe(true)
+    expect(isCodeOwned('apps/api/x.ts', parsed)).toBe(false)
+  })
+
+  it('glob / escape を含む CODEOWNERS は解析しない（照合を保証できないので undefined → fail closed）', () => {
+    expect(parseCodeOwners('*.ts @owner\n')).toBeUndefined()
+    expect(parseCodeOwners('docs/**/x.md @owner\n')).toBeUndefined()
+    expect(parseCodeOwners('my\\ file @owner\n')).toBeUndefined()
+  })
+
+  it('行末コメントは owner に含めない', () => {
+    expect(parseCodeOwners('CLAUDE.md @owner # constitution\n')).toEqual([
+      { pattern: 'CLAUDE.md', owners: ['@owner'] },
+    ])
+  })
+
+  it('このリポジトリの実際の CODEOWNERS は literal のみで解析でき、追加した canonical surface を保護する', () => {
+    const text = readFileSync(path.resolve(__dirname, '../../../../.github/CODEOWNERS'), 'utf-8')
+    const repoRules = parseCodeOwners(text)
+    expect(repoRules).toBeDefined()
+    for (const file of [
+      'AGENTS.md',
+      'CLAUDE.md',
+      'specs/22_safety_approval_design_principle.md',
+      'docs/project_memory/rules/approval_rules.md',
+      'apps/worker/src/metaReviewer/autoReview.ts',
+      'packages/shared/src/approvalGateLogic.ts',
+      'apps/api/src/auth/humanOnlyRoutes.ts',
+      'apps/api/src/gitCommitEvidence.ts',
+    ]) {
+      expect(isCodeOwned(file, repoRules!), file).toBe(true)
+    }
+    expect(isCodeOwned('apps/worker/src/jobRunner.ts', repoRules!)).toBe(false)
   })
 })

@@ -25,12 +25,13 @@ AGENTS.md には Claude Code・Codex 共同運用ルールと TypeScript 品質�
 - **Reviewer AI**: レビュー・ルール違反検出
 - **QA AI**: 品質保証・リスク判定
 
-人間（CEO）は Goal変更・方向修正のみ行う。コードを書かない。
+人間（CEO）は Human Decision Authority（`specs/22` 1-2）に属する判断のみ行う。コードを書かない。
 
 **現在の運用（Phase 1）における実際の担当:** Codex（通常実装）/ Claude（設計・進行計画・危険箇所実装）/
 Gemini（低コストなレビュー・監査レイヤー: Risk Review・Alignment Review・Meta Review・preReview・
 postReview・Report Translation。最終判断者ではない）/ ChatGPT（重要判断・コミット前判断・人間向け整理）/
-Human・CEO（Goal・Design Philosophy・外部サービス・課金・本番・認証権限・破壊的変更の最終判断）。
+Human・CEO（Goal・Design Philosophy・新しい外部サービス・課金・新しい外部公開・AI authority の拡大／
+Safety boundary の弱化・不可逆な外部 commitment の最終判断。判定は操作名ではなく意味で行う。`specs/22` 1章）。
 変更内容はReview Level 0〜3に分類し、Levelに応じたレビュー・確認・エスカレーションを行う。
 詳細は `AGENTS.md` 3章・`docs/multi_ai_step_review_flow.md` を参照。
 
@@ -73,8 +74,9 @@ AIが自由にできること（Green Zone）:
 CEOの承認が必要（Yellow Zone）:
   Goal変更 / Design Philosophy変更
   外部サービス追加 / 課金発生
-  本番公開 / セキュリティモデル変更
-  リポジトリ外操作
+  新しい外部公開（既存公開範囲内の通常 deploy は含まない）
+  AI authority の拡大 / Safety boundary の弱化（hardening・credential rotation は含まない）
+  新しい外部対象へのリポジトリ外操作（既存の運用対象への既存 authority 内の操作は含まない）
 
 絶対禁止:
   ai-team-backend/ の変更（Control Repositoryは触れない）
@@ -89,8 +91,9 @@ CEOの承認が必要（Yellow Zone）:
 Isolation / Simulation / Mechanical Validation / Independent Review / Test・E2E / Limited Rollout /
 Monitoring / Fast Rollback の多層防御で AI の自律実行範囲を広げる方向を定める。
 
-**同原則は、それ自体では上記 Yellow Zone を1つも緩めない。** 差分は同原則 14 章に
-「要調整・現行有効」として列挙されており、**個別に CEO 承認を経るまで現行 Zone が優先する。**
+**Human Gate の要否は同原則 1 章 Decision Authority Principle（2026-10-02 CEO 改訂）で決める。**
+Risk Level・「Production だから」「Security 関連だから」だけでは CEO 承認にしない。
+コードが強制している Gate は、同原則 14-2 の段階で外すまで有効である。
 
 ---
 
