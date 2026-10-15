@@ -65,3 +65,29 @@ describe('Meta Reviewer 判定契約 — 承認済み authority boundary の扱�
     expect(checklist).toContain('scope どおりに実装する変更は、人の承認を外す方向でも「Cage弱体化」に数えない')
   })
 })
+
+describe('Meta Reviewer 判定契約 — DA trigger (1) は文書ではなく意味の変更', () => {
+  const contractDocuments = [
+    ['prompt', prompt],
+    ['checklist', checklist],
+  ] as const
+
+  it.each(contractDocuments)('%s は DA (1) を意味で判定し、ファイル編集だけでは A にしない', (_name, document) => {
+    expect(document).toContain('DA (1) はファイル名ではなく差分の意味で判定する')
+    expect(document).toContain('Goal・事業上の Goal 優先順位・Product / Business 方針・Design Philosophy / Constitution の原則・Policy / Value の**意味の変更**')
+    expect(document).toContain('`tasks/roadmap.md` や `docs/PROJECT_CURRENT_STATE.md` の編集')
+    expect(document).toContain('ファイル名・「roadmap」という語・記録済み CEO instruction・HIGH / Production risk だけでは A にしない')
+  })
+
+  it.each(contractDocuments)('%s は roadmap evidence・technical item 等を B / C とする', (_name, document) => {
+    expect(document).toContain('調査結果・evidence の記録、進捗・state 更新')
+    expect(document).toContain('既存 Goal 内の technical-fix item 追加、実装順・技術的 priority')
+    expect(document).toContain('機械的な `PROJECT_CURRENT_STATE` sync は B / C')
+  })
+
+  it.each(contractDocuments)('%s は意味を変える A の例と CEO approval を維持する', (_name, document) => {
+    expect(document).toContain('Goal / Product 方針、事業上の優先順位・トレードオフ')
+    expect(document).toContain('Design Philosophy / Policy / Value、authority / Safety boundary の意味を変える差分は A')
+    expect(document).toContain('`requiresCeoApproval: true` を返す')
+  })
+})
