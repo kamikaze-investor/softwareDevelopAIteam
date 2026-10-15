@@ -686,7 +686,7 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(diagnosis.recoverable).toBe(true)
   })
 
-  it('H6c. invalid generation >1 uses the non-CEO maintenance lane and remains fail-closed', () => {
+  it('H6c. invalid generation >1 stays on the technical path (not CEO) and records the lineage reason', () => {
     const { storage, taskId, projectId } = seed()
     const nonAnchor = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'failed',
@@ -704,11 +704,14 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
       detail: 'blocked', stuckForMs: 0,
     } as AttentionItem)
 
-    expect(diagnosis.rootCauseClass).toBe('unknown')
-    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
-    expect(diagnosis.recoverable).toBe(false)
-    expect(diagnosis.existingRecoveryAvailable).toBe(false)
-    expect(diagnosis.summary).toContain('lineage')
+    // resume 自体は 409 で fail closed（resumeExpiredApproval.test.ts）。triage は CEO へ上げず、
+    // 既存の technical budget に任せる。
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+    expect(diagnosis.recommendedLane).not.toBe('ceo_escalation')
+    expect(diagnosis.evidence).toContainEqual(expect.objectContaining({
+      fact: 'git_commit.resume_lineage', id: invalid.id,
+    }))
   })
 
   it('H6d. a directly linked REJECTED approval wins over invalid lineage on any key shape', () => {

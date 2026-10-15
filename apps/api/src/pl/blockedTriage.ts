@@ -914,35 +914,6 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
   if (facts.job?.status === 'blocked' && !hasLiveJob(facts)) {
     const ceoRejected = facts.ceoRejectedGitCommit === true
-    if (!ceoRejected && facts.gitCommitResumeLineageInvalidReason !== undefined) {
-      // 新方式（固定 anchor + generation）の lineage が壊れている = 重複・欠番・不正 anchor。
-      // 正常なコードでは作られず（UNIQUE index と単調な採番）、データ破損でしか起きない。
-      // **Decision Authority の問題ではない**が、未配線の fail-closed 状態はすべて人へ届ける
-      // という本ファイルの不変条件に従う。maintenance_lane（protected 領域の Tier B handoff）は
-      // 意味が違うので使わない。旧形式（key 無し・入れ子の `resume:<prev>:1`）はここへ来ない。
-      return {
-        ...result,
-        rootCauseClass: 'unknown',
-        blockingLayer: 'job_creation',
-        evidence: [
-          {
-            fact: 'job.workflowStepKey',
-            id: facts.job.id,
-            value: facts.job.workflowStepKey ?? 'none',
-          },
-          {
-            fact: 'git_commit.resume_lineage',
-            id: facts.job.id,
-            value: facts.gitCommitResumeLineageInvalidReason,
-          },
-        ],
-        recoverable: false,
-        existingRecoveryAvailable: false,
-        confidence: 'high',
-        recommendedLane: 'ceo_escalation',
-        summary: `git_commit resume lineage が不正なため自動再開しない: ${facts.gitCommitResumeLineageInvalidReason}`,
-      }
-    }
     return {
       ...result,
       rootCauseClass: 'approval_not_actionable',
@@ -956,6 +927,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           value: ceoRejected ? 'REJECTED' : facts.approvalStatus ?? 'none',
         },
         { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        // 新方式 lineage の破損（重複・欠番・不正 anchor）は Decision Authority の問題ではない。
+        // CEO へは回さず、既存の技術復旧経路に任せる: resume は 409 で何も作らず理由を返し、
+        // 試行は technical budget で止まり `technical_exhausted` として見える（specs/22 §1-3）。
+        ...(facts.gitCommitResumeLineageInvalidReason !== undefined
+          ? [{
+            fact: 'git_commit.resume_lineage',
+            id: facts.job.id,
+            value: facts.gitCommitResumeLineageInvalidReason,
+          }]
+          : []),
       ],
       // **却下は「復旧できない」ではなく「AI が勝手に復旧してはいけない」。**
       // 経路自体は存在するので `existingRecoveryAvailable` は true のままにし、
