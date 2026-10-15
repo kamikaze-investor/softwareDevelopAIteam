@@ -1910,6 +1910,13 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       矛盾する場合は「未解決の review 不一致」（§14-3 DA trigger 7）として fail-closed に扱うべきである。
       記録: `docs/project_memory/decisions/p2_technical_recovery_production_e2e.md`。
 
+      **追加実測（2026-10-15・CI Meta Review・PR #348）**: 同じ変更内容に対し、Meta Review（Copilot fallback）は
+      head `86a65e8` で APPROVED（指摘なし）、master 追従と merge 解消後の head `700abc3` で BLOCKED
+      （DA(2) と判定、CODEOWNERS 対象なしで fail closed）、承認規則を `approval_rules.md` へ記録した head `008dad0`
+      で APPROVED（指摘なし）、文言修正後の `bf71474` で APPROVED（DA(2) の advisory 付き）と揺れた。
+      CEO が chat で SHA 限定の Code Owner 承認を与えて merge した。**承認されたことは揺れの解消ではない**
+      （CEO 指示）。同一 PR 内で DA 判定そのものが反転しうるため、DA 判定も verdict instability の対象に含める。
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
@@ -9742,8 +9749,15 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 承認された resume review から git_commit が作られない件（`isAutomaticReviewJob` が `implement:*:review` 限定）
       - `repairFromStoredReview` の `resolveStoredReviewChain()` が resume review を受け付けない件
 
-<!-- roadmap:id=git-commit-resume-chain-closes-rejected-reimplementation state=planned priority=high -->
-0. [ ] **期限切れ git_commit Approval の定常 resume が lineage を深くし、CEO REJECT 後の再実装経路を自ら閉じる**
+<!-- roadmap:id=git-commit-resume-chain-closes-rejected-reimplementation state=done priority=high -->
+0. [x] **期限切れ git_commit Approval の定常 resume が lineage を深くし、CEO REJECT 後の再実装経路を自ら閉じる — 完了（2026-10-15, PR #348）**
+
+      **【2026-10-15 完了】** merge commit `068422fe09aa6ab6520f9351ddef67402ac28434`。固定 anchor + generation
+      （`resume:<review:<id>:git-commit の Job>:<n>`）で、REJECT は anchor を1回だけ参照して再実装へ届く。
+      旧形式（key 無し・入れ子の `resume:<prev>:1`）は従来どおりで自動移行しない。壊れた新方式 lineage は 409 で
+      fail-closed（CEO へは上げず technical budget で停止）。規則: `docs/project_memory/rules/approval_rules.md`
+      「期限切れ git_commit の resume 系譜」。同時に manual abort（PR #347）で REJECTED git_commit の Task を
+      解放できるようになった。**Task `b6d4097a` の既存7段チェーンは未移行**（一度限りの明示的移行は別途 CEO 判断）。
       — 2026-10-15 登録（production 実測・CEO 指示。24時間自律運転の復旧を直接妨げる構造的欠陥）。
 
       **実測（Task `b6d4097a`）**: blocked git_commit の `WAITING_FOR_USER` Approval が期限切れになるたび、
