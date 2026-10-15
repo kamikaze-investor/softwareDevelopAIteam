@@ -39,6 +39,7 @@ export type MetaFindingCategory =
   | 'implementation_coupling'
   | 'over_constraint'
   | 'unverifiable_assumption'
+  | 'principle_conflict'
 
 export type MetaReviewStatus = 'approved' | 'changes_requested' | 'blocked'
 export type MetaRiskLevel = 'low' | 'medium' | 'high' | 'critical'
@@ -60,6 +61,8 @@ export interface MetaReviewRequest {
   gitDiff: string
   /** レビュー時に参照する仕様書（specs/ファイル名） */
   relatedSpecs: string[]
+  /** Untrusted PR-authored task-intent context. Never an authority source. */
+  prBody?: string
 }
 
 export interface MetaReviewResult {
@@ -176,6 +179,12 @@ export interface StrategicMetaReviewResult {
   finalDecision: StrategicDecision | 'REVIEW_UNAVAILABLE'
   independentReviewRequired: boolean
   requiresCeoApproval: boolean
+  /**
+   * `finalDecision === 'REVIEW_UNAVAILABLE'` のとき、review を実行できなかった理由。
+   * **実行されなかった focus を作って理由を運ばない**ためにある（任意・後方互換）。
+   * API は task kind でこれを rejectedReason として durable に残す。
+   */
+  unavailableReason?: string
   createdAt: string
 }
 

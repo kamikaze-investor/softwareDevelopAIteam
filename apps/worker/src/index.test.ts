@@ -24,6 +24,13 @@ const notifierMocks = vi.hoisted(() => ({
 
 const jobRunnerMocks = vi.hoisted(() => ({
   computeWorkspaceBaseline: vi.fn(),
+  revertBlockedJobChanges: vi.fn(),
+}))
+
+const workspaceVerificationMocks = vi.hoisted(() => ({
+  observeWorkspace: vi.fn(),
+  verifyWorkspaceAgainstBaseline: vi.fn(),
+  workspaceObservationMatchesBaseline: vi.fn(),
 }))
 
 vi.mock('./outbox/outboxStore.js', () => outboxMocks)
@@ -34,8 +41,10 @@ vi.mock('./jobRunner.js', async (importOriginal) => {
   return {
     ...actual,
     computeWorkspaceBaseline: jobRunnerMocks.computeWorkspaceBaseline,
+    revertBlockedJobChanges: jobRunnerMocks.revertBlockedJobChanges,
   }
 })
+vi.mock('./workspaceVerification.js', () => workspaceVerificationMocks)
 vi.mock('./jobStateManager.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./jobStateManager.js')>()
   return {
@@ -49,13 +58,14 @@ import {
   pollJobs,
   persistJobResult,
   processQueuedWork,
+  reportAbortCleanupObservations,
   start,
 } from './index.js'
 
 const NOW = '2026-08-08T01:02:03.000Z'
 const fetchMock = vi.fn<typeof fetch>()
 
-const CLEAN_BASELINE = { mode: 'clean', startCommitHash: 'abc123' }
+const CLEAN_BASELINE = { mode: 'clean', startCommitHash: 'abc123' } as const
 
 const job: Job = {
   id: 'job-1',
@@ -105,6 +115,10 @@ beforeEach(() => {
   watchdogMocks.startWatchdog.mockReset()
   notifierMocks.sendAlert.mockReset()
   jobRunnerMocks.computeWorkspaceBaseline.mockReset()
+  jobRunnerMocks.revertBlockedJobChanges.mockReset()
+  workspaceVerificationMocks.observeWorkspace.mockReset()
+  workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReset()
+  workspaceVerificationMocks.workspaceObservationMatchesBaseline.mockReset()
   outboxMocks.recordPending.mockReturnValue({
     eventId: 'event-1',
     payloadHash: 'payload-hash-1',
@@ -114,6 +128,19 @@ beforeEach(() => {
   jobStateMocks.recoverStaleJobs.mockResolvedValue(0)
   notifierMocks.sendAlert.mockResolvedValue([])
   jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({ ok: true, baseline: CLEAN_BASELINE })
+  jobRunnerMocks.revertBlockedJobChanges.mockResolvedValue(undefined)
+  workspaceVerificationMocks.observeWorkspace.mockReturnValue({
+    observation: CLEAN_BASELINE,
+    knownGood: {
+      gitOperationMarkers: [],
+      worktreeClean: true,
+      indexClean: true,
+      headValid: true,
+      blindSpotsAbsent: true,
+    },
+  })
+  workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
+  workspaceVerificationMocks.workspaceObservationMatchesBaseline.mockReturnValue(true)
   vi.spyOn(console, 'log').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
@@ -125,7 +152,342 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+describe('abort cleanup observation reporting', () => {
+  function arrangeAbortCleanup(
+    taskStatus: Task['status'],
+    jobStatus: Job['status'],
+    marked = true,
+  ): void {
+    const project = {
+      id: 'project-1',
+      name: 'AIteamOS',
+      goal: 'g',
+      designPhilosophy: [],
+      status: 'running',
+      createdAt: NOW,
+      updatedAt: NOW,
+    }
+    const requestedTask: Task = {
+      ...task,
+      status: taskStatus,
+      roadmapActive: taskStatus === 'blocked',
+    }
+    const requestedJob: Job = {
+      ...job,
+      status: jobStatus,
+      safeCommand: taskStatus === 'blocked' && jobStatus === 'blocked'
+        ? { kind: 'git_commit', workingDir: '/workspace/target' }
+        : job.safeCommand,
+      ...(marked
+        ? {
+            failureMetadata: {
+              abortCleanupRequestedAt: NOW,
+              abortApprovalRequestId: 'approval-1',
+            },
+          }
+        : {}),
+    }
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) {
+        return new Response(JSON.stringify([project]), { status: 200 })
+      }
+      if (value.includes('/api/tasks?projectId=')) {
+        return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=')) {
+        return new Response(JSON.stringify([requestedJob]), { status: 200 })
+      }
+      if (value.includes('/abort-cleanup-result')) return new Response(null, { status: 200 })
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+  }
+
+  it.each(['failed', 'success'] as const)(
+    'reports the marked terminal %s Job while its Task is blocked',
+    async (jobStatus) => {
+      arrangeAbortCleanup('blocked', jobStatus)
+
+      await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+      expect(workspaceVerificationMocks.observeWorkspace).toHaveBeenCalledWith('/workspace/target')
+      const report = fetchMock.mock.calls.find(([url]) => String(url).includes('/abort-cleanup-result'))
+      expect(report).toBeDefined()
+      expect(JSON.parse(String(report?.[1]?.body))).toEqual({
+        observation: CLEAN_BASELINE,
+        knownGood: {
+          gitOperationMarkers: [],
+          worktreeClean: true,
+          indexClean: true,
+          headValid: true,
+          blindSpotsAbsent: true,
+        },
+      })
+    },
+  )
+
+  it.each(['failed', 'success'] as const)(
+    'ignores a marked terminal %s Job after the Task becomes pending',
+    async (jobStatus) => {
+      arrangeAbortCleanup('pending', jobStatus)
+
+      await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+      expect(workspaceVerificationMocks.observeWorkspace).not.toHaveBeenCalled()
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(false)
+    },
+  )
+
+  it('keeps the existing pending Task + blocked Job reporting behavior', async () => {
+    arrangeAbortCleanup('pending', 'blocked')
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(true)
+  })
+
+  it('reports an API-marked latest blocked git_commit without modifying the workspace', async () => {
+    arrangeAbortCleanup('blocked', 'blocked')
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+    expect(workspaceVerificationMocks.observeWorkspace).toHaveBeenCalledTimes(1)
+    expect(workspaceVerificationMocks.verifyWorkspaceAgainstBaseline).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(true)
+  })
+
+  it('REJECT alone has no cleanup marker and is not observed', async () => {
+    arrangeAbortCleanup('blocked', 'blocked', false)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(workspaceVerificationMocks.observeWorkspace).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(false)
+  })
+
+  it('does not report an old marked terminal Job after a newer Job exists', async () => {
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const newerJob: Job = { ...job, id: 'job-newer', status: 'failed' }
+    const oldMarkedJob: Job = {
+      ...job,
+      id: 'job-old-marked',
+      status: 'failed',
+      failureMetadata: {
+        abortCleanupRequestedAt: NOW,
+        abortApprovalRequestId: 'approval-1',
+      },
+    }
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) {
+        return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=')) {
+        return new Response(JSON.stringify([newerJob, oldMarkedJob]), { status: 200 })
+      }
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(workspaceVerificationMocks.observeWorkspace).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/abort-cleanup-result'))).toBe(false)
+  })
+
+  it('continues to later cleanup candidates when an earlier report is refused', async () => {
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const tasks: Task[] = [
+      { ...task, id: 'task-refused', status: 'pending' },
+      { ...task, id: 'task-accepted', status: 'pending' },
+    ]
+    const markedJob = (id: string, taskId: string): Job => ({
+      ...job,
+      id,
+      taskId,
+      status: 'blocked',
+      failureMetadata: {
+        abortCleanupRequestedAt: NOW,
+        abortApprovalRequestId: `approval-${id}`,
+      },
+    })
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify(tasks), { status: 200 })
+      if (value.includes('/api/jobs?taskId=task-refused')) {
+        return new Response(JSON.stringify([markedJob('job-refused', 'task-refused')]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=task-accepted')) {
+        return new Response(JSON.stringify([markedJob('job-accepted', 'task-accepted')]), { status: 200 })
+      }
+      if (value.includes('/api/jobs/job-refused/abort-cleanup-result')) {
+        return new Response(JSON.stringify({ error: 'refused' }), { status: 409 })
+      }
+      if (value.includes('/api/jobs/job-accepted/abort-cleanup-result')) {
+        return new Response(null, { status: 200 })
+      }
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+    const reports = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.includes('/abort-cleanup-result'))
+    expect(reports).toEqual([
+      expect.stringContaining('/api/jobs/job-refused/abort-cleanup-result'),
+      expect.stringContaining('/api/jobs/job-accepted/abort-cleanup-result'),
+    ])
+  })
+
+  it('verifies Technical Abort cleanup against the persisted END fingerprint, not the START baseline', async () => {
+    const endFingerprint = { mode: 'clean' as const, startCommitHash: 'end-head' }
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const requestedJob: Job = {
+      ...job,
+      status: 'failed',
+      workspaceBaseline: CLEAN_BASELINE,
+      failureMetadata: {
+        workspaceEndFingerprint: endFingerprint,
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+      },
+    }
+    workspaceVerificationMocks.observeWorkspace.mockReturnValue({
+      observation: endFingerprint,
+      knownGood: {
+        gitOperationMarkers: [], worktreeClean: true, indexClean: true,
+        headValid: true, blindSpotsAbsent: true,
+      },
+    })
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=')) return new Response(JSON.stringify([requestedJob]), { status: 200 })
+      if (value.includes('/abort-cleanup-result')) return new Response(null, { status: 200 })
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+    expect(workspaceVerificationMocks.verifyWorkspaceAgainstBaseline)
+      .toHaveBeenCalledWith('/workspace/target', endFingerprint)
+  })
+
+  it('reports mixed manual and Technical Abort metadata without reverting files', async () => {
+    const dirtyObservation = {
+      mode: 'dirty' as const,
+      startCommitHash: 'end-head',
+      entries: [{ path: 'src/feature.ts', kind: 'added' as const, worktreeHash: 'sha256:value-free' }],
+    }
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const requestedJob: Job = {
+      ...job,
+      status: 'failed',
+      failureMetadata: {
+        workspaceEndFingerprint: dirtyObservation,
+        abortCleanupRequestedAt: NOW,
+        abortApprovalRequestId: 'approval-1',
+        abortTechnicalEvidenceId: 'evidence-1',
+      },
+    }
+    workspaceVerificationMocks.observeWorkspace.mockReturnValue({
+      observation: dirtyObservation,
+      knownGood: {
+        gitOperationMarkers: [], worktreeClean: false, indexClean: true,
+        headValid: true, blindSpotsAbsent: true,
+      },
+    })
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=')) return new Response(JSON.stringify([requestedJob]), { status: 200 })
+      if (value.includes('/abort-cleanup-result')) return new Response(JSON.stringify({ error: 'refused' }), { status: 409 })
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(jobRunnerMocks.revertBlockedJobChanges).not.toHaveBeenCalled()
+    expect(workspaceVerificationMocks.verifyWorkspaceAgainstBaseline).not.toHaveBeenCalled()
+    const report = fetchMock.mock.calls.find(([url]) => String(url).includes('/abort-cleanup-result'))
+    expect(JSON.parse(String(report?.[1]?.body))).toEqual({
+      observation: dirtyObservation,
+      knownGood: {
+        gitOperationMarkers: [], worktreeClean: false, indexClean: true,
+        headValid: true, blindSpotsAbsent: true,
+      },
+    })
+  })
+})
+
 describe('terminal result persistence', () => {
+  it('persists the value-free workspace END fingerprint in existing failureMetadata JSON', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const workspaceEndFingerprint = {
+      mode: 'dirty' as const,
+      startCommitHash: 'abc123',
+      entries: [{ path: 'src/feature.ts', kind: 'modified' as const, worktreeHash: 'sha256:value-free' }],
+    }
+
+    await persistJobResult('job-end-fingerprint', {
+      ...runResult,
+      workspaceEndFingerprint,
+    }, 'success', { patchJob })
+
+    expect(patchJob).toHaveBeenCalledWith('job-end-fingerprint', expect.objectContaining({
+      failureMetadata: { workspaceEndFingerprint },
+    }))
+  })
+
+  it('persists a value-free secret-scan refusal in failureMetadata', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const refusal = {
+      kind: 'secret_scan' as const,
+      patternKinds: ['password assignment' as const],
+      repairEligible: true as const,
+      repairEligibilityReason: 'implementation_added_generic_assignment' as const,
+    }
+    const refusedResult: JobRunResult = {
+      ...runResult,
+      status: 'failed',
+      exitCode: 1,
+      refusal,
+      workspaceState: 'unchanged',
+    }
+
+    await persistJobResult('review-refused', refusedResult, 'failed', { patchJob })
+
+    const failureMetadata = { refusal, workspaceState: 'unchanged' }
+    expect(patchJob).toHaveBeenCalledWith('review-refused', expect.objectContaining({ failureMetadata }))
+    expect(outboxMocks.recordPending).toHaveBeenCalledWith(
+      'review-refused',
+      expect.objectContaining({ failureMetadata }),
+    )
+  })
+
   it('provider failure metadataをterminal PATCHとOutboxへ同じ内容で渡す', async () => {
     const patchJob = vi.fn().mockResolvedValue(true)
     const timeoutResult: JobRunResult = {

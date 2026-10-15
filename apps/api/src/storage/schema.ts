@@ -389,6 +389,27 @@ export const CREATE_TABLES = `
     UNIQUE (completed_task_id)
   );
 
+  -- 外部（ChatGPT MCP / Mobile Operator Chat）から PL への依頼。共通 Operator Interface の唯一の記録。
+  -- message は untrusted input で、保存するだけ（operational state は変えない）。
+  CREATE TABLE IF NOT EXISTS operator_requests (
+    id TEXT PRIMARY KEY,
+    requester_class TEXT NOT NULL CHECK (requester_class IN ('operator_gateway', 'admin', 'legacy', 'unauthenticated')),
+    kind TEXT NOT NULL CHECK (kind IN ('question', 'request')),
+    message TEXT NOT NULL,
+    target_key TEXT,
+    project_id TEXT,
+    task_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'answered', 'failed')),
+    disposition TEXT CHECK (disposition IS NULL OR disposition IN ('answered', 'acted', 'escalated', 'declined')),
+    response TEXT,
+    pl_action TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    answered_at TEXT,
+    FOREIGN KEY (project_id) REFERENCES projects(id),
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+  );
+
   CREATE TABLE IF NOT EXISTS audit_log (
     id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -438,6 +459,11 @@ export const CREATE_TABLES = `
  * CREATE TABLE IF NOT EXISTS does not change already-created tables.
  */
 export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; definition: string }> = [
+  // Operator Request（2026-09-28）。初版の operator_requests を作った DB に後から足した列を補う。
+  // SQLite は NOT NULL の ADD COLUMN に既定値を要求する。初版の依頼はすべて質問扱い（実行しない側）。
+  { table: 'operator_requests', column: 'kind', definition: "TEXT NOT NULL DEFAULT 'question' CHECK (kind IN ('question', 'request'))" },
+  { table: 'operator_requests', column: 'target_key', definition: 'TEXT' },
+  { table: 'operator_requests', column: 'pl_action', definition: 'TEXT' },
   // Project開始workflowの永続stage。長時間の開始処理をHTTP requestのlifecycleから
   // 切り離し、Mobileがread-onlyで進捗を復元できるようにする（2026-09-07）。
   { table: 'projects', column: 'start_stage', definition: 'TEXT' },
@@ -527,4 +553,5 @@ export const INDEX_STATEMENTS: string[] = [
   'CREATE INDEX IF NOT EXISTS ix_design_review_runs_status_started_at ON design_review_runs(status, started_at)',
   'CREATE INDEX IF NOT EXISTS ix_task_continuations_project ON task_continuations(project_id)',
   'CREATE INDEX IF NOT EXISTS ix_task_continuations_completed ON task_continuations(completed_task_id)',
+  'CREATE INDEX IF NOT EXISTS ix_operator_requests_status_created ON operator_requests(status, created_at)',
 ]

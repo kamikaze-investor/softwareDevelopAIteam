@@ -1,0 +1,23 @@
+[Unit]
+Description=AIteamOS Operator MCP Gateway (loopback only; reached through OpenAI Secure MCP Tunnel)
+After=ai-team-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=/absolute/path/to/softwareDevelopAIteam/apps/mcp-gateway
+# Secrets are never written in this unit. They come only from the EnvironmentFile
+# (mode 0600, owned by the service user). See mcp-gateway.env.example for the names.
+EnvironmentFile=/absolute/path/to/env/mcp-gateway.env
+Environment=NODE_ENV=production
+# Loopback only. `local_static_bearer` refuses to start on any other host (src/config.ts).
+# Do not set MCP_GATEWAY_HOST / MCP_GATEWAY_PORT in the EnvironmentFile: values there
+# override these lines.
+Environment=MCP_GATEWAY_HOST=127.0.0.1
+Environment=MCP_GATEWAY_PORT=3100
+Environment=AITEAMOS_API_BASE_URL=http://127.0.0.1:3000
+ExecStart=/usr/bin/env pnpm exec tsx src/index.ts
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

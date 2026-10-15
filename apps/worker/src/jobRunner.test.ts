@@ -17,10 +17,12 @@ import { saveJobLogs } from './jobLogger.js'
 import { persistJobResult } from './index.js'
 import {
   WorkspaceReconciliationError,
+  buildCleanupManifestFromBaseline,
   buildStructuredReviewPrompt,
   computeWorkspaceBaseline,
   parseStructuredReviewOutput,
   runJob,
+  type StructuredReviewContext,
 } from './jobRunner.js'
 import {
   FINGERPRINT_ABSENT,
@@ -62,6 +64,32 @@ import {
   clearContainedCommandOverride,
   setContainedCommandOverride,
 } from './execution/containedCommandTestBridge.js'
+
+describe('Technical Abort cleanup manifest', () => {
+  it('reconstructs only persisted Task-owned dirty entries and reports counts', () => {
+    const cleanup = buildCleanupManifestFromBaseline({
+      mode: 'dirty',
+      startCommitHash: 'head',
+      entries: [
+        { path: 'modified.ts', kind: 'modified', xyStatus: '.M', worktreeHash: 'm' },
+        { path: 'added.ts', kind: 'added', xyStatus: '?', worktreeHash: 'a' },
+        { path: 'old.ts', kind: 'renamed', xyStatus: 'R.', worktreeHash: ':absent:' },
+        {
+          path: 'new.ts', oldPath: 'old.ts', kind: 'renamed', xyStatus: 'R.',
+          worktreeHash: 'r',
+        },
+      ],
+    })
+
+    expect(cleanup.manifest.changes).toEqual([
+      expect.objectContaining({ path: 'modified.ts', kind: 'modified' }),
+      expect.objectContaining({ path: 'added.ts', kind: 'added' }),
+      expect.objectContaining({ path: 'new.ts', oldPath: 'old.ts', kind: 'renamed' }),
+    ])
+    expect(cleanup.manifest.paths).toEqual(['modified.ts', 'added.ts', 'old.ts', 'new.ts'])
+    expect(cleanup).toMatchObject({ changedPathCount: 4, restoredPathCount: 2, removedPathCount: 2 })
+  })
+})
 
 vi.mock('./commandResolver.js', () => ({
   resolveCommand: vi.fn(),
@@ -400,7 +428,7 @@ function createPolicy(overrides: Record<string, unknown> = {}) {
   }) as never
 }
 
-function createStructuredReviewContext() {
+function createStructuredReviewContext(): StructuredReviewContext {
   const task: Task = {
     id: 'task-1',
     projectId: 'project-1',
@@ -461,6 +489,9 @@ beforeEach(() => {
       paths,
     }
   })
+  fingerprintWorktreeEntriesMock.mockImplementation((_workingDir, manifest) => new Map(
+    manifest.paths.map((manifestPath) => [manifestPath, `sha256:${manifestPath}`]),
+  ))
   buildApprovedStateMapMock.mockImplementation((_workingDir, manifest) => {
     const states = new Map()
     for (const change of manifest.changes) {
@@ -2166,6 +2197,7 @@ vi.mock('./aiCli/factory.js', () => ({
 }))
 
 import { createAiCliAdapter } from './aiCli/factory.js'
+import { AiCliPromptRefusalError } from './aiCli/adapter.js'
 const createAiCliAdapterMock = vi.mocked(createAiCliAdapter)
 
 function makeCliResult(overrides: Partial<{
@@ -2321,6 +2353,67 @@ describe('task-022: AI CLI 実行ブロック', () => {
     resolveCommandMock.mockReturnValue({ argv: ['git', 'status', '--short'], description: 'git status' })
     fileChangeGuardMock.mockReturnValue({ allowed: true, violations: [], reasons: {} })
     execFileSyncMock.mockImplementation((_c: string, a: readonly string[] | undefined) => gitFallback(a))
+  })
+
+  it('carries a typed pre-send secret refusal without changing the failed outcome', async () => {
+    const matchedValue = 'never-persist-this-value'
+    const mockAdapter = {
+      run: vi.fn().mockRejectedValue(new AiCliPromptRefusalError(
+        'Prompt refused by secret scan',
+        ['password assignment'],
+      )),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as never)
+
+    const result = await runJob(createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: `password=${matchedValue}`,
+      aiCliMode: 'implement',
+    }), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.refusal).toEqual({
+      kind: 'secret_scan', patternKinds: ['password assignment'],
+      repairEligible: false,
+      repairEligibilityReason: 'not_post_implementation_review',
+    })
+    expect(JSON.stringify(result.refusal)).not.toContain(matchedValue)
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('passes the reviewed implement Job to report-ownership classification', async () => {
+    const mockAdapter = {
+      run: vi.fn().mockRejectedValue(new AiCliPromptRefusalError(
+        'Prompt refused by secret scan',
+        ['secret assignment'],
+      )),
+    }
+    createAiCliAdapterMock.mockReturnValue(mockAdapter as never)
+    const context = createStructuredReviewContext()
+    const reviewJob = createJob({
+      id: 'review-job-1',
+      workflowStepKey: 'implement:implement-job-1:review',
+      aiCliProvider: 'claude_code',
+      aiCliMode: 'review',
+    })
+    context.reviewJobs = [reviewJob, context.implementJob]
+
+    context.implementJob.stdout = [
+      '=== AI CLI (claude_code/implement) ===',
+      'Implementation summary mentions secret: string',
+      '=== SafeCommand (test) ===',
+      'tests passed',
+    ].join('\n')
+
+    const result = await runJob(reviewJob, createPolicy(), context)
+
+    expect(result.status).toBe('failed')
+    expect(result.refusal).toEqual({
+      kind: 'secret_scan',
+      patternKinds: ['secret assignment'],
+      repairEligible: true,
+      repairEligibilityReason: 'implementation_report_generic_assignment',
+    })
   })
 
   it('aiCliProvider なし → AI CLI をスキップして SafeCommand を実行する', async () => {

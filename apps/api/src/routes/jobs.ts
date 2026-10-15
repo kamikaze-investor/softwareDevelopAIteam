@@ -1,24 +1,33 @@
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
 import { completeAbortCleanup } from '../pl/abortTask'
+import { TECHNICAL_ABORT_WORKER_REFUSAL_CODES } from '../pl/technicalAbortEvidence'
 import type { FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { canonicalizeJobUpdate, isLiveJob, type Job, type ReviewResult } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
 import { getStorage } from '../storage'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
+import { appendImplementContracts } from '../implementPrompt'
 import type { DesignReviewRun, OutboxEventInput } from '../storage/interface'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
   canApplyJobResultStatus,
   describeApplicableJobStatuses,
+  isTerminalJobStatus,
 } from '../jobResultApplicationPolicy'
-import { escalateTaskToHuman, executeQueuedRepair, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
-import { REPAIR_STEP_PREFIX } from '../designReview/repairPolicy'
+import {
+  escalateTaskToHuman,
+  executeQueuedRepair,
+  isWorkspaceQuarantined,
+  prepareRepairFlow,
+  resolveReviewedImplementation,
+} from '../designReview/repairFlow'
+import {
+  parseRetrySource,
+  REPAIR_STEP_PREFIX,
+  RESUME_STEP_PREFIX,
+  RETRY_STEP_PREFIX,
+} from '../designReview/repairPolicy'
 import { bindResultingCommitForJob } from '../designReview/resultingCommitBinding'
 import { ensureTaskContinuation } from '../ctoAi/taskContinuation'
 
@@ -74,6 +83,40 @@ const SafeCommandInputSchema = z.object({
 // 対応時はこのSchemaと同時に更新すること（2026-08-26 独立レビュー指摘: 型とAPI契約の不整合）。
 const AiCliProviderSchema = z.enum(['claude_code', 'codex', 'gemini'])
 const AiCliModeSchema = z.enum(['implement', 'review', 'qa', 'summarize'])
+const SecretScanPatternKindSchema = z.enum([
+  'ANTHROPIC_API_KEY assignment',
+  'CLAUDE_API_KEY assignment',
+  'GEMINI_API_KEY assignment',
+  'GITHUB_TOKEN assignment',
+  'private key header',
+  'RSA private key header',
+  'password assignment',
+  'secret assignment',
+])
+// Worker 認証で受け取る判定を信頼する。API には送信前 prompt がなく、offset ownership を再計算できない。
+const RefusalMetadataSchema = z.discriminatedUnion('repairEligible', [
+  z.object({
+    kind: z.literal('secret_scan'),
+    patternKinds: z.array(SecretScanPatternKindSchema).min(1),
+    repairEligible: z.literal(true),
+    repairEligibilityReason: z.enum([
+      'implementation_added_generic_assignment',
+      'implementation_report_generic_assignment',
+    ]),
+  }).strict(),
+  z.object({
+    kind: z.literal('secret_scan'),
+    patternKinds: z.array(SecretScanPatternKindSchema).min(1),
+    repairEligible: z.literal(false),
+    repairEligibilityReason: z.enum([
+      'not_post_implementation_review',
+      'non_generic_assignment_kind',
+      'credential_like_assignment',
+      'match_not_owned_by_implementation',
+      'match_origin_unclear',
+    ]),
+  }).strict(),
+])
 const ReviewStatusSchema = z.enum(['approved', 'changes_requested', 'rejected'])
 const FindingSeveritySchema = z.enum(['low', 'medium', 'high', 'critical'])
 const StructuredReviewResultSchema = z.object({
@@ -136,6 +179,7 @@ const UpdateJobBody = z.object({
   failureMetadata: z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    refusal: RefusalMetadataSchema.optional(),
     // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
     // Worker が正当に送る quarantine payload を API が 400 で弾き、
     // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
@@ -143,6 +187,29 @@ const UpdateJobBody = z.object({
     quarantineReason: z.string().optional(),
     quarantineClearedAt: z.string().optional(),
     quarantineClearedReason: z.string().optional(),
+    workspaceEndFingerprint: z.discriminatedUnion('mode', [
+      z.object({
+        mode: z.literal('clean'),
+        startCommitHash: z.string(),
+      }).strict(),
+      z.object({
+        mode: z.literal('dirty'),
+        startCommitHash: z.string(),
+        entries: z.array(z.object({
+          path: z.string(),
+          oldPath: z.string().optional(),
+          kind: z.enum(['added', 'modified', 'deleted', 'renamed']),
+          xyStatus: z.string().optional(),
+          beforeType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+          afterType: z.enum(['regular', 'symlink', 'gitlink', 'special']).optional(),
+          beforeMode: z.string().optional(),
+          afterMode: z.string().optional(),
+          headHash: z.string().optional(),
+          indexHash: z.string().optional(),
+          worktreeHash: z.string(),
+        })),
+      }).strict(),
+    ]).optional(),
   }).strict().optional(),
   workspaceBaseline: z.discriminatedUnion('mode', [
     z.object({
@@ -184,6 +251,7 @@ const FailIfRunningJobBody = z.object({
   failureMetadata: z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
+    refusal: RefusalMetadataSchema.optional(),
     // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
     // Worker が正当に送る quarantine payload を API が 400 で弾き、
     // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
@@ -259,10 +327,21 @@ const KnownGoodFactsSchema = z.object({
 
 // abort cleanup も quarantine 解除と**同じ材料**を同じ厳密さで要求する。
 // 所有権の解放は quarantine 解除より重く、緩い検証で通してよい理由がない。
-const AbortCleanupResultBody = z.object({
-  observation: WorkspaceObservationSchema,
-  knownGood: KnownGoodFactsSchema,
-}).strict()
+const AbortCleanupResultBody = z.union([
+  z.object({
+    observation: WorkspaceObservationSchema,
+    knownGood: KnownGoodFactsSchema,
+    preCleanupObservation: WorkspaceObservationSchema.optional(),
+    cleanupSummary: z.object({
+      changedPathCount: z.number().int().nonnegative(),
+      restoredPathCount: z.number().int().nonnegative(),
+      removedPathCount: z.number().int().nonnegative(),
+    }).strict().optional(),
+  }).strict(),
+  z.object({
+    refusalCode: z.enum(TECHNICAL_ABORT_WORKER_REFUSAL_CODES),
+  }).strict(),
+])
 
 const ClearQuarantineJobBody = z.object({
   observation: WorkspaceObservationSchema,
@@ -322,17 +401,6 @@ function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, ded
   }
 }
 
-function appendBaseDesignContract(prompt: string): string {
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(undefined, principles),
-    principles,
-  })
-
-  return `${prompt}\n\n${designContract}`
-}
-
-
 /**
  * durableにqueuedとなったDesign Review runのexecutorをkickする。
  *
@@ -350,6 +418,41 @@ function kickQueuedDesignReview(
   void executeQueuedRepair(storage, run, stepKey)
     .catch((err) => log.error({ err, runId: run.id }, 'stage 2 repair execution failed'))
 }
+
+/**
+ * 成功した implement Job が post-implement review を必要とする workflow step か。
+ * **この問いはここだけで答える。**
+ *
+ * - initial implement / repair（`repair:<source>:1`）/ resume（`resume:<source>:1`。
+ *   `resumeBlockedTask()` が付ける）はいずれも workflow 上の実装 step であり、成功したら
+ *   review → git_commit → Task done → continuation へ戻る。これが無いと成功しても先へ進めない。
+ * - retry（`retry:<source>:1`）は provider timeout 後の**同一入力の再実行**であって、独立した
+ *   step ではない。よって答えは **source Job の答えをそのまま引き継ぐ**（key の形からは決めない）。
+ *   manual Job の retry は manual のまま review しない。source が辿れない・別 Task・retry の retry
+ *   （producer は作らない）は step とみなさない（fail-closed。呼び出し側が warn を残す）。
+ * - それ以外の key（未知の形を含む）は implement step とみなさない。
+ */
+function isPostImplementReviewStep(storage: ReturnType<typeof getStorage>, job: Job): boolean {
+  const isBaseImplementStep = (candidate: Job): boolean =>
+    candidate.aiCliMode === 'implement' && (
+      candidate.workflowStepKey === `task:${candidate.taskId}:initial-implement`
+      || candidate.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true
+      || candidate.workflowStepKey?.startsWith(RESUME_STEP_PREFIX) === true
+    )
+
+  const stepKey = job.workflowStepKey
+  const retrySourceId = stepKey === undefined ? undefined : parseRetrySource(stepKey)
+  if (retrySourceId === undefined) return isBaseImplementStep(job)
+
+  const source = storage.jobs.findById(retrySourceId)
+  return job.aiCliMode === 'implement'
+    && source !== undefined
+    && source.taskId === job.taskId
+    && source.projectId === job.projectId
+    && source.workflowStepKey?.startsWith(RETRY_STEP_PREFIX) !== true
+    && isBaseImplementStep(source)
+}
+
 export async function jobRoutes(app: FastifyInstance): Promise<void> {
   const storage = getStorage()
 
@@ -422,7 +525,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       aiCliPrompt: result.data.agentRole === 'developer_ai'
         && result.data.aiCliMode === 'implement'
         && result.data.aiCliPrompt !== undefined
-        ? appendBaseDesignContract(result.data.aiCliPrompt)
+        ? appendImplementContracts(result.data.aiCliPrompt, task)
         : result.data.aiCliPrompt,
     }
     const designReviewCheck = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
@@ -511,8 +614,27 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
 
     const result = completeAbortCleanup(storage, {
       jobId: req.params.id,
-      observation: parsed.data.observation as JobWorkspaceBaseline,
-      knownGood: parsed.data.knownGood,
+      ...('refusalCode' in parsed.data
+        ? {
+            refusalCode: parsed.data.refusalCode,
+            knownGood: {
+              gitOperationMarkers: [],
+              worktreeClean: false,
+              indexClean: false,
+              headValid: false,
+              blindSpotsAbsent: false,
+            },
+          }
+        : {
+            observation: parsed.data.observation as JobWorkspaceBaseline,
+            knownGood: parsed.data.knownGood,
+            ...(parsed.data.preCleanupObservation !== undefined
+              ? { preCleanupObservation: parsed.data.preCleanupObservation as JobWorkspaceBaseline }
+              : {}),
+            ...(parsed.data.cleanupSummary !== undefined
+              ? { cleanupSummary: parsed.data.cleanupSummary }
+              : {}),
+          }),
     })
     if (!result.ok) {
       const status = result.code === 'NOT_FOUND' ? 404 : 409
@@ -575,6 +697,56 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     const existing = storage.jobs.findById(req.params.id)
     if (!existing) {
       return reply.status(404).send({ error: 'Job not found' })
+    }
+
+    const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
+    if (workspaceEndFingerprint !== undefined) {
+      if (existing.failureMetadata?.workspaceEndFingerprint !== undefined) {
+        return reply.status(409).send({
+          error: 'workspaceEndFingerprint is write-once and has already been recorded',
+        })
+      }
+      if (
+        existing.status !== 'running'
+        || jobUpdate.status === undefined
+        || !isTerminalJobStatus(jobUpdate.status)
+      ) {
+        return reply.status(409).send({
+          error: 'workspaceEndFingerprint is only accepted on a running-to-terminal transition',
+        })
+      }
+    }
+
+    // initial-implement が running を一度も獲得しないまま failed を報告できるのは、
+    // Worker の pre-start workspace baseline / ownership admission が拒否した場合だけである。
+    // この構造的事実（queued + canonical initial step + baseline/start時刻なし）で分類し、
+    // stderr 文言には依存しない。
+    //
+    // ここを通常の implement failure として保存すると、この後の repair admission が
+    // INTENTIONALLY-DIRTY な `repair:` Job を作り、foreign dirt を実装成果として継承し得る。
+    // `failed` のまま repair だけを除外しても、Human Resume の `resume:` が同じ dirt を
+    // 継承するため不十分である。既存 quarantine protocol に合流させれば、Worker が
+    // known-good clean workspace を再観測して clear-quarantine が成立するまで、repair / retry /
+    // resume / 新規 claim がすべて fail-closed になる。
+    //
+    // Outbox hash は Worker が実際に送った payload を先に検証済みであり、これはその後の
+    // server-side state-application policy である。replay は event hash により dedup される。
+    const isInitialImplementPreStartRefusal =
+      existing.status === 'queued' &&
+      existing.aiCliMode === 'implement' &&
+      existing.workflowStepKey === `task:${existing.taskId}:initial-implement` &&
+      existing.startedAt === undefined &&
+      existing.workspaceBaseline === undefined &&
+      jobUpdate.status === 'failed'
+    if (isInitialImplementPreStartRefusal) {
+      const reason = jobUpdate.stderr ?? 'initial implementation was refused before workspace ownership was established'
+      jobUpdate.status = 'blocked'
+      jobUpdate.failureMetadata = {
+        kind: 'workspace_baseline_failure',
+        workspaceState: 'unknown',
+        quarantined: true,
+        quarantineReason: reason,
+      }
     }
 
     // **park された Task の Job を live な status へ戻さない。**
@@ -661,10 +833,18 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       }
       return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
     }
+    // **Human Resume で再実行された review（`resume:<review>:1`）も同じ post-implement review である。**
+    // 以前は `implement:<id>:review` の形だけを見ていたため、approved でも git_commit が作られず、
+    // Task は blocked のまま latest Job = success になり、resume も recover もできない行き止まりになった
+    // （D4・2026-09-28 監査）。resume の形は保存済み lineage で元の実装まで辿れるときだけ認める
+    // （`resolveReviewedImplementation()`。辿れなければ従来どおり git_commit を作らない = fail-closed）。
     const isAutomaticReviewJob =
-      existing.workflowStepKey?.startsWith('implement:') === true &&
-      existing.workflowStepKey.endsWith(':review') &&
-      isReviewJob
+      isReviewJob && (
+        (existing.workflowStepKey?.startsWith('implement:') === true
+          && existing.workflowStepKey.endsWith(':review'))
+        || (existing.workflowStepKey?.startsWith('resume:') === true
+          && resolveReviewedImplementation(storage, existing.id).ok)
+      )
 
     if (reviewResult) {
       const approved = reviewResult.status === 'approved' && jobUpdate.status === 'success'
@@ -705,17 +885,35 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       // 対象は review 対象の implement Job であって review Job 自身ではない。
       // review結果の永続化は既に完了しているため、ここでのqueue失敗はStage 2を失うだけで
       // review結果は失われない。失敗はlogに残し、PATCH応答は妨げない。
+      //
+      // **対象の implement Job は保存済み lineage から引く。** Human Resume で再実行された
+      // review は `resume:<元review>:1` になり、以前の `implement:<id>:review` 一致だけでは
+      // repair も escalation も作られずに終わっていた（2026-09-28 production・Task `9fdee5a3`）。
       if (!approved && !persisted.deduplicated) {
-        const implementJobId = existing.workflowStepKey?.match(/^implement:(.+):review$/)?.[1]
-        const implementJob = implementJobId ? storage.jobs.findById(implementJobId) : undefined
+        const reviewed = resolveReviewedImplementation(storage, existing.id)
+        if (!reviewed.ok && existing.workflowStepKey !== undefined) {
+          // workflow 上の review なのに実装へ辿れない。黙って終わらせず理由を残す（fail-closed）。
+          req.log.warn({ jobId: existing.id, reason: reviewed.reason }, 'review requested changes but its implementation could not be resolved; stage 2 not started')
+        }
+        const implementJob = reviewed.ok ? reviewed.implementJob : undefined
         if (implementJob) {
           try {
             const reviewPreparation = prepareRepairFlow(storage, {
               failedJob: implementJob,
               review: persisted.reviewResult,
               qaResults: storage.qaResults.findByTaskId(existing.taskId),
+              reviewJobId: existing.id,
             })
-            if (reviewPreparation.action === 'escalate') {
+            if (reviewPreparation.action === 'skip') {
+              // **修正要求が repair へ渡らなかったことを黙らせない。** skip は Task を動かさないので、
+              // 理由と対象（どの実装・どの review・どの run に止められたか）を残す。
+              req.log.warn({
+                reason: reviewPreparation.reason,
+                sourceJobId: implementJob.id,
+                reviewJobId: existing.id,
+                runId: reviewPreparation.runId,
+              }, 'review requested changes but repair was not admitted; stage 2 skipped')
+            } else if (reviewPreparation.action === 'escalate') {
               escalateTaskToHuman(storage, existing.taskId)
             } else if (reviewPreparation.action === 'queue') {
               const run = storage.designReviewRuns.create(reviewPreparation.run)
@@ -760,6 +958,50 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         stderr: jobUpdate.stderr ?? 'Structured review result is missing (fail-closed)',
       }
 
+      const reviewRefusal = jobUpdate.status === 'failed'
+        ? jobUpdate.failureMetadata?.refusal
+        : undefined
+      const reviewed = reviewRefusal === undefined
+        ? undefined
+        : resolveReviewedImplementation(storage, existing.id)
+      const refusalPreparation = reviewRefusal?.repairEligible === true
+        && reviewed?.ok === true
+        && reviewed.implementJob.status === 'success'
+        ? prepareRepairFlow(storage, {
+            failedJob: reviewed.implementJob,
+            reviewJobId: existing.id,
+            reviewRefusal,
+          })
+        : undefined
+
+      if (refusalPreparation?.action === 'skip') {
+        req.log.warn({
+          reason: refusalPreparation.reason,
+          sourceJobId: reviewed?.ok === true ? reviewed.implementJob.id : undefined,
+          reviewJobId: existing.id,
+          runId: refusalPreparation.runId,
+        }, 'review refusal repair was not admitted; falling back to Human escalation')
+      } else if (refusalPreparation !== undefined) {
+        const persisted = storage.jobs.updateWithOutboxEvent(
+          existing.id,
+          failedUpdate,
+          outboxEvent,
+          refusalPreparation.action === 'queue' ? refusalPreparation.run : undefined,
+        )
+        if (!persisted.ok) {
+          if (persisted.code === 'OUTBOX_HASH_MISMATCH') {
+            return reply.status(409).send({ error: persisted.reason })
+          }
+          return reply.status(persisted.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: persisted.reason })
+        }
+        if (refusalPreparation.action === 'escalate') {
+          escalateTaskToHuman(storage, existing.taskId)
+        } else if (persisted.queuedDesignReviewRun && refusalPreparation.action === 'queue') {
+          kickQueuedDesignReview(storage, req.log, persisted.queuedDesignReviewRun, refusalPreparation.stepKey)
+        }
+        return reply.send(outboxResponse(persisted.job, outboxEvent, persisted.deduplicated))
+      }
+
       // escalate の判定は **Task の現在状態**で行う（deduplicated では判定しない）。
       //
       // 独立レビュー指摘（CLAIM 1）: `updateWithOutboxEvent` は Job の更新と Outbox event の
@@ -794,33 +1036,24 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.send(failed)
     }
 
-    const isInitialImplementWorkflowJob =
-      existing.workflowStepKey === `task:${existing.taskId}:initial-implement` &&
-      existing.aiCliMode === 'implement'
-    // repair Job（workflowStepKey: `repair:<sourceJobId>:1`、既存 REPAIR_STEP_PREFIX を再利用）も
-    // implement Jobの一種であり、initial-implement Jobと同じ「成功したらreviewが必要」という
-    // 責務を持つ。repair success後にreviewが生成されず停止していたのを、既存のreview生成経路を
-    // そのまま再利用して解消する（新しいworkflow/Queue/state管理は追加しない）。
-    const isRepairImplementJob =
-      existing.workflowStepKey?.startsWith(REPAIR_STEP_PREFIX) === true &&
-      existing.aiCliMode === 'implement'
-    // resumeBlockedTask()（POST /api/tasks/:id/resume）が作るAI-CLI Jobも同様。
-    // workflowStepKey: `resume:<元Job>:1`（storage/sqlite.ts のresumeBlockedTask参照。
-    // 文字列はそちらと一致させること）。これが無いと、Design Review escalationからMobileの
-    // 追加指示で正常に再開できたJobが成功しても、その先のreview→git_commit→Task done→
-    // continuationへ自動的に戻れず、CEOが独立レビューを毎回手動で起票する必要があった。
-    const isResumeImplementJob =
-      existing.workflowStepKey?.startsWith('resume:') === true &&
-      existing.aiCliMode === 'implement'
-    const requiresPostImplementReview = isInitialImplementWorkflowJob || isRepairImplementJob || isResumeImplementJob
-    const shouldCreateReview =
-      requiresPostImplementReview &&
+    const requiresPostImplementReview = isPostImplementReviewStep(storage, existing)
+    const hasSuccessfulChangedImplementResult =
+      existing.aiCliMode === 'implement' &&
+      existing.workflowStepKey !== undefined &&
       existing.safeCommand.kind === 'test' &&
       jobUpdate.status === 'success' &&
       jobUpdate.exitCode === 0 &&
       (jobUpdate.changedFiles?.length ?? 0) > 0 &&
       jobUpdate.guardResult?.permissionAllowed === true &&
       jobUpdate.guardResult.fileChangeAllowed === true
+    const shouldCreateReview = requiresPostImplementReview && hasSuccessfulChangedImplementResult
+
+    if (hasSuccessfulChangedImplementResult && !requiresPostImplementReview) {
+      req.log.warn(
+        { jobId: existing.id, workflowStepKey: existing.workflowStepKey },
+        'Workflow implement Job succeeded with changes but no post-implement review was created',
+      )
+    }
 
     if (shouldCreateReview) {
       const transition = storage.jobs.updateAndCreateNextWorkflowJob({

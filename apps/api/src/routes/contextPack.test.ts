@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import { contextPackRoutes } from './contextPack.js'
@@ -31,6 +31,12 @@ describe('Context Pack API', () => {
   beforeEach(() => {
     tmpDir = path.join(os.tmpdir(), `ctx-api-test-${Date.now()}`)
     mkdirSync(tmpDir, { recursive: true })
+    // context-pack は設定済み target root だけを受け付ける（security fix）。正当な利用＝設定値と同じ root。
+    process.env.TARGET_ROOT = tmpDir
+  })
+
+  afterEach(() => {
+    delete process.env.TARGET_ROOT
   })
 
   it('POST /api/context-pack — Context Pack を生成できる', async () => {

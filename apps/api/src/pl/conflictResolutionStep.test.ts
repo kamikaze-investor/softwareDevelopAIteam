@@ -6,7 +6,8 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
+import { ensureInitialWorkflowsForActiveTasks } from '../ctoAi/projectInitialization'
+import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
   PL_MAX_REMEDIATION_ATTEMPTS,
@@ -79,6 +80,14 @@ const DISPUTED_CRITIQUE = {
   }],
 }
 
+const ALIGNED_RESULT_JSON = JSON.stringify({
+  focusedReviewResults: [
+    { focus: 'scope_simplicity', decision: 'ALIGNED', summary: 'ok' },
+  ],
+  integrationReviewResult: { decision: 'ALIGNED', summary: 'ok' },
+  finalDecision: 'ALIGNED',
+})
+
 const PL_REVISION = {
   implementationScope: '既存 validateRoadmapTasks の検査を1件足すだけ',
   allowedPaths: ['apps/api/src/storage'],
@@ -104,7 +113,7 @@ afterAll(() => {
   rmSync(ledgerRoot, { recursive: true, force: true })
 })
 
-function seed(options: { resultJson?: string } = {}): {
+function seed(options: { resultJson?: string; roadmapTaskKey?: string } = {}): {
   storage: IStorage
   taskId: string
   designText: string
@@ -122,7 +131,7 @@ function seed(options: { resultJson?: string } = {}): {
     dependencies: [],
     allowedPaths: ['apps/api/src', 'packages/shared/src'],
     acceptanceCriteria: ['当初の受入条件'],
-    roadmapTaskKey: 'conflicted-item',
+    roadmapTaskKey: options.roadmapTaskKey ?? 'conflicted-item',
     phase: 1,
     roadmapActive: true,
   } as Parameters<IStorage['tasks']['create']>[0])
@@ -202,6 +211,47 @@ describe('selectConflictStage — 既存 state の observer', () => {
 })
 
 describe('Critic → 条件分岐', () => {
+  it('follow-up Task でも base ledger item の本文を Critic へ渡す', async () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'conflicted-item#2' })
+    let criticPrompt = ''
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          criticPrompt = (JSON.parse(raw) as { prompt: string }).prompt
+          return { ok: true, stdout: JSON.stringify(SUPPORTED_CRITIQUE), timedOut: false }
+        },
+      },
+    }) as never)
+
+    expect(result.failureCode).not.toBe('item_not_in_ledger')
+    expect(criticPrompt).toContain('Roadmap item (the CEO-approved source of truth): conflicted-item')
+    expect(criticPrompt).toContain('本文はここに続く。')
+  })
+
+  it('follow-up Task の PL revision は同じ Task identity を更新し、fresh Review 後に同じ Task の Job を作る', async () => {
+    const { storage, taskId } = seed({ roadmapTaskKey: 'conflicted-item#2' })
+    const projectId = storage.tasks.findById(taskId)?.projectId as string
+    const taskCount = storage.tasks.findByProjectId(projectId).length
+    const originalRun = storage.designReviewRuns.findLatestByTaskId(taskId)
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      adopt: (s: IStorage, input: Parameters<typeof adoptRoadmapItem>[1]) => adoptRoadmapItem(s, input, {
+        ensureInitialWorkflows: (st, pid) => ensureInitialWorkflowsForActiveTasks(st, pid, {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async () => ({ ok: true, stdout: ALIGNED_RESULT_JSON, timedOut: false }),
+        }),
+      }),
+    }) as never)
+
+    expect(result).toMatchObject({ status: 'revised_and_aligned', taskId })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(taskCount)
+    expect(storage.tasks.findById(taskId)?.roadmapTaskKey).toBe('conflicted-item#2')
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.id).not.toBe(originalRun?.id)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+
   it('dispute が無ければ Challenge せず PL revision へ進む', async () => {
     const { storage, taskId } = seed()
 
@@ -276,7 +326,7 @@ describe('Critic → 条件分岐', () => {
   })
 
   it('**same spec + same finding への Challenge は1回だけ**（PASS reroll にしない）', async () => {
-    const { storage, taskId } = seed()
+    const { storage, taskId, designText } = seed()
     let evaluations = 0
     const challenging = deps(DISPUTED_CRITIQUE, {
       reEvaluate: async () => {
@@ -286,6 +336,19 @@ describe('Critic → 条件分岐', () => {
     })
 
     const first = await runConflictResolutionRound(storage, taskId, challenging as never)
+
+    // canonical prompt の書式だけが変わっても、同じ material spec の Challenge 予算は復活しない。
+    const reformatted = `${designText}\n\n[non-semantic prompt format revision]`
+    const run = storage.designReviewRuns.create({
+      taskId,
+      taskTitle: 'CONFLICT した項目',
+      designText: reformatted,
+      designTextHash: computeDesignTextHash(reformatted),
+      changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(run.id, claimed.claimToken as string, 'succeeded', CONFLICT_RESULT_JSON)
+
     const second = await runConflictResolutionRound(storage, taskId, challenging as never)
 
     expect(first.stage).toBe('challenge')
@@ -295,16 +358,14 @@ describe('Critic → 条件分岐', () => {
   })
 
   it('Challenge の上限に当たっても BLOCKED にせず PL revision を続ける', async () => {
-    const { storage, taskId } = seed()
+    const { storage, taskId, designText } = seed()
+    // Task Contract 導入前に永続化された audit は prompt hash key を持つ。
+    // seed が実際に Review へ保存した prompt を使い、legacy key の読み取り互換を固定する。
     recordRemediationFailure(
       storage,
       taskId,
-      `stage=challenge chal=${computeDesignTextHash(
-        buildInitialImplementAiCliPrompt({
-          description: buildAdoptedDescription(LEDGER_BODY, '当初の広い scope'),
-          allowedPaths: ['apps/api/src', 'packages/shared/src'],
-        }),
-      ).slice(0, 12)}:scope_simplicity outcome=starting`,
+      `stage=challenge chal=${computeDesignTextHash(designText).slice(0, 12)}`
+      + ':scope_simplicity outcome=starting',
     )
 
     const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE) as never)

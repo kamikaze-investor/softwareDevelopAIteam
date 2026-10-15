@@ -248,7 +248,7 @@ describe('recoverBlockedTask — audit と有界性', () => {
   it('**訂正されずに blocked へ戻っても、再投入を拒否して deadlock にしない**', () => {
     // 独立レビュー round 1 を受けて「同一 designTextHash では1回だけ」を入れたが、
     // round 2 で deadlock が判明して撤回した経緯を固定する:
-    //   design text は description + allowedPaths 由来 → **訂正しなければ hash は同じ**
+    //   design text は Task の固定契約由来 → **訂正しなければ hash は同じ**
     //   訂正には `syncRoadmapTasks()` が要る → それは `pending` を要求する
     //   `pending` にするにはこの関数が要る
     // よって同一 hash で拒否すると、訂正する手段ごと失われる。

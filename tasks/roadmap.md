@@ -28,6 +28,14 @@ PL の採用候補は `planned` だけである（`deferred` は候補に入ら�
 これは Review 結果の override ではなく、**Source of Truth の時点整合修正**である。
 経緯: `docs/project_memory/decisions/multi_task_continuous_autonomous_development_evidence.md`。
 
+**Promotion 済み Tier A 項目の ID 運用**: Promotion が元の責務を完了したら、元の `roadmap:id` は
+`done` にする。同じ責務を人間が継続するなら元 ID を `in_progress` に戻してよい（2026-08-14 の
+既存運用）が、PL の自動採用対象にはしない。PL が自動採用する独立した残作業は、新しい ID を
+`planned` で登録する。Promotion 済み Tier A 項目を `planned` のまま残すと、awaiting-promotion check が
+follow-up 採用を fail-closed で停止し、既存 `audit_log` に
+`roadmap_completion_awaiting_promotion` を記録する。この規則は roadmap CLI の一般的な state 遷移能力を
+制限しない。
+
 ---
 
 ## Phase 1: 基盤構築（現在）
@@ -1500,8 +1508,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
 **将来項目（Step 2系の完了後に個別判断。今回は着手しない）**
 
-<!-- roadmap:id=meta-review-structured-output-robustness state=planned -->
-12. [ ] **Meta Reviewer structured-output robustness / false-BLOCKED の解消** — 2026-09-07、PR #98 / #99
+<!-- roadmap:id=meta-review-structured-output-robustness state=done -->
+12. [x] **Meta Reviewer structured-output robustness / false-BLOCKED の解消** — 2026-09-07、PR #98 / #99
       の実測により登録。`project-auto-meta-review-hardening`（上記11、done）の後続で、**同じ既存
       Meta Review経路の改善**である。新しいReviewer・新しいReview基盤・新しいGateは追加しない。
 
@@ -1889,6 +1897,25 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
         同一原則に対する `design` と `independent` の判定差を返す。
         **新しい比較記録を作る前に、これで足りるかを先に見る**
         （設計正本: `specs/23_system_one_decision_layer.md` 9章）
+
+      **追加実測（2026-10-08〜09・Task `b6d4097a`・post-implementation review）**: Meta Review ではなく
+      **post-implementation review** でも同じ反転が起きた。repair `9c5d22e9` の review `517d0af7` は
+      `changes_requested`（medium: secret-file 判定が requested name の `path.basename(file)` だけで、
+      `realpathSync` 後の実ファイルに掛からず、repository 内 symlink 経由で `.env` を読める）を返した。
+      repair を挟まず**同一 diff** を Human Resume で再実行した review `9dfffc41` は `approved` を返し、
+      同じ指摘を non-blocker へ格下げした。欠陥はコード上で未修正のまま（`reviewerAdapter.ts:199`）で、
+      git_commit Approval 待ちへ進んだ（CEO は承認していない）。
+      **含意**: 失敗した review の resume は**再抽選**として働き、未解決の blocking finding を消せる。
+      Decision Authority Principle 上、同一 diff への後続 review が先行 review の blocking finding と
+      矛盾する場合は「未解決の review 不一致」（§14-3 DA trigger 7）として fail-closed に扱うべきである。
+      記録: `docs/project_memory/decisions/p2_technical_recovery_production_e2e.md`。
+
+      **追加実測（2026-10-15・CI Meta Review・PR #348）**: 同じ変更内容に対し、Meta Review（Copilot fallback）は
+      head `86a65e8` で APPROVED（指摘なし）、master 追従と merge 解消後の head `700abc3` で BLOCKED
+      （DA(2) と判定、CODEOWNERS 対象なしで fail closed）、承認規則を `approval_rules.md` へ記録した head `008dad0`
+      で APPROVED（指摘なし）、文言修正後の `bf71474` で APPROVED（DA(2) の advisory 付き）と揺れた。
+      CEO が chat で SHA 限定の Code Owner 承認を与えて merge した。**承認されたことは揺れの解消ではない**
+      （CEO 指示）。同一 PR 内で DA 判定そのものが反転しうるため、DA 判定も verdict instability の対象に含める。
 
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
@@ -3872,9 +3899,9 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    修正を Production で検証した直後に発覚。commit は成功したのに後続が進まなかった）。
 
    **内容**: `findWorkspaceOwningTaskId()`（`apps/worker/src/index.ts`）は Job の status だけで
-   所有者を決め、**Task の status を一切見ていなかった**。`resumeBlockedTask()` は新しい Job を
-   別行として作り、旧 `blocked` 行を監査証跡として残す（`approveAndResumeJob()` は同一行を
-   `blocked -> queued` へ UPDATE するので滞留しない）。そのため resume 経路でだけ
+   所有者を決め、**Task の status を一切見ていなかった**。当時の `resumeBlockedTask()` は新しい Job を
+   別行として作り、旧 `blocked` 行を監査証跡として残していた（`approveAndResumeJob()` は同一行を
+   `blocked -> queued` へ UPDATE するので滞留しない）。そのため当時は resume 経路でだけ
    「`done` Task に blocked 行が残る」状態が生まれ、所有権が永久に解放されなかった。
 
    **実害**: 期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が解放されず、
@@ -3892,6 +3919,10 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **workspace がまだ使用中の間だけ**所有者として振る舞う。手放してよい状態になれば自然に解放する。
    候補条件は (1) Task が `done` (2) その blocked Job が quarantine されていない の2つだけで、
    解放するか否かは worktree の実観測が決める。
+
+   **2026-09-30 更新**: 新しい resume handoff は successor 作成と同じ transaction で source を
+   `failed` へ終端化する。既存行も、同一 Task の canonical `resume:<source>:<n>` を proof にした
+   startup reconciliation だけが終端化する。proof の無い legacy 行には本項目の fallback が残る。
 
    **解放条件は admission の拒否条件すべてにそろえる（独立レビュー round 3・4・5 の指摘）**:
    `computeWorkspaceBaseline()` が clean を拒否する条件は3つあり、どれか1つでも成立していれば
@@ -4423,11 +4454,12 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    別 liveness 依存である `approval-resume-liveness-dependency`（M2）が残るため、
    その完了をもって初めて M3 で通しの実測を行う。
 
-<!-- roadmap:id=mobile-approval-role-docs state=planned -->
-1. [ ] 2種類の承認の役割整理とMobile導線設計 — **Mobile導線は実装完了・文書整理のみ未完**。
+<!-- roadmap:id=mobile-approval-role-docs state=done -->
+1. [x] 2種類の承認の役割整理とMobile導線設計 — **完了（2026-09-30 promotion）**。
+   Mobile導線の実装に加え、両承認の役割と使い分けを `docs/project_memory/rules/approval_rules.md` へ記録した。
    Project単位承認（`/api/approvals/pending`）とTask/Job単位Approval Gate
    （`/api/approval-requests/waiting`）は、統合せず併存させる形で`approvals.tsx`に実装済み
-   （一覧取得・承認/却下操作とも動作）。**未完了なのは両者の役割・使い分けの文書化のみ**で、
+   （一覧取得・承認/却下操作とも動作）。登録時に未完了だったのは両者の役割・使い分けの文書化のみで、
    これはMVP必須ではなく非ブロッキング（スマホ操作サイクルは現状の併存実装で完結するため、
    **（延期条件は充足済み: MVP は 2026-09-13 に完了。上記の「MVP後」は書かれた時点の記録であり、現在の BLOCK 条件ではない。現在の可否は `state=` が正本。）**
    項目4の後またはMVP後に実施してよい）
@@ -4942,6 +4974,14 @@ worktree と別 repository は採らない。
   そのまま再利用**でき、新規機構がゼロ。Stable の deploy ディレクトリ自体も同 repo の clone であり、
   Candidate はその兄弟 clone になる
 
+**Promotion の完了条件**: Candidate の成果を canonical master へ到達させるだけでは完了としない。
+同じ promotion PR で、(1) 成果を canonical master へ入れる、(2) 実際の受入結果に従って Roadmap の
+state / checkbox を `roadmap:update` で更新する（元の責務が完了したら元 ID は `done`、同じ責務を
+人間が継続するなら元 ID は `in_progress`、PL が自動採用する独立した残作業は新しい ID を `planned` で
+登録する。Promotion 済み Tier A を `planned` のまま残すと awaiting-promotion audit で fail-closed）、
+(3) `roadmap:sync` で `PROJECT_CURRENT_STATE` を同期する、(4) `roadmap:check` を PASS させる。
+merge 後は Candidate clone を canonical master へ同期してから次の自己開発を開始する。同期で `pnpm-lock.yaml`（または package.json）が変化した場合は、Candidate clone で `pnpm install --frozen-lockfile` を実行して dependency を同期し、実行前後で HEAD・tracked files・lockfile・未 commit 差分が変化していないことを確認する（2026-10-01、dependency 未同期で Task `7458ea33` の全 Job が SafeCommand test で失敗した事例）。
+
 **Candidate 検証の2種別（区別する）**:
 1. **Synthetic / Destructive Test** — テスト専用の Project / Roadmap / DB を使い、
    dirty workspace・quarantine・provider failure・stuck state・他 Project への不正アクセス等を
@@ -5377,6 +5417,10 @@ Mobile Operator Chat ──┘
 quarantine / retry / recovery / Review / Approval / runtime progress / cost を1本で返す。
 **write 側**: 既存の `POST /api/tasks/:id/resume`・`PATCH /api/jobs/:id/clear-quarantine`・
 `PATCH /api/approval-requests/:id/status` 等をそのまま使う。**新しい Control subsystem を作らない。**
+
+**【2026-09-28 CEO 方針で更新】** ChatGPT（MCP）側は上記 write API を**直接呼ばない**。
+ChatGPT に許すのは safe read と Operator Request（`ask_pl` 相当）の作成・結果取得だけで、
+実際の操作は PL が既存 Gate を通して行う。詳細は `chatgpt-mcp-inspect` を参照。
 
 ### 横断制約: 従量課金APIを新しい標準経路にしない（CEO 追加指示・2026-09-14）
 
@@ -5906,6 +5950,42 @@ deploy canary は全 PASS だった。
 
       **関連**: `quarantined-dirty-task-generic-recovery`（この quarantine から**出られない**理由。
       同じ復旧クラスタだが根本原因と責務が異なるため、**1つの実装 / PR にまとめない**）。
+
+<!-- roadmap:id=containment-placement-ack-race state=done -->
+4. [x] **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される — correctness bug（2026-09-25 本番実測）— 完了（2026-09-25, PR #289）**
+
+      **【2026-09-25 完了】** merge commit `a23732928ca5eacec297f956697d9ebf8f6ffe28`。
+      abort / timeout 時に placement handshake が pending なら、ACK / fd3 terminal / child exit・error /
+      bounded deadline の最初の決着まで待ってから `cgroup.kill` を撃つようにした。成功判定は引き続き
+      fd3 ACK protocol のみで、`SAFE_OUTCOMES` / `isContainmentSafe()` / `placement_failed` の分類 /
+      true placement failure の fail-closed はいずれも不変（byte-identical）。
+      検証: delegated cgroup で pre-abort 90 回の `placement_failed` 0 件（修正前は 38 回中 10 回）、
+      同環境で worker 69 files / 1,388 tests pass、Independent Review approved / findings 0。
+
+      **責務**: cgroup placement 自体が成功している実行を、ACK / abort / timeout / kill ordering の
+      race によって `placement_failed` と誤分類しない。**ただし真の placement failure は引き続き
+      fail-closed にする。** この2つ以外はこの項目に含めない
+      （general flaky-test 対策 / delegation contract / adversarial escape / observability 一般 /
+      `createRepairJobWithHandoff()` の Job history finding / 新しい retry・Gate・workflow・status・daemon）。
+
+      **実測（本番 VPS・delegated cgroup・2026-09-25）**: pre-aborted な `AbortSignal` を渡すと
+      `cgroup.kill` が `spawn()` の直後（≒0ms）に撃たれる。ラッパは
+      `echo $$ > cgroup.procs`（= cgroup へ参加）までは完了するが、次行の `echo ok >&3` に
+      到達する前に、自分が参加したことで届いた SIGKILL で死ぬ。結果 **placement は成功して
+      いるのに ACK が 1 バイトも出ず**、安全だった実行が `placement_failed`（= `isContainmentSafe`
+      false）になる。38 回中 10 回（26%）再現。10 件すべてで fd3 は `end` まで到達し raw bytes 0、
+      child は SIGKILL、`killedDescendants` は true。**late ACK（Node stream の配送遅れ）は 0 件**で、
+      「exit 後に既存 ACK を回収する」修正では 1 件も救えないことを確認済み。
+
+      **影響**: 誤りの向きは fail-closed（危険を安全と報告する経路ではない）。しかし正常な Job を
+      不定期に停止させる。2026-09-25 に Task `c3849205` の repair Job を実際に一度止めた。
+
+      **着手時の制約**: `SAFE_OUTCOMES` / `isContainmentSafe()` / `placement_failed` の意味 /
+      真の placement failure の fail-closed は変更しない。SIGKILL されたこと自体を placement 成功の
+      証拠に使わない。既存 fd3 ACK protocol を正本として維持する。child 全体の `close` 待ちへは
+      戻さない（生存子孫に引きずられるため）。placement 待ちに `DEFAULT_DRAIN_MS`（10s）を流用せず、
+      cancel 応答性を損なわない短い bounded deadline を使う。deadline 到達は placement 成功では
+      ないので、到達後は kill したうえで従来どおり fail-closed に分類する。
 
 <!-- roadmap:id=containment-success-path-observability state=planned -->
 4. [ ] **Containment success path の可観測性（低優先 hardening）** — 2026-09-08、P1 Phase 1/2
@@ -7150,8 +7230,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
 ### 優先度 2: Escalation / recovery / resume
 
-<!-- roadmap:id=pl-escalation-recorded-without-delivery state=planned priority=high -->
-0. [ ] **PL Escalation が未配達でも `escalated` と記録し、以後 PL の全作業が永久に止まる** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
+<!-- roadmap:id=pl-escalation-recorded-without-delivery state=done priority=high -->
+0. [x] **PL Escalation の配達結果が記録されず、配達済み・未配達・意図的抑制を区別できない** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
 
    **事実**: `apps/api/src/pl/executionLoop.ts` の `escalateTo()` は
    `await escalate({...})` の直後に**無条件で** `record(storage, key, 'escalated', reason)` する。
@@ -7272,8 +7352,27 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - 既存 `no-status-for-closing-a-task-without-implementing` と同じ出口の問題である。
      **新しい TaskStatus を足す前に**そちらの検討結果と突き合わせる
 
-<!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=planned -->
-0. [ ] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。
+   **完了（2026-09-30 promotion）**: 本項目の固有責務である B / D の可視化を実装した。
+   `defaultEscalate()` の配達結果を捨てず、`delivery=delivered|undelivered|suppressed` を
+   `escalated` audit に残す。配達成否や通知例外に関係なく `escalated` 自体は必ず記録する。
+   上記の採用停止は別の未達責務であり、直後の item へ分割した。
+
+<!-- roadmap:id=pl-adoption-stalled-by-escalated-attention state=done priority=high -->
+0. [x] **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**
+   — `pl-escalation-recorded-without-delivery` に混在していた未達責務の split（新機能ではない）。
+   `runPlTick()` は `apps/api/src/pl/executionLoop.ts:1441-1447` で `hasEscalated()` 済みの対象を
+   `actionable` から外す一方、`maybeAdoptNext()` は同ファイル `1738-1743` で除外前の
+   `state.attention.length > 0` を見て即 return する。そのため CEO 判断待ちの1件が、関係のない
+   Project の採用まで止める。未 escalate の停滞中に新しい仕事を増やさない既存意図は維持し、
+   新しい recovery subsystem や TaskStatus を作らず、採用判定へ同じ除外を適用できるか確認する。
+
+   **完了（2026-10-02 promotion、Tier A Task `7458ea33` / Candidate `3926b97`）**: `runPlTick()` が
+   `actionable` の除外に使う `hasEscalated()` 判定を採用判定にも適用した。attention がすべて
+   Escalation 済みのときだけ `maybeAdoptNext()` を呼び、判断待ちの Project 自体は採用先から外す。
+   未 escalate の attention が1件でもあれば従来どおり採用しない。新しい subsystem・TaskStatus は無し。
+
+<!-- roadmap:id=pl-resume-task-design-review-evidence-mismatch state=done -->
+0. [x] **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる** — 2026-09-15 監査（Confirmed / P2）。復旧経路が 2 重に実装されており、PL 側だけ復旧処理を持たない。
 
    **事実（2026-09-15 master で再確認）**: HTTP route 側（`apps/api/src/routes/tasks.ts`）は
    `resumeBlockedTask` を呼び、`DESIGN_REVIEW_PRECONDITION_FAILED` のときは
@@ -7302,8 +7401,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - **新しい recovery 経路を作らない。** 既存の 2 経路を 1 本へ寄せる
    - 効果検証可能性: この理由で消費された attempt / escalation の件数が後から数えられること
 
-<!-- roadmap:id=cheap-ai-latency-and-timeout-contract state=planned -->
-0. [ ] **cheap AI（説明・質問経路）の latency と timeout 契約** — 2026-09-15 監査により**正式登録**（それ以前は本文中で open と宣言されながら `roadmap:id` を持たず、PL が構造的に採用できなかった）。
+<!-- roadmap:id=cheap-ai-latency-and-timeout-contract state=done -->
+0. [x] **cheap AI（説明・質問経路）の latency と timeout 契約** — 2026-09-15 監査により**正式登録**（それ以前は本文中で open と宣言されながら `roadmap:id` を持たず、PL が構造的に採用できなかった）。
 
    **登録経緯**: 本ファイルの「### P1 とは分離して open のまま維持する項目」で
    `cheap-ai-latency-and-timeout-contract` として open と宣言されていたが、
@@ -7320,12 +7419,23 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    PL の attempt を消費してよいか（`provider-outage-burns-attempt-budget` と隣接）。
    **新しい timeout 機構を作らない。**
 
+   **完了（2026-10-02 promotion、Tier A Task `f7c4ff37` / Candidate `b71f2e08`）**: Task の AC 1〜5 を満たした。
+   `cheapAiClient.ts` に試行ごとの期限 `CHEAP_AI_ATTEMPT_TIMEOUT_MS` と caller 種別ごとの CLI 起動後の最悪待ち定数を置き、
+   timeout / retry / fallback の契約を code comment に明記した（kill は既に自前 timer + SIGTERM→SIGKILL で、
+   本文の `spawn({ timeout })` 依存は解消済みだった）。timeout は `requestTextResult()` が
+   `{ ok: false, reason }` の構造化結果として**提供**する。AC は提供までで、caller への配線は求めていない
+   （AC 5: `apps/api/src/aiExplain` 外を変更しない）。
+   **未決のまま残すもの**: (1) timeout 値は 60 秒の暫定値のまま。CEO 判断により、PL adoption proposal の
+   専用 agent 化を Production で観測した後に、独立した変更として決める。(2) timeout 時の PL attempt 消費は
+   `provider-outage-burns-attempt-budget` の責務。(3) `requestTextResult()` を実 caller へ配線するかは、
+   必要になった時点で別 item として扱う（現時点で未使用の公開 API である）。
+
 ---
 
 ### 優先度 3: AI へ注入される Current Truth の誤情報
 
-<!-- roadmap:id=vps-operation-docs-current-truth state=planned priority=high -->
-0. [ ] **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる** — 2026-09-15 監査（Confirmed / P1）。「VPS常駐運用化」節をまとめて現在の実態へ更新する。
+<!-- roadmap:id=vps-operation-docs-current-truth state=done priority=high -->
+0. [x] **VPS 運用手順の Current Truth 文書を canonical にする** — 2026-09-15 監査（Confirmed / P1）。現在の実態を `docs/project_memory/decisions/vps-operations.md` に集約する。
 
    **(1) 起動 env allowlist が API の実際の読み取りを欠いている（最も実害が大きい）**:
    本ファイル「VPS常駐運用化」節の「**正式Production起動方式の確定**」は `set -a; . .env` を禁止したうえで
@@ -7386,6 +7496,26 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
    **着手時の制約**: **(1)〜(6) はすべて記述・設定側の修正で足りる。新しい仕組みを作らない。**
    production への操作（再起動・env 変更）は本項目の範囲外で、別途 CEO 承認のうえ既存 deploy 手順で行う。
+
+   **完了（2026-09-30 promotion）**: 本 ID の責務である Current Truth 文書
+   `docs/project_memory/decisions/vps-operations.md` は master へ到達した。上記 (1)〜(6) の既存
+   runtime / env 文書・tooling への反映は、独立した残作業
+   `vps-runtime-env-docs-tooling-alignment` が引き継ぐ。
+
+<!-- roadmap:id=vps-runtime-env-docs-tooling-alignment state=planned priority=high -->
+0. [ ] **VPS runtime / env の文書と tooling を Current Truth に整合させる** —
+   `vps-operation-docs-current-truth` が確定した Current Truth を、残る既存 surface へ一体で反映する。
+   相互依存する同一の整合責務なので、次の (1)〜(6) を分割せず扱う:
+   (1) canonical production 起動 env allowlist と runtime spec を同期し、Actions 認証と CEO 通知の
+   必須変数を欠かさない、(2) 完了済み VPS 運用項目を roadmap / runtime spec で整理し、真に open な
+   Docker 化と log 保存・rotation を明確にする、(3) `sandbox/hooks/pre-push` の `tsx` 起動方法と
+   `set -e` による到達不能分岐を修正する、(4) DB 復元手順・wrapper・実復元テストの接続を文書化する、
+   (5) CI と production の Meta Review model を整合させる、(6) `.env.example` を実際の読取変数へ
+   揃え、`BACKUP_KEEP_COUNT = 28` の保持期間を文書化する。
+
+   **制約**: 記述・設定側の修正に限定し、新しい仕組みを作らない。production の再起動・env 変更は
+   範囲外で、別途 CEO 承認と既存 deploy 手順を要する。VPS 上だけにある systemd unit を version 管理へ
+   入れるかは、production 設定の扱いとして CEO 判断を維持する。
 
 <!-- roadmap:id=current-truth-dual-record-prevention state=planned priority=high -->
 0. [ ] **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める** — 2026-09-15 監査（Confirmed / P1）。監査 92 Finding の**共通根本原因**。
@@ -7574,6 +7704,7 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - `git_commit` は CEO 承認（`approval-20260918-037d5430`, CONSUMED）を経て成立
 
    **この `done` は未検証完了ではない。** 上記 evidence と受入条件を照合したうえでの完了記録である。
+   Candidate-only だった実内容は 2026-09-30 の promotion change を通じて master へ到達した。
 
    **本件から出た設計上の学び**は `executed-item-remaining-work-has-no-continuation` と
    `adoption-does-not-check-implementation-feasibility` へ記録した（重複記載しない）。
@@ -9105,6 +9236,35 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: 「採用したが allowedPaths 内で実装不能だった」
         件数を後から数えられること
 
+<!-- roadmap:id=implement-prompt-omits-allowed-paths-and-acceptance state=done priority=high -->
+0. [x] **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**
+      — 2026-10-02 登録（production 実測、CEO 指示）。`adoption-does-not-check-implementation-feasibility`
+      （採用時に宣言する範囲の誤り）とは別の層で、**範囲は正しいのに実装 AI へ伝わっていない**問題である。
+
+      **事実（2026-10-02 master で確認）**: `buildInitialImplementAiCliPrompt()`
+      （`apps/api/src/ctoAi/initialImplementWorkflow.ts:25-35`）は `task.description` と Design Contract
+      だけを返す。`allowedPaths` は Design Contract の principle 選択にしか使われず、本文には出ない。
+      `acceptanceCriteria` は使われていない。`claudeCodeAdapter.ts` の implement 接頭辞は
+      「allowedPaths 外を編集するな」と言うが、**値を示していない**。一方 Reviewer は
+      `jobRunner.ts` で `acceptanceCriteria` / `allowedPaths` / `forbiddenPaths` を受け取っている。
+
+      **再現事例**: Task `f7c4ff37`（`cheap-ai-latency-and-timeout-contract`）の Job `9af619ee`。
+      allowedPaths は `apps/api/src/aiExplain`、AC 5 は「`apps/api/src/aiExplain` 外を変更しない」。
+      実装 AI（prompt 2113字。`allowedPaths` も AC も0件）は timeout reason を HTTP route・shared types まで
+      伝播させ、範囲外8ファイルを変更して stage A で blocked になった。実装 AI 自身が結果報告で
+      「Task didn't list allowed paths explicitly」と述べている。
+
+      **第一候補（最小変更）**: 既存 `buildInitialImplementAiCliPrompt()` の構築を改善し、Task に既に
+      保存されている `allowedPaths` / `acceptanceCriteria`（Design Review も同じ Task を見ている）を
+      implementer へ明示する。Reviewer へ渡している情報の再利用を優先する。
+      **新しい Guard / workflow / Remediation は作らない。**
+
+      **着手時に確認すること**:
+      - prompt を変えると Design Review evidence の `designTextHash` が変わる。既存 evidence との整合
+        （`checkImplementJobDesignReviewEvidence`）を壊さない置き場所を選ぶ
+      - resume prompt（`buildResumeAiCliPrompt()`）にも同じ欠落があるか
+      - 効果検証可能性: 「範囲外変更による stage A blocked」件数を変更前後で数えられること
+
 <!-- roadmap:id=adopted-item-blocked-by-stale-deferral-text state=done -->
 9. [x] **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
       — **完了（2026-09-15, PR #211）**。CEO 判断により、ledger 全体の時点整合を取って解消した。
@@ -9651,6 +9811,196 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - **新しい診断機構は作らない。** 渡す context の作り方（`buildContext()`）の改善で足りるか
       - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
 
+<!-- roadmap:id=human-resume-superseded-job-hides-new-failure state=done -->
+14. [x] **Human Resume 後も古い blocked Job が Attention を占有し、後継の新しい失敗が PL に見えない（D2）** —
+      2026-09-28 production 実測（Task `9fdee5a3`）で登録し、同日修正。
+
+      **責務は 1 つ**: Human Resume で後継が作られた古い blocked / failed Job を、「いま Task を止めている Job」
+      として数えないこと。**新しい永続状態 / status / Gate / PL の責務は作らない。**
+      当時は元の行を書き換えない設計だった。
+
+      **実測（当時）**: `resumeBlockedTask()` は元の Job を `blocked` のまま残して `resume:<元Job>:1` を作っていた。
+      `systemState.ts` の `hasMovableJob` は blocked を「動かせる Job」と数えるため、残った元 Job が
+      以後の `job_failed` をすべて抑止した。古い `job_blocked:<元Job>` は PL が escalate 済みで、
+      `hasEscalated()` が生涯 dedup するので、Human Resume した review の失敗は**誰にも見えないまま止まった**。
+
+      **修正**: superseded を保存済みの事実だけから導く（`jobsSupersededByHumanResume()` /
+      `readJobsSupersededByHumanResume()`）。Job X が superseded なのは、`resume:<X>:<n>` の Job S があり、
+      S の `resume_actor` が `human`（admin_credential 根拠）で、S からの lineage が既存 `walkRepairGeneration()` で
+      well-formed なときだけ。`hasMovableJob` / `job_blocked` / `stallingFailure` の 3 箇所で superseded を除外する。
+      後継の失敗は新しい key（`job_failed:<後継>`）で出るので、dedup も episode 単位になる。
+      AI / unknown / malformed / 別 Task を指す resume は superseded にしない。`workspace_quarantined` は従来どおり出す。
+
+      **2026-09-30 更新**: 現行 handoff は source を同一 transaction で `failed` へ終端化し、既存の
+      canonical lineage も startup reconciliation で揃える。この superseded 導出は、旧DBや安全上
+      reconciliation できない行に対する compatibility rule として残る。
+      AI resume（PL `resume_task`）も同じ handoff を通るため、下の「含めないもの」にある AI resume の停止も
+      以後は元 Job の終端化によって `job_failed:<後継>` として見えるようになる（Human authority の境界は動かしていない）。
+
+      **この項目に含めないもの**（別責務）:
+      - AI resume で同じ形に陥る停止を、この superseded 導出で扱うこと（Human authority の境界を AI resume で動かさないため、意図的に対象外。2026-09-30 以降は上記の source 終端化で別途解消している）
+      - repair admission の Design Review 根拠（D3）、approved な resumed review の git_commit（D4）
+
+<!-- roadmap:id=low-load-design-review-unreachable-on-vps state=done -->
+12. [x] **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた** —
+      2026-09-28 production 実測（Task `9fdee5a3` の docs-only repair、design review run `d0af140a`）で登録し、同日修正。
+
+      **責務は 1 つ**: docs / test / 非 policy markdown だけの変更（review load = low）の Design Review が
+      VPS で実行でき、判定が API まで届くこと。実行できなかった場合は `REVIEW_UNAVAILABLE` と本当の理由が
+      durable に残ること。**新しい Gate / provider / status / fallback workflow は作らない。**
+
+      **実測した欠陥（3 つが同時に起きていた）**:
+      - **prompt の root**: low-load 経路（legacy Meta Review）だけが `runner.ts` の既定
+        `/workspace/control`（container 時代のパス）から `docs/meta_reviewer/prompt.md` を読み、VPS では毎回
+        ENOENT。focused 経路（medium 以上）は coordinator が解決した `controlContextDir` を使っており無事だった。
+        VPS の API は cwd = repo root で、`resolveDefaultControlContextDir()` はそこへ解決する（read-only 実測）。
+      - **架空の focus**: 失敗結果に実行されていない `strategic_alignment` を 1 件足していたため、API の
+        集合一致検査が `focus set mismatch: expected [] but runner reported [strategic_alignment]` として弾き、
+        ENOENT が見えなくなっていた。
+      - **判定の欠落**: 成功しても low-load は判定を `finalDecision`（自己申告・API は読まない）にしか載せず、
+        API の recompute は `resolveFinalDecision([], undefined)` = **常に UNCERTAIN** だった。
+        low-load の Design Review は root を直しても ALIGNED に届かない状態だった。
+
+      **修正**: low-load も focused 経路と同じ `controlContextDir` から prompt を読む（新しい root 概念は
+      作らない。`runner.ts` の既定は CI 用に不変）。判定は API が読む `integrationReviewResult` へ載せる
+      （approved だけが ALIGNED）。unavailable は架空 focus を作らず `unavailableReason`（任意・後方互換）で
+      理由を運び、API は **期待 focus が空の task kind に限って** `REVIEW_UNAVAILABLE` をそのまま採用し
+      `rejectedReason` に理由を残す。medium 以上（CONFLICT と unavailable が混在し得る）と roadmap kind の
+      判定は不変。
+
+      **この項目に含めないもの**: PL escalation が LINE へ届かない件（`pl-escalation-recorded-without-delivery`
+      が正本）、medium 以上で unavailable の理由が rejectedReason に残らない既存挙動、Task `9fdee5a3` の再開
+      （Production deploy 後に別途）。
+
+<!-- roadmap:id=approved-resumed-review-creates-no-git-commit state=done -->
+16. [x] **approved になった Human Resume review から git_commit が作られず、Task が行き止まりになる（D4）** —
+      2026-09-28 監査（Task `9fdee5a3` の再開前確認）で登録し、同日修正。
+
+      **責務は 1 つ**: Human Resume で再実行された review が approved なら、通常の review と同じ git_commit successor へ繋ぎ、
+      その git_commit を CEO が REJECT した後も元の実装まで provenance を復元できること。**新しい status / Gate / workflow は作らない。**
+
+      **実測（コード）**: `routes/jobs.ts` の `isAutomaticReviewJob` は `implement:<id>:review` の形だけを見ていた。
+      `resume:<review>:1` の review が approved でも git_commit は作られず、Task は blocked のまま latest Job = success になり、
+      `resumeBlockedTask()`（latest が blocked / failed のときだけ）も `/recover`（Job がある Task は対象外）も使えない。
+      さらに REJECT 後の provenance（`resolveSourceImplementJobForRejectedGitCommit`）も review → implement を
+      `implement:<id>:review` の parse だけで辿っていたので、git_commit だけ作ると REJECT 後に別の行き止まりができる。
+
+      **修正**: review → implement の traversal を `repairPolicy.ts` の `resolveReviewedImplementationFrom()` 1 本へ寄せ
+      （D1 の walker を移動。Job の `findById` / `findByTaskId` だけを受け取るので storage 層が flow 層へ依存しない）、
+      D1 / D3 の入口・approved continuation・REJECT 後の provenance がすべてそれを使う。approved な resumed review は
+      辿れたときだけ `review:<今回の review>:git-commit` を作る（辿れなければ従来どおり作らない）。
+      **git_commit 側の resume 正規化は従来どおり最大 1 ホップ**で、その先の review → implement の区間だけを walker が担う。
+
+      **この項目に含めないもの**: `repairFromStoredReview` の resume 対応（既知 Finding）、Worker の review context 推測（W1）。
+
+<!-- roadmap:id=resumed-review-changes-requested-reaches-no-repair state=done -->
+13. [x] **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）** —
+      2026-09-28 production 実測（Task `9fdee5a3`、review `12c5287f`）で登録し、同日修正。
+
+      **責務は 1 つ**: Human Resume で再実行された review が `changes_requested` を返したとき、保存済み
+      lineage から元の実装を復元して、既存 repair flow（admission / budget / allowedPaths / authority）へ戻すこと。
+      **新しい status / Gate / workflow は作らない。**
+
+      **実測**: `resumeBlockedTask()` は最新 Job を複製するので、最新 Job が失敗した review なら resume Job も
+      review（`resume:<review>:1`）になる。`routes/jobs.ts` の Stage 2 は `implement:<id>:review` の形しか
+      受け付けず、その review の修正要求は **repair run も repair Job も escalation もログも無く**消えていた。
+
+      **修正**: `resolveReviewedImplementation()` が `resume:<review>:1` を、キーが名指す 1 件ずつ遡って
+      `implement:<id>:review` の review と実装へ辿る。各段は同じ Task / Project の review Job でなければならず、
+      循環・再訪・存在しない元・別 Task・review 以外の段はすべて不成立（fail-closed）。Human Resume のたびに
+      1 段増えるので段数は固定しない（git_commit 却下の provenance の「1 ホップだけ」とは対象が違う）。
+      blocked admission は引き金の review Job を selector として受け取り、**その review Job 自身に保存された
+      verdict** だけを使う。予算と権限は実装の lineage を既存 `walkRepairGeneration()` が決める（不変）。
+
+      **この項目に含めないもの**（別責務）:
+      - 古い blocked Job が Attention を占有して新しい失敗が PL に見えない件（D2）
+      - admission の「最新 Design Review が ALIGNED」条件。production `9fdee5a3` は最新 run が
+        実行できなかった repair review（`d0af140a`、REVIEW_UNAVAILABLE）なので、D1 後もここで skip する
+      - 承認された resume review から git_commit が作られない件（`isAutomaticReviewJob` が `implement:*:review` 限定）
+      - `repairFromStoredReview` の `resolveStoredReviewChain()` が resume review を受け付けない件
+
+<!-- roadmap:id=git-commit-resume-chain-closes-rejected-reimplementation state=done priority=high -->
+0. [x] **期限切れ git_commit Approval の定常 resume が lineage を深くし、CEO REJECT 後の再実装経路を自ら閉じる — 完了（2026-10-15, PR #348）**
+
+      **【2026-10-15 完了】** merge commit `068422fe09aa6ab6520f9351ddef67402ac28434`。固定 anchor + generation
+      （`resume:<review:<id>:git-commit の Job>:<n>`）で、REJECT は anchor を1回だけ参照して再実装へ届く。
+      旧形式（key 無し・入れ子の `resume:<prev>:1`）は従来どおりで自動移行しない。壊れた新方式 lineage は 409 で
+      fail-closed（CEO へは上げず technical budget で停止）。規則: `docs/project_memory/rules/approval_rules.md`
+      「期限切れ git_commit の resume 系譜」。同時に manual abort（PR #347）で REJECTED git_commit の Task を
+      解放できるようになった。**Task `b6d4097a` の既存7段チェーンは未移行**（一度限りの明示的移行は別途 CEO 判断）。
+      — 2026-10-15 登録（production 実測・CEO 指示。24時間自律運転の復旧を直接妨げる構造的欠陥）。
+
+      **実測（Task `b6d4097a`）**: blocked git_commit の `WAITING_FOR_USER` Approval が期限切れになるたび、
+      PL が約24時間ごとに定常 resume（`resume_actor=pl`）し、新しい git_commit Job
+      （`workflowStepKey = resume:<直前の git_commit Job>:1`）と新しい Approval を作る（旧 Approval は #342 で
+      SUPERSEDED）。6日で git_commit 側は `review:<review>:git-commit` から **7段の `resume:`** になった。
+
+      **なぜ閉じるか**: CEO REJECT 後の再実装（`resolveSourceImplementJobForRejectedGitCommit`、
+      `apps/api/src/storage/sqlite.ts`）は、2026-09-23 の CEO 承認どおり git_commit 側の `resume:` を
+      **1段だけ**正規化し、2段以上の traversal / recursive resolver を禁止している（本ファイル
+      「`resume:` 1ホップの正規化」節）。定常の technical recovery がこの前提を自ら崩すため、REJECT すると
+      `REJECTED_COMMIT_SOURCE_UNRESOLVED` で fail-closed になり、Task は blocked のまま Project を占有し続ける。
+      加えて manual abort は blocked Task の全 Job terminal を要求するため、REJECTED の blocked git_commit が
+      残る形では park もできない（別途、既存 abort 経路の最小修正を設計中）。
+
+      **制約（CEO）**: 元の `workflowStepKey` を新 Job へ再利用する案は**未承認**。1ホップ規則を緩めない。
+      新しい Gate / status / workflow を作らない。
+
+      **着手時に確認すること**:
+      - `workflowStepKey` の意味と一意制約、`resume:<id>:<n>` / `review:<id>:git-commit` を解釈する箇所
+        （lineage walker・resume actor・repair generation・evidence / Approval provenance・#342 supersede・
+        gate_evaluations の binding）
+      - 同一 diff の再承認に新 Job が要るか（既存 blocked git_commit Job へ新しい承認サイクルを付けられるか）
+      - 1ホップ規則と履歴・Approval・Evidence の整合を保つ最小修正
+      - 効果検証可能性: git_commit 側 resume 段数の分布と、REJECT 後に再実装へ到達できた件数を数えられること
+
+<!-- roadmap:id=review-preflight-refusal-reaches-no-reimplementation state=planned priority=high -->
+0. [ ] **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**
+      — 2026-10-02 production 実測で登録（CEO 指示: 24時間自律運転の阻害要因）。
+      `resumed-review-changes-requested-reaches-no-repair`（verdict が `changes_requested` の場合）の
+      **隣接ケース**で、verdict が出る前に adapter が拒否する場合である。
+
+      **実測**: Task `463563d0`（`task-codex-review-cannot-read-repo`）。implement Job `6b6fcb4e` は success。
+      実装 AI が書いた `apps/worker/src/approvalLevel/repoContext.test.ts` に、secret 省略ロジックを試すための
+      ダミー（`password` + `= "x"` の形）があり、review Job `9e11e2e4` の prompt が既存 Secret Scan
+      （`isPromptSafe`、`packages/shared/src/types/ai_cli.ts`）に一致して `AiCliAdapter` が送信を拒否した。
+      Human Resume は最新 Job（失敗した review）を複製するだけなので、resume review `98798dad` も同じ理由で失敗した。
+      既存 repair flow は review の **verdict** を起点にするため、ここへは届かない。結果として Task は blocked のまま
+      唯一の running Project を占有し、PL の採用も止まった（formal abort で park して解消）。
+
+      **Secret Scan の fail-closed 自体は正しい**（本物の secret でないことを機械的に区別できない）。
+      問題は「実装側の修正で解消できる拒否」を実装へ戻す経路が無いことである。
+
+      **第一候補（最小変更）**: review Job の送信前拒否のうち、**原因が実装差分の内容にあるもの**（Secret Scan 一致）を
+      既存 repair flow へ渡す。拒否理由は untrusted data として repair prompt に入れ（既存の fence と sanitizer を使う）、
+      repair の admission / budget / allowedPaths / authority はそのまま適用する。
+      **新しい status / Gate / workflow / Remediation 工程は作らない。Secret Scan を弱めない・迂回しない。**
+
+      **着手時に確認すること**:
+      - 送信前拒否の種類（workingDir 外 / Secret Scan / その他）のうち、実装差分で解消できるものだけを対象にする
+      - repair 後の review でも同じ fixture を作り直さないよう、repair prompt に拒否パターンの種類（値ではなく）を示す
+      - 効果検証可能性: 「review 送信前拒否で blocked」になった件数と、repair で解消した件数を数えられること
+
+<!-- roadmap:id=answered-design-review-run-blocks-repair-admission state=done -->
+15. [x] **Human Resume で回答済みの repair Design Review run が「最新だから」という理由で repair admission を止め続ける（D3）** —
+      2026-09-28 production 実測（Task `9fdee5a3`、run `d0af140a`）で登録し、同日修正。
+
+      **責務は 1 つ**: blocked Task の repair admission（規則 7「最新 Design Review が ALIGNED」）が、
+      人が Human Resume で既に答えた repair run を根拠にしないこと。**新しい status / Gate / workflow は作らない。**
+
+      **実測**: R0 の修正要求から作られた repair run `d0af140a` は REVIEW_UNAVAILABLE で終わり、Task は blocked のまま
+      人へ渡った。CEO はその後 R0 を Human Resume し（R1）、R1 も修正を要求した。規則 7 は Task の最新 run を読むため、
+      D1 で R1 を元の実装へ戻しても `d0af140a` に止められ、しかも skip はログも残さなかった。
+
+      **修正**: run を新しい順に読み、**Human Resume で回答済みの run だけ**を外して、残りのうち最も新しい run に従来の規則を当てる。
+      回答済みとするのは、同じ Task・`repairSourceJobId === decision.sourceJobId`・run が終端・引き金の review の
+      resume lineage 上に `resume_actor = human`（admin_credential 根拠）の Job があり、その `createdAt > run.completedAt`
+      をすべて満たすときだけ。**verdict では特例にしない。** AI / unknown / malformed の resume、別 lineage、
+      別 `repairSourceJobId`、run 完了前の resume は回答にしない。`repairSourceJobId` 無しの Task 設計 run と active run の
+      既存 gate は不変。admission が skip したら `reason / sourceJobId / reviewJobId / runId` を warn log に残す。
+
+      **この項目に含めないもの**: approved な resumed review の git_commit（D4）、`repairFromStoredReview` の resume 対応（既知 Finding）。
+
 <!-- roadmap:id=repair-budget-counted-per-task-not-per-chain state=done -->
 0. [x] **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった** —
       2026-09-22 実装。**Human resume と AI resume を同じ意味として扱わないことが本項目の主境界である。**
@@ -9746,10 +10096,19 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       テストも別々に固定してある（`lineage walk — 意味側` / `lineage walk — 停止側`）。
 
 
-<!-- roadmap:id=auth-empty-token-hash-accepted state=planned priority=high -->
-0. [ ] **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する** —
+<!-- roadmap:id=auth-empty-token-hash-accepted state=in_progress priority=high -->
+0. [~] **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する** —
       2026-09-22 登録（read-only 確認）。**concrete な authority boundary の欠陥であり、
       `split-credential-migration` の cutover 前 blocker である。**
+
+      **【2026-09-28 コード修正済み・merge 待ち】** 既存の fail-closed 分岐へ 1 本足す形で塞いだ
+      （新しい検査層は作っていない）。ADMIN / WORKER / ACTIONS_READONLY のいずれかの hash が
+      空 token 由来（大文字・前後空白も含む）なら 503、token 部が空の `Bearer ` は 401。
+      regression test: `apps/api/src/auth/emptyTokenHash.test.ts`（修正前に 4 件失敗することを確認済み）。
+      手順書 `human_recovery.md` の生成式は `${X:?}` で空値を止める形へ変更（副次）。
+      **production の設定値が空 token 由来 hash でないかの確認は未実施**（VPS 権限が必要。
+      `split-credential-migration` の「最初にやること」に含まれる）。merge・deploy 後に done とする。
+      本項目は `chatgpt-mcp-inspect` の D0（外部接続の前提）でもある。
 
       **確認した事実（コードと手順書を読んだだけ。production の設定値は読んでいない）**:
 
@@ -10168,8 +10527,99 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       新しい通知基盤 / 新しいダッシュボード / Monitor 専用 DB。既存の改善で足りない場合のみ、
       その時点で不足を具体的に示してから検討する。
 
-<!-- roadmap:id=chatgpt-mcp-inspect state=planned -->
-1. [ ] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
+<!-- roadmap:id=chatgpt-mcp-inspect state=deferred -->
+1. [~] **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）** — 2026-09-14登録。
+
+      **【2026-09-30 現状: Stage A 完了・Stage B は deferred（CEO 判断）】**
+      - **Stage A（Production・loopback のみ）完了**: `3ddbaa0` で `ai-team-mcp-gateway` を常駐（`127.0.0.1:3100`・
+        `local_static_bearer`）。API に `OPERATOR_GATEWAY_TOKEN_SHA256` を追加。受入 A1〜A8 全合格:
+        bearer なし・不正 bearer・内部 credential を外部 bearer に使う場合はいずれも 401 / initialize・tools/list（8 tools）・
+        `get_system_state` 成功 / `operator_gateway` で ADMIN・WORKER route は 403 / `ask_pl` は
+        `operator_requests` +1 のみ（Task・Job・Approval・Grant 不変、`requester_class=operator_gateway`）/
+        平文は journal に 0 件。**この構成を完成状態として維持する**（OpenAI 側とは未接続）。
+      - **Stage B（Secure MCP Tunnel・ChatGPT 接続）は deferred**: CEO の個人 ChatGPT workspace では
+        Developer mode / Tunnel の利用入口が UI 上に確認できなかった。調査結果（一次資料 `help.openai.com` /
+        `developers.openai.com` はこの実行環境から遮断され、検索抜粋で確認）: Tunnel は Platform organization に属し、
+        ChatGPT workspace ID を紐づけないと connector の tunnel picker に出ない（`openai/tunnel-client` docs で確認）。
+        個人（Pro）workspace から使うと `401 tunnel_active_organization_required` になるという未回答の公開 issue
+        （`openai/tunnel-client#60`）がある。tunnel-client に tool を絞る設定は無い。
+        **Tunnel・runtime key・tunnel-client は作成していない。**
+      - **read-only profile（ChatGPT に `ask_pl` を出さない 7 tools 構成）は実装しない**。方針のみ記録:
+        必要になったら gateway に `MCP_TOOL_PROFILE=read_only|full`（既定 `read_only`）を足し、read_only では
+        `ask_pl` を登録しない（tools/list に出ず、tools/call は SDK が `Tool ask_pl not found` を返し API を呼ばない）。
+        API の `operator_gateway` allowlist は変更しない。設定だけで隠す手段は gateway・tunnel-client の
+        どちらにも無い。
+      - **再開条件**: 個人 workspace で Tunnel が利用可能になった場合、または ChatGPT Business 導入を決めた場合。
+        再開時は Tunnel の可否を実 UI で確認してから、read-only profile の要否と Stage B を判断する。
+      - **当面の正式な PL 操作窓口は Mobile Operator Chat**（`operator-chat-mobile`）。write（Operator Request の作成）は
+        Mobile に集約する。
+
+      **【2026-09-28 進捗: D0〜D4 実装済み・D5 はローカル検証まで。Production 外部接続は未有効化】**
+
+      | 段 | 状態 | 実体 |
+      |---|---|---|
+      | D0 | コード修正済み | `auth-empty-token-hash-accepted`（本 ledger 同項目）。production の auth mode 確認は**未実施**（VPS 権限が要る） |
+      | D1 | 済 | `operator_requests` table / `POST・GET /api/operator-requests`（`routes/operatorRequests.ts`）。保存するだけで operational state を変えない（全 table hash で固定） |
+      | D2 | 済（2026-09-28 改訂2） | `pl/operatorRequestStep.ts`。依頼は caller が `kind: question \| request` を明示する（LLM に分類させない）。**question**: 調べて回答するだけ（実行経路なし）。**request**: 対象 attention を決め（`targetKey` 指定時は現在の attention と照合し不一致なら fail closed、無ければ提示候補から LLM に1つ選ばせるだけ）、自律ループと**同じ** `handleTarget()`（Triage → 試行上限 → 診断 → `authorizePlAction()` → 既存 executor → Verify）を1回走らせ、実結果を `plAction` と `acted / declined / escalated` に保存。`request` は権限ではなく、action の種類は caller も LLM 分類も決めない（決めるのは本文を含まない自律診断）。本文は Gate の根拠・条件・選択条件・prompt・Job / Task / audit に入らない（DB 全体検査で固定）。依頼の処理は2 tick に1回まで（自律ループを止めさせない）、pending 上限は依頼元ごと。外部へ返す失敗は固定コードのみ。escalation 通知は id と依頼元だけ（本文・回答文を載せない）・1時間3件まで |
+      | D3 | 済 | credential class `operator_gateway`（`OPERATOR_GATEWAY_TOKEN_SHA256`・split mode のみ）。allowlist は `/api/operator/*` の safe read 5本 + Operator Request 3本。safe read は `operator/projection.ts` の field allowlist（stdout / stderr / prompt / パス / QA details / CEO メモを出さない。`job_blocked` / `job_failed` の attention.detail は `[jobRunner]` 構造化行のときだけ出す —— 既存 `/api/state` はそれ以外で stderr 末尾を detail に入れるため。Design Review run の error は runner stderr を含むので先頭の分類部分だけ出す。**残存**: quarantineReason / permissionReason / review summary 等の自由文は長さ制限のみ）。登録全 route を列挙して allowlist 外 403 を固定 |
+      | D4 | 済 | `apps/mcp-gateway`（stateless Streamable HTTP）。tool は safe read 5 / `ask_pl(kind, message, targetKey?)` / 結果取得 2 のみ（action の種類を渡す引数は無い）。operator_gateway は自分の依頼だけ読める。内部 credential は gateway 側だけに置き、外部の bearer は API へ転送しない |
+      | D5 | ローカルのみ | MCP client → gateway → 実 API 境界 → PL 回答 → 結果取得の E2E（`localConnection.e2e.test.ts`）と、実 process を loopback で起動した curl 確認。**ChatGPT 本体とは未接続** |
+
+      **Control Repository 変更の承認記録**: `apps/api/src/index.ts`（AI編集禁止）への変更は
+      Operator Interface route 登録の最小変更のみ CEO 承認済み（2026-09-28）。実差分は
+      `app.register(operatorRequestRoutes, ...)` の1行と、それに必要な import 1行の計2行。この承認で他の refactor・
+      責務変更は行わない（read route は既存 operator plugin の中で登録している）。
+
+      **外部認証（ChatGPT → gateway）の経緯**: ChatGPT の remote MCP connector が受け付けるのは
+      OAuth 2.1（MCP authorization spec: Protected Resource Metadata / DCR または CIMD / PKCE）・
+      No Authentication・Mixed で、固定 bearer は無い（2026-09-28 調査。一次資料
+      `developers.openai.com` はこの実行環境の egress で遮断され、検索結果の抜粋で確認した）。
+      gateway の既定は `disabled`（全拒否）で、他は loopback 限定の `local_static_bearer` だけ。
+
+      **【2026-09-30 CEO 判断】接続方式は OpenAI Secure MCP Tunnel を採用する。** 公開 MCP hostname・
+      inbound port・Cloudflare route・reverse proxy・独自 OAuth server は作らない（既存機能で成立しないと
+      確認された場合だけ再検討する）。構成は ChatGPT → OpenAI Tunnel → VPS の tunnel-client（外向き HTTPS のみ）
+      → `127.0.0.1:3100` の MCP Gateway（`local_static_bearer`）→ `operator_gateway` credential → API。
+      ChatGPT から届く主体を決めるのは OpenAI 側の Tunnel ACL（tunnel の organization / workspace と
+      Tunnels Use 権限）で、local bearer は同じ host の他プロセスを締め出すためのもの。**gateway の runtime
+      コードは変更不要**（`fcfd732`→`06616d9` で gateway・auth・operator route に差分なしを確認）。
+      根拠は OpenAI 公式 `openai/tunnel-client` の docs（2026-09-28 取得分と 2026-09-30 再取得分が一致）。
+      運用定義（unit 雛形・env 名・手順・rollback）は `apps/mcp-gateway/ops/systemd/`。
+      **Stage A（loopback のみ・OpenAI 未接続）**: lockfile からの依存 install（Worker 停止中）、
+      `operator_gateway` credential と local bearer の生成、API への hash 追加と API のみ再起動、
+      gateway unit の配置。受入: gateway は `127.0.0.1` のみ／bearer 無し・不正 bearer は 401／正しい bearer で
+      initialize・tools/list・operator read が成功／`operator_gateway` で ADMIN route は 403／`ask_pl` は
+      Operator Request だけを作る／平文が journal に出ない。
+      **Stage B（Stage A 確認後。A と同時に入れない）**: CEO が UI で Tunnel 作成（org と ChatGPT workspace に
+      紐づけ）・Restricted runtime key（Tunnels Read + Use）・ChatGPT の Connection: Tunnel（**認証なし**。
+      OAuth / Mixed だと connector の Authorization が local bearer を上書きして全呼び出しが 401 になる）を行い、
+      PL は tunnel-client（`runtime` flavor の `tunnel-client-runtime`、`SHA256SUMS.txt` 照合）と unit を配置する
+      （health は `127.0.0.1:3180`）。
+      受入: 新しい外向きの待ち受けが無い／ChatGPT に tool が出て read と `ask_pl` が既存 Gate どおり動く／
+      tunnel-client 停止で ChatGPT から届かなくなる。**緊急遮断**は `systemctl --user disable --now ai-team-tunnel-client`（決定的な遮断は runtime key の revoke /
+      tunnel の削除）、
+      credential の無効化は API から `OPERATOR_GATEWAY_TOKEN_SHA256` を外して API 再起動。
+      **未確認（CEO が UI で確認）**: この account / workspace で Tunnel と developer mode が使えるか、write tool
+      （`ask_pl`）が使えるか、Tunnel の課金。ChatGPT が送る MCP protocol version に SDK 1.30.1 の stateless 実装が
+      応じられるかは Stage B で実測する。
+
+      **Production 有効化までに残るもの（すべて CEO 判断 / VPS 作業）**:
+      (1) production の effective auth mode が split であることの確認（`split-credential-migration`）と、
+      設定値が空 token 由来 hash でないことの確認 / (2) 本修正の deploy /
+      (3) `POST /api/context-pack` 任意ファイル読み取りの別 security fix / (4) 外部認証方式の決定と実装 /
+      (5) gateway の公開方法（HTTPS・常駐 process）/ (6) ChatGPT 実機での接続テスト。
+      （(4)(5) は 2026-09-30 に Secure MCP Tunnel 採用で方針確定。実施は上記 Stage A → Stage B。）
+
+      **(1)〜(3) の進捗（2026-09-28）**: (1) production は split credential mode（ADMIN / WORKER hash は
+      設定済みで異なる値・空 token 由来 hash なし、ACTIONS_READONLY / OPERATOR_GATEWAY は未設定）を
+      read-only で確認済み。(2) と (3) は **Production deploy済み（#297 / `0ce7bff`・#301 / `fcfd732`）**
+      （`d2aeaee` → `fcfd732` の fast-forward。記録は `docs/PROJECT_CURRENT_STATE.md`「Production Baseline」）。
+      `OPERATOR_GATEWAY_TOKEN_SHA256` は未設定のままで、外部接続は無効。
+      (3) の内容:
+      root は設定済み target root だけ（allowlist・realpath 一致）、読み取りはすべて realpath で root 内に閉じる
+      （symlink 脱出不可）、`.env` 等の秘密ファイルと dotfile は返さない（`ALWAYS_FORBIDDEN_PATTERNS` を再利用）。
+      regression test: `apps/api/src/routes/contextPackSecurity.test.ts`（修正前に 8 件失敗を確認）。
+      **`validateTargetRoot()` を使う他 route（`summary/update` 等）は本修正の範囲外。**
       **【制約: 従量課金APIを新しい標準経路にしない（CEO 指示・2026-09-14）】**
       AIteamOS 側が ChatGPT との接続のために **OpenAI API を呼ぶ構造を前提にしない**。
       MCP は `ChatGPT → MCP → AIteamOS Control / State Interface` の**接続口**に徹し、
@@ -10186,13 +10636,44 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       quarantine、retry / resume 状況、Review / Approval、Recovery / Watchdog、runtime progress、
       Finding / audit 情報を ChatGPT から読める状態にする。
 
-      **Phase 2（既存 Gate で安全に実行可能な範囲のみ）**: resume / retry / recovery request。
-      **既存 API をそのまま使う**（`POST /api/tasks/:id/resume`・
-      `PATCH /api/jobs/:id/clear-quarantine` 等）。MCP 専用の resume / recovery 経路は作らない。
-      Approval Gate・Permission Guard・quarantine の fail-closed は**一切迂回しない**。
+      **Phase 2（廃止・2026-09-28 CEO 方針）**: ~~ChatGPT から `POST /api/tasks/:id/resume`・
+      `PATCH /api/jobs/:id/clear-quarantine` 等の write API を直接呼ぶ~~ 設計は**廃止**した。
+      **ChatGPT に operational write capability は一切与えない。**
 
-      **今回実装しないもの**: 自由な write API / Gate を迂回する操作 / MCP 専用の state store /
-      credential の MCP 側保持。
+      **【2026-09-28 CEO 方針で確定した権限境界】**
+      ChatGPT に許すのは次の3つだけ:
+      (1) 安全に projection された read / (2) Operator Request の作成（`ask_pl` 相当）/
+      (3) Operator Request の結果取得。
+      Task / Job mutation・resume・approve・`ceo_approval` 作成・Design Review evidence 作成・
+      quarantine 解除・commit・PL tick・context-pack 等、operational state を直接変える操作は
+      **すべて許可しない**。Operator Request の作成は request record の保存だけで、
+      operational state を変えない。実際の操作が要る場合は、PL が既存の
+      `authorizePlAction()` と既存 Gate を通して行う（Operator Request は PL の権限を拡張しない。
+      PL に無い approve / Human Recovery / `ceo_approval` は追加しない。実行できない要求は
+      response で断るか既存の escalation 経路へ回す）。
+
+      **共通 Operator Interface を先に作る**: `operator-chat-mobile` と共有する
+      `operator_request` ベースの interface を先に実装し、MCP はその薄い adapter とする
+      （state・独自 Gate を持たない）。
+
+      **credential**: 専用 class `operator_gateway`（default-deny allowlist: safe read と
+      Operator Request の POST / GET のみ）。ADMIN / WORKER / legacy / ACTIONS_READONLY の流用は禁止。
+      ChatGPT → MCP の外部認証と MCP → AIteamOS の内部 credential は分離し、
+      **AIteamOS の credential を ChatGPT クライアントへ渡さない**。外部認証は現行の OpenAI MCP
+      authentication requirements を確認してから設計する（推測で実装しない）。
+
+      **実装順**: D0 認証前提確認 + `auth-empty-token-hash-accepted` 修正 →
+      D1 Operator Request storage / route / types → D2 PL が Operator Request を診断し response を保存 →
+      D3 safe read projection と `operator_gateway` credential / allowlist → D4 薄い MCP adapter →
+      D5 ChatGPT との接続テスト。
+
+      **Production 有効化の blocking prerequisite（CEO 判断）**: production が split credential mode
+      であることの確認 / `auth-empty-token-hash-accepted` の deploy / `POST /api/context-pack` の
+      任意ファイル読み取り問題の修正（**本項目へ混ぜず別の security fix として行う**）/ D5 の結果。
+      これらが揃うまで ChatGPT から Production への外部接続は有効化しない。
+
+      **今回実装しないもの**: 自由な write API / Gate を迂回する操作 / ChatGPT からの直接 write /
+      MCP 専用の state store / credential の MCP 側保持（ChatGPT クライアント側への配布）。
 
       **関連**: `operator-chat-mobile`（同じ interface を Mobile 側から使う）。
       **両者で別々の操作システムを作らない**（CEO 指示・2026-09-14）。
@@ -10221,6 +10702,42 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **再利用するもの（新規に作らない）**: 既存の Task / Job state、`resume`、Recovery、
       Approval、Watchdog、`audit_log`。**Chat 専用の Resume / Recovery 機構は作らない。**
+
+      **【2026-09-28 CEO 方針】** 本項目は `chatgpt-mcp-inspect` と同じ **Operator Request
+      （`operator_request`）interface** を再利用する。Mobile 用に別の command / message backend は
+      新設しない。Operator Request interface 自体は `chatgpt-mcp-inspect` の D1/D2 として先に作る。
+      **【2026-09-28 進捗】** 共通 interface は実装済み（`POST・GET /api/operator-requests` と
+      PL の回答経路）。Mobile は ADMIN credential でこの route をそのまま使える（`requesterClass=admin`）。
+      **【2026-09-29 進捗】** Mobile の MVP 画面を実装（`apps/mobile/app/operator.tsx`・
+      `apps/mobile/lib/operatorChat.ts`、Dashboard から遷移）。現在状態・attention・attention 選択による
+      対象指定（`projectId` / `taskId`。targetKey は送らず PL が範囲内の候補から選ぶ）・「質問 / 依頼」の
+      明示選択（既定値なし）・送信・status / PL 回答 / `plAction` / 最近の依頼を表示し、回答待ちの間だけ
+      polling する。**API・route・認証の変更は無い。** 認証は既存 Mobile の ADMIN token をそのまま使う
+      （CEO 判断・2026-09-29。Mobile から ADMIN を外す設計変更はしない）が、この画面が呼ぶのは
+      `GET /api/operator/state` と `GET・POST /api/operator-requests` だけで、resume・approval 等の
+      操作 API は呼ばない。前提の `PL_LOOP_ENABLED=true`（60s）は Production で read-only 確認済み。
+      **【2026-09-29 実機 E2E 完了・MVP 完成（CEO 判断）】** master `6102f6e` の preview build を実機へ
+      上書き install（既存 SecureStore の ADMIN token をそのまま使用）。Production（API `fcfd732`・
+      PL loop 60s）で question → PL 回答 → Mobile 表示、request → Gate 結果（disposition=declined・
+      plAction「実行: なし」）→ Mobile 表示の2経路が成立し、PL loop の処理を `audit_log` で確認した。
+      **ただし最初の question は `provider_failure`（`OpenCode CLI timed out after 60000ms`）**。API 再起動後の
+      最初の provider 呼び出しで、同じ API process の2回目以降（question 2件・request 3件）は成功した。
+      **timeout の調査（read-only・Production 14日分）**: provider timeout は16件（自律 PL の
+      `diagnosis_failed` 15件＋上記1件）。隔離 dir の作成時刻（= process ごとの初回呼び出し）と突き合わせると、
+      **cold start（初回の OpenCode 初期化。隔離 HOME へ約100〜160MB を書く）で説明できるのは1件だけ**で、
+      残り15件は同じ process の途中で束になって起きていた。**そのため cold start 専用の対策
+      （初回だけ timeout 延長・warm-up・隔離 HOME の永続化）は採らず、タイミングに依らない
+      bounded provider recovery を採用した**（CEO 判断 2026-09-29）: PL 系の provider 推論（Operator の回答・
+      対象選択、自律 PL の診断・採用・修正案）に限り、AIteamOS 自身の timeout か明らかな異常終了
+      （SIGKILL / SIGSEGV 等。SIGTERM / SIGINT 等の意図的停止は除く）のときだけ、新しい OpenCode process で
+      **1回だけ**再試行する（`apps/api/src/aiExplain/cheapAiClient.ts` の `retryTransientOnce`）。
+      あわせて timeout を spawn 任せにせず自前で持ち、プロセスグループへ SIGTERM → 猶予後 SIGKILL で必ず決着させる。
+      Gate・`authorizePlAction`・`PL_MAX_ATTEMPTS_PER_TARGET` は変えていない（再試行は1回の PL attempt の内部）。
+      説明系（approvalAi / taskFailureAi）は対象外。新しい常駐監視は作っていない。
+      代償として、PL 推論1回の最悪待ち時間は約133秒（60s + 猶予5s + 待ち3s + 60s + 猶予5s）に伸びる
+      （tick は既存の in-flight guard で重ならない。失敗時に Operator Request が `pending` のまま待つ時間も伸びる）。
+      **未確認**: 本修正の Production 反映と、反映後の自然な timeout に対する再試行の実観測
+      （API journal の `[cheapAi] attempt …` 行で確認できる）。
 
       **PL Console（下記 deferred 4件）との関係**: 別物である。PL Console は「ベンダー非依存の
       PL 指示 UI」（LibreChat 等の評価・Gateway・Provider Adapter を含む重量級）で、本項目は
@@ -10742,6 +11259,13 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       目的は**既存 Principle の意味変更ではない**。
       「既存 Principle を現在の Registry 方式で**選択・Review・履歴保存・集計可能にする**」ことである。
       既存の Principle Registry / contextual selection / `principle_applications` を再利用する。
+
+      **2026-10-07 canonical principle delivery 監査で確定した追加 scope**:
+      CI Meta Review と Independent / Design Review の既存 path・focus 選択を再利用し、
+      `specs/22` の Decision Authority 抜粋を必要な role にだけ配る。CI Meta Review には
+      PR body を上限付きの untrusted task-intent context として渡し、提供済み原則自体の問題は
+      `principle_conflict` で名指し報告できるようにする。監査では PR #329 の fallback Meta Review に
+      canonical Decision Authority Principle と PR body が届かず、技術判断を CEO authority と誤判定したことを確認した。
 
       - **本文と metadata の二重正本を作らない。** `specs/21` と同じく metadata marker を
         **本文と同じ marker block へ置く**方式を一般化できるなら、それを優先する
@@ -11295,7 +11819,7 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         これは閉じ込めの解除ではなく**安全境界の後退**である。既存 walker の `rootKind` を
         そのまま条件に使い、`human_resume` / `human_recovery` generation の descendant だけを
         通す。新しい authority flag / parser / table / status は足していない
-      - **liveness 側**: `resumeBlockedTask()` は元の行を `blocked` のまま残すのに、live Job の
+      - **liveness 側（当時）**: `resumeBlockedTask()` は元の行を `blocked` のまま残していたのに、live Job の
         除外は implementJob 自身の `resume:` キーだけを見ていた。attempt 2 以降の実装は
         `repair:` 規約なので自分の stepKey からは元の resume 元を辿れず、**人が承認した chain が
         attempt 1 の次で必ず止まっていた**
@@ -11356,6 +11880,163 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       新しい `PlActionKind` / 新しい dedup 機構 / 別の repair budget アルゴリズム /
       route 独自の budget override / `MAX_REPAIR_ATTEMPTS` の変更。
 
+<!-- roadmap:id=repair-handoff-overwrites-terminal-result state=done -->
+8. [x] **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた** —
+      2026-09-25登録・同日完了（No Lost Completion Checkpoint 2 後の read-only 調査）。
+
+      **責務は 1 つだけ。** `createRepairJobWithHandoff()` の source Job status 遷移である。
+      repair 予算・lineage・generation は `repair-budget-counted-per-task-not-per-chain`（done）、
+      stored review の再駆動は `consumed-stored-review-has-no-recovery-route`（done）が正本で、
+      本項目はそのどちらにも触れない。新しい workflow / Gate / review 工程も作らない。
+
+      **事象**: helper は同一 transaction で ①repair Job 作成 ②source Job を**無条件に**
+      `failed` ③任意の Task 更新、を行っていた。②の目的は workspace 所有権の解放だが、
+      所有権を持つのは `running` / `blocked` / non-initial `queued` だけで、
+      `success` / `failed` は持たない。したがって `success` に対する②は解放に一切寄与せず、
+      成功記録だけを壊していた。
+
+      **実測（2026-09-25・in-memory、`routes/jobs.ts` の review 経路と同じ呼び方）**:
+
+      | | source Job |
+      |---|---|
+      | BEFORE handoff | `status=success` / `exitCode=0` |
+      | AFTER handoff | `status=failed` / `exitCode=0` / stderr 無し |
+
+      **`success` の source が到達する production 経路**は 2 本あり、どちらも repair の主要な入口である
+      （helper を実行しうる dispatch 経路そのものはこれより多い）:
+      `routes/jobs.ts` の review が `changes_requested` を返す通常の Stage 2 と、
+      `repairFromStoredReview.ts` の Human Recovery。後者の admission
+      （`repairableBlockedReviewRequest()`）は「実装が成功していること」を条件にしており、
+      **handoff が自分の前提条件を壊していた**。`routes/tasks.ts` の `isTaskFailureJob()` も
+      成功した Job を失敗として拾っていた。
+
+      **入れたもの**: ②を条件付きにしただけである。
+
+      ```ts
+      if (source.status !== 'success' && source.status !== 'failed') {
+        jobs.update(source.id, { status: 'failed' })
+      }
+      ```
+
+      transaction 境界・rollback・stepKey dedup・冪等性は変えていない。
+      `blocked → failed` の所有権解放も従来どおりである。
+
+      **今回は変えなかったもの（別 Finding 候補）**: `running` / non-initial `queued` の
+      source から handoff が呼ばれうるかは未実測である。ここで fail-closed を足すと
+      現在動いている経路を escalation へ倒しかねないため、現状挙動を維持した。
+      到達可能性の調査が必要になった時点で別項目として登録する。
+      `input.taskUpdate` が production から一度も渡されていない点も同様に別扱いとする。
+
+<!-- roadmap:id=repair-chain-successor-durability state=done -->
+9. [x] **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）** —
+      2026-09-22 監査で検出、2026-09-25 登録、**2026-09-28 に U3 を land して完了**。
+      表の 5 件すべてが land 済みで、残件はゼロである。
+
+      **責務は 1 つ**: repair chain の各段が「durable な結果」を残したとき、その successor が
+      必ず実行されるか、さもなくば人へ収束すること。予算・lineage・generation の意味論は
+      `repair-budget-counted-per-task-not-per-chain`（done）が正本で、ここでは触らない。
+      stored review の再駆動は `consumed-stored-review-has-no-recovery-route`（done）が正本である。
+      **新しい workflow / Gate / review 工程 / status / queue / daemon は作らない。**
+
+      横断監査は同じ根から 5 つの欠落を挙げた。**細切れ item にせず、ここで一括管理する。**
+
+      | | 欠落 | 状態 |
+      |---|---|---|
+      | U1 | repair-purpose run の successor intent が durable でない（stepKey が process stack 上にしか無い） | **land 済み** #283 |
+      | U4 | queued な repair-purpose run が汎用 executor へ誤 dispatch され、repair Job を作る機会が消える | **land 済み** #287 |
+      | #290 | handoff が成功した source Job の結果を `failed` へ書き換える | **land 済み** #290（専用項目 `repair-handoff-overwrites-terminal-result` に詳細） |
+      | U2 | ALIGNED evidence を残した直後に落ちた terminal run の repair Job successor が回収されない | **land 済み** #292 |
+      | U3 | **非 ALIGNED で終端した run の Human escalation successor が成立しない** | **本 PR で完了** |
+
+      **U2 の failure window（今回の対象）**: `executeQueuedRepair()` は
+      review → `completeWithEvidence()` → `createRepairJobWithHandoff()` と続くが、
+      **2 番目と 3 番目の間に transaction が無い。** ここで落ちると run は `succeeded`、
+      evidence は正しく残り、repair Job は 0 件になる。`findQueued()` は `queued` しか
+      返さず、U4 の dispatcher も `claim()` が `status='queued'` 以外を拒むため入れない。
+      つまり **evidence も run も正しいのに successor を作る機会だけが消える。**
+
+      **U2 で入れたもの**:
+      - `IDesignReviewRunStorage.findAlignedRepairPurposeTerminal()` —— read を 1 本だけ。
+        条件は `status='succeeded' AND error IS NULL AND repair_source_job_id IS NOT NULL`。
+        **この 3 条件は prefilter であって ALIGNED の同値条件ではない。**
+        初出時は「`error IS NULL` は ALIGNED と同値」と書いたが**誤りだった**（独立レビュー指摘）:
+        `recomputeDecision()` が `rejectedReason` を埋めるのは `reviewKind === 'roadmap'` の
+        ときだけで、repair が使う `task` kind では非 ALIGNED でも undefined になり、
+        `complete()` が `error ?? null` で保存するため **非 ALIGNED な task run も
+        `error IS NULL` で終端する**。ALIGNED の判定は呼び出し側が run 自身の `resultJson` から
+        既存 `safeRecomputedDecision()` で計算し直す（読めない / UNCERTAIN は回収しない）。
+        **新 table / processed 列 / generic ledger / queue / migration は無し。**
+      - `resolveRepairHandoffTarget()` / `completeRepairHandoff()` —— `executeQueuedRepair()` の
+        既存 guard を review の前後で 2 分割した。判定・順序・reason 文言は
+        **handoff 失敗時の 1 分岐を除いて**不変である（その 1 点は下記の競合 semantics）。
+        U2 はこの 2 つの間に「Design Review 実行」ではなく
+        「この run の判定が ALIGNED であること + durable な ALIGNED evidence の
+        `designTextHash` 一致」の確認を挟む。**第二実装を作らない。**
+      - `recoverTerminalRepairSuccessors()` —— 既存 `POST /api/task-continuations/reconcile` の
+        chain へ U7 と同じ形で 3 本目として並べた。既存 `sweepInFlight` guard がそのまま覆う。
+        **新しい timer / daemon / endpoint は無し。**
+
+      **Design Review を再実行しない。** module が `CoordinatorDeps` を受け取らないのが
+      その保証である（runner を起動する手段が無い）。admission と予算も再判定しない ——
+      どちらも元 run の生成時に決着し `repair_source_job_id` と stepKey へ durable 化されている。
+      回収時に再評価すると、実際に走って evidence を残した review と別の結論になりうる。
+
+      **sweep は候補ごとに隔離する。** 1 件の例外で後続が飢えないよう try/catch で受け、
+      `failed` を数えて **0 件でないときは必ず log へ出す** —— 全候補が落ちた sweep は正常終了
+      扱いで外側の catch にも入らないため、出さないと繰り返す欠陥が無音になる（独立レビュー指摘）。
+
+      **冪等性は既存機構だけで閉じている**: stepKey dedup（速い経路）と
+      `ux_jobs_workflow_step_key`（全体一意・最後の砦）の二重防御。**processed 列は無し。**
+      handoff の競合 semantics は `runRepairFlow` と 1 つに揃えた —— 同一 Task が既に
+      successor を持つなら `already_started`（良性。人へ渡さない）、**別 Task が同じ key を
+      持つなら従来どおり escalate**（key は*この Task の*失敗 Job を名指すので lineage 破損）。
+
+      **fail-closed（generic executor へ fallback しない）**: source Job 不在 / 別 Task /
+      規約外 stepKey / 非 task review kind / workspace quarantine は既存
+      `escalateTaskToHuman()` で Task `blocked` へ収束する。park 済み Task は park を維持する。
+
+      **index は追加していない。** 既存 `ix_design_review_runs_status_started_at(status, started_at)`
+      の先頭列と等値条件が一致し、残り 2 条件は residual filter で足りる。件数は Task あたりの
+      review 回数オーダーで、poll は 5s に 1 query。**先回りの最適化はしない。**
+
+      **U3 の failure window（本 PR で完了）**: 非 ALIGNED の終端も同じ形で successor を失う。
+      `executeDesignReviewRun()` が `complete(run,'succeeded',stdout,rejectedReason)` で却下を
+      durable 化して戻り、**その後**呼び出し側が `escalateTaskToHuman()` を呼ぶ。2 文の間に
+      transaction は無く、ここで落ちると run は terminal・evidence は無し・**Task は blocked に
+      ならない**。しかも `succeeded` な run は attention producer（`idle` と `failed` しか見ない）
+      にも現れないため、却下が誰にも渡らないまま停止する。
+
+      **U3 で入れたもの**:
+      - shared read への中立化 —— `findAlignedRepairPurposeTerminal()` を
+        **`findTerminalRepairPurposeRuns()`** へ改名し、`error IS NULL` を条件から外した。
+        `error` は「非 ALIGNED のうちどちらの形か」しか表さない（正常な CONFLICT は task kind
+        では `rejectedReason` が undefined なので NULL、形が壊れた `reject()` 経路では値が入る）。
+        **storage は ALIGNED / 非 ALIGNED を判定しない。** U2 / U3 が同じ母集団を見て、
+        それぞれ自分の authority（`safeRecomputedDecision()`）で判定する。read は 1 本のまま。
+      - `recoverTerminalRepairEscalations()` —— 既存 reconcile chain の 4 本目。action は
+        既存 `escalateTaskToHuman()` の再利用 1 回だけ。**新しい status / Approval 種別 / Gate /
+        audit 機構 / Human Recovery route は作っていない。**
+
+      **`status='failed'` は shared read に含めない。** 既存 `design_review_failed` attention が
+      観測しているので、含めると同じ停止に 2 つの escalation ができる。read が `succeeded` しか
+      返さないことで機械的に保証している。
+
+      **ALIGNED は絶対に escalate しない**（U2 の領分）。逆に、読めない `resultJson` は人へ渡す
+      —— U2 は「読めないなら repair Job を作らない」が fail-closed だが、U3 の action は自律実行を
+      止めて人へ渡すこと自体なので、放置するほうが危険側になる。なお production で `succeeded`
+      かつ読めない `resultJson` は作れない（unparsable な出力は `finalizeFailure()` が `failed`）。
+
+      **冪等性**: escalate 成功 → Task `blocked` → 次 poll で候補から外れる。既に blocked / done /
+      successor 既存は no-op。park 済みは skip し park を維持する（park は durable なので毎 poll
+      安い skip を繰り返す。それを消すためだけの state は作らない —— CEO 判断・2026-09-28）。
+      processed 列は追加していない。
+
+      **別 Finding 候補（本 PR では実装しない）**: `claim()` が attempt 上限超過で run を `failed`
+      へ落とすと、`executeDesignReviewRun()` は `not_claimable`、`executeQueuedRepair()` は
+      **`already_started`** を返す —— escalate せずに。既存 `design_review_failed` attention には
+      出るので Lost Completion ではないが、「予算切れで終わった」ことが repair 側の戻り値からは
+      「既に始まっている」に見える。ここへ混ぜず、別項目として起票するかを別途判断する。
+
 ---
 
-*Updated: 2026-09-22*
+*Updated: 2026-09-28*

@@ -406,10 +406,14 @@ describe('resume API to worker integration', () => {
       expect(callConsumeMock).not.toHaveBeenCalled()
       expect(appendObservationLogMock).toHaveBeenCalled()
 
-      const unchangedBlockedJob = storage.jobs.findById(blockedJob.id)
-      expect(unchangedBlockedJob).toMatchObject({
+      // resume handoff は source を同一 transaction で failed へ終端化する。
+      // 行そのもの（prompt / provider / safeCommand）は履歴として変わらずに残る。
+      // source は再実行対象にならない: Worker が実行したのは successor の1件だけ。
+      expect(adapterRunMock).toHaveBeenCalledTimes(1)
+      const handedOffSourceJob = storage.jobs.findById(blockedJob.id)
+      expect(handedOffSourceJob).toMatchObject({
         id: blockedJob.id,
-        status: 'blocked',
+        status: 'failed',
         safeCommand: blockedJob.safeCommand,
         aiCliProvider: 'codex',
         aiCliPrompt: 'Original blocked prompt',

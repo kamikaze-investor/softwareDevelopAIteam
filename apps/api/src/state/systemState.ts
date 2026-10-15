@@ -18,6 +18,8 @@
 import { occupiesProject } from '@ai-team/shared'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
+import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
 import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
 
@@ -101,6 +103,26 @@ export interface AttentionItem {
   detail: string
   /** 判明していれば、その状態が続いている時間。 */
   stuckForMs?: number
+}
+
+/**
+ * 対象単位の technical recovery budget が尽きたことを、既存 audit から投影する。
+ * Task 単位の resume cap は他の recovery action を止めないため、ここでは対象全体が
+ * terminal になった記録だけを見る。
+ */
+export function isAttentionTechnicalRecoveryExhausted(
+  storage: IStorage,
+  item: AttentionItem,
+): boolean {
+  return isTechnicalRecoveryTargetExhausted(storage, item)
+}
+
+function projectAttention(storage: IStorage, item: AttentionItem): AttentionItem {
+  if (!isAttentionTechnicalRecoveryExhausted(storage, item)) return item
+  return {
+    ...item,
+    detail: `${item.detail}; PL technical recovery budget is exhausted and no CEO decision was requested`,
+  }
 }
 
 export interface ProjectStateSummary {
@@ -390,10 +412,26 @@ export function buildSystemState(
         && task.status !== 'done'
         && storage.tasks.isParked(task.id)
 
+      // **Human Resume で後継が作られた blocked / failed Job は、いま Task を止めている Job ではない。**
+      //
+      // 2026-09-30 以降の `resumeBlockedTask()` は元の行を failed へ終端化する。下の導出は、
+      // それ以前に作られた行や startup reconciliation が安全上触れない quarantine 行にも耐える
+      // compatibility rule として残す。元の blocked 行を「動かせる Job」と数え続けると、
+      // 後継が失敗しても `job_failed` が一切出ず、しかも古い
+      // `job_blocked:<元Job>` は PL が escalate 済みで dedup されているので、**新しい失敗が
+      // 誰にも見えないまま止まる**（2026-09-28 production・Task `9fdee5a3`）。
+      // 判定は保存済みの resume lineage と `resume_actor` だけから導く（`readJobsSupersededByHumanResume`）。
+      // AI / unknown / malformed の resume は superseded にしない。
+      const superseded = task.status === 'done'
+        ? new Set<string>()
+        : readJobsSupersededByHumanResume(storage, jobs)
       const hasMovableJob = jobs.some((job) => (
-        job.status === 'queued' || job.status === 'running' || job.status === 'blocked'
+        job.status === 'queued' || job.status === 'running'
+        || (job.status === 'blocked' && !superseded.has(job.id))
       ))
-      const stallingFailure = jobs.find((job) => job.status === 'failed' && !isQuarantined(job))
+      const stallingFailure = jobs.find((job) => (
+        job.status === 'failed' && !isQuarantined(job) && !superseded.has(job.id)
+      ))
       if (task.status !== 'done' && !parentIsParked && !hasMovableJob && stallingFailure !== undefined) {
         attention.push({
           kind: 'job_failed',
@@ -420,6 +458,7 @@ export function buildSystemState(
           })
         } else if (
           job.status === 'blocked'
+          && !superseded.has(job.id)
           && task.status !== 'done'
           && !parentIsParked
           && !isWaitingOnLiveApproval(storage, job, nowMs)
@@ -593,6 +632,6 @@ export function buildSystemState(
       activeSupervisedRuns: storage.supervisedRuns.findActiveRuns().length,
     },
     projects,
-    attention,
+    attention: attention.map((item) => projectAttention(storage, item)),
   }
 }

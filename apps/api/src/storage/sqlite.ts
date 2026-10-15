@@ -11,6 +11,7 @@ import {
   isStaleBlockedJobCandidate,
   LIVE_JOB_STATUSES,
   OCCUPIES_PROJECT_SQL,
+  occupiesProject,
 } from '@ai-team/shared'
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
@@ -22,18 +23,32 @@ import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
   ITaskContinuationStorage,
+  IOperatorRequestStorage,
   PersistCommitSuccessWithContinuationResult,
   ReconcileExternalCompletionResult,
 } from './interface'
-import type { TaskContinuation } from '@ai-team/shared'
+import type { TaskContinuation, OperatorRequest } from '@ai-team/shared'
 import type { PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleApplication, PrincipleApplicationInput, PrincipleDisagreementRow, PrincipleReviewStage, StrategicDecision } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
+import { parseResumeSource, resolveReviewedImplementationFrom, retryStepKeyFor } from '../designReview/repairPolicy'
+import { hasTechnicalAbortMetadata, technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
+import type {
+  AbortAuthorization,
+  TechnicalAbortCleanupSummary,
+} from '../pl/technicalAbortEvidence'
 // 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
 // 型以外に storage へ依存しないモジュールなので循環しない。
 import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
+import {
+  classifyGitCommitResumeLineage,
+  exactGitCommitResumePredecessor,
+  parseGitCommitResumeStepKey,
+  type GitCommitResumeLineageClassification,
+} from '../gitCommitResumeLineage'
+import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -73,6 +88,51 @@ export class RoadmapTaskConflictError extends Error {
 }
 
 const now = () => new Date().toISOString()
+
+const RESUME_SOURCE_TERMINALIZED_OPERATION = 'resume_source_terminalized'
+
+function recordResumeSourceTerminalized(
+  db: Database.Database,
+  sourceJobId: string,
+  successorJobId: string,
+  mode: 'resume' | 'startup_reconciliation',
+  supersededApprovalId?: string,
+): void {
+  db.prepare(`
+    INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+    VALUES (?, 'api', ?, 'job', ?, 'success', ?, ?)
+  `).run(
+    randomUUID(),
+    RESUME_SOURCE_TERMINALIZED_OPERATION,
+    sourceJobId,
+    `successor_job_id=${successorJobId} mode=${mode} source_status=blocked target_status=failed`
+      + (supersededApprovalId === undefined ? '' : ` superseded_approval_id=${supersededApprovalId}`),
+    now(),
+  )
+}
+
+/**
+ * **ApprovalRequest が紐づく Job が terminal になったら、その request を actionable state に残さない。**
+ *
+ * `WAITING_FOR_USER` / `APPROVED` だけを既存の `SUPERSEDED` へ CAS で進める。
+ * `approveAndResumeJob()` は紐づく Job が running / blocked であることを要求するので、
+ * terminal な Job に紐づいたままの request は誰も進められない（承認しても 409）のに、
+ * actionable に見え続ける（2026-10-09〜14 production: 同一 commit / diff の request が毎日1件ずつ残った）。
+ *
+ * `REJECTED`（CEO の却下の記録）/ `CONSUMED` / `STALE` / `EXPIRED` / `SUPERSEDED` は変えない。
+ * 人の判断を偽らないため `reason` / `reviewed_at` も書かない。
+ * 変えた場合だけ true（呼び出し側が audit に残す）。
+ */
+function supersedeApprovalOfTerminalJob(
+  db: Database.Database,
+  approvalId: string,
+  taskId: string,
+): boolean {
+  return db.prepare(`
+    UPDATE approval_requests SET status = 'SUPERSEDED'
+    WHERE id = ? AND task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+  `).run(approvalId, taskId).changes === 1
+}
 
 function selectNextContinuableTask(tasks: Task[]): Task | undefined {
   const byId = new Map(tasks.map((task) => [task.id, task]))
@@ -561,6 +621,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   db.pragma('journal_mode = WAL')
   db.exec(CREATE_TABLES)
   runMigrations(db)
+  reconcileResumedBlockedSourceJobs(db)
+  reconcileHistoricalOrphanBlockedJobs(db)
   runDesignReviewSubjectMigration(db)
   runIndexMigrations(db)
 
@@ -757,6 +819,127 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     approvalRequestId: string,
   ): { ok: true } | { ok: false; reason: string } {
     return verifyAndConsumeTaskApproval(taskId, approvalRequestId, 'abort_task')
+  }
+
+  /** Technical Abort は Project 境界を越えて同じ physical workspace の利用を拒否する。 */
+  function findWorkspaceUserAnywhere(
+    workingDir: string,
+    excludeTaskId: string,
+  ): { job: Job; task: Task } | undefined {
+    const rows = db.prepare('SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC').all() as any[]
+    for (const row of rows) {
+      const job = deserializeJob(row)
+      if (job.taskId === excludeTaskId || job.safeCommand?.workingDir !== workingDir) continue
+      const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(job.taskId) as any
+      if (!taskRow) continue
+      const task = deserializeTask(taskRow)
+      if (
+        job.status === 'queued'
+        || job.status === 'running'
+        || holdsWorkspaceWhenBlocked(task, job)
+        || occupiesProject(task)
+      ) return { job, task }
+    }
+    return undefined
+  }
+
+  function verifyAbortAuthorization(
+    task: Task,
+    taskJobs: readonly Job[],
+    carrier: Job | undefined,
+    authorization: AbortAuthorization,
+    preCleanupObservation?: JobWorkspaceBaseline,
+    cleanupSummary?: TechnicalAbortCleanupSummary,
+  ): { ok: true } | { ok: false; reason: string } {
+    if (authorization.kind === 'manual_approval') {
+      return verifyAndConsumeAbortApproval(task.id, authorization.approvalRequestId)
+    }
+    if (carrier === undefined) {
+      return { ok: false, reason: 'technical abort requires a cleanup carrier Job' }
+    }
+    const metadata = carrier.failureMetadata
+    if (
+      metadata?.abortTechnicalEvidenceId !== authorization.evidenceId
+      || metadata.abortTechnicalStateFingerprint !== authorization.stateFingerprint
+      || metadata.abortTechnicalRootCauseClass !== authorization.rootCauseClass
+      || metadata.abortTechnicalAttentionKind !== authorization.attentionKind
+    ) {
+      return { ok: false, reason: 'technical abort evidence is not bound to the cleanup carrier' }
+    }
+    const evidenceRow = db.prepare(
+      "SELECT detail FROM audit_log WHERE entity_type = 'technical_abort_evidence' AND entity_id = ? "
+      + "AND operation = 'technical_abort_evidence' AND result = 'verified' LIMIT 1",
+    ).get(authorization.evidenceId) as { detail?: string } | undefined
+    if (evidenceRow === undefined) {
+      return { ok: false, reason: 'technical abort evidence audit is missing' }
+    }
+    try {
+      const detail = JSON.parse(evidenceRow.detail ?? '{}') as Record<string, unknown>
+      if (
+        detail.evidenceId !== authorization.evidenceId
+        || detail.rootCauseClass !== authorization.rootCauseClass
+      ) {
+        return { ok: false, reason: 'technical abort evidence audit is malformed or mismatched' }
+      }
+    } catch {
+      return { ok: false, reason: 'technical abort evidence audit is unreadable' }
+    }
+    const currentFingerprint = technicalAbortStateFingerprint(task, taskJobs, {
+      kind: authorization.attentionKind,
+      taskId: task.id,
+      jobId: carrier.id,
+    })
+    if (currentFingerprint !== authorization.stateFingerprint) {
+      return { ok: false, reason: 'Task/latest Job facts changed after technical evidence was issued' }
+    }
+    if (
+      preCleanupObservation === undefined
+      || metadata.workspaceEndFingerprint === undefined
+      || !baselineEqualsObservation(metadata.workspaceEndFingerprint, preCleanupObservation)
+    ) {
+      return {
+        ok: false,
+        reason: 'pre-cleanup workspace does not exactly match the latest persisted end fingerprint',
+      }
+    }
+    if (
+      cleanupSummary === undefined
+      || !Number.isInteger(cleanupSummary.changedPathCount)
+      || !Number.isInteger(cleanupSummary.restoredPathCount)
+      || !Number.isInteger(cleanupSummary.removedPathCount)
+      || cleanupSummary.changedPathCount < 0
+      || cleanupSummary.restoredPathCount < 0
+      || cleanupSummary.removedPathCount < 0
+      || cleanupSummary.changedPathCount
+        !== cleanupSummary.restoredPathCount + cleanupSummary.removedPathCount
+    ) {
+      return { ok: false, reason: 'technical cleanup summary is missing or inconsistent' }
+    }
+    return { ok: true }
+  }
+
+  function staleActiveGitCommitApprovals(taskId: string): number {
+    return db.prepare(
+      "UPDATE approval_requests SET status = 'STALE' WHERE task_id = ? "
+      + "AND requested_action = 'git_commit' AND status IN ('WAITING_FOR_USER', 'APPROVED')",
+    ).run(taskId).changes
+  }
+
+  function technicalAbortAuditDetail(input: {
+    authorization: Extract<AbortAuthorization, { kind: 'technical_evidence' }>
+    observedHead: string
+    parkCount: number
+    cleanupSummary: TechnicalAbortCleanupSummary
+    staleApprovalCount: number
+  }): string {
+    return JSON.stringify({
+      technicalEvidenceId: input.authorization.evidenceId,
+      rootCauseClass: input.authorization.rootCauseClass,
+      parkCount: input.parkCount,
+      observedHead: input.observedHead,
+      cleanup: input.cleanupSummary,
+      staleApprovalCount: input.staleApprovalCount,
+    })
   }
 
   /**
@@ -1443,8 +1626,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **既存 `workflowStepKey` だけ**で逆引きする。
    *
    * ```
-   * [任意] resume:<sourceJobId>:1        … 1段だけ正規化する
-   *   → git_commit  review:<reviewJobId>:git-commit
+   * [任意] resume:<anchorGitCommitJobId>:<positive generation>
+   *   → canonical git_commit  review:<reviewJobId>:git-commit（exact id を1回だけ参照）
+   *   → [0..n 段] review resume:<reviewJobId>:1   … Human Resume で再実行された review（D4）
    *   → review      implement:<implementJobId>:review
    *   → implement   (aiCliMode = 'implement')
    * ```
@@ -1452,8 +1636,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **7条件をすべて満たすときだけ返す。1つでも欠ければ fail-closed**（CEO 判断・2026-09-23）。
    * 同一 diff を再承認へ回さないことのほうが、自動復旧できることより優先される。
    *
+   * **2 つの区間を混ぜない。** git_commit 側は fixed anchor を exact id で1回だけ
+   * 正規化する。そこで得た review Job から implement までの区間だけ、D1 と共用の
+   * `resolveReviewedImplementationFrom()`（review Job だけを経由する bounded / cycle-safe な walk。
+   * CEO 承認・2026-09-28）を使う。下の禁止事項は git_commit 側についてのものである。
+   *
    * **やってはいけないこと（意図的に実装していない）**:
-   * - 2段以上の `resume:` traversal（1ホップ正規化した先は `review:...:git-commit` しか許さない）
+   * - git_commit generation 間の `resume:` traversal（anchor は `review:...:git-commit` しか許さない）
    * - recursive ancestry resolver
    * - 「最新 implement Job」の推測
    * - 複数候補からの選択
@@ -1477,20 +1666,44 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * 新しい Approval は作られないので **その Job に `approvalId` は付かない**
    * （`ux_jobs_approval_id` が UNIQUE なので、既存の却下行を2つ目の Job へ結び直すこともできない）。
    * 何もしないと「却下されていない Job」に見え、PL が同じ内容を自動 resume し続ける
-   * （独立レビュー指摘）。そこで `resume:<sourceJobId>:1` を **1回だけ**辿り、
-   * 元の Job の linked Approval を見る。**provenance と同じ規約・同じ1ホップ**であり、
+   * （独立レビュー指摘）。そこで `resume:<anchorJobId>:<generation>` の anchor を **1回だけ**参照し、
+   * canonical anchor Job の linked Approval を見る。**provenance と同じ規約・同じ1参照**であり、
    * 探索でも候補選択でもない。
    */
-  function isLinkedGitCommitRejection(job: Job): boolean {
+  function gitCommitResumeLineage(job: Job): GitCommitResumeLineageClassification {
+    const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
+    return classifyGitCommitResumeLineage({
+      currentJob: job,
+      referencedJob: parsed !== undefined ? jobs.findById(parsed.anchorJobId) : undefined,
+      taskJobs: jobs.findByTaskId(job.taskId),
+      requireCurrentIsLatestGeneration: true,
+    })
+  }
+
+  function isLinkedGitCommitRejection(
+    job: Job,
+    lineage: GitCommitResumeLineageClassification,
+  ): boolean {
     if (job.safeCommand.kind !== 'git_commit') return false
 
     // link のある Job はそれだけで判定する。
     if (job.approvalId) return isGitCommitRejectionOf(job, job.approvalId)
 
-    // link が無い Job は、`resume:` を **1回だけ** 辿って元の Job の link を見る。
+    if (lineage.kind === 'new_scheme') {
+      // link が無い generation は、事前に exact id で1回だけ検証した canonical anchor の
+      // link を見る。直前 generation や別候補を探索しない。
+      const anchorJob = lineage.lineage.anchorJob
+      return anchorJob.approvalId !== undefined
+        && isGitCommitRejectionOf(anchorJob, anchorJob.approvalId)
+    }
+
+    if (lineage.kind !== 'legacy') return false
+
+    // Legacy behaviour: `resume:<source>:1` is dereferenced exactly once, even
+    // when source is another resume Job. Deeper chains remain unresolved.
     const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
     if (!resumed) return false
-    const source = jobs.findById(resumed[1] as string)
+    const source = lineage.referencedJob
     if (!source || !source.approvalId) return false
     if (source.taskId !== job.taskId || source.projectId !== job.projectId) return false
     if (source.safeCommand.kind !== 'git_commit') return false
@@ -1508,31 +1721,35 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
   function resolveSourceImplementJobForRejectedGitCommit(
     latestJob: Job,
+    lineage: GitCommitResumeLineageClassification,
   ): { ok: true; job: Job } | { ok: false; reason: string } {
     const sameOwner = (job: Job): boolean =>
       job.taskId === latestJob.taskId && job.projectId === latestJob.projectId
 
-    // 2. `resume:<sourceJobId>:1` は **1回だけ** 辿る。
-    //    latest が最初から `review:...:git-commit` ならここは素通りする。
-    let gitCommitJob = latestJob
-    const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
-    if (resumed) {
-      const source = jobs.findById(resumed[1] as string)
-      if (!source) {
-        return { ok: false, reason: `resume source job ${resumed[1]} not found` }
+    // 2. New-scheme generations receive their validated canonical anchor.
+    //    Legacy rows retain the previous one-hop `resume:<source>:1` normalization.
+    let gitCommitJob = lineage.kind === 'new_scheme' ? lineage.lineage.anchorJob : latestJob
+    if (lineage.kind === 'legacy') {
+      const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
+      if (resumed) {
+        const source = lineage.referencedJob
+        if (!source) return { ok: false, reason: `resume source job ${resumed[1]} not found` }
+        if (!sameOwner(source)) {
+          return { ok: false, reason: 'resume source job belongs to a different task or project' }
+        }
+        if (source.safeCommand.kind !== 'git_commit') {
+          return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
+        }
+        gitCommitJob = source
       }
-      // 3. 同一 Task / Project の git_commit であること。
-      if (!sameOwner(source)) {
-        return { ok: false, reason: 'resume source job belongs to a different task or project' }
-      }
-      if (source.safeCommand.kind !== 'git_commit') {
-        return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
-      }
-      gitCommitJob = source
+    }
+
+    if (!sameOwner(gitCommitJob)) {
+      return { ok: false, reason: 'git_commit anchor belongs to a different task or project' }
     }
 
     // 4. `review:<reviewJobId>:git-commit`。
-    //    ここで2段目の `resume:` は一致しないので、**多段 traversal は構造的に起きない**。
+    //    Legacy nested resume sources do not match, preserving the old fail-closed result.
     const reviewRef = /^review:([^:]+):git-commit$/.exec(gitCommitJob.workflowStepKey ?? '')
     if (!reviewRef) {
       return {
@@ -1553,16 +1770,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       }
     }
 
-    // 5. `implement:<implementJobId>:review`
-    const implementRef = /^implement:([^:]+):review$/.exec(reviewJob.workflowStepKey ?? '')
-    if (!implementRef) {
-      return {
-        ok: false,
-        reason: `review job workflowStepKey is not implement:<id>:review (got ${reviewJob.workflowStepKey ?? 'none'})`,
-      }
-    }
-    const implementJob = jobs.findById(implementRef[1] as string)
-    if (!implementJob) return { ok: false, reason: `implement job ${implementRef[1]} not found` }
+    // 5. review → `implement:<implementJobId>:review` → implement。
+    //    Human Resume で再実行された review（D4 で approved なら git_commit を作るようになった）は
+    //    `resume:<review>:1` の段を review Job だけで遡る。walk は D1 / D3 と同じ唯一の実装で、
+    //    欠落・別 Task / Project・review 以外の段・循環はすべて不成立（fail-closed）。
+    //    ここで parser を複製すると、D4 の git_commit が REJECT された後だけ provenance が解けない
+    //    行き止まりになる。
+    const reviewed = resolveReviewedImplementationFrom(jobs, reviewJob.id)
+    if (!reviewed.ok) return { ok: false, reason: reviewed.reason }
+    const implementJob = reviewed.implementJob
     if (!sameOwner(implementJob)) {
       return { ok: false, reason: 'implement job belongs to a different task or project' }
     }
@@ -1866,7 +2082,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (!job) {
             return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found' }
           }
-          const retryJob = findJobByWorkflowStepKey(db, `retry:${job.id}:1`)
+          const retryJob = findJobByWorkflowStepKey(db, retryStepKeyFor(job.id))
           return {
             ok: true,
             job,
@@ -1915,7 +2131,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return finishWithoutRetry()
         }
 
-        const retryWorkflowStepKey = `retry:${source.id}:1`
+        const retryWorkflowStepKey = retryStepKeyFor(source.id)
         const existingRetry = findJobByWorkflowStepKey(db, retryWorkflowStepKey)
         if (existingRetry) {
           recordOutboxEvent(db, source.id, input.outboxEvent)
@@ -2172,14 +2388,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
         // 2) source Job を所有権保持状態（`blocked` 等）から `failed` へ解放する。
         //    `failed` は所有権を持たない（Job status からの所有権導出: running | blocked
-        //    | non-initial queued のみが所有）。既に failed なら no-op になる。
+        //    | non-initial queued のみが所有）。
         const source = jobs.findById(input.sourceJobId)
         if (!source) {
           // 所有権を保持し続けてよい repair Job が既に作られた後では rollback する
           // （throw で transaction を abort し、repair Job の作成も巻き戻す）。
           throw new Error(`source job ${input.sourceJobId} not found for repair handoff`)
         }
-        jobs.update(source.id, { status: 'failed' })
+        // **既に終端した結果は上書きしない。**
+        //
+        // この更新の目的は所有権の解放であって、実行結果の書き換えではない。
+        // `success` / `failed` はどちらも所有権を持たないので、ここで触っても
+        // 解放には一切寄与しない —— にもかかわらず、以前は無条件に `failed` を
+        // 書いていた。
+        //
+        // その結果、review が `changes_requested` を返した通常の Stage 2
+        // （`routes/jobs.ts` の review 経路）と Human Recovery の stored review 経路
+        // では、**成功した implement Job が `status=failed` かつ `exitCode=0` かつ
+        // stderr 無し**という自己矛盾した行に書き換えられていた（2026-09-25 実測）。
+        // 成功記録が消えるだけでなく、`isTaskFailureJob()` がそれを失敗として拾い、
+        // `repairableBlockedReviewRequest()` が admission 条件に使っている
+        // 「実装が成功していること」という前提を handoff 自身が壊していた。
+        //
+        // **`running` / non-initial `queued` の扱いは変えない。** そこへ到達しうるかは
+        // 未実測であり、ここで fail-closed を足すと現在動いている経路を escalation へ
+        // 倒しかねない。到達可能性は別 Finding として扱う。
+        if (source.status !== 'success' && source.status !== 'failed') {
+          jobs.update(source.id, { status: 'failed' })
+        }
 
         // 3) この handoff に属する Task / recovery 状態更新を適用する。
         if (input.taskUpdate) {
@@ -2384,7 +2620,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
 
         const jobRows = db.prepare(
-          'SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC'
+          'SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
         ).all(taskId) as any[]
         const taskJobs = jobRows.map(deserializeJob)
         const latestJob = taskJobs[0]
@@ -2436,6 +2672,28 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         ).get(taskId) as any
         const latestApproval = latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined
 
+        // 後継を先に queued で作り、その後で source を failed へ終端化する。両方ともこの
+        // transaction 内なので、workspace ownership がどちらにも属さない window は無い。
+        // source 行は削除せず、successor の resume:<source>:<n> と audit で lineage を保つ。
+        const completeResumeHandoff = (successor: Job): ResumeBlockedTaskResult => {
+          if (isJobDirectlyBlocked) {
+            const terminalized = db.prepare(
+              "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+            ).run(latestJob.id)
+            if (terminalized.changes !== 1) {
+              throw new Error(`Failed to atomically terminalize resumed source Job ${latestJob.id}`)
+            }
+            // 終端化した source に紐づく request を同じ transaction で actionable から外す。
+            // successor は approval_id を継承せず、`/gate/check` が現 diff に対して新しく発行する。
+            const supersededApprovalId = latestJob.approvalId !== undefined
+              && supersedeApprovalOfTerminalJob(db, latestJob.approvalId, latestJob.taskId)
+              ? latestJob.approvalId
+              : undefined
+            recordResumeSourceTerminalized(db, latestJob.id, successor.id, 'resume', supersededApprovalId)
+          }
+          return { ok: true, job: successor }
+        }
+
         // 有効な承認待ちがあるうちは resume しない（承認と resume の二重駆動を避ける）。
         //
         // ただし `WAITING_FOR_USER` は**期限切れでも行として残る**（expiry は参照時の遅延判定で、
@@ -2464,6 +2722,31 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, reason: 'The latest approval request is waiting for user review' }
         }
 
+        // Recognized git_commit anchors/generations use fixed anchor + generation.
+        // The referenced Job is read exactly once and generations are checked as a set.
+        // Legacy keyless/other-key/nested-:1 rows keep the previous nested resume writer;
+        // an invalid recognized lineage never falls back to that legacy path.
+        const gitCommitLineage = latestJob.safeCommand.kind === 'git_commit'
+          ? gitCommitResumeLineage(latestJob)
+          : undefined
+        if (gitCommitLineage?.kind === 'invalid_new_scheme') {
+          if (
+            latestJob.approvalId !== undefined
+            && isGitCommitRejectionOf(latestJob, latestJob.approvalId)
+          ) {
+            return {
+              ok: false,
+              code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED',
+              reason: gitCommitLineage.reason,
+            }
+          }
+          return {
+            ok: false,
+            code: 'GIT_COMMIT_RESUME_LINEAGE_INVALID',
+            reason: gitCommitLineage.reason,
+          }
+        }
+
         // **CEO が REJECT した git_commit は、同じ commit を作り直さない。**
         //
         // ここを素通しにすると、resume が `instructionPrompt` を捨てて同一 SafeCommand を
@@ -2476,8 +2759,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 一度も下っていない」状態で、同じ diff で新しい承認サイクルを始めるのが正しい。
         // 条件を `instructionPrompt` の有無にしないのは、route も PL も**常に非空**を
         // 渡すためで、そうすると既存の正常経路まで変わってしまう。
-        if (isLinkedGitCommitRejection(latestJob)) {
-          const source = resolveSourceImplementJobForRejectedGitCommit(latestJob)
+        if (
+          gitCommitLineage !== undefined
+          && isLinkedGitCommitRejection(latestJob, gitCommitLineage)
+        ) {
+          const source = resolveSourceImplementJobForRejectedGitCommit(
+            latestJob,
+            gitCommitLineage,
+          )
           if (!source.ok) {
             return { ok: false, code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED', reason: source.reason }
           }
@@ -2514,7 +2803,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             aiCliMode: 'implement',
             workflowStepKey: `resume:${latestJob.id}:1`,
           })
-          return { ok: true, job }
+          return completeResumeHandoff(job)
         }
 
         // git_commit SafeCommand Job（AI CLIを介さない）の resume。
@@ -2522,16 +2811,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 変えて作成するため approvalId を引き継がず、/gate/check が現在のdiffに対して
         // 新しいapprovalを発行する（既存の git_commit Job生成と同じ形、既存のGate/Queueのまま）。
         if (latestJob.safeCommand.kind === 'git_commit') {
+          if (gitCommitLineage === undefined) {
+            return {
+              ok: false,
+              code: 'GIT_COMMIT_RESUME_LINEAGE_INVALID',
+              reason: 'git_commit resume lineage was not validated',
+            }
+          }
           const job = jobs.create({
             taskId,
             projectId: latestJob.projectId,
             agentRole: latestJob.agentRole,
             status: 'queued',
-            workflowStepKey: `resume:${latestJob.id}:1`,
+            workflowStepKey: gitCommitLineage.kind === 'new_scheme'
+              ? gitCommitLineage.lineage.nextWorkflowStepKey
+              : `resume:${latestJob.id}:1`,
             safeCommand: { ...latestJob.safeCommand, workingDir: TARGET_WORKING_DIR },
             dryRun: latestJob.dryRun,
           })
-          return { ok: true, job }
+          return completeResumeHandoff(job)
         }
 
         if (!latestJob.aiCliProvider || !latestJob.aiCliMode) {
@@ -2571,7 +2869,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           workflowStepKey: `resume:${latestJob.id}:1`,
         })
 
-        return { ok: true, job }
+        return completeResumeHandoff(job)
       })
 
       return resumeTransaction(input.taskId, input.instructionPrompt)
@@ -2628,7 +2926,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
 
-          const approval = verifyAndConsumeAbortApproval(task.id, input.approvalRequestId)
+          const approval = verifyAbortAuthorization(task, [], undefined, input.authorization)
           if (!approval.ok) {
             return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
@@ -2642,7 +2940,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             result: 'success',
             detail:
               `parked (status kept as ${task.status}, no job to release, `
-              + `approval ${input.approvalRequestId}): ${input.reason.slice(0, 300)}`,
+              + `approval ${input.authorization.approvalRequestId}): ${input.reason.slice(0, 300)}`,
           })
 
           const updated = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
@@ -2667,6 +2965,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as any
           if (!taskRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Task not found' }
           const task = deserializeTask(taskRow)
+          const taskJobs = jobs.findByTaskId(task.id)
 
           // 対象 Job は対象 Task のものでなければならない。任意の Job の所有権を解放させない。
           if (job.taskId !== task.id) {
@@ -2676,11 +2975,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `job ${job.id} does not belong to task ${task.id}`,
             }
           }
-          if (job.status !== 'blocked') {
+          const technical = input.authorization.kind === 'technical_evidence'
+          if (job.status !== 'blocked' && !(technical && (job.status === 'failed' || job.status === 'success'))) {
             return {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
               reason: `job ${job.id} is ${job.status}, not blocked`,
+            }
+          }
+          if (
+            !job.failureMetadata?.abortCleanupRequestedAt
+            || (input.authorization.kind === 'manual_approval'
+              ? job.failureMetadata.abortApprovalRequestId !== input.authorization.approvalRequestId
+              : job.failureMetadata.abortTechnicalEvidenceId !== input.authorization.evidenceId)
+          ) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} does not carry this abort cleanup authorization`,
+            }
+          }
+          // manual と technical の metadata family は transaction 内でも排他（TOCTOU）。
+          if (job.failureMetadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(job.failureMetadata)) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id}'s abort cleanup request mixes manual and technical authorization`,
             }
           }
           // quarantine 中の行は「安全と証明できない限り解放しない」既存不変条件に従い触らない。
@@ -2726,7 +3046,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               reason: `job ${job.id} has no workspace baseline; cannot prove the workspace is unchanged`,
             }
           }
-          if (!baselineEqualsObservation(job.workspaceBaseline, input.observation)) {
+          const ownershipObservation = technical ? input.preCleanupObservation : input.observation
+          if (
+            ownershipObservation === undefined
+            || !baselineEqualsObservation(job.workspaceBaseline, ownershipObservation)
+          ) {
             return {
               ok: false as const,
               code: 'VERIFICATION_FAILED' as const,
@@ -2743,6 +3067,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // （独立レビュー Finding 4）。所有権の解放は quarantine 解除より重い操作である。
           const knownGood = input.knownGood
           if (
+            (technical && input.observation.mode !== 'clean')
+            ||
             knownGood.gitOperationMarkers.length > 0
             || !knownGood.worktreeClean
             || !knownGood.indexClean
@@ -2769,7 +3095,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // しかも Task はもう roadmap-active ではないので**2本目の報告はもう通らない**
           // （承認も使い切られている）。park したのに project が止まったままになる
           // ——このPRが防ぐはずの状態そのものである（独立レビュー round 3 Finding 1）。
-          const blockedSiblings = jobs.findByTaskId(task.id).filter((sibling) => sibling.status === 'blocked')
+          const blockedSiblings = taskJobs.filter((sibling) => sibling.status === 'blocked')
 
           // **解放する Job は1本ずつ証明を要求する。**
           //
@@ -2797,11 +3123,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
 
-          const unproven = blockedSiblings.find((sibling) => (
-            sibling.safeCommand?.workingDir !== workingDir
-            || !sibling.workspaceBaseline
-            || !baselineEqualsObservation(sibling.workspaceBaseline, input.observation)
-          ))
+          const unproven = technical
+            ? taskJobs.find((sibling) => (
+                sibling.safeCommand?.workingDir !== workingDir
+                || !sibling.workspaceBaseline
+                || sibling.workspaceBaseline.startCommitHash !== input.observation.startCommitHash
+              ))
+            : blockedSiblings.find((sibling) => (
+                sibling.safeCommand?.workingDir !== workingDir
+                || !sibling.workspaceBaseline
+                || !baselineEqualsObservation(sibling.workspaceBaseline, input.observation)
+              ))
           if (unproven) {
             return {
               ok: false as const,
@@ -2851,10 +3183,29 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 + 'refusing to park',
             }
           }
+          if (technical) {
+            const workspaceUser = findWorkspaceUserAnywhere(workingDir, task.id)
+            if (workspaceUser) {
+              return {
+                ok: false as const,
+                code: 'PRECONDITION_FAILED' as const,
+                reason:
+                  `task ${workspaceUser.task.id} in project ${workspaceUser.task.projectId} `
+                  + `owns or uses ${workingDir}; refusing to park`,
+              }
+            }
+          }
 
-          // 承認は**この Task**へ束縛されていなければならない。Job から Task を導く経路なので、
-          // ここを通さないと別 Task 向けの承認で park が通る（独立レビュー Finding 2）。
-          const approval = verifyAndConsumeAbortApproval(task.id, input.approvalRequestId)
+          // manual approval は APPROVED -> CONSUMED。technical evidence は current Task/latest Job/
+          // pre-cleanup fingerprint を同じ write transaction 内で再検証する。
+          const approval = verifyAbortAuthorization(
+            task,
+            taskJobs,
+            job,
+            input.authorization,
+            input.preCleanupObservation,
+            input.cleanupSummary,
+          )
           if (!approval.ok) {
             return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
@@ -2874,16 +3225,31 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             })
           }
           tasks.update(task.id, { roadmapActive: false })
+          const staleApprovalCount = technical && (input.cleanupSummary?.changedPathCount ?? 0) > 0
+            ? staleActiveGitCommitApprovals(task.id)
+            : 0
+          const parkCount = (db.prepare(
+            "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type = 'task' AND entity_id = ? "
+            + "AND operation = 'task_aborted' AND result = 'success'",
+          ).get(task.id) as { count: number }).count + 1
           auditLog.record({
             actor: 'api',
             operation: 'task_aborted',
             entityType: 'task',
             entityId: task.id,
             result: 'success',
-            detail:
-              `parked (status kept as ${task.status}, `
-              + `job(s) ${blockedSiblings.map((sibling) => sibling.id).join(', ')} released, `
-              + `approval ${input.approvalRequestId}): ${input.reason.slice(0, 300)}`,
+            detail: technical
+              ? technicalAbortAuditDetail({
+                  authorization: input.authorization as Extract<AbortAuthorization, { kind: 'technical_evidence' }>,
+                  observedHead: input.observation.startCommitHash,
+                  parkCount,
+                  cleanupSummary: input.cleanupSummary as TechnicalAbortCleanupSummary,
+                  staleApprovalCount,
+                })
+              : `parked (status kept as ${task.status}, `
+                + `job(s) ${blockedSiblings.map((sibling) => sibling.id).join(', ')} released, `
+                + `approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}): `
+                + input.reason.slice(0, 300),
           })
 
           const updatedJob = deserializeJob(db.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id) as any)
@@ -2891,6 +3257,355 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: true as const, job: updatedJob, task: updatedTask }
         })
         return run()
+      } catch (err: unknown) {
+        return {
+          ok: false as const,
+          code: 'STORAGE_ERROR' as const,
+          reason: err instanceof Error ? err.message : String(err),
+        }
+      }
+    },
+    parkBlockedTaskWithTerminalJobs(input) {
+      try {
+        const run = db.transaction(() => {
+          const jobRow = db.prepare('SELECT * FROM jobs WHERE id = ?').get(input.jobId) as any
+          if (!jobRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Job not found' }
+          const job = deserializeJob(jobRow)
+
+          const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as any
+          if (!taskRow) return { ok: false as const, code: 'NOT_FOUND' as const, reason: 'Task not found' }
+          const task = deserializeTask(taskRow)
+
+          if (job.taskId !== task.id) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} does not belong to task ${task.id}`,
+            }
+          }
+          if (
+            !job.failureMetadata?.abortCleanupRequestedAt
+            || (input.authorization.kind === 'manual_approval'
+              ? job.failureMetadata.abortApprovalRequestId !== input.authorization.approvalRequestId
+              : job.failureMetadata.abortTechnicalEvidenceId !== input.authorization.evidenceId)
+          ) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id} does not carry this abort cleanup request`,
+            }
+          }
+          // **manual と technical の metadata family は transaction 内でも排他。** 外側の確認後に
+          // 別接続が metadata を書き換えても、承認消費・park の前にここで止める（TOCTOU）。
+          if (job.failureMetadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(job.failureMetadata)) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${job.id}'s abort cleanup request mixes manual and technical authorization`,
+            }
+          }
+          if (task.status !== 'blocked' || task.roadmapActive !== true) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `task ${task.id} is ${task.status} / roadmapActive=${task.roadmapActive}; `
+                + 'terminal-job parking requires a blocked, roadmap-active task',
+            }
+          }
+
+          const taskJobs = jobs.findByTaskId(task.id)
+          if (taskJobs.length === 0) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} has no jobs; use the existing recovery path before parking`,
+            }
+          }
+          const latestJob = taskJobs[0]
+          if (!latestJob) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} has no latest job; refusing to park`,
+            }
+          }
+          if (latestJob.id !== job.id) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `job ${job.id} is not task ${task.id}'s latest job (${latestJob.id}); `
+                + 'a later execution superseded this abort cleanup request',
+            }
+          }
+          if (latestJob.taskId !== task.id || latestJob.projectId !== task.projectId) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `latest job ${latestJob.id} is not bound to task ${task.id} and project ${task.projectId}`,
+            }
+          }
+          const cleanupRequestedAt = job.failureMetadata.abortCleanupRequestedAt
+          const cleanupRequestedAtMs = Date.parse(cleanupRequestedAt)
+          const latestJobCreatedAtMs = Date.parse(latestJob.createdAt)
+          if (
+            !Number.isFinite(cleanupRequestedAtMs)
+            || !Number.isFinite(latestJobCreatedAtMs)
+            || cleanupRequestedAtMs < latestJobCreatedAtMs
+          ) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `abort cleanup request ${cleanupRequestedAt} predates task ${task.id}'s latest job `
+                + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`,
+            }
+          }
+          const linkedRejection = resolveLinkedGitCommitRejection(latestJob, {
+            findApprovalById: (id) => approvalRequests.findById(id),
+          })
+          const rejectedGitCommitException = input.authorization.kind === 'manual_approval'
+            && latestJob.status === 'blocked'
+            && linkedRejection !== undefined
+          const nonTerminal = taskJobs.find((candidate, index) => (
+            candidate.status !== 'failed'
+            && candidate.status !== 'success'
+            && !(rejectedGitCommitException && index === 0 && candidate.status === 'blocked')
+          ))
+          if (nonTerminal) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `task ${task.id} still has non-terminal job ${nonTerminal.id} (${nonTerminal.status})`,
+            }
+          }
+          const quarantined = taskJobs.find((candidate) => candidate.failureMetadata?.quarantined === true)
+          if (quarantined) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `job ${quarantined.id} is quarantined; clear it through the existing path first`,
+            }
+          }
+
+          const live = db.prepare(
+            "SELECT j.id AS id, j.status AS status FROM jobs j JOIN tasks t ON t.id = j.task_id "
+            + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
+          ).get(task.projectId) as { id: string; status: string } | undefined
+          if (live) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason: `project has a live job (${live.id} is ${live.status}); refusing to park`,
+            }
+          }
+
+          const knownGood = input.knownGood
+          if (
+            input.observation.mode !== 'clean'
+            || knownGood.gitOperationMarkers.length > 0
+            || !knownGood.worktreeClean
+            || !knownGood.indexClean
+            || !knownGood.headValid
+            || !knownGood.blindSpotsAbsent
+          ) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `job ${job.id}'s workspace is not provably clean and known-good `
+                + `(observation=${input.observation.mode}, git operations: `
+                + `${knownGood.gitOperationMarkers.join(', ') || 'none'}, `
+                + `worktreeClean=${knownGood.worktreeClean}, indexClean=${knownGood.indexClean}, `
+                + `headValid=${knownGood.headValid}, blindSpotsAbsent=${knownGood.blindSpotsAbsent})`,
+            }
+          }
+
+          const workingDir = job.safeCommand?.workingDir
+          const differentWorkspaceJob = taskJobs.find((candidate) => (
+            workingDir === undefined
+            || workingDir === ''
+            || candidate.safeCommand?.workingDir !== workingDir
+          ))
+          if (differentWorkspaceJob) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id} job ${differentWorkspaceJob.id} is not proven by the clean observation `
+                + (workingDir === undefined || workingDir === ''
+                  ? '(the observed job has no workingDir)'
+                  : `(workingDir ${differentWorkspaceJob.safeCommand?.workingDir} differs from ${workingDir})`),
+            }
+          }
+          const missingBaselineJob = taskJobs.find((candidate) => !candidate.workspaceBaseline)
+          if (missingBaselineJob) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason: `task ${task.id} job ${missingBaselineJob.id} has no workspace baseline`,
+            }
+          }
+          if (input.authorization.kind === 'technical_evidence') {
+            const cleanBaselineIndex = taskJobs.findIndex(
+              (candidate) => candidate.workspaceBaseline?.mode === 'clean',
+            )
+            const missingEndFingerprintJob = taskJobs.slice(0, cleanBaselineIndex + 1).find(
+              (candidate) => candidate.failureMetadata?.workspaceEndFingerprint === undefined,
+            )
+            if (missingEndFingerprintJob) {
+              return {
+                ok: false as const,
+                code: 'VERIFICATION_FAILED' as const,
+                reason:
+                  `task ${task.id} job ${missingEndFingerprintJob.id} has no workspace end fingerprint; `
+                  + 'legacy lineage cannot be cleaned automatically',
+              }
+            }
+          }
+          const startHeads = new Set(
+            taskJobs.map((candidate) => candidate.workspaceBaseline?.startCommitHash),
+          )
+          if (startHeads.size !== 1) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id}'s terminal Jobs do not share one start HEAD `
+                + `(${Array.from(startHeads).join(', ')})`,
+            }
+          }
+          const sharedStartHead = latestJob.workspaceBaseline?.startCommitHash
+          if (sharedStartHead !== input.observation.startCommitHash) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `task ${task.id}'s shared start HEAD ${sharedStartHead} differs from observed HEAD `
+                + input.observation.startCommitHash,
+            }
+          }
+          if (
+            rejectedGitCommitException
+            && linkedRejection.approval.targetCommit !== input.observation.startCommitHash
+          ) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason:
+                `rejected approval ${linkedRejection.approval.id} targets HEAD `
+                + `${linkedRejection.approval.targetCommit}, not observed HEAD ${input.observation.startCommitHash}`,
+            }
+          }
+          if (
+            input.authorization.kind === 'technical_evidence'
+            && !taskJobs.some((candidate) => candidate.workspaceBaseline?.mode === 'clean')
+          ) {
+            return {
+              ok: false as const,
+              code: 'VERIFICATION_FAILED' as const,
+              reason: `task ${task.id} has no clean baseline in its same-HEAD lineage`,
+            }
+          }
+
+          const foreign = findBlockedOwnerInProject(task.projectId, {
+            excludeTaskId: task.id,
+            provenWorkingDir: workingDir,
+          })
+          if (foreign) {
+            return {
+              ok: false as const,
+              code: 'PRECONDITION_FAILED' as const,
+              reason:
+                `task ${foreign.task.id} holds the workspace through blocked job ${foreign.job.id}; `
+                + 'refusing to park',
+            }
+          }
+          if (
+            (input.authorization.kind === 'technical_evidence' || rejectedGitCommitException)
+            && workingDir !== undefined
+          ) {
+            const workspaceUser = findWorkspaceUserAnywhere(workingDir, task.id)
+            if (workspaceUser) {
+              return {
+                ok: false as const,
+                code: 'PRECONDITION_FAILED' as const,
+                reason:
+                  `task ${workspaceUser.task.id} in project ${workspaceUser.task.projectId} `
+                  + `owns or uses ${workingDir}; refusing to park`,
+              }
+            }
+          }
+
+          const approval = verifyAbortAuthorization(
+            task,
+            taskJobs,
+            job,
+            input.authorization,
+            input.preCleanupObservation,
+            input.cleanupSummary,
+          )
+          if (!approval.ok) {
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
+          }
+
+          if (rejectedGitCommitException) {
+            const failureMetadata = { ...(job.failureMetadata ?? {}) }
+            delete failureMetadata.abortCleanupRequestedAt
+            delete failureMetadata.abortApprovalRequestId
+            delete failureMetadata.abortReason
+            jobs.update(job.id, {
+              status: 'failed',
+              completedAt: now(),
+              stderr: 'manual_abort:rejected_git_commit',
+              failureMetadata,
+            })
+          }
+          tasks.update(task.id, { status: 'pending', roadmapActive: false })
+          const technical = input.authorization.kind === 'technical_evidence'
+          const staleApprovalCount = technical && (input.cleanupSummary?.changedPathCount ?? 0) > 0
+            ? staleActiveGitCommitApprovals(task.id)
+            : 0
+          const parkCount = (db.prepare(
+            "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type = 'task' AND entity_id = ? "
+            + "AND operation = 'task_aborted' AND result = 'success'",
+          ).get(task.id) as { count: number }).count + 1
+          auditLog.record({
+            actor: 'api',
+            operation: 'task_aborted',
+            entityType: 'task',
+            entityId: task.id,
+            result: 'success',
+            detail: technical
+              ? technicalAbortAuditDetail({
+                  authorization: input.authorization as Extract<AbortAuthorization, { kind: 'technical_evidence' }>,
+                  observedHead: input.observation.startCommitHash,
+                  parkCount,
+                  cleanupSummary: input.cleanupSummary as TechnicalAbortCleanupSummary,
+                  staleApprovalCount,
+                })
+              : rejectedGitCommitException
+                ? JSON.stringify({
+                    taskId: task.id,
+                    jobId: job.id,
+                    rejectedApprovalId: linkedRejection.approval.id,
+                    abortApprovalId: (input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId,
+                    observedHead: input.observation.startCommitHash,
+                    targetDiffHash: linkedRejection.approval.targetDiffHash,
+                  })
+                : `parked blocked -> pending (approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}, `
+                  + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}): `
+                  + input.reason.slice(0, 300),
+          })
+
+          const updatedTask = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
+          const updatedJob = deserializeJob(db.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id) as any)
+          return { ok: true as const, job: updatedJob, task: updatedTask }
+        })
+        // live Job / foreign owner の確認から approval consume・park まで write lock を保持する。
+        // 別 connection の claim が検証直後に割り込む余地を作らない。
+        return run.immediate()
       } catch (err: unknown) {
         return {
           ok: false as const,
@@ -4067,9 +4782,30 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
+    findByTaskId(taskId) {
+      const rows = db.prepare(
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+      ).all(taskId) as any[]
+      return rows.map(deserializeDesignReviewRun)
+    },
     findQueued() {
       const rows = db.prepare(
         "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
+      ).all() as any[]
+      return rows.map(deserializeDesignReviewRun)
+    },
+    findTerminalRepairPurposeRuns() {
+      // 既存 ix_design_review_runs_status_started_at(status, started_at) の先頭列と
+      // 等値条件が一致する。residual filter 1 つで足りるため新しい index は作らない
+      // （件数は Task あたりの review 回数オーダーで、poll は 5s に 1 query）。
+      //
+      // **ALIGNED / 非 ALIGNED の判定はしない。** consumer が run 自身の resultJson から
+      // 計算し直す。`status='failed'` を含めないのは、既存 design_review_failed attention と
+      // escalation が二重になるためである。
+      const rows = db.prepare(
+        "SELECT * FROM design_review_runs "
+        + "WHERE status = 'succeeded' AND repair_source_job_id IS NOT NULL "
+        + 'ORDER BY created_at ASC, rowid ASC'
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
@@ -4283,6 +5019,88 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         'UPDATE task_continuations SET status = ?, error = ?, completed_at = ? WHERE id = ?'
       ).run(updated.status, updated.error ?? null, updated.completedAt ?? null, id)
       return updated
+    },
+  }
+
+  const operatorRequests: IOperatorRequestStorage = {
+    findById(id) {
+      const row = db.prepare('SELECT * FROM operator_requests WHERE id = ?').get(id) as any
+      return row ? deserializeOperatorRequest(row) : undefined
+    },
+    list({ status, requesterClass, limit }) {
+      const conditions: string[] = []
+      const params: unknown[] = []
+      if (status !== undefined) { conditions.push('status = ?'); params.push(status) }
+      if (requesterClass !== undefined) { conditions.push('requester_class = ?'); params.push(requesterClass) }
+      const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+      const rows = db.prepare(
+        `SELECT * FROM operator_requests ${where} ORDER BY created_at DESC, rowid DESC LIMIT ?`
+      ).all(...params, limit) as any[]
+      return rows.map(deserializeOperatorRequest)
+    },
+    countPending(requesterClass) {
+      const row = (requesterClass === undefined
+        ? db.prepare("SELECT COUNT(*) AS c FROM operator_requests WHERE status = 'pending'").get()
+        : db.prepare(
+            "SELECT COUNT(*) AS c FROM operator_requests WHERE status = 'pending' AND requester_class = ?"
+          ).get(requesterClass)) as { c: number }
+      return row.c
+    },
+    findOldestPending() {
+      const row = db.prepare(
+        // Mobile（CEO / admin・legacy）の依頼を外部 Operator の依頼より先に処理する。
+        // pending 上限は依頼元ごとなので、外部 Operator が枠を埋めても CEO の依頼が後回しにならない。
+        "SELECT * FROM operator_requests WHERE status = 'pending' "
+        + "ORDER BY CASE requester_class WHEN 'operator_gateway' THEN 1 ELSE 0 END, created_at ASC, rowid ASC LIMIT 1"
+      ).get() as any
+      return row ? deserializeOperatorRequest(row) : undefined
+    },
+    create(data) {
+      const request: OperatorRequest = {
+        id: randomUUID(),
+        requesterClass: data.requesterClass,
+        kind: data.kind,
+        message: data.message,
+        ...(data.targetKey !== undefined ? { targetKey: data.targetKey } : {}),
+        ...(data.projectId !== undefined ? { projectId: data.projectId } : {}),
+        ...(data.taskId !== undefined ? { taskId: data.taskId } : {}),
+        status: 'pending',
+        createdAt: now(),
+      }
+      db.prepare(`
+        INSERT INTO operator_requests
+          (id, requester_class, kind, message, target_key, project_id, task_id, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      `).run(
+        request.id,
+        request.requesterClass,
+        request.kind,
+        request.message,
+        request.targetKey ?? null,
+        request.projectId ?? null,
+        request.taskId ?? null,
+        request.createdAt,
+      )
+      return request
+    },
+    complete(id, result) {
+      const answeredAt = now()
+      const info = result.status === 'answered'
+        ? db.prepare(`
+            UPDATE operator_requests SET status = 'answered', disposition = ?, response = ?, pl_action = ?, answered_at = ?
+            WHERE id = ? AND status = 'pending'
+          `).run(
+            result.disposition,
+            result.response,
+            result.plAction !== undefined ? JSON.stringify(result.plAction) : null,
+            answeredAt,
+            id,
+          )
+        : db.prepare(`
+            UPDATE operator_requests SET status = 'failed', error = ?, answered_at = ?
+            WHERE id = ? AND status = 'pending'
+          `).run(result.error, answeredAt, id)
+      return info.changes === 1 ? operatorRequests.findById(id) : undefined
     },
   }
 
@@ -5088,7 +5906,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
   }
 
-  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, supervisedRuns, gateEvaluations, auditLog, principleApplications, taskContinuations, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
+  storage = { projects, tasks, jobs, approvals, reviewResults, qaResults, permissionGrants, watchdogEvents, approvalRequests, designReviewEvidence, designReviewRuns, supervisedRuns, gateEvaluations, auditLog, principleApplications, taskContinuations, operatorRequests, projectRoadmapPhases, knowledgeGraph, decisionCache, incidentDB, patternLibrary, featureDNA, selfReflection }
   return storage
 }
 
@@ -5416,6 +6234,25 @@ function deserializeTaskContinuation(row: any): TaskContinuation {
   }
 }
 
+function deserializeOperatorRequest(row: any): OperatorRequest {
+  return {
+    id: row.id,
+    requesterClass: row.requester_class as OperatorRequest['requesterClass'],
+    kind: row.kind as OperatorRequest['kind'],
+    message: row.message,
+    targetKey: row.target_key ?? undefined,
+    projectId: row.project_id ?? undefined,
+    taskId: row.task_id ?? undefined,
+    status: row.status as OperatorRequest['status'],
+    disposition: row.disposition ?? undefined,
+    response: row.response ?? undefined,
+    plAction: row.pl_action ? JSON.parse(row.pl_action) : undefined,
+    error: row.error ?? undefined,
+    createdAt: row.created_at,
+    answeredAt: row.answered_at ?? undefined,
+  }
+}
+
 function deserializePrincipleApplication(row: any): PrincipleApplication {
   return {
     id: row.id,
@@ -5560,6 +6397,265 @@ function runMigrations(db: Database.Database): void {
       db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
     }
   }
+}
+
+/**
+ * `resumeBlockedTask()` が正式な後継を作成済みなのに source が `blocked` のまま残った既存行を、
+ * 現行の handoff invariant へ揃える。推測はせず、同一 Task に canonical な
+ * resume predecessor（git_commit は fixed generation、それ以外は従来 source id）が
+ * exact に保存されている場合だけを proof とする。
+ *
+ * malformed な failure_metadata は「quarantine でない」と証明できないため触らない。
+ * status の CAS と audit は同一 transaction で、再起動時は `blocked` 条件により冪等である。
+ */
+function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
+  const reconcile = db.transaction((): void => {
+    const sources = db.prepare(`
+      SELECT id, task_id, failure_metadata, approval_id
+      FROM jobs
+      WHERE status = 'blocked'
+      ORDER BY rowid ASC
+    `).all() as Array<{ id: string; task_id: string; failure_metadata: string | null; approval_id: string | null }>
+
+    const jobsForTask = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY rowid ASC')
+    const jobById = db.prepare('SELECT * FROM jobs WHERE id = ?')
+    const approvalStatus = db.prepare('SELECT status FROM approval_requests WHERE id = ?')
+
+    const exactResumeSuccessors = (sourceJobId: string, taskId: string): Job[] => {
+      const taskJobs = (jobsForTask.all(taskId) as unknown[]).map(deserializeJob)
+      return taskJobs.filter((candidate) => {
+        if (candidate.workflowStepKey?.startsWith('resume:') !== true) return false
+
+        // Fixed-anchor git_commit generations name the anchor, not generation n-1.
+        // Legacy git_commit rows retain the old parseResumeSource exact match.
+        if (candidate.safeCommand.kind === 'git_commit') {
+          const parsed = parseGitCommitResumeStepKey(candidate.workflowStepKey)
+          const referencedRow = parsed === undefined
+            ? undefined
+            : jobById.get(parsed.anchorJobId) as unknown
+          const referencedJob = referencedRow === undefined ? undefined : deserializeJob(referencedRow)
+          const classification = classifyGitCommitResumeLineage({
+            currentJob: candidate,
+            referencedJob,
+            taskJobs,
+            requireCurrentIsLatestGeneration: false,
+          })
+          if (classification.kind === 'invalid_new_scheme') return false
+          if (classification.kind === 'legacy') {
+            return parseResumeSource(candidate.workflowStepKey) === sourceJobId
+          }
+          return exactGitCommitResumePredecessor({
+            successor: candidate,
+            lineage: classification.lineage,
+            taskJobs,
+          })?.id === sourceJobId
+        }
+
+        // Non-git_commit resume semantics are unchanged.
+        return parseResumeSource(candidate.workflowStepKey) === sourceJobId
+      })
+    }
+
+    for (const source of sources) {
+      // 承認待ちが結び付いたままの行は、その承認が approveAndResumeJob() で同じ行を動かしうる。
+      // lineage があっても「もう誰も動かさない」とは言えないので触らない（fail-closed）。
+      // 結び付いた承認行が見つからない場合も、状態を確かめられないので同じく触らない
+      // （`jobs.approval_id` に外部キーは無い）。期限は見ない —— WAITING は期限切れでも行として残る。
+      if (source.approval_id !== null) {
+        const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
+        if (approval === undefined || approval.status === 'WAITING_FOR_USER') continue
+      }
+
+      if (source.failure_metadata !== null) {
+        let metadata: unknown
+        try {
+          metadata = JSON.parse(source.failure_metadata)
+        } catch {
+          continue
+        }
+        if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) continue
+        if ((metadata as { quarantined?: unknown }).quarantined === true) continue
+      }
+
+      const successor = exactResumeSuccessors(source.id, source.task_id)[0]
+      if (!successor) continue
+
+      const terminalized = db.prepare(
+        "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+      ).run(source.id)
+      if (terminalized.changes !== 1) continue
+      recordResumeSourceTerminalized(db, source.id, successor.id, 'startup_reconciliation')
+    }
+
+    // ── 終端化済み source に紐づいたまま残った request の回収（冪等） ──
+    //
+    // `completeResumeHandoff()` が source の request を supersede するようになる前に終端化された
+    // 行（および上のループで今回終端化した行）を、同じ invariant へ揃える。
+    // proof は「同一 Task・同一 Project・同じ SafeCommand kind で、canonical な
+    // resume predecessor が source を exact に指す後継が **ちょうど1件**」。
+    // 曖昧（0件 / 複数件 / kind 不明）なら触らない（fail-closed）。
+    const terminalSourcesWithActiveApproval = db.prepare(`
+      SELECT j.id, j.task_id, j.project_id, j.approval_id, j.safe_command
+      FROM jobs j
+      JOIN approval_requests a ON a.id = j.approval_id AND a.task_id = j.task_id
+      WHERE j.status = 'failed' AND a.status IN ('WAITING_FOR_USER', 'APPROVED')
+      ORDER BY j.rowid ASC
+    `).all() as Array<{ id: string; task_id: string; project_id: string; approval_id: string; safe_command: string }>
+    const commandKind = (safeCommand: string): string | undefined => {
+      try {
+        const kind = (JSON.parse(safeCommand) as { kind?: unknown }).kind
+        return typeof kind === 'string' && kind.length > 0 ? kind : undefined
+      } catch {
+        return undefined
+      }
+    }
+
+    for (const source of terminalSourcesWithActiveApproval) {
+      const sourceKind = commandKind(source.safe_command)
+      if (sourceKind === undefined) continue
+      const successors = exactResumeSuccessors(source.id, source.task_id).filter((candidate) =>
+        candidate.projectId === source.project_id
+        && candidate.safeCommand.kind === sourceKind)
+      if (successors.length !== 1) continue
+      if (!supersedeApprovalOfTerminalJob(db, source.approval_id, source.task_id)) continue
+      db.prepare(`
+        INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+        VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
+      `).run(
+        randomUUID(),
+        source.approval_id,
+        `reason=linked_job_terminal source_job_id=${source.id} successor_job_id=${successors[0]!.id} mode=startup_reconciliation`,
+        now(),
+      )
+    }
+  })
+
+  reconcile()
+}
+
+/**
+ * **一度限りの historical reconciliation（一般ルールではない）。** CEO 承認 2026-09-30。
+ *
+ * 対象は下表の2行だけである。どちらも `done` な Task の下に `blocked` のまま残り、
+ * 後継 Job の lineage（`reconcileResumedBlockedSourceJobs()` の proof）を持たないため、
+ * 0-Job Task の `abortTask()` / `parkTask()` を恒久的に塞いでいた。
+ *
+ * 所有権を既に失っていたことの証拠（行ごとに下の `laterForeignJobId`）:
+ *   - blocked になった**後に**、別 Task の Job が**同じ workingDir** で開始されている
+ *   - その時点の Production には、done Task の blocked 行を「worktree の clean を観測するまで」
+ *     所有者として扱う Worker（#158 `533735c`、VPS checkout は 2026-09-13 03:31 JST 以降この子孫）と、
+ *     dirty な worktree で Job を開始させない baseline 検査（#98 `1ad656a`）が deploy 済みだった
+ *   - よって別 Task の Job が開始できた時点で、Worker は worktree を clean と観測している
+ *
+ * **この証拠の形を他の行へ広げてはならない。** 「完了 Task の blocked 行を一般に終端化する」
+ * 規則は、dirty worktree が initial implement の失敗を経て repair に引き継がれる経路が
+ * 塞がるまで入れない（2026-09-30 の DESIGN_BLOCKER）。ここは id 固定のまま置く。
+ *
+ * 起動のたびに証拠を DB から**再検証**し、1つでも合わなければ触らない（fail-closed）。
+ * status の CAS と audit は同一 transaction で、2回目以降は `blocked` 条件により何もしない。
+ */
+const HISTORICAL_ORPHAN_BLOCKED_JOBS: ReadonlyArray<{ jobId: string; laterForeignJobId: string }> = [
+  // Task 76ea5ff3（2026-09-14 に汎用 PATCH で done）。唯一の Job。
+  { jobId: 'd5206ab3-0751-4302-bf64-fa1ccd0d42ae', laterForeignJobId: '71b9ed29-b083-40e4-a572-3071e82c26b7' },
+  // Task 7bd4a65a（2026-09-15 に reconcile_external_completion で done）。blocked の repair Job。
+  { jobId: 'e8f04766-c80b-4571-99a0-ecd065736f98', laterForeignJobId: '8664cddc-11bd-4560-897d-bb813ac74826' },
+]
+
+const HISTORICAL_ORPHAN_TERMINALIZED_OPERATION = 'historical_orphan_terminalized'
+
+function reconcileHistoricalOrphanBlockedJobs(db: Database.Database): void {
+  const reconcile = db.transaction((): void => {
+    const jobRow = db.prepare(`
+      SELECT id, task_id, project_id, status, safe_command, failure_metadata, approval_id,
+             started_at, completed_at
+      FROM jobs WHERE id = ?
+    `)
+    const taskStatus = db.prepare('SELECT status FROM tasks WHERE id = ?')
+    const approvalStatus = db.prepare('SELECT status FROM approval_requests WHERE id = ?')
+
+    type Row = {
+      id: string
+      task_id: string
+      project_id: string
+      status: string
+      safe_command: string | null
+      failure_metadata: string | null
+      approval_id: string | null
+      started_at: string | null
+      completed_at: string | null
+    }
+    const workingDirOf = (row: Row): string | undefined => {
+      if (row.safe_command === null) return undefined
+      try {
+        const dir = (JSON.parse(row.safe_command) as { workingDir?: unknown }).workingDir
+        return typeof dir === 'string' && dir !== '' ? dir : undefined
+      } catch {
+        return undefined
+      }
+    }
+
+    for (const entry of HISTORICAL_ORPHAN_BLOCKED_JOBS) {
+      const source = jobRow.get(entry.jobId) as Row | undefined
+      if (!source || source.status !== 'blocked') continue
+      if ((taskStatus.get(source.task_id) as { status: string } | undefined)?.status !== 'done') continue
+
+      // #306 の reconciliation と同じ fail-closed 条件（承認待ち / 承認行不明 / quarantine / 壊れた metadata）。
+      if (source.approval_id !== null) {
+        const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
+        if (approval === undefined || approval.status === 'WAITING_FOR_USER') continue
+      }
+      // 承認時に確認した metadata（provider_timeout の記録）が残っていることも証拠の一部。
+      // 欠けていれば「quarantine でない」と言えないので触らない。
+      if (source.failure_metadata === null) continue
+      let metadata: unknown
+      try {
+        metadata = JSON.parse(source.failure_metadata)
+      } catch {
+        continue
+      }
+      if (typeof metadata !== 'object' || metadata === null || Array.isArray(metadata)) continue
+      if ((metadata as { quarantined?: unknown }).quarantined === true) continue
+
+      // 証拠: 別 Task の Job が、同じ Project・同じ workingDir で、source の終了後に開始されている。
+      // 時刻は正規形の UTC ISO 文字列だけを比較に使う（形が崩れていれば順序を証明できない）。
+      const isCanonicalUtc = (value: string | null): value is string => {
+        if (value === null || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) return false
+        const parsed = new Date(value)
+        return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value
+      }
+      const later = jobRow.get(entry.laterForeignJobId) as Row | undefined
+      const sourceDir = workingDirOf(source)
+      if (
+        !later
+        || later.task_id === source.task_id
+        || later.project_id !== source.project_id
+        || sourceDir === undefined
+        || workingDirOf(later) !== sourceDir
+        || !isCanonicalUtc(source.completed_at)
+        || !isCanonicalUtc(later.started_at)
+        || !(later.started_at > source.completed_at)
+      ) continue
+
+      const terminalized = db.prepare(
+        "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+      ).run(source.id)
+      if (terminalized.changes !== 1) continue
+      db.prepare(`
+        INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+        VALUES (?, 'api', ?, 'job', ?, 'success', ?, ?)
+      `).run(
+        randomUUID(),
+        HISTORICAL_ORPHAN_TERMINALIZED_OPERATION,
+        source.id,
+        `one_time=ceo_2026-09-30 later_foreign_job_id=${later.id} later_started_at=${later.started_at} `
+        + `source_completed_at=${source.completed_at} working_dir=${sourceDir} `
+        + 'source_status=blocked target_status=failed',
+        now(),
+      )
+    }
+  })
+
+  reconcile()
 }
 
 function runDesignReviewSubjectMigration(db: Database.Database): void {

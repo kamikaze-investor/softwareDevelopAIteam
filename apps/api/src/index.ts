@@ -24,6 +24,7 @@ import { permissionGrantRoutes } from './routes/permissionGrants'
 import { watchdogEventRoutes } from './routes/watchdogEvents'
 import { supervisedRunRoutes } from './routes/supervisedRuns'
 import { taskContinuationRoutes } from './routes/taskContinuations'
+import { operatorRequestRoutes } from './routes/operatorRequests'
 import { registerDelegationContinuation } from './supervision/continuation'
 import { dashboardRoutes } from './routes/dashboard'
 import { approvalGateRoutes } from './routes/approvalGate'
@@ -86,6 +87,7 @@ app.register(permissionGrantRoutes, { prefix: '/api' })
 app.register(watchdogEventRoutes, { prefix: '/api' })
 app.register(supervisedRunRoutes, { prefix: '/api' })
 app.register(taskContinuationRoutes, { prefix: '/api' })
+app.register(operatorRequestRoutes, { prefix: '/api' })
 app.register(dashboardRoutes, { prefix: '/api' })
 app.register(approvalGateRoutes, { prefix: '/api' })
 app.register(knowledgeGraphRoutes, { prefix: '/api' })

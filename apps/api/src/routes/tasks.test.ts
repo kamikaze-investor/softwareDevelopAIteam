@@ -2,12 +2,9 @@ import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskSummary } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { appendImplementContracts } from '../implementPrompt'
+import { buildSystemState } from '../state/systemState'
 import { buildResumeAiCliPrompt, type TaskRouteOptions } from './tasks'
 
 /**
@@ -95,7 +92,7 @@ async function createJob(
     const routeWillAppendBaseContract = body.agentRole === undefined || body.agentRole === 'developer_ai'
     await createAlignedDesignReviewEvidence(
       task.id,
-      routeWillAppendBaseContract ? appendBaseDesignContract(body.aiCliPrompt) : body.aiCliPrompt,
+      routeWillAppendBaseContract ? appendImplementContracts(body.aiCliPrompt, task) : body.aiCliPrompt,
     )
   }
 
@@ -124,14 +121,6 @@ async function createAlignedDesignReviewEvidence(taskId: string, designText: str
     decision: 'ALIGNED',
     independentReviewRequired: false,
   })
-}
-
-function appendBaseDesignContract(prompt: string): string {
-  const principles = loadEngineeringPrinciples()
-  return `${prompt}\n\n${buildDesignContract({
-    slugs: selectPrincipleSlugs(undefined, principles),
-    principles,
-  })}`
 }
 
 async function updateJob(
@@ -203,22 +192,130 @@ beforeEach(() => {
 })
 
 describe('buildResumeAiCliPrompt', () => {
-  it('appends a Design Contract using allowedPaths focus signals', () => {
+  it('keeps the Task Contract and the Human instruction as separate, additive sections', () => {
     const prompt = buildResumeAiCliPrompt({
       title: 'Resume storage work',
       description: 'Finish the storage update.',
       allowedPaths: ['apps/api/src/storage/sqlite.ts'],
+      forbiddenPaths: ['apps/worker/src/guards'],
+      acceptanceCriteria: ['Storage update is persisted.', 'No files outside storage are changed.'],
+      expectedOutputs: ['apps/api/src/storage/sqlite.ts'],
     }, 'Use the reviewed storage API.')
 
     expect(prompt).toContain('## Design Contract')
     expect(prompt).toContain('Finish the storage update.')
+    expect(prompt).toContain('[Task Contract]')
+    expect(prompt).toContain('apps/api/src/storage/sqlite.ts')
+    expect(prompt).toContain('apps/worker/src/guards')
+    expect(prompt).toContain('Storage update is persisted.')
+    expect(prompt).toContain('No files outside storage are changed.')
     expect(prompt).toContain('Use the reviewed storage API.')
+    expect(prompt.indexOf('[Task Contract]')).toBeLessThan(prompt.indexOf('[CEOからの追加指示]'))
     expect(prompt).toContain('current implementation is evidence, not specification')
     expect(prompt).toContain('Keep security and data boundaries strict')
   })
 })
 
 describe('Task API', () => {
+  it('POST /api/tasks/:id/abort exposes only manual approval and consumes APPROVED abort_task approval', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'manual abort', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as never)
+      const request = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+        targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd', changedFiles: [],
+        triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+
+      const waiting = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { approvalRequestId: request.id, reason: 'manual admin decision' },
+      })
+      expect(waiting.statusCode).toBe(403)
+      expect(storage.tasks.findById(task.id)?.roadmapActive).toBe(true)
+
+      // technical evidence fields are not part of the strict HTTP schema.
+      const hiddenTechnicalPath = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { technicalEvidenceId: 'forged', reason: 'forged' },
+      })
+      expect(hiddenTechnicalPath.statusCode).toBe(400)
+
+      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      const approved = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { approvalRequestId: request.id, reason: 'manual admin decision' },
+      })
+      expect(approved.statusCode).toBe(200)
+      expect(storage.tasks.findById(task.id)?.roadmapActive).toBe(false)
+      expect(storage.approvalRequests.findById(request.id)?.status).toBe('CONSUMED')
+    })
+  })
+
+  it('POST /api/tasks/:id/abort marks only a directly linked rejected latest git_commit for observation', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'rejected commit', description: '', status: 'blocked',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as never)
+      const baseline = { mode: 'clean' as const, startCommitHash: 'candidate-head' }
+      storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: baseline,
+      } as never)
+      const rejected = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'git_commit', riskLevel: 'HIGH',
+        targetBranch: 'ai/manual-abort', targetCommit: baseline.startCommitHash,
+        targetDiffHash: '404c5f2c', changedFiles: ['bounded.ts'], triggeredRules: [], invalidIf: [],
+        status: 'REJECTED', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+      const latest = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+        approvalId: rejected.id,
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        workspaceBaseline: baseline,
+        workflowStepKey: 'seven:hops:are:not:approval:provenance',
+      } as never)
+      storage.jobs.update(latest.id, { approvalId: rejected.id })
+      const abortApproval = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+        targetBranch: 'ai/manual-abort', targetCommit: 'unrelated-gate-target', targetDiffHash: 'abort',
+        changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { approvalRequestId: abortApproval.id, reason: 'backup verified and candidate restored' },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(parseBody(response.body)).toMatchObject({
+        ok: true, status: 'cleanup_requested', taskId: task.id, jobIds: [latest.id],
+      })
+      expect(storage.jobs.findById(latest.id)?.failureMetadata).toMatchObject({
+        abortApprovalRequestId: abortApproval.id,
+      })
+      expect(storage.jobs.findById(latest.id)?.status).toBe('blocked')
+      expect(storage.tasks.findById(task.id)).toMatchObject({ status: 'blocked', roadmapActive: true })
+      expect(storage.approvalRequests.findById(abortApproval.id)?.status).toBe('APPROVED')
+      expect(storage.approvalRequests.findById(rejected.id)?.status).toBe('REJECTED')
+    })
+  })
+
   // in_progress と blocked は roadmapActive に関係なく project を占有する。park した Task を
   // ここで動かせると park は事実上取り消され、resume は park を理由に拒否するので
   // 誰も解消できない状態になる。
@@ -364,7 +461,7 @@ describe('Task API', () => {
       })
       expect(taskRes.statusCode).toBe(201)
       const task = parseBody<Task>(taskRes.body)
-      const finalPrompt = appendBaseDesignContract(prompt)
+      const finalPrompt = appendImplementContracts(prompt, task)
       await createAlignedDesignReviewEvidence(task.id, finalPrompt)
 
       const jobRes = await app.inject({
@@ -969,7 +1066,7 @@ describe('Task API', () => {
       })
     })
 
-    it('creates a queued job from the latest blocked job and keeps the blocked job unchanged', async () => {
+    it('creates a queued job, terminalizes its blocked source, and does not start a second recovery', async () => {
       await withApp(async (app) => {
         const project = await createProject(app)
         const task = await createTask(app, project.id, {
@@ -1016,10 +1113,54 @@ describe('Task API', () => {
         expect(jobs).toHaveLength(2)
         const original = jobs.find((job) => job.id === blockedJob.id)
         const created = jobs.find((job) => job.id === resumedJob.id)
-        expect(original?.status).toBe('blocked')
+        expect(original?.status).toBe('failed')
         expect(original?.aiCliPrompt).toBe(blockedJob.aiCliPrompt)
         expect(original?.aiCliPrompt).toContain('## Design Contract')
         expect(created?.status).toBe('queued')
+        expect(created?.workflowStepKey).toBe(`resume:${blockedJob.id}:1`)
+
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        expect(storage.jobs.findByTaskId(task.id).some((candidate) => (
+          candidate.workflowStepKey?.startsWith('repair:')
+        ))).toBe(false)
+        expect(storage.designReviewRuns.findByTaskId(task.id)).toEqual([])
+        expect(buildSystemState(storage).attention.some((item) => (
+          item.taskId === task.id && (item.kind === 'job_failed' || item.kind === 'job_blocked')
+        ))).toBe(false)
+      })
+    })
+
+    it('uses the queued resume successor as the source of the next resume, even at the same timestamp', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        const blockedJob = await createBlockedAiCliJob(app, task, {
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'Original prompt',
+          aiCliMode: 'implement',
+        })
+        const instruction = 'Continue with the approved design.'
+        await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
+
+        const firstResponse = await app.inject({
+          method: 'POST', url: `/api/tasks/${task.id}/resume`, payload: { instruction },
+        })
+        expect(firstResponse.statusCode).toBe(201)
+        const first = parseBody<Job>(firstResponse.body)
+
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.jobs.update(first.id, { status: 'blocked' })
+
+        const secondResponse = await app.inject({
+          method: 'POST', url: `/api/tasks/${task.id}/resume`, payload: { instruction },
+        })
+        expect(secondResponse.statusCode).toBe(201)
+        const second = parseBody<Job>(secondResponse.body)
+        expect(second.workflowStepKey).toBe(`resume:${first.id}:1`)
+        expect(storage.jobs.findById(first.id)?.status).toBe('failed')
+        expect(storage.jobs.findById(blockedJob.id)?.status).toBe('failed')
       })
     })
 
@@ -1233,6 +1374,9 @@ describe('Task API', () => {
           const jobs = parseBody<Job[]>(jobsRes.body)
           expect(jobs).toHaveLength(2)
           expect(jobs.find((job) => job.id === failedJob.id)?.status).toBe('failed')
+          // source は既に failed で blocked からの handoff ではないので、終端化の audit は書かない。
+          expect(getStorage().auditLog.findByEntity('job', failedJob.id)
+            .filter((entry) => entry.operation === 'resume_source_terminalized')).toHaveLength(0)
         })
       })
 
@@ -1465,7 +1609,8 @@ describe('Task API', () => {
         const jobs = parseBody<Job[]>(jobsRes.body)
         expect(jobs).toHaveLength(2)
         expect(jobs.filter((job) => job.status === 'queued')).toHaveLength(1)
-        expect(jobs.filter((job) => job.status === 'blocked')).toHaveLength(1)
+        expect(jobs.filter((job) => job.status === 'blocked')).toHaveLength(0)
+        expect(jobs.filter((job) => job.status === 'failed')).toHaveLength(1)
       })
     })
   })

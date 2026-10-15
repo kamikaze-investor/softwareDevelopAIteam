@@ -8,10 +8,17 @@ import {
 } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
+import {
+  adoptRoadmapItem,
+  AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+  awaitingPromotionAuditKey,
+} from '../ctoAi/roadmapAdoption'
+import { buildSystemState } from '../state/systemState'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
+import { summarizeBlockedTriage } from './blockedTriage'
 import {
   applyFollowUpBoost,
+  AUDIT_PROPOSAL_UNPARSED,
   AUDIT_FOLLOW_UP_ADOPTED,
   AUDIT_FOLLOW_UP_BOOSTED,
   AUDIT_FOLLOW_UP_SKIPPED,
@@ -19,8 +26,14 @@ import {
   classifyAdoptionCandidates,
   countConsecutiveSkips,
   FOLLOW_UP_SKIPS_BEFORE_BOOST,
+  adoptionPromptVersion,
+  findProposalDiagnostics,
   parseAdoptionProposal,
+  PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION,
+  PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT,
+  PROPOSAL_DIAGNOSTIC_RAW_LIMIT,
   readAdoptionCandidates,
+  redactDiagnosticSecrets,
   selectAdoptionCandidates,
   buildAdoptionPrompt,
   ADOPTION_SYSTEM_PROMPT,
@@ -100,6 +113,10 @@ function deps(over: Partial<Parameters<typeof runAdoptionStep>[2]> = {}) {
     ...over,
   }
 }
+
+// Token-shaped fixtures are assembled at runtime so no secret-like literal appears in the source
+// (keeps GitHub push protection quiet; these are not real credentials).
+const fake = (...parts: string[]): string => parts.join('')
 
 describe('readAdoptionCandidates', () => {
   it('候補は planned だけ（現在の可否は state が正本）', () => {
@@ -228,12 +245,250 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     return { storage, projectId: project.id }
   }
 
+  function projectWithCompletion(options: {
+    sourceKind?: 'git_commit' | 'test'
+    sourceStatus?: 'success' | 'failed'
+    sourceCommitHash?: string
+    taskCommitHash?: string
+    externallyReconciled?: boolean
+    noApproval?: boolean
+    approvalTargetBranch?: string
+    approvalStatus?: 'CONSUMED' | 'APPROVED' | 'STALE'
+    approvalForAnotherTask?: boolean
+    approvalRequestedAction?: string
+    sourceJobForAnotherTask?: boolean
+  } = {}): { storage: IStorage; projectId: string; taskId: string; sourceJobId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'Candidate completion', description: '', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item',
+      ...(options.taskCommitHash !== undefined ? { commitHash: options.taskCommitHash } : {}),
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const sourceTask = options.sourceJobForAnotherTask === true
+      ? storage.tasks.create({
+        projectId: project.id, title: 'unrelated source task', description: '', status: 'done',
+        assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      : task
+    const sourceKind = options.sourceKind ?? 'git_commit'
+    const sourceJob = storage.jobs.create({
+      taskId: sourceTask.id,
+      projectId: project.id,
+      agentRole: 'developer_ai',
+      status: options.sourceStatus ?? 'success',
+      safeCommand: sourceKind === 'git_commit'
+        ? { kind: 'git_commit', workingDir: '/workspace/target', message: 'candidate result' }
+        : { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+      ...(options.sourceCommitHash !== undefined ? { commitHash: options.sourceCommitHash } : {}),
+    } as Parameters<IStorage['jobs']['create']>[0])
+    if (options.sourceCommitHash !== undefined) {
+      storage.jobs.update(sourceJob.id, { commitHash: options.sourceCommitHash })
+    }
+    if (options.noApproval !== true) {
+      const approvalTask = options.approvalForAnotherTask === true
+        ? storage.tasks.create({
+          projectId: project.id, title: 'approval owner', description: '', status: 'done',
+          assignee: 'developer_ai', dependencies: [],
+        } as Parameters<IStorage['tasks']['create']>[0])
+        : sourceTask
+      const approvalInput: Parameters<IStorage['approvalRequests']['create']>[0] = {
+        taskId: approvalTask.id,
+        targetBranch: options.approvalTargetBranch ?? 'candidate/self-dev',
+        targetCommit: 'candidate-parent',
+        targetDiffHash: 'candidate-diff',
+        riskLevel: 'LOW' as const,
+        requestedAction: options.approvalRequestedAction ?? 'git_commit',
+        changedFiles: ['apps/api/src/pl/adoptionStep.ts'],
+        triggeredRules: [],
+        status: options.approvalStatus ?? 'CONSUMED',
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        invalidIf: ['commit changes', 'diff changes'],
+      }
+      if (
+        sourceJob.safeCommand.kind === 'git_commit'
+        && approvalInput.taskId === sourceJob.taskId
+        && approvalInput.requestedAction === 'git_commit'
+      ) {
+        const created = storage.approvalRequests.createForJob(approvalInput, sourceJob.id)
+        if (!created.ok) throw new Error(`failed to bind approval: ${created.reason}`)
+      } else {
+        // Corrupt/legacy evidence is seeded deliberately: the predicate must fail open toward ordinary follow-up.
+        const approval = storage.approvalRequests.create(approvalInput)
+        storage.jobs.update(sourceJob.id, { approvalId: approval.id })
+      }
+    }
+    storage.taskContinuations.create({
+      sourceJobId: sourceJob.id,
+      projectId: project.id,
+      completedTaskId: task.id,
+      status: 'completed',
+    })
+    if (options.externallyReconciled === true) {
+      storage.auditLog.record({
+        actor: 'api', operation: 'reconcile_external_completion', entityType: 'task',
+        entityId: task.id, result: 'done', detail: 'Tier B completion',
+      })
+    }
+    return { storage, projectId: project.id, taskId: task.id, sourceJobId: sourceJob.id }
+  }
+
   it('実行済み・active なし・continuation なしを follow_up として分類する', () => {
     const { storage, projectId } = projectWithExecutedItem()
 
     const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
 
     expect(classified.find((c) => c.id === 'open-item')?.kind).toBe('follow_up')
+  })
+
+  it('production Tier A completion は classifier と seam の反復でも拒否され、audit は1件', async () => {
+    const { storage, projectId, taskId, sourceJobId } = projectWithCompletion({
+      sourceCommitHash: 'candidate-abc123',
+    })
+
+    const first = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+    const second = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+    const seam = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'open-item',
+      allowedPaths: GOOD.allowedPaths,
+      acceptanceCriteria: GOOD.acceptanceCriteria,
+      implementationScope: GOOD.implementationScope,
+      followUp: true,
+    }, { readRoadmap: () => LEDGER, ensureInitialWorkflows: vi.fn().mockResolvedValue([]) })
+    const third = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(first.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+    expect(second.find((candidate) => candidate.id === 'open-item')?.kind).toBe('not_available')
+    expect(seam).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    expect(third.find((candidate) => candidate.id === 'open-item')?.kind).toBe('not_available')
+    expect(storage.tasks.findByProjectId(projectId).some(
+      (candidate) => candidate.roadmapTaskKey === 'open-item#2',
+    )).toBe(false)
+    expect(buildSystemState(storage).attention.some((item) => item.taskId === taskId)).toBe(false)
+    const audits = storage.auditLog
+      .findByEntity('roadmap_item', awaitingPromotionAuditKey(projectId, 'open-item', sourceJobId))
+      .filter((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)
+    expect(audits).toHaveLength(1)
+    expect(JSON.parse(audits[0]?.detail ?? '{}')).toEqual({
+      taskId,
+      candidateCommitHash: 'candidate-abc123',
+    })
+  })
+
+  it('promoted completion を誤って planned に戻しても fail-closed で audit を残す', () => {
+    // canonical master 包含はこの DB に保存しない。ledger が誤って planned のままなら、
+    // Candidate completion と同じ証拠形を安全側へ倒し、PL に再採用させない。
+    const { storage, projectId, sourceJobId } = projectWithCompletion()
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+    expect(storage.auditLog.findByEntity(
+      'roadmap_item', awaitingPromotionAuditKey(projectId, 'open-item', sourceJobId),
+    ).some((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)).toBe(true)
+  })
+
+  it('後続の parked/failed #2 があっても、先行 completion は awaiting promotion のまま', () => {
+    const { storage, projectId } = projectWithCompletion()
+    const parked = storage.tasks.create({
+      projectId, title: 'parked follow-up', description: '', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapTaskKey: 'open-item#2', roadmapActive: false,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: parked.id, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+  })
+
+  it('Tier B reconcile audit がある completion は awaiting promotion と扱わない', () => {
+    const { storage, projectId } = projectWithCompletion({ externallyReconciled: true })
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')?.kind).toBe('follow_up')
+    expect(storage.auditLog.findAll().some(
+      (entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+    )).toBe(false)
+  })
+
+  it.each([
+    ['non-git_commit Job の commitHash', { sourceKind: 'test' as const, sourceCommitHash: 'misleading' }],
+    ['failed git_commit Job の commitHash', { sourceStatus: 'failed' as const, sourceCommitHash: 'failed-sha' }],
+    ['Task row だけの commitHash', { sourceKind: 'test' as const, taskCommitHash: 'task-only-sha' }],
+  ])('%s だけでは awaiting promotion にしない', (_label, options) => {
+    const { storage, projectId } = projectWithCompletion(options)
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')?.kind).toBe('follow_up')
+    expect(storage.auditLog.findAll().some(
+      (entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+    )).toBe(false)
+  })
+
+  it.each([
+    ['approval が無い', { noApproval: true }],
+    ['targetBranch が master', { approvalTargetBranch: 'master' }],
+    ['targetBranch が unknown', { approvalTargetBranch: 'unknown' }],
+    ['approval が APPROVED', { approvalStatus: 'APPROVED' as const }],
+    ['approval が STALE', { approvalStatus: 'STALE' as const }],
+    ['approval が別 Task 所有', { approvalForAnotherTask: true }],
+    ['requestedAction が git_commit 以外', { approvalRequestedAction: 'test' }],
+  ])('%s なら ordinary completion として follow-up を許す', (_label, options) => {
+    const { storage, projectId } = projectWithCompletion(options)
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')?.kind).toBe('follow_up')
+    expect(storage.auditLog.findAll().some(
+      (entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+    )).toBe(false)
+  })
+
+  it('continuation の source Job が別 Task 所有なら awaiting promotion にしない', () => {
+    const { storage, projectId } = projectWithCompletion({ sourceJobForAnotherTask: true })
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')?.kind).not.toBe('not_available')
+    expect(storage.auditLog.findAll().some(
+      (entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+    )).toBe(false)
+  })
+
+  it('qualifying source Job は commitHash が無くても awaiting promotion と扱う', () => {
+    const { storage, projectId } = projectWithCompletion()
+
+    const classified = classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER))
+
+    expect(classified.find((candidate) => candidate.id === 'open-item')).toMatchObject({
+      kind: 'not_available',
+      notAvailableReason: 'awaiting_promotion',
+    })
+  })
+
+  it('done から in_progress に戻した ledger item は既存 planned-only filter で採用候補にならない', () => {
+    const ledger = LEDGER.replace('roadmap:id=open-item state=planned', 'roadmap:id=open-item state=in_progress')
+      .replace('1. [ ] **未着手の項目**', '1. [~] **未着手の項目**')
+
+    expect(readAdoptionCandidates(() => ledger).some((candidate) => candidate.id === 'open-item')).toBe(false)
   })
 
   it('一度も採用されていない項目は従来どおり fresh', () => {
@@ -392,6 +647,439 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     }
 
     expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(0)
+  })
+
+  it('全候補が awaiting promotion なら no_candidate の理由に明示する', async () => {
+    const { storage, projectId } = projectWithCompletion()
+    const propose = vi.fn().mockResolvedValue('{}')
+
+    const result = await runAdoptionStep(storage, projectId, {
+      propose,
+      readLedger: () => LEDGER,
+      adopt: async () => ({ ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' }),
+    })
+
+    expect(result).toEqual({
+      status: 'no_candidate',
+      reason: 'all open roadmap items are awaiting Tier A Candidate promotion',
+    })
+    expect(propose).not.toHaveBeenCalled()
+  })
+
+  it('awaiting-promotion と診断が共存しても audit dedup・rotation・attention を変えない', async () => {
+    const { storage, projectId, sourceJobId } = projectWithCompletion({
+      sourceCommitHash: 'candidate-abc123',
+    })
+    const mixedLedger = [
+      LEDGER,
+      '',
+      '<!-- roadmap:id=fresh-item state=planned -->',
+      '6. [ ] **別の未着手項目** — 診断経路を通す候補',
+    ].join('\n')
+    const attentionBefore = buildSystemState(storage).attention
+
+    const result = await runAdoptionStep(storage, projectId, {
+      propose: async () => 'not json',
+      proposerId: 'test/provider',
+      readLedger: () => mixedLedger,
+    })
+    // 再分類しても awaiting-promotion audit は source completion ごとに1件のまま。
+    classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => mixedLedger))
+
+    expect(result).toMatchObject({ status: 'proposal_unusable', failureCode: 'unparsable_proposal' })
+    expect(findProposalDiagnostics(storage, projectId)).toHaveLength(1)
+    expect(storage.auditLog
+      .findByEntity('roadmap_item', awaitingPromotionAuditKey(projectId, 'open-item', sourceJobId))
+      .filter((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)).toHaveLength(1)
+    // attempt budget と rotationOffset はこの entity の行数だけを見る。
+    expect(storage.auditLog.findByEntity('pl_loop_target', `adopt:${projectId}`)).toHaveLength(0)
+    expect(buildSystemState(storage).attention).toEqual(attentionBefore)
+  })
+
+  it('診断行は follow-up の skip/boost count と attention を変えない', async () => {
+    const { storage, projectId } = projectWithExecutedItem()
+    for (let round = 0; round < FOLLOW_UP_SKIPS_BEFORE_BOOST; round += 1) {
+      storage.auditLog.record({
+        actor: 'api', operation: AUDIT_FOLLOW_UP_SKIPPED, entityType: 'roadmap_item',
+        entityId: followUpAuditKey(projectId, 'open-item'), result: 'success', detail: 'test',
+      })
+    }
+    const attentionBefore = buildSystemState(storage).attention
+    const before = applyFollowUpBoost(
+      storage,
+      projectId,
+      classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER)),
+    )
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => 'not json',
+      readLedger: () => LEDGER,
+    })
+
+    const after = applyFollowUpBoost(
+      storage,
+      projectId,
+      classifyAdoptionCandidates(storage, projectId, readAdoptionCandidates(() => LEDGER)),
+    )
+    expect(countConsecutiveSkips(storage, projectId, 'open-item')).toBe(FOLLOW_UP_SKIPS_BEFORE_BOOST)
+    expect(after.find((candidate) => candidate.id === 'open-item')?.boosted)
+      .toBe(before.find((candidate) => candidate.id === 'open-item')?.boosted)
+    expect(buildSystemState(storage).attention).toEqual(attentionBefore)
+  })
+})
+
+describe('proposal_unusable — adoption proposal diagnostics', () => {
+  it('raw output と bounded な分類材料を専用 failure audit に1件残す', async () => {
+    const { storage, projectId } = seed()
+    const raw = 'roadmap says lane=auto_recovery cause=provider_transient conf=high'
+    const triageBefore = summarizeBlockedTriage(storage.auditLog.findAll())
+
+    const result = await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      proposerId: 'opencode-go/mimo-v2.5',
+      readLedger: () => LEDGER,
+    })
+
+    expect(result).toMatchObject({ status: 'proposal_unusable', failureCode: 'unparsable_proposal' })
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic).toEqual({
+      reason: 'no_json_object_found',
+      proposer: 'opencode-go/mimo-v2.5',
+      promptVersion: adoptionPromptVersion(),
+      candidateCount: 1,
+      followUpCandidateCount: 0,
+      rawLength: raw.length,
+      rawTruncated: false,
+      redactions: 0,
+      raw,
+    })
+    expect(diagnostic?.promptVersion).toMatch(/^[0-9a-f]{12}$/)
+    expect(storage.auditLog.findAll().filter((entry) => entry.operation === 'adoption_proposal_unparsed'))
+      .toEqual([expect.objectContaining({
+        entityType: 'pl_loop_target',
+        entityId: `adopt-diagnostic:${projectId}`,
+        result: 'failure',
+      })])
+    expect(summarizeBlockedTriage(storage.auditLog.findAll())).toEqual(triageBefore)
+  })
+
+  it.each([
+    ['no JSON object', 'plain prose', 'no_json_object_found'],
+    ['empty object is not unterminated', '{}', 'no_json_object_found'],
+    ['unterminated object', '{"roadmapId": "open-item"', 'no_json_object_found: unterminated'],
+    ['generic parse error', '{"roadmapId": sk-NOT-A-REAL-TOKEN}', 'json_parse_error'],
+    ['unexpected end', '```json\n{"roadmapId":\n```', 'json_parse_error: unexpected_end_of_input'],
+    ['non-object JSON', '```json\n[]\n```', 'not_an_object'],
+    [
+      'missing fields',
+      JSON.stringify({ roadmapId: 'open-item', implementationScope: 'x' }),
+      'missing_or_invalid_fields: allowedPaths, acceptanceCriteria',
+    ],
+  ])('reason code: %s', async (_label, raw, expected) => {
+    const { storage, projectId } = seed()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    expect(findProposalDiagnostics(storage, projectId)[0]?.reason).toBe(expected)
+  })
+
+  it('位置が分かる parse error は固定の数値形式で残す', async () => {
+    const { storage, projectId } = seed()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => '{"roadmapId":1,}',
+      readLedger: () => LEDGER,
+    })
+
+    expect(findProposalDiagnostics(storage, projectId)[0]?.reason)
+      .toMatch(/^json_parse_error_at_position: \d+$/)
+  })
+
+  it('raw と proposer を上限で切り、元の長さと切り詰めを残す', async () => {
+    const { storage, projectId } = seed()
+    const raw = 'x'.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 5000)
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      proposerId: 'p'.repeat(PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT + 50),
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.raw).toHaveLength(PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+    expect(diagnostic?.rawTruncated).toBe(true)
+    expect(diagnostic?.proposer).toHaveLength(PROPOSAL_DIAGNOSTIC_PROPOSER_LIMIT)
+  })
+
+  it.each([
+    ['complete PEM', 'before -----BEGIN PRIVATE KEY-----\nvery-secret\n-----END PRIVATE KEY----- after', 'very-secret'],
+    ['unterminated PEM', 'before -----BEGIN OPENSSH PRIVATE KEY-----\nvery-secret', 'very-secret'],
+    ['authorization bearer', 'Authorization: Bearer bearer-secret-123', 'bearer-secret-123'],
+    ['standalone bearer', 'Bearer standalone-secret-123', 'standalone-secret-123'],
+    ['JWT', fake('eyJh', 'bGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature123'), fake('eyJh', 'bGciOiJIUzI1NiJ9')],
+    ['OpenAI prefix', fake('sk-a', 'bcdefghijklmnopqrstuvwxyz'), fake('sk-a', 'bcdefghijklmnopqrstuvwxyz')],
+    ['Anthropic prefix', fake('sk-a', 'nt-abcdefghijklmnopqrstuvwxyz'), fake('sk-a', 'nt-abcdefghijklmnopqrstuvwxyz')],
+    ['GitHub prefix', fake('gith', 'ub_pat_abcdefghijklmnopqrstuvwxyz'), fake('gith', 'ub_pat_abcdefghijklmnopqrstuvwxyz')],
+    ['Slack prefix', fake('xoxb', '-abcdefghijklmnopqrstuvwxyz'), fake('xoxb', '-abcdefghijklmnopqrstuvwxyz')],
+    ['AWS access key', fake('AKIA', 'ABCDEFGHIJKLMNOP'), fake('AKIA', 'ABCDEFGHIJKLMNOP')],
+    ['Google API key', fake('AIza', 'SyAbCdEfGhIjKlMnOpQrStUvWxYz'), fake('AIza', 'SyAbCdEfGhIjKlMnOpQrStUvWxYz')],
+    ['env assignment', 'API_KEY=assignment-secret-value', 'assignment-secret-value'],
+    ['JSON secret value', '{"password": "json-secret-value"}', 'json-secret-value'],
+    ['high entropy', fake('aB3d', 'E5fG7hI9jK1mN3pQ5rS7tU9vW1xY3zA5bC7d'), fake('aB3d', 'E5fG7hI9jK1mN3pQ5rS7tU9vW1xY3zA5bC7d')],
+  ])('redacts %s in persisted diagnostic raw text', async (_label, raw, secret) => {
+    const { storage, projectId } = seed()
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    const storedDetail = storage.auditLog.findAll()
+      .find((entry) => entry.operation === AUDIT_PROPOSAL_UNPARSED)?.detail
+    expect(diagnostic?.raw).not.toContain(secret)
+    expect(storedDetail).not.toContain(secret)
+    expect(diagnostic?.raw).toContain('[REDACTED:')
+    expect(diagnostic?.redactions).toBeGreaterThan(0)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+  })
+
+  it('preserves non-secret JSON/prose structure and reports the replacement count', () => {
+    const safe = '{"roadmapId": "foo", "allowedPaths": ["apps/api"]} prose remains'
+    expect(redactDiagnosticSecrets(safe)).toEqual({ text: safe, redactions: 0 })
+
+    const result = redactDiagnosticSecrets('token=first-secret Authorization: Bearer second-secret')
+    expect(result.text).toBe(
+      'token=[REDACTED:SECRET_VALUE] Authorization: Bearer [REDACTED:BEARER_TOKEN]',
+    )
+    expect(result.redactions).toBe(2)
+  })
+
+  it.each([
+    'Author: kamikaze',
+    'tokenizer: fast',
+    'auth-middleware: update the handler',
+    'auth_middleware: update the handler',
+    'session: expires after 1h',
+    'authentication: required',
+    'token: abc',
+    'session_id: abc123',
+    'auth-service: abc',
+    'AUTH: abc',
+    'https://example.com/auth:8080/x',
+  ])('does not redact ordinary prose or URL text: %s', (safe) => {
+    expect(redactDiagnosticSecrets(safe)).toEqual({ text: safe, redactions: 0 })
+  })
+
+  it.each([
+    ['snake-case colon key', 'access_token: abc123', 'abc123'],
+    ['kebab-case colon key', 'client-secret: abc123', 'abc123'],
+    ['camelCase colon key', 'clientSecret: abc123', 'abc123'],
+    ['bare-word colon key', 'password: hunter2', 'hunter2'],
+    ['passwd colon key', 'passwd: abc123', 'abc123'],
+    ['bare secret colon key', 'secret: abc123', 'abc123'],
+    ['credential colon key', 'credential: abc123', 'abc123'],
+    ['compact API key colon key', 'apikey: abc123', 'abc123'],
+    ['kebab API key colon key', 'api-key: abc123', 'abc123'],
+    ['snake private key colon key', 'private_key: abc123', 'abc123'],
+    ['kebab private key colon key', 'private-key: abc123', 'abc123'],
+    ['refresh token colon key', 'refresh_token: abc123', 'abc123'],
+    ['qualified password colon key', 'DB_PASSWORD: hunter2', 'hunter2'],
+    ['qualified token colon key', 'GITHUB_TOKEN: abc', 'abc'],
+    ['qualified API key colon key', 'OPENCODE_GO_API_KEY: abc', 'abc'],
+    ['qualified access key colon key', 'aws_secret_access_key: abc', 'abc'],
+    ['camelCase token colon key', 'secretToken: abc', 'abc'],
+    ['snake client secret colon key', 'client_secret: abc', 'abc'],
+    ['bare-word equals key', 'password=abc123', 'abc123'],
+    ['auth equals key', 'auth=abc123', 'abc123'],
+    ['segmented auth equals key', 'service_auth_middleware=abc123', 'abc123'],
+    ['segmented auth JSON key', '{"auth-middleware": "abc123"}', 'abc123'],
+  ])('redacts supported assignment form: %s', (_label, raw, secret) => {
+    const result = redactDiagnosticSecrets(raw)
+
+    expect(result.text).not.toContain(secret)
+    expect(result.text).toContain('[REDACTED:SECRET_VALUE]')
+    expect(result.redactions).toBe(1)
+  })
+
+  it.each([
+    'access_token:\nnext-line-value',
+    '{"password":\n"next-line-value"}',
+    'clientSecret: "first-line\nnext-line-value"',
+  ])('does not redact assignment values across line boundaries', (raw) => {
+    expect(redactDiagnosticSecrets(raw)).toEqual({ text: raw, redactions: 0 })
+  })
+
+  it.each([
+    ['OPENCODE_GO_API_KEY=hunter2secret', 'hunter2secret'],
+    ['DB_PASSWORD=hunter2', 'hunter2'],
+    ['GITHUB_TOKEN=abc123', 'abc123'],
+    ['{"access_token": "abc"}', 'abc'],
+    ['{"client_secret": "abc"}', 'abc'],
+    ['{"OPENCODE_GO_API_KEY": "abc"}', 'abc'],
+  ])('redacts identifier-qualified secret key values: %s', (raw, secret) => {
+    const result = redactDiagnosticSecrets(raw)
+
+    expect(result.text).not.toContain(secret)
+    expect(result.text).toContain('[REDACTED:SECRET_VALUE]')
+    expect(result.redactions).toBe(1)
+  })
+
+  it('preserves ordinary proposal fields, long paths, roadmap ids, and git SHAs', () => {
+    const safe = JSON.stringify({
+      roadmapId: 'adoption-proposal-parse-diagnostics-follow-up-item',
+      implementationScope: 'apps/mobile/src/components/ProjectSettingsScreen.tsx',
+      allowedPaths: ['docs/project_memory/decisions/tier_a_self_development_e2e.md'],
+      acceptanceCriteria: ['preserve diagnostics'],
+      rationale: 'respond safely',
+      respondsTo: '0123456789abcdef0123456789abcdef01234567',
+    })
+
+    expect(redactDiagnosticSecrets(safe)).toEqual({ text: safe, redactions: 0 })
+  })
+
+  it('redacts before applying the persisted raw-text cap', async () => {
+    const { storage, projectId } = seed()
+    const secret = `sk-${'a'.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 100)}`
+    const raw = `${secret}\n${'z'.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 100)}`
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.raw.length).toBeLessThanOrEqual(PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+    expect(diagnostic?.raw).not.toContain(secret)
+    expect(diagnostic?.raw).toMatch(/^\[REDACTED:TOKEN_PREFIX\]/)
+    expect(diagnostic?.redactions).toBe(1)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+    expect(diagnostic?.rawTruncated).toBe(true)
+  })
+
+  it('redacts a JWT pulled into the stored cap by a large PEM replacement', async () => {
+    const { storage, projectId } = seed()
+    const pemHeader = '-----BEGIN PRIVATE KEY-----\n'
+    const pemFooter = '\n-----END PRIVATE KEY-----'
+    const pem = `${pemHeader}${'A'.repeat(4500 - pemHeader.length - pemFooter.length)}${pemFooter}`
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123'
+    const raw = `${pem}${'x'.repeat(7989 - pem.length)}\n${jwt}`
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(raw.indexOf(jwt)).toBe(7990)
+    expect(diagnostic?.raw).toContain('[REDACTED:PEM_PRIVATE_KEY]')
+    expect(diagnostic?.raw).toContain('[REDACTED:JWT]')
+    expect(diagnostic?.raw).not.toContain('eyJhbGciOiJIUzI1NiJ9')
+    expect(diagnostic?.raw).not.toContain('eyJzdWIiOiIxMjM0NTY3ODkwIn0')
+    expect(diagnostic?.redactions).toBe(2)
+  })
+
+  it.each([
+    ['alternating identifier characters', 'a_'.repeat(50_000)],
+    ['identifier punctuation', '_'.repeat(100_000)],
+  ])('bounds redaction work and stored raw for %s', async (_label, raw) => {
+    const { storage, projectId } = seed()
+    const directlyRedacted = redactDiagnosticSecrets(raw)
+
+    // 絶対時間ではなく入力長に対する伸び方で判定する（並列実行中の CI でも安定させるため）。
+    // 線形なら 4 倍の入力で約 4 倍、二乗なら約 16 倍になる。最小値を取ってノイズを抑える。
+    const fastest = (input: string): number => {
+      let best = Number.POSITIVE_INFINITY
+      for (let i = 0; i < 3; i += 1) {
+        const startedAt = performance.now()
+        redactDiagnosticSecrets(input)
+        best = Math.min(best, performance.now() - startedAt)
+      }
+      return Math.max(best, 0.5)
+    }
+    const unit = raw.slice(0, 2)
+    const small = fastest(unit.repeat(8_000))
+    const large = fastest(unit.repeat(32_000))
+    expect(large / small).toBeLessThan(10)
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(directlyRedacted).toEqual({ text: raw, redactions: 0 })
+    expect(diagnostic?.raw).toHaveLength(PROPOSAL_DIAGNOSTIC_RAW_LIMIT)
+    expect(diagnostic?.rawLength).toBe(raw.length)
+    expect(diagnostic?.rawTruncated).toBe(true)
+  })
+
+  it('JSON.parse の入力断片入り message を reason に保存しない', async () => {
+    const { storage, projectId } = seed()
+    const secretish = 'sk-NOT-A-REAL-TOKEN-0123456789'
+    const raw = `{ "roadmapId": ${' '.repeat(PROPOSAL_DIAGNOSTIC_RAW_LIMIT + 100)}${secretish} }`
+
+    await runAdoptionStep(storage, projectId, {
+      propose: async () => raw,
+      readLedger: () => LEDGER,
+    })
+
+    const [diagnostic] = findProposalDiagnostics(storage, projectId)
+    expect(diagnostic?.reason).toBe('json_parse_error')
+    expect(diagnostic?.reason).not.toContain(secretish)
+    expect(diagnostic?.reason).not.toContain('sk-')
+    expect(diagnostic?.raw).not.toContain(secretish)
+  })
+
+  it('同じ project・promptVersion は20件で打ち止める', async () => {
+    const { storage, projectId } = seed()
+
+    for (let index = 0; index < PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION + 10; index += 1) {
+      await runAdoptionStep(storage, projectId, {
+        propose: async () => `not json #${index}`,
+        readLedger: () => LEDGER,
+      })
+    }
+
+    expect(findProposalDiagnostics(storage, projectId))
+      .toHaveLength(PROPOSAL_DIAGNOSTIC_MAX_PER_PROMPT_VERSION)
+  })
+
+  it('audit write failure はログだけに留め proposal_unusable を維持する', async () => {
+    const { storage, projectId } = seed()
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const broken = {
+      ...storage,
+      auditLog: {
+        ...storage.auditLog,
+        record: () => { throw new Error('audit storage unavailable') },
+      },
+    } as unknown as IStorage
+
+    const result = await runAdoptionStep(broken, projectId, {
+      propose: async () => 'not json',
+      readLedger: () => LEDGER,
+    })
+
+    expect(result).toMatchObject({ status: 'proposal_unusable', failureCode: 'unparsable_proposal' })
+    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining('audit storage unavailable'))
+    errorLog.mockRestore()
+  })
+
+  it('成功 path と parse 後の unoffered candidate は診断を書かない', async () => {
+    const success = seed()
+    await runAdoptionStep(success.storage, success.projectId, deps())
+    expect(findProposalDiagnostics(success.storage, success.projectId)).toHaveLength(0)
+
+    const unoffered = seed()
+    await runAdoptionStep(unoffered.storage, unoffered.projectId, deps({
+      propose: async () => JSON.stringify({ ...GOOD, roadmapId: 'not-offered' }),
+    }))
+    expect(findProposalDiagnostics(unoffered.storage, unoffered.projectId)).toHaveLength(0)
   })
 })
 

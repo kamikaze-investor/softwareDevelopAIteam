@@ -26,12 +26,18 @@ import type {
 import {
   runJob,
   computeWorkspaceBaseline,
+  buildCleanupManifestFromBaseline,
   revertBlockedJobChanges,
   WorkspaceReconciliationError,
 } from './jobRunner.js'
+import { resolveReviewedImplementJobId } from './reviewRefusalEligibility.js'
 import type { JobRunResult, StructuredReviewContext } from './jobRunner.js'
 import { getCommitHash } from './jobRunner.js'
-import { observeWorkspace } from './workspaceVerification.js'
+import {
+  observeWorkspace,
+  verifyWorkspaceAgainstBaseline,
+  workspaceObservationMatchesBaseline,
+} from './workspaceVerification.js'
 import { isContainmentInfrastructureError } from './execution/runContainedCommand.js'
 import { buildRuntimeTaskPolicy } from './guards/fileChangeGuard.js'
 import { buildWorktreeManifest } from './guards/changeManifest.js'
@@ -150,10 +156,12 @@ export type WorkspaceOwnership =
 /**
  * この blocked 行は「終わった Task に取り残された行」の候補か。
  *
- * `resumeBlockedTask()` は新しい Job を**別行**として作り、旧 `blocked` 行を監査証跡として
- * 残す（`approveAndResumeJob()` は同一行を `blocked -> queued` へ UPDATE するので滞留しない）。
- * そのため resume 経路でだけ「終わった Task に blocked 行が残る」状態が生まれ、
- * その行が workspace 所有権を永久に握り続けていた。
+ * 現行の `resumeBlockedTask()` は新しい Job を別行で作り、同一 transaction で source を
+ * `blocked -> failed` にする。startup reconciliation も canonical な `resume:<source>:<n>` が
+ * 同一 Task にある既存行だけを同じ invariant へ揃える。
+ *
+ * ここで扱うのは、正式な successor proof が無いまま外部完了等で Task だけが終わった旧行である。
+ * その行は推測で書き換えないため、workspace 所有権の fail-closed fallback が引き続き必要になる。
  *
  * **ここは「候補」しか決めない。解放するかどうかは worktree の実観測で決める。**
  * durable な自己申告はどれも「もう dirty が無い」ことの証明にならないため:
@@ -179,8 +187,8 @@ function isStaleBlockedJobOfFinishedTask(task: Task, job: Job): boolean {
  * blocked Job も原則としてここに入るが、`isStaleBlockedJobOfFinishedTask()` に当たる行だけは
  * ここでは確定させず、`resolveWorkspaceOwnership()` が worktree を観測してから決める。
  *
- * 旧 blocked 行そのものには触れない。行を残すのは既存設計で
- * `resumeBlockedGitCommitJob.test.ts` が固定しているため、所有権の述語だけを直す。
+ * canonical resume lineage がある行の終端化は API startup reconciliation の責務であり、
+ * この Worker の述語は proof の無い stale 行そのものには触れない。
  */
 function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
   for (const { task, jobs } of perTask) {
@@ -467,7 +475,12 @@ export async function persistJobResult(
   result: Awaited<ReturnType<typeof runJob>>,
   resultStatus: Job['status'],
   dependencies: JobPersistenceDependencies = {},
+  workspaceBaseline?: Job['workspaceBaseline'],
 ): Promise<void> {
+  // runJob が子プロセスを開始した経路では terminal 時点の fingerprint を返す。
+  // それ以前の fail-closed return（policy/context/検出失敗）は workspace を変更していないため、
+  // claim 時の durable baseline がそのまま end fingerprint になる。
+  const workspaceEndFingerprint = result.workspaceEndFingerprint ?? workspaceBaseline
   const resultUpdate: JobUpdate = {
     status: resultStatus,
     exitCode: result.exitCode,
@@ -479,10 +492,12 @@ export async function persistJobResult(
     commitHash: result.commitHash,
     completedAt: result.completedAt,
     guardResult: result.guardResult,
-    failureMetadata: result.providerFailureKind || result.workspaceState
+    failureMetadata: result.providerFailureKind || result.workspaceState || result.refusal || workspaceEndFingerprint
       ? {
           kind: result.providerFailureKind,
           workspaceState: result.workspaceState,
+          refusal: result.refusal,
+          workspaceEndFingerprint,
         }
       : undefined,
     reviewResult: result.reviewResult,
@@ -706,7 +721,7 @@ export async function processQueuedWork(
   const resultStatus = resolveResultStatus(result)
 
   assertTransition('running', resultStatus)
-  await persistJobResult(job.id, result, resultStatus, dependencies)
+  await persistJobResult(job.id, result, resultStatus, dependencies, job.workspaceBaseline)
   return resultStatus
 }
 
@@ -993,13 +1008,12 @@ export async function pollJobs(): Promise<never> {
  *
  * ## TOCTOU
  *
- * 観測から解放までの間に別 Job が同じ workspace を書き換えないことは、**既存の所有権規則**が
- * 担保する。対象 Job は `blocked` のまま所有権を保持しており、
- * `findWorkspaceOwningTaskId()` がその Task を所有者と判定するため、
- * `fetchQueuedJob()` は他 Task の Job を claim しない。**新しい lock は足していない。**
- * 解放後は所有者が居なくなるので、次の poll から通常どおり claim が再開する。
+ * pending Task の従来形では対象 Job が `blocked` のまま所有権を保持する。blocked Task の
+ * terminal-Job 形では、この報告を同じ poll の queued Job fetch より先に直列実行し、API 側が
+ * transaction 内で project の live Job 不在を再確認する。**新しい lock は足していない。**
+ * 成功後は Task が pending / roadmapActive=false になるので、次の poll から通常どおり進める。
  */
-async function reportAbortCleanupObservations(): Promise<boolean> {
+export async function reportAbortCleanupObservations(): Promise<boolean> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return false
 
@@ -1013,9 +1027,24 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
 
-      const requested = jobs.find((job) => (
-        job.status === 'blocked' && job.failureMetadata?.abortCleanupRequestedAt !== undefined
-      ))
+      // `/api/jobs` は storage と同じ created_at DESC, rowid DESC。terminal-blocked 形では
+      // 最新 Job だけを候補にし、resume 後の古い mark を報告しない。
+      const latestJob = jobs[0]
+      const requested = task.status === 'blocked'
+        ? latestJob
+          && (
+            latestJob.status === 'failed'
+            || latestJob.status === 'success'
+            || (latestJob.status === 'blocked' && latestJob.safeCommand.kind === 'git_commit')
+          )
+          && latestJob.failureMetadata?.abortCleanupRequestedAt !== undefined
+          ? latestJob
+          : undefined
+        : jobs.find((job) => (
+          task.status === 'pending'
+          && job.status === 'blocked'
+          && job.failureMetadata?.abortCleanupRequestedAt !== undefined
+        ))
       if (!requested) continue
 
       const observed = observeWorkspace(requested.safeCommand.workingDir)
@@ -1030,6 +1059,72 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
         return false
       }
 
+      let finalObservation = observed.observation
+      let finalKnownGood = observed.knownGood
+      let cleanupSummary: {
+        changedPathCount: number
+        restoredPathCount: number
+        removedPathCount: number
+      } | undefined
+      const technicalEvidenceId = requested.failureMetadata?.abortTechnicalEvidenceId
+      const manualApprovalRequestId = requested.failureMetadata?.abortApprovalRequestId
+      const technicalCleanup = technicalEvidenceId !== undefined && manualApprovalRequestId === undefined
+      if (technicalCleanup) {
+        const baseline = requested.failureMetadata?.workspaceEndFingerprint
+        const verified = verifyWorkspaceAgainstBaseline(requested.safeCommand.workingDir, baseline)
+        if (
+          !verified.verified
+          || baseline === undefined
+          || !workspaceObservationMatchesBaseline(baseline, observed.observation)
+        ) {
+          await reportAbortCleanupRefusal(requested.id, 'PRE_CLEANUP_BASELINE_MISMATCH')
+          continue
+        }
+        if (baseline.mode === 'dirty') {
+          const cleanup = buildCleanupManifestFromBaseline(baseline)
+          cleanupSummary = {
+            changedPathCount: cleanup.changedPathCount,
+            restoredPathCount: cleanup.restoredPathCount,
+            removedPathCount: cleanup.removedPathCount,
+          }
+          let cleanupWarning: string | undefined
+          try {
+            cleanupWarning = await revertBlockedJobChanges(
+              requested.safeCommand.workingDir,
+              baseline.startCommitHash,
+              cleanup.manifest,
+              [],
+            )
+          } catch {
+            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_EXECUTION_FAILED')
+            continue
+          }
+          if (cleanupWarning !== undefined) {
+            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_INCOMPLETE')
+            continue
+          }
+        } else {
+          cleanupSummary = { changedPathCount: 0, restoredPathCount: 0, removedPathCount: 0 }
+        }
+
+        // cleanup 後の**別観測**。clean + 同一 HEAD + known-good が揃わなければ park を要求しない。
+        const afterCleanup = observeWorkspace(requested.safeCommand.workingDir)
+        if (
+          afterCleanup.observation?.mode !== 'clean'
+          || afterCleanup.observation.startCommitHash !== baseline.startCommitHash
+          || afterCleanup.knownGood.gitOperationMarkers.length > 0
+          || !afterCleanup.knownGood.worktreeClean
+          || !afterCleanup.knownGood.indexClean
+          || !afterCleanup.knownGood.headValid
+          || !afterCleanup.knownGood.blindSpotsAbsent
+        ) {
+          await reportAbortCleanupRefusal(requested.id, 'POST_CLEANUP_NOT_CLEAN_AT_HEAD')
+          continue
+        }
+        finalObservation = afterCleanup.observation
+        finalKnownGood = afterCleanup.knownGood
+      }
+
       console.log(`[Worker] Job ${requested.id} の workspace を観測し、abort cleanup 結果を報告します`)
       try {
         const response = await fetch(
@@ -1041,8 +1136,14 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
             // Worker 側で「安全だ」と判断して送る材料を絞ると、API は
             // 進行中の git 操作や観測に出ない変更を見られなくなる。
             body: JSON.stringify({
-              observation: observed.observation,
-              knownGood: observed.knownGood,
+              observation: finalObservation,
+              knownGood: finalKnownGood,
+              ...(technicalCleanup
+                ? {
+                    preCleanupObservation: observed.observation,
+                    cleanupSummary,
+                  }
+                : {}),
             }),
           },
         )
@@ -1053,7 +1154,7 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
           )
           // 成立しなかった poll では intake を飛ばさない。403（allowlist 漏れ等）や
           // 恒久的な不一致が続いても、Worker 全体は止まらない。
-          return false
+          continue
         }
       } catch (err: unknown) {
         console.warn(`[Worker] abort cleanup 報告エラー: ${formatUnknownError(err)}`)
@@ -1064,6 +1165,28 @@ async function reportAbortCleanupObservations(): Promise<boolean> {
   }
 
   return false
+}
+
+type AbortCleanupRefusalCode =
+  | 'PRE_CLEANUP_BASELINE_MISMATCH'
+  | 'CLEANUP_EXECUTION_FAILED'
+  | 'CLEANUP_INCOMPLETE'
+  | 'POST_CLEANUP_NOT_CLEAN_AT_HEAD'
+
+async function reportAbortCleanupRefusal(
+  jobId: string,
+  refusalCode: AbortCleanupRefusalCode,
+): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/abort-cleanup-result`, {
+      method: 'POST',
+      headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refusalCode }),
+    })
+  } catch (err: unknown) {
+    // refusal の delivery 失敗は黙らせない。request marker は残るので次 poll でも再試行される。
+    console.warn(`[Worker] abort cleanup refusal 報告エラー: ${formatUnknownError(err)}`)
+  }
 }
 
 /**
@@ -1151,11 +1274,14 @@ function buildStructuredReviewContext(
 ): StructuredReviewContext | undefined {
   if (job.aiCliMode !== 'review') return undefined
 
-  const match = job.workflowStepKey
+  const reviewedImplementJobId = resolveReviewedImplementJobId(job, jobs)
+  const directMatch = job.workflowStepKey
     ? /^implement:(.+):review$/.exec(job.workflowStepKey)
     : null
-  const implementJob = match
-    ? jobs.find((candidate) => candidate.id === match[1])
-    : jobs.find((candidate) => candidate.aiCliMode === 'implement' && candidate.status === 'success')
-  return implementJob ? { task, implementJob } : undefined
+  const implementJob = reviewedImplementJobId !== undefined
+    ? jobs.find((candidate) => candidate.id === reviewedImplementJobId)
+    : directMatch
+      ? jobs.find((candidate) => candidate.id === directMatch[1])
+      : jobs.find((candidate) => candidate.aiCliMode === 'implement' && candidate.status === 'success')
+  return implementJob ? { task, implementJob, reviewJobs: jobs } : undefined
 }

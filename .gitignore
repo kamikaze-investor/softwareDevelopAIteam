@@ -63,6 +63,7 @@ data/quota-exhausted.json
 
 # Worker ランタイム生成物（実行ログ・stdout/stderrダンプ）
 apps/worker/data/
+apps/mcp-gateway/data/
 
 # SQLite DB本体・一時承認ディレクトリ（data/README.md等の追跡ファイルは対象外）
 data/*.db
@@ -70,3 +71,5 @@ data/.tmp_approval/
 
 # PL作業で生成する一時QR画像（リポジトリへ入れない）
 expo-qr*.svg
+# Real gateway / tunnel-client EnvironmentFiles must never be committed (templates are *.env.example)
+apps/mcp-gateway/ops/systemd/*.env

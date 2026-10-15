@@ -21,6 +21,8 @@ import {
 } from './executionLoop'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import type { Job, JobRefusalMetadata, ReviewStatus } from '@ai-team/shared'
+import { retryStepKeyFor } from '../designReview/repairPolicy'
 
 /**
  * ここで固定しているのは次の2つである。
@@ -100,6 +102,61 @@ function providerTimeoutJob(
   } as Parameters<IStorage['jobs']['update']>[1])
   storage.tasks.update(taskId, { status: 'blocked' })
   return job.id
+}
+
+function failedPostImplementationReview(
+  storage: IStorage,
+  taskId: string,
+  projectId: string,
+  options: {
+    refusal?: JobRefusalMetadata
+    storedReviewStatus?: ReviewStatus
+  } = {},
+): AttentionItem {
+  const implementation = storage.jobs.create({
+    taskId,
+    projectId,
+    agentRole: 'developer_ai',
+    status: 'success',
+    workflowStepKey: `task:${taskId}:initial-implement`,
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliMode: 'implement',
+    aiCliPrompt: 'Implement the Task Contract.',
+  } as Parameters<IStorage['jobs']['create']>[0])
+  const review = storage.jobs.create({
+    taskId,
+    projectId,
+    agentRole: 'reviewer_ai',
+    status: 'failed',
+    workflowStepKey: `implement:${implementation.id}:review`,
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliMode: 'review',
+    aiCliPrompt: 'Review the implementation.',
+    ...(options.refusal !== undefined
+      ? { failureMetadata: { workspaceState: 'unchanged' as const, refusal: options.refusal } }
+      : {}),
+  } as Parameters<IStorage['jobs']['create']>[0])
+  if (options.storedReviewStatus !== undefined) {
+    storage.reviewResults.create({
+      taskId,
+      jobId: review.id,
+      reviewer: 'reviewer_ai',
+      status: options.storedReviewStatus,
+      summary: 'review returned a decision',
+      findings: [],
+    })
+  }
+  storage.tasks.update(taskId, { status: 'blocked' })
+  return attentionOf(storage, 'job_failed')
+}
+
+const ELIGIBLE_SECRET_SCAN_REFUSAL: JobRefusalMetadata = {
+  kind: 'secret_scan',
+  patternKinds: ['secret assignment'],
+  repairEligible: true,
+  repairEligibilityReason: 'implementation_report_generic_assignment',
 }
 
 /** 終端した task-kind Design Review。`decision` がそのまま `finalDecision` になる。 */
@@ -223,6 +280,62 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(diagnosis.existingRecoveryAvailable).toBe(false)
   })
 
+  it('1c. eligible な structured secret-scan refusal だけを review Technical Resume へ渡す', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId, {
+        refusal: ELIGIBLE_SECRET_SCAN_REFUSAL,
+      }),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('review_execution_failed')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+  })
+
+  it('1d. stored changes_requested がある failed review は Technical Resume しない', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId, {
+        refusal: ELIGIBLE_SECRET_SCAN_REFUSAL,
+        storedReviewStatus: 'changes_requested',
+      }),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('unknown')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
+  it('1e. non-eligible secret-scan refusal は Technical Resume しない', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId, {
+        refusal: {
+          kind: 'secret_scan',
+          patternKinds: ['GITHUB_TOKEN assignment'],
+          repairEligible: false,
+          repairEligibilityReason: 'credential_like_assignment',
+        },
+      }),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('unknown')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
+  it('1f. refusal metadata が無い failed review は Technical Resume しない', () => {
+    const { storage, taskId, projectId } = seed()
+    const diagnosis = triageBlocked(
+      storage,
+      failedPostImplementationReview(storage, taskId, projectId),
+    )
+
+    expect(diagnosis.rootCauseClass).toBe('unknown')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
   it('2. task-kind Design Review の CONFLICT は INDEPENDENT_REMEDIATION', () => {
     const { storage, taskId } = seed()
     completedReview(storage, taskId, 'CONFLICT')
@@ -257,6 +370,16 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(diagnosis.rootCauseClass).toBe('protected_path')
     expect(diagnosis.recommendedLane).toBe('maintenance_lane')
     expect(diagnosis.requiresSafetyBoundaryChange).toBe(false)
+  })
+
+  it('4b. jobRunner.test.ts is not the protected jobRunner.ts maintenance file', () => {
+    const { storage, taskId, projectId } = seed()
+    blockedByGuard(storage, taskId, projectId, ['apps/worker/src/jobRunner.test.ts'])
+
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'job_blocked'))
+
+    expect(diagnosis.rootCauseClass).toBe('safety_or_authority_boundary')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
   })
 
   it('5. 同じ protected でも Safety Boundary 中核なら CEO_ESCALATION（Maintenance へ降ろさない）', () => {
@@ -414,6 +537,7 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     const job = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' }, dryRun: false,
+      workflowStepKey: `review:approval-review-${taskId}:git-commit`,
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(job.id, { stderr: 'blocked: approval required' } as Parameters<IStorage['jobs']['update']>[1])
     const created = storage.approvalRequests.createForJob({
@@ -505,6 +629,117 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(allowed).toEqual(['escalate_to_ceo'])
   })
 
+  it('H6a. generation 3 inherits only the canonical anchor REJECT and remains CEO_ESCALATION', () => {
+    const storage = seedBlockedGitCommitWithApproval('REJECTED')
+    const task = storage.tasks.findByProjectId(storage.projects.findAll()[0].id)[0]
+    const anchor = storage.jobs.findByTaskId(task.id).find((job) => job.safeCommand.kind === 'git_commit')!
+    storage.jobs.update(anchor.id, { status: 'failed' })
+    let latest: Job = anchor
+    for (let generation = 1; generation <= 3; generation += 1) {
+      latest = storage.jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: generation === 3 ? 'blocked' : 'failed',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' },
+        dryRun: false,
+        workflowStepKey: `resume:${anchor.id}:${generation}`,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    }
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId: task.projectId, taskId: task.id,
+      jobId: latest.id, detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    expect(latest.approvalId).toBeUndefined()
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+    expect(diagnosis.recoverable).toBe(false)
+    expect(diagnosis.summary).toContain('却下')
+  })
+
+  it('H6b. keyless and legacy nested git_commit rows keep the legacy AUTO_RECOVERY triage', () => {
+    const { storage, taskId, projectId } = seed()
+    const keyless = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const firstLegacyResume = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: `resume:${keyless.id}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const nestedLegacyResume = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: `resume:${firstLegacyResume.id}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId, taskId, jobId: nestedLegacyResume.id,
+      detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+    expect(diagnosis.recoverable).toBe(true)
+  })
+
+  it('H6c. invalid generation >1 stays on the technical path (not CEO) and records the lineage reason', () => {
+    const { storage, taskId, projectId } = seed()
+    const nonAnchor = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const invalid = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: `resume:${nonAnchor.id}:2`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId, taskId, jobId: invalid.id,
+      detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    // resume 自体は 409 で fail closed（resumeExpiredApproval.test.ts）。triage は CEO へ上げず、
+    // 既存の technical budget に任せる。
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+    expect(diagnosis.recommendedLane).not.toBe('ceo_escalation')
+    expect(diagnosis.evidence).toContainEqual(expect.objectContaining({
+      fact: 'git_commit.resume_lineage', id: invalid.id,
+    }))
+  })
+
+  it('H6d. a directly linked REJECTED approval wins over invalid lineage on any key shape', () => {
+    const { storage, taskId, projectId } = seed()
+    const invalid = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'resume:missing-anchor:2',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const created = storage.approvalRequests.createForJob({
+      taskId, targetBranch: 'master', targetCommit: 'c', targetDiffHash: 'd',
+      riskLevel: 'LOW', requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 1800_000).toISOString(), invalidIf: [],
+    } as never, invalid.id)
+    if (!created.ok) throw new Error('failed to seed approval')
+    storage.approvalRequests.updateStatus(created.approvalRequest.id, 'REJECTED', undefined, true)
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId, taskId, jobId: invalid.id,
+      detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+    expect(diagnosis.summary).toContain('却下')
+  })
+
   it('G. EXPIRED は従来どおり AUTO_RECOVERY のまま（resume_task を残す）', () => {
     const storage = seedBlockedGitCommitWithApproval('EXPIRED')
 
@@ -554,6 +789,7 @@ describe('triageBlocked — Triage は権限を作らない', () => {
     const job = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' }, dryRun: false,
+      workflowStepKey: `review:approval-review-${taskId}:git-commit`,
     } as Parameters<IStorage['jobs']['create']>[0])
     expect(job.id).toBeDefined()
     storage.tasks.update(taskId, { status: 'blocked' })
@@ -668,7 +904,7 @@ describe('triageAllowedActions — 絞ることしかできない', () => {
 // ────────────────────────────────────────────────────────────
 
 describe('runPlTick — 同じ blocker を延々と retry しない', () => {
-  it('10. 同じ blocker は上限回数までしか試されず、その後は retry も診断もしない', async () => {
+  it('10. 同じ technical blocker は上限回数までしか試されず、回数だけで CEO へ上げない', async () => {
     const { storage, taskId, projectId } = seed()
     providerTimeoutJob(storage, taskId, projectId, 'unchanged')
     let diagnosed = 0
@@ -680,14 +916,14 @@ describe('runPlTick — 同じ blocker を延々と retry しない', () => {
       },
     })
 
-    // 上限ぶん回した時点で、Triage が auto_recovery と言っていても Escalation で終端する。
+    // 上限ぶんは既存 action を試すが、failure count を CEO decision へ変換しない。
     for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET; i += 1) {
       resetPlLoopInFlightForTest()
       const tick = await runPlTick(storage, d)
       statuses.push(tick.status)
       expect(tick.triage?.lane).toBe('auto_recovery')
     }
-    expect(statuses).toContain('escalated')
+    expect(statuses).toEqual(Array(PL_MAX_ATTEMPTS_PER_TARGET).fill('acted'))
     // 試行は上限ちょうどで止まる（それ以上 provider を呼ばない）
     expect(diagnosed).toBe(PL_MAX_ATTEMPTS_PER_TARGET)
 
@@ -701,38 +937,76 @@ describe('runPlTick — 同じ blocker を延々と retry しない', () => {
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.status === 'queued')).toBe(false)
   })
 
-  it('15. 既に自動 retry が走っている対象は「待つ」になり、再評価条件が明示される', async () => {
-    const { storage, taskId, projectId } = seed()
-    const failedId = providerTimeoutJob(storage, taskId, projectId, 'unchanged')
-    // API の既存経路が作る1回限りの retry Job（`persistProviderTimeoutFailure()` と同じ形）
-    storage.jobs.create({
-      taskId,
-      projectId,
-      agentRole: 'developer_ai',
-      status: 'queued',
-      workflowStepKey: `retry:${failedId}:1`,
-      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
-      dryRun: false,
-    } as Parameters<IStorage['jobs']['create']>[0])
+  it.each(['queued', 'running', 'blocked'] as const)(
+    '15. 既に自動 retry が %s の対象は「待つ」になり、再評価条件が明示される',
+    async (retryStatus) => {
+      const { storage, taskId, projectId } = seed()
+      const failedId = providerTimeoutJob(storage, taskId, projectId, 'unchanged')
+      // API の既存経路が作る1回限りの retry Job（`persistProviderTimeoutFailure()` と同じ形）
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: retryStatus,
+        workflowStepKey: retryStepKeyFor(failedId),
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
 
-    // queued Job があるので `job_failed` は立たない。分類関数そのものを直接確かめる。
-    const diagnosis = triageBlocked(storage, {
-      kind: 'job_failed',
-      projectId,
-      projectName: 'AIteamOS',
-      taskId,
-      jobId: failedId,
-      detail: 'provider timeout',
-    })
+      // queued Job があるので `job_failed` は立たない。分類関数そのものを直接確かめる。
+      const diagnosis = triageBlocked(storage, {
+        kind: 'job_failed',
+        projectId,
+        projectName: 'AIteamOS',
+        taskId,
+        jobId: failedId,
+        detail: 'provider timeout',
+      })
 
-    expect(diagnosis.recommendedLane).toBe('auto_recovery')
-    // **「様子を見る」で終わらせない。** 何を・いつ・どこまで待ち、次にどこへ行くかが埋まる
-    expect(diagnosis.observation).toBeDefined()
-    expect(diagnosis.observation?.watch).toContain(failedId)
-    expect(diagnosis.observation?.reevaluateOn).toBe('pl_tick')
-    expect(diagnosis.observation?.thresholdMs).toBeGreaterThan(0)
-    expect(diagnosis.observation?.nextLane).toBe('ceo_escalation')
-  })
+      expect(diagnosis.recommendedLane).toBe('auto_recovery')
+      // **「様子を見る」で終わらせない。** 何を・いつ・どこまで待ち、次にどこへ行くかが埋まる
+      expect(diagnosis.observation).toBeDefined()
+      expect(diagnosis.observation?.watch).toContain(failedId)
+      expect(diagnosis.observation?.reevaluateOn).toBe('pl_tick')
+      expect(diagnosis.observation?.thresholdMs).toBeGreaterThan(0)
+      expect(diagnosis.observation?.nextLane).toBe('ceo_escalation')
+      expect(diagnosis.evidence.some((entry) => entry.value.includes(`status=${retryStatus}`))).toBe(true)
+    },
+  )
+
+  it.each(['success', 'failed'] as const)(
+    '終了済み自動 retry（%s）は待機扱いにせず CEO escalation へ送る',
+    (retryStatus) => {
+      const { storage, taskId, projectId } = seed()
+      const failedId = providerTimeoutJob(storage, taskId, projectId, 'unchanged')
+      const retry = storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: retryStatus,
+        workflowStepKey: retryStepKeyFor(failedId),
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      const diagnosis = triageBlocked(storage, {
+        kind: 'job_failed',
+        projectId,
+        projectName: 'AIteamOS',
+        taskId,
+        jobId: failedId,
+        detail: 'provider timeout',
+      })
+
+      expect(diagnosis.rootCauseClass).toBe('provider_transient')
+      expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+      expect(diagnosis.recoverable).toBe(false)
+      expect(diagnosis.existingRecoveryAvailable).toBe(false)
+      expect(diagnosis.observation).toBeUndefined()
+      expect(diagnosis.evidence).toContainEqual({ fact: 'jobs.status', id: retry.id, value: retryStatus })
+      expect(diagnosis.summary).toContain(`status=${retryStatus}`)
+    },
+  )
 })
 
 // ────────────────────────────────────────────────────────────
@@ -940,10 +1214,10 @@ describe('観測 — 既存 audit_log から集計できる', () => {
   it('総数 / 原因別 / route 別 / 成功率 / CEO 率 / UNKNOWN 率 / 再発数を出せる', () => {
     const now = NOW
     const entries = [
-      { id: '1', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_blocked:a', result: 'acted', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
-      { id: '2', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_blocked:b', result: 'blocked', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
-      { id: '3', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_blocked:a', result: 'escalated', detail: 'lane=ceo_escalation cause=provider_transient layer=provider conf=high x', createdAt: now },
-      { id: '4', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'job_failed:c', result: 'escalated', detail: 'lane=ceo_escalation cause=unknown layer=unknown conf=low x', createdAt: now },
+      { id: '1', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_blocked:a', result: 'acted', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
+      { id: '2', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_blocked:b', result: 'blocked', detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now },
+      { id: '3', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_blocked:a', result: 'escalated', detail: 'lane=ceo_escalation cause=provider_transient layer=provider conf=high x', createdAt: now },
+      { id: '4', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target', entityId: 'job_failed:c', result: 'escalated', detail: 'lane=ceo_escalation cause=unknown layer=unknown conf=low x', createdAt: now },
       // 構造化欄を持たない既存の行は無視される（採用サイクル等）
       { id: '5', actor: 'api' as const, operation: 'pl_loop', entityType: 't', entityId: 'adopt:p', result: 'acted', detail: 'adoption=adopted code=- target=x', createdAt: now },
     ]
@@ -960,6 +1234,28 @@ describe('観測 — 既存 audit_log から集計できる', () => {
     expect(summary.unknownRate).toBeCloseTo(0.25)
     // 同じ対象（job_blocked:a）で同じ原因が2回出ている
     expect(summary.recurringRootCauses).toBe(1)
+  })
+
+  it('診断 raw や別種の audit row に含まれる triage token を集計しない', () => {
+    const now = NOW
+    const baseline = [{
+      id: '1', actor: 'api' as const, operation: 'pl_loop', entityType: 'pl_loop_target',
+      entityId: 'job_blocked:a', result: 'acted',
+      detail: 'lane=auto_recovery cause=provider_transient layer=provider conf=high x', createdAt: now,
+    }]
+    const diagnostic = {
+      id: '2', actor: 'api' as const, operation: 'adoption_proposal_unparsed',
+      entityType: 'pl_loop_target', entityId: 'adopt-diagnostic:p', result: 'failure',
+      detail: 'raw=lane=auto_recovery cause=provider_transient conf=high', createdAt: now,
+    }
+    const unrelated = {
+      id: '3', actor: 'api' as const, operation: 'other_operation',
+      entityType: 'other_entity', entityId: 'other:1', result: 'escalated',
+      detail: 'lane=ceo_escalation cause=unknown conf=low', createdAt: now,
+    }
+
+    expect(summarizeBlockedTriage([...baseline, diagnostic, unrelated]))
+      .toEqual(summarizeBlockedTriage(baseline))
   })
 
   it('記録が無ければ率は 0 になり、0 除算にならない', () => {

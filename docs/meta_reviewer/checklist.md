@@ -45,8 +45,29 @@
 
 ## チェック3: 権限境界
 
+CEO へ上げるのは `specs/22_safety_approval_design_principle.md` §14-3 の DA trigger (1)〜(7) に該当する場合だけ。
+HIGH / CRITICAL、production、security、DB migration、recovery、または技術的に難しいという理由だけで CEO 承認を要求しない。
+Technical Safety Decision は、Risk に応じて Safety Evidence を強めて評価する。
+
+DA trigger は以下の7項目である（正本: `specs/22_safety_approval_design_principle.md` §14-3）。
+
+- (1) Goal・事業上の Goal 優先順位・Product / Business 方針・Design Philosophy / Constitution の原則・Policy / Value の**意味の変更**
+- (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed
+- (3) 新しい外部 service・有償依存・公開範囲・公開 route
+- (4) 個人データ・保持・削除方針の変更
+- (5) 不可逆（diff 本文で判定する destructive migration・データ削除）
+- (6) diff 内の secret 検出
+- (7) Review verdict の不一致が未解消
+
+DA (1) はファイル名ではなく差分の意味で判定する。Goal / Product 方針、事業上の優先順位・トレードオフ、Design Philosophy / Policy / Value、authority / Safety boundary の意味を変える差分は A であり、`requiresCeoApproval: true` を返す。一方、調査結果・evidence の記録、進捗・state 更新、既存 Goal 内の technical-fix item 追加、実装順・技術的 priority、機械的な `PROJECT_CURRENT_STATE` sync は B / C である。`tasks/roadmap.md` や `docs/PROJECT_CURRENT_STATE.md` の編集、ファイル名・「roadmap」という語・記録済み CEO instruction・HIGH / Production risk だけでは A にしない。
+
+DA trigger (1)〜(5) に当たっても、欠陥・弱体化・未解消の矛盾が無ければ `blocked` にしない。
+`requiresCeoApproval: true` を付け、人の判断は CODEOWNERS review に委ねる（`prompt.md`「Human Decision Authority のみ」）。
+canonical spec で承認済みの authority boundary を scope どおりに実装する変更は、人の承認を外す方向でも「Cage弱体化」に数えない。
+「Cage弱体化」として `blocked` にするのは、承認済み scope の逸脱・無断の authority 拡大・意図しない bypass / fail-open・実装欠陥がある場合だけ。
+
 ### CLAUDE.md
-- [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない
+- [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない（変更されていれば、欠陥が無い限り `requiresCeoApproval: true`）
 - [ ] Repository Boundary（ai-team-backend / target-project）が維持されている
 - [ ] 絶対禁止リストから項目が削除されていない
 
@@ -107,7 +128,10 @@
 |---|---|---|
 | Cage弱体化 | 1件でも | `blocked` |
 | Sandbox制限解除 | 1件でも | `blocked` |
-| 権限境界変更 | 1件でも | `blocked` + CEO通知 |
+| DA trigger (1)〜(5)（欠陥・弱体化・未解消の矛盾なし） | 1件でも | 技術評価の status + `requiresCeoApproval: true`（CODEOWNERS review が Human Gate） |
+| DA trigger (6) secret / (7) 未解消の不一致 | 1件でも | `blocked` |
+| Human Decision と欠陥の両方 | — | `blocked` + `requiresCeoApproval: true` |
+| recovery / technical changes outside DA(2) | Risk に応じて | Safety Evidence を強化して AI が判定 |
 | 禁止コマンド追加 | 1件でも | `blocked` |
 | 仕様思想逸脱 | 軽微 | `changes_requested` |
 | MVPスコープ外 | あり | `changes_requested` |

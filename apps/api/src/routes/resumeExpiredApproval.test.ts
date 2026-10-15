@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildResumeAiCliPrompt } from './tasks'
 import type { ApprovalRequest, Job, Project, Task } from '@ai-team/shared'
+import { validateGitCommitResumeLineage } from '../gitCommitResumeLineage'
 
 /**
  * 期限切れの `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を
@@ -103,6 +104,7 @@ async function createRejectedGitCommitChain(
   task: Task,
   options: {
     withResumeHop?: boolean
+    resumeGeneration?: number
     alignedEvidenceFor?: string
     /** review Job の実体を review でなくする（H4）。 */
     breakReviewMode?: boolean
@@ -150,19 +152,25 @@ async function createRejectedGitCommitChain(
   } as never)
   await tick()
 
-  // 初回 Human Resume が作ってしまう1段（production の c3849205 と同じ形）。
-  const latestJob = options.withResumeHop === true
-    ? storage.jobs.create({
-      ...base,
-      status: 'blocked',
-      safeCommand: {
-        kind: 'git_commit',
-        workingDir: '/workspace/target',
-        params: { commitMessage: 'rejected work' },
-      },
-      workflowStepKey: `resume:${gitCommitJob.id}:1`,
-    } as never)
-    : gitCommitJob
+  // fixed anchor + generation。withResumeHop は既存 generation 1 fixture の互換 alias。
+  const resumeGeneration = options.resumeGeneration ?? (options.withResumeHop === true ? 1 : 0)
+  let latestJob = gitCommitJob
+  if (resumeGeneration > 0) {
+    storage.jobs.update(gitCommitJob.id, { status: 'failed' })
+    for (let generation = 1; generation <= resumeGeneration; generation += 1) {
+      await tick()
+      latestJob = storage.jobs.create({
+        ...base,
+        status: generation === resumeGeneration ? 'blocked' : 'failed',
+        safeCommand: {
+          kind: 'git_commit',
+          workingDir: '/workspace/target',
+          params: { commitMessage: 'rejected work' },
+        },
+        workflowStepKey: `resume:${gitCommitJob.id}:${generation}`,
+      } as never)
+    }
+  }
 
   const created = storage.approvalRequests.createForJob(
     {
@@ -216,6 +224,7 @@ async function createBlockedGitCommitJobWithWaitingApproval(
       workingDir: '/workspace/target',
       params: { commitMessage: 'Expired approval target task' },
     },
+    workflowStepKey: `review:approval-review-${task.id}:git-commit`,
   })
 
   const created = storage.approvalRequests.createForJob(
@@ -362,6 +371,78 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       expect(resumedJob.safeCommand.kind).toBe('git_commit')
       // 古い approval を引き継がない（再利用・再承認しない）。
       expect(resumedJob.approvalId).toBeUndefined()
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findById(blockedJob.id)?.status).toBe('failed')
+    })
+  })
+
+  it('2a. creates generations 1, 2, and 3 from one fixed canonical anchor without rewriting saved keys', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { job: anchor } = await createBlockedGitCommitJobWithWaitingApproval(task, -1 * HOUR)
+      const anchorKey = anchor.workflowStepKey
+
+      const first = await resumeTask(app, task.id)
+      expect(first.statusCode).toBe(201)
+      const generation1 = first.body as Job
+      expect(generation1.workflowStepKey).toBe(`resume:${anchor.id}:1`)
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.jobs.update(generation1.id, { status: 'blocked' })
+      const second = await resumeTask(app, task.id)
+      expect(second.statusCode).toBe(201)
+      const generation2 = second.body as Job
+      expect(generation2.workflowStepKey).toBe(`resume:${anchor.id}:2`)
+
+      storage.jobs.update(generation2.id, { status: 'blocked' })
+      const third = await resumeTask(app, task.id)
+      expect(third.statusCode).toBe(201)
+      const generation3 = third.body as Job
+      expect(generation3.workflowStepKey).toBe(`resume:${anchor.id}:3`)
+
+      expect(storage.jobs.findById(anchor.id)?.workflowStepKey).toBe(anchorKey)
+      expect(storage.jobs.findById(generation1.id)?.workflowStepKey).toBe(`resume:${anchor.id}:1`)
+      expect(storage.jobs.findById(generation2.id)?.workflowStepKey).toBe(`resume:${anchor.id}:2`)
+      expect(new Set([anchor.id, generation1.id, generation2.id, generation3.id]).size).toBe(4)
+    })
+  })
+
+  it('2b. keeps approval ownership generation-local and makes a HEAD/diff change STALE', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { approval: anchorApproval } = await createBlockedGitCommitJobWithWaitingApproval(task, -1 * HOUR)
+      const first = await resumeTask(app, task.id)
+      const generation1 = first.body as Job
+
+      const gate = await claimAndGateCheck(app, generation1.id, task.id)
+      const generation1Approval = gate.approvalRequest as ApprovalRequest
+      expect(generation1.approvalId).toBeUndefined()
+      expect(generation1Approval.id).not.toBe(anchorApproval.id)
+
+      const approved = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${generation1Approval.id}/status`,
+        payload: { status: 'APPROVED' },
+      })
+      expect(approved.statusCode).toBe(200)
+
+      const stale = await app.inject({
+        method: 'POST',
+        url: `/api/approval-requests/${generation1Approval.id}/consume`,
+        payload: {
+          jobId: generation1.id,
+          currentCommit: 'different-head',
+          currentDiffHash: 'different-diff',
+        },
+      })
+      expect(stale.statusCode).toBe(409)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      expect(storage.approvalRequests.findById(generation1Approval.id)?.status).toBe('STALE')
+      expect(storage.approvalRequests.findById(anchorApproval.id)?.status).toBe('SUPERSEDED')
     })
   })
 
@@ -436,7 +517,7 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
     })
   })
 
-  it('5. the old expired approval is left untouched and does not interfere with the new one', async () => {
+  it('5. the old expired approval is neither approved nor deleted, leaves the actionable set, and does not interfere with the new one', async () => {
     await withApp(async (app) => {
       const project = await createProject()
       const task = await createTask(project.id)
@@ -450,10 +531,12 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
 
-      // 古い行は自動承認も force delete もされない。
+      // 古い行は自動承認も force delete もされない。ただし紐づく Job が resume で終端化されたので、
+      // actionable state（WAITING_FOR_USER / APPROVED）には残らず既存の SUPERSEDED になる
+      // （invariant: 紐づく Job が terminal なら request は actionable に残らない）。
       const still = storage.approvalRequests.findById(expired.id)
       expect(still).toBeDefined()
-      expect(still?.status).toBe('WAITING_FOR_USER')
+      expect(still?.status).toBe('SUPERSEDED')
       expect(still?.id).not.toBe(newApprovalId)
 
       // 新しい承認は古い行に妨げられず APPROVED まで進む。
@@ -465,14 +548,15 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       expect(approveRes.statusCode).toBe(200)
       expect(storage.approvalRequests.findById(newApprovalId)?.status).toBe('APPROVED')
 
-      // 期限切れの古い行は承認できない（EXPIRED として fail-closed）。自動承認されていない証拠。
+      // 古い行は承認できない（SUPERSEDED は WAITING_FOR_USER ではないので 409 で fail-closed）。
+      // 自動承認されておらず、承認操作で actionable に戻りもしない証拠。
       const approveOld = await app.inject({
         method: 'PATCH',
         url: `/api/approval-requests/${expired.id}/status`,
         payload: { status: 'APPROVED' },
       })
       expect(approveOld.statusCode).toBe(409)
-      expect(storage.approvalRequests.findById(expired.id)?.status).toBe('EXPIRED')
+      expect(storage.approvalRequests.findById(expired.id)?.status).toBe('SUPERSEDED')
     })
   })
 
@@ -491,7 +575,8 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
       const jobs = parseBody<Job[]>(jobsRes.body)
       expect(jobs.filter((j) => j.status === 'queued')).toHaveLength(1)
-      expect(jobs.filter((j) => j.status === 'blocked')).toHaveLength(1)
+      expect(jobs.filter((j) => j.status === 'blocked')).toHaveLength(0)
+      expect(jobs.filter((j) => j.status === 'failed')).toHaveLength(1)
 
       const { getStorage } = await import('../storage/index.js')
       expect(getStorage().approvalRequests.findByTaskId(task.id)).toHaveLength(1)
@@ -542,6 +627,7 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       expect(created.aiCliProvider).toBe(implementJob.aiCliProvider)
       // 既存 resume 規約に乗っている（post-implement review が自動生成される条件）。
       expect(created.workflowStepKey).toBe(`resume:${gitCommitJob.id}:1`)
+      expect(storage.jobs.findById(gitCommitJob.id)?.status).toBe('failed')
       expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before + 1)
     })
   })
@@ -557,6 +643,27 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
 
       expect(statusCode).toBe(201)
       const created = body as Job
+      expect(created.aiCliMode).toBe('implement')
+      expect(created.aiCliProvider).toBe(implementJob.aiCliProvider)
+      expect(created.workflowStepKey).toBe(`resume:${latestJob.id}:1`)
+    })
+  })
+
+  it('7b-i-a. a generation 3 REJECT reaches re-implementation through one canonical-anchor dereference', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const instruction = 'generation 3 の却下内容を修正する'
+      const { implementJob, gitCommitJob, latestJob } = await createRejectedGitCommitChain(task, {
+        resumeGeneration: 3,
+        alignedEvidenceFor: instruction,
+      })
+
+      const { statusCode, body } = await resumeTask(app, task.id, instruction)
+
+      expect(statusCode).toBe(201)
+      const created = body as Job
+      expect(latestJob.workflowStepKey).toBe(`resume:${gitCommitJob.id}:3`)
       expect(created.aiCliMode).toBe('implement')
       expect(created.aiCliProvider).toBe(implementJob.aiCliProvider)
       expect(created.workflowStepKey).toBe(`resume:${latestJob.id}:1`)
@@ -739,6 +846,106 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       expect(statusCode).toBe(409)
       expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
       expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
+    })
+  })
+
+  it('7b-iv. gap, foreign Task/Project anchor, and non-git_commit anchor fail closed without creating a Job', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const command = { kind: 'git_commit' as const, workingDir: '/workspace/target' }
+
+      const expectRefusal = async (task: Task, reason: RegExp): Promise<void> => {
+        const before = storage.jobs.findByTaskId(task.id).length
+        const response = await resumeTask(app, task.id)
+        expect(response.statusCode).toBe(409)
+        expect((response.body as { code?: string }).code).toBe('GIT_COMMIT_RESUME_LINEAGE_INVALID')
+        expect((response.body as { error?: string }).error).toMatch(reason)
+        expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
+      }
+
+      const gapTask = await createTask(project.id)
+      const gapAnchor = storage.jobs.create({
+        taskId: gapTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: command, workflowStepKey: `review:gap-review-${gapTask.id}:git-commit`,
+      } as never)
+      storage.jobs.create({
+        taskId: gapTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: command, workflowStepKey: `resume:${gapAnchor.id}:2`,
+      } as never)
+      await expectRefusal(gapTask, /missing generation 1/)
+
+      const foreignOwner = await createTask(project.id)
+      const foreignAnchor = storage.jobs.create({
+        taskId: foreignOwner.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: command, workflowStepKey: `review:foreign-task-review-${foreignOwner.id}:git-commit`,
+      } as never)
+      const foreignTaskTarget = await createTask(project.id)
+      storage.jobs.create({
+        taskId: foreignTaskTarget.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: command, workflowStepKey: `resume:${foreignAnchor.id}:1`,
+      } as never)
+      await expectRefusal(foreignTaskTarget, /different task/)
+
+      const archivedProject = storage.projects.create({
+        name: 'Archived foreign project', goal: 'g', designPhilosophy: [], status: 'archived',
+      })
+      const foreignProjectTask = await createTask(project.id)
+      const foreignProjectAnchor = storage.jobs.create({
+        taskId: foreignProjectTask.id, projectId: archivedProject.id, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: command, workflowStepKey: `review:foreign-project-${foreignProjectTask.id}:git-commit`,
+      } as never)
+      storage.jobs.create({
+        taskId: foreignProjectTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: command, workflowStepKey: `resume:${foreignProjectAnchor.id}:1`,
+      } as never)
+      await expectRefusal(foreignProjectTask, /different project/)
+
+      const nonGitTask = await createTask(project.id)
+      const nonGitAnchor = storage.jobs.create({
+        taskId: nonGitTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        workflowStepKey: `review:non-git-${nonGitTask.id}:git-commit`,
+      } as never)
+      storage.jobs.create({
+        taskId: nonGitTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: command, workflowStepKey: `resume:${nonGitAnchor.id}:2`,
+      } as never)
+      await expectRefusal(nonGitTask, /not a canonical/)
+    })
+  })
+
+  it('7b-v. duplicate generation validation fails closed and does not mutate persisted Jobs', async () => {
+    await withApp(async () => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const anchor = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        workflowStepKey: `review:duplicate-review-${task.id}:git-commit`,
+      } as never)
+      const generation1 = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        workflowStepKey: `resume:${anchor.id}:1`,
+      } as never)
+      const before = storage.jobs.findByTaskId(task.id)
+
+      const validation = validateGitCommitResumeLineage({
+        currentJob: generation1,
+        anchorJob: anchor,
+        taskJobs: [...before, { ...generation1, id: 'duplicate-generation-row' }],
+        requireCurrentIsLatestGeneration: true,
+      })
+
+      expect(validation).toEqual({
+        ok: false,
+        reason: `git_commit resume lineage has duplicate generation 1 for anchor ${anchor.id}`,
+      })
+      expect(storage.jobs.findByTaskId(task.id)).toEqual(before)
     })
   })
 

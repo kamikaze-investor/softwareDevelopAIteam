@@ -1,7 +1,7 @@
 # Project Current State Map
 
 **作成日**: 2026-06-19
-**最終更新**: 2026-08-22
+**最終更新**: 2026-09-29
 **作成者**: Claude Code (CTO)
 **目的**: リポジトリの現状を一枚で把握するためのスナップショット
 
@@ -34,6 +34,40 @@ CEO（人間）
 AI Development Team OS は最終的に VPS 上で常駐稼働し、CEO（人間）はスマホから Web UI（未実装・将来候補）または Mobile app（`apps/mobile`, 実装済み）経由で操作する。ローカルPC起動は開発・検証用の一時形態であり、本番運用形態ではない。詳細な接続関係・後続タスクは正本を参照。
 
 ### Production Baseline（現在Productionで稼働しているcommit）
+
+**Production baseline SHA**: `fcfd732df6e83b2f52f34b5dd59a3ac1d757c42c`（2026-09-28 deploy）
+
+`d2aeaee` から2 commit（#297 `0ce7bff` 共通 Operator Interface・`operator_gateway` credential・
+MCP gateway のコード / #301 `fcfd732` context-pack の読み取り範囲制限）をverified SHA固定
+（`--ff-only`）で反映した。既存手順どおり preflight（running Job 0・in-flight review 0・
+API / Worker pending outbox 0）→ 既存 backup service で DB backup（`pre_deploy_*_d2aeaee.db` へ退避、
+sha 一致・`integrity_check: ok`）→ Worker → API の順で停止 → fast-forward → API 起動・検証 → Worker 起動。
+API / Worker / shared の `package.json` に変更が無いため `pnpm install` は行っていない
+（lockfile の差分は `apps/mcp-gateway` の依存だけで、gateway は Production で起動していない）。
+追加 migration は `operator_requests` table と index の新規作成のみ。**rollbackは不要だった**。
+
+**Production acceptance: PASS**: API / Worker とも active・起動 error 0、`/health` local / 外部とも 200、
+認証なしの `/api/projects`・`/api/state`・`/api/operator/state`・`/api/operator-requests` はすべて 401
+（503・auth 設定 error なし）、`operator_requests` table / index 作成・件数 0、projects / tasks / jobs 等の
+件数は deploy 前と同じで `quick_check: ok`、context-pack の新制約がコードに存在、Worker log の
+auth / 接続 error 0。**credential は変更していない**（split mode 維持、
+`ACTIONS_READONLY_TOKEN_SHA256` / `OPERATOR_GATEWAY_TOKEN_SHA256` は未設定＝外部 MCP 接続は無効）。
+rollback 先は `d2aeaee584abf473fe4783a3ce0c5c64fecf952e`。
+
+**未確認として残るもの（この deploy 分）**: Worker が deploy 後に実 Job を処理すること
+（deploy 時点で claim 可能な queued Job が無かったため。次の自然な Job で確認する。人工 Job は作らない）。
+
+**この baseline 上の追加確認（2026-09-29）**: Mobile Operator Chat（master `6102f6e`、API 側の変更なし）の
+実機 E2E で question → PL 回答、request → Gate 結果（declined）の2経路が Production で成立した。
+API 再起動後の最初の PL provider 呼び出しは OpenCode の 60 秒 timeout で失敗し、同じ process の2回目以降は
+成功した。14日分の provider timeout 16件のうち cold start で説明できるのは1件だけだったため、
+対処は bounded provider recovery（PL 系だけ1回再試行）として別途 PR で行う（`tasks/roadmap.md`
+`operator-chat-mobile` の進捗を参照）。**Production への反映は未実施。**
+
+**記録の欠落**: 下の `dff52cf`（2026-08-19）以降、`d2aeaee` までの Production deploy はこの節に
+記録されていない（運用記録は `docs/project_memory/decisions/` の各 E2E 記録に分散している）。
+
+### 以前のProduction Baseline（2026-08-19 deploy・履歴）
 
 **Production baseline SHA**: `dff52cffffc7cb9045e940b30bfa10e740906466`（2026-08-19 deploy）
 
@@ -195,6 +229,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Task→Job自動生成と連続実行**
 - Project全体の完了判定
 - **Meta Review MVP Hardening
+- **Meta Reviewer structured-output robustness / false-BLOCKED の解消**
 - **Interactive Project Definition / Readiness
 - **Design Review CONFLICT Recovery
 - **Project Pause / Continuation-Control Gap
@@ -211,6 +246,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
 - **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**
 - **Task ContinuationのGET依存解消（高優先度）
+- 2種類の承認の役割整理とMobile導線設計
 - Task/Job一覧・詳細画面（Mobile）
 - Task/Job単位Approval GateのMobile UI連携
 - 追加開発指示（追加Task作成）画面（Mobile）
@@ -220,23 +256,37 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **正式 Roadmap の1項目を実行可能な Task として採用する最小経路
 - **Tier A: 自己開発の最初の安全な切替点
 - **cleanup だけが失敗した containment が Job を quarantine させる
+- **placement 成功済みの実行が ACK / kill ordering race で `placement_failed` へ誤分類される
+- **PL Escalation の配達結果が記録されず、配達済み・未配達・意図的抑制を区別できない**
+- **Escalate 済み attention が1件あるだけで、無関係な Roadmap 採用まで止まる責務を分離して解消する**
+- **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**
+- **cheap AI（説明・質問経路）の latency と timeout 契約**
+- **VPS 運用手順の Current Truth 文書を canonical にする**
 - **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
 - **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
+- **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
+- **Human Resume 後も古い blocked Job が Attention を占有し、後継の新しい失敗が PL に見えない（D2）**
+- **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた**
+- **approved になった Human Resume review から git_commit が作られず、Task が行き止まりになる（D4）**
+- **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）**
+- **期限切れ git_commit Approval の定常 resume が lineage を深くし、CEO REJECT 後の再実装経路を自ら閉じる
+- **Human Resume で回答済みの repair Design Review run が「最新だから」という理由で repair admission を止め続ける（D3）**
 - **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
 - **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**
 - **原則自体の再Review候補を、適用記録から機械的に起こす**
 - **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない**
+- **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた**
+- **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
-- **Meta Reviewer structured-output robustness / false-BLOCKED の解消**（state: planned）
 - **Safety / Authority 変更に対する Independent Review の判定が安定しない**（state: planned）
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
@@ -256,7 +306,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: planned）
 - **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
-- 2種類の承認の役割整理とMobile導線設計（state: planned）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
 - **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Maintenance Lane v0 = Tier B: 自分では触れない変更を、正本を手放さずに管理する**（state: planned）
@@ -276,10 +325,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
 - **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった**（state: planned）
 - **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる**（state: planned）
-- **PL Escalation が未配達でも `escalated` と記録し、以後 PL の全作業が永久に止まる**（state: planned）
-- **PL の `resume_task` が AI CLI implement Job に対して構造的に失敗し、attempt を使い切って CEO へ上がる**（state: planned）
-- **cheap AI（説明・質問経路）の latency と timeout 契約**（state: planned）
-- **VPS 運用手順の Current Truth が古く、文書どおりに再起動すると CEO Escalation が届かなくなる**（state: planned）
+- **VPS runtime / env の文書と tooling を Current Truth に整合させる**（state: planned）
 - **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める**（state: planned）
 - **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）**（state: planned）
 - **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）**（state: planned）
@@ -301,14 +347,15 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`⚠️ CONTROL REPOSITORY（state: planned）
 - **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる**（state: planned）
 - **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
-- **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する**（state: planned）
+- **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**（state: planned）
+- **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する**（state: in_progress）
 - **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）**（state: deferred）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
 - **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
 - **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
-- **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: planned）
+- **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: deferred）
 - **Mobile 内の運用指示窓口（Operator Chat）**（state: planned）
 - **CEO Escalation を AIteamOS Mobile Push で届ける（将来の正式第一通知チャネル）**（state: planned）
 - **PL Console候補の評価（調査のみ・コード変更なし）**（state: deferred）

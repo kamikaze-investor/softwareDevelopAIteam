@@ -42,8 +42,13 @@ import {
   MAX_FOLLOW_UPS_PER_ROADMAP_ITEM,
   isLiveJob,
   occupiesProject,
+  type Job,
 } from '@ai-team/shared'
 import type { IStorage, RoadmapSyncTaskInput, RoadmapSyncPhaseInput } from '../storage/interface'
+import {
+  recomputeDecision,
+  type RawStrategicResult,
+} from '../designReview/designReviewCoordinator'
 import { validateRoadmapTasks, validateRoadmapPhases } from '../storage/roadmapTaskValidation'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
 
@@ -108,6 +113,14 @@ export interface AdoptRoadmapItemInput {
    * 「同一 Task identity の二重実行は禁止」への精緻化である。
    */
   followUp?: boolean
+  /**
+   * CONFLICT で止まった follow-up Task を、同じ identity のまま採用し直すときの Task id。
+   *
+   * caller は `roadmapTaskKey` を指定できない。サーバがこの id から既存 key を導出し、
+   * Project / base ledger id / Job 0件 / pending / 最新 CONFLICT をすべて検証する。
+   * 通常採用と新規 follow-up 採用では指定しないため、従来挙動には影響しない。
+   */
+  recoveryTaskId?: string
 }
 
 export interface AdoptRoadmapItemDeps {
@@ -115,6 +128,154 @@ export interface AdoptRoadmapItemDeps {
   roadmapPath?: string
   readRoadmap?: (roadmapPath: string) => string
   ensureInitialWorkflows?: typeof ensureInitialWorkflowsForActiveTasks
+}
+
+export const AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION = 'roadmap_completion_awaiting_promotion'
+const ROADMAP_ITEM_AUDIT_ENTITY_TYPE = 'roadmap_item'
+const TIER_A_CANDIDATE_BRANCH = 'candidate/self-dev'
+
+export interface AwaitingPromotionCompletion {
+  taskId: string
+  sourceJobId: string
+  candidateCommitHash?: string
+}
+
+/** `roadmap_completion_awaiting_promotion` audit の source completion 単位の identity。 */
+export function awaitingPromotionAuditKey(
+  projectId: string,
+  roadmapId: string,
+  sourceJobId: string,
+): string {
+  return `${projectId}/${roadmapId}/${sourceJobId}`
+}
+
+/**
+ * Safety Evidence path で Candidate commit を証明できる Gate 判定の policy version。
+ * #340（Stage 1）より前の Gate 評価は approval 無しの git_commit を ALLOW しないので対象外。
+ * policy を上げるときは、その policy でこの証明が同じ意味を持つかを確認して更新する。
+ */
+const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSION = 'gate-policy-v2'
+
+/** Human Approval path: source Job の linked approval が Candidate への CONSUMED な git_commit。 */
+function hasConsumedCandidateApproval(storage: IStorage, taskId: string, sourceJob: Job): boolean {
+  const approval = sourceJob.approvalId === undefined
+    ? undefined
+    : storage.approvalRequests.findById(sourceJob.approvalId)
+  return approval !== undefined
+    && approval.taskId === taskId
+    && approval.requestedAction === 'git_commit'
+    && approval.status === 'CONSUMED'
+    && approval.targetBranch === TIER_A_CANDIDATE_BRANCH
+}
+
+/**
+ * Safety Evidence path（#340 Stage 1）: approval が link されていない source Job 自身の Gate Evaluation Evidence に、
+ * `bindResultingCommitForJob()` が bind した `resultingCommit` があり、それが source Job の
+ * commit と exact に一致する。該当する evidence がちょうど 1 件のときだけ成立する。
+ */
+function hasBoundCandidateGateEvidence(storage: IStorage, taskId: string, sourceJob: Job): boolean {
+  // approval が link された Job は Human Approval path だけで判定する（CONSUMED 以外を evidence で補わない）。
+  if (sourceJob.approvalId !== undefined) return false
+  if (sourceJob.commitHash === undefined) return false
+  const bound = storage.gateEvaluations.findByJobId(sourceJob.id).filter((evidence) =>
+    evidence.jobId === sourceJob.id
+    && evidence.taskId === taskId
+    && evidence.decision === 'ALLOW'
+    && evidence.bindingVerification === 'authoritative'
+    && evidence.policyVersion === CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSION
+    && evidence.targetBranch === TIER_A_CANDIDATE_BRANCH
+    && evidence.resultingCommit !== undefined
+    && evidence.resultingCommit === sourceJob.commitHash)
+  return bound.length === 1
+}
+
+/**
+ * Candidate の完了が canonical master への Promotion を待っているかを判定する共有 predicate。
+ *
+ * `commitHash` は Worker / generic PATCH から書ける情報なので根拠にしない。Task completion が作った
+ * continuation の source Job 自体が、同じ Task に属する成功済み `git_commit` であることを要求する。
+ * Tier B の正式な external completion は既存 audit で除外する。
+ *
+ * branch は security boundary ではなく、trusted Worker が gate check 時に
+ * `git rev-parse --abbrev-ref HEAD` で記録する operational signal である。`/consume` が再検証するのは
+ * commit + diff であって branch ではない。それでも exact branch は現在の Tier A Candidate operation を
+ * 識別できる。approval が無い、`unknown`、または不整合なら従来どおり follow-up を許す側へ戻す。
+ * Candidate branch の運用を変える場合は、この predicate も同時に更新しなければならない。
+ *
+ * Candidate commit の証明は次のどちらか（OR）。どちらも成立しなければ従来どおり検出しない:
+ * - Human Approval path: source Job の linked approval が CONSUMED（従来の経路）
+ * - Safety Evidence path（#340 Stage 1）: approval を経ずに commit された source Job 自身の
+ *   Gate Evaluation Evidence に、API が bind した `resultingCommit` がある
+ *
+ * Evidence path は `bindResultingCommitForJob()` が検証済みの事実（commit 実在・parent 一致・
+ * canonical manifest hash 一致）を `resultingCommit` の exact binding として使い、ここで再判定しない。
+ *
+ * 検出した source completion は既存 audit_log へ一度だけ記録する。分類器と authoritative seam の
+ * どちらから呼ばれても、同じ entity id で重複しない。
+ */
+export function checkRoadmapCompletionAwaitingPromotion(
+  storage: IStorage,
+  projectId: string,
+  roadmapId: string,
+  knownLedgerIds: ReadonlySet<string>,
+): AwaitingPromotionCompletion[] {
+  const completions = storage.tasks.findByProjectId(projectId).flatMap((task) => {
+    if (
+      task.status !== 'done'
+      || task.roadmapTaskKey === undefined
+      || getBaseRoadmapId(task.roadmapTaskKey, knownLedgerIds) !== roadmapId
+    ) return []
+
+    const continuation = storage.taskContinuations.findByCompletedTaskId(task.id)
+    if (!continuation || continuation.projectId !== projectId) return []
+
+    const sourceJob = storage.jobs.findById(continuation.sourceJobId)
+    if (
+      !sourceJob
+      || sourceJob.taskId !== task.id
+      || sourceJob.projectId !== projectId
+      || sourceJob.status !== 'success'
+      || sourceJob.safeCommand.kind !== 'git_commit'
+    ) return []
+
+    if (
+      !hasConsumedCandidateApproval(storage, task.id, sourceJob)
+      && !hasBoundCandidateGateEvidence(storage, task.id, sourceJob)
+    ) return []
+
+    const externallyReconciled = storage.auditLog
+      .findByEntity('task', task.id)
+      .some((entry) => entry.operation === 'reconcile_external_completion')
+    if (externallyReconciled) return []
+
+    return [{
+      taskId: task.id,
+      sourceJobId: sourceJob.id,
+      ...(sourceJob.commitHash !== undefined ? { candidateCommitHash: sourceJob.commitHash } : {}),
+    }]
+  })
+
+  for (const completion of completions) {
+    const entityId = awaitingPromotionAuditKey(projectId, roadmapId, completion.sourceJobId)
+    const alreadyRecorded = storage.auditLog
+      .findByEntity(ROADMAP_ITEM_AUDIT_ENTITY_TYPE, entityId)
+      .some((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)
+    if (alreadyRecorded) continue
+
+    storage.auditLog.record({
+      actor: 'api',
+      operation: AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+      entityType: ROADMAP_ITEM_AUDIT_ENTITY_TYPE,
+      entityId,
+      result: 'success',
+      detail: JSON.stringify({
+        taskId: completion.taskId,
+        candidateCommitHash: completion.candidateCommitHash ?? null,
+      }),
+    })
+  }
+
+  return completions
 }
 
 function resolveTargetRoot(): string {
@@ -186,6 +347,20 @@ function checkFollowUpEligibility(
     ok: false,
     failure: { ok: false, code, reason },
   })
+
+  const awaitingPromotion = checkRoadmapCompletionAwaitingPromotion(
+    storage,
+    input.projectId,
+    input.roadmapId,
+    knownLedgerIds,
+  )
+  if (awaitingPromotion.length > 0) {
+    return fail(
+      'FOLLOW_UP_NOT_ELIGIBLE',
+      `roadmap item "${input.roadmapId}" has a Tier A Candidate completion awaiting promotion; `
+        + 'promote and reconcile the roadmap ledger before considering follow-up work',
+    )
+  }
 
   const siblings = projectTasks.filter(
     (task) => task.roadmapTaskKey !== undefined
@@ -389,23 +564,109 @@ export async function adoptRoadmapItem(
 
   // ── Task identity を決める ──────────────────────────────
   // 通常採用では taskKey === input.roadmapId であり、以降の判定は従来と完全に同一に働く。
-  // follow-up のときだけ別 identity を **サーバ側で** 発番する（caller は key を選べない）。
+  // 新規 follow-up は別 identity を **サーバ側で**発番し、CONFLICT recovery は検証済みの
+  // 既存 Task から identity を導出する。どちらも caller は key を選べない。
   const projectTasks = storage.tasks.findByProjectId(input.projectId)
+  const ledgerIds = new Set(items.map((candidate) => candidate.id))
 
   let taskKey = input.roadmapId
-  if (input.followUp === true) {
+  if (input.recoveryTaskId !== undefined) {
+    if (input.followUp === true) {
+      return {
+        ok: false,
+        code: 'SPEC_INVALID',
+        reason: 'recoveryTaskId and followUp cannot be requested together',
+      }
+    }
+
+    const recoveryTask = storage.tasks.findById(input.recoveryTaskId)
+    if (
+      !recoveryTask
+      || recoveryTask.projectId !== input.projectId
+      || !projectTasks.some((task) => task.id === recoveryTask.id)
+      || recoveryTask.roadmapTaskKey === undefined
+      || !isFollowUpTaskKey(recoveryTask.roadmapTaskKey, ledgerIds)
+      || getBaseRoadmapId(recoveryTask.roadmapTaskKey, ledgerIds) !== input.roadmapId
+    ) {
+      return {
+        ok: false,
+        code: 'SPEC_INVALID',
+        reason:
+          `Task ${input.recoveryTaskId} is not an existing follow-up Task for roadmap item`
+          + ` "${input.roadmapId}" in Project ${input.projectId}`,
+      }
+    }
+
+    // recoveryTaskId は通常の follow-up seam を通らないため、ここを final authoritative check とする。
+    // classifier 後に直接この経路を呼んでも、Tier A completion を同じ #N identity で再採用させない。
+    const awaitingPromotion = checkRoadmapCompletionAwaitingPromotion(
+      storage,
+      input.projectId,
+      input.roadmapId,
+      ledgerIds,
+    )
+    if (awaitingPromotion.length > 0) {
+      return {
+        ok: false,
+        code: 'FOLLOW_UP_NOT_ELIGIBLE',
+        reason: `roadmap item "${input.roadmapId}" has a Tier A Candidate completion awaiting promotion; `
+          + 'promote and reconcile the roadmap ledger before recovering follow-up work',
+      }
+    }
+
+    // 同じ identity に Job 履歴があれば、修正版 spec と実行済み変更を混ぜない。
+    if (storage.jobs.findByTaskId(recoveryTask.id).length > 0) {
+      return {
+        ok: false,
+        code: 'ALREADY_EXECUTED',
+        reason: `task identity "${recoveryTask.roadmapTaskKey}" already has an executed Task (${recoveryTask.id})`,
+      }
+    }
+
+    const run = storage.designReviewRuns.findLatestByTaskId(recoveryTask.id)
+    const evidence = storage.designReviewEvidence.findLatestByTaskId(recoveryTask.id)
+    let recoveryDecision: string | undefined
+    try {
+      recoveryDecision = run?.resultJson === undefined
+        ? undefined
+        : recomputeDecision(
+          JSON.parse(run.resultJson) as RawStrategicResult,
+          'task',
+          run.changedFiles,
+        ).decision
+    } catch {
+      recoveryDecision = undefined
+    }
+    if (
+      recoveryTask.status !== 'pending'
+      || run?.reviewKind !== 'task'
+      || run.status !== 'succeeded'
+      || evidence?.designTextHash === run.designTextHash
+      || recoveryDecision !== 'CONFLICT'
+    ) {
+      return {
+        ok: false,
+        code: 'SPEC_INVALID',
+        reason:
+          `Task ${recoveryTask.id} is not the pending, unexecuted follow-up Task`
+          + ' currently stopped by a Design Review CONFLICT',
+      }
+    }
+
+    // identity は caller の入力ではなく、検証済みの既存 Task からだけ取得する。
+    taskKey = recoveryTask.roadmapTaskKey
+  } else if (input.followUp === true) {
     const eligibility = checkFollowUpEligibility(
       storage,
       input,
       projectTasks,
-      new Set(items.map((candidate) => candidate.id)),
+      ledgerIds,
       extractItemDescription(markdown, item),
     )
     if (!eligibility.ok) return eligibility.failure
 
     // 実在の ledger id 集合を渡し、`foo` と `foo#2` が両方 ledger に居るケースを取り違えない
     // （独立レビュー Finding 2）。
-    const ledgerIds = new Set(items.map((candidate) => candidate.id))
     const minted = createFollowUpTaskKey(
       input.roadmapId,
       projectTasks

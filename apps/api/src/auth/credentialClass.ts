@@ -23,7 +23,7 @@
 import type { FastifyRequest } from 'fastify'
 
 /** 認証を通った credential の種別。`apiTokenAuth()` だけが設定する。 */
-export type CredentialClass = 'admin' | 'worker' | 'actions_readonly' | 'legacy'
+export type CredentialClass = 'admin' | 'worker' | 'actions_readonly' | 'operator_gateway' | 'legacy'
 
 /** `req` へ載せるときのキー。`declare module` を足さずに済ませるための最小定義。 */
 const CREDENTIAL_CLASS_KEY = '__aiTeamCredentialClass'

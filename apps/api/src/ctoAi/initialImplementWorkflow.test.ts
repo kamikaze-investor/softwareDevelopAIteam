@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { buildInitialImplementAiCliPrompt, createInitialImplementWorkflow } from './initialImplementWorkflow'
 import type { IStorage } from '../storage/interface'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { abortTask } from '../pl/abortTask'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
 
@@ -25,16 +25,37 @@ function conflictingDeps() {
 }
 
 describe('buildInitialImplementAiCliPrompt', () => {
-  it('appends a Design Contract using allowedPaths focus signals', () => {
+  it('includes the complete Task Contract for an f7c4ff37-shaped Task', () => {
+    const acceptanceCriteria = [
+      'Latency reason is exposed.',
+      'Timeout behavior is documented.',
+      'API response remains compatible.',
+      'Tests cover the timeout path.',
+      'No changes to files outside apps/api/src/aiExplain',
+    ]
     const prompt = buildInitialImplementAiCliPrompt({
       description: 'Implement T.',
-      allowedPaths: ['apps/api/src/storage/sqlite.ts'],
+      allowedPaths: ['apps/api/src/aiExplain'],
+      forbiddenPaths: ['apps/worker/src/guards'],
+      expectedOutputs: ['apps/api/src/aiExplain/timeout.ts'],
+      acceptanceCriteria,
     })
 
     expect(prompt).toContain('Implement T.')
+    expect(prompt).toContain('"allowedPaths": [\n    "apps/api/src/aiExplain"')
+    expect(prompt).toContain('"forbiddenPaths": [\n    "apps/worker/src/guards"')
+    expect(prompt).toContain('"expectedOutputs": [\n    "apps/api/src/aiExplain/timeout.ts"')
+    for (const criterion of acceptanceCriteria) expect(prompt).toContain(criterion)
     expect(prompt).toContain('## Design Contract')
     expect(prompt).toContain('current implementation is evidence, not specification')
-    expect(prompt).toContain('Keep security and data boundaries strict')
+  })
+
+  it('builds a prompt for a legacy Task with no declared paths or acceptance criteria', () => {
+    const prompt = buildInitialImplementAiCliPrompt({ description: 'Legacy task.' })
+
+    expect(prompt).toContain('Legacy task.')
+    expect(prompt).toContain('"acceptanceCriteria": []')
+    expect(prompt).toContain('"allowedPaths": []')
   })
 })
 
@@ -96,6 +117,7 @@ describe('initial implement workflow', () => {
     expect(jobs[0].aiCliPrompt).toContain('Implement T.')
     expect(jobs[0].aiCliPrompt).toContain('## Design Contract')
     expect(jobs[0].aiCliPrompt).toContain('current implementation is evidence, not specification')
+    expect(checkImplementJobDesignReviewEvidence(jobs[0], storage.designReviewEvidence)).toMatchObject({ ok: true })
   })
 
   it('does not create a Job when Design Review is not aligned', async () => {

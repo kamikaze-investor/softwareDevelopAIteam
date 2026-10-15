@@ -755,7 +755,8 @@ describe('Task failure explanation routes', () => {
         aiCliProvider: 'codex',
         aiCliMode: 'implement',
       })
-      expect(storage.jobs.findById(blockedJob.id)?.status).toBe('blocked')
+      // resume handoff は source を successor 作成と同じ transaction で failed へ終端化する。
+      expect(storage.jobs.findById(blockedJob.id)?.status).toBe('failed')
     } finally {
       await app.close()
     }

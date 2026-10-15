@@ -3,11 +3,7 @@ import Fastify, { type FastifyInstance } from 'fastify'
 import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate, type DesignReviewEvidence, type Job, type Project, type Task } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
+import { appendImplementContracts } from '../implementPrompt'
 
 async function buildApp(): Promise<FastifyInstance> {
   const [{ projectRoutes }, { taskRoutes }, { jobRoutes }, { designReviewEvidenceRoutes }, { resetStorage }] = await Promise.all([
@@ -145,14 +141,6 @@ async function createDesignReviewEvidence(
   return parseBody<DesignReviewEvidence>(res.body)
 }
 
-function appendBaseDesignContract(prompt: string): string {
-  const principles = loadEngineeringPrinciples()
-  return `${prompt}\n\n${buildDesignContract({
-    slugs: selectPrincipleSlugs(undefined, principles),
-    principles,
-  })}`
-}
-
 async function createJob(
   app: FastifyInstance,
   task: Task,
@@ -228,6 +216,45 @@ function providerTimeoutFailure(
   }
 }
 
+async function createProducedTimeoutRetry(
+  app: FastifyInstance,
+  task: Task,
+  prompt: string,
+  workflowStepKey?: string,
+): Promise<{ source: Job; retry: Job }> {
+  await createDesignReviewEvidence(app, task, prompt)
+  const { getStorage } = await import('../storage/index.js')
+  const source = getStorage().jobs.create({
+    taskId: task.id,
+    projectId: task.projectId,
+    ...(workflowStepKey === undefined ? {} : { workflowStepKey }),
+    agentRole: 'developer_ai',
+    status: 'running',
+    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    aiCliProvider: 'codex',
+    aiCliPrompt: prompt,
+    aiCliMode: 'implement',
+  })
+
+  const timeout = await app.inject({
+    method: 'PATCH',
+    url: `/api/jobs/${source.id}`,
+    payload: providerTimeoutFailure(),
+  })
+  expect(timeout.statusCode).toBe(200)
+
+  const retry = getStorage().jobs.findByTaskId(task.id).find((job) => job.id !== source.id)
+  if (!retry) throw new Error('Provider timeout retry Job was not created')
+  return { source, retry }
+}
+
+const successfulChangedImplementResult = {
+  status: 'success' as const,
+  exitCode: 0,
+  changedFiles: ['src/retry-result.ts'],
+  guardResult: { permissionAllowed: true, fileChangeAllowed: true },
+}
+
 async function createApprovalRequestWithStatus(
   task: Task,
   status: 'WAITING_FOR_USER' | 'REJECTED',
@@ -289,6 +316,64 @@ beforeEach(() => {
 })
 
 describe('Job API', () => {
+  it('rejects value-bearing Technical Abort refusal text at the HTTP boundary', async () => {
+    await withApp(async (app) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/jobs/missing/abort-cleanup-result',
+        payload: { refusalCode: 'provider returned secret=value' },
+      })
+      expect(response.statusCode).toBe(400)
+    })
+  })
+
+  it('retires and quarantines a refused Technical Abort cleanup marker exactly once', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { status: 'blocked', roadmapActive: true })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const job = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+        failureMetadata: {
+          abortCleanupRequestedAt: '2026-10-08T00:00:00.000Z',
+          abortTechnicalEvidenceId: 'evidence-1',
+          abortTechnicalStateFingerprint: 'fingerprint-1',
+          abortTechnicalRootCauseClass: 'protected_path',
+          abortTechnicalAttentionKind: 'job_failed',
+        },
+      } as Parameters<typeof storage.jobs.create>[0])
+
+      const first = await app.inject({
+        method: 'POST',
+        url: `/api/jobs/${job.id}/abort-cleanup-result`,
+        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED' },
+      })
+      expect(first.statusCode).toBe(409)
+      expect(storage.jobs.findById(job.id)?.failureMetadata).toMatchObject({
+        quarantined: true,
+        quarantineReason: 'technical abort cleanup refused (CLEANUP_EXECUTION_FAILED)',
+      })
+      expect(storage.jobs.findById(job.id)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+      expect(storage.jobs.findById(job.id)?.failureMetadata?.abortTechnicalEvidenceId).toBeUndefined()
+
+      const second = await app.inject({
+        method: 'POST',
+        url: `/api/jobs/${job.id}/abort-cleanup-result`,
+        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED' },
+      })
+      expect(second.statusCode).toBe(409)
+      expect(storage.auditLog.findByEntity('task', task.id).filter(
+        (entry) => entry.operation === 'technical_abort_refused',
+      )).toHaveLength(1)
+    })
+  })
+
   it('GET /api/jobs returns 400 without taskId', async () => {
     await withApp(async (app) => {
       const res = await app.inject({ method: 'GET', url: '/api/jobs' })
@@ -467,12 +552,12 @@ describe('Job API', () => {
     })
   })
 
-  it('persists aiCliProvider/aiCliPrompt/aiCliMode with a base Design Contract across a DB round-trip', async () => {
+  it('persists aiCliProvider/aiCliPrompt/aiCliMode with Task and Design Contracts across a DB round-trip', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
       const task = await createTask(app, project.id)
       const prompt = 'Implement the requested change carefully.'
-      await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt))
+      await createDesignReviewEvidence(app, task, appendImplementContracts(prompt, task))
       const created = await createJob(app, task, {
         aiCliProvider: 'codex',
         aiCliPrompt: prompt,
@@ -487,6 +572,9 @@ describe('Job API', () => {
       const fetched = parseBody<Job>(res.body)
       expect(fetched.aiCliProvider).toBe('codex')
       expect(fetched.aiCliPrompt).toContain('Implement the requested change carefully.')
+      expect(fetched.aiCliPrompt).toContain('[Task Contract]')
+      expect(fetched.aiCliPrompt).toContain('"acceptanceCriteria": []')
+      expect(fetched.aiCliPrompt).toContain('"allowedPaths": []')
       expect(fetched.aiCliPrompt).toContain('## Design Contract')
       expect(fetched.aiCliPrompt).toContain('current implementation is evidence, not specification')
       expect(fetched.aiCliMode).toBe('implement')
@@ -575,7 +663,7 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: implement the approved storage interface change.'
-        const finalPrompt = appendBaseDesignContract(prompt)
+        const finalPrompt = appendImplementContracts(prompt, task)
         await createDesignReviewEvidence(app, task, finalPrompt)
 
         const res = await postImplementJob(app, task, prompt)
@@ -611,7 +699,7 @@ describe('Job API', () => {
           const project = await createProject(app)
           const task = await createTask(app, project.id)
           const prompt = `Design: ${decision.toLowerCase()} result must fail closed.`
-          await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), { decision })
+          await createDesignReviewEvidence(app, task, appendImplementContracts(prompt, task), { decision })
 
           const res = await postImplementJob(app, task, prompt)
 
@@ -626,7 +714,7 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: reviewer unavailable must not pass.'
-        await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), { decision: 'REVIEW_UNAVAILABLE' })
+        await createDesignReviewEvidence(app, task, appendImplementContracts(prompt, task), { decision: 'REVIEW_UNAVAILABLE' })
 
         const res = await postImplementJob(app, task, prompt)
 
@@ -653,7 +741,7 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: critical meta-review change approved independently.'
-        await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), {
+        await createDesignReviewEvidence(app, task, appendImplementContracts(prompt, task), {
           reviewLoad: 'critical',
           decision: 'ALIGNED',
           independentReviewRequired: true,
@@ -671,7 +759,7 @@ describe('Job API', () => {
         const project = await createProject(app)
         const task = await createTask(app, project.id)
         const prompt = 'Design: critical change without independent approval.'
-        await createDesignReviewEvidence(app, task, appendBaseDesignContract(prompt), {
+        await createDesignReviewEvidence(app, task, appendImplementContracts(prompt, task), {
           reviewLoad: 'critical',
           decision: 'ALIGNED',
           independentReviewRequired: true,
@@ -792,6 +880,119 @@ describe('Job API', () => {
       const body = parseBody<OutboxJobResponse>(res.body)
       expect(body.status).toBe('running')
       expect(body.outbox).toBeUndefined()
+    })
+  })
+
+  it('PATCH /api/jobs/:id accepts and persists a value-free workspace END fingerprint', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      const workspaceEndFingerprint = {
+        mode: 'dirty' as const,
+        startCommitHash: '0805249b',
+        entries: [{
+          path: 'src/feature.ts', kind: 'modified' as const, worktreeHash: 'sha256:value-free',
+        }],
+      }
+
+      const running = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: { status: 'running' },
+      })
+      expect(running.statusCode).toBe(200)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: { status: 'success', failureMetadata: { workspaceEndFingerprint } },
+      })
+
+      expect(res.statusCode).toBe(200)
+      const body = parseBody<OutboxJobResponse>(res.body)
+      expect(body.failureMetadata?.workspaceEndFingerprint).toEqual(workspaceEndFingerprint)
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects a workspace END fingerprint without a running-to-terminal transition', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          status: 'running',
+          failureMetadata: {
+            workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('running-to-terminal')
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects a workspace END fingerprint after the Job is terminal', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      await app.inject({
+        method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'running' },
+      })
+      await app.inject({
+        method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'success' },
+      })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          failureMetadata: {
+            workspaceEndFingerprint: { mode: 'clean', startCommitHash: '0805249b' },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('running-to-terminal')
+    })
+  })
+
+  it('PATCH /api/jobs/:id rejects rewriting an existing workspace END fingerprint', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      storage.jobs.update(created.id, {
+        status: 'running',
+        failureMetadata: {
+          workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'original' },
+        },
+      })
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          status: 'failed',
+          failureMetadata: {
+            workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'replacement' },
+          },
+        },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ error: string }>(res.body).error).toContain('write-once')
+      expect(storage.jobs.findById(created.id)?.failureMetadata?.workspaceEndFingerprint)
+        .toEqual({ mode: 'clean', startCommitHash: 'original' })
     })
   })
 
@@ -1701,6 +1902,136 @@ describe('Job API', () => {
     })
   })
 
+  it('creates a review after a produced retry of initial implement succeeds with changes', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(
+        app,
+        task,
+        'Retry the initial implementation.',
+        `task:${task.id}:initial-implement`,
+      )
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      const jobs = getStorage().jobs.findByTaskId(task.id)
+      expect(getStorage().jobs.findById(retry.id)?.status).toBe('success')
+      expect(jobs.find((job) => job.workflowStepKey === `implement:${retry.id}:review`)).toMatchObject({
+        aiCliMode: 'review',
+        status: 'queued',
+      })
+      expect(jobs.some((job) => job.status === 'queued')).toBe(true)
+    })
+  })
+
+  it.each([
+    ['repair', 'repair:review-source:1'],
+    ['resume', 'resume:review-source:1'],
+  ])('creates a review after a produced retry of %s implement succeeds with changes', async (_kind, stepKey) => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(
+        app,
+        task,
+        `Retry the ${_kind} implementation.`,
+        stepKey,
+      )
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      const jobs = getStorage().jobs.findByTaskId(task.id)
+      expect(getStorage().jobs.findById(retry.id)?.status).toBe('success')
+      expect(jobs.find((job) => job.workflowStepKey === `implement:${retry.id}:review`)).toMatchObject({
+        aiCliMode: 'review',
+        status: 'queued',
+      })
+    })
+  })
+
+  it('does not create a review when a produced workflow retry succeeds without changed files', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(
+        app,
+        task,
+        'Retry without changes.',
+        `task:${task.id}:initial-implement`,
+      )
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: { ...successfulChangedImplementResult, changedFiles: [] },
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id).filter((job) => job.aiCliMode === 'review')).toHaveLength(0)
+    })
+  })
+
+  it('does not create a review when a produced retry of a manual implement succeeds with changes', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { retry } = await createProducedTimeoutRetry(app, task, 'Retry a manual implementation.')
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id).filter((job) => job.aiCliMode === 'review')).toHaveLength(0)
+    })
+  })
+
+  it('fails closed without throwing when a retry source does not exist', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { getStorage } = await import('../storage/index.js')
+      const retry = getStorage().jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        workflowStepKey: 'retry:nonexistent:1',
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        aiCliProvider: 'codex',
+        aiCliPrompt: 'Do not resolve this retry source.',
+        aiCliMode: 'implement',
+      })
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${retry.id}`,
+        payload: successfulChangedImplementResult,
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(getStorage().jobs.findById(retry.id)?.status).toBe('success')
+      expect(getStorage().jobs.findByTaskId(task.id).filter((job) => job.aiCliMode === 'review')).toHaveLength(0)
+    })
+  })
+
   it.each(['blocked', 'queued', 'success'] as const)(
     'applies an Outbox provider_timeout result to a %s source Job without retrying and deduplicates its resend',
     async (status) => {
@@ -2144,7 +2475,7 @@ describe('Job API', () => {
       })
       expect(rejectedCreate.statusCode).toBe(400)
 
-      await createDesignReviewEvidence(app, task, appendBaseDesignContract('Manual recovery'))
+      await createDesignReviewEvidence(app, task, appendImplementContracts('Manual recovery', task))
       const manualResponse = await app.inject({
         method: 'POST',
         url: '/api/jobs',

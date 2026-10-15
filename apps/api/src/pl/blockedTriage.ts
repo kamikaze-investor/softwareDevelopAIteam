@@ -43,7 +43,7 @@
  * ## 効果検証可能性（Design Philosophy 8）
  *
  * `formatTriageAuditDetail()` が `lane=` / `cause=` / `layer=` / `conf=` を既存
- * `audit_log.detail` の**先頭**へ構造化して載せ、`summarizeBlockedTriage()` が
+ * `audit_log.detail` の先頭側へ構造化して載せ（`escalated` 行では配達欄 `delivery=` の後ろに続く）、`summarizeBlockedTriage()` が
  * そこから件数・route 別内訳・AUTO_RECOVERY 成功率・CEO escalation 率・UNKNOWN 率・
  * 同一原因の再発数を導く。**新しい metrics backend は作らない**
  * （`adoptionFailure.ts` と同じ形である）。
@@ -61,12 +61,19 @@ import {
   recoveryReleasesProjectSlot,
 } from '../humanRecovery/recoveryAudit'
 import { countRemediationAttempts, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import { findTechnicalResumeImplementation } from './technicalResumePolicy'
 import {
   predictHumanRecoveryDriver,
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { retryStepKeyFor } from '../designReview/repairPolicy'
+import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
+import {
+  classifyGitCommitResumeLineage,
+  parseGitCommitResumeStepKey,
+} from '../gitCommitResumeLineage'
 
 // ────────────────────────────────────────────────────────────
 // 語彙
@@ -101,6 +108,8 @@ export const BLOCKED_ROOT_CAUSE_CLASSES = [
   'design_review_stalled',
   /** attempt を使い切った run。再kickしても claim できない。 */
   'design_review_exhausted',
+  /** successful implement に対する post-implementation review Job 自体が failed。 */
+  'review_execution_failed',
   /** File Change Guard 違反。ただし allowedPaths を直せば通りうる範囲。 */
   'allowed_paths_mismatch',
   /** protected file だが Safety / Authority policy 本体ではない（runtime engine 等）。 */
@@ -217,7 +226,7 @@ export function protectedViolations(fileViolations: readonly string[] | undefine
  * Safety Policy・Gate・Approval・permission・認証・secret は**1つも含まない**。
  */
 const MAINTENANCE_ELIGIBLE_PROTECTED: readonly RegExp[] = Object.freeze([
-  /jobRunner/i,
+  /^apps\/worker\/src\/jobRunner\.ts$/i,
   /^apps\/worker\/src\/index\.ts$/i,
   /^apps\/worker\/src\/aiCli\/adapter\.ts$/i,
   /metaReviewer\/geminiClient/i,
@@ -238,10 +247,8 @@ const SECRET_PATTERNS: readonly RegExp[] = Object.freeze([
 /**
  * Maintenance Lane で扱ってよい protected file か。
  *
- * **secret は何があっても対象外にする。** allowlist の pattern は `/jobRunner/i` のように
- * 語単位で、パス全体を固定していない。そのため `apps/worker/src/jobRunner.key` のような
- * 名前は「maintenance 対象」と「secret」の両方に一致しうる —— secret を先に落とさないと、
- * **秘密ファイルが Maintenance Lane へ流れる**（独立レビュー指摘 2026-09-18）。
+ * **secret は何があっても対象外にする。** allowlist は protected file の正確な repository path
+ * だけを受け付ける。secret 判定も先に行い、Maintenance Lane へ降ろさない。
  */
 function isMaintenanceEligible(file: string): boolean {
   if (isSecret(file)) return false
@@ -340,6 +347,8 @@ interface Facts {
   ceoRejectedGitCommit?: boolean
   /** 却下判定の根拠に使った Approval 行 id（証拠欄に出す）。 */
   rejectedApprovalId?: string
+  /** fixed-anchor generation が壊れており、自動 resume へ倒してはならない。 */
+  gitCommitResumeLineageInvalidReason?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -351,8 +360,8 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     item.taskId !== undefined ? storage.approvalRequests.findActiveByTaskId(item.taskId) : undefined
   // **linked Approval 基準**（`resumeBlockedTask()` と同じ判定）。
   // Task 最新行ではなく、その Job の `approvalId` が指す行だけを根拠にする。
-  const linkedRejection = (() => {
-    if (!job || job.safeCommand.kind !== 'git_commit') return undefined
+  const linkedGitCommit = (() => {
+    if (!job || job.safeCommand.kind !== 'git_commit') return {}
 
     const rejectionOf = (owner: Job, approvalId: string) => {
       const approval = storage.approvalRequests.findById(approvalId)
@@ -363,20 +372,48 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
       return approval.status === 'REJECTED' ? approval : undefined
     }
 
-    if (job.approvalId) return rejectionOf(job, job.approvalId)
+    // A rejection directly linked to this Job is authoritative on every key shape.
+    // Check it before technical lineage classification so corruption cannot hide a human decision.
+    if (job.approvalId) {
+      const directRejection = rejectionOf(job, job.approvalId)
+      if (directRejection !== undefined) return { rejection: directRejection }
+    }
 
-    // **link が無い Job も1ホップだけ辿る。** Gate が既存 REJECTED を再利用して弾いた Job には
+    const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
+    const classification = classifyGitCommitResumeLineage({
+      currentJob: job,
+      referencedJob: parsed === undefined ? undefined : storage.jobs.findById(parsed.anchorJobId),
+      taskJobs,
+      requireCurrentIsLatestGeneration: true,
+    })
+    if (classification.kind === 'invalid_new_scheme') {
+      return { invalidReason: classification.reason }
+    }
+
+    // Preserve the old rule: a directly linked non-REJECTED approval never inherits
+    // a rejection from another row.
+    if (job.approvalId) return {}
+
+    // **link が無い Job は canonical anchor を1回だけ参照する。** Gate が既存 REJECTED を再利用して弾いた Job には
     // `approvalId` が付かない（`ux_jobs_approval_id` が UNIQUE なので結び直しもできない）。
     // 放置すると「却下されていない」と読んで `auto_recovery` を返し、PL が同じ内容を
-    // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1ホップに揃える。
+    // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1参照に揃える。
+    if (classification.kind === 'new_scheme') {
+      const anchor = classification.lineage.anchorJob
+      if (!anchor.approvalId) return {}
+      return { rejection: rejectionOf(anchor, anchor.approvalId) }
+    }
+
+    // Legacy behaviour is intentionally one exact hop, including nested chains.
     const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
-    if (!resumed) return undefined
-    const source = storage.jobs.findById(resumed[1] as string)
-    if (!source || !source.approvalId) return undefined
-    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return undefined
-    if (source.safeCommand.kind !== 'git_commit') return undefined
-    return rejectionOf(source, source.approvalId)
+    if (!resumed) return {}
+    const source = classification.referencedJob
+    if (!source || !source.approvalId) return {}
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return {}
+    if (source.safeCommand.kind !== 'git_commit') return {}
+    return { rejection: rejectionOf(source, source.approvalId) }
   })()
+  const linkedRejection = linkedGitCommit.rejection
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -390,6 +427,9 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     ...(approval !== undefined ? { approvalStatus: approval.status, approvalId: approval.id } : {}),
     ...(linkedRejection !== undefined
       ? { ceoRejectedGitCommit: true, rejectedApprovalId: linkedRejection.id }
+      : {}),
+    ...(linkedGitCommit.invalidReason !== undefined
+      ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
     ...(review !== undefined ? { review } : {}),
     ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
@@ -421,14 +461,15 @@ function base(item: AttentionItem): BlockedDiagnosis {
 }
 
 /**
- * 既存の provider timeout 自動 retry が**既に作られているか**。
+ * 既存の provider timeout 自動 retry Job。
  *
  * API は条件を満たす implement Job の timeout に対して `retry:<jobId>:1` を1回だけ作る
  * （`persistProviderTimeoutFailure()`）。それが既にある状態で PL がさらに retry を提案すると、
- * 同じ失敗を二重に押し進めることになる。ここが `true` なら「待つ」が正しい。
+ * 同じ失敗を二重に押し進めないため、状態まで含めて呼び出し側で判断する。
  */
-function hasAutomaticRetryJob(facts: Facts, jobId: string): boolean {
-  return facts.taskJobs.some((job) => job.workflowStepKey === `retry:${jobId}:1`)
+function findAutomaticRetryJob(facts: Facts, jobId: string): Job | undefined {
+  const stepKey = retryStepKeyFor(jobId)
+  return facts.taskJobs.find((job) => job.workflowStepKey === stepKey)
 }
 
 /** この Task に、いま動かせる Job があるか（あれば resume は要らないし通らない）。 */
@@ -737,6 +778,34 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     }
   }
 
+  // ── 5.5 successful implement に対する post-implementation review の実行失敗 ──────
+  // **lineage だけでは Technical Recovery と判定しない。** failed review には、修復予算を
+  // 使い切った changes_requested / rejected と、credential-like な secret scan refusal も含まれる。
+  // それらを fresh reviewer へ掛け直すのは Decision Authority の迂回になる。
+  // Worker が保存した value-free refusal が「implementation-owned な generic assignment」と
+  // 機械判定した場合だけ、既存 `resumeBlockedTask()` による bounded な review 再実行へ渡す。
+  if (facts.job !== undefined && item.taskId !== undefined) {
+    const implementJob = findTechnicalResumeImplementation(storage, item.taskId, facts.job)
+    if (implementJob !== undefined) {
+      return {
+        ...result,
+        rootCauseClass: 'review_execution_failed',
+        blockingLayer: 'provider',
+        evidence: [
+          { fact: 'review_job.status', id: facts.job.id, value: 'failed' },
+          { fact: 'review_job.workflowStepKey', id: facts.job.id, value: facts.job.workflowStepKey ?? 'none' },
+          { fact: 'implementation_job.status', id: implementJob.id, value: 'success' },
+        ],
+        recoverable: true,
+        existingRecoveryAvailable: true,
+        confidence: 'high',
+        recommendedLane: 'auto_recovery',
+        summary: 'successful implement の post-implementation review 実行が失敗した。'
+          + '既存 resume は同じ Task Contract のまま review を再実行できる。',
+      }
+    }
+  }
+
   // ── 6. provider timeout ───────────────────────────────────────────
   if (facts.job?.failureMetadata?.kind === 'provider_timeout') {
     const workspaceState = facts.job.failureMetadata.workspaceState
@@ -762,27 +831,53 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       }
     }
 
-    // 既存の1回限り自動 retry が既に作られているなら、**待つ**のが正しい。
-    if (hasAutomaticRetryJob(facts, facts.job.id)) {
+    const automaticRetry = findAutomaticRetryJob(facts, facts.job.id)
+    // queued / running / blocked の retry があるなら、**待つ**のが正しい。
+    if (
+      automaticRetry !== undefined
+      && (automaticRetry.status === 'blocked' || !isTerminalJobStatus(automaticRetry.status))
+    ) {
       return {
         ...result,
         rootCauseClass: 'provider_transient',
         blockingLayer: 'provider',
         evidence: [
           ...providerEvidence,
-          { fact: 'jobs.workflowStepKey', value: `retry:${facts.job.id}:1 exists` },
+          {
+            fact: 'jobs.workflowStepKey',
+            id: automaticRetry.id,
+            value: `${retryStepKeyFor(facts.job.id)} status=${automaticRetry.status}`,
+          },
         ],
         recoverable: true,
         existingRecoveryAvailable: true,
         confidence: 'high',
         recommendedLane: 'auto_recovery',
         observation: {
-          watch: `job:${facts.job.id} -> retry:${facts.job.id}:1`,
+          watch: `job:${facts.job.id} -> ${retryStepKeyFor(facts.job.id)}`,
           reevaluateOn: 'pl_tick',
           thresholdMs: DEFAULT_STALL_HINT_MS,
           nextLane: 'ceo_escalation',
         },
         summary: '既存の1回限り自動 retry が既に作られている。二重に押し進めず、その結果を待つ。',
+      }
+    }
+
+    if (automaticRetry !== undefined && isTerminalJobStatus(automaticRetry.status)) {
+      return {
+        ...result,
+        rootCauseClass: 'provider_transient',
+        blockingLayer: 'provider',
+        evidence: [
+          ...providerEvidence,
+          { fact: 'jobs.status', id: automaticRetry.id, value: automaticRetry.status },
+        ],
+        recoverable: false,
+        existingRecoveryAvailable: false,
+        confidence: 'high',
+        recommendedLane: 'ceo_escalation',
+        summary: `自動 retry は既に終了している（status=${automaticRetry.status}）。`
+          + '待機中の処理はなく、元 Job を再 retry すると同じ処理を二重に進めるため、自動復旧は行わない。',
       }
     }
 
@@ -832,6 +927,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           value: ceoRejected ? 'REJECTED' : facts.approvalStatus ?? 'none',
         },
         { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        // 新方式 lineage の破損（重複・欠番・不正 anchor）は Decision Authority の問題ではない。
+        // CEO へは回さず、既存の技術復旧経路に任せる: resume は 409 で何も作らず理由を返し、
+        // 試行は technical budget で止まり `technical_exhausted` として見える（specs/22 §1-3）。
+        ...(facts.gitCommitResumeLineageInvalidReason !== undefined
+          ? [{
+            fact: 'git_commit.resume_lineage',
+            id: facts.job.id,
+            value: facts.gitCommitResumeLineageInvalidReason,
+          }]
+          : []),
       ],
       // **却下は「復旧できない」ではなく「AI が勝手に復旧してはいけない」。**
       // 経路自体は存在するので `existingRecoveryAvailable` は true のままにし、
@@ -956,7 +1061,7 @@ function ceoDecisionAndOptions(
   item: AttentionItem,
 ): { decision: string; options: string[] } {
   // **Job 0 件の blocked は、どの原因であってもまず `pending` へ戻すのが先。**
-  // `abortTask()` も `syncRoadmapTasks()` も `status === 'pending'` を要求するので、
+  // この Job 0 件形では `abortTask()` も `syncRoadmapTasks()` も `status === 'pending'` を要求するので、
   // 原因が CONFLICT と特定できなかった（`rootCauseClass='unknown'`）場合に汎用の選択肢へ
   // 落ちると、**park を勧めておきながら `TASK_NOT_PARKABLE` で弾かれる**
   // （独立レビュー round 5 指摘）。分岐の鍵は原因ではなく**どの attention か**である。
@@ -1041,8 +1146,9 @@ function ceoDecisionAndOptions(
     // したがって「もう一度 Remediation へ」は選択肢にならない。まず再投入が要る。
     case 'design_review_conflict':
       // **どの選択肢も、まず `pending` へ戻すことが前提になる。**
-      // `syncRoadmapTasks()`（採用し直し）も `abortTask()`（park）も `status === 'pending'` を
-      // 要求するため、blocked のままではそれぞれ `SYNC_FAILED` / `TASK_NOT_PARKABLE` で弾かれる。
+      // この Job 0 件形では `syncRoadmapTasks()`（採用し直し）も `abortTask()`（park）も
+      // `status === 'pending'` を要求するため、blocked のままではそれぞれ
+      // `SYNC_FAILED` / `TASK_NOT_PARKABLE` で弾かれる。
       // 順序を書かないと**どれも実行できない選択肢**を CEO へ渡すことになる
       // （独立レビュー指摘・2026-09-21）。
       return {
@@ -1158,7 +1264,7 @@ export function buildTriageEscalationBody(input: TriageEscalationInput): string 
 // 観測（既存 audit_log に相乗りする）
 // ────────────────────────────────────────────────────────────
 
-/** `audit_log.detail` の先頭に置く構造化欄。後ろの散文とは役割が違う。 */
+/** `audit_log.detail` に置く構造化欄（`escalated` 行では配達欄 `delivery=` の後ろ）。後ろの散文とは役割が違う。読み手は `\blane=` 等で位置に依らず読む。 */
 export function formatTriageAuditDetail(diagnosis: BlockedDiagnosis): string {
   return (
     `lane=${diagnosis.recommendedLane} cause=${diagnosis.rootCauseClass} `
@@ -1228,6 +1334,9 @@ export function summarizeBlockedTriage(entries: readonly AuditLogEntry[]): Block
   let recurringRootCauses = 0
 
   for (const entry of entries) {
+    // executionLoop.record() is the only persisted triage writer. Other audit details may
+    // contain echoed roadmap text with the same lane/cause/conf tokens.
+    if (entry.operation !== 'pl_loop' || entry.entityType !== 'pl_loop_target') continue
     const parsed = parseTriageAuditDetail(entry.detail)
     if (parsed === undefined) continue
 

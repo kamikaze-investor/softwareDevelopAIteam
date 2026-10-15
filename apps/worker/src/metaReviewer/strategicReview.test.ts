@@ -21,6 +21,7 @@ vi.mock('./runner.js', () => ({
     relatedSpecs: [],
   })),
   buildMetaReviewPrompt: vi.fn(() => 'legacy meta review prompt'),
+  providedCanonicalPrincipleIds: vi.fn(() => ['specs/00 §3.14']),
   parseMetaReviewResult: vi.fn(() => ({
     id: 'meta-review-task-test',
     taskId: 'task-test',
@@ -366,6 +367,60 @@ describe('runStrategicMetaReview', () => {
       expect(outcome.verdict).toBe('changes_requested')
       expect(outcome.summary).toBe('please address X')
     })
+
+    it('uses the Task Contract as post-diff purpose context instead of only the title', async () => {
+      const run = vi.fn().mockResolvedValue({
+        blocked: false,
+        exitCode: 0,
+        stdout: 'review output',
+        stderr: '',
+        parsedOutput: { verdict: 'approved', summary: 'ok', issues: [], confidence: 0.9 },
+      })
+      mockCreateAiCliAdapter.mockReturnValue({ run } as unknown as ReturnType<typeof createAiCliAdapter>)
+
+      await runIndependentReview({
+        subjectId: 'task-contract',
+        taskTitle: 'Canonical delivery',
+        changedFiles: ['apps/api/src/pl/recovery.ts'],
+        gitDiff: '+ implementation',
+        workingDir: repoRoot,
+        materialKind: 'diff',
+        taskContract: {
+          acceptanceCriteria: ['Decision Authority reaches the reviewer'],
+          allowedPaths: ['apps/api/src/pl/'],
+        },
+      })
+
+      const prompt = (run.mock.calls[0]![0] as { prompt: string }).prompt
+      expect(prompt).toContain('[Task Contract]')
+      expect(prompt).toContain('Decision Authority reaches the reviewer')
+      expect(prompt).toContain('apps/api/src/pl/')
+      expect(prompt).toContain('## 1-2. Human Decision Authority')
+    })
+
+    it('keeps the previous purpose when no structured Task Contract is provided', async () => {
+      const run = vi.fn().mockResolvedValue({
+        blocked: false,
+        exitCode: 0,
+        stdout: 'review output',
+        stderr: '',
+        parsedOutput: { verdict: 'approved', summary: 'ok', issues: [], confidence: 0.9 },
+      })
+      mockCreateAiCliAdapter.mockReturnValue({ run } as unknown as ReturnType<typeof createAiCliAdapter>)
+
+      await runIndependentReview({
+        subjectId: 'task-without-contract',
+        taskTitle: 'Existing production purpose',
+        changedFiles: ['apps/worker/src/jobRunner.ts'],
+        gitDiff: '+ implementation',
+        workingDir: repoRoot,
+        materialKind: 'diff',
+      })
+
+      const prompt = (run.mock.calls[0]![0] as { prompt: string }).prompt
+      expect(prompt).toContain('Existing production purpose')
+      expect(prompt).not.toContain('[Task Contract]')
+    })
   })
 
   it('requires CEO approval for CRITICAL CONFLICT', async () => {
@@ -445,6 +500,82 @@ describe('runStrategicMetaReview', () => {
     expect(prompt).toContain('## Proposed Design (pre-implementation, not yet a diff)')
     expect(prompt).toContain('```text\nDesign: reuse the current Meta Reviewer router')
     expect(prompt).not.toContain('## Git Diff or Design Text\n\n```diff\nDesign:')
+  })
+
+  it('adds the Semantic Integrity checklist to a focus whose principles select canonical-domain-meaning', async () => {
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
+
+    await runStrategicMetaReview(highStorageInput())
+
+    const prompts = mockReviewWithProviderFallback.mock.calls.map(([prompt]) => prompt)
+    const dataPrompt = prompts.find((prompt) => prompt.includes('Focus only on data_state_integrity'))
+    const strategicPrompt = prompts.find((prompt) => prompt.includes('Focus only on strategic_alignment'))
+
+    // 選択は原則 routing（focus → 原則）が決め、checklist はその原則の guidance として載る。
+    expect(dataPrompt).toContain('- canonical-domain-meaning: Decide domain facts through their canonical owner')
+    expect(dataPrompt).toContain('## docs/meta_reviewer/checklists/semantic_integrity.md')
+    expect(dataPrompt).toContain('[semantic_reinference]')
+    // focus 自身の checklist は従来どおり残る。
+    expect(dataPrompt).toContain('## docs/meta_reviewer/checklists/storage.md')
+    // 原則を選ばない focus には載せない。
+    expect(strategicPrompt).not.toContain('semantic_integrity.md')
+  })
+
+  it('names a missing principle checklist in the prompt instead of silently dropping it, without failing the focus', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: true,
+      controlHasChecklists: true,
+    })
+    mockReviewWithProviderFallback
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'strategic aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'data aligned'), providerUsed: 'gemini' })
+      .mockResolvedValueOnce({ raw: jsonDecision('ALIGNED', 'integration aligned'), providerUsed: 'gemini' })
+
+    try {
+      const result = await runStrategicMetaReview({
+        ...highStorageInput(),
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      const dataPrompt = mockReviewWithProviderFallback.mock.calls
+        .map(([prompt]) => prompt)
+        .find((prompt) => prompt.includes('Focus only on data_state_integrity'))
+      expect(dataPrompt).toContain('## docs/meta_reviewer/checklists/semantic_integrity.md\n\n(unavailable: file not found.')
+      expect(dataPrompt).toContain('# Storage checklist')
+      expect(result.finalDecision).toBe('ALIGNED')
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let a principle checklist stand in for a missing focus checklist', async () => {
+    const { targetRoot, controlRoot } = await createTwoRootSetup({
+      targetHasProjectMemory: true,
+      controlHasConstitution: true,
+      controlHasChecklists: false,
+    })
+    await writeDeep(controlRoot, 'docs/meta_reviewer/checklists/semantic_integrity.md', '# Semantic Integrity checklist')
+
+    try {
+      const result = await runStrategicMetaReview({
+        ...highStorageInput(),
+        workingDir: targetRoot,
+        controlContextDir: controlRoot,
+      })
+
+      const focusResult = result.focusedReviewResults.find((f) => f.focus === 'data_state_integrity')
+      expect(focusResult?.summary).toContain('Checklist context is missing')
+      expect(result.finalDecision).toBe('REVIEW_UNAVAILABLE')
+    } finally {
+      await rm(targetRoot, { recursive: true, force: true })
+      await rm(controlRoot, { recursive: true, force: true })
+    }
   })
 
   it('fails closed without calling Gemini when non-strategic checklist context is missing', async () => {

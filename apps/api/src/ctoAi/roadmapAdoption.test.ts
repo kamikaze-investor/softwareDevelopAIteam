@@ -1,7 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { adoptRoadmapItem, buildAdoptedDescription, extractItemDescription } from './roadmapAdoption'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { buildInitialImplementAiCliPrompt } from './initialImplementWorkflow'
+import {
+  adoptRoadmapItem,
+  AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION,
+  awaitingPromotionAuditKey,
+  buildAdoptedDescription,
+  checkRoadmapCompletionAwaitingPromotion,
+  extractItemDescription,
+} from './roadmapAdoption'
 
 const LEDGER = [
   '# Roadmap',
@@ -40,6 +49,49 @@ function makeStorage(): { storage: IStorage; projectId: string } {
 const SPEC = {
   allowedPaths: ['apps/worker/scripts/roadmap'],
   acceptanceCriteria: ['roadmap:check が通る'],
+}
+
+const CONFLICT_RESULT_JSON = JSON.stringify({
+  focusedReviewResults: [
+    { focus: 'scope_simplicity', decision: 'CONFLICT', summary: 'scope conflict' },
+  ],
+  finalDecision: 'CONFLICT',
+})
+
+function createConflictedFollowUp(
+  storage: IStorage,
+  projectId: string,
+  input: { roadmapTaskKey: string; title?: string },
+): string {
+  const task = storage.tasks.create({
+    projectId,
+    title: input.title ?? 'CONFLICT した follow-up',
+    description: buildAdoptedDescription('ledger body', 'old scope'),
+    status: 'pending',
+    assignee: 'developer_ai',
+    dependencies: [],
+    allowedPaths: SPEC.allowedPaths,
+    acceptanceCriteria: SPEC.acceptanceCriteria,
+    roadmapTaskKey: input.roadmapTaskKey,
+    phase: 1,
+    roadmapActive: true,
+  } as Parameters<IStorage['tasks']['create']>[0])
+  const designText = buildInitialImplementAiCliPrompt(task)
+  const run = storage.designReviewRuns.create({
+    taskId: task.id,
+    taskTitle: task.title,
+    designText,
+    designTextHash: computeDesignTextHash(designText),
+    changedFiles: [],
+  })
+  const claimed = storage.designReviewRuns.claim(run.id, 3)
+  storage.designReviewRuns.complete(
+    run.id,
+    claimed.claimToken as string,
+    'succeeded',
+    CONFLICT_RESULT_JSON,
+  )
+  return task.id
 }
 
 function deps(ensure = vi.fn().mockResolvedValue([])) {
@@ -116,6 +168,118 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
     storage.tasks.update(first.taskId, { status: 'done' })
     return { storage, projectId, taskId: first.taskId }
   }
+
+  async function withCandidateCompletion(options: {
+    externallyReconciled?: boolean
+    targetBranch?: string
+  } = {}): Promise<{
+    storage: IStorage
+    projectId: string
+    taskId: string
+    sourceJobId: string
+  }> {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+
+    const sourceJob = storage.jobs.create({
+      taskId: first.taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'candidate result' },
+      commitHash: 'candidate-commit',
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(sourceJob.id, { commitHash: 'candidate-commit' })
+    const approval = storage.approvalRequests.createForJob({
+      taskId: first.taskId,
+      targetBranch: options.targetBranch ?? 'candidate/self-dev',
+      targetCommit: 'candidate-parent',
+      targetDiffHash: 'candidate-diff',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      changedFiles: ['apps/api/src/ctoAi/roadmapAdoption.ts'],
+      triggeredRules: [],
+      status: 'CONSUMED',
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      invalidIf: ['commit changes', 'diff changes'],
+    }, sourceJob.id)
+    if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
+    storage.tasks.update(first.taskId, { status: 'done' })
+    storage.taskContinuations.create({
+      sourceJobId: sourceJob.id,
+      projectId,
+      completedTaskId: first.taskId,
+      status: 'completed',
+    })
+    if (options.externallyReconciled === true) {
+      storage.auditLog.record({
+        actor: 'api', operation: 'reconcile_external_completion', entityType: 'task',
+        entityId: first.taskId, result: 'done', detail: 'Tier B completion',
+      })
+    }
+    return { storage, projectId, taskId: first.taskId, sourceJobId: sourceJob.id }
+  }
+
+  it('Candidate completion awaiting promotion は seam でも拒否し、#2 を作らず audit を重複させない', async () => {
+    const { storage, projectId, sourceJobId } = await withCandidateCompletion()
+
+    const firstAttempt = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+    const repeatedAttempt = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(firstAttempt).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    expect(repeatedAttempt).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    expect(storage.tasks.findByProjectId(projectId).some(
+      (task) => task.roadmapTaskKey === 'first-item#2',
+    )).toBe(false)
+    const audits = storage.auditLog
+      .findByEntity('roadmap_item', awaitingPromotionAuditKey(projectId, 'first-item', sourceJobId))
+      .filter((entry) => entry.operation === AUDIT_ROADMAP_COMPLETION_AWAITING_PROMOTION)
+    expect(audits).toHaveLength(1)
+  })
+
+  it('Tier B reconcile completion は seam で awaiting promotion として拒否しない', async () => {
+    const { storage, projectId } = await withCandidateCompletion({ externallyReconciled: true })
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: true, roadmapTaskKey: 'first-item#2' })
+  })
+
+  it('Tier A completion は recoveryTaskId の final authoritative check でも再採用を拒否する', async () => {
+    const { storage, projectId } = await withCandidateCompletion()
+    const recoveryTaskId = createConflictedFollowUp(storage, projectId, { roadmapTaskKey: 'first-item#2' })
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SCOPE_B,
+      recoveryTaskId,
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+    expect(storage.tasks.findById(recoveryTaskId)?.roadmapTaskKey).toBe('first-item#2')
+    expect(storage.tasks.findByProjectId(projectId).some(
+      (task) => task.roadmapTaskKey === 'first-item#3',
+    )).toBe(false)
+  })
+
+  it('master 上の ordinary git_commit completion は従来どおり follow-up できる', async () => {
+    const { storage, projectId } = await withCandidateCompletion({ targetBranch: 'master' })
+
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+
+    expect(result).toMatchObject({ ok: true, roadmapTaskKey: 'first-item#2' })
+  })
 
   it('初回 Task の後に #2 を作る', async () => {
     const { storage, projectId } = await withExecutedInitialTask()
@@ -811,6 +975,68 @@ describe('adoptRoadmapItem — 重複実行の防止', () => {
   })
 })
 
+describe('adoptRoadmapItem — CONFLICT follow-up の同一 identity 再採用', () => {
+  it('存在しない recovery Task id から新しい identity を作らない', async () => {
+    const { storage, projectId } = makeStorage()
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SPEC,
+      implementationScope: 'revised scope',
+      recoveryTaskId: 'caller-chosen-new-identity',
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'SPEC_INVALID' })
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(0)
+  })
+
+  it('同じ follow-up identity に Job があれば ALREADY_EXECUTED で拒否する', async () => {
+    const { storage, projectId } = makeStorage()
+    const taskId = createConflictedFollowUp(storage, projectId, { roadmapTaskKey: 'first-item#2' })
+    storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    })
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SPEC,
+      implementationScope: 'revised scope',
+      recoveryTaskId: taskId,
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'ALREADY_EXECUTED' })
+    expect(storage.tasks.findById(taskId)?.roadmapTaskKey).toBe('first-item#2')
+  })
+
+  it('別 ledger item の Task id を指定しても、その identity を上書きしない', async () => {
+    const { storage, projectId } = makeStorage()
+    const otherTaskId = createConflictedFollowUp(storage, projectId, {
+      roadmapTaskKey: 'second-item#2',
+      title: '別項目の follow-up',
+    })
+    const before = storage.tasks.findById(otherTaskId)
+
+    const result = await adoptRoadmapItem(storage, {
+      projectId,
+      roadmapId: 'first-item',
+      ...SPEC,
+      implementationScope: 'overwrite attempt',
+      recoveryTaskId: otherTaskId,
+    }, deps())
+
+    expect(result).toMatchObject({ ok: false, code: 'SPEC_INVALID' })
+    expect(storage.tasks.findById(otherTaskId)).toEqual(before)
+    expect(storage.tasks.findByProjectId(projectId)).toHaveLength(1)
+  })
+})
+
 describe('extractItemDescription', () => {
   it('次の roadmap metadata 行の直前までを本文として取る', () => {
     const items = [
@@ -950,5 +1176,168 @@ describe('adoptRoadmapItem — 直前 Task の残 Job が採用を詰まらせ�
 
     expect(second.ok).toBe(false)
     expect((second as { reason: string }).reason).toContain('queued')
+  })
+})
+
+describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#340 Stage 1）', () => {
+  const SCOPE_A = { ...SPEC, implementationScope: 'API 側の配線' }
+  const SCOPE_B = { ...SPEC, implementationScope: 'Worker 側の配線' }
+  const LEDGER_IDS = new Set([
+    'first-item', 'second-item', 'in-progress-item', 'finished-item', 'deferred-item', 'blocked-item',
+  ])
+
+  type EvidenceOverrides = Partial<{
+    decision: 'ALLOW' | 'BLOCKED'
+    bindingVerification: 'authoritative' | 'diff_text_hash' | 'unverified'
+    policyVersion: string
+    targetBranch: string
+    resultingCommit: string | null
+    onOtherJob: boolean
+    sourceWithoutCommitHash: boolean
+    linkedApprovalStatus: 'WAITING_FOR_USER' | 'APPROVED' | 'REJECTED'
+  }>
+
+  /** approval を経ずに Safety Evidence で commit された Candidate completion を作る。 */
+  async function withEvidenceCompletion(overrides: EvidenceOverrides = {}): Promise<{
+    storage: IStorage
+    projectId: string
+    taskId: string
+    sourceJobId: string
+  }> {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+
+    const createGitCommitJob = (): string => storage.jobs.create({
+      taskId: first.taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'candidate result' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0]).id
+    const sourceJobId = createGitCommitJob()
+    if (overrides.sourceWithoutCommitHash !== true) {
+      storage.jobs.update(sourceJobId, { commitHash: 'candidate-commit' })
+    }
+    if (overrides.linkedApprovalStatus !== undefined) {
+      const approval = storage.approvalRequests.createForJob({
+        taskId: first.taskId,
+        targetBranch: 'candidate/self-dev',
+        targetCommit: 'candidate-parent',
+        targetDiffHash: 'candidate-diff',
+        riskLevel: 'LOW',
+        requestedAction: 'git_commit',
+        changedFiles: ['apps/api/src/ctoAi/roadmapAdoption.ts'],
+        triggeredRules: [],
+        status: overrides.linkedApprovalStatus,
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        invalidIf: ['commit changes', 'diff changes'],
+      }, sourceJobId)
+      if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
+    }
+    const evidenceJobId = overrides.onOtherJob === true ? createGitCommitJob() : sourceJobId
+
+    const resultingCommit = overrides.resultingCommit === undefined ? 'candidate-commit' : overrides.resultingCommit
+    storage.gateEvaluations.create({
+      taskId: first.taskId,
+      jobId: evidenceJobId,
+      targetBranch: overrides.targetBranch ?? 'candidate/self-dev',
+      targetCommit: 'candidate-parent',
+      targetDiffHash: 'candidate-diff',
+      decision: overrides.decision ?? 'ALLOW',
+      riskLevel: 'LOW',
+      triggeredRules: ['git_commit: safety evidence verified'],
+      policyVersion: overrides.policyVersion ?? 'gate-policy-v2',
+      bindingVerification: overrides.bindingVerification ?? 'authoritative',
+      approvedContentHash: 'approved-content',
+      ...(resultingCommit === null ? {} : { resultingCommit }),
+    })
+
+    storage.tasks.update(first.taskId, { status: 'done' })
+    storage.taskContinuations.create({
+      sourceJobId,
+      projectId,
+      completedTaskId: first.taskId,
+      status: 'completed',
+    })
+    return { storage, projectId, taskId: first.taskId, sourceJobId }
+  }
+
+  it('source Job 自身の bind 済み ALLOW evidence があれば promotion 待ちとして検出し、seam も follow-up を拒否する', async () => {
+    const { storage, projectId, taskId, sourceJobId } = await withEvidenceCompletion()
+
+    expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([
+      { taskId, sourceJobId, candidateCommitHash: 'candidate-commit' },
+    ])
+    const result = await adoptRoadmapItem(
+      storage, { projectId, roadmapId: 'first-item', ...SCOPE_B, followUp: true }, deps(),
+    )
+    expect(result).toMatchObject({ ok: false, code: 'FOLLOW_UP_NOT_ELIGIBLE' })
+  })
+
+  it.each<[string, EvidenceOverrides]>([
+    ['resultingCommit が未 bind', { resultingCommit: null }],
+    ['resultingCommit が source Job の commitHash と不一致', { resultingCommit: 'other-commit' }],
+    ['evidence が別 Job のもの', { onOtherJob: true }],
+    ['decision が ALLOW でない', { decision: 'BLOCKED' }],
+    ['bindingVerification が authoritative でない', { bindingVerification: 'diff_text_hash' }],
+    ['policyVersion が gate-policy-v2 でない', { policyVersion: 'gate-policy-v1' }],
+    ['targetBranch が Candidate でない', { targetBranch: 'master' }],
+    ['source Job に commitHash が無い', { sourceWithoutCommitHash: true }],
+    ['source Job に CONSUMED でない approval（APPROVED）が link されている', { linkedApprovalStatus: 'APPROVED' }],
+    ['source Job に CONSUMED でない approval（WAITING_FOR_USER）が link されている', { linkedApprovalStatus: 'WAITING_FOR_USER' }],
+    ['source Job に REJECTED の approval が link されている', { linkedApprovalStatus: 'REJECTED' }],
+  ])('%s なら検出しない（fail closed で従来どおり）', async (_label, overrides) => {
+    const { storage, projectId } = await withEvidenceCompletion(overrides)
+
+    expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([])
+  })
+
+  it('Tier B reconcile 済みなら Evidence path でも検出しない', async () => {
+    const { storage, projectId, taskId } = await withEvidenceCompletion()
+    storage.auditLog.record({
+      actor: 'api', operation: 'reconcile_external_completion', entityType: 'task',
+      entityId: taskId, result: 'done', detail: 'Tier B completion',
+    })
+
+    expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([])
+  })
+
+  it('Human Approval の CONSUMED path は従来どおり検出する（evidence 無し）', async () => {
+    const { storage, projectId } = makeStorage()
+    const first = await adoptRoadmapItem(storage, { projectId, roadmapId: 'first-item', ...SCOPE_A }, deps())
+    if (!first.ok) throw new Error('setup failed')
+    const sourceJob = storage.jobs.create({
+      taskId: first.taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'success',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'candidate result' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(sourceJob.id, { commitHash: 'candidate-commit' })
+    const approval = storage.approvalRequests.createForJob({
+      taskId: first.taskId,
+      targetBranch: 'candidate/self-dev',
+      targetCommit: 'candidate-parent',
+      targetDiffHash: 'candidate-diff',
+      riskLevel: 'LOW',
+      requestedAction: 'git_commit',
+      changedFiles: ['apps/api/src/ctoAi/roadmapAdoption.ts'],
+      triggeredRules: [],
+      status: 'CONSUMED',
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      invalidIf: ['commit changes', 'diff changes'],
+    }, sourceJob.id)
+    if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
+    storage.tasks.update(first.taskId, { status: 'done' })
+    storage.taskContinuations.create({
+      sourceJobId: sourceJob.id, projectId, completedTaskId: first.taskId, status: 'completed',
+    })
+
+    expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([
+      { taskId: first.taskId, sourceJobId: sourceJob.id, candidateCommitHash: 'candidate-commit' },
+    ])
   })
 })

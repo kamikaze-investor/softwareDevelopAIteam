@@ -7,7 +7,11 @@
  * 実装の差し替えはこのinterfaceを実装したクラスを切り替えるだけでよい
  */
 
-import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
+import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, OperatorRequestPlAction, OperatorRequestRequesterClass, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
+import type {
+  AbortAuthorization,
+  TechnicalAbortCleanupSummary,
+} from '../pl/technicalAbortEvidence'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
@@ -32,6 +36,7 @@ export type ResumeBlockedTaskResult =
          * 自動復旧できることより優先される。
          */
         | 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
+        | 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
       reason: string
     }
 
@@ -461,7 +466,9 @@ export interface IJobStorage {
    *
    * 順序（原子性・所有権の連続性のため）:
    *   1. repair Job（`queued`、non-initial `workflowStepKey` → 所有権を保持）を作成
-   *   2. source Job を所有権保持状態（`blocked`）から `failed` へ解放
+   *   2. source Job が所有権を保持している状態（`blocked`）なら `failed` へ解放する。
+   *      **`success` / `failed` は所有権を持たないので触らない** —— 解放に寄与しないうえ、
+   *      成功した実装の結果を書き換えてしまうため（2026-09-25 修正）。
    *   3. この handoff に属する Task / recovery 状態更新（あれば）を適用
    * いずれかが失敗したら transaction 全体が rollback し、source Job は `blocked` のまま。
    */
@@ -524,7 +531,7 @@ export interface IJobStorage {
   parkTask(input: {
     taskId: string
     reason: string
-    approvalRequestId: string
+    authorization: Extract<AbortAuthorization, { kind: 'manual_approval' }>
   }): ReleaseBlockedJobAndParkTaskResult
   releaseBlockedJobAndParkTask(input: {
     jobId: string
@@ -546,8 +553,37 @@ export interface IJobStorage {
     }
     /** audit に残す park 理由。 */
     reason: string
-    /** 承認の出所。transaction 内で束縛を再検証し、CONSUMED まで進める。 */
-    approvalRequestId: string
+    /** manual approval または server-verified technical evidence。transaction 内で再検証する。 */
+    authorization: AbortAuthorization
+    /** technical cleanup の前状態。manual abort では不要。 */
+    preCleanupObservation?: JobWorkspaceBaseline
+    /** technical audit に残す counts-only summary。 */
+    cleanupSummary?: TechnicalAbortCleanupSummary
+  }): ReleaseBlockedJobAndParkTaskResult
+  /**
+   * 通常は全 Job が既に terminal な blocked Task を abort_task で park する最終段。
+   * 例外として、最新 Job 自身に直接リンクした `git_commit` Approval が REJECTED の場合だけ、
+   * その最新 blocked Job を同じ transaction で failed にしてから park する。継承 link は使わない。
+   * 通常形では Job 行を変更せず、観測対象が Task の最新 Job であること、cleanup request より後の
+   * Job が無いこと、workspace の clean 観測、Project/Task 束縛、全 Job の workingDir と
+   * start HEAD 一致、rejected Approval の targetCommit 一致を transaction 内で再検証してから
+   * Job/Task 遷移・abort 承認消費・audit を確定する。
+   */
+  parkBlockedTaskWithTerminalJobs(input: {
+    jobId: string
+    taskId: string
+    observation: JobWorkspaceBaseline
+    knownGood: {
+      gitOperationMarkers: string[]
+      worktreeClean: boolean
+      indexClean: boolean
+      headValid: boolean
+      blindSpotsAbsent: boolean
+    }
+    reason: string
+    authorization: AbortAuthorization
+    preCleanupObservation?: JobWorkspaceBaseline
+    cleanupSummary?: TechnicalAbortCleanupSummary
   }): ReleaseBlockedJobAndParkTaskResult
   clearWorkspaceQuarantine(input: {
     jobId: string
@@ -872,10 +908,41 @@ export interface IDesignReviewRunStorage {
    * （ledger: `cross-project-state-api` の production 検証で欠落が判明）。
    */
   findLatestByTaskId(taskId: string): DesignReviewRun | undefined
+  /**
+   * その Task の run を**新しい順**に全件返す（順序は `findLatestByTaskId()` と同じ）。
+   * repair admission が「Human Resume で回答済みの run」を根拠から外すための read-only 導出。
+   */
+  findByTaskId(taskId: string): DesignReviewRun[]
   /** 同一Taskにqueued/running中のrunがある場合は作成せず既存を返す（partial unique index準拠）。 */
   create(input: DesignReviewRunCreateInput): DesignReviewRun
   /** startup recovery後に再kick対象となるqueued run一覧。 */
   findQueued(): DesignReviewRun[]
+  /**
+   * repair 目的で**終端した** run（`succeeded`）。**ALIGNED かどうかはここでは判定しない。**
+   *
+   * `findQueued()` は `queued` しか返さないため、終端した直後に successor を作る前に落ちた
+   * repair run は、既存のどの read にも二度と現れない（`findLatestByTaskId()` は Task 単位・
+   * 最新 1 件だけ）。successor を作る機会が消えるのはそこである。
+   *
+   * **判定を storage に持たせない。** 終端 run には 2 つの successor が対応する:
+   *   - ALIGNED → repair Job（`terminalRepairSuccessorRecovery`）
+   *   - 非 ALIGNED → Human escalation（`terminalRepairEscalationRecovery`）
+   * どちらなのかは run 自身の `resultJson` を計算し直して決まる（`safeRecomputedDecision()`）。
+   * 以前この read は `error IS NULL` を条件に持っていたが、それは ALIGNED の同値条件ではない
+   * ——`recomputeDecision()` が `rejectedReason` を埋めるのは roadmap kind のときだけで、
+   * repair が使う task kind では**非 ALIGNED でも `error` が NULL になる**一方、形が壊れた
+   * 入力の `reject()` 経路では非 ALIGNED でも `error` が入る。つまり `error` は
+   * 「非 ALIGNED のうちどちらの形か」しか表さない。両方の consumer が同じ母集団を見るために、
+   * ここからは外してある（2026-09-28）。
+   *
+   * `status='failed'` は**含めない**。あちらは既存 `design_review_failed` attention が
+   * 観測しており、ここで拾うと二重に escalation を作る。
+   *
+   * `repair_source_job_id IS NOT NULL` だけが repair 目的の判定で、**NULL の旧行を
+   * 推測で repair 目的として扱わない。** successor が既に在るかはこの表の事実ではないので
+   * ここでは判定しない。
+   */
+  findTerminalRepairPurposeRuns(): DesignReviewRun[]
   /** queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。 */
   claim(id: string, maxAttempts: number): ClaimDesignReviewRunResult
   /** claim_token一致時のみ終端へ遷移する。不一致（stale）ならfalseを返し、呼び出し側は結果を破棄する。 */
@@ -1133,6 +1200,32 @@ export interface ITaskContinuationStorage {
   update(id: string, data: Partial<Pick<TaskContinuation, 'status' | 'error' | 'completedAt'>>): TaskContinuation | undefined
 }
 
+/**
+ * Operator Request（外部から PL への依頼）の保存。
+ *
+ * **ここにある write は operator_requests テーブルだけに閉じる。** Task / Job / Approval /
+ * Design Review 等の operational state には触れない。
+ */
+export interface IOperatorRequestStorage {
+  findById(id: string): OperatorRequest | undefined
+  /** 新しい順。`status` 指定時はその状態のみ。 */
+  list(filter: { status?: OperatorRequestStatus; requesterClass?: OperatorRequestRequesterClass; limit: number }): OperatorRequest[]
+  /** pending の件数。`requesterClass` 指定時はその依頼元の分だけ。 */
+  countPending(requesterClass?: OperatorRequestRequesterClass): number
+  /** PL が次に処理する依頼（最古の pending）。 */
+  findOldestPending(): OperatorRequest | undefined
+  create(data: Pick<OperatorRequest, 'requesterClass' | 'kind' | 'message' | 'targetKey' | 'projectId' | 'taskId'>): OperatorRequest
+  /**
+   * pending の依頼を終端させる。**pending でなければ何もせず undefined**（二重回答しない）。
+   */
+  complete(
+    id: string,
+    result:
+      | { status: 'answered'; disposition: OperatorRequestDisposition; response: string; plAction?: OperatorRequestPlAction }
+      | { status: 'failed'; error: string },
+  ): OperatorRequest | undefined
+}
+
 export interface IStorage {
   projects: IProjectStorage
   tasks: ITaskStorage
@@ -1150,6 +1243,7 @@ export interface IStorage {
   auditLog: IAuditLogStorage
   principleApplications: IPrincipleApplicationStorage
   taskContinuations: ITaskContinuationStorage
+  operatorRequests: IOperatorRequestStorage
   projectRoadmapPhases: IProjectRoadmapPhaseStorage
   knowledgeGraph: IKnowledgeGraphStorage
   decisionCache: IDecisionCacheStorage

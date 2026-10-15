@@ -15,6 +15,7 @@ import type {
   AiCliProvider,
   AiCliResult,
   Job,
+  JobFailureMetadata,
   JobGuardResult,
   JobWorkspaceBaseline,
   JobWorkspaceBaselineEntry,
@@ -27,6 +28,8 @@ import type {
 import { aiCliTimeoutMs, runRiskReview } from '@ai-team/shared'
 import { z } from 'zod'
 import { createAiCliAdapter } from './aiCli/factory.js'
+import { AiCliPromptRefusalError } from './aiCli/adapter.js'
+import { buildImplementJobReport, classifyPromptRefusal } from './reviewRefusalEligibility.js'
 import { evaluateJobApprovalLevel } from './approvalLevel/jobApprovalLevelIntegration.js'
 import { scanTargetProjectRisk, formatRiskScanSummary } from './approvalLevel/targetProjectRiskScan.js'
 import type { TargetProjectRiskScanResult } from './approvalLevel/targetProjectRiskScan.js'
@@ -174,6 +177,7 @@ export type StructuredReviewVerdict = Pick<ReviewResult, 'status' | 'summary' | 
 export interface StructuredReviewContext {
   task: Task
   implementJob: Job
+  reviewJobs?: readonly Job[]
 }
 
 /**
@@ -340,16 +344,7 @@ ${evidence.summaryLines.length > 0 ? evidence.summaryLines.join('\n') : '(集計
 [SafeCommand出力（bounded 抜粋。全文ではない）]
 ${evidence.excerpt}
 
-[implement Job結果]
-${JSON.stringify({
-    id: implementJob.id,
-    status: implementJob.status,
-    changedFiles: implementJob.changedFiles ?? [],
-    completedAt: implementJob.completedAt,
-    aiCliProvider: implementJob.aiCliProvider,
-    aiCliMode: implementJob.aiCliMode,
-    stdoutPreview: implementJob.stdout,
-  }, null, 2)}`
+${buildImplementJobReport(implementJob)}`
 }
 
 export interface JobRunResult {
@@ -366,7 +361,10 @@ export interface JobRunResult {
   startedAt: string
   completedAt: string
   providerFailureKind?: AiCliResult['providerFailureKind']
+  refusal?: JobFailureMetadata['refusal']
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
+  /** 子プロセスと Job 固有 cleanup が終わった時点の value-free workspace fingerprint。 */
+  workspaceEndFingerprint?: JobWorkspaceBaseline
   permissionBlockEvent?: PermissionBlockEvent
   rollbackInfo?: RollbackInfo
   gatePolicy?: EffectivePolicy
@@ -884,6 +882,16 @@ export async function runJob(
         exitCode: 1,
         stdout: '',
         stderr: message,
+        refusal: err instanceof AiCliPromptRefusalError
+          ? classifyPromptRefusal({
+              mode: job.aiCliMode,
+              prompt: effectiveAiCliPrompt,
+              implementationDiff: preDiffText,
+              implementJob: structuredReviewContext?.implementJob,
+              reviewJob: job,
+              reviewJobs: structuredReviewContext?.reviewJobs,
+            })
+          : undefined,
       })
     }
 
@@ -1039,6 +1047,7 @@ export async function runJob(
       stageAManifest,
       preManifest.paths,
     )
+    const workspaceEndFingerprint = captureWorkspaceEndFingerprint(job.safeCommand.workingDir)
     // 既存契約に合わせ status は 'failed' を返す。
     // index.ts の resolveResultStatus() が guardResult.fileChangeAllowed=false を見て
     // 最終的に 'blocked' へ変換する（File Change Guard 由来の停止の既存表現）。
@@ -1061,6 +1070,7 @@ export async function runJob(
       completedAt: new Date().toISOString(),
       targetProjectRiskScanResult,
       finalChangeManifest: stageAManifest,
+      workspaceEndFingerprint,
     }
   }
 
@@ -1428,6 +1438,7 @@ export async function runJob(
   const previews = logPaths
     ? { stdoutPreview: logPaths.stdoutPreview, stderrPreview: logPaths.stderrPreview }
     : buildLogPreviews(combinedStdout, stderr)
+  const workspaceEndFingerprint = captureWorkspaceEndFingerprint(job.safeCommand.workingDir)
 
   return {
     status:
@@ -1455,6 +1466,7 @@ export async function runJob(
     postReviewResult,
     safetyVerificationResult,
     finalChangeManifest: finalManifest,
+    workspaceEndFingerprint,
     // AI CLI 失敗経路（inspectAfterAiFailure）と同じ後始末の材料。こちらは
     // AI CLI が exit 0 でも test/review/guard で failed になる経路を拾う。
     workspaceCleanup: {
@@ -1562,6 +1574,45 @@ export async function revertBlockedJobChanges(
     return message
   }
   return undefined
+}
+
+/**
+ * Persisted dirty baseline を既存 revert helper の ChangeManifest へ戻す。
+ * baseline の fingerprint 一致を先に証明した Technical Abort だけが使う。
+ */
+export function buildCleanupManifestFromBaseline(
+  baseline: Extract<JobWorkspaceBaseline, { mode: 'dirty' }>,
+): { manifest: ChangeManifest; changedPathCount: number; restoredPathCount: number; removedPathCount: number } {
+  const changes = baseline.entries
+    // rename 元は target entry の oldPath として同じ change に復元する。
+    .filter((entry) => entry.kind !== 'renamed' || entry.oldPath !== undefined)
+    .map((entry) => ({
+      path: entry.path,
+      ...(entry.oldPath !== undefined ? { oldPath: entry.oldPath } : {}),
+      kind: entry.kind,
+      ...(entry.xyStatus !== undefined ? { xyStatus: entry.xyStatus } : {}),
+      ...(entry.beforeType !== undefined ? { beforeType: entry.beforeType } : {}),
+      ...(entry.afterType !== undefined ? { afterType: entry.afterType } : {}),
+      ...(entry.beforeMode !== undefined ? { beforeMode: entry.beforeMode } : {}),
+      ...(entry.afterMode !== undefined ? { afterMode: entry.afterMode } : {}),
+      ...(entry.headHash !== undefined ? { headHash: entry.headHash } : {}),
+      ...(entry.indexHash !== undefined ? { indexHash: entry.indexHash } : {}),
+    }))
+  const paths = [...new Set(baseline.entries.map((entry) => entry.path))]
+  const restoredPathCount = changes.reduce(
+    (count, change) => count + (change.kind === 'modified' || change.kind === 'deleted' ? 1 : change.kind === 'renamed' ? 1 : 0),
+    0,
+  )
+  const removedPathCount = changes.reduce(
+    (count, change) => count + (change.kind === 'added' || change.kind === 'renamed' ? 1 : 0),
+    0,
+  )
+  return {
+    manifest: { changes, paths },
+    changedPathCount: paths.length,
+    restoredPathCount,
+    removedPathCount,
+  }
 }
 
 /** 後始末の結果（スキップ・部分失敗）を Job 結果のメッセージへ連結する */
@@ -1790,18 +1841,18 @@ function withSensitiveChanges(
  * エラーでなければ undefined。
  *
  * **CLI が返した理由をそのまま出す。**
- * 
+ *
  * ここを generic な1文で潰していたため、2026-09-18 に API credit が尽きたとき
  * 運用側に見えたのは「error result」だけで、真因（400 Credit balance is too low）は
  * stdout の JSON を人手で開くまで分からなかった。
  * API key を渡すのをやめた以降、subscription の失効も同じ形で届く。
  * 出すのは **HTTP status と、固定語彙の原因ラベルだけ**である。
- * 
+ *
  * provider の文字列をそのまま載せない。`result` は成功時にはモデル本文が入る欄であり
  * （`reviewerAdapter.ts`: `result: '<モデル本文>'`）、API エラー時でも中身は信用できない
  * —— 実際に `401 invalid Authorization: Bearer sk-...` のように credential 断片や
  * prompt 抜粋を含みうる（独立レビュー指摘）。redact（denylist）では取りこぼす形が残る。
- * 
+ *
  * そこで **echo せず分類する**。出力は下の固定語彙のいずれかで、入力文字列は外へ出ない。
  * 2026-09-18 の実例（API credit 枯渇）は `credit exhausted` として十分に伝わる。
     const apiErrorStatus = typeof parsed.api_error_status === 'number'
@@ -2071,6 +2122,7 @@ interface AiFailureInspectionInput {
   stdoutPath?: string
   stderrPath?: string
   providerFailureKind?: AiCliResult['providerFailureKind']
+  refusal?: JobFailureMetadata['refusal']
 }
 
 /**
@@ -2086,6 +2138,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
   let workspaceState: JobRunResult['workspaceState']
   let workspaceCleanupNote: string | undefined
   let guardBlockNote: string | undefined
+  let workspaceEndFingerprint: JobWorkspaceBaseline | undefined
   try {
     const inspection = buildFinalInspection(
       input.workingDir,
@@ -2119,6 +2172,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     riskScan = scanTargetProjectRisk({ changedFiles: manifest.paths, diffText: inspection.diffText })
     const summary = formatRiskScanSummary(riskScan)
     if (summary) console.warn(`[final][ai-failure] ${summary}`)
+    workspaceEndFingerprint = captureWorkspaceEndFingerprint(input.workingDir)
   } catch (err: unknown) {
     // この try は buildFinalInspection だけでなく revertBlockedJobChanges も覆っている。
     // containment 失敗をここで failed へ潰すと、生き残ったプロセスがいるかもしれない
@@ -2127,6 +2181,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     return {
       ...failClosed(input.startedAt, formatChangeDetectionError(err), input.guardResult),
       ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
+      ...(input.refusal ? { refusal: input.refusal } : {}),
       workspaceState: 'unknown',
     }
   }
@@ -2152,6 +2207,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
     approvalLevelResult: input.approvalLevelResult,
     targetProjectRiskScanResult: riskScan,
     finalChangeManifest: manifest,
+    workspaceEndFingerprint,
     // escalate が確定した場合にだけ Worker 側で使う後始末の材料。
     // Guard 違反で既に取り消した場合も manifest は空にならないが、
     // `revertBlockedJobChanges()` は同じ path へ二度実行しても no-op（checkout/clean は
@@ -2162,6 +2218,7 @@ async function inspectAfterAiFailure(input: AiFailureInspectionInput): Promise<J
       preChangedPaths: [...input.preChangedPaths],
     },
     ...(input.providerFailureKind ? { providerFailureKind: input.providerFailureKind } : {}),
+    ...(input.refusal ? { refusal: input.refusal } : {}),
     workspaceState,
   }
 }
@@ -2244,6 +2301,31 @@ function inspectFinalState(
     manifest: mergeManifests(commitManifest, worktreeManifest),
     diffText: getCommitRangeDiffText(workingDir, startCommitHash, currentHead) + worktreeDiff,
     workspaceState: 'changed',
+  }
+}
+
+/**
+ * terminal result と同じ瞬間の worktree を、既存 baseline 表現へ正規化する。
+ * Job の変更内容は保存せず、path と content hash だけを durable metadata へ渡す。
+ */
+function captureWorkspaceEndFingerprint(workingDir: string): JobWorkspaceBaseline {
+  try {
+    const startCommitHash = requireCommitHash(workingDir)
+    const manifest = buildWorktreeManifest(workingDir)
+    if (manifest.paths.length === 0) return { mode: 'clean', startCommitHash }
+    const fingerprints = fingerprintWorktreeEntries(workingDir, manifest)
+    return {
+      mode: 'dirty',
+      startCommitHash,
+      entries: buildBaselineEntries(manifest, fingerprints),
+    }
+  } catch (err: unknown) {
+    if (err instanceof WorkspaceReconciliationError) throw err
+    if (isContainmentInfrastructureError(err)) throw err
+    throw new WorkspaceReconciliationError(
+      `workspace end fingerprint failed (${formatUnknownError(err)}); `
+      + 'cannot prove Job ownership continuity (fail-closed)',
+    )
   }
 }
 

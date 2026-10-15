@@ -69,6 +69,7 @@ jobs:
           BASE_SHA:  ${{ github.event.pull_request.base.sha }}
           HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
           PR_TITLE:  ${{ github.event.pull_request.title }}
+          PR_BODY:   ${{ github.event.pull_request.body }}
           TASK_ID:   "pr-${{ github.event.pull_request.number }}"
           META_REVIEW_RESULT_PATH: ${{ github.workspace }}/meta-review-result.json
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
@@ -118,8 +119,10 @@ jobs:
               : '\n*検出事項なし*'
 
             const ceoNote = result.requiresCeoApproval
-              ? '\n\n> 🔴 **CEO承認が必要です。** このPRはマージ不可です。'
-              : ''
+             ? result.status === 'blocked'
+              ? '\n\n> 🔴 **CEO判断が必要です。** Meta Review は BLOCKED のため、この状態ではマージできません。'
+              : '\n\n> 🟡 **CEOのCode Owner承認が必要です。** Human Decision Authority の確認はGitHub Reviewで行います。'
+             : ''
 
             // providerUsed は autoReview.ts が additive に書き込む監査証跡（2026-08-26追加）。
             // 未設定（古い結果ファイル・エラー時）は従来どおり Gemini 表記にフォールバックする。

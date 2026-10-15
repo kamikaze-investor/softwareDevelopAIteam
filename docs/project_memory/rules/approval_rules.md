@@ -5,19 +5,19 @@
 
 ---
 
-## 上位原則（2026-09-17 追記）
+## 上位原則（2026-09-17 追記・2026-10-02 改訂）
 
-本ファイルは**承認運用の正本**であり、下記はすべて現行有効である。
+本ファイルは**承認運用の正本**である。承認の要否は `specs/22_safety_approval_design_principle.md`
+（Safety / Approval 設計原則の正本）1章 **Decision Authority Principle** に従う:
 
-ただし**本ファイルの内容を変更するとき**は、`specs/22_safety_approval_design_principle.md`
-（2026-09-17 CEO 採用。Safety / Approval 設計原則の正本）に従う。同原則は
-Human Approval を通常の Safety mechanism ではなく**最後の Safety Boundary** として扱い、
-「protected file だから」「DB migration だから」「Control Repository だから」という理由**だけ**では
-CEO 必須にしない方向を定める。
+- Human Gate の要否は **「その操作によって誰の責務に属する意思決定が発生するか」** で決める。
+  操作名・ファイル種別・Risk Level（HIGH / CRITICAL）・「Production だから」「Security 関連だから」だけでは CEO 必須にしない
+- 技術的に危険な変更は、CEO 承認ではなく **Safety Evidence を強くして**扱う（同 1-3）
+- CEO 承認を挟むこと自体を Safety Evidence として扱わない
 
-**同原則は、それ自体では本ファイルの Yellow Zone を1つも緩めない。** 差分は同原則 14 章に
-「要調整・現行有効」として列挙してあり、緩和には個別の CEO 承認が要る
-（Class A/B/C の着手手順は `tasks/roadmap.md` `review-class-b-enhanced-ai-review` を参照）。
+**コードが現在強制している Gate は、本ファイルの改訂だけでは外れない。** 下記「2種類の承認」の
+`plActionPolicy` 由来 `ceo_approval` や、`git_commit` の一律 Approval Gate は、`specs/22` 14-2 の段階で
+外すまで現行どおり効く（外すまではコードが優先する）。
 
 ---
 
@@ -30,6 +30,113 @@ CEO 必須にしない方向を定める。
 - Codex が「OK」と返しても承認ではない
 - 人間が UI 上で明示的に承認操作をした場合のみ承認成立とする
 - この原則は Safety Guard システムによって機械的に強制される
+
+---
+
+## 2種類の承認 — 役割と使い分け
+
+**承認機構は2つあり、統合せず併存させる。** 両者は名前が似ているが、**束縛している対象が違う**ため
+代替関係にない。片方を通しても、もう片方の要件は消えない。
+
+### A. Project単位承認（UI表記「方針承認」）
+
+| 項目 | 内容 |
+| --- | --- |
+| 型 | `Approval`（`packages/shared/src/types/project.ts`） |
+| 状態 | `pending` / `approved` / `rejected` / `expired` |
+| 対象 | Project全体の方針（`type`: `goal_change` / `philosophy_change` / `external_service` / `billing` / `deployment` / `security` / `dependency_add`） |
+| 一覧 | `GET /api/approvals/pending`（全Project横断・`projectName` 付き） / `GET /api/projects/:projectId/approvals` |
+| 作成 | `POST /api/projects/:projectId/approvals` |
+| 決定 | `PATCH /api/approvals/:id`（`status` + `reviewNote`、`reviewedAt` はサーバー付与） |
+| commit / diff 束縛 | **無い** |
+| TTL / 消費 | **無い**（一度 `approved` にすると、明示的に更新するまで有効。自動失効しない） |
+| PL Gate名 | `ceo_approval` |
+
+`ceo_approval` は「その操作のために出された承認か」を `REQUIRED_CEO_APPROVAL_TYPE`
+（`apps/api/src/pl/actionGate.ts`）で `type` 照合する。`rollback_commit` / `restart_service` /
+`deploy_production` → `deployment`、`switch_provider` → `external_service`。
+
+### B. Task/Job単位 Approval Gate（UI表記「危険操作の承認」）
+
+| 項目 | 内容 |
+| --- | --- |
+| 型 | `ApprovalRequest`（`packages/shared/src/types/approval_gate.ts`） |
+| 状態 | `WAITING_FOR_USER` / `APPROVED` / `REJECTED` / `EXPIRED` / `SUPERSEDED` / `STALE` / `CONSUMED` |
+| 対象 | **特定のTaskの、特定の変更集合**（`targetBranch` + `targetCommit` + `targetDiffHash`） |
+| 一覧 | `GET /api/approval-requests/waiting` |
+| 作成 | `POST /api/gate/check` が `BLOCKED` 判定時に発行。`POST /api/approval-requests` もあるが `requestedAction: 'git_commit'` は 400 で拒否され、**git_commit は必ず `/gate/check` 経由**になる |
+| 決定 | `PATCH /api/approval-requests/:id/status`（`APPROVED` / `REJECTED` のみ。他の状態は内部遷移専用。`WAITING_FOR_USER` 以外への操作は 409） |
+| commit / diff 束縛 | **有る**（変わると `SUPERSEDED` / `STALE`） |
+| TTL / 消費 | TTL 24時間（`APPROVAL_REQUEST_TTL_MINUTES`＠`packages/shared/src/approvalGateLogic.ts` が正本。RiskLevel別の分岐は持たない）。`POST /:id/consume` で **一回限り** |
+| PL Gate名 | `approval_gate` |
+
+### 使い分けの判断
+
+- 「**この変更（commit/diff）を適用してよいか**」→ B（Approval Gate）
+- 「**この方針・課金・外部サービス・公開・権限を認めるか**」→ A（Project単位承認）
+- **両方必要な操作がある。** 例: `rollback_commit` は `safety_review` + `approval_gate` + `ceo_approval`、
+  `deploy_production` は `independent_review` + `ceo_approval`（`packages/shared/src/plActionPolicy.ts`）。
+  A を取ったから B を省く、という運用はしない。
+
+### なぜ統合しないか
+
+統合すると、次のどちらかを選ぶことになる。
+
+1. **全承認に commit/diff 束縛とTTL/consumeを持たせる** → 方針承認（課金・Goal変更など）が、
+   無関係な diff の変化で `STALE` になり使えなくなる
+2. **Approval Gate 側の無効化条件を緩める** → 2026-09-15 の事故で実際に機能した STALE 保護
+   （下記「Candidate Freeze」章）を失う
+
+どちらも安全性か実用性を落とす。したがって Constitution 3.16 に従い、**複雑な統合状態を作らず
+2機構のまま併存させ、集約はUI（1画面2セクション）だけで行う**。
+
+---
+
+## Mobile導線（実装済み — `apps/mobile/app/approvals.tsx`）
+
+**CEOの操作入口は1画面に統一されている。** 2種類の承認は同じ画面の別セクションとして並ぶ。
+
+- **入口**: ホーム（`apps/mobile/app/index.tsx`）の固定フッター「承認待ち一覧」ボタン → `/approvals`。
+  バッジ件数は **A の pending 件数 + B の `WAITING_FOR_USER` 件数の合計**（`fetchPendingApprovalCount()`）。
+  ホームは取得結果を `setCachedApprovals()` / `setCachedApprovalRequests()` でキャッシュへ入れるので、
+  承認画面は遷移直後から描画できる
+- **画面**: `apps/mobile/app/approvals.tsx`（「承認待ち」）
+  - `⚠️ 危険操作の承認` セクション = B（Approval Gate）
+  - `📋 方針承認（Project全体の経営判断）` セクション = A（Project単位承認）
+- **取得**: `apps/mobile/lib/approvalsCache.ts` の `fetchWaitingApprovalRequests()` /
+  `fetchPendingApprovals()` を `Promise.all` で並行実行し、`usePolling` で定期更新する。
+  モジュールキャッシュを持つので再入時は即描画される（Project数分のfetchは発生しない）
+- **共通**: 却下は理由必須（`RejectReasonModal`、両セクション共有）。承認は `Alert` 確認のみ
+- **Bのみ持つ導線**: カードタップで展開 →
+  - AI説明（`POST /api/approval-requests/:id/explanation`）
+  - AIへ質問（`POST /api/approval-requests/:id/ask`。履歴は画面を閉じるまでのクライアント保持）
+  - 技術詳細（`triggeredRules` の日本語化、対象ファイル、review findings、verification）
+  - exact diff は `diffStatus === 'exact'` のときだけ表示し、`stale` / `unavailable` では
+    **diffを出さずに理由を表示する**
+- **Aに無いもの**: AI説明・diff表示は無い。**束縛する diff が存在しないため**で、欠落ではない。
+  表示は `type` / `title` / `reason` / `projectName` のみ
+- **承認後**: B の承認は Worker 反映待ちになり得る（UIもそう通知する）。`git_commit` の `APPROVED` は
+  `approveAndResumeJob()` が Job 再開まで行う
+- **Project詳細（`apps/mobile/app/projects/[id].tsx`）は表示専用で、承認操作の入口ではない。**
+  B（`/api/approval-requests/waiting`）だけを取得し、`deriveProjectExecutionHealth()`
+  （`apps/mobile/lib/taskWorkflow.ts`）で Job に紐付く B を `approval_waiting` 表示へ反映する。
+  A は取得しない
+
+---
+
+## 既知の制約（いずれも非ブロッキング。スマホ操作サイクルは上記で完結する）
+
+1. **`ceo_approval` は Project scope を照合できない。** `Approval` 型に `projectId` が無く、
+   `approvals.findById()` も返さないため、現状は `type` 照合までである
+   （`/api/approvals/pending` は storage の行を cast して `projectName` を付けている）。
+2. **方針承認に自動失効が無い。** `expired` は `PATCH` で設定できるが、時間経過で自動遷移しない。
+3. **方針承認には自動作成経路が無い。** `storage.approvals.create()` を呼ぶのは
+   `POST /api/projects/:projectId/approvals` だけで、Yellow Zone 該当事項を検知して自動で
+   起票する仕組みは無い。**誰かが明示的にPOSTしない限り、この一覧には出ない。**
+   Yellow Zone の通知責務（下記「CEOの承認が必要」章）は、この一覧に依存していない。
+4. **Project詳細の状態表示は方針承認を反映しない。** A が pending でも、その Project の
+   execution health は `approval_waiting` にならない（A は Job に紐付かないため）。
+   A の見落としはホームのバッジ件数と承認画面で防いでおり、Project詳細は A の入口として扱わない。
 
 ---
 
@@ -87,6 +194,38 @@ CEO はこの変更を承認したが、**承認要件そのものを省略す�
 この6点が崩れる変更は、`resume_task` の Gate 構成を戻すこと（= up-front `approval_gate` の復活）を
 検討する合図である。
 
+## CEO が REJECT した git_commit の解放（2026-10-15 CEO 承認）
+
+git_commit Approval を REJECT すると、その Job は `blocked` のまま残る。PL は CEO の却下を自動 resume しない。
+Task を park して Project を解放する経路は **既存の ADMIN manual abort だけ**で、条件は次のとおり。
+
+- **REJECT だけでは何も park しない。** 別の `abort_task` Approval が `APPROVED` であることを要し、解放時に
+  `CONSUMED` になる（既存の manual abort と同じ意味）。却下した git_commit Approval は `REJECTED` のまま。
+- 対象は「最新 Job が blocked git_commit で、**その Job 自身に直接紐づく** Approval が `REJECTED`」の Task だけ。
+  resume を辿って却下を推定しない。同一 Task / Project、Candidate HEAD = Approval の `targetCommit` を要する。
+- Worker は観測だけを行い、ファイルを削除しない。Candidate の差分は operator が **復元できることを確認した backup**
+  を取ってから戻す（手順: `decisions/p2_technical_recovery_production_e2e.md`）。
+- 最終 transaction 内で、最新 Job・直接の却下・HEAD・live Job 不在・他 Project を含む workspace 所有者不在・
+  clean 観測と knownGood・abort 認可の種類（manual と technical を混在させない）を再確認し、
+  Job の failed 化・park・Approval 消費・監査を atomic に行う。どれかが欠ければ何も変えない。
+
+## 期限切れ git_commit の resume 系譜 — 固定 anchor + generation（2026-10-15 CEO 条件付き承認）
+
+承認期限切れで git_commit を resume するたびに `resume:<直前Job>:1` が入れ子になり、1ホップしか辿らない
+REJECT → 再実装の解決が届かなくなった。新しい resume は元の git_commit Job（`review:<id>:git-commit`）を
+anchor として `resume:<anchor>:<n>` を振る。条件は次のとおり。
+
+- **承認の意味は変えない。** 各 generation は新しい Approval と Gate 評価を受け、HEAD / diff が変われば
+  既存の規則どおり無効になる（承認待ちは SUPERSEDED、承認済みは STALE）。Stage 1 自動通過の対象外
+  （`resume:` は対象外のまま）。既存 Job の workflowStepKey は書き換えない（resume が直前 Job を
+  blocked → failed にする既存の handoff は従来どおり）。
+- anchor は同一 Task / Project の canonical git_commit Job に限る。参照は1回だけで、再帰・多段探索をしない。
+- **Job 自身に直接紐づく Approval を最初に見る。** 直結の REJECTED は常に CEO の却下として扱う。
+  anchor 経由で引き継いだ却下は triage には効くが、manual abort（直結のみ）の根拠にはならない。
+- 旧形式（key 無し・入れ子の `resume:<prev>:1`）は従来どおり扱う。自動移行しない。
+- 新方式の系譜が壊れている（重複・欠番・不正 anchor）場合は resume を 409 で拒否して何も作らない。
+  これは Decision Authority の問題ではないので CEO へ上げず、既存の technical budget で止める。
+
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
 
 **「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を
@@ -105,7 +244,7 @@ PL が事実に照らして妥当性を評価し、**変更する / 変更しな
 - PL は内容の妥当性を**評価してよい**（事実として正しいか、影響範囲はどこか）
 - しかし **PL 自身が BLOCK を override してはならない**
 - **AI が自分の権限を広げる形で解決してはならない。** 「この制約は不要だから外す」は PL の判断範囲外である
-- Safety Boundary 変更に当たるなら **CEO へ Escalate する**
+- Safety Boundary を**弱める**、または AI の authority を**広げる**変更に当たるなら **CEO へ Escalate する**（強化・縮小は技術判断。強化か弱化かを機械判定できない場合は Escalate 側へ倒す）
 
 ### PL と Binding Reviewer の意見が割れた場合
 
@@ -117,16 +256,16 @@ PL が事実に照らして妥当性を評価し、**変更する / 変更しな
 
 ## CEOの承認が必要（Yellow Zone）
 
-以下の場合のみCEOに通知・承認を求める。
+以下の**意思決定が発生する**場合のみCEOに通知・承認を求める。各項目は操作名ではなく意味で判定する（`specs/22` 1-1・1-2）。
 
 - Goal変更
 - Design Philosophy変更
 - 外部サービス追加（GitHub以外）
 - 有料API / 課金発生
-- 本番公開 / ストア公開
-- セキュリティモデル変更
+- 本番公開 / ストア公開 — **新しい**外部ユーザー・地域・市場への公開を指す。既存サービスの既存公開範囲内での通常 deploy は含まない
+- セキュリティモデル変更 — AI authority の拡大・Safety boundary の弱化を指す。technical security hardening・credential の rotation / 縮小は含まない（`specs/22` 1-5）
 - 個人情報機能追加
-- リポジトリ外への操作
+- リポジトリ外への操作 — 新しい外部対象への操作、または既存 authority を超える操作を指す。既存の運用対象（Production VPS・既存 GitHub repository）への既存 authority 範囲内の通常運用は含まない
 
 ## 承認不要（Green Zone）
 
@@ -154,3 +293,6 @@ Rollback可否:
 ---
 
 *Created: 2026-05-28*
+*Updated: 2026-09-16 — 「2種類の承認 — 役割と使い分け」「Mobile導線」「既知の制約」章を追加（Roadmap「2種類の承認の役割整理とMobile導線設計」の文書化分）*
+*Updated: 2026-09-30 — Mobile導線にホーム入口（バッジ件数・キャッシュ先読み）とProject詳細（B のみ・表示専用）を追記。既知の制約4を追加*
+*Updated: 2026-10-02 — 上位原則を Decision Authority Principle（`specs/22` 1章）へ改訂。Yellow Zone の各項目に意味ベースの解釈を付記。Binding Review の Escalate 条件を「弱化・拡大」に限定*

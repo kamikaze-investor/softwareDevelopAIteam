@@ -148,7 +148,7 @@ function productionShape(storage: IStorage, taskOverrides: Record<string, unknow
 }
 
 describe('blocked Task への repair — 通るケース', () => {
-  // **`resumeBlockedTask()` は元 Job が `blocked` のときも受理し、その行を blocked のまま残す。**
+  // **旧 `resumeBlockedTask()` が source を blocked のまま残した production shape も扱う。**
   // stepKey が名指しする元 Job を live 判定から外さないと、その正規経路で再開した成果が
   // 必ず弾かれる —— 直そうとしている閉じ込めを別の形で作り直すことになる（独立レビュー指摘）。
   // 元の resume 元が実際に blocked で残っている形を、production と同じように組む。
@@ -214,7 +214,7 @@ describe('blocked Task への repair — 通るケース', () => {
   //       → human resume  569cd4ae (implement, success)
   //         → review changes_requested
   //
-  // `resumeBlockedTask()` は元の行を blocked のまま残すので、REJECT のたびに blocked な
+  // 旧 `resumeBlockedTask()` が元の行を blocked のまま残していたため、REJECT のたびに blocked な
   // ancestor が 1 件ずつ増える。除外を「最も近い resume 元 1 件」に固定していた頃は、
   // ここで `7061400a` が live 判定になり、canonical repair が admission だけで止まっていた。
   it('REJECT が 2 回続いて blocked ancestor が 2 件あっても repair を作る', () => {

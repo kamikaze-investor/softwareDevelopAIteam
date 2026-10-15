@@ -34,6 +34,7 @@ import { readFileSync } from 'node:fs'
 import {
   bindingDisputes,
   challengeableDisputes,
+  getBaseRoadmapId,
   parseCritique,
   selectCriticModel,
   challengeTarget,
@@ -64,6 +65,7 @@ import {
   priorCriticProviders,
   recordRemediationFailure,
   runRemediationStep,
+  shortSpecKey,
   stageEntries,
   type PlRemediationDeps,
   type RemediationSubject,
@@ -244,8 +246,8 @@ export const PL_REVISION_SYSTEM_PROMPT = [
   '- allowedPaths entries must be repository-relative and at least two path segments deep.',
   '- implementationScope must say exactly what is in scope and what is out of scope.',
   '- acceptanceCriteria must be mechanically checkable.',
-  '- The revision must be MATERIALLY different from what was rejected: changing only the',
-  '  acceptanceCriteria does not count, because the reviewer never sees them.',
+  '- The revision must be MATERIALLY different from what was rejected: an acceptanceCriteria-only',
+  '  change is not a material redesign. implementationScope or allowedPaths must change.',
   '',
   ADOPTION_REPOSITORY_MAP,
   '',
@@ -384,36 +386,51 @@ export interface ConflictResolutionDeps {
 const PL_REVISION_MAX_TOKENS = 900
 
 /**
- * 同一 (frozen spec, finding) に対する再評価キー。
+ * 同一 (material spec, finding) に対する再評価キー。
  *
- * **これが「1回だけ」の根拠である。** 新しい counter table は作らず、既存 audit 行に
- * このキーを書いておき、存在すれば消費済みとする。
+ * canonical prompt の書式変更だけで Challenge 予算を復活させないため、prompt hash ではなく
+ * Remediation と同じ material-spec identity（scope + allowedPaths）を使う。新しい counter table は
+ * 作らず、既存 audit 行にこのキーを書いておき、存在すれば消費済みとする。
  */
-function challengeKey(designTextHash: string, findingSource: string): string {
+function challengeKey(subject: RemediationSubject, findingSource: string): string {
+  const specKey = shortSpecKey({
+    implementationScope: extractImplementationScope(subject.task.description) ?? '',
+    allowedPaths: subject.task.allowedPaths ?? [],
+  })
+  return `${specKey.slice(0, 12)}:${findingSource}`
+}
+
+/** Task Contract 導入前の audit 行が使っていた prompt-hash key。読み取り互換にだけ使う。 */
+function legacyChallengeKey(designTextHash: string, findingSource: string): string {
   return `${designTextHash.slice(0, 12)}:${findingSource}`
 }
 
-function challengeConsumed(storage: IStorage, taskId: string, key: string): boolean {
+function challengeConsumed(storage: IStorage, taskId: string, keys: readonly string[]): boolean {
   return stageEntries(storage, taskId, 'challenge')
-    .some((entry) => (entry.detail ?? '').includes(`chal=${key}`))
+    .some((entry) => keys.some((key) => (entry.detail ?? '').includes(`chal=${key}`)))
 }
 
 /** ledger 本文を読む（既存 parser をそのまま使う）。 */
 function readLedgerBody(
   subject: RemediationSubject,
   readLedger: () => string,
-): { ok: true; body: string } | { ok: false; failureCode: string; reason: string } {
+): { ok: true; body: string; roadmapId: string } | { ok: false; failureCode: string; reason: string } {
   try {
     const markdown = readLedger()
-    const item = getValidRoadmapItems(markdown).find((c) => c.id === subject.roadmapId)
+    const items = getValidRoadmapItems(markdown)
+    const roadmapId = getBaseRoadmapId(
+      subject.roadmapTaskKey,
+      new Set(items.map((candidate) => candidate.id)),
+    )
+    const item = items.find((c) => c.id === roadmapId)
     if (!item) {
       return {
         ok: false,
         failureCode: 'item_not_in_ledger',
-        reason: `roadmap item "${subject.roadmapId}" is no longer in the ledger`,
+        reason: `roadmap item "${roadmapId}" is no longer in the ledger`,
       }
     }
-    return { ok: true, body: extractItemDescription(markdown, item) }
+    return { ok: true, body: extractItemDescription(markdown, item), roadmapId }
   } catch (error: unknown) {
     return {
       ok: false,
@@ -449,10 +466,11 @@ async function runChallenge(
   deps: ConflictResolutionDeps,
 ): Promise<ConflictRoundResult> {
   const taskId = subject.task.id
-  const key = challengeKey(subject.reviewedDesignTextHash, dispute.source)
+  const key = challengeKey(subject, dispute.source)
+  const legacyKey = legacyChallengeKey(subject.reviewedDesignTextHash, dispute.source)
   const base = { stage: 'challenge' as const, taskId }
 
-  if (challengeConsumed(storage, taskId, key)) {
+  if (challengeConsumed(storage, taskId, [key, legacyKey])) {
     return {
       ...base,
       status: 'challenge_cap_reached',
@@ -676,7 +694,7 @@ async function runPlRevision(
   const base = { stage: 'pl_revision' as const, taskId }
 
   const revise = deps.revise
-    ?? ((system: string, user: string) => requestText(system, user, {}, PL_REVISION_MAX_TOKENS))
+    ?? ((system: string, user: string) => requestText(system, user, { retryTransientOnce: true }, PL_REVISION_MAX_TOKENS))
 
   let raw: string
   try {
@@ -789,5 +807,5 @@ export async function runConflictResolutionRound(
     }
   }
 
-  return runCriticRound(storage, subject, ledger.body, deps)
+  return runCriticRound(storage, { ...subject, roadmapId: ledger.roadmapId }, ledger.body, deps)
 }

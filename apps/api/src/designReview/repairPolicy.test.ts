@@ -3,6 +3,8 @@ import {
   MAX_REPAIR_ATTEMPTS,
   computeFailureSignature,
   decideRepairAction,
+  parseRetrySource,
+  retryStepKeyFor,
   walkRepairGeneration,
   type PriorRepairJob,
   type RepairFailureFacts,
@@ -39,6 +41,16 @@ function repairOf(
   facts: RepairFailureFacts = FACTS_A,
 ): PriorRepairJob {
   return { id, workflowStepKey: `repair:${source}:1`, status, facts }
+}
+
+/** `source` を同じ入力で再実行する retry Job。 */
+function retryOf(
+  source: string,
+  id: string,
+  status = 'failed',
+  facts: RepairFailureFacts = FACTS_A,
+): PriorRepairJob {
+  return { id, workflowStepKey: retryStepKeyFor(source), status, facts }
 }
 
 /** `source` を直接の親に持つ resume Job。actor class は省略可（= 記録が無い）。 */
@@ -304,6 +316,15 @@ describe('decideRepairAction — AI resume', () => {
     if (decision.action === 'escalate') expect(decision.reason).toContain('limit')
   })
 
+  it('PL Technical Resume も予算を再発行しない', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS)
+    const priors = [...built.jobs, resumeOf(built.tip, 'resume-pl', 'pl')]
+
+    const decision = decideRepairAction('resume-pl', priors, FACTS_A)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.code).toBe('attempt_limit')
+  })
+
   it('[9] AI resume は前 generation の深さをそのまま引き継ぐ', () => {
     const built = chain(1)
     const priors = [...built.jobs, resumeOf(built.tip, 'resume-ai', 'ai')]
@@ -388,6 +409,24 @@ describe('decideRepairAction — actor 不明の resume', () => {
 // ---------------------------------------------------------------------------
 
 describe('walkRepairGeneration — lineage ancestor の記録', () => {
+  it('retry を透過して元の generation の repair 段数と root を保つ', () => {
+    const priors: PriorRepairJob[] = [
+      originJob('initial'),
+      repairOf('initial', 'repair-1'),
+      retryOf('repair-1', 'retry-1'),
+      repairOf('retry-1', 'repair-2'),
+    ]
+
+    const walk = walkRepairGeneration('repair-2', priors)
+
+    expect(walk.ok).toBe(true)
+    if (!walk.ok) return
+    expect(walk.depth).toBe(2)
+    expect(walk.rootJobId).toBe('initial')
+    expect(walk.generationRepairJobIds).toEqual(['repair-2', 'repair-1'])
+    expect(walk.lineageAncestorJobIds).toEqual(['retry-1', 'repair-1', 'initial'])
+  })
+
   // admission の live Job 判定は、この 1 度の walk が辿った経路だけを根拠に除外する。
   // 経路外を混ぜたり、起点を含めたり、足りなかったりすると、そのまま admission がずれる。
   it('辿った ancestor を近い順に、起点を含めずに返す', () => {
@@ -457,6 +496,7 @@ describe('walkRepairGeneration — lineage ancestor の記録', () => {
     ['別 Task 参照', () => walkRepairGeneration('repair-1', [repairOf('job-of-another-task', 'repair-1')]), 'not a job of this task'],
     ['親が欠損', () => walkRepairGeneration('a', [repairOf('b', 'a')]), 'not a job of this task'],
     ['malformed repair key', () => walkRepairGeneration('a', [{ id: 'a', workflowStepKey: 'repair:', status: 'failed', facts: FACTS_A }]), 'malformed repair step key'],
+    ['malformed retry key', () => walkRepairGeneration('a', [{ id: 'a', workflowStepKey: 'retry:source:2', status: 'failed', facts: FACTS_A }]), 'malformed retry step key'],
     ['id 重複', () => walkRepairGeneration('a', [originJob('a'), originJob('a')]), 'duplicate job id'],
   ])('%s では ok:false になり、ancestor 欄そのものを返さない', (_label, run, expectedReason) => {
     const walk = run()
@@ -465,6 +505,22 @@ describe('walkRepairGeneration — lineage ancestor の記録', () => {
     expect(walk.reason).toContain(expectedReason)
     expect(walk).not.toHaveProperty('lineageAncestorJobIds')
   })
+})
+
+describe('retry step key contract', () => {
+  it('source Job id を round trip する', () => {
+    const stepKey = retryStepKeyFor('source-job')
+
+    expect(stepKey).toBe('retry:source-job:1')
+    expect(parseRetrySource(stepKey)).toBe('source-job')
+  })
+
+  it.each(['retry:', 'retry:source', 'retry:source:2', 'repair:source:1'])(
+    'malformed key %s は受理しない',
+    (stepKey) => {
+      expect(parseRetrySource(stepKey)).toBeUndefined()
+    },
+  )
 })
 
 describe('walkRepairGeneration — 数え切れないときは fail-closed', () => {

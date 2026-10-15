@@ -19,6 +19,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import type { Job } from '@ai-team/shared'
 
 /** 同一Taskで自動生成を許すrepair Jobの上限（hard bound）。 */
 export const MAX_REPAIR_ATTEMPTS = 3
@@ -29,6 +30,9 @@ export const MAX_REPAIR_ATTEMPTS = 3
  * 全体一意なので、Stage 1の `retry:<jobId>:1` と同様にID を含めないとTask間で衝突する。
  */
 export const REPAIR_STEP_PREFIX = 'repair:'
+
+/** provider timeout の同一入力 retry Job を示す `workflowStepKey` の接頭辞。 */
+export const RETRY_STEP_PREFIX = 'retry:'
 
 /**
  * resume Job であることを示す `workflowStepKey` の接頭辞。
@@ -50,10 +54,11 @@ export interface RepairFailureFacts {
  * 「誰が再開してよいと判断したか」は別の事実（authority fact）であり、
  * server 側で credential から導く。caller の自己申告は入力にしない。
  *
- * `unknown` は「human かもしれない」ではなく「human と証明できていない」である。
- * したがって `ai` と同じ扱い（generation を跨がない）にする。
+ * `pl` は既存 Policy と Design Review evidence を通った in-process Technical Resume である。
+ * Human Resume ではなく、repair generation を跨がない。`unknown` も「human かもしれない」
+ * ではなく「human と証明できていない」なので、`ai` / `pl` と同じく generation を跨がない。
  */
-export type ResumeActorClass = 'human' | 'ai' | 'unknown'
+export type ResumeActorClass = 'human' | 'pl' | 'ai' | 'unknown'
 
 export interface PriorRepairJob {
   /**
@@ -139,7 +144,7 @@ export interface RepairGeneration {
   depth: number
   /** `rootKind === 'human_resume'` のときだけ入る。 */
   previousGenerationRoot?: string
-  /** 途中で AI / unknown の resume を跨いだか。跨いでも予算は再発行されない。 */
+  /** 途中で PL / AI / unknown の resume を跨いだか。跨いでも予算は再発行されない。 */
   crossedAiResume: boolean
   /** 予算が再発行されたか（= 新しい generation が始まったか）。 */
   budgetReset: boolean
@@ -204,11 +209,138 @@ export function parseRepairSource(stepKey: string): string | undefined {
   return source !== undefined && source.length > 0 ? source : undefined
 }
 
-/** `resume:<sourceJobId>:<n>` から source Job id を取り出す。 */
-function parseResumeSource(stepKey: string): string | undefined {
+/** `retry:<sourceJobId>:1` を組み立てる。 */
+export function retryStepKeyFor(sourceJobId: string): string {
+  return `${RETRY_STEP_PREFIX}${sourceJobId}:1`
+}
+
+/**
+ * `retry:<sourceJobId>:1` から source Job id を取り出す。
+ * 形が違えば `undefined`。**呼び出し側は必ず fail-closed 側へ倒すこと。**
+ */
+export function parseRetrySource(stepKey: string): string | undefined {
+  const match = /^retry:(.+):1$/.exec(stepKey)
+  const source = match?.[1]
+  return source !== undefined && source.length > 0 ? source : undefined
+}
+
+/**
+ * `resume:<sourceJobId>:<n>` から source Job id を取り出す。
+ * 形が違えば `undefined`。**呼び出し側は必ず fail-closed 側へ倒すこと。**
+ */
+export function parseResumeSource(stepKey: string): string | undefined {
   const match = /^resume:(.+):\d+$/.exec(stepKey)
   const source = match?.[1]
   return source !== undefined && source.length > 0 ? source : undefined
+}
+
+export type ReviewedImplementation =
+  | {
+      ok: true
+      reviewJob: Job
+      implementJob: Job
+      /**
+       * 実際に辿った `resume:` の段（`reviewJob` 側から近い順）。各要素は **resume key を持つ review Job**。
+       * 通常の `implement:<id>:review` を直接渡したときは空。authority はここでは判定しない
+       * （repair admission が「Human Resume で回答済みの run」を判定する材料。D3）。
+       */
+      resumeHops: Job[]
+    }
+  | { ok: false, reason: string }
+
+/**
+ * lineage walk が読むのは Job の 2 つの read だけ。policy を storage 実装へ依存させない境界。
+ * `IStorage['jobs']` はそのまま満たす。
+ */
+export interface ReviewLineageJobReader {
+  findById(id: string): Job | undefined
+  findByTaskId(taskId: string): readonly Job[]
+}
+
+/**
+ * **review Job から、それがレビューした implement Job を保存済み行だけで引く。**
+ *
+ * **review → implement の traversal はここが唯一の実装である。** Stage 2（D1）、repair admission（D3）、
+ * approved review の git_commit continuation と CEO REJECT 後の provenance（D4）が共用する。
+ *
+ * ```
+ * [0..n 段] resume:<reviewJobId>:1   … Human Resume が review を再実行した形
+ *   → review      implement:<implementJobId>:review
+ *   → implement   (aiCliMode = 'implement')
+ * ```
+ *
+ * ## なぜ resume を辿るのか（2026-09-28 production 実測）
+ *
+ * `resumeBlockedTask()` は **最新 Job をそのまま複製する**。最新 Job が失敗した review なら
+ * resume Job も review（`resume:<元review>:1`）になる。Stage 2 はこれまで
+ * `implement:<id>:review` の形しか受け付けなかったため、その review が `changes_requested`
+ * を返しても **repair も escalation もログも無く**終わっていた（Task `9fdee5a3`、
+ * review `12c5287f`）。Human Resume のたびに 1 段増えるので、段数は固定しない。
+ *
+ * ## 何をしないか
+ *
+ * - **探索しない。** 各段でキーが名指ししている 1 件だけを読む。候補集合も「最新 Job」も使わない
+ * - **prompt や本文から元 Job を推測しない**
+ * - **review 以外の段を跨がない。** resume の各段は同じ Task / Project の review Job でなければ
+ *   ならず、途中で implement / git_commit 等に当たったら不成立（fail-closed）
+ * - 循環・同じ Job の再訪・Task の Job 数を超える段数は不成立
+ *
+ * authority（Human / AI の resume か）はここでは判定しない。repair の予算と権限は、
+ * 返した implement Job の lineage を既存 `walkRepairGeneration()` が決める（変更しない）。
+ * review の再実行は verdict を作り直すだけで、repair generation を作らないためである。
+ */
+export function resolveReviewedImplementationFrom(
+  jobs: ReviewLineageJobReader,
+  reviewJobId: string,
+): ReviewedImplementation {
+  const reviewJob = jobs.findById(reviewJobId)
+  if (!reviewJob) return { ok: false, reason: `review job ${reviewJobId} is not a stored job` }
+  if (reviewJob.aiCliMode !== 'review') {
+    return { ok: false, reason: `job ${reviewJob.id} is ${reviewJob.aiCliMode ?? 'not an AI CLI job'}, not review` }
+  }
+  const sameOwner = (job: Job): boolean =>
+    job.taskId === reviewJob.taskId && job.projectId === reviewJob.projectId
+
+  // resume の段を、キーが名指す 1 件ずつ遡る。上限は同じ Task の Job 数（それ以上は必ず再訪）。
+  const maxHops = jobs.findByTaskId(reviewJob.taskId).length
+  const visited = new Set<string>([reviewJob.id])
+  const resumeHops: Job[] = []
+  let anchor = reviewJob
+  for (;;) {
+    const sourceId = parseResumeSource(anchor.workflowStepKey ?? '')
+    if (sourceId === undefined) break
+    if (visited.has(sourceId) || visited.size > maxHops) {
+      return { ok: false, reason: `resume lineage of review ${reviewJob.id} does not terminate` }
+    }
+    const source = jobs.findById(sourceId)
+    if (!source) return { ok: false, reason: `resume source job ${sourceId} not found` }
+    if (!sameOwner(source)) {
+      return { ok: false, reason: `resume source job ${sourceId} belongs to a different task or project` }
+    }
+    if (source.aiCliMode !== 'review') {
+      return { ok: false, reason: `resume source job ${sourceId} is ${source.aiCliMode ?? 'not an AI CLI job'}, not review` }
+    }
+    visited.add(sourceId)
+    resumeHops.push(anchor)
+    anchor = source
+  }
+
+  const implementRef = /^implement:([^:]+):review$/.exec(anchor.workflowStepKey ?? '')
+  if (!implementRef) {
+    return {
+      ok: false,
+      reason: `review job ${anchor.id} workflowStepKey is not implement:<id>:review (got ${anchor.workflowStepKey ?? 'none'})`,
+    }
+  }
+  const implementJob = jobs.findById(implementRef[1] as string)
+  if (!implementJob) return { ok: false, reason: `implement job ${implementRef[1]} not found` }
+  if (!sameOwner(implementJob)) {
+    return { ok: false, reason: 'implement job belongs to a different task or project' }
+  }
+  if (implementJob.aiCliMode !== 'implement') {
+    return { ok: false, reason: `job ${implementJob.id} is ${implementJob.aiCliMode ?? 'not an AI CLI job'}, not implement` }
+  }
+  return { ok: true, reviewJob, implementJob, resumeHops }
 }
 
 /**
@@ -246,9 +378,9 @@ export type GenerationWalk =
        * generation の境界とも無関係で、根より上に出ても構わない —— 「この chain が
        * どの Job を経由して来たか」は予算の話ではないためである。
        *
-       * **なぜ必要か**: `resumeBlockedTask()` は元の行を `blocked` のまま残して successor を
-       * 作る。だから CEO の REJECT → Human Resume を繰り返した chain には、blocked のまま
-       * 残る ancestor が**複数**積み上がる。admission の live Job 判定がそのうち 1 件しか
+       * **なぜ必要か**: 旧 `resumeBlockedTask()` は元の行を `blocked` のまま残して successor を
+       * 作っていた。だから既存DBの CEO REJECT → Human Resume を繰り返した chain には、
+       * blocked のまま残る ancestor が**複数**積み上がる。admission の live Job 判定がそのうち 1 件しか
        * 外せないと、2 回目以降の REJECT を経た正規 lineage が必ず弾かれる
        * （2026-09-24 production 実測: Task `c3849205` は `7061400a` と `5472d0c1` の
        * 2 件が blocked で残り、canonical repair 経路が admission だけで止まっていた）。
@@ -273,7 +405,7 @@ export type GenerationWalk =
  *   2. **深さを数える範囲だけが generation で切れる。** 数え終わりは
  *      repair でも resume でもない Job か、**human と証明された resume Job** である。
  *
- * AI / unknown の resume は数え終わりにしない。前の generation の深さを引き継ぐ。
+ * PL / AI / unknown の resume は数え終わりにしない。前の generation の深さを引き継ぐ。
  * これをしないと「repair 使い切り → AI resume → 予算復活」を AI 自身が繰り返せる。
  *
  * 1 と 2 を分けているのは、human resume の意味が「**上流の履歴を跨いで**やり直す」だから
@@ -335,10 +467,11 @@ export function walkRepairGeneration(
         }
   }
 
-  /** `repair:` / `resume:` いずれの規約でも親を返す。それ以外は端なので undefined。 */
+  /** `repair:` / `retry:` / `resume:` いずれの規約でも親を返す。それ以外は端なので undefined。 */
   const lineageParentOf = (stepKey: string | undefined): string | undefined => {
     if (stepKey === undefined) return undefined
     if (stepKey.startsWith(REPAIR_STEP_PREFIX)) return parseRepairSource(stepKey)
+    if (stepKey.startsWith(RETRY_STEP_PREFIX)) return parseRetrySource(stepKey)
     if (stepKey.startsWith(RESUME_STEP_PREFIX)) return parseResumeSource(stepKey)
     return undefined
   }
@@ -406,6 +539,16 @@ export function walkRepairGeneration(
       continue
     }
 
+    if (stepKey.startsWith(RETRY_STEP_PREFIX)) {
+      const parent = parseRetrySource(stepKey)
+      if (parent === undefined) {
+        return { ok: false, reason: `malformed retry step key on job ${cursor}` }
+      }
+      // retry は同じ入力の再実行なので repair 段数を増やさず、source へ透過する。
+      cursor = parent
+      continue
+    }
+
     if (stepKey.startsWith(RESUME_STEP_PREFIX)) {
       const parent = parseResumeSource(stepKey)
       if (parent === undefined) {
@@ -422,7 +565,7 @@ export function walkRepairGeneration(
       continue
     }
 
-    // repair でも resume でもない Job（implement / retry 等）が lineage の端。
+    // repair / retry / resume のいずれでもない Job（initial implement 等）が lineage の端。
     return finish(cursor)
   }
 
@@ -433,6 +576,35 @@ export function walkRepairGeneration(
     ok: false,
     reason: `lineage walk did not terminate within the ${byId.size} jobs of this task`,
   }
+}
+
+/**
+ * **Human Resume で後継が作られた Job の id 集合**（superseded）。
+ *
+ * `resumeBlockedTask()` は元の Job を `failed` へ終端化して
+ * `resume:<元Job>:<n>` を作る。旧DBに残る `blocked` source も含め、元の行は durable history
+ * であって、もう Task を止めている
+ * 原因ではない —— 人が「ここから続ける」と明示的に答えたからである。
+ *
+ * Job X を superseded とするのは、次をすべて満たす Job S があるときだけ:
+ *   - S の stepKey が `resume:<X>:<n>`（既存 `parseResumeSource()`。形が違えば対象外）
+ *   - S の actor が `human`（`unknown` / `pl` / `ai` は対象外。記録が無いことを human と解釈しない）
+ *   - S から辿る lineage 全体が well-formed（既存 `walkRepairGeneration()` が ok。
+ *     X の実在・同一 Task・非環はそちらの責務）
+ *
+ * この純粋関数自身は行を書き換えない。ここは「いま誰かが対応すべき停止か」を読むときの
+ * compatibility 解釈だけである。
+ */
+export function jobsSupersededByHumanResume(priorJobs: readonly PriorRepairJob[]): Set<string> {
+  const superseded = new Set<string>()
+  for (const job of priorJobs) {
+    if (job.resumeActorClass !== 'human') continue
+    const source = parseResumeSource(job.workflowStepKey ?? '')
+    if (source === undefined) continue
+    if (!walkRepairGeneration(job.id, priorJobs).ok) continue
+    superseded.add(source)
+  }
+  return superseded
 }
 
 /**

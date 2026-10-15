@@ -157,6 +157,18 @@ describe('POST /api/tasks/:id/resume — blocked git_commit Job (STALE approval)
       // workingDirは既存のAI-CLI resume分岐と同じく正規TARGET_WORKING_DIRへ正規化される
       expect(resumedJob.safeCommand.workingDir).toBe('/workspace/target')
       expect(resumedJob.safeCommand.params).toEqual(blockedJob.safeCommand.params)
+      expect(resumedJob.workflowStepKey).toBe(`resume:${blockedJob.id}:1`)
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      expect(storage.jobs.findById(blockedJob.id)?.status).toBe('failed')
+      expect(storage.auditLog.findByEntity('job', blockedJob.id)).toEqual([
+        expect.objectContaining({
+          operation: 'resume_source_terminalized',
+          result: 'success',
+          detail: expect.stringContaining(`successor_job_id=${resumedJob.id}`),
+        }),
+      ])
     })
   })
 
@@ -247,7 +259,96 @@ describe('POST /api/tasks/:id/resume — blocked git_commit Job (STALE approval)
       const jobsRes = await app.inject({ method: 'GET', url: `/api/jobs?taskId=${task.id}` })
       const jobs = parseBody<Job[]>(jobsRes.body)
       expect(jobs.filter((j) => j.status === 'queued')).toHaveLength(1)
-      expect(jobs.filter((j) => j.status === 'blocked')).toHaveLength(1)
+      expect(jobs.filter((j) => j.status === 'blocked')).toHaveLength(0)
+      expect(jobs.filter((j) => j.status === 'failed')).toHaveLength(1)
+    })
+  })
+
+  it('resumes a blocked git_commit Job with no approval and terminalizes only that source', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const source = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: {
+          kind: 'git_commit',
+          workingDir: '/workspace/target',
+          params: { commitMessage: 'no approval yet' },
+        },
+      })
+
+      const { statusCode, body } = await resumeTask(app, task.id)
+
+      expect(statusCode).toBe(201)
+      const successor = body as Job
+      expect(successor.workflowStepKey).toBe(`resume:${source.id}:1`)
+      expect(storage.jobs.findById(source.id)?.status).toBe('failed')
+      expect(storage.jobs.findByTaskId(task.id).filter((job) => job.status === 'blocked')).toEqual([])
+    })
+  })
+
+  it('keeps a legacy nested git_commit chain on resume:<latestJob>:1', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const original = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const previousResume = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        workflowStepKey: `resume:${original.id}:1`,
+      })
+      const latest = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        workflowStepKey: `resume:${previousResume.id}:1`,
+      })
+
+      const { statusCode, body } = await resumeTask(app, task.id)
+
+      expect(statusCode).toBe(201)
+      expect((body as Job).workflowStepKey).toBe(`resume:${latest.id}:1`)
+      expect(storage.jobs.findById(latest.id)?.status).toBe('failed')
+    })
+  })
+
+  it('keeps an other-key git_commit Job on the legacy resume:<latestJob>:1 path', async () => {
+    await withApp(async (app) => {
+      const project = await createProject()
+      const task = await createTask(project.id)
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const source = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        workflowStepKey: 'repair:legacy-git-commit:1',
+      })
+
+      const { statusCode, body } = await resumeTask(app, task.id)
+
+      expect(statusCode).toBe(201)
+      expect((body as Job).workflowStepKey).toBe(`resume:${source.id}:1`)
     })
   })
 

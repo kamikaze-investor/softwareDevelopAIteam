@@ -295,10 +295,8 @@ describe('reviewVisibleSpecKey', () => {
     })).toBe(reviewVisibleSpecKey(REJECTED))
   })
 
-  it('**acceptanceCriteria はキーに入らない**（Review が見ないため）', () => {
-    // `buildInitialImplementAiCliPrompt()` のレビュー対象は description + allowedPaths 由来の
-    // Design Contract だけで、AC は1文字も入らない。AC だけ変えた提案を「違う」と扱うと、
-    // **byte 単位で同一のテキストへの再抽選**を引けてしまう。
+  it('**acceptanceCriteria はキーに入らない**（既存 policy では AC-only は非 material）', () => {
+    // AC は implement prompt と Review へ届くが、AC だけの書き換えで material redesign としない。
     const withCriteria = { ...REJECTED, acceptanceCriteria: ['まったく別の受入条件'] }
 
     expect(reviewVisibleSpecKey(withCriteria)).toBe(reviewVisibleSpecKey(REJECTED))

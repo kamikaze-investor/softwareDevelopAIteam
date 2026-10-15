@@ -896,7 +896,7 @@ describe('recovery action — 承認の束縛', () => {
  * **元 Job が `blocked` のまま残る human generation の repair descendant**
  * （独立レビュー指摘・2026-09-23 の HIGH 回帰）。
  *
- * production `c3849205` の形そのもの: `resumeBlockedTask()` は元の行を `blocked` の
+ * production `c3849205` の legacy shape: 当時の `resumeBlockedTask()` は元の行を `blocked` の
  * まま残して `resume:<元Job>:1` を作る。その resume 成果へ recovery epoch を張って
  * repair を始めると、attempt 2 以降の実装は `repair:` 規約になるため、**自分の stepKey
  * からは元の resume 元を辿れない**。live Job の除外が implementJob 自身の `resume:` キー

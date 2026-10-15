@@ -70,8 +70,9 @@ async function executeRoadmapReviewToTerminal(
 /**
  * 参照されたAI調査対象の不確実性を、そのタスクの`description`へ決定論的に展開する。
  *
- * Implementerへ届く既存の唯一の経路は`Task.description`であり
- * （`buildInitialImplementAiCliPrompt()`はdescriptionとallowedPathsしか使わない。
+ * 不確実性の本文を Implementer へ届ける既存の経路は`Task.description`であり
+ * （`buildInitialImplementAiCliPrompt()`はdescriptionにTask Contractを加えるが、
+ * `technicalUncertaintyRefs`自体は使わない。
  * Context Packは未配線）、生成AIが本文を書き写したかどうかに依存させると不変条件にならない。
  * 生成AIには構造化された参照（`technicalUncertaintyRefs`）だけを返させ、本文の展開は
  * ここで機械的に行う。

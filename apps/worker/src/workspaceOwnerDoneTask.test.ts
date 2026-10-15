@@ -1,10 +1,9 @@
 /**
  * 終わった Task に取り残された blocked Job が workspace 所有権を握り続ける問題の回帰テスト。
  *
- * `resumeBlockedTask()` は**新しい Job を別行として作り、旧 blocked 行を監査証跡として残す**
- * （`approveAndResumeJob()` は同一行を `blocked -> queued` へ UPDATE するので滞留しない）。
- * そのため resume 経路でだけ「終わった Task に blocked 行が残る」状態が生まれ、
- * `findWorkspaceOwningTaskId()` が Job status しか見ていなかったために所有権が永久に残っていた。
+ * 現行の resume handoff / startup reconciliation は canonical な successor proof がある source を
+ * `failed` にする。この fixture は、successor proof が無いまま外部完了等で Task だけが終わった
+ * legacy 行を対象にし、`findWorkspaceOwningTaskId()` の fail-closed fallback を固定する。
  *
  * 実害: 期限切れ Approval からスマホで正規復旧して commit に成功しても所有権が解放されず、
  * 後続 Task / Project が進まない。解放手段が archive / pause しか無い状態は

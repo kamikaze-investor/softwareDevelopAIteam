@@ -13,12 +13,7 @@ import {
   type Task,
   type TaskFailureQuestionTurn,
 } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
-import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
+import { buildResumeAiCliPrompt } from '../implementPrompt'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
 import { verifyExternalCompletion } from '../reconcile/externalCompletion'
 import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
@@ -31,12 +26,12 @@ import {
   type TaskFailureAiOptions,
   type TaskFailureJob,
 } from '../taskFailureExplain/taskFailureAi'
-import {
-  buildDefaultCoordinatorDeps,
-  createAndExecuteDesignReview,
-  type CoordinatorDeps,
-} from '../designReview/designReviewCoordinator'
+import type { CoordinatorDeps } from '../designReview/designReviewCoordinator'
 import { classifyResumeActorFromRequest, recordResumeActor } from '../designReview/resumeActor'
+import {
+  RESUME_DESIGN_REVIEW_FAILED,
+  resumeBlockedTaskWithDesignReview,
+} from '../designReview/resumeBlockedTask'
 
 export const TASK_FAILURE_EXPLANATION_INPUT_VERSION = 1 as const
 
@@ -196,26 +191,7 @@ function isTaskFailureJob(job: Job): job is TaskFailureJob {
   return job.status === 'failed' || job.status === 'blocked'
 }
 
-export function buildResumeAiCliPrompt(task: Pick<Task, 'title' | 'description' | 'allowedPaths'>, instruction: string): string {
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs({
-      predictedFocuses: (task.allowedPaths ?? []).flatMap(mapFileToFocuses),
-    }, principles),
-    principles,
-  })
-
-  return `[Task] ${task.title}
-${task.description}
-
-[CEOからの追加指示]
-${instruction}
-
-[重要な注意]
-却下された操作を変更せず繰り返さないこと。CEOの追加指示を反映した、異なる内容の変更を作成してください。
-
-${designContract}`
-}
+export { buildResumeAiCliPrompt } from '../implementPrompt'
 
 // limit はここで厳密なnumber検証をせず、storage層のnormalizeSummaryLimit()に正規化を委ねる
 // （0/負数/NaN/非数値文字列/100超過はいずれもそこで安全な値へfallback・clampされる）
@@ -560,26 +536,19 @@ export async function taskRoutes(
     }
 
     const instructionPrompt = buildResumeAiCliPrompt(task, result.data.instruction)
-    let resumed = storage.jobs.resumeBlockedTask({ taskId: task.id, instructionPrompt })
+    const resumed = await resumeBlockedTaskWithDesignReview(storage, {
+      task,
+      instructionPrompt,
+      ...(options.resumeDesignReviewDeps !== undefined
+        ? { coordinatorDeps: options.resumeDesignReviewDeps }
+        : {}),
+    })
 
-    // 再開指示は元Jobとは異なる実装promptになるため、元promptへのevidenceを流用しない。
-    // 既存のDesign Review coordinatorでそのpromptだけを再レビューしてから、既存resume producerを再試行する。
-    if (!resumed.ok && resumed.code === 'DESIGN_REVIEW_PRECONDITION_FAILED') {
-      const review = await createAndExecuteDesignReview(storage, {
-        taskId: task.id,
-        taskTitle: task.title,
-        designText: instructionPrompt,
-        changedFiles: [],
-      }, options.resumeDesignReviewDeps ?? buildDefaultCoordinatorDeps())
-
-      if (review.status !== 'evidence_registered') {
-        return reply.status(409).send({
-          error: 'Resume instruction did not pass the pre-implementation Design Review',
-          reason: review.error,
-        })
-      }
-
-      resumed = storage.jobs.resumeBlockedTask({ taskId: task.id, instructionPrompt })
+    if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_FAILED) {
+      return reply.status(409).send({
+        error: 'Resume instruction did not pass the pre-implementation Design Review',
+        reason: resumed.reviewError,
+      })
     }
 
     if (!resumed.ok) {
@@ -590,7 +559,10 @@ export async function taskRoutes(
       // 400 ではなく 409 を返す。code を添えるのは、呼び出し側が
       // 「retry すれば直る」と誤解しないようにするためである（fail-closed であり、
       // 探索を広げて自動復旧させることは意図的にしていない）。
-      if (resumed.code === 'REJECTED_COMMIT_SOURCE_UNRESOLVED') {
+      if (
+        resumed.code === 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
+        || resumed.code === 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
+      ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
       return reply.status(400).send({ error: resumed.reason })

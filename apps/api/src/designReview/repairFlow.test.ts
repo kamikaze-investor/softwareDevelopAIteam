@@ -28,6 +28,8 @@ function seed(storage: IStorage): { taskId: string; projectId: string } {
   const task = storage.tasks.create({
     projectId: project.id, title: 'T', description: 'd',
     status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+    acceptanceCriteria: ['repair preserves the requested behavior'],
+    allowedPaths: ['apps/api/src/designReview'],
   })
   return { taskId: task.id, projectId: project.id }
 }
@@ -316,6 +318,8 @@ describe('review済みpromptがそのままrepair Jobへ渡る', () => {
       const repairJob = storage.jobs.findById(outcome.jobId)!
       const evidence = storage.designReviewEvidence.findLatestByTaskId(ids.taskId)!
       expect(computeDesignTextHash(repairJob.aiCliPrompt!)).toBe(evidence.designTextHash)
+      expect(repairJob.aiCliPrompt).toContain('repair preserves the requested behavior')
+      expect(repairJob.aiCliPrompt).toContain('apps/api/src/designReview')
     }
   })
 })
@@ -698,5 +702,255 @@ describe('generation の導出そのものが失敗しても repair は止めな
 
     expect(outcome.status).toBe('repair_job_created')
     expect(storage.tasks.findById(ids.taskId)!.status).not.toBe('blocked')
+  })
+})
+
+/**
+ * **repair handoff は source Job の終端結果を上書きしない。**
+ *
+ * production の repair は 2 種類の source から始まる:
+ *   - 実装が失敗した（`failed`）/ 所有権を保持したまま止めた（`blocked`）
+ *   - **実装は成功したが review が `changes_requested` を返した（`success`）**
+ *
+ * 後者は `routes/jobs.ts` の review 経路と Human Recovery の stored review 経路で、
+ * repair の主要な入口である。以前は `createRepairJobWithHandoff()` が source を
+ * 無条件に `failed` へ落としていたため、成功記録が消えていた（2026-09-25 実測）。
+ * ここは storage 単体ではなく **実際の repair 経路を通して**それを固定する。
+ */
+describe('repair handoff は source Job の終端結果を保持する', () => {
+  /** review 対象になった、成功した implement Job。 */
+  function createSucceededImplementJob(
+    storage: IStorage,
+    ids: { taskId: string; projectId: string },
+  ): Job {
+    const job = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'original prompt',
+    } as never)
+    return storage.jobs.update(job.id, {
+      status: 'success',
+      exitCode: 0,
+      stdout: 'implementation finished',
+      // focus 集合は changedFiles から決まる（selectFocuses）。deps() の ALIGNED stdout は
+      // focus を 1 件も報告しないので、focus が選ばれない changedFiles に揃える。
+      changedFiles: ['docs/readme.md'],
+    } as never)!
+  }
+
+  /** その implement Job に対する review Job と、保存済みの `changes_requested` verdict。 */
+  function storeChangesRequestedReview(
+    storage: IStorage,
+    ids: { taskId: string; projectId: string },
+    implementJobId: string,
+  ): void {
+    const reviewJob = storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'reviewer_ai',
+      status: 'queued',
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'review',
+      aiCliProvider: 'claude_code',
+      workflowStepKey: `implement:${implementJobId}:review`,
+    } as never)
+    storage.jobs.update(reviewJob.id, { status: 'success', exitCode: 0 } as never)
+    storage.reviewResults.create({
+      taskId: ids.taskId,
+      jobId: reviewJob.id,
+      reviewer: 'qa_ai',
+      status: 'changes_requested',
+      summary: 'fix the reported points',
+      findings: [{ severity: 'medium', file: 'docs/readme.md', message: 'in scope' }],
+    } as never)
+  }
+
+  it('review が却下した成功実装から repair を作っても、成功記録は残る', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const implementJob = createSucceededImplementJob(storage, ids)
+    storeChangesRequestedReview(storage, ids, implementJob.id)
+    const review = storage.reviewResults.findByTaskId(ids.taskId)[0]
+
+    // `routes/jobs.ts` の review 経路と同じ呼び方。
+    const preparation = prepareRepairFlow(storage, { failedJob: implementJob, review })
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+    expect(preparation.run.repairSourceJobId).toBe(implementJob.id)
+
+    const run = storage.designReviewRuns.create(preparation.run)
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    expect(outcome.status).toBe('repair_job_created')
+    // successor は従来どおり作られる。
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+    // **source の成功記録は壊れない。**
+    const after = storage.jobs.findById(implementJob.id)!
+    expect(after.status).toBe('success')
+    expect(after.exitCode).toBe(0)
+    expect(after.stdout).toBe('implementation finished')
+  })
+
+  // **`runRepairFlow()` では確かめられない。** あちらは `storage.jobs.create()` を直接呼び、
+  // `createRepairJobWithHandoff()` を通らない（`repairFlow.ts` の `runRepairFlow`）ため、
+  // handoff の source 更新を 1 行も実行しない（独立レビュー指摘・2026-09-25）。
+  // 失敗側も success 側と同じ `prepareRepairFlow()` + `executeQueuedRepair()` で確かめる。
+  it('失敗した実装からの repair では、従来どおり source は failed のまま', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+
+    const run = storage.designReviewRuns.create(preparation.run)
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    expect(outcome.status).toBe('repair_job_created')
+    if (outcome.status !== 'repair_job_created') return
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+    const after = storage.jobs.findById(failed.id)!
+    expect(after.status).toBe('failed')
+    expect(after.exitCode).toBe(1)
+    expect(after.stderr).toBe('TypeError: boom')
+    const repairJob = storage.jobs.findById(outcome.jobId)!
+    expect(repairJob.aiCliPrompt).toContain('repair preserves the requested behavior')
+    expect(repairJob.aiCliPrompt).toContain('apps/api/src/designReview')
+  })
+})
+
+/**
+ * **handoff の workflowStepKey 競合 semantics は queued / terminal で 1 つである。**
+ *
+ * `ux_jobs_workflow_step_key` は全体一意で、手前の dedup は同一 Task しか見ない。よって
+ * dedup を通り抜けて一意制約で落ちる形が原理的に存在する。`completeRepairHandoff()` は
+ * それを `runRepairFlow` と同じ 2 分岐で扱う（CEO 判断・2026-09-25）:
+ *
+ *   同一 Task が既に持っている → `already_started`（良性。人へ渡さない）
+ *   別 Task が持っている       → escalate（lineage 破損。黙って進行中扱いにしない）
+ *
+ * ここで固定するのは「通常経路に regression が無い」ことと「良性の重複が false human
+ * escalation にならない」ことの両方である。
+ */
+describe('handoff の stepKey 競合は queued path でも同じ 2 分岐で収束する', () => {
+  it('通常の handoff は従来どおり repair Job を作り、Task を blocked にしない', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    expect(preparation.action).toBe('queue')
+    if (preparation.action !== 'queue') return
+    const run = storage.designReviewRuns.create(preparation.run)
+
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    expect(outcome.status).toBe('repair_job_created')
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+    expect(storage.tasks.findById(ids.taskId)!.status).not.toBe('blocked')
+  })
+
+  it('同一 Task が dedup 通過後に同じ key を取っても already_started で、Task を blocked にしない', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    if (preparation.action !== 'queue') throw new Error('fixture failed')
+    const run = storage.designReviewRuns.create(preparation.run)
+
+    // 良性の重複そのもの: 同一 Task の successor が既に実体化している。
+    storage.jobs.create({
+      taskId: ids.taskId,
+      projectId: ids.projectId,
+      agentRole: 'developer_ai',
+      status: 'queued',
+      workflowStepKey: preparation.stepKey,
+      safeCommand: { kind: 'noop' },
+      aiCliMode: 'implement',
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'the successor that already exists',
+    } as never)
+
+    // **dedup だけを盲目にして、一意制約まで到達させる。**
+    // `findByTaskId` は 1 回の handoff で quarantine 判定 → dedup → 失敗後の読み直し の
+    // 順に呼ばれる。2 番目（dedup）だけ key を隠すと、create が一意制約で落ち、
+    // 3 番目の読み直しが「この Task が持っている」と正しく答える経路を通る。
+    let calls = 0
+    const racingStorage: IStorage = {
+      ...storage,
+      jobs: {
+        ...storage.jobs,
+        findByTaskId: (taskId: string) => {
+          calls += 1
+          const rows = storage.jobs.findByTaskId(taskId)
+          if (calls === 2) return rows.filter((job) => job.workflowStepKey !== preparation.stepKey)
+          return rows
+        },
+      },
+    }
+
+    const outcome = await executeQueuedRepair(racingStorage, run, preparation.stepKey, deps())
+
+    // **false human escalation にしない。**
+    expect(outcome.status).toBe('already_started')
+    expect(storage.tasks.findById(ids.taskId)!.status).not.toBe('blocked')
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(1)
+  })
+
+  it('別 Task が同じ key を持っている場合は従来どおり escalate する（lineage 破損）', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    if (preparation.action !== 'queue') throw new Error('fixture failed')
+    const run = storage.designReviewRuns.create(preparation.run)
+
+    const otherTask = storage.tasks.create({
+      projectId: ids.projectId, title: 'T2', description: 'd',
+      status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+    } as never)
+
+    // Design Review 中に、**別 Task の** Job がこの key を取ってしまう。
+    // 手前の dedup は同一 Task しか見ないので通り抜け、一意制約で落ちる。
+    const racingDeps = {
+      ...deps(),
+      execute: async () => {
+        storage.jobs.create({
+          taskId: otherTask.id,
+          projectId: ids.projectId,
+          agentRole: 'developer_ai',
+          status: 'queued',
+          workflowStepKey: preparation.stepKey,
+          safeCommand: { kind: 'noop' },
+          aiCliMode: 'implement',
+          aiCliProvider: 'claude_code',
+          aiCliPrompt: 'foreign prompt',
+        } as never)
+        return { ok: true as const, stdout: ALIGNED_STDOUT, timedOut: false }
+      },
+    }
+
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, racingDeps)
+
+    // lineage 破損は黙って進行中扱いにしない。人へ渡す。
+    expect(outcome.status).toBe('escalated')
+    expect(storage.tasks.findById(ids.taskId)!.status).toBe('blocked')
+    // この Task 側に repair Job は作られていない（transaction rollback）。
+    expect(
+      storage.jobs.findByTaskId(ids.taskId).filter((job) => job.workflowStepKey === preparation.stepKey),
+    ).toHaveLength(0)
   })
 })
