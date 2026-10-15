@@ -194,6 +194,38 @@ CEO はこの変更を承認したが、**承認要件そのものを省略す�
 この6点が崩れる変更は、`resume_task` の Gate 構成を戻すこと（= up-front `approval_gate` の復活）を
 検討する合図である。
 
+## CEO が REJECT した git_commit の解放（2026-10-15 CEO 承認）
+
+git_commit Approval を REJECT すると、その Job は `blocked` のまま残る。PL は CEO の却下を自動 resume しない。
+Task を park して Project を解放する経路は **既存の ADMIN manual abort だけ**で、条件は次のとおり。
+
+- **REJECT だけでは何も park しない。** 別の `abort_task` Approval が `APPROVED` であることを要し、解放時に
+  `CONSUMED` になる（既存の manual abort と同じ意味）。却下した git_commit Approval は `REJECTED` のまま。
+- 対象は「最新 Job が blocked git_commit で、**その Job 自身に直接紐づく** Approval が `REJECTED`」の Task だけ。
+  resume を辿って却下を推定しない。同一 Task / Project、Candidate HEAD = Approval の `targetCommit` を要する。
+- Worker は観測だけを行い、ファイルを削除しない。Candidate の差分は operator が **復元できることを確認した backup**
+  を取ってから戻す（手順: `decisions/p2_technical_recovery_production_e2e.md`）。
+- 最終 transaction 内で、最新 Job・直接の却下・HEAD・live Job 不在・他 Project を含む workspace 所有者不在・
+  clean 観測と knownGood・abort 認可の種類（manual と technical を混在させない）を再確認し、
+  Job の failed 化・park・Approval 消費・監査を atomic に行う。どれかが欠ければ何も変えない。
+
+## 期限切れ git_commit の resume 系譜 — 固定 anchor + generation（2026-10-15 CEO 条件付き承認）
+
+承認期限切れで git_commit を resume するたびに `resume:<直前Job>:1` が入れ子になり、1ホップしか辿らない
+REJECT → 再実装の解決が届かなくなった。新しい resume は元の git_commit Job（`review:<id>:git-commit`）を
+anchor として `resume:<anchor>:<n>` を振る。条件は次のとおり。
+
+- **承認の意味は変えない。** 各 generation は新しい Approval と Gate 評価を受け、HEAD / diff が変われば
+  既存の規則どおり無効になる（承認待ちは SUPERSEDED、承認済みは STALE）。Stage 1 自動通過の対象外
+  （`resume:` は対象外のまま）。既存 Job の workflowStepKey は書き換えない（resume が直前 Job を
+  blocked → failed にする既存の handoff は従来どおり）。
+- anchor は同一 Task / Project の canonical git_commit Job に限る。参照は1回だけで、再帰・多段探索をしない。
+- **Job 自身に直接紐づく Approval を最初に見る。** 直結の REJECTED は常に CEO の却下として扱う。
+  anchor 経由で引き継いだ却下は triage には効くが、manual abort（直結のみ）の根拠にはならない。
+- 旧形式（key 無し・入れ子の `resume:<prev>:1`）は従来どおり扱う。自動移行しない。
+- 新方式の系譜が壊れている（重複・欠番・不正 anchor）場合は resume を 409 で拒否して何も作らない。
+  これは Decision Authority の問題ではないので CEO へ上げず、既存の technical budget で止める。
+
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
 
 **「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を

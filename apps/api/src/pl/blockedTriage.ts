@@ -70,6 +70,10 @@ import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
+import {
+  classifyGitCommitResumeLineage,
+  parseGitCommitResumeStepKey,
+} from '../gitCommitResumeLineage'
 
 // ────────────────────────────────────────────────────────────
 // 語彙
@@ -343,6 +347,8 @@ interface Facts {
   ceoRejectedGitCommit?: boolean
   /** 却下判定の根拠に使った Approval 行 id（証拠欄に出す）。 */
   rejectedApprovalId?: string
+  /** fixed-anchor generation が壊れており、自動 resume へ倒してはならない。 */
+  gitCommitResumeLineageInvalidReason?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -354,8 +360,8 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     item.taskId !== undefined ? storage.approvalRequests.findActiveByTaskId(item.taskId) : undefined
   // **linked Approval 基準**（`resumeBlockedTask()` と同じ判定）。
   // Task 最新行ではなく、その Job の `approvalId` が指す行だけを根拠にする。
-  const linkedRejection = (() => {
-    if (!job || job.safeCommand.kind !== 'git_commit') return undefined
+  const linkedGitCommit = (() => {
+    if (!job || job.safeCommand.kind !== 'git_commit') return {}
 
     const rejectionOf = (owner: Job, approvalId: string) => {
       const approval = storage.approvalRequests.findById(approvalId)
@@ -366,20 +372,48 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
       return approval.status === 'REJECTED' ? approval : undefined
     }
 
-    if (job.approvalId) return rejectionOf(job, job.approvalId)
+    // A rejection directly linked to this Job is authoritative on every key shape.
+    // Check it before technical lineage classification so corruption cannot hide a human decision.
+    if (job.approvalId) {
+      const directRejection = rejectionOf(job, job.approvalId)
+      if (directRejection !== undefined) return { rejection: directRejection }
+    }
 
-    // **link が無い Job も1ホップだけ辿る。** Gate が既存 REJECTED を再利用して弾いた Job には
+    const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
+    const classification = classifyGitCommitResumeLineage({
+      currentJob: job,
+      referencedJob: parsed === undefined ? undefined : storage.jobs.findById(parsed.anchorJobId),
+      taskJobs,
+      requireCurrentIsLatestGeneration: true,
+    })
+    if (classification.kind === 'invalid_new_scheme') {
+      return { invalidReason: classification.reason }
+    }
+
+    // Preserve the old rule: a directly linked non-REJECTED approval never inherits
+    // a rejection from another row.
+    if (job.approvalId) return {}
+
+    // **link が無い Job は canonical anchor を1回だけ参照する。** Gate が既存 REJECTED を再利用して弾いた Job には
     // `approvalId` が付かない（`ux_jobs_approval_id` が UNIQUE なので結び直しもできない）。
     // 放置すると「却下されていない」と読んで `auto_recovery` を返し、PL が同じ内容を
-    // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1ホップに揃える。
+    // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1参照に揃える。
+    if (classification.kind === 'new_scheme') {
+      const anchor = classification.lineage.anchorJob
+      if (!anchor.approvalId) return {}
+      return { rejection: rejectionOf(anchor, anchor.approvalId) }
+    }
+
+    // Legacy behaviour is intentionally one exact hop, including nested chains.
     const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
-    if (!resumed) return undefined
-    const source = storage.jobs.findById(resumed[1] as string)
-    if (!source || !source.approvalId) return undefined
-    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return undefined
-    if (source.safeCommand.kind !== 'git_commit') return undefined
-    return rejectionOf(source, source.approvalId)
+    if (!resumed) return {}
+    const source = classification.referencedJob
+    if (!source || !source.approvalId) return {}
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return {}
+    if (source.safeCommand.kind !== 'git_commit') return {}
+    return { rejection: rejectionOf(source, source.approvalId) }
   })()
+  const linkedRejection = linkedGitCommit.rejection
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -393,6 +427,9 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     ...(approval !== undefined ? { approvalStatus: approval.status, approvalId: approval.id } : {}),
     ...(linkedRejection !== undefined
       ? { ceoRejectedGitCommit: true, rejectedApprovalId: linkedRejection.id }
+      : {}),
+    ...(linkedGitCommit.invalidReason !== undefined
+      ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
     ...(review !== undefined ? { review } : {}),
     ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
@@ -890,6 +927,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           value: ceoRejected ? 'REJECTED' : facts.approvalStatus ?? 'none',
         },
         { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        // 新方式 lineage の破損（重複・欠番・不正 anchor）は Decision Authority の問題ではない。
+        // CEO へは回さず、既存の技術復旧経路に任せる: resume は 409 で何も作らず理由を返し、
+        // 試行は technical budget で止まり `technical_exhausted` として見える（specs/22 §1-3）。
+        ...(facts.gitCommitResumeLineageInvalidReason !== undefined
+          ? [{
+            fact: 'git_commit.resume_lineage',
+            id: facts.job.id,
+            value: facts.gitCommitResumeLineageInvalidReason,
+          }]
+          : []),
       ],
       // **却下は「復旧できない」ではなく「AI が勝手に復旧してはいけない」。**
       // 経路自体は存在するので `existingRecoveryAvailable` は true のままにし、

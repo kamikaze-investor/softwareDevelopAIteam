@@ -21,7 +21,7 @@ import {
 } from './executionLoop'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import type { JobRefusalMetadata, ReviewStatus } from '@ai-team/shared'
+import type { Job, JobRefusalMetadata, ReviewStatus } from '@ai-team/shared'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 
 /**
@@ -537,6 +537,7 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     const job = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' }, dryRun: false,
+      workflowStepKey: `review:approval-review-${taskId}:git-commit`,
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(job.id, { stderr: 'blocked: approval required' } as Parameters<IStorage['jobs']['update']>[1])
     const created = storage.approvalRequests.createForJob({
@@ -628,6 +629,117 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(allowed).toEqual(['escalate_to_ceo'])
   })
 
+  it('H6a. generation 3 inherits only the canonical anchor REJECT and remains CEO_ESCALATION', () => {
+    const storage = seedBlockedGitCommitWithApproval('REJECTED')
+    const task = storage.tasks.findByProjectId(storage.projects.findAll()[0].id)[0]
+    const anchor = storage.jobs.findByTaskId(task.id).find((job) => job.safeCommand.kind === 'git_commit')!
+    storage.jobs.update(anchor.id, { status: 'failed' })
+    let latest: Job = anchor
+    for (let generation = 1; generation <= 3; generation += 1) {
+      latest = storage.jobs.create({
+        taskId: task.id,
+        projectId: task.projectId,
+        agentRole: 'developer_ai',
+        status: generation === 3 ? 'blocked' : 'failed',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' },
+        dryRun: false,
+        workflowStepKey: `resume:${anchor.id}:${generation}`,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    }
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId: task.projectId, taskId: task.id,
+      jobId: latest.id, detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    expect(latest.approvalId).toBeUndefined()
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+    expect(diagnosis.recoverable).toBe(false)
+    expect(diagnosis.summary).toContain('却下')
+  })
+
+  it('H6b. keyless and legacy nested git_commit rows keep the legacy AUTO_RECOVERY triage', () => {
+    const { storage, taskId, projectId } = seed()
+    const keyless = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const firstLegacyResume = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: `resume:${keyless.id}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const nestedLegacyResume = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: `resume:${firstLegacyResume.id}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId, taskId, jobId: nestedLegacyResume.id,
+      detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+    expect(diagnosis.recoverable).toBe(true)
+  })
+
+  it('H6c. invalid generation >1 stays on the technical path (not CEO) and records the lineage reason', () => {
+    const { storage, taskId, projectId } = seed()
+    const nonAnchor = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const invalid = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: `resume:${nonAnchor.id}:2`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId, taskId, jobId: invalid.id,
+      detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    // resume 自体は 409 で fail closed（resumeExpiredApproval.test.ts）。triage は CEO へ上げず、
+    // 既存の technical budget に任せる。
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('auto_recovery')
+    expect(diagnosis.recommendedLane).not.toBe('ceo_escalation')
+    expect(diagnosis.evidence).toContainEqual(expect.objectContaining({
+      fact: 'git_commit.resume_lineage', id: invalid.id,
+    }))
+  })
+
+  it('H6d. a directly linked REJECTED approval wins over invalid lineage on any key shape', () => {
+    const { storage, taskId, projectId } = seed()
+    const invalid = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'resume:missing-anchor:2',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const created = storage.approvalRequests.createForJob({
+      taskId, targetBranch: 'master', targetCommit: 'c', targetDiffHash: 'd',
+      riskLevel: 'LOW', requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 1800_000).toISOString(), invalidIf: [],
+    } as never, invalid.id)
+    if (!created.ok) throw new Error('failed to seed approval')
+    storage.approvalRequests.updateStatus(created.approvalRequest.id, 'REJECTED', undefined, true)
+    storage.tasks.update(taskId, { status: 'blocked' })
+
+    const diagnosis = triageBlocked(storage, {
+      kind: 'job_blocked', projectId, taskId, jobId: invalid.id,
+      detail: 'blocked', stuckForMs: 0,
+    } as AttentionItem)
+
+    expect(diagnosis.rootCauseClass).toBe('approval_not_actionable')
+    expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+    expect(diagnosis.summary).toContain('却下')
+  })
+
   it('G. EXPIRED は従来どおり AUTO_RECOVERY のまま（resume_task を残す）', () => {
     const storage = seedBlockedGitCommitWithApproval('EXPIRED')
 
@@ -677,6 +789,7 @@ describe('triageBlocked — Triage は権限を作らない', () => {
     const job = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
       safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', message: 'm' }, dryRun: false,
+      workflowStepKey: `review:approval-review-${taskId}:git-commit`,
     } as Parameters<IStorage['jobs']['create']>[0])
     expect(job.id).toBeDefined()
     storage.tasks.update(taskId, { status: 'blocked' })

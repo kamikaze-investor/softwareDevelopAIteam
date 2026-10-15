@@ -559,7 +559,10 @@ export async function taskRoutes(
       // 400 ではなく 409 を返す。code を添えるのは、呼び出し側が
       // 「retry すれば直る」と誤解しないようにするためである（fail-closed であり、
       // 探索を広げて自動復旧させることは意図的にしていない）。
-      if (resumed.code === 'REJECTED_COMMIT_SOURCE_UNRESOLVED') {
+      if (
+        resumed.code === 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
+        || resumed.code === 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
+      ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
       return reply.status(400).send({ error: resumed.reason })

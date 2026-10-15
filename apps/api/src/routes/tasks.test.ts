@@ -261,6 +261,61 @@ describe('Task API', () => {
     })
   })
 
+  it('POST /api/tasks/:id/abort marks only a directly linked rejected latest git_commit for observation', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'rejected commit', description: '', status: 'blocked',
+        assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+      } as never)
+      const baseline = { mode: 'clean' as const, startCommitHash: 'candidate-head' }
+      storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: baseline,
+      } as never)
+      const rejected = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'git_commit', riskLevel: 'HIGH',
+        targetBranch: 'ai/manual-abort', targetCommit: baseline.startCommitHash,
+        targetDiffHash: '404c5f2c', changedFiles: ['bounded.ts'], triggeredRules: [], invalidIf: [],
+        status: 'REJECTED', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+      const latest = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
+        approvalId: rejected.id,
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+        workspaceBaseline: baseline,
+        workflowStepKey: 'seven:hops:are:not:approval:provenance',
+      } as never)
+      storage.jobs.update(latest.id, { approvalId: rejected.id })
+      const abortApproval = storage.approvalRequests.create({
+        taskId: task.id, requestedAction: 'abort_task', riskLevel: 'HIGH',
+        targetBranch: 'ai/manual-abort', targetCommit: 'unrelated-gate-target', targetDiffHash: 'abort',
+        changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      } as never)
+
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/tasks/${task.id}/abort`,
+        payload: { approvalRequestId: abortApproval.id, reason: 'backup verified and candidate restored' },
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(parseBody(response.body)).toMatchObject({
+        ok: true, status: 'cleanup_requested', taskId: task.id, jobIds: [latest.id],
+      })
+      expect(storage.jobs.findById(latest.id)?.failureMetadata).toMatchObject({
+        abortApprovalRequestId: abortApproval.id,
+      })
+      expect(storage.jobs.findById(latest.id)?.status).toBe('blocked')
+      expect(storage.tasks.findById(task.id)).toMatchObject({ status: 'blocked', roadmapActive: true })
+      expect(storage.approvalRequests.findById(abortApproval.id)?.status).toBe('APPROVED')
+      expect(storage.approvalRequests.findById(rejected.id)?.status).toBe('REJECTED')
+    })
+  })
+
   // in_progress と blocked は roadmapActive に関係なく project を占有する。park した Task を
   // ここで動かせると park は事実上取り消され、resume は park を理由に拒否するので
   // 誰も解消できない状態になる。

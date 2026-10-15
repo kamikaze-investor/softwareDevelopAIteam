@@ -36,6 +36,7 @@ export type ResumeBlockedTaskResult =
          * 自動復旧できることより優先される。
          */
         | 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
+        | 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
       reason: string
     }
 
@@ -560,10 +561,13 @@ export interface IJobStorage {
     cleanupSummary?: TechnicalAbortCleanupSummary
   }): ReleaseBlockedJobAndParkTaskResult
   /**
-   * 全 Job が既に terminal な blocked Task を abort_task で park する最終段。
-   * Job 行は変更せず、観測対象が Task の最新 Job であること、cleanup request より後の
-   * Job が無いこと、workspace の clean 観測と全 Job の start HEAD 一致を transaction 内で
-   * 再検証してから Task 遷移・承認消費・audit を確定する。
+   * 通常は全 Job が既に terminal な blocked Task を abort_task で park する最終段。
+   * 例外として、最新 Job 自身に直接リンクした `git_commit` Approval が REJECTED の場合だけ、
+   * その最新 blocked Job を同じ transaction で failed にしてから park する。継承 link は使わない。
+   * 通常形では Job 行を変更せず、観測対象が Task の最新 Job であること、cleanup request より後の
+   * Job が無いこと、workspace の clean 観測、Project/Task 束縛、全 Job の workingDir と
+   * start HEAD 一致、rejected Approval の targetCommit 一致を transaction 内で再検証してから
+   * Job/Task 遷移・abort 承認消費・audit を確定する。
    */
   parkBlockedTaskWithTerminalJobs(input: {
     jobId: string
