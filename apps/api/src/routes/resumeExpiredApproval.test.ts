@@ -700,15 +700,16 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
     })
   })
 
-  // B'. 2段以上の resume: traversal は許さない。
+  // B'. 2段以上の git_commit resume: も遡り、元の review:<id>:git-commit から修正へ戻す
+  //     （CEO 判断・2026-10-15。PL の daily resume で段が伸びても REJECT 後に修正へ進めるようにする）。
   //
   // 3段目にも **自分の REJECTED git_commit 承認を紐づける** ——  そうしないと
   // linked Approval が無いので REJECTED recovery 分岐自体に入らず、この性質を試せない。
-  it('7b-iii. a second resume: hop is not traversed', async () => {
+  it('7b-iii. a second git_commit resume: hop is traversed back to the reviewed commit', async () => {
     await withApp(async (app) => {
       const project = await createProject()
       const task = await createTask(project.id)
-      const { latestJob } = await createRejectedGitCommitChain(task, { withResumeHop: true })
+      const { latestJob } = await createRejectedGitCommitChain(task, { withResumeHop: true, alignedEvidenceFor: '修正指示' })
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
       // もう1段積む（`resume: → resume: → ...`）。
@@ -742,10 +743,12 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
 
       const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
 
-      // 1ホップ正規化した先が `resume:` なので `review:<id>:git-commit` に一致せず fail-closed。
-      expect(statusCode).toBe(409)
-      expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
-      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
+      expect(statusCode).toBe(201)
+      const created = body as Job
+      expect(created.safeCommand.kind).not.toBe('git_commit')
+      expect(created.aiCliMode).toBe('implement')
+      expect(created.workflowStepKey).toBe(`resume:${secondHop.id}:1`)
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before + 1)
     })
   })
 

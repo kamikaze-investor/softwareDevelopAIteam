@@ -33,7 +33,12 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
-import { parseResumeSource, resolveReviewedImplementationFrom, retryStepKeyFor } from '../designReview/repairPolicy'
+import {
+  parseResumeSource,
+  resolveGitCommitResumeOrigin,
+  resolveReviewedImplementationFrom,
+  retryStepKeyFor,
+} from '../designReview/repairPolicy'
 import { technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
 import type {
   AbortAuthorization,
@@ -1619,7 +1624,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **既存 `workflowStepKey` だけ**で逆引きする。
    *
    * ```
-   * [任意] resume:<sourceJobId>:1        … 1段だけ正規化する
+   * [0..n 段] git_commit resume:<sourceJobId>:1   … PL / Human の resume で作り直された git_commit
    *   → git_commit  review:<reviewJobId>:git-commit
    *   → [0..n 段] review resume:<reviewJobId>:1   … Human Resume で再実行された review（D4）
    *   → review      implement:<implementJobId>:review
@@ -1629,13 +1634,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **7条件をすべて満たすときだけ返す。1つでも欠ければ fail-closed**（CEO 判断・2026-09-23）。
    * 同一 diff を再承認へ回さないことのほうが、自動復旧できることより優先される。
    *
-   * **2 つの区間を混ぜない。** git_commit 側（1.〜4.）は従来どおり `resume:` を最大 1 ホップだけ
-   * 正規化する。そこで得た review Job から implement までの区間だけ、D1 と共用の
+   * **2 つの区間を混ぜない。** git_commit 側（1.〜4.）は `resolveGitCommitResumeOrigin()` が
+   * git_commit の段だけを遡る（2026-09-23 の「最大 1 ホップ」は、PL の daily resume で段が伸びると
+   * REJECT 後に修正へ進めなくなるため、CEO 判断・2026-10-15 で多段へ改めた）。そこで得た
+   * review Job から implement までの区間だけ、D1 と共用の
    * `resolveReviewedImplementationFrom()`（review Job だけを経由する bounded / cycle-safe な walk。
    * CEO 承認・2026-09-28）を使う。下の禁止事項は git_commit 側についてのものである。
    *
    * **やってはいけないこと（意図的に実装していない）**:
-   * - git_commit 側の 2段以上の `resume:` traversal（1ホップ正規化した先は `review:...:git-commit` しか許さない）
+   * - git_commit の段と review の段を 1 つの walk で混ぜること（git_commit 側の端は `review:...:git-commit` しか許さない）
    * - recursive ancestry resolver
    * - 「最新 implement Job」の推測
    * - 複数候補からの選択
@@ -1694,27 +1701,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     const sameOwner = (job: Job): boolean =>
       job.taskId === latestJob.taskId && job.projectId === latestJob.projectId
 
-    // 2. `resume:<sourceJobId>:1` は **1回だけ** 辿る。
+    // 2.–3. `resume:<sourceJobId>:1` を、同一 Task / Project の git_commit の段だけ遡る。
+    //    PL の daily resume で段は日数分伸びるため段数は固定しない（CEO 判断・2026-10-15）。
+    //    walk は bounded / cycle-safe で、git_commit 以外の段・欠損・別 Task は fail-closed。
     //    latest が最初から `review:...:git-commit` ならここは素通りする。
-    let gitCommitJob = latestJob
-    const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
-    if (resumed) {
-      const source = jobs.findById(resumed[1] as string)
-      if (!source) {
-        return { ok: false, reason: `resume source job ${resumed[1]} not found` }
-      }
-      // 3. 同一 Task / Project の git_commit であること。
-      if (!sameOwner(source)) {
-        return { ok: false, reason: 'resume source job belongs to a different task or project' }
-      }
-      if (source.safeCommand.kind !== 'git_commit') {
-        return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
-      }
-      gitCommitJob = source
-    }
+    const origin = resolveGitCommitResumeOrigin(jobs, latestJob)
+    if (!origin.ok) return { ok: false, reason: origin.reason }
+    const gitCommitJob = origin.origin
 
     // 4. `review:<reviewJobId>:git-commit`。
-    //    ここで2段目の `resume:` は一致しないので、**多段 traversal は構造的に起きない**。
+    //    review の段（`resume:<review>:1`）はここでは辿らない。git_commit の段と混ぜない。
     const reviewRef = /^review:([^:]+):git-commit$/.exec(gitCommitJob.workflowStepKey ?? '')
     if (!reviewRef) {
       return {
