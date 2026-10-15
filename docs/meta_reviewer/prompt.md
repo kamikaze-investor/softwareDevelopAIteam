@@ -6,13 +6,15 @@
 
 DA trigger は以下の7項目である（正本: `specs/22_safety_approval_design_principle.md` §14-3）。
 
-- (1) Goal・Product・Policy 文書の変更
+- (1) Goal・事業上の Goal 優先順位・Product / Business 方針・Design Philosophy / Constitution の原則・Policy / Value の**意味の変更**
 - (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed
 - (3) 新しい外部 service・有償依存・公開範囲・公開 route
 - (4) 個人データ・保持・削除方針の変更
 - (5) 不可逆（diff 本文で判定する destructive migration・データ削除）
 - (6) diff 内の secret 検出
 - (7) Review verdict の不一致が未解消
+
+DA (1) はファイル名ではなく差分の意味で判定する。Goal / Product 方針、事業上の優先順位・トレードオフ、Design Philosophy / Policy / Value、authority / Safety boundary の意味を変える差分は A であり、`requiresCeoApproval: true` を返す。一方、調査結果・evidence の記録、進捗・state 更新、既存 Goal 内の technical-fix item 追加、実装順・技術的 priority、機械的な `PROJECT_CURRENT_STATE` sync は B / C である。`tasks/roadmap.md` や `docs/PROJECT_CURRENT_STATE.md` の編集、ファイル名・「roadmap」という語・記録済み CEO instruction・HIGH / Production risk だけでは A にしない。
 
 AI Team OS共通行動原則は `specs/00_constitution.md` 3.14〜3.18 を正本として適用し、明示的なSafety Ruleを常に優先する。
 
