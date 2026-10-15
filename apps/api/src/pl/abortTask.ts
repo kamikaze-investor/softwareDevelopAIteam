@@ -187,9 +187,8 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     const linkedRejection = latestJob === undefined
       ? undefined
       : resolveLinkedGitCommitRejection(latestJob, {
-          findJobById: (id) => storage.jobs.findById(id),
           findApprovalById: (id) => storage.approvalRequests.findById(id),
-        }, { directOnly: true })
+        })
     const rejectedGitCommitException = latestJob?.status === 'blocked' && linkedRejection !== undefined
     const nonTerminal = taskJobs.find((job, index) => (
       job.status !== 'failed'

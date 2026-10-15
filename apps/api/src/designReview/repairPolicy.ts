@@ -346,9 +346,11 @@ export function resolveReviewedImplementationFrom(
 /**
  * **git_commit Job の `resume:` の段を、`review:<id>:git-commit` を持つ元の git_commit まで遡る。**
  *
- * PL の daily resume は、承認待ちが期限切れになった git_commit を `resume:<直前の git_commit>:1` として
- * 毎回作り直す。CEO が REJECT するまでに段は日数分伸びる（2026-10-15 production 実測: Task b6d4097a で 6 段）。
- * 1 段しか辿らないと、REJECT 後の Human Resume が元の review へ到達できず、修正へ進めなくなる。
+ * **#348 以前の旧形式の入れ子専用。** 当時の PL daily resume は、承認待ちが期限切れになった git_commit を
+ * `resume:<直前の git_commit>:1` として毎回作り直し、段は日数分伸びた（2026-10-15 production 実測:
+ * Task b6d4097a で 6 段）。1 段しか辿らないと、REJECT 後の Human Resume が元の review へ到達できない。
+ * 新方式（`resume:<anchor>:<n>`）は fixed anchor を1回だけ参照するので、この walk を使わない
+ * （呼び出し側が `classifyGitCommitResumeLineage()` の `legacy` のときだけ呼ぶ）。
  *
  * `resolveReviewedImplementationFrom()` と同じ規約で辿る:
  * - **探索しない。** 各段でキーが名指ししている 1 件だけを読む

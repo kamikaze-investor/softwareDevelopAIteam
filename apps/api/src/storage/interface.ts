@@ -36,6 +36,7 @@ export type ResumeBlockedTaskResult =
          * 自動復旧できることより優先される。
          */
         | 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
+        | 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
       reason: string
     }
 

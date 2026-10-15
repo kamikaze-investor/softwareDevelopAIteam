@@ -446,6 +446,36 @@ describe('D4: resumed review 由来の git_commit を CEO が REJECT した後�
     })
   })
 
+  it('旧形式の段が新方式の generation（:2 以降）に当たれば fail-closed（#348 の系譜と混ぜない）', async () => {
+    await withApp(async (app) => {
+      const c = await chain()
+      const s = await storage()
+      const r1 = await resumedReview(c, c.firstReview)
+      await approve(app, r1)
+      const [anchor] = await gitCommitsOf(c.task.id)
+      const commitJob = (stepKey: string, status: string) => s.jobs.create({
+        ...c.base, status,
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+        workflowStepKey: stepKey,
+      } as never)
+      s.jobs.update(anchor!.id, { status: 'failed' } as never)
+      await tick()
+      commitJob(`resume:${anchor!.id}:1`, 'failed')
+      await tick()
+      const generation2 = commitJob(`resume:${anchor!.id}:2`, 'failed')
+      await tick()
+      const legacyOnTop = commitJob(`resume:${generation2.id}:1`, 'queued')
+      await rejectCommit(c.task, legacyOnTop)
+      const before = s.jobs.findByTaskId(c.task.id).length
+
+      const { statusCode, body } = await resume(app, c.task.id)
+
+      expect(statusCode).toBe(409)
+      expect(body.code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
+      expect(s.jobs.findByTaskId(c.task.id)).toHaveLength(before)
+    })
+  })
+
   it('通常 review 由来の git_commit の REJECT provenance は従来どおり（regression）', async () => {
     await withApp(async (app) => {
       const c = await chain(false)

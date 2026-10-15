@@ -208,13 +208,27 @@ function seedTerminalSource(
   db: Database.Database,
   name: string,
   approvalStatus: ApprovalGateStatus,
-  successor: { taskId?: string; projectId?: string; kind?: string; count?: number } | 'none' = {},
+  successor: {
+    taskId?: string
+    projectId?: string
+    kind?: string
+    count?: number
+    startGeneration?: number
+  } | 'none' = {},
 ): void {
   insertTask(db, name)
   insertApproval(db, `approval-${name}`, name, approvalStatus)
-  insertJob(db, { id: `source-${name}`, taskId: name, status: 'failed', approvalId: `approval-${name}` })
+  insertJob(db, {
+    id: `source-${name}`,
+    taskId: name,
+    status: 'failed',
+    approvalId: `approval-${name}`,
+    workflowStepKey: `review:review-${name}:git-commit`,
+  })
   if (successor === 'none') return
-  for (let n = 1; n <= (successor.count ?? 1); n += 1) {
+  const startGeneration = successor.startGeneration ?? 1
+  const endGeneration = startGeneration + (successor.count ?? 1) - 1
+  for (let n = startGeneration; n <= endGeneration; n += 1) {
     if (successor.taskId !== undefined && successor.taskId !== name) insertTask(db, successor.taskId)
     insertJob(db, {
       id: `successor-${name}-${n}`,
@@ -257,6 +271,132 @@ describe('startup reconciliation — 終端化済み source に紐づいたま�
     }
   })
 
+  it('fixed generations reconcile only the exact predecessor (n=1 anchor, n>1 generation n-1)', () => {
+    const dbPath = tempDbPath()
+    seedRaw(dbPath, (db) => {
+      insertTask(db, 'exact-predecessor')
+      insertJob(db, {
+        id: 'anchor-exact', taskId: 'exact-predecessor', status: 'failed',
+        workflowStepKey: 'review:review-exact:git-commit',
+      })
+      insertJob(db, {
+        id: 'generation-exact-1', taskId: 'exact-predecessor', status: 'failed',
+        workflowStepKey: 'resume:anchor-exact:1',
+      })
+      insertJob(db, {
+        id: 'generation-exact-2', taskId: 'exact-predecessor', status: 'blocked',
+        workflowStepKey: 'resume:anchor-exact:2',
+      })
+      insertJob(db, {
+        id: 'generation-exact-3', taskId: 'exact-predecessor', status: 'queued',
+        workflowStepKey: 'resume:anchor-exact:3',
+      })
+
+      insertTask(db, 'gap-predecessor')
+      insertJob(db, {
+        id: 'anchor-gap', taskId: 'gap-predecessor', status: 'failed',
+        workflowStepKey: 'review:review-gap:git-commit',
+      })
+      insertJob(db, {
+        id: 'generation-gap-1', taskId: 'gap-predecessor', status: 'blocked',
+        workflowStepKey: 'resume:anchor-gap:1',
+      })
+      insertJob(db, {
+        id: 'generation-gap-3', taskId: 'gap-predecessor', status: 'queued',
+        workflowStepKey: 'resume:anchor-gap:3',
+      })
+    })
+
+    const storage = createSQLiteStorage(dbPath)
+
+    expect(storage.jobs.findById('generation-exact-2')?.status).toBe('failed')
+    expect(storage.jobs.findById('generation-gap-1')?.status).toBe('blocked')
+    expect(storage.jobs.findById('anchor-exact')?.workflowStepKey).toBe('review:review-exact:git-commit')
+    expect(storage.jobs.findById('generation-exact-1')?.workflowStepKey).toBe('resume:anchor-exact:1')
+    expect(storage.jobs.findById('generation-exact-2')?.workflowStepKey).toBe('resume:anchor-exact:2')
+    expect(storage.jobs.findById('generation-exact-3')?.workflowStepKey).toBe('resume:anchor-exact:3')
+  })
+
+  it('legacy nested git_commit successors still terminalize and supersede their exact source', () => {
+    const dbPath = tempDbPath()
+    seedRaw(dbPath, (db) => {
+      insertTask(db, 'legacy-terminalize')
+      insertJob(db, { id: 'legacy-origin-a', taskId: 'legacy-terminalize', status: 'failed' })
+      insertJob(db, {
+        id: 'legacy-source-a', taskId: 'legacy-terminalize', status: 'blocked',
+        workflowStepKey: 'resume:legacy-origin-a:1',
+      })
+      insertJob(db, {
+        id: 'legacy-successor-a', taskId: 'legacy-terminalize', status: 'queued',
+        workflowStepKey: 'resume:legacy-source-a:1',
+      })
+
+      insertTask(db, 'legacy-supersede')
+      insertApproval(db, 'legacy-approval-b', 'legacy-supersede', 'WAITING_FOR_USER')
+      insertJob(db, { id: 'legacy-origin-b', taskId: 'legacy-supersede', status: 'failed' })
+      insertJob(db, {
+        id: 'legacy-source-b', taskId: 'legacy-supersede', status: 'failed',
+        approvalId: 'legacy-approval-b', workflowStepKey: 'resume:legacy-origin-b:1',
+      })
+      insertJob(db, {
+        id: 'legacy-successor-b', taskId: 'legacy-supersede', status: 'queued',
+        workflowStepKey: 'resume:legacy-source-b:1',
+      })
+    })
+
+    const storage = createSQLiteStorage(dbPath)
+
+    expect(storage.jobs.findById('legacy-source-a')?.status).toBe('failed')
+    expect(storage.auditLog.findByEntity('job', 'legacy-source-a')).toEqual([
+      expect.objectContaining({
+        detail: expect.stringContaining('successor_job_id=legacy-successor-a'),
+      }),
+    ])
+    expect(approvalStatusOf(storage, 'legacy-approval-b')).toBe('SUPERSEDED')
+    expect(storage.auditLog.findByEntity('approval_request', 'legacy-approval-b')).toEqual([
+      expect.objectContaining({
+        detail: expect.stringContaining(
+          'source_job_id=legacy-source-b successor_job_id=legacy-successor-b',
+        ),
+      }),
+    ])
+  })
+
+  it('generation 3 supersedes only generation 2 approval after exact predecessor reconciliation', () => {
+    const dbPath = tempDbPath()
+    seedRaw(dbPath, (db) => {
+      insertTask(db, 'approval-generation-3')
+      insertApproval(db, 'approval-generation-2', 'approval-generation-3', 'WAITING_FOR_USER')
+      insertJob(db, {
+        id: 'anchor-approval', taskId: 'approval-generation-3', status: 'failed',
+        workflowStepKey: 'review:review-approval:git-commit',
+      })
+      insertJob(db, {
+        id: 'approval-generation-1', taskId: 'approval-generation-3', status: 'failed',
+        workflowStepKey: 'resume:anchor-approval:1',
+      })
+      insertJob(db, {
+        id: 'approval-generation-2-job', taskId: 'approval-generation-3', status: 'failed',
+        approvalId: 'approval-generation-2', workflowStepKey: 'resume:anchor-approval:2',
+      })
+      insertJob(db, {
+        id: 'approval-generation-3-job', taskId: 'approval-generation-3', status: 'queued',
+        workflowStepKey: 'resume:anchor-approval:3',
+      })
+    })
+
+    const storage = createSQLiteStorage(dbPath)
+
+    expect(approvalStatusOf(storage, 'approval-generation-2')).toBe('SUPERSEDED')
+    expect(storage.auditLog.findByEntity('approval_request', 'approval-generation-2')).toEqual([
+      expect.objectContaining({
+        detail: expect.stringContaining(
+          'source_job_id=approval-generation-2-job successor_job_id=approval-generation-3-job',
+        ),
+      }),
+    ])
+  })
+
   it.each<ApprovalGateStatus>(['REJECTED', 'CONSUMED', 'STALE', 'EXPIRED'])('%s は変えない', (status) => {
     const dbPath = tempDbPath()
     seedRaw(dbPath, (db) => seedTerminalSource(db, 'kept', status))
@@ -267,19 +407,19 @@ describe('startup reconciliation — 終端化済み source に紐づいたま�
     expect(storage.auditLog.findByEntity('approval_request', 'approval-kept')).toHaveLength(0)
   })
 
-  it('lineage を exact に証明できない行は触らない（後継なし / 別 Task / 別 Project / 別 kind / 複数後継）', () => {
+  it('lineage を exact に証明できない行は触らない（後継なし / 別 Task / 別 Project / 別 kind / generation gap）', () => {
     const dbPath = tempDbPath()
     seedRaw(dbPath, (db) => {
       seedTerminalSource(db, 'no-successor', 'WAITING_FOR_USER', 'none')
       seedTerminalSource(db, 'other-task', 'WAITING_FOR_USER', { taskId: 'foreign-task' })
       seedTerminalSource(db, 'other-project', 'WAITING_FOR_USER', { projectId: 'project-2' })
       seedTerminalSource(db, 'other-kind', 'WAITING_FOR_USER', { kind: 'test' })
-      seedTerminalSource(db, 'ambiguous', 'WAITING_FOR_USER', { count: 2 })
+      seedTerminalSource(db, 'gap', 'WAITING_FOR_USER', { startGeneration: 2 })
     })
 
     const storage = createSQLiteStorage(dbPath)
 
-    for (const name of ['no-successor', 'other-task', 'other-project', 'other-kind', 'ambiguous']) {
+    for (const name of ['no-successor', 'other-task', 'other-project', 'other-kind', 'gap']) {
       expect(approvalStatusOf(storage, `approval-${name}`), name).toBe('WAITING_FOR_USER')
       expect(storage.auditLog.findByEntity('approval_request', `approval-${name}`), name).toHaveLength(0)
     }

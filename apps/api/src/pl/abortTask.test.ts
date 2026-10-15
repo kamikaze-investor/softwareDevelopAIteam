@@ -11,7 +11,9 @@ import {
   recordTechnicalAbortRefusal,
   technicalAbortStateFingerprint,
 } from './technicalAbortEvidence'
+import { triageBlocked } from './blockedTriage'
 import type { BlockedDiagnosis, BlockedRootCauseClass } from './blockedTriage'
+import type { AttentionItem } from '../state/systemState'
 
 const FUTURE = new Date(Date.now() + 60 * 60 * 1000).toISOString()
 const BASELINE: JobWorkspaceBaseline = { mode: 'clean', startCommitHash: '0805249b' }
@@ -2138,6 +2140,75 @@ describe('abortTask — directly linked rejected git_commit observation-only rel
       jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
     })).toMatchObject({ ok: true })
     expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('CONSUMED')
+  })
+
+  describe('with fixed-anchor resume generations (#348)', () => {
+    /** anchor（REJECTED 直結）→ generation 1 → generation 2（最新・blocked）。 */
+    function seedGenerations(options: { latestCarriesOwnRejection: boolean }) {
+      const fx = seedRejectedGitCommit({ workflowStepKey: 'review:anchor-review:git-commit' })
+      const anchorId = fx.latestJobId
+      fx.storage.jobs.update(anchorId, { status: 'failed' })
+      const generation1 = fx.storage.jobs.create({
+        taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+        workflowStepKey: `resume:${anchorId}:1`,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      let ownRejectionId: string | undefined
+      if (options.latestCarriesOwnRejection) {
+        ownRejectionId = fx.storage.approvalRequests.create({
+          taskId: fx.taskId, requestedAction: 'git_commit', riskLevel: 'HIGH',
+          targetBranch: 'ai/manual-abort', targetCommit: BASELINE.startCommitHash,
+          targetDiffHash: '404c5f2c', changedFiles: ['bounded.ts'], triggeredRules: [], invalidIf: [],
+          status: 'REJECTED', expiresAt: FUTURE,
+        } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+      }
+      const generation2 = fx.storage.jobs.create({
+        taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+        workflowStepKey: `resume:${anchorId}:2`,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      // create は approvalId を受け取らない（既存 fixture と同じく update で結ぶ）。
+      if (ownRejectionId !== undefined) fx.storage.jobs.update(generation2.id, { approvalId: ownRejectionId })
+      return { fx, anchorId, generation1Id: generation1.id, latestId: generation2.id, ownRejectionId }
+    }
+
+    function triage(fx: RejectedGitCommitFixture, jobId: string): BlockedDiagnosis {
+      return triageBlocked(fx.storage, {
+        kind: 'job_blocked', projectId: fx.projectId, taskId: fx.taskId, jobId,
+        detail: 'blocked', stuckForMs: 0,
+      } as AttentionItem)
+    }
+
+    it('a generation directly linked to its own REJECTED approval is released by the manual abort', () => {
+      const { fx, latestId, ownRejectionId } = seedGenerations({ latestCarriesOwnRejection: true })
+      expect(triage(fx, latestId)).toMatchObject({ recommendedLane: 'ceo_escalation', recoverable: false })
+
+      const abortApprovalId = approve(fx.storage, fx.taskId)
+      expect(abortTask(fx.storage, {
+        taskId: fx.taskId, approvalRequestId: abortApprovalId, reason: 'backed up and restored',
+      })).toMatchObject({ ok: true, status: 'cleanup_requested' })
+      expect(completeAbortCleanup(fx.storage, {
+        jobId: latestId, observation: BASELINE, knownGood: KNOWN_GOOD,
+      })).toMatchObject({ ok: true })
+      expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+      expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('CONSUMED')
+      expect(fx.storage.approvalRequests.findById(ownRejectionId as string)?.status).toBe('REJECTED')
+    })
+
+    it('an anchor-inherited rejection reaches triage but never authorizes the direct-only manual release', () => {
+      const { fx, latestId } = seedGenerations({ latestCarriesOwnRejection: false })
+      // triage は anchor を1回だけ参照して CEO の却下を認識する（#348）。
+      expect(triage(fx, latestId)).toMatchObject({ recommendedLane: 'ceo_escalation', recoverable: false })
+
+      // manual abort は最新 Job 自身の link だけを根拠にする（#347）。推定した却下では解放しない。
+      const abortApprovalId = approve(fx.storage, fx.taskId)
+      expect(abortTask(fx.storage, {
+        taskId: fx.taskId, approvalRequestId: abortApprovalId, reason: 'inherited only',
+      })).toMatchObject({ ok: false, code: 'TASK_NOT_PARKABLE' })
+      expect(fx.storage.jobs.findById(latestId)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+      expect(fx.storage.approvalRequests.findById(abortApprovalId)?.status).toBe('APPROVED')
+      expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+    })
   })
 
   it('REJECT alone never marks, cleans, fails, or parks', () => {

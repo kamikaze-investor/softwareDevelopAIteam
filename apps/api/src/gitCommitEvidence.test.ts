@@ -267,6 +267,15 @@ describe('evaluateGitCommitEvidence — exact provenance', () => {
     expect(failuresOf(chain, { gitCommitJob: orphan })).toEqual(['review_lineage_unresolved'])
   })
 
+  it('fixed-anchor resume generation の git_commit Job は Stage 1 auto-pass の対象外', () => {
+    const chain = seedChain()
+    const resumed = {
+      ...chain.gitCommitJob,
+      workflowStepKey: `resume:${chain.gitCommitJob.id}:3`,
+    }
+    expect(failuresOf(chain, { gitCommitJob: resumed })).toContain('review_lineage_unresolved')
+  })
+
   it('implement Job が成功していなければ通さない', () => {
     expect(failuresOf(seedChain({ implementExitCode: 1 }))).toContain('implementation_not_successful')
   })

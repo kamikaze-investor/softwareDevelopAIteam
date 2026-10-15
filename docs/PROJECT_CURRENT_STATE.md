@@ -273,6 +273,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた**
 - **approved になった Human Resume review から git_commit が作られず、Task が行き止まりになる（D4）**
 - **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）**
+- **期限切れ git_commit Approval の定常 resume が lineage を深くし、CEO REJECT 後の再実装経路を自ら閉じる
 - **Human Resume で回答済みの repair Design Review run が「最新だから」という理由で repair admission を止め続ける（D3）**
 - **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
