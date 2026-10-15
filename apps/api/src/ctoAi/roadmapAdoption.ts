@@ -169,11 +169,13 @@ function hasConsumedCandidateApproval(storage: IStorage, taskId: string, sourceJ
 }
 
 /**
- * Safety Evidence path（#340 Stage 1）: source Job 自身の Gate Evaluation Evidence に、
+ * Safety Evidence path（#340 Stage 1）: approval が link されていない source Job 自身の Gate Evaluation Evidence に、
  * `bindResultingCommitForJob()` が bind した `resultingCommit` があり、それが source Job の
  * commit と exact に一致する。該当する evidence がちょうど 1 件のときだけ成立する。
  */
 function hasBoundCandidateGateEvidence(storage: IStorage, taskId: string, sourceJob: Job): boolean {
+  // approval が link された Job は Human Approval path だけで判定する（CONSUMED 以外を evidence で補わない）。
+  if (sourceJob.approvalId !== undefined) return false
   if (sourceJob.commitHash === undefined) return false
   const bound = storage.gateEvaluations.findByJobId(sourceJob.id).filter((evidence) =>
     evidence.jobId === sourceJob.id

@@ -1194,6 +1194,7 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     resultingCommit: string | null
     onOtherJob: boolean
     sourceWithoutCommitHash: boolean
+    linkedApprovalStatus: 'WAITING_FOR_USER' | 'APPROVED' | 'REJECTED'
   }>
 
   /** approval を経ずに Safety Evidence で commit された Candidate completion を作る。 */
@@ -1218,6 +1219,22 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     const sourceJobId = createGitCommitJob()
     if (overrides.sourceWithoutCommitHash !== true) {
       storage.jobs.update(sourceJobId, { commitHash: 'candidate-commit' })
+    }
+    if (overrides.linkedApprovalStatus !== undefined) {
+      const approval = storage.approvalRequests.createForJob({
+        taskId: first.taskId,
+        targetBranch: 'candidate/self-dev',
+        targetCommit: 'candidate-parent',
+        targetDiffHash: 'candidate-diff',
+        riskLevel: 'LOW',
+        requestedAction: 'git_commit',
+        changedFiles: ['apps/api/src/ctoAi/roadmapAdoption.ts'],
+        triggeredRules: [],
+        status: overrides.linkedApprovalStatus,
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        invalidIf: ['commit changes', 'diff changes'],
+      }, sourceJobId)
+      if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     }
     const evidenceJobId = overrides.onOtherJob === true ? createGitCommitJob() : sourceJobId
 
@@ -1268,6 +1285,9 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     ['policyVersion が gate-policy-v2 でない', { policyVersion: 'gate-policy-v1' }],
     ['targetBranch が Candidate でない', { targetBranch: 'master' }],
     ['source Job に commitHash が無い', { sourceWithoutCommitHash: true }],
+    ['source Job に CONSUMED でない approval（APPROVED）が link されている', { linkedApprovalStatus: 'APPROVED' }],
+    ['source Job に CONSUMED でない approval（WAITING_FOR_USER）が link されている', { linkedApprovalStatus: 'WAITING_FOR_USER' }],
+    ['source Job に REJECTED の approval が link されている', { linkedApprovalStatus: 'REJECTED' }],
   ])('%s なら検出しない（fail closed で従来どおり）', async (_label, overrides) => {
     const { storage, projectId } = await withEvidenceCompletion(overrides)
 
