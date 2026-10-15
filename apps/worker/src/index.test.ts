@@ -24,6 +24,7 @@ const notifierMocks = vi.hoisted(() => ({
 
 const jobRunnerMocks = vi.hoisted(() => ({
   computeWorkspaceBaseline: vi.fn(),
+  revertBlockedJobChanges: vi.fn(),
 }))
 
 const workspaceVerificationMocks = vi.hoisted(() => ({
@@ -40,6 +41,7 @@ vi.mock('./jobRunner.js', async (importOriginal) => {
   return {
     ...actual,
     computeWorkspaceBaseline: jobRunnerMocks.computeWorkspaceBaseline,
+    revertBlockedJobChanges: jobRunnerMocks.revertBlockedJobChanges,
   }
 })
 vi.mock('./workspaceVerification.js', () => workspaceVerificationMocks)
@@ -113,6 +115,7 @@ beforeEach(() => {
   watchdogMocks.startWatchdog.mockReset()
   notifierMocks.sendAlert.mockReset()
   jobRunnerMocks.computeWorkspaceBaseline.mockReset()
+  jobRunnerMocks.revertBlockedJobChanges.mockReset()
   workspaceVerificationMocks.observeWorkspace.mockReset()
   workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReset()
   workspaceVerificationMocks.workspaceObservationMatchesBaseline.mockReset()
@@ -125,6 +128,7 @@ beforeEach(() => {
   jobStateMocks.recoverStaleJobs.mockResolvedValue(0)
   notifierMocks.sendAlert.mockResolvedValue([])
   jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({ ok: true, baseline: CLEAN_BASELINE })
+  jobRunnerMocks.revertBlockedJobChanges.mockResolvedValue(undefined)
   workspaceVerificationMocks.observeWorkspace.mockReturnValue({
     observation: CLEAN_BASELINE,
     knownGood: {
@@ -384,6 +388,58 @@ describe('abort cleanup observation reporting', () => {
     await expect(reportAbortCleanupObservations()).resolves.toBe(true)
     expect(workspaceVerificationMocks.verifyWorkspaceAgainstBaseline)
       .toHaveBeenCalledWith('/workspace/target', endFingerprint)
+  })
+
+  it('reports mixed manual and Technical Abort metadata without reverting files', async () => {
+    const dirtyObservation = {
+      mode: 'dirty' as const,
+      startCommitHash: 'end-head',
+      entries: [{ path: 'src/feature.ts', kind: 'added' as const, worktreeHash: 'sha256:value-free' }],
+    }
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const requestedJob: Job = {
+      ...job,
+      status: 'failed',
+      failureMetadata: {
+        workspaceEndFingerprint: dirtyObservation,
+        abortCleanupRequestedAt: NOW,
+        abortApprovalRequestId: 'approval-1',
+        abortTechnicalEvidenceId: 'evidence-1',
+      },
+    }
+    workspaceVerificationMocks.observeWorkspace.mockReturnValue({
+      observation: dirtyObservation,
+      knownGood: {
+        gitOperationMarkers: [], worktreeClean: false, indexClean: true,
+        headValid: true, blindSpotsAbsent: true,
+      },
+    })
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=')) return new Response(JSON.stringify([requestedJob]), { status: 200 })
+      if (value.includes('/abort-cleanup-result')) return new Response(JSON.stringify({ error: 'refused' }), { status: 409 })
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(jobRunnerMocks.revertBlockedJobChanges).not.toHaveBeenCalled()
+    expect(workspaceVerificationMocks.verifyWorkspaceAgainstBaseline).not.toHaveBeenCalled()
+    const report = fetchMock.mock.calls.find(([url]) => String(url).includes('/abort-cleanup-result'))
+    expect(JSON.parse(String(report?.[1]?.body))).toEqual({
+      observation: dirtyObservation,
+      knownGood: {
+        gitOperationMarkers: [], worktreeClean: false, indexClean: true,
+        headValid: true, blindSpotsAbsent: true,
+      },
+    })
   })
 })
 

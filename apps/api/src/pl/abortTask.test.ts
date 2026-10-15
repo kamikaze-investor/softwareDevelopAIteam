@@ -1594,6 +1594,95 @@ describe('P2-2 Automatic Technical Abort', () => {
     })).toMatchObject({ ok: true })
     expect(fx.storage.approvalRequests.findById(waiting.id)?.status).toBe('CONSUMED')
   })
+
+  it.each([
+    ['evidence id', { abortTechnicalEvidenceId: 'evidence-1' }],
+    ['state fingerprint', { abortTechnicalStateFingerprint: 'fingerprint-1' }],
+    ['root cause', { abortTechnicalRootCauseClass: 'protected_path' as const }],
+    ['attention kind', { abortTechnicalAttentionKind: 'job_failed' }],
+  ])('manual abort refuses existing Technical Abort %s without merging metadata', (_name, technicalMetadata) => {
+    const fx = seed()
+    const carrier = fx.storage.jobs.findById(fx.jobId)
+    if (carrier === undefined) throw new Error('carrier missing')
+    fx.storage.jobs.update(carrier.id, {
+      failureMetadata: { ...(carrier.failureMetadata ?? {}), ...technicalMetadata },
+    })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId, reason: 'manual conflict',
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+    expect(fx.storage.jobs.findById(fx.jobId)?.failureMetadata).toEqual({
+      ...(carrier.failureMetadata ?? {}),
+      ...technicalMetadata,
+    })
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('APPROVED')
+    const refusal = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'technical_abort_refused')
+    expect(JSON.parse(refusal?.detail ?? '{}')).toMatchObject({
+      code: 'ABORT_AUTHORIZATION_FAMILY_CONFLICT',
+      stage: 'authorization',
+    })
+    expect(refusal?.detail).not.toContain('manual conflict')
+  })
+
+  it('Technical Abort refuses a carrier with manual abort metadata without adding evidence', () => {
+    const fx = seedTechnicalAbort()
+    const carrier = fx.storage.jobs.findById(fx.latestJobId)
+    if (carrier === undefined) throw new Error('carrier missing')
+    fx.storage.jobs.update(carrier.id, {
+      failureMetadata: {
+        ...(carrier.failureMetadata ?? {}),
+        abortApprovalRequestId: 'approval-1',
+      },
+    })
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId, attention, readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual({
+      ...(carrier.failureMetadata ?? {}),
+      abortApprovalRequestId: 'approval-1',
+    })
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId).filter(
+      (entry) => entry.operation === 'technical_abort_evidence',
+    )).toHaveLength(0)
+  })
+
+  it('finalization fails closed on mixed abort metadata without parking or consuming approval', () => {
+    const fx = seed()
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId, reason: 'manual finalization conflict',
+    })).toMatchObject({ ok: true, status: 'cleanup_requested' })
+    const carrier = fx.storage.jobs.findById(fx.jobId)
+    if (carrier?.failureMetadata === undefined) throw new Error('cleanup carrier missing metadata')
+    fx.storage.jobs.update(carrier.id, {
+      failureMetadata: {
+        ...carrier.failureMetadata,
+        abortTechnicalEvidenceId: 'evidence-1',
+        abortTechnicalStateFingerprint: 'fingerprint-1',
+        abortTechnicalRootCauseClass: 'protected_path',
+        abortTechnicalAttentionKind: 'job_failed',
+      },
+    })
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: true })
+    expect(fx.storage.jobs.findById(fx.jobId)).toMatchObject({ status: 'blocked' })
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('APPROVED')
+    const refusal = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'technical_abort_refused')
+    expect(JSON.parse(refusal?.detail ?? '{}')).toEqual({
+      code: 'ABORT_AUTHORIZATION_FAMILY_CONFLICT',
+      stage: 'finalization',
+      evidenceId: 'evidence-1',
+    })
+  })
 })
 
 describe('P2-2 re-adoption suppression and re-enable signals', () => {

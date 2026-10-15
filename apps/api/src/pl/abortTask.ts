@@ -112,6 +112,28 @@ function holdsWorkspaceOwnership(task: { status: string }, job: Job): boolean {
   return holdsWorkspaceWhenBlocked(task, job)
 }
 
+function hasTechnicalAbortMetadata(metadata: Job['failureMetadata']): boolean {
+  return metadata?.abortTechnicalEvidenceId !== undefined
+    || metadata?.abortTechnicalStateFingerprint !== undefined
+    || metadata?.abortTechnicalRootCauseClass !== undefined
+    || metadata?.abortTechnicalAttentionKind !== undefined
+}
+
+function recordAbortAuthorizationConflict(
+  storage: IStorage,
+  job: Job,
+  stage: 'authorization' | 'finalization',
+): void {
+  recordTechnicalAbortRefusal(storage, {
+    taskId: job.taskId,
+    ...(job.failureMetadata?.abortTechnicalEvidenceId !== undefined
+      ? { evidenceId: job.failureMetadata.abortTechnicalEvidenceId }
+      : {}),
+    code: 'ABORT_AUTHORIZATION_FAMILY_CONFLICT',
+    stage,
+  })
+}
+
 export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskResult {
   const task = storage.tasks.findById(input.taskId)
   if (!task) {
@@ -343,6 +365,15 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   }
 
   // cleanup を要求する。**実体の掃除・観測は Worker の既存経路が行う。**
+  const technicalCarrier = cleanupTargets.find((job) => hasTechnicalAbortMetadata(job.failureMetadata))
+  if (technicalCarrier !== undefined) {
+    recordAbortAuthorizationConflict(storage, technicalCarrier, 'authorization')
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'manual abort cannot replace Technical Abort metadata on its cleanup carrier',
+    }
+  }
   const requestedAt = new Date().toISOString()
   for (const job of cleanupTargets) {
     storage.jobs.update(job.id, {
@@ -446,6 +477,15 @@ export function completeAbortCleanup(
       ok: false,
       code: 'NOT_REQUESTED',
       reason: `job ${input.jobId} has no abort cleanup request; ownership is not releasable this way`,
+    }
+  }
+
+  if (metadata.abortApprovalRequestId !== undefined && hasTechnicalAbortMetadata(metadata)) {
+    recordAbortAuthorizationConflict(storage, job, 'finalization')
+    return {
+      ok: false,
+      code: 'PRECONDITION_FAILED',
+      reason: `job ${input.jobId}'s abort cleanup request mixes manual and technical authorization`,
     }
   }
 
@@ -638,6 +678,14 @@ export function requestTechnicalAbort(
     }
   }
   const existingMetadata = latestJob.failureMetadata
+  if (existingMetadata?.abortApprovalRequestId !== undefined) {
+    recordAbortAuthorizationConflict(storage, latestJob, 'authorization')
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'Technical Abort cannot replace manual abort metadata on its cleanup carrier',
+    }
+  }
   if (existingMetadata?.abortCleanupRequestedAt !== undefined) {
     const currentFingerprint = technicalAbortStateFingerprint(task, taskJobs, current)
     const requestStillCurrent = existingMetadata.abortTechnicalEvidenceId !== undefined
@@ -791,6 +839,15 @@ export function requestTechnicalAbort(
       ok: false,
       code: 'OWNERSHIP_UNPROVEN',
       reason: 'Task state changed while Technical Abort evidence was being issued',
+    }
+  }
+  const refreshedCarrier = refreshedJobs[0]
+  if (refreshedCarrier.failureMetadata?.abortApprovalRequestId !== undefined) {
+    recordAbortAuthorizationConflict(storage, refreshedCarrier, 'authorization')
+    return {
+      ok: false,
+      code: 'TECHNICAL_EVIDENCE_INELIGIBLE',
+      reason: 'Technical Abort cannot replace manual abort metadata on its cleanup carrier',
     }
   }
 
