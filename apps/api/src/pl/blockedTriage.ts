@@ -70,6 +70,11 @@ import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
+import {
+  isCanonicalGitCommitAnchor,
+  parseGitCommitResumeStepKey,
+  validateGitCommitResumeLineage,
+} from '../gitCommitResumeLineage'
 
 // ────────────────────────────────────────────────────────────
 // 語彙
@@ -343,6 +348,8 @@ interface Facts {
   ceoRejectedGitCommit?: boolean
   /** 却下判定の根拠に使った Approval 行 id（証拠欄に出す）。 */
   rejectedApprovalId?: string
+  /** fixed-anchor generation が壊れており、自動 resume へ倒してはならない。 */
+  gitCommitResumeLineageInvalidReason?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -354,8 +361,8 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     item.taskId !== undefined ? storage.approvalRequests.findActiveByTaskId(item.taskId) : undefined
   // **linked Approval 基準**（`resumeBlockedTask()` と同じ判定）。
   // Task 最新行ではなく、その Job の `approvalId` が指す行だけを根拠にする。
-  const linkedRejection = (() => {
-    if (!job || job.safeCommand.kind !== 'git_commit') return undefined
+  const linkedGitCommit = (() => {
+    if (!job || job.safeCommand.kind !== 'git_commit') return {}
 
     const rejectionOf = (owner: Job, approvalId: string) => {
       const approval = storage.approvalRequests.findById(approvalId)
@@ -366,20 +373,33 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
       return approval.status === 'REJECTED' ? approval : undefined
     }
 
-    if (job.approvalId) return rejectionOf(job, job.approvalId)
+    let anchor = job
+    if (!isCanonicalGitCommitAnchor(job)) {
+      const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
+      if (!parsed) {
+        return { invalidReason: `invalid git_commit resume key ${job.workflowStepKey ?? 'none'}` }
+      }
+      const loadedAnchor = storage.jobs.findById(parsed.anchorJobId)
+      const lineage = validateGitCommitResumeLineage({
+        currentJob: job,
+        anchorJob: loadedAnchor,
+        taskJobs,
+        requireCurrentIsLatestGeneration: true,
+      })
+      if (!lineage.ok) return { invalidReason: lineage.reason }
+      anchor = lineage.anchorJob
+    }
 
-    // **link が無い Job も1ホップだけ辿る。** Gate が既存 REJECTED を再利用して弾いた Job には
+    if (job.approvalId) return { rejection: rejectionOf(job, job.approvalId) }
+
+    // **link が無い Job は canonical anchor を1回だけ参照する。** Gate が既存 REJECTED を再利用して弾いた Job には
     // `approvalId` が付かない（`ux_jobs_approval_id` が UNIQUE なので結び直しもできない）。
     // 放置すると「却下されていない」と読んで `auto_recovery` を返し、PL が同じ内容を
-    // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1ホップに揃える。
-    const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
-    if (!resumed) return undefined
-    const source = storage.jobs.findById(resumed[1] as string)
-    if (!source || !source.approvalId) return undefined
-    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return undefined
-    if (source.safeCommand.kind !== 'git_commit') return undefined
-    return rejectionOf(source, source.approvalId)
+    // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1参照に揃える。
+    if (!anchor.approvalId) return {}
+    return { rejection: rejectionOf(anchor, anchor.approvalId) }
   })()
+  const linkedRejection = linkedGitCommit.rejection
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -393,6 +413,9 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     ...(approval !== undefined ? { approvalStatus: approval.status, approvalId: approval.id } : {}),
     ...(linkedRejection !== undefined
       ? { ceoRejectedGitCommit: true, rejectedApprovalId: linkedRejection.id }
+      : {}),
+    ...(linkedGitCommit.invalidReason !== undefined
+      ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
     ...(review !== undefined ? { review } : {}),
     ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
@@ -877,6 +900,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
   if (facts.job?.status === 'blocked' && !hasLiveJob(facts)) {
     const ceoRejected = facts.ceoRejectedGitCommit === true
+    const invalidGitCommitLineage = facts.gitCommitResumeLineageInvalidReason !== undefined
     return {
       ...result,
       rootCauseClass: 'approval_not_actionable',
@@ -887,21 +911,25 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           ...(facts.rejectedApprovalId !== undefined
             ? { id: facts.rejectedApprovalId }
             : facts.approvalId !== undefined ? { id: facts.approvalId } : {}),
-          value: ceoRejected ? 'REJECTED' : facts.approvalStatus ?? 'none',
+          value: ceoRejected
+            ? 'REJECTED'
+            : invalidGitCommitLineage ? 'INVALID_RESUME_LINEAGE' : facts.approvalStatus ?? 'none',
         },
         { fact: 'job.status', id: facts.job.id, value: 'blocked' },
       ],
       // **却下は「復旧できない」ではなく「AI が勝手に復旧してはいけない」。**
       // 経路自体は存在するので `existingRecoveryAvailable` は true のままにし、
       // `recoverable` を false にして自動レーンから外す。
-      recoverable: !ceoRejected,
+      recoverable: !ceoRejected && !invalidGitCommitLineage,
       existingRecoveryAvailable: true,
       confidence: 'high',
-      recommendedLane: ceoRejected ? 'ceo_escalation' : 'auto_recovery',
+      recommendedLane: ceoRejected || invalidGitCommitLineage ? 'ceo_escalation' : 'auto_recovery',
       summary: ceoRejected
         ? 'CEO が明示的に却下したため、同一内容を自動再開してはならない。'
           + '実装修正指示を伴う Human Resume が必要（それは却下された commit を作り直さず、'
           + '修正指示を載せた implement Job へ戻す）。'
+        : invalidGitCommitLineage
+          ? `git_commit resume lineage が不正なため自動再開しない: ${facts.gitCommitResumeLineageInvalidReason}`
         : `承認が ${facts.approvalStatus ?? '未発行'} で、その行では誰も進められない。`
           + '既存 resume は新しい承認サイクルを開始する（古い承認を再利用しない）。',
     }
