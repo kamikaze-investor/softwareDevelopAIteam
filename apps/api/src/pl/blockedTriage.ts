@@ -71,9 +71,8 @@ import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
 import {
-  isCanonicalGitCommitAnchor,
+  classifyGitCommitResumeLineage,
   parseGitCommitResumeStepKey,
-  validateGitCommitResumeLineage,
 } from '../gitCommitResumeLineage'
 
 // ────────────────────────────────────────────────────────────
@@ -373,31 +372,46 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
       return approval.status === 'REJECTED' ? approval : undefined
     }
 
-    let anchor = job
-    if (!isCanonicalGitCommitAnchor(job)) {
-      const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
-      if (!parsed) {
-        return { invalidReason: `invalid git_commit resume key ${job.workflowStepKey ?? 'none'}` }
-      }
-      const loadedAnchor = storage.jobs.findById(parsed.anchorJobId)
-      const lineage = validateGitCommitResumeLineage({
-        currentJob: job,
-        anchorJob: loadedAnchor,
-        taskJobs,
-        requireCurrentIsLatestGeneration: true,
-      })
-      if (!lineage.ok) return { invalidReason: lineage.reason }
-      anchor = lineage.anchorJob
+    // A rejection directly linked to this Job is authoritative on every key shape.
+    // Check it before technical lineage classification so corruption cannot hide a human decision.
+    if (job.approvalId) {
+      const directRejection = rejectionOf(job, job.approvalId)
+      if (directRejection !== undefined) return { rejection: directRejection }
     }
 
-    if (job.approvalId) return { rejection: rejectionOf(job, job.approvalId) }
+    const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
+    const classification = classifyGitCommitResumeLineage({
+      currentJob: job,
+      referencedJob: parsed === undefined ? undefined : storage.jobs.findById(parsed.anchorJobId),
+      taskJobs,
+      requireCurrentIsLatestGeneration: true,
+    })
+    if (classification.kind === 'invalid_new_scheme') {
+      return { invalidReason: classification.reason }
+    }
+
+    // Preserve the old rule: a directly linked non-REJECTED approval never inherits
+    // a rejection from another row.
+    if (job.approvalId) return {}
 
     // **link が無い Job は canonical anchor を1回だけ参照する。** Gate が既存 REJECTED を再利用して弾いた Job には
     // `approvalId` が付かない（`ux_jobs_approval_id` が UNIQUE なので結び直しもできない）。
     // 放置すると「却下されていない」と読んで `auto_recovery` を返し、PL が同じ内容を
     // 自動 resume し続ける（独立レビュー指摘）。`resumeBlockedTask()` と同じ1参照に揃える。
-    if (!anchor.approvalId) return {}
-    return { rejection: rejectionOf(anchor, anchor.approvalId) }
+    if (classification.kind === 'new_scheme') {
+      const anchor = classification.lineage.anchorJob
+      if (!anchor.approvalId) return {}
+      return { rejection: rejectionOf(anchor, anchor.approvalId) }
+    }
+
+    // Legacy behaviour is intentionally one exact hop, including nested chains.
+    const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
+    if (!resumed) return {}
+    const source = classification.referencedJob
+    if (!source || !source.approvalId) return {}
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return {}
+    if (source.safeCommand.kind !== 'git_commit') return {}
+    return { rejection: rejectionOf(source, source.approvalId) }
   })()
   const linkedRejection = linkedGitCommit.rejection
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
@@ -900,7 +914,35 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
   if (facts.job?.status === 'blocked' && !hasLiveJob(facts)) {
     const ceoRejected = facts.ceoRejectedGitCommit === true
-    const invalidGitCommitLineage = facts.gitCommitResumeLineageInvalidReason !== undefined
+    if (!ceoRejected && facts.gitCommitResumeLineageInvalidReason !== undefined) {
+      // 新方式（固定 anchor + generation）の lineage が壊れている = 重複・欠番・不正 anchor。
+      // 正常なコードでは作られず（UNIQUE index と単調な採番）、データ破損でしか起きない。
+      // **Decision Authority の問題ではない**が、未配線の fail-closed 状態はすべて人へ届ける
+      // という本ファイルの不変条件に従う。maintenance_lane（protected 領域の Tier B handoff）は
+      // 意味が違うので使わない。旧形式（key 無し・入れ子の `resume:<prev>:1`）はここへ来ない。
+      return {
+        ...result,
+        rootCauseClass: 'unknown',
+        blockingLayer: 'job_creation',
+        evidence: [
+          {
+            fact: 'job.workflowStepKey',
+            id: facts.job.id,
+            value: facts.job.workflowStepKey ?? 'none',
+          },
+          {
+            fact: 'git_commit.resume_lineage',
+            id: facts.job.id,
+            value: facts.gitCommitResumeLineageInvalidReason,
+          },
+        ],
+        recoverable: false,
+        existingRecoveryAvailable: false,
+        confidence: 'high',
+        recommendedLane: 'ceo_escalation',
+        summary: `git_commit resume lineage が不正なため自動再開しない: ${facts.gitCommitResumeLineageInvalidReason}`,
+      }
+    }
     return {
       ...result,
       rootCauseClass: 'approval_not_actionable',
@@ -911,25 +953,21 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           ...(facts.rejectedApprovalId !== undefined
             ? { id: facts.rejectedApprovalId }
             : facts.approvalId !== undefined ? { id: facts.approvalId } : {}),
-          value: ceoRejected
-            ? 'REJECTED'
-            : invalidGitCommitLineage ? 'INVALID_RESUME_LINEAGE' : facts.approvalStatus ?? 'none',
+          value: ceoRejected ? 'REJECTED' : facts.approvalStatus ?? 'none',
         },
         { fact: 'job.status', id: facts.job.id, value: 'blocked' },
       ],
       // **却下は「復旧できない」ではなく「AI が勝手に復旧してはいけない」。**
       // 経路自体は存在するので `existingRecoveryAvailable` は true のままにし、
       // `recoverable` を false にして自動レーンから外す。
-      recoverable: !ceoRejected && !invalidGitCommitLineage,
+      recoverable: !ceoRejected,
       existingRecoveryAvailable: true,
       confidence: 'high',
-      recommendedLane: ceoRejected || invalidGitCommitLineage ? 'ceo_escalation' : 'auto_recovery',
+      recommendedLane: ceoRejected ? 'ceo_escalation' : 'auto_recovery',
       summary: ceoRejected
         ? 'CEO が明示的に却下したため、同一内容を自動再開してはならない。'
           + '実装修正指示を伴う Human Resume が必要（それは却下された commit を作り直さず、'
           + '修正指示を載せた implement Job へ戻す）。'
-        : invalidGitCommitLineage
-          ? `git_commit resume lineage が不正なため自動再開しない: ${facts.gitCommitResumeLineageInvalidReason}`
         : `承認が ${facts.approvalStatus ?? '未発行'} で、その行では誰も進められない。`
           + '既存 resume は新しい承認サイクルを開始する（古い承認を再利用しない）。',
     }

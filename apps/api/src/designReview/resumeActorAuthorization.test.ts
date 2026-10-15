@@ -99,7 +99,6 @@ async function seedResumableTask(): Promise<{ task: Task; blockedJob: Job }> {
       workingDir: '/some/legacy/path',
       params: { commitMessage: 'resume actor target' },
     },
-    workflowStepKey: `review:resume-actor-review-${task.id}:git-commit`,
   })
 
   return { task, blockedJob }

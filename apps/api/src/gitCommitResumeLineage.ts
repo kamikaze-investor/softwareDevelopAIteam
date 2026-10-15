@@ -32,6 +32,14 @@ export type GitCommitResumeLineageValidation =
     }
   | { ok: false; reason: string }
 
+export type GitCommitResumeLineageClassification =
+  | { kind: 'legacy'; referencedJob?: Job }
+  | {
+      kind: 'new_scheme'
+      lineage: Extract<GitCommitResumeLineageValidation, { ok: true }>
+    }
+  | { kind: 'invalid_new_scheme'; reason: string }
+
 /**
  * Validate the fixed-anchor generation set without following a Job-to-Job chain.
  *
@@ -156,6 +164,45 @@ export function validateGitCommitResumeLineage(input: {
     highestGeneration,
     nextWorkflowStepKey: gitCommitResumeStepKey(anchorJob.id, highestGeneration + 1),
   }
+}
+
+/**
+ * Select the fixed-anchor scheme without claiming legacy `resume:` rows.
+ *
+ * A generation-1 row is legacy unless its single referenced Job is a canonical
+ * git_commit anchor. Generations greater than 1 could never be produced by the
+ * legacy writer, so an invalid reference is a visible fail-closed condition.
+ */
+export function classifyGitCommitResumeLineage(input: {
+  currentJob: Job
+  referencedJob: Job | undefined
+  taskJobs: readonly Job[]
+  requireCurrentIsLatestGeneration: boolean
+}): GitCommitResumeLineageClassification {
+  const parsed = parseGitCommitResumeStepKey(input.currentJob.workflowStepKey)
+  const isAnchor = isCanonicalGitCommitAnchor(input.currentJob)
+
+  if (!isAnchor && parsed === undefined) return { kind: 'legacy' }
+  if (
+    !isAnchor
+    && parsed?.generation === 1
+    && (input.referencedJob === undefined || !isCanonicalGitCommitAnchor(input.referencedJob))
+  ) {
+    return {
+      kind: 'legacy',
+      ...(input.referencedJob !== undefined ? { referencedJob: input.referencedJob } : {}),
+    }
+  }
+
+  const validation = validateGitCommitResumeLineage({
+    currentJob: input.currentJob,
+    anchorJob: isAnchor ? input.currentJob : input.referencedJob,
+    taskJobs: input.taskJobs,
+    requireCurrentIsLatestGeneration: input.requireCurrentIsLatestGeneration,
+  })
+  return validation.ok
+    ? { kind: 'new_scheme', lineage: validation }
+    : { kind: 'invalid_new_scheme', reason: validation.reason }
 }
 
 export function exactGitCommitResumePredecessor(input: {

@@ -43,11 +43,10 @@ import type {
 // 型以外に storage へ依存しないモジュールなので循環しない。
 import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
 import {
+  classifyGitCommitResumeLineage,
   exactGitCommitResumePredecessor,
-  isCanonicalGitCommitAnchor,
   parseGitCommitResumeStepKey,
-  validateGitCommitResumeLineage,
-  type GitCommitResumeLineageValidation,
+  type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 
 export class SingleRunningProjectError extends Error {
@@ -1670,29 +1669,44 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * canonical anchor Job の linked Approval を見る。**provenance と同じ規約・同じ1参照**であり、
    * 探索でも候補選択でもない。
    */
-  function gitCommitResumeLineage(job: Job): GitCommitResumeLineageValidation {
+  function gitCommitResumeLineage(job: Job): GitCommitResumeLineageClassification {
     const parsed = parseGitCommitResumeStepKey(job.workflowStepKey)
-    const anchorJob = isCanonicalGitCommitAnchor(job)
-      ? job
-      : parsed !== undefined ? jobs.findById(parsed.anchorJobId) : undefined
-    return validateGitCommitResumeLineage({
+    return classifyGitCommitResumeLineage({
       currentJob: job,
-      anchorJob,
+      referencedJob: parsed !== undefined ? jobs.findById(parsed.anchorJobId) : undefined,
       taskJobs: jobs.findByTaskId(job.taskId),
       requireCurrentIsLatestGeneration: true,
     })
   }
 
-  function isLinkedGitCommitRejection(job: Job, anchorJob: Job): boolean {
+  function isLinkedGitCommitRejection(
+    job: Job,
+    lineage: GitCommitResumeLineageClassification,
+  ): boolean {
     if (job.safeCommand.kind !== 'git_commit') return false
 
     // link のある Job はそれだけで判定する。
     if (job.approvalId) return isGitCommitRejectionOf(job, job.approvalId)
 
-    // link が無い generation は、事前に exact id で1回だけ検証した canonical anchor の
-    // link を見る。直前 generation や別候補を探索しない。
-    if (!anchorJob.approvalId) return false
-    return isGitCommitRejectionOf(anchorJob, anchorJob.approvalId)
+    if (lineage.kind === 'new_scheme') {
+      // link が無い generation は、事前に exact id で1回だけ検証した canonical anchor の
+      // link を見る。直前 generation や別候補を探索しない。
+      const anchorJob = lineage.lineage.anchorJob
+      return anchorJob.approvalId !== undefined
+        && isGitCommitRejectionOf(anchorJob, anchorJob.approvalId)
+    }
+
+    if (lineage.kind !== 'legacy') return false
+
+    // Legacy behaviour: `resume:<source>:1` is dereferenced exactly once, even
+    // when source is another resume Job. Deeper chains remain unresolved.
+    const resumed = /^resume:([^:]+):1$/.exec(job.workflowStepKey ?? '')
+    if (!resumed) return false
+    const source = lineage.referencedJob
+    if (!source || !source.approvalId) return false
+    if (source.taskId !== job.taskId || source.projectId !== job.projectId) return false
+    if (source.safeCommand.kind !== 'git_commit') return false
+    return isGitCommitRejectionOf(source, source.approvalId)
   }
 
   function isGitCommitRejectionOf(job: Job, approvalId: string): boolean {
@@ -1706,22 +1720,35 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
   function resolveSourceImplementJobForRejectedGitCommit(
     latestJob: Job,
-    gitCommitJob: Job,
+    lineage: GitCommitResumeLineageClassification,
   ): { ok: true; job: Job } | { ok: false; reason: string } {
     const sameOwner = (job: Job): boolean =>
       job.taskId === latestJob.taskId && job.projectId === latestJob.projectId
 
-    // 2. resume generation の場合も、caller が exact id で1回だけロード・検証した
-    //    canonical anchor を受け取る。generation 間を辿る resolver は作らない。
+    // 2. New-scheme generations receive their validated canonical anchor.
+    //    Legacy rows retain the previous one-hop `resume:<source>:1` normalization.
+    let gitCommitJob = lineage.kind === 'new_scheme' ? lineage.lineage.anchorJob : latestJob
+    if (lineage.kind === 'legacy') {
+      const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
+      if (resumed) {
+        const source = lineage.referencedJob
+        if (!source) return { ok: false, reason: `resume source job ${resumed[1]} not found` }
+        if (!sameOwner(source)) {
+          return { ok: false, reason: 'resume source job belongs to a different task or project' }
+        }
+        if (source.safeCommand.kind !== 'git_commit') {
+          return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
+        }
+        gitCommitJob = source
+      }
+    }
+
     if (!sameOwner(gitCommitJob)) {
       return { ok: false, reason: 'git_commit anchor belongs to a different task or project' }
     }
-    if (!isCanonicalGitCommitAnchor(gitCommitJob)) {
-      return { ok: false, reason: 'git_commit anchor is not a canonical review:<id>:git-commit Job' }
-    }
 
     // 4. `review:<reviewJobId>:git-commit`。
-    //    anchor は既にこの形に限定済みなので、**多段 traversal は構造的に起きない**。
+    //    Legacy nested resume sources do not match, preserving the old fail-closed result.
     const reviewRef = /^review:([^:]+):git-commit$/.exec(gitCommitJob.workflowStepKey ?? '')
     if (!reviewRef) {
       return {
@@ -2694,13 +2721,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, reason: 'The latest approval request is waiting for user review' }
         }
 
-        // git_commit の approval-expiry resume だけは fixed anchor + generation を使う。
-        // canonical anchor は exact id で1回だけ読み、保存済み generation は集合として
-        // duplicate / gap を検査する。壊れた lineage から従来の nested resume へは戻さない。
-        const validatedGitCommitLineage = latestJob.safeCommand.kind === 'git_commit'
+        // Recognized git_commit anchors/generations use fixed anchor + generation.
+        // The referenced Job is read exactly once and generations are checked as a set.
+        // Legacy keyless/other-key/nested-:1 rows keep the previous nested resume writer;
+        // an invalid recognized lineage never falls back to that legacy path.
+        const gitCommitLineage = latestJob.safeCommand.kind === 'git_commit'
           ? gitCommitResumeLineage(latestJob)
           : undefined
-        if (validatedGitCommitLineage !== undefined && !validatedGitCommitLineage.ok) {
+        if (gitCommitLineage?.kind === 'invalid_new_scheme') {
           if (
             latestJob.approvalId !== undefined
             && isGitCommitRejectionOf(latestJob, latestJob.approvalId)
@@ -2708,13 +2736,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             return {
               ok: false,
               code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED',
-              reason: validatedGitCommitLineage.reason,
+              reason: gitCommitLineage.reason,
             }
           }
           return {
             ok: false,
             code: 'GIT_COMMIT_RESUME_LINEAGE_INVALID',
-            reason: validatedGitCommitLineage.reason,
+            reason: gitCommitLineage.reason,
           }
         }
 
@@ -2731,12 +2759,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 条件を `instructionPrompt` の有無にしないのは、route も PL も**常に非空**を
         // 渡すためで、そうすると既存の正常経路まで変わってしまう。
         if (
-          validatedGitCommitLineage?.ok === true
-          && isLinkedGitCommitRejection(latestJob, validatedGitCommitLineage.anchorJob)
+          gitCommitLineage !== undefined
+          && isLinkedGitCommitRejection(latestJob, gitCommitLineage)
         ) {
           const source = resolveSourceImplementJobForRejectedGitCommit(
             latestJob,
-            validatedGitCommitLineage.anchorJob,
+            gitCommitLineage,
           )
           if (!source.ok) {
             return { ok: false, code: 'REJECTED_COMMIT_SOURCE_UNRESOLVED', reason: source.reason }
@@ -2782,7 +2810,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 変えて作成するため approvalId を引き継がず、/gate/check が現在のdiffに対して
         // 新しいapprovalを発行する（既存の git_commit Job生成と同じ形、既存のGate/Queueのまま）。
         if (latestJob.safeCommand.kind === 'git_commit') {
-          if (validatedGitCommitLineage?.ok !== true) {
+          if (gitCommitLineage === undefined) {
             return {
               ok: false,
               code: 'GIT_COMMIT_RESUME_LINEAGE_INVALID',
@@ -2794,7 +2822,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             projectId: latestJob.projectId,
             agentRole: latestJob.agentRole,
             status: 'queued',
-            workflowStepKey: validatedGitCommitLineage.nextWorkflowStepKey,
+            workflowStepKey: gitCommitLineage.kind === 'new_scheme'
+              ? gitCommitLineage.lineage.nextWorkflowStepKey
+              : `resume:${latestJob.id}:1`,
             safeCommand: { ...latestJob.safeCommand, workingDir: TARGET_WORKING_DIR },
             dryRun: latestJob.dryRun,
           })
@@ -6327,20 +6357,28 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
         if (candidate.workflowStepKey?.startsWith('resume:') !== true) return false
 
         // Fixed-anchor git_commit generations name the anchor, not generation n-1.
-        // Prove the predecessor by one exact match; never walk generation-to-generation.
+        // Legacy git_commit rows retain the old parseResumeSource exact match.
         if (candidate.safeCommand.kind === 'git_commit') {
           const parsed = parseGitCommitResumeStepKey(candidate.workflowStepKey)
-          if (!parsed) return false
-          const anchorRow = jobById.get(parsed.anchorJobId) as unknown
-          const anchorJob = anchorRow === undefined ? undefined : deserializeJob(anchorRow)
-          const lineage = validateGitCommitResumeLineage({
+          const referencedRow = parsed === undefined
+            ? undefined
+            : jobById.get(parsed.anchorJobId) as unknown
+          const referencedJob = referencedRow === undefined ? undefined : deserializeJob(referencedRow)
+          const classification = classifyGitCommitResumeLineage({
             currentJob: candidate,
-            anchorJob,
+            referencedJob,
             taskJobs,
             requireCurrentIsLatestGeneration: false,
           })
-          if (!lineage.ok) return false
-          return exactGitCommitResumePredecessor({ successor: candidate, lineage, taskJobs })?.id === sourceJobId
+          if (classification.kind === 'invalid_new_scheme') return false
+          if (classification.kind === 'legacy') {
+            return parseResumeSource(candidate.workflowStepKey) === sourceJobId
+          }
+          return exactGitCommitResumePredecessor({
+            successor: candidate,
+            lineage: classification.lineage,
+            taskJobs,
+          })?.id === sourceJobId
         }
 
         // Non-git_commit resume semantics are unchanged.

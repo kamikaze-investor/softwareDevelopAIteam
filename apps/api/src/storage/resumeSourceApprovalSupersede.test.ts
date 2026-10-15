@@ -317,6 +317,51 @@ describe('startup reconciliation — 終端化済み source に紐づいたま�
     expect(storage.jobs.findById('generation-exact-3')?.workflowStepKey).toBe('resume:anchor-exact:3')
   })
 
+  it('legacy nested git_commit successors still terminalize and supersede their exact source', () => {
+    const dbPath = tempDbPath()
+    seedRaw(dbPath, (db) => {
+      insertTask(db, 'legacy-terminalize')
+      insertJob(db, { id: 'legacy-origin-a', taskId: 'legacy-terminalize', status: 'failed' })
+      insertJob(db, {
+        id: 'legacy-source-a', taskId: 'legacy-terminalize', status: 'blocked',
+        workflowStepKey: 'resume:legacy-origin-a:1',
+      })
+      insertJob(db, {
+        id: 'legacy-successor-a', taskId: 'legacy-terminalize', status: 'queued',
+        workflowStepKey: 'resume:legacy-source-a:1',
+      })
+
+      insertTask(db, 'legacy-supersede')
+      insertApproval(db, 'legacy-approval-b', 'legacy-supersede', 'WAITING_FOR_USER')
+      insertJob(db, { id: 'legacy-origin-b', taskId: 'legacy-supersede', status: 'failed' })
+      insertJob(db, {
+        id: 'legacy-source-b', taskId: 'legacy-supersede', status: 'failed',
+        approvalId: 'legacy-approval-b', workflowStepKey: 'resume:legacy-origin-b:1',
+      })
+      insertJob(db, {
+        id: 'legacy-successor-b', taskId: 'legacy-supersede', status: 'queued',
+        workflowStepKey: 'resume:legacy-source-b:1',
+      })
+    })
+
+    const storage = createSQLiteStorage(dbPath)
+
+    expect(storage.jobs.findById('legacy-source-a')?.status).toBe('failed')
+    expect(storage.auditLog.findByEntity('job', 'legacy-source-a')).toEqual([
+      expect.objectContaining({
+        detail: expect.stringContaining('successor_job_id=legacy-successor-a'),
+      }),
+    ])
+    expect(approvalStatusOf(storage, 'legacy-approval-b')).toBe('SUPERSEDED')
+    expect(storage.auditLog.findByEntity('approval_request', 'legacy-approval-b')).toEqual([
+      expect.objectContaining({
+        detail: expect.stringContaining(
+          'source_job_id=legacy-source-b successor_job_id=legacy-successor-b',
+        ),
+      }),
+    ])
+  })
+
   it('generation 3 supersedes only generation 2 approval after exact predecessor reconciliation', () => {
     const dbPath = tempDbPath()
     seedRaw(dbPath, (db) => {

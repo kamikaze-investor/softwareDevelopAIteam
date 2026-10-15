@@ -910,7 +910,7 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
       } as never)
       storage.jobs.create({
         taskId: nonGitTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
-        safeCommand: command, workflowStepKey: `resume:${nonGitAnchor.id}:1`,
+        safeCommand: command, workflowStepKey: `resume:${nonGitAnchor.id}:2`,
       } as never)
       await expectRefusal(nonGitTask, /not a canonical/)
     })
