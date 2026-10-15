@@ -215,8 +215,10 @@ Task を park して Project を解放する経路は **既存の ADMIN manual a
 REJECT → 再実装の解決が届かなくなった。新しい resume は元の git_commit Job（`review:<id>:git-commit`）を
 anchor として `resume:<anchor>:<n>` を振る。条件は次のとおり。
 
-- **承認の意味は変えない。** 各 generation は新しい Approval と Gate 評価を受け、HEAD / diff が変われば STALE。
-  Stage 1 自動通過の対象外（`resume:` は対象外のまま）。既存の Job 行・workflowStepKey は書き換えない。
+- **承認の意味は変えない。** 各 generation は新しい Approval と Gate 評価を受け、HEAD / diff が変われば
+  既存の規則どおり無効になる（承認待ちは SUPERSEDED、承認済みは STALE）。Stage 1 自動通過の対象外
+  （`resume:` は対象外のまま）。既存 Job の workflowStepKey は書き換えない（resume が直前 Job を
+  blocked → failed にする既存の handoff は従来どおり）。
 - anchor は同一 Task / Project の canonical git_commit Job に限る。参照は1回だけで、再帰・多段探索をしない。
 - **Job 自身に直接紐づく Approval を最初に見る。** 直結の REJECTED は常に CEO の却下として扱う。
   anchor 経由で引き継いだ却下は triage には効くが、manual abort（直結のみ）の根拠にはならない。
