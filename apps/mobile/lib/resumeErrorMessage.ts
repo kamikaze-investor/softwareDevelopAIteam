@@ -100,3 +100,18 @@ const RECOVER_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
 export function formatRecoverErrorMessage(code: string | null): string {
   return messageForCode(RECOVER_ERROR_MESSAGE_BY_CODE, code) ?? RECOVER_ERROR_MESSAGE_FALLBACK
 }
+
+export const APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK = '操作に失敗しました'
+
+/**
+ * `PATCH /api/approval-requests/:id/status` の拒否 `code` ごとの文言。
+ * この route も `HUMAN_ONLY_ROUTES`（C-02）なので、API の認証構成が人と自動を区別できないと 403 になる。
+ */
+const APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS:
+    '承認・却下はCEO専用の操作です。現在のAPIの認証設定では実行できません。AI開発チームに確認を依頼してください。',
+}
+
+export function formatApprovalDecisionErrorMessage(code: string | null): string {
+  return messageForCode(APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE, code) ?? APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK
+}

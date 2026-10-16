@@ -133,7 +133,9 @@ describe('PATCH /api/approval-requests/:id/status — approval_actor を記録�
     }
   })
 
-  it('legacy 単一 token で承認された要求は human ではなく、recovery は consume せず新しい承認待ちへ置き換える', async () => {
+  // C-02: 承認 PATCH は HUMAN_ONLY_ROUTES。legacy 単一 token では人と Worker を区別できないので、
+  // 正しい token でも 403（HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS）で、決定も actor 行も残らない。
+  it('legacy 単一 token では承認 PATCH に届かず（403）、決定も actor 記録も残らない', async () => {
     useLegacyCredential()
     const { app, storage } = await buildApp()
     try {
@@ -142,11 +144,29 @@ describe('PATCH /api/approval-requests/:id/status — approval_actor を記録�
       if (first.status !== 'awaiting_approval') throw new Error(`unexpected ${first.status}`)
 
       const res = await decide(app, first.approvalRequestId, 'APPROVED', LEGACY_TOKEN)
-      expect(res.statusCode).toBe(200)
-      expect(readApprovalActorClass(storage, first.approvalRequestId)).not.toBe('human')
+      expect(res.statusCode).toBe(403)
+      expect(res.json()).toMatchObject({ code: 'HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS' })
+      expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('WAITING_FOR_USER')
+      expect(readApprovalActorClass(storage, first.approvalRequestId)).toBe('unknown')
+    } finally {
+      await app.close()
+    }
+  })
 
-      expect(recover(storage, shape)).toMatchObject({ status: 'awaiting_approval', reused: false })
-      expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('SUPERSEDED')
+  it('認証なし（API_TOKEN 未設定）の構成でも承認 PATCH は 403', async () => {
+    const { app, storage } = await buildApp()
+    try {
+      const shape = storedReviewShape(storage)
+      const first = recover(storage, shape)
+      if (first.status !== 'awaiting_approval') throw new Error(`unexpected ${first.status}`)
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/approval-requests/${first.approvalRequestId}/status`,
+        payload: { status: 'APPROVED' },
+      })
+      expect(res.statusCode).toBe(403)
+      expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('WAITING_FOR_USER')
     } finally {
       await app.close()
     }
