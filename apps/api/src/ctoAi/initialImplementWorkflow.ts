@@ -19,7 +19,14 @@ export type InitialImplementWorkflowResult =
   | { taskId: string; status: 'created'; job: Job }
   | { taskId: string; status: 'skipped'; reason: string; retryable?: boolean }
 
-function initialWorkflowStepKey(taskId: string): string {
+/**
+ * 初回 workflow Job が既に在るために作らなかったときの skipped reason。呼び出し側が
+ * 「既に在る」を他の skip と区別する唯一の根拠なので、文字列を書き写さずこの定数を使う。
+ */
+export const INITIAL_WORKFLOW_JOB_EXISTS = 'initial workflow job already exists'
+
+/** 初回 workflow Job の canonical な workflowStepKey。 */
+export function initialWorkflowStepKey(taskId: string): string {
   return `task:${taskId}:initial-implement`
 }
 
@@ -77,7 +84,7 @@ export async function createInitialImplementWorkflow(
 
   const stepKey = initialWorkflowStepKey(task.id)
   if (storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey === stepKey)) {
-    return { taskId, status: 'skipped', reason: 'initial workflow job already exists' }
+    return { taskId, status: 'skipped', reason: INITIAL_WORKFLOW_JOB_EXISTS }
   }
 
   // Job Gateは常に実行する。すでに同一Task・同一prompt hashのALIGNED evidenceがあれば、
@@ -107,7 +114,8 @@ export async function createInitialImplementWorkflow(
         taskId,
         status: 'skipped',
         reason: `design review did not align (${review.status})`,
-        retryable: review.status === 'requeued' || review.status === 'not_claimable' || review.status === 'stale',
+        retryable: review.status === 'requeued' || review.status === 'contended'
+          || review.status === 'not_claimable' || review.status === 'stale',
       }
     }
     gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
@@ -133,7 +141,7 @@ export async function createInitialImplementWorkflow(
   } catch (error: unknown) {
     // unique index衝突は並行した同一producerによる既存Jobとして扱う。
     if (storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey === stepKey)) {
-      return { taskId, status: 'skipped', reason: 'initial workflow job already exists' }
+      return { taskId, status: 'skipped', reason: INITIAL_WORKFLOW_JOB_EXISTS }
     }
     throw error
   }

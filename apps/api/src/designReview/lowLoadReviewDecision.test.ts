@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import type { Job } from '@ai-team/shared'
-import { recomputeDecision } from './designReviewCoordinator'
+import { DESIGN_REVIEW_MAX_ATTEMPTS, recomputeDecision } from './designReviewCoordinator'
 import { executeQueuedRepair, prepareRepairFlow } from './repairFlow'
 
 /**
@@ -59,6 +59,28 @@ describe('recomputeDecision: low-load（task kind）', () => {
     expect(outcome.rejectedReason).not.toContain('focus set mismatch')
   })
 
+  it('unavailable を申告していても integration の CONFLICT は CONFLICT のまま返す', () => {
+    // low load の早期 return が CONFLICT を REVIEW_UNAVAILABLE に置き換えていた（独立レビュー指摘・2026-10-16）。
+    const outcome = recomputeDecision(lowLoad({
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'conflicts with the goal' },
+      finalDecision: 'REVIEW_UNAVAILABLE',
+      unavailableReason: 'focused review partially unavailable',
+    }) as never, 'task', DOCS_ONLY)
+
+    expect(outcome.decision).toBe('CONFLICT')
+  })
+
+  it('unavailable を申告し integration が CONFLICT でなければ REVIEW_UNAVAILABLE で理由が残る', () => {
+    const outcome = recomputeDecision(lowLoad({
+      integrationReviewResult: { decision: 'UNCERTAIN', summary: 'integration unavailable' },
+      finalDecision: 'REVIEW_UNAVAILABLE',
+      unavailableReason: 'Claude integration review unavailable: exit 1',
+    }) as never, 'task', DOCS_ONLY)
+
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('Claude integration review unavailable')
+  })
+
   it('旧 runner の形（架空の strategic_alignment 付き）でも focus set mismatch にならない', () => {
     // 修正版 Worker の deploy 前後で旧 runner の結果が届いても、原因を取り違えない。
     const outcome = recomputeDecision(lowLoad({
@@ -68,6 +90,18 @@ describe('recomputeDecision: low-load（task kind）', () => {
 
     expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
     expect(outcome.rejectedReason ?? '').not.toContain('focus set mismatch')
+  })
+
+  it('unavailable 申告 + 旧形 focus（集合不一致）+ integration CONFLICT は CONFLICT を返す', () => {
+    // 構造不一致を REVIEW_UNAVAILABLE へ変換する前に、有効な CONFLICT を探す（独立レビュー指摘・2026-10-16）。
+    const outcome = recomputeDecision(lowLoad({
+      finalDecision: 'REVIEW_UNAVAILABLE',
+      focusedReviewResults: [{ focus: 'strategic_alignment', decision: 'UNCERTAIN', summary: 'x', findings: [] }],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'conflicts with the goal' },
+    }) as never, 'task', DOCS_ONLY)
+
+    expect(outcome.decision).toBe('CONFLICT')
+    expect(outcome.rejectedReason).toContain('focus set mismatch')
   })
 
   it('構造化された判定が無い自己申告の ALIGNED は、従来どおり ALIGNED にしない（fail-open 防止）', () => {
@@ -119,7 +153,7 @@ describe('recomputeDecision: 既存経路の regression', () => {
     expect(outcome.decision).toBe('CONFLICT')
   })
 
-  it('roadmap kind の REVIEW_UNAVAILABLE は本修正の対象外で、挙動が変わらない', () => {
+  it('roadmap kind でも REVIEW_UNAVAILABLE の申告は ALIGNED にも構造不採用の UNCERTAIN にもならない', () => {
     const outcome = recomputeDecision({
       reviewLoad: 'critical',
       selectedFocuses: [],
@@ -128,9 +162,10 @@ describe('recomputeDecision: 既存経路の regression', () => {
       unavailableReason: 'integration unavailable',
     } as never, 'roadmap', [])
 
-    // roadmap は integration review 必須のまま（早期 return で素通りさせない）。
-    expect(outcome.decision).toBe('UNCERTAIN')
-    expect(outcome.rejectedReason ?? '').not.toContain('review unavailable:')
+    // 構造検証（integration 必須・focus 集合）には落ちるが、runner が実行できなかったと申告して
+    // いるので判定無し。roadmap の終端は従来どおり非 ALIGNED（retry は task kind のみ）。
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('integration unavailable')
   })
 })
 
@@ -185,18 +220,27 @@ describe('T6 production 形の docs-only repair Design Review', () => {
     expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
   })
 
-  it('review を実行できなかった場合は escalation し、run.error に本当の原因が残る', async () => {
+  it('review を実行できなかった場合は attempt 上限まで requeue し、上限で escalation して run.error に本当の原因が残る', async () => {
     const storage = createSQLiteStorage(':memory:')
     const ids = seed(storage)
     const preparation = prepareRepairFlow(storage, { failedJob: failedDocsJob(storage, ids) })
     if (preparation.action !== 'queue') throw new Error('fixture failed')
     const run = storage.designReviewRuns.create(preparation.run)
-
-    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, depsReturning(JSON.stringify(lowLoad({
+    const deps = depsReturning(JSON.stringify(lowLoad({
       reviewKind: 'task',
       finalDecision: 'REVIEW_UNAVAILABLE',
       unavailableReason: "Low-load legacy Meta Review could not complete: ENOENT: no such file or directory, open '/workspace/control/docs/meta_reviewer/prompt.md'",
-    }))) as never)
+    }))) as never
+
+    // REVIEW_UNAVAILABLE は判定ではないので、runner crash と同じく requeue され Task は止めない。
+    for (let attempt = 1; attempt < DESIGN_REVIEW_MAX_ATTEMPTS; attempt += 1) {
+      const requeued = await executeQueuedRepair(storage, storage.designReviewRuns.findById(run.id)!, preparation.stepKey, deps)
+      expect(requeued.status).toBe('already_started')
+      expect(storage.designReviewRuns.findById(run.id)?.status).toBe('queued')
+      expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
+    }
+
+    const outcome = await executeQueuedRepair(storage, storage.designReviewRuns.findById(run.id)!, preparation.stepKey, deps)
 
     // 実行できなかった review から repair を作らない（fail-closed は維持）。
     expect(outcome.status).toBe('escalated')

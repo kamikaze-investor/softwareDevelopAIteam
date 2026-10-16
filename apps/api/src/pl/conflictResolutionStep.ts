@@ -51,9 +51,14 @@ import {
   type CoordinatorDeps,
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
-import { createInitialImplementWorkflow } from '../ctoAi/initialImplementWorkflow'
+import {
+  createInitialImplementWorkflow,
+  INITIAL_WORKFLOW_JOB_EXISTS,
+  initialWorkflowStepKey,
+} from '../ctoAi/initialImplementWorkflow'
 import { extractImplementationScope, extractItemDescription } from '../ctoAi/roadmapAdoption'
-import type { IStorage } from '../storage/interface'
+import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { ADOPTION_REPOSITORY_MAP, resolveLedgerPath } from './adoptionStep'
 import {
   applyRevisedSpec,
@@ -346,6 +351,13 @@ export type ConflictRoundStatus =
   | 'challenge_not_aligned'
   /** 同一 (spec, finding) の再評価は既に使い切っている。 */
   | 'challenge_cap_reached'
+  /**
+   * 再評価 / 修正版の fresh Review が**まだ判定を出していない**（run が queued に戻った）。
+   * 否定的な判定ではないので escalation しない。run は design_review_idle → rekick で再開され、
+   * ALIGNED なら既存 `recoverReadyTasksWithoutJob()` が `createInitialImplementWorkflow()` で
+   * Job を作る（stepKey 一意で1回だけ）。CONFLICT なら次の Round がその判定から始まる。
+   */
+  | 'review_pending'
   /** Independent Remediation へ移行した（結果は `remediation` に入る）。 */
   | 'remediation'
   /** Round 予算を使い切った。 */
@@ -481,6 +493,19 @@ async function runChallenge(
     }
   }
 
+  // **別の同一性の review が active なら、Challenge を消費せず待つ。** active run は Task ごとに
+  // 1本なので、ここで再評価を要求しても別の設計の run しか返らない（create() は契約上それを返さず
+  // contention を投げる）。それを消費してしまうと、この Challenge は一度も評価されずに失われる。
+  // ここから create() までの間に await は無いので、判定と作成の間に別経路は割り込めない。
+  const active = storage.designReviewRuns.findActiveByTaskId(taskId)
+  if (active !== undefined && !isSameReviewIdentity(active, subject)) {
+    return {
+      ...base,
+      status: 'review_pending',
+      reason: `another design review (run ${active.id}) is active for this task; the challenge waits for it`,
+    }
+  }
+
   // **先に消費を記録する。** 後で書くと、途中で落ちた場合に何度でも引けてしまう。
   // `orig_provider` / `orig_model` は取得不能なので `unavailable` と明示する
   // （owner: review-provider-exhausted-alternate-rereview）。
@@ -507,6 +532,28 @@ async function runChallenge(
     deps.coordinatorDeps ?? buildDefaultCoordinatorDeps(),
   )
 
+  // **requeued は判定ではない。** 評価済み（outcome=evaluated）とも否定とも記録しない。
+  // 再評価 run は queued のまま残り、design_review_idle → rekick で同じ run が判定まで進む。
+  // Challenge は1回きりのまま —— 新しい run を引き直さず、この run の判定がこの Challenge の
+  // 判定になる（上の starting 行は「この Challenge は始まった」の記録として残す）。
+  // `contended` / 読み直しても終端していない `not_claimable` / `stale` も同じく判定待ち。
+  if (
+    outcome.status === 'requeued' || outcome.status === 'contended'
+    || outcome.status === 'not_claimable' || outcome.status === 'stale'
+  ) {
+    recordRemediationFailure(
+      storage,
+      taskId,
+      `stage=challenge chal=${key} orig_verdict=CONFLICT outcome=pending`
+      + ` reason=${outcome.decision ?? outcome.status}`,
+    )
+    return {
+      ...base,
+      status: 'review_pending',
+      reason: 'the fresh re-evaluation has not produced a judgment yet; the queued run will be resumed',
+    }
+  }
+
   const verdict = outcome.decision ?? outcome.status
   // verdict reversal を観測可能な事実として残す（新しい metrics backend は作らない）。
   recordRemediationFailure(
@@ -531,17 +578,54 @@ async function runChallenge(
   // ALIGNED evidence が出た。**既存 Job Gate に従って進む**（override はしない）。
   const ensureJob = deps.ensureJob ?? createInitialImplementWorkflow
   const job = await ensureJob(storage, taskId, deps.coordinatorDeps ?? buildDefaultCoordinatorDeps())
+  // **Job が既に在るなら成功である。** ALIGNED の後、既存の `recoverReadyTasksWithoutJob()` 等が
+  // 先に初回 Job を作っていると ensureJob は skipped を返す。保存済みの Job を読み直し、
+  // **「既に在る」で skip し、かつ canonical な初回 Job がレビューした prompt のもの**のときだけ
+  // released とみなす。他の skip 理由（park 等）は従来どおり失敗。
+  const released = job.status === 'created'
+    || (job.status === 'skipped' && job.reason === INITIAL_WORKFLOW_JOB_EXISTS
+      && hasCanonicalInitialJobForReviewedPrompt(storage, subject))
 
   return {
     ...base,
-    status: job.status === 'created' ? 'challenge_aligned' : 'challenge_not_aligned',
-    ...(job.status === 'created'
+    status: released ? 'challenge_aligned' : 'challenge_not_aligned',
+    ...(released
       ? {}
       : {
           failureCode: 'gate_did_not_release',
           reason: `re-evaluation aligned but the existing job gate did not create a job: ${job.reason}`,
         }),
   }
+}
+
+/**
+ * active run が、この Challenge が再評価する frozen spec と同じ review か。
+ *
+ * storage の再利用条件（`reuseActiveRun`）と同じ同一性で比べる: design hash・changedFiles（集合）・
+ * successor intent。Challenge は repair ではないので `repairSourceJobId` が無い run だけが同じ review である。
+ * intent を見ないと、同じ prompt の repair 目的 run があるときに Challenge を消費した直後に
+ * create() が contention になり、Challenge が評価されずに失われる（独立レビュー round 7）。
+ */
+function isSameReviewIdentity(run: DesignReviewRun, subject: RemediationSubject): boolean {
+  return run.repairSourceJobId === undefined
+    && run.designTextHash === subject.reviewedDesignTextHash
+    && JSON.stringify([...run.changedFiles].sort()) === JSON.stringify([...subject.reviewedChangedFiles].sort())
+}
+
+/**
+ * ensureJob が「初回 workflow Job は既に在る」で skip したとき、その Job が**この Challenge が
+ * レビューした prompt から作られた canonical な初回 Job**か。
+ *
+ * canonical key（`task:<taskId>:initial-implement`）と prompt の同一性の両方を要求する。
+ * 同じ prompt の repair / resume Job は初回 Job ではないので数えない。
+ */
+function hasCanonicalInitialJobForReviewedPrompt(storage: IStorage, subject: RemediationSubject): boolean {
+  const canonicalKey = initialWorkflowStepKey(subject.task.id)
+  return storage.jobs.findByTaskId(subject.task.id).some((job) =>
+    job.workflowStepKey === canonicalKey
+    && job.aiCliMode === 'implement'
+    && job.aiCliPrompt !== undefined
+    && computeDesignTextHash(job.aiCliPrompt) === subject.reviewedDesignTextHash)
 }
 
 /**
@@ -760,6 +844,9 @@ async function runPlRevision(
   }
   if (outcome.status === 'still_not_aligned') {
     return { ...base, status: 'revised_not_aligned', failureCode: outcome.failureCode, reason: outcome.reason }
+  }
+  if (outcome.status === 'review_pending') {
+    return { ...base, status: 'review_pending', taskId: outcome.taskId, reason: outcome.reason }
   }
   return { ...base, status: 'revision_rejected', failureCode: outcome.failureCode, reason: outcome.reason }
 }

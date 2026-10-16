@@ -957,3 +957,101 @@ describe('handoff の stepKey 競合は queued path でも同じ 2 分岐で収�
     ).toHaveLength(0)
   })
 })
+
+/**
+ * **判定が無い repair review は escalation しない**（2026-10-16 production・Task `b8d0fc5d`）。
+ *
+ * requeued は「durably queued」であり、design_review_idle → PL rekick_design_review が再開する。
+ */
+describe('executeQueuedRepair: requeued は escalation しない', () => {
+  it('runner が判定を返さず requeue されたら already_started を返し、Task は blocked にならない', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const preparation = prepareRepairFlow(storage, { failedJob: createFailedJob(storage, ids) })
+    if (preparation.action !== 'queue') throw new Error('fixture failed')
+    const run = storage.designReviewRuns.create(preparation.run)
+
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, {
+      ...deps(),
+      execute: async () => ({ ok: false, stdout: '', error: 'boom', timedOut: false }),
+    })
+
+    expect(outcome).toEqual({ status: 'already_started', stepKey: preparation.stepKey })
+    expect(storage.tasks.findById(ids.taskId)?.status).toBe('in_progress')
+    expect(storage.designReviewRuns.findById(run.id)?.status).toBe('queued')
+    expect(storage.jobs.findByTaskId(ids.taskId).some((job) => job.workflowStepKey === preparation.stepKey)).toBe(false)
+  })
+})
+
+/** ALIGNED の後、repair Job を作る直前に Task / Project 状態を確かめ直す。 */
+describe('completeRepairHandoff: Job 作成直前の Task / Project 再確認', () => {
+  async function runAlignedRepair(
+    mutate: (storage: IStorage, ids: { taskId: string; projectId: string }) => void,
+  ) {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const preparation = prepareRepairFlow(storage, { failedJob: createFailedJob(storage, ids) })
+    if (preparation.action !== 'queue') throw new Error('fixture failed')
+    const run = storage.designReviewRuns.create(preparation.run)
+    // review の実行中に状態が変わった、という順序を再現する。
+    mutate(storage, ids)
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+    const created = storage.jobs.findByTaskId(ids.taskId).some((job) => job.workflowStepKey === preparation.stepKey)
+    return { outcome, created }
+  }
+
+  it('Task が done なら repair Job を作らない', async () => {
+    const { outcome, created } = await runAlignedRepair((storage, ids) => {
+      storage.tasks.update(ids.taskId, { status: 'done' })
+    })
+
+    expect(outcome).toMatchObject({ status: 'skipped', reason: 'task is already done' })
+    expect(created).toBe(false)
+  })
+
+  it('Project が running でなければ repair Job を作らない', async () => {
+    const { outcome, created } = await runAlignedRepair((storage, ids) => {
+      storage.projects.update(ids.projectId, { status: 'paused' })
+    })
+
+    expect(outcome.status).toBe('skipped')
+    if (outcome.status === 'skipped') expect(outcome.reason).toContain('project is not running')
+    expect(created).toBe(false)
+  })
+
+  // run が succeeded（ALIGNED evidence 登録済み）になった後・handoff の前に Project が止まる順序。
+  // 再確認は storage の handoff transaction 内なので、この窓でも Job は作られない。
+  it('run 完了後・handoff 前に Project が paused になったら Job を作らず source の所有権も変えない', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids)
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    if (preparation.action !== 'queue') throw new Error('fixture failed')
+    const run = storage.designReviewRuns.create(preparation.run)
+    const sourceBefore = storage.jobs.findById(failed.id)!.status
+    const completeWithEvidence = storage.designReviewRuns.completeWithEvidence.bind(storage.designReviewRuns)
+    storage.designReviewRuns.completeWithEvidence = ((...args: Parameters<typeof completeWithEvidence>) => {
+      const evidence = completeWithEvidence(...args)
+      storage.projects.update(ids.projectId, { status: 'paused' })
+      return evidence
+    }) as typeof completeWithEvidence
+
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+
+    expect(storage.designReviewRuns.findById(run.id)?.status).toBe('succeeded')
+    expect(outcome.status).toBe('skipped')
+    if (outcome.status === 'skipped') expect(outcome.reason).toContain('project is not running')
+    expect(storage.jobs.findByTaskId(ids.taskId).some((job) => job.workflowStepKey === preparation.stepKey)).toBe(false)
+    expect(storage.jobs.findById(failed.id)?.status).toBe(sourceBefore)
+    expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
+  })
+
+  it('Task が blocked なだけでは断らない（Stored Review Recovery の正規 handoff）', async () => {
+    const { outcome, created } = await runAlignedRepair((storage, ids) => {
+      storage.tasks.update(ids.taskId, { status: 'blocked' })
+    })
+
+    expect(outcome.status).toBe('repair_job_created')
+    expect(created).toBe(true)
+  })
+})

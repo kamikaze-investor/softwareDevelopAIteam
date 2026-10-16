@@ -51,6 +51,7 @@ import {
 } from '../designReview/designReviewCoordinator'
 import { validateRoadmapTasks, validateRoadmapPhases } from '../storage/roadmapTaskValidation'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 
 /**
  * 採用した Task が属する Phase。
@@ -641,7 +642,10 @@ export async function adoptRoadmapItem(
       recoveryTask.status !== 'pending'
       || run?.reviewKind !== 'task'
       || run.status !== 'succeeded'
-      || evidence?.designTextHash === run.designTextHash
+      // 同じ設計の ALIGNED evidence があっても、それより新しいこの run の CONFLICT が正である
+      // （覆されていない evidence のときだけ「CONFLICT で止まっていない」とみなす）。
+      || (evidence?.designTextHash === run.designTextHash
+        && isUsableAlignedEvidence(evidence, storage.designReviewEvidence))
       || recoveryDecision !== 'CONFLICT'
     ) {
       return {

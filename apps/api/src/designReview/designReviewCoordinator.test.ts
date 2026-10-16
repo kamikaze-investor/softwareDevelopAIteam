@@ -1,9 +1,12 @@
-import { describe, expect, it, beforeEach, vi, afterAll } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi, afterAll } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
-import type { IStorage } from '../storage/interface'
+import { DesignReviewRunContentionError, type IStorage } from '../storage/interface'
+import { checkImplementJobDesignReviewEvidence, computeDesignTextHash as computeHashForTest } from '../designReviewEvidencePolicy'
+import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import { recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
   DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES,
@@ -19,6 +22,8 @@ import {
 } from './designReviewCoordinator'
 import type { CoordinatorDeps } from './designReviewCoordinator'
 import { recoverAndRekickAtStartup } from './queuedRunDispatch'
+import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
+import { selectFocuses, selectRoadmapReviewFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 
 /**
  * Design Review executor の検証。
@@ -580,6 +585,25 @@ describe('recomputeDecision with reviewKind=roadmap', () => {
     expect(outcome.rejectedReason).toBeUndefined()
   })
 
+  it('roadmap でも runner が REVIEW_UNAVAILABLE を申告したら全件 ALIGNED でも ALIGNED にしない', () => {
+    const raw = roadmapAlignedRaw()
+    raw.finalDecision = 'REVIEW_UNAVAILABLE'
+    raw.unavailableReason = 'Claude integration review unavailable'
+
+    const outcome = recomputeDecision(raw, 'roadmap', [])
+
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('Claude integration review unavailable')
+  })
+
+  it('roadmap の unavailable 申告でも CONFLICT は CONFLICT のまま', () => {
+    const raw = roadmapAlignedRaw()
+    raw.finalDecision = 'REVIEW_UNAVAILABLE'
+    raw.integrationReviewResult = { decision: 'CONFLICT', summary: 'phases conflict' }
+
+    expect(recomputeDecision(raw, 'roadmap', []).decision).toBe('CONFLICT')
+  })
+
   it('roadmap focus集合と不一致なら採用しない（changedFiles起因のfocus推論を混ぜない）', () => {
     const raw = roadmapAlignedRaw()
     raw.focusedReviewResults = (raw.focusedReviewResults as Array<{ focus: string; decision: string }>).slice(0, 2)
@@ -659,6 +683,22 @@ describe('createAndExecuteRoadmapReview', () => {
     expect(stored!.reviewKind).toBe('roadmap')
     expect(stored!.subjectId).toBe(projectId)
     expect(stored!.taskId).toBeUndefined()
+  })
+
+  it('runner が REVIEW_UNAVAILABLE を申告したら全件 ALIGNED でも evidence を登録せず、従来どおり非 ALIGNED で終端する', async () => {
+    const storage = createStorage()
+    const projectId = 'project-roadmap-unavailable'
+    const raw = { ...roadmapAlignedRaw(), finalDecision: 'REVIEW_UNAVAILABLE' }
+
+    const result = await createAndExecuteRoadmapReview(
+      storage,
+      { projectId, reviewMaterial: '# Roadmap Design Review Material' },
+      deps(async () => ({ ok: true, stdout: JSON.stringify(raw), timedOut: false })),
+    )
+
+    // retry（finalizeFailure）は task kind のみ。roadmap は非 ALIGNED として確定する。
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'REVIEW_UNAVAILABLE' })
+    expect(storage.designReviewEvidence.findLatestBySubjectId('roadmap', projectId)).toBeUndefined()
   })
 
   it('runnerへ渡すinputはreviewKind=roadmap・subjectId=projectId・changedFiles=[] であり、taskIdを合成しない', async () => {
@@ -923,3 +963,624 @@ function readFileIfExists(p: string): string | undefined {
     return undefined
   }
 }
+
+/**
+ * **「判定が無い」と否定的な判定を分ける**（2026-10-16 production・Task `b8d0fc5d` の run `c11357e8`）。
+ *
+ * critical load で independent review が取れない（Codex logout）と、focused の実質的な CONFLICT が
+ * REVIEW_UNAVAILABLE に置き換わり、しかも not_aligned として確定して retry されなかった。
+ */
+describe('critical load: independent 欠落と focused CONFLICT の分離', () => {
+  const CRITICAL_FILES = ['specs/00_constitution.md']
+
+  function criticalRaw(scopeDecision: string, independent?: Record<string, unknown>) {
+    return {
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'UNCERTAIN' },
+        { focus: 'scope_simplicity', decision: scopeDecision },
+      ],
+      ...(independent ? { independentReviewResult: independent } : {}),
+      finalDecision: 'REVIEW_UNAVAILABLE',
+    }
+  }
+
+  it('independent が欠落していても focused が CONFLICT なら CONFLICT を返す', () => {
+    const outcome = recomputeDecision(criticalRaw('CONFLICT'), 'task', CRITICAL_FILES)
+
+    expect(outcome.reviewLoad).toBe('critical')
+    expect(outcome.decision).toBe('CONFLICT')
+    expect(outcome.rejectedReason).toContain('critical review load requires an independent review result')
+  })
+
+  it('independent が unavailable でも focused が CONFLICT なら CONFLICT を返す', () => {
+    const outcome = recomputeDecision(
+      criticalRaw('CONFLICT', { verdict: 'blocking', summary: 'Independent review failed: logged out', unavailable: true }),
+      'task',
+      CRITICAL_FILES,
+    )
+
+    expect(outcome.decision).toBe('CONFLICT')
+    expect(outcome.rejectedReason).toContain('requires an independent review result, but it was unavailable')
+  })
+
+  it('independent が unavailable で focused に CONFLICT が無ければ REVIEW_UNAVAILABLE', () => {
+    const outcome = recomputeDecision(
+      criticalRaw('ALIGNED', { verdict: 'blocking', summary: 'failed', unavailable: true }),
+      'task',
+      CRITICAL_FILES,
+    )
+
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+  })
+
+  it('全 focus ALIGNED でも independent 欠落は REVIEW_UNAVAILABLE になり、run は完了せず requeue される', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const stdout = JSON.stringify({
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'ALIGNED' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      ],
+      finalDecision: 'ALIGNED',
+    })
+    expect(recomputeDecision(JSON.parse(stdout), 'task', CRITICAL_FILES).decision).toBe('REVIEW_UNAVAILABLE')
+
+    const runner = deps(async () => ({ ok: true, stdout, timedOut: false }))
+    const first = await createAndExecuteDesignReview(
+      storage, { ...baseInput(taskId), changedFiles: CRITICAL_FILES }, runner,
+    )
+
+    expect(first.status).toBe('requeued')
+    expect(first.decision).toBe('REVIEW_UNAVAILABLE')
+    const runId = storage.designReviewRuns.findLatestByTaskId(taskId)!.id
+    const afterFirst = storage.designReviewRuns.findById(runId)!
+    expect(afterFirst.status).toBe('queued')
+    expect(afterFirst.attemptCount).toBe(1)
+    expect(afterFirst.completedAt).toBeUndefined()
+    expect(afterFirst.error).toContain('independent review')
+
+    const second = await executeDesignReviewRun(storage, afterFirst, runner)
+    expect(second.status).toBe('requeued')
+    expect(storage.designReviewRuns.findById(runId)!.attemptCount).toBe(2)
+
+    // attempt 上限で failed 終端する（runner crash と同じ finalizeFailure 経路）。
+    for (let i = 0; i < DESIGN_REVIEW_MAX_ATTEMPTS + 2; i += 1) {
+      const active = storage.designReviewRuns.findById(runId)!
+      if (active.status !== 'queued') break
+      await executeDesignReviewRun(storage, active, runner)
+    }
+    const final = storage.designReviewRuns.findById(runId)!
+    expect(final.status).toBe('failed')
+    expect(final.attemptCount).toBe(DESIGN_REVIEW_MAX_ATTEMPTS)
+    expect(final.resultJson).toBeUndefined()
+  })
+
+  it('focused CONFLICT + independent 欠落は従来どおり判定として完了する（retry しない）', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = deps(async () => ({ ok: true, stdout: JSON.stringify(criticalRaw('CONFLICT')), timedOut: false }))
+
+    const result = await createAndExecuteDesignReview(
+      storage, { ...baseInput(taskId), changedFiles: CRITICAL_FILES }, runner,
+    )
+
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+    expect(run.status).toBe('succeeded')
+    expect(run.attemptCount).toBe(1)
+  })
+})
+
+/**
+ * runner の「実行できなかった」申告は判定を厳しくする向きにしか使わない（独立レビュー指摘・2026-10-16）。
+ * focused が全件 ALIGNED でも integration が欠けて REVIEW_UNAVAILABLE を申告した payload を、
+ * 組み直して ALIGNED にしてはならない。
+ */
+describe('runner が申告した REVIEW_UNAVAILABLE は ALIGNED へ格上げしない（task kind・全 load）', () => {
+  const HIGH_FILES = ['apps/api/src/auth/credentials.ts']
+  const unavailablePayload = {
+    focusedReviewResults: [
+      { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      { focus: 'strategic_alignment', decision: 'ALIGNED' },
+    ],
+    finalDecision: 'REVIEW_UNAVAILABLE',
+    unavailableReason: 'integration review unavailable',
+  }
+
+  it('high load で focused 全件 ALIGNED・integration 無し・finalDecision=REVIEW_UNAVAILABLE は REVIEW_UNAVAILABLE', () => {
+    const outcome = recomputeDecision(unavailablePayload, 'task', HIGH_FILES)
+
+    expect(outcome.reviewLoad).not.toBe('critical')
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('integration review unavailable')
+  })
+
+  it('同じ payload で evidence は登録されず run は requeue される', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = deps(async () => ({ ok: true, stdout: JSON.stringify(unavailablePayload), timedOut: false }))
+
+    const result = await createAndExecuteDesignReview(storage, { ...baseInput(taskId), changedFiles: HIGH_FILES }, runner)
+
+    expect(result.status).toBe('requeued')
+    expect(storage.designReviewEvidence.findByTaskId(taskId)).toEqual([])
+  })
+
+  it('unavailable でも focused の CONFLICT は CONFLICT のまま', () => {
+    const outcome = recomputeDecision({
+      ...unavailablePayload,
+      focusedReviewResults: [
+        { focus: 'scope_simplicity', decision: 'CONFLICT' },
+        { focus: 'strategic_alignment', decision: 'ALIGNED' },
+      ],
+    }, 'task', HIGH_FILES)
+
+    expect(outcome.decision).toBe('CONFLICT')
+  })
+})
+
+/**
+ * **判定 pipeline の不変条件を全組み合わせで固定する**（独立レビュー round 4・2026-10-16）。
+ *
+ * kind × load × 構造の妥当性 × unavailable の出どころ × CONFLICT の有無。分岐ごとの継ぎ足しでは
+ * 「ある組み合わせだけ CONFLICT が隠れる / unavailable が ALIGNED になる」が漏れ続けたため、
+ * 個別ケースではなく表で確かめる:
+ *   - 有効な CONFLICT があれば必ず CONFLICT
+ *   - unavailable で CONFLICT が無ければ必ず REVIEW_UNAVAILABLE
+ *   - unavailable / 構造不正のときは決して ALIGNED にならない
+ */
+describe('recomputeDecision の判定 pipeline（kind × load × 妥当性 × unavailable × CONFLICT）', () => {
+  const FILES_BY_LOAD = {
+    low: ['docs/readme.md'],
+    medium: ['apps/api/src/pl/executionLoop.ts'],
+    high: ['apps/api/src/auth/credentials.ts'],
+    critical: ['specs/00_constitution.md'],
+  } as const
+  const KINDS = ['task', 'roadmap'] as const
+  const VALIDITY = ['valid', 'invalid'] as const
+  const UNAVAILABLE = ['none', 'finalDecision', 'focus', 'integration', 'independent'] as const
+  const CONFLICT_PRESENCE = [true, false] as const
+
+  type Item = { focus?: string; decision: string; unavailable?: boolean; summary?: string }
+
+  function buildPayload(
+    kind: (typeof KINDS)[number],
+    files: readonly string[],
+    validity: (typeof VALIDITY)[number],
+    unavailable: (typeof UNAVAILABLE)[number],
+    hasConflict: boolean,
+  ): { raw: Record<string, unknown>; applicable: boolean } {
+    const load = classifyReviewLoad({ changedFiles: [...files] }).reviewLoad
+    const expected: string[] = kind === 'roadmap' ? selectRoadmapReviewFocuses() : selectFocuses(load, [...files])
+    const focused: Item[] = expected.map((focus) => ({ focus, decision: 'ALIGNED' }))
+    const integration: Item = { decision: 'ALIGNED', summary: 'ok' }
+    const raw: Record<string, unknown> = { finalDecision: 'ALIGNED' }
+    if (kind === 'task' && load === 'critical') {
+      raw.independentReviewResult = { verdict: 'approved', summary: 'ok', unavailable: false }
+    }
+
+    // CONFLICT は要求した focus があればそこへ、無ければ integration へ置く。
+    if (hasConflict) {
+      if (focused.length > 0) focused[0].decision = 'CONFLICT'
+      else integration.decision = 'CONFLICT'
+    }
+    if (validity === 'invalid') {
+      focused.push({ focus: 'not_a_real_focus', decision: 'UNCERTAIN' })
+    }
+
+    switch (unavailable) {
+      case 'finalDecision':
+        raw.finalDecision = 'REVIEW_UNAVAILABLE'
+        raw.unavailableReason = 'matrix: runner could not run the review'
+        break
+      case 'focus': {
+        const target = focused[focused.length - 1]
+        // 期待 focus が無い妥当な payload には印を付ける場所が無い（組み合わせとして成立しない）。
+        if (target === undefined) return { raw, applicable: false }
+        target.unavailable = true
+        if (target.decision !== 'CONFLICT') target.decision = 'UNCERTAIN'
+        break
+      }
+      case 'integration':
+        integration.unavailable = true
+        if (integration.decision !== 'CONFLICT') integration.decision = 'UNCERTAIN'
+        break
+      case 'independent':
+        raw.independentReviewResult = { verdict: 'blocking', summary: 'Independent review failed', unavailable: true }
+        break
+      case 'none':
+        break
+    }
+
+    raw.focusedReviewResults = focused
+    raw.integrationReviewResult = integration
+    return { raw, applicable: true }
+  }
+
+  const cases: Array<[string, string, string, string, boolean]> = []
+  for (const kind of KINDS) {
+    for (const load of Object.keys(FILES_BY_LOAD)) {
+      for (const validity of VALIDITY) {
+        for (const unavailable of UNAVAILABLE) {
+          for (const hasConflict of CONFLICT_PRESENCE) {
+            cases.push([kind, load, validity, unavailable, hasConflict])
+          }
+        }
+      }
+    }
+  }
+
+  it.each(cases)('%s / %s / %s / unavailable=%s / conflict=%s', (kind, load, validity, unavailable, hasConflict) => {
+    const files = FILES_BY_LOAD[load as keyof typeof FILES_BY_LOAD]
+    const { raw, applicable } = buildPayload(
+      kind as (typeof KINDS)[number],
+      files,
+      validity as (typeof VALIDITY)[number],
+      unavailable as (typeof UNAVAILABLE)[number],
+      hasConflict,
+    )
+    if (!applicable) return
+
+    const outcome = recomputeDecision(raw, kind as 'task' | 'roadmap', [...files])
+
+    if (hasConflict) {
+      expect(outcome.decision).toBe('CONFLICT')
+    } else if (unavailable !== 'none') {
+      expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    } else if (validity === 'invalid') {
+      expect(outcome.decision).toBe('UNCERTAIN')
+    } else {
+      expect(outcome.decision).toBe('ALIGNED')
+    }
+    if (unavailable !== 'none' || validity === 'invalid') {
+      expect(outcome.decision).not.toBe('ALIGNED')
+    }
+  })
+
+  it.each([['null'], ['[]'], ['"text"'], ['42']])('runner 出力 %s は finalizeFailure で終端し、run を running のまま残さない', async (stdout) => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = deps(async () => ({ ok: true, stdout, timedOut: false }))
+
+    const result = await createAndExecuteDesignReview(storage, baseInput(taskId), runner)
+
+    expect(result.status).toBe('requeued')
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+    expect(run.status).toBe('queued')
+    expect(run.error).toContain('no usable output')
+    expect(storage.designReviewEvidence.findByTaskId(taskId)).toEqual([])
+  })
+})
+/**
+ * **active run の再利用は、runner から見える同一性が一致するときだけ**（独立レビュー round 6・2026-10-16）。
+ *
+ * active run は subject ごとに1本。別の design text / changedFiles の run を返すと、その判定が
+ * レビューされていない設計に帰属する。一致しなければ contention（判定待ち）として返す。
+ */
+describe('active run の同一性による再利用と contention', () => {
+  const ALIGNED_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  })
+
+  function seedActiveRun(storage: IStorage, taskId: string) {
+    return storage.designReviewRuns.create({
+      ...baseInput(taskId),
+      designText: 'original design',
+      designTextHash: computeHashForTest('original design'),
+    })
+  }
+
+  it('別の design text の active run があれば、それを返さず contended（相手の run には触れない）', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const active = seedActiveRun(storage, taskId)
+    let executed = 0
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText: 'a different instruction', changedFiles: LOW_LOAD_FILES },
+      deps(async () => { executed += 1; return { ok: true, stdout: ALIGNED_LOW, timedOut: false } }),
+    )
+
+    expect(result.status).toBe('contended')
+    expect(executed).toBe(0)
+    expect(storage.designReviewRuns.findById(active.id)).toMatchObject({ status: 'queued', attemptCount: 0 })
+    expect(storage.designReviewRuns.findByTaskId(taskId)).toHaveLength(1)
+    expect(storage.designReviewEvidence.findByTaskId(taskId)).toEqual([])
+  })
+
+  it('同じ design text でも changedFiles が違えば contended', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    seedActiveRun(storage, taskId)
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText: 'original design', changedFiles: ['specs/00_constitution.md'] },
+      deps(async () => ({ ok: true, stdout: ALIGNED_LOW, timedOut: false })),
+    )
+
+    expect(result.status).toBe('contended')
+    expect(() => storage.designReviewRuns.create({
+      ...baseInput(taskId),
+      designText: 'original design',
+      designTextHash: computeHashForTest('original design'),
+      changedFiles: ['specs/00_constitution.md'],
+    })).toThrow(DesignReviewRunContentionError)
+  })
+
+  it('同一性が一致すれば同じ active run を再利用して実行する', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const active = seedActiveRun(storage, taskId)
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      // changedFiles の順序は同一性に効かない。
+      { taskId, taskTitle: 'design', designText: 'original design', changedFiles: [...LOW_LOAD_FILES].reverse() },
+      deps(async () => ({ ok: true, stdout: ALIGNED_LOW, timedOut: false })),
+    )
+
+    expect(result.status).toBe('evidence_registered')
+    expect(storage.designReviewRuns.findById(active.id)?.status).toBe('succeeded')
+    expect(storage.designReviewRuns.findByTaskId(taskId)).toHaveLength(1)
+  })
+})
+describe('別 executor が終端させた run の読み直し（独立レビュー round 7）', () => {
+  it('同じ design hash の古い ALIGNED evidence があっても、この run が CONFLICT なら not_aligned / CONFLICT', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const designText = 'design text'
+    const designTextHash = computeHashForTest(designText)
+    // 以前の review が同じ design を ALIGNED にした evidence。
+    storage.designReviewEvidence.create({
+      taskId, reviewKind: 'task', subjectId: taskId, designTextHash,
+      reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+    const conflictStdout = JSON.stringify({
+      focusedReviewResults: [],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'conflicts with the goal' },
+      finalDecision: 'CONFLICT',
+    })
+    // 別 executor が claim を取り、この run を CONFLICT で終端させた状態を再現する。
+    const claim = storage.designReviewRuns.claim
+    storage.designReviewRuns.claim = (id, max) => {
+      const won = claim.call(storage.designReviewRuns, id, max)
+      storage.designReviewRuns.complete(id, won.claimToken!, 'succeeded', conflictStdout)
+      return {}
+    }
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText, changedFiles: LOW_LOAD_FILES },
+      deps(async () => { throw new Error('must not run') }),
+    )
+
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
+    expect(result.evidence).toBeUndefined()
+  })
+})
+describe('読み直しの evidence も単一の失効規則を通す（独立レビュー round 9）', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  const ALIGNED_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  })
+  const CONFLICT_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'CONFLICT' },
+    finalDecision: 'CONFLICT',
+  })
+
+  /**
+   * 別 executor がこの run を ALIGNED で終端させ、その直後に同じ設計の新しい run が起票された、
+   * という読み直しの競合を作る。`after` が新しい run をどう終わらせるかを決める。
+   */
+  async function rereadWithNewerRun(after: (storage: IStorage, newerRunId: string) => void) {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const designText = 'design text'
+    const designTextHash = computeHashForTest(designText)
+    const claim = storage.designReviewRuns.claim
+    storage.designReviewRuns.claim = (id, max) => {
+      const won = claim.call(storage.designReviewRuns, id, max)
+      storage.designReviewRuns.completeWithEvidence(id, won.claimToken!, ALIGNED_LOW, {
+        reviewKind: 'task', subjectId: taskId, taskId, designTextHash,
+        reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+      })
+      vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+      storage.designReviewRuns.claim = claim
+      const newer = storage.designReviewRuns.create({ ...baseInput(taskId), designText, designTextHash })
+      after(storage, newer.id)
+      return {}
+    }
+
+    return createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText, changedFiles: LOW_LOAD_FILES },
+      deps(async () => { throw new Error('must not run') }),
+    )
+  }
+
+  it('新しい同じ設計の run が active なら evidence_registered にせず requeued', async () => {
+    const result = await rereadWithNewerRun(() => {})
+
+    expect(result.status).toBe('requeued')
+    expect(result.evidence).toBeUndefined()
+  })
+
+  it('新しい同じ設計の run が CONFLICT で終わっていれば not_aligned / CONFLICT', async () => {
+    const result = await rereadWithNewerRun((storage, newerRunId) => {
+      const claimed = storage.designReviewRuns.claim(newerRunId, 3)
+      storage.designReviewRuns.complete(newerRunId, claimed.claimToken!, 'succeeded', CONFLICT_LOW)
+    })
+
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
+    expect(result.evidence).toBeUndefined()
+  })
+})
+/**
+ * **evidence の失効順序は、それを生んだ run の挿入順で決める**（独立レビュー round 10・2026-10-16）。
+ *
+ * 時計を止めて全行を同じ timestamp にしても、run に結び付いた evidence は後から挿入された
+ * 同じ設計の run（active / CONFLICT）に覆される。生んだ run の無い legacy evidence だけは
+ * 従来の timestamp 規則のまま。
+ */
+describe('run に結び付いた evidence の失効（同じ timestamp）', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  // changedFiles [] の review は scope_simplicity を選ぶ（medium load）。
+  const ALIGNED_MEDIUM = JSON.stringify({
+    focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  })
+  const CONFLICT_MEDIUM = JSON.stringify({
+    focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }],
+    integrationReviewResult: { decision: 'CONFLICT' },
+    finalDecision: 'CONFLICT',
+  })
+
+  function freeze(): void {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+  }
+
+  /** 初回 workflow の対象 Task（running Project・pending・roadmapActive・developer_ai）。 */
+  function seedInitialTarget(storage: IStorage): { taskId: string; designText: string } {
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: 'd', status: 'pending', assignee: 'developer_ai',
+      dependencies: [], roadmapActive: true, phase: 1,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    return { taskId: task.id, designText: buildInitialImplementAiCliPrompt(task) }
+  }
+
+  async function alignThenAddSameDesignRun(
+    storage: IStorage,
+    taskId: string,
+    designText: string,
+    finish: 'active' | 'conflict',
+  ): Promise<void> {
+    const aligned = await createAndExecuteDesignReview(
+      storage, { taskId, taskTitle: 'T', designText, changedFiles: [] },
+      deps(async () => ({ ok: true, stdout: ALIGNED_MEDIUM, timedOut: false })),
+    )
+    expect(aligned.status).toBe('evidence_registered')
+    expect(aligned.evidence?.runId).toBeDefined()
+    const newer = storage.designReviewRuns.create({
+      taskId, taskTitle: 'T', designText, designTextHash: computeHashForTest(designText), changedFiles: [],
+    })
+    if (finish === 'conflict') {
+      const claimed = storage.designReviewRuns.claim(newer.id, 3)
+      storage.designReviewRuns.complete(newer.id, claimed.claimToken!, 'succeeded', CONFLICT_MEDIUM)
+    }
+    // 全行が同じ timestamp であること（timestamp では順序を決められない状態）を明示する。
+    expect(storage.designReviewRuns.findById(newer.id)?.createdAt).toBe(aligned.evidence?.createdAt)
+  }
+
+  for (const finish of ['active', 'conflict'] as const) {
+    it(`Job Gate: 同じ timestamp の新しい ${finish} run が evidence を覆す`, async () => {
+      freeze()
+      const storage = createStorage()
+      const { taskId, designText } = seedInitialTarget(storage)
+      await alignThenAddSameDesignRun(storage, taskId, designText, finish)
+
+      expect(checkImplementJobDesignReviewEvidence(
+        { taskId, aiCliMode: 'implement', aiCliPrompt: designText }, storage.designReviewEvidence,
+      )).toMatchObject({ ok: false, code: 'DESIGN_REVIEW_SUPERSEDED' })
+    })
+
+    it(`回収経路: 同じ timestamp の新しい ${finish} run があれば初回 Job を作らない`, async () => {
+      freeze()
+      const storage = createStorage()
+      const { taskId, designText } = seedInitialTarget(storage)
+      await alignThenAddSameDesignRun(storage, taskId, designText, finish)
+
+      const summary = await recoverReadyTasksWithoutJob(
+        storage, deps(async () => { throw new Error('the recovery sweep must not run a review') }),
+      )
+
+      expect(summary.recovered).toBe(0)
+      expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+    })
+  }
+
+  it('回収経路の対照: 新しい run が無ければ同じ evidence から初回 Job を1つ作る', async () => {
+    freeze()
+    const storage = createStorage()
+    const { taskId, designText } = seedInitialTarget(storage)
+    await createAndExecuteDesignReview(
+      storage, { taskId, taskTitle: 'T', designText, changedFiles: [] },
+      deps(async () => ({ ok: true, stdout: ALIGNED_MEDIUM, timedOut: false })),
+    )
+
+    expect((await recoverReadyTasksWithoutJob(storage, deps(async () => { throw new Error('no review') }))).recovered)
+      .toBe(1)
+  })
+
+  it('読み直し: 同じ timestamp の新しい active / CONFLICT run があれば evidence_registered にしない', async () => {
+    for (const finish of ['active', 'conflict'] as const) {
+      freeze()
+      const storage = createStorage()
+      const taskId = seedTask(storage)
+      const designText = 'design text'
+      const designTextHash = computeHashForTest(designText)
+      const claim = storage.designReviewRuns.claim
+      storage.designReviewRuns.claim = (id, max) => {
+        const won = claim.call(storage.designReviewRuns, id, max)
+        storage.designReviewRuns.completeWithEvidence(id, won.claimToken!, JSON.stringify({
+          focusedReviewResults: [], integrationReviewResult: { decision: 'ALIGNED' }, finalDecision: 'ALIGNED',
+        }), {
+          reviewKind: 'task', subjectId: taskId, taskId, designTextHash,
+          reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+        })
+        storage.designReviewRuns.claim = claim
+        const newer = storage.designReviewRuns.create({ ...baseInput(taskId), designText, designTextHash })
+        if (finish === 'conflict') {
+          const c = storage.designReviewRuns.claim(newer.id, 3)
+          storage.designReviewRuns.complete(newer.id, c.claimToken!, 'succeeded', JSON.stringify({
+            focusedReviewResults: [], integrationReviewResult: { decision: 'CONFLICT' }, finalDecision: 'CONFLICT',
+          }))
+        }
+        return {}
+      }
+
+      const result = await createAndExecuteDesignReview(
+        storage, { taskId, taskTitle: 'design', designText, changedFiles: LOW_LOAD_FILES },
+        deps(async () => { throw new Error('must not run') }),
+      )
+
+      expect(result.status, finish).not.toBe('evidence_registered')
+      expect(result.status, finish).toBe(finish === 'active' ? 'requeued' : 'not_aligned')
+      vi.useRealTimers()
+    }
+  })
+
+  it('legacy evidence（run_id 無し）は従来の timestamp 規則: 同じ ms の run は覆さず、後の run は覆す', () => {
+    freeze()
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const designTextHash = computeHashForTest('legacy design')
+    const evidence = storage.designReviewEvidence.create({
+      taskId, reviewKind: 'task', subjectId: taskId, designTextHash,
+      reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+    expect(evidence.runId).toBeUndefined()
+    const sameMs = storage.designReviewRuns.create({ ...baseInput(taskId), designText: 'legacy design', designTextHash })
+
+    expect(storage.designReviewEvidence.findSupersedingRun(evidence)).toBeUndefined()
+
+    const claimed = storage.designReviewRuns.claim(sameMs.id, 3)
+    storage.designReviewRuns.complete(sameMs.id, claimed.claimToken!, 'failed', undefined, 'boom')
+    vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+    const later = storage.designReviewRuns.create({ ...baseInput(taskId), designText: 'legacy design', designTextHash })
+    expect(storage.designReviewEvidence.findSupersedingRun(evidence)?.id).toBe(later.id)
+  })
+})

@@ -52,6 +52,7 @@
 import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
+  isUsableRunnerOutput,
   recomputeDecision,
   type RawStrategicResult,
 } from '../designReview/designReviewCoordinator'
@@ -68,6 +69,7 @@ import {
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
 import {
@@ -263,7 +265,7 @@ function isSecret(file: string): boolean {
 // Design Review の判定を実レコードから読む
 // ────────────────────────────────────────────────────────────
 
-/** 最新 Design Review run の機械的な要約。**判定は `resultJson` の実値から読む。** */
+/** 最新 Design Review run の機械的な要約。**判定は `resultJson` を API と同じ関数で再計算した値。** */
 export interface LatestDesignReviewVerdict {
   runId: string
   status: DesignReviewRun['status']
@@ -277,7 +279,10 @@ export interface LatestDesignReviewVerdict {
    * 同じ扱いにすると、**結果はあるのに『結果なし』の短い文面**を人へ出すことになる。
    */
   hasResult: boolean
-  /** `finalDecision`（ALIGNED / CONFLICT / UNCERTAIN / REVIEW_UNAVAILABLE）。読めなければ undefined。 */
+  /**
+   * API が再計算した判定（ALIGNED / CONFLICT / UNCERTAIN / REVIEW_UNAVAILABLE）。runner の
+   * `finalDecision` 自己申告ではない。結果が読めなければ undefined。
+   */
   decision?: string
   /** Integration Review の要約。**人向けの説明にだけ使う。** */
   summary?: string
@@ -307,12 +312,21 @@ export function readLatestDesignReview(
   if (run.resultJson === undefined) return base
 
   try {
-    const parsed = JSON.parse(run.resultJson) as Record<string, unknown>
-    const decision = parsed.finalDecision
-    const summary = (parsed.integrationReviewResult as Record<string, unknown> | undefined)?.summary
+    const parsed: unknown = JSON.parse(run.resultJson)
+    if (!isUsableRunnerOutput(parsed)) return base
+    // **判定は runner の自己申告（`finalDecision`）ではなく、API と同じ再計算で決める。**
+    // 生値を返すと、`finalDecision` を持たない #255 形の CONFLICT が判定なしになり、逆に
+    // focus は CONFLICT なのに `finalDecision: ALIGNED` と書いた出力が ALIGNED に見える。
+    // この値は Triage の分類・PL の通知本文・Operator 表示がそのまま使うので、ここで正す
+    // （独立レビュー指摘・2026-10-16。task_blocked_without_job 経路と同じ recompute）。
+    const decision = recomputeDecision(parsed, run.reviewKind, run.changedFiles).decision
+    const integration = parsed.integrationReviewResult
+    const summary = typeof integration === 'object' && integration !== null
+      ? (integration as { summary?: unknown }).summary
+      : undefined
     return {
       ...base,
-      ...(typeof decision === 'string' ? { decision } : {}),
+      decision,
       ...(typeof summary === 'string' ? { summary } : {}),
     }
   } catch {
@@ -432,7 +446,8 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
       ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
     ...(review !== undefined ? { review } : {}),
-    ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
+    // 新しい同じ設計の判定に覆された ALIGNED は根拠にしない（isUsableAlignedEvidence）。
+    ...(evidence?.reviewKind === 'task' && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)
       ? { alignedEvidenceId: evidence.id }
       : {}),
   }
@@ -629,7 +644,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     const stalled = facts.review
     // **判定は runner の自己申告ではなく API 側の再計算で決める。**
     //
-    // `readLatestDesignReview()` が返す `decision` は top-level `finalDecision` の生値である。
+    // （以前の `readLatestDesignReview()` は top-level `finalDecision` の生値を返していた。現在は同じ再計算値。）
     // #255 が書く CONFLICT は `{"focusedReviewResults":[...]}` だけで **`finalDecision` を持たない**
     // ので、生値で `=== 'CONFLICT'` と比べると**本番で最も多い形が丸ごと漏れる**
     // （独立レビュー round 3 指摘。round 2 で「ALIGNED 以外」を絞った際に入れた退行）。
