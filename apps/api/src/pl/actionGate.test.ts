@@ -408,20 +408,15 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
     expect(blocked.missingGates).toContain('independent_review')
   })
 
-  it('pending な CEO Approval は充足にならない', () => {
+  // 2026-10-17 監査 P2: legacy CEO Approval は actor・action・target・一回性を束縛できないので、
+  // 状態や type に関係なく ceo_approval の根拠にならない（人の承認は approval_gate で積む）。
+  it.each([
+    { label: 'pending', over: { status: 'pending' } },
+    { label: '用途の違う（billing）承認済み', over: { type: 'billing' } },
+    { label: '用途の合う（deployment）承認済み', over: { type: 'deployment' } },
+  ])('$label の legacy CEO Approval では restart_service は通らない', ({ over }) => {
     const { storage, projectId } = seed()
-    const approvalId = addCeoApproval(storage, projectId, { status: 'pending' })
-
-    expectBlocked(storage, {
-      proposal: { kind: 'restart_service' },
-      target: { kind: 'system' },
-      evidence: [{ gate: 'ceo_approval', approvalId }],
-    })
-  })
-
-  it('用途の違う CEO Approval は流用できない', () => {
-    const { storage, projectId } = seed()
-    const approvalId = addCeoApproval(storage, projectId, { type: 'billing' })
+    const approvalId = addCeoApproval(storage, projectId, over)
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'restart_service' },
@@ -429,20 +424,23 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
       evidence: [{ gate: 'ceo_approval', approvalId }],
     })
 
-    expect(blocked.rejectedEvidence.join(' ')).toContain("not 'deployment'")
+    expect(blocked.missingGates).toContain('ceo_approval')
+    expect(blocked.rejectedEvidence.join(' ')).toContain('LEGACY_CEO_APPROVAL_NOT_ACCEPTED')
   })
 
-  it('用途の合う承認済み CEO Approval なら restart_service は通る', () => {
-    const { storage, projectId } = seed()
+  it('同じ deployment 承認を別の操作（deploy_production / rollback_commit）へ流用できない', () => {
+    const { storage, projectId, taskId, jobId } = seed()
     const approvalId = addCeoApproval(storage, projectId, { type: 'deployment' })
 
-    const { decision } = authorizePlAction(storage, {
-      proposal: { kind: 'restart_service' },
-      target: { kind: 'system' },
-      evidence: [{ gate: 'ceo_approval', approvalId }],
-    })
-
-    expect(decision.kind).toBe('restart_service')
+    for (const request of [
+      { proposal: { kind: 'deploy_production' as const }, target: { kind: 'system' as const } },
+      { proposal: { kind: 'rollback_commit' as const }, target: { kind: 'job' as const, jobId, taskId } },
+    ]) {
+      const blocked = expectBlocked(storage, { ...request, evidence: [{ gate: 'ceo_approval', approvalId }] })
+      expect(blocked.missingGates).toContain('ceo_approval')
+    }
+    // 拒否は承認行を書き換えない（存在しない consume を装わない）。
+    expect(storage.approvals.findById(approvalId)?.status).toBe('approved')
   })
 })
 
