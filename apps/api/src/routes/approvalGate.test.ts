@@ -1,6 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import { createHash } from 'crypto'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Job, RiskReviewResult } from '@ai-team/shared'
 import { decideGateOutcome } from '@ai-team/shared'
 
@@ -1900,6 +1900,73 @@ describe('Phase A — git_commit Approvalと同一Jobの自動再開', () => {
       expect(storage.jobs.findById(expiredJob.id)?.status).toBe('running')
     })
   })
+
+  // F-1（2026-10-17）: 承認後、Worker が consume する前に TTL が過ぎた git_commit。以前は EXPIRED にした後
+  // createForJob を呼び、job.approvalId が残っているので JOB_ALREADY_LINKED の 409 → Worker の failTechnical
+  // → Job failed（resume も recover も拒否）。既存 STALE 応答（re_check）で返し、Worker に blocked を報告させる。
+  it('承認済みのまま期限切れになった linked approval は 409 にせず re_check（新しい依頼を同じ Job に作らない）', async () => {
+    await withApp(async (app) => {
+      const { approvalRequest, job } = await startGitCommitApproval(app, 'phase-a-approved-expired')
+      await patchJob(app, job.id, { status: 'blocked' })
+      expect((await patchStatus(app, approvalRequest.id, 'APPROVED')).status).toBe('APPROVED')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      await patchJob(app, job.id, { status: 'running' })
+
+      vi.useFakeTimers({ toFake: ['Date'] })
+      try {
+        vi.setSystemTime(new Date(Date.now() + 25 * 60 * 60 * 1000))
+        const { statusCode, body } = await gateCheck(app, {
+          ...BASE_GATE_PAYLOAD,
+          taskId: 'phase-a-approved-expired',
+          jobId: job.id,
+          requestedAction: 'git_commit',
+          changedFiles: ['docs/README.md'],
+        })
+
+        expect(statusCode).toBe(200)
+        expect(body.outcome.decision).toBe('STALE')
+        // 既存 STALE と同じ継続方針（Worker はどちらでも blocked を報告する）
+        expect(['block_until_approved', 're_check']).toContain(body.continuationPolicy)
+        expect(body.nextAction.action).toBe('re_check')
+        expect(body.approvalRequest).toMatchObject({ id: approvalRequest.id, status: 'EXPIRED' })
+        expect(body.sideEffects.map((effect) => effect.type)).not.toContain('CREATED_APPROVAL_REQUEST')
+        // 期限切れ承認は consume されず、同じ Job に 2 つ目の依頼は付かない
+        expect(storage.approvalRequests.findById(approvalRequest.id)?.status).toBe('EXPIRED')
+        expect(storage.approvalRequests.findByTaskId(approvalRequest.taskId)).toHaveLength(1)
+        expect(storage.jobs.findById(job.id)?.approvalId).toBe(approvalRequest.id)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+  })
+
+  it.each(['STALE', 'SUPERSEDED', 'CONSUMED'] as const)(
+    'linked approval が終端（%s）のまま人間承認が要る判定になっても 409 にせず re_check',
+    async (terminal) => {
+      await withApp(async (app) => {
+        const { approvalRequest, job } = await startGitCommitApproval(app, `phase-a-linked-${terminal}`)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.approvalRequests.updateStatus(approvalRequest.id, terminal, undefined, true)
+
+        const { statusCode, body } = await gateCheck(app, {
+          ...BASE_GATE_PAYLOAD,
+          taskId: `phase-a-linked-${terminal}`,
+          jobId: job.id,
+          requestedAction: 'git_commit',
+          changedFiles: ['docs/README.md'],
+        })
+
+        expect(statusCode).toBe(200)
+        expect(body.outcome.decision).toBe('STALE')
+        expect(body.nextAction.action).toBe('re_check')
+        expect(storage.approvalRequests.findById(approvalRequest.id)?.status).toBe(terminal)
+        expect(storage.approvalRequests.findByTaskId(approvalRequest.taskId)).toHaveLength(1)
+      })
+    },
+  )
 })
 
 // ────────────────────────────────────────────────────────────

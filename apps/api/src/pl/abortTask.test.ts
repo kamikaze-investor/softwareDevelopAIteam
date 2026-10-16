@@ -436,6 +436,65 @@ describe('abortTask — 段階1: 前提条件と承認', () => {
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
     expect(fx.storage.tasks.findById(fx.taskId)?.status).toBe('pending')
   })
+
+  // 2026-10-17 F-1: cleanup の当てが無いのに最新 Job が dirty な終了 fingerprint を残していれば、
+  // 所有者の居ない差分の上で黙って park しない（次の採用が quarantine される）。ファイルには触れない。
+  const DIRTY_END: JobWorkspaceBaseline = {
+    mode: 'dirty',
+    startCommitHash: '0805249b',
+    entries: [{ path: 'docs/a.md', kind: 'modified' }],
+  } as JobWorkspaceBaseline
+
+  it('解放すべき Job が無くても、最新 Job の終了 workspace が dirty なら park せず UNATTRIBUTED_DIRTY_WORKSPACE', () => {
+    const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+
+    const result = abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })
+
+    expect(result).toMatchObject({ ok: false, code: 'UNATTRIBUTED_DIRTY_WORKSPACE' })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+  })
+
+  it('終了 workspace が clean / fingerprint 無し（legacy）なら従来どおり park する', () => {
+    for (const fingerprint of [BASELINE, undefined]) {
+      const fx = seed()
+      fx.storage.jobs.update(fx.jobId, {
+        status: 'failed',
+        ...(fingerprint === undefined ? {} : { failureMetadata: { workspaceEndFingerprint: fingerprint } }),
+      })
+      expect(abortTask(fx.storage, {
+        taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+      })).toMatchObject({ ok: true, status: 'parked' })
+    }
+  })
+
+  it('dirty な終了の後に同じ workingDir で別 Task の Job が走っていれば、その差分はこの Task のものではない', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+    const other = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'later', description: 'd', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    // created_at は ISO 文字列。同一ミリ秒にならないよう、後の Job は時計を進めてから作る。
+    const own = fx.storage.jobs.findById(fx.jobId)!
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date(Date.parse(own.createdAt) + 1000))
+      fx.storage.jobs.create({
+        taskId: other.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'parked' })
+  })
 })
 
 describe('abortTask — 段階2: 観測の再検証と所有権解放', () => {

@@ -98,6 +98,7 @@ export type AbortTaskResult =
       | 'FOREIGN_BLOCKED_JOB'
       | 'JOB_QUARANTINED'
       | 'OWNERSHIP_UNPROVEN'
+      | 'UNATTRIBUTED_DIRTY_WORKSPACE'
       | 'TECHNICAL_EVIDENCE_INELIGIBLE'
       | 'NOT_AUTHORIZED'
       | 'PARK_FAILED'
@@ -115,6 +116,21 @@ export type AbortTaskResult =
  */
 function holdsWorkspaceOwnership(task: { status: string; parked?: boolean }, job: Job): boolean {
   return holdsWorkspaceWhenBlocked(task, job)
+}
+
+/**
+ * Task の最新 Job が dirty な終了 fingerprint を残し、その後に同じ workingDir で別 Job が走っていなければ
+ * その Job を返す（＝その差分を所有・後始末する Job が無い）。
+ * `taskJobs` は `findByTaskId()` の順（created_at DESC）で、先頭が最新。
+ */
+function findUnattributedDirtyEnd(taskJobs: readonly Job[], otherJobs: readonly Job[]): Job | undefined {
+  const latest = taskJobs[0]
+  if (latest === undefined) return undefined
+  if (latest.failureMetadata?.workspaceEndFingerprint?.mode !== 'dirty') return undefined
+  const workingDir = latest.safeCommand?.workingDir
+  const supersededByLaterJob = otherJobs.some((job) =>
+    job.createdAt > latest.createdAt && job.safeCommand?.workingDir === workingDir)
+  return supersededByLaterJob ? undefined : latest
 }
 
 function recordAbortAuthorizationConflict(
@@ -330,6 +346,25 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
           `task ${staleCandidates[0].taskId} has a blocked job (${staleCandidates[0].id}) left over `
           + 'from a finished task, and this task has no job whose cleanup would prove the workspace '
           + 'is clean; refusing to park without that proof',
+      }
+    }
+
+    // **所有者の居ない dirty workspace の上で黙って park しない**（2026-10-17 F-1）。
+    // cleanup の当てが無い（blocked な所有 Job が無い）のに、この Task の最新 Job が終了時に dirty な
+    // workspace を報告していて、その後に同じ workingDir で走った Job も無いなら、その差分は誰の
+    // 所有でもないまま残る。park すると次の採用がその差分の上で始まり quarantine される。
+    // 判定材料は Worker が報告した既存の `workspaceEndFingerprint` だけで、ファイルには触れない
+    // （何も破棄しない）。fingerprint の無い legacy 行は従来どおり（証明材料が無いので判定しない）。
+    const dirtyLeftover = findUnattributedDirtyEnd(taskJobs, otherTasks.flatMap((candidate) =>
+      storage.jobs.findByTaskId(candidate.id)))
+    if (dirtyLeftover !== undefined) {
+      return {
+        ok: false,
+        code: 'UNATTRIBUTED_DIRTY_WORKSPACE',
+        reason:
+          `job ${dirtyLeftover.id} ended with a dirty workspace in ${dirtyLeftover.safeCommand?.workingDir} `
+          + 'and no job holds it for cleanup; parking would leave those changes unowned for the next '
+          + 'adoption. Resolve the workspace through the existing resume / cleanup path first',
       }
     }
 

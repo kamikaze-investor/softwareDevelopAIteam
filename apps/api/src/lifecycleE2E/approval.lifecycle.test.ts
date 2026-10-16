@@ -1,5 +1,5 @@
 /**
- * Lifecycle E2E — Approval paths（A1 REJECT / A2 expiry / A3 HIGH safe-work）。
+ * Lifecycle E2E — Approval paths（A1 REJECT / A2 expiry / A3 HIGH safe-work / A4 APPROVED expiry）。
  *
  * git_commit を人間承認へ送るために、LOW の docs 変更でも review に high finding を付ける
  * （Safety Evidence の `review_has_high_or_critical_finding`）。HIGH diff を使わないのは、
@@ -174,6 +174,58 @@ describe('A2: approval expiry → PL auto resume → new approval → approve �
     expect(waitingRows(task.id)).toEqual([])
     state = await env.systemState()
     expect(state.attention).toEqual([])
+  })
+})
+
+describe('A4: approved git_commit whose approval expires before the Worker consumes it → blocked → resume → completes', () => {
+  // F-1（2026-10-17）: 以前は gate/check が期限切れ APPROVED を EXPIRED にした後 createForJob を呼び、
+  // job.approvalId が残っているため JOB_ALREADY_LINKED の 409 → Worker が failTechnical → Job failed。
+  // resume（LATEST_JOB_NOT_BLOCKED）も recover（TASK_NOT_BLOCKED）も拒否され、abort しか残らなかった。
+  it.each([
+    { id: 'a4-a', path: 'docs/a4a', expiredBy: 24 * 60 + 1 },
+    { id: 'a4-b', path: 'docs/a4b', expiredBy: 3 * 24 * 60 },
+  ])('$id (expired by $expiredBy min)', async ({ id, path, expiredBy }) => {
+    // Start: git_commit blocked on a WAITING Job-linked approval.
+    const { task, commitJob, approval } = await blockedOnHumanGate(id, path, [HIGH_FINDING])
+
+    // Operation 1: ADMIN approves → the Job is requeued, but the Worker does not pick it up before the TTL.
+    expect((await env.ceo.approve(approval.id)).statusCode).toBe(200)
+    expect(env.storage.jobs.findById(commitJob.id)?.status).toBe('queued')
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(Date.now() + expiredBy * 60 * 1000))
+
+    // Operation 2: the Worker runs the requeued git_commit. Expected: the expired approval is not consumed,
+    // no second request is linked to the same Job, and the Job reports blocked (not a technical failure).
+    const first = await env.worker.runUntilIdle()
+    expect(first.map((step) => [step.kind, step.reported])).toEqual([['git_commit', 'blocked']])
+    expect(env.storage.jobs.findById(commitJob.id)).toMatchObject({ status: 'blocked', approvalId: approval.id })
+    expect(env.storage.approvalRequests.findById(approval.id)?.status).toBe('EXPIRED')
+    expect(waitingRows(task.id)).toEqual([])
+    expect((await env.mobileAdmission(task.id)).resume).toEqual({ ok: true })
+
+    // Operation 3: PL tick with a resume diagnosis → a NEW git_commit Job in the canonical resume lineage.
+    const tick = await env.plTick({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'approval expired', riskLevel: 'LOW' }),
+    })
+    expect(tick, JSON.stringify(tick)).toMatchObject({ status: 'acted', proposedKind: 'resume_task' })
+    const resumed = env.jobsOf(task.id).find((job) => job.workflowStepKey?.startsWith(`resume:${commitJob.id}:`))!
+    expect(resumed.safeCommand.kind).toBe('git_commit')
+    expect(resumed.status).toBe('queued')
+
+    // Operation 4: the resumed git_commit gets a fresh Job-linked approval; ADMIN approves; commit completes.
+    const blocked = await env.worker.runUntilIdle()
+    expect(blocked.map((step) => [step.kind, step.reported])).toEqual([['git_commit', 'blocked']])
+    const waiting = waitingRows(task.id)
+    expect(waiting).toHaveLength(1)
+    expect(waiting[0]!.id).not.toBe(approval.id)
+    expect(env.storage.jobs.findById(resumed.id)?.approvalId).toBe(waiting[0]!.id)
+    expect((await env.ceo.approve(waiting[0]!.id)).statusCode).toBe(200)
+    const done = await env.worker.runUntilIdle()
+    expect(done.map((step) => [step.kind, step.reported, step.consumeStatus])).toEqual([['git_commit', 'success', 200]])
+    expect(env.task(task.id).status).toBe('done')
+    expect(env.storage.approvalRequests.findById(approval.id)?.status).toBe('EXPIRED')
+    expect(waitingRows(task.id)).toEqual([])
+    expect((await env.systemState()).attention).toEqual([])
   })
 })
 
