@@ -31,7 +31,7 @@ import { readResumeActorClasses } from '../designReview/resumeActor'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from '../designReview/repairFlow'
 import type { JobRefusalMetadata } from '@ai-team/shared'
-import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
+import { advanceWallClock, passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 /**
  * ここで固定しているのは「PL が自分の権限で動かない」ことと「操作したら必ず確かめる」ことである。
@@ -2783,6 +2783,74 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     // 新しい run を引き直さず、同じ queued run が判定まで進んだ。
     expect(storage.designReviewRuns.findById(queuedRun!.id)?.status).toBe('succeeded')
     expect(storage.jobs.findByTaskId(taskId).filter((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toHaveLength(1)
+  })
+
+  // C3-c independent review: the cooldown wait applies only to a Job whose recovery is proven to depend
+  // on the cooling run. Other stops on the same Task must stay actionable during the cooldown.
+  async function coolingPlResumeReview(storage: IStorage, taskId: string): Promise<string> {
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+    const pending = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: noJudgment,
+    }))
+    expect(pending.reason).toContain('resume pending')
+    const run = storage.designReviewRuns.findActiveByTaskId(taskId)!
+    expect(run).toMatchObject({ status: 'queued', attemptCount: 1 })
+    return run.id
+  }
+
+  function diagnoseCounter(): { count: () => number; diagnose: () => Promise<string> } {
+    let calls = 0
+    return {
+      count: () => calls,
+      diagnose: async () => {
+        calls += 1
+        return JSON.stringify({ actionKind: 'observe_state', rationale: 'look at it', riskLevel: 'LOW' })
+      },
+    }
+  }
+
+  it('cooldown wait does not hide an unrelated failed Job created on the same Task after the review', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedAiCliJob(storage, taskId, projectId)
+    const runId = await coolingPlResumeReview(storage, taskId)
+    // A manual, non-implement Job (POST /api/jobs) that failed after the resume review was requested.
+    advanceWallClock(1_000)
+    const manual = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'queued', attemptCount: 1 })
+    expect(counter.count()).toBe(1)
+    expect(tick.target).toBeDefined()
+    // Neither the manual Job nor the (no longer latest) source Job is proven to wait on this run.
+    expect([`job_failed:${manual.id}`, `job_blocked:${storage.jobs.findByTaskId(taskId).at(-1)!.id}`]).toContain(tick.target?.key)
+  })
+
+  it('cooldown wait does not hide an older blocked Job that the resume would not target', async () => {
+    const { storage, taskId, projectId } = seed()
+    const older = blockedAiCliJob(storage, taskId, projectId)
+    advanceWallClock(1_000)
+    const newer = blockedAiCliJob(storage, taskId, projectId)
+    await coolingPlResumeReview(storage, taskId)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    // The newer (latest) blocked Job is what the resume targets, so it waits; the older one does not.
+    expect(counter.count()).toBe(1)
+    expect(tick.target?.key).toBe(`job_blocked:${older}`)
+    expect(tick.target?.key).not.toBe(`job_blocked:${newer}`)
   })
 
   it('a CONFLICT re-review creates no resume Job and leaves the source blocked', async () => {
