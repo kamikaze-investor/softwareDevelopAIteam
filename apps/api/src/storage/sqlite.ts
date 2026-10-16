@@ -616,7 +616,7 @@ function buildTaskSummary(
     displayStatus: computeTaskDisplayStatus({
       taskStatus: task.status,
       latestJobStatus: latestJob?.status,
-      linkedApprovalStatus: linkedApproval?.status,
+      linkedApproval,
     }),
     updatedAt: newestIso([
       task.updatedAt,

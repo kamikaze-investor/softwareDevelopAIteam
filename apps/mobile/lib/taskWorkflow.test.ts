@@ -104,7 +104,7 @@ describe('manualWorkflowIsLocked', () => {
     const approvalRequests: ApprovalRequest[] = [
       {
         changedFiles: [],
-        expiresAt: '2026-08-01T01:00:00.000Z',
+        expiresAt: '2999-01-01T00:00:00.000Z',
         id: 'approval-1',
         requestedAction: 'git_commit',
         riskLevel: 'HIGH',
@@ -116,6 +116,14 @@ describe('manualWorkflowIsLocked', () => {
       },
     ]
     expect(manualWorkflowIsLocked(jobs, approvalRequests)).toBe(true)
+  })
+
+  it('does not lock on an expired linked WAITING approval (nobody waits on it; A-02)', () => {
+    const jobs = [makeJob({ id: 'job-1', approvalId: 'approval-1', status: 'blocked' })]
+    const approvalRequests = [
+      { id: 'approval-1', status: 'WAITING_FOR_USER', expiresAt: '2000-01-01T00:00:00.000Z' },
+    ] as ApprovalRequest[]
+    expect(manualWorkflowIsLocked(jobs, approvalRequests)).toBe(false)
   })
 })
 
@@ -368,8 +376,18 @@ describe('MOB-001: 実行状態の見分け', () => {
 
   it('承認待ちの blocked は approval_waiting として出る', () => {
     const job = baseJob({ status: 'blocked', approvalId: 'apr-1' } as Partial<Job>)
-    const approvals = [{ id: 'apr-1', status: 'WAITING_FOR_USER' }] as ApprovalRequest[]
+    const approvals = [
+      { id: 'apr-1', status: 'WAITING_FOR_USER', expiresAt: '2999-01-01T00:00:00.000Z' },
+    ] as ApprovalRequest[]
     expect(deriveJobDisplayState(job, approvals, [])).toBe('approval_waiting')
+  })
+
+  it('期限切れの WAITING に紐づく blocked は承認待ちではなく blocked（監査 A-02）', () => {
+    const job = baseJob({ status: 'blocked', approvalId: 'apr-1' } as Partial<Job>)
+    const approvals = [
+      { id: 'apr-1', status: 'WAITING_FOR_USER', expiresAt: '2000-01-01T00:00:00.000Z' },
+    ] as ApprovalRequest[]
+    expect(deriveJobDisplayState(job, approvals, [])).toBe('blocked')
   })
 
   it('quarantine された Job には resume UI を出さない', () => {
@@ -458,7 +476,7 @@ describe('MOB-001 Project実行健全性', () => {
     const health = deriveProjectExecutionHealth(
       [task('t1')],
       { t1: [job({ approvalId: 'a1', id: 'j1', status: 'blocked' })] },
-      [{ id: 'a1', status: 'WAITING_FOR_USER' } as ApprovalRequest],
+      [{ id: 'a1', status: 'WAITING_FOR_USER', expiresAt: '2999-01-01T00:00:00.000Z' } as ApprovalRequest],
     )
     expect(health).toBe('approval_waiting')
     expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).toBe('承認待ち')

@@ -20,3 +20,20 @@ export function isLiveWaitingApproval<T extends Pick<ApprovalRequest, 'status' |
   if (approval?.status !== 'WAITING_FOR_USER') return false
   return new Date(approval.expiresAt).getTime() > nowMs
 }
+
+/**
+ * **その ApprovalRequest が「使える人の判断（APPROVED）」として生きているか。**
+ *
+ * `APPROVED` も期限は参照時の遅延判定で、期限切れを `EXPIRED` へ進める actor は居ない。
+ * consume 側（`verifyAndConsumeForTaskAction` / `consumeForJob`）は期限切れ・読めない期限を
+ * 使わせないので、そのような行はもう誰の authority にもならない。それを「生きた人の判断」と
+ * 数えると、Technical Abort のように APPROVED の存在で拒否する経路が恒久的に塞がる（2026-10-16 監査 B-2）。
+ * 期限の読み方は `isLiveWaitingApproval` と同じ（読めない期限は live にしない）。
+ */
+export function isLiveApprovedApproval<T extends Pick<ApprovalRequest, 'status' | 'expiresAt'>>(
+  approval: T | undefined,
+  nowMs: number = Date.now(),
+): approval is T {
+  if (approval?.status !== 'APPROVED') return false
+  return new Date(approval.expiresAt).getTime() > nowMs
+}
