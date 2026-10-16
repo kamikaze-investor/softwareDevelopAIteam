@@ -63,19 +63,35 @@ function isWaitingOnLiveApproval(storage: IStorage, job: Job, nowMs: number): bo
 export const DEFAULT_STALL_HINT_MS = 5 * 60 * 1000
 
 /** `workspace_held_by_stalled_owner` の原因。detail 先頭に `cause=<値>` として載る。 */
-export type StalledOwnerCause = 'inactive_project' | 'done_task_blocked_row' | 'parked_task_blocked_row'
+export type StalledOwnerCause =
+  | 'inactive_project'
+  | 'done_task_blocked_row'
+  | 'parked_task_blocked_row'
+  | 'multiple_live_owners'
 
-/** CEO / PL が出口を読み取れるよう、原因ごとに観測事実と既存の解消経路だけを書く。 */
+/**
+ * CEO / PL へ渡す原因ごとの要約。**実際に使える出口だけを書く。**
+ *
+ * done / park された Task の blocked 行には自動の出口が無い（`abort_task` は done Task を拒否し、
+ * park された Task は resume も abort もできない）。そう書かずに既存操作を案内すると、
+ * 案内どおりにしても何も解けない（W5 独立レビュー指摘）。
+ */
 const STALLED_OWNER_SUMMARY: Record<StalledOwnerCause, (job: Job, project: Project) => string> = {
   inactive_project: (job, project) =>
-    `a ${job.status} job in the ${project.status} project holds the shared workspace; `
-    + 'the exit is resuming or archiving that project (archive refuses while it still owns work).',
+    `a ${job.status} job in the ${project.status} project holds the shared workspace. `
+    + 'Exit: set that project back to running (pause / resume is never refused) so its owner can finish; '
+    + 'archiving it or returning it to draft is refused while it still owns work.',
   done_task_blocked_row: () =>
-    'a blocked job left on a done task holds the shared workspace; the exit is the existing abort_task '
-    + 'stale-row release, which frees it once the Worker observes a clean worktree.',
+    'a blocked job left on a done task holds the shared workspace (its completion had no clean-worktree '
+    + 'evidence, or the row predates that rule). No automated exit exists: a manual workspace check and '
+    + 'an operator terminalization of that job are required.',
   parked_task_blocked_row: () =>
-    'a blocked job left on a parked task holds the shared workspace; the exit is the existing abort_task '
-    + 'cleanup (Worker observation) or resuming the task.',
+    'a blocked job left on a parked task holds the shared workspace (legacy row; parking now requires '
+    + 'terminal jobs). No automated exit exists: a manual workspace check and an operator terminalization '
+    + 'of that job are required.',
+  multiple_live_owners: () =>
+    'more than one task owns the shared workspace at once, so the Worker and the claim guard refuse every '
+    + 'claim. Exit: decide which owner continues and terminalize or cancel the other owner jobs.',
 }
 
 export type AttentionKind =
@@ -106,12 +122,13 @@ export type AttentionKind =
    *
    *   - `inactive_project` … paused / draft Project の Job が所有者
    *   - `done_task_blocked_row` … done な Task に残った blocked 行（どの Project でも）
-   *   - `parked_task_blocked_row` … park された Task に残った blocked 行（どの Project でも）
+   *   - `parked_task_blocked_row` … park された Task に残った blocked 行（どの Project でも。legacy）
+   *   - `multiple_live_owners` … 所有者が2つ以上あり、互いに claim を拒否し合っている
    *
    * queued は「動かせる」扱い、done / park の blocked 行は他の attention から除外されているため、
    * これが無いと claim が止まったまま PL は idle になり誰にも知らせない（lifecycle repair W5）。
-   * 解消は CEO の判断（Project の再開・放棄、または既存 abort_task の観測による stale 行の解放）なので
-   * notify-only。referenceId は所有者 Job の id で、所有者ごとに1回だけ escalate される。
+   * 解消は CEO / operator の判断（Project の再開、または手動の workspace 確認と Job の終端化）なので
+   * notify-only。referenceId は所有者 Job の id（multiple_live_owners は所有者集合のキー）で、1回だけ escalate される。
    */
   | 'workspace_held_by_stalled_owner'
 
@@ -344,6 +361,8 @@ export function buildSystemState(
 
   // 共有 workspace を自力では進まない所有者が握っているか（`workspace_held_by_stalled_owner`）。
   const stalledOwners: Array<{ project: Project; task: Task; job: Job; cause: StalledOwnerCause }> = []
+  // claim guard が所有者と数える全 Task（1 Task につき代表 Job 1件）。
+  const allOwners: Array<{ project: Project; task: Task; job: Job }> = []
   const runningQueuedTaskIds = new Set<string>()
 
   for (const project of observed) {
@@ -468,8 +487,9 @@ export function buildSystemState(
         // されていない blocked 行。done な Task の行も含める（解放の証明は Worker の観測だけ）。
         const ownershipSuperseded = task.status === 'done' ? readJobsSupersededByHumanResume(storage, jobs) : superseded
         const blockedOwner = jobs.find((job) => job.status === 'blocked' && !ownershipSuperseded.has(job.id))
+        const owner = jobs.find((job) => isLiveWorkspaceOwnerJob(task.id, job)) ?? blockedOwner
+        if (owner !== undefined) allOwners.push({ project, task, job: owner })
         if (project.status !== 'running') {
-          const owner = jobs.find((job) => isLiveWorkspaceOwnerJob(task.id, job)) ?? blockedOwner
           if (owner !== undefined) stalledOwners.push({ project, task, job: owner, cause: 'inactive_project' })
         } else if (blockedOwner !== undefined && task.status === 'done') {
           stalledOwners.push({ project, task, job: blockedOwner, cause: 'done_task_blocked_row' })
@@ -674,8 +694,22 @@ export function buildSystemState(
 
   // **claim guard が実際に拒否する queued の仕事（running Project の、所有者とは別 Task）があるときだけ**
   // 出す。pause は CEO の停止スイッチであり、誰も待っていないのに鳴らすと pause のたびに誤報になる。
+  // **同じ Job に既に CEO 向けの attention（quarantine / 承認待ち）があれば重ねて鳴らさない。**
+  // それぞれが notify-only で1回ずつ escalate されるため、出すと同じ所有者で2回 page する。
+  const quarantinedJobIds = new Set(attention
+    .filter((item) => item.kind === 'workspace_quarantined' && item.jobId !== undefined)
+    .map((item) => item.jobId!))
+  const waitingApprovalIds = new Set(attention
+    .filter((item) => item.kind === 'approval_waiting' && item.referenceId !== undefined)
+    .map((item) => item.referenceId!))
+  const alreadyNotified = (job: Job): boolean => quarantinedJobIds.has(job.id)
+    || (job.approvalId !== undefined && waitingApprovalIds.has(job.approvalId))
+
+  let stalledOwnerEmitted = false
   for (const { project, task, job, cause } of stalledOwners) {
     if (![...runningQueuedTaskIds].some((taskId) => taskId !== task.id)) continue
+    if (alreadyNotified(job)) continue
+    stalledOwnerEmitted = true
     attention.push({
       kind: 'workspace_held_by_stalled_owner',
       projectId: project.id,
@@ -686,6 +720,34 @@ export function buildSystemState(
       detail: `cause=${cause}: ${STALLED_OWNER_SUMMARY[cause](job, project)} `
         + 'Queued work in the running project cannot be claimed until this owner is resolved.',
       stuckForMs: elapsedMs(job.completedAt ?? job.startedAt ?? job.createdAt, nowMs),
+    })
+  }
+
+  // **所有者が2つ以上**（どちらも単独では「進まない所有者」ではない、例: running Project の2 Task が
+  // それぞれ非 initial-implement の queued Job を持つ）。Worker は ambiguous で claim せず、API の
+  // claim guard も互いを所有者として拒否するので、誰も進めないまま止まる。個別の原因で既に
+  // 知らせた場合はそれが出口を示すので重ねない。referenceId は所有者集合の安定キーで、
+  // 同じ incident は1回だけ escalate される（集合が変われば別 incident）。
+  if (
+    !stalledOwnerEmitted
+    && allOwners.length > 1
+    && runningQueuedTaskIds.size > 0
+    && !allOwners.some((owner) => alreadyNotified(owner.job))
+  ) {
+    const ordered = [...allOwners].sort((a, b) => a.job.createdAt.localeCompare(b.job.createdAt)
+      || a.job.id.localeCompare(b.job.id))
+    const newest = ordered[ordered.length - 1]!
+    attention.push({
+      kind: 'workspace_held_by_stalled_owner',
+      projectId: newest.project.id,
+      projectName: newest.project.name,
+      taskId: newest.task.id,
+      jobId: newest.job.id,
+      referenceId: `owners:${ordered.map((owner) => owner.job.id).sort().join('+')}`,
+      detail: `cause=multiple_live_owners: ${STALLED_OWNER_SUMMARY.multiple_live_owners(newest.job, newest.project)} `
+        + `owner jobs: ${ordered.map((owner) => `${owner.job.id} (${owner.job.status}, task ${owner.task.id})`).join(', ')}. `
+        + 'Queued work in the running project cannot be claimed until only one owner remains.',
+      stuckForMs: elapsedMs(newest.job.createdAt, nowMs),
     })
   }
 

@@ -689,6 +689,44 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     return kinds
   }
 
+  /**
+   * git_commit の完了が worktree の clean を証明したときだけ、同じ Task に残った blocked 行を終端化する。
+   *
+   * 残すと done な Task の blocked 行になり、Worker はそれを clean と観測するまで所有者として扱い、
+   * API の claim guard も解放の証明が無いため所有者として数える。done Task の行には自動の出口が
+   * 無いので（`abort_task` は done Task を拒否する）、**作らないことで防ぐ**（lifecycle repair W5）。
+   *
+   * 証明は committing Job が報告した `workspaceEndFingerprint` が committed HEAD で `clean` であること。
+   * 欠落・dirty・HEAD 不一致なら何もしない（fail-closed）。quarantine 行と Human Resume に
+   * superseded された行は対象外（前者は既存の clear-quarantine protocol の担当）。
+   */
+  function terminalizeBlockedJobsOnCleanCompletion(taskId: string, committing: Job): void {
+    const fingerprint = committing.failureMetadata?.workspaceEndFingerprint
+    if (
+      fingerprint?.mode !== 'clean'
+      || committing.commitHash === undefined
+      || fingerprint.startCommitHash !== committing.commitHash
+    ) return
+    const taskJobs = jobs.findByTaskId(taskId)
+    const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
+    for (const job of taskJobs) {
+      if (job.id === committing.id || job.status !== 'blocked') continue
+      if (superseded.has(job.id) || job.failureMetadata?.quarantined === true) continue
+      const terminalized = db.prepare(
+        "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+      ).run(job.id)
+      if (terminalized.changes !== 1) continue
+      auditLog.record({
+        actor: 'api',
+        operation: 'completion_terminalized',
+        entityType: 'job',
+        entityId: job.id,
+        result: 'failed',
+        detail: `reason=clean_completion committing_job_id=${committing.id} commit=${committing.commitHash}`,
+      })
+    }
+  }
+
   const projects: IProjectStorage = {
     findAll() {
       const rows = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as any[]
@@ -2137,6 +2175,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         recordOutboxEvent(db, input.jobId, input.outboxEvent)
 
+        terminalizeBlockedJobsOnCleanCompletion(sourceTask.id, updated)
         const continuation = completeTaskAndCreateContinuation(sourceTask, source.id)
 
         return { ok: true, job: updated, continuation, deduplicated: false }
