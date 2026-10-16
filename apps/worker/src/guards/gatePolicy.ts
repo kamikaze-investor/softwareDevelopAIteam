@@ -193,7 +193,7 @@ function technicalStop(code: GateTechnicalStopCode, detail: string): ResolvePoli
 
 /**
  * API の gate/check が返しうる組か（computeContinuationPolicy / computeNextAction と同じ対応）。
- *   - ALLOW                       → continue + (proceed | call_consume)
+ *   - ALLOW                       → continue + (call_consume | proceed は riskLevel が LOW / MEDIUM のときだけ)
  *   - PENDING_APPROVAL / BLOCKED  → wait_for_approval + (continue_safe_work_only | block_until_approved)
  *   - REJECTED                    → wait_for_approval + (continue_safe_work_only | block_until_approved)
  *   - STALE                       → re_check
@@ -204,8 +204,14 @@ function isCoherentGateResponse(checkResponse: GateCheckResponse): boolean {
   const policy = checkResponse.continuationPolicy
   const action = checkResponse.nextAction.action
   switch (decision) {
-    case 'ALLOW':
-      return policy === 'continue' && (action === 'proceed' || action === 'call_consume')
+    case 'ALLOW': {
+      if (policy !== 'continue') return false
+      if (action === 'call_consume') return true
+      // HIGH / CRITICAL の ALLOW は承認を使い切るとき（call_consume）だけ。decideGateOutcome は HIGH / CRITICAL を
+      // consumedRequestId 付きでしか ALLOW しない。HIGH / CRITICAL の ALLOW + proceed は consume 無しの実行になるので契約外。
+      const risk = checkResponse.riskReview.riskLevel
+      return action === 'proceed' && (risk === 'LOW' || risk === 'MEDIUM')
+    }
     case 'PENDING_APPROVAL':
     case 'BLOCKED':
     case 'REJECTED':

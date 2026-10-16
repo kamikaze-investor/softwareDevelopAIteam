@@ -195,8 +195,16 @@ describe('resolvePolicy — ALLOW はローカルの HIGH / CRITICAL で格下�
     expect(result.reason).toBe('consume it')
   })
 
-  it.each(['HIGH', 'CRITICAL'] as const)('ALLOW + proceed（%s、Evidence 経路）、ローカル同じ → continue（再ブロックしない）', (risk) => {
+  it.each(['LOW', 'MEDIUM'] as const)('ALLOW + proceed（%s）→ continue', (risk) => {
     expect(resolvePolicy(makeGateResult({ finalRiskLevel: risk }), allowProceed(risk)).policy).toBe('continue')
+  })
+
+  // API の decideGateOutcome は HIGH / CRITICAL を consumedRequestId 付き（call_consume）でしか ALLOW しない。
+  // HIGH / CRITICAL の ALLOW + proceed は consume 無しの実行になるので契約違反（re_check）。
+  it.each(['HIGH', 'CRITICAL'] as const)('ALLOW + proceed（%s）は契約外 → re_check approval_contract_violation（consume 無しで実行しない）', (risk) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), allowProceed(risk))
+    expect(result.policy).toBe('re_check')
+    expect(findGateTechnicalStopCode(result.reason)).toBe('approval_contract_violation')
   })
 
   it('ローカルが API より低い → API に従う', () => {
@@ -243,8 +251,8 @@ describe('resolvePolicy — 組の整合（全 decision × continuationPolicy ×
   const decisions = ['ALLOW', 'PENDING_APPROVAL', 'BLOCKED', 'REJECTED', 'STALE'] as const
   const policies = ['continue', 'continue_safe_work_only', 'block_until_approved'] as const
   const actions = ['proceed', 'call_consume', 'wait_for_approval', 're_check'] as const
+  // build() は riskLevel HIGH を返すので、ALLOW + proceed は契約外（LOW / MEDIUM のときだけ整合。上の describe）。
   const coherent = new Set<string>([
-    'ALLOW|continue|proceed',
     'ALLOW|continue|call_consume',
     ...['PENDING_APPROVAL', 'BLOCKED', 'REJECTED'].flatMap((d) => [
       `${d}|continue_safe_work_only|wait_for_approval`,
