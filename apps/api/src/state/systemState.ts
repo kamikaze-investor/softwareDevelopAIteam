@@ -109,8 +109,10 @@ export type AttentionKind =
   | 'task_blocked_without_job'
   | 'job_running_long'
   /**
-   * running Project の queued Job が、停滞閾値（`stallHintMs`。`job_running_long` と同じ）を過ぎても
-   * claim されていない（lifecycle repair C2 / RC5）。Worker の停止、Worker 側の所有権 ambiguous
+   * Worker が次に claim するはずの head-of-line の queued Job（running Project。`fetchQueuedJob` と同じ順序と
+   * 所有者制限。deployment に高々1件）が、最後に queued になってから停滞閾値（`stallHintMs`。
+   * `job_running_long` と同じ）を過ぎても claim されていない（lifecycle repair C2 / RC5）。どこかで Job が
+   * running なら正常な直列待ちなので出さない。Worker の停止、Worker 側の所有権 ambiguous
    * （stale な dirty 行と帰属できない dirt）、他の attention に表れない claim 拒否のどれでも
    * **黙って止まらない**ための受け皿。referenceId は Job id（1回だけ escalate される）。
    * 同じ停止を既に説明する attention（workspace_quarantined / workspace_held_by_stalled_owner は
@@ -291,6 +293,35 @@ function stopReason(value: string | undefined, max = 200): string | undefined {
   return tail(value, max)
 }
 
+/**
+ * Job が**最後に queued になった時刻**（`job_queued_long` の起点）。根拠の無い requeue なら undefined。
+ *
+ * Job を queued にする経路と、それぞれが残す永続的な時刻:
+ *   - 新規作成（initial implement / repair / retry / resume / git_commit 後続 等）… `createdAt`
+ *   - git_commit 承認による再開（`approveAndResumeJob`）… 同じ Job を queued に戻し started_at /
+ *     completed_at を消す。時刻は紐づく承認の `reviewedAt`
+ *   - quarantine 解除（clear-quarantine）… `failureMetadata.quarantineClearedAt`（解除まで queued は
+ *     Worker から隠されている）
+ *   - 汎用 `PATCH /api/jobs/:id` の requeue（terminal / running → queued）… started_at / completed_at を
+ *     残したまま queued になり、時刻を残す audit も無い。**保守的に undefined（通知しない）**
+ * started_at / completed_at が残っている queued Job は最後の経路でしか生まれない（承認再開は消す）。
+ */
+function queuedSinceOf(storage: IStorage, job: Job): string | undefined {
+  if (job.startedAt !== undefined || job.completedAt !== undefined) return undefined
+  const times = [job.createdAt]
+  if (job.failureMetadata?.quarantineClearedAt !== undefined) times.push(job.failureMetadata.quarantineClearedAt)
+  if (job.approvalId !== undefined) {
+    const approval = storage.approvalRequests.findById(job.approvalId)
+    if (approval?.reviewedAt !== undefined && (approval.status === 'APPROVED' || approval.status === 'CONSUMED')) {
+      times.push(approval.reviewedAt)
+    }
+  }
+  return times
+    .filter((value) => !Number.isNaN(Date.parse(value)))
+    .sort((a, b) => Date.parse(a) - Date.parse(b))
+    .pop()
+}
+
 function elapsedMs(from: string | undefined, nowMs: number): number | undefined {
   if (from === undefined) return undefined
   const started = Date.parse(from)
@@ -366,8 +397,14 @@ export function buildSystemState(
   // claim guard が所有者と数える全 Task（1 Task につき代表 Job 1件）。
   const allOwners: Array<{ project: Project; task: Task; job: Job }> = []
   const runningQueuedTaskIds = new Set<string>()
-  // claim されないまま閾値を過ぎた queued Job の候補（`job_queued_long`）。抑止は最後にまとめて判定する。
-  const queuedLongCandidates: Array<{ project: Project; task: Task; job: Job; queuedForMs: number }> = []
+  // Worker（`fetchQueuedJob`）が claim を試みる順の queued Job（`job_queued_long` の head-of-line 判定用）。
+  // 順序は Worker と同じ: `GET /api/projects`（findAll）→ `GET /api/tasks`（findByProjectId）→
+  // 各 Task の `GET /api/jobs`（findByTaskId）で最初の queued。quarantine された Task の queued は
+  // `GET /api/jobs` が隠すので候補にしない。claim するのは running Project の Task だけ。
+  const claimOrderQueued: Array<{ project: Project; task: Task; job: Job }> = []
+  // archived 以外の Project に running Job があるか。単一の共有 workspace を Worker が直列に使うので、
+  // その間の queued は正常な待ちである（長い実行は `job_running_long` が扱う）。
+  let anyJobRunning = false
 
   for (const project of observed) {
     const tasks = storage.tasks.findByProjectId(project.id)
@@ -568,20 +605,17 @@ export function buildSystemState(
           })
         }
 
-        if (job.status === 'queued' && project.status === 'running' && !storage.tasks.isParked(task.id)) {
-          // 経過の起点は「最後に queued になった時刻」の近似: requeue された Job は前回の
-          // startedAt / completedAt を持つので、createdAt と合わせた最新の時刻から数える。
-          const queuedSince = [job.createdAt, job.startedAt, job.completedAt]
-            .filter((value): value is string => value !== undefined && !Number.isNaN(Date.parse(value)))
-            .sort((a, b) => Date.parse(a) - Date.parse(b))
-            .pop()
-          const queuedFor = elapsedMs(queuedSince, nowMs)
-          if (queuedFor !== undefined && queuedFor >= stallHintMs) {
-            queuedLongCandidates.push({ project, task, job, queuedForMs: queuedFor })
-          }
+        if (
+          job.status === 'queued'
+          && project.status === 'running'
+          && job === jobs.find((candidate) => candidate.status === 'queued')
+          && !jobs.some(isQuarantined)
+        ) {
+          claimOrderQueued.push({ project, task, job })
         }
 
         if (job.status === 'running') {
+          anyJobRunning = true
           const runningFor = elapsedMs(job.startedAt ?? job.createdAt, nowMs)
           if (runningFor !== undefined && runningFor >= stallHintMs) {
             attention.push({
@@ -781,9 +815,24 @@ export function buildSystemState(
     })
   }
 
-  // **claim されない queued Job（`job_queued_long`）。** 他の attention が同じ停止を既に説明していれば出さない。
-  // workspace_quarantined / workspace_held_by_stalled_owner は所有者がいて claim 全体が拒否される状態を
-  // 説明する（所有者は別 Task なので Task 単位では一致しない）ため、どれか1つでもあれば全体を抑止する。
+  // **claim されない queued Job（`job_queued_long`）。deployment に高々1件。**
+  //
+  // 対象は Worker が次に claim するはずの head-of-line だけ（`fetchQueuedJob` と同じ順序・同じ所有者制限:
+  // 所有者 Task が1つならその Task の queued だけ、2つ以上なら誰も claim しない）。running Job が
+  // どこかにあれば正常な直列待ちなので出さない。経過は「最後に queued になった時刻」から数える
+  // （`queuedSinceOf`。根拠の無い requeue は保守的に出さない）。
+  // 他の attention が同じ停止を既に説明していれば出さない。workspace_quarantined /
+  // workspace_held_by_stalled_owner は claim 全体の拒否を説明する（所有者は別 Task）ので全体を抑止する。
+  const headOfLine = anyJobRunning || allOwners.length > 1
+    ? undefined
+    : claimOrderQueued.find(({ task }) => allOwners.length === 0 || allOwners[0]!.task.id === task.id)
+  const headQueuedSince = headOfLine !== undefined && !storage.tasks.isParked(headOfLine.task.id)
+    ? queuedSinceOf(storage, headOfLine.job)
+    : undefined
+  const headQueuedFor = elapsedMs(headQueuedSince, nowMs)
+  const queuedLongCandidates = headOfLine !== undefined && headQueuedFor !== undefined && headQueuedFor >= stallHintMs
+    ? [{ ...headOfLine, queuedForMs: headQueuedFor }]
+    : []
   {
     const claimWideExplained = attention.some((item) => (
       item.kind === 'workspace_quarantined' || item.kind === 'workspace_held_by_stalled_owner'
