@@ -223,6 +223,40 @@ describe('reconcileExternalCompletion — blocked Job が残る Task は done �
     expect(storage.tasks.findById(taskId)?.status).toBe('done')
   })
 
+  it('a legacy (non-quarantined) blocked row on a parked Task does not refuse: it no longer holds the workspace', () => {
+    const { storage, taskId, jobId } = seedWithJob('blocked')
+    storage.tasks.update(taskId, { roadmapActive: false })
+    storage.auditLog.record({ actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: taskId, result: 'success' })
+
+    expect(findBlockedJobsPreventingReconcile(storage, taskId)).toEqual([])
+    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId }).ok).toBe(true)
+    expect(storage.tasks.findById(taskId)?.status).toBe('done')
+  })
+
+  it('a quarantined blocked row on a parked Task still refuses', () => {
+    const { storage, taskId, jobId } = seedWithJob('blocked')
+    storage.jobs.update(jobId, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
+    storage.auditLog.record({ actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: taskId, result: 'success' })
+
+    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId }))
+      .toMatchObject({ ok: false, code: 'TASK_HAS_BLOCKED_JOBS' })
+  })
+
+  it('a quarantined blocked source superseded by a human resume still refuses (quarantine wins)', () => {
+    const { storage, taskId, jobId } = seedWithJob('blocked')
+    storage.jobs.update(jobId, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
+    const task = storage.tasks.findById(taskId)!
+    const successor = storage.jobs.create({
+      taskId, projectId: task.projectId, agentRole: 'developer_ai', status: 'success',
+      workflowStepKey: `resume:${jobId}:1`,
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    recordResumeActor(storage, { jobId: successor.id, taskId, actorClass: 'human', evidence: 'admin_credential' })
+
+    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: successor.id }))
+      .toMatchObject({ ok: false, code: 'TASK_HAS_BLOCKED_JOBS' })
+  })
+
   it.each(['failed', 'success'] as const)('a Task whose Jobs are all terminal (%s) is reconciled as before', (status) => {
     const { storage, taskId, jobId } = seedWithJob(status)
 

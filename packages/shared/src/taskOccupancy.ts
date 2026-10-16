@@ -39,7 +39,7 @@ export function isLiveJob(job: { status: string }): boolean {
 }
 
 /**
- * **終わった Task に取り残された blocked 行か。**
+ * **終わった（done または park された）Task に取り残された blocked 行か。**
  *
  * `apps/worker/src/index.ts` の `isStaleBlockedJobOfFinishedTask()` と同じ判定である。
  *
@@ -48,15 +48,21 @@ export function isLiveJob(job: { status: string }): boolean {
  * 「次の Task を実際に始められる状態」（worktree に差分が無い / 進行中の git 操作が無い /
  * HEAD を解決できる）になって初めて所有権を手放したと見なす。それまでは所有者のままである。
  *
+ * **park された Task（`parked === true`。`ITaskStorage.isParked()` = abort_task の成功 audit）も同じ扱い。**
+ * park は全 Job の終端化と観測済みの clean 解放を要求するので、park された Task に残る
+ * blocked 行は done Task の行と同じく legacy / stale 行である（lifecycle repair C2）。
+ * `parked` を渡さない呼び出し側は park されていないものとして扱われる（所有者側＝fail-closed）。
+ * Worker は `GET /api/tasks` の各 Task に載る `parked` をそのまま渡す。
+ *
  * つまりこの述語が真でも、workspace の観測抜きに「所有していない」と結論してはならない。
  * quarantine されている行はそもそも候補にならない（安全と証明されるまで保有し続ける）。
  */
 export function isStaleBlockedJobCandidate(
-  task: { status: string },
+  task: { status: string; parked?: boolean },
   job: { status: string; failureMetadata?: { quarantined?: boolean } | null },
 ): boolean {
   return job.status === 'blocked'
-    && task.status === 'done'
+    && (task.status === 'done' || task.parked === true)
     && job.failureMetadata?.quarantined !== true
 }
 
@@ -73,7 +79,7 @@ export function isStaleBlockedJobCandidate(
  * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
  */
 export function holdsWorkspaceWhenBlocked(
-  task: { status: string },
+  task: { status: string; parked?: boolean },
   job: { status: string; failureMetadata?: { quarantined?: boolean } | null },
 ): boolean {
   if (job.status !== 'blocked') return false

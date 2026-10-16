@@ -270,7 +270,11 @@ export async function taskRoutes(
       return reply.status(404).send({ error: 'Project not found' })
     }
 
-    return reply.send(storage.tasks.findByProjectId(query.data.projectId))
+    // **各 Task に `parked` を載せる**（additive）。Worker は workspace 所有権の判定で shared の
+    // `isStaleBlockedJobCandidate()` にこれを渡し、API の claim guard と同じ意味で
+    // park された Task の stale blocked 行を扱う（lifecycle repair C2）。park 判定はここで再定義しない。
+    return reply.send(storage.tasks.findByProjectId(query.data.projectId)
+      .map((task) => ({ ...task, parked: storage.tasks.isParked(task.id) })))
   })
 
   app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {

@@ -15,7 +15,8 @@
  * `mandatory-gate-policy` が決める（本 API は権限判断をしない）。
  */
 
-import { holdsWorkspaceWhenBlocked, isLiveWorkspaceOwnerJob, occupiesProject } from '@ai-team/shared'
+import { isLiveWorkspaceOwnerJob, occupiesProject } from '@ai-team/shared'
+import { findBlockedRowsHoldingWorkspace } from './blockedRowOwnership'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
@@ -59,7 +60,6 @@ export const DEFAULT_STALL_HINT_MS = 5 * 60 * 1000
 /** `workspace_held_by_stalled_owner` の原因。detail 先頭に `cause=<値>` として載る。 */
 export type StalledOwnerCause =
   | 'inactive_project'
-  | 'parked_task_blocked_row'
   | 'multiple_live_owners'
 
 /**
@@ -69,10 +69,11 @@ export type StalledOwnerCause =
  * park された Task は resume も abort もできない）。そう書かずに既存操作を案内すると、
  * 案内どおりにしても何も解けない（W5 独立レビュー指摘）。
  *
- * done な Task の行が所有者になるのは quarantine 行だけである（shared `holdsWorkspaceWhenBlocked`）。
- * 非 quarantine の stale 候補は claim guard も所有者と数えず、Worker の worktree 観測と
- * baseline admission に任せるので、ここにも出ない。quarantine 行は `workspace_quarantined` が
- * 既に CEO へ届くので、done Task 用の原因は持たない（旧 `done_task_blocked_row` は廃止）。
+ * done / park された Task の行が所有者になるのは quarantine 行だけである（shared
+ * `holdsWorkspaceWhenBlocked` に park 状態を渡した `findBlockedRowsHoldingWorkspace`）。
+ * 非 quarantine の stale 候補は claim guard も Worker も観測で扱うので、ここにも出ない。
+ * quarantine 行は `workspace_quarantined` が既に CEO へ届くので、done / park 用の原因は持たない
+ * （旧 `done_task_blocked_row` / `parked_task_blocked_row` は廃止。lifecycle repair C2）。
  */
 const STALLED_OWNER_SUMMARY: Record<StalledOwnerCause, (job: Job, project: Project) => string> = {
   inactive_project: (job, project) =>
@@ -80,10 +81,6 @@ const STALLED_OWNER_SUMMARY: Record<StalledOwnerCause, (job: Job, project: Proje
     + 'Exit: pause the currently running project first (only one project may run at a time), then resume '
     + 'this project so its owner can finish; archiving it or returning it to draft is refused while it '
     + 'still owns work.',
-  parked_task_blocked_row: () =>
-    'a blocked job left on a parked task holds the shared workspace (legacy row; parking now requires '
-    + 'terminal jobs). No automated exit exists: a manual workspace check and an operator terminalization '
-    + 'of that job are required.',
   multiple_live_owners: () =>
     'more than one task owns the shared workspace at once, so the Worker and the claim guard refuse every '
     + 'claim. Exit: decide which owner continues and terminalize or cancel the other owner jobs.',
@@ -116,11 +113,10 @@ export type AttentionKind =
    * Project の queued Job を Worker も API も claim しない。detail 先頭の `cause=` が原因:
    *
    *   - `inactive_project` … paused / draft Project の Job が所有者
-   *   - `parked_task_blocked_row` … park された Task に残った blocked 行（どの Project でも。legacy）
    *   - `multiple_live_owners` … 所有者が2つ以上あり、互いに claim を拒否し合っている
    *
-   * done な Task の所有者は quarantine 行だけで、`workspace_quarantined` が担当する（ここには出さない）。
-   * queued は「動かせる」扱い、park の blocked 行は他の attention から除外されているため、
+   * done / park された Task の所有者は quarantine 行だけで、`workspace_quarantined` が担当する（ここには出さない）。
+   * queued は「動かせる」扱いのため、
    * これが無いと claim が止まったまま PL は idle になり誰にも知らせない（lifecycle repair W5）。
    * 解消は CEO / operator の判断（Project の再開、または手動の workspace 確認と Job の終端化）なので
    * notify-only。referenceId は所有者 Job の id（multiple_live_owners は所有者集合のキー）で、1回だけ escalate される。
@@ -486,25 +482,19 @@ export function buildSystemState(
       }
       {
         // 所有者の意味は claim guard（storage の `taskHoldsWorkspaceViaBlockedRow`）と完全に同じ:
-        // live な所有者か、shared `holdsWorkspaceWhenBlocked` が所有者とし、Human Resume に
-        // superseded されていない blocked 行。done な Task の非 quarantine 行（stale 候補）は
-        // Worker の観測に任せるので数えない（数えると guard とずれ、出口の無い警報になる）。
-        const ownershipSuperseded = task.status === 'done' ? readJobsSupersededByHumanResume(storage, jobs) : superseded
-        const blockedOwner = jobs.find((job) => holdsWorkspaceWhenBlocked(task, job) && !ownershipSuperseded.has(job.id))
+        // live な所有者か、`findBlockedRowsHoldingWorkspace`（shared 述語 + park 状態 + quarantine が
+        // 優先する superseded 除外）が返す blocked 行。done / park された Task の非 quarantine 行
+        // （stale 候補）は Worker の観測に任せるので数えない（数えると guard とずれ、出口の無い警報になる）。
+        const blockedOwner = findBlockedRowsHoldingWorkspace(storage, task, jobs)[0]
         const owner = jobs.find((job) => isLiveWorkspaceOwnerJob(task.id, job)) ?? blockedOwner
         if (owner !== undefined) allOwners.push({ project, task, job: owner })
-        // 選ばれた所有者が park された Task の blocked 行なら、Project の status に関係なく
-        // stale 行の原因を使う。inactive_project として Project の再開を案内しても、その Task は
-        // 動かせないので所有者は消えない（W5 独立レビュー指摘）。done な Task の所有者は
-        // quarantine 行だけ（上の述語）で、`workspace_quarantined` が CEO へ届けるので重ねない。
-        const doneTaskQuarantinedOwner = owner?.status === 'blocked' && task.status === 'done'
-        const staleRowCause: StalledOwnerCause | undefined = owner?.status === 'blocked' && parentIsParked
-          ? 'parked_task_blocked_row'
-          : undefined
-        if (doneTaskQuarantinedOwner) {
+        // done / park された Task の blocked 所有者は quarantine 行だけ（上の述語）で、
+        // `workspace_quarantined` が CEO へ届けるので重ねない。inactive_project として Project の
+        // 再開を案内しても、その Task は動かせないので所有者は消えない（W5 独立レビュー指摘）。
+        const finishedTaskQuarantinedOwner = owner?.status === 'blocked'
+          && (task.status === 'done' || storage.tasks.isParked(task.id))
+        if (finishedTaskQuarantinedOwner) {
           // allOwners には数えたまま（multiple_live_owners の判定は guard と一致させる）。
-        } else if (owner !== undefined && staleRowCause !== undefined) {
-          stalledOwners.push({ project, task, job: owner, cause: staleRowCause })
         } else if (owner !== undefined && project.status !== 'running') {
           stalledOwners.push({ project, task, job: owner, cause: 'inactive_project' })
         }

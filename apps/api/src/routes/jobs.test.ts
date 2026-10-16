@@ -762,6 +762,60 @@ describe('Job API', () => {
       })
     })
 
+    // Codex review (C2): park は全 Job の終端化と観測済みの clean 解放を要求するので、park された
+    // Task に残る非 quarantine の blocked 行は done Task の行と同じ legacy 行。以前は resume / abort /
+    // PATCH / reconcile のどれも通らず、claim が永久に止まった。
+    it('a legacy blocked row on a parked Task elsewhere does not refuse the claim; no stalled-owner attention; GET /api/tasks reports parked', async () => {
+      await withApp(async (app) => {
+        const { buildSystemState } = await import('../state/systemState.js')
+        const { storage, job, pausedId } = await setup(app)
+        const parkedTask = storage.tasks.create({
+          projectId: pausedId, title: 'Parked', description: '', status: 'pending',
+          assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+        } as Parameters<typeof storage.tasks.create>[0])
+        storage.auditLog.record({
+          actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: parkedTask.id, result: 'success',
+        })
+        storage.jobs.create({
+          taskId: parkedTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        const listed = parseBody<Array<{ id: string; parked?: boolean }>>(
+          (await app.inject({ method: 'GET', url: `/api/tasks?projectId=${pausedId}` })).body)
+        expect(listed.find((task) => task.id === parkedTask.id)?.parked).toBe(true)
+        expect(buildSystemState(storage).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
+    // Codex review (C2): quarantine が優先する。startup reconciliation は quarantine された source を
+    // 意図的に blocked のまま残し、Worker はすべての quarantine 行を所有者とするので、API も同じにする。
+    it('a quarantined blocked source superseded by a human resume is still an owner: claim refused, workspace_quarantined raised', async () => {
+      await withApp(async (app) => {
+        const { recordResumeActor } = await import('../designReview/resumeActor.js')
+        const { buildSystemState } = await import('../state/systemState.js')
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const source = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        storage.jobs.update(source.id, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
+        const successor = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'success',
+          workflowStepKey: `resume:${source.id}:1`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        recordResumeActor(storage, { jobId: successor.id, taskId: otherTask.id, actorClass: 'human', evidence: 'admin_credential' })
+
+        expect(buildSystemState(storage).attention
+          .some((item) => item.kind === 'workspace_quarantined' && item.jobId === source.id)).toBe(true)
+        expect((await claim(app, job.id)).statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      })
+    })
+
     it('a quarantined blocked row on a done Task elsewhere is still an owner', async () => {
       await withApp(async (app) => {
         const { storage, job, pausedId } = await setup(app)

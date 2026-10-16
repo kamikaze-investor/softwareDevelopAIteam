@@ -63,6 +63,7 @@ import {
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
 import { blockedJobsReconcileRefusalReason, findBlockedJobsPreventingReconcile } from '../reconcile/externalCompletion'
+import { findBlockedRowsHoldingWorkspace } from '../state/blockedRowOwnership'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -671,11 +672,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    *
    * **claim guard（`jobs.update` queued→running）・`activeLifecycleKindsOf`・systemState の
    * `workspace_held_by_stalled_owner` はすべてこの意味を使う**（ownership を自前で書き直さない）。
-   * 判定は shared の `holdsWorkspaceWhenBlocked()` に、Human Resume で後継が作られた旧行の除外
-   * （`readJobsSupersededByHumanResume`）を足したものだけ。quarantine 行は述語側で所有者のまま。
+   * 実体は `findBlockedRowsHoldingWorkspace()`（`state/blockedRowOwnership.ts`）: shared の
+   * `holdsWorkspaceWhenBlocked()` に park 状態を渡し、Human Resume で後継が作られた旧行を
+   * quarantine でない場合だけ除く（quarantine が優先。Worker と同じ）。
    *
-   * done な Task に残った非 quarantine の blocked 行（`isStaleBlockedJobCandidate`）はここでは
-   * 所有者にしない。それは「所有していない」ではなく「観測しないと決められない」であり、
+   * done / park された Task に残った非 quarantine の blocked 行（`isStaleBlockedJobCandidate`）は
+   * ここでは所有者にしない。それは「所有していない」ではなく「観測しないと決められない」であり、
    * 観測は Worker（clean worktree・HEAD 解決可能・git 操作なしを確認して初めて解放）と、
    * 次の initial implement の `computeWorkspaceBaseline` admission（dirty なら fail-closed）が担う。
    * API がここで所有者と数えると、Worker が解放した後も claim が永久に止まり、出口が無い
@@ -684,9 +686,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   function taskHoldsWorkspaceViaBlockedRow(taskId: string): boolean {
     const task = tasks.findById(taskId)
     if (!task) return false
-    const taskJobs = jobs.findByTaskId(taskId)
-    const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
-    return taskJobs.some((job) => holdsWorkspaceWhenBlocked(task, job) && !superseded.has(job.id))
+    return findBlockedRowsHoldingWorkspace(storage, task, jobs.findByTaskId(taskId)).length > 0
   }
 
   /**
@@ -917,7 +917,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(job.taskId) as any
       if (!taskRow) continue
       const task = deserializeTask(taskRow)
-      if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
+      if (holdsWorkspaceWhenBlocked({ status: task.status, parked: isParkedTaskId(task.id) }, job)) return { job, task }
       // ここへ来るのは stale 候補だけ。証明の及ぶ workspace のものだけを見逃す。
       //
       // **どちらかの workingDir が読めなければ「同じ workspace だ」と言えない。**
@@ -1022,7 +1022,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       if (
         job.status === 'queued'
         || job.status === 'running'
-        || holdsWorkspaceWhenBlocked(task, job)
+        || holdsWorkspaceWhenBlocked({ status: task.status, parked: isParkedTaskId(task.id) }, job)
         || occupiesProject(task)
       ) return { job, task }
     }

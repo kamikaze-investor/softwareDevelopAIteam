@@ -34,13 +34,16 @@ import path from 'node:path'
 import { getBaseRoadmapId, isFollowUpTaskKey } from '@ai-team/shared'
 import type { Job } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
-import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { findBlockedRowsHoldingWorkspace } from '../state/blockedRowOwnership'
 
 /** `reconcileExternalCompletion` が blocked Job の残る Task を断るときの code。 */
 export const TASK_HAS_BLOCKED_JOBS = 'TASK_HAS_BLOCKED_JOBS' as const
 
 /**
- * 外部完了の取り込みを塞ぐ blocked Job（Human Resume に superseded されていない blocked 行）。
+ * 外部完了の取り込みを塞ぐ blocked Job — **workspace を所有する** blocked 行
+ * （claim guard と同じ `findBlockedRowsHoldingWorkspace`: quarantine 行、または stale 候補でも
+ * Human Resume に superseded されてもいない行）。park された Task の非 quarantine 行は stale 候補で、
+ * 解放は Worker の観測が担うので取り込みを塞がない（lifecycle repair C2 / Codex review）。
  *
  * 取り込みは Task を done にするだけで Job に触れない。blocked 行を残したまま done にすると
  * 「done な Task の blocked 行」になり、workspace の解放は Worker の観測頼みで、
@@ -51,9 +54,9 @@ export const TASK_HAS_BLOCKED_JOBS = 'TASK_HAS_BLOCKED_JOBS' as const
  * 同じこの関数を使う。
  */
 export function findBlockedJobsPreventingReconcile(storage: IStorage, taskId: string): Job[] {
-  const jobs = storage.jobs.findByTaskId(taskId)
-  const superseded = readJobsSupersededByHumanResume(storage, jobs)
-  return jobs.filter((job) => job.status === 'blocked' && !superseded.has(job.id))
+  const task = storage.tasks.findById(taskId)
+  if (!task) return []
+  return findBlockedRowsHoldingWorkspace(storage, task, storage.jobs.findByTaskId(taskId))
 }
 
 /** 409 応答の本文。route の Gate 前チェックと storage の拒否で同じ文面を使う。 */
