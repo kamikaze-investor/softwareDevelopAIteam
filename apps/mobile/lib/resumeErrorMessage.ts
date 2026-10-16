@@ -55,6 +55,15 @@ const RESUME_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
     '却下されたコミットの元の作業を特定できないため、再開できませんでした。AI開発チームに確認を依頼してください。',
   GIT_COMMIT_RESUME_LINEAGE_INVALID:
     '却下されたコミットの元の作業を特定できないため、再開できませんでした。AI開発チームに確認を依頼してください。',
+  // 409: 事前 Design Review を待つ間に、再開しようとした停止中の作業が別のものに変わった。
+  RESUME_TARGET_CHANGED:
+    '設計レビューを待つ間に対象の作業が変わったため、再開しませんでした。画面を更新して状態を確認してから、もう一度送信してください。',
+  // 503（retryable）: 事前 Design Review の判定がまだ出ていない。否定ではない。
+  RESUME_DESIGN_REVIEW_PENDING:
+    '追加指示の事前の設計レビューがまだ終わっていません。しばらく待ってから同じ指示をもう一度送信してください。',
+  // 503（retryable）: 再開の記録が書けず、何も変更されなかった。
+  RESUME_COMMIT_FAILED:
+    '再開の記録に失敗したため、何も変更されませんでした。時間をおいてもう一度送信してください。',
 }
 
 function messageForCode(table: Readonly<Record<string, string>>, code: string | null): string | undefined {

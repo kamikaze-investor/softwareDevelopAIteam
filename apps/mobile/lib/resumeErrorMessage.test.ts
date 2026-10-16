@@ -52,6 +52,36 @@ describe('formatResumeErrorMessage（stable code）', () => {
     expect(formatResumeErrorMessage('Validation failed', code)).toBe(expected)
   })
 
+  /**
+   * `POST /api/tasks/:id/resume`（`apps/api/src/routes/tasks.ts`）が返しうる 409 / 503 の code。
+   * 共有の export 定数が無いので明示的に列挙する。route に code を足したらここにも足すこと
+   * （足さないと、その code は fallback の汎用文言になる）。
+   */
+  const RESUME_ROUTE_409_CODES = [
+    'RESUME_DESIGN_REVIEW_FAILED',
+    'WORKSPACE_QUARANTINED',
+    'TASK_DONE',
+    'PROJECT_NOT_RUNNING',
+    'HUMAN_DECISION_PENDING',
+    'REPAIR_REVIEW_IN_FLIGHT',
+    'RESUME_TARGET_CHANGED',
+    'REJECTED_COMMIT_SOURCE_UNRESOLVED',
+    'GIT_COMMIT_RESUME_LINEAGE_INVALID',
+  ] as const
+  const RESUME_ROUTE_503_CODES = ['RESUME_DESIGN_REVIEW_PENDING', 'RESUME_COMMIT_FAILED'] as const
+
+  it.each([...RESUME_ROUTE_409_CODES, ...RESUME_ROUTE_503_CODES])(
+    'resume route の code %s には専用の文言がある（fallback にならない）',
+    (code) => {
+      expect(formatResumeErrorMessage(null, code)).not.toBe(RESUME_ERROR_MESSAGE_FALLBACK)
+    },
+  )
+
+  it('判定待ち（503）は否定ではなく、同じ指示の再送を促す', () => {
+    expect(formatResumeErrorMessage(null, 'RESUME_DESIGN_REVIEW_PENDING')).toContain('もう一度送信')
+    expect(formatResumeErrorMessage(null, 'RESUME_DESIGN_REVIEW_PENDING')).not.toBe(RESUME_DESIGN_REVIEW_FAILED_MESSAGE)
+  })
+
   it('設計レビュー不通過の code は既存の文言', () => {
     expect(formatResumeErrorMessage(null, 'RESUME_DESIGN_REVIEW_FAILED')).toBe(RESUME_DESIGN_REVIEW_FAILED_MESSAGE)
   })
