@@ -112,6 +112,9 @@ export const APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK = '操作に失敗しま�
 const APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
   HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS:
     '承認・却下はCEO専用の操作です。現在のAPIの認証設定では実行できません。AI開発チームに確認を依頼してください。',
+  // 409: 判断の期限が切れていた（API は承認・却下のどちらも記録せず、依頼を期限切れにする）。
+  APPROVAL_EXPIRED:
+    'この承認依頼は期限が切れていたため、承認・却下は記録されませんでした。必要な場合はAI開発チームが改めて依頼します。',
 }
 
 export function formatApprovalDecisionErrorMessage(code: string | null): string {

@@ -83,6 +83,13 @@ describe('formatApprovalDecisionErrorMessage', () => {
     expect(formatApprovalDecisionErrorMessage('HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS')).toContain('CEO専用')
   })
 
+  it('期限切れの 409 code は「記録されなかった」ことを出す（fallback にしない）', () => {
+    const message = formatApprovalDecisionErrorMessage('APPROVAL_EXPIRED')
+    expect(message).not.toBe(APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK)
+    expect(message).toContain('期限が切れて')
+    expect(message).toContain('記録されませんでした')
+  })
+
   it('code が無い・未知なら fallback', () => {
     expect(formatApprovalDecisionErrorMessage(null)).toBe(APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK)
     expect(formatApprovalDecisionErrorMessage('SOMETHING')).toBe(APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK)
