@@ -232,6 +232,11 @@ const STOPWORDS = new Set([
   'meta',
   'review',
   'project',
+  // docs/project_memory/decisions/ の共通パス要素は関連性の手がかりにならない
+  // （2026-10-16: 全 Decision Record が一致し、strategic_alignment prompt が 193,755 文字に膨張）
+  'memory',
+  'decision',
+  'decisions',
 ])
 
 export async function runStrategicMetaReview(
@@ -750,7 +755,7 @@ async function buildStrategicAlignmentContext(input: StrategicReviewInput): Prom
   }
 
   const keywords = buildKeywords(input)
-  const decisionsContext = await buildDecisionContext(input.workingDir, keywords)
+  const decisionsContext = await buildDecisionContext(input.workingDir, keywords, input.changedFiles)
   if (decisionsContext) {
     sections.push(decisionsContext)
   }
@@ -864,8 +869,13 @@ function checklistMatchesFile(checklistFile: string, file: string): boolean {
   }
 }
 
-async function buildDecisionContext(workingDir: string, keywords: readonly string[]): Promise<string> {
+async function buildDecisionContext(
+  workingDir: string,
+  keywords: readonly string[],
+  changedFiles: readonly string[],
+): Promise<string> {
   const decisionsDir = join(workingDir, 'docs/project_memory/decisions')
+  const changed = new Set(changedFiles.map((file) => file.replace(/\\/g, '/')))
   let entries: string[]
 
   try {
@@ -877,6 +887,7 @@ async function buildDecisionContext(workingDir: string, keywords: readonly strin
   }
 
   const titleLines: string[] = []
+  const changedSections: string[] = []
   const bodySections: string[] = []
 
   for (const entry of entries) {
@@ -889,7 +900,13 @@ async function buildDecisionContext(workingDir: string, keywords: readonly strin
     const title = extractMarkdownTitle(content) ?? basename(entry, '.md')
     titleLines.push(`- ${relPath}: ${title}`)
 
-    if (isRelatedText(`${relPath} ${title}`, keywords)) {
+    if (changed.has(relPath)) {
+      // この Task が変更中の Decision Record はレビュー対象そのもの。Design Review の material は
+      // 設計文であり、変更ファイルは名前しか渡らないので、内容はここでしか届かない。
+      // キーワードの選択（上限 30 語）に依存させず、文字数でも切り詰めずに必ず載せる。
+      changedSections.push(`### ${relPath}\n\n${content}`)
+    } else if (isRelatedText(`${basename(entry, '.md')} ${title}`, keywords)) {
+      // 関連性はファイル名と title で判定する（共通のディレクトリ名で全件を一致させない）
       bodySections.push(`### ${relPath}\n\n${content}`)
     }
   }
@@ -903,6 +920,10 @@ async function buildDecisionContext(workingDir: string, keywords: readonly strin
     '',
     '### Decision title list',
     ...titleLines,
+    // 変更中の記録は「承認済みの過去 Decision」と混ぜない（作業中の内容を正本の判断根拠として読ませない）
+    changedSections.length > 0
+      ? ['', '### Decision records changed by this Task (current working-tree content, not yet accepted)', ...changedSections].join('\n')
+      : '',
     bodySections.length > 0
       ? ['', '### Related decision bodies', ...bodySections].join('\n')
       : '',
@@ -1367,8 +1388,8 @@ function extractMarkdownTitle(markdown: string): string | null {
 }
 
 function buildKeywords(input: StrategicReviewInput): string[] {
+  // subjectId は常に UUID（Task / Project の id）で、関連性の手がかりにならないので使わない
   const source = [
-    input.subjectId,
     input.taskTitle,
     ...input.changedFiles,
   ].join(' ')
@@ -1377,7 +1398,8 @@ function buildKeywords(input: StrategicReviewInput): string[] {
     source
       .toLowerCase()
       .split(/[^a-z0-9]+/)
-      .filter((word) => word.length >= 3 && !STOPWORDS.has(word)),
+      // 数字だけの語（2026・001 等の日付・連番）は無関係な記録まで一致させる
+      .filter((word) => word.length >= 3 && !STOPWORDS.has(word) && !/^\d+$/.test(word)),
   ).slice(0, 30)
 }
 
