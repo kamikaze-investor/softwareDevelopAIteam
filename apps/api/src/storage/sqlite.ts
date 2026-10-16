@@ -20,7 +20,7 @@ import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
 import { DesignReviewRunContentionError } from './interface'
-import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveWaitingApproval } from '@ai-team/shared'
+import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -1063,14 +1063,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     }
     // requestTechnicalAbort() の precheck（live WAITING / APPROVED があれば拒否）を最終 transaction で
     // もう一度行う。precheck 後に作られた承認を、park の STALE 化で黙って消さないため（新しい gate ではなく
-    // 同じ条件の atomic 化）。期限解釈は shared isLiveWaitingApproval。
+    // 同じ条件の atomic 化）。期限解釈は shared isLiveWaitingApproval / isLiveApprovedApproval
+    // （期限切れ APPROVED は consume できないので人の判断として生きていない。監査 B-2）。
+    const nowMs = Date.parse(now())
     const humanDecision = (db.prepare(`
       SELECT status, expires_at FROM approval_requests
       WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
       ORDER BY created_at DESC, rowid DESC
     `).all(task.id) as Array<{ status: ApprovalGateStatus; expires_at: string }>)
-      .find((row) => row.status === 'APPROVED'
-        || isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at }))
+      .find((row) => isLiveApprovedApproval({ status: row.status, expiresAt: row.expires_at }, nowMs)
+        || isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at }, nowMs))
     // cleanup 要求の後に作られ、既に CONSUMED になった request も人の判断である（承認→消費まで
     // Worker の報告が届かなかった場合、上の status 条件だけでは見えない）。
     const consumedAfterRequest = metadata.abortCleanupRequestedAt === undefined

@@ -1612,12 +1612,25 @@ describe('P2-2 Automatic Technical Abort', () => {
     expectNotParkedNorQuarantined(fx)
   })
 
-  it('an expired APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
+  // 2026-10-16 監査 B-2: 期限切れ未消費の APPROVED は consume できない（gate と同じ遅延判定）ので、
+  // もう誰の authority でもない。以前はこれも「人の判断」として数え、Technical Abort を恒久拒否していた。
+  it('an expired APPROVED approval does not block Technical Abort, and the park stales it (B-2)', () => {
     const fx = seedTechnicalAbort()
-    approvedRequest(fx.storage, fx.taskId, {
+    const expiredApprovedId = approvedRequest(fx.storage, fx.taskId, {
       action: 'git_commit',
       expiresAt: new Date(Date.now() - 60_000).toISOString(),
     })
+
+    requestTechnical(fx)
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+    expect(fx.storage.approvalRequests.findById(expiredApprovedId)?.status).toBe('STALE')
+  })
+
+  it('a live APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
+    const fx = seedTechnicalAbort()
+    approvedRequest(fx.storage, fx.taskId, { action: 'git_commit' })
     const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
     if (attention === undefined) throw new Error('attention missing')
 
@@ -1628,6 +1641,18 @@ describe('P2-2 Automatic Technical Abort', () => {
     })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
     expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
       .toBeUndefined()
+  })
+
+  it('an expired APPROVED approval appearing after the precheck does not refuse the final park transaction (B-2)', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const lateExpiredId = approvedRequest(fx.storage, fx.taskId, {
+      action: 'git_commit',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    })
+
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+    expect(fx.storage.approvalRequests.findById(lateExpiredId)?.status).toBe('STALE')
   })
 
   it('an APPROVED approval hidden behind a newer expired WAITING still blocks Technical Abort', () => {
