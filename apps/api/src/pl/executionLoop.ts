@@ -1562,9 +1562,11 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
       return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
     }
-    // authority evidence が書けず resume ごと rollback された。否定ではないので試行を消費しない。
+    // authority evidence が書けず resume ごと rollback された（何も変わっていない）。再試行は安全だが、
+    // 永続的な書き込み失敗なら毎 tick 黙って繰り返すことになる（Codex round 2）。pending にせず
+    // 技術的な失敗の試行として数え、既存の technical budget で止める（尽きれば technical_exhausted）。
     if (!resumed.ok && resumed.code === 'RESUME_COMMIT_FAILED') {
-      return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
+      return { ok: false, summary: `resume commit failed (technical; retried within the technical budget): ${resumed.reason}` }
     }
     // 生きた人の判断（APPROVED / WAITING の abort_task 等）がある。PL はそれを上書きしない。
     // 正当な人の判断待ちなので試行を消費せず（idle）、escalation も起こさない。

@@ -51,10 +51,30 @@ export function isTaskScopedApprovalAction(requestedAction: string | undefined):
   return !Object.prototype.hasOwnProperty.call(COMMAND_ZONES, requestedAction)
 }
 
-/** 生きた（未期限の WAITING / APPROVED）Task 単位の人の判断か。 */
+/**
+ * APPROVED の後も **人が実行する** Task 単位の判断か（abort_task は CEO の /abort、
+ * reconcile_external_completion は CEO の reconcile route、repair_from_stored_review:* は再投入の route が使う）。
+ * それ以外の Task 単位 APPROVED（retry_job / fail_stuck_job 等）は PL が自分の approval_gate 根拠として
+ * 使う承認で、承認後に人を待っているわけではない（Codex round 2）。
+ */
+export function isHumanExecutedTaskDecision(requestedAction: string | undefined): boolean {
+  if (requestedAction === undefined) return false
+  return requestedAction === 'abort_task'
+    || requestedAction === 'reconcile_external_completion'
+    || requestedAction.startsWith('repair_from_stored_review:')
+}
+
+/**
+ * **人の判断がいま Task を止めている**か: 未期限 WAITING の Task 単位 request（判断そのものを待っている）、
+ * または未期限 APPROVED の、人が実行する Task 単位判断（実行を人が待っている）。
+ * 人でない resume はこれがある間 `HUMAN_DECISION_PENDING`、systemState は `job_blocked` ではなく
+ * `approval_waiting` として見せる。
+ */
 export function isLiveTaskScopedDecision<
   T extends Pick<ApprovalRequest, 'status' | 'expiresAt'> & { requestedAction?: string },
 >(approval: T, nowMs: number = Date.now()): boolean {
-  if (!isTaskScopedApprovalAction(approval.requestedAction)) return false
-  return isLiveWaitingApproval(approval, nowMs) || isLiveApprovedApproval(approval, nowMs)
+  const action = approval.requestedAction
+  if (!isTaskScopedApprovalAction(action)) return false
+  if (isLiveWaitingApproval(approval, nowMs)) return true
+  return isHumanExecutedTaskDecision(action) && isLiveApprovedApproval(approval, nowMs)
 }

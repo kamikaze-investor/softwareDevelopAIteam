@@ -72,6 +72,7 @@ import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
+import { classifyApprovedRunBlock } from '../approvedRunBlock'
 import {
   classifyGitCommitResumeLineage,
   parseGitCommitResumeStepKey,
@@ -945,7 +946,15 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // gate policy（AI 編集禁止の Control 領域）が実行を拒んで blocked を報告した。下の 7 へ落とすと
   // auto_recovery → PL resume → 新しい承認 → CEO 承認 → また Worker が拒否、の無限往復になる。
   // AI が解ける停止ではない（policy の変更は CEO の判断）ので、CEO に一度だけ見せて止める。
-  if (facts.job?.status === 'blocked' && facts.approvedLinkedGitCommitId !== undefined && !hasLiveJob(facts)) {
+  // **Worker が送った証拠（guardResult / quarantine）が Gate 段階の拒否を示すときだけ**（Codex round 2）。
+  // Permission 拒否・File Change Guard・quarantine は既存の rule（1〜3・7）がそれぞれ扱う。保存側
+  // （`jobs.update` の停止理由）と同じ `classifyApprovedRunBlock()` で判定する。
+  if (
+    facts.job?.status === 'blocked'
+    && facts.approvedLinkedGitCommitId !== undefined
+    && classifyApprovedRunBlock(facts.job) === 'gate_refusal'
+    && !hasLiveJob(facts)
+  ) {
     return {
       ...result,
       rootCauseClass: 'safety_or_authority_boundary',

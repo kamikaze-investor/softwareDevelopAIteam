@@ -61,6 +61,7 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
+import { classifyApprovedRunBlock, describeApprovedRunBlock } from '../approvedRunBlock'
 import { approvalActorAuditRecord, readApprovalActorClass, readJobsSupersededByHumanResume, resumeActorAuditRecord } from '../designReview/resumeActor'
 
 /** resume transaction 内で authority evidence（`resume_actor`）が書けなかったことを表す（G-01）。 */
@@ -2328,11 +2329,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const updated = { ...existing, ...data }
       if (approvedButBlockedByWorker !== undefined && !(updated.stderr ?? '').trim()) {
         // Worker の gate block 理由は結果 payload に載らない（stderr 空）。停止理由を attention の
-        // detail（stopReason(job.stderr)）に出すため、API が確定できる事実だけで書く。
-        // attention detail は末尾 200 字なので 200 字以内に収める。
-        updated.stderr = `approved_but_worker_blocked: approval ${approvedButBlockedByWorker} is APPROVED and unconsumed,`
-          + ` but the Worker gate policy refused ${existing.safeCommand.kind}`
-          + ` (e.g. safe_work_only: ${existing.safeCommand.kind} not permitted)`
+        // detail（stopReason(job.stderr)）に出すため、Worker が実際に送った guardResult / quarantine だけから
+        // 原因を決めて書く（Codex round 2: 全部を gate policy の拒否と書くと Permission 拒否を偽る）。
+        updated.stderr = describeApprovedRunBlock(classifyApprovedRunBlock(updated), {
+          approvalId: approvedButBlockedByWorker,
+          kind: existing.safeCommand.kind,
+          permissionReason: updated.guardResult?.permissionReason,
+          fileViolations: updated.guardResult?.fileViolations,
+        })
       }
       db.prepare(`
         UPDATE jobs SET
