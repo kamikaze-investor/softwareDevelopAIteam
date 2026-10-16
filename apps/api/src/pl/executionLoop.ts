@@ -167,9 +167,10 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // 一方で採用は「全 attention が escalate 済み / exhausted」を要求するので、**どこか1件の
   // quarantine が全 Project の採用を通知なしに止めていた**（lifecycle repair W5）。
   'workspace_quarantined',
-  // paused / draft Project の Job が共有 workspace を握り、running Project の claim が止まっている。
-  // **通知だけ**する。再開するか放棄するかは CEO の判断（lifecycle repair W5）。
-  'workspace_held_by_inactive_project',
+  // 自力では進まない所有者（paused / draft Project の Job、done / park された Task の blocked 行）が
+  // 共有 workspace を握り、running Project の claim が止まっている。**通知だけ**する。
+  // 解消（Project の再開・放棄、既存 abort_task の観測による解放）は CEO の判断（lifecycle repair W5）。
+  'workspace_held_by_stalled_owner',
   // blocked は notify-only にしない。blocked reason を読んで sanctioned な復旧を選ばせる
   // （CEO 指示・2026-09-15）。executor が無い・判断不能なら fail-closed で Escalation へ倒れる。
   'job_blocked',
@@ -197,7 +198,7 @@ const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   'task_blocked_without_job',
   // quarantine も人の判断（観測と再受け入れ）だけが解く。1回だけ CEO へ届ける。
   'workspace_quarantined',
-  'workspace_held_by_inactive_project',
+  'workspace_held_by_stalled_owner',
   // blocked は workflow を止めているので早く見る。
   // **`ACTIONABLE_ATTENTION_KINDS` に入れてもここに無ければ永久に選ばれない**（selectTarget が
   // この順序を走査するため）。両方に入れること。
@@ -385,8 +386,8 @@ const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // 1回 escalate すれば `hasEscalated()` で以後は「CEO 判断待ち」として数えられ、
   // その Project 以外の採用を止めなくなる。解除条件そのものはここでは一切変えない。
   'workspace_quarantined',
-  // 停止中の Project が workspace を握っている。PL に Project を再開・放棄する権限は無い。
-  'workspace_held_by_inactive_project',
+  // 進まない所有者が workspace を握っている。PL には Project の再開・放棄も stale 行の解放もできない。
+  'workspace_held_by_stalled_owner',
 ]
 
 /**
@@ -1718,7 +1719,7 @@ async function handleTarget(
     diagnosis.rootCauseClass === 'protected_path'
     && item.taskId !== undefined
     && item.kind !== 'workspace_quarantined'
-    && item.kind !== 'workspace_held_by_inactive_project'
+    && item.kind !== 'workspace_held_by_stalled_owner'
   ) {
     const abort = requestTechnicalAbort(storage, {
       taskId: item.taskId,

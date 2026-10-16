@@ -62,6 +62,22 @@ function isWaitingOnLiveApproval(storage: IStorage, job: Job, nowMs: number): bo
 /** 停滞とみなす既定の閾値。Watchdog の閾値とは別で、こちらは「PL へ知らせるか」の目安。 */
 export const DEFAULT_STALL_HINT_MS = 5 * 60 * 1000
 
+/** `workspace_held_by_stalled_owner` の原因。detail 先頭に `cause=<値>` として載る。 */
+export type StalledOwnerCause = 'inactive_project' | 'done_task_blocked_row' | 'parked_task_blocked_row'
+
+/** CEO / PL が出口を読み取れるよう、原因ごとに観測事実と既存の解消経路だけを書く。 */
+const STALLED_OWNER_SUMMARY: Record<StalledOwnerCause, (job: Job, project: Project) => string> = {
+  inactive_project: (job, project) =>
+    `a ${job.status} job in the ${project.status} project holds the shared workspace; `
+    + 'the exit is resuming or archiving that project (archive refuses while it still owns work).',
+  done_task_blocked_row: () =>
+    'a blocked job left on a done task holds the shared workspace; the exit is the existing abort_task '
+    + 'stale-row release, which frees it once the Worker observes a clean worktree.',
+  parked_task_blocked_row: () =>
+    'a blocked job left on a parked task holds the shared workspace; the exit is the existing abort_task '
+    + 'cleanup (Worker observation) or resuming the task.',
+}
+
 export type AttentionKind =
   | 'job_blocked'
   /** 未完了 Task の最新 Job が failed で、後続が無い＝いま止まっている。履歴上の失敗は含めない。 */
@@ -85,14 +101,19 @@ export type AttentionKind =
   | 'task_blocked_without_job'
   | 'job_running_long'
   /**
-   * running でも archived でもない Project（paused / draft）の Job が単一の共有 workspace の
-   * 所有者であり、そのせいで running Project の queued Job を Worker も API も claim しない。
+   * 単一の共有 workspace の所有者（claim guard と同じ意味）が**自力では進まない**ため、running
+   * Project の queued Job を Worker も API も claim しない。detail 先頭の `cause=` が原因:
    *
-   * queued は「動かせる」扱いで他の attention が立たず、`task_ready_without_job` は running
-   * Project だけが対象なので、これが無いと PL は idle のまま誰にも知らせない（lifecycle repair W5）。
-   * 解消（その Project を再開する / 放棄する）は CEO の判断なので notify-only。
+   *   - `inactive_project` … paused / draft Project の Job が所有者
+   *   - `done_task_blocked_row` … done な Task に残った blocked 行（どの Project でも）
+   *   - `parked_task_blocked_row` … park された Task に残った blocked 行（どの Project でも）
+   *
+   * queued は「動かせる」扱い、done / park の blocked 行は他の attention から除外されているため、
+   * これが無いと claim が止まったまま PL は idle になり誰にも知らせない（lifecycle repair W5）。
+   * 解消は CEO の判断（Project の再開・放棄、または既存 abort_task の観測による stale 行の解放）なので
+   * notify-only。referenceId は所有者 Job の id で、所有者ごとに1回だけ escalate される。
    */
-  | 'workspace_held_by_inactive_project'
+  | 'workspace_held_by_stalled_owner'
 
 export interface AttentionItem {
   kind: AttentionKind
@@ -321,9 +342,9 @@ export function buildSystemState(
   // archived は観測対象から外す。履歴は既存の Project 単位エンドポイントで読める。
   const observed = allProjects.filter((project) => project.status !== 'archived')
 
-  // 共有 workspace を running 以外の Project が握っているか（`workspace_held_by_inactive_project`）。
-  const inactiveOwners: Array<{ project: Project; task: Task; job: Job }> = []
-  let runningProjectHasQueuedWork = false
+  // 共有 workspace を自力では進まない所有者が握っているか（`workspace_held_by_stalled_owner`）。
+  const stalledOwners: Array<{ project: Project; task: Task; job: Job; cause: StalledOwnerCause }> = []
+  const runningQueuedTaskIds = new Set<string>()
 
   for (const project of observed) {
     const tasks = storage.tasks.findByProjectId(project.id)
@@ -440,17 +461,21 @@ export function buildSystemState(
         : readJobsSupersededByHumanResume(storage, jobs)
 
       if (project.status === 'running' && jobs.some((job) => job.status === 'queued')) {
-        runningProjectHasQueuedWork = true
+        runningQueuedTaskIds.add(task.id)
       }
-      if (project.status !== 'running') {
+      {
         // 所有者の意味は claim guard（storage）と同じ: live な所有者か、Human Resume に superseded
         // されていない blocked 行。done な Task の行も含める（解放の証明は Worker の観測だけ）。
         const ownershipSuperseded = task.status === 'done' ? readJobsSupersededByHumanResume(storage, jobs) : superseded
-        const owner = jobs.find((job) => (
-          isLiveWorkspaceOwnerJob(task.id, job)
-          || (job.status === 'blocked' && !ownershipSuperseded.has(job.id))
-        ))
-        if (owner !== undefined) inactiveOwners.push({ project, task, job: owner })
+        const blockedOwner = jobs.find((job) => job.status === 'blocked' && !ownershipSuperseded.has(job.id))
+        if (project.status !== 'running') {
+          const owner = jobs.find((job) => isLiveWorkspaceOwnerJob(task.id, job)) ?? blockedOwner
+          if (owner !== undefined) stalledOwners.push({ project, task, job: owner, cause: 'inactive_project' })
+        } else if (blockedOwner !== undefined && task.status === 'done') {
+          stalledOwners.push({ project, task, job: blockedOwner, cause: 'done_task_blocked_row' })
+        } else if (blockedOwner !== undefined && parentIsParked) {
+          stalledOwners.push({ project, task, job: blockedOwner, cause: 'parked_task_blocked_row' })
+        }
       }
       const hasMovableJob = jobs.some((job) => (
         job.status === 'queued' || job.status === 'running'
@@ -647,23 +672,21 @@ export function buildSystemState(
     })
   }
 
-  // **running Project に queued の仕事があるときだけ**出す。pause は CEO の停止スイッチであり、
-  // 誰も待っていないのに「止めた Project が workspace を持っている」と鳴らすと pause のたびに誤報になる。
-  // 実際に止まっているのは「running Project の queued Job が claim されない」ときである。
-  if (runningProjectHasQueuedWork) {
-    for (const { project, task, job } of inactiveOwners) {
-      attention.push({
-        kind: 'workspace_held_by_inactive_project',
-        projectId: project.id,
-        projectName: project.name,
-        taskId: task.id,
-        jobId: job.id,
-        referenceId: job.id,
-        detail: `${job.status} job in a ${project.status} project holds the shared workspace; `
-          + 'queued work in the running project cannot be claimed',
-        stuckForMs: elapsedMs(job.completedAt ?? job.startedAt ?? job.createdAt, nowMs),
-      })
-    }
+  // **claim guard が実際に拒否する queued の仕事（running Project の、所有者とは別 Task）があるときだけ**
+  // 出す。pause は CEO の停止スイッチであり、誰も待っていないのに鳴らすと pause のたびに誤報になる。
+  for (const { project, task, job, cause } of stalledOwners) {
+    if (![...runningQueuedTaskIds].some((taskId) => taskId !== task.id)) continue
+    attention.push({
+      kind: 'workspace_held_by_stalled_owner',
+      projectId: project.id,
+      projectName: project.name,
+      taskId: task.id,
+      jobId: job.id,
+      referenceId: job.id,
+      detail: `cause=${cause}: ${STALLED_OWNER_SUMMARY[cause](job, project)} `
+        + 'Queued work in the running project cannot be claimed until this owner is resolved.',
+      stuckForMs: elapsedMs(job.completedAt ?? job.startedAt ?? job.createdAt, nowMs),
+    })
   }
 
   return {

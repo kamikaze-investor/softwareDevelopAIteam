@@ -102,7 +102,7 @@ const ATTENTION_KIND_LABEL: Record<string, string> = {
   task_ready_without_job: 'Job 未作成',
   task_blocked_without_job: 'Task 停止（Job なし）',
   job_running_long: '長時間実行中',
-  workspace_held_by_inactive_project: '停止中 Project が workspace を保持',
+  workspace_held_by_stalled_owner: '進まない所有者が workspace を保持',
 }
 
 export function attentionKindLabel(kind: string): string {

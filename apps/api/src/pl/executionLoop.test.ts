@@ -1214,7 +1214,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(escalations).toHaveLength(1)
   })
 
-  describe('workspace_held_by_inactive_project (W5)', () => {
+  describe('workspace_held_by_stalled_owner (W5)', () => {
     function seedHeldWorkspace(ownerStatus: 'running' | 'queued' | 'blocked'): {
       storage: IStorage
       ownerJobId: string
@@ -1252,10 +1252,11 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         const { storage, ownerJobId, pausedProjectId } = seedHeldWorkspace(ownerStatus)
 
         const held = buildSystemState(storage, { now: () => NOW }).attention
-          .filter((item) => item.kind === 'workspace_held_by_inactive_project')
+          .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
 
         expect(held).toHaveLength(1)
         expect(held[0]).toMatchObject({ projectId: pausedProjectId, jobId: ownerJobId, referenceId: ownerJobId })
+        expect(held[0]!.detail).toMatch(/^cause=inactive_project: /)
       },
     )
 
@@ -1267,7 +1268,68 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       }
 
       expect(buildSystemState(storage, { now: () => NOW }).attention
-        .some((item) => item.kind === 'workspace_held_by_inactive_project')).toBe(false)
+        .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+    })
+
+    it('a done-Task blocked row in the running Project + queued work elsewhere: cause=done_task_blocked_row, escalated exactly once', async () => {
+      const { storage, projectId, taskId } = seed()
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const doneTask = storage.tasks.create({
+        projectId, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      const staleRow = storage.jobs.create({
+        taskId: doneTask.id,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      const held = buildSystemState(storage, { now: () => NOW }).attention
+        .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
+      expect(held).toHaveLength(1)
+      expect(held[0]).toMatchObject({ projectId, taskId: doneTask.id, referenceId: staleRow.id })
+      expect(held[0]!.detail).toMatch(/^cause=done_task_blocked_row: /)
+      expect(held[0]!.detail).toContain('abort_task')
+
+      let diagnosed = 0
+      const escalations: string[] = []
+      const d = deps({
+        diagnose: async () => { diagnosed += 1; return '{}' },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      })
+      const first = await runPlTick(storage, d)
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, d)
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, d)
+
+      expect(first).toMatchObject({ status: 'escalated', target: { kind: 'workspace_held_by_stalled_owner', jobId: staleRow.id } })
+      expect(escalations).toHaveLength(1)
+      expect(diagnosed).toBe(0)
+    })
+
+    it('a done-Task blocked row is not reported while no running-Project queued work would be refused', () => {
+      const { storage, projectId } = seed()
+      const doneTask = storage.tasks.create({
+        projectId, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      storage.jobs.create({
+        taskId: doneTask.id, projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      expect(buildSystemState(storage, { now: () => NOW }).attention
+        .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
     })
 
     it('runPlTick escalates it to the CEO exactly once, without diagnosis', async () => {
@@ -1287,7 +1349,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
 
       expect(first).toMatchObject({
         status: 'escalated',
-        target: { kind: 'workspace_held_by_inactive_project', jobId: ownerJobId },
+        target: { kind: 'workspace_held_by_stalled_owner', jobId: ownerJobId },
       })
       expect(second.status).not.toBe('escalated')
       expect(escalations).toHaveLength(1)
