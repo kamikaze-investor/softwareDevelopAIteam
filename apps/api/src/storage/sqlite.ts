@@ -5210,17 +5210,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             approvalRequest: stale,
           }
         }
-        // D2 hardening: 承認を使うのは実行中（claim 済み）の Job だけ。queued / blocked / 終端の Job に
-        // 使い切らせない（EXPIRED / STALE への無効化は Job の状態に関係なく上で行う）。
-        if (job.status !== 'running') {
-          return {
-            ok: false,
-            code: 'JOB_NOT_RUNNING',
-            reason: `Cannot consume: Job is '${job.status}' (must be running)`,
-            approvalRequest: existing,
-          }
-        }
-
         // D2 hardening: 人が決めた記録（approval_actor = human）の無い APPROVED は authority ではない。
         // Task 操作の verifyAndConsumeTaskApproval と同じ処理（同じ transaction で SUPERSEDED + audit）。
         if (readApprovalActorClass(storage, input.id) !== 'human') {
@@ -5232,6 +5221,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             approvalRequest: approvalRequests.findById(input.id),
           }
         }
+        // D2 hardening: APPROVED → CONSUMED の遷移は実行中（claim 済み）の Job にだけ許す。queued / blocked /
+        // 終端の Job には使い切らせない（EXPIRED / STALE / SUPERSEDED への無効化は Job の状態に関係なく上で行う）。
+        if (job.status !== 'running') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_RUNNING',
+            reason: `Cannot consume: Job is '${job.status}' (must be running)`,
+            approvalRequest: existing,
+          }
+        }
+
         const consumed = db.prepare(`
           UPDATE approval_requests SET status = 'CONSUMED'
           WHERE id = ? AND status = 'APPROVED'
@@ -5309,18 +5309,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
         }
 
-        // D2 hardening: 承認を使うのは実行中（claim 済み）の Job だけ。queued / blocked / 終端の Job には
-        // 使い切らせない（STALE への無効化は Job の状態に関係なく上で行う）。
-        if (requestedJob.status !== 'running') {
-          return {
-            ok: false,
-            code: 'JOB_NOT_RUNNING',
-            reason: `Cannot consume: Job is '${requestedJob.status}' (must be running)`,
-            approvalRequest: existing,
-            linkedJobId: linkedJob.id,
-          }
-        }
-
         if (existing.status === 'CONSUMED') {
           return {
             ok: true,
@@ -5363,6 +5351,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             code: 'APPROVAL_ACTOR_NOT_HUMAN',
             reason: 'Approval request has no record that a human (ADMIN credential) decided it; it was superseded',
             approvalRequest: { ...existing, status: 'SUPERSEDED' },
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        // D2 hardening: APPROVED → CONSUMED の遷移は実行中（claim 済み）の Job にだけ許す。同じ Job による
+        // CONSUMED の再送（上の alreadyConsumed）は Job が running でなくても冪等な成功のまま。
+        // EXPIRED / STALE / SUPERSEDED への無効化も Job の状態に関係なく上で行う。
+        if (requestedJob.status !== 'running') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_RUNNING',
+            reason: `Cannot consume: Job is '${requestedJob.status}' (must be running)`,
+            approvalRequest: existing,
             linkedJobId: linkedJob.id,
           }
         }

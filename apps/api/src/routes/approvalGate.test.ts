@@ -3258,6 +3258,30 @@ describe('POST /api/approval-requests/:id/consume — D2 hardening', () => {
     })
   })
 
+  it.each(['success', 'failed'] as const)('git_commit: 同じ Job の CONSUMED 再送は Job が %s になっていても冪等な成功（running 要件は APPROVED → CONSUMED だけ）', async (laterStatus) => {
+    await withApp(async (app) => {
+      const { storage, job, approvalId } = await seed(app, `d2-replay-${laterStatus}`)
+      expect((await consume(app, approvalId, { jobId: job.id, ...match })).statusCode).toBe(200)
+      storage.jobs.update(job.id, { status: laterStatus })
+      expect(storage.jobs.findById(job.id)?.status).toBe(laterStatus)
+      const replay = await consume(app, approvalId, { jobId: job.id, ...match })
+      expect(replay.statusCode).toBe(200)
+      expect(replay.body).toMatchObject({ consumed: true, alreadyConsumed: true, jobId: job.id })
+      expect(storage.approvalRequests.findById(approvalId)?.status).toBe('CONSUMED')
+    })
+  })
+
+  it.each(['queued', 'blocked'] as const)('git_commit: running でない Job（%s）でも期限切れ・人の決定なしの無効化は行う（遷移は無効化側だけ）', async (jobStatus) => {
+    await withApp(async (app) => {
+      const expired = await seed(app, `d2-inv-exp-${jobStatus}`, { jobStatus, expiresAt: '2000-01-01T00:00:00.000Z' })
+      expect((await consume(app, expired.approvalId, { jobId: expired.job.id, ...match })).statusCode).toBe(409)
+      expect(expired.storage.approvalRequests.findById(expired.approvalId)?.status).toBe('EXPIRED')
+      const nonHuman = await seed(app, `d2-inv-actor-${jobStatus}`, { jobStatus, actor: 'none' })
+      expect((await consume(app, nonHuman.approvalId, { jobId: nonHuman.job.id, ...match })).statusCode).toBe(409)
+      expect(nonHuman.storage.approvalRequests.findById(nonHuman.approvalId)?.status).toBe('SUPERSEDED')
+    })
+  })
+
   it('非 git_commit: 二重 consume は 2 回目が 409（一回限り）', async () => {
     await withApp(async (app) => {
       const { job, approvalId } = await seed(app, 'd2-double-cmd', { action: 'test' })
