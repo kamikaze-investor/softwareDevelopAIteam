@@ -1391,6 +1391,13 @@ async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration)
           ? {
               preCleanupObservation: observed.observation,
               cleanupSummary,
+              // この証拠がどの cleanup generation のものか。API は carrier の現在の marker と一致しない
+              // 報告（取り消し後に新しい generation が出た後の古い証拠の再送）を GENERATION_MISMATCH で拒否する。
+              cleanupGeneration: {
+                abortCleanupRequestedAt: requested.failureMetadata?.abortCleanupRequestedAt,
+                abortTechnicalEvidenceId: technicalEvidenceId,
+                abortTechnicalStateFingerprint: requested.failureMetadata?.abortTechnicalStateFingerprint,
+              },
             }
           : {}),
       })

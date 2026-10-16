@@ -10,6 +10,7 @@
 import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, OperatorRequestPlAction, OperatorRequestRequesterClass, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type {
   AbortAuthorization,
+  TechnicalAbortCleanupGeneration,
   TechnicalAbortCleanupSummary,
 } from '../pl/technicalAbortEvidence'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
@@ -568,6 +569,8 @@ export interface IJobStorage {
     preCleanupObservation?: JobWorkspaceBaseline
     /** technical audit に残す counts-only summary。 */
     cleanupSummary?: TechnicalAbortCleanupSummary
+    /** technical cleanup で必須: 報告が名指す generation（carrier の現在の marker と一致を要求する）。 */
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
   }): ReleaseBlockedJobAndParkTaskResult
   /**
    * 通常は全 Job が既に terminal な blocked Task を abort_task で park する最終段。
@@ -593,6 +596,7 @@ export interface IJobStorage {
     authorization: AbortAuthorization
     preCleanupObservation?: JobWorkspaceBaseline
     cleanupSummary?: TechnicalAbortCleanupSummary
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
   }): ReleaseBlockedJobAndParkTaskResult
   clearWorkspaceQuarantine(input: {
     jobId: string
@@ -630,6 +634,8 @@ export type ReleaseBlockedJobAndParkTaskResult =
       | 'CLEANUP_SUPERSEDED'
       /** 別 connection の write と lock 競合した（再試行可能。何も変えていない）。 */
       | 'STORAGE_BUSY'
+      /** 報告の technical cleanup generation が carrier の現在の marker と違う（何も変えていない）。 */
+      | 'GENERATION_MISMATCH'
     reason: string
   }
 

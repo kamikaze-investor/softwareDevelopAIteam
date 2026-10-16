@@ -532,8 +532,29 @@ describe('dirty Technical Abort cleanup — identical resubmission after a retry
       observation: cleanEnd,
       preCleanupObservation: dirtyEnd,
       cleanupSummary: { changedPathCount: 1 },
+      // 証拠がどの cleanup generation のものかを名指す（API が現在の marker と照合する）。
+      cleanupGeneration: {
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+        abortTechnicalStateFingerprint: 'fp-1',
+      },
     })
     // refusal（quarantine につながる）は一度も送らない。
+    expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
+  })
+
+  it('a resubmission refused as GENERATION_MISMATCH is definitive: the entry is cleared and not resent', async () => {
+    const mismatch = (): Response =>
+      new Response(JSON.stringify({ error: 'mismatch', code: 'GENERATION_MISMATCH' }), { status: 409 })
+    const { reports } = arrange([busy, mismatch])
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-dirty'])
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+    expect(reports()).toHaveLength(2)
+    expect(reports()[1]).toBe(reports()[0])
     expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
   })
 

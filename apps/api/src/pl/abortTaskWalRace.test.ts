@@ -101,9 +101,20 @@ function seedPendingTechnicalAbort(
   return { taskId: task.id, carrierId: carrier.id }
 }
 
+/** Worker と同じく、報告する時点の carrier の marker から cleanup generation を名指す。 */
+function generationOf(storage: IStorage, carrierId: string) {
+  const metadata = storage.jobs.findById(carrierId)?.failureMetadata
+  return {
+    abortCleanupRequestedAt: metadata?.abortCleanupRequestedAt ?? '',
+    abortTechnicalEvidenceId: metadata?.abortTechnicalEvidenceId ?? '',
+    abortTechnicalStateFingerprint: metadata?.abortTechnicalStateFingerprint ?? '',
+  }
+}
+
 function finish(storage: IStorage, carrierId: string): ReturnType<typeof completeAbortCleanup> {
   return completeAbortCleanup(storage, {
     jobId: carrierId,
+    cleanupGeneration: generationOf(storage, carrierId),
     preCleanupObservation: BASELINE,
     observation: BASELINE,
     knownGood: KNOWN_GOOD,
@@ -122,8 +133,12 @@ const DIRTY_REPORT = {
   cleanupSummary: { changedPathCount: 1, restoredPathCount: 1, removedPathCount: 0 },
 }
 
-function finishDirty(storage: IStorage, carrierId: string): ReturnType<typeof completeAbortCleanup> {
-  return completeAbortCleanup(storage, { jobId: carrierId, ...DIRTY_REPORT })
+function finishDirty(
+  storage: IStorage,
+  carrierId: string,
+  generation: ReturnType<typeof generationOf>,
+): ReturnType<typeof completeAbortCleanup> {
+  return completeAbortCleanup(storage, { jobId: carrierId, ...DIRTY_REPORT, cleanupGeneration: generation })
 }
 
 function holdWriteLock(dbPath: string, write: (db: Database.Database) => void): Database.Database {
@@ -203,6 +218,8 @@ describe('dirty Technical Abort cleanup: STORAGE_BUSY, then the identical report
     const dbPath = tempDbPath()
     const storage = createSQLiteStorage(dbPath)
     const { taskId, carrierId } = seedPendingTechnicalAbort(storage, { dirty: true })
+    // Worker は最初の報告の generation を証拠と一緒に保持し、再送でもそのまま名指す。
+    const generation = generationOf(storage, carrierId)
     const metadataBefore = storage.jobs.findById(carrierId)?.failureMetadata
 
     const other = holdWriteLock(dbPath, (db) => {
@@ -211,14 +228,14 @@ describe('dirty Technical Abort cleanup: STORAGE_BUSY, then the identical report
         + "VALUES (?, 'api', 'unrelated', 'project', 'p', 'success', '', ?)",
       ).run(randomUUID(), new Date().toISOString())
     })
-    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: false, code: 'STORAGE_BUSY' })
+    expect(finishDirty(storage, carrierId, generation)).toMatchObject({ ok: false, code: 'STORAGE_BUSY' })
     // 何も変えていない: 永続化済みの dirty fingerprint と cleanup generation はそのまま。
     expect(storage.jobs.findById(carrierId)?.failureMetadata).toEqual(metadataBefore)
     other.exec('COMMIT')
     other.close()
 
     // Worker は観測し直さず、同じ証拠を再送する。
-    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: true })
+    expect(finishDirty(storage, carrierId, generation)).toMatchObject({ ok: true })
     expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(false)
     expect(storage.jobs.findById(carrierId)?.failureMetadata?.quarantined).toBeUndefined()
   }, 30_000)
@@ -227,6 +244,8 @@ describe('dirty Technical Abort cleanup: STORAGE_BUSY, then the identical report
     const dbPath = tempDbPath()
     const storage = createSQLiteStorage(dbPath)
     const { taskId, carrierId } = seedPendingTechnicalAbort(storage, { dirty: true })
+    // Worker は最初の報告の generation を証拠と一緒に保持し、再送でもそのまま名指す。
+    const generation = generationOf(storage, carrierId)
 
     const approvalId = `approval-${randomUUID()}`
     const other = holdWriteLock(dbPath, (db) => {
@@ -237,11 +256,11 @@ describe('dirty Technical Abort cleanup: STORAGE_BUSY, then the identical report
         VALUES (?, ?, 'b', 'c', 'd', 'HIGH', 'repair_from_stored_review:r', 'WAITING_FOR_USER', ?, '[]', '[]', '[]', ?)
       `).run(approvalId, taskId, FUTURE(), new Date().toISOString())
     })
-    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: false, code: 'STORAGE_BUSY' })
+    expect(finishDirty(storage, carrierId, generation)).toMatchObject({ ok: false, code: 'STORAGE_BUSY' })
     other.exec('COMMIT')
     other.close()
 
-    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    expect(finishDirty(storage, carrierId, generation)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
     const carrier = storage.jobs.findById(carrierId)
     expect(carrier?.failureMetadata?.quarantined).toBeUndefined()
     expect(carrier?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()

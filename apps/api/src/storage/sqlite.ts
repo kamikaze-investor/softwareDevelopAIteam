@@ -39,7 +39,11 @@ import {
   resolveReviewedImplementationFrom,
   retryStepKeyFor,
 } from '../designReview/repairPolicy'
-import { hasTechnicalAbortMetadata, technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
+import {
+  hasTechnicalAbortMetadata,
+  technicalAbortStateFingerprint,
+  technicalCleanupGenerationMatches,
+} from '../pl/technicalAbortEvidence'
 import type {
   AbortAuthorization,
   TechnicalAbortCleanupSummary,
@@ -3108,6 +3112,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
           if (
+            input.authorization.kind === 'technical_evidence'
+            && !technicalCleanupGenerationMatches(job.failureMetadata, input.cleanupGeneration)
+          ) {
+            // 報告が名指す cleanup generation が carrier の現在の marker と違う（取り消し後に新しい
+            // technical request が出た後の古い証拠の再送など）。cleanup の失敗ではないので quarantine せず、
+            // 何も変えずに typed で返す。現在の generation はそのまま残る。
+            return {
+              ok: false as const,
+              code: 'GENERATION_MISMATCH' as const,
+              reason: `job ${job.id}'s report names a different technical cleanup generation`,
+            }
+          }
+          if (
             !job.failureMetadata?.abortCleanupRequestedAt
             || (input.authorization.kind === 'manual_approval'
               ? job.failureMetadata.abortApprovalRequestId !== input.authorization.approvalRequestId
@@ -3418,6 +3435,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
               reason: `job ${job.id} does not belong to task ${task.id}`,
+            }
+          }
+          if (
+            input.authorization.kind === 'technical_evidence'
+            && !technicalCleanupGenerationMatches(job.failureMetadata, input.cleanupGeneration)
+          ) {
+            // 報告が名指す cleanup generation が carrier の現在の marker と違う（取り消し後に新しい
+            // technical request が出た後の古い証拠の再送など）。cleanup の失敗ではないので quarantine せず、
+            // 何も変えずに typed で返す。現在の generation はそのまま残る。
+            return {
+              ok: false as const,
+              code: 'GENERATION_MISMATCH' as const,
+              reason: `job ${job.id}'s report names a different technical cleanup generation`,
             }
           }
           if (

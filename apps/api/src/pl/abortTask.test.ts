@@ -123,12 +123,23 @@ function requestTechnical(fx: ReturnType<typeof seedTechnicalAbort>): void {
   }
 }
 
+/** Worker と同じく、報告する時点の carrier の marker から cleanup generation を名指す。 */
+function currentCleanupGeneration(storage: IStorage, jobId: string) {
+  const metadata = storage.jobs.findById(jobId)?.failureMetadata
+  return {
+    abortCleanupRequestedAt: metadata?.abortCleanupRequestedAt ?? '',
+    abortTechnicalEvidenceId: metadata?.abortTechnicalEvidenceId ?? '',
+    abortTechnicalStateFingerprint: metadata?.abortTechnicalStateFingerprint ?? '',
+  }
+}
+
 function finishTechnical(
   fx: ReturnType<typeof seedTechnicalAbort>,
   input: Partial<Parameters<typeof completeAbortCleanup>[1]> = {},
 ): ReturnType<typeof completeAbortCleanup> {
   return completeAbortCleanup(fx.storage, {
     jobId: fx.latestJobId,
+    cleanupGeneration: currentCleanupGeneration(fx.storage, fx.latestJobId),
     preCleanupObservation: BASELINE,
     observation: BASELINE,
     knownGood: KNOWN_GOOD,
@@ -1482,6 +1493,64 @@ describe('P2-2 Automatic Technical Abort', () => {
     expect(fx.storage.jobs.findById(repair.id)?.status).toBe('queued')
     expect(fx.storage.jobs.findByTaskId(fx.taskId)
       .some((job) => job.failureMetadata?.quarantined === true)).toBe(false)
+  })
+
+  // Codex review / PL 2026-10-16: 取り消された generation の証拠を、同じ carrier の新しい generation として受理しない。
+  it('after a cancelled generation and a fresh technical request, a resend of the old evidence is GENERATION_MISMATCH', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const oldGeneration = currentCleanupGeneration(fx.storage, fx.latestJobId)
+    const late = lateRequest(fx, 'WAITING_FOR_USER')
+    // 人の判断で generation 1 を取り消す。
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    // その判断は却下され、同じ carrier に新しい technical request（generation 2）が出る。
+    fx.storage.approvalRequests.updateStatus(late, 'REJECTED')
+    requestTechnical(fx)
+    const newGeneration = currentCleanupGeneration(fx.storage, fx.latestJobId)
+    expect(newGeneration.abortTechnicalEvidenceId).not.toBe(oldGeneration.abortTechnicalEvidenceId)
+
+    // Worker が generation 1 の証拠を再送する。
+    expect(finishTechnical(fx, { cleanupGeneration: oldGeneration }))
+      .toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    expectNotParkedNorQuarantined(fx)
+    expect(currentCleanupGeneration(fx.storage, fx.latestJobId)).toEqual(newGeneration)
+    // generation を名指さない technical 報告も受理しない。
+    expect(finishTechnical(fx, { cleanupGeneration: undefined }))
+      .toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    expectNotParkedNorQuarantined(fx)
+
+    // 現在の generation を名指す報告は受理する。
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+  })
+
+  it('the storage final transaction re-checks the generation (GENERATION_MISMATCH, no change)', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const metadataBefore = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    const current = currentCleanupGeneration(fx.storage, fx.latestJobId)
+
+    const result = fx.storage.jobs.parkBlockedTaskWithTerminalJobs({
+      jobId: fx.latestJobId,
+      taskId: fx.taskId,
+      observation: BASELINE,
+      knownGood: KNOWN_GOOD,
+      reason: 'r',
+      authorization: {
+        kind: 'technical_evidence',
+        evidenceId: current.abortTechnicalEvidenceId,
+        stateFingerprint: current.abortTechnicalStateFingerprint,
+        rootCauseClass: 'protected_path',
+        attentionKind: metadataBefore?.abortTechnicalAttentionKind as never,
+      },
+      preCleanupObservation: BASELINE,
+      cleanupSummary: { changedPathCount: 0, restoredPathCount: 0, removedPathCount: 0 },
+      cleanupGeneration: { ...current, abortCleanupRequestedAt: '2000-01-01T00:00:00.000Z' },
+    })
+
+    expect(result).toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual(metadataBefore)
+    expectNotParkedNorQuarantined(fx)
   })
 
   it('an expired APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {

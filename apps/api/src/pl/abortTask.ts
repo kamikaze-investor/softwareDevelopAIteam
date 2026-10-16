@@ -68,7 +68,9 @@ import {
   recordTechnicalAbortEvidence,
   recordTechnicalAbortRefusal,
   technicalAbortStateFingerprint,
+  technicalCleanupGenerationMatches,
   type AbortAuthorization,
+  type TechnicalAbortCleanupGeneration,
   type TechnicalAbortCleanupSummary,
 } from './technicalAbortEvidence'
 
@@ -400,6 +402,7 @@ export type CompleteAbortCleanupResult =
       | 'HUMAN_DECISION_CONFLICT'
       | 'CLEANUP_SUPERSEDED'
       | 'STORAGE_BUSY'
+      | 'GENERATION_MISMATCH'
     reason: string
   }
 
@@ -468,6 +471,8 @@ export function completeAbortCleanup(
     /** technical cleanup が deletion 前に観測した exact dirty/clean baseline。 */
     preCleanupObservation?: JobWorkspaceBaseline
     cleanupSummary?: TechnicalAbortCleanupSummary
+    /** technical cleanup の報告で必須: 報告が名指す cleanup generation。 */
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
     /** Worker が cleanup 前に拒否した場合。API は refusal audit だけを残し、状態を変えない。 */
     refusalCode?: string
   },
@@ -544,6 +549,20 @@ export function completeAbortCleanup(
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'final workspace observation is missing' }
   }
 
+  // 古い generation の証拠（取り消し後に同じ carrier へ新しい technical request が出た後の再送など）は
+  // 現在の generation として受理しない。cleanup の失敗ではないので quarantine も refusal 記録もせず、
+  // 現在の generation はそのまま残す。storage の transaction でも同じ一致を再確認する。
+  if (
+    authorization.kind === 'technical_evidence'
+    && !technicalCleanupGenerationMatches(metadata, input.cleanupGeneration)
+  ) {
+    return {
+      ok: false,
+      code: 'GENERATION_MISMATCH',
+      reason: `job ${input.jobId}'s report names a different technical cleanup generation`,
+    }
+  }
+
   // taskId は Job から導くが、**承認がその Task に束縛されているか**は
   // storage の status 別 release transaction が検証する。ここでは承認の正当性を決めない。
   const task = storage.tasks.findById(job.taskId)
@@ -558,11 +577,16 @@ export function completeAbortCleanup(
       ? { preCleanupObservation: input.preCleanupObservation }
       : {}),
     ...(input.cleanupSummary !== undefined ? { cleanupSummary: input.cleanupSummary } : {}),
+    ...(input.cleanupGeneration !== undefined ? { cleanupGeneration: input.cleanupGeneration } : {}),
   }
   const released = task?.status === 'blocked'
     ? storage.jobs.parkBlockedTaskWithTerminalJobs(releaseInput)
     : storage.jobs.releaseBlockedJobAndParkTask(releaseInput)
   if (!released.ok) {
+    if (released.code === 'GENERATION_MISMATCH') {
+      // transaction 内で generation が変わっていた。何も変えていない（quarantine しない）。
+      return { ok: false, code: 'GENERATION_MISMATCH', reason: released.reason }
+    }
     if (released.code === 'STORAGE_BUSY') {
       // 別 connection の write（人の承認・後続 Job など）と lock 競合しただけで、transaction は何も変えていない。
       // 再試行可能なので cleanup generation はそのまま残し、quarantine も refusal 記録もしない

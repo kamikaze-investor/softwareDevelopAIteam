@@ -35,6 +35,31 @@ export interface TechnicalAbortCleanupSummary {
   removedPathCount: number
 }
 
+/**
+ * Worker の cleanup 報告が名指す technical cleanup generation（carrier の marker 3つ）。
+ * technical cleanup の報告では必須: 取り消し後に同じ carrier へ新しい technical request が出たとき、
+ * 古い generation の証拠の再送を新しい generation として受理しないため。
+ * Production の deploy は API と Worker を同時に止めて入れ替えるので、旧 Worker が field 無しで
+ * 送る移行期間は無い（field 無しの technical 報告は GENERATION_MISMATCH で拒否する）。
+ */
+export interface TechnicalAbortCleanupGeneration {
+  abortCleanupRequestedAt: string
+  abortTechnicalEvidenceId: string
+  abortTechnicalStateFingerprint: string
+}
+
+/** 報告の generation が carrier の現在の technical cleanup marker と完全に一致するか。 */
+export function technicalCleanupGenerationMatches(
+  metadata: Job['failureMetadata'],
+  generation: TechnicalAbortCleanupGeneration | undefined,
+): boolean {
+  return generation !== undefined
+    && metadata?.abortCleanupRequestedAt !== undefined
+    && metadata.abortCleanupRequestedAt === generation.abortCleanupRequestedAt
+    && metadata.abortTechnicalEvidenceId === generation.abortTechnicalEvidenceId
+    && metadata.abortTechnicalStateFingerprint === generation.abortTechnicalStateFingerprint
+}
+
 export interface TechnicalAbortSuppressionSnapshot {
   version: 1
   evidenceId: string
