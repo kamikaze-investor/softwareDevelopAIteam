@@ -1566,6 +1566,11 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
     if (!resumed.ok && resumed.code === 'RESUME_COMMIT_FAILED') {
       return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
     }
+    // 生きた人の判断（APPROVED / WAITING の abort_task 等）がある。PL はそれを上書きしない。
+    // 正当な人の判断待ちなので試行を消費せず（idle）、escalation も起こさない。
+    if (!resumed.ok && resumed.code === 'HUMAN_DECISION_PENDING') {
+      return { ok: false, pending: true, summary: `resume waiting for a human decision: ${resumed.reason}` }
+    }
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }

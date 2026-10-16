@@ -1208,19 +1208,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * command kind の承認は commit / diff / Job に束縛済みで、この問題を持たない。
    * `REJECTED` / `CONSUMED` / `STALE` / `EXPIRED` / `SUPERSEDED` は変えない。reason / reviewed_at も書かない。
    */
+  /** 規則は1箇所: command kind（`git_commit` を含む）でない requestedAction が Task 単位の判断である。 */
+  function activeTaskScopedDecisions(
+    taskId: string,
+  ): Array<{ id: string; status: ApprovalGateStatus; expiresAt: string }> {
+    const commandKinds = new Set<string>(Object.keys(COMMAND_ZONES))
+    return (db.prepare(`
+      SELECT id, status, expires_at, requested_action FROM approval_requests
+      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+      ORDER BY created_at ASC, rowid ASC
+    `).all(taskId) as Array<{ id: string; status: ApprovalGateStatus; expires_at: string; requested_action: string }>)
+      .filter((row) => !commandKinds.has(row.requested_action))
+      .map((row) => ({ id: row.id, status: row.status, expiresAt: row.expires_at }))
+  }
+
   function supersedeTaskScopedDecisions(
     taskId: string,
     reason: 'superseded_by_resume' | 'superseded_by_recover',
     successorDetail: string,
   ): string[] {
-    const commandKinds = new Set<string>(Object.keys(COMMAND_ZONES))
-    const ids = (db.prepare(`
-      SELECT id, requested_action FROM approval_requests
-      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
-      ORDER BY created_at ASC, rowid ASC
-    `).all(taskId) as Array<{ id: string; requested_action: string }>)
-      .filter((row) => !commandKinds.has(row.requested_action))
-      .map((row) => row.id)
+    const ids = activeTaskScopedDecisions(taskId).map((row) => row.id)
     const supersede = db.prepare(`
       UPDATE approval_requests SET status = 'SUPERSEDED'
       WHERE id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
@@ -3075,6 +3082,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         if (!latestJob) {
           return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
+        }
+        // **人の判断が生きている間、人でない resume（PL / AI / 主体不明）は再開しない**（C-03 の残り）。
+        // 人の resume は新しい人の判断として古い Task 単位の判断を置き換える（completeResumeHandoff）。
+        // 人でない resume がそれを置き換えれば AI が CEO の判断を取り消せてしまい、置き換えずに再開すれば
+        // 古い APPROVED abort が再開後の作業を後から park する。どちらも避け、正当な人の判断待ちとして返す。
+        // 期限の読み方は shared の遅延判定（期限切れ行は誰の判断でもない）。
+        if (resumedBy?.actorClass !== 'human') {
+          const nowMs = Date.parse(now())
+          const pending = activeTaskScopedDecisions(taskId).find((row) =>
+            isLiveApprovedApproval(row, nowMs) || isLiveWaitingApproval(row, nowMs))
+          if (pending !== undefined) {
+            return {
+              ok: false,
+              code: 'HUMAN_DECISION_PENDING',
+              reason: `Task has a live ${pending.status} task-scoped decision (${pending.id}); only a human resume supersedes it`,
+            }
+          }
         }
         const isJobDirectlyBlocked = latestJob.status === 'blocked'
 

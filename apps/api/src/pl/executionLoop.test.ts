@@ -2412,6 +2412,32 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(readResumeActorClasses(storage, storage.jobs.findByTaskId(taskId)).get(resumeJob!.id)).toBe('pl')
   })
 
+  // C-03 の残り: 生きた人の判断（APPROVED abort_task）がある Task を PL は resume しない。
+  // 人の判断を上書きせず、正当な人の判断待ちとして idle（試行を消費しない・escalation しない）。
+  it('a live APPROVED abort_task makes the PL resume wait for the human: refused, not superseded, no attempt', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    const abortApproval = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    const escalations: string[] = []
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      coordinatorDeps: alignedCoordinatorDeps,
+    }))
+
+    expect(result.status).toBe('idle')
+    expect(result.reason).toContain('waiting for a human decision')
+    expect(escalations).toEqual([])
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
+    expect(storage.approvalRequests.findById(abortApproval.id)?.status).toBe('APPROVED')
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+  })
+
   // **判定が出ていない resume の Design Review は否定ではない**（独立レビュー round 5・2026-10-16）。
   // 試行を消費せず attention を残し、次の tick で同じ instruction を再送すると active-run dedup で
   // **同じ run** が再開され、ALIGNED なら resume Job が1回だけ作られる。

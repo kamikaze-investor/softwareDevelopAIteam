@@ -606,6 +606,7 @@ export async function taskRoutes(
         resumed.code === 'WORKSPACE_QUARANTINED'
         || resumed.code === 'TASK_DONE'
         || resumed.code === 'PROJECT_NOT_RUNNING'
+        || resumed.code === 'HUMAN_DECISION_PENDING'
       ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }

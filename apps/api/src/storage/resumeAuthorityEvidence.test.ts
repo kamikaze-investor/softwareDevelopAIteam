@@ -7,6 +7,7 @@ import { resumeActorClassFromAudit, RESUME_ACTOR_OPERATION } from '../designRevi
 /**
  * G-01: authority を変える遷移と、その authority evidence は一緒に commit する。
  * C-03: 新しい人の判断（Human Resume / Human Recovery）は、その Task の古い Task 単位の判断を置き換える。
+ * 人でない resume は、生きた Task 単位の人の判断がある間は再開しない（HUMAN_DECISION_PENDING）。
  */
 
 const HOUR = 60 * 60 * 1000
@@ -112,15 +113,50 @@ describe('Task 単位の承認は新しい人の判断で置き換わる（C-03�
     }).ok).toBe(false)
   })
 
-  it('PL の resume は人の判断（APPROVED abort_task）を置き換えない', () => {
+  it('PL の resume は生きた人の判断（APPROVED abort_task）を置き換えず、HUMAN_DECISION_PENDING で再開しない', () => {
     const storage = createSQLiteStorage(':memory:')
     const seeded = seedBlockedTask(storage)
     const abortApproval = taskApproval(storage, seeded.taskId, 'abort_task')
+    const jobsBefore = storage.jobs.findByTaskId(seeded.taskId).map((job) => job.id)
+
+    const refused = storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: PL })
+
+    expect(refused).toMatchObject({ ok: false, code: 'HUMAN_DECISION_PENDING' })
+    expect(storage.approvalRequests.findById(abortApproval)?.status).toBe('APPROVED')
+    expect(storage.jobs.findByTaskId(seeded.taskId).map((job) => job.id)).toEqual(jobsBefore)
+    expect(storage.jobs.findById(seeded.jobId)?.status).toBe('blocked')
+
+    // 続いて人が resume すれば、abort は置き換えられて resume が進む。
+    const resumed = storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: HUMAN })
+    expect(resumed.ok).toBe(true)
+    expect(storage.approvalRequests.findById(abortApproval)?.status).toBe('SUPERSEDED')
+  })
+
+  it('主体不明（resumedBy なし）の resume も、生きた Task 単位の APPROVED がある間は再開しない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const seeded = seedBlockedTask(storage)
+    // live WAITING は resume admission（APPROVAL_WAITING）が先に断るので、ここでは APPROVED で確かめる。
+    taskApproval(storage, seeded.taskId, 'repair_from_stored_review:review-1')
+
+    expect(storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume' }))
+      .toMatchObject({ ok: false, code: 'HUMAN_DECISION_PENDING' })
+  })
+
+  it('期限切れの APPROVED や command kind の承認は PL の resume を止めない', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const seeded = seedBlockedTask(storage)
+    const expired = storage.approvalRequests.create({
+      taskId: seeded.taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+      expiresAt: new Date(Date.now() - HOUR).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+    const command = taskApproval(storage, seeded.taskId, 'git_revert')
 
     const resumed = storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: PL })
 
     expect(resumed.ok).toBe(true)
-    expect(storage.approvalRequests.findById(abortApproval)?.status).toBe('APPROVED')
+    expect(storage.approvalRequests.findById(expired)?.status).toBe('APPROVED')
+    expect(storage.approvalRequests.findById(command)?.status).toBe('APPROVED')
   })
 
   it('command kind の承認（git_commit 以外も含む）には触れない', () => {

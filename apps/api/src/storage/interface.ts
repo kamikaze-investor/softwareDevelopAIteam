@@ -57,6 +57,11 @@ export type ResumeBlockedTaskResult =
          * transaction ごと rollback 済みで何も変わっていないので、同じ resume を再試行してよい。
          */
         | 'RESUME_COMMIT_FAILED'
+        /**
+         * 人でない resume（PL / AI / 主体不明）を、Task に生きた Task 単位の人の判断（未期限の APPROVED /
+         * WAITING の abort_task 等）がある間は行わない。否定ではなく正当な人の判断待ち。
+         */
+        | 'HUMAN_DECISION_PENDING'
       reason: string
     }
 

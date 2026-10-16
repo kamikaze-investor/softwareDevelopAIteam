@@ -2333,9 +2333,12 @@ describe('abortTask — terminal blocked Task の storage release', () => {
         jobIds: [fx.jobId],
       })
 
+      // 生きた APPROVED abort_task がある間、人でない resume は HUMAN_DECISION_PENDING で断られる
+      // （C-03）。後続 Job を作れるのは Human Resume だけで、それは abort 承認を SUPERSEDED にする。
       const resumed = fx.storage.jobs.resumeBlockedTask({
         taskId: fx.taskId,
         instructionPrompt: 'resume after cleanup observation was refused',
+        resumedBy: { actorClass: 'human', evidence: 'admin_credential' },
       })
       if (!resumed.ok) throw new Error(resumed.reason)
       expect(resumed.ok).toBe(true)
@@ -2350,7 +2353,11 @@ describe('abortTask — terminal blocked Task の storage release', () => {
       expect(result).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
       if (result.ok) throw new Error('expected stale cleanup refusal')
       expect(result.reason).toContain(`is not task ${fx.taskId}'s latest job (${resumed.job.id})`)
-      expectStillBlocked({ ...fx, latestJobId: resumed.job.id }, approvalRequestId)
+      expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+      // consume されず、Human Resume によって置き換えられている。
+      expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('SUPERSEDED')
+      expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+        .filter((entry) => entry.operation === 'task_aborted')).toHaveLength(0)
     },
   )
 
