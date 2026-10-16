@@ -172,6 +172,15 @@ const TASK_LIFECYCLE_STATE_OWNED_REFUSAL = {
   code: 'TASK_LIFECYCLE_STATE_OWNED',
 } as const
 
+/** blocked からの汎用経路での復帰を断る応答（code・文言は従来のまま）。 */
+const TASK_BLOCKED_USE_RECOVERY_ROUTE_REFUSAL = {
+  error:
+    'A blocked task cannot be moved out of blocked through this generic route. '
+    + 'Use POST /api/tasks/:id/recover (no job) or POST /api/tasks/:id/resume (has jobs), '
+    + 'which audit the human reason and report what will drive the task next',
+  code: 'TASK_BLOCKED_USE_RECOVERY_ROUTE',
+} as const
+
 const ListQuerySchema = z.object({
   projectId: z.string().min(1),
 })
@@ -815,16 +824,12 @@ export async function taskRoutes(
     // 既存 audit 行の id を使う）。Job を持つ Task は従来どおり `/resume` の担当である。
     //
     // 制限するのは blocked から**出る**方向だけで、他の status 遷移は従来どおりである。
-    if (result.data.status !== undefined && result.data.status !== 'blocked') {
+    // `pending` への PATCH はこの事前読みを使わず、下の transaction が最新の status で同じ code を返す
+    // （/recover が直前に pending へ戻した Task に古い 409 を返して編集を落とさない。Codex review 348c22a）。
+    if (result.data.status !== undefined && result.data.status !== 'blocked' && result.data.status !== 'pending') {
       const current = storage.tasks.findById(req.params.id)
       if (current?.status === 'blocked') {
-        return reply.status(409).send({
-          error:
-            'A blocked task cannot be moved out of blocked through this generic route. '
-            + 'Use POST /api/tasks/:id/recover (no job) or POST /api/tasks/:id/resume (has jobs), '
-            + 'which audit the human reason and report what will drive the task next',
-          code: 'TASK_BLOCKED_USE_RECOVERY_ROUTE',
-        })
+        return reply.status(409).send(TASK_BLOCKED_USE_RECOVERY_ROUTE_REFUSAL)
       }
     }
 
@@ -837,19 +842,28 @@ export async function taskRoutes(
     // 読んだ status で経路を選ぶと、その後に driver 付きの in_progress になった Task や done になった Task へ
     // pending を直接書けてしまう。判定は transaction 内で読み直した最新の status だけで行う:
     //   - pending → 遷移ではないので通す（他の欄の編集は従来どおり）
-    //   - in_progress / review → park されておらず stranded のときだけ通す
-    //   - それ以外（done / blocked 等）→ 断る（完了の取り消しや blocked からの復帰はこの経路の担当ではない）
+    //   - blocked → 409 TASK_BLOCKED_USE_RECOVERY_ROUTE（/recover・/resume の担当。上の事前読みと同じ code）
+    //   - in_progress / review → stranded のときだけ通す。**park 済みでも通す**: park 状態は task_aborted
+    //     audit から推定され status に DB 制約は無いので、park された in_progress / review の legacy 行があり得る。
+    //     abort / resume / recover はどれも park された Task を断るので、ここも断ると Project を占有したまま
+    //     出口が無い。park の audit と roadmapActive=false はそのまま残す（Codex review 348c22a）。
+    //   - それ以外（done 等）→ 断る（完了の取り消しはこの経路の担当ではない）
     if (result.data.status === 'pending') {
+      let latestWasBlocked = false
       const released = storage.tasks.updateIfAdmitted(req.params.id, result.data, (latest) => {
         if (latest.status === 'pending') return undefined
-        if (LIFECYCLE_OWNED_TASK_STATUSES.has(latest.status) && latest.status !== 'blocked') {
-          if (storage.tasks.isParked(latest.id)) return 'task was parked by abort_task'
+        if (latest.status === 'blocked') {
+          latestWasBlocked = true
+          return 'task is blocked'
+        }
+        if (latest.status === 'in_progress' || latest.status === 'review') {
           return strandedLifecycleRefusal(storage, latest)
         }
         return `task is ${latest.status}; only a stranded in_progress / review task can be moved back to pending here`
       })
       if (!released.ok) {
         if (released.code === 'TASK_NOT_FOUND') return reply.status(404).send({ error: 'Task not found' })
+        if (latestWasBlocked) return reply.status(409).send(TASK_BLOCKED_USE_RECOVERY_ROUTE_REFUSAL)
         return reply.status(409).send({
           ...TASK_LIFECYCLE_STATE_OWNED_REFUSAL,
           error: `The task cannot be moved back to pending through this generic route: ${released.reason}`,

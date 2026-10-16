@@ -535,6 +535,51 @@ describe('Task API', () => {
       })
     })
 
+    it('a parked but stranded in_progress task can normalize to pending, stays parked and stops occupying the project', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        // legacy: park 状態は task_aborted audit から推定され、status に DB 制約は無い。
+        const task = await createTask(app, project.id, { status: 'in_progress', roadmapActive: false })
+        storage.auditLog.record({
+          actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: task.id,
+          result: 'success', detail: 'parked by CEO',
+        })
+        expect(storage.tasks.isParked(task.id)).toBe(true)
+        const occupant = () => buildSystemState(storage).projects.find((p) => p.id === project.id)?.currentTask
+        expect(occupant()?.id).toBe(task.id)
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+
+        expect(res.statusCode).toBe(200)
+        expect(storage.tasks.findById(task.id)).toMatchObject({ status: 'pending', roadmapActive: false })
+        expect(storage.tasks.isParked(task.id)).toBe(true)
+        expect(occupant()?.id).not.toBe(task.id)
+      })
+    })
+
+    it('PATCH to pending decides blocked vs pending on the latest state (after recover: 200 with the edits)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        const task = await createTask(app, project.id)
+        storage.tasks.update(task.id, { status: 'blocked' })
+        const refused = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending', title: 'x' } })
+        expect(refused.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(refused.body).code).toBe('TASK_BLOCKED_USE_RECOVERY_ROUTE')
+        expect(storage.tasks.findById(task.id)?.title).not.toBe('x')
+
+        // /recover が pending へ戻した後なら、同じ PATCH は通り編集も残る。
+        storage.tasks.update(task.id, { status: 'pending' })
+        const ok = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending', title: 'x' } })
+        expect(ok.statusCode).toBe(200)
+        expect(storage.tasks.findById(task.id)?.title).toBe('x')
+      })
+    })
+
     it('a failed design review on a stranded in_progress task raises only design_review_failed; PATCH to pending stays the exit', async () => {
       await withApp(async (app) => {
         const project = await createProject(app)
