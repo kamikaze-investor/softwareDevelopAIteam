@@ -54,6 +54,7 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
+import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -62,10 +63,23 @@ export class SingleRunningProjectError extends Error {
   }
 }
 
-export class ArchiveBlockedByRunningJobError extends Error {
-  constructor() {
-    super('Cannot archive project while a Job is running')
-    this.name = 'ArchiveBlockedByRunningJobError'
+/** Project を止める（pause / archive）と、その時点で lifecycle を持つ実体が見えなくなる種類。 */
+export type ProjectActiveLifecycleKind =
+  | 'queued_or_running_job'
+  | 'blocked_job'
+  | 'repair_design_review_run'
+
+/**
+ * pause / archive を拒否した理由。**status 変更と同じ transaction の中で**判定する。
+ *
+ * 以前は archive が running Job だけを見ており、queued Job・未解決の blocked Job・
+ * repair 用 Design Review run を持ったまま Project を止められた。止まった Project は
+ * PL / attention の対象から外れるため、それらの所有者が誰にも見えないまま残る（lifecycle repair W5）。
+ */
+export class ProjectHasActiveLifecycleError extends Error {
+  constructor(public readonly blockers: readonly ProjectActiveLifecycleKind[]) {
+    super(`Cannot pause or archive project while it has an active lifecycle: ${blockers.join(', ')}`)
+    this.name = 'ProjectHasActiveLifecycleError'
   }
 }
 
@@ -635,6 +649,43 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   // `storage` 全体へアクセスする必要がある。クロージャ経由で late-assign する。
   let storage: IStorage
 
+  /**
+   * Project を止めると所有者が見えなくなる lifecycle の種類。
+   *
+   * blocked Job は「blocked なら所有者」とは決めない。done な Task に残る行は履歴であり
+   * （`holdsWorkspaceWhenBlocked`）、Human Resume で後継が作られた旧行は superseded である
+   * （`readJobsSupersededByHumanResume`。attention と同じ reader を使い、ここで再実装しない）。
+   * それ以外を所有者として残すと、止めた Project の中で誰も解消できない停止になる。
+   */
+  function activeLifecycleKindsOf(projectId: string): ProjectActiveLifecycleKind[] {
+    const kinds: ProjectActiveLifecycleKind[] = []
+    const movingJob = db.prepare(
+      "SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued','running') LIMIT 1",
+    ).get(projectId)
+    if (movingJob) kinds.push('queued_or_running_job')
+
+    const blockedTaskIds = (db.prepare(
+      "SELECT DISTINCT j.task_id AS task_id FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status = 'blocked'",
+    ).all(projectId) as Array<{ task_id: string }>).map((row) => row.task_id)
+    const hasBlockedOwner = blockedTaskIds.some((taskId) => {
+      const task = tasks.findById(taskId)
+      if (!task) return false
+      const taskJobs = jobs.findByTaskId(taskId)
+      const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
+      return taskJobs.some((job) => holdsWorkspaceWhenBlocked(task, job) && !superseded.has(job.id))
+    })
+    if (hasBlockedOwner) kinds.push('blocked_job')
+
+    const repairRun = db.prepare(
+      "SELECT r.id FROM design_review_runs r JOIN tasks t ON t.id = r.task_id "
+      + "WHERE t.project_id = ? AND r.status IN ('queued','running') "
+      + 'AND r.repair_source_job_id IS NOT NULL LIMIT 1',
+    ).get(projectId)
+    if (repairRun) kinds.push('repair_design_review_run')
+    return kinds
+  }
+
   const projects: IProjectStorage = {
     findAll() {
       const rows = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as any[]
@@ -674,42 +725,47 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return project
     },
     update(id, data) {
-      const existing = projects.findById(id)
-      if (!existing) return undefined
+      // 判定と書き込みを1つの transaction にする。間に Job が作られて「確認したときは空だった」
+      // が成り立たなくなるのを防ぐ。
+      return db.transaction((): Project | undefined => {
+        const existing = projects.findById(id)
+        if (!existing) return undefined
 
-      if (data.status === 'archived') {
-        const runningJob = db.prepare(
-          `SELECT id FROM jobs WHERE project_id = ? AND status = 'running' LIMIT 1`
-        ).get(id)
-        if (runningJob) {
-          throw new ArchiveBlockedByRunningJobError()
+        // running から出る遷移（paused / draft / archived のどれでも）と、archived への遷移を止める。
+        // archived → paused（復元）は止まった Project を見える側へ戻す操作なので対象にしない。
+        const stopsProject = (
+          existing.status === 'running' && data.status !== undefined && data.status !== 'running'
+        ) || (data.status === 'archived' && existing.status !== 'archived')
+        if (stopsProject) {
+          const blockers = activeLifecycleKindsOf(id)
+          if (blockers.length > 0) throw new ProjectHasActiveLifecycleError(blockers)
         }
-      }
 
-      const updated = { ...existing, ...data, updatedAt: now() }
-      // startStageを同じUPDATEで書けるようにする。status='running'への遷移と開始stageの
-      // 永続化を別writeにすると、その間のcrashで「runningだがstageが無い」Projectが残り、
-      // recoveryがそれを推測で拾わざるを得なくなる。推測に頼ると、start_stage列導入前から
-      // 存在するlegacy runningまで巻き込んで再初期化しかねない（独立レビュー指摘、2026-09-07）。
-      const writesStage = Object.prototype.hasOwnProperty.call(data, 'startStage')
-      try {
-        db.prepare(`
-          UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=?${
-            writesStage ? ', start_stage=?, start_stage_updated_at=?, start_blocked_reason=NULL' : ''
-          } WHERE id=?
-        `).run(
-          updated.name,
-          updated.goal,
-          JSON.stringify(updated.designPhilosophy),
-          updated.status,
-          updated.updatedAt,
-          ...(writesStage ? [updated.startStage ?? null, updated.updatedAt] : []),
-          id,
-        )
-      } catch (err: unknown) {
-        throwSingleRunningProjectError(err)
-      }
-      return updated
+        const updated = { ...existing, ...data, updatedAt: now() }
+        // startStageを同じUPDATEで書けるようにする。status='running'への遷移と開始stageの
+        // 永続化を別writeにすると、その間のcrashで「runningだがstageが無い」Projectが残り、
+        // recoveryがそれを推測で拾わざるを得なくなる。推測に頼ると、start_stage列導入前から
+        // 存在するlegacy runningまで巻き込んで再初期化しかねない（独立レビュー指摘、2026-09-07）。
+        const writesStage = Object.prototype.hasOwnProperty.call(data, 'startStage')
+        try {
+          db.prepare(`
+            UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=?${
+              writesStage ? ', start_stage=?, start_stage_updated_at=?, start_blocked_reason=NULL' : ''
+            } WHERE id=?
+          `).run(
+            updated.name,
+            updated.goal,
+            JSON.stringify(updated.designPhilosophy),
+            updated.status,
+            updated.updatedAt,
+            ...(writesStage ? [updated.startStage ?? null, updated.updatedAt] : []),
+            id,
+          )
+        } catch (err: unknown) {
+          throwSingleRunningProjectError(err)
+        }
+        return updated
+      })()
     },
 
     updateStartStage(id, stage, blockedReason) {

@@ -51,11 +51,12 @@ describe('git_commit durable continuation route', () => {
     const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
     const source = storage.tasks.create({ projectId: project.id, title: 'Source', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 1 })
     storage.tasks.create({ projectId: project.id, title: 'Next', description: 'Implement next.', status: 'pending', assignee: 'developer_ai', dependencies: [source.id], roadmapActive: true, phase: 2 })
-    const commit = storage.jobs.create({ taskId: source.id, projectId: project.id, agentRole: 'developer_ai', status: 'running', safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' } })
-    // Pausing between commit-start and the Worker's success PATCH is the scenario this
-    // guards: the continuation must not hold the Worker's Outbox event pending while the
-    // Project can stay paused indefinitely.
+    // A paused Project that still receives a commit success is the scenario this guards:
+    // the continuation must not hold the Worker's Outbox event pending while the Project can
+    // stay paused indefinitely. W5 now refuses pausing while a Job is running, so the Project
+    // is paused first (the shape a pre-W5 paused Project left behind) and the commit runs after.
     storage.projects.update(project.id, { status: 'paused' })
+    const commit = storage.jobs.create({ taskId: source.id, projectId: project.id, agentRole: 'developer_ai', status: 'running', safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' } })
     const app = Fastify()
     app.register(jobRoutes, { prefix: '/api/jobs' })
     await app.ready()

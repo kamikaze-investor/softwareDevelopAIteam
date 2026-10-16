@@ -662,6 +662,22 @@ export async function taskRoutes(
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
+    // **完了をこの汎用経路で付けさせない。**
+    //
+    // `tasks.update()` は commit も continuation も audit も伴わずに `done` を書けてしまい、
+    // done は blocked Job の attention 抑止や workspace 所有の判断にも使われるため、
+    // 根拠の無い完了が後続の停止を見えなくする（lifecycle repair W5）。完了は
+    // git_commit Job の完了経路か `POST /api/tasks/:id/reconcile-external-completion` に限る。
+    if (result.data.status === 'done') {
+      return reply.status(409).send({
+        error:
+          'A task cannot be marked done through this generic route. '
+          + 'Completion is recorded by the git_commit job completion path, or by '
+          + 'POST /api/tasks/:id/reconcile-external-completion for work completed outside the loop',
+        code: 'TASK_DONE_USE_COMPLETION_ROUTE',
+      })
+    }
+
     // **park された Task を、この汎用経路から占有状態へ戻さない。**
     //
     // `in_progress` と `blocked` は `occupiesProject()` が `roadmapActive` に関係なく

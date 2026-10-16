@@ -1631,6 +1631,30 @@ describe('Task API', () => {
     })
   })
 
+  it.each(['pending', 'in_progress'] as const)(
+    'PATCH /api/tasks/:id refuses status done from %s (completion has its own audited routes)',
+    async (from) => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const created = await createTask(app, project.id, { status: from })
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/tasks/${created.id}`,
+          payload: { status: 'done', commitHash: 'abc123' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        const body = parseBody<{ code: string; error: string }>(res.body)
+        expect(body.code).toBe('TASK_DONE_USE_COMPLETION_ROUTE')
+        expect(body.error).toContain('reconcile-external-completion')
+        const found = await app.inject({ method: 'GET', url: `/api/tasks/${created.id}` })
+        expect(parseBody<Task>(found.body)).toMatchObject({ status: from })
+        expect(parseBody<Task>(found.body).commitHash).toBeUndefined()
+      })
+    },
+  )
+
   it('PATCH /api/tasks/:id updates provider and allowed paths', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

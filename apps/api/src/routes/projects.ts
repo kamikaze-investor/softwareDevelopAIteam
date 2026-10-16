@@ -6,7 +6,7 @@ import { kickProjectStart } from '../ctoAi/projectStartWorkflow.js'
 import { retryPendingContinuationsForProject } from '../ctoAi/taskContinuation'
 import { adoptRoadmapItem } from '../ctoAi/roadmapAdoption'
 import { getStorage } from '../storage'
-import { ArchiveBlockedByRunningJobError, SingleRunningProjectError } from '../storage/sqlite'
+import { ProjectHasActiveLifecycleError, SingleRunningProjectError } from '../storage/sqlite'
 
 const ProjectStatusSchema = z.enum(['draft', 'running', 'paused', 'archived'])
 
@@ -280,8 +280,13 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       if (err instanceof SingleRunningProjectError) {
         return reply.status(409).send(singleRunningProjectResponse)
       }
-      if (err instanceof ArchiveBlockedByRunningJobError) {
-        return reply.status(409).send({ error: 'Cannot archive project while a Job is running' })
+      if (err instanceof ProjectHasActiveLifecycleError) {
+        // 止めると所有者が見えなくなる lifecycle が残っている。どれが止めたかを機械可読で返す。
+        return reply.status(409).send({
+          error: err.message,
+          code: 'PROJECT_HAS_ACTIVE_LIFECYCLE',
+          blockers: err.blockers,
+        })
       }
       throw err
     }

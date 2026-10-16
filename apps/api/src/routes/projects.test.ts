@@ -2,7 +2,8 @@ import { mkdirSync } from 'node:fs'
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Approval, ApprovalType, JobStatus, Project, ProjectRoadmapCompletion } from '@ai-team/shared'
+import type { Approval, ApprovalType, JobStatus, Project, ProjectRoadmapCompletion, Task } from '@ai-team/shared'
+import type { IStorage } from '../storage/interface'
 
 const roadmapMocks = vi.hoisted(() => ({ generateRoadmap: vi.fn() }))
 vi.mock('../ctoAi/roadmapGenerator.js', async (importOriginal) => ({
@@ -115,24 +116,38 @@ async function createProject(app: FastifyInstance, body: Partial<Project> = {}):
   return parseBody<Project>(res.body)
 }
 
-async function createProjectJob(projectId: string, status: JobStatus): Promise<void> {
+async function createProjectJob(
+  projectId: string,
+  status: JobStatus,
+  taskStatus: Task['status'] = 'pending',
+): Promise<{ taskId: string; jobId: string }> {
   const { getStorage } = await import('../storage/index.js')
   const storage = getStorage()
   const task = storage.tasks.create({
     projectId,
     title: 'Task',
     description: '',
-    status: 'pending',
+    status: taskStatus,
     assignee: 'developer_ai',
     dependencies: [],
   })
-  storage.jobs.create({
+  const job = storage.jobs.create({
     taskId: task.id,
     projectId,
     agentRole: 'developer_ai',
     status,
     safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
   })
+  return { taskId: task.id, jobId: job.id }
+}
+
+/** 開始 workflow が作った queued Job を終端させる（pause の前提を作るためだけに使う）。 */
+function settleQueuedJobs(storage: IStorage, projectId: string): void {
+  for (const task of storage.tasks.findByProjectId(projectId)) {
+    for (const job of storage.jobs.findByTaskId(task.id)) {
+      if (job.status === 'queued' || job.status === 'running') storage.jobs.update(job.id, { status: 'success' })
+    }
+  }
 }
 
 async function createApproval(
@@ -408,6 +423,9 @@ describe('Project API', () => {
         sourceJobId: sourceJob.id, projectId: project.id, completedTaskId: sourceTask.id,
         nextTaskId: nextTask.id, status: 'pending',
       })
+      // 開始で作られた初回 Job が queued のままだと pause は拒否される（W5）。このテストの関心は
+      // pause 中に残った continuation なので、その Job を先に終端させてから pause する。
+      settleQueuedJobs(storage, project.id)
 
       const pauseRes = await app.inject({
         method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' },
@@ -461,7 +479,9 @@ describe('Project API', () => {
         nextTaskId: nextTask.id, status: 'pending',
       })
 
-      await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' } })
+      settleQueuedJobs(storage, project.id)
+      const pauseRes = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' } })
+      expect(pauseRes.statusCode).toBe(200)
       const resumeRes = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
       expect(resumeRes.statusCode).toBe(200)
       await new Promise((resolve) => setTimeout(resolve, 50))
@@ -549,40 +569,137 @@ describe('Project API', () => {
     })
   })
 
-  it.each(['queued', 'blocked'] as const)(
-    'PATCH /api/projects/:id archives a project with only a %s Job',
-    async (jobStatus) => {
+  describe('pause / archive は lifecycle の所有者を残したまま止めない（W5）', () => {
+    async function patchStatus(app: FastifyInstance, projectId: string, status: Project['status']) {
+      return app.inject({ method: 'PATCH', url: `/api/projects/${projectId}`, payload: { status } })
+    }
+
+    async function storageOf() {
+      const { getStorage } = await import('../storage/index.js')
+      return getStorage()
+    }
+
+    it.each([
+      ['running', 'archived'],
+      ['running', 'paused'],
+      ['running', 'draft'],
+      ['paused', 'archived'],
+    ] as const)('%s → %s is refused with a queued Job, and the status is unchanged', async (from, to) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: from })
+        await createProjectJob(project.id, 'queued')
+
+        const res = await patchStatus(app, project.id, to)
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string; blockers: string[] }>(res.body)).toMatchObject({
+          code: 'PROJECT_HAS_ACTIVE_LIFECYCLE',
+          blockers: ['queued_or_running_job'],
+        })
+        expect((await storageOf()).projects.findById(project.id)?.status).toBe(from)
+      })
+    })
+
+    it('refuses archive while a Job is running', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        await createProjectJob(project.id, 'running')
+
+        const res = await patchStatus(app, project.id, 'archived')
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string; blockers: string[] }>(res.body)).toMatchObject({
+          code: 'PROJECT_HAS_ACTIVE_LIFECYCLE',
+          blockers: ['queued_or_running_job'],
+        })
+      })
+    })
+
+    it('refuses archive while an un-superseded blocked Job owns a live Task', async () => {
       await withApp(async (app) => {
         const project = await createProject(app, { status: 'paused' })
-        await createProjectJob(project.id, jobStatus)
+        await createProjectJob(project.id, 'blocked')
 
-        const res = await app.inject({
-          method: 'PATCH',
-          url: `/api/projects/${project.id}`,
-          payload: { status: 'archived' },
-        })
+        const res = await patchStatus(app, project.id, 'archived')
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ blockers: string[] }>(res.body).blockers).toEqual(['blocked_job'])
+      })
+    })
+
+    it('a blocked row left on a done Task is history and does not block archive', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'paused' })
+        await createProjectJob(project.id, 'blocked', 'done')
+
+        const res = await patchStatus(app, project.id, 'archived')
 
         expect(res.statusCode).toBe(200)
         expect(parseBody<Project>(res.body).status).toBe('archived')
       })
-    },
-  )
+    })
 
-  it('PATCH /api/projects/:id rejects archive while a Job is running', async () => {
-    await withApp(async (app) => {
-      const project = await createProject(app, { status: 'running' })
-      await createProjectJob(project.id, 'running')
+    it.each([
+      ['human', 200],
+      ['ai', 409],
+    ] as const)('a legacy blocked source with a %s resume successor → %i', async (actorClass, expected) => {
+      await withApp(async (app) => {
+        const { recordResumeActor } = await import('../designReview/resumeActor.js')
+        const storage = await storageOf()
+        const project = await createProject(app, { status: 'paused' })
+        const { taskId, jobId: sourceId } = await createProjectJob(project.id, 'blocked')
+        const successor = storage.jobs.create({
+          taskId,
+          projectId: project.id,
+          agentRole: 'developer_ai',
+          status: 'success',
+          workflowStepKey: `resume:${sourceId}:1`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<IStorage['jobs']['create']>[0])
+        recordResumeActor(storage, {
+          jobId: successor.id,
+          taskId,
+          actorClass,
+          evidence: actorClass === 'human' ? 'admin_credential' : 'in_process_pl',
+        })
 
-      const res = await app.inject({
-        method: 'PATCH',
-        url: `/api/projects/${project.id}`,
-        payload: { status: 'archived' },
+        const res = await patchStatus(app, project.id, 'archived')
+
+        expect(res.statusCode).toBe(expected)
       })
+    })
 
-      expect(res.statusCode).toBe(409)
-      expect(parseBody<{ error: string }>(res.body).error).toBe(
-        'Cannot archive project while a Job is running',
-      )
+    it('refuses pause while a repair Design Review run is queued', async () => {
+      await withApp(async (app) => {
+        const storage = await storageOf()
+        const project = await createProject(app, { status: 'running' })
+        const { taskId, jobId } = await createProjectJob(project.id, 'failed')
+        storage.designReviewRuns.create({
+          taskId,
+          taskTitle: 'Task',
+          designText: 'repair design',
+          designTextHash: 'hash',
+          changedFiles: [],
+          repairSourceJobId: jobId,
+        })
+
+        const res = await patchStatus(app, project.id, 'paused')
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ blockers: string[] }>(res.body).blockers).toEqual(['repair_design_review_run'])
+      })
+    })
+
+    it('restoring an archived Project to paused is not blocked', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'archived' })
+        await createProjectJob(project.id, 'blocked')
+
+        const res = await patchStatus(app, project.id, 'paused')
+
+        expect(res.statusCode).toBe(200)
+        expect(parseBody<Project>(res.body).status).toBe('paused')
+      })
     })
   })
 

@@ -16,6 +16,7 @@ import {
 import { buildSystemState } from '../state/systemState'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { summarizeBlockedTriage } from './blockedTriage'
+import { resetPlLoopInFlightForTest, runPlTick } from './executionLoop'
 import {
   applyFollowUpBoost,
   AUDIT_PROPOSAL_UNPARSED,
@@ -662,8 +663,49 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
     expect(result).toEqual({
       status: 'no_candidate',
       reason: 'all open roadmap items are awaiting Tier A Candidate promotion',
+      failureCode: 'awaiting_promotion',
     })
     expect(propose).not.toHaveBeenCalled()
+  })
+
+  it('PL tick: promotion 待ちの停滞は adopt audit に1行だけ残り、採用予算も失敗表示も動かさない（W5）', async () => {
+    const { storage, projectId } = projectWithCompletion()
+    const propose = vi.fn().mockResolvedValue('{}')
+    const d = { readLedger: () => LEDGER, proposeAdoption: propose, escalate: async () => [] }
+    const awaitingRows = () => storage.auditLog
+      .findByEntity('pl_loop_target', `adopt:${projectId}`)
+      .filter((entry) => (entry.detail ?? '').startsWith('adoption=no_candidate code=awaiting_promotion '))
+
+    for (let i = 0; i < 3; i += 1) {
+      resetPlLoopInFlightForTest()
+      expect((await runPlTick(storage, d)).status).toBe('idle')
+    }
+
+    expect(awaitingRows()).toHaveLength(1)
+    expect(awaitingRows()[0]).toMatchObject({ operation: 'pl_loop', result: 'idle' })
+    expect(propose).not.toHaveBeenCalled()
+    expect(buildSystemState(storage).projects.find((p) => p.id === projectId)?.adoptionFailure).toBeUndefined()
+
+    // 間に別の採用記録が挟まれば、再び promotion 待ちになった時点で新しく残す（毎 tick ではない）。
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_loop', entityType: 'pl_loop_target',
+      entityId: `adopt:${projectId}`, result: 'acted', detail: 'adoption=adopted code=- target=other',
+    })
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, d)
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, d)
+    expect(awaitingRows()).toHaveLength(2)
+  })
+
+  it('PL tick: ledger が空（やり切った）なら adopt audit に何も残さない', async () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+
+    resetPlLoopInFlightForTest()
+    expect((await runPlTick(storage, { readLedger: () => '', escalate: async () => [] })).status).toBe('idle')
+
+    expect(storage.auditLog.findByEntity('pl_loop_target', `adopt:${project.id}`)).toEqual([])
   })
 
   it('awaiting-promotion と診断が共存しても audit dedup・rotation・attention を変えない', async () => {

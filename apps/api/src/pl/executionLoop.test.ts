@@ -19,6 +19,8 @@ import {
   runPlTick,
   parseEscalationDelivery,
   verifyOutcome,
+  allowedActionsFor,
+  hasWiredPlExecutor,
   type PlDiagnosisInput,
   type PlEscalationChannelResult,
   type PlLoopDeps,
@@ -1167,9 +1169,11 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       .toContain('technical recovery budget is exhausted')
   })
 
-  it('未 escalate の停滞は、別 Project の採用も従来どおり止める', async () => {
+  it('未 escalate の停滞は、別 Project の採用も止める。quarantine は1回 escalate された後は止めない', async () => {
     // 判断待ちの除外は Escalation 済みに限る。まだ誰にも上げていない停滞が残るうちは、
     // どの Project にも新しい仕事を増やさない（既存の意図）。
+    // W5: workspace_quarantined は以前 PL が一度も escalate しなかったため、ここで**永久に**
+    // 全採用を止めていた。今は最初の tick で CEO へ1回届け、次の tick から別 Project の採用を許す。
     const { storage, projectId, taskId } = seed()
     // running な Project は1つだけ（既存制約）。停滞している Project は paused にし、採用先を Other にする。
     // paused では task_ready_without_job が出ないため、status に関係なく出る workspace_quarantined を使う。
@@ -1185,19 +1189,75 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     storage.jobs.update(job.id, {
       failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
     })
-    // 前提: 未 escalate の workspace_quarantined が1件あり、PL は扱わない（actionable でない）
+    // 前提: 未 escalate の workspace_quarantined が1件ある
     expect(buildSystemState(storage, { now: () => NOW }).attention.map((a) => a.kind)).toEqual(['workspace_quarantined'])
     storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'running' })
     let adoptCalls = 0
-
-    const result = await runPlTick(storage, deps({
+    const escalations: string[] = []
+    const d = deps({
       readLedger: () => LEDGER,
       proposeAdoption: async () => PROPOSAL,
       adopt: async () => { adoptCalls += 1; return { ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' } },
-    }))
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+    })
 
-    expect(result.status).toBe('idle')
+    // 1 tick 目: 未 escalate の停滞なので採用しない。その代わり CEO へ届ける。
+    const first = await runPlTick(storage, d)
+    expect(first.status).toBe('escalated')
     expect(adoptCalls).toBe(0)
+    expect(escalations).toHaveLength(1)
+
+    // 2 tick 目: escalate 済みは「CEO 判断待ち」。止めるのはその Project だけで、Other は採用できる。
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, d)
+    expect(adoptCalls).toBe(1)
+    expect(escalations).toHaveLength(1)
+  })
+
+  it('workspace_quarantined は診断も Gate も経ずに1回だけ escalate し、解除はしない（W5）', async () => {
+    const { storage, projectId, taskId } = seed()
+    const job = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
+    })
+    let diagnosed = 0
+    const escalations: string[] = []
+    const d = deps({
+      diagnose: async () => { diagnosed += 1; return '{}' },
+      escalate: async (p) => { escalations.push(p.body); return DELIVERED },
+    })
+
+    const first = await runPlTick(storage, d)
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    expect(first).toMatchObject({ status: 'escalated', target: { kind: 'workspace_quarantined' } })
+    expect(second.status).toBe('idle')
+    expect(diagnosed).toBe(0)
+    expect(escalations).toHaveLength(1)
+    // 解除条件（観測 + known-good）には触れない。quarantine は残ったまま。
+    expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+    expect(buildSystemState(storage, { now: () => NOW }).attention.map((a) => a.kind))
+      .toContain('workspace_quarantined')
+  })
+
+  it('PL に提示する候補は executor が配線された action だけ（W5）', () => {
+    for (const kind of ['job_blocked', 'job_failed', 'design_review_idle', 'design_review_failed', 'workspace_quarantined'] as const) {
+      for (const action of allowedActionsFor(kind)) {
+        expect(hasWiredPlExecutor(action), `${kind} offers ${action}`).toBe(true)
+      }
+    }
+    expect(allowedActionsFor('job_blocked')).toEqual(['resume_task', 'observe_state', 'escalate_to_ceo'])
+    expect(allowedActionsFor('job_failed')).toEqual(['resume_task', 'observe_state', 'escalate_to_ceo'])
+    expect(hasWiredPlExecutor('retry_job')).toBe(false)
+    expect(hasWiredPlExecutor('clear_workspace_quarantine')).toBe(false)
   })
 
   it('Escalation 後も、原因が直れば採用を再開できる（永久に止まらない）', async () => {
@@ -2223,7 +2283,8 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(exhausted.status).toBe('acted')
     expect(exhausted.proposedKind).toBe('observe_state')
     expect(lastAllowedActions).not.toContain('resume_task')
-    expect(lastAllowedActions).toContain('retry_job')
+    // retry_job は executor が無いので候補に出さない（W5）。残るのは配線済みの observe_state。
+    expect(lastAllowedActions).not.toContain('retry_job')
     expect(lastAllowedActions).toContain('observe_state')
     expect(storage.jobs.findByTaskId(taskId)
       .some((job) => job.workflowStepKey === `resume:${finalFailedReviewId}:1`)).toBe(false)
@@ -2280,9 +2341,12 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       },
     }))
 
-    expect(seen?.allowedActionKinds).toContain('retry_job')
-    // retry は候補から失われず Gate まで届く。承認根拠が無いので既存 Gate が blocked にする。
+    // routine resume は Rule 5.5 の cap を消費しないので、resume_task は候補に残る。
+    // retry_job は executor が無いので候補に出さず、提案されても Gate の手前で止める（W5）。
+    expect(seen?.allowedActionKinds).toContain('resume_task')
+    expect(seen?.allowedActionKinds).not.toContain('retry_job')
     expect(retried).toMatchObject({ status: 'blocked', proposedKind: 'retry_job' })
+    expect(retried.reason ?? '').toContain('outside the actions this triage allows')
     expect(retried.reason ?? '').not.toContain('technical recovery budget exhausted')
   })
 
@@ -2350,12 +2414,12 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       diagnose: async () => JSON.stringify({ actionKind: 'retry_job', rationale: 'transient', riskLevel: 'LOW' }),
     }))
 
-    // Gate の根拠照合まで到達している。approval_gate の根拠が無いので止まるが、
-    // 理由は「対象種別のズレ」ではなく「根拠が足りない」でなければならない。
+    // 対象種別のズレでは落ちない。retry_job は executor が無く候補に出ないため（W5）、
+    // 理由は「候補の外」になる（以前は Gate の approval_gate 不足で止まり、attempt を焼いていた）。
     expect(result.status).toBe('blocked')
     expect(result.reason).not.toContain('requires a job target')
     expect(result.reason).not.toContain('cannot be addressed')
-    expect(result.reason).toContain('approval_gate')
+    expect(result.reason).toContain('outside the actions this triage allows')
   })
 
   it('要求される対象を組み立てられない提案は、Gate を呼ばずに fail-closed で止める', async () => {
