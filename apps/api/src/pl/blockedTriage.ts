@@ -950,7 +950,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 同じ不整合で再停止、の連鎖になる（非 git の safe-work kind でも同じ）。原因（版ずれ等）は AI の
   // resume では直らないので、6.9 と同じ自動実行しない lane で一度だけ見せる。Authority の変更は要求しない。
   // 原因を直した後の resume が出口（git_commit なら新しい承認が求められる）。
-  const technicalStopCode = facts.job?.status === 'blocked' ? findGateTechnicalStopCode(facts.job.stderr) : undefined
+  // 照合は stderr の先頭だけ（findGateTechnicalStopCode）で、さらにコマンドが一度も実行されていない Job に限る
+  // （Gate 段階の停止は exitCode も stdout ログも持たない。実行後の出力で技術停止を詐称させない）。
+  // CEO が却下した git_commit は下の 7 の却下の扱い（指示つき Human Resume）を優先する。
+  const technicalStopCode =
+    facts.job?.status === 'blocked'
+    && facts.job.exitCode === undefined
+    && facts.job.stdoutPath === undefined
+    && facts.ceoRejectedGitCommit !== true
+      ? findGateTechnicalStopCode(facts.job.stderr)
+      : undefined
   if (facts.job !== undefined && technicalStopCode !== undefined && !hasLiveJob(facts)) {
     return {
       ...result,

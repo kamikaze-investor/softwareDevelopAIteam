@@ -3672,3 +3672,65 @@ describe('triage rule 6.8: technical Gate stop recognized from the persisted rea
     expect(triageBlocked(fx.storage, item).rootCauseClass).not.toBe('unknown')
   })
 })
+
+describe('triage rule 6.8: only an unspoofable, pre-execution technical stop; a CEO rejection keeps rule 7', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+
+  function blocked(kind: string, update: Record<string, unknown>): { storage: IStorage; jobId: string; taskId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind, workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(),
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+      ...update,
+    } as never)
+    return { storage, jobId: job.id, taskId }
+  }
+
+  function triageOf(fx: { storage: IStorage; jobId: string }) {
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    return triageBlocked(fx.storage, item)
+  }
+
+  it('a code on a later stderr line (command output) is not a technical stop', () => {
+    const triage = triageOf(blocked('test', { stderr: `some output\n${SKEW}` }))
+    expect(triage.evidence.some((e) => e.fact.startsWith('gate technical stop code'))).toBe(false)
+  })
+
+  it('a Job that executed (exitCode recorded) is not a technical Gate stop even if stderr starts with the code', () => {
+    const triage = triageOf(blocked('test', { stderr: SKEW, exitCode: 0 }))
+    expect(triage.evidence.some((e) => e.fact.startsWith('gate technical stop code'))).toBe(false)
+  })
+
+  it('a CEO-REJECTED git_commit with a technical stop reason keeps the rule-7 rejection handling (no "new approval" wording)', () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:rej-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    const rejected = storage.approvalRequests.recordDecision(linked.approvalRequest.id, 'REJECTED', 'no', { credentialClass: 'admin' })
+    if (!rejected.ok) throw new Error(rejected.reason)
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr: SKEW,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+    const triage = triageOf({ storage, jobId: job.id })
+    expect(triage.evidence.some((e) => e.fact.startsWith('gate technical stop code'))).toBe(false)
+    expect(triage.rootCauseClass).toBe('approval_not_actionable')
+    expect(triage.summary).not.toContain('新しい承認が求められる')
+  })
+})

@@ -29,15 +29,14 @@ import type { CommandKind } from './types/command'
 export const GATE_TECHNICAL_STOP_CODES = ['risk_rule_skew', 'approval_contract_violation'] as const
 export type GateTechnicalStopCode = typeof GATE_TECHNICAL_STOP_CODES[number]
 
-/** `<code>: ...` で始まる行があればその理由コードを返す（stderr / gate 理由のどちらにも使う）。 */
+/**
+ * 文字列が**先頭（offset 0）から** `<code>: ` で始まるときだけその理由コードを返す（stderr / gate 理由のどちらにも使う）。
+ * Worker は技術停止の理由をそのまま stderr 全体として書く。途中の行や前置きのある行は照合しない
+ * （コマンド出力などの任意の文字列で技術停止を詐称させないため）。
+ */
 export function findGateTechnicalStopCode(text: string | undefined): GateTechnicalStopCode | undefined {
   if (!text) return undefined
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trimStart()
-    const code = GATE_TECHNICAL_STOP_CODES.find((candidate) => trimmed.startsWith(`${candidate}:`))
-    if (code !== undefined) return code
-  }
-  return undefined
+  return GATE_TECHNICAL_STOP_CODES.find((candidate) => text.startsWith(`${candidate}: `))
 }
 
 /**

@@ -2,6 +2,8 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { describe, it, expect } from 'vitest'
 import {
+  GATE_TECHNICAL_STOP_CODES,
+  findGateTechnicalStopCode,
   GATE_CHANGE_EXACT_FILES,
   runRiskReview,
   SAFE_WORK_COMMAND_KINDS,
@@ -190,5 +192,30 @@ describe('SAFE_WORK_COMMAND_KINDS', () => {
       expect(isSafeWorkCommandKind(kind)).toBe(false)
     }
     expect(isSafeWorkCommandKind('git_status')).toBe(true)
+  })
+})
+
+describe('findGateTechnicalStopCode (D2)', () => {
+  it.each([
+    ['risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision', 'risk_rule_skew'],
+    ['approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval', 'approval_contract_violation'],
+  ])('matches a reason that starts with the code at offset 0: %s', (text, code) => {
+    expect(findGateTechnicalStopCode(text)).toBe(code)
+  })
+
+  it.each([
+    ['a later line', 'test output\nrisk_rule_skew: local CRITICAL > API HIGH'],
+    ['leading whitespace', '  risk_rule_skew: local CRITICAL > API HIGH'],
+    ['a prefix', '[gate] approval_contract_violation: x'],
+    ['no space after the colon', 'risk_rule_skew:local CRITICAL'],
+    ['an unknown code', 'risk_rule: x'],
+    ['empty', ''],
+    ['undefined', undefined],
+  ])('does not match %s (command output cannot spoof a technical stop)', (_label, text) => {
+    expect(findGateTechnicalStopCode(text)).toBeUndefined()
+  })
+
+  it('exposes exactly the two D2 codes', () => {
+    expect([...GATE_TECHNICAL_STOP_CODES]).toEqual(['risk_rule_skew', 'approval_contract_violation'])
   })
 })
