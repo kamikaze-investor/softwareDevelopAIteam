@@ -61,6 +61,7 @@ import {
   reportAbortCleanupObservations,
   clearPendingAbortCleanupSubmissions,
   pendingAbortCleanupSubmissionJobIds,
+  hasPendingAbortCleanupSubmissions,
   start,
 } from './index.js'
 
@@ -709,6 +710,57 @@ describe('pending Technical Abort cleanup delivery gates intake and is swept whe
     state.projectsFail = true
     await reportAbortCleanupObservations()
     expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+  })
+
+  // Codex review 44ddd0f: 列挙が失敗し続けても、保留は毎回列挙と独立に再送され、上限で必ず（通知付きで）解ける。
+  it('with discovery failing every poll, the pending report is still resent each poll and released at the bound with one alert', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    const cleanupPosts = (): number => fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/abort-cleanup-result')).length
+    expect(cleanupPosts()).toBe(1)
+
+    state.projectsFail = true
+    let polls = 0
+    while (hasPendingAbortCleanupSubmissions() && polls < 50) {
+      const before = cleanupPosts()
+      await reportAbortCleanupObservations()
+      polls += 1
+      // 列挙が失敗しても、各 poll で必ず1回再送する（上限が進む）。
+      expect(cleanupPosts()).toBe(before + 1)
+    }
+
+    // 初回を含めて 20 回で解け、黙らずに一度だけ通知する。
+    expect(hasPendingAbortCleanupSubmissions()).toBe(false)
+    expect(cleanupPosts()).toBe(20)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({
+      severity: 'critical',
+      sourceId: 'abort_cleanup:job-carrier',
+    }))
+    // 全ての再送は同じ証拠。
+    const bodies = new Set(fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/abort-cleanup-result'))
+      .map(([, init]) => String(init?.body)))
+    expect(bodies.size).toBe(1)
+  })
+
+  it('with discovery failing, an accepted resubmission clears the entry and releases the gate', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy, () => new Response(null, { status: 200 })],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    state.projectsFail = true
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+    expect(hasPendingAbortCleanupSubmissions()).toBe(false)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
   })
 })
 
