@@ -79,8 +79,9 @@ export type StalledOwnerCause =
 const STALLED_OWNER_SUMMARY: Record<StalledOwnerCause, (job: Job, project: Project) => string> = {
   inactive_project: (job, project) =>
     `a ${job.status} job in the ${project.status} project holds the shared workspace. `
-    + 'Exit: set that project back to running (pause / resume is never refused) so its owner can finish; '
-    + 'archiving it or returning it to draft is refused while it still owns work.',
+    + 'Exit: pause the currently running project first (only one project may run at a time), then resume '
+    + 'this project so its owner can finish; archiving it or returning it to draft is refused while it '
+    + 'still owns work.',
   done_task_blocked_row: () =>
     'a blocked job left on a done task holds the shared workspace (its completion had no clean-worktree '
     + 'evidence, or the row predates that rule). No automated exit exists: a manual workspace check and '
