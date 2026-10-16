@@ -814,13 +814,28 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    */
   function repairHandoffRefusal(
     taskId: string,
-    projectId: string,
+    repairProjectId: string,
+    sourceJobId: string,
   ): { code: RepairHandoffRefusalCode; reason: string } | undefined {
-    const task = db.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId) as { status: string } | undefined
+    const task = db.prepare('SELECT status, project_id FROM tasks WHERE id = ?').get(taskId) as
+      | { status: string; project_id: string }
+      | undefined
     if (task === undefined) return { code: 'TASK_NOT_FOUND', reason: 'task no longer exists' }
     if (task.status === 'done') return { code: 'TASK_DONE', reason: 'task is already done' }
     if (isParkedTaskId(taskId)) return { code: 'TASK_PARKED', reason: 'task was parked by abort_task while the review ran' }
-    const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(projectId) as { status: string } | undefined
+    // **見る Project は Task の正本（tasks.project_id）から引く。** 呼び出し側が渡した projectId を
+    // そのまま信じると、別 Project の running を根拠に止まっている Project へ Job を作りうる。
+    // repair Job と source Job の projectId がどちらも Task の Project と一致しなければ断る。
+    const source = db.prepare('SELECT project_id FROM jobs WHERE id = ?').get(sourceJobId) as
+      | { project_id: string }
+      | undefined
+    if (repairProjectId !== task.project_id || (source !== undefined && source.project_id !== task.project_id)) {
+      return {
+        code: 'PROJECT_MISMATCH',
+        reason: `repair job / source job project does not match the task's project ${task.project_id}`,
+      }
+    }
+    const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(task.project_id) as { status: string } | undefined
     if (project?.status !== 'running') {
       return { code: 'PROJECT_NOT_RUNNING', reason: `project is not running (${project?.status ?? 'missing'})` }
     }
@@ -2406,7 +2421,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         //    確かめると、その後に done / park / Project 停止が起きても repair Job が作られる
         //    （TOCTOU）。断るときは何も書かず、source Job の所有権にも触らない。
         //    **blocked では断らない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
-        const refusal = repairHandoffRefusal(input.repairJob.taskId, input.repairJob.projectId)
+        const refusal = repairHandoffRefusal(input.repairJob.taskId, input.repairJob.projectId, input.sourceJobId)
         if (refusal !== undefined) {
           return { ok: false, ...refusal }
         }

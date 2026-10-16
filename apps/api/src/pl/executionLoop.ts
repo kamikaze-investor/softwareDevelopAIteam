@@ -110,6 +110,7 @@ import {
   PL_MAX_TECHNICAL_RESUMES_PER_TASK,
   taskTechnicalResumeAuditKey,
   technicalRecoveryTargetKey,
+  findPlTargetAuditEntries,
   technicalResumeBudget,
 } from './technicalResumePolicy'
 import {
@@ -486,11 +487,11 @@ function recordTechnicalRecoveryExhaustion(
   item: AttentionItem,
   exhaustion: TechnicalRecoveryExhaustion,
 ): void {
-  const prior = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, exhaustion.auditKey)
+  // legacy な Task 単位キーの exhaustion も同じ target のものとして数える（findPlTargetAuditEntries）。
+  const prior = findPlTargetAuditEntries(storage, exhaustion.auditKey)
   if (prior.some((entry) =>
     entry.operation === AUDIT_OPERATION
     && entry.entityType === AUDIT_ENTITY_TYPE
-    && entry.entityId === exhaustion.auditKey
     && entry.result === 'technical_exhausted')) return
 
   storage.auditLog.record({
@@ -608,8 +609,7 @@ function selfResolutionBlockedReason(diagnosis: BlockedDiagnosis): string {
 const STRUCTURED_AUDIT_FIELDS = /\b(?:lane|cause|layer|conf|kind|adoption|code)=[^\s]+/g
 
 function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .filter((entry) => ATTEMPT_RESULTS.includes(entry.result))
     .slice(0, PL_ESCALATION_HISTORY_LINES)
     .reverse()
@@ -832,14 +832,12 @@ async function actOnOperatorTarget(
 }
 
 export function countPriorAttempts(storage: IStorage, targetKey: string): number {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length
 }
 
 function hasEscalated(storage: IStorage, targetKey: string): boolean {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .some((entry) => entry.result === 'escalated')
 }
 
@@ -1431,7 +1429,7 @@ async function executeAction(
   item: AttentionItem,
   deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
   technicalResume: boolean,
-): Promise<{ ok: boolean; summary: string }> {
+): Promise<{ ok: boolean; summary: string; stale?: boolean }> {
   if (kind === 'escalate_to_ceo') {
     // Escalation は「実行」ではなく報告である。ここでは成功扱いにせず、呼び出し側が escalated を返す。
     return { ok: true, summary: 'escalation requested by PL' }
@@ -1441,9 +1439,19 @@ async function executeAction(
     if (item.taskId === undefined) {
       return { ok: false, summary: 'attention has no taskId; cannot locate the design review run' }
     }
-    const run = storage.designReviewRuns.findLatestByTaskId(item.taskId)
-    if (!run) {
-      return { ok: false, summary: `no design review run for task ${item.taskId}` }
+    // **attention が名指した run だけを動かす。** 診断（await）の間に run が差し替わる・
+    // 状態が進むことがある。Task の最新 run を引き直すと、PL が見ていない別 episode の run を
+    // rekick してしまう。名指した run がもう actionable でなければ stale として何もせず、
+    // 試行も消費しない（呼び出し側が audit を書かない）。
+    const run = item.referenceId !== undefined ? storage.designReviewRuns.findById(item.referenceId) : undefined
+    if (!run || run.taskId !== item.taskId) {
+      return { ok: false, stale: true, summary: `design review run ${item.referenceId ?? '(none)'} is not this task's attention run` }
+    }
+    const stillActionable = item.kind === 'design_review_idle'
+      ? run.status === 'queued' && run.startedAt === undefined
+      : item.kind === 'design_review_failed' && run.status === 'failed'
+    if (!stillActionable) {
+      return { ok: false, stale: true, summary: `design review run ${run.id} is no longer ${item.kind} (status=${run.status})` }
     }
     // **盲目的な re-kick をしない**（CEO 指示）。attempt を使い切った run は再実行しても
     // `not_claimable` になるだけなので、Escalation 側へ倒す。
@@ -1875,6 +1883,18 @@ async function handleTarget(
         )
       }),
   }, diagnosis.rootCauseClass === 'review_execution_failed')
+
+  // 対象が既に actionable でない（run の差し替え等）。何も実行していないので試行として記録しない。
+  if (execution.stale) {
+    return {
+      status: 'idle',
+      target,
+      triage,
+      proposedKind: proposal.kind,
+      reason: `stale target: ${execution.summary}`,
+      attempt,
+    }
+  }
 
   // ── Verify（実行側の戻り値だけで成功としない）────────────────────
   const after = buildSystemState(storage, deps.now ? { now: deps.now } : {})

@@ -200,6 +200,19 @@ export interface RecomputeOutcome {
   rejectedReason?: string
 }
 
+/**
+ * runner が review の一部または全部を実行できなかったと申告しているか。
+ * `finalDecision: 'REVIEW_UNAVAILABLE'`、または focused / integration 結果の `unavailable: true`。
+ * 判定を厳しくする向きにしか使わない（ALIGNED を作る根拠にはしない）。
+ */
+function runnerReportedUnavailable(raw: RawStrategicResult): boolean {
+  if (raw.finalDecision === 'REVIEW_UNAVAILABLE') return true
+  const marked = (value: unknown): boolean =>
+    typeof value === 'object' && value !== null && (value as { unavailable?: unknown }).unavailable === true
+  return (Array.isArray(raw.focusedReviewResults) && raw.focusedReviewResults.some(marked))
+    || marked(raw.integrationReviewResult)
+}
+
 function isFocusResultArray(value: unknown): value is Array<{ focus: string; decision: string }> {
   return (
     Array.isArray(value) &&
@@ -453,6 +466,25 @@ export function recomputeDecision(
 
   if (independentReviewRequired && independent) {
     decision = applyIndependentReviewOverride(decision, independent as never) as RecomputedDecision
+  }
+
+  // **runner が「review を実行できなかった」と申告したら、ALIGNED にしない（task kind・全 load）。**
+  //
+  // 自己申告を信じないのは ALIGNED への格上げを防ぐためであって、unavailable を ALIGNED へ
+  // 格上げしてよい理由にはならない。focused が全件 ALIGNED でも integration が落ちていれば
+  // runner は REVIEW_UNAVAILABLE を返すが、組み直すと ALIGNED になり evidence が登録されていた
+  // （独立レビュー指摘・2026-10-16）。CONFLICT は判定として優先し、それ以外は判定無しにする。
+  if (reviewKind === 'task' && decision !== 'CONFLICT' && runnerReportedUnavailable(raw)) {
+    const reason = typeof raw.unavailableReason === 'string' && raw.unavailableReason.trim() !== ''
+      ? raw.unavailableReason.trim().slice(0, 500)
+      : 'runner reported REVIEW_UNAVAILABLE'
+    return {
+      decision: 'REVIEW_UNAVAILABLE',
+      reviewLoad,
+      independentReviewRequired,
+      independentReviewVerdict: independent?.verdict,
+      rejectedReason: `review unavailable: ${reason}`,
+    }
   }
 
   return {

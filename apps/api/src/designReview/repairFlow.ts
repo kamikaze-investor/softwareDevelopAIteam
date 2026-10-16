@@ -1322,6 +1322,11 @@ export function completeRepairHandoff(
   }
 }
 
+/**
+ * 状態変化による「良性の」refusal（skipped で返す）。`PROJECT_MISMATCH` は含めない ——
+ * Task / Job の Project が食い違うのは lineage の破損であり、別 Task の source と同じく
+ * 既存の escalation 経路へ渡す（source Job の所有権は storage 側で変わっていない）。
+ */
 const REPAIR_HANDOFF_REFUSAL_CODES: readonly RepairHandoffRefusalCode[] = [
   'TASK_NOT_FOUND',
   'TASK_DONE',
@@ -1329,7 +1334,7 @@ const REPAIR_HANDOFF_REFUSAL_CODES: readonly RepairHandoffRefusalCode[] = [
   'PROJECT_NOT_RUNNING',
 ]
 
-function isRepairHandoffRefusal(code: string): code is RepairHandoffRefusalCode {
+function isRepairHandoffRefusal(code: string): boolean {
   return (REPAIR_HANDOFF_REFUSAL_CODES as readonly string[]).includes(code)
 }
 

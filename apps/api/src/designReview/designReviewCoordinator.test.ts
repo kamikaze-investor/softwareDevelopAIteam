@@ -1030,3 +1030,51 @@ describe('critical load: independent 欠落と focused CONFLICT の分離', () =
     expect(run.attemptCount).toBe(1)
   })
 })
+
+/**
+ * runner の「実行できなかった」申告は判定を厳しくする向きにしか使わない（独立レビュー指摘・2026-10-16）。
+ * focused が全件 ALIGNED でも integration が欠けて REVIEW_UNAVAILABLE を申告した payload を、
+ * 組み直して ALIGNED にしてはならない。
+ */
+describe('runner が申告した REVIEW_UNAVAILABLE は ALIGNED へ格上げしない（task kind・全 load）', () => {
+  const HIGH_FILES = ['apps/api/src/auth/credentials.ts']
+  const unavailablePayload = {
+    focusedReviewResults: [
+      { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      { focus: 'strategic_alignment', decision: 'ALIGNED' },
+    ],
+    finalDecision: 'REVIEW_UNAVAILABLE',
+    unavailableReason: 'integration review unavailable',
+  }
+
+  it('high load で focused 全件 ALIGNED・integration 無し・finalDecision=REVIEW_UNAVAILABLE は REVIEW_UNAVAILABLE', () => {
+    const outcome = recomputeDecision(unavailablePayload, 'task', HIGH_FILES)
+
+    expect(outcome.reviewLoad).not.toBe('critical')
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('integration review unavailable')
+  })
+
+  it('同じ payload で evidence は登録されず run は requeue される', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = deps(async () => ({ ok: true, stdout: JSON.stringify(unavailablePayload), timedOut: false }))
+
+    const result = await createAndExecuteDesignReview(storage, { ...baseInput(taskId), changedFiles: HIGH_FILES }, runner)
+
+    expect(result.status).toBe('requeued')
+    expect(storage.designReviewEvidence.findByTaskId(taskId)).toEqual([])
+  })
+
+  it('unavailable でも focused の CONFLICT は CONFLICT のまま', () => {
+    const outcome = recomputeDecision({
+      ...unavailablePayload,
+      focusedReviewResults: [
+        { focus: 'scope_simplicity', decision: 'CONFLICT' },
+        { focus: 'strategic_alignment', decision: 'ALIGNED' },
+      ],
+    }, 'task', HIGH_FILES)
+
+    expect(outcome.decision).toBe('CONFLICT')
+  })
+})

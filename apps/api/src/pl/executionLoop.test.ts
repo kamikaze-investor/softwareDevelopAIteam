@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, beforeAll, afterAll } from 'vitest'
+import { describe, expect, it, beforeEach, beforeAll, afterAll, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -2392,5 +2392,78 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
 
     expect(exhausted.status).toBe('idle')
     expect(escalations).toEqual([])
+  })
+})
+
+/**
+ * design_review_failed / idle のキーを `<kind>:<taskId>` から `<kind>:<runId>` へ移した後も、
+ * 移行前の履歴（escalation・試行）はその時点で既に在った run のものとして数える。
+ * 新しい run（同じ Task の次の episode）は新しい同一性から始める。
+ */
+describe('Design Review attention の legacy Task 単位履歴', () => {
+  afterAll(() => {
+    vi.useRealTimers()
+  })
+
+  function recordLegacy(storage: IStorage, key: string, result: string): void {
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_loop', entityType: 'pl_loop_target', entityId: key, result, detail: 'legacy',
+    })
+  }
+
+  it('既存 run は legacy の escalation・試行を引き継ぎ、後から作られた run は新しく始まる', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-14T09:00:00.000Z'))
+    const { storage, taskId, runId } = seedIdleDesignReview()
+    vi.setSystemTime(new Date('2026-09-14T09:10:00.000Z'))
+    recordTargetAttempts(storage, `design_review_idle:${taskId}`, 2)
+    recordLegacy(storage, `design_review_idle:${taskId}`, 'escalated')
+
+    expect(countPriorAttempts(storage, `design_review_idle:${runId}`)).toBe(2)
+    let diagnosed = 0
+    const d = deps({ diagnose: async () => { diagnosed += 1; return JSON.stringify({ actionKind: 'rekick_design_review', rationale: 'r', riskLevel: 'LOW' }) } })
+    expect((await runPlTick(storage, d)).status).not.toBe('acted')
+    expect(diagnosed).toBe(0)
+
+    // 同じ Task の新しい episode。legacy 行より後に作られたので履歴を引き継がない。
+    vi.setSystemTime(new Date('2026-09-14T09:20:00.000Z'))
+    const first = storage.designReviewRuns.claim(runId, 3)
+    storage.designReviewRuns.complete(runId, first.claimToken!, 'failed', undefined, 'boom')
+    const newer = storage.designReviewRuns.create({
+      taskId, taskTitle: 'design', designText: 'design text 2', designTextHash: 'hash-2', changedFiles: ['docs/notes.md'],
+    })
+    vi.useRealTimers()
+    expect(countPriorAttempts(storage, `design_review_idle:${newer.id}`)).toBe(0)
+    resetPlLoopInFlightForTest()
+    expect((await runPlTick(storage, d)).status).toBe('acted')
+    expect(diagnosed).toBe(1)
+  })
+})
+
+describe('rekick_design_review は attention が名指した run だけを動かす', () => {
+  it('診断中に run が差し替わったら何もせず、試行も消費しない', async () => {
+    const { storage, taskId, runId } = seedIdleDesignReview()
+    const rekicked: string[] = []
+    let replacementId = ''
+    const d = deps({
+      diagnose: async () => {
+        // 診断の間に名指しの run が終端し（idle でなくなり）、同じ Task の新しい run が作られる。
+        const claimed = storage.designReviewRuns.claim(runId, 3)
+        storage.designReviewRuns.complete(runId, claimed.claimToken!, 'failed', undefined, 'boom')
+        replacementId = storage.designReviewRuns.create({
+          taskId, taskTitle: 'design', designText: 'design text 2', designTextHash: 'hash-2', changedFiles: ['docs/notes.md'],
+        }).id
+        return JSON.stringify({ actionKind: 'rekick_design_review', rationale: 'queued run is idle', riskLevel: 'LOW' })
+      },
+      rekickDesignReview: async (_s, id) => { rekicked.push(id); return { status: 'evidence_registered' } },
+    })
+
+    const result = await runPlTick(storage, d)
+
+    expect(result.status).toBe('idle')
+    expect(result.reason).toContain('stale target')
+    expect(rekicked).toEqual([])
+    expect(countPriorAttempts(storage, `design_review_idle:${runId}`)).toBe(0)
+    expect(storage.designReviewRuns.findById(replacementId)?.status).toBe('queued')
   })
 })

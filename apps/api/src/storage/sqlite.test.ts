@@ -2343,6 +2343,32 @@ describe('SQLiteStorage', () => {
           expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)).ok).toBe(true)
         })
 
+        it('refuses with PROJECT_MISMATCH when the repair or source Job names another Project, keeping source ownership', () => {
+          // Task の Project は止まっていて、別 Project が running。呼び出し側の projectId を信じると通ってしまう形。
+          storage.projects.update(projectId, { status: 'paused' })
+          const other = storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'running' })
+          const source = createBlockedSourceJob()
+          const input = repairJobInput(source.id)
+
+          expect(storage.jobs.createRepairJobWithHandoff({ ...input, repairJob: { ...input.repairJob, projectId: other.id } }))
+            .toMatchObject({ ok: false, code: 'PROJECT_MISMATCH' })
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+
+          // source Job が別 Project を名指す場合も同じ。
+          const foreignSource = storage.jobs.create({
+            taskId,
+            projectId: other.id,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliMode: 'implement',
+          })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(foreignSource.id)))
+            .toMatchObject({ ok: false, code: 'PROJECT_MISMATCH' })
+          expect(storage.jobs.findById(foreignSource.id)?.status).toBe('blocked')
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey?.startsWith('repair:'))).toBe(false)
+        })
+
         it('transaction rolls back on successor creation failure, source Job REMAINS blocked (ownership retained)', () => {
           const source = createBlockedSourceJob()
 
