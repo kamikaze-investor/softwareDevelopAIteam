@@ -1,10 +1,4 @@
 import type { Job, Task } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
-import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import {
   buildDefaultCoordinatorDeps,
@@ -12,7 +6,7 @@ import {
   type CoordinatorDeps,
 } from '../designReview/designReviewCoordinator'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
-import { buildTaskContract } from '../implementPrompt'
+import { buildTaskContract, buildTaskDesignContract } from '../implementPrompt'
 import type { IStorage } from '../storage/interface'
 
 export type InitialImplementWorkflowResult =
@@ -34,15 +28,7 @@ export function buildInitialImplementAiCliPrompt(task: Pick<
   Task,
   'description' | 'acceptanceCriteria' | 'expectedOutputs' | 'allowedPaths' | 'forbiddenPaths'
 >): string {
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs({
-      predictedFocuses: (task.allowedPaths ?? []).flatMap(mapFileToFocuses),
-    }, principles),
-    principles,
-  })
-
-  return `${task.description}\n\n${buildTaskContract(task)}\n\n${designContract}`
+  return `${task.description}\n\n${buildTaskContract(task)}\n\n${buildTaskDesignContract(task)}`
 }
 
 /**

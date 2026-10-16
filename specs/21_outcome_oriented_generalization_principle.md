@@ -1,7 +1,7 @@
 # Outcome-Oriented Generalization Principle
 
 <!-- principle-id: evidence-not-spec -->
-<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification. -->
+<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause, check where it plausibly recurs within the Task scope (scaled to risk), fix the shared cause there and report suspected sites beyond it. -->
 <!-- principle-category: outcome-definition -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: core -->
@@ -11,6 +11,28 @@ to implement it." Within Required Outcomes / Non-Negotiable Invariants, preserve
 Freedom. Current implementation is evidence, not specification. Priority: Goal -> Design Philosophy ->
 Policy/Approval Policy -> Required Outcomes -> Non-Negotiable Invariants -> Stable Contract -> Current
 Implementation.
+Root Cause Generalization (fixing a defect, error or design inconsistency): the reported site is
+evidence, not the scope. Name the cause behind the symptom (the missing or duplicated owner, the
+unenforced invariant, the unhandled state or transition, the contract read from an incidental
+representation), then look for latent sites that share the named cause -- in other features, modules,
+layers, state transitions -- including ones that would show a different symptom. Size the search
+by how plausibly the cause is shared and by what its failure would cost (`scale-to-risk`): a typo
+needs none; a cause in a shared helper, contract, owner or state machine needs its consumers checked.
+This is never an unconditional whole-system audit, and it is scope of the fix, not re-verification of
+the same conclusion (Constitution 3.14 still bounds verification). When several sites share the cause,
+repair the shared cause and add what keeps it from recurring (the owner, contract, invariant or test
+that would have caught it) instead of patching each site; a duplicated or re-inferred owner is a
+common shared cause (`canonical-domain-meaning`). It targets sites sharing a found cause; it is not a
+reason to rewrite unrelated code (`existing-code-grandfather`). State the generalized cause and the
+scope searched in the change or its report (one line suffices for a small fix). Same-cause sites
+outside the current Task scope are recorded through an existing path (report, review finding, roadmap
+item), not silently widened into the change and not silently dropped. The cross-site search belongs
+to whoever scopes the work (PL / triage, when it decomposes findings and delegates), not to an
+implementer inside a bounded Task; the shared cause is itself the one finding of one bounded Task,
+which lists the reported symptoms it closes. A reviewer marks this principle CONFLICT only when the material it was given shows a same-cause
+site the change leaves untouched and unreported, and starts that reason with `[root_cause]`; when the
+material shows no other site the verdict is ALIGNED; UNCERTAIN only when the material hints at one it
+cannot confirm; never a demand for a search the material cannot show.
 
 <!-- principle-id: standard-design-frame -->
 <!-- principle-oneliner: Name the failure a constraint prevents before adding it. -->
@@ -172,7 +194,7 @@ would direct-to-target plus scale-down diagnosis on failure cost less in total; 
 justified.
 
 <!-- principle-id: canonical-domain-meaning -->
-<!-- principle-oneliner: Decide domain facts through their canonical owner; never re-infer them from incidental representation (string shape, prefix, ID format, ordering, timestamps, message text). -->
+<!-- principle-oneliner: Decide domain facts through their canonical owner -- one owner per meaning, distinct meanings kept distinct; never re-infer them from incidental representation (string shape, prefix, ID format, naming variants, ordering, timestamps, message text). -->
 <!-- principle-category: coupling -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: contextual -->
@@ -180,9 +202,18 @@ justified.
 ■ Canonical Domain Meaning. Each domain fact (authority, safety, lifecycle state, completion,
 current / superseded, lineage, entity relation, candidate selection, error meaning) has one canonical
 owner: the spec, policy, type or function already responsible for it. Consumers ask that owner instead
-of each re-deriving the fact from string shape, prefix / suffix, ID format, naming, ordering or
-"latest", timestamps, human-readable message text or fixture shape. Use the owner where it naturally
-lives; this principle alone never justifies a new resolver, abstraction, Gate, status or workflow.
+of each re-deriving the fact from string shape, prefix / suffix, ID format, naming or spelling
+variants, ordering or "latest", timestamps, human-readable message text or fixture shape. Use the owner
+where it naturally lives; this principle alone never justifies a new resolver, abstraction, Gate,
+status or workflow.
+One meaning, one owner: do not add a second independent owner (another predicate, mapping, table,
+status list or copy of the rule) for a fact that already has one. When two or more already exist, or
+the owner sits where its consumers cannot reach it naturally, prefer the smallest structural
+refactoring that leaves one owner (move it, delegate to it, delete the copy) over adding a layer on
+top. Do not merge distinct meanings: when consumers legitimately need different facts (e.g.
+"can view" vs "can edit", an amount in minor vs major currency units, "terminal" vs "succeeded"),
+name each fact and
+its owner explicitly instead of sharing one overloaded predicate, value or flag.
 Distinguish contractual representation (persisted schema, external API, event format, stable
 identifier) from incidental representation; changing a contractual one requires a migration /
 compatibility strategy. When it is unclear which one a persisted or externally observable

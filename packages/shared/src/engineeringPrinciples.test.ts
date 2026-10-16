@@ -208,6 +208,18 @@ describe('corePrincipleSlugs', () => {
   it('returns nothing when the registry is unavailable', () => {
     expect(corePrincipleSlugs(loadEngineeringPrinciples([missingPath]))).toEqual([])
   })
+
+  it('carries root cause generalization to every prompt through a core one-liner', () => {
+    // 実装・repair prompt は signal 無しで core だけを載せ、Design Contract には one-liner しか載らない。
+    // Root Cause Generalization が fix の現場へ届く経路はこの 1 行だけなので、ここで固定する。
+    const principles = loadForTest()
+    const contract = buildDesignContract({ slugs: selectPrincipleSlugs(undefined, principles), principles })
+    expect(contract).toContain('a reported failure is evidence of its cause')
+    // 範囲の上限（risk 相応・Task scope 内）も同じ 1 行で届くこと。上限が全文にしか無いと、
+    // core-only の repair prompt には「範囲を広げろ」だけが届く。
+    expect(contract).toContain('scaled to risk')
+    expect(contract).toContain('within the Task scope')
+  })
 })
 
 describe('selectPrinciples', () => {
@@ -311,6 +323,8 @@ describe('buildApplicablePrinciplesSection', () => {
     expect(section).toContain('Do not invent principle ids')
     // 全文ではなく one-liner だけを載せる（原則数に対して prompt が線形に太らない）。
     expect(section).not.toContain('an unfalsifiable TODO')
+    // root cause の verdict 上限は verdict を返す全 reviewer へ届く必要がある（ledger の集計対象）。
+    expect(section).toContain('give CONFLICT on root cause only when the material shows a same-cause site')
   })
 
   it('says so explicitly when nothing could be selected', () => {
@@ -331,6 +345,7 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     expect(guidance).toContain('- over_constraint (unnecessary_staging; report it as over_constraint): Stage by unknown, not by size')
     // canonical-domain-meaning は contextual principle なので、選択結果を経ずに常時注入しない。
     expect(guidance).not.toContain('semantic_reinference')
+    expect(guidance).toContain('start the message with [root_cause]')
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {

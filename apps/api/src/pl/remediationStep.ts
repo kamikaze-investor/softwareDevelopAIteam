@@ -55,11 +55,6 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Task } from '@ai-team/shared'
 import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
-import {
   extractDesignReviewFindings,
   getBaseRoadmapId,
   parseRemediationProposal,
@@ -72,7 +67,6 @@ import {
 } from '@ai-team/shared'
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
-import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import {
   executeRunner,
   recomputeDecision,
@@ -83,6 +77,7 @@ import {
 import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
 import { computeDesignTextHash, isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import { buildTaskDesignContract } from '../implementPrompt'
 import {
   adoptRoadmapItem,
   buildAdoptedDescription,
@@ -587,19 +582,11 @@ export function buildRemediationPrompt(input: {
 /**
  * Remediation AI へ渡す Design Contract。
  *
- * **実装 prompt と同じ関数から作る**（`buildInitialImplementAiCliPrompt()` と同じ
- * `selectPrincipleSlugs` + `buildDesignContract`）。別に組み立てると、Remediation が
- * 従う原則と実装側が従う原則がずれる。
+ * **実装 prompt と同じ owner（`buildTaskDesignContract()`）から作る**。別に組み立てると、
+ * Remediation が従う原則と実装側が従う原則がずれる。
  */
 function buildRemediationDesignContract(allowedPaths: readonly string[]): string {
-  const principles = loadEngineeringPrinciples()
-  return buildDesignContract({
-    slugs: selectPrincipleSlugs(
-      { predictedFocuses: [...allowedPaths].flatMap(mapFileToFocuses) },
-      principles,
-    ),
-    principles,
-  })
+  return buildTaskDesignContract({ allowedPaths: [...allowedPaths] })
 }
 
 // ────────────────────────────────────────────────────────────
