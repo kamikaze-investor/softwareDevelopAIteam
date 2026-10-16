@@ -4447,19 +4447,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     findByTaskId(taskId) {
       const rows = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY rowid DESC'
       ).all(taskId) as any[]
       return rows.map(deserializeDesignReviewEvidence)
     },
     findLatestByTaskId(taskId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(taskId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
     },
     findLatestBySubjectId(reviewKind, subjectId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(reviewKind, subjectId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
     },
@@ -4862,21 +4862,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
+    // **run / evidence の「最新」「新しい順」は挿入順（rowid）で決める。** created_at は ms 精度で
+    // 時計の巻き戻りもあり、後から挿入された CONFLICT run が「最新」にならないことがあった
+    // （独立レビュー round 11）。evidence の失効順序（findSupersedingRun）と同じ順序を使う。
+    // timestamp は表示用にだけ残す。
     findLatestByTaskId(taskId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
     findByTaskId(taskId) {
       const rows = db.prepare(
-        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY rowid DESC'
       ).all(taskId) as any[]
       return rows.map(deserializeDesignReviewRun)
     },
     findQueued() {
       const rows = db.prepare(
-        "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
+        "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY rowid ASC"
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
@@ -4891,7 +4895,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const rows = db.prepare(
         "SELECT * FROM design_review_runs "
         + "WHERE status = 'succeeded' AND repair_source_job_id IS NOT NULL "
-        + 'ORDER BY created_at ASC, rowid ASC'
+        + 'ORDER BY rowid ASC'
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },

@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
@@ -23,6 +23,7 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import type { Job, JobRefusalMetadata, ReviewStatus } from '@ai-team/shared'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
+import { findRemediationSubject } from './remediationStep'
 
 /**
  * ここで固定しているのは次の2つである。
@@ -1282,5 +1283,58 @@ describe('観測 — 既存 audit_log から集計できる', () => {
       cause: diagnosis.rootCauseClass,
       confidence: diagnosis.confidence,
     })
+  })
+})
+/**
+ * **「最新の run」は挿入順で決める**（独立レビュー round 11・2026-10-16）。
+ *
+ * 時計が巻き戻ると、後から挿入された CONFLICT run の created_at が古い ALIGNED run より前になる。
+ * created_at で並べると古い ALIGNED が「最新」になり、Remediation・Triage が CONFLICT を見失った。
+ */
+describe('時計の巻き戻り後に挿入された CONFLICT run', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('最新として返り、Remediation と Triage がその CONFLICT を見る', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T10:00:00.000Z'))
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'CONFLICT した項目', description: 'body', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], allowedPaths: ['apps/api/src'], acceptanceCriteria: ['c'],
+      roadmapTaskKey: 'conflicted-item', phase: 1, roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const designTextHash = computeDesignTextHash(designText)
+
+    // R1: 同じ設計を ALIGNED にした run（evidence 付き）。
+    const r1 = storage.designReviewRuns.create({ taskId: task.id, taskTitle: task.title, designText, designTextHash, changedFiles: [] })
+    const c1 = storage.designReviewRuns.claim(r1.id, 3)
+    storage.designReviewRuns.completeWithEvidence(r1.id, c1.claimToken!, JSON.stringify({
+      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+      integrationReviewResult: { decision: 'ALIGNED' },
+    }), {
+      reviewKind: 'task', subjectId: task.id, taskId: task.id, designTextHash,
+      reviewLoad: 'medium', decision: 'ALIGNED', independentReviewRequired: false,
+    })
+
+    // 時計が巻き戻った後に挿入された R2: 同じ設計の CONFLICT。
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    const r2 = storage.designReviewRuns.create({ taskId: task.id, taskTitle: task.title, designText, designTextHash, changedFiles: [] })
+    const c2 = storage.designReviewRuns.claim(r2.id, 3)
+    storage.designReviewRuns.complete(r2.id, c2.claimToken!, 'succeeded', JSON.stringify({
+      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'scope は 1 件に絞るべき' },
+      finalDecision: 'CONFLICT',
+    }))
+    expect(r2.createdAt < r1.createdAt).toBe(true)
+
+    expect(storage.designReviewRuns.findLatestByTaskId(task.id)?.id).toBe(r2.id)
+    expect(storage.designReviewRuns.findByTaskId(task.id)[0]?.id).toBe(r2.id)
+    expect(findRemediationSubject(storage, task.id)?.task.id).toBe(task.id)
+
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'task_ready_without_job', '2026-10-16T12:00:00.000Z'))
+    expect(diagnosis.rootCauseClass).toBe('design_review_conflict')
+    expect(diagnosis.recommendedLane).toBe('independent_remediation')
   })
 })
