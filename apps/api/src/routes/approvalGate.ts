@@ -529,6 +529,21 @@ export async function approvalGateRoutes(
         }
         linkedGitCommitApproval = linkedApproval
       }
+    } else if (jobId !== undefined) {
+      // 非 git_commit でも、jobId を名乗るなら実在する同じ Task の、同じ kind の Job でなければならない
+      // （2026-10-16 Codex review）。名乗った Job と別物の評価を gate_evaluations へ残さず、
+      // その応答の call_consume を別 Task / 別 action の Job に使わせない。
+      // jobId 無しの呼び出し（trusted internal caller の申告評価）は従来どおりで、consume は jobId 必須なので
+      // そこから承認を使い切ることはできない。
+      const job = storage.jobs.findById(jobId)
+      if (!job) {
+        return reply.status(404).send({ error: 'Job not found' })
+      }
+      if (job.taskId !== taskId || job.safeCommand.kind !== requestedAction) {
+        return reply.status(409).send({
+          error: 'Job task or requested action does not match the gate check',
+        })
+      }
     }
 
     // Risk Review（changedFiles ベース）
@@ -579,6 +594,30 @@ export async function approvalGateRoutes(
         sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
         existingReq = undefined
       }
+    }
+
+    // HIGH の SAFE_WORK（Worker は承認を待たずに continue_safe_work_only で走る）に残っている
+    // **同じ action の** WAITING は、誰も待っていない行である（この修正以前に作られた git_status 等の行。
+    // 2026-10-16 b8d0fc5d の approval-20261016-f73df27a）。PENDING_APPROVAL として返し続けると Task が
+    // 承認待ちに見え続けるので、既存の supersede と同じく SUPERSEDED にして、無い前提で判定し直す
+    // （下で新しい依頼も作らない）。別 action の行には触れない。CRITICAL は block_until_approved なので対象外。
+    if (
+      !isGitCommitPolicyAction
+      && riskReview.riskLevel === 'HIGH'
+      && isSafeWorkCommandKind(requestedAction)
+      && existingReq?.status === 'WAITING_FOR_USER'
+    ) {
+      storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
+      storage.auditLog.record({
+        actor: 'api',
+        operation: 'supersede',
+        entityType: 'approval_request',
+        entityId: existingReq.id,
+        result: 'success',
+        detail: `reason=safe_work_no_waiter requested_action=${requestedAction}`,
+      })
+      sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
+      existingReq = undefined
     }
 
     // **却下済み判定の探索は git_commit でも行う。**
@@ -1056,36 +1095,29 @@ export async function approvalGateRoutes(
       })
     }
 
-    // 非git_commit経路は既存契約を維持する。
-    // ただし jobId を名乗った consume は、その Job の action と承認の action が一致するときだけ通す
-    // （承認は自 action にしか効かない。2026-10-16 監査 RC4: 別 action の APPROVED が call_consume で
-    // 使い切られていた）。jobId 無し・Job 不在の呼び出しは従来どおり（ここで緩めも締めもしない）。
-    if (jobId !== undefined) {
-      const consumingJob = storage.jobs.findById(jobId)
-      if (consumingJob && consumingJob.safeCommand.kind !== request.requestedAction) {
-        return reply.status(409).send({
-          error: `Cannot consume: approval is for '${request.requestedAction}', not '${consumingJob.safeCommand.kind}'`,
-        })
-      }
+    // 非 git_commit の consume は、**それを使う実在の Job** に束縛する（2026-10-16 監査・Codex review）。
+    // 以前は jobId 省略・存在しない Job・別 Task の Job でも使い切れ、承認が Task にも実行にも
+    // 結び付いていなかった。この口を使うのは Worker の call_consume（gate/check の requestedAction =
+    // その Job の safeCommand.kind）だけなので、jobId を必須にし、Task 一致・kind 一致・APPROVED・未失効・
+    // commit / diff 一致を storage の 1 transaction で確かめてから CONSUMED にする。
+    // Task 単位の操作（abort_task・reconcile_external_completion・repair_from_stored_review:* 等）の承認は
+    // その名前の command kind を持つ Job が無いので、この口では決して consume できない
+    // （それぞれ verifyAndConsumeForTaskAction で消費する。/consume を迂回路にしない）。
+    if (!jobId) {
+      return reply.status(400).send({ error: 'jobId is required to consume an approval' })
     }
-    if (request.status !== 'APPROVED') {
-      return reply.status(409).send({
-        error: `Cannot consume: current status is '${request.status}' (must be APPROVED)`,
+    const consumed = storage.approvalRequests.consumeForCommandJob({
+      id: req.params.id,
+      jobId,
+      currentCommit,
+      currentDiffHash,
+    })
+    if (!consumed.ok) {
+      return reply.status(consumed.code === 'NOT_FOUND' || consumed.code === 'JOB_NOT_FOUND' ? 404 : 409).send({
+        error: consumed.reason,
       })
     }
-
-    if (new Date(request.expiresAt) <= new Date()) {
-      storage.approvalRequests.updateStatus(req.params.id, 'EXPIRED', undefined, true)
-      return reply.status(409).send({ error: 'Approval request has expired' })
-    }
-
-    if (request.targetCommit !== currentCommit || request.targetDiffHash !== currentDiffHash) {
-      storage.approvalRequests.updateStatus(req.params.id, 'STALE', undefined, true)
-      return reply.status(409).send({ error: 'Approval request is stale: commit or diff has changed' })
-    }
-
-    const updated = storage.approvalRequests.updateStatus(req.params.id, 'CONSUMED', undefined, true)
-    return reply.send(updated)
+    return reply.send(consumed.approvalRequest)
   })
 
   // GET /api/approval-requests/:id/active?taskId=xxx — アクティブな承認リクエストを取得

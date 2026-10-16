@@ -46,10 +46,13 @@ const BASE_REQUEST_PAYLOAD = {
 }
 
 async function createApprovalRequest(app: FastifyInstance, overrides: Record<string, unknown> = {}): Promise<ApprovalRequest> {
+  // 非 git_commit の consume は実在する Job（jobs.task_id は tasks への FK）に束縛されるので、
+  // 論理 taskId を実在の Task へ写す（2026-10-16）。
+  const merged = { ...BASE_REQUEST_PAYLOAD, ...overrides }
   const res = await app.inject({
     method: 'POST',
     url: '/api/approval-requests',
-    payload: { ...BASE_REQUEST_PAYLOAD, ...overrides },
+    payload: { ...merged, taskId: await ensureGateTask(app, String(merged.taskId)) },
   })
   expect(res.statusCode).toBe(201)
   return parseBody<ApprovalRequest>(res.body)
@@ -69,9 +72,10 @@ async function consumeRequest(
   app: FastifyInstance,
   id: string,
   payload: { jobId?: string; currentCommit: string; currentDiffHash: string },
+  options: { autoJob?: boolean } = {},
 ): Promise<{ statusCode: number; body: unknown }> {
   let effectivePayload = payload
-  if (!payload.jobId) {
+  if (!payload.jobId && options.autoJob !== false) {
     const { getStorage } = await import('../storage/index.js')
     const storage = getStorage()
     const approvalRequest = storage.approvalRequests.findById(id)
@@ -79,6 +83,14 @@ async function consumeRequest(
       const linkedJob = storage.jobs.findByTaskId(approvalRequest.taskId)
         .find((job) => job.approvalId === id)
       if (linkedJob) effectivePayload = { ...payload, jobId: linkedJob.id }
+    } else if (approvalRequest) {
+      // 非 git_commit の consume は、それを使う同じ Task・同じ action の Job に束縛される（2026-10-16）。
+      // 既存の consume 契約テストは「その action の Job が consume する」前提で、その Job を用意する。
+      const job = storage.jobs.create({
+        taskId: approvalRequest.taskId, projectId: 'consume-project', agentRole: 'developer_ai', status: 'running',
+        safeCommand: { kind: approvalRequest.requestedAction, workingDir: '/workspace/target' },
+      } as never)
+      effectivePayload = { ...payload, jobId: job.id }
     }
   }
   const res = await app.inject({
@@ -221,7 +233,7 @@ describe('POST /api/approval-requests/:id/consume', () => {
 
       const res = await app.inject({
         method: 'GET',
-        url: '/api/approval-requests/active?taskId=task-001',
+        url: `/api/approval-requests/active?taskId=${await ensureGateTask(app, 'task-001')}`,
       })
       expect(res.statusCode).toBe(200)
       const active = parseBody<ApprovalRequest | null>(res.body)
@@ -443,7 +455,7 @@ describe('findActiveByTaskId CONSUMED 除外', () => {
 
       const res = await app.inject({
         method: 'GET',
-        url: '/api/approval-requests/active?taskId=task-001',
+        url: `/api/approval-requests/active?taskId=${await ensureGateTask(app, 'task-001')}`,
       })
       expect(res.statusCode).toBe(200)
       const active = parseBody<ApprovalRequest | null>(res.body)
@@ -459,7 +471,7 @@ describe('findActiveByTaskId CONSUMED 除外', () => {
 
       const res = await app.inject({
         method: 'GET',
-        url: '/api/approval-requests/active?taskId=task-001',
+        url: `/api/approval-requests/active?taskId=${await ensureGateTask(app, 'task-001')}`,
       })
       expect(res.statusCode).toBe(200)
       const active = parseBody<ApprovalRequest | null>(res.body)
@@ -639,6 +651,8 @@ async function ensureGateTask(app: FastifyInstance, logicalTaskId: string): Prom
 
   const { getStorage } = await import('../storage/index.js')
   const storage = getStorage()
+  // 既に実在する Task id が渡されたらそのまま使う（写し直さない）。
+  if (storage.tasks.findById(logicalTaskId)) return logicalTaskId
   const project = storage.projects.create({
     name: `Gate project ${logicalTaskId}`,
     goal: 'Approval Gate test',
@@ -661,7 +675,7 @@ async function gateCheck(
   app: FastifyInstance,
   payload: Record<string, unknown>,
 ): Promise<{ statusCode: number; body: GateCheckResponse }> {
-  let effectivePayload = payload
+  let effectivePayload: Record<string, unknown> = { ...payload, taskId: await ensureGateTask(app, String(payload.taskId)) }
   if (payload.requestedAction === 'git_commit' && typeof payload.jobId !== 'string') {
     const { getStorage } = await import('../storage/index.js')
     const storage = getStorage()
@@ -921,7 +935,7 @@ describe('POST /api/gate/check', () => {
       await patchStatus(app, req.id, 'REJECTED')
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
-      const before = storage.approvalRequests.findByTaskId(taskId)
+      const before = storage.approvalRequests.findByTaskId(await ensureGateTask(app, taskId))
 
       const { statusCode, body } = await gateCheck(app, {
         ...BASE_GATE_PAYLOAD,
@@ -938,7 +952,7 @@ describe('POST /api/gate/check', () => {
       expect(body.nextAction.requestId).toBe(req.id)
       expect(body.approvalRequest?.id).toBe(req.id)
       expect(body.approvalRequest?.status).toBe('REJECTED')
-      expect(storage.approvalRequests.findByTaskId(taskId)).toHaveLength(before.length)
+      expect(storage.approvalRequests.findByTaskId(await ensureGateTask(app, taskId))).toHaveLength(before.length)
     })
   })
 
@@ -954,7 +968,7 @@ describe('POST /api/gate/check', () => {
       await patchStatus(app, req.id, 'REJECTED')
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
-      const before = storage.approvalRequests.findByTaskId(taskId)
+      const before = storage.approvalRequests.findByTaskId(await ensureGateTask(app, taskId))
 
       const { statusCode, body } = await gateCheck(app, {
         ...BASE_GATE_PAYLOAD,
@@ -969,7 +983,7 @@ describe('POST /api/gate/check', () => {
       expect(body.sideEffects[0].type).toBe('CREATED_APPROVAL_REQUEST')
       expect(body.approvalRequest?.id).not.toBe(req.id)
       expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
-      expect(storage.approvalRequests.findByTaskId(taskId)).toHaveLength(before.length + 1)
+      expect(storage.approvalRequests.findByTaskId(await ensureGateTask(app, taskId))).toHaveLength(before.length + 1)
     })
   })
 
@@ -1884,7 +1898,7 @@ describe('POST /api/gate/check — expired APPROVED cleanup (P2-followup)', () =
       const storage = getStorage()
       // 期限切れの APPROVED を直接 storage に作成
       const expiredReq = storage.approvalRequests.create({
-        taskId: 'gate-p2-016',
+        taskId: await ensureGateTask(app, 'gate-p2-016'),
         targetBranch: 'feat/test',
         targetCommit: 'commit-abc123',
         targetDiffHash: 'hash-deadbeef',
@@ -2237,12 +2251,14 @@ const IDENTITY_X = 'merge feature branch'
 const IDENTITY_Y = 'deploy preview'
 
 async function seedIdentityRequest(
-  taskId: string,
+  app: FastifyInstance,
+  logicalTaskId: string,
   requestedAction: string,
   status: 'WAITING_FOR_USER' | 'APPROVED' | 'REJECTED',
 ): Promise<ApprovalRequest> {
   const { getStorage } = await import('../storage/index.js')
   const storage = getStorage()
+  const taskId = await ensureGateTask(app, logicalTaskId)
   const created = storage.approvalRequests.create({
     taskId,
     targetBranch: BASE_GATE_PAYLOAD.targetBranch,
@@ -2271,7 +2287,7 @@ describe('POST /api/gate/check — approval identity is the requestedAction (202
   it('X 向けの APPROVED は Y の gate/check で call_consume されず、Y は自分の承認依頼を作る', async () => {
     await withApp(async (app) => {
       const taskId = 'identity-task-approved'
-      const approvedX = await seedIdentityRequest(taskId, IDENTITY_X, 'APPROVED')
+      const approvedX = await seedIdentityRequest(app, taskId, IDENTITY_X, 'APPROVED')
 
       const y = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: IDENTITY_Y })
       expect(y.statusCode).toBe(200)
@@ -2292,7 +2308,7 @@ describe('POST /api/gate/check — approval identity is the requestedAction (202
   it('X 向けの REJECTED は同じ diff の Y を REJECTED にしない（X 自身は REJECTED のまま）', async () => {
     await withApp(async (app) => {
       const taskId = 'identity-task-rejected'
-      const rejectedX = await seedIdentityRequest(taskId, IDENTITY_X, 'REJECTED')
+      const rejectedX = await seedIdentityRequest(app, taskId, IDENTITY_X, 'REJECTED')
 
       const y = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: IDENTITY_Y })
       expect(y.body.outcome.decision).toBe('BLOCKED')
@@ -2308,7 +2324,7 @@ describe('POST /api/gate/check — approval identity is the requestedAction (202
   it('X 向けの WAITING を Y の承認待ちと取り違えない（Y は依頼を作り、X の WAITING は畳まれる）', async () => {
     await withApp(async (app) => {
       const taskId = 'identity-task-waiting'
-      const waitingX = await seedIdentityRequest(taskId, IDENTITY_X, 'WAITING_FOR_USER')
+      const waitingX = await seedIdentityRequest(app, taskId, IDENTITY_X, 'WAITING_FOR_USER')
 
       const y = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: IDENTITY_Y })
       expect(y.body.outcome.decision).toBe('BLOCKED')
@@ -2324,9 +2340,9 @@ describe('POST /api/gate/check — approval identity is the requestedAction (202
   it('gate/check の作成は atomic op: Task の WAITING は action を問わず SUPERSEDED、別 action の APPROVED は残る', async () => {
     await withApp(async (app) => {
       const taskId = 'identity-task-atomic-gate'
-      const olderWaiting = await seedIdentityRequest(taskId, 'older action', 'WAITING_FOR_USER')
-      const newerWaiting = await seedIdentityRequest(taskId, 'newer action', 'WAITING_FOR_USER')
-      const approvedOther = await seedIdentityRequest(taskId, IDENTITY_X, 'APPROVED')
+      const olderWaiting = await seedIdentityRequest(app, taskId, 'older action', 'WAITING_FOR_USER')
+      const newerWaiting = await seedIdentityRequest(app, taskId, 'newer action', 'WAITING_FOR_USER')
+      const approvedOther = await seedIdentityRequest(app, taskId, IDENTITY_X, 'APPROVED')
 
       const y = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: IDENTITY_Y })
       expect(y.body.outcome.decision).toBe('BLOCKED')
@@ -2335,7 +2351,7 @@ describe('POST /api/gate/check — approval identity is the requestedAction (202
       expect(await identityStatusOf(approvedOther.id)).toBe('APPROVED')
 
       const { getStorage } = await import('../storage/index.js')
-      const waiting = getStorage().approvalRequests.findByTaskId(taskId)
+      const waiting = getStorage().approvalRequests.findByTaskId(await ensureGateTask(app, taskId))
         .filter((request) => request.status === 'WAITING_FOR_USER')
       expect(waiting.map((request) => request.id)).toEqual([y.body.approvalRequest?.id])
     })
@@ -2344,10 +2360,10 @@ describe('POST /api/gate/check — approval identity is the requestedAction (202
   it('POST /approval-requests も atomic op: WAITING は全部・同 action の APPROVED は SUPERSEDED、別 action の APPROVED は残る', async () => {
     await withApp(async (app) => {
       const taskId = 'identity-task-atomic-post'
-      const olderWaiting = await seedIdentityRequest(taskId, 'older action', 'WAITING_FOR_USER')
-      const newerWaiting = await seedIdentityRequest(taskId, IDENTITY_Y, 'WAITING_FOR_USER')
-      const approvedSame = await seedIdentityRequest(taskId, IDENTITY_X, 'APPROVED')
-      const approvedOther = await seedIdentityRequest(taskId, IDENTITY_Y, 'APPROVED')
+      const olderWaiting = await seedIdentityRequest(app, taskId, 'older action', 'WAITING_FOR_USER')
+      const newerWaiting = await seedIdentityRequest(app, taskId, IDENTITY_Y, 'WAITING_FOR_USER')
+      const approvedSame = await seedIdentityRequest(app, taskId, IDENTITY_X, 'APPROVED')
+      const approvedOther = await seedIdentityRequest(app, taskId, IDENTITY_Y, 'APPROVED')
 
       const created = await createApprovalRequest(app, { taskId, requestedAction: IDENTITY_X })
       expect(created.status).toBe('WAITING_FOR_USER')
@@ -2363,7 +2379,7 @@ describe('POST /api/gate/check — approval identity is the requestedAction (202
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
       const taskId = await ensureGateTask(app, 'identity-task-consume')
-      const approvedTest = await seedIdentityRequest(taskId, 'test', 'APPROVED')
+      const approvedTest = await seedIdentityRequest(app, taskId, 'test', 'APPROVED')
       const lintJob = storage.jobs.create({
         taskId, projectId: 'p', agentRole: 'qa_ai', status: 'running',
         safeCommand: { kind: 'lint', workingDir: '/workspace/target' },
@@ -2394,7 +2410,11 @@ describe('POST /api/gate/check — SAFE_WORK HIGH は誰も待たない承認依
     async (kind) => {
       await withApp(async (app) => {
         const taskId = `safe-work-high-${kind}`
-        const jobId = `job-${kind}`
+        const { getStorage: storageFor } = await import('../storage/index.js')
+        const jobId = storageFor().jobs.create({
+          taskId: await ensureGateTask(app, taskId), projectId: 'p', agentRole: 'qa_ai', status: 'running',
+          safeCommand: { kind, workingDir: '/workspace/target' },
+        } as never).id
         const { statusCode, body } = await gateCheck(app, {
           ...BASE_GATE_PAYLOAD, taskId, jobId, requestedAction: kind,
           changedFiles: ['docs/project_memory/rules/approval_rules.md'],
@@ -2410,7 +2430,7 @@ describe('POST /api/gate/check — SAFE_WORK HIGH は誰も待たない承認依
 
         const { getStorage } = await import('../storage/index.js')
         const storage = getStorage()
-        expect(storage.approvalRequests.findByTaskId(taskId)).toEqual([])
+        expect(storage.approvalRequests.findByTaskId(await ensureGateTask(app, taskId))).toEqual([])
         const evaluations = storage.gateEvaluations.findByJobId(jobId)
         expect(evaluations).toHaveLength(1)
         expect(evaluations[0]).toMatchObject({ decision: 'BLOCKED', riskLevel: 'HIGH' })
@@ -2452,6 +2472,127 @@ describe('POST /api/gate/check — SAFE_WORK HIGH は誰も待たない承認依
       expect(body.riskReview.riskLevel).toBe('HIGH')
       expect(body.continuationPolicy).toBe('continue_safe_work_only')
       expect(body.approvalRequest?.status).toBe('WAITING_FOR_USER')
+    })
+  })
+})
+
+describe('POST /api/approval-requests/:id/consume — 非 git_commit は実在する同じ Task・同じ action の Job に束縛 (2026-10-16 Codex review)', () => {
+  const REF = { currentCommit: BASE_GATE_PAYLOAD.targetCommit, currentDiffHash: BASE_GATE_PAYLOAD.targetDiffHash }
+
+  async function createJob(app: FastifyInstance, taskId: string, kind: string): Promise<Job> {
+    const { getStorage } = await import('../storage/index.js')
+    return getStorage().jobs.create({
+      taskId: await ensureGateTask(app, taskId), projectId: 'p', agentRole: 'qa_ai', status: 'running',
+      safeCommand: { kind, workingDir: '/workspace/target' },
+    } as never)
+  }
+
+  it('jobId 省略は 400、存在しない Job は 404、別 Task の Job は 409。いずれも APPROVED のまま', async () => {
+    await withApp(async (app) => {
+      const approved = await seedIdentityRequest(app, 'binding-task-a', 'test', 'APPROVED')
+      const otherTaskJob = await createJob(app, 'binding-task-b', 'test')
+
+      const missing = await consumeRequest(app, approved.id, REF, { autoJob: false })
+      expect(missing.statusCode).toBe(400)
+      const nonexistent = await consumeRequest(app, approved.id, { jobId: 'no-such-job', ...REF })
+      expect(nonexistent.statusCode).toBe(404)
+      const crossTask = await consumeRequest(app, approved.id, { jobId: otherTaskJob.id, ...REF })
+      expect(crossTask.statusCode).toBe(409)
+
+      expect(await identityStatusOf(approved.id)).toBe('APPROVED')
+    })
+  })
+
+  it('同じ Task・同じ action の Job なら consume され、2回目は 409', async () => {
+    await withApp(async (app) => {
+      const approved = await seedIdentityRequest(app, 'binding-task-ok', 'test', 'APPROVED')
+      const job = await createJob(app, 'binding-task-ok', 'test')
+
+      const first = await consumeRequest(app, approved.id, { jobId: job.id, ...REF })
+      expect(first.statusCode).toBe(200)
+      expect((first.body as ApprovalRequest).status).toBe('CONSUMED')
+      const second = await consumeRequest(app, approved.id, { jobId: job.id, ...REF })
+      expect(second.statusCode).toBe(409)
+    })
+  })
+
+  it('Task 単位の操作（abort_task）の承認は /consume では使い切れない（専用の consume 経路だけ）', async () => {
+    await withApp(async (app) => {
+      const approved = await seedIdentityRequest(app, 'binding-task-abort', 'abort_task', 'APPROVED')
+      const job = await createJob(app, 'binding-task-abort', 'test')
+
+      const res = await consumeRequest(app, approved.id, { jobId: job.id, ...REF })
+      expect(res.statusCode).toBe(409)
+      expect(await identityStatusOf(approved.id)).toBe('APPROVED')
+    })
+  })
+})
+
+describe('POST /api/gate/check — 非 git_commit の jobId も Task・action に束縛 (2026-10-16 Codex review)', () => {
+  it('存在しない jobId は 404、別 Task / 別 kind の Job は 409（評価も依頼も残さない）', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const taskId = 'gate-binding-task'
+      const otherTaskJob = storage.jobs.create({
+        taskId: await ensureGateTask(app, 'gate-binding-other'), projectId: 'p', agentRole: 'qa_ai', status: 'running',
+        safeCommand: { kind: 'build', workingDir: '/workspace/target' },
+      } as never)
+      const otherKindJob = storage.jobs.create({
+        taskId: await ensureGateTask(app, taskId), projectId: 'p', agentRole: 'qa_ai', status: 'running',
+        safeCommand: { kind: 'lint', workingDir: '/workspace/target' },
+      } as never)
+
+      const nonexistent = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'build', jobId: 'no-such-job' })
+      expect(nonexistent.statusCode).toBe(404)
+      const crossTask = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'build', jobId: otherTaskJob.id })
+      expect(crossTask.statusCode).toBe(409)
+      const otherKind = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'build', jobId: otherKindJob.id })
+      expect(otherKind.statusCode).toBe(409)
+
+      expect(storage.approvalRequests.findByTaskId(await ensureGateTask(app, taskId))).toEqual([])
+      expect(storage.gateEvaluations.findByTaskId(await ensureGateTask(app, taskId))).toEqual([])
+    })
+  })
+})
+
+describe('POST /api/gate/check — 誰も待たない legacy の同 action WAITING を畳む (2026-10-16 b8d0fc5d)', () => {
+  it('HIGH の git_status に残る同 action の WAITING は SUPERSEDED になり、新しい行は作らず continue_safe_work_only', async () => {
+    await withApp(async (app) => {
+      const taskId = 'legacy-safe-work-waiting'
+      const legacy = await seedIdentityRequest(app, taskId, 'git_status', 'WAITING_FOR_USER')
+      const otherAction = await seedIdentityRequest(app, taskId, IDENTITY_X, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status' })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.continuationPolicy).toBe('continue_safe_work_only')
+      expect(body.approvalRequest).toBeUndefined()
+      expect(body.sideEffects).toEqual([{ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: legacy.id }])
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      expect(await identityStatusOf(legacy.id)).toBe('SUPERSEDED')
+      expect(await identityStatusOf(otherAction.id)).toBe('APPROVED')
+      expect(storage.approvalRequests.findByTaskId(await ensureGateTask(app, taskId))).toHaveLength(2)
+      expect(storage.auditLog.findByEntity('approval_request', legacy.id).map((entry) => entry.operation))
+        .toContain('supersede')
+    })
+  })
+
+  it('CRITICAL の git_status は従来どおり同 action の WAITING を承認待ちとして返す', async () => {
+    await withApp(async (app) => {
+      const taskId = 'legacy-safe-work-critical'
+      const { body: first } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status', changedFiles: ['AGENTS.md'],
+      })
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status', changedFiles: ['AGENTS.md'],
+      })
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.continuationPolicy).toBe('block_until_approved')
+      expect(await identityStatusOf(first.approvalRequest!.id)).toBe('WAITING_FOR_USER')
     })
   })
 })
