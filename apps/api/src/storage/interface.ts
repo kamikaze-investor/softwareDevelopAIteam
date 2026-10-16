@@ -742,6 +742,12 @@ export interface IApprovalRequestStorage {
     currentDiffHash: string
   }): ConsumeApprovalForJobResult
   /**
+   * 誰も待っていない safe work の承認待ちを畳む（単一 transaction）。その Task・その requestedAction の
+   * WAITING_FOR_USER のうち、**保存 riskLevel が HIGH の行すべて**を SUPERSEDED にし、1 行ずつ
+   * `supersede` audit（reason=safe_work_no_waiter）を残す。CRITICAL の行には触れない。畳んだ id を返す。
+   */
+  supersedeUnwaitedSafeWorkRequests(taskId: string, requestedAction: string): string[]
+  /**
    * git_commit 以外の承認を、それを使う **実在する Job** に束縛して一度だけ consume する（単一 transaction）。
    * Job が同じ Task のもので、Job の command kind が承認の requestedAction と一致し、APPROVED・未失効・
    * commit / diff 一致のときだけ CONSUMED にする。期限切れは EXPIRED、commit / diff 不一致は STALE へ進める。

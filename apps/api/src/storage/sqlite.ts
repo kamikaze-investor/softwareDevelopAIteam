@@ -4489,6 +4489,37 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
       return approveTransaction()
     },
+    supersedeUnwaitedSafeWorkRequests(taskId, requestedAction): string[] {
+      // 2026-10-16 Codex review round 3: 最新 1 行だけを畳むと、同じ action の古い legacy WAITING
+      // （b8d0fc5d のような git_status の行）が生き残り、resume / Mobile を塞ぎ続ける。
+      // HIGH の行を全部、audit と同じ transaction で畳む。CRITICAL の行は Worker が待っていた判断なので残す。
+      const supersedeTransaction = db.transaction((): string[] => {
+        const ids = (db.prepare(`
+          SELECT id FROM approval_requests
+          WHERE task_id = ? AND requested_action = ? AND status = 'WAITING_FOR_USER' AND risk_level = 'HIGH'
+          ORDER BY created_at ASC, rowid ASC
+        `).all(taskId, requestedAction) as Array<{ id: string }>).map((row) => row.id)
+        const supersede = db.prepare(`
+          UPDATE approval_requests SET status = 'SUPERSEDED'
+          WHERE id = ? AND status = 'WAITING_FOR_USER'
+        `)
+        for (const id of ids) {
+          if (supersede.run(id).changes !== 1) {
+            throw new Error(`Failed to supersede approval request ${id}`)
+          }
+          auditLog.record({
+            actor: 'api',
+            operation: 'supersede',
+            entityType: 'approval_request',
+            entityId: id,
+            result: 'success',
+            detail: `reason=safe_work_no_waiter requested_action=${requestedAction}`,
+          })
+        }
+        return ids
+      })
+      return supersedeTransaction()
+    },
     consumeForCommandJob(input): ConsumeApprovalForCommandJobResult {
       // 2026-10-16 監査（Codex review）: 非 git_commit の /consume は Task にも実在する Job にも
       // 束縛されておらず、jobId 省略・存在しない Job・別 Task の Job でも使い切れた。

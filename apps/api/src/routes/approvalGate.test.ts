@@ -2684,3 +2684,73 @@ describe('POST /api/gate/check — 保存 riskLevel が CRITICAL の WAITING は
     })
   })
 })
+
+describe('POST /api/gate/check — 同 action の legacy WAITING は HIGH のものを全部畳む (Codex review round 3)', () => {
+  async function seedWaiting(app: FastifyInstance, logicalTaskId: string, riskLevel: 'HIGH' | 'CRITICAL'): Promise<ApprovalRequest> {
+    const { getStorage } = await import('../storage/index.js')
+    const created = getStorage().approvalRequests.create({
+      taskId: await ensureGateTask(app, logicalTaskId),
+      targetBranch: BASE_GATE_PAYLOAD.targetBranch,
+      targetCommit: BASE_GATE_PAYLOAD.targetCommit,
+      targetDiffHash: BASE_GATE_PAYLOAD.targetDiffHash,
+      riskLevel,
+      requestedAction: 'git_status',
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      invalidIf: [],
+    })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    return created
+  }
+
+  async function supersedeAudits(id: string): Promise<number> {
+    const { getStorage } = await import('../storage/index.js')
+    return getStorage().auditLog.findByEntity('approval_request', id)
+      .filter((entry) => entry.operation === 'supersede').length
+  }
+
+  it('HIGH 2 行 + CRITICAL 1 行: HIGH は両方 SUPERSEDED（各 audit 付き）、CRITICAL は残り PENDING_APPROVAL', async () => {
+    await withApp(async (app) => {
+      const taskId = 'multi-legacy-waiting'
+      const critical = await seedWaiting(app, taskId, 'CRITICAL') // 最古
+      const olderHigh = await seedWaiting(app, taskId, 'HIGH')
+      const newestHigh = await seedWaiting(app, taskId, 'HIGH') // 最新（最初に選ばれる行）
+
+      const { statusCode, body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status' })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.sideEffects).toEqual(expect.arrayContaining([
+        { type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: olderHigh.id },
+        { type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: newestHigh.id },
+      ]))
+      expect(body.sideEffects).toHaveLength(2)
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.outcome.requestId).toBe(critical.id)
+
+      expect(await identityStatusOf(olderHigh.id)).toBe('SUPERSEDED')
+      expect(await identityStatusOf(newestHigh.id)).toBe('SUPERSEDED')
+      expect(await identityStatusOf(critical.id)).toBe('WAITING_FOR_USER')
+      expect(await supersedeAudits(olderHigh.id)).toBe(1)
+      expect(await supersedeAudits(newestHigh.id)).toBe(1)
+      expect(await supersedeAudits(critical.id)).toBe(0)
+    })
+  })
+
+  it('HIGH 2 行だけなら両方畳み、新しい行は作らず continue_safe_work_only', async () => {
+    await withApp(async (app) => {
+      const taskId = 'multi-legacy-high-only'
+      const first = await seedWaiting(app, taskId, 'HIGH')
+      const second = await seedWaiting(app, taskId, 'HIGH')
+
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status' })
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.continuationPolicy).toBe('continue_safe_work_only')
+      expect(body.approvalRequest).toBeUndefined()
+      expect(await identityStatusOf(first.id)).toBe('SUPERSEDED')
+      expect(await identityStatusOf(second.id)).toBe('SUPERSEDED')
+
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().approvalRequests.findByTaskId(await ensureGateTask(app, taskId))).toHaveLength(2)
+    })
+  })
+})
