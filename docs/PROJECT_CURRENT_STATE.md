@@ -284,6 +284,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない**
 - **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた**
 - **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）**
+- **`canonical-domain-meaning` が初回実装 prompt と repair prompt に載らない**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
@@ -365,7 +366,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**（state: in_progress）
 - **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: planned）
 - **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）**（state: deferred）
-- **`canonical-domain-meaning` が初回実装 prompt と repair prompt に載らない**（state: planned）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->

@@ -28,7 +28,12 @@ Status・finding category は追加していない。正本は `specs/21`。
   の「coverage 拡張のためだけに本文を変えない」制約には当たらない（原則の意味の変更であり、CEO 指示）。
   RCG 由来の判定は記録される reason の先頭 `[root_cause]` で検索して区別できる（ledger 自体は接頭辞を解析しない）
 
-## 既知の gap（本変更前から存在。今回は直していない）
+## 既知の gap（本変更前から存在）
+
+**2026-10-16 追記（適用監査で一部解消）**: POST /jobs と repair の欠落は、原則選択の owner を
+`buildTaskDesignContract()` 1 箇所へ寄せて解消した（Roadmap 項目は done）。残る selection coverage の欠落
+（lifecycle / approval / target app の path では全経路で選ばれない）は `principle-registry-coverage-and-threshold-review`
+Task A へ移した。以下は当初の記録。
 
 `canonical-domain-meaning` は contextual で、`appendImplementContracts()` と
 `buildRepairPrompt()` は signal 無し（core のみ）で原則を選ぶため、初回実装 prompt と repair prompt には
