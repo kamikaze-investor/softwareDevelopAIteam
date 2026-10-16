@@ -876,7 +876,7 @@ async function actOnOperatorTarget(
     return { attempted: false, status: 'not_eligible', reason }
   }
 
-  const result = await handleTarget(storage, deps, item, state)
+  const result = await handleTargetBounded(storage, deps, item, state)
   return {
     attempted: true,
     status: result.status,
@@ -1726,16 +1726,30 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       }
     }
 
-    try {
-      return await handleTarget(storage, deps, item, before)
-    } catch (error: unknown) {
-      // 例外は従来どおり呼び出し側へ返す。ただし audit に試行を残せていない可能性があるので、
-      // プロセス内で数えて同じ上限で打ち切る（DB 書き込み障害で無限に再試行しない）。
-      recordInProcessFailedAttempt(targetKeyOf(item), error)
-      throw error
-    }
+    return await handleTargetBounded(storage, deps, item, before)
   } finally {
     inFlight = false
+  }
+}
+
+/**
+ * `handleTarget()` の唯一の呼び出し口（自律 tick と Operator Request の両方）。
+ *
+ * 例外は従来どおり呼び出し側へ返す。ただし audit に試行を残せていない可能性があるので、
+ * プロセス内で数えて同じ上限で打ち切る（DB 書き込み障害で無限に再試行しない。Codex round 3/4）。
+ * 上限に達した対象は `isActionableNow()` が外すので、どちらの経路からも再び選ばれない。
+ */
+async function handleTargetBounded(
+  storage: IStorage,
+  deps: PlLoopDeps,
+  item: AttentionItem,
+  before: SystemStateSnapshot,
+): Promise<PlTickResult> {
+  try {
+    return await handleTarget(storage, deps, item, before)
+  } catch (error: unknown) {
+    recordInProcessFailedAttempt(targetKeyOf(item), error)
+    throw error
   }
 }
 
