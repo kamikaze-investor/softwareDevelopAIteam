@@ -40,6 +40,20 @@ export function findGateTechnicalStopCode(text: string | undefined): GateTechnic
 }
 
 /**
+ * その Job が **Gate 段階の技術停止で blocked** になっているときの理由コード（D2）。
+ * コマンドが一度も実行されていない（exitCode も stdout ログも無い）ことも条件にする（実行後の出力で詐称させない）。
+ * API の attention（systemState）と PL triage（rule 6.8）が同じ判定を使う。
+ */
+export function gateTechnicalStopCodeOfJob(
+  job: { status: string; stderr?: string; exitCode?: number; stdoutPath?: string } | undefined,
+): GateTechnicalStopCode | undefined {
+  if (job === undefined || job.status !== 'blocked') return undefined
+  if (job.exitCode !== undefined && job.exitCode !== null) return undefined
+  if (job.stdoutPath !== undefined && job.stdoutPath !== null) return undefined
+  return findGateTechnicalStopCode(job.stderr)
+}
+
+/**
  * HIGH の承認待ち（`continue_safe_work_only`）の間も実行してよい CommandKind。
  * 読み取り・テスト・品質チェックだけで、コード変更・commit は含めない。
  *

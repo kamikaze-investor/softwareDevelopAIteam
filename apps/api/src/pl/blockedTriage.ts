@@ -68,7 +68,7 @@ import {
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
-import { findGateTechnicalStopCode, isLiveApprovedApproval } from '@ai-team/shared'
+import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
@@ -953,13 +953,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 照合は stderr の先頭だけ（findGateTechnicalStopCode）で、さらにコマンドが一度も実行されていない Job に限る
   // （Gate 段階の停止は exitCode も stdout ログも持たない。実行後の出力で技術停止を詐称させない）。
   // CEO が却下した git_commit は下の 7 の却下の扱い（指示つき Human Resume）を優先する。
-  const technicalStopCode =
-    facts.job?.status === 'blocked'
-    && facts.job.exitCode === undefined
-    && facts.job.stdoutPath === undefined
-    && facts.ceoRejectedGitCommit !== true
-      ? findGateTechnicalStopCode(facts.job.stderr)
-      : undefined
+  const technicalStopCode = facts.ceoRejectedGitCommit !== true ? gateTechnicalStopCodeOfJob(facts.job) : undefined
   if (facts.job !== undefined && technicalStopCode !== undefined && !hasLiveJob(facts)) {
     return {
       ...result,

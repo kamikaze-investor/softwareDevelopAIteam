@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest'
 import {
   GATE_TECHNICAL_STOP_CODES,
   findGateTechnicalStopCode,
+  gateTechnicalStopCodeOfJob,
   GATE_CHANGE_EXACT_FILES,
   runRiskReview,
   SAFE_WORK_COMMAND_KINDS,
@@ -217,5 +218,21 @@ describe('findGateTechnicalStopCode (D2)', () => {
 
   it('exposes exactly the two D2 codes', () => {
     expect([...GATE_TECHNICAL_STOP_CODES]).toEqual(['risk_rule_skew', 'approval_contract_violation'])
+  })
+})
+
+describe('gateTechnicalStopCodeOfJob (D2)', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew)'
+  it('a blocked Job that never executed, with the code at the start of stderr', () => {
+    expect(gateTechnicalStopCodeOfJob({ status: 'blocked', stderr: SKEW })).toBe('risk_rule_skew')
+  })
+  it.each([
+    ['not blocked', { status: 'failed', stderr: SKEW }],
+    ['executed (exitCode)', { status: 'blocked', stderr: SKEW, exitCode: 0 }],
+    ['executed (stdout log)', { status: 'blocked', stderr: SKEW, stdoutPath: '/logs/x.out' }],
+    ['code on a later line', { status: 'blocked', stderr: `out\n${SKEW}` }],
+    ['no stderr', { status: 'blocked' }],
+  ])('%s → undefined', (_label, job) => {
+    expect(gateTechnicalStopCodeOfJob(job)).toBeUndefined()
   })
 })

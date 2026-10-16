@@ -42,6 +42,7 @@ export {
   isSafeWorkCommandKind,
   GATE_TECHNICAL_STOP_CODES,
   findGateTechnicalStopCode,
+  gateTechnicalStopCodeOfJob,
   type GateTechnicalStopCode,
   runRiskReview,
   resolveEffectiveStatus,
