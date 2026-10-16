@@ -516,7 +516,7 @@ describe('runStrategicMetaReview', () => {
     const strategicPrompt = prompts.find((prompt) => prompt.includes('Focus only on strategic_alignment'))
 
     // 選択は原則 routing（focus → 原則）が決め、checklist はその原則の guidance として載る。
-    expect(dataPrompt).toContain('- canonical-domain-meaning: Decide domain facts through their canonical owner')
+    expect(dataPrompt).toContain('- canonical-domain-meaning: Decide each domain fact through its single canonical owner')
     expect(dataPrompt).toContain('## docs/meta_reviewer/checklists/semantic_integrity.md')
     expect(dataPrompt).toContain('[semantic_reinference]')
     // focus 自身の checklist は従来どおり残る。

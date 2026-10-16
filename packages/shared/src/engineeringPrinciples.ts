@@ -27,6 +27,7 @@ export type PrincipleSlug =
   | 'observation-closes-loop'
   | 'unknown-driven-staging'
   | 'canonical-domain-meaning'
+  | 'root-cause-generalization'
 
 /** core = signal によらず毎回適用される。contextual = signal から選ばれたときだけ適用される。 */
 export type PrincipleTier = 'core' | 'contextual'
@@ -87,6 +88,7 @@ const ALL_PRINCIPLE_SLUGS: readonly PrincipleSlug[] = [
   'observation-closes-loop',
   'unknown-driven-staging',
   'canonical-domain-meaning',
+  'root-cause-generalization',
 ] as const
 
 const SLUG_SET = new Set<string>(ALL_PRINCIPLE_SLUGS)
@@ -335,6 +337,7 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
   const standardDesignFrame = principles.bySlug.get('standard-design-frame')
   const honestUnverifiable = principles.bySlug.get('honest-unverifiable')
   const unknownDrivenStaging = principles.bySlug.get('unknown-driven-staging')
+  const rootCause = principles.bySlug.get('root-cause-generalization')
 
   return [
     '## Engineering Principle Review Guidance',
@@ -343,6 +346,9 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
     // unnecessary_staging は over_constraint の一種として報告させる（新しい category を作らない）。
     `- over_constraint (unnecessary_staging; report it as over_constraint): ${unknownDrivenStaging?.oneLiner ?? 'Principle unknown-driven-staging was not available; do not treat it as applied.'}`,
     `- unverifiable_assumption: ${honestUnverifiable?.oneLiner ?? 'Principle honest-unverifiable was not available; do not treat it as applied.'}`,
+    // root-cause-generalization は core なので、per-principle verdict を持たない Meta Review（PR）にも
+    // ここから届ける。修正の原因・探索範囲の欠落は unverifiable_assumption の一種として報告させる。
+    `- unverifiable_assumption (unexamined_root_cause; report it as unverifiable_assumption): ${rootCause?.oneLiner ?? 'Principle root-cause-generalization was not available; do not treat it as applied.'}`,
   ].join('\n')
 }
 

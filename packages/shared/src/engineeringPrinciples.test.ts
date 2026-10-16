@@ -87,6 +87,25 @@ describe('loadEngineeringPrinciples', () => {
     expect(meaning?.fullText).toContain('similar representation with different meaning gives a different result')
     // 一般原則である。発見の契機になった個別 incident の表現を本文へ持ち込まない。
     expect(meaning?.fullText.toLowerCase()).not.toContain('resume')
+    // 第二の正本を足さないこと・別概念を表現の類似だけで統合しないことの両方向を持つ。
+    expect(meaning?.oneLiner).toContain('never add a second independent owner')
+    expect(meaning?.fullText).toContain('do not merge concepts that only share a name, value or')
+    expect(meaning?.fullText).toContain('smallest')
+    expect(meaning?.fullText).toContain('root-cause-generalization')
+
+    // root-cause-generalization は「修正である」という signal が提案の中身にしか無いので、
+    // observation-closes-loop と同じ理由で core に置く（focus / risk から選ぶと当て推量になる）。
+    const rootCause = result.bySlug.get('root-cause-generalization')
+    expect(rootCause?.tier).toBe('core')
+    expect(rootCause?.category).toBe('outcome-definition')
+    expect(rootCause?.scope).toBe('universal')
+    expect(rootCause?.fullText).toContain('never means an unconditional whole-system audit')
+    expect(rootCause?.fullText).toContain('Group by cause, not by resemblance')
+    expect(rootCause?.fullText).toContain('not silently fixed')
+    expect(rootCause?.fullText).toContain('`unexamined_root_cause`')
+    for (const incidentWord of ['lifecycle', 'resume', 'git_commit', 'aiteamos']) {
+      expect(rootCause?.fullText.toLowerCase()).not.toContain(incidentWord)
+    }
   })
 
   it('derives a version hash that ignores line-ending differences', () => {
@@ -202,6 +221,7 @@ describe('corePrincipleSlugs', () => {
       'standard-design-frame',
       'observable-behavior',
       'observation-closes-loop',
+      'root-cause-generalization',
     ])
   })
 
@@ -271,7 +291,7 @@ describe('selectPrinciples', () => {
 
     const selection = selectPrinciples({ predictedFocuses: ['data_state_integrity'] }, principles)
     const contract = buildDesignContract({ slugs: selection.map((item) => item.slug), principles })
-    expect(contract).toContain('Decide domain facts through their canonical owner')
+    expect(contract).toContain('Decide each domain fact through its single canonical owner')
   })
 
   it('records risk-derived selections separately from focus-derived ones', () => {
@@ -329,6 +349,8 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     expect(guidance).toContain('- unverifiable_assumption: Report unverifiable claims honestly instead of turning guesses into PASS.')
     // unnecessary_staging は独立 category ではなく over_constraint の一種として報告させる。
     expect(guidance).toContain('- over_constraint (unnecessary_staging; report it as over_constraint): Stage by unknown, not by size')
+    // root-cause-generalization は core なので、原則 verdict を返さない review 経路にも常に届ける。
+    expect(guidance).toContain('- unverifiable_assumption (unexamined_root_cause; report it as unverifiable_assumption): When fixing a defect, remove its cause')
     // canonical-domain-meaning は contextual principle なので、選択結果を経ずに常時注入しない。
     expect(guidance).not.toContain('semantic_reinference')
   })
