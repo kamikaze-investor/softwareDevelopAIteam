@@ -92,6 +92,9 @@ function initTargetRepo(ledger: string): void {
   git(['config', 'user.name', 'lifecycle-e2e'])
   git(['config', 'core.autocrlf', 'false'])
   git(['config', 'commit.gpgsign', 'false'])
+  // production（Linux VPS）と同じく executable bit を git status に出す。Windows の git init は false にするため、
+  // そのままだと Worker の観測が blind spot ありと判定する（`detectUnreportableWorkspaceState()`）。
+  git(['config', 'core.filemode', 'true'])
   mkdirSync(path.join(LIFECYCLE_TARGET_DIR, 'tasks'), { recursive: true })
   mkdirSync(path.join(LIFECYCLE_TARGET_DIR, 'docs', 'project_memory'), { recursive: true })
   writeFileSync(path.join(LIFECYCLE_TARGET_DIR, 'tasks', 'roadmap.md'), ledger)
@@ -119,6 +122,8 @@ export type ImplementOutcome =
   | { kind: 'fail'; stderr: string; files?: Record<string, string> }
   /** containment が静止を証明できなかった（Worker は quarantine 付き blocked を報告する）。 */
   | { kind: 'quarantine'; reason: string; files?: Record<string, string> }
+  /** File Change Guard 違反（Worker は自分の変更を取り消してから Guard 違反の blocked を報告する）。 */
+  | { kind: 'guard_violation'; violations: string[]; files?: undefined }
 
 /** review の AI 出力の代わり。`unstructured` は structured result を返せずに終わった review。 */
 export type ReviewOutcome =
@@ -288,7 +293,20 @@ export class WorkerSimulator {
     return executed
   }
 
+  /**
+   * 次の terminal 結果を **PATCH せずに** この callback へ渡して終わる（Worker が Outbox に記録した直後に
+   * 落ちた形）。callback は本物の `outboxStore.recordPending()` に記録する想定。1 回で解除される。
+   */
+  crashBeforeNextReport: ((jobId: string, payload: Record<string, unknown>) => void) | undefined
+
   private async report(job: Job, payload: Record<string, unknown>, step: WorkerStep): Promise<void> {
+    if (this.crashBeforeNextReport) {
+      const crash = this.crashBeforeNextReport
+      this.crashBeforeNextReport = undefined
+      crash(job.id, payload)
+      step.reported = payload.status as Job['status']
+      return
+    }
     const delivery = withOutbox(payload)
     this.lastDelivery = { jobId: job.id, payload: delivery }
     const res = await this.env.api<{ error?: string }>('PATCH', `/api/jobs/${job.id}`, delivery, 'worker')
@@ -423,6 +441,19 @@ export class WorkerSimulator {
     if (job.aiCliMode === 'implement') {
       const outcome = this.behaviors.implement(job, task)
       if (outcome.files) writeFiles(outcome.files)
+      if (outcome.kind === 'guard_violation') {
+        // `revertBlockedJobChanges()` 済みの形: worktree は Job 開始時のまま、Guard 違反の blocked を報告する。
+        await this.report(running, {
+          status: 'blocked',
+          exitCode: 0,
+          stderr: `File change guard violation: ${outcome.violations.join(', ')}`,
+          changedFiles: [],
+          guardResult: { permissionAllowed: true, fileChangeAllowed: false, fileViolations: outcome.violations },
+          completedAt: new Date().toISOString(),
+          failureMetadata: { workspaceEndFingerprint: endFingerprint(running) },
+        }, step)
+        return step
+      }
       if (outcome.kind === 'quarantine') {
         // `quarantineRunningJob()` と同じ payload（containment / reconciliation が静止を証明できなかった）。
         const message = `workspace could not be proven quiescent: ${outcome.reason}`
@@ -779,4 +810,55 @@ export function claimBody(job: Job): Record<string, unknown> {
   const baseline = computeWorkspaceBaseline(job, LIFECYCLE_TARGET_DIR)
   if (!baseline.ok) throw new Error(`baseline failed: ${baseline.reason}`)
   return { status: 'running', startedAt: new Date().toISOString(), workspaceBaseline: baseline.baseline }
+}
+
+export interface FetchBridge {
+  /** bridge を通った request（method + path）。 */
+  readonly calls: Array<{ method: string; path: string; status: number; requestBody?: string; responseBody?: string }>
+  /** 返すと、その request は API へ届かずこの status で失敗する（一時障害の模擬）。 */
+  failWith: ((method: string, path: string) => number | undefined) | undefined
+  restore(): void
+}
+
+/**
+ * **本物の Worker 関数**（`patchJobWithRetry()` / `recoverStaleJobs()` / `reportAbortCleanupObservations()` など、
+ * global `fetch` を使うもの）を、この Fastify app へ in-process でつなぐ。host は無視し path + query だけを
+ * `app.inject()` へ渡す。Worker の credential は API_TOKEN 由来なので、ここで WORKER token に差し替える
+ * （network 層の役目。route 側の auth / allowlist は本物が効く）。
+ */
+export function installFetchBridge(env: LifecycleEnv): FetchBridge {
+  const original = globalThis.fetch
+  const bridge: FetchBridge = {
+    calls: [],
+    failWith: undefined,
+    restore: () => {
+      globalThis.fetch = original
+    },
+  }
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url)
+    const method = (init?.method ?? 'GET').toUpperCase()
+    const pathWithQuery = `${url.pathname}${url.search}`
+    const injected = bridge.failWith?.(method, url.pathname)
+    if (injected !== undefined) {
+      bridge.calls.push({ method, path: url.pathname, status: injected })
+      return new Response(JSON.stringify({ error: 'simulated outage' }), { status: injected })
+    }
+    const res = await env.app.inject({
+      method: method as 'GET' | 'POST' | 'PATCH',
+      url: pathWithQuery,
+      headers: {
+        authorization: `Bearer ${WORKER_TOKEN}`,
+        ...(typeof init?.body === 'string' ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(typeof init?.body === 'string' ? { payload: init.body } : {}),
+    })
+    bridge.calls.push({
+      method, path: url.pathname, status: res.statusCode,
+      ...(typeof init?.body === 'string' ? { requestBody: init.body } : {}),
+      responseBody: res.body,
+    })
+    return new Response(res.body, { status: res.statusCode, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  return bridge
 }
