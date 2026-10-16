@@ -356,12 +356,16 @@ export function buildSystemState(
           error: run.error,
           idle,
         }
+        // 両 attention とも同一性は **run 単位**（`referenceId: run.id`）。Task 単位だと、
+        // 1回目の episode を escalation 済み・budget 消費済みとした記録が、同じ Task の
+        // 新しい Design Review run（2回目の episode）まで黙らせる（task_blocked_without_job と同じ理由）。
         if (idle) {
           attention.push({
             kind: 'design_review_idle',
             projectId: project.id,
             projectName: project.name,
             taskId: currentTask.id,
+            referenceId: run.id,
             detail:
               `design review run is queued with no execution in progress `
               + `(attempt ${run.attemptCount}${run.error ? `, last error: ${run.error}` : ''})`,
@@ -374,6 +378,7 @@ export function buildSystemState(
             projectId: project.id,
             projectName: project.name,
             taskId: currentTask.id,
+            referenceId: run.id,
             detail: `design review failed after ${run.attemptCount} attempt(s)`
               + `${run.error ? `: ${run.error}` : ''}`,
             stuckForMs: elapsedMs(run.completedAt ?? run.createdAt, nowMs),

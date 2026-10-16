@@ -279,7 +279,9 @@ function buildRoadmapRejectedReason(
  *
  * 構造検証で不採用にするもの:
  *   - 再計算した focus 集合と runner の focusedReviewResults が一致しない場合
- *   - critical なのに independentReviewResult が欠落している場合
+ *
+ * critical なのに independentReviewResult が欠落・unavailable の場合は不採用ではなく、
+ * focused が CONFLICT なら CONFLICT、それ以外は REVIEW_UNAVAILABLE（判定無し）を返す。
  *
  * 残存リスク（本実装で解消したと主張しないもの）:
  *   各focusのdecision・integrationのdecision・independent reviewのverdict自体は
@@ -377,14 +379,19 @@ export function recomputeDecision(
     | { verdict?: string; unavailable?: boolean }
     | undefined
 
-  if (independentReviewRequired && (!independent || typeof independent.verdict !== 'string')) {
-    return reject('critical review load requires an independent review result')
-  }
+  // critical で independent が欠落していても、**ここでは reject しない。**
+  // 欠落は「判定が無い」であって「判定が否定的」ではないので、focused の CONFLICT を
+  // 見てから結論を決める（下の base decision 参照）。
+  const independentMissing = !independent || typeof independent.verdict !== 'string'
 
   // verdict は reviewerAdapter の定義値のみ受理する。未知の文字列をそのまま evidence へ
   // 保存すると、decisionはALIGNEDなのにJob Gate（independentReviewVerdict === 'approved'）が
   // 恒久的に落ちる不整合状態になるため、ここで弾く。
-  if (independent && !INDEPENDENT_REVIEW_VERDICTS.includes(independent.verdict as never)) {
+  if (
+    independent &&
+    !(independentReviewRequired && independentMissing) &&
+    !INDEPENDENT_REVIEW_VERDICTS.includes(independent.verdict as never)
+  ) {
     return reject(`unknown independent review verdict: ${String(independent.verdict)}`)
   }
 
@@ -413,6 +420,36 @@ export function recomputeDecision(
     raw.focusedReviewResults as never,
     integration as never,
   )
+
+  if (independentReviewRequired && (independentMissing || independent?.unavailable === true)) {
+    const independentState = independentMissing ? 'missing' : 'unavailable'
+    // **focused の CONFLICT は independent の欠落より先に返す。**
+    //
+    // 以前は欠落を最初に reject していたため、critical load で independent が取れないと
+    // focused の実質的な CONFLICT が「レビューできなかった」に置き換わり、CONFLICT だけを
+    // 対象にする remediation が動かなかった（2026-10-16 production・Task `b8d0fc5d` の
+    // repair run `c11357e8`: scope_simplicity=CONFLICT・Codex logout で independent 欠落）。
+    // CONFLICT は ALIGNED から遠ざける向きにしか働かないので、independent 無しで確定してよい。
+    if (decision === 'CONFLICT') {
+      return {
+        decision: 'CONFLICT',
+        reviewLoad,
+        independentReviewRequired,
+        independentReviewVerdict: independentMissing ? undefined : independent?.verdict,
+        rejectedReason: `focused review found a CONFLICT; the independent review result was ${independentState}`,
+      }
+    }
+    // それ以外は判定そのものが無い。critical の ALIGNED は approved な independent を要する。
+    return {
+      decision: 'REVIEW_UNAVAILABLE',
+      reviewLoad,
+      independentReviewRequired,
+      independentReviewVerdict: independentMissing ? undefined : independent?.verdict,
+      rejectedReason: independentMissing
+        ? 'critical review load requires an independent review result'
+        : 'critical review load requires an independent review result, but it was unavailable',
+    }
+  }
 
   if (independentReviewRequired && independent) {
     decision = applyIndependentReviewOverride(decision, independent as never) as RecomputedDecision
@@ -702,6 +739,23 @@ export async function executeDesignReviewRun(
   // （同じ run.id なので unique index が後勝ちを許さない）。
   // 結果として **Review が採用しなかった判定が ledger に残る**（独立レビュー指摘 2026-09-17 第2回）。
   // ALIGNED でない結果も記録したいので、両方の分岐の fence 直後に置く。
+
+  // **task kind の REVIEW_UNAVAILABLE は判定ではない。** runner が使える判定を返さなかった
+  // のと同じなので、runner crash と同じ `finalizeFailure()`（attempt 残があれば requeue、
+  // 上限で failed）で終端する。以前は `succeeded` / not_aligned として確定させていたため、
+  // Codex logout のような一時的な欠落でも retry されず escalation された（Task `b8d0fc5d`）。
+  // 判定が無いので principle ledger にも記録しない（finalizeFailure 経路と同じ扱い）。
+  // roadmap kind はこの関数の挙動を変えない。
+  if (run.reviewKind === 'task' && outcome.decision === 'REVIEW_UNAVAILABLE') {
+    const failure = finalizeFailure(
+      storage,
+      claimed.run,
+      claimToken,
+      appendRunnerStderr(outcome.rejectedReason ?? 'review unavailable', execution.stderr),
+    )
+    // 呼び出し側の escalation 理由に「なぜ判定が無いか」を残すため decision を添える。
+    return failure.status === 'stale' ? failure : { ...failure, decision: 'REVIEW_UNAVAILABLE' }
+  }
 
   if (outcome.decision !== 'ALIGNED') {
     if (execution.stderr) {

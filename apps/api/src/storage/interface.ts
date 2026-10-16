@@ -174,9 +174,19 @@ export type CreateRepairJobWithHandoffResult =
   | { ok: true; repairJob: Job }
   | {
       ok: false
-      code: 'SOURCE_JOB_NOT_FOUND' | 'STORAGE_ERROR'
+      code: 'SOURCE_JOB_NOT_FOUND' | 'STORAGE_ERROR' | RepairHandoffRefusalCode
       reason: string
     }
+
+/**
+ * handoff transaction 内で Task / Project 状態を確かめ直して断ったときの理由。
+ * 断った場合 repair Job は作られず、source Job の所有権も変わらない。
+ */
+export type RepairHandoffRefusalCode =
+  | 'TASK_NOT_FOUND'
+  | 'TASK_DONE'
+  | 'TASK_PARKED'
+  | 'PROJECT_NOT_RUNNING'
 
 export type PersistReviewWorkflowResult =
   | {
@@ -471,6 +481,10 @@ export interface IJobStorage {
    *      成功した実装の結果を書き換えてしまうため（2026-09-25 修正）。
    *   3. この handoff に属する Task / recovery 状態更新（あれば）を適用
    * いずれかが失敗したら transaction 全体が rollback し、source Job は `blocked` のまま。
+   *
+   * 1 の前に、同じ transaction 内で Task が存在し `done` でも park 済みでもないこと、
+   * Project が `running` であることを確かめ直す。満たさなければ何も書かずに
+   * `RepairHandoffRefusalCode` で断る（`blocked` な Task は断らない）。
    */
   createRepairJobWithHandoff(input: {
     sourceJobId: string

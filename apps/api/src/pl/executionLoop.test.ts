@@ -909,7 +909,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
   })
 
   it('対象が残った technical recovery は試行上限で止まるが CEO へ上げない', async () => {
-    const { storage, taskId } = seedIdleDesignReview()
+    const { storage, runId } = seedIdleDesignReview()
     const escalations: string[] = []
     const d = deps({
       // 「成功した」と言うだけで何もしない実行 → 対象は消えない
@@ -927,7 +927,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
     expect(escalations).toEqual([])
 
     const exhaustionAudits = storage.auditLog
-      .findByEntity('pl_loop_target', `design_review_idle:${taskId}`)
+      .findByEntity('pl_loop_target', `design_review_idle:${runId}`)
       .filter((entry) => entry.result === 'technical_exhausted')
     expect(exhaustionAudits).toHaveLength(1)
     expect(exhaustionAudits[0]?.detail).toContain('scope=target')
@@ -936,7 +936,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
     resetPlLoopInFlightForTest()
     await runPlTick(storage, d)
     expect(storage.auditLog
-      .findByEntity('pl_loop_target', `design_review_idle:${taskId}`)
+      .findByEntity('pl_loop_target', `design_review_idle:${runId}`)
       .filter((entry) => entry.result === 'technical_exhausted')).toHaveLength(1)
   })
 })
@@ -1130,11 +1130,11 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
   })
 
   it('technical exhaustion は対象 Project だけを待たせ、別の idle Project の採用を止めない', async () => {
-    const { storage, taskId } = seedIdleDesignReview()
+    const { storage, taskId, runId } = seedIdleDesignReview()
     const exhaustedProjectId = storage.projects.findAll()[0]!.id
     recordTargetAttempts(
       storage,
-      `design_review_idle:${taskId}`,
+      `design_review_idle:${runId}`,
       PL_MAX_ATTEMPTS_PER_TARGET,
     )
     storage.projects.update(exhaustedProjectId, { status: 'paused' })

@@ -17,7 +17,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
 import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
@@ -806,6 +806,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       + "AND operation = 'task_aborted' AND result = 'success' LIMIT 1",
     ).get(taskId)
     return row !== undefined
+  }
+
+  /**
+   * repair handoff を断る理由（無ければ undefined）。`createRepairJobWithHandoff` の
+   * transaction 内からだけ呼ぶ —— 外で呼ぶと判定と Job 作成の間に状態が変わりうる。
+   */
+  function repairHandoffRefusal(
+    taskId: string,
+    projectId: string,
+  ): { code: RepairHandoffRefusalCode; reason: string } | undefined {
+    const task = db.prepare('SELECT status FROM tasks WHERE id = ?').get(taskId) as { status: string } | undefined
+    if (task === undefined) return { code: 'TASK_NOT_FOUND', reason: 'task no longer exists' }
+    if (task.status === 'done') return { code: 'TASK_DONE', reason: 'task is already done' }
+    if (isParkedTaskId(taskId)) return { code: 'TASK_PARKED', reason: 'task was parked by abort_task while the review ran' }
+    const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(projectId) as { status: string } | undefined
+    if (project?.status !== 'running') {
+      return { code: 'PROJECT_NOT_RUNNING', reason: `project is not running (${project?.status ?? 'missing'})` }
+    }
+    return undefined
   }
 
   /**
@@ -2382,6 +2401,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     createRepairJobWithHandoff(input) {
       const handoffTransaction = db.transaction((): CreateRepairJobWithHandoffResult => {
+        // 0) **Task / Project 状態の再確認は Job を作る transaction の中で行う。**
+        //    Design Review run は handoff の時点で既に succeeded なので、呼び出し側で先に
+        //    確かめると、その後に done / park / Project 停止が起きても repair Job が作られる
+        //    （TOCTOU）。断るときは何も書かず、source Job の所有権にも触らない。
+        //    **blocked では断らない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
+        const refusal = repairHandoffRefusal(input.repairJob.taskId, input.repairJob.projectId)
+        if (refusal !== undefined) {
+          return { ok: false, ...refusal }
+        }
+
         // 1) 後続 repair Job を**先に**作成する。所有権保持（queued + non-initial
         //    workflowStepKey）であり、source Job を解放する前に workspace の所有者が
         //    1本でも存在することを保証する。

@@ -923,3 +923,110 @@ function readFileIfExists(p: string): string | undefined {
     return undefined
   }
 }
+
+/**
+ * **「判定が無い」と否定的な判定を分ける**（2026-10-16 production・Task `b8d0fc5d` の run `c11357e8`）。
+ *
+ * critical load で independent review が取れない（Codex logout）と、focused の実質的な CONFLICT が
+ * REVIEW_UNAVAILABLE に置き換わり、しかも not_aligned として確定して retry されなかった。
+ */
+describe('critical load: independent 欠落と focused CONFLICT の分離', () => {
+  const CRITICAL_FILES = ['specs/00_constitution.md']
+
+  function criticalRaw(scopeDecision: string, independent?: Record<string, unknown>) {
+    return {
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'UNCERTAIN' },
+        { focus: 'scope_simplicity', decision: scopeDecision },
+      ],
+      ...(independent ? { independentReviewResult: independent } : {}),
+      finalDecision: 'REVIEW_UNAVAILABLE',
+    }
+  }
+
+  it('independent が欠落していても focused が CONFLICT なら CONFLICT を返す', () => {
+    const outcome = recomputeDecision(criticalRaw('CONFLICT'), 'task', CRITICAL_FILES)
+
+    expect(outcome.reviewLoad).toBe('critical')
+    expect(outcome.decision).toBe('CONFLICT')
+    expect(outcome.rejectedReason).toContain('independent review result was missing')
+  })
+
+  it('independent が unavailable でも focused が CONFLICT なら CONFLICT を返す', () => {
+    const outcome = recomputeDecision(
+      criticalRaw('CONFLICT', { verdict: 'blocking', summary: 'Independent review failed: logged out', unavailable: true }),
+      'task',
+      CRITICAL_FILES,
+    )
+
+    expect(outcome.decision).toBe('CONFLICT')
+    expect(outcome.rejectedReason).toContain('independent review result was unavailable')
+  })
+
+  it('independent が unavailable で focused に CONFLICT が無ければ REVIEW_UNAVAILABLE', () => {
+    const outcome = recomputeDecision(
+      criticalRaw('ALIGNED', { verdict: 'blocking', summary: 'failed', unavailable: true }),
+      'task',
+      CRITICAL_FILES,
+    )
+
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+  })
+
+  it('全 focus ALIGNED でも independent 欠落は REVIEW_UNAVAILABLE になり、run は完了せず requeue される', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const stdout = JSON.stringify({
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'ALIGNED' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+      ],
+      finalDecision: 'ALIGNED',
+    })
+    expect(recomputeDecision(JSON.parse(stdout), 'task', CRITICAL_FILES).decision).toBe('REVIEW_UNAVAILABLE')
+
+    const runner = deps(async () => ({ ok: true, stdout, timedOut: false }))
+    const first = await createAndExecuteDesignReview(
+      storage, { ...baseInput(taskId), changedFiles: CRITICAL_FILES }, runner,
+    )
+
+    expect(first.status).toBe('requeued')
+    expect(first.decision).toBe('REVIEW_UNAVAILABLE')
+    const runId = storage.designReviewRuns.findLatestByTaskId(taskId)!.id
+    const afterFirst = storage.designReviewRuns.findById(runId)!
+    expect(afterFirst.status).toBe('queued')
+    expect(afterFirst.attemptCount).toBe(1)
+    expect(afterFirst.completedAt).toBeUndefined()
+    expect(afterFirst.error).toContain('independent review')
+
+    const second = await executeDesignReviewRun(storage, afterFirst, runner)
+    expect(second.status).toBe('requeued')
+    expect(storage.designReviewRuns.findById(runId)!.attemptCount).toBe(2)
+
+    // attempt 上限で failed 終端する（runner crash と同じ finalizeFailure 経路）。
+    for (let i = 0; i < DESIGN_REVIEW_MAX_ATTEMPTS + 2; i += 1) {
+      const active = storage.designReviewRuns.findById(runId)!
+      if (active.status !== 'queued') break
+      await executeDesignReviewRun(storage, active, runner)
+    }
+    const final = storage.designReviewRuns.findById(runId)!
+    expect(final.status).toBe('failed')
+    expect(final.attemptCount).toBe(DESIGN_REVIEW_MAX_ATTEMPTS)
+    expect(final.resultJson).toBeUndefined()
+  })
+
+  it('focused CONFLICT + independent 欠落は従来どおり判定として完了する（retry しない）', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = deps(async () => ({ ok: true, stdout: JSON.stringify(criticalRaw('CONFLICT')), timedOut: false }))
+
+    const result = await createAndExecuteDesignReview(
+      storage, { ...baseInput(taskId), changedFiles: CRITICAL_FILES }, runner,
+    )
+
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+    expect(run.status).toBe('succeeded')
+    expect(run.attemptCount).toBe(1)
+  })
+})

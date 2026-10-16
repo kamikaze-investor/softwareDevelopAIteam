@@ -2261,6 +2261,11 @@ describe('SQLiteStorage', () => {
       })
 
       describe('createRepairJobWithHandoff', () => {
+        // handoff は running な Project でしか Job を作らない（transaction 内の再確認）。
+        beforeEach(() => {
+          storage.projects.update(projectId, { status: 'running' })
+        })
+
         function createBlockedSourceJob(): { id: string; previous: Job } {
           const source = storage.jobs.create({
             taskId,
@@ -2312,6 +2317,30 @@ describe('SQLiteStorage', () => {
           expect(repairJob.aiCliPrompt).toBe('reviewed repair prompt')
           // source Job は所有権を持たない状態（failed）へ解放されている
           expect(storage.jobs.findById(sourceJobId)?.status).toBe('failed')
+        })
+
+        // Task / Project 状態の再確認は Job を作る transaction の中で行う（TOCTOU 回避）。
+        // 断るときは Job を作らず、source Job の所有権（blocked）にも触らない。
+        it('refuses inside the transaction when the Project is not running: no Job, source stays blocked', () => {
+          const source = createBlockedSourceJob()
+          storage.projects.update(projectId, { status: 'paused' })
+
+          const result = storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id))
+
+          expect(result).toMatchObject({ ok: false, code: 'PROJECT_NOT_RUNNING' })
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === `repair:${source.id}:1`)).toBe(false)
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+        })
+
+        it('refuses inside the transaction when the Task is done, but not merely because it is blocked', () => {
+          const source = createBlockedSourceJob()
+          storage.tasks.update(taskId, { status: 'done' })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)))
+            .toMatchObject({ ok: false, code: 'TASK_DONE' })
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+
+          storage.tasks.update(taskId, { status: 'blocked' })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)).ok).toBe(true)
         })
 
         it('transaction rolls back on successor creation failure, source Job REMAINS blocked (ownership retained)', () => {

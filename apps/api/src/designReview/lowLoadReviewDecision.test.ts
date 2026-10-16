@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import type { Job } from '@ai-team/shared'
-import { recomputeDecision } from './designReviewCoordinator'
+import { DESIGN_REVIEW_MAX_ATTEMPTS, recomputeDecision } from './designReviewCoordinator'
 import { executeQueuedRepair, prepareRepairFlow } from './repairFlow'
 
 /**
@@ -185,18 +185,27 @@ describe('T6 production 形の docs-only repair Design Review', () => {
     expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
   })
 
-  it('review を実行できなかった場合は escalation し、run.error に本当の原因が残る', async () => {
+  it('review を実行できなかった場合は attempt 上限まで requeue し、上限で escalation して run.error に本当の原因が残る', async () => {
     const storage = createSQLiteStorage(':memory:')
     const ids = seed(storage)
     const preparation = prepareRepairFlow(storage, { failedJob: failedDocsJob(storage, ids) })
     if (preparation.action !== 'queue') throw new Error('fixture failed')
     const run = storage.designReviewRuns.create(preparation.run)
-
-    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, depsReturning(JSON.stringify(lowLoad({
+    const deps = depsReturning(JSON.stringify(lowLoad({
       reviewKind: 'task',
       finalDecision: 'REVIEW_UNAVAILABLE',
       unavailableReason: "Low-load legacy Meta Review could not complete: ENOENT: no such file or directory, open '/workspace/control/docs/meta_reviewer/prompt.md'",
-    }))) as never)
+    }))) as never
+
+    // REVIEW_UNAVAILABLE は判定ではないので、runner crash と同じく requeue され Task は止めない。
+    for (let attempt = 1; attempt < DESIGN_REVIEW_MAX_ATTEMPTS; attempt += 1) {
+      const requeued = await executeQueuedRepair(storage, storage.designReviewRuns.findById(run.id)!, preparation.stepKey, deps)
+      expect(requeued.status).toBe('already_started')
+      expect(storage.designReviewRuns.findById(run.id)?.status).toBe('queued')
+      expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
+    }
+
+    const outcome = await executeQueuedRepair(storage, storage.designReviewRuns.findById(run.id)!, preparation.stepKey, deps)
 
     // 実行できなかった review から repair を作らない（fail-closed は維持）。
     expect(outcome.status).toBe('escalated')
