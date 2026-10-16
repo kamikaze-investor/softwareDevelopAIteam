@@ -245,6 +245,11 @@ export type RepairHandoffRefusalCode =
   | 'PROJECT_NOT_RUNNING'
   | 'PROJECT_MISMATCH'
   | 'LINEAGE_MISMATCH'
+  /**
+   * Task に source 以外の queued / running Job がある（例: repair review の間に Human Resume が作った
+   * `resume:`）。repair Job を足すと 1 Task に 2 本の live 連鎖が並ぶ（lifecycle repair C3 / D3-1）。
+   */
+  | 'FOREIGN_LIVE_JOB'
 
 export type PersistReviewWorkflowResult =
   | {
@@ -390,6 +395,11 @@ export type RecoverFromBlockedResult =
   | { ok: false; code?: RecoverAdmissionCode; reason: string }
 
 export interface ITaskStorage {
+  /**
+   * queued / running の repair Design Review run（`repair_source_job_id` 付き）があるか（読み取りのみ）。
+   * resume admission と `TaskDetail.repairDesignReviewInFlight` の唯一の事実（lifecycle repair C3 / D3-1）。
+   */
+  hasRepairDesignReviewInFlight(taskId: string): boolean
   findByProjectId(projectId: string): Task[]
   /**
    * abort_task で park された Task か。**park 判定の唯一の定義**である。

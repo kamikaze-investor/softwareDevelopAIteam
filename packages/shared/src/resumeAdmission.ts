@@ -34,6 +34,12 @@ export interface ResumeAdmissionInput {
   /** Task の Job。**新しい順**（先頭が最新）。 */
   jobs: readonly ResumeAdmissionJob[]
   /**
+   * この Task に queued / running の **repair Design Review run**（`repair_source_job_id` 付き）があるか。
+   * API が保存済みの run から計算する（Mobile へは `TaskDetail.repairDesignReviewInFlight`）。意味は
+   * archive / draft の放棄ガード（`repair_design_review_run`）と同じ。lifecycle repair C3 / D3-1。
+   */
+  repairDesignReviewInFlight: boolean
+  /**
    * Task の ApprovalRequest（順不同）。Job 束縛（command kind）の live な承認待ちが 1 件でもあれば断る。
    * Task 単位の判断（`isTaskScopedApprovalAction`）は `resumedByHuman` で扱いが分かれる。
    */
@@ -60,6 +66,12 @@ export type ResumeAdmissionCode =
   | 'TASK_PARKED'
   | 'WORKSPACE_QUARANTINED'
   | 'LIVE_JOB_EXISTS'
+  /**
+   * repair Design Review run が queued / running（stored-review recovery 等が始めた修正の連鎖が進行中）。
+   * ここで resume すると、run が ALIGNED で終わったときの `repair:<impl>:1` と `resume:` の 2 本の連鎖が
+   * 同じ Task に並ぶ（lifecycle repair C3 / D3-1）。
+   */
+  | 'REPAIR_REVIEW_IN_FLIGHT'
   | 'APPROVAL_WAITING'
   /** 生きた Task 単位の人の判断がある。人の resume だけがそれを置き換えられる。 */
   | 'HUMAN_DECISION_PENDING'
@@ -91,6 +103,8 @@ export function evaluateResumeAdmission(input: ResumeAdmissionInput): ResumeAdmi
   if (input.jobs.some((job) => job.status === 'queued' || job.status === 'running')) {
     return { ok: false, code: 'LIVE_JOB_EXISTS' }
   }
+  // live Job と同じく、進行中の repair Design Review run も「既に Task を動かしているもの」である。
+  if (input.repairDesignReviewInFlight) return { ok: false, code: 'REPAIR_REVIEW_IN_FLIGHT' }
   // 期限切れの WAITING は誰も待っていない（`isLiveWaitingApproval()`）。それで resume を
   // 恒久拒否すると Task はどこからも復旧できなくなる（2026-09-12 Production）。
   // Task 単位の判断はここでは数えない（下で人 / 人でないで分ける）。Job 束縛の承認待ちは従来どおり断る。

@@ -729,6 +729,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   /**
+   * その Task に queued / running の repair Design Review run（`repair_source_job_id` 付き）があるか。
+   * 意味は `activeLifecycleKindsOf` の `repair_design_review_run` と同じ（Task 単位）。resume admission と
+   * `TaskDetail.repairDesignReviewInFlight` が使う（lifecycle repair C3 / D3-1）。
+   */
+  function hasRepairDesignReviewInFlight(taskId: string): boolean {
+    return db.prepare(
+      "SELECT id FROM design_review_runs WHERE task_id = ? AND status IN ('queued','running') "
+      + 'AND repair_source_job_id IS NOT NULL LIMIT 1',
+    ).get(taskId) !== undefined
+  }
+
+  /**
    * Project を放棄すると所有者が見えなくなる lifecycle の種類。
    *
    * blocked Job が所有者かは claim guard・systemState と同じ `taskHoldsWorkspaceViaBlockedRow()`
@@ -1011,6 +1023,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     taskId: string,
     repairProjectId: string,
     sourceJobId: string,
+    repairStepKey?: string,
   ): { code: RepairHandoffRefusalCode; reason: string } | undefined {
     const task = db.prepare('SELECT status, project_id FROM tasks WHERE id = ?').get(taskId) as
       | { status: string; project_id: string }
@@ -1041,6 +1054,20 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(task.project_id) as { status: string } | undefined
     if (project?.status !== 'running') {
       return { code: 'PROJECT_NOT_RUNNING', reason: `project is not running (${project?.status ?? 'missing'})` }
+    }
+    // **source 以外の live Job が既に Task を動かしているなら repair Job を足さない**（lifecycle repair C3 / D3-1。
+    // resume admission の REPAIR_REVIEW_IN_FLIGHT に対する多層防御）。
+    // 同じ repair stepKey の Job は「この handoff の successor が既に在る」良性の重複で、下の dedup /
+    // 一意制約の経路（already_started）が扱うので foreign には数えない。
+    const foreignLive = db.prepare(
+      "SELECT id FROM jobs WHERE task_id = ? AND id != ? AND status IN ('queued','running') "
+      + 'AND (workflow_step_key IS NULL OR workflow_step_key != ?) LIMIT 1',
+    ).get(taskId, sourceJobId, repairStepKey ?? '') as { id: string } | undefined
+    if (foreignLive !== undefined) {
+      return {
+        code: 'FOREIGN_LIVE_JOB',
+        reason: `job ${foreignLive.id} is already queued or running for this task; a repair job would be a second live chain`,
+      }
     }
     return undefined
   }
@@ -1429,6 +1456,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   const tasks: ITaskStorage = {
     isParked(taskId) {
       return isParkedTaskId(taskId)
+    },
+    hasRepairDesignReviewInFlight(taskId) {
+      return hasRepairDesignReviewInFlight(taskId)
     },
     recoverFromBlocked(input) {
       // **状態遷移と audit を1 transaction にする。** 片方だけ成功する経路を残さない。
@@ -2949,7 +2979,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         //    確かめると、その後に done / park / Project 停止が起きても repair Job が作られる
         //    （TOCTOU）。断るときは何も書かず、source Job の所有権にも触らない。
         //    **blocked では断らない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
-        const refusal = repairHandoffRefusal(input.repairJob.taskId, input.repairJob.projectId, input.sourceJobId)
+        const refusal = repairHandoffRefusal(
+          input.repairJob.taskId,
+          input.repairJob.projectId,
+          input.sourceJobId,
+          input.repairJob.workflowStepKey,
+        )
         if (refusal !== undefined) {
           return { ok: false, ...refusal }
         }
@@ -3233,6 +3268,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           parked: isParkedTaskId(taskId),
           projectStatus: projectRow?.status,
           jobs: taskJobs,
+          // 同じ transaction で読む（Mobile は TaskDetail.repairDesignReviewInFlight で同じ事実を受け取る）。
+          repairDesignReviewInFlight: hasRepairDesignReviewInFlight(taskId),
           approvals: admissionApprovals,
           nowMs: resumeNowMs,
           // 人の resume は生きた Task 単位の判断を置き換える（completeResumeHandoff）。人でない resume は
@@ -3273,6 +3310,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
             case 'LIVE_JOB_EXISTS':
               return { ok: false, code: 'LIVE_JOB_EXISTS', reason: 'A queued or running job already exists for this task' }
+            case 'REPAIR_REVIEW_IN_FLIGHT':
+              return {
+                ok: false,
+                code: 'REPAIR_REVIEW_IN_FLIGHT',
+                reason: 'A repair design review run is queued or running for this task; it will create the repair job',
+              }
             case 'APPROVAL_WAITING':
               return { ok: false, code: 'APPROVAL_WAITING', reason: 'The latest approval request is waiting for user review' }
             case 'HUMAN_DECISION_PENDING':

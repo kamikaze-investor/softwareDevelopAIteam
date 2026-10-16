@@ -88,6 +88,11 @@ export interface TaskDetail extends Task {
    * （主体の記録の無い APPROVED は authority ではないので、ここには載らない）。
    */
   humanTaskDecisions: TaskHumanDecisionFact[]
+  /**
+   * queued / running の repair Design Review run があるか（`evaluateResumeAdmission()` の
+   * `repairDesignReviewInFlight`。lifecycle repair C3 / D3-1）。
+   */
+  repairDesignReviewInFlight: boolean
 }
 
 export interface TaskHumanDecisionFact {

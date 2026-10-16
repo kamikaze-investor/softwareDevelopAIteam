@@ -88,6 +88,32 @@ describe('resumeBlockedTask — resume_actor は resume と同じ transaction �
   })
 })
 
+describe('resume admission refuses while a repair Design Review run is in flight (lifecycle repair C3 / D3-1)', () => {
+  it('human resume of a blocked task with a queued repair run is REPAIR_REVIEW_IN_FLIGHT and creates nothing', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const seeded = seedBlockedTask(storage)
+    const run = storage.designReviewRuns.create({
+      taskId: seeded.taskId, taskTitle: 'T', designText: 'repair', designTextHash: 'h', changedFiles: [],
+      repairSourceJobId: seeded.jobId,
+    })
+    const jobsBefore = storage.jobs.findByTaskId(seeded.taskId).map((job) => job.id)
+    expect(storage.tasks.hasRepairDesignReviewInFlight(seeded.taskId)).toBe(true)
+
+    const refused = storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: HUMAN })
+
+    expect(refused).toMatchObject({ ok: false, code: 'REPAIR_REVIEW_IN_FLIGHT' })
+    expect(storage.jobs.findByTaskId(seeded.taskId).map((job) => job.id)).toEqual(jobsBefore)
+
+    // run が終端すれば（running も同じ扱い）resume は通る。
+    const claim = storage.designReviewRuns.claim(run.id, 3)
+    expect(storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: HUMAN }))
+      .toMatchObject({ ok: false, code: 'REPAIR_REVIEW_IN_FLIGHT' })
+    storage.designReviewRuns.complete(run.id, claim.claimToken!, 'failed', undefined, 'boom')
+    expect(storage.tasks.hasRepairDesignReviewInFlight(seeded.taskId)).toBe(false)
+    expect(storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: HUMAN }).ok).toBe(true)
+  })
+})
+
 describe('Task 単位の承認は新しい人の判断で置き換わる（C-03）', () => {
   it('APPROVED abort_task の後に Human Resume すると abort は SUPERSEDED になり、後から park に使えない', () => {
     const storage = createSQLiteStorage(':memory:')

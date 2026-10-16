@@ -312,6 +312,7 @@ export async function taskRoutes(
       // 生きた Task 単位の人の判断（approval_actor を付けて shared `liveTaskDecisionState()` が決める）。
       // Mobile は ApprovalRequest の生の status から authority を組み立て直さない（lifecycle repair C3）。
       humanTaskDecisions: humanTaskDecisionFacts(storage, task.id),
+      repairDesignReviewInFlight: storage.tasks.hasRepairDesignReviewInFlight(task.id),
     }
     return reply.send(detail)
   })
@@ -645,6 +646,7 @@ export async function taskRoutes(
         || resumed.code === 'TASK_DONE'
         || resumed.code === 'PROJECT_NOT_RUNNING'
         || resumed.code === 'HUMAN_DECISION_PENDING'
+        || resumed.code === 'REPAIR_REVIEW_IN_FLIGHT'
       ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }

@@ -312,7 +312,7 @@ export function canReflectChanges(jobs: Job[], approvalRequests: ApprovalRequest
  * 判定できないので、ボタンを出さない**（押しても断られる操作へ CEO を誘導しない側へ倒す）。
  */
 export type TaskAdmissionFacts =
-  Pick<Task, 'status'> & Partial<Pick<TaskDetail, 'parked' | 'projectStatus'>>
+  Pick<Task, 'status'> & Partial<Pick<TaskDetail, 'parked' | 'projectStatus' | 'repairDesignReviewInFlight'>>
 
 /**
  * 判定へ渡す Job の並び。API の `resumeBlockedTask()` と同じ **createdAt の新しい順**。
@@ -340,11 +340,14 @@ export function canShowResumeUI(
   nowMs: number = Date.now(),
 ): boolean {
   if (typeof task.parked !== 'boolean') return false
+  // 事実が無い（古い API）なら出さない（parked と同じく fail-closed。判定の正本は API）。
+  if (typeof task.repairDesignReviewInFlight !== 'boolean') return false
   return evaluateResumeAdmission({
     taskStatus: task.status,
     parked: task.parked,
     projectStatus: task.projectStatus ?? undefined,
     jobs: jobsInAdmissionOrder(jobs),
+    repairDesignReviewInFlight: task.repairDesignReviewInFlight,
     // Mobile の操作は CEO（ADMIN credential）なので人の resume として判定する（API と同じ規則）。
     resumedByHuman: true,
     approvals: approvalRequests,

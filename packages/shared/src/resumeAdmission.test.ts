@@ -9,6 +9,7 @@ function input(overrides: Partial<ResumeAdmissionInput> = {}): ResumeAdmissionIn
     parked: false,
     projectStatus: 'running',
     jobs: [{ status: 'blocked', aiCliMode: 'implement', aiCliProvider: 'codex', safeCommand: { kind: 'test' } }],
+    repairDesignReviewInFlight: false,
     approvals: [],
     nowMs: NOW,
     ...overrides,

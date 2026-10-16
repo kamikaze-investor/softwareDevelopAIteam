@@ -127,12 +127,34 @@ describe('manualWorkflowIsLocked', () => {
   })
 })
 
+describe('canShowResumeUI — in-flight repair review (lifecycle repair C3 / D3-1)', () => {
+  const blockedJob = {
+    id: 'job-1', taskId: 'task-1', projectId: 'p', agentRole: 'developer_ai', status: 'blocked',
+    safeCommand: { kind: 'test', workingDir: '/w' }, aiCliMode: 'implement', aiCliProvider: 'codex',
+    createdAt: '2026-10-16T00:00:00.000Z',
+  } as unknown as Job
+  const facts = (repairDesignReviewInFlight?: boolean) => ({
+    status: 'blocked' as const, parked: false, projectStatus: 'running' as const, repairDesignReviewInFlight,
+  })
+
+  it('hides Resume while the API reports an in-flight repair review, and agrees with the API otherwise', () => {
+    expect(canShowResumeUI(facts(true), [blockedJob], [])).toBe(false)
+    expect(canShowResumeUI(facts(false), [blockedJob], [])).toBe(true)
+  })
+
+  it('fails closed when the API did not report the fact (older API)', () => {
+    expect(canShowResumeUI(facts(undefined), [blockedJob], [])).toBe(false)
+  })
+})
+
 describe('canShowResumeUI（共有 evaluateResumeAdmission と同じ判定）', () => {
   const NOW = Date.parse('2026-08-01T00:30:00.000Z')
   const detail = (over: Partial<TaskDetail> = {}): TaskDetail => ({
     ...makeTask({ status: 'blocked' }),
     parked: false,
     projectStatus: 'running',
+    humanTaskDecisions: [],
+    repairDesignReviewInFlight: false,
     ...over,
   })
   const blockedImplement = (over: Partial<Job> = {}): Job =>
@@ -251,6 +273,8 @@ describe('canShowRecoverUI（共有 evaluateRecoverAdmission と同じ判定）'
     ...makeTask({ status: 'blocked' }),
     parked: false,
     projectStatus: 'running',
+    humanTaskDecisions: [],
+    repairDesignReviewInFlight: false,
     ...over,
   })
   const waiting = (expiresAt: string): ApprovalRequest => ({
@@ -405,7 +429,7 @@ describe('MOB-001: 実行状態の見分け', () => {
   it('quarantine された Job には resume UI を出さない', () => {
     // resume しても API 側の quarantine guard が claim を拒否する。
     // 「押しても失敗する操作」をCEOに見せてはならない。
-    const task = { id: 'task-1', status: 'blocked', parked: false, projectStatus: 'running' } as TaskDetail
+    const task = { id: 'task-1', status: 'blocked', parked: false, projectStatus: 'running', repairDesignReviewInFlight: false } as TaskDetail
     const quarantined = baseJob({
       status: 'blocked',
       failureMetadata: { quarantined: true },
