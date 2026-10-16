@@ -85,11 +85,8 @@ async function consumeRequest(
       if (linkedJob) effectivePayload = { ...payload, jobId: linkedJob.id }
     } else if (approvalRequest) {
       // 非 git_commit の consume は、それを使う同じ Task・同じ action の Job に束縛される（2026-10-16）。
-      // 既存の consume 契約テストは「その action の Job が consume する」前提で、その Job を用意する。
-      const job = storage.jobs.create({
-        taskId: approvalRequest.taskId, projectId: 'consume-project', agentRole: 'developer_ai', status: 'running',
-        safeCommand: { kind: approvalRequest.requestedAction, workingDir: '/workspace/target' },
-      } as never)
+      // 既存の consume 契約テストは「その action の Job が consume する」前提で、その Job を使う。
+      const job = await jobForAction(app, approvalRequest.taskId, approvalRequest.requestedAction)
       effectivePayload = { ...payload, jobId: job.id }
     }
   }
@@ -671,11 +668,31 @@ async function ensureGateTask(app: FastifyInstance, logicalTaskId: string): Prom
   return task.id
 }
 
+/**
+ * その Task・その kind の Job を返す（無ければ作る）。Worker の Gate は常に自 Job の評価として呼ばれるので、
+ * 非 git_commit の評価・consume も実在する Job に束縛する（2026-10-16。jobs.task_id は tasks への FK）。
+ */
+async function jobForAction(app: FastifyInstance, logicalTaskId: string, kind: string): Promise<Job> {
+  const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
+  const taskId = await ensureGateTask(app, logicalTaskId)
+  return storage.jobs.findByTaskId(taskId).find((job) => job.safeCommand.kind === kind)
+    ?? storage.jobs.create({
+      taskId, projectId: 'gate-project-001', agentRole: 'developer_ai', status: 'running',
+      safeCommand: { kind, workingDir: '/workspace/target' },
+    } as never)
+}
+
 async function gateCheck(
   app: FastifyInstance,
   payload: Record<string, unknown>,
+  options: { withoutJob?: boolean } = {},
 ): Promise<{ statusCode: number; body: GateCheckResponse }> {
   let effectivePayload: Record<string, unknown> = { ...payload, taskId: await ensureGateTask(app, String(payload.taskId)) }
+  if (payload.requestedAction !== 'git_commit' && typeof payload.jobId !== 'string' && options.withoutJob !== true) {
+    const job = await jobForAction(app, String(payload.taskId), String(payload.requestedAction))
+    effectivePayload = { ...effectivePayload, jobId: job.id }
+  }
   if (payload.requestedAction === 'git_commit' && typeof payload.jobId !== 'string') {
     const { getStorage } = await import('../storage/index.js')
     const storage = getStorage()
@@ -2593,6 +2610,77 @@ describe('POST /api/gate/check — 誰も待たない legacy の同 action WAITI
       expect(body.outcome.decision).toBe('PENDING_APPROVAL')
       expect(body.continuationPolicy).toBe('block_until_approved')
       expect(await identityStatusOf(first.approvalRequest!.id)).toBe('WAITING_FOR_USER')
+    })
+  })
+})
+
+describe('POST /api/gate/check — jobId の無い非 git_commit は evaluation-only (2026-10-16 Codex review round 2)', () => {
+  it('HIGH でも承認依頼を作らず requestId も返さず、gate_evaluations だけを残す', async () => {
+    await withApp(async (app) => {
+      const taskId = 'evaluation-only-high'
+      const { statusCode, body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId }, { withoutJob: true })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.nextAction.action).toBe('wait_for_approval')
+      expect(body.nextAction.requestId).toBeUndefined()
+      expect(body.approvalRequest).toBeUndefined()
+      expect(body.sideEffects).toEqual([])
+
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const realTaskId = await ensureGateTask(app, taskId)
+      expect(storage.approvalRequests.findByTaskId(realTaskId)).toEqual([])
+      expect(storage.gateEvaluations.findByTaskId(realTaskId)).toHaveLength(1)
+    })
+  })
+
+  it('同じ action の APPROVED があっても call_consume を返さず、その承認は Job 無しでも別 Job からも使い切れない', async () => {
+    await withApp(async (app) => {
+      const taskId = 'evaluation-only-approved'
+      const approved = await seedIdentityRequest(app, taskId, IDENTITY_X, 'APPROVED')
+
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: IDENTITY_X }, { withoutJob: true })
+      expect(body.nextAction.action).not.toBe('call_consume')
+      expect(body.outcome.consumedRequestId).toBeUndefined()
+      expect(body.approvalRequest).toBeUndefined()
+
+      const ref = { currentCommit: BASE_GATE_PAYLOAD.targetCommit, currentDiffHash: BASE_GATE_PAYLOAD.targetDiffHash }
+      const withoutJob = await consumeRequest(app, approved.id, ref, { autoJob: false })
+      expect(withoutJob.statusCode).toBe(400)
+      expect(await identityStatusOf(approved.id)).toBe('APPROVED')
+    })
+  })
+
+  it('同じ action の WAITING を自分の承認待ちとして使わず、畳みもしない', async () => {
+    await withApp(async (app) => {
+      const taskId = 'evaluation-only-waiting'
+      const waiting = await seedIdentityRequest(app, taskId, IDENTITY_X, 'WAITING_FOR_USER')
+
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: IDENTITY_X }, { withoutJob: true })
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.approvalRequest).toBeUndefined()
+      expect(await identityStatusOf(waiting.id)).toBe('WAITING_FOR_USER')
+    })
+  })
+})
+
+describe('POST /api/gate/check — 保存 riskLevel が CRITICAL の WAITING は HIGH の safe work でも畳まない (Codex review round 2)', () => {
+  it('CRITICAL で作られた git_status の WAITING は、後の HIGH 評価で SUPERSEDED にならず承認待ちのまま', async () => {
+    await withApp(async (app) => {
+      const taskId = 'stored-critical-waiting'
+      const critical = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status', changedFiles: ['AGENTS.md'],
+      })
+      expect(critical.body.approvalRequest?.riskLevel).toBe('CRITICAL')
+      const criticalId = critical.body.approvalRequest!.id
+
+      const { body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status' })
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.outcome.requestId).toBe(criticalId)
+      expect(body.sideEffects).toEqual([])
+      expect(await identityStatusOf(criticalId)).toBe('WAITING_FOR_USER')
     })
   })
 })

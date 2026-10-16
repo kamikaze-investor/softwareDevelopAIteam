@@ -236,7 +236,7 @@ function computeNextAction(
   requiresApprovalByPolicy: boolean,
   newRequestId?: string,
   gitCommitEvidenceVerified = false,
-  safeWorkWithoutRequest = false,
+  noRequestReason?: 'safe_work' | 'evaluation_only',
 ): NextAction {
   switch (outcome.decision) {
     case 'ALLOW':
@@ -273,12 +273,19 @@ function computeNextAction(
       }
 
     case 'BLOCKED':
-      if (safeWorkWithoutRequest) {
+      if (noRequestReason === 'safe_work') {
         // requestId は付けない（作っていない）。Worker は requestId 無しの wait_for_approval を受理し、
         // HIGH → continue_safe_work_only で safe work だけを続ける。
         return {
           action: 'wait_for_approval',
           message: 'HIGH リスク変更を含みますが、この操作は safe work のため承認リクエストは作成しません。safe work のみ継続してください。',
+        }
+      }
+      if (noRequestReason === 'evaluation_only') {
+        // Job の無い評価は実行の許可にならない。承認依頼も作らず、requestId も付けない。
+        return {
+          action: 'wait_for_approval',
+          message: 'jobId の無い評価のため、承認リクエストは作成しません（実行を許可する応答ではありません）。',
         }
       }
       return {
@@ -533,8 +540,7 @@ export async function approvalGateRoutes(
       // 非 git_commit でも、jobId を名乗るなら実在する同じ Task の、同じ kind の Job でなければならない
       // （2026-10-16 Codex review）。名乗った Job と別物の評価を gate_evaluations へ残さず、
       // その応答の call_consume を別 Task / 別 action の Job に使わせない。
-      // jobId 無しの呼び出し（trusted internal caller の申告評価）は従来どおりで、consume は jobId 必須なので
-      // そこから承認を使い切ることはできない。
+      // jobId 無しの呼び出しは下の evaluation-only（評価だけを残し、承認を作らず call_consume も返さない）。
       const job = storage.jobs.findById(jobId)
       if (!job) {
         return reply.status(404).send({ error: 'Job not found' })
@@ -574,9 +580,19 @@ export async function approvalGateRoutes(
     // 同一Taskには複数の正当なJobが存在し得る。git_commitはTask単位の最新Approvalではなく、
     // jobs.approval_idでこのJobに結び付いたApprovalだけを再利用する。
     // それ以外の action は、同じ requestedAction の active 行だけを再利用する（承認は自 action にしか効かない）。
+    //
+    // **jobId の無い非 git_commit の評価は evaluation-only**（2026-10-16 Codex review round 2）。
+    // 承認は「それを評価した Job」に結び付かなければならないが、Job の無い評価で承認を作る・再利用する・
+    // call_consume を返すと、後から同じ Task・同じ kind の任意の Job がそれを使い切れる。
+    // production の呼び出し元は Worker の callGateCheck だけで、常に jobId を送る（GateCheckParams.jobId は必須）。
+    // よって Job の無い評価は gate_evaluations だけを残し、active な承認を読まず・作らず・call_consume を出さない。
+    // 却下済み（REJECTED）の参照は実行を許可しないので従来どおり行う（fail closed 側の情報）。
+    const evaluationOnly = !isGitCommitPolicyAction && jobId === undefined
     let existingReq = isGitCommitPolicyAction
       ? linkedGitCommitApproval
-      : findActiveRequestForAction(storage.approvalRequests.findByTaskId(taskId), requestedAction)
+      : evaluationOnly
+        ? undefined
+        : findActiveRequestForAction(storage.approvalRequests.findByTaskId(taskId), requestedAction)
 
     // P2-followup: expired APPROVED cleanup
     // findActiveByTaskId は expiresAt を見ないため期限切れ APPROVED が返ることがある。
@@ -601,11 +617,14 @@ export async function approvalGateRoutes(
     // 2026-10-16 b8d0fc5d の approval-20261016-f73df27a）。PENDING_APPROVAL として返し続けると Task が
     // 承認待ちに見え続けるので、既存の supersede と同じく SUPERSEDED にして、無い前提で判定し直す
     // （下で新しい依頼も作らない）。別 action の行には触れない。CRITICAL は block_until_approved なので対象外。
+    // 畳むのは**保存された riskLevel も HIGH** の行だけ（Codex review round 2）。CRITICAL として作られた
+    // 依頼は Worker が block_until_approved で待っていた判断なので、今回の評価が HIGH でも残し、fail closed にする。
     if (
       !isGitCommitPolicyAction
       && riskReview.riskLevel === 'HIGH'
       && isSafeWorkCommandKind(requestedAction)
       && existingReq?.status === 'WAITING_FOR_USER'
+      && existingReq.riskLevel === 'HIGH'
     ) {
       storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
       storage.auditLog.record({
@@ -745,8 +764,11 @@ export async function approvalGateRoutes(
     // Evidence が成立した git_commit は ApprovalRequest を一切使わない。探索で拾った
     // 別 diff の REJECTED 等を応答に載せると「ALLOW なのに REJECTED が付く」不整合になるので載せない。
     // 依頼を作らない safe work も同様（期限切れ行などを「今回の依頼」に見せない）。
+    // evaluation-only でも REJECTED はそのまま返す（実行を許可しない事実なので隠さない）。
     let approvalRequest: ApprovalRequest | undefined =
-      gitCommitEvidenceVerified || safeWorkWithoutRequest ? undefined : existingReq
+      gitCommitEvidenceVerified || safeWorkWithoutRequest || (evaluationOnly && outcome.decision !== 'REJECTED')
+        ? undefined
+        : existingReq
     let newRequestId: string | undefined
 
     // ApprovalRequest / gate_evaluations に残す git_commit の判定理由ラベル
@@ -769,7 +791,7 @@ export async function approvalGateRoutes(
       approvalRequest = storage.approvalRequests.findById(existingReq!.id)
     } else if (outcome.decision === 'REJECTED') {
       approvalRequest = existingReq
-    } else if (outcome.decision === 'BLOCKED' && !safeWorkWithoutRequest) {
+    } else if (outcome.decision === 'BLOCKED' && !safeWorkWithoutRequest && !evaluationOnly) {
       const input: ApprovalGateInput = {
         taskId, requestedAction, targetBranch, targetCommit, targetDiffHash, changedFiles,
       }
@@ -855,7 +877,7 @@ export async function approvalGateRoutes(
 
     const nextAction = computeNextAction(
       outcome, riskReview.riskLevel, requiresApprovalByPolicy, newRequestId, gitCommitEvidenceVerified,
-      safeWorkWithoutRequest,
+      safeWorkWithoutRequest ? 'safe_work' : evaluationOnly && outcome.decision === 'BLOCKED' ? 'evaluation_only' : undefined,
     )
 
     const response: GateCheckResponse = {
