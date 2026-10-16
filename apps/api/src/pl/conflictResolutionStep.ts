@@ -592,11 +592,7 @@ async function runChallenge(
     ...(released
       ? {}
       : {
-          // 同じ frozen spec の再評価が ALIGNED でも、元の CONFLICT は未回答の不一致として残り、
-          // Job Gate が止める（lifecycle repair C2 / C-05・spec 22 DA trigger 7）。理由を型で残す。
-          failureCode: job.status === 'skipped' && job.code === 'DESIGN_REVIEW_DISAGREEMENT'
-            ? 'design_review_disagreement'
-            : 'gate_did_not_release',
+          failureCode: 'gate_did_not_release',
           reason: `re-evaluation aligned but the existing job gate did not create a job: ${job.reason}`,
         }),
   }

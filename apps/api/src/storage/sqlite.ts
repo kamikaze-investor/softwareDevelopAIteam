@@ -33,7 +33,7 @@ import type { TaskContinuation, OperatorRequest } from '@ai-team/shared'
 import type { PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleApplication, PrincipleApplicationInput, PrincipleDisagreementRow, PrincipleReviewStage, StrategicDecision } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
-import { checkImplementJobDesignReviewEvidence, findSupersedingRun, findUnresolvedDisagreementRun } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, findSupersedingRun } from '../designReviewEvidencePolicy'
 import { classifyStoredRunJudgment } from '../designReview/designReviewCoordinator'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import {
@@ -61,7 +61,7 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
-import { readJobsSupersededByHumanResume, readResumeActorClasses } from '../designReview/resumeActor'
+import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -4961,75 +4961,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   // KnowledgeGraph Storage
   // ────────────────────────────────────────────────────────────
 
-  /**
-   * evidence と同じ subject・同じ hash の run（新しい順）と、「evidence より新しい」の順序。
-   *
-   * **順序は run の挿入順（rowid）で決める。** evidence が生んだ run を知っていれば、それより後に
-   * 挿入された run だけが「新しい」。timestamp（ms 精度・時計の巻き戻り）には頼らない。
-   * 生んだ run が分からない（legacy / 手動登録）・見つからない evidence だけ timestamp 規則に落とす
-   * （isAfterEvidence が undefined = policy 側の既定）。
-   */
-  const sameDesignRunsOf = (evidence: DesignReviewEvidence): {
-    runs: DesignReviewRun[]
-    isAfterEvidence: ((run: DesignReviewRun) => boolean) | undefined
-  } => {
-    const rows = db.prepare(
-      'SELECT *, rowid AS _rowid FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND design_text_hash = ?'
-      + ' ORDER BY rowid DESC'
-    ).all(evidence.reviewKind, evidence.subjectId, evidence.designTextHash) as any[]
-    const origin = evidence.runId !== undefined
-      ? db.prepare('SELECT rowid AS _rowid FROM design_review_runs WHERE id = ?').get(evidence.runId) as
-        | { _rowid: number }
-        | undefined
-      : undefined
-    const insertionOrder = new Map<string, number>(rows.map((row) => [row.id as string, row._rowid as number]))
-    return {
-      runs: rows.map(deserializeDesignReviewRun),
-      isAfterEvidence: origin !== undefined
-        ? (run) => (insertionOrder.get(run.id) ?? 0) > origin._rowid
-        : undefined,
-    }
-  }
-
-  /**
-   * 古い未回答の不一致（designReviewEvidencePolicy.findUnresolvedDisagreementRun）。
-   *
-   * 「人が答えた」は D3 と同じ意味だけを使う: その run の完了後に作られた、actor が human と
-   * 証明された Human Resume Job（resume actor audit が admin_credential の human）。PL / AI /
-   * unknown の resume、Human Recovery、承認は答えではない。Task を持たない subject（roadmap）には
-   * Human Resume が無いので、設計（material）を変える以外に解消しない。
-   */
-  const unresolvedDisagreementOf = (
-    evidence: DesignReviewEvidence,
-    runs: readonly DesignReviewRun[],
-    isAfterEvidence: ((run: DesignReviewRun) => boolean) | undefined,
-  ): DesignReviewRun | undefined => {
-    let humanResumeTimes: number[] | undefined
-    const readHumanResumeTimes = (): number[] => {
-      if (humanResumeTimes !== undefined) return humanResumeTimes
-      if (evidence.taskId === undefined) return (humanResumeTimes = [])
-      const taskJobs = storage.jobs.findByTaskId(evidence.taskId)
-      const actors = readResumeActorClasses(storage, taskJobs)
-      humanResumeTimes = taskJobs
-        .filter((job) => actors.get(job.id) === 'human')
-        .map((job) => Date.parse(job.createdAt))
-        .filter((time) => Number.isFinite(time))
-      return humanResumeTimes
-    }
-    const isAnsweredByHuman = (run: DesignReviewRun): boolean => {
-      const completedAt = run.completedAt === undefined ? Number.NaN : Date.parse(run.completedAt)
-      if (!Number.isFinite(completedAt)) return false
-      return readHumanResumeTimes().some((createdAt) => createdAt > completedAt)
-    }
-    return findUnresolvedDisagreementRun(
-      evidence,
-      runs,
-      classifyStoredRunJudgment,
-      isAnsweredByHuman,
-      isAfterEvidence,
-    )
-  }
-
   const designReviewEvidence: IDesignReviewEvidenceStorage = {
     findById(id) {
       const row = db.prepare('SELECT * FROM design_review_evidence WHERE id = ?').get(id) as any
@@ -5056,18 +4987,27 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     findSupersedingRun(evidence) {
       // 規則は designReviewEvidencePolicy.findSupersedingRun() の1箇所。ここは同じ subject・同じ hash の
       // 候補 run を新しい順に渡し、終端 run の判定は API と同じ再計算（classifyStoredRunJudgment）で決める。
-      //
-      // **古い未回答の不一致も evidence を覆す**（lifecycle repair C2 / C-05。規則は
-      // designReviewEvidencePolicy.findUnresolvedDisagreementRun()）。ここで併せて返すので、
-      // findSupersedingRun() を読む既存の consumer（isUsableAlignedEvidence / PL action gate /
-      // coordinator の読み直し / Job Gate）はすべて同じ規則に従う。
-      const { runs, isAfterEvidence } = sameDesignRunsOf(evidence)
-      return findSupersedingRun(evidence, runs, classifyStoredRunJudgment, isAfterEvidence)
-        ?? unresolvedDisagreementOf(evidence, runs, isAfterEvidence)
-    },
-    findUnresolvedDisagreementRun(evidence) {
-      const { runs, isAfterEvidence } = sameDesignRunsOf(evidence)
-      return unresolvedDisagreementOf(evidence, runs, isAfterEvidence)
+      const rows = db.prepare(
+        'SELECT *, rowid AS _rowid FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND design_text_hash = ?'
+        + ' ORDER BY rowid DESC'
+      ).all(evidence.reviewKind, evidence.subjectId, evidence.designTextHash) as any[]
+      // **順序は run の挿入順（rowid）で決める。** evidence が生んだ run を知っていれば、それより後に
+      // 挿入された run だけが「新しい」。timestamp（ms 精度・時計の巻き戻り）には頼らない。
+      // 生んだ run が分からない（legacy / 手動登録）・見つからない evidence だけ timestamp 規則に落とす。
+      const origin = evidence.runId !== undefined
+        ? db.prepare('SELECT rowid AS _rowid FROM design_review_runs WHERE id = ?').get(evidence.runId) as
+          | { _rowid: number }
+          | undefined
+        : undefined
+      const insertionOrder = new Map<string, number>(rows.map((row) => [row.id as string, row._rowid as number]))
+      return findSupersedingRun(
+        evidence,
+        rows.map(deserializeDesignReviewRun),
+        classifyStoredRunJudgment,
+        origin !== undefined
+          ? (run) => (insertionOrder.get(run.id) ?? 0) > origin._rowid
+          : undefined,
+      )
     },
     create(data) {
       const subject = resolveDesignReviewSubject(data)

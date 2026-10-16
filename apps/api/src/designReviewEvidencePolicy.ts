@@ -14,8 +14,6 @@ export type ImplementDesignReviewPreconditionFailureCode =
   | 'DESIGN_REVIEW_NOT_ALIGNED'
   | 'CRITICAL_INDEPENDENT_REVIEW_NOT_APPROVED'
   | 'DESIGN_REVIEW_SUPERSEDED'
-  /** 同じ設計への古い未回答の CONFLICT / UNCERTAIN がある（`findUnresolvedDisagreementRun()`）。 */
-  | 'DESIGN_REVIEW_DISAGREEMENT'
 
 export type ImplementDesignReviewPreconditionResult =
   | { ok: true; evidence?: DesignReviewEvidence }
@@ -76,43 +74,7 @@ export function findSupersedingRun<TRun extends { status: string; designTextHash
   })
 }
 
-/**
- * **同じ subject・同じ design hash の、より古い未回答の判定（CONFLICT / UNCERTAIN）**（lifecycle repair C2 / C-05）。
- *
- * `findSupersedingRun()` は evidence より**新しい** run しか見ない。そのため、同じ設計に対して
- * 先に CONFLICT が出て、後から（Human Recovery → 再 adoption 等で同じ設計が再提出され）別の
- * reviewer が ALIGNED を返すと、その ALIGNED が未解決の不一致を**洗い流して**しまう
- * （reviewer を引き直せば通る）。判定が割れた同じ設計は、人が答えるか設計を変えるまで使わない。
- *
- * 次をすべて満たす run を返す（無ければ undefined）:
- *   - evidence と同じ design hash（呼び出し側が同じ subject で絞る）
- *   - evidence より**新しくない**（`isAfterEvidence` が false）で、evidence を生んだ run 自身ではない
- *   - `succeeded` で終端し、再計算した判定が `negative`（CONFLICT / UNCERTAIN）
- *   - **人が答えていない**（`isAnsweredByHuman` が false。D3 と同じ意味: その run の完了後に作られた
- *     human と証明された Human Resume。PL / AI / unknown の resume や Human Recovery は答えではない）
- *
- * 判定の無い終端（failed / REVIEW_UNAVAILABLE / 結果なし）は不一致ではない。design hash が違う
- * （設計が実質的に変わった）run は対象外。
- */
-export function findUnresolvedDisagreementRun<TRun extends { id: string; status: string; designTextHash: string; createdAt: string }>(
-  evidence: Pick<DesignReviewEvidence, 'designTextHash' | 'createdAt' | 'runId'>,
-  runs: readonly TRun[],
-  judgmentOf: (run: TRun) => StoredRunJudgment,
-  isAnsweredByHuman: (run: TRun) => boolean,
-  isAfterEvidence: (run: TRun) => boolean = (run) => run.createdAt > evidence.createdAt,
-): TRun | undefined {
-  return runs.find((run) => {
-    if (run.designTextHash !== evidence.designTextHash) return false
-    if (run.id === evidence.runId || isAfterEvidence(run)) return false
-    if (run.status !== 'succeeded' || judgmentOf(run) !== 'negative') return false
-    return !isAnsweredByHuman(run)
-  })
-}
-
-/**
- * evidence が ALIGNED で、かつ覆されていない（使ってよい）か。storage の `findSupersedingRun()` は
- * 新しい run と、古い未回答の不一致（`findUnresolvedDisagreementRun()`）の両方を返す。
- */
+/** evidence が ALIGNED で、かつ新しい run に覆されていない（使ってよい）か。 */
 export function isUsableAlignedEvidence(
   evidence: DesignReviewEvidence | undefined,
   evidenceStorage: IDesignReviewEvidenceStorage,
@@ -171,16 +133,6 @@ export function checkImplementJobDesignReviewEvidence(
     }
   }
 
-  // 古い未回答の不一致を先に見る（storage の findSupersedingRun はそれも返すが、理由を型で分けるため）。
-  const disagreement = evidenceStorage.findUnresolvedDisagreementRun(evidence)
-  if (disagreement !== undefined) {
-    return {
-      ok: false,
-      code: 'DESIGN_REVIEW_DISAGREEMENT',
-      reason: `An earlier Design Review run (${disagreement.id}) for the same design returned a CONFLICT/UNCERTAIN judgment that no Human Resume has answered; a later ALIGNED for the unchanged design does not resolve it`,
-    }
-  }
-
   const superseding = evidenceStorage.findSupersedingRun(evidence)
   if (superseding !== undefined) {
     return {
@@ -199,7 +151,6 @@ export type RoadmapDesignReviewFreshnessFailureCode =
   | 'ROADMAP_DESIGN_REVIEW_NOT_ALIGNED'
   | 'ROADMAP_DESIGN_REVIEW_INDEPENDENT_REVIEW_NOT_APPROVED'
   | 'ROADMAP_DESIGN_REVIEW_SUPERSEDED'
-  | 'ROADMAP_DESIGN_REVIEW_DISAGREEMENT'
   // PR C: Roadmapの第二意見はClaude integration reviewが担うようになったため、
   // 特定providerのverdictではなく generator/final の vendor 分離を要求する。
   | 'ROADMAP_DESIGN_REVIEW_VENDOR_NOT_SEPARATED'
@@ -228,14 +179,6 @@ export function checkRoadmapDesignReviewFreshness(
   }
   if (evidence.decision !== 'ALIGNED') {
     return { ok: false, code: 'ROADMAP_DESIGN_REVIEW_NOT_ALIGNED', reason: `Latest Roadmap Design Review decision is ${evidence.decision}` }
-  }
-  const disagreement = evidenceStorage.findUnresolvedDisagreementRun(evidence)
-  if (disagreement !== undefined) {
-    return {
-      ok: false,
-      code: 'ROADMAP_DESIGN_REVIEW_DISAGREEMENT',
-      reason: `An earlier Roadmap Design Review run (${disagreement.id}) for the same material returned a CONFLICT/UNCERTAIN judgment; a later ALIGNED for unchanged material does not resolve it`,
-    }
   }
   const superseding = evidenceStorage.findSupersedingRun(evidence)
   if (superseding !== undefined) {

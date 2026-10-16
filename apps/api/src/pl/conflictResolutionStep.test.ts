@@ -8,7 +8,6 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt, INITIAL_WORKFLOW_JOB_EXISTS } from '../ctoAi/initialImplementWorkflow'
 import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import { executeQueuedRun } from '../designReview/queuedRunDispatch'
-import { buildSystemState } from '../state/systemState'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
@@ -559,13 +558,11 @@ describe('PL revision 後に stale な Design Review evidence を再利用でき
       decision: 'ALIGNED',
       independentReviewRequired: false,
     } as never)
-    // 旧 prompt では hash は一致する（前提の確認）。ただし seed の Task は同じ設計への未回答の
-    // CONFLICT で止まっているので、後から登録された ALIGNED では通らない（lifecycle repair C2 / C-05:
-    // 同じ設計の不一致は reviewer の引き直しで解消しない）。
+    // 旧 prompt ならその evidence で通る（前提の確認）。
     expect(checkImplementJobDesignReviewEvidence(
       { taskId, aiCliMode: 'implement', aiCliPrompt: oldPrompt },
       storage.designReviewEvidence,
-    )).toMatchObject({ ok: false, code: 'DESIGN_REVIEW_DISAGREEMENT' })
+    ).ok).toBe(true)
 
     // 2. PL revision が組む spec（判断記録を折り込んだ最終形）から prompt を作る。
     const revisedPrompt = buildInitialImplementAiCliPrompt({
@@ -635,10 +632,7 @@ describe('Challenge の再評価が requeued になった場合', () => {
     expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.status).toBe('queued')
   })
 
-  // **同じ frozen spec の再評価が ALIGNED でも、元の CONFLICT は未回答の不一致のまま残る**
-  // （lifecycle repair C2 / C-05・spec 22 DA trigger 7）。以前はここで回収経路が Job を作っていた。
-  // 解消は Human Resume か設計の変更（PL revision / Remediation）に限る。
-  it('同じ run が rekick で ALIGNED になっても、未回答の CONFLICT が残るので回収経路は Job を作らない', async () => {
+  it('同じ run が rekick で ALIGNED になれば、既存の回収が Job を1回だけ作る', async () => {
     const { storage, taskId } = seed()
     await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
       coordinatorDeps: coordinator('null'),
@@ -649,23 +643,9 @@ describe('Challenge の再評価が requeued になった場合', () => {
     expect(storage.designReviewEvidence.findLatestByTaskId(taskId)?.decision).toBe('ALIGNED')
     expect(storage.jobs.findByTaskId(taskId)).toEqual([])
 
+    expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(1)
     expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(0)
-    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
-    const evidence = storage.designReviewEvidence.findLatestByTaskId(taskId)!
-    expect(storage.designReviewEvidence.findUnresolvedDisagreementRun(evidence)).toBeDefined()
-    // 見えない停止にしない: Job の無い Task として attention に出る。
-    expect(buildSystemState(storage).attention.some((item) => item.kind === 'task_ready_without_job' && item.taskId === taskId)).toBe(true)
-  })
-
-  it('同じ frozen spec の再評価がその場で ALIGNED でも release せず、design_review_disagreement を返す', async () => {
-    const { storage, taskId } = seed()
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      coordinatorDeps: coordinator(ALIGNED_RESULT_JSON),
-    }) as never)
-
-    expect(result).toMatchObject({ stage: 'challenge', status: 'challenge_not_aligned', failureCode: 'design_review_disagreement' })
-    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
   })
 })
 describe('Challenge と他の review / 回収経路の重なり（独立レビュー round 6）', () => {
