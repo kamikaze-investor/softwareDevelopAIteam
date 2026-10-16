@@ -35,21 +35,12 @@ const SHARED_AUTHORITY_FILE = /^(?:[A-Za-z0-9]*(?:Admission|Occupancy|Liveness|S
  * Adding a line here is a classification decision; give the reason.
  */
 const REVIEWED_NON_AUTHORITY_FILES: Readonly<Record<string, string>> = {
-  'apps/api/src/designReview/queuedRunDispatch.ts':
-    'routes an already-queued run to its executor; both executors run the Design Review (liveness, not admission)',
-  'apps/api/src/designReview/repairPromptBuilder.ts':
-    'builds repair design text; that text is still Design-Reviewed and bound by its hash before any Job exists',
   'apps/api/src/designReview/retryCooldownTestClock.ts':
     'test-only vitest clock helper; not imported by production code',
-  'apps/api/src/pl/adoptionFailure.ts':
-    'summarises adoption failures from audit rows for notification and display; decides nothing',
   'apps/api/src/pl/implementTimeoutSensor.ts':
-    'read-only sensor that asks for a timeout budget re-evaluation; changes no state',
-  'apps/api/src/storage/backup.ts': 'database backup / verification utility',
-  'apps/api/src/storage/index.ts': 'storage singleton wiring',
-  'apps/api/src/storage/roadmapTaskValidation.ts':
-    'structural validation of generated roadmap tasks; runtime path enforcement is the File Change Guard '
-    + 'and the Safety Evidence file_policy_violation check',
+    'advisory sensor: writes audit rows asking for a timeout budget re-evaluation; gates and escalates nothing',
+  'apps/api/src/storage/backup.ts':
+    'backup create / rotate / verify used only by apps/api/scripts (dbBackup, dbRestoreTest); restores nothing',
 }
 
 function isProductionTs(file: string): boolean {
@@ -110,6 +101,18 @@ describe('RC6-LIST: authority files are classified HIGH or explicitly reviewed',
     expect(newFile in REVIEWED_NON_AUTHORITY_FILES).toBe(false)
     expect(SHARED_AUTHORITY_FILE.test('humanAdmission.ts')).toBe(true)
     expect(SHARED_AUTHORITY_FILE.test('humanAdmission.test.ts')).toBe(false)
+  })
+
+  // Codex review r5: these were wrongly exempted. Fixed by explicit path, independent of the list,
+  // so dropping a line from GATE_CHANGE_EXACT_FILES cannot silently make them LOW again.
+  it.each([
+    'apps/api/src/designReview/queuedRunDispatch.ts',
+    'apps/api/src/storage/roadmapTaskValidation.ts',
+    'apps/api/src/designReview/repairPromptBuilder.ts',
+    'apps/api/src/pl/adoptionFailure.ts',
+    'apps/api/src/storage/index.ts',
+  ])('%s is HIGH', (file) => {
+    expect(runRiskReview([file]).riskLevel).toBe('HIGH')
   })
 
   it('this test file is itself HIGH (editing the reviewed list is a HIGH change)', () => {
