@@ -1323,7 +1323,7 @@ export function completeRepairHandoff(
 }
 
 /**
- * 状態変化による「良性の」refusal（skipped で返す）。`PROJECT_MISMATCH` は含めない ——
+ * 状態変化による「良性の」refusal（skipped で返す）。`PROJECT_MISMATCH` / `LINEAGE_MISMATCH` は含めない ——
  * Task / Job の Project が食い違うのは lineage の破損であり、別 Task の source と同じく
  * 既存の escalation 経路へ渡す（source Job の所有権は storage 側で変わっていない）。
  */

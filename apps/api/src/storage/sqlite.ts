@@ -826,9 +826,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     // **見る Project は Task の正本（tasks.project_id）から引く。** 呼び出し側が渡した projectId を
     // そのまま信じると、別 Project の running を根拠に止まっている Project へ Job を作りうる。
     // repair Job と source Job の projectId がどちらも Task の Project と一致しなければ断る。
-    const source = db.prepare('SELECT project_id FROM jobs WHERE id = ?').get(sourceJobId) as
-      | { project_id: string }
+    const source = db.prepare('SELECT project_id, task_id FROM jobs WHERE id = ?').get(sourceJobId) as
+      | { project_id: string; task_id: string }
       | undefined
+    // **source Job は repair 先と同じ Task のものでなければならない。** 別 Task の Job を source に
+    // すると lineage が Task をまたぎ、`walkRepairGeneration()` が数えられない親を持つ repair になる。
+    if (source !== undefined && source.task_id !== taskId) {
+      return {
+        code: 'LINEAGE_MISMATCH',
+        reason: `source job ${sourceJobId} belongs to task ${source.task_id}, not to the repair task ${taskId}`,
+      }
+    }
     if (repairProjectId !== task.project_id || (source !== undefined && source.project_id !== task.project_id)) {
       return {
         code: 'PROJECT_MISMATCH',

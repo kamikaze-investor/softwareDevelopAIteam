@@ -59,6 +59,28 @@ describe('recomputeDecision: low-load（task kind）', () => {
     expect(outcome.rejectedReason).not.toContain('focus set mismatch')
   })
 
+  it('unavailable を申告していても integration の CONFLICT は CONFLICT のまま返す', () => {
+    // low load の早期 return が CONFLICT を REVIEW_UNAVAILABLE に置き換えていた（独立レビュー指摘・2026-10-16）。
+    const outcome = recomputeDecision(lowLoad({
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'conflicts with the goal' },
+      finalDecision: 'REVIEW_UNAVAILABLE',
+      unavailableReason: 'focused review partially unavailable',
+    }) as never, 'task', DOCS_ONLY)
+
+    expect(outcome.decision).toBe('CONFLICT')
+  })
+
+  it('unavailable を申告し integration が CONFLICT でなければ REVIEW_UNAVAILABLE で理由が残る', () => {
+    const outcome = recomputeDecision(lowLoad({
+      integrationReviewResult: { decision: 'UNCERTAIN', summary: 'integration unavailable' },
+      finalDecision: 'REVIEW_UNAVAILABLE',
+      unavailableReason: 'Claude integration review unavailable: exit 1',
+    }) as never, 'task', DOCS_ONLY)
+
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('Claude integration review unavailable')
+  })
+
   it('旧 runner の形（架空の strategic_alignment 付き）でも focus set mismatch にならない', () => {
     // 修正版 Worker の deploy 前後で旧 runner の結果が届いても、原因を取り違えない。
     const outcome = recomputeDecision(lowLoad({

@@ -188,6 +188,7 @@ export type RepairHandoffRefusalCode =
   | 'TASK_PARKED'
   | 'PROJECT_NOT_RUNNING'
   | 'PROJECT_MISMATCH'
+  | 'LINEAGE_MISMATCH'
 
 export type PersistReviewWorkflowResult =
   | {

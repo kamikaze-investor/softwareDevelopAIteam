@@ -2343,6 +2343,26 @@ describe('SQLiteStorage', () => {
           expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)).ok).toBe(true)
         })
 
+        it('refuses with LINEAGE_MISMATCH when the source Job belongs to another Task of the same Project', () => {
+          const taskB = storage.tasks.create({
+            projectId, title: 'B', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+          })
+          const sourceOfB = storage.jobs.create({
+            taskId: taskB.id,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliMode: 'implement',
+          })
+
+          // repair 先は Task A（repairJobInput の taskId）、source は Task B の Job。
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(sourceOfB.id)))
+            .toMatchObject({ ok: false, code: 'LINEAGE_MISMATCH' })
+          expect(storage.jobs.findById(sourceOfB.id)?.status).toBe('blocked')
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === `repair:${sourceOfB.id}:1`)).toBe(false)
+        })
+
         it('refuses with PROJECT_MISMATCH when the repair or source Job names another Project, keeping source ownership', () => {
           // Task の Project は止まっていて、別 Project が running。呼び出し側の projectId を信じると通ってしまう形。
           storage.projects.update(projectId, { status: 'paused' })
