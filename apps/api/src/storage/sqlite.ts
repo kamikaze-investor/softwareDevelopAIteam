@@ -18,7 +18,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
-import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
+import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateResumeAdmission, isSupervisedRunKind } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -1038,17 +1038,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false as const, reason: 'Task was parked concurrently' }
         }
 
+        // **Project が running であることも読み直す**（precheck と同じ code。b8d0fc5d 監査）。
+        // precheck の後に Project が pause されたら、pending へ戻しても誰も拾わない。
+        const projectRow = db.prepare('SELECT status FROM projects WHERE id = ?').get(current.projectId) as
+          { status: string } | undefined
+        if (projectRow?.status !== 'running') {
+          return {
+            ok: false as const,
+            code: 'PROJECT_NOT_RUNNING' as const,
+            reason: `Project is ${projectRow?.status ?? 'missing'}, not running`,
+          }
+        }
+
         // **有効な承認待ちも同じ transaction の中で確かめ直す。** precheck だけだと、
         // 別 connection が precheck 後・commit 前に Approval Request を作れてしまい、
         // 「人の判断待ちと Recovery が同時進行しない」という条件を破ったまま commit される。
         // 判定は precheck と同じ `hasActiveApprovalWaiting()` —— 条件をここへ書き写さない。
-        const latestApprovalRow = db.prepare(
-          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
-        ).get(taskId) as any
-        if (hasActiveApprovalWaiting(
-          latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined,
-          now(),
-        )) {
+        const approvalRows = db.prepare(
+          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC',
+        ).all(taskId) as any[]
+        if (hasActiveApprovalWaiting(approvalRows.map(deserializeApprovalRequest), now())) {
           // **precheck と同じ code を返す。** ここでしか気付けなかった（= race だった）
           // というだけで machine-readable code が変わってはならない
           // （独立レビュー round 7 指摘）。
@@ -2630,10 +2639,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         ).all(taskId) as any[]
         const taskJobs = jobRows.map(deserializeJob)
         const latestJob = taskJobs[0]
+        const projectRow = db.prepare('SELECT status FROM projects WHERE id = ?').get(taskRow.project_id) as
+          { status: string } | undefined
+        const approvalRows = db.prepare(
+          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC'
+        ).all(taskId) as any[]
 
-        if (!latestJob) {
-          return { ok: false, reason: 'No jobs exist for this task' }
-        }
+        // **前提条件は共有の純関数 1 つで決める**（Mobile の Resume ボタンも同じ関数を使う）。
+        // 以下の分岐の注記は、各前提がなぜ在るかの記録として残してある。判定はここでしか行わない。
+        // done / Project 非 running の拒否もこの transaction の中で読み直した値で行う（b8d0fc5d 監査）。
+        const admission = evaluateResumeAdmission({
+          taskStatus: taskRow.status,
+          parked: isParkedTaskId(taskId),
+          projectStatus: projectRow?.status,
+          jobs: taskJobs,
+          approvals: approvalRows.map(deserializeApprovalRequest),
+          nowMs: Date.parse(now()),
+        })
 
         // 通常はJob自体がblockedの場合のみ再開対象（guard違反等）。
         // それに加え、Design Review CONFLICT/NOT_ALIGNED等でrepair flowが
@@ -2641,42 +2663,54 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // このescalationはJobを更新せずTask.statusだけをblockedにするため、
         // 最新Jobはfailedのまま残る。これを「blockedでない」として拒否すると、
         // 正式にescalateされたTaskが既存のresume経路から一切復旧できなくなる。
-        const isJobDirectlyBlocked = latestJob.status === 'blocked'
-        const isEscalatedFailure = taskRow.status === 'blocked' && latestJob.status === 'failed'
-        if (!isJobDirectlyBlocked && !isEscalatedFailure) {
-          return { ok: false, reason: `Latest job status is ${latestJob.status}, not blocked` }
+        if (!admission.ok) {
+          switch (admission.code) {
+            case 'TASK_DONE':
+              return { ok: false, code: 'TASK_DONE', reason: 'Task is done; a completed task is not resumed' }
+            case 'PROJECT_NOT_RUNNING':
+              return {
+                ok: false,
+                code: 'PROJECT_NOT_RUNNING',
+                reason: `Project is ${projectRow?.status ?? 'missing'}, not running; a resumed job would never be picked up`,
+              }
+            case 'NO_JOBS':
+              return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
+            case 'LATEST_JOB_NOT_BLOCKED':
+              return { ok: false, code: 'LATEST_JOB_NOT_BLOCKED', reason: `Latest job status is ${latestJob?.status}, not blocked` }
+            case 'TASK_PARKED':
+              return {
+                ok: false,
+                code: 'TASK_PARKED',
+                reason: 'This task was parked by abort_task; resuming it would silently un-park it',
+              }
+            case 'WORKSPACE_QUARANTINED': {
+              const reason = taskJobs.find((job) => job.failureMetadata?.quarantined === true)
+                ?.failureMetadata?.quarantineReason ?? 'workspace is quarantined'
+              return { ok: false, code: 'WORKSPACE_QUARANTINED', reason: `Cannot resume: ${reason}` }
+            }
+            case 'LIVE_JOB_EXISTS':
+              return { ok: false, code: 'LIVE_JOB_EXISTS', reason: 'A queued or running job already exists for this task' }
+            case 'APPROVAL_WAITING':
+              return { ok: false, code: 'APPROVAL_WAITING', reason: 'The latest approval request is waiting for user review' }
+            case 'AI_CLI_MODE_MISSING':
+              return { ok: false, code: 'AI_CLI_MODE_MISSING', reason: 'Latest blocked job is missing AI CLI provider or mode' }
+          }
         }
+        if (!latestJob) {
+          return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
+        }
+        const isJobDirectlyBlocked = latestJob.status === 'blocked'
 
         // **park された Task は resume しない。** abort_task は Task を done にせず
         // 現役から外すだけなので、最新 Job は blocked / failed のまま残る。
         // ここを塞がないと、park した Task が既存の resume 経路から新しい Job を得て
         // そのまま走り出す（独立レビュー Finding 7）。park の解除は CEO の判断であり、
         // resume の副作用として起きてよいものではない。
-        if (isParkedTaskId(taskId)) {
-          return {
-            ok: false,
-            reason: 'This task was parked by abort_task; resuming it would silently un-park it',
-          }
-        }
-
+        //
         // PR-C Tranche 3: workspace quarantine は fail-closed に resume を拒否する。
         // 最新Jobだけを見ず、このTaskの**任意の**未解除quarantine Jobから判定する
         // （quarantine は `running -> blocked` と同一transactionで一度だけ設定され、解除機構はない）。
         // 未検証 workspace を持つ Task へ新しい Job を生成してはならない。
-        if (taskJobs.some((job) => job.failureMetadata?.quarantined === true)) {
-          const reason = taskJobs.find((job) => job.failureMetadata?.quarantined === true)
-            ?.failureMetadata?.quarantineReason ?? 'workspace is quarantined'
-          return { ok: false, code: 'WORKSPACE_QUARANTINED', reason: `Cannot resume: ${reason}` }
-        }
-
-        if (taskJobs.some((job) => job.status === 'queued' || job.status === 'running')) {
-          return { ok: false, reason: 'A queued or running job already exists for this task' }
-        }
-
-        const latestApprovalRow = db.prepare(
-          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1'
-        ).get(taskId) as any
-        const latestApproval = latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined
 
         // 後継を先に queued で作り、その後で source を failed へ終端化する。両方ともこの
         // transaction 内なので、workspace ownership がどちらにも属さない window は無い。
@@ -2724,9 +2758,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 期限切れの承認は resume を妨げない。resume は Approval Gate を迂回せず、
         // 古い行を承認・削除もしない: 新 Job が `/gate/check` で**新しい**Approval Request を
         // 発行し、CEO が Mobile からそれを承認する、という正規経路へ戻すだけである。
-        if (latestApproval?.status === 'WAITING_FOR_USER' && new Date(latestApproval.expiresAt) > new Date(now())) {
-          return { ok: false, reason: 'The latest approval request is waiting for user review' }
-        }
+        // 判定は上の `evaluateResumeAdmission()`（共有の `isLiveWaitingApproval()`）が行う。
+        // W4 の不変条件（Task あたり WAITING は高々 1 行）の下では「最新の有効行が live WAITING」と
+        // 「live WAITING が 1 行でもある」は同値なので、より頑健な後者で判定している。
 
         // Recognized git_commit anchors/generations use fixed anchor + generation.
         // The referenced Job is read exactly once and generations are checked as a set.

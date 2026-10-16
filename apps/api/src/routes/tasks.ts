@@ -547,13 +547,21 @@ export async function taskRoutes(
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_FAILED) {
       return reply.status(409).send({
         error: 'Resume instruction did not pass the pre-implementation Design Review',
+        code: resumed.code,
         reason: resumed.reviewError,
       })
     }
 
     if (!resumed.ok) {
-      if (resumed.code === 'WORKSPACE_QUARANTINED') {
-        return reply.status(409).send({ error: resumed.reason })
+      // **409 は必ず stable な code を添える。** Mobile と PL が reason 文字列で分岐しないため。
+      // done の Task と running でない Project は request の不備ではなく状態の衝突なので 409
+      // （b8d0fc5d 監査）。他の既存の拒否は status を変えず、code だけを足す。
+      if (
+        resumed.code === 'WORKSPACE_QUARANTINED'
+        || resumed.code === 'TASK_DONE'
+        || resumed.code === 'PROJECT_NOT_RUNNING'
+      ) {
+        return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
       // **却下済み commit の出所を特定できなかったのは request の不備ではなく状態の問題**なので
       // 400 ではなく 409 を返す。code を添えるのは、呼び出し側が
@@ -565,7 +573,10 @@ export async function taskRoutes(
       ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
-      return reply.status(400).send({ error: resumed.reason })
+      return reply.status(400).send({
+        error: resumed.reason,
+        ...(resumed.code === undefined ? {} : { code: resumed.code }),
+      })
     }
 
     // **誰が再開したかを、この request の credential だけから決めて残す。**
