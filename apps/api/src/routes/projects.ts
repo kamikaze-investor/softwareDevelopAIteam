@@ -281,7 +281,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(409).send(singleRunningProjectResponse)
       }
       if (err instanceof ProjectHasActiveLifecycleError) {
-        // 止めると所有者が見えなくなる lifecycle が残っている。どれが止めたかを機械可読で返す。
+        // 放棄すると所有者が見えなくなる lifecycle が残っている。どれが拒否させたかを機械可読で返す。
         return reply.status(409).send({
           error: err.message,
           code: 'PROJECT_HAS_ACTIVE_LIFECYCLE',

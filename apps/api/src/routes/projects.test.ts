@@ -141,15 +141,6 @@ async function createProjectJob(
   return { taskId: task.id, jobId: job.id }
 }
 
-/** 開始 workflow が作った queued Job を終端させる（pause の前提を作るためだけに使う）。 */
-function settleQueuedJobs(storage: IStorage, projectId: string): void {
-  for (const task of storage.tasks.findByProjectId(projectId)) {
-    for (const job of storage.jobs.findByTaskId(task.id)) {
-      if (job.status === 'queued' || job.status === 'running') storage.jobs.update(job.id, { status: 'success' })
-    }
-  }
-}
-
 async function createApproval(
   app: FastifyInstance,
   projectId: string,
@@ -423,10 +414,6 @@ describe('Project API', () => {
         sourceJobId: sourceJob.id, projectId: project.id, completedTaskId: sourceTask.id,
         nextTaskId: nextTask.id, status: 'pending',
       })
-      // 開始で作られた初回 Job が queued のままだと pause は拒否される（W5）。このテストの関心は
-      // pause 中に残った continuation なので、その Job を先に終端させてから pause する。
-      settleQueuedJobs(storage, project.id)
-
       const pauseRes = await app.inject({
         method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' },
       })
@@ -479,9 +466,7 @@ describe('Project API', () => {
         nextTaskId: nextTask.id, status: 'pending',
       })
 
-      settleQueuedJobs(storage, project.id)
-      const pauseRes = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' } })
-      expect(pauseRes.statusCode).toBe(200)
+      await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' } })
       const resumeRes = await app.inject({ method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'running' } })
       expect(resumeRes.statusCode).toBe(200)
       await new Promise((resolve) => setTimeout(resolve, 50))
@@ -569,7 +554,7 @@ describe('Project API', () => {
     })
   })
 
-  describe('pause / archive は lifecycle の所有者を残したまま止めない（W5）', () => {
+  describe('archive / draft への放棄は lifecycle の所有者を残したまま行わない（W5）', () => {
     async function patchStatus(app: FastifyInstance, projectId: string, status: Project['status']) {
       return app.inject({ method: 'PATCH', url: `/api/projects/${projectId}`, payload: { status } })
     }
@@ -581,9 +566,9 @@ describe('Project API', () => {
 
     it.each([
       ['running', 'archived'],
-      ['running', 'paused'],
       ['running', 'draft'],
       ['paused', 'archived'],
+      ['paused', 'draft'],
     ] as const)('%s → %s is refused with a queued Job, and the status is unchanged', async (from, to) => {
       await withApp(async (app) => {
         const project = await createProject(app, { status: from })
@@ -669,7 +654,23 @@ describe('Project API', () => {
       })
     })
 
-    it('refuses pause while a repair Design Review run is queued', async () => {
+    it('pause is the CEO stop switch and is never refused, even with queued / running / blocked Jobs', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        await createProjectJob(project.id, 'queued')
+        await createProjectJob(project.id, 'running')
+        await createProjectJob(project.id, 'blocked')
+
+        const paused = await patchStatus(app, project.id, 'paused')
+        expect(paused.statusCode).toBe(200)
+        expect(parseBody<Project>(paused.body).status).toBe('paused')
+
+        const resumed = await patchStatus(app, project.id, 'running')
+        expect(resumed.statusCode).toBe(200)
+      })
+    })
+
+    it('refuses returning to draft while a repair Design Review run is queued', async () => {
       await withApp(async (app) => {
         const storage = await storageOf()
         const project = await createProject(app, { status: 'running' })
@@ -683,7 +684,7 @@ describe('Project API', () => {
           repairSourceJobId: jobId,
         })
 
-        const res = await patchStatus(app, project.id, 'paused')
+        const res = await patchStatus(app, project.id, 'draft')
 
         expect(res.statusCode).toBe(409)
         expect(parseBody<{ blockers: string[] }>(res.body).blockers).toEqual(['repair_design_review_run'])

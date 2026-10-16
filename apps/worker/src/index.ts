@@ -343,9 +343,17 @@ export async function fetchQueuedJob(): Promise<QueuedWork | null> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return null
 
+  // **所有権は archived 以外のすべての Project の Task で判定し、claim は running Project に限る。**
+  //
+  // workspace は deployment ごとに1つ（TARGET_ROOT）であり、paused / draft の Project も同じ
+  // worktree を使う。以前は running 以外を判定から外していたため、paused Project の running /
+  // blocked / dirty な所有者がいても別 Project の Job を claim し、未 commit の変更の上で
+  // 走らせうるところだった（lifecycle repair W5）。pause は CEO の停止スイッチなので止めない代わりに、
+  // 止めた Project の所有者はここで見え続ける（fail-closed）。止めた Project 自身の queued Job は実行しない。
   const perTask: Array<{ task: Task; jobs: Job[] }> = []
+  const claimableTaskIds = new Set<string>()
   for (const project of projects) {
-    if (project.status !== 'running') continue
+    if (project.status === 'archived') continue
 
     const tasks = await fetchJson<Task[]>(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)
     if (!tasks) continue
@@ -354,6 +362,7 @@ export async function fetchQueuedJob(): Promise<QueuedWork | null> {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
       perTask.push({ task, jobs })
+      if (project.status === 'running') claimableTaskIds.add(task.id)
     }
   }
 
@@ -363,6 +372,7 @@ export async function fetchQueuedJob(): Promise<QueuedWork | null> {
 
   for (const { task, jobs } of perTask) {
     if (ownership.kind === 'owner' && ownership.taskId !== task.id) continue
+    if (!claimableTaskIds.has(task.id)) continue
 
     const queued = jobs.find((job) => job.status === 'queued')
     if (queued) return { job: queued, task, jobs }

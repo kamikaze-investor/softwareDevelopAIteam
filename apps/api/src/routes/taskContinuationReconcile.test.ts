@@ -250,10 +250,6 @@ describe('POST /api/task-continuations/reconcile', () => {
     try {
       const { project, sourceTask, storage } = await createRunningProjectWithTask(app)
       const { nextTask, continuation } = await seedPendingContinuation(storage, project.id, sourceTask.id)
-      // 開始で作られた queued Job が残ると pause は拒否される（W5）。関心は continuation なので先に終端させる。
-      for (const job of storage.jobs.findByTaskId(sourceTask.id)) {
-        if (job.status === 'queued' || job.status === 'running') storage.jobs.update(job.id, { status: 'success' })
-      }
 
       const pauseRes = await app.inject({
         method: 'PATCH', url: `/api/projects/${project.id}`, payload: { status: 'paused' },

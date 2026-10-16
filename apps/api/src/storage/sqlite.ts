@@ -63,22 +63,23 @@ export class SingleRunningProjectError extends Error {
   }
 }
 
-/** Project を止める（pause / archive）と、その時点で lifecycle を持つ実体が見えなくなる種類。 */
+/** Project を放棄する（archive / draft へ戻す）と、その時点で lifecycle を持つ実体が見えなくなる種類。 */
 export type ProjectActiveLifecycleKind =
   | 'queued_or_running_job'
   | 'blocked_job'
   | 'repair_design_review_run'
 
 /**
- * pause / archive を拒否した理由。**status 変更と同じ transaction の中で**判定する。
+ * archive / draft への遷移を拒否した理由。**status 変更と同じ transaction の中で**判定する。
  *
  * 以前は archive が running Job だけを見ており、queued Job・未解決の blocked Job・
- * repair 用 Design Review run を持ったまま Project を止められた。止まった Project は
- * PL / attention の対象から外れるため、それらの所有者が誰にも見えないまま残る（lifecycle repair W5）。
+ * repair 用 Design Review run を持ったまま Project を放棄できた。放棄された Project は
+ * PL / attention / Worker の所有権判定から外れるため、それらの所有者が誰にも見えないまま残る
+ * （lifecycle repair W5）。pause は対象にしない（CEO の停止スイッチであり、Worker が所有権を見続ける）。
  */
 export class ProjectHasActiveLifecycleError extends Error {
   constructor(public readonly blockers: readonly ProjectActiveLifecycleKind[]) {
-    super(`Cannot pause or archive project while it has an active lifecycle: ${blockers.join(', ')}`)
+    super(`Cannot archive project or return it to draft while it has an active lifecycle: ${blockers.join(', ')}`)
     this.name = 'ProjectHasActiveLifecycleError'
   }
 }
@@ -650,12 +651,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   let storage: IStorage
 
   /**
-   * Project を止めると所有者が見えなくなる lifecycle の種類。
+   * Project を放棄すると所有者が見えなくなる lifecycle の種類。
    *
    * blocked Job は「blocked なら所有者」とは決めない。done な Task に残る行は履歴であり
    * （`holdsWorkspaceWhenBlocked`）、Human Resume で後継が作られた旧行は superseded である
    * （`readJobsSupersededByHumanResume`。attention と同じ reader を使い、ここで再実装しない）。
-   * それ以外を所有者として残すと、止めた Project の中で誰も解消できない停止になる。
+   * それ以外を所有者として残すと、放棄した Project の中で誰も解消できない停止になる。
    */
   function activeLifecycleKindsOf(projectId: string): ProjectActiveLifecycleKind[] {
     const kinds: ProjectActiveLifecycleKind[] = []
@@ -731,12 +732,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         const existing = projects.findById(id)
         if (!existing) return undefined
 
-        // running から出る遷移（paused / draft / archived のどれでも）と、archived への遷移を止める。
+        // 止めるのは**放棄する遷移**だけ: archived への遷移と、running / paused → draft。
+        // pause は CEO の停止スイッチなので常に通す。paused Project の所有者は Worker が
+        // 引き続き workspace 所有権の判定に含めるので、pause しても見えなくはならない。
         // archived → paused（復元）は止まった Project を見える側へ戻す操作なので対象にしない。
-        const stopsProject = (
-          existing.status === 'running' && data.status !== undefined && data.status !== 'running'
-        ) || (data.status === 'archived' && existing.status !== 'archived')
-        if (stopsProject) {
+        const abandonsProject = (data.status === 'archived' && existing.status !== 'archived')
+          || (data.status === 'draft' && (existing.status === 'running' || existing.status === 'paused'))
+        if (abandonsProject) {
           const blockers = activeLifecycleKindsOf(id)
           if (blockers.length > 0) throw new ProjectHasActiveLifecycleError(blockers)
         }
