@@ -16,7 +16,12 @@ import {
 } from '@ai-team/shared'
 import { buildResumeAiCliPrompt } from '../implementPrompt'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
-import { verifyExternalCompletion } from '../reconcile/externalCompletion'
+import {
+  blockedJobsReconcileRefusalReason,
+  findBlockedJobsPreventingReconcile,
+  TASK_HAS_BLOCKED_JOBS,
+  verifyExternalCompletion,
+} from '../reconcile/externalCompletion'
 import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
 import { getStorage } from '../storage'
 import {
@@ -657,6 +662,16 @@ export async function taskRoutes(
       return reply.status(422).send({ error: verification.reason })
     }
 
+    // blocked Job が残る Task は取り込まない（storage の transaction でも同じ関数で再確認する）。
+    // Gate より前に断るのは、断られる操作のために承認を評価・消費させないため。
+    const blockedJobs = findBlockedJobsPreventingReconcile(storage, task.id)
+    if (blockedJobs.length > 0) {
+      return reply.status(409).send({
+        code: TASK_HAS_BLOCKED_JOBS,
+        error: blockedJobsReconcileRefusalReason(blockedJobs),
+      })
+    }
+
     // 2) Mandatory Gate。**Task completion を起こす正式操作なので必ず通す。**
     //    充足の根拠は seam が DB の実レコードで検証する（Gate 名の文字列では通らない）。
     try {
@@ -678,6 +693,9 @@ export async function taskRoutes(
       sourceJobId: parsed.data.sourceJobId,
     })
     if (!reconciled.ok) {
+      if (reconciled.code === 'TASK_HAS_BLOCKED_JOBS') {
+        return reply.status(409).send({ code: reconciled.code, error: reconciled.reason })
+      }
       return reply.status(reconciled.code === 'ALREADY_DONE' ? 409 : 400).send({ error: reconciled.reason })
     }
 

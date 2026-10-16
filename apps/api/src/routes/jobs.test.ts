@@ -622,6 +622,63 @@ describe('Job API', () => {
     },
   )
 
+  // lifecycle repair C2: 適用しない遷移を 200 で「成功したように」見せない。200 + no-op は
+  // Outbox 配送（eventId 付き。at-least-once の遅延・重複 result）にだけ使う。
+  describe('PATCH with a non-applicable transition', () => {
+    async function storedJob(status: 'blocked' | 'failed' | 'success') {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'T', description: '', status: 'blocked', assignee: 'developer_ai', dependencies: [],
+      })
+      const job = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status,
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      } as Parameters<typeof storage.jobs.create>[0])
+      return { storage, job }
+    }
+
+    it('a direct blocked -> failed is refused with 409 JOB_TRANSITION_NOT_APPLICABLE and nothing changes', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('blocked')
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'failed', stderr: 'x' } })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string; error: string }>(res.body)).toMatchObject({ code: 'JOB_TRANSITION_NOT_APPLICABLE' })
+        expect(storage.jobs.findById(job.id)).toMatchObject({ status: 'blocked' })
+        expect(storage.jobs.findById(job.id)?.stderr).toBeUndefined()
+      })
+    })
+
+    it('a direct claim of an already-terminal Job is refused with the definitive JOB_CLAIM_REFUSED (the Worker must not run it)', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('failed')
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'running' } })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+        expect(storage.jobs.findById(job.id)?.status).toBe('failed')
+      })
+    })
+
+    it('an Outbox delivery (eventId) of a stale terminal result keeps the at-least-once contract: 200, status not applied', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('success')
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`,
+          payload: withOutbox({ status: 'failed', stderr: 'late' }, 'stale-terminal-result'),
+        })
+
+        expect(res.statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('success')
+      })
+    })
+  })
+
   describe('claim guard: another Task that is a live workspace owner (W5)', () => {
     async function setup(app: FastifyInstance) {
       const { getStorage } = await import('../storage/index.js')
@@ -681,8 +738,12 @@ describe('Job API', () => {
       })
     })
 
-    it('a blocked row left on a done Task elsewhere is still an owner (no API-side release proof)', async () => {
+    // lifecycle repair C2: done な Task の非 quarantine blocked 行は shared `holdsWorkspaceWhenBlocked` では
+    // 所有者ではない（stale 候補）。解放は Worker の worktree 観測、dirty の保護は baseline admission。
+    // 以前はここで 409 を返し、Worker が解放した後も claim が永久に止まった（出口なし）。
+    it('a legacy blocked row on a done Task elsewhere does not refuse the claim, and systemState reports no stalled owner for it', async () => {
       await withApp(async (app) => {
+        const { buildSystemState } = await import('../state/systemState.js')
         const { storage, job, pausedId } = await setup(app)
         const doneTask = storage.tasks.create({
           projectId: pausedId, title: 'Done', description: '', status: 'done',
@@ -693,7 +754,29 @@ describe('Job API', () => {
           safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
         } as Parameters<typeof storage.jobs.create>[0])
 
+        // claim の前の観測: claim を止める所有者が居ないので attention は出ない（guard と同じ意味）。
+        expect(buildSystemState(storage).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('running')
+      })
+    })
+
+    it('a quarantined blocked row on a done Task elsewhere is still an owner', async () => {
+      await withApp(async (app) => {
+        const { storage, job, pausedId } = await setup(app)
+        const doneTask = storage.tasks.create({
+          projectId: pausedId, title: 'Done', description: '', status: 'done',
+          assignee: 'developer_ai', dependencies: [],
+        })
+        const row = storage.jobs.create({
+          taskId: doneTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        storage.jobs.update(row.id, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
+
         expect((await claim(app, job.id)).statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
       })
     })
 

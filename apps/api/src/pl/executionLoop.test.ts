@@ -1271,7 +1271,10 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
     })
 
-    it('a done-Task blocked row in the running Project + queued work elsewhere: cause=done_task_blocked_row, escalated exactly once', async () => {
+    // lifecycle repair C2: done な Task の非 quarantine blocked 行（stale 候補）は API の所有者ではない。
+    // 解放は Worker の worktree 観測、dirty の保護は次の initial implement の baseline admission が担う。
+    // 以前は guard と attention がこの行を所有者と数え、Worker が解放した後も claim が永久に止まった。
+    it('a legacy done-Task blocked row is left to the Worker: the claim proceeds and no stalled-owner attention is emitted or escalated', async () => {
       const { storage, projectId, taskId } = seed()
       storage.jobs.create({
         taskId,
@@ -1285,7 +1288,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       const doneTask = storage.tasks.create({
         projectId, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
       } as Parameters<IStorage['tasks']['create']>[0])
-      const staleRow = storage.jobs.create({
+      storage.jobs.create({
         taskId: doneTask.id,
         projectId,
         agentRole: 'developer_ai',
@@ -1294,28 +1297,34 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         dryRun: false,
       } as Parameters<IStorage['jobs']['create']>[0])
 
-      const held = buildSystemState(storage, { now: () => NOW }).attention
-        .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
-      expect(held).toHaveLength(1)
-      expect(held[0]).toMatchObject({ projectId, taskId: doneTask.id, referenceId: staleRow.id })
-      expect(held[0]!.detail).toMatch(/^cause=done_task_blocked_row: /)
-      expect(held[0]!.detail).toContain('No automated exit exists')
+      expect(buildSystemState(storage, { now: () => NOW }).attention
+        .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
 
-      let diagnosed = 0
-      const escalations: string[] = []
-      const d = deps({
-        diagnose: async () => { diagnosed += 1; return '{}' },
-        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
-      })
-      const first = await runPlTick(storage, d)
-      resetPlLoopInFlightForTest()
-      await runPlTick(storage, d)
-      resetPlLoopInFlightForTest()
-      await runPlTick(storage, d)
+      const initial = storage.jobs.findByTaskId(taskId)
+        .find((job) => job.workflowStepKey === `task:${taskId}:initial-implement`)!
+      expect(storage.jobs.update(initial.id, { status: 'running' })?.status).toBe('running')
+    })
 
-      expect(first).toMatchObject({ status: 'escalated', target: { kind: 'workspace_held_by_stalled_owner', jobId: staleRow.id } })
-      expect(escalations).toHaveLength(1)
-      expect(diagnosed).toBe(0)
+    it('a quarantined done-Task blocked row is still an owner: the claim is refused and only workspace_quarantined pages', () => {
+      const { storage, projectId, taskId } = seed()
+      const queued = storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const doneTask = storage.tasks.create({
+        projectId, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      const row = storage.jobs.create({
+        taskId: doneTask.id, projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      storage.jobs.update(row.id, { failureMetadata: { quarantined: true, quarantineReason: 'unverified workspace' } })
+
+      expect(storage.jobs.update(queued.id, { status: 'running' })?.status).toBe('queued')
+      const kinds = buildSystemState(storage, { now: () => NOW }).attention.map((item) => item.kind)
+      expect(kinds).toContain('workspace_quarantined')
+      expect(kinds).not.toContain('workspace_held_by_stalled_owner')
     })
 
     it('a done-Task blocked row is not reported while no running-Project queued work would be refused', () => {
@@ -1427,11 +1436,45 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         expect(storage.jobs.update(queuedId, { status: 'running' })?.status).toBe('running')
       })
 
+      it('supersedes the WAITING approval linked to a blocked row it terminalizes, in the same transaction (audited)', () => {
+        const { storage, doneTaskId, commitId, blockedId } = completingTask()
+        const created = storage.approvalRequests.create({
+          taskId: doneTaskId,
+          targetBranch: 'candidate/self-dev',
+          targetCommit: 'abc1234',
+          targetDiffHash: 'hash',
+          riskLevel: 'LOW',
+          requestedAction: 'git_commit',
+          status: 'WAITING_FOR_USER',
+          expiresAt: '2099-01-01T00:00:00.000Z',
+          invalidIf: [],
+          changedFiles: ['docs/notes.md'],
+          triggeredRules: ['git_commit requires CEO approval (policy)'],
+        } as Parameters<IStorage['approvalRequests']['create']>[0])
+        storage.jobs.update(blockedId, { approvalId: created.id })
+        const approvalId = created.id
+
+        storage.jobs.persistCommitSuccessWithContinuation({
+          jobId: commitId,
+          update: {
+            status: 'success', exitCode: 0, commitHash: 'c0ffee',
+            failureMetadata: { workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'c0ffee' } },
+          },
+        })
+
+        expect(storage.jobs.findById(blockedId)?.status).toBe('failed')
+        expect(storage.approvalRequests.findById(approvalId)?.status).toBe('SUPERSEDED')
+        const audit = storage.auditLog.findByEntity('approval_request', approvalId)
+          .filter((entry) => entry.operation === 'supersede')
+        expect(audit).toHaveLength(1)
+        expect(audit[0]!.detail).toContain(`source_job_id=${blockedId}`)
+      })
+
       it.each([
         ['a dirty end fingerprint', { workspaceEndFingerprint: { mode: 'dirty', startCommitHash: 'c0ffee', entries: [] } }],
         ['a missing end fingerprint', {}],
         ['a clean fingerprint at another HEAD', { workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'other' } }],
-      ])('%s leaves the row; the claim is refused and the truthful attention appears', (_label, failureMetadata) => {
+      ])('%s leaves the row; the API leaves it to the Worker observation (claim proceeds, no stalled-owner attention)', (_label, failureMetadata) => {
         const { storage, commitId, blockedId, queuedId } = completingTask()
 
         storage.jobs.persistCommitSuccessWithContinuation({
@@ -1439,14 +1482,12 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
           update: { status: 'success', exitCode: 0, commitHash: 'c0ffee', failureMetadata } as Parameters<IStorage['jobs']['update']>[1],
         })
 
+        // 行は終端化しない（clean の証拠が無い）。所有の判断は Worker の worktree 観測と
+        // 次の initial implement の baseline admission（dirty なら fail-closed）が行う。
         expect(storage.jobs.findById(blockedId)?.status).toBe('blocked')
-        expect(storage.jobs.update(queuedId, { status: 'running' })?.status).toBe('queued')
-        const held = buildSystemState(storage, { now: () => NOW }).attention
-          .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
-        expect(held).toHaveLength(1)
-        expect(held[0]!.detail).toMatch(/^cause=done_task_blocked_row: /)
-        expect(held[0]!.detail).toContain('No automated exit exists')
-        expect(held[0]!.detail).not.toContain('abort_task')
+        expect(buildSystemState(storage, { now: () => NOW }).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+        expect(storage.jobs.update(queuedId, { status: 'running' })?.status).toBe('running')
       })
     })
 
@@ -1474,7 +1515,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     })
 
     it.each(['paused', 'draft'] as const)(
-      'a sole done-Task blocked row in a %s Project reports cause=done_task_blocked_row, not inactive_project',
+      'a sole legacy done-Task blocked row in a %s Project is not an owner: no stalled-owner attention (no inactive_project either)',
       (status) => {
         const { storage, projectId, taskId } = seed()
         storage.jobs.create({
@@ -1486,18 +1527,13 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
         const doneTask = storage.tasks.create({
           projectId: stopped.id, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
         } as Parameters<IStorage['tasks']['create']>[0])
-        const staleRow = storage.jobs.create({
+        storage.jobs.create({
           taskId: doneTask.id, projectId: stopped.id, agentRole: 'developer_ai', status: 'blocked',
           safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
         } as Parameters<IStorage['jobs']['create']>[0])
 
-        const held = buildSystemState(storage, { now: () => NOW }).attention
-          .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
-
-        expect(held).toHaveLength(1)
-        expect(held[0]).toMatchObject({ projectId: stopped.id, referenceId: staleRow.id })
-        expect(held[0]!.detail).toMatch(/^cause=done_task_blocked_row: /)
-        expect(held[0]!.detail).toContain('No automated exit exists')
+        expect(buildSystemState(storage, { now: () => NOW }).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
       },
     )
 
