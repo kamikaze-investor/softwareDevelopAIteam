@@ -141,11 +141,18 @@ export function repairFromStoredReview(
 
   // 3. **approval を作る前に下見する。** 同じ `prepareRepairFlow()` を使うので、
   //    ここに簡易判定は無い。epoch があっても変わらない不適格は、この時点で返す。
+  //
+  //    **承認へ進んでよい skip は `recovery_authority_required` だけである**（b8d0fc5d）。
+  //    最新の初回 implement は consume 済み承認があって初めて admission を通るので、下見では
+  //    必ず skip になる。admission はその場合でも 5〜8（範囲・critical・Design Review・live Job）を
+  //    最後まで見てから、欠けているのが authority だけのときにこの code を付ける。
+  //    他の skip（CONFLICT の Design Review を含む）は承認を作る前に返す —— 承認しても
+  //    通らない要求を CEO へ出さない。preview 用の epoch は作らない。
   const dryRun = prepareRepairFlow(storage, {
     failedJob: chain.implementJob,
     review: chain.review,
   })
-  if (dryRun.action === 'skip') {
+  if (dryRun.action === 'skip' && dryRun.code !== 'recovery_authority_required') {
     return { status: 'skipped', reason: dryRun.reason }
   }
   if (dryRun.action === 'escalate' && dryRun.code !== 'attempt_limit') {
@@ -168,7 +175,7 @@ export function repairFromStoredReview(
     //  `escalate` でも同じ判定を使う。上限に達した human generation に対して
     //  さらに承認を要求すると、承認のたびに予算が作り直せてしまう。その場合は
     //  `evaluateAndAct()` がそのまま escalate を返す（新しい承認は作らない）。
-  if (dryRun.generation?.rootKind === 'human_recovery') {
+  if (dryRun.action !== 'skip' && dryRun.generation?.rootKind === 'human_recovery') {
     return evaluateAndAct(storage, task.id, chain, deps)
   }
 

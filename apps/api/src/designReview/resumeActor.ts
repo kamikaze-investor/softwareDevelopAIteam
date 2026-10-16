@@ -40,7 +40,12 @@ import {
   RESUME_ACTOR_AUDIT_OPERATION,
   TECHNICAL_RESUME_AUDIT_TOKEN,
 } from '../pl/technicalResumePolicy'
-import { RESUME_STEP_PREFIX, jobsSupersededByHumanResume, type ResumeActorClass } from './repairPolicy'
+import {
+  RESUME_STEP_PREFIX,
+  jobsSupersededByHumanResume,
+  type GenerationAuthority,
+  type ResumeActorClass,
+} from './repairPolicy'
 
 /** resume actor を記録する audit operation 名。新 table は作らない。 */
 export const RESUME_ACTOR_OPERATION = RESUME_ACTOR_AUDIT_OPERATION
@@ -180,6 +185,11 @@ export function recordRepairGeneration(
     previousGenerationRoot?: string
     budgetReset: boolean
     resetReason: string
+    /**
+     * generation を始めた保存済み authority への参照。reset の理由だけでは
+     * 「どの承認 / どの Human Resume で」が後から追えないので、id ごと残す（b8d0fc5d 修正）。
+     */
+    authority?: GenerationAuthority
   },
 ): void {
   const parts = [
@@ -189,6 +199,7 @@ export function recordRepairGeneration(
     `previous_generation_root=${input.previousGenerationRoot ?? 'none'}`,
     `budget_reset=${input.budgetReset ? 'yes' : 'no'}`,
     `reset_reason=${input.resetReason}`,
+    ...authorityAuditTokens(input.authority),
   ]
   recordWithoutFailingCaller(REPAIR_GENERATION_OPERATION, () => {
     storage.auditLog.record({
@@ -200,6 +211,22 @@ export function recordRepairGeneration(
       detail: parts.join(' '),
     })
   })
+}
+
+function authorityAuditTokens(authority: GenerationAuthority | undefined): string[] {
+  if (authority === undefined) return []
+  if (authority.kind === 'human_recovery') {
+    return [
+      'authority_kind=human_recovery',
+      `authority_approval_request_id=${authority.approvalRequestId}`,
+      `authority_review_job_id=${authority.reviewJobId}`,
+    ]
+  }
+  return [
+    'authority_kind=human_resume',
+    `authority_resume_job_id=${authority.resumeJobId}`,
+    `authority_resumed_review_job_id=${authority.resumedReviewJobId}`,
+  ]
 }
 
 /**

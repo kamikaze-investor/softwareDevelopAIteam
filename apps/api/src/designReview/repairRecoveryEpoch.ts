@@ -139,7 +139,21 @@ export function epochCoveredImplementationJobIds(
   storage: IStorage,
   taskId: string,
 ): Set<string> {
-  const covered = new Set<string>()
+  return new Set(humanRecoveryAuthorityByImplementation(storage, taskId).keys())
+}
+
+/**
+ * 上と同じ成立条件で、**epoch を開いた承認そのものへの参照**を実装 Job id ごとに返す。
+ *
+ * repair generation は「誰の権限で始まったか」を label ではなく保存済み事実の参照として持つ
+ * （b8d0fc5d 修正）。同じ実装に複数の consume 済み承認があれば、最初に読めた 1 件を使う
+ * （`findByTaskId()` の順。どれも同じ実装の同じ種類の authority であり、予算の導出は変わらない）。
+ */
+export function humanRecoveryAuthorityByImplementation(
+  storage: IStorage,
+  taskId: string,
+): Map<string, { approvalRequestId: string; reviewJobId: string }> {
+  const covered = new Map<string, { approvalRequestId: string; reviewJobId: string }>()
 
   for (const request of storage.approvalRequests.findByTaskId(taskId)) {
     if (request.status !== 'CONSUMED') continue
@@ -149,7 +163,8 @@ export function epochCoveredImplementationJobIds(
     // 承認行の文字列を信じず、**Job 側から関連を引き直す**。
     const chain = resolveStoredReviewChain(storage, taskId, reviewJobId)
     if (!chain.ok) continue
-    covered.add(chain.implementJob.id)
+    if (covered.has(chain.implementJob.id)) continue
+    covered.set(chain.implementJob.id, { approvalRequestId: request.id, reviewJobId: chain.reviewJob.id })
   }
 
   return covered

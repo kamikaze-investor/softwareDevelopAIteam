@@ -77,6 +77,23 @@ async function shape() {
   } as never)
   await tick()
 
+  /** 判定のある終端 run（RC3 以降、REVIEW_UNAVAILABLE は根拠にならないので CONFLICT で止める）。 */
+  const conflictRun = async (): Promise<string> => {
+    const designText = `repair plan ${Math.random()}`
+    const run = s.designReviewRuns.create({
+      taskId: task.id, taskTitle: 'VPS docs', designText, designTextHash: computeDesignTextHash(designText),
+      changedFiles: [DOC], repairSourceJobId: i1.id,
+    })
+    const claimed = s.designReviewRuns.claim(run.id, 3)
+    s.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'CONFLICT', findings: [] },
+      finalDecision: 'CONFLICT',
+    }))
+    await tick()
+    return run.id
+  }
+
   const unavailableRun = async (): Promise<string> => {
     const designText = `repair plan ${Math.random()}`
     const run = s.designReviewRuns.create({
@@ -101,7 +118,7 @@ async function shape() {
     return r1
   }
 
-  return { s, taskId: task.id, i1, unavailableRun, humanResumedReview }
+  return { s, taskId: task.id, i1, unavailableRun, conflictRun, humanResumedReview }
 }
 
 const changesRequested = {
@@ -148,9 +165,9 @@ describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design 
     const lines: LogLine[] = []
     const app = await buildApp(lines)
     try {
-      const { s, taskId, i1, unavailableRun, humanResumedReview } = await shape()
+      const { s, taskId, i1, conflictRun, humanResumedReview } = await shape()
       const r1 = await humanResumedReview()
-      const runId = await unavailableRun()
+      const runId = await conflictRun()
 
       const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${r1.id}`, payload: changesRequested })
 
@@ -160,7 +177,7 @@ describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design 
       const warn = lines.find((line) => line.msg.includes('stage 2 skipped'))
       expect(warn).toMatchObject({
         level: 40,
-        reason: 'task is blocked (latest design review is REVIEW_UNAVAILABLE)',
+        reason: 'task is blocked (latest design review is CONFLICT)',
         sourceJobId: i1.id,
         reviewJobId: r1.id,
         runId,
