@@ -3297,7 +3297,7 @@ describe('POST /api/approval-requests/:id/consume — D2 hardening', () => {
 // CRITICAL → block）と同じ結果を返すことを固定し、応答を本物の Worker resolvePolicy にも通す。
 // ────────────────────────────────────────────────────────────
 
-describe('POST /api/gate/check — D2 continuationPolicy contract（route → Worker resolvePolicy）', () => {
+describe('POST /api/gate/check — D2 v4 contract（route → Worker resolvePolicy）', () => {
   const HIGH_FILE = 'docs/project_memory/goal.md'
   const CRITICAL_FILE = 'docs/AGENTS.md'
   const refs = { targetBranch: 'main', targetCommit: 'commit-cp', targetDiffHash: 'diff-cp' }
@@ -3313,20 +3313,21 @@ describe('POST /api/gate/check — D2 continuationPolicy contract（route → Wo
   }
 
   it.each([
-    ['HIGH safe-work action (no request)', 'test', [HIGH_FILE], 'BLOCKED', 'continue_safe_work_only'],
-    ['CRITICAL safe-work action', 'test', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved'],
-    ['HIGH non-safe-work action', 'merge feature branch', [HIGH_FILE], 'BLOCKED', 'continue_safe_work_only'],
-    ['CRITICAL non-safe-work action', 'merge feature branch', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved'],
-    ['LOW git_commit (policy-required human approval)', 'git_commit', ['docs/README.md'], 'BLOCKED', 'block_until_approved'],
-    ['HIGH git_commit (policy-required)', 'git_commit', [HIGH_FILE], 'BLOCKED', 'block_until_approved'],
-    ['CRITICAL git_commit (policy-required)', 'git_commit', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved'],
-  ] as const)('%s → API %s / %s, and the Worker maps it unchanged', async (label, action, files, decision, policy) => {
+    // [label, action, files, API decision, API continuationPolicy, Worker policy（従来の PENDING / BLOCKED の扱い）]
+    ['HIGH safe-work action (no request)', 'test', [HIGH_FILE], 'BLOCKED', 'continue_safe_work_only', 'continue_safe_work_only'],
+    ['CRITICAL safe-work action', 'test', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved', 'block_until_approved'],
+    ['HIGH non-safe-work action', 'merge feature branch', [HIGH_FILE], 'BLOCKED', 'continue_safe_work_only', 'continue_safe_work_only'],
+    ['CRITICAL non-safe-work action', 'merge feature branch', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved', 'block_until_approved'],
+    ['LOW git_commit (policy-required human approval)', 'git_commit', ['docs/README.md'], 'BLOCKED', 'block_until_approved', 'continue_safe_work_only'],
+    ['HIGH git_commit (policy-required)', 'git_commit', [HIGH_FILE], 'BLOCKED', 'block_until_approved', 'continue_safe_work_only'],
+    ['CRITICAL git_commit (policy-required)', 'git_commit', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved', 'block_until_approved'],
+  ] as const)('%s: action=%s files=%j → API %s / %s → Worker %s (git_commit is not safe work either way)', async (label, action, files, decision, policy, worker) => {
     await withApp(async (app) => {
       const { statusCode, body } = await gateCheck(app, { taskId: `d2-cp-${label}`, requestedAction: action, ...refs, changedFiles: [...files] })
       expect(statusCode).toBe(200)
       expect(body.outcome.decision).toBe(decision)
       expect(body.continuationPolicy).toBe(policy)
-      expect((await workerPolicy(body, [...files])).policy).toBe(policy)
+      expect((await workerPolicy(body, [...files])).policy).toBe(worker)
     })
   })
 
