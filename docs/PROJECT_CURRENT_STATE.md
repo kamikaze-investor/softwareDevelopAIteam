@@ -234,6 +234,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review CONFLICT Recovery
 - **Project Pause / Continuation-Control Gap
 - **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる**
+- **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、
 - **resume 経路のテストが実 LLM レビューの判定に依存していた（非 hermetic）
 - **`resolveFinalDecision` が未知のdecision値をALIGNEDへfall-throughする（fail-open）
 - **approval後にblocked git_commit Jobが自動resumeせず、client起点の `/resume` が要る**
@@ -294,7 +295,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
 - **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行（state: in_progress）
-- **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、（state: planned）
 - **evidence登録後〜Task sync前のcrashでRoadmapが再生成されうる**（2026-09-08登録。（state: planned）
 - **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。（state: planned）
 - **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**（state: planned）

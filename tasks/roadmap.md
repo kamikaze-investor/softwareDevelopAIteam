@@ -2745,8 +2745,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **未解決の間の表現**: 「モデルによるrepo変更は禁止される」とは言ってよいが、
    **「filesystem上完全read-only」とは主張しない**。
 
-<!-- roadmap:id=task-codex-review-cannot-read-repo state=planned priority=high -->
-0. [ ] **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、
+<!-- roadmap:id=task-codex-review-cannot-read-repo state=done priority=high -->
+0. [x] **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、
    **高優先度**。CEO判断: Roadmap topology cutover（PR C）とは別責務なので**PR Cへ混ぜない**）。
 
    **事実**: task-kindのCodex independent reviewは、`buildReviewPrompt()`
@@ -2770,6 +2770,18 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **これはdeprecatedな暫定手段**であり、恒久解決は
    `codex-sandbox-off-deprecated-landlock`側で行う。適用範囲を広げる変更は
    既存production reviewerの挙動を変えるため、独立した変更として扱いCEO承認を得ること。
+
+   **2026-10-16 完了（Tier A Task b6d4097a → Candidate `9389f74` → master へ Promotion）**:
+   `buildReviewPrompt()` が対象ファイルの現在内容を「Repository context」として phase pre/post 両方の
+   prompt へ載せる（1ファイル・全体の文字数上限、省略・切り詰め理由を明示）。repository 外・symlink 外部参照・
+   秘密情報ファイル名（要求パスと symlink 解決後の実パスの両方で判定）・secret scan 一致・バイナリは載せない。
+   Codex の shell 実行可否に依存せず diff 外の文脈をレビュアーへ渡す形で degradation を解消した
+   （`use_legacy_landlock` の適用拡大は行っていない）。
+   残る non-blocking finding（post-implementation review 57db83cf、いずれも medium 以下で blocking ではない）:
+   秘密情報ファイル名パターンが `.npmrc` / `.netrc` / `credentials.json` 等を含まない、
+   通常名の hard link は名前判定をすり抜ける（内容の secret scan が後段で残る）、
+   `repoRoot` が `TARGET_ROOT` 固定で別 workspace の実装とは内容が一致しない可能性、
+   全 reviewer の prompt が最大約 60,000 文字増える。
 
 <!-- roadmap:id=roadmap-evidence-before-task-sync-crash-window state=planned -->
 0. [ ] **evidence登録後〜Task sync前のcrashでRoadmapが再生成されうる**（2026-09-08登録。

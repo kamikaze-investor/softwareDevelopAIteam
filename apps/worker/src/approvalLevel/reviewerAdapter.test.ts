@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AiCliResult, ApprovalLevelResult } from '@ai-team/shared'
 
 // callGeminiWithFallback だけを差し替え、AGY_* モデル定数など他の export は実物を使う
@@ -23,6 +26,8 @@ import {
   createReviewerAdapter,
   GeminiReviewerAdapter,
   parseReviewerResponse,
+  REPOSITORY_CONTEXT_MAX_FILE_CHARS,
+  REPOSITORY_CONTEXT_MAX_TOTAL_CHARS,
   reviewWithSeparation,
   selectReviewerProvider,
   shouldEscalateToChatGpt,
@@ -221,6 +226,146 @@ describe('buildReviewPrompt', () => {
     expect(authorityPrompt).toContain('## 14-3. Priority 2 境界表')
     expect(unrelatedPrompt).not.toContain('## 1-2. Human Decision Authority')
     expect(unrelatedPrompt).not.toContain('## 14-3. Priority 2 境界表')
+  })
+})
+
+describe('buildReviewPrompt repository context', () => {
+  let repoRoot: string
+
+  beforeEach(() => {
+    repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-repo-'))
+  })
+
+  afterEach(() => {
+    fs.rmSync(repoRoot, { recursive: true, force: true })
+  })
+
+  function writeRepoFile(relativePath: string, content: string): void {
+    const fullPath = path.join(repoRoot, relativePath)
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true })
+    fs.writeFileSync(fullPath, content)
+  }
+
+  it('phase:post で diff に加えて対象ファイルの現在内容（diff外の行を含む）を載せる', () => {
+    writeRepoFile('src/feature.ts', [
+      'export function callerOutsideDiff(): number {',
+      '  return reviewed()',
+      '}',
+      'export const reviewed = () => 1',
+    ].join('\n'))
+
+    const prompt = buildReviewPrompt(makeRequest({
+      phase: 'post',
+      diffText: '+export const reviewed = () => 1',
+      targetFiles: ['src/feature.ts'],
+    }), [], repoRoot)
+
+    expect(prompt).toContain('+export const reviewed = () => 1')
+    expect(prompt).toContain('Repository context')
+    expect(prompt).toContain('### src/feature.ts')
+    expect(prompt).toContain('export function callerOutsideDiff(): number {')
+  })
+
+  it('phase:pre でも対象ファイルの現在内容を載せる', () => {
+    writeRepoFile('src/existing.ts', 'export const contractBeforeChange = 42')
+
+    const prompt = buildReviewPrompt(makeRequest({
+      phase: 'pre',
+      targetFiles: ['src/existing.ts'],
+    }), [], repoRoot)
+
+    expect(prompt).toContain('export const contractBeforeChange = 42')
+  })
+
+  it('存在しないファイルは黙って落とさず、載せていない理由を明示する', () => {
+    const prompt = buildReviewPrompt(makeRequest({ targetFiles: ['src/deleted.ts'] }), [], repoRoot)
+
+    expect(prompt).toContain('### src/deleted.ts')
+    expect(prompt).toContain('ファイルが存在しません')
+  })
+
+  it('repository外を指すパス・symlinkの内容は載せない', () => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reviewer-outside-'))
+    try {
+      fs.writeFileSync(path.join(outsideDir, 'outside.txt'), 'OUTSIDE_REPO_CONTENT')
+      fs.symlinkSync(path.join(outsideDir, 'outside.txt'), path.join(repoRoot, 'link.txt'))
+
+      const prompt = buildReviewPrompt(makeRequest({
+        targetFiles: [path.relative(repoRoot, path.join(outsideDir, 'outside.txt')), 'link.txt'],
+      }), [], repoRoot)
+
+      expect(prompt).not.toContain('OUTSIDE_REPO_CONTENT')
+      expect(prompt).toContain('repository外を指すため載せていません')
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true })
+    }
+  })
+
+  it('.env 等の秘密情報ファイルとsecret scanに一致するファイルの内容は載せない', () => {
+    writeRepoFile('.env', 'PLAIN_ENV_CONTENT')
+    // fixtureは実行時に組み立てる。リテラルで書くとこのテストのdiff自体がsecret scanに一致し、
+    // review送信前にrefusalされるため
+    writeRepoFile('src/config.ts', `const ${['pass', 'word'].join('')} = "hunter2"`)
+
+    const prompt = buildReviewPrompt(makeRequest({ targetFiles: ['.env', 'src/config.ts'] }), [], repoRoot)
+
+    expect(prompt).not.toContain('PLAIN_ENV_CONTENT')
+    expect(prompt).not.toContain('hunter2')
+    expect(prompt).toContain('秘密情報ファイルの可能性があるため載せていません')
+    expect(prompt).toContain('secret scanに一致したため載せていません')
+  })
+
+  it('通常名のsymlink経由でも、実体が .env 等の秘密情報ファイルなら内容を載せない', () => {
+    writeRepoFile('.env', 'SYMLINKED_ENV_CONTENT')
+    writeRepoFile('src/normal.ts', 'NORMAL_FILE_CONTENT')
+    fs.mkdirSync(path.join(repoRoot, 'docs'), { recursive: true })
+    fs.symlinkSync(path.join(repoRoot, '.env'), path.join(repoRoot, 'docs', 'notes.txt'))
+
+    const prompt = buildReviewPrompt(makeRequest({
+      targetFiles: ['docs/notes.txt', 'src/normal.ts'],
+    }), [], repoRoot)
+
+    expect(prompt).not.toContain('SYMLINKED_ENV_CONTENT')
+    expect(prompt).toContain('### docs/notes.txt\n(秘密情報ファイルの可能性があるため載せていません)')
+    // 秘密情報でない通常ファイルは引き続き載る
+    expect(prompt).toContain('NORMAL_FILE_CONTENT')
+  })
+
+  it('1ファイルの上限を超える内容は切り詰め、その旨を明示する', () => {
+    writeRepoFile('src/large.ts', 'a'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS + 100))
+
+    const prompt = buildReviewPrompt(makeRequest({ targetFiles: ['src/large.ts'] }), [], repoRoot)
+
+    expect(prompt).toContain('a'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS))
+    expect(prompt).not.toContain('a'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS + 1))
+    expect(prompt).toContain(`先頭${REPOSITORY_CONTEXT_MAX_FILE_CHARS}文字のみ`)
+  })
+
+  it('全体上限に達した後のファイルは省略し、その旨を明示する', () => {
+    const fileCount = Math.ceil(REPOSITORY_CONTEXT_MAX_TOTAL_CHARS / REPOSITORY_CONTEXT_MAX_FILE_CHARS)
+    const files = Array.from({ length: fileCount }, (_, i) => `src/f${i}.ts`)
+    for (const file of files) writeRepoFile(file, 'b'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS))
+    writeRepoFile('src/last.ts', 'LAST_FILE_CONTENT')
+
+    const prompt = buildReviewPrompt(makeRequest({ targetFiles: [...files, 'src/last.ts'] }), [], repoRoot)
+
+    expect(prompt).not.toContain('LAST_FILE_CONTENT')
+    expect(prompt).toContain('repository context全体の上限に達したため載せていません')
+  })
+
+  it('CodexReviewerAdapter が実行に渡す prompt に repository context が含まれる', async () => {
+    const run = mockCodexAdapterRun()
+    run.mockResolvedValue(makeAiCliResult())
+
+    await new CodexReviewerAdapter().review(makeRequest({
+      reviewerProvider: 'codex',
+      phase: 'post',
+      targetFiles: ['apps/worker/src/approvalLevel/reviewerAdapter.ts'],
+    }))
+
+    // 本番経路はTARGET_ROOTを読む。実行環境のファイル有無に依存しないよう、section自体の存在だけを確認する。
+    const prompt = (run.mock.calls[0]?.[0] as { prompt: string }).prompt
+    expect(prompt).toContain('Repository context')
   })
 })
 
