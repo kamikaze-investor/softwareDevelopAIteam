@@ -942,6 +942,8 @@ export async function runAdoptionStep(
         : allTechnicalAbortUnchanged
           ? 'all technically parked items are unchanged and remain visible as parked Tasks'
           : 'no open roadmap item in the ledger',
+      // 呼び出し側が「やり切った」と「promotion 待ちで止まっている」を散文に頼らず区別するための下位分類。
+      ...(allAwaitingPromotion ? { failureCode: 'awaiting_promotion' } : {}),
     }
   }
 

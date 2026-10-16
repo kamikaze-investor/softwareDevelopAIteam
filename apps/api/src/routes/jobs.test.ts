@@ -580,6 +580,217 @@ describe('Job API', () => {
     })
   })
 
+  it('POST /api/jobs refuses a projectId that differs from the Task Project (W5)', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const other = await createProject(app)
+      const task = await createTask(app, project.id)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: { taskId: task.id, projectId: other.id, agentRole: 'developer_ai', safeCommand: { kind: 'git_status' } },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_PROJECT_MISMATCH')
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id)).toEqual([])
+    })
+  })
+
+  // running -> draft は queued Job がある間は lifecycle guard が拒否するので、到達できる停止は paused だけ。
+  it.each(['paused'] as const)(
+    'PATCH queued -> running is refused with 409 while the Task Project is %s; the Job stays queued (W5)',
+    async (status) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        const task = await createTask(app, project.id)
+        const job = await createJob(app, task)
+        // Worker の poll の後・claim の前に CEO が止めた。
+        const { getStorage } = await import('../storage/index.js')
+        getStorage().projects.update(project.id, { status })
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'running' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+        expect(getStorage().jobs.findById(job.id)?.status).toBe('queued')
+      })
+    },
+  )
+
+  describe('claim guard: another Task that is a live workspace owner (W5)', () => {
+    async function setup(app: FastifyInstance) {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const project = await createProject(app, { status: 'running' })
+      const paused = await createProject(app, { status: 'paused' })
+      const task = await createTask(app, project.id)
+      const job = await createJob(app, task)
+      const otherTask = await createTask(app, paused.id)
+      return { storage, task, job, otherTask, pausedId: paused.id }
+    }
+
+    async function claim(app: FastifyInstance, jobId: string) {
+      return app.inject({ method: 'PATCH', url: `/api/jobs/${jobId}`, payload: { status: 'running' } })
+    }
+
+    it.each([
+      ['a concurrent non-initial queued Job', 'queued', true],
+      ['a running Job', 'running', false],
+    ] as const)('refuses the claim while another Task (paused Project) has %s', async (_label, status, resumeKey) => {
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const key = resumeKey ? `resume:src-${otherTask.id}:1` : undefined
+        storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+          ...(key !== undefined ? { workflowStepKey: key } : {}),
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        const res = await claim(app, job.id)
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      })
+    })
+
+    it("refuses the claim when another Task's queued Job became blocked (pre-start refusal) after the snapshot", async () => {
+      // queued -> blocked は running を経ずに起こる（開始前の拒否は blocked + quarantine になる）。
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const other = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${otherTask.id}:initial-implement`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const blocked = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${other.id}`, payload: { status: 'blocked', stderr: 'refused before start' },
+        })
+        expect(blocked.statusCode).toBe(200)
+        expect(storage.jobs.findById(other.id)?.status).toBe('blocked')
+
+        const res = await claim(app, job.id)
+
+        expect(res.statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      })
+    })
+
+    it('a blocked row left on a done Task elsewhere is still an owner (no API-side release proof)', async () => {
+      await withApp(async (app) => {
+        const { storage, job, pausedId } = await setup(app)
+        const doneTask = storage.tasks.create({
+          projectId: pausedId, title: 'Done', description: '', status: 'done',
+          assignee: 'developer_ai', dependencies: [],
+        })
+        storage.jobs.create({
+          taskId: doneTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(409)
+      })
+    })
+
+    it('a blocked source superseded by a human resume (successor finished) is not an owner', async () => {
+      await withApp(async (app) => {
+        const { recordResumeActor } = await import('../designReview/resumeActor.js')
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const source = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const successor = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'success',
+          workflowStepKey: `resume:${source.id}:1`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        recordResumeActor(storage, { jobId: successor.id, taskId: otherTask.id, actorClass: 'human', evidence: 'admin_credential' })
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
+    it('a fresh initial-implement queued elsewhere is not an owner', async () => {
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${otherTask.id}:initial-implement`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('running')
+      })
+    })
+
+    it("the claiming Task's own queued Jobs are not a blocker", async () => {
+      await withApp(async (app) => {
+        const { storage, task, job } = await setup(app)
+        storage.jobs.create({
+          taskId: task.id, projectId: task.projectId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `resume:${job.id}:1`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
+    it('Jobs in an archived Project are not owners', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await setup(app)
+        const archived = await createProject(app, { status: 'archived' })
+        const archivedTask = await createTask(app, archived.id)
+        storage.jobs.create({
+          taskId: archivedTask.id, projectId: archived.id, agentRole: 'developer_ai', status: 'running',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
+    it('a refused Outbox-tagged claim is not recorded as applied: the replay is refused again (409)', async () => {
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'running',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const payload = withOutbox({ status: 'running' as const, startedAt: '2026-08-08T01:02:03.000Z' }, 'event-refused-claim')
+
+        for (let i = 0; i < 2; i += 1) {
+          const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload })
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+          expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+        }
+      })
+    })
+  })
+
+  it('PATCH queued -> running still succeeds for a running Project', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const job = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'running' },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<Job>(res.body).status).toBe('running')
+    })
+  })
+
   it('POST /api/jobs rejects a client-supplied workingDir with 400', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -973,7 +1184,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id updates status', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
 
@@ -992,7 +1203,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id accepts and persists a value-free workspace END fingerprint', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       const workspaceEndFingerprint = {
@@ -1073,7 +1284,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id rejects rewriting an existing workspace END fingerprint', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       const { getStorage } = await import('../storage/index.js')
@@ -1258,7 +1469,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id accepts an Outbox event and returns Outbox metadata', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       const payload = { status: 'running' as const, startedAt: '2026-08-08T01:02:03.000Z' }
@@ -1322,7 +1533,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id rejects the same eventId with a different valid payload', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
 
@@ -1348,7 +1559,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id/fail-if-running changes running to blocked when a repair is queued', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       await app.inject({
@@ -1437,7 +1648,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id/fail-if-running returns 409 while the Task workspace is quarantined', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const first = await createJob(app, task)
       await app.inject({
@@ -1533,7 +1744,7 @@ describe('Job API', () => {
 
     it('clears quarantine when the observation matches the persisted baseline, and records it', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)
@@ -1565,7 +1776,7 @@ describe('Job API', () => {
 
     it('rejects a request carrying only a boolean (no observation) — no bypass remains', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1584,7 +1795,7 @@ describe('Job API', () => {
 
     it('rejects clearance when the observation is missing', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1601,7 +1812,7 @@ describe('Job API', () => {
 
     it('rejects clearance when the observation does NOT match the persisted baseline (quarantine remains)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)
@@ -1623,7 +1834,7 @@ describe('Job API', () => {
 
     it('clears WITHOUT a persisted baseline when a full known-good state is presented (baseline-computation failure case)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1644,7 +1855,7 @@ describe('Job API', () => {
 
     it('refuses WITHOUT a persisted baseline when a known-good condition is false (quarantine remains)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1667,7 +1878,7 @@ describe('Job API', () => {
 
     it('is idempotent: a second clearance reports alreadyCleared and preserves the recorded state', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)
@@ -1699,7 +1910,7 @@ describe('Job API', () => {
 
     it('does NOT clear a quarantined Job for a DIFFERENT workingDir', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)

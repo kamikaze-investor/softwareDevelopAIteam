@@ -67,9 +67,14 @@ function mockEndpoints(input: {
   projects: Project[]
   tasksByProjectId: Record<string, Task[]>
   jobsByTaskId: Record<string, Job[]>
+  /** この部分文字列を含む URL は 500 を返す（一覧取得の失敗注入）。 */
+  failingUrls?: string[]
 }): void {
   fetchMock.mockImplementation(async (url) => {
     const href = String(url)
+    if (input.failingUrls?.some((fragment) => href.includes(fragment))) {
+      return new Response('unavailable', { status: 500 })
+    }
     const body = href.includes('/api/projects')
       ? input.projects
       : href.includes('/api/tasks?projectId=')
@@ -195,7 +200,9 @@ describe('fetchQueuedJob workspace exclusivity', () => {
     expect(result?.job.id).toBe('job-a-3')
   })
 
-  it('9. does not serialize across unrelated Projects when only one is running (paused Projects\' active Jobs are ignored)', async () => {
+  it("9. a paused Project's running Job still owns the single target workspace (W5)", async () => {
+    // 以前の前提「無関係な Project は直列化しない」は誤り。workspace は deployment ごとに1つ
+    // （TARGET_ROOT）なので、paused Project の未 commit の Job の上で別 Project を走らせてはならない。
     const taskA = task({ id: 'task-a', projectId: 'project-paused' })
     const taskB = task({ id: 'task-b', projectId: 'project-1' })
     mockEndpoints({
@@ -205,8 +212,128 @@ describe('fetchQueuedJob workspace exclusivity', () => {
         'project-paused': [taskA],
       },
       jobsByTaskId: {
-        // task-a (paused Project) has a stale running Job, but its Project is not running,
-        // so it must not block task-b in the currently running Project.
+        'task-a': [job({ id: 'job-a-1', taskId: 'task-a', status: 'running' })],
+        // initial-implement の queued は所有者にならない。所有者は paused Project の task-a だけ。
+        'task-b': [job({
+          id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'task:task-b:initial-implement',
+        })],
+      },
+    })
+
+    const result = await fetchQueuedJob()
+
+    expect(result).toBeNull()
+  })
+
+  it("9b. a paused Project's blocked owner blocks a running Project's initial-implement claim, and its own queued Job is never claimed (W5)", async () => {
+    const taskA = task({ id: 'task-a', projectId: 'project-paused', status: 'blocked' })
+    const taskB = task({ id: 'task-b', projectId: 'project-1' })
+    mockEndpoints({
+      projects: [project(), project({ id: 'project-paused', status: 'paused' })],
+      tasksByProjectId: {
+        'project-1': [taskB],
+        'project-paused': [taskA],
+      },
+      jobsByTaskId: {
+        'task-a': [
+          job({ id: 'job-a-2', taskId: 'task-a', status: 'queued', workflowStepKey: 'retry:job-a-1:1' }),
+          job({ id: 'job-a-1', taskId: 'task-a', status: 'blocked' }),
+        ],
+        'task-b': [job({
+          id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'task:task-b:initial-implement',
+        })],
+      },
+    })
+
+    const result = await fetchQueuedJob()
+
+    // 所有者（paused Project の task-a）は claim 対象外、他 Task は所有者でないので claim しない。
+    expect(result).toBeNull()
+  })
+
+  it('9c. a paused Project with no owner never has its queued Job claimed, while a running Project can proceed (W5)', async () => {
+    const taskA = task({ id: 'task-a', projectId: 'project-paused' })
+    const taskB = task({ id: 'task-b', projectId: 'project-1' })
+    mockEndpoints({
+      projects: [project({ id: 'project-paused', status: 'paused' }), project()],
+      tasksByProjectId: {
+        'project-1': [taskB],
+        'project-paused': [taskA],
+      },
+      jobsByTaskId: {
+        'task-a': [job({
+          id: 'job-a-1', taskId: 'task-a', status: 'queued', workflowStepKey: 'task:task-a:initial-implement',
+        })],
+        'task-b': [job({
+          id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'task:task-b:initial-implement',
+        })],
+      },
+    })
+
+    const result = await fetchQueuedJob()
+
+    expect(result?.job.id).toBe('job-b-1')
+  })
+
+  it("9d. two owners at once (a running Project's and a paused Project's) are ambiguous: nothing is claimed (W5)", async () => {
+    // 以前は API の並び順で先に来た方を所有者にし、その queued Job を claim していた。
+    const taskA = task({ id: 'task-a', projectId: 'project-paused' })
+    const taskB = task({ id: 'task-b', projectId: 'project-1' })
+    mockEndpoints({
+      projects: [project(), project({ id: 'project-paused', status: 'paused' })],
+      tasksByProjectId: {
+        'project-1': [taskB],
+        'project-paused': [taskA],
+      },
+      jobsByTaskId: {
+        'task-a': [job({ id: 'job-a-1', taskId: 'task-a', status: 'running' })],
+        // repair の続き（initial-implement 以外の queued）なので task-b も所有者になる。
+        'task-b': [job({ id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'repair:job-b-0:1' })],
+      },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const result = await fetchQueuedJob()
+
+    expect(result).toBeNull()
+    expect(warn.mock.calls.some(([message]) => String(message).includes('task-b, task-a'))).toBe(true)
+    warn.mockRestore()
+  })
+
+  it.each([
+    ["the paused Project's Task listing", '/api/tasks?projectId=project-paused'],
+    ["the paused owner's Job listing", '/api/jobs?taskId=task-a'],
+  ])('claims nothing when %s cannot be read (fail-closed, W5)', async (_label, failingUrl) => {
+    // 読めなかった一覧を飛ばすと、paused Project の blocked 所有者が判定から消え、
+    // running Project の initial-implement を claim してしまう。
+    const taskA = task({ id: 'task-a', projectId: 'project-paused', status: 'blocked' })
+    const taskB = task({ id: 'task-b', projectId: 'project-1' })
+    mockEndpoints({
+      projects: [project({ id: 'project-paused', status: 'paused' }), project()],
+      tasksByProjectId: { 'project-1': [taskB], 'project-paused': [taskA] },
+      jobsByTaskId: {
+        'task-a': [job({ id: 'job-a-1', taskId: 'task-a', status: 'blocked' })],
+        'task-b': [job({
+          id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'task:task-b:initial-implement',
+        })],
+      },
+      failingUrls: [failingUrl],
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const result = await fetchQueuedJob()
+
+    expect(result).toBeNull()
+    warn.mockRestore()
+  })
+
+  it('archived Projects do not take part in workspace ownership', async () => {
+    const taskA = task({ id: 'task-a', projectId: 'project-archived' })
+    const taskB = task({ id: 'task-b', projectId: 'project-1' })
+    mockEndpoints({
+      projects: [project(), project({ id: 'project-archived', status: 'archived' })],
+      tasksByProjectId: { 'project-1': [taskB], 'project-archived': [taskA] },
+      jobsByTaskId: {
         'task-a': [job({ id: 'job-a-1', taskId: 'task-a', status: 'running' })],
         'task-b': [job({ id: 'job-b-1', taskId: 'task-b', status: 'queued' })],
       },
