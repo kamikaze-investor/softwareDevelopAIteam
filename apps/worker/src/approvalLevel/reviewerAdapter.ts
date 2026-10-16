@@ -5,6 +5,8 @@ import {
   selectPrinciples,
   type PrincipleSelection,
 } from '@ai-team/shared/src/engineeringPrinciples.js'
+import fs from 'node:fs'
+import path from 'node:path'
 import type { AppliedPrinciple, MetaFindingCategory } from '@ai-team/shared'
 import { hasDecisionAuthorityReviewFocus, mapFileToFocuses } from './focusSelector'
 import {
@@ -17,6 +19,7 @@ import {
   loadConstitutionPrinciples,
   loadDecisionAuthorityPrinciples,
 } from '@ai-team/shared/src/constitutionPrinciples.js'
+import { isPromptSafe } from '@ai-team/shared'
 import type { ApprovalLevelResult, DesignReviewKind } from '@ai-team/shared'
 import { createAiCliAdapter } from '../aiCli/factory.js'
 import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
@@ -243,9 +246,146 @@ export function providedReviewerPrincipleIds(
     : ids
 }
 
+/** 1ファイルあたりpromptへ載せる上限（文字数）。超過分は切り詰め、その旨を明示する。 */
+export const REPOSITORY_CONTEXT_MAX_FILE_CHARS = 20_000
+/** repository context全体の上限（文字数）。超えた後のファイルは省略し、その旨を明示する。 */
+export const REPOSITORY_CONTEXT_MAX_TOTAL_CHARS = 60_000
+
+const SECRET_FILE_BASENAME_PATTERNS: readonly RegExp[] = [
+  /^\.env(\..*)?$/iu,
+  /\.(pem|key|p12|pfx|keystore|jks)$/iu,
+  /^id_(rsa|dsa|ecdsa|ed25519)/iu,
+  // 認証情報を平文で持つ代表的な設定ファイル（package registry・netrc・git・Docker・クラウド SDK）
+  /^\.(npmrc|yarnrc|yarnrc\.yml|pypirc|netrc|git-credentials|dockercfg)$/iu,
+  /^credentials(\..*)?$/iu,
+  /service[-_]?account.*\.json$/iu,
+]
+
+const SECRET_FILE_OMITTED = { omitted: '秘密情報ファイルの可能性があるため載せていません' } as const
+const BINARY_FILE_OMITTED = { omitted: 'バイナリファイルのため載せていません' } as const
+
+function isSecretFileName(file: string): boolean {
+  return SECRET_FILE_BASENAME_PATTERNS.some(pattern => pattern.test(path.basename(file)))
+}
+
+function readRepositoryFile(
+  file: string,
+  realRoot: string,
+): { content: string } | { omitted: string } {
+  if (isSecretFileName(file)) {
+    return SECRET_FILE_OMITTED
+  }
+
+  const resolved = path.resolve(realRoot, file)
+  if (!resolved.startsWith(realRoot + path.sep)) {
+    return { omitted: 'repository外を指すため載せていません' }
+  }
+  if (!fs.existsSync(resolved)) {
+    return { omitted: 'ファイルが存在しません（削除済み、または未作成）' }
+  }
+
+  // symlink経由でrepository外を読まないよう、realpathで包含判定する
+  const realFile = fs.realpathSync(resolved)
+  if (realFile !== realRoot && !realFile.startsWith(realRoot + path.sep)) {
+    return { omitted: 'repository外を指すため載せていません' }
+  }
+  // 通常名のsymlink（例: docs/notes.txt → .env）経由で秘密情報を載せないよう、実体名でも判定する
+  if (isSecretFileName(realFile)) {
+    return SECRET_FILE_OMITTED
+  }
+  const stat = fs.statSync(realFile)
+  if (!stat.isFile()) {
+    return { omitted: '通常ファイルではありません' }
+  }
+  // hard link は realpath でも実体名が分からない（.env への通常名の hard link を名前判定で止められない）。
+  // 実体を名前で確認できないものは載せない。
+  if (stat.nlink > 1) {
+    return { omitted: '複数の名前を持つファイル（hard link）で実体を確認できないため載せていません' }
+  }
+
+  // NUL を含まないバイナリ（JPEG 等）も載せないよう、生バイトを厳格な UTF-8 として復号できるかでも判定する
+  const bytes = fs.readFileSync(realFile)
+  let content: string
+  try {
+    content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    return BINARY_FILE_OMITTED
+  }
+  if (content.includes('\0')) {
+    return BINARY_FILE_OMITTED
+  }
+  return { content }
+}
+
+/**
+ * 対象ファイルの現在内容をreviewer promptへ載せる。
+ *
+ * Codex reviewerは`--sandbox read-only`下でshellを実行できず、repoを自分で読めない
+ * （roadmap: codex-sandbox-off-deprecated-landlock）。diffだけでは「既存の呼び出し元・
+ * 関数の契約と整合しているか」を判断できないため、対象ファイル全文をprompt側で渡す。
+ *
+ * 載せられなかったファイルは黙って落とさず、理由を明示する（reviewerが「読めた」と誤認しないため）。
+ * 個別ファイルのsecret scan不一致はファイル単位で省略する。prompt全体のsecret scan
+ * （AiCliAdapter）でreview自体がfail-closedになるのを、周辺文脈のために起こさないため。
+ */
+export function buildRepositoryContextSection(
+  targetFiles: readonly string[],
+  repoRoot: string = TARGET_ROOT,
+): string {
+  if (targetFiles.length === 0) return ''
+
+  let realRoot: string
+  try {
+    realRoot = fs.realpathSync(repoRoot)
+  } catch {
+    return [
+      'Repository context:',
+      `(repository root を読めなかったため対象ファイル内容は載せていません: ${repoRoot})`,
+    ].join('\n')
+  }
+
+  let remaining = REPOSITORY_CONTEXT_MAX_TOTAL_CHARS
+  const sections = targetFiles.map(file => {
+    let result: { content: string } | { omitted: string }
+    try {
+      result = readRepositoryFile(file, realRoot)
+    } catch (err) {
+      result = { omitted: `読み込みに失敗しました: ${err instanceof Error ? err.message : String(err)}` }
+    }
+
+    if ('content' in result) {
+      if (remaining <= 0) {
+        result = { omitted: 'repository context全体の上限に達したため載せていません' }
+      } else {
+        const limit = Math.min(REPOSITORY_CONTEXT_MAX_FILE_CHARS, remaining)
+        const excerpt = result.content.slice(0, limit)
+        if (!isPromptSafe(excerpt)) {
+          result = { omitted: 'secret scanに一致したため載せていません' }
+        } else {
+          remaining -= excerpt.length
+          const truncatedNote = result.content.length > excerpt.length
+            ? `\n(先頭${excerpt.length}文字のみ。以降は切り詰めています)`
+            : ''
+          return `### ${file}\n\`\`\`\n${excerpt}\n\`\`\`${truncatedNote}`
+        }
+      }
+    }
+    return `### ${file}\n(${result.omitted})`
+  })
+
+  return [
+    'Repository context（対象ファイルの現在内容）:',
+    'diff外の文脈（呼び出し元・関数の契約・同じパターンの箇所）の確認に使ってください。',
+    '省略・切り詰めと明記された部分は確認できていない前提で判断してください。',
+    '',
+    sections.join('\n\n'),
+  ].join('\n')
+}
+
 export function buildReviewPrompt(
   req: ReviewerRequest,
   principleSelection: readonly PrincipleSelection[] = selectReviewPrinciples(req),
+  repoRoot: string = TARGET_ROOT,
 ): string {
   const targetFileList = req.targetFiles.map(file => `- ${file}`).join('\n')
   const constitutionPrinciples = loadConstitutionPrinciples()
@@ -296,6 +436,8 @@ export function buildReviewPrompt(
     '',
     '対象ファイル一覧:',
     targetFileList,
+    '',
+    buildRepositoryContextSection(req.targetFiles, repoRoot),
     '',
     '以下のJSON形式で回答してください。他のテキストを含めないでください。',
     '```json',
