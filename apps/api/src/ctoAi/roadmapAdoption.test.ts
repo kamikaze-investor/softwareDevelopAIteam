@@ -192,6 +192,8 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
       dryRun: false,
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(sourceJob.id, { commitHash: 'candidate-commit' })
+    // createForJob は running / blocked の Job にしか結び付けない（承認は Job 実行中に発行される）。
+    storage.jobs.update(sourceJob.id, { status: 'running' })
     const approval = storage.approvalRequests.createForJob({
       taskId: first.taskId,
       targetBranch: options.targetBranch ?? 'candidate/self-dev',
@@ -205,6 +207,7 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       invalidIf: ['commit changes', 'diff changes'],
     }, sourceJob.id)
+    storage.jobs.update(sourceJob.id, { status: 'success' })
     if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     storage.tasks.update(first.taskId, { status: 'done' })
     storage.taskContinuations.create({
@@ -1221,6 +1224,8 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
       storage.jobs.update(sourceJobId, { commitHash: 'candidate-commit' })
     }
     if (overrides.linkedApprovalStatus !== undefined) {
+      // createForJob は running / blocked の Job にしか結び付けない（承認は Job 実行中に発行される）。
+      storage.jobs.update(sourceJobId, { status: 'running' })
       const approval = storage.approvalRequests.createForJob({
         taskId: first.taskId,
         targetBranch: 'candidate/self-dev',
@@ -1234,6 +1239,7 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
         invalidIf: ['commit changes', 'diff changes'],
       }, sourceJobId)
+      storage.jobs.update(sourceJobId, { status: 'success' })
       if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     }
     const evidenceJobId = overrides.onOtherJob === true ? createGitCommitJob() : sourceJobId
@@ -1317,6 +1323,8 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
       dryRun: false,
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(sourceJob.id, { commitHash: 'candidate-commit' })
+    // createForJob は running / blocked の Job にしか結び付けない（承認は Job 実行中に発行される）。
+    storage.jobs.update(sourceJob.id, { status: 'running' })
     const approval = storage.approvalRequests.createForJob({
       taskId: first.taskId,
       targetBranch: 'candidate/self-dev',
@@ -1330,6 +1338,7 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       invalidIf: ['commit changes', 'diff changes'],
     }, sourceJob.id)
+    storage.jobs.update(sourceJob.id, { status: 'success' })
     if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     storage.tasks.update(first.taskId, { status: 'done' })
     storage.taskContinuations.create({

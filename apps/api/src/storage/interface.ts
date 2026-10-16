@@ -10,6 +10,7 @@
 import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, OperatorRequestPlAction, OperatorRequestRequesterClass, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type {
   AbortAuthorization,
+  TechnicalAbortCleanupGeneration,
   TechnicalAbortCleanupSummary,
 } from '../pl/technicalAbortEvidence'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
@@ -203,9 +204,18 @@ export type PersistReviewWorkflowResult =
       reason: string
     }
 
+/**
+ * `replaceActiveAndCreate()` の結果。`supersededIds` は同じ transaction で SUPERSEDED にした
+ * 旧 request（WAITING は action・期限を問わず、APPROVED は同 action のものだけ）。
+ */
+export interface ReplaceActiveApprovalAndCreateResult {
+  approvalRequest: ApprovalRequest
+  supersededIds: string[]
+}
+
 export type CreateApprovalForJobResult =
   | { ok: true; approvalRequest: ApprovalRequest }
-  | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED'; reason: string }
+  | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED' | 'JOB_NOT_ACTIVE'; reason: string }
 
 export type ReviewApprovalAndResumeJobResult =
   | { ok: true; approvalRequest: ApprovalRequest; job: Job }
@@ -563,6 +573,8 @@ export interface IJobStorage {
     preCleanupObservation?: JobWorkspaceBaseline
     /** technical audit に残す counts-only summary。 */
     cleanupSummary?: TechnicalAbortCleanupSummary
+    /** technical cleanup で必須: 報告が名指す generation（carrier の現在の marker と一致を要求する）。 */
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
   }): ReleaseBlockedJobAndParkTaskResult
   /**
    * 通常は全 Job が既に terminal な blocked Task を abort_task で park する最終段。
@@ -588,7 +600,18 @@ export interface IJobStorage {
     authorization: AbortAuthorization
     preCleanupObservation?: JobWorkspaceBaseline
     cleanupSummary?: TechnicalAbortCleanupSummary
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
   }): ReleaseBlockedJobAndParkTaskResult
+  /**
+   * Technical Abort cleanup の generation を、報告が名指す generation と carrier の現在の marker が
+   * 一致するときだけ退役させる（marker を消して quarantine する）。一致確認と書き込みは単一 transaction。
+   * 一致しなければ何も変えず false（遅れて届いた古い generation の拒否が新しい generation を壊さない）。
+   */
+  retireTechnicalAbortCleanupForGeneration(input: {
+    jobId: string
+    generation: TechnicalAbortCleanupGeneration
+    quarantineReason: string
+  }): boolean
   clearWorkspaceQuarantine(input: {
     jobId: string
     /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
@@ -610,7 +633,23 @@ export type ReleaseBlockedJobAndParkTaskResult =
   | { ok: true; job: Job; task: Task }
   | {
     ok: false
-    code: 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR'
+    /**
+     * Technical Abort の最終 transaction で、cleanup の失敗ではない理由で拒否したときの code。
+     * どちらも carrier を quarantine せず、同じ transaction でその cleanup generation を取り消す。
+     * - `HUMAN_DECISION_CONFLICT`: precheck 後に live な WAITING / APPROVED、または CONSUMED の request が現れた。
+     * - `CLEANUP_SUPERSEDED`: carrier より後の Job（repair / resume 等）が既にある。
+     */
+    code:
+      | 'NOT_FOUND'
+      | 'PRECONDITION_FAILED'
+      | 'VERIFICATION_FAILED'
+      | 'STORAGE_ERROR'
+      | 'HUMAN_DECISION_CONFLICT'
+      | 'CLEANUP_SUPERSEDED'
+      /** 別 connection の write と lock 競合した（再試行可能。何も変えていない）。 */
+      | 'STORAGE_BUSY'
+      /** 報告の technical cleanup generation が carrier の現在の marker と違う（何も変えていない）。 */
+      | 'GENERATION_MISMATCH'
     reason: string
   }
 
@@ -660,6 +699,13 @@ export interface IApprovalRequestStorage {
   /** status = WAITING_FOR_USER の全件を返す（health-score 用） */
   findWaiting(): ApprovalRequest[]
   create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
+  /**
+   * **Task あたり WAITING_FOR_USER は高々1件、APPROVED は action ごと**という invariant を守る作成。
+   * 単一 transaction で、その Task の WAITING 行を requestedAction・期限を問わず SUPERSEDED にし、
+   * 同 action の APPROVED も置き換えてから新しい行を insert する。別 action の APPROVED は人の判断なので残す。
+   * Job に結び付く git_commit の作成（`createForJob`）は同じ規則で WAITING だけを畳み、APPROVED は残す。
+   */
+  replaceActiveAndCreate(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ReplaceActiveApprovalAndCreateResult
   /** git_commit Approval の作成と jobs.approval_id 設定を単一transactionで行う。 */
   createForJob(
     data: Omit<ApprovalRequest, 'id' | 'createdAt'>,

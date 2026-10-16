@@ -209,6 +209,14 @@ describe('POST /api/tasks/:id/resume — blocked git_commit Job (STALE approval)
       const { body: resumeBody } = await resumeTask(app, task.id)
       const resumedJob = resumeBody as Job
 
+      // 実際のWorkerはqueued Jobをdequeueした時点でrunningへ遷移させてからgate/checkを呼ぶ。
+      // queued のままの Job には承認を結び付けない（createForJob は running / blocked を要求する）。
+      await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${resumedJob.id}`,
+        payload: { status: 'running' },
+      })
+
       const gateRes = await app.inject({
         method: 'POST',
         url: '/api/gate/check',
