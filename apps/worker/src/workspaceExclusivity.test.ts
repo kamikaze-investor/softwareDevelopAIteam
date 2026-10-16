@@ -270,6 +270,31 @@ describe('fetchQueuedJob workspace exclusivity', () => {
     expect(result?.job.id).toBe('job-b-1')
   })
 
+  it("9d. two owners at once (a running Project's and a paused Project's) are ambiguous: nothing is claimed (W5)", async () => {
+    // 以前は API の並び順で先に来た方を所有者にし、その queued Job を claim していた。
+    const taskA = task({ id: 'task-a', projectId: 'project-paused' })
+    const taskB = task({ id: 'task-b', projectId: 'project-1' })
+    mockEndpoints({
+      projects: [project(), project({ id: 'project-paused', status: 'paused' })],
+      tasksByProjectId: {
+        'project-1': [taskB],
+        'project-paused': [taskA],
+      },
+      jobsByTaskId: {
+        'task-a': [job({ id: 'job-a-1', taskId: 'task-a', status: 'running' })],
+        // repair の続き（initial-implement 以外の queued）なので task-b も所有者になる。
+        'task-b': [job({ id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'repair:job-b-0:1' })],
+      },
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const result = await fetchQueuedJob()
+
+    expect(result).toBeNull()
+    expect(warn.mock.calls.some(([message]) => String(message).includes('task-b, task-a'))).toBe(true)
+    warn.mockRestore()
+  })
+
   it('archived Projects do not take part in workspace ownership', async () => {
     const taskA = task({ id: 'task-a', projectId: 'project-archived' })
     const taskB = task({ id: 'task-b', projectId: 'project-1' })

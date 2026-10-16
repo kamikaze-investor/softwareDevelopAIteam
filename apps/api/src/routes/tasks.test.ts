@@ -1655,6 +1655,23 @@ describe('Task API', () => {
     },
   )
 
+  it('POST /api/tasks refuses creating a task that is already done', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: { projectId: project.id, title: 'Already done', status: 'done', assignee: 'developer_ai' },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('TASK_DONE_USE_COMPLETION_ROUTE')
+      const list = await app.inject({ method: 'GET', url: `/api/tasks?projectId=${project.id}` })
+      expect(parseBody<Task[]>(list.body)).toEqual([])
+    })
+  })
+
   it('PATCH /api/tasks/:id updates provider and allowed paths', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

@@ -190,16 +190,18 @@ function isStaleBlockedJobOfFinishedTask(task: Task, job: Job): boolean {
  * canonical resume lineage がある行の終端化は API startup reconciliation の責務であり、
  * この Worker の述語は proof の無い stale 行そのものには触れない。
  */
-function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
-  for (const { task, jobs } of perTask) {
-    const owns = jobs.some((job) => (
+function findWorkspaceOwningTaskIds(perTask: readonly { task: Task; jobs: Job[] }[]): string[] {
+  // **全件を返す。** 以前は API の並び順で最初の1件を所有者にしていたため、所有者が2つ
+  // 同時に立つ（＝既に不変条件が破れている）状態で、どちらか一方の Job を claim してしまえた。
+  // 所有権判定を archived 以外の全 Project へ広げた（W5）ことで現実に起こりうるので、
+  // 呼び出し側で fail-closed にする。
+  return perTask
+    .filter(({ task, jobs }) => jobs.some((job) => (
       job.status === 'running' ||
       (job.status === 'blocked' && !isStaleBlockedJobOfFinishedTask(task, job)) ||
       (job.status === 'queued' && !isInitialImplementStepKey(task.id, job.workflowStepKey))
-    ))
-    if (owns) return task.id
-  }
-  return undefined
+    )))
+    .map(({ task }) => task.id)
 }
 
 /**
@@ -253,8 +255,15 @@ export function resolveWorkspaceOwnership(
   readHead: (dir: string) => string | undefined = getCommitHash,
   readGitOperations: (dir: string) => readonly string[] = detectGitOperationState,
 ): WorkspaceOwnership {
-  const existing = findWorkspaceOwningTaskId(perTask)
-  if (existing !== undefined) return { kind: 'owner', taskId: existing }
+  const existing = findWorkspaceOwningTaskIds(perTask)
+  if (existing.length > 1) {
+    console.warn(
+      `[Worker] workspace の所有者が複数 Task に一致しました ` +
+      `(${existing.join(', ')})。任意に選ばず claim を見送ります。`,
+    )
+    return { kind: 'ambiguous' }
+  }
+  if (existing.length === 1) return { kind: 'owner', taskId: existing[0] }
 
   // 終わった Task に取り残された blocked 行。次の Task をまだ始められない間だけ所有権を保持する。
   const staleOwners = perTask.filter(({ task, jobs }) => (
@@ -803,7 +812,7 @@ async function confirmRunningTransition(
   // ── PR-C: claim（queued -> running）と workspace baseline を同一 PATCH で原子化する ──
   // baseline は Job の子プロセスが workspace を変更し得る**前**に durable に保存しなければ
   // ならない。ここで Job はまだ queued であり、initial-implement 以外の queued Job は
-  // findWorkspaceOwningTaskId() により該当 Task が workspace を保有している扱いになる。
+  // findWorkspaceOwningTaskIds() により該当 Task が workspace を保有している扱いになる。
   // Worker は systemd の flock で単一インスタンス化され、poll loop も単一スレッドのため、
   // baseline 計算と claim の間に他 Task が workspace を奪うことは無い。
   // baseline 取得に失敗したら claim せず fail-closed で failed へ落とす（子プロセスを起動しない）。
