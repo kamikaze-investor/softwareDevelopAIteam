@@ -709,6 +709,11 @@ export interface IDesignReviewEvidenceStorage {
   findByTaskId(taskId: string): DesignReviewEvidence[]
   findLatestByTaskId(taskId: string): DesignReviewEvidence | undefined
   findLatestBySubjectId(reviewKind: DesignReviewKind, subjectId: string): DesignReviewEvidence | undefined
+  /**
+   * この evidence を覆す、同じ subject・同じ design hash の新しい run（active か、ALIGNED 以外の判定で
+   * 終端したもの）。無ければ undefined。規則は `designReviewEvidencePolicy.findSupersedingRun()`。
+   */
+  findSupersedingRun(evidence: DesignReviewEvidence): DesignReviewRun | undefined
   create(data: DesignReviewEvidenceCreateInput): DesignReviewEvidence
 }
 

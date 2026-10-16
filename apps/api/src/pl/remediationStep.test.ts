@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeAll, afterAll } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll, afterEach, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -10,7 +10,7 @@ import { FLAGSHIP_REMEDIATION_CANDIDATES, selectRemediationModel } from '@ai-tea
 import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import { executeQueuedRun } from '../designReview/queuedRunDispatch'
@@ -953,5 +953,59 @@ describe('fresh Review が判定を出さなかった（requeued）場合', () =
     expect(storage.designReviewRuns.findById(runId)?.status).toBe('failed')
     expect(buildSystemState(storage).attention.some((item) =>
       item.kind === 'design_review_failed' && item.referenceId === runId)).toBe(true)
+  })
+})
+/**
+ * **古い ALIGNED evidence が、同じ設計に対する新しい CONFLICT を上書きしない**（独立レビュー round 8・2026-10-16）。
+ *
+ * 以前は evidence だけを見る Gate が古い ALIGNED を受理し、回収経路が Job を作り、
+ * Remediation は「evidence がある＝ALIGNED」として CONFLICT を見失った。
+ */
+describe('古い ALIGNED evidence → 新しい同じ hash の CONFLICT', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('回収経路は Job を作らず、Job Gate も通らず、Remediation は CONFLICT を対象にする', async () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'CONFLICT した項目',
+      description: buildAdoptedDescription(LEDGER_BODY, '当初の広い scope'),
+      status: 'pending', assignee: 'developer_ai', dependencies: [],
+      allowedPaths: ['apps/api/src'], acceptanceCriteria: ['当初の受入条件'],
+      roadmapTaskKey: 'conflicted-item', phase: 1, roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const designTextHash = computeDesignTextHash(designText)
+
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    // 1. 以前の review が同じ設計を ALIGNED にした。
+    storage.designReviewEvidence.create({
+      taskId: task.id, reviewKind: 'task', subjectId: task.id, designTextHash,
+      reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+    vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+    // 2. その後、同じ設計の新しい review が本物の CONFLICT を出した。
+    const run = storage.designReviewRuns.create({
+      taskId: task.id, taskTitle: task.title, designText, designTextHash, changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(run.id, claimed.claimToken as string, 'succeeded', CONFLICT_RESULT_JSON)
+
+    expect(checkImplementJobDesignReviewEvidence(
+      { taskId: task.id, aiCliMode: 'implement', aiCliPrompt: designText },
+      storage.designReviewEvidence,
+    )).toMatchObject({ ok: false, code: 'DESIGN_REVIEW_SUPERSEDED' })
+
+    const recovered = await recoverReadyTasksWithoutJob(storage, {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => { throw new Error('the recovery sweep must not run a review') },
+    })
+    expect(recovered.recovered).toBe(0)
+    expect(storage.jobs.findByTaskId(task.id)).toEqual([])
+
+    expect(findRemediationSubject(storage, task.id)?.task.id).toBe(task.id)
   })
 })

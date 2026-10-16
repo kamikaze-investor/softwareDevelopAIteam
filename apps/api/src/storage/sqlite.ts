@@ -32,7 +32,8 @@ import type { TaskContinuation, OperatorRequest } from '@ai-team/shared'
 import type { PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleApplication, PrincipleApplicationInput, PrincipleDisagreementRow, PrincipleReviewStage, StrategicDecision } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
-import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, findSupersedingRun } from '../designReviewEvidencePolicy'
+import { classifyStoredRunJudgment } from '../designReview/designReviewCoordinator'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import {
   parseResumeSource,
@@ -4461,6 +4462,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
       ).get(reviewKind, subjectId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
+    },
+    findSupersedingRun(evidence) {
+      // 規則は designReviewEvidencePolicy.findSupersedingRun() の1箇所。ここは同じ subject・同じ hash の
+      // 候補 run を新しい順に渡し、終端 run の判定は API と同じ再計算（classifyStoredRunJudgment）で決める。
+      const rows = db.prepare(
+        'SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND design_text_hash = ?'
+        + ' ORDER BY created_at DESC, rowid DESC'
+      ).all(evidence.reviewKind, evidence.subjectId, evidence.designTextHash) as any[]
+      return findSupersedingRun(evidence, rows.map(deserializeDesignReviewRun), classifyStoredRunJudgment)
     },
     create(data) {
       const subject = resolveDesignReviewSubject(data)

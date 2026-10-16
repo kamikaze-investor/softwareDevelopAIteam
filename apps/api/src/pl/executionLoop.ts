@@ -103,6 +103,7 @@ import {
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { recordResumeActor } from '../designReview/resumeActor'
 import { RESUME_DESIGN_REVIEW_PENDING, resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
@@ -1155,7 +1156,8 @@ function collectSystemEvidence(
   //
   // 最新が ALIGNED でない / task-kind でない場合は**何も積まない**（古いものへ遡らない）。
   const latest = storage.designReviewEvidence.findLatestByTaskId(item.taskId)
-  if (latest?.decision === 'ALIGNED' && latest.reviewKind === 'task') {
+  // 新しい同じ設計の判定に覆された ALIGNED は積まない（isUsableAlignedEvidence）。
+  if (latest?.reviewKind === 'task' && isUsableAlignedEvidence(latest, storage.designReviewEvidence)) {
     evidence.push({ gate: 'design_review', designReviewEvidenceId: latest.id })
   }
 

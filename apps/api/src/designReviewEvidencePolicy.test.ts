@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from './storage/sqlite'
 import type { IStorage } from './storage/interface'
 import {
   checkRoadmapDesignReviewFreshness,
   computeDesignTextHash,
+  findSupersedingRun,
+  type StoredRunJudgment,
 } from './designReviewEvidencePolicy'
 
 function createStorage(): IStorage {
@@ -159,5 +161,74 @@ describe('checkRoadmapDesignReviewFreshness', () => {
 
     // and the task-kind row itself is still retrievable via findLatestBySubjectId('task', taskId).
     expect(storage.designReviewEvidence.findLatestBySubjectId('task', task.id)?.id).toBeDefined()
+  })
+})
+/**
+ * **同じ subject・同じ design hash では最新の判定が正**（独立レビュー round 8・2026-10-16）。
+ */
+describe('findSupersedingRun — evidence の失効規則', () => {
+  const evidence = { designTextHash: 'h1', createdAt: '2026-10-16T10:00:00.000Z' }
+  type Run = { id: string; status: string; designTextHash: string; createdAt: string; judgment: StoredRunJudgment }
+  const run = (over: Partial<Run>): Run => ({
+    id: 'r', status: 'succeeded', designTextHash: 'h1', createdAt: '2026-10-16T10:05:00.000Z', judgment: 'negative', ...over,
+  })
+  const find = (runs: Run[]) => findSupersedingRun(evidence, runs, (r) => r.judgment)
+
+  it('新しい同じ hash の CONFLICT / UNCERTAIN（negative）は evidence を覆す', () => {
+    expect(find([run({ id: 'conflict' })])?.id).toBe('conflict')
+  })
+
+  it('新しい同じ hash の active run（queued / running）は evidence を覆す', () => {
+    expect(find([run({ id: 'q', status: 'queued', judgment: 'none' })])?.id).toBe('q')
+    expect(find([run({ id: 'r', status: 'running', judgment: 'none' })])?.id).toBe('r')
+  })
+
+  it('判定の無い終端（failed / REVIEW_UNAVAILABLE / 結果なし）と ALIGNED は覆さない', () => {
+    expect(find([
+      run({ status: 'failed', judgment: 'none' }),
+      run({ judgment: 'none' }),
+      run({ judgment: 'aligned' }),
+    ])).toBeUndefined()
+  })
+
+  it('古い run・同じ ms の run・別の hash の run は覆さない', () => {
+    expect(find([
+      run({ createdAt: '2026-10-16T09:59:59.999Z' }),
+      run({ designTextHash: 'h2' }),
+    ])).toBeUndefined()
+    expect(find([run({ id: 'same-ms', createdAt: evidence.createdAt })])).toBeUndefined()
+  })
+})
+
+describe('checkRoadmapDesignReviewFreshness — 新しい同じ material の CONFLICT run', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('古い ALIGNED evidence は、より新しい同じ hash の CONFLICT run に覆される', () => {
+    const storage = createStorage()
+    const projectId = 'project-superseded'
+    const hash = computeDesignTextHash(REVIEW_MATERIAL)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    storage.designReviewEvidence.create({
+      reviewKind: 'roadmap', subjectId: projectId, designTextHash: hash, reviewLoad: 'critical',
+      decision: 'ALIGNED', independentReviewRequired: false,
+    })
+    vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+    const conflictRun = storage.designReviewRuns.create({
+      reviewKind: 'roadmap', subjectId: projectId, taskTitle: 'Whole-Roadmap Review',
+      designText: REVIEW_MATERIAL, designTextHash: hash, changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(conflictRun.id, 3)
+    storage.designReviewRuns.complete(conflictRun.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      focusedReviewResults: [
+        { focus: 'strategic_alignment', decision: 'CONFLICT' },
+        { focus: 'scope_simplicity', decision: 'ALIGNED' },
+        { focus: 'architecture_responsibility', decision: 'ALIGNED' },
+      ],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'phases conflict' },
+    }))
+
+    expect(checkRoadmapDesignReviewFreshness(projectId, REVIEW_MATERIAL, storage.designReviewEvidence))
+      .toMatchObject({ ok: false, code: 'ROADMAP_DESIGN_REVIEW_SUPERSEDED' })
   })
 })

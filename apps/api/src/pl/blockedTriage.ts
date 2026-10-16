@@ -68,6 +68,7 @@ import {
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
 import {
@@ -432,7 +433,8 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
       ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
     ...(review !== undefined ? { review } : {}),
-    ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
+    // 新しい同じ設計の判定に覆された ALIGNED は根拠にしない（isUsableAlignedEvidence）。
+    ...(evidence?.reviewKind === 'task' && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)
       ? { alignedEvidenceId: evidence.id }
       : {}),
   }

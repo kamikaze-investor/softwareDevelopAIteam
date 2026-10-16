@@ -81,7 +81,7 @@ import {
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
 import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { computeDesignTextHash, isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import {
   adoptRoadmapItem,
@@ -327,8 +327,12 @@ export function findRemediationSubject(
   if (run.status !== 'succeeded') return undefined
 
   // evidence が登録されていれば ALIGNED である（非 ALIGNED は evidence を作らない）。
+  // ただし**同じ設計に対する新しい判定が正**。この run が evidence より新しい CONFLICT なら
+  // evidence は覆されており、ここで CONFLICT を見失ってはならない（isUsableAlignedEvidence）。
   const evidence = storage.designReviewEvidence.findLatestByTaskId(task.id)
-  if (evidence?.designTextHash === run.designTextHash) return undefined
+  if (evidence?.designTextHash === run.designTextHash && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)) {
+    return undefined
+  }
 
   // **判定は runner の自己申告（`finalDecision`）を採用せず、API と同じ関数で再計算する。**
   // Job Gate / evidence 登録が使っているのと同一の `recomputeDecision()` を通すので、

@@ -32,7 +32,7 @@ import {
 import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
 import { DesignReviewRunContentionError, type IStorage, type DesignReviewRun } from '../storage/interface'
 import type { AppliedPrinciple } from '@ai-team/shared'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { computeDesignTextHash, type StoredRunJudgment } from '../designReviewEvidencePolicy'
 import { recordPrincipleApplications } from '../principles/ledger'
 
 /** bounded attempt。超過したrunはrequeueせずfailedで終端する。 */
@@ -913,6 +913,23 @@ async function createAndExecute(
   const result = await executeDesignReviewRun(storage, run, deps)
   if (result.status !== 'not_claimable' && result.status !== 'stale') return result
   return readDurableRunOutcome(storage, run.id) ?? result
+}
+
+/**
+ * 終端した run の判定を、API と同じ再計算で分類する（evidence 失効規則の入力）。
+ * succeeded 以外・結果なし・読めない結果・REVIEW_UNAVAILABLE は「判定なし」。
+ */
+export function classifyStoredRunJudgment(run: DesignReviewRun): StoredRunJudgment {
+  if (run.status !== 'succeeded' || run.resultJson === undefined) return 'none'
+  try {
+    const parsed: unknown = JSON.parse(run.resultJson)
+    if (!isUsableRunnerOutput(parsed)) return 'none'
+    const decision = recomputeDecision(parsed, run.reviewKind, run.changedFiles).decision
+    if (decision === 'ALIGNED') return 'aligned'
+    return decision === 'CONFLICT' || decision === 'UNCERTAIN' ? 'negative' : 'none'
+  } catch {
+    return 'none'
+  }
 }
 
 /** 他の executor が扱った run の、保存済みの結果。読めなければ undefined（呼び出し側は元の結果を返す）。 */
