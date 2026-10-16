@@ -50,6 +50,8 @@ import { gateEvaluationRoutes } from './gateEvaluations'
 // v3（2026-10-16 監査 RC4/RC6）: 承認を requestedAction 単位に束縛し、SAFE_WORK の HIGH には承認依頼を
 // 作らず、RISK_RULES の HIGH 対象（Gate / 承認の実装ファイル・docs/project_memory/rules/）を広げた。
 // v2 の evidence を読む側（roadmapAdoption の Candidate commit 証明）は v2 / v3 の両方を受け付ける。
+// 2026-10-17（RC6 / DA trigger 2）の RISK_RULES 拡張（authority・admission・recovery の定義ファイル）も v3 に含める。
+// v3 は同じ lifecycle repair の一連の変更で未リリース（origin/master は v2）なので、v4 へは上げない。
 const GATE_POLICY_VERSION = 'gate-policy-v3'
 
 function computeDiffHash(diffText: string): string {

@@ -54,6 +54,50 @@ interface RiskRule {
   level: RiskLevel
 }
 
+/**
+ * 'alignment / gate change' の exact path 対象（拡張子 `.ts` を除いた repository-relative path）。
+ * **production の実ファイルだけ**を並べる。隣のテスト（`*.test.ts`）は一致しない。
+ * 英数字と `/` だけなので RegExp へそのまま埋め込める（下の検査で固定する）。
+ */
+export const GATE_CHANGE_EXACT_FILES: readonly string[] = [
+  // 2026-10-16 監査（RC4/RC6）: approval の保存・却下伝播・PL abort・停止判定・commit gate
+  'apps/api/src/storage/sqlite',
+  'apps/api/src/pl/abortTask',
+  'apps/api/src/pl/executionLoop',
+  'apps/api/src/state/systemState',
+  'apps/api/src/gitCommitResumeLineage',
+  'apps/api/src/linkedGitCommitRejection',
+  'apps/worker/src/approvalLevel/commitGate',
+  'packages/shared/src/approvalLiveness',
+  // 2026-10-17 監査（RC6 / DA trigger 2）: authority・approval/consume・actor 分類・admission・recovery の定義
+  'apps/api/src/designReview/resumeActor',                      // 承認 / resume の actor（人・AI）分類
+  'apps/api/src/designReview/repairRecoveryEpoch',              // repair 再発行 budget の epoch
+  'apps/api/src/designReview/repairFromStoredReview',           // stored-review recovery の authority
+  'apps/api/src/designReview/resumeBlockedTask',                // blocked Task resume の admission
+  'apps/api/src/designReview/terminalRepairSuccessorRecovery',  // Review を回さず successor を作る recovery
+  'apps/api/src/designReview/terminalRepairEscalationRecovery', // 却下の Human escalation recovery
+  'apps/api/src/designReview/designReviewCoordinator',          // recomputeDecision（formal verdict）
+  'apps/api/src/designReview/resultingCommitBinding',           // Gate ALLOW と resulting commit の bind
+  'apps/api/src/humanRecovery/recoverBlockedTask',              // Human Recovery の authority
+  'apps/api/src/humanRecovery/recoveryAudit',                   // Human Recovery 履歴（park / attention の根拠）
+  'apps/api/src/storage/interface',                             // approval consume / actor 記録の storage 契約
+  'packages/shared/src/resumeAdmission',                        // resume admission
+  'packages/shared/src/recoverAdmission',                       // recover admission
+  'packages/shared/src/taskOccupancy',                          // Task 占有（並走 admission）
+  'packages/shared/src/reviewSeparation',                       // generator / final reviewer の自己承認禁止
+  'apps/api/src/approvedRunBlock',                              // 承認済み run の block 判定
+  'apps/api/src/state/blockedRowOwnership',                     // blocked 行の所有（誰が解除してよいか）
+  'apps/api/src/reconcile/externalCompletion',                  // Candidate 外の完了を done にする authority
+  'apps/api/src/pl/technicalResumePolicy',                      // PL Technical Resume の budget / actor token
+  'apps/api/src/pl/technicalAbortEvidence',                     // PL technical abort の authority
+  'apps/api/src/ctoAi/roadmapAdoption',                         // adoption admission / 受理する policy version
+]
+for (const file of GATE_CHANGE_EXACT_FILES) {
+  if (!/^[A-Za-z0-9/]+$/.test(file)) {
+    throw new Error(`GATE_CHANGE_EXACT_FILES entry must be a plain path: ${file}`)
+  }
+}
+
 export const RISK_RULES: RiskRule[] = [
   { label: 'DB migration / schema',      pattern: /migration|schema\.ts/i,                    level: 'HIGH' },
   { label: 'auth / permission guard',    pattern: /auth|permission|guard/i,                   level: 'HIGH' },
@@ -72,7 +116,19 @@ export const RISK_RULES: RiskRule[] = [
   // 抜けていた。LOW のまま Evidence で commit できると、Gate を弱める変更が人の目を通らない。
   // **production の実ファイルだけ**を exact path で足す（隣のテストまで HIGH にすると、
   // テストを足すだけの変更まで Evidence の対象外になる）。
-  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir|(^|\/)(apps\/api\/src\/(storage\/sqlite|pl\/abortTask|pl\/executionLoop|state\/systemState|gitCommitResumeLineage|linkedGitCommitRejection)|apps\/worker\/src\/approvalLevel\/commitGate|packages\/shared\/src\/approvalLiveness)\.ts$/i, level: 'HIGH' },
+  //
+  // 2026-10-17 監査（RC6 / DA trigger 2）: authority・admission・recovery の**定義そのもの**が LOW のままだった。
+  // これらを編集してよい Task が、CEO 依頼なしに Safety Evidence で auto-commit できてしまう。
+  // exact path の一覧は `GATE_CHANGE_EXACT_FILES`（理由つき）を正本にする。
+  {
+    label: 'alignment / gate change',
+    pattern: new RegExp(
+      String.raw`alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir`
+        + String.raw`|(^|\/)(` + GATE_CHANGE_EXACT_FILES.join('|') + String.raw`)\.ts$`,
+      'i',
+    ),
+    level: 'HIGH',
+  },
   // 2026-10-02: Decision Authority / Safety policy の正本 docs。docs/ 配下は SAFE_ONLY で LOW に
   // 落ちるため、下の SAFE_ONLY 早期リターンより先に評価する（NEVER_SAFE_ONLY_RULES）。
   // 2026-10-16 監査: rules/ は approval_rules.md 以外も運用ルールの正本なので配下すべてを対象にする。

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest'
-import { runRiskReview, SAFE_WORK_COMMAND_KINDS, isSafeWorkCommandKind } from './approvalGateLogic'
+import {
+  GATE_CHANGE_EXACT_FILES,
+  runRiskReview,
+  SAFE_WORK_COMMAND_KINDS,
+  isSafeWorkCommandKind,
+} from './approvalGateLogic'
 
 const GATE = 'alignment / gate change'
 const DA_DOC = 'decision authority / safety policy doc'
@@ -42,6 +47,83 @@ describe('RISK_RULES — alignment / gate change（2026-10-16 追加分）', () 
     'apps/api/src/state/systemStateView.ts',
   ])('%s does not match alignment / gate change', (file) => {
     expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
+  })
+})
+
+/**
+ * 2026-10-17 監査（RC6 / DA trigger 2）: authority・admission・recovery の定義ファイル。
+ * ここが LOW だと、これらを編集してよい Task が CEO 依頼なしに Safety Evidence で auto-commit できる。
+ */
+describe('RISK_RULES — alignment / gate change（2026-10-17 authority / admission / recovery 定義）', () => {
+  const authorityFiles = [
+    'apps/api/src/designReview/resumeActor.ts',
+    'apps/api/src/designReview/repairRecoveryEpoch.ts',
+    'apps/api/src/designReview/repairFromStoredReview.ts',
+    'apps/api/src/designReview/resumeBlockedTask.ts',
+    'apps/api/src/designReview/terminalRepairSuccessorRecovery.ts',
+    'apps/api/src/designReview/terminalRepairEscalationRecovery.ts',
+    'apps/api/src/designReview/designReviewCoordinator.ts',
+    'apps/api/src/designReview/resultingCommitBinding.ts',
+    'apps/api/src/humanRecovery/recoverBlockedTask.ts',
+    'apps/api/src/humanRecovery/recoveryAudit.ts',
+    'apps/api/src/storage/interface.ts',
+    'packages/shared/src/resumeAdmission.ts',
+    'packages/shared/src/recoverAdmission.ts',
+    'packages/shared/src/taskOccupancy.ts',
+    'packages/shared/src/reviewSeparation.ts',
+    'apps/api/src/approvedRunBlock.ts',
+    'apps/api/src/state/blockedRowOwnership.ts',
+    'apps/api/src/reconcile/externalCompletion.ts',
+    'apps/api/src/pl/technicalResumePolicy.ts',
+    'apps/api/src/pl/technicalAbortEvidence.ts',
+    'apps/api/src/ctoAi/roadmapAdoption.ts',
+  ]
+
+  it.each(authorityFiles)('%s → HIGH / alignment / gate change', (file) => {
+    const result = runRiskReview([file])
+    expect(result.riskLevel).toBe('HIGH')
+    expect(result.triggeredRules).toContain(GATE)
+  })
+
+  it('一覧は GATE_CHANGE_EXACT_FILES の正本と一致する（追加漏れ・テスト漏れを相互に検出する）', () => {
+    const expected = authorityFiles.map((file) => file.replace(/\.ts$/, ''))
+    for (const file of expected) {
+      expect(GATE_CHANGE_EXACT_FILES).toContain(file)
+    }
+  })
+
+  it.each(authorityFiles.map((file) => file.replace(/\.ts$/, '.test.ts')))(
+    '%s（隣のテスト）は alignment / gate change に一致しない',
+    (file) => {
+      expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
+    },
+  )
+
+  it.each([
+    // 似た名前の別ファイル・別ディレクトリ・前方一致は対象外
+    'apps/api/src/designReview/resumeActorView.ts',
+    'apps/web/src/designReview/resumeActor.ts',
+    'apps/api/src/storage/interfaceHelpers.ts',
+    'apps/api/src/storage/interface.tsx',
+    'packages/shared/src/taskOccupancyView.ts',
+    'packages/shared/src/resumeAdmission.md',
+    'apps/api/src/reconcile/externalCompletionReport.ts',
+    'apps/api/src/ctoAi/roadmapAdoptionPrompt.ts',
+    'xapps/api/src/approvedRunBlock.ts',
+  ])('%s does not match alignment / gate change', (file) => {
+    expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
+  })
+
+  it('humanOnlyRoutes.ts は auth rule で既に HIGH（重複して足さない）', () => {
+    const result = runRiskReview(['apps/api/src/auth/humanOnlyRoutes.ts'])
+    expect(result.riskLevel).toBe('HIGH')
+    expect(result.triggeredRules).toContain('auth / permission guard')
+  })
+
+  it('一覧の各 path は英数字と / だけ（RegExp へ埋め込んでも意味が変わらない）', () => {
+    for (const file of GATE_CHANGE_EXACT_FILES) {
+      expect(file).toMatch(/^[A-Za-z0-9/]+$/)
+    }
   })
 })
 
