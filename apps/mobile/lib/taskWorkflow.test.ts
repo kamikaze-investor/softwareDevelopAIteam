@@ -674,6 +674,28 @@ describe('deriveSafeCommandQaEvidence — QA 事実は Job レコードから導
     expect(derived.every((q) => q.details.includes('verify:implement'))).toBe(true)
   })
 
+  it.each([
+    ['package.json'],
+    ['apps/api/package.json'],
+    ['apps/api/tsconfig.json'],
+    ['tsconfig.base.json'],
+  ])('profile 付きでも Job が %s を変えていたら typecheck=passed を主張しない', (file) => {
+    const { implementJob } = storedReviewShape({
+      implement: {
+        changedFiles: ['apps/api/src/a.ts', file],
+        safeCommand: {
+          kind: 'test',
+          workingDir: '/workspace/target',
+          params: { verificationProfile: 'implement' },
+        },
+      },
+    })
+    const typecheck = deriveSafeCommandQaEvidence(implementJob).find((q) => q.type === 'typecheck')
+
+    expect(typecheck?.status).toBe('skipped')
+    expect(typecheck?.details).toContain(file)
+  })
+
   it('profile 付きでも失敗した Job からは typecheck を主張しない', () => {
     const { implementJob } = storedReviewShape({
       implement: {

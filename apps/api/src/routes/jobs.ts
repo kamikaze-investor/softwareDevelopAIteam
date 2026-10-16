@@ -62,8 +62,10 @@ const SafeCommandParamsSchema = z.object({
   revertCommit: z.string().optional(),
   testPattern: z.string().optional(),
   agentPrefix: z.string().optional(),
-  // 固定値のみ。未知の値は enum 不一致で 400 になる（任意 script 名を通さない）。
-  verificationProfile: z.literal('implement').optional(),
+  // `verificationProfile` は意図的に含めない（`.strict()` により 400）。
+  // profile はサーバー側の Implement producer（initialImplementWorkflow）だけが付け、
+  // 派生 Job は safeCommand ごと引き継ぐ。クライアントが付けられると、QA・手動 test Job の
+  // 実行内容をクライアントが変えられてしまう（独立レビュー指摘）。
 }).strict()
 
 /**
@@ -76,13 +78,7 @@ const SafeCommandParamsSchema = z.object({
 const SafeCommandInputSchema = z.object({
   kind: CommandKindSchema,
   params: SafeCommandParamsSchema.optional(),
-}).strict().refine(
-  // verificationProfile は test の検証を強める固定選択肢。test 以外に付けても意味がなく、
-  // testPattern と併用すると「一部だけ実行」と「typecheck を含む全体検証」が矛盾する。
-  (d) => d.params?.verificationProfile === undefined
-    || (d.kind === 'test' && d.params.testPattern === undefined),
-  { message: 'verificationProfileはkind=testでのみ指定でき、testPatternとは併用できません' },
-)
+}).strict()
 
 // 意図的に 'copilot' を含めない。@ai-team/shared の AiCliProvider 型には
 // 存在するが、Task/Job実装用のプロバイダーとしてはまだ未対応

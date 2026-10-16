@@ -445,17 +445,12 @@ describe('Job API', () => {
       return response
     }
 
-    it('accepts the fixed implement profile on kind=test and stores it as given', async () => {
-      const res = await postSafeCommand({ kind: 'test', params: { verificationProfile: 'implement' } })
-      expect(res.statusCode).toBe(201)
-      expect(parseBody<Job>(res.body).safeCommand).toEqual({
+    // profile はサーバー側 producer だけが付ける。既知の値でもクライアントからは受けない。
+    it.each([
+      ['the implement profile from a client (QA / manual test Job)', {
         kind: 'test',
         params: { verificationProfile: 'implement' },
-        workingDir: '/workspace/target',
-      })
-    })
-
-    it.each([
+      }],
       ['an unknown profile', { kind: 'test', params: { verificationProfile: 'full' } }],
       ['a script-like profile', { kind: 'test', params: { verificationProfile: 'verify:implement; rm -rf /' } }],
       ['the profile on a non-test kind', { kind: 'typecheck', params: { verificationProfile: 'implement' } }],
