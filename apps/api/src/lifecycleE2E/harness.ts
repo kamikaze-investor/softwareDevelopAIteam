@@ -117,6 +117,8 @@ export function dirtyPaths(): string[] {
 export type ImplementOutcome =
   | { kind: 'change'; files: Record<string, string> }
   | { kind: 'fail'; stderr: string; files?: Record<string, string> }
+  /** containment が静止を証明できなかった（Worker は quarantine 付き blocked を報告する）。 */
+  | { kind: 'quarantine'; reason: string; files?: Record<string, string> }
 
 /** review の AI 出力の代わり。`unstructured` は structured result を返せずに終わった review。 */
 export type ReviewOutcome =
@@ -204,6 +206,9 @@ export class WorkerSimulator {
   /** Worker の local Outbox（未配送の terminal 結果）。 */
   private pending: PendingOutbox | undefined
 
+  /** 直前に配送した terminal 結果（Outbox event 付き）。重複配送の検証に使う。 */
+  lastDelivery: PendingOutbox | undefined
+
   readonly steps: WorkerStep[] = []
 
   constructor(private readonly env: LifecycleEnv) {}
@@ -285,6 +290,7 @@ export class WorkerSimulator {
 
   private async report(job: Job, payload: Record<string, unknown>, step: WorkerStep): Promise<void> {
     const delivery = withOutbox(payload)
+    this.lastDelivery = { jobId: job.id, payload: delivery }
     const res = await this.env.api<{ error?: string }>('PATCH', `/api/jobs/${job.id}`, delivery, 'worker')
     step.reported = payload.status as Job['status']
     step.reportStatus = res.statusCode
@@ -417,6 +423,22 @@ export class WorkerSimulator {
     if (job.aiCliMode === 'implement') {
       const outcome = this.behaviors.implement(job, task)
       if (outcome.files) writeFiles(outcome.files)
+      if (outcome.kind === 'quarantine') {
+        // `quarantineRunningJob()` と同じ payload（containment / reconciliation が静止を証明できなかった）。
+        const message = `workspace could not be proven quiescent: ${outcome.reason}`
+        await this.report(running, {
+          status: 'blocked',
+          stderr: `${message} (workspace quarantined; ownership retained)`,
+          completedAt: new Date().toISOString(),
+          failureMetadata: {
+            kind: 'workspace_containment_failure',
+            workspaceState: 'unknown',
+            quarantined: true,
+            quarantineReason: message,
+          },
+        }, step)
+        return step
+      }
       const after = dirtyPaths()
       await this.report(running, outcome.kind === 'change'
         ? {
@@ -538,6 +560,8 @@ export interface MobileAdmission {
 
 export interface StartOptions {
   ledger?: string
+  /** file-backed DB にする（別 connection で lock を握るシナリオ用）。省略時は :memory:。 */
+  dbPath?: string
 }
 
 export class LifecycleEnv {
@@ -686,7 +710,7 @@ export class LifecycleEnv {
 /** 1 scenario 分の環境を作る（storage・worktree・route を毎回作り直す）。 */
 export async function startLifecycle(options: StartOptions = {}): Promise<LifecycleEnv> {
   initTargetRepo(options.ledger ?? buildLedger([]))
-  process.env.DB_PATH = ':memory:'
+  process.env.DB_PATH = options.dbPath ?? ':memory:'
   process.env.TARGET_ROOT = LIFECYCLE_TARGET_DIR
   process.env.ADMIN_TOKEN_SHA256 = sha256(ADMIN_TOKEN)
   process.env.WORKER_TOKEN_SHA256 = sha256(WORKER_TOKEN)
@@ -748,4 +772,11 @@ export function createRunningProject(env: LifecycleEnv, name = 'AIteamOS'): Proj
 
 export function removeTargetRepo(): void {
   rmSync(LIFECYCLE_TARGET_DIR, { recursive: true, force: true })
+}
+
+/** Worker の claim PATCH と同じ body（`confirmRunningTransition()`）。poll と claim の間の競合を作るときに使う。 */
+export function claimBody(job: Job): Record<string, unknown> {
+  const baseline = computeWorkspaceBaseline(job, LIFECYCLE_TARGET_DIR)
+  if (!baseline.ok) throw new Error(`baseline failed: ${baseline.reason}`)
+  return { status: 'running', startedAt: new Date().toISOString(), workspaceBaseline: baseline.baseline }
 }

@@ -263,3 +263,42 @@ describe('N2-low: LOW-risk diff routed to a human gate by review evidence', () =
     expect(env.worker.hasPendingOutbox()).toBe(false)
   })
 })
+
+describe('N3: continuation to an already-synced next Task (git_commit PATCH answers 503 while the continuation runs)', () => {
+  /**
+   * DEFECT D3（continuation 経路での決定的な発火）。
+   *
+   * Start:     running Project、Task A（採用済み）と、Roadmap 同期で既に存在する pending の Task B
+   *            （roadmapActive、依存なし。Roadmap generator の出力と同じ形を storage へ直接作る＝simulation）。
+   * Operation: Worker が A を implement → review → git_commit まで進める。
+   * Expected:  git_commit の結果 PATCH は continuation（B の Design Review → initial implement 作成）を待たずに
+   *            503 を返し、Worker は Outbox に残した同じ event を次の poll で再送して 200（deduplicated）を得る。
+   *            その後 B の initial-implement を claim して B も done になる。
+   * Actual:    再送は `workspaceEndFingerprint is write-once` の 409 になり（D3: write-once 検査が Outbox 重複判定より前）、
+   *            Worker の Outbox は永久に pending、`pollJobs()` は queued Job の取得を止めたまま B は実行されない。
+   */
+  it.fails('DEFECT D3 the Worker resends the 503-answered commit result, then runs the next Task', async () => {
+    env = await startLifecycle({ ledger: buildLedger([{ id: 'cont-a', title: 'First synced task' }]) })
+    const project = createRunningProject(env)
+    env.adoptionAllowedPaths = ['docs/cont']
+    const taskA = await env.adoptNext(project.id, 'cont-a')
+    const taskB = env.storage.tasks.create({
+      projectId: project.id, title: 'Second synced task', description: 'Write the second page.', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true, phase: 2, roadmapTaskKey: 'cont-b',
+      allowedPaths: ['docs/cont'], acceptanceCriteria: ['the page exists'],
+    } as Parameters<typeof env.storage.tasks.create>[0])
+
+    const first = await env.worker.runUntilIdle(6)
+    const commit = first.find((step) => step.kind === 'git_commit')!
+    expect(commit).toMatchObject({ reported: 'success', reportStatus: 503 })
+    expect(env.task(taskA.id).status).toBe('done')
+
+    // The Worker re-delivers the pending Outbox event and then continues with Task B.
+    expect(env.worker.hasPendingOutbox()).toBe(false)
+    const rest = await env.worker.runUntilIdle()
+    expect(rest.map((step) => [step.kind, step.reported])).toEqual([
+      ['implement', 'success'], ['review', 'success'], ['git_commit', 'success'],
+    ])
+    expect(env.task(taskB.id).status).toBe('done')
+  })
+})
