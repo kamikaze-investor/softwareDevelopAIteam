@@ -43,6 +43,7 @@ import {
 } from './runner.js'
 import {
   applyIndependentReviewOverride,
+  buildFocusedReviewPrompt,
   parseFocusedReviewResponse,
   runIndependentReview,
   runStrategicMetaReview,
@@ -986,6 +987,150 @@ describe('two-root control context resolution (control-plane vs target-project)'
     } finally {
       await rm(targetRoot, { recursive: true, force: true })
       await rm(controlRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('strategic_alignment の Decision Record 選択（2026-10-16 Context 膨張の修正）', () => {
+  const DECISIONS = 'docs/project_memory/decisions'
+
+  async function setup(records: Record<string, string>): Promise<{ targetRoot: string; controlRoot: string }> {
+    const roots = await createTwoRootSetup({ targetHasProjectMemory: true, controlHasConstitution: true, controlHasChecklists: true })
+    for (const [name, content] of Object.entries(records)) {
+      await writeDeep(roots.targetRoot, `${DECISIONS}/${name}`, content)
+    }
+    return roots
+  }
+
+  async function strategicPrompt(
+    roots: { targetRoot: string; controlRoot: string },
+    input: { subjectId?: string; taskTitle: string; changedFiles: string[] },
+  ): Promise<string> {
+    const { prompt } = await buildFocusedReviewPrompt({
+      subjectId: input.subjectId ?? 'b8d0fc5d-e4c1-40c3-bb21-c5e41adb039a',
+      taskTitle: input.taskTitle,
+      changedFiles: input.changedFiles,
+      gitDiff: 'design text',
+      workingDir: roots.targetRoot,
+      controlContextDir: roots.controlRoot,
+      materialKind: 'design',
+    }, 'strategic_alignment', [])
+    return prompt
+  }
+
+  async function cleanup(roots: { targetRoot: string; controlRoot: string }): Promise<void> {
+    await rm(roots.targetRoot, { recursive: true, force: true })
+    await rm(roots.controlRoot, { recursive: true, force: true })
+  }
+
+  it('共通のパス要素（memory / decisions）と task title の decision で全記録を本文ごと選ばない', async () => {
+    const roots = await setup({
+      '001_tech_stack.md': '# Tech stack\n\nBODY_TECH_STACK',
+      'mvp_completion.md': '# MVP completion\n\nBODY_MVP',
+      'vps-operations.md': '# VPS operations current truth\n\nBODY_VPS',
+    })
+    try {
+      const prompt = await strategicPrompt(roots, {
+        taskTitle: 'governance / spec / decision docs current truth sweep',
+        changedFiles: ['docs/project_memory/rules/development_rules.md'],
+      })
+      expect(prompt).toContain('BODY_VPS')
+      expect(prompt).not.toContain('BODY_TECH_STACK')
+      expect(prompt).not.toContain('BODY_MVP')
+      // 名前は title list に残る（存在は reviewer から見える）
+      expect(prompt).toContain(`- ${DECISIONS}/001_tech_stack.md: Tech stack`)
+      expect(prompt).toContain(`- ${DECISIONS}/mvp_completion.md: MVP completion`)
+    } finally {
+      await cleanup(roots)
+    }
+  })
+
+  it('数字だけの語（2026・001）と subjectId の UUID 断片では選ばない', async () => {
+    const roots = await setup({
+      'mvp_completion.md': '# MVP completion 2026-09-13\n\nBODY_DATED',
+      'b8d0fc5d_note.md': '# Unrelated note\n\nBODY_UUID',
+      '001_tech_stack.md': '# Tech stack\n\nBODY_NUMBERED',
+    })
+    try {
+      const prompt = await strategicPrompt(roots, {
+        taskTitle: 'Codex independent review degradation (2026-09-07)',
+        changedFiles: ['apps/worker/src/approvalLevel/reviewerAdapter.ts', 'tasks/001.md'],
+      })
+      expect(prompt).not.toContain('BODY_DATED')
+      expect(prompt).not.toContain('BODY_UUID')
+      expect(prompt).not.toContain('BODY_NUMBERED')
+    } finally {
+      await cleanup(roots)
+    }
+  })
+
+  it('ファイル名・title が関連する記録は従来どおり本文を載せる', async () => {
+    const roots = await setup({
+      'native_runtime_investigation_codex.md': '# Native runtime investigation\n\nBODY_BY_STEM',
+      'review_degradation_notes.md': '# Codex reviewer degradation\n\nBODY_BY_TITLE',
+      'mvp_completion.md': '# MVP completion\n\nBODY_UNRELATED',
+    })
+    try {
+      const prompt = await strategicPrompt(roots, {
+        taskTitle: 'Codex independent review degradation',
+        changedFiles: ['apps/worker/src/approvalLevel/reviewerAdapter.ts'],
+      })
+      expect(prompt).toContain('### Related decision bodies')
+      expect(prompt).toContain('BODY_BY_STEM')
+      expect(prompt).toContain('BODY_BY_TITLE')
+      expect(prompt).not.toContain('BODY_UNRELATED')
+    } finally {
+      await cleanup(roots)
+    }
+  })
+
+  it('変更中の Decision Record はキーワード上限を超えても全件・全文を別セクションに載せる', async () => {
+    // b8d0fc5d と同じ形: 26 件の Decision Record を変更（キーワードは 30 語で打ち切られる）
+    const changedNames = Array.from({ length: 26 }, (_, i) => `${String(i).padStart(3, '0')}_record_topic${i}_alpha${i}_beta${i}.md`)
+    const records: Record<string, string> = Object.fromEntries(
+      changedNames.map((name, i) => [name, `# Record ${i}\n\nCHANGED_BODY_${i}\n${'x'.repeat(5000)}`]),
+    )
+    records['accepted_unrelated.md'] = '# Accepted decision\n\nACCEPTED_BODY'
+    const roots = await setup(records)
+    try {
+      const prompt = await strategicPrompt(roots, {
+        taskTitle: 'governance / spec / decision docs current truth sweep',
+        changedFiles: changedNames.map((name) => `${DECISIONS}/${name}`),
+      })
+      const changedHeading = '### Decision records changed by this Task (current working-tree content, not yet accepted)'
+      expect(prompt).toContain(changedHeading)
+      for (let i = 0; i < 26; i += 1) {
+        expect(prompt).toContain(`CHANGED_BODY_${i}\n${'x'.repeat(5000)}`)
+      }
+      expect(prompt).not.toContain('ACCEPTED_BODY')
+      // 変更中の記録は「承認済みの過去 Decision」の節に混ぜない
+      const relatedIndex = prompt.indexOf('### Related decision bodies')
+      expect(relatedIndex).toBe(-1)
+    } finally {
+      await cleanup(roots)
+    }
+  })
+
+  it('Goal・Design Philosophy・Constitution・Decision Authority excerpt・title list は維持される', async () => {
+    const roots = await setup({
+      'vps-operations.md': '# VPS operations\n\nBODY_VPS',
+      'mvp_completion.md': '# MVP completion\n\nBODY_MVP',
+    })
+    await writeDeep(roots.controlRoot, 'specs/22_safety_approval_design_principle.md', '# 22\n\n## 1-2. Human Decision Authority\n\nDA_TEXT')
+    try {
+      const prompt = await strategicPrompt(roots, {
+        taskTitle: 'governance / spec / decision docs current truth sweep',
+        changedFiles: ['docs/project_memory/goal.md', `${DECISIONS}/vps-operations.md`],
+      })
+      expect(prompt).toContain('## docs/project_memory/goal.md')
+      expect(prompt).toContain('## docs/project_memory/design_philosophy.md')
+      expect(prompt).toContain('## specs/00_constitution.md')
+      expect(prompt).toContain('### Decision title list')
+      expect(prompt).toContain(`- ${DECISIONS}/mvp_completion.md: MVP completion`)
+      expect(prompt).toContain('BODY_VPS')
+      expect(prompt).toContain('Decision Authority')
+    } finally {
+      await cleanup(roots)
     }
   })
 })
