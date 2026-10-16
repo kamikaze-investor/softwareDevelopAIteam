@@ -706,11 +706,13 @@ export function buildSystemState(
   const alreadyNotified = (job: Job): boolean => quarantinedJobIds.has(job.id)
     || (job.approvalId !== undefined && waitingApprovalIds.has(job.approvalId))
 
-  let stalledOwnerEmitted = false
-  for (const { project, task, job, cause } of stalledOwners) {
+  // **単一所有者の原因は、所有者がちょうど1つのときだけ出す。** 2つ以上あるときに個別の原因
+  // （例: inactive_project）を出すと、その出口（paused を running へ戻す）を取っても所有者は
+  // 2つのまま claim は止まり続ける。複数のときは下の multiple_live_owners だけを出す（W5 独立レビュー指摘）。
+  const singleOwner = allOwners.length === 1
+  for (const { project, task, job, cause } of singleOwner ? stalledOwners : []) {
     if (![...runningQueuedTaskIds].some((taskId) => taskId !== task.id)) continue
     if (alreadyNotified(job)) continue
-    stalledOwnerEmitted = true
     attention.push({
       kind: 'workspace_held_by_stalled_owner',
       projectId: project.id,
@@ -724,14 +726,13 @@ export function buildSystemState(
     })
   }
 
-  // **所有者が2つ以上**（どちらも単独では「進まない所有者」ではない、例: running Project の2 Task が
-  // それぞれ非 initial-implement の queued Job を持つ）。Worker は ambiguous で claim せず、API の
-  // claim guard も互いを所有者として拒否するので、誰も進めないまま止まる。個別の原因で既に
-  // 知らせた場合はそれが出口を示すので重ねない。referenceId は所有者集合の安定キーで、
-  // 同じ incident は1回だけ escalate される（集合が変われば別 incident）。
+  // **所有者が2つ以上**（例: running Project の2 Task がそれぞれ非 initial-implement の queued Job を
+  // 持つ、または paused Project の所有者と running Project の所有者が並ぶ）。Worker は ambiguous で
+  // claim せず、API の claim guard も互いを所有者として拒否するので、誰も進めないまま止まる。
+  // いずれかの所有者に quarantine / 承認待ちの attention があれば、そちらが CEO へ届くので重ねない。
+  // referenceId は所有者集合の安定キーで、同じ incident は1回だけ escalate される（集合が変われば別 incident）。
   if (
-    !stalledOwnerEmitted
-    && allOwners.length > 1
+    allOwners.length > 1
     && runningQueuedTaskIds.size > 0
     && !allOwners.some((owner) => alreadyNotified(owner.job))
   ) {

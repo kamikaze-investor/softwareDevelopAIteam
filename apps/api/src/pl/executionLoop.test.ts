@@ -1450,6 +1450,29 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       })
     })
 
+    it("a paused-Project owner + a running-Project non-initial queued owner: exactly one attention, cause=multiple_live_owners", () => {
+      const { storage } = seedHeldWorkspace('blocked')
+      const runningProject = storage.projects.findAll().find((project) => project.status === 'running')!
+      const [runningTask] = storage.tasks.findByProjectId(runningProject.id)
+      for (const job of storage.jobs.findByTaskId(runningTask!.id)) storage.jobs.update(job.id, { status: 'success' })
+      storage.jobs.create({
+        taskId: runningTask!.id,
+        projectId: runningProject.id,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `resume:prior-${runningTask!.id}:1`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      const held = buildSystemState(storage, { now: () => NOW }).attention
+        .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
+
+      expect(held).toHaveLength(1)
+      expect(held[0]!.detail).toMatch(/^cause=multiple_live_owners: /)
+      expect(held[0]!.detail).not.toContain('cause=inactive_project')
+    })
+
     it('runPlTick escalates it to the CEO exactly once, without diagnosis', async () => {
       const { storage, ownerJobId } = seedHeldWorkspace('queued')
       let diagnosed = 0
