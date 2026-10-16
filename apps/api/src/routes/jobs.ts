@@ -325,6 +325,13 @@ const KnownGoodFactsSchema = z.object({
   blindSpotsAbsent: z.boolean(),
 })
 
+/** 報告が名指す technical cleanup generation（carrier の marker 3つ）。 */
+const CleanupGenerationSchema = z.object({
+  abortCleanupRequestedAt: z.string().min(1),
+  abortTechnicalEvidenceId: z.string().min(1),
+  abortTechnicalStateFingerprint: z.string().min(1),
+}).strict()
+
 // abort cleanup も quarantine 解除と**同じ材料**を同じ厳密さで要求する。
 // 所有権の解放は quarantine 解除より重く、緩い検証で通してよい理由がない。
 const AbortCleanupResultBody = z.union([
@@ -339,14 +346,13 @@ const AbortCleanupResultBody = z.union([
     }).strict().optional(),
     // technical cleanup の報告で必須（無ければ completeAbortCleanup が GENERATION_MISMATCH で拒否する）。
     // manual cleanup では送らない。
-    cleanupGeneration: z.object({
-      abortCleanupRequestedAt: z.string().min(1),
-      abortTechnicalEvidenceId: z.string().min(1),
-      abortTechnicalStateFingerprint: z.string().min(1),
-    }).strict().optional(),
+    cleanupGeneration: CleanupGenerationSchema.optional(),
   }).strict(),
   z.object({
     refusalCode: z.enum(TECHNICAL_ABORT_WORKER_REFUSAL_CODES),
+    // technical cleanup の拒否でも必須（無ければ GENERATION_MISMATCH）: 遅れて届いた古い generation の拒否が
+    // 新しい generation を退役・quarantine させないため。
+    cleanupGeneration: CleanupGenerationSchema.optional(),
   }).strict(),
 ])
 
@@ -624,6 +630,9 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       ...('refusalCode' in parsed.data
         ? {
             refusalCode: parsed.data.refusalCode,
+            ...(parsed.data.cleanupGeneration !== undefined
+              ? { cleanupGeneration: parsed.data.cleanupGeneration }
+              : {}),
             knownGood: {
               gitOperationMarkers: [],
               worktreeClean: false,

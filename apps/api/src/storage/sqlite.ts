@@ -3794,6 +3794,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
       }
     },
+    retireTechnicalAbortCleanupForGeneration(input) {
+      const retire = db.transaction((): boolean => {
+        const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(input.jobId) as Record<string, unknown> | undefined
+        if (!row) return false
+        const carrier = deserializeJob(row)
+        if (!technicalCleanupGenerationMatches(carrier.failureMetadata, input.generation)) return false
+        const failureMetadata = { ...(carrier.failureMetadata ?? {}) }
+        delete failureMetadata.abortCleanupRequestedAt
+        delete failureMetadata.abortTechnicalEvidenceId
+        delete failureMetadata.abortTechnicalStateFingerprint
+        delete failureMetadata.abortTechnicalRootCauseClass
+        delete failureMetadata.abortTechnicalAttentionKind
+        delete failureMetadata.abortReason
+        jobs.update(carrier.id, {
+          failureMetadata: { ...failureMetadata, quarantined: true, quarantineReason: input.quarantineReason },
+        })
+        return true
+      })
+      return retire.immediate()
+    },
     clearWorkspaceQuarantine(input) {
       const clearTransaction = db.transaction((
         jobId: string,

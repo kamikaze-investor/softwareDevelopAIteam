@@ -1231,8 +1231,12 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
   let reported = false
   try {
     reported = await reportAbortCleanupObservationsOnce(seen)
-  } finally {
+    // sweep は列挙が例外なく終わったときだけ（例外で途切れた列挙は authoritative とみなさず保留を残す）。
     sweepPendingAbortCleanupSubmissions(seen)
+  } catch (err: unknown) {
+    // fetchJson() は通信失敗や JSON 破損で throw する。ここで poll を抜けると独立再送に届かず、上限も
+    // 進まず intake が黙って止まり続ける（Codex review 57f2cf6）。列挙の失敗として扱い、再送は続ける。
+    console.warn(`[Worker] abort cleanup の列挙に失敗しました（保留は残します）: ${formatUnknownError(err)}`)
   }
   if (reported) return true
   return resubmitUnhandledPendingAbortCleanups(seen.handledPending)
@@ -1332,7 +1336,7 @@ async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration)
           || baseline === undefined
           || !workspaceObservationMatchesBaseline(baseline, observed.observation)
         ) {
-          await reportAbortCleanupRefusal(requested.id, 'PRE_CLEANUP_BASELINE_MISMATCH')
+          await reportAbortCleanupRefusal(requested, 'PRE_CLEANUP_BASELINE_MISMATCH')
           continue
         }
         if (baseline.mode === 'dirty') {
@@ -1351,11 +1355,11 @@ async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration)
               [],
             )
           } catch {
-            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_EXECUTION_FAILED')
+            await reportAbortCleanupRefusal(requested, 'CLEANUP_EXECUTION_FAILED')
             continue
           }
           if (cleanupWarning !== undefined) {
-            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_INCOMPLETE')
+            await reportAbortCleanupRefusal(requested, 'CLEANUP_INCOMPLETE')
             continue
           }
         } else {
@@ -1373,7 +1377,7 @@ async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration)
           || !afterCleanup.knownGood.headValid
           || !afterCleanup.knownGood.blindSpotsAbsent
         ) {
-          await reportAbortCleanupRefusal(requested.id, 'POST_CLEANUP_NOT_CLEAN_AT_HEAD')
+          await reportAbortCleanupRefusal(requested, 'POST_CLEANUP_NOT_CLEAN_AT_HEAD')
           continue
         }
         finalObservation = afterCleanup.observation
@@ -1393,11 +1397,7 @@ async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration)
               cleanupSummary,
               // この証拠がどの cleanup generation のものか。API は carrier の現在の marker と一致しない
               // 報告（取り消し後に新しい generation が出た後の古い証拠の再送）を GENERATION_MISMATCH で拒否する。
-              cleanupGeneration: {
-                abortCleanupRequestedAt: requested.failureMetadata?.abortCleanupRequestedAt,
-                abortTechnicalEvidenceId: technicalEvidenceId,
-                abortTechnicalStateFingerprint: requested.failureMetadata?.abortTechnicalStateFingerprint,
-              },
+              cleanupGeneration: technicalCleanupGenerationOf(requested),
             }
           : {}),
       })
@@ -1435,15 +1435,30 @@ type AbortCleanupRefusalCode =
   | 'CLEANUP_INCOMPLETE'
   | 'POST_CLEANUP_NOT_CLEAN_AT_HEAD'
 
+/** carrier の現在の technical cleanup generation（報告・拒否がどの generation のものかを名指す）。 */
+function technicalCleanupGenerationOf(job: Job): {
+  abortCleanupRequestedAt: string | undefined
+  abortTechnicalEvidenceId: string | undefined
+  abortTechnicalStateFingerprint: string | undefined
+} {
+  return {
+    abortCleanupRequestedAt: job.failureMetadata?.abortCleanupRequestedAt,
+    abortTechnicalEvidenceId: job.failureMetadata?.abortTechnicalEvidenceId,
+    abortTechnicalStateFingerprint: job.failureMetadata?.abortTechnicalStateFingerprint,
+  }
+}
+
 async function reportAbortCleanupRefusal(
-  jobId: string,
+  carrier: Job,
   refusalCode: AbortCleanupRefusalCode,
 ): Promise<void> {
   try {
-    await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/abort-cleanup-result`, {
+    await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(carrier.id)}/abort-cleanup-result`, {
       method: 'POST',
       headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refusalCode }),
+      // 拒否もどの generation のものかを名指す。API は carrier の現在の marker と一致しない（遅れて届いた
+      // 古い generation の）拒否を GENERATION_MISMATCH で捨て、新しい generation を退役させない。
+      body: JSON.stringify({ refusalCode, cleanupGeneration: technicalCleanupGenerationOf(carrier) }),
     })
   } catch (err: unknown) {
     // refusal の delivery 失敗は黙らせない。request marker は残るので次 poll でも再試行される。

@@ -613,6 +613,8 @@ describe('pending Technical Abort cleanup delivery gates intake and is swept whe
     carrierJobs: Job[]
     extraTasks: Task[]
     extraJobs: Record<string, Job[]>
+    /** discovery の fetch を reject（throw）させる対象。 */
+    throwOn?: 'projects' | 'tasks' | 'jobs'
     cleanupResponses: Array<() => Response>
     onAccepted?: (state: ApiState) => void
   }
@@ -624,6 +626,9 @@ describe('pending Technical Abort cleanup delivery gates intake and is swept whe
     let reports = 0
     fetchMock.mockImplementation(async (url: string | URL | Request, init?: RequestInit) => {
       const value = String(url)
+      if (state.throwOn === 'projects' && value.endsWith('/api/projects')) throw new TypeError('fetch failed')
+      if (state.throwOn === 'tasks' && value.includes('/api/tasks?projectId=')) throw new TypeError('fetch failed')
+      if (state.throwOn === 'jobs' && value.includes('/api/jobs?taskId=')) throw new TypeError('fetch failed')
       if (value.endsWith('/api/projects')) {
         if (state.projectsFail) return new Response(null, { status: 503 })
         return new Response(JSON.stringify([{ ...project, status: state.projectStatus }]), { status: 200 })
@@ -768,6 +773,58 @@ describe('pending Technical Abort cleanup delivery gates intake and is swept whe
       .filter(([url]) => String(url).includes('/abort-cleanup-result'))
       .map(([, init]) => String(init?.body)))
     expect(bodies.size).toBe(1)
+  })
+
+  // Codex review 57f2cf6: fetchJson() は reject で throw する。列挙が throw しても保留は残り、毎 poll 独立に再送され、
+  // 上限で通知付きで解ける（poll ごと外側の catch へ抜けて黙って止まらない）。
+  it.each(['projects', 'tasks', 'jobs'] as const)(
+    'with discovery throwing at /api/%s every poll, the pending report is still resent and released at the bound',
+    async (throwOn) => {
+      const state: ApiState = {
+        projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+        extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+      }
+      stubApi(state)
+      await reportAbortCleanupObservations()
+      expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+      const cleanupPosts = (): number => fetchMock.mock.calls
+        .filter(([url]) => String(url).includes('/abort-cleanup-result')).length
+
+      state.throwOn = throwOn
+      // throw した列挙は authoritative ではない: sweep で消さず、再送は続ける。
+      await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+      expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+      expect(cleanupPosts()).toBe(2)
+
+      let polls = 0
+      while (hasPendingAbortCleanupSubmissions() && polls < 50) {
+        await reportAbortCleanupObservations()
+        polls += 1
+      }
+      expect(hasPendingAbortCleanupSubmissions()).toBe(false)
+      expect(cleanupPosts()).toBe(20)
+      expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  it('a technical refusal report names the carrier generation', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: false })
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [() => new Response(null, { status: 409 })],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+
+    const refusal = fetchMock.mock.calls.find(([url]) => String(url).includes('/abort-cleanup-result'))
+    expect(JSON.parse(String(refusal?.[1]?.body))).toEqual({
+      refusalCode: 'PRE_CLEANUP_BASELINE_MISMATCH',
+      cleanupGeneration: {
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+        abortTechnicalStateFingerprint: 'fp-1',
+      },
+    })
   })
 
   it('with discovery failing, an accepted resubmission clears the entry and releases the gate', async () => {

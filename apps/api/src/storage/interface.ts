@@ -598,6 +598,16 @@ export interface IJobStorage {
     cleanupSummary?: TechnicalAbortCleanupSummary
     cleanupGeneration?: TechnicalAbortCleanupGeneration
   }): ReleaseBlockedJobAndParkTaskResult
+  /**
+   * Technical Abort cleanup の generation を、報告が名指す generation と carrier の現在の marker が
+   * 一致するときだけ退役させる（marker を消して quarantine する）。一致確認と書き込みは単一 transaction。
+   * 一致しなければ何も変えず false（遅れて届いた古い generation の拒否が新しい generation を壊さない）。
+   */
+  retireTechnicalAbortCleanupForGeneration(input: {
+    jobId: string
+    generation: TechnicalAbortCleanupGeneration
+    quarantineReason: string
+  }): boolean
   clearWorkspaceQuarantine(input: {
     jobId: string
     /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */

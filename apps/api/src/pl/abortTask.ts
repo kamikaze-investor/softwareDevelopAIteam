@@ -520,15 +520,27 @@ export function completeAbortCleanup(
       reason: `job ${input.jobId}'s abort cleanup request has no verifiable authorization`,
     }
   }
+  // 古い generation の報告（取り消し後に同じ carrier へ新しい technical request が出た後の再送や、
+  // 遅れて届いた拒否）は現在の generation のものとして扱わない。cleanup の失敗ではないので
+  // quarantine も refusal 記録もせず、現在の generation はそのまま残す。結果の報告だけでなく
+  // Worker の拒否（refusalCode）も対象: 古い拒否が新しい generation を退役・quarantine させない
+  // （Codex review 57f2cf6）。退役させる書き込み自体も storage で同じ一致を atomic に再確認する。
+  if (
+    authorization.kind === 'technical_evidence'
+    && !technicalCleanupGenerationMatches(metadata, input.cleanupGeneration)
+  ) {
+    return generationMismatch(input.jobId)
+  }
   if (input.refusalCode !== undefined) {
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, input.refusalCode)
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: input.refusalCode,
         stage: 'worker_cleanup',
       })
-      retireTechnicalAbortCleanup(storage, job, input.refusalCode)
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, input.refusalCode)
     }
@@ -536,31 +548,18 @@ export function completeAbortCleanup(
   }
   if (input.observation === undefined) {
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, 'FINAL_OBSERVATION_MISSING')
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: 'FINAL_OBSERVATION_MISSING',
         stage: 'worker_cleanup',
       })
-      retireTechnicalAbortCleanup(storage, job, 'FINAL_OBSERVATION_MISSING')
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, 'FINAL_OBSERVATION_MISSING')
     }
     return { ok: false, code: 'VERIFICATION_FAILED', reason: 'final workspace observation is missing' }
-  }
-
-  // 古い generation の証拠（取り消し後に同じ carrier へ新しい technical request が出た後の再送など）は
-  // 現在の generation として受理しない。cleanup の失敗ではないので quarantine も refusal 記録もせず、
-  // 現在の generation はそのまま残す。storage の transaction でも同じ一致を再確認する。
-  if (
-    authorization.kind === 'technical_evidence'
-    && !technicalCleanupGenerationMatches(metadata, input.cleanupGeneration)
-  ) {
-    return {
-      ok: false,
-      code: 'GENERATION_MISMATCH',
-      reason: `job ${input.jobId}'s report names a different technical cleanup generation`,
-    }
   }
 
   // taskId は Job から導くが、**承認がその Task に束縛されているか**は
@@ -610,13 +609,14 @@ export function completeAbortCleanup(
       return { ok: false, code: released.code, reason: released.reason }
     }
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, released.code)
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: released.code,
         stage: 'final_transaction',
       })
-      retireTechnicalAbortCleanup(storage, job, released.code)
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, released.code)
     }
@@ -628,6 +628,32 @@ export function completeAbortCleanup(
   }
 
   return { ok: true, taskId: job.taskId, jobId: job.id }
+}
+
+function generationMismatch(jobId: string): CompleteAbortCleanupResult {
+  return {
+    ok: false,
+    code: 'GENERATION_MISMATCH',
+    reason: `job ${jobId}'s report names a different technical cleanup generation`,
+  }
+}
+
+/**
+ * completeAbortCleanup() の退役（marker 削除 + quarantine）。報告の generation が carrier の現在の
+ * marker と一致するときだけ、storage の単一 transaction で書く。一致しなければ false（何も変えない）。
+ */
+function retireTechnicalAbortCleanupForGeneration(
+  storage: IStorage,
+  job: Job,
+  generation: TechnicalAbortCleanupGeneration | undefined,
+  refusalCode: string,
+): boolean {
+  if (generation === undefined) return false
+  return storage.jobs.retireTechnicalAbortCleanupForGeneration({
+    jobId: job.id,
+    generation,
+    quarantineReason: `technical abort cleanup refused (${refusalCode})`,
+  })
 }
 
 function retireTechnicalAbortCleanup(storage: IStorage, job: Job, refusalCode: string): void {

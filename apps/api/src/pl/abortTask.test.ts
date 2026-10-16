@@ -1524,6 +1524,65 @@ describe('P2-2 Automatic Technical Abort', () => {
     expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
   })
 
+  // Codex review 57f2cf6: 遅れて届いた generation 1 の Worker 拒否が generation 2 を退役・quarantine させない。
+  it('a delayed refusal of generation 1 after generation 2 was requested is GENERATION_MISMATCH; a matching refusal retires', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const oldGeneration = currentCleanupGeneration(fx.storage, fx.latestJobId)
+    const late = lateRequest(fx, 'WAITING_FOR_USER')
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    fx.storage.approvalRequests.updateStatus(late, 'REJECTED')
+    requestTechnical(fx)
+    const metadataGen2 = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    const refusalsBefore = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'technical_abort_refused').length
+
+    for (const cleanupGeneration of [oldGeneration, undefined]) {
+      expect(completeAbortCleanup(fx.storage, {
+        jobId: fx.latestJobId,
+        knownGood: KNOWN_GOOD,
+        refusalCode: 'CLEANUP_EXECUTION_FAILED',
+        ...(cleanupGeneration !== undefined ? { cleanupGeneration } : {}),
+      })).toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    }
+    // generation 2 はそのまま、quarantine も refusal 記録も無い。
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual(metadataGen2)
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'technical_abort_refused').length).toBe(refusalsBefore)
+
+    // 現在の generation を名指す拒否は従来どおり退役・quarantine する。
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId,
+      knownGood: KNOWN_GOOD,
+      refusalCode: 'CLEANUP_EXECUTION_FAILED',
+      cleanupGeneration: currentCleanupGeneration(fx.storage, fx.latestJobId),
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    const retired = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    expect(retired).toMatchObject({
+      quarantined: true,
+      quarantineReason: 'technical abort cleanup refused (CLEANUP_EXECUTION_FAILED)',
+    })
+    expect(retired?.abortCleanupRequestedAt).toBeUndefined()
+  })
+
+  it('the storage retire write re-checks the generation atomically', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const before = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    const current = currentCleanupGeneration(fx.storage, fx.latestJobId)
+
+    expect(fx.storage.jobs.retireTechnicalAbortCleanupForGeneration({
+      jobId: fx.latestJobId,
+      generation: { ...current, abortTechnicalEvidenceId: 'evidence-other' },
+      quarantineReason: 'r',
+    })).toBe(false)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual(before)
+    expect(fx.storage.jobs.retireTechnicalAbortCleanupForGeneration({
+      jobId: fx.latestJobId, generation: current, quarantineReason: 'r',
+    })).toBe(true)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toMatchObject({ quarantined: true })
+  })
+
   it('the storage final transaction re-checks the generation (GENERATION_MISMATCH, no change)', () => {
     const fx = seedTechnicalAbort()
     requestTechnical(fx)
