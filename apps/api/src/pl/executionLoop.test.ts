@@ -3527,8 +3527,11 @@ describe('approved-run blocked cause comes from the evidence the Worker sent', (
   it('guards passed (gate-step refusal) is the only evidence that triage rule 6.9 escalates', () => {
     const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
     const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    // D2: after the fix this is worker/api skew or an unexpected consume refusal, not an authority boundary.
+    // The escalation lane stays visible; no authority change is requested; the existing resume is the exit.
     expect(triageBlocked(fx.storage, item)).toMatchObject({
-      rootCauseClass: 'safety_or_authority_boundary', recommendedLane: 'ceo_escalation',
+      rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation',
+      requiresAuthorityChange: false, existingRecoveryAvailable: true,
     })
   })
 })

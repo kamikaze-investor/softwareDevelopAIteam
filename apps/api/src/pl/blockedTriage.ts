@@ -942,10 +942,14 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
   // ── 6.9 承認済みなのに Worker が実行を拒んだ git_commit ─────────────────────
   //
-  // linked Approval は APPROVED（未 consume）で、Gate は ALLOW + call_consume を返したが、Worker 側の
-  // gate policy（AI 編集禁止の Control 領域）が実行を拒んで blocked を報告した。下の 7 へ落とすと
-  // auto_recovery → PL resume → 新しい承認 → CEO 承認 → また Worker が拒否、の無限往復になる。
-  // AI が解ける停止ではない（policy の変更は CEO の判断）ので、CEO に一度だけ見せて止める。
+  // linked Approval は APPROVED（未 consume）で、Gate は ALLOW + call_consume を返したが、Worker が
+  // Gate 段階で実行しなかった（両 Guard は通過）。下の 7 へ落とすと auto_recovery → PL resume →
+  // 新しい承認 → CEO 承認 → また同じ停止、の無限往復になりうるので、CEO に一度だけ見せて止める。
+  // **D2（2026-10-17）以後、これは Authority の境界ではない。** Worker は API の continuationPolicy を
+  // そのまま写すので、承認済み ALLOW + call_consume を Worker が拒むのは、Worker / API の rule の版ずれ
+  // （resolvePolicy の "risk inconsistency"）か consume の想定外の拒否だけである。原因は Worker が
+  // stderr にしか載せないので機械的には特定せず unknown とし、Authority の変更も要求しない。
+  // 版が揃えば既存の resume が出口になる（existingRecoveryAvailable）。
   // **Worker が送った証拠（guardResult / quarantine）が Gate 段階の拒否を示すときだけ**（Codex round 2）。
   // Permission 拒否・File Change Guard・quarantine は既存の rule（1〜3・7）がそれぞれ扱う。保存側
   // （`jobs.update` の停止理由）と同じ `classifyApprovedRunBlock()` で判定する。
@@ -957,7 +961,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   ) {
     return {
       ...result,
-      rootCauseClass: 'safety_or_authority_boundary',
+      rootCauseClass: 'unknown',
       blockingLayer: 'approval',
       evidence: [
         { fact: 'approval_request.status (linked, unconsumed)', id: facts.approvedLinkedGitCommitId, value: 'APPROVED' },
@@ -966,13 +970,14 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       ],
       recoverable: false,
       existingRecoveryAvailable: true,
-      requiresAuthorityChange: true,
+      requiresAuthorityChange: false,
       confidence: 'high',
       recommendedLane: 'ceo_escalation',
       summary:
-        'CEO が承認し Gate も許可した git_commit を、Worker 側の gate policy が実行しなかった'
-        + '（承認は APPROVED のまま未使用）。自動 resume しても同じ拒否を繰り返すだけで、'
-        + 'Worker の policy は AI が変更できない。CEO の判断が必要。',
+        'CEO が承認し Gate も許可した git_commit を、Worker が Gate 段階で実行しなかった'
+        + '（承認は APPROVED のまま未使用）。Worker / API の rule の版ずれ（risk inconsistency）か'
+        + ' consume の想定外の拒否で、Authority の境界ではない。版を揃えた後に既存の resume で再開できる。'
+        + '自動 resume は同じ停止を繰り返しうるので CEO に一度だけ見せる。',
     }
   }
 
