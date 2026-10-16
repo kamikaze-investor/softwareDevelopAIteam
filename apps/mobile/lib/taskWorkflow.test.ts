@@ -4,6 +4,7 @@ import type {
   QAResult,
   ReviewResult,
   Task,
+  TaskDetail,
   TaskSummary,
   WatchdogEvent,
 } from '@ai-team/shared'
@@ -15,6 +16,7 @@ import {
   blockerNeedsHumanDecision,
   visibleTaskActions,
   allowsRoutineRecoveryActions,
+  canShowRecoverUI,
   canShowResumeUI,
   deriveJobDisplayState,
   deriveProjectExecutionHealth,
@@ -117,43 +119,166 @@ describe('manualWorkflowIsLocked', () => {
   })
 })
 
-describe('canShowResumeUI', () => {
-  it('shows resume UI when the latest Job is directly blocked (guard violation)', () => {
-    const task = makeTask({ status: 'in_progress' })
-    const jobs = [makeJob({ id: 'job-1', status: 'blocked' })]
-    expect(canShowResumeUI(task, jobs, [])).toBe(true)
+describe('canShowResumeUI（共有 evaluateResumeAdmission と同じ判定）', () => {
+  const NOW = Date.parse('2026-08-01T00:30:00.000Z')
+  const detail = (over: Partial<TaskDetail> = {}): TaskDetail => ({
+    ...makeTask({ status: 'blocked' }),
+    parked: false,
+    projectStatus: 'running',
+    ...over,
+  })
+  const blockedImplement = (over: Partial<Job> = {}): Job =>
+    makeJob({ aiCliMode: 'implement', aiCliProvider: 'codex', id: 'job-2', status: 'blocked', createdAt: '2026-08-01T00:10:00.000Z', ...over })
+  const approval = (over: Partial<ApprovalRequest>): ApprovalRequest => ({
+    createdAt: '2026-08-01T00:00:00.000Z',
+    invalidIf: [],
+    changedFiles: [],
+    expiresAt: '2026-08-01T01:00:00.000Z',
+    id: 'approval-1',
+    requestedAction: 'git_commit',
+    riskLevel: 'HIGH',
+    status: 'WAITING_FOR_USER',
+    targetBranch: 'main',
+    targetCommit: 'abc123',
+    targetDiffHash: 'hash',
+    taskId: 'task-1',
+    ...over,
   })
 
-  it('shows resume UI when Design Review escalation left Task blocked with a failed latest Job', () => {
-    const task = makeTask({ status: 'blocked' })
-    const jobs = [makeJob({ id: 'job-1', status: 'failed' })]
-    expect(canShowResumeUI(task, jobs, [])).toBe(true)
+  it('最新 Job が直接 blocked なら出す（Guard 違反）', () => {
+    expect(canShowResumeUI(detail({ status: 'in_progress' }), [blockedImplement()], [], NOW)).toBe(true)
   })
 
-  it('does not show resume UI when Task is not blocked and latest Job merely failed', () => {
-    const task = makeTask({ status: 'in_progress' })
-    const jobs = [makeJob({ id: 'job-1', status: 'failed' })]
-    expect(canShowResumeUI(task, jobs, [])).toBe(false)
+  it('Design Review escalation（Task blocked・最新 Job failed）でも出す', () => {
+    expect(canShowResumeUI(detail(), [blockedImplement({ status: 'failed' })], [], NOW)).toBe(true)
   })
 
-  it('does not show resume UI while a linked approval is still waiting for the user', () => {
-    const task = makeTask({ status: 'blocked' })
-    const jobs = [makeJob({ id: 'job-1', approvalId: 'approval-1', status: 'blocked' })]
-    const approvalRequests: ApprovalRequest[] = [
-      {
-        changedFiles: [],
-        expiresAt: '2026-08-01T01:00:00.000Z',
-        id: 'approval-1',
-        requestedAction: 'git_commit',
-        riskLevel: 'HIGH',
-        status: 'WAITING_FOR_USER',
-        targetBranch: 'main',
-        targetCommit: 'abc123',
-        targetDiffHash: 'hash',
-        taskId: 'task-1',
-      },
-    ]
-    expect(canShowResumeUI(task, jobs, approvalRequests)).toBe(false)
+  it('blocked な git_commit Job は aiCliMode が無くても出す', () => {
+    const commit = makeJob({ id: 'commit-1', status: 'blocked', safeCommand: { kind: 'git_commit' } as Job['safeCommand'] })
+    expect(canShowResumeUI(detail(), [commit], [], NOW)).toBe(true)
+  })
+
+  it('Task が blocked でなく最新 Job が failed なだけなら出さない', () => {
+    expect(canShowResumeUI(detail({ status: 'in_progress' }), [blockedImplement({ status: 'failed' })], [], NOW)).toBe(false)
+  })
+
+  it('park された Task には出さない', () => {
+    expect(canShowResumeUI(detail({ parked: true }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it('quarantine が古い Job にあるだけでも出さない（API は Task の全 Job を見る）', () => {
+    const olderQuarantined = makeJob({
+      aiCliMode: 'implement',
+      createdAt: '2026-08-01T00:00:00.000Z',
+      failureMetadata: { quarantined: true } as Job['failureMetadata'],
+      id: 'job-1',
+      status: 'blocked',
+    })
+    expect(canShowResumeUI(detail(), [blockedImplement(), olderQuarantined], [], NOW)).toBe(false)
+  })
+
+  it('最新 Job に紐付かない別の live な承認待ちがあっても出さない', () => {
+    const unlinked = approval({ id: 'approval-other' })
+    expect(canShowResumeUI(detail(), [blockedImplement()], [unlinked], NOW)).toBe(false)
+  })
+
+  it('紐付いた承認待ちが live なら出さない', () => {
+    const job = blockedImplement({ approvalId: 'approval-1' })
+    expect(canShowResumeUI(detail(), [job], [approval({})], NOW)).toBe(false)
+  })
+
+  it('紐付いた WAITING が期限切れなら出す（API は受け付ける）', () => {
+    const job = blockedImplement({ approvalId: 'approval-1' })
+    const expired = approval({ expiresAt: '2026-08-01T00:00:00.000Z' })
+    expect(canShowResumeUI(detail(), [job], [expired], NOW)).toBe(true)
+  })
+
+  it('done の Task には出さない', () => {
+    expect(canShowResumeUI(detail({ status: 'done' }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it.each(['paused', 'draft', 'archived'] as const)('Project が %s なら出さない', (projectStatus) => {
+    expect(canShowResumeUI(detail({ projectStatus }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it('Project が見つからない（null）なら出さない', () => {
+    expect(canShowResumeUI(detail({ projectStatus: null }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it('live な Job（queued / running）が残っていれば出さない', () => {
+    const queuedOlder = makeJob({ id: 'job-0', status: 'queued', createdAt: '2026-08-01T00:00:00.000Z' })
+    expect(canShowResumeUI(detail(), [blockedImplement(), queuedOlder], [], NOW)).toBe(false)
+  })
+
+  it('最新は createdAt で決める（startedAt の新しい古い Job を最新と見なさない）', () => {
+    const olderButLateStart = makeJob({
+      id: 'job-0', status: 'success', createdAt: '2026-08-01T00:00:00.000Z', startedAt: '2026-08-01T00:20:00.000Z',
+    })
+    expect(canShowResumeUI(detail(), [olderButLateStart, blockedImplement()], [], NOW)).toBe(true)
+  })
+
+  it('aiCliMode の無い非 git_commit Job は出さない（API は AI_CLI_MODE_MISSING）', () => {
+    expect(canShowResumeUI(detail(), [blockedImplement({ aiCliMode: undefined })], [], NOW)).toBe(false)
+  })
+
+  it('aiCliProvider の無い非 git_commit Job は出さない（API は AI_CLI_PROVIDER_MISSING）', () => {
+    expect(canShowResumeUI(detail(), [blockedImplement({ aiCliProvider: undefined })], [], NOW)).toBe(false)
+  })
+
+  it('parked / projectStatus を返さない古い API の Task には出さない（判定できない）', () => {
+    expect(canShowResumeUI(makeTask({ status: 'blocked' }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+})
+
+describe('canShowRecoverUI（共有 evaluateRecoverAdmission と同じ判定）', () => {
+  const NOW = Date.parse('2026-08-01T00:30:00.000Z')
+  const detail = (over: Partial<TaskDetail> = {}): TaskDetail => ({
+    ...makeTask({ status: 'blocked' }),
+    parked: false,
+    projectStatus: 'running',
+    ...over,
+  })
+  const waiting = (expiresAt: string): ApprovalRequest => ({
+    createdAt: '2026-08-01T00:00:00.000Z',
+    invalidIf: [],
+    changedFiles: [],
+    expiresAt,
+    id: 'approval-1',
+    requestedAction: 'roadmap_adoption',
+    riskLevel: 'HIGH',
+    status: 'WAITING_FOR_USER',
+    targetBranch: 'main',
+    targetCommit: 'abc123',
+    targetDiffHash: 'hash',
+    taskId: 'task-1',
+  })
+
+  it('Job 0 件の blocked Task（running Project）には出す', () => {
+    expect(canShowRecoverUI(detail(), [], [], NOW)).toBe(true)
+  })
+
+  it('Job があれば出さない（resume の担当）', () => {
+    expect(canShowRecoverUI(detail(), [makeJob({ status: 'blocked' })], [], NOW)).toBe(false)
+  })
+
+  it.each([
+    [{ status: 'pending' }],
+    [{ status: 'done' }],
+    [{ parked: true }],
+    [{ projectStatus: 'paused' }],
+    [{ projectStatus: 'archived' }],
+    [{ projectStatus: null }],
+  ] as const)('%o なら出さない', (over) => {
+    expect(canShowRecoverUI(detail(over as Partial<TaskDetail>), [], [], NOW)).toBe(false)
+  })
+
+  it('live な承認待ちがあれば出さず、期限切れの WAITING なら出す', () => {
+    expect(canShowRecoverUI(detail(), [], [waiting('2026-08-01T01:00:00.000Z')], NOW)).toBe(false)
+    expect(canShowRecoverUI(detail(), [], [waiting('2026-08-01T00:00:00.000Z')], NOW)).toBe(true)
+  })
+
+  it('parked を返さない古い API の Task には出さない', () => {
+    expect(canShowRecoverUI(makeTask({ status: 'blocked' }), [], [], NOW)).toBe(false)
   })
 })
 
@@ -250,7 +375,7 @@ describe('MOB-001: 実行状態の見分け', () => {
   it('quarantine された Job には resume UI を出さない', () => {
     // resume しても API 側の quarantine guard が claim を拒否する。
     // 「押しても失敗する操作」をCEOに見せてはならない。
-    const task = { id: 'task-1', status: 'blocked' } as Task
+    const task = { id: 'task-1', status: 'blocked', parked: false, projectStatus: 'running' } as TaskDetail
     const quarantined = baseJob({
       status: 'blocked',
       failureMetadata: { quarantined: true },
@@ -258,7 +383,7 @@ describe('MOB-001: 実行状態の見分け', () => {
 
     expect(canShowResumeUI(task, [quarantined], [])).toBe(false)
     // quarantine でない通常の blocked では従来どおり出る
-    expect(canShowResumeUI(task, [baseJob({ status: 'blocked' })], [])).toBe(true)
+    expect(canShowResumeUI(task, [baseJob({ status: 'blocked', aiCliMode: 'implement', aiCliProvider: 'codex' } as Partial<Job>)], [])).toBe(true)
   })
 })
 
