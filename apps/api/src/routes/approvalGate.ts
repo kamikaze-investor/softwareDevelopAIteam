@@ -594,46 +594,50 @@ export async function approvalGateRoutes(
         ? undefined
         : findActiveRequestForAction(storage.approvalRequests.findByTaskId(taskId), requestedAction)
 
-    // P2-followup: expired APPROVED cleanup
-    // findActiveByTaskId は expiresAt を見ないため期限切れ APPROVED が返ることがある。
-    // DB を EXPIRED に更新して次回以降も正しく扱えるようにする。
-    if (existingReq?.status === 'APPROVED' && new Date(existingReq.expiresAt) < new Date()) {
-      console.warn(`[gate/check] expired APPROVED detected: id=${existingReq.id}. Updating to EXPIRED.`)
-      storage.approvalRequests.updateStatus(existingReq.id, 'EXPIRED', undefined, true)
-      existingReq = undefined
-    }
-
-    // WAITING_FOR_USER + ref 変化 → SUPERSEDE（decideGateOutcome に渡す前に処理）
-    if (existingReq?.status === 'WAITING_FOR_USER') {
-      if (existingReq.targetCommit !== targetCommit || existingReq.targetDiffHash !== targetDiffHash) {
-        storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
-        sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
-        existingReq = undefined
-      }
-    }
-
     // HIGH の SAFE_WORK（Worker は承認を待たずに continue_safe_work_only で走る）に残っている
     // **同じ action の** WAITING は、誰も待っていない行である（この修正以前に作られた git_status 等の行。
     // 2026-10-16 b8d0fc5d の approval-20261016-f73df27a）。PENDING_APPROVAL として返し続けると Task が
     // 承認待ちに見え続けるので、SUPERSEDED にして無い前提で判定し直す（下で新しい依頼も作らない）。
     // - 最新 1 行だけでなく、**保存 riskLevel が HIGH の同 action WAITING をすべて** 1 transaction で畳む
     //   （Codex review round 3: 古い legacy 行が残ると resume / Mobile を塞ぎ続ける）
-    // - CRITICAL として作られた行は Worker が block_until_approved で待っていた判断なので残す（round 2）。
-    //   残っていれば下の再選択でそれを拾い、PENDING_APPROVAL のまま fail closed になる
+    // - CRITICAL として作られた行は Worker が block_until_approved で待っていた判断なので残す（round 2）
+    // - **この畳み込みを ref 変化の処理より先に行い、その後は必ず生き残りを選び直す**（round 4）。
+    //   先に ref 変化で最新の HIGH 行を畳むと existingReq が空になり、古い current-ref の CRITICAL 行を
+    //   選び直さないまま continue_safe_work_only を返していた。生き残った CRITICAL は PENDING_APPROVAL（fail closed）
     // - 別 action の行、Job の無い evaluation-only、今回の評価が CRITICAL の場合は触れない
-    if (
+    const safeWorkCleanup =
       !isGitCommitPolicyAction
       && !evaluationOnly
       && riskReview.riskLevel === 'HIGH'
       && isSafeWorkCommandKind(requestedAction)
-    ) {
+    const reselectSameAction = (): ApprovalRequest | undefined =>
+      findActiveRequestForAction(storage.approvalRequests.findByTaskId(taskId), requestedAction)
+    if (safeWorkCleanup) {
       const supersededIds = storage.approvalRequests.supersedeUnwaitedSafeWorkRequests(taskId, requestedAction)
       for (const supersededId of supersededIds) {
         sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: supersededId })
       }
-      if (existingReq !== undefined && supersededIds.includes(existingReq.id)) {
-        existingReq = findActiveRequestForAction(storage.approvalRequests.findByTaskId(taskId), requestedAction)
-      }
+      existingReq = reselectSameAction()
+    }
+
+    // P2-followup: expired APPROVED cleanup
+    // findActiveByTaskId は expiresAt を見ないため期限切れ APPROVED が返ることがある。
+    // DB を EXPIRED に更新して次回以降も正しく扱えるようにする。
+    // safe work の畳み込みの後は、ここでも同 action の生き残りを選び直す（1 回ごとに active が 1 行減るので止まる）。
+    while (existingReq?.status === 'APPROVED' && new Date(existingReq.expiresAt) < new Date()) {
+      console.warn(`[gate/check] expired APPROVED detected: id=${existingReq.id}. Updating to EXPIRED.`)
+      storage.approvalRequests.updateStatus(existingReq.id, 'EXPIRED', undefined, true)
+      existingReq = safeWorkCleanup ? reselectSameAction() : undefined
+    }
+
+    // WAITING_FOR_USER + ref 変化 → SUPERSEDE（decideGateOutcome に渡す前に処理）
+    // safe work の畳み込みの後は、ref 変化で畳んだら同 action の生き残りを選び直す（畳めるものが無くなるまで。
+    // 1 回ごとに WAITING が 1 行減るので必ず止まる）。それ以外の経路は従来どおり 1 回だけ。
+    while (existingReq?.status === 'WAITING_FOR_USER'
+      && (existingReq.targetCommit !== targetCommit || existingReq.targetDiffHash !== targetDiffHash)) {
+      storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
+      sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
+      existingReq = safeWorkCleanup ? reselectSameAction() : undefined
     }
 
     // **却下済み判定の探索は git_commit でも行う。**

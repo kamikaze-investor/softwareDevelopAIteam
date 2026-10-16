@@ -2754,3 +2754,41 @@ describe('POST /api/gate/check — 同 action の legacy WAITING は HIGH のも
     })
   })
 })
+
+describe('POST /api/gate/check — safe work の畳み込みは ref 変化の処理より先 (Codex review round 4)', () => {
+  it('current-ref の CRITICAL（古い）+ stale-ref の HIGH（新しい）: HIGH は safe_work_no_waiter で畳まれ、CRITICAL を指す PENDING_APPROVAL', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const taskId = await ensureGateTask(app, 'critical-current-high-stale')
+      const base = {
+        taskId, targetBranch: BASE_GATE_PAYLOAD.targetBranch, requestedAction: 'git_status',
+        status: 'WAITING_FOR_USER' as const, invalidIf: [],
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      }
+      const critical = storage.approvalRequests.create({
+        ...base, riskLevel: 'CRITICAL',
+        targetCommit: BASE_GATE_PAYLOAD.targetCommit, targetDiffHash: BASE_GATE_PAYLOAD.targetDiffHash,
+      })
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      const staleHigh = storage.approvalRequests.create({
+        ...base, riskLevel: 'HIGH', targetCommit: 'old-commit', targetDiffHash: 'old-diff',
+      })
+
+      const { statusCode, body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId, requestedAction: 'git_status' })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.outcome.requestId).toBe(critical.id)
+      expect(body.continuationPolicy).not.toBe('continue')
+      expect(body.sideEffects).toEqual([{ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: staleHigh.id }])
+
+      expect(await identityStatusOf(staleHigh.id)).toBe('SUPERSEDED')
+      expect(await identityStatusOf(critical.id)).toBe('WAITING_FOR_USER')
+      const audits = storage.auditLog.findByEntity('approval_request', staleHigh.id)
+        .filter((entry) => entry.operation === 'supersede')
+      expect(audits).toHaveLength(1)
+      expect(audits[0]?.detail).toContain('reason=safe_work_no_waiter')
+    })
+  })
+})
