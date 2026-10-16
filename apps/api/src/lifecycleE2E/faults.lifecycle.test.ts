@@ -86,7 +86,7 @@ async function f1Start(duplicate: 'implement' | 'review') {
 
 describe('F1: duplicate result delivery (same Outbox eventId) is idempotent', () => {
   /**
-   * DEFECT D3（Outbox の再送が write-once 検査で 409 になる）。
+   * FIXED D3（Cycle 2: exact replay is deduplicated before the fingerprint write-once check。修正前の記録として残す。Outbox の再送が write-once 検査で 409 になる）。
    *
    * Expected: 同じ eventId / payloadHash の terminal 結果の再送は 200 + `outbox.deduplicated: true`
    *           で、状態も successor も変わらない（at-least-once）。
@@ -99,7 +99,7 @@ describe('F1: duplicate result delivery (same Outbox eventId) is idempotent', ()
    *           `pollJobs()` は Outbox pending の間 **全 Project の queued Job 取得を止める**。
    */
   for (const { label, duplicate } of F1_CASES) {
-    it.fails(`DEFECT D3 ${label}: the re-delivered event is deduplicated (200) and changes nothing`, async () => {
+    it(`(was DEFECT D3, fixed in Cycle 2) ${label}: the re-delivered event is deduplicated (200) and changes nothing`, async () => {
       const { task } = await f1Start(duplicate)
       const jobsBefore = env.jobsOf(task.id).map((job) => [job.id, job.status])
       const runsBefore = env.storage.designReviewRuns.findByTaskId(task.id).length

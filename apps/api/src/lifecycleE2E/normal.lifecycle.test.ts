@@ -194,7 +194,7 @@ describe('N2: HIGH-risk diff — git_commit needs a Job-linked human approval', 
   })
 
   /**
-   * DEFECT D2（HIGH git_commit は承認後も commit できない）。
+   * DEFECT D2（HIGH git_commit は承認後も commit できない）。CEO decision item: design/D2 proposal（gatePolicy.ts は AI編集禁止・CODEOWNERS。修正には CEO 承認済みの変更が要る）。
    *
    * Expected: 承認後の再実行で Gate は ALLOW + call_consume を返し、Worker は consume して commit し、Task は done。
    * Actual:   Gate は ALLOW + call_consume / continuationPolicy=continue を返すが、Worker の
@@ -266,7 +266,7 @@ describe('N2-low: LOW-risk diff routed to a human gate by review evidence', () =
 
 describe('N3: continuation to an already-synced next Task (git_commit PATCH answers 503 while the continuation runs)', () => {
   /**
-   * DEFECT D3（continuation 経路での決定的な発火）。
+   * FIXED D3（Cycle 2 で修正済み。修正前の記録として残す。continuation 経路での決定的な発火）。
    *
    * Start:     running Project、Task A（採用済み）と、Roadmap 同期で既に存在する pending の Task B
    *            （roadmapActive、依存なし。Roadmap generator の出力と同じ形を storage へ直接作る＝simulation）。
@@ -277,7 +277,7 @@ describe('N3: continuation to an already-synced next Task (git_commit PATCH answ
    * Actual:    再送は `workspaceEndFingerprint is write-once` の 409 になり（D3: write-once 検査が Outbox 重複判定より前）、
    *            Worker の Outbox は永久に pending、`pollJobs()` は queued Job の取得を止めたまま B は実行されない。
    */
-  it.fails('DEFECT D3 the Worker resends the 503-answered commit result, then runs the next Task', async () => {
+  it('(was DEFECT D3, fixed in Cycle 2) the Worker resends the 503-answered commit result, then runs the next Task', async () => {
     env = await startLifecycle({ ledger: buildLedger([{ id: 'cont-a', title: 'First synced task' }]) })
     const project = createRunningProject(env)
     env.adoptionAllowedPaths = ['docs/cont']
