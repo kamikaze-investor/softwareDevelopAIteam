@@ -123,8 +123,34 @@ export function resolvePolicy(
     }
   }
 
+  // ── 人間承認を使い切る ALLOW（call_consume）── D2（2026-10-17）
+  // API Gate は HIGH / CRITICAL を人間承認（ADMIN だけが APPROVED にできる・Job / Task / action /
+  // commit / diff に束縛・未失効）へ変換したうえで ALLOW + call_consume を返す。ここで同じ
+  // runRiskReview を同じ changedFiles に掛け直して「HIGH だから」と格下げすると、承認済みの
+  // git_commit は consume 前に blocked になり、永遠に commit できなかった（D2）。
+  // 「承認済みの対象を実行してよいか」の正本は API Gate であり、実行は直後の atomic consume
+  // （束縛の再検証・不一致なら STALE / EXPIRED）が成功したときだけ進む。HIGH と CRITICAL は
+  // 承認後は同じ扱い（同じ ADMIN 承認・同じ TTL。specs/22 1-3・14-3: Risk Level は誰が判断するかを決めない）。
+  // 承認前の CRITICAL（PENDING_APPROVAL / BLOCKED → block_until_approved）は上で処理済みで不変。
+  // 承認対象と現在のリスクの食い違い（rule drift）は API 側の risk floor が STALE にする。
+  // tuple の整合（ALLOW / continue / 同じ consumedRequestId / APPROVED の approvalRequest）は
+  // gateClient が応答検証で強制し、壊れた応答は技術障害としてここへ到達しない。
+  if (
+    checkResponse.outcome.decision === 'ALLOW' &&
+    apiPolicy === 'continue' &&
+    checkResponse.nextAction.action === 'call_consume' &&
+    typeof checkResponse.nextAction.consumedRequestId === 'string' &&
+    checkResponse.nextAction.consumedRequestId.length > 0
+  ) {
+    return {
+      policy: 'continue',
+      reason: checkResponse.nextAction.message,
+      apiAvailable: true,
+    }
+  }
+
   // ── ローカルリスクによる escalation ──
-  // API が continue でもローカルが HIGH/CRITICAL なら安全側へ上げる
+  // API が continue（承認を使わない ALLOW + proceed）でもローカルが HIGH/CRITICAL なら安全側へ上げる
   if (apiPolicy === 'continue') {
     if (localResult.finalRiskLevel === 'CRITICAL') {
       return {

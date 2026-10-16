@@ -291,3 +291,90 @@ describe('resolvePolicy — 承認依頼の無い SAFE_WORK HIGH / 依頼のあ�
     expect(result.reason).toContain('approval-critical-1')
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// D2（2026-10-17）: 人間承認を使い切る ALLOW + call_consume はローカル escalation で格下げしない。
+// 実行は直後の atomic consume が成功したときだけ進む（jobRunner は不変）。
+// ────────────────────────────────────────────────────────────
+
+function approvedConsume(
+  risk: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL',
+  overrides: Partial<GateCheckResponse> = {},
+): GateCheckResponse {
+  return makeCheckResponse({
+    outcome: { decision: 'ALLOW', riskLevel: risk, consumedRequestId: 'approval-d2' },
+    riskReview: { riskLevel: risk, triggeredRules: [], requiresIndependentReview: true },
+    continuationPolicy: 'continue',
+    nextAction: { action: 'call_consume', consumedRequestId: 'approval-d2', message: 'consume it' },
+    approvalRequest: { id: 'approval-d2', status: 'APPROVED', expiresAt: '2099-01-01T00:00:00.000Z', riskLevel: risk },
+    ...overrides,
+  })
+}
+
+describe('resolvePolicy — D2 承認済み call_consume', () => {
+  it('HIGH ALLOW + call_consume、ローカル HIGH → continue（承認済み commit を consume 前に止めない）', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), approvedConsume('HIGH'))
+    expect(result.policy).toBe('continue')
+    expect(result.reason).toBe('consume it')
+  })
+
+  it('CRITICAL ALLOW + call_consume、ローカル CRITICAL → continue（承認後は HIGH と同じ）', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'CRITICAL' }), approvedConsume('CRITICAL'))
+    expect(result.policy).toBe('continue')
+  })
+
+  it('ALLOW + proceed（承認を使わない）、ローカル HIGH → continue_safe_work_only（escalation は残る）', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'HIGH' }),
+      makeCheckResponse({ outcome: { decision: 'ALLOW', riskLevel: 'LOW' }, nextAction: { action: 'proceed', message: 'go' } }),
+    )
+    expect(result.policy).toBe('continue_safe_work_only')
+  })
+
+  it('ALLOW + proceed、ローカル CRITICAL → block_until_approved（escalation は残る）', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
+      makeCheckResponse({ outcome: { decision: 'ALLOW', riskLevel: 'LOW' }, nextAction: { action: 'proceed', message: 'go' } }),
+    )
+    expect(result.policy).toBe('block_until_approved')
+  })
+
+  it('call_consume でも consumedRequestId が空・continuationPolicy が continue でない → 例外扱いしない', () => {
+    expect(resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'HIGH' }),
+      approvedConsume('HIGH', { nextAction: { action: 'call_consume', consumedRequestId: '', message: 'x' } }),
+    ).policy).toBe('continue_safe_work_only')
+    expect(resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
+      approvedConsume('CRITICAL', { continuationPolicy: 'continue_safe_work_only' }),
+    ).policy).toBe('block_until_approved')
+  })
+
+  it.each([
+    ['PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only'],
+    ['BLOCKED', 'HIGH', 'continue_safe_work_only'],
+    ['PENDING_APPROVAL', 'CRITICAL', 'block_until_approved'],
+    ['BLOCKED', 'CRITICAL', 'block_until_approved'],
+  ] as const)('%s（%s）は承認前のまま（%s）', (decision, risk, expected) => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: risk }),
+      approvedConsume(risk, {
+        outcome: { decision, riskLevel: risk, requestId: 'approval-d2' },
+        continuationPolicy: risk === 'CRITICAL' ? 'block_until_approved' : 'continue_safe_work_only',
+        nextAction: { action: 'wait_for_approval', requestId: 'approval-d2', message: 'waiting' },
+      }),
+    )
+    expect(result.policy).toBe(expected)
+  })
+
+  it('STALE は re_check のまま', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'HIGH' }),
+      approvedConsume('HIGH', {
+        outcome: { decision: 'STALE', requestId: 'approval-d2', reason: 'diff changed' },
+        nextAction: { action: 're_check', message: 're-check' },
+      }),
+    )
+    expect(result.policy).toBe('re_check')
+  })
+})
