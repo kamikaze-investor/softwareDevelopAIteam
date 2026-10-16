@@ -60,6 +60,7 @@ import {
   processQueuedWork,
   reportAbortCleanupObservations,
   clearPendingAbortCleanupSubmissions,
+  pendingAbortCleanupSubmissionJobIds,
   start,
 } from './index.js'
 
@@ -550,6 +551,164 @@ describe('dirty Technical Abort cleanup — identical resubmission after a retry
     expect(reports()).toHaveLength(2)
     expect(reports()[1]).toBe(reports()[0])
     expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
+  })
+})
+
+describe('pending Technical Abort cleanup delivery gates intake and is swept when its generation disappears', () => {
+  // Codex review cf8a33e: 配送待ちの間は queued Job を取らない / generation が消えた保留は掃除する。
+  const dirtyEnd = {
+    mode: 'dirty' as const,
+    startCommitHash: 'end-head',
+    entries: [{ path: 'apps/worker/src/index.ts', kind: 'modified' as const, xyStatus: '.M', worktreeHash: 'sha256:owned' }],
+  }
+  const cleanEnd = { mode: 'clean' as const, startCommitHash: 'end-head' }
+  const knownGoodClean = {
+    gitOperationMarkers: [], worktreeClean: true, indexClean: true, headValid: true, blindSpotsAbsent: true,
+  }
+  const project = {
+    id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    createdAt: NOW, updatedAt: NOW,
+  }
+  const carrierTask: Task = { ...task, id: 'task-a', status: 'blocked', roadmapActive: true }
+  const carrier: Job = {
+    ...job,
+    id: 'job-carrier',
+    taskId: 'task-a',
+    status: 'failed',
+    failureMetadata: {
+      workspaceEndFingerprint: dirtyEnd,
+      abortCleanupRequestedAt: NOW,
+      abortTechnicalEvidenceId: 'evidence-1',
+      abortTechnicalStateFingerprint: 'fp-1',
+    },
+  }
+  const busy = (): Response => new Response(JSON.stringify({ error: 'busy', code: 'STORAGE_BUSY' }), { status: 409 })
+
+  interface ApiState {
+    projectStatus: string
+    projectsFail: boolean
+    carrierTask: Task
+    carrierJobs: Job[]
+    extraTasks: Task[]
+    extraJobs: Record<string, Job[]>
+    cleanupResponses: Array<() => Response>
+    onAccepted?: (state: ApiState) => void
+  }
+
+  function stubApi(state: ApiState): void {
+    workspaceVerificationMocks.observeWorkspace
+      .mockReturnValueOnce({ observation: dirtyEnd, knownGood: { ...knownGoodClean, worktreeClean: false } })
+      .mockReturnValue({ observation: cleanEnd, knownGood: knownGoodClean })
+    let reports = 0
+    fetchMock.mockImplementation(async (url: string | URL | Request, init?: RequestInit) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) {
+        if (state.projectsFail) return new Response(null, { status: 503 })
+        return new Response(JSON.stringify([{ ...project, status: state.projectStatus }]), { status: 200 })
+      }
+      if (value.includes('/api/tasks?projectId=')) {
+        return new Response(JSON.stringify([state.carrierTask, ...state.extraTasks]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=task-a')) return new Response(JSON.stringify(state.carrierJobs), { status: 200 })
+      const extra = /\/api\/jobs\?taskId=([^&]+)/.exec(value)
+      if (extra) return new Response(JSON.stringify(state.extraJobs[decodeURIComponent(extra[1]!)] ?? []), { status: 200 })
+      if (value.includes('/abort-cleanup-result')) {
+        const respond = state.cleanupResponses[reports] ?? state.cleanupResponses[state.cleanupResponses.length - 1]!
+        reports += 1
+        const response = respond()
+        if (response.ok) state.onAccepted?.(state)
+        return response
+      }
+      // queued Job の claim（running への PATCH）は 409 で止める。呼ばれたこと自体が claim の証拠。
+      if (value.includes('/api/jobs/job-queued') && init?.method === 'PATCH') {
+        return new Response(JSON.stringify({ error: 'stop here' }), { status: 409 })
+      }
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+  }
+
+  const claimed = (): boolean => fetchMock.mock.calls.some(
+    ([url, init]) => String(url).includes('/api/jobs/job-queued') && init?.method === 'PATCH',
+  )
+
+  beforeEach(() => {
+    clearPendingAbortCleanupSubmissions()
+  })
+
+  it('a queued Job is not claimed while the cleanup delivery is pending, and is claimed after acceptance', async () => {
+    vi.useFakeTimers()
+    const queuedTask: Task = { ...task, id: 'task-b', status: 'pending', roadmapActive: true }
+    const queuedJob: Job = { ...job, id: 'job-queued', taskId: 'task-b', status: 'queued' }
+    const state: ApiState = {
+      projectStatus: 'running',
+      projectsFail: false,
+      carrierTask,
+      carrierJobs: [carrier],
+      extraTasks: [queuedTask],
+      extraJobs: { 'task-b': [queuedJob] },
+      cleanupResponses: [busy, () => new Response(null, { status: 200 })],
+      // 受理後の API: Task は park され、carrier から cleanup marker が消える。
+      onAccepted: (current) => {
+        current.carrierTask = { ...carrierTask, status: 'pending', roadmapActive: false }
+        current.carrierJobs = [{ ...carrier, failureMetadata: { workspaceEndFingerprint: dirtyEnd } }]
+      },
+    }
+    stubApi(state)
+
+    void pollJobs()
+    await flushPollCycle()
+    // poll 1: STORAGE_BUSY で配送待ち → intake しない。
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+    expect(claimed()).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
+    // poll 2: 同じ証拠を再送して受理。この poll は従来どおり intake を飛ばす。
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+    expect(claimed()).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
+    // poll 3: 配送待ちが無いので queued Job を claim しにいく。
+    expect(claimed()).toBe(true)
+  })
+
+  it('sweeps the pending entry when the API shows the generation was cancelled', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+
+    // marker が消えた（generation 取り消し / commit 済みで応答だけ失われた）。
+    state.carrierJobs = [{ ...carrier, failureMetadata: { workspaceEndFingerprint: dirtyEnd } }]
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+  })
+
+  it('sweeps the pending entry when its project is no longer running', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    state.projectStatus = 'paused'
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+  })
+
+  it('keeps the pending entry (and keeps intake paused) when the API enumeration fails', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    state.projectsFail = true
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
   })
 })
 

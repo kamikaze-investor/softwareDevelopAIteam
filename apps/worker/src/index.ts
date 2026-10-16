@@ -969,7 +969,9 @@ export async function pollJobs(): Promise<never> {
         // 対象 Job は所有権を保持しているので、どのみち `fetchQueuedJob()` は何も返さない。
         // 先に観測を報告して所有権を解放できるようにしておく。
         const reported = await reportAbortCleanupObservations()
-        if (reported) {
+        // 「何も扱わなかった」と「technical cleanup の報告が配送待ち」を区別する。配送待ちの間は
+        // queued Job を取らない（観測と再送の間に別 Job が workspace を変えないように）。
+        if (reported || hasPendingAbortCleanupSubmissions()) {
           await sleep(POLL_INTERVAL_MS)
           continue
         }
@@ -1032,6 +1034,9 @@ interface PendingAbortCleanupSubmission {
   generationKey: string
   body: string
   attempts: number
+  /** sweep 用: どの Task / Project の列挙で carrier を確かめられるか。 */
+  taskId: string
+  projectId: string
 }
 
 const MAX_ABORT_CLEANUP_RESUBMISSIONS = 20
@@ -1040,6 +1045,49 @@ const pendingAbortCleanupSubmissions = new Map<string, PendingAbortCleanupSubmis
 /** テスト用: 保留中の再送を全て捨てる。 */
 export function clearPendingAbortCleanupSubmissions(): void {
   pendingAbortCleanupSubmissions.clear()
+}
+
+/**
+ * technical cleanup の報告が配送待ちか。pollJobs() はこの間 queued Job を取らない（Codex review cf8a33e）:
+ * clean な terminal carrier は所有者として数えられないため、観測と再送の間に別 Job が同じ workspace で
+ * 走ると、再送する証拠が古くなり拒否→quarantine になりうる。受理・確定拒否・取り消し・上限到達で解ける。
+ */
+export function hasPendingAbortCleanupSubmissions(): boolean {
+  return pendingAbortCleanupSubmissions.size > 0
+}
+
+/** テスト用: 保留中の carrier Job id。 */
+export function pendingAbortCleanupSubmissionJobIds(): string[] {
+  return [...pendingAbortCleanupSubmissions.keys()]
+}
+
+/** この poll で API から**確かに**読めた事実。読めなかった範囲の保留は消さない（fail closed）。 */
+interface AbortCleanupEnumeration {
+  projectStatuses?: Map<string, string>
+  taskIdsByProject: Map<string, Set<string>>
+  jobsFetchedForTask: Set<string>
+  liveGenerations: Map<string, string>
+}
+
+/**
+ * generation が消えた保留を捨てる（marker 除去・project 停止・commit 済みで応答だけ失われた等）。
+ * 消すのは、その carrier を含む範囲を API から読めたうえで、同じ generation の要求が見当たらないときだけ。
+ * 列挙に失敗した範囲の保留は残し、intake も止めたままにする。
+ */
+function sweepPendingAbortCleanupSubmissions(seen: AbortCleanupEnumeration): void {
+  for (const [jobId, entry] of pendingAbortCleanupSubmissions) {
+    const projectStatus = seen.projectStatuses?.get(entry.projectId)
+    const projectGone = seen.projectStatuses !== undefined
+      && (projectStatus === undefined || projectStatus !== 'running')
+    const taskIds = seen.taskIdsByProject.get(entry.projectId)
+    const taskGone = taskIds !== undefined && !taskIds.has(entry.taskId)
+    const generationGone = seen.jobsFetchedForTask.has(entry.taskId)
+      && seen.liveGenerations.get(jobId) !== entry.generationKey
+    if (projectGone || taskGone || generationGone) {
+      pendingAbortCleanupSubmissions.delete(jobId)
+      console.warn(`[Worker] Job ${jobId} の abort cleanup 保留を破棄します（API にその generation の要求がありません）`)
+    }
+  }
 }
 
 function abortCleanupGenerationKey(job: Job): string {
@@ -1093,12 +1141,13 @@ async function submitAbortCleanupResult(jobId: string, body: string): Promise<Ab
 
 /** 再試行可能な失敗を保留へ積む（technical cleanup のときだけ）。上限に達したら諦めて警告する。 */
 function keepPendingAbortCleanupSubmission(
-  jobId: string,
+  carrier: Job,
   generationKey: string,
   body: string,
   previousAttempts: number,
   reason: string,
 ): void {
+  const jobId = carrier.id
   const attempts = previousAttempts + 1
   if (attempts >= MAX_ABORT_CLEANUP_RESUBMISSIONS) {
     pendingAbortCleanupSubmissions.delete(jobId)
@@ -1108,7 +1157,9 @@ function keepPendingAbortCleanupSubmission(
     )
     return
   }
-  pendingAbortCleanupSubmissions.set(jobId, { generationKey, body, attempts })
+  pendingAbortCleanupSubmissions.set(jobId, {
+    generationKey, body, attempts, taskId: carrier.taskId, projectId: carrier.projectId,
+  })
   console.warn(
     `[Worker] Job ${jobId} の abort cleanup 報告は再試行可能な理由で届きませんでした（${reason}）。`
     + '次の poll で同じ観測・summary をそのまま再送します',
@@ -1116,18 +1167,34 @@ function keepPendingAbortCleanupSubmission(
 }
 
 export async function reportAbortCleanupObservations(): Promise<boolean> {
+  const seen: AbortCleanupEnumeration = {
+    taskIdsByProject: new Map(),
+    jobsFetchedForTask: new Set(),
+    liveGenerations: new Map(),
+  }
+  try {
+    return await reportAbortCleanupObservationsOnce(seen)
+  } finally {
+    sweepPendingAbortCleanupSubmissions(seen)
+  }
+}
+
+async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration): Promise<boolean> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return false
+  seen.projectStatuses = new Map(projects.map((project) => [project.id, project.status]))
 
   for (const project of projects) {
     if (project.status !== 'running') continue
 
     const tasks = await fetchJson<Task[]>(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)
     if (!tasks) continue
+    seen.taskIdsByProject.set(project.id, new Set(tasks.map((task) => task.id)))
 
     for (const task of tasks) {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
+      seen.jobsFetchedForTask.add(task.id)
 
       // `/api/jobs` は storage と同じ created_at DESC, rowid DESC。terminal-blocked 形では
       // 最新 Job だけを候補にし、resume 後の古い mark を報告しない。
@@ -1148,6 +1215,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
           && job.failureMetadata?.abortCleanupRequestedAt !== undefined
         ))
       if (!requested) continue
+      seen.liveGenerations.set(requested.id, abortCleanupGenerationKey(requested))
 
       // 同じ carrier + generation の保留があれば、観測も cleanup もやり直さず同じ payload を再送する。
       const generationKey = abortCleanupGenerationKey(requested)
@@ -1169,7 +1237,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
           )
           continue
         }
-        keepPendingAbortCleanupSubmission(requested.id, generationKey, pending.body, pending.attempts, resent.reason)
+        keepPendingAbortCleanupSubmission(requested, generationKey, pending.body, pending.attempts, resent.reason)
         if (resent.status === undefined) return false
         continue
       }
@@ -1270,7 +1338,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
       if (submitted.kind === 'retryable') {
         if (technicalCleanup) {
           // technical cleanup は workspace を変えているので、同じ証拠で再送する（観測し直さない）。
-          keepPendingAbortCleanupSubmission(requested.id, generationKey, body, 0, submitted.reason)
+          keepPendingAbortCleanupSubmission(requested, generationKey, body, 0, submitted.reason)
         } else {
           console.warn(`[Worker] abort cleanup 報告エラー: ${submitted.reason}`)
         }
