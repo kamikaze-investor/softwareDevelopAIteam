@@ -253,8 +253,12 @@ export const REPOSITORY_CONTEXT_MAX_TOTAL_CHARS = 60_000
 
 const SECRET_FILE_BASENAME_PATTERNS: readonly RegExp[] = [
   /^\.env(\..*)?$/iu,
-  /\.(pem|key|p12|pfx)$/iu,
+  /\.(pem|key|p12|pfx|keystore|jks)$/iu,
   /^id_(rsa|dsa|ecdsa|ed25519)/iu,
+  // 認証情報を平文で持つ代表的な設定ファイル（package registry・netrc・git・Docker・クラウド SDK）
+  /^\.(npmrc|yarnrc|yarnrc\.yml|pypirc|netrc|git-credentials|dockercfg)$/iu,
+  /^credentials(\..*)?$/iu,
+  /service[-_]?account.*\.json$/iu,
 ]
 
 const SECRET_FILE_OMITTED = { omitted: '秘密情報ファイルの可能性があるため載せていません' } as const
@@ -289,8 +293,14 @@ function readRepositoryFile(
   if (isSecretFileName(realFile)) {
     return SECRET_FILE_OMITTED
   }
-  if (!fs.statSync(realFile).isFile()) {
+  const stat = fs.statSync(realFile)
+  if (!stat.isFile()) {
     return { omitted: '通常ファイルではありません' }
+  }
+  // hard link は realpath でも実体名が分からない（.env への通常名の hard link を名前判定で止められない）。
+  // 実体を名前で確認できないものは載せない。
+  if (stat.nlink > 1) {
+    return { omitted: '複数の名前を持つファイル（hard link）で実体を確認できないため載せていません' }
   }
 
   // NUL を含まないバイナリ（JPEG 等）も載せないよう、生バイトを厳格な UTF-8 として復号できるかでも判定する
