@@ -11879,6 +11879,32 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       出るので Lost Completion ではないが、「予算切れで終わった」ことが repair 側の戻り値からは
       「既に始まっている」に見える。ここへ混ぜず、別項目として起票するかを別途判断する。
 
+<!-- roadmap:id=canonical-domain-meaning-missing-from-implement-and-repair-prompts state=planned -->
+10. [ ] **`canonical-domain-meaning` が初回実装 prompt と repair prompt に載らない** —
+      2026-10-16登録（原則強化 PR の独立レビュー指摘。**本項目は Finding であり、まだ実装しない。**
+      記録: `docs/project_memory/decisions/root_cause_and_semantic_ownership_principles_2026_10_16.md`）。
+
+      **事象**: `canonical-domain-meaning` は contextual 原則で、focus から選ばれたときだけ載る。
+      `appendImplementContracts()`（`apps/api/src/implementPrompt.ts`）と `buildRepairPrompt()`
+      （`apps/api/src/designReview/repairPromptBuilder.ts`）は signal 無し（core のみ）で原則を選ぶため、
+      状態遷移・authority・lifecycle を触る実装 / 修復でも Design Contract に載らない。
+      Meta Review 側は focus 経由で載るので、**指摘はされるが、実装時に先回りできない**。
+      `remediationStep.ts` と `buildResumeAiCliPrompt()` は既に `allowedPaths` → focus で選んでいる。
+
+      **方向**: 同じく `allowedPaths.flatMap(mapFileToFocuses)` を渡す（新しい選択規則・原則・Gate は作らない。
+      core 化しない —— `principle-registry-coverage-and-threshold-review` の「安易に core 化しない」）。
+
+      **着手時の注意**: repair prompt は Design Review で hash 照合される canonical 文字列である
+      （`repairPromptBuilder.ts` 冒頭）。変えると、変更前に Design Review を通った repair Job の
+      prompt と hash が一致しなくなる。進行中の repair / Lifecycle 修復が無いことを確認するか、
+      既存の hash 照合が旧 prompt をどう扱うかを先に確認してから入れる。
+
+      **Acceptance Criteria**:
+      - 状態遷移系の `allowedPaths` を持つ Task の初回実装 prompt / repair prompt の Design Contract に
+        `canonical-domain-meaning` の one-liner が載る（テストで固定）
+      - focus に該当しない Task では載らない（全 prompt へ常時注入しない）
+      - 既存の repair Job が hash mismatch で詰まらない
+
 ---
 
 *Updated: 2026-09-28*

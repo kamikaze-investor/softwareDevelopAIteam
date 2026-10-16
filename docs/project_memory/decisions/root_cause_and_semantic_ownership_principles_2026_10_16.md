@@ -33,7 +33,8 @@ Status・finding category は追加していない。正本は `specs/21`。
 `buildRepairPrompt()` は signal 無し（core のみ）で原則を選ぶため、初回実装 prompt と repair prompt には
 載らない（Meta Review では focus 経由で載る）。`remediationStep.ts` と同じく `allowedPaths` から focus を
 渡せば解消するが、repair prompt は Design Review で hash される canonical 文字列であり、進行中の
-Lifecycle 修復と並行して変えない。後続 Task で扱う。
+Lifecycle 修復と並行して変えない。後続 Task として Roadmap
+`canonical-domain-meaning-missing-from-implement-and-repair-prompts`（planned）で追跡する。
 
 ## 検証
 
