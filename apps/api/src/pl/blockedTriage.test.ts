@@ -1338,3 +1338,59 @@ describe('時計の巻き戻り後に挿入された CONFLICT run', () => {
     expect(diagnosis.recommendedLane).toBe('independent_remediation')
   })
 })
+/**
+ * **Triage は runner の自己申告（finalDecision）を判定に使わない**（独立レビュー指摘・2026-10-16）。
+ *
+ * task_ready_without_job の分類も task_blocked_without_job と同じ API の再計算で決める。
+ */
+describe('task_ready_without_job の Design Review 判定は再計算値', () => {
+  function seedWithResult(resultJson: string): { storage: IStorage; taskId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: 'body', status: 'pending', assignee: 'developer_ai',
+      dependencies: [], roadmapActive: true, phase: 1,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const run = storage.designReviewRuns.create({
+      taskId: task.id, taskTitle: task.title, designText, designTextHash: computeDesignTextHash(designText), changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', resultJson)
+    return { storage, taskId: task.id }
+  }
+
+  const FOCUSED_CONFLICT = [{ focus: 'scope_simplicity', decision: 'CONFLICT', summary: 'scope が広すぎる' }]
+
+  it('focus は CONFLICT で finalDecision が無い（#255 形）→ design_review_conflict', () => {
+    const { storage, taskId } = seedWithResult(JSON.stringify({ focusedReviewResults: FOCUSED_CONFLICT }))
+
+    expect(readLatestDesignReview(storage, taskId)?.decision).toBe('CONFLICT')
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'task_ready_without_job'))
+    expect(diagnosis.rootCauseClass).toBe('design_review_conflict')
+    expect(diagnosis.recommendedLane).toBe('independent_remediation')
+  })
+
+  it('focus は CONFLICT なのに finalDecision: ALIGNED と自己申告 → 自己申告を信じず design_review_conflict', () => {
+    const { storage, taskId } = seedWithResult(JSON.stringify({
+      focusedReviewResults: FOCUSED_CONFLICT,
+      finalDecision: 'ALIGNED',
+    }))
+
+    expect(readLatestDesignReview(storage, taskId)?.decision).toBe('CONFLICT')
+    expect(triageBlocked(storage, attentionOf(storage, 'task_ready_without_job')).rootCauseClass)
+      .toBe('design_review_conflict')
+  })
+
+  it('finalDecision: CONFLICT と自己申告していても、組み直して ALIGNED なら CONFLICT 扱いしない', () => {
+    const { storage, taskId } = seedWithResult(JSON.stringify({
+      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+      integrationReviewResult: { decision: 'ALIGNED' },
+      finalDecision: 'CONFLICT',
+    }))
+
+    expect(readLatestDesignReview(storage, taskId)?.decision).toBe('ALIGNED')
+    expect(triageBlocked(storage, attentionOf(storage, 'task_ready_without_job')).rootCauseClass)
+      .not.toBe('design_review_conflict')
+  })
+})
