@@ -106,6 +106,10 @@ export const GATE_CHANGE_EXACT_FILES: readonly string[] = [
   'apps/api/src/jobResultApplicationPolicy',                    // Job result の状態遷移 admission（正本）
   'apps/api/src/routes/jobs',                                   // 直接遷移 / claim の拒否と Outbox 受理の境界
   'apps/api/src/routes/tasks',                                  // generic route で無許可の done を止める唯一の場所・lifecycle 所有状態の拒否
+  // 2026-10-17 最終監査（lifecycle repair final）
+  'apps/api/src/state/strandedTask',                            // lifecycle 所有状態（in_progress / review）から出してよいかの stranded 判定
+  'apps/api/src/ctoAi/taskContinuation',                        // Task continuation と CEO escalation の選択
+  'apps/api/src/designReview/retryCooldown',                    // 判定の出ない Design Review の再試行 budget の時間配分
 ]
 for (const file of GATE_CHANGE_EXACT_FILES) {
   if (!/^[A-Za-z0-9/]+$/.test(file)) {

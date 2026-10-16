@@ -2957,3 +2957,85 @@ describe('POST /api/gate/check — safe work の生き残り選択は 1 つの�
     })
   })
 })
+
+// lifecycle repair final（P3）: 期限切れの Task 単位 WAITING を決定しない。以前は status だけを見て
+// APPROVED にし、何の authority にもならない承認が 200 で返っていた（git_commit の approveAndResumeJob
+// は既に期限切れを断っていた）。APPROVED / REJECTED のどちらも同じ扱いにする。
+describe('PATCH /approval-requests/:id/status — expired WAITING is not decided (lifecycle repair final)', () => {
+  async function seedWaiting(app: FastifyInstance, expiresAt: string): Promise<ApprovalRequest> {
+    const { getStorage } = await import('../storage/index.js')
+    return getStorage().approvalRequests.create({
+      taskId: await ensureGateTask(app, 'expired-task-scoped'),
+      targetBranch: 'main',
+      targetCommit: 'abc123',
+      targetDiffHash: 'deadbeef',
+      riskLevel: 'HIGH',
+      requestedAction: 'abort_task',
+      status: 'WAITING_FOR_USER',
+      expiresAt,
+      invalidIf: [],
+    })
+  }
+
+  it.each(['APPROVED', 'REJECTED'] as const)(
+    'an expired task-scoped WAITING request decided as %s → 409 APPROVAL_EXPIRED, row EXPIRED, no actor evidence',
+    async (decision) => {
+      await withApp(async (app) => {
+        const { getStorage } = await import('../storage/index.js')
+        const request = await seedWaiting(app, new Date(Date.now() - 1000).toISOString())
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/approval-requests/${request.id}/status`, payload: { status: decision },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string; status: string }>(res.body)).toMatchObject({
+          code: 'APPROVAL_EXPIRED', status: 'EXPIRED',
+        })
+        expect(getStorage().approvalRequests.findById(request.id)?.status).toBe('EXPIRED')
+        const audits = getStorage().auditLog.findByEntity('approval_request', request.id)
+        expect(audits.filter((entry) => entry.operation === 'approval_actor')).toHaveLength(0)
+        expect(audits.some((entry) => entry.result === 'success')).toBe(false)
+      })
+    },
+  )
+
+  it('a live task-scoped WAITING request is still decided (200, APPROVED, actor evidence written)', async () => {
+    await withApp(async (app) => {
+      const { getStorage } = await import('../storage/index.js')
+      const request = await seedWaiting(app, new Date(Date.now() + 60_000).toISOString())
+
+      const decided = await patchStatus(app, request.id, 'APPROVED')
+
+      expect(decided.status).toBe('APPROVED')
+      const audits = getStorage().auditLog.findByEntity('approval_request', request.id)
+      expect(audits.filter((entry) => entry.operation === 'approval_actor')).toHaveLength(1)
+    })
+  })
+
+  it('an expired git_commit approval reports the same APPROVAL_EXPIRED code', async () => {
+    await withApp(async (app) => {
+      const taskId = await ensureGateTask(app, 'expired-git-commit-code')
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const task = storage.tasks.findById(taskId)!
+      const job = storage.jobs.create({
+        taskId, projectId: task.projectId, agentRole: 'developer_ai', status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      })
+      const linked = storage.approvalRequests.createForJob({
+        taskId, targetBranch: 'main', targetCommit: 'c', targetDiffHash: 'd', riskLevel: 'LOW',
+        requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() - 1000).toISOString(), invalidIf: [],
+      }, job.id)
+      if (!linked.ok) throw new Error(linked.reason)
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/approval-requests/${linked.approvalRequest.id}/status`, payload: { status: 'APPROVED' },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('APPROVAL_EXPIRED')
+    })
+  })
+})

@@ -54,6 +54,9 @@ import { gateEvaluationRoutes } from './gateEvaluations'
 // v3 は同じ lifecycle repair の一連の変更で未リリース（origin/master は v2）なので、v4 へは上げない。
 const GATE_POLICY_VERSION = 'gate-policy-v3'
 
+/** 承認 PATCH が期限切れの WAITING を決定しなかったときの 409 `code`（Mobile が文言へ写す）。 */
+const APPROVAL_EXPIRED_CODE = 'APPROVAL_EXPIRED'
+
 function computeDiffHash(diffText: string): string {
   return createHash('sha256').update(diffText, 'utf-8').digest('hex')
 }
@@ -1110,19 +1113,29 @@ export async function approvalGateRoutes(
       if (!approved.ok) {
         return reply.status(approved.code === 'NOT_FOUND' ? 404 : 409).send({
           error: approved.reason,
+          ...(approved.code === 'EXPIRED' ? { code: APPROVAL_EXPIRED_CODE } : {}),
           ...(approved.approvalRequest ? { status: approved.approvalRequest.status } : {}),
         })
       }
       return reply.send(approved.approvalRequest)
     }
 
-    const updated = storage.approvalRequests.recordDecision(
+    // 期限切れの WAITING は storage が transaction 内で読み直して EXPIRED へ進め、決定しない
+    // （git_commit の approveAndResumeJob と同じ扱い。APPROVED / REJECTED のどちらも）。
+    const decided = storage.approvalRequests.recordDecision(
       req.params.id,
       result.data.status as 'APPROVED' | 'REJECTED',
       result.data.reason,
       { credentialClass: getCredentialClass(req) },
     )
-    return reply.send(updated)
+    if (!decided.ok) {
+      return reply.status(decided.code === 'NOT_FOUND' ? 404 : 409).send({
+        error: decided.reason,
+        ...(decided.code === 'EXPIRED' ? { code: APPROVAL_EXPIRED_CODE } : {}),
+        ...(decided.approvalRequest ? { status: decided.approvalRequest.status } : {}),
+      })
+    }
+    return reply.send(decided.approvalRequest)
   })
 
   // POST /api/approval-requests/:id/consume — APPROVED → CONSUMED に遷移（一回限りの承認を強制）

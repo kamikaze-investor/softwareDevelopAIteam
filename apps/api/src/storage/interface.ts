@@ -296,6 +296,16 @@ export type CreateApprovalForJobResult =
   | { ok: true; approvalRequest: ApprovalRequest }
   | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED' | 'JOB_NOT_ACTIVE'; reason: string }
 
+/** `recordDecision()` の結果（PATCH /approval-requests/:id/status の git_commit 承認以外）。 */
+export type RecordApprovalDecisionResult =
+  | { ok: true; approvalRequest: ApprovalRequest }
+  | {
+      ok: false
+      code: 'NOT_FOUND' | 'STATUS_CONFLICT' | 'EXPIRED'
+      reason: string
+      approvalRequest?: ApprovalRequest
+    }
+
 export type ReviewApprovalAndResumeJobResult =
   | { ok: true; approvalRequest: ApprovalRequest; job: Job }
   | {
@@ -930,13 +940,17 @@ export interface IApprovalRequestStorage {
   /**
    * 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用）。
    * 決定と同じ transaction で `decidedBy` の `approval_actor` 行も書く（必須。片方だけ残らない）。
+   *
+   * transaction の中で行を読み直し、**生きた WAITING（`isLiveWaitingApproval`）でなければ決定しない**。
+   * 期限切れの WAITING は `approveAndResumeJob` と同じく EXPIRED へ進めて `EXPIRED` を返す
+   * （以前は status だけを見て APPROVED にし、何の authority にもならない承認が 200 で返っていた）。
    */
   recordDecision(
     id: string,
     status: 'APPROVED' | 'REJECTED',
     reason: string | undefined,
     decidedBy: ApprovalDecisionActor,
-  ): ApprovalRequest | undefined
+  ): RecordApprovalDecisionResult
 }
 
 export interface IDesignReviewEvidenceStorage {

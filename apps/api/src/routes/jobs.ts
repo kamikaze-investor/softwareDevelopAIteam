@@ -767,10 +767,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // の 2 つが起きた。適用できないと分かった配送は event を記録（Worker が捨てられる）して payload を
     // 1 つも適用せず、下流の処理（review / repair / continuation）も走らせずに 200 + 現在の Job を返す。
     // claim（→ running）は対象外: 拒否された claim は記録しない既存契約（W5）を保つ。
+    //
+    // **同じ status への配送も含める**（lifecycle repair final）。Worker の Outbox は Job ごとに
+    // terminal event を 1 つしか持たない（`recordPending`）ので、eventId の違う同 status 配送は
+    // 「別の経路（operator PATCH 等）が先にその status にした」ことを意味する。例: operator が running を
+    // failed にした後、Worker の `failed` + workspaceEndFingerprint が届く。以前は同 status を除外していた
+    // ため下の running-only 検査で 409 になり、再送が永久に 409 → Worker の intake 全体が止まった。
+    // 同じ eventId の完全な再送は `isExactReplay` で先に dedup される。
     const isNonApplicableOutboxDelivery = (job: Job): boolean => (
       jobUpdate.status !== undefined
       && jobUpdate.status !== 'running'
-      && jobUpdate.status !== job.status
       && !canApplyJobResultStatus(job.status, jobUpdate.status)
     )
     if (outboxEvent !== undefined && !isExactReplay && isNonApplicableOutboxDelivery(existing)) {
@@ -870,6 +876,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // Worker側のexecution FSMとは責務が異なるため同一化しない。
     // 同一statusの再送（from === to）はDB stateを変えないが、statusを削ると下流の
     // 判定（review approved等）まで変わってしまうため、そのまま通す。
+    // （eventId の違う同 status の Outbox 配送は、上の acknowledge で既に返っているのでここへ来ない。）
     //
     // **200 + no-op は Outbox 配送（eventId 付き）にだけ使う。** at-least-once の遅延・重複 result は
     // Worker の Outbox からしか来ない（`persistTerminalUpdate`）。eventId の無い要求は配送の再送では

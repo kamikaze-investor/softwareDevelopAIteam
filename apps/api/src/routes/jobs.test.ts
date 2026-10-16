@@ -725,6 +725,60 @@ describe('Job API', () => {
       })
     })
 
+    // lifecycle repair final: 同じ status への配送も適用できない配送として受ける。以前は same-status を
+    // 除外していたため running-only の fingerprint 検査で 409 になり、再送が永久に 409 → Worker の intake 停止。
+    it.each(['failed', 'success'] as const)(
+      'operator ends a running Job as %s, then the Worker delivers the same status with a fingerprint: 200, nothing applied, event recorded',
+      async (status) => {
+        await withApp(async (app) => {
+          const { storage, job } = await storedJob('running')
+          const operator = await app.inject({
+            method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status, stderr: 'operator ended it' },
+          })
+          expect(operator.statusCode).toBe(200)
+          const before = storage.jobs.findById(job.id)
+          expect(before?.status).toBe(status)
+
+          const workerEvent = withOutbox({
+            status, exitCode: status === 'success' ? 0 : 1, stderr: 'worker result',
+            failureMetadata: { workspaceEndFingerprint: { mode: 'clean' as const, startCommitHash: '0805249b' } },
+          }, `evt-same-${status}`)
+          const first = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: workerEvent })
+
+          expect(first.statusCode).toBe(200)
+          expect(parseBody<OutboxJobResponse>(first.body)).toMatchObject({
+            status, outbox: { eventId: `evt-same-${status}`, deduplicated: false },
+          })
+          expect(storage.jobs.findById(job.id)).toEqual(before)
+          expect(storage.jobs.findById(job.id)?.failureMetadata?.workspaceEndFingerprint).toBeUndefined()
+
+          // 完全な再送は deduplicated（acknowledge と同じ記録を見る）。
+          const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: workerEvent })
+          expect(replay.statusCode).toBe(200)
+          expect(parseBody<OutboxJobResponse>(replay.body).outbox).toEqual({ eventId: `evt-same-${status}`, deduplicated: true })
+          expect(storage.jobs.findById(job.id)).toEqual(before)
+        })
+      },
+    )
+
+    it('a legitimate running -> terminal Outbox delivery with a fingerprint still applies', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('running')
+        const fingerprint = { mode: 'clean' as const, startCommitHash: '0805249b' }
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`,
+          payload: withOutbox({ status: 'failed', exitCode: 1, stderr: 'worker result', failureMetadata: { workspaceEndFingerprint: fingerprint } }, 'evt-legit-terminal'),
+        })
+
+        expect(res.statusCode).toBe(200)
+        const after = storage.jobs.findById(job.id)
+        expect(after?.status).toBe('failed')
+        expect(after?.stderr).toBe('worker result')
+        expect(after?.failureMetadata?.workspaceEndFingerprint).toEqual(fingerprint)
+      })
+    })
+
     it('a stale failed + quarantined result on a success row does not make the row "success but quarantined"', async () => {
       await withApp(async (app) => {
         const { storage, job } = await storedJob('success')
