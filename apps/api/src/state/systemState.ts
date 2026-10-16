@@ -15,7 +15,7 @@
  * `mandatory-gate-policy` が決める（本 API は権限判断をしない）。
  */
 
-import { occupiesProject } from '@ai-team/shared'
+import { isLiveWorkspaceOwnerJob, occupiesProject } from '@ai-team/shared'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
@@ -84,6 +84,15 @@ export type AttentionKind =
    */
   | 'task_blocked_without_job'
   | 'job_running_long'
+  /**
+   * running でも archived でもない Project（paused / draft）の Job が単一の共有 workspace の
+   * 所有者であり、そのせいで running Project の queued Job を Worker も API も claim しない。
+   *
+   * queued は「動かせる」扱いで他の attention が立たず、`task_ready_without_job` は running
+   * Project だけが対象なので、これが無いと PL は idle のまま誰にも知らせない（lifecycle repair W5）。
+   * 解消（その Project を再開する / 放棄する）は CEO の判断なので notify-only。
+   */
+  | 'workspace_held_by_inactive_project'
 
 export interface AttentionItem {
   kind: AttentionKind
@@ -312,6 +321,10 @@ export function buildSystemState(
   // archived は観測対象から外す。履歴は既存の Project 単位エンドポイントで読める。
   const observed = allProjects.filter((project) => project.status !== 'archived')
 
+  // 共有 workspace を running 以外の Project が握っているか（`workspace_held_by_inactive_project`）。
+  const inactiveOwners: Array<{ project: Project; task: Task; job: Job }> = []
+  let runningProjectHasQueuedWork = false
+
   for (const project of observed) {
     const tasks = storage.tasks.findByProjectId(project.id)
     const activeTasks = tasks.filter((task) => task.roadmapActive)
@@ -425,6 +438,20 @@ export function buildSystemState(
       const superseded = task.status === 'done'
         ? new Set<string>()
         : readJobsSupersededByHumanResume(storage, jobs)
+
+      if (project.status === 'running' && jobs.some((job) => job.status === 'queued')) {
+        runningProjectHasQueuedWork = true
+      }
+      if (project.status !== 'running') {
+        // 所有者の意味は claim guard（storage）と同じ: live な所有者か、Human Resume に superseded
+        // されていない blocked 行。done な Task の行も含める（解放の証明は Worker の観測だけ）。
+        const ownershipSuperseded = task.status === 'done' ? readJobsSupersededByHumanResume(storage, jobs) : superseded
+        const owner = jobs.find((job) => (
+          isLiveWorkspaceOwnerJob(task.id, job)
+          || (job.status === 'blocked' && !ownershipSuperseded.has(job.id))
+        ))
+        if (owner !== undefined) inactiveOwners.push({ project, task, job: owner })
+      }
       const hasMovableJob = jobs.some((job) => (
         job.status === 'queued' || job.status === 'running'
         || (job.status === 'blocked' && !superseded.has(job.id))
@@ -618,6 +645,25 @@ export function buildSystemState(
       adoptionFailure: adoptionFailureOf(storage, project.id),
       designReview,
     })
+  }
+
+  // **running Project に queued の仕事があるときだけ**出す。pause は CEO の停止スイッチであり、
+  // 誰も待っていないのに「止めた Project が workspace を持っている」と鳴らすと pause のたびに誤報になる。
+  // 実際に止まっているのは「running Project の queued Job が claim されない」ときである。
+  if (runningProjectHasQueuedWork) {
+    for (const { project, task, job } of inactiveOwners) {
+      attention.push({
+        kind: 'workspace_held_by_inactive_project',
+        projectId: project.id,
+        projectName: project.name,
+        taskId: task.id,
+        jobId: job.id,
+        referenceId: job.id,
+        detail: `${job.status} job in a ${project.status} project holds the shared workspace; `
+          + 'queued work in the running project cannot be claimed',
+        stuckForMs: elapsedMs(job.completedAt ?? job.startedAt ?? job.createdAt, nowMs),
+      })
+    }
   }
 
   return {

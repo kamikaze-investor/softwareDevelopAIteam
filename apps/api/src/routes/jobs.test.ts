@@ -553,6 +553,63 @@ describe('Job API', () => {
       })
     })
 
+    it("refuses the claim when another Task's queued Job became blocked (pre-start refusal) after the snapshot", async () => {
+      // queued -> blocked は running を経ずに起こる（開始前の拒否は blocked + quarantine になる）。
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const other = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${otherTask.id}:initial-implement`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const blocked = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${other.id}`, payload: { status: 'blocked', stderr: 'refused before start' },
+        })
+        expect(blocked.statusCode).toBe(200)
+        expect(storage.jobs.findById(other.id)?.status).toBe('blocked')
+
+        const res = await claim(app, job.id)
+
+        expect(res.statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      })
+    })
+
+    it('a blocked row left on a done Task elsewhere is still an owner (no API-side release proof)', async () => {
+      await withApp(async (app) => {
+        const { storage, job, pausedId } = await setup(app)
+        const doneTask = storage.tasks.create({
+          projectId: pausedId, title: 'Done', description: '', status: 'done',
+          assignee: 'developer_ai', dependencies: [],
+        })
+        storage.jobs.create({
+          taskId: doneTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(409)
+      })
+    })
+
+    it('a blocked source superseded by a human resume (successor finished) is not an owner', async () => {
+      await withApp(async (app) => {
+        const { recordResumeActor } = await import('../designReview/resumeActor.js')
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const source = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const successor = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'success',
+          workflowStepKey: `resume:${source.id}:1`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        recordResumeActor(storage, { jobId: successor.id, taskId: otherTask.id, actorClass: 'human', evidence: 'admin_credential' })
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
     it('a fresh initial-implement queued elsewhere is not an owner', async () => {
       await withApp(async (app) => {
         const { storage, job, otherTask, pausedId } = await setup(app)

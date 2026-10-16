@@ -1214,6 +1214,87 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     expect(escalations).toHaveLength(1)
   })
 
+  describe('workspace_held_by_inactive_project (W5)', () => {
+    function seedHeldWorkspace(ownerStatus: 'running' | 'queued' | 'blocked'): {
+      storage: IStorage
+      ownerJobId: string
+      pausedProjectId: string
+    } {
+      const { storage, projectId, taskId } = seed()
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const paused = storage.projects.create({ name: 'Paused', goal: 'g', designPhilosophy: [], status: 'paused' })
+      const pausedTask = storage.tasks.create({
+        projectId: paused.id, title: 'P', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      const owner = storage.jobs.create({
+        taskId: pausedTask.id,
+        projectId: paused.id,
+        agentRole: 'developer_ai',
+        status: ownerStatus,
+        workflowStepKey: `resume:prior-${pausedTask.id}:1`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      return { storage, ownerJobId: owner.id, pausedProjectId: paused.id }
+    }
+
+    it.each(['running', 'queued', 'blocked'] as const)(
+      'a paused Project %s owner + queued work in the running Project emits the attention',
+      (ownerStatus) => {
+        const { storage, ownerJobId, pausedProjectId } = seedHeldWorkspace(ownerStatus)
+
+        const held = buildSystemState(storage, { now: () => NOW }).attention
+          .filter((item) => item.kind === 'workspace_held_by_inactive_project')
+
+        expect(held).toHaveLength(1)
+        expect(held[0]).toMatchObject({ projectId: pausedProjectId, jobId: ownerJobId, referenceId: ownerJobId })
+      },
+    )
+
+    it('is not emitted when no running Project has queued work (a plain pause does not page)', () => {
+      const { storage } = seedHeldWorkspace('queued')
+      const runningProject = storage.projects.findAll().find((project) => project.status === 'running')!
+      for (const task of storage.tasks.findByProjectId(runningProject.id)) {
+        for (const job of storage.jobs.findByTaskId(task.id)) storage.jobs.update(job.id, { status: 'success' })
+      }
+
+      expect(buildSystemState(storage, { now: () => NOW }).attention
+        .some((item) => item.kind === 'workspace_held_by_inactive_project')).toBe(false)
+    })
+
+    it('runPlTick escalates it to the CEO exactly once, without diagnosis', async () => {
+      const { storage, ownerJobId } = seedHeldWorkspace('queued')
+      let diagnosed = 0
+      const escalations: string[] = []
+      const d = deps({
+        diagnose: async () => { diagnosed += 1; return '{}' },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      })
+
+      const first = await runPlTick(storage, d)
+      resetPlLoopInFlightForTest()
+      const second = await runPlTick(storage, d)
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, d)
+
+      expect(first).toMatchObject({
+        status: 'escalated',
+        target: { kind: 'workspace_held_by_inactive_project', jobId: ownerJobId },
+      })
+      expect(second.status).not.toBe('escalated')
+      expect(escalations).toHaveLength(1)
+      expect(diagnosed).toBe(0)
+    })
+  })
+
   it('workspace_quarantined は診断も Gate も経ずに1回だけ escalate し、解除はしない（W5）', async () => {
     const { storage, projectId, taskId } = seed()
     const job = storage.jobs.create({

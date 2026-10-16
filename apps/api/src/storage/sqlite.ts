@@ -1984,18 +1984,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // ここは claim の単一の choke point（IMMEDIATE transaction 内）なので、同じ意味
         // （`isLiveWorkspaceOwnerJob`。Worker と共有）で archived 以外の全 Project を再確認する。
         //
-        // **blocked 行はこの guard に入れない。** Job が blocked になれるのは running からだけで、
-        // running になるには claim が要り、その claim をこの guard が直列化している。blocked / dirty
-        // の帰属（done Task に残った行の解放証明を含む）は worktree を観測できる Worker 側に残す。
-        const otherLiveJobs = db.prepare(
+        // **un-superseded な blocked 行も所有者として数える。** blocked は running からだけでなく
+        // queued からも起こる（`jobResultApplicationPolicy` は queued → blocked を許し、開始前の
+        // 拒否は blocked + quarantine へ変換される）ので、claim の直列化だけでは防げない。
+        // Human Resume で後継が作られた旧行は既存 reader（`readJobsSupersededByHumanResume`）で除く
+        // （resume が終端化した source は既に failed）。done な Task に残った blocked 行も除かない:
+        // 解放の証明は Worker の worktree 観測だけで、API 側には永続化されていない（fail-closed）。
+        const otherOwnerRows = db.prepare(
           "SELECT j.task_id AS task_id, j.status AS status, j.workflow_step_key AS workflow_step_key "
           + 'FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
-          + "WHERE p.status != 'archived' AND j.task_id != ? AND j.status IN ('queued','running')",
+          + "WHERE p.status != 'archived' AND j.task_id != ? AND j.status IN ('queued','running','blocked')",
         ).all(existing.taskId) as Array<{ task_id: string; status: string; workflow_step_key: string | null }>
-        if (otherLiveJobs.some((row) => isLiveWorkspaceOwnerJob(row.task_id, {
+        if (otherOwnerRows.some((row) => isLiveWorkspaceOwnerJob(row.task_id, {
           status: row.status,
           workflowStepKey: row.workflow_step_key,
         }))) {
+          return existing
+        }
+        const blockedTaskIds = [...new Set(otherOwnerRows
+          .filter((row) => row.status === 'blocked')
+          .map((row) => row.task_id))]
+        const hasBlockedOwner = blockedTaskIds.some((taskId) => {
+          const taskJobs = jobs.findByTaskId(taskId)
+          const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
+          return taskJobs.some((job) => job.status === 'blocked' && !superseded.has(job.id))
+        })
+        if (hasBlockedOwner) {
           return existing
         }
       }
