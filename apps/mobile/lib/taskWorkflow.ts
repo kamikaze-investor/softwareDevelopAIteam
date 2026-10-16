@@ -547,6 +547,29 @@ export function deriveSafeCommandQaEvidence(implementJob: Job): DerivedQaEvidenc
     + ' Worker が AI CLI 終了後に別途実行した結果であり、実装 AI の自己申告ではない。'
     + (implementJob.stdoutPath ? ` 完全なログ: ${implementJob.stdoutPath}` : '')
 
+  // `verificationProfile: 'implement'` の Job は Worker が `verify:implement`
+  // （typecheck → test。typecheck 失敗時は test へ進まない）を実行しており、exitCode 0 は両方の成功を意味する。
+  // profile の無い Job（導入前の Job を含む）は従来どおり typecheck を主張しない。
+  if (implementJob.safeCommand.params?.verificationProfile === 'implement') {
+    const profileEvidence = `${evidence} verificationProfile=implement (pnpm run verify:implement).`
+    return [
+      {
+        jobId: implementJob.id,
+        type: 'unit_test',
+        status: 'passed',
+        summary: 'Worker SafeCommand (kind=test, profile=implement) passed',
+        details: profileEvidence,
+      },
+      {
+        jobId: implementJob.id,
+        type: 'typecheck',
+        status: 'passed',
+        summary: 'Worker SafeCommand (kind=test, profile=implement) passed typecheck',
+        details: profileEvidence,
+      },
+    ]
+  }
+
   return [
     {
       jobId: implementJob.id,

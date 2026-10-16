@@ -655,6 +655,40 @@ describe('deriveSafeCommandQaEvidence — QA 事実は Job レコードから導
     expect(typecheck?.details).toContain('選ばれた検証は上記1つだけ')
   })
 
+  it('verificationProfile=implement の成功 Job だけ typecheck=passed を導く', () => {
+    const { implementJob } = storedReviewShape({
+      implement: {
+        safeCommand: {
+          kind: 'test',
+          workingDir: '/workspace/target',
+          params: { verificationProfile: 'implement' },
+        },
+      },
+    })
+    const derived = deriveSafeCommandQaEvidence(implementJob)
+
+    expect(derived.map((q) => `${q.type}:${q.status}`)).toEqual([
+      'unit_test:passed',
+      'typecheck:passed',
+    ])
+    expect(derived.every((q) => q.details.includes('verify:implement'))).toBe(true)
+  })
+
+  it('profile 付きでも失敗した Job からは typecheck を主張しない', () => {
+    const { implementJob } = storedReviewShape({
+      implement: {
+        status: 'failed',
+        exitCode: 1,
+        safeCommand: {
+          kind: 'test',
+          workingDir: '/workspace/target',
+          params: { verificationProfile: 'implement' },
+        },
+      },
+    })
+    expect(deriveSafeCommandQaEvidence(implementJob)).toEqual([])
+  })
+
   // **観測できない形からは QA を作らない。** `failed` な Job は AI CLI 段で早期失敗して
   // SafeCommand が走っていない場合もあり、Job レコードからは区別がつかない。
   it('SafeCommand が失敗していれば QA を作らない（実行の有無を断定しない）', () => {

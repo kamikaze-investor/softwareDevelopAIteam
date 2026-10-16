@@ -34,6 +34,13 @@ export interface SafeCommandParams {
   testPattern?: string      // test: 特定テストのみ実行
 
   /**
+   * test: 固定された検証プロファイル。`'implement'` は typecheck → test の順に実行する
+   * （commandResolver が root の `verify:implement` script へ固定解決する）。
+   * 任意コマンドを選ばせるものではなく、既知の値以外は API が拒否する。testPattern とは併用不可。
+   */
+  verificationProfile?: 'implement'
+
+  /**
    * git_commit のプレフィックス（JPstock方式: git log が誰が何をしたかのタイムラインになる）
    *   '[claude_code task-xxx]' または '[codex task-xxx]'
    * Workerが自動でセットする（AI入力ではないためサニタイズ不要）
