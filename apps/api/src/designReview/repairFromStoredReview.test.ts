@@ -123,8 +123,7 @@ function productionShape(storage: IStorage, taskOverrides: Record<string, unknow
  * `approval_actor` の記録も残す（epoch は human が決めた承認しか数えない）。
  */
 function approve(storage: IStorage, approvalRequestId: string) {
-  recordApprovalActor(storage, approvalRequestId, 'admin')
-  return storage.approvalRequests.recordDecision(approvalRequestId, 'APPROVED')
+  return storage.approvalRequests.recordDecision(approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
 }
 
 const call = (storage: IStorage, taskId: string, reviewJobId: string) =>
@@ -311,7 +310,7 @@ describe('recovery action — 承認を経て canonical repair へ戻る', () =>
     const first = call(storage, ids.taskId, reviewJob.id)
     if (first.status !== 'awaiting_approval') throw new Error(`unexpected ${first.status}`)
     // actor 行を書かない決定 = actor 記録導入前の承認と同じ形。
-    storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+    storage.approvalRequests.updateStatus(first.approvalRequestId, 'APPROVED')
 
     const second = call(storage, ids.taskId, reviewJob.id)
     expect(second).toMatchObject({ status: 'awaiting_approval', reused: false })

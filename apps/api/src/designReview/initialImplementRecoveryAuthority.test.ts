@@ -136,8 +136,7 @@ describe('Stored Review Recovery: 最新の初回 implement は consume 済み�
       // 承認が無い間は何も queue しない。
       expect(shape.storage.designReviewRuns.findQueued()).toHaveLength(0)
 
-      recordApprovalActor(shape.storage, first.approvalRequestId, 'admin')
-      shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+      shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
       const second = recover(shape)
 
       expect(second).toMatchObject({ status: 'queued', stepKey: `repair:${shape.impl.id}:1` })
@@ -154,8 +153,7 @@ describe('Stored Review Recovery: 最新の初回 implement は consume 済み�
     await terminalRun(shape, 'REVIEW_UNAVAILABLE')
     const first = recover(shape)
     if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
-    recordApprovalActor(shape.storage, first.approvalRequestId, 'admin')
-    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
     expect(shape.storage.approvalRequests.verifyAndConsumeForTaskAction({
       taskId: shape.taskId,
       approvalRequestId: first.approvalRequestId,
@@ -364,13 +362,19 @@ function consumedRecoveryApproval(shape: Shape, actor: 'admin' | 'worker' | 'leg
     expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
     invalidIf: [],
   } as never)
-  if (actor !== 'none') recordApprovalActor(shape.storage, approval.id, actor)
-  shape.storage.approvalRequests.recordDecision(approval.id, 'APPROVED')
-  expect(shape.storage.approvalRequests.verifyAndConsumeForTaskAction({
-    taskId: shape.taskId,
-    approvalRequestId: approval.id,
-    expectedAction: repairRecoveryActionFor(shape.r0.id),
-  }).ok).toBe(true)
+  if (actor === 'admin') {
+    shape.storage.approvalRequests.recordDecision(approval.id, 'APPROVED', undefined, { credentialClass: 'admin' })
+    expect(shape.storage.approvalRequests.verifyAndConsumeForTaskAction({
+      taskId: shape.taskId,
+      approvalRequestId: approval.id,
+      expectedAction: repairRecoveryActionFor(shape.r0.id),
+    }).ok).toBe(true)
+  } else {
+    // 人でない（または記録の無い）承認は、今は consume できない（APPROVAL_ACTOR_NOT_HUMAN）。
+    // それでも過去に consume 済みになった行（actor 記録導入前）は存在しうるので、その形を直接作る。
+    if (actor !== 'none') recordApprovalActor(shape.storage, approval.id, actor)
+    shape.storage.approvalRequests.updateStatus(approval.id, 'CONSUMED')
+  }
   return approval.id
 }
 
@@ -409,8 +413,7 @@ describe('consume 済み承認は、人が決めた記録があるときだけ a
     await terminalRun(shape, 'REVIEW_UNAVAILABLE')
     const first = recover(shape)
     if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
-    recordApprovalActor(shape.storage, first.approvalRequestId, 'legacy')
-    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED', undefined, { credentialClass: 'legacy' })
 
     const second = recover(shape)
     expect(second).toMatchObject({ status: 'awaiting_approval', reused: false })
@@ -514,8 +517,7 @@ describe('Stored Review Recovery の skip も repair_admission_skipped を残す
     await terminalRun(shape, 'REVIEW_UNAVAILABLE')
     const first = recover(shape)
     if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
-    recordApprovalActor(shape.storage, first.approvalRequestId, 'admin')
-    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
     // 承認と consume の間に live Job が現れる（step 8 で skip になる）。
     job(shape.storage, shape, { aiCliMode: 'implement', workflowStepKey: 'manual' }, { status: 'running' })
 

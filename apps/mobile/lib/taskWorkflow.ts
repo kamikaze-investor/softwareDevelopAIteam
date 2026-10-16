@@ -344,6 +344,8 @@ export function canShowResumeUI(
     parked: task.parked,
     projectStatus: task.projectStatus ?? undefined,
     jobs: jobsInAdmissionOrder(jobs),
+    // Mobile の操作は CEO（ADMIN credential）なので人の resume として判定する（API と同じ規則）。
+    resumedByHuman: true,
     approvals: approvalRequests,
     nowMs,
   }).ok

@@ -761,7 +761,12 @@ export interface IApprovalRequestStorage {
     taskId: string
     approvalRequestId: string
     expectedAction: string
-  }): { ok: true } | { ok: false; reason: string }
+  }): { ok: true } | {
+    ok: false
+    /** 人が決めた記録の無い APPROVED。SUPERSEDED にされ、改めて人の承認が要る。 */
+    code?: 'APPROVAL_ACTOR_NOT_HUMAN'
+    reason: string
+  }
   findByTaskId(taskId: string): ApprovalRequest[]
   findById(id: string): ApprovalRequest | undefined
   /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す（CONSUMED は除外） */
@@ -783,9 +788,9 @@ export interface IApprovalRequestStorage {
   ): CreateApprovalForJobResult
   /**
    * WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。
-   * `decidedBy` を渡すと、承認・Job 再 queue と同じ transaction で `approval_actor` 行を書く。
+   * 承認・Job 再 queue と同じ transaction で `decidedBy` の `approval_actor` 行を書く（必須）。
    */
-  approveAndResumeJob(id: string, reason?: string, decidedBy?: ApprovalDecisionActor): ReviewApprovalAndResumeJobResult
+  approveAndResumeJob(id: string, reason: string | undefined, decidedBy: ApprovalDecisionActor): ReviewApprovalAndResumeJobResult
   /** Job/Task/Action/baselineを検証して git_commit Approval を一度だけconsumeする。 */
   consumeForJob(input: {
     id: string
@@ -816,13 +821,13 @@ export interface IApprovalRequestStorage {
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
   /**
    * 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用）。
-   * `decidedBy` を渡すと、決定と同じ transaction で `approval_actor` 行も書く（片方だけ残らない）。
+   * 決定と同じ transaction で `decidedBy` の `approval_actor` 行も書く（必須。片方だけ残らない）。
    */
   recordDecision(
     id: string,
     status: 'APPROVED' | 'REJECTED',
-    reason?: string,
-    decidedBy?: ApprovalDecisionActor,
+    reason: string | undefined,
+    decidedBy: ApprovalDecisionActor,
   ): ApprovalRequest | undefined
 }
 

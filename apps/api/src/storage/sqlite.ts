@@ -20,7 +20,7 @@ import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
 import { DesignReviewRunContentionError } from './interface'
-import { COMMAND_ZONES, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
+import { isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -61,7 +61,7 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
-import { approvalActorAuditRecord, readJobsSupersededByHumanResume, resumeActorAuditRecord } from '../designReview/resumeActor'
+import { approvalActorAuditRecord, readApprovalActorClass, readJobsSupersededByHumanResume, resumeActorAuditRecord } from '../designReview/resumeActor'
 
 /** resume transaction 内で authority evidence（`resume_actor`）が書けなかったことを表す（G-01）。 */
 class ResumeAuthorityEvidenceWriteError extends Error {
@@ -984,7 +984,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   function verifyAndConsumeAbortApproval(
     taskId: string,
     approvalRequestId: string,
-  ): { ok: true } | { ok: false; reason: string } {
+  ): { ok: true } | { ok: false; code?: 'APPROVAL_ACTOR_NOT_HUMAN'; reason: string } {
     return verifyAndConsumeTaskApproval(taskId, approvalRequestId, 'abort_task')
   }
 
@@ -1019,7 +1019,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     cleanupSummary?: TechnicalAbortCleanupSummary,
   ): { ok: true } | { ok: false; reason: string; code?: 'HUMAN_DECISION_CONFLICT' } {
     if (authorization.kind === 'manual_approval') {
-      return verifyAndConsumeAbortApproval(task.id, authorization.approvalRequestId)
+      const consumed = verifyAndConsumeAbortApproval(task.id, authorization.approvalRequestId)
+      if (consumed.ok) return consumed
+      // 呼び出し側の code 空間（PRECONDITION_FAILED）へ写す。理由文に code を残し、再承認が要ると分かるようにする。
+      return { ok: false, reason: consumed.code ? `${consumed.code}: ${consumed.reason}` : consumed.reason }
     }
     if (carrier === undefined) {
       return { ok: false, reason: 'technical abort requires a cleanup carrier Job' }
@@ -1208,17 +1211,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * command kind の承認は commit / diff / Job に束縛済みで、この問題を持たない。
    * `REJECTED` / `CONSUMED` / `STALE` / `EXPIRED` / `SUPERSEDED` は変えない。reason / reviewed_at も書かない。
    */
-  /** 規則は1箇所: command kind（`git_commit` を含む）でない requestedAction が Task 単位の判断である。 */
+  /** 分類は共有 `isTaskScopedApprovalAction`（command kind でない requestedAction が Task 単位の判断）。 */
   function activeTaskScopedDecisions(
     taskId: string,
   ): Array<{ id: string; status: ApprovalGateStatus; expiresAt: string }> {
-    const commandKinds = new Set<string>(Object.keys(COMMAND_ZONES))
     return (db.prepare(`
       SELECT id, status, expires_at, requested_action FROM approval_requests
       WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
       ORDER BY created_at ASC, rowid ASC
     `).all(taskId) as Array<{ id: string; status: ApprovalGateStatus; expires_at: string; requested_action: string }>)
-      .filter((row) => !commandKinds.has(row.requested_action))
+      .filter((row) => isTaskScopedApprovalAction(row.requested_action))
       .map((row) => ({ id: row.id, status: row.status, expiresAt: row.expires_at }))
   }
 
@@ -1274,7 +1276,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     taskId: string,
     approvalRequestId: string,
     expectedAction: string,
-  ): { ok: true } | { ok: false; reason: string } {
+  ): { ok: true } | { ok: false; code?: 'APPROVAL_ACTOR_NOT_HUMAN'; reason: string } {
     const row = db.prepare('SELECT * FROM approval_requests WHERE id = ?').get(approvalRequestId) as any
     if (!row) {
       return { ok: false, reason: `approval request ${approvalRequestId} does not exist` }
@@ -1304,6 +1306,31 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     }
     if (expiresAtMs <= Date.now()) {
       return { ok: false, reason: `approval request ${approvalRequestId} has expired` }
+    }
+    // **人が決めた記録（approval_actor = human）の無い APPROVED は authority ではない**（Codex review 361c19a）。
+    // legacy 単一 token / actor 記録導入前の決定は行の状態だけでは人の判断と区別できない。使い切らずに
+    // 同じ transaction で SUPERSEDED にし（supersede audit 付き）、改めて人の承認を求める。
+    if (readApprovalActorClass(storage, approvalRequestId) !== 'human') {
+      const superseded = db.prepare(
+        "UPDATE approval_requests SET status = 'SUPERSEDED' WHERE id = ? AND status = 'APPROVED'",
+      ).run(approvalRequestId)
+      if (superseded.changes === 1) {
+        auditLog.record({
+          actor: 'api',
+          operation: 'supersede',
+          entityType: 'approval_request',
+          entityId: approvalRequestId,
+          result: 'success',
+          detail: 'reason=approval_actor_not_human',
+        })
+      }
+      return {
+        ok: false,
+        code: 'APPROVAL_ACTOR_NOT_HUMAN',
+        reason:
+          `approval request ${approvalRequestId} has no record that a human (ADMIN credential) decided it;`
+          + ' it was superseded and a fresh human approval is required',
+      }
     }
 
     const consumed = db.prepare(
@@ -3056,6 +3083,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           jobs: taskJobs,
           approvals: approvalRows.map(deserializeApprovalRequest),
           nowMs: Date.parse(now()),
+          // 人の resume は生きた Task 単位の判断を置き換える（completeResumeHandoff）。人でない resume は
+          // それがある間 HUMAN_DECISION_PENDING（C-03）。規則は共有 admission の1箇所（Mobile と同じ）。
+          resumedByHuman: resumedBy?.actorClass === 'human',
         })
 
         // 通常はJob自体がblockedの場合のみ再開対象（guard違反等）。
@@ -3093,6 +3123,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               return { ok: false, code: 'LIVE_JOB_EXISTS', reason: 'A queued or running job already exists for this task' }
             case 'APPROVAL_WAITING':
               return { ok: false, code: 'APPROVAL_WAITING', reason: 'The latest approval request is waiting for user review' }
+            case 'HUMAN_DECISION_PENDING':
+              return {
+                ok: false,
+                code: 'HUMAN_DECISION_PENDING',
+                reason: 'Task has a live task-scoped human decision (WAITING or APPROVED); only a human resume supersedes it',
+              }
             case 'AI_CLI_MODE_MISSING':
             case 'AI_CLI_PROVIDER_MISSING':
               return { ok: false, code: admission.code, reason: 'Latest blocked job is missing AI CLI provider or mode' }
@@ -3100,23 +3136,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         if (!latestJob) {
           return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
-        }
-        // **人の判断が生きている間、人でない resume（PL / AI / 主体不明）は再開しない**（C-03 の残り）。
-        // 人の resume は新しい人の判断として古い Task 単位の判断を置き換える（completeResumeHandoff）。
-        // 人でない resume がそれを置き換えれば AI が CEO の判断を取り消せてしまい、置き換えずに再開すれば
-        // 古い APPROVED abort が再開後の作業を後から park する。どちらも避け、正当な人の判断待ちとして返す。
-        // 期限の読み方は shared の遅延判定（期限切れ行は誰の判断でもない）。
-        if (resumedBy?.actorClass !== 'human') {
-          const nowMs = Date.parse(now())
-          const pending = activeTaskScopedDecisions(taskId).find((row) =>
-            isLiveApprovedApproval(row, nowMs) || isLiveWaitingApproval(row, nowMs))
-          if (pending !== undefined) {
-            return {
-              ok: false,
-              code: 'HUMAN_DECISION_PENDING',
-              reason: `Task has a live ${pending.status} task-scoped decision (${pending.id}); only a human resume supersedes it`,
-            }
-          }
         }
         const isJobDirectlyBlocked = latestJob.status === 'blocked'
 
@@ -4693,6 +4712,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return createTransaction()
     },
     approveAndResumeJob(id, reason, decidedBy): ReviewApprovalAndResumeJobResult {
+      if (decidedBy === undefined) throw new Error('approveAndResumeJob requires decidedBy (approval_actor evidence)')
       const approveTransaction = db.transaction((): ReviewApprovalAndResumeJobResult => {
         const record = (result: ReviewApprovalAndResumeJobResult): ReviewApprovalAndResumeJobResult => {
           auditLog.record({
@@ -4803,9 +4823,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         // 「誰が決めたか」は承認・Job 再 queue と同じ transaction で書く（H-03）。ここで失敗したら
         // 承認も再 queue も rollback される —— human evidence の無い APPROVED を残さない。
-        if (decidedBy !== undefined) {
-          auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
-        }
+        auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
 
         const approvalRequest = approvalRequests.findById(id)
         const resumedJob = jobs.findById(job.id)
@@ -5060,6 +5078,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return { ...existing, status, reason: newReason ?? undefined, reviewedAt: newReviewedAt ?? undefined }
     },
     recordDecision(id, status, reason, decidedBy) {
+      if (decidedBy === undefined) throw new Error('recordDecision requires decidedBy (approval_actor evidence)')
       const decisionTransaction = db.transaction((): ApprovalRequest | undefined => {
         const updated = approvalRequests.updateStatus(id, status, reason)
         if (updated) {
@@ -5071,9 +5090,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             result: 'success',
           })
           // 決定と「誰が決めたか」は同じ transaction（H-03）。片方だけが commit される窓を残さない。
-          if (decidedBy !== undefined) {
-            auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
-          }
+          auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
         }
         return updated
       })

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { occupiesProject, type JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
+import { recordApprovalActor } from '../designReview/resumeActor'
 import { buildSystemState } from '../state/systemState'
 import { recoverBlockedTask } from '../humanRecovery/recoverBlockedTask'
 import { abortTask, completeAbortCleanup, requestTechnicalAbort } from './abortTask'
@@ -255,7 +256,7 @@ function approve(storage: IStorage, taskId: string, action = 'abort_task'): stri
     changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
     status: 'WAITING_FOR_USER', expiresAt: FUTURE,
   } as Parameters<IStorage['approvalRequests']['create']>[0])
-  storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+  storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
   return request.id
 }
 
@@ -277,6 +278,8 @@ function approvedRequest(
     status: 'APPROVED',
     expiresAt: options.expiresAt ?? FUTURE,
   } as Parameters<IStorage['approvalRequests']['create']>[0])
+  // 人（ADMIN）が決めた承認として作る（Task 単位の承認は approval_actor = human で初めて authority）。
+  recordApprovalActor(storage, request.id, 'admin')
   return request.id
 }
 
@@ -1450,7 +1453,7 @@ describe('P2-2 Automatic Technical Abort', () => {
     expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
 
     // 人が承認し、stored-review recovery が消費して repair 用 Design Review が queued になった。
-    fx.storage.approvalRequests.updateStatus(late, 'APPROVED')
+    fx.storage.approvalRequests.recordDecision(late, 'APPROVED', undefined, { credentialClass: 'admin' })
     fx.storage.approvalRequests.updateStatus(late, 'CONSUMED', undefined, true)
     fx.storage.designReviewRuns.create({
       taskId: fx.taskId, taskTitle: 'repair', designText: 'd', designTextHash: 'h', changedFiles: [],
@@ -1985,7 +1988,7 @@ describe('P2-2 Automatic Technical Abort', () => {
       taskId: fx.taskId, approvalRequestId: waiting.id, reason: 'manual',
     })).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
 
-    fx.storage.approvalRequests.updateStatus(waiting.id, 'APPROVED')
+    fx.storage.approvalRequests.recordDecision(waiting.id, 'APPROVED', undefined, { credentialClass: 'admin' })
     expect(abortTask(fx.storage, {
       taskId: fx.taskId, approvalRequestId: waiting.id, reason: 'manual',
     })).toMatchObject({ ok: true, status: 'cleanup_requested' })
@@ -2793,7 +2796,7 @@ describe('abortTask — directly linked rejected git_commit observation-only rel
   it('refuses when the linked git_commit approval is no longer REJECTED during observation', () => {
     const fx = seedRejectedGitCommit()
     const abortApprovalId = requestRejectedGitCommitAbort(fx)
-    fx.storage.approvalRequests.updateStatus(fx.rejectedApprovalId, 'APPROVED')
+    fx.storage.approvalRequests.recordDecision(fx.rejectedApprovalId, 'APPROVED', undefined, { credentialClass: 'admin' })
 
     expect(completeAbortCleanup(fx.storage, {
       jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,

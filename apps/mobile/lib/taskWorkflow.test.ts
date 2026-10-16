@@ -190,6 +190,13 @@ describe('canShowResumeUI（共有 evaluateResumeAdmission と同じ判定）', 
     expect(canShowResumeUI(detail(), [blockedImplement()], [unlinked], NOW)).toBe(false)
   })
 
+  // C-03: Mobile の resume は CEO の操作（人の resume）。live WAITING の Task 単位 request は
+  // API が同じ transaction で置き換えるので、それだけなら Resume を出す（API と同じ判定）。
+  it('live WAITING の Task 単位 request（abort_task）だけなら出す（人の resume が置き換える）', () => {
+    const waitingAbort = approval({ id: 'approval-abort', requestedAction: 'abort_task' })
+    expect(canShowResumeUI(detail(), [blockedImplement()], [waitingAbort], NOW)).toBe(true)
+  })
+
   it('紐付いた承認待ちが live なら出さない', () => {
     const job = blockedImplement({ approvalId: 'approval-1' })
     expect(canShowResumeUI(detail(), [job], [approval({})], NOW)).toBe(false)
@@ -252,7 +259,7 @@ describe('canShowRecoverUI（共有 evaluateRecoverAdmission と同じ判定）'
     changedFiles: [],
     expiresAt,
     id: 'approval-1',
-    requestedAction: 'roadmap_adoption',
+    requestedAction: 'git_status', // command kind（Job 束縛）。Task 単位の request は recover が置き換える（C-03）
     riskLevel: 'HIGH',
     status: 'WAITING_FOR_USER',
     targetBranch: 'main',
@@ -283,6 +290,11 @@ describe('canShowRecoverUI（共有 evaluateRecoverAdmission と同じ判定）'
   it('live な承認待ちがあれば出さず、期限切れの WAITING なら出す', () => {
     expect(canShowRecoverUI(detail(), [], [waiting('2026-08-01T01:00:00.000Z')], NOW)).toBe(false)
     expect(canShowRecoverUI(detail(), [], [waiting('2026-08-01T00:00:00.000Z')], NOW)).toBe(true)
+  })
+
+  it('live WAITING の Task 単位 request だけなら出す（recover が同じ transaction で置き換える）', () => {
+    const taskScoped = { ...waiting('2026-08-01T01:00:00.000Z'), requestedAction: 'roadmap_adoption' }
+    expect(canShowRecoverUI(detail(), [], [taskScoped], NOW)).toBe(true)
   })
 
   it('parked を返さない古い API の Task には出さない', () => {

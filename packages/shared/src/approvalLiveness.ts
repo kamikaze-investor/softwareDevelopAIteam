@@ -1,4 +1,5 @@
 import type { ApprovalRequest } from './types/approval_gate'
+import { COMMAND_ZONES } from './types/command'
 
 /**
  * **その ApprovalRequest が「いま人の判断を待っている」か。**
@@ -36,4 +37,24 @@ export function isLiveApprovedApproval<T extends Pick<ApprovalRequest, 'status' 
 ): approval is T {
   if (approval?.status !== 'APPROVED') return false
   return new Date(approval.expiresAt).getTime() > nowMs
+}
+
+/**
+ * **その requestedAction が Task 単位の人の判断か**（abort_task / reconcile_external_completion /
+ * repair_from_stored_review:* 等）。command kind（git_commit を含む）の承認は commit / diff / Job に
+ * 束縛されており、Task 単位ではない。分類の唯一の出どころ（API storage の supersede / 拒否、
+ * resume / recover の admission、Mobile が同じ関数を使う）。
+ * `requestedAction` が分からない行は Task 単位と見なさない（Job 束縛側として従来どおり扱う）。
+ */
+export function isTaskScopedApprovalAction(requestedAction: string | undefined): boolean {
+  if (requestedAction === undefined) return false
+  return !Object.prototype.hasOwnProperty.call(COMMAND_ZONES, requestedAction)
+}
+
+/** 生きた（未期限の WAITING / APPROVED）Task 単位の人の判断か。 */
+export function isLiveTaskScopedDecision<
+  T extends Pick<ApprovalRequest, 'status' | 'expiresAt'> & { requestedAction?: string },
+>(approval: T, nowMs: number = Date.now()): boolean {
+  if (!isTaskScopedApprovalAction(approval.requestedAction)) return false
+  return isLiveWaitingApproval(approval, nowMs) || isLiveApprovedApproval(approval, nowMs)
 }

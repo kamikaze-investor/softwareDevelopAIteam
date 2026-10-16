@@ -2803,7 +2803,7 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       requestedAction, status: 'WAITING_FOR_USER',
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), invalidIf: [],
     } as Parameters<IStorage['approvalRequests']['create']>[0])
-    storage.approvalRequests.recordDecision(created.id, 'APPROVED', 'seeded')
+    storage.approvalRequests.recordDecision(created.id, 'APPROVED', 'seeded', { credentialClass: 'admin' })
     return created.id
   }
 
