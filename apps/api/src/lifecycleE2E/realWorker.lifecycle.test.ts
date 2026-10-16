@@ -391,12 +391,11 @@ describe.skipIf(!setup.gitAvailable)('real Worker E2E — HIGH approval', () => 
   })
 
   /**
-   * DEFECT D2 (being fixed concurrently in apps/worker/src/guards/gatePolicy.ts): after approval the Gate says
-   * ALLOW + call_consume, but the Worker's resolvePolicy() downgrades a local-HIGH `continue` to
-   * `continue_safe_work_only`, and git_commit is not a safe-work command, so runJob() returns `blocked` before
-   * consuming. Flip this to `it` once D2 merges.
+   * (was DEFECT D2, fixed by D2 v4) after approval the Gate says ALLOW + call_consume; the Worker's resolvePolicy()
+   * used to downgrade a local-HIGH `continue` to `continue_safe_work_only`, so runJob() returned `blocked` before
+   * consuming. resolvePolicy() no longer downgrades ALLOW by local risk.
    */
-  it.fails('RW4b DEFECT D2: the real Worker re-runs the approved git_commit, consumes the approval, commits and the Task is done', async () => {
+  it('RW4b (was DEFECT D2): the real Worker re-runs the approved git_commit, consumes the approval, commits and the Task is done', async () => {
     if (!rw4 || !api) throw new Error('RW4a did not leave an approved git_commit')
     const env = api.env
     const { taskId, commitJobId, approvalId, completedAt } = rw4
@@ -409,7 +408,6 @@ describe.skipIf(!setup.gitAvailable)('real Worker E2E — HIGH approval', () => 
       () => `approved git_commit re-run; now ${env.storage.jobs.findById(commitJobId)?.status}`,
     )
     const rerun = env.storage.jobs.findById(commitJobId)!
-    // On the D2 base this logs status=blocked with the approval still APPROVED (unconsumed).
     console.log(`[RW4b] approved git_commit re-run: status=${rerun.status} approval=${env.storage.approvalRequests.findById(approvalId)?.status}`)
     expect(rerun.status).toBe('success')
     await waitTaskStatus(taskId, 'done', 30_000)
