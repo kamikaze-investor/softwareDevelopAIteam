@@ -694,6 +694,41 @@ export function buildSystemState(
         })
       }
 
+      // **lifecycle が所有する status（in_progress / review）なのに、動かすものが何も無い Task**（lifecycle repair C3）。
+      //
+      // in_progress / review は Job・Design Review が Task を動かしている間の状態で、Project を占有する
+      // （currentTask）。汎用 CRUD は C3 からこの status を書けないが、それ以前に書かれた行や想定外の経路で
+      // 残った行は、live Job も active な Design Review run も無いまま占有し続け、どの attention にも出ない。
+      // blocked / failed の Job は job_blocked / job_failed が既に表すので、ここは「何も無い」ときだけ。
+      //
+      // 新しい kind は作らず `task_ready_without_job`（Task があるのに自分では何も始まらない。notify-only・
+      // 停滞閾値付き）を再利用する。`task_blocked_without_job` は blocked Task 専用の出口（Human Recovery
+      // = /recover。blocked 以外を拒否する）を前提にしており合わない。referenceId は Task の updatedAt 付きで、
+      // pending へ戻した後の通常の `task_ready_without_job:<taskId>` や次のエピソードと同一視しない。
+      if (
+        project.status === 'running'
+        && (task.status === 'in_progress' || task.status === 'review')
+        && !parentIsParked
+        && !hasMovableJob
+        && stallingFailure === undefined
+        && storage.designReviewRuns.findActiveByTaskId(task.id) === undefined
+        && findLiveWaitingApproval(storage, task.id, nowMs) === undefined
+        && findLiveTaskScopedDecision(storage, task.id, nowMs) === undefined
+      ) {
+        attention.push({
+          kind: 'task_ready_without_job',
+          projectId: project.id,
+          projectName: project.name,
+          taskId: task.id,
+          referenceId: `${task.id}:stranded:${task.status}:${task.updatedAt}`,
+          detail:
+            `task is ${task.status} (occupying the project) but has no live job and no active design review run; `
+            + 'nothing will move it on its own. Exit: move it back to pending with PATCH /api/tasks/:id '
+            + '{"status":"pending"} so the normal adoption path can drive it again, or park it with abort_task',
+          stuckForMs: elapsedMs(task.updatedAt, nowMs),
+        })
+      }
+
       if (project.status === 'running' && isReadyTaskWithoutJob(task, jobs)) {
         attention.push({
           kind: 'task_ready_without_job',

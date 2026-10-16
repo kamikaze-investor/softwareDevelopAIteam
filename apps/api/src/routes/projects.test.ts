@@ -738,6 +738,51 @@ describe('Project API', () => {
       })
     })
 
+    it('refuses archive / draft while an initial (non-repair) Design Review run is queued or running (lifecycle repair C3)', async () => {
+      await withApp(async (app) => {
+        const storage = await storageOf()
+        const project = await createProject(app, { status: 'running' })
+        const task = storage.tasks.create({
+          projectId: project.id, title: 'T', description: '', status: 'pending',
+          assignee: 'developer_ai', dependencies: [],
+        })
+        const run = storage.designReviewRuns.create({
+          taskId: task.id, taskTitle: 'T', designText: 'initial design', designTextHash: 'hash', changedFiles: [],
+        })
+
+        for (const target of ['archived', 'draft'] as const) {
+          const res = await patchStatus(app, project.id, target)
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ blockers: string[] }>(res.body).blockers).toEqual(['design_review_run'])
+        }
+        // running になっても同じ。
+        storage.designReviewRuns.claim(run.id, 3)
+        expect((await patchStatus(app, project.id, 'archived')).statusCode).toBe(409)
+      })
+    })
+
+    it('refuses archive / draft while a task_continuation is pending (lifecycle repair C3)', async () => {
+      await withApp(async (app) => {
+        const storage = await storageOf()
+        const project = await createProject(app, { status: 'running' })
+        const { taskId, jobId } = await createProjectJob(project.id, 'success', 'done')
+        const next = storage.tasks.create({
+          projectId: project.id, title: 'Next', description: '', status: 'pending',
+          assignee: 'developer_ai', dependencies: [],
+        })
+        storage.taskContinuations.create({
+          sourceJobId: jobId, projectId: project.id, completedTaskId: taskId, nextTaskId: next.id, status: 'pending',
+        } as Parameters<typeof storage.taskContinuations.create>[0])
+
+        for (const target of ['archived', 'draft'] as const) {
+          const res = await patchStatus(app, project.id, target)
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ blockers: string[] }>(res.body).blockers).toEqual(['pending_task_continuation'])
+        }
+        expect(storage.projects.findById(project.id)?.status).toBe('running')
+      })
+    })
+
     it('restoring an archived Project to paused is not blocked', async () => {
       await withApp(async (app) => {
         const project = await createProject(app, { status: 'archived' })

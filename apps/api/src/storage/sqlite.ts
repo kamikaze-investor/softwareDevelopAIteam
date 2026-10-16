@@ -18,7 +18,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode, CreateInitialImplementJobResult, CreateManualJobResult, AcknowledgeOutboxEventResult } from './interface'
 import { DesignReviewRunContentionError } from './interface'
 import { isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
@@ -86,6 +86,10 @@ export type ProjectActiveLifecycleKind =
   | 'queued_or_running_job'
   | 'blocked_job'
   | 'repair_design_review_run'
+  /** repair でない（initial implement 等）queued / running の Design Review run（lifecycle repair C3）。 */
+  | 'design_review_run'
+  /** pending の task_continuation（次 Task を作る途中。lifecycle repair C3）。 */
+  | 'pending_task_continuation'
 
 /**
  * archive / draft への遷移を拒否した理由。**status 変更と同じ transaction の中で**判定する。
@@ -699,6 +703,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   /**
+   * **別 Task が共有 workspace を所有しているか**（claim guard の所有者述語。唯一の実装）。
+   *
+   * archived 以外の全 Project について、live な所有者（`isLiveWorkspaceOwnerJob`。Worker と共有）か、
+   * workspace を所有する blocked 行（`taskHoldsWorkspaceViaBlockedRow`）を持つ別 Task があれば true。
+   * claim guard（queued → running）と手動 Job 作成（`createManualJob`。lifecycle repair C3）が使う。
+   * **呼び出し側の transaction の中で呼ぶ。**
+   */
+  function anotherTaskHoldsWorkspace(taskId: string): boolean {
+    const otherOwnerRows = db.prepare(
+      "SELECT j.task_id AS task_id, j.status AS status, j.workflow_step_key AS workflow_step_key "
+      + 'FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
+      + "WHERE p.status != 'archived' AND j.task_id != ? AND j.status IN ('queued','running','blocked')",
+    ).all(taskId) as Array<{ task_id: string; status: string; workflow_step_key: string | null }>
+    if (otherOwnerRows.some((row) => isLiveWorkspaceOwnerJob(row.task_id, {
+      status: row.status,
+      workflowStepKey: row.workflow_step_key,
+    }))) {
+      return true
+    }
+    const blockedTaskIds = [...new Set(otherOwnerRows
+      .filter((row) => row.status === 'blocked')
+      .map((row) => row.task_id))]
+    return blockedTaskIds.some(taskHoldsWorkspaceViaBlockedRow)
+  }
+
+  /**
    * Project を放棄すると所有者が見えなくなる lifecycle の種類。
    *
    * blocked Job が所有者かは claim guard・systemState と同じ `taskHoldsWorkspaceViaBlockedRow()`
@@ -725,6 +755,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       + 'AND r.repair_source_job_id IS NOT NULL LIMIT 1',
     ).get(projectId)
     if (repairRun) kinds.push('repair_design_review_run')
+
+    // **repair でない Design Review run も放棄を止める**（lifecycle repair C3）。initial implement の run が
+    // queued / running のまま archive / draft にすると、ALIGNED の後に archived Project へ誰も claim できない
+    // queued Job が入る（または review が宙に浮く）。名前は repair run と分けて安定させる。
+    const otherRun = db.prepare(
+      "SELECT r.id FROM design_review_runs r JOIN tasks t ON t.id = r.task_id "
+      + "WHERE t.project_id = ? AND r.status IN ('queued','running') "
+      + 'AND r.repair_source_job_id IS NULL LIMIT 1',
+    ).get(projectId)
+    if (otherRun) kinds.push('design_review_run')
+
+    // **pending の task_continuation も放棄を止める**（lifecycle repair C3）。放棄後に continuation が
+    // 「project is unavailable」で失敗し、次 Task が blocked になる。
+    const continuation = db.prepare(
+      "SELECT id FROM task_continuations WHERE project_id = ? AND status = 'pending' LIMIT 1",
+    ).get(projectId)
+    if (continuation) kinds.push('pending_task_continuation')
     return kinds
   }
 
@@ -2209,6 +2256,20 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     classifyOutboxEvent(jobId, outboxEvent) {
       return checkOutboxEvent(db, jobId, outboxEvent).status
     },
+    acknowledgeOutboxEventWithoutApplying(jobId, outboxEvent, stillNonApplicable) {
+      return db.transaction((): AcknowledgeOutboxEventResult => {
+        const dedup = checkOutboxEvent(db, jobId, outboxEvent)
+        if (dedup.status === 'conflict') return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        const job = jobs.findById(jobId)
+        if (!job) return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        if (dedup.status === 'deduplicated') return { ok: true, job, deduplicated: true }
+        if (!stillNonApplicable(job)) {
+          return { ok: false, code: 'NOW_APPLICABLE', reason: 'the job reached a state the event applies to' }
+        }
+        recordOutboxEvent(db, jobId, outboxEvent)
+        return { ok: true, job, deduplicated: false }
+      }).immediate()
+    },
     findByTaskId(taskId) {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
       return rows.map(deserializeJob)
@@ -2252,6 +2313,50 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       } catch {
         return undefined
       }
+    },
+    createManualJob(data) {
+      return db.transaction((): CreateManualJobResult => {
+        if (anotherTaskHoldsWorkspace(data.taskId)) {
+          return {
+            ok: false,
+            code: 'WORKSPACE_HELD_BY_OTHER_TASK',
+            reason: 'another task already holds the shared workspace; a second owner would deadlock every claim',
+          }
+        }
+        return { ok: true, job: jobs.create(data) }
+      }).immediate()
+    },
+    createInitialImplementJob(data) {
+      return db.transaction((): CreateInitialImplementJobResult => {
+        const task = db.prepare(
+          'SELECT status, project_id, roadmap_active, assignee FROM tasks WHERE id = ?',
+        ).get(data.taskId) as
+          | { status: string; project_id: string; roadmap_active: number; assignee: string }
+          | undefined
+        if (task === undefined) return { ok: false, code: 'TASK_NOT_FOUND', reason: 'task no longer exists' }
+        if (task.status !== 'pending' || task.roadmap_active !== 1 || task.assignee !== 'developer_ai') {
+          return {
+            ok: false,
+            code: 'TASK_NOT_INITIAL_TARGET',
+            reason: `task is no longer an initial workflow target (status=${task.status})`,
+          }
+        }
+        if (isParkedTaskId(data.taskId)) {
+          return { ok: false, code: 'TASK_PARKED', reason: 'task was parked by abort_task' }
+        }
+        // Project は Task の正本（tasks.project_id）から引く。
+        const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(task.project_id) as
+          | { status: string }
+          | undefined
+        if (project?.status !== 'running' || data.projectId !== task.project_id) {
+          return {
+            ok: false,
+            code: 'PROJECT_NOT_RUNNING',
+            reason: `project is not running (${project?.status ?? 'missing'})`,
+          }
+        }
+        return { ok: true, job: jobs.create(data) }
+      }).immediate()
     },
     saveFailureExplanation(jobId, envelope) {
       db.prepare(
@@ -2321,21 +2426,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 判定は `taskHoldsWorkspaceViaBlockedRow()`（shared `holdsWorkspaceWhenBlocked` +
         // Human Resume superseded 除外）。done な Task の stale 候補は Worker の worktree 観測と
         // baseline admission に任せる（ここで数えると Worker の解放後も claim が永久に止まる）。
-        const otherOwnerRows = db.prepare(
-          "SELECT j.task_id AS task_id, j.status AS status, j.workflow_step_key AS workflow_step_key "
-          + 'FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
-          + "WHERE p.status != 'archived' AND j.task_id != ? AND j.status IN ('queued','running','blocked')",
-        ).all(existing.taskId) as Array<{ task_id: string; status: string; workflow_step_key: string | null }>
-        if (otherOwnerRows.some((row) => isLiveWorkspaceOwnerJob(row.task_id, {
-          status: row.status,
-          workflowStepKey: row.workflow_step_key,
-        }))) {
-          return existing
-        }
-        const blockedTaskIds = [...new Set(otherOwnerRows
-          .filter((row) => row.status === 'blocked')
-          .map((row) => row.task_id))]
-        if (blockedTaskIds.some(taskHoldsWorkspaceViaBlockedRow)) {
+        if (anotherTaskHoldsWorkspace(existing.taskId)) {
           return existing
         }
       }

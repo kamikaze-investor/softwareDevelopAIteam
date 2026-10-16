@@ -409,6 +409,105 @@ describe('Task API', () => {
     })
   })
 
+  describe('lifecycle-owned task statuses (lifecycle repair C3)', () => {
+    it('POST /api/tasks refuses to create a task as in_progress / review / blocked', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        for (const status of ['in_progress', 'review', 'blocked']) {
+          const res = await app.inject({
+            method: 'POST', url: '/api/tasks',
+            payload: { projectId: project.id, title: 'T', assignee: 'developer_ai', status },
+          })
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('TASK_LIFECYCLE_STATE_OWNED')
+        }
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+      })
+    })
+
+    it('PATCH /api/tasks/:id refuses a transition INTO in_progress / review / blocked and leaves the task unchanged', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        for (const status of ['in_progress', 'review', 'blocked']) {
+          const res = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status } })
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('TASK_LIFECYCLE_STATE_OWNED')
+        }
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().tasks.findById(task.id)?.status).toBe('pending')
+      })
+    })
+
+    it('a stranded in_progress task (no live job, no active review) is visible and PATCH back to pending is its exit', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        // 旧経路が書いた不正な行を再現する（汎用 route からはもう書けない）。
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+
+        const stranded = buildSystemState(storage).attention.filter((a) => a.taskId === task.id)
+        expect(stranded.map((a) => a.kind)).toEqual(['task_ready_without_job'])
+        expect(stranded[0].detail).toContain('PATCH /api/tasks/:id')
+        expect(stranded[0].referenceId).toContain(':stranded:in_progress:')
+
+        // 同じ status のままの編集は遷移ではないので通る。
+        const same = await app.inject({
+          method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'in_progress', title: 'renamed' },
+        })
+        expect(same.statusCode).toBe(200)
+
+        const exit = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+        expect(exit.statusCode).toBe(200)
+        expect(storage.tasks.findById(task.id)?.status).toBe('pending')
+        expect(buildSystemState(storage).attention
+          .filter((a) => a.taskId === task.id && a.referenceId?.includes(':stranded:'))).toEqual([])
+      })
+    })
+
+    it('an in_progress task with an active design review run is not reported as stranded', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+        storage.designReviewRuns.create({
+          taskId: task.id, taskTitle: 'T', designText: 'd', designTextHash: 'h', changedFiles: [],
+        })
+        expect(buildSystemState(storage).attention
+          .filter((a) => a.taskId === task.id && a.referenceId?.includes(':stranded:'))).toEqual([])
+      })
+    })
+  })
+
+  it('POST /api/jobs refuses a manual job while another task holds the shared workspace (lifecycle repair C3)', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const first = await createTask(app, project.id, { title: 'A' })
+      const second = await createTask(app, project.id, { title: 'B' })
+      const payload = (task: Task) => ({
+        taskId: task.id, projectId: task.projectId, agentRole: 'developer_ai',
+        safeCommand: { kind: 'test' },
+      })
+
+      const ok = await app.inject({ method: 'POST', url: '/api/jobs', payload: payload(first) })
+      expect(ok.statusCode).toBe(201)
+      // 手動 Job は workflowStepKey を持たないので live な所有者。2 本目は multiple_live_owners の deadlock になる。
+      const refused = await app.inject({ method: 'POST', url: '/api/jobs', payload: payload(second) })
+      expect(refused.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(refused.body).code).toBe('WORKSPACE_HELD_BY_OTHER_TASK')
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(second.id)).toEqual([])
+      // 同じ Task へもう 1 本作るのは所有者の衝突ではない。
+      const sameTask = await app.inject({ method: 'POST', url: '/api/jobs', payload: payload(first) })
+      expect(sameTask.statusCode).toBe(201)
+    })
+  })
+
   it('POST /api/jobs rejects the new Task implement Job without Design Review evidence', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -623,7 +722,13 @@ describe('Task API', () => {
         status: 'running',
         startedAt: '2026-07-22T10:00:00.000Z',
       })
-      await createJob(app, betaTask)
+      // alpha の running Job が共有 workspace を所有している間、POST /api/jobs は別 Task の手動 Job を
+      // 断る（lifecycle repair C3）。この test は summary の表示を見るものなので、beta の行は fixture で置く。
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().jobs.create({
+        taskId: betaTask.id, projectId: betaTask.projectId, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      } as Parameters<ReturnType<typeof getStorage>['jobs']['create']>[0])
       await createApprovalRequest(alphaTask.id, { status: 'WAITING_FOR_USER' })
 
       const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
@@ -1665,18 +1770,20 @@ describe('Task API', () => {
   })
 
   it('PATCH /api/tasks/:id updates status', async () => {
+    // in_progress / review / blocked へ入る遷移は lifecycle の担当（TASK_LIFECYCLE_STATE_OWNED。lifecycle repair C3）。
+    // 汎用 PATCH が書ける status 遷移は、そこから出る方向（in_progress → pending）である。
     await withApp(async (app) => {
       const project = await createProject(app)
-      const created = await createTask(app, project.id)
+      const created = await createTask(app, project.id, { status: 'in_progress' })
 
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/tasks/${created.id}`,
-        payload: { status: 'in_progress' },
+        payload: { status: 'pending' },
       })
 
       expect(res.statusCode).toBe(200)
-      expect(parseBody<Task>(res.body).status).toBe('in_progress')
+      expect(parseBody<Task>(res.body).status).toBe('pending')
     })
   })
 

@@ -215,6 +215,25 @@ export type CreateRepairJobWithHandoffResult =
       reason: string
     }
 
+/** `acknowledgeOutboxEventWithoutApplying()` の結果。 */
+export type AcknowledgeOutboxEventResult =
+  | { ok: true; job: Job; deduplicated: boolean }
+  | { ok: false; code: 'OUTBOX_HASH_MISMATCH' | 'JOB_NOT_FOUND' | 'NOW_APPLICABLE'; reason: string }
+
+/** `createManualJob()` の結果。断った場合 Job は作られていない。 */
+export type CreateManualJobResult =
+  | { ok: true; job: Job }
+  | { ok: false; code: 'WORKSPACE_HELD_BY_OTHER_TASK'; reason: string }
+
+/** `createInitialImplementJob()` の結果。断った場合 Job は作られていない。 */
+export type CreateInitialImplementJobResult =
+  | { ok: true; job: Job }
+  | {
+      ok: false
+      code: 'TASK_NOT_FOUND' | 'TASK_NOT_INITIAL_TARGET' | 'TASK_PARKED' | 'PROJECT_NOT_RUNNING'
+      reason: string
+    }
+
 /**
  * handoff transaction 内で Task / Project 状態を確かめ直して断ったときの理由。
  * 断った場合 repair Job は作られず、source Job の所有権も変わらない。
@@ -470,6 +489,20 @@ export interface IJobStorage {
   findFailureExplanation(jobId: string): PersistedTaskFailureExplanationV1 | undefined
   saveFailureExplanation(jobId: string, envelope: PersistedTaskFailureExplanationV1): void
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
+  /**
+   * initial implement Job を、**Project が running で Task がまだ初回 workflow の対象**（roadmapActive・
+   * pending・developer_ai・park されていない）であることを**同じ transaction で確かめ直してから**作る
+   * （lifecycle repair C3）。Design Review を await している間に Project が archive / draft / pause され、
+   * または Task が done / park されたら作らない（archived Project に誰も claim できない queued Job を残さない）。
+   */
+  createInitialImplementJob(job: Omit<Job, 'id' | 'createdAt'>): CreateInitialImplementJobResult
+  /**
+   * `POST /api/jobs` の手動 Job を作る。**同じ transaction で**、claim guard と同じ所有者述語で
+   * 別 Task が共有 workspace を所有していないことを確かめる（lifecycle repair C3）。workflowStepKey の
+   * 無い queued Job は所有者と数えられるので、2 つの Task がそれぞれ持つと multiple_live_owners で
+   * すべての claim が止まる。
+   */
+  createManualJob(job: Omit<Job, 'id' | 'createdAt'>): CreateManualJobResult
   update(id: string, data: Partial<Job>): Job | undefined
   /**
    * Job更新（+Outbox冪等化）を行う。
@@ -490,6 +523,18 @@ export interface IJobStorage {
    * - `new`: 未適用（または outboxEvent 無し）
    */
   classifyOutboxEvent(jobId: string, outboxEvent: OutboxEventInput | undefined): 'new' | 'deduplicated' | 'conflict'
+  /**
+   * **適用できない Outbox 配送を「適用済み」として記録し、payload を何も適用しない**（lifecycle repair C3）。
+   *
+   * 同じ transaction で Job を読み直し、`stillNonApplicable(job)` が true のときだけ event を記録する
+   * （Worker はこの event を捨てられる）。Job の列は 1 つも書かない。読み直した時点で適用可能に
+   * なっていれば `NOW_APPLICABLE` を返し、呼び出し側は通常の適用経路へ進む。
+   */
+  acknowledgeOutboxEventWithoutApplying(
+    jobId: string,
+    outboxEvent: OutboxEventInput,
+    stillNonApplicable: (job: Job) => boolean,
+  ): AcknowledgeOutboxEventResult
   /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
   persistCommitSuccessWithContinuation(input: {
     jobId: string

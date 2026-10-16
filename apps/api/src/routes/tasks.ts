@@ -151,6 +151,26 @@ const TASK_DONE_REFUSAL = {
   code: 'TASK_DONE_USE_COMPLETION_ROUTE',
 } as const
 
+/**
+ * lifecycle が所有する status（lifecycle repair C3）。
+ *
+ * `in_progress` / `review` / `blocked` は「Job・Design Review・失敗処理がこの Task を動かしている」ことを
+ * 表す状態で、書き手は採用・review・失敗・resume・recovery の各 transaction だけである。
+ * 汎用 CRUD がそれを書けると、Job も Design Review も無いのに Project を占有し（currentTask）、
+ * attention も出口も無い Task を作れてしまう。汎用経路から**入る**遷移は拒否する。
+ * 出る方向（`in_progress` / `review` → `pending`）は従来どおり汎用 PATCH が出口である
+ * （`blocked` から出るのは recover / resume の担当。下の TASK_BLOCKED_USE_RECOVERY_ROUTE）。
+ */
+export const LIFECYCLE_OWNED_TASK_STATUSES: ReadonlySet<string> = new Set(['in_progress', 'review', 'blocked'])
+
+const TASK_LIFECYCLE_STATE_OWNED_REFUSAL = {
+  error:
+    'in_progress / review / blocked are owned by the task lifecycle (adoption, design review, job failure, '
+    + 'resume and recovery) and cannot be set through this generic route. Create tasks as pending; '
+    + 'a task that is stuck in in_progress / review without a live job can be moved back to pending here.',
+  code: 'TASK_LIFECYCLE_STATE_OWNED',
+} as const
+
 const ListQuerySchema = z.object({
   projectId: z.string().min(1),
 })
@@ -453,6 +473,10 @@ export async function taskRoutes(
     // PATCH と同じ理由で、完了済みとして**作る**ことも許さない（根拠の無い done を作れる裏口になる）。
     if (result.data.status === 'done') {
       return reply.status(409).send(TASK_DONE_REFUSAL)
+    }
+    // 作成は `pending` だけ。lifecycle が所有する status で**作る**と、Job も Design Review も無い占有 Task になる。
+    if (LIFECYCLE_OWNED_TASK_STATUSES.has(result.data.status)) {
+      return reply.status(409).send(TASK_LIFECYCLE_STATE_OWNED_REFUSAL)
     }
 
     const project = storage.projects.findById(result.data.projectId)
@@ -758,6 +782,18 @@ export async function taskRoutes(
         error: 'Task was parked by abort_task; it cannot be moved back into an occupying status',
         code: 'TASK_PARKED',
       })
+    }
+
+    // **lifecycle が所有する status へ、この汎用経路から入らせない**（lifecycle repair C3）。
+    // 同じ status のままの PATCH（title 等の編集に status を添えたもの）は遷移ではないので通す。
+    if (result.data.status !== undefined && LIFECYCLE_OWNED_TASK_STATUSES.has(result.data.status)) {
+      const current = storage.tasks.findById(req.params.id)
+      if (!current) {
+        return reply.status(404).send({ error: 'Task not found' })
+      }
+      if (current.status !== result.data.status) {
+        return reply.status(409).send(TASK_LIFECYCLE_STATE_OWNED_REFUSAL)
+      }
     }
 
     // **blocked からの復帰をこの汎用経路で行わせない。**
