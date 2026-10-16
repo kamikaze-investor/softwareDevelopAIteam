@@ -60,13 +60,9 @@ async function seedBlockedTaskWithoutJob(app: FastifyInstance): Promise<string> 
   const { getStorage } = await import('../storage/index.js')
   getStorage().tasks.update(taskId, { roadmapActive: true })
 
-  // pending -> blocked は従来どおり通る（閉じたのは blocked から**出る**方向だけ）。
-  const blocked = await app.inject({
-    method: 'PATCH',
-    url: `/api/tasks/${taskId}`,
-    payload: { status: 'blocked' },
-  })
-  expect(blocked.statusCode).toBe(200)
+  // blocked への遷移は lifecycle の担当で、汎用 PATCH からはもう書けない（TASK_LIFECYCLE_STATE_OWNED。
+  // lifecycle repair C3）。failContinuation 等が書いた blocked を fixture で置く。
+  getStorage().tasks.update(taskId, { status: 'blocked' })
   return taskId
 }
 
@@ -230,15 +226,18 @@ describe('PATCH /api/tasks/:id は blocked からの復帰に使えない', () =
         },
       })
       const taskId = (JSON.parse(task.body) as { id: string }).id
+      // 汎用 PATCH が書ける status 遷移は lifecycle の所有状態から**出る**方向（lifecycle repair C3）。
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().tasks.update(taskId, { status: 'in_progress' })
 
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/tasks/${taskId}`,
-        payload: { status: 'in_progress' },
+        payload: { status: 'pending' },
       })
 
       expect(res.statusCode).toBe(200)
-      expect((JSON.parse(res.body) as Task).status).toBe('in_progress')
+      expect((JSON.parse(res.body) as Task).status).toBe('pending')
     })
   })
 

@@ -45,6 +45,7 @@ const RESUME_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
   TASK_PARKED: 'このTaskは中止（保留）されているため、再開できません。',
   WORKSPACE_QUARANTINED: '安全のため停止しているため、追加指示では再開できません。AI開発チーム側で作業領域の復旧が必要です。',
   LIVE_JOB_EXISTS: '既に実行中または待機中の作業があるため、追加指示を送れませんでした。',
+  REPAIR_REVIEW_IN_FLIGHT: '修正の設計レビューが進行中のため、追加指示を送れませんでした。レビューの結果を待ってください。',
   APPROVAL_WAITING: '承認待ちの操作があるため、追加指示を送れませんでした。',
   HUMAN_DECISION_PENDING: '承認画面で判断待ち・判断済みの操作（中止など）があるため、この操作では再開できませんでした。CEOの操作として再開してください。',
   AI_CLI_MODE_MISSING: 'AI実行設定が不足しているため、再開できませんでした。',

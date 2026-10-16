@@ -65,16 +65,59 @@ export function isHumanExecutedTaskDecision(requestedAction: string | undefined)
 }
 
 /**
- * **人の判断がいま Task を止めている**か: 未期限 WAITING の Task 単位 request（判断そのものを待っている）、
- * または未期限 APPROVED の、人が実行する Task 単位判断（実行を人が待っている）。
- * 人でない resume はこれがある間 `HUMAN_DECISION_PENDING`、systemState は `job_blocked` ではなく
- * `approval_waiting` として見せる。
+ * 承認の決定主体（API が `approval_actor` audit から読んだ事実。`readApprovalActorClass()` の結果）。
+ * **shared の純関数は storage を読まない。** API がこの事実を計算して渡す（Mobile へは
+ * `TaskDetail.humanTaskDecisions` として届く）。渡されない（undefined）行は human ではない。
  */
-export function isLiveTaskScopedDecision<
-  T extends Pick<ApprovalRequest, 'status' | 'expiresAt'> & { requestedAction?: string },
->(approval: T, nowMs: number = Date.now()): boolean {
+export type ApprovalActorFact = 'human' | 'ai' | 'unknown'
+
+/** Task 単位の人の判断の判定に使う入力。`approvalActor` は API が付ける型付きの事実。 */
+export type TaskDecisionApprovalInput = Pick<ApprovalRequest, 'status' | 'expiresAt'> & {
+  requestedAction?: string
+  approvalActor?: ApprovalActorFact
+}
+
+/** 生きた Task 単位の人の判断の状態。waiting = 判断を待っている / approved = 人の実行を待っている。 */
+export type LiveTaskDecisionState = 'waiting' | 'approved'
+
+/**
+ * **Task 単位の人の判断の唯一の事実**（lifecycle repair C3）。
+ *
+ * - 未期限 WAITING の Task 単位 request → `waiting`（判断そのものを待っている）。
+ * - 未期限 APPROVED の、人が実行する Task 単位判断 → **決定主体が human のときだけ** `approved`。
+ *   実行側（storage `verifyAndConsumeTaskApproval`）は approval_actor=human の無い APPROVED を
+ *   authority として使わず SUPERSEDED にする。主体の無い legacy 行をここで「人の判断」と数えると、
+ *   authority の無い行が HUMAN_DECISION_PENDING・job_blocked の抑止・Mobile の「承認済み」を生む
+ *   （C3 独立レビュー P1）。
+ * - それ以外 → undefined。
+ */
+export function liveTaskDecisionState(
+  approval: TaskDecisionApprovalInput,
+  nowMs: number = Date.now(),
+): LiveTaskDecisionState | undefined {
   const action = approval.requestedAction
-  if (!isTaskScopedApprovalAction(action)) return false
-  if (isLiveWaitingApproval(approval, nowMs)) return true
-  return isHumanExecutedTaskDecision(action) && isLiveApprovedApproval(approval, nowMs)
+  // 型ガードの否定分岐で narrowing が never にならないよう、先に読む。
+  const actor = approval.approvalActor
+  if (!isTaskScopedApprovalAction(action)) return undefined
+  if (isLiveWaitingApproval(approval, nowMs)) return 'waiting'
+  if (
+    isHumanExecutedTaskDecision(action)
+    && isLiveApprovedApproval(approval, nowMs)
+    && actor === 'human'
+  ) {
+    return 'approved'
+  }
+  return undefined
+}
+
+/**
+ * **人の判断がいま Task を止めている**か（`liveTaskDecisionState()` が状態を返すか）。
+ * 人でない resume はこれがある間 `HUMAN_DECISION_PENDING`、systemState は `job_blocked` ではなく
+ * `approval_waiting` として見せる。APPROVED は `approvalActor === 'human'` のときだけ数える。
+ */
+export function isLiveTaskScopedDecision(
+  approval: TaskDecisionApprovalInput,
+  nowMs: number = Date.now(),
+): boolean {
+  return liveTaskDecisionState(approval, nowMs) !== undefined
 }

@@ -409,6 +409,238 @@ describe('Task API', () => {
     })
   })
 
+  describe('lifecycle-owned task statuses (lifecycle repair C3)', () => {
+    it('POST /api/tasks refuses to create a task as in_progress / review / blocked', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        for (const status of ['in_progress', 'review', 'blocked']) {
+          const res = await app.inject({
+            method: 'POST', url: '/api/tasks',
+            payload: { projectId: project.id, title: 'T', assignee: 'developer_ai', status },
+          })
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('TASK_LIFECYCLE_STATE_OWNED')
+        }
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().tasks.findByProjectId(project.id)).toEqual([])
+      })
+    })
+
+    it('PATCH /api/tasks/:id refuses a transition INTO in_progress / review / blocked and leaves the task unchanged', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        for (const status of ['in_progress', 'review', 'blocked']) {
+          const res = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status } })
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('TASK_LIFECYCLE_STATE_OWNED')
+        }
+        const { getStorage } = await import('../storage/index.js')
+        expect(getStorage().tasks.findById(task.id)?.status).toBe('pending')
+      })
+    })
+
+    it('a stranded in_progress task (no live job, no active review) is visible and PATCH back to pending is its exit', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        // 旧経路が書いた不正な行を再現する（汎用 route からはもう書けない）。
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+
+        const stranded = buildSystemState(storage).attention.filter((a) => a.taskId === task.id)
+        expect(stranded.map((a) => a.kind)).toEqual(['task_ready_without_job'])
+        expect(stranded[0].detail).toContain('PATCH /api/tasks/:id')
+        expect(stranded[0].referenceId).toContain(':stranded:in_progress:')
+
+        // 同じ status のままの編集は遷移ではないので通る。
+        const same = await app.inject({
+          method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'in_progress', title: 'renamed' },
+        })
+        expect(same.statusCode).toBe(200)
+
+        const exit = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+        expect(exit.statusCode).toBe(200)
+        expect(storage.tasks.findById(task.id)?.status).toBe('pending')
+        expect(buildSystemState(storage).attention
+          .filter((a) => a.taskId === task.id && a.referenceId?.includes(':stranded:'))).toEqual([])
+      })
+    })
+
+    it('PATCH back to pending is refused while a running job or an active design review run still drives the task', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+
+        // running Job が居る。
+        const withJob = await createTask(app, project.id, { status: 'in_progress' })
+        const job = storage.jobs.create({
+          taskId: withJob.id, projectId: project.id, agentRole: 'developer_ai', status: 'running',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const refusedJob = await app.inject({ method: 'PATCH', url: `/api/tasks/${withJob.id}`, payload: { status: 'pending' } })
+        expect(refusedJob.statusCode).toBe(409)
+        expect(parseBody<{ code: string; reason: string }>(refusedJob.body)).toMatchObject({
+          code: 'TASK_LIFECYCLE_STATE_OWNED', reason: expect.stringContaining(job.id),
+        })
+        expect(storage.tasks.findById(withJob.id)?.status).toBe('in_progress')
+
+        // active な Design Review run が居る（review status でも同じ）。
+        const withRun = await createTask(app, project.id, { status: 'review' })
+        storage.designReviewRuns.create({
+          taskId: withRun.id, taskTitle: 'T', designText: 'd', designTextHash: 'h', changedFiles: [],
+        })
+        const refusedRun = await app.inject({ method: 'PATCH', url: `/api/tasks/${withRun.id}`, payload: { status: 'pending' } })
+        expect(refusedRun.statusCode).toBe(409)
+        expect(parseBody<{ code: string; reason: string }>(refusedRun.body)).toMatchObject({
+          code: 'TASK_LIFECYCLE_STATE_OWNED', reason: expect.stringContaining('design review run'),
+        })
+        expect(storage.tasks.findById(withRun.id)?.status).toBe('review')
+
+        // driver が終われば stranded になり、出口が開く。
+        storage.jobs.update(job.id, { status: 'success' })
+        const released = await app.inject({ method: 'PATCH', url: `/api/tasks/${withJob.id}`, payload: { status: 'pending' } })
+        expect(released.statusCode).toBe(200)
+        expect(storage.tasks.findById(withJob.id)?.status).toBe('pending')
+      })
+    })
+
+    it('PATCH to pending never reopens a task that is done (status is decided inside the transaction)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        // 書き込みの前に done になった Task（完了経路が先に確定した）。
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+        storage.tasks.update(task.id, { status: 'done' })
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string; reason: string }>(res.body)).toMatchObject({
+          code: 'TASK_LIFECYCLE_STATE_OWNED', reason: expect.stringContaining('done'),
+        })
+        expect(storage.tasks.findById(task.id)?.status).toBe('done')
+
+        // pending → pending（他の欄の編集）は遷移ではないので通る。
+        const pendingTask = await createTask(app, project.id)
+        const edit = await app.inject({
+          method: 'PATCH', url: `/api/tasks/${pendingTask.id}`, payload: { status: 'pending', title: 'renamed' },
+        })
+        expect(edit.statusCode).toBe(200)
+        expect(storage.tasks.findById(pendingTask.id)?.title).toBe('renamed')
+      })
+    })
+
+    it('a parked but stranded in_progress task can normalize to pending, stays parked and stops occupying the project', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        // legacy: park 状態は task_aborted audit から推定され、status に DB 制約は無い。
+        const task = await createTask(app, project.id, { status: 'in_progress', roadmapActive: false })
+        storage.auditLog.record({
+          actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: task.id,
+          result: 'success', detail: 'parked by CEO',
+        })
+        expect(storage.tasks.isParked(task.id)).toBe(true)
+        const occupant = () => buildSystemState(storage).projects.find((p) => p.id === project.id)?.currentTask
+        expect(occupant()?.id).toBe(task.id)
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+
+        expect(res.statusCode).toBe(200)
+        expect(storage.tasks.findById(task.id)).toMatchObject({ status: 'pending', roadmapActive: false })
+        expect(storage.tasks.isParked(task.id)).toBe(true)
+        expect(occupant()?.id).not.toBe(task.id)
+      })
+    })
+
+    it('PATCH to pending decides blocked vs pending on the latest state (after recover: 200 with the edits)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        const task = await createTask(app, project.id)
+        storage.tasks.update(task.id, { status: 'blocked' })
+        const refused = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending', title: 'x' } })
+        expect(refused.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(refused.body).code).toBe('TASK_BLOCKED_USE_RECOVERY_ROUTE')
+        expect(storage.tasks.findById(task.id)?.title).not.toBe('x')
+
+        // /recover が pending へ戻した後なら、同じ PATCH は通り編集も残る。
+        storage.tasks.update(task.id, { status: 'pending' })
+        const ok = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending', title: 'x' } })
+        expect(ok.statusCode).toBe(200)
+        expect(storage.tasks.findById(task.id)?.title).toBe('x')
+      })
+    })
+
+    it('a failed design review on a stranded in_progress task raises only design_review_failed; PATCH to pending stays the exit', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+        const run = storage.designReviewRuns.create({
+          taskId: task.id, taskTitle: 'T', designText: 'd', designTextHash: 'h', changedFiles: [],
+        })
+        const claim = storage.designReviewRuns.claim(run.id, 3)
+        storage.designReviewRuns.complete(run.id, claim.claimToken!, 'failed', undefined, 'runner failed')
+
+        const kinds = buildSystemState(storage).attention.filter((a) => a.taskId === task.id).map((a) => a.kind)
+        expect(kinds).toEqual(['design_review_failed'])
+
+        const exit = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+        expect(exit.statusCode).toBe(200)
+      })
+    })
+
+    it('an in_progress task with an active design review run is not reported as stranded', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+        storage.designReviewRuns.create({
+          taskId: task.id, taskTitle: 'T', designText: 'd', designTextHash: 'h', changedFiles: [],
+        })
+        expect(buildSystemState(storage).attention
+          .filter((a) => a.taskId === task.id && a.referenceId?.includes(':stranded:'))).toEqual([])
+      })
+    })
+  })
+
+  it('POST /api/jobs refuses a manual job while another task holds the shared workspace (lifecycle repair C3)', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const first = await createTask(app, project.id, { title: 'A' })
+      const second = await createTask(app, project.id, { title: 'B' })
+      const payload = (task: Task) => ({
+        taskId: task.id, projectId: task.projectId, agentRole: 'developer_ai',
+        safeCommand: { kind: 'test' },
+      })
+
+      const ok = await app.inject({ method: 'POST', url: '/api/jobs', payload: payload(first) })
+      expect(ok.statusCode).toBe(201)
+      // 手動 Job は workflowStepKey を持たないので live な所有者。2 本目は multiple_live_owners の deadlock になる。
+      const refused = await app.inject({ method: 'POST', url: '/api/jobs', payload: payload(second) })
+      expect(refused.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(refused.body).code).toBe('WORKSPACE_HELD_BY_OTHER_TASK')
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(second.id)).toEqual([])
+      // 同じ Task へもう 1 本作るのは所有者の衝突ではない。
+      const sameTask = await app.inject({ method: 'POST', url: '/api/jobs', payload: payload(first) })
+      expect(sameTask.statusCode).toBe(201)
+    })
+  })
+
   it('POST /api/jobs rejects the new Task implement Job without Design Review evidence', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -623,7 +855,13 @@ describe('Task API', () => {
         status: 'running',
         startedAt: '2026-07-22T10:00:00.000Z',
       })
-      await createJob(app, betaTask)
+      // alpha の running Job が共有 workspace を所有している間、POST /api/jobs は別 Task の手動 Job を
+      // 断る（lifecycle repair C3）。この test は summary の表示を見るものなので、beta の行は fixture で置く。
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().jobs.create({
+        taskId: betaTask.id, projectId: betaTask.projectId, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      } as Parameters<ReturnType<typeof getStorage>['jobs']['create']>[0])
       await createApprovalRequest(alphaTask.id, { status: 'WAITING_FOR_USER' })
 
       const res = await app.inject({ method: 'GET', url: '/api/tasks/summary' })
@@ -949,6 +1187,32 @@ describe('Task API', () => {
 
       expect(res.statusCode).toBe(200)
       expect(parseBody<Task>(res.body).title).toBe('T')
+    })
+  })
+
+  it('GET /api/tasks/:id exposes humanTaskDecisions: an actorless APPROVED is not a human decision (lifecycle repair C3)', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const created = await createTask(app, project.id, { title: 'T', status: 'blocked' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const make = (requestedAction: string) => storage.approvalRequests.create({
+        taskId: created.id, requestedAction, riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+        targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      } as Parameters<typeof storage.approvalRequests.create>[0])
+      // 主体記録の無い legacy APPROVED（authority ではない）と、ADMIN が決めた APPROVED。
+      const actorless = make('repair_from_stored_review:review-a')
+      const human = make('repair_from_stored_review:review-b')
+      recordApprovalActor(storage, human.id, 'admin')
+
+      const detail = parseBody<TaskDetail>((await app.inject({ method: 'GET', url: `/api/tasks/${created.id}` })).body)
+      expect(detail.humanTaskDecisions).toEqual([
+        { approvalRequestId: human.id, requestedAction: 'repair_from_stored_review:review-b', state: 'approved' },
+      ])
+      expect(detail.humanTaskDecisions.some((d) => d.approvalRequestId === actorless.id)).toBe(false)
+      // GET は read-only: 主体の無い行は数えないだけで、書き換えない。
+      expect(storage.approvalRequests.findById(actorless.id)?.status).toBe('APPROVED')
     })
   })
 
@@ -1639,18 +1903,20 @@ describe('Task API', () => {
   })
 
   it('PATCH /api/tasks/:id updates status', async () => {
+    // in_progress / review / blocked へ入る遷移は lifecycle の担当（TASK_LIFECYCLE_STATE_OWNED。lifecycle repair C3）。
+    // 汎用 PATCH が書ける status 遷移は、そこから出る方向（in_progress → pending）である。
     await withApp(async (app) => {
       const project = await createProject(app)
-      const created = await createTask(app, project.id)
+      const created = await createTask(app, project.id, { status: 'in_progress' })
 
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/tasks/${created.id}`,
-        payload: { status: 'in_progress' },
+        payload: { status: 'pending' },
       })
 
       expect(res.statusCode).toBe(200)
-      expect(parseBody<Task>(res.body).status).toBe('in_progress')
+      expect(parseBody<Task>(res.body).status).toBe('pending')
     })
   })
 

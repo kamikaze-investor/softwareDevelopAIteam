@@ -9,6 +9,7 @@ function input(overrides: Partial<ResumeAdmissionInput> = {}): ResumeAdmissionIn
     parked: false,
     projectStatus: 'running',
     jobs: [{ status: 'blocked', aiCliMode: 'implement', aiCliProvider: 'codex', safeCommand: { kind: 'test' } }],
+    repairDesignReviewInFlight: false,
     approvals: [],
     nowMs: NOW,
     ...overrides,
@@ -80,7 +81,22 @@ describe('evaluateResumeAdmission — Task 単位の判断', () => {
   it('人でない resume は live WAITING / APPROVED の Task 単位判断があると HUMAN_DECISION_PENDING', () => {
     expect(evaluateResumeAdmission(input({ approvals: [live('reconcile_external_completion')] })))
       .toEqual({ ok: false, code: 'HUMAN_DECISION_PENDING' })
-    expect(evaluateResumeAdmission(input({ approvals: [live('repair_from_stored_review:r1', 'APPROVED')] })))
+    // APPROVED は決定主体（API が付ける approvalActor）が human のときだけ人の判断（lifecycle repair C3）。
+    expect(evaluateResumeAdmission(input({
+      approvals: [{ ...live('repair_from_stored_review:r1', 'APPROVED'), approvalActor: 'human' as const }],
+    }))).toEqual({ ok: false, code: 'HUMAN_DECISION_PENDING' })
+  })
+
+  it('決定主体が human でない（記録なし / ai / unknown）live APPROVED は人の判断として数えない', () => {
+    // 実行側（verifyAndConsumeTaskApproval）は approval_actor=human の無い APPROVED を authority として
+    // 使わない。それを HUMAN_DECISION_PENDING の根拠にすると、authority の無い行が Task を止める（C3 P1）。
+    for (const approvalActor of [undefined, 'ai' as const, 'unknown' as const]) {
+      expect(evaluateResumeAdmission(input({
+        approvals: [{ ...live('abort_task', 'APPROVED'), approvalActor }],
+      }))).toEqual({ ok: true })
+    }
+    // WAITING は主体に依らず判断待ち。
+    expect(evaluateResumeAdmission(input({ approvals: [live('abort_task')] })))
       .toEqual({ ok: false, code: 'HUMAN_DECISION_PENDING' })
   })
 

@@ -17,9 +17,10 @@
 
 import { isLiveWorkspaceOwnerJob, occupiesProject } from '@ai-team/shared'
 import { findBlockedRowsHoldingWorkspace } from './blockedRowOwnership'
+import { strandedLifecycleRefusal } from './strandedTask'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
-import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { readJobsSupersededByHumanResume, withApprovalActorFacts } from '../designReview/resumeActor'
 import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
 import { isLiveApprovedApproval, isLiveTaskScopedDecision, isLiveWaitingApproval } from '@ai-team/shared'
@@ -58,7 +59,10 @@ function findLiveWaitingApproval(storage: IStorage, taskId: string, nowMs: numbe
  * 同じく人の判断待ちとして扱い、`job_blocked` を出さない（判断は `approval_waiting` が表す）。
  */
 function findLiveTaskScopedDecision(storage: IStorage, taskId: string, nowMs: number): ApprovalRequest | undefined {
-  const decisions = storage.approvalRequests.findByTaskId(taskId)
+  // APPROVED は決定主体が human の行だけを数える（`withApprovalActorFacts` が付ける型付きの事実。
+  // 主体の記録の無い APPROVED は authority ではないので、job_blocked を抑止しない。lifecycle repair C3）。
+  // GET の read-only 契約を守るため、ここでは SUPERSEDED にせず数えないだけにする。
+  const decisions = withApprovalActorFacts(storage, storage.approvalRequests.findByTaskId(taskId))
     .filter((request) => isLiveTaskScopedDecision(request, nowMs))
   // WAITING を優先（判断そのものを待っている）。無ければ APPROVED（実行を人が待っている）。
   return decisions.find((request) => isLiveWaitingApproval(request, nowMs))
@@ -572,7 +576,12 @@ export function buildSystemState(
       const stallingFailure = jobs.find((job) => (
         job.status === 'failed' && !isQuarantined(job) && !superseded.has(job.id)
       ))
-      if (task.status !== 'done' && !parentIsParked && !hasMovableJob && stallingFailure !== undefined) {
+      // 生きた Task 単位の人の判断（job_blocked と同じ actor-aware な事実）がある間は job_failed も出さない。
+      // 止めているのは人の判断で、それは approval_waiting が表す（重ねると CEO へ誤った二重通知。lifecycle repair C3）。
+      if (
+        task.status !== 'done' && !parentIsParked && !hasMovableJob && stallingFailure !== undefined
+        && findLiveTaskScopedDecision(storage, task.id, nowMs) === undefined
+      ) {
         attention.push({
           kind: 'job_failed',
           projectId: project.id,
@@ -682,6 +691,44 @@ export function buildSystemState(
           detail:
             'task is blocked but has no job at all; no resume, retry or remediation path can reach it '
             + 'without an explicit human recovery',
+          stuckForMs: elapsedMs(task.updatedAt, nowMs),
+        })
+      }
+
+      // **lifecycle が所有する status（in_progress / review）なのに、動かすものが何も無い Task**（lifecycle repair C3）。
+      //
+      // in_progress / review は Job・Design Review が Task を動かしている間の状態で、Project を占有する
+      // （currentTask）。汎用 CRUD は C3 からこの status を書けないが、それ以前に書かれた行や想定外の経路で
+      // 残った行は、live Job も active な Design Review run も無いまま占有し続け、どの attention にも出ない。
+      // blocked / failed の Job は job_blocked / job_failed が既に表すので、ここは「何も無い」ときだけ。
+      //
+      // 新しい kind は作らず `task_ready_without_job`（Task があるのに自分では何も始まらない。notify-only・
+      // 停滞閾値付き）を再利用する。`task_blocked_without_job` は blocked Task 専用の出口（Human Recovery
+      // = /recover。blocked 以外を拒否する）を前提にしており合わない。referenceId は Task の updatedAt 付きで、
+      // pending へ戻した後の通常の `task_ready_without_job:<taskId>` や次のエピソードと同一視しない。
+      // stranded の判定は `strandedLifecycleRefusal()`（汎用 PATCH の出口と同じ唯一の述語）。ここで足す条件は
+      // attention の重複を避けるためだけのもの（blocked / failed の Job は job_blocked / job_failed が表す）。
+      if (
+        project.status === 'running'
+        && !parentIsParked
+        && !hasMovableJob
+        && stallingFailure === undefined
+        // その Task の最新 run が failed で、既に design_review_failed として出ているなら重ねない
+        // （同じ停止に remediation と escalation が競合する。Codex review 2d8f060）。attention の経路だけの
+        // 条件で、共有述語は変えない（PATCH → pending の出口は残る）。
+        && !(currentTask?.id === task.id && designReview?.status === 'failed')
+        && strandedLifecycleRefusal(storage, task, nowMs) === undefined
+      ) {
+        attention.push({
+          kind: 'task_ready_without_job',
+          projectId: project.id,
+          projectName: project.name,
+          taskId: task.id,
+          referenceId: `${task.id}:stranded:${task.status}:${task.updatedAt}`,
+          detail:
+            `task is ${task.status} (occupying the project) but has no live job and no active design review run; `
+            + 'nothing will move it on its own. Exit: move it back to pending with PATCH /api/tasks/:id '
+            + '{"status":"pending"} so the normal adoption path can drive it again, or park it with abort_task',
           stuckForMs: elapsedMs(task.updatedAt, nowMs),
         })
       }

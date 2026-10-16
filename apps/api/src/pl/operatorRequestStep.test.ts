@@ -360,6 +360,9 @@ describe('runPlTick — Operator Request', () => {
   })
 
   it('範囲に attention が無ければ LLM を呼ばずに no_matching_target', async () => {
+    // in_progress のまま live Job も Design Review も無い Task は、lifecycle repair C3 から
+    // 「止まった占有 Task」として attention に出る。attention の無い範囲を作るため、Task を占有しない形にする。
+    storage.tasks.update(taskId, { status: 'pending', roadmapActive: false })
     const request = ask('request', 'resume it', { taskId })
     await runPlTick(storage, deps({ answerOperatorRequest: failIfCalled }))
     expect(storage.operatorRequests.findById(request.id)).toMatchObject({

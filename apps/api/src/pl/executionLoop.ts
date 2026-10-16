@@ -1608,6 +1608,10 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
     if (!resumed.ok && resumed.code === 'HUMAN_DECISION_PENDING') {
       return { ok: false, pending: true, summary: `resume waiting for a human decision: ${resumed.reason}` }
     }
+    // 進行中の repair Design Review run が Task を動かしている。試行を消費せずに待つ（lifecycle repair C3 / D3-1）。
+    if (!resumed.ok && resumed.code === 'REPAIR_REVIEW_IN_FLIGHT') {
+      return { ok: false, pending: true, summary: `resume waiting for the in-flight repair review: ${resumed.reason}` }
+    }
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }

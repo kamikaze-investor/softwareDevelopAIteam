@@ -574,8 +574,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const job = storage.jobs.create(jobInput)
-    return reply.status(201).send(job)
+    // 別 Task が workspace を所有していれば作らない（claim guard と同じ所有者述語・同じ transaction。
+    // 手動 Job は workflowStepKey を持たず所有者と数えられるので、2 本目は multiple_live_owners の
+    // deadlock になる。lifecycle repair C3）。
+    const created = storage.jobs.createManualJob(jobInput)
+    if (!created.ok) {
+      return reply.status(409).send({ error: created.reason, code: created.code })
+    }
+    return reply.status(201).send(created.job)
   })
 
   app.patch<{ Params: { id: string } }>('/:id/fail-if-running', async (req, reply) => {
@@ -749,6 +755,45 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // 再送はこの後の storage 呼び出しで deduplicated として元の結果を返す（状態は変えない）。
     // 同じ eventId で payload が違う再送（conflict）は従来どおり拒否される。
     const isExactReplay = storage.jobs.classifyOutboxEvent(existing.id, outboxEvent) === 'deduplicated'
+
+    // **適用できない Outbox 配送は、状態に依存する事前検証より先に「適用済み・何も適用しない」で受ける**
+    // （lifecycle repair C3。H-02 の一般化）。
+    //
+    // Outbox 配送（eventId 付き）が、もう適用先の状態に無い Job へ届いた（例: Worker の端末 event が
+    // pending の間に operator PATCH が running の Job を failed にした）。以前は
+    //   - fingerprint の running-only 検査が先に 409 を返し、再送が永久に 409 → Worker の intake が止まる
+    //   - status だけを落として stderr / commitHash / guardResult / failureMetadata（quarantined を含む）を
+    //     既存行へ重ね、success なのに quarantined のような矛盾した行で作業を隠す
+    // の 2 つが起きた。適用できないと分かった配送は event を記録（Worker が捨てられる）して payload を
+    // 1 つも適用せず、下流の処理（review / repair / continuation）も走らせずに 200 + 現在の Job を返す。
+    // claim（→ running）は対象外: 拒否された claim は記録しない既存契約（W5）を保つ。
+    const isNonApplicableOutboxDelivery = (job: Job): boolean => (
+      jobUpdate.status !== undefined
+      && jobUpdate.status !== 'running'
+      && jobUpdate.status !== job.status
+      && !canApplyJobResultStatus(job.status, jobUpdate.status)
+    )
+    if (outboxEvent !== undefined && !isExactReplay && isNonApplicableOutboxDelivery(existing)) {
+      const acknowledged = storage.jobs.acknowledgeOutboxEventWithoutApplying(
+        existing.id,
+        outboxEvent,
+        isNonApplicableOutboxDelivery,
+      )
+      if (acknowledged.ok) {
+        req.log.warn(
+          { jobId: existing.id, from: acknowledged.job.status, to: jobUpdate.status },
+          'outbox delivery acknowledged without applying anything (job is no longer in a state it applies to)',
+        )
+        return reply.send(outboxResponse(acknowledged.job, outboxEvent, acknowledged.deduplicated))
+      }
+      if (acknowledged.code === 'OUTBOX_HASH_MISMATCH') {
+        return reply.status(409).send({ error: acknowledged.reason })
+      }
+      if (acknowledged.code === 'JOB_NOT_FOUND') {
+        return reply.status(404).send({ error: 'Job not found' })
+      }
+      // NOW_APPLICABLE: 読み直した時点で適用先の状態にある。通常の経路で評価する。
+    }
 
     const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
     if (workspaceEndFingerprint !== undefined && !isExactReplay) {
