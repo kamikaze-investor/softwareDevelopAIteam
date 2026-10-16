@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
-import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import { buildInitialImplementAiCliPrompt, INITIAL_WORKFLOW_JOB_EXISTS } from '../ctoAi/initialImplementWorkflow'
 import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import { executeQueuedRun } from '../designReview/queuedRunDispatch'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
@@ -705,5 +705,65 @@ describe('Challenge と他の review / 回収経路の重なり（独立レビ�
     }) as never)
 
     expect(result).toMatchObject({ status: 'challenge_not_aligned', failureCode: 'gate_did_not_release' })
+  })
+})
+describe('Challenge の同一性と「既に在る」の判定（独立レビュー round 7）', () => {
+  function criticThat(onRun: () => void) {
+    return {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => { onRun(); return { ok: true, stdout: JSON.stringify(DISPUTED_CRITIQUE), timedOut: false } },
+    }
+  }
+
+  it('同じ text / files でも repair 目的の active run なら別の review として pending（Challenge を消費しない）', async () => {
+    const { storage, taskId, designText } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      runnerDeps: criticThat(() => {
+        storage.designReviewRuns.create({
+          taskId, taskTitle: 'repair', designText, designTextHash: computeDesignTextHash(designText),
+          changedFiles: [], repairSourceJobId: 'source-job-1',
+        })
+      }),
+      reEvaluate: async () => { throw new Error('must not re-evaluate against a repair-purpose run') },
+    }) as never)
+
+    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
+    expect(stageEntries(storage, taskId, 'challenge')).toEqual([])
+  })
+
+  // Remediation の対象は Job 0 件の Task なので、Job は再評価の最中（ALIGNED の直後）に現れる形で再現する。
+  async function challengeWith(workflowStepKey: string | undefined, reason: string) {
+    const { storage, taskId, designText } = seed()
+    const projectId = storage.tasks.findById(taskId)!.projectId
+    // '__CANONICAL__' は初回 workflow の canonical key（task:<taskId>:initial-implement）を表す。
+    const key = workflowStepKey === '__CANONICAL__' ? `task:${taskId}:initial-implement` : workflowStepKey
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      reEvaluate: async () => {
+        if (key !== undefined) {
+          storage.jobs.create({
+            taskId, projectId, agentRole: 'developer_ai', status: 'queued', workflowStepKey: key,
+            safeCommand: { kind: 'test', workingDir: '/workspace/target' }, aiCliMode: 'implement', aiCliPrompt: designText,
+          } as never)
+        }
+        return { status: 'evidence_registered', decision: 'ALIGNED' }
+      },
+      ensureJob: async () => ({ taskId, status: 'skipped', reason }),
+    }) as never)
+    return result.status
+  }
+
+  it('同じ prompt の repair / resume Job は canonical な初回 Job ではないので released にしない', async () => {
+    expect(await challengeWith('repair:some-job:1', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_not_aligned')
+    expect(await challengeWith('resume:some-job:1', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_not_aligned')
+  })
+
+  it('skip 理由が「既に在る」以外なら、canonical な初回 Job が在っても released にしない', async () => {
+    const status = await challengeWith('__CANONICAL__', 'task was parked by abort_task')
+    expect(status).toBe('challenge_not_aligned')
+  })
+
+  it('「既に在る」で、canonical な初回 Job がレビューした prompt のものなら released', async () => {
+    expect(await challengeWith('__CANONICAL__', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_aligned')
   })
 })

@@ -925,6 +925,25 @@ function readDurableRunOutcome(storage: IStorage, runId: string): ExecuteDesignR
   if (run.status === 'failed') {
     return { status: 'failed', error: run.error }
   }
+  // **この run 自身の保存済み結果を先に組み直す。** 同じ design hash の古い ALIGNED evidence が
+  // 残っていても、この run が CONFLICT で終わったなら CONFLICT である。evidence を先に見ると、
+  // 古い承認がこの run の否定判定を上書きしてしまう（独立レビュー round 7・2026-10-16）。
+  if (run.resultJson === undefined) return undefined
+  let decision: RecomputedDecision
+  let rejectedReason: string | undefined
+  try {
+    const parsed: unknown = JSON.parse(run.resultJson)
+    if (!isUsableRunnerOutput(parsed)) return undefined
+    const outcome = recomputeDecision(parsed, run.reviewKind, run.changedFiles)
+    decision = outcome.decision
+    rejectedReason = outcome.rejectedReason
+  } catch {
+    return undefined
+  }
+  if (decision !== 'ALIGNED') {
+    return { status: 'not_aligned', decision, error: run.error ?? rejectedReason }
+  }
+  // この run が ALIGNED のときだけ、それが登録した（同じ hash の）evidence を採用する。
   const evidence = run.reviewKind === 'task' && run.taskId !== undefined
     ? storage.designReviewEvidence.findByTaskId(run.taskId)
       .find((item) => item.designTextHash === run.designTextHash && item.decision === 'ALIGNED')
@@ -932,15 +951,7 @@ function readDurableRunOutcome(storage: IStorage, runId: string): ExecuteDesignR
   if (evidence !== undefined && evidence.designTextHash === run.designTextHash && evidence.decision === 'ALIGNED') {
     return { status: 'evidence_registered', decision: 'ALIGNED', evidence }
   }
-  if (run.resultJson === undefined) return undefined
-  try {
-    const parsed: unknown = JSON.parse(run.resultJson)
-    if (!isUsableRunnerOutput(parsed)) return undefined
-    const outcome = recomputeDecision(parsed, run.reviewKind, run.changedFiles)
-    return { status: 'not_aligned', decision: outcome.decision, error: run.error ?? outcome.rejectedReason }
-  } catch {
-    return undefined
-  }
+  return undefined
 }
 
 export interface CreateAndExecuteRoadmapReviewInput {

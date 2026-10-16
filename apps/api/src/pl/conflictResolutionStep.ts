@@ -51,7 +51,11 @@ import {
   type CoordinatorDeps,
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
-import { createInitialImplementWorkflow } from '../ctoAi/initialImplementWorkflow'
+import {
+  createInitialImplementWorkflow,
+  INITIAL_WORKFLOW_JOB_EXISTS,
+  initialWorkflowStepKey,
+} from '../ctoAi/initialImplementWorkflow'
 import { extractImplementationScope, extractItemDescription } from '../ctoAi/roadmapAdoption'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -576,8 +580,11 @@ async function runChallenge(
   const job = await ensureJob(storage, taskId, deps.coordinatorDeps ?? buildDefaultCoordinatorDeps())
   // **Job が既に在るなら成功である。** ALIGNED の後、既存の `recoverReadyTasksWithoutJob()` 等が
   // 先に初回 Job を作っていると ensureJob は skipped を返す。保存済みの Job を読み直し、
-  // **レビューした prompt と同じ内容の** implement Job があれば released とみなす。
-  const released = job.status === 'created' || hasReviewedImplementJob(storage, subject)
+  // **「既に在る」で skip し、かつ canonical な初回 Job がレビューした prompt のもの**のときだけ
+  // released とみなす。他の skip 理由（park 等）は従来どおり失敗。
+  const released = job.status === 'created'
+    || (job.status === 'skipped' && job.reason === INITIAL_WORKFLOW_JOB_EXISTS
+      && hasCanonicalInitialJobForReviewedPrompt(storage, subject))
 
   return {
     ...base,
@@ -591,19 +598,34 @@ async function runChallenge(
   }
 }
 
-/** active run が、この Challenge が再評価する frozen spec と同じ review か（runner から見える同一性）。 */
+/**
+ * active run が、この Challenge が再評価する frozen spec と同じ review か。
+ *
+ * storage の再利用条件（`reuseActiveRun`）と同じ同一性で比べる: design hash・changedFiles（集合）・
+ * successor intent。Challenge は repair ではないので `repairSourceJobId` が無い run だけが同じ review である。
+ * intent を見ないと、同じ prompt の repair 目的 run があるときに Challenge を消費した直後に
+ * create() が contention になり、Challenge が評価されずに失われる（独立レビュー round 7）。
+ */
 function isSameReviewIdentity(run: DesignReviewRun, subject: RemediationSubject): boolean {
-  return run.designTextHash === subject.reviewedDesignTextHash
+  return run.repairSourceJobId === undefined
+    && run.designTextHash === subject.reviewedDesignTextHash
     && JSON.stringify([...run.changedFiles].sort()) === JSON.stringify([...subject.reviewedChangedFiles].sort())
 }
 
-/** レビューした prompt と同じ内容の implement Job が、この Task に既に在るか。 */
-function hasReviewedImplementJob(storage: IStorage, subject: RemediationSubject): boolean {
-  const reviewedHash = subject.reviewedDesignTextHash
+/**
+ * ensureJob が「初回 workflow Job は既に在る」で skip したとき、その Job が**この Challenge が
+ * レビューした prompt から作られた canonical な初回 Job**か。
+ *
+ * canonical key（`task:<taskId>:initial-implement`）と prompt の同一性の両方を要求する。
+ * 同じ prompt の repair / resume Job は初回 Job ではないので数えない。
+ */
+function hasCanonicalInitialJobForReviewedPrompt(storage: IStorage, subject: RemediationSubject): boolean {
+  const canonicalKey = initialWorkflowStepKey(subject.task.id)
   return storage.jobs.findByTaskId(subject.task.id).some((job) =>
-    job.aiCliMode === 'implement'
+    job.workflowStepKey === canonicalKey
+    && job.aiCliMode === 'implement'
     && job.aiCliPrompt !== undefined
-    && computeDesignTextHash(job.aiCliPrompt) === reviewedHash)
+    && computeDesignTextHash(job.aiCliPrompt) === subject.reviewedDesignTextHash)
 }
 
 /**

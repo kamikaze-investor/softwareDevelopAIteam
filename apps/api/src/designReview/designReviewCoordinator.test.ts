@@ -1326,3 +1326,37 @@ describe('active run の同一性による再利用と contention', () => {
     expect(storage.designReviewRuns.findByTaskId(taskId)).toHaveLength(1)
   })
 })
+describe('別 executor が終端させた run の読み直し（独立レビュー round 7）', () => {
+  it('同じ design hash の古い ALIGNED evidence があっても、この run が CONFLICT なら not_aligned / CONFLICT', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const designText = 'design text'
+    const designTextHash = computeHashForTest(designText)
+    // 以前の review が同じ design を ALIGNED にした evidence。
+    storage.designReviewEvidence.create({
+      taskId, reviewKind: 'task', subjectId: taskId, designTextHash,
+      reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+    const conflictStdout = JSON.stringify({
+      focusedReviewResults: [],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'conflicts with the goal' },
+      finalDecision: 'CONFLICT',
+    })
+    // 別 executor が claim を取り、この run を CONFLICT で終端させた状態を再現する。
+    const claim = storage.designReviewRuns.claim
+    storage.designReviewRuns.claim = (id, max) => {
+      const won = claim.call(storage.designReviewRuns, id, max)
+      storage.designReviewRuns.complete(id, won.claimToken!, 'succeeded', conflictStdout)
+      return {}
+    }
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText, changedFiles: LOW_LOAD_FILES },
+      deps(async () => { throw new Error('must not run') }),
+    )
+
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
+    expect(result.evidence).toBeUndefined()
+  })
+})
