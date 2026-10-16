@@ -2792,3 +2792,101 @@ describe('POST /api/gate/check — safe work の畳み込みは ref 変化の処
     })
   })
 })
+
+describe('POST /api/gate/check — safe work の生き残り選択は 1 つのループ (Codex review round 5)', () => {
+  type Seed = {
+    riskLevel: 'HIGH' | 'CRITICAL'
+    status: 'WAITING_FOR_USER' | 'APPROVED'
+    stale?: boolean
+    expired?: boolean
+  }
+
+  /** 古い順に作る（findByTaskId は新しい順なので、最後に作った行が最初に選ばれる）。 */
+  async function seedRows(app: FastifyInstance, logicalTaskId: string, rows: Seed[]): Promise<ApprovalRequest[]> {
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const taskId = await ensureGateTask(app, logicalTaskId)
+    const created: ApprovalRequest[] = []
+    for (const row of rows) {
+      const request = storage.approvalRequests.create({
+        taskId,
+        targetBranch: BASE_GATE_PAYLOAD.targetBranch,
+        targetCommit: row.stale ? 'old-commit' : BASE_GATE_PAYLOAD.targetCommit,
+        targetDiffHash: row.stale ? 'old-diff' : BASE_GATE_PAYLOAD.targetDiffHash,
+        riskLevel: row.riskLevel,
+        requestedAction: 'git_status',
+        status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + (row.expired ? -5_000 : 60 * 60 * 1000)).toISOString(),
+        invalidIf: [],
+      })
+      if (row.status === 'APPROVED') storage.approvalRequests.recordDecision(request.id, 'APPROVED', 'seeded')
+      created.push(request)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    return created
+  }
+
+  async function check(app: FastifyInstance, logicalTaskId: string) {
+    const { statusCode, body } = await gateCheck(app, { ...BASE_GATE_PAYLOAD, taskId: logicalTaskId, requestedAction: 'git_status' })
+    expect(statusCode).toBe(200)
+    expect(body.riskReview.riskLevel).toBe('HIGH')
+    return body
+  }
+
+  it('stale-ref の APPROVED（新しい）+ current-ref の CRITICAL WAITING（古い） → STALE 化して CRITICAL の PENDING_APPROVAL', async () => {
+    await withApp(async (app) => {
+      const [critical, staleApproved] = await seedRows(app, 'loop-stale-approved', [
+        { riskLevel: 'CRITICAL', status: 'WAITING_FOR_USER' },
+        { riskLevel: 'HIGH', status: 'APPROVED', stale: true },
+      ])
+
+      const body = await check(app, 'loop-stale-approved')
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.outcome.requestId).toBe(critical!.id)
+      expect(body.nextAction.action).not.toBe('re_check')
+      expect(body.sideEffects).toEqual([{ type: 'MARKED_STALE', requestId: staleApproved!.id }])
+      expect(await identityStatusOf(staleApproved!.id)).toBe('STALE')
+      expect(await identityStatusOf(critical!.id)).toBe('WAITING_FOR_USER')
+    })
+  })
+
+  it('期限切れ APPROVED + stale-ref の WAITING（CRITICAL）+ current-ref の CRITICAL WAITING → 順に片付けて CRITICAL の PENDING_APPROVAL', async () => {
+    await withApp(async (app) => {
+      const [critical, staleWaiting, expiredApproved] = await seedRows(app, 'loop-expired-stale-current', [
+        { riskLevel: 'CRITICAL', status: 'WAITING_FOR_USER' },
+        { riskLevel: 'CRITICAL', status: 'WAITING_FOR_USER', stale: true },
+        { riskLevel: 'HIGH', status: 'APPROVED', expired: true },
+      ])
+
+      const body = await check(app, 'loop-expired-stale-current')
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.outcome.requestId).toBe(critical!.id)
+      expect(body.sideEffects).toEqual([{ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: staleWaiting!.id }])
+      expect(await identityStatusOf(expiredApproved!.id)).toBe('EXPIRED')
+      expect(await identityStatusOf(staleWaiting!.id)).toBe('SUPERSEDED')
+      expect(await identityStatusOf(critical!.id)).toBe('WAITING_FOR_USER')
+    })
+  })
+
+  it('すべて stale / 期限切れなら新しい依頼は作らず continue_safe_work_only', async () => {
+    await withApp(async (app) => {
+      const rows = await seedRows(app, 'loop-all-stale', [
+        { riskLevel: 'CRITICAL', status: 'WAITING_FOR_USER', stale: true },
+        { riskLevel: 'HIGH', status: 'APPROVED', stale: true },
+        { riskLevel: 'HIGH', status: 'APPROVED', expired: true },
+      ])
+
+      const body = await check(app, 'loop-all-stale')
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.continuationPolicy).toBe('continue_safe_work_only')
+      expect(body.approvalRequest).toBeUndefined()
+      expect(body.nextAction.requestId).toBeUndefined()
+      expect(await identityStatusOf(rows[0]!.id)).toBe('SUPERSEDED')
+      expect(await identityStatusOf(rows[1]!.id)).toBe('STALE')
+      expect(await identityStatusOf(rows[2]!.id)).toBe('EXPIRED')
+
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().approvalRequests.findByTaskId(await ensureGateTask(app, 'loop-all-stale'))).toHaveLength(3)
+    })
+  })
+})
