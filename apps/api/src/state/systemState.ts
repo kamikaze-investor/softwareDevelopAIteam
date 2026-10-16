@@ -109,6 +109,17 @@ export type AttentionKind =
   | 'task_blocked_without_job'
   | 'job_running_long'
   /**
+   * running Project の queued Job が、停滞閾値（`stallHintMs`。`job_running_long` と同じ）を過ぎても
+   * claim されていない（lifecycle repair C2 / RC5）。Worker の停止、Worker 側の所有権 ambiguous
+   * （stale な dirty 行と帰属できない dirt）、他の attention に表れない claim 拒否のどれでも
+   * **黙って止まらない**ための受け皿。referenceId は Job id（1回だけ escalate される）。
+   * 同じ停止を既に説明する attention（workspace_quarantined / workspace_held_by_stalled_owner は
+   * claim 拒否全体を、approval_waiting / design_review_* は同じ Task を、continuation_pending は
+   * 同じ Project を説明する）があれば出さない。park された Task と running 以外の Project は
+   * claim を意図的に止めているので出さない。notify-only。
+   */
+  | 'job_queued_long'
+  /**
    * 単一の共有 workspace の所有者（claim guard と同じ意味）が**自力では進まない**ため、running
    * Project の queued Job を Worker も API も claim しない。detail 先頭の `cause=` が原因:
    *
@@ -355,6 +366,8 @@ export function buildSystemState(
   // claim guard が所有者と数える全 Task（1 Task につき代表 Job 1件）。
   const allOwners: Array<{ project: Project; task: Task; job: Job }> = []
   const runningQueuedTaskIds = new Set<string>()
+  // claim されないまま閾値を過ぎた queued Job の候補（`job_queued_long`）。抑止は最後にまとめて判定する。
+  const queuedLongCandidates: Array<{ project: Project; task: Task; job: Job; queuedForMs: number }> = []
 
   for (const project of observed) {
     const tasks = storage.tasks.findByProjectId(project.id)
@@ -555,6 +568,19 @@ export function buildSystemState(
           })
         }
 
+        if (job.status === 'queued' && project.status === 'running' && !storage.tasks.isParked(task.id)) {
+          // 経過の起点は「最後に queued になった時刻」の近似: requeue された Job は前回の
+          // startedAt / completedAt を持つので、createdAt と合わせた最新の時刻から数える。
+          const queuedSince = [job.createdAt, job.startedAt, job.completedAt]
+            .filter((value): value is string => value !== undefined && !Number.isNaN(Date.parse(value)))
+            .sort((a, b) => Date.parse(a) - Date.parse(b))
+            .pop()
+          const queuedFor = elapsedMs(queuedSince, nowMs)
+          if (queuedFor !== undefined && queuedFor >= stallHintMs) {
+            queuedLongCandidates.push({ project, task, job, queuedForMs: queuedFor })
+          }
+        }
+
         if (job.status === 'running') {
           const runningFor = elapsedMs(job.startedAt ?? job.createdAt, nowMs)
           if (runningFor !== undefined && runningFor >= stallHintMs) {
@@ -753,6 +779,37 @@ export function buildSystemState(
         + 'Queued work in the running project cannot be claimed until only one owner remains.',
       stuckForMs: elapsedMs(newest.job.createdAt, nowMs),
     })
+  }
+
+  // **claim されない queued Job（`job_queued_long`）。** 他の attention が同じ停止を既に説明していれば出さない。
+  // workspace_quarantined / workspace_held_by_stalled_owner は所有者がいて claim 全体が拒否される状態を
+  // 説明する（所有者は別 Task なので Task 単位では一致しない）ため、どれか1つでもあれば全体を抑止する。
+  {
+    const claimWideExplained = attention.some((item) => (
+      item.kind === 'workspace_quarantined' || item.kind === 'workspace_held_by_stalled_owner'
+    ))
+    const taskExplained = new Set(attention
+      .filter((item) => (
+        item.kind === 'approval_waiting' || item.kind === 'design_review_failed' || item.kind === 'design_review_idle'
+      ) && item.taskId !== undefined)
+      .map((item) => item.taskId!))
+    const projectExplained = new Set(attention
+      .filter((item) => item.kind === 'continuation_pending')
+      .map((item) => item.projectId))
+    for (const { project, task, job, queuedForMs } of claimWideExplained ? [] : queuedLongCandidates) {
+      if (taskExplained.has(task.id) || projectExplained.has(project.id)) continue
+      attention.push({
+        kind: 'job_queued_long',
+        projectId: project.id,
+        projectName: project.name,
+        taskId: task.id,
+        jobId: job.id,
+        referenceId: job.id,
+        detail: `job has been queued for ${Math.round(queuedForMs / 1000)}s without being claimed `
+          + '(the Worker may be down, or it cannot attribute workspace ownership); nothing else explains it',
+        stuckForMs: queuedForMs,
+      })
+    }
   }
 
   return {

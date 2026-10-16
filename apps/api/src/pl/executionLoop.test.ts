@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { buildSystemState } from '../state/systemState'
+import { buildSystemState, DEFAULT_STALL_HINT_MS } from '../state/systemState'
 import {
   PL_MAX_ATTEMPTS_PER_TARGET,
   PL_MAX_TECHNICAL_RESUMES_PER_TASK,
@@ -1559,6 +1559,91 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       expect(second.status).not.toBe('escalated')
       expect(escalations).toHaveLength(1)
       expect(diagnosed).toBe(0)
+    })
+  })
+
+  // lifecycle repair C2 / RC5: claim されない queued Job が他のどの attention にも表れず黙って止まらない。
+  describe('job_queued_long', () => {
+    // seed の Job は実時刻で作られるので、停滞閾値を過ぎた「現在」を実時刻から作る。
+    const later = (): string => new Date(Date.now() + DEFAULT_STALL_HINT_MS + 60_000).toISOString()
+
+    function seedQueued(): { storage: IStorage; projectId: string; taskId: string; jobId: string } {
+      const { storage, projectId, taskId } = seed()
+      const job = storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      return { storage, projectId, taskId, jobId: job.id }
+    }
+
+    it('a running-Project queued Job past the threshold with nothing else explaining it: one job_queued_long, escalated once without diagnosis', async () => {
+      const { storage, jobId } = seedQueued()
+      const now = later()
+
+      const queuedLong = buildSystemState(storage, { now: () => now }).attention
+        .filter((item) => item.kind === 'job_queued_long')
+      expect(queuedLong).toHaveLength(1)
+      expect(queuedLong[0]).toMatchObject({ jobId, referenceId: jobId })
+      expect(queuedLong[0]!.stuckForMs).toBeGreaterThanOrEqual(DEFAULT_STALL_HINT_MS)
+
+      let diagnosed = 0
+      const escalations: string[] = []
+      const d = deps({
+        now: () => now,
+        diagnose: async () => { diagnosed += 1; return '{}' },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      })
+      const first = await runPlTick(storage, d)
+      for (let i = 0; i < 2; i += 1) {
+        resetPlLoopInFlightForTest()
+        await runPlTick(storage, d)
+      }
+
+      expect(first).toMatchObject({ status: 'escalated', target: { kind: 'job_queued_long', jobId } })
+      expect(escalations).toHaveLength(1)
+      expect(diagnosed).toBe(0)
+    })
+
+    it('is not emitted before the threshold', () => {
+      const { storage } = seedQueued()
+      expect(buildSystemState(storage).attention.some((item) => item.kind === 'job_queued_long')).toBe(false)
+    })
+
+    it('is suppressed while workspace_held_by_stalled_owner explains the refused claim', () => {
+      const { storage } = seedQueued()
+      const paused = storage.projects.create({ name: 'Paused', goal: 'g', designPhilosophy: [], status: 'paused' })
+      const pausedTask = storage.tasks.create({
+        projectId: paused.id, title: 'P', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      storage.jobs.create({
+        taskId: pausedTask.id, projectId: paused.id, agentRole: 'developer_ai', status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const now = later()
+
+      const kinds = buildSystemState(storage, { now: () => now }).attention.map((item) => item.kind)
+      expect(kinds).toContain('workspace_held_by_stalled_owner')
+      expect(kinds).not.toContain('job_queued_long')
+    })
+
+    it.each(['paused'] as const)('is not emitted in a %s Project (claims are intentionally stopped)', (status) => {
+      const { storage, projectId } = seedQueued()
+      storage.projects.update(projectId, { status })
+      const now = later()
+
+      expect(buildSystemState(storage, { now: () => now }).attention
+        .some((item) => item.kind === 'job_queued_long')).toBe(false)
+    })
+
+    it('is not emitted for a parked Task', () => {
+      const { storage, taskId } = seedQueued()
+      storage.tasks.update(taskId, { roadmapActive: false })
+      storage.auditLog.record({ actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: taskId, result: 'success' })
+      const now = later()
+
+      expect(buildSystemState(storage, { now: () => now }).attention
+        .some((item) => item.kind === 'job_queued_long')).toBe(false)
     })
   })
 
