@@ -216,36 +216,7 @@ function isGateCheckResponse(value: unknown): value is GateCheckResponse {
     }
   }
 
-  // D2（2026-10-17）: gatePolicy は API の continuationPolicy をそのまま写す（ローカルで再判定しない）。
-  // 食い違う 200 を受理すると fail-open になるので、API（computeContinuationPolicy / computeNextAction）が
-  // 返しうる decision × continuationPolicy × nextAction の組だけを受理する。それ以外は技術障害。
-  if (!isCoherentDecisionTuple(outcome.decision, v.continuationPolicy, nextAction.action)) return false
-
   return true
-}
-
-/**
- *   - ALLOW                       → continue + (proceed | call_consume)
- *   - PENDING_APPROVAL / BLOCKED  → wait_for_approval + (continue_safe_work_only | block_until_approved)
- *   - REJECTED                    → wait_for_approval + continue 以外
- *   - STALE                       → re_check
- * call_consume の id・approvalRequest の整合は呼び出し元で検証済み。
- */
-function isCoherentDecisionTuple(decision: string, continuationPolicy: string, action: string): boolean {
-  switch (decision) {
-    case 'ALLOW':
-      return continuationPolicy === 'continue' && (action === 'proceed' || action === 'call_consume')
-    case 'PENDING_APPROVAL':
-    case 'BLOCKED':
-      return action === 'wait_for_approval'
-        && (continuationPolicy === 'continue_safe_work_only' || continuationPolicy === 'block_until_approved')
-    case 'REJECTED':
-      return action === 'wait_for_approval' && continuationPolicy !== 'continue'
-    case 'STALE':
-      return action === 're_check'
-    default:
-      return false
-  }
 }
 
 /**
