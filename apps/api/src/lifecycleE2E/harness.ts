@@ -162,7 +162,7 @@ export interface WorkerStep {
   /** claim の HTTP 応答（409 = JOB_CLAIM_REFUSED） */
   claimStatus?: number
   claimCode?: string
-  gate?: { decision: string; policy: string; nextAction: string; requestId?: string }
+  gate?: { decision: string; policy: string; nextAction: string; requestId?: string; reason?: string }
   consumeStatus?: number
   /** Worker が報告した terminal status */
   reported?: Job['status']
@@ -299,6 +299,25 @@ export class WorkerSimulator {
    */
   crashBeforeNextReport: ((jobId: string, payload: Record<string, unknown>) => void) | undefined
 
+  /**
+   * 次の consume が成功した直後に（commit も結果報告もせず）落ちる。Job は API 上 running のまま、
+   * 承認は CONSUMED、worktree は Job 開始時のまま。1 回で解除される（D2: consume と commit の間の crash）。
+   */
+  crashAfterNextConsume = false
+
+  /**
+   * gate/check の後・consume の前に 1 回だけ呼ぶ（時計を進める・worktree を変える等の TOCTOU の模擬）。
+   * 数値を返すと consume は API へ届かずその HTTP status で失敗したことにする（5xx / 409 の模擬）。
+   * consume の payload は gate/check のときの commit / diff のまま（Worker と同じ）。
+   */
+  beforeNextConsume: (() => number | void) | undefined
+
+  /**
+   * Worker のローカル risk 評価を差し替える（Worker / API の rule の版ずれの模擬）。既定は API と同じ
+   * `runRiskReview()`。
+   */
+  localRiskOverride: ((changedFiles: string[]) => ReturnType<typeof runRiskReview>['riskLevel']) | undefined
+
   private async report(job: Job, payload: Record<string, unknown>, step: WorkerStep): Promise<void> {
     if (this.crashBeforeNextReport) {
       const crash = this.crashBeforeNextReport
@@ -385,11 +404,11 @@ export class WorkerSimulator {
       return step
     }
     const check = gateRes.body
-    const local = runRiskReview(changedFiles)
+    const localRisk = this.localRiskOverride?.(changedFiles) ?? runRiskReview(changedFiles).riskLevel
     const policy = resolvePolicy({
-      finalRiskLevel: local.riskLevel,
-      gateDecision: toGateDecision(local.riskLevel),
-      auditRiskLevel: local.riskLevel,
+      finalRiskLevel: localRisk,
+      gateDecision: toGateDecision(localRisk),
+      auditRiskLevel: localRisk,
       alignmentRiskLevel: 'LOW',
     }, check)
     step.gate = {
@@ -397,6 +416,7 @@ export class WorkerSimulator {
       policy: policy.policy,
       nextAction: check.nextAction.action,
       ...(check.approvalRequest?.id !== undefined ? { requestId: check.approvalRequest.id } : {}),
+      reason: policy.reason,
     }
     const blocked = (): Record<string, unknown> => ({
       status: 'blocked',
@@ -416,11 +436,16 @@ export class WorkerSimulator {
       return step
     }
     if (check.nextAction.action === 'call_consume' && check.nextAction.consumedRequestId) {
-      const consume = await this.env.api('POST', `/api/approval-requests/${check.nextAction.consumedRequestId}/consume`, {
-        jobId: job.id,
-        currentCommit: current.headCommit,
-        currentDiffHash: current.diffHash,
-      }, 'worker')
+      const hook = this.beforeNextConsume
+      this.beforeNextConsume = undefined
+      const injected = hook?.()
+      const consume = typeof injected === 'number'
+        ? { statusCode: injected, body: { error: 'simulated consume failure' } as unknown }
+        : await this.env.api('POST', `/api/approval-requests/${check.nextAction.consumedRequestId}/consume`, {
+          jobId: job.id,
+          currentCommit: current.headCommit,
+          currentDiffHash: current.diffHash,
+        }, 'worker')
       step.consumeStatus = consume.statusCode
       if (consume.statusCode !== 200 && consume.statusCode !== 409) {
         await this.report(running, {
@@ -437,6 +462,10 @@ export class WorkerSimulator {
       const conflict = consume.body as { consumed?: boolean; jobId?: string }
       if (consume.statusCode === 409 && !(conflict.consumed === true && conflict.jobId === job.id)) {
         await this.report(running, blocked(), step)
+        return step
+      }
+      if (this.crashAfterNextConsume) {
+        this.crashAfterNextConsume = false
         return step
       }
     }
@@ -475,6 +504,24 @@ export class WorkerSimulator {
         return step
       }
       const after = dirtyPaths()
+      // implement の SafeCommand が git_commit のとき（git_commit Job から作られた repair Job 等）、
+      // jobRunner は AI CLI の後に SafeCommand として commit する。成功時はその commit を報告する。
+      if (outcome.kind === 'change' && job.safeCommand.kind === 'git_commit' && after.length > 0) {
+        git(['add', '--', ...after])
+        git(['commit', '-q', '-m', job.safeCommand.params?.commitMessage ?? 'lifecycle e2e repair commit'])
+        const commitHash = headCommit()
+        await this.report(running, {
+          status: 'success',
+          exitCode: 0,
+          stdout: `implemented; committed ${commitHash}`,
+          changedFiles: after,
+          commitHash,
+          guardResult: ALLOWED_GUARD,
+          completedAt: new Date().toISOString(),
+          failureMetadata: { workspaceEndFingerprint: { mode: 'clean', startCommitHash: commitHash } },
+        }, step)
+        return step
+      }
       await this.report(running, outcome.kind === 'change'
         ? {
             status: 'success',
