@@ -266,6 +266,20 @@ describe('buildReviewPrompt repository context', () => {
     expect(prompt).toContain('export function callerOutsideDiff(): number {')
   })
 
+  it('NUL を含まないバイナリ（不正な UTF-8 バイト列）も内容を載せず理由を明示する', () => {
+    // JPEG 先頭と同じ形のバイト列。NUL を含まないが UTF-8 としては不正。
+    const fullPath = path.join(repoRoot, 'assets/photo.jpg')
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true })
+    fs.writeFileSync(fullPath, Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x4a, 0x46, 0x49, 0x46, 0x81, 0xfe]))
+    writeRepoFile('src/text.ts', 'export const plain = \'日本語テキストも UTF-8 として載る\'')
+
+    const prompt = buildReviewPrompt(makeRequest({ targetFiles: ['assets/photo.jpg', 'src/text.ts'] }), [], repoRoot)
+
+    expect(prompt).toContain('### assets/photo.jpg\n(バイナリファイルのため載せていません)')
+    expect(prompt).not.toContain('JFIF')
+    expect(prompt).toContain('日本語テキストも UTF-8 として載る')
+  })
+
   it('phase:pre でも対象ファイルの現在内容を載せる', () => {
     writeRepoFile('src/existing.ts', 'export const contractBeforeChange = 42')
 

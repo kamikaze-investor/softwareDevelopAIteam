@@ -258,6 +258,7 @@ const SECRET_FILE_BASENAME_PATTERNS: readonly RegExp[] = [
 ]
 
 const SECRET_FILE_OMITTED = { omitted: '秘密情報ファイルの可能性があるため載せていません' } as const
+const BINARY_FILE_OMITTED = { omitted: 'バイナリファイルのため載せていません' } as const
 
 function isSecretFileName(file: string): boolean {
   return SECRET_FILE_BASENAME_PATTERNS.some(pattern => pattern.test(path.basename(file)))
@@ -292,9 +293,16 @@ function readRepositoryFile(
     return { omitted: '通常ファイルではありません' }
   }
 
-  const content = fs.readFileSync(realFile, 'utf-8')
+  // NUL を含まないバイナリ（JPEG 等）も載せないよう、生バイトを厳格な UTF-8 として復号できるかでも判定する
+  const bytes = fs.readFileSync(realFile)
+  let content: string
+  try {
+    content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    return BINARY_FILE_OMITTED
+  }
   if (content.includes('\0')) {
-    return { omitted: 'バイナリファイルのため載せていません' }
+    return BINARY_FILE_OMITTED
   }
   return { content }
 }
