@@ -128,6 +128,12 @@ function recordResumeSourceTerminalized(
  * 人の判断を偽らないため `reason` / `reviewed_at` も書かない。
  * 変えた場合だけ true（呼び出し側が audit に残す）。
  */
+/** better-sqlite3 の SqliteError が、別 connection との lock 競合（再試行で解消しうる）を表すか。 */
+function isSqliteBusyError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code
+  return typeof code === 'string' && /^SQLITE_(BUSY|LOCKED)/.test(code)
+}
+
 function supersedeApprovalOfTerminalJob(
   db: Database.Database,
   approvalId: string,
@@ -3382,11 +3388,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           const updatedTask = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
           return { ok: true as const, job: updatedJob, task: updatedTask }
         })
-        return run()
+        // terminal-Task 経路と同じく、最初の読み取りから park まで write lock を保持する（BEGIN IMMEDIATE）。
+        // deferred だと、読んだ後に別 connection が承認や後続 Job を commit したとき write upgrade が
+        // SQLITE_BUSY_SNAPSHOT で失敗し、人の判断との競合が STORAGE_ERROR → quarantine になる（Codex review 527668d）。
+        return run.immediate()
       } catch (err: unknown) {
         return {
           ok: false as const,
-          code: 'STORAGE_ERROR' as const,
+          // 別 connection の write と競合しただけ（SQLITE_BUSY / BUSY_SNAPSHOT / LOCKED）なら再試行可能と返す。
+          // cleanup の失敗ではないので、呼び出し側は carrier を quarantine しない。
+          code: isSqliteBusyError(err) ? 'STORAGE_BUSY' as const : 'STORAGE_ERROR' as const,
           reason: err instanceof Error ? err.message : String(err),
         }
       }
@@ -3746,7 +3757,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       } catch (err: unknown) {
         return {
           ok: false as const,
-          code: 'STORAGE_ERROR' as const,
+          // 別 connection の write と競合しただけ（SQLITE_BUSY / BUSY_SNAPSHOT / LOCKED）なら再試行可能と返す。
+          // cleanup の失敗ではないので、呼び出し側は carrier を quarantine しない。
+          code: isSqliteBusyError(err) ? 'STORAGE_BUSY' as const : 'STORAGE_ERROR' as const,
           reason: err instanceof Error ? err.message : String(err),
         }
       }

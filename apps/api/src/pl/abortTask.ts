@@ -399,6 +399,7 @@ export type CompleteAbortCleanupResult =
       | 'PRECONDITION_FAILED'
       | 'HUMAN_DECISION_CONFLICT'
       | 'CLEANUP_SUPERSEDED'
+      | 'STORAGE_BUSY'
     reason: string
   }
 
@@ -562,6 +563,12 @@ export function completeAbortCleanup(
     ? storage.jobs.parkBlockedTaskWithTerminalJobs(releaseInput)
     : storage.jobs.releaseBlockedJobAndParkTask(releaseInput)
   if (!released.ok) {
+    if (released.code === 'STORAGE_BUSY') {
+      // 別 connection の write（人の承認・後続 Job など）と lock 競合しただけで、transaction は何も変えていない。
+      // 再試行可能なので cleanup generation はそのまま残し、quarantine も refusal 記録もしない
+      // （Codex review 527668d: 競合した人の判断が quarantine を引き起こさないように）。
+      return { ok: false, code: 'STORAGE_BUSY', reason: released.reason }
+    }
     if (released.code === 'HUMAN_DECISION_CONFLICT' || released.code === 'CLEANUP_SUPERSEDED') {
       // 人の判断（live WAITING / APPROVED / 後から CONSUMED）または後続の Job が先にある。cleanup 自体の
       // 失敗ではないので retireTechnicalAbortCleanup() で carrier を quarantine しない —— quarantine すると

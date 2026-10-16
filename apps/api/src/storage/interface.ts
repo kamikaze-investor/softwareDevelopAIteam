@@ -628,6 +628,8 @@ export type ReleaseBlockedJobAndParkTaskResult =
       | 'STORAGE_ERROR'
       | 'HUMAN_DECISION_CONFLICT'
       | 'CLEANUP_SUPERSEDED'
+      /** 別 connection の write と lock 競合した（再試行可能。何も変えていない）。 */
+      | 'STORAGE_BUSY'
     reason: string
   }
 
