@@ -18,7 +18,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
-import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateResumeAdmission, isSupervisedRunKind, isLiveWaitingApproval } from '@ai-team/shared'
+import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -50,7 +50,7 @@ import type {
 } from '../pl/technicalAbortEvidence'
 // 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
 // 型以外に storage へ依存しないモジュールなので循環しない。
-import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
+import { APPROVAL_WAITING_REASON } from '../humanRecovery/recoveryAudit'
 import {
   classifyGitCommitResumeLineage,
   exactGitCommitResumePredecessor,
@@ -1135,51 +1135,49 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // （独立レビュー round 6 指摘）。読み直す条件が判定に使った条件より少ない限り、
         // IMMEDIATE で lock を取っても意味が無い。
         const current = deserializeTask(row)
-        if (current.status !== 'blocked') {
-          return { ok: false as const, reason: `Task is ${current.status}, not blocked` }
-        }
-
         const jobCount = (db.prepare(
           'SELECT COUNT(*) AS n FROM jobs WHERE task_id = ?',
         ).get(taskId) as { n: number }).n
-        if (jobCount > 0) {
-          return {
-            ok: false as const,
-            reason: `Task acquired ${jobCount} job(s) concurrently; use /resume instead`,
-          }
-        }
-
-        if (isParkedTaskId(taskId)) {
-          return { ok: false as const, reason: 'Task was parked concurrently' }
-        }
-
-        // **Project が running であることも読み直す**（precheck と同じ code。b8d0fc5d 監査）。
+        // **Project が running であることも読み直す**（b8d0fc5d 監査）。
         // precheck の後に Project が pause されたら、pending へ戻しても誰も拾わない。
         const projectRow = db.prepare('SELECT status FROM projects WHERE id = ?').get(current.projectId) as
           { status: string } | undefined
-        if (projectRow?.status !== 'running') {
-          return {
-            ok: false as const,
-            code: 'PROJECT_NOT_RUNNING' as const,
-            reason: `Project is ${projectRow?.status ?? 'missing'}, not running`,
-          }
-        }
-
         // **有効な承認待ちも同じ transaction の中で確かめ直す。** precheck だけだと、
         // 別 connection が precheck 後・commit 前に Approval Request を作れてしまい、
         // 「人の判断待ちと Recovery が同時進行しない」という条件を破ったまま commit される。
-        // 判定は precheck と同じ `hasActiveApprovalWaiting()` —— 条件をここへ書き写さない。
         const approvalRows = db.prepare(
           'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC',
         ).all(taskId) as any[]
-        if (hasActiveApprovalWaiting(approvalRows.map(deserializeApprovalRequest), now())) {
-          // **precheck と同じ code を返す。** ここでしか気付けなかった（= race だった）
-          // というだけで machine-readable code が変わってはならない
-          // （独立レビュー round 7 指摘）。
-          return {
-            ok: false as const,
-            code: 'APPROVAL_WAITING' as const,
-            reason: APPROVAL_WAITING_REASON,
+
+        // **判定は precheck と同じ共有の `evaluateRecoverAdmission()`** —— 読み直した値を渡すだけで、
+        // 条件をここへ書き写さない。**precheck と同じ code を返す。** ここでしか気付けなかった
+        // （= race だった）というだけで machine-readable code が変わってはならない（独立レビュー round 7 指摘）。
+        const admission = evaluateRecoverAdmission({
+          taskStatus: current.status,
+          parked: isParkedTaskId(taskId),
+          projectStatus: projectRow?.status,
+          jobCount,
+          approvals: approvalRows.map(deserializeApprovalRequest),
+          nowMs: Date.parse(now()),
+        })
+        if (!admission.ok) {
+          switch (admission.code) {
+            case 'TASK_NOT_BLOCKED':
+              return { ok: false as const, code: admission.code, reason: `Task is ${current.status}, not blocked` }
+            case 'TASK_HAS_JOBS':
+              return {
+                ok: false as const,
+                code: admission.code,
+                reason: `Task acquired ${jobCount} job(s) concurrently; use /resume instead`,
+              }
+            case 'TASK_PARKED':
+              return { ok: false as const, code: admission.code, reason: 'Task was parked concurrently' }
+            case 'PROJECT_UNAVAILABLE':
+              return { ok: false as const, code: admission.code, reason: 'Project is missing or archived' }
+            case 'PROJECT_NOT_RUNNING':
+              return { ok: false as const, code: admission.code, reason: `Project is ${projectRow?.status}, not running` }
+            case 'APPROVAL_WAITING':
+              return { ok: false as const, code: admission.code, reason: APPROVAL_WAITING_REASON }
           }
         }
 

@@ -405,6 +405,25 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
   })
 
+  it('**transaction 内の再確認も precheck と同じ共有述語の code を返す（archived / park）**', () => {
+    const archived = seed({})
+    const archivedTask = archived.storage.tasks.findById(archived.taskId)!
+    archived.storage.projects.update(archivedTask.projectId, { status: 'archived' })
+    expect(archived.storage.tasks.recoverFromBlocked({ taskId: archived.taskId, detail: 'race' }))
+      .toMatchObject({ ok: false, code: 'PROJECT_UNAVAILABLE' })
+    expect(recoverBlockedTask(archived.storage, { taskId: archived.taskId, reason: 'r' }))
+      .toMatchObject({ ok: false, code: 'PROJECT_UNAVAILABLE' })
+
+    const parked = seed({})
+    parked.storage.auditLog.record({
+      actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: parked.taskId,
+      result: 'success', detail: 'parked mid-flight',
+    })
+    expect(parked.storage.tasks.recoverFromBlocked({ taskId: parked.taskId, detail: 'race' }))
+      .toMatchObject({ ok: false, code: 'TASK_PARKED' })
+    expect(parked.storage.tasks.findById(parked.taskId)?.status).toBe('blocked')
+  })
+
   it('**attention_only は「通知が必ず飛ぶ」ことまでは意味しない**', () => {
     // `hasEscalated()` のキー `task_ready_without_job:<taskId>` は Task の生涯で変わらない。
     // 過去に一度でも同じ kind で Escalate されていれば、再投入しても `runPlTick()` は

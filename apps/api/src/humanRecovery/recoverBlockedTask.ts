@@ -72,11 +72,10 @@
 import type { IStorage } from '../storage/interface'
 import {
   APPROVAL_WAITING_REASON,
-  hasActiveApprovalWaiting,
   isReachableByAutonomousLoop,
   latestHumanRecoveryId,
 } from './recoveryAudit'
-import type { Task } from '@ai-team/shared'
+import { evaluateRecoverAdmission, type Task } from '@ai-team/shared'
 
 export { latestHumanRecoveryId } from './recoveryAudit'
 import {
@@ -300,74 +299,74 @@ export function recoverBlockedTask(
   }
 
   const project = storage.projects.findById(task.projectId)
-  if (!project || project.status === 'archived') {
-    return {
-      ok: false,
-      code: 'PROJECT_UNAVAILABLE',
-      reason: `Task ${input.taskId} belongs to a project that is missing or archived`,
-    }
-  }
-
-  // **running でない Project では再投入しない**（b8d0fc5d 監査）。paused / draft の Project では
-  // PL tick も attention 導出も Worker の claim も動かないので、`pending` へ戻しても誰も拾わず、
-  // blocked という「人が見るべき停止」の表示だけが消える。transaction の中でも読み直す。
-  if (project.status !== 'running') {
-    return {
-      ok: false,
-      code: 'PROJECT_NOT_RUNNING',
-      reason: `Task ${input.taskId} belongs to a project that is ${project.status}, not running; resume the project first`,
-    }
-  }
-
-  // **`blocked` 以外は対象にしない。** `pending` は既に再投入済みか、そもそも止まっていない。
-  if (task.status !== 'blocked') {
-    return {
-      ok: false,
-      code: 'TASK_NOT_BLOCKED',
-      reason: `Task ${input.taskId} is ${task.status}, not blocked; there is nothing to re-admit`,
-    }
-  }
-
-  // **Job があるものはこの経路の責務ではない。** 既存 `resumeBlockedTask()` が
-  // quarantine / 承認待ち / Design Review evidence の門を持っており、
-  // ここで二重の復旧経路を作ると門の数だけ挙動が分岐する。
   const jobs = storage.jobs.findByTaskId(task.id)
-  if (jobs.length > 0) {
-    return {
-      ok: false,
-      code: 'TASK_HAS_JOBS',
-      reason:
-        `Task ${input.taskId} already has ${jobs.length} job(s); `
-        + 'use the existing POST /api/tasks/:id/resume path, which carries the quarantine, '
-        + 'approval and design-review-evidence gates for a task that has already executed',
-    }
-  }
 
-  // park の解除は CEO の別判断（`abort_task` の取り消し）であり、復旧の副作用で起きてよくない。
-  // 既存 `PATCH /api/tasks/:id` が park された Task を占有状態へ戻さないのと同じ理由である。
-  if (storage.tasks.isParked(task.id)) {
-    return {
-      ok: false,
-      code: 'TASK_PARKED',
-      reason:
-        `Task ${input.taskId} was parked by abort_task; re-admitting it here would silently undo the park. `
-        + 'Adopt the roadmap item again as a follow-up instead',
+  // **前提条件は共有の純関数 1 つで決める**（Mobile の「復旧」ボタンも同じ関数を使う）。
+  // 以下の分岐の注記は、各前提がなぜ在るかの記録として残してある。判定は `evaluateRecoverAdmission()` だけが行う。
+  const admission = evaluateRecoverAdmission({
+    taskStatus: task.status,
+    parked: storage.tasks.isParked(task.id),
+    projectStatus: project?.status,
+    jobCount: jobs.length,
+    // Task の全行を渡す（live な承認待ちが 1 行でもあれば断る。resume 側と同じ集約形）。
+    approvals: storage.approvalRequests.findByTaskId(task.id),
+    nowMs: Date.now(),
+  })
+  if (!admission.ok) {
+    switch (admission.code) {
+      case 'PROJECT_UNAVAILABLE':
+        return {
+          ok: false,
+          code: 'PROJECT_UNAVAILABLE',
+          reason: `Task ${input.taskId} belongs to a project that is missing or archived`,
+        }
+      // **running でない Project では再投入しない**（b8d0fc5d 監査）。paused / draft の Project では
+      // PL tick も attention 導出も Worker の claim も動かないので、`pending` へ戻しても誰も拾わず、
+      // blocked という「人が見るべき停止」の表示だけが消える。transaction の中でも読み直す。
+      case 'PROJECT_NOT_RUNNING':
+        return {
+          ok: false,
+          code: 'PROJECT_NOT_RUNNING',
+          reason: `Task ${input.taskId} belongs to a project that is ${project?.status}, not running; resume the project first`,
+        }
+      // **`blocked` 以外は対象にしない。** `pending` は既に再投入済みか、そもそも止まっていない。
+      case 'TASK_NOT_BLOCKED':
+        return {
+          ok: false,
+          code: 'TASK_NOT_BLOCKED',
+          reason: `Task ${input.taskId} is ${task.status}, not blocked; there is nothing to re-admit`,
+        }
+      // **Job があるものはこの経路の責務ではない。** 既存 `resumeBlockedTask()` が
+      // quarantine / 承認待ち / Design Review evidence の門を持っており、
+      // ここで二重の復旧経路を作ると門の数だけ挙動が分岐する。
+      case 'TASK_HAS_JOBS':
+        return {
+          ok: false,
+          code: 'TASK_HAS_JOBS',
+          reason:
+            `Task ${input.taskId} already has ${jobs.length} job(s); `
+            + 'use the existing POST /api/tasks/:id/resume path, which carries the quarantine, '
+            + 'approval and design-review-evidence gates for a task that has already executed',
+        }
+      // park の解除は CEO の別判断（`abort_task` の取り消し）であり、復旧の副作用で起きてよくない。
+      // 既存 `PATCH /api/tasks/:id` が park された Task を占有状態へ戻さないのと同じ理由である。
+      case 'TASK_PARKED':
+        return {
+          ok: false,
+          code: 'TASK_PARKED',
+          reason:
+            `Task ${input.taskId} was parked by abort_task; re-admitting it here would silently undo the park. `
+            + 'Adopt the roadmap item again as a follow-up instead',
+        }
+      // **人の判断が既に1件待っているなら、2本目の駆動を始めない。**
+      // 既存 `resumeBlockedTask()` が持つ不変条件をそのまま借りる（live 判定は共有の
+      // `isLiveWaitingApproval()`。transaction 内の再確認も同じ `evaluateRecoverAdmission()`）。
+      // 新しい Approval Gate ではない —— Human Recovery が承認を要求するようになったのではなく、
+      // **同時進行を避ける**だけである。放置すると `approval_waiting` と `task_ready_without_job` が
+      // 同時に立ち、PL は前者を先に処理するので、`nextDriver` と実際に進行を止めるものが食い違う。
+      case 'APPROVAL_WAITING':
+        return { ok: false, code: 'APPROVAL_WAITING', reason: APPROVAL_WAITING_REASON }
     }
-  }
-
-  // **人の判断が既に1件待っているなら、2本目の駆動を始めない。**
-  // 既存 `resumeBlockedTask()` が持つ不変条件をそのまま借りる（条件は
-  // `hasActiveApprovalWaiting()` の1箇所にある）。新しい Approval Gate ではない ——
-  // Human Recovery が承認を要求するようになったのではなく、**同時進行を避ける**だけである。
-  // 放置すると `approval_waiting` と `task_ready_without_job` が同時に立ち、PL は前者を
-  // 先に処理するので、`nextDriver` と実際に進行を止めるものが食い違う。
-  //
-  // Task の全行を渡す（live な承認待ちが 1 行でもあれば断る。resume 側と同じ集約形）。
-  if (hasActiveApprovalWaiting(
-    storage.approvalRequests.findByTaskId(task.id),
-    new Date().toISOString(),
-  )) {
-    return { ok: false, code: 'APPROVAL_WAITING', reason: APPROVAL_WAITING_REASON }
   }
 
   // **却下済みテキスト世代での上限は置かない（独立レビュー round 2 で撤回した）。**
@@ -412,6 +411,6 @@ export function recoverBlockedTask(
     taskId: task.id,
     task: committed.task,
     // 遷移**後**の状態で判定する（`findRemediationSubject()` は `pending` を要求する）。
-    nextDriver: predictHumanRecoveryDriver(storage, committed.task, project.status === 'running'),
+    nextDriver: predictHumanRecoveryDriver(storage, committed.task, project?.status === 'running'),
   }
 }
