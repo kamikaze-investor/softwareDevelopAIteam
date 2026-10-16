@@ -343,10 +343,10 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
     // unnecessary_staging は over_constraint の一種として報告させる（新しい category を作らない）。
     `- over_constraint (unnecessary_staging; report it as over_constraint): ${unknownDrivenStaging?.oneLiner ?? 'Principle unknown-driven-staging was not available; do not treat it as applied.'}`,
     `- unverifiable_assumption: ${honestUnverifiable?.oneLiner ?? 'Principle honest-unverifiable was not available; do not treat it as applied.'}`,
-    // Root Cause Generalization は core 原則 evidence-not-spec の一部。reviewer は diff の外を見られないので、
-    // 見えている同原因箇所がある場合だけ CONFLICT にさせる（全数調査を要求させない）。
-    // [root_cause] は ledger 上で同原則の他の判定と区別するための接頭辞（新しい category は作らない）。
-    '- evidence-not-spec (root cause): give CONFLICT only when the material shows a same-cause site the change leaves untouched and unreported, and start that reason with [root_cause]; otherwise ALIGNED or UNCERTAIN. Never request a search the material cannot show.',
+    // Root Cause Generalization（core 原則 evidence-not-spec の一部）の finding 側。reviewer は diff の外を
+    // 見られないので、見えている同原因箇所だけを指摘させる（全数調査を要求させない）。新しい category は作らない。
+    // 原則 verdict 側の同じ上限は buildApplicablePrinciplesSection() が持つ。
+    '- root cause (evidence-not-spec): report a same-cause site only when the material shows it and the change leaves it untouched and unreported; use the category of that defect and start the message with [root_cause]. Never request a search the material cannot show.',
   ].join('\n')
 }
 
@@ -370,6 +370,12 @@ export function buildApplicablePrinciplesSection(selection: readonly PrincipleSe
     'ALIGNED = the change respects it. CONFLICT = the change violates it. UNCERTAIN = you cannot tell from the material given.',
     'Do not invent principle ids that are not in this list.',
     ...selection.map((item) => `- ${item.slug}: ${item.oneLiner}`),
+    // evidence-not-spec の root cause 部分は reviewer が diff の外を見られないため、verdict の上限を明示する。
+    // verdict を集計する全経路（Design Review / focused review）がこの関数を通るので、ここに 1 箇所だけ置く。
+    // [root_cause] は ledger 上で同原則の他の判定と区別するための接頭辞。
+    ...(selection.some((item) => item.slug === 'evidence-not-spec')
+      ? ['For evidence-not-spec, give CONFLICT on root cause only when the material shows a same-cause site the change leaves untouched and unreported, and start that reason with [root_cause]; otherwise judge root cause ALIGNED or UNCERTAIN.']
+      : []),
   ].join('\n')
 }
 

@@ -570,7 +570,7 @@ Codexの利用枠は全セッション共有資源。同じ品質をより少な
 
 | # | ルール | 要点 |
 |---|---|---|
-| 014 | 1 Finding = 1 bounded task | 複数Findingを1セッションへまとめない |
+| 014 | 1 Finding = 1 bounded task | 複数Findingを1セッションへまとめない（同じ根本原因の複数症状は、その原因を1 Findingとして扱う。`specs/21` `evidence-not-spec`） |
 | 015 | repository全体の再調査をさせない | Evidence/対象ファイル/Root Cause候補を渡し探索範囲を限定 |
 | 016 | 結論は独立検証、情報収集は繰り返させない | 検証対象の結論と根拠をprompt/Context Packに明示 |
 | 017 | 必要なファイルだけ読む | 無関係な履歴・PR・testを広範囲に読み込ませない |

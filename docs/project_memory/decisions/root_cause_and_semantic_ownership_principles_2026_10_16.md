@@ -12,8 +12,9 @@ Status・finding category は追加していない。正本は `specs/21`。
   残りは報告）も one-liner に入れた**
 - 横断探索は PL / triage が Task を切る段で行い、実装者に bounded Task の外を探させない
   （AGENTS.md 9章 014 / 015 と整合。共通原因そのものを 1 Finding として 1 bounded Task にする）
-- Reviewer 向けには `buildEngineeringPrincipleReviewGuidance` に 1 行: material に同原因箇所が
-  見えるときだけ CONFLICT、理由の先頭に `[root_cause]`
+- Reviewer 向け: verdict 側は `buildApplicablePrinciplesSection`（verdict を集計する Design Review /
+  focused review の全経路）、finding 側は `buildEngineeringPrincipleReviewGuidance`（PR Meta Review を含む）に
+  各 1 行。material に同原因箇所が見えるときだけ CONFLICT / 指摘、先頭に `[root_cause]`
 - **Canonical Semantic Ownership** → `canonical-domain-meaning` と `semantic_integrity.md` の拡張
   （one owner per meaning / 意味が異なる fact を統合しない / owner 配置は最小の構造変更で直す）
 
@@ -38,4 +39,5 @@ Lifecycle 修復と並行して変えない。後続 Task で扱う。
 
 独立レビュー（Codex CLI はこの環境に無く、別コンテキストの agent で代替）: 初回 CHANGES_REQUESTED
 （one-liner に上限が無い / verdict の混線 / AGENTS.md 014・015 との緊張 / checklist 重複 /
-既存コードへの遡及 / lifecycle 例への偏り）→ 全件反映。上の gap のみ記録に留めた。
+既存コードへの遡及 / lifecycle 例への偏り）→ 反映。再レビューで focused review の verdict 経路に
+上限が届いていない blocker → `buildApplicablePrinciplesSection` へ移して解消。上の gap のみ記録に留めた。
