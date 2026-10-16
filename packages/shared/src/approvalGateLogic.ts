@@ -102,6 +102,10 @@ export const GATE_CHANGE_EXACT_FILES: readonly string[] = [
   'apps/worker/src/jobStateManager',                            // stale Job recovery の admission
   'apps/worker/src/workspaceVerification',                      // crash recovery で workspace 所有権を解放する exact 検証
   'apps/worker/src/index',                                      // abort cleanup 再送 budget（fileChangeGuard 保護とは別に不変条件として）
+  // 2026-10-17 Codex review round 2（c3-b）
+  'apps/api/src/jobResultApplicationPolicy',                    // Job result の状態遷移 admission（正本）
+  'apps/api/src/routes/jobs',                                   // 直接遷移 / claim の拒否と Outbox 受理の境界
+  'apps/api/src/routes/tasks',                                  // generic route で無許可の done を止める唯一の場所・lifecycle 所有状態の拒否
 ]
 for (const file of GATE_CHANGE_EXACT_FILES) {
   if (!/^[A-Za-z0-9/]+$/.test(file)) {
