@@ -214,7 +214,11 @@ describe('corePrincipleSlugs', () => {
     // Root Cause Generalization が fix の現場へ届く経路はこの 1 行だけなので、ここで固定する。
     const principles = loadForTest()
     const contract = buildDesignContract({ slugs: selectPrincipleSlugs(undefined, principles), principles })
-    expect(contract).toContain('a reported failure is evidence of its cause, not the boundary of its fix')
+    expect(contract).toContain('a reported failure is evidence of its cause')
+    // 範囲の上限（risk 相応・Task scope 内）も同じ 1 行で届くこと。上限が全文にしか無いと、
+    // core-only の repair prompt には「範囲を広げろ」だけが届く。
+    expect(contract).toContain('scaled to risk')
+    expect(contract).toContain('within Task scope')
   })
 })
 
@@ -339,6 +343,7 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     expect(guidance).toContain('- over_constraint (unnecessary_staging; report it as over_constraint): Stage by unknown, not by size')
     // canonical-domain-meaning は contextual principle なので、選択結果を経ずに常時注入しない。
     expect(guidance).not.toContain('semantic_reinference')
+    expect(guidance).toContain('start that reason with [root_cause]')
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {

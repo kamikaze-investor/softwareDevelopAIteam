@@ -1,7 +1,7 @@
 # Outcome-Oriented Generalization Principle
 
 <!-- principle-id: evidence-not-spec -->
-<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification, and a reported failure is evidence of its cause, not the boundary of its fix. -->
+<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause, check where it plausibly recurs (scaled to risk), fix the shared cause within Task scope and report the rest. -->
 <!-- principle-category: outcome-definition -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: core -->
@@ -12,10 +12,10 @@ Freedom. Current implementation is evidence, not specification. Priority: Goal -
 Policy/Approval Policy -> Required Outcomes -> Non-Negotiable Invariants -> Stable Contract -> Current
 Implementation.
 Root Cause Generalization (fixing a defect, error or design inconsistency): the reported site is
-evidence, not the scope. Name the cause one level above the symptom (the missing or duplicated owner,
-the unenforced invariant, the unhandled state or transition, the contract read from an incidental
-representation), then look for the same cause elsewhere -- other features, modules, layers, state
-transitions -- including different symptoms and failures that have not happened yet. Size the search
+evidence, not the scope. Name the cause behind the symptom (the missing or duplicated owner, the
+unenforced invariant, the unhandled state or transition, the contract read from an incidental
+representation), then look for latent sites that share the named cause -- in other features, modules,
+layers, state transitions -- including ones that would show a different symptom. Size the search
 by how plausibly the cause is shared and by what its failure would cost (`scale-to-risk`): a typo
 needs none; a cause in a shared helper, contract, owner or state machine needs its consumers checked.
 This is never an unconditional whole-system audit, and it is scope of the fix, not re-verification of
@@ -26,10 +26,13 @@ common shared cause (`canonical-domain-meaning`). It targets sites sharing a fou
 reason to rewrite unrelated code (`existing-code-grandfather`). State the generalized cause and the
 scope searched in the change or its report (one line suffices for a small fix). Same-cause sites
 outside the current Task scope are recorded through an existing path (report, review finding, roadmap
-item), not silently widened into the change and not silently dropped. A reviewer marks this principle
-CONFLICT when the change patches only the reported site while the material shows the same cause
-elsewhere, or when a non-trivial fix names no cause; it does not demand a search the cause does not
-warrant.
+item), not silently widened into the change and not silently dropped. The cross-site search belongs
+to whoever scopes the work (PL / triage, when it decomposes findings and delegates), not to an
+implementer inside a bounded Task; the shared cause is itself the one finding of one bounded Task,
+which lists the reported symptoms it closes. A reviewer marks this principle CONFLICT only when the material it was given shows a same-cause
+site the change leaves untouched and unreported, and starts that reason with `[root_cause]`; when the
+material cannot show it (no other sites visible, no report attached) the verdict is ALIGNED or
+UNCERTAIN, never a demand for a search the material cannot show.
 
 <!-- principle-id: standard-design-frame -->
 <!-- principle-oneliner: Name the failure a constraint prevents before adding it. -->
@@ -208,7 +211,8 @@ status list or copy of the rule) for a fact that already has one. When two or mo
 the owner sits where its consumers cannot reach it naturally, prefer the smallest structural
 refactoring that leaves one owner (move it, delegate to it, delete the copy) over adding a layer on
 top. Do not merge distinct meanings: when consumers legitimately need different facts (e.g.
-"terminal" vs "succeeded", "current" vs "selectable", "superseded" vs "stale"), name each fact and
+"can view" vs "can edit", an amount in minor vs major currency units, "terminal" vs "succeeded"),
+name each fact and
 its owner explicitly instead of sharing one overloaded predicate, value or flag.
 Distinguish contractual representation (persisted schema, external API, event format, stable
 identifier) from incidental representation; changing a contractual one requires a migration /
