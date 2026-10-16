@@ -423,7 +423,18 @@ export interface PatchJobResult {
    * 既存の `revertBlockedJobChanges()` で自分の変更だけを取り消す。
    */
   workspaceCleanupRequired?: boolean
+  /**
+   * API が更新を**確定的に拒否した**ときの code（現在は claim 拒否の `JOB_CLAIM_REFUSED` だけ）。
+   * 応答が失われた場合とは違い、Job は API 側で queued のまま確定している。
+   */
+  refusedCode?: typeof JOB_CLAIM_REFUSED_CODE
 }
+
+/**
+ * claim（queued -> running）を API が拒否した（Project が running でない / quarantine）ときの code。
+ * 通常の CEO pause でも起きる確定応答なので、retry・reconcile・通知の対象にしない（lifecycle repair W5）。
+ */
+export const JOB_CLAIM_REFUSED_CODE = 'JOB_CLAIM_REFUSED'
 
 export function normalizePatchJobResult(value: boolean | PatchJobResult): PatchJobResult {
   return typeof value === 'boolean' ? { ok: value } : value
@@ -468,6 +479,17 @@ export async function patchJobWithRetry(
           workspaceCleanupRequired = false
         }
         return { ok: true, workspaceCleanupRequired }
+      }
+      // claim 拒否は確定応答。retry しても結果は変わらないので即座に返す。
+      // それ以外の非 2xx（未知の 409 を含む）は従来どおり retry する。
+      if (response.status === 409) {
+        let code: unknown
+        try {
+          code = (await response.json() as { code?: unknown })?.code
+        } catch {
+          code = undefined
+        }
+        if (code === JOB_CLAIM_REFUSED_CODE) return { ok: false, refusedCode: JOB_CLAIM_REFUSED_CODE }
       }
     } catch {
       // A network error and an AbortController timeout are both retryable here.
@@ -887,6 +909,13 @@ async function confirmRunningTransition(
     await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload),
   )
   if (confirmed.ok) return true
+
+  // API が claim を確定的に拒否した（Project が pause された等）。応答が失われたわけではないので
+  // reconcile（fail-if-running）も CRITICAL 通知もしない。Job は queued のまま、この poll では実行しない。
+  if (confirmed.refusedCode === JOB_CLAIM_REFUSED_CODE) {
+    console.warn(`[Worker] Job ${job.id} の claim は API に拒否されました（Project が running でない、または quarantine）。queued のまま見送ります`)
+    return false
+  }
 
   await reconcileAfterPatchFailure(
     job.id,

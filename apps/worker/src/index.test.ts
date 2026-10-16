@@ -938,6 +938,58 @@ describe('running transition', () => {
     expect(alert).toHaveBeenCalledTimes(1)
   })
 
+  it('a JOB_CLAIM_REFUSED 409 is a definitive answer: no retry, no reconcile, no alert, Job not run (W5)', async () => {
+    // 通常の CEO pause で起きる。以前は「status persistence technical failure」として CRITICAL が鳴っていた。
+    const executeJob = vi.fn().mockResolvedValue(runResult)
+    const reconcileJob = vi.fn()
+    const alert = vi.fn().mockResolvedValue([])
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      error: 'Job claim refused: the workspace is quarantined or the Project is not running',
+      code: 'JOB_CLAIM_REFUSED',
+    }), { status: 409 }))
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob: retryingPatchJob(),
+      reconcileJob,
+      executeJob,
+      alert,
+      now: () => NOW,
+    })
+
+    expect(status).toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(reconcileJob).not.toHaveBeenCalled()
+    expect(alert).not.toHaveBeenCalled()
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+    expect(executeJob).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it.each([
+    ['a transport failure', async () => { throw new TypeError('fetch failed') }],
+    ['an unknown 409', async () => new Response(JSON.stringify({ code: 'SOMETHING_ELSE' }), { status: 409 })],
+  ])('%s keeps the existing retry + reconcile + alert path', async (_label, respond) => {
+    const executeJob = vi.fn().mockResolvedValue(runResult)
+    const reconcileJob = vi.fn().mockResolvedValue({ outcome: 'unrecoverable', updated: false })
+    const alert = vi.fn().mockResolvedValue([])
+    fetchMock.mockImplementation(respond)
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob: retryingPatchJob(),
+      reconcileJob,
+      executeJob,
+      alert,
+      now: () => NOW,
+    })
+
+    expect(status).toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(reconcileJob).toHaveBeenCalledTimes(1)
+    expect(alert).toHaveBeenCalledTimes(1)
+    expect(executeJob).not.toHaveBeenCalled()
+  })
+
   it('does not call runJob or its AI CLI path while the running PATCH is retrying', async () => {
     const executeJob = vi.fn().mockResolvedValue(runResult)
     const executeCountsDuringPatch: number[] = []
