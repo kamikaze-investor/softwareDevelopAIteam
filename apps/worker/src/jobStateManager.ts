@@ -135,9 +135,23 @@ export async function reconcileRunningJob(
   }
 }
 
+export interface RecoverStaleJobsOptions {
+  /**
+   * この Job の terminal update が Worker の durable Outbox に未配送で残っているか。
+   *
+   * true の running Job には startup recovery が terminal 遷移（fail-if-running）を作らない。
+   * 本当の結果は Outbox replay が届ける。recovery が先に failed / blocked へ動かすと、replay
+   * （write-once の workspaceEndFingerprint を含む）は running→terminal 以外で 409 になり、
+   * event が pending のまま残って queued Job intake が止まり続ける（lifecycle repair C2 / H-01）。
+   * replay が一時的に失敗している間も同じ理由で触らない（次の replay に任せる）。
+   */
+  hasPendingTerminalEvent?: (jobId: string) => boolean
+}
+
 export async function recoverStaleJobs(
   apiBaseUrl: string,
-  headers: Record<string, string> = {}
+  headers: Record<string, string> = {},
+  options: RecoverStaleJobsOptions = {},
 ): Promise<number> {
   let recovered = 0
   const projects = await fetchJson<Pick<Project, 'id'>[]>('/api/projects', apiBaseUrl, headers)
@@ -161,6 +175,12 @@ export async function recoverStaleJobs(
 
       for (const job of jobs) {
         if (job.status === 'running') {
+          if (options.hasPendingTerminalEvent?.(job.id) === true) {
+            console.log(
+              `[Recovery] Job ${job.id} は terminal update が Outbox に未配送で残っているため復旧対象外（Outbox replay に任せる）`,
+            )
+            continue
+          }
           const didRecover = await reconcileRunningJobAtStartup(job, apiBaseUrl, headers)
           if (didRecover) recovered += 1
           continue

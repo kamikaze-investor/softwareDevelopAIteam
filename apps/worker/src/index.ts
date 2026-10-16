@@ -249,6 +249,97 @@ function isReleasableForNextTask(
   }
 }
 
+/**
+ * 既存所有者（live な Job / 非 stale の blocked 行を持つ Task）がいても、**別 Task に stale 候補の
+ * blocked 行がある**なら、worktree の dirt が所有者 Task のものだと説明できるときだけ所有者を確定する。
+ *
+ * repair: / resume: / retry: / review / git_commit などの非 initial Job は baseline 取得時に dirty
+ * worktree を受け入れる（`computeWorkspaceBaseline()`）。所有者確定を stale 行の観測より前に返すと、
+ * 終わった（または park された）Task A が残した dirt を、所有者 Task B の次の Job が自分の baseline
+ * として取り込み、A の変更を B の成果として継承しうる（独立レビュー P1）。
+ *
+ * 判定は既存の材料だけを使う: worktree の実観測 + durable な `changedFiles` と baseline HEAD の一致
+ * （`jobOwnsRecordedDirt()`、fallback 所有者判定と同じ帰属）。
+ * - stale 候補が無い → 従来どおり所有者を返す（worktree を読まない）
+ * - admission と同じ clean（manifest 空 + git 操作無し + HEAD 解決可）→ 所有者を返す
+ * - 観測できない / git 操作中 / HEAD 不明 / 所有者 Task で説明できない dirt → ambiguous（この cycle は誰も claim しない）
+ */
+function confirmOwnerAgainstStaleDirt(
+  ownerTaskId: string,
+  perTask: readonly { task: Task; jobs: Job[] }[],
+  workingDir: string,
+  readDirtyPaths: (dir: string) => readonly string[],
+  readHead: (dir: string) => string | undefined,
+  readGitOperations: (dir: string) => readonly string[],
+): WorkspaceOwnership {
+  const owner: WorkspaceOwnership = { kind: 'owner', taskId: ownerTaskId }
+  const hasStaleElsewhere = perTask.some(({ task, jobs }) => (
+    task.id !== ownerTaskId && jobs.some((job) => isStaleBlockedJobOfFinishedTask(task, job))
+  ))
+  if (!hasStaleElsewhere) return owner
+
+  let dirtyPaths: ReadonlySet<string>
+  let head: string | undefined
+  try {
+    dirtyPaths = new Set(readDirtyPaths(workingDir))
+  } catch (err: unknown) {
+    console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
+    return { kind: 'ambiguous' }
+  }
+
+  // clean の定義は admission / stale 解放と同じ（`isReleasableForNextTask()`）:
+  // manifest が空 + 進行中の git 操作が無い + HEAD を解決できる。stale Task が MERGE_HEAD /
+  // index.lock / 読めない HEAD を残していると、所有者の次 Job は baseline admission で
+  // fail-closed（quarantine）になるので、ここでは誰も選ばない。
+  if (dirtyPaths.size === 0) {
+    if (isReleasableForNextTask(workingDir, dirtyPaths, readGitOperations, readHead)) return owner
+    console.warn(`[Worker] 別 Task の stale 行があり、workspace が admission 可能な clean 状態でないため claim を見送ります`)
+    return { kind: 'ambiguous' }
+  }
+
+  try {
+    // dirty の場合も、進行中の git 操作があれば帰属を問わず選ばない（admission が拒否する）。
+    const gitOperations = readGitOperations(workingDir)
+    if (gitOperations.length > 0) {
+      console.warn(`[Worker] 進行中の git 操作があるため claim を見送ります (${gitOperations.join(', ')})`)
+      return { kind: 'ambiguous' }
+    }
+    head = readHead(workingDir)
+  } catch (err: unknown) {
+    console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
+    return { kind: 'ambiguous' }
+  }
+
+  const ownerJobs = perTask.find(({ task }) => task.id === ownerTaskId)?.jobs ?? []
+  const explained = new Set(
+    ownerJobs
+      .filter((job) => jobOwnsRecordedDirt(job, head, dirtyPaths))
+      .flatMap((job) => job.changedFiles ?? []),
+  )
+  const unexplained = [...dirtyPaths].filter((path) => !explained.has(path))
+  if (unexplained.length > 0) {
+    console.warn(
+      `[Worker] dirty workspace に帰属不明の変更が含まれます ` +
+      `(${unexplained.slice(0, 5).join(', ')})。owner を決めず claim を見送ります。`,
+    )
+    return { kind: 'ambiguous' }
+  }
+  return owner
+}
+
+/**
+ * Job の記録した変更が、いまの worktree の dirt だと主張できるか（CLAIM 7）。
+ * baseline commit が現在の HEAD と一致し、かつ記録された `changedFiles` が今 dirty であること。
+ * baseline が無い Job は帰属を証明できないので false（fail-closed）。
+ */
+function jobOwnsRecordedDirt(job: Job, head: string | undefined, dirtyPaths: ReadonlySet<string>): boolean {
+  return (
+    head !== undefined &&
+    job.workspaceBaseline?.startCommitHash === head &&
+    (job.changedFiles ?? []).some((path) => dirtyPaths.has(path))
+  )
+}
+
 export function resolveWorkspaceOwnership(
   perTask: readonly { task: Task; jobs: Job[] }[],
   workingDir: string = TARGET_ROOT,
@@ -264,7 +355,9 @@ export function resolveWorkspaceOwnership(
     )
     return { kind: 'ambiguous' }
   }
-  if (existing.length === 1) return { kind: 'owner', taskId: existing[0] }
+  if (existing.length === 1) {
+    return confirmOwnerAgainstStaleDirt(existing[0], perTask, workingDir, readDirtyPaths, readHead, readGitOperations)
+  }
 
   // 終わった Task に取り残された blocked 行。次の Task をまだ始められない間だけ所有権を保持する。
   const staleOwners = perTask.filter(({ task, jobs }) => (
@@ -312,11 +405,7 @@ export function resolveWorkspaceOwnership(
   //     もう worktree 上の同じものではない（= 帰属を主張できない）。
   //     baseline が無い Job も帰属を証明できないので候補にしない（fail-closed）。
   const head = readHead(workingDir)
-  const ownsRecordedDirt = (job: Job): boolean => (
-    head !== undefined &&
-    job.workspaceBaseline?.startCommitHash === head &&
-    (job.changedFiles ?? []).some((path) => dirtyPaths.has(path))
-  )
+  const ownsRecordedDirt = (job: Job): boolean => jobOwnsRecordedDirt(job, head, dirtyPaths)
 
   const candidates = blockedTasks.filter(({ jobs }) => (
     canInheritDirtyWorkspace(jobs) && jobs.some(ownsRecordedDirt)
@@ -1580,9 +1669,34 @@ function resolveResultStatus(result: Awaited<ReturnType<typeof runJob>>): Job['s
   return result.status
 }
 
+/**
+ * startup recovery の**前に** durable Outbox を1回だけ再送する（lifecycle repair C2 / H-01）。
+ *
+ * 前回の Worker が terminal update を Outbox に記録した後、API へ届く前に落ちた場合、
+ * API 上の Job はまだ running である。recovery が先に動くと、その Job を fail-if-running で
+ * failed / blocked へ動かしてしまい、後から届く replay（write-once の workspaceEndFingerprint を含む）は
+ * running→terminal 以外で 409 になる。event は pending のまま残り、pollJobs() は pending がある間
+ * queued Job を一切取らないため intake が止まり続けていた。
+ *
+ * ここは既存の resendPending() / patchJobWithRetry() を使うだけで、待ち続けない
+ * （1回の bounded な再送。失敗は pollJobs() の既存再送・既存 CRITICAL 通知に任せる）。
+ */
+async function replayOutboxAtStartup(): Promise<void> {
+  try {
+    if (!outboxStore.hasPending()) return
+    await outboxStore.resendPending(async (jobId, payload) => (await patchJobWithRetry(jobId, payload)).ok)
+  } catch (err: unknown) {
+    console.error(`[Worker] 起動時 Outbox 再送エラー: ${formatUnknownError(err)}。通常ポーリングで再試行します`)
+  }
+}
+
 async function recoverJobsAtStartup(): Promise<void> {
   try {
-    const recovered = await recoverStaleJobs(API_BASE, buildApiAuthHeaders())
+    // 再送できなかった（一時失敗・確定拒否のどちらでも）terminal update を持つ Job には、
+    // recovery が競合する terminal 遷移を作らない。結果の適用は Outbox replay に任せる。
+    const recovered = await recoverStaleJobs(API_BASE, buildApiAuthHeaders(), {
+      hasPendingTerminalEvent: (jobId) => outboxStore.hasPendingFor(jobId),
+    })
     if (recovered > 0) {
       console.log(`[Worker] ${recovered} 件の stale Job を復旧しました`)
     }
@@ -1592,9 +1706,12 @@ async function recoverJobsAtStartup(): Promise<void> {
 }
 
 export async function start(): Promise<void> {
-  // pending Outboxがあっても待たない。pollJobs()自身がpoll cycleごとに
+  // pending Outboxの解消は待たない。pollJobs()自身がpoll cycleごとに
   // pendingの再送とnew Job fetchのskipを行うため、起動直後からwatchdog/pollingを
   // 開始してよい（起動専用の別blockingループは持たない）。
+  // ただし**recoveryより前に1回だけ再送する**（H-01）。前回 Worker の terminal 結果を
+  // recovery が上書きしないようにするため。再送できずに残った Job は recovery が skip する。
+  await replayOutboxAtStartup()
   await recoverJobsAtStartup()
   // ウォッチドッグを pollJobs と並行して起動
   void startWatchdog(API_BASE, buildApiAuthHeaders())
