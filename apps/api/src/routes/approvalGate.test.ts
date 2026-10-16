@@ -3290,3 +3290,85 @@ describe('POST /api/approval-requests/:id/consume — D2 hardening', () => {
     })
   })
 })
+
+// ────────────────────────────────────────────────────────────
+// D2（2026-10-17）: Worker は API の continuationPolicy をそのまま写す（ローカルで再判定しない）。
+// API の computeContinuationPolicy が旧 Worker の risk 由来の対応（HIGH → safe work only、
+// CRITICAL → block）と同じ結果を返すことを固定し、応答を本物の Worker resolvePolicy にも通す。
+// ────────────────────────────────────────────────────────────
+
+describe('POST /api/gate/check — D2 continuationPolicy contract（route → Worker resolvePolicy）', () => {
+  const HIGH_FILE = 'docs/project_memory/goal.md'
+  const CRITICAL_FILE = 'docs/AGENTS.md'
+  const refs = { targetBranch: 'main', targetCommit: 'commit-cp', targetDiffHash: 'diff-cp' }
+
+  async function workerPolicy(body: GateCheckResponse, changedFiles: string[]) {
+    const { resolvePolicy } = await import('@ai-team/worker/src/guards/gatePolicy.js')
+    const { runRiskReview } = await import('@ai-team/shared')
+    const local = runRiskReview(changedFiles)
+    return resolvePolicy(
+      { finalRiskLevel: local.riskLevel, gateDecision: 'ALLOW', auditRiskLevel: local.riskLevel, alignmentRiskLevel: 'LOW' },
+      body as never,
+    )
+  }
+
+  it.each([
+    ['HIGH safe-work action (no request)', 'test', [HIGH_FILE], 'BLOCKED', 'continue_safe_work_only'],
+    ['CRITICAL safe-work action', 'test', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved'],
+    ['HIGH non-safe-work action', 'merge feature branch', [HIGH_FILE], 'BLOCKED', 'continue_safe_work_only'],
+    ['CRITICAL non-safe-work action', 'merge feature branch', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved'],
+    ['LOW git_commit (policy-required human approval)', 'git_commit', ['docs/README.md'], 'BLOCKED', 'block_until_approved'],
+    ['HIGH git_commit (policy-required)', 'git_commit', [HIGH_FILE], 'BLOCKED', 'block_until_approved'],
+    ['CRITICAL git_commit (policy-required)', 'git_commit', [CRITICAL_FILE], 'BLOCKED', 'block_until_approved'],
+  ] as const)('%s → API %s / %s, and the Worker maps it unchanged', async (label, action, files, decision, policy) => {
+    await withApp(async (app) => {
+      const { statusCode, body } = await gateCheck(app, { taskId: `d2-cp-${label}`, requestedAction: action, ...refs, changedFiles: [...files] })
+      expect(statusCode).toBe(200)
+      expect(body.outcome.decision).toBe(decision)
+      expect(body.continuationPolicy).toBe(policy)
+      expect((await workerPolicy(body, [...files])).policy).toBe(policy)
+    })
+  })
+
+  it('PENDING_APPROVAL keeps the same policy on the second check (CRITICAL non-safe-work → block)', async () => {
+    await withApp(async (app) => {
+      const payload = { taskId: 'd2-cp-pending', requestedAction: 'merge feature branch', ...refs, changedFiles: [CRITICAL_FILE] }
+      await gateCheck(app, payload)
+      const { body } = await gateCheck(app, payload)
+      expect(body.outcome.decision).toBe('PENDING_APPROVAL')
+      expect(body.continuationPolicy).toBe('block_until_approved')
+      expect((await workerPolicy(body, [CRITICAL_FILE])).policy).toBe('block_until_approved')
+    })
+  })
+
+  it('REJECTED keeps today’s API policy (HIGH → continue_safe_work_only; read-only safe work is the accepted residual)', async () => {
+    await withApp(async (app) => {
+      const taskId = await ensureGateTask(app, 'd2-cp-rejected')
+      const created = await app.inject({
+        method: 'POST', url: '/api/approval-requests',
+        payload: { taskId, requestedAction: 'test', riskLevel: 'HIGH', changedFiles: [HIGH_FILE], invalidIf: [], ...refs },
+      })
+      expect(created.statusCode).toBe(201)
+      await patchStatus(app, parseBody<ApprovalRequest>(created.body).id, 'REJECTED', 'no')
+      const { body } = await gateCheck(app, { taskId, requestedAction: 'test', ...refs, changedFiles: [HIGH_FILE] })
+      expect(body.outcome.decision).toBe('REJECTED')
+      expect(body.continuationPolicy).toBe('continue_safe_work_only')
+      expect((await workerPolicy(body, [HIGH_FILE])).policy).toBe('continue_safe_work_only')
+    })
+  })
+
+  it('approved HIGH / CRITICAL git_commit → ALLOW + call_consume, and the Worker continues (no local re-block)', async () => {
+    for (const file of [HIGH_FILE, CRITICAL_FILE]) {
+      await withApp(async (app) => {
+        const payload = { taskId: `d2-cp-approved-${file}`, requestedAction: 'git_commit', ...refs, changedFiles: [file] }
+        const first = await gateCheck(app, payload)
+        const approvalId = first.body.approvalRequest!.id
+        await patchStatus(app, approvalId, 'APPROVED')
+        const { body } = await gateCheck(app, payload)
+        expect(body.outcome.decision).toBe('ALLOW')
+        expect(body.nextAction).toMatchObject({ action: 'call_consume', consumedRequestId: approvalId })
+        expect((await workerPolicy(body, [file])).policy).toBe('continue')
+      })
+    }
+  })
+})
