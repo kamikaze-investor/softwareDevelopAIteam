@@ -284,6 +284,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない**
 - **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた**
 - **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）**
+- **`canonical-domain-meaning` が初回実装 prompt と repair prompt に載らない**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）

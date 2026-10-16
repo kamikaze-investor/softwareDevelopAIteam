@@ -11135,6 +11135,19 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         既存の設計原則から判断すること。
         **使用率を上げることだけを目的に core 化しない／無理な focus mapping を足さない**
         （core は全 prompt へ入るため、上記 `principle-tier` の注意がそのまま当てはまる）。
+      - **2026-10-16 実測（原則強化 PR #359 の適用監査）: `canonical-domain-meaning` も同種。**
+        `mapFileToFocuses()` は `apps/api/src/pl/`・`apps/api/src/designReview/`・API 側 approval（`apps/api/src/approval/`・`gitCommitEvidence.ts`）
+        および **target app の全 path** を `scope_simplicity` へ落とし、`FOCUS_PRINCIPLE_SLUGS.scope_simplicity` は
+        意図的に（`engineeringPrinciples.test.ts`）この原則を含まない。結果、lifecycle / authority の判断を持つ
+        コードと将来のアプリ開発では、実装・repair・Design Review・focused review・PR Meta Review の**どこでも選ばれない**
+        （storage / worker / routes / guards では全経路で選ばれる。`sandbox/`・`.github/workflows/`・`apps/mobile/` も選ばれないが、
+        これらは domain fact の判断が主でないので意図どおりの可能性が高い。列挙は網羅ではない）。同じファイル内の `isDecisionAuthoritySurface()` は
+        `apps/api/src/pl/` を authority surface と扱っており、path の意味付けが2通りある。
+        `scope_simplicity` へ足すと実質 core になるので足さない。`mapFileToFocuses()` の変更は Design Review の
+        focus 集合（`recomputeDecision()` が集合一致を要求）と review 負荷を変えるため、**Lifecycle 一括修復の完了後**に、
+        どの signal で選ぶべきか（path の意味付けの owner を一本化するか、target project 用の signal を持つか）を
+        本 Task A で判断する。PL の task 設計（adoption）・再設計（PL revision）・roadmap 生成の prompt にも specs/21 は
+        載らないが、出力はすべて Design Review を通るので、そこでの selection が直れば適用される
         なお `riskLevel` が Review 経路へ未配線である点は
         `principle_management_design_2026_09_17.md` 13章の**意図された状態**であり、
         Class B / Risk 設計との境界を維持するため**本項目では変更しない**
@@ -11878,6 +11891,46 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **`already_started`** を返す —— escalate せずに。既存 `design_review_failed` attention には
       出るので Lost Completion ではないが、「予算切れで終わった」ことが repair 側の戻り値からは
       「既に始まっている」に見える。ここへ混ぜず、別項目として起票するかを別途判断する。
+
+<!-- roadmap:id=canonical-domain-meaning-missing-from-implement-and-repair-prompts state=done -->
+10. [x] **`canonical-domain-meaning` が初回実装 prompt と repair prompt に載らない** —
+      2026-10-16登録（原則強化 PR の独立レビュー指摘。**本項目は Finding であり、まだ実装しない。**
+      記録: `docs/project_memory/decisions/root_cause_and_semantic_ownership_principles_2026_10_16.md`）。
+
+      **事象**: `canonical-domain-meaning` は contextual 原則で、focus から選ばれたときだけ載る。
+      `appendImplementContracts()`（`apps/api/src/implementPrompt.ts`）と `buildRepairPrompt()`
+      （`apps/api/src/designReview/repairPromptBuilder.ts`）は signal 無し（core のみ）で原則を選ぶため、
+      状態遷移・authority・lifecycle を触る実装 / 修復でも Design Contract に載らない。
+      Meta Review 側は focus 経由で載るので、**指摘はされるが、実装時に先回りできない**。
+      `remediationStep.ts` と `buildResumeAiCliPrompt()` は既に `allowedPaths` → focus で選んでいる。
+
+      **方向**: 同じく `allowedPaths.flatMap(mapFileToFocuses)` を渡す（新しい選択規則・原則・Gate は作らない。
+      core 化しない —— `principle-registry-coverage-and-threshold-review` の「安易に core 化しない」）。
+
+      **着手時の注意**: repair prompt は Design Review で hash 照合される canonical 文字列である
+      （`repairPromptBuilder.ts` 冒頭）。変えると、変更前に Design Review を通った repair Job の
+      prompt と hash が一致しなくなる。進行中の repair / Lifecycle 修復が無いことを確認するか、
+      既存の hash 照合が旧 prompt をどう扱うかを先に確認してから入れる。
+
+      **Acceptance Criteria**:
+      - 状態遷移系の `allowedPaths` を持つ Task の初回実装 prompt / repair prompt の Design Contract に
+        `canonical-domain-meaning` の one-liner が載る（テストで固定）
+      - focus に該当しない Task では載らない（全 prompt へ常時注入しない）
+      - 既存の repair Job が hash mismatch で詰まらない
+
+      **完了（2026-10-16・PR #359）**: 実測では初回実装 prompt（`buildInitialImplementAiCliPrompt`）は既に
+      `allowedPaths` から選んでおり、欠けていたのは POST /jobs（`appendImplementContracts`）と repair の2経路だった。
+      原因は「この Task にどの原則を適用するか」を producer 5 箇所がそれぞれ組み立てていたこと
+      （`canonical-domain-meaning` 違反そのもの）。`buildTaskDesignContract()`（`apps/api/src/implementPrompt.ts`）を
+      唯一の owner にし、初回実装・resume・POST /jobs・repair・remediation をすべてそこへ寄せた。
+      - 初回実装・resume の prompt は変更前と byte 一致（既存 Design Review evidence はそのまま有効）
+      - repair の canonical prompt は run 作成時に1度だけ作られ保存されるので、既存 run・作成済み repair Job は不変。
+        変わるのは deploy 後に新しく作られる repair run と、POST /jobs で新しく作る implement Job だけ
+        （#320 と同じ扱い: evidence は実際に走る文字列に束縛される）
+      - テスト: `apps/api/src/implementPrompt.test.ts`（同じ Task なら全 producer で同じ原則 / mobile では載らない）
+      **残り**: 例えば lifecycle（`apps/api/src/pl/`・`designReview/`）・API 側 approval / git_commit・target app のファイルでは、
+      どの経路でも `canonical-domain-meaning` が選ばれない。原因は prompt 側ではなく focus routing であり、
+      selection coverage の owner である `principle-registry-coverage-and-threshold-review` Task A へ移した。
 
 ---
 

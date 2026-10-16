@@ -1,10 +1,5 @@
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
 import type { JobRefusalMetadata } from '@ai-team/shared'
-import { buildTaskContract, type TaskContractSource } from '../implementPrompt'
+import { buildTaskContract, buildTaskDesignContract, type TaskContractSource } from '../implementPrompt'
 
 /**
  * Failure-aware Repair Prompt の構築（pure / deterministic）。
@@ -182,11 +177,10 @@ function formatQaFacts(qaResults: RepairQaFacts[]): string[] {
  */
 export function buildRepairPrompt(input: RepairPromptInput): string {
   const untrusted: string[] = []
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(undefined, principles),
-    principles,
-  })
+  // 実装 prompt と同じ owner から作る（repair だけ core のみだと、同じ Task の修復で
+  // canonical-domain-meaning 等が落ちる）。canonical prompt は run 作成時に1度だけ作られて保存されるので、
+  // ここを変えても既存 run / 作成済み repair Job の prompt と hash は変わらない。
+  const designContract = buildTaskDesignContract(input)
 
   if (input.job) untrusted.push(...formatJobFacts(input.job), '')
   if (input.review) untrusted.push(...formatReviewFacts(input.review), '')
