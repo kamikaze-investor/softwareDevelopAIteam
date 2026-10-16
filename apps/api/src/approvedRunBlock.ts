@@ -47,7 +47,7 @@ export function describeApprovedRunBlock(
   switch (cause) {
     case 'gate_refusal':
       return `approved_but_worker_blocked: approval ${input.approvalId} is APPROVED and unconsumed; guards passed`
-        + ` but the Worker gate step blocked ${input.kind} (e.g. safe_work_only or consume failure)`
+        + ` but the Worker gate step blocked ${input.kind} (e.g. risk skew or consume failure)`
     case 'permission_denied':
       return `approved_run_permission_denied: ${clip(input.permissionReason ?? 'permission guard denied the command')}`
     case 'file_change_guard':

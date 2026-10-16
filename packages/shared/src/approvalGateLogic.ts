@@ -20,6 +20,40 @@ import type { CommandKind } from './types/command'
 // ────────────────────────────────────────────────────────────
 
 /**
+ * Worker の Gate policy（`resolvePolicy()`）が **承認の判断ではなく技術的な不整合**で止めたときの理由コード（D2 2026-10-17）。
+ *   - `risk_rule_skew`: Worker のローカル risk が API の評価より高い（Worker / API の rule の版ずれ）
+ *   - `approval_contract_violation`: Gate 応答の decision / continuationPolicy / nextAction の組が API の契約に無い
+ * どちらも re_check で止まり、Worker は理由を Job の stderr に `<code>: ...` として残す。PL triage はこれを見て
+ * 自動 resume しない（原因を直した後に resume すれば新しい承認が求められる）。
+ */
+export const GATE_TECHNICAL_STOP_CODES = ['risk_rule_skew', 'approval_contract_violation'] as const
+export type GateTechnicalStopCode = typeof GATE_TECHNICAL_STOP_CODES[number]
+
+/**
+ * 文字列が**先頭（offset 0）から** `<code>: ` で始まるときだけその理由コードを返す（stderr / gate 理由のどちらにも使う）。
+ * Worker は技術停止の理由をそのまま stderr 全体として書く。途中の行や前置きのある行は照合しない
+ * （コマンド出力などの任意の文字列で技術停止を詐称させないため）。
+ */
+export function findGateTechnicalStopCode(text: string | undefined): GateTechnicalStopCode | undefined {
+  if (!text) return undefined
+  return GATE_TECHNICAL_STOP_CODES.find((candidate) => text.startsWith(`${candidate}: `))
+}
+
+/**
+ * その Job が **Gate 段階の技術停止で blocked** になっているときの理由コード（D2）。
+ * コマンドが一度も実行されていない（exitCode も stdout ログも無い）ことも条件にする（実行後の出力で詐称させない）。
+ * API の attention（systemState）と PL triage（rule 6.8）が同じ判定を使う。
+ */
+export function gateTechnicalStopCodeOfJob(
+  job: { status: string; stderr?: string; exitCode?: number; stdoutPath?: string } | undefined,
+): GateTechnicalStopCode | undefined {
+  if (job === undefined || job.status !== 'blocked') return undefined
+  if (job.exitCode !== undefined && job.exitCode !== null) return undefined
+  if (job.stdoutPath !== undefined && job.stdoutPath !== null) return undefined
+  return findGateTechnicalStopCode(job.stderr)
+}
+
+/**
  * HIGH の承認待ち（`continue_safe_work_only`）の間も実行してよい CommandKind。
  * 読み取り・テスト・品質チェックだけで、コード変更・commit は含めない。
  *

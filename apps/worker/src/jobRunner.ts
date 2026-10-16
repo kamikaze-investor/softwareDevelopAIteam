@@ -25,7 +25,7 @@ import type {
   ReviewResult,
   Task,
 } from '@ai-team/shared'
-import { aiCliTimeoutMs, runRiskReview } from '@ai-team/shared'
+import { aiCliTimeoutMs, findGateTechnicalStopCode, runRiskReview } from '@ai-team/shared'
 import { z } from 'zod'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { AiCliPromptRefusalError } from './aiCli/adapter.js'
@@ -593,6 +593,9 @@ export async function runJob(
 
   if (gateResult.policy === 'block_until_approved' || gateResult.policy === 're_check') {
     console.warn(`[gate] ${gateResult.policy}: taskId=${job.taskId} reason="${gateResult.reason}"`)
+    // D2: 技術的不整合による re_check（承認の判断ではない）。通知文言を分け、理由を stderr に残して
+    // API（PL triage）が自動 resume しない停止として扱えるようにする。
+    const technicalStopCode = gateResult.policy === 're_check' ? findGateTechnicalStopCode(gateResult.reason) : undefined
 
     const approvalRequestId =
       checkResponse?.approvalRequest?.id ??
@@ -627,6 +630,29 @@ export async function runJob(
             '承認が必要な場合は approval request を確認してください。',
           ].join('\n'),
           sourceType: 'gate_blocked',
+          sourceId: approvalRequestId ?? job.id,
+        })
+      } else if (technicalStopCode !== undefined) {
+        // D2: resolvePolicy の技術的不整合（risk_rule_skew / approval_contract_violation）。承認の判断ではない。
+        notifyGateEvent({
+          severity: 'warning',
+          title: `⚠️ Gate の技術的不整合で停止 (${job.safeCommand.kind})`,
+          body: [
+            'Gate の評価に技術的な不整合があったため停止しました（承認の判断ではありません）。',
+            '',
+            `コマンド: ${job.safeCommand.kind}`,
+            `タスク: ${job.taskId}`,
+            `Job: ${job.id}`,
+            `理由コード: ${technicalStopCode}`,
+            `理由: ${gateResult.reason}`,
+            `コミット: ${targetCommit}`,
+            `DiffHash: ${targetDiffHash}`,
+            `検出時刻: ${new Date().toISOString()}`,
+            '',
+            '次のアクション:',
+            '原因（Worker / API の版ずれ等）を直した後に resume してください。resume すると新しい承認が求められます。',
+          ].join('\n'),
+          sourceType: 'gate_technical_stop',
           sourceId: approvalRequestId ?? job.id,
         })
       } else {
@@ -664,6 +690,7 @@ export async function runJob(
       },
       gatePolicy: gateResult.policy,
       gateBlockReason: gateResult.reason,
+      ...(technicalStopCode !== undefined ? { stderr: gateResult.reason } : {}),
       startedAt,
       completedAt: new Date().toISOString(),
     }
