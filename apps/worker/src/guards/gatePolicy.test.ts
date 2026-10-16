@@ -103,278 +103,148 @@ describe('resolvePolicy — STALE / re_check', () => {
   })
 })
 
-// ────────────────────────────────────────────────────────────
-// PENDING_APPROVAL / BLOCKED
-// ────────────────────────────────────────────────────────────
-
-describe('resolvePolicy — PENDING_APPROVAL / BLOCKED', () => {
-  it('PENDING_APPROVAL + HIGH → continue_safe_work_only', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH', gateDecision: 'DEEP_REVIEW' }),
-      makeCheckResponse({
-        outcome: { decision: 'PENDING_APPROVAL', requestId: 'req-001', riskLevel: 'HIGH' },
-        riskReview: { riskLevel: 'HIGH', triggeredRules: ['auth'], requiresIndependentReview: true },
-        continuationPolicy: 'continue_safe_work_only',
-        nextAction: { action: 'wait_for_approval', requestId: 'req-001', message: 'waiting' },
-      }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-    expect(result.apiAvailable).toBe(true)
-  })
-
-  it('PENDING_APPROVAL + CRITICAL → block_until_approved', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
-      makeCheckResponse({
-        outcome: { decision: 'PENDING_APPROVAL', requestId: 'req-002', riskLevel: 'CRITICAL' },
-        riskReview: { riskLevel: 'CRITICAL', triggeredRules: ['payment'], requiresIndependentReview: true },
-        continuationPolicy: 'block_until_approved',
-        nextAction: { action: 'wait_for_approval', requestId: 'req-002', message: 'CEO approval required' },
-      }),
-    )
-    expect(result.policy).toBe('block_until_approved')
-  })
-
-  it('BLOCKED + HIGH → continue_safe_work_only', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH', gateDecision: 'DEEP_REVIEW' }),
-      makeCheckResponse({
-        outcome: { decision: 'BLOCKED', reason: 'no existing approval', riskLevel: 'HIGH' },
-        riskReview: { riskLevel: 'HIGH', triggeredRules: ['auth'], requiresIndependentReview: true },
-        continuationPolicy: 'continue_safe_work_only',
-        nextAction: { action: 'wait_for_approval', message: 'approval created' },
-      }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-  })
-
-  it('BLOCKED + CRITICAL → block_until_approved', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
-      makeCheckResponse({
-        outcome: { decision: 'BLOCKED', reason: 'CRITICAL', riskLevel: 'CRITICAL' },
-        riskReview: { riskLevel: 'CRITICAL', triggeredRules: ['payment'], requiresIndependentReview: true },
-        continuationPolicy: 'block_until_approved',
-        nextAction: { action: 'wait_for_approval', message: 'CEO approval required' },
-      }),
-    )
-    expect(result.policy).toBe('block_until_approved')
-  })
-})
 
 // ────────────────────────────────────────────────────────────
-// ローカルリスクによる escalation
+// D2（2026-10-17）: API の continuationPolicy をそのまま写す。ローカルのリスクで実行可否を再判定しない。
 // ────────────────────────────────────────────────────────────
 
-describe('resolvePolicy — ローカルリスク escalation', () => {
-  it('localRisk LOW + api continue → continue', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'LOW' }),
-      makeCheckResponse({ continuationPolicy: 'continue' }),
-    )
-    expect(result.policy).toBe('continue')
-  })
+type Risk = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
 
-  it('localRisk HIGH + api continue → continue_safe_work_only (escalation)', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH', gateDecision: 'DEEP_REVIEW', reason: 'dangerous file' }),
-      makeCheckResponse({ continuationPolicy: 'continue' }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-    expect(result.reason).toContain('Escalating')
-  })
-
-  it('localRisk CRITICAL + api continue → block_until_approved (escalation)', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED', reason: 'payment file' }),
-      makeCheckResponse({ continuationPolicy: 'continue' }),
-    )
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.reason).toContain('Escalating')
-  })
-
-  it('localRisk CRITICAL + api continue_safe_work_only → block_until_approved (escalation)', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
-      makeCheckResponse({ continuationPolicy: 'continue_safe_work_only' }),
-    )
-    expect(result.policy).toBe('block_until_approved')
-  })
-
-  it('localRisk HIGH + api continue_safe_work_only → continue_safe_work_only (no further escalation)', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH', gateDecision: 'DEEP_REVIEW' }),
-      makeCheckResponse({ continuationPolicy: 'continue_safe_work_only' }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-  })
-})
-
-// ────────────────────────────────────────────────────────────
-// API policy をそのまま採用するケース
-// ────────────────────────────────────────────────────────────
-
-describe('resolvePolicy — API policy の採用', () => {
-  it('api continuationPolicy block_until_approved → block_until_approved', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'LOW' }),
-      makeCheckResponse({ continuationPolicy: 'block_until_approved' }),
-    )
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.apiAvailable).toBe(true)
-  })
-
-  it('api continuationPolicy continue_safe_work_only → continue_safe_work_only', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'LOW' }),
-      makeCheckResponse({ continuationPolicy: 'continue_safe_work_only' }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-  })
-
-  it('ALLOW + proceed → continue', () => {
-    const result = resolvePolicy(
-      makeGateResult(),
-      makeCheckResponse({
-        outcome: { decision: 'ALLOW', riskLevel: 'LOW' },
-        continuationPolicy: 'continue',
-        nextAction: { action: 'proceed', message: 'proceed' },
-      }),
-    )
-    expect(result.policy).toBe('continue')
-  })
-})
-
-// ────────────────────────────────────────────────────────────
-// 2026-10-16 b8d0fc5d: API は SAFE_WORK の HIGH に承認依頼を作らない（requestId 無しの BLOCKED）
-// ────────────────────────────────────────────────────────────
-
-describe('resolvePolicy — 承認依頼の無い SAFE_WORK HIGH / 依頼のある CRITICAL', () => {
-  it('HIGH の BLOCKED で requestId が無くても continue_safe_work_only（safe work はそのまま続く）', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH' }),
-      makeCheckResponse({
-        outcome: { decision: 'BLOCKED', riskLevel: 'HIGH' },
-        riskReview: { riskLevel: 'HIGH', triggeredRules: ['decision authority / safety policy doc'], requiresIndependentReview: true },
-        continuationPolicy: 'continue_safe_work_only',
-        nextAction: { action: 'wait_for_approval', message: 'safe work only' },
-      }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-    expect(SAFE_WORK_ALLOWED_COMMAND_KINDS).toContain('git_status')
-  })
-
-  it('ローカルが CRITICAL でも API の HIGH BLOCKED（依頼なし）は continue_safe_work_only のまま（API 判定を採る既存挙動）', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
-      makeCheckResponse({
-        outcome: { decision: 'BLOCKED', riskLevel: 'HIGH' },
-        riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
-        continuationPolicy: 'continue_safe_work_only',
-        nextAction: { action: 'wait_for_approval', message: 'safe work only' },
-      }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-  })
-
-  it('CRITICAL の BLOCKED（承認依頼あり）は block_until_approved で、requestId を理由に載せる', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
-      makeCheckResponse({
-        outcome: { decision: 'BLOCKED', riskLevel: 'CRITICAL' },
-        riskReview: { riskLevel: 'CRITICAL', triggeredRules: ['AI instruction file'], requiresIndependentReview: true },
-        continuationPolicy: 'block_until_approved',
-        nextAction: { action: 'wait_for_approval', requestId: 'approval-critical-1', message: 'blocked' },
-      }),
-    )
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.reason).toContain('approval-critical-1')
-  })
-})
-
-// ────────────────────────────────────────────────────────────
-// D2（2026-10-17）: 人間承認を使い切る ALLOW + call_consume はローカル escalation で格下げしない。
-// 実行は直後の atomic consume が成功したときだけ進む（jobRunner は不変）。
-// ────────────────────────────────────────────────────────────
-
-function approvedConsume(
-  risk: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL',
-  overrides: Partial<GateCheckResponse> = {},
+function waiting(
+  decision: 'PENDING_APPROVAL' | 'BLOCKED' | 'REJECTED',
+  risk: Risk,
+  continuationPolicy: 'continue_safe_work_only' | 'block_until_approved',
+  requestId?: string,
 ): GateCheckResponse {
+  return makeCheckResponse({
+    outcome: { decision, riskLevel: risk, ...(requestId ? { requestId } : {}) },
+    riskReview: { riskLevel: risk, triggeredRules: [], requiresIndependentReview: risk === 'HIGH' || risk === 'CRITICAL' },
+    continuationPolicy,
+    nextAction: { action: 'wait_for_approval', ...(requestId ? { requestId } : {}), message: 'waiting' },
+  })
+}
+
+function approvedConsume(risk: Risk): GateCheckResponse {
   return makeCheckResponse({
     outcome: { decision: 'ALLOW', riskLevel: risk, consumedRequestId: 'approval-d2' },
     riskReview: { riskLevel: risk, triggeredRules: [], requiresIndependentReview: true },
     continuationPolicy: 'continue',
     nextAction: { action: 'call_consume', consumedRequestId: 'approval-d2', message: 'consume it' },
     approvalRequest: { id: 'approval-d2', status: 'APPROVED', expiresAt: '2099-01-01T00:00:00.000Z', riskLevel: risk },
-    ...overrides,
   })
 }
 
-describe('resolvePolicy — D2 承認済み call_consume', () => {
-  it('HIGH ALLOW + call_consume、ローカル HIGH → continue（承認済み commit を consume 前に止めない）', () => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), approvedConsume('HIGH'))
-    expect(result.policy).toBe('continue')
-    expect(result.reason).toBe('consume it')
+function allowProceed(risk: Risk): GateCheckResponse {
+  return makeCheckResponse({
+    outcome: { decision: 'ALLOW', riskLevel: risk },
+    riskReview: { riskLevel: risk, triggeredRules: [], requiresIndependentReview: risk === 'HIGH' || risk === 'CRITICAL' },
+    continuationPolicy: 'continue',
+    nextAction: { action: 'proceed', message: 'go' },
   })
+}
 
-  it('CRITICAL ALLOW + call_consume、ローカル CRITICAL → continue（承認後は HIGH と同じ）', () => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'CRITICAL' }), approvedConsume('CRITICAL'))
-    expect(result.policy).toBe('continue')
-  })
-
-  it('ALLOW + proceed（承認を使わない）、ローカル HIGH → continue_safe_work_only（escalation は残る）', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH' }),
-      makeCheckResponse({ outcome: { decision: 'ALLOW', riskLevel: 'LOW' }, nextAction: { action: 'proceed', message: 'go' } }),
-    )
-    expect(result.policy).toBe('continue_safe_work_only')
-  })
-
-  it('ALLOW + proceed、ローカル CRITICAL → block_until_approved（escalation は残る）', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
-      makeCheckResponse({ outcome: { decision: 'ALLOW', riskLevel: 'LOW' }, nextAction: { action: 'proceed', message: 'go' } }),
-    )
-    expect(result.policy).toBe('block_until_approved')
-  })
-
-  it('call_consume でも consumedRequestId が空・continuationPolicy が continue でない → 例外扱いしない', () => {
-    expect(resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH' }),
-      approvedConsume('HIGH', { nextAction: { action: 'call_consume', consumedRequestId: '', message: 'x' } }),
-    ).policy).toBe('continue_safe_work_only')
-    expect(resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
-      approvedConsume('CRITICAL', { continuationPolicy: 'continue_safe_work_only' }),
-    ).policy).toBe('block_until_approved')
-  })
-
+describe('resolvePolicy — PENDING_APPROVAL / BLOCKED / REJECTED は API の continuationPolicy をそのまま写す', () => {
+  // API の computeContinuationPolicy: HIGH → continue_safe_work_only、CRITICAL → block_until_approved、
+  // policy 起因（git_commit の人間承認）→ riskLevel に関わらず block_until_approved。REJECTED も API の値をそのまま写す。
   it.each([
     ['PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only'],
     ['BLOCKED', 'HIGH', 'continue_safe_work_only'],
     ['PENDING_APPROVAL', 'CRITICAL', 'block_until_approved'],
     ['BLOCKED', 'CRITICAL', 'block_until_approved'],
-  ] as const)('%s（%s）は承認前のまま（%s）', (decision, risk, expected) => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: risk }),
-      approvedConsume(risk, {
-        outcome: { decision, riskLevel: risk, requestId: 'approval-d2' },
-        continuationPolicy: risk === 'CRITICAL' ? 'block_until_approved' : 'continue_safe_work_only',
-        nextAction: { action: 'wait_for_approval', requestId: 'approval-d2', message: 'waiting' },
-      }),
-    )
-    expect(result.policy).toBe(expected)
+    ['BLOCKED', 'LOW', 'block_until_approved'],
+    ['BLOCKED', 'HIGH', 'block_until_approved'],
+    ['PENDING_APPROVAL', 'MEDIUM', 'block_until_approved'],
+    ['REJECTED', 'HIGH', 'continue_safe_work_only'],
+    ['REJECTED', 'HIGH', 'block_until_approved'],
+    ['REJECTED', 'CRITICAL', 'block_until_approved'],
+    ['REJECTED', 'LOW', 'block_until_approved'],
+  ] as const)('%s（%s）+ API %s → そのまま', (decision, risk, apiPolicy) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), waiting(decision, risk, apiPolicy, 'req-1'))
+    expect(result.policy).toBe(apiPolicy)
+    expect(result.apiAvailable).toBe(true)
   })
 
-  it('STALE は re_check のまま', () => {
+  it('非 continue の理由には decision・risk・requestId を載せる（通知用）', () => {
     const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'HIGH' }),
-      approvedConsume('HIGH', {
-        outcome: { decision: 'STALE', requestId: 'approval-d2', reason: 'diff changed' },
+      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
+      waiting('BLOCKED', 'CRITICAL', 'block_until_approved', 'approval-critical-1'),
+    )
+    expect(result.reason).toContain('BLOCKED (CRITICAL)')
+    expect(result.reason).toContain('approval-critical-1')
+  })
+
+  it('HIGH の BLOCKED で requestId が無くても continue_safe_work_only（safe work はそのまま続く）', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), waiting('BLOCKED', 'HIGH', 'continue_safe_work_only'))
+    expect(result.policy).toBe('continue_safe_work_only')
+    expect(SAFE_WORK_ALLOWED_COMMAND_KINDS).toContain('git_status')
+  })
+
+})
+
+describe('resolvePolicy — ALLOW はローカルのリスクで格下げしない（D2）', () => {
+  it.each(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const)('ALLOW + call_consume（%s）、ローカル同じ → continue', (risk) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), approvedConsume(risk))
+    expect(result.policy).toBe('continue')
+    expect(result.reason).toBe('consume it')
+  })
+
+  it.each(['HIGH', 'CRITICAL'] as const)('ALLOW + proceed（%s、将来の Evidence 経路）、ローカル同じ → continue（再ブロックしない）', (risk) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), allowProceed(risk))
+    expect(result.policy).toBe('continue')
+  })
+
+  it('ローカルが API より低い（LOW < HIGH）→ API に従う', () => {
+    expect(resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), approvedConsume('HIGH')).policy).toBe('continue')
+    expect(resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), waiting('BLOCKED', 'CRITICAL', 'block_until_approved')).policy)
+      .toBe('block_until_approved')
+  })
+})
+
+describe('resolvePolicy — ローカルのリスク > API のリスク は block_until_approved（rule の版ずれ。実行も safe work も consume もしない）', () => {
+  it.each([
+    ['ALLOW + proceed', 'HIGH', allowProceed('LOW')],
+    ['ALLOW + proceed', 'CRITICAL', allowProceed('MEDIUM')],
+    ['ALLOW + call_consume', 'CRITICAL', approvedConsume('HIGH')],
+    ['BLOCKED', 'CRITICAL', waiting('BLOCKED', 'HIGH', 'continue_safe_work_only')],
+    ['PENDING_APPROVAL', 'CRITICAL', waiting('PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only', 'r')],
+  ] as const)('%s: ローカル %s > API → block_until_approved（例外にしない）', (_label, local, response) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: local }), response)
+    expect(result.policy).toBe('block_until_approved')
+    expect(result.reason).toBe(`risk inconsistency: local ${local} > API ${response.riskReview.riskLevel} (worker/api rule skew)`)
+  })
+
+  it('ローカルのリスク値が読めない → block_until_approved', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'SEVERE' as never }), allowProceed('CRITICAL'))
+    expect(result.policy).toBe('block_until_approved')
+    expect(result.reason).toContain('risk inconsistency')
+  })
+
+  it('STALE / re_check はリスク比較より先に re_check（従来どおり）', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
+      makeCheckResponse({
+        outcome: { decision: 'STALE', requestId: 'r', reason: 'diff changed' },
+        riskReview: { riskLevel: 'LOW', triggeredRules: [], requiresIndependentReview: false },
         nextAction: { action: 're_check', message: 're-check' },
       }),
     )
     expect(result.policy).toBe('re_check')
+  })
+})
+
+describe('resolvePolicy — 項目間の契約が破れた応答は block_until_approved（gateClient が先に技術障害にする。二重の防御）', () => {
+  it.each<[string, GateCheckResponse]>([
+    ['call_consume なのに decision が ALLOW でない', { ...approvedConsume('HIGH'), outcome: { decision: 'PENDING_APPROVAL', riskLevel: 'HIGH', requestId: 'approval-d2' } }],
+    ['call_consume なのに consumedRequestId が空', { ...approvedConsume('HIGH'), nextAction: { action: 'call_consume', consumedRequestId: '', message: 'x' } }],
+    ['outcome と nextAction の consumedRequestId が違う', { ...approvedConsume('HIGH'), outcome: { decision: 'ALLOW', riskLevel: 'HIGH', consumedRequestId: 'other' } }],
+    ['ALLOW なのに continue でない', { ...approvedConsume('HIGH'), continuationPolicy: 'continue_safe_work_only' }],
+    ['ALLOW なのに wait_for_approval', { ...allowProceed('LOW'), nextAction: { action: 'wait_for_approval', message: 'x' } }],
+    ['BLOCKED なのに continue', { ...waiting('BLOCKED', 'HIGH', 'continue_safe_work_only'), continuationPolicy: 'continue' }],
+    ['REJECTED なのに continue', { ...waiting('REJECTED', 'HIGH', 'block_until_approved'), continuationPolicy: 'continue' }],
+    ['PENDING_APPROVAL なのに proceed', { ...waiting('PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only'), nextAction: { action: 'proceed', message: 'x' } }],
+  ])('%s → block_until_approved', (_label, response) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), response)
+    expect(result.policy).toBe('block_until_approved')
+    expect(result.reason).toContain('incoherent Gate response')
   })
 })
