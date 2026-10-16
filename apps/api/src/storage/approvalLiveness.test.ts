@@ -54,6 +54,11 @@ describe('tasks.findSummaries — hasWaitingApproval は live な WAITING だけ
 
 describe('persistProviderTimeoutFailure — 最新承認による retry 抑止', () => {
   function timeoutWithLatestApproval(status: ApprovalGateStatus | undefined, expiresAt: string) {
+    return timeoutWithRequests(status === undefined ? [] : [[status, expiresAt, 'git_commit']])
+  }
+
+  /** requests を古い順に作る（同じ ms でも rowid 順が tie-break になる）。 */
+  function timeoutWithRequests(requests: Array<[ApprovalGateStatus, string, string]>) {
     const { storage, projectId, taskId } = seedRunningTask()
     const prompt = 'Implement the reviewed provider-timeout case.'
     storage.designReviewEvidence.create({
@@ -63,7 +68,7 @@ describe('persistProviderTimeoutFailure — 最新承認による retry 抑止',
       decision: 'ALIGNED',
       independentReviewRequired: false,
     })
-    if (status !== undefined) addRequest(storage, taskId, status, expiresAt)
+    for (const [status, expiresAt, action] of requests) addRequest(storage, taskId, status, expiresAt, action)
     const source = storage.jobs.create({
       taskId, projectId, agentRole: 'developer_ai', status: 'running',
       safeCommand: { kind: 'test', workingDir: '/workspace/target' },
@@ -72,7 +77,7 @@ describe('persistProviderTimeoutFailure — 最新承認による retry 抑止',
     return storage.jobs.persistProviderTimeoutFailure({
       jobId: source.id,
       update: { status: 'failed', failureMetadata: { kind: 'provider_timeout', workspaceState: 'unchanged' } },
-      outboxEvent: { eventId: `evt-${status ?? 'none'}-${expiresAt}`, payloadHash: 'h' },
+      outboxEvent: { eventId: `evt-${requests.length}-${Math.random()}`, payloadHash: 'h' },
     })
   }
 
@@ -88,6 +93,26 @@ describe('persistProviderTimeoutFailure — 最新承認による retry 抑止',
   it('期限切れ WAITING は retry を止めない（誰も待っていない）', () => {
     expect(timeoutWithLatestApproval('WAITING_FOR_USER', EXPIRED()))
       .toMatchObject({ ok: true, retryJobCreated: true })
+  })
+
+  // 最新行だけでなく Task の全 request から live WAITING を探す（Codex review 84fe348）。
+  it('新しい APPROVED（別 action）の陰の古い live WAITING も retry を止める', () => {
+    const result = timeoutWithRequests([
+      ['WAITING_FOR_USER', LIVE(), 'git_commit'],
+      ['APPROVED', LIVE(), 'abort_task'],
+    ])
+    expect(result).toMatchObject({ ok: true, retryJobCreated: false })
+  })
+
+  it('REJECTED は最新行のときだけ止める（従来どおり）: 古い REJECTED の後に APPROVED があれば retry する', () => {
+    expect(timeoutWithRequests([
+      ['REJECTED', LIVE(), 'git_commit'],
+      ['APPROVED', LIVE(), 'abort_task'],
+    ])).toMatchObject({ ok: true, retryJobCreated: true })
+    expect(timeoutWithRequests([
+      ['APPROVED', LIVE(), 'abort_task'],
+      ['REJECTED', LIVE(), 'git_commit'],
+    ])).toMatchObject({ ok: true, retryJobCreated: false })
   })
 
   it.each([LIVE, EXPIRED])('REJECTED は期限に関係なく retry を止める（CEO の却下の記録）', (expiresAt) => {

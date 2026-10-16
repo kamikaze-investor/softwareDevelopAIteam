@@ -546,6 +546,25 @@ describe('D7: 期限切れ承認は live な承認待ちとして扱わない', 
       .toBe(0)
   })
 
+  // 別 action の APPROVED は SUPERSEDED にされず残る。最新の active 行だけを見ると、その陰の古い live WAITING を
+  // 見落とす（Codex review 84fe348）。Task の全 request から live WAITING を探し、その行を referenceId に使う。
+  it.each([
+    ['newer APPROVED of another action', 'abort_task', 'APPROVED', LIVE],
+    ['newer expired WAITING (legacy multi-active)', 'deploy', 'WAITING_FOR_USER', EXPIRED],
+  ] as const)('older live WAITING behind a %s is still counted and referenced', (_label, action, status, expiresAt) => {
+    const { storage, taskId } = seedBlockedWithWaitingApproval(LIVE)
+    const waiting = storage.approvalRequests.findByTaskId(taskId)[0]!
+    storage.approvalRequests.create({
+      taskId, targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd', riskLevel: 'HIGH',
+      requestedAction: action, status, expiresAt, invalidIf: [], changedFiles: [], triggeredRules: [],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.totals.approvalsWaiting).toBe(1)
+    expect(state.attention.find((a) => a.kind === 'approval_waiting')?.referenceId).toBe(waiting.id)
+  })
+
   it('AC4: 判定しただけで durable row は書き換えない（lazy expiry を壊さない）', () => {
     const { storage, taskId } = seedBlockedWithWaitingApproval(EXPIRED)
 

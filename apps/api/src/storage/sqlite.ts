@@ -919,13 +919,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     `).all(task.id) as Array<{ status: ApprovalGateStatus; expires_at: string }>)
       .find((row) => row.status === 'APPROVED'
         || isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at }))
-    if (humanDecision !== undefined) {
-      // 専用 code で返す: 呼び出し側はこれを cleanup の失敗として扱わず、carrier を quarantine しない
-      // （人の判断が解決すれば、同じ cleanup request でそのまま park できる）。
+    // cleanup 要求の後に作られ、既に CONSUMED になった request も人の判断である（承認→消費まで
+    // Worker の報告が届かなかった場合、上の status 条件だけでは見えない）。
+    const consumedAfterRequest = metadata.abortCleanupRequestedAt === undefined
+      ? undefined
+      : db.prepare(`
+          SELECT id FROM approval_requests
+          WHERE task_id = ? AND status = 'CONSUMED' AND created_at >= ?
+          LIMIT 1
+        `).get(task.id, metadata.abortCleanupRequestedAt) as { id: string } | undefined
+    if (humanDecision !== undefined || consumedAfterRequest !== undefined) {
+      // 専用 code で返す: 呼び出し側は cleanup の失敗として扱わず carrier を quarantine しない。
+      // その代わりこの cleanup generation を同じ transaction で取り消す（再送は NOT_REQUESTED になる）。
       return {
         ok: false,
         code: 'HUMAN_DECISION_CONFLICT',
-        reason: `Task has an active ${humanDecision.status} approval`,
+        reason: humanDecision !== undefined
+          ? `Task has an active ${humanDecision.status} approval`
+          : `approval ${consumedAfterRequest!.id} was consumed after the cleanup request`,
       }
     }
     if (
@@ -950,6 +961,22 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * だけ呼ぶこと。manual abort の承認は先に `CONSUMED` になっているので対象外。
    * `REJECTED`（CEO の却下の記録）/ `CONSUMED` / `EXPIRED` / `SUPERSEDED` は変えない。
    */
+  /**
+   * technical cleanup の generation を取り消す（cleanup 要求と technical 認可の marker を消す）。
+   * quarantine はしない: 拒否の理由が「cleanup の失敗」ではなく「人の判断 / 後続の作業が先にある」ときに使う。
+   * marker が無くなるので、同じ generation の再送は completeAbortCleanup() で NOT_REQUESTED になる。
+   */
+  function cancelTechnicalCleanupGeneration(carrier: Job): void {
+    const failureMetadata = { ...(carrier.failureMetadata ?? {}) }
+    delete failureMetadata.abortCleanupRequestedAt
+    delete failureMetadata.abortTechnicalEvidenceId
+    delete failureMetadata.abortTechnicalStateFingerprint
+    delete failureMetadata.abortTechnicalRootCauseClass
+    delete failureMetadata.abortTechnicalAttentionKind
+    delete failureMetadata.abortReason
+    jobs.update(carrier.id, { failureMetadata })
+  }
+
   function staleActiveApprovalsOfTask(taskId: string): number {
     return db.prepare(
       "UPDATE approval_requests SET status = 'STALE' WHERE task_id = ? "
@@ -2254,21 +2281,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return finishWithoutRetry()
         }
 
-        const latestApprovalRow = db.prepare(`
+        const approvalRows = db.prepare(`
           SELECT status, expires_at FROM approval_requests
           WHERE task_id = ?
           ORDER BY created_at DESC, rowid DESC
-          LIMIT 1
-        `).get(source.taskId) as { status: ApprovalGateStatus; expires_at: string } | undefined
-        // 期限切れ WAITING は誰も待っていない（承認しても EXPIRED で拒否される）ので retry を止めない。
-        // REJECTED は CEO の却下の記録なので期限に関係なく止める。
+        `).all(source.taskId) as Array<{ status: ApprovalGateStatus; expires_at: string }>
+        // live な WAITING は Task の全行から探す: 最新行だけを見ると、新しい APPROVED（別 action の判断は
+        // 残る）の陰の古い live WAITING を見落とす（Codex review 84fe348）。期限切れ WAITING は誰も
+        // 待っていない（承認しても EXPIRED で拒否される）ので retry を止めない。
+        // REJECTED は従来どおり最新行のときだけ、期限に関係なく止める（CEO の却下の記録）。
         if (
-          isLiveWaitingApproval(
-            latestApprovalRow === undefined
-              ? undefined
-              : { status: latestApprovalRow.status, expiresAt: latestApprovalRow.expires_at },
-          ) ||
-          latestApprovalRow?.status === 'REJECTED'
+          approvalRows.some((row) => isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at })) ||
+          approvalRows[0]?.status === 'REJECTED'
         ) {
           return finishWithoutRetry()
         }
@@ -3301,6 +3325,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             input.cleanupSummary,
           )
           if (!approval.ok) {
+            if (approval.code === 'HUMAN_DECISION_CONFLICT') {
+              // 同じ transaction でこの technical cleanup generation を取り消す（quarantine はしない）。
+              // 認可を carrier に残すと、人の判断が CONSUMED になった後の Worker 再送が park してしまう。
+              cancelTechnicalCleanupGeneration(job)
+            }
             return { ok: false as const, code: approval.code ?? 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
@@ -3428,13 +3457,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
           if (latestJob.id !== job.id) {
-            return {
-              ok: false as const,
-              code: 'PRECONDITION_FAILED' as const,
-              reason:
-                `job ${job.id} is not task ${task.id}'s latest job (${latestJob.id}); `
-                + 'a later execution superseded this abort cleanup request',
+            const reason = `job ${job.id} is not task ${task.id}'s latest job (${latestJob.id}); `
+              + 'a later execution superseded this abort cleanup request'
+            if (input.authorization.kind === 'technical_evidence') {
+              // 後続の Job（人が認可した repair / resume 等）が既にある。古い carrier を quarantine すると
+              // その後続の resume / park まで塞ぐので、この cleanup generation を取り消すだけにする。
+              cancelTechnicalCleanupGeneration(job)
+              return { ok: false as const, code: 'CLEANUP_SUPERSEDED' as const, reason }
             }
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason }
           }
           if (latestJob.taskId !== task.id || latestJob.projectId !== task.projectId) {
             return {
@@ -3451,13 +3482,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             || !Number.isFinite(latestJobCreatedAtMs)
             || cleanupRequestedAtMs < latestJobCreatedAtMs
           ) {
-            return {
-              ok: false as const,
-              code: 'PRECONDITION_FAILED' as const,
-              reason:
-                `abort cleanup request ${cleanupRequestedAt} predates task ${task.id}'s latest job `
-                + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`,
+            const reason = `abort cleanup request ${cleanupRequestedAt} predates task ${task.id}'s latest job `
+              + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`
+            if (input.authorization.kind === 'technical_evidence') {
+              cancelTechnicalCleanupGeneration(job)
+              return { ok: false as const, code: 'CLEANUP_SUPERSEDED' as const, reason }
             }
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason }
           }
           const linkedRejection = resolveLinkedGitCommitRejection(latestJob, {
             findApprovalById: (id) => approvalRequests.findById(id),
@@ -3644,6 +3675,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             input.cleanupSummary,
           )
           if (!approval.ok) {
+            if (approval.code === 'HUMAN_DECISION_CONFLICT') {
+              // 同じ transaction でこの technical cleanup generation を取り消す（quarantine はしない）。
+              // 認可を carrier に残すと、人の判断が CONSUMED になった後の Worker 再送が park してしまう。
+              cancelTechnicalCleanupGeneration(job)
+            }
             return { ok: false as const, code: approval.code ?? 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 

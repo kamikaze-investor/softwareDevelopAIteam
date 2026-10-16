@@ -1389,12 +1389,15 @@ describe('P2-2 Automatic Technical Abort', () => {
       expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
       expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
       expect(fx.storage.approvalRequests.findById(late.id)?.status).toBe(status)
-      // cleanup の失敗ではないので、carrier を quarantine せず cleanup 認可も消さない（Codex review cb1f2db）。
+      // cleanup の失敗ではないので carrier を quarantine しない。ただしこの cleanup generation は
+      // 同じ transaction で取り消す（Codex review cb1f2db / 84fe348）。
       const carrierAfter = fx.storage.jobs.findById(fx.latestJobId)
       expect(carrierAfter?.status).toBe(carrierBefore?.status)
-      expect(carrierAfter?.failureMetadata).toEqual(carrierBefore?.failureMetadata)
       expect(carrierAfter?.failureMetadata?.quarantined).toBeUndefined()
-      expect(carrierAfter?.failureMetadata?.abortCleanupRequestedAt).toBeDefined()
+      expect(carrierAfter?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+      expect(carrierAfter?.failureMetadata?.abortTechnicalEvidenceId).toBeUndefined()
+      expect(carrierAfter?.failureMetadata?.workspaceEndFingerprint)
+        .toEqual(carrierBefore?.failureMetadata?.workspaceEndFingerprint)
       expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
         (entry) => entry.operation === 'technical_abort_refused'
           && entry.detail?.includes('HUMAN_DECISION_CONFLICT') === true,
@@ -1404,6 +1407,82 @@ describe('P2-2 Automatic Technical Abort', () => {
       )).toBe(false)
     },
   )
+
+  function lateRequest(fx: ReturnType<typeof seedTechnicalAbort>, status: 'WAITING_FOR_USER' | 'APPROVED'): string {
+    return fx.storage.approvalRequests.create({
+      taskId: fx.taskId,
+      requestedAction: 'repair_from_stored_review:review-1',
+      riskLevel: 'HIGH',
+      targetBranch: 'ai/technical',
+      targetCommit: 'c5',
+      targetDiffHash: 'd5',
+      changedFiles: [],
+      triggeredRules: [],
+      invalidIf: [],
+      status,
+      expiresAt: FUTURE,
+    } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+  }
+
+  function expectNotParkedNorQuarantined(fx: ReturnType<typeof seedTechnicalAbort>): void {
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.quarantined).toBeUndefined()
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
+      (entry) => entry.operation === 'task_aborted' && entry.result === 'success',
+    )).toBe(false)
+  }
+
+  it('after a HUMAN_DECISION_CONFLICT, a Worker retry once the decision is CONSUMED (review queued) is refused', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const late = lateRequest(fx, 'WAITING_FOR_USER')
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+
+    // 人が承認し、stored-review recovery が消費して repair 用 Design Review が queued になった。
+    fx.storage.approvalRequests.updateStatus(late, 'APPROVED')
+    fx.storage.approvalRequests.updateStatus(late, 'CONSUMED', undefined, true)
+    fx.storage.designReviewRuns.create({
+      taskId: fx.taskId, taskTitle: 'repair', designText: 'd', designTextHash: 'h', changedFiles: [],
+    })
+
+    // 取り消し済みの generation の再送は認可されていない。
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
+    expectNotParkedNorQuarantined(fx)
+    expect(fx.storage.designReviewRuns.findActiveByTaskId(fx.taskId)?.status).toBe('queued')
+  })
+
+  it('a request approved and CONSUMED after the cleanup request refuses the first report too', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const late = lateRequest(fx, 'APPROVED')
+    fx.storage.approvalRequests.updateStatus(late, 'CONSUMED', undefined, true)
+
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    expectNotParkedNorQuarantined(fx)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
+  })
+
+  it('a late cleanup after a repair Job was created is refused as superseded without quarantining the old carrier', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const repair = fx.storage.jobs.create({
+      taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'queued',
+      workflowStepKey: `repair:${fx.latestJobId}:1`,
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'CLEANUP_SUPERSEDED' })
+    expectNotParkedNorQuarantined(fx)
+    // 古い carrier の cleanup generation は取り消され、再送は認可されない。
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
+    // repair は quarantine に塞がれず、そのまま実行できる状態のまま。
+    expect(fx.storage.jobs.findById(repair.id)?.status).toBe('queued')
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)
+      .some((job) => job.failureMetadata?.quarantined === true)).toBe(false)
+  })
 
   it('an expired APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
     const fx = seedTechnicalAbort()

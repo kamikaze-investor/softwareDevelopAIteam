@@ -616,10 +616,18 @@ export type ReleaseBlockedJobAndParkTaskResult =
   | {
     ok: false
     /**
-     * `HUMAN_DECISION_CONFLICT`: Technical Abort の最終 transaction で、precheck 後に live な WAITING /
-     * APPROVED request が現れていた。cleanup の失敗ではないので carrier を quarantine しない。
+     * Technical Abort の最終 transaction で、cleanup の失敗ではない理由で拒否したときの code。
+     * どちらも carrier を quarantine せず、同じ transaction でその cleanup generation を取り消す。
+     * - `HUMAN_DECISION_CONFLICT`: precheck 後に live な WAITING / APPROVED、または CONSUMED の request が現れた。
+     * - `CLEANUP_SUPERSEDED`: carrier より後の Job（repair / resume 等）が既にある。
      */
-    code: 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR' | 'HUMAN_DECISION_CONFLICT'
+    code:
+      | 'NOT_FOUND'
+      | 'PRECONDITION_FAILED'
+      | 'VERIFICATION_FAILED'
+      | 'STORAGE_ERROR'
+      | 'HUMAN_DECISION_CONFLICT'
+      | 'CLEANUP_SUPERSEDED'
     reason: string
   }
 

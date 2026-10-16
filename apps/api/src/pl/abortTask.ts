@@ -392,7 +392,13 @@ export type CompleteAbortCleanupResult =
   | { ok: true; taskId: string; jobId: string }
   | {
     ok: false
-    code: 'NOT_REQUESTED' | 'NOT_FOUND' | 'VERIFICATION_FAILED' | 'PRECONDITION_FAILED' | 'HUMAN_DECISION_CONFLICT'
+    code:
+      | 'NOT_REQUESTED'
+      | 'NOT_FOUND'
+      | 'VERIFICATION_FAILED'
+      | 'PRECONDITION_FAILED'
+      | 'HUMAN_DECISION_CONFLICT'
+      | 'CLEANUP_SUPERSEDED'
     reason: string
   }
 
@@ -556,11 +562,12 @@ export function completeAbortCleanup(
     ? storage.jobs.parkBlockedTaskWithTerminalJobs(releaseInput)
     : storage.jobs.releaseBlockedJobAndParkTask(releaseInput)
   if (!released.ok) {
-    if (released.code === 'HUMAN_DECISION_CONFLICT') {
-      // precheck 後に人の判断（live WAITING / APPROVED）が現れた。cleanup 自体の失敗ではないので
-      // retireTechnicalAbortCleanup() で認可を消したり carrier を quarantine したりしない。
-      // quarantine すると、その判断が解決した後の人の abort / resume まで塞ぐ（Codex review cb1f2db）。
-      // Job と cleanup metadata はそのまま残し、拒否の事実だけを audit に残す。
+    if (released.code === 'HUMAN_DECISION_CONFLICT' || released.code === 'CLEANUP_SUPERSEDED') {
+      // 人の判断（live WAITING / APPROVED / 後から CONSUMED）または後続の Job が先にある。cleanup 自体の
+      // 失敗ではないので retireTechnicalAbortCleanup() で carrier を quarantine しない —— quarantine すると
+      // その判断に続く人の abort / resume / repair まで塞ぐ（Codex review cb1f2db / 84fe348）。
+      // この cleanup generation は storage が同じ transaction で取り消し済み（再送は NOT_REQUESTED）。
+      // ここでは拒否の事実だけを audit に残す。
       if (authorization.kind === 'technical_evidence') {
         recordTechnicalAbortRefusal(storage, {
           taskId: job.taskId,
@@ -569,7 +576,7 @@ export function completeAbortCleanup(
           stage: 'final_transaction',
         })
       }
-      return { ok: false, code: 'HUMAN_DECISION_CONFLICT', reason: released.reason }
+      return { ok: false, code: released.code, reason: released.reason }
     }
     if (authorization.kind === 'technical_evidence') {
       recordTechnicalAbortRefusal(storage, {
