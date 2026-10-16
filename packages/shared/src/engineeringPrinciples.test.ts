@@ -218,7 +218,7 @@ describe('corePrincipleSlugs', () => {
     // 範囲の上限（risk 相応・Task scope 内）も同じ 1 行で届くこと。上限が全文にしか無いと、
     // core-only の repair prompt には「範囲を広げろ」だけが届く。
     expect(contract).toContain('scaled to risk')
-    expect(contract).toContain('within Task scope')
+    expect(contract).toContain('within the Task scope')
   })
 })
 

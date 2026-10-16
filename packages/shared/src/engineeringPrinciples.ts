@@ -372,9 +372,9 @@ export function buildApplicablePrinciplesSection(selection: readonly PrincipleSe
     ...selection.map((item) => `- ${item.slug}: ${item.oneLiner}`),
     // evidence-not-spec の root cause 部分は reviewer が diff の外を見られないため、verdict の上限を明示する。
     // verdict を集計する全経路（Design Review / focused review）がこの関数を通るので、ここに 1 箇所だけ置く。
-    // [root_cause] は ledger 上で同原則の他の判定と区別するための接頭辞。
+    // [root_cause] は記録される reason 上の検索用接頭辞（ledger は解析しない）。
     ...(selection.some((item) => item.slug === 'evidence-not-spec')
-      ? ['For evidence-not-spec, give CONFLICT on root cause only when the material shows a same-cause site the change leaves untouched and unreported, and start that reason with [root_cause]; otherwise judge root cause ALIGNED or UNCERTAIN.']
+      ? ['For evidence-not-spec, give CONFLICT on root cause only when the material shows a same-cause site the change leaves untouched and unreported, and start that reason with [root_cause]; otherwise judge root cause ALIGNED, and UNCERTAIN only when the material hints at a same-cause site it cannot confirm.']
       : []),
   ].join('\n')
 }

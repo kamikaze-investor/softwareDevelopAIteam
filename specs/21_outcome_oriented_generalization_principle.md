@@ -1,7 +1,7 @@
 # Outcome-Oriented Generalization Principle
 
 <!-- principle-id: evidence-not-spec -->
-<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause, check where it plausibly recurs (scaled to risk), fix the shared cause within Task scope and report the rest. -->
+<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause, check where it plausibly recurs within the Task scope (scaled to risk), fix the shared cause there and report suspected sites beyond it. -->
 <!-- principle-category: outcome-definition -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: core -->
@@ -31,8 +31,8 @@ to whoever scopes the work (PL / triage, when it decomposes findings and delegat
 implementer inside a bounded Task; the shared cause is itself the one finding of one bounded Task,
 which lists the reported symptoms it closes. A reviewer marks this principle CONFLICT only when the material it was given shows a same-cause
 site the change leaves untouched and unreported, and starts that reason with `[root_cause]`; when the
-material cannot show it (no other sites visible, no report attached) the verdict is ALIGNED or
-UNCERTAIN, never a demand for a search the material cannot show.
+material shows no other site the verdict is ALIGNED; UNCERTAIN only when the material hints at one it
+cannot confirm; never a demand for a search the material cannot show.
 
 <!-- principle-id: standard-design-frame -->
 <!-- principle-oneliner: Name the failure a constraint prevents before adding it. -->
