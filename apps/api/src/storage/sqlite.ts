@@ -909,6 +909,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         reason: 'pre-cleanup workspace does not exactly match the latest persisted end fingerprint',
       }
     }
+    // requestTechnicalAbort() の precheck（live WAITING / APPROVED があれば拒否）を最終 transaction で
+    // もう一度行う。precheck 後に作られた承認を、park の STALE 化で黙って消さないため（新しい gate ではなく
+    // 同じ条件の atomic 化）。期限解釈は shared isLiveWaitingApproval。
+    const humanDecision = (db.prepare(`
+      SELECT status, expires_at FROM approval_requests
+      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+      ORDER BY created_at DESC, rowid DESC
+    `).all(task.id) as Array<{ status: ApprovalGateStatus; expires_at: string }>)
+      .find((row) => row.status === 'APPROVED'
+        || isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at }))
+    if (humanDecision !== undefined) {
+      return { ok: false, reason: `Task has an active ${humanDecision.status} approval` }
+    }
     if (
       cleanupSummary === undefined
       || !Number.isInteger(cleanupSummary.changedPathCount)
@@ -936,6 +949,57 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       "UPDATE approval_requests SET status = 'STALE' WHERE task_id = ? "
       + "AND status IN ('WAITING_FOR_USER', 'APPROVED')",
     ).run(taskId).changes
+  }
+
+  /**
+   * **新しい ApprovalRequest を作る直前に、同じ Task の「人の判断待ち」を1件に畳む。**（同一 transaction 内で呼ぶ）
+   *
+   * - `WAITING_FOR_USER` は action・期限を問わず SUPERSEDED（lazy expiry で期限切れも WAITING のまま残る）。
+   * - `APPROVED` は人の判断なので、別 action の要求では SUPERSEDED にしない（2026-10-16 PL 判断:
+   *   進行中の abort_task 承認を repair 要求が消すと park が認可に失敗する）。
+   * - 同 action の `APPROVED` は `includeSameActionApproved` のときだけ置き換える。
+   *
+   * 結果として Task には WAITING が高々1件、APPROVED は action ごとに残る。reason / reviewed_at は書かない。
+   */
+  function supersedeForNewRequest(
+    taskId: string,
+    requestedAction: string,
+    includeSameActionApproved: boolean,
+  ): string[] {
+    const ids = (db.prepare(`
+      SELECT id FROM approval_requests
+      WHERE task_id = ?
+        AND (status = 'WAITING_FOR_USER' OR (? = 1 AND status = 'APPROVED' AND requested_action = ?))
+      ORDER BY created_at ASC, rowid ASC
+    `).all(taskId, includeSameActionApproved ? 1 : 0, requestedAction) as Array<{ id: string }>)
+      .map((row) => row.id)
+    const supersede = db.prepare(`
+      UPDATE approval_requests SET status = 'SUPERSEDED'
+      WHERE id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+    `)
+    for (const id of ids) {
+      if (supersede.run(id).changes !== 1) {
+        throw new Error(`Failed to supersede approval request ${id}`)
+      }
+    }
+    return ids
+  }
+
+  /** supersedeForNewRequest() で置き換えた事実を audit に残す（置換先と action を記録する）。 */
+  function recordSupersededForNewRequest(ids: readonly string[], replacement: ApprovalRequest): void {
+    const recordSupersede = db.prepare(`
+      INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+      VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
+    `)
+    for (const id of ids) {
+      recordSupersede.run(
+        randomUUID(),
+        id,
+        `reason=replaced_by_new_request new_approval_id=${replacement.id} `
+          + `new_requested_action=${replacement.requestedAction}`,
+        now(),
+      )
+    }
   }
 
   function technicalAbortAuditDetail(input: {
@@ -4092,39 +4156,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     replaceActiveAndCreate(data): ReplaceActiveApprovalAndCreateResult {
       // 「findActiveByTaskId() で最新1件だけ SUPERSEDED → create()」を呼び出し側ごとに書くと、
-      // (1) 古い active 行が残る、(2) 別 action の行が残る、(3) 2段の間に割り込める、の3つで
-      // 同じ Task に生きた承認が複数並ぶ（2026-10-16 監査）。期限切れ WAITING も対象にする
-      // （lazy expiry のため WAITING のまま残り、Task の active 行として数えられ続ける）。
+      // (1) 古い WAITING が残る、(2) 別 action の WAITING が残る、(3) 2段の間に割り込める、の3つで
+      // 同じ Task に人の判断待ちが複数並ぶ（2026-10-16 監査）。規則は supersedeForNewRequest() を参照。
+      // 同 action の APPROVED は置き換える: 既存の POST /approval-requests が active 行を status に
+      // 関係なく SUPERSEDED にしていた挙動を保つ（同じ判断を要求し直す = 旧い判断の置き換え）。
       const replaceTransaction = db.transaction((): ReplaceActiveApprovalAndCreateResult => {
-        const supersededIds = (db.prepare(`
-          SELECT id FROM approval_requests
-          WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
-          ORDER BY created_at ASC, rowid ASC
-        `).all(data.taskId) as Array<{ id: string }>).map((row) => row.id)
-        const supersede = db.prepare(`
-          UPDATE approval_requests SET status = 'SUPERSEDED'
-          WHERE id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
-        `)
-        for (const id of supersededIds) {
-          if (supersede.run(id).changes !== 1) {
-            throw new Error(`Failed to supersede active approval request ${id}`)
-          }
-        }
+        const supersededIds = supersedeForNewRequest(data.taskId, data.requestedAction, true)
         const approvalRequest = approvalRequests.create(data)
-        // reason / reviewed_at は書かない（人の判断を偽らない）。置換の事実は audit に残す。
-        const recordSupersede = db.prepare(`
-          INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
-          VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
-        `)
-        for (const id of supersededIds) {
-          recordSupersede.run(
-            randomUUID(),
-            id,
-            `reason=replaced_by_new_request new_approval_id=${approvalRequest.id} `
-              + `new_requested_action=${approvalRequest.requestedAction}`,
-            now(),
-          )
-        }
+        recordSupersededForNewRequest(supersededIds, approvalRequest)
         return { approvalRequest, supersededIds }
       })
       return replaceTransaction()
@@ -4156,7 +4195,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
         }
 
+        // 同じ Task の他の WAITING（action・期限を問わない）は同じ transaction で SUPERSEDED にする。
+        // APPROVED は action を問わず残す: 別 action の APPROVED は人の判断であり、同 action（git_commit）の
+        // APPROVED は別 Job に結び付いた判断でありうる（gate/check は自 Job の linked approval だけを使う）。
+        const supersededIds = supersedeForNewRequest(data.taskId, data.requestedAction, false)
         const approvalRequest = approvalRequests.create(data)
+        recordSupersededForNewRequest(supersededIds, approvalRequest)
         const linked = db.prepare(
           'UPDATE jobs SET approval_id = ? WHERE id = ? AND approval_id IS NULL'
         ).run(approvalRequest.id, jobId)

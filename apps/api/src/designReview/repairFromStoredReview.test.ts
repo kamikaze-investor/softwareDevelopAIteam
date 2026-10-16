@@ -895,11 +895,10 @@ describe('recovery action — 承認の束縛', () => {
     } as never)
     approve(storage, otherRequest.id)
 
-    // 目的の review を再駆動しようとしても、その承認は使われない（CONSUMED にならない）。
-    // 新しい承認待ちと同時に SUPERSEDED になる: Task あたり active request は高々1件（2026-10-16 監査）。
+    // 目的の review を再駆動しようとしても、その承認は使われない。
     const outcome = call(storage, ids.taskId, reviewJob.id)
     expect(outcome.status).toBe('awaiting_approval')
-    expect(storage.approvalRequests.findById(otherRequest.id)?.status).toBe('SUPERSEDED')
+    expect(storage.approvalRequests.findById(otherRequest.id)?.status).toBe('APPROVED')
   })
 
   it('期限切れの承認では通さない', () => {

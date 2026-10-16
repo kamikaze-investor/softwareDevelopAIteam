@@ -1364,6 +1364,36 @@ describe('P2-2 Automatic Technical Abort', () => {
     expect(JSON.parse(aborted?.detail ?? '{}')).toMatchObject({ staleApprovalCount: 1 })
   })
 
+  // precheck 後に作られた人の判断を、park の STALE 化で黙って消さない。同じ条件を最終 transaction で
+  // atomic に再確認する（新しい gate ではない）。拒否は typed で、Task / request は変えない。
+  it.each(['WAITING_FOR_USER', 'APPROVED'] as const)(
+    'a %s approval created after the precheck makes the final park transaction refuse',
+    (status) => {
+      const fx = seedTechnicalAbort()
+      requestTechnical(fx)
+      const late = fx.storage.approvalRequests.create({
+        taskId: fx.taskId,
+        requestedAction: 'deploy',
+        riskLevel: 'HIGH',
+        targetBranch: 'ai/technical',
+        targetCommit: 'c4',
+        targetDiffHash: 'd4',
+        changedFiles: [],
+        triggeredRules: [],
+        invalidIf: [],
+        status,
+        expiresAt: FUTURE,
+      } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+      expect(finishTechnical(fx)).toMatchObject({ ok: false })
+      expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+      expect(fx.storage.approvalRequests.findById(late.id)?.status).toBe(status)
+      expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
+        (entry) => entry.operation === 'task_aborted' && entry.result === 'success',
+      )).toBe(false)
+    },
+  )
+
   it('an expired APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
     const fx = seedTechnicalAbort()
     approvedRequest(fx.storage, fx.taskId, {

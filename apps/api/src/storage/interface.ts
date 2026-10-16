@@ -202,7 +202,7 @@ export type PersistReviewWorkflowResult =
 
 /**
  * `replaceActiveAndCreate()` の結果。`supersededIds` は同じ transaction で SUPERSEDED にした
- * 旧 active request（action・期限を問わない）。呼び出し側が応答や記録に使う。
+ * 旧 request（WAITING は action・期限を問わず、APPROVED は同 action のものだけ）。
  */
 export interface ReplaceActiveApprovalAndCreateResult {
   approvalRequest: ApprovalRequest
@@ -666,10 +666,10 @@ export interface IApprovalRequestStorage {
   findWaiting(): ApprovalRequest[]
   create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
   /**
-   * **Task あたり active request（WAITING_FOR_USER / APPROVED）は高々1件**という invariant を守る作成。
-   * 単一 transaction で、その Task の active 行を requestedAction・期限を問わず全て SUPERSEDED にし、
-   * 新しい行を insert する。Job に結び付く git_commit の作成（`createForJob`）はこれを使わない
-   * （同一 Task の別 Job が自分の linked approval を持ちうるため）。
+   * **Task あたり WAITING_FOR_USER は高々1件、APPROVED は action ごと**という invariant を守る作成。
+   * 単一 transaction で、その Task の WAITING 行を requestedAction・期限を問わず SUPERSEDED にし、
+   * 同 action の APPROVED も置き換えてから新しい行を insert する。別 action の APPROVED は人の判断なので残す。
+   * Job に結び付く git_commit の作成（`createForJob`）は同じ規則で WAITING だけを畳み、APPROVED は残す。
    */
   replaceActiveAndCreate(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ReplaceActiveApprovalAndCreateResult
   /** git_commit Approval の作成と jobs.approval_id 設定を単一transactionで行う。 */
