@@ -17,7 +17,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
 import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
@@ -4089,6 +4089,45 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         req.reviewedAt ?? null,
       )
       return req
+    },
+    replaceActiveAndCreate(data): ReplaceActiveApprovalAndCreateResult {
+      // 「findActiveByTaskId() で最新1件だけ SUPERSEDED → create()」を呼び出し側ごとに書くと、
+      // (1) 古い active 行が残る、(2) 別 action の行が残る、(3) 2段の間に割り込める、の3つで
+      // 同じ Task に生きた承認が複数並ぶ（2026-10-16 監査）。期限切れ WAITING も対象にする
+      // （lazy expiry のため WAITING のまま残り、Task の active 行として数えられ続ける）。
+      const replaceTransaction = db.transaction((): ReplaceActiveApprovalAndCreateResult => {
+        const supersededIds = (db.prepare(`
+          SELECT id FROM approval_requests
+          WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+          ORDER BY created_at ASC, rowid ASC
+        `).all(data.taskId) as Array<{ id: string }>).map((row) => row.id)
+        const supersede = db.prepare(`
+          UPDATE approval_requests SET status = 'SUPERSEDED'
+          WHERE id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+        `)
+        for (const id of supersededIds) {
+          if (supersede.run(id).changes !== 1) {
+            throw new Error(`Failed to supersede active approval request ${id}`)
+          }
+        }
+        const approvalRequest = approvalRequests.create(data)
+        // reason / reviewed_at は書かない（人の判断を偽らない）。置換の事実は audit に残す。
+        const recordSupersede = db.prepare(`
+          INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+          VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
+        `)
+        for (const id of supersededIds) {
+          recordSupersede.run(
+            randomUUID(),
+            id,
+            `reason=replaced_by_new_request new_approval_id=${approvalRequest.id} `
+              + `new_requested_action=${approvalRequest.requestedAction}`,
+            now(),
+          )
+        }
+        return { approvalRequest, supersededIds }
+      })
+      return replaceTransaction()
     },
     createForJob(data, jobId): CreateApprovalForJobResult {
       const createTransaction = db.transaction((): CreateApprovalForJobResult => {

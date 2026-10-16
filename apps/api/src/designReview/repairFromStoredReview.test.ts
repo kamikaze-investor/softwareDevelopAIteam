@@ -315,6 +315,37 @@ describe('recovery action — 承認を経て canonical repair へ戻る', () =>
     ).toBe(1)
   })
 
+  // Task あたり active request は高々1件（2026-10-16 監査）。別 action の生きた要求と、
+  // 期限切れで WAITING のまま残った同 action の要求は、新しい要求と同じ transaction で SUPERSEDED になる。
+  it('承認待ちを作るとき、別 action の active 要求と期限切れの同 action 要求を SUPERSEDED にする', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, reviewJob } = productionShape(storage)
+    const base = {
+      taskId: ids.taskId, riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER',
+    }
+    const otherAction = storage.approvalRequests.create({
+      ...base, requestedAction: 'abort_task', expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    } as never).id
+    const expiredSame = storage.approvalRequests.create({
+      ...base,
+      requestedAction: repairRecoveryActionFor(reviewJob.id),
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    } as never).id
+
+    const first = call(storage, ids.taskId, reviewJob.id)
+    expect(first.status).toBe('awaiting_approval')
+    if (first.status !== 'awaiting_approval') return
+    expect(first.reused).toBe(false)
+    expect(storage.approvalRequests.findById(otherAction)?.status).toBe('SUPERSEDED')
+    expect(storage.approvalRequests.findById(expiredSame)?.status).toBe('SUPERSEDED')
+    expect(
+      storage.approvalRequests.findByTaskId(ids.taskId)
+        .filter((r) => r.status === 'WAITING_FOR_USER' || r.status === 'APPROVED')
+        .map((r) => r.id),
+    ).toEqual([first.approvalRequestId])
+  })
+
   it('queue 後にもう一度呼んでも run を二重に作らない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, reviewJob } = productionShape(storage)
@@ -864,10 +895,11 @@ describe('recovery action — 承認の束縛', () => {
     } as never)
     approve(storage, otherRequest.id)
 
-    // 目的の review を再駆動しようとしても、その承認は使われない。
+    // 目的の review を再駆動しようとしても、その承認は使われない（CONSUMED にならない）。
+    // 新しい承認待ちと同時に SUPERSEDED になる: Task あたり active request は高々1件（2026-10-16 監査）。
     const outcome = call(storage, ids.taskId, reviewJob.id)
     expect(outcome.status).toBe('awaiting_approval')
-    expect(storage.approvalRequests.findById(otherRequest.id)?.status).toBe('APPROVED')
+    expect(storage.approvalRequests.findById(otherRequest.id)?.status).toBe('SUPERSEDED')
   })
 
   it('期限切れの承認では通さない', () => {
