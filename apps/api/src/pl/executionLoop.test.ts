@@ -2358,6 +2358,53 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(result.reason).toContain('approval_gate')
   })
 
+  // 2026-10-16 監査 RC6: 根拠に積む approval は「今実行する action 向け」のものだけ。
+  // Task の最新行（別 action）を積むと、別 action の承認で PL 操作が通り、逆に自 action の承認を見落とす。
+  function seedApprovedRequest(storage: IStorage, taskId: string, requestedAction: string): string {
+    const created = storage.approvalRequests.create({
+      taskId, targetBranch: 'master', targetCommit: 'c', targetDiffHash: 'd', riskLevel: 'HIGH',
+      requestedAction, status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), invalidIf: [],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    storage.approvalRequests.recordDecision(created.id, 'APPROVED', 'seeded')
+    return created.id
+  }
+
+  function authorizeAudits(storage: IStorage): string[] {
+    return storage.auditLog.findAll()
+      .filter((entry) => entry.operation === 'pl_action_authorize')
+      .map((entry) => `${entry.result} ${entry.detail ?? ''}`)
+  }
+
+  it('別 action（git_commit）の APPROVED は retry_job の approval_gate 根拠にならない', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    seedApprovedRequest(storage, taskId, 'git_commit')
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'retry_job', rationale: 'transient', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.status).toBe('blocked')
+    expect(result.reason).toContain('approval_gate')
+    expect(authorizeAudits(storage).some((entry) => entry.startsWith('authorized'))).toBe(false)
+  })
+
+  it('Task の最新行が別 action でも、retry_job 向けの APPROVED を選んで根拠にする', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    seedApprovedRequest(storage, taskId, 'retry_job')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    seedApprovedRequest(storage, taskId, 'git_commit') // 新しい行は別 action
+
+    await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'retry_job', rationale: 'transient', riskLevel: 'LOW' }),
+    }))
+
+    expect(authorizeAudits(storage).some((entry) =>
+      entry.startsWith('authorized') && entry.includes('kind=retry_job'))).toBe(true)
+  })
+
   it('要求される対象を組み立てられない提案は、Gate を呼ばずに fail-closed で止める', async () => {
     const { storage, taskId, projectId } = seed()
     blockedCommitJob(storage, taskId, projectId)

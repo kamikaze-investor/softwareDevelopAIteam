@@ -302,11 +302,15 @@ function checkDesignReview(
  * 「この Task の何かを承認した」以上の意味を持たない**。別 action（git_commit 等）の
  * 承認で park を通さないよう、action 名まで一致を要求する。
  *
- * ここに載っていない action の検証は変えていない（既存経路の挙動は不変）。
- * 束縛材料は既存の `requestedAction` であり、新しい承認種別は追加していない。
+ * **全 action に適用する**（2026-10-16 監査 RC4/RC6）。以前は abort_task だけで、それ以外の
+ * approval_gate 対象（retry_job・reconcile_external_completion・fail_stuck_job 等）は
+ * Task のどの APPROVED でも通った —— git_status 向けに勝手に作られた行が承認されると、それが
+ * 無関係な PL 操作の根拠になり得た。承認は自 action にしか効かない、を Gate 側でも揃える。
+ * 束縛材料は既存の `requestedAction`（= PL action 名）であり、新しい承認種別は追加していない。
  */
-const REQUIRED_APPROVAL_REQUEST_ACTION: Partial<Record<PlActionKind, string>> = {
-  abort_task: 'abort_task',
+// `string` を受けるのは、PL 提案（未検証の文字列）から根拠を選ぶ executionLoop の selector も同じ規則を使うため。
+export function requiredApprovalRequestAction(kind: string): string {
+  return kind
 }
 
 function checkApprovalGate(
@@ -331,8 +335,8 @@ function checkApprovalGate(
     return { satisfied: false, rejection: `approval request ${approvalRequestId} is ${request.status}` }
   }
 
-  const requiredAction = REQUIRED_APPROVAL_REQUEST_ACTION[kind]
-  if (requiredAction !== undefined && request.requestedAction !== requiredAction) {
+  const requiredAction = requiredApprovalRequestAction(kind)
+  if (request.requestedAction !== requiredAction) {
     return {
       satisfied: false,
       rejection:

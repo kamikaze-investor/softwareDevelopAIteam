@@ -121,6 +121,7 @@ import {
 import {
   authorizePlAction,
   PlActionBlockedError,
+  requiredApprovalRequestAction,
   requiredTargetKindFor,
   type GateEvidenceRef,
   type PlActionTarget,
@@ -1129,6 +1130,7 @@ export function buildPlResumeAiCliPrompt(
 function collectSystemEvidence(
   storage: IStorage,
   item: AttentionItem,
+  actionKind: string,
 ): GateEvidenceRef[] {
   if (item.taskId === undefined) return []
 
@@ -1152,10 +1154,16 @@ function collectSystemEvidence(
     evidence.push({ gate: 'design_review', designReviewEvidenceId: latest.id })
   }
 
-  // Approval Gate: **承認済み**の approval request だけを積む。
+  // Approval Gate: **今実行しようとしている action 向けの承認済み** approval request だけを積む。
   // WAITING / STALE / EXPIRED は充足ではないので積まない（seam 側でも弾かれる）。
-  const approval = storage.approvalRequests.findActiveByTaskId(item.taskId)
-  if (approval?.status === 'APPROVED') {
+  //
+  // 以前は Task の最新 active 行をそのまま積んでいた。最新行が別 action の WAITING だと、同じ Task に
+  // この action 向けの APPROVED があっても積めず、逆に最新行が別 action の APPROVED だとそれを根拠に
+  // していた（2026-10-16 監査 RC6）。action は seam と同じ `requiredApprovalRequestAction()` で決める。
+  const expectedAction = requiredApprovalRequestAction(actionKind)
+  const approval = storage.approvalRequests.findByTaskId(item.taskId)
+    .find((request) => request.status === 'APPROVED' && request.requestedAction === expectedAction)
+  if (approval !== undefined) {
     evidence.push({ gate: 'approval_gate', approvalRequestId: approval.id })
   }
 
@@ -1819,7 +1827,7 @@ async function handleTarget(
       target: plActionTarget,
       // 根拠は**システムが観測した実レコード**から積む。PL の申告は渡さない。
       // 該当が無ければ空のままで、Gate が missing として止める（fail-closed）。
-      evidence: collectSystemEvidence(storage, item),
+      evidence: collectSystemEvidence(storage, item, proposal.kind),
     })
   } catch (error: unknown) {
     if (error instanceof PlActionBlockedError) {
