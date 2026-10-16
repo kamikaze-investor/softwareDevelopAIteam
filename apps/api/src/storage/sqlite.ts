@@ -61,7 +61,7 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
-import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { approvalActorAuditRecord, readJobsSupersededByHumanResume } from '../designReview/resumeActor'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -4576,7 +4576,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
       return createTransaction()
     },
-    approveAndResumeJob(id, reason): ReviewApprovalAndResumeJobResult {
+    approveAndResumeJob(id, reason, decidedBy): ReviewApprovalAndResumeJobResult {
       const approveTransaction = db.transaction((): ReviewApprovalAndResumeJobResult => {
         const record = (result: ReviewApprovalAndResumeJobResult): ReviewApprovalAndResumeJobResult => {
           auditLog.record({
@@ -4684,6 +4684,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         `).run(job.id, id)
         if (jobUpdated.changes !== 1) {
           throw new Error('Failed to atomically resume the linked Job')
+        }
+        // 「誰が決めたか」は承認・Job 再 queue と同じ transaction で書く（H-03）。ここで失敗したら
+        // 承認も再 queue も rollback される —— human evidence の無い APPROVED を残さない。
+        if (decidedBy !== undefined) {
+          auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
         }
 
         const approvalRequest = approvalRequests.findById(id)
@@ -4938,7 +4943,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).run(status, newReason, newReviewedAt, id)
       return { ...existing, status, reason: newReason ?? undefined, reviewedAt: newReviewedAt ?? undefined }
     },
-    recordDecision(id, status, reason) {
+    recordDecision(id, status, reason, decidedBy) {
       const decisionTransaction = db.transaction((): ApprovalRequest | undefined => {
         const updated = approvalRequests.updateStatus(id, status, reason)
         if (updated) {
@@ -4949,6 +4954,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             entityId: id,
             result: 'success',
           })
+          // 決定と「誰が決めたか」は同じ transaction（H-03）。片方だけが commit される窓を残さない。
+          if (decidedBy !== undefined) {
+            auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
+          }
         }
         return updated
       })

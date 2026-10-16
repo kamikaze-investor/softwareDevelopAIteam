@@ -223,7 +223,9 @@ export const APPROVAL_ACTOR_AUDIT_OPERATION = 'approval_actor'
  * ところが `APPROVED` は legacy 単一 token でも書けるので、行の状態だけでは「人が決めた」ことの
  * 証明にならない。Human Resume と同じ規則（`resumeActorClassForCredential()`：ADMIN だけが human、
  * legacy / 不明は決して human にしない）で決めた種別を、承認 id に紐づけて 1 行残す。
- * 呼び出しは承認 PATCH route の担当（CODEOWNERS 保護のため別 unit が配線する）。
+ * 承認 PATCH route は storage の決定操作（`recordDecision` / `approveAndResumeJob`）へ credential 種別を渡し、
+ * storage が **状態変更と同じ transaction で** `approvalActorAuditRecord()` の行を書く（H-03）。
+ * この関数は transaction の外で後から書く既存経路（テストの seed 等）用で、行の形は同じ helper から作る。
  * 記録の失敗は authority を増やす方向へは倒れない（読み側が `unknown` を返す）。
  */
 export function recordApprovalActor(
@@ -231,18 +233,30 @@ export function recordApprovalActor(
   approvalRequestId: string,
   credentialClass: CredentialClass | undefined,
 ): void {
+  recordWithoutFailingCaller(APPROVAL_ACTOR_AUDIT_OPERATION, () => {
+    storage.auditLog.record(approvalActorAuditRecord(approvalRequestId, credentialClass))
+  })
+}
+
+/**
+ * `approval_actor` audit 行の**唯一の形**。書き手（`recordApprovalActor()` と storage の決定 transaction）は
+ * どちらもここから行を作り、読み手（`readApprovalActorClass()`）はこの形だけを読む。
+ * 種別は credential だけから決める（`resumeActorClassForCredential()`：ADMIN だけが human）。
+ */
+export function approvalActorAuditRecord(
+  approvalRequestId: string,
+  credentialClass: CredentialClass | undefined,
+): Omit<AuditLogEntry, 'id' | 'createdAt'> {
   const actorClass = resumeActorClassForCredential(credentialClass)
   const evidence = resumeEvidenceForCredential(credentialClass)
-  recordWithoutFailingCaller(APPROVAL_ACTOR_AUDIT_OPERATION, () => {
-    storage.auditLog.record({
-      actor: 'api',
-      operation: APPROVAL_ACTOR_AUDIT_OPERATION,
-      entityType: 'approval_request',
-      entityId: approvalRequestId,
-      result: actorClass,
-      detail: `approval_actor=${actorClass} authorization_evidence=${evidence}`,
-    })
-  })
+  return {
+    actor: 'api',
+    operation: APPROVAL_ACTOR_AUDIT_OPERATION,
+    entityType: 'approval_request',
+    entityId: approvalRequestId,
+    result: actorClass,
+    detail: `approval_actor=${actorClass} authorization_evidence=${evidence}`,
+  }
 }
 
 /**

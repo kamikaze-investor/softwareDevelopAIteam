@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import Fastify, { type FastifyInstance } from 'fastify'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Job } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { apiTokenAuth } from '../auth/apiToken'
@@ -133,7 +133,7 @@ describe('PATCH /api/approval-requests/:id/status — approval_actor を記録�
     }
   })
 
-  it('legacy 単一 token で承認された要求は human ではなく、recovery は APPROVAL_ACTOR_NOT_HUMAN で承認を残す', async () => {
+  it('legacy 単一 token で承認された要求は human ではなく、recovery は consume せず新しい承認待ちへ置き換える', async () => {
     useLegacyCredential()
     const { app, storage } = await buildApp()
     try {
@@ -145,8 +145,8 @@ describe('PATCH /api/approval-requests/:id/status — approval_actor を記録�
       expect(res.statusCode).toBe(200)
       expect(readApprovalActorClass(storage, first.approvalRequestId)).not.toBe('human')
 
-      expect(recover(storage, shape)).toMatchObject({ status: 'rejected', code: 'APPROVAL_ACTOR_NOT_HUMAN' })
-      expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('APPROVED')
+      expect(recover(storage, shape)).toMatchObject({ status: 'awaiting_approval', reused: false })
+      expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('SUPERSEDED')
     } finally {
       await app.close()
     }
@@ -164,6 +164,83 @@ describe('PATCH /api/approval-requests/:id/status — approval_actor を記録�
       expect(res.statusCode).toBe(403)
       expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('WAITING_FOR_USER')
       expect(readApprovalActorClass(storage, first.approvalRequestId)).toBe('unknown')
+    } finally {
+      await app.close()
+    }
+  })
+
+  // H-03: 決定と actor 記録は同じ transaction。actor 行の書き込みが落ちたら決定も（git_commit は Job の
+  // 再 queue も）残らず、要求は WAITING のまま —— 同じ PATCH をもう一度送れば通る（409 で詰まない）。
+  it('actor 行の書き込みが transaction 内で失敗すると、決定も actor 行も残らず、再 PATCH で通る', async () => {
+    useSplitCredentials()
+    const { app, storage } = await buildApp()
+    try {
+      const shape = storedReviewShape(storage)
+      const first = recover(storage, shape)
+      if (first.status !== 'awaiting_approval') throw new Error(`unexpected ${first.status}`)
+
+      const original = storage.auditLog.record.bind(storage.auditLog)
+      const spy = vi.spyOn(storage.auditLog, 'record').mockImplementation((entry) => {
+        if (entry.operation === 'approval_actor') throw new Error('simulated crash inside the decision transaction')
+        return original(entry)
+      })
+      const failed = await decide(app, first.approvalRequestId, 'APPROVED', ADMIN_TOKEN)
+      spy.mockRestore()
+
+      expect(failed.statusCode).toBe(500)
+      expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('WAITING_FOR_USER')
+      expect(storage.auditLog.findByEntity('approval_request', first.approvalRequestId)).toEqual([])
+      expect(readApprovalActorClass(storage, first.approvalRequestId)).toBe('unknown')
+
+      const retried = await decide(app, first.approvalRequestId, 'APPROVED', ADMIN_TOKEN)
+      expect(retried.statusCode).toBe(200)
+      expect(readApprovalActorClass(storage, first.approvalRequestId)).toBe('human')
+      expect(recover(storage, shape).status).toBe('queued')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('git_commit の承認も、actor 行が書けなければ承認と Job の再 queue ごと rollback される', async () => {
+    useSplitCredentials()
+    const { app, storage } = await buildApp()
+    try {
+      const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'T', description: 'd', status: 'in_progress',
+        assignee: 'developer_ai', dependencies: [],
+      } as never)
+      const created = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', args: { message: 'm' } },
+      } as never)
+      const job = storage.jobs.update(created.id, { status: 'blocked' } as never)!
+      const linked = storage.approvalRequests.createForJob({
+        taskId: task.id, targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd', riskLevel: 'HIGH',
+        requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), invalidIf: [],
+      } as never, job.id)
+      if (!linked.ok) throw new Error(linked.reason)
+      const approvalId = linked.approvalRequest.id
+
+      const original = storage.auditLog.record.bind(storage.auditLog)
+      const spy = vi.spyOn(storage.auditLog, 'record').mockImplementation((entry) => {
+        if (entry.operation === 'approval_actor') throw new Error('simulated crash inside the approve transaction')
+        return original(entry)
+      })
+      const failed = await decide(app, approvalId, 'APPROVED', ADMIN_TOKEN)
+      spy.mockRestore()
+
+      expect(failed.statusCode).toBe(500)
+      expect(storage.approvalRequests.findById(approvalId)?.status).toBe('WAITING_FOR_USER')
+      expect(storage.jobs.findById(job.id)?.status).toBe('blocked')
+      expect(readApprovalActorClass(storage, approvalId)).toBe('unknown')
+
+      const retried = await decide(app, approvalId, 'APPROVED', ADMIN_TOKEN)
+      expect(retried.statusCode).toBe(200)
+      expect(storage.approvalRequests.findById(approvalId)?.status).toBe('APPROVED')
+      expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      expect(readApprovalActorClass(storage, approvalId)).toBe('human')
     } finally {
       await app.close()
     }

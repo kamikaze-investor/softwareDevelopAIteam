@@ -401,7 +401,10 @@ describe('consume 済み承認は、人が決めた記録があるときだけ a
     })
   })
 
-  it('人が決めた記録の無い APPROVED は consume せずに rejected を返す（承認を焼かない）', async () => {
+  // H-03: 人が決めた記録の無い APPROVED は consume しない（authority にならない承認を焼かない）。
+  // ただし拒否のまま残すと、その行が期限まで APPROVED で居座り、誰も新しい要求を作れない。
+  // 使えない承認として置き換え、CEO に改めて判断を求める。
+  it('人が決めた記録の無い APPROVED は consume せず、置き換えて新しい承認待ちを作る', async () => {
     const shape = await b8d0fc5dShape()
     await terminalRun(shape, 'REVIEW_UNAVAILABLE')
     const first = recover(shape)
@@ -409,8 +412,12 @@ describe('consume 済み承認は、人が決めた記録があるときだけ a
     recordApprovalActor(shape.storage, first.approvalRequestId, 'legacy')
     shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
 
-    expect(recover(shape)).toMatchObject({ status: 'rejected', code: 'APPROVAL_ACTOR_NOT_HUMAN' })
-    expect(shape.storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('APPROVED')
+    const second = recover(shape)
+    expect(second).toMatchObject({ status: 'awaiting_approval', reused: false })
+    if (second.status !== 'awaiting_approval') return
+    expect(second.approvalRequestId).not.toBe(first.approvalRequestId)
+    expect(shape.storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('SUPERSEDED')
+    expect(shape.storage.approvalRequests.findById(second.approvalRequestId)?.status).toBe('WAITING_FOR_USER')
     expect(shape.storage.designReviewRuns.findQueued()).toHaveLength(0)
   })
 })

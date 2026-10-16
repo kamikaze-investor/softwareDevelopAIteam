@@ -18,6 +18,16 @@ import type { AiCliProvider, AiCliMode, RecoverAdmissionCode } from '@ai-team/sh
 import type { ResumeAdmissionCode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
+import type { CredentialClass } from '../auth/credentialClass'
+
+/**
+ * 承認の決定を下した主体（`apiTokenAuth()` が決めた credential 種別だけ）。
+ * storage はこれを `approval_actor` audit 行として**状態変更と同じ transaction で**書く（H-03）。
+ * 行の形は `designReview/resumeActor.ts` の `approvalActorAuditRecord()` が唯一の出どころ。
+ */
+export interface ApprovalDecisionActor {
+  credentialClass: CredentialClass | undefined
+}
 
 export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -754,8 +764,11 @@ export interface IApprovalRequestStorage {
     data: Omit<ApprovalRequest, 'id' | 'createdAt'>,
     jobId: string,
   ): CreateApprovalForJobResult
-  /** WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。 */
-  approveAndResumeJob(id: string, reason?: string): ReviewApprovalAndResumeJobResult
+  /**
+   * WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。
+   * `decidedBy` を渡すと、承認・Job 再 queue と同じ transaction で `approval_actor` 行を書く。
+   */
+  approveAndResumeJob(id: string, reason?: string, decidedBy?: ApprovalDecisionActor): ReviewApprovalAndResumeJobResult
   /** Job/Task/Action/baselineを検証して git_commit Approval を一度だけconsumeする。 */
   consumeForJob(input: {
     id: string
@@ -784,8 +797,16 @@ export interface IApprovalRequestStorage {
   }): ConsumeApprovalForCommandJobResult
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
-  /** 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用） */
-  recordDecision(id: string, status: 'APPROVED' | 'REJECTED', reason?: string): ApprovalRequest | undefined
+  /**
+   * 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用）。
+   * `decidedBy` を渡すと、決定と同じ transaction で `approval_actor` 行も書く（片方だけ残らない）。
+   */
+  recordDecision(
+    id: string,
+    status: 'APPROVED' | 'REJECTED',
+    reason?: string,
+    decidedBy?: ApprovalDecisionActor,
+  ): ApprovalRequest | undefined
 }
 
 export interface IDesignReviewEvidenceStorage {
