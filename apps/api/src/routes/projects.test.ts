@@ -761,6 +761,33 @@ describe('Project API', () => {
       })
     })
 
+    it('refuses archive / draft while a whole-roadmap Design Review run (project subject, no task) is queued or running; pause still passes', async () => {
+      await withApp(async (app) => {
+        const storage = await storageOf()
+        const project = await createProject(app, { status: 'running' })
+        const run = storage.designReviewRuns.create({
+          reviewKind: 'roadmap', subjectId: project.id, taskTitle: 'Whole-Roadmap Review',
+          designText: 'roadmap', designTextHash: 'hash', changedFiles: [],
+        })
+
+        for (const target of ['archived', 'draft'] as const) {
+          const res = await patchStatus(app, project.id, target)
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ blockers: string[] }>(res.body).blockers).toEqual(['design_review_run'])
+        }
+        storage.designReviewRuns.claim(run.id, 3)
+        for (const target of ['archived', 'draft'] as const) {
+          expect((await patchStatus(app, project.id, target)).statusCode).toBe(409)
+        }
+        // 別 Project の roadmap run は止めない（subject は Project 単位）。
+        const other = await createProject(app, { status: 'paused' })
+        expect((await patchStatus(app, other.id, 'archived')).statusCode).toBe(200)
+
+        const paused = await patchStatus(app, project.id, 'paused')
+        expect(paused.statusCode).toBe(200)
+      })
+    })
+
     it('refuses archive / draft while a task_continuation is pending (lifecycle repair C3)', async () => {
       await withApp(async (app) => {
         const storage = await storageOf()

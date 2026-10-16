@@ -771,11 +771,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     // **repair でない Design Review run も放棄を止める**（lifecycle repair C3）。initial implement の run が
     // queued / running のまま archive / draft にすると、ALIGNED の後に archived Project へ誰も claim できない
     // queued Job が入る（または review が宙に浮く）。名前は repair run と分けて安定させる。
+    //
+    // **run の scope は Task 経由と Project subject 経由の両方で解決する。** review_kind は 'task'
+    // （task_id = subject_id）と 'roadmap'（task_id 無し・subject_id = projectId。Whole-Roadmap Review）の
+    // 2 種類だけ（`DesignReviewKind`）。Task 経由だけを見ると、project initialization の roadmap review が
+    // queued / running の間に archive でき、その後に roadmap / task の同期が続く（Codex review 148a927）。
     const otherRun = db.prepare(
-      "SELECT r.id FROM design_review_runs r JOIN tasks t ON t.id = r.task_id "
-      + "WHERE t.project_id = ? AND r.status IN ('queued','running') "
-      + 'AND r.repair_source_job_id IS NULL LIMIT 1',
-    ).get(projectId)
+      "SELECT r.id FROM design_review_runs r LEFT JOIN tasks t ON t.id = r.task_id "
+      + "WHERE r.status IN ('queued','running') AND r.repair_source_job_id IS NULL "
+      + "AND (t.project_id = ? OR (r.review_kind = 'roadmap' AND r.subject_id = ?)) LIMIT 1",
+    ).get(projectId, projectId)
     if (otherRun) kinds.push('design_review_run')
 
     // **pending の task_continuation も放棄を止める**（lifecycle repair C3）。放棄後に continuation が
