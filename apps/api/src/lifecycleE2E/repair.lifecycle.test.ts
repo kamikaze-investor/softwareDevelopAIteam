@@ -150,6 +150,14 @@ describe('R2: repair Design Review runner unavailable → requeued (not escalate
     expect(cooling.attention.map((item) => item.kind)).not.toContain('design_review_idle')
     expect(cooling.projects.find((p) => p.designReview !== undefined)?.designReview)
       .toMatchObject({ status: 'queued', attemptCount: 1, idle: false, retryNotBefore: expect.any(String) })
+    // PL ticks during the cooldown spend no provider diagnosis on this Task (its job_failed waits too).
+    let coolingDiagnoses = 0
+    for (let i = 0; i < 3; i += 1) {
+      const tick = await env.plTick({ diagnose: async () => { coolingDiagnoses += 1; return REKICK() } })
+      expect(tick.status).toBe('idle')
+    }
+    expect(coolingDiagnoses).toBe(0)
+    expect(env.storage.designReviewRuns.findById(repairRun!.id)).toMatchObject({ status: 'queued', attemptCount: 1 })
     // Advance the clock past the cooldown: the run is idle again and PL rekicks it.
     passDesignReviewRetryCooldown()
     const attention = (await env.systemState()).attention

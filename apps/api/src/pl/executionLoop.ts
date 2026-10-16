@@ -53,6 +53,7 @@ import {
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
 import { executeQueuedRun, toExecuteDesignReviewResult } from '../designReview/queuedRunDispatch'
+import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
 import {
   CHEAP_AI_PROPOSER_ID,
   PL_ADOPTION_PROPOSAL_AGENT,
@@ -475,7 +476,28 @@ function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
     && !hasExhaustedTargetTechnicalRecovery(storage, item)
     && !hasExhaustedInProcessAttempts(targetKeyOf(item))
     && hasStalledLongEnough(item)
+    && designReviewRetryWaitUntil(storage, item) === undefined
   )
+}
+
+/** retry cooldown を待つ間、PL が診断を回さない attention kind（どちらも resume で同じ run を再実行する）。 */
+const WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS: readonly AttentionItem['kind'][] = ['job_blocked', 'job_failed']
+
+/**
+ * その Task の直近 Design Review run が、判定の出なかった attempt の後の retry cooldown 中なら
+ * 明ける時刻（ISO）。そうでなければ undefined。
+ *
+ * cooldown 中は `claim()` が拒むので、resume しても同じ run は動かず pending になるだけである。
+ * そこへ毎 tick provider 診断を払わない（lifecycle repair C3-c）。**待つだけで、試行も Escalation も
+ * 記録しない。** 判定は `claim()` と同じ壁時計で行う（「いま claim できるか」と同じ問い）。
+ * cooldown が明ければ undefined になり、従来の選択（`design_review_idle` の rekick を含む）へ戻るので、
+ * 配線済みの executor を先取りしない。
+ */
+function designReviewRetryWaitUntil(storage: IStorage, item: AttentionItem): string | undefined {
+  if (item.taskId === undefined || !WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS.includes(item.kind)) return undefined
+  const run = storage.designReviewRuns.findLatestByTaskId(item.taskId)
+  const notBeforeMs = run === undefined ? undefined : designReviewRetryNotBeforeMs(run)
+  return notBeforeMs !== undefined && Date.now() < notBeforeMs ? new Date(notBeforeMs).toISOString() : undefined
 }
 
 /**
@@ -879,7 +901,9 @@ async function actOnOperatorTarget(
         ? 'already escalated to the CEO; the PL waits for the CEO decision'
         : hasExhaustedTargetTechnicalRecovery(storage, item)
           ? 'technical recovery budget exhausted; the PL will not resume this target'
-          : 'not stalled long enough yet; the PL will look at it automatically'
+          : designReviewRetryWaitUntil(storage, item) !== undefined
+            ? `the Design Review retry is cooling down until ${designReviewRetryWaitUntil(storage, item)}; the PL will look at it automatically`
+            : 'not stalled long enough yet; the PL will look at it automatically'
     return { attempted: false, status: 'not_eligible', reason }
   }
 

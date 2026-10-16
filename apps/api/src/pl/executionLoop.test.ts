@@ -2752,15 +2752,24 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(queuedRun?.status).toBe('queued')
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
 
-    // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）中は、同じ resume も
-    // pending のまま（claim されず attempt も消費しない）。
-    resetPlLoopInFlightForTest()
-    const cooling = await runPlTick(storage, deps({
-      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
-      coordinatorDeps: alignedCoordinatorDeps,
-    }))
-    expect(cooling.status).toBe('idle')
-    expect(cooling.reason).toContain('resume pending')
+    // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）中は、PL はその Task の
+    // job_blocked を選ばない: 何 tick 回しても provider 診断は 0 回、run も動かず attempt も増えない。
+    let coolingDiagnoses = 0
+    for (let i = 0; i < 5; i += 1) {
+      resetPlLoopInFlightForTest()
+      const cooling = await runPlTick(storage, deps({
+        diagnose: async () => {
+          coolingDiagnoses += 1
+          return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+        },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+        coordinatorDeps: alignedCoordinatorDeps,
+      }))
+      expect(cooling.status).toBe('idle')
+    }
+    expect(coolingDiagnoses).toBe(0)
+    expect(escalations).toEqual([])
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
     expect(storage.designReviewRuns.findById(queuedRun!.id)).toMatchObject({ status: 'queued', attemptCount: 1 })
 
     passDesignReviewRetryCooldown()
