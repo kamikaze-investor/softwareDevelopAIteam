@@ -18,6 +18,7 @@ import { router } from 'expo-router'
 import {
   ActivityIndicator,
   Alert,
+  Clipboard,
   Modal,
   RefreshControl,
   ScrollView,
@@ -29,6 +30,7 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../lib/api'
+import { approvalIdLabel, approvalTargetDescription, copyApprovalId } from '../lib/approvalIdentity'
 import {
   fetchPendingApprovals,
   fetchWaitingApprovalRequests,
@@ -246,10 +248,13 @@ const NO_DETAIL_INFO_WARNING =
 function RejectReasonModal({
   onCancel,
   onConfirm,
+  targetDescription,
   visible,
 }: {
   onCancel: () => void
   onConfirm: (reason: string) => void
+  /** 却下する Approval request の識別情報。方針承認では渡さない。 */
+  targetDescription?: string
   visible: boolean
 }): ReactElement {
   const [reason, setReason] = useState('')
@@ -268,6 +273,9 @@ function RejectReasonModal({
       <View style={styles.modalOverlay}>
         <View style={styles.modalBox}>
           <Text style={styles.modalTitle}>却下理由</Text>
+          {targetDescription !== undefined && (
+            <Text selectable style={styles.modalTargetText}>{targetDescription}</Text>
+          )}
           <TextInput
             maxLength={500}
             multiline
@@ -421,6 +429,7 @@ export default function ApprovalsScreen(): ReactElement {
   )
   const [refreshing, setRefreshing] = useState(false)
   const [rejectTarget, setRejectTarget] = useState<RejectTarget | null>(null)
+  const [copiedApprovalMessage, setCopiedApprovalMessage] = useState<{ id: string; message: string } | null>(null)
 
   const loadApprovalRequests = useCallback(async (): Promise<void> => {
     try {
@@ -597,7 +606,9 @@ export default function ApprovalsScreen(): ReactElement {
   function confirmApproveApprovalRequest(item: ApprovalRequest): void {
     Alert.alert(
       '危険操作の承認',
-      `Task ${item.taskId} の「${item.requestedAction}」を承認しますか？`,
+      `${approvalTargetDescription(item)}
+
+「${item.requestedAction}」を承認しますか？`,
       [
         { style: 'cancel', text: 'キャンセル' },
         {
@@ -706,6 +717,25 @@ export default function ApprovalsScreen(): ReactElement {
                   </Text>
                 </View>
               </View>
+
+              <View style={styles.approvalIdRow}>
+                <Text selectable style={styles.approvalIdText}>{approvalIdLabel(item.id)}</Text>
+                <TouchableOpacity
+                  accessibilityLabel={`${approvalIdLabel(item.id)} をコピー`}
+                  hitSlop={8}
+                  onPress={(event) => {
+                    event.stopPropagation()
+                    const message = copyApprovalId(item.id, (text) => Clipboard.setString(text))
+                    setCopiedApprovalMessage({ id: item.id, message })
+                  }}
+                  style={styles.copyButton}
+                >
+                  <Text style={styles.copyButtonText}>コピー</Text>
+                </TouchableOpacity>
+              </View>
+              {copiedApprovalMessage?.id === item.id && (
+                <Text style={styles.copiedText}>{copiedApprovalMessage.message}</Text>
+              )}
 
               <Text style={styles.itemTitle}>
                 AIがしようとしていること: {formatRequestedActionSummary(item.requestedAction)}
@@ -980,6 +1010,7 @@ export default function ApprovalsScreen(): ReactElement {
     <RejectReasonModal
       onCancel={() => setRejectTarget(null)}
       onConfirm={handleConfirmReject}
+      targetDescription={rejectTarget?.type === 'gate' ? approvalTargetDescription(rejectTarget.item) : undefined}
       visible={rejectTarget !== null}
     />
     <ApprovalQuestionModal
@@ -1031,6 +1062,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     padding: 16,
     width: '100%',
+  },
+  modalTargetText: {
+    color: '#d4d4d4',
+    fontFamily: 'monospace',
+    fontSize: 12,
+    marginBottom: 10,
   },
   modalTitle: {
     color: '#fff',
@@ -1112,11 +1149,41 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     padding: 16,
   },
+  approvalIdRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 8,
+  },
+  approvalIdText: {
+    color: '#d4d4d4',
+    flex: 1,
+    flexShrink: 1,
+    fontFamily: 'monospace',
+    fontSize: 12,
+  },
   cardTop: {
     alignItems: 'center',
     flexDirection: 'row',
     gap: 8,
     marginBottom: 8,
+  },
+  copiedText: {
+    color: '#22c55e',
+    fontSize: 12,
+    marginBottom: 8,
+  },
+  copyButton: {
+    borderColor: '#3a3a3a',
+    borderRadius: 6,
+    borderWidth: 1,
+    minHeight: 32,
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
+  copyButtonText: {
+    color: '#d4d4d4',
+    fontSize: 12,
   },
   center: {
     alignItems: 'center',
