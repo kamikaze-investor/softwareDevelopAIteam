@@ -85,6 +85,7 @@ export * from './roadmapTaskIdentity'
 export * from './taskOccupancy'
 export * from './approvalLiveness'
 export * from './resumeAdmission'
+export * from './recoverAdmission'
 export * from './roadmapTopology'
 export {
   PL_ACTION_KINDS,

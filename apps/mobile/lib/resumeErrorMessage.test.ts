@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  formatRecoverErrorMessage,
   formatResumeErrorMessage,
+  RECOVER_ERROR_MESSAGE_FALLBACK,
   RESUME_DESIGN_REVIEW_FAILED_MESSAGE,
   RESUME_ERROR_MESSAGE_FALLBACK,
 } from './resumeErrorMessage'
@@ -31,5 +33,45 @@ describe('formatResumeErrorMessage', () => {
     expect(formatResumeErrorMessage(null)).toBe(RESUME_ERROR_MESSAGE_FALLBACK)
     expect(formatResumeErrorMessage('')).toBe(RESUME_ERROR_MESSAGE_FALLBACK)
     expect(formatResumeErrorMessage('something else')).toBe(RESUME_ERROR_MESSAGE_FALLBACK)
+  })
+})
+
+describe('formatResumeErrorMessage（stable code）', () => {
+  it.each([
+    ['AI_CLI_PROVIDER_MISSING', 'AI実行設定（使用するAI）が記録されていないため、再開できませんでした。AI開発チームに確認を依頼してください。'],
+    ['TASK_DONE', 'このTaskは完了しているため、再開できません。'],
+    ['PROJECT_NOT_RUNNING', 'Projectが実行中ではないため、再開できませんでした。先にProjectを再開してください。'],
+    ['TASK_PARKED', 'このTaskは中止（保留）されているため、再開できません。'],
+    ['WORKSPACE_QUARANTINED', '安全のため停止しているため、追加指示では再開できません。AI開発チーム側で作業領域の復旧が必要です。'],
+    ['LIVE_JOB_EXISTS', '既に実行中または待機中の作業があるため、追加指示を送れませんでした。'],
+    ['APPROVAL_WAITING', '承認待ちの操作があるため、追加指示を送れませんでした。'],
+    ['NO_JOBS', 'このTaskには作業履歴が無いため、追加指示では再開できません。「復旧（再開待ちに戻す）」を使ってください。'],
+  ])('code %s は専用の文言（error 文字列より優先）', (code, expected) => {
+    expect(formatResumeErrorMessage('Validation failed', code)).toBe(expected)
+  })
+
+  it('設計レビュー不通過の code は既存の文言', () => {
+    expect(formatResumeErrorMessage(null, 'RESUME_DESIGN_REVIEW_FAILED')).toBe(RESUME_DESIGN_REVIEW_FAILED_MESSAGE)
+  })
+
+  it('未知の code は従来の error 文字列の照合へ落ちる', () => {
+    expect(formatResumeErrorMessage('Task is not blocked', 'SOMETHING_NEW')).toBe('現在は停止状態ではないため、追加指示を送れませんでした。')
+    expect(formatResumeErrorMessage(null, 'SOMETHING_NEW')).toBe(RESUME_ERROR_MESSAGE_FALLBACK)
+    expect(formatResumeErrorMessage(null, 'toString')).toBe(RESUME_ERROR_MESSAGE_FALLBACK)
+  })
+})
+
+describe('formatRecoverErrorMessage', () => {
+  it.each([
+    ['PROJECT_NOT_RUNNING', 'Projectが実行中ではないため、復旧できませんでした。先にProjectを再開してください。'],
+    ['TASK_HAS_JOBS', 'このTaskには作業履歴があるため、「追加指示を出す」から再開してください。'],
+    ['APPROVAL_WAITING', '承認待ちの操作があるため、復旧できませんでした。先に承認画面で判断してください。'],
+  ])('code %s', (code, expected) => {
+    expect(formatRecoverErrorMessage(code)).toBe(expected)
+  })
+
+  it('code が無い・未知なら fallback', () => {
+    expect(formatRecoverErrorMessage(null)).toBe(RECOVER_ERROR_MESSAGE_FALLBACK)
+    expect(formatRecoverErrorMessage('RECOVERY_FAILED')).toBe(RECOVER_ERROR_MESSAGE_FALLBACK)
   })
 })
