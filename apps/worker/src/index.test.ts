@@ -807,6 +807,59 @@ describe('pending Technical Abort cleanup delivery gates intake and is swept whe
     },
   )
 
+  // Codex review 35a1784: 同じ poll で新しい cleanup が受理されても、別の保留の再送を飛ばさない。
+  it('a newly accepted cleanup does not starve a separate pending submission in the same poll', async () => {
+    const cleanEndOnly = { mode: 'clean' as const, startCommitHash: 'end-head' }
+    workspaceVerificationMocks.observeWorkspace.mockReturnValue({ observation: cleanEndOnly, knownGood: knownGoodClean })
+    const marked = (id: string, taskId: string, evidence: string): Job => ({
+      ...job,
+      id,
+      taskId,
+      status: 'failed',
+      failureMetadata: {
+        workspaceEndFingerprint: cleanEndOnly,
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: evidence,
+        abortTechnicalStateFingerprint: `fp-${evidence}`,
+      },
+    })
+    const taskA: Task = { ...task, id: 'task-a', status: 'blocked', roadmapActive: true }
+    const taskB: Task = { ...task, id: 'task-b', status: 'blocked', roadmapActive: true }
+    const jobA = marked('job-a', 'task-a', 'evidence-a')
+    const jobB = marked('job-b', 'task-b', 'evidence-b')
+    let bMarked = false
+    let aAttempts = 0
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      // B を先に列挙する: B の受理で列挙が早期に終わり、A には列挙経路では届かない。
+      if (value.includes('/api/tasks?projectId=')) {
+        return new Response(JSON.stringify(bMarked ? [taskB, taskA] : [taskA]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=task-a')) return new Response(JSON.stringify([jobA]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=task-b')) return new Response(JSON.stringify([jobB]), { status: 200 })
+      if (value.includes('/api/jobs/job-a/abort-cleanup-result')) {
+        aAttempts += 1
+        return aAttempts === 1 ? busy() : new Response(null, { status: 200 })
+      }
+      if (value.includes('/api/jobs/job-b/abort-cleanup-result')) return new Response(null, { status: 200 })
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    // poll 1: A が STORAGE_BUSY で保留になる。
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-a'])
+
+    // poll 2: 新しく B の cleanup が要求され受理される。同じ poll で A の保留も再送されて解ける。
+    bMarked = true
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+    const posted = fetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes('/abort-cleanup-result'))
+    expect(posted.filter((url) => url.includes('job-b'))).toHaveLength(1)
+    expect(posted.filter((url) => url.includes('job-a'))).toHaveLength(2)
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+  })
+
   it('a technical refusal report names the carrier generation', async () => {
     workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: false })
     const state: ApiState = {

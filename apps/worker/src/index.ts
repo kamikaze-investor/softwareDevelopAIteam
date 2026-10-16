@@ -1238,8 +1238,10 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
     // 進まず intake が黙って止まり続ける（Codex review 57f2cf6）。列挙の失敗として扱い、再送は続ける。
     console.warn(`[Worker] abort cleanup の列挙に失敗しました（保留は残します）: ${formatUnknownError(err)}`)
   }
-  if (reported) return true
-  return resubmitUnhandledPendingAbortCleanups(seen.handledPending)
+  // 新しい cleanup が受理された poll でも、列挙で扱わなかった保留を必ず再送する。受理が続くと
+  // 別 generation の保留が再送されず上限も進まないまま intake が止まり続けるため（Codex review 35a1784）。
+  const resubmitted = await resubmitUnhandledPendingAbortCleanups(seen.handledPending)
+  return reported || resubmitted
 }
 
 async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration): Promise<boolean> {
