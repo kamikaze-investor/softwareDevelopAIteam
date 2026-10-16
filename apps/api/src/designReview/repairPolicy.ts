@@ -344,6 +344,59 @@ export function resolveReviewedImplementationFrom(
 }
 
 /**
+ * **git_commit Job の `resume:` の段を、`review:<id>:git-commit` を持つ元の git_commit まで遡る。**
+ *
+ * **#348 以前の旧形式の入れ子専用。** 当時の PL daily resume は、承認待ちが期限切れになった git_commit を
+ * `resume:<直前の git_commit>:1` として毎回作り直し、段は日数分伸びた（2026-10-15 production 実測:
+ * Task b6d4097a で 6 段）。1 段しか辿らないと、REJECT 後の Human Resume が元の review へ到達できない。
+ * 新方式（`resume:<anchor>:<n>`）は fixed anchor を1回だけ参照するので、この walk を使わない
+ * （呼び出し側が `classifyGitCommitResumeLineage()` の `legacy` のときだけ呼ぶ）。
+ *
+ * `resolveReviewedImplementationFrom()` と同じ規約で辿る:
+ * - **探索しない。** 各段でキーが名指ししている 1 件だけを読む
+ * - 各段は**同じ Task / Project の git_commit Job** でなければならない（review / implement 等を跨がない）
+ * - 循環・同じ Job の再訪・Task の Job 数を超える段数・途中の欠損は不成立（fail-closed）
+ * - 段のキーは `resume:<id>:1` だけを受け付ける（resume が作る形。`ux_jobs_workflow_step_key` により
+ *   1 つの source に対する successor は 1 件しか存在できないので、lineage は分岐しない）
+ *
+ * 返すのは段の端の git_commit Job である。それが `review:<id>:git-commit` を持つかの検証と、
+ * review → implement の区間は呼び出し側（既存の provenance 規則）が行う。
+ */
+export function resolveGitCommitResumeOrigin(
+  jobs: ReviewLineageJobReader,
+  gitCommitJob: Job,
+): { ok: true; origin: Job; hops: number } | { ok: false; reason: string } {
+  if (gitCommitJob.safeCommand.kind !== 'git_commit') {
+    return { ok: false, reason: `job ${gitCommitJob.id} is ${gitCommitJob.safeCommand.kind}, not git_commit` }
+  }
+  const sameOwner = (job: Job): boolean =>
+    job.taskId === gitCommitJob.taskId && job.projectId === gitCommitJob.projectId
+
+  const maxHops = jobs.findByTaskId(gitCommitJob.taskId).length
+  const visited = new Set<string>([gitCommitJob.id])
+  let anchor = gitCommitJob
+  for (;;) {
+    const resumed = /^resume:([^:]+):1$/.exec(anchor.workflowStepKey ?? '')
+    if (!resumed) break
+    const sourceId = resumed[1] as string
+    if (visited.has(sourceId) || visited.size > maxHops) {
+      return { ok: false, reason: `git_commit resume lineage of ${gitCommitJob.id} does not terminate` }
+    }
+    const source = jobs.findById(sourceId)
+    if (!source) return { ok: false, reason: `resume source job ${sourceId} not found` }
+    if (!sameOwner(source)) {
+      return { ok: false, reason: `resume source job ${sourceId} belongs to a different task or project` }
+    }
+    if (source.safeCommand.kind !== 'git_commit') {
+      return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
+    }
+    visited.add(sourceId)
+    anchor = source
+  }
+  return { ok: true, origin: anchor, hops: visited.size - 1 }
+}
+
+/**
  * generation の根がどちら側の事実で決まったか。
  *
  * `origin` は lineage の端（通常の implement 等）。

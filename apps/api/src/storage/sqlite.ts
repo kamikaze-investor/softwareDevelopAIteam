@@ -33,7 +33,12 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
-import { parseResumeSource, resolveReviewedImplementationFrom, retryStepKeyFor } from '../designReview/repairPolicy'
+import {
+  parseResumeSource,
+  resolveGitCommitResumeOrigin,
+  resolveReviewedImplementationFrom,
+  retryStepKeyFor,
+} from '../designReview/repairPolicy'
 import { hasTechnicalAbortMetadata, technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
 import type {
   AbortAuthorization,
@@ -1626,8 +1631,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **既存 `workflowStepKey` だけ**で逆引きする。
    *
    * ```
-   * [任意] resume:<anchorGitCommitJobId>:<positive generation>
+   * [任意] resume:<anchorGitCommitJobId>:<positive generation>   … 新方式（#348）
    *   → canonical git_commit  review:<reviewJobId>:git-commit（exact id を1回だけ参照）
+   * [0..n 段] 旧形式 resume:<sourceJobId>:1   … #348 以前に PL / Human の resume が入れ子にした git_commit
+   *   → canonical git_commit  review:<reviewJobId>:git-commit
    *   → [0..n 段] review resume:<reviewJobId>:1   … Human Resume で再実行された review（D4）
    *   → review      implement:<implementJobId>:review
    *   → implement   (aiCliMode = 'implement')
@@ -1636,13 +1643,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **7条件をすべて満たすときだけ返す。1つでも欠ければ fail-closed**（CEO 判断・2026-09-23）。
    * 同一 diff を再承認へ回さないことのほうが、自動復旧できることより優先される。
    *
-   * **2 つの区間を混ぜない。** git_commit 側は fixed anchor を exact id で1回だけ
-   * 正規化する。そこで得た review Job から implement までの区間だけ、D1 と共用の
+   * **2 つの区間を混ぜない。** git_commit 側は、新方式なら fixed anchor を exact id で1回だけ
+   * 正規化する。旧形式（#348 以前の入れ子）だけは `resolveGitCommitResumeOrigin()` が git_commit の段を
+   * 遡る（2026-09-23 の「最大 1 ホップ」では深い旧形式から REJECT 後に修正へ戻れないため、
+   * CEO 判断・2026-10-15 Option A で旧形式に限り多段にした）。そこで得た review Job から
+   * implement までの区間だけ、D1 と共用の
    * `resolveReviewedImplementationFrom()`（review Job だけを経由する bounded / cycle-safe な walk。
    * CEO 承認・2026-09-28）を使う。下の禁止事項は git_commit 側についてのものである。
    *
    * **やってはいけないこと（意図的に実装していない）**:
-   * - git_commit generation 間の `resume:` traversal（anchor は `review:...:git-commit` しか許さない）
+   * - git_commit generation 間の `resume:` traversal（新方式。anchor は `review:...:git-commit` しか許さない）
+   * - git_commit の段と review の段を 1 つの walk で混ぜること（旧形式の端も `review:...:git-commit` しか許さない）
    * - recursive ancestry resolver
    * - 「最新 implement Job」の推測
    * - 複数候補からの選択
@@ -1727,21 +1738,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       job.taskId === latestJob.taskId && job.projectId === latestJob.projectId
 
     // 2. New-scheme generations receive their validated canonical anchor.
-    //    Legacy rows retain the previous one-hop `resume:<source>:1` normalization.
+    //    Legacy nested rows (written before #348) walk the git_commit `resume:<source>:1`
+    //    hops back to the canonical git_commit (CEO decision 2026-10-15, Option A).
+    //    The walk is bounded / cycle-safe and only crosses same Task / Project git_commit
+    //    Jobs; a missing hop, a cycle or a non-git_commit hop fails closed. A hop that
+    //    lands on a new-scheme generation > 1 stops there and fails the anchor check below.
     let gitCommitJob = lineage.kind === 'new_scheme' ? lineage.lineage.anchorJob : latestJob
     if (lineage.kind === 'legacy') {
-      const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
-      if (resumed) {
-        const source = lineage.referencedJob
-        if (!source) return { ok: false, reason: `resume source job ${resumed[1]} not found` }
-        if (!sameOwner(source)) {
-          return { ok: false, reason: 'resume source job belongs to a different task or project' }
-        }
-        if (source.safeCommand.kind !== 'git_commit') {
-          return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
-        }
-        gitCommitJob = source
-      }
+      const origin = resolveGitCommitResumeOrigin(jobs, latestJob)
+      if (!origin.ok) return { ok: false, reason: origin.reason }
+      gitCommitJob = origin.origin
     }
 
     if (!sameOwner(gitCommitJob)) {
@@ -1749,7 +1755,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     }
 
     // 4. `review:<reviewJobId>:git-commit`。
-    //    Legacy nested resume sources do not match, preserving the old fail-closed result.
+    //    review の段（`resume:<review>:1`）はここでは辿らない。git_commit の段と混ぜない。
     const reviewRef = /^review:([^:]+):git-commit$/.exec(gitCommitJob.workflowStepKey ?? '')
     if (!reviewRef) {
       return {
