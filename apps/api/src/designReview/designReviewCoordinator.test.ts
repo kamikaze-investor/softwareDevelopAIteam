@@ -19,6 +19,8 @@ import {
 } from './designReviewCoordinator'
 import type { CoordinatorDeps } from './designReviewCoordinator'
 import { recoverAndRekickAtStartup } from './queuedRunDispatch'
+import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
+import { selectFocuses, selectRoadmapReviewFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 
 /**
  * Design Review executor の検証。
@@ -984,7 +986,7 @@ describe('critical load: independent 欠落と focused CONFLICT の分離', () =
 
     expect(outcome.reviewLoad).toBe('critical')
     expect(outcome.decision).toBe('CONFLICT')
-    expect(outcome.rejectedReason).toContain('independent review result was missing')
+    expect(outcome.rejectedReason).toContain('critical review load requires an independent review result')
   })
 
   it('independent が unavailable でも focused が CONFLICT なら CONFLICT を返す', () => {
@@ -995,7 +997,7 @@ describe('critical load: independent 欠落と focused CONFLICT の分離', () =
     )
 
     expect(outcome.decision).toBe('CONFLICT')
-    expect(outcome.rejectedReason).toContain('independent review result was unavailable')
+    expect(outcome.rejectedReason).toContain('requires an independent review result, but it was unavailable')
   })
 
   it('independent が unavailable で focused に CONFLICT が無ければ REVIEW_UNAVAILABLE', () => {
@@ -1111,5 +1113,138 @@ describe('runner が申告した REVIEW_UNAVAILABLE は ALIGNED へ格上げし�
     }, 'task', HIGH_FILES)
 
     expect(outcome.decision).toBe('CONFLICT')
+  })
+})
+
+/**
+ * **判定 pipeline の不変条件を全組み合わせで固定する**（独立レビュー round 4・2026-10-16）。
+ *
+ * kind × load × 構造の妥当性 × unavailable の出どころ × CONFLICT の有無。分岐ごとの継ぎ足しでは
+ * 「ある組み合わせだけ CONFLICT が隠れる / unavailable が ALIGNED になる」が漏れ続けたため、
+ * 個別ケースではなく表で確かめる:
+ *   - 有効な CONFLICT があれば必ず CONFLICT
+ *   - unavailable で CONFLICT が無ければ必ず REVIEW_UNAVAILABLE
+ *   - unavailable / 構造不正のときは決して ALIGNED にならない
+ */
+describe('recomputeDecision の判定 pipeline（kind × load × 妥当性 × unavailable × CONFLICT）', () => {
+  const FILES_BY_LOAD = {
+    low: ['docs/readme.md'],
+    medium: ['apps/api/src/pl/executionLoop.ts'],
+    high: ['apps/api/src/auth/credentials.ts'],
+    critical: ['specs/00_constitution.md'],
+  } as const
+  const KINDS = ['task', 'roadmap'] as const
+  const VALIDITY = ['valid', 'invalid'] as const
+  const UNAVAILABLE = ['none', 'finalDecision', 'focus', 'integration', 'independent'] as const
+  const CONFLICT_PRESENCE = [true, false] as const
+
+  type Item = { focus?: string; decision: string; unavailable?: boolean; summary?: string }
+
+  function buildPayload(
+    kind: (typeof KINDS)[number],
+    files: readonly string[],
+    validity: (typeof VALIDITY)[number],
+    unavailable: (typeof UNAVAILABLE)[number],
+    hasConflict: boolean,
+  ): { raw: Record<string, unknown>; applicable: boolean } {
+    const load = classifyReviewLoad({ changedFiles: [...files] }).reviewLoad
+    const expected: string[] = kind === 'roadmap' ? selectRoadmapReviewFocuses() : selectFocuses(load, [...files])
+    const focused: Item[] = expected.map((focus) => ({ focus, decision: 'ALIGNED' }))
+    const integration: Item = { decision: 'ALIGNED', summary: 'ok' }
+    const raw: Record<string, unknown> = { finalDecision: 'ALIGNED' }
+    if (kind === 'task' && load === 'critical') {
+      raw.independentReviewResult = { verdict: 'approved', summary: 'ok', unavailable: false }
+    }
+
+    // CONFLICT は要求した focus があればそこへ、無ければ integration へ置く。
+    if (hasConflict) {
+      if (focused.length > 0) focused[0].decision = 'CONFLICT'
+      else integration.decision = 'CONFLICT'
+    }
+    if (validity === 'invalid') {
+      focused.push({ focus: 'not_a_real_focus', decision: 'UNCERTAIN' })
+    }
+
+    switch (unavailable) {
+      case 'finalDecision':
+        raw.finalDecision = 'REVIEW_UNAVAILABLE'
+        raw.unavailableReason = 'matrix: runner could not run the review'
+        break
+      case 'focus': {
+        const target = focused[focused.length - 1]
+        // 期待 focus が無い妥当な payload には印を付ける場所が無い（組み合わせとして成立しない）。
+        if (target === undefined) return { raw, applicable: false }
+        target.unavailable = true
+        if (target.decision !== 'CONFLICT') target.decision = 'UNCERTAIN'
+        break
+      }
+      case 'integration':
+        integration.unavailable = true
+        if (integration.decision !== 'CONFLICT') integration.decision = 'UNCERTAIN'
+        break
+      case 'independent':
+        raw.independentReviewResult = { verdict: 'blocking', summary: 'Independent review failed', unavailable: true }
+        break
+      case 'none':
+        break
+    }
+
+    raw.focusedReviewResults = focused
+    raw.integrationReviewResult = integration
+    return { raw, applicable: true }
+  }
+
+  const cases: Array<[string, string, string, string, boolean]> = []
+  for (const kind of KINDS) {
+    for (const load of Object.keys(FILES_BY_LOAD)) {
+      for (const validity of VALIDITY) {
+        for (const unavailable of UNAVAILABLE) {
+          for (const hasConflict of CONFLICT_PRESENCE) {
+            cases.push([kind, load, validity, unavailable, hasConflict])
+          }
+        }
+      }
+    }
+  }
+
+  it.each(cases)('%s / %s / %s / unavailable=%s / conflict=%s', (kind, load, validity, unavailable, hasConflict) => {
+    const files = FILES_BY_LOAD[load as keyof typeof FILES_BY_LOAD]
+    const { raw, applicable } = buildPayload(
+      kind as (typeof KINDS)[number],
+      files,
+      validity as (typeof VALIDITY)[number],
+      unavailable as (typeof UNAVAILABLE)[number],
+      hasConflict,
+    )
+    if (!applicable) return
+
+    const outcome = recomputeDecision(raw, kind as 'task' | 'roadmap', [...files])
+
+    if (hasConflict) {
+      expect(outcome.decision).toBe('CONFLICT')
+    } else if (unavailable !== 'none') {
+      expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    } else if (validity === 'invalid') {
+      expect(outcome.decision).toBe('UNCERTAIN')
+    } else {
+      expect(outcome.decision).toBe('ALIGNED')
+    }
+    if (unavailable !== 'none' || validity === 'invalid') {
+      expect(outcome.decision).not.toBe('ALIGNED')
+    }
+  })
+
+  it.each([['null'], ['[]'], ['"text"'], ['42']])('runner 出力 %s は finalizeFailure で終端し、run を running のまま残さない', async (stdout) => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = deps(async () => ({ ok: true, stdout, timedOut: false }))
+
+    const result = await createAndExecuteDesignReview(storage, baseInput(taskId), runner)
+
+    expect(result.status).toBe('requeued')
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+    expect(run.status).toBe('queued')
+    expect(run.error).toContain('no usable output')
+    expect(storage.designReviewEvidence.findByTaskId(taskId)).toEqual([])
   })
 })

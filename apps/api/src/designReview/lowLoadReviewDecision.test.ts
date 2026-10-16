@@ -153,7 +153,7 @@ describe('recomputeDecision: 既存経路の regression', () => {
     expect(outcome.decision).toBe('CONFLICT')
   })
 
-  it('roadmap kind の REVIEW_UNAVAILABLE は本修正の対象外で、挙動が変わらない', () => {
+  it('roadmap kind でも REVIEW_UNAVAILABLE の申告は ALIGNED にも構造不採用の UNCERTAIN にもならない', () => {
     const outcome = recomputeDecision({
       reviewLoad: 'critical',
       selectedFocuses: [],
@@ -162,9 +162,10 @@ describe('recomputeDecision: 既存経路の regression', () => {
       unavailableReason: 'integration unavailable',
     } as never, 'roadmap', [])
 
-    // roadmap は integration review 必須のまま（早期 return で素通りさせない）。
-    expect(outcome.decision).toBe('UNCERTAIN')
-    expect(outcome.rejectedReason ?? '').not.toContain('review unavailable:')
+    // 構造検証（integration 必須・focus 集合）には落ちるが、runner が実行できなかったと申告して
+    // いるので判定無し。roadmap の終端は従来どおり非 ALIGNED（retry は task kind のみ）。
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('integration unavailable')
   })
 })
 
