@@ -46,8 +46,14 @@ import { createHash } from 'node:crypto'
 import type { IStorage } from '../storage/interface'
 import type { DesignReviewRun } from '../storage/interface'
 import type { Job, ReviewResult } from '@ai-team/shared'
-import { escalateTaskToHuman, executeQueuedRepair, prepareRepairFlow } from './repairFlow'
+import {
+  escalateTaskToHuman,
+  executeQueuedRepair,
+  prepareRepairFlow,
+  recordRepairAdmissionSkipped,
+} from './repairFlow'
 import { resolveStoredReviewChain } from './repairRecoveryEpoch'
+import { readApprovalActorClass } from './resumeActor'
 
 /** 承認の有効期限。既存 `APPROVAL_REQUEST_TTL_MINUTES` と同じ考え方で、新しい値を作らない。 */
 const APPROVAL_TTL_MINUTES = 60
@@ -153,6 +159,13 @@ export function repairFromStoredReview(
     review: chain.review,
   })
   if (dryRun.action === 'skip' && dryRun.code !== 'recovery_authority_required') {
+    // 通常の review 経路と同じく、修正要求が repair へ渡らなかったことを audit に残す（L4）。
+    recordRepairAdmissionSkipped(storage, {
+      taskId: task.id,
+      reviewJobId: chain.reviewJob.id,
+      implementJobId: chain.implementJob.id,
+      skip: dryRun,
+    })
     return { status: 'skipped', reason: dryRun.reason }
   }
   if (dryRun.action === 'escalate' && dryRun.code !== 'attempt_limit') {
@@ -223,6 +236,18 @@ export function repairFromStoredReview(
     }
   }
 
+  // 6a. **人が決めた承認であることを、使い切る前に確かめる**（Codex review）。
+  //     epoch は `approval_actor` = human の記録がある承認しか数えない
+  //     （`humanRecoveryAuthorityByImplementation()`）。証明できない承認を consume すると、
+  //     authority にならないまま承認だけが使い切られる。consume せずに返し、承認は残す。
+  if (readApprovalActorClass(storage, approved.id) !== 'human') {
+    return {
+      status: 'rejected',
+      code: 'APPROVAL_ACTOR_NOT_HUMAN',
+      reason: `approval ${approved.id} has no record that a human (ADMIN credential) decided it`,
+    }
+  }
+
   // 6. **最後の authorization step として使い切る。** Task 束縛・action 一致・APPROVED・
   //    未失効を既存実装が再確認し、CAS で一度だけ CONSUMED にする。
   const consumed = storage.approvalRequests.verifyAndConsumeForTaskAction({
@@ -247,7 +272,7 @@ export function repairFromStoredReview(
 function evaluateAndAct(
   storage: IStorage,
   taskId: string,
-  chain: { implementJob: Job, review: ReviewResult },
+  chain: { implementJob: Job, reviewJob: Job, review: ReviewResult },
   deps: RepairFromStoredReviewDeps,
 ): RepairFromStoredReviewOutcome {
   // **保存済み QA 結果も canonical prompt へ載せる。**
@@ -276,6 +301,12 @@ function evaluateAndAct(
     return { status: 'escalated', reason: preparation.reason }
   }
   if (preparation.action === 'skip') {
+    recordRepairAdmissionSkipped(storage, {
+      taskId,
+      reviewJobId: chain.reviewJob.id,
+      implementJobId: chain.implementJob.id,
+      skip: preparation,
+    })
     return { status: 'skipped', reason: preparation.reason }
   }
 

@@ -6,7 +6,7 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { completeRepairHandoff, prepareRepairFlow } from './repairFlow'
 import { repairFromStoredReview } from './repairFromStoredReview'
 import { repairRecoveryActionFor } from './repairRecoveryEpoch'
-import { recordResumeActor } from './resumeActor'
+import { recordApprovalActor, recordResumeActor } from './resumeActor'
 
 /**
  * **最新の初回 implement を、stepKey の形ではなく human authority の意味で認める**（b8d0fc5d）。
@@ -136,6 +136,7 @@ describe('Stored Review Recovery: 最新の初回 implement は consume 済み�
       // 承認が無い間は何も queue しない。
       expect(shape.storage.designReviewRuns.findQueued()).toHaveLength(0)
 
+      recordApprovalActor(shape.storage, first.approvalRequestId, 'admin')
       shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
       const second = recover(shape)
 
@@ -153,6 +154,7 @@ describe('Stored Review Recovery: 最新の初回 implement は consume 済み�
     await terminalRun(shape, 'REVIEW_UNAVAILABLE')
     const first = recover(shape)
     if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
+    recordApprovalActor(shape.storage, first.approvalRequestId, 'admin')
     shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
     expect(shape.storage.approvalRequests.verifyAndConsumeForTaskAction({
       taskId: shape.taskId,
@@ -347,6 +349,210 @@ describe('step 7: 判定を出さずに終わった run は根拠にしない（
     expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id })).toMatchObject({
       action: 'skip',
       runId: active.id,
+    })
+  })
+})
+
+/** recovery 承認を作り、決定と consume まで進める。actor は記録しないこともできる。 */
+function consumedRecoveryApproval(shape: Shape, actor: 'admin' | 'worker' | 'legacy' | 'none'): string {
+  const approval = shape.storage.approvalRequests.create({
+    taskId: shape.taskId,
+    targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
+    riskLevel: 'HIGH',
+    requestedAction: repairRecoveryActionFor(shape.r0.id),
+    status: 'WAITING_FOR_USER',
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    invalidIf: [],
+  } as never)
+  if (actor !== 'none') recordApprovalActor(shape.storage, approval.id, actor)
+  shape.storage.approvalRequests.recordDecision(approval.id, 'APPROVED')
+  expect(shape.storage.approvalRequests.verifyAndConsumeForTaskAction({
+    taskId: shape.taskId,
+    approvalRequestId: approval.id,
+    expectedAction: repairRecoveryActionFor(shape.r0.id),
+  }).ok).toBe(true)
+  return approval.id
+}
+
+describe('consume 済み承認は、人が決めた記録があるときだけ authority になる（Codex review）', () => {
+  it.each([
+    ['記録なし', 'none'],
+    ['WORKER credential（ai）', 'worker'],
+    ['legacy 単一 token（unknown）', 'legacy'],
+  ] as const)('%s の承認は authority にならない（recovery_authority_required、budget reset なし）', async (_label, actor) => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    consumedRecoveryApproval(shape, actor)
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl })).toMatchObject({
+      action: 'skip',
+      code: 'recovery_authority_required',
+    })
+  })
+
+  it('ADMIN credential で決めた承認は authority になる', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const approvalId = consumedRecoveryApproval(shape, 'admin')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl })).toMatchObject({
+      action: 'queue',
+      generation: { rootKind: 'human_recovery', budgetReset: true, authority: { approvalRequestId: approvalId } },
+    })
+  })
+
+  it('人が決めた記録の無い APPROVED は consume せずに rejected を返す（承認を焼かない）', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const first = recover(shape)
+    if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
+    recordApprovalActor(shape.storage, first.approvalRequestId, 'legacy')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+
+    expect(recover(shape)).toMatchObject({ status: 'rejected', code: 'APPROVAL_ACTOR_NOT_HUMAN' })
+    expect(shape.storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('APPROVED')
+    expect(shape.storage.designReviewRuns.findQueued()).toHaveLength(0)
+  })
+})
+
+describe('step 7: 適用される run をすべて見る（新しい ALIGNED が古い CONFLICT を隠さない）', () => {
+  async function taskDesignRun(shape: Shape, kind: 'ALIGNED' | 'CONFLICT'): Promise<string> {
+    const designText = `task design ${Math.random()}`
+    const created = shape.storage.designReviewRuns.create({
+      taskId: shape.taskId, taskTitle: 'VPS docs', designText,
+      designTextHash: computeDesignTextHash(designText), changedFiles: [DOC],
+    })
+    const claimed = shape.storage.designReviewRuns.claim(created.id, 3)
+    shape.storage.designReviewRuns.complete(created.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: kind, summary: kind, findings: [] },
+      finalDecision: kind,
+    }))
+    await tick()
+    return created.id
+  }
+
+  it('この実装の未回答の repair CONFLICT は、より新しい無関係な ALIGNED があっても止める', async () => {
+    const shape = await b8d0fc5dShape()
+    const conflict = await terminalRun(shape, 'CONFLICT')
+    await taskDesignRun(shape, 'ALIGNED')
+    const r1 = await resumedReview(shape, 'pl')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id })).toEqual({
+      action: 'skip',
+      reason: 'task is blocked (latest design review is CONFLICT)',
+      runId: conflict,
+    })
+  })
+
+  it('同じ対象（repairSourceJobId）のより新しい ALIGNED があれば、古い CONFLICT は解消済み', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'CONFLICT')
+    await terminalRun(shape, 'ALIGNED')
+    const r1 = await resumedReview(shape, 'human')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id }).action).toBe('queue')
+  })
+
+  it('Task 設計の CONFLICT は、より新しい Task 設計の ALIGNED（別の design text）で解消済み', async () => {
+    const shape = await b8d0fc5dShape()
+    await taskDesignRun(shape, 'CONFLICT')
+    await taskDesignRun(shape, 'ALIGNED')
+    const r1 = await resumedReview(shape, 'human')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id }).action).toBe('queue')
+  })
+
+  it('Task 設計の CONFLICT は、より新しい repair の ALIGNED では解消されない', async () => {
+    const shape = await b8d0fc5dShape()
+    const conflict = await taskDesignRun(shape, 'CONFLICT')
+    await terminalRun(shape, 'ALIGNED')
+    const r1 = await resumedReview(shape, 'human')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id })).toMatchObject({
+      action: 'skip',
+      runId: conflict,
+    })
+  })
+
+  it('この実装の lineage に無い repair 対象の CONFLICT は適用しない', async () => {
+    const shape = await b8d0fc5dShape()
+    const unrelated = job(shape.storage, shape, { aiCliMode: 'review', workflowStepKey: 'manual-review' }, { status: 'failed' })
+    await terminalRun(shape, 'CONFLICT', unrelated.id)
+    const r1 = await resumedReview(shape, 'human')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id }).action).toBe('queue')
+  })
+})
+
+describe('Stored Review Recovery の skip も repair_admission_skipped を残す', () => {
+  const skips = (shape: Shape) => shape.storage.auditLog.findByEntity('task', shape.taskId)
+    .filter((entry) => entry.operation === 'repair_admission_skipped')
+
+  it('下見の skip（CONFLICT run）', async () => {
+    const shape = await b8d0fc5dShape()
+    const runId = await terminalRun(shape, 'CONFLICT')
+
+    expect(recover(shape).status).toBe('skipped')
+
+    const rows = skips(shape)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.detail).toContain(`review_job_id=${shape.r0.id}`)
+    expect(rows[0]!.detail).toContain(`implementation_job_id=${shape.impl.id}`)
+    expect(rows[0]!.detail).toContain(`design_review_run_id=${runId}`)
+  })
+
+  it('consume 後の評価の skip', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const first = recover(shape)
+    if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
+    recordApprovalActor(shape.storage, first.approvalRequestId, 'admin')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+    // 承認と consume の間に live Job が現れる（step 8 で skip になる）。
+    job(shape.storage, shape, { aiCliMode: 'implement', workflowStepKey: 'manual' }, { status: 'running' })
+
+    expect(recover(shape).status).toBe('skipped')
+
+    const rows = skips(shape)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.detail).toContain('reason_code=not_admitted')
+    expect(rows[0]!.detail).toContain(`implementation_job_id=${shape.impl.id}`)
+  })
+})
+
+describe('step 7: 実装 lineage 上の Human Resume も run への回答になる', () => {
+  async function resumedImplementation(shape: Shape, actor: 'human' | 'ai'): Promise<{ i1: Job; review: Job }> {
+    const i1 = job(shape.storage, shape, { aiCliMode: 'implement', workflowStepKey: `resume:${shape.impl.id}:1` }, { status: 'success', exitCode: 0, changedFiles: [DOC] })
+    recordResumeActor(shape.storage, {
+      jobId: i1.id,
+      taskId: shape.taskId,
+      actorClass: actor,
+      evidence: actor === 'human' ? 'admin_credential' : 'worker_credential',
+    })
+    await tick()
+    const review = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `implement:${i1.id}:review` }, { status: 'failed', exitCode: 0 })
+    verdict(shape.storage, shape.taskId, review.id)
+    await tick()
+    return { i1, review }
+  }
+
+  it('repair CONFLICT の後に人がその実装を Human Resume したなら、その run は答えられている', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'CONFLICT')
+    const { i1, review } = await resumedImplementation(shape, 'human')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: i1, reviewJobId: review.id }).action).toBe('queue')
+  })
+
+  it('AI の resume は答えにならない', async () => {
+    const shape = await b8d0fc5dShape()
+    const conflict = await terminalRun(shape, 'CONFLICT')
+    const { i1, review } = await resumedImplementation(shape, 'ai')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: i1, reviewJobId: review.id })).toMatchObject({
+      action: 'skip',
+      runId: conflict,
     })
   })
 })

@@ -18,6 +18,7 @@ export interface ResumeAdmissionJob {
   status: JobStatus | string
   failureMetadata?: { quarantined?: boolean }
   aiCliMode?: string
+  aiCliProvider?: string
   safeCommand: { kind: string }
 }
 
@@ -43,6 +44,7 @@ export type ResumeAdmissionCode =
   | 'LIVE_JOB_EXISTS'
   | 'APPROVAL_WAITING'
   | 'AI_CLI_MODE_MISSING'
+  | 'AI_CLI_PROVIDER_MISSING'
 
 export type ResumeAdmission = { ok: true } | { ok: false; code: ResumeAdmissionCode }
 
@@ -74,8 +76,11 @@ export function evaluateResumeAdmission(input: ResumeAdmissionInput): ResumeAdmi
   if (input.approvals.some((approval) => isLiveWaitingApproval(approval, input.nowMs))) {
     return { ok: false, code: 'APPROVAL_WAITING' }
   }
-  if (latestJob.safeCommand.kind !== 'git_commit' && !latestJob.aiCliMode) {
-    return { ok: false, code: 'AI_CLI_MODE_MISSING' }
+  // AI CLI Job の resume は provider と mode をそのまま引き継ぐので、どちらかが欠けると作れない。
+  // storage 側に同じ検査を二重に持たない（API と Mobile の判定を一致させる）。
+  if (latestJob.safeCommand.kind !== 'git_commit') {
+    if (!latestJob.aiCliMode) return { ok: false, code: 'AI_CLI_MODE_MISSING' }
+    if (!latestJob.aiCliProvider) return { ok: false, code: 'AI_CLI_PROVIDER_MISSING' }
   }
   return { ok: true }
 }

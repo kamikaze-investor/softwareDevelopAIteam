@@ -2693,7 +2693,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             case 'APPROVAL_WAITING':
               return { ok: false, code: 'APPROVAL_WAITING', reason: 'The latest approval request is waiting for user review' }
             case 'AI_CLI_MODE_MISSING':
-              return { ok: false, code: 'AI_CLI_MODE_MISSING', reason: 'Latest blocked job is missing AI CLI provider or mode' }
+            case 'AI_CLI_PROVIDER_MISSING':
+              return { ok: false, code: admission.code, reason: 'Latest blocked job is missing AI CLI provider or mode' }
           }
         }
         if (!latestJob) {
@@ -2872,8 +2873,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return completeResumeHandoff(job)
         }
 
+        // provider / mode の欠落は上の `evaluateResumeAdmission()` が既に拒否している
+        // （git_commit 以外）。ここは型の絞り込みだけで、到達したら同じ code を返す。
         if (!latestJob.aiCliProvider || !latestJob.aiCliMode) {
-          return { ok: false, reason: 'Latest blocked job is missing AI CLI provider or mode' }
+          return {
+            ok: false,
+            code: latestJob.aiCliMode ? 'AI_CLI_PROVIDER_MISSING' : 'AI_CLI_MODE_MISSING',
+            reason: 'Latest blocked job is missing AI CLI provider or mode',
+          }
         }
 
         const designReviewCheck = checkImplementJobDesignReviewEvidence({

@@ -8,7 +8,7 @@ function input(overrides: Partial<ResumeAdmissionInput> = {}): ResumeAdmissionIn
     taskStatus: 'blocked',
     parked: false,
     projectStatus: 'running',
-    jobs: [{ status: 'blocked', aiCliMode: 'implement', safeCommand: { kind: 'test' } }],
+    jobs: [{ status: 'blocked', aiCliMode: 'implement', aiCliProvider: 'codex', safeCommand: { kind: 'test' } }],
     approvals: [],
     nowMs: NOW,
     ...overrides,
@@ -22,7 +22,7 @@ describe('evaluateResumeAdmission', () => {
 
   it('Task が blocked で最新 Job が failed（escalation）でも受け付ける', () => {
     expect(evaluateResumeAdmission(input({
-      jobs: [{ status: 'failed', aiCliMode: 'review', safeCommand: { kind: 'test' } }],
+      jobs: [{ status: 'failed', aiCliMode: 'review', aiCliProvider: 'codex', safeCommand: { kind: 'test' } }],
     }))).toEqual({ ok: true })
   })
 
@@ -46,12 +46,13 @@ describe('evaluateResumeAdmission', () => {
 
   it.each([
     [{ jobs: [] }, 'NO_JOBS'],
-    [{ jobs: [{ status: 'success', aiCliMode: 'implement', safeCommand: { kind: 'test' } }] }, 'LATEST_JOB_NOT_BLOCKED'],
-    [{ taskStatus: 'pending', jobs: [{ status: 'failed', aiCliMode: 'implement', safeCommand: { kind: 'test' } }] }, 'LATEST_JOB_NOT_BLOCKED'],
+    [{ jobs: [{ status: 'success', aiCliMode: 'implement', aiCliProvider: 'codex', safeCommand: { kind: 'test' } }] }, 'LATEST_JOB_NOT_BLOCKED'],
+    [{ taskStatus: 'pending', jobs: [{ status: 'failed', aiCliMode: 'implement', aiCliProvider: 'codex', safeCommand: { kind: 'test' } }] }, 'LATEST_JOB_NOT_BLOCKED'],
     [{ parked: true }, 'TASK_PARKED'],
-    [{ jobs: [{ status: 'blocked', aiCliMode: 'implement', safeCommand: { kind: 'test' }, failureMetadata: { quarantined: true } }] }, 'WORKSPACE_QUARANTINED'],
-    [{ jobs: [{ status: 'blocked', aiCliMode: 'implement', safeCommand: { kind: 'test' } }, { status: 'queued', safeCommand: { kind: 'test' } }] }, 'LIVE_JOB_EXISTS'],
+    [{ jobs: [{ status: 'blocked', aiCliMode: 'implement', aiCliProvider: 'codex', safeCommand: { kind: 'test' }, failureMetadata: { quarantined: true } }] }, 'WORKSPACE_QUARANTINED'],
+    [{ jobs: [{ status: 'blocked', aiCliMode: 'implement', aiCliProvider: 'codex', safeCommand: { kind: 'test' } }, { status: 'queued', safeCommand: { kind: 'test' } }] }, 'LIVE_JOB_EXISTS'],
     [{ jobs: [{ status: 'blocked', safeCommand: { kind: 'test' } }] }, 'AI_CLI_MODE_MISSING'],
+    [{ jobs: [{ status: 'blocked', aiCliMode: 'implement', safeCommand: { kind: 'test' } }] }, 'AI_CLI_PROVIDER_MISSING'],
   ] as const)('%o → %s', (overrides, code) => {
     expect(evaluateResumeAdmission(input(overrides as Partial<ResumeAdmissionInput>))).toEqual({ ok: false, code })
   })

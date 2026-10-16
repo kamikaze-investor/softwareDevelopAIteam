@@ -43,6 +43,7 @@
 
 import type { IStorage } from '../storage/interface'
 import type { Job, ReviewResult } from '@ai-team/shared'
+import { readApprovalActorClass } from './resumeActor'
 
 /** `requestedAction` の接頭辞。**新しい承認種別ではなく、既存の自由文字列欄の値**である。 */
 export const REPAIR_RECOVERY_ACTION_PREFIX = 'repair_from_stored_review:'
@@ -131,7 +132,9 @@ export function resolveStoredReviewChain(
 /**
  * この Task で **epoch が成立している実装 Job の id**。
  *
- * 成立の条件は「その review Job を名指しした ApprovalRequest が `CONSUMED` であること」。
+ * 成立の条件は「その review Job を名指しした ApprovalRequest が `CONSUMED` であり、かつ
+ * **その承認を human が決定したという記録（`approval_actor` = human）があること**」。
+ * `CONSUMED` だけでは legacy 単一 token の主体が書いた承認と区別できない（Codex review）。
  * `APPROVED` のままは数えない —— 承認されただけで使われていない approval は、
  * まだ epoch を開始していないからである（consume が epoch 開始の一点になる）。
  */
@@ -159,6 +162,8 @@ export function humanRecoveryAuthorityByImplementation(
     if (request.status !== 'CONSUMED') continue
     const reviewJobId = parseRepairRecoveryAction(request.requestedAction)
     if (reviewJobId === undefined) continue
+    // 人が決めたと証明できない承認は authority ではない（Human Resume と同じ規則）。
+    if (readApprovalActorClass(storage, request.id) !== 'human') continue
 
     // 承認行の文字列を信じず、**Job 側から関連を引き直す**。
     const chain = resolveStoredReviewChain(storage, taskId, reviewJobId)

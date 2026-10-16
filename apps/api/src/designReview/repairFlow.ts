@@ -737,6 +737,82 @@ function isTerminalRunWithoutJudgment(run: DesignReviewRun): boolean {
 }
 
 /**
+ * **admission step 7 を止める Design Review run**（無ければ undefined）。runs は新しい順。
+ *
+ * 1 件ずつ、次の順に見る:
+ *   1. D3 で答えられた run（引き金の review lineage 上の、run 完了後の Human Resume）→ 外す
+ *   2. queued / running → 従来どおり止める（結果がまだ無い）
+ *   3. 判定を出さずに終わった run（RC3）→ 外す
+ *   4. **適用されない run → 外す**: repair run のうち、`repairSourceJobId` がこの実装の lineage
+ *      （実装自身と、walk が辿った ancestor）に無いもの。別の作業の repair 計画への判定で、
+ *      この実装はそこから派生していない。これを数えると、過去の無関係な CONFLICT が Task を
+ *      恒久的に止める
+ *   5. **解消済みの run → 外す**: 同じ対象に対する、より新しい ALIGNED がある。対象は repair run なら
+ *      同じ `repairSourceJobId`、Task 設計の run（`repairSourceJobId` 無し）なら Task 設計全体。
+ *      Task 設計を design_text_hash で分けないのは、CONFLICT 後の Human Resume は**修正した指示**
+ *      （= 別 hash）の Design Review を通るのが正規の復旧経路だからで（tasks.test の
+ *      「Design Review CONFLICT stop → Mobile resume → ALIGNED」）、hash で分けるとその経路の後も
+ *      古い CONFLICT が永久に残る
+ *   6. **lineage 上の Human Resume で答えられた run → 外す**: 実装の lineage にある human の resume Job
+ *      が run の完了より後に作られ、かつ run の対象より実装側にある（人がその判定を見てから
+ *      「ここから続ける」と答えた）。Task 設計の run は lineage 全体が対象
+ *   7. 残った run は再計算した判定で決める。ALIGNED なら次の run へ、それ以外（再計算できない
+ *      壊れた結果を含む）は止める
+ */
+function blockingDesignReviewRun(
+  runs: readonly DesignReviewRun[],
+  context: {
+    implementJobId: string
+    reviewHumanResumes: readonly Job[]
+    /** 実装自身から近い順の lineage（`[実装, ...ancestors]`）。 */
+    lineageJobIds: readonly string[]
+    lineageHumanResumes: readonly Job[]
+  },
+): { reason: string; runId: string } | undefined {
+  const sameSubject = (a: DesignReviewRun, b: DesignReviewRun): boolean =>
+    a.repairSourceJobId === b.repairSourceJobId
+  const createdAfterCompletion = (run: DesignReviewRun, job: Job): boolean => {
+    const completedAt = run.completedAt === undefined ? Number.NaN : Date.parse(run.completedAt)
+    const createdAt = Date.parse(job.createdAt)
+    return Number.isFinite(completedAt) && Number.isFinite(createdAt) && createdAt > completedAt
+  }
+
+  for (const [index, run] of runs.entries()) {
+    if (answeredByHumanResume(run, context.implementJobId, context.reviewHumanResumes)) continue
+    if (run.status === 'queued' || run.status === 'running') {
+      return { reason: 'latest design review decision could not be recomputed', runId: run.id }
+    }
+    if (isTerminalRunWithoutJudgment(run)) continue
+
+    // 対象が lineage のどこにあるか。Task 設計の run は lineage 全体（末端の外側）を対象にする。
+    const subjectIndex = run.repairSourceJobId === undefined
+      ? context.lineageJobIds.length
+      : context.lineageJobIds.indexOf(run.repairSourceJobId)
+    if (subjectIndex < 0) continue
+
+    const recomputed = safeRecomputedDecision(run)
+    if (recomputed === 'ALIGNED') continue
+
+    const resolvedLater = runs.slice(0, index).some((newer) =>
+      sameSubject(newer, run)
+      && newer.status === 'succeeded'
+      && safeRecomputedDecision(newer) === 'ALIGNED')
+    if (resolvedLater) continue
+
+    const answerableHops = new Set(context.lineageJobIds.slice(0, subjectIndex))
+    const answeredInLineage = context.lineageHumanResumes.some((job) =>
+      answerableHops.has(job.id) && createdAfterCompletion(run, job))
+    if (answeredInLineage) continue
+
+    if (recomputed === undefined) {
+      return { reason: 'latest design review decision could not be recomputed', runId: run.id }
+    }
+    return { reason: `latest design review is ${recomputed}`, runId: run.id }
+  }
+  return undefined
+}
+
+/**
  * `blocked` の例外を認めるかどうかの判定結果。理由は skip reason にそのまま載る。
  *
  * 認めるときは **照合に使った保存済みレコードそのもの**を返す。呼び出し元は repair を
@@ -887,12 +963,13 @@ function repairableBlockedReviewRequest(
   }
 
   //    lineage が辿れない実装は、段数も根も確定できない。**推測せず落とす。**
+  const resumeActorClasses = readResumeActorClasses(storage, taskJobs)
   const lineage = walkRepairGeneration(
     implementJob.id,
     toPriorRepairJobs(
       taskJobs,
       storage.reviewResults.findByTaskId(task.id),
-      readResumeActorClasses(storage, taskJobs),
+      resumeActorClasses,
       implementationAuthorities,
     ),
   )
@@ -988,26 +1065,24 @@ function repairableBlockedReviewRequest(
   //    新しい repair を止め続けていた（run `d0af140a`）。**verdict で特例にはしない。** 外すのは
   //    `answeredByHumanResume()` の条件をすべて満たす run だけで、残りのうち最も新しい run に
   //    従来の規則をそのまま当てる。Task 設計由来の run（`repairSourceJobId` 無し）は外さない。
-  const humanResumeAnswers = humanResumesOf(storage, reviewResumeHops)
   //    CONFLICT / UNCERTAIN は、後から Human Resume で答えられない限り根拠のまま残る。
   //    Stored Review Recovery の承認は Design Review run への回答ではない（verdict の再駆動の承認）。
-  const authorityRun = storage.designReviewRuns.findByTaskId(task.id)
-    .find((run) =>
-      !answeredByHumanResume(run, implementJob.id, humanResumeAnswers)
-      && !isTerminalRunWithoutJudgment(run))
-  if (authorityRun !== undefined) {
-    const recomputed = safeRecomputedDecision(authorityRun)
-    if (recomputed === undefined) {
-      return {
-        ok: false,
-        reason: 'latest design review decision could not be recomputed',
-        runId: authorityRun.id,
-      }
-    }
-    if (recomputed !== 'ALIGNED') {
-      return { ok: false, reason: `latest design review is ${recomputed}`, runId: authorityRun.id }
-    }
-  }
+  //
+  //    **最新の 1 件だけでなく、適用される run をすべて見る**（Codex review）。以前は最初の
+  //    非除外 run だけを見ていたため、新しい無関係な ALIGNED（別の repair や Task 設計の run）が
+  //    古い未回答の CONFLICT を隠していた。規則は `blockingDesignReviewRun()` に 1 か所でまとめてある。
+  const lineageJobIds = [implementJob.id, ...lineage.lineageAncestorJobIds]
+  const blockingRun = blockingDesignReviewRun(
+    storage.designReviewRuns.findByTaskId(task.id),
+    {
+      implementJobId: implementJob.id,
+      reviewHumanResumes: humanResumesOf(storage, reviewResumeHops),
+      lineageJobIds,
+      lineageHumanResumes: taskJobs.filter((job) =>
+        lineageJobIds.includes(job.id) && resumeActorClasses.get(job.id) === 'human'),
+    },
+  )
+  if (blockingRun !== undefined) return { ok: false, ...blockingRun }
 
   // 8. **競合する live Job が無い**こと。動いている Job の上へ repair を積まない。
   //
