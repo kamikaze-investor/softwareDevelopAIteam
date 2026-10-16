@@ -2821,7 +2821,7 @@ describe('Job API', () => {
         changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
         status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
       } as never)
-      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
       storage.jobs.update(source.id, { status: 'failed' } as never)
       const { abortTask } = await import('../pl/abortTask.js')
       expect(abortTask(storage, {
@@ -2865,7 +2865,7 @@ describe('Job API', () => {
         changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
         status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
       } as never)
-      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
       const { abortTask } = await import('../pl/abortTask.js')
       expect(abortTask(storage, {
         taskId: task.id, approvalRequestId: request.id, reason: 'parked',

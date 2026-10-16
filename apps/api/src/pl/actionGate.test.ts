@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
+import { recordApprovalActor } from '../designReview/resumeActor'
 import {
   authorizePlAction,
   previewPlActionPolicy,
@@ -79,7 +80,7 @@ function addDesignReviewEvidence(
 }
 
 function addApprovalRequest(storage: IStorage, taskId: string, over: Record<string, unknown> = {}): string {
-  return storage.approvalRequests.create({
+  const id = storage.approvalRequests.create({
     taskId,
     requestedAction: 'git_commit',
     riskLevel: 'LOW',
@@ -92,6 +93,9 @@ function addApprovalRequest(storage: IStorage, taskId: string, over: Record<stri
     expiresAt: FUTURE,
     ...over,
   } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+  // 人（ADMIN）が決めた承認として作る（approval_gate は approval_actor = human を要求する）。
+  recordApprovalActor(storage, id, 'admin')
+  return id
 }
 
 function addCeoApproval(

@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK,
+  formatApprovalDecisionErrorMessage,
   formatRecoverErrorMessage,
   formatResumeErrorMessage,
   RECOVER_ERROR_MESSAGE_FALLBACK,
@@ -73,5 +75,16 @@ describe('formatRecoverErrorMessage', () => {
   it('code が無い・未知なら fallback', () => {
     expect(formatRecoverErrorMessage(null)).toBe(RECOVER_ERROR_MESSAGE_FALLBACK)
     expect(formatRecoverErrorMessage('RECOVERY_FAILED')).toBe(RECOVER_ERROR_MESSAGE_FALLBACK)
+  })
+})
+
+describe('formatApprovalDecisionErrorMessage', () => {
+  it('human-only の 403 code は CEO 専用である旨を出す（C-02）', () => {
+    expect(formatApprovalDecisionErrorMessage('HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS')).toContain('CEO専用')
+  })
+
+  it('code が無い・未知なら fallback', () => {
+    expect(formatApprovalDecisionErrorMessage(null)).toBe(APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK)
+    expect(formatApprovalDecisionErrorMessage('SOMETHING')).toBe(APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK)
   })
 })

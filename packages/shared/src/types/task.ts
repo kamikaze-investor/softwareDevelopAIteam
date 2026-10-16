@@ -2,7 +2,8 @@
 
 import type { AgentRole } from './agent'
 import type { AiCliProvider } from './ai_cli'
-import type { ApprovalGateStatus } from './approval_gate'
+import type { ApprovalGateStatus, ApprovalRequest } from './approval_gate'
+import { isLiveWaitingApproval } from '../approvalLiveness'
 import type { JobStatus } from './job'
 import type { ProjectStatus } from './project'
 import type { RiskLevel } from './safety_guard'
@@ -127,15 +128,21 @@ export interface TaskSummary {
 export interface TaskDisplayStatusInput {
   taskStatus: TaskStatus
   latestJobStatus?: JobStatus
-  /** Approval referenced by the latest Job's approvalId, if that link resolves. */
-  linkedApprovalStatus?: ApprovalGateStatus
+  /**
+   * Approval referenced by the latest Job's approvalId, if that link resolves.
+   * status だけでなく期限も渡す: 期限切れ WAITING は誰も待っていない（`isLiveWaitingApproval`）。
+   * status だけで「承認待ち」と出すと、API が Resume を許す Task を画面が承認待ちと表示する（監査 A-02）。
+   */
+  linkedApproval?: Pick<ApprovalRequest, 'status' | 'expiresAt'>
+  /** 期限判定の基準時刻（既定は現在時刻）。 */
+  nowMs?: number
 }
 
 export function computeTaskDisplayStatus(input: TaskDisplayStatusInput): TaskDisplayStatus {
-  if (input.latestJobStatus === 'blocked' && input.linkedApprovalStatus === 'WAITING_FOR_USER') {
+  if (input.latestJobStatus === 'blocked' && isLiveWaitingApproval(input.linkedApproval, input.nowMs)) {
     return 'waiting_approval'
   }
-  if (input.latestJobStatus === 'blocked' && input.linkedApprovalStatus === 'REJECTED') {
+  if (input.latestJobStatus === 'blocked' && input.linkedApproval?.status === 'REJECTED') {
     return 'rejected_waiting_instruction'
   }
   if (input.latestJobStatus === 'blocked') return 'blocked'

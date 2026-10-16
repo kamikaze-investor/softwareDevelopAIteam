@@ -1,7 +1,7 @@
 import type { ApprovalRequest } from './types/approval_gate'
 import type { ProjectStatus } from './types/project'
 import type { TaskStatus } from './types/task'
-import { isLiveWaitingApproval } from './approvalLiveness'
+import { isLiveWaitingApproval, isTaskScopedApprovalAction } from './approvalLiveness'
 
 /**
  * **Human Recovery（`POST /api/tasks/:id/recover`）を受け付けてよいかの前提条件**（純関数・唯一の定義）。
@@ -18,8 +18,12 @@ export interface RecoverAdmissionInput {
   projectStatus: ProjectStatus | string | null | undefined
   /** Task の Job 件数。Job がある Task は `/resume` の担当。 */
   jobCount: number
-  /** Task の ApprovalRequest（順不同）。live な承認待ちが 1 件でもあれば断る。 */
-  approvals: readonly Pick<ApprovalRequest, 'status' | 'expiresAt'>[]
+  /**
+   * Task の ApprovalRequest（順不同）。Job 束縛（command kind）の live な承認待ちが 1 件でもあれば断る。
+   * Task 単位の判断（`isTaskScopedApprovalAction`）の待ちは断らない: recover は human-only route で
+   * それ自体が新しい人の判断なので、storage が同じ transaction でそれらを SUPERSEDED にする。
+   */
+  approvals: readonly (Pick<ApprovalRequest, 'status' | 'expiresAt'> & { requestedAction?: string })[]
   nowMs: number
 }
 
@@ -47,7 +51,8 @@ export function evaluateRecoverAdmission(input: RecoverAdmissionInput): RecoverA
   // live な WAITING が 1 行でもあれば断る。APPROVED では断らない。**期限切れの WAITING でも
   // 断らない** —— 行を EXPIRED へ進める actor が居ないので、断ると Task がどこからも
   // 復旧できなくなる（2026-09-12 Production）。expiry 解釈は `isLiveWaitingApproval()` だけ。
-  if (input.approvals.some((approval) => isLiveWaitingApproval(approval, input.nowMs))) {
+  if (input.approvals.some((approval) =>
+    !isTaskScopedApprovalAction(approval.requestedAction) && isLiveWaitingApproval(approval, input.nowMs))) {
     return { ok: false, code: 'APPROVAL_WAITING' }
   }
   return { ok: true }

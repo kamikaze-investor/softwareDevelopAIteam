@@ -2288,7 +2288,7 @@ async function seedIdentityRequest(
     invalidIf: [],
   })
   if (status !== 'WAITING_FOR_USER') {
-    storage.approvalRequests.recordDecision(created.id, status, 'seeded')
+    storage.approvalRequests.recordDecision(created.id, status, 'seeded', { credentialClass: 'admin' })
   }
   // created_at の順序を確定させる（findByTaskId は新しい順）
   await new Promise((resolve) => setTimeout(resolve, 5))
@@ -2819,7 +2819,7 @@ describe('POST /api/gate/check — safe work の生き残り選択は 1 つの�
         expiresAt: new Date(Date.now() + (row.expired ? -5_000 : 60 * 60 * 1000)).toISOString(),
         invalidIf: [],
       })
-      if (row.status === 'APPROVED') storage.approvalRequests.recordDecision(request.id, 'APPROVED', 'seeded')
+      if (row.status === 'APPROVED') storage.approvalRequests.recordDecision(request.id, 'APPROVED', 'seeded', { credentialClass: 'admin' })
       created.push(request)
       await new Promise((resolve) => setTimeout(resolve, 5))
     }

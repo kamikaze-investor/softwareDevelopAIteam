@@ -155,7 +155,7 @@ describe('POST /api/gate/check — git_commit Safety Evidence（Stage 1）', () 
         targetDiffHash: 'an-earlier-diff', riskLevel: 'LOW', requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
         expiresAt: new Date(Date.now() + 60_000).toISOString(), invalidIf: [],
       } as Parameters<IStorage['approvalRequests']['create']>[0])
-      storage.approvalRequests.recordDecision(earlier.id, 'REJECTED', 'earlier diff')
+      storage.approvalRequests.recordDecision(earlier.id, 'REJECTED', 'earlier diff', { credentialClass: 'admin' })
 
       const body = await gateCheck(app, chain)
       expect(body.outcome.decision).toBe('ALLOW')
@@ -177,7 +177,7 @@ describe('POST /api/gate/check — git_commit Safety Evidence（Stage 1）', () 
         targetDiffHash: chain.targetDiffHash, riskLevel: 'LOW', requestedAction: 'git_commit', status: 'WAITING_FOR_USER',
         expiresAt: new Date(Date.now() + 60_000).toISOString(), invalidIf: [],
       } as Parameters<IStorage['approvalRequests']['create']>[0])
-      storage.approvalRequests.recordDecision(same.id, 'REJECTED', 'same diff')
+      storage.approvalRequests.recordDecision(same.id, 'REJECTED', 'same diff', { credentialClass: 'admin' })
 
       const body = await gateCheck(app, chain)
       expect(body.outcome.decision).toBe('REJECTED')

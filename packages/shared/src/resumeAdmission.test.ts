@@ -63,3 +63,34 @@ describe('evaluateResumeAdmission', () => {
     }))).toEqual({ ok: true })
   })
 })
+
+// Codex review 361c19a（C-03）: Task 単位の判断（command kind でない requestedAction）は、人の resume なら
+// 置き換え対象として通し、人でない resume なら HUMAN_DECISION_PENDING。Job 束縛の承認待ちは従来どおり。
+describe('evaluateResumeAdmission — Task 単位の判断', () => {
+  const live = (requestedAction: string, status: 'WAITING_FOR_USER' | 'APPROVED' = 'WAITING_FOR_USER') => ({
+    status, requestedAction, expiresAt: new Date(NOW + 60_000).toISOString(),
+  })
+
+  it('人の resume は live WAITING / APPROVED の Task 単位判断があっても受け付ける', () => {
+    expect(evaluateResumeAdmission(input({ resumedByHuman: true, approvals: [live('abort_task')] }))).toEqual({ ok: true })
+    expect(evaluateResumeAdmission(input({ resumedByHuman: true, approvals: [live('abort_task', 'APPROVED')] })))
+      .toEqual({ ok: true })
+  })
+
+  it('人でない resume は live WAITING / APPROVED の Task 単位判断があると HUMAN_DECISION_PENDING', () => {
+    expect(evaluateResumeAdmission(input({ approvals: [live('reconcile_external_completion')] })))
+      .toEqual({ ok: false, code: 'HUMAN_DECISION_PENDING' })
+    expect(evaluateResumeAdmission(input({ approvals: [live('repair_from_stored_review:r1', 'APPROVED')] })))
+      .toEqual({ ok: false, code: 'HUMAN_DECISION_PENDING' })
+  })
+
+  it('期限切れの Task 単位判断は誰も止めない', () => {
+    const expired = { status: 'APPROVED' as const, requestedAction: 'abort_task', expiresAt: new Date(NOW - 60_000).toISOString() }
+    expect(evaluateResumeAdmission(input({ approvals: [expired] }))).toEqual({ ok: true })
+  })
+
+  it('live WAITING の command kind 承認は人の resume でも APPROVAL_WAITING', () => {
+    expect(evaluateResumeAdmission(input({ resumedByHuman: true, approvals: [live('git_commit')] })))
+      .toEqual({ ok: false, code: 'APPROVAL_WAITING' })
+  })
+})

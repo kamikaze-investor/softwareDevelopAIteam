@@ -33,7 +33,7 @@ import {
   type TaskFailureJob,
 } from '../taskFailureExplain/taskFailureAi'
 import type { CoordinatorDeps } from '../designReview/designReviewCoordinator'
-import { classifyResumeActorFromRequest, recordResumeActor } from '../designReview/resumeActor'
+import { classifyResumeActorFromRequest } from '../designReview/resumeActor'
 import {
   RESUME_DESIGN_REVIEW_FAILED,
   RESUME_DESIGN_REVIEW_PENDING,
@@ -574,9 +574,17 @@ export async function taskRoutes(
     }
 
     const instructionPrompt = buildResumeAiCliPrompt(task, result.data.instruction)
+    // **誰が再開したかを、この request の credential だけから決める。**
+    //
+    // body は見ない。`{"human": true}` や `{"resetRepairBudget": true}` を送られても
+    // `ResumeTaskBody` が落とすうえ、ここは request の認証結果しか読まない。
+    // repair budget の generation 境界はこの記録だけを根拠にする（`../designReview/resumeActor`）。
+    // 記録は storage が resume Job の作成と同じ transaction で書く（G-01）。
+    const actor = classifyResumeActorFromRequest(req)
     const resumed = await resumeBlockedTaskWithDesignReview(storage, {
       task,
       instructionPrompt,
+      resumedBy: { actorClass: actor.actorClass, evidence: actor.evidence },
       ...(options.resumeDesignReviewDeps !== undefined
         ? { coordinatorDeps: options.resumeDesignReviewDeps }
         : {}),
@@ -585,6 +593,11 @@ export async function taskRoutes(
     // 判定がまだ出ていないだけ。否定ではないので 409 にせず、同じ instruction の再送で
     // 同じ queued run が再開されることを示す（503 + retryable）。
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
+      return reply.status(503).send({ error: resumed.reason, code: resumed.code, retryable: true })
+    }
+
+    // authority evidence が書けず resume ごと rollback された（何も変わっていない）。再送してよい。
+    if (!resumed.ok && resumed.code === 'RESUME_COMMIT_FAILED') {
       return reply.status(503).send({ error: resumed.reason, code: resumed.code, retryable: true })
     }
 
@@ -604,6 +617,7 @@ export async function taskRoutes(
         resumed.code === 'WORKSPACE_QUARANTINED'
         || resumed.code === 'TASK_DONE'
         || resumed.code === 'PROJECT_NOT_RUNNING'
+        || resumed.code === 'HUMAN_DECISION_PENDING'
       ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
@@ -622,19 +636,6 @@ export async function taskRoutes(
         ...(resumed.code === undefined ? {} : { code: resumed.code }),
       })
     }
-
-    // **誰が再開したかを、この request の credential だけから決めて残す。**
-    //
-    // body は見ない。`{"human": true}` や `{"resetRepairBudget": true}` を送られても
-    // `ResumeTaskBody` が落とすうえ、ここは request の認証結果しか読まない。
-    // repair budget の generation 境界はこの記録だけを根拠にする（`../designReview/resumeActor`）。
-    const actor = classifyResumeActorFromRequest(req)
-    recordResumeActor(storage, {
-      jobId: resumed.job.id,
-      taskId: task.id,
-      actorClass: actor.actorClass,
-      evidence: actor.evidence,
-    })
 
     return reply.status(201).send(resumed.job)
   })

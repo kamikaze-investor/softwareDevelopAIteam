@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { occupiesProject, type JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
+import { recordApprovalActor } from '../designReview/resumeActor'
 import { buildSystemState } from '../state/systemState'
 import { recoverBlockedTask } from '../humanRecovery/recoverBlockedTask'
 import { abortTask, completeAbortCleanup, requestTechnicalAbort } from './abortTask'
@@ -255,7 +256,7 @@ function approve(storage: IStorage, taskId: string, action = 'abort_task'): stri
     changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
     status: 'WAITING_FOR_USER', expiresAt: FUTURE,
   } as Parameters<IStorage['approvalRequests']['create']>[0])
-  storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+  storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
   return request.id
 }
 
@@ -277,6 +278,8 @@ function approvedRequest(
     status: 'APPROVED',
     expiresAt: options.expiresAt ?? FUTURE,
   } as Parameters<IStorage['approvalRequests']['create']>[0])
+  // 人（ADMIN）が決めた承認として作る（Task 単位の承認は approval_actor = human で初めて authority）。
+  recordApprovalActor(storage, request.id, 'admin')
   return request.id
 }
 
@@ -1450,7 +1453,7 @@ describe('P2-2 Automatic Technical Abort', () => {
     expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
 
     // 人が承認し、stored-review recovery が消費して repair 用 Design Review が queued になった。
-    fx.storage.approvalRequests.updateStatus(late, 'APPROVED')
+    fx.storage.approvalRequests.recordDecision(late, 'APPROVED', undefined, { credentialClass: 'admin' })
     fx.storage.approvalRequests.updateStatus(late, 'CONSUMED', undefined, true)
     fx.storage.designReviewRuns.create({
       taskId: fx.taskId, taskTitle: 'repair', designText: 'd', designTextHash: 'h', changedFiles: [],
@@ -1612,12 +1615,25 @@ describe('P2-2 Automatic Technical Abort', () => {
     expectNotParkedNorQuarantined(fx)
   })
 
-  it('an expired APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
+  // 2026-10-16 監査 B-2: 期限切れ未消費の APPROVED は consume できない（gate と同じ遅延判定）ので、
+  // もう誰の authority でもない。以前はこれも「人の判断」として数え、Technical Abort を恒久拒否していた。
+  it('an expired APPROVED approval does not block Technical Abort, and the park stales it (B-2)', () => {
     const fx = seedTechnicalAbort()
-    approvedRequest(fx.storage, fx.taskId, {
+    const expiredApprovedId = approvedRequest(fx.storage, fx.taskId, {
       action: 'git_commit',
       expiresAt: new Date(Date.now() - 60_000).toISOString(),
     })
+
+    requestTechnical(fx)
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+    expect(fx.storage.approvalRequests.findById(expiredApprovedId)?.status).toBe('STALE')
+  })
+
+  it('a live APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
+    const fx = seedTechnicalAbort()
+    approvedRequest(fx.storage, fx.taskId, { action: 'git_commit' })
     const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
     if (attention === undefined) throw new Error('attention missing')
 
@@ -1628,6 +1644,18 @@ describe('P2-2 Automatic Technical Abort', () => {
     })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
     expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
       .toBeUndefined()
+  })
+
+  it('an expired APPROVED approval appearing after the precheck does not refuse the final park transaction (B-2)', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const lateExpiredId = approvedRequest(fx.storage, fx.taskId, {
+      action: 'git_commit',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    })
+
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+    expect(fx.storage.approvalRequests.findById(lateExpiredId)?.status).toBe('STALE')
   })
 
   it('an APPROVED approval hidden behind a newer expired WAITING still blocks Technical Abort', () => {
@@ -1960,7 +1988,7 @@ describe('P2-2 Automatic Technical Abort', () => {
       taskId: fx.taskId, approvalRequestId: waiting.id, reason: 'manual',
     })).toMatchObject({ ok: false, code: 'NOT_AUTHORIZED' })
 
-    fx.storage.approvalRequests.updateStatus(waiting.id, 'APPROVED')
+    fx.storage.approvalRequests.recordDecision(waiting.id, 'APPROVED', undefined, { credentialClass: 'admin' })
     expect(abortTask(fx.storage, {
       taskId: fx.taskId, approvalRequestId: waiting.id, reason: 'manual',
     })).toMatchObject({ ok: true, status: 'cleanup_requested' })
@@ -2308,9 +2336,12 @@ describe('abortTask — terminal blocked Task の storage release', () => {
         jobIds: [fx.jobId],
       })
 
+      // 生きた APPROVED abort_task がある間、人でない resume は HUMAN_DECISION_PENDING で断られる
+      // （C-03）。後続 Job を作れるのは Human Resume だけで、それは abort 承認を SUPERSEDED にする。
       const resumed = fx.storage.jobs.resumeBlockedTask({
         taskId: fx.taskId,
         instructionPrompt: 'resume after cleanup observation was refused',
+        resumedBy: { actorClass: 'human', evidence: 'admin_credential' },
       })
       if (!resumed.ok) throw new Error(resumed.reason)
       expect(resumed.ok).toBe(true)
@@ -2325,7 +2356,11 @@ describe('abortTask — terminal blocked Task の storage release', () => {
       expect(result).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
       if (result.ok) throw new Error('expected stale cleanup refusal')
       expect(result.reason).toContain(`is not task ${fx.taskId}'s latest job (${resumed.job.id})`)
-      expectStillBlocked({ ...fx, latestJobId: resumed.job.id }, approvalRequestId)
+      expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+      // consume されず、Human Resume によって置き換えられている。
+      expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('SUPERSEDED')
+      expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+        .filter((entry) => entry.operation === 'task_aborted')).toHaveLength(0)
     },
   )
 
@@ -2761,7 +2796,7 @@ describe('abortTask — directly linked rejected git_commit observation-only rel
   it('refuses when the linked git_commit approval is no longer REJECTED during observation', () => {
     const fx = seedRejectedGitCommit()
     const abortApprovalId = requestRejectedGitCommitAbort(fx)
-    fx.storage.approvalRequests.updateStatus(fx.rejectedApprovalId, 'APPROVED')
+    fx.storage.approvalRequests.recordDecision(fx.rejectedApprovalId, 'APPROVED', undefined, { credentialClass: 'admin' })
 
     expect(completeAbortCleanup(fx.storage, {
       jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,
