@@ -1203,7 +1203,8 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       }
       return reply.status(updated.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: updated.reason })
     }
-    // claim（queued -> running）が storage で拒否された（quarantine / Project が running でない）。
+    // claim（queued -> running）が storage で拒否された（quarantine / Project が running でない /
+    // 別 Task が live な所有者）。
     // 以前は 200 + queued の Job を返しており、Worker はそれを claim 成功と区別できなかった。
     // 非 2xx にして Worker に実行させない（lifecycle repair W5）。Job は queued のまま残る。
     if (
@@ -1213,7 +1214,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       && updated.job.status !== 'running'
     ) {
       return reply.status(409).send({
-        error: 'Job claim refused: the workspace is quarantined or the Project is not running',
+        error: 'Job claim refused: the workspace is quarantined, the Project is not running, or another Task owns the workspace',
         code: 'JOB_CLAIM_REFUSED',
       })
     }

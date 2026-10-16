@@ -516,6 +516,103 @@ describe('Job API', () => {
     },
   )
 
+  describe('claim guard: another Task that is a live workspace owner (W5)', () => {
+    async function setup(app: FastifyInstance) {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const project = await createProject(app, { status: 'running' })
+      const paused = await createProject(app, { status: 'paused' })
+      const task = await createTask(app, project.id)
+      const job = await createJob(app, task)
+      const otherTask = await createTask(app, paused.id)
+      return { storage, task, job, otherTask, pausedId: paused.id }
+    }
+
+    async function claim(app: FastifyInstance, jobId: string) {
+      return app.inject({ method: 'PATCH', url: `/api/jobs/${jobId}`, payload: { status: 'running' } })
+    }
+
+    it.each([
+      ['a concurrent non-initial queued Job', 'queued', true],
+      ['a running Job', 'running', false],
+    ] as const)('refuses the claim while another Task (paused Project) has %s', async (_label, status, resumeKey) => {
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const key = resumeKey ? `resume:src-${otherTask.id}:1` : undefined
+        storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+          ...(key !== undefined ? { workflowStepKey: key } : {}),
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        const res = await claim(app, job.id)
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      })
+    })
+
+    it('a fresh initial-implement queued elsewhere is not an owner', async () => {
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${otherTask.id}:initial-implement`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('running')
+      })
+    })
+
+    it("the claiming Task's own queued Jobs are not a blocker", async () => {
+      await withApp(async (app) => {
+        const { storage, task, job } = await setup(app)
+        storage.jobs.create({
+          taskId: task.id, projectId: task.projectId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `resume:${job.id}:1`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
+    it('Jobs in an archived Project are not owners', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await setup(app)
+        const archived = await createProject(app, { status: 'archived' })
+        const archivedTask = await createTask(app, archived.id)
+        storage.jobs.create({
+          taskId: archivedTask.id, projectId: archived.id, agentRole: 'developer_ai', status: 'running',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
+    it('a refused Outbox-tagged claim is not recorded as applied: the replay is refused again (409)', async () => {
+      await withApp(async (app) => {
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'running',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const payload = withOutbox({ status: 'running' as const, startedAt: '2026-08-08T01:02:03.000Z' }, 'event-refused-claim')
+
+        for (let i = 0; i < 2; i += 1) {
+          const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload })
+          expect(res.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+          expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+        }
+      })
+    })
+  })
+
   it('PATCH queued -> running still succeeds for a running Project', async () => {
     await withApp(async (app) => {
       const project = await createProject(app, { status: 'running' })

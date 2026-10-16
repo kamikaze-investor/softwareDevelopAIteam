@@ -13,7 +13,8 @@
  */
 
 import type { Job, Project, ReviewResult, Task } from '@ai-team/shared'
-import { isStaleBlockedJobCandidate } from '@ai-team/shared'
+import { isStaleBlockedJobCandidate, isLiveWorkspaceOwnerJob } from '@ai-team/shared'
+import { isInitialImplementStepKey as isSharedInitialImplementStepKey } from '@ai-team/shared'
 import {
   assertTransition,
   reconcileRunningJob,
@@ -103,7 +104,8 @@ export interface QueuedWork {
  * （＝そのTaskはまだ何も実行していない）は対象外のままにする。
  */
 function isInitialImplementStepKey(taskId: string, workflowStepKey: string | undefined): boolean {
-  return workflowStepKey === `task:${taskId}:initial-implement`
+  // 判定の実体は `@ai-team/shared` に置いた（API の claim guard が同じ意味を使うため）。
+  return isSharedInitialImplementStepKey(taskId, workflowStepKey)
 }
 
 /**
@@ -197,9 +199,8 @@ function findWorkspaceOwningTaskIds(perTask: readonly { task: Task; jobs: Job[] 
   // 呼び出し側で fail-closed にする。
   return perTask
     .filter(({ task, jobs }) => jobs.some((job) => (
-      job.status === 'running' ||
-      (job.status === 'blocked' && !isStaleBlockedJobOfFinishedTask(task, job)) ||
-      (job.status === 'queued' && !isInitialImplementStepKey(task.id, job.workflowStepKey))
+      isLiveWorkspaceOwnerJob(task.id, job) ||
+      (job.status === 'blocked' && !isStaleBlockedJobOfFinishedTask(task, job))
     )))
     .map(({ task }) => task.id)
 }

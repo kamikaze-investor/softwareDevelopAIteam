@@ -8,6 +8,7 @@
 
 import {
   holdsWorkspaceWhenBlocked,
+  isLiveWorkspaceOwnerJob,
   isStaleBlockedJobCandidate,
   LIVE_JOB_STATUSES,
   OCCUPIES_PROJECT_SQL,
@@ -1976,6 +1977,27 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         if (claimingProject?.status !== 'running') {
           return existing
         }
+        // **別 Task が live な所有者なら claim を書かない**（lifecycle repair W5）。
+        //
+        // Worker の所有権判定は複数リクエストで組んだ snapshot に基づくため、その間に別 Task
+        // （paused Project を含む）へ作られた非 initial-implement の queued Job を見落としうる。
+        // ここは claim の単一の choke point（IMMEDIATE transaction 内）なので、同じ意味
+        // （`isLiveWorkspaceOwnerJob`。Worker と共有）で archived 以外の全 Project を再確認する。
+        //
+        // **blocked 行はこの guard に入れない。** Job が blocked になれるのは running からだけで、
+        // running になるには claim が要り、その claim をこの guard が直列化している。blocked / dirty
+        // の帰属（done Task に残った行の解放証明を含む）は worktree を観測できる Worker 側に残す。
+        const otherLiveJobs = db.prepare(
+          "SELECT j.task_id AS task_id, j.status AS status, j.workflow_step_key AS workflow_step_key "
+          + 'FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
+          + "WHERE p.status != 'archived' AND j.task_id != ? AND j.status IN ('queued','running')",
+        ).all(existing.taskId) as Array<{ task_id: string; status: string; workflow_step_key: string | null }>
+        if (otherLiveJobs.some((row) => isLiveWorkspaceOwnerJob(row.task_id, {
+          status: row.status,
+          workflowStepKey: row.workflow_step_key,
+        }))) {
+          return existing
+        }
       }
       // Approval承認とWorkerのblocked結果保存が競合した場合、承認transactionがqueuedへ
       // 戻したJobを古いblocked結果で巻き戻さない。実行結果も再注入せず、現在値を返す。
@@ -2029,9 +2051,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: true, job, deduplicated: true }
         }
 
+        const before = jobs.findById(id)
         const updated = jobs.update(id, data)
         if (!updated) {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+        // **拒否された claim は「適用済み」として記録しない**（lifecycle repair W5）。記録すると
+        // 同じ event の再送が deduplicated 200 + queued になり、Worker が拒否を成功と取り違えうる。
+        // 記録しなければ再送は毎回評価し直され、同じく拒否（409）される。
+        const claimRefused = data.status === 'running'
+          && before?.status === 'queued'
+          && updated.status !== 'running'
+        if (claimRefused) {
+          return { ok: true, job: updated, deduplicated: false }
         }
         recordOutboxEvent(db, id, outboxEvent)
 
