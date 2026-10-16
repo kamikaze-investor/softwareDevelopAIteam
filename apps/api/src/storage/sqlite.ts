@@ -2279,16 +2279,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       }
       // Approval承認とWorkerのblocked結果保存が競合した場合、承認transactionがqueuedへ
       // 戻したJobを古いblocked結果で巻き戻さない。実行結果も再注入せず、現在値を返す。
+      //
+      // **ただし承認後に claim された実行（running）からの blocked は古い結果ではない**（integrated E2E・P1）。
+      // 承認は Job を queued へ戻すので、承認前の実行の遅延 blocked は queued の行に届く。running の行へ
+      // 届く blocked は承認後の実行そのもので、Gate が ALLOW + call_consume を返したのに Worker 側の
+      // policy が実行を拒んだ（例: safe_work_only で git_commit 不可）ことを意味する。これを捨てると
+      // Job は running・承認は APPROVED・attention 無し・resume / recover も拒否、という無音停止になる。
+      // blocked を保存して停止を見せる。承認は APPROVED のまま束縛を保ち、consume しない。
+      let approvedButBlockedByWorker: string | undefined
       if (data.status === 'blocked' && existing.approvalId) {
         const approvalRow = db.prepare(
           'SELECT status FROM approval_requests WHERE id = ?'
         ).get(existing.approvalId) as { status: ApprovalGateStatus } | undefined
-        if (approvalRow?.status === 'APPROVED' || approvalRow?.status === 'CONSUMED') {
+        if (existing.status === 'running' && approvalRow?.status === 'APPROVED') {
+          approvedButBlockedByWorker = existing.approvalId
+        } else if (approvalRow?.status === 'APPROVED' || approvalRow?.status === 'CONSUMED') {
           return existing
         }
       }
 
       const updated = { ...existing, ...data }
+      if (approvedButBlockedByWorker !== undefined && !(updated.stderr ?? '').trim()) {
+        // Worker の gate block 理由は結果 payload に載らない（stderr 空）。停止理由を attention の
+        // detail（stopReason(job.stderr)）に出すため、API が確定できる事実だけで書く。
+        // attention detail は末尾 200 字なので 200 字以内に収める。
+        updated.stderr = `approved_but_worker_blocked: approval ${approvedButBlockedByWorker} is APPROVED and unconsumed,`
+          + ` but the Worker gate policy refused ${existing.safeCommand.kind}`
+          + ` (e.g. safe_work_only: ${existing.safeCommand.kind} not permitted)`
+      }
       db.prepare(`
         UPDATE jobs SET
           status=?, started_at=?, completed_at=?, exit_code=?,

@@ -2940,3 +2940,114 @@ describe('rekick_design_review は attention が名指した run だけを動か
     expect(storage.designReviewRuns.findById(replacementId)?.status).toBe('queued')
   })
 })
+
+// integrated E2E・P1: ADMIN が HIGH の git_commit を承認 → gate/check は ALLOW + call_consume →
+// Worker の gate policy（AI 編集禁止）が continue_safe_work_only へ倒して blocked を報告する。
+// 以前は API がこの blocked を「承認と競合した古い結果」として捨て、Job は running のまま無音停止した。
+describe('approved git_commit blocked by the Worker gate policy', () => {
+  function approvedThenWorkerBlocked(): { storage: IStorage; taskId: string; jobId: string; approvalId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:some-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c0ffee',
+      targetDiffHash: 'd1ff', changedFiles: ['src/a.ts'], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    // 最初の実行は承認待ちで blocked。
+    storage.jobs.update(job.id, { status: 'blocked' })
+    const approved = storage.approvalRequests.approveAndResumeJob(
+      linked.approvalRequest.id, undefined, { credentialClass: 'admin' },
+    )
+    if (!approved.ok) throw new Error(approved.reason)
+    // 承認後の実行: claim → Worker が safe_work_only で blocked を報告（stderr 無し）。
+    const claimed = storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    expect(claimed?.status).toBe('running')
+    storage.jobs.update(job.id, {
+      status: 'blocked',
+      completedAt: new Date().toISOString(),
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    })
+    return { storage, taskId, jobId: job.id, approvalId: linked.approvalRequest.id }
+  }
+
+  it('persists the blocked result, keeps the approval APPROVED, and surfaces job_blocked with the cause', () => {
+    const fx = approvedThenWorkerBlocked()
+
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('APPROVED')
+    const attention = buildSystemState(fx.storage, { now: () => NOW }).attention
+      .filter((item) => item.taskId === fx.taskId && item.kind === 'job_blocked')
+    expect(attention).toHaveLength(1)
+    expect(attention[0].detail).toContain('approved_but_worker_blocked')
+    expect(attention[0].detail).toContain(fx.approvalId)
+    expect(attention[0].detail).toContain('safe_work_only: git_commit not permitted')
+  })
+
+  it('a stale blocked result for a requeued (queued) Job is still ignored', () => {
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:other-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    const approved = storage.approvalRequests.approveAndResumeJob(linked.approvalRequest.id, undefined, { credentialClass: 'admin' })
+    if (!approved.ok) throw new Error(approved.reason)
+
+    storage.jobs.update(job.id, { status: 'blocked' })
+    expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+  })
+
+  it('the PL escalates it once to the CEO (not auto-resume) and does not churn on later ticks', async () => {
+    const fx = approvedThenWorkerBlocked()
+    const escalations: string[] = []
+    const tickDeps = deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'retry', riskLevel: 'LOW' }),
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    })
+
+    const first = await runPlTick(fx.storage, tickDeps)
+    expect(first.status).toBe('escalated')
+    expect(first.triage?.lane).toBe('ceo_escalation')
+    expect(escalations).toHaveLength(1)
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(fx.storage, tickDeps)
+    }
+    expect(escalations).toHaveLength(1)
+    // 自動 resume していない: 後継 Job も新しい承認も作られず、承認は APPROVED のまま。
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('APPROVED')
+  })
+
+  it('a Human Resume starts a new generation and supersedes the unused approval', () => {
+    const fx = approvedThenWorkerBlocked()
+    fx.storage.tasks.update(fx.taskId, { status: 'blocked' })
+
+    const resumed = fx.storage.jobs.resumeBlockedTask({
+      taskId: fx.taskId,
+      instructionPrompt: 'resume',
+      resumedBy: { actorClass: 'human', evidence: 'admin_credential' },
+    })
+
+    expect(resumed.ok).toBe(true)
+    if (!resumed.ok) return
+    expect(resumed.job.approvalId).toBeUndefined()
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('failed')
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('SUPERSEDED')
+  })
+})
