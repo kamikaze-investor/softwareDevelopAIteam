@@ -431,7 +431,11 @@ export class WorkerSimulator {
         }, step)
         return step
       }
-      if (consume.statusCode === 409 && (consume.body as { consumed?: boolean; jobId?: string }).jobId !== job.id) {
+      // `gateClient.callConsume()` と同じ: 409 で続行するのは「この Job がもう使い切った」（consumed=true かつ
+      // 同じ jobId）ときだけ。STALE / EXPIRED / 非 APPROVED の 409 も jobId（linked Job）を返すので、
+      // jobId だけを見ると期限切れ・古い承認のまま commit してしまう。
+      const conflict = consume.body as { consumed?: boolean; jobId?: string }
+      if (consume.statusCode === 409 && !(conflict.consumed === true && conflict.jobId === job.id)) {
         await this.report(running, blocked(), step)
         return step
       }
