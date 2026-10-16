@@ -2082,6 +2082,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   const jobs: IJobStorage = {
+    classifyOutboxEvent(jobId, outboxEvent) {
+      return checkOutboxEvent(db, jobId, outboxEvent).status
+    },
     findByTaskId(taskId) {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
       return rows.map(deserializeJob)

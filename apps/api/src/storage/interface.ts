@@ -462,6 +462,13 @@ export interface IJobStorage {
     outboxEvent?: OutboxEventInput,
     queueDesignReview?: QueuedDesignReviewRunInput,
   ): UpdateWithOutboxEventResult
+  /**
+   * Outbox event がこの Job に既に適用済みか（読み取りのみ。書き込み経路の dedup と同じ照合）。
+   * - `deduplicated`: 同じ eventId・同じ payloadHash が適用済み（完全な再送）
+   * - `conflict`: 同じ eventId が別の Job か別の payloadHash で適用済み
+   * - `new`: 未適用（または outboxEvent 無し）
+   */
+  classifyOutboxEvent(jobId: string, outboxEvent: OutboxEventInput | undefined): 'new' | 'deduplicated' | 'conflict'
   /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
   persistCommitSuccessWithContinuation(input: {
     jobId: string
