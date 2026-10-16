@@ -172,7 +172,7 @@ would direct-to-target plus scale-down diagnosis on failure cost less in total; 
 justified.
 
 <!-- principle-id: canonical-domain-meaning -->
-<!-- principle-oneliner: Decide each domain fact through its single canonical owner; never add a second independent owner or re-infer the fact from incidental representation (string shape, prefix, ID format, ordering, timestamps, message text). -->
+<!-- principle-oneliner: Decide each domain fact through its single canonical owner; never add a second independent owner or re-infer the fact from incidental representation (string shape, prefix, ID format, ordering, timestamps, message text), and never merge concepts that only look alike. -->
 <!-- principle-category: coupling -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: contextual -->
@@ -186,7 +186,9 @@ lives; this principle alone never justifies a new Gate, status or workflow, nor 
 front of an owner that already answers the question.
 One fact, one owner: do not add a second independent definition or decision of the same fact (a
 parallel table, enum, mapping, predicate, regex or prompt rule), even when it agrees with the owner
-today; two owners that agree now diverge on the next change. When consumers must re-derive a fact
+today; two owners that agree now diverge on the next change. A copy generated from the owner, a layer
+that delegates to it, or an enforcement mirror (schema check, DB constraint) whose agreement with the
+owner is verified by a test is not a second owner; what matters is whether it decides independently. When consumers must re-derive a fact
 because no single owner exposes it (the owner is missing, split or misplaced), prefer the smallest
 structural refactor that gives the fact one owner (expose a typed field or predicate on the existing
 owner, move the decision into it, make the other sites delegate) over another consumer-side
@@ -212,7 +214,7 @@ apply `root-cause-generalization` to the other consumers of the same representat
 deciders of the same fact.
 
 <!-- principle-id: root-cause-generalization -->
-<!-- principle-oneliner: When fixing a defect, remove its cause, not only its site: name the abstracted root cause, check where else that cause can fire in proportion to risk, and prefer one common-cause fix over repeated local patches. -->
+<!-- principle-oneliner: When fixing a defect, remove its cause, not only its site: name the abstracted root cause, check in proportion to risk where else that cause can fire, fix a shared cause once instead of patching each site, and record same-cause instances outside the authorized scope instead of fixing them. -->
 <!-- principle-category: outcome-definition -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: core -->
@@ -240,8 +242,8 @@ bundled. Recurrence prevention uses existing means (owner, type, test, checklist
 to add a Gate, review step, status or workflow.
 5) Group by cause, not by resemblance: sites that merely share syntax, a name or a symptom are not
 one class unless the same mechanism is shown; do not widen a fix on resemblance alone.
-6) Respect the authorized scope: instances outside the current change's scope (Task Contract, allowed
-paths, approval) are not silently fixed; record them through an existing path (finding, roadmap item,
+6) Respect the authorized scope: instances outside the current change's scope (its task contract,
+allowed paths or approval, whatever the project uses) are not silently fixed; record them through an existing path (finding, roadmap item,
 report) with the cause they share. Existing code is still grandfathered (`existing-code-grandfather`);
 an incident only opens the instances of its own cause.
 The fix report states the abstracted cause, the searched scope and why it was enough, and each

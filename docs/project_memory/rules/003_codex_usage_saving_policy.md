@@ -23,6 +23,9 @@ Codexへ依頼する単位は「1つの特定されたFinding」に限定する�
 複数Findingを1つの長大なCodexセッションへまとめない（Rule-021と対）。
 ```
 
+同じ原因を共有する複数の箇所は、原因 1 件の Finding として扱う（`specs/21` `root-cause-generalization`）。
+この Rule が禁じているのは**無関係な** Finding をまとめることである。
+
 ---
 
 ## 2. 探索範囲の限定（Rule-015〜017）
@@ -34,6 +37,10 @@ Codexへ依頼する単位は「1つの特定されたFinding」に限定する�
 Root Cause候補をCodexへ渡し、Codexの探索範囲をそれらへ限定する。
 Codexを「ゼロから調べ直す」用途で使わない。
 ```
+
+`root-cause-generalization`（`specs/21`）が求める「同じ原因が他で発火しうるか」の横断探索は
+**呼び出し元**が risk に応じた範囲で行い、その結果の候補箇所を Codex へ渡す。
+Codex に原因の横断探索をゼロから任せることは、この Rule の例外にならない。
 
 ### Rule-016: Codexは結論の独立検証を行うが、同じ情報収集を最初から繰り返さない
 

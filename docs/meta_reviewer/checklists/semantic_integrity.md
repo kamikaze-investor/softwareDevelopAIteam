@@ -34,7 +34,9 @@ domain fact の判断（authority / safety / lifecycle / completion / supersessi
       （typed error / error code / typed state を使う）
 - [ ] **Single owner**: 同じ domain fact を独立に定義・判定する第二の正本
       （並行する table / enum / mapping / predicate / 正規表現 / prompt 上の rule）を**新たに足していない**。
-      今は owner と一致していても対象（一致は次の変更で崩れる）
+      今は owner と一致していても対象（一致は次の変更で崩れる）。owner から生成される copy・
+      owner へ委譲する層・owner との一致がテストで検証される enforcement（schema check / DB 制約）は
+      第二の正本ではない。**独立に判断していること**が条件
 - [ ] **Distinct meanings**: 名前・値・表現が似ているだけの別概念を統合していない。
       統合するなら「表現ではなく意味が同じ」根拠があり、似た別概念を分けておくなら
       その違いが両方の定義箇所に書かれている
@@ -46,6 +48,7 @@ domain fact の判断（authority / safety / lifecycle / completion / supersessi
 - [ ] **Owner placement**: owner が欠けている・分裂している・置き場所が違うために consumer が
       再推論している場合、consumer 側の回避策を重ねず、既存 owner に typed field / predicate を
       出す・判定を owner へ移すといった**最小の構造的リファクタリング**を提案する
+      （この変更の範囲外なら finding / roadmap item として記録させ、この変更では要求しない）
 - [ ] **Test adequacy**: semantic boundary のテストが両方向ある
   - same meaning / different representation → same result
   - similar representation / different meaning → different result

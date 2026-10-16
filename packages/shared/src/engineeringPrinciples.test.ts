@@ -89,6 +89,8 @@ describe('loadEngineeringPrinciples', () => {
     expect(meaning?.fullText.toLowerCase()).not.toContain('resume')
     // 第二の正本を足さないこと・別概念を表現の類似だけで統合しないことの両方向を持つ。
     expect(meaning?.oneLiner).toContain('never add a second independent owner')
+    expect(meaning?.oneLiner).toContain('never merge concepts that only look alike')
+    expect(meaning?.fullText).toContain('whether it decides independently')
     expect(meaning?.fullText).toContain('do not merge concepts that only share a name, value or')
     expect(meaning?.fullText).toContain('smallest')
     expect(meaning?.fullText).toContain('root-cause-generalization')
@@ -102,6 +104,9 @@ describe('loadEngineeringPrinciples', () => {
     expect(rootCause?.fullText).toContain('never means an unconditional whole-system audit')
     expect(rootCause?.fullText).toContain('Group by cause, not by resemblance')
     expect(rootCause?.fullText).toContain('not silently fixed')
+    // prompt に載るのは one-liner だけなので、範囲の歯止めも one-liner 側に持たせる。
+    expect(rootCause?.oneLiner).toContain('in proportion to risk')
+    expect(rootCause?.oneLiner).toContain('outside the authorized scope instead of fixing them')
     expect(rootCause?.fullText).toContain('`unexamined_root_cause`')
     for (const incidentWord of ['lifecycle', 'resume', 'git_commit', 'aiteamos']) {
       expect(rootCause?.fullText.toLowerCase()).not.toContain(incidentWord)
@@ -329,6 +334,8 @@ describe('buildApplicablePrinciplesSection', () => {
     expect(section).toContain('## Applicable Principles')
     expect(section).toContain('- observation-closes-loop: Deferring to observation requires a closed loop')
     expect(section).toContain('Do not invent principle ids')
+    // 判定対象の無い core 原則を UNCERTAIN にさせない（降格センサーを止めないため）。
+    expect(section).toContain('answer ALIGNED with reason "not exercised"')
     // 全文ではなく one-liner だけを載せる（原則数に対して prompt が線形に太らない）。
     expect(section).not.toContain('an unfalsifiable TODO')
   })

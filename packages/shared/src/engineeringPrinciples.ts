@@ -370,6 +370,10 @@ export function buildApplicablePrinciplesSection(selection: readonly PrincipleSe
     '## Applicable Principles',
     'Judge each principle below separately against this change and report one verdict per principle id.',
     'ALIGNED = the change respects it. CONFLICT = the change violates it. UNCERTAIN = you cannot tell from the material given.',
+    // core 原則は変更の種類によらず載る（例: 修正でない変更に root-cause-generalization）。
+    // 判定対象が無いときに UNCERTAIN が返ると、core 降格センサー（CONFLICT / UNCERTAIN 0 件が条件）が
+    // 永久に発火せず、core にした判断の再評価ループが閉じない。
+    'If a principle has nothing to judge in this change, answer ALIGNED with reason "not exercised"; keep UNCERTAIN for a principle that applies but cannot be judged from the material given.',
     'Do not invent principle ids that are not in this list.',
     ...selection.map((item) => `- ${item.slug}: ${item.oneLiner}`),
   ].join('\n')

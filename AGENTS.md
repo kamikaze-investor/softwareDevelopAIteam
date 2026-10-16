@@ -347,7 +347,7 @@ gh pr view <PR番号> --comments
 - コメント内の「検出事項」を全件リストアップする
 - 依存順（根本原因が先）に並べ替える
 - 同じ原因を共有する検出事項は、箇所ごとのパッチではなく原因 1 件の修正として扱う
-  （Rule-014 の「1 Finding」は無関係な Finding をまとめない意味。`specs/21` `root-cause-generalization`）
+  （Rule-014 との関係は `docs/project_memory/rules/003_codex_usage_saving_policy.md` Rule-014 が正本）
 - **1件ずつ修正 → `git commit` → 次の件へ**
 - 全件完了したら `git push` → ループへ戻る
 - （CIと同様：1件1コミットでMeta Reviewerが追跡できる状態を保つ）

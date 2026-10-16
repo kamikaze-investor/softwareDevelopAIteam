@@ -46,7 +46,19 @@ core にしたことで、**コード配線の追加なしに**次の既存経�
   ここへ常時注入しない既存方針は維持）。Design Review も同じ guidance を読む
 
 人・外部セッション（Claude Code / Codex）の修正作業は `AGENTS.md` の CI トリアージと
-Meta Review `changes_requested` 対応手順から参照させた。
+Meta Review `changes_requested` 対応手順から参照させた。Rule-014（1 Finding = 1 bounded task）と
+Rule-015（Codex に全体再調査をさせない）との関係は、その正本の
+`docs/project_memory/rules/003_codex_usage_saving_policy.md` に書いた（同じ原因の箇所は 1 Finding。
+横断探索は呼び出し元が行い候補を渡す）。
+
+**検討して採らなかった案**: contextual にして、構造上修正だと分かる 3 経路（`buildRepairPrompt()` /
+`buildRemediationDesignContract()` / PL technical recovery の resume）だけ `explicitSlugs` で選ぶ。
+これは修正経路の prompt には届くが、修理の Design Review と、手作業の修正 PR を見る Meta Review には
+構造上の signal が無く届かない。core のほうが経路漏れが無く、配線も増えない。
+
+**範囲外にした経路**: Roadmap 再生成（`conflictResolutionStep.ts`）は Design Contract を使わず、
+独自に「root causes, not symptoms」を求める Critic prompt を持つ。対象が欠陥修正ではなく
+Roadmap の再設計なので、今回は配線しない。
 
 **新しい Gate / Review 工程 / Status / Workflow / finding category は追加していない。**
 違反は既存 category `unverifiable_assumption`（sub-kind `unexamined_root_cause`）、
@@ -59,6 +71,8 @@ Meta Review `changes_requested` 対応手順から参照させた。
 - 局所的な原因（typo 等）は「原因が局所である理由」の 1 文で足りる
 - 同じ原因の箇所は finding を量産せず原因 1 件にまとめる（checklist にも明記）
 - 増えるのは prompt の one-liner 1 行と、review ごとの原則 verdict 1 件である
+- 範囲の歯止め（risk 比例・権限範囲外は記録のみ）は prompt に載る one-liner 自体に入れた。
+  全文だけに置くと、実装 AI には「広く探して直せ」だけが届く
 
 ## 5. 再評価条件（`observation-closes-loop` を自分に適用）
 
@@ -66,5 +80,9 @@ Meta Review `changes_requested` 対応手順から参照させた。
 contextual 降格を再Review候補にする。`PRINCIPLE_SENSOR_THRESHOLDS`）がそのまま
 `root-cause-generalization` にも効く。修正以外の変更では ALIGNED になりやすいため、
 **このセンサーの発火は「core が過剰か」を見直す正規の契機**として扱う。
+判定対象の無い core 原則に UNCERTAIN が返るとこのセンサーは永久に発火しないため、
+`buildApplicablePrinciplesSection()` に「判定対象が無ければ ALIGNED（reason: not exercised）」を足した
+（既存の `observation-closes-loop` にも同じ穴があった）。機構全体センサーの閾値 200 は
+「core 4 件 × 50」から決めた値で、core が 5 件になった今も再導出していない（note に明記）。
 `canonical-domain-meaning` は本文が変わったため版 hash が更新され、実績は新版でゼロから数え直される
 （`engineeringPrinciples.ts` の版の設計どおり）。
