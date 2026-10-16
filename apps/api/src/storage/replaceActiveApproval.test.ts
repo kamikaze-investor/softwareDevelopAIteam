@@ -186,6 +186,34 @@ describe('approvalRequests.createForJob — 同じ規則で WAITING だけを畳
     ])
   })
 
+  // 遅延・再送された gate/check が終わった Job を名指ししても、他 Job の WAITING・audit・link を変えない
+  // （Codex review cb1f2db）。
+  it.each(['success', 'failed', 'queued'] as const)(
+    '%s の git_commit Job には新しい承認を結び付けず、既存の request・audit・Job link を変えない',
+    (jobStatus) => {
+      const storage = createSQLiteStorage(':memory:')
+      const { projectId, taskId } = seedTask(storage)
+      const liveJob = gitCommitJob(storage, projectId, taskId)
+      const live = storage.approvalRequests.createForJob(input(taskId, 'git_commit'), liveJob)
+      if (!live.ok) throw new Error('live linked approval not created')
+      const otherWaiting = storage.approvalRequests.create(input(taskId, 'abort_task')).id
+      const staleJob = gitCommitJob(storage, projectId, taskId)
+      storage.jobs.update(staleJob, { status: jobStatus })
+      const requestsBefore = storage.approvalRequests.findByTaskId(taskId)
+
+      expect(storage.approvalRequests.createForJob(input(taskId, 'git_commit'), staleJob)).toMatchObject({
+        ok: false, code: 'JOB_NOT_ACTIVE',
+      })
+      expect(storage.approvalRequests.findByTaskId(taskId)).toEqual(requestsBefore)
+      expect(statusOf(storage, live.approvalRequest.id)).toBe('WAITING_FOR_USER')
+      expect(statusOf(storage, otherWaiting)).toBe('WAITING_FOR_USER')
+      expect(storage.auditLog.findByEntity('approval_request', live.approvalRequest.id)).toEqual([])
+      expect(storage.auditLog.findByEntity('approval_request', otherWaiting)).toEqual([])
+      expect(storage.jobs.findById(staleJob)?.approvalId).toBeUndefined()
+      expect(storage.jobs.findById(liveJob)?.approvalId).toBe(live.approvalRequest.id)
+    },
+  )
+
   it('Job 検証で拒否したときは何も SUPERSEDED にしない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { projectId, taskId } = seedTask(storage)

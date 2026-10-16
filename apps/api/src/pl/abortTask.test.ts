@@ -1371,6 +1371,7 @@ describe('P2-2 Automatic Technical Abort', () => {
     (status) => {
       const fx = seedTechnicalAbort()
       requestTechnical(fx)
+      const carrierBefore = fx.storage.jobs.findById(fx.latestJobId)
       const late = fx.storage.approvalRequests.create({
         taskId: fx.taskId,
         requestedAction: 'deploy',
@@ -1385,9 +1386,19 @@ describe('P2-2 Automatic Technical Abort', () => {
         expiresAt: FUTURE,
       } as Parameters<IStorage['approvalRequests']['create']>[0])
 
-      expect(finishTechnical(fx)).toMatchObject({ ok: false })
+      expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
       expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
       expect(fx.storage.approvalRequests.findById(late.id)?.status).toBe(status)
+      // cleanup の失敗ではないので、carrier を quarantine せず cleanup 認可も消さない（Codex review cb1f2db）。
+      const carrierAfter = fx.storage.jobs.findById(fx.latestJobId)
+      expect(carrierAfter?.status).toBe(carrierBefore?.status)
+      expect(carrierAfter?.failureMetadata).toEqual(carrierBefore?.failureMetadata)
+      expect(carrierAfter?.failureMetadata?.quarantined).toBeUndefined()
+      expect(carrierAfter?.failureMetadata?.abortCleanupRequestedAt).toBeDefined()
+      expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
+        (entry) => entry.operation === 'technical_abort_refused'
+          && entry.detail?.includes('HUMAN_DECISION_CONFLICT') === true,
+      )).toBe(true)
       expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
         (entry) => entry.operation === 'task_aborted' && entry.result === 'success',
       )).toBe(false)

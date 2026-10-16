@@ -211,7 +211,7 @@ export interface ReplaceActiveApprovalAndCreateResult {
 
 export type CreateApprovalForJobResult =
   | { ok: true; approvalRequest: ApprovalRequest }
-  | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED'; reason: string }
+  | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED' | 'JOB_NOT_ACTIVE'; reason: string }
 
 export type ReviewApprovalAndResumeJobResult =
   | { ok: true; approvalRequest: ApprovalRequest; job: Job }
@@ -615,7 +615,11 @@ export type ReleaseBlockedJobAndParkTaskResult =
   | { ok: true; job: Job; task: Task }
   | {
     ok: false
-    code: 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR'
+    /**
+     * `HUMAN_DECISION_CONFLICT`: Technical Abort の最終 transaction で、precheck 後に live な WAITING /
+     * APPROVED request が現れていた。cleanup の失敗ではないので carrier を quarantine しない。
+     */
+    code: 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR' | 'HUMAN_DECISION_CONFLICT'
     reason: string
   }
 

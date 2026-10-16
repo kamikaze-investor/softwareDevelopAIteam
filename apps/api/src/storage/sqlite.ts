@@ -857,7 +857,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     authorization: AbortAuthorization,
     preCleanupObservation?: JobWorkspaceBaseline,
     cleanupSummary?: TechnicalAbortCleanupSummary,
-  ): { ok: true } | { ok: false; reason: string } {
+  ): { ok: true } | { ok: false; reason: string; code?: 'HUMAN_DECISION_CONFLICT' } {
     if (authorization.kind === 'manual_approval') {
       return verifyAndConsumeAbortApproval(task.id, authorization.approvalRequestId)
     }
@@ -920,7 +920,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       .find((row) => row.status === 'APPROVED'
         || isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at }))
     if (humanDecision !== undefined) {
-      return { ok: false, reason: `Task has an active ${humanDecision.status} approval` }
+      // 専用 code で返す: 呼び出し側はこれを cleanup の失敗として扱わず、carrier を quarantine しない
+      // （人の判断が解決すれば、同じ cleanup request でそのまま park できる）。
+      return {
+        ok: false,
+        code: 'HUMAN_DECISION_CONFLICT',
+        reason: `Task has an active ${humanDecision.status} approval`,
+      }
     }
     if (
       cleanupSummary === undefined
@@ -3295,7 +3301,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             input.cleanupSummary,
           )
           if (!approval.ok) {
-            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
+            return { ok: false as const, code: approval.code ?? 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
           // ── 解放 → park → audit。すべて同じ transaction ──
@@ -3638,7 +3644,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             input.cleanupSummary,
           )
           if (!approval.ok) {
-            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
+            return { ok: false as const, code: approval.code ?? 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
           if (rejectedGitCommitException) {
@@ -4192,6 +4198,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             ok: false,
             code: 'JOB_ALREADY_LINKED',
             reason: 'Job is already linked to an approval request',
+          }
+        }
+        // supersede より先に、対象 Job がまだ承認を待ちうる（running / blocked）ことを同じ transaction で確かめる。
+        // 遅延・再送された gate/check が終わった Job（success / failed）や queued の Job を名指ししても、
+        // 他 Job の WAITING・audit・Job link を一切変えない（approveAndResumeJob() も running / blocked を要求する）。
+        if (job.status !== 'running' && job.status !== 'blocked') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_ACTIVE',
+            reason: `Job is ${job.status}; only a running or blocked git_commit Job can be linked to a new approval`,
           }
         }
 
