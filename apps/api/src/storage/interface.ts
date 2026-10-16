@@ -396,6 +396,16 @@ export type RecoverFromBlockedResult =
 
 export interface ITaskStorage {
   /**
+   * `admit(current)` が undefined を返したときだけ `update(id, data)` を行う。読み直し・判定・書き込みを
+   * **1 つの IMMEDIATE transaction** で行う（`admit` は同じ connection の storage を同期的に読む）。
+   * 汎用 PATCH の owned → pending 出口が stranded 述語を確かめ直すために使う（lifecycle repair C3）。
+   */
+  updateIfAdmitted(
+    id: string,
+    data: Partial<Task>,
+    admit: (current: Task) => string | undefined,
+  ): { ok: true; task: Task } | { ok: false; code: 'TASK_NOT_FOUND' | 'NOT_ADMITTED'; reason: string }
+  /**
    * queued / running の repair Design Review run（`repair_source_job_id` 付き）があるか（読み取りのみ）。
    * resume admission と `TaskDetail.repairDesignReviewInFlight` の唯一の事実（lifecycle repair C3 / D3-1）。
    */

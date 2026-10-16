@@ -468,6 +468,46 @@ describe('Task API', () => {
       })
     })
 
+    it('PATCH back to pending is refused while a running job or an active design review run still drives the task', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+
+        // running Job が居る。
+        const withJob = await createTask(app, project.id, { status: 'in_progress' })
+        const job = storage.jobs.create({
+          taskId: withJob.id, projectId: project.id, agentRole: 'developer_ai', status: 'running',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        const refusedJob = await app.inject({ method: 'PATCH', url: `/api/tasks/${withJob.id}`, payload: { status: 'pending' } })
+        expect(refusedJob.statusCode).toBe(409)
+        expect(parseBody<{ code: string; reason: string }>(refusedJob.body)).toMatchObject({
+          code: 'TASK_LIFECYCLE_STATE_OWNED', reason: expect.stringContaining(job.id),
+        })
+        expect(storage.tasks.findById(withJob.id)?.status).toBe('in_progress')
+
+        // active な Design Review run が居る（review status でも同じ）。
+        const withRun = await createTask(app, project.id, { status: 'review' })
+        storage.designReviewRuns.create({
+          taskId: withRun.id, taskTitle: 'T', designText: 'd', designTextHash: 'h', changedFiles: [],
+        })
+        const refusedRun = await app.inject({ method: 'PATCH', url: `/api/tasks/${withRun.id}`, payload: { status: 'pending' } })
+        expect(refusedRun.statusCode).toBe(409)
+        expect(parseBody<{ code: string; reason: string }>(refusedRun.body)).toMatchObject({
+          code: 'TASK_LIFECYCLE_STATE_OWNED', reason: expect.stringContaining('design review run'),
+        })
+        expect(storage.tasks.findById(withRun.id)?.status).toBe('review')
+
+        // driver が終われば stranded になり、出口が開く。
+        storage.jobs.update(job.id, { status: 'success' })
+        const released = await app.inject({ method: 'PATCH', url: `/api/tasks/${withJob.id}`, payload: { status: 'pending' } })
+        expect(released.statusCode).toBe(200)
+        expect(storage.tasks.findById(withJob.id)?.status).toBe('pending')
+      })
+    })
+
     it('an in_progress task with an active design review run is not reported as stranded', async () => {
       await withApp(async (app) => {
         const project = await createProject(app)

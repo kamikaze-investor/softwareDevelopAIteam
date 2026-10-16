@@ -23,6 +23,7 @@ import {
   verifyExternalCompletion,
 } from '../reconcile/externalCompletion'
 import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
+import { strandedLifecycleRefusal } from '../state/strandedTask'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
@@ -824,6 +825,37 @@ export async function taskRoutes(
             + 'which audit the human reason and report what will drive the task next',
           code: 'TASK_BLOCKED_USE_RECOVERY_ROUTE',
         })
+      }
+    }
+
+    // **lifecycle が所有する status（in_progress / review）から出る遷移は、stranded のときだけ通す**
+    // （lifecycle repair C3）。Job / Design Review / 人の判断がまだ Task を動かしているのに pending へ戻すと、
+    // driver が走っている間に Project の占有が外れる。判定は stranded attention と同じ唯一の述語
+    // （`strandedLifecycleRefusal`）を、書き込みと同じ storage transaction の中で呼び直す。
+    if (result.data.status !== undefined) {
+      const current = storage.tasks.findById(req.params.id)
+      if (
+        current !== undefined
+        && LIFECYCLE_OWNED_TASK_STATUSES.has(current.status)
+        && current.status !== result.data.status
+      ) {
+        const released = storage.tasks.updateIfAdmitted(
+          req.params.id,
+          result.data,
+          (latest) => (LIFECYCLE_OWNED_TASK_STATUSES.has(latest.status)
+            ? strandedLifecycleRefusal(storage, latest)
+            : undefined),
+        )
+        if (!released.ok) {
+          if (released.code === 'TASK_NOT_FOUND') return reply.status(404).send({ error: 'Task not found' })
+          return reply.status(409).send({
+            ...TASK_LIFECYCLE_STATE_OWNED_REFUSAL,
+            error: `The task is still driven by its lifecycle and cannot leave ${current.status} through this generic route: `
+              + released.reason,
+            reason: released.reason,
+          })
+        }
+        return reply.send(released.task)
       }
     }
 

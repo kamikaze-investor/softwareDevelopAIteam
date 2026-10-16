@@ -1465,6 +1465,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     hasRepairDesignReviewInFlight(taskId) {
       return hasRepairDesignReviewInFlight(taskId)
     },
+    updateIfAdmitted(id, data, admit) {
+      return db.transaction(() => {
+        const current = tasks.findById(id)
+        if (!current) return { ok: false as const, code: 'TASK_NOT_FOUND' as const, reason: 'Task not found' }
+        const refusal = admit(current)
+        if (refusal !== undefined) return { ok: false as const, code: 'NOT_ADMITTED' as const, reason: refusal }
+        const updated = tasks.update(id, data)
+        if (!updated) return { ok: false as const, code: 'TASK_NOT_FOUND' as const, reason: 'Task not found' }
+        return { ok: true as const, task: updated }
+      }).immediate()
+    },
     recoverFromBlocked(input) {
       // **状態遷移と audit を1 transaction にする。** 片方だけ成功する経路を残さない。
       const tx = db.transaction((taskId: string, detail: string) => {

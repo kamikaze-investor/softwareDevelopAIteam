@@ -17,6 +17,7 @@
 
 import { isLiveWorkspaceOwnerJob, occupiesProject } from '@ai-team/shared'
 import { findBlockedRowsHoldingWorkspace } from './blockedRowOwnership'
+import { strandedLifecycleRefusal } from './strandedTask'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume, withApprovalActorFacts } from '../designReview/resumeActor'
@@ -705,15 +706,14 @@ export function buildSystemState(
       // 停滞閾値付き）を再利用する。`task_blocked_without_job` は blocked Task 専用の出口（Human Recovery
       // = /recover。blocked 以外を拒否する）を前提にしており合わない。referenceId は Task の updatedAt 付きで、
       // pending へ戻した後の通常の `task_ready_without_job:<taskId>` や次のエピソードと同一視しない。
+      // stranded の判定は `strandedLifecycleRefusal()`（汎用 PATCH の出口と同じ唯一の述語）。ここで足す条件は
+      // attention の重複を避けるためだけのもの（blocked / failed の Job は job_blocked / job_failed が表す）。
       if (
         project.status === 'running'
-        && (task.status === 'in_progress' || task.status === 'review')
         && !parentIsParked
         && !hasMovableJob
         && stallingFailure === undefined
-        && storage.designReviewRuns.findActiveByTaskId(task.id) === undefined
-        && findLiveWaitingApproval(storage, task.id, nowMs) === undefined
-        && findLiveTaskScopedDecision(storage, task.id, nowMs) === undefined
+        && strandedLifecycleRefusal(storage, task, nowMs) === undefined
       ) {
         attention.push({
           kind: 'task_ready_without_job',
