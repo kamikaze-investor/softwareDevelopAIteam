@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import { GATE_POLICY_VERSION } from '../routes/approvalGate'
+import { CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS } from './roadmapAdoption'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -1358,5 +1360,13 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([
       { taskId: first.taskId, sourceJobId: sourceJob.id, candidateCommitHash: 'candidate-commit' },
     ])
+  })
+})
+
+// gate の policy version を上げたら、awaiting-promotion 判定が受け入れる version 集合も更新しないと、
+// Candidate の done 作業が再び follow-up として採用され得る（#310 の形）。両者をここで結び付ける。
+describe('awaiting-promotion policy versions', () => {
+  it('accept the current gate policy version', () => {
+    expect(CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS.has(GATE_POLICY_VERSION)).toBe(true)
   })
 })
