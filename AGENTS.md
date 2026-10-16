@@ -308,7 +308,8 @@ gh run view <run-id> --log-failed
 **複合エラー時のトリアージ手順:**
 
 1. `gh run view <run-id> --log-failed` で全エラーを収集する
-2. 根本原因（症状ではなく原因）を特定する
+2. 根本原因（症状ではなく原因）を特定し、同じ原因が他の箇所にも無いかを原因の共有可能性とリスクに
+   応じた範囲で確認する（`specs/21` `evidence-not-spec` の Root Cause Generalization。全数監査ではない）
 3. 前提条件を洗い出してリスト化する
    ```
    例:

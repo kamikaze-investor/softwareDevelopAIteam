@@ -208,6 +208,14 @@ describe('corePrincipleSlugs', () => {
   it('returns nothing when the registry is unavailable', () => {
     expect(corePrincipleSlugs(loadEngineeringPrinciples([missingPath]))).toEqual([])
   })
+
+  it('carries root cause generalization to every prompt through a core one-liner', () => {
+    // 実装・repair prompt は signal 無しで core だけを載せ、Design Contract には one-liner しか載らない。
+    // Root Cause Generalization が fix の現場へ届く経路はこの 1 行だけなので、ここで固定する。
+    const principles = loadForTest()
+    const contract = buildDesignContract({ slugs: selectPrincipleSlugs(undefined, principles), principles })
+    expect(contract).toContain('a reported failure is evidence of its cause, not the boundary of its fix')
+  })
 })
 
 describe('selectPrinciples', () => {
