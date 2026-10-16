@@ -41,7 +41,7 @@ describe('root package.json の verify:implement', () => {
 
   // `&&` なので typecheck が失敗すれば test は走らず、終了コードは非 0 になる。
   it('typecheck → test の順に、前段失敗で止まる形で実行する', () => {
-    expect(rootPackage.scripts['verify:implement']).toBe('pnpm -r typecheck && pnpm -r test')
+    expect(rootPackage.scripts['verify:implement']).toBe('pnpm -r --parallel typecheck && pnpm -r --parallel test')
   })
 
   it('既存の test / typecheck / verify は変えない', () => {
