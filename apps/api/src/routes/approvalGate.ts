@@ -37,6 +37,8 @@ import {
   type GitCommitEvidenceResult,
   type GitCommitHumanGateReason,
 } from '../gitCommitEvidence'
+import { getCredentialClass } from '../auth/credentialClass'
+import { recordApprovalActor } from '../designReview/resumeActor'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
 import { gateEvaluationRoutes } from './gateEvaluations'
 
@@ -964,6 +966,13 @@ export async function approvalGateRoutes(
   })
 
   // PATCH /api/approval-requests/:id/status — 状態更新（人間が承認/拒否する口）
+  //
+  // 決定の直後に「誰が決めたか」（credential 種別だけから導いた human / ai / unknown）を
+  // `approval_actor` audit へ残す。APPROVED は legacy 単一 token でも書けるため、行の状態だけでは
+  // 人の判断である証明にならない（b8d0fc5d: stored-review recovery の承認が repair budget を作り直す）。
+  // 決定と記録は同じ同期区間で連続して書く（間に await が無いので別 request は割り込まない）。
+  // 残る窓は 2 つの書き込みの間のプロセス停止だけで、そのとき行は「actor 記録の無い決定」になり、
+  // 読み側（`readApprovalActorClass()`）は unknown = 人ではない、と扱う（fail closed。authority は増えない）。
   app.patch<{ Params: { id: string } }>('/approval-requests/:id/status', async (req, reply) => {
     const result = UpdateStatusBody.safeParse(req.body)
     if (!result.success) {
@@ -988,6 +997,7 @@ export async function approvalGateRoutes(
           ...(approved.approvalRequest ? { status: approved.approvalRequest.status } : {}),
         })
       }
+      recordApprovalActor(storage, req.params.id, getCredentialClass(req))
       return reply.send(approved.approvalRequest)
     }
 
@@ -996,6 +1006,7 @@ export async function approvalGateRoutes(
       result.data.status as 'APPROVED' | 'REJECTED',
       result.data.reason,
     )
+    if (updated) recordApprovalActor(storage, req.params.id, getCredentialClass(req))
     return reply.send(updated)
   })
 

@@ -333,7 +333,11 @@ describe('POST /api/approval-requests/:id/consume', () => {
       await patchStatus(app, req.id, 'REJECTED', 'CEOが却下した')
 
       const { getStorage } = await import('../storage/index.js')
-      const entries = getStorage().auditLog.findByEntity('approval_request', req.id)
+      // 決定の行と、決定者（approval_actor）の行が1件ずつ残る。認証 hook の無いテスト app なので actor は human ではない。
+      const all = getStorage().auditLog.findByEntity('approval_request', req.id)
+      expect(all.filter((entry) => entry.operation === 'approval_actor')).toHaveLength(1)
+      expect(all.find((entry) => entry.operation === 'approval_actor')?.result).not.toBe('human')
+      const entries = all.filter((entry) => entry.operation !== 'approval_actor')
       expect(entries).toHaveLength(1)
       expect(entries[0]).toMatchObject({
         actor: 'api',
@@ -351,7 +355,11 @@ describe('POST /api/approval-requests/:id/consume', () => {
       await patchStatus(app, req.id, 'APPROVED', 'CEOが承認した')
 
       const { getStorage } = await import('../storage/index.js')
-      const entries = getStorage().auditLog.findByEntity('approval_request', req.id)
+      // 決定の行と、決定者（approval_actor）の行が1件ずつ残る。認証 hook の無いテスト app なので actor は human ではない。
+      const all = getStorage().auditLog.findByEntity('approval_request', req.id)
+      expect(all.filter((entry) => entry.operation === 'approval_actor')).toHaveLength(1)
+      expect(all.find((entry) => entry.operation === 'approval_actor')?.result).not.toBe('human')
+      const entries = all.filter((entry) => entry.operation !== 'approval_actor')
       expect(entries).toHaveLength(1)
       expect(entries[0]).toMatchObject({
         actor: 'api',
