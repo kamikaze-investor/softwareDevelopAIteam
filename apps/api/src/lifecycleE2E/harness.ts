@@ -709,6 +709,8 @@ export class LifecycleEnv {
         parked: task.parked,
         projectStatus: task.projectStatus ?? undefined,
         jobs: ordered,
+        // Mobile（`canShowResumeUI()`）は CEO の操作として resumedByHuman: true を渡す。同じ入力で判定する。
+        resumedByHuman: true,
         approvals,
         nowMs,
       }),
