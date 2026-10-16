@@ -156,9 +156,9 @@ async function highRiskTaskApproved(file: string) {
     ['git_commit', 'blocked'],
   ])
   expect(steps[1]!.gate).toMatchObject({ policy: 'continue_safe_work_only' })
-  // API says block_until_approved (policy-required human approval); since D2 the Worker's `resolvePolicy()`
-  // maps the API continuationPolicy as is (no local re-derivation from the HIGH risk).
-  expect(steps[2]!.gate).toMatchObject({ decision: 'BLOCKED', policy: 'block_until_approved' })
+  // API says block_until_approved (policy); the Worker's `resolvePolicy()` maps HIGH BLOCKED to safe-work-only,
+  // and git_commit is not a safe-work command, so the Job is reported blocked either way.
+  expect(steps[2]!.gate).toMatchObject({ decision: 'BLOCKED', policy: 'continue_safe_work_only' })
   const commitJob = env.jobsOf(task.id).find((job) => job.safeCommand.kind === 'git_commit')!
   expect(commitJob.status).toBe('blocked')
   // W3: the review's HIGH safe-work check created no request — only the Job-linked git_commit approval exists.
@@ -198,7 +198,7 @@ describe('N2: HIGH-risk diff — git_commit needs a Job-linked human approval', 
    *
    * 以前は Gate が ALLOW + call_consume / continuationPolicy=continue を返しても、Worker の `resolvePolicy()` が
    * ローカルの HIGH から continue_safe_work_only へ格下げし、git_commit は consume 前に blocked になっていた。
-   * 現在 `resolvePolicy()` は API の continuationPolicy をそのまま写す（ローカルのリスクは整合確認だけ）。
+   * 現在 `resolvePolicy()` は ALLOW（call_consume を含む）をローカルのリスクで格下げしない（D2 v4）。
    * Expected: 承認後の再実行で Gate は ALLOW + call_consume を返し、Worker は consume して commit し、Task は done。
    */
   for (const { label, file } of HIGH_CASES) {

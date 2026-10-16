@@ -32,6 +32,7 @@ import {
   canonicalizeJobUpdate,
   evaluateRecoverAdmission,
   evaluateResumeAdmission,
+  findGateTechnicalStopCode,
   runRiskReview,
   type ApprovalRequest,
   type Job,
@@ -425,7 +426,9 @@ export class WorkerSimulator {
       ...earlyEnd,
     })
     if (policy.policy === 'block_until_approved' || policy.policy === 're_check') {
-      await this.report(running, blocked(), step)
+      // `jobRunner.ts` と同じ: 技術的不整合の re_check（risk_rule_skew 等）は理由を stderr に残す。
+      const technicalStop = policy.policy === 're_check' && findGateTechnicalStopCode(policy.reason) !== undefined
+      await this.report(running, technicalStop ? { ...blocked(), stderr: policy.reason } : blocked(), step)
       return step
     }
     if (

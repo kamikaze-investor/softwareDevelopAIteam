@@ -99,8 +99,8 @@ async function highCommitWaiting(id: string, items = [{ id, title: `HIGH ${id}` 
   expect(steps.map((step) => [step.kind, step.reported])).toEqual([
     ['implement', 'success'], ['review', 'success'], ['git_commit', 'blocked'],
   ])
-  // API の continuationPolicy（policy 起因の人間承認 → block_until_approved）をそのまま写す。
-  expect(steps[2]!.gate).toMatchObject({ decision: 'BLOCKED', policy: 'block_until_approved', nextAction: 'wait_for_approval' })
+  // 従来どおり HIGH の BLOCKED は safe work only（git_commit は safe work ではないので blocked）。
+  expect(steps[2]!.gate).toMatchObject({ decision: 'BLOCKED', policy: 'continue_safe_work_only', nextAction: 'wait_for_approval' })
   const commitJob = env.jobsOf(task.id).find((job) => job.safeCommand.kind === 'git_commit')!
   const approval = waitingGitCommit(task.id)!
   expect(approval).toMatchObject({ riskLevel: 'HIGH' })
@@ -478,28 +478,42 @@ describe('D2 criterion 15: approved commit → Task done → continuation → ne
   })
 })
 
-describe('D2: local risk > API risk (worker/api rule skew) → blocked and visible, never executed', () => {
-  it('the approved commit is not consumed; the Job is blocked with the risk-inconsistency reason, visible in attention, and resumable', async () => {
+describe('D2 v4: local risk > API risk (worker/api rule skew) → technical re_check, visible, never auto-resumed', () => {
+  async function expectTechnicalStopNotAutoResumed(taskId: string, jobId: string): Promise<void> {
+    const item = (await env.systemState()).attention.find((a) => a.kind === 'job_blocked' && a.jobId === jobId)!
+    expect(item.detail).toContain('risk_rule_skew')
+    const { triageBlocked } = await import('../pl/blockedTriage.js')
+    expect(triageBlocked(env.storage, item)).toMatchObject({
+      rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation', requiresAuthorityChange: false, recoverable: false,
+    })
+    // Even when the provider diagnosis proposes a resume, the PL does not auto-resume a technical stop.
+    const before = env.jobsOf(taskId).length
+    await env.plTick({ diagnose: RESUME })
+    await env.plTick({ diagnose: RESUME })
+    expect(env.jobsOf(taskId).length).toBe(before)
+    expect(await env.worker.runUntilIdle()).toEqual([])
+    expect(env.escalations.some((e) => e.body.includes('risk_rule_skew'))).toBe(true)
+  }
+
+  it('git_commit: the approved commit is not consumed; blocked with risk_rule_skew in stderr, visible, not auto-resumed; resume after the fix commits', async () => {
     const { task, commitJob, approval, head } = await highCommitWaiting('skew')
     expect((await env.ceo.approve(approval.id)).statusCode).toBe(200)
     env.worker.localRiskOverride = () => 'CRITICAL'
     const steps = await env.worker.runUntilIdle()
     expect(steps.map((step) => [step.kind, step.reported, step.consumeStatus])).toEqual([['git_commit', 'blocked', undefined]])
-    expect(steps[0]!.gate).toMatchObject({
-      decision: 'ALLOW', nextAction: 'call_consume', policy: 'block_until_approved',
-      reason: 'risk inconsistency: local CRITICAL > API HIGH (worker/api rule skew)',
-    })
-    expect(env.storage.jobs.findById(commitJob.id)?.status).toBe('blocked')
+    expect(steps[0]!.gate).toMatchObject({ decision: 'ALLOW', nextAction: 'call_consume', policy: 're_check' })
+    expect(steps[0]!.gate!.reason).toMatch(/^risk_rule_skew: local CRITICAL > API HIGH \(worker\/api rule skew\)/)
+    expect(env.storage.jobs.findById(commitJob.id)).toMatchObject({ status: 'blocked' })
+    expect(env.storage.jobs.findById(commitJob.id)?.stderr).toMatch(/^risk_rule_skew: /)
     expect(env.storage.approvalRequests.findById(approval.id)?.status).toBe('APPROVED')
     expectNotCommitted(head, HIGH_FILE)
-    const attention = (await env.systemState()).attention
-    expect(attention.find((item) => item.kind === 'job_blocked' && item.jobId === commitJob.id)?.detail).toContain('approved_but_worker_blocked')
     expect((await env.mobileAdmission(task.id)).resume).toEqual({ ok: true })
+    await expectTechnicalStopNotAutoResumed(task.id, commitJob.id)
+    expectNotCommitted(head, HIGH_FILE)
 
-    // Once the versions agree again, the existing resume is the exit.
+    // After the cause is fixed, a (human) resume is the exit; the new git_commit Job asks for a new approval.
     env.worker.localRiskOverride = undefined
     expect((await env.ceo.resume(task.id)).statusCode).toBe(201)
-    // The resumed git_commit is a new Job, so it gets its own Job-linked approval (one approval per Job).
     const resumedRun = await env.worker.runUntilIdle()
     expect(resumedRun.map((step) => [step.kind, step.reported])).toEqual([['git_commit', 'blocked']])
     const waiting = waitingGitCommit(task.id)!
@@ -509,5 +523,32 @@ describe('D2: local risk > API risk (worker/api rule skew) → blocked and visib
     expect(steps2.map((step) => [step.kind, step.reported, step.consumeStatus])).toEqual([['git_commit', 'success', 200]])
     expect(env.task(task.id).status).toBe('done')
     expect(headCommit()).not.toBe(head)
+  })
+
+  it('non-git (review git_status, a safe-work kind): skew → technical re_check before any safe work, visible, not auto-resumed; resume after the fix continues', async () => {
+    env = await startLifecycle({ ledger: buildLedger([{ id: 'skew-review', title: 'HIGH skew review' }]) })
+    const project = createRunningProject(env)
+    env.adoptionAllowedPaths = [HIGH_FILE]
+    env.worker.behaviors.implement = () => ({ kind: 'change', files: { [HIGH_FILE]: '# Goal\n\nskew review\n' } })
+    const task = await env.adoptNext(project.id, 'skew-review')
+    const head = headCommit()
+    expect((await env.worker.pollOnce())).toMatchObject({ kind: 'implement', reported: 'success' })
+
+    env.worker.localRiskOverride = () => 'CRITICAL'
+    const steps = await env.worker.runUntilIdle()
+    expect(steps.map((step) => [step.kind, step.reported])).toEqual([['review', 'blocked']])
+    // The API says BLOCKED / continue_safe_work_only (HIGH safe work); the Worker does NOT run it as safe work.
+    expect(steps[0]!.gate).toMatchObject({ decision: 'BLOCKED', policy: 're_check' })
+    expect(steps[0]!.gate!.reason).toMatch(/^risk_rule_skew: local CRITICAL > API HIGH/)
+    const review = env.jobsOf(task.id).find((job) => job.aiCliMode === 'review')!
+    expect(review.status).toBe('blocked')
+    expect(env.jobsOf(task.id).some((job) => job.safeCommand.kind === 'git_commit')).toBe(false)
+    await expectTechnicalStopNotAutoResumed(task.id, review.id)
+
+    env.worker.localRiskOverride = undefined
+    expect((await env.ceo.resume(task.id)).statusCode).toBe(201)
+    const rest = await env.worker.runUntilIdle()
+    expect(rest.map((step) => [step.kind, step.reported])).toEqual([['review', 'success'], ['git_commit', 'blocked']])
+    expectNotCommitted(head, HIGH_FILE)
   })
 })
