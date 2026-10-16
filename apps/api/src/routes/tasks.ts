@@ -145,7 +145,9 @@ const TASK_DONE_REFUSAL = {
   error:
     'A task cannot be marked done through this generic route. '
     + 'Completion is recorded by the git_commit job completion path, or by '
-    + 'POST /api/tasks/:id/reconcile-external-completion for work completed outside the loop',
+    + 'POST /api/tasks/:id/reconcile-external-completion for work completed outside the loop '
+    + '(a task that still has blocked jobs must first be parked with abort_task, which observes the '
+    + 'worktree and releases them, or be resumed)',
   code: 'TASK_DONE_USE_COMPLETION_ROUTE',
 } as const
 
