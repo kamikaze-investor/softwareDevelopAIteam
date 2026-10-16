@@ -51,14 +51,18 @@ const ANTIGRAVITY_CLAUDE_FALLBACK_MODEL = 'claude-sonnet-4-6'
  * 識別子（`gemini-3.5-flash-medium` 等、2026-08-24 時点の形式）は現行 agy では
  * `not recognized as a known model` になる。2026-09-04 実測。
  *
+ * agy 1.3.6（2026-10-16 実測）が受け付ける Gemini は Gemini 3.8 Flash（High / Medium / Low）だけで、
+ * `gemini-3.6-flash` は一覧から消えた。消えた id には `--effort is not supported for model` と出るが、
+ * 実態は未知モデルである。`gemini-3.8-flash` は `--effort medium` / `low` の両方で応答することを確認済み。
+ *
  * ここで対のオブジェクトとして持つのは、片方だけを指定して確定的に失敗する呼び出しを
  * 構造的に防ぐため。**これは Gemini REST API のモデル名とは別の名前空間**であり、
  * `apiModel` 側へ流用してはならない。
  */
-export const AGY_REVIEW_MODEL = { cliModel: 'gemini-3.6-flash', cliEffort: 'medium' } as const
+export const AGY_REVIEW_MODEL = { cliModel: 'gemini-3.8-flash', cliEffort: 'medium' } as const
 
 /** 軽量用途（alignment check・watchdog 分析・audit 説明文）向けの agy モデル指定。 */
-export const AGY_LIGHT_MODEL = { cliModel: 'gemini-3.6-flash', cliEffort: 'low' } as const
+export const AGY_LIGHT_MODEL = { cliModel: 'gemini-3.8-flash', cliEffort: 'low' } as const
 
 export interface GeminiRouterOptions {
   /** CLI を優先する場合 true（デフォルト false = API優先） */
