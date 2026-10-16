@@ -53,6 +53,11 @@ export const HUMAN_ONLY_ROUTES: readonly HumanOnlyRouteEntry[] = [
   // 載っていないので既に ADMIN だけだが、legacy 単一 token / 認証なしの構成では token を持つ誰でも
   // （Worker を含む）承認できてしまっていた。承認の authority を deployment mode に依存させない。
   { method: 'PATCH', url: '/api/approval-requests/:id/status' },
+  // Legacy CEO Approval（goal_change / billing / deployment 等）の承認 / 却下（2026-10-17 監査 P2）。
+  // 決定は CEO の判断そのものなので、上と同じく主体を区別できない構成では実行させない。
+  // この記録は PL の `ceo_approval` 根拠には使えない（`pl/actionGate.ts` の checkCeoApproval が常に拒否）が、
+  // 人の判断を記録する route である以上、誰が決めたかを deployment mode に依存させない。
+  { method: 'PATCH', url: '/api/approvals/:id' },
 ]
 
 /**

@@ -46,6 +46,24 @@ describe('escalateTaskToHuman', () => {
     expect(escalations(storage, taskId).map((row) => row.result)).toEqual(['not_moved_done'])
   })
 
+  it('precondition は同じ transaction の中で評価され、崩れていれば何も書かない', () => {
+    const { storage, taskId } = seed('pending')
+
+    const result = escalateTaskToHuman(storage, taskId, 'r', { precondition: (task) => `saw ${task.status}` })
+
+    expect(result).toEqual({ result: 'precondition_failed', reason: 'saw pending' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+    expect(escalations(storage, taskId)).toEqual([])
+  })
+
+  it('precondition が成立すれば blocked にして結果を返す', () => {
+    const { storage, taskId } = seed('pending')
+
+    expect(escalateTaskToHuman(storage, taskId, 'r', { precondition: () => undefined })).toEqual({ result: 'blocked' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    expect(escalations(storage, taskId).map((row) => row.result)).toEqual(['blocked'])
+  })
+
   it('既に blocked の Task でも escalation の理由は残る', () => {
     const { storage, taskId } = seed('blocked')
 

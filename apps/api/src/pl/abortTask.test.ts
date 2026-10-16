@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
-import { occupiesProject, type JobWorkspaceBaseline } from '@ai-team/shared'
+import { evaluateResumeAdmission, occupiesProject, type JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { recordApprovalActor } from '../designReview/resumeActor'
+import { recordApprovalActor, withApprovalActorFacts } from '../designReview/resumeActor'
 import { buildSystemState } from '../state/systemState'
 import { recoverBlockedTask } from '../humanRecovery/recoverBlockedTask'
 import { abortTask, completeAbortCleanup, requestTechnicalAbort } from './abortTask'
@@ -435,6 +435,158 @@ describe('abortTask — 段階1: 前提条件と承認', () => {
     expect(result).toMatchObject({ ok: true, status: 'parked' })
     expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(false)
     expect(fx.storage.tasks.findById(fx.taskId)?.status).toBe('pending')
+  })
+
+  // 2026-10-17 F-1: cleanup の当てが無いのに最新 Job が dirty な終了 fingerprint を残していれば、
+  // 所有者の居ない差分の上で黙って park しない（次の採用が quarantine される）。ファイルには触れない。
+  const DIRTY_END: JobWorkspaceBaseline = {
+    mode: 'dirty',
+    startCommitHash: '0805249b',
+    entries: [{ path: 'docs/a.md', kind: 'modified' }],
+  } as JobWorkspaceBaseline
+
+  it('解放すべき Job が無くても、最新 Job の終了 workspace が dirty なら park せず blocked へ escalation し、Human Resume が admit される', () => {
+    const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+    // 前提: pending + 最新 Job failed は resume も recover も admit されない（これが行き止まりだった）
+    const admissionInput = () => ({
+      taskStatus: fx.storage.tasks.findById(fx.taskId)!.status,
+      parked: fx.storage.tasks.isParked(fx.taskId),
+      projectStatus: fx.storage.projects.findById(fx.projectId)!.status,
+      jobs: fx.storage.jobs.findByTaskId(fx.taskId),
+      approvals: withApprovalActorFacts(fx.storage, fx.storage.approvalRequests.findByTaskId(fx.taskId)),
+      repairDesignReviewInFlight: fx.storage.tasks.hasRepairDesignReviewInFlight(fx.taskId),
+      nowMs: Date.now(),
+      resumedByHuman: true,
+    })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    expect(evaluateResumeAdmission(admissionInput())).toEqual({ ok: false, code: 'LATEST_JOB_NOT_BLOCKED' })
+
+    const result = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })
+
+    expect(result).toMatchObject({
+      ok: false, code: 'UNATTRIBUTED_DIRTY_WORKSPACE', details: { escalatedTaskStatus: 'blocked' },
+    })
+    expect(result.ok ? '' : result.reason).toContain('Human Resume')
+    const task = fx.storage.tasks.findById(fx.taskId)!
+    expect(task.status).toBe('blocked')
+    expect(task.roadmapActive).toBe(true)
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    // 何も破棄していない: Job も fingerprint もそのまま
+    expect(fx.storage.jobs.findById(fx.jobId)).toMatchObject({
+      status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END },
+    })
+    // escalation の理由が既存の audit に残る
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .some((entry) => entry.operation === 'task_escalated_to_human' && entry.result === 'blocked')).toBe(true)
+    // 共有 admission（API / Mobile と同じ関数）で Human Resume が通る
+    expect(evaluateResumeAdmission(admissionInput())).toEqual({ ok: true })
+  })
+
+  // Codex review c3-b round 2: 判定の後・blocked へ上げる前に前提が崩れたら、何も書かずに TASK_STATE_CHANGED。
+  // 読み直しは escalation と同じ IMMEDIATE transaction の中で行う（ここでは transaction 開始直前に割り込む）。
+  it.each([
+    {
+      label: 'project に live Job が入った',
+      mutate: (fx: Fixture) => fx.storage.jobs.create({
+        taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0]),
+    },
+    {
+      label: 'Task が別経路で blocked になった',
+      mutate: (fx: Fixture) => fx.storage.tasks.update(fx.taskId, { status: 'blocked' }),
+    },
+    {
+      label: '最新 Job の fingerprint が変わった',
+      mutate: (fx: Fixture) => fx.storage.jobs.update(fx.jobId, { failureMetadata: { workspaceEndFingerprint: BASELINE } }),
+    },
+    {
+      label: '承認した request が使えなくなった',
+      mutate: (fx: Fixture, approvalRequestId: string) =>
+        fx.storage.approvalRequests.updateStatus(approvalRequestId, 'SUPERSEDED', undefined, true),
+    },
+  ])('前提が崩れたら TASK_STATE_CHANGED で何も書かない: $label', ({ mutate }) => {
+    const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    const original = fx.storage.tasks.escalateToHuman.bind(fx.storage.tasks)
+    fx.storage.tasks.escalateToHuman = (input) => {
+      mutate(fx, approvalRequestId)
+      return original(input)
+    }
+    const statusBefore = () => fx.storage.tasks.findById(fx.taskId)!.status
+
+    const result = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: false, code: 'TASK_STATE_CHANGED' })
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'task_escalated_to_human')).toEqual([])
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    expect(['pending', 'blocked']).toContain(statusBefore())
+  })
+
+  it('終了 workspace が clean / fingerprint 無し（legacy）なら従来どおり park する', () => {
+    for (const fingerprint of [BASELINE, undefined]) {
+      const fx = seed()
+      fx.storage.jobs.update(fx.jobId, {
+        status: 'failed',
+        ...(fingerprint === undefined ? {} : { failureMetadata: { workspaceEndFingerprint: fingerprint } }),
+      })
+      expect(abortTask(fx.storage, {
+        taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+      })).toMatchObject({ ok: true, status: 'parked' })
+    }
+  })
+
+  it('別 Project の後続 Job が同じ workingDir で走っていても、その差分はこの Task のものではない（Project を問わない）', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+    const otherProject = fx.storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'paused' })
+    const otherTask = fx.storage.tasks.create({
+      projectId: otherProject.id, title: 'other', description: 'd', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const own = fx.storage.jobs.findById(fx.jobId)!
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date(Date.parse(own.createdAt) + 1000))
+      fx.storage.jobs.create({
+        taskId: otherTask.id, projectId: otherProject.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'parked' })
+  })
+
+  it('dirty な終了の後に同じ workingDir で別 Task の Job が走っていれば、その差分はこの Task のものではない', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+    const other = fx.storage.tasks.create({
+      projectId: fx.projectId, title: 'later', description: 'd', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    // created_at は ISO 文字列。同一ミリ秒にならないよう、後の Job は時計を進めてから作る。
+    const own = fx.storage.jobs.findById(fx.jobId)!
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date(Date.parse(own.createdAt) + 1000))
+      fx.storage.jobs.create({
+        taskId: other.id, projectId: fx.projectId, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'parked' })
   })
 })
 
