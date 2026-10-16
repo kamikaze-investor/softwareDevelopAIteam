@@ -119,7 +119,7 @@ export type ReconcileExternalCompletionResult =
   | { ok: true; task: Task; continuation: TaskContinuation }
   | {
       ok: false
-      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'STORAGE_ERROR'
+      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'TASK_HAS_BLOCKED_JOBS' | 'STORAGE_ERROR'
       reason: string
     }
 export type PersistProviderTimeoutFailureResult =
@@ -462,6 +462,13 @@ export interface IJobStorage {
     outboxEvent?: OutboxEventInput,
     queueDesignReview?: QueuedDesignReviewRunInput,
   ): UpdateWithOutboxEventResult
+  /**
+   * Outbox event がこの Job に既に適用済みか（読み取りのみ。書き込み経路の dedup と同じ照合）。
+   * - `deduplicated`: 同じ eventId・同じ payloadHash が適用済み（完全な再送）
+   * - `conflict`: 同じ eventId が別の Job か別の payloadHash で適用済み
+   * - `new`: 未適用（または outboxEvent 無し）
+   */
+  classifyOutboxEvent(jobId: string, outboxEvent: OutboxEventInput | undefined): 'new' | 'deduplicated' | 'conflict'
   /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
   persistCommitSuccessWithContinuation(input: {
     jobId: string

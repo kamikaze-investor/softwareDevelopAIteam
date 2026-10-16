@@ -1102,8 +1102,10 @@ function ceoDecisionAndOptions(
         'protected な runtime / infrastructure への最小変更を、Maintenance Lane（Tier B）として '
         + '外部実行者へ出してよいか。',
       options: [
-        'Tier B として最小差分だけを外部実行者へ出し、Independent Review / CI を通して '
-        + '`reconcile_external_completion` で戻す',
+        'Tier B として最小差分だけを外部実行者へ出し、Independent Review / CI を通したら、'
+        + '先に `abort_task` で park し（Worker が worktree を観測して blocked Job を解放する）、'
+        + 'その後 `reconcile_external_completion` で戻す。'
+        + '**blocked Job が残ったままでは `TASK_HAS_BLOCKED_JOBS` で取り込めない**',
         'protected 領域に触れない代替設計を Independent Remediation へ回す',
         'この Task を park する（`abort_task`）',
       ],

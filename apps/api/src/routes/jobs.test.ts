@@ -622,6 +622,63 @@ describe('Job API', () => {
     },
   )
 
+  // lifecycle repair C2: 適用しない遷移を 200 で「成功したように」見せない。200 + no-op は
+  // Outbox 配送（eventId 付き。at-least-once の遅延・重複 result）にだけ使う。
+  describe('PATCH with a non-applicable transition', () => {
+    async function storedJob(status: 'blocked' | 'failed' | 'success') {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'T', description: '', status: 'blocked', assignee: 'developer_ai', dependencies: [],
+      })
+      const job = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status,
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      } as Parameters<typeof storage.jobs.create>[0])
+      return { storage, job }
+    }
+
+    it('a direct blocked -> failed is refused with 409 JOB_TRANSITION_NOT_APPLICABLE and nothing changes', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('blocked')
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'failed', stderr: 'x' } })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string; error: string }>(res.body)).toMatchObject({ code: 'JOB_TRANSITION_NOT_APPLICABLE' })
+        expect(storage.jobs.findById(job.id)).toMatchObject({ status: 'blocked' })
+        expect(storage.jobs.findById(job.id)?.stderr).toBeUndefined()
+      })
+    })
+
+    it('a direct claim of an already-terminal Job is refused with the definitive JOB_CLAIM_REFUSED (the Worker must not run it)', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('failed')
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'running' } })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+        expect(storage.jobs.findById(job.id)?.status).toBe('failed')
+      })
+    })
+
+    it('an Outbox delivery (eventId) of a stale terminal result keeps the at-least-once contract: 200, status not applied', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('success')
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`,
+          payload: withOutbox({ status: 'failed', stderr: 'late' }, 'stale-terminal-result'),
+        })
+
+        expect(res.statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('success')
+      })
+    })
+  })
+
   describe('claim guard: another Task that is a live workspace owner (W5)', () => {
     async function setup(app: FastifyInstance) {
       const { getStorage } = await import('../storage/index.js')
@@ -681,8 +738,12 @@ describe('Job API', () => {
       })
     })
 
-    it('a blocked row left on a done Task elsewhere is still an owner (no API-side release proof)', async () => {
+    // lifecycle repair C2: done な Task の非 quarantine blocked 行は shared `holdsWorkspaceWhenBlocked` では
+    // 所有者ではない（stale 候補）。解放は Worker の worktree 観測、dirty の保護は baseline admission。
+    // 以前はここで 409 を返し、Worker が解放した後も claim が永久に止まった（出口なし）。
+    it('a legacy blocked row on a done Task elsewhere does not refuse the claim, and systemState reports no stalled owner for it', async () => {
       await withApp(async (app) => {
+        const { buildSystemState } = await import('../state/systemState.js')
         const { storage, job, pausedId } = await setup(app)
         const doneTask = storage.tasks.create({
           projectId: pausedId, title: 'Done', description: '', status: 'done',
@@ -693,7 +754,83 @@ describe('Job API', () => {
           safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
         } as Parameters<typeof storage.jobs.create>[0])
 
+        // claim の前の観測: claim を止める所有者が居ないので attention は出ない（guard と同じ意味）。
+        expect(buildSystemState(storage).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('running')
+      })
+    })
+
+    // Codex review (C2): park は全 Job の終端化と観測済みの clean 解放を要求するので、park された
+    // Task に残る非 quarantine の blocked 行は done Task の行と同じ legacy 行。以前は resume / abort /
+    // PATCH / reconcile のどれも通らず、claim が永久に止まった。
+    it('a legacy blocked row on a parked Task elsewhere does not refuse the claim; no stalled-owner attention; GET /api/tasks reports parked', async () => {
+      await withApp(async (app) => {
+        const { buildSystemState } = await import('../state/systemState.js')
+        const { storage, job, pausedId } = await setup(app)
+        const parkedTask = storage.tasks.create({
+          projectId: pausedId, title: 'Parked', description: '', status: 'pending',
+          assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+        } as Parameters<typeof storage.tasks.create>[0])
+        storage.auditLog.record({
+          actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: parkedTask.id, result: 'success',
+        })
+        storage.jobs.create({
+          taskId: parkedTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+
+        const listed = parseBody<Array<{ id: string; parked?: boolean }>>(
+          (await app.inject({ method: 'GET', url: `/api/tasks?projectId=${pausedId}` })).body)
+        expect(listed.find((task) => task.id === parkedTask.id)?.parked).toBe(true)
+        expect(buildSystemState(storage).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+        expect((await claim(app, job.id)).statusCode).toBe(200)
+      })
+    })
+
+    // Codex review (C2): quarantine が優先する。startup reconciliation は quarantine された source を
+    // 意図的に blocked のまま残し、Worker はすべての quarantine 行を所有者とするので、API も同じにする。
+    it('a quarantined blocked source superseded by a human resume is still an owner: claim refused, workspace_quarantined raised', async () => {
+      await withApp(async (app) => {
+        const { recordResumeActor } = await import('../designReview/resumeActor.js')
+        const { buildSystemState } = await import('../state/systemState.js')
+        const { storage, job, otherTask, pausedId } = await setup(app)
+        const source = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        storage.jobs.update(source.id, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
+        const successor = storage.jobs.create({
+          taskId: otherTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'success',
+          workflowStepKey: `resume:${source.id}:1`,
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        recordResumeActor(storage, { jobId: successor.id, taskId: otherTask.id, actorClass: 'human', evidence: 'admin_credential' })
+
+        expect(buildSystemState(storage).attention
+          .some((item) => item.kind === 'workspace_quarantined' && item.jobId === source.id)).toBe(true)
         expect((await claim(app, job.id)).statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+      })
+    })
+
+    it('a quarantined blocked row on a done Task elsewhere is still an owner', async () => {
+      await withApp(async (app) => {
+        const { storage, job, pausedId } = await setup(app)
+        const doneTask = storage.tasks.create({
+          projectId: pausedId, title: 'Done', description: '', status: 'done',
+          assignee: 'developer_ai', dependencies: [],
+        })
+        const row = storage.jobs.create({
+          taskId: doneTask.id, projectId: pausedId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        storage.jobs.update(row.id, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
+
+        expect((await claim(app, job.id)).statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('queued')
       })
     })
 
@@ -1317,6 +1454,50 @@ describe('Job API', () => {
       expect(parseBody<{ error: string }>(res.body).error).toContain('write-once')
       expect(storage.jobs.findById(created.id)?.failureMetadata?.workspaceEndFingerprint)
         .toEqual({ mode: 'clean', startCommitHash: 'original' })
+    })
+  })
+
+  // **応答が失われた fingerprint 付き端末 PATCH の再送は deduplicated 200**（lifecycle repair C2）。
+  // write-once / running-only の検査が Outbox dedup より先に走っていたため、完全な再送が 409 になり、
+  // Worker の Outbox event は pending のまま残って intake が止まっていた。
+  it('PATCH /api/jobs/:id: fingerprint 付き端末 PATCH の完全な再送は 200 deduplicated で、状態を変えない', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      await app.inject({ method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'running' } })
+      const terminal = withOutbox({
+        status: 'failed',
+        exitCode: 1,
+        failureMetadata: { workspaceEndFingerprint: { mode: 'clean' as const, startCommitHash: '0805249b' } },
+      }, 'evt-fingerprint-terminal')
+
+      const first = await app.inject({ method: 'PATCH', url: `/api/jobs/${created.id}`, payload: terminal })
+      expect(first.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(first.body).outbox).toEqual({ eventId: 'evt-fingerprint-terminal', deduplicated: false })
+      const { getStorage } = await import('../storage/index.js')
+      const before = getStorage().jobs.findById(created.id)
+
+      const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${created.id}`, payload: terminal })
+
+      expect(replay.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(replay.body).outbox).toEqual({ eventId: 'evt-fingerprint-terminal', deduplicated: true })
+      expect(getStorage().jobs.findById(created.id)).toEqual(before)
+
+      // 同じ eventId で payload が違う再送は従来どおり拒否する。
+      const tampered = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          ...withOutbox({
+            status: 'failed',
+            exitCode: 2,
+            failureMetadata: { workspaceEndFingerprint: { mode: 'clean' as const, startCommitHash: 'other' } },
+          }, 'evt-fingerprint-terminal'),
+        },
+      })
+      expect(tampered.statusCode).toBe(409)
+      expect(getStorage().jobs.findById(created.id)).toEqual(before)
     })
   })
 

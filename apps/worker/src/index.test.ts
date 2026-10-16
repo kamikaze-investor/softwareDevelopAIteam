@@ -8,6 +8,7 @@ const outboxMocks = vi.hoisted(() => ({
   deletePending: vi.fn(),
   resendPending: vi.fn(),
   hasPending: vi.fn(),
+  hasPendingFor: vi.fn(),
 }))
 
 const jobStateMocks = vi.hoisted(() => ({
@@ -114,6 +115,7 @@ beforeEach(() => {
   outboxMocks.deletePending.mockReset()
   outboxMocks.resendPending.mockReset()
   outboxMocks.hasPending.mockReset()
+  outboxMocks.hasPendingFor.mockReset()
   jobStateMocks.recoverStaleJobs.mockReset()
   watchdogMocks.startWatchdog.mockReset()
   notifierMocks.sendAlert.mockReset()
@@ -128,6 +130,7 @@ beforeEach(() => {
   })
   outboxMocks.resendPending.mockResolvedValue(undefined)
   outboxMocks.hasPending.mockReturnValue(false)
+  outboxMocks.hasPendingFor.mockReturnValue(false)
   jobStateMocks.recoverStaleJobs.mockResolvedValue(0)
   notifierMocks.sendAlert.mockResolvedValue([])
   jobRunnerMocks.computeWorkspaceBaseline.mockReturnValue({ ok: true, baseline: CLEAN_BASELINE })
@@ -1247,9 +1250,44 @@ describe('outbox gating', () => {
     expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
     expect(watchdogMocks.startWatchdog).toHaveBeenCalledTimes(1)
 
-    // pollJobs自体も開始しており、最初のcycleでpendingの再送を試みている
-    expect(outboxMocks.resendPending).toHaveBeenCalledTimes(1)
+    // recovery 前の1回（H-01）に加えて、pollJobs自体も開始しており、最初のcycleでpendingの再送を試みている
+    expect(outboxMocks.resendPending).toHaveBeenCalledTimes(2)
     // pendingが残っている間はqueued Job fetchだけがこのcycleでskipされる（既存仕様）
+    expectNoQueuedJobFetch()
+  })
+
+  it('start replays the durable Outbox before stale-Job recovery and passes the per-Job pending check to recovery (H-01)', async () => {
+    vi.useFakeTimers()
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const order: string[] = []
+    outboxMocks.hasPending.mockReturnValueOnce(true).mockReturnValue(false)
+    outboxMocks.resendPending.mockImplementation(async () => { order.push('replay') })
+    jobStateMocks.recoverStaleJobs.mockImplementation(async () => { order.push('recovery'); return 0 })
+    outboxMocks.hasPendingFor.mockImplementation((jobId: string) => jobId === 'job-with-pending-result')
+
+    void start()
+    await flushPollCycle()
+
+    expect(order).toEqual(['replay', 'recovery'])
+    const options = jobStateMocks.recoverStaleJobs.mock.calls[0]?.[2] as
+      { hasPendingTerminalEvent?: (jobId: string) => boolean } | undefined
+    expect(options?.hasPendingTerminalEvent?.('job-with-pending-result')).toBe(true)
+    expect(options?.hasPendingTerminalEvent?.('job-without')).toBe(false)
+  })
+
+  it('a throwing startup replay still lets recovery, watchdog and polling start', async () => {
+    vi.useFakeTimers()
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockRejectedValue(new Error('outbox db locked'))
+
+    void start()
+    await flushPollCycle()
+
+    expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
+    expect(watchdogMocks.startWatchdog).toHaveBeenCalledTimes(1)
     expectNoQueuedJobFetch()
   })
 
@@ -1260,9 +1298,8 @@ describe('outbox gating', () => {
     outboxMocks.hasPending.mockReturnValue(true)
 
     void start()
-    await Promise.resolve()
-    await Promise.resolve()
-    await Promise.resolve()
+    // start() は recovery の前に1回だけ Outbox を再送する（H-01）ので、microtask を流し切る
+    await flushPollCycle()
 
     expect(jobStateMocks.recoverStaleJobs).toHaveBeenCalledTimes(1)
     expect(watchdogMocks.startWatchdog).toHaveBeenCalledTimes(1)

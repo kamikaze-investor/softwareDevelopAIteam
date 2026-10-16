@@ -112,7 +112,7 @@ export type AbortTaskResult =
  * ここで独自に「blocked なら所有者」と決めていたため、2026-09-17 の Operational E2E では
  * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
  */
-function holdsWorkspaceOwnership(task: { status: string }, job: Job): boolean {
+function holdsWorkspaceOwnership(task: { status: string; parked?: boolean }, job: Job): boolean {
   return holdsWorkspaceWhenBlocked(task, job)
 }
 
@@ -277,7 +277,10 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   const cleanupTargets = isTerminalBlockedTask ? [taskJobs[0]] : owning
 
   // 他 Task が workspace を所有したままなら park しても workspace は解放されない。
+  // park 状態を shared 述語へ渡す（park された Task の非 quarantine blocked 行は stale 候補。
+  // claim guard / Worker と同じ意味。lifecycle repair C2）。
   const otherTasks = projectTasks.filter((candidate) => candidate.id !== task.id)
+    .map((candidate) => ({ ...candidate, parked: storage.tasks.isParked(candidate.id) }))
   const foreign = otherTasks.flatMap((candidate) =>
     storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(candidate, job)))
   if (foreign.length > 0) {
@@ -1036,7 +1039,7 @@ function technicalOwnershipFailure(
         if (job.safeCommand?.workingDir !== workingDir) continue
         if (
           isLiveJob(job)
-          || holdsWorkspaceOwnership(otherTask, job)
+          || holdsWorkspaceOwnership({ ...otherTask, parked: storage.tasks.isParked(otherTask.id) }, job)
           || occupiesProject(otherTask)
         ) {
           return {
