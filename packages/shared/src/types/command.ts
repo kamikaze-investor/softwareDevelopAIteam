@@ -36,7 +36,7 @@ export interface SafeCommandParams {
   /**
    * test: 固定された検証プロファイル。`'implement'` は typecheck → test の順に実行する
    * （commandResolver が root の `verify:implement` script へ固定解決する）。
-   * 任意コマンドを選ばせるものではなく、既知の値以外は API が拒否する。testPattern とは併用不可。
+   * サーバー側の Implement producer だけが付ける（POST /api/jobs はクライアントからの指定を拒否する）。
    */
   verificationProfile?: 'implement'
 
