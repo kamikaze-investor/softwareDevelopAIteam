@@ -11963,8 +11963,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       |---|---|---|
       | W1 | 復旧 Authority を意味で判定する（`approval_actor` による人間の承認 evidence を含む）。resume admission を1つの共有述語へ | RC1・RC2 |
       | W2 | Design Review の判定 pipeline（未判定と否定判定の区別）と evidence supersession（同じ設計の最新判定が古い ALIGNED に優先） | RC3 |
-      | W3 | git_commit Approval への DA trigger 7（未解決の review 不一致）開示 | RC6 |
-      | W4 | Approval の identity を判断ごとに持たせ、「承認待ち」を canonical な1つの述語にする | RC2・RC4 |
+      | W3 | Approval の identity を判断ごと（CODEOWNERS 単位）に持たせる: request は自分の `requestedAction` だけを承認する / 全 creator で atomic な supersede-and-create / 誰も待たない HIGH safe-work check には request を作らない / PL の `approval_gate` を期待 action に束縛 / 判断へ `approval_actor` evidence を記録 / `RISK_RULES` で DA trigger (2) の path coverage（`rules/**`・authority files）/ git_commit Approval への DA trigger 7（未解決の review 不一致）開示 / gate-policy-v3 | RC1・RC4・RC6 |
+      | W4 | 「承認待ち」を canonical な1つの述語にする（W3 の判断単位 identity を前提にする） | RC2・RC4 |
       | W5 | 停止の可視化・claim guard・inactive Project が保持する workspace の attention | RC5 |
       | W6 | Mobile の resume / recover 表示を共有 admission 述語から導く | RC2 |
       | W7 | ledger（本項目の登録と `independent-review-verdict-instability` の `deferred` 化） | — |
