@@ -213,6 +213,17 @@ function runnerReportedUnavailable(raw: RawStrategicResult): boolean {
     || marked(raw.integrationReviewResult)
 }
 
+/**
+ * payload の中に有効な（enum 上正しい）CONFLICT 判定が1件でもあるか。構造が崩れていても使える
+ * 判定だけを拾う。CONFLICT は ALIGNED から遠ざける向きにしか働かないので、ここで採用してよい。
+ */
+function payloadHasValidConflict(raw: RawStrategicResult): boolean {
+  const isConflict = (value: unknown): boolean =>
+    typeof value === 'object' && value !== null && (value as { decision?: unknown }).decision === 'CONFLICT'
+  return (Array.isArray(raw.focusedReviewResults) && raw.focusedReviewResults.some(isConflict))
+    || isConflict(raw.integrationReviewResult)
+}
+
 function isFocusResultArray(value: unknown): value is Array<{ focus: string; decision: string }> {
   return (
     Array.isArray(value) &&
@@ -324,14 +335,15 @@ export function recomputeDecision(
   // 「Claudeが落ちたので統合を省いて続行」を許すと、単独のGemini群だけで承認が通る。
   const integrationReviewRequired = reviewKind === 'roadmap'
 
-  // **runner が「review を実行できなかった」と申告したときの結果**（task kind のみ）。
+  // **runner が「review を実行できなかった」と申告したときの結果**（task / roadmap 両 kind）。
   //
   // 申告は判定を厳しくする向きにしか使わない。**focused / integration を組み直して CONFLICT に
   // なるなら、それを先に返す**（下の各 return 参照）。CONFLICT でないときだけ判定無しにする。
   //
   // 以前は low load でこの申告を見た時点で早期 return していたため、integration の CONFLICT が
   // 組み直されずに REVIEW_UNAVAILABLE へ置き換わっていた（独立レビュー指摘・2026-10-16）。
-  const runnerUnavailable = reviewKind === 'task' && runnerReportedUnavailable(raw)
+  // retry（finalizeFailure）は task kind だけで、roadmap kind の非 ALIGNED 終端は従来どおり。
+  const runnerUnavailable = runnerReportedUnavailable(raw)
   const unavailableOutcome = (verdict?: string): RecomputeOutcome => {
     const reason = typeof raw.unavailableReason === 'string' && raw.unavailableReason.trim() !== ''
       ? raw.unavailableReason.trim().slice(0, 500)
@@ -350,15 +362,28 @@ export function recomputeDecision(
   // 合わないことがあり、そのまま reject すると本当の原因が `focus set mismatch` に置き換わる
   // （2026-09-28 production・run `d0af140a`: prompt.md の ENOENT が focus set mismatch として
   // escalation された）。medium 以上と roadmap kind の構造検証は従来どおり UNCERTAIN で reject する。
-  const reject = (rejectedReason: string): RecomputeOutcome =>
-    runnerUnavailable && expectedFocuses.length === 0
-      ? unavailableOutcome()
-      : {
-          decision: 'UNCERTAIN',
-          reviewLoad,
-          independentReviewRequired,
-          rejectedReason,
-        }
+  //
+  // **ただし変換の前に、payload に残っている有効な CONFLICT を探す。** focus 集合が崩れていても
+  // integration や個々の focus が有効な CONFLICT を返していれば、それは判定であり隠してはならない
+  // （独立レビュー指摘・2026-10-16: 旧形 focus + integration CONFLICT が REVIEW_UNAVAILABLE になった）。
+  const reject = (rejectedReason: string): RecomputeOutcome => {
+    if (reviewKind === 'task' && runnerUnavailable && expectedFocuses.length === 0) {
+      return payloadHasValidConflict(raw)
+        ? {
+            decision: 'CONFLICT',
+            reviewLoad,
+            independentReviewRequired,
+            rejectedReason: `CONFLICT reported in a partially invalid payload (${rejectedReason})`,
+          }
+        : unavailableOutcome()
+    }
+    return {
+      decision: 'UNCERTAIN',
+      reviewLoad,
+      independentReviewRequired,
+      rejectedReason,
+    }
+  }
 
   if (!isFocusResultArray(raw.focusedReviewResults)) {
     return reject('focusedReviewResults has invalid shape')
@@ -467,7 +492,7 @@ export function recomputeDecision(
     decision = applyIndependentReviewOverride(decision, independent as never) as RecomputedDecision
   }
 
-  // **申告された unavailable は ALIGNED にしない（task kind・全 load）。** 自己申告を信じないのは
+  // **申告された unavailable は ALIGNED にしない（task / roadmap 両 kind・全 load）。** 自己申告を信じないのは
   // ALIGNED への格上げを防ぐためであって、unavailable を ALIGNED へ格上げしてよい理由にはならない
   // （focused 全件 ALIGNED・integration 欠落の payload が evidence を登録していた。独立レビュー指摘）。
   if (runnerUnavailable && decision !== 'CONFLICT') {

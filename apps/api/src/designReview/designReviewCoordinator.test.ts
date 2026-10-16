@@ -580,6 +580,25 @@ describe('recomputeDecision with reviewKind=roadmap', () => {
     expect(outcome.rejectedReason).toBeUndefined()
   })
 
+  it('roadmap でも runner が REVIEW_UNAVAILABLE を申告したら全件 ALIGNED でも ALIGNED にしない', () => {
+    const raw = roadmapAlignedRaw()
+    raw.finalDecision = 'REVIEW_UNAVAILABLE'
+    raw.unavailableReason = 'Claude integration review unavailable'
+
+    const outcome = recomputeDecision(raw, 'roadmap', [])
+
+    expect(outcome.decision).toBe('REVIEW_UNAVAILABLE')
+    expect(outcome.rejectedReason).toContain('Claude integration review unavailable')
+  })
+
+  it('roadmap の unavailable 申告でも CONFLICT は CONFLICT のまま', () => {
+    const raw = roadmapAlignedRaw()
+    raw.finalDecision = 'REVIEW_UNAVAILABLE'
+    raw.integrationReviewResult = { decision: 'CONFLICT', summary: 'phases conflict' }
+
+    expect(recomputeDecision(raw, 'roadmap', []).decision).toBe('CONFLICT')
+  })
+
   it('roadmap focus集合と不一致なら採用しない（changedFiles起因のfocus推論を混ぜない）', () => {
     const raw = roadmapAlignedRaw()
     raw.focusedReviewResults = (raw.focusedReviewResults as Array<{ focus: string; decision: string }>).slice(0, 2)
@@ -659,6 +678,22 @@ describe('createAndExecuteRoadmapReview', () => {
     expect(stored!.reviewKind).toBe('roadmap')
     expect(stored!.subjectId).toBe(projectId)
     expect(stored!.taskId).toBeUndefined()
+  })
+
+  it('runner が REVIEW_UNAVAILABLE を申告したら全件 ALIGNED でも evidence を登録せず、従来どおり非 ALIGNED で終端する', async () => {
+    const storage = createStorage()
+    const projectId = 'project-roadmap-unavailable'
+    const raw = { ...roadmapAlignedRaw(), finalDecision: 'REVIEW_UNAVAILABLE' }
+
+    const result = await createAndExecuteRoadmapReview(
+      storage,
+      { projectId, reviewMaterial: '# Roadmap Design Review Material' },
+      deps(async () => ({ ok: true, stdout: JSON.stringify(raw), timedOut: false })),
+    )
+
+    // retry（finalizeFailure）は task kind のみ。roadmap は非 ALIGNED として確定する。
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'REVIEW_UNAVAILABLE' })
+    expect(storage.designReviewEvidence.findLatestBySubjectId('roadmap', projectId)).toBeUndefined()
   })
 
   it('runnerへ渡すinputはreviewKind=roadmap・subjectId=projectId・changedFiles=[] であり、taskIdを合成しない', async () => {

@@ -92,6 +92,18 @@ describe('recomputeDecision: low-load（task kind）', () => {
     expect(outcome.rejectedReason ?? '').not.toContain('focus set mismatch')
   })
 
+  it('unavailable 申告 + 旧形 focus（集合不一致）+ integration CONFLICT は CONFLICT を返す', () => {
+    // 構造不一致を REVIEW_UNAVAILABLE へ変換する前に、有効な CONFLICT を探す（独立レビュー指摘・2026-10-16）。
+    const outcome = recomputeDecision(lowLoad({
+      finalDecision: 'REVIEW_UNAVAILABLE',
+      focusedReviewResults: [{ focus: 'strategic_alignment', decision: 'UNCERTAIN', summary: 'x', findings: [] }],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'conflicts with the goal' },
+    }) as never, 'task', DOCS_ONLY)
+
+    expect(outcome.decision).toBe('CONFLICT')
+    expect(outcome.rejectedReason).toContain('focus set mismatch')
+  })
+
   it('構造化された判定が無い自己申告の ALIGNED は、従来どおり ALIGNED にしない（fail-open 防止）', () => {
     const outcome = recomputeDecision(lowLoad({ finalDecision: 'ALIGNED' }) as never, 'task', DOCS_ONLY)
 
