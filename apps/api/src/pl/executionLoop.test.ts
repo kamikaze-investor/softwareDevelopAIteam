@@ -31,6 +31,7 @@ import { readResumeActorClasses } from '../designReview/resumeActor'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from '../designReview/repairFlow'
 import type { JobRefusalMetadata } from '@ai-team/shared'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 /**
  * ここで固定しているのは「PL が自分の権限で動かない」ことと「操作したら必ず確かめる」ことである。
@@ -110,6 +111,9 @@ function recordTargetAttempts(storage: IStorage, targetKey: string, count: numbe
 beforeEach(() => {
   resetPlLoopInFlightForTest()
 })
+
+// retry cooldown を明けさせるために壁時計を進めたテストの後始末（retryCooldownTestClock.ts）。
+afterEach(() => { vi.useRealTimers() })
 
 describe('PL resume prompt', () => {
   it('keeps the same Task Contract and adds the PL resume instruction', () => {
@@ -548,6 +552,8 @@ describe('runPlTick — Execute / Verify', () => {
     const { storage, runId } = seedIdleDesignReview()
     // 3 attempt すべて消費した状態にする
     for (let i = 0; i < 3; i += 1) {
+      // attempt の間の retry cooldown（retryCooldown.ts）を時計で明けさせる。
+      passDesignReviewRetryCooldown()
       const claim = storage.designReviewRuns.claim(runId, 3)
       if (claim.claimToken) storage.designReviewRuns.requeue(runId, claim.claimToken, 'timeout')
     }
@@ -2746,6 +2752,18 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(queuedRun?.status).toBe('queued')
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
 
+    // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）中は、同じ resume も
+    // pending のまま（claim されず attempt も消費しない）。
+    resetPlLoopInFlightForTest()
+    const cooling = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: alignedCoordinatorDeps,
+    }))
+    expect(cooling.status).toBe('idle')
+    expect(cooling.reason).toContain('resume pending')
+    expect(storage.designReviewRuns.findById(queuedRun!.id)).toMatchObject({ status: 'queued', attemptCount: 1 })
+
+    passDesignReviewRetryCooldown()
     resetPlLoopInFlightForTest()
     const resumed = await runPlTick(storage, deps({
       diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),

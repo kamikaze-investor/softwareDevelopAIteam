@@ -31,6 +31,7 @@ import {
   type ReviewOutcome,
 } from './harness'
 import { designReviewCalls, resetDesignReviewStub, scriptDesignReview } from './runnerStub'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 vi.setConfig({ testTimeout: 240_000 })
 
@@ -40,6 +41,8 @@ beforeEach(() => {
   resetDesignReviewStub()
 })
 afterEach(async () => {
+  // retry cooldown を明けさせるために進めた壁時計を戻す（retryCooldownTestClock.ts）。
+  vi.useRealTimers()
   await env?.close()
 })
 afterAll(() => {
@@ -141,6 +144,14 @@ describe('R2: repair Design Review runner unavailable → requeued (not escalate
     expect(env.jobsOf(task.id).some((job) => job.workflowStepKey?.startsWith('repair:'))).toBe(false)
     expect(env.task(task.id).status).not.toBe('blocked')
     expect(env.storage.auditLog.findAll().filter((entry) => entry.operation === 'task_escalated_to_human')).toEqual([])
+    // While the retry cooldown (retryCooldown.ts) runs, the run is not idle (no rekick target) and the
+    // project summary says when it may retry.
+    const cooling = await env.systemState()
+    expect(cooling.attention.map((item) => item.kind)).not.toContain('design_review_idle')
+    expect(cooling.projects.find((p) => p.designReview !== undefined)?.designReview)
+      .toMatchObject({ status: 'queued', attemptCount: 1, idle: false, retryNotBefore: expect.any(String) })
+    // Advance the clock past the cooldown: the run is idle again and PL rekicks it.
+    passDesignReviewRetryCooldown()
     const attention = (await env.systemState()).attention
     // The repair run is idle, and the review Job (failed by changes_requested) is reported as job_failed.
     // PL handles design_review_idle first (ATTENTION_PRIORITY), so the rekick below is what runs.
@@ -183,8 +194,11 @@ describe('R3: repair Design Review unavailable 3 times → failed → escalation
     expect(repairRun).toMatchObject({ status: 'queued', attemptCount: 1 })
 
     // Operation 2: two PL rekicks (attempt 2 requeued, attempt 3 → failed → escalation to human).
+    // Each rekick happens after the retry cooldown (retryCooldown.ts); advance the clock past it.
+    passDesignReviewRetryCooldown()
     await env.plTick({ diagnose: REKICK })
     expect(env.storage.designReviewRuns.findById(repairRun!.id)).toMatchObject({ status: 'queued', attemptCount: 2 })
+    passDesignReviewRetryCooldown()
     await env.plTick({ diagnose: REKICK })
 
     // Expected: run failed, Task blocked, escalation audited, the stop is visible as attention.

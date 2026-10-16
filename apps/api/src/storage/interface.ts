@@ -898,6 +898,11 @@ export interface DesignReviewRun {
 export interface ClaimDesignReviewRunResult {
   run?: DesignReviewRun
   claimToken?: string
+  /**
+   * 判定の出なかった attempt の後の retry cooldown 中で claim しなかったとき、明ける時刻（ISO）。
+   * 方針は `designReview/retryCooldown.ts`。
+   */
+  retryNotBefore?: string
 }
 
 /** terminal Job update と同一transactionでqueue するDesign Review run の内容。 */
@@ -1115,7 +1120,11 @@ export interface IDesignReviewRunStorage {
    * ここでは判定しない。
    */
   findTerminalRepairPurposeRuns(): DesignReviewRun[]
-  /** queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。 */
+  /**
+   * queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。
+   * 判定の出なかった task run の retry cooldown（`designReview/retryCooldown.ts`）中は claim せず
+   * `retryNotBefore` を返す。**cooldown を強制するのはここ1箇所だけ**である。
+   */
   claim(id: string, maxAttempts: number): ClaimDesignReviewRunResult
   /** claim_token一致時のみ終端へ遷移する。不一致（stale）ならfalseを返し、呼び出し側は結果を破棄する。 */
   complete(id: string, claimToken: string, status: 'succeeded' | 'failed', resultJson?: string, error?: string): boolean
@@ -1129,7 +1138,11 @@ export interface IDesignReviewRunStorage {
     resultJson: string,
     evidence: DesignReviewEvidenceCreateInput,
   ): DesignReviewEvidence | undefined
-  /** claim_token一致時のみqueuedへ戻し、tokenを無効化する。 */
+  /**
+   * claim_token一致時のみqueuedへ戻し、tokenを無効化する。
+   * 直前の attempt の終了時刻を `completedAt` に記録する（retry cooldown の起点）。queued の行でだけ
+   * この意味を持ち、次の claim で消える。
+   */
   requeue(id: string, claimToken: string, error: string): boolean
   /**
    * API process crash後の起動時回収専用。runningのまま残った行をqueuedへ戻す。

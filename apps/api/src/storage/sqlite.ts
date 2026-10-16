@@ -35,6 +35,7 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence, findSupersedingRun } from '../designReviewEvidencePolicy'
 import { classifyStoredRunJudgment } from '../designReview/designReviewCoordinator'
+import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import {
   parseResumeSource,
@@ -5667,10 +5668,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return {}
         }
 
+        // 判定の出なかった attempt の後の retry cooldown（designReview/retryCooldown.ts）。
+        // 全実行経路がこの claim を通るので、cooldown の強制はここ1箇所に置く。
+        const retryNotBeforeMs = designReviewRetryNotBeforeMs(deserializeDesignReviewRun(current))
+        if (retryNotBeforeMs !== undefined && Date.now() < retryNotBeforeMs) {
+          return { retryNotBefore: new Date(retryNotBeforeMs).toISOString() }
+        }
+
         const claimToken = randomUUID()
+        // completed_at は queued の間だけ「直前の attempt の終了時刻」を表すので、running では消す。
         const result = db.prepare(`
           UPDATE design_review_runs
-          SET status = 'running', attempt_count = attempt_count + 1, claim_token = ?, started_at = ?
+          SET status = 'running', attempt_count = attempt_count + 1, claim_token = ?, started_at = ?,
+              completed_at = NULL
           WHERE id = ? AND status = 'queued'
         `).run(claimToken, now(), id)
 
@@ -5710,11 +5720,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return completeTransaction()
     },
     requeue(id, claimToken, error) {
+      // completed_at = 直前の attempt の終了時刻（retry cooldown の起点。次の claim で消える）。
       const result = db.prepare(`
         UPDATE design_review_runs
-        SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL
+        SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL, completed_at = ?
         WHERE id = ? AND claim_token = ? AND status = 'running'
-      `).run(error, id, claimToken)
+      `).run(error, now(), id, claimToken)
       return result.changes === 1
     },
     recoverStaleRunningAtStartup(maxAttempts, startedBefore) {

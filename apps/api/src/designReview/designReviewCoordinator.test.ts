@@ -22,6 +22,8 @@ import {
 } from './designReviewCoordinator'
 import type { CoordinatorDeps } from './designReviewCoordinator'
 import { recoverAndRekickAtStartup } from './queuedRunDispatch'
+import { advanceWallClock, passDesignReviewRetryCooldown } from './retryCooldownTestClock'
+import { DESIGN_REVIEW_RETRY_COOLDOWNS_MS, designReviewRetryNotBeforeMs } from './retryCooldown'
 import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
 import { selectFocuses, selectRoadmapReviewFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 
@@ -36,6 +38,9 @@ import { selectFocuses, selectRoadmapReviewFocuses } from '@ai-team/worker/src/a
 function createStorage(): IStorage {
   return createSQLiteStorage(':memory:')
 }
+
+// retry cooldown を明けさせるために壁時計を進めたテストの後始末（retryCooldownTestClock.ts）。
+afterEach(() => { vi.useRealTimers() })
 
 function seedTask(storage: IStorage): string {
   const project = storage.projects.create({
@@ -142,7 +147,9 @@ describe('2. stale completion fencing', () => {
     // attempt1 が hang したとみなして requeue
     expect(storage.designReviewRuns.requeue(run.id, attempt1.claimToken!, 'timeout')).toBe(true)
 
-    const attempt2 = storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS)
+    // 判定の出なかった attempt の後は retry cooldown が明けるまで claim できない（retryCooldown.ts）。
+    passDesignReviewRetryCooldown()
+    const attempt2 =storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS)
     expect(attempt2.claimToken).toBeDefined()
     expect(attempt2.claimToken).not.toBe(attempt1.claimToken)
 
@@ -488,6 +495,7 @@ describe('4. bounded recovery', () => {
     for (let i = 0; i < DESIGN_REVIEW_MAX_ATTEMPTS + 2; i += 1) {
       const active = storage.designReviewRuns.findById(runId)!
       if (active.status !== 'queued') break
+      passDesignReviewRetryCooldown()
       await executeDesignReviewRun(storage, active, failing)
     }
 
@@ -1036,9 +1044,13 @@ describe('critical load: independent 欠落と focused CONFLICT の分離', () =
     const afterFirst = storage.designReviewRuns.findById(runId)!
     expect(afterFirst.status).toBe('queued')
     expect(afterFirst.attemptCount).toBe(1)
-    expect(afterFirst.completedAt).toBeUndefined()
+    // queued の run の completedAt は「直前の attempt の終了時刻」（retry cooldown の起点）であって
+    // 完了ではない。完了していないことは status === 'queued' が示す。
+    expect(afterFirst.completedAt).toBeDefined()
+    expect(afterFirst.resultJson).toBeUndefined()
     expect(afterFirst.error).toContain('independent review')
 
+    passDesignReviewRetryCooldown()
     const second = await executeDesignReviewRun(storage, afterFirst, runner)
     expect(second.status).toBe('requeued')
     expect(storage.designReviewRuns.findById(runId)!.attemptCount).toBe(2)
@@ -1047,6 +1059,7 @@ describe('critical load: independent 欠落と focused CONFLICT の分離', () =
     for (let i = 0; i < DESIGN_REVIEW_MAX_ATTEMPTS + 2; i += 1) {
       const active = storage.designReviewRuns.findById(runId)!
       if (active.status !== 'queued') break
+      passDesignReviewRetryCooldown()
       await executeDesignReviewRun(storage, active, runner)
     }
     const final = storage.designReviewRuns.findById(runId)!
@@ -1582,5 +1595,130 @@ describe('run に結び付いた evidence の失効（同じ timestamp）', () =
     vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
     const later = storage.designReviewRuns.create({ ...baseInput(taskId), designText: 'legacy design', designTextHash })
     expect(storage.designReviewEvidence.findSupersedingRun(evidence)?.id).toBe(later.id)
+  })
+})
+
+describe('判定の出なかった task run の retry cooldown（lifecycle repair C3-c）', () => {
+  const MINUTE = 60_000
+  const UNAVAILABLE_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'REVIEW_UNAVAILABLE',
+    reviewUnavailableReason: 'codex logged out',
+  })
+  const ALIGNED_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  })
+
+  afterEach(() => { vi.useRealTimers() })
+
+  function scripted(outputs: string[]) {
+    const calls: string[] = []
+    return {
+      calls,
+      deps: deps(async () => {
+        const stdout = outputs[calls.length] ?? outputs[outputs.length - 1]!
+        calls.push(stdout)
+        return { ok: true, stdout, timedOut: false }
+      }),
+    }
+  }
+
+  it('REVIEW_UNAVAILABLE の後は 5 分 claim できず、明けると claim できる', async () => {
+    advanceWallClock(0)
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = scripted([UNAVAILABLE_LOW, ALIGNED_LOW])
+
+    const first = await createAndExecuteDesignReview(storage, baseInput(taskId), runner.deps)
+    expect(first).toMatchObject({ status: 'requeued', decision: 'REVIEW_UNAVAILABLE' })
+    const runId = storage.designReviewRuns.findLatestByTaskId(taskId)!.id
+
+    // cooldown 中: claim されず、runner も呼ばれず、attempt も消費しない。
+    advanceWallClock(DESIGN_REVIEW_RETRY_COOLDOWNS_MS[0]! - MINUTE)
+    const early = await executeDesignReviewRun(storage, storage.designReviewRuns.findById(runId)!, runner.deps)
+    expect(early.status).toBe('not_claimable')
+    expect(early.error).toContain('cooling down until')
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'queued', attemptCount: 1 })
+    expect(runner.calls).toHaveLength(1)
+    expect(storage.designReviewRuns.claim(runId, DESIGN_REVIEW_MAX_ATTEMPTS).retryNotBefore).toBeDefined()
+
+    // 明けた後: provider が戻っていれば attempt 2 で ALIGNED になり evidence が登録される。
+    advanceWallClock(2 * MINUTE)
+    const second = await executeDesignReviewRun(storage, storage.designReviewRuns.findById(runId)!, runner.deps)
+    expect(second.status).toBe('evidence_registered')
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'succeeded', attemptCount: 2 })
+    expect(runner.calls).toHaveLength(2)
+  })
+
+  it('cooldown は attempt 番号で伸び（5 分 → 30 分）、3 回とも判定が無ければ従来どおり failed で終わる', async () => {
+    advanceWallClock(0)
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const runner = scripted([UNAVAILABLE_LOW])
+
+    await createAndExecuteDesignReview(storage, baseInput(taskId), runner.deps)
+    const runId = storage.designReviewRuns.findLatestByTaskId(taskId)!.id
+    expect(DESIGN_REVIEW_RETRY_COOLDOWNS_MS).toEqual([5 * MINUTE, 30 * MINUTE])
+
+    advanceWallClock(5 * MINUTE + 1_000)
+    expect((await executeDesignReviewRun(storage, storage.designReviewRuns.findById(runId)!, runner.deps)).status)
+      .toBe('requeued')
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'queued', attemptCount: 2 })
+
+    // 2 回目の後は 5 分では明けない。
+    advanceWallClock(5 * MINUTE + 1_000)
+    expect((await executeDesignReviewRun(storage, storage.designReviewRuns.findById(runId)!, runner.deps)).status)
+      .toBe('not_claimable')
+    expect(storage.designReviewRuns.findById(runId)!.attemptCount).toBe(2)
+
+    advanceWallClock(25 * MINUTE)
+    const third = await executeDesignReviewRun(storage, storage.designReviewRuns.findById(runId)!, runner.deps)
+    expect(third).toMatchObject({ status: 'failed', decision: 'REVIEW_UNAVAILABLE' })
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'failed', attemptCount: DESIGN_REVIEW_MAX_ATTEMPTS })
+    expect(runner.calls).toHaveLength(DESIGN_REVIEW_MAX_ATTEMPTS)
+  })
+
+  it('判定（CONFLICT）は遅らせない: run はその場で終端し、cooldown の対象にならない', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const conflict = JSON.stringify({ focusedReviewResults: [], integrationReviewResult: { decision: 'CONFLICT' }, finalDecision: 'CONFLICT' })
+    const result = await createAndExecuteDesignReview(storage, baseInput(taskId), scripted([conflict]).deps)
+    expect(result.status).toBe('not_aligned')
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+    expect(run.status).toBe('succeeded')
+    expect(designReviewRetryNotBeforeMs(run)).toBeUndefined()
+  })
+
+  it('startup recovery の requeue（API 再起動）は cooldown を作らない', () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const run = storage.designReviewRuns.create(baseInput(taskId))
+    expect(storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS).claimToken).toBeDefined()
+    storage.designReviewRuns.recoverStaleRunningAtStartup(DESIGN_REVIEW_MAX_ATTEMPTS, new Date(Date.now() + 60_000).toISOString())
+    const recovered = storage.designReviewRuns.findById(run.id)!
+    expect(recovered).toMatchObject({ status: 'queued', attemptCount: 1 })
+    expect(storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS).claimToken).toBeDefined()
+  })
+
+  it('cooldown は attempt の間の数だけあり、attempt を使い切った run は待たせない', () => {
+    expect(DESIGN_REVIEW_RETRY_COOLDOWNS_MS).toHaveLength(DESIGN_REVIEW_MAX_ATTEMPTS - 1)
+    expect(designReviewRetryNotBeforeMs({
+      reviewKind: 'task', status: 'queued', attemptCount: DESIGN_REVIEW_MAX_ATTEMPTS, completedAt: new Date().toISOString(),
+    })).toBeUndefined()
+    expect(designReviewRetryNotBeforeMs({
+      reviewKind: 'task', status: 'queued', attemptCount: 0, completedAt: new Date().toISOString(),
+    })).toBeUndefined()
+  })
+
+  it('roadmap kind には適用しない（同期 drain の意味を変えない）', () => {
+    expect(designReviewRetryNotBeforeMs({
+      reviewKind: 'roadmap', status: 'queued', attemptCount: 1, completedAt: new Date().toISOString(),
+    })).toBeUndefined()
+    expect(designReviewRetryNotBeforeMs({
+      reviewKind: 'task', status: 'queued', attemptCount: 1, completedAt: '2026-10-17T00:00:00.000Z',
+    })).toBe(Date.parse('2026-10-17T00:05:00.000Z'))
   })
 })

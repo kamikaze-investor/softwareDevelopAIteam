@@ -31,6 +31,7 @@ import {
   type ReviewOutcome,
 } from './harness'
 import { resetDesignReviewStub, scriptDesignReview } from './runnerStub'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 vi.setConfig({ testTimeout: 240_000 })
 
@@ -40,6 +41,8 @@ beforeEach(() => {
   resetDesignReviewStub()
 })
 afterEach(async () => {
+  // retry cooldown を明けさせるために進めた壁時計を戻す（retryCooldownTestClock.ts）。
+  vi.useRealTimers()
   await env?.close()
 })
 afterAll(() => {
@@ -130,7 +133,10 @@ describe('M1: Mobile admission (shared predicates over GET responses) agrees wit
     env.worker.behaviors.review = () => changesRequested('restructure')
     scriptDesignReview('RUNNER_UNAVAILABLE', 'RUNNER_UNAVAILABLE', 'RUNNER_UNAVAILABLE')
     await env.worker.runUntilIdle()
+    // Each rekick happens after the retry cooldown (retryCooldown.ts); advance the clock past it.
+    passDesignReviewRetryCooldown()
     await env.plTick({ diagnose: REKICK })
+    passDesignReviewRetryCooldown()
     await env.plTick({ diagnose: REKICK })
     expect(env.task(task.id).status).toBe('blocked')
     env.worker.behaviors.review = () => APPROVED_REVIEW

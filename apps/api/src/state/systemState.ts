@@ -20,6 +20,7 @@ import { findBlockedRowsHoldingWorkspace } from './blockedRowOwnership'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
 import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
 import { isLiveApprovedApproval, isLiveTaskScopedDecision, isLiveWaitingApproval } from '@ai-team/shared'
@@ -251,6 +252,8 @@ export interface ProjectStateSummary {
     attemptCount: number
     error?: string
     idle: boolean
+    /** 判定の出なかった attempt の後の retry cooldown 中なら、再試行できるようになる時刻（ISO）。 */
+    retryNotBefore?: string
   }
 }
 
@@ -461,12 +464,19 @@ export function buildSystemState(
       const run = storage.designReviewRuns.findLatestByTaskId(currentTask.id)
       if (run) {
         // `queued` のまま誰も実行していない run は、外部が気付くまで進まない。
-        const idle = run.status === 'queued' && run.startedAt === undefined
+        // 判定の出なかった attempt の後の retry cooldown 中は idle ではない（claim が拒むので
+        // rekick は空振りになる）。cooldown が明けると idle に戻り、従来どおり rekick される。
+        const retryNotBeforeMs = designReviewRetryNotBeforeMs(run)
+        const retryNotBefore = retryNotBeforeMs !== undefined && nowMs < retryNotBeforeMs
+          ? new Date(retryNotBeforeMs).toISOString()
+          : undefined
+        const idle = run.status === 'queued' && run.startedAt === undefined && retryNotBefore === undefined
         designReview = {
           status: run.status,
           attemptCount: run.attemptCount,
           error: run.error,
           idle,
+          ...(retryNotBefore !== undefined ? { retryNotBefore } : {}),
         }
         // 両 attention とも同一性は **run 単位**（`referenceId: run.id`）。Task 単位だと、
         // 1回目の episode を escalation 済み・budget 消費済みとした記録が、同じ Task の

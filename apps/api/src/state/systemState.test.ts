@@ -445,6 +445,42 @@ describe('buildSystemState — 終端した Design Review も観測できる（p
     expect(state.projects[0].designReview?.status).toBe('succeeded')
   })
 
+  // lifecycle repair C3-c: 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）中は
+  // rekick しても claim されないので idle ではない。明けたら従来どおり idle に戻る。
+  it('retry cooldown 中の requeued run は idle ではなく、明けると design_review_idle に戻る', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const run = storage.designReviewRuns.create({
+      reviewKind: 'task',
+      subjectId: task.id,
+      taskId: task.id,
+      designText: 'd',
+      designTextHash: 'h',
+      taskTitle: 'T',
+      changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.requeue(run.id, claimed.claimToken!, 'review unavailable: codex logged out')
+    const endedAt = Date.parse(storage.designReviewRuns.findById(run.id)!.completedAt!)
+    const at = (offsetMs: number) => () => new Date(endedAt + offsetMs).toISOString()
+
+    const cooling = buildSystemState(storage, { now: at(4 * 60_000) })
+    expect(cooling.attention.some((a) => a.kind === 'design_review_idle')).toBe(false)
+    expect(cooling.projects[0].designReview).toMatchObject({
+      status: 'queued',
+      attemptCount: 1,
+      idle: false,
+      retryNotBefore: new Date(endedAt + 5 * 60_000).toISOString(),
+    })
+
+    const ready = buildSystemState(storage, { now: at(5 * 60_000) })
+    const idle = ready.attention.find((a) => a.kind === 'design_review_idle')
+    expect(idle?.referenceId).toBe(run.id)
+    expect(idle?.detail).toContain('codex logged out')
+    expect(ready.projects[0].designReview).toMatchObject({ idle: true })
+    expect(ready.projects[0].designReview?.retryNotBefore).toBeUndefined()
+  })
+
   // 同じ Task の2回目の Design Review episode を1回目と同一視すると、1回目の escalation 済み・
   // budget 消費済みの記録が2回目を黙らせる（2026-10-16 production・Task `b8d0fc5d`）。
   it('同じ Task の2つの Design Review 失敗 episode は別の dedup key になる', () => {
