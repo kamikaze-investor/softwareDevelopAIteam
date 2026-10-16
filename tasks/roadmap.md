@@ -11136,11 +11136,12 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         **使用率を上げることだけを目的に core 化しない／無理な focus mapping を足さない**
         （core は全 prompt へ入るため、上記 `principle-tier` の注意がそのまま当てはまる）。
       - **2026-10-16 実測（原則強化 PR #359 の適用監査）: `canonical-domain-meaning` も同種。**
-        `mapFileToFocuses()` は `apps/api/src/pl/`・`apps/api/src/designReview/`・approval / `gitCommitEvidence.ts`
+        `mapFileToFocuses()` は `apps/api/src/pl/`・`apps/api/src/designReview/`・API 側 approval（`apps/api/src/approval/`・`gitCommitEvidence.ts`）
         および **target app の全 path** を `scope_simplicity` へ落とし、`FOCUS_PRINCIPLE_SLUGS.scope_simplicity` は
         意図的に（`engineeringPrinciples.test.ts`）この原則を含まない。結果、lifecycle / authority の判断を持つ
         コードと将来のアプリ開発では、実装・repair・Design Review・focused review・PR Meta Review の**どこでも選ばれない**
-        （storage / worker / routes / guards では全経路で選ばれる）。同じファイル内の `isDecisionAuthoritySurface()` は
+        （storage / worker / routes / guards では全経路で選ばれる。`sandbox/`・`.github/workflows/`・`apps/mobile/` も選ばれないが、
+        これらは domain fact の判断が主でないので意図どおりの可能性が高い。列挙は網羅ではない）。同じファイル内の `isDecisionAuthoritySurface()` は
         `apps/api/src/pl/` を authority surface と扱っており、path の意味付けが2通りある。
         `scope_simplicity` へ足すと実質 core になるので足さない。`mapFileToFocuses()` の変更は Design Review の
         focus 集合（`recomputeDecision()` が集合一致を要求）と review 負荷を変えるため、**Lifecycle 一括修復の完了後**に、
@@ -11927,7 +11928,7 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
         変わるのは deploy 後に新しく作られる repair run と、POST /jobs で新しく作る implement Job だけ
         （#320 と同じ扱い: evidence は実際に走る文字列に束縛される）
       - テスト: `apps/api/src/implementPrompt.test.ts`（同じ Task なら全 producer で同じ原則 / mobile では載らない）
-      **残り**: lifecycle（`apps/api/src/pl/`・`designReview/`）・approval / git_commit・target app のファイルでは、
+      **残り**: 例えば lifecycle（`apps/api/src/pl/`・`designReview/`）・API 側 approval / git_commit・target app のファイルでは、
       どの経路でも `canonical-domain-meaning` が選ばれない。原因は prompt 側ではなく focus routing であり、
       selection coverage の owner である `principle-registry-coverage-and-threshold-review` Task A へ移した。
 

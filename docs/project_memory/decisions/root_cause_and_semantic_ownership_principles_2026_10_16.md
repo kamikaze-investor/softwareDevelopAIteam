@@ -32,7 +32,7 @@ Status・finding category は追加していない。正本は `specs/21`。
 
 **2026-10-16 追記（適用監査で一部解消）**: POST /jobs と repair の欠落は、原則選択の owner を
 `buildTaskDesignContract()` 1 箇所へ寄せて解消した（Roadmap 項目は done）。残る selection coverage の欠落
-（lifecycle / approval / target app の path では全経路で選ばれない）は `principle-registry-coverage-and-threshold-review`
+（例えば lifecycle / API 側 approval・git_commit / target app の path では全経路で選ばれない）は `principle-registry-coverage-and-threshold-review`
 Task A へ移した。以下は当初の記録。
 
 `canonical-domain-meaning` は contextual で、`appendImplementContracts()` と
