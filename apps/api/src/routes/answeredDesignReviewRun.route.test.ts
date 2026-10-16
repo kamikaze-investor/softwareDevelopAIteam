@@ -186,4 +186,29 @@ describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design 
       await app.close()
     }
   })
+
+  it('L4: blocked Task で skip したら repair_admission_skipped を audit に残し、Task は動かさない', async () => {
+    const lines: LogLine[] = []
+    const app = await buildApp(lines)
+    try {
+      const { s, taskId, i1, conflictRun, humanResumedReview } = await shape()
+      const r1 = await humanResumedReview()
+      const runId = await conflictRun()
+
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${r1.id}`, payload: changesRequested })
+
+      expect(res.statusCode).toBe(200)
+      const rows = s.auditLog.findByEntity('task', taskId)
+        .filter((entry) => entry.operation === 'repair_admission_skipped')
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.result).toBe('not_admitted')
+      expect(rows[0]!.detail).toContain('reason_code=not_admitted')
+      expect(rows[0]!.detail).toContain(`review_job_id=${r1.id}`)
+      expect(rows[0]!.detail).toContain(`implementation_job_id=${i1.id}`)
+      expect(rows[0]!.detail).toContain(`design_review_run_id=${runId}`)
+      expect(s.tasks.findById(taskId)?.status).toBe('blocked')
+    } finally {
+      await app.close()
+    }
+  })
 })

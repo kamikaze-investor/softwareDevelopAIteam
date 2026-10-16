@@ -238,7 +238,7 @@ function deriveAndRecordRepairGeneration(storage: IStorage, repairJob: Job): voi
  * blockedのTaskはStage 1 retryの対象外であり、既存のresumeエンドポイントで再開できる。
  */
 function escalateToHuman(storage: IStorage, task: Task, reason: string): RepairFlowOutcome {
-  escalateTaskToHuman(storage, task.id)
+  escalateTaskToHuman(storage, task.id, reason)
   return { status: 'escalated', reason }
 }
 
@@ -1256,18 +1256,103 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
 }
 
 /** Taskを既存のHuman escalation（blocked）へ入れる。呼び出し元から明示的に使う。 */
-export function escalateTaskToHuman(storage: IStorage, taskId: string): void {
+export function escalateTaskToHuman(storage: IStorage, taskId: string, reason?: string): void {
   // **park された Task を blocked へ上げない。**
   //
   // blocked は `roadmapActive` に関係なく project を占有する（`occupiesProject()`）ため、
   // park した Task をここで上げると park が事実上取り消され、しかも
   // `resumeBlockedTask()` は park を理由に拒否するので誰も解消できなくなる。
   // park された Task について「人へ渡す」相手はもう居ない —— CEO が既に判断した結果である。
-  if (storage.tasks.isParked(taskId)) return
+  if (storage.tasks.isParked(taskId)) {
+    recordTaskEscalation(storage, taskId, 'not_moved_parked', reason)
+    return
+  }
 
   const task = storage.tasks.findById(taskId)
-  if (task && task.status !== 'blocked') {
+  if (!task) return
+  // **`done` の Task を blocked へ戻さない。** 完了は commit 済みの事実で、遅れて届いた
+  // repair / review の escalation が覆してよいものではない（b8d0fc5d 監査 L5）。
+  if (task.status === 'done') {
+    recordTaskEscalation(storage, taskId, 'not_moved_done', reason)
+    return
+  }
+  if (task.status !== 'blocked') {
     storage.tasks.update(taskId, { status: 'blocked' })
+    recordTaskEscalation(storage, taskId, 'blocked', reason)
+    return
+  }
+  recordTaskEscalation(storage, taskId, 'already_blocked', reason)
+}
+
+/** escalation を記録する audit operation 名。新しい table は作らない。 */
+export const TASK_ESCALATED_TO_HUMAN_OPERATION = 'task_escalated_to_human'
+
+/**
+ * **なぜ人へ渡ったかを残す**（L5）。以前は Task status が変わるだけで理由がどこにも無く、
+ * 既に blocked の Task へ届いた escalation は痕跡すら残らなかった。
+ * 記録の失敗で escalation 自体（呼び出し側の操作）を失敗させない。
+ */
+function recordTaskEscalation(
+  storage: IStorage,
+  taskId: string,
+  result: 'blocked' | 'already_blocked' | 'not_moved_done' | 'not_moved_parked',
+  reason: string | undefined,
+): void {
+  try {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: TASK_ESCALATED_TO_HUMAN_OPERATION,
+      entityType: 'task',
+      entityId: taskId,
+      result,
+      detail: `reason=${(reason ?? 'unspecified').slice(0, 500)}`,
+    })
+  } catch (error: unknown) {
+    console.warn(
+      `[repairFlow] failed to record the escalation of task ${taskId}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+/** Stage 2 admission skip を記録する audit operation 名（L4）。 */
+export const REPAIR_ADMISSION_SKIPPED_OPERATION = 'repair_admission_skipped'
+
+/**
+ * **blocked な Task で修正要求が repair へ渡らなかったことを audit へ残す**（L4・b8d0fc5d）。
+ *
+ * skip は Task を動かさないので、warn log が流れた後には何も残らなかった（Human Resume した
+ * review の修正要求が黙って消えた）。状態は一切変えない。blocked 以外の Task では書かない ——
+ * そちらは呼び出し側が別の経路（escalation 等）で扱う。
+ */
+export function recordRepairAdmissionSkipped(
+  storage: IStorage,
+  input: {
+    taskId: string
+    reviewJobId: string
+    implementJobId: string
+    skip: { reason: string; code?: RepairAdmissionSkipCode; runId?: string }
+  },
+): void {
+  try {
+    if (storage.tasks.findById(input.taskId)?.status !== 'blocked') return
+    storage.auditLog.record({
+      actor: 'api',
+      operation: REPAIR_ADMISSION_SKIPPED_OPERATION,
+      entityType: 'task',
+      entityId: input.taskId,
+      result: input.skip.code ?? 'not_admitted',
+      detail: [
+        `reason_code=${input.skip.code ?? 'not_admitted'}`,
+        `review_job_id=${input.reviewJobId}`,
+        `implementation_job_id=${input.implementJobId}`,
+        input.skip.runId === undefined ? undefined : `design_review_run_id=${input.skip.runId}`,
+        `reason=${input.skip.reason.slice(0, 500)}`,
+      ].filter((token) => token !== undefined).join(' '),
+    })
+  } catch (error: unknown) {
+    console.warn(
+      `[repairFlow] failed to record the admission skip of task ${input.taskId}: ${error instanceof Error ? error.message : String(error)}`,
+    )
   }
 }
 
@@ -1317,7 +1402,7 @@ export function resolveRepairHandoffTarget(
   // 未検証 workspace を持つ Task へ repair Job を生成・実行してはならない。
   // このTaskの任意のquarantine Jobから判定する（最新Jobだけでなく）。
   if (isWorkspaceQuarantined(storage.jobs.findByTaskId(taskId))) {
-    escalateTaskToHuman(storage, taskId)
+    escalateTaskToHuman(storage, taskId, 'workspace is quarantined')
     return {
       ok: false,
       outcome: {
@@ -1332,7 +1417,7 @@ export function resolveRepairHandoffTarget(
   // 黙って受理し、`walkRepairGeneration()` が後で数えられない key の Job を作ってしまう。**
   const sourceJobId = parseRepairSource(stepKey)
   if (sourceJobId === undefined) {
-    escalateTaskToHuman(storage, taskId)
+    escalateTaskToHuman(storage, taskId, `malformed repair step key: ${stepKey}`)
     return { ok: false, outcome: { status: 'escalated', reason: `malformed repair step key: ${stepKey}` } }
   }
 
@@ -1340,13 +1425,13 @@ export function resolveRepairHandoffTarget(
   // source Jobが引けないとprojectId / safeCommand / providerを復元できない。
   // 部分的に埋めた不完全なJobを作るより、人へ渡すほうが安全side。
   if (!sourceJob) {
-    escalateTaskToHuman(storage, taskId)
+    escalateTaskToHuman(storage, taskId, 'source job for the repair chain is missing')
     return { ok: false, outcome: { status: 'escalated', reason: 'source job for the repair chain is missing' } }
   }
   // **別 Task の Job を source にした repair を作らない。** 作ると lineage が Task を
   // またぎ、`walkRepairGeneration()` から見て「この Task に無い親」になる（数え切れない）。
   if (sourceJob.taskId !== taskId) {
-    escalateTaskToHuman(storage, taskId)
+    escalateTaskToHuman(storage, taskId, 'source job for the repair chain belongs to another task')
     return {
       ok: false,
       outcome: { status: 'escalated', reason: 'source job for the repair chain belongs to another task' },
@@ -1432,7 +1517,7 @@ export function completeRepairHandoff(
     // 後続の実体化に失敗した。transaction は rollback され、source Job は `blocked` の
     // まま所有権を保持する。ここで workspace を放置せず、Human escalation（Task blocked）
     // へ渡して後の介入を可能にする。
-    escalateTaskToHuman(storage, taskId)
+    escalateTaskToHuman(storage, taskId, `repair handoff failed: ${repairJob.reason}`)
     return { status: 'escalated', reason: repairJob.reason }
   }
 
@@ -1469,11 +1554,9 @@ export async function executeQueuedRepair(
     return { status: 'already_started', stepKey }
   }
   if (outcome.status !== 'evidence_registered') {
-    escalateTaskToHuman(storage, target.taskId)
-    return {
-      status: 'escalated',
-      reason: `design review did not align (${outcome.status}${outcome.decision ? `: ${outcome.decision}` : ''})`,
-    }
+    const reason = `design review did not align (${outcome.status}${outcome.decision ? `: ${outcome.decision}` : ''})`
+    escalateTaskToHuman(storage, target.taskId, reason)
+    return { status: 'escalated', reason }
   }
 
   return completeRepairHandoff(storage, run, stepKey, target.taskId, target.sourceJob)

@@ -272,7 +272,7 @@ function evaluateAndAct(
   })
 
   if (preparation.action === 'escalate') {
-    escalateTaskToHuman(storage, taskId)
+    escalateTaskToHuman(storage, taskId, preparation.reason)
     return { status: 'escalated', reason: preparation.reason }
   }
   if (preparation.action === 'skip') {
