@@ -146,11 +146,14 @@ function findUnattributedDirtyEnd(taskJobs: readonly Job[], otherJobs: readonly 
  * - 人の判断: 未期限の WAITING が無く、この abort を承認した request 以外に生きた Task 単位の判断が無い。
  *   承認した request 自体はまだ使える APPROVED のまま
  */
-/** `findUnattributedDirtyEnd` に渡す「この Task 以外の Job」。 */
+/**
+ * `findUnattributedDirtyEnd` に渡す「この Task 以外の Job」。**Project を問わない**
+ * （Codex review c3-b round 2: workspace は Project 間で共有され得るので、別 Project の後続 Job が
+ * 同じ workingDir で走っていれば、その差分はもうこの Task のものとは言えない）。
+ */
 function laterJobCandidates(storage: IStorage, taskId: string): Job[] {
-  const task = storage.tasks.findById(taskId)
-  if (task === undefined) return []
-  return storage.tasks.findByProjectId(task.projectId)
+  return storage.projects.findAll()
+    .flatMap((project) => storage.tasks.findByProjectId(project.id))
     .filter((candidate) => candidate.id !== taskId)
     .flatMap((candidate) => storage.jobs.findByTaskId(candidate.id))
 }

@@ -538,6 +538,31 @@ describe('abortTask — 段階1: 前提条件と承認', () => {
     }
   })
 
+  it('別 Project の後続 Job が同じ workingDir で走っていても、その差分はこの Task のものではない（Project を問わない）', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+    const otherProject = fx.storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'paused' })
+    const otherTask = fx.storage.tasks.create({
+      projectId: otherProject.id, title: 'other', description: 'd', status: 'done',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: false,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const own = fx.storage.jobs.findById(fx.jobId)!
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date(Date.parse(own.createdAt) + 1000))
+      fx.storage.jobs.create({
+        taskId: otherTask.id, projectId: otherProject.id, agentRole: 'developer_ai', status: 'success',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(abortTask(fx.storage, {
+      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    })).toMatchObject({ ok: true, status: 'parked' })
+  })
+
   it('dirty な終了の後に同じ workingDir で別 Task の Job が走っていれば、その差分はこの Task のものではない', () => {
     const fx = seed()
     fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })

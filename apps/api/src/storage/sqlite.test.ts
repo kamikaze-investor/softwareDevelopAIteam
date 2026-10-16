@@ -3507,3 +3507,64 @@ describe('SQLiteStorage', () => {
     })
   })
 })
+
+// Codex review c3-b round 2 P2: `resume:` は source Job が残した workspace だけを引き継ぐ。
+describe('jobs.update claim — resume baseline continuity', () => {
+  const DIRTY: JobWorkspaceBaseline = {
+    mode: 'dirty',
+    startCommitHash: 'abc123',
+    entries: [{ path: 'docs/a.md', kind: 'modified', worktreeHash: 'h1' } as never],
+  }
+
+  function seedResume(sourceEnd: JobWorkspaceBaseline | undefined) {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: 'd', status: 'blocked',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    } as never)
+    const source = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, workspaceBaseline: DIRTY,
+      ...(sourceEnd === undefined ? {} : { failureMetadata: { workspaceEndFingerprint: sourceEnd } }),
+    } as never)
+    const resumed = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+      workflowStepKey: `resume:${source.id}:1`,
+    } as never)
+    return { storage, resumed }
+  }
+
+  it('source の終了 fingerprint と一致する baseline なら claim できる', () => {
+    const { storage, resumed } = seedResume(DIRTY)
+    expect(storage.jobs.update(resumed.id, { status: 'running', workspaceBaseline: DIRTY })?.status).toBe('running')
+  })
+
+  it.each([
+    { label: 'path が足された', baseline: { ...DIRTY, entries: [...DIRTY.entries, { path: 'docs/extra.md', kind: 'added', worktreeHash: 'h2' } as never] } },
+    { label: '内容が変わった', baseline: { ...DIRTY, entries: [{ path: 'docs/a.md', kind: 'modified', worktreeHash: 'h-changed' } as never] } },
+    { label: 'HEAD が動いた', baseline: { ...DIRTY, startCommitHash: 'def456' } },
+    { label: 'baseline が無い', baseline: undefined },
+  ])('一致しなければ claim を書かず、quarantine 付き blocked にする: $label', ({ baseline }) => {
+    const { storage, resumed } = seedResume(DIRTY)
+
+    const result = storage.jobs.update(resumed.id, {
+      status: 'running', ...(baseline === undefined ? {} : { workspaceBaseline: baseline as JobWorkspaceBaseline }),
+    })
+
+    expect(result?.status).toBe('blocked')
+    const stored = storage.jobs.findById(resumed.id)!
+    expect(stored.status).toBe('blocked')
+    expect(stored.startedAt).toBeUndefined()
+    expect(stored.failureMetadata).toMatchObject({ quarantined: true, kind: 'workspace_baseline_failure' })
+    expect(stored.failureMetadata?.quarantineReason).toContain('resume_baseline_mismatch')
+  })
+
+  it('source に終了 fingerprint が無い（legacy）なら従来どおり claim できる', () => {
+    const { storage, resumed } = seedResume(undefined)
+    expect(storage.jobs.update(resumed.id, {
+      status: 'running', workspaceBaseline: { ...DIRTY, startCommitHash: 'anything' },
+    })?.status).toBe('running')
+  })
+})

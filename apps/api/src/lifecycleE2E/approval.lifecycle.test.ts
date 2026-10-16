@@ -24,13 +24,16 @@ import {
   APPROVED_REVIEW,
   buildLedger,
   createRunningProject,
+  dirtyPaths,
   git,
   removeTargetRepo,
   startLifecycle,
   type LifecycleEnv,
   type ReviewOutcome,
 } from './harness'
-import { resetDesignReviewStub } from './runnerStub'
+import { LIFECYCLE_TARGET_DIR, resetDesignReviewStub } from './runnerStub'
+import { writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 vi.setConfig({ testTimeout: 240_000 })
 
@@ -278,6 +281,57 @@ describe('A5: abort over an unowned dirty workspace escalates to blocked → Hum
     expect(done.map((step) => [step.kind, step.reported])).toEqual([['git_commit', 'success']])
     expect(env.task(task.id).status).toBe('done')
     expect(waitingRows(task.id)).toEqual([])
+  })
+})
+
+describe('A5b: dirt added between abort and Resume is never committed under the Task', () => {
+  // Codex review c3-b round 2 P2: resume: は INTENTIONALLY-DIRTY として現在の worktree を丸ごと baseline に採る。
+  // abort から Resume までの間に足された差分は source Job の終了 fingerprint と一致しないので、claim を書かず
+  // 既存 quarantine で止める（commit されない・止まったことが見える）。
+  it.each([
+    { label: 'a path is added', id: 'a5b-add', mutate: (dir: string) => writeFileSync(join(dir, 'docs/a5b-add/extra.md'), 'manual edit\n') },
+    { label: 'the changed path is edited again', id: 'a5b-edit', mutate: (dir: string) => {
+      const changed = dirtyPaths().find((file) => file.startsWith('docs/a5b-edit/'))!
+      writeFileSync(join(dir, changed), 'edited after abort\n')
+    } },
+  ])('$label', async ({ id, mutate }) => {
+    // Start: the same state A5 reaches after the abort — Task blocked over a failed dirty git_commit.
+    const { task, commitJob, approval } = await blockedOnHumanGate(id, `docs/${id}`, [HIGH_FINDING])
+    env.storage.approvalRequests.updateStatus(approval.id, 'EXPIRED', undefined, true)
+    const dirty = env.storage.jobs.findById(commitJob.id)!.workspaceBaseline
+    env.storage.jobs.update(commitJob.id, { status: 'failed', failureMetadata: { workspaceEndFingerprint: dirty } })
+    env.storage.tasks.update(task.id, { status: 'pending' })
+    const created = await env.api<{ id: string }>('POST', '/api/approval-requests', {
+      taskId: task.id, targetBranch: 'master', targetCommit: 'n/a', targetDiffHash: 'n/a', riskLevel: 'HIGH',
+      requestedAction: 'abort_task',
+    })
+    expect((await env.ceo.approve(created.body.id)).statusCode).toBe(200)
+    const abort = await env.api<{ code?: string }>('POST', `/api/tasks/${task.id}/abort`, {
+      approvalRequestId: created.body.id, reason: 'give up on this commit',
+    })
+    expect(abort.body.code).toBe('UNATTRIBUTED_DIRTY_WORKSPACE')
+    expect(env.task(task.id).status).toBe('blocked')
+    const headBefore = git(['rev-parse', 'HEAD']).trim()
+
+    // Operation 1: unrelated dirt appears in the shared worktree before the human resumes.
+    mutate(LIFECYCLE_TARGET_DIR)
+
+    // Operation 2: Human Resume is admitted (the API cannot see the worktree), the resumed git_commit is created.
+    const resume = await env.ceo.resume(task.id, 'Commit the reviewed change.')
+    expect(resume.statusCode, JSON.stringify(resume.body)).toBe(201)
+    const resumedId = (resume.body as Job).id
+
+    // Operation 3: Worker. Expected: the claim is refused and the resumed Job is quarantined; nothing is committed.
+    const steps = await env.worker.runUntilIdle()
+    expect(steps.map((step) => [step.kind, step.claimStatus, step.claimCode])).toEqual([['git_commit', 409, 'JOB_CLAIM_REFUSED']])
+    const resumed = env.storage.jobs.findById(resumedId)!
+    expect(resumed.status).toBe('blocked')
+    expect(resumed.failureMetadata).toMatchObject({ quarantined: true, kind: 'workspace_baseline_failure' })
+    expect(resumed.failureMetadata?.quarantineReason).toContain('resume_baseline_mismatch')
+    expect(git(['rev-parse', 'HEAD']).trim()).toBe(headBefore)
+    expect(env.task(task.id).status).not.toBe('done')
+    expect((await env.systemState()).attention.map((item) => item.kind)).toContain('workspace_quarantined')
+    expect((await env.mobileAdmission(task.id)).resume).toEqual({ ok: false, code: 'WORKSPACE_QUARANTINED' })
   })
 })
 
