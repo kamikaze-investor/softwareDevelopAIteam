@@ -21,6 +21,7 @@ import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
 import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
+import { isLiveWaitingApproval } from '@ai-team/shared'
 import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
 
 /**
@@ -32,28 +33,10 @@ import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
  *
  * 期限切れ / STALE / REJECTED は対象外 — そちらは**誰も進められない本物の停滞**であり、
  * `job_blocked` として PL に見せなければならない（この状態が今回の復旧対象そのものだった）。
- */
-/**
- * **その ApprovalRequest が「いま人の判断を待っている」か。**
  *
- * `status === 'WAITING_FOR_USER'` だけでは足りない。`expires_at` は**参照時の遅延判定**で、
- * 期限切れ行を `EXPIRED` へ進める actor は存在しない（writer は
- * `approveAndResumeJob` / `consumeForJob` / `gate/check` / 承認 PATCH のいずれも request 駆動）。
- * よって「誰も待っていない承認」が `WAITING_FOR_USER` のまま残り続ける。
- *
- * **この関数が expiry 解釈の唯一の出どころである。** Job 起点（`isWaitingOnLiveApproval`）と
- * Task 起点（`approval_waiting` attention）でシグネチャが違うだけで、問うている事実は同一なので、
- * 両者をここへ寄せる。片方だけ status を見て片方だけ expiry も見る、という 2026-09-23 の
- * 不一致を再発させないため、新しい expiry 判定をこのファイルへ書き足さないこと。
+ * expiry 解釈の正本は `@ai-team/shared` の `isLiveWaitingApproval`（approvalLiveness.ts）。
+ * Job 起点（ここ）と Task 起点（`approval_waiting` attention）は同じ関数を使う。
  */
-function isLiveWaitingApproval(
-  approval: ApprovalRequest | undefined,
-  nowMs: number,
-): approval is ApprovalRequest {
-  if (approval?.status !== 'WAITING_FOR_USER') return false
-  return new Date(approval.expiresAt).getTime() > nowMs
-}
-
 function isWaitingOnLiveApproval(storage: IStorage, job: Job, nowMs: number): boolean {
   if (job.approvalId === undefined) return false
   return isLiveWaitingApproval(storage.approvalRequests.findById(job.approvalId), nowMs)
