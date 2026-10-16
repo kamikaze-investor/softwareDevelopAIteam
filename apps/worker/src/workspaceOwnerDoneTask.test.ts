@@ -500,6 +500,31 @@ describe('非 initial の queued 所有者がいても、別 Task の stale 行�
     expect(resolve([staleA(), ownerB()], [])).toEqual({ kind: 'owner', taskId: 'task-b' })
   })
 
+  it('stale A + clean manifest でも MERGE_HEAD が残っていれば ambiguous（admission と同じ clean 定義）', () => {
+    expect(resolve([staleA(), ownerB()], [], ['MERGE_HEAD'])).toEqual({ kind: 'ambiguous' })
+  })
+
+  it('stale A + clean manifest でも HEAD を解決できなければ ambiguous', () => {
+    expect(resolveWorkspaceOwnership(
+      [staleA(), ownerB()], '/workspace/target', () => [], () => undefined, () => [],
+    )).toEqual({ kind: 'ambiguous' })
+    expect(resolveWorkspaceOwnership(
+      [staleA(), ownerB()], '/workspace/target', () => [],
+      () => { throw new Error('rev-parse failed') }, () => [],
+    )).toEqual({ kind: 'ambiguous' })
+  })
+
+  it('stale A + clean manifest でも git 操作の検出に失敗すれば ambiguous', () => {
+    expect(resolveWorkspaceOwnership(
+      [staleA(), ownerB()], '/workspace/target', () => [], () => HEAD,
+      () => { throw new Error('git status failed') },
+    )).toEqual({ kind: 'ambiguous' })
+  })
+
+  it('B で説明できる dirt でも進行中の git 操作があれば ambiguous', () => {
+    expect(resolve([staleA(), ownerB()], ['b.ts'], ['index.lock'])).toEqual({ kind: 'ambiguous' })
+  })
+
   it('dirt がすべて B の記録（baseline HEAD 一致 + changedFiles）で説明できれば B が owner', () => {
     expect(resolve([staleA(), ownerB()], ['b.ts'])).toEqual({ kind: 'owner', taskId: 'task-b' })
   })

@@ -260,8 +260,9 @@ function isReleasableForNextTask(
  *
  * 判定は既存の材料だけを使う: worktree の実観測 + durable な `changedFiles` と baseline HEAD の一致
  * （`jobOwnsRecordedDirt()`、fallback 所有者判定と同じ帰属）。
- * - stale 候補が無い / worktree が clean → 従来どおり所有者を返す
- * - 観測できない / 所有者 Task で説明できない dirt がある → ambiguous（この cycle は誰も claim しない）
+ * - stale 候補が無い → 従来どおり所有者を返す（worktree を読まない）
+ * - admission と同じ clean（manifest 空 + git 操作無し + HEAD 解決可）→ 所有者を返す
+ * - 観測できない / git 操作中 / HEAD 不明 / 所有者 Task で説明できない dirt → ambiguous（この cycle は誰も claim しない）
  */
 function confirmOwnerAgainstStaleDirt(
   ownerTaskId: string,
@@ -269,6 +270,7 @@ function confirmOwnerAgainstStaleDirt(
   workingDir: string,
   readDirtyPaths: (dir: string) => readonly string[],
   readHead: (dir: string) => string | undefined,
+  readGitOperations: (dir: string) => readonly string[],
 ): WorkspaceOwnership {
   const owner: WorkspaceOwnership = { kind: 'owner', taskId: ownerTaskId }
   const hasStaleElsewhere = perTask.some(({ task, jobs }) => (
@@ -280,7 +282,28 @@ function confirmOwnerAgainstStaleDirt(
   let head: string | undefined
   try {
     dirtyPaths = new Set(readDirtyPaths(workingDir))
-    if (dirtyPaths.size === 0) return owner
+  } catch (err: unknown) {
+    console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
+    return { kind: 'ambiguous' }
+  }
+
+  // clean の定義は admission / stale 解放と同じ（`isReleasableForNextTask()`）:
+  // manifest が空 + 進行中の git 操作が無い + HEAD を解決できる。stale Task が MERGE_HEAD /
+  // index.lock / 読めない HEAD を残していると、所有者の次 Job は baseline admission で
+  // fail-closed（quarantine）になるので、ここでは誰も選ばない。
+  if (dirtyPaths.size === 0) {
+    if (isReleasableForNextTask(workingDir, dirtyPaths, readGitOperations, readHead)) return owner
+    console.warn(`[Worker] 別 Task の stale 行があり、workspace が admission 可能な clean 状態でないため claim を見送ります`)
+    return { kind: 'ambiguous' }
+  }
+
+  try {
+    // dirty の場合も、進行中の git 操作があれば帰属を問わず選ばない（admission が拒否する）。
+    const gitOperations = readGitOperations(workingDir)
+    if (gitOperations.length > 0) {
+      console.warn(`[Worker] 進行中の git 操作があるため claim を見送ります (${gitOperations.join(', ')})`)
+      return { kind: 'ambiguous' }
+    }
     head = readHead(workingDir)
   } catch (err: unknown) {
     console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
@@ -333,7 +356,7 @@ export function resolveWorkspaceOwnership(
     return { kind: 'ambiguous' }
   }
   if (existing.length === 1) {
-    return confirmOwnerAgainstStaleDirt(existing[0], perTask, workingDir, readDirtyPaths, readHead)
+    return confirmOwnerAgainstStaleDirt(existing[0], perTask, workingDir, readDirtyPaths, readHead, readGitOperations)
   }
 
   // 終わった Task に取り残された blocked 行。次の Task をまだ始められない間だけ所有権を保持する。
