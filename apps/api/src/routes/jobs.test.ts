@@ -3336,3 +3336,92 @@ describe('Job API', () => {
     })
   })
 })
+
+// R-FINAL-OPPATCH (Codex review r5): eventId / payloadHash are caller-computable, so the Outbox event alone
+// does not prove the Worker sent the result. Under split credentials only the WORKER credential's event-bearing
+// success is applied. `legacy` (one shared API_TOKEN for humans and the Worker) and an unauthenticated route
+// (no credential class recorded, i.e. these unit tests) cannot tell the sender apart and keep accepting it.
+describe('event-bearing success provenance by credential class', () => {
+  async function withCredential(
+    credential: 'admin' | 'worker' | 'legacy' | undefined,
+    run: (app: FastifyInstance) => Promise<void>,
+  ): Promise<void> {
+    const [{ jobRoutes }, { resetStorage }, { setCredentialClass }] = await Promise.all([
+      import('./jobs.js'),
+      import('../storage/index.js'),
+      import('../auth/credentialClass.js'),
+    ])
+    resetStorage()
+    const app = Fastify()
+    app.addHook('preHandler', async (req) => {
+      if (credential !== undefined) setCredentialClass(req, credential)
+    })
+    app.register(jobRoutes, { prefix: '/api/jobs' })
+    await app.ready()
+    try {
+      await run(app)
+    } finally {
+      await app.close()
+    }
+  }
+
+  async function runningJob() {
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+    })
+    const job = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'running',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    } as Parameters<typeof storage.jobs.create>[0])
+    return { storage, job }
+  }
+
+  const delivery = (eventId: string) => withOutbox({ status: 'success', exitCode: 0, stdout: 'result' }, eventId)
+
+  it('ADMIN with a valid eventId + payloadHash cannot write success (409, nothing changes)', async () => {
+    await withCredential('admin', async (app) => {
+      const { storage, job } = await runningJob()
+      const before = storage.jobs.findById(job.id)
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: delivery('evt-admin') })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(storage.jobs.findById(job.id)).toEqual(before)
+    })
+  })
+
+  it.each(['worker', 'legacy', undefined] as const)(
+    'credential %s with an Outbox event applies success',
+    async (credential) => {
+      await withCredential(credential, async (app) => {
+        const { storage, job } = await runningJob()
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: delivery(`evt-${credential}`) })
+        expect(res.statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('success')
+      })
+    },
+  )
+
+  it.each(['admin', 'worker', 'legacy'] as const)(
+    'credential %s without an Outbox event cannot write success',
+    async (credential) => {
+      await withCredential(credential, async (app) => {
+        const { storage, job } = await runningJob()
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'success' } })
+        expect(res.statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('running')
+      })
+    },
+  )
+
+  it('ADMIN can still end a running Job as failed', async () => {
+    await withCredential('admin', async (app) => {
+      const { storage, job } = await runningJob()
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'failed', stderr: 'stopped' } })
+      expect(res.statusCode).toBe(200)
+      expect(storage.jobs.findById(job.id)?.status).toBe('failed')
+    })
+  })
+})

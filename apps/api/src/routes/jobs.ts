@@ -1,4 +1,5 @@
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
+import { getCredentialClass } from '../auth/credentialClass'
 import { completeAbortCleanup } from '../pl/abortTask'
 import { TECHNICAL_ABORT_WORKER_REFUSAL_CODES } from '../pl/technicalAbortEvidence'
 import type { FastifyInstance } from 'fastify'
@@ -814,8 +815,13 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // Worker は terminal 結果を必ず `persistTerminalUpdate()`（eventId 付き）で送り、eventId 無しで送るのは
     // claim（→ running）だけなので、この拒否は Worker の配送を何も変えない。止まった running Job の出口は
     // 従来どおり `PATCH /:id/fail-if-running`・eventId 無しの failed / blocked・requeue（→ queued）である。
+    // **Outbox event の由来も確かめる**（Codex review r5）: eventId と payloadHash は呼び出し側が計算できるので、
+    // split credential では Worker credential の配送だけを Worker の結果として受ける。ADMIN が event 欄を付けても
+    // success は書けない。legacy（単一 token）と未認証のテスト構成は由来を区別できないため従来どおり。
+    const credentialClass = getCredentialClass(req)
+    const workerProvenance = credentialClass === undefined || credentialClass === 'worker' || credentialClass === 'legacy'
     if (
-      outboxEvent === undefined
+      (outboxEvent === undefined || !workerProvenance)
       && jobUpdate.status === 'success'
       && existing.status !== 'success'
     ) {

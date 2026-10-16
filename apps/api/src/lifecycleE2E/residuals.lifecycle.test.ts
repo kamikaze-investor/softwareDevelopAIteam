@@ -103,6 +103,29 @@ describe('R-FINAL-OPPATCH: a direct success write cannot pre-empt the Worker res
     },
   )
 
+  it('an ADMIN success carrying a caller-computed eventId + payloadHash is refused under split credentials', async () => {
+    env = await startLifecycle({ ledger: buildLedger([{ id: 'docs-a', title: 'Docs A' }]) })
+    const project = createRunningProject(env)
+    const task = await env.adoptNext(project.id, 'docs-a')
+    let held: { jobId: string; payload: Record<string, unknown> } | undefined
+    env.worker.crashBeforeNextReport = (jobId, payload) => {
+      held = { jobId, payload }
+    }
+    await env.worker.pollOnce()
+
+    // Same body the Worker would send (valid hash), but from the ADMIN credential.
+    const forged = await env.api<{ code?: string }>('PATCH', `/api/jobs/${held!.jobId}`, asOutboxDelivery(held!.payload), 'admin')
+    expect(forged.statusCode).toBe(409)
+    expect(forged.body.code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+    expect(env.storage.jobs.findById(held!.jobId)?.status).toBe('running')
+
+    const delivered = await env.api('PATCH', `/api/jobs/${held!.jobId}`, asOutboxDelivery(held!.payload), 'worker')
+    expect(delivered.statusCode).toBe(200)
+    await env.quiesce()
+    await env.worker.runUntilIdle()
+    expect(env.task(task.id).status).toBe('done')
+  })
+
   it('a direct success on a git_commit Job cannot mark the Task done without a commit', async () => {
     env = await startLifecycle({ ledger: buildLedger([{ id: 'docs-a', title: 'Docs A' }]) })
     const project = createRunningProject(env)
