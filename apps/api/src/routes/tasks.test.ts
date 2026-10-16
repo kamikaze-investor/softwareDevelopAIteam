@@ -508,6 +508,54 @@ describe('Task API', () => {
       })
     })
 
+    it('PATCH to pending never reopens a task that is done (status is decided inside the transaction)', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        // 書き込みの前に done になった Task（完了経路が先に確定した）。
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+        storage.tasks.update(task.id, { status: 'done' })
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string; reason: string }>(res.body)).toMatchObject({
+          code: 'TASK_LIFECYCLE_STATE_OWNED', reason: expect.stringContaining('done'),
+        })
+        expect(storage.tasks.findById(task.id)?.status).toBe('done')
+
+        // pending → pending（他の欄の編集）は遷移ではないので通る。
+        const pendingTask = await createTask(app, project.id)
+        const edit = await app.inject({
+          method: 'PATCH', url: `/api/tasks/${pendingTask.id}`, payload: { status: 'pending', title: 'renamed' },
+        })
+        expect(edit.statusCode).toBe(200)
+        expect(storage.tasks.findById(pendingTask.id)?.title).toBe('renamed')
+      })
+    })
+
+    it('a failed design review on a stranded in_progress task raises only design_review_failed; PATCH to pending stays the exit', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        storage.projects.update(project.id, { status: 'running' })
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+        const run = storage.designReviewRuns.create({
+          taskId: task.id, taskTitle: 'T', designText: 'd', designTextHash: 'h', changedFiles: [],
+        })
+        const claim = storage.designReviewRuns.claim(run.id, 3)
+        storage.designReviewRuns.complete(run.id, claim.claimToken!, 'failed', undefined, 'runner failed')
+
+        const kinds = buildSystemState(storage).attention.filter((a) => a.taskId === task.id).map((a) => a.kind)
+        expect(kinds).toEqual(['design_review_failed'])
+
+        const exit = await app.inject({ method: 'PATCH', url: `/api/tasks/${task.id}`, payload: { status: 'pending' } })
+        expect(exit.statusCode).toBe(200)
+      })
+    })
+
     it('an in_progress task with an active design review run is not reported as stranded', async () => {
       await withApp(async (app) => {
         const project = await createProject(app)

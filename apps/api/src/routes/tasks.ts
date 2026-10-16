@@ -832,31 +832,31 @@ export async function taskRoutes(
     // （lifecycle repair C3）。Job / Design Review / 人の判断がまだ Task を動かしているのに pending へ戻すと、
     // driver が走っている間に Project の占有が外れる。判定は stranded attention と同じ唯一の述語
     // （`strandedLifecycleRefusal`）を、書き込みと同じ storage transaction の中で呼び直す。
-    if (result.data.status !== undefined) {
-      const current = storage.tasks.findById(req.params.id)
-      if (
-        current !== undefined
-        && LIFECYCLE_OWNED_TASK_STATUSES.has(current.status)
-        && current.status !== result.data.status
-      ) {
-        const released = storage.tasks.updateIfAdmitted(
-          req.params.id,
-          result.data,
-          (latest) => (LIFECYCLE_OWNED_TASK_STATUSES.has(latest.status)
-            ? strandedLifecycleRefusal(storage, latest)
-            : undefined),
-        )
-        if (!released.ok) {
-          if (released.code === 'TASK_NOT_FOUND') return reply.status(404).send({ error: 'Task not found' })
-          return reply.status(409).send({
-            ...TASK_LIFECYCLE_STATE_OWNED_REFUSAL,
-            error: `The task is still driven by its lifecycle and cannot leave ${current.status} through this generic route: `
-              + released.reason,
-            reason: released.reason,
-          })
+    //
+    // **明示的な `status: 'pending'` はすべてこの 1 transaction を通す**（Codex review 2d8f060）。transaction の外で
+    // 読んだ status で経路を選ぶと、その後に driver 付きの in_progress になった Task や done になった Task へ
+    // pending を直接書けてしまう。判定は transaction 内で読み直した最新の status だけで行う:
+    //   - pending → 遷移ではないので通す（他の欄の編集は従来どおり）
+    //   - in_progress / review → park されておらず stranded のときだけ通す
+    //   - それ以外（done / blocked 等）→ 断る（完了の取り消しや blocked からの復帰はこの経路の担当ではない）
+    if (result.data.status === 'pending') {
+      const released = storage.tasks.updateIfAdmitted(req.params.id, result.data, (latest) => {
+        if (latest.status === 'pending') return undefined
+        if (LIFECYCLE_OWNED_TASK_STATUSES.has(latest.status) && latest.status !== 'blocked') {
+          if (storage.tasks.isParked(latest.id)) return 'task was parked by abort_task'
+          return strandedLifecycleRefusal(storage, latest)
         }
-        return reply.send(released.task)
+        return `task is ${latest.status}; only a stranded in_progress / review task can be moved back to pending here`
+      })
+      if (!released.ok) {
+        if (released.code === 'TASK_NOT_FOUND') return reply.status(404).send({ error: 'Task not found' })
+        return reply.status(409).send({
+          ...TASK_LIFECYCLE_STATE_OWNED_REFUSAL,
+          error: `The task cannot be moved back to pending through this generic route: ${released.reason}`,
+          reason: released.reason,
+        })
       }
+      return reply.send(released.task)
     }
 
     const updated = storage.tasks.update(req.params.id, result.data)

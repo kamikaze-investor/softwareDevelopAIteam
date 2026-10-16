@@ -713,6 +713,10 @@ export function buildSystemState(
         && !parentIsParked
         && !hasMovableJob
         && stallingFailure === undefined
+        // その Task の最新 run が failed で、既に design_review_failed として出ているなら重ねない
+        // （同じ停止に remediation と escalation が競合する。Codex review 2d8f060）。attention の経路だけの
+        // 条件で、共有述語は変えない（PATCH → pending の出口は残る）。
+        && !(currentTask?.id === task.id && designReview?.status === 'failed')
         && strandedLifecycleRefusal(storage, task, nowMs) === undefined
       ) {
         attention.push({
