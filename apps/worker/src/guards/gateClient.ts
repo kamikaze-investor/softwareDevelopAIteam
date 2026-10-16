@@ -201,6 +201,19 @@ function isGateCheckResponse(value: unknown): value is GateCheckResponse {
     if (typeof nextAction.consumedRequestId !== 'string' || nextAction.consumedRequestId.length === 0) {
       return false
     }
+    // D2（2026-10-17）: gatePolicy は整合した call_consume を「承認済み対象の実行」として
+    // ローカル escalation の対象外にする。その前提となる tuple の整合をここで強制する
+    // （API は decideGateOutcome の APPROVED 分岐でだけこの組を返す）。食い違う応答は技術障害。
+    if (outcome.decision !== 'ALLOW' || v.continuationPolicy !== 'continue') return false
+    if (outcome.consumedRequestId !== nextAction.consumedRequestId) return false
+    const approvalRequest = asRecord(v.approvalRequest)
+    if (
+      !approvalRequest ||
+      approvalRequest.id !== nextAction.consumedRequestId ||
+      approvalRequest.status !== 'APPROVED'
+    ) {
+      return false
+    }
   }
 
   return true
