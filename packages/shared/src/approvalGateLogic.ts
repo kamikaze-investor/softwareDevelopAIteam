@@ -91,6 +91,17 @@ export const GATE_CHANGE_EXACT_FILES: readonly string[] = [
   'apps/api/src/pl/technicalResumePolicy',                      // PL Technical Resume の budget / actor token
   'apps/api/src/pl/technicalAbortEvidence',                     // PL technical abort の authority
   'apps/api/src/ctoAi/roadmapAdoption',                         // adoption admission / 受理する policy version
+  // 2026-10-17 Codex review（c3-b）: recovery / attempt budget・admission・escalation 選択の定義
+  'apps/api/src/pl/adoptionStep',                               // adoption の authorizePlAction seam と試行 budget
+  'apps/api/src/ctoAi/initialImplementWorkflow',                // initial implement の U7 recovery admission
+  'apps/api/src/ctoAi/projectInitialization',                   // Roadmap CONFLICT recovery の admission と試行 budget
+  'apps/api/src/pl/remediationStep',                            // remediation の試行 budget
+  'apps/api/src/pl/conflictResolutionStep',                     // critic / recovery round の budget
+  'apps/api/src/pl/blockedTriage',                              // 自動 recovery か CEO escalation かの選択
+  'apps/api/src/pl/operatorRequestStep',                        // 外部依頼を PL 判断経路へ入れる対象照合（admission）
+  'apps/worker/src/jobStateManager',                            // stale Job recovery の admission
+  'apps/worker/src/workspaceVerification',                      // crash recovery で workspace 所有権を解放する exact 検証
+  'apps/worker/src/index',                                      // abort cleanup 再送 budget（fileChangeGuard 保護とは別に不変条件として）
 ]
 for (const file of GATE_CHANGE_EXACT_FILES) {
   if (!/^[A-Za-z0-9/]+$/.test(file)) {

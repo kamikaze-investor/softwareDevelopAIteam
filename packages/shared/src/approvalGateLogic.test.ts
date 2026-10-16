@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs'
+import path from 'node:path'
 import { describe, it, expect } from 'vitest'
 import {
   GATE_CHANGE_EXACT_FILES,
@@ -54,50 +56,34 @@ describe('RISK_RULES — alignment / gate change（2026-10-16 追加分）', () 
  * 2026-10-17 監査（RC6 / DA trigger 2）: authority・admission・recovery の定義ファイル。
  * ここが LOW だと、これらを編集してよい Task が CEO 依頼なしに Safety Evidence で auto-commit できる。
  */
-describe('RISK_RULES — alignment / gate change（2026-10-17 authority / admission / recovery 定義）', () => {
-  const authorityFiles = [
-    'apps/api/src/designReview/resumeActor.ts',
-    'apps/api/src/designReview/repairRecoveryEpoch.ts',
-    'apps/api/src/designReview/repairFromStoredReview.ts',
-    'apps/api/src/designReview/resumeBlockedTask.ts',
-    'apps/api/src/designReview/terminalRepairSuccessorRecovery.ts',
-    'apps/api/src/designReview/terminalRepairEscalationRecovery.ts',
-    'apps/api/src/designReview/designReviewCoordinator.ts',
-    'apps/api/src/designReview/resultingCommitBinding.ts',
-    'apps/api/src/humanRecovery/recoverBlockedTask.ts',
-    'apps/api/src/humanRecovery/recoveryAudit.ts',
-    'apps/api/src/storage/interface.ts',
-    'packages/shared/src/resumeAdmission.ts',
-    'packages/shared/src/recoverAdmission.ts',
-    'packages/shared/src/taskOccupancy.ts',
-    'packages/shared/src/reviewSeparation.ts',
-    'apps/api/src/approvedRunBlock.ts',
-    'apps/api/src/state/blockedRowOwnership.ts',
-    'apps/api/src/reconcile/externalCompletion.ts',
-    'apps/api/src/pl/technicalResumePolicy.ts',
-    'apps/api/src/pl/technicalAbortEvidence.ts',
-    'apps/api/src/ctoAi/roadmapAdoption.ts',
-  ]
+/**
+ * GATE_CHANGE_EXACT_FILES（production の正本）の全 path。テスト側に allowlist を複製しない。
+ * ここが LOW だと、これらを編集してよい Task が CEO 依頼なしに Safety Evidence で auto-commit できる。
+ */
+describe('RISK_RULES — alignment / gate change（GATE_CHANGE_EXACT_FILES の全 path）', () => {
+  const productionFiles = GATE_CHANGE_EXACT_FILES.map((file) => `${file}.ts`)
+  const repoRoot = path.resolve(__dirname, '../../..')
 
-  it.each(authorityFiles)('%s → HIGH / alignment / gate change', (file) => {
+  it.each(productionFiles)('%s → HIGH / alignment / gate change', (file) => {
     const result = runRiskReview([file])
     expect(result.riskLevel).toBe('HIGH')
     expect(result.triggeredRules).toContain(GATE)
   })
 
-  it('一覧は GATE_CHANGE_EXACT_FILES の正本と一致する（追加漏れ・テスト漏れを相互に検出する）', () => {
-    const expected = authorityFiles.map((file) => file.replace(/\.ts$/, ''))
-    for (const file of expected) {
-      expect(GATE_CHANGE_EXACT_FILES).toContain(file)
-    }
+  it.each(productionFiles)('%s は実在する production file（綴り違いで素通りしない）', (file) => {
+    expect(existsSync(path.join(repoRoot, file))).toBe(true)
   })
 
-  it.each(authorityFiles.map((file) => file.replace(/\.ts$/, '.test.ts')))(
+  it.each(productionFiles.map((file) => file.replace(/.ts$/, '.test.ts')))(
     '%s（隣のテスト）は alignment / gate change に一致しない',
     (file) => {
       expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
     },
   )
+
+  it('一覧に重複が無い', () => {
+    expect(new Set(GATE_CHANGE_EXACT_FILES).size).toBe(GATE_CHANGE_EXACT_FILES.length)
+  })
 
   it.each([
     // 似た名前の別ファイル・別ディレクトリ・前方一致は対象外
@@ -110,6 +96,10 @@ describe('RISK_RULES — alignment / gate change（2026-10-17 authority / admiss
     'apps/api/src/reconcile/externalCompletionReport.ts',
     'apps/api/src/ctoAi/roadmapAdoptionPrompt.ts',
     'xapps/api/src/approvedRunBlock.ts',
+    'apps/worker/src/guards/index.ts',
+    'apps/worker/src/indexHelpers.ts',
+    'apps/api/src/pl/blockedTriageSummary.ts',
+    'apps/worker/src/jobStateManager.js',
   ])('%s does not match alignment / gate change', (file) => {
     expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
   })
