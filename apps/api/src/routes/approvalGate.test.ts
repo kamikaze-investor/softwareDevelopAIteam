@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass.js'
 import { createHash } from 'crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ApprovalRequest, Job, RiskReviewResult } from '@ai-team/shared'
@@ -16,6 +17,15 @@ async function buildApp(): Promise<FastifyInstance> {
   resetStorage()
 
   const app = Fastify()
+  // production では PATCH /approval-requests/:id/status は HUMAN_ONLY_ROUTES（split mode の ADMIN だけが届く）。
+  // このテスト app は認証 hook を持たないので、その境界だけを模して ADMIN として記録する
+  // （consume は approval_actor=human を要求する。D2 hardening 2026-10-17）。
+  app.addHook('preHandler', async (req) => {
+    const path = req.url.split('?')[0]!
+    if (req.method === 'PATCH' && path.startsWith('/api/approval-requests/') && path.endsWith('/status')) {
+      setCredentialClass(req, 'admin')
+    }
+  })
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
@@ -342,10 +352,10 @@ describe('POST /api/approval-requests/:id/consume', () => {
       await patchStatus(app, req.id, 'REJECTED', 'CEOが却下した')
 
       const { getStorage } = await import('../storage/index.js')
-      // 決定の行と、決定者（approval_actor）の行が1件ずつ残る。認証 hook の無いテスト app なので actor は human ではない。
+      // 決定の行と、決定者（approval_actor）の行が1件ずつ残る。テスト app は PATCH /status を ADMIN として模すので human。
       const all = getStorage().auditLog.findByEntity('approval_request', req.id)
       expect(all.filter((entry) => entry.operation === 'approval_actor')).toHaveLength(1)
-      expect(all.find((entry) => entry.operation === 'approval_actor')?.result).not.toBe('human')
+      expect(all.find((entry) => entry.operation === 'approval_actor')?.result).toBe('human')
       const entries = all.filter((entry) => entry.operation !== 'approval_actor')
       expect(entries).toHaveLength(1)
       expect(entries[0]).toMatchObject({
@@ -364,10 +374,10 @@ describe('POST /api/approval-requests/:id/consume', () => {
       await patchStatus(app, req.id, 'APPROVED', 'CEOが承認した')
 
       const { getStorage } = await import('../storage/index.js')
-      // 決定の行と、決定者（approval_actor）の行が1件ずつ残る。認証 hook の無いテスト app なので actor は human ではない。
+      // 決定の行と、決定者（approval_actor）の行が1件ずつ残る。テスト app は PATCH /status を ADMIN として模すので human。
       const all = getStorage().auditLog.findByEntity('approval_request', req.id)
       expect(all.filter((entry) => entry.operation === 'approval_actor')).toHaveLength(1)
-      expect(all.find((entry) => entry.operation === 'approval_actor')?.result).not.toBe('human')
+      expect(all.find((entry) => entry.operation === 'approval_actor')?.result).toBe('human')
       const entries = all.filter((entry) => entry.operation !== 'approval_actor')
       expect(entries).toHaveLength(1)
       expect(entries[0]).toMatchObject({
@@ -742,6 +752,19 @@ async function startGitCommitApproval(
     .find((candidate) => candidate.approvalId === approvalRequest.id)
   expect(job).toBeDefined()
   return { approvalRequest, job: job! }
+}
+
+/**
+ * Worker の claim（queued → running）を再現する。claim は Project が running のときだけ書かれるので
+ * （JOB_CLAIM_REFUSED）、テスト用 Project を running にしてから storage の claim 経路で running にする。
+ */
+async function claimJobForTest(jobId: string): Promise<void> {
+  const { getStorage } = await import('../storage/index.js')
+  const storage = getStorage()
+  const job = storage.jobs.findById(jobId)!
+  const task = storage.tasks.findById(job.taskId)!
+  storage.projects.update(task.projectId, { status: 'running' })
+  expect(storage.jobs.update(jobId, { status: 'running' })?.status).toBe('running')
 }
 
 async function patchJob(
@@ -1406,6 +1429,13 @@ describe('POST /api/gate/check — git_commit requiresApprovalByPolicy', () => {
       const requestId = first.body.approvalRequest?.id
       expect(requestId).toBeTruthy()
       await patchStatus(app, requestId!, 'APPROVED')
+      // 承認（approveAndResumeJob）で Job は queued に戻る。Worker は claim（running）してから gate/check・consume する
+      // （consume は running の Job だけを受け付ける。D2 hardening 2026-10-17）。
+      {
+        const { getStorage } = await import('../storage/index.js')
+        const linked = getStorage().jobs.findByTaskId(first.body.approvalRequest!.taskId).find((job) => job.approvalId === requestId)!
+        await claimJobForTest(linked.id)
+      }
 
       const { statusCode, body } = await gateCheck(app, { ...GIT_COMMIT_PAYLOAD, taskId })
       expect(statusCode).toBe(200)
@@ -1742,6 +1772,9 @@ describe('Phase A — git_commit Approvalと同一Jobの自動再開', () => {
     await withApp(async (app) => {
       const { approvalRequest, job } = await startGitCommitApproval(app, 'phase-a-consume')
       await patchStatus(app, approvalRequest.id, 'APPROVED')
+      // 承認（approveAndResumeJob）で Job は queued に戻る。Worker は claim（running）してから gate/check・consume する
+      // （consume は running の Job だけを受け付ける。D2 hardening 2026-10-17）。
+      await claimJobForTest(job.id)
 
       const first = await consumeRequest(app, approvalRequest.id, {
         jobId: job.id,
@@ -3036,6 +3069,200 @@ describe('PATCH /approval-requests/:id/status — expired WAITING is not decided
 
       expect(res.statusCode).toBe(409)
       expect(parseBody<{ code: string }>(res.body).code).toBe('APPROVAL_EXPIRED')
+    })
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// D2 hardening（2026-10-17）: consume は束縛・人の決定・期限・実行中の Job を 1 transaction で確かめる。
+// gatePolicy は整合した ALLOW + call_consume を承認済み対象の実行として通すので、最後の砦は consume。
+// ────────────────────────────────────────────────────────────
+
+describe('POST /api/approval-requests/:id/consume — D2 hardening', () => {
+  const FUTURE = '2099-01-01T00:00:00.000Z'
+  type Seed = {
+    action?: string
+    jobStatus?: Job['status']
+    expiresAt?: string
+    actor?: 'admin' | 'worker' | 'legacy' | 'none'
+    status?: ApprovalRequest['status']
+  }
+
+  /** 実在 Task・Job と、それに束縛した承認を storage に直接作る（Gate 経由の束縛と同じ形）。 */
+  async function seed(app: FastifyInstance, logical: string, over: Seed = {}) {
+    const { getStorage } = await import('../storage/index.js')
+    const { recordApprovalActor } = await import('../designReview/resumeActor.js')
+    const storage = getStorage()
+    const action = over.action ?? 'git_commit'
+    const taskId = await ensureGateTask(app, logical)
+    const job = storage.jobs.create({
+      taskId, projectId: 'gate-project-001', agentRole: 'developer_ai', status: 'running',
+      safeCommand: { kind: action, workingDir: '/workspace/target', ...(action === 'git_commit' ? { params: { commitMessage: 'd2' } } : {}) },
+    } as never)
+    const data = {
+      taskId, requestedAction: action, riskLevel: 'HIGH', triggeredRules: [], invalidIf: [],
+      targetBranch: 'main', targetCommit: 'commit-d2', targetDiffHash: 'diff-d2',
+      changedFiles: ['docs/project_memory/goal.md'],
+      status: over.status ?? 'APPROVED', expiresAt: over.expiresAt ?? FUTURE,
+    } as never
+    let approvalId: string
+    if (action === 'git_commit') {
+      const created = storage.approvalRequests.createForJob(data, job.id)
+      if (!created.ok) throw new Error(created.reason)
+      approvalId = created.approvalRequest.id
+    } else {
+      approvalId = storage.approvalRequests.create(data).id
+    }
+    const actor = over.actor ?? 'admin'
+    if (actor !== 'none') recordApprovalActor(storage, approvalId, actor)
+    if (over.jobStatus && over.jobStatus !== 'running') storage.jobs.update(job.id, { status: over.jobStatus })
+    return { storage, job: storage.jobs.findById(job.id)!, approvalId, taskId }
+  }
+
+  async function consume(app: FastifyInstance, id: string, body: Record<string, unknown>) {
+    const res = await app.inject({ method: 'POST', url: `/api/approval-requests/${id}/consume`, payload: body })
+    return { statusCode: res.statusCode, body: parseBody<Record<string, unknown>>(res.body) }
+  }
+
+  const match = { currentCommit: 'commit-d2', currentDiffHash: 'diff-d2' }
+
+  for (const action of ['git_commit', 'test']) {
+    describe(`${action}`, () => {
+      it('人（ADMIN）が決めた・未失効・束縛一致・running の Job → 200 CONSUMED（基準）', async () => {
+        await withApp(async (app) => {
+          const { storage, job, approvalId } = await seed(app, `d2-ok-${action}`, { action })
+          const res = await consume(app, approvalId, { jobId: job.id, ...match })
+          expect(res.statusCode).toBe(200)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('CONSUMED')
+        })
+      })
+
+      it.each(['none', 'worker', 'legacy'] as const)('approval_actor が human でない（%s）→ 409、SUPERSEDED + supersede audit、使い切らない', async (actor) => {
+        await withApp(async (app) => {
+          const { storage, job, approvalId } = await seed(app, `d2-actor-${actor}-${action}`, { action, actor })
+          const res = await consume(app, approvalId, { jobId: job.id, ...match })
+          expect(res.statusCode).toBe(409)
+          expect(String(res.body.error)).toMatch(/human/)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('SUPERSEDED')
+          expect(storage.auditLog.findByEntity('approval_request', approvalId)
+            .filter((entry) => entry.operation === 'supersede').map((entry) => entry.detail))
+            .toEqual(['reason=approval_actor_not_human'])
+        })
+      })
+
+      it.each(['not-a-date', 'unparsable'])('読めない期限値（%s）→ 409 EXPIRED（未失効として通さない）', async (expiresAt) => {
+        await withApp(async (app) => {
+          const { storage, job, approvalId } = await seed(app, `d2-exp-${expiresAt}-${action}`, { action, expiresAt })
+          const res = await consume(app, approvalId, { jobId: job.id, ...match })
+          expect(res.statusCode).toBe(409)
+          expect(String(res.body.error)).toMatch(/expired/i)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('EXPIRED')
+        })
+      })
+
+      it('期限切れ → 409 EXPIRED', async () => {
+        await withApp(async (app) => {
+          const { storage, job, approvalId } = await seed(app, `d2-past-${action}`, { action, expiresAt: '2000-01-01T00:00:00.000Z' })
+          const res = await consume(app, approvalId, { jobId: job.id, ...match })
+          expect(res.statusCode).toBe(409)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('EXPIRED')
+        })
+      })
+
+      it.each(['queued', 'blocked', 'success', 'failed'] as const)('Job が running でない（%s）→ 409、承認は APPROVED のまま（遷移しない）', async (jobStatus) => {
+        await withApp(async (app) => {
+          const { storage, job, approvalId } = await seed(app, `d2-job-${jobStatus}-${action}`, { action, jobStatus })
+          expect(job.status).toBe(jobStatus)
+          const res = await consume(app, approvalId, { jobId: job.id, ...match })
+          expect(res.statusCode).toBe(409)
+          expect(String(res.body.error)).toMatch(/must be running/)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('APPROVED')
+        })
+      })
+
+      it.each([
+        ['commit-mismatch', { currentCommit: 'other-commit', currentDiffHash: 'diff-d2' }],
+        ['diff-mismatch', { currentCommit: 'commit-d2', currentDiffHash: 'other-diff' }],
+      ])('%s → 409 STALE（使い切らない）', async (label, binding) => {
+        await withApp(async (app) => {
+          const { storage, job, approvalId } = await seed(app, `d2-stale-${label}-${action}`, { action })
+          const res = await consume(app, approvalId, { jobId: job.id, ...binding })
+          expect(res.statusCode).toBe(409)
+          expect(String(res.body.error)).toMatch(/stale/i)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('STALE')
+        })
+      })
+
+      it.each(['REJECTED', 'WAITING_FOR_USER', 'STALE', 'EXPIRED', 'SUPERSEDED'] as const)('%s の承認は consume できない（409）', async (status) => {
+        await withApp(async (app) => {
+          const { storage, job, approvalId } = await seed(app, `d2-st-${status}-${action}`, { action, status })
+          const res = await consume(app, approvalId, { jobId: job.id, ...match })
+          expect(res.statusCode).toBe(409)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe(status)
+        })
+      })
+
+      it('Task 不一致（別 Task の Job）→ 409、使い切らない', async () => {
+        await withApp(async (app) => {
+          const { storage, approvalId } = await seed(app, `d2-task-a-${action}`, { action })
+          const other = await seed(app, `d2-task-b-${action}`, { action })
+          const res = await consume(app, approvalId, { jobId: other.job.id, ...match })
+          expect(res.statusCode).toBe(409)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('APPROVED')
+        })
+      })
+
+      it('action 不一致（同じ Task の別 kind の Job）→ 409、使い切らない', async () => {
+        await withApp(async (app) => {
+          const { storage, approvalId, taskId } = await seed(app, `d2-action-${action}`, { action })
+          const otherKind = storage.jobs.create({
+            taskId, projectId: 'gate-project-001', agentRole: 'developer_ai', status: 'running',
+            safeCommand: { kind: action === 'git_commit' ? 'test' : 'lint', workingDir: '/workspace/target' },
+          } as never)
+          const res = await consume(app, approvalId, { jobId: otherKind.id, ...match })
+          expect(res.statusCode).toBe(409)
+          expect(storage.approvalRequests.findById(approvalId)?.status).toBe('APPROVED')
+        })
+      })
+    })
+  }
+
+  it('git_commit: Job 不一致（同じ Task・同じ kind の別 Job）→ 409、使い切らない', async () => {
+    await withApp(async (app) => {
+      const { storage, approvalId, taskId } = await seed(app, 'd2-job-mismatch')
+      const otherJob = storage.jobs.create({
+        taskId, projectId: 'gate-project-001', agentRole: 'developer_ai', status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+      } as never)
+      const res = await consume(app, approvalId, { jobId: otherJob.id, ...match })
+      expect(res.statusCode).toBe(409)
+      expect(res.body).toMatchObject({ consumed: false })
+      expect(storage.approvalRequests.findById(approvalId)?.status).toBe('APPROVED')
+    })
+  })
+
+  it('git_commit: 二重 consume — 同じ Job は冪等（alreadyConsumed）、別 Job は 409 consumed=true', async () => {
+    await withApp(async (app) => {
+      const { storage, job, approvalId, taskId } = await seed(app, 'd2-double')
+      const first = await consume(app, approvalId, { jobId: job.id, ...match })
+      const second = await consume(app, approvalId, { jobId: job.id, ...match })
+      expect([first.statusCode, first.body.alreadyConsumed]).toEqual([200, false])
+      expect([second.statusCode, second.body.alreadyConsumed]).toEqual([200, true])
+      const otherJob = storage.jobs.create({
+        taskId, projectId: 'gate-project-001', agentRole: 'developer_ai', status: 'running',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+      } as never)
+      const third = await consume(app, approvalId, { jobId: otherJob.id, ...match })
+      expect(third.statusCode).toBe(409)
+      expect(third.body).toMatchObject({ consumed: true, jobId: job.id })
+    })
+  })
+
+  it('非 git_commit: 二重 consume は 2 回目が 409（一回限り）', async () => {
+    await withApp(async (app) => {
+      const { job, approvalId } = await seed(app, 'd2-double-cmd', { action: 'test' })
+      expect((await consume(app, approvalId, { jobId: job.id, ...match })).statusCode).toBe(200)
+      expect((await consume(app, approvalId, { jobId: job.id, ...match })).statusCode).toBe(409)
     })
   })
 })
