@@ -20,7 +20,7 @@ import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
 import { DesignReviewRunContentionError } from './interface'
-import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
+import { COMMAND_ZONES, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -61,7 +61,15 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
-import { approvalActorAuditRecord, readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { approvalActorAuditRecord, readJobsSupersededByHumanResume, resumeActorAuditRecord } from '../designReview/resumeActor'
+
+/** resume transaction 内で authority evidence（`resume_actor`）が書けなかったことを表す（G-01）。 */
+class ResumeAuthorityEvidenceWriteError extends Error {
+  constructor(cause: unknown) {
+    super(`failed to record resume_actor: ${cause instanceof Error ? cause.message : String(cause)}`)
+    this.name = 'ResumeAuthorityEvidenceWriteError'
+  }
+}
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -1189,6 +1197,47 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     }
   }
 
+  /**
+   * **新しい人の判断（Human Resume / Human Recovery）は、その Task の古い Task 単位の判断を置き換える**（C-03）。
+   *
+   * Task 単位の承認（`abort_task` / `reconcile_external_completion` / `repair_from_stored_review:*`）は
+   * Task・action・status・期限だけで照合されるので、resume / recover の前に下りた APPROVED abort が、
+   * 再開後の新しい作業を後から park できてしまう。resume / recover の transaction の中で、その Task の
+   * active（`WAITING_FOR_USER` / `APPROVED`）な Task 単位の request を `SUPERSEDED` にし、既存の
+   * `supersede` audit を残す。対象は requestedAction が command kind（`git_commit` を含む）でないものだけ:
+   * command kind の承認は commit / diff / Job に束縛済みで、この問題を持たない。
+   * `REJECTED` / `CONSUMED` / `STALE` / `EXPIRED` / `SUPERSEDED` は変えない。reason / reviewed_at も書かない。
+   */
+  function supersedeTaskScopedDecisions(
+    taskId: string,
+    reason: 'superseded_by_resume' | 'superseded_by_recover',
+    successorDetail: string,
+  ): string[] {
+    const commandKinds = new Set<string>(Object.keys(COMMAND_ZONES))
+    const ids = (db.prepare(`
+      SELECT id, requested_action FROM approval_requests
+      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+      ORDER BY created_at ASC, rowid ASC
+    `).all(taskId) as Array<{ id: string; requested_action: string }>)
+      .filter((row) => !commandKinds.has(row.requested_action))
+      .map((row) => row.id)
+    const supersede = db.prepare(`
+      UPDATE approval_requests SET status = 'SUPERSEDED'
+      WHERE id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+    `)
+    const recordSupersede = db.prepare(`
+      INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+      VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
+    `)
+    for (const id of ids) {
+      if (supersede.run(id).changes !== 1) {
+        throw new Error(`Failed to supersede task-scoped approval request ${id}`)
+      }
+      recordSupersede.run(randomUUID(), id, `reason=${reason} ${successorDetail}`, now())
+    }
+    return ids
+  }
+
   function technicalAbortAuditDetail(input: {
     authorization: Extract<AbortAuthorization, { kind: 'technical_evidence' }>
     observedHead: string
@@ -1327,6 +1376,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
         const updated = tasks.update(taskId, { status: 'pending' })
         if (!updated) return { ok: false as const, reason: 'Task could not be updated' }
+        // Human Recovery は新しい人の判断。古い Task 単位の判断を同じ transaction で置き換える（C-03）。
+        supersedeTaskScopedDecisions(taskId, 'superseded_by_recover', `recovered_task_id=${taskId}`)
 
         auditLog.record({
           actor: 'api',
@@ -3042,6 +3093,22 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // transaction 内なので、workspace ownership がどちらにも属さない window は無い。
         // source 行は削除せず、successor の resume:<source>:<n> と audit で lineage を保つ。
         const completeResumeHandoff = (successor: Job): ResumeBlockedTaskResult => {
+          // 誰が再開したか（authority evidence）は resume Job と同じ transaction で書く（G-01）。
+          // 書けなければ resume ごと rollback する —— 本物の Human Resume が resume_actor を欠いたまま
+          // commit され、後から human_resume authority を失う窓を残さない。
+          if (resumedBy !== undefined) {
+            try {
+              auditLog.record(resumeActorAuditRecord({ jobId: successor.id, taskId, ...resumedBy }))
+            } catch (error: unknown) {
+              throw new ResumeAuthorityEvidenceWriteError(error)
+            }
+            // **人の** resume は新しい人の判断。resume 前に下りた Task 単位の判断（abort_task 等）が、
+            // 再開後の作業へ後から効かないよう同じ transaction で置き換える（C-03）。command kind の
+            // 承認には触れない。PL / AI の resume は人の判断を上書きしない（CEO の abort 承認は残る）。
+            if (resumedBy.actorClass === 'human') {
+              supersedeTaskScopedDecisions(taskId, 'superseded_by_resume', `resume_job_id=${successor.id}`)
+            }
+          }
           if (isJobDirectlyBlocked) {
             const terminalized = db.prepare(
               "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
@@ -3244,7 +3311,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         return completeResumeHandoff(job)
       })
 
-      return resumeTransaction(input.taskId, input.instructionPrompt)
+      const resumedBy = input.resumedBy
+      try {
+        return resumeTransaction(input.taskId, input.instructionPrompt)
+      } catch (error: unknown) {
+        if (!(error instanceof ResumeAuthorityEvidenceWriteError)) throw error
+        // transaction は rollback 済み（resume Job も source の終端化も残っていない）。再試行してよい。
+        return { ok: false, code: 'RESUME_COMMIT_FAILED', reason: error.message }
+      }
     },
     /**
  * abort_task の最終段。所有権解放と park を**単一 transaction**で行う。

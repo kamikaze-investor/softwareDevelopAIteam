@@ -104,7 +104,6 @@ import {
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
-import { recordResumeActor } from '../designReview/resumeActor'
 import { RESUME_DESIGN_REVIEW_PENDING, resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
   countPlTechnicalResumes,
@@ -1546,6 +1545,15 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
         task,
         deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION,
       ),
+      // **この経路は定義上 PL である。** PL は in-process で動き HTTP credential を持たない
+      // ので、route 側の認証では区別できない。ここで `pl` と記録しておくことで、
+      // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
+      // 記録は storage が resume Job の作成と同じ transaction で書く（G-01）。
+      resumedBy: {
+        actorClass: 'pl',
+        evidence: 'in_process_pl',
+        ...(technicalResume ? { technicalResume: true } : {}),
+      },
       ...(deps.coordinatorDeps !== undefined ? { coordinatorDeps: deps.coordinatorDeps } : {}),
     })
     // 判定がまだ出ていない Design Review は否定ではない。試行を消費せず、attention を残す。
@@ -1554,19 +1562,13 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
       return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
     }
+    // authority evidence が書けず resume ごと rollback された。否定ではないので試行を消費しない。
+    if (!resumed.ok && resumed.code === 'RESUME_COMMIT_FAILED') {
+      return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
+    }
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }
-    // **この経路は定義上 PL である。** PL は in-process で動き HTTP credential を持たない
-    // ので、route 側の認証では区別できない。ここで `pl` と記録しておくことで、
-    // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
-    recordResumeActor(storage, {
-      jobId: resumed.job.id,
-      taskId: item.taskId,
-      actorClass: 'pl',
-      evidence: 'in_process_pl',
-      ...(technicalResume ? { technicalResume: true } : {}),
-    })
     return { ok: true, summary: `resume queued job ${resumed.job.id}` }
   },
 }

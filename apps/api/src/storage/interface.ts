@@ -19,6 +19,7 @@ import type { ResumeAdmissionCode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import type { CredentialClass } from '../auth/credentialClass'
+import type { ResumeActorEvidence } from '../designReview/resumeActor'
 
 /**
  * 承認の決定を下した主体（`apiTokenAuth()` が決めた credential 種別だけ）。
@@ -51,6 +52,11 @@ export type ResumeBlockedTaskResult =
         | 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
         /** 共有 `evaluateResumeAdmission()` の前提条件による拒否（Mobile と同じ code）。 */
         | ResumeAdmissionCode
+        /**
+         * resume と同じ transaction で書く authority evidence（`resume_actor`）が書けなかった（G-01）。
+         * transaction ごと rollback 済みで何も変わっていないので、同じ resume を再試行してよい。
+         */
+        | 'RESUME_COMMIT_FAILED'
       reason: string
     }
 
@@ -563,6 +569,12 @@ export interface IJobStorage {
   resumeBlockedTask(input: {
     taskId: string
     instructionPrompt: string
+    /**
+     * 誰が再開したか。渡すと resume Job の作成と**同じ transaction で** `resume_actor` 行を書き、
+     * 書けなければ resume ごと rollback して `RESUME_COMMIT_FAILED` を返す（G-01）。
+     * `human` の resume は新しい人の判断として、その Task の Task 単位の承認を置き換える（C-03）。
+     */
+    resumedBy?: ResumeActorEvidence
   }): ResumeBlockedTaskResult
   /**
    * PR-C finding 14 修復 (BLOCKER B): quarantine を解除する（単一transaction・冪等）。
