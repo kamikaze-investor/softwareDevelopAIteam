@@ -321,7 +321,9 @@ export function buildSystemState(
     continuationsPendingTotal += continuationsPending
 
     const waitingForProject = tasks.filter(
-      (task) => storage.approvalRequests.findActiveByTaskId(task.id)?.status === 'WAITING_FOR_USER',
+      // attention の `approval_waiting` と同じ意味で数える（期限切れ WAITING は誰も待っていない）。
+      // status だけで数えると、attention には出ないのに「承認待ち N 件」と表示される（2026-10-16 監査 A2）。
+      (task) => isLiveWaitingApproval(storage.approvalRequests.findActiveByTaskId(task.id), nowMs),
     ).length
     approvalsWaitingTotal += waitingForProject
 

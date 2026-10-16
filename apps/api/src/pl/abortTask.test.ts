@@ -848,6 +848,58 @@ describe('abortTask — blocked Job を1本残さない', () => {
   })
 })
 
+describe('abortTask — 認可された park は Task の active request を action を問わず STALE にする', () => {
+  function waitingRequest(storage: IStorage, taskId: string, action: string): string {
+    return storage.approvalRequests.create({
+      taskId, requestedAction: action, riskLevel: 'HIGH',
+      targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: FUTURE,
+    } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+  }
+
+  it('Job 付きの manual park は git_commit 以外の active request も STALE にし、abort 承認は CONSUMED のまま', () => {
+    const fx = seed()
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    const other = waitingRequest(fx.storage, fx.taskId, 'deploy')
+    const requested = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })
+    if (!requested.ok || requested.status !== 'cleanup_requested') throw new Error('expected cleanup_requested')
+    // 認可 guard を通る前（cleanup 要求の段階）では何も変えない。
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('WAITING_FOR_USER')
+
+    const done = completeAbortCleanup(fx.storage, { jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD })
+    expect(done).toMatchObject({ ok: true })
+
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('STALE')
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('CONSUMED')
+    const aborted = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'task_aborted' && entry.result === 'success')
+    expect(aborted?.detail).toContain('1 active approval(s) staled')
+  })
+
+  it('Job の無い直接 park も git_commit 以外の active request を STALE にする', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    const other = waitingRequest(fx.storage, fx.taskId, 'deploy')
+
+    expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' }))
+      .toMatchObject({ ok: true, status: 'parked' })
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('STALE')
+  })
+
+  it('認可に失敗した park は active request を変えない', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    const other = waitingRequest(fx.storage, fx.taskId, 'deploy')
+
+    expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId: other, reason: 'r' }))
+      .toMatchObject({ ok: false })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('WAITING_FOR_USER')
+  })
+})
+
 describe('abortTask — park した Task を別経路で再武装させない', () => {
   it('resume は park された Task を進めない', () => {
     const fx = seed()
@@ -1282,6 +1334,79 @@ describe('P2-2 Automatic Technical Abort', () => {
         .toBeUndefined()
     },
   )
+
+  // 期限解釈は shared isLiveWaitingApproval に一本化（2026-10-16 監査 A2）。期限切れ WAITING は
+  // 誰も待っておらず承認もできないので、Technical Abort を恒久的に塞がない。
+  it('an expired WAITING approval does not block Technical Abort, and the park stales it', () => {
+    const fx = seedTechnicalAbort()
+    const expired = fx.storage.approvalRequests.create({
+      taskId: fx.taskId,
+      requestedAction: 'deploy',
+      riskLevel: 'HIGH',
+      targetBranch: 'ai/technical',
+      targetCommit: 'c2',
+      targetDiffHash: 'd2',
+      changedFiles: [],
+      triggeredRules: [],
+      invalidIf: [],
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+    requestTechnical(fx)
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+    // changedPathCount=0 でも、action を問わず残った active request を STALE にする。
+    expect(fx.storage.approvalRequests.findById(expired.id)?.status).toBe('STALE')
+    const aborted = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'task_aborted' && entry.result === 'success')
+    expect(JSON.parse(aborted?.detail ?? '{}')).toMatchObject({ staleApprovalCount: 1 })
+  })
+
+  it('an expired APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
+    const fx = seedTechnicalAbort()
+    approvedRequest(fx.storage, fx.taskId, {
+      action: 'git_commit',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    })
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
+  })
+
+  it('an APPROVED approval hidden behind a newer expired WAITING still blocks Technical Abort', () => {
+    const fx = seedTechnicalAbort()
+    approvedRequest(fx.storage, fx.taskId, { action: 'git_commit' })
+    fx.storage.approvalRequests.create({
+      taskId: fx.taskId,
+      requestedAction: 'deploy',
+      riskLevel: 'HIGH',
+      targetBranch: 'ai/technical',
+      targetCommit: 'c3',
+      targetDiffHash: 'd3',
+      changedFiles: [],
+      triggeredRules: [],
+      invalidIf: [],
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+  })
 
   it('refuses a subject that already has a CEO escalation', () => {
     const fx = seedTechnicalAbort()

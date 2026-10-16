@@ -18,7 +18,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
-import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
+import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -577,7 +577,9 @@ function buildTaskSummary(
       quarantined: latestJob.failureMetadata?.quarantined === true,
     } : undefined,
     approvalSummary: {
-      hasWaitingApproval: approvalRequests.some(request => request.status === 'WAITING_FOR_USER'),
+      // Mobile / operator 表示の「承認待ち」は shared の `isLiveWaitingApproval` と同じ意味にする。
+      // 期限切れ WAITING を数えると、API が Resume を許すのに画面は承認待ちと出す（2026-10-16 監査 A2）。
+      hasWaitingApproval: approvalRequests.some(request => isLiveWaitingApproval(request)),
       hasRejectedApproval: approvalRequests.some(request => request.status === 'REJECTED'),
       latestApprovalRequestId: latestApproval?.id,
       latestApprovalStatus,
@@ -923,10 +925,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     return { ok: true }
   }
 
-  function staleActiveGitCommitApprovals(taskId: string): number {
+  /**
+   * authorized abort / park が成功した Task の active request（`WAITING_FOR_USER` / `APPROVED`）を、
+   * requestedAction と期限を問わず `STALE` へ進める。認可 guard を通過した後、同じ transaction 内で
+   * だけ呼ぶこと。manual abort の承認は先に `CONSUMED` になっているので対象外。
+   * `REJECTED`（CEO の却下の記録）/ `CONSUMED` / `EXPIRED` / `SUPERSEDED` は変えない。
+   */
+  function staleActiveApprovalsOfTask(taskId: string): number {
     return db.prepare(
       "UPDATE approval_requests SET status = 'STALE' WHERE task_id = ? "
-      + "AND requested_action = 'git_commit' AND status IN ('WAITING_FOR_USER', 'APPROVED')",
+      + "AND status IN ('WAITING_FOR_USER', 'APPROVED')",
     ).run(taskId).changes
   }
 
@@ -2177,13 +2185,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
 
         const latestApprovalRow = db.prepare(`
-          SELECT status FROM approval_requests
+          SELECT status, expires_at FROM approval_requests
           WHERE task_id = ?
           ORDER BY created_at DESC, rowid DESC
           LIMIT 1
-        `).get(source.taskId) as { status: ApprovalGateStatus } | undefined
+        `).get(source.taskId) as { status: ApprovalGateStatus; expires_at: string } | undefined
+        // 期限切れ WAITING は誰も待っていない（承認しても EXPIRED で拒否される）ので retry を止めない。
+        // REJECTED は CEO の却下の記録なので期限に関係なく止める。
         if (
-          latestApprovalRow?.status === 'WAITING_FOR_USER' ||
+          isLiveWaitingApproval(
+            latestApprovalRow === undefined
+              ? undefined
+              : { status: latestApprovalRow.status, expiresAt: latestApprovalRow.expires_at },
+          ) ||
           latestApprovalRow?.status === 'REJECTED'
         ) {
           return finishWithoutRetry()
@@ -2938,6 +2952,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
 
           tasks.update(task.id, { roadmapActive: false })
+          // job 付きの park / abort と同じく、認可通過後に Task の active request を action を問わず STALE にする。
+          const staleApprovalCount = staleActiveApprovalsOfTask(task.id)
           auditLog.record({
             actor: 'api',
             operation: 'task_aborted',
@@ -2946,7 +2962,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             result: 'success',
             detail:
               `parked (status kept as ${task.status}, no job to release, `
-              + `approval ${input.authorization.approvalRequestId}): ${input.reason.slice(0, 300)}`,
+              + `approval ${input.authorization.approvalRequestId}`
+              + (staleApprovalCount > 0 ? `, ${staleApprovalCount} active approval(s) staled` : '')
+              + `): ${input.reason.slice(0, 300)}`,
           })
 
           const updated = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
@@ -3231,9 +3249,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             })
           }
           tasks.update(task.id, { roadmapActive: false })
-          const staleApprovalCount = technical && (input.cleanupSummary?.changedPathCount ?? 0) > 0
-            ? staleActiveGitCommitApprovals(task.id)
-            : 0
+          // 認可（manual approval の consume / technical evidence の再検証）が通った後、同じ transaction で
+          // その Task の active request を action を問わず STALE にする。park / abort 後に残った request は
+          // 誰の判断も待っておらず、残すと再採用後の別 Job が古い判断を拾う（2026-10-16 監査）。
+          const staleApprovalCount = staleActiveApprovalsOfTask(task.id)
           const parkCount = (db.prepare(
             "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type = 'task' AND entity_id = ? "
             + "AND operation = 'task_aborted' AND result = 'success'",
@@ -3254,7 +3273,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 })
               : `parked (status kept as ${task.status}, `
                 + `job(s) ${blockedSiblings.map((sibling) => sibling.id).join(', ')} released, `
-                + `approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}): `
+                + `approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}`
+                + (staleApprovalCount > 0 ? `, ${staleApprovalCount} active approval(s) staled` : '')
+                + '): '
                 + input.reason.slice(0, 300),
           })
 
@@ -3570,9 +3591,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
           tasks.update(task.id, { status: 'pending', roadmapActive: false })
           const technical = input.authorization.kind === 'technical_evidence'
-          const staleApprovalCount = technical && (input.cleanupSummary?.changedPathCount ?? 0) > 0
-            ? staleActiveGitCommitApprovals(task.id)
-            : 0
+          // 認可（manual approval の consume / technical evidence の再検証）が通った後、同じ transaction で
+          // その Task の active request を action を問わず STALE にする。park / abort 後に残った request は
+          // 誰の判断も待っておらず、残すと再採用後の別 Job が古い判断を拾う（2026-10-16 監査）。
+          const staleApprovalCount = staleActiveApprovalsOfTask(task.id)
           const parkCount = (db.prepare(
             "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type = 'task' AND entity_id = ? "
             + "AND operation = 'task_aborted' AND result = 'success'",
@@ -3599,9 +3621,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                     abortApprovalId: (input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId,
                     observedHead: input.observation.startCommitHash,
                     targetDiffHash: linkedRejection.approval.targetDiffHash,
+                    ...(staleApprovalCount > 0 ? { staleApprovalCount } : {}),
                   })
                 : `parked blocked -> pending (approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}, `
-                  + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}): `
+                  + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}`
+                  + (staleApprovalCount > 0 ? `, ${staleApprovalCount} active approval(s) staled` : '')
+                  + '): '
                   + input.reason.slice(0, 300),
           })
 
@@ -6425,7 +6450,7 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
 
     const jobsForTask = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY rowid ASC')
     const jobById = db.prepare('SELECT * FROM jobs WHERE id = ?')
-    const approvalStatus = db.prepare('SELECT status FROM approval_requests WHERE id = ?')
+    const approvalStatus = db.prepare('SELECT status, expires_at FROM approval_requests WHERE id = ?')
 
     const exactResumeSuccessors = (sourceJobId: string, taskId: string): Job[] => {
       const taskJobs = (jobsForTask.all(taskId) as unknown[]).map(deserializeJob)
@@ -6466,10 +6491,17 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       // 承認待ちが結び付いたままの行は、その承認が approveAndResumeJob() で同じ行を動かしうる。
       // lineage があっても「もう誰も動かさない」とは言えないので触らない（fail-closed）。
       // 結び付いた承認行が見つからない場合も、状態を確かめられないので同じく触らない
-      // （`jobs.approval_id` に外部キーは無い）。期限は見ない —— WAITING は期限切れでも行として残る。
+      // （`jobs.approval_id` に外部キーは無い）。
+      // 期限切れ WAITING は pin しない: `approveAndResumeJob()` は期限切れを EXPIRED として拒否するので、
+      // その承認が同じ行を動かすことはもう無い（期限解釈は shared `isLiveWaitingApproval` に一本化。
+      // 2026-10-16 監査 A2: 期限切れ WAITING が source を恒久的に blocked へ留めていた）。
       if (source.approval_id !== null) {
-        const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
-        if (approval === undefined || approval.status === 'WAITING_FOR_USER') continue
+        const approval = approvalStatus.get(source.approval_id) as
+          { status: ApprovalGateStatus; expires_at: string } | undefined
+        if (
+          approval === undefined
+          || isLiveWaitingApproval({ status: approval.status, expiresAt: approval.expires_at })
+        ) continue
       }
 
       if (source.failure_metadata !== null) {

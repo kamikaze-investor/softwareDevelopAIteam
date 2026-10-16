@@ -51,6 +51,7 @@ import {
   getBaseRoadmapId,
   holdsWorkspaceWhenBlocked,
   isLiveJob,
+  isLiveWaitingApproval,
   isStaleBlockedJobCandidate,
   occupiesProject,
 } from '@ai-team/shared'
@@ -717,7 +718,13 @@ export function requestTechnicalAbort(
       reason: `Worker does not service ${task.status} Task + ${latestJob.status} Job cleanup carriers`,
     }
   }
-  const activeApproval = storage.approvalRequests.findActiveByTaskId(task.id)
+  // 止めるのは「人の判断が生きている」request だけ: 期限内の WAITING（判断待ち）と APPROVED
+  // （下された人の判断。技術的 cleanup で上書きしない）。期限切れ WAITING は誰も待っておらず
+  // 承認もできないので、ここで拒否すると Technical Abort が恒久的に塞がる（2026-10-16 監査 A2）。
+  // 期限解釈は shared `isLiveWaitingApproval` に一本化する。最新1件ではなく全行を見るのは、
+  // 新しい期限切れ WAITING の陰に古い APPROVED が残る legacy 状態でも人の判断を見落とさないため。
+  const activeApproval = storage.approvalRequests.findByTaskId(task.id)
+    .find((request) => request.status === 'APPROVED' || isLiveWaitingApproval(request))
   if (activeApproval !== undefined) {
     recordTechnicalAbortRefusal(storage, {
       taskId: task.id,

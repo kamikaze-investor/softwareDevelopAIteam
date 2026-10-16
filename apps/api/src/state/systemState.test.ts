@@ -538,6 +538,14 @@ describe('D7: 期限切れ承認は live な承認待ちとして扱わない', 
     expect(diagnosis.recommendedLane).toBe('ceo_escalation')
   })
 
+  it('totals.approvalsWaiting は attention と同じく live な WAITING だけを数える', () => {
+    // 期限切れを数えると、attention に出ないのに「承認待ち 1 件」と表示される（2026-10-16 監査 A2）。
+    expect(buildSystemState(seedBlockedWithWaitingApproval(LIVE).storage, { now }).totals.approvalsWaiting)
+      .toBe(1)
+    expect(buildSystemState(seedBlockedWithWaitingApproval(EXPIRED).storage, { now }).totals.approvalsWaiting)
+      .toBe(0)
+  })
+
   it('AC4: 判定しただけで durable row は書き換えない（lazy expiry を壊さない）', () => {
     const { storage, taskId } = seedBlockedWithWaitingApproval(EXPIRED)
 
