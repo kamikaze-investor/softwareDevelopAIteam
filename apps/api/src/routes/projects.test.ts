@@ -779,6 +779,21 @@ describe('Project API', () => {
         for (const target of ['archived', 'draft'] as const) {
           expect((await patchStatus(app, project.id, target)).statusCode).toBe(409)
         }
+        // repair_source_job_id を持つ roadmap run も数える（Task 経由の repair query からは見えない）。
+        storage.designReviewRuns.complete(run.id, storage.designReviewRuns.findById(run.id)!.claimToken!, 'failed', undefined, 'x')
+        const sourceTask = storage.tasks.create({
+          projectId: project.id, title: 'S', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+        })
+        const sourceJob = storage.jobs.create({
+          taskId: sourceTask.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        } as Parameters<typeof storage.jobs.create>[0])
+        storage.designReviewRuns.create({
+          reviewKind: 'roadmap', subjectId: project.id, taskTitle: 'Whole-Roadmap Review',
+          designText: 'roadmap repair', designTextHash: 'hash2', changedFiles: [], repairSourceJobId: sourceJob.id,
+        })
+        expect(parseBody<{ blockers: string[] }>((await patchStatus(app, project.id, 'archived')).body).blockers)
+          .toEqual(['design_review_run'])
         // 別 Project の roadmap run は止めない（subject は Project 単位）。
         const other = await createProject(app, { status: 'paused' })
         expect((await patchStatus(app, other.id, 'archived')).statusCode).toBe(200)

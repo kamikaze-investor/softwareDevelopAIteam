@@ -776,10 +776,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     // （task_id = subject_id）と 'roadmap'（task_id 無し・subject_id = projectId。Whole-Roadmap Review）の
     // 2 種類だけ（`DesignReviewKind`）。Task 経由だけを見ると、project initialization の roadmap review が
     // queued / running の間に archive でき、その後に roadmap / task の同期が続く（Codex review 148a927）。
+    // Project subject の roadmap run は repair_source_job_id の有無に関わらず数える（上の repair 用 query は
+    // Task 経由でしか引かないので、ここで拾わないと repair 付きの roadmap run が両方から漏れる。Codex review 2d8f060）。
     const otherRun = db.prepare(
       "SELECT r.id FROM design_review_runs r LEFT JOIN tasks t ON t.id = r.task_id "
-      + "WHERE r.status IN ('queued','running') AND r.repair_source_job_id IS NULL "
-      + "AND (t.project_id = ? OR (r.review_kind = 'roadmap' AND r.subject_id = ?)) LIMIT 1",
+      + "WHERE r.status IN ('queued','running') "
+      + "AND ((t.project_id = ? AND r.repair_source_job_id IS NULL) "
+      + "OR (r.review_kind = 'roadmap' AND r.subject_id = ?)) LIMIT 1",
     ).get(projectId, projectId)
     if (otherRun) kinds.push('design_review_run')
 
