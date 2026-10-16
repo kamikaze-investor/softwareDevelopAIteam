@@ -3626,3 +3626,49 @@ describe('a live task-scoped human decision is a human wait, not a blocked-job r
   })
 })
 
+
+// D2 v4: a technical Gate stop (risk_rule_skew / approval_contract_violation in job.stderr) is a visible,
+// non-auto stop for ANY command kind — it is recognized before rule 7, so the PL never auto-resumes it.
+describe('triage rule 6.8: technical Gate stop recognized from the persisted reason, for any command kind', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+  const CONTRACT = 'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision'
+
+  function blockedWith(kind: string, stderr: string): { storage: IStorage; jobId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind, workingDir: '/workspace/target' }, dryRun: false,
+      ...(kind === 'git_status' ? { aiCliMode: 'review', aiCliProvider: 'claude', workflowStepKey: 'implement:src-job:review' } : {}),
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+    return { storage, jobId: job.id }
+  }
+
+  it.each([
+    ['git_status (safe-work kind)', 'git_status', SKEW, 'risk_rule_skew'],
+    ['test (safe-work kind)', 'test', CONTRACT, 'approval_contract_violation'],
+    ['git_commit without a linked approval', 'git_commit', SKEW, 'risk_rule_skew'],
+  ])('%s → non-auto lane, unknown, no authority change, visible', (_label, kind, stderr, code) => {
+    const fx = blockedWith(kind, stderr)
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    expect(item).toBeDefined()
+    const triage = triageBlocked(fx.storage, item)
+    expect(triage).toMatchObject({
+      rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation', recoverable: false,
+      requiresAuthorityChange: false, existingRecoveryAvailable: true,
+    })
+    expect(triage.evidence.find((e) => e.fact.startsWith('gate technical stop code'))?.value).toBe(code)
+    expect(triage.recommendedLane).not.toBe('auto_recovery')
+  })
+
+  it('an ordinary blocked Job without a technical stop code still reaches rule 7 (unchanged)', () => {
+    const fx = blockedWith('git_status', 'some other block')
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    expect(triageBlocked(fx.storage, item).rootCauseClass).not.toBe('unknown')
+  })
+})

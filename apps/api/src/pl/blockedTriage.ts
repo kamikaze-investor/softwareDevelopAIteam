@@ -68,6 +68,7 @@ import {
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
+import { findGateTechnicalStopCode, isLiveApprovedApproval } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
@@ -438,7 +439,8 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     if (!job || job.safeCommand.kind !== 'git_commit' || !job.approvalId) return undefined
     const linked = storage.approvalRequests.findById(job.approvalId)
     if (!linked || linked.taskId !== job.taskId || linked.requestedAction !== 'git_commit') return undefined
-    return linked.status === 'APPROVED' ? linked.id : undefined
+    // 期限切れ・読めない期限の APPROVED はもう誰の authority にもならない（consume が使わせない）。
+    return isLiveApprovedApproval(linked) ? linked.id : undefined
   })()
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
@@ -940,16 +942,50 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // （2026-09-23 production で、人の REJECT が同一 diff の承認待ちへ戻った）。
   // `rootCauseClass` は増やさず、既存 schema の値だけで
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
+  // ── 6.8 Gate の技術的不整合で止まった Job（command kind を問わない）── D2 v4（2026-10-17）
+  //
+  // Worker の resolvePolicy が承認の判断ではなく技術的な不整合（risk_rule_skew: Worker / API の rule の版ずれ、
+  // approval_contract_violation: Gate 応答の組が契約外）で re_check にした Job は、理由を stderr に
+  // `<code>: ...` として残す（`findGateTechnicalStopCode`）。下の 7 へ落とすと auto_recovery → PL resume →
+  // 同じ不整合で再停止、の連鎖になる（非 git の safe-work kind でも同じ）。原因（版ずれ等）は AI の
+  // resume では直らないので、6.9 と同じ自動実行しない lane で一度だけ見せる。Authority の変更は要求しない。
+  // 原因を直した後の resume が出口（git_commit なら新しい承認が求められる）。
+  const technicalStopCode = facts.job?.status === 'blocked' ? findGateTechnicalStopCode(facts.job.stderr) : undefined
+  if (facts.job !== undefined && technicalStopCode !== undefined && !hasLiveJob(facts)) {
+    return {
+      ...result,
+      rootCauseClass: 'unknown',
+      blockingLayer: 'approval',
+      evidence: [
+        { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        { fact: 'gate technical stop code (job.stderr)', id: facts.job.id, value: technicalStopCode },
+        { fact: 'job.stderr', id: facts.job.id, value: (facts.job.stderr ?? '').slice(0, 200) },
+        ...(facts.approvedLinkedGitCommitId !== undefined
+          ? [{ fact: 'approval_request.status (linked, unconsumed, live)', id: facts.approvedLinkedGitCommitId, value: 'APPROVED' }]
+          : []),
+      ],
+      recoverable: false,
+      existingRecoveryAvailable: true,
+      requiresAuthorityChange: false,
+      confidence: 'high',
+      recommendedLane: 'ceo_escalation',
+      summary:
+        `Gate の技術的な不整合（${technicalStopCode}）で ${facts.job.safeCommand.kind} が停止した。`
+        + '承認の判断ではなく、未解決の技術的制約（Authority の境界ではない）。'
+        + '自動 resume は同じ不整合で再停止するだけなので行わない。原因を直した後に resume すれば再開でき、'
+        + 'git_commit なら新しい承認が求められる。',
+    }
+  }
+
   // ── 6.9 承認済みなのに Worker が実行を拒んだ git_commit ─────────────────────
   //
   // linked Approval は APPROVED（未 consume）で、Gate は ALLOW + call_consume を返したが、Worker が
   // Gate 段階で実行しなかった（両 Guard は通過）。下の 7 へ落とすと auto_recovery → PL resume →
   // 新しい承認 → CEO 承認 → また同じ停止、の無限往復になりうるので、CEO に一度だけ見せて止める。
-  // **D2（2026-10-17）以後、これは Authority の境界ではない。** Worker は API の continuationPolicy を
-  // そのまま写すので、承認済み ALLOW + call_consume を Worker が拒むのは、Worker / API の rule の版ずれ
-  // （resolvePolicy の "risk inconsistency"）か consume の想定外の拒否だけである。原因は Worker が
-  // stderr にしか載せないので機械的には特定せず unknown とし、Authority の変更も要求しない。
-  // 版が揃えば既存の resume が出口になる（existingRecoveryAvailable）。
+  // **D2（2026-10-17）以後、これは Authority の境界ではなく未解決の技術的制約である。** Worker は承認済みの
+  // ALLOW + call_consume をローカルのリスクで格下げしない。Worker の技術的不整合（risk_rule_skew 等）は
+  // stderr の理由コードで上の 6.8 が先に扱うので、ここへ来るのは consume の想定外の拒否など原因コードの
+  // 無い停止だけ。unknown とし、Authority の変更は要求しない。原因を直した後の resume が出口。
   // **Worker が送った証拠（guardResult / quarantine）が Gate 段階の拒否を示すときだけ**（Codex round 2）。
   // Permission 拒否・File Change Guard・quarantine は既存の rule（1〜3・7）がそれぞれ扱う。保存側
   // （`jobs.update` の停止理由）と同じ `classifyApprovedRunBlock()` で判定する。
@@ -975,9 +1011,9 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       recommendedLane: 'ceo_escalation',
       summary:
         'CEO が承認し Gate も許可した git_commit を、Worker が Gate 段階で実行しなかった'
-        + '（承認は APPROVED のまま未使用）。Worker / API の rule の版ずれ（risk inconsistency）か'
-        + ' consume の想定外の拒否で、Authority の境界ではない。版を揃えた後に既存の resume で再開できる。'
-        + '自動 resume は同じ停止を繰り返しうるので CEO に一度だけ見せる。',
+        + '（承認は APPROVED のまま未使用）。未解決の技術的制約（consume の想定外の拒否など）で、'
+        + 'Authority の境界ではない。原因を直した後に既存の resume で再開できる。'
+        + '自動 resume は同じ停止を繰り返しうるので行わず、一度だけ見せる。',
     }
   }
 
