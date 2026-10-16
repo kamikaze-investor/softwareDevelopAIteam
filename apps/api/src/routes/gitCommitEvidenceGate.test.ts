@@ -132,7 +132,7 @@ describe('POST /api/gate/check — git_commit Safety Evidence（Stage 1）', () 
       expect(storage.jobs.findById(chain.gitCommitJob.id)?.approvalId).toBeUndefined()
 
       const [evaluation] = storage.gateEvaluations.findByJobId(chain.gitCommitJob.id)
-      expect(evaluation?.policyVersion).toBe('gate-policy-v2')
+      expect(evaluation?.policyVersion).toBe('gate-policy-v3')
       expect(evaluation?.bindingVerification).toBe('authoritative')
       expect(evaluation?.approvedContentHash).toBeDefined()
       expect(evaluation?.triggeredRules).toContain('git_commit: safety evidence verified')
@@ -212,6 +212,114 @@ describe('POST /api/gate/check — git_commit Safety Evidence（Stage 1）', () 
       const audit = storage.auditLog.findByEntity('job', chain.gitCommitJob.id)
       expect(audit[0]).toMatchObject({ result: 'insufficient_safety_evidence' })
       expect(audit[0]?.detail).toContain('design_review_not_aligned')
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+/**
+ * spec 22 §14-3 DA trigger (7) の開示（2026-10-09 b6d4097a の形）:
+ *   implement → R0 `implement:I:review`（changes_requested）
+ *   → R1 `resume:R0:1`（同じ実装を再レビューして approved）
+ *   → G0 `review:R1:git-commit` → G1 `resume:G0:1`（resume された git_commit）
+ * Evidence は lineage で既に fail closed する。人間承認の依頼に「判定不一致」が載ることを固定する。
+ */
+function seedDisagreementChain(storage: IStorage, dir: string, options: { earlierVerdict: 'changes_requested' | 'approved' }): {
+  gitCommitJob: Job
+  taskId: string
+  targetCommit: string
+  targetDiffHash: string
+} {
+  const current = readCurrentWorktreeDiff(dir)
+  const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+  const task = storage.tasks.create({
+    projectId: project.id, title: 'T', description: '', status: 'blocked',
+    assignee: 'developer_ai', dependencies: [], allowedPaths: ['src/'],
+  } as Parameters<IStorage['tasks']['create']>[0])
+  const base = { taskId: task.id, projectId: project.id }
+  const implement = storage.jobs.create({
+    ...base, agentRole: 'developer_ai', status: 'queued',
+    safeCommand: { kind: 'test' }, aiCliMode: 'implement', aiCliProvider: 'claude_code', aiCliPrompt: PROMPT,
+  } as never)
+  storage.jobs.update(implement.id, { status: 'success', exitCode: 0 } as never)
+  const firstReview = storage.jobs.create({
+    ...base, agentRole: 'qa_ai', status: 'failed',
+    safeCommand: { kind: 'git_status' }, aiCliMode: 'review', aiCliProvider: 'claude_code',
+    workflowStepKey: `implement:${implement.id}:review`,
+  } as never)
+  storage.reviewResults.create({
+    taskId: task.id, jobId: firstReview.id, reviewer: 'qa_ai', status: options.earlierVerdict,
+    summary: 'first review',
+    findings: options.earlierVerdict === 'approved' ? [] : [{ severity: 'medium', file: 'src/feature.ts', message: 'blocking' }],
+  } as never)
+  const resumedReview = storage.jobs.create({
+    ...base, agentRole: 'qa_ai', status: 'success',
+    safeCommand: { kind: 'git_status' }, aiCliMode: 'review', aiCliProvider: 'claude_code',
+    workflowStepKey: `resume:${firstReview.id}:1`,
+  } as never)
+  storage.reviewResults.create({
+    taskId: task.id, jobId: resumedReview.id, reviewer: 'qa_ai', status: 'approved', summary: 'rerun', findings: [],
+  } as never)
+  const anchor = storage.jobs.create({
+    ...base, agentRole: 'developer_ai', status: 'blocked',
+    safeCommand: { kind: 'git_commit', workingDir: dir }, workflowStepKey: `review:${resumedReview.id}:git-commit`,
+  } as never)
+  const gitCommitJob = storage.jobs.create({
+    ...base, agentRole: 'developer_ai', status: 'running',
+    safeCommand: { kind: 'git_commit', workingDir: dir }, workflowStepKey: `resume:${anchor.id}:1`,
+  } as never)
+  return { gitCommitJob, taskId: task.id, targetCommit: current.headCommit, targetDiffHash: current.diffHash }
+}
+
+describe('POST /api/gate/check — git_commit の review 判定不一致を開示する（DA trigger 7）', () => {
+  it('changes_requested の後に resume review が approved を返した git_commit の承認依頼に開示ラベルが付く', async () => {
+    const dir = initRepoWithChange()
+    const { app, storage } = await buildApp(dir)
+    try {
+      const chain = seedDisagreementChain(storage, dir, { earlierVerdict: 'changes_requested' })
+      const body = await gateCheck(app, chain)
+
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.continuationPolicy).toBe('block_until_approved')
+      expect(body.approvalRequest?.triggeredRules).toEqual(expect.arrayContaining([
+        'git_commit requires CEO approval (policy)',
+        'git_commit human gate: insufficient_safety_evidence',
+        'review verdict disagreement',
+      ]))
+      expect(storage.approvalRequests.findById(body.approvalRequest!.id)?.triggeredRules)
+        .toContain('review verdict disagreement')
+      const [evaluation] = storage.gateEvaluations.findByJobId(chain.gitCommitJob.id)
+      expect(evaluation?.triggeredRules).toContain('review verdict disagreement')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('前の review も approved だった resume（判定が割れていない）には付けない', async () => {
+    const dir = initRepoWithChange()
+    const { app, storage } = await buildApp(dir)
+    try {
+      const chain = seedDisagreementChain(storage, dir, { earlierVerdict: 'approved' })
+      const body = await gateCheck(app, chain)
+
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.approvalRequest?.triggeredRules).not.toContain('review verdict disagreement')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('resume の無い通常の approved review から来た git_commit には付けない', async () => {
+    const dir = initRepoWithChange()
+    const { app, storage } = await buildApp(dir)
+    try {
+      const chain = seedChain(storage, dir, { designReview: false })
+      const body = await gateCheck(app, chain)
+
+      expect(body.outcome.decision).toBe('BLOCKED')
+      expect(body.approvalRequest?.triggeredRules).toContain('git_commit human gate: insufficient_safety_evidence')
+      expect(body.approvalRequest?.triggeredRules).not.toContain('review verdict disagreement')
     } finally {
       await app.close()
     }

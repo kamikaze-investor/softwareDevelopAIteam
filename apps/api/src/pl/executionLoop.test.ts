@@ -2769,6 +2769,42 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(result.reason).toContain('outside the actions this triage allows')
   })
 
+  // 2026-10-16 監査 RC6: 根拠に積む approval は「今実行する action 向け」のものだけ。
+  // Task の最新行（別 action）を積むと、別 action の承認で PL 操作が通り、逆に自 action の承認を見落とす。
+  function seedApprovedRequest(storage: IStorage, taskId: string, requestedAction: string): string {
+    const created = storage.approvalRequests.create({
+      taskId, targetBranch: 'master', targetCommit: 'c', targetDiffHash: 'd', riskLevel: 'HIGH',
+      requestedAction, status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), invalidIf: [],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    storage.approvalRequests.recordDecision(created.id, 'APPROVED', 'seeded')
+    return created.id
+  }
+
+  function authorizeAudits(storage: IStorage): string[] {
+    return storage.auditLog.findAll()
+      .filter((entry) => entry.operation === 'pl_action_authorize')
+      .map((entry) => `${entry.result} ${entry.detail ?? ''}`)
+  }
+
+  // approval_gate を要する PL 操作（retry_job 等）は、いまこのループに executor が無いため候補に出ない
+  // （lifecycle repair W5）。よって「別 action の APPROVED を根拠にしない」binding はループからは到達できず、
+  // `actionGate.test.ts` の requiredApprovalRequestAction / checkApprovalGate の単体テストで固定している。
+  // ここでは、承認がどう積まれていても未配線の操作は Gate より前に候補外として止まることを固定する。
+  it('approval_gate 対象の未配線操作は、承認の有無に関わらず候補外として Gate 前に止まる', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    seedApprovedRequest(storage, taskId, 'retry_job')
+    seedApprovedRequest(storage, taskId, 'git_commit')
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'retry_job', rationale: 'transient', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.reason).toContain('outside the actions')
+    expect(authorizeAudits(storage).some((entry) => entry.startsWith('authorized'))).toBe(false)
+  })
+
   it('要求される対象を組み立てられない提案は、Gate を呼ばずに fail-closed で止める', async () => {
     const { storage, taskId, projectId } = seed()
     blockedCommitJob(storage, taskId, projectId)
