@@ -40,7 +40,12 @@ import {
   RESUME_ACTOR_AUDIT_OPERATION,
   TECHNICAL_RESUME_AUDIT_TOKEN,
 } from '../pl/technicalResumePolicy'
-import { RESUME_STEP_PREFIX, jobsSupersededByHumanResume, type ResumeActorClass } from './repairPolicy'
+import {
+  RESUME_STEP_PREFIX,
+  jobsSupersededByHumanResume,
+  type GenerationAuthority,
+  type ResumeActorClass,
+} from './repairPolicy'
 
 /** resume actor を記録する audit operation 名。新 table は作らない。 */
 export const RESUME_ACTOR_OPERATION = RESUME_ACTOR_AUDIT_OPERATION
@@ -180,6 +185,11 @@ export function recordRepairGeneration(
     previousGenerationRoot?: string
     budgetReset: boolean
     resetReason: string
+    /**
+     * generation を始めた保存済み authority への参照。reset の理由だけでは
+     * 「どの承認 / どの Human Resume で」が後から追えないので、id ごと残す（b8d0fc5d 修正）。
+     */
+    authority?: GenerationAuthority
   },
 ): void {
   const parts = [
@@ -189,6 +199,7 @@ export function recordRepairGeneration(
     `previous_generation_root=${input.previousGenerationRoot ?? 'none'}`,
     `budget_reset=${input.budgetReset ? 'yes' : 'no'}`,
     `reset_reason=${input.resetReason}`,
+    ...authorityAuditTokens(input.authority),
   ]
   recordWithoutFailingCaller(REPAIR_GENERATION_OPERATION, () => {
     storage.auditLog.record({
@@ -200,6 +211,80 @@ export function recordRepairGeneration(
       detail: parts.join(' '),
     })
   })
+}
+
+/** 承認を決定した主体を記録する audit operation 名。新 table は作らない。 */
+export const APPROVAL_ACTOR_AUDIT_OPERATION = 'approval_actor'
+
+/**
+ * **ApprovalRequest を決定した主体の種別を、credential だけから決めて残す**（Codex review・b8d0fc5d）。
+ *
+ * consume 済みの `repair_from_stored_review:*` 承認は repair budget を作り直す authority になる。
+ * ところが `APPROVED` は legacy 単一 token でも書けるので、行の状態だけでは「人が決めた」ことの
+ * 証明にならない。Human Resume と同じ規則（`resumeActorClassForCredential()`：ADMIN だけが human、
+ * legacy / 不明は決して human にしない）で決めた種別を、承認 id に紐づけて 1 行残す。
+ * 呼び出しは承認 PATCH route の担当（CODEOWNERS 保護のため別 unit が配線する）。
+ * 記録の失敗は authority を増やす方向へは倒れない（読み側が `unknown` を返す）。
+ */
+export function recordApprovalActor(
+  storage: IStorage,
+  approvalRequestId: string,
+  credentialClass: CredentialClass | undefined,
+): void {
+  const actorClass = resumeActorClassForCredential(credentialClass)
+  const evidence = resumeEvidenceForCredential(credentialClass)
+  recordWithoutFailingCaller(APPROVAL_ACTOR_AUDIT_OPERATION, () => {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: APPROVAL_ACTOR_AUDIT_OPERATION,
+      entityType: 'approval_request',
+      entityId: approvalRequestId,
+      result: actorClass,
+      detail: `approval_actor=${actorClass} authorization_evidence=${evidence}`,
+    })
+  })
+}
+
+/**
+ * 承認の決定主体を読む。規則は `resumeActorClassFromAudit()` と同じ:
+ * 記録が無い・矛盾する・`human` なのに `admin_credential` の根拠が無い → human ではない。
+ * 読めなかった場合も `unknown`（authority を増やす方向へは倒れない）。
+ */
+export function readApprovalActorClass(
+  storage: IStorage,
+  approvalRequestId: string,
+): 'human' | 'ai' | 'unknown' {
+  try {
+    const rows = storage.auditLog.findByEntity('approval_request', approvalRequestId)
+      .filter((entry) => entry.operation === APPROVAL_ACTOR_AUDIT_OPERATION)
+    const seen = new Set(rows.map((row) => row.result))
+    if (seen.size !== 1) return 'unknown'
+    const only = [...seen][0]
+    if (only === 'ai') return 'ai'
+    if (only !== 'human') return 'unknown'
+    return rows.every((row) => ADMIN_EVIDENCE_PATTERN.test(row.detail ?? '')) ? 'human' : 'unknown'
+  } catch (error: unknown) {
+    console.warn(
+      `[resumeActor] failed to read the approval actor of ${approvalRequestId}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return 'unknown'
+  }
+}
+
+function authorityAuditTokens(authority: GenerationAuthority | undefined): string[] {
+  if (authority === undefined) return []
+  if (authority.kind === 'human_recovery') {
+    return [
+      'authority_kind=human_recovery',
+      `authority_approval_request_id=${authority.approvalRequestId}`,
+      `authority_review_job_id=${authority.reviewJobId}`,
+    ]
+  }
+  return [
+    'authority_kind=human_resume',
+    `authority_resume_job_id=${authority.resumeJobId}`,
+    `authority_resumed_review_job_id=${authority.resumedReviewJobId}`,
+  ]
 }
 
 /**

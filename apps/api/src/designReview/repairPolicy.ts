@@ -83,7 +83,26 @@ export interface PriorRepairJob {
    * **省略時は false**。記録が無いことを authority と解釈しない（fail-safe）。
    */
   humanRecoveryEpoch?: boolean
+  /**
+   * この実装を覆う **保存済みの human authority の参照**（読み取りは flow 層）。
+   *
+   * `human_recovery` は `humanRecoveryEpoch` と同じ consume 済み承認を名指す。
+   * `human_resume` は、この実装の stepKey lineage ではなく **それをレビューした review の
+   * resume lineage** 上にある Human Resume を名指す（b8d0fc5d: 初回 implement の review を CEO が
+   * Human Resume した形。実装の lineage には resume が無いので、従来の walker では origin になっていた）。
+   * 根の identity は書き換えない —— 根はこの実装 Job のままで、権限の出どころだけを参照として持つ。
+   * **省略時は authority 無し**（fail-safe）。
+   */
+  implementationAuthority?: GenerationAuthority
 }
+
+/**
+ * generation を始めた human authority の **保存済み事実への参照**。
+ * 予算 reset はこの参照の種別から導く（`generationResetFacts()`）。label ではなく出どころを残す。
+ */
+export type GenerationAuthority =
+  | { kind: 'human_recovery'; approvalRequestId: string; reviewJobId: string }
+  | { kind: 'human_resume'; resumeJobId: string; resumedReviewJobId: string }
 
 export type RepairDecision =
   | {
@@ -150,6 +169,8 @@ export interface RepairGeneration {
   budgetReset: boolean
   /** なぜ再発行された / されなかったのか。audit に残す短い理由。 */
   resetReason: string
+  /** 根に保存済み authority の参照があるときだけ入る（`PriorRepairJob.implementationAuthority`）。 */
+  authority?: GenerationAuthority
 }
 
 /**
@@ -444,6 +465,8 @@ export type GenerationWalk =
        * 復元できていない lineage が除外に使われることはない。
        */
       lineageAncestorJobIds: string[]
+      /** 根に保存済み authority の参照があるときだけ入る。 */
+      authority?: GenerationAuthority
     }
   | { ok: false; reason: string }
 
@@ -492,6 +515,7 @@ export function walkRepairGeneration(
     rootJobId: string
     previousGenerationRoot?: string
     kind: 'human_resume' | 'human_recovery'
+    authority?: GenerationAuthority
   } | undefined
 
   const finish = (originJobId: string): GenerationWalk => {
@@ -517,6 +541,7 @@ export function walkRepairGeneration(
           crossedAiResume,
           generationRepairJobIds,
           lineageAncestorJobIds,
+          ...(countedRoot.authority === undefined ? {} : { authority: countedRoot.authority }),
         }
   }
 
@@ -567,11 +592,23 @@ export function walkRepairGeneration(
     // 上流にさらに `human_resume` があっても現在の根を上書きしない。
     // そして `human_resume` と同じく **ここで walk を止めない** —— 止めると、この Job
     // 自身が環の一部でも別 Task から来ていても素通りしてしまう。
+    const authority = job.implementationAuthority
     if (countedRoot === undefined && job.humanRecoveryEpoch === true) {
       countedRoot = {
         rootJobId: cursor,
         previousGenerationRoot: lineageParentOf(stepKey),
         kind: 'human_recovery',
+        ...(authority?.kind === 'human_recovery' ? { authority } : {}),
+      }
+    } else if (countedRoot === undefined && authority?.kind === 'human_resume') {
+      // **review lineage 上の Human Resume を、この実装を根とする generation の authority にする。**
+      // 根は実装 Job のまま（relabel しない）。`human_recovery` と同じく stepKey 種別に依らず、
+      // ここで walk は止めない。予算 reset は既存の `human_resume` 根と同じ導出になる。
+      countedRoot = {
+        rootJobId: cursor,
+        previousGenerationRoot: lineageParentOf(stepKey),
+        kind: 'human_resume',
+        authority,
       }
     }
 
@@ -692,6 +729,7 @@ export function toRepairGeneration(walk: Extract<GenerationWalk, { ok: true }>):
     previousGenerationRoot: walk.previousGenerationRoot,
     crossedAiResume: walk.crossedAiResume,
     ...generationResetFacts(walk),
+    ...(walk.authority === undefined ? {} : { authority: walk.authority }),
   }
 }
 

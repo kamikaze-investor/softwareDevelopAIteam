@@ -962,7 +962,7 @@ describe('Task API', () => {
   describe('POST /api/tasks/:id/resume', () => {
     it('rejects resume with 409 while the Task workspace is quarantined (fail-closed)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const job = await createJob(app, task)
         await updateJob(app, job.id, { status: 'running' })
@@ -992,7 +992,7 @@ describe('Task API', () => {
 
     it('resume succeeds after a verified clear-quarantine (workflow: quarantine -> resume refused -> cleared -> resume succeeds)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id, {
           title: 'Fix blocked deployment',
           description: 'Update only the allowed API files.',
@@ -1068,7 +1068,7 @@ describe('Task API', () => {
 
     it('creates a queued job, terminalizes its blocked source, and does not start a second recovery', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id, {
           title: 'Fix blocked deployment',
           description: 'Update only the allowed API files.',
@@ -1133,7 +1133,7 @@ describe('Task API', () => {
 
     it('uses the queued resume successor as the source of the next resume, even at the same timestamp', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const blockedJob = await createBlockedAiCliJob(app, task, {
           aiCliProvider: 'codex',
@@ -1184,7 +1184,7 @@ describe('Task API', () => {
       await withApp(async (app) => {
         const { getStorage } = await import('../storage/index.js')
         const storage = getStorage()
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id, {
           title: 'Retry safely',
           description: 'Update only documentation.',
@@ -1221,7 +1221,7 @@ describe('Task API', () => {
         const { getStorage } = await import('../storage/index.js')
         const storage = getStorage()
 
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
 
         // POST /api/jobs は常に正規workingDirを強制するため、異なるworkingDirを持つ
@@ -1256,7 +1256,7 @@ describe('Task API', () => {
 
     it('rejects resume while the latest approval request is waiting for the user', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         await createBlockedAiCliJob(app, task)
         await createApprovalRequest(task.id, { status: 'WAITING_FOR_USER' })
@@ -1279,7 +1279,7 @@ describe('Task API', () => {
       'rejects resume when a %s job already exists',
       async (activeStatus) => {
         await withApp(async (app) => {
-          const project = await createProject(app)
+          const project = await createProject(app, { status: 'running' })
           const task = await createTask(app, project.id)
           await createBlockedAiCliJob(app, task)
           await wait(5)
@@ -1311,7 +1311,7 @@ describe('Task API', () => {
       async (status) => {
         await withApp(async (app) => {
           const { getStorage } = await import('../storage/index.js')
-          const project = await createProject(app)
+          const project = await createProject(app, { status: 'running' })
           const task = await createTask(app, project.id)
           const job = await createJob(app, task, {
             aiCliProvider: 'codex',
@@ -1344,7 +1344,7 @@ describe('Task API', () => {
       it('accepts resume once aligned evidence already exists for the instruction', async () => {
         await withApp(async (app) => {
           const { getStorage } = await import('../storage/index.js')
-          const project = await createProject(app)
+          const project = await createProject(app, { status: 'running' })
           const task = await createTask(app, project.id, { status: 'blocked' })
           const failedJob = await createJob(app, task, {
             aiCliProvider: 'codex',
@@ -1399,7 +1399,7 @@ describe('Task API', () => {
         await withApp(async (app) => {
           const { getStorage } = await import('../storage/index.js')
           const storage = getStorage()
-          const project = await createProject(app)
+          const project = await createProject(app, { status: 'running' })
           const task = await createTask(app, project.id, { status: 'blocked' })
           const failedJob = await createJob(app, task, {
             aiCliProvider: 'codex',
@@ -1433,7 +1433,7 @@ describe('Task API', () => {
 
       it('still rejects resume when Task is blocked but the latest job succeeded', async () => {
         await withApp(async (app) => {
-          const project = await createProject(app)
+          const project = await createProject(app, { status: 'running' })
           const task = await createTask(app, project.id, { status: 'blocked' })
           const job = await createJob(app, task, {
             aiCliProvider: 'codex',
@@ -1485,7 +1485,7 @@ describe('Task API', () => {
           // 1) Design Review CONFLICT/NOT_ALIGNED相当の停止を、実際のescalation関数で再現する
           //    （repair flow内部のsubprocess実行そのものはrepairFlow自身のテストで別途検証済みのため、
           //    ここでは「escalateTaskToHumanが呼ばれた後の状態」から検証する）。
-          const project = await createProject(app)
+          const project = await createProject(app, { status: 'running' })
           const task = await createTask(app, project.id)
           const failedJob = await createJob(app, task, {
             aiCliProvider: 'codex',
@@ -1555,7 +1555,7 @@ describe('Task API', () => {
 
     it.each(['', '   '])('rejects blank instruction input', async (instruction) => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
 
         const res = await app.inject({
@@ -1570,7 +1570,7 @@ describe('Task API', () => {
 
     it('rejects instruction input longer than 2000 characters', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
 
         const res = await app.inject({
@@ -1585,7 +1585,7 @@ describe('Task API', () => {
 
     it('creates only one job when resume is submitted twice', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         await createBlockedAiCliJob(app, task)
         const instruction = 'Retry with the approved file list.'

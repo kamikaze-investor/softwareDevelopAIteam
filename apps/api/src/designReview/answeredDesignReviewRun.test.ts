@@ -151,11 +151,12 @@ describe('D3: Human Resume で回答済みの repair run は admission の根拠
   it('run の完了より前に作られた resume は回答ではない（従来どおり skip、runId を返す）', async () => {
     const shape = await shapeBeforeRun()
     const r1 = await resumedReview(shape, 'human')
-    const runId = await terminalRun(shape, 'REVIEW_UNAVAILABLE', shape.i1.id)
+    // RC3 以降、REVIEW_UNAVAILABLE は判定の無い run として根拠から外れるので、判定のある CONFLICT で確かめる。
+    const runId = await terminalRun(shape, 'CONFLICT', shape.i1.id)
 
     expect(admit(shape, r1.id)).toEqual({
       action: 'skip',
-      reason: 'task is blocked (latest design review is REVIEW_UNAVAILABLE)',
+      reason: 'task is blocked (latest design review is CONFLICT)',
       runId,
     })
   })
@@ -166,7 +167,7 @@ describe('D3: Human Resume で回答済みの repair run は admission の根拠
     ['admin_credential の根拠が無い human 記録', 'human_without_admin'],
   ] as const)('%s は回答として扱わない', async (_label, actor) => {
     const shape = await shapeBeforeRun()
-    const runId = await terminalRun(shape, 'REVIEW_UNAVAILABLE', shape.i1.id)
+    const runId = await terminalRun(shape, 'CONFLICT', shape.i1.id)
     const r1 = await resumedReview(shape, actor)
 
     expect(admit(shape, r1.id)).toMatchObject({ action: 'skip', runId })
@@ -174,7 +175,7 @@ describe('D3: Human Resume で回答済みの repair run は admission の根拠
 
   it('別の repairSourceJobId の run は外さない（別 lineage）', async () => {
     const shape = await shapeBeforeRun()
-    const runId = await terminalRun(shape, 'REVIEW_UNAVAILABLE', shape.b0.id)
+    const runId = await terminalRun(shape, 'CONFLICT', shape.b0.id)
     const r1 = await resumedReview(shape, 'human')
 
     expect(admit(shape, r1.id)).toMatchObject({ action: 'skip', runId })
@@ -229,7 +230,7 @@ describe('D3: Human Resume で回答済みの repair run は admission の根拠
 
   it('selector 無しの通常 review 経路は resume lineage を持たないので、従来どおり skip する', async () => {
     const shape = await shapeBeforeRun()
-    const runId = await terminalRun(shape, 'REVIEW_UNAVAILABLE', shape.i1.id)
+    const runId = await terminalRun(shape, 'CONFLICT', shape.i1.id)
     await resumedReview(shape, 'human')
 
     expect(admit(shape)).toMatchObject({ action: 'skip', runId })
@@ -246,7 +247,7 @@ describe('D3: Human Resume で回答済みの repair run は admission の根拠
 
   it('lineage 外の Human Resume（同じ Task の別の Job）は回答として数えない', async () => {
     const shape = await shapeBeforeRun()
-    const runId = await terminalRun(shape, 'REVIEW_UNAVAILABLE', shape.i1.id)
+    const runId = await terminalRun(shape, 'CONFLICT', shape.i1.id)
     // 同じ Task に、run の後に作られた human resume があるが、引き金の review の lineage ではない。
     const unrelated = job(shape.storage, shape, { aiCliMode: 'implement', workflowStepKey: `resume:${shape.b0.id}:2` }, { status: 'failed' })
     recordResumeActor(shape.storage, { jobId: unrelated.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential' })
